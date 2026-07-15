@@ -114,13 +114,14 @@ export class BaseContentCache {
   async load(adapter: DataAdapter, pluginDir: string): Promise<void> {
     try {
       const raw = await adapter.read(`${pluginDir}/${CACHE_FILE}`);
-      const parsed = JSON.parse(raw) as unknown;
-      this.store = isStringRecord(parsed)
+      const parsed: unknown = JSON.parse(raw);
+      const nextStore: Map<string, string> = isStringRecord(parsed)
         ? stringRecordToMap(parsed)
-        : new Map();
+        : new Map<string, string>();
+      this.store = nextStore;
     } catch {
       // File doesn't exist or is corrupt — start with empty cache
-      this.store = new Map();
+      this.store = new Map<string, string>();
     }
     this.dirty = false;
   }
