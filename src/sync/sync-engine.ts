@@ -86,7 +86,7 @@ export class SyncEngine {
       [...renames.values()].map((r) => r.newPath),
     );
 
-    for (const [oldPath, { newPath, localEntry, baseEntry, remoteEntry }] of renames) {
+    for (const [oldPath, { newPath, localEntry, remoteEntry }] of renames) {
       plan.push({
         type: SyncActionType.RenameRemote,
         path: newPath,

@@ -7,6 +7,11 @@ import {
   setIcon,
   setTooltip,
 } from "obsidian";
+import {
+  compatCancelAnimationFrame,
+  compatRequestAnimationFrame,
+  type AnimationFrameHandle,
+} from "../obsidian-compat";
 import type EasySyncPlugin from "../main";
 import { SyncActionType } from "../sync/types";
 import type { PlanReviewItem, SyncPlanItem } from "../sync/types";
@@ -133,12 +138,6 @@ export function buildSyncViewContentKey(
   return `idle:${authKey}:${input.lastSyncTime}:${historyKey}`;
 }
 
-function formatByteSize(bytes: number): string {
-  if (bytes >= 1_048_576) return `${(bytes/1_048_576).toFixed(1)} MB`;
-  if (bytes >= 1_024) return `${Math.round(bytes/1_024)} KB`;
-  return `${bytes} B`;
-}
-
 /** Format byte progress as "downloaded/total unit" with unit shown once. */
 function formatByteProgress(downloaded: number, total: number): string {
   if (total >= 1_048_576) return `${(downloaded/1_048_576).toFixed(1)}/${(total/1_048_576).toFixed(1)} MB`;
@@ -171,7 +170,7 @@ export class EasySyncSyncView extends ItemView {
   private historyExpanded = false;
   private allCollapsed = false;
   // P0: incremental render — frame merging + diffed file list
-  private renderFrameId: number | null = null;
+  private renderFrameId: AnimationFrameHandle | null = null;
   private lastContentKey: string | null = null;
   private renderedFilePaths: Set<string> = new Set();
   private lastPhase: SyncPhase = "idle";
@@ -214,7 +213,7 @@ export class EasySyncSyncView extends ItemView {
 
   async onClose(): Promise<void> {
     if (this.renderFrameId !== null) {
-      cancelAnimationFrame(this.renderFrameId);
+      compatCancelAnimationFrame(this.renderFrameId);
       this.renderFrameId = null;
     }
   }
@@ -222,7 +221,7 @@ export class EasySyncSyncView extends ItemView {
   /** Public entry point — merges multiple calls within the same animation frame. */
   render(): void {
     if (this.renderFrameId !== null) return;
-    this.renderFrameId = requestAnimationFrame(() => {
+    this.renderFrameId = compatRequestAnimationFrame(() => {
       this.renderFrameId = null;
       this.doRender();
     });
@@ -439,7 +438,7 @@ export class EasySyncSyncView extends ItemView {
     } else if (state.isLoggedIn && state.isRunning) {
       new ButtonComponent(actions)
         .setButtonText(t("syncView.cancelSync"))
-        .setWarning()
+        .setDestructive()
         .onClick(() => {
           void this.plugin.cancelSync();
         });
@@ -448,17 +447,21 @@ export class EasySyncSyncView extends ItemView {
         .setButtonText(t("command.syncNow"))
         .setCta()
         .setDisabled(state.isInitializing)
-        .onClick(async () => this.plugin.startManualSync());
+        .onClick(() => {
+          void this.plugin.startManualSync();
+        });
     } else {
       new ButtonComponent(actions)
         .setButtonText(t("settings.account.login"))
         .setCta()
-        .onClick(async () => {
-          try {
-            await this.plugin.auth?.login();
-          } catch (error) {
-            new Notice(error instanceof Error ? error.message : t("general.unknown"));
-          }
+        .onClick(() => {
+          void (async () => {
+            try {
+              await this.plugin.auth?.login();
+            } catch (error) {
+              new Notice(error instanceof Error ? error.message : t("general.unknown"));
+            }
+          })();
         });
     }
   }
@@ -478,8 +481,8 @@ export class EasySyncSyncView extends ItemView {
 
     if (state.isRunning && state.progress.total > 0) {
       if (!this.statusCounterEl) {
-        const statusLine = this.contentEl.querySelector(".easy-sync-status-line") as HTMLElement | null;
-        if (statusLine) {
+        const statusLine = this.contentEl.querySelector(".easy-sync-status-line");
+        if (statusLine instanceof HTMLElement) {
           this.statusCounterEl = statusLine.createSpan("easy-sync-status-counter");
         }
       }
@@ -677,12 +680,14 @@ export class EasySyncSyncView extends ItemView {
     const actions = body.createDiv("easy-sync-item-actions");
     const localFile = this.plugin.app.vault.getAbstractFileByPath(issue.path);
     if (localFile instanceof TFile) {
-      this.createActionChip(actions, t("syncView.issues.openFile"), "", () =>
-        this.plugin.app.workspace.getLeaf(false).openFile(localFile));
+      this.createActionChip(actions, t("syncView.issues.openFile"), "", () => {
+        void this.plugin.app.workspace.getLeaf(false).openFile(localFile);
+      });
     }
     if (retryable) {
-      this.createActionChip(actions, t("syncView.issues.retry"), "accent", () =>
-        this.plugin.startManualSync());
+      this.createActionChip(actions, t("syncView.issues.retry"), "accent", () => {
+        void this.plugin.startManualSync();
+      });
     }
   }
 
@@ -796,7 +801,9 @@ export class EasySyncSyncView extends ItemView {
     const actions = panel.createDiv("easy-sync-plan-execute");
     new ButtonComponent(actions)
       .setButtonText(t("syncPlan.recalculate"))
-      .onClick(async () => this.plugin.rebuildPlanReview());
+      .onClick(() => {
+        void this.plugin.rebuildPlanReview();
+      });
   }
 
   private renderPlanGroups(

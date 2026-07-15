@@ -12,7 +12,8 @@
  *  - Conflict and delete-confirmation routing
  */
 
-import { Notice, Platform, type DataAdapter } from "obsidian";
+import { Notice, Platform, type DataAdapter, type FileManager } from "obsidian";
+import { compatSetTimeout, getConfigDir, getEasySyncPaths } from "../obsidian-compat";
 import { OneDriveError, OneDriveErrorType } from "../onedrive/types";
 import type { DriveItem, UploadResult } from "../onedrive/types";
 import { AuthError } from "../auth/types";
@@ -113,6 +114,7 @@ export class SyncExecutor {
     private progressStore?: SyncProgressStore,
     private diag?: DiagnosticLogger,
     private autoMerge = true,
+    private fileManager?: FileManager,
   ) {}
 
   private t(key: string, params?: Record<string, string | number>): string {
@@ -170,7 +172,8 @@ export class SyncExecutor {
   }
 
   private getDownloadTempPath(filePath: string): string {
-    return `.obsidian/plugins/easy-sync/tmp/downloads/${filePath}.part`;
+    const { tmpDir } = getEasySyncPaths(this.scanner.vault);
+    return `${tmpDir}/downloads/${filePath}.part`;
   }
 
   private async removePathIfExists(path: string): Promise<void> {
@@ -298,7 +301,7 @@ export class SyncExecutor {
             } else {
               const waitMs = 500 * (2 ** attempt);
               this.diag?.log("state", `cloud baseline download failed (attempt ${attempt + 1}), retrying in ${waitMs}ms`);
-              await new Promise((r) => setTimeout(r, waitMs));
+              await new Promise((r) => compatSetTimeout(r, waitMs));
             }
           }
         }
@@ -393,12 +396,14 @@ export class SyncExecutor {
         }
       }
 
-      const obsidianUploads = plan.items.filter(i => i.type === SyncActionType.Upload && i.path.startsWith('.obsidian/'));
+      const configPrefix = `${getConfigDir(this.scanner.vault)}/`;
+      const obsidianUploads = plan.items.filter((i) =>
+        i.type === SyncActionType.Upload && i.path.startsWith(configPrefix));
       if (obsidianUploads.length > 0) {
-        this.diag?.log("plan", `plan includes .obsidian/ uploads: ${obsidianUploads.map(i => i.path).join(', ')}`);
+        this.diag?.log("plan", `plan includes ${configPrefix} uploads: ${obsidianUploads.map((i) => i.path).join(', ')}`);
       } else {
-        const obsidianLocal = localEntries.filter(e => e.path.startsWith('.obsidian/'));
-        this.diag?.log("plan", `NO .obsidian/ uploads in plan. localEntries with .obsidian/: ${obsidianLocal.map(e => e.path).join(', ') || '(none)'}`);
+        const obsidianLocal = localEntries.filter((e) => e.path.startsWith(configPrefix));
+        this.diag?.log("plan", `NO ${configPrefix} uploads in plan. localEntries with ${configPrefix}: ${obsidianLocal.map((e) => e.path).join(', ') || '(none)'}`);
       }
 
       // Step 5.5: Scan health check — if any file failed to read,
@@ -753,8 +758,9 @@ export class SyncExecutor {
     // M19: anti-downgrade guard for EasySync self-sync.
     // Before any plugin files are downloaded, fetch remote manifest.json and
     // compare versions. If remote < local, skip all EasySync downloads this round.
+    const { pluginDirPrefix } = getEasySyncPaths(this.scanner.vault);
     const easySyncDownloads = downloads.filter((i) =>
-      i.path.startsWith(".obsidian/plugins/easy-sync/"));
+      i.path.startsWith(pluginDirPrefix));
     if (easySyncDownloads.length > 0) {
       const skipped = await this.guardEasySyncDowngrade(easySyncDownloads);
       if (skipped > 0) {
@@ -1520,7 +1526,7 @@ export class SyncExecutor {
   private shouldIncludeRemotePath(path: string): boolean {
     return typeof this.scanner.shouldSyncPath === "function"
       ? this.scanner.shouldSyncPath(path)
-      : !isEasySyncInternalPath(path);
+      : !isEasySyncInternalPath(path, getConfigDir(this.scanner.vault));
   }
 
   /**
@@ -1576,15 +1582,14 @@ export class SyncExecutor {
   private async guardEasySyncDowngrade(
     items: SyncPlanItem[],
   ): Promise<number> {
-    const manifestItem = items.find((i) => i.path === ".obsidian/plugins/easy-sync/manifest.json");
+    const { manifestFile } = getEasySyncPaths(this.scanner.vault);
+    const manifestItem = items.find((i) => i.path === manifestFile);
     if (!manifestItem?.remote) return 0; // no remote manifest to check
 
     // Read local version
     let localVersion = "";
     try {
-      const localRaw = await this.scanner.vault.adapter.read(
-        ".obsidian/plugins/easy-sync/manifest.json",
-      );
+      const localRaw = await this.scanner.vault.adapter.read(manifestFile);
       const localManifest = JSON.parse(localRaw) as { version?: string };
       localVersion = localManifest.version ?? "";
     } catch {
@@ -1738,7 +1743,11 @@ export class SyncExecutor {
       const tfile = this.scanner.vault.getFileByPath(path);
       if (tfile) {
         try {
-          await this.scanner.vault.trash(tfile, false);
+          if (this.fileManager) {
+            await this.fileManager.trashFile(tfile);
+          } else {
+            await this.scanner.vault.adapter.remove(path);
+          }
         } catch {
           await this.scanner.vault.adapter.remove(path);
         }

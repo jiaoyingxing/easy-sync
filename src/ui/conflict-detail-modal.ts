@@ -12,7 +12,7 @@
  * the modal silently degrades to metadata + local preview only.
  */
 
-import { Modal, Notice } from "obsidian";
+import { Modal } from "obsidian";
 import type EasySyncPlugin from "../main";
 import type { SyncPlanItem } from "../sync/types";
 import { computeDiff } from "./diff-engine";
@@ -399,7 +399,7 @@ export class ConflictDetailModal extends Modal {
     });
     keepLocalBtn.addEventListener("click", () => {
       this.close();
-      (async () => {
+      void (async () => {
         await this.plugin.syncExecutor?.resolveConflictKeepLocal(
           this.item.path,
         );
@@ -413,7 +413,7 @@ export class ConflictDetailModal extends Modal {
     });
     keepRemoteBtn.addEventListener("click", () => {
       this.close();
-      (async () => {
+      void (async () => {
         await this.plugin.syncExecutor?.resolveConflictKeepRemote(
           this.item.path,
         );
@@ -426,7 +426,7 @@ export class ConflictDetailModal extends Modal {
       text: t("syncView.conflict.skip"),
     }).addEventListener("click", () => {
       this.close();
-      (async () => {
+      void (async () => {
         await this.plugin.state?.removePendingConflict(this.item.path);
         this.onResolved?.();
       })();

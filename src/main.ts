@@ -1,5 +1,16 @@
 import { Notice, Platform, Plugin, setIcon, setTooltip, WorkspaceLeaf } from "obsidian";
 import { AuthModule, type AuthPluginContext } from "./auth/auth-module";
+import {
+  compatClearInterval,
+  compatClearTimeout,
+  compatSetInterval,
+  compatSetTimeout,
+  getConfigDir,
+  getEasySyncPaths,
+  IntervalHandle,
+  isRecord,
+  TimeoutHandle,
+} from "./obsidian-compat";
 import { OneDriveClient } from "./onedrive/client";
 import { LocalScanner } from "./sync/local-scanner";
 import { SyncEngine } from "./sync/sync-engine";
@@ -10,11 +21,9 @@ import { DiagnosticLogger } from "./sync/diagnostic-logger";
 import { EasySyncSettingTab } from "./ui/settings-tab";
 import { EasySyncSyncView, SYNC_VIEW_TYPE } from "./ui/sync-view";
 import { RIBBON_STATUS_ICONS, resolveRibbonStatus, type RibbonStatus } from "./ui/ribbon-status";
-import { ConfirmModal } from "./ui/confirm-modal";
 import { SyncPlanAlertModal } from "./ui/confirm-modal";
 import type { SyncPlan } from "./sync/types";
-import type { SyncActionType } from "./sync/types";
-import type { SyncPhase } from "./sync/sync-progress";
+import { SyncActionType } from "./sync/types";
 import { I18n } from "./i18n/index";
 
 /** Plugin data keys for sync settings */
@@ -69,10 +78,10 @@ export default class EasySyncPlugin extends Plugin {
   diagLogEnabled = false;
   autoSyncPaused = false;
   private opLock: string | null = null;
-  private autoSyncTimer: ReturnType<typeof setInterval> | null = null;
+  private autoSyncTimer: IntervalHandle | null = null;
   private statusBarEl: HTMLElement | null = null;
   private ribbonEl: HTMLElement | null = null;
-  private ribbonSuccessTimer: ReturnType<typeof setTimeout> | null = null;
+  private ribbonSuccessTimer: TimeoutHandle | null = null;
   private ribbonSuccessVisible = false;
   private settingsTab: EasySyncSettingTab | null = null;
   private stateLoadPromise: Promise<void> | null = null;
@@ -99,7 +108,7 @@ export default class EasySyncPlugin extends Plugin {
 
   async onload(): Promise<void> {
     this.diag.log("lifecycle", "====== onload start ======");
-    this.diag.setAdapter(this.app.vault.adapter);
+    this.diag.setAdapter(this.app.vault.adapter, getConfigDir(this.app.vault));
 
     // ════ ① Fast init (all synchronous / negligible I/O) ════
 
@@ -146,8 +155,12 @@ export default class EasySyncPlugin extends Plugin {
       // User profile cache: avoid network call on every cold start
       profileCache: {
         get: async () => {
-          const data = await this.loadData();
-          return data?.[KEY_PROFILE_CACHE] ?? null;
+          const data = await this.loadPluginData();
+          const cached = data?.[KEY_PROFILE_CACHE];
+          if (!isRecord(cached)) return null;
+          return typeof cached.displayName === "string" && typeof cached.accountId === "string"
+            ? { displayName: cached.displayName, accountId: cached.accountId }
+            : null;
         },
         set: async (profile) => {
           await this.updatePluginData((data) => {
@@ -162,7 +175,7 @@ export default class EasySyncPlugin extends Plugin {
       },
       diag: this.diag,
     };
-    this.auth = new AuthModule(authCtx, (key, params) => this.i18n.t(key, params as Record<string, string | number> | undefined));
+    this.auth = new AuthModule(authCtx, (key, params) => this.i18n.t(key, params));
 
     // CRITICAL: register callback BEFORE initialize() so UI updates
     // when the background token refresh completes
@@ -183,10 +196,15 @@ export default class EasySyncPlugin extends Plugin {
     };
     // Loaded in the background after UI registration so Ribbon state is accurate.
 
-    this.scanner = new LocalScanner(this.app.vault);
+    this.scanner = new LocalScanner(this.app.vault, undefined, this.manifest.id);
     this.scanner.setDiag(this.diag);
     this.applyPluginFilesSetting(); // Apply saved setting after scanner is created
-    this.onedrive = new OneDriveClient(() => this.auth!.getAccessToken(), this.diag);
+    this.onedrive = new OneDriveClient(
+      () => this.auth!.getAccessToken(),
+      this.diag,
+      getConfigDir(this.app.vault),
+      this.manifest.id,
+    );
     this.syncExecutor = new SyncExecutor(
       this.onedrive,
       this.scanner,
@@ -197,6 +215,7 @@ export default class EasySyncPlugin extends Plugin {
       this.progressStore,
       this.diag,
       this.autoMerge,
+      this.app.fileManager,
     );
 
     // ════ ④ Register UI (Obsidian is usable from here on) ════
@@ -216,19 +235,23 @@ export default class EasySyncPlugin extends Plugin {
     this.statusBarEl = this.addStatusBarItem();
     this.updateStatusBar(); // Shows "Connecting…" while auth initializes
     this.addCommand({
-      id: "easy-sync-start",
+      id: "start-sync",
       name: this.i18n.t("command.syncNow"),
-      callback: () => this.startManualSync(),
+      callback: () => {
+        void this.startManualSync();
+      },
     });
     this.addCommand({
-      id: "easy-sync-show-detail",
+      id: "show-detail",
       name: this.i18n.t("command.showDetail"),
-      callback: () => this.activateSyncView(),
+      callback: () => {
+        void this.activateSyncView();
+      },
     });
 
     // ════ ⑤ Background auth init (non-blocking) ════
 
-    this.auth.initialize().catch((e) => {
+    void this.auth.initialize().catch((e) => {
       this.diag.warn("lifecycle", "background auth init failed", e);
     });
     // onStateChange callback fires when complete → UI auto-refreshes
@@ -243,11 +266,11 @@ export default class EasySyncPlugin extends Plugin {
     this.diag.log("lifecycle", "onload complete (auth initializing in background)");
   }
 
-  async onunload(): Promise<void> {
+  onunload(): void {
     this.diag.log("lifecycle", "unloading");
     this.stopAutoSync();
-    if (this.ribbonSuccessTimer) clearTimeout(this.ribbonSuccessTimer);
-    await this.diag.dispose();
+    compatClearTimeout(this.ribbonSuccessTimer);
+    void this.diag.dispose().catch(() => undefined);
     // Auth token stays in SecretStorage across sessions
   }
 
@@ -454,14 +477,16 @@ export default class EasySyncPlugin extends Plugin {
   ): Promise<boolean> {
     const t = this.i18n.t.bind(this.i18n);
 
-    const conflictItems = plan.items.filter(i => i.type === "conflict");
+    const conflictItems = plan.items.filter((i) => i.type === SyncActionType.Conflict);
 
     const counts = {
-      uploads: plan.items.filter(i => i.type === "upload").length,
-      downloads: plan.items.filter(i => i.type === "download").length,
-      deletes: plan.items.filter(i => i.type === "deleteRemote" || i.type === "confirmLocalDelete").length,
+      uploads: plan.items.filter((i) => i.type === SyncActionType.Upload).length,
+      downloads: plan.items.filter((i) => i.type === SyncActionType.Download).length,
+      deletes: plan.items.filter((i) =>
+        i.type === SyncActionType.DeleteRemote || i.type === SyncActionType.ConfirmLocalDelete).length,
       conflicts: conflictItems.length,
-      skipped: plan.items.filter(i => i.type === "skipLargeFile" || i.type === "skipIgnoredPath").length,
+      skipped: plan.items.filter((i) =>
+        i.type === SyncActionType.SkipLargeFile || i.type === SyncActionType.SkipIgnoredPath).length,
     };
     await this.state!.setPlanReviewBundle(plan.items, counts);
 
@@ -475,7 +500,7 @@ export default class EasySyncPlugin extends Plugin {
       t("syncPlan.readyTitle"),
       t("syncPlan.readyMessage"),
       t("syncPlan.viewButton"),
-      () => this.activateSyncView(),
+      () => { void this.activateSyncView(); },
     );
     modal.open();
 
@@ -518,7 +543,7 @@ export default class EasySyncPlugin extends Plugin {
 
     const deadline = Date.now() + 30_000;
     while (this.syncExecutor.isRunning && Date.now() < deadline) {
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => compatSetTimeout(r, 100));
     }
 
     if (this.syncExecutor.isRunning) {
@@ -662,7 +687,7 @@ export default class EasySyncPlugin extends Plugin {
   startAutoSync(): void {
     this.stopAutoSync();
     if (this.syncInterval <= 0 || this.autoSyncPaused) return;
-    this.autoSyncTimer = setInterval(async () => {
+    this.autoSyncTimer = compatSetInterval(async () => {
       // Skip if auth not ready, sync already running, or lock held
       if (!this.auth?.authState.isLoggedIn) return;
       if (this.opLock !== null) return;
@@ -708,7 +733,7 @@ export default class EasySyncPlugin extends Plugin {
 
   stopAutoSync(): void {
     if (this.autoSyncTimer) {
-      clearInterval(this.autoSyncTimer);
+      compatClearInterval(this.autoSyncTimer);
       this.autoSyncTimer = null;
     }
   }
@@ -720,7 +745,7 @@ export default class EasySyncPlugin extends Plugin {
   // ---- Settings persistence ----
 
   async loadSyncSettings(): Promise<void> {
-    const data = await this.loadData();
+    const data = await this.loadPluginData();
     if (data) {
       if (typeof data[KEY_SYNC_INTERVAL] === "number") this.syncInterval = data[KEY_SYNC_INTERVAL];
       if (typeof data[KEY_SYNC_PLUGIN_FILES] === "boolean") this.syncPluginFiles = data[KEY_SYNC_PLUGIN_FILES];
@@ -745,12 +770,17 @@ export default class EasySyncPlugin extends Plugin {
    *  auth profile) mutate through this queue — no interleaved load-modify-save. */
   async updatePluginData(mutator: (data: Record<string, unknown>) => void): Promise<void> {
     const task = this.pluginDataQueue.then(async () => {
-      const data = (await this.loadData()) ?? {};
+      const data = (await this.loadPluginData()) ?? {};
       mutator(data);
       await this.saveData(data);
     });
     this.pluginDataQueue = task.catch(() => undefined);
     return task;
+  }
+
+  private async loadPluginData(): Promise<Record<string, unknown> | null> {
+    const data = await this.loadData();
+    return isRecord(data) ? data : null;
   }
 
   async saveSyncSettings(): Promise<void> {
@@ -774,37 +804,39 @@ export default class EasySyncPlugin extends Plugin {
   /** Build includePaths from all config sync toggles and apply to scanner. */
   applyPluginFilesSetting(): void {
     const paths = new Set<string>();
+    const { configDir, pluginDir } = getEasySyncPaths(this.app.vault, this.manifest.id);
+    const pluginDirPrefix = `${pluginDir}/`;
 
     // EasySync self-sync (default on)
-    if (this.syncPluginFiles) paths.add(".obsidian/plugins/easy-sync/");
+    if (this.syncPluginFiles) paths.add(pluginDirPrefix);
 
     // Editor
-    if (this.syncEditorSettings) paths.add(".obsidian/app.json");
+    if (this.syncEditorSettings) paths.add(`${configDir}/app.json`);
 
     // Appearance settings
-    if (this.syncAppearance) paths.add(".obsidian/appearance.json");
+    if (this.syncAppearance) paths.add(`${configDir}/appearance.json`);
 
     // Themes & snippets
     if (this.syncThemes) {
-      paths.add(".obsidian/themes/");
-      paths.add(".obsidian/snippets/");
+      paths.add(`${configDir}/themes/`);
+      paths.add(`${configDir}/snippets/`);
     }
 
     // Hotkeys
-    if (this.syncHotkeys) paths.add(".obsidian/hotkeys.json");
+    if (this.syncHotkeys) paths.add(`${configDir}/hotkeys.json`);
 
     // Core plugins (built-in enable states only, no code files)
-    if (this.syncCorePlugins) paths.add(".obsidian/core-plugins.json");
+    if (this.syncCorePlugins) paths.add(`${configDir}/core-plugins.json`);
 
     // Community plugins (enable list + code files, no data.json)
     if (this.syncCommunityPlugins) {
-      paths.add(".obsidian/community-plugins.json");
-      paths.add(".obsidian/plugins/");
+      paths.add(`${configDir}/community-plugins.json`);
+      paths.add(`${configDir}/plugins/`);
     }
 
     // Plugin data (data.json only)
     if (this.syncPluginData) {
-      paths.add(".obsidian/plugins/");
+      paths.add(`${configDir}/plugins/`);
     }
 
     this.scanner?.setConfig({
@@ -923,7 +955,7 @@ export default class EasySyncPlugin extends Plugin {
     lines.push("");
 
     // Transmission failures (non-skip issues)
-    const failures = issues.filter((i) => i.actionType !== "skipLargeFile");
+    const failures = issues.filter((i) => i.actionType !== SyncActionType.SkipLargeFile);
     if (failures.length > 0) {
       lines.push(`### 传输异常（${failures.length}）`);
       lines.push("");
@@ -1123,7 +1155,7 @@ export default class EasySyncPlugin extends Plugin {
   private showRibbonSuccess(): void {
     this.clearRibbonSuccess();
     this.ribbonSuccessVisible = true;
-    this.ribbonSuccessTimer = setTimeout(() => {
+    this.ribbonSuccessTimer = compatSetTimeout(() => {
       this.ribbonSuccessVisible = false;
       this.ribbonSuccessTimer = null;
       this.updateStatusBar();
@@ -1131,7 +1163,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private clearRibbonSuccess(): void {
-    if (this.ribbonSuccessTimer) clearTimeout(this.ribbonSuccessTimer);
+    compatClearTimeout(this.ribbonSuccessTimer);
     this.ribbonSuccessTimer = null;
     this.ribbonSuccessVisible = false;
   }

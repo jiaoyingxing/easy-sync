@@ -8,20 +8,18 @@
 
 import type { Vault } from "obsidian";
 import {
+  compatSetTimeout,
+  DEFAULT_CONFIG_DIR,
+  getConfigDir,
+  getEasySyncPaths,
+  isRecord,
+} from "../obsidian-compat";
+import {
   type LocalFileEntry,
   type ScanConfig,
   DEFAULT_SCAN_CONFIG,
 } from "./types";
 import type { DiagnosticLogger } from "./diagnostic-logger";
-
-const PLUGIN_ROOT = ".obsidian/plugins/";
-const EASY_SYNC_ROOT = ".obsidian/plugins/easy-sync/";
-const EASY_SYNC_DIR = EASY_SYNC_ROOT.slice(0, -1);
-const EASY_SYNC_DATA = `${EASY_SYNC_ROOT}data.json`;
-const EASY_SYNC_REMOTE_STATE = `${EASY_SYNC_ROOT}remote-state.json`;
-const EASY_SYNC_LOGS = `${EASY_SYNC_ROOT}logs`;
-const EASY_SYNC_TMP = `${EASY_SYNC_ROOT}tmp`;
-const SCAN_CACHE_FILE = `${EASY_SYNC_ROOT}scan-cache.json`;
 const SCAN_CACHE_FORMAT = 1;
 const SCAN_SLEEP_EVERY = 50;
 
@@ -33,18 +31,23 @@ const COMMUNITY_PLUGIN_CODE_FILES = new Set([
   "styles.css",
 ]);
 
-export function isEasySyncInternalPath(path: string): boolean {
-  return path === EASY_SYNC_DATA
+export function isEasySyncInternalPath(
+  path: string,
+  configDir = DEFAULT_CONFIG_DIR,
+  pluginId = "easy-sync",
+): boolean {
+  const paths = getEasySyncPaths(configDir, pluginId);
+  return path === paths.dataFile
     || (
-      path.startsWith(`${EASY_SYNC_ROOT}data.sync-conflict-`)
+      path.startsWith(`${paths.pluginDirPrefix}data.sync-conflict-`)
       && path.endsWith(".json")
     )
-    || path === EASY_SYNC_REMOTE_STATE
-    || path === SCAN_CACHE_FILE
-    || path === EASY_SYNC_LOGS
-    || path.startsWith(`${EASY_SYNC_LOGS}/`)
-    || path === EASY_SYNC_TMP
-    || path.startsWith(`${EASY_SYNC_TMP}/`);
+    || path === paths.remoteStateFile
+    || path === paths.scanCacheFile
+    || path === paths.logsDir
+    || path.startsWith(`${paths.logsDir}/`)
+    || path === paths.tmpDir
+    || path.startsWith(`${paths.tmpDir}/`);
 }
 
 /** Full SHA-256 hash of the entire file, returned as 64-char hex string */
@@ -70,15 +73,16 @@ function isBinary(content: ArrayBuffer): boolean {
 /** Check if a path should be excluded based on config.
  *  includePaths override excludePaths — a path matching any includePath is never excluded,
  *  except for plugin data.json files which would cause self-referential sync writes. */
-function isExcluded(path: string, config: ScanConfig): boolean {
-  if (isEasySyncInternalPath(path)) return true;
+function isExcluded(path: string, config: ScanConfig, configDir: string, pluginId: string): boolean {
+  const paths = getEasySyncPaths(configDir, pluginId);
+  if (isEasySyncInternalPath(path, configDir, pluginId)) return true;
 
   if (
-    path.startsWith(PLUGIN_ROOT)
-    && path !== EASY_SYNC_DIR
-    && !path.startsWith(EASY_SYNC_ROOT)
+    path.startsWith(paths.pluginRoot)
+    && path !== paths.pluginDir
+    && !path.startsWith(paths.pluginDirPrefix)
   ) {
-    const parts = path.slice(PLUGIN_ROOT.length).split("/");
+    const parts = path.slice(paths.pluginRoot.length).split("/");
     if (parts.length !== 2) return true;
     const fileName = parts[1];
     if (fileName === "data.json") return !config.includePluginData;
@@ -97,20 +101,21 @@ function isExcluded(path: string, config: ScanConfig): boolean {
   return false;
 }
 
-function isExcludedDirectory(path: string, config: ScanConfig): boolean {
+function isExcludedDirectory(path: string, config: ScanConfig, configDir: string, pluginId: string): boolean {
+  const paths = getEasySyncPaths(configDir, pluginId);
   if (
-    path === EASY_SYNC_LOGS
-    || path.startsWith(`${EASY_SYNC_LOGS}/`)
-    || path === EASY_SYNC_TMP
-    || path.startsWith(`${EASY_SYNC_TMP}/`)
+    path === paths.logsDir
+    || path.startsWith(`${paths.logsDir}/`)
+    || path === paths.tmpDir
+    || path.startsWith(`${paths.tmpDir}/`)
   ) return true;
 
   if (
-    path.startsWith(PLUGIN_ROOT)
-    && path !== EASY_SYNC_DIR
-    && !path.startsWith(EASY_SYNC_ROOT)
+    path.startsWith(paths.pluginRoot)
+    && path !== paths.pluginDir
+    && !path.startsWith(paths.pluginDirPrefix)
   ) {
-    const parts = path.slice(PLUGIN_ROOT.length).split("/");
+    const parts = path.slice(paths.pluginRoot.length).split("/");
     if (parts.length > 1) return true;
     return !config.includePluginCode && !config.includePluginData;
   }
@@ -127,6 +132,8 @@ function isExcludedDirectory(path: string, config: ScanConfig): boolean {
 export class LocalScanner {
   /** Public accessor for SyncExecutor file I/O (readBinary, writeBinary, remove, mkdir) */
   readonly vault: Vault;
+  private readonly configDir: string;
+  private config: ScanConfig;
   private diag?: DiagnosticLogger;
   private scanCache: ScanCache = { format: SCAN_CACHE_FORMAT, entries: {} };
   private scanCacheLoaded = false;
@@ -134,9 +141,14 @@ export class LocalScanner {
 
   constructor(
     vault: Vault,
-    private config: ScanConfig = DEFAULT_SCAN_CONFIG,
+    config: ScanConfig = DEFAULT_SCAN_CONFIG,
+    private pluginId = "easy-sync",
   ) {
     this.vault = vault;
+    this.configDir = getConfigDir(vault);
+    this.config = { ...DEFAULT_SCAN_CONFIG, ...config };
+    this.config.excludePaths = config.excludePaths
+      ?? [`${this.configDir}/`, ...DEFAULT_SCAN_CONFIG.excludePaths];
   }
 
   setDiag(diag: DiagnosticLogger): void {
@@ -152,18 +164,35 @@ export class LocalScanner {
   }
 
   shouldSyncPath(path: string): boolean {
-    return !isExcluded(path, this.config);
+    return !isExcluded(path, this.config, this.configDir, this.pluginId);
   }
 
   // ---- Scan Cache ----
 
   private async loadScanCache(): Promise<void> {
     if (this.scanCacheLoaded) return;
+    const { scanCacheFile } = getEasySyncPaths(this.configDir, this.pluginId);
     try {
-      const json = await this.vault.adapter.read(SCAN_CACHE_FILE);
+      const json = await this.vault.adapter.read(scanCacheFile);
       const parsed = JSON.parse(json);
-      if (parsed && parsed.format === SCAN_CACHE_FORMAT && parsed.entries) {
-        this.scanCache = parsed;
+      if (
+        isRecord(parsed)
+        && parsed.format === SCAN_CACHE_FORMAT
+        && isRecord(parsed.entries)
+      ) {
+        this.scanCache = {
+          format: SCAN_CACHE_FORMAT,
+          entries: Object.fromEntries(
+            Object.entries(parsed.entries).filter((entry): entry is [string, ScanCacheEntry] => {
+              const value = entry[1];
+              return isRecord(value)
+                && typeof value.mtime === "number"
+                && typeof value.size === "number"
+                && typeof value.hash === "string"
+                && typeof value.binary === "boolean";
+            }),
+          ),
+        };
       }
     } catch {
       this.scanCache = { format: SCAN_CACHE_FORMAT, entries: {} };
@@ -174,8 +203,9 @@ export class LocalScanner {
 
   private async saveScanCache(): Promise<void> {
     if (!this.scanCacheDirty) return;
+    const { scanCacheFile } = getEasySyncPaths(this.configDir, this.pluginId);
     try {
-      await this.vault.adapter.write(SCAN_CACHE_FILE, JSON.stringify(this.scanCache));
+      await this.vault.adapter.write(scanCacheFile, JSON.stringify(this.scanCache));
       this.scanCacheDirty = false;
     } catch {
       // Best-effort — losing the cache is a perf regression, not data loss
@@ -186,7 +216,8 @@ export class LocalScanner {
     this.scanCache = { format: SCAN_CACHE_FORMAT, entries: {} };
     this.scanCacheLoaded = true;
     this.scanCacheDirty = false;
-    try { await this.vault.adapter.remove(SCAN_CACHE_FILE); } catch { /* ok */ }
+    const { scanCacheFile } = getEasySyncPaths(this.configDir, this.pluginId);
+    try { await this.vault.adapter.remove(scanCacheFile); } catch { /* ok */ }
   }
 
   private cacheProbe(path: string, mtime: number, size: number): ScanCacheEntry | null {
@@ -249,7 +280,7 @@ export class LocalScanner {
       const path = file.path;
       scannedPaths.add(path);
 
-      if (isExcluded(path, this.config)) {
+      if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
         continue;
       }
 
@@ -290,7 +321,7 @@ export class LocalScanner {
     // ── IncludePaths enumeration ──
     this.diag?.log("scan", `includePaths: [${this.config.includePaths.join(', ')}], excludePaths: [${this.config.excludePaths.join(', ')}]`);
     await this.scanIncludePaths(entries, skippedLarge, failedPaths, scannedPaths, scannedDirs);
-    const pluginEntries = entries.filter(e => e.path.startsWith('.obsidian/'));
+    const pluginEntries = entries.filter((e) => e.path.startsWith(`${this.configDir}/`));
     this.diag?.log("scan", `scanAll done — ${entries.length} entries (${pluginEntries.length} plugin), ${skippedLarge.length} skipped-large, ${failedPaths.length} failed`);
     // ponytail: only log the count — full path listing is verbose and rarely useful
 
@@ -307,7 +338,7 @@ export class LocalScanner {
   }
 
   /** Enumerate paths listed in config.includePaths that are NOT
-   *  covered by vault.getFiles() (i.e. .obsidian/ sub-trees).
+   *  covered by vault.getFiles() (for example config-dir subtrees).
    *
    *  Directory paths (ending with /) are scanned recursively;
    *  single file paths are scanned directly. */
@@ -327,8 +358,8 @@ export class LocalScanner {
     }
   }
 
-  /** Scan a single file path (not a directory). Used for includePaths like
-   *  ".obsidian/app.json" that point to individual config files. */
+  /** Scan a single file path (not a directory). Used for includePaths that
+   *  point to individual config files inside the vault config dir. */
   private async scanSinglePath(
     filePath: string,
     entries: LocalFileEntry[],
@@ -339,7 +370,7 @@ export class LocalScanner {
     if (scannedPaths.has(filePath)) return;
     scannedPaths.add(filePath);
 
-    if (isExcluded(filePath, this.config)) return;
+    if (isExcluded(filePath, this.config, this.configDir, this.pluginId)) return;
 
     const stat = await this.vault.adapter.stat(filePath);
     if (!stat) {
@@ -387,7 +418,7 @@ export class LocalScanner {
   ): Promise<void> {
     // Normalize: strip trailing slash(es) so path construction is clean
     const base = dirPath.replace(/\/+$/, "");
-    if (scannedDirs.has(base) || isExcludedDirectory(base, this.config)) return;
+    if (scannedDirs.has(base) || isExcludedDirectory(base, this.config, this.configDir, this.pluginId)) return;
     scannedDirs.add(base);
 
     let listed: { files: string[]; folders: string[] };
@@ -404,7 +435,7 @@ export class LocalScanner {
       if (scannedPaths.has(path)) continue;
       scannedPaths.add(path);
 
-      if (isExcluded(path, this.config)) {
+      if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
         if (path.endsWith("/data.json")) {
           this.diag?.log("scan", `isExcluded("${path}") → true (/data.json, self-referential protection)`);
         }
@@ -449,7 +480,7 @@ export class LocalScanner {
   }
 
   async scanFile(path: string): Promise<LocalFileEntry | null> {
-    if (isExcluded(path, this.config)) return null;
+    if (isExcluded(path, this.config, this.configDir, this.pluginId)) return null;
 
     const stat = await this.vault.adapter.stat(path);
     if (!stat || stat.size > this.config.maxFileSize) return null;
@@ -478,5 +509,5 @@ function normalizeListedPath(base: string, entry: string): string {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => compatSetTimeout(resolve, ms));
 }

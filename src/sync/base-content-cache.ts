@@ -10,6 +10,7 @@
  */
 
 import type { DataAdapter } from "obsidian";
+import { isRecord } from "../obsidian-compat";
 
 /** File extensions considered text for caching. Not exhaustive — covers vault content. */
 const TEXT_EXTENSIONS = new Set([
@@ -105,8 +106,14 @@ export class BaseContentCache {
   async load(adapter: DataAdapter, pluginDir: string): Promise<void> {
     try {
       const raw = await adapter.read(`${pluginDir}/${CACHE_FILE}`);
-      const parsed: Record<string, string> = JSON.parse(raw);
-      this.store = new Map(Object.entries(parsed));
+      const parsed = JSON.parse(raw);
+      this.store = isRecord(parsed)
+        ? new Map(
+          Object.entries(parsed).filter(
+            (entry): entry is [string, string] => typeof entry[1] === "string",
+          ),
+        )
+        : new Map();
     } catch {
       // File doesn't exist or is corrupt — start with empty cache
       this.store = new Map();

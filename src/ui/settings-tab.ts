@@ -70,8 +70,8 @@ export class EasySyncSettingTab extends PluginSettingTab {
         .setDesc(t("settings.diagReport.desc"))
         .addButton((btn) => {
           btn.setButtonText(t("settings.diagReport.generate"))
-            .onClick(async () => {
-              await this.plugin.generateDiagnosticReport();
+            .onClick(() => {
+              void this.plugin.generateDiagnosticReport();
             });
         });
     });
@@ -81,24 +81,26 @@ export class EasySyncSettingTab extends PluginSettingTab {
         .setName(t("settings.reset.name"))
         .setDesc(t("settings.reset.desc"))
         .addButton((btn) => {
-          btn.setWarning();
-          btn.setButtonText(t("settings.reset.button")).onClick(async () => {
-            const confirmed = await new ConfirmModal(
-              this.plugin.app,
-              t("settings.reset.confirmTitle"),
-              null,
-              t("settings.reset.confirm"),
-              t("confirm.cancel"),
-              t,
-              {
-                message: t("settings.reset.confirmMessage"),
-                warning: t("settings.reset.confirmWarning"),
-                danger: true,
-              },
-            ).awaitConfirm();
-            if (!confirmed) return;
-            await this.plugin.resetSyncState();
-            this.refreshSyncSection();
+          btn.setDestructive();
+          btn.setButtonText(t("settings.reset.button")).onClick(() => {
+            void (async () => {
+              const confirmed = await new ConfirmModal(
+                this.plugin.app,
+                t("settings.reset.confirmTitle"),
+                null,
+                t("settings.reset.confirm"),
+                t("confirm.cancel"),
+                t,
+                {
+                  message: t("settings.reset.confirmMessage"),
+                  warning: t("settings.reset.confirmWarning"),
+                  danger: true,
+                },
+              ).awaitConfirm();
+              if (!confirmed) return;
+              await this.plugin.resetSyncState();
+              this.refreshSyncSection();
+            })();
           });
         });
     });
@@ -186,13 +188,15 @@ export class EasySyncSettingTab extends PluginSettingTab {
               hasCompletedSync
                 ? t("settings.firstSync.sync")
                 : t("settings.firstSync.start"),
-            ).onClick(async () => {
-              if (hasCompletedSync) {
-                await this.plugin.startManualSync?.();
-              } else {
-                await this.plugin.startFirstSync?.();
-              }
-              this.refreshSyncSection();
+            ).onClick(() => {
+              void (async () => {
+                if (hasCompletedSync) {
+                  await this.plugin.startManualSync?.();
+                } else {
+                  await this.plugin.startFirstSync?.();
+                }
+                this.refreshSyncSection();
+              })();
             });
           });
       });
@@ -242,7 +246,6 @@ export class EasySyncSettingTab extends PluginSettingTab {
             slider
               .setLimits(3, 10, 1)
               .setValue(this.plugin.syncInterval)
-              .setDynamicTooltip()
               .onChange(async (value) => {
                 this.plugin.syncInterval = value;
                 await this.plugin.saveSyncSettings();
@@ -264,10 +267,9 @@ export class EasySyncSettingTab extends PluginSettingTab {
         .setDesc(t("settings.maxFileSize.desc", { size: `${this.plugin.syncMaxFileSizeMb} MB` }))
         .addSlider((slider) => {
           slider
-            .setLimits(200, 2000, 100)
-            .setValue(this.plugin.syncMaxFileSizeMb)
-            .setDynamicTooltip()
-            .onChange(async (value) => {
+              .setLimits(200, 2000, 100)
+              .setValue(this.plugin.syncMaxFileSizeMb)
+              .onChange(async (value) => {
               this.plugin.syncMaxFileSizeMb = value;
               await this.plugin.saveSyncSettings();
               this.plugin.applyMaxFileSize();
@@ -316,53 +318,59 @@ export class EasySyncSettingTab extends PluginSettingTab {
         if (this.plugin.auth?.isInitializing) {
           btn.setButtonText(t("settings.account.checking")).setDisabled(true);
         } else if (this.plugin.auth?.authState.isLoggedIn) {
-          btn.setButtonText(t("settings.account.logout")).onClick(async () => {
-            await this.plugin.logoutUser();
-            this.refreshAuthState();
+          btn.setButtonText(t("settings.account.logout")).onClick(() => {
+            void (async () => {
+              await this.plugin.logoutUser();
+              this.refreshAuthState();
+            })();
           });
         } else if (this.plugin.auth?.isPending) {
           btn
             .setButtonText(t("settings.account.checking"))
             .setCta()
-            .onClick(async () => {
-              if (this.plugin.auth?.checkAuthStatus()) {
-                this.refreshAuthState();
-                return;
-              }
-              const modal = new AuthPendingModal(
-                this.plugin.app,
-                t("settings.account.pendingTitle"),
-                t("settings.account.pendingMessage"),
-                t("settings.account.recheck"),
-                t("settings.account.reopenAuth"),
-              );
-              const result = await modal.awaitAction();
-              if (result.action === "recheck") {
+            .onClick(() => {
+              void (async () => {
                 if (this.plugin.auth?.checkAuthStatus()) {
-                  new Notice(t("settings.account.loginSuccess"));
-                } else {
-                  new Notice(t("settings.account.desc.pending"));
+                  this.refreshAuthState();
+                  return;
                 }
-              } else if (result.action === "reopen") {
-                try {
-                  await this.plugin.auth?.login();
-                } catch (e) {
-                  console.error("EasySync: login error:", e);
+                const modal = new AuthPendingModal(
+                  this.plugin.app,
+                  t("settings.account.pendingTitle"),
+                  t("settings.account.pendingMessage"),
+                  t("settings.account.recheck"),
+                  t("settings.account.reopenAuth"),
+                );
+                const result = await modal.awaitAction();
+                if (result.action === "recheck") {
+                  if (this.plugin.auth?.checkAuthStatus()) {
+                    new Notice(t("settings.account.loginSuccess"));
+                  } else {
+                    new Notice(t("settings.account.desc.pending"));
+                  }
+                } else if (result.action === "reopen") {
+                  try {
+                    await this.plugin.auth?.login();
+                  } catch (error) {
+                    console.error("EasySync: login error:", error);
+                  }
                 }
-              }
-              this.refreshAuthState();
+                this.refreshAuthState();
+              })();
             });
         } else {
           btn
             .setButtonText(t("settings.account.login"))
             .setCta()
-            .onClick(async () => {
-              try {
-                await this.plugin.auth?.login();
-              } catch (e) {
-                console.error("EasySync: login error:", e);
-              }
-              this.refreshAuthState();
+            .onClick(() => {
+              void (async () => {
+                try {
+                  await this.plugin.auth?.login();
+                } catch (error) {
+                  console.error("EasySync: login error:", error);
+                }
+                this.refreshAuthState();
+              })();
             });
         }
       });

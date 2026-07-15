@@ -10,13 +10,14 @@
  */
 
 import type { DataAdapter } from "obsidian";
+import { getPluginDir } from "../obsidian-compat";
 import { retainFileProgress, type FileProgress } from "./sync-progress";
 
 /** M14: minimal plugin-data store contract — EasySyncPlugin satisfies this. */
 export interface PluginDataStore {
   loadData(): Promise<Record<string, unknown>>;
   updatePluginData(mutator: (data: Record<string, unknown>) => void): Promise<void>;
-  app: { vault: { adapter: DataAdapter } };
+  app: { vault: { adapter: DataAdapter; configDir: string } };
   manifest: { dir?: string; id: string };
 }
 import {
@@ -27,7 +28,7 @@ import {
   type PlanReviewCounts,
   type PlanReviewItem,
   type RemoteSyncState,
-  type SyncActionType,
+  SyncActionType,
   planDigest,
 } from "./types";
 import { BaseContentCache } from "./base-content-cache";
@@ -130,7 +131,7 @@ function createDefaultData(generation = 0): PluginData {
     [KEY_SYNC_HISTORY]: [],
     [KEY_GENERATION]: generation,
     [KEY_BOUND_ACCOUNT]: "",
-  } as PluginData;
+  };
 }
 
 export class StateManager {
@@ -190,8 +191,9 @@ export class StateManager {
   private save(): Promise<void> {
     const snapshot = { ...this.data };
     const saveTask = this.plugin.updatePluginData((data) => {
+      const snapshotRecord = snapshot as Record<string, unknown>;
       for (const key of Object.keys(snapshot)) {
-        (data as Record<string, unknown>)[key] = (snapshot as unknown as Record<string, unknown>)[key];
+        data[key] = snapshotRecord[key];
       }
     }).then(async () => {
       // Independently-owned file — not part of PluginData
@@ -205,7 +207,7 @@ export class StateManager {
 
   private get pluginDir(): string {
     return this.plugin.manifest.dir
-      ?? `.obsidian/plugins/${this.plugin.manifest.id}`;
+      ?? getPluginDir(this.plugin.app.vault, this.plugin.manifest.id);
   }
 
   private async loadRemoteState(): Promise<RemoteSyncState | null> {
@@ -554,8 +556,8 @@ export class StateManager {
     items: SyncPlanItem[],
     counts: PlanReviewCounts,
   ): Promise<void> {
-    const conflicts = items.filter((item) => item.type === "conflict");
-    const deletes = items.filter((item) => item.type === "confirmLocalDelete");
+    const conflicts = items.filter((item) => item.type === SyncActionType.Conflict);
+    const deletes = items.filter((item) => item.type === SyncActionType.ConfirmLocalDelete);
     this.data[KEY_PENDING_CONFLICTS] = upsertPlanItems(
       this.data[KEY_PENDING_CONFLICTS],
       conflicts,

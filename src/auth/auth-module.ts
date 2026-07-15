@@ -12,6 +12,11 @@
  */
 
 import {
+  compatClearInterval,
+  compatSetInterval,
+  IntervalHandle,
+} from "../obsidian-compat";
+import {
   requestUrl,
   type RequestUrlResponse,
 } from "obsidian";
@@ -24,7 +29,7 @@ import {
   MS_AUTH_CONFIG,
   SS_REFRESH_TOKEN,
 } from "./types";
-import { generateCodeVerifier, generateCodeChallenge, generateCodeChallengeSync, generateState } from "./pkce";
+import { generateCodeVerifier, generateCodeChallengeSync, generateState } from "./pkce";
 import type { DiagnosticLogger } from "../sync/diagnostic-logger";
 
 /** Minimal interface for the Obsidian plugin context used by auth */
@@ -83,7 +88,7 @@ export class AuthModule {
   private _initializing = false;
 
   /** Polling timer for auto-detecting OAuth callback completion */
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private pollTimer: IntervalHandle | null = null;
 
   /** Callback when auth state changes */
   private onChange: (() => void) | null = null;
@@ -147,7 +152,7 @@ export class AuthModule {
   /** Start auto-polling for OAuth callback completion (every 3 seconds) */
   private startPolling(): void {
     this.stopPolling();
-    this.pollTimer = setInterval(() => {
+    this.pollTimer = compatSetInterval(() => {
       if (this.state.isLoggedIn) {
         // Auth completed — stop polling and refresh UI
         this.stopPolling();
@@ -167,7 +172,7 @@ export class AuthModule {
 
   private stopPolling(): void {
     if (this.pollTimer) {
-      clearInterval(this.pollTimer);
+      compatClearInterval(this.pollTimer);
       this.pollTimer = null;
     }
   }
@@ -394,7 +399,7 @@ export class AuthModule {
       this.state.isLoggedIn = true;
 
       return this.accessToken;
-    } catch (e) {
+    } catch {
       this.state.isLoggedIn = false;
       this.notifyChange();
       throw new AuthError(
@@ -483,7 +488,7 @@ export class AuthModule {
       );
     }
 
-    return response.json as unknown as TokenResponse;
+    return response.json as TokenResponse;
   }
 
   /** Get the stored refresh token from SecretStorage */

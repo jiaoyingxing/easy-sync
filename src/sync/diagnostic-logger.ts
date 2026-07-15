@@ -4,13 +4,21 @@
  * Three outputs:
  *   1. Console  — `[EasySync|category] HH:MM:SS message`
  *   2. Memory   — Ring buffer (5000 entries max)
- *   3. Disk     — JSONL file at .obsidian/plugins/easy-sync/logs/YYYY-MM-DD.jsonl
+ *   3. Disk     — JSONL files under the EasySync log directory in the vault config dir
  *
  * warn/error level entries always emit regardless of category enablement.
- * Log files are NOT synced (stored under .obsidian/ which is excluded from sync).
+ * Log files are NOT synced (stored under the vault config dir, which sync excludes).
  */
 
 import type { DataAdapter } from "obsidian";
+import {
+  compatClearTimeout,
+  compatSetTimeout,
+  DEFAULT_CONFIG_DIR,
+  getEasySyncPaths,
+  isRecord,
+  TimeoutHandle,
+} from "../obsidian-compat";
 
 export type DiagCategory =
   | "scan"       // 本地扫描
@@ -40,19 +48,19 @@ const MAX_LOG_DAYS = 7;
 const MAX_LOG_BYTES = 30 * 1024 * 1024;
 const MAX_LOG_FILE_BYTES = 5 * 1024 * 1024;
 const FLUSH_INTERVAL_MS = 5000;
-const LOG_DIR = ".obsidian/plugins/easy-sync/logs";
-
 export class DiagnosticLogger {
   private enabled = new Set<DiagCategory>();
   private buffer: DiagEntry[] = [];
   private pending: DiagEntry[] = [];
-  private timer: ReturnType<typeof setTimeout> | null = null;
+  private timer: TimeoutHandle | null = null;
   private adapter: DataAdapter | null = null;
+  private logDir = getEasySyncPaths(DEFAULT_CONFIG_DIR).logsDir;
   private lastPruneDate: string | null = null;
 
   /** Must be called after the Obsidian vault adapter is available. */
-  setAdapter(adapter: DataAdapter): void {
+  setAdapter(adapter: DataAdapter, configDir: string): void {
     this.adapter = adapter;
+    this.logDir = `${configDir}/plugins/easy-sync/logs`;
   }
 
   /** Enable all categories. Called when the user turns on diagnostic logging. */
@@ -112,7 +120,9 @@ export class DiagnosticLogger {
     // 3. Queue for batched disk flush
     this.pending.push(e);
     if (!this.timer) {
-      this.timer = setTimeout(() => this.flush(), FLUSH_INTERVAL_MS);
+      this.timer = compatSetTimeout(() => {
+        void this.flush();
+      }, FLUSH_INTERVAL_MS);
     }
   }
 
@@ -127,18 +137,18 @@ export class DiagnosticLogger {
     const text = batch.map((e) => JSON.stringify(e)).join("\n") + "\n";
 
     try {
-      await ensureDir(this.adapter, LOG_DIR);
+      await ensureDir(this.adapter, this.logDir);
 
       // Pick the current segment, rolling if the file exceeds the single-file cap
       let seg = 0;
-      let path = `${LOG_DIR}/${today}.jsonl`;
+      let path = `${this.logDir}/${today}.jsonl`;
       while (seg < 99) {
         try {
           const st = await this.adapter.stat(path);
           if (!st || st.size + text.length <= MAX_LOG_FILE_BYTES) break;
         } catch { break; }
         seg++;
-        path = `${LOG_DIR}/${today}.${seg}.jsonl`;
+        path = `${this.logDir}/${today}.${seg}.jsonl`;
       }
 
       if (await this.adapter.exists(path)) {
@@ -148,7 +158,7 @@ export class DiagnosticLogger {
       }
       // Prune daily; always run after write to enforce byte limits
       if (this.lastPruneDate !== today) {
-        await pruneLogs(this.adapter, LOG_DIR, MAX_LOG_DAYS, MAX_LOG_BYTES);
+        await pruneLogs(this.adapter, this.logDir, MAX_LOG_DAYS, MAX_LOG_BYTES);
         this.lastPruneDate = today;
       }
     } catch {
@@ -159,7 +169,7 @@ export class DiagnosticLogger {
   /** Force flush pending entries to disk. Call on plugin unload. */
   async dispose(): Promise<void> {
     if (this.timer) {
-      clearTimeout(this.timer);
+      compatClearTimeout(this.timer);
       this.timer = null;
     }
     await this.flush();
@@ -174,7 +184,7 @@ export class DiagnosticLogger {
    *  Called before reading snapshot so the report includes the latest events. */
   async forceFlush(): Promise<void> {
     if (this.timer) {
-      clearTimeout(this.timer);
+      compatClearTimeout(this.timer);
       this.timer = null;
     }
     await this.flush();
@@ -214,7 +224,7 @@ export class DiagnosticLogger {
     try {
       let listed: { files: string[] };
       try {
-        listed = await this.adapter.list(LOG_DIR);
+        listed = await this.adapter.list(this.logDir);
       } catch {
         return this.buffer.slice(-count);
       }
@@ -235,8 +245,26 @@ export class DiagnosticLogger {
             if (!trimmed) continue;
             try {
               const parsed = JSON.parse(trimmed);
-              if (typeof parsed.ts === "number" && typeof parsed.msg === "string") {
-                entries.push(parsed as DiagEntry);
+              if (
+                isRecord(parsed)
+                && typeof parsed.ts === "number"
+                && typeof parsed.msg === "string"
+                && (parsed.cat === "scan"
+                  || parsed.cat === "plan"
+                  || parsed.cat === "execute"
+                  || parsed.cat === "auth"
+                  || parsed.cat === "onedrive"
+                  || parsed.cat === "state"
+                  || parsed.cat === "lifecycle")
+                && (parsed.lvl === "log" || parsed.lvl === "warn" || parsed.lvl === "error")
+              ) {
+                entries.push({
+                  ts: parsed.ts,
+                  cat: parsed.cat,
+                  lvl: parsed.lvl,
+                  msg: parsed.msg,
+                  data: parsed.data,
+                });
               }
             } catch {
               // Skip malformed lines

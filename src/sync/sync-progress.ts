@@ -10,7 +10,7 @@
  * render loop reads each time it fires.
  */
 
-import type { SyncActionType } from "./types";
+import { SyncActionType } from "./types";
 
 /** High-level phase the sync is currently in */
 export type SyncPhase =
@@ -180,19 +180,19 @@ export class SyncProgressStore {
   /** Map a SyncActionType to a FileProgress status string */
   static actionToStatus(type: SyncActionType): FileProgress["status"] {
     switch (type) {
-      case "upload":
+      case SyncActionType.Upload:
         return "upload";
-      case "download":
+      case SyncActionType.Download:
         return "download";
-      case "deleteRemote":
+      case SyncActionType.DeleteRemote:
         return "delete";
-      case "renameRemote":
+      case SyncActionType.RenameRemote:
         return "upload";
-      case "conflict":
-      case "confirmLocalDelete":
+      case SyncActionType.Conflict:
+      case SyncActionType.ConfirmLocalDelete:
         return "conflict";
-      case "skipLargeFile":
-      case "skipIgnoredPath":
+      case SyncActionType.SkipLargeFile:
+      case SyncActionType.SkipIgnoredPath:
         return "skip";
       default:
         return "error";

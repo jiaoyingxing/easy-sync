@@ -11,6 +11,14 @@
 
 import { requestUrl, type DataAdapter, type RequestUrlResponse } from "obsidian";
 import {
+  compatClearTimeout,
+  compatSetTimeout,
+  DEFAULT_CONFIG_DIR,
+  getEasySyncPaths,
+  isRecord,
+  isStringRecord,
+} from "../obsidian-compat";
+import {
   type DriveItem,
   type DeltaResponse,
   type UploadResult,
@@ -40,7 +48,7 @@ const MAX_CHUNK_SIZE = 60 * 1024 * 1024;
 const TARGET_CHUNKS_PER_FILE = 20;
 
 /** Pick chunk size so large files finish in ~20 round-trips.
- *  Must be a multiple of 320 KiB (Graph API requirement for non-final chunks). */
+ *  Must be a multiple of 320 KiB (Graph API requirement for non-final chunks). */
 function calculateChunkSize(fileSize: number): number {
     const target = Math.floor(fileSize / TARGET_CHUNKS_PER_FILE);
     const aligned = Math.ceil(
@@ -90,6 +98,8 @@ export class OneDriveClient {
   constructor(
     private getToken: TokenProvider,
     private diag?: DiagnosticLogger,
+    private configDir = DEFAULT_CONFIG_DIR,
+    private pluginId = "easy-sync",
   ) {}
 
   setAbortSignal(signal: AbortSignal | null): void {
@@ -215,10 +225,11 @@ export class OneDriveClient {
 
   private async hasNonBootstrapContent(storageVaultName: string): Promise<boolean> {
     const filesPath = APP_FOLDER_PATHS.filesDir(storageVaultName);
+    const { configDir } = getEasySyncPaths(this.configDir, this.pluginId);
     const levels = [
-      { path: filesPath, allowed: ".obsidian" },
-      { path: `${filesPath}/.obsidian`, allowed: "plugins" },
-      { path: `${filesPath}/.obsidian/plugins`, allowed: "easy-sync" },
+      { path: filesPath, allowed: configDir },
+      { path: `${filesPath}/${configDir}`, allowed: "plugins" },
+      { path: `${filesPath}/${configDir}/plugins`, allowed: this.pluginId },
     ];
 
     for (const level of levels) {
@@ -454,8 +465,9 @@ export class OneDriveClient {
             remainingMs(),
             this.abortSignal,
           );
-        } catch (err) {
-          if (isAbortError(err)) throw err;
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          let err = error;
           // fetch CORS/network error → fall back to requestUrl
           if (err instanceof TypeError || (err as { status?: number }).status === 0) {
             try {
@@ -713,8 +725,9 @@ export class OneDriveClient {
             remainingMs(),
             this.abortSignal,
           );
-        } catch (err) {
-          if (isAbortError(err)) throw err;
+        } catch (error) {
+          if (isAbortError(error)) throw error;
+          let err = error;
           if (err instanceof TypeError || (err as { status?: number }).status === 0) {
             try {
               throwIfAborted(this.abortSignal);
@@ -1388,12 +1401,12 @@ export class OneDriveClient {
   private toRequestError(rawError: unknown, url: string): OneDriveError {
     // Obsidian's requestUrl throws on non-2xx. The error object carries
     // status, headers, and sometimes json/text from the response.
-    const errAny = rawError as Record<string, unknown>;
+    const errAny = isRecord(rawError) ? rawError : {};
     const errStatus = typeof errAny.status === "number" ? errAny.status : 0;
-    const errHeaders = (errAny.headers as Record<string, string>) ?? {};
+    const errHeaders = isStringRecord(errAny.headers) ? errAny.headers : {};
     let graphBody: Record<string, unknown> | undefined;
-    if (errAny.json) {
-      graphBody = errAny.json as Record<string, unknown>;
+    if (isRecord(errAny.json)) {
+      graphBody = errAny.json;
     } else if (errAny.text && typeof errAny.text === "string") {
       try { graphBody = JSON.parse(errAny.text); } catch { /* not JSON */ }
     }
@@ -1546,12 +1559,6 @@ function downloadTimeoutError(filePath: string): OneDriveError {
   );
 }
 
-function isDownloadTimeoutError(error: unknown): error is OneDriveError {
-  return error instanceof OneDriveError
-    && error.type === OneDriveErrorType.NetworkError
-    && error.message.startsWith("Download timed out for:");
-}
-
 function isRequestTimeoutError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith("Request timed out after ");
 }
@@ -1643,18 +1650,18 @@ function sanitizeUrl(url: string): string {
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(
+    const timer = compatSetTimeout(
       () => reject(new Error(`Request timed out after ${ms}ms`)),
       ms,
     );
     promise.then(
       (value) => {
-        clearTimeout(timer);
+        compatClearTimeout(timer);
         resolve(value);
       },
       (error) => {
-        clearTimeout(timer);
-        reject(error);
+        compatClearTimeout(timer);
+        reject(toErrorLike(error));
       },
     );
   });
@@ -1676,27 +1683,43 @@ function withAbortableTimeout<T>(
         outerSignal.addEventListener("abort", onAbort, { once: true });
       }
     }
-    const timer = setTimeout(() => {
+    const timer = compatSetTimeout(() => {
       timedOut = true;
       controller.abort();
     }, ms);
     run(controller.signal).then(
       (value) => {
-        clearTimeout(timer);
+        compatClearTimeout(timer);
         outerSignal?.removeEventListener("abort", onAbort);
         resolve(value);
       },
       (error) => {
-        clearTimeout(timer);
+        compatClearTimeout(timer);
         outerSignal?.removeEventListener("abort", onAbort);
         if (timedOut && isAbortError(error)) {
           reject(new Error(`Request timed out after ${ms}ms`));
           return;
         }
-        reject(error);
+        reject(toErrorLike(error));
       },
     );
   });
+}
+
+function browserFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  if (typeof window === "undefined") {
+    throw new TypeError("fetch unavailable");
+  }
+  const fetchFn = window["fetch"]?.bind(window) ?? globalThis["fetch"]?.bind(globalThis);
+  if (!fetchFn) throw new TypeError("fetch unavailable");
+  return fetchFn(input, init);
+}
+
+function toErrorLike(error: unknown): Error {
+  if (error instanceof Error) return error;
+  const wrapped = new Error(String(error));
+  if (isRecord(error)) Object.assign(wrapped, error);
+  return wrapped;
 }
 
 function isTransientRequestError(error: OneDriveError): boolean {
@@ -1892,7 +1915,7 @@ function throwIfAborted(signal: AbortSignal | null | undefined): void {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve) => compatSetTimeout(resolve, ms));
 }
 
 function responseToText(response: RequestUrlResponse): string {
@@ -1927,9 +1950,7 @@ async function uploadChunkFetch(
   signal?: AbortSignal,
 ): Promise<RequestUrlResponse> {
   // In Node.js (test), fall through to requestUrl — fetch with fake timers hangs.
-  if (typeof window === "undefined") throw new TypeError("not browser");
-
-  const res = await fetch(uploadUrl, {
+  const res = await browserFetch(uploadUrl, {
     method: "PUT",
     headers: {
       "Content-Range": `bytes ${start}-${end}/${total}`,
@@ -2089,8 +2110,7 @@ async function contentUrlFetch(
   onProgress?: (downloaded: number, total: number) => void,
   signal?: AbortSignal,
 ): Promise<RequestUrlResponse> {
-  if (typeof window === "undefined") throw new TypeError("not browser");
-  const res = await fetch(url, {
+  const res = await browserFetch(url, {
     method: "GET",
     headers: { Authorization: `Bearer ${token}` },
     cache: "no-store",
@@ -2109,8 +2129,7 @@ async function contentUrlFetchToBinaryFile(
   onProgress?: (downloaded: number, total: number) => void,
   signal?: AbortSignal,
 ): Promise<DownloadToPathResult> {
-  if (typeof window === "undefined") throw new TypeError("not browser");
-  const res = await fetch(url, {
+  const res = await browserFetch(url, {
     method: "GET",
     headers: { Authorization: `Bearer ${token}` },
     cache: "no-store",
@@ -2128,8 +2147,7 @@ async function downloadUrlFetch(
   onProgress?: (downloaded: number, total: number) => void,
   signal?: AbortSignal,
 ): Promise<RequestUrlResponse> {
-  if (typeof window === "undefined") throw new TypeError("not browser");
-  const res = await fetch(url, { cache: "no-store", signal });
+  const res = await browserFetch(url, { cache: "no-store", signal });
   const buf = await readResponseBuffer(res, onProgress, signal);
   return { arrayBuffer: buf, status: res.status, headers: {} } as RequestUrlResponse;
 }
@@ -2142,7 +2160,6 @@ async function downloadUrlFetchToBinaryFile(
   onProgress?: (downloaded: number, total: number) => void,
   signal?: AbortSignal,
 ): Promise<DownloadToPathResult> {
-  if (typeof window === "undefined") throw new TypeError("not browser");
-  const res = await fetch(url, { cache: "no-store", signal });
+  const res = await browserFetch(url, { cache: "no-store", signal });
   return streamResponseToBinaryFile(res, adapter, path, expectedSha256, onProgress, signal);
 }

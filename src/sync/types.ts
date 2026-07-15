@@ -114,14 +114,14 @@ export interface ScanConfig {
   includePaths: string[];
   /** Maximum file size in bytes (default 100MB) */
   maxFileSize: number;
-  /** Include community plugin code files under .obsidian/plugins/. */
+  /** Include community plugin code files under the vault config dir plugin area. */
   includePluginCode?: boolean;
-  /** Include community plugin data.json files under .obsidian/plugins/. */
+  /** Include community plugin data.json files under the vault config dir plugin area. */
   includePluginData?: boolean;
 }
 
 export const DEFAULT_SCAN_CONFIG: ScanConfig = {
-  excludePaths: [".obsidian/", ".trash/", ".DS_Store", "Thumbs.db"],
+  excludePaths: [".trash/", ".DS_Store", "Thumbs.db"],
   // M19: EasySync self-sync default OFF. Explicit opt-in via syncOwnPlugin setting
   // with anti-downgrade protection (manifest.json version comparison).
   includePaths: [],
