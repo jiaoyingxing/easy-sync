@@ -1,5 +1,7 @@
 # EasySync
 
+Language: English | [简体中文](README-zh.md)
+
 **Two-way OneDrive sync for Obsidian. Conflicts don't get silently resolved. Works on mobile. Notes and settings each get their own sync toggle.**
 
 EasySync has been running reliably across desktop and mobile through thousands of syncs. Incremental syncs finish in about two seconds — you won't notice it's there until there's a conflict that needs you.
