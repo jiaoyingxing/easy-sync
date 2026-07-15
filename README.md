@@ -90,7 +90,7 @@ The source code is open for review in `src/`. Automated tests cover the core syn
 
 ## Install
 
-**Community Plugins (under review):** Obsidian Settings → Community Plugins → Search **EasySync** → Install → Enable
+**Community Plugins (after approval):** Obsidian Settings → Community Plugins → Search **EasySync** → Install → Enable
 
 **Manual install:** Download the latest from [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) and extract to `<vault>/.obsidian/plugins/easy-sync/`
 

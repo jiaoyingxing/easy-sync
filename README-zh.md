@@ -90,7 +90,7 @@
 
 ## 安装
 
-**社区插件（审核中）：** Obsidian 设置 → 社区插件 → 搜索 **EasySync** → 安装 → 启用
+**社区插件（通过审核后）：** Obsidian 设置 → 社区插件 → 搜索 **EasySync** → 安装 → 启用
 
 **手动安装：** 从 [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) 下载最新版，解压到 `<vault>/.obsidian/plugins/easy-sync/`
 
