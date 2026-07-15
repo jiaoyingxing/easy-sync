@@ -1,0 +1,23 @@
+EasySync Source-Available License
+
+Copyright (c) 2026 Jiao Yingxing
+
+The source code of EasySync is publicly available so users and reviewers can inspect how the plugin works.
+
+This project is not open source.
+
+Permission is granted to download, install, and use the official release builds of EasySync for personal use.
+
+Permission is also granted to read and inspect the source code for review, security evaluation, learning, and compatibility checking.
+
+Without prior written permission from the copyright holder, you may not:
+
+- copy or redistribute the source code or modified versions of it;
+- publish, sell, sublicense, or commercially exploit the source code or derived works;
+- use the source code to create or distribute a competing plugin or product;
+- remove or alter copyright, author, or license notices;
+- represent modified versions as official releases of EasySync.
+
+Official release builds are distributed through the project's GitHub Releases page and, if approved, the Obsidian Community Plugins directory.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY ARISING FROM OR IN CONNECTION WITH THE SOFTWARE OR THE USE OF THE SOFTWARE.

@@ -1,0 +1,34 @@
+{
+  "name": "easy-sync",
+  "version": "1.0.0",
+  "description": "EasySync / 易同步 — 面向新手用户的极简 Obsidian 云盘同步插件",
+  "main": "main.js",
+  "scripts": {
+    "typecheck": "tsc -noEmit -skipLibCheck",
+    "build": "tsc -noEmit -skipLibCheck && esbuild src/main.ts --bundle --external:obsidian --format=cjs --outfile=main.js",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "sync",
+    "onedrive"
+  ],
+  "author": "Jiao Yingxing",
+  "homepage": "https://github.com/jiaoyingxing/easy-sync",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jiaoyingxing/easy-sync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jiaoyingxing/easy-sync/issues"
+  },
+  "license": "SEE LICENSE IN LICENSE",
+  "devDependencies": {
+    "@types/node": "^26.1.0",
+    "esbuild": "^0.24.0",
+    "obsidian": "latest",
+    "typescript": "^5.4.0",
+    "vitest": "^4.1.10"
+  }
+}

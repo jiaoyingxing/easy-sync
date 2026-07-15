@@ -1,0 +1,10 @@
+{
+  "id": "easy-sync",
+  "name": "EasySync",
+  "version": "1.0.0",
+  "minAppVersion": "1.11.4",
+  "description": "Two-way OneDrive sync for Obsidian, with conflict safeguards, mobile support, and optional settings/plugin sync.",
+  "author": "Jiao Yingxing",
+  "authorUrl": "https://github.com/jiaoyingxing/easy-sync",
+  "isDesktopOnly": false
+}
