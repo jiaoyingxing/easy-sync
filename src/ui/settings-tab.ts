@@ -81,7 +81,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
         .setName(t("settings.reset.name"))
         .setDesc(t("settings.reset.desc"))
         .addButton((btn) => {
-          btn.setDestructive();
+          btn.buttonEl.classList.add("mod-warning");
           btn.setButtonText(t("settings.reset.button")).onClick(() => {
             void (async () => {
               const confirmed = await new ConfirmModal(

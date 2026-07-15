@@ -436,12 +436,12 @@ export class EasySyncSyncView extends ItemView {
         .setButtonText(t("settings.account.checking"))
         .setDisabled(true);
     } else if (state.isLoggedIn && state.isRunning) {
-      new ButtonComponent(actions)
-        .setButtonText(t("syncView.cancelSync"))
-        .setDestructive()
-        .onClick(() => {
-          void this.plugin.cancelSync();
-        });
+      const cancelButton = new ButtonComponent(actions)
+        .setButtonText(t("syncView.cancelSync"));
+      cancelButton.buttonEl.classList.add("mod-warning");
+      cancelButton.onClick(() => {
+        void this.plugin.cancelSync();
+      });
     } else if (state.isLoggedIn) {
       new ButtonComponent(actions)
         .setButtonText(t("command.syncNow"))

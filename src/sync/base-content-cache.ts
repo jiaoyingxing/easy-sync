@@ -29,6 +29,14 @@ const MAX_ENTRIES = 5000;
 /** File name for the cache on disk. */
 const CACHE_FILE = "base-content.json";
 
+function stringRecordToMap(record: Record<string, string>): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const [key, value] of Object.entries(record)) {
+    map.set(key, value);
+  }
+  return map;
+}
+
 export function isTextFile(path: string): boolean {
   const dot = path.lastIndexOf(".");
   if (dot === -1) return false;
@@ -106,9 +114,9 @@ export class BaseContentCache {
   async load(adapter: DataAdapter, pluginDir: string): Promise<void> {
     try {
       const raw = await adapter.read(`${pluginDir}/${CACHE_FILE}`);
-      const parsed: unknown = JSON.parse(raw);
+      const parsed = JSON.parse(raw) as unknown;
       this.store = isStringRecord(parsed)
-        ? new Map(Object.entries(parsed))
+        ? stringRecordToMap(parsed)
         : new Map();
     } catch {
       // File doesn't exist or is corrupt — start with empty cache
