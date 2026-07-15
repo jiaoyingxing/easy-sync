@@ -204,23 +204,7 @@ describe("OneDriveClient.downloadFile", () => {
 
   it("streams fetch downloads directly into appendBinary when writing to a temp file", async () => {
     const originalWindow = (globalThis as { window?: unknown }).window;
-    (globalThis as { window?: unknown }).window = {};
-    const chunks: number[][] = [];
-    const adapter = {
-      writeBinary: vi.fn(async (_path: string, data: ArrayBuffer) => {
-        chunks.push(Array.from(new Uint8Array(data)));
-      }),
-      appendBinary: vi.fn(async (_path: string, data: ArrayBuffer) => {
-        chunks.push(Array.from(new Uint8Array(data)));
-      }),
-      remove: vi.fn().mockResolvedValue(undefined),
-    };
-    const requestSpy = vi.spyOn(obsidian, "requestUrl");
     const content = new Uint8Array([1, 2, 3, 4, 5, 6]);
-    const expectedHashBuffer = await crypto.subtle.digest("SHA-256", content);
-    const expectedHash = Array.from(new Uint8Array(expectedHashBuffer))
-      .map((byte) => byte.toString(16).padStart(2, "0"))
-      .join("");
     const fetchSpy = vi.fn().mockResolvedValue(
       new Response(
         new ReadableStream<Uint8Array>({
@@ -236,7 +220,22 @@ describe("OneDriveClient.downloadFile", () => {
         },
       ),
     );
-    vi.stubGlobal("fetch", fetchSpy);
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    const chunks: number[][] = [];
+    const adapter = {
+      writeBinary: vi.fn(async (_path: string, data: ArrayBuffer) => {
+        chunks.push(Array.from(new Uint8Array(data)));
+      }),
+      appendBinary: vi.fn(async (_path: string, data: ArrayBuffer) => {
+        chunks.push(Array.from(new Uint8Array(data)));
+      }),
+      remove: vi.fn().mockResolvedValue(undefined),
+    };
+    const requestSpy = vi.spyOn(obsidian, "requestUrl");
+    const expectedHashBuffer = await crypto.subtle.digest("SHA-256", content);
+    const expectedHash = Array.from(new Uint8Array(expectedHashBuffer))
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
 
     try {
       const client = new OneDriveClient(async () => "token");
@@ -257,7 +256,6 @@ describe("OneDriveClient.downloadFile", () => {
       expect(adapter.appendBinary).toHaveBeenCalledTimes(1);
       expect(requestSpy).not.toHaveBeenCalled();
     } finally {
-      vi.unstubAllGlobals();
       if (originalWindow === undefined) {
         delete (globalThis as { window?: unknown }).window;
       } else {

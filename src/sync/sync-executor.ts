@@ -301,7 +301,7 @@ export class SyncExecutor {
             } else {
               const waitMs = 500 * (2 ** attempt);
               this.diag?.log("state", `cloud baseline download failed (attempt ${attempt + 1}), retrying in ${waitMs}ms`);
-              await new Promise((r) => compatSetTimeout(r, waitMs));
+              await new Promise<void>((resolve) => compatSetTimeout(() => resolve(), waitMs));
             }
           }
         }
@@ -1319,7 +1319,7 @@ export class SyncExecutor {
 
               if (!mergeResult.hasConflicts) {
                 // Clean merge — write merged result locally and upload
-                const mergedBytes = new TextEncoder().encode(mergeResult.merged).buffer as ArrayBuffer;
+                const mergedBytes = new TextEncoder().encode(mergeResult.merged).buffer;
                 await this.scanner.vault.adapter.writeBinary(item.path, mergedBytes);
                 const hash = await fullHash(mergedBytes);
                 const uploadResult = await this.onedrive.uploadFile(

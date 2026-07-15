@@ -107,47 +107,54 @@ export function threeWayMerge(
     const rHunk = remoteIdx < remoteHunks.length ? remoteHunks[remoteIdx] : null;
 
     // Determine affected range for each side at current base position
-    const localTouchesBase = lHunk && basePos >= lHunk.baseStart && basePos <= Math.max(lHunk.baseStart, lHunk.baseEnd);
-    const remoteTouchesBase = rHunk && basePos >= rHunk.baseStart && basePos <= Math.max(rHunk.baseStart, rHunk.baseEnd);
+    const localTouchesBase = lHunk !== null
+      && basePos >= lHunk.baseStart
+      && basePos <= Math.max(lHunk.baseStart, lHunk.baseEnd);
+    const remoteTouchesBase = rHunk !== null
+      && basePos >= rHunk.baseStart
+      && basePos <= Math.max(rHunk.baseStart, rHunk.baseEnd);
 
     if (!localTouchesBase && !remoteTouchesBase) {
       // Neither side changed this line
       output.push(baseLines[basePos - 1]);
       basePos++;
-    } else if (localTouchesBase && !remoteTouchesBase) {
+    } else if (lHunk && localTouchesBase && !remoteTouchesBase) {
       // Only local changed — apply local hunk
-      for (const line of lHunk!.lines) {
+      for (const line of lHunk.lines) {
         output.push(line);
       }
-      basePos = advancePast(basePos, lHunk!);
+      basePos = advancePast(basePos, lHunk);
       localIdx++;
-    } else if (!localTouchesBase && remoteTouchesBase) {
+    } else if (rHunk && !localTouchesBase && remoteTouchesBase) {
       // Only remote changed — apply remote hunk
-      for (const line of rHunk!.lines) {
+      for (const line of rHunk.lines) {
         output.push(line);
       }
-      basePos = advancePast(basePos, rHunk!);
+      basePos = advancePast(basePos, rHunk);
       remoteIdx++;
-    } else {
+    } else if (lHunk && rHunk) {
       // Both changed — conflict
       hasConflicts = true;
       output.push("<<<<<<< Local");
-      for (const line of lHunk!.lines) {
+      for (const line of lHunk.lines) {
         output.push(line);
       }
       output.push("=======");
-      for (const line of rHunk!.lines) {
+      for (const line of rHunk.lines) {
         output.push(line);
       }
       output.push(">>>>>>> Remote");
 
       // Advance past both hunks, using the larger range
       basePos = Math.max(
-        advancePast(basePos, lHunk!),
-        advancePast(basePos, rHunk!),
+        advancePast(basePos, lHunk),
+        advancePast(basePos, rHunk),
       );
       localIdx++;
       remoteIdx++;
+    } else {
+      output.push(baseLines[basePos - 1]);
+      basePos++;
     }
   }
 

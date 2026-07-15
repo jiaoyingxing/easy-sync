@@ -438,7 +438,7 @@ export class EasySyncSyncView extends ItemView {
     } else if (state.isLoggedIn && state.isRunning) {
       new ButtonComponent(actions)
         .setButtonText(t("syncView.cancelSync"))
-        .setDestructive()
+        .setWarning()
         .onClick(() => {
           void this.plugin.cancelSync();
         });
@@ -871,15 +871,20 @@ export class EasySyncSyncView extends ItemView {
     }
 
     const actions = body.createDiv("easy-sync-item-actions");
-    this.createActionChip(actions, t("syncView.conflict.keepLocal"), "accent", () =>
-      this.runItemAction(actions, () => this.plugin.syncExecutor!.resolveConflictKeepLocal(item.path)));
-    this.createActionChip(actions, t("syncView.conflict.keepRemote"), "accent", () =>
-      this.runItemAction(actions, () => this.plugin.syncExecutor!.resolveConflictKeepRemote(item.path)));
-    this.createActionChip(actions, t("syncView.conflict.viewDetail"), "", () =>
-      new ConflictDetailModal(this.plugin, item).setOnResolved(() => {
+    this.createActionChip(actions, t("syncView.conflict.keepLocal"), "accent", () => {
+      void this.runItemAction(actions, () => this.plugin.syncExecutor!.resolveConflictKeepLocal(item.path));
+    });
+    this.createActionChip(actions, t("syncView.conflict.keepRemote"), "accent", () => {
+      void this.runItemAction(actions, () => this.plugin.syncExecutor!.resolveConflictKeepRemote(item.path));
+    });
+    this.createActionChip(actions, t("syncView.conflict.viewDetail"), "", () => {
+      const modal = new ConflictDetailModal(this.plugin, item);
+      modal.setOnResolved(() => {
         this.plugin.updateStatusBar();
         this.render();
-      }).open());
+      });
+      modal.open();
+    });
   }
 
   private renderDeleteItem(container: HTMLElement, item: SyncPlanItem): void {
@@ -895,10 +900,12 @@ export class EasySyncSyncView extends ItemView {
     const body = details.createDiv("easy-sync-tree-item-body");
     body.createDiv("easy-sync-item-reason").setText(t("syncView.delete.reason"));
     const actions = body.createDiv("easy-sync-item-actions");
-    this.createActionChip(actions, t("syncView.delete.confirm"), "warning", () =>
-      this.runItemAction(actions, () => this.plugin.syncExecutor!.confirmRemoteDelete(item.path)));
-    this.createActionChip(actions, t("syncView.delete.reject"), "", () =>
-      this.runItemAction(actions, () => this.plugin.syncExecutor!.rejectRemoteDelete(item.path)));
+    this.createActionChip(actions, t("syncView.delete.confirm"), "warning", () => {
+      void this.runItemAction(actions, () => this.plugin.syncExecutor!.confirmRemoteDelete(item.path));
+    });
+    this.createActionChip(actions, t("syncView.delete.reject"), "", () => {
+      void this.runItemAction(actions, () => this.plugin.syncExecutor!.rejectRemoteDelete(item.path));
+    });
   }
 
   private createSection(container: HTMLElement, title: string): HTMLElement {

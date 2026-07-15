@@ -82,6 +82,25 @@ export function requestUrl(_opts: {
   });
 }
 
+export const activeWindow = {
+  setTimeout: (handler: () => unknown, timeout?: number) =>
+    setTimeout(handler, timeout) as unknown as number,
+  clearTimeout: (handle: number) => {
+    clearTimeout(handle);
+  },
+  setInterval: (handler: () => unknown, timeout?: number) =>
+    setInterval(handler, timeout) as unknown as number,
+  clearInterval: (handle: number) => {
+    clearInterval(handle);
+  },
+  requestAnimationFrame: (callback: FrameRequestCallback) =>
+    setTimeout(() => callback(Date.now()), 16) as unknown as number,
+  cancelAnimationFrame: (handle: number) => {
+    clearTimeout(handle);
+  },
+  fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
+} as unknown as Window;
+
 // Plugin base class
 export class Plugin {
   app: App;

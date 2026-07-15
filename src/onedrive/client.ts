@@ -520,7 +520,7 @@ export class OneDriveClient {
       try {
         const apiPath = `${APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), filePath)}:/content`;
         const response = await this.contentGet(apiPath, contentRequestOptions, onProgress);
-        const buf = response.arrayBuffer as ArrayBuffer;
+        const buf = response.arrayBuffer;
         onProgress?.(0, fileSize || buf.byteLength);
         onProgress?.(buf.byteLength, fileSize || buf.byteLength);
         return buf;
@@ -568,7 +568,7 @@ export class OneDriveClient {
       try {
         const response = await fetchDownloadUrl(downloadUrl, 1, onProgress);
         this.downloadMethod = "downloadUrl";
-        const buf = response.arrayBuffer as ArrayBuffer;
+        const buf = response.arrayBuffer;
         onProgress?.(buf.byteLength, fileSize || buf.byteLength);
         return buf;
       } catch (err) {
@@ -599,7 +599,7 @@ export class OneDriveClient {
             onProgress,
           );
           this.downloadMethod = "downloadUrl";
-          return dlResp.arrayBuffer as ArrayBuffer;
+          return dlResp.arrayBuffer;
         }
       } catch (err) {
         if (isAuthExpired(err)) {
@@ -642,7 +642,7 @@ export class OneDriveClient {
 
       const response = await this.contentGet(apiPath, contentRequestOptions, onProgress);
       this.downloadMethod = "content";
-      return response.arrayBuffer as ArrayBuffer;
+      return response.arrayBuffer;
     } catch (err) {
       if (isUncancellableRequestTimeout(err)) throw downloadTimeoutError(filePath);
       if (isAuthExpired(err)) {
@@ -664,7 +664,7 @@ export class OneDriveClient {
         const apiPath = `/me/drive/items/${driveItemId}/content`;
         const response = await this.contentGet(apiPath, contentRequestOptions, onProgress);
         this.downloadMethod = "content";
-        return response.arrayBuffer as ArrayBuffer;
+        return response.arrayBuffer;
       } catch (err) {
         if (isAuthExpired(err)) {
           throw metadataAuthError ?? asFileDownloadUnauthorized(err, filePath);
@@ -738,7 +738,7 @@ export class OneDriveClient {
               return await writeArrayBufferToBinaryFile(
                 adapter,
                 localPath,
-                response.arrayBuffer as ArrayBuffer,
+                response.arrayBuffer,
                 expectedSha256,
                 fileSize,
                 onDlProgress,
@@ -950,13 +950,13 @@ export class OneDriveClient {
         // If the server ignores Range and returns the full file, use it directly.
         if (resp.status === 200 && i === 0) {
           this.diag?.log("onedrive", "parallel download — server returned full file (Range not supported)");
-          const buf = resp.arrayBuffer as ArrayBuffer;
+          const buf = resp.arrayBuffer;
           chunks[0] = buf;
           onProgress?.(buf.byteLength, fileSize);
           return;
         }
 
-        const buf = resp.arrayBuffer as ArrayBuffer;
+        const buf = resp.arrayBuffer;
         chunks[i] = buf;
         downloadedSize += buf.byteLength;
         onProgress?.(downloadedSize, fileSize);
@@ -993,7 +993,7 @@ export class OneDriveClient {
       "onedrive",
       `parallel download complete — ${totalChunks} chunks, ${total} bytes`,
     );
-    return result.buffer as ArrayBuffer;
+    return result.buffer;
   }
 
   /** Delete a file or folder.
@@ -1295,7 +1295,7 @@ export class OneDriveClient {
     return writeArrayBufferToBinaryFile(
       adapter,
       localPath,
-      response.arrayBuffer as ArrayBuffer,
+      response.arrayBuffer,
       expectedSha256,
       0,
       onProgress,
@@ -1408,7 +1408,12 @@ export class OneDriveClient {
     if (isRecord(errAny.json)) {
       graphBody = errAny.json;
     } else if (errAny.text && typeof errAny.text === "string") {
-      try { graphBody = JSON.parse(errAny.text); } catch { /* not JSON */ }
+      try {
+        const parsed: unknown = JSON.parse(errAny.text);
+        if (isRecord(parsed)) graphBody = parsed;
+      } catch {
+        // Not JSON
+      }
     }
     const graphErr = graphBody?.error as Record<string, unknown> | undefined;
     // 409 is "folder already exists" — handled gracefully, don't alarm the user
@@ -1707,12 +1712,11 @@ function withAbortableTimeout<T>(
 }
 
 function browserFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  if (typeof window === "undefined") {
-    throw new TypeError("fetch unavailable");
+  const currentWindow = typeof window !== "undefined" ? (window.activeWindow ?? window) : null;
+  if (currentWindow && typeof currentWindow.fetch === "function") {
+    return currentWindow.fetch(input, init);
   }
-  const fetchFn = window["fetch"]?.bind(window) ?? globalThis["fetch"]?.bind(globalThis);
-  if (!fetchFn) throw new TypeError("fetch unavailable");
-  return fetchFn(input, init);
+  throw new TypeError("fetch unavailable");
 }
 
 function toErrorLike(error: unknown): Error {
@@ -1746,7 +1750,7 @@ async function safeRemove(adapter: DataAdapter, path: string): Promise<void> {
 }
 
 function exactArrayBuffer(chunk: Uint8Array): ArrayBuffer {
-  return chunk.slice().buffer as ArrayBuffer;
+  return chunk.slice().buffer;
 }
 
 async function sha256Hex(content: ArrayBuffer): Promise<string> {
@@ -1915,7 +1919,7 @@ function throwIfAborted(signal: AbortSignal | null | undefined): void {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => compatSetTimeout(resolve, ms));
+  return new Promise<void>((resolve) => compatSetTimeout(() => resolve(), ms));
 }
 
 function responseToText(response: RequestUrlResponse): string {

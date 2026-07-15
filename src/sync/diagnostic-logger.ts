@@ -244,7 +244,7 @@ export class DiagnosticLogger {
             const trimmed = line.trim();
             if (!trimmed) continue;
             try {
-              const parsed = JSON.parse(trimmed);
+              const parsed: unknown = JSON.parse(trimmed);
               if (
                 isRecord(parsed)
                 && typeof parsed.ts === "number"

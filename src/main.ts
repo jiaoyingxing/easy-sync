@@ -192,7 +192,9 @@ export default class EasySyncPlugin extends Plugin {
     // Reset circuit breakers on fresh OAuth login — old failures may
     // be due to stale auth scope and are no longer predictive.
     authCtx.onFreshLogin = () => {
-      this.state!.resetCircuitBreakers();
+      void this.state!.resetCircuitBreakers().catch((error) => {
+        this.diag.warn("state", "failed to reset circuit breakers after fresh login", error);
+      });
     };
     // Loaded in the background after UI registration so Ribbon state is accurate.
 
@@ -288,7 +290,7 @@ export default class EasySyncPlugin extends Plugin {
   async activateSyncView(): Promise<void> {
     const existing = this.app.workspace.getLeavesOfType(SYNC_VIEW_TYPE);
     if (existing.length > 0) {
-      this.app.workspace.revealLeaf(existing[0]);
+      await this.app.workspace.revealLeaf(existing[0]);
       return;
     }
     await this.app.workspace.getLeftLeaf(false)?.setViewState({
@@ -543,7 +545,7 @@ export default class EasySyncPlugin extends Plugin {
 
     const deadline = Date.now() + 30_000;
     while (this.syncExecutor.isRunning && Date.now() < deadline) {
-      await new Promise((r) => compatSetTimeout(r, 100));
+      await new Promise<void>((resolve) => compatSetTimeout(() => resolve(), 100));
     }
 
     if (this.syncExecutor.isRunning) {
@@ -779,7 +781,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private async loadPluginData(): Promise<Record<string, unknown> | null> {
-    const data = await this.loadData();
+    const data: unknown = await this.loadData();
     return isRecord(data) ? data : null;
   }
 

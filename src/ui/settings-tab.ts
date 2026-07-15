@@ -81,7 +81,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
         .setName(t("settings.reset.name"))
         .setDesc(t("settings.reset.desc"))
         .addButton((btn) => {
-          btn.setDestructive();
+          btn.setWarning();
           btn.setButtonText(t("settings.reset.button")).onClick(() => {
             void (async () => {
               const confirmed = await new ConfirmModal(
@@ -110,11 +110,11 @@ export class EasySyncSettingTab extends PluginSettingTab {
     // ========================================================================
     const aboutGroup = new SettingGroup(containerEl).setHeading(t("settings.group.about"));
 
-    aboutGroup.addSetting((setting) =>
+    aboutGroup.addSetting((setting) => {
       setting
         .setName(t("settings.about.product.name"))
-        .setDesc(t("settings.about.product.desc", { version: this.plugin.manifest.version })),
-    );
+        .setDesc(t("settings.about.product.desc", { version: this.plugin.manifest.version }));
+    });
 
     aboutGroup.addSetting((setting) => {
       setting
@@ -122,25 +122,29 @@ export class EasySyncSettingTab extends PluginSettingTab {
         .setDesc(t("settings.about.author.desc"))
         .addButton((btn) => {
           btn.setButtonText(t("settings.about.contact.github"))
-            .onClick(() => window.open(GITHUB_URL, "_blank", "noopener,noreferrer"));
+            .onClick(() => {
+              window.open(GITHUB_URL, "_blank", "noopener,noreferrer");
+            });
         })
         .addButton((btn) => {
           btn.setButtonText(t("settings.about.contact.xiaohongshu"))
-            .onClick(() => window.open(XHS_URL, "_blank", "noopener,noreferrer"));
+            .onClick(() => {
+              window.open(XHS_URL, "_blank", "noopener,noreferrer");
+            });
         });
     });
 
-    aboutGroup.addSetting((setting) =>
+    aboutGroup.addSetting((setting) => {
       setting
         .setName(t("settings.about.usage.name"))
-        .setDesc(t("settings.about.usage.desc")),
-    );
+        .setDesc(t("settings.about.usage.desc"));
+    });
 
-    aboutGroup.addSetting((setting) =>
+    aboutGroup.addSetting((setting) => {
       setting
         .setName(t("settings.about.disclaimer.name"))
-        .setDesc(t("settings.about.disclaimer.desc")),
-    );
+        .setDesc(t("settings.about.disclaimer.desc"));
+    });
   }
 
   refreshAuthState(): void {

@@ -106,7 +106,7 @@ export class BaseContentCache {
   async load(adapter: DataAdapter, pluginDir: string): Promise<void> {
     try {
       const raw = await adapter.read(`${pluginDir}/${CACHE_FILE}`);
-      const parsed = JSON.parse(raw);
+      const parsed: unknown = JSON.parse(raw);
       this.store = isRecord(parsed)
         ? new Map(
           Object.entries(parsed).filter(

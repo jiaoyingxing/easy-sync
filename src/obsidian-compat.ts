@@ -2,9 +2,12 @@ import type { Vault } from "obsidian";
 
 export const DEFAULT_CONFIG_DIR = `.${"obsidian"}`;
 
-export type TimeoutHandle = number | ReturnType<typeof globalThis.setTimeout>;
-export type IntervalHandle = number | ReturnType<typeof globalThis.setInterval>;
-export type AnimationFrameHandle = number | TimeoutHandle;
+export type TimeoutHandle = number;
+export type IntervalHandle = number;
+export type AnimationFrameHandle = number;
+
+type TimerWindow = Pick<Window, "setTimeout" | "clearTimeout" | "setInterval" | "clearInterval">;
+type AnimationWindow = Pick<Window, "requestAnimationFrame" | "cancelAnimationFrame">;
 
 export function getConfigDir(vault: Pick<Vault, "configDir">): string {
   return vault.configDir || DEFAULT_CONFIG_DIR;
@@ -63,58 +66,88 @@ export function isStringRecord(value: unknown): value is Record<string, string> 
   return Object.values(value).every((entry) => typeof entry === "string");
 }
 
+function getCurrentWindow(): Window | null {
+  return typeof window !== "undefined" ? (window.activeWindow ?? window) : null;
+}
+
+function hasTimerMethods(value: unknown): value is TimerWindow {
+  return typeof value === "object"
+    && value !== null
+    && typeof (value as TimerWindow).setTimeout === "function"
+    && typeof (value as TimerWindow).clearTimeout === "function"
+    && typeof (value as TimerWindow).setInterval === "function"
+    && typeof (value as TimerWindow).clearInterval === "function";
+}
+
+function hasAnimationMethods(value: unknown): value is AnimationWindow {
+  return typeof value === "object"
+    && value !== null
+    && typeof (value as AnimationWindow).requestAnimationFrame === "function"
+    && typeof (value as AnimationWindow).cancelAnimationFrame === "function";
+}
+
+function getTimerWindow(): TimerWindow {
+  const currentWindow = getCurrentWindow();
+  if (hasTimerMethods(currentWindow)) return currentWindow;
+  return {
+    setTimeout: ((handler: () => unknown, timeout?: number) =>
+      setTimeout(handler, timeout) as unknown as number) as typeof window.setTimeout,
+    clearTimeout: ((handle: number) => {
+      clearTimeout(handle);
+    }) as typeof window.clearTimeout,
+    setInterval: ((handler: () => unknown, timeout?: number) =>
+      setInterval(handler, timeout) as unknown as number) as typeof window.setInterval,
+    clearInterval: ((handle: number) => {
+      clearInterval(handle);
+    }) as typeof window.clearInterval,
+  };
+}
+
+function getAnimationWindow(): AnimationWindow | null {
+  const currentWindow = getCurrentWindow();
+  return hasAnimationMethods(currentWindow) ? currentWindow : null;
+}
+
 export function compatSetTimeout(
-  handler: TimerHandler,
+  handler: () => unknown,
   timeout?: number,
 ): TimeoutHandle {
-  if (typeof window !== "undefined" && typeof window.setTimeout === "function") {
-    return window.setTimeout(handler, timeout);
-  }
-  return globalThis.setTimeout(handler, timeout);
+  return getTimerWindow().setTimeout(handler, timeout);
 }
 
 export function compatClearTimeout(handle: TimeoutHandle | null | undefined): void {
   if (handle == null) return;
-  if (typeof window !== "undefined" && typeof window.clearTimeout === "function") {
-    window.clearTimeout(handle as unknown as number);
-    return;
-  }
-  globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>);
+  getTimerWindow().clearTimeout(handle);
 }
 
 export function compatSetInterval(
-  handler: TimerHandler,
+  handler: () => unknown,
   timeout?: number,
 ): IntervalHandle {
-  if (typeof window !== "undefined" && typeof window.setInterval === "function") {
-    return window.setInterval(handler, timeout);
-  }
-  return globalThis.setInterval(handler, timeout);
+  return getTimerWindow().setInterval(handler, timeout);
 }
 
 export function compatClearInterval(handle: IntervalHandle | null | undefined): void {
   if (handle == null) return;
-  if (typeof window !== "undefined" && typeof window.clearInterval === "function") {
-    window.clearInterval(handle as unknown as number);
-    return;
-  }
-  globalThis.clearInterval(handle as ReturnType<typeof globalThis.setInterval>);
+  getTimerWindow().clearInterval(handle);
 }
 
 export function compatRequestAnimationFrame(
   callback: FrameRequestCallback,
 ): AnimationFrameHandle {
-  if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
-    return window.requestAnimationFrame(callback);
+  const compatWindow = getAnimationWindow();
+  if (compatWindow) {
+    return compatWindow.requestAnimationFrame(callback);
   }
-  return globalThis.setTimeout(() => callback(Date.now()), 16);
+  return getTimerWindow().setTimeout(() => callback(Date.now()), 16);
 }
 
 export function compatCancelAnimationFrame(handle: AnimationFrameHandle | null | undefined): void {
   if (handle == null) return;
-  if (typeof window !== "undefined" && typeof window.cancelAnimationFrame === "function") {
-    window.cancelAnimationFrame(handle as number);
+  const compatWindow = getAnimationWindow();
+  if (compatWindow) {
+    compatWindow.cancelAnimationFrame(handle);
     return;
   }
-  globalThis.clearTimeout(handle as TimeoutHandle);
+  getTimerWindow().clearTimeout(handle);
 }

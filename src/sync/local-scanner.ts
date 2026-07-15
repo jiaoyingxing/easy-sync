@@ -174,7 +174,7 @@ export class LocalScanner {
     const { scanCacheFile } = getEasySyncPaths(this.configDir, this.pluginId);
     try {
       const json = await this.vault.adapter.read(scanCacheFile);
-      const parsed = JSON.parse(json);
+      const parsed: unknown = JSON.parse(json);
       if (
         isRecord(parsed)
         && parsed.format === SCAN_CACHE_FORMAT
@@ -509,5 +509,5 @@ function normalizeListedPath(base: string, entry: string): string {
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => compatSetTimeout(resolve, ms));
+  return new Promise<void>((resolve) => compatSetTimeout(() => resolve(), ms));
 }
