@@ -1,3 +1,4 @@
+import "obsidian";
 import type { Vault } from "obsidian";
 
 export const DEFAULT_CONFIG_DIR = `.${"obsidian"}`;
@@ -8,6 +9,7 @@ export type AnimationFrameHandle = number;
 
 type TimerWindow = Pick<Window, "setTimeout" | "clearTimeout" | "setInterval" | "clearInterval">;
 type AnimationWindow = Pick<Window, "requestAnimationFrame" | "cancelAnimationFrame">;
+const fallbackWindow = typeof window !== "undefined" ? window : null;
 
 export function getConfigDir(vault: Pick<Vault, "configDir">): string {
   return vault.configDir || DEFAULT_CONFIG_DIR;
@@ -89,23 +91,14 @@ function hasAnimationMethods(value: unknown): value is AnimationWindow {
 function getTimerWindow(): TimerWindow {
   const currentWindow = getCurrentWindow();
   if (hasTimerMethods(currentWindow)) return currentWindow;
-  return {
-    setTimeout: ((handler: () => unknown, timeout?: number) =>
-      setTimeout(handler, timeout) as unknown as number) as typeof window.setTimeout,
-    clearTimeout: ((handle: number) => {
-      clearTimeout(handle);
-    }) as typeof window.clearTimeout,
-    setInterval: ((handler: () => unknown, timeout?: number) =>
-      setInterval(handler, timeout) as unknown as number) as typeof window.setInterval,
-    clearInterval: ((handle: number) => {
-      clearInterval(handle);
-    }) as typeof window.clearInterval,
-  };
+  if (hasTimerMethods(fallbackWindow)) return fallbackWindow;
+  throw new Error("Timer APIs unavailable");
 }
 
 function getAnimationWindow(): AnimationWindow | null {
   const currentWindow = getCurrentWindow();
-  return hasAnimationMethods(currentWindow) ? currentWindow : null;
+  if (hasAnimationMethods(currentWindow)) return currentWindow;
+  return hasAnimationMethods(fallbackWindow) ? fallbackWindow : null;
 }
 
 export function compatSetTimeout(

@@ -98,8 +98,11 @@ export const activeWindow = {
   cancelAnimationFrame: (handle: number) => {
     clearTimeout(handle);
   },
-  fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
 } as unknown as Window;
+
+if (typeof (globalThis as { window?: Window }).window === "undefined") {
+  (globalThis as { window?: Window }).window = activeWindow;
+}
 
 // Plugin base class
 export class Plugin {
@@ -173,6 +176,7 @@ export class ButtonComponent {
   setButtonText(_text: string): this { return this; }
   setDisabled(_disabled: boolean): this { return this; }
   setWarning(): this { return this; }
+  setDestructive(): this { return this; }
   setCta(): this { return this; }
   onClick(_callback: () => void | Promise<void>): this { return this; }
 }

@@ -438,7 +438,7 @@ export class EasySyncSyncView extends ItemView {
     } else if (state.isLoggedIn && state.isRunning) {
       new ButtonComponent(actions)
         .setButtonText(t("syncView.cancelSync"))
-        .setWarning()
+        .setDestructive()
         .onClick(() => {
           void this.plugin.cancelSync();
         });
