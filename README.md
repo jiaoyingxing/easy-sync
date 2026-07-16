@@ -1,105 +1,136 @@
-# EasySync
+# 易同步（EasySync）
 
-Language: English | [简体中文](README-zh.md)
+语言：简体中文 | [English](README-en.md)
 
-**Two-way OneDrive sync for Obsidian. Conflicts don't get silently resolved. Works on mobile. Notes and settings each get their own sync toggle.**
+**基于 OneDrive 的 Obsidian 双向同步插件。冲突可控，移动端可用，笔记和设置同步各有独立开关。**
 
-EasySync has been running reliably across desktop and mobile through thousands of syncs. Incremental syncs finish in about two seconds — you won't notice it's there until there's a conflict that needs you.
-
----
-
-## What makes it different
-
-**It doesn't slow down Obsidian.** In our measurements, cold-start overhead is about 30 milliseconds. You won't feel it when you open Obsidian.
-
-**It doesn't trust timestamps. It trusts content.** Most sync plugins compare file modification times — and get it wrong when clocks drift. EasySync computes a SHA-256 hash of each file and compares content, not time. Restore an old file. Edit on devices with different timezones. Your system clock jumps. None of that tricks it. EasySync almost never overwrites your notes by mistake.
-
-**It won't pick a winner for you.** If you edited the same note on two devices, EasySync won't silently discard one side. It shows both versions side by side, highlights the differences, and lets you decide.
-
-**Problems stay visible.** Failed files, unresolved conflicts, files skipped for being too large — they all stay listed in the sidebar. Not a quick notice that disappears in three seconds.
-
-**You decide what syncs.** Notes and attachments are the baseline. Editor settings, appearance, themes, hotkeys, core plugins, community plugin code, and plugin data — each one has its own toggle. No "all or nothing."
-
-**It protects your data quietly.** Before uploading, it re-hashes the file to make sure nothing changed mid-flight. Before overwriting a local file from the cloud, it double-checks. Before deleting anything remotely, it asks you. You don't see any of this happening — but it runs every round.
+易同步已经在桌面端和移动端稳定运行了数千次同步。日常增量同步通常在 2 秒左右完成，你几乎感觉不到它的存在——直到有冲突需要你决定的时候。
 
 ---
 
-## Start in 2 minutes
+## 它和别的同步插件有什么不同
 
-1. If EasySync is already approved, install it from Obsidian Community Plugins. Otherwise, use the manual install steps below.
-2. Open settings, sign in with your Microsoft account
-3. Tap **Sync now**
+**启动不拖累 Obsidian。** 按我们当前的测量，易同步冷启动额外开销大约 30 毫秒，打开 Obsidian 基本感觉不到它。
 
-The first sync scans your vault and builds a cloud baseline. Large vaults may take a while. After that, daily syncs finish in seconds.
+**不靠时间判断文件变了没，靠内容。** 多数同步插件看文件的修改时间——时间不准就会误判。易同步每次给文件内容算一个 SHA-256 哈希指纹，只比对内容是否真的变了。你把旧文件拷回来、在不同设备上编辑、系统时间跳了——这些都骗不到它。易同步几乎不会误覆盖你的笔记。
 
-> Before the plugin is approved in the community directory, download `main.js`, `manifest.json`, and `styles.css` from [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) and place them in `<vault>/.obsidian/plugins/easy-sync/`. Then enable it in settings.
+**冲突不替你乱选。** 同一份笔记你在两台设备上都改了？易同步不会挑一个覆盖另一个。它把两个版本并排展示，标出差异，让你自己决定留哪个——后续会升级到自动合并两边的修改。
 
----
+**出问题不会被藏起来。** 同步失败的、冲突待处理的、因为太大被跳过的文件——全部列在侧栏里，不会只弹一条几秒钟就消失的提示。
 
-## Where your data lives and who can see it
+**想同步什么，自己选。** 笔记和附件是基础。编辑器设置、外观、主题、快捷键、核心插件、社区三方插件、插件数据——每一项都有独立开关。你不用再纠结"要么全同步，要么全不同步"。
 
-EasySync stores your data inside your own OneDrive App Folder — an isolated space OneDrive reserves for applications. EasySync can't see your other files. Other apps can't see EasySync's data.
-
-It asks Microsoft for the minimum permissions needed: `Files.ReadWrite.AppFolder` (its own App Folder only) and `Files.Read` (basic file metadata). It does not request full drive access.
-
-EasySync talks only to Microsoft's login and OneDrive endpoints. No third-party servers. No telemetry. No analytics. Diagnostic logs stay on your machine unless you choose to export or sync them.
-
-The source code is open for review in `src/`. Automated tests cover the core sync paths — currently 136 cases.
+**一直在悄悄保护你的数据。** 上传前会重新算一遍文件哈希指纹，确认没有中途变化。从云端下载的文件在覆盖本地之前也会复核。远端删除你的文件时会先问你。这些事情你都看不见，但它们每一轮都在跑。
 
 ---
 
-## Features
+## 2 分钟开始用
 
-| Capability | Description |
+1. 如果 EasySync 已通过审核，就在 Obsidian 社区插件中安装；否则先按下方手动安装方式使用
+2. 打开设置，点登录，用 Microsoft 账号授权
+3. 点 **立即同步**
+
+首次同步需要扫描本地仓库并建立云端对照，文件多的话可能需要比较久的时间。之后的日常同步通常几秒钟完成。
+
+> 社区插件上线前，可以从 [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) 下载 `main.js`、`manifest.json`、`styles.css` 三个文件，放入 `<vault>/.obsidian/plugins/easy-sync/`，再到设置里启用。
+
+---
+
+## 使用教程
+
+### 第一步：注册 Microsoft 账号
+
+易同步基于 OneDrive，你需要一个 Microsoft 个人账号。如果你已经有 Outlook 或 Hotmail 邮箱，直接用那个登录就行。没有的话：
+
+1. 打开 [outlook.com](https://outlook.com)，点击"创建免费账户"
+2. 填一个你喜欢的邮箱名（比如 `你的名字@outlook.com`），设置密码
+3. 完成验证，账号就注册好了
+4. 在 Obsidian 里打开易同步设置，用这个账号登录
+
+整个过程大概 3 分钟，不需要手机号，不需要付费，不需要任何技术背景。
+
+### 第二步：在所有设备上使用同一个仓库名
+
+跨设备同步的关键：你在每台设备上的 Obsidian 仓库名必须**完全一样**。易同步用仓库名来区分"这是谁的笔记"——两个名字不同的仓库，就认为是两个独立的同步空间。
+
+- 如果你已经有一个叫"我的笔记"的仓库，在新手机上新建仓库时也填"我的笔记"
+- 如果你还没开始，建议先想好一个名字，在所有设备上统一使用
+- 仓库名区分大小写——"my vault"和"My Vault"会被当成两个不同的仓库
+
+### 第三步：首次同步
+
+首次同步会做一次完整的"对账"——扫描你本地所有文件，和云端建立对照。这里有几个建议：
+
+- **先同步文件少的那台设备。** 如果你电脑上有一千个文件、手机上是空的，先在电脑上同步——它会把本地文件推送到云端。然后打开手机，手机从云端拉下来就行了。
+- **两边的仓库都有内容？也没关系。** 易同步会自动识别：同一个文件两边都有且内容一样的就跳过；只有一边有的就同步过去；两边都改了同一个文件的就标为冲突，让你来决定。
+- **第一次同步可能会慢一些。** 因为要把所有文件扫一遍、算一遍指纹。取决于仓库大小和网络速度，可能需要几十秒到几分钟。之后的日常同步几秒钟就能完成。
+
+---
+
+## 你的数据放在哪、谁看得到
+
+易同步只把数据存到你自己 OneDrive 的 App Folder 里——这是 OneDrive 为应用专门划出的隔离空间。易同步看不到你的其他文件，其他应用也看不到易同步的数据。
+
+它向 Microsoft 申请的权限是最小集：`Files.ReadWrite.AppFolder`（仅限自己的 App Folder）和 `Files.Read`（读取文件基本信息）。不申请全盘读写。
+
+易同步不和第三方服务器通信。不采集使用数据，不上报分析日志。诊断记录默认留在你电脑上，除非你主动导出或同步它们。
+
+源码公开在 `src/` 目录下，可以自己看。自动化测试覆盖了核心同步流程，当前 136 个。
+
+---
+
+## 功能清单
+
+| 能力 | 说明 |
 |------|------|
-| Two-way sync | Notes, images, audio, PDFs — everything in your vault |
-| Settings sync | Editor, appearance, themes, hotkeys, core plugins — each independently toggleable |
-| Community plugin sync | Plugin code and plugin data controlled separately |
-| Conflict resolution | Side-by-side diff view with per-line highlighting; keep local, keep remote |
-| Text auto-merge | If you edit the top of a note and another device edits the bottom, those non-overlapping changes merge automatically |
-| Large files | Uploads over 50 MB use chunked upload; downloads use the safest path available in the current runtime |
-| Safety guards | Re-hash before upload, verify before local overwrite, confirm before remote delete, pause and ask if a round changes over half your files |
-| Desktop | Windows / macOS / Linux |
-| Mobile | iOS / Android — same codebase as desktop |
-| Diagnostic reports | One-click export to Markdown with file sizes, durations, and error details |
-| i18n Chinese / English | Follows your Obsidian language setting |
+| 双向同步 | 笔记、图片、音频、PDF——仓库里的文件都在同步范围 |
+| 设置同步 | 编辑器、外观、主题、快捷键、核心插件，每项独立开关 |
+| 社区插件同步 | 插件代码和插件数据分开控制，各有一个开关 |
+| 冲突处理 | 并排对比两个版本、逐行标出差异，可以保留本地、保留远端 |
+| 文本自动合并 | 你改了开头、另一台设备改了结尾——这种不重叠的修改会自动合到一起 |
+| 大文件 | 超过 50 MB 的上传会走分片上传；下载则按当前运行环境选择最稳妥的路径 |
+| 安全保护 | 上传前重算文件哈希指纹、下载覆盖前复核本地、远端删除先问你、一轮变更超过一半先暂停确认 |
+| 桌面端 | Windows / macOS / Linux |
+| 移动端 | iOS / Android，和桌面端同一套代码 |
+| 诊断报告 | 出问题时一键导出 Markdown 报告，包含文件大小、耗时、错误详情 |
+| i18n 中/英文界面 | 跟随 Obsidian 语言设置自动切换 |
 
-### What we don't do yet
+### 暂时不做的
 
-| Scenario | Status |
+| 场景 | 说明 |
 |------|------|
-| Multiple people editing the same file at once | EasySync is not a real-time collaboration tool. Don't edit the same file simultaneously on different devices. |
-| Move or rename a file on one device, have another device automatically recognize it | Currently the other device sees "one new file + one file pending deletion." Automatic rename/move tracking is planned. |
+| 多人同时编辑同一文件 | 易同步不是实时协作工具，不同设备不要同时改同一个文件 |
+| 在一台设备上改名/移动文件，另一台自动识别 | 目前另一台会看到"新增一个文件 + 旧文件待删"，这个场景的自动识别还在做 |
 
 ---
 
-## How it compares
+## 和其他方案比
 
-| | EasySync | Obsidian Sync | Remotely Save |
+| | 易同步 | Obsidian Sync | Remotely Save |
 |---|---|---|---|
-| Storage | Your own OneDrive | Obsidian servers | OneDrive / S3 / Dropbox |
-| Price | Free (OneDrive account needed) | $5/month | Free |
-| Sync method | SHA-256 content hashing | — | Modification timestamps |
-| Cold start | ~30ms | — | — |
-| Daily sync speed | ~2s | — | Depends on file count |
-| Conflict handling | Git-style per-line diff | Version history + merge | Pick one side |
-| Settings sync | 8 independent toggles | Yes | No |
-| Mobile | Full support | Full support | Full support |
-| Large file chunking | Yes | Yes | No |
-| Source | Public, reviewable | Closed | Open-source (Apache 2.0) |
+| 存储 | 你自己的 OneDrive | Obsidian 官方服务器 | OneDrive / S3 / Dropbox 等 |
+| 费用 | 免费（需 OneDrive 账号） | $5/月 | 免费 |
+| 同步机制 | SHA-256 看内容 | — | 修改时间 |
+| 冷启动耗时 | ~30ms | — | — |
+| 日常同步速度 | ~2s | — | 取决于文件数 |
+| 冲突处理 | 类git逐行对比 | 版本历史 + 合并 | 选一边保留 |
+| 设置同步 | 8 项独立开关 | 支持 | 不支持 |
+| 移动端 | 完整支持 | 完整支持 | 完整支持 |
+| 大文件分片 | 支持 | 支持 | 不支持 |
+| 源码 | 公开可审查 | 闭源 | 开源 (Apache 2.0) |
 
 ---
 
-## Install
+## 安装
 
-**Community Plugins (after approval):** Obsidian Settings → Community Plugins → Search **EasySync** → Install → Enable
+**社区插件（通过审核后）：** Obsidian 设置 → 社区插件 → 搜索 **EasySync** → 安装 → 启用
 
-**Manual install:** Download the latest from [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) and extract to `<vault>/.obsidian/plugins/easy-sync/`
+**手动安装：** 从 [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) 下载最新版，解压到 `<vault>/.obsidian/plugins/easy-sync/`
 
-**Requirements:** Obsidian `1.11.4` or later. A personal Microsoft account.
+**需要：** Obsidian `1.11.4` 或更高版本， Microsoft 个人账号。
 
 ---
 
-## License
+## 许可
 
-EasySync is source-available — the code is open for review and learning, but it is not released under an open-source license. See [LICENSE](LICENSE) for details.
+易同步采用 source-available 许可——源码开放供审查和学习，不是开源授权。完整条款见 [LICENSE](LICENSE)。
