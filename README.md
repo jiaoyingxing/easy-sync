@@ -26,13 +26,13 @@
 
 ## 2 分钟开始用
 
-1. 如果 EasySync 已通过审核，就在 Obsidian 社区插件中安装；否则先按下方手动安装方式使用
+1. 在 Obsidian 社区插件中搜索 **EasySync** 并安装
 2. 打开设置，点登录，用 Microsoft 账号授权
 3. 点 **立即同步**
 
 首次同步需要扫描本地仓库并建立云端对照，文件多的话可能需要比较久的时间。之后的日常同步通常几秒钟完成。
 
-> 社区插件上线前，可以从 [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) 下载 `main.js`、`manifest.json`、`styles.css` 三个文件，放入 `<vault>/.obsidian/plugins/easy-sync/`，再到设置里启用。
+> 也可以从 [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) 手动安装：下载 `main.js`、`manifest.json`、`styles.css` 三个文件，放入 `<vault>/.obsidian/plugins/easy-sync/`，再到设置里启用。
 
 ---
 
@@ -123,11 +123,11 @@
 
 ## 安装
 
-**社区插件（通过审核后）：** Obsidian 设置 → 社区插件 → 搜索 **EasySync** → 安装 → 启用
+**社区插件：** Obsidian 设置 → 社区插件 → 搜索 **EasySync** → 安装 → 启用
 
 **手动安装：** 从 [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) 下载最新版，解压到 `<vault>/.obsidian/plugins/easy-sync/`
 
-**需要：** Obsidian `1.11.4` 或更高版本， Microsoft 个人账号。
+**需要：** Obsidian `1.11.4` 或更高版本，一个 Microsoft 个人账号。
 
 ---
 
