@@ -14,7 +14,7 @@ EasySync is published in the Obsidian community plugin store. It has been runnin
 
 **It doesn't trust timestamps. It trusts content.** Most sync plugins compare file modification times — and get it wrong when clocks drift. EasySync computes a SHA-256 hash of each file and compares content, not time. Restore an old file. Edit on devices with different timezones. Your system clock jumps. None of that tricks it. EasySync almost never overwrites your notes by mistake.
 
-**It won't pick a winner for you.** If you edited the same note on two devices, EasySync won't silently discard one side. It shows both versions side by side, highlights the differences, and lets you decide.
+**It won't pick a winner for you.** If you edited the same note on two devices, EasySync won't silently discard one side. Markdown and other text files get a side-by-side per-line diff so you can see exactly what changed. PDFs, images, and other binary files show the size and timestamp of both sides so you can compare and pick — automatic text merging on the roadmap.
 
 **Problems stay visible.** Failed files, unresolved conflicts, files skipped for being too large — they all stay listed in the sidebar. Not a quick notice that disappears in three seconds.
 
@@ -111,7 +111,7 @@ The first sync does a full reconciliation — scanning all your local files and 
 | Two-way sync | Notes, images, audio, PDFs — everything in your vault |
 | Settings sync | Editor, appearance, themes, hotkeys, core plugins — each independently toggleable |
 | Community plugin sync | Plugin code and plugin data controlled separately |
-| Conflict resolution | Side-by-side diff view with per-line highlighting; keep local, keep remote |
+| Conflict resolution | Per-line diff for md and text files; PDFs/images show size & timestamp, manual pick |
 | Text auto-merge | Non-overlapping changes (you edit the top, another device edits the bottom) merge automatically |
 | Recovery copies | Before overwriting a local file from the cloud, a `.easy-sync-recovery` backup is saved first |
 | Large files | Over 50 MB auto chunked upload; downloads choose the optimal path for the current runtime |
