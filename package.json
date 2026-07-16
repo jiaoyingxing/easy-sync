@@ -1,6 +1,6 @@
 {
   "name": "easy-sync",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "EasySync / 易同步 — 面向新手用户的极简 Obsidian 云盘同步插件",
   "main": "main.js",
   "scripts": {
