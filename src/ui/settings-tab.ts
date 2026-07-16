@@ -178,7 +178,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
   ): void {
     if (!this.syncSectionEl) return;
     this.syncSectionEl.empty();
-    const hasCompletedSync = (this.plugin.state?.lastSyncTime ?? 0) > 0;
+    const hasCompletedSync = this.plugin.hasCompletedSyncState();
     const syncGroup = new SettingGroup(this.syncSectionEl).setHeading(t("settings.group.sync"));
 
     if (this.plugin.auth?.authState.isLoggedIn) {

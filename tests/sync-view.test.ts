@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { buildSyncViewContentKey } from "../src/ui/sync-view";
+import {
+  buildCompletedFilesRenderState,
+  buildSyncViewContentKey,
+  trimFilePathPrefix,
+} from "../src/ui/sync-view";
 
 describe("buildSyncViewContentKey", () => {
   const baseInput = {
@@ -84,5 +88,69 @@ describe("buildSyncViewContentKey", () => {
     expect(initializing).not.toBe(ready);
     expect(initializing).toContain("auth:1:0");
     expect(ready).toContain("auth:0:1");
+  });
+
+  it("changes when a reviewed plan settles from running to paused so action buttons rebuild", () => {
+    const runningPlan = buildSyncViewContentKey(false, {
+      ...baseInput,
+      isLoggedIn: true,
+      isRunning: true,
+      planReviewActive: true,
+      planReviewCounts: {
+        uploads: 1,
+        downloads: 0,
+        deletes: 0,
+        conflicts: 0,
+        skipped: 0,
+      },
+      planReviewItems: [{
+        type: "upload",
+        path: "foo.md",
+      }],
+    });
+    const pausedPlan = buildSyncViewContentKey(false, {
+      ...baseInput,
+      isLoggedIn: true,
+      isRunning: false,
+      planReviewActive: true,
+      progress: {
+        ...baseInput.progress,
+        phase: "done",
+      },
+      planReviewCounts: {
+        uploads: 1,
+        downloads: 0,
+        deletes: 0,
+        conflicts: 0,
+        skipped: 0,
+      },
+      planReviewItems: [{
+        type: "upload",
+        path: "foo.md",
+      }],
+    });
+
+    expect(runningPlan).not.toBe(pausedPlan);
+    expect(runningPlan).toContain("run:1");
+    expect(pausedPlan).toContain("run:0");
+  });
+
+  it("only trims a path when the computed prefix actually matches", () => {
+    expect(trimFilePathPrefix("Resojot Todo.md", "test/")).toBe("Resojot Todo.md");
+    expect(trimFilePathPrefix("test/Resojot Todo.md", "test/")).toBe("Resojot Todo.md");
+  });
+
+  it("changes completed-file render state when a shared prefix appears later", () => {
+    const firstOnly = buildCompletedFilesRenderState([
+      { path: "test/333333(4)-副本.md", status: "download" },
+    ]);
+    const withSibling = buildCompletedFilesRenderState([
+      { path: "test/333333(4)-副本.md", status: "download" },
+      { path: "test/444444.md", status: "download" },
+    ]);
+
+    expect(firstOnly.prefix).toBe("");
+    expect(withSibling.prefix).toBe("test/");
+    expect(firstOnly.key).not.toBe(withSibling.key);
   });
 });

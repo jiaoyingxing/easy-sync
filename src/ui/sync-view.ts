@@ -102,6 +102,21 @@ function commonDirPrefix(paths: string[]): string {
   return depth > 0 ? `${parts[0].slice(0, depth).join("/")}/` : "";
 }
 
+export function trimFilePathPrefix(path: string, prefix: string): string {
+  return prefix && path.startsWith(prefix) ? path.slice(prefix.length) : path;
+}
+
+export function buildCompletedFilesRenderState(
+  files: readonly Pick<FileProgress, "path" | "status" | "reason">[],
+): { prefix: string; key: string } {
+  return {
+    prefix: commonDirPrefix(files.map((file) => file.path)),
+    key: files
+      .map((file) => `${file.path}\u0000${file.status}\u0000${file.reason ?? ""}`)
+      .join("\u0001"),
+  };
+}
+
 export const SYNC_VIEW_TYPE = "easy-sync-detail";
 
 export function buildSyncViewContentKey(
@@ -112,13 +127,14 @@ export function buildSyncViewContentKey(
   const historyIds = input.history.map((entry) => entry.id).join("|");
   const historyKey = historyExpanded ? `history:open:${historyIds}` : "history:closed";
   if (input.planReviewActive) {
+    const runningKey = input.isRunning ? "run:1" : "run:0";
     const counts = input.planReviewCounts
       ? `${input.planReviewCounts.uploads},${input.planReviewCounts.downloads},${input.planReviewCounts.deletes},${input.planReviewCounts.conflicts},${input.planReviewCounts.skipped}`
       : "";
     const items = input.planReviewItems
       .map((item) => `${item.type}:${item.path}:${item.reason ?? ""}`)
       .join("|");
-    return `plan:${authKey}:${counts}:${items}:${historyKey}`;
+    return `plan:${authKey}:${runningKey}:${counts}:${items}:${historyKey}`;
   }
   if (input.isRunning) {
     return `running:${authKey}:${input.progress.phase}:${historyKey}`;
@@ -159,7 +175,7 @@ function renderFileRow(file: FileProgress, list: HTMLElement, prefix: string, t:
     ? (ISSUE_ACTION_ICONS[file.actionType] ?? FILE_STATUS_ICONS[file.status])
     : FILE_STATUS_ICONS[file.status]);
   row.createSpan("easy-sync-file-path").setText(
-    prefix ? file.path.slice(prefix.length) : file.path,
+    trimFilePathPrefix(file.path, prefix),
   );
   row.createSpan("easy-sync-tree-chip").setText(t(`syncView.fileStatus.${file.status}`));
   if (file.reason) row.createDiv("easy-sync-file-reason").setText(file.reason);
@@ -172,7 +188,6 @@ export class EasySyncSyncView extends ItemView {
   // P0: incremental render — frame merging + diffed file list
   private renderFrameId: AnimationFrameHandle | null = null;
   private lastContentKey: string | null = null;
-  private renderedFilePaths: Set<string> = new Set();
   private lastPhase: SyncPhase = "idle";
   // Cached DOM refs for direct progress-bar updates
   private progressPanelEl: HTMLElement | null = null;
@@ -180,6 +195,7 @@ export class EasySyncSyncView extends ItemView {
   private progressSubtitleEl: HTMLElement | null = null;
   private fileListEl: HTMLElement | null = null;
   private cachedPrefix: string | null = null;
+  private completedFilesRenderKey: string | null = null;
   private statusLineEl: HTMLElement | null = null;
   private statusIconEl: HTMLElement | null = null;
   private statusTextEl: HTMLElement | null = null;
@@ -269,12 +285,12 @@ export class EasySyncSyncView extends ItemView {
     });
 
     if (this.lastContentKey !== contentKey) {
-      this.renderedFilePaths.clear();
       this.progressPanelEl = null;
       this.progressFillEl = null;
       this.progressSubtitleEl = null;
       this.fileListEl = null;
       this.cachedPrefix = null;
+      this.completedFilesRenderKey = null;
       this.statusLineEl = null;
       this.statusIconEl = null;
       this.statusTextEl = null;
@@ -330,30 +346,23 @@ export class EasySyncSyncView extends ItemView {
     if (files.length === 0 || !this.progressPanelEl) return;
     if (!this.fileListEl) {
       this.progressSubtitleEl = this.progressPanelEl.createDiv("easy-sync-progress-subtitle");
-      this.fileListEl = this.progressPanelEl.createDiv("easy-sync-file-list is-limited");
+      this.progressSubtitleEl.setText(
+        this.plugin.i18n.t("syncView.progress.completed", { count: files.length }),
+      );
     }
-    const list = this.fileListEl;
-    if (!this.cachedPrefix) {
-      this.cachedPrefix = commonDirPrefix(files.map((f) => f.path));
+    const nextState = buildCompletedFilesRenderState(files);
+    if (!this.fileListEl
+      || this.cachedPrefix !== nextState.prefix
+      || this.completedFilesRenderKey !== nextState.key) {
+      // ponytail: the visible list is capped, so a small rebuild is simpler than keeping a drifting incremental cache
+      this.progressPanelEl.querySelector(".easy-sync-progress-prefix")?.remove();
+      this.fileListEl?.remove();
+      this.fileListEl = null;
+      this.renderFileResults(this.progressPanelEl, [...files], true);
     }
-    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    const prefix = this.cachedPrefix;
-    let added = false;
-
-    for (const file of files) {
-      if (this.renderedFilePaths.has(file.path)) continue;
-      this.renderedFilePaths.add(file.path);
-      added = true;
-      if (prefix && !list.querySelector(".easy-sync-progress-prefix")) {
-        const prefixEl = list.createDiv("easy-sync-progress-prefix");
-        prefixEl.setText(prefix);
-      }
-      renderFileRow(file, list, prefix, t);
-    }
-
-    if (added) {
-      this.progressSubtitleEl?.setText(t("syncView.progress.completed", { count: files.length }));
-    }
+    this.progressSubtitleEl?.setText(
+      this.plugin.i18n.t("syncView.progress.completed", { count: files.length }),
+    );
   }
 
   private renderToolbar(container: HTMLElement): void {
@@ -442,6 +451,10 @@ export class EasySyncSyncView extends ItemView {
       cancelButton.onClick(() => {
         void this.plugin.cancelSync();
       });
+    } else if (state.isLoggedIn && state.planReviewActive) {
+      new ButtonComponent(actions)
+        .setButtonText(t("command.syncNow"))
+        .setDisabled(true);
     } else if (state.isLoggedIn) {
       new ButtonComponent(actions)
         .setButtonText(t("command.syncNow"))
@@ -748,7 +761,8 @@ export class EasySyncSyncView extends ItemView {
     limitHeight: boolean,
   ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    const prefix = limitHeight ? commonDirPrefix(files.map((f) => f.path)) : "";
+    const renderState = buildCompletedFilesRenderState(files);
+    const prefix = limitHeight ? renderState.prefix : "";
     if (prefix) container.createDiv("easy-sync-progress-prefix").setText(prefix);
     const list = container.createDiv("easy-sync-file-list");
     const renderedPaths = new Set<string>();
@@ -756,6 +770,7 @@ export class EasySyncSyncView extends ItemView {
       list.addClass("is-limited");
       this.fileListEl = list;
       this.cachedPrefix = prefix;
+      this.completedFilesRenderKey = renderState.key;
     }
 
     // Iterate in reverse (newest first)
@@ -763,9 +778,6 @@ export class EasySyncSyncView extends ItemView {
       if (limitHeight && renderedPaths.has(files[i].path)) continue;
       renderedPaths.add(files[i].path);
       renderFileRow(files[i], list, prefix, t);
-    }
-    if (limitHeight) {
-      this.renderedFilePaths = renderedPaths;
     }
   }
 
@@ -796,9 +808,18 @@ export class EasySyncSyncView extends ItemView {
       this.renderPlanGroups(panel, items, conflicts, pendingDeletes);
     } else if (!counts || Object.values(counts).every((count) => count === 0)) {
       panel.createDiv("easy-sync-empty-state").setText(t("syncPlan.noChanges"));
+    } else {
+      panel.createDiv("easy-sync-empty-state").setText(t("syncPlan.detailsUnavailable"));
     }
 
     const actions = panel.createDiv("easy-sync-plan-execute");
+    new ButtonComponent(actions)
+      .setButtonText(t("syncPlan.confirmExecute"))
+      .setCta()
+      .setDisabled(this.plugin.syncExecutor?.isRunning ?? false)
+      .onClick(() => {
+        void this.plugin.executePlanReview();
+      });
     new ButtonComponent(actions)
       .setButtonText(t("syncPlan.recalculate"))
       .onClick(() => {

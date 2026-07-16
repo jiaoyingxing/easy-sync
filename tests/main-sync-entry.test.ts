@@ -112,6 +112,21 @@ describe("main sync entry guards", () => {
     expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
   });
 
+  it("routes manual sync to first-sync preview when the vault has no sync state yet", async () => {
+    const plugin = makePlugin();
+    plugin.syncExecutor = { isRunning: false } as never;
+    plugin.state = {
+      planReviewActive: false,
+      lastSyncTime: 0,
+      baseSnapshot: [],
+    } as never;
+    const startFirstSync = vi.spyOn(plugin, "startFirstSync").mockResolvedValue(undefined);
+
+    await plugin.startManualSync();
+
+    expect(startFirstSync).toHaveBeenCalledOnce();
+  });
+
   it("keeps the reviewed plan in state until manual sync hands off to the executor", async () => {
     const plugin = makePlugin();
     const clearPlanReview = vi.fn().mockResolvedValue(undefined);

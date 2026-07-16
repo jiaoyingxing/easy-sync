@@ -347,6 +347,12 @@ export default class EasySyncPlugin extends Plugin {
     await this.startFirstSync();
   }
 
+  hasCompletedSyncState(): boolean {
+    const baseCount = this.state?.baseSnapshot?.length ?? 0;
+    return (this.state?.lastSyncTime ?? 0) > 0
+      || baseCount > 0;
+  }
+
   /** Verify the current account matches the vault's bound identity.
    *  First sync ever silently binds. Account mismatch → Notice + block.
    *  Returns true if sync may proceed. */
@@ -427,6 +433,10 @@ export default class EasySyncPlugin extends Plugin {
   /** Start a manual sync */
   async startManualSync(): Promise<void> {
     if (!this.syncExecutor) return;
+    if (!this.hasCompletedSyncState() && !(this.state?.planReviewActive ?? false)) {
+      await this.startFirstSync();
+      return;
+    }
     if (this.acquireOpLock("sync")) return;
     try {
     await this.ensureStateLoaded();
