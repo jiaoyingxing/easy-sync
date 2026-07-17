@@ -10,6 +10,8 @@ describe("buildSyncViewContentKey", () => {
     isLoggedIn: false,
     isInitializing: false,
     isRunning: true,
+    canCancel: false,
+    bodyMode: "progress" as const,
     progress: {
       phase: "executing" as const,
       current: 1,
@@ -96,6 +98,8 @@ describe("buildSyncViewContentKey", () => {
       isLoggedIn: true,
       isRunning: true,
       planReviewActive: true,
+      bodyMode: "plan" as const,
+      canCancel: true,
       planReviewCounts: {
         uploads: 1,
         downloads: 0,
@@ -112,7 +116,9 @@ describe("buildSyncViewContentKey", () => {
       ...baseInput,
       isLoggedIn: true,
       isRunning: false,
+      canCancel: false,
       planReviewActive: true,
+      bodyMode: "plan" as const,
       progress: {
         ...baseInput.progress,
         phase: "done",
@@ -133,6 +139,41 @@ describe("buildSyncViewContentKey", () => {
     expect(runningPlan).not.toBe(pausedPlan);
     expect(runningPlan).toContain("run:1");
     expect(pausedPlan).toContain("run:0");
+  });
+
+  it("keeps pending body mode while a side action is processing", () => {
+    const waiting = buildSyncViewContentKey(false, {
+      ...baseInput,
+      isLoggedIn: true,
+      isRunning: false,
+      canCancel: false,
+      bodyMode: "pending",
+      progress: {
+        ...baseInput.progress,
+        phase: "idle",
+      },
+      conflicts: [{
+        type: "conflict",
+        path: "a.md",
+      }],
+    });
+    const processing = buildSyncViewContentKey(false, {
+      ...baseInput,
+      isLoggedIn: true,
+      isRunning: true,
+      canCancel: false,
+      bodyMode: "pending",
+      conflicts: [{
+        type: "conflict",
+        path: "a.md",
+      }],
+    });
+
+    expect(waiting).toContain("pending:");
+    expect(processing).toContain("pending:");
+    expect(processing).not.toContain("progress:");
+    expect(waiting).not.toBe(processing);
+    expect(processing).toContain("run:1:0");
   });
 
   it("only trims a path when the computed prefix actually matches", () => {

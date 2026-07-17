@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { SyncProgressStore } from "../src/sync/sync-progress";
+import {
+  isAnySyncActivityRunning,
+  SyncProgressStore,
+} from "../src/sync/sync-progress";
 import { SyncActionType } from "../src/sync/types";
 
 describe("SyncProgressStore retention", () => {
@@ -46,6 +49,21 @@ describe("SyncProgressStore retention", () => {
     expect(progress.state.currentFile).toBe("second.bin");
     expect(progress.state.currentItemBytes).toBe(0);
     expect(progress.state.currentItemTotalBytes).toBe(0);
+  });
+
+  it("treats executor and progress store as one running signal", () => {
+    const progress = new SyncProgressStore();
+
+    expect(isAnySyncActivityRunning(progress.state, false, false)).toBe(false);
+
+    progress.markStarted();
+    progress.setPhase("scanning");
+    expect(isAnySyncActivityRunning(progress.state, false, false)).toBe(true);
+
+    progress.finish();
+    expect(isAnySyncActivityRunning(progress.state, false, false)).toBe(false);
+    expect(isAnySyncActivityRunning(progress.state, false, true)).toBe(true);
+    expect(isAnySyncActivityRunning(progress.state, true, false)).toBe(true);
   });
 
 });

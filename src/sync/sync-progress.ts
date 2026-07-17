@@ -56,6 +56,18 @@ export interface SyncProgressState {
 
 export const MAX_SUCCESS_FILE_RECORDS = 100;
 
+export function isProgressActivityRunning(state: Readonly<SyncProgressState>): boolean {
+  return state.startedAt > 0 && state.phase !== "done";
+}
+
+export function isAnySyncActivityRunning(
+  state: Readonly<SyncProgressState>,
+  fullSyncRunning: boolean,
+  sideActionRunning: boolean,
+): boolean {
+  return fullSyncRunning || sideActionRunning || isProgressActivityRunning(state);
+}
+
 export function retainFileProgress(files: FileProgress[]): FileProgress[] {
   let successesToSkip = Math.max(
     0,

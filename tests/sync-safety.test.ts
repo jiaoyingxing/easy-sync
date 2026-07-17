@@ -2814,6 +2814,13 @@ describe("Pending conflict cleanup", () => {
 
 describe("Large file boundary — base file exceeds 50MB", () => {
   const engine = new SyncEngine();
+  const protectedConfigPaths = [
+    ".obsidian/app.json",
+    ".obsidian/appearance.json",
+    ".obsidian/hotkeys.json",
+    ".obsidian/core-plugins.json",
+    ".obsidian/community-plugins.json",
+  ] as const;
 
   function baseEntry(path: string, overrides: Partial<BaseFileEntry> = {}): BaseFileEntry {
     return { path, hash: "bb".repeat(32), size: 10000, eTag: "old-etag", ...overrides };
@@ -2887,6 +2894,44 @@ describe("Large file boundary — base file exceeds 50MB", () => {
       { type: SyncActionType.DeleteRemote, path: "deleted.md" },
     ]);
   });
+
+  for (const path of protectedConfigPaths) {
+    it(`protected config ${path} missing remotely stays a conflict instead of a delete prompt`, () => {
+      const plan = engine.generatePlan(
+        [localEntry(path, { hash: "same".repeat(16), size: 850 })],
+        [],
+        [baseEntry(path, { hash: "same".repeat(16), size: 850, eTag: "etag-app" })],
+        [],
+      );
+
+      expect(plan.items).toContainEqual(expect.objectContaining({
+        type: SyncActionType.Conflict,
+        path,
+        reason: "reason.fileDeletedFromRemote",
+      }));
+      expect(plan.items.some((item) =>
+        item.type === SyncActionType.ConfirmLocalDelete && item.path === path,
+      )).toBe(false);
+    });
+
+    it(`protected config ${path} missing locally stays a conflict instead of deleting remote immediately`, () => {
+      const plan = engine.generatePlan(
+        [],
+        [remoteEntry(path, { size: 850, eTag: "etag-app" })],
+        [baseEntry(path, { hash: "same".repeat(16), size: 850, eTag: "etag-app" })],
+        [],
+      );
+
+      expect(plan.items).toContainEqual(expect.objectContaining({
+        type: SyncActionType.Conflict,
+        path,
+        reason: "reason.fileDeletedLocally",
+      }));
+      expect(plan.items.some((item) =>
+        item.type === SyncActionType.DeleteRemote && item.path === path,
+      )).toBe(false);
+    });
+  }
 
   it("file in base, not scanned, not in skippedLarge, not in remote → no action (deleted both sides)", () => {
     // Edge case: file was in base but now missing from local, remote, AND skippedLarge.
@@ -3008,5 +3053,294 @@ describe("Rename detection — content hash matching", () => {
     expect(plan.items.some((i) => i.type === SyncActionType.Upload && i.path === "new.md")).toBe(true);
     expect(plan.items.some((i) => i.type === SyncActionType.DeleteRemote && i.path === "old.md")).toBe(true);
     expect(plan.items.filter((i) => i.type === SyncActionType.RenameRemote)).toHaveLength(0);
+  });
+});
+
+describe("Conflict resolution actions report standalone transfer progress", () => {
+  async function waitUntil(assertion: () => void, attempts = 20): Promise<void> {
+    let lastError: unknown;
+    for (let index = 0; index < attempts; index++) {
+      try {
+        assertion();
+        return;
+      } catch (error) {
+        lastError = error;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+    throw lastError;
+  }
+
+  function makeProgressAwareExecutor(options: {
+    downloadFile?: ReturnType<typeof vi.fn>;
+    uploadFile?: ReturnType<typeof vi.fn>;
+    pendingConflicts?: SyncPlanItem[];
+    pendingRemoteDeletes?: SyncPlanItem[];
+    adapterOverrides?: Record<string, unknown>;
+    onProgressUpdate?: () => void;
+    progressStore?: SyncProgressStore;
+  }): SyncExecutor {
+    const progressStore = options.progressStore ?? new SyncProgressStore();
+    const mockState = {
+      ...remoteStateStub(),
+      baseSnapshot: [],
+      pendingConflicts: options.pendingConflicts ?? [],
+      pendingRemoteDeletes: options.pendingRemoteDeletes ?? [],
+      updateBaseEntry: vi.fn().mockResolvedValue(undefined),
+      removeBaseEntry: vi.fn().mockResolvedValue(undefined),
+      removePendingConflict: vi.fn().mockResolvedValue(undefined),
+      removePendingDelete: vi.fn().mockResolvedValue(undefined),
+      applyRemoteMutations: vi.fn().mockResolvedValue(undefined),
+      cacheBaseContent: vi.fn(),
+    } as unknown as StateManager;
+
+    return new SyncExecutor(
+      makeMockOneDrive({
+        downloadFile: options.downloadFile,
+        uploadFile: options.uploadFile,
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter(options.adapterOverrides),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+          getFileByPath: vi.fn().mockReturnValue(null),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+        }),
+        scanFile: vi.fn().mockResolvedValue(null),
+      } as unknown as LocalScanner,
+      {} as SyncEngine,
+      mockState,
+      "testVault",
+      undefined,
+      progressStore,
+      undefined,
+      true,
+      undefined,
+      options.onProgressUpdate,
+    );
+  }
+
+  it("keepRemote feeds byte progress into the shared progress store", async () => {
+    const progressStore = new SyncProgressStore();
+    const snapshots: Array<{
+      phase: string;
+      currentFile: string;
+      currentActionType?: SyncActionType;
+      currentItemBytes: number;
+      currentItemTotalBytes: number;
+    }> = [];
+    const remote = {
+      path: "attachments/audio.m4a",
+      driveId: "drive-1",
+      downloadUrl: "https://example.invalid/download",
+      size: 10,
+      mtime: 1,
+      eTag: "etag-1",
+      cTag: "ctag-1",
+    } as RemoteFileEntry;
+    const executor = makeProgressAwareExecutor({
+      progressStore,
+      pendingConflicts: [{
+        type: SyncActionType.Conflict,
+        path: remote.path,
+        remote,
+        local: {
+          path: remote.path,
+          hash: "aa".repeat(32),
+          size: 10,
+          mtime: 1,
+          binary: true,
+        },
+      }],
+      adapterOverrides: {
+        stat: vi.fn().mockResolvedValue({ size: 10, mtime: 1 }),
+      },
+      downloadFile: vi.fn().mockImplementation(
+        async (_vaultName: string, _path: string, _downloadUrl?: string, _driveId?: string, fileSize = 0, onProgress?: (downloaded: number, total: number) => void) => {
+          onProgress?.(4, fileSize);
+          onProgress?.(fileSize, fileSize);
+          return new Uint8Array(fileSize).fill(7).buffer;
+        },
+      ),
+      onProgressUpdate: () => {
+        snapshots.push({
+          phase: progressStore.state.phase,
+          currentFile: progressStore.state.currentFile,
+          currentActionType: progressStore.state.currentActionType,
+          currentItemBytes: progressStore.state.currentItemBytes,
+          currentItemTotalBytes: progressStore.state.currentItemTotalBytes,
+        });
+      },
+    });
+
+    await executor.resolveConflictKeepRemote(remote.path);
+
+    expect(snapshots.some((snapshot) =>
+      snapshot.phase === "executing"
+      && snapshot.currentFile === remote.path
+      && snapshot.currentActionType === SyncActionType.Download,
+    )).toBe(true);
+    expect(snapshots.some((snapshot) =>
+      snapshot.currentItemBytes === 4 && snapshot.currentItemTotalBytes === 10,
+    )).toBe(true);
+    await waitUntil(() => {
+      expect(progressStore.state.phase).toBe("done");
+    });
+  });
+
+  it("keepLocal feeds upload progress into the shared progress store", async () => {
+    const progressStore = new SyncProgressStore();
+    const snapshots: Array<{
+      phase: string;
+      currentFile: string;
+      currentActionType?: SyncActionType;
+      currentItemBytes: number;
+      currentItemTotalBytes: number;
+    }> = [];
+    const local = {
+      path: "attachments/audio.m4a",
+      hash: "bb".repeat(32),
+      size: 12,
+      mtime: 1,
+      binary: true,
+    } as LocalFileEntry;
+    const executor = makeProgressAwareExecutor({
+      progressStore,
+      pendingConflicts: [{
+        type: SyncActionType.Conflict,
+        path: local.path,
+        local,
+        remote: {
+          path: local.path,
+          driveId: "drive-1",
+          size: 12,
+          mtime: 1,
+          eTag: "etag-1",
+          cTag: "ctag-1",
+        },
+      }],
+      adapterOverrides: {
+        readBinary: vi.fn().mockResolvedValue(new Uint8Array(local.size).fill(9).buffer),
+      },
+      uploadFile: vi.fn().mockImplementation(
+        async (_vaultName: string, _path: string, content: ArrayBuffer, onProgress?: (uploaded: number, total: number) => void) => {
+          onProgress?.(5, content.byteLength);
+          onProgress?.(content.byteLength, content.byteLength);
+          return { eTag: "uploaded-etag" };
+        },
+      ),
+      onProgressUpdate: () => {
+        snapshots.push({
+          phase: progressStore.state.phase,
+          currentFile: progressStore.state.currentFile,
+          currentActionType: progressStore.state.currentActionType,
+          currentItemBytes: progressStore.state.currentItemBytes,
+          currentItemTotalBytes: progressStore.state.currentItemTotalBytes,
+        });
+      },
+    });
+
+    await executor.resolveConflictKeepLocal(local.path);
+
+    expect(snapshots.some((snapshot) =>
+      snapshot.phase === "executing"
+      && snapshot.currentFile === local.path
+      && snapshot.currentActionType === SyncActionType.Upload,
+    )).toBe(true);
+    expect(snapshots.some((snapshot) =>
+      snapshot.currentItemBytes === 5 && snapshot.currentItemTotalBytes === local.size,
+    )).toBe(true);
+    await waitUntil(() => {
+      expect(progressStore.state.phase).toBe("done");
+    });
+  });
+
+  it("keepRemote accepts a remote-side deletion conflict by deleting the local file", async () => {
+    const remove = vi.fn().mockResolvedValue(undefined);
+    const executor = makeProgressAwareExecutor({
+      pendingConflicts: [{
+        type: SyncActionType.Conflict,
+        path: ".obsidian/app.json",
+        local: {
+          path: ".obsidian/app.json",
+          hash: "aa".repeat(32),
+          size: 850,
+          mtime: 1,
+          binary: false,
+        },
+        reason: "reason.fileDeletedFromRemote",
+      }],
+      adapterOverrides: {
+        remove,
+      },
+    });
+
+    await executor.resolveConflictKeepRemote(".obsidian/app.json");
+
+    expect(remove).toHaveBeenCalledWith(".obsidian/app.json");
+  });
+
+  it("queues repeated item actions so later clicks do not fail behind the first transfer", async () => {
+    let resolveFirstUpload: ((value: { eTag: string }) => void) | null = null;
+    const startedPaths: string[] = [];
+    const uploadFile = vi.fn().mockImplementation(
+      (_vaultName: string, path: string) => {
+        startedPaths.push(path);
+        if (path === "a.md") {
+          return new Promise<{ eTag: string }>((resolve) => {
+            resolveFirstUpload = resolve;
+          });
+        }
+        return Promise.resolve({ eTag: `etag-${path}` });
+      },
+    );
+
+    const executor = makeProgressAwareExecutor({
+      pendingConflicts: [
+        {
+          type: SyncActionType.Conflict,
+          path: "a.md",
+          local: { path: "a.md", hash: "aa".repeat(32), size: 1, mtime: 1, binary: false },
+          remote: { path: "a.md", driveId: "id-a", size: 1, mtime: 1, eTag: "etag-a", cTag: "ctag-a" },
+        },
+        {
+          type: SyncActionType.Conflict,
+          path: "b.md",
+          local: { path: "b.md", hash: "bb".repeat(32), size: 1, mtime: 1, binary: false },
+          remote: { path: "b.md", driveId: "id-b", size: 1, mtime: 1, eTag: "etag-b", cTag: "ctag-b" },
+        },
+      ],
+      adapterOverrides: {
+        readBinary: vi.fn().mockResolvedValue(new Uint8Array([1]).buffer),
+      },
+      uploadFile,
+    });
+
+    const firstQueued = executor.resolveConflictKeepLocal("a.md");
+    const secondQueued = executor.resolveConflictKeepLocal("b.md");
+    let enqueued = false;
+    void Promise.all([firstQueued, secondQueued]).then(() => {
+      enqueued = true;
+    });
+
+    await waitUntil(() => {
+      expect(enqueued).toBe(true);
+      expect(executor.isSideActionQueued("a.md")).toBe(true);
+      expect(executor.isSideActionQueued("b.md")).toBe(true);
+      expect(startedPaths).toEqual(["a.md"]);
+    });
+
+    resolveFirstUpload?.({ eTag: "etag-a-new" });
+    await waitUntil(() => {
+      expect(startedPaths).toEqual(["a.md", "b.md"]);
+      expect(executor.isSideActionQueued("a.md")).toBe(false);
+      expect(executor.isSideActionQueued("b.md")).toBe(false);
+    });
   });
 });

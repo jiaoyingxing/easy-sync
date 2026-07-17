@@ -100,9 +100,13 @@ export interface SyncCallbacks {
 
 export class SyncExecutor {
   private running = false;
+  private sideActionRunning = false;
+  private sideActionQueue: Promise<void> = Promise.resolve();
+  private queuedSideActionPaths = new Set<string>();
   private cancelled = false;
   private cancelController: AbortController | null = null;
   private startGeneration = 0;
+  private actionNotice: Notice | null = null;
 
   constructor(
     private onedrive: OneDriveClient,
@@ -115,6 +119,7 @@ export class SyncExecutor {
     private diag?: DiagnosticLogger,
     private autoMerge = true,
     private fileManager?: FileManager,
+    private onProgressUpdate?: () => void,
   ) {}
 
   private t(key: string, params?: Record<string, string | number>): string {
@@ -123,11 +128,22 @@ export class SyncExecutor {
 
   /** Show a translated notice to the user */
   private notice(key: string, params?: Record<string, string | number>): void {
-    new Notice(this.t(key, params));
+    if (this.actionNotice && typeof (this.actionNotice as { hide?: () => void }).hide === "function") {
+      this.actionNotice.hide();
+    }
+    this.actionNotice = new Notice(this.t(key, params));
   }
 
   get isRunning(): boolean {
     return this.running;
+  }
+
+  get hasSideActionsInFlight(): boolean {
+    return this.sideActionRunning || this.queuedSideActionPaths.size > 0;
+  }
+
+  isSideActionQueued(path: string): boolean {
+    return this.queuedSideActionPaths.has(path);
   }
 
   cancel(): void {
@@ -224,7 +240,7 @@ export class SyncExecutor {
    * @param skipConfirmation  skip threshold/first-sync checks (user confirmed from sidebar)
    */
   async run(mode: SyncMode, callbacks: SyncCallbacks = {}, skipConfirmation = false): Promise<SyncResult> {
-    if (this.running) {
+    if (this.running || this.sideActionRunning || this.queuedSideActionPaths.size > 0) {
       return { success: false, uploaded: 0, downloaded: 0, deleted: 0, conflicts: 0, skippedLarge: 0, skippedIgnored: 0, errors: 0, authExpired: false, message: this.t("result.alreadyRunning") };
     }
 
@@ -1645,148 +1661,226 @@ export class SyncExecutor {
 
   /** Gate check: refuse state-modifying operations while a sync round is in-flight. */
   private acquireGate(op: string): string | null {
-    if (this.running) return "sync";
+    if (this.running || this.sideActionRunning || this.queuedSideActionPaths.size > 0) return "sync";
     return null;
+  }
+
+  private enqueueSideAction(
+    path: string,
+    actionType: SyncActionType,
+    task: () => Promise<void>,
+  ): Promise<void> {
+    if (this.running) {
+      this.notice("notice.conflict.failed", { path, reason: this.t("result.lockBusy") });
+      return Promise.resolve();
+    }
+    if (this.queuedSideActionPaths.has(path)) {
+      return Promise.resolve();
+    }
+
+    this.queuedSideActionPaths.add(path);
+    this.diag?.log("execute", `queued side action ${actionType} ${path}`);
+    this.onProgressUpdate?.();
+
+    // ponytail: one shared side-action queue keeps conflict/delete picks serial; split by lane only if real throughput needs appear
+    this.sideActionQueue = this.sideActionQueue
+      .catch(() => undefined)
+      .then(async () => {
+        this.beginSideAction(path, actionType);
+        try {
+          await task();
+        } finally {
+          this.queuedSideActionPaths.delete(path);
+          this.finishSideAction();
+        }
+      });
+
+    return Promise.resolve();
+  }
+
+  private beginSideAction(path: string, actionType: SyncActionType): void {
+    this.sideActionRunning = true;
+    this.progressStore?.markStarted();
+    this.progressStore?.setPhase("executing");
+    this.progressStore?.setProgress(0, 1, path, actionType);
+    this.onProgressUpdate?.();
+  }
+
+  private updateSideActionProgress(bytes: number, total: number): void {
+    this.progressStore?.setByteProgress(bytes, total);
+    this.onProgressUpdate?.();
+  }
+
+  private finishSideAction(): void {
+    this.sideActionRunning = false;
+    this.progressStore?.finish();
+    this.onProgressUpdate?.();
+  }
+
+  private async deleteLocalPath(path: string): Promise<void> {
+    const tfile = this.scanner.vault.getFileByPath(path);
+    if (tfile) {
+      try {
+        if (this.fileManager) {
+          await this.fileManager.trashFile(tfile);
+        } else {
+          await this.scanner.vault.adapter.remove(path);
+        }
+      } catch {
+        await this.scanner.vault.adapter.remove(path);
+      }
+      return;
+    }
+    await this.scanner.vault.adapter.remove(path);
   }
 
   /** Resolve a conflict: keep local version (re-upload) */
   async resolveConflictKeepLocal(path: string): Promise<void> {
-    if (this.acquireGate("resolveConflict")) {
-      this.notice("notice.conflict.failed", { path, reason: this.t("result.lockBusy") });
-      return;
-    }
     const conflict = this.state.pendingConflicts.find((c) => c.path === path);
-    if (conflict?.remote && !conflict.local) {
+    const actionType = conflict?.remote && !conflict.local
+      ? SyncActionType.DeleteRemote
+      : SyncActionType.Upload;
+    return this.enqueueSideAction(path, actionType, async () => {
+      const queuedConflict = this.state.pendingConflicts.find((c) => c.path === path);
+      if (queuedConflict?.remote && !queuedConflict.local) {
+        try {
+          await this.onedrive.deleteItem(this.vaultName, path, queuedConflict.remote.eTag);
+          await this.state.removePendingConflict(path);
+          await this.state.removeBaseEntry(path);
+          await this.state.applyRemoteMutations([], [path]);
+          this.notice("notice.conflict.keptLocal", { path });
+        } catch (e) {
+          this.notice("notice.conflict.failed", { path, reason: e instanceof Error ? e.message : this.t("general.unknown") });
+        }
+        return;
+      }
+      if (!queuedConflict?.local) {
+        this.notice("notice.conflict.failed", { path, reason: this.t("general.unknown") });
+        return;
+      }
       try {
-        await this.onedrive.deleteItem(this.vaultName, path, conflict.remote.eTag);
+        const content = await this.scanner.vault.adapter.readBinary(path);
+        const uploadResult = await this.onedrive.uploadFile(
+          this.vaultName,
+          path,
+          content,
+          (uploaded, total) => this.updateSideActionProgress(uploaded, total),
+        );
+        await this.state.updateBaseEntry({
+          path,
+          hash: queuedConflict.local.hash,
+          size: queuedConflict.local.size,
+          eTag: uploadResult.eTag ?? "",
+        });
+        await this.state.applyRemoteMutations([
+          this.toUploadedRemoteEntry(path, queuedConflict.local, uploadResult),
+        ], []);
         await this.state.removePendingConflict(path);
-        await this.state.removeBaseEntry(path);
-        await this.state.applyRemoteMutations([], [path]);
+        this.state.cacheBaseContent(path, content);
         this.notice("notice.conflict.keptLocal", { path });
       } catch (e) {
         this.notice("notice.conflict.failed", { path, reason: e instanceof Error ? e.message : this.t("general.unknown") });
       }
-      return;
-    }
-    if (!conflict?.local) {
-      this.notice("notice.conflict.failed", { path, reason: this.t("general.unknown") });
-      return;
-    }
-    try {
-      const content = await this.scanner.vault.adapter.readBinary(path);
-      const uploadResult = await this.onedrive.uploadFile(this.vaultName, path, content);
-      await this.state.updateBaseEntry({
-        path,
-        hash: conflict.local.hash,
-        size: conflict.local.size,
-        eTag: uploadResult.eTag ?? "",
-      });
-      await this.state.applyRemoteMutations([
-        this.toUploadedRemoteEntry(path, conflict.local, uploadResult),
-      ], []);
-      await this.state.removePendingConflict(path);
-      this.state.cacheBaseContent(path, content);
-      this.notice("notice.conflict.keptLocal", { path });
-    } catch (e) {
-      this.notice("notice.conflict.failed", { path, reason: e instanceof Error ? e.message : this.t("general.unknown") });
-    }
+    });
   }
 
   /** Resolve a conflict: keep remote version (re-download) */
   async resolveConflictKeepRemote(path: string): Promise<void> {
-    if (this.acquireGate("resolveConflict")) {
-      this.notice("notice.conflict.failed", { path, reason: this.t("result.lockBusy") });
-      return;
-    }
     const conflict = this.state.pendingConflicts.find((c) => c.path === path);
-    if (!conflict?.remote) {
-      this.notice("notice.conflict.failed", { path, reason: this.t("general.unknown") });
-      return;
-    }
-    try {
-      const content = await this.onedrive.downloadFile(
-        this.vaultName,
-        path,
-        conflict.remote.downloadUrl,
-        conflict.remote.driveId,
-        conflict.remote.size,
-      );
-      await this.ensureParentDirs(path);
-      await this.scanner.vault.adapter.writeBinary(path, content);
-      // Hash from memory — content is already loaded, no need to re-read
-      const hash = await fullHash(content);
-      const stat = await this.scanner.vault.adapter.stat(path);
-      await this.state.updateBaseEntry({
-        path,
-        hash,
-        size: stat?.size ?? content.byteLength,
-        eTag: conflict.remote.eTag,
-      });
-      await this.state.removePendingConflict(path);
-      this.state.cacheBaseContent(path, content);
-      this.notice("notice.conflict.keptRemote", { path });
-    } catch {
-      // Download failed — most likely network restriction (401 on /content, DNS block on downloadUrl).
-      // Show a user-friendly message instead of the raw HTTP error.
-      this.notice("notice.conflict.downloadFailed");
-    }
+    const actionType = conflict?.local && !conflict.remote
+      ? SyncActionType.ConfirmLocalDelete
+      : SyncActionType.Download;
+    return this.enqueueSideAction(path, actionType, async () => {
+      const queuedConflict = this.state.pendingConflicts.find((c) => c.path === path);
+      if (queuedConflict?.local && !queuedConflict.remote) {
+        try {
+          await this.deleteLocalPath(path);
+          await this.state.removePendingConflict(path);
+          await this.state.removeBaseEntry(path);
+          await this.state.applyRemoteMutations([], [path]);
+          this.notice("notice.conflict.keptRemote", { path });
+        } catch (e) {
+          this.notice("notice.conflict.failed", { path, reason: e instanceof Error ? e.message : this.t("general.unknown") });
+        }
+        return;
+      }
+      if (!queuedConflict?.remote) {
+        this.notice("notice.conflict.failed", { path, reason: this.t("general.unknown") });
+        return;
+      }
+      try {
+        const content = await this.onedrive.downloadFile(
+          this.vaultName,
+          path,
+          queuedConflict.remote.downloadUrl,
+          queuedConflict.remote.driveId,
+          queuedConflict.remote.size,
+          (downloaded, total) => this.updateSideActionProgress(downloaded, total),
+        );
+        await this.ensureParentDirs(path);
+        await this.scanner.vault.adapter.writeBinary(path, content);
+        // Hash from memory — content is already loaded, no need to re-read
+        const hash = await fullHash(content);
+        const stat = await this.scanner.vault.adapter.stat(path);
+        await this.state.updateBaseEntry({
+          path,
+          hash,
+          size: stat?.size ?? content.byteLength,
+          eTag: queuedConflict.remote.eTag,
+        });
+        await this.state.removePendingConflict(path);
+        this.state.cacheBaseContent(path, content);
+        this.notice("notice.conflict.keptRemote", { path });
+      } catch {
+        // Download failed — most likely network restriction (401 on /content, DNS block on downloadUrl).
+        // Show a user-friendly message instead of the raw HTTP error.
+        this.notice("notice.conflict.downloadFailed");
+      }
+    });
   }
 
   /** Confirm a remote delete: delete local file */
   async confirmRemoteDelete(path: string): Promise<void> {
-    if (this.acquireGate("confirmDelete")) {
-      this.notice("notice.delete.failed", { path, reason: this.t("result.lockBusy") });
-      return;
-    }
-    try {
-      // Try Obsidian Trash first (recoverable), fall back to permanent remove
-      const tfile = this.scanner.vault.getFileByPath(path);
-      if (tfile) {
-        try {
-          if (this.fileManager) {
-            await this.fileManager.trashFile(tfile);
-          } else {
-            await this.scanner.vault.adapter.remove(path);
-          }
-        } catch {
-          await this.scanner.vault.adapter.remove(path);
-        }
-      } else {
-        await this.scanner.vault.adapter.remove(path);
+    return this.enqueueSideAction(path, SyncActionType.DeleteRemote, async () => {
+      try {
+        await this.deleteLocalPath(path);
+        await this.state.removeBaseEntry(path);
+        await this.state.removePendingDelete(path);
+        this.notice("notice.delete.confirmed", { path });
+      } catch (e) {
+        this.notice("notice.delete.failed", { path, reason: e instanceof Error ? e.message : this.t("general.unknown") });
       }
-      await this.state.removeBaseEntry(path);
-      await this.state.removePendingDelete(path);
-      this.notice("notice.delete.confirmed", { path });
-    } catch (e) {
-      this.notice("notice.delete.failed", { path, reason: e instanceof Error ? e.message : this.t("general.unknown") });
-    }
+    });
   }
 
   /** Reject a remote delete: re-upload local file */
   async rejectRemoteDelete(path: string): Promise<void> {
-    if (this.acquireGate("rejectDelete")) {
-      this.notice("notice.delete.failed", { path, reason: this.t("result.lockBusy") });
-      return;
-    }
-    const pending = this.state.pendingRemoteDeletes.find((d) => d.path === path);
-    if (!pending?.local) {
-      this.notice("notice.delete.failed", { path, reason: this.t("general.unknown") });
-      return;
-    }
-    try {
-      const content = await this.scanner.vault.adapter.readBinary(path);
-      const uploadResult = await this.onedrive.uploadFile(this.vaultName, path, content);
-      await this.state.updateBaseEntry({
-        path, hash: pending.local.hash, size: pending.local.size, eTag: uploadResult.eTag ?? "",
-      });
-      await this.state.applyRemoteMutations([
-        this.toUploadedRemoteEntry(path, pending.local, uploadResult),
-      ], []);
-      await this.state.removePendingDelete(path);
-      this.notice("notice.delete.rejected", { path });
-    } catch (e) {
-      this.notice("notice.delete.failed", { path, reason: e instanceof Error ? e.message : this.t("general.unknown") });
-    }
+    return this.enqueueSideAction(path, SyncActionType.Upload, async () => {
+      const pending = this.state.pendingRemoteDeletes.find((d) => d.path === path);
+      if (!pending?.local) {
+        this.notice("notice.delete.failed", { path, reason: this.t("general.unknown") });
+        return;
+      }
+      try {
+        const content = await this.scanner.vault.adapter.readBinary(path);
+        const uploadResult = await this.onedrive.uploadFile(
+          this.vaultName,
+          path,
+          content,
+          (uploaded, total) => this.updateSideActionProgress(uploaded, total),
+        );
+        await this.state.updateBaseEntry({
+          path, hash: pending.local.hash, size: pending.local.size, eTag: uploadResult.eTag ?? "",
+        });
+        await this.state.applyRemoteMutations([
+          this.toUploadedRemoteEntry(path, pending.local, uploadResult),
+        ], []);
+        await this.state.removePendingDelete(path);
+        this.notice("notice.delete.rejected", { path });
+      } catch (e) {
+        this.notice("notice.delete.failed", { path, reason: e instanceof Error ? e.message : this.t("general.unknown") });
+      }
+    });
   }
 }
 

@@ -20,7 +20,6 @@ export class SyncPlanAlertModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.addClass("easy-sync-plan-alert");
     this.setTitle(this.title);
 
     contentEl.createEl("p", {
@@ -105,7 +104,6 @@ export class ConfirmModal extends Modal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.addClass("easy-sync-confirm-modal");
     this.setTitle(this.title);
 
     if (this.options?.message) {
@@ -134,17 +132,17 @@ export class ConfirmModal extends Modal {
         }
       }
       if (this.plan.deletes > 0) {
-        contentEl.createDiv("easy-sync-confirm-warn").setText(
+        contentEl.createDiv().setText(
           this.t("confirm.deleteWarning", { count: this.plan.deletes }),
         );
       }
     }
     if (this.options?.warning) {
-      contentEl.createDiv("easy-sync-confirm-warn").setText(this.options.warning);
+      contentEl.createDiv().setText(this.options.warning);
     }
 
     // Buttons
-    const btnRow = contentEl.createDiv({ cls: "modal-button-container easy-sync-confirm-actions" });
+    const btnRow = contentEl.createDiv("modal-button-container");
     const confirmBtn = btnRow.createEl("button", {
       text: this.confirmLabel,
       cls: this.options?.danger ? "mod-warning" : "mod-cta",

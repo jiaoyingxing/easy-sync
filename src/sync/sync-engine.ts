@@ -55,6 +55,20 @@ export function remoteContentMatchesBase(
   );
 }
 
+const PROTECTED_CONFIG_CONFLICT_PATHS = new Set([
+  ".obsidian/app.json",
+  ".obsidian/appearance.json",
+  ".obsidian/hotkeys.json",
+  ".obsidian/core-plugins.json",
+  ".obsidian/community-plugins.json",
+]);
+
+function isProtectedConfigConflictPath(path: string): boolean {
+  // ponytail: keep this list narrow — only single-path, user-meaningful config
+  // files that would otherwise degrade into noisy "new + delete" churn.
+  return PROTECTED_CONFIG_CONFLICT_PATHS.has(path);
+}
+
 export class SyncEngine {
   /**
    * Generate a sync plan by comparing local, remote, and base snapshots.
@@ -192,6 +206,14 @@ export class SyncEngine {
           reason: "reason.localDeletedRemoteModified",
         };
       }
+      if (isProtectedConfigConflictPath(path)) {
+        return {
+          type: SyncActionType.Conflict,
+          path,
+          remote,
+          reason: "reason.fileDeletedLocally",
+        };
+      }
       // Remote unchanged → user deleted locally, sync the deletion
       return {
         type: SyncActionType.DeleteRemote,
@@ -210,6 +232,14 @@ export class SyncEngine {
           path,
           local,
           reason: "reason.remoteDeletedLocalModified",
+        };
+      }
+      if (isProtectedConfigConflictPath(path)) {
+        return {
+          type: SyncActionType.Conflict,
+          path,
+          local,
+          reason: "reason.fileDeletedFromRemote",
         };
       }
       // Local unchanged → remote deletion affects local, ask user

@@ -152,6 +152,15 @@ export class Plugin {
   registerObsidianProtocolHandler(_action: string, _handler: (params: unknown) => void): void {}
 }
 
+export class PluginSettingTab {
+  containerEl: HTMLElement = document.createElement("div");
+
+  constructor(public app: App, public plugin: Plugin) {}
+
+  display(): void {}
+  hide(): void {}
+}
+
 export interface App {
   vault: Vault;
   workspace: Workspace;

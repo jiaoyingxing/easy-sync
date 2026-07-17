@@ -10,12 +10,76 @@
 
 import { PluginSettingTab, Setting, SettingGroup, Notice } from "obsidian";
 import type EasySyncPlugin from "../main";
+import { isAnySyncActivityRunning } from "../sync/sync-progress";
 import { AuthPendingModal } from "./auth-pending-modal";
 import { ConfigSyncModal } from "./config-sync-modal";
 import { ConfirmModal } from "./confirm-modal";
 
 const GITHUB_URL = "https://github.com/jiaoyingxing/easy-sync";
 const XHS_URL = "https://xhslink.com/m/57v8xzlVMKp";
+
+export interface SettingsSyncButtonStateInput {
+  hasCompletedSync: boolean;
+  isRunning: boolean;
+  canCancel: boolean;
+  planReviewActive: boolean;
+}
+
+export interface SettingsSyncButtonState {
+  labelKey: string;
+  cta: boolean;
+  warning: boolean;
+  disabled: boolean;
+  action: "start-first" | "start-manual" | "confirm-plan" | "cancel-sync" | "processing";
+}
+
+export function buildSettingsSyncButtonState(
+  input: SettingsSyncButtonStateInput,
+): SettingsSyncButtonState {
+  if (input.isRunning && input.canCancel) {
+    return {
+      labelKey: "syncView.cancelSync",
+      cta: false,
+      warning: true,
+      disabled: false,
+      action: "cancel-sync",
+    };
+  }
+  if (input.isRunning) {
+    return {
+      labelKey: "syncView.conflict.processing",
+      cta: false,
+      warning: false,
+      disabled: true,
+      action: "processing",
+    };
+  }
+  if (input.planReviewActive) {
+    return {
+      labelKey: "syncPlan.confirmExecute",
+      cta: true,
+      warning: false,
+      disabled: false,
+      action: "confirm-plan",
+    };
+  }
+  if (input.hasCompletedSync) {
+    return {
+      labelKey: "settings.firstSync.sync",
+      cta: true,
+      warning: false,
+      disabled: false,
+      action: "start-manual",
+    };
+  }
+  return {
+    labelKey: "settings.firstSync.start",
+    cta: true,
+    warning: false,
+    disabled: false,
+    action: "start-first",
+  };
+}
 
 export class EasySyncSettingTab extends PluginSettingTab {
   plugin: EasySyncPlugin;
@@ -99,7 +163,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
               ).awaitConfirm();
               if (!confirmed) return;
               await this.plugin.resetSyncState();
-              this.refreshSyncSection();
+              this.refreshSyncState();
             })();
           });
         });
@@ -154,7 +218,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
     this.renderSyncSection(t);
   }
 
-  private refreshSyncSection(): void {
+  refreshSyncState(): void {
     if (!this.syncSectionEl?.isConnected) return;
     this.renderSyncSection(this.plugin.i18n.t.bind(this.plugin.i18n));
   }
@@ -179,6 +243,19 @@ export class EasySyncSettingTab extends PluginSettingTab {
     if (!this.syncSectionEl) return;
     this.syncSectionEl.empty();
     const hasCompletedSync = this.plugin.hasCompletedSyncState();
+    const fullSyncRunning = this.plugin.syncExecutor?.isRunning ?? false;
+    const sideActionRunning = this.plugin.syncExecutor?.hasSideActionsInFlight ?? false;
+    const isRunning = isAnySyncActivityRunning(
+      this.plugin.progressStore.state,
+      fullSyncRunning,
+      sideActionRunning,
+    );
+    const buttonState = buildSettingsSyncButtonState({
+      hasCompletedSync,
+      isRunning,
+      canCancel: fullSyncRunning,
+      planReviewActive: this.plugin.state?.planReviewActive ?? false,
+    });
     const syncGroup = new SettingGroup(this.syncSectionEl).setHeading(t("settings.group.sync"));
 
     if (this.plugin.auth?.authState.isLoggedIn) {
@@ -187,21 +264,33 @@ export class EasySyncSettingTab extends PluginSettingTab {
           .setName(t("settings.firstSync.name"))
           .setDesc(t("settings.firstSync.desc"))
           .addButton((btn) => {
-            btn.setCta();
-            btn.setButtonText(
-              hasCompletedSync
-                ? t("settings.firstSync.sync")
-                : t("settings.firstSync.start"),
-            ).onClick(() => {
-              void (async () => {
-                if (hasCompletedSync) {
-                  await this.plugin.startManualSync?.();
-                } else {
-                  await this.plugin.startFirstSync?.();
+            if (buttonState.cta) {
+              btn.setCta();
+            }
+            if (buttonState.warning) {
+              btn.buttonEl.classList.add("mod-warning");
+            }
+            btn
+              .setButtonText(t(buttonState.labelKey))
+              .setDisabled(buttonState.disabled)
+              .onClick(() => {
+                switch (buttonState.action) {
+                  case "start-manual":
+                    void this.plugin.startManualSync?.();
+                    return;
+                  case "start-first":
+                    void this.plugin.startFirstSync?.();
+                    return;
+                  case "confirm-plan":
+                    void this.plugin.executePlanReview?.();
+                    return;
+                  case "cancel-sync":
+                    void this.plugin.cancelSync?.();
+                    return;
+                  case "processing":
+                    return;
                 }
-                this.refreshSyncSection();
-              })();
-            });
+              });
           });
       });
     }
@@ -236,7 +325,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
               this.plugin.autoSyncPaused = false;
               await this.plugin.saveSyncSettings();
               this.plugin.restartAutoSync();
-              this.refreshSyncSection();
+              this.refreshSyncState();
             });
         });
     });

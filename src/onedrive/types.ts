@@ -54,27 +54,6 @@ export interface UploadResult {
   lastModifiedDateTime?: string;
 }
 
-/** Error response from Microsoft Graph */
-export interface GraphErrorResponse {
-  error?: {
-    code: string;
-    message: string;
-    innerError?: {
-      code: string;
-      date?: string;
-      "request-id"?: string;
-      "client-request-id"?: string;
-    };
-  };
-}
-
-/** Rate limit info extracted from response headers */
-export interface RateLimitInfo {
-  retryAfterSeconds: number | null;
-  rateLimitRemaining: string | null;
-  rateLimitTotal: string | null;
-}
-
 /** OneDrive-specific error types for classification */
 export enum OneDriveErrorType {
   Unauthorized = "Unauthorized",

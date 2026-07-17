@@ -18,6 +18,7 @@ import type { PlanReviewItem, SyncPlanItem } from "../sync/types";
 import {
   type SyncPhase,
   type FileProgress,
+  isAnySyncActivityRunning,
   type SyncProgressState,
 } from "../sync/sync-progress";
 import type { PendingIssue, SyncHistoryEntry } from "../sync/state-manager";
@@ -32,6 +33,7 @@ interface StatusPanelState {
   isLoggedIn: boolean;
   isInitializing: boolean;
   isRunning: boolean;
+  canCancel: boolean;
   lastSyncTime: number;
   pendingCount: number;
   planReviewActive: boolean;
@@ -40,10 +42,14 @@ interface StatusPanelState {
   progress: Readonly<SyncProgressState>;
 }
 
+type SyncViewBodyMode = "plan" | "progress" | "pending" | "idle";
+
 export interface SyncViewContentKeyInput {
   isLoggedIn: boolean;
   isInitializing: boolean;
   isRunning: boolean;
+  canCancel: boolean;
+  bodyMode: SyncViewBodyMode;
   progress: Readonly<SyncProgressState>;
   planReviewActive: boolean;
   pendingIssues: PendingIssue[];
@@ -124,22 +130,22 @@ export function buildSyncViewContentKey(
   input: SyncViewContentKeyInput,
 ): string {
   const authKey = `auth:${input.isInitializing ? 1 : 0}:${input.isLoggedIn ? 1 : 0}`;
+  const runKey = `run:${input.isRunning ? 1 : 0}:${input.canCancel ? 1 : 0}`;
   const historyIds = input.history.map((entry) => entry.id).join("|");
   const historyKey = historyExpanded ? `history:open:${historyIds}` : "history:closed";
-  if (input.planReviewActive) {
-    const runningKey = input.isRunning ? "run:1" : "run:0";
+  if (input.bodyMode === "plan") {
     const counts = input.planReviewCounts
       ? `${input.planReviewCounts.uploads},${input.planReviewCounts.downloads},${input.planReviewCounts.deletes},${input.planReviewCounts.conflicts},${input.planReviewCounts.skipped}`
       : "";
     const items = input.planReviewItems
       .map((item) => `${item.type}:${item.path}:${item.reason ?? ""}`)
       .join("|");
-    return `plan:${authKey}:${runningKey}:${counts}:${items}:${historyKey}`;
+    return `plan:${authKey}:${runKey}:${counts}:${items}:${historyKey}`;
   }
-  if (input.isRunning) {
-    return `running:${authKey}:${input.progress.phase}:${historyKey}`;
+  if (input.bodyMode === "progress") {
+    return `progress:${authKey}:${input.progress.phase}:${historyKey}`;
   }
-  if (input.pendingIssues.length > 0 || input.conflicts.length > 0 || input.pendingDeletes.length > 0) {
+  if (input.bodyMode === "pending") {
     const issues = input.pendingIssues
       .map((issue) => `${issue.actionType}:${issue.path}:${issue.updatedAt}:${issue.reason ?? ""}`)
       .join("|");
@@ -149,9 +155,9 @@ export function buildSyncViewContentKey(
     const deletes = input.pendingDeletes
       .map((item) => `${item.type}:${item.path}:${item.reason ?? ""}`)
       .join("|");
-    return `pending:${authKey}:${issues}:${conflicts}:${deletes}:${historyKey}`;
+    return `pending:${authKey}:${runKey}:${issues}:${conflicts}:${deletes}:${historyKey}`;
   }
-  return `idle:${authKey}:${input.lastSyncTime}:${historyKey}`;
+  return `idle:${authKey}:${runKey}:${input.lastSyncTime}:${historyKey}`;
 }
 
 /** Format byte progress as "downloaded/total unit" with unit shown once. */
@@ -246,22 +252,39 @@ export class EasySyncSyncView extends ItemView {
   private doRender(): void {
     const container = this.contentEl;
     const progress = this.plugin.progressStore.state;
-    const isRunning = this.plugin.syncExecutor?.isRunning ?? false;
+    const fullSyncRunning = this.plugin.syncExecutor?.isRunning ?? false;
+    const canCancel = fullSyncRunning;
+    const sideActionRunning = this.plugin.syncExecutor?.hasSideActionsInFlight ?? false;
+    const isRunning = isAnySyncActivityRunning(
+      progress,
+      fullSyncRunning,
+      sideActionRunning,
+    );
     const syncState = this.plugin.state;
     const isInitializing = this.plugin.auth?.isInitializing ?? false;
     const authState = this.plugin.auth?.authState;
     const isLoggedIn = isInitializing ? false : (authState?.isLoggedIn ?? false);
-    const conflicts = syncState?.pendingConflicts ?? [];
-    const pendingDeletes = syncState?.pendingRemoteDeletes ?? [];
+    const conflicts = (syncState?.pendingConflicts ?? [])
+      .filter((item) => !this.plugin.syncExecutor?.isSideActionQueued(item.path));
+    const pendingDeletes = (syncState?.pendingRemoteDeletes ?? [])
+      .filter((item) => !this.plugin.syncExecutor?.isSideActionQueued(item.path));
     const pendingIssues = syncState?.pendingIssues ?? [];
     const planReviewActive = syncState?.planReviewActive ?? false;
     const pendingCount = pendingIssues.length + conflicts.length + pendingDeletes.length;
+    const bodyMode: SyncViewBodyMode = planReviewActive && syncState
+      ? "plan"
+      : fullSyncRunning
+        ? "progress"
+        : pendingCount > 0
+          ? "pending"
+          : "idle";
 
     // Phase change or not running → full rebuild
     const statusState: StatusPanelState = {
       isLoggedIn,
       isInitializing,
       isRunning,
+      canCancel,
       lastSyncTime: syncState?.lastSyncTime ?? 0,
       pendingCount,
       planReviewActive,
@@ -273,6 +296,8 @@ export class EasySyncSyncView extends ItemView {
       isLoggedIn,
       isInitializing,
       isRunning,
+      canCancel,
+      bodyMode,
       progress,
       planReviewActive,
       pendingIssues,
@@ -307,7 +332,7 @@ export class EasySyncSyncView extends ItemView {
 
       this.renderStatusPanel(content, statusState);
 
-      if (planReviewActive && syncState) {
+      if (bodyMode === "plan" && syncState) {
         this.renderPlanReviewSection(
           content,
           syncState.planReviewCounts,
@@ -315,9 +340,9 @@ export class EasySyncSyncView extends ItemView {
           conflicts,
           pendingDeletes,
         );
-      } else if (isRunning) {
+      } else if (bodyMode === "progress") {
         this.renderProgressPanel(content, progress);
-      } else if (pendingIssues.length > 0 || conflicts.length > 0 || pendingDeletes.length > 0) {
+      } else if (bodyMode === "pending") {
         this.renderPendingSection(content, pendingIssues, conflicts, pendingDeletes);
       }
 
@@ -414,7 +439,7 @@ export class EasySyncSyncView extends ItemView {
     pressed?: boolean,
   ): HTMLButtonElement {
     const button = container.createEl("button", {
-      cls: "clickable-icon nav-action-button easy-sync-nav-action",
+      cls: "clickable-icon nav-action-button",
       attr: { "aria-label": label, type: "button" },
     });
     if (pressed !== undefined) {
@@ -444,13 +469,17 @@ export class EasySyncSyncView extends ItemView {
       new ButtonComponent(actions)
         .setButtonText(t("settings.account.checking"))
         .setDisabled(true);
-    } else if (state.isLoggedIn && state.isRunning) {
+    } else if (state.isLoggedIn && state.isRunning && state.canCancel) {
       const cancelButton = new ButtonComponent(actions)
         .setButtonText(t("syncView.cancelSync"));
       cancelButton.buttonEl.classList.add("mod-warning");
       cancelButton.onClick(() => {
         void this.plugin.cancelSync();
       });
+    } else if (state.isLoggedIn && state.isRunning) {
+      new ButtonComponent(actions)
+        .setButtonText(t("syncView.conflict.processing"))
+        .setDisabled(true);
     } else if (state.isLoggedIn && state.planReviewActive) {
       new ButtonComponent(actions)
         .setButtonText(t("command.syncNow"))
@@ -656,7 +685,7 @@ export class EasySyncSyncView extends ItemView {
     pendingDeletes: SyncPlanItem[],
   ): void {
     const section = container
-      .createDiv("easy-sync-section easy-sync-issues-section")
+      .createDiv("easy-sync-section")
       .createDiv("easy-sync-section-body");
     const failures = issues.filter((issue) => issue.actionType !== SyncActionType.SkipLargeFile);
     const skipped = issues.filter((issue) => issue.actionType === SyncActionType.SkipLargeFile);
@@ -673,7 +702,7 @@ export class EasySyncSyncView extends ItemView {
     retryable: boolean,
   ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    const details = container.createEl("details", "easy-sync-tree-item easy-sync-issue-item");
+    const details = container.createEl("details", "easy-sync-tree-item");
     const summary = details.createEl("summary", "easy-sync-tree-row");
     this.addCollapseIcon(summary);
     const actionIcon = summary.createSpan("easy-sync-tree-status-icon");
@@ -866,7 +895,7 @@ export class EasySyncSyncView extends ItemView {
 
   private renderConflictItem(container: HTMLElement, item: SyncPlanItem): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    const details = container.createEl("details", "easy-sync-tree-item easy-sync-issue-item");
+    const details = container.createEl("details", "easy-sync-tree-item");
     const summary = details.createEl("summary", "easy-sync-tree-row");
     this.addCollapseIcon(summary);
     const icon = summary.createSpan("easy-sync-tree-status-icon");
@@ -910,7 +939,7 @@ export class EasySyncSyncView extends ItemView {
 
   private renderDeleteItem(container: HTMLElement, item: SyncPlanItem): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    const details = container.createEl("details", "easy-sync-tree-item easy-sync-issue-item");
+    const details = container.createEl("details", "easy-sync-tree-item");
     const summary = details.createEl("summary", "easy-sync-tree-row");
     this.addCollapseIcon(summary);
     const icon = summary.createSpan("easy-sync-tree-status-icon");
@@ -932,7 +961,7 @@ export class EasySyncSyncView extends ItemView {
   private createSection(container: HTMLElement, title: string): HTMLElement {
     const section = container.createDiv("easy-sync-section");
     section.createEl("h4", { cls: "easy-sync-section-title", text: title });
-    return section.createDiv("easy-sync-section-body");
+    return section.createDiv("easy-sync-section-body easy-sync-section-content");
   }
 
   private createTreeGroup(
@@ -941,9 +970,9 @@ export class EasySyncSyncView extends ItemView {
     count: number,
     open: boolean,
   ): HTMLElement {
-    const details = container.createEl("details", "easy-sync-tree-group easy-sync-tree-item");
+    const details = container.createEl("details", "easy-sync-tree-item");
     details.open = open;
-    const summary = details.createEl("summary", "easy-sync-tree-group-summary easy-sync-tree-row");
+    const summary = details.createEl("summary", "easy-sync-tree-row");
     this.addCollapseIcon(summary);
     summary.createSpan("easy-sync-tree-label").setText(title);
     summary.createSpan("easy-sync-tree-count").setText(String(count));

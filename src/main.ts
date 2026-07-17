@@ -16,7 +16,7 @@ import { LocalScanner } from "./sync/local-scanner";
 import { SyncEngine } from "./sync/sync-engine";
 import { StateManager } from "./sync/state-manager";
 import { SyncExecutor, type SyncMode, type SyncResult } from "./sync/sync-executor";
-import { SyncProgressStore } from "./sync/sync-progress";
+import { isAnySyncActivityRunning, SyncProgressStore } from "./sync/sync-progress";
 import { DiagnosticLogger } from "./sync/diagnostic-logger";
 import { EasySyncSettingTab } from "./ui/settings-tab";
 import { EasySyncSyncView, SYNC_VIEW_TYPE } from "./ui/sync-view";
@@ -218,6 +218,11 @@ export default class EasySyncPlugin extends Plugin {
       this.diag,
       this.autoMerge,
       this.app.fileManager,
+      () => {
+        this.updateStatusBar();
+        this.syncView?.render();
+        this.settingsTab?.refreshSyncState();
+      },
     );
 
     // ════ ④ Register UI (Obsidian is usable from here on) ════
@@ -1067,9 +1072,13 @@ export default class EasySyncPlugin extends Plugin {
 
   updateStatusBar(): void {
     this.updateRibbon();
+    this.settingsTab?.refreshSyncState();
     if (!this.statusBarEl) return;
     this.statusBarEl.empty();
     const t = this.i18n.t.bind(this.i18n);
+    const fullSyncRunning = this.syncExecutor?.isRunning ?? false;
+    const sideActionRunning = this.syncExecutor?.hasSideActionsInFlight ?? false;
+    const isRunning = isAnySyncActivityRunning(this.progressStore.state, fullSyncRunning, sideActionRunning);
 
     // Auth still initializing in background -> show "Connecting..."
     if (this.auth?.isInitializing) {
@@ -1083,7 +1092,7 @@ export default class EasySyncPlugin extends Plugin {
       return;
     }
 
-    if (this.syncExecutor?.isRunning) {
+    if (isRunning) {
       this.statusBarEl.setText(t("status.syncing"));
       return;
     }
@@ -1129,10 +1138,12 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private getRibbonStatus(): RibbonStatus {
+    const fullSyncRunning = this.syncExecutor?.isRunning ?? false;
+    const sideActionRunning = this.syncExecutor?.hasSideActionsInFlight ?? false;
     return resolveRibbonStatus({
       loggedIn: this.auth?.authState.isLoggedIn ?? false,
       cancelling: this.progressStore.state.cancelRequested,
-      syncing: this.syncExecutor?.isRunning ?? false,
+      syncing: isAnySyncActivityRunning(this.progressStore.state, fullSyncRunning, sideActionRunning),
       needsAttention: this.autoSyncPaused
         || (this.state?.planReviewActive ?? false)
         || (this.state?.pendingIssues.length ?? 0) > 0
