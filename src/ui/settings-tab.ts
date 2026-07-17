@@ -85,6 +85,8 @@ export class EasySyncSettingTab extends PluginSettingTab {
   plugin: EasySyncPlugin;
   private accountSectionEl: HTMLElement | null = null;
   private syncSectionEl: HTMLElement | null = null;
+  private aboutSectionEl: HTMLElement | null = null;
+  private maintenanceSectionEl: HTMLElement | null = null;
 
   constructor(plugin: EasySyncPlugin) {
     super(plugin.app, plugin);
@@ -94,9 +96,14 @@ export class EasySyncSettingTab extends PluginSettingTab {
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    containerEl.addClass("easy-sync-settings-tab");
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     this.accountSectionEl = containerEl.createDiv("easy-sync-settings-account");
-    this.syncSectionEl = containerEl.createDiv("easy-sync-settings-sync");
+    this.syncSectionEl = containerEl.createDiv("easy-sync-settings-group-host easy-sync-settings-sync");
+    this.aboutSectionEl = containerEl.createDiv("easy-sync-settings-group-host easy-sync-settings-about");
+    this.maintenanceSectionEl = containerEl.createDiv(
+      "easy-sync-settings-group-host easy-sync-settings-maintenance",
+    );
 
     // ========================================================================
     // Account — no heading, always visible
@@ -109,106 +116,14 @@ export class EasySyncSettingTab extends PluginSettingTab {
     this.renderSyncSection(t);
 
     // ========================================================================
-    // Maintenance group
-    // ========================================================================
-    const maintGroup = new SettingGroup(containerEl).setHeading(t("settings.group.maintenance"));
-
-    maintGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.diagLog.name"))
-        .setDesc(t("settings.diagLog.desc"))
-        .addToggle((toggle) => {
-          toggle
-            .setValue(this.plugin.diagLogEnabled)
-            .onChange(async (value) => {
-              this.plugin.diagLogEnabled = value;
-              await this.plugin.saveSyncSettings();
-              this.plugin.applyDiagnosticSetting();
-            });
-        });
-    });
-
-    maintGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.diagReport.name"))
-        .setDesc(t("settings.diagReport.desc"))
-        .addButton((btn) => {
-          btn.setButtonText(t("settings.diagReport.generate"))
-            .onClick(() => {
-              void this.plugin.generateDiagnosticReport();
-            });
-        });
-    });
-
-    maintGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.reset.name"))
-        .setDesc(t("settings.reset.desc"))
-        .addButton((btn) => {
-          btn.buttonEl.classList.add("mod-warning");
-          btn.setButtonText(t("settings.reset.button")).onClick(() => {
-            void (async () => {
-              const confirmed = await new ConfirmModal(
-                this.plugin.app,
-                t("settings.reset.confirmTitle"),
-                null,
-                t("settings.reset.confirm"),
-                t("confirm.cancel"),
-                t,
-                {
-                  message: t("settings.reset.confirmMessage"),
-                  warning: t("settings.reset.confirmWarning"),
-                  danger: true,
-                },
-              ).awaitConfirm();
-              if (!confirmed) return;
-              await this.plugin.resetSyncState();
-              this.refreshSyncState();
-            })();
-          });
-        });
-    });
-
-    // ========================================================================
     // About group
     // ========================================================================
-    const aboutGroup = new SettingGroup(containerEl).setHeading(t("settings.group.about"));
+    this.renderAboutSection(t);
 
-    aboutGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.about.product.name"))
-        .setDesc(t("settings.about.product.desc", { version: this.plugin.manifest.version }));
-    });
-
-    aboutGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.about.author.name"))
-        .setDesc(t("settings.about.author.desc"))
-        .addButton((btn) => {
-          btn.setButtonText(t("settings.about.contact.github"))
-            .onClick(() => {
-              window.open(GITHUB_URL, "_blank", "noopener,noreferrer");
-            });
-        })
-        .addButton((btn) => {
-          btn.setButtonText(t("settings.about.contact.xiaohongshu"))
-            .onClick(() => {
-              window.open(XHS_URL, "_blank", "noopener,noreferrer");
-            });
-        });
-    });
-
-    aboutGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.about.usage.name"))
-        .setDesc(t("settings.about.usage.desc"));
-    });
-
-    aboutGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.about.disclaimer.name"))
-        .setDesc(t("settings.about.disclaimer.desc"));
-    });
+    // ========================================================================
+    // Maintenance group
+    // ========================================================================
+    this.renderMaintenanceSection(t);
   }
 
   refreshAuthState(): void {
@@ -227,6 +142,8 @@ export class EasySyncSettingTab extends PluginSettingTab {
     super.hide();
     this.accountSectionEl = null;
     this.syncSectionEl = null;
+    this.aboutSectionEl = null;
+    this.maintenanceSectionEl = null;
   }
 
   private renderAccountSection(
@@ -387,6 +304,116 @@ export class EasySyncSettingTab extends PluginSettingTab {
               this.plugin.autoMerge = value;
               await this.plugin.saveSyncSettings();
             });
+        });
+    });
+  }
+
+  private renderAboutSection(
+    t: (key: string, params?: Record<string, string | number>) => string,
+  ): void {
+    if (!this.aboutSectionEl) return;
+    this.aboutSectionEl.empty();
+    const aboutGroup = new SettingGroup(this.aboutSectionEl).setHeading(t("settings.group.about"));
+
+    aboutGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.about.product.name"))
+        .setDesc(t("settings.about.product.desc", { version: this.plugin.manifest.version }));
+    });
+
+    aboutGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.about.author.name"))
+        .setDesc(t("settings.about.author.desc"))
+        .addButton((btn) => {
+          btn.setButtonText(t("settings.about.contact.github"))
+            .onClick(() => {
+              window.open(GITHUB_URL, "_blank", "noopener,noreferrer");
+            });
+        })
+        .addButton((btn) => {
+          btn.setButtonText(t("settings.about.contact.xiaohongshu"))
+            .onClick(() => {
+              window.open(XHS_URL, "_blank", "noopener,noreferrer");
+            });
+        });
+    });
+
+    aboutGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.about.usage.name"))
+        .setDesc(t("settings.about.usage.desc"));
+    });
+
+    aboutGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.about.disclaimer.name"))
+        .setDesc(t("settings.about.disclaimer.desc"));
+    });
+  }
+
+  private renderMaintenanceSection(
+    t: (key: string, params?: Record<string, string | number>) => string,
+  ): void {
+    if (!this.maintenanceSectionEl) return;
+    this.maintenanceSectionEl.empty();
+    const maintGroup = new SettingGroup(this.maintenanceSectionEl).setHeading(
+      t("settings.group.maintenance"),
+    );
+
+    maintGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.diagLog.name"))
+        .setDesc(t("settings.diagLog.desc"))
+        .addToggle((toggle) => {
+          toggle
+            .setValue(this.plugin.diagLogEnabled)
+            .onChange(async (value) => {
+              this.plugin.diagLogEnabled = value;
+              await this.plugin.saveSyncSettings();
+              this.plugin.applyDiagnosticSetting();
+            });
+        });
+    });
+
+    maintGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.diagReport.name"))
+        .setDesc(t("settings.diagReport.desc"))
+        .addButton((btn) => {
+          btn.setButtonText(t("settings.diagReport.generate"))
+            .onClick(() => {
+              void this.plugin.generateDiagnosticReport();
+            });
+        });
+    });
+
+    maintGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.reset.name"))
+        .setDesc(t("settings.reset.desc"))
+        .addButton((btn) => {
+          btn.buttonEl.classList.add("mod-warning");
+          btn.setButtonText(t("settings.reset.button")).onClick(() => {
+            void (async () => {
+              const confirmed = await new ConfirmModal(
+                this.plugin.app,
+                t("settings.reset.confirmTitle"),
+                null,
+                t("settings.reset.confirm"),
+                t("confirm.cancel"),
+                t,
+                {
+                  message: t("settings.reset.confirmMessage"),
+                  warning: t("settings.reset.confirmWarning"),
+                  danger: true,
+                },
+              ).awaitConfirm();
+              if (!confirmed) return;
+              await this.plugin.resetSyncState();
+              this.refreshSyncState();
+            })();
+          });
         });
     });
   }

@@ -161,6 +161,60 @@ export class PluginSettingTab {
   hide(): void {}
 }
 
+export class ButtonComponent {
+  buttonEl = { classList: { add: () => undefined } } as unknown as HTMLButtonElement;
+
+  constructor(_containerEl: HTMLElement) {}
+  setButtonText(_text: string): this { return this; }
+  setDisabled(_disabled: boolean): this { return this; }
+  setWarning(): this { return this; }
+  setDestructive(): this { return this; }
+  setCta(): this { return this; }
+  onClick(_callback: () => void | Promise<void>): this { return this; }
+}
+
+export class ToggleComponent {
+  constructor(_containerEl: HTMLElement) {}
+  setValue(_value: boolean): this { return this; }
+  onChange(_callback: (value: boolean) => void | Promise<void>): this { return this; }
+}
+
+export class SliderComponent {
+  sliderEl = {} as HTMLInputElement;
+
+  constructor(_containerEl: HTMLElement) {}
+  setLimits(_min: number, _max: number, _step: number): this { return this; }
+  setValue(_value: number): this { return this; }
+  onChange(_callback: (value: number) => void | Promise<void>): this { return this; }
+}
+
+export class Setting {
+  constructor(_containerEl: HTMLElement) {}
+  setName(_name: string): this { return this; }
+  setDesc(_desc: string): this { return this; }
+  addButton(callback: (component: ButtonComponent) => void): this {
+    callback(new ButtonComponent({} as HTMLElement));
+    return this;
+  }
+  addToggle(callback: (component: ToggleComponent) => void): this {
+    callback(new ToggleComponent({} as HTMLElement));
+    return this;
+  }
+  addSlider(callback: (component: SliderComponent) => void): this {
+    callback(new SliderComponent({} as HTMLElement));
+    return this;
+  }
+}
+
+export class SettingGroup {
+  constructor(_containerEl: HTMLElement) {}
+  setHeading(_text: string): this { return this; }
+  addSetting(callback: (setting: Setting) => void): this {
+    callback(new Setting({} as HTMLElement));
+    return this;
+  }
+}
+
 export interface App {
   vault: Vault;
   workspace: Workspace;
@@ -178,16 +232,6 @@ export class ItemView {
   contentEl: HTMLElement = document.createElement("div");
 
   constructor(_leaf: WorkspaceLeaf) {}
-}
-
-export class ButtonComponent {
-  constructor(_containerEl: HTMLElement) {}
-  setButtonText(_text: string): this { return this; }
-  setDisabled(_disabled: boolean): this { return this; }
-  setWarning(): this { return this; }
-  setDestructive(): this { return this; }
-  setCta(): this { return this; }
-  onClick(_callback: () => void | Promise<void>): this { return this; }
 }
 
 export function setIcon(_el: HTMLElement, _icon: string): void {}
