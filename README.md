@@ -1,6 +1,19 @@
 # 易同步（EasySync）
 
-语言：简体中文 | [English](README-en.md)
+<p align="center">
+  <a href="https://github.com/jiaoyingxing/easy-sync/releases">
+    <img alt="Release downloads" src="https://img.shields.io/github/downloads/jiaoyingxing/easy-sync/total.svg?style=flat-square&label=Release%20downloads" />
+  </a>
+  <a href="https://github.com/jiaoyingxing/easy-sync/releases">
+    <img alt="Latest release" src="https://img.shields.io/github/v/release/jiaoyingxing/easy-sync?style=flat-square&label=Latest%20release" />
+  </a>
+  <a href="./README.md">
+    <img alt="CN 中文版" src="https://img.shields.io/badge/CN-%E4%B8%AD%E6%96%87%E7%89%88-d32f2f?style=flat-square" />
+  </a>
+  <a href="./README-en.md">
+    <img alt="EN English" src="https://img.shields.io/badge/EN-English-2f6fed?style=flat-square" />
+  </a>
+</p>
 
 **基于 OneDrive 的 Obsidian 双向同步插件。冲突可控，移动端可用，笔记和设置同步各有独立开关。**
 
