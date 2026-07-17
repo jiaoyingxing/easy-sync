@@ -1,90 +1,6 @@
 /* EasySync plugin styles */
 
-.easy-sync-status-line {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-weight: 600;
-}
-
-.easy-sync-primary-actions {
-  flex-shrink: 0;
-}
-
-.easy-sync-section {
-  display: flex;
-  flex-direction: column;
-  gap: var(--size-4-2);
-}
-
-.easy-sync-section-title {
-  margin: 0;
-  font-size: 0.95em;
-  font-weight: 600;
-}
-
-.easy-sync-section-body {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.easy-sync-item {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.easy-sync-item + .easy-sync-item {
-  padding-top: 10px;
-  border-top: 1px solid var(--background-modifier-border);
-}
-
-.easy-sync-item-path {
-  font-family: var(--font-monospace);
-  font-size: var(--font-ui-smaller);
-  word-break: break-all;
-}
-
-.easy-sync-item-reason {
-  color: var(--text-muted);
-  font-size: var(--font-ui-smaller);
-}
-
-.easy-sync-item-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.easy-sync-conflict-meta {
-  color: var(--text-faint);
-  font-size: 0.78em;
-  line-height: 1.45;
-}
-
-.easy-sync-conflict-meta-tag {
-  display: inline-flex;
-  align-items: center;
-  margin-left: 6px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: var(--background-modifier-hover);
-  color: var(--text-accent);
-}
-
-.easy-sync-empty-state {
-  color: var(--text-muted);
-  font-size: var(--font-ui-smaller);
-}
-
 /* ---- Sync Progress Panel ---- */
-
-.easy-sync-progress-panel {
-  display: flex;
-  flex-direction: column;
-  gap: var(--size-4-2);
-}
 
 .easy-sync-progress-bar {
   height: 4px;
@@ -111,64 +27,6 @@
   font-size: var(--font-ui-smaller);
   color: var(--text-faint);
   margin-bottom: 2px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.easy-sync-progress-file-list {
-  max-height: 200px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.easy-sync-progress-file {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-  font-size: var(--font-ui-smaller);
-  padding: 2px 4px;
-  border-radius: 3px;
-}
-
-.easy-sync-progress-file:hover {
-  background: var(--background-modifier-hover);
-}
-
-.easy-sync-progress-file-icon {
-  flex-shrink: 0;
-  width: 16px;
-  text-align: center;
-  color: var(--text-muted);
-}
-
-.easy-sync-progress-file-path {
-  flex: 1;
-  font-family: var(--font-monospace);
-  word-break: break-all;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.easy-sync-progress-file-status {
-  flex-shrink: 0;
-  color: var(--text-faint);
-  font-size: 0.85em;
-  padding: 0 4px;
-  border-radius: 999px;
-  background: var(--background-modifier-hover);
-}
-
-.easy-sync-progress-file-reason {
-  flex-basis: calc(100% - 22px);
-  margin-left: 22px;
-  color: var(--text-muted);
-  font-size: 0.85em;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -305,10 +163,6 @@
   background-color: rgba(var(--color-red-rgb), 0.15);
 }
 
-.easy-sync-diff-equal {
-  /* default background */
-}
-
 .easy-sync-diff-gutter {
   flex-shrink: 0;
   width: 80px;
@@ -385,82 +239,6 @@
 
 .easy-sync-detail-actions button {
   padding: 6px 16px;
-}
-
-/* ---- Plan Review Section (sidebar) ---- */
-
-.easy-sync-plan-review {
-  display: flex;
-  flex-direction: column;
-  gap: var(--size-4-2);
-}
-
-.easy-sync-plan-counts {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 4px var(--size-4-3);
-  font-size: var(--font-ui-smaller);
-}
-
-.easy-sync-plan-count {
-  display: flex;
-  justify-content: space-between;
-  gap: var(--size-4-2);
-  min-width: 0;
-}
-
-.easy-sync-plan-count span {
-  color: var(--text-muted);
-}
-
-.easy-sync-plan-groups {
-  border-top: 1px solid var(--background-modifier-border);
-}
-
-.easy-sync-plan-group {
-  border-bottom: 1px solid var(--background-modifier-border);
-}
-
-.easy-sync-plan-group-summary {
-  display: flex;
-  justify-content: space-between;
-  gap: var(--size-4-2);
-  padding: 8px 2px;
-  cursor: pointer;
-  font-size: var(--font-ui-small);
-}
-
-.easy-sync-plan-group-summary strong {
-  color: var(--text-muted);
-}
-
-.easy-sync-plan-group-body {
-  display: flex;
-  flex-direction: column;
-  padding: 0 2px 8px 16px;
-}
-
-.easy-sync-plan-item {
-  min-width: 0;
-  padding: 5px 0;
-}
-
-.easy-sync-plan-item + .easy-sync-plan-item {
-  border-top: 1px solid var(--background-modifier-border-hover);
-}
-
-.easy-sync-plan-item-path {
-  font-family: var(--font-monospace);
-  font-size: var(--font-ui-smaller);
-  overflow-wrap: anywhere;
-}
-
-.easy-sync-plan-execute {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  justify-content: flex-end;
-  margin-top: 4px;
 }
 
 /* ---- Sidebar navigation layout ---- */
@@ -613,6 +391,10 @@
   display: flex;
   flex-direction: column;
   gap: 0;
+}
+
+.easy-sync-section-content {
+  gap: 4px;
 }
 
 .easy-sync-tree-status-icon,
@@ -870,13 +652,16 @@
   font-size: var(--font-ui-smaller);
 }
 
-.easy-sync-history-omitted,
-.easy-sync-empty-state {
-  padding: var(--size-4-2);
-}
-
 .easy-sync-plan-counts {
   display: block;
+  padding: 2px 4px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.easy-sync-history-omitted,
+.easy-sync-empty-state {
+  padding: 2px 4px;
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
 }
@@ -895,4 +680,12 @@
 
 .easy-sync-ribbon[data-easy-sync-status="success"] {
   color: var(--color-green);
+}
+
+/* Settings tab: Obsidian spaces consecutive .setting-group siblings by 1.5em.
+   EasySync wraps each group in a host div for local refresh, which breaks the
+   native adjacent-sibling chain. We restore the same gap on the host divs. */
+.easy-sync-settings-tab .easy-sync-settings-account + .easy-sync-settings-group-host,
+.easy-sync-settings-tab .easy-sync-settings-group-host + .easy-sync-settings-group-host {
+  margin-top: var(--size-4-6);
 }
