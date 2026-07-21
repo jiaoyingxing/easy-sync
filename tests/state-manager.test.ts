@@ -1,7 +1,21 @@
 import { describe, expect, it, vi } from "vitest";
 import { StateManager, type PluginDataStore } from "../src/sync/state-manager";
 import { SyncActionType } from "../src/sync/types";
-import type { BaseFileEntry, RemoteFileEntry, SyncPlanItem } from "../src/sync/types";
+import type {
+  BaseFileEntry,
+  MutationIntentV1,
+  MutationReceiptV1,
+  RemoteFileEntry,
+  RemoteFolderEntry,
+  SyncPlanItem,
+} from "../src/sync/types";
+
+const TEST_SCOPE = {
+  accountId: "account-id",
+  driveId: "drive-id",
+  vaultFolderId: "vault-folder-id",
+  filesRootId: "files-root-id",
+};
 
 function conflict(path: string): SyncPlanItem {
   return { type: SyncActionType.Conflict, path };
@@ -37,6 +51,284 @@ function makeState() {
 }
 
 describe("StateManager batch persistence", () => {
+  it("atomically commits an identical conflict as base and removes the pending item", async () => {
+    const { state, saveData } = makeState();
+    const path = "same.md";
+    await state.upsertPendingConflicts([conflict(path)]);
+    await state.setPlanReviewBundle(
+      [conflict(path)],
+      { uploads: 0, downloads: 0, deletes: 0, conflicts: 1, skipped: 0 },
+      TEST_SCOPE,
+    );
+    saveData.mockClear();
+
+    const entry: BaseFileEntry = {
+      path,
+      hash: "aa".repeat(32),
+      size: 12,
+      eTag: "etag-same",
+    };
+    await state.reconcileIdenticalConflict(entry);
+
+    expect(state.baseSnapshot).toEqual([entry]);
+    expect(state.pendingConflicts).toEqual([]);
+    expect(state.planReviewActive).toBe(false);
+    expect(state.planReviewItems).toEqual([]);
+    expect(saveData).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a mutation receipt until base, remote, and pending checkpoints commit", async () => {
+    const { state } = makeState();
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "op-1",
+      planRevision: 3,
+      scope: TEST_SCOPE,
+      action: "upload",
+      path: "note.md",
+      expectedLocal: { exists: true, hash: "aa".repeat(32), size: 10 },
+      expectedRemote: { exists: false },
+      createdAt: 1,
+    };
+    const remote: RemoteFileEntry = {
+      path: "note.md",
+      driveId: "item-note",
+      parentId: "files-root-id",
+      size: 10,
+      mtime: 2,
+      eTag: "etag-new",
+      cTag: "ctag-new",
+      sha256Hash: "aa".repeat(32),
+    };
+    const receipt: MutationReceiptV1 = {
+      version: 1,
+      operationId: intent.operationId,
+      completedAt: 2,
+      checkpoint: {
+        baseUpserts: [{ path: "note.md", hash: "aa".repeat(32), size: 10, eTag: "etag-new" }],
+        baseRemovals: [],
+        remoteUpserts: [remote],
+        remoteDeletes: [],
+        pendingConflictRemovals: ["note.md"],
+        pendingDeleteRemovals: ["note.md"],
+      },
+    };
+    await state.setRemoteState([], "https://graph.example/delta", TEST_SCOPE);
+    await state.upsertPendingConflicts([conflict("note.md")]);
+    await state.upsertPendingDeletes([pendingDelete("note.md")]);
+
+    await state.beginMutationIntent(intent);
+    await state.recordMutationReceipt(receipt);
+
+    expect(state.mutationLedger).toEqual([{ intent, receipt }]);
+    expect(state.baseSnapshot).toEqual([]);
+    await state.commitMutationCheckpoint(intent.operationId);
+    expect(state.mutationLedger).toEqual([]);
+    expect(state.baseSnapshot).toEqual(receipt.checkpoint.baseUpserts);
+    expect(state.remoteSnapshot).toEqual([remote]);
+    expect(state.pendingConflicts).toEqual([]);
+    expect(state.pendingRemoteDeletes).toEqual([]);
+  });
+
+  it("loads only merge intents with an exact target version", async () => {
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "merge-1",
+      planRevision: 2,
+      scope: TEST_SCOPE,
+      action: "merge",
+      path: "note.md",
+      expectedLocal: { exists: true, hash: "aa".repeat(32), size: 10 },
+      expectedRemote: {
+        exists: true,
+        driveId: "item-note",
+        eTag: "etag-old",
+        size: 11,
+        sha256Hash: "bb".repeat(32),
+      },
+      target: { hash: "cc".repeat(32), size: 12 },
+      createdAt: 1,
+    };
+    const loadState = async (candidate: MutationIntentV1) => {
+      const plugin: PluginDataStore = {
+        loadData: vi.fn().mockResolvedValue({
+          "easy-sync-mutation-ledger": [{ intent: candidate, receipt: null }],
+        }),
+        updatePluginData: vi.fn().mockResolvedValue(undefined),
+        manifest: { id: "easy-sync", dir: ".obsidian/plugins/easy-sync" },
+        app: {
+          vault: {
+            adapter: {
+              read: vi.fn().mockRejectedValue(new Error("missing")),
+              write: vi.fn().mockResolvedValue(undefined),
+            },
+          },
+        },
+      };
+      const state = new StateManager(plugin);
+      await state.load();
+      return state;
+    };
+
+    const valid = await loadState(intent);
+    expect(valid.hasMutationLedgerCorruption).toBe(false);
+    expect(valid.mutationLedger).toEqual([{ intent, receipt: null }]);
+
+    const corrupt = await loadState({
+      ...intent,
+      target: { hash: "not-a-sha256", size: -1 },
+    });
+    expect(corrupt.hasMutationLedgerCorruption).toBe(true);
+    expect(corrupt.mutationLedger).toEqual([]);
+  });
+
+  it("rejects a fresh remote cache mutation without a parent identity", async () => {
+    const { state } = makeState();
+    await state.setRemoteState([], "https://graph.example/delta", TEST_SCOPE);
+    const incomplete: RemoteFileEntry = {
+      path: "note.md",
+      driveId: "item-note",
+      size: 10,
+      mtime: 2,
+      eTag: "etag-new",
+      cTag: "ctag-new",
+    };
+
+    await expect(state.applyRemoteMutations([incomplete], []))
+      .rejects.toThrow("parent identity");
+
+    expect(state.remoteSnapshot).toEqual([]);
+  });
+
+  it("keeps a mutation receipt when its remote upsert lacks a parent identity", async () => {
+    const { state } = makeState();
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "op-incomplete-parent",
+      planRevision: 1,
+      scope: TEST_SCOPE,
+      action: "upload",
+      path: "note.md",
+      expectedLocal: { exists: true, hash: "aa".repeat(32), size: 10 },
+      expectedRemote: { exists: false },
+      createdAt: 1,
+    };
+    const receipt: MutationReceiptV1 = {
+      version: 1,
+      operationId: intent.operationId,
+      completedAt: 2,
+      checkpoint: {
+        baseUpserts: [],
+        baseRemovals: [],
+        remoteUpserts: [{
+          path: "note.md",
+          driveId: "item-note",
+          size: 10,
+          mtime: 2,
+          eTag: "etag-new",
+          cTag: "ctag-new",
+        }],
+        remoteDeletes: [],
+        pendingConflictRemovals: [],
+        pendingDeleteRemovals: [],
+      },
+    };
+    await state.setRemoteState([], "https://graph.example/delta", TEST_SCOPE);
+    await state.beginMutationIntent(intent);
+    await state.recordMutationReceipt(receipt);
+
+    await expect(state.commitMutationCheckpoint(intent.operationId))
+      .rejects.toThrow("parent identity");
+
+    expect(state.mutationLedger).toEqual([{ intent, receipt }]);
+    expect(state.remoteSnapshot).toEqual([]);
+  });
+
+  it("preserves a receipt when its shared-state checkpoint save fails", async () => {
+    const { state, saveData } = makeState();
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "op-failed-checkpoint",
+      planRevision: 1,
+      scope: TEST_SCOPE,
+      action: "download",
+      path: "note.md",
+      expectedLocal: { exists: false },
+      expectedRemote: {
+        exists: true,
+        driveId: "item-note",
+        eTag: "etag-note",
+        size: 10,
+        sha256Hash: "aa".repeat(32),
+      },
+      createdAt: 1,
+    };
+    const receipt: MutationReceiptV1 = {
+      version: 1,
+      operationId: intent.operationId,
+      completedAt: 2,
+      checkpoint: {
+        baseUpserts: [{ path: "note.md", hash: "aa".repeat(32), size: 10, eTag: "etag-note" }],
+        baseRemovals: [],
+        remoteUpserts: [],
+        remoteDeletes: [],
+        pendingConflictRemovals: [],
+        pendingDeleteRemovals: [],
+      },
+    };
+    await state.beginMutationIntent(intent);
+    await state.recordMutationReceipt(receipt);
+    saveData.mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(state.commitMutationCheckpoint(intent.operationId)).rejects.toThrow("disk full");
+
+    expect(state.mutationLedger).toEqual([{ intent, receipt }]);
+    expect(state.baseSnapshot).toEqual([]);
+  });
+
+  it("does not publish a failed base snapshot write into memory or a later save", async () => {
+    const { state, saveData } = makeState();
+    const entry: BaseFileEntry = {
+      path: "failed.md",
+      hash: "aa".repeat(32),
+      size: 10,
+      eTag: "etag-failed",
+    };
+    saveData.mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(state.upsertBaseEntries([entry])).rejects.toThrow("disk full");
+
+    expect(state.baseSnapshot).toEqual([]);
+    await state.setLastSyncTime(123);
+    expect(state.lastSyncTime).toBe(123);
+    expect(saveData.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({
+      "easy-sync-base-snapshot": {},
+      "easy-sync-last-sync-time": 123,
+    }));
+  });
+
+  it("keeps pending lists and scalar state unchanged when persistence fails", async () => {
+    const { state, saveData } = makeState();
+    saveData.mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(state.upsertPendingConflicts([conflict("failed.md")]))
+      .rejects.toThrow("disk full");
+    expect(state.pendingConflicts).toEqual([]);
+
+    saveData.mockRejectedValueOnce(new Error("disk full"));
+    await expect(state.setLastSyncTime(456)).rejects.toThrow("disk full");
+    expect(state.lastSyncTime).toBe(0);
+  });
+
+  it("Preflight Merge — caches a text ancestor received as ArrayBuffer", () => {
+    const { state } = makeState();
+    const content = new TextEncoder().encode("base line 1\nbase line 2").buffer;
+
+    state.cacheBaseContent("note.md", content);
+
+    expect(state.getBaseContent("note.md")).toBe("base line 1\nbase line 2");
+  });
+
   it("upserts a large conflict batch with one save", async () => {
     const { state, saveData } = makeState();
     const items = [
@@ -78,9 +370,12 @@ describe("StateManager batch persistence", () => {
     await state.setPlanReviewBundle(
       items,
       { uploads: 1, downloads: 0, deletes: 1, conflicts: 1, skipped: 1 },
+      TEST_SCOPE,
     );
 
     expect(state.planReviewActive).toBe(true);
+    expect(state.planReviewRevision).toBe(1);
+    expect(state.planReviewScope).toEqual(TEST_SCOPE);
     expect(state.pendingConflicts.map((item) => item.path)).toEqual(["conflict.md"]);
     expect(state.pendingRemoteDeletes.map((item) => item.path)).toEqual(["deleted.md"]);
     expect(state.planReviewCounts).toEqual({
@@ -103,33 +398,128 @@ describe("StateManager batch persistence", () => {
       },
     ]);
     expect(saveData).toHaveBeenCalledTimes(1);
+    expect(saveData.mock.calls[0][0]).toEqual(expect.objectContaining({
+      "easy-sync-plan-review-active": true,
+      "easy-sync-plan-review-revision": 1,
+      "easy-sync-plan-review-scope": TEST_SCOPE,
+      "easy-sync-plan-review-digest": state.planReviewDigest,
+    }));
   });
 
-  it("marks the cloud baseline dirty only when base entries change", async () => {
-    const { state, saveData } = makeState();
-    const entry: BaseFileEntry = {
-      path: "note.md",
-      hash: "aa".repeat(32),
-      size: 10,
-      eTag: "etag",
-    };
+  it("restores the previous review bundle when persistence fails", async () => {
+    const { state } = makeState();
+    const oldConflict = conflict("old.md");
+    await state.setPlanReviewBundle(
+      [oldConflict],
+      { uploads: 0, downloads: 0, deletes: 0, conflicts: 1, skipped: 0 },
+      TEST_SCOPE,
+    );
+    const oldDigest = state.planReviewDigest;
+    const oldItems = state.planReviewItems;
+    const oldCounts = state.planReviewCounts;
+    const oldRevision = state.planReviewRevision;
+    const oldScope = state.planReviewScope;
+    const oldConflicts = state.pendingConflicts;
+    const store = (state as unknown as {
+      plugin: PluginDataStore;
+    }).plugin;
+    store.updatePluginData = vi.fn().mockRejectedValue(new Error("disk full"));
 
-    await state.markCloudBaselineSynced();
-    expect(state.needsCloudBaselineUpload).toBe(false);
+    await expect(state.setPlanReviewBundle(
+      [{
+        type: SyncActionType.Upload,
+        path: "new.md",
+        local: {
+          path: "new.md",
+          size: 1,
+          mtime: 1,
+          hash: "aa".repeat(32),
+          binary: false,
+        },
+      }],
+      { uploads: 1, downloads: 0, deletes: 0, conflicts: 0, skipped: 0 },
+      { ...TEST_SCOPE, driveId: "drive-new" },
+    )).rejects.toThrow("disk full");
 
-    await state.upsertBaseEntries([entry]);
-    expect(state.needsCloudBaselineUpload).toBe(true);
+    expect(state.planReviewActive).toBe(true);
+    expect(state.planReviewDigest).toBe(oldDigest);
+    expect(state.planReviewItems).toEqual(oldItems);
+    expect(state.planReviewCounts).toEqual(oldCounts);
+    expect(state.planReviewRevision).toBe(oldRevision);
+    expect(state.planReviewScope).toEqual(oldScope);
+    expect(state.pendingConflicts).toEqual(oldConflicts);
+  });
 
-    await state.markCloudBaselineSynced();
-    saveData.mockClear();
-    await state.upsertBaseEntries([entry]);
+  it("increments plan revisions and refuses a stale clear authorization", async () => {
+    const { state } = makeState();
+    const counts = { uploads: 0, downloads: 0, deletes: 0, conflicts: 0, skipped: 0 };
 
-    expect(state.needsCloudBaselineUpload).toBe(false);
-    expect(saveData).not.toHaveBeenCalled();
+    await state.setPlanReviewBundle([], counts, TEST_SCOPE);
+    const first = state.planReviewAuthorization;
+    await state.setPlanReviewBundle([], counts, TEST_SCOPE);
+    const second = state.planReviewAuthorization;
+
+    expect(first?.revision).toBe(1);
+    expect(second?.revision).toBe(2);
+    await expect(state.clearPlanReview(first ?? undefined)).resolves.toBe(false);
+    expect(state.planReviewActive).toBe(true);
+    await expect(state.clearPlanReview(second ?? undefined)).resolves.toBe(true);
+    expect(state.planReviewActive).toBe(false);
+    expect(state.planReviewRevision).toBe(2);
+    expect(state.planReviewScope).toBeNull();
   });
 
   it("persists the remote snapshot and delta link atomically", async () => {
     const { state, saveData, writeRemoteState } = makeState();
+    const remote: RemoteFileEntry = {
+      path: "note.md",
+      driveId: "item-note",
+      parentId: "files-root-id",
+      size: 10,
+      mtime: 1,
+      eTag: "etag",
+      cTag: "ctag",
+    };
+
+    const scope = {
+      accountId: "account-id",
+      driveId: "drive-id",
+      vaultFolderId: "vault-folder-id",
+      filesRootId: "files-root-id",
+    };
+    const folder: RemoteFolderEntry = {
+      path: "Empty",
+      driveId: "empty-folder-id",
+      parentId: "files-root-id",
+      name: "Empty",
+    };
+    await state.setRemoteState(
+      [remote],
+      "https://graph.example/delta-1",
+      scope,
+      [folder],
+    );
+
+    expect(state.hasRemoteState).toBe(true);
+    expect(state.remoteSnapshot).toEqual([remote]);
+    expect(state.remoteDeltaLink).toBe("https://graph.example/delta-1");
+    expect(state.remoteScope).toEqual(scope);
+    expect(state.remoteFolders).toEqual([folder]);
+    expect(saveData).not.toHaveBeenCalled();
+    expect(writeRemoteState).toHaveBeenCalledTimes(1);
+    expect(writeRemoteState.mock.calls[0][0]).toBe(
+      ".obsidian/plugins/easy-sync/remote-state.json",
+    );
+    expect(JSON.parse(writeRemoteState.mock.calls[0][1])).toMatchObject({
+      version: 1,
+      scope,
+      deltaLink: "https://graph.example/delta-1",
+      entries: { "note.md": remote },
+      folders: { "empty-folder-id": folder },
+    });
+  });
+
+  it("loads a legacy remote cache without a files root identity", async () => {
     const remote: RemoteFileEntry = {
       path: "note.md",
       driveId: "item-note",
@@ -138,22 +528,32 @@ describe("StateManager batch persistence", () => {
       eTag: "etag",
       cTag: "ctag",
     };
+    const plugin: PluginDataStore = {
+      loadData: vi.fn().mockResolvedValue({}),
+      updatePluginData: vi.fn().mockResolvedValue(undefined),
+      manifest: { id: "easy-sync", dir: ".obsidian/plugins/easy-sync" },
+      app: {
+        vault: {
+          adapter: {
+            read: vi.fn().mockResolvedValue(JSON.stringify({
+              version: 1,
+              generation: 0,
+              deltaLink: "https://graph.example/legacy",
+              entries: { "note.md": remote },
+            })),
+            write: vi.fn().mockResolvedValue(undefined),
+          },
+        },
+      },
+    };
+    const state = new StateManager(plugin);
 
-    await state.setRemoteState([remote], "https://graph.example/delta-1");
+    await state.load();
 
     expect(state.hasRemoteState).toBe(true);
+    expect(state.remoteScope).toBeNull();
     expect(state.remoteSnapshot).toEqual([remote]);
-    expect(state.remoteDeltaLink).toBe("https://graph.example/delta-1");
-    expect(saveData).not.toHaveBeenCalled();
-    expect(writeRemoteState).toHaveBeenCalledTimes(1);
-    expect(writeRemoteState.mock.calls[0][0]).toBe(
-      ".obsidian/plugins/easy-sync/remote-state.json",
-    );
-    expect(JSON.parse(writeRemoteState.mock.calls[0][1])).toMatchObject({
-      version: 1,
-      deltaLink: "https://graph.example/delta-1",
-      entries: { "note.md": remote },
-    });
+    expect(state.remoteFolders).toEqual([]);
   });
 
   it("ignores a corrupt persisted remote cache", async () => {

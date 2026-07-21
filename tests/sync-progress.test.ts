@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   isAnySyncActivityRunning,
+  syncProgressPercent,
   SyncProgressStore,
 } from "../src/sync/sync-progress";
 import { SyncActionType } from "../src/sync/types";
@@ -49,6 +50,44 @@ describe("SyncProgressStore retention", () => {
     expect(progress.state.currentFile).toBe("second.bin");
     expect(progress.state.currentItemBytes).toBe(0);
     expect(progress.state.currentItemTotalBytes).toBe(0);
+  });
+
+  it("keeps byte progress monotonic and never exposes current above total", () => {
+    const progress = new SyncProgressStore();
+
+    progress.setPhase("executing");
+    progress.setProgress(1, 1, "download.bin", SyncActionType.Download);
+    progress.setByteProgress(0, 100);
+    progress.setByteProgress(60, 100);
+    progress.setByteProgress(0, 100);
+
+    expect(progress.state.currentItemBytes).toBe(60);
+    expect(progress.state.currentItemTotalBytes).toBe(100);
+
+    progress.setByteProgress(130, 100);
+    expect(progress.state.currentItemBytes).toBe(130);
+    expect(progress.state.currentItemTotalBytes).toBe(130);
+
+    progress.setByteProgress(Number.NaN, -1);
+    expect(progress.state.currentItemBytes).toBe(130);
+    expect(progress.state.currentItemTotalBytes).toBe(130);
+  });
+
+  it("folds current-file byte progress into monotonic whole-run progress", () => {
+    const progress = new SyncProgressStore();
+
+    progress.setPhase("executing");
+    progress.setProgress(3, 4, "large.bin", SyncActionType.Download);
+    expect(syncProgressPercent(progress.state)).toBe(50);
+
+    progress.setByteProgress(50, 100);
+    expect(syncProgressPercent(progress.state)).toBe(63);
+
+    progress.completeCurrentItem();
+    expect(syncProgressPercent(progress.state)).toBe(75);
+
+    progress.setProgress(4, 4, "last.md", SyncActionType.Upload);
+    expect(syncProgressPercent(progress.state)).toBe(75);
   });
 
   it("treats executor and progress store as one running signal", () => {

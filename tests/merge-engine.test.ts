@@ -1,5 +1,22 @@
 import { describe, expect, it } from "vitest";
 import { threeWayMerge } from "../src/sync/merge-engine";
+import { MERGE_CONTRACT_CASES } from "./fixtures/merge-contract-cases";
+
+describe("merge contract fixture", () => {
+  it("covers every required preflight category", () => {
+    expect(new Set(MERGE_CONTRACT_CASES.map((item) => item.category))).toEqual(new Set([
+      "non-overlap",
+      "overlap",
+      "same-edit",
+      "empty",
+      "line-ending",
+      "unicode",
+      "long-line",
+      "large-text",
+    ]));
+    expect(MERGE_CONTRACT_CASES.every((item) => item.base !== undefined)).toBe(true);
+  });
+});
 
 describe("threeWayMerge", () => {
   it("clean merge: non-overlapping changes on different lines", () => {
@@ -57,6 +74,24 @@ describe("threeWayMerge", () => {
     expect(result.hasConflicts).toBe(true);
   });
 
+  it("Preflight Merge — partially overlapping multi-line hunks conflict", () => {
+    const base = "a\nb\nc\nd";
+    const local = "a\nlocal-b\nlocal-c\nd";
+    const remote = "a\nb\nremote-c\nd";
+
+    const result = threeWayMerge(base, local, remote);
+
+    expect(result.hasConflicts).toBe(true);
+    expect(result.merged).toContain("<<<<<<< Local");
+    expect(result.merged).toContain("remote-c");
+  });
+
+  it.each(MERGE_CONTRACT_CASES)("contract: $id", (fixture) => {
+    const result = threeWayMerge(fixture.base, fixture.local, fixture.remote);
+    expect(result.hasConflicts).toBe(fixture.expected === "conflict");
+    if (fixture.expectedMerged !== undefined) expect(result.merged).toBe(fixture.expectedMerged);
+  });
+
   it("clean merge: both sides append different lines", () => {
     const base = "line1\nline2";
     const local = "line1\nline2\nlocal-addition";
@@ -68,17 +103,14 @@ describe("threeWayMerge", () => {
     expect(result.merged).toContain("remote-addition");
   });
 
-  it("merge with empty base: both sides create identical content", () => {
+  it("clean merge with empty base when both sides created identical content", () => {
     const base = "";
     const local = "hello world";
     const remote = "hello world";
 
-    // Empty base splits to [""]. Both sides replace the baseline empty string
-    // with identical content. In real usage this won't reach the merge engine
-    // — sync-engine content-identical detection handles it first.
     const result = threeWayMerge(base, local, remote);
-    expect(result.hasConflicts).toBe(true);
-    expect(result.merged).toContain("hello world");
+    expect(result.hasConflicts).toBe(false);
+    expect(result.merged).toBe("hello world");
   });
 
   it("clean merge: local inserts, remote unchanged", () => {

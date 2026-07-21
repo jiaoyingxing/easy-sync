@@ -17,7 +17,7 @@
 
 **Two-way OneDrive sync for Obsidian. Conflicts don't get silently resolved. Works on mobile. Notes and settings each get their own sync toggle.**
 
-EasySync is published in the Obsidian community plugin store. It has been running reliably across desktop and mobile through thousands of syncs, with 140 automated tests covering the core sync paths. Incremental syncs finish in about two seconds — you won't notice it's there until there's a conflict that needs you.
+EasySync is published in the Obsidian community plugin store. It has been running reliably across desktop and mobile through thousands of syncs, with hundreds of automated tests covering the core sync paths. Incremental syncs finish in about two seconds — you won't notice it's there until there's a conflict that needs you.
 
 ---
 
@@ -27,13 +27,13 @@ EasySync is published in the Obsidian community plugin store. It has been runnin
 
 **It doesn't trust timestamps. It trusts content.** Most sync plugins compare file modification times — and get it wrong when clocks drift. EasySync computes a SHA-256 hash of each file and compares content, not time. Restore an old file. Edit on devices with different timezones. Your system clock jumps. None of that tricks it. EasySync almost never overwrites your notes by mistake.
 
-**It won't pick a winner for you.** If you edited the same note on two devices, EasySync won't silently discard one side. Markdown and other text files get a side-by-side per-line diff so you can see exactly what changed. PDFs, images, and other binary files show the size and timestamp of both sides so you can compare and pick — automatic text merging on the roadmap.
+**It won't pick a winner for you.** If two devices change non-overlapping parts of the same previously synced text file, EasySync merges both changes. Edits to the same line, conflicts inside the Obsidian config directory, missing common versions, and any other case it cannot prove safe still get a side-by-side diff for you to resolve. PDFs, images, and other binary files show the size and timestamp of both sides.
 
 **Problems stay visible.** Failed files, unresolved conflicts, files skipped for being too large — they all stay listed in the sidebar. Not a quick notice that disappears in three seconds.
 
 **You decide what syncs.** Notes and attachments are the baseline. Editor settings, appearance, themes, hotkeys, core plugins, community plugin code, and plugin data — each one has its own toggle. No "all or nothing."
 
-**It protects your data quietly.** Before uploading, it re-hashes the file to make sure nothing changed mid-flight. Before overwriting a local file from the cloud, it double-checks. Before deleting anything remotely, it asks you. You don't see any of this happening — but it runs every round.
+**It protects your data quietly.** Before uploading, it re-hashes the file to make sure nothing changed mid-flight. Before overwriting a local file from the cloud, it double-checks. Remote deletions require confirmation by default; only deletions that pass the safety checks are handled automatically after you explicitly enable that option. You don't see any of this happening — but it runs every round.
 
 ---
 
@@ -74,7 +74,7 @@ It does not request full drive access, nor access to your email, contacts, or ot
 
 ### Can I inspect the code?
 
-**Yes.** The source code is public on GitHub for anyone to review. Automated tests cover the core sync paths — currently **140** cases. Every change passes the full suite before release.
+**Yes.** The source code is public on GitHub for anyone to review. Hundreds of automated tests cover the core sync paths, and every change passes the full suite before release.
 
 ### OneDrive has your back too
 
@@ -112,7 +112,7 @@ The key to cross-device sync: your Obsidian vault name must be **exactly the sam
 The first sync does a full reconciliation — scanning all your local files and building the cloud baseline. A few tips:
 
 - **Sync the most complete device first.** If your computer has a thousand files and your phone is empty, sync the computer first — it pushes everything to the cloud. Then open your phone and it pulls from the cloud.
-- **Both devices already have content? That's fine.** EasySync will figure it out: files that are identical on both sides are skipped; files only on one side get synced; files edited on both sides are flagged as conflicts for you to resolve.
+- **Both devices already have content? That's fine.** EasySync will figure it out: files that are identical on both sides are skipped; files only on one side get synced; non-overlapping text edits based on the same synced version are merged safely; other two-sided changes are flagged as conflicts for you to resolve.
 - **The first sync takes patience.** Every file needs scanning, hashing, and transferring — the more files, the longer it takes. A few hundred markdown files may take a few minutes; a few thousand may take ten minutes or more. After that, daily syncs only process what changed and finish in seconds.
 
 ---
@@ -124,11 +124,12 @@ The first sync does a full reconciliation — scanning all your local files and 
 | Two-way sync | Notes, images, audio, PDFs — everything in your vault |
 | Settings sync | Editor, appearance, themes, hotkeys, core plugins — each independently toggleable |
 | Community plugin sync | Plugin code and plugin data controlled separately |
-| Conflict resolution | Per-line diff for md and text files; PDFs/images show size & timestamp, manual pick |
-| Text auto-merge | Non-overlapping changes (you edit the top, another device edits the bottom) merge automatically |
+| Conflict resolution | Text changes that cannot be handled safely get a per-line diff; PDFs/images show size and timestamp for a manual choice |
+| Text auto-merge | Non-overlapping edits from the same trusted baseline merge automatically; same-line and Obsidian config conflicts always stay manual |
+| Automatic handling | Optionally apply remote deletions locally; off by default, with per-item or batch confirmation retained when disabled |
 | Recovery copies | Before overwriting a local file from the cloud, a `.easy-sync-recovery` backup is saved first |
 | Large files | Over 50 MB auto chunked upload; downloads choose the optimal path for the current runtime |
-| Safety guards | Re-hash before upload, backup before overwrite, confirm before remote delete, pause if a round changes over half your files, auto-block on account switch |
+| Safety guards | Re-hash before upload, backup before overwrite, confirm remote deletions by default, pause if a round changes over half your files, auto-block on account switch |
 | Desktop | Windows / macOS / Linux |
 | Mobile | iOS / Android |
 | Diagnostic reports | One-click export to Markdown with file sizes, durations, and error details |

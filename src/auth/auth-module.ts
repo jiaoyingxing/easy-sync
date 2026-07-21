@@ -241,9 +241,9 @@ export class AuthModule {
       );
     }
 
-    // Pre-open a blank browser window BEFORE any async work.
-    // On iOS this preserves the user-action gesture; on desktop it
-    // gives us a popup handle we can navigate after URL construction.
+    // Mobile pre-opens a blank browser window BEFORE any async work to
+    // preserve the user-action gesture. Desktop skips the popup and opens
+    // the completed authorization URL directly in the system browser.
     const popup = this.ctx.openAuthPopup?.() ?? null;
 
     try {
@@ -276,10 +276,9 @@ export class AuthModule {
       const authUrl = `${MS_AUTH_CONFIG.authorizeEndpoint}?${params.toString()}`;
       // ---- End synchronous block ----
 
-      // Try navigating the pre-opened popup first (desktop path).
-      // If that fails (null popup, blocked navigation, iOS), fall
-      // back to a direct window.open — still on the synchronous
-      // click chain so iOS allows it.
+      // Try navigating the mobile pre-opened popup first. Desktop has no
+      // popup and uses the system-browser launcher directly. A blocked mobile
+      // popup also falls back while still on the synchronous click chain.
       this.diag?.log("auth", "opening auth URL...");
       const navigated = popup?.navigate(authUrl) ?? false;
       if (!navigated) {
@@ -504,19 +503,17 @@ export class AuthModule {
   }
 
   /** Fetch user profile from Microsoft Graph to populate displayName and accountId.
-   *  Uses profileCache to avoid a network call on every startup. */
+   *  Cached profile data is display-only: account authorization must always be
+   *  anchored to /me for the current access token. */
   private async fetchUserProfile(): Promise<void> {
-    // 1. Try cache first (avoids network call on every cold start)
     const cached = await this.ctx.profileCache?.get();
     if (cached) {
       this.state.displayName = cached.displayName;
-      this.state.accountId = cached.accountId;
-      this.diag?.log("auth", `profile cache hit: ${cached.displayName}`);
-      return;
+      this.diag?.log("auth", `profile display cache hit: ${cached.displayName}`);
     }
-    this.diag?.log("auth", "profile cache miss, fetching from Graph API");
+    this.state.accountId = "";
+    this.diag?.log("auth", "verifying current token account through Graph /me");
 
-    // 2. Network fetch
     try {
       const response = await requestUrl({
         url: "https://graph.microsoft.com/v1.0/me?$select=displayName,id",
@@ -534,15 +531,17 @@ export class AuthModule {
         if (data.id) {
           this.state.accountId = data.id;
         }
-        // 3. Save to cache for next startup
-        await this.ctx.profileCache?.set({
-          displayName: this.state.displayName,
-          accountId: this.state.accountId,
-        });
+        if (this.state.accountId) {
+          await this.ctx.profileCache?.set({
+            displayName: this.state.displayName,
+            accountId: this.state.accountId,
+          });
+        }
       }
     } catch (e) {
-      // Profile fetch is non-critical — don't break login if it fails
-      this.diag?.warn("auth", "failed to fetch user profile", e);
+      // The refreshed token remains available, but sync authorization stays
+      // closed because accountId is empty until /me succeeds.
+      this.diag?.warn("auth", "failed to verify current token account", e);
     }
   }
 

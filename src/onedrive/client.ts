@@ -10,6 +10,7 @@
  */
 
 import { requestUrl, type DataAdapter, type RequestUrlResponse } from "obsidian";
+import { sha256Hex } from "../crypto";
 import {
   compatClearTimeout,
   compatSetTimeout,
@@ -21,12 +22,21 @@ import {
 import {
   type DriveItem,
   type DeltaResponse,
+  type RemoteVaultScope,
   type UploadResult,
   OneDriveError,
   OneDriveErrorType,
   GRAPH_BASE_URL,
   APP_FOLDER_PATHS,
 } from "./types";
+import {
+  firstMissingUploadRange,
+  shouldUseUploadSession,
+  uploadRangeEndExclusive,
+  uploadSessionChunkSize,
+  uploadSessionChunkTimeoutMs,
+  type UploadMissingRange,
+} from "./upload-session-policy";
 import type { DiagnosticLogger } from "../sync/diagnostic-logger";
 
 /** Callback to get a fresh access token */
@@ -41,39 +51,97 @@ const DOWNLOAD_BASE_TIMEOUT_MS = 30_000;  // 30s base — covers slow/unstable c
 const DOWNLOAD_PER_MIB_TIMEOUT_MS = 3_000;  // 3s/MiB — slower connections need more headroom
 const DOWNLOAD_MAX_TIMEOUT_MS = 300_000; // 5min hard cap — slow connections may need minutes, not seconds
 const DOWNLOAD_FAILURE_RESERVE_RATIO = 0.5;  // 50% reserve for slow/stalled connections
-const SIMPLE_UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
-const KIB_320 = 320 * 1024;
-const MIN_CHUNK_SIZE = KIB_320;
-const MAX_CHUNK_SIZE = 60 * 1024 * 1024;
-const TARGET_CHUNKS_PER_FILE = 20;
-
-/** Pick chunk size so large files finish in ~20 round-trips.
- *  Must be a multiple of 320 KiB (Graph API requirement for non-final chunks). */
-function calculateChunkSize(fileSize: number): number {
-    const target = Math.floor(fileSize / TARGET_CHUNKS_PER_FILE);
-    const aligned = Math.ceil(
-        Math.max(target, MIN_CHUNK_SIZE) / KIB_320
-    ) * KIB_320;
-    return Math.min(aligned, MAX_CHUNK_SIZE);
-}
-
-// ---- Download chunking (parallel Range requests) ----
-
-/** Files above this size use parallel chunked download when a downloadUrl is available. */
-// ponytail: keep parallel download disabled until Range handling has a real safety contract.
-const PARALLEL_DOWNLOAD_THRESHOLD = Number.MAX_SAFE_INTEGER;
-/** Target chunk size for parallel downloads. */
-const PARALLEL_DOWNLOAD_CHUNK = 16 * 1024 * 1024;        // 16 MiB
-/** Max concurrent Range requests per file. */
-const PARALLEL_DOWNLOAD_CONCURRENCY = 4;
-const UPLOAD_CHUNK_TIMEOUT_MS = 45_000;
-const MAX_UPLOAD_CHUNK_ATTEMPTS = 2;
+const UPLOAD_SESSION_CONTROL_TIMEOUT_MS = 15_000;
+const MAX_UPLOAD_SESSION_RECOVERIES = 3;
 
 interface RequestOptions {
   deadlineMs?: number;
   maxAttempts?: number;
   extraHeaders?: Record<string, string>;
   perRequestTimeoutMs?: number;
+  observationAttemptOffset?: number;
+  metadataReason?: OneDriveMetadataReason;
+  expectedNotFound?: boolean;
+}
+
+export type OneDriveEndpointCategory =
+  | "metadata"
+  | "delta"
+  | "simpleUpload"
+  | "uploadSessionCreate"
+  | "uploadSessionChunk"
+  | "uploadSessionStatus"
+  | "uploadSessionCancel"
+  | "downloadUrl"
+  | "contentFallback";
+
+export type OneDriveAttemptStatusCategory =
+  | "success"
+  | "cancelled"
+  | "auth"
+  | "forbidden"
+  | "notFound"
+  | "conflict"
+  | "precondition"
+  | "rangeNotSatisfiable"
+  | "rateLimited"
+  | "insufficientStorage"
+  | "serverError"
+  | "network"
+  | "unknown";
+
+export type OneDriveMetadataReason =
+  | "downloadUrlRefresh"
+  | "downloadVersionVerify"
+  | "other";
+
+export interface OneDriveMetadataReasonRunMetrics {
+  attempts: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+  elapsedMs: number;
+}
+
+export interface OneDriveEndpointRunMetrics {
+  attempts: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+  elapsedMs: number;
+  effectiveBytes: number;
+  failedBytes: number;
+  retriedBytes: number;
+  peakConcurrency: number;
+  statusCategories: Partial<Record<OneDriveAttemptStatusCategory, number>>;
+}
+
+export interface OneDriveRunMetricsSummary {
+  schemaVersion: 2;
+  tokenAcquisition: {
+    attempts: number;
+    elapsedMs: number;
+    maxElapsedMs: number;
+  };
+  totals: Omit<OneDriveEndpointRunMetrics, "statusCategories">;
+  endpoints: Partial<Record<OneDriveEndpointCategory, OneDriveEndpointRunMetrics>>;
+  metadataReasons: Partial<Record<OneDriveMetadataReason, OneDriveMetadataReasonRunMetrics>>;
+}
+
+interface MutableEndpointRunMetrics extends OneDriveEndpointRunMetrics {
+  activeConcurrency: number;
+}
+
+interface ActiveRunMetrics {
+  activeConcurrency: number;
+  peakConcurrency: number;
+  tokenAcquisition: {
+    attempts: number;
+    elapsedMs: number;
+    maxElapsedMs: number;
+  };
+  endpoints: Partial<Record<OneDriveEndpointCategory, MutableEndpointRunMetrics>>;
+  metadataReasons: Partial<Record<OneDriveMetadataReason, OneDriveMetadataReasonRunMetrics>>;
 }
 
 interface DownloadToPathResult {
@@ -84,6 +152,7 @@ interface DownloadToPathResult {
 export class OneDriveClient {
   private initializedVaults = new Set<string>();
   private storageVaultNames = new Map<string, string>();
+  private vaultScopes = new Map<string, RemoteVaultScope>();
   private abortSignal: AbortSignal | null = null;
   /** Remember which download strategy worked last in this sync round so
    *  subsequent files skip the waterfall of known-broken tiers. */
@@ -94,6 +163,7 @@ export class OneDriveClient {
   /** Set when CDN downloadUrl fails for a file this round.
    *  Subsequent files skip CDN entirely — saves budget for /content. */
   private cdnFailedThisRound = false;
+  private runMetrics: ActiveRunMetrics | null = null;
 
   constructor(
     private getToken: TokenProvider,
@@ -106,6 +176,145 @@ export class OneDriveClient {
     this.abortSignal = signal;
   }
 
+  /** Start an in-memory diagnostic scope for one sync round. */
+  beginRunMetrics(): void {
+    this.runMetrics = {
+      activeConcurrency: 0,
+      peakConcurrency: 0,
+      tokenAcquisition: {
+        attempts: 0,
+        elapsedMs: 0,
+        maxElapsedMs: 0,
+      },
+      endpoints: {},
+      metadataReasons: {},
+    };
+  }
+
+  /** Finish the current diagnostic scope without persisting any state. */
+  finishRunMetrics(): OneDriveRunMetricsSummary | null {
+    const active = this.runMetrics;
+    this.runMetrics = null;
+    if (!active) return null;
+
+    const endpoints: OneDriveRunMetricsSummary["endpoints"] = {};
+    const totals: OneDriveRunMetricsSummary["totals"] = {
+      attempts: 0,
+      succeeded: 0,
+      failed: 0,
+      cancelled: 0,
+      elapsedMs: 0,
+      effectiveBytes: 0,
+      failedBytes: 0,
+      retriedBytes: 0,
+      peakConcurrency: active.peakConcurrency,
+    };
+    for (const [category, metrics] of Object.entries(active.endpoints) as Array<
+      [OneDriveEndpointCategory, MutableEndpointRunMetrics]
+    >) {
+      const { activeConcurrency: _activeConcurrency, ...snapshot } = metrics;
+      endpoints[category] = {
+        ...snapshot,
+        statusCategories: { ...snapshot.statusCategories },
+      };
+      totals.attempts += snapshot.attempts;
+      totals.succeeded += snapshot.succeeded;
+      totals.failed += snapshot.failed;
+      totals.cancelled += snapshot.cancelled;
+      totals.elapsedMs += snapshot.elapsedMs;
+      totals.effectiveBytes += snapshot.effectiveBytes;
+      totals.failedBytes += snapshot.failedBytes;
+      totals.retriedBytes += snapshot.retriedBytes;
+    }
+    return {
+      schemaVersion: 2,
+      tokenAcquisition: { ...active.tokenAcquisition },
+      totals,
+      endpoints,
+      metadataReasons: Object.fromEntries(
+        Object.entries(active.metadataReasons).map(([reason, metrics]) => [
+          reason,
+          { ...metrics },
+        ]),
+      ),
+    };
+  }
+
+  private recordTokenAcquisition(startedAt: number): void {
+    const active = this.runMetrics;
+    if (!active) return;
+    const elapsedMs = Math.max(0, Date.now() - startedAt);
+    active.tokenAcquisition.attempts++;
+    active.tokenAcquisition.elapsedMs += elapsedMs;
+    active.tokenAcquisition.maxElapsedMs = Math.max(
+      active.tokenAcquisition.maxElapsedMs,
+      elapsedMs,
+    );
+  }
+
+  private async acquireToken(): Promise<string> {
+    const startedAt = Date.now();
+    try {
+      return await this.getToken();
+    } finally {
+      this.recordTokenAcquisition(startedAt);
+    }
+  }
+
+  private beginMetricAttempt(endpoint: OneDriveEndpointCategory): number {
+    const startedAt = Date.now();
+    const active = this.runMetrics;
+    if (!active) return startedAt;
+    const metrics = active.endpoints[endpoint] ?? createEndpointRunMetrics();
+    active.endpoints[endpoint] = metrics;
+    metrics.activeConcurrency++;
+    metrics.peakConcurrency = Math.max(metrics.peakConcurrency, metrics.activeConcurrency);
+    active.activeConcurrency++;
+    active.peakConcurrency = Math.max(active.peakConcurrency, active.activeConcurrency);
+    return startedAt;
+  }
+
+  private finishMetricAttempt(
+    endpoint: OneDriveEndpointCategory,
+    status: OneDriveAttemptStatusCategory,
+    startedAt: number,
+    effectiveBytes = 0,
+    retriedBytes = 0,
+    failedBytes = 0,
+    metadataReason?: OneDriveMetadataReason,
+    countsAsSucceeded = false,
+  ): void {
+    const active = this.runMetrics;
+    if (!active) return;
+    const metrics = active.endpoints[endpoint] ?? createEndpointRunMetrics();
+    active.endpoints[endpoint] = metrics;
+    metrics.attempts++;
+    metrics.elapsedMs += Math.max(0, Date.now() - startedAt);
+    metrics.effectiveBytes += Math.max(0, effectiveBytes);
+    metrics.retriedBytes += Math.max(0, retriedBytes);
+    metrics.failedBytes += Math.max(0, failedBytes);
+    metrics.statusCategories[status] = (metrics.statusCategories[status] ?? 0) + 1;
+    if (status === "success" || countsAsSucceeded) {
+      metrics.succeeded++;
+    } else if (status === "cancelled") {
+      metrics.cancelled++;
+    } else {
+      metrics.failed++;
+    }
+    metrics.activeConcurrency = Math.max(0, metrics.activeConcurrency - 1);
+    active.activeConcurrency = Math.max(0, active.activeConcurrency - 1);
+    if (endpoint === "metadata" && metadataReason) {
+      const reasonMetrics = active.metadataReasons[metadataReason]
+        ?? createMetadataReasonRunMetrics();
+      active.metadataReasons[metadataReason] = reasonMetrics;
+      reasonMetrics.attempts++;
+      reasonMetrics.elapsedMs += Math.max(0, Date.now() - startedAt);
+      if (status === "success" || countsAsSucceeded) reasonMetrics.succeeded++;
+      else if (status === "cancelled") reasonMetrics.cancelled++;
+      else reasonMetrics.failed++;
+    }
+  }
+
   // ---- App Folder Bootstrap ----
 
   /** Get the App Folder special folder metadata */
@@ -114,8 +323,8 @@ export class OneDriveClient {
     return response.json as DriveItem;
   }
 
-  /** Ensure a directory exists (idempotent — 409 Conflict is treated as success) */
-  async createFolder(folderPath: string): Promise<void> {
+  /** Ensure a directory exists and return its metadata when Graph creates it. */
+  async createFolder(folderPath: string): Promise<DriveItem | null> {
     // For path-based creation, we use:
     // PUT /me/drive/special/approot:/path/to/folder
     const encodedName = folderPath.split("/").pop() || "";
@@ -129,35 +338,115 @@ export class OneDriveClient {
           "@microsoft.graph.conflictBehavior": "fail",
         },
       );
-      void response;
+      return response.json as DriveItem;
     } catch (e) {
       if (e instanceof OneDriveError && e.type === OneDriveErrorType.Conflict) {
         this.diag?.log("onedrive", `folder already exists (409): ${folderPath}`);
-        return;
+        return null;
       }
       throw e;
     }
   }
 
-  /** Initialize the App Folder directory structure for a vault */
-  async initVaultDirectories(vaultName: string): Promise<void> {
-    if (this.initializedVaults.has(vaultName)) return;
+  /** Initialize the App Folder directory structure and return Graph-owned identities.
+   *  Read-only preview callers can require existing folders so this method
+   *  uses GET only and never sends an idempotent create request. */
+  async initVaultScope(
+    vaultName: string,
+    options: { createMissing?: boolean } = {},
+  ): Promise<RemoteVaultScope> {
+    if (this.initializedVaults.has(vaultName)) {
+      const scope = this.vaultScopes.get(vaultName);
+      if (!scope) throw new Error(`Missing initialized vault scope: ${vaultName}`);
+      return scope;
+    }
 
     const storageVaultName = await this.resolveStorageVaultName(vaultName);
     this.storageVaultNames.set(vaultName, storageVaultName);
 
-    // Create vault directory
+    const createMissing = options.createMissing ?? true;
+
+    // Create or resolve vault directory.
     const vaultPath = APP_FOLDER_PATHS.vaultDir(storageVaultName);
-    await this.createFolder(vaultPath);
+    const createdVaultFolder = createMissing
+      ? await this.createFolder(vaultPath)
+      : null;
+    const vaultFolder = createdVaultFolder ?? (
+      await this.request("GET", vaultPath)
+    ).json as DriveItem;
+    if (!vaultFolder.id || !vaultFolder.folder) {
+      throw new Error(`Invalid vault folder metadata: ${vaultPath}`);
+    }
 
-    // Create files/ directory
+    // Create or resolve files/ directory.
     const filesPath = APP_FOLDER_PATHS.filesDir(storageVaultName);
-    await this.createFolder(filesPath);
+    const createdFilesFolder = createMissing
+      ? await this.createFolder(filesPath)
+      : null;
+    const filesFolder = createdFilesFolder ?? (
+      await this.request("GET", filesPath)
+    ).json as DriveItem;
+    if (!filesFolder.id || !filesFolder.folder) {
+      throw new Error(`Invalid files root metadata: ${filesPath}`);
+    }
+    if (
+      filesFolder.parentReference?.id
+      && filesFolder.parentReference.id !== vaultFolder.id
+    ) {
+      throw new Error(`Files root parent identity mismatch: ${filesPath}`);
+    }
 
-    // Create .easy-sync/ directory
-    const pluginPath = APP_FOLDER_PATHS.pluginDir(storageVaultName);
-    await this.createFolder(pluginPath);
+    let driveId = filesFolder.parentReference?.driveId
+      ?? vaultFolder.parentReference?.driveId;
+    if (!driveId) {
+      const drive = (await this.request("GET", "/me/drive?$select=id")).json as { id?: string };
+      driveId = drive.id;
+    }
+    if (!driveId) throw new Error(`Missing drive identity for vault: ${vaultName}`);
+
+    if (createMissing) {
+      const pluginPath = APP_FOLDER_PATHS.pluginDir(storageVaultName);
+      await this.createFolder(pluginPath);
+    }
+    const scope: RemoteVaultScope = {
+      driveId,
+      vaultFolderId: vaultFolder.id,
+      filesRootId: filesFolder.id,
+    };
+    this.vaultScopes.set(vaultName, scope);
+    if (createMissing) this.initializedVaults.add(vaultName);
+    return scope;
+  }
+
+  /** Restore a previously committed Graph-owned scope without probing folders.
+   *  The delta link must still prove which canonical/legacy storage path owns
+   *  the cursor; callers fall back to live initialization when it cannot. */
+  restoreVaultScope(
+    vaultName: string,
+    scope: RemoteVaultScope,
+    deltaLink: string,
+  ): boolean {
+    if (!scope.driveId || !scope.vaultFolderId || !scope.filesRootId || !deltaLink) {
+      return false;
+    }
+    const candidates = [vaultName];
+    const legacyName = encodeURIComponent(vaultName);
+    if (legacyName !== vaultName) candidates.push(legacyName);
+    const storageVaultName = candidates.find((candidate) =>
+      deltaLink.includes(APP_FOLDER_PATHS.filesDelta(candidate))
+    );
+    if (!storageVaultName) return false;
+
+    this.storageVaultNames.set(vaultName, storageVaultName);
+    this.vaultScopes.set(vaultName, { ...scope });
     this.initializedVaults.add(vaultName);
+    return true;
+  }
+
+  invalidateVaultScope(vaultName: string): void {
+    this.initializedVaults.delete(vaultName);
+    this.storageVaultNames.delete(vaultName);
+    this.vaultScopes.delete(vaultName);
   }
 
   isDeltaLinkForVault(vaultName: string, deltaLink: string): boolean {
@@ -172,6 +461,29 @@ export class OneDriveClient {
     this.downloadMethod = null;
     this.contentFailedThisRound = false;
     this.cdnFailedThisRound = false;
+  }
+
+  /**
+   * A read-only signal for the per-run small-file download controller.
+   * Once a CDN/content fallback or a retryable transport failure is observed,
+   * callers must keep the remainder of the round serial.
+   */
+  hasDegradedDownloadPathThisRound(): boolean {
+    if (this.cdnFailedThisRound || this.contentFailedThisRound) return true;
+    const unhealthy = new Set<OneDriveAttemptStatusCategory>([
+      "rateLimited",
+      "serverError",
+      "network",
+      "unknown",
+    ]);
+    for (const endpoint of ["downloadUrl", "contentFallback"] as const) {
+      const categories = this.runMetrics?.endpoints[endpoint]?.statusCategories;
+      if (!categories) continue;
+      for (const category of unhealthy) {
+        if ((categories[category] ?? 0) > 0) return true;
+      }
+    }
+    return false;
   }
 
   private getStorageVaultName(vaultName: string): string {
@@ -271,7 +583,7 @@ export class OneDriveClient {
 
   // ---- File Operations ----
 
-  /** Upload a file, using an upload session above 50MB.
+  /** Upload a file, using an upload session above 10 MiB.
    *
    *  @param eTag  When set, the upload includes an If-Match header. OneDrive
    *               rejects the request with 412 if the remote eTag has changed,
@@ -282,13 +594,16 @@ export class OneDriveClient {
     content: ArrayBuffer,
     onProgress?: UploadProgressCallback,
     eTag?: string,
+    driveItemId?: string,
   ): Promise<UploadResult> {
     throwIfAborted(this.abortSignal);
     onProgress?.(0, content.byteLength);
-    if (content.byteLength > SIMPLE_UPLOAD_MAX_BYTES) {
-      return this.uploadLargeFile(vaultName, filePath, content, onProgress, eTag);
+    if (shouldUseUploadSession(content.byteLength)) {
+      return this.uploadLargeFile(vaultName, filePath, content, onProgress, eTag, driveItemId);
     }
-    const apiPath = `${APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), filePath)}:/content`;
+    const apiPath = driveItemId
+      ? `/me/drive/items/${encodeURIComponent(driveItemId)}/content`
+      : `${APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), filePath)}:/content?@microsoft.graph.conflictBehavior=fail`;
     const headers: Record<string, string> = {};
     if (eTag) headers["If-Match"] = eTag;
     const response = await this.request(
@@ -309,15 +624,18 @@ export class OneDriveClient {
     content: ArrayBuffer,
     onProgress?: UploadProgressCallback,
     eTag?: string,
+    driveItemId?: string,
   ): Promise<UploadResult> {
     throwIfAborted(this.abortSignal);
-    const apiPath = `${APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), filePath)}:/createUploadSession`;
+    const apiPath = driveItemId
+      ? `/me/drive/items/${encodeURIComponent(driveItemId)}/createUploadSession`
+      : `${APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), filePath)}:/createUploadSession`;
     const extraHeaders = eTag ? { "If-Match": eTag } : undefined;
     const sessionResponse = await this.request(
       "POST",
       apiPath,
       {
-        item: { "@microsoft.graph.conflictBehavior": "replace" },
+        item: { "@microsoft.graph.conflictBehavior": driveItemId ? "replace" : "fail" },
       },
       undefined,
       undefined,
@@ -331,36 +649,109 @@ export class OneDriveClient {
       );
     }
 
-    const chunkSize = calculateChunkSize(content.byteLength);
-
     this.diag?.log(
       "onedrive",
-      `large upload session — path=${filePath}, bytes=${content.byteLength}, chunkBytes=${chunkSize}`,
+      `large upload session — path=${filePath}, bytes=${content.byteLength}`,
     );
-    for (let start = 0; start < content.byteLength; start += chunkSize) {
-      throwIfAborted(this.abortSignal);
-      const end = Math.min(content.byteLength, start + chunkSize) - 1;
-      const response = await this.uploadChunk(
-        uploadUrl,
-        content.slice(start, end + 1),
-        start,
-        end,
-        content.byteLength,
-      );
-      this.diag?.log(
-        "onedrive",
-        `large upload progress — path=${filePath}, uploaded=${end + 1}/${content.byteLength}`,
-      );
-      onProgress?.(end + 1, content.byteLength);
-      if (response.status === 200 || response.status === 201) {
-        return response.json as UploadResult;
-      }
-    }
+    let range: UploadMissingRange = { start: 0, endExclusive: content.byteLength };
+    let observedBytesPerSecond: number | null = null;
+    let recovering = false;
+    let recoveriesForRange = 0;
+    let reportedProgress = 0;
 
-    throw new OneDriveError(
-      OneDriveErrorType.Unknown,
-      `Upload session ended without a completed driveItem: ${filePath}`,
-    );
+    try {
+      while (range.start < content.byteLength) {
+        throwIfAborted(this.abortSignal);
+        const chunkSize = uploadSessionChunkSize(observedBytesPerSecond, recovering);
+        const endExclusive = uploadRangeEndExclusive(range, chunkSize, content.byteLength);
+        if (endExclusive <= range.start) {
+          throw new OneDriveError(
+            OneDriveErrorType.Unknown,
+            `Upload session returned an invalid missing range: ${filePath}`,
+          );
+        }
+        const end = endExclusive - 1;
+        const chunk = content.slice(range.start, endExclusive);
+        const timeoutMs = uploadSessionChunkTimeoutMs(chunk.byteLength, observedBytesPerSecond);
+        const startedAt = Date.now();
+        let response: RequestUrlResponse;
+        try {
+          response = await this.uploadChunk(
+            uploadUrl,
+            chunk,
+            range.start,
+            end,
+            content.byteLength,
+            timeoutMs,
+          );
+        } catch (rawError) {
+          if (isAbortError(rawError)) throw rawError;
+          const error = rawError instanceof OneDriveError
+            ? rawError
+            : this.toRequestError(rawError, uploadUrl);
+          if (isUncancellableRequestTimeout(error)) throw error;
+          if (!isRecoverableUploadSessionError(error)) throw error;
+          recoveriesForRange++;
+          if (recoveriesForRange > MAX_UPLOAD_SESSION_RECOVERIES) throw error;
+          range = await this.recoverUploadSessionRange(
+            uploadUrl,
+            content.byteLength,
+            error,
+          );
+          recovering = true;
+          this.diag?.warn(
+            "onedrive",
+            `large upload resumed from session state — next=${range.start}, recovery=${recoveriesForRange}/${MAX_UPLOAD_SESSION_RECOVERIES}`,
+          );
+          continue;
+        }
+
+        if (response.status === 200 || response.status === 201) {
+          onProgress?.(content.byteLength, content.byteLength);
+          return response.json as UploadResult;
+        }
+        if (response.status !== 202) {
+          throw new OneDriveError(
+            OneDriveErrorType.Unknown,
+            `Upload session returned unexpected status ${response.status}: ${filePath}`,
+            response.status,
+          );
+        }
+
+        const nextRange = firstMissingUploadRange(
+          (response.json as { nextExpectedRanges?: unknown } | undefined)?.nextExpectedRanges,
+          content.byteLength,
+        ) ?? await this.getUploadSessionRange(uploadUrl, content.byteLength);
+        if (nextRange.start <= range.start) {
+          throw new OneDriveError(
+            OneDriveErrorType.Unknown,
+            `Upload session did not advance after an accepted fragment: ${filePath}`,
+          );
+        }
+
+        const elapsedMs = Math.max(1, Date.now() - startedAt);
+        observedBytesPerSecond = chunk.byteLength / (elapsedMs / 1000);
+        range = nextRange;
+        recovering = false;
+        recoveriesForRange = 0;
+        reportedProgress = Math.max(reportedProgress, Math.min(range.start, content.byteLength));
+        this.diag?.log(
+          "onedrive",
+          `large upload progress — path=${filePath}, uploaded=${reportedProgress}/${content.byteLength}, chunkBytes=${chunk.byteLength}, timeoutMs=${timeoutMs}`,
+        );
+        onProgress?.(reportedProgress, content.byteLength);
+      }
+
+      throw new OneDriveError(
+        OneDriveErrorType.Unknown,
+        `Upload session ended without a completed driveItem: ${filePath}`,
+      );
+    } catch (error) {
+      if (!isUncancellableRequestTimeout(error)) {
+        await this.cancelUploadSessionBestEffort(uploadUrl);
+      }
+      throw error;
+    }
   }
 
   private async uploadChunk(
@@ -369,63 +760,197 @@ export class OneDriveClient {
     start: number,
     end: number,
     total: number,
+    timeoutMs: number,
   ): Promise<RequestUrlResponse> {
     // Try native fetch first — bypasses requestUrl mobile bugs
     // (Android base64 encoding, iOS status=0 on non-Graph domains).
     // Azure Blob upload session URLs are non-Graph, same risk profile as CDN downloadUrl.
+    let observedAttempt = 1;
+    const fetchStartedAt = this.beginMetricAttempt("uploadSessionChunk");
     try {
-      return await withTimeout(
-        uploadChunkFetch(uploadUrl, chunk, start, end, total, this.abortSignal ?? undefined),
-        UPLOAD_CHUNK_TIMEOUT_MS,
+      const response = await withAbortableTimeout(
+        (signal) => uploadChunkFetch(uploadUrl, chunk, start, end, total, signal),
+        timeoutMs,
+        this.abortSignal,
       );
+      this.finishMetricAttempt(
+        "uploadSessionChunk",
+        "success",
+        fetchStartedAt,
+        chunk.byteLength,
+      );
+      return response;
     } catch (fetchError) {
+      this.finishMetricAttempt(
+        "uploadSessionChunk",
+        rawAttemptStatus(fetchError, this.abortSignal),
+        fetchStartedAt,
+      );
       if (isAbortError(fetchError)) throw fetchError;
-      this.diag?.log("onedrive", `upload chunk fetch failed, falling back to requestUrl: ${requestErrorMessage(fetchError)}`);
-    }
-
-    // Fall back to requestUrl with retry
-    for (let attempt = 1; attempt <= MAX_UPLOAD_CHUNK_ATTEMPTS; attempt++) {
-      throwIfAborted(this.abortSignal);
-      try {
-        return await withTimeout(
-          requestUrl({
-            url: uploadUrl,
-            method: "PUT",
-            headers: {
-              "Content-Range": `bytes ${start}-${end}/${total}`,
-            },
-            body: chunk,
-            contentType: "application/octet-stream",
-          }),
-          UPLOAD_CHUNK_TIMEOUT_MS,
-        );
-      } catch (rawError) {
-        this.diag?.warn(
-          "onedrive",
-          `large upload chunk failed — range=${start}-${end}, bytes=${chunk.byteLength}, attempt=${attempt}/${MAX_UPLOAD_CHUNK_ATTEMPTS}, hostError=${requestErrorMessage(rawError)}`,
-        );
-        const classified = this.toRequestError(rawError, uploadUrl);
-        const error = classified.type === OneDriveErrorType.AuthExpired
-          ? new OneDriveError(
-            OneDriveErrorType.Unauthorized,
-            classified.message,
+      if (!isFetchUnavailableError(fetchError)) {
+        const classified = classifyUploadSessionUrlError(this.toRequestError(fetchError, uploadUrl));
+        if (isRequestTimeoutError(fetchError)) {
+          throw new OneDriveError(
+            OneDriveErrorType.NetworkError,
+            `Abortable upload chunk timed out after ${timeoutMs}ms`,
             classified.statusCode,
             classified.retryAfterSeconds,
             classified.graphCode,
-          )
-          : classified;
-        if (!isTransientRequestError(error) || attempt === MAX_UPLOAD_CHUNK_ATTEMPTS) {
+          );
+        }
+        throw classified;
+      }
+      this.diag?.log("onedrive", "upload chunk fetch unavailable, falling back to requestUrl");
+    }
+
+    throwIfAborted(this.abortSignal);
+    observedAttempt++;
+    const fallbackStartedAt = this.beginMetricAttempt("uploadSessionChunk");
+    try {
+      const response = await withTimeout(
+        requestUrl({
+          url: uploadUrl,
+          method: "PUT",
+          headers: {
+            "Content-Range": `bytes ${start}-${end}/${total}`,
+          },
+          body: chunk,
+          contentType: "application/octet-stream",
+        }),
+        timeoutMs,
+      );
+      this.finishMetricAttempt(
+        "uploadSessionChunk",
+        "success",
+        fallbackStartedAt,
+        chunk.byteLength,
+        observedAttempt > 1 ? chunk.byteLength : 0,
+      );
+      return response;
+    } catch (rawError) {
+      this.finishMetricAttempt(
+        "uploadSessionChunk",
+        rawAttemptStatus(rawError, this.abortSignal),
+        fallbackStartedAt,
+        0,
+        observedAttempt > 1 ? chunk.byteLength : 0,
+      );
+      this.diag?.warn(
+        "onedrive",
+        `large upload chunk failed — range=${start}-${end}, bytes=${chunk.byteLength}, hostError=${requestErrorMessage(rawError)}`,
+      );
+      throw classifyUploadSessionUrlError(this.toRequestError(rawError, uploadUrl));
+    }
+  }
+
+  private async recoverUploadSessionRange(
+    uploadUrl: string,
+    totalBytes: number,
+    cause: OneDriveError,
+  ): Promise<UploadMissingRange> {
+    for (let attempt = 1; attempt <= MAX_UPLOAD_SESSION_RECOVERIES; attempt++) {
+      throwIfAborted(this.abortSignal);
+      if (attempt > 1 || cause.type !== OneDriveErrorType.RangeNotSatisfiable) {
+        await sleepWithAbort(retryDelayMs(cause, attempt), this.abortSignal);
+      }
+      try {
+        return await this.getUploadSessionRange(uploadUrl, totalBytes);
+      } catch (rawError) {
+        if (isAbortError(rawError)) throw rawError;
+        const error = rawError instanceof OneDriveError
+          ? rawError
+          : this.toRequestError(rawError, uploadUrl);
+        if (
+          isUncancellableRequestTimeout(error)
+          || !isTransientRequestError(error)
+          || attempt === MAX_UPLOAD_SESSION_RECOVERIES
+        ) {
           throw error;
         }
-        const waitMs = retryDelayMs(error, attempt);
-        this.diag?.warn(
-          "onedrive",
-          `large upload chunk retry — range=${start}-${end}, attempt=${attempt}/${MAX_UPLOAD_CHUNK_ATTEMPTS}, waitMs=${waitMs}`,
-        );
-        await sleep(waitMs);
       }
     }
-    throw new OneDriveError(OneDriveErrorType.Unknown, "Upload chunk failed");
+    throw cause;
+  }
+
+  private async getUploadSessionRange(
+    uploadUrl: string,
+    totalBytes: number,
+  ): Promise<UploadMissingRange> {
+    const response = await this.uploadSessionControlRequest(uploadUrl, "GET");
+    const range = firstMissingUploadRange(
+      (response.json as { nextExpectedRanges?: unknown } | undefined)?.nextExpectedRanges,
+      totalBytes,
+    );
+    if (!range) {
+      throw new OneDriveError(
+        OneDriveErrorType.Unknown,
+        "Upload session status returned no valid missing range",
+      );
+    }
+    return range;
+  }
+
+  private async uploadSessionControlRequest(
+    uploadUrl: string,
+    method: "GET" | "DELETE",
+  ): Promise<RequestUrlResponse> {
+    const endpoint: OneDriveEndpointCategory = method === "GET"
+      ? "uploadSessionStatus"
+      : "uploadSessionCancel";
+    const fetchStartedAt = this.beginMetricAttempt(endpoint);
+    try {
+      const response = await withAbortableTimeout(
+        (signal) => uploadSessionControlFetch(uploadUrl, method, signal),
+        UPLOAD_SESSION_CONTROL_TIMEOUT_MS,
+        method === "GET" ? this.abortSignal : null,
+      );
+      this.finishMetricAttempt(endpoint, "success", fetchStartedAt);
+      return response;
+    } catch (fetchError) {
+      this.finishMetricAttempt(
+        endpoint,
+        rawAttemptStatus(fetchError, method === "GET" ? this.abortSignal : null),
+        fetchStartedAt,
+      );
+      if (isAbortError(fetchError)) throw fetchError;
+      if (!isFetchUnavailableError(fetchError)) {
+        throw classifyUploadSessionUrlError(this.toRequestError(fetchError, uploadUrl));
+      }
+    }
+
+    const fallbackStartedAt = this.beginMetricAttempt(endpoint);
+    try {
+      const response = await withTimeout(
+        requestUrl({ url: uploadUrl, method }),
+        UPLOAD_SESSION_CONTROL_TIMEOUT_MS,
+      );
+      this.finishMetricAttempt(endpoint, "success", fallbackStartedAt);
+      return response;
+    } catch (rawError) {
+      this.finishMetricAttempt(
+        endpoint,
+        rawAttemptStatus(rawError, method === "GET" ? this.abortSignal : null),
+        fallbackStartedAt,
+      );
+      throw classifyUploadSessionUrlError(this.toRequestError(rawError, uploadUrl));
+    }
+  }
+
+  private async cancelUploadSessionBestEffort(uploadUrl: string): Promise<void> {
+    try {
+      await this.uploadSessionControlRequest(uploadUrl, "DELETE");
+      this.diag?.log("onedrive", "upload session cancelled and temporary data cleanup requested");
+    } catch (error) {
+      const classified = error instanceof OneDriveError
+        ? error
+        : this.toRequestError(error, uploadUrl);
+      if (classified.type !== OneDriveErrorType.NotFound) {
+        this.diag?.warn(
+          "onedrive",
+          `upload session cleanup failed — type=${classified.type}, status=${classified.statusCode}`,
+        );
+      }
+    }
   }
 
   /** Download file content as ArrayBuffer.
@@ -458,25 +983,61 @@ export class OneDriveClient {
       maxAttempts: number,
       onDlProgress?: (downloaded: number, total: number) => void,
     ): Promise<RequestUrlResponse> => {
+      let observedAttempt = 0;
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        observedAttempt++;
+        const fetchStartedAt = this.beginMetricAttempt("downloadUrl");
         try {
-          return await withAbortableTimeout(
+          const response = await withAbortableTimeout(
             (signal) => downloadUrlFetch(url, onDlProgress, signal),
             remainingMs(),
             this.abortSignal,
           );
+          const bytes = responsePayloadByteLength(response);
+          this.finishMetricAttempt(
+            "downloadUrl",
+            "success",
+            fetchStartedAt,
+            bytes,
+            observedAttempt > 1 ? bytes : 0,
+          );
+          return response;
         } catch (error) {
+          this.finishMetricAttempt(
+            "downloadUrl",
+            rawAttemptStatus(error, this.abortSignal),
+            fetchStartedAt,
+            0,
+            0,
+            transferredBytesFromError(error),
+          );
           if (isAbortError(error)) throw error;
           let err = error;
           // fetch CORS/network error → fall back to requestUrl
           if (err instanceof TypeError || (err as { status?: number }).status === 0) {
+            observedAttempt++;
+            const fallbackStartedAt = this.beginMetricAttempt("downloadUrl");
             try {
               throwIfAborted(this.abortSignal);
-              return await withTimeout(
+              const response = await withTimeout(
                 requestUrl({ url, method: "GET" }),
                 remainingMs(),
               );
+              const bytes = responsePayloadByteLength(response);
+              this.finishMetricAttempt(
+                "downloadUrl",
+                "success",
+                fallbackStartedAt,
+                bytes,
+                observedAttempt > 1 ? bytes : 0,
+              );
+              return response;
             } catch (fallbackErr) {
+              this.finishMetricAttempt(
+                "downloadUrl",
+                rawAttemptStatus(fallbackErr, this.abortSignal),
+                fallbackStartedAt,
+              );
               err = fallbackErr;
             }
           }
@@ -504,7 +1065,11 @@ export class OneDriveClient {
       maxAttempts: 2,
       perRequestTimeoutMs: DOWNLOAD_MAX_TIMEOUT_MS,
     };
-    const metaRequestOptions: RequestOptions = { deadlineMs, maxAttempts: 1 };
+    const metaRequestOptions: RequestOptions = {
+      deadlineMs,
+      maxAttempts: 1,
+      metadataReason: "downloadUrlRefresh",
+    };
     this.diag?.log(
       "onedrive",
       `downloadFile "${filePath}" — size=${fileSize}, primaryMs=${primaryTimeoutMs}, reserveMs=${failureReserveMs}, budgetMs=${timeoutMs}, hint=${this.downloadMethod ?? "none"}`,
@@ -535,35 +1100,6 @@ export class OneDriveClient {
     // Primary: pre-signed download URL. Skip if CDN was confirmed
     // unreachable earlier this round — saves budget for /content.
     if (downloadUrl && !this.cdnFailedThisRound) {
-      if (
-        fileSize > PARALLEL_DOWNLOAD_THRESHOLD
-        && this.downloadMethod !== "content"
-      ) {
-        throwIfAborted(this.abortSignal);
-        const tier1StartMs = Date.now();
-        try {
-          const result = await this.downloadParallel(
-            downloadUrl,
-            fileSize,
-            remainingMs,
-            onProgress,
-            (extendByMs) => {
-              deadlineMs = Math.max(deadlineMs, Date.now() + extendByMs);
-            },
-          );
-          this.downloadMethod = "downloadUrl";
-          return result;
-        } catch (err) {
-          if (isUncancellableRequestTimeout(err)) throw downloadTimeoutError(filePath);
-          this.diag?.warn(
-            "onedrive",
-            `downloadFile "${filePath}" — parallel download failed, falling back to serial`,
-            { ...downloadErrorData(err), tierMs: Date.now() - tier1StartMs },
-          );
-          remainingMs();
-        }
-      }
-
       const tier2StartMs = Date.now();
       try {
         const response = await fetchDownloadUrl(downloadUrl, 1, onProgress);
@@ -625,20 +1161,6 @@ export class OneDriveClient {
         `downloadFile "${filePath}" — executing path /content fallback, remainingMs=${remainingMs()}`,
       );
       const apiPath = `${APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), filePath)}:/content`;
-
-      // For large files, use parallel Range requests against /content.
-      if (fileSize > PARALLEL_DOWNLOAD_THRESHOLD) {
-        const url = `${GRAPH_BASE_URL}${apiPath}`;
-        throwIfAborted(this.abortSignal);
-        const token = await this.getToken();
-        const result = await this.downloadParallel(
-          url, fileSize, remainingMs, onProgress,
-          (extendByMs) => { deadlineMs = Math.max(deadlineMs, Date.now() + extendByMs); },
-          { Authorization: `Bearer ${token}` },
-        );
-        this.downloadMethod = "content";
-        return result;
-      }
 
       const response = await this.contentGet(apiPath, contentRequestOptions, onProgress);
       this.downloadMethod = "content";
@@ -711,9 +1233,12 @@ export class OneDriveClient {
       maxAttempts: number,
       onDlProgress?: (downloaded: number, total: number) => void,
     ): Promise<DownloadToPathResult> => {
+      let observedAttempt = 0;
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        observedAttempt++;
+        const fetchStartedAt = this.beginMetricAttempt("downloadUrl");
         try {
-          return await withAbortableTimeout(
+          const result = await withAbortableTimeout(
             (signal) => downloadUrlFetchToBinaryFile(
               url,
               adapter,
@@ -725,17 +1250,35 @@ export class OneDriveClient {
             remainingMs(),
             this.abortSignal,
           );
+          this.finishMetricAttempt(
+            "downloadUrl",
+            "success",
+            fetchStartedAt,
+            result.size,
+            observedAttempt > 1 ? result.size : 0,
+          );
+          return result;
         } catch (error) {
+          this.finishMetricAttempt(
+            "downloadUrl",
+            rawAttemptStatus(error, this.abortSignal),
+            fetchStartedAt,
+            0,
+            0,
+            transferredBytesFromError(error),
+          );
           if (isAbortError(error)) throw error;
           let err = error;
           if (err instanceof TypeError || (err as { status?: number }).status === 0) {
+            observedAttempt++;
+            const fallbackStartedAt = this.beginMetricAttempt("downloadUrl");
             try {
               throwIfAborted(this.abortSignal);
               const response = await withTimeout(
                 requestUrl({ url, method: "GET" }),
                 remainingMs(),
               );
-              return await writeArrayBufferToBinaryFile(
+              const result = await writeArrayBufferToBinaryFile(
                 adapter,
                 localPath,
                 response.arrayBuffer,
@@ -743,7 +1286,20 @@ export class OneDriveClient {
                 fileSize,
                 onDlProgress,
               );
+              this.finishMetricAttempt(
+                "downloadUrl",
+                "success",
+                fallbackStartedAt,
+                result.size,
+                observedAttempt > 1 ? result.size : 0,
+              );
+              return result;
             } catch (fallbackErr) {
+              this.finishMetricAttempt(
+                "downloadUrl",
+                rawAttemptStatus(fallbackErr, this.abortSignal),
+                fallbackStartedAt,
+              );
               err = fallbackErr;
             }
           }
@@ -770,7 +1326,11 @@ export class OneDriveClient {
       maxAttempts: 2,
       perRequestTimeoutMs: DOWNLOAD_MAX_TIMEOUT_MS,
     };
-    const metaRequestOptions: RequestOptions = { deadlineMs, maxAttempts: 1 };
+    const metaRequestOptions: RequestOptions = {
+      deadlineMs,
+      maxAttempts: 1,
+      metadataReason: "downloadUrlRefresh",
+    };
     this.diag?.log(
       "onedrive",
       `downloadFileToPath "${filePath}" — size=${fileSize}, primaryMs=${primaryTimeoutMs}, reserveMs=${failureReserveMs}, budgetMs=${timeoutMs}, hint=${this.downloadMethod ?? "none"}`,
@@ -908,124 +1468,57 @@ export class OneDriveClient {
     );
   }
 
-  /** Download a large file in parallel chunks via HTTP Range requests.
-   *  Falls back to serial download on any chunk failure.
-   *  Only called when downloadUrl is available and fileSize > threshold. */
-  private async downloadParallel(
-    downloadUrl: string,
-    fileSize: number,
-    remainingMs: () => number,
-    onProgress?: (downloaded: number, total: number) => void,
-    extendDeadline?: (byMs: number) => void,
-    extraHeaders?: Record<string, string>,
-  ): Promise<ArrayBuffer> {
-    throwIfAborted(this.abortSignal);
-    const totalChunks = Math.ceil(fileSize / PARALLEL_DOWNLOAD_CHUNK);
-    const chunks = new Array<ArrayBuffer | null>(totalChunks).fill(null);
-    let downloadedSize = 0;
-    let index = 0;
-
-    this.diag?.log(
-      "onedrive",
-      `parallel download — url=${downloadUrl.substring(0, 80)}… chunks=${totalChunks}×${PARALLEL_DOWNLOAD_CHUNK / (1024 * 1024)}MiB concurrency=${PARALLEL_DOWNLOAD_CONCURRENCY}`,
-    );
-
-    const worker = async (): Promise<void> => {
-      while (index < totalChunks) {
-        throwIfAborted(this.abortSignal);
-        const i = index++;
-        const start = i * PARALLEL_DOWNLOAD_CHUNK;
-        const end = Math.min(start + PARALLEL_DOWNLOAD_CHUNK, fileSize) - 1;
-        const budgetMs = remainingMs();
-
-        const headers: Record<string, string> = {
-          Range: `bytes=${start}-${end}`,
-          ...extraHeaders,
-        };
-        const resp = await withTimeout(
-          requestUrl({ url: downloadUrl, method: "GET", headers }),
-          Math.min(budgetMs, 30_000),
-        );
-
-        // If the server ignores Range and returns the full file, use it directly.
-        if (resp.status === 200 && i === 0) {
-          this.diag?.log("onedrive", "parallel download — server returned full file (Range not supported)");
-          const buf = resp.arrayBuffer;
-          chunks[0] = buf;
-          onProgress?.(buf.byteLength, fileSize);
-          return;
-        }
-
-        const buf = resp.arrayBuffer;
-        chunks[i] = buf;
-        downloadedSize += buf.byteLength;
-        onProgress?.(downloadedSize, fileSize);
-        // Each completed chunk proves the network is alive — extend the
-        // total deadline so large files don't hit the cap while making progress.
-        extendDeadline?.(downloadTimeoutMs(buf.byteLength));
-      }
-    };
-
-    await Promise.all(
-      Array.from({ length: PARALLEL_DOWNLOAD_CONCURRENCY }, () => worker()),
-    );
-
-    // Assemble — ensure every chunk succeeded
-    let total = 0;
-    for (let i = 0; i < chunks.length; i++) {
-      if (!chunks[i]) {
-        throw new OneDriveError(
-          OneDriveErrorType.Unknown,
-          `Parallel download chunk ${i} missing`,
-        );
-      }
-      total += chunks[i]!.byteLength;
-    }
-
-    const result = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(new Uint8Array(chunk!), offset);
-      offset += chunk!.byteLength;
-    }
-
-    this.diag?.log(
-      "onedrive",
-      `parallel download complete — ${totalChunks} chunks, ${total} bytes`,
-    );
-    return result.buffer;
-  }
-
   /** Delete a file or folder.
    *  @param eTag  When set, the DELETE includes an If-Match header. If the
    *               file has been modified remotely since the plan was generated,
    *               the server returns 412 and the caller routes to conflict. */
-  async deleteItem(vaultName: string, itemPath: string, eTag?: string): Promise<void> {
-    const apiPath = APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), itemPath);
+  async deleteItem(
+    vaultName: string,
+    itemPath: string,
+    eTag?: string,
+    driveItemId?: string,
+  ): Promise<void> {
+    const apiPath = driveItemId
+      ? `/me/drive/items/${encodeURIComponent(driveItemId)}`
+      : APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), itemPath);
     await this.request("DELETE", apiPath, undefined, undefined, undefined, undefined, eTag);
   }
 
   /** Rename a file on OneDrive without re-uploading content.
    *
-   *  Uses PATCH on the path-based endpoint with only `name` set.
+   *  Uses the reviewed driveItem identity and If-Match version.
    *  OneDrive handles the rename server-side — no content transfer.
-   *
-   *  ponytail: only same-directory renames. Cross-directory moves would
-   *  need the destination folder's driveItem ID for parentReference;
-   *  those fall through to the Upload+DeleteRemote path for now.
    *
    *  Returns the updated DriveItem so callers can grab the new eTag. */
   async renameItem(
-    vaultName: string,
-    oldPath: string,
+    _vaultName: string,
+    _oldPath: string,
     newPath: string,
+    driveItemId: string,
+    eTag: string,
   ): Promise<DriveItem> {
-    const apiPath = APP_FOLDER_PATHS.filePath(
-      this.getStorageVaultName(vaultName),
-      oldPath,
-    );
+    const apiPath = `/me/drive/items/${encodeURIComponent(driveItemId)}`;
     const newName = newPath.split("/").pop() || newPath;
-    const response = await this.request("PATCH", apiPath, { name: newName });
+    const response = await this.request("PATCH", apiPath, { name: newName }, undefined, undefined, undefined, eTag);
+    return response.json as DriveItem;
+  }
+
+  /** Move/rename a known driveItem using reviewed identity + version. */
+  async moveItemById(
+    driveItemId: string,
+    eTag: string,
+    newName: string,
+    newParentId: string,
+  ): Promise<DriveItem> {
+    const response = await this.request(
+      "PATCH",
+      `/me/drive/items/${encodeURIComponent(driveItemId)}`,
+      { name: newName, parentReference: { id: newParentId } },
+      undefined,
+      undefined,
+      undefined,
+      eTag,
+    );
     return response.json as DriveItem;
   }
 
@@ -1034,10 +1527,18 @@ export class OneDriveClient {
   async getFileMetadata(
     vaultName: string,
     filePath: string,
-  ): Promise<{ eTag: string; size: number; sha256Hash?: string; downloadUrl?: string; driveId: string; mtime: number } | null> {
+    metadataReason: OneDriveMetadataReason = "other",
+  ): Promise<{ eTag: string; size: number; sha256Hash?: string; downloadUrl?: string; driveId: string; parentId?: string; mtime: number } | null> {
     try {
       const apiPath = APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), filePath);
-      const response = await this.request("GET", apiPath);
+      const response = await this.request(
+        "GET",
+        apiPath,
+        undefined,
+        undefined,
+        undefined,
+        { metadataReason, expectedNotFound: true },
+      );
       const item = response.json as DriveItem;
       if (!item.file) return null;
       return {
@@ -1046,6 +1547,7 @@ export class OneDriveClient {
         sha256Hash: item.file?.hashes?.sha256Hash?.toLowerCase(),
         downloadUrl: item["@microsoft.graph.downloadUrl"],
         driveId: item.id,
+        parentId: item.parentReference?.id,
         mtime: item.lastModifiedDateTime ? new Date(item.lastModifiedDateTime).getTime() : 0,
       };
     } catch (e) {
@@ -1057,12 +1559,6 @@ export class OneDriveClient {
   }
 
   // ---- Cloud Baseline ----
-
-  /** Upload the cloud baseline snapshot to .easy-sync/baseline.json */
-  async uploadBaseline(vaultName: string, content: string): Promise<void> {
-    const apiPath = `${APP_FOLDER_PATHS.pluginDir(this.getStorageVaultName(vaultName))}/baseline.json:/content`;
-    await this.request("PUT", apiPath, content, "application/json");
-  }
 
   /** Download the cloud baseline snapshot from .easy-sync/baseline.json.
    *  Returns null if the file doesn't exist (NotFound → first sync on a fresh vault). */
@@ -1092,7 +1588,8 @@ export class OneDriveClient {
           );
           this.diag?.log("onedrive", "cloud baseline downloaded via plugin-dir children downloadUrl");
           return responseToText(downloadResp);
-        } catch {
+        } catch (error) {
+          rethrowUncancellableRequestTimeout(error);
           // downloadUrl may expire or be blocked — fall through to Graph fallback
         }
       }
@@ -1117,7 +1614,8 @@ export class OneDriveClient {
             this.diag?.log("onedrive", "cloud baseline downloaded via item metadata downloadUrl fallback");
             return responseToText(downloadResp);
           }
-        } catch {
+        } catch (error) {
+          rethrowUncancellableRequestTimeout(error);
           // fall through to direct Graph /content
         }
       }
@@ -1141,6 +1639,93 @@ export class OneDriveClient {
       }
       throw e;
     }
+  }
+
+  // ---- Cloud Bootstrap V2 ----
+
+  async readCloudBootstrapV2(
+    vaultName: string,
+  ): Promise<{ id: string; eTag: string; content: string } | null> {
+    const storageVaultName = this.getStorageVaultName(vaultName);
+    const childrenResp = await this.request(
+      "GET",
+      `${APP_FOLDER_PATHS.pluginDir(storageVaultName)}:/children`,
+    );
+    const children = (childrenResp.json as { value?: DriveItem[] }).value ?? [];
+    const item = children.find((entry) => entry.name === "bootstrap-v2.json" && entry.file);
+    if (!item) return null;
+    return this.readCloudBootstrapItemV2(item);
+  }
+
+  async readCloudBootstrapV2ById(
+    id: string,
+  ): Promise<{ id: string; eTag: string; content: string }> {
+    const metaResp = await this.request(
+      "GET",
+      `/me/drive/items/${encodeURIComponent(id)}?select=id,name,eTag,file,@microsoft.graph.downloadUrl`,
+    );
+    return this.readCloudBootstrapItemV2(metaResp.json as DriveItem);
+  }
+
+  async createCloudBootstrapV2(
+    vaultName: string,
+    content: string,
+  ): Promise<{ id: string; eTag: string }> {
+    const apiPath = `${APP_FOLDER_PATHS.pluginDir(this.getStorageVaultName(vaultName))}/bootstrap-v2.json:/content?@microsoft.graph.conflictBehavior=fail`;
+    const response = await this.request("PUT", apiPath, content, "application/json");
+    return requireCloudBootstrapVersion(response.json);
+  }
+
+  async updateCloudBootstrapV2(
+    id: string,
+    eTag: string,
+    content: string,
+  ): Promise<{ id: string; eTag: string }> {
+    const response = await this.request(
+      "PUT",
+      `/me/drive/items/${encodeURIComponent(id)}/content`,
+      content,
+      "application/json",
+      undefined,
+      {},
+      eTag,
+    );
+    return requireCloudBootstrapVersion(response.json);
+  }
+
+  private async readCloudBootstrapItemV2(
+    initial: DriveItem,
+  ): Promise<{ id: string; eTag: string; content: string }> {
+    if (!initial.id) throw new Error("CloudBootstrapV2 item has no driveItem id");
+    let item = initial;
+    if (!item.eTag || !item["@microsoft.graph.downloadUrl"]) {
+      const metaResp = await this.request(
+        "GET",
+        `/me/drive/items/${encodeURIComponent(item.id)}?select=id,name,eTag,file,@microsoft.graph.downloadUrl`,
+      );
+      item = metaResp.json as DriveItem;
+    }
+    if (!item.eTag) throw new Error("CloudBootstrapV2 item has no eTag");
+    if (item["@microsoft.graph.downloadUrl"]) {
+      try {
+        const response = await withTimeout(requestUrl({
+          url: item["@microsoft.graph.downloadUrl"],
+          method: "GET",
+        }), 8000);
+        return { id: item.id, eTag: item.eTag, content: responseToText(response) };
+      } catch (error) {
+        rethrowUncancellableRequestTimeout(error);
+        // Fall through to the authenticated ID /content path.
+      }
+    }
+    const response = await this.request(
+      "GET",
+      `/me/drive/items/${encodeURIComponent(item.id)}/content`,
+      undefined,
+      undefined,
+      "json",
+    );
+    return { id: item.id, eTag: item.eTag, content: responseToText(response) };
   }
 
   // ---- Directory Listing ----
@@ -1214,7 +1799,7 @@ export class OneDriveClient {
 
   /**
    * Full scan fallback when delta is unavailable.
-   * Lists all files and returns as a flat DriveItem array.
+   * Returns files and folders so callers can rebuild paths from identities.
    */
   async fullScan(vaultName: string): Promise<DriveItem[]> {
     return this.listFiles(vaultName);
@@ -1233,27 +1818,50 @@ export class OneDriveClient {
     onProgress?: (downloaded: number, total: number) => void,
   ): Promise<RequestUrlResponse> {
     throwIfAborted(this.abortSignal);
-    const token = await this.getToken();
+    const token = await this.acquireToken();
     const url = apiPath.startsWith("https://")
       ? apiPath
       : `${GRAPH_BASE_URL}${apiPath}`;
 
+    const fetchStartedAt = this.beginMetricAttempt("contentFallback");
     try {
       const timeoutMs = requestTimeoutWithCap(options.deadlineMs, options.perRequestTimeoutMs ?? DOWNLOAD_MAX_TIMEOUT_MS);
       this.diag?.log("onedrive", `contentGet — trying fetch, timeoutMs=${timeoutMs}, url=${sanitizeUrl(url)}`);
-      return await withAbortableTimeout(
+      const response = await withAbortableTimeout(
         (signal) => contentUrlFetch(url, token, onProgress, signal),
         timeoutMs,
         this.abortSignal,
       );
+      this.finishMetricAttempt(
+        "contentFallback",
+        "success",
+        fetchStartedAt,
+        responsePayloadByteLength(response),
+      );
+      return response;
     } catch (fetchErr) {
+      this.finishMetricAttempt(
+        "contentFallback",
+        rawAttemptStatus(fetchErr, this.abortSignal),
+        fetchStartedAt,
+        0,
+        0,
+        transferredBytesFromError(fetchErr),
+      );
       if (isAbortError(fetchErr)) throw fetchErr;
       this.diag?.log("onedrive", `content fetch failed, falling back to requestUrl: ${requestErrorMessage(fetchErr)}`);
     }
 
     // Fall back to requestUrl — may 401 on SharePoint redirect but
     // handles environments where fetch is unavailable.
-    return this.request("GET", apiPath, undefined, undefined, "arraybuffer", options);
+    return this.request(
+      "GET",
+      apiPath,
+      undefined,
+      undefined,
+      "arraybuffer",
+      { ...options, observationAttemptOffset: 1 },
+    );
   }
 
   private async contentGetToPath(
@@ -1265,15 +1873,16 @@ export class OneDriveClient {
     onProgress?: (downloaded: number, total: number) => void,
   ): Promise<DownloadToPathResult> {
     throwIfAborted(this.abortSignal);
-    const token = await this.getToken();
+    const token = await this.acquireToken();
     const url = apiPath.startsWith("https://")
       ? apiPath
       : `${GRAPH_BASE_URL}${apiPath}`;
 
+    const fetchStartedAt = this.beginMetricAttempt("contentFallback");
     try {
       const timeoutMs = requestTimeoutWithCap(options.deadlineMs, options.perRequestTimeoutMs ?? DOWNLOAD_MAX_TIMEOUT_MS);
       this.diag?.log("onedrive", `contentGetToPath — trying fetch stream, timeoutMs=${timeoutMs}, url=${sanitizeUrl(url)}`);
-      return await withAbortableTimeout(
+      const result = await withAbortableTimeout(
         (signal) => contentUrlFetchToBinaryFile(
           url,
           token,
@@ -1286,12 +1895,34 @@ export class OneDriveClient {
         timeoutMs,
         this.abortSignal,
       );
+      this.finishMetricAttempt(
+        "contentFallback",
+        "success",
+        fetchStartedAt,
+        result.size,
+      );
+      return result;
     } catch (fetchErr) {
+      this.finishMetricAttempt(
+        "contentFallback",
+        rawAttemptStatus(fetchErr, this.abortSignal),
+        fetchStartedAt,
+        0,
+        0,
+        transferredBytesFromError(fetchErr),
+      );
       if (isAbortError(fetchErr)) throw fetchErr;
       this.diag?.log("onedrive", `content stream fetch failed, falling back to requestUrl: ${requestErrorMessage(fetchErr)}`);
     }
 
-    const response = await this.request("GET", apiPath, undefined, undefined, "arraybuffer", options);
+    const response = await this.request(
+      "GET",
+      apiPath,
+      undefined,
+      undefined,
+      "arraybuffer",
+      { ...options, observationAttemptOffset: 1 },
+    );
     return writeArrayBufferToBinaryFile(
       adapter,
       localPath,
@@ -1312,7 +1943,7 @@ export class OneDriveClient {
     ifMatch?: string,
   ): Promise<RequestUrlResponse> {
     throwIfAborted(this.abortSignal);
-    const token = await this.getToken();
+    const token = await this.acquireToken();
     const url = apiPath.startsWith("https://")
       ? apiPath
       : `${GRAPH_BASE_URL}${apiPath}`;
@@ -1342,13 +1973,18 @@ export class OneDriveClient {
     }
 
     const maxAttempts = options.maxAttempts ?? MAX_REQUEST_ATTEMPTS;
+    const endpoint = classifyRequestEndpoint(method, apiPath);
+    const requestBytes = endpoint === "simpleUpload"
+      ? requestPayloadByteLength(requestBody)
+      : 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       throwIfAborted(this.abortSignal);
+      const attemptStartedAt = this.beginMetricAttempt(endpoint);
       try {
         const timeoutMs = options.perRequestTimeoutMs
           ? requestTimeoutWithCap(options.deadlineMs, options.perRequestTimeoutMs)
           : requestTimeoutMs(options.deadlineMs);
-        return await withTimeout(
+        const response = await withTimeout(
           requestUrl({
             url,
             method,
@@ -1358,12 +1994,53 @@ export class OneDriveClient {
           }),
           timeoutMs,
         );
+        const effectiveBytes = endpoint === "simpleUpload"
+          ? requestBytes
+          : endpoint === "contentFallback"
+            ? responsePayloadByteLength(response)
+            : 0;
+        const observedAttempt = attempt + (options.observationAttemptOffset ?? 0);
+        this.finishMetricAttempt(
+          endpoint,
+          "success",
+          attemptStartedAt,
+          effectiveBytes,
+          observedAttempt > 1 ? effectiveBytes : 0,
+          0,
+          options.metadataReason ?? (endpoint === "metadata" ? "other" : undefined),
+        );
+        return response;
       } catch (rawError) {
-        const error = this.toRequestError(rawError, url);
+        const error = this.toRequestError(rawError, url, options.expectedNotFound === true);
+        const expectedNotFound = options.expectedNotFound === true
+          && error.type === OneDriveErrorType.NotFound;
+        const observedAttempt = attempt + (options.observationAttemptOffset ?? 0);
+        this.finishMetricAttempt(
+          endpoint,
+          requestAttemptStatus(error, this.abortSignal),
+          attemptStartedAt,
+          0,
+          observedAttempt > 1 ? requestBytes : 0,
+          0,
+          options.metadataReason ?? (endpoint === "metadata" ? "other" : undefined),
+          expectedNotFound,
+        );
+        if (
+          isRequestTimeoutError(rawError)
+          || (method !== "GET" && method !== "HEAD" && rawStatusCode(rawError) === 0)
+        ) {
+          this.diag?.warn(
+            "onedrive",
+            `request outcome unclear — not retrying method=${method}, endpoint=${endpoint}`,
+          );
+          throw error;
+        }
         if (error.type === OneDriveErrorType.NotFound) {
           this.initializedVaults.clear();
           this.storageVaultNames.clear();
+          this.vaultScopes.clear();
         }
+        if (expectedNotFound) throw error;
         if (
           method === "DELETE"
           && attempt > 1
@@ -1398,7 +2075,11 @@ export class OneDriveClient {
     throw new OneDriveError(OneDriveErrorType.Unknown, `Request failed: ${url}`);
   }
 
-  private toRequestError(rawError: unknown, url: string): OneDriveError {
+  private toRequestError(
+    rawError: unknown,
+    url: string,
+    suppressExpectedNotFoundWarning = false,
+  ): OneDriveError {
     // Obsidian's requestUrl throws on non-2xx. The error object carries
     // status, headers, and sometimes json/text from the response.
     const errAny = isRecord(rawError) ? rawError : {};
@@ -1419,7 +2100,7 @@ export class OneDriveClient {
     // 409 is "folder already exists" — handled gracefully, don't alarm the user
     if (errStatus === 409) {
       this.diag?.log("onedrive", `requestUrl 409 — ${sanitizeUrl(url)}`);
-    } else {
+    } else if (!(suppressExpectedNotFoundWarning && errStatus === 404)) {
       this.diag?.warn("onedrive", `requestUrl error — status=${errStatus}, graphCode=${graphErr?.code || "none"}, graphMsg=${graphErr?.message || "none"}, url=${sanitizeUrl(url)}`);
     }
 
@@ -1489,9 +2170,25 @@ export class OneDriveClient {
           retryAfter,
           graphError?.code ?? null,
         );
+      case 416:
+        return new OneDriveError(
+          OneDriveErrorType.RangeNotSatisfiable,
+          message,
+          status,
+          retryAfter,
+          graphError?.code ?? null,
+        );
       case 429:
         return new OneDriveError(
           OneDriveErrorType.RateLimited,
+          message,
+          status,
+          retryAfter,
+          graphError?.code ?? null,
+        );
+      case 507:
+        return new OneDriveError(
+          OneDriveErrorType.InsufficientStorage,
           message,
           status,
           retryAfter,
@@ -1523,6 +2220,106 @@ export class OneDriveClient {
 function isAuthExpired(error: unknown): error is OneDriveError {
   return error instanceof OneDriveError
     && error.type === OneDriveErrorType.AuthExpired;
+}
+
+function createEndpointRunMetrics(): MutableEndpointRunMetrics {
+  return {
+    attempts: 0,
+    succeeded: 0,
+    failed: 0,
+    cancelled: 0,
+    elapsedMs: 0,
+    effectiveBytes: 0,
+    failedBytes: 0,
+    retriedBytes: 0,
+    peakConcurrency: 0,
+    statusCategories: {},
+    activeConcurrency: 0,
+  };
+}
+
+function createMetadataReasonRunMetrics(): OneDriveMetadataReasonRunMetrics {
+  return {
+    attempts: 0,
+    succeeded: 0,
+    failed: 0,
+    cancelled: 0,
+    elapsedMs: 0,
+  };
+}
+
+function classifyRequestEndpoint(method: string, apiPath: string): OneDriveEndpointCategory {
+  const normalizedMethod = method.toUpperCase();
+  const path = apiPath.toLowerCase();
+  if (path.includes("/delta")) return "delta";
+  if (path.includes("createuploadsession")) return "uploadSessionCreate";
+  if (path.includes("/content")) {
+    return normalizedMethod === "PUT" ? "simpleUpload" : "contentFallback";
+  }
+  return "metadata";
+}
+
+function requestPayloadByteLength(body: ArrayBuffer | string | undefined): number {
+  if (body instanceof ArrayBuffer) return body.byteLength;
+  return typeof body === "string" ? new TextEncoder().encode(body).byteLength : 0;
+}
+
+function responsePayloadByteLength(response: RequestUrlResponse): number {
+  return response.arrayBuffer instanceof ArrayBuffer ? response.arrayBuffer.byteLength : 0;
+}
+
+function requestAttemptStatus(
+  error: OneDriveError,
+  signal: AbortSignal | null,
+): OneDriveAttemptStatusCategory {
+  if (signal?.aborted || isAbortError(error)) return "cancelled";
+  switch (error.type) {
+    case OneDriveErrorType.AuthExpired:
+    case OneDriveErrorType.Unauthorized:
+      return "auth";
+    case OneDriveErrorType.Forbidden:
+      return "forbidden";
+    case OneDriveErrorType.NotFound:
+      return "notFound";
+    case OneDriveErrorType.Conflict:
+      return "conflict";
+    case OneDriveErrorType.PreconditionFailed:
+      return "precondition";
+    case OneDriveErrorType.RangeNotSatisfiable:
+      return "rangeNotSatisfiable";
+    case OneDriveErrorType.RateLimited:
+      return "rateLimited";
+    case OneDriveErrorType.InsufficientStorage:
+      return "insufficientStorage";
+    case OneDriveErrorType.ServerError:
+      return "serverError";
+    case OneDriveErrorType.NetworkError:
+      return "network";
+    default:
+      return "unknown";
+  }
+}
+
+function rawAttemptStatus(
+  error: unknown,
+  signal: AbortSignal | null,
+): OneDriveAttemptStatusCategory {
+  if (signal?.aborted || isAbortError(error)) return "cancelled";
+  if (error instanceof OneDriveError) return requestAttemptStatus(error, signal);
+  const status = isRecord(error) && typeof error.status === "number"
+    ? error.status
+    : 0;
+  if (status === 401) return "auth";
+  if (status === 403) return "forbidden";
+  if (status === 404) return "notFound";
+  if (status === 409) return "conflict";
+  if (status === 412) return "precondition";
+  if (status === 416) return "rangeNotSatisfiable";
+  if (status === 429) return "rateLimited";
+  if (status === 507) return "insufficientStorage";
+  if ([500, 502, 503, 504].includes(status)) return "serverError";
+  if (status === 0 || error instanceof TypeError) return "network";
+  return "unknown";
 }
 
 function asFileDownloadUnauthorized(
@@ -1566,6 +2363,16 @@ function downloadTimeoutError(filePath: string): OneDriveError {
 
 function isRequestTimeoutError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith("Request timed out after ");
+}
+
+function rethrowUncancellableRequestTimeout(error: unknown): void {
+  if (isRequestTimeoutError(error)) {
+    throw new OneDriveError(OneDriveErrorType.NetworkError, requestErrorMessage(error));
+  }
+}
+
+function rawStatusCode(error: unknown): number {
+  return isRecord(error) && typeof error.status === "number" ? error.status : 0;
 }
 
 function isUncancellableRequestTimeout(error: unknown): boolean {
@@ -1732,6 +2539,28 @@ function isTransientRequestError(error: OneDriveError): boolean {
     || error.type === OneDriveErrorType.ServerError;
 }
 
+function isRecoverableUploadSessionError(error: OneDriveError): boolean {
+  return error.type === OneDriveErrorType.NetworkError
+    || error.type === OneDriveErrorType.RateLimited
+    || error.type === OneDriveErrorType.ServerError
+    || error.type === OneDriveErrorType.RangeNotSatisfiable;
+}
+
+function classifyUploadSessionUrlError(error: OneDriveError): OneDriveError {
+  if (error.type !== OneDriveErrorType.AuthExpired) return error;
+  return new OneDriveError(
+    OneDriveErrorType.Unauthorized,
+    error.message,
+    error.statusCode,
+    error.retryAfterSeconds,
+    error.graphCode,
+  );
+}
+
+function isFetchUnavailableError(error: unknown): boolean {
+  return error instanceof TypeError && error.message === "fetch unavailable";
+}
+
 function retryDelayMs(error: OneDriveError, attempt: number): number {
   const base = error.type === OneDriveErrorType.RateLimited
     && error.retryAfterSeconds !== null
@@ -1745,22 +2574,19 @@ function requestErrorMessage(rawError: unknown): string {
   return message.replace(/https?:\/\/\S+/g, "[redacted-url]");
 }
 
+function requireCloudBootstrapVersion(value: unknown): { id: string; eTag: string } {
+  if (!value || typeof value !== "object") throw new Error("CloudBootstrapV2 write returned no metadata");
+  const item = value as Partial<DriveItem>;
+  if (!item.id || !item.eTag) throw new Error("CloudBootstrapV2 write returned no id/eTag");
+  return { id: item.id, eTag: item.eTag };
+}
+
 async function safeRemove(adapter: DataAdapter, path: string): Promise<void> {
   try { await adapter.remove(path); } catch { /* noop */ }
 }
 
 function exactArrayBuffer(chunk: Uint8Array): ArrayBuffer {
   return chunk.slice().buffer;
-}
-
-async function sha256Hex(content: ArrayBuffer): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest("SHA-256", content);
-  const bytes = new Uint8Array(hashBuffer);
-  let hex = "";
-  for (let i = 0; i < bytes.length; i++) {
-    hex += bytes[i].toString(16).padStart(2, "0");
-  }
-  return hex;
 }
 
 class StreamingSha256 {
@@ -1922,6 +2748,23 @@ function sleep(ms: number): Promise<void> {
   return new Promise<void>((resolve) => compatSetTimeout(() => resolve(), ms));
 }
 
+function sleepWithAbort(ms: number, signal: AbortSignal | null): Promise<void> {
+  if (!signal) return sleep(ms);
+  throwIfAborted(signal);
+  return new Promise<void>((resolve, reject) => {
+    const timer = compatSetTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = (): void => {
+      compatClearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 function responseToText(response: RequestUrlResponse): string {
   if (typeof response.text === "string") {
     return response.text;
@@ -1965,15 +2808,52 @@ async function uploadChunkFetch(
     signal,
   });
   if (!res.ok) {
-    // Simulate requestUrl error shape so downstream error handling works
-    const err = new Error(`HTTP ${res.status}`) as Error & { status: number };
-    err.status = res.status;
-    throw err;
+    throw await fetchResponseError(res);
   }
   // 200/201 → driveItem JSON, 202 (Accepted) → no body
   let json: unknown = undefined;
   try { json = await res.json(); } catch { /* 202 Accepted has no body */ }
   return { json, status: res.status, headers: {} } as RequestUrlResponse;
+}
+
+async function uploadSessionControlFetch(
+  uploadUrl: string,
+  method: "GET" | "DELETE",
+  signal: AbortSignal,
+): Promise<RequestUrlResponse> {
+  const res = await browserFetch(uploadUrl, {
+    method,
+    cache: "no-store",
+    signal,
+  });
+  if (!res.ok) {
+    throw await fetchResponseError(res);
+  }
+  let json: unknown = undefined;
+  if (res.status !== 204) {
+    try { json = await res.json(); } catch { /* empty control response */ }
+  }
+  return { json, status: res.status, headers: {} } as RequestUrlResponse;
+}
+
+async function fetchResponseError(response: Response): Promise<Error> {
+  const headers: Record<string, string> = {};
+  response.headers?.forEach((value, key) => {
+    headers[key] = value;
+  });
+  let json: unknown = undefined;
+  let text: string | undefined;
+  try {
+    json = await response.json();
+  } catch {
+    try { text = await response.text(); } catch { /* empty error body */ }
+  }
+  return Object.assign(new Error(`HTTP ${response.status}`), {
+    status: response.status,
+    headers,
+    ...(json === undefined ? {} : { json }),
+    ...(text === undefined ? {} : { text }),
+  });
 }
 
 /** Shared helper: read a fetch Response as ArrayBuffer, optionally reporting
@@ -1996,13 +2876,19 @@ async function readResponseBuffer(
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
   let downloaded = 0;
-  while (true) {
-    throwIfAborted(signal);
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    downloaded += value.length;
-    onProgress(downloaded, contentLength || downloaded);
+  try {
+    while (true) {
+      throwIfAborted(signal);
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      downloaded += value.length;
+      onProgress(downloaded, contentLength || downloaded);
+    }
+  } catch (error) {
+    throw withTransferredBytes(error, downloaded);
+  } finally {
+    try { reader.releaseLock(); } catch { /* noop */ }
   }
   const buf = new Uint8Array(downloaded);
   let pos = 0;
@@ -2095,10 +2981,28 @@ async function streamResponseToBinaryFile(
     return { size: downloaded, hash };
   } catch (error) {
     await safeRemove(adapter, path);
-    throw error;
+    throw withTransferredBytes(error, downloaded);
   } finally {
     try { reader.releaseLock(); } catch { /* noop */ }
   }
+}
+
+function withTransferredBytes(error: unknown, transferredBytes: number): unknown {
+  if (transferredBytes <= 0) return error;
+  if ((typeof error === "object" && error !== null) || typeof error === "function") {
+    try {
+      const target = error as { transferredBytes?: number };
+      target.transferredBytes = Math.max(target.transferredBytes ?? 0, transferredBytes);
+    } catch { /* Preserve the original error even when it is not extensible. */ }
+    return error;
+  }
+  return Object.assign(new Error(String(error)), { transferredBytes });
+}
+
+function transferredBytesFromError(error: unknown): number {
+  if ((typeof error !== "object" || error === null) && typeof error !== "function") return 0;
+  const value = (error as { transferredBytes?: unknown }).transferredBytes;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
 /** Download via a Graph API /content endpoint using native fetch.

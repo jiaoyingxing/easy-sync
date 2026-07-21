@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as obsidian from "obsidian";
 import { AuthModule, type AuthPluginContext } from "../src/auth/auth-module";
 
 // We mock generateCodeChallengeSync (the sync path now used by login()).
@@ -125,6 +126,89 @@ describe("AuthModule.login", () => {
       expect.stringContaining("code_challenge=challenge-sync-fixed"),
     );
     expect(auth.isPending).toBe(true);
+  });
+});
+
+describe("AuthModule account identity", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("uses current-token /me identity instead of the cached account id", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { access_token: "current-token", expires_in: 3600 },
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "Current User", id: "current-account" },
+      };
+    });
+    const cacheSet = vi.fn().mockResolvedValue(undefined);
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn().mockResolvedValue("stored-refresh-token"),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      profileCache: {
+        get: vi.fn().mockResolvedValue({
+          displayName: "Cached User",
+          accountId: "cached-account",
+        }),
+        set: cacheSet,
+        clear: vi.fn().mockResolvedValue(undefined),
+      },
+    }));
+
+    await auth.initialize();
+
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(auth.authState.accountId).toBe("current-account");
+    expect(auth.authState.displayName).toBe("Current User");
+    expect(cacheSet).toHaveBeenCalledWith({
+      displayName: "Current User",
+      accountId: "current-account",
+    });
+  });
+
+  it("does not authorize with a cached account when /me cannot be verified", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { access_token: "current-token", expires_in: 3600 },
+        };
+      }
+      throw new Error("profile unavailable");
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn().mockResolvedValue("stored-refresh-token"),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      profileCache: {
+        get: vi.fn().mockResolvedValue({
+          displayName: "Cached User",
+          accountId: "cached-account",
+        }),
+        set: vi.fn().mockResolvedValue(undefined),
+        clear: vi.fn().mockResolvedValue(undefined),
+      },
+    }));
+
+    await auth.initialize();
+
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(auth.authState.displayName).toBe("Cached User");
+    expect(auth.authState.accountId).toBe("");
   });
 });
 

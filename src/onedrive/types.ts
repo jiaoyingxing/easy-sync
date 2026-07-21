@@ -44,6 +44,13 @@ export interface DeltaResponse {
   "@odata.nextLink"?: string;
 }
 
+/** Stable Graph identities that define the remote side of one vault. */
+export interface RemoteVaultScope {
+  driveId: string;
+  vaultFolderId: string;
+  filesRootId: string;
+}
+
 /** Upload response for small file PUT */
 export interface UploadResult {
   id: string;
@@ -52,6 +59,7 @@ export interface UploadResult {
   eTag?: string;
   cTag?: string;
   lastModifiedDateTime?: string;
+  parentReference?: DriveItem["parentReference"];
 }
 
 /** OneDrive-specific error types for classification */
@@ -61,10 +69,12 @@ export enum OneDriveErrorType {
   NotFound = "NotFound",
   Conflict = "Conflict",
   RateLimited = "RateLimited",
+  InsufficientStorage = "InsufficientStorage",
   ServerError = "ServerError",
   NetworkError = "NetworkError",
   AuthExpired = "AuthExpired",
   PreconditionFailed = "PreconditionFailed",
+  RangeNotSatisfiable = "RangeNotSatisfiable",
   Unknown = "Unknown",
 }
 

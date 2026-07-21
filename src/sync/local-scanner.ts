@@ -7,6 +7,7 @@
  */
 
 import type { Vault } from "obsidian";
+import { sha256Hex } from "../crypto";
 import {
   compatSetTimeout,
   DEFAULT_CONFIG_DIR,
@@ -25,6 +26,17 @@ const SCAN_SLEEP_EVERY = 50;
 
 interface ScanCacheEntry { mtime: number; size: number; hash: string; binary: boolean; }
 type ScanCache = { format: number; entries: Record<string, ScanCacheEntry>; };
+export interface LocalScanResult {
+  entries: LocalFileEntry[];
+  skippedLarge: string[];
+  failedPaths: string[];
+  skippedCount: number;
+  complete: boolean;
+}
+export type LocalFileInspection =
+  | { status: "missing" }
+  | { status: "present"; entry?: LocalFileEntry }
+  | { status: "uncertain"; reason: "excluded" | "stat" | "too-large" | "read" };
 const COMMUNITY_PLUGIN_CODE_FILES = new Set([
   "main.js",
   "manifest.json",
@@ -37,28 +49,30 @@ export function isEasySyncInternalPath(
   pluginId = "easy-sync",
 ): boolean {
   const paths = getEasySyncPaths(configDir, pluginId);
-  return path === paths.dataFile
+  return path.endsWith(".easy-sync-recovery")
+    || path === paths.dataFile
     || (
       path.startsWith(`${paths.pluginDirPrefix}data.sync-conflict-`)
       && path.endsWith(".json")
     )
     || path === paths.remoteStateFile
+    || path === paths.stateV2File
+    || path === paths.stateV2NextFile
+    || path === paths.stateV2PreviousFile
+    || path === paths.stateV2RecoveryFile
+    || path === paths.stateV2ManifestFile
+    || path === paths.stateV2ManifestNextFile
+    || path === paths.stateV1BackupFile
+    || path === paths.baseContentFile
+    || path === paths.ancestorManifestV2File
+    || path === paths.ancestorManifestV2NextFile
+    || path === paths.ancestorsV2Dir
+    || path.startsWith(`${paths.ancestorsV2Dir}/`)
     || path === paths.scanCacheFile
     || path === paths.logsDir
     || path.startsWith(`${paths.logsDir}/`)
     || path === paths.tmpDir
     || path.startsWith(`${paths.tmpDir}/`);
-}
-
-/** Full SHA-256 hash of the entire file, returned as 64-char hex string */
-export async function fullHash(content: ArrayBuffer): Promise<string> {
-  const hashBuffer = await crypto.subtle.digest("SHA-256", content);
-  const bytes = new Uint8Array(hashBuffer);
-  let hex = "";
-  for (let i = 0; i < bytes.length; i++) {
-    hex += bytes[i].toString(16).padStart(2, "0");
-  }
-  return hex;
 }
 
 /** Heuristic binary detection: check for null bytes in the first 8KB */
@@ -108,6 +122,8 @@ function isExcludedDirectory(path: string, config: ScanConfig, configDir: string
     || path.startsWith(`${paths.logsDir}/`)
     || path === paths.tmpDir
     || path.startsWith(`${paths.tmpDir}/`)
+    || path === paths.ancestorsV2Dir
+    || path.startsWith(`${paths.ancestorsV2Dir}/`)
   ) return true;
 
   if (
@@ -261,19 +277,26 @@ export class LocalScanner {
   /**
    * Scan all non-excluded files in the vault and return LocalFileEntry snapshots.
    */
-  async scanAll(): Promise<{
-    entries: LocalFileEntry[];
-    skippedLarge: string[];
-    failedPaths: string[];
-    skippedCount: number;
-  }> {
+  async scanAll(): Promise<LocalScanResult> {
     await this.loadScanCache();
     const entries: LocalFileEntry[] = [];
     const skippedLarge: string[] = [];
     const failedPaths: string[] = [];
     const scannedPaths = new Set<string>();
     const scannedDirs = new Set<string>();
-    const allFiles = this.vault.getFiles();
+    let allFiles: ReturnType<Vault["getFiles"]>;
+    try {
+      allFiles = this.vault.getFiles();
+    } catch (error) {
+      this.diag?.warn("scan", "vault file enumeration failed", error);
+      return {
+        entries,
+        skippedLarge,
+        failedPaths: ["/"],
+        skippedCount: 0,
+        complete: false,
+      };
+    }
     let fileCount = 0;
 
     for (const file of allFiles) {
@@ -284,8 +307,18 @@ export class LocalScanner {
         continue;
       }
 
-      const stat = file.stat ?? await this.vault.adapter.stat(path);
-      if (!stat) continue;
+      let stat: { size: number; mtime?: number } | null | undefined = file.stat;
+      if (!stat) {
+        try {
+          stat = await this.vault.adapter.stat(path);
+        } catch (error) {
+          this.diag?.warn("scan", `stat failed for "${path}"`, error);
+        }
+      }
+      if (!stat) {
+        failedPaths.push(path);
+        continue;
+      }
 
       if (stat.size > this.config.maxFileSize) {
         skippedLarge.push(path);
@@ -309,7 +342,7 @@ export class LocalScanner {
         continue;
       }
 
-      const hash = await fullHash(content);
+      const hash = await sha256Hex(content);
       const binary = stat.size > 0 ? isBinary(content) : false;
       entries.push({ path, size: stat.size, mtime: stat.mtime ?? 0, hash, binary });
       this.cacheSet(path, stat.mtime ?? 0, stat.size, hash, binary);
@@ -325,15 +358,19 @@ export class LocalScanner {
     this.diag?.log("scan", `scanAll done — ${entries.length} entries (${pluginEntries.length} plugin), ${skippedLarge.length} skipped-large, ${failedPaths.length} failed`);
     // ponytail: only log the count — full path listing is verbose and rarely useful
 
-    // Prune stale cache entries for deleted/renamed files, then persist
-    this.cachePrune(scannedPaths);
-    await this.saveScanCache();
+    // An incomplete scan cannot prove a cached path was deleted. Keep the
+    // previous cache intact and publish nothing until a healthy scan succeeds.
+    if (failedPaths.length === 0) {
+      this.cachePrune(scannedPaths);
+      await this.saveScanCache();
+    }
 
     return {
       entries,
       skippedLarge,
       failedPaths,
       skippedCount: allFiles.length - entries.length - skippedLarge.length - failedPaths.length,
+      complete: failedPaths.length === 0,
     };
   }
 
@@ -372,7 +409,14 @@ export class LocalScanner {
 
     if (isExcluded(filePath, this.config, this.configDir, this.pluginId)) return;
 
-    const stat = await this.vault.adapter.stat(filePath);
+    let stat;
+    try {
+      stat = await this.vault.adapter.stat(filePath);
+    } catch (error) {
+      this.diag?.warn("scan", `stat failed for "${filePath}"`, error);
+      failedPaths.push(filePath);
+      return;
+    }
     if (!stat) {
       this.diag?.warn("scan", `stat returned null for "${filePath}", skipping`);
       return;
@@ -397,7 +441,7 @@ export class LocalScanner {
       return;
     }
 
-    const hash = await fullHash(content);
+    const hash = await sha256Hex(content);
     const binary = stat.size > 0 ? isBinary(content) : false;
     entries.push({ path: filePath, size: stat.size, mtime: stat.mtime ?? 0, hash, binary });
     this.cacheSet(filePath, stat.mtime ?? 0, stat.size, hash, binary);
@@ -427,6 +471,7 @@ export class LocalScanner {
       this.diag?.log("scan", `scanDir("${base}") → ${listed.files.length} files, ${listed.folders.length} folders: [${listed.files.join(', ')}]`);
     } catch (err) {
       this.diag?.warn("scan", `scanDir("${base}") — list failed`, err);
+      failedPaths.push(base);
       return;
     }
 
@@ -442,9 +487,17 @@ export class LocalScanner {
         continue;
       }
 
-      const stat = await this.vault.adapter.stat(path);
+      let stat;
+      try {
+        stat = await this.vault.adapter.stat(path);
+      } catch (error) {
+        this.diag?.warn("scan", `stat failed for "${path}"`, error);
+        failedPaths.push(path);
+        continue;
+      }
       if (!stat) {
-        this.diag?.warn("scan", `stat returned null for "${path}", skipping`);
+        this.diag?.warn("scan", `stat returned null for "${path}", marking scan incomplete`);
+        failedPaths.push(path);
         continue;
       }
 
@@ -467,7 +520,7 @@ export class LocalScanner {
         continue;
       }
 
-      const hash = await fullHash(content);
+      const hash = await sha256Hex(content);
       const binary = stat.size > 0 ? isBinary(content) : false;
       entries.push({ path, size: stat.size, mtime: stat.mtime ?? 0, hash, binary });
       this.cacheSet(path, stat.mtime ?? 0, stat.size, hash, binary);
@@ -480,26 +533,48 @@ export class LocalScanner {
   }
 
   async scanFile(path: string): Promise<LocalFileEntry | null> {
-    if (isExcluded(path, this.config, this.configDir, this.pluginId)) return null;
+    const inspection = await this.inspectFile(path);
+    if (inspection.status !== "present" || !inspection.entry) return null;
+    const { entry } = inspection;
+    // Keep scan cache current so the next scanAll() doesn't redundantly re-read
+    await this.loadScanCache();
+    this.cacheSet(path, entry.mtime, entry.size, entry.hash, entry.binary);
+    await this.saveScanCache();
 
-    const stat = await this.vault.adapter.stat(path);
-    if (!stat || stat.size > this.config.maxFileSize) return null;
+    return entry;
+  }
+
+  /** Read the current local version for a write-time compare-and-swap check.
+   *  Unlike scanFile(), missing and unreadable are never conflated. */
+  async inspectFile(path: string): Promise<LocalFileInspection> {
+    if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
+      return { status: "uncertain", reason: "excluded" };
+    }
+
+    let stat;
+    try {
+      stat = await this.vault.adapter.stat(path);
+    } catch {
+      return { status: "uncertain", reason: "stat" };
+    }
+    if (!stat) return { status: "missing" };
+    if (stat.size > this.config.maxFileSize) {
+      return { status: "uncertain", reason: "too-large" };
+    }
 
     let content: ArrayBuffer;
     try {
       content = await this.vault.adapter.readBinary(path);
     } catch {
-      return null;
+      return { status: "uncertain", reason: "read" };
     }
 
-    const hash = await fullHash(content);
+      const hash = await sha256Hex(content);
     const binary = stat.size > 0 ? isBinary(content) : false;
-    // Keep scan cache current so the next scanAll() doesn't redundantly re-read
-    await this.loadScanCache();
-    this.cacheSet(path, stat.mtime ?? 0, stat.size, hash, binary);
-    await this.saveScanCache();
-
-    return { path, size: stat.size, mtime: stat.mtime ?? 0, hash, binary };
+    return {
+      status: "present",
+      entry: { path, size: stat.size, mtime: stat.mtime ?? 0, hash, binary },
+    };
   }
 }
 

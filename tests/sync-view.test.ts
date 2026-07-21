@@ -1,9 +1,29 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   buildCompletedFilesRenderState,
   buildSyncViewContentKey,
+  resolveSyncViewBodyMode,
+  syncViewProgressPercent,
   trimFilePathPrefix,
 } from "../src/ui/sync-view";
+
+describe("syncViewProgressPercent", () => {
+  it("keeps sidebar file-count progress separate from floating byte-folded progress", () => {
+    expect(syncViewProgressPercent({
+      phase: "executing",
+      current: 3,
+      total: 12,
+      currentFile: "large.bin",
+      currentItemBytes: 50,
+      currentItemTotalBytes: 100,
+      currentItemComplete: false,
+      cancelRequested: false,
+      completedFiles: [],
+      startedAt: 1,
+    })).toBe(25);
+  });
+});
 
 describe("buildSyncViewContentKey", () => {
   const baseInput = {
@@ -193,5 +213,93 @@ describe("buildSyncViewContentKey", () => {
     expect(firstOnly.prefix).toBe("");
     expect(withSibling.prefix).toBe("test/");
     expect(firstOnly.key).not.toBe(withSibling.key);
+  });
+
+  it("keeps plan review actions spaced, right aligned, and mobile safe", () => {
+    const styles = readFileSync("styles.css", "utf8");
+    const actionBlock = styles.match(/\.easy-sync-plan-execute\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(actionBlock).toContain("display: flex");
+    expect(actionBlock).toContain("flex-wrap: wrap");
+    expect(actionBlock).toContain("justify-content: flex-end");
+    expect(actionBlock).toContain("gap: var(--size-4-2)");
+
+    const mobileBlock = styles.match(/body\.is-mobile \.easy-sync-plan-execute\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(mobileBlock).toContain("flex-direction: column");
+    expect(mobileBlock).toContain("align-items: stretch");
+    expect(styles).toMatch(/body\.is-mobile \.easy-sync-plan-execute button\s*\{[^}]*width:\s*100%/);
+
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const sectionStart = source.indexOf("private renderPlanReviewSection");
+    const sectionEnd = source.indexOf("private renderPlanGroups", sectionStart);
+    const section = source.slice(sectionStart, sectionEnd);
+    expect(section.indexOf('t("syncPlan.recalculate")')).toBeLessThan(
+      section.indexOf('t("syncPlan.confirmExecute")'),
+    );
+  });
+
+  it("submits UI decisions only through the plugin gateway", () => {
+    const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
+    const modalSource = readFileSync("src/ui/conflict-detail-modal.ts", "utf8");
+    const directExecutorMutation = /syncExecutor[^\n]*(resolveConflictKeepLocal|resolveConflictKeepRemote|confirmRemoteDelete|rejectRemoteDelete)/;
+
+    expect(viewSource).not.toMatch(directExecutorMutation);
+    expect(modalSource).not.toMatch(directExecutorMutation);
+    expect(modalSource).not.toContain("plugin.state?.removePendingConflict");
+    expect(viewSource).toContain("plugin.resolveConflictKeepLocal");
+    expect(viewSource).toContain("plugin.confirmRemoteDelete");
+    expect(viewSource).toContain("plugin.confirmRemoteDeletes");
+    expect(modalSource).toContain("plugin.dismissConflict");
+    expect(modalSource).toContain("plugin.reconcileIdenticalConflict");
+  });
+
+  it("requires a native confirmation and reuses the full-width primary action style for batch deletes", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const sectionStart = source.indexOf("private renderPendingSection");
+    const sectionEnd = source.indexOf("private renderPendingIssue", sectionStart);
+    const section = source.slice(sectionStart, sectionEnd);
+
+    expect(section).toContain("pendingDeletes.length > 1");
+    expect(section).toContain('createDiv("easy-sync-plan-execute")');
+    expect(section).toContain('actions.addClass("easy-sync-primary-actions")');
+    expect(section).toContain('t("syncView.delete.confirmAll"');
+    expect(section).toContain("new ConfirmModal(");
+    expect(section).toContain('t("syncView.delete.confirmAllTitle"');
+    expect(section).toContain('t("syncView.delete.confirmAllMessage"');
+    expect(section).toContain('t("syncView.delete.confirmAllWarning"');
+    expect(section).toContain("danger: true");
+    expect(section).toContain(".awaitConfirm()");
+    expect(section).toContain("if (!confirmed) return");
+    expect(section).toContain("plugin.confirmRemoteDeletes");
+    expect(section.indexOf("if (!confirmed) return")).toBeLessThan(
+      section.indexOf("plugin.confirmRemoteDeletes"),
+    );
+  });
+});
+
+describe("resolveSyncViewBodyMode", () => {
+  it("keeps pending items visible during side actions and shows the batch result after the last item", () => {
+    expect(resolveSyncViewBodyMode({
+      planReviewActive: false,
+      hasSyncState: true,
+      fullSyncRunning: false,
+      pendingCount: 2,
+      sideActionResultsVisible: true,
+    })).toBe("pending");
+
+    expect(resolveSyncViewBodyMode({
+      planReviewActive: false,
+      hasSyncState: true,
+      fullSyncRunning: false,
+      pendingCount: 0,
+      sideActionResultsVisible: true,
+    })).toBe("progress");
+
+    expect(resolveSyncViewBodyMode({
+      planReviewActive: false,
+      hasSyncState: true,
+      fullSyncRunning: false,
+      pendingCount: 0,
+      sideActionResultsVisible: false,
+    })).toBe("idle");
   });
 });

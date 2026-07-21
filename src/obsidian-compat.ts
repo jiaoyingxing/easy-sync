@@ -35,6 +35,17 @@ export function getEasySyncPaths(
   pluginDirPrefix: string;
   dataFile: string;
   remoteStateFile: string;
+  stateV2File: string;
+  stateV2NextFile: string;
+  stateV2PreviousFile: string;
+  stateV2RecoveryFile: string;
+  stateV2ManifestFile: string;
+  stateV2ManifestNextFile: string;
+  stateV1BackupFile: string;
+  baseContentFile: string;
+  ancestorsV2Dir: string;
+  ancestorManifestV2File: string;
+  ancestorManifestV2NextFile: string;
   logsDir: string;
   tmpDir: string;
   scanCacheFile: string;
@@ -52,6 +63,17 @@ export function getEasySyncPaths(
     pluginDirPrefix: `${pluginDir}/`,
     dataFile: `${pluginDir}/data.json`,
     remoteStateFile: `${pluginDir}/remote-state.json`,
+    stateV2File: `${pluginDir}/state-v2.json`,
+    stateV2NextFile: `${pluginDir}/state-v2.next.json`,
+    stateV2PreviousFile: `${pluginDir}/state-v2.previous.json`,
+    stateV2RecoveryFile: `${pluginDir}/state-v2.recovery.json`,
+    stateV2ManifestFile: `${pluginDir}/state-v2.manifest.json`,
+    stateV2ManifestNextFile: `${pluginDir}/state-v2.manifest.next.json`,
+    stateV1BackupFile: `${pluginDir}/state-v1.backup.json`,
+    baseContentFile: `${pluginDir}/base-content.json`,
+    ancestorsV2Dir: `${pluginDir}/ancestors-v2`,
+    ancestorManifestV2File: `${pluginDir}/ancestor-manifest-v2.json`,
+    ancestorManifestV2NextFile: `${pluginDir}/ancestor-manifest-v2.next.json`,
     logsDir: `${pluginDir}/logs`,
     tmpDir: `${pluginDir}/tmp`,
     scanCacheFile: `${pluginDir}/scan-cache.json`,

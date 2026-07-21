@@ -8,6 +8,7 @@
 
 import { computeDiff } from "../ui/diff-engine";
 import type { DiffLine } from "../ui/diff-engine";
+const MERGE_MAX_TOTAL_LINES = 20_000;
 
 export interface MergeResult {
   merged: string;
@@ -83,9 +84,16 @@ export function threeWayMerge(
   local: string,
   remote: string,
 ): MergeResult {
+  base = normalizeLineEndings(base);
+  local = normalizeLineEndings(local);
+  remote = normalizeLineEndings(remote);
+  if (local === remote) return { merged: local, hasConflicts: false };
+  if (local === base) return { merged: remote, hasConflicts: false };
+  if (remote === base) return { merged: local, hasConflicts: false };
+
   const baseLines = base.split("\n");
-  const localDiff = computeDiff(base, local);
-  const remoteDiff = computeDiff(base, remote);
+  const localDiff = computeDiff(base, local, MERGE_MAX_TOTAL_LINES);
+  const remoteDiff = computeDiff(base, remote, MERGE_MAX_TOTAL_LINES);
 
   // Degrade gracefully if either diff was truncated (shouldn't happen for cached files)
   if (localDiff.truncated || remoteDiff.truncated) {
@@ -94,6 +102,24 @@ export function threeWayMerge(
 
   const localHunks = extractHunks(localDiff.lines);
   const remoteHunks = extractHunks(remoteDiff.lines);
+
+  // Any shared base region is a conflict. Detect this globally before the
+  // line walker advances past the beginning of a wider hunk; otherwise a
+  // later, partially-overlapping hunk can be stranded and misclassified as a
+  // trailing insertion.
+  if (localHunks.some((localHunk) =>
+    remoteHunks.some((remoteHunk) => hunksOverlap(localHunk, remoteHunk)))) {
+    return {
+      merged: [
+        "<<<<<<< Local",
+        local,
+        "=======",
+        remote,
+        ">>>>>>> Remote",
+      ].join("\n"),
+      hasConflicts: true,
+    };
+  }
 
   // Walk through base lines, applying hunks from each side
   const output: string[] = [];
@@ -184,4 +210,17 @@ export function threeWayMerge(
   }
 
   return { merged: output.join("\n"), hasConflicts };
+}
+
+function hunksOverlap(left: Hunk, right: Hunk): boolean {
+  const leftInsert = left.baseEnd < left.baseStart;
+  const rightInsert = right.baseEnd < right.baseStart;
+  if (leftInsert && rightInsert) return left.baseStart === right.baseStart;
+  if (leftInsert) return left.baseStart >= right.baseStart && left.baseStart <= right.baseEnd;
+  if (rightInsert) return right.baseStart >= left.baseStart && right.baseStart <= left.baseEnd;
+  return left.baseStart <= right.baseEnd && right.baseStart <= left.baseEnd;
+}
+
+function normalizeLineEndings(content: string): string {
+  return content.replace(/\r\n?/g, "\n");
 }

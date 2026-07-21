@@ -48,6 +48,7 @@ export class SyncPlanAlertModal extends Modal {
  *
  * Used for:
  *  - Settings reset confirmation
+ *  - Batch remote-delete confirmation
  *  - (First sync / threshold alerts now use SyncPlanAlertModal)
  *
  * Design: deliberately minimal. A real plugin would improve the UI later,

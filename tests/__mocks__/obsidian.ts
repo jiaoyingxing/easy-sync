@@ -46,8 +46,33 @@ export const Platform = {
 
 // Notice — constructor shows a notification
 export class Notice {
-  constructor(_message: string, _duration?: number) {}
-  static setMessage(_message: string): void {}
+  noticeEl = {
+    classList: {
+      add: (..._tokens: string[]) => undefined,
+      remove: (..._tokens: string[]) => undefined,
+    },
+  } as unknown as HTMLElement;
+  messageEl = this.noticeEl;
+  hidden = false;
+
+  constructor(_message: string | DocumentFragment, _duration?: number) {}
+  setMessage(_message: string | DocumentFragment): this { return this; }
+  hide(): void { this.hidden = true; }
+}
+
+export class ProgressBarComponent {
+  static instances: ProgressBarComponent[] = [];
+  private value = 0;
+
+  constructor(readonly containerEl: HTMLElement) {
+    ProgressBarComponent.instances.push(this);
+  }
+
+  getValue(): number { return this.value; }
+  setValue(value: number): this {
+    this.value = value;
+    return this;
+  }
 }
 
 export class Modal {
@@ -179,6 +204,13 @@ export class ToggleComponent {
   onChange(_callback: (value: boolean) => void | Promise<void>): this { return this; }
 }
 
+export class ExtraButtonComponent {
+  constructor(_containerEl: HTMLElement) {}
+  setIcon(_icon: string): this { return this; }
+  setTooltip(_tooltip: string): this { return this; }
+  onClick(_callback: () => void | Promise<void>): this { return this; }
+}
+
 export class SliderComponent {
   sliderEl = {} as HTMLInputElement;
 
@@ -194,6 +226,10 @@ export class Setting {
   setDesc(_desc: string): this { return this; }
   addButton(callback: (component: ButtonComponent) => void): this {
     callback(new ButtonComponent({} as HTMLElement));
+    return this;
+  }
+  addExtraButton(callback: (component: ExtraButtonComponent) => void): this {
+    callback(new ExtraButtonComponent({} as HTMLElement));
     return this;
   }
   addToggle(callback: (component: ToggleComponent) => void): this {

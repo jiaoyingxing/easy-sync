@@ -34,6 +34,8 @@ export interface FileProgress {
 }
 
 export interface SyncProgressState {
+  /** Which user-visible workflow owns the current progress/result snapshot. */
+  activityKind?: "fullSync" | "sideAction";
   phase: SyncPhase;
   /** Current item index (1-based during execution, 0 for phase-only steps) */
   current: number;
@@ -44,6 +46,8 @@ export interface SyncProgressState {
   /** Byte-level progress for the current item (0 when not tracking a single item) */
   currentItemBytes: number;
   currentItemTotalBytes: number;
+  /** True after the current item settles and before execution advances. */
+  currentItemComplete?: boolean;
   /** Current file action while executing a plan item */
   currentActionType?: SyncActionType;
   /** True after the user requests cancellation and before the run settles */
@@ -66,6 +70,25 @@ export function isAnySyncActivityRunning(
   sideActionRunning: boolean,
 ): boolean {
   return fullSyncRunning || sideActionRunning || isProgressActivityRunning(state);
+}
+
+/**
+ * Whole-run progress with the current file's byte fraction folded in.
+ * `current` identifies the item being processed, so completed items are
+ * `current - 1` until the item settles.
+ */
+export function syncProgressPercent(state: Readonly<SyncProgressState>): number {
+  if (state.total <= 0) return 0;
+  const completedItems = Math.max(0, state.current - 1);
+  const currentFraction = state.currentItemComplete
+    ? 1
+    : state.currentItemTotalBytes > 0
+      ? Math.min(1, Math.max(0, state.currentItemBytes / state.currentItemTotalBytes))
+      : 0;
+  return Math.min(
+    100,
+    Math.max(0, Math.round(((completedItems + currentFraction) / state.total) * 100)),
+  );
 }
 
 export function retainFileProgress(files: FileProgress[]): FileProgress[] {
@@ -96,6 +119,7 @@ export class SyncProgressStore {
       currentFile: "",
       currentItemBytes: 0,
       currentItemTotalBytes: 0,
+      currentItemComplete: false,
       cancelRequested: false,
       completedFiles: [],
       startedAt: 0,
@@ -115,6 +139,7 @@ export class SyncProgressStore {
       currentFile: "",
       currentItemBytes: 0,
       currentItemTotalBytes: 0,
+      currentItemComplete: false,
       cancelRequested: false,
       completedFiles: [],
       startedAt: 0,
@@ -129,6 +154,7 @@ export class SyncProgressStore {
     this._state.currentFile = "";
     this._state.currentItemBytes = 0;
     this._state.currentItemTotalBytes = 0;
+    this._state.currentItemComplete = false;
     this._state.currentActionType = undefined;
     if (phase === "executing") {
       this._state.completedFiles = [];
@@ -148,6 +174,7 @@ export class SyncProgressStore {
     if (itemChanged) {
       this._state.currentItemBytes = 0;
       this._state.currentItemTotalBytes = 0;
+      this._state.currentItemComplete = false;
     }
     this._state.current = current;
     this._state.total = total;
@@ -164,6 +191,7 @@ export class SyncProgressStore {
     this._state.currentFile = "";
     this._state.currentItemBytes = 0;
     this._state.currentItemTotalBytes = 0;
+    this._state.currentItemComplete = false;
     this._state.currentActionType = undefined;
     this._state.cancelRequested = false;
   }
@@ -178,15 +206,43 @@ export class SyncProgressStore {
 
   /** Update byte-level progress for the current file */
   setByteProgress(bytes: number, total: number): void {
-    this._state.currentItemBytes = bytes;
-    this._state.currentItemTotalBytes = total;
+    const reportedBytes = Number.isFinite(bytes) ? Math.max(0, bytes) : 0;
+    const reportedTotal = Number.isFinite(total) ? Math.max(0, total) : 0;
+    const nextBytes = Math.max(this._state.currentItemBytes, reportedBytes);
+    const nextTotal = Math.max(
+      this._state.currentItemTotalBytes,
+      reportedTotal,
+      nextBytes,
+    );
+    this._state.currentItemBytes = nextBytes;
+    this._state.currentItemTotalBytes = nextTotal;
+    this._state.currentItemComplete = false;
+  }
+
+  /** Mark the current plan item as settled without fabricating byte progress. */
+  completeCurrentItem(): void {
+    this._state.currentItemComplete = true;
   }
 
   /** Mark the sync as started */
-  markStarted(): void {
+  markStarted(activityKind: "fullSync" | "sideAction" = "fullSync"): void {
+    this._state.activityKind = activityKind;
     this._state.startedAt = Date.now();
     this._state.cancelRequested = false;
     this._state.completedFiles = [];
+  }
+
+  /** Resume the visible side-action result batch without erasing earlier decisions. */
+  resumeSideActionBatch(): void {
+    this._state.activityKind = "sideAction";
+    this._state.phase = "executing";
+    this._state.currentFile = "";
+    this._state.currentItemBytes = 0;
+    this._state.currentItemTotalBytes = 0;
+    this._state.currentItemComplete = false;
+    this._state.currentActionType = undefined;
+    this._state.cancelRequested = false;
+    if (this._state.startedAt === 0) this._state.startedAt = Date.now();
   }
 
   /** Map a SyncActionType to a FileProgress status string */
@@ -197,6 +253,7 @@ export class SyncProgressStore {
       case SyncActionType.Download:
         return "download";
       case SyncActionType.DeleteRemote:
+      case SyncActionType.DeleteLocal:
         return "delete";
       case SyncActionType.RenameRemote:
         return "upload";

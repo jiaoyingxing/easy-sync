@@ -55,7 +55,7 @@ export function remoteContentMatchesBase(
   );
 }
 
-const PROTECTED_CONFIG_CONFLICT_PATHS = new Set([
+const OBSIDIAN_MANAGED_CONFIG_PATHS = new Set([
   ".obsidian/app.json",
   ".obsidian/appearance.json",
   ".obsidian/hotkeys.json",
@@ -63,10 +63,10 @@ const PROTECTED_CONFIG_CONFLICT_PATHS = new Set([
   ".obsidian/community-plugins.json",
 ]);
 
-function isProtectedConfigConflictPath(path: string): boolean {
-  // ponytail: keep this list narrow — only single-path, user-meaningful config
-  // files that would otherwise degrade into noisy "new + delete" churn.
-  return PROTECTED_CONFIG_CONFLICT_PATHS.has(path);
+export function isObsidianManagedConfigPath(path: string): boolean {
+  // These files are live host-owned state. Their absence is not a durable
+  // delete signal, so the present side restores the missing side.
+  return OBSIDIAN_MANAGED_CONFIG_PATHS.has(path);
 }
 
 export class SyncEngine {
@@ -99,6 +99,13 @@ export class SyncEngine {
     const renamedNewPaths = new Set(
       [...renames.values()].map((r) => r.newPath),
     );
+    const unresolvedRelocationOldPaths = this.detectUnresolvedRelocations(
+      localMap,
+      remoteMap,
+      baseMap,
+      skippedSet,
+      renamedOldPaths,
+    );
 
     for (const [oldPath, { newPath, localEntry, remoteEntry }] of renames) {
       plan.push({
@@ -128,6 +135,16 @@ export class SyncEngine {
       const remote = remoteMap.get(path);
       const base = baseMap.get(path);
 
+      if (unresolvedRelocationOldPaths.has(path) && remote && base) {
+        plan.push({
+          type: SyncActionType.Conflict,
+          path,
+          remote,
+          reason: "reason.renameIdentityAmbiguous",
+        });
+        continue;
+      }
+
       const item = this.classify(path, local, remote, base);
       if (item) {
         plan.push(item);
@@ -136,14 +153,13 @@ export class SyncEngine {
 
     // Add skip items for large files
     for (const path of skippedLarge) {
-      // Only add if file actually exists locally (not already handled)
-      if (!plan.some((p) => p.path === path)) {
-        plan.push({
-          type: SyncActionType.SkipLargeFile,
-          path,
-          reason: `reason.fileExceedsSizeLimit`,
-        });
-      }
+      // skippedSet already excluded these paths from the main classification
+      // loop, so every scanner-reported oversized path gets exactly one item.
+      plan.push({
+        type: SyncActionType.SkipLargeFile,
+        path,
+        reason: `reason.fileExceedsSizeLimit`,
+      });
     }
 
     return {
@@ -197,6 +213,9 @@ export class SyncEngine {
 
     // Local deleted
     if (!local && remote) {
+      if (isObsidianManagedConfigPath(path)) {
+        return { type: SyncActionType.Download, path, remote };
+      }
       // Remote also changed → conflict (one side deleted, other modified)
       if (remoteChanged) {
         return {
@@ -204,14 +223,6 @@ export class SyncEngine {
           path,
           remote,
           reason: "reason.localDeletedRemoteModified",
-        };
-      }
-      if (isProtectedConfigConflictPath(path)) {
-        return {
-          type: SyncActionType.Conflict,
-          path,
-          remote,
-          reason: "reason.fileDeletedLocally",
         };
       }
       // Remote unchanged → user deleted locally, sync the deletion
@@ -225,6 +236,9 @@ export class SyncEngine {
 
     // Remote deleted
     if (local && !remote) {
+      if (isObsidianManagedConfigPath(path)) {
+        return { type: SyncActionType.Upload, path, local };
+      }
       // Local also changed → conflict
       if (localChanged) {
         return {
@@ -232,14 +246,6 @@ export class SyncEngine {
           path,
           local,
           reason: "reason.remoteDeletedLocalModified",
-        };
-      }
-      if (isProtectedConfigConflictPath(path)) {
-        return {
-          type: SyncActionType.Conflict,
-          path,
-          local,
-          reason: "reason.fileDeletedFromRemote",
         };
       }
       // Local unchanged → remote deletion affects local, ask user
@@ -268,10 +274,10 @@ export class SyncEngine {
         };
       }
       if (localChanged && !remoteChanged) {
-        return { type: SyncActionType.Upload, path, local, baseEtag: base.eTag };
+        return { type: SyncActionType.Upload, path, local, remote, baseEtag: base.eTag };
       }
       if (!localChanged && remoteChanged) {
-        return { type: SyncActionType.Download, path, remote };
+        return { type: SyncActionType.Download, path, local, remote };
       }
       // Neither changed → no action
       return null;
@@ -346,6 +352,7 @@ export class SyncEngine {
       if (oldDir !== newDir) continue; // cross-directory → fall through to Upload+DeleteRemote
 
       const remote = remoteMap.get(oldPath)!;
+      if (!remoteVersionMatchesBase(remote, disappeared[0].base)) continue;
       renames.set(oldPath, {
         newPath,
         localEntry: appeared[0].local,
@@ -357,11 +364,37 @@ export class SyncEngine {
     return renames;
   }
 
+  /** Preserve the old remote object when hash evidence suggests a move/copy,
+   *  but destination identity is not a unique safe rename. */
+  private detectUnresolvedRelocations(
+    localMap: Map<string, LocalFileEntry>,
+    remoteMap: Map<string, RemoteFileEntry>,
+    baseMap: Map<string, BaseFileEntry>,
+    skippedSet: Set<string>,
+    resolvedOldPaths: ReadonlySet<string>,
+  ): Set<string> {
+    const protectedPaths = new Set<string>();
+    for (const [oldPath, base] of baseMap) {
+      if (resolvedOldPaths.has(oldPath) || localMap.has(oldPath) || skippedSet.has(oldPath) || base.size === 0) continue;
+      const remote = remoteMap.get(oldPath);
+      if (!remote || !remoteVersionMatchesBase(remote, base)) continue;
+      const candidates = [...localMap.values()].filter((local) =>
+        !baseMap.has(local.path)
+        && !remoteMap.has(local.path)
+        && !skippedSet.has(local.path)
+        && local.hash === base.hash
+        && local.size === base.size,
+      );
+      if (candidates.length > 0) protectedPaths.add(oldPath);
+    }
+    return protectedPaths;
+  }
+
   /**
    * Order plan items for safe execution:
    * 1. Uploads + Downloads (create/update files)
    * 2. Conflicts (flag, don't execute)
-   * 3. Deletes (deleteRemote, confirmLocalDelete — safest last)
+   * 3. Deletes (deleteRemote, deleteLocal, confirmLocalDelete — safest last)
    */
   private orderPlan(items: SyncPlanItem[]): SyncPlanItem[] {
     const priority: Record<SyncActionType, number> = {
@@ -373,6 +406,7 @@ export class SyncEngine {
       [SyncActionType.RetryLater]: 2,
       [SyncActionType.Conflict]: 3,
       [SyncActionType.ConfirmLocalDelete]: 4,
+      [SyncActionType.DeleteLocal]: 5,
       [SyncActionType.DeleteRemote]: 5,
       [SyncActionType.AuthExpired]: 6,
     };
@@ -405,4 +439,10 @@ export class SyncEngine {
     const ratio = changeCount / plan.lastTotalFiles;
     return ratio > CHANGE_THRESHOLD_RATIO;
   }
+}
+
+function remoteVersionMatchesBase(remote: RemoteFileEntry, base: BaseFileEntry): boolean {
+  return remote.sha256Hash
+    ? remoteContentMatchesBase(remote, base)
+    : remote.eTag === base.eTag;
 }

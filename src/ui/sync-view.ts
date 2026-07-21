@@ -1,7 +1,6 @@
 import {
   ButtonComponent,
   ItemView,
-  Notice,
   TFile,
   WorkspaceLeaf,
   setIcon,
@@ -22,12 +21,18 @@ import {
   type SyncProgressState,
 } from "../sync/sync-progress";
 import type { PendingIssue, SyncHistoryEntry } from "../sync/state-manager";
+import { ConfirmModal } from "./confirm-modal";
 import { ConflictDetailModal } from "./conflict-detail-modal";
+import { NOTICE_PRIORITY } from "./notice-center";
 import {
   RIBBON_STATUS_ICONS,
   resolveRibbonStatus,
   type RibbonStatus,
 } from "./ribbon-status";
+import {
+  resolveSyncActivityPresentation,
+  translateSyncActivity,
+} from "./sync-status-presentation";
 
 interface StatusPanelState {
   isLoggedIn: boolean;
@@ -43,6 +48,20 @@ interface StatusPanelState {
 }
 
 type SyncViewBodyMode = "plan" | "progress" | "pending" | "idle";
+
+export function resolveSyncViewBodyMode(input: {
+  planReviewActive: boolean;
+  hasSyncState: boolean;
+  fullSyncRunning: boolean;
+  pendingCount: number;
+  sideActionResultsVisible: boolean;
+}): SyncViewBodyMode {
+  if (input.planReviewActive && input.hasSyncState) return "plan";
+  if (input.fullSyncRunning) return "progress";
+  if (input.pendingCount > 0) return "pending";
+  if (input.sideActionResultsVisible) return "progress";
+  return "idle";
+}
 
 export interface SyncViewContentKeyInput {
   isLoggedIn: boolean;
@@ -61,24 +80,6 @@ export interface SyncViewContentKeyInput {
   lastSyncTime: number;
 }
 
-const PHASE_LABEL_MAP: Record<SyncPhase, string | null> = {
-  idle: null,
-  scanning: "progress.scanningLocal",
-  baseline: "progress.loadingBaseline",
-  preparing: "progress.preparingRemote",
-  checking: "progress.checkingRemote",
-  planning: "progress.generatingPlan",
-  verifying: "progress.verifyingFiles",
-  executing: "syncView.progress",
-  done: null,
-};
-
-const ACTIVE_ACTION_LABEL_MAP: Partial<Record<SyncActionType, string>> = {
-  [SyncActionType.Upload]: "syncView.active.upload",
-  [SyncActionType.Download]: "syncView.active.download",
-  [SyncActionType.DeleteRemote]: "syncView.active.delete",
-};
-
 const FILE_STATUS_ICONS: Record<FileProgress["status"], string> = {
   upload: "arrow-up",
   download: "arrow-down",
@@ -92,6 +93,7 @@ const ISSUE_ACTION_ICONS: Partial<Record<SyncActionType, string>> = {
   [SyncActionType.Upload]: "arrow-up",
   [SyncActionType.Download]: "arrow-down",
   [SyncActionType.DeleteRemote]: "trash-2",
+  [SyncActionType.DeleteLocal]: "trash-2",
   [SyncActionType.SkipLargeFile]: "circle-slash-2",
   [SyncActionType.RetryLater]: "rotate-cw",
 };
@@ -167,11 +169,9 @@ function formatByteProgress(downloaded: number, total: number): string {
   return `${downloaded}/${total} B`;
 }
 
-function progressPercent(state: Readonly<SyncProgressState>): number {
-  if (state.total > 0) {
-    return Math.min(100, Math.round((state.current/state.total) * 100));
-  }
-  return 0;
+export function syncViewProgressPercent(state: Readonly<SyncProgressState>): number {
+  if (state.total <= 0) return 0;
+  return Math.min(100, Math.round((state.current / state.total) * 100));
 }
 
 function renderFileRow(file: FileProgress, list: HTMLElement, prefix: string, t: (key: string) => string): void {
@@ -271,13 +271,15 @@ export class EasySyncSyncView extends ItemView {
     const pendingIssues = syncState?.pendingIssues ?? [];
     const planReviewActive = syncState?.planReviewActive ?? false;
     const pendingCount = pendingIssues.length + conflicts.length + pendingDeletes.length;
-    const bodyMode: SyncViewBodyMode = planReviewActive && syncState
-      ? "plan"
-      : fullSyncRunning
-        ? "progress"
-        : pendingCount > 0
-          ? "pending"
-          : "idle";
+    const sideActionResultsVisible = progress.activityKind === "sideAction"
+      && (sideActionRunning || progress.completedFiles.length > 0);
+    const bodyMode = resolveSyncViewBodyMode({
+      planReviewActive,
+      hasSyncState: Boolean(syncState),
+      fullSyncRunning,
+      pendingCount,
+      sideActionResultsVisible,
+    });
 
     // Phase change or not running → full rebuild
     const statusState: StatusPanelState = {
@@ -343,6 +345,7 @@ export class EasySyncSyncView extends ItemView {
       } else if (bodyMode === "progress") {
         this.renderProgressPanel(content, progress);
       } else if (bodyMode === "pending") {
+        if (sideActionResultsVisible) this.renderProgressPanel(content, progress);
         this.renderPendingSection(content, pendingIssues, conflicts, pendingDeletes);
       }
 
@@ -357,7 +360,7 @@ export class EasySyncSyncView extends ItemView {
       this.updateStatusPanel(statusState);
       if (isRunning) {
         if (this.progressFillEl && progress.total > 0) {
-          this.progressFillEl.style.width = `${progressPercent(progress)}%`;
+          this.progressFillEl.style.width = `${syncViewProgressPercent(progress)}%`;
         }
         this.appendNewFileRows(progress.completedFiles);
       }
@@ -501,7 +504,11 @@ export class EasySyncSyncView extends ItemView {
             try {
               await this.plugin.auth?.login();
             } catch (error) {
-              new Notice(error instanceof Error ? error.message : t("general.unknown"));
+              this.plugin.noticeCenter.show({
+                key: "auth-login-error",
+                message: error instanceof Error ? error.message : t("general.unknown"),
+                priority: NOTICE_PRIORITY.failure,
+              });
             }
           })();
         });
@@ -645,15 +652,7 @@ export class EasySyncSyncView extends ItemView {
 
   private getRunningStatusLabel(progress: Readonly<SyncProgressState>): string {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    if (progress.cancelRequested) return t("syncView.cancelling");
-    if (progress.phase === "executing" && progress.currentActionType) {
-      return t(ACTIVE_ACTION_LABEL_MAP[progress.currentActionType] ?? "syncView.progress");
-    }
-    const phaseKey = PHASE_LABEL_MAP[progress.phase];
-    if (!phaseKey) return t("syncView.progress");
-    return progress.phase === "verifying"
-      ? t(phaseKey, { current: progress.current, total: progress.total })
-      : t(phaseKey);
+    return translateSyncActivity(resolveSyncActivityPresentation(progress), t);
   }
 
   private renderProgressPanel(
@@ -667,7 +666,7 @@ export class EasySyncSyncView extends ItemView {
     if (state.total > 0) {
       const bar = panel.createDiv("easy-sync-progress-bar");
       this.progressFillEl = bar.createDiv("easy-sync-progress-fill");
-      this.progressFillEl.style.width = `${progressPercent(state)}%`;
+      this.progressFillEl.style.width = `${syncViewProgressPercent(state)}%`;
     }
     if (state.completedFiles.length > 0) {
       this.progressSubtitleEl = panel.createDiv("easy-sync-progress-subtitle");
@@ -692,6 +691,34 @@ export class EasySyncSyncView extends ItemView {
 
     for (const issue of failures) this.renderPendingIssue(section, issue, true);
     for (const conflict of conflicts) this.renderConflictItem(section, conflict);
+    if (pendingDeletes.length > 1) {
+      const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+      const paths = pendingDeletes.map((item) => item.path);
+      const actions = section.createDiv("easy-sync-plan-execute");
+      actions.addClass("easy-sync-primary-actions");
+      new ButtonComponent(actions)
+        .setButtonText(t("syncView.delete.confirmAll", { count: paths.length }))
+        .setWarning()
+        .onClick(() => {
+          void this.runItemAction(actions, async () => {
+            const confirmed = await new ConfirmModal(
+              this.plugin.app,
+              t("syncView.delete.confirmAllTitle", { count: paths.length }),
+              null,
+              t("syncView.delete.confirmAll", { count: paths.length }),
+              t("confirm.cancel"),
+              t,
+              {
+                message: t("syncView.delete.confirmAllMessage"),
+                warning: t("syncView.delete.confirmAllWarning"),
+                danger: true,
+              },
+            ).awaitConfirm();
+            if (!confirmed) return;
+            await this.plugin.confirmRemoteDeletes(paths);
+          });
+        });
+    }
     for (const item of pendingDeletes) this.renderDeleteItem(section, item);
     for (const issue of skipped) this.renderPendingIssue(section, issue, false);
   }
@@ -843,16 +870,16 @@ export class EasySyncSyncView extends ItemView {
 
     const actions = panel.createDiv("easy-sync-plan-execute");
     new ButtonComponent(actions)
+      .setButtonText(t("syncPlan.recalculate"))
+      .onClick(() => {
+        void this.plugin.rebuildPlanReview();
+      });
+    new ButtonComponent(actions)
       .setButtonText(t("syncPlan.confirmExecute"))
       .setCta()
       .setDisabled(this.plugin.syncExecutor?.isRunning ?? false)
       .onClick(() => {
         void this.plugin.executePlanReview();
-      });
-    new ButtonComponent(actions)
-      .setButtonText(t("syncPlan.recalculate"))
-      .onClick(() => {
-        void this.plugin.rebuildPlanReview();
       });
   }
 
@@ -869,7 +896,7 @@ export class EasySyncSyncView extends ItemView {
       { label: t("syncView.fileStatus.upload"), items: items.filter((item) => item.type === SyncActionType.Upload || item.type === SyncActionType.RenameRemote), open: false },
       { label: t("syncView.fileStatus.download"), items: items.filter((item) => item.type === SyncActionType.Download), open: true },
       { label: t("syncView.fileStatus.conflict"), items: items.filter((item) => item.type === SyncActionType.Conflict), open: true },
-      { label: t("syncView.fileStatus.delete"), items: items.filter((item) => item.type === SyncActionType.DeleteRemote || item.type === SyncActionType.ConfirmLocalDelete), open: true },
+      { label: t("syncView.fileStatus.delete"), items: items.filter((item) => item.type === SyncActionType.DeleteRemote || item.type === SyncActionType.DeleteLocal || item.type === SyncActionType.ConfirmLocalDelete), open: true },
       { label: t("syncView.fileStatus.skip"), items: items.filter((item) => item.type === SyncActionType.SkipLargeFile || item.type === SyncActionType.SkipIgnoredPath || item.type === SyncActionType.RetryLater), open: false },
     ].filter((group) => group.items.length > 0);
 
@@ -922,10 +949,10 @@ export class EasySyncSyncView extends ItemView {
 
     const actions = body.createDiv("easy-sync-item-actions");
     this.createActionChip(actions, t("syncView.conflict.keepLocal"), "accent", () => {
-      void this.runItemAction(actions, () => this.plugin.syncExecutor!.resolveConflictKeepLocal(item.path));
+      void this.runItemAction(actions, () => this.plugin.resolveConflictKeepLocal(item.path));
     });
     this.createActionChip(actions, t("syncView.conflict.keepRemote"), "accent", () => {
-      void this.runItemAction(actions, () => this.plugin.syncExecutor!.resolveConflictKeepRemote(item.path));
+      void this.runItemAction(actions, () => this.plugin.resolveConflictKeepRemote(item.path));
     });
     this.createActionChip(actions, t("syncView.conflict.viewDetail"), "", () => {
       const modal = new ConflictDetailModal(this.plugin, item);
@@ -951,10 +978,10 @@ export class EasySyncSyncView extends ItemView {
     body.createDiv("easy-sync-item-reason").setText(t("syncView.delete.reason"));
     const actions = body.createDiv("easy-sync-item-actions");
     this.createActionChip(actions, t("syncView.delete.confirm"), "warning", () => {
-      void this.runItemAction(actions, () => this.plugin.syncExecutor!.confirmRemoteDelete(item.path));
+      void this.runItemAction(actions, () => this.plugin.confirmRemoteDelete(item.path));
     });
     this.createActionChip(actions, t("syncView.delete.reject"), "", () => {
-      void this.runItemAction(actions, () => this.plugin.syncExecutor!.rejectRemoteDelete(item.path));
+      void this.runItemAction(actions, () => this.plugin.rejectRemoteDelete(item.path));
     });
   }
 
@@ -999,9 +1026,9 @@ export class EasySyncSyncView extends ItemView {
     return chip;
   }
 
-  private disableActionChips(actionsEl: HTMLElement): void {
-    for (const chip of Array.from(actionsEl.querySelectorAll(".easy-sync-action-chip"))) {
-      (chip as HTMLButtonElement).disabled = true;
+  private disableActionButtons(actionsEl: HTMLElement): void {
+    for (const button of Array.from(actionsEl.querySelectorAll("button"))) {
+      (button as HTMLButtonElement).disabled = true;
     }
   }
 
@@ -1012,6 +1039,7 @@ export class EasySyncSyncView extends ItemView {
       [t("syncView.fileStatus.download"), entry.downloaded],
       [t("syncView.fileStatus.delete"), entry.deleted],
       [t("syncView.fileStatus.conflict"), entry.conflicts],
+      [t("syncView.fileStatus.deferred"), entry.deferred ?? 0],
       [t("syncView.fileStatus.skip"), entry.skipped],
       [t("syncView.fileStatus.error"), entry.errors],
     ];
@@ -1023,9 +1051,9 @@ export class EasySyncSyncView extends ItemView {
 
   private async runItemAction(
     actionsEl: HTMLElement,
-    action: () => Promise<void>,
+    action: () => Promise<unknown>,
   ): Promise<void> {
-    this.disableActionChips(actionsEl);
+    this.disableActionButtons(actionsEl);
     try {
       await action();
     } finally {

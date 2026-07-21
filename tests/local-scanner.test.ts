@@ -39,10 +39,21 @@ function makeScanner(includePluginCode: boolean, includePluginData: boolean) {
         ".obsidian/plugins/easy-sync/data.json",
         ".obsidian/plugins/easy-sync/data.sync-conflict-20260709.json",
         ".obsidian/plugins/easy-sync/remote-state.json",
+        ".obsidian/plugins/easy-sync/base-content.json",
+        ".obsidian/plugins/easy-sync/state-v2.json",
+        ".obsidian/plugins/easy-sync/state-v2.next.json",
+        ".obsidian/plugins/easy-sync/state-v2.previous.json",
+        ".obsidian/plugins/easy-sync/state-v2.recovery.json",
+        ".obsidian/plugins/easy-sync/state-v2.manifest.json",
+        ".obsidian/plugins/easy-sync/state-v2.manifest.next.json",
+        ".obsidian/plugins/easy-sync/state-v1.backup.json",
+        ".obsidian/plugins/easy-sync/ancestor-manifest-v2.json",
+        ".obsidian/plugins/easy-sync/ancestor-manifest-v2.next.json",
       ],
       folders: [
         ".obsidian/plugins/easy-sync/logs",
         ".obsidian/plugins/easy-sync/tmp",
+        ".obsidian/plugins/easy-sync/ancestors-v2",
       ],
     },
     ".obsidian/plugins/easy-sync/logs": {
@@ -51,6 +62,10 @@ function makeScanner(includePluginCode: boolean, includePluginData: boolean) {
     },
     ".obsidian/plugins/easy-sync/tmp": {
       files: [".obsidian/plugins/easy-sync/tmp/download.part"],
+      folders: [],
+    },
+    ".obsidian/plugins/easy-sync/ancestors-v2": {
+      files: [`.obsidian/plugins/easy-sync/ancestors-v2/${"a".repeat(64)}.txt`],
       folders: [],
     },
   };
@@ -219,5 +234,179 @@ describe("LocalScanner large file boundary", () => {
     await scanner.scanAll();
 
     expect(adapter.write).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("Preflight P0 — Included path failures make the scan incomplete", () => {
+  const config: ScanConfig = {
+    excludePaths: [".obsidian/"],
+    includePaths: [".obsidian/plugins/"],
+    maxFileSize: 50 * 1024 * 1024,
+    includePluginCode: true,
+    includePluginData: false,
+  };
+
+  it("records an included directory traversal failure", async () => {
+    const adapter = {
+      list: vi.fn(async () => {
+        throw new Error("simulated list failure");
+      }),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, config);
+
+    const result = await scanner.scanAll();
+
+    expect(result.failedPaths).toContain(".obsidian/plugins");
+    expect(result.complete).toBe(false);
+  });
+
+  it("records a stat failure for a file found during included traversal", async () => {
+    const path = ".obsidian/plugins/example-plugin/main.js";
+    const adapter = {
+      list: vi.fn(async () => ({ files: [path], folders: [] })),
+      stat: vi.fn(async () => null),
+      readBinary: vi.fn(async () => content),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, config);
+
+    const result = await scanner.scanAll();
+
+    expect(result.failedPaths).toContain(path);
+    expect(result.complete).toBe(false);
+  });
+
+  it("records a stat failure for a file reported by the vault", async () => {
+    const path = "note.md";
+    const adapter = {
+      read: vi.fn(async () => JSON.stringify({
+        format: 1,
+        entries: {
+          [path]: {
+            mtime: 1,
+            size: content.byteLength,
+            hash: "aa".repeat(32),
+            binary: false,
+          },
+        },
+      })),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      stat: vi.fn(async () => null),
+      readBinary: vi.fn(async () => content),
+      write: vi.fn(async () => undefined),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => [{ path }]),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      excludePaths: [],
+      includePaths: [],
+      maxFileSize: 50 * 1024 * 1024,
+      includePluginCode: false,
+      includePluginData: false,
+    });
+
+    const result = await scanner.scanAll();
+
+    expect(result.failedPaths).toContain(path);
+    expect(result.entries).toEqual([]);
+  });
+
+  it("records a content read failure for an included file", async () => {
+    const path = ".obsidian/plugins/example-plugin/main.js";
+    const adapter = {
+      list: vi.fn(async () => ({ files: [path], folders: [] })),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => { throw new Error("simulated read failure"); }),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, config);
+
+    const result = await scanner.scanAll();
+
+    expect(result.failedPaths).toContain(path);
+  });
+
+  it("records the exact uncertain subtree when nested traversal fails", async () => {
+    const nested = ".obsidian/plugins/example-plugin";
+    const adapter = {
+      list: vi.fn(async (path: string) => {
+        if (path === ".obsidian/plugins") return { files: [], folders: [nested] };
+        throw new Error("nested list failure");
+      }),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, config);
+
+    const result = await scanner.scanAll();
+
+    expect(result.failedPaths).toContain(nested);
+  });
+
+  it("does not mark an excluded plugin data file as uncertain", async () => {
+    const excludedPath = ".obsidian/plugins/example-plugin/data.json";
+    const adapter = {
+      list: vi.fn(async () => ({ files: [excludedPath], folders: [] })),
+      stat: vi.fn(async () => { throw new Error("must not stat excluded path"); }),
+      readBinary: vi.fn(async () => content),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, config);
+
+    const result = await scanner.scanAll();
+
+    expect(result.failedPaths).toEqual([]);
+    expect(adapter.stat).not.toHaveBeenCalled();
+  });
+
+  it("does not prune or persist the scan cache after an incomplete traversal", async () => {
+    const adapter = {
+      read: vi.fn(async () => JSON.stringify({
+        format: 1,
+        entries: {
+          "previous.md": {
+            mtime: 1,
+            size: content.byteLength,
+            hash: "aa".repeat(32),
+            binary: false,
+          },
+        },
+      })),
+      list: vi.fn(async () => { throw new Error("simulated list failure"); }),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+      write: vi.fn(async () => undefined),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, config);
+
+    const result = await scanner.scanAll();
+
+    expect(result.failedPaths).toContain(".obsidian/plugins");
+    expect(adapter.write).not.toHaveBeenCalled();
   });
 });

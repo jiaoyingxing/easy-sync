@@ -1,10 +1,14 @@
-import { Notice, Platform, Plugin, setIcon, setTooltip, WorkspaceLeaf } from "obsidian";
+import { Platform, Plugin, setIcon, setTooltip, WorkspaceLeaf } from "obsidian";
 import { AuthModule, type AuthPluginContext } from "./auth/auth-module";
+import { createAuthBrowserLauncher } from "./auth/auth-browser";
 import {
   compatClearInterval,
   compatClearTimeout,
+  compatCancelAnimationFrame,
+  compatRequestAnimationFrame,
   compatSetInterval,
   compatSetTimeout,
+  type AnimationFrameHandle,
   getConfigDir,
   getEasySyncPaths,
   IntervalHandle,
@@ -15,16 +19,60 @@ import { OneDriveClient } from "./onedrive/client";
 import { LocalScanner } from "./sync/local-scanner";
 import { SyncEngine } from "./sync/sync-engine";
 import { StateManager } from "./sync/state-manager";
-import { SyncExecutor, type SyncMode, type SyncResult } from "./sync/sync-executor";
-import { isAnySyncActivityRunning, SyncProgressStore } from "./sync/sync-progress";
+import {
+  SyncExecutor,
+  type SyncCallbacks,
+  type SyncMode,
+  type SyncResult,
+  type SyncRunOptions,
+  type ReviewedContentEqualityProof,
+} from "./sync/sync-executor";
+import {
+  isAnySyncActivityRunning,
+  SyncProgressStore,
+} from "./sync/sync-progress";
 import { DiagnosticLogger } from "./sync/diagnostic-logger";
 import { EasySyncSettingTab } from "./ui/settings-tab";
 import { EasySyncSyncView, SYNC_VIEW_TYPE } from "./ui/sync-view";
-import { RIBBON_STATUS_ICONS, resolveRibbonStatus, type RibbonStatus } from "./ui/ribbon-status";
+import {
+  RIBBON_STATUS_ICONS,
+  resolveRibbonStatus,
+  resolveRibbonStatusLabel,
+  type RibbonStatus,
+} from "./ui/ribbon-status";
 import { SyncPlanAlertModal } from "./ui/confirm-modal";
-import type { SyncPlan } from "./sync/types";
+import type { PlanReviewAuthorization, SyncPlan } from "./sync/types";
 import { SyncActionType } from "./sync/types";
 import { I18n } from "./i18n/index";
+import { OperationLifecycle } from "./sync/operation-lifecycle";
+import { EasySyncNoticeCenter, NOTICE_PRIORITY } from "./ui/notice-center";
+import {
+  createSyncProgressNoticeMessage,
+  formatSyncProgressNoticeLabel,
+  resolveSyncProgressNoticePresentation,
+  resolveSyncNoticeOutcome,
+  shouldSuppressSyncNoticeForMobileSidebar,
+  type SyncNoticeOutcomeKind,
+} from "./ui/sync-notice";
+import {
+  AutoSyncDirtyHint,
+  LOCAL_DIRTY_DEBOUNCE_MS,
+} from "./sync/auto-sync-dirty-hint";
+import { sha256Hex } from "./crypto";
+import {
+  buildConflictEvidence,
+  findLatestAutomaticHandlingSummary,
+  findLatestNetworkSummary,
+  findLatestPhaseSummary,
+  findLatestTransferSummary,
+  fingerprintOpaqueValue,
+  summarizeMutationRecovery,
+} from "./sync/diagnostic-report-evidence";
+import {
+  DEFAULT_AUTOMATIC_HANDLING_POLICY,
+  readAutomaticHandlingPolicy,
+  type AutomaticHandlingPolicy,
+} from "./sync/automatic-handling-policy";
 
 /** Plugin data keys for sync settings */
 const KEY_SYNC_INTERVAL = "sync-interval";
@@ -39,9 +87,33 @@ const KEY_SYNC_CORE_PLUGINS = "sync-core-plugins";
 const KEY_SYNC_COMMUNITY_PLUGINS = "sync-community-plugins";
 const KEY_SYNC_PLUGIN_DATA = "sync-plugin-data";
 const KEY_AUTO_SYNC_PAUSED = "auto-sync-paused";
-const KEY_AUTO_MERGE = "sync-auto-merge";
+const KEY_LEGACY_AUTO_MERGE = "sync-auto-merge";
+const KEY_AUTOMATIC_HANDLING_POLICY = "sync-auto-conflict-policy";
 const KEY_PROFILE_CACHE = "easy-sync-profile-cache";
 const RIBBON_SUCCESS_DURATION_MS = 5_000;
+const SYNC_RESULT_NOTICE_DURATION_MS = 2_000;
+const SYNC_PROGRESS_NOTICE_KEY = "sync-progress";
+
+function clonePluginData(data: Record<string, unknown>): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(data)) as Record<string, unknown>;
+}
+
+function measurePluginDataWrite(data: Record<string, unknown>): {
+  serializedBytes: number;
+  topLevelKeys: number;
+  largestKeys: Array<{ key: string; bytes: number }>;
+} {
+  const encoder = new TextEncoder();
+  const serializedBytes = encoder.encode(JSON.stringify(data)).byteLength;
+  const largestKeys = Object.entries(data)
+    .map(([key, value]) => {
+      const serialized = JSON.stringify(value);
+      return { key, bytes: serialized === undefined ? 0 : encoder.encode(serialized).byteLength };
+    })
+    .sort((left, right) => right.bytes - left.bytes)
+    .slice(0, 5);
+  return { serializedBytes, topLevelKeys: Object.keys(data).length, largestKeys };
+}
 
 /**
  * EasySync / 易同步
@@ -56,6 +128,7 @@ export default class EasySyncPlugin extends Plugin {
   state: StateManager | null = null;
   syncExecutor: SyncExecutor | null = null;
   progressStore: SyncProgressStore = new SyncProgressStore();
+  noticeCenter: EasySyncNoticeCenter = new EasySyncNoticeCenter();
   i18n: I18n = new I18n("en");
   diag: DiagnosticLogger = new DiagnosticLogger();
 
@@ -63,11 +136,15 @@ export default class EasySyncPlugin extends Plugin {
   // StateManager.save() / saveSyncSettings() / auth profile writes
   // from racing on loadData → modify → saveData cycles.
   private pluginDataQueue: Promise<void> = Promise.resolve();
+  private pluginDataCache: Record<string, unknown> | null | undefined;
+  private pluginDataLoadPromise: Promise<Record<string, unknown> | null> | null = null;
 
   syncInterval = 3;
   syncPluginFiles = false; // M19: EasySync self-sync default OFF — explicit opt-in
   syncMaxFileSizeMb = 500;
-  autoMerge = true;
+  automaticHandlingPolicy: AutomaticHandlingPolicy = {
+    ...DEFAULT_AUTOMATIC_HANDLING_POLICY,
+  };
   syncEditorSettings = false;
   syncAppearance = false;
   syncThemes = false;
@@ -79,12 +156,18 @@ export default class EasySyncPlugin extends Plugin {
   autoSyncPaused = false;
   private opLock: string | null = null;
   private autoSyncTimer: IntervalHandle | null = null;
+  private readonly autoSyncDirtyHint = new AutoSyncDirtyHint(
+    () => this.runAutomaticSync("dirty"),
+  );
   private statusBarEl: HTMLElement | null = null;
   private ribbonEl: HTMLElement | null = null;
   private ribbonSuccessTimer: TimeoutHandle | null = null;
   private ribbonSuccessVisible = false;
   private settingsTab: EasySyncSettingTab | null = null;
   private stateLoadPromise: Promise<void> | null = null;
+  private syncNoticeFrame: AnimationFrameHandle | null = null;
+  private syncNoticeSignature: string | null = null;
+  private readonly operationLifecycle = new OperationLifecycle();
 
   /** Set to true after state.load() completes. Public so settings-tab
    *  can guard the "Reset" button with it. */
@@ -118,6 +201,12 @@ export default class EasySyncPlugin extends Plugin {
 
     // ════ ② Auth (create, register callback, then background-init) ════
 
+    const authBrowser = createAuthBrowserLauncher({
+      isDesktopApp: Platform.isDesktopApp,
+      onPopupNavigationError: (error) => {
+        this.diag.warn("auth", "failed to navigate auth popup, falling back to direct open", error);
+      },
+    });
     const authCtx: AuthPluginContext = {
       secretStorage: {
         set: (key, value) => this.saveSecret(key, value),
@@ -127,31 +216,8 @@ export default class EasySyncPlugin extends Plugin {
       registerProtocolHandler: (action, handler) => {
         this.registerObsidianProtocolHandler(action, handler);
       },
-      openAuthPopup: () => {
-        const popup = window.open("about:blank", "_blank");
-        if (!popup) return null;
-        return {
-          navigate: (url: string) => {
-            try {
-              popup.location.href = url;
-              return true;
-            } catch (error) {
-              this.diag.warn("auth", "failed to navigate auth popup, falling back to direct open", error);
-              return false;
-            }
-          },
-          close: () => {
-            try {
-              popup.close();
-            } catch {
-              // Ignore popup close failures.
-            }
-          },
-        };
-      },
-      openUrl: (url) => {
-        window.open(url, "_blank");
-      },
+      openAuthPopup: authBrowser.openAuthPopup,
+      openUrl: authBrowser.openUrl,
       // User profile cache: avoid network call on every cold start
       profileCache: {
         get: async () => {
@@ -188,7 +254,12 @@ export default class EasySyncPlugin extends Plugin {
     // ════ ③ Sync engine + scanner (no state load yet) ════
 
     this.engine = new SyncEngine();
-    this.state = new StateManager(this);
+    this.state = new StateManager({
+      loadData: () => this.loadPluginData(),
+      updatePluginData: (mutator) => this.updatePluginData(mutator),
+      app: this.app,
+      manifest: this.manifest,
+    });
     // Reset circuit breakers on fresh OAuth login — old failures may
     // be due to stale auth scope and are no longer predictive.
     authCtx.onFreshLogin = () => {
@@ -216,14 +287,16 @@ export default class EasySyncPlugin extends Plugin {
       this.i18n,
       this.progressStore,
       this.diag,
-      this.autoMerge,
       this.app.fileManager,
       () => {
         this.updateStatusBar();
         this.syncView?.render();
         this.settingsTab?.refreshSyncState();
       },
+      this.operationLifecycle,
+      this.noticeCenter,
     );
+    this.syncExecutor.setAutomaticHandlingPolicy(this.automaticHandlingPolicy);
 
     // ════ ④ Register UI (Obsidian is usable from here on) ════
 
@@ -233,6 +306,14 @@ export default class EasySyncPlugin extends Plugin {
       SYNC_VIEW_TYPE,
       (leaf: WorkspaceLeaf) => new EasySyncSyncView(leaf, this),
     );
+    this.registerEvent(this.app.workspace.on(
+      "layout-change",
+      () => this.refreshSyncNoticeVisibility(),
+    ));
+    this.registerEvent(this.app.workspace.on(
+      "active-leaf-change",
+      () => this.refreshSyncNoticeVisibility(),
+    ));
     this.ribbonEl = this.addRibbonIcon(
       "cloud",
       this.i18n.t("syncView.title"),
@@ -268,6 +349,10 @@ export default class EasySyncPlugin extends Plugin {
 
     // ════ ⑥ Auto-sync timer (skips until auth is ready) ════
 
+    this.registerEvent(this.app.vault.on("create", (file) => this.markLocalDirtyHint(file.path)));
+    this.registerEvent(this.app.vault.on("modify", (file) => this.markLocalDirtyHint(file.path)));
+    this.registerEvent(this.app.vault.on("delete", (file) => this.markLocalDirtyHint(file.path)));
+    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.markLocalDirtyHint(file.path, oldPath)));
     this.startAutoSync();
 
     this.diag.log("lifecycle", "onload complete (auth initializing in background)");
@@ -275,8 +360,14 @@ export default class EasySyncPlugin extends Plugin {
 
   onunload(): void {
     this.diag.log("lifecycle", "unloading");
+    this.syncExecutor?.invalidateLifecycle("unload");
+    // Sever the UI gateway immediately. The invalidated executor object stays
+    // alive only for already-captured async work to drain safely.
+    this.syncExecutor = null;
     this.stopAutoSync();
     compatClearTimeout(this.ribbonSuccessTimer);
+    compatCancelAnimationFrame(this.syncNoticeFrame);
+    this.noticeCenter.dispose();
     void this.diag.dispose().catch(() => undefined);
     // Auth token stays in SecretStorage across sessions
   }
@@ -296,50 +387,208 @@ export default class EasySyncPlugin extends Plugin {
     const existing = this.app.workspace.getLeavesOfType(SYNC_VIEW_TYPE);
     if (existing.length > 0) {
       await this.app.workspace.revealLeaf(existing[0]);
+      this.refreshSyncNoticeVisibility();
       return;
     }
     await this.app.workspace.getLeftLeaf(false)?.setViewState({
       type: SYNC_VIEW_TYPE,
       active: true,
     });
+    this.refreshSyncNoticeVisibility();
+  }
+
+  private async runSideActionIntent(
+    path: string,
+    failureKey: "notice.conflict.failed" | "notice.delete.failed",
+    action: (executor: SyncExecutor, state: StateManager) => Promise<void>,
+    requireIdleSideActions = false,
+  ): Promise<boolean> {
+    const executor = this.syncExecutor;
+    const state = this.state;
+    if (!executor || !state) return false;
+
+    const rejectBusy = (): boolean => {
+      if (this.opLock === null
+        && !executor.isRunning
+        && (!requireIdleSideActions || !executor.hasSideActionsInFlight)) {
+        return false;
+      }
+      this.noticeCenter.show({
+        key: `side-action-gateway:busy:${path}`,
+        message: this.i18n.t(failureKey, {
+          path,
+          reason: this.i18n.t("result.lockBusy"),
+        }),
+        priority: NOTICE_PRIORITY.attention,
+        className: "easy-sync-notice-action",
+      });
+      return true;
+    };
+
+    try {
+      await this.ensureStateLoaded();
+      if (rejectBusy()) return false;
+      if (!await this.checkAccountBinding()) return false;
+      if (rejectBusy()) return false;
+      await action(executor, state);
+      this.updateStatusBar();
+      this.syncView?.render();
+      this.settingsTab?.refreshSyncState();
+      return true;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      this.diag.warn("execute", `side-action gateway failed — ${path}`, reason);
+      this.noticeCenter.show({
+        key: `side-action-gateway:failed:${path}`,
+        message: this.i18n.t(failureKey, { path, reason }),
+        priority: NOTICE_PRIORITY.failure,
+        className: "easy-sync-notice-action",
+      });
+      this.updateStatusBar();
+      this.syncView?.render();
+      this.settingsTab?.refreshSyncState();
+      return false;
+    }
+  }
+
+  resolveConflictKeepLocal(path: string): Promise<boolean> {
+    return this.runSideActionIntent(
+      path,
+      "notice.conflict.failed",
+      (executor) => executor.resolveConflictKeepLocal(path),
+    );
+  }
+
+  resolveConflictKeepRemote(path: string): Promise<boolean> {
+    return this.runSideActionIntent(
+      path,
+      "notice.conflict.failed",
+      (executor) => executor.resolveConflictKeepRemote(path),
+    );
+  }
+
+  reconcileIdenticalConflict(
+    path: string,
+    proof: ReviewedContentEqualityProof,
+  ): Promise<boolean> {
+    return this.runSideActionIntent(
+      path,
+      "notice.conflict.failed",
+      (executor) => executor.reconcileIdenticalConflict(path, proof),
+    );
+  }
+
+  confirmRemoteDelete(path: string): Promise<boolean> {
+    return this.runSideActionIntent(
+      path,
+      "notice.delete.failed",
+      (executor) => executor.confirmRemoteDelete(path),
+    );
+  }
+
+  confirmRemoteDeletes(paths: readonly string[]): Promise<boolean> {
+    const requestedPaths = [...new Set(paths)];
+    if (requestedPaths.length === 0) return Promise.resolve(false);
+    return this.runSideActionIntent(
+      requestedPaths[0],
+      "notice.delete.failed",
+      (executor, state) => {
+        const requested = new Set(requestedPaths);
+        const currentPaths = state.pendingRemoteDeletes
+          .filter((item) => requested.has(item.path))
+          .map((item) => item.path);
+        return executor.confirmRemoteDeletes(currentPaths);
+      },
+    );
+  }
+
+  rejectRemoteDelete(path: string): Promise<boolean> {
+    return this.runSideActionIntent(
+      path,
+      "notice.delete.failed",
+      (executor) => executor.rejectRemoteDelete(path),
+    );
+  }
+
+  dismissConflict(path: string): Promise<boolean> {
+    return this.runSideActionIntent(
+      path,
+      "notice.conflict.failed",
+      async (_executor, state) => state.removePendingConflict(path),
+      true,
+    );
+  }
+
+  private createSyncCallbacks(mode: SyncMode): SyncCallbacks {
+    return {
+      onProgress: (current, total, currentFile) => {
+        this.handleProgress(current, total, currentFile);
+        this.updateStatusBar();
+        this.syncView?.render();
+      },
+      onFileProgress: (downloaded, total) => {
+        this.handleFileProgress(downloaded, total);
+      },
+      onFileComplete: (path, actionType, success, reason, fileSize) => {
+        this.handleFileComplete(path, actionType, success, reason, fileSize);
+      },
+      onFirstSyncPreview: mode === "first"
+        ? async (plan) => this.showPlanAlert("firstSync", plan)
+        : undefined,
+      onConfirmThreshold: mode === "auto"
+        ? async () => false
+        : async (plan) => this.showPlanAlert("threshold", plan),
+      onStateChange: () => {
+        this.updateStatusBar();
+        this.syncView?.render();
+      },
+    };
+  }
+
+  private async dispatchSyncRun(request: {
+    mode: SyncMode;
+    skipConfirmation?: boolean;
+    reviewedAuthorization?: PlanReviewAuthorization;
+    options?: SyncRunOptions;
+    logLabel?: string;
+    renderAfter?: boolean;
+  }): Promise<SyncResult | null> {
+    if (!this.syncExecutor) return null;
+    this.progressStore.markStarted();
+    this.beginSyncNotice();
+    const result = await this.syncExecutor.run(
+      request.mode,
+      this.createSyncCallbacks(request.mode),
+      request.skipConfirmation ?? false,
+      request.reviewedAuthorization,
+      request.options ?? {},
+    );
+    if (request.logLabel) {
+      this.diag.log("execute", `${request.logLabel}: ${result.message}`);
+    }
+    await this.handleSyncResult(result, request.mode);
+    if (request.renderAfter) this.syncView?.render();
+    return result;
   }
 
   /** Execute a sync after the user has reviewed the plan in the sidebar.
-   *  Clears plan review state, then runs the sync with confirmation
-   *  checks skipped (user already reviewed). */
+   *  The reviewed digest may become stale before execution; in that case the
+   *  executor sends the replacement plan back through the normal alert path. */
   async executePlanReview(): Promise<void> {
     if (!this.syncExecutor || !this.state) return;
     if (this.acquireOpLock("sync")) return;
     try {
     await this.ensureStateLoaded();
     if (!this.state.planReviewActive) return;
-    this.progressStore.markStarted();
-
-    const result = await this.syncExecutor.run(
-      "manual",
-      {
-        onProgress: (current, total, currentFile) => {
-          this.handleProgress(current, total, currentFile);
-          this.updateStatusBar();
-          this.syncView?.render();
-        },
-        onFileProgress: (downloaded, total) => {
-          this.handleFileProgress(downloaded, total);
-        },
-        onFileComplete: (path, actionType, success, reason, fileSize) => {
-          this.handleFileComplete(path, actionType, success, reason, fileSize);
-        },
-        onStateChange: () => {
-          this.updateStatusBar();
-          this.syncView?.render();
-        },
-      },
-      /* skipConfirmation = */ true,
-    );
-
-    this.diag.log("execute", `plan review execution result: ${result.message}`);
-    await this.handleSyncResult(result, "manual");
-    this.syncView?.render();
+    if (!await this.checkAccountBinding()) return;
+    const reviewedAuthorization = this.state.planReviewAuthorization ?? undefined;
+    await this.dispatchSyncRun({
+      mode: "manual",
+      skipConfirmation: true,
+      reviewedAuthorization,
+      logLabel: "plan review execution result",
+      renderAfter: true,
+    });
     } finally {
       this.releaseOpLock();
     }
@@ -368,11 +617,19 @@ export default class EasySyncPlugin extends Plugin {
     const bound = this.state?.boundAccountId;
     if (!bound) {
       // First sync ever — bind to this account
+      this.operationLifecycle.invalidate("account-binding-change");
       await this.state?.bindAccount(currentId);
       return true;
     }
     if (bound !== currentId) {
-      new Notice(`账号不匹配：此仓库已绑定账号 ${bound.slice(0, 8)}…，当前账号为 ${currentId.slice(0, 8)}…。请先重置同步状态再切换账号。`);
+      this.noticeCenter.show({
+        key: "account-mismatch",
+        message: this.i18n.t("notice.accountMismatch", {
+          bound: `${bound.slice(0, 8)}…`,
+          current: `${currentId.slice(0, 8)}…`,
+        }),
+        priority: NOTICE_PRIORITY.critical,
+      });
       this.diag.warn("lifecycle", `account mismatch — bound=${bound.slice(0, 8)}, current=${currentId.slice(0, 8)}`);
       return false;
     }
@@ -392,7 +649,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   /** Start a first sync (manual trigger from settings) */
-  async startFirstSync(): Promise<void> {
+  async startFirstSync(options: SyncRunOptions = {}): Promise<void> {
     if (!this.syncExecutor) return;
     if (this.acquireOpLock("sync")) return;
     try {
@@ -404,32 +661,11 @@ export default class EasySyncPlugin extends Plugin {
       return;
     }
     await this.activateSyncView();
-    this.progressStore.markStarted();
-    const result = await this.syncExecutor.run("first", {
-      onProgress: (current, total, currentFile) => {
-        this.handleProgress(current, total, currentFile);
-        this.updateStatusBar();
-        this.syncView?.render();
-      },
-      onFileProgress: (downloaded, total) => {
-        this.handleFileProgress(downloaded, total);
-      },
-      onFileComplete: (path, actionType, success, reason) => {
-        this.handleFileComplete(path, actionType, success, reason);
-      },
-      onFirstSyncPreview: async (plan) => {
-        return this.showPlanAlert("firstSync", plan);
-      },
-      onConfirmThreshold: async (plan) => {
-        return this.showPlanAlert("threshold", plan);
-      },
-      onStateChange: () => {
-        this.updateStatusBar();
-        this.syncView?.render();
-      },
+    await this.dispatchSyncRun({
+      mode: "first",
+      options,
+      logLabel: "first sync result",
     });
-    this.diag.log("execute", `first sync result: ${result.message}`);
-    await this.handleSyncResult(result, "first");
     } finally {
       this.releaseOpLock();
     }
@@ -450,34 +686,16 @@ export default class EasySyncPlugin extends Plugin {
     // If a plan review is pending, execute it directly — but keep the
     // reviewed bundle in state until SyncExecutor re-validates its digest.
     const skipConfirmation = this.state?.planReviewActive ?? false;
+    const reviewedAuthorization = skipConfirmation
+      ? this.state?.planReviewAuthorization ?? undefined
+      : undefined;
 
-    this.progressStore.markStarted();
-    const result = await this.syncExecutor.run(
-      "manual",
-      {
-        onProgress: (current, total, currentFile) => {
-          this.handleProgress(current, total, currentFile);
-          this.updateStatusBar();
-          this.syncView?.render();
-        },
-        onFileProgress: (downloaded, total) => {
-          this.handleFileProgress(downloaded, total);
-        },
-        onFileComplete: (path, actionType, success, reason, fileSize) => {
-          this.handleFileComplete(path, actionType, success, reason, fileSize);
-        },
-        onConfirmThreshold: async (plan) => {
-          return this.showPlanAlert("threshold", plan);
-        },
-        onStateChange: () => {
-          this.updateStatusBar();
-          this.syncView?.render();
-        },
-      },
+    await this.dispatchSyncRun({
+      mode: "manual",
       skipConfirmation,
-    );
-    this.diag.log("execute", `manual sync result: ${result.message}`);
-    await this.handleSyncResult(result, "manual");
+      reviewedAuthorization,
+      logLabel: "manual sync result",
+    });
     } finally {
       this.releaseOpLock();
     }
@@ -500,12 +718,17 @@ export default class EasySyncPlugin extends Plugin {
       uploads: plan.items.filter((i) => i.type === SyncActionType.Upload).length,
       downloads: plan.items.filter((i) => i.type === SyncActionType.Download).length,
       deletes: plan.items.filter((i) =>
-        i.type === SyncActionType.DeleteRemote || i.type === SyncActionType.ConfirmLocalDelete).length,
+        i.type === SyncActionType.DeleteRemote
+          || i.type === SyncActionType.DeleteLocal
+          || i.type === SyncActionType.ConfirmLocalDelete).length,
       conflicts: conflictItems.length,
       skipped: plan.items.filter((i) =>
         i.type === SyncActionType.SkipLargeFile || i.type === SyncActionType.SkipIgnoredPath).length,
     };
-    await this.state!.setPlanReviewBundle(plan.items, counts);
+    if (!plan.scope) {
+      throw new Error("Cannot persist a plan review without a complete sync scope");
+    }
+    await this.state!.setPlanReviewBundle(plan.items, counts, plan.scope);
 
     // Refresh sidebar to show plan review section
     this.updateStatusBar();
@@ -527,11 +750,141 @@ export default class EasySyncPlugin extends Plugin {
 
   // ---- Progress helpers ----
 
+  private shouldSuppressSyncNotice(): boolean {
+    const leftSidebar = this.app.workspace.leftSplit;
+    if (!leftSidebar) return false;
+    return shouldSuppressSyncNoticeForMobileSidebar({
+      isMobile: Platform.isMobile,
+      leftSidebarCollapsed: leftSidebar.collapsed,
+      easySyncViewInLeftSidebar: this.app.workspace
+        .getLeavesOfType(SYNC_VIEW_TYPE)
+        .some((leaf) => leaf.parent === leftSidebar),
+    });
+  }
+
+  private clearSyncLifecycleNotice(): void {
+    const activeKey = this.noticeCenter.activeKey;
+    this.noticeCenter.clear(SYNC_PROGRESS_NOTICE_KEY);
+    if (activeKey?.startsWith("sync-result:")) this.noticeCenter.clear(activeKey);
+  }
+
+  private refreshSyncNoticeVisibility(): void {
+    if (!Platform.isMobile) return;
+    if (this.shouldSuppressSyncNotice()) {
+      this.syncNoticeSignature = null;
+      this.clearSyncLifecycleNotice();
+      return;
+    }
+    if (this.syncExecutor?.isRunning) this.renderSyncNoticeProgress();
+  }
+
+  private beginSyncNotice(): void {
+    compatCancelAnimationFrame(this.syncNoticeFrame);
+    this.syncNoticeFrame = null;
+    if (this.shouldSuppressSyncNotice()) {
+      this.syncNoticeSignature = null;
+      this.clearSyncLifecycleNotice();
+      return;
+    }
+    const label = this.i18n.t("notice.sync.start");
+    this.syncNoticeSignature = `start:${label}`;
+    this.noticeCenter.show({
+      key: SYNC_PROGRESS_NOTICE_KEY,
+      message: () => createSyncProgressNoticeMessage(label, 0, false, false),
+      priority: NOTICE_PRIORITY.progress,
+      durationMs: 0,
+      className: "easy-sync-notice-progress",
+      resumable: true,
+    });
+  }
+
+  private scheduleSyncNoticeUpdate(): void {
+    if (this.syncNoticeFrame !== null) return;
+    this.syncNoticeFrame = compatRequestAnimationFrame(() => {
+      this.syncNoticeFrame = null;
+      if (this.syncExecutor?.isRunning) this.renderSyncNoticeProgress();
+    });
+  }
+
+  private renderSyncNoticeProgress(): void {
+    if (this.shouldSuppressSyncNotice()) {
+      this.syncNoticeSignature = null;
+      this.clearSyncLifecycleNotice();
+      return;
+    }
+    const progress = this.progressStore.state;
+    const presentation = resolveSyncProgressNoticePresentation(progress);
+    const t = this.i18n.t.bind(this.i18n);
+    const label = formatSyncProgressNoticeLabel(presentation, t);
+    const signature = [
+      presentation.kind,
+      presentation.activity.kind,
+      label,
+      presentation.percent,
+      presentation.determinate,
+      presentation.showProgressBar,
+    ].join(":");
+    if (signature === this.syncNoticeSignature) return;
+    this.syncNoticeSignature = signature;
+    this.noticeCenter.show({
+      key: SYNC_PROGRESS_NOTICE_KEY,
+      message: () => createSyncProgressNoticeMessage(
+        label,
+        presentation.percent,
+        presentation.determinate,
+        presentation.showProgressBar,
+      ),
+      priority: NOTICE_PRIORITY.progress,
+      durationMs: 0,
+      className: "easy-sync-notice-progress",
+      resumable: true,
+    });
+  }
+
+  private finishSyncNotice(result: SyncResult): void {
+    compatCancelAnimationFrame(this.syncNoticeFrame);
+    this.syncNoticeFrame = null;
+    this.syncNoticeSignature = null;
+    const suppressNotice = this.shouldSuppressSyncNotice();
+    this.clearSyncLifecycleNotice();
+
+    const outcome = resolveSyncNoticeOutcome(result, {
+      pausedForReview: result.message === this.i18n.t("result.pausedForReview"),
+      cancelled: result.message === this.i18n.t("result.cancelled"),
+    });
+    if (!outcome || suppressNotice) return;
+
+    const messageKeys: Record<SyncNoticeOutcomeKind, string> = {
+      completed: "notice.sync.completed",
+      conflicts: "notice.sync.conflicts",
+      review: "notice.sync.review",
+      cancelled: "notice.sync.cancelled",
+      failed: "notice.sync.failed",
+      authExpired: "notice.sync.authExpired",
+    };
+    const priorities: Record<SyncNoticeOutcomeKind, number> = {
+      completed: NOTICE_PRIORITY.info,
+      conflicts: NOTICE_PRIORITY.attention,
+      review: NOTICE_PRIORITY.attention,
+      cancelled: NOTICE_PRIORITY.action,
+      failed: NOTICE_PRIORITY.failure,
+      authExpired: NOTICE_PRIORITY.critical,
+    };
+    this.noticeCenter.show({
+      key: `sync-result:${outcome.kind}`,
+      message: this.i18n.t(messageKeys[outcome.kind], { count: outcome.count }),
+      priority: priorities[outcome.kind],
+      durationMs: SYNC_RESULT_NOTICE_DURATION_MS,
+      className: "easy-sync-notice-result",
+    });
+  }
+
   /** Forward progress from executor to the store for sync-view display.
    *  Phase and progress are set directly by the executor on the store;
    *  this callback only triggers UI refresh. */
   private handleProgress(_current: number, _total: number, _currentFile: string): void {
     // Store already updated by SyncExecutor — just refresh UI
+    this.scheduleSyncNoticeUpdate();
   }
 
   /** Track byte-level progress for the current file download */
@@ -540,6 +893,7 @@ export default class EasySyncPlugin extends Plugin {
     // render() uses requestAnimationFrame — multiple calls per frame are
     // coalesced, so calling on every byte chunk is safe and efficient.
     this.syncView?.render();
+    this.scheduleSyncNoticeUpdate();
   }
 
   /** Track a completed file in the progress store */
@@ -547,13 +901,16 @@ export default class EasySyncPlugin extends Plugin {
     const status = success
       ? SyncProgressStore.actionToStatus(actionType)
       : "error";
+    this.progressStore.completeCurrentItem();
     this.progressStore.addCompletedFile({ path, status, actionType, reason, fileSize });
+    this.scheduleSyncNoticeUpdate();
   }
 
   async cancelSync(): Promise<void> {
     if (!this.syncExecutor?.isRunning) return;
     this.progressStore.requestCancel();
-    this.syncExecutor.cancel();
+    this.scheduleSyncNoticeUpdate();
+    this.syncExecutor.invalidateLifecycle("cancel");
     this.diag.log("execute", "sync cancellation requested, waiting for drain...");
     this.updateStatusBar();
     this.syncView?.render();
@@ -573,21 +930,57 @@ export default class EasySyncPlugin extends Plugin {
     this.syncView?.render();
   }
 
+  private async invalidateAndDrainSyncActivity(reason: string): Promise<boolean> {
+    const executor = this.syncExecutor;
+    if (!executor) {
+      this.operationLifecycle.invalidate(reason);
+      return true;
+    }
+
+    if (executor.isRunning) {
+      this.progressStore.requestCancel();
+    }
+    executor.invalidateLifecycle(reason);
+
+    const deadline = Date.now() + 30_000;
+    while ((executor.hasActivityInFlight || this.opLock !== null) && Date.now() < deadline) {
+      await new Promise<void>((resolve) => compatSetTimeout(() => resolve(), 100));
+    }
+    if (executor.hasActivityInFlight || this.opLock !== null) {
+      this.diag.warn("lifecycle", `${reason} blocked because old sync work did not drain within 30s`);
+      return false;
+    }
+    return true;
+  }
+
   /** Reset sync state safely — cancels running sync, acquires lock, clears state. */
   async resetSyncState(): Promise<void> {
-    if (this.syncExecutor?.isRunning) {
-      await this.cancelSync();
+    if (!await this.invalidateAndDrainSyncActivity("reset")) {
+      this.noticeCenter.show({
+        key: "reset-lock-busy",
+        message: this.i18n.t("result.lockBusy"),
+        priority: NOTICE_PRIORITY.attention,
+      });
+      return;
     }
     const holder = this.acquireOpLock("reset");
     if (holder) {
-      new Notice(this.i18n.t("result.lockBusy"));
+      this.noticeCenter.show({
+        key: "reset-lock-busy",
+        message: this.i18n.t("result.lockBusy"),
+        priority: NOTICE_PRIORITY.attention,
+      });
       return;
     }
     try {
       await this.ensureStateLoaded();
       await this.state?.reset();
       await this.scanner?.clearScanCache();
-      new Notice("Sync state reset");
+      this.noticeCenter.show({
+        key: "reset-complete",
+        message: this.i18n.t("settings.reset.done"),
+        priority: NOTICE_PRIORITY.action,
+      });
       this.updateStatusBar();
       this.syncView?.render();
     } finally {
@@ -597,12 +990,21 @@ export default class EasySyncPlugin extends Plugin {
 
   /** Log out safely — cancels running sync, acquires lock, clears auth. */
   async logoutUser(): Promise<void> {
-    if (this.syncExecutor?.isRunning) {
-      await this.cancelSync();
+    if (!await this.invalidateAndDrainSyncActivity("logout")) {
+      this.noticeCenter.show({
+        key: "logout-lock-busy",
+        message: this.i18n.t("result.lockBusy"),
+        priority: NOTICE_PRIORITY.attention,
+      });
+      return;
     }
     const holder = this.acquireOpLock("logout");
     if (holder) {
-      new Notice(this.i18n.t("result.lockBusy"));
+      this.noticeCenter.show({
+        key: "logout-lock-busy",
+        message: this.i18n.t("result.lockBusy"),
+        priority: NOTICE_PRIORITY.attention,
+      });
       return;
     }
     try {
@@ -613,15 +1015,15 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private async handleSyncResult(result: SyncResult, mode: SyncMode): Promise<void> {
+    this.finishSyncNotice(result);
     await this.recordSyncHistory(result, mode);
-    // Show user-visible notification when auth expires — the sidebar status
-    // alone is too subtle; users won't notice unless they open the sync view.
-    if (result.authExpired) {
-      new Notice(this.i18n.t("result.authExpired"));
-    }
-    const pauseAutoSync = result.errors > 0
+    const harmlessRejectedRun = result.message === this.i18n.t("result.alreadyRunning");
+    const pauseAutoSync = (!result.success && !harmlessRejectedRun)
+      || result.errors > 0
       || result.authExpired
-      || result.message === this.i18n.t("result.cancelled");
+      || result.message === this.i18n.t("result.cancelled")
+      || result.message === this.i18n.t("result.pausedForReview")
+      || (this.state?.planReviewActive ?? false);
     if (pauseAutoSync) {
       this.autoSyncPaused = true;
       this.stopAutoSync();
@@ -632,7 +1034,7 @@ export default class EasySyncPlugin extends Plugin {
       this.syncView?.render();
       return;
     }
-    if (result.success && this.autoSyncPaused) {
+    if (result.success && result.deferred === 0 && this.autoSyncPaused) {
       this.autoSyncPaused = false;
       await this.saveSyncSettings();
       this.startAutoSync();
@@ -643,7 +1045,7 @@ export default class EasySyncPlugin extends Plugin {
     if (result.success && mode === "auto") {
       this.startAutoSync();
     }
-    if (result.success) this.showRibbonSuccess();
+    if (result.success && result.deferred === 0) this.showRibbonSuccess();
     else this.clearRibbonSuccess();
     this.updateStatusBar();
     this.syncView?.render();
@@ -661,7 +1063,7 @@ export default class EasySyncPlugin extends Plugin {
     }
     const endedAt = Date.now();
     const status = result.success
-      ? "success"
+      ? result.deferred > 0 ? "partial" : "success"
       : result.message === this.i18n.t("result.cancelled")
         ? "cancelled"
         : result.authExpired
@@ -680,6 +1082,7 @@ export default class EasySyncPlugin extends Plugin {
         downloaded: result.downloaded,
         deleted: result.deleted,
         conflicts: result.conflicts,
+        deferred: result.deferred,
         skipped: result.skippedLarge + result.skippedIgnored,
         skippedLarge: result.skippedLarge,
         skippedIgnored: result.skippedIgnored,
@@ -701,50 +1104,61 @@ export default class EasySyncPlugin extends Plugin {
 
   // ---- Auto-sync ----
 
-  startAutoSync(): void {
-    this.stopAutoSync();
+  private markLocalDirtyHint(path: string, oldPath?: string): void {
     if (this.syncInterval <= 0 || this.autoSyncPaused) return;
-    this.autoSyncTimer = compatSetInterval(async () => {
-      // Skip if auth not ready, sync already running, or lock held
-      if (!this.auth?.authState.isLoggedIn) return;
-      if (this.opLock !== null) return;
-      if (this.syncExecutor && !this.syncExecutor.isRunning) {
-        if (this.acquireOpLock("sync")) return;
-        try {
-        await this.ensureStateLoaded();
-        if (!await this.checkAccountBinding()) return;
-        if (this.state?.planReviewActive) {
-          this.diag.log("execute", "auto sync skipped — plan review pending");
-          return;
-        }
-        this.progressStore.markStarted();
-        const result = await this.syncExecutor.run("auto", {
-          onProgress: (current, total, currentFile) => {
-            this.handleProgress(current, total, currentFile);
-            this.updateStatusBar();
-            this.syncView?.render();
-          },
-          onFileProgress: (downloaded, total) => {
-            this.handleFileProgress(downloaded, total);
-          },
-          onFileComplete: (path, actionType, success, reason) => {
-            this.handleFileComplete(path, actionType, success, reason);
-          },
-          onConfirmThreshold: async () => {
-            // Auto-sync never interrupts with a modal.
-            // If threshold exceeded, skip and surface in status bar.
-            return false;
-          },
-          onStateChange: () => {
-            this.updateStatusBar();
-            this.syncView?.render();
-          },
-        });
-        await this.handleSyncResult(result, "auto");
-        } finally {
-          this.releaseOpLock();
-        }
+    const currentIncluded = this.scanner?.shouldSyncPath(path) === true;
+    const previousIncluded = oldPath !== undefined
+      && this.scanner?.shouldSyncPath(oldPath) === true;
+    if (!currentIncluded && !previousIncluded) return;
+    if (this.autoSyncDirtyHint.mark()) {
+      this.diag.log("execute", "local dirty hint scheduled normal auto sync", {
+        debounceMs: LOCAL_DIRTY_DEBOUNCE_MS,
+        scopeMatch: currentIncluded ? "current" : "previous",
+      });
+    }
+  }
+
+  /** Shared activity-gated entry for periodic reconciliation and dirty hints. */
+  private async runAutomaticSync(trigger: "interval" | "dirty"): Promise<boolean> {
+    if (this.syncInterval <= 0 || this.autoSyncPaused) return true;
+    if (!this.auth?.authState.isLoggedIn) return true;
+    if (!this.syncExecutor) return false;
+    if (this.opLock !== null || this.syncExecutor.isRunning) return false;
+    if (this.acquireOpLock("sync")) return false;
+    let dispatched = false;
+    try {
+      await this.ensureStateLoaded();
+      if (!await this.checkAccountBinding()) return true;
+      if (this.state?.planReviewActive) {
+        this.diag.log("execute", `auto sync skipped — plan review pending (${trigger})`);
+        return true;
       }
+      this.diag.log("execute", `auto sync started — trigger=${trigger}`);
+      dispatched = true;
+      await this.dispatchSyncRun({ mode: "auto" });
+      return true;
+    } catch (error) {
+      this.diag.warn(
+        "execute",
+        `auto sync setup failed — trigger=${trigger}`,
+        error instanceof Error ? error.message : String(error),
+      );
+      // Only consume a dirty hint after the executor actually received it.
+      // A transient setup failure must keep the in-memory hint for retry.
+      return dispatched;
+    } finally {
+      this.releaseOpLock();
+    }
+  }
+
+  startAutoSync(): void {
+    if (this.autoSyncTimer) {
+      compatClearInterval(this.autoSyncTimer);
+      this.autoSyncTimer = null;
+    }
+    if (this.syncInterval <= 0 || this.autoSyncPaused) return;
+    this.autoSyncTimer = compatSetInterval(() => {
+      void this.runAutomaticSync("interval");
     }, this.syncInterval * 60 * 1000);
   }
 
@@ -753,9 +1167,11 @@ export default class EasySyncPlugin extends Plugin {
       compatClearInterval(this.autoSyncTimer);
       this.autoSyncTimer = null;
     }
+    this.autoSyncDirtyHint.cancel();
   }
 
   restartAutoSync(): void {
+    this.stopAutoSync();
     this.startAutoSync();
   }
 
@@ -776,7 +1192,10 @@ export default class EasySyncPlugin extends Plugin {
       if (typeof data[KEY_SYNC_PLUGIN_DATA] === "boolean") this.syncPluginData = data[KEY_SYNC_PLUGIN_DATA];
       if (typeof data[KEY_AUTO_SYNC_PAUSED] === "boolean") this.autoSyncPaused = data[KEY_AUTO_SYNC_PAUSED];
       if (typeof data[KEY_MAX_FILE_SIZE_MB] === "number") this.syncMaxFileSizeMb = data[KEY_MAX_FILE_SIZE_MB];
-      if (typeof data[KEY_AUTO_MERGE] === "boolean") this.autoMerge = data[KEY_AUTO_MERGE];
+      this.automaticHandlingPolicy = readAutomaticHandlingPolicy(
+        data[KEY_AUTOMATIC_HANDLING_POLICY],
+        data[KEY_LEGACY_AUTO_MERGE],
+      );
     }
     this.applyPluginFilesSetting();
     this.applyMaxFileSize();
@@ -785,19 +1204,71 @@ export default class EasySyncPlugin extends Plugin {
 
   /** M14: serialized PluginData write. All callers (StateManager, settings,
    *  auth profile) mutate through this queue — no interleaved load-modify-save. */
-  async updatePluginData(mutator: (data: Record<string, unknown>) => void): Promise<void> {
+  private async updatePluginData(mutator: (data: Record<string, unknown>) => void): Promise<void> {
     const task = this.pluginDataQueue.then(async () => {
-      const data = (await this.loadPluginData()) ?? {};
+      const diagnosticsEnabled = this.diag.isEnabled("state");
+      const totalStartedAt = diagnosticsEnabled ? performance.now() : 0;
+      const committed = await this.ensurePluginDataCache();
+      // The private synchronous mutator never escapes this candidate. Keeping
+      // the old cache until saveData succeeds preserves failure atomicity while
+      // avoiding a second whole-object clone after the physical write.
+      const data = committed === null ? {} : clonePluginData(committed);
       mutator(data);
-      await this.saveData(data);
+      const prepareFinishedAt = diagnosticsEnabled ? performance.now() : 0;
+      const measurementStartedAt = prepareFinishedAt;
+      const measurement = diagnosticsEnabled ? measurePluginDataWrite(data) : null;
+      const measurementFinishedAt = diagnosticsEnabled ? performance.now() : 0;
+      const startedAt = diagnosticsEnabled ? performance.now() : 0;
+      let saveMs = 0;
+      let publishMs = 0;
+      let success = false;
+      try {
+        const saveStartedAt = diagnosticsEnabled ? performance.now() : 0;
+        try {
+          await this.saveData(data);
+        } finally {
+          if (diagnosticsEnabled) saveMs = performance.now() - saveStartedAt;
+        }
+        const publishStartedAt = diagnosticsEnabled ? performance.now() : 0;
+        this.pluginDataCache = data;
+        if (diagnosticsEnabled) publishMs = performance.now() - publishStartedAt;
+        success = true;
+      } finally {
+        if (measurement) {
+          const finishedAt = performance.now();
+          this.diag.log("state", "plugin data write", {
+            ...measurement,
+            elapsedMs: Number((finishedAt - startedAt).toFixed(3)),
+            prepareMs: Number((prepareFinishedAt - totalStartedAt).toFixed(3)),
+            measurementMs: Number((measurementFinishedAt - measurementStartedAt).toFixed(3)),
+            saveMs: Number(saveMs.toFixed(3)),
+            publishMs: Number(publishMs.toFixed(3)),
+            totalMs: Number((finishedAt - totalStartedAt).toFixed(3)),
+            success,
+          });
+        }
+      }
     });
     this.pluginDataQueue = task.catch(() => undefined);
     return task;
   }
 
-  private async loadPluginData(): Promise<Record<string, unknown> | null> {
-    const data: unknown = await this.loadData();
-    return isRecord(data) ? data : null;
+  async loadPluginData(): Promise<Record<string, unknown> | null> {
+    const data = await this.ensurePluginDataCache();
+    return data === null ? null : clonePluginData(data);
+  }
+
+  private async ensurePluginDataCache(): Promise<Record<string, unknown> | null> {
+    if (this.pluginDataCache !== undefined) return this.pluginDataCache;
+    this.pluginDataLoadPromise ??= this.loadData()
+      .then((data: unknown) => {
+        this.pluginDataCache = isRecord(data) ? clonePluginData(data) : null;
+        return this.pluginDataCache;
+      })
+      .finally(() => {
+        this.pluginDataLoadPromise = null;
+      });
+    return this.pluginDataLoadPromise;
   }
 
   async saveSyncSettings(): Promise<void> {
@@ -814,8 +1285,28 @@ export default class EasySyncPlugin extends Plugin {
       data[KEY_SYNC_PLUGIN_DATA] = this.syncPluginData;
       data[KEY_AUTO_SYNC_PAUSED] = this.autoSyncPaused;
       data[KEY_MAX_FILE_SIZE_MB] = this.syncMaxFileSizeMb;
-      data[KEY_AUTO_MERGE] = this.autoMerge;
+      data[KEY_AUTOMATIC_HANDLING_POLICY] = { ...this.automaticHandlingPolicy };
     });
+  }
+
+  async updateAutomaticHandlingPolicy(
+    policy: Readonly<AutomaticHandlingPolicy>,
+  ): Promise<void> {
+    const previous = this.automaticHandlingPolicy;
+    this.automaticHandlingPolicy = { ...policy };
+    try {
+      await this.saveSyncSettings();
+    } catch (error) {
+      this.automaticHandlingPolicy = previous;
+      throw error;
+    }
+    this.syncExecutor?.setAutomaticHandlingPolicy(this.automaticHandlingPolicy);
+    if (this.state?.planReviewActive) {
+      await this.state.clearPlanReview();
+    }
+    this.updateStatusBar();
+    this.syncView?.render();
+    this.settingsTab?.refreshSyncState();
   }
 
   /** Build includePaths from all config sync toggles and apply to scanner. */
@@ -892,6 +1383,27 @@ export default class EasySyncPlugin extends Plugin {
     };
 
     const auth = this.auth?.authState;
+    const reportState = this.state;
+    const reportScope = reportState?.remoteScope;
+    const [accountFingerprint, driveFingerprint, vaultFingerprint, filesRootFingerprint] = await Promise.all([
+      fingerprintOpaqueValue(reportScope?.accountId || reportState?.boundAccountId),
+      fingerprintOpaqueValue(reportScope?.driveId),
+      fingerprintOpaqueValue(reportScope?.vaultFolderId),
+      fingerprintOpaqueValue(reportScope?.filesRootId),
+    ]);
+    const { pluginDir } = getEasySyncPaths(this.app.vault, this.manifest.id);
+    let buildFingerprint = "不可用";
+    try {
+      const mainPath = `${pluginDir}/main.js`;
+      const [mainRaw, mainStat] = await Promise.all([
+        this.app.vault.adapter.readBinary(mainPath),
+        this.app.vault.adapter.stat(mainPath),
+      ]);
+      const mainHash = await sha256Hex(mainRaw);
+      buildFingerprint = `sha256:${mainHash.slice(0, 16)} (${mainRaw.byteLength}B, mtime ${fmt(mainStat?.mtime ?? 0)})`;
+    } catch {
+      // A missing artifact must not prevent the report itself from being generated.
+    }
     const lines: string[] = [];
 
     // ── Header ──
@@ -900,16 +1412,40 @@ export default class EasySyncPlugin extends Plugin {
     lines.push(`**生成时间**: ${fmt(now.getTime())}`);
     lines.push(`**插件版本**: ${this.manifest.version}`);
     lines.push(`**仓库名**: ${this.app.vault.getName()}`);
-    lines.push(`**登录账号**: ${auth?.isLoggedIn ? auth.displayName || auth.accountId : "未登录"}`);
+    lines.push(`**登录账号**: ${auth?.isLoggedIn ? auth.displayName || "已登录" : "未登录"}`);
+    lines.push(`**构筑物指纹**: ${buildFingerprint}`);
     if (this.syncInterval > 0) {
       lines.push(`**自动同步**: ${this.autoSyncPaused ? "已暂停" : `运行中（每 ${this.syncInterval} 分钟）`}`);
     } else {
       lines.push("**自动同步**: 已关闭");
     }
+    const automaticActivity = this.syncExecutor?.isRunning
+      ? "同步中"
+      : this.opLock !== null
+        ? "其他操作占用中"
+        : "空闲";
+    lines.push(`**自动同步触发**: 本地变更 ${this.autoSyncDirtyHint.pending ? "等待重试" : "无等待"} / 当前 ${automaticActivity}`);
     const platformLabel = Platform.isIosApp ? "iOS" : Platform.isAndroidApp ? "Android" : Platform.isMobile ? "Mobile" : "Desktop";
     lines.push(`**平台**: ${platformLabel}`);
     lines.push(`**上次同步**: ${fmt(this.state?.lastSyncTime ?? 0)}`);
-    lines.push(`**远端快照**: generation ${this.state?.remoteGeneration ?? 0}`);
+    lines.push(`**远端快照**: generation ${reportState?.remoteGeneration ?? 0}`);
+    lines.push(`**最近同步记录 ID**: ${reportState?.syncHistory?.[0]?.id ?? "—"}`);
+    lines.push(`**同步范围指纹**: account ${accountFingerprint} / drive ${driveFingerprint} / vault ${vaultFingerprint} / files ${filesRootFingerprint}`);
+    lines.push(`**状态规模**: 基线 ${reportState?.baseSnapshot.length ?? 0} / 远端文件 ${reportState?.remoteSnapshot.length ?? 0} / 远端目录 ${reportState?.remoteFolders.length ?? 0} / 冲突 ${reportState?.pendingConflicts.length ?? 0} / 待删除 ${reportState?.pendingRemoteDeletes.length ?? 0} / 传输异常 ${reportState?.pendingIssues.length ?? 0}`);
+    lines.push(`**增量游标**: ${reportState?.remoteDeltaLink ? "已保存" : "无"}`);
+    lines.push(`**计划审阅**: ${reportState?.planReviewActive ? `等待确认（revision ${reportState.planReviewRevision}）` : "无"}`);
+    lines.push(`**自动处理配置**: 将远端删除同步到本地 ${this.automaticHandlingPolicy.autoDeleteLocalFiles ? "开启" : "关闭"} / 合并不重叠的文本修改 ${this.automaticHandlingPolicy.mergeNonOverlappingText ? "开启" : "关闭"}`);
+    const configSyncLabels = [
+      [this.syncEditorSettings, "编辑器设置"],
+      [this.syncAppearance, "外观"],
+      [this.syncThemes, "主题"],
+      [this.syncHotkeys, "快捷键"],
+      [this.syncCorePlugins, "核心插件"],
+      [this.syncCommunityPlugins, "社区插件"],
+      [this.syncPluginData, "插件数据"],
+      [this.syncPluginFiles, "EasySync 插件文件"],
+    ] as const;
+    lines.push(`**已启用配置同步**: ${configSyncLabels.filter(([enabled]) => enabled).map(([, label]) => label).join("、") || "无"}`);
     lines.push("");
 
     // ── Sync History ──
@@ -919,8 +1455,8 @@ export default class EasySyncPlugin extends Plugin {
     if (history.length === 0) {
       lines.push("*暂无同步记录*");
     } else {
-      lines.push("| 时间 | 模式 | 状态 | 耗时 | 上传 | 下载 | 删除 | 冲突 | 跳过(L/I) | 错误 |");
-      lines.push("|------|------|------|------|------|------|------|------|-----------|------|");
+      lines.push("| 时间 | 模式 | 状态 | 耗时 | 上传 | 下载 | 删除 | 冲突 | 延后 | 跳过(L/I) | 错误 |");
+      lines.push("|------|------|------|------|------|------|------|------|------|-----------|------|");
       for (const h of history) {
         const mode = h.mode === "manual" ? "手动" : h.mode === "auto" ? "自动" : "首次";
         const statusMap: Record<string, string> = { success: "已完成", partial: "部分完成", cancelled: "已取消", authExpired: "登录过期", failed: "失败" };
@@ -928,7 +1464,7 @@ export default class EasySyncPlugin extends Plugin {
         const duration = h.endedAt > 0 && h.startedAt > 0 ? `${Math.round((h.endedAt - h.startedAt) / 1000)}s` : "—";
         const skipLarge = h.skippedLarge ?? 0;
         const skipIgnored = h.skippedIgnored ?? 0;
-        lines.push(`| ${fmt(h.startedAt)} | ${mode} | ${status} | ${duration} | ${h.uploaded} | ${h.downloaded} | ${h.deleted} | ${h.conflicts} | ${skipLarge}/${skipIgnored} | ${h.errors} |`);
+        lines.push(`| ${fmt(h.startedAt)} | ${mode} | ${status} | ${duration} | ${h.uploaded} | ${h.downloaded} | ${h.deleted} | ${h.conflicts} | ${h.deferred ?? 0} | ${skipLarge}/${skipIgnored} | ${h.errors} |`);
       }
     }
     lines.push("");
@@ -990,7 +1526,16 @@ export default class EasySyncPlugin extends Plugin {
     if (conflicts.length > 0) {
       lines.push(`### 待处理冲突（${conflicts.length}）`);
       lines.push("");
-      for (const c of conflicts) lines.push(`- \`${c.path}\` — ${(c as { reason?: string }).reason ?? "冲突"}`);
+      for (const c of conflicts) {
+        const evidence = buildConflictEvidence(c, reportState?.getBaseEntry(c.path));
+        const eTagFingerprint = await fingerprintOpaqueValue(evidence.remoteETag);
+        const reasonCode = c.reason ?? "conflict";
+        const reasonText = c.reason ? this.i18n.t(c.reason) : "冲突";
+        lines.push(`- \`${c.path}\` — ${reasonText} (${reasonCode})`);
+        lines.push(`  - 判等证据: ${evidence.equalityStatus} / ${evidence.equalityProof}; decision token: ${evidence.hasDecisionToken ? "有" : "无"}`);
+        lines.push(`  - 本地: ${formatSize(evidence.localSize)}, mtime ${fmt(evidence.localMtime ?? 0)}, sha256 ${evidence.localHash}`);
+        lines.push(`  - 远端: ${formatSize(evidence.remoteSize)}, mtime ${fmt(evidence.remoteMtime ?? 0)}, sha256 ${evidence.remoteSha256}, eTag ${eTagFingerprint}`);
+      }
     } else {
       lines.push("### 待处理冲突（0）");
       lines.push("");
@@ -1011,6 +1556,62 @@ export default class EasySyncPlugin extends Plugin {
 
     // ── Recent Diagnostic Anomalies (from disk logs) ──
     const diagAll = await this.diag.snapshot(500);
+    const latestAutomaticHandlingSummary = findLatestAutomaticHandlingSummary(diagAll);
+    const currentRecoverySummary = summarizeMutationRecovery(
+      reportState?.mutationLedger ?? [],
+    );
+    const latestPhaseSummary = findLatestPhaseSummary(diagAll);
+    const latestNetworkSummary = findLatestNetworkSummary(diagAll);
+    const latestTransferSummary = findLatestTransferSummary(diagAll);
+    lines.push("## 自动处理与恢复摘要");
+    lines.push("");
+    lines.push("**当前恢复账本**:");
+    lines.push("```json");
+    lines.push(formatDiagData(currentRecoverySummary));
+    lines.push("```");
+    if (latestAutomaticHandlingSummary) {
+      lines.push("");
+      lines.push(`**最近一轮自动处理**（${fmt(latestAutomaticHandlingSummary.ts)}）:`);
+      lines.push("```json");
+      lines.push(formatDiagData(latestAutomaticHandlingSummary.data));
+      lines.push("```");
+    } else {
+      lines.push("");
+      lines.push("*暂无结构化自动处理摘要；开启诊断日志并完成一轮同步后再生成报告。*");
+    }
+    lines.push("");
+    lines.push("## 最近一轮阶段耗时与请求摘要");
+    lines.push("");
+    if (latestPhaseSummary) {
+      lines.push(`**记录时间**: ${fmt(latestPhaseSummary.ts)}`);
+      lines.push("**同步阶段**:");
+      lines.push("```json");
+      lines.push(formatDiagData(latestPhaseSummary.data));
+      lines.push("```");
+    } else {
+      lines.push("*暂无结构化阶段摘要；完成一轮同步后再生成报告。*");
+    }
+    if (latestNetworkSummary) {
+      lines.push("");
+      lines.push(`**OneDrive 请求与令牌获取**（${fmt(latestNetworkSummary.ts)}）:`);
+      lines.push("```json");
+      lines.push(formatDiagData(latestNetworkSummary.data));
+      lines.push("```");
+    } else {
+      lines.push("");
+      lines.push("*暂无结构化 OneDrive 请求摘要。*");
+    }
+    if (latestTransferSummary) {
+      lines.push("");
+      lines.push(`**文件传输与本地处理**（${fmt(latestTransferSummary.ts)}）:`);
+      lines.push("```json");
+      lines.push(formatDiagData(latestTransferSummary.data));
+      lines.push("```");
+    } else {
+      lines.push("");
+      lines.push("*暂无结构化文件传输摘要。*");
+    }
+    lines.push("");
     const diagEntries = diagAll
       .filter((e) => e.lvl === "warn" || e.lvl === "error"
         || (e.cat === "onedrive" && e.lvl === "log" && e.msg.includes("downloadFile"))
@@ -1058,7 +1659,11 @@ export default class EasySyncPlugin extends Plugin {
     lines.push("");
 
     await this.app.vault.adapter.write(fileName, lines.join("\n"));
-    new Notice(`诊断报告已生成：${fileName}`);
+    this.noticeCenter.show({
+      key: "diagnostic-report-created",
+      message: this.i18n.t("notice.diagnosticReportGenerated", { fileName }),
+      priority: NOTICE_PRIORITY.action,
+    });
   }
 
   /** Apply max file size setting to the scanner. Public so settings-tab can call it. */
@@ -1130,7 +1735,11 @@ export default class EasySyncPlugin extends Plugin {
     if (!this.ribbonEl) return;
     if ((this.auth?.isInitializing ?? true) || !this._stateLoaded) return;
     const status = this.getRibbonStatus();
-    const label = this.i18n.t(`ribbon.${status}`);
+    const label = resolveRibbonStatusLabel(
+      status,
+      this.progressStore.state,
+      this.i18n.t.bind(this.i18n),
+    );
     setIcon(this.ribbonEl, RIBBON_STATUS_ICONS[status]);
     setTooltip(this.ribbonEl, label);
     this.ribbonEl.setAttr("aria-label", label);

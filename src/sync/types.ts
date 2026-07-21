@@ -27,6 +27,8 @@ export interface RemoteFileEntry {
   path: string;
   /** OneDrive driveItem id */
   driveId: string;
+  /** Stable OneDrive parent driveItem id; absent only on legacy/local mutation entries. */
+  parentId?: string;
   /** Pre-signed download URL (from @microsoft.graph.downloadUrl) */
   downloadUrl?: string;
   /** File size in bytes */
@@ -41,12 +43,45 @@ export interface RemoteFileEntry {
   sha256Hash?: string;
 }
 
+/** Persisted Graph folder identity used only to project incremental deltas. */
+export interface RemoteFolderEntry {
+  /** Vault-relative folder path below files/ (forward slashes). */
+  path: string;
+  /** Stable OneDrive driveItem id. */
+  driveId: string;
+  /** Stable parent driveItem id. */
+  parentId: string;
+  /** Current Graph-owned folder name. */
+  name: string;
+}
+
+/** Complete identity boundary for every reusable sync artifact. */
+export interface SyncScope {
+  accountId: string;
+  driveId: string;
+  vaultFolderId: string;
+  filesRootId: string;
+}
+
+export function isSyncScope(value: unknown): value is SyncScope {
+  if (!value || typeof value !== "object") return false;
+  const scope = value as Partial<SyncScope>;
+  return typeof scope.accountId === "string" && scope.accountId.length > 0
+    && typeof scope.driveId === "string" && scope.driveId.length > 0
+    && typeof scope.vaultFolderId === "string" && scope.vaultFolderId.length > 0
+    && typeof scope.filesRootId === "string" && scope.filesRootId.length > 0;
+}
+
 export interface RemoteSyncState {
   version: 1;
   /** Monotonically increasing counter — detects mid-sync resets or concurrent runs */
   generation: number;
+  /** Null means legacy/incomplete identity and must never authorize cursor reuse. */
+  scope: SyncScope | null;
   deltaLink: string | null;
   entries: Record<string, RemoteFileEntry>;
+  /** Same-generation folder identity index; missing in legacy V1 files. */
+  folders: Record<string, RemoteFolderEntry>;
 }
 
 /** Baseline entry — the state after last successful sync */
@@ -66,6 +101,7 @@ export enum SyncActionType {
   Upload = "upload",
   Download = "download",
   DeleteRemote = "deleteRemote",
+  DeleteLocal = "deleteLocal",
   ConfirmLocalDelete = "confirmLocalDelete",
   RenameRemote = "renameRemote",
   Conflict = "conflict",
@@ -90,10 +126,18 @@ export interface SyncPlanItem {
   baseEtag?: string;
   /** For RenameRemote: the old path the file is being renamed from. */
   renameFrom?: string;
-  /** Merged content from three-way merge (always set when hasMergeConflicts is true). */
-  mergedContent?: string;
-  /** True if three-way merge was attempted but has unresolved conflict regions. */
-  hasMergeConflicts?: boolean;
+  /** Exact versions authorized by a user-facing pending decision. */
+  decisionToken?: SyncDecisionToken;
+}
+
+export interface SyncDecisionToken {
+  version: 1;
+  vaultName: string;
+  accountId: string;
+  scope: SyncScope;
+  local: { exists: false } | { exists: true; hash: string; size: number };
+  remote: { exists: false } | { exists: true; driveId: string; eTag: string };
+  ancestorHash: string | null;
 }
 
 export interface SyncPlan {
@@ -102,6 +146,68 @@ export interface SyncPlan {
   lastTotalFiles: number;
   /** Whether the plan has been confirmed by user (if threshold was exceeded) */
   confirmed: boolean;
+  /** Filled by SyncExecutor after resolving the current Graph scope. */
+  scope?: SyncScope;
+}
+
+export interface PlanReviewAuthorization {
+  revision: number;
+  scope: SyncScope;
+}
+
+export type MutationAction = "upload" | "download" | "deleteRemote" | "renameRemote" | "deleteLocal" | "merge";
+
+export type MutationLocalExpectation =
+  | { exists: false }
+  | { exists: true; hash: string; size: number };
+
+export type MutationRemoteExpectation =
+  | { exists: false }
+  | { exists: true; driveId: string; eTag: string; size: number; sha256Hash?: string };
+
+/** Durable fact written before any local or remote file mutation. */
+export interface MutationIntentV1 {
+  version: 1;
+  operationId: string;
+  planRevision: number;
+  scope: SyncScope;
+  action: MutationAction;
+  path: string;
+  sourcePath?: string;
+  expectedLocal: MutationLocalExpectation;
+  expectedRemote: MutationRemoteExpectation;
+  /** Exact result bytes persisted in merge-ready storage before a merge mutates either side. */
+  target?: { hash: string; size: number };
+  createdAt: number;
+}
+
+export interface MutationCheckpointV1 {
+  baseUpserts: BaseFileEntry[];
+  baseRemovals: string[];
+  remoteUpserts: RemoteFileEntry[];
+  remoteDeletes: string[];
+  pendingConflictRemovals: string[];
+  pendingDeleteRemovals: string[];
+}
+
+/** Durable mutation result; shared state may advance only after this exists. */
+export interface MutationReceiptV1 {
+  version: 1;
+  operationId: string;
+  completedAt: number;
+  checkpoint: MutationCheckpointV1;
+}
+
+export interface MutationLedgerEntryV1 {
+  intent: MutationIntentV1;
+  receipt: MutationReceiptV1 | null;
+}
+
+export function sameSyncScope(left: SyncScope | null, right: SyncScope | null): boolean {
+  return left?.accountId === right?.accountId
+    && left?.driveId === right?.driveId
+    && left?.vaultFolderId === right?.vaultFolderId
+    && left?.filesRootId === right?.filesRootId;
 }
 
 // ---- Scan Configuration ----

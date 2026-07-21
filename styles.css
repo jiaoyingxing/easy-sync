@@ -1,5 +1,48 @@
 /* EasySync plugin styles */
 
+/* ---- Global Sync Notice ---- */
+
+.easy-sync-notice-progress {
+  pointer-events: none;
+}
+
+.easy-sync-notice-progress-content {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 220px;
+  max-width: calc(100vw - 64px);
+}
+
+.easy-sync-notice-progress-content.is-text-only {
+  width: auto;
+}
+
+/* Obsidian stretches phone Notices to the full row by default. Keep this
+ * display-only sync Notice fitted to its actual text/progress content. */
+.is-phone .notice.easy-sync-notice-progress {
+  align-self: center;
+  width: fit-content;
+}
+
+.easy-sync-notice-progress-label {
+  overflow: hidden;
+  font-size: var(--font-ui-small);
+  font-weight: 600;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.easy-sync-notice-progress-native {
+  width: 100%;
+}
+
+.easy-sync-notice-progress-native progress {
+  display: block;
+  width: 100%;
+}
+
 /* ---- Sync Progress Panel ---- */
 
 .easy-sync-progress-bar {
@@ -99,19 +142,12 @@
   font-weight: 600;
 }
 
-/* Column color coding — mirrors diff line colors so the table
-   acts as a visual legend: local → red, remote → green. */
-.easy-sync-meta-col-local {
+/* Headers stay neutral; only metadata values carry source colors. */
+.easy-sync-metadata-table td.easy-sync-meta-col-local {
   background-color: rgba(var(--color-red-rgb), 0.12);
 }
-.easy-sync-meta-col-local.easy-sync-metadata-table th {
-  color: var(--color-red);
-}
-.easy-sync-meta-col-remote {
+.easy-sync-metadata-table td.easy-sync-meta-col-remote {
   background-color: rgba(var(--color-green-rgb), 0.12);
-}
-.easy-sync-meta-col-remote.easy-sync-metadata-table th {
-  color: var(--color-green);
 }
 
 /* Loading indicator */
@@ -164,16 +200,25 @@
 }
 
 .easy-sync-diff-gutter {
+  display: grid;
+  grid-template-columns: repeat(2, var(--easy-sync-diff-line-number-width, 2ch));
+  column-gap: 0.75ch;
   flex-shrink: 0;
-  width: 80px;
   color: var(--text-faint);
   user-select: none;
-  white-space: pre;
-  padding-right: 8px;
+  padding-right: 6px;
   border-right: 1px solid var(--background-modifier-border);
 }
 
+.easy-sync-diff-line-number {
+  min-width: 0;
+  text-align: right;
+  white-space: nowrap;
+}
+
 .easy-sync-diff-content {
+  flex: 1;
+  min-width: 0;
   padding-left: 8px;
   white-space: pre-wrap;
   word-break: break-all;
@@ -203,6 +248,26 @@
   padding: 4px 8px;
   background: rgba(var(--color-yellow-rgb), 0.1);
   border-radius: 3px;
+}
+
+.easy-sync-diff-summary {
+  border-top: 1px solid var(--background-modifier-border);
+  border-bottom: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+}
+
+.easy-sync-diff-summary-reason {
+  padding: 8px;
+  color: var(--text-warning);
+  font-family: var(--font-interface);
+  font-size: 0.95em;
+}
+
+.easy-sync-diff-summary-range {
+  padding: 0 8px 8px;
+  color: var(--text-muted);
+  font-family: var(--font-interface);
+  font-size: 0.9em;
 }
 
 /* Remote unavailable fallback */
@@ -239,6 +304,28 @@
 
 .easy-sync-detail-actions button {
   padding: 6px 16px;
+}
+
+.easy-sync-detail-actions .easy-sync-detail-action-local {
+  background-color: rgba(var(--color-red-rgb), 0.18);
+  border-color: rgba(var(--color-red-rgb), 0.28);
+  box-shadow: none;
+  color: var(--color-red);
+}
+
+.easy-sync-detail-actions .easy-sync-detail-action-remote {
+  background-color: rgba(var(--color-green-rgb), 0.18);
+  border-color: rgba(var(--color-green-rgb), 0.28);
+  box-shadow: none;
+  color: var(--color-green);
+}
+
+.easy-sync-detail-actions .easy-sync-detail-action-local:hover {
+  background-color: rgba(var(--color-red-rgb), 0.26);
+}
+
+.easy-sync-detail-actions .easy-sync-detail-action-remote:hover {
+  background-color: rgba(var(--color-green-rgb), 0.26);
 }
 
 /* ---- Sidebar navigation layout ---- */
@@ -667,7 +754,21 @@
 }
 
 .easy-sync-plan-execute {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--size-4-2);
   padding-top: var(--size-4-2);
+}
+
+body.is-mobile .easy-sync-plan-execute {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+body.is-mobile .easy-sync-plan-execute button {
+  width: 100%;
 }
 
 .easy-sync-ribbon[data-easy-sync-status="loggedOut"] {

@@ -21,6 +21,7 @@ export interface LocaleStrings {
   "ribbon.loggedOut": string;
   "ribbon.cancelling": string;
   "ribbon.syncing": string;
+  "ribbon.syncingPhase": string;
   "ribbon.attention": string;
   "ribbon.success": string;
   "ribbon.ready": string;
@@ -52,6 +53,16 @@ export interface LocaleStrings {
   "settings.autoSync.desc.disabled": string;
   "settings.autoSync.desc.enabled": string;
   "settings.autoSync.desc.paused": string;
+  "settings.automaticHandling.button": string;
+  "settings.automaticHandling.open": string;
+  "settings.automaticHandling.name": string;
+  "settings.automaticHandling.desc": string;
+  "settings.automaticHandling.title": string;
+  "settings.automaticHandling.intro": string;
+  "settings.automaticHandling.autoDeleteLocalFiles.name": string;
+  "settings.automaticHandling.autoDeleteLocalFiles.desc": string;
+  "settings.automaticHandling.mergeNonOverlappingText.name": string;
+  "settings.automaticHandling.mergeNonOverlappingText.desc": string;
   "settings.moreConfig.name": string;
   "settings.moreConfig.desc": string;
   "settings.moreConfig.button": string;
@@ -81,8 +92,6 @@ export interface LocaleStrings {
   "settings.syncInterval.desc": string;
   "settings.maxFileSize.name": string;
   "settings.maxFileSize.desc": string;
-  "settings.autoMerge.name": string;
-  "settings.autoMerge.desc": string;
   "settings.reset.name": string;
   "settings.reset.desc": string;
   "settings.reset.button": string;
@@ -112,6 +121,10 @@ export interface LocaleStrings {
   "syncView.conflict.skip": string;
   "syncView.conflict.defaultReason": string;
   "syncView.delete.confirm": string;
+  "syncView.delete.confirmAll": string;
+  "syncView.delete.confirmAllTitle": string;
+  "syncView.delete.confirmAllMessage": string;
+  "syncView.delete.confirmAllWarning": string;
   "syncView.delete.reject": string;
   "syncView.delete.reason": string;
 
@@ -130,6 +143,7 @@ export interface LocaleStrings {
   // ---- Sync Results ----
   "result.synced": string;
   "result.partial": string;
+  "result.deferred": string;
   "result.firstSyncCancelled": string;
   "result.thresholdDeclined": string;
   "result.authExpired": string;
@@ -138,6 +152,23 @@ export interface LocaleStrings {
   "result.cancelled": string;
   "result.generationMismatch": string;
   "result.lockBusy": string;
+  "result.scanIncomplete": string;
+  "result.localRecoveryFailed": string;
+  "result.legacyStateDisabled": string;
+
+  // ---- Sync Lifecycle Notices ----
+  "notice.sync.start": string;
+  "notice.sync.stage": string;
+  "notice.sync.progress": string;
+  "notice.sync.cancelling": string;
+  "notice.sync.completed": string;
+  "notice.sync.conflicts": string;
+  "notice.sync.review": string;
+  "notice.sync.cancelled": string;
+  "notice.sync.failed": string;
+  "notice.sync.authExpired": string;
+  "notice.accountMismatch": string;
+  "notice.diagnosticReportGenerated": string;
 
   // ---- Sync Plan Reasons ----
   "reason.fileExceedsSizeLimit": string;
@@ -147,6 +178,7 @@ export interface LocaleStrings {
   "reason.remoteDeletedLocalModified": string;
   "reason.fileDeletedFromRemote": string;
   "reason.bothSidesModified": string;
+  "reason.renameIdentityAmbiguous": string;
   "reason.scanUnhealthy": string;
 
   // ---- Auth Errors ----
@@ -170,6 +202,15 @@ export interface LocaleStrings {
   "notice.conflict.keptRemote": string;
   "notice.conflict.failed": string;
   "notice.conflict.downloadFailed": string;
+  "notice.conflict.identical": string;
+  "notice.localChangedSinceReview": string;
+  "notice.localRecoveryFailed": string;
+  "notice.sideActionRemotePrepareFailed": string;
+  "notice.sideActionScopeChanged": string;
+  "notice.sideActionMutationRecoveryFailed": string;
+  "notice.configSyncDisabled": string;
+  "notice.configSnapshotInvalid": string;
+  "notice.decisionExpired": string;
   "notice.delete.confirmed": string;
   "notice.delete.rejected": string;
   "notice.delete.failed": string;
@@ -186,19 +227,34 @@ export interface LocaleStrings {
   "conflictDetail.diffTitle": string;
   "conflictDetail.diffAdded": string;
   "conflictDetail.diffRemoved": string;
-  "conflictDetail.remoteUnavailable": string;
+  "conflictDetail.summaryComparing": string;
+  "conflictDetail.summaryComparisonUnavailable": string;
+  "conflictDetail.summaryLocalExtra": string;
+  "conflictDetail.summaryRemoteExtra": string;
+  "conflictDetail.summaryBothModified": string;
+  "conflictDetail.summaryBothExistDifferent": string;
+  "conflictDetail.summaryDifferent": string;
+  "conflictDetail.summaryBytesDifferentNoLineDiff": string;
+  "conflictDetail.remoteComparisonUnavailable": string;
   "conflictDetail.loading": string;
   "conflictDetail.fetchingRemote": string;
   "conflictDetail.computingDiff": string;
-  "conflictDetail.loadFailed": string;
+  "conflictDetail.localReadUnavailable": string;
+  "conflictDetail.loadUnavailable": string;
   "conflictDetail.binaryFile": string;
-  "conflictDetail.diffTooLarge": string;
-  "conflictDetail.remainingLines": string;
-  "conflictDetail.mergeResult": string;
+  "conflictDetail.diffRegionsLocated": string;
+  "conflictDetail.diffChangeBudget": string;
+  "conflictDetail.diffAlignmentLimit": string;
+  "conflictDetail.diffDisplayBudget": string;
+  "conflictDetail.diffRegionRange": string;
+  "conflictDetail.diffOmitted": string;
+  "conflictDetail.textDiffByteLimit": string;
+  "conflictDetail.previewTruncated": string;
+  "conflictDetail.identical": string;
+  "conflictDetail.textSameBytesDifferent": string;
 
   // ---- Sync View extras ----
   "syncView.merge.autoMerged": string;
-  "syncView.merge.hasConflicts": string;
   "syncView.conflict.viewDetail": string;
   "syncView.conflict.processing": string;
 
@@ -208,6 +264,7 @@ export interface LocaleStrings {
   "syncView.fileStatus.delete": string;
   "syncView.fileStatus.conflict": string;
   "syncView.fileStatus.skip": string;
+  "syncView.fileStatus.deferred": string;
   "syncView.fileStatus.error": string;
   "syncView.progress.current": string;
   "syncView.progress.items": string;
@@ -217,9 +274,11 @@ export interface LocaleStrings {
   "syncView.active.upload": string;
   "syncView.active.download": string;
   "syncView.active.delete": string;
+  "syncView.active.rename": string;
   "syncView.failure.contentUnavailable": string;
   "syncView.failure.network": string;
   "syncView.failure.rateLimited": string;
+  "syncView.failure.storageFull": string;
   "syncView.failure.authExpired": string;
   "syncView.failure.remote": string;
   "syncView.failure.local": string;

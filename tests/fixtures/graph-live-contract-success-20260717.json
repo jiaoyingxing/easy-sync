@@ -1,0 +1,952 @@
+{
+  "schemaVersion": 2,
+  "environment": {
+    "vault": "<vault>",
+    "accountType": "OneDriveConsumer",
+    "namespace": "<probe-root>"
+  },
+  "preflight": {
+    "quota": "pass",
+    "namespaceCreate": "pass"
+  },
+  "observations": {
+    "smallPutQueryConflictBehavior": {
+      "createStatus": 201,
+      "secondStatus": 409,
+      "secondCode": "nameAlreadyExists",
+      "preventedOverwrite": true
+    },
+    "smallPutIfMatchZero": {
+      "createStatus": 201,
+      "secondStatus": 412,
+      "secondCode": "notAllowed",
+      "preventedOverwrite": true
+    },
+    "uploadSessionCreateOnlyRace": {
+      "finalStatus": 404,
+      "finalCode": "itemNotFound",
+      "preventedOverwrite": true
+    },
+    "uploadSessionStaleIfMatchAtCreate": {
+      "status": 412,
+      "code": "notAllowed",
+      "preventedStaleSession": true
+    },
+    "uploadSessionConcurrentWriteAfterCreate": {
+      "finalStatus": 404,
+      "finalCode": "itemNotFound",
+      "preventedOverwrite": true
+    },
+    "interruptedUploadSession": {
+      "partialStatus": 202,
+      "nextExpectedRanges": [
+        "327680-655359"
+      ],
+      "targetStatusBeforeCancel": 200,
+      "cancelStatus": 204,
+      "targetStatusAfterCancel": 404
+    },
+    "delta": {
+      "pageCount": 11,
+      "itemCount": 32,
+      "repeatedIdCount": 5,
+      "usesLastOccurrenceRule": true,
+      "parentPathPresentCount": 29,
+      "parentPathMissingCount": 3,
+      "staleDeleteStatus": 412,
+      "staleDeleteCode": "resourceModified",
+      "currentDeleteStatus": 204,
+      "deleteRecreateUsesNewId": true,
+      "specialEventCount": 4,
+      "descendantReturnedAfterFolderRename": true
+    }
+  },
+  "deltaPages": [
+    {
+      "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(microsoft.graph.driveItem)",
+      "@odata.nextLink": "<next-link>",
+      "value": [
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-1>",
+          "id": "<item-1>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "<probe-root>",
+          "cTag": "<etag-2>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-3>",
+            "path": "/drive/root:/应用/EasySync",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 14,
+            "view": {}
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-3>",
+          "id": "<item-5>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "MOVE SOURCE RENAMED",
+          "cTag": "<etag-4>",
+          "isAuthoritative": false,
+          "size": -10,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 1,
+            "view": {}
+          }
+        }
+      ]
+    },
+    {
+      "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(microsoft.graph.driveItem)",
+      "@odata.nextLink": "<next-link>",
+      "value": [
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-1>",
+          "id": "<item-1>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "<probe-root>",
+          "cTag": "<etag-2>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-3>",
+            "path": "/drive/root:/应用/EasySync",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 14,
+            "view": {}
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-5>",
+          "id": "<item-6>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "Move Target Ä",
+          "cTag": "<etag-6>",
+          "isAuthoritative": false,
+          "size": 10,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 1,
+            "view": {}
+          }
+        }
+      ]
+    },
+    {
+      "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(microsoft.graph.driveItem)",
+      "@odata.nextLink": "<next-link>",
+      "value": [
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-1>",
+          "id": "<item-1>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "<probe-root>",
+          "cTag": "<etag-2>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-3>",
+            "path": "/drive/root:/应用/EasySync",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 14,
+            "view": {}
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-3>",
+          "id": "<item-5>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "MOVE SOURCE RENAMED",
+          "cTag": "<etag-4>",
+          "isAuthoritative": false,
+          "size": -10,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 1,
+            "view": {}
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-7>",
+          "id": "<item-7>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "Nested 中文",
+          "cTag": "<etag-8>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-5>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>/MOVE SOURCE RENAMED",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 1,
+            "view": {}
+          }
+        }
+      ]
+    },
+    {
+      "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(microsoft.graph.driveItem)",
+      "@odata.nextLink": "<next-link>",
+      "value": [
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-1>",
+          "id": "<item-1>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "<probe-root>",
+          "cTag": "<etag-2>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-3>",
+            "path": "/drive/root:/应用/EasySync",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 14,
+            "view": {}
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-3>",
+          "id": "<item-5>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "MOVE SOURCE RENAMED",
+          "cTag": "<etag-4>",
+          "isAuthoritative": false,
+          "size": -10,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 1,
+            "view": {}
+          }
+        },
+        {
+          "id": "<item-8>",
+          "cTag": "<etag-9>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-5>",
+            "siteId": "<item-4>"
+          },
+          "deleted": {
+            "state": "deleted"
+          },
+          "file": {
+            "hashes": {
+              "quickXorHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            }
+          },
+          "fileSystemInfo": {}
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-7>",
+          "id": "<item-7>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "Nested 中文",
+          "cTag": "<etag-8>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-5>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>/MOVE SOURCE RENAMED",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 1,
+            "view": {}
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-10>",
+          "id": "<item-9>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "child.md",
+          "cTag": "<etag-11>",
+          "isAuthoritative": false,
+          "size": 5,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-7>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>/MOVE SOURCE RENAMED/Nested 中文",
+            "siteId": "<item-4>"
+          },
+          "file": {
+            "mimeType": "text/markdown",
+            "hashes": {
+              "quickXorHash": "Y0BDGthABgAAAAAABQAAAAAAAAA="
+            }
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          }
+        }
+      ]
+    },
+    {
+      "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(microsoft.graph.driveItem)",
+      "@odata.nextLink": "<next-link>",
+      "value": [
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-1>",
+          "id": "<item-1>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "<probe-root>",
+          "cTag": "<etag-2>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-3>",
+            "path": "/drive/root:/应用/EasySync",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 14,
+            "view": {}
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-12>",
+          "id": "<item-10>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "page-0.md",
+          "cTag": "<etag-13>",
+          "isAuthoritative": false,
+          "size": 6,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "file": {
+            "mimeType": "text/markdown",
+            "hashes": {
+              "quickXorHash": "cAjDGcrQAhgAAAAABgAAAAAAAAA="
+            }
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-14>",
+          "id": "<item-11>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "page-1.md",
+          "cTag": "<etag-15>",
+          "isAuthoritative": false,
+          "size": 6,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "file": {
+            "mimeType": "text/markdown",
+            "hashes": {
+              "quickXorHash": "cAjDGcrQghgAAAAABgAAAAAAAAA="
+            }
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          }
+        }
+      ]
+    },
+    {
+      "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(microsoft.graph.driveItem)",
+      "@odata.nextLink": "<next-link>",
+      "value": [
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-1>",
+          "id": "<item-1>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "<probe-root>",
+          "cTag": "<etag-2>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-3>",
+            "path": "/drive/root:/应用/EasySync",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 14,
+            "view": {}
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-16>",
+          "id": "<item-12>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "page-2.md",
+          "cTag": "<etag-17>",
+          "isAuthoritative": false,
+          "size": 6,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "file": {
+            "mimeType": "text/markdown",
+            "hashes": {
+              "quickXorHash": "cAjDGcrQAhkAAAAABgAAAAAAAAA="
+            }
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-18>",
+          "id": "<item-13>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "page-3.md",
+          "cTag": "<etag-19>",
+          "isAuthoritative": false,
+          "size": 6,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "file": {
+            "mimeType": "text/markdown",
+            "hashes": {
+              "quickXorHash": "cAjDGcrQghkAAAAABgAAAAAAAAA="
+            }
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          }
+        }
+      ]
+    },
+    {
+      "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(microsoft.graph.driveItem)",
+      "@odata.nextLink": "<next-link>",
+      "value": [
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-1>",
+          "id": "<item-1>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "<probe-root>",
+          "cTag": "<etag-2>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-3>",
+            "path": "/drive/root:/应用/EasySync",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 14,
+            "view": {}
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-20>",
+          "id": "<item-14>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "page-4.md",
+          "cTag": "<etag-21>",
+          "isAuthoritative": false,
+          "size": 6,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "file": {
+            "mimeType": "text/markdown",
+            "hashes": {
+              "quickXorHash": "cAjDGcrQAhoAAAAABgAAAAAAAAA="
+            }
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-22>",
+          "id": "<item-15>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "page-5.md",
+          "cTag": "<etag-23>",
+          "isAuthoritative": false,
+          "size": 6,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "file": {
+            "mimeType": "text/markdown",
+            "hashes": {
+              "quickXorHash": "cAjDGcrQghoAAAAABgAAAAAAAAA="
+            }
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          }
+        }
+      ]
+    },
+    {
+      "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(microsoft.graph.driveItem)",
+      "@odata.nextLink": "<next-link>",
+      "value": [
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-1>",
+          "id": "<item-1>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "<probe-root>",
+          "cTag": "<etag-2>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-3>",
+            "path": "/drive/root:/应用/EasySync",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 14,
+            "view": {}
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-24>",
+          "id": "<item-16>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "page-6.md",
+          "cTag": "<etag-25>",
+          "isAuthoritative": false,
+          "size": 6,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "file": {
+            "mimeType": "text/markdown",
+            "hashes": {
+              "quickXorHash": "cAjDGcrQAhsAAAAABgAAAAAAAAA="
+            }
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-26>",
+          "id": "<item-17>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "page-7.md",
+          "cTag": "<etag-27>",
+          "isAuthoritative": false,
+          "size": 6,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "file": {
+            "mimeType": "text/markdown",
+            "hashes": {
+              "quickXorHash": "cAjDGcrQghsAAAAABgAAAAAAAAA="
+            }
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          }
+        }
+      ]
+    },
+    {
+      "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(microsoft.graph.driveItem)",
+      "@odata.nextLink": "<next-link>",
+      "value": [
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-1>",
+          "id": "<item-1>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "<probe-root>",
+          "cTag": "<etag-2>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-3>",
+            "path": "/drive/root:/应用/EasySync",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 14,
+            "view": {}
+          }
+        },
+        {
+          "id": "<item-8>",
+          "cTag": "<etag-9>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-6>",
+            "siteId": "<item-4>"
+          },
+          "deleted": {
+            "state": "deleted"
+          },
+          "file": {
+            "hashes": {
+              "quickXorHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            }
+          },
+          "fileSystemInfo": {}
+        }
+      ]
+    },
+    {
+      "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(microsoft.graph.driveItem)",
+      "@odata.nextLink": "<next-link>",
+      "value": [
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-1>",
+          "id": "<item-1>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "<probe-root>",
+          "cTag": "<etag-2>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-3>",
+            "path": "/drive/root:/应用/EasySync",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 14,
+            "view": {}
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-5>",
+          "id": "<item-6>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "Move Target Ä",
+          "cTag": "<etag-6>",
+          "isAuthoritative": false,
+          "size": 10,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 1,
+            "view": {}
+          }
+        },
+        {
+          "id": "<item-8>",
+          "cTag": "<etag-9>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-6>",
+            "siteId": "<item-4>"
+          },
+          "deleted": {
+            "state": "deleted"
+          },
+          "file": {
+            "hashes": {
+              "quickXorHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            }
+          },
+          "fileSystemInfo": {}
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-28>",
+          "id": "<item-18>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "case-ä-中文 #%.md",
+          "cTag": "<etag-29>",
+          "isAuthoritative": false,
+          "size": 17,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-6>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>/Move Target Ä",
+            "siteId": "<item-4>"
+          },
+          "file": {
+            "mimeType": "text/markdown",
+            "hashes": {
+              "quickXorHash": "0ownGcaQhjCwoQVyOcMY5FCGMNA="
+            }
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          }
+        }
+      ]
+    },
+    {
+      "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#Collection(microsoft.graph.driveItem)",
+      "@odata.deltaLink": "<delta-link>",
+      "value": [
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-1>",
+          "id": "<item-1>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "<probe-root>",
+          "cTag": "<etag-2>",
+          "isAuthoritative": false,
+          "size": 0,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-3>",
+            "path": "/drive/root:/应用/EasySync",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 14,
+            "view": {}
+          }
+        },
+        {
+          "createdDateTime": "<timestamp>",
+          "eTag": "<etag-3>",
+          "id": "<item-5>",
+          "lastModifiedDateTime": "<timestamp>",
+          "name": "MOVE SOURCE RENAMED",
+          "cTag": "<etag-4>",
+          "isAuthoritative": false,
+          "size": -10,
+          "parentReference": {
+            "driveType": "personal",
+            "driveId": "<item-2>",
+            "id": "<item-1>",
+            "path": "/drive/root:/应用/EasySync/<probe-root>",
+            "siteId": "<item-4>"
+          },
+          "fileSystemInfo": {
+            "createdDateTime": "<timestamp>",
+            "lastModifiedDateTime": "<timestamp>"
+          },
+          "folder": {
+            "childCount": 1,
+            "view": {}
+          }
+        }
+      ]
+    }
+  ],
+  "cleanup": {
+    "attempted": true,
+    "method": "permanentDelete",
+    "confirmedAbsent": true,
+    "verifyStatus": 404
+  },
+  "fatal": null,
+  "independentResidualCheck": {
+    "status": 200,
+    "probeCount": 0,
+    "hasNext": false
+  }
+}

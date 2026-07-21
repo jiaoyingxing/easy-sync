@@ -1,3 +1,11 @@
+import type { SyncProgressState } from "../sync/sync-progress";
+import {
+  resolveSyncActivityPresentation,
+  translateSyncActivity,
+  trimSyncActivityLabel,
+  type SyncStatusTranslator,
+} from "./sync-status-presentation";
+
 export type RibbonStatus =
   | "loggedOut"
   | "cancelling"
@@ -30,4 +38,15 @@ export function resolveRibbonStatus(input: RibbonStatusInput): RibbonStatus {
   if (input.needsAttention) return "attention";
   if (input.recentSuccess) return "success";
   return "ready";
+}
+
+export function resolveRibbonStatusLabel(
+  status: RibbonStatus,
+  progress: Readonly<SyncProgressState>,
+  t: SyncStatusTranslator,
+): string {
+  if (status !== "syncing") return t(`ribbon.${status}`);
+  const activity = resolveSyncActivityPresentation(progress);
+  const phase = trimSyncActivityLabel(translateSyncActivity(activity, t));
+  return t("ribbon.syncingPhase", { phase });
 }

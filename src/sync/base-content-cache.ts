@@ -55,13 +55,23 @@ export class BaseContentCache {
   /** Cache the baseline content for a file. Skips binary and oversized files.
    *  Evicts LRU entries when total size or count exceeds limits. */
   cache(path: string, content: string | ArrayBuffer): void {
-    if (typeof content !== "string") return; // binary — never cache
     if (!isTextFile(path)) return;
-    if (content.length > MAX_CACHE_SIZE) return;
+    let text: string;
+    if (typeof content === "string") {
+      if (new TextEncoder().encode(content).byteLength > MAX_CACHE_SIZE) return;
+      text = content;
+    } else {
+      if (content.byteLength > MAX_CACHE_SIZE) return;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(content);
+      } catch {
+        return; // invalid UTF-8 is binary for merge purposes
+      }
+    }
 
     // LRU: delete and re-insert to move to end (most-recently-used)
     this.store.delete(path);
-    this.store.set(path, content);
+    this.store.set(path, text);
     this.evictLRU();
     this.dirty = true;
   }

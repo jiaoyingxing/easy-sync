@@ -8,10 +8,12 @@
  *   - About (关于)
  */
 
-import { PluginSettingTab, Setting, SettingGroup, Notice } from "obsidian";
+import { PluginSettingTab, Setting, SettingGroup } from "obsidian";
 import type EasySyncPlugin from "../main";
+import { NOTICE_PRIORITY } from "./notice-center";
 import { isAnySyncActivityRunning } from "../sync/sync-progress";
 import { AuthPendingModal } from "./auth-pending-modal";
+import { AutomaticHandlingModal } from "./automatic-handling-modal";
 import { ConfigSyncModal } from "./config-sync-modal";
 import { ConfirmModal } from "./confirm-modal";
 
@@ -226,6 +228,24 @@ export class EasySyncSettingTab extends PluginSettingTab {
 
     syncGroup.addSetting((setting) => {
       setting
+        .setName(t("settings.automaticHandling.name"))
+        .setDesc(t("settings.automaticHandling.desc"))
+        .addButton((button) => {
+          button
+            .setButtonText(t("settings.automaticHandling.button"))
+            .setTooltip(t("settings.automaticHandling.open"))
+            .onClick(() => {
+              new AutomaticHandlingModal(this.plugin).open();
+            });
+          button.buttonEl.setAttribute(
+            "aria-label",
+            t("settings.automaticHandling.open"),
+          );
+        });
+    });
+
+    syncGroup.addSetting((setting) => {
+      setting
         .setName(t("settings.autoSync.name"))
         .setDesc(
           this.plugin.syncInterval === 0
@@ -293,19 +313,6 @@ export class EasySyncSettingTab extends PluginSettingTab {
         });
     });
 
-    syncGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.autoMerge.name"))
-        .setDesc(t("settings.autoMerge.desc"))
-        .addToggle((toggle) => {
-          toggle
-            .setValue(this.plugin.autoMerge)
-            .onChange(async (value) => {
-              this.plugin.autoMerge = value;
-              await this.plugin.saveSyncSettings();
-            });
-        });
-    });
   }
 
   private renderAboutSection(
@@ -464,9 +471,17 @@ export class EasySyncSettingTab extends PluginSettingTab {
                 const result = await modal.awaitAction();
                 if (result.action === "recheck") {
                   if (this.plugin.auth?.checkAuthStatus()) {
-                    new Notice(t("settings.account.loginSuccess"));
+                    this.plugin.noticeCenter.show({
+                      key: "settings-login-success",
+                      message: t("settings.account.loginSuccess"),
+                      priority: NOTICE_PRIORITY.action,
+                    });
                   } else {
-                    new Notice(t("settings.account.desc.pending"));
+                    this.plugin.noticeCenter.show({
+                      key: "settings-login-pending",
+                      message: t("settings.account.desc.pending"),
+                      priority: NOTICE_PRIORITY.attention,
+                    });
                   }
                 } else if (result.action === "reopen") {
                   try {
