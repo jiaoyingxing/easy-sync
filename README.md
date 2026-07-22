@@ -21,9 +21,13 @@
 
 **Obsidian 多端同步，简单、清晰、可控。**
 
-EasySync 在电脑、手机和平板之间双向同步笔记和附件；Obsidian 设置、主题及插件可按需开启。无需自建服务，文件存放在你自己的 OneDrive。
+EasySync 让你在电脑、手机和平板之间轻松同步笔记和附件；Obsidian 设置、主题、快捷键和插件可按需开启。无需自建服务，登录自己的 OneDrive 即可开始使用。
 
-能够确认安全的变更自动处理；证据不足时保留冲突，并提供比较与处理入口。
+- 明确安全的变更自动处理，冲突内容支持逐行比较。
+
+- 同步状态、进度和历史集中显示在独立侧栏。
+
+- 自动同步与各类配置同步可分别控制。
 
 支持 Windows、macOS、Linux、iOS 和 Android。
 
@@ -64,7 +68,7 @@ EasySync 在电脑、手机和平板之间双向同步笔记和附件；Obsidian
 
 **Obsidian 设置 → EasySync → 登录 OneDrive**
 
-在浏览器中完成 Microsoft 登录后返回 Obsidian。
+完成 Microsoft 登录后，按页面提示返回 Obsidian。
 
 ### 4. 在所有设备使用相同的仓库名
 

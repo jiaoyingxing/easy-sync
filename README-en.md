@@ -21,9 +21,13 @@
 
 **Obsidian sync across devices—simple, clear, and under your control.**
 
-EasySync keeps notes and attachments in sync across computers, phones, and tablets. Obsidian settings, themes, and plugins are optional. No server setup is required, and files stay in your own OneDrive.
+EasySync keeps notes and attachments in sync across computers, phones, and tablets. Obsidian settings, themes, hotkeys, and plugins are optional. No server setup is required—just sign in to your own OneDrive.
 
-Changes that can be confirmed as safe are handled automatically. When the evidence is insufficient, EasySync preserves the conflict and gives you tools to compare and resolve it.
+- Changes confirmed as safe are handled automatically; conflicts support per-line comparison.
+
+- Sync status, progress, and history are collected in a dedicated sidebar.
+
+- Auto sync and each category of optional configuration sync can be controlled separately.
 
 Supports Windows, macOS, Linux, iOS, and Android.
 
