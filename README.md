@@ -2,19 +2,26 @@
 
 <p align="center">
   <a href="https://github.com/jiaoyingxing/easy-sync/releases">
+    <img alt="Release downloads" src="https://img.shields.io/github/downloads/jiaoyingxing/easy-sync/total.svg?style=flat-square&label=Release%20downloads" />
+  </a>
+  <a href="https://github.com/jiaoyingxing/easy-sync/releases">
     <img alt="Latest release" src="https://img.shields.io/github/v/release/jiaoyingxing/easy-sync?style=flat-square&label=Latest%20release" />
   </a>
   <a href="./README.md">
-    <img alt="中文" src="https://img.shields.io/badge/中文-README-d32f2f?style=flat-square" />
+    <img alt="CN 中文版" src="https://img.shields.io/badge/CN-%E4%B8%AD%E6%96%87%E7%89%88-d32f2f?style=flat-square" />
   </a>
   <a href="./README-en.md">
-    <img alt="English" src="https://img.shields.io/badge/English-README-2f6fed?style=flat-square" />
+    <img alt="EN English" src="https://img.shields.io/badge/EN-English-2f6fed?style=flat-square" />
   </a>
 </p>
 
-使用你自己的 OneDrive，在电脑、手机和平板之间双向同步 Obsidian 仓库。
+<p align="center">
+  <strong>阅读语言：</strong> <strong>简体中文</strong> · <a href="./README-en.md"><strong>English</strong></a>
+</p>
 
-EasySync 默认同步笔记和附件，Obsidian 设置、主题及插件可按需开启。能够证明安全的操作自动完成；证据不足时保留冲突，交给你决定。
+**让 Obsidian 仓库在电脑、手机和平板之间轻松保持同步。**
+
+EasySync 是一款面向新手的极简同步插件。只需登录自己的 OneDrive，即可双向同步笔记和附件；Obsidian 设置、主题及插件可按需开启。能够确认安全的操作自动完成，证据不足时保留冲突，由你决定。
 
 支持 Windows、macOS、Linux、iOS 和 Android。
 
