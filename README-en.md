@@ -19,9 +19,11 @@
   <strong>Language:</strong> <a href="./README.md"><strong>简体中文</strong></a> · <strong>English</strong>
 </p>
 
-**Keep your Obsidian vault in sync across computers, phones, and tablets.**
+**Obsidian sync across devices—simple, clear, and under your control.**
 
-EasySync is a simple sync plugin designed for beginners. Sign in to your own OneDrive to sync notes and attachments in both directions; Obsidian settings, themes, and plugins are optional. Operations that can be confirmed as safe are handled automatically. Uncertain changes remain as conflicts for you to review.
+EasySync keeps notes and attachments in sync across computers, phones, and tablets. Obsidian settings, themes, and plugins are optional. No server setup is required, and files stay in your own OneDrive.
+
+Changes that can be confirmed as safe are handled automatically. When the evidence is insufficient, EasySync preserves the conflict and gives you tools to compare and resolve it.
 
 Supports Windows, macOS, Linux, iOS, and Android.
 

@@ -19,9 +19,11 @@
   <strong>阅读语言：</strong> <strong>简体中文</strong> · <a href="./README-en.md"><strong>English</strong></a>
 </p>
 
-**让 Obsidian 仓库在电脑、手机和平板之间轻松保持同步。**
+**Obsidian 多端同步，简单、清晰、可控。**
 
-EasySync 是一款面向新手的极简同步插件。只需登录自己的 OneDrive，即可双向同步笔记和附件；Obsidian 设置、主题及插件可按需开启。能够确认安全的操作自动完成，证据不足时保留冲突，由你决定。
+EasySync 在电脑、手机和平板之间双向同步笔记和附件；Obsidian 设置、主题及插件可按需开启。无需自建服务，文件存放在你自己的 OneDrive。
+
+能够确认安全的变更自动处理；证据不足时保留冲突，并提供比较与处理入口。
 
 支持 Windows、macOS、Linux、iOS 和 Android。
 
