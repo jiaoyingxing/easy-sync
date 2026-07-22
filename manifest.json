@@ -1,7 +1,7 @@
 {
   "id": "easy-sync",
   "name": "EasySync",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "minAppVersion": "1.11.4",
   "description": "Two-way OneDrive sync with conflict safeguards, mobile support, and optional settings/plugin sync.",
   "author": "Jiao Yingxing",

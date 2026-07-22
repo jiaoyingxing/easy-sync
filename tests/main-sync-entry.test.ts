@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
-import { Platform } from "obsidian";
 
 vi.mock("../src/auth/auth-module", () => ({
   AuthModule: class {},
@@ -274,9 +273,11 @@ describe("main sync entry guards", () => {
     plugin.stopAutoSync();
   });
 
-  it("suppresses sync lifecycle notices only while the mobile EasySync sidebar is open", () => {
-    const previousMobile = Platform.isMobile;
+  it("suppresses sync lifecycle notices while the EasySync sidebar is visible on desktop or mobile", () => {
     const leftSidebar = { collapsed: false };
+    const desktopTabs = { parent: leftSidebar };
+    let active = true;
+    let leafParent: object = desktopTabs;
     const plugin = makePlugin();
     const show = vi.fn();
     const clear = vi.fn();
@@ -285,40 +286,45 @@ describe("main sync entry guards", () => {
     plugin.app = {
       workspace: {
         leftSplit: leftSidebar,
-        getLeavesOfType: () => [{ parent: leftSidebar }],
+        getLeavesOfType: () => [{
+          parent: leafParent,
+          getViewState: () => ({ type: "easy-sync-detail", active }),
+        }],
       },
     } as never;
 
-    try {
-      Platform.isMobile = true;
-      (plugin as never as { beginSyncNotice: () => void }).beginSyncNotice();
-      (plugin as never as { finishSyncNotice: (result: SyncResult) => void })
-        .finishSyncNotice(okResult());
+    (plugin as never as { beginSyncNotice: () => void }).beginSyncNotice();
+    (plugin as never as { finishSyncNotice: (result: SyncResult) => void })
+      .finishSyncNotice(okResult());
 
-      expect(show).not.toHaveBeenCalled();
-      expect(clear).toHaveBeenCalledWith("sync-progress");
+    expect(show).not.toHaveBeenCalled();
+    expect(clear).toHaveBeenCalledWith("sync-progress");
 
-      leftSidebar.collapsed = true;
-      (plugin as never as { beginSyncNotice: () => void }).beginSyncNotice();
-      expect(show).toHaveBeenCalledWith(expect.objectContaining({
-        key: "sync-progress",
-      }));
+    leftSidebar.collapsed = true;
+    (plugin as never as { beginSyncNotice: () => void }).beginSyncNotice();
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "sync-progress",
+    }));
 
-      show.mockClear();
-      leftSidebar.collapsed = false;
-      Platform.isMobile = false;
-      (plugin as never as { beginSyncNotice: () => void }).beginSyncNotice();
-      expect(show).toHaveBeenCalledWith(expect.objectContaining({
-        key: "sync-progress",
-      }));
-    } finally {
-      Platform.isMobile = previousMobile;
-    }
+    show.mockClear();
+    leftSidebar.collapsed = false;
+    active = false;
+    (plugin as never as { beginSyncNotice: () => void }).beginSyncNotice();
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "sync-progress",
+    }));
+
+    show.mockClear();
+    active = true;
+    leafParent = leftSidebar;
+    (plugin as never as { beginSyncNotice: () => void }).beginSyncNotice();
+    expect(show).not.toHaveBeenCalled();
   });
 
-  it("re-evaluates an in-flight sync notice when the mobile sidebar visibility changes", () => {
-    const previousMobile = Platform.isMobile;
+  it("re-evaluates an in-flight sync notice when the visible sidebar tab changes", () => {
     const leftSidebar = { collapsed: false };
+    const desktopTabs = { parent: leftSidebar };
+    let active = true;
     const plugin = makePlugin();
     const clear = vi.fn();
     plugin.noticeCenter = { show: vi.fn(), clear, dispose: vi.fn() } as never;
@@ -326,26 +332,24 @@ describe("main sync entry guards", () => {
     plugin.app = {
       workspace: {
         leftSplit: leftSidebar,
-        getLeavesOfType: () => [{ parent: leftSidebar }],
+        getLeavesOfType: () => [{
+          parent: desktopTabs,
+          getViewState: () => ({ type: "easy-sync-detail", active }),
+        }],
       },
     } as never;
     const render = vi.spyOn(plugin as never, "renderSyncNoticeProgress")
       .mockImplementation(() => undefined);
 
-    try {
-      Platform.isMobile = true;
-      (plugin as never as { refreshSyncNoticeVisibility: () => void })
-        .refreshSyncNoticeVisibility();
-      expect(clear).toHaveBeenCalledWith("sync-progress");
-      expect(render).not.toHaveBeenCalled();
+    (plugin as never as { refreshSyncNoticeVisibility: () => void })
+      .refreshSyncNoticeVisibility();
+    expect(clear).toHaveBeenCalledWith("sync-progress");
+    expect(render).not.toHaveBeenCalled();
 
-      leftSidebar.collapsed = true;
-      (plugin as never as { refreshSyncNoticeVisibility: () => void })
-        .refreshSyncNoticeVisibility();
-      expect(render).toHaveBeenCalledOnce();
-    } finally {
-      Platform.isMobile = previousMobile;
-    }
+    active = false;
+    (plugin as never as { refreshSyncNoticeVisibility: () => void })
+      .refreshSyncNoticeVisibility();
+    expect(render).toHaveBeenCalledOnce();
   });
 
   it("releases the sync lock when manual sync is blocked before execution", async () => {

@@ -6,6 +6,10 @@
   pointer-events: none;
 }
 
+.easy-sync-notice-hidden {
+  display: none !important;
+}
+
 .easy-sync-notice-progress-content {
   display: flex;
   flex-direction: column;

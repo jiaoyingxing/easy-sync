@@ -7,7 +7,7 @@ import {
   formatSyncProgressNoticeLabel,
   resolveSyncProgressNoticePresentation,
   resolveSyncNoticeOutcome,
-  shouldSuppressSyncNoticeForMobileSidebar,
+  shouldSuppressSyncNoticeForVisibleSidebar,
 } from "../src/ui/sync-notice";
 import type { SyncProgressState } from "../src/sync/sync-progress";
 import type { SyncResult } from "../src/sync/sync-executor";
@@ -77,31 +77,22 @@ describe("resolveSyncNoticeOutcome", () => {
   });
 });
 
-describe("shouldSuppressSyncNoticeForMobileSidebar", () => {
-  it("suppresses duplicate sync notices only while the mobile EasySync sidebar is open", () => {
-    expect(shouldSuppressSyncNoticeForMobileSidebar({
-      isMobile: true,
+describe("shouldSuppressSyncNoticeForVisibleSidebar", () => {
+  it("suppresses duplicate sync notices while the EasySync sidebar is visible", () => {
+    expect(shouldSuppressSyncNoticeForVisibleSidebar({
       leftSidebarCollapsed: false,
-      easySyncViewInLeftSidebar: true,
+      easySyncViewVisibleInLeftSidebar: true,
     })).toBe(true);
-
-    expect(shouldSuppressSyncNoticeForMobileSidebar({
-      isMobile: true,
-      leftSidebarCollapsed: true,
-      easySyncViewInLeftSidebar: true,
-    })).toBe(false);
-    expect(shouldSuppressSyncNoticeForMobileSidebar({
-      isMobile: true,
-      leftSidebarCollapsed: false,
-      easySyncViewInLeftSidebar: false,
-    })).toBe(false);
   });
 
-  it("keeps desktop sync notices even when the EasySync sidebar is open", () => {
-    expect(shouldSuppressSyncNoticeForMobileSidebar({
-      isMobile: false,
+  it("keeps sync notices when the sidebar is collapsed or another sidebar tab is visible", () => {
+    expect(shouldSuppressSyncNoticeForVisibleSidebar({
+      leftSidebarCollapsed: true,
+      easySyncViewVisibleInLeftSidebar: true,
+    })).toBe(false);
+    expect(shouldSuppressSyncNoticeForVisibleSidebar({
       leftSidebarCollapsed: false,
-      easySyncViewInLeftSidebar: true,
+      easySyncViewVisibleInLeftSidebar: false,
     })).toBe(false);
   });
 });

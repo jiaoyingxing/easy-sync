@@ -51,7 +51,7 @@ import {
   formatSyncProgressNoticeLabel,
   resolveSyncProgressNoticePresentation,
   resolveSyncNoticeOutcome,
-  shouldSuppressSyncNoticeForMobileSidebar,
+  shouldSuppressSyncNoticeForVisibleSidebar,
   type SyncNoticeOutcomeKind,
 } from "./ui/sync-notice";
 import {
@@ -753,12 +753,17 @@ export default class EasySyncPlugin extends Plugin {
   private shouldSuppressSyncNotice(): boolean {
     const leftSidebar = this.app.workspace.leftSplit;
     if (!leftSidebar) return false;
-    return shouldSuppressSyncNoticeForMobileSidebar({
-      isMobile: Platform.isMobile,
+    const easySyncViewVisibleInLeftSidebar = this.app.workspace
+      .getLeavesOfType(SYNC_VIEW_TYPE)
+      .some((leaf) => {
+        const parent = leaf.parent;
+        const belongsToLeftSidebar = parent === leftSidebar
+          || parent.parent === leftSidebar;
+        return belongsToLeftSidebar && leaf.getViewState().active === true;
+      });
+    return shouldSuppressSyncNoticeForVisibleSidebar({
       leftSidebarCollapsed: leftSidebar.collapsed,
-      easySyncViewInLeftSidebar: this.app.workspace
-        .getLeavesOfType(SYNC_VIEW_TYPE)
-        .some((leaf) => leaf.parent === leftSidebar),
+      easySyncViewVisibleInLeftSidebar,
     });
   }
 
@@ -769,7 +774,6 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private refreshSyncNoticeVisibility(): void {
-    if (!Platform.isMobile) return;
     if (this.shouldSuppressSyncNotice()) {
       this.syncNoticeSignature = null;
       this.clearSyncLifecycleNotice();

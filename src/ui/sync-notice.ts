@@ -25,14 +25,12 @@ export interface SyncNoticeOutcome {
   count: number;
 }
 
-export function shouldSuppressSyncNoticeForMobileSidebar(input: {
-  isMobile: boolean;
+export function shouldSuppressSyncNoticeForVisibleSidebar(input: {
   leftSidebarCollapsed: boolean;
-  easySyncViewInLeftSidebar: boolean;
+  easySyncViewVisibleInLeftSidebar: boolean;
 }): boolean {
-  return input.isMobile
-    && !input.leftSidebarCollapsed
-    && input.easySyncViewInLeftSidebar;
+  return !input.leftSidebarCollapsed
+    && input.easySyncViewVisibleInLeftSidebar;
 }
 
 export type SyncProgressNoticeKind =

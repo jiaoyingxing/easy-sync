@@ -159,10 +159,10 @@ export class EasySyncNoticeCenter {
   private hideImmediately(handle: EasySyncNoticeHandle): void {
     const element = handle.noticeEl ?? handle.messageEl;
     if (!element) return;
-    element.style?.setProperty("display", "none");
+    element.classList.add("easy-sync-notice-hidden");
     const host = typeof element.closest === "function"
       ? element.closest<HTMLElement>(".notice")
       : null;
-    if (host && host !== element) host.style.setProperty("display", "none");
+    if (host && host !== element) host.classList.add("easy-sync-notice-hidden");
   }
 }

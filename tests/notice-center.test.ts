@@ -18,13 +18,14 @@ class FakeClassList {
 }
 
 class FakeNotice implements EasySyncNoticeHandle {
-  readonly hostDisplay: string[] = [];
-  readonly messageDisplay: string[] = [];
+  readonly hostClassList = new FakeClassList();
+  readonly messageClassList = new FakeClassList();
   readonly noticeEl = {
-    classList: new FakeClassList(),
-    style: { setProperty: (_name: string, value: string) => this.messageDisplay.push(value) },
+    classList: this.messageClassList,
+    style: { setProperty: () => undefined },
     closest: () => ({
-      style: { setProperty: (_name: string, value: string) => this.hostDisplay.push(value) },
+      classList: this.hostClassList,
+      style: { setProperty: () => undefined },
     }),
   } as unknown as HTMLElement;
   readonly messages: Array<string | DocumentFragment>;
@@ -105,8 +106,8 @@ describe("EasySyncNoticeCenter", () => {
 
     expect(created).toHaveLength(2);
     expect(created[0].hidden).toBe(true);
-    expect(created[0].messageDisplay).toEqual(["none"]);
-    expect(created[0].hostDisplay).toEqual(["none"]);
+    expect(created[0].messageClassList.values).toContain("easy-sync-notice-hidden");
+    expect(created[0].hostClassList.values).toContain("easy-sync-notice-hidden");
     expect(created[1].messages).toEqual(["failed"]);
   });
 
