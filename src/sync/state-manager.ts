@@ -560,6 +560,40 @@ export class StateManager {
     this.remoteState = null;
   }
 
+  /** Commit a device-local sync-path change through the shared PluginData writer.
+   *  Durable base history is preserved; stale review state and out-of-scope
+   *  pending items are retired in the same physical write as the settings. */
+  async commitSyncPathSettingsChange(
+    isPathInScope: (path: string) => boolean,
+    persistSettings: (data: Record<string, unknown>) => void,
+  ): Promise<void> {
+    if (this.mutationLedgerCorrupt || this.data[KEY_MUTATION_LEDGER].length > 0) {
+      throw new Error("Cannot change sync paths while mutation recovery is unresolved");
+    }
+    await this.commitPluginData((current) => {
+      const next: PluginData = {
+        ...current,
+        [KEY_PENDING_CONFLICTS]: current[KEY_PENDING_CONFLICTS].filter(
+          (item) => isPathInScope(item.path),
+        ),
+        [KEY_PENDING_DELETES]: current[KEY_PENDING_DELETES].filter(
+          (item) => isPathInScope(item.path),
+        ),
+        [KEY_PENDING_ISSUES]: current[KEY_PENDING_ISSUES].filter(
+          (item) => isPathInScope(item.path),
+        ),
+        [KEY_PLAN_REVIEW_ACTIVE]: false,
+        [KEY_PLAN_REVIEW_COUNTS]: null,
+        [KEY_PLAN_REVIEW_ITEMS]: [],
+        [KEY_PLAN_REVIEW_DIGEST]: "",
+        [KEY_PLAN_REVIEW_REVISION]: current[KEY_PLAN_REVIEW_REVISION] + 1,
+        [KEY_PLAN_REVIEW_SCOPE]: null,
+      };
+      persistSettings(next as unknown as Record<string, unknown>);
+      return next;
+    });
+  }
+
   async applyRemoteMutations(
     upserts: RemoteFileEntry[],
     deletedPaths: string[],

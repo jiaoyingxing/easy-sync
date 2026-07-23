@@ -16,6 +16,11 @@ import { AuthPendingModal } from "./auth-pending-modal";
 import { AutomaticHandlingModal } from "./automatic-handling-modal";
 import { ConfigSyncModal } from "./config-sync-modal";
 import { ConfirmModal } from "./confirm-modal";
+import {
+  renderExcludedFolderChips,
+  SyncExclusionModal,
+  updateExcludedFoldersFromUi,
+} from "./sync-exclusion-modal";
 
 const GITHUB_URL = "https://github.com/jiaoyingxing/easy-sync";
 const XHS_URL = "https://xhslink.com/m/57v8xzlVMKp";
@@ -216,14 +221,38 @@ export class EasySyncSettingTab extends PluginSettingTab {
 
     syncGroup.addSetting((setting) => {
       setting
-        .setName(t("settings.moreConfig.name"))
-        .setDesc(t("settings.moreConfig.desc"))
+        .setName(t("settings.syncScope.name"))
+        .setDesc(t("settings.syncScope.desc"))
         .addButton((btn) => {
-          btn.setButtonText(t("settings.moreConfig.button"))
+          btn.setButtonText(t("settings.syncScope.button"))
             .onClick(() => {
               new ConfigSyncModal(this.plugin).open();
             });
         });
+    });
+
+    syncGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.syncExclusion.name"))
+        .setDesc(t("settings.syncExclusion.desc"))
+        .addButton((button) => {
+          button
+            .setButtonText(t("settings.syncExclusion.button"))
+            .onClick(() => {
+              new SyncExclusionModal(this.plugin).open();
+            });
+        });
+
+      if (this.plugin.excludedFolders.length > 0) {
+        const chipsEl = setting.descEl.createDiv();
+        renderExcludedFolderChips(chipsEl, this.plugin.excludedFolders, {
+          removeLabel: (path) => t("settings.syncExclusion.removeFolder", { path }),
+          onRemove: (path) => updateExcludedFoldersFromUi(
+            this.plugin,
+            this.plugin.excludedFolders.filter((current) => current !== path),
+          ),
+        });
+      }
     });
 
     syncGroup.addSetting((setting) => {

@@ -63,10 +63,20 @@ export interface LocaleStrings {
   "settings.automaticHandling.autoDeleteLocalFiles.desc": string;
   "settings.automaticHandling.mergeNonOverlappingText.name": string;
   "settings.automaticHandling.mergeNonOverlappingText.desc": string;
-  "settings.moreConfig.name": string;
-  "settings.moreConfig.desc": string;
-  "settings.moreConfig.button": string;
-  "settings.moreConfig.title": string;
+  "settings.syncScope.name": string;
+  "settings.syncScope.desc": string;
+  "settings.syncScope.button": string;
+  "settings.syncScope.title": string;
+  "settings.syncExclusion.name": string;
+  "settings.syncExclusion.desc": string;
+  "settings.syncExclusion.button": string;
+  "settings.syncExclusion.title": string;
+  "settings.syncExclusion.intro": string;
+  "settings.syncExclusion.folders.name": string;
+  "settings.syncExclusion.add": string;
+  "settings.syncExclusion.empty": string;
+  "settings.syncExclusion.removeFolder": string;
+  "settings.syncExclusion.pickerPlaceholder": string;
   "settings.syncPluginFiles.name": string;
   "settings.syncPluginFiles.desc": string;
   "settings.syncEditor.name": string;
@@ -169,6 +179,9 @@ export interface LocaleStrings {
   "notice.sync.authExpired": string;
   "notice.accountMismatch": string;
   "notice.diagnosticReportGenerated": string;
+  "notice.syncPathSettings.busy": string;
+  "notice.syncPathSettings.recovery": string;
+  "notice.syncPathSettings.failed": string;
 
   // ---- Sync Plan Reasons ----
   "reason.fileExceedsSizeLimit": string;

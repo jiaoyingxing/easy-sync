@@ -1087,7 +1087,9 @@ export class SyncExecutor {
       }
 
       // Step 4: Load base snapshot
-      let baseEntries = this.state.baseSnapshot;
+      let baseEntries = this.state.baseSnapshot.filter(
+        (entry) => this.shouldIncludeRemotePath(entry.path),
+      );
       let seededBaseEntries: BaseFileEntry[] = [];
       if (baseEntries.length === 0 && cloudBaselineJson) {
         seededBaseEntries = this.seedBaseEntriesFromCloudBaseline(

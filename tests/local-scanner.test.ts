@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Vault } from "obsidian";
-import { LocalScanner } from "../src/sync/local-scanner";
+import {
+  LocalScanner,
+  normalizeExcludedFolders,
+} from "../src/sync/local-scanner";
 import type { ScanConfig } from "../src/sync/types";
 
 const content = new TextEncoder().encode("test").buffer;
@@ -153,6 +156,87 @@ describe("LocalScanner plugin config paths", () => {
     expect(scanner.shouldSyncPath(".obsidian/plugins/example-plugin/runtime/cache.json")).toBe(false);
     expect(scanner.shouldSyncPath(".obsidian/plugins/example-plugin/data.json")).toBe(false);
     expect(scanner.shouldSyncPath(".obsidian/plugins/easy-sync/tmp/download.part")).toBe(false);
+  });
+});
+
+describe("LocalScanner device-local folder exclusions", () => {
+  it("normalizes separators, removes config paths, deduplicates case-insensitively, and collapses nested folders", () => {
+    expect(normalizeExcludedFolders([
+      " Notes\\Private/ ",
+      "notes/private",
+      "Notes/Private/Archive",
+      "Projects/Local",
+      ".obsidian",
+      ".obsidian/themes",
+      "",
+      "/",
+    ], ".obsidian")).toEqual([
+      "Notes/Private",
+      "Projects/Local",
+    ]);
+  });
+
+  it("matches exact folder boundaries case-insensitively without excluding siblings", () => {
+    const vault = {
+      adapter: {},
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      excludePaths: [],
+      includePaths: [],
+      excludedFolders: ["Private"],
+      maxFileSize: 50 * 1024 * 1024,
+    });
+
+    expect(scanner.shouldSyncPath("Private")).toBe(false);
+    expect(scanner.shouldSyncPath("private/note.md")).toBe(false);
+    expect(scanner.shouldSyncPath("PRIVATE/Nested/note.md")).toBe(false);
+    expect(scanner.shouldSyncPath("Private-old/note.md")).toBe(true);
+    expect(scanner.shouldSyncPath("Public/Private/note.md")).toBe(true);
+  });
+
+  it("keeps user folder exclusions stronger than technical include paths", () => {
+    const vault = {
+      adapter: {},
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      excludePaths: [],
+      includePaths: ["Shared/"],
+      excludedFolders: ["Shared"],
+      maxFileSize: 50 * 1024 * 1024,
+    });
+
+    expect(scanner.shouldSyncPath("Shared/note.md")).toBe(false);
+  });
+
+  it("does not report intentionally excluded files as skipped", async () => {
+    const adapter = {
+      read: vi.fn().mockRejectedValue(new Error("missing")),
+      write: vi.fn().mockResolvedValue(undefined),
+      stat: vi.fn().mockResolvedValue({ size: content.byteLength, mtime: 1 }),
+      readBinary: vi.fn().mockResolvedValue(content),
+      list: vi.fn().mockResolvedValue({ files: [], folders: [] }),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => [
+        { path: "Private/secret.md", stat: { size: content.byteLength, mtime: 1 } },
+        { path: "Public/note.md", stat: { size: content.byteLength, mtime: 1 } },
+      ]),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      excludePaths: [],
+      includePaths: [],
+      excludedFolders: ["Private"],
+      maxFileSize: 50 * 1024 * 1024,
+    });
+
+    const result = await scanner.scanAll();
+
+    expect(result.entries.map((entry) => entry.path)).toEqual(["Public/note.md"]);
+    expect(result.skippedCount).toBe(0);
+    expect(adapter.readBinary).toHaveBeenCalledTimes(1);
   });
 });
 

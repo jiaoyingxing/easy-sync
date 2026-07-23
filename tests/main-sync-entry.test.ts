@@ -13,6 +13,9 @@ vi.mock("../src/sync/local-scanner", () => ({
   LocalScanner: class {},
   isEasySyncInternalPath: (path: string) => path.includes("/.obsidian/plugins/easy-sync/tmp/")
     || path.startsWith(".obsidian/plugins/easy-sync/tmp/"),
+  normalizeExcludedFolders: (paths: unknown[]) => paths.filter(
+    (path): path is string => typeof path === "string" && path.length > 0,
+  ),
 }));
 
 vi.mock("../src/sync/sync-engine", () => ({
@@ -276,7 +279,7 @@ describe("main sync entry guards", () => {
   it("suppresses sync lifecycle notices while the EasySync sidebar is visible on desktop or mobile", () => {
     const leftSidebar = { collapsed: false };
     const desktopTabs = { parent: leftSidebar };
-    let active = true;
+    let visible = true;
     let leafParent: object = desktopTabs;
     const plugin = makePlugin();
     const show = vi.fn();
@@ -288,7 +291,13 @@ describe("main sync entry guards", () => {
         leftSplit: leftSidebar,
         getLeavesOfType: () => [{
           parent: leafParent,
-          getViewState: () => ({ type: "easy-sync-detail", active }),
+          view: {
+            containerEl: {
+              isShown: () => visible,
+            },
+          },
+          // The real Obsidian runtime does not return ViewState.active here.
+          getViewState: () => ({ type: "easy-sync-detail" }),
         }],
       },
     } as never;
@@ -308,14 +317,14 @@ describe("main sync entry guards", () => {
 
     show.mockClear();
     leftSidebar.collapsed = false;
-    active = false;
+    visible = false;
     (plugin as never as { beginSyncNotice: () => void }).beginSyncNotice();
     expect(show).toHaveBeenCalledWith(expect.objectContaining({
       key: "sync-progress",
     }));
 
     show.mockClear();
-    active = true;
+    visible = true;
     leafParent = leftSidebar;
     (plugin as never as { beginSyncNotice: () => void }).beginSyncNotice();
     expect(show).not.toHaveBeenCalled();
@@ -324,7 +333,7 @@ describe("main sync entry guards", () => {
   it("re-evaluates an in-flight sync notice when the visible sidebar tab changes", () => {
     const leftSidebar = { collapsed: false };
     const desktopTabs = { parent: leftSidebar };
-    let active = true;
+    let visible = true;
     const plugin = makePlugin();
     const clear = vi.fn();
     plugin.noticeCenter = { show: vi.fn(), clear, dispose: vi.fn() } as never;
@@ -334,7 +343,12 @@ describe("main sync entry guards", () => {
         leftSplit: leftSidebar,
         getLeavesOfType: () => [{
           parent: desktopTabs,
-          getViewState: () => ({ type: "easy-sync-detail", active }),
+          view: {
+            containerEl: {
+              isShown: () => visible,
+            },
+          },
+          getViewState: () => ({ type: "easy-sync-detail" }),
         }],
       },
     } as never;
@@ -346,7 +360,7 @@ describe("main sync entry guards", () => {
     expect(clear).toHaveBeenCalledWith("sync-progress");
     expect(render).not.toHaveBeenCalled();
 
-    active = false;
+    visible = false;
     (plugin as never as { refreshSyncNoticeVisibility: () => void })
       .refreshSyncNoticeVisibility();
     expect(render).toHaveBeenCalledOnce();

@@ -1,7 +1,24 @@
 import { describe, expect, it, vi } from "vitest";
-import EasySyncPlugin from "../src/main";
+import EasySyncPlugin, { SyncPathSettingsUpdateError } from "../src/main";
 
 describe("plugin data cold-start cache", () => {
+  it("loads and normalizes device-local folder exclusions without a cold-start write", async () => {
+    const plugin = new EasySyncPlugin();
+    vi.spyOn(plugin, "loadData").mockResolvedValue({
+      "sync-excluded-folders": [
+        " Notes\\Private/ ",
+        "notes/private/archive",
+        ".obsidian/themes",
+      ],
+    });
+    const saveData = vi.spyOn(plugin, "saveData").mockResolvedValue(undefined);
+
+    await plugin.loadSyncSettings();
+
+    expect(plugin.excludedFolders).toEqual(["Notes/Private"]);
+    expect(saveData).not.toHaveBeenCalled();
+  });
+
   it("defaults legacy conflict switches to no deletion authority and saves the canonical policy", async () => {
     const plugin = new EasySyncPlugin();
     vi.spyOn(plugin, "loadData").mockResolvedValue({
@@ -52,6 +69,101 @@ describe("plugin data cold-start cache", () => {
       mergeNonOverlappingText: false,
     });
     expect(clearPlanReview).toHaveBeenCalledTimes(1);
+  });
+
+  it("changes sync paths only after clearing remote cache and commits settings with scoped pending state", async () => {
+    const plugin = new EasySyncPlugin();
+    const events: string[] = [];
+    let activeExcluded: string[] = [];
+    let savedData: Record<string, unknown> = {};
+    plugin.scanner = {
+      setConfig: vi.fn((config: { excludedFolders?: string[] }) => {
+        activeExcluded = [...(config.excludedFolders ?? [])];
+        events.push(activeExcluded.length > 0 ? "apply-candidate" : "apply-previous");
+      }),
+      shouldSyncPath: vi.fn((path: string) =>
+        !activeExcluded.some((folder) =>
+          path === folder || path.startsWith(`${folder}/`),
+        )),
+    } as never;
+    plugin.state = {
+      hasMutationLedgerCorruption: false,
+      mutationLedger: [],
+      clearRemoteState: vi.fn(async () => {
+        events.push("clear-remote");
+      }),
+      commitSyncPathSettingsChange: vi.fn(async (
+        isPathInScope: (path: string) => boolean,
+        persistSettings: (data: Record<string, unknown>) => void,
+      ) => {
+        events.push("commit");
+        expect(isPathInScope("Private/note.md")).toBe(false);
+        expect(isPathInScope("Notes/note.md")).toBe(true);
+        persistSettings(savedData);
+      }),
+    } as never;
+    plugin.syncExecutor = { hasActivityInFlight: false } as never;
+    vi.spyOn(plugin as never, "ensureStateLoaded").mockResolvedValue(undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await plugin.updateExcludedFolders(["Private"]);
+
+    expect(events).toEqual(["clear-remote", "apply-candidate", "commit"]);
+    expect(plugin.excludedFolders).toEqual(["Private"]);
+    expect(savedData["sync-excluded-folders"]).toEqual(["Private"]);
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
+  it("rolls scanner settings back when the combined sync-path write fails", async () => {
+    const plugin = new EasySyncPlugin();
+    const applied: string[][] = [];
+    plugin.scanner = {
+      setConfig: vi.fn((config: { excludedFolders?: string[] }) => {
+        applied.push([...(config.excludedFolders ?? [])]);
+      }),
+      shouldSyncPath: vi.fn().mockReturnValue(true),
+    } as never;
+    plugin.state = {
+      hasMutationLedgerCorruption: false,
+      mutationLedger: [],
+      clearRemoteState: vi.fn().mockResolvedValue(undefined),
+      commitSyncPathSettingsChange: vi.fn().mockRejectedValue(new Error("disk full")),
+    } as never;
+    plugin.syncExecutor = { hasActivityInFlight: false } as never;
+    vi.spyOn(plugin as never, "ensureStateLoaded").mockResolvedValue(undefined);
+
+    await expect(plugin.updateExcludedFolders(["Private"]))
+      .rejects.toThrow("disk full");
+
+    expect(plugin.excludedFolders).toEqual([]);
+    expect(applied).toEqual([["Private"], []]);
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
+  it("rejects sync-path changes while sync or mutation recovery is active", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.scanner = {
+      setConfig: vi.fn(),
+      shouldSyncPath: vi.fn().mockReturnValue(true),
+    } as never;
+    plugin.state = {
+      hasMutationLedgerCorruption: false,
+      mutationLedger: [],
+    } as never;
+    plugin.syncExecutor = { hasActivityInFlight: true } as never;
+    vi.spyOn(plugin as never, "ensureStateLoaded").mockResolvedValue(undefined);
+
+    await expect(plugin.updateExcludedFolders(["Private"]))
+      .rejects.toMatchObject<Partial<SyncPathSettingsUpdateError>>({ code: "busy" });
+
+    plugin.syncExecutor = { hasActivityInFlight: false } as never;
+    plugin.state = {
+      hasMutationLedgerCorruption: false,
+      mutationLedger: [{}],
+    } as never;
+
+    await expect(plugin.updateExcludedFolders(["Private"]))
+      .rejects.toMatchObject<Partial<SyncPathSettingsUpdateError>>({ code: "recovery" });
   });
 
   it("shares one physical load across the settings, auth, and state consumers", async () => {

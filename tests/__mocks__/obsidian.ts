@@ -7,6 +7,7 @@
 export interface Vault {
   adapter: DataAdapter;
   getFiles(): TFile[];
+  getAllLoadedFiles?(): TAbstractFile[];
   getName(): string;
 }
 
@@ -23,14 +24,18 @@ export interface DataAdapter {
   stat(path: string): Promise<FileStats | null>;
 }
 
-// Minimal TFile
-export class TFile {
+export class TAbstractFile {
   path: string;
 
   constructor(path = "") {
     this.path = path;
   }
 }
+
+// Minimal TFile / TFolder
+export class TFile extends TAbstractFile {}
+
+export class TFolder extends TAbstractFile {}
 
 // FileStats
 export interface FileStats {
@@ -82,6 +87,14 @@ export class Modal {
   setTitle(_title: string): void {}
   open(): void {}
   close(): void {}
+}
+
+export abstract class FuzzySuggestModal<T> extends Modal {
+  abstract getItems(): T[];
+  abstract getItemText(item: T): string;
+  abstract onChooseItem(item: T, evt: MouseEvent | KeyboardEvent): void;
+  setPlaceholder(_placeholder: string): this { return this; }
+  setInstructions(_instructions: Array<{ command: string; purpose: string }>): this { return this; }
 }
 
 // requestUrl — used by OneDrive client

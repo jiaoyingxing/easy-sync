@@ -51,6 +51,87 @@ function makeState() {
 }
 
 describe("StateManager batch persistence", () => {
+  it("commits sync-path settings with scoped pending state and invalidates the reviewed plan", async () => {
+    const { state, saveData } = makeState();
+    await state.upsertPendingConflicts([
+      conflict("Notes/keep.md"),
+      conflict("Private/drop.md"),
+    ]);
+    await state.upsertPendingDeletes([
+      pendingDelete("Notes/delete.md"),
+      pendingDelete("Private/delete.md"),
+    ]);
+    await state.reconcilePendingIssues([
+      {
+        path: "Notes/retry.md",
+        actionType: SyncActionType.Upload,
+        updatedAt: 1,
+      },
+      {
+        path: "Private/retry.md",
+        actionType: SyncActionType.Upload,
+        updatedAt: 1,
+      },
+    ], []);
+    await state.setPlanReviewBundle(
+      [conflict("Notes/keep.md"), conflict("Private/drop.md")],
+      { uploads: 0, downloads: 0, deletes: 0, conflicts: 2, skipped: 0 },
+      TEST_SCOPE,
+    );
+    const priorRevision = state.planReviewRevision;
+    saveData.mockClear();
+
+    await state.commitSyncPathSettingsChange(
+      (path) => !path.toLocaleLowerCase().startsWith("private/"),
+      (data) => {
+        data["sync-excluded-folders"] = ["Private"];
+      },
+    );
+
+    expect(state.pendingConflicts.map((item) => item.path)).toEqual(["Notes/keep.md"]);
+    expect(state.pendingRemoteDeletes.map((item) => item.path)).toEqual(["Notes/delete.md"]);
+    expect(state.pendingIssues.map((item) => item.path)).toEqual(["Notes/retry.md"]);
+    expect(state.planReviewActive).toBe(false);
+    expect(state.planReviewItems).toEqual([]);
+    expect(state.planReviewRevision).toBe(priorRevision + 1);
+    expect(saveData).toHaveBeenCalledTimes(1);
+    expect(saveData).toHaveBeenCalledWith(expect.objectContaining({
+      "sync-excluded-folders": ["Private"],
+      "easy-sync-pending-conflicts": [expect.objectContaining({ path: "Notes/keep.md" })],
+      "easy-sync-pending-remote-deletes": [expect.objectContaining({ path: "Notes/delete.md" })],
+      "easy-sync-plan-review-active": false,
+    }));
+  });
+
+  it("does not publish scoped pending state when the combined settings write fails", async () => {
+    const { state, saveData } = makeState();
+    await state.upsertPendingConflicts([
+      conflict("Notes/keep.md"),
+      conflict("Private/drop.md"),
+    ]);
+    await state.setPlanReviewBundle(
+      [conflict("Private/drop.md")],
+      { uploads: 0, downloads: 0, deletes: 0, conflicts: 1, skipped: 0 },
+      TEST_SCOPE,
+    );
+    const priorRevision = state.planReviewRevision;
+    saveData.mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(state.commitSyncPathSettingsChange(
+      (path) => !path.startsWith("Private/"),
+      (data) => {
+        data["sync-excluded-folders"] = ["Private"];
+      },
+    )).rejects.toThrow("disk full");
+
+    expect(state.pendingConflicts.map((item) => item.path)).toEqual([
+      "Notes/keep.md",
+      "Private/drop.md",
+    ]);
+    expect(state.planReviewActive).toBe(true);
+    expect(state.planReviewRevision).toBe(priorRevision);
+  });
+
   it("atomically commits an identical conflict as base and removes the pending item", async () => {
     const { state, saveData } = makeState();
     const path = "same.md";

@@ -16,7 +16,10 @@ import {
   TimeoutHandle,
 } from "./obsidian-compat";
 import { OneDriveClient } from "./onedrive/client";
-import { LocalScanner } from "./sync/local-scanner";
+import {
+  LocalScanner,
+  normalizeExcludedFolders,
+} from "./sync/local-scanner";
 import { SyncEngine } from "./sync/sync-engine";
 import { StateManager } from "./sync/state-manager";
 import {
@@ -86,6 +89,7 @@ const KEY_SYNC_HOTKEYS = "sync-hotkeys";
 const KEY_SYNC_CORE_PLUGINS = "sync-core-plugins";
 const KEY_SYNC_COMMUNITY_PLUGINS = "sync-community-plugins";
 const KEY_SYNC_PLUGIN_DATA = "sync-plugin-data";
+const KEY_SYNC_EXCLUDED_FOLDERS = "sync-excluded-folders";
 const KEY_AUTO_SYNC_PAUSED = "auto-sync-paused";
 const KEY_LEGACY_AUTO_MERGE = "sync-auto-merge";
 const KEY_AUTOMATIC_HANDLING_POLICY = "sync-auto-conflict-policy";
@@ -93,6 +97,25 @@ const KEY_PROFILE_CACHE = "easy-sync-profile-cache";
 const RIBBON_SUCCESS_DURATION_MS = 5_000;
 const SYNC_RESULT_NOTICE_DURATION_MS = 2_000;
 const SYNC_PROGRESS_NOTICE_KEY = "sync-progress";
+
+export interface SyncPathSettings {
+  syncPluginFiles: boolean;
+  syncEditorSettings: boolean;
+  syncAppearance: boolean;
+  syncThemes: boolean;
+  syncHotkeys: boolean;
+  syncCorePlugins: boolean;
+  syncCommunityPlugins: boolean;
+  syncPluginData: boolean;
+  excludedFolders: string[];
+}
+
+export class SyncPathSettingsUpdateError extends Error {
+  constructor(readonly code: "busy" | "recovery") {
+    super(code);
+    this.name = "SyncPathSettingsUpdateError";
+  }
+}
 
 function clonePluginData(data: Record<string, unknown>): Record<string, unknown> {
   return JSON.parse(JSON.stringify(data)) as Record<string, unknown>;
@@ -152,6 +175,7 @@ export default class EasySyncPlugin extends Plugin {
   syncCorePlugins = false;
   syncCommunityPlugins = false;
   syncPluginData = false;
+  excludedFolders: string[] = [];
   diagLogEnabled = false;
   autoSyncPaused = false;
   private opLock: string | null = null;
@@ -271,7 +295,7 @@ export default class EasySyncPlugin extends Plugin {
 
     this.scanner = new LocalScanner(this.app.vault, undefined, this.manifest.id);
     this.scanner.setDiag(this.diag);
-    this.applyPluginFilesSetting(); // Apply saved setting after scanner is created
+    this.applySyncPathSettings(); // Apply saved path settings after scanner is created
     this.onedrive = new OneDriveClient(
       () => this.auth!.getAccessToken(),
       this.diag,
@@ -759,7 +783,7 @@ export default class EasySyncPlugin extends Plugin {
         const parent = leaf.parent;
         const belongsToLeftSidebar = parent === leftSidebar
           || parent.parent === leftSidebar;
-        return belongsToLeftSidebar && leaf.getViewState().active === true;
+        return belongsToLeftSidebar && leaf.view.containerEl.isShown();
       });
     return shouldSuppressSyncNoticeForVisibleSidebar({
       leftSidebarCollapsed: leftSidebar.collapsed,
@@ -1194,6 +1218,12 @@ export default class EasySyncPlugin extends Plugin {
       if (typeof data[KEY_SYNC_CORE_PLUGINS] === "boolean") this.syncCorePlugins = data[KEY_SYNC_CORE_PLUGINS];
       if (typeof data[KEY_SYNC_COMMUNITY_PLUGINS] === "boolean") this.syncCommunityPlugins = data[KEY_SYNC_COMMUNITY_PLUGINS];
       if (typeof data[KEY_SYNC_PLUGIN_DATA] === "boolean") this.syncPluginData = data[KEY_SYNC_PLUGIN_DATA];
+      this.excludedFolders = normalizeExcludedFolders(
+        Array.isArray(data[KEY_SYNC_EXCLUDED_FOLDERS])
+          ? data[KEY_SYNC_EXCLUDED_FOLDERS]
+          : [],
+        getConfigDir(this.app.vault),
+      );
       if (typeof data[KEY_AUTO_SYNC_PAUSED] === "boolean") this.autoSyncPaused = data[KEY_AUTO_SYNC_PAUSED];
       if (typeof data[KEY_MAX_FILE_SIZE_MB] === "number") this.syncMaxFileSizeMb = data[KEY_MAX_FILE_SIZE_MB];
       this.automaticHandlingPolicy = readAutomaticHandlingPolicy(
@@ -1201,7 +1231,7 @@ export default class EasySyncPlugin extends Plugin {
         data[KEY_LEGACY_AUTO_MERGE],
       );
     }
-    this.applyPluginFilesSetting();
+    this.applySyncPathSettings();
     this.applyMaxFileSize();
     this.applyDiagnosticSetting();
   }
@@ -1278,18 +1308,122 @@ export default class EasySyncPlugin extends Plugin {
   async saveSyncSettings(): Promise<void> {
     await this.updatePluginData((data) => {
       data[KEY_SYNC_INTERVAL] = this.syncInterval;
-      data[KEY_SYNC_PLUGIN_FILES] = this.syncPluginFiles;
       data[KEY_DIAG_LOG] = this.diagLogEnabled;
-      data[KEY_SYNC_EDITOR] = this.syncEditorSettings;
-      data[KEY_SYNC_APPEARANCE] = this.syncAppearance;
-      data[KEY_SYNC_THEMES] = this.syncThemes;
-      data[KEY_SYNC_HOTKEYS] = this.syncHotkeys;
-      data[KEY_SYNC_CORE_PLUGINS] = this.syncCorePlugins;
-      data[KEY_SYNC_COMMUNITY_PLUGINS] = this.syncCommunityPlugins;
-      data[KEY_SYNC_PLUGIN_DATA] = this.syncPluginData;
+      this.writeSyncPathSettingsData(data, this.captureSyncPathSettings());
       data[KEY_AUTO_SYNC_PAUSED] = this.autoSyncPaused;
       data[KEY_MAX_FILE_SIZE_MB] = this.syncMaxFileSizeMb;
       data[KEY_AUTOMATIC_HANDLING_POLICY] = { ...this.automaticHandlingPolicy };
+    });
+  }
+
+  private captureSyncPathSettings(): SyncPathSettings {
+    return {
+      syncPluginFiles: this.syncPluginFiles,
+      syncEditorSettings: this.syncEditorSettings,
+      syncAppearance: this.syncAppearance,
+      syncThemes: this.syncThemes,
+      syncHotkeys: this.syncHotkeys,
+      syncCorePlugins: this.syncCorePlugins,
+      syncCommunityPlugins: this.syncCommunityPlugins,
+      syncPluginData: this.syncPluginData,
+      excludedFolders: [...this.excludedFolders],
+    };
+  }
+
+  private writeSyncPathSettingsData(
+    data: Record<string, unknown>,
+    settings: Readonly<SyncPathSettings>,
+  ): void {
+    data[KEY_SYNC_PLUGIN_FILES] = settings.syncPluginFiles;
+    data[KEY_SYNC_EDITOR] = settings.syncEditorSettings;
+    data[KEY_SYNC_APPEARANCE] = settings.syncAppearance;
+    data[KEY_SYNC_THEMES] = settings.syncThemes;
+    data[KEY_SYNC_HOTKEYS] = settings.syncHotkeys;
+    data[KEY_SYNC_CORE_PLUGINS] = settings.syncCorePlugins;
+    data[KEY_SYNC_COMMUNITY_PLUGINS] = settings.syncCommunityPlugins;
+    data[KEY_SYNC_PLUGIN_DATA] = settings.syncPluginData;
+    data[KEY_SYNC_EXCLUDED_FOLDERS] = [...settings.excludedFolders];
+  }
+
+  private publishSyncPathSettings(settings: Readonly<SyncPathSettings>): void {
+    this.syncPluginFiles = settings.syncPluginFiles;
+    this.syncEditorSettings = settings.syncEditorSettings;
+    this.syncAppearance = settings.syncAppearance;
+    this.syncThemes = settings.syncThemes;
+    this.syncHotkeys = settings.syncHotkeys;
+    this.syncCorePlugins = settings.syncCorePlugins;
+    this.syncCommunityPlugins = settings.syncCommunityPlugins;
+    this.syncPluginData = settings.syncPluginData;
+    this.excludedFolders = [...settings.excludedFolders];
+    this.applySyncPathSettings();
+  }
+
+  async updateSyncPathSettings(
+    patch: Partial<SyncPathSettings>,
+  ): Promise<void> {
+    const previous = this.captureSyncPathSettings();
+    const candidate: SyncPathSettings = {
+      ...previous,
+      ...patch,
+      excludedFolders: normalizeExcludedFolders(
+        patch.excludedFolders ?? previous.excludedFolders,
+        getConfigDir(this.app.vault),
+      ),
+    };
+    if (
+      previous.syncPluginFiles === candidate.syncPluginFiles
+      && previous.syncEditorSettings === candidate.syncEditorSettings
+      && previous.syncAppearance === candidate.syncAppearance
+      && previous.syncThemes === candidate.syncThemes
+      && previous.syncHotkeys === candidate.syncHotkeys
+      && previous.syncCorePlugins === candidate.syncCorePlugins
+      && previous.syncCommunityPlugins === candidate.syncCommunityPlugins
+      && previous.syncPluginData === candidate.syncPluginData
+      && previous.excludedFolders.length === candidate.excludedFolders.length
+      && previous.excludedFolders.every(
+        (path, index) => path === candidate.excludedFolders[index],
+      )
+    ) return;
+
+    await this.ensureStateLoaded();
+    if (this.syncExecutor?.hasActivityInFlight) {
+      throw new SyncPathSettingsUpdateError("busy");
+    }
+    if (
+      this.state?.hasMutationLedgerCorruption
+      || (this.state?.mutationLedger.length ?? 0) > 0
+    ) {
+      throw new SyncPathSettingsUpdateError("recovery");
+    }
+    const lockHolder = this.acquireOpLock("sync-path-settings");
+    if (lockHolder !== null) {
+      throw new SyncPathSettingsUpdateError("busy");
+    }
+
+    try {
+      if (!this.state || !this.scanner) {
+        throw new Error("Sync path state is unavailable");
+      }
+      await this.state.clearRemoteState();
+      this.publishSyncPathSettings(candidate);
+      await this.state.commitSyncPathSettingsChange(
+        (path) => this.scanner!.shouldSyncPath(path),
+        (data) => this.writeSyncPathSettingsData(data, candidate),
+      );
+      this.updateStatusBar();
+      this.syncView?.render();
+      this.settingsTab?.refreshSyncState();
+    } catch (error) {
+      this.publishSyncPathSettings(previous);
+      throw error;
+    } finally {
+      this.releaseOpLock();
+    }
+  }
+
+  async updateExcludedFolders(excludedFolders: readonly string[]): Promise<void> {
+    await this.updateSyncPathSettings({
+      excludedFolders: [...excludedFolders],
     });
   }
 
@@ -1313,8 +1447,8 @@ export default class EasySyncPlugin extends Plugin {
     this.settingsTab?.refreshSyncState();
   }
 
-  /** Build includePaths from all config sync toggles and apply to scanner. */
-  applyPluginFilesSetting(): void {
+  /** Apply the single effective local/remote path policy to the scanner. */
+  applySyncPathSettings(): void {
     const paths = new Set<string>();
     const { configDir, pluginDir } = getEasySyncPaths(this.app.vault, this.manifest.id);
     const pluginDirPrefix = `${pluginDir}/`;
@@ -1353,6 +1487,7 @@ export default class EasySyncPlugin extends Plugin {
 
     this.scanner?.setConfig({
       includePaths: [...paths],
+      excludedFolders: [...this.excludedFolders],
       includePluginCode: this.syncCommunityPlugins,
       includePluginData: this.syncPluginData,
     });
@@ -1450,6 +1585,13 @@ export default class EasySyncPlugin extends Plugin {
       [this.syncPluginFiles, "EasySync 插件文件"],
     ] as const;
     lines.push(`**已启用配置同步**: ${configSyncLabels.filter(([enabled]) => enabled).map(([, label]) => label).join("、") || "无"}`);
+    lines.push(`**本机同步排除**: ${this.excludedFolders.length} 个`);
+    if (this.excludedFolders.length > 0) {
+      lines.push("");
+      for (const path of this.excludedFolders) {
+        lines.push(`- \`${path.replace(/`/g, "\\`")}\``);
+      }
+    }
     lines.push("");
 
     // ── Sync History ──

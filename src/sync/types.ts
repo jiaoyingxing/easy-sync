@@ -215,6 +215,9 @@ export function sameSyncScope(left: SyncScope | null, right: SyncScope | null): 
 export interface ScanConfig {
   /** Paths to exclude from sync (glob-like prefixes) */
   excludePaths: string[];
+  /** Device-local vault-relative folders excluded from sync.
+   *  These exact folder boundaries take precedence over includePaths. */
+  excludedFolders?: string[];
   /** Paths that override exclusions. Checked before excludePaths —
    *  a path matching any includePath is never excluded. */
   includePaths: string[];
@@ -228,6 +231,7 @@ export interface ScanConfig {
 
 export const DEFAULT_SCAN_CONFIG: ScanConfig = {
   excludePaths: [".trash/", ".DS_Store", "Thumbs.db"],
+  excludedFolders: [],
   // M19: EasySync self-sync default OFF. Explicit opt-in via syncOwnPlugin setting
   // with anti-downgrade protection (manifest.json version comparison).
   includePaths: [],

@@ -536,6 +536,74 @@ describe("automatic non-overlapping text merge", () => {
   });
 });
 
+describe("device-local sync scope projection", () => {
+  it("passes only in-scope durable base entries to planning", async () => {
+    const includedBase: BaseFileEntry = {
+      path: "Notes/keep.md",
+      hash: "aa".repeat(32),
+      size: 10,
+      eTag: "etag-keep",
+    };
+    const excludedBase: BaseFileEntry = {
+      path: "Private/drop.md",
+      hash: "bb".repeat(32),
+      size: 11,
+      eTag: "etag-drop",
+    };
+    const generatePlan = vi.fn().mockReturnValue({
+      items: [],
+      lastTotalFiles: 0,
+      confirmed: false,
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive(),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        shouldSyncPath: vi.fn((path: string) => !path.startsWith("Private/")),
+      } as unknown as LocalScanner,
+      {
+        generatePlan,
+        shouldPauseForConfirmation: vi.fn().mockReturnValue(false),
+      } as unknown as SyncEngine,
+      {
+        ...remoteStateStub(),
+        baseSnapshot: [includedBase, excludedBase],
+        upsertBaseEntries: vi.fn().mockResolvedValue(undefined),
+        upsertPendingConflicts: vi.fn().mockResolvedValue(undefined),
+        prunePendingConflicts: vi.fn().mockResolvedValue(undefined),
+        upsertPendingDeletes: vi.fn().mockResolvedValue(undefined),
+        prunePendingDeletes: vi.fn().mockResolvedValue(undefined),
+        setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+        pendingConflicts: [],
+        pendingRemoteDeletes: [],
+        lastSyncTime: 0,
+      } as unknown as StateManager,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(generatePlan).toHaveBeenCalledWith(
+      [],
+      [],
+      [includedBase],
+      [],
+    );
+  });
+});
+
 // ---- P0.3: Full SHA-256 hash correctness ----
 
 describe("P0.3 — sha256Hex (full SHA-256)", () => {

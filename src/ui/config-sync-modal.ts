@@ -8,7 +8,11 @@
  * safe on mobile (no soft keyboard interference).
  */
 
-import { Modal, Setting } from "obsidian";
+import { Modal, Notice, Setting } from "obsidian";
+import {
+  SyncPathSettingsUpdateError,
+  type SyncPathSettings,
+} from "../main";
 import type EasySyncPlugin from "../main";
 
 export class ConfigSyncModal extends Modal {
@@ -19,38 +23,39 @@ export class ConfigSyncModal extends Modal {
   onOpen() {
     const { contentEl } = this;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    this.modalEl.addClass("easy-sync-settings-modal");
     contentEl.empty();
-    this.setTitle(t("settings.moreConfig.title"));
+    this.setTitle(t("settings.syncScope.title"));
 
     const toggles: Array<{
       key: string;
       get: () => boolean;
-      set: (v: boolean) => void;
+      patch: (value: boolean) => Partial<SyncPathSettings>;
     }> = [
       { key: "settings.syncPluginFiles",
         get: () => this.plugin.syncPluginFiles,
-        set: (v) => { this.plugin.syncPluginFiles = v; } },
+        patch: (value) => ({ syncPluginFiles: value }) },
       { key: "settings.syncEditor",
         get: () => this.plugin.syncEditorSettings,
-        set: (v) => { this.plugin.syncEditorSettings = v; } },
+        patch: (value) => ({ syncEditorSettings: value }) },
       { key: "settings.syncAppearance",
         get: () => this.plugin.syncAppearance,
-        set: (v) => { this.plugin.syncAppearance = v; } },
+        patch: (value) => ({ syncAppearance: value }) },
       { key: "settings.syncThemes",
         get: () => this.plugin.syncThemes,
-        set: (v) => { this.plugin.syncThemes = v; } },
+        patch: (value) => ({ syncThemes: value }) },
       { key: "settings.syncHotkeys",
         get: () => this.plugin.syncHotkeys,
-        set: (v) => { this.plugin.syncHotkeys = v; } },
+        patch: (value) => ({ syncHotkeys: value }) },
       { key: "settings.syncCorePlugins",
         get: () => this.plugin.syncCorePlugins,
-        set: (v) => { this.plugin.syncCorePlugins = v; } },
+        patch: (value) => ({ syncCorePlugins: value }) },
       { key: "settings.syncCommunityPlugins",
         get: () => this.plugin.syncCommunityPlugins,
-        set: (v) => { this.plugin.syncCommunityPlugins = v; } },
+        patch: (value) => ({ syncCommunityPlugins: value }) },
       { key: "settings.syncPluginData",
         get: () => this.plugin.syncPluginData,
-        set: (v) => { this.plugin.syncPluginData = v; } },
+        patch: (value) => ({ syncPluginData: value }) },
     ];
 
     for (const ct of toggles) {
@@ -61,9 +66,18 @@ export class ConfigSyncModal extends Modal {
           toggle
             .setValue(ct.get())
             .onChange(async (value) => {
-              ct.set(value);
-              await this.plugin.saveSyncSettings();
-              this.plugin.applyPluginFilesSetting();
+              const previous = ct.get();
+              try {
+                await this.plugin.updateSyncPathSettings(ct.patch(value));
+              } catch (error) {
+                toggle.setValue(previous);
+                const key = error instanceof SyncPathSettingsUpdateError
+                  ? error.code === "busy"
+                    ? "notice.syncPathSettings.busy"
+                    : "notice.syncPathSettings.recovery"
+                  : "notice.syncPathSettings.failed";
+                new Notice(t(key));
+              }
             });
         });
     }

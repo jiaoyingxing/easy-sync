@@ -43,6 +43,66 @@ const COMMUNITY_PLUGIN_CODE_FILES = new Set([
   "styles.css",
 ]);
 
+function normalizeVaultRelativePath(value: string): string {
+  return value
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+}
+
+/** Normalize the persisted device-local folder scope.
+ *  Invalid/root/config paths are ignored; parent folders subsume descendants. */
+export function normalizeExcludedFolders(
+  values: readonly unknown[],
+  configDir = DEFAULT_CONFIG_DIR,
+): string[] {
+  const normalizedConfigDir = normalizeVaultRelativePath(configDir).toLowerCase();
+  const unique = new Map<string, string>();
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const path = normalizeVaultRelativePath(value);
+    if (!path || path === ".") continue;
+    const segments = path.split("/");
+    if (segments.some((segment) => segment === "." || segment === "..")) continue;
+    const key = path.toLowerCase();
+    if (
+      normalizedConfigDir
+      && (key === normalizedConfigDir || key.startsWith(`${normalizedConfigDir}/`))
+    ) continue;
+    if (!unique.has(key)) unique.set(key, path);
+  }
+
+  const byParentFirst = [...unique.values()].sort((left, right) =>
+    left.split("/").length - right.split("/").length
+    || left.length - right.length
+    || left.localeCompare(right),
+  );
+  const collapsed: string[] = [];
+  for (const path of byParentFirst) {
+    const key = path.toLowerCase();
+    if (collapsed.some((parent) => {
+      const parentKey = parent.toLowerCase();
+      return key === parentKey || key.startsWith(`${parentKey}/`);
+    })) continue;
+    collapsed.push(path);
+  }
+  return collapsed.sort((left, right) => left.localeCompare(right));
+}
+
+export function isPathExcludedByFolders(
+  path: string,
+  excludedFolders: readonly string[] | undefined,
+): boolean {
+  if (!excludedFolders?.length) return false;
+  const normalizedPath = normalizeVaultRelativePath(path).toLowerCase();
+  return excludedFolders.some((folder) => {
+    const normalizedFolder = normalizeVaultRelativePath(folder).toLowerCase();
+    return normalizedPath === normalizedFolder
+      || normalizedPath.startsWith(`${normalizedFolder}/`);
+  });
+}
+
 export function isEasySyncInternalPath(
   path: string,
   configDir = DEFAULT_CONFIG_DIR,
@@ -90,6 +150,7 @@ function isBinary(content: ArrayBuffer): boolean {
 function isExcluded(path: string, config: ScanConfig, configDir: string, pluginId: string): boolean {
   const paths = getEasySyncPaths(configDir, pluginId);
   if (isEasySyncInternalPath(path, configDir, pluginId)) return true;
+  if (isPathExcludedByFolders(path, config.excludedFolders)) return true;
 
   if (
     path.startsWith(paths.pluginRoot)
@@ -125,6 +186,7 @@ function isExcludedDirectory(path: string, config: ScanConfig, configDir: string
     || path === paths.ancestorsV2Dir
     || path.startsWith(`${paths.ancestorsV2Dir}/`)
   ) return true;
+  if (isPathExcludedByFolders(path, config.excludedFolders)) return true;
 
   if (
     path.startsWith(paths.pluginRoot)
@@ -162,9 +224,19 @@ export class LocalScanner {
   ) {
     this.vault = vault;
     this.configDir = getConfigDir(vault);
-    this.config = { ...DEFAULT_SCAN_CONFIG, ...config };
-    this.config.excludePaths = config.excludePaths
-      ?? [`${this.configDir}/`, ...DEFAULT_SCAN_CONFIG.excludePaths];
+    this.config = {
+      ...DEFAULT_SCAN_CONFIG,
+      ...config,
+      includePaths: [...(config.includePaths ?? DEFAULT_SCAN_CONFIG.includePaths)],
+      excludedFolders: normalizeExcludedFolders(
+        config.excludedFolders ?? DEFAULT_SCAN_CONFIG.excludedFolders ?? [],
+        this.configDir,
+      ),
+    };
+    this.config.excludePaths = [
+      ...(config.excludePaths
+        ?? [`${this.configDir}/`, ...DEFAULT_SCAN_CONFIG.excludePaths]),
+    ];
   }
 
   setDiag(diag: DiagnosticLogger): void {
@@ -172,7 +244,20 @@ export class LocalScanner {
   }
 
   setConfig(config: Partial<ScanConfig>): void {
-    this.config = { ...this.config, ...config };
+    this.config = {
+      ...this.config,
+      ...config,
+      ...(config.includePaths ? { includePaths: [...config.includePaths] } : {}),
+      ...(config.excludePaths ? { excludePaths: [...config.excludePaths] } : {}),
+      ...(config.excludedFolders
+        ? {
+            excludedFolders: normalizeExcludedFolders(
+              config.excludedFolders,
+              this.configDir,
+            ),
+          }
+        : {}),
+    };
   }
 
   getMaxFileSize(): number {
@@ -298,12 +383,16 @@ export class LocalScanner {
       };
     }
     let fileCount = 0;
+    let skippedCount = 0;
 
     for (const file of allFiles) {
       const path = file.path;
       scannedPaths.add(path);
 
       if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
+        if (!isPathExcludedByFolders(path, this.config.excludedFolders)) {
+          skippedCount++;
+        }
         continue;
       }
 
@@ -369,7 +458,7 @@ export class LocalScanner {
       entries,
       skippedLarge,
       failedPaths,
-      skippedCount: allFiles.length - entries.length - skippedLarge.length - failedPaths.length,
+      skippedCount,
       complete: failedPaths.length === 0,
     };
   }
