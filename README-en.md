@@ -19,21 +19,19 @@
   <strong>Language:</strong> <a href="./README.md"><strong>简体中文</strong></a> · <strong>English</strong>
 </p>
 
-**Obsidian sync across devices—simple, clear, and under your control.**
+EasySync keeps your Obsidian notes and attachments in sync across computers, phones, and tablets. Themes, hotkeys, plugins, and other Obsidian data are optional. Install the plugin, sign in to OneDrive, and start syncing in about two minutes.
 
-EasySync keeps notes and attachments in sync across computers, phones, and tablets. Obsidian settings, themes, hotkeys, and plugins are optional. No server setup is required—just sign in to your own OneDrive.
+- Safe and controlled: changes confirmed as safe are handled automatically; conflicts support per-line comparison and remain your decision.
 
-- Changes confirmed as safe are handled automatically; conflicts support per-line comparison.
+- Clear throughout: sync status, progress, and history stay visible in a dedicated sidebar.
 
-- Sync status, progress, and history are collected in a dedicated sidebar.
+- Flexible scope: auto sync and optional editor settings, appearance, themes, hotkeys, and plugins can be controlled separately.
 
-- Auto sync and each category of optional configuration sync can be controlled separately.
+- Supports Windows, macOS, Linux, iOS, and Android, with fast startup and sync.
 
-Supports Windows, macOS, Linux, iOS, and Android.
+## 1. Install and set up your first sync
 
-## Install and set up your first sync
-
-### 1. Install the plugin
+### 1.1 Install the plugin
 
 In Obsidian, open:
 
@@ -49,9 +47,8 @@ For manual installation, download `main.js`, `manifest.json`, and `styles.css` f
 
 Enable EasySync in Obsidian afterward.
 
-### 2. Prepare the local vault
+### 1.2 Prepare the local vault
 
-> [!IMPORTANT]
 > When using EasySync, do not place the same Obsidian vault inside a folder already managed by OneDrive, iCloud Drive, Dropbox, Syncthing, or another sync tool.
 
 If EasySync and another sync tool both modify the same files, you may get conflict copies, duplicate uploads, restored deletions, or incorrect sync decisions.
@@ -62,7 +59,7 @@ Recommended setup:
 - Let EasySync be the only tool managing cross-device sync for that vault.
 - Keep an independent backup of important vaults before the first sync.
 
-### 3. Sign in to OneDrive
+### 1.3 Sign in to OneDrive
 
 Open:
 
@@ -70,7 +67,7 @@ Open:
 
 Complete Microsoft sign-in in your browser, then return to Obsidian.
 
-### 4. Use the same vault name on every device
+### 1.4 Use the same vault name on every device
 
 EasySync uses the vault name to identify its cloud sync space.
 
@@ -82,7 +79,7 @@ My Notes
 
 Create or open a vault named “My Notes” on your phone as well. A different name is treated as a separate sync space.
 
-### 5. Run the first sync
+### 1.5 Run the first sync
 
 Start with the device that has the most complete copy of your vault. Select **Sync now**, wait for the upload to finish, and then sync the other devices.
 
@@ -95,7 +92,7 @@ If a new device has no content yet:
 
 The first sync scans the vault, hashes its files, and establishes a shared baseline. Large vaults or slower networks will take longer than later syncs.
 
-## Recommended settings
+## 2. Recommended settings
 
 Basic sync needs no extra configuration: notes and attachments in the vault are included by default.
 
@@ -103,8 +100,8 @@ Enable other options only when you need them:
 
 | Setting | Recommendation |
 | --- | --- |
-| More settings | Enable only the editor, appearance, theme, hotkey, or plugin content that should match across devices |
-| Community plugins | Syncs plugin code and the enabled list; plugin `data.json` files require the separate “Community plugin data” option |
+| Sync scope | Editor settings, appearance, themes, hotkeys, core plugins, community plugins, and other optional content can be controlled separately |
+| Community plugins | Plugin code and the enabled list are controlled by “Community plugins”; each plugin’s `data.json` is controlled separately by “Community plugin data” |
 | EasySync self-sync | Off by default; enable it only if EasySync updates should propagate to other devices |
 | Auto sync | Runs at the configured interval; when disabled, **Sync now** remains available |
 | Merge non-overlapping text changes | On by default; conflicts remain manual whenever safety cannot be proven |
@@ -113,7 +110,9 @@ Enable other options only when you need them:
 
 Settings apply to the current vault only and do not automatically change other vaults.
 
-## Where the cloud files are stored
+## 3. Data and permissions in OneDrive
+
+### 3.1 Where the cloud files are stored
 
 EasySync stores each vault separately inside its OneDrive app folder:
 
@@ -133,22 +132,45 @@ The sibling `.easy-sync` directory stores sync state. Do not manually edit, move
 
 > These are cloud copies managed by EasySync. Their presence in OneDrive does not mean that your local Obsidian vault should be moved into a OneDrive-synced folder.
 
-## What EasySync does
+### 3.2 How data is transferred
+
+Synced files remain in your own OneDrive account. EasySync connects directly to Microsoft sign-in and Microsoft Graph without a third-party relay server.
+
+The current Microsoft permissions include:
+
+- `Files.ReadWrite.AppFolder`: read and write EasySync’s OneDrive app folder.
+- `Files.Read`: read and download files.
+- Basic identity and offline access: identify the active account and maintain sign-in.
+
+EasySync limits its sync paths to its own app folder:
+
+```text
+Apps/EasySync/
+```
+
+The plugin contains no telemetry, advertising, or behavioral analytics. Diagnostic logs stay in the local plugin directory by default. A diagnostic report is written to the vault only when you explicitly generate one.
+
+The source is published on GitHub for review.
+
+### 3.3 Recycle Bin and backup boundary
+
+If a file is deleted from OneDrive, you may be able to recover it from the OneDrive Recycle Bin according to your account policy. Neither the Recycle Bin nor sync history replaces an independent backup; keep important content in a location that is not managed by EasySync or another sync tool.
+
+## 4. What EasySync does
 
 - Two-way sync for Markdown, images, audio, PDFs, and other vault files.
-- The same sync model on desktop and mobile.
 - Content hashes for change detection instead of relying only on timestamps.
+- Rechecks file contents before upload; if a file changes after scanning, that file is deferred instead of uploading the scanned version.
+- Records recoverable state before replacing a local file during download; after an interruption, EasySync restores the original or preserves a newer local version for another decision.
+- Leaves remote deletions pending by default; they are applied locally automatically only when the local file has not changed since the shared baseline and you enabled the corresponding automatic handling option.
 - Automatic merging of non-overlapping text edits that share a trusted baseline.
 - Per-line diffs for text conflicts that cannot be handled safely.
 - File size and modification time for binary conflicts such as images and PDFs.
 - Persistent sidebar status for progress, conflicts, and pending decisions.
 - Queueing and progress for handling several conflicts or decisions in sequence.
-- Batch confirmation for remote deletions.
 - Chunked uploads for large files.
-- Recovery copies before a download overwrites a local file.
-- One-click local Markdown diagnostic reports.
 
-## How conflicts are handled
+## 5. How conflicts are handled
 
 EasySync records the last successfully synced content and evaluates local and remote changes against that shared baseline.
 
@@ -170,27 +192,7 @@ Cases like these normally require your decision:
 
 EasySync does not overwrite one side merely because a file appears to be newer.
 
-## Data and privacy
-
-Synced files remain in your own OneDrive account. EasySync connects directly to Microsoft sign-in and Microsoft Graph without a third-party relay server.
-
-The current Microsoft permissions include:
-
-- `Files.ReadWrite.AppFolder`: read and write EasySync’s OneDrive app folder.
-- `Files.Read`: read and download files.
-- Basic identity and offline access: identify the active account and maintain sign-in.
-
-EasySync limits its sync paths to its own app folder:
-
-```text
-Apps/EasySync/
-```
-
-The plugin contains no telemetry, advertising, or behavioral analytics. Diagnostic logs stay in the local plugin directory by default. A diagnostic report is written to the vault only when you explicitly generate one.
-
-The source is published on GitHub for review.
-
-## Usage boundaries
+## 6. Usage boundaries
 
 EasySync is a cross-device file sync tool, not a real-time collaboration service.
 
@@ -203,23 +205,15 @@ Keep these limits in mind:
 - Automatic handling runs only when all safety conditions are satisfied; otherwise, the operation stops or becomes a manual decision.
 - Sync is not a substitute for an independent backup. Back up important data regularly.
 
-If a file is deleted from OneDrive, you may also be able to recover it from the OneDrive recycle bin according to your account policy.
-
-## Troubleshooting
+## 7. Troubleshooting
 
 Start by generating a **Diagnostic report** from EasySync settings.
 
-When reporting an issue, include:
-
-- EasySync version.
-- Obsidian version.
-- Operating system or mobile device type.
-- The steps immediately before and after the issue.
-- A redacted EasySync diagnostic report.
+When reporting an issue, include the complete EasySync diagnostic report.
 
 Report issues through [GitHub Issues](https://github.com/jiaoyingxing/easy-sync/issues).
 
-## License
+## 8. License
 
 EasySync is source-available: the source is published for review and learning, but it is not distributed under an open-source license.
 
