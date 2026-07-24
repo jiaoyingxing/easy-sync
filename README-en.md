@@ -215,6 +215,4 @@ Report issues through [GitHub Issues](https://github.com/jiaoyingxing/easy-sync/
 
 ## 8. License
 
-EasySync is source-available: the source is published for review and learning, but it is not distributed under an open-source license.
-
-See [LICENSE](LICENSE) for the full terms.
+EasySync is open source under the [MIT License](LICENSE).
