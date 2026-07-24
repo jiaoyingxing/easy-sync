@@ -211,6 +211,4 @@ EasySync 是跨设备文件同步工具，不是多人实时协作系统。
 
 ## 8. 许可
 
-EasySync 采用 source-available 许可：源码开放供审查和学习，但不属于开放源代码授权。
-
-完整条款见 [LICENSE](LICENSE)。
+EasySync 采用 [MIT License](LICENSE) 开源。

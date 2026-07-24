@@ -24,7 +24,7 @@
   "bugs": {
     "url": "https://github.com/jiaoyingxing/easy-sync/issues"
   },
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "MIT",
   "devDependencies": {
     "@types/node": "^26.1.0",
     "esbuild": "^0.24.0",
