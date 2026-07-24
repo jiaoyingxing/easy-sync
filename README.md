@@ -19,7 +19,7 @@
   <strong>阅读语言：</strong> <strong>简体中文</strong> · <a href="./README-en.md"><strong>English</strong></a>
 </p>
 
-EasySync 让你在电脑、手机和平板之间轻松同步Obsidian的笔记和附件。主题、快捷键、插件等内容可按需开启。安装，登录 OneDrive 即可开始使用，2分钟完成部署。
+EasySync 让你在电脑、手机和平板之间轻松同步Obsidian的笔记和附件。主题、快捷键、插件等内容可按需开启。安装插件后，登录OneDrive即可开始使用，2分钟完成部署。
 
 - 安全可控：安全的变更可自动处理；冲突支持逐行比较，由你决定。
 
