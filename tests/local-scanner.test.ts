@@ -74,6 +74,7 @@ function makeScanner(includePluginCode: boolean, includePluginData: boolean) {
   };
 
   const adapter = {
+    exists: vi.fn(async () => true),
     list: vi.fn(async (path: string) => directories[path] ?? { files: [], folders: [] }),
     stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
     readBinary: vi.fn(async () => content),
@@ -332,6 +333,7 @@ describe("Preflight P0 — Included path failures make the scan incomplete", () 
 
   it("records an included directory traversal failure", async () => {
     const adapter = {
+      exists: vi.fn(async () => true),
       list: vi.fn(async () => {
         throw new Error("simulated list failure");
       }),
@@ -350,9 +352,60 @@ describe("Preflight P0 — Included path failures make the scan incomplete", () 
     expect(result.complete).toBe(false);
   });
 
+  it("treats an explicitly included directory that does not exist as a healthy empty scope", async () => {
+    const missingPath = ".obsidian/snippets";
+    const adapter = {
+      exists: vi.fn(async (path: string) => path !== missingPath),
+      list: vi.fn(async (path: string) => {
+        if (path === ".obsidian/themes") return { files: [], folders: [] };
+        throw Object.assign(new Error("no such file"), { code: "ENOENT" });
+      }),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      ...config,
+      includePaths: [".obsidian/themes/", ".obsidian/snippets/"],
+    });
+
+    const result = await scanner.scanAll();
+
+    expect(result.failedPaths).toEqual([]);
+    expect(result.complete).toBe(true);
+    expect(adapter.list).not.toHaveBeenCalledWith(missingPath);
+    expect(scanner.shouldSyncPath(".obsidian/snippets/mobile.css")).toBe(true);
+  });
+
+  it("keeps the scan incomplete when an included directory existence check fails", async () => {
+    const adapter = {
+      exists: vi.fn(async () => {
+        throw new Error("simulated existence check failure");
+      }),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, config);
+
+    const result = await scanner.scanAll();
+
+    expect(result.failedPaths).toContain(".obsidian/plugins");
+    expect(result.complete).toBe(false);
+    expect(adapter.list).not.toHaveBeenCalled();
+  });
+
   it("records a stat failure for a file found during included traversal", async () => {
     const path = ".obsidian/plugins/example-plugin/main.js";
     const adapter = {
+      exists: vi.fn(async () => true),
       list: vi.fn(async () => ({ files: [path], folders: [] })),
       stat: vi.fn(async () => null),
       readBinary: vi.fn(async () => content),
@@ -409,6 +462,7 @@ describe("Preflight P0 — Included path failures make the scan incomplete", () 
   it("records a content read failure for an included file", async () => {
     const path = ".obsidian/plugins/example-plugin/main.js";
     const adapter = {
+      exists: vi.fn(async () => true),
       list: vi.fn(async () => ({ files: [path], folders: [] })),
       stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
       readBinary: vi.fn(async () => { throw new Error("simulated read failure"); }),
@@ -427,6 +481,7 @@ describe("Preflight P0 — Included path failures make the scan incomplete", () 
   it("records the exact uncertain subtree when nested traversal fails", async () => {
     const nested = ".obsidian/plugins/example-plugin";
     const adapter = {
+      exists: vi.fn(async () => true),
       list: vi.fn(async (path: string) => {
         if (path === ".obsidian/plugins") return { files: [], folders: [nested] };
         throw new Error("nested list failure");
@@ -448,6 +503,7 @@ describe("Preflight P0 — Included path failures make the scan incomplete", () 
   it("does not mark an excluded plugin data file as uncertain", async () => {
     const excludedPath = ".obsidian/plugins/example-plugin/data.json";
     const adapter = {
+      exists: vi.fn(async () => true),
       list: vi.fn(async () => ({ files: [excludedPath], folders: [] })),
       stat: vi.fn(async () => { throw new Error("must not stat excluded path"); }),
       readBinary: vi.fn(async () => content),
@@ -466,6 +522,7 @@ describe("Preflight P0 — Included path failures make the scan incomplete", () 
 
   it("does not prune or persist the scan cache after an incomplete traversal", async () => {
     const adapter = {
+      exists: vi.fn(async () => true),
       read: vi.fn(async () => JSON.stringify({
         format: 1,
         entries: {

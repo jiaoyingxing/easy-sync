@@ -477,7 +477,15 @@ export class LocalScanner {
   ): Promise<void> {
     for (const prefix of this.config.includePaths) {
       if (prefix.endsWith("/")) {
-        await this.scanDir(prefix, entries, skippedLarge, failedPaths, scannedPaths, scannedDirs);
+        await this.scanDir(
+          prefix,
+          entries,
+          skippedLarge,
+          failedPaths,
+          scannedPaths,
+          scannedDirs,
+          true,
+        );
       } else {
         await this.scanSinglePath(prefix, entries, skippedLarge, failedPaths, scannedPaths);
       }
@@ -548,11 +556,30 @@ export class LocalScanner {
     failedPaths: string[],
     scannedPaths: Set<string>,
     scannedDirs: Set<string>,
+    allowMissingRoot = false,
   ): Promise<void> {
     // Normalize: strip trailing slash(es) so path construction is clean
     const base = dirPath.replace(/\/+$/, "");
     if (scannedDirs.has(base) || isExcludedDirectory(base, this.config, this.configDir, this.pluginId)) return;
     scannedDirs.add(base);
+
+    // Explicitly included config directories such as themes/ and snippets/
+    // are optional and may not exist yet. A confirmed absence is a complete,
+    // empty local subtree; an uncertain existence check must still fail closed.
+    if (allowMissingRoot) {
+      let exists: boolean;
+      try {
+        exists = await this.vault.adapter.exists(base);
+      } catch (error) {
+        this.diag?.warn("scan", `scanDir("${base}") — existence check failed`, error);
+        failedPaths.push(base);
+        return;
+      }
+      if (!exists) {
+        this.diag?.log("scan", `scanDir("${base}") → directory absent, treating as empty`);
+        return;
+      }
+    }
 
     let listed: { files: string[]; folders: string[] };
     try {
