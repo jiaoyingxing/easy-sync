@@ -212,6 +212,9 @@ export function sameSyncScope(left: SyncScope | null, right: SyncScope | null): 
 
 // ---- Scan Configuration ----
 
+/** Plugin sync granularity mode */
+export type PluginSyncMode = "all" | "whitelist" | "blacklist";
+
 export interface ScanConfig {
   /** Paths to exclude from sync (glob-like prefixes) */
   excludePaths: string[];
@@ -227,6 +230,10 @@ export interface ScanConfig {
   includePluginCode?: boolean;
   /** Include community plugin data.json files under the vault config dir plugin area. */
   includePluginData?: boolean;
+  /** Plugin-level sync granularity: "all" (default, sync all), "whitelist" (only synced if in list), "blacklist" (synced unless in list). */
+  pluginSyncMode?: PluginSyncMode;
+  /** Plugin IDs affected by pluginSyncMode. Ignored when mode is "all". */
+  pluginSyncList?: string[];
 }
 
 export const DEFAULT_SCAN_CONFIG: ScanConfig = {
@@ -238,6 +245,8 @@ export const DEFAULT_SCAN_CONFIG: ScanConfig = {
   maxFileSize: 500 * 1024 * 1024,
   includePluginCode: false,
   includePluginData: false,
+  pluginSyncMode: "all",
+  pluginSyncList: [],
 };
 
 // ---- Change Threshold ----

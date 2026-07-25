@@ -45,7 +45,7 @@ import {
 } from "./ui/ribbon-status";
 import { SyncPlanAlertModal } from "./ui/confirm-modal";
 import type { PlanReviewAuthorization, SyncPlan } from "./sync/types";
-import { SyncActionType } from "./sync/types";
+import { SyncActionType, type PluginSyncMode } from "./sync/types";
 import { I18n } from "./i18n/index";
 import { OperationLifecycle } from "./sync/operation-lifecycle";
 import { EasySyncNoticeCenter, NOTICE_PRIORITY } from "./ui/notice-center";
@@ -90,6 +90,12 @@ const KEY_SYNC_CORE_PLUGINS = "sync-core-plugins";
 const KEY_SYNC_COMMUNITY_PLUGINS = "sync-community-plugins";
 const KEY_SYNC_PLUGIN_DATA = "sync-plugin-data";
 const KEY_SYNC_EXCLUDED_FOLDERS = "sync-excluded-folders";
+const KEY_SYNC_PLUGIN_MODE = "sync-plugin-mode";
+const KEY_SYNC_PLUGIN_LIST = "sync-plugin-list";
+
+function isPluginSyncMode(value: unknown): value is PluginSyncMode {
+  return value === "all" || value === "whitelist" || value === "blacklist";
+}
 const KEY_AUTO_SYNC_PAUSED = "auto-sync-paused";
 const KEY_LEGACY_AUTO_MERGE = "sync-auto-merge";
 const KEY_AUTOMATIC_HANDLING_POLICY = "sync-auto-conflict-policy";
@@ -108,6 +114,8 @@ export interface SyncPathSettings {
   syncCommunityPlugins: boolean;
   syncPluginData: boolean;
   excludedFolders: string[];
+  pluginSyncMode: PluginSyncMode;
+  pluginSyncList: string[];
 }
 
 export class SyncPathSettingsUpdateError extends Error {
@@ -176,6 +184,8 @@ export default class EasySyncPlugin extends Plugin {
   syncCommunityPlugins = false;
   syncPluginData = false;
   excludedFolders: string[] = [];
+  pluginSyncMode: PluginSyncMode = "all";
+  pluginSyncList: string[] = [];
   diagLogEnabled = false;
   autoSyncPaused = false;
   private opLock: string | null = null;
@@ -1224,6 +1234,8 @@ export default class EasySyncPlugin extends Plugin {
           : [],
         getConfigDir(this.app.vault),
       );
+      if (typeof data[KEY_SYNC_PLUGIN_MODE] === "string" && isPluginSyncMode(data[KEY_SYNC_PLUGIN_MODE])) this.pluginSyncMode = data[KEY_SYNC_PLUGIN_MODE];
+      if (Array.isArray(data[KEY_SYNC_PLUGIN_LIST])) this.pluginSyncList = data[KEY_SYNC_PLUGIN_LIST] as string[];
       if (typeof data[KEY_AUTO_SYNC_PAUSED] === "boolean") this.autoSyncPaused = data[KEY_AUTO_SYNC_PAUSED];
       if (typeof data[KEY_MAX_FILE_SIZE_MB] === "number") this.syncMaxFileSizeMb = data[KEY_MAX_FILE_SIZE_MB];
       this.automaticHandlingPolicy = readAutomaticHandlingPolicy(
@@ -1327,6 +1339,8 @@ export default class EasySyncPlugin extends Plugin {
       syncCommunityPlugins: this.syncCommunityPlugins,
       syncPluginData: this.syncPluginData,
       excludedFolders: [...this.excludedFolders],
+      pluginSyncMode: this.pluginSyncMode,
+      pluginSyncList: [...this.pluginSyncList],
     };
   }
 
@@ -1343,6 +1357,8 @@ export default class EasySyncPlugin extends Plugin {
     data[KEY_SYNC_COMMUNITY_PLUGINS] = settings.syncCommunityPlugins;
     data[KEY_SYNC_PLUGIN_DATA] = settings.syncPluginData;
     data[KEY_SYNC_EXCLUDED_FOLDERS] = [...settings.excludedFolders];
+    data[KEY_SYNC_PLUGIN_MODE] = settings.pluginSyncMode;
+    data[KEY_SYNC_PLUGIN_LIST] = [...settings.pluginSyncList];
   }
 
   private publishSyncPathSettings(settings: Readonly<SyncPathSettings>): void {
@@ -1355,6 +1371,8 @@ export default class EasySyncPlugin extends Plugin {
     this.syncCommunityPlugins = settings.syncCommunityPlugins;
     this.syncPluginData = settings.syncPluginData;
     this.excludedFolders = [...settings.excludedFolders];
+    this.pluginSyncMode = settings.pluginSyncMode;
+    this.pluginSyncList = [...settings.pluginSyncList];
     this.applySyncPathSettings();
   }
 
@@ -1382,6 +1400,11 @@ export default class EasySyncPlugin extends Plugin {
       && previous.excludedFolders.length === candidate.excludedFolders.length
       && previous.excludedFolders.every(
         (path, index) => path === candidate.excludedFolders[index],
+      )
+      && previous.pluginSyncMode === candidate.pluginSyncMode
+      && previous.pluginSyncList.length === candidate.pluginSyncList.length
+      && previous.pluginSyncList.every(
+        (id, index) => id === candidate.pluginSyncList[index],
       )
     ) return;
 
@@ -1490,6 +1513,8 @@ export default class EasySyncPlugin extends Plugin {
       excludedFolders: [...this.excludedFolders],
       includePluginCode: this.syncCommunityPlugins,
       includePluginData: this.syncPluginData,
+      pluginSyncMode: this.pluginSyncMode,
+      pluginSyncList: [...this.pluginSyncList],
     });
   }
 

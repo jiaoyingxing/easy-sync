@@ -93,6 +93,14 @@ export interface LocaleStrings {
   "settings.syncCommunityPlugins.desc": string;
   "settings.syncPluginData.name": string;
   "settings.syncPluginData.desc": string;
+  "settings.pluginSyncMode.name": string;
+  "settings.pluginSyncMode.desc": string;
+  "settings.pluginSyncMode.all": string;
+  "settings.pluginSyncMode.whitelist": string;
+  "settings.pluginSyncMode.blacklist": string;
+  "settings.pluginSyncMode.pluginList": string;
+  "settings.pluginSyncMode.noPlugins": string;
+  "settings.pluginSyncMode.depHint": string;
   "settings.diagLog.name": string;
   "settings.diagLog.desc": string;
   "settings.diagReport.name": string;

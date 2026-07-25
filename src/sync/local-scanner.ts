@@ -159,7 +159,20 @@ function isExcluded(path: string, config: ScanConfig, configDir: string, pluginI
   ) {
     const parts = path.slice(paths.pluginRoot.length).split("/");
     if (parts.length !== 2) return true;
+    const pluginId = parts[0];
     const fileName = parts[1];
+
+    // Per-plugin sync granularity (code files only; data.json uses
+    // the global includePluginData toggle for simplicity).
+    if (fileName !== "data.json" && config.includePluginCode) {
+      if (config.pluginSyncMode === "whitelist" && !(config.pluginSyncList ?? []).includes(pluginId)) {
+        return true;
+      }
+      if (config.pluginSyncMode === "blacklist" && (config.pluginSyncList ?? []).includes(pluginId)) {
+        return true;
+      }
+    }
+
     if (fileName === "data.json") return !config.includePluginData;
     return !config.includePluginCode
       || !COMMUNITY_PLUGIN_CODE_FILES.has(fileName);
