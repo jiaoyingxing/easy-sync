@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { I18n } from "../src/i18n";
 import type { SyncProgressState } from "../src/sync/sync-progress";
 import { SyncActionType } from "../src/sync/types";
+import { resolveSyncActionPresentation } from "../src/sync/sync-action-presentation";
 import {
   resolveSyncActivityPresentation,
   translateSyncActivity,
@@ -59,7 +60,7 @@ describe("sync activity presentation", () => {
       currentActionType: SyncActionType.Download,
     }))).toEqual({
       kind: "downloading",
-      labelKey: "syncView.active.download",
+      labelKey: "syncAction.download.active",
     });
 
     expect(resolveSyncActivityPresentation(progress({
@@ -67,7 +68,7 @@ describe("sync activity presentation", () => {
       currentActionType: SyncActionType.RenameRemote,
     }))).toEqual({
       kind: "renaming",
-      labelKey: "syncView.active.rename",
+      labelKey: "syncAction.renameRemote.active",
     });
 
     expect(resolveSyncActivityPresentation(progress({
@@ -75,8 +76,21 @@ describe("sync activity presentation", () => {
       currentActionType: SyncActionType.DeleteLocal,
     }))).toEqual({
       kind: "deleting",
-      labelKey: "syncView.active.delete",
+      labelKey: "syncAction.deleteLocal.active",
     });
+  });
+
+  it("uses the exact action mapping for every executing action", () => {
+    for (const type of Object.values(SyncActionType)) {
+      const action = resolveSyncActionPresentation(type);
+      expect(resolveSyncActivityPresentation(progress({
+        phase: "executing",
+        currentActionType: type,
+      }))).toEqual({
+        kind: action.activityKind,
+        labelKey: action.activeLabelKey,
+      });
+    }
   });
 
   it("gives cancellation priority and translates through the existing locale", () => {
@@ -93,5 +107,24 @@ describe("sync activity presentation", () => {
     const i18n = new I18n("zh-cn");
     expect(translateSyncActivity(presentation, i18n.t.bind(i18n)))
       .toBe("正在取消…");
+  });
+
+  it("shows recovery as its own running activity while keeping cancellation authoritative", () => {
+    expect(resolveSyncActivityPresentation(progress({
+      phase: "checking",
+      activityKind: "mutationRecovery",
+    }))).toEqual({
+      kind: "recovery",
+      labelKey: "progress.recoveringMutation",
+    });
+
+    expect(resolveSyncActivityPresentation(progress({
+      phase: "checking",
+      activityKind: "mutationRecovery",
+      cancelRequested: true,
+    }))).toEqual({
+      kind: "cancelling",
+      labelKey: "syncView.cancelling",
+    });
   });
 });

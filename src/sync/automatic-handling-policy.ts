@@ -1,6 +1,6 @@
 import { SyncActionType, type SyncPlanItem } from "./types";
 import { isTextFile } from "./base-content-cache";
-import { isObsidianManagedConfigPath } from "./sync-engine";
+import { isObsidianManagedConfigPath } from "./file-decision-planner-v2";
 
 /** User choices that authorize otherwise manual sync actions. */
 export interface AutomaticHandlingPolicy {

@@ -48,7 +48,7 @@ describe("V1 to V2 migration preflight model", () => {
     expect(result.mutations).toEqual([]);
   });
 
-  it("seeds a cloud-only hint only after current local hash and remote id/hash both verify", () => {
+  it("seeds a cloud-only hint from local SHA and a cTag-bound remote identity", () => {
     const result = simulateV1ToV2Migration(migrationCase("cloud-baseline-only"));
     expect(result.publishedEnvelope?.anchors.byAnchorId["cloud:remote-cloud"]).toMatchObject({
       contentHash: "bb".repeat(32),

@@ -1,6 +1,9 @@
 import type { LocaleStrings } from "../i18n/types";
 import type { SyncProgressState } from "../sync/sync-progress";
-import { SyncActionType } from "../sync/types";
+import {
+  resolveSyncActionPresentation,
+  type SyncActionActivityKind,
+} from "../sync/sync-action-presentation";
 
 export type SyncActivityKind =
   | "starting"
@@ -10,11 +13,9 @@ export type SyncActivityKind =
   | "checking"
   | "planning"
   | "verifying"
+  | "recovery"
   | "syncing"
-  | "uploading"
-  | "downloading"
-  | "deleting"
-  | "renaming"
+  | SyncActionActivityKind
   | "cancelling";
 
 export interface SyncActivityPresentation {
@@ -39,6 +40,12 @@ export function resolveSyncActivityPresentation(
   if (progress.cancelRequested) {
     return { kind: "cancelling", labelKey: "syncView.cancelling" };
   }
+  if (progress.activityKind === "mutationRecovery") {
+    return {
+      kind: "recovery",
+      labelKey: "progress.recoveringMutation",
+    };
+  }
 
   switch (progress.phase) {
     case "scanning":
@@ -58,19 +65,14 @@ export function resolveSyncActivityPresentation(
         params: { current: progress.current, total: progress.total },
       };
     case "executing":
-      switch (progress.currentActionType) {
-        case SyncActionType.Upload:
-          return { kind: "uploading", labelKey: "syncView.active.upload" };
-        case SyncActionType.Download:
-          return { kind: "downloading", labelKey: "syncView.active.download" };
-        case SyncActionType.DeleteRemote:
-        case SyncActionType.DeleteLocal:
-          return { kind: "deleting", labelKey: "syncView.active.delete" };
-        case SyncActionType.RenameRemote:
-          return { kind: "renaming", labelKey: "syncView.active.rename" };
-        default:
-          return { kind: "syncing", labelKey: "syncView.progress" };
+      if (progress.currentActionType) {
+        const action = resolveSyncActionPresentation(progress.currentActionType);
+        return {
+          kind: action.activityKind,
+          labelKey: action.activeLabelKey,
+        };
       }
+      return { kind: "syncing", labelKey: "syncView.progress" };
     case "idle":
     case "done":
     default:

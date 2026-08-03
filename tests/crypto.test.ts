@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { sha256Hex } from "../src/crypto";
+import { quickXorHashBase64, sha256Hex } from "../src/crypto";
 
 const UTF8_VECTORS = [
   ["", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"],
@@ -17,5 +17,22 @@ describe("shared SHA-256 primitive", () => {
     expect(await sha256Hex(new Uint8Array([0, 1, 2, 255]).buffer)).toBe(
       "3d1f57c984978ef98a18378c8166c1cb8ede02c03eeb6aee7e2f121dfeee3e56",
     );
+  });
+});
+
+describe("OneDrive QuickXor primitive", () => {
+  it("matches the empty and live Graph probe vectors", () => {
+    expect(quickXorHashBase64(new ArrayBuffer(0))).toBe(
+      "AAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    );
+    expect(quickXorHashBase64(new TextEncoder().encode("child").buffer)).toBe(
+      "Y0BDGthABgAAAAAABQAAAAAAAAA=",
+    );
+  });
+
+  it("is sensitive to byte order and length", () => {
+    const first = quickXorHashBase64(new Uint8Array([1, 2, 3]).buffer);
+    expect(quickXorHashBase64(new Uint8Array([3, 2, 1]).buffer)).not.toBe(first);
+    expect(quickXorHashBase64(new Uint8Array([1, 2, 3, 0]).buffer)).not.toBe(first);
   });
 });

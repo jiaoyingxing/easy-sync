@@ -16,20 +16,79 @@ const ancestorPaths: AncestorStoreV2Paths = {
 function makeAdapter() {
   const files = new Map<string, string>();
   const dirs = new Set<string>();
+  let failNextObjectWrite = false;
+  let loseNextObjectWriteResponse = false;
+  let failNextObjectRename = false;
+  let loseNextObjectRenameResponse = false;
+  let failNextPublishedObjectRead = false;
+  let loseNextManifestWriteResponse = false;
+  let failNextManifestRename = false;
+  let loseNextManifestRenameResponse = false;
+  const isObjectNext = (path: string) =>
+    path.startsWith(`${ancestorPaths.directory}/.`)
+    && path.endsWith(".next");
+  const isPublishedObject = (path: string) =>
+    path.startsWith(`${ancestorPaths.directory}/`)
+    && path.endsWith(".txt");
   const adapter = {
     exists: vi.fn(async (path: string) => files.has(path) || dirs.has(path)),
     read: vi.fn(async (path: string) => {
+      if (failNextPublishedObjectRead && isPublishedObject(path)) {
+        failNextPublishedObjectRead = false;
+        throw new Error("published object read interrupted");
+      }
       const value = files.get(path);
       if (value === undefined) throw new Error(`missing ${path}`);
       return value;
     }),
-    write: vi.fn(async (path: string, value: string) => { files.set(path, value); }),
+    write: vi.fn(async (path: string, value: string) => {
+      if (failNextObjectWrite && isObjectNext(path)) {
+        failNextObjectWrite = false;
+        throw new Error("object write interrupted");
+      }
+      files.set(path, value);
+      if (loseNextObjectWriteResponse && isObjectNext(path)) {
+        loseNextObjectWriteResponse = false;
+        throw new Error("object write response lost");
+      }
+      if (
+        loseNextManifestWriteResponse
+        && path === ancestorPaths.manifestNext
+      ) {
+        loseNextManifestWriteResponse = false;
+        throw new Error("ancestor manifest write response lost");
+      }
+    }),
     remove: vi.fn(async (path: string) => { files.delete(path); }),
     rename: vi.fn(async (from: string, to: string) => {
       const value = files.get(from);
       if (value === undefined) throw new Error(`missing ${from}`);
+      if (failNextObjectRename && isObjectNext(from)) {
+        failNextObjectRename = false;
+        throw new Error("object rename interrupted");
+      }
+      if (
+        failNextManifestRename
+        && from === ancestorPaths.manifestNext
+        && to === ancestorPaths.manifest
+      ) {
+        failNextManifestRename = false;
+        throw new Error("ancestor manifest rename interrupted");
+      }
       files.delete(from);
       files.set(to, value);
+      if (loseNextObjectRenameResponse && isObjectNext(from)) {
+        loseNextObjectRenameResponse = false;
+        throw new Error("object rename response lost");
+      }
+      if (
+        loseNextManifestRenameResponse
+        && from === ancestorPaths.manifestNext
+        && to === ancestorPaths.manifest
+      ) {
+        loseNextManifestRenameResponse = false;
+        throw new Error("ancestor manifest rename response lost");
+      }
     }),
     mkdir: vi.fn(async (path: string) => { dirs.add(path); }),
     list: vi.fn(async (path: string) => ({
@@ -37,7 +96,29 @@ function makeAdapter() {
       folders: [],
     })),
   };
-  return { adapter: adapter as unknown as DataAdapter, files, spies: adapter };
+  return {
+    adapter: adapter as unknown as DataAdapter,
+    files,
+    spies: adapter,
+    failObjectWriteOnce: () => { failNextObjectWrite = true; },
+    loseObjectWriteResponseOnce: () => {
+      loseNextObjectWriteResponse = true;
+    },
+    failObjectRenameOnce: () => { failNextObjectRename = true; },
+    loseObjectRenameResponseOnce: () => {
+      loseNextObjectRenameResponse = true;
+    },
+    failPublishedObjectReadOnce: () => {
+      failNextPublishedObjectRead = true;
+    },
+    loseManifestWriteResponseOnce: () => {
+      loseNextManifestWriteResponse = true;
+    },
+    failManifestRenameOnce: () => { failNextManifestRename = true; },
+    loseManifestRenameResponseOnce: () => {
+      loseNextManifestRenameResponse = true;
+    },
+  };
 }
 
 describe("AncestorStoreV2", () => {
@@ -109,6 +190,117 @@ describe("AncestorStoreV2", () => {
     expect(await store.getText(hash!)).toBeNull();
     await expect(store.putText("original")).rejects.toThrow("corrupt");
   });
+
+  it("does not publish an object when its staged write never happened", async () => {
+    const { adapter, files, failObjectWriteOnce } = makeAdapter();
+    const store = new AncestorStoreV2(adapter, ancestorPaths);
+    failObjectWriteOnce();
+
+    await expect(store.putText("base")).rejects.toThrow(
+      "object write interrupted",
+    );
+    expect([...files.keys()].some((path) => path.endsWith(".txt")))
+      .toBe(false);
+    await expect(store.putText("base")).resolves.toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it("continues only from exact staged bytes when the write response is lost", async () => {
+    const {
+      adapter,
+      files,
+      loseObjectWriteResponseOnce,
+    } = makeAdapter();
+    const store = new AncestorStoreV2(adapter, ancestorPaths);
+    loseObjectWriteResponseOnce();
+
+    const hash = await store.putText("base");
+    expect(files.get(`${ancestorPaths.directory}/${hash}.txt`)).toBe("base");
+    expect(JSON.parse(files.get(ancestorPaths.manifest)!).textHashes)
+      .toEqual([hash]);
+  });
+
+  it("rejects a rename that did not publish and retries from the staged boundary", async () => {
+    const { adapter, files, failObjectRenameOnce } = makeAdapter();
+    const store = new AncestorStoreV2(adapter, ancestorPaths);
+    failObjectRenameOnce();
+
+    await expect(store.putText("base")).rejects.toThrow(
+      "object rename interrupted",
+    );
+    expect([...files.keys()].some((path) => path.endsWith(".txt")))
+      .toBe(false);
+
+    const restarted = new AncestorStoreV2(adapter, ancestorPaths);
+    const hash = await restarted.putText("base");
+    expect(files.get(`${ancestorPaths.directory}/${hash}.txt`)).toBe("base");
+  });
+
+  it("accepts a verified object when its rename response is lost", async () => {
+    const { adapter, files, loseObjectRenameResponseOnce } = makeAdapter();
+    const store = new AncestorStoreV2(adapter, ancestorPaths);
+    loseObjectRenameResponseOnce();
+
+    const hash = await store.putText("base");
+    expect(files.get(`${ancestorPaths.directory}/${hash}.txt`)).toBe("base");
+    expect(JSON.parse(files.get(ancestorPaths.manifest)!).textHashes)
+      .toEqual([hash]);
+  });
+
+  it("reuses a durable object after its final verification was interrupted", async () => {
+    const { adapter, files, failPublishedObjectReadOnce } = makeAdapter();
+    const store = new AncestorStoreV2(adapter, ancestorPaths);
+    failPublishedObjectReadOnce();
+
+    await expect(store.putText("base")).rejects.toThrow(
+      "failed publication",
+    );
+    expect([...files.keys()].filter((path) => path.endsWith(".txt")))
+      .toHaveLength(1);
+
+    const restarted = new AncestorStoreV2(adapter, ancestorPaths);
+    const hash = await restarted.putText("base");
+    expect(JSON.parse(files.get(ancestorPaths.manifest)!).textHashes)
+      .toEqual([hash]);
+  });
+
+  it("recovers a staged ancestor manifest whose write response was lost", async () => {
+    const { adapter, files, loseManifestWriteResponseOnce } = makeAdapter();
+    const store = new AncestorStoreV2(adapter, ancestorPaths);
+    loseManifestWriteResponseOnce();
+
+    const hash = await store.putText("base");
+    expect(JSON.parse(files.get(ancestorPaths.manifest)!).textHashes)
+      .toEqual([hash]);
+    expect(files.has(ancestorPaths.manifestNext)).toBe(false);
+  });
+
+  it("accepts a committed ancestor manifest whose rename response was lost", async () => {
+    const { adapter, files, loseManifestRenameResponseOnce } = makeAdapter();
+    const store = new AncestorStoreV2(adapter, ancestorPaths);
+    loseManifestRenameResponseOnce();
+
+    const hash = await store.putText("base");
+    expect(JSON.parse(files.get(ancestorPaths.manifest)!).textHashes)
+      .toEqual([hash]);
+    expect(files.has(ancestorPaths.manifestNext)).toBe(false);
+  });
+
+  it("keeps verified objects authoritative and rebuilds a missing manifest after restart", async () => {
+    const { adapter, files, failManifestRenameOnce } = makeAdapter();
+    const store = new AncestorStoreV2(adapter, ancestorPaths);
+    failManifestRenameOnce();
+
+    const hash = await store.putText("base");
+    expect(files.get(`${ancestorPaths.directory}/${hash}.txt`)).toBe("base");
+    expect(files.has(ancestorPaths.manifest)).toBe(false);
+    expect(files.has(ancestorPaths.manifestNext)).toBe(true);
+
+    const restarted = new AncestorStoreV2(adapter, ancestorPaths);
+    await expect(restarted.putText("base")).resolves.toBe(hash);
+    expect(JSON.parse(files.get(ancestorPaths.manifest)!).textHashes)
+      .toEqual([hash]);
+    expect(files.has(ancestorPaths.manifestNext)).toBe(false);
+  });
 });
 
 describe("AncestorStoreV2 envelope linkage", () => {
@@ -162,5 +354,24 @@ describe("AncestorStoreV2 envelope linkage", () => {
     const hash = await ancestors.putText("base");
     const withVerifier = new StateEnvelopeV2Store(adapter, envelopePaths, (candidate) => ancestors.has(candidate));
     await expect(withVerifier.publish(envelope(hash!))).resolves.toBeUndefined();
+  });
+
+  it("uses verified object bytes rather than the rebuildable inventory as reference authority", async () => {
+    const {
+      adapter,
+      files,
+      failManifestRenameOnce,
+    } = makeAdapter();
+    const ancestors = new AncestorStoreV2(adapter, ancestorPaths);
+    failManifestRenameOnce();
+    const hash = await ancestors.putText("base");
+    expect(files.has(ancestorPaths.manifest)).toBe(false);
+
+    const envelopes = new StateEnvelopeV2Store(
+      adapter,
+      envelopePaths,
+      (candidate) => ancestors.has(candidate),
+    );
+    await expect(envelopes.publish(envelope(hash!))).resolves.toBeUndefined();
   });
 });

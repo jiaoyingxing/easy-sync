@@ -4,15 +4,18 @@
  * Settings page organized by groups (aligned with Obsidian's native SettingGroup style):
  *   - Account (no heading, always visible)
  *   - Sync (同步)
+ *   - Automatic (自动)
  *   - Maintenance (维护)
  *   - About (关于)
  */
 
 import { PluginSettingTab, Setting, SettingGroup } from "obsidian";
 import type EasySyncPlugin from "../main";
-import { NOTICE_PRIORITY } from "./notice-center";
 import { isAnySyncActivityRunning } from "../sync/sync-progress";
-import { AuthPendingModal } from "./auth-pending-modal";
+import {
+  handleAuthEntryAction,
+  resolveAuthEntryPresentation,
+} from "./auth-entry-flow";
 import { AutomaticHandlingModal } from "./automatic-handling-modal";
 import { ConfigSyncModal } from "./config-sync-modal";
 import { ConfirmModal } from "./confirm-modal";
@@ -92,6 +95,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
   plugin: EasySyncPlugin;
   private accountSectionEl: HTMLElement | null = null;
   private syncSectionEl: HTMLElement | null = null;
+  private automaticSectionEl: HTMLElement | null = null;
   private aboutSectionEl: HTMLElement | null = null;
   private maintenanceSectionEl: HTMLElement | null = null;
 
@@ -107,6 +111,9 @@ export class EasySyncSettingTab extends PluginSettingTab {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     this.accountSectionEl = containerEl.createDiv("easy-sync-settings-account");
     this.syncSectionEl = containerEl.createDiv("easy-sync-settings-group-host easy-sync-settings-sync");
+    this.automaticSectionEl = containerEl.createDiv(
+      "easy-sync-settings-group-host easy-sync-settings-automatic",
+    );
     this.aboutSectionEl = containerEl.createDiv("easy-sync-settings-group-host easy-sync-settings-about");
     this.maintenanceSectionEl = containerEl.createDiv(
       "easy-sync-settings-group-host easy-sync-settings-maintenance",
@@ -121,6 +128,11 @@ export class EasySyncSettingTab extends PluginSettingTab {
     // Sync group
     // ========================================================================
     this.renderSyncSection(t);
+
+    // ========================================================================
+    // Automatic group
+    // ========================================================================
+    this.renderAutomaticSection(t);
 
     // ========================================================================
     // About group
@@ -141,14 +153,25 @@ export class EasySyncSettingTab extends PluginSettingTab {
   }
 
   refreshSyncState(): void {
-    if (!this.syncSectionEl?.isConnected) return;
-    this.renderSyncSection(this.plugin.i18n.t.bind(this.plugin.i18n));
+    if (!this.syncSectionEl?.isConnected && !this.automaticSectionEl?.isConnected) return;
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    this.renderSyncSection(t);
+    this.renderAutomaticSection(t);
+  }
+
+  openCommunityPluginEnablementReview(): void {
+    new ConfigSyncModal(
+      this.plugin,
+      "community-plugin-files",
+      true,
+    ).open();
   }
 
   hide(): void {
     super.hide();
     this.accountSectionEl = null;
     this.syncSectionEl = null;
+    this.automaticSectionEl = null;
     this.aboutSectionEl = null;
     this.maintenanceSectionEl = null;
   }
@@ -257,71 +280,6 @@ export class EasySyncSettingTab extends PluginSettingTab {
 
     syncGroup.addSetting((setting) => {
       setting
-        .setName(t("settings.automaticHandling.name"))
-        .setDesc(t("settings.automaticHandling.desc"))
-        .addButton((button) => {
-          button
-            .setButtonText(t("settings.automaticHandling.button"))
-            .setTooltip(t("settings.automaticHandling.open"))
-            .onClick(() => {
-              new AutomaticHandlingModal(this.plugin).open();
-            });
-          button.buttonEl.setAttribute(
-            "aria-label",
-            t("settings.automaticHandling.open"),
-          );
-        });
-    });
-
-    syncGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.autoSync.name"))
-        .setDesc(
-          this.plugin.syncInterval === 0
-            ? t("settings.autoSync.desc.disabled")
-            : this.plugin.autoSyncPaused
-              ? t("settings.autoSync.desc.paused")
-              : t("settings.autoSync.desc.enabled", { minutes: this.plugin.syncInterval }),
-        )
-        .addToggle((toggle) => {
-          toggle
-            .setValue(this.plugin.syncInterval > 0)
-            .onChange(async (value) => {
-              this.plugin.syncInterval = value ? 3 : 0;
-              this.plugin.autoSyncPaused = false;
-              await this.plugin.saveSyncSettings();
-              this.plugin.restartAutoSync();
-              this.refreshSyncState();
-            });
-        });
-    });
-
-    if (this.plugin.syncInterval > 0) {
-      syncGroup.addSetting((setting) => {
-        setting
-          .setName(t("settings.syncInterval.name"))
-          .setDesc(t("settings.syncInterval.desc", { minutes: this.plugin.syncInterval }))
-          .addSlider((slider) => {
-            slider
-              .setLimits(3, 10, 1)
-              .setValue(this.plugin.syncInterval)
-              .onChange(async (value) => {
-                this.plugin.syncInterval = value;
-                await this.plugin.saveSyncSettings();
-                this.plugin.restartAutoSync();
-                const desc = slider.sliderEl
-                  .closest(".setting-item")
-                  ?.querySelector(".setting-item-description");
-                if (desc) {
-                  desc.textContent = t("settings.syncInterval.desc", { minutes: value });
-                }
-              });
-          });
-      });
-    }
-
-    syncGroup.addSetting((setting) => {
-      setting
         .setName(t("settings.maxFileSize.name"))
         .setDesc(t("settings.maxFileSize.desc", { size: `${this.plugin.syncMaxFileSizeMb} MB` }))
         .addSlider((slider) => {
@@ -342,6 +300,106 @@ export class EasySyncSettingTab extends PluginSettingTab {
         });
     });
 
+  }
+
+  private renderAutomaticSection(
+    t: (key: string, params?: Record<string, string | number>) => string,
+  ): void {
+    if (!this.automaticSectionEl) return;
+    this.automaticSectionEl.empty();
+    const automaticGroup = new SettingGroup(this.automaticSectionEl).setHeading(
+      t("settings.group.automatic"),
+    );
+
+    automaticGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.automaticHandling.name"))
+        .setDesc(t("settings.automaticHandling.desc"))
+        .addButton((button) => {
+          button
+            .setButtonText(t("settings.automaticHandling.button"))
+            .setTooltip(t("settings.automaticHandling.open"))
+            .onClick(() => {
+              new AutomaticHandlingModal(this.plugin).open();
+            });
+          button.buttonEl.setAttribute(
+            "aria-label",
+            t("settings.automaticHandling.open"),
+          );
+        });
+    });
+
+    automaticGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.autoSync.name"))
+        .setDesc(
+          this.plugin.syncInterval === 0
+            ? t("settings.autoSync.desc.disabled")
+            : this.plugin.autoSyncPaused
+              ? t("settings.autoSync.desc.paused")
+              : t("settings.autoSync.desc.enabled", { minutes: this.plugin.syncInterval }),
+        )
+        .addToggle((toggle) => {
+          toggle
+            .setValue(this.plugin.syncInterval > 0)
+            .onChange(async (value) => {
+              this.plugin.syncInterval = value ? 3 : 0;
+              this.plugin.autoSyncPaused = false;
+              await this.plugin.saveSyncSettings();
+              this.plugin.restartAutoSync();
+              this.renderAutomaticSection(t);
+            });
+        });
+    });
+
+    if (this.plugin.syncInterval > 0) {
+      automaticGroup.addSetting((setting) => {
+        setting
+          .setName(t("settings.syncInterval.name"))
+          .setDesc(t("settings.syncInterval.desc", { minutes: this.plugin.syncInterval }))
+          .addSlider((slider) => {
+            slider
+              .setLimits(3, 10, 1)
+              .setValue(this.plugin.syncInterval)
+              .onChange(async (value) => {
+                this.plugin.syncInterval = value;
+                await this.plugin.saveSyncSettings();
+                this.plugin.restartAutoSync();
+                const desc = slider.sliderEl
+                  .closest(".setting-item")
+                  ?.querySelector(".setting-item-description");
+                if (desc) {
+                  desc.textContent = t("settings.syncInterval.desc", { minutes: value });
+                }
+              });
+          });
+      });
+
+      automaticGroup.addSetting((setting) => {
+        setting
+          .setName(t("settings.autoSyncChangeDelay.name"))
+          .setDesc(t("settings.autoSyncChangeDelay.desc", {
+            seconds: this.plugin.autoSyncChangeDelaySeconds,
+          }))
+          .addSlider((slider) => {
+            slider
+              .setLimits(1, 10, 1)
+              .setValue(this.plugin.autoSyncChangeDelaySeconds)
+              .onChange(async (value) => {
+                this.plugin.setAutoSyncChangeDelaySeconds(value);
+                await this.plugin.saveSyncSettings();
+                const desc = slider.sliderEl
+                  .closest(".setting-item")
+                  ?.querySelector(".setting-item-description");
+                if (desc) {
+                  desc.textContent = t("settings.autoSyncChangeDelay.desc", {
+                    seconds: value,
+                  });
+                }
+              });
+          });
+      });
+    }
   }
 
   private renderAboutSection(
@@ -459,83 +517,38 @@ export class EasySyncSettingTab extends PluginSettingTab {
     containerEl: HTMLElement,
     t: (key: string, params?: Record<string, string | number>) => string,
   ): void {
+    const auth = this.plugin.auth;
+    const authEntry = resolveAuthEntryPresentation({
+      isInitializing: auth?.isInitializing ?? false,
+      isPending: auth?.isPending ?? false,
+    });
     new Setting(containerEl)
       .setName(t("settings.account.name"))
       .setDesc(
-        this.plugin.auth?.isInitializing
-          ? t("settings.account.desc.connecting")
-          : this.plugin.auth?.authState.isLoggedIn
-            ? t("settings.account.desc.loggedIn", { name: this.plugin.auth.authState.displayName || t("general.unknown") })
-            : this.plugin.auth?.isPending
-              ? t("settings.account.desc.pending")
-              : t("settings.account.desc.notLoggedIn"),
+        auth?.authState.isLoggedIn
+          ? t("settings.account.desc.loggedIn", {
+            name: auth.authState.displayName || t("general.unknown"),
+          })
+          : t(authEntry.descriptionKey),
       )
       .addButton((btn) => {
-        if (this.plugin.auth?.isInitializing) {
-          btn.setButtonText(t("settings.account.checking")).setDisabled(true);
-        } else if (this.plugin.auth?.authState.isLoggedIn) {
+        if (auth?.authState.isLoggedIn) {
           btn.setButtonText(t("settings.account.logout")).onClick(() => {
             void (async () => {
               await this.plugin.logoutUser();
               this.refreshAuthState();
             })();
           });
-        } else if (this.plugin.auth?.isPending) {
-          btn
-            .setButtonText(t("settings.account.checking"))
-            .setCta()
-            .onClick(() => {
-              void (async () => {
-                if (this.plugin.auth?.checkAuthStatus()) {
-                  this.refreshAuthState();
-                  return;
-                }
-                const modal = new AuthPendingModal(
-                  this.plugin.app,
-                  t("settings.account.pendingTitle"),
-                  t("settings.account.pendingMessage"),
-                  t("settings.account.recheck"),
-                  t("settings.account.reopenAuth"),
-                );
-                const result = await modal.awaitAction();
-                if (result.action === "recheck") {
-                  if (this.plugin.auth?.checkAuthStatus()) {
-                    this.plugin.noticeCenter.show({
-                      key: "settings-login-success",
-                      message: t("settings.account.loginSuccess"),
-                      priority: NOTICE_PRIORITY.action,
-                    });
-                  } else {
-                    this.plugin.noticeCenter.show({
-                      key: "settings-login-pending",
-                      message: t("settings.account.desc.pending"),
-                      priority: NOTICE_PRIORITY.attention,
-                    });
-                  }
-                } else if (result.action === "reopen") {
-                  try {
-                    await this.plugin.auth?.login();
-                  } catch (error) {
-                    console.error("EasySync: login error:", error);
-                  }
-                }
-                this.refreshAuthState();
-              })();
-            });
         } else {
-          btn
-            .setButtonText(t("settings.account.login"))
-            .setCta()
-            .onClick(() => {
-              void (async () => {
-                try {
-                  await this.plugin.auth?.login();
-                } catch (error) {
-                  console.error("EasySync: login error:", error);
-                }
-                this.refreshAuthState();
-              })();
+          btn.setButtonText(t(authEntry.labelKey));
+          if (authEntry.cta) btn.setCta();
+          if (authEntry.disabled) {
+            btn.setDisabled(true);
+          } else {
+            btn.onClick(() => {
+              void handleAuthEntryAction(this.plugin);
             });
+          }
         }
       });
   }

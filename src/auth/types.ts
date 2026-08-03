@@ -30,6 +30,8 @@ export interface PendingAuth {
   codeVerifier: string;
   /** Random state value for CSRF protection */
   state: string;
+  /** Exact authorization URL for the current in-memory login attempt */
+  authUrl: string;
   /** Timestamp when this auth attempt was started */
   createdAt: number;
 }

@@ -25,6 +25,23 @@ describe("AutoSyncDirtyHint", () => {
     expect(hint.pending).toBe(false);
   });
 
+  it("reschedules a pending hint when the delay changes without dropping it", async () => {
+    vi.useFakeTimers();
+    const onReady = vi.fn().mockResolvedValue(true);
+    const hint = new AutoSyncDirtyHint(onReady);
+
+    hint.mark();
+    await vi.advanceTimersByTimeAsync(2_000);
+    hint.setDelayMs(1_000);
+    expect(hint.pending).toBe(true);
+    await vi.advanceTimersByTimeAsync(999);
+    expect(onReady).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(onReady).toHaveBeenCalledOnce();
+    expect(hint.pending).toBe(false);
+  });
+
   it("retains a hint while the shared activity gate is busy", async () => {
     vi.useFakeTimers();
     const onReady = vi.fn()

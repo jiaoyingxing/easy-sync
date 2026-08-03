@@ -2,32 +2,51 @@
  * LocalScanner — Vault file enumeration and snapshot building
  *
  * Uses Obsidian Vault API for cross-platform file access.
- * Generates LocalFileEntry snapshots with path, size, mtime, and
- * a lightweight content hash (first 16KB SHA-256, truncated to 16 hex chars).
+ * Generates LocalFileEntry snapshots with path, size, mtime, full SHA-256,
+ * and an optional OneDrive-compatible QuickXor fingerprint from the same read.
  */
 
-import type { Vault } from "obsidian";
-import { sha256Hex } from "../crypto";
+import { TFolder, type Vault } from "obsidian";
+import { quickXorHashBase64, sha256Hex } from "../crypto";
 import {
   compatSetTimeout,
   DEFAULT_CONFIG_DIR,
   getConfigDir,
   getEasySyncPaths,
+  isEasySyncSelfSyncFilePath,
   isRecord,
 } from "../obsidian-compat";
 import {
   type LocalFileEntry,
+  type LocalFolderEntry,
   type ScanConfig,
   DEFAULT_SCAN_CONFIG,
 } from "./types";
+import {
+  isPluginDataSelected,
+  isPluginSelected,
+  normalizePluginScopeSelection,
+  type PluginScopeSelection,
+} from "./community-plugin-sync-policy";
 import type { DiagnosticLogger } from "./diagnostic-logger";
 const SCAN_CACHE_FORMAT = 1;
 const SCAN_SLEEP_EVERY = 50;
 
-interface ScanCacheEntry { mtime: number; size: number; hash: string; binary: boolean; }
+interface ScanCacheEntry {
+  mtime: number;
+  size: number;
+  hash: string;
+  quickXorHash?: string;
+  binary: boolean;
+}
 type ScanCache = { format: number; entries: Record<string, ScanCacheEntry>; };
 export interface LocalScanResult {
   entries: LocalFileEntry[];
+  /** Read-only folder topology. It does not authorize folder mutations. */
+  folders: LocalFolderEntry[];
+  /** Folder completeness is separate so V1 file sync stays unchanged in F0. */
+  folderScanComplete: boolean;
+  folderScanFailures: string[];
   skippedLarge: string[];
   failedPaths: string[];
   skippedCount: number;
@@ -122,6 +141,28 @@ export function isEasySyncInternalPath(
     || path === paths.stateV2RecoveryFile
     || path === paths.stateV2ManifestFile
     || path === paths.stateV2ManifestNextFile
+    || path === paths.stateV2AuthorityWitnessFile
+    || path === paths.stateV2AuthorityWitnessNextFile
+    || path === paths.stateV2IndexedDbRecoveryDir
+    || path.startsWith(`${paths.stateV2IndexedDbRecoveryDir}/`)
+    || path === paths.stateV2RetiredManifestFile
+    || path === paths.stateV2RollbackFile
+    || path === paths.stateV2MigrationHoldFile
+    || path === paths.stateV2MigrationHoldNextFile
+    || path === paths.stateV2ScopeTransitionFile
+    || path === paths.stateV2ScopeTransitionNextFile
+    || (
+      path.startsWith(paths.stateV2CorruptSourcePrefix)
+      && (path.endsWith(".json") || path.endsWith(".json.next"))
+    )
+    || path === paths.stateV2CorruptRecoveryFile
+    || path === paths.stateV2CorruptRecoveryNextFile
+    || path === paths.stateV2CorruptPublicationFile
+    || path === paths.stateV2CorruptPublicationNextFile
+    || (
+      path.startsWith(paths.stateV2ReactivationArchivePrefix)
+      && (path.endsWith(".json") || path.endsWith(".json.next"))
+    )
     || path === paths.stateV1BackupFile
     || path === paths.baseContentFile
     || path === paths.ancestorManifestV2File
@@ -152,6 +193,11 @@ function isExcluded(path: string, config: ScanConfig, configDir: string, pluginI
   if (isEasySyncInternalPath(path, configDir, pluginId)) return true;
   if (isPathExcludedByFolders(path, config.excludedFolders)) return true;
 
+  if (path === paths.pluginDir || path.startsWith(paths.pluginDirPrefix)) {
+    return config.includeOwnPluginCode !== true
+      || !isEasySyncSelfSyncFilePath(path, configDir, pluginId);
+  }
+
   if (
     path.startsWith(paths.pluginRoot)
     && path !== paths.pluginDir
@@ -159,9 +205,29 @@ function isExcluded(path: string, config: ScanConfig, configDir: string, pluginI
   ) {
     const parts = path.slice(paths.pluginRoot.length).split("/");
     if (parts.length !== 2) return true;
+    const communityPluginId = parts[0];
     const fileName = parts[1];
-    if (fileName === "data.json") return !config.includePluginData;
-    return !config.includePluginCode
+    const pluginCodeSelection = normalizePluginScopeSelection(
+      config.pluginCodeSelection,
+      config.includePluginCode,
+      pluginId,
+    );
+    const pluginDataSelection = normalizePluginScopeSelection(
+      config.pluginDataSelection,
+      config.includePluginData,
+      pluginId,
+    );
+    if (fileName === "data.json") {
+      return !isPluginDataSelected(
+        pluginCodeSelection,
+        pluginDataSelection,
+        communityPluginId,
+      );
+    }
+    return !isPluginSelected(
+      pluginCodeSelection,
+      communityPluginId,
+    )
       || !COMMUNITY_PLUGIN_CODE_FILES.has(fileName);
   }
 
@@ -185,8 +251,15 @@ function isExcludedDirectory(path: string, config: ScanConfig, configDir: string
     || path.startsWith(`${paths.tmpDir}/`)
     || path === paths.ancestorsV2Dir
     || path.startsWith(`${paths.ancestorsV2Dir}/`)
+    || path === paths.stateV2IndexedDbRecoveryDir
+    || path.startsWith(`${paths.stateV2IndexedDbRecoveryDir}/`)
   ) return true;
   if (isPathExcludedByFolders(path, config.excludedFolders)) return true;
+
+  if (path === paths.pluginDir) {
+    return config.includeOwnPluginCode !== true;
+  }
+  if (path.startsWith(paths.pluginDirPrefix)) return true;
 
   if (
     path.startsWith(paths.pluginRoot)
@@ -195,7 +268,23 @@ function isExcludedDirectory(path: string, config: ScanConfig, configDir: string
   ) {
     const parts = path.slice(paths.pluginRoot.length).split("/");
     if (parts.length > 1) return true;
-    return !config.includePluginCode && !config.includePluginData;
+    const communityPluginId = parts[0];
+    const pluginCodeSelection = normalizePluginScopeSelection(
+      config.pluginCodeSelection,
+      config.includePluginCode,
+      pluginId,
+    );
+    const pluginDataSelection = normalizePluginScopeSelection(
+      config.pluginDataSelection,
+      config.includePluginData,
+      pluginId,
+    );
+    return !isPluginSelected(pluginCodeSelection, communityPluginId)
+      && !isPluginDataSelected(
+        pluginCodeSelection,
+        pluginDataSelection,
+      communityPluginId,
+    );
   }
 
   const prefix = `${path.replace(/\/+$/, "")}/`;
@@ -205,6 +294,123 @@ function isExcludedDirectory(path: string, config: ScanConfig, configDir: string
   if (relatedInclude) return false;
 
   return config.excludePaths.some((exclude) => prefix.startsWith(exclude));
+}
+
+export interface FolderSyncScopeSnapshotV1 {
+  version: 1;
+  configDir: string;
+  pluginId: string;
+  excludePaths: string[];
+  excludedFolders: string[];
+  includePaths: string[];
+  includeOwnPluginCode: boolean;
+  includePluginCode: boolean;
+  includePluginData: boolean;
+  pluginCodeSelection: PluginScopeSelection;
+  pluginDataSelection: PluginScopeSelection;
+}
+
+/**
+ * Persistable, capability-free folder-range facts for one settings revision.
+ * The snapshot is only used by the source-bound scope-expansion transaction;
+ * normal scanning continues to read the live LocalScanner config.
+ */
+export function createFolderSyncScopeSnapshotV1(
+  config: Partial<ScanConfig>,
+  configDir = DEFAULT_CONFIG_DIR,
+  pluginId = "easy-sync",
+): FolderSyncScopeSnapshotV1 {
+  const normalizedConfigDir = normalizeVaultRelativePath(configDir);
+  const normalizedPluginId = pluginId.trim() || "easy-sync";
+  const includePluginCode = config.includePluginCode === true;
+  const includePluginData = config.includePluginData === true;
+  return {
+    version: 1,
+    configDir: normalizedConfigDir,
+    pluginId: normalizedPluginId,
+    excludePaths: [...(
+      config.excludePaths
+      ?? [`${normalizedConfigDir}/`, ...DEFAULT_SCAN_CONFIG.excludePaths]
+    )],
+    excludedFolders: normalizeExcludedFolders(
+      config.excludedFolders ?? [],
+      normalizedConfigDir,
+    ),
+    includePaths: [...(config.includePaths ?? [])],
+    includeOwnPluginCode: config.includeOwnPluginCode === true,
+    includePluginCode,
+    includePluginData,
+    pluginCodeSelection: normalizePluginScopeSelection(
+      config.pluginCodeSelection,
+      includePluginCode,
+      normalizedPluginId,
+    ),
+    pluginDataSelection: normalizePluginScopeSelection(
+      config.pluginDataSelection,
+      includePluginData,
+      normalizedPluginId,
+    ),
+  };
+}
+
+export function readFolderSyncScopeSnapshotV1(
+  value: unknown,
+): FolderSyncScopeSnapshotV1 | null {
+  if (!isRecord(value) || value.version !== 1) return null;
+  if (
+    typeof value.configDir !== "string"
+    || !normalizeVaultRelativePath(value.configDir)
+    || typeof value.pluginId !== "string"
+    || !value.pluginId.trim()
+    || !Array.isArray(value.excludePaths)
+    || !value.excludePaths.every((path) => typeof path === "string")
+    || !Array.isArray(value.excludedFolders)
+    || !value.excludedFolders.every((path) => typeof path === "string")
+    || !Array.isArray(value.includePaths)
+    || !value.includePaths.every((path) => typeof path === "string")
+    || typeof value.includeOwnPluginCode !== "boolean"
+    || typeof value.includePluginCode !== "boolean"
+    || typeof value.includePluginData !== "boolean"
+    || !isRecord(value.pluginCodeSelection)
+    || !isRecord(value.pluginDataSelection)
+  ) return null;
+  return createFolderSyncScopeSnapshotV1({
+    excludePaths: value.excludePaths,
+    excludedFolders: value.excludedFolders,
+    includePaths: value.includePaths,
+    includeOwnPluginCode: value.includeOwnPluginCode,
+    includePluginCode: value.includePluginCode,
+    includePluginData: value.includePluginData,
+    pluginCodeSelection: normalizePluginScopeSelection(
+      value.pluginCodeSelection,
+      value.includePluginCode,
+      value.pluginId,
+    ),
+    pluginDataSelection: normalizePluginScopeSelection(
+      value.pluginDataSelection,
+      value.includePluginData,
+      value.pluginId,
+    ),
+  }, value.configDir, value.pluginId);
+}
+
+export function isFolderPathInSyncScopeSnapshot(
+  snapshot: Readonly<FolderSyncScopeSnapshotV1>,
+  path: string,
+): boolean {
+  const normalized = normalizeVaultRelativePath(path);
+  if (!normalized) return false;
+  return !isExcludedDirectory(normalized, {
+    excludePaths: [...snapshot.excludePaths],
+    excludedFolders: [...snapshot.excludedFolders],
+    includePaths: [...snapshot.includePaths],
+    maxFileSize: DEFAULT_SCAN_CONFIG.maxFileSize,
+    includeOwnPluginCode: snapshot.includeOwnPluginCode,
+    includePluginCode: snapshot.includePluginCode,
+    includePluginData: snapshot.includePluginData,
+    pluginCodeSelection: snapshot.pluginCodeSelection,
+    pluginDataSelection: snapshot.pluginDataSelection,
+  }, snapshot.configDir, snapshot.pluginId);
 }
 
 export class LocalScanner {
@@ -219,7 +425,7 @@ export class LocalScanner {
 
   constructor(
     vault: Vault,
-    config: ScanConfig = DEFAULT_SCAN_CONFIG,
+    config: Partial<ScanConfig> = {},
     private pluginId = "easy-sync",
   ) {
     this.vault = vault;
@@ -268,6 +474,12 @@ export class LocalScanner {
     return !isExcluded(path, this.config, this.configDir, this.pluginId);
   }
 
+  shouldSyncFolderPath(path: string): boolean {
+    const normalized = normalizeVaultRelativePath(path);
+    return Boolean(normalized)
+      && !isExcludedDirectory(normalized, this.config, this.configDir, this.pluginId);
+  }
+
   // ---- Scan Cache ----
 
   private async loadScanCache(): Promise<void> {
@@ -290,6 +502,7 @@ export class LocalScanner {
                 && typeof value.mtime === "number"
                 && typeof value.size === "number"
                 && typeof value.hash === "string"
+                && (value.quickXorHash === undefined || typeof value.quickXorHash === "string")
                 && typeof value.binary === "boolean";
             }),
           ),
@@ -327,18 +540,26 @@ export class LocalScanner {
     return null;
   }
 
-  private cacheSet(path: string, mtime: number, size: number, hash: string, binary: boolean): void {
+  private cacheSet(
+    path: string,
+    mtime: number,
+    size: number,
+    hash: string,
+    quickXorHash: string | undefined,
+    binary: boolean,
+  ): void {
     const current = this.scanCache.entries[path];
     if (
       current
       && current.mtime === mtime
       && current.size === size
       && current.hash === hash
+      && current.quickXorHash === quickXorHash
       && current.binary === binary
     ) {
       return;
     }
-    this.scanCache.entries[path] = { mtime, size, hash, binary };
+    this.scanCache.entries[path] = { mtime, size, hash, quickXorHash, binary };
     this.scanCacheDirty = true;
   }
 
@@ -367,7 +588,10 @@ export class LocalScanner {
     const entries: LocalFileEntry[] = [];
     const skippedLarge: string[] = [];
     const failedPaths: string[] = [];
+    const folderScanFailures: string[] = [];
+    const folderPaths = new Set<string>();
     const scannedPaths = new Set<string>();
+    const observedFilePaths = new Set<string>();
     const scannedDirs = new Set<string>();
     let allFiles: ReturnType<Vault["getFiles"]>;
     try {
@@ -376,6 +600,9 @@ export class LocalScanner {
       this.diag?.warn("scan", "vault file enumeration failed", error);
       return {
         entries,
+        folders: [],
+        folderScanComplete: false,
+        folderScanFailures: ["/"],
         skippedLarge,
         failedPaths: ["/"],
         skippedCount: 0,
@@ -385,9 +612,12 @@ export class LocalScanner {
     let fileCount = 0;
     let skippedCount = 0;
 
+    this.collectLoadedFolderPaths(folderPaths, folderScanFailures);
+
     for (const file of allFiles) {
       const path = file.path;
       scannedPaths.add(path);
+      observedFilePaths.add(path);
 
       if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
         if (!isPathExcludedByFolders(path, this.config.excludedFolders)) {
@@ -417,7 +647,14 @@ export class LocalScanner {
       // P0: reuse cached hash when mtime and size are unchanged
       const cached = this.cacheProbe(path, stat.mtime ?? 0, stat.size);
       if (cached) {
-        entries.push({ path, size: stat.size, mtime: stat.mtime ?? 0, hash: cached.hash, binary: cached.binary });
+        entries.push({
+          path,
+          size: stat.size,
+          mtime: stat.mtime ?? 0,
+          hash: cached.hash,
+          ...(cached.quickXorHash ? { quickXorHash: cached.quickXorHash } : {}),
+          binary: cached.binary,
+        });
         continue;
       }
 
@@ -432,9 +669,10 @@ export class LocalScanner {
       }
 
       const hash = await sha256Hex(content);
+      const quickXorHash = quickXorHashBase64(content);
       const binary = stat.size > 0 ? isBinary(content) : false;
-      entries.push({ path, size: stat.size, mtime: stat.mtime ?? 0, hash, binary });
-      this.cacheSet(path, stat.mtime ?? 0, stat.size, hash, binary);
+      entries.push({ path, size: stat.size, mtime: stat.mtime ?? 0, hash, quickXorHash, binary });
+      this.cacheSet(path, stat.mtime ?? 0, stat.size, hash, quickXorHash, binary);
 
       // P1: yield to UI thread every N files (per Obsidian performance docs)
       if (++fileCount % SCAN_SLEEP_EVERY === 0) await sleep(0);
@@ -442,9 +680,32 @@ export class LocalScanner {
 
     // ── IncludePaths enumeration ──
     this.diag?.log("scan", `includePaths: [${this.config.includePaths.join(', ')}], excludePaths: [${this.config.excludePaths.join(', ')}]`);
-    await this.scanIncludePaths(entries, skippedLarge, failedPaths, scannedPaths, scannedDirs);
+    await this.scanIncludePaths(
+      entries,
+      skippedLarge,
+      failedPaths,
+      scannedPaths,
+      observedFilePaths,
+      scannedDirs,
+      folderPaths,
+    );
+    for (const path of observedFilePaths) {
+      if (this.shouldSyncPath(path)) addParentFolderPaths(path, folderPaths);
+    }
+    const folderSnapshot = buildFolderSnapshot(folderPaths, observedFilePaths, this);
+    if (folderSnapshot.conflicts.length > 0) {
+      folderScanFailures.push(...folderSnapshot.conflicts);
+      this.diag?.warn(
+        "scan",
+        `local folder topology rejected — ${folderSnapshot.conflicts.length} normalized path conflict(s)`,
+        folderSnapshot.conflicts,
+      );
+    }
     const pluginEntries = entries.filter((e) => e.path.startsWith(`${this.configDir}/`));
-    this.diag?.log("scan", `scanAll done — ${entries.length} entries (${pluginEntries.length} plugin), ${skippedLarge.length} skipped-large, ${failedPaths.length} failed`);
+    this.diag?.log(
+      "scan",
+      `scanAll done — ${entries.length} files (${pluginEntries.length} plugin), ${folderSnapshot.entries.length} folders, ${skippedLarge.length} skipped-large, ${failedPaths.length} file failure(s), ${folderScanFailures.length} folder failure(s)`,
+    );
     // ponytail: only log the count — full path listing is verbose and rarely useful
 
     // An incomplete scan cannot prove a cached path was deleted. Keep the
@@ -456,6 +717,9 @@ export class LocalScanner {
 
     return {
       entries,
+      folders: folderSnapshot.entries,
+      folderScanComplete: failedPaths.length === 0 && folderScanFailures.length === 0,
+      folderScanFailures,
       skippedLarge,
       failedPaths,
       skippedCount,
@@ -473,7 +737,9 @@ export class LocalScanner {
     skippedLarge: string[],
     failedPaths: string[],
     scannedPaths: Set<string>,
+    observedFilePaths: Set<string>,
     scannedDirs: Set<string>,
+    folderPaths: Set<string>,
   ): Promise<void> {
     for (const prefix of this.config.includePaths) {
       if (prefix.endsWith("/")) {
@@ -483,11 +749,20 @@ export class LocalScanner {
           skippedLarge,
           failedPaths,
           scannedPaths,
+          observedFilePaths,
           scannedDirs,
+          folderPaths,
           true,
         );
       } else {
-        await this.scanSinglePath(prefix, entries, skippedLarge, failedPaths, scannedPaths);
+        await this.scanSinglePath(
+          prefix,
+          entries,
+          skippedLarge,
+          failedPaths,
+          scannedPaths,
+          observedFilePaths,
+        );
       }
     }
   }
@@ -500,6 +775,7 @@ export class LocalScanner {
     skippedLarge: string[],
     failedPaths: string[],
     scannedPaths: Set<string>,
+    observedFilePaths: Set<string>,
   ): Promise<void> {
     if (scannedPaths.has(filePath)) return;
     scannedPaths.add(filePath);
@@ -518,6 +794,7 @@ export class LocalScanner {
       this.diag?.warn("scan", `stat returned null for "${filePath}", skipping`);
       return;
     }
+    observedFilePaths.add(filePath);
 
     if (stat.size > this.config.maxFileSize) {
       skippedLarge.push(filePath);
@@ -526,7 +803,14 @@ export class LocalScanner {
 
     const cached = this.cacheProbe(filePath, stat.mtime ?? 0, stat.size);
     if (cached) {
-      entries.push({ path: filePath, size: stat.size, mtime: stat.mtime ?? 0, hash: cached.hash, binary: cached.binary });
+      entries.push({
+        path: filePath,
+        size: stat.size,
+        mtime: stat.mtime ?? 0,
+        hash: cached.hash,
+        ...(cached.quickXorHash ? { quickXorHash: cached.quickXorHash } : {}),
+        binary: cached.binary,
+      });
       return;
     }
 
@@ -539,9 +823,17 @@ export class LocalScanner {
     }
 
     const hash = await sha256Hex(content);
+    const quickXorHash = quickXorHashBase64(content);
     const binary = stat.size > 0 ? isBinary(content) : false;
-    entries.push({ path: filePath, size: stat.size, mtime: stat.mtime ?? 0, hash, binary });
-    this.cacheSet(filePath, stat.mtime ?? 0, stat.size, hash, binary);
+    entries.push({
+      path: filePath,
+      size: stat.size,
+      mtime: stat.mtime ?? 0,
+      hash,
+      quickXorHash,
+      binary,
+    });
+    this.cacheSet(filePath, stat.mtime ?? 0, stat.size, hash, quickXorHash, binary);
   }
 
   /** Recursively list and scan files under `dirPath` via vault.adapter.
@@ -555,7 +847,9 @@ export class LocalScanner {
     skippedLarge: string[],
     failedPaths: string[],
     scannedPaths: Set<string>,
+    observedFilePaths: Set<string>,
     scannedDirs: Set<string>,
+    folderPaths: Set<string>,
     allowMissingRoot = false,
   ): Promise<void> {
     // Normalize: strip trailing slash(es) so path construction is clean
@@ -584,6 +878,7 @@ export class LocalScanner {
     let listed: { files: string[]; folders: string[] };
     try {
       listed = await this.vault.adapter.list(base);
+      folderPaths.add(base);
       this.diag?.log("scan", `scanDir("${base}") → ${listed.files.length} files, ${listed.folders.length} folders: [${listed.files.join(', ')}]`);
     } catch (err) {
       this.diag?.warn("scan", `scanDir("${base}") — list failed`, err);
@@ -595,6 +890,7 @@ export class LocalScanner {
       const path = normalizeListedPath(base, file);
       if (scannedPaths.has(path)) continue;
       scannedPaths.add(path);
+      observedFilePaths.add(path);
 
       if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
         if (path.endsWith("/data.json")) {
@@ -624,7 +920,14 @@ export class LocalScanner {
 
       const cached = this.cacheProbe(path, stat.mtime ?? 0, stat.size);
       if (cached) {
-        entries.push({ path, size: stat.size, mtime: stat.mtime ?? 0, hash: cached.hash, binary: cached.binary });
+        entries.push({
+          path,
+          size: stat.size,
+          mtime: stat.mtime ?? 0,
+          hash: cached.hash,
+          ...(cached.quickXorHash ? { quickXorHash: cached.quickXorHash } : {}),
+          binary: cached.binary,
+        });
         continue;
       }
 
@@ -637,14 +940,51 @@ export class LocalScanner {
       }
 
       const hash = await sha256Hex(content);
+      const quickXorHash = quickXorHashBase64(content);
       const binary = stat.size > 0 ? isBinary(content) : false;
-      entries.push({ path, size: stat.size, mtime: stat.mtime ?? 0, hash, binary });
-      this.cacheSet(path, stat.mtime ?? 0, stat.size, hash, binary);
+      entries.push({ path, size: stat.size, mtime: stat.mtime ?? 0, hash, quickXorHash, binary });
+      this.cacheSet(path, stat.mtime ?? 0, stat.size, hash, quickXorHash, binary);
     }
 
     for (const sub of listed.folders) {
       const path = normalizeListedPath(base, sub);
-      await this.scanDir(path, entries, skippedLarge, failedPaths, scannedPaths, scannedDirs);
+      await this.scanDir(
+        path,
+        entries,
+        skippedLarge,
+        failedPaths,
+        scannedPaths,
+        observedFilePaths,
+        scannedDirs,
+        folderPaths,
+      );
+    }
+  }
+
+  private collectLoadedFolderPaths(
+    folderPaths: Set<string>,
+    folderScanFailures: string[],
+  ): void {
+    const getAllLoadedFiles = (
+      this.vault as Vault & { getAllLoadedFiles?: Vault["getAllLoadedFiles"] }
+    ).getAllLoadedFiles;
+    if (typeof getAllLoadedFiles !== "function") {
+      folderScanFailures.push("/");
+      this.diag?.warn("scan", "vault folder enumeration is unavailable");
+      return;
+    }
+    let loaded: ReturnType<Vault["getAllLoadedFiles"]>;
+    try {
+      loaded = getAllLoadedFiles.call(this.vault);
+    } catch (error) {
+      folderScanFailures.push("/");
+      this.diag?.warn("scan", "vault folder enumeration failed", error);
+      return;
+    }
+    for (const entry of loaded) {
+      if (!(entry instanceof TFolder)) continue;
+      const path = normalizeVaultRelativePath(entry.path);
+      if (this.shouldSyncFolderPath(path)) folderPaths.add(path);
     }
   }
 
@@ -654,7 +994,14 @@ export class LocalScanner {
     const { entry } = inspection;
     // Keep scan cache current so the next scanAll() doesn't redundantly re-read
     await this.loadScanCache();
-    this.cacheSet(path, entry.mtime, entry.size, entry.hash, entry.binary);
+    this.cacheSet(
+      path,
+      entry.mtime,
+      entry.size,
+      entry.hash,
+      entry.quickXorHash,
+      entry.binary,
+    );
     await this.saveScanCache();
 
     return entry;
@@ -685,11 +1032,19 @@ export class LocalScanner {
       return { status: "uncertain", reason: "read" };
     }
 
-      const hash = await sha256Hex(content);
+    const hash = await sha256Hex(content);
+    const quickXorHash = quickXorHashBase64(content);
     const binary = stat.size > 0 ? isBinary(content) : false;
     return {
       status: "present",
-      entry: { path, size: stat.size, mtime: stat.mtime ?? 0, hash, binary },
+      entry: {
+        path,
+        size: stat.size,
+        mtime: stat.mtime ?? 0,
+        hash,
+        quickXorHash,
+        binary,
+      },
     };
   }
 }
@@ -697,6 +1052,63 @@ export class LocalScanner {
 function normalizeListedPath(base: string, entry: string): string {
   const normalized = entry.replace(/\/+$/, "");
   return normalized.startsWith(`${base}/`) ? normalized : `${base}/${normalized}`;
+}
+
+function addParentFolderPaths(filePath: string, target: Set<string>): void {
+  const parts = normalizeVaultRelativePath(filePath).split("/");
+  parts.pop();
+  let current = "";
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    target.add(current);
+  }
+}
+
+function buildFolderSnapshot(
+  candidates: ReadonlySet<string>,
+  observedFiles: ReadonlySet<string>,
+  scanner: Pick<LocalScanner, "shouldSyncFolderPath" | "shouldSyncPath">,
+): { entries: LocalFolderEntry[]; conflicts: string[] } {
+  const byNormalizedPath = new Map<string, string>();
+  const conflicts = new Set<string>();
+  const candidatesWithParents = new Set(candidates);
+  for (const candidate of candidates) {
+    addParentFolderPaths(`${candidate}/__folder_snapshot__`, candidatesWithParents);
+  }
+  for (const candidate of candidatesWithParents) {
+    const path = normalizeVaultRelativePath(candidate);
+    if (!path || !scanner.shouldSyncFolderPath(path)) continue;
+    const key = normalizeTopologyPath(path);
+    const previous = byNormalizedPath.get(key);
+    if (previous && previous !== path) {
+      conflicts.add(previous);
+      conflicts.add(path);
+      continue;
+    }
+    byNormalizedPath.set(key, path);
+  }
+  for (const candidate of observedFiles) {
+    const path = normalizeVaultRelativePath(candidate);
+    if (!path || !scanner.shouldSyncPath(path)) continue;
+    if (byNormalizedPath.has(normalizeTopologyPath(path))) {
+      conflicts.add(path);
+      conflicts.add(byNormalizedPath.get(normalizeTopologyPath(path))!);
+    }
+  }
+  return {
+    entries: [...byNormalizedPath.values()]
+      .sort(comparePath)
+      .map((path) => ({ path })),
+    conflicts: [...conflicts].sort(comparePath),
+  };
+}
+
+function comparePath(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function normalizeTopologyPath(path: string): string {
+  return path.normalize("NFC").toLocaleLowerCase();
 }
 
 function sleep(ms: number): Promise<void> {

@@ -1,12 +1,18 @@
 import { ProgressBarComponent } from "obsidian";
 import type { SyncResult } from "../sync/sync-executor";
 import {
+  isSyncResultFullyComplete,
+  resolveSyncPendingAttentionCounts,
+} from "./sync-result-presentation";
+import {
   syncProgressPercent,
+  type FileProgress,
   type SyncProgressState,
 } from "../sync/sync-progress";
 import type { EasySyncNoticeMessage } from "./notice-center";
 import {
   resolveSyncActivityPresentation,
+  trimSyncActivityLabel,
   translateSyncActivity,
   type SyncActivityPresentation,
   type SyncStatusTranslator,
@@ -15,6 +21,9 @@ import {
 export type SyncNoticeOutcomeKind =
   | "completed"
   | "conflicts"
+  | "remoteDeletes"
+  | "mixedPending"
+  | "communityPluginEnablement"
   | "review"
   | "cancelled"
   | "failed"
@@ -23,6 +32,7 @@ export type SyncNoticeOutcomeKind =
 export interface SyncNoticeOutcome {
   kind: SyncNoticeOutcomeKind;
   count: number;
+  remoteDeletes?: number;
 }
 
 export function shouldSuppressSyncNoticeForVisibleSidebar(input: {
@@ -64,10 +74,7 @@ export function resolveSyncProgressNoticePresentation(
     kind = "cancelling";
   } else if (activity.kind === "starting") {
     kind = "starting";
-  } else if (
-    determinate
-    && ["syncing", "uploading", "downloading", "deleting", "renaming"].includes(activity.kind)
-  ) {
+  } else if (determinate && progress.phase === "executing") {
     kind = "progress";
   }
   return {
@@ -92,6 +99,15 @@ export function formatSyncProgressNoticeLabel(
     case "cancelling":
       return t("notice.sync.cancelling");
     case "progress":
+      if (presentation.activity.kind !== "syncing") {
+        return t("notice.sync.actionProgress", {
+          action: trimSyncActivityLabel(
+            translateSyncActivity(presentation.activity, t),
+          ),
+          current: presentation.current,
+          total: presentation.total,
+        });
+      }
       return t("notice.sync.progress", {
         current: presentation.current,
         total: presentation.total,
@@ -109,16 +125,39 @@ export function formatSyncProgressNoticeLabel(
 export function resolveSyncNoticeOutcome(
   result: SyncResult,
   context: { pausedForReview?: boolean; cancelled?: boolean } = {},
+  completedFiles: readonly Pick<FileProgress, "actionType">[] = [],
 ): SyncNoticeOutcome | null {
   if (result.authExpired) return { kind: "authExpired", count: 0 };
+  if (
+    result.attention?.reason
+      === "community-plugin-enablement-decision-required"
+  ) {
+    return {
+      kind: "communityPluginEnablement",
+      count: result.attention.count,
+    };
+  }
   if (context.pausedForReview) return { kind: "review", count: 0 };
   if (context.cancelled) return { kind: "cancelled", count: 0 };
   if (result.errors > 0 || !result.success) return { kind: "failed", count: 0 };
-  if (result.conflicts > 0) return { kind: "conflicts", count: result.conflicts };
-  if (result.deferred > 0) return null;
-  const changedFiles = result.uploaded + result.downloaded + result.deleted > 0;
-  const healthyNoChange = result.skippedLarge === 0 && result.skippedIgnored === 0;
-  if (changedFiles || healthyNoChange) {
+  if (result.conflicts > 0) {
+    const pending = resolveSyncPendingAttentionCounts(
+      result.conflicts,
+      completedFiles,
+    );
+    if (pending.remoteDeletes > 0 && pending.conflicts === 0) {
+      return { kind: "remoteDeletes", count: pending.remoteDeletes };
+    }
+    if (pending.remoteDeletes > 0) {
+      return {
+        kind: "mixedPending",
+        count: pending.conflicts,
+        remoteDeletes: pending.remoteDeletes,
+      };
+    }
+    return { kind: "conflicts", count: result.conflicts };
+  }
+  if (isSyncResultFullyComplete(result)) {
     return { kind: "completed", count: 0 };
   }
   return null;

@@ -33,13 +33,6 @@ import { generateCodeVerifier, generateCodeChallengeSync, generateState } from "
 import type { DiagnosticLogger } from "../sync/diagnostic-logger";
 
 /** Minimal interface for the Obsidian plugin context used by auth */
-export interface AuthPopupHandle {
-  /** Navigate an already-opened browser window to the target URL. */
-  navigate(url: string): boolean;
-  /** Close the pre-opened window when auth bootstrap fails early. */
-  close(): void;
-}
-
 export interface AuthPluginContext {
   /** Obsidian SecretStorage for refresh token persistence */
   secretStorage: {
@@ -52,8 +45,6 @@ export interface AuthPluginContext {
     action: string,
     handler: (params: Record<string, string>) => void,
   ): void;
-  /** Pre-open a browser window synchronously from the click gesture. */
-  openAuthPopup?(): AuthPopupHandle | null;
   /** Open a URL in the system browser */
   openUrl(url: string): void;
   /** Cache for user profile (displayName, accountId) to avoid network call on every startup */
@@ -128,6 +119,13 @@ export class AuthModule {
       return false;
     }
     return true;
+  }
+
+  /** Exact URL for the current unexpired login attempt.
+   *  Kept in memory only so the UI can offer a manual browser fallback. */
+  get pendingAuthUrl(): string | null {
+    if (!this.isPending) return null;
+    return this.pending?.authUrl ?? null;
   }
 
   /** True while initialize() is restoring a session from SecretStorage.
@@ -241,58 +239,47 @@ export class AuthModule {
       );
     }
 
-    // Mobile pre-opens a blank browser window BEFORE any async work to
-    // preserve the user-action gesture. Desktop skips the popup and opens
-    // the completed authorization URL directly in the system browser.
-    const popup = this.ctx.openAuthPopup?.() ?? null;
+    // ---- Synchronous block: entire PKCE + URL construction and browser open ----
+    // No await is allowed here. Mobile WebViews require window.open() to stay
+    // on the same synchronous chain as the user tap.
+    const codeVerifier = generateCodeVerifier();
+    const codeChallenge = generateCodeChallengeSync(codeVerifier);
+    const state = generateState();
 
-    try {
-      // ---- Synchronous block: entire PKCE + URL construction ----
-      // No await allowed in this section — iOS WKWebView requires
-      // window.open() to be called on the same synchronous chain as
-      // the user tap.
+    const params = new URLSearchParams({
+      client_id: MS_AUTH_CONFIG.clientId,
+      response_type: "code",
+      redirect_uri: MS_AUTH_CONFIG.redirectUri,
+      scope: MS_AUTH_CONFIG.scopes.join(" "),
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256",
+      state,
+      prompt: "consent", // force re-consent so scope upgrades (e.g. AppFolder → Files.ReadWrite) take effect
+    });
 
-      const codeVerifier = generateCodeVerifier();
-      const codeChallenge = generateCodeChallengeSync(codeVerifier);
-      const state = generateState();
+    const authUrl = `${MS_AUTH_CONFIG.authorizeEndpoint}?${params.toString()}`;
 
-      this.pending = {
-        codeVerifier,
-        state,
-        createdAt: Date.now(),
-      };
+    // Store the exact URL before opening it so a manual copy uses the same
+    // state and PKCE verifier as the callback that this attempt expects.
+    this.pending = {
+      codeVerifier,
+      state,
+      authUrl,
+      createdAt: Date.now(),
+    };
 
-      const params = new URLSearchParams({
-        client_id: MS_AUTH_CONFIG.clientId,
-        response_type: "code",
-        redirect_uri: MS_AUTH_CONFIG.redirectUri,
-        scope: MS_AUTH_CONFIG.scopes.join(" "),
-        code_challenge: codeChallenge,
-        code_challenge_method: "S256",
-        state,
-        prompt: "consent", // force re-consent so scope upgrades (e.g. AppFolder → Files.ReadWrite) take effect
-      });
+    // Open the completed URL exactly once. Android WebView can leave a
+    // pre-opened about:blank page unchanged without throwing on location
+    // assignment, which made the former fallback report a false success.
+    this.diag?.log("auth", "opening auth URL...");
+    this.ctx.openUrl(authUrl);
+    this.diag?.log("auth", "openUrl returned");
+    // ---- End synchronous block ----
 
-      const authUrl = `${MS_AUTH_CONFIG.authorizeEndpoint}?${params.toString()}`;
-      // ---- End synchronous block ----
-
-      // Try navigating the mobile pre-opened popup first. Desktop has no
-      // popup and uses the system-browser launcher directly. A blocked mobile
-      // popup also falls back while still on the synchronous click chain.
-      this.diag?.log("auth", "opening auth URL...");
-      const navigated = popup?.navigate(authUrl) ?? false;
-      if (!navigated) {
-        this.ctx.openUrl(authUrl);
-      }
-      this.diag?.log("auth", "openUrl returned");
-
-      // Start auto-polling — detects OAuth callback completion and refreshes UI
-      this.startPolling();
-      this.diag?.log("auth", "polling started");
-    } catch (error) {
-      popup?.close();
-      throw error;
-    }
+    // Start auto-polling — detects OAuth callback completion and refreshes UI
+    this.startPolling();
+    this.notifyChange();
+    this.diag?.log("auth", "polling started");
   }
 
   /** Handle the OAuth redirect callback */
@@ -531,7 +518,13 @@ export class AuthModule {
         if (data.id) {
           this.state.accountId = data.id;
         }
-        if (this.state.accountId) {
+        if (
+          this.state.accountId
+          && (
+            cached?.displayName !== this.state.displayName
+            || cached.accountId !== this.state.accountId
+          )
+        ) {
           await this.ctx.profileCache?.set({
             displayName: this.state.displayName,
             accountId: this.state.accountId,

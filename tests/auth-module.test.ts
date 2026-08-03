@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as obsidian from "obsidian";
 import { AuthModule, type AuthPluginContext } from "../src/auth/auth-module";
+import { createAuthBrowserLauncher } from "../src/auth/auth-browser";
 
 // We mock generateCodeChallengeSync (the sync path now used by login()).
 // generateCodeChallenge (async) is kept unmocked for other test paths.
@@ -28,10 +29,6 @@ function makeContext(overrides: Partial<AuthPluginContext> = {}): AuthPluginCont
       remove: vi.fn().mockResolvedValue(undefined),
     },
     registerProtocolHandler: vi.fn(),
-    openAuthPopup: vi.fn(() => ({
-      navigate: vi.fn(() => true),
-      close: vi.fn(),
-    })),
     openUrl: vi.fn(),
     ...overrides,
   };
@@ -44,88 +41,122 @@ describe("AuthModule.login", () => {
     vi.restoreAllMocks();
   });
 
-  it("builds the auth URL synchronously and navigates the pre-opened popup", async () => {
+  it("builds and directly opens the completed mobile auth URL on the synchronous click chain", async () => {
     vi.useFakeTimers();
 
-    const popup = {
-      navigate: vi.fn(() => true),
-      close: vi.fn(),
-    };
+    const openWindow = vi.fn(() => null);
+    const launcher = createAuthBrowserLauncher({
+      isDesktopApp: false,
+      openWindow,
+    });
     const ctx = makeContext({
-      openAuthPopup: vi.fn(() => popup),
-      openUrl: vi.fn(),
+      ...launcher,
     });
     const auth = new AuthModule(ctx);
+    const onStateChange = vi.fn();
+    auth.onStateChange(onStateChange);
 
-    // login() is still declared async but the browser-open path is
-    // entirely synchronous — no await needed for the core logic.
-    await auth.login();
+    const loginPromise = auth.login();
 
-    // Popup must be pre-opened first (sync, before PKCE)
-    expect(ctx.openAuthPopup).toHaveBeenCalledTimes(1);
-
-    // Sync challenge must have been called
     expect(syncChallengeMock.generateCodeChallengeSync).toHaveBeenCalledWith("verifier-fixed");
-
-    // Popup must be navigated to the full auth URL
-    expect(popup.navigate).toHaveBeenCalledTimes(1);
-    expect(popup.navigate).toHaveBeenCalledWith(
+    expect(openWindow).toHaveBeenCalledOnce();
+    expect(openWindow).toHaveBeenCalledWith(
       expect.stringContaining("code_challenge=challenge-sync-fixed"),
+      "_blank",
     );
-    expect(popup.navigate).toHaveBeenCalledWith(
+    expect(openWindow).toHaveBeenCalledWith(
       expect.stringContaining(`redirect_uri=${encodeURIComponent("obsidian://easy-sync-auth")}`),
+      "_blank",
     );
-    expect(popup.navigate).toHaveBeenCalledWith(
+    expect(openWindow).toHaveBeenCalledWith(
       expect.stringContaining("state=state-fixed"),
+      "_blank",
+    );
+    expect(openWindow).not.toHaveBeenCalledWith("about:blank", "_blank");
+    expect(auth.pendingAuthUrl).toBe(openWindow.mock.calls[0][0]);
+    expect(auth.isPending).toBe(true);
+    expect(onStateChange).toHaveBeenCalledOnce();
+    expect(openWindow.mock.invocationCallOrder[0]).toBeLessThan(
+      onStateChange.mock.invocationCallOrder[0],
     );
 
-    // openUrl must NOT be called (popup navigation succeeded)
-    expect(ctx.openUrl).not.toHaveBeenCalled();
+    await loginPromise;
 
-    // pending must be set
-    expect(auth.isPending).toBe(true);
-
-    // polling must be active
     expect(vi.getTimerCount()).toBeGreaterThan(0);
   });
 
-  it("falls back to direct openUrl when popup navigation fails", async () => {
-    const popup = {
-      navigate: vi.fn(() => false), // navigation fails
-      close: vi.fn(),
-    };
-    const ctx = makeContext({
-      openAuthPopup: vi.fn(() => popup),
-      openUrl: vi.fn(),
-    });
-    const auth = new AuthModule(ctx);
+  it("expires the current pending URL with the existing five-minute pending state", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-01T12:00:00Z"));
+    const auth = new AuthModule(makeContext());
 
     await auth.login();
+    expect(auth.pendingAuthUrl).toContain("state=state-fixed");
 
-    expect(popup.navigate).toHaveBeenCalledTimes(1);
-    // Fallback must fire
-    expect(ctx.openUrl).toHaveBeenCalledTimes(1);
-    expect(ctx.openUrl).toHaveBeenCalledWith(
-      expect.stringContaining("code_challenge=challenge-sync-fixed"),
-    );
-    expect(auth.isPending).toBe(true);
+    vi.setSystemTime(new Date("2026-08-01T12:05:00.001Z"));
+    expect(auth.pendingAuthUrl).toBeNull();
+    expect(auth.isPending).toBe(false);
   });
 
-  it("falls back to direct openUrl when openAuthPopup is not available", async () => {
-    const ctx = makeContext({
-      openAuthPopup: undefined,
-      openUrl: vi.fn(),
-    });
-    const auth = new AuthModule(ctx);
-
-    await auth.login();
-
-    // openUrl must be called directly
-    expect(ctx.openUrl).toHaveBeenCalledTimes(1);
-    expect(ctx.openUrl).toHaveBeenCalledWith(
-      expect.stringContaining("code_challenge=challenge-sync-fixed"),
+  it("completes the callback chain for the exact current URL opened manually", async () => {
+    let callback: ((params: Record<string, string>) => void) | undefined;
+    const registerProtocolHandler = vi.fn(
+      (_action: string, handler: (params: Record<string, string>) => void) => {
+        callback = handler;
+      },
     );
-    expect(auth.isPending).toBe(true);
+    const openUrl = vi.fn();
+    const secretSet = vi.fn().mockResolvedValue(undefined);
+    const request = vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            access_token: "access-token",
+            refresh_token: "refresh-token",
+            expires_in: 3600,
+          },
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "Manual Browser User", id: "manual-account" },
+      };
+    });
+    const auth = new AuthModule(makeContext({
+      registerProtocolHandler,
+      openUrl,
+      secretStorage: {
+        set: secretSet,
+        get: vi.fn().mockResolvedValue(null),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+    }));
+
+    await auth.initialize();
+    await auth.login();
+    const currentUrl = auth.pendingAuthUrl;
+
+    expect(currentUrl).toBe(openUrl.mock.calls[0][0]);
+    expect(currentUrl).toContain("state=state-fixed");
+    expect(callback).toBeTypeOf("function");
+
+    callback?.({ code: "manual-auth-code", state: "state-fixed" });
+    await vi.waitFor(() => expect(auth.authState.isLoggedIn).toBe(true));
+
+    const tokenRequest = request.mock.calls.find(([options]) =>
+      options.url.includes("/oauth2/v2.0/token"),
+    )?.[0];
+    expect(tokenRequest?.body).toContain("code=manual-auth-code");
+    expect(tokenRequest?.body).toContain("code_verifier=verifier-fixed");
+    expect(secretSet).toHaveBeenCalledWith(
+      "easy-sync-onedrive-refresh-token",
+      "refresh-token",
+    );
+    expect(auth.authState.accountId).toBe("manual-account");
+    expect(auth.pendingAuthUrl).toBeNull();
   });
 });
 
@@ -209,6 +240,48 @@ describe("AuthModule account identity", () => {
     expect(auth.authState.isLoggedIn).toBe(true);
     expect(auth.authState.displayName).toBe("Cached User");
     expect(auth.authState.accountId).toBe("");
+  });
+
+  it("verifies /me on cold start without rewriting an identical profile cache", async () => {
+    const request = vi.spyOn(obsidian, "requestUrl").mockImplementation(
+      async (options) => {
+        if (options.url.includes("/oauth2/v2.0/token")) {
+          return {
+            status: 200,
+            headers: {},
+            json: { access_token: "current-token", expires_in: 3600 },
+          };
+        }
+        return {
+          status: 200,
+          headers: {},
+          json: { displayName: "Current User", id: "current-account" },
+        };
+      },
+    );
+    const cacheSet = vi.fn().mockResolvedValue(undefined);
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn().mockResolvedValue("stored-refresh-token"),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      profileCache: {
+        get: vi.fn().mockResolvedValue({
+          displayName: "Current User",
+          accountId: "current-account",
+        }),
+        set: cacheSet,
+        clear: vi.fn().mockResolvedValue(undefined),
+      },
+    }));
+
+    await auth.initialize();
+
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request.mock.calls[1][0].url).toContain("/me?");
+    expect(auth.authState.accountId).toBe("current-account");
+    expect(cacheSet).not.toHaveBeenCalled();
   });
 });
 

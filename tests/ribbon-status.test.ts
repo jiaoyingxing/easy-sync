@@ -87,4 +87,18 @@ describe("resolveRibbonStatus", () => {
       .toBe("准备远端存储，打开同步状态");
     expect(RIBBON_STATUS_ICONS.syncing).toBe("refresh-cw");
   });
+
+  it("describes recovery blocks as unconfirmed outcomes rather than user review", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+
+    expect(zh.t("status.recoveryBlocked"))
+      .toBe("EasySync: 上次操作结果无法确认");
+    expect(zh.t("ribbon.recoveryBlocked"))
+      .toBe("上次操作结果无法确认，打开同步状态");
+    expect(en.t("status.recoveryBlocked"))
+      .toBe("EasySync: Previous operation could not be confirmed");
+    expect(en.t("ribbon.recoveryBlocked"))
+      .toBe("Previous operation could not be confirmed; open sync status");
+  });
 });

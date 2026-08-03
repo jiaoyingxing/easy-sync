@@ -1,0 +1,312 @@
+{
+  "provenance": {
+    "release": "1.1.3",
+    "kind": "schema-exemplar",
+    "containsUserData": false,
+    "sourceRepository": "E:/Code/easy-sync-public",
+    "sourceTag": "1.1.3",
+    "sourceCommit": "01a4ac30936a89c53ddbf521e7ea9399d71e79c4",
+    "releaseUrl": "https://github.com/jiaoyingxing/easy-sync/releases/tag/1.1.3",
+    "method": "Synthetic values constrained by the exact public tag constants and parsers; release asset hashes are copied from the verified 1.1.3 release record.",
+    "releaseAssets": {
+      "main.js": {
+        "bytes": 630669,
+        "sha256": "efee3d8a67a0bd7dacf7816eea92d1f1efa6498ae708f0fd137348717af3db91"
+      },
+      "manifest.json": {
+        "bytes": 321,
+        "sha256": "bd436312289ad658726ac3fc116755a6ab0aca3910afb0e24552d5d5192244d4"
+      },
+      "styles.css": {
+        "bytes": 17554,
+        "sha256": "1d295c09152dd3070295c44f47114e336a81d69bbf24f2890529e4166ce24e10"
+      }
+    },
+    "sourceFiles": {
+      "manifest.json": "bd436312289ad658726ac3fc116755a6ab0aca3910afb0e24552d5d5192244d4",
+      "src/main.ts": "7fcde78df6d4bf684bfe99fce3363823529fea9b461e985128b47aac131d539e",
+      "src/sync/sync-engine.ts": "ad708214a0421025889cd334f8d3e91b885b7df4747d55ecd425fe8a2a8aa581",
+      "src/sync/sync-executor.ts": "d24af74247d08256454c14524559fcc7e03e0a65b3e9c2ee6475c70dca8fdde5",
+      "src/sync/state-manager.ts": "11b1701a9487582fc3bc43a24411d04ea03aa8df0af8c5ea79d34c6ff54a94b8",
+      "src/sync/types.ts": "d2243c1e34529bfcf99f332ddc7dc10b87d9c9039abb03d1c60b7d38558e7d55",
+      "src/sync/local-scanner.ts": "e100b929b02bba4f848a752e7e0b3efc071b4e260fc9b538b0146834ccf8d97d",
+      "src/auth/types.ts": "8bc4a10edf26123774703a68745b1fb6580e90221691548deef15a4034ab3382",
+      "src/obsidian-compat.ts": "6cc8ec42daf973ef32d255f0f31ae10384ad39e3f70d867f9dbbb460d02b5488"
+    }
+  },
+  "manifest": {
+    "id": "easy-sync",
+    "name": "EasySync",
+    "version": "1.1.3",
+    "minAppVersion": "1.11.4",
+    "description": "Two-way OneDrive sync with conflict safeguards, mobile support, and optional settings/plugin sync.",
+    "author": "Jiao Yingxing",
+    "authorUrl": "https://github.com/jiaoyingxing",
+    "isDesktopOnly": false
+  },
+  "oauth": {
+    "secretStorageKey": "easy-sync-onedrive-refresh-token",
+    "clientId": "7d9ac248-9c51-422f-8cba-49e0a6a1ed67",
+    "redirectUri": "obsidian://easy-sync-auth",
+    "scopes": [
+      "User.Read",
+      "offline_access",
+      "Files.ReadWrite.AppFolder",
+      "Files.Read"
+    ]
+  },
+  "pluginData": {
+    "sync-interval": 3,
+    "sync-plugin-files": true,
+    "sync-max-file-size-mb": 128,
+    "sync-diagnostic-logging": true,
+    "sync-editor": true,
+    "sync-appearance": false,
+    "sync-themes": true,
+    "sync-hotkeys": true,
+    "sync-core-plugins": false,
+    "sync-community-plugins": true,
+    "sync-plugin-data": false,
+    "sync-excluded-folders": [
+      "Private"
+    ],
+    "auto-sync-paused": true,
+    "sync-auto-merge": true,
+    "sync-auto-conflict-policy": {
+      "autoDeleteLocalFiles": false,
+      "mergeNonOverlappingText": true
+    },
+    "easy-sync-profile-cache": {
+      "displayName": "Release Fixture",
+      "accountId": "fixture-account-113"
+    },
+    "easy-sync-base-snapshot": {
+      "notes/stable.md": {
+        "path": "notes/stable.md",
+        "hash": "ed88b149ed4b8200429b1eba3751ea8461c260e4ffc1c489b48047132db92cab",
+        "size": 30,
+        "eTag": "etag-stable-113"
+      },
+      "notes/conflict.md": {
+        "path": "notes/conflict.md",
+        "hash": "2369f0667c374bd72db2f812f457f4847e664a2b73d2737b1d62828a45dda7e5",
+        "size": 32,
+        "eTag": "etag-conflict-base-113"
+      }
+    },
+    "easy-sync-pending-conflicts": [
+      {
+        "type": "conflict",
+        "path": "notes/conflict.md",
+        "local": {
+          "path": "notes/conflict.md",
+          "size": 34,
+          "mtime": 1721234501000,
+          "hash": "1111111111111111111111111111111111111111111111111111111111111111",
+          "binary": false
+        },
+        "remote": {
+          "path": "notes/conflict.md",
+          "driveId": "fixture-file-conflict",
+          "parentId": "fixture-folder-notes",
+          "size": 35,
+          "mtime": 1721234502000,
+          "eTag": "etag-conflict-remote-113",
+          "cTag": "ctag-conflict-remote-113",
+          "sha256Hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "reason": "reason.bothModified",
+        "baseEtag": "etag-conflict-base-113",
+        "decisionToken": {
+          "version": 1,
+          "vaultName": "Release Fixture Vault",
+          "accountId": "fixture-account-113",
+          "scope": {
+            "accountId": "fixture-account-113",
+            "driveId": "fixture-drive-113",
+            "vaultFolderId": "fixture-vault-folder-113",
+            "filesRootId": "fixture-files-root-113"
+          },
+          "local": {
+            "exists": true,
+            "hash": "1111111111111111111111111111111111111111111111111111111111111111",
+            "size": 34
+          },
+          "remote": {
+            "exists": true,
+            "driveId": "fixture-file-conflict",
+            "eTag": "etag-conflict-remote-113"
+          },
+          "ancestorHash": "2369f0667c374bd72db2f812f457f4847e664a2b73d2737b1d62828a45dda7e5"
+        }
+      }
+    ],
+    "easy-sync-pending-remote-deletes": [
+      {
+        "type": "confirmLocalDelete",
+        "path": "notes/deleted-remotely.md",
+        "reason": "reason.remoteDeleted"
+      }
+    ],
+    "easy-sync-pending-issues": [
+      {
+        "path": "notes/recover.md",
+        "actionType": "download",
+        "reason": "fixture interrupted download",
+        "updatedAt": 1721234510000,
+        "fileSize": 21,
+        "remoteETag": "etag-recover-113",
+        "consecutiveFailures": 1
+      }
+    ],
+    "easy-sync-last-sync-time": 1721234567890,
+    "easy-sync-plan-review-active": true,
+    "easy-sync-plan-review-counts": {
+      "uploads": 0,
+      "downloads": 1,
+      "deletes": 1,
+      "conflicts": 1,
+      "skipped": 0
+    },
+    "easy-sync-plan-review-items": [
+      {
+        "type": "conflict",
+        "path": "notes/conflict.md",
+        "reason": "reason.bothModified",
+        "localHash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "remoteETag": "etag-conflict-remote-113"
+      },
+      {
+        "type": "confirmLocalDelete",
+        "path": "notes/deleted-remotely.md",
+        "reason": "reason.remoteDeleted"
+      }
+    ],
+    "easy-sync-plan-review-digest": "release-1.1.3-review-digest",
+    "easy-sync-plan-review-revision": 12,
+    "easy-sync-plan-review-scope": {
+      "accountId": "fixture-account-113",
+      "driveId": "fixture-drive-113",
+      "vaultFolderId": "fixture-vault-folder-113",
+      "filesRootId": "fixture-files-root-113"
+    },
+    "easy-sync-history": [
+      {
+        "id": "release-1.1.3-history",
+        "mode": "manual",
+        "status": "partial",
+        "startedAt": 1721234500000,
+        "endedAt": 1721234510000,
+        "uploaded": 0,
+        "downloaded": 0,
+        "deleted": 0,
+        "conflicts": 1,
+        "deferred": 1,
+        "skipped": 0,
+        "errors": 1,
+        "message": "fixture partial run",
+        "files": []
+      }
+    ],
+    "easy-sync-generation": 11,
+    "easy-sync-bound-account": "fixture-account-113",
+    "easy-sync-mutation-ledger": [
+      {
+        "intent": {
+          "version": 1,
+          "operationId": "release-1.1.3-interrupted-download",
+          "planRevision": 12,
+          "scope": {
+            "accountId": "fixture-account-113",
+            "driveId": "fixture-drive-113",
+            "vaultFolderId": "fixture-vault-folder-113",
+            "filesRootId": "fixture-files-root-113"
+          },
+          "action": "download",
+          "path": "notes/recover.md",
+          "expectedLocal": {
+            "exists": false
+          },
+          "expectedRemote": {
+            "exists": true,
+            "driveId": "fixture-file-recover",
+            "eTag": "etag-recover-113",
+            "size": 21
+          },
+          "createdAt": 1721234505000
+        },
+        "receipt": null
+      }
+    ],
+    "release-1.1.3-unknown-key": {
+      "mustSurvive": true
+    }
+  },
+  "sidecars": {
+    ".obsidian/plugins/easy-sync/remote-state.json": {
+      "version": 1,
+      "generation": 11,
+      "scope": {
+        "accountId": "fixture-account-113",
+        "driveId": "fixture-drive-113",
+        "vaultFolderId": "fixture-vault-folder-113",
+        "filesRootId": "fixture-files-root-113"
+      },
+      "deltaLink": "https://graph.example/release-1.1.3-delta",
+      "entries": {
+        "notes/stable.md": {
+          "path": "notes/stable.md",
+          "driveId": "fixture-file-stable",
+          "parentId": "fixture-folder-notes",
+          "size": 30,
+          "mtime": 1721234500000,
+          "eTag": "etag-stable-113",
+          "cTag": "ctag-stable-113",
+          "sha256Hash": "ed88b149ed4b8200429b1eba3751ea8461c260e4ffc1c489b48047132db92cab"
+        },
+        "notes/conflict.md": {
+          "path": "notes/conflict.md",
+          "driveId": "fixture-file-conflict",
+          "parentId": "fixture-folder-notes",
+          "size": 35,
+          "mtime": 1721234502000,
+          "eTag": "etag-conflict-remote-113",
+          "cTag": "ctag-conflict-remote-113",
+          "sha256Hash": "2222222222222222222222222222222222222222222222222222222222222222"
+        },
+        "notes/recover.md": {
+          "path": "notes/recover.md",
+          "driveId": "fixture-file-recover",
+          "parentId": "fixture-folder-notes",
+          "size": 21,
+          "mtime": 1721234504000,
+          "eTag": "etag-recover-113",
+          "cTag": "ctag-recover-113"
+        }
+      },
+      "folders": {
+        "fixture-folder-notes": {
+          "path": "notes",
+          "driveId": "fixture-folder-notes",
+          "parentId": "fixture-files-root-113",
+          "name": "notes"
+        }
+      }
+    },
+    ".obsidian/plugins/easy-sync/base-content.json": {
+      "notes/stable.md": "release-1.1.3 stable baseline\n",
+      "notes/conflict.md": "release-1.1.3 conflict ancestor\n"
+    },
+    ".obsidian/plugins/easy-sync/scan-cache.json": {
+      "format": 1,
+      "entries": {
+        "notes/stable.md": {
+          "mtime": 1721234500000,
+          "size": 30,
+          "hash": "ed88b149ed4b8200429b1eba3751ea8461c260e4ffc1c489b48047132db92cab",
+          "binary": false
+        }
+      }
+    }
+  }
+}

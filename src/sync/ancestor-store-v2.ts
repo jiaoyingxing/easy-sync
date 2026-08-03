@@ -37,13 +37,20 @@ export class AncestorStoreV2 {
     const target = this.pathFor(hash);
     if (await this.adapter.exists(target)) {
       if (!await this.verifyObject(hash)) throw new Error(`Ancestor object is corrupt: ${hash}`);
+      await this.refreshManifestBestEffort();
       return hash;
     }
 
     await this.ensureDirectory();
     const next = `${this.paths.directory}/.${hash}.next`;
     await this.removeIfExists(next);
-    await this.adapter.write(next, new TextDecoder().decode(bytes));
+    try {
+      await this.adapter.write(next, new TextDecoder().decode(bytes));
+    } catch (error) {
+      // Adapter writes can complete durably before the platform reports a
+      // failure. Continue only when the exact staged bytes can be proven.
+      if (!await this.verifyPath(next, hash)) throw error;
+    }
     if (!await this.verifyPath(next, hash)) {
       throw new Error(`Ancestor staged object failed verification: ${hash}`);
     }
@@ -56,7 +63,7 @@ export class AncestorStoreV2 {
       await this.removeIfExists(next);
     }
     if (!await this.verifyObject(hash)) throw new Error(`Ancestor object failed publication: ${hash}`);
-    await this.publishManifest(await this.listHashes());
+    await this.refreshManifestBestEffort();
     return hash;
   }
 
@@ -127,14 +134,69 @@ export class AncestorStoreV2 {
       schemaVersion: 2,
       textHashes: [...new Set(hashes)].sort(),
     };
+    if (await this.manifestMatches(this.paths.manifest, manifest)) {
+      await this.removeIfExists(this.paths.manifestNext);
+      return;
+    }
     await this.removeIfExists(this.paths.manifestNext);
-    await this.adapter.write(this.paths.manifestNext, JSON.stringify(manifest));
-    const reread = JSON.parse(await this.adapter.read(this.paths.manifestNext)) as AncestorManifestV2;
-    if (reread.schemaVersion !== 2 || JSON.stringify(reread.textHashes) !== JSON.stringify(manifest.textHashes)) {
+    try {
+      await this.adapter.write(
+        this.paths.manifestNext,
+        JSON.stringify(manifest),
+      );
+    } catch (error) {
+      if (!await this.manifestMatches(this.paths.manifestNext, manifest)) {
+        throw error;
+      }
+    }
+    if (!await this.manifestMatches(this.paths.manifestNext, manifest)) {
       throw new Error("Ancestor manifest failed staged verification");
     }
     await this.removeIfExists(this.paths.manifest);
-    await this.adapter.rename(this.paths.manifestNext, this.paths.manifest);
+    try {
+      await this.adapter.rename(this.paths.manifestNext, this.paths.manifest);
+    } catch (error) {
+      if (!await this.manifestMatches(this.paths.manifest, manifest)) {
+        throw error;
+      }
+      await this.removeIfExists(this.paths.manifestNext);
+    }
+    if (!await this.manifestMatches(this.paths.manifest, manifest)) {
+      throw new Error("Ancestor manifest failed committed verification");
+    }
+  }
+
+  /**
+   * The manifest is a reconstructible inventory, never ancestor authority.
+   * A verified content-addressed object remains safe for an envelope to
+   * reference even if this derived cache cannot be refreshed. The next
+   * put/sweep attempt rebuilds it from the object directory.
+   */
+  private async refreshManifestBestEffort(): Promise<void> {
+    try {
+      await this.publishManifest(await this.listHashes());
+    } catch {
+      // Object existence plus hash verification is the publication proof.
+    }
+  }
+
+  private async manifestMatches(
+    path: string,
+    expected: AncestorManifestV2,
+  ): Promise<boolean> {
+    try {
+      if (!await this.adapter.exists(path)) return false;
+      const value = JSON.parse(
+        await this.adapter.read(path),
+      ) as Partial<AncestorManifestV2>;
+      return value.schemaVersion === 2
+        && Array.isArray(value.textHashes)
+        && value.textHashes.every((hash) => typeof hash === "string")
+        && JSON.stringify(value.textHashes)
+          === JSON.stringify(expected.textHashes);
+    } catch {
+      return false;
+    }
   }
 
   private async ensureDirectory(): Promise<void> {

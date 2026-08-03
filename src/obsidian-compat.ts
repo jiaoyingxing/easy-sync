@@ -41,6 +41,21 @@ export function getEasySyncPaths(
   stateV2RecoveryFile: string;
   stateV2ManifestFile: string;
   stateV2ManifestNextFile: string;
+  stateV2AuthorityWitnessFile: string;
+  stateV2AuthorityWitnessNextFile: string;
+  stateV2IndexedDbRecoveryDir: string;
+  stateV2RetiredManifestFile: string;
+  stateV2RollbackFile: string;
+  stateV2ReactivationArchivePrefix: string;
+  stateV2MigrationHoldFile: string;
+  stateV2MigrationHoldNextFile: string;
+  stateV2ScopeTransitionFile: string;
+  stateV2ScopeTransitionNextFile: string;
+  stateV2CorruptSourcePrefix: string;
+  stateV2CorruptRecoveryFile: string;
+  stateV2CorruptRecoveryNextFile: string;
+  stateV2CorruptPublicationFile: string;
+  stateV2CorruptPublicationNextFile: string;
   stateV1BackupFile: string;
   baseContentFile: string;
   ancestorsV2Dir: string;
@@ -69,6 +84,22 @@ export function getEasySyncPaths(
     stateV2RecoveryFile: `${pluginDir}/state-v2.recovery.json`,
     stateV2ManifestFile: `${pluginDir}/state-v2.manifest.json`,
     stateV2ManifestNextFile: `${pluginDir}/state-v2.manifest.next.json`,
+    stateV2AuthorityWitnessFile: `${pluginDir}/state-v2.authority.json`,
+    stateV2AuthorityWitnessNextFile: `${pluginDir}/state-v2.authority.next.json`,
+    stateV2IndexedDbRecoveryDir:
+      `${pluginDir}/state-v2-indexeddb-recovery`,
+    stateV2RetiredManifestFile: `${pluginDir}/state-v2.manifest.retired.json`,
+    stateV2RollbackFile: `${pluginDir}/state-v2.rollback.json`,
+    stateV2ReactivationArchivePrefix: `${pluginDir}/state-v2.reactivation-archive-`,
+    stateV2MigrationHoldFile: `${pluginDir}/state-v2.migration-hold.json`,
+    stateV2MigrationHoldNextFile: `${pluginDir}/state-v2.migration-hold.next.json`,
+    stateV2ScopeTransitionFile: `${pluginDir}/state-v2.scope-transition.json`,
+    stateV2ScopeTransitionNextFile: `${pluginDir}/state-v2.scope-transition.next.json`,
+    stateV2CorruptSourcePrefix: `${pluginDir}/state-v2.corrupt-source-`,
+    stateV2CorruptRecoveryFile: `${pluginDir}/state-v2.corrupt-recovery.json`,
+    stateV2CorruptRecoveryNextFile: `${pluginDir}/state-v2.corrupt-recovery.next.json`,
+    stateV2CorruptPublicationFile: `${pluginDir}/state-v2.corrupt-publication.json`,
+    stateV2CorruptPublicationNextFile: `${pluginDir}/state-v2.corrupt-publication.next.json`,
     stateV1BackupFile: `${pluginDir}/state-v1.backup.json`,
     baseContentFile: `${pluginDir}/base-content.json`,
     ancestorsV2Dir: `${pluginDir}/ancestors-v2`,
@@ -79,6 +110,25 @@ export function getEasySyncPaths(
     scanCacheFile: `${pluginDir}/scan-cache.json`,
     manifestFile: `${pluginDir}/manifest.json`,
   };
+}
+
+const EASY_SYNC_SELF_SYNC_FILE_NAMES = new Set([
+  "main.js",
+  "manifest.json",
+  "styles.css",
+]);
+
+/** Exact EasySync bundle files owned by the self-sync feature. */
+export function isEasySyncSelfSyncFilePath(
+  path: string,
+  configDir = DEFAULT_CONFIG_DIR,
+  pluginId = "easy-sync",
+): boolean {
+  const prefix = getEasySyncPaths(configDir, pluginId).pluginDirPrefix;
+  if (!path.startsWith(prefix)) return false;
+  const relativePath = path.slice(prefix.length);
+  return !relativePath.includes("/")
+    && EASY_SYNC_SELF_SYNC_FILE_NAMES.has(relativePath);
 }
 
 export function isRecord(value: unknown): value is Record<string, unknown> {

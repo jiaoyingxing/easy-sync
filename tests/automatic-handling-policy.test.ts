@@ -5,7 +5,7 @@ import {
   isAutomaticTextMergeCandidatePath,
   readAutomaticHandlingPolicy,
 } from "../src/sync/automatic-handling-policy";
-import { SyncEngine } from "../src/sync/sync-engine";
+import { shouldPauseFilePlanForConfirmationV2 } from "../src/sync/file-decision-planner-v2";
 import { SyncActionType, type SyncPlanItem } from "../src/sync/types";
 
 describe("automatic handling policy", () => {
@@ -68,8 +68,7 @@ describe("automatic handling policy", () => {
   });
 
   it("counts an executable local delete toward the large-change safety threshold", () => {
-    const engine = new SyncEngine();
-    expect(engine.shouldPauseForConfirmation({
+    expect(shouldPauseFilePlanForConfirmationV2({
       items: [{ type: SyncActionType.DeleteLocal, path: "deleted-remotely.md" }],
       lastTotalFiles: 1,
       confirmed: false,

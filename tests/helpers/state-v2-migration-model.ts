@@ -105,7 +105,12 @@ function verifiedCloudAnchor(
   const remoteEntry = remote.find((entry) => entry.id === hint.remoteId && entry.kind === "file");
   if (!localEntry || !remoteEntry?.eTag) return null;
   if (localEntry.hash !== hint.contentHash || localEntry.size !== hint.size) return null;
-  if (remoteEntry.path !== hint.lastPath || remoteEntry.contentHash !== hint.contentHash) return null;
+  const versionMatches = hint.remoteCTag
+    ? remoteEntry.cTag === hint.remoteCTag
+    : Boolean(hint.remoteETag) && remoteEntry.eTag === hint.remoteETag;
+  if (remoteEntry.path !== hint.lastPath
+    || remoteEntry.size !== hint.size
+    || !versionMatches) return null;
   return {
     anchorId: `cloud:${remoteEntry.id}`,
     remoteId: remoteEntry.id,

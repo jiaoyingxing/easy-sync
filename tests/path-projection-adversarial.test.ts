@@ -6,13 +6,14 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import type { DataAdapter } from "obsidian";
 import type { OneDriveClient } from "../src/onedrive/client";
 import type { DriveItem } from "../src/onedrive/types";
+import { getEasySyncPaths } from "../src/obsidian-compat";
 import type { LocalScanner } from "../src/sync/local-scanner";
-import type { DiagnosticLogger } from "../src/sync/diagnostic-logger";
+import { projectFileStatePathViewV2 } from "../src/sync/file-state-reducer-v2";
 import { StateManager } from "../src/sync/state-manager";
 import { SyncExecutor } from "../src/sync/sync-executor";
-import { SyncEngine } from "../src/sync/sync-engine";
 import type { LocalFileEntry, RemoteFileEntry } from "../src/sync/types";
 
 const ROOT_OLD = "files-root-old";
@@ -23,6 +24,7 @@ const CURRENT_SCOPE = {
   vaultFolderId: "vault-current",
   filesRootId: ROOT_NEW,
 };
+const PATHS = getEasySyncPaths(".obsidian");
 
 function remoteEntry(path: string, driveId = `remote-${path}`): RemoteFileEntry {
   return {
@@ -71,10 +73,56 @@ function file(id: string, name: string, parentId: string): DriveItem {
 
 async function makeMemoryState(initialRemoteState: unknown = null) {
   let persisted: Record<string, unknown> = {};
-  let remoteStateJson: string | null = initialRemoteState === null
-    ? null
-    : JSON.stringify(initialRemoteState);
+  const files = new Map<string, string>();
+  const folders = new Set<string>();
+  if (initialRemoteState !== null) {
+    files.set(PATHS.remoteStateFile, JSON.stringify(initialRemoteState));
+  }
   let saveQueue: Promise<void> = Promise.resolve();
+  const parentPath = (path: string): string => {
+    const separator = path.lastIndexOf("/");
+    return separator < 0 ? "" : path.slice(0, separator);
+  };
+  const adapter = {
+    exists: vi.fn(async (path: string) => files.has(path) || folders.has(path)),
+    read: vi.fn(async (path: string) => {
+      const value = files.get(path);
+      if (value === undefined) throw new Error(`missing ${path}`);
+      return value;
+    }),
+    write: vi.fn(async (path: string, value: string) => {
+      files.set(path, value);
+    }),
+    readBinary: vi.fn(async (path: string) => {
+      const value = files.get(path);
+      if (value === undefined) throw new Error(`missing ${path}`);
+      return new TextEncoder().encode(value).buffer;
+    }),
+    writeBinary: vi.fn(async (path: string, value: ArrayBuffer) => {
+      files.set(path, new TextDecoder().decode(value));
+    }),
+    remove: vi.fn(async (path: string) => {
+      files.delete(path);
+      folders.delete(path);
+    }),
+    rename: vi.fn(async (from: string, to: string) => {
+      const value = files.get(from);
+      if (value === undefined) throw new Error(`missing ${from}`);
+      files.delete(from);
+      files.set(to, value);
+    }),
+    mkdir: vi.fn(async (path: string) => {
+      folders.add(path);
+    }),
+    list: vi.fn(async (path: string) => ({
+      files: [...files.keys()]
+        .filter((candidate) => parentPath(candidate) === path)
+        .sort(),
+      folders: [...folders]
+        .filter((candidate) => parentPath(candidate) === path)
+        .sort(),
+    })),
+  } as unknown as DataAdapter;
   const plugin = {
     loadData: vi.fn(async () => persisted),
     saveData: vi.fn(async (next: Record<string, unknown>) => {
@@ -93,15 +141,7 @@ async function makeMemoryState(initialRemoteState: unknown = null) {
     app: {
       vault: {
         configDir: ".obsidian",
-        adapter: {
-          read: vi.fn(async () => {
-            if (remoteStateJson === null) throw new Error("missing");
-            return remoteStateJson;
-          }),
-          write: vi.fn(async (_path: string, value: string) => {
-            remoteStateJson = value;
-          }),
-        },
+        adapter,
       },
     },
   };
@@ -110,7 +150,30 @@ async function makeMemoryState(initialRemoteState: unknown = null) {
   return state;
 }
 
+function publicRemoteState(
+  entries: RemoteFileEntry[],
+  deltaLink: string,
+  scope: typeof CURRENT_SCOPE,
+) {
+  return {
+    version: 1,
+    generation: 0,
+    scope,
+    deltaLink,
+    entries: Object.fromEntries(entries.map((entry) => [entry.path, entry])),
+    folders: {},
+    folderIndexComplete: true,
+  };
+}
+
 function makeScanner(entries: LocalFileEntry[] = []): LocalScanner {
+  const folderPaths = new Set<string>();
+  for (const entry of entries) {
+    const segments = entry.path.split("/");
+    for (let index = 1; index < segments.length; index++) {
+      folderPaths.add(segments.slice(0, index).join("/"));
+    }
+  }
   return {
     vault: {
       adapter: {
@@ -130,28 +193,18 @@ function makeScanner(entries: LocalFileEntry[] = []): LocalScanner {
     },
     scanAll: vi.fn().mockResolvedValue({
       entries,
+      folders: [...folderPaths].sort().map((path) => ({ path, mtime: 1 })),
+      folderScanComplete: true,
       skippedLarge: [],
       failedPaths: [],
       skippedCount: 0,
       complete: true,
     }),
     scanFile: vi.fn().mockResolvedValue(null),
+    shouldSyncPath: vi.fn().mockReturnValue(true),
+    shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+    getMaxFileSize: vi.fn().mockReturnValue(500 * 1024 * 1024),
   } as unknown as LocalScanner;
-}
-
-function makeEngine() {
-  const generatePlan = vi.fn().mockReturnValue({
-    items: [],
-    lastTotalFiles: 0,
-    confirmed: false,
-  });
-  return {
-    generatePlan,
-    engine: {
-      generatePlan,
-      shouldPauseForConfirmation: vi.fn().mockReturnValue(false),
-    } as unknown as SyncEngine,
-  };
 }
 
 function makeOneDrive(
@@ -169,6 +222,7 @@ function makeOneDrive(
     downloadFileToPath: vi.fn(),
     deleteItem: vi.fn(),
   };
+  let sharedProtocol: { id: string; eTag: string; content: string } | null = null;
   return {
     client: {
       downloadBaseline: vi.fn().mockResolvedValue(null),
@@ -181,6 +235,24 @@ function makeOneDrive(
       getDelta,
       fullScan: vi.fn().mockResolvedValue([]),
       getFileMetadata: vi.fn().mockResolvedValue(null),
+      readSharedSyncProtocolV2: vi.fn(async () => sharedProtocol),
+      createSharedSyncProtocolV2: vi.fn(async (
+        _vaultName: string,
+        content: string,
+      ) => {
+        sharedProtocol = {
+          id: "protocol-id",
+          eTag: "protocol-etag",
+          content,
+        };
+        return { id: sharedProtocol.id, eTag: sharedProtocol.eTag };
+      }),
+      readSharedSyncProtocolV2ById: vi.fn(async (id: string) => {
+        if (!sharedProtocol || sharedProtocol.id !== id) {
+          throw new Error("protocol missing");
+        }
+        return sharedProtocol;
+      }),
       ...mutations,
     } as unknown as OneDriveClient,
     mutations,
@@ -195,31 +267,29 @@ async function runIdentityRebuild(
     local?: LocalFileEntry[];
   } = {},
 ) {
-  const state = await makeMemoryState();
-  await state.bindAccount(CURRENT_SCOPE.accountId);
   const cached = options.cached ?? [remoteEntry("old.md", "old-id")];
-  await state.setRemoteState(cached, "https://graph.example/delta-old", {
+  const cachedScope = {
     ...CURRENT_SCOPE,
     filesRootId: options.filesRootId ?? ROOT_NEW,
+  };
+  const state = await makeMemoryState(publicRemoteState(
+    cached,
+    "https://graph.example/delta-old",
+    cachedScope,
+  ));
+  await state.bindAccount(CURRENT_SCOPE.accountId);
+  const getDelta = vi.fn().mockResolvedValue({
+    value: completeItems,
+    "@odata.deltaLink": "https://graph.example/delta-rebuilt",
   });
-  const getDelta = vi.fn()
-    .mockResolvedValueOnce({
-      value: [folder("changed-folder", "changed", options.filesRootId ?? ROOT_NEW)],
-      "@odata.deltaLink": "https://graph.example/delta-unsafe",
-    })
-    .mockResolvedValueOnce({
-      value: completeItems,
-      "@odata.deltaLink": "https://graph.example/delta-rebuilt",
-    });
   const { client, mutations } = makeOneDrive(
     getDelta,
     options.filesRootId ?? ROOT_NEW,
   );
-  const { engine, generatePlan } = makeEngine();
+  vi.mocked(client.fullScan).mockResolvedValue(completeItems);
   const executor = new SyncExecutor(
     client,
     makeScanner(options.local),
-    engine,
     state,
     "testVault",
   );
@@ -227,7 +297,13 @@ async function runIdentityRebuild(
   const result = await executor.run("first", {
     onFirstSyncPreview: vi.fn().mockResolvedValue(false),
   });
-  return { state, getDelta, generatePlan, mutations, result };
+  return { state, getDelta, mutations, result };
+}
+
+function pendingMigrationRemoteSnapshot(state: StateManager): RemoteFileEntry[] {
+  const candidate = state.activeV2MigrationHold?.candidate;
+  if (!candidate) throw new Error("expected a pending V2 migration candidate");
+  return projectFileStatePathViewV2(candidate).remoteEntries;
 }
 
 function expectNoMutations(mutations: ReturnType<typeof makeOneDrive>["mutations"]): void {
@@ -248,10 +324,11 @@ describe("remote identity projection adversarial contract", () => {
       file("internal", "baseline.json", "plugin-root"),
     ]);
 
-    expect(result.state.remoteSnapshot).toEqual([
+    expect(pendingMigrationRemoteSnapshot(result.state)).toEqual([
       expect.objectContaining({ path: "Notes/note.md", driveId: "note" }),
     ]);
-    expect(result.state.remoteDeltaLink).toBe("https://graph.example/delta-rebuilt");
+    expect(result.getDelta).toHaveBeenCalledWith("testVault");
+    expect(result.state.remoteDeltaLink).toBe("https://graph.example/delta-old");
     expectNoMutations(result.mutations);
   });
 
@@ -262,20 +339,19 @@ describe("remote identity projection adversarial contract", () => {
       file("note", "note.md", "user-files"),
     ]);
 
-    expect(result.state.remoteSnapshot).toEqual([
+    expect(pendingMigrationRemoteSnapshot(result.state)).toEqual([
       expect.objectContaining({ path: "files/note.md", driveId: "note" }),
     ]);
     expectNoMutations(result.mutations);
   });
 
   it("does not mistake a legitimate local files folder for legacy pollution", async () => {
-    const state = await makeMemoryState();
-    await state.bindAccount(CURRENT_SCOPE.accountId);
-    await state.setRemoteState(
+    const state = await makeMemoryState(publicRemoteState(
       [remoteEntry("files/note.md", "note")],
       "https://graph.example/delta-old",
       CURRENT_SCOPE,
-    );
+    ));
+    await state.bindAccount(CURRENT_SCOPE.accountId);
     const local: LocalFileEntry = {
       path: "files/note.md",
       size: 4,
@@ -284,18 +360,27 @@ describe("remote identity projection adversarial contract", () => {
       binary: false,
     };
     const getDelta = vi.fn().mockResolvedValue({
-      value: [],
+      value: [
+        folder("user-files", "files", ROOT_NEW),
+        file("note", "note.md", "user-files"),
+      ],
       "@odata.deltaLink": "https://graph.example/delta-next",
     });
     const { client, mutations } = makeOneDrive(getDelta);
-    const { engine } = makeEngine();
-    const executor = new SyncExecutor(client, makeScanner([local]), engine, state, "testVault");
+    const executor = new SyncExecutor(client, makeScanner([local]), state, "testVault");
 
-    await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
+    await executor.run("first", {
+      onFirstSyncPreview: vi.fn().mockResolvedValue(false),
+    });
 
     expect(getDelta).toHaveBeenCalledTimes(1);
-    expect(getDelta).toHaveBeenCalledWith("testVault", "https://graph.example/delta-old");
-    expect(state.remoteSnapshot).toEqual([expect.objectContaining({ path: "files/note.md" })]);
+    expect(getDelta).toHaveBeenCalledWith("testVault");
+    expect(pendingMigrationRemoteSnapshot(state)).toEqual([
+      expect.objectContaining({ path: "files/note.md" }),
+    ]);
+    expect(state.remoteSnapshot).toEqual([
+      expect.objectContaining({ path: "files/note.md" }),
+    ]);
     expectNoMutations(mutations);
   });
 
@@ -304,9 +389,7 @@ describe("remote identity projection adversarial contract", () => {
       folder(ROOT_NEW, "files", "vault-root"),
       file("orphan", "orphan.md", "missing-parent"),
     ]);
-
     expect(result.result.success).toBe(false);
-    expect(result.generatePlan).not.toHaveBeenCalled();
     expect(result.state.remoteSnapshot).toEqual([remoteEntry("old.md", "old-id")]);
     expect(result.state.remoteDeltaLink).toBe("https://graph.example/delta-old");
     expectNoMutations(result.mutations);
@@ -320,7 +403,6 @@ describe("remote identity projection adversarial contract", () => {
     ]);
 
     expect(result.result.success).toBe(false);
-    expect(result.generatePlan).not.toHaveBeenCalled();
     expect(result.state.remoteSnapshot).toEqual([remoteEntry("old.md", "old-id")]);
     expectNoMutations(result.mutations);
   });
@@ -334,7 +416,6 @@ describe("remote identity projection adversarial contract", () => {
     ]);
 
     expect(result.result.success).toBe(false);
-    expect(result.generatePlan).not.toHaveBeenCalled();
     expect(result.state.remoteSnapshot).toEqual([remoteEntry("old.md", "old-id")]);
     expectNoMutations(result.mutations);
   });
@@ -365,33 +446,32 @@ describe("remote identity projection adversarial contract", () => {
       deleted,
     ]);
 
-    expect(result.state.remoteSnapshot).toEqual([]);
-    expect(result.state.remoteDeltaLink).toBe("https://graph.example/delta-rebuilt");
+    expect(pendingMigrationRemoteSnapshot(result.state)).toEqual([]);
+    expect(result.state.remoteDeltaLink).toBe("https://graph.example/delta-old");
     expectNoMutations(result.mutations);
   });
 
   it("keeps an existing file under its identity-proven parent when Graph path text contradicts it", async () => {
-    const state = await makeMemoryState();
-    await state.bindAccount(CURRENT_SCOPE.accountId);
-    await state.setRemoteState(
+    const state = await makeMemoryState(publicRemoteState(
       [identityRemoteEntry("Safe/old-name.md", "note", "safe-folder")],
       "https://graph.example/delta-old",
       CURRENT_SCOPE,
-    );
+    ));
+    await state.bindAccount(CURRENT_SCOPE.accountId);
     const changed = file("note", "new-name.md", "safe-folder");
     changed.parentReference!.path = "/drives/drive-current/root:/Apps/EasySync/vaults/testVault/files/Forged";
     const getDelta = vi.fn().mockResolvedValue({
-      value: [changed],
+      value: [folder("safe-folder", "Safe", ROOT_NEW), changed],
       "@odata.deltaLink": "https://graph.example/delta-next",
     });
     const { client, mutations } = makeOneDrive(getDelta);
-    const { engine } = makeEngine();
-    const executor = new SyncExecutor(client, makeScanner(), engine, state, "testVault");
+    const executor = new SyncExecutor(client, makeScanner(), state, "testVault");
 
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
     expect(getDelta).toHaveBeenCalledTimes(1);
-    expect(state.remoteSnapshot).toEqual([
+    expect(getDelta).toHaveBeenCalledWith("testVault");
+    expect(pendingMigrationRemoteSnapshot(state)).toEqual([
       expect.objectContaining({
         path: "Safe/new-name.md",
         driveId: "note",
@@ -402,25 +482,27 @@ describe("remote identity projection adversarial contract", () => {
   });
 
   it("applies a pathless file update when the cached and live parent identities match", async () => {
-    const state = await makeMemoryState();
-    await state.bindAccount(CURRENT_SCOPE.accountId);
-    await state.setRemoteState(
+    const state = await makeMemoryState(publicRemoteState(
       [identityRemoteEntry("Safe/note.md", "note", "safe-folder")],
       "https://graph.example/delta-old",
       CURRENT_SCOPE,
-    );
+    ));
+    await state.bindAccount(CURRENT_SCOPE.accountId);
     const getDelta = vi.fn().mockResolvedValue({
-      value: [file("note", "note.md", "safe-folder")],
+      value: [
+        folder("safe-folder", "Safe", ROOT_NEW),
+        file("note", "note.md", "safe-folder"),
+      ],
       "@odata.deltaLink": "https://graph.example/delta-next",
     });
     const { client, mutations } = makeOneDrive(getDelta);
-    const { engine } = makeEngine();
-    const executor = new SyncExecutor(client, makeScanner(), engine, state, "testVault");
+    const executor = new SyncExecutor(client, makeScanner(), state, "testVault");
 
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
     expect(getDelta).toHaveBeenCalledTimes(1);
-    expect(state.remoteSnapshot).toEqual([
+    expect(getDelta).toHaveBeenCalledWith("testVault");
+    expect(pendingMigrationRemoteSnapshot(state)).toEqual([
       expect.objectContaining({
         path: "Safe/note.md",
         driveId: "note",
@@ -431,36 +513,30 @@ describe("remote identity projection adversarial contract", () => {
   });
 
   it("rebuilds identity state for a new nested file instead of trusting Graph path text", async () => {
-    const state = await makeMemoryState();
-    await state.bindAccount(CURRENT_SCOPE.accountId);
-    await state.setRemoteState(
+    const state = await makeMemoryState(publicRemoteState(
       [],
       "https://graph.example/delta-old",
       CURRENT_SCOPE,
-    );
-    const unproven = file("note", "note.md", "unknown-folder");
-    unproven.parentReference!.path = "/drives/drive-current/root:/Apps/EasySync/vaults/testVault/files/Forged";
-    const getDelta = vi.fn()
-      .mockResolvedValueOnce({
-        value: [unproven],
-        "@odata.deltaLink": "https://graph.example/delta-unsafe",
-      })
-      .mockResolvedValueOnce({
-        value: [
-          folder("safe-folder", "Safe", ROOT_NEW),
-          file("note", "note.md", "safe-folder"),
-        ],
-        "@odata.deltaLink": "https://graph.example/delta-rebuilt",
-      });
+    ));
+    await state.bindAccount(CURRENT_SCOPE.accountId);
+    const live = file("note", "note.md", "safe-folder");
+    live.parentReference!.path =
+      "/drives/drive-current/root:/Apps/EasySync/vaults/testVault/files/Forged";
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [
+        folder("safe-folder", "Safe", ROOT_NEW),
+        live,
+      ],
+      "@odata.deltaLink": "https://graph.example/delta-rebuilt",
+    });
     const { client, mutations } = makeOneDrive(getDelta);
-    const { engine } = makeEngine();
-    const executor = new SyncExecutor(client, makeScanner(), engine, state, "testVault");
+    const executor = new SyncExecutor(client, makeScanner(), state, "testVault");
 
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
-    expect(getDelta).toHaveBeenNthCalledWith(1, "testVault", "https://graph.example/delta-old");
-    expect(getDelta).toHaveBeenNthCalledWith(2, "testVault");
-    expect(state.remoteSnapshot).toEqual([
+    expect(getDelta).toHaveBeenCalledTimes(1);
+    expect(getDelta).toHaveBeenCalledWith("testVault");
+    expect(pendingMigrationRemoteSnapshot(state)).toEqual([
       expect.objectContaining({
         path: "Safe/note.md",
         driveId: "note",
@@ -471,38 +547,40 @@ describe("remote identity projection adversarial contract", () => {
   });
 
   it("does not let an unknown tombstone delete a cached file by matching path text", async () => {
-    const state = await makeMemoryState();
-    await state.bindAccount(CURRENT_SCOPE.accountId);
-    await state.setRemoteState(
+    const state = await makeMemoryState(publicRemoteState(
       [identityRemoteEntry("Safe/note.md", "real-note", "safe-folder")],
       "https://graph.example/delta-old",
       CURRENT_SCOPE,
-    );
+    ));
+    await state.bindAccount(CURRENT_SCOPE.accountId);
     const getDelta = vi.fn().mockResolvedValue({
-      value: [{
-        id: "unrelated-deleted-id",
-        name: "note.md",
-        deleted: { state: "deleted" },
-        parentReference: {
-          id: "safe-folder",
-          path: "/drives/drive-current/root:/Apps/EasySync/vaults/testVault/files/Safe",
-        },
-      } satisfies DriveItem],
+      value: [
+        folder("safe-folder", "Safe", ROOT_NEW),
+        file("real-note", "note.md", "safe-folder"),
+        {
+          id: "unrelated-deleted-id",
+          name: "note.md",
+          deleted: { state: "deleted" },
+          parentReference: {
+            id: "safe-folder",
+            path: "/drives/drive-current/root:/Apps/EasySync/vaults/testVault/files/Safe",
+          },
+        } satisfies DriveItem,
+      ],
       "@odata.deltaLink": "https://graph.example/delta-next",
     });
     const { client, mutations } = makeOneDrive(getDelta);
-    const { engine } = makeEngine();
-    const executor = new SyncExecutor(client, makeScanner(), engine, state, "testVault");
+    const executor = new SyncExecutor(client, makeScanner(), state, "testVault");
 
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
-    expect(state.remoteSnapshot).toEqual([
+    expect(pendingMigrationRemoteSnapshot(state)).toEqual([
       expect.objectContaining({ path: "Safe/note.md", driveId: "real-note" }),
     ]);
     expectNoMutations(mutations);
   });
 
-  it("keeps the same identity-projected view on the following zero-delta round", async () => {
+  it("keeps the same identity-projected migration view on a repeated full observation", async () => {
     const state = await makeMemoryState();
     await state.bindAccount(CURRENT_SCOPE.accountId);
     const getDelta = vi.fn()
@@ -514,34 +592,32 @@ describe("remote identity projection adversarial contract", () => {
         "@odata.deltaLink": "https://graph.example/delta-1",
       })
       .mockResolvedValueOnce({
-        value: [],
+        value: [
+          folder("safe-folder", "Safe", ROOT_NEW),
+          file("note", "note.md", "safe-folder"),
+        ],
         "@odata.deltaLink": "https://graph.example/delta-2",
       });
     const { client, mutations } = makeOneDrive(getDelta);
-    const { engine } = makeEngine();
-    const executor = new SyncExecutor(client, makeScanner(), engine, state, "testVault");
+    const executor = new SyncExecutor(client, makeScanner(), state, "testVault");
 
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
-    const firstSnapshot = structuredClone(state.remoteSnapshot);
+    const firstSnapshot = pendingMigrationRemoteSnapshot(state);
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
     expect(getDelta).toHaveBeenNthCalledWith(1, "testVault");
-    expect(getDelta).toHaveBeenNthCalledWith(2, "testVault", "https://graph.example/delta-1");
-    expect(state.remoteSnapshot).toEqual(firstSnapshot);
-    expect(state.remoteDeltaLink).toBe("https://graph.example/delta-2");
+    expect(getDelta).toHaveBeenNthCalledWith(2, "testVault");
+    expect(pendingMigrationRemoteSnapshot(state)).toEqual(firstSnapshot);
     expectNoMutations(mutations);
   });
 
   it("rebuilds instead of reusing a cursor bound to a different files root", async () => {
-    const state = await makeMemoryState();
-    await state.bindAccount(CURRENT_SCOPE.accountId);
-    await (state as unknown as {
-      setRemoteState(entries: RemoteFileEntry[], deltaLink: string, scope: typeof CURRENT_SCOPE): Promise<void>;
-    }).setRemoteState(
+    const state = await makeMemoryState(publicRemoteState(
       [remoteEntry("old-name.md", "note")],
       "https://graph.example/delta-old",
       { ...CURRENT_SCOPE, filesRootId: ROOT_OLD },
-    );
+    ));
+    await state.bindAccount(CURRENT_SCOPE.accountId);
     const getDelta = vi.fn().mockImplementation(async (_vaultName: string, deltaLink?: string) => {
       if (deltaLink) {
         return { value: [], "@odata.deltaLink": "https://graph.example/delta-wrongly-reused" };
@@ -552,14 +628,13 @@ describe("remote identity projection adversarial contract", () => {
       };
     });
     const { client, mutations } = makeOneDrive(getDelta, ROOT_NEW);
-    const { engine } = makeEngine();
-    const executor = new SyncExecutor(client, makeScanner(), engine, state, "testVault");
+    const executor = new SyncExecutor(client, makeScanner(), state, "testVault");
 
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
     expect(getDelta).toHaveBeenCalledTimes(1);
     expect(getDelta).toHaveBeenCalledWith("testVault");
-    expect(state.remoteSnapshot).toEqual([
+    expect(pendingMigrationRemoteSnapshot(state)).toEqual([
       expect.objectContaining({ path: "current-name.md", driveId: "note" }),
     ]);
     expectNoMutations(mutations);
@@ -593,69 +668,16 @@ describe("remote identity projection adversarial contract", () => {
       };
     });
     const { client, mutations } = makeOneDrive(getDelta, ROOT_NEW);
-    const { engine } = makeEngine();
-    const executor = new SyncExecutor(client, makeScanner(), engine, state, "testVault");
+    const executor = new SyncExecutor(client, makeScanner(), state, "testVault");
 
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
     expect(getDelta).toHaveBeenCalledTimes(1);
     expect(getDelta).toHaveBeenCalledWith("testVault");
-    expect(state.remoteSnapshot).toEqual([
+    expect(pendingMigrationRemoteSnapshot(state)).toEqual([
       expect.objectContaining({ path: "current-name.md", driveId: "note" }),
     ]);
     expectNoMutations(mutations);
   });
 
-  it("runs the V2 shadow from the production full-rebuild path without mutations", async () => {
-    const state = await makeMemoryState();
-    await state.bindAccount(CURRENT_SCOPE.accountId);
-    const local: LocalFileEntry = {
-      path: "Safe/note.md",
-      size: 4,
-      mtime: 1,
-      hash: "aa".repeat(32),
-      binary: false,
-    };
-    await state.updateBaseEntry({
-      path: local.path,
-      size: local.size,
-      hash: local.hash,
-      eTag: "etag-note",
-    });
-    const getDelta = vi.fn().mockResolvedValue({
-      value: [
-        folder("safe-folder", "Safe", ROOT_NEW),
-        file("note", "note.md", "safe-folder"),
-      ],
-      "@odata.deltaLink": "https://graph.example/delta-shadow",
-    });
-    const { client, mutations } = makeOneDrive(getDelta);
-    const log = vi.fn();
-    const diag = { log, warn: vi.fn(), error: vi.fn() } as unknown as DiagnosticLogger;
-    const executor = new SyncExecutor(
-      client,
-      makeScanner([local]),
-      new SyncEngine(),
-      state,
-      "testVault",
-      undefined,
-      undefined,
-      diag,
-    );
-
-    await executor.run("first", {
-      onFirstSyncPreview: vi.fn().mockResolvedValue(false),
-    });
-
-    const shadowCall = log.mock.calls.find(([category, message]) =>
-      category === "plan" && String(message).startsWith("V2 read-only shadow"));
-    expect(shadowCall?.[2]).toMatchObject({
-      status: "match",
-      remoteCounts: { v1: 1, v2: 1 },
-      planCounts: { v1: 0, v2: 0 },
-      mutations: [],
-      manifestWrites: 0,
-    });
-    expectNoMutations(mutations);
-  });
 });

@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { sha256Hex } from "../src/crypto";
 import {
+  createTextMergeManualEvidenceV1,
   evaluateConservativeMergeV2,
+  matchingTextMergeManualEvidenceV1,
   type ConservativeMergeInputV2,
+  type TextMergeEvidenceIdentityV1,
 } from "../src/sync/conservative-merge-v2";
 
 function bytes(text: string): ArrayBuffer {
@@ -34,6 +37,42 @@ async function input(
     localVersionCurrent: true,
     remoteVersionCurrent: true,
     recoveryPending: false,
+  };
+}
+
+async function evidenceIdentity(): Promise<TextMergeEvidenceIdentityV1> {
+  const ancestor = bytes("ancestor\n");
+  const local = bytes("local\n");
+  const remote = bytes("remote\n");
+  return {
+    scope: {
+      accountId: "account",
+      driveId: "drive",
+      vaultFolderId: "vault",
+      filesRootId: "files",
+    },
+    ancestor: {
+      path: "note.md",
+      hash: await sha256Hex(ancestor),
+      size: ancestor.byteLength,
+      eTag: "ancestor-etag",
+    },
+    local: {
+      path: "note.md",
+      hash: await sha256Hex(local),
+      size: local.byteLength,
+      mtime: 1,
+      binary: false,
+    },
+    remote: {
+      path: "note.md",
+      driveId: "remote-file",
+      size: remote.byteLength,
+      mtime: 2,
+      eTag: "remote-etag",
+      cTag: "remote-ctag",
+      sha256Hash: await sha256Hex(remote),
+    },
   };
 }
 
@@ -126,6 +165,65 @@ describe("conservative merge V2 preflight", () => {
       status: "manual",
       reason: "mixed-line-endings",
     });
+  });
+
+  it("reuses only well-formed manual evidence bound to every exact source", async () => {
+    const identity = await evidenceIdentity();
+    const evidence = createTextMergeManualEvidenceV1(
+      identity,
+      "overlap",
+      identity.remote.sha256Hash!,
+    );
+    expect(matchingTextMergeManualEvidenceV1(evidence, identity)).toEqual(evidence);
+
+    const mismatches: TextMergeEvidenceIdentityV1[] = [
+      {
+        ...identity,
+        scope: { ...identity.scope, accountId: "other-account" },
+      },
+      {
+        ...identity,
+        ancestor: { ...identity.ancestor, hash: "1".repeat(64) },
+      },
+      {
+        ...identity,
+        local: { ...identity.local, hash: "2".repeat(64) },
+      },
+      {
+        ...identity,
+        remote: { ...identity.remote, driveId: "other-file" },
+      },
+      {
+        ...identity,
+        remote: { ...identity.remote, eTag: "other-etag" },
+      },
+      {
+        ...identity,
+        remote: { ...identity.remote, sha256Hash: "3".repeat(64) },
+      },
+    ];
+    for (const mismatch of mismatches) {
+      expect(matchingTextMergeManualEvidenceV1(evidence, mismatch)).toBeNull();
+    }
+    expect(matchingTextMergeManualEvidenceV1(
+      { ...evidence, algorithm: "future-merge" },
+      identity,
+    )).toBeNull();
+    expect(matchingTextMergeManualEvidenceV1(
+      { ...evidence, remoteHash: "corrupt" },
+      identity,
+    )).toBeNull();
+  });
+
+  it("does not cache transient or integrity-related manual outcomes", async () => {
+    const identity = await evidenceIdentity();
+    for (const reason of ["stale-version", "recovery-pending", "invalid-hash"] as const) {
+      expect(createTextMergeManualEvidenceV1(
+        identity,
+        reason,
+        identity.remote.sha256Hash!,
+      )).toBeNull();
+    }
   });
 
 });

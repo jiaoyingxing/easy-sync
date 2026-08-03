@@ -1,14 +1,22 @@
 import { describe, expect, it, vi } from "vitest";
-import type { Vault } from "obsidian";
+import { TFile, TFolder, type Vault } from "obsidian";
 import {
+  isEasySyncInternalPath,
   LocalScanner,
   normalizeExcludedFolders,
 } from "../src/sync/local-scanner";
 import type { ScanConfig } from "../src/sync/types";
+import type { PluginScopeSelection } from "../src/sync/community-plugin-sync-policy";
 
 const content = new TextEncoder().encode("test").buffer;
 
-function makeScanner(includePluginCode: boolean, includePluginData: boolean) {
+function makeScanner(
+  includePluginCode: boolean,
+  includePluginData: boolean,
+  pluginCodeSelection?: PluginScopeSelection,
+  pluginDataSelection?: PluginScopeSelection,
+  includeOwnPluginCode = true,
+) {
   const directories: Record<string, { files: string[]; folders: string[] }> = {
     ".obsidian/plugins": {
       files: [],
@@ -49,6 +57,14 @@ function makeScanner(includePluginCode: boolean, includePluginData: boolean) {
         ".obsidian/plugins/easy-sync/state-v2.recovery.json",
         ".obsidian/plugins/easy-sync/state-v2.manifest.json",
         ".obsidian/plugins/easy-sync/state-v2.manifest.next.json",
+        ".obsidian/plugins/easy-sync/state-v2.manifest.retired.json",
+        ".obsidian/plugins/easy-sync/state-v2.rollback.json",
+        ".obsidian/plugins/easy-sync/state-v2.migration-hold.json",
+        ".obsidian/plugins/easy-sync/state-v2.migration-hold.next.json",
+        `.obsidian/plugins/easy-sync/state-v2.corrupt-source-${"a".repeat(64)}.json`,
+        `.obsidian/plugins/easy-sync/state-v2.corrupt-source-${"a".repeat(64)}.json.next`,
+        ".obsidian/plugins/easy-sync/state-v2.corrupt-recovery.json",
+        ".obsidian/plugins/easy-sync/state-v2.corrupt-recovery.next.json",
         ".obsidian/plugins/easy-sync/state-v1.backup.json",
         ".obsidian/plugins/easy-sync/ancestor-manifest-v2.json",
         ".obsidian/plugins/easy-sync/ancestor-manifest-v2.next.json",
@@ -83,7 +99,7 @@ function makeScanner(includePluginCode: boolean, includePluginData: boolean) {
     adapter,
     getFiles: vi.fn(() => []),
   } as unknown as Vault;
-  const config: ScanConfig = {
+  const config: ScanConfig & { includeOwnPluginCode: boolean } = {
     excludePaths: [".obsidian/"],
     includePaths: [
       ".obsidian/plugins/easy-sync/",
@@ -91,14 +107,49 @@ function makeScanner(includePluginCode: boolean, includePluginData: boolean) {
       ".obsidian/plugins/",
     ],
     maxFileSize: 50 * 1024 * 1024,
+    includeOwnPluginCode,
     includePluginCode,
     includePluginData,
+    pluginCodeSelection,
+    pluginDataSelection,
   };
 
   return { scanner: new LocalScanner(vault, config), adapter };
 }
 
 describe("LocalScanner plugin config paths", () => {
+  it("excludes the vault config directory by default and re-includes only selected paths", () => {
+    const vault = {
+      configDir: ".obsidian",
+      adapter: {},
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault);
+
+    expect(scanner.shouldSyncPath(".obsidian/app.json")).toBe(false);
+    expect(scanner.shouldSyncPath(".obsidian/hotkeys.json")).toBe(false);
+    expect(scanner.shouldSyncPath("Notes/note.md")).toBe(true);
+
+    scanner.setConfig({
+      includePaths: [".obsidian/appearance.json"],
+    });
+
+    expect(scanner.shouldSyncPath(".obsidian/app.json")).toBe(false);
+    expect(scanner.shouldSyncPath(".obsidian/appearance.json")).toBe(true);
+  });
+
+  it("uses the vault's custom config directory for the default exclusion", () => {
+    const vault = {
+      configDir: ".mobile-config",
+      adapter: {},
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault);
+
+    expect(scanner.shouldSyncPath(".mobile-config/app.json")).toBe(false);
+    expect(scanner.shouldSyncPath(".obsidian/app.json")).toBe(true);
+  });
+
   it.each([
     { code: false, data: false, expected: [
       ".obsidian/plugins/easy-sync/main.js",
@@ -117,7 +168,6 @@ describe("LocalScanner plugin config paths", () => {
       ".obsidian/plugins/easy-sync/main.js",
       ".obsidian/plugins/easy-sync/manifest.json",
       ".obsidian/plugins/easy-sync/styles.css",
-      ".obsidian/plugins/example-plugin/data.json",
     ] },
     { code: true, data: true, expected: [
       ".obsidian/plugins/easy-sync/main.js",
@@ -128,7 +178,7 @@ describe("LocalScanner plugin config paths", () => {
       ".obsidian/plugins/example-plugin/manifest.json",
       ".obsidian/plugins/example-plugin/styles.css",
     ] },
-  ])("keeps plugin code/data switches independent", async ({ code, data, expected }) => {
+  ])("requires plugin code participation before plugin data", async ({ code, data, expected }) => {
     const { scanner } = makeScanner(code, data);
 
     const result = await scanner.scanAll();
@@ -150,6 +200,87 @@ describe("LocalScanner plugin config paths", () => {
     expect(adapter.list).toHaveBeenCalledTimes(3);
   });
 
+  it("keeps EasySync self-sync outside the community-plugin owner", async () => {
+    const { scanner } = makeScanner(
+      true,
+      true,
+      { mode: "all", pluginIds: [] },
+      { mode: "all", pluginIds: [] },
+      false,
+    );
+
+    const result = await scanner.scanAll();
+
+    expect(result.entries.map((entry) => entry.path).sort()).toEqual([
+      ".obsidian/plugins/example-plugin/data.json",
+      ".obsidian/plugins/example-plugin/main.js",
+      ".obsidian/plugins/example-plugin/manifest.json",
+      ".obsidian/plugins/example-plugin/styles.css",
+    ]);
+    expect(scanner.shouldSyncPath(
+      ".obsidian/plugins/easy-sync/main.js",
+    )).toBe(false);
+    expect(scanner.shouldSyncFolderPath(
+      ".obsidian/plugins/easy-sync",
+    )).toBe(false);
+    expect(scanner.shouldSyncFolderPath(".obsidian/plugins")).toBe(true);
+    expect(scanner.shouldSyncPath(
+      ".obsidian/plugins/example-plugin/main.js",
+    )).toBe(true);
+  });
+
+  it("filters community plugin code and data independently in selected mode", async () => {
+    const { scanner } = makeScanner(
+      true,
+      true,
+      { mode: "selected", pluginIds: ["example-plugin"] },
+      { mode: "selected", pluginIds: [] },
+    );
+
+    const result = await scanner.scanAll();
+
+    expect(result.entries.map((entry) => entry.path).sort()).toEqual([
+      ".obsidian/plugins/easy-sync/main.js",
+      ".obsidian/plugins/easy-sync/manifest.json",
+      ".obsidian/plugins/easy-sync/styles.css",
+      ".obsidian/plugins/example-plugin/main.js",
+      ".obsidian/plugins/example-plugin/manifest.json",
+      ".obsidian/plugins/example-plugin/styles.css",
+    ]);
+    expect(scanner.shouldSyncPath(".obsidian/plugins/example-plugin/data.json")).toBe(false);
+  });
+
+  it("keeps device-local plugin exclusions outside an all-mode scan", async () => {
+    const { scanner } = makeScanner(
+      true,
+      true,
+      {
+        mode: "all",
+        pluginIds: [],
+        ignoredPluginIds: ["example-plugin"],
+      },
+      {
+        mode: "all",
+        pluginIds: [],
+        ignoredPluginIds: ["example-plugin"],
+      },
+    );
+
+    const result = await scanner.scanAll();
+
+    expect(result.entries.map((entry) => entry.path).sort()).toEqual([
+      ".obsidian/plugins/easy-sync/main.js",
+      ".obsidian/plugins/easy-sync/manifest.json",
+      ".obsidian/plugins/easy-sync/styles.css",
+    ]);
+    expect(scanner.shouldSyncPath(
+      ".obsidian/plugins/example-plugin/main.js",
+    )).toBe(false);
+    expect(scanner.shouldSyncPath(
+      ".obsidian/plugins/example-plugin/data.json",
+    )).toBe(false);
+  });
+
   it("exposes the same plugin path filter for remote snapshots", () => {
     const { scanner } = makeScanner(true, false);
 
@@ -157,6 +288,126 @@ describe("LocalScanner plugin config paths", () => {
     expect(scanner.shouldSyncPath(".obsidian/plugins/example-plugin/runtime/cache.json")).toBe(false);
     expect(scanner.shouldSyncPath(".obsidian/plugins/example-plugin/data.json")).toBe(false);
     expect(scanner.shouldSyncPath(".obsidian/plugins/easy-sync/tmp/download.part")).toBe(false);
+  });
+
+  it.each([
+    ".obsidian/plugins/easy-sync/state-v2.authority.json",
+    ".obsidian/plugins/easy-sync/state-v2.authority.next.json",
+    ".obsidian/plugins/easy-sync/state-v2-indexeddb-recovery",
+    ".obsidian/plugins/easy-sync/state-v2-indexeddb-recovery/checkpoint-000000000003.json",
+    ".obsidian/plugins/easy-sync/state-v2-indexeddb-recovery/commit-000000000004.json.next",
+    ".obsidian/plugins/easy-sync/state-v2.manifest.retired.json",
+    ".obsidian/plugins/easy-sync/state-v2.rollback.json",
+    ".obsidian/plugins/easy-sync/state-v2.reactivation-archive-123.json",
+    ".obsidian/plugins/easy-sync/state-v2.reactivation-archive-123.json.next",
+    `.obsidian/plugins/easy-sync/state-v2.corrupt-source-${"a".repeat(64)}.json`,
+    `.obsidian/plugins/easy-sync/state-v2.corrupt-source-${"a".repeat(64)}.json.next`,
+    ".obsidian/plugins/easy-sync/state-v2.corrupt-recovery.json",
+    ".obsidian/plugins/easy-sync/state-v2.corrupt-recovery.next.json",
+  ])("keeps V2 authority and downgrade evidence local: %s", (path) => {
+    expect(isEasySyncInternalPath(path)).toBe(true);
+  });
+});
+
+describe("LocalScanner folder topology", () => {
+  const config: ScanConfig = {
+    excludePaths: [".obsidian/"],
+    includePaths: [".obsidian/snippets/"],
+    maxFileSize: 50 * 1024 * 1024,
+    includePluginCode: false,
+    includePluginData: false,
+  };
+
+  it("combines file parent chains, loaded empty folders, and adapter-only included folders", async () => {
+    const note = Object.assign(new TFile("Projects/Active/note.md"), {
+      stat: { size: content.byteLength, mtime: 1 },
+    });
+    const adapter = {
+      exists: vi.fn(async () => true),
+      list: vi.fn(async (path: string) => {
+        if (path === ".obsidian/snippets") {
+          return { files: [], folders: [".obsidian/snippets/mobile"] };
+        }
+        if (path === ".obsidian/snippets/mobile") {
+          return { files: [], folders: [] };
+        }
+        return { files: [], folders: [] };
+      }),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => [note]),
+      getAllLoadedFiles: vi.fn(() => [
+        note,
+        new TFolder("Projects"),
+        new TFolder("Projects/Active"),
+        new TFolder("Empty"),
+        new TFolder("Excluded"),
+      ]),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      ...config,
+      excludePaths: [".obsidian/", "Excluded/"],
+    });
+
+    const result = await scanner.scanAll();
+
+    expect(result.folders).toEqual([
+      { path: ".obsidian" },
+      { path: ".obsidian/snippets" },
+      { path: ".obsidian/snippets/mobile" },
+      { path: "Empty" },
+      { path: "Projects" },
+      { path: "Projects/Active" },
+    ]);
+    expect(result.folderScanComplete).toBe(true);
+    expect(result.folderScanFailures).toEqual([]);
+  });
+
+  it("keeps file sync complete but rejects folder shadow when folder enumeration is unavailable", async () => {
+    const adapter = {
+      exists: vi.fn(async () => false),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, config);
+
+    const result = await scanner.scanAll();
+
+    expect(result.complete).toBe(true);
+    expect(result.folderScanComplete).toBe(false);
+    expect(result.folderScanFailures).toEqual(["/"]);
+  });
+
+  it("fails the folder snapshot closed on normalized folder collisions", async () => {
+    const adapter = {
+      exists: vi.fn(async () => false),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => []),
+      getAllLoadedFiles: vi.fn(() => [
+        new TFolder("Notes"),
+        new TFolder("notes"),
+      ]),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, { ...config, includePaths: [] });
+
+    const result = await scanner.scanAll();
+
+    expect(result.complete).toBe(true);
+    expect(result.folderScanComplete).toBe(false);
+    expect(result.folderScanFailures).toEqual(["Notes", "notes"]);
   });
 });
 
@@ -315,10 +566,15 @@ describe("LocalScanner large file boundary", () => {
       includePluginData: false,
     });
 
-    await scanner.scanAll();
+    const first = await scanner.scanAll();
     await scanner.scanAll();
 
     expect(adapter.write).toHaveBeenCalledTimes(1);
+    const persisted = JSON.parse(adapter.write.mock.calls[0]![1] as string);
+    expect(first.entries[0]?.quickXorHash).toMatch(/^[A-Za-z0-9+/]{27}=$/);
+    expect(persisted.entries["note.md"].quickXorHash).toBe(
+      first.entries[0]?.quickXorHash,
+    );
   });
 });
 

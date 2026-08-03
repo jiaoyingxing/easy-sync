@@ -1,6 +1,12 @@
 import { isSyncScope, sameSyncScope, type LocalFileEntry, type SyncScope } from "./types";
 import type { OneDriveClient } from "../onedrive/client";
-import { projectRemoteIndexV2, type RemoteIndexV2 } from "./remote-index-v2";
+import { sha256Hex } from "../crypto";
+import { isRecord } from "../obsidian-compat";
+import {
+  projectRemoteIndexV2,
+  type RemoteIndexV2,
+  type RemoteNodeV2,
+} from "./remote-index-v2";
 import type { SyncStateEnvelopeV2 } from "./state-envelope-v2";
 
 export interface CloudBootstrapAnchorV2 {
@@ -9,6 +15,7 @@ export interface CloudBootstrapAnchorV2 {
   contentHash: string;
   size: number;
   remoteETag?: string;
+  remoteCTag?: string;
 }
 
 export interface CloudBootstrapV2 {
@@ -24,6 +31,20 @@ export interface CloudBootstrapObjectV2 {
   id: string;
   eTag: string;
   content: string;
+}
+
+/**
+ * Non-authoritative receipt for the last bootstrap version this device
+ * published or read back successfully. It only avoids proving the same
+ * recovery hint again; the committed V2 envelope remains authoritative.
+ */
+export interface CloudBootstrapPublicationCheckpointV2 {
+  version: 1;
+  scope: SyncScope;
+  anchorDigest: string;
+  objectId: string;
+  eTag: string;
+  revision: number;
 }
 
 export interface CloudBootstrapTransportV2 {
@@ -59,7 +80,8 @@ export interface CloudBootstrapPublishResultV2 {
   published: boolean;
   dirty: boolean;
   revision: number | null;
-  reason?: "unhealthy" | "invalid-current" | "stale-envelope" | "write-failed";
+  checkpoint: CloudBootstrapPublicationCheckpointV2 | null;
+  reason?: "unhealthy" | "invalid-current" | "write-failed";
 }
 
 export interface VerifiedCloudBootstrapV2 {
@@ -75,25 +97,97 @@ export async function publishCloudBootstrapV2(
   envelope: SyncStateEnvelopeV2,
   health: CloudBootstrapHealthV2,
   now = Date.now(),
+  checkpoint: Readonly<CloudBootstrapPublicationCheckpointV2> | null = null,
 ): Promise<CloudBootstrapPublishResultV2> {
+  const anchorDigest = await cloudBootstrapAnchorDigestV2(envelope);
+  if (
+    checkpoint
+    && cloudBootstrapCheckpointMatchesEnvelopeV2(
+      checkpoint,
+      envelope,
+      anchorDigest,
+    )
+  ) {
+    return {
+      published: false,
+      dirty: false,
+      revision: checkpoint.revision,
+      checkpoint: { ...checkpoint, scope: { ...checkpoint.scope } },
+    };
+  }
   if (!isHealthy(health) || envelope.remoteIndex.complete !== true) {
-    return { published: false, dirty: true, revision: null, reason: "unhealthy" };
+    return {
+      published: false,
+      dirty: true,
+      revision: null,
+      checkpoint: null,
+      reason: "unhealthy",
+    };
   }
 
   let currentObject: CloudBootstrapObjectV2 | null;
   let current: CloudBootstrapV2 | null = null;
+
+  if (checkpoint && sameSyncScope(checkpoint.scope, envelope.scope)) {
+    const bootstrap = buildCloudBootstrap(
+      envelope,
+      checkpoint.revision + 1,
+      now,
+    );
+    const content = JSON.stringify(bootstrap);
+    try {
+      const written = await transport.updateCas(
+        checkpoint.objectId,
+        checkpoint.eTag,
+        content,
+      );
+      const verified = await transport.readById(written.id);
+      const verifiedDocument = parseCloudBootstrap(verified.content);
+      if (!verifiedDocument || JSON.stringify(verifiedDocument) !== content) {
+        throw new Error("Cloud bootstrap read-back mismatch");
+      }
+      return {
+        published: true,
+        dirty: false,
+        revision: bootstrap.revision,
+        checkpoint: checkpointFromObject(
+          envelope.scope,
+          anchorDigest,
+          verified,
+          bootstrap.revision,
+        ),
+      };
+    } catch {
+      // The cached eTag may be stale or the write response/read-back may have
+      // been lost. Re-read once and converge from provider-observed facts.
+    }
+  }
+
   try {
     currentObject = await transport.read();
     if (currentObject) {
       current = parseCloudBootstrap(currentObject.content);
       if (!current || !sameSyncScope(current.scope, envelope.scope)) {
-        return { published: false, dirty: true, revision: null, reason: "invalid-current" };
+        return {
+          published: false,
+          dirty: true,
+          revision: null,
+          checkpoint: null,
+          reason: "invalid-current",
+        };
       }
-      if (current.sourceCommitSeq > envelope.meta.commitSeq) {
-        return { published: false, dirty: true, revision: current.revision, reason: "stale-envelope" };
-      }
-      if (current.sourceCommitSeq === envelope.meta.commitSeq) {
-        return { published: false, dirty: false, revision: current.revision };
+      if (sameBootstrapAnchors(current, envelope)) {
+        return {
+          published: false,
+          dirty: false,
+          revision: current.revision,
+          checkpoint: checkpointFromObject(
+            envelope.scope,
+            anchorDigest,
+            currentObject,
+            current.revision,
+          ),
+        };
       }
     }
 
@@ -107,10 +201,73 @@ export async function publishCloudBootstrapV2(
     if (!verifiedDocument || JSON.stringify(verifiedDocument) !== content) {
       throw new Error("Cloud bootstrap read-back mismatch");
     }
-    return { published: true, dirty: false, revision: bootstrap.revision };
+    return {
+      published: true,
+      dirty: false,
+      revision: bootstrap.revision,
+      checkpoint: checkpointFromObject(
+        envelope.scope,
+        anchorDigest,
+        verified,
+        bootstrap.revision,
+      ),
+    };
   } catch {
-    return { published: false, dirty: true, revision: current?.revision ?? null, reason: "write-failed" };
+    return {
+      published: false,
+      dirty: true,
+      revision: current?.revision ?? checkpoint?.revision ?? null,
+      checkpoint: null,
+      reason: "write-failed",
+    };
   }
+}
+
+export async function cloudBootstrapAnchorDigestV2(
+  envelope: SyncStateEnvelopeV2,
+): Promise<string> {
+  const content = new TextEncoder().encode(JSON.stringify({
+    schemaVersion: 2,
+    scope: envelope.scope,
+    anchors: buildCloudBootstrap(envelope, 1, 0).anchors,
+  }));
+  return sha256Hex(content.buffer);
+}
+
+export function cloudBootstrapCheckpointMatchesEnvelopeV2(
+  checkpoint: Readonly<CloudBootstrapPublicationCheckpointV2>,
+  envelope: Readonly<SyncStateEnvelopeV2>,
+  anchorDigest: string,
+): boolean {
+  return sameSyncScope(checkpoint.scope, envelope.scope)
+    && checkpoint.anchorDigest === anchorDigest;
+}
+
+export function readCloudBootstrapPublicationCheckpointV2(
+  value: unknown,
+): CloudBootstrapPublicationCheckpointV2 | null {
+  if (
+    !isRecord(value)
+    || value.version !== 1
+    || !isSyncScope(value.scope)
+    || typeof value.anchorDigest !== "string"
+    || !/^[a-f0-9]{64}$/.test(value.anchorDigest)
+    || typeof value.objectId !== "string"
+    || value.objectId.length === 0
+    || typeof value.eTag !== "string"
+    || value.eTag.length === 0
+    || typeof value.revision !== "number"
+    || !Number.isSafeInteger(value.revision)
+    || value.revision < 1
+  ) return null;
+  return {
+    version: 1,
+    scope: { ...value.scope },
+    anchorDigest: value.anchorDigest,
+    objectId: value.objectId,
+    eTag: value.eTag,
+    revision: value.revision,
+  };
 }
 
 export function verifyCloudBootstrapV2(
@@ -122,6 +279,10 @@ export function verifyCloudBootstrapV2(
   const bootstrap = typeof value === "string" ? parseCloudBootstrap(value) : parseCloudBootstrapValue(value);
   if (!bootstrap) return rejected("invalid-schema");
   if (!sameSyncScope(bootstrap.scope, expectedScope)) return rejected("scope-mismatch");
+  if (remoteIndex.filesRootId !== expectedScope.filesRootId) {
+    return rejected("scope-mismatch");
+  }
+  if (remoteIndex.complete !== true) return rejected("remote-index-incomplete");
 
   let pathById: Map<string, string>;
   try {
@@ -140,13 +301,24 @@ export function verifyCloudBootstrapV2(
     const local = localByPath.get(hint.lastPath);
     const verified = !seenRemote.has(hint.remoteId)
       && !seenPath.has(normalizedPath)
-      && remote?.kind === "file"
+      && cloudBootstrapRemoteVersionMatches(remote, hint)
       && pathById.get(hint.remoteId) === hint.lastPath
-      && remote.contentHash === hint.contentHash
-      && remote.size === hint.size
-      && (!hint.remoteETag || remote.eTag === hint.remoteETag)
       && local?.hash === hint.contentHash
-      && local.size === hint.size;
+      && local.size === hint.size
+      // Graph normally omits SHA-256 for OneDrive Personal files, which is
+      // why the bootstrap exists. When Graph does expose a stronger current
+      // content fact, however, it must never be ignored if it contradicts the
+      // bootstrap. QuickXor mismatch is likewise definitive evidence that the
+      // local and remote bytes differ, although a match alone is not enough.
+      && (
+        !remote?.contentHash
+        || remote.contentHash.toLowerCase() === hint.contentHash.toLowerCase()
+      )
+      && (
+        !remote?.quickXorHash
+        || !local.quickXorHash
+        || remote.quickXorHash === local.quickXorHash
+      );
     if (!verified) {
       rejectedPaths.push(hint.lastPath);
       continue;
@@ -156,6 +328,36 @@ export function verifyCloudBootstrapV2(
     anchors.push(hint);
   }
   return { status: "verified", anchors, rejectedPaths, mutations: [] };
+}
+
+/** Match only the provider version that the cloud content anchor was bound to. */
+export function cloudBootstrapRemoteVersionMatches(
+  remote: RemoteNodeV2 | undefined,
+  hint: Pick<CloudBootstrapAnchorV2, "size" | "remoteCTag" | "remoteETag">,
+): boolean {
+  return remote?.kind === "file"
+    && remote.size === hint.size
+    && (
+      hint.remoteCTag
+        ? remote.cTag === hint.remoteCTag
+        : Boolean(hint.remoteETag) && remote.eTag === hint.remoteETag
+    );
+}
+
+function checkpointFromObject(
+  scope: Readonly<SyncScope>,
+  anchorDigest: string,
+  object: Readonly<CloudBootstrapObjectV2>,
+  revision: number,
+): CloudBootstrapPublicationCheckpointV2 {
+  return {
+    version: 1,
+    scope: { ...scope },
+    anchorDigest,
+    objectId: object.id,
+    eTag: object.eTag,
+    revision,
+  };
 }
 
 function buildCloudBootstrap(
@@ -171,7 +373,9 @@ function buildCloudBootstrap(
       lastPath: anchor.lastPath,
       contentHash: anchor.contentHash,
       size: anchor.size,
-      remoteETag: anchor.remoteETag,
+      remoteETag: anchor.remoteETag
+        ?? envelope.remoteIndex.itemsById[anchor.remoteId]?.eTag,
+      remoteCTag: envelope.remoteIndex.itemsById[anchor.remoteId]?.cTag,
     }))
     .sort((left, right) => left.remoteId.localeCompare(right.remoteId));
   return {
@@ -206,7 +410,17 @@ function isAnchor(value: unknown): value is CloudBootstrapAnchorV2 {
     && typeof anchor.lastPath === "string" && anchor.lastPath.length > 0
     && typeof anchor.contentHash === "string" && /^[a-f0-9]{64}$/i.test(anchor.contentHash)
     && typeof anchor.size === "number" && Number.isSafeInteger(anchor.size) && anchor.size >= 0
-    && (anchor.remoteETag === undefined || typeof anchor.remoteETag === "string");
+    && (anchor.remoteETag === undefined || typeof anchor.remoteETag === "string")
+    && (anchor.remoteCTag === undefined || typeof anchor.remoteCTag === "string")
+    && Boolean(anchor.remoteCTag || anchor.remoteETag);
+}
+
+function sameBootstrapAnchors(
+  current: CloudBootstrapV2,
+  envelope: SyncStateEnvelopeV2,
+): boolean {
+  const candidate = buildCloudBootstrap(envelope, current.revision, current.generatedAt);
+  return JSON.stringify(current.anchors) === JSON.stringify(candidate.anchors);
 }
 
 function isHealthy(health: CloudBootstrapHealthV2): boolean {

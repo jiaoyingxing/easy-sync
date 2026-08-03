@@ -1,13 +1,13 @@
 {
   "name": "easy-sync",
-  "version": "1.1.3",
+  "version": "1.2.0",
   "description": "EasySync / 易同步 — Obsidian OneDrive sync with minimal setup, clear status, and controlled conflict handling",
   "main": "main.js",
   "scripts": {
     "typecheck": "tsc -noEmit -skipLibCheck",
     "build": "tsc -noEmit -skipLibCheck && esbuild src/main.ts --bundle --external:obsidian --format=cjs --outfile=main.js",
     "test": "vitest run",
-    "test:performance": "vitest run tests/sync-performance-contract.test.ts tests/sync-safety.test.ts tests/plugin-data-cold-start.test.ts -t \"A0-P|platform-neutral 500-file\" --reporter=verbose"
+    "test:performance": "vitest run tests/sync-performance-contract.test.ts tests/sync-safety.test.ts tests/plugin-data-cold-start.test.ts tests/startup-performance-contract.test.ts tests/community-plugin-enablement-runtime.test.ts -t \"A0-P|platform-neutral 500-file|V2 cold-start\" --reporter=verbose"
   },
   "keywords": [
     "obsidian",
@@ -27,7 +27,10 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^26.1.0",
+    "core-js-pure": "3.49.0",
     "esbuild": "^0.24.0",
+    "fake-indexeddb": "^6.2.5",
+    "idb": "^8.0.3",
     "obsidian": "latest",
     "typescript": "^5.4.0",
     "vitest": "^4.1.10"

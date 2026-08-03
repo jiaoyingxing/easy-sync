@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
+import { ConfigSyncModal } from "../src/ui/config-sync-modal";
 import { buildSettingsSyncButtonState } from "../src/ui/settings-tab";
 import en from "../src/i18n/en";
 import zhCN from "../src/i18n/zh-cn";
@@ -71,37 +72,82 @@ describe("buildSettingsSyncButtonState", () => {
     });
   });
 
-  it("places sync exclusion and automatic handling between sync scope and auto-sync", () => {
+  it("places automatic handling and both automatic triggers in the Automatic group", () => {
     const source = readFileSync("src/ui/settings-tab.ts", "utf8");
-    const syncScopeStart = source.indexOf('.setName(t("settings.syncScope.name"))');
-    const exclusionStart = source.indexOf('.setName(t("settings.syncExclusion.name"))');
-    const handlingStart = source.indexOf('.setName(t("settings.automaticHandling.name"))');
-    const autoSyncStart = source.indexOf('.setName(t("settings.autoSync.name"))');
-    const scopeAction = source.indexOf(".addButton", handlingStart);
-    const autoSyncToggle = source.indexOf(".addToggle", autoSyncStart);
+    const displayStart = source.indexOf("  display(): void {");
+    const refreshStart = source.indexOf("  refreshAuthState(): void {", displayStart);
+    const displaySource = source.slice(displayStart, refreshStart);
+    const syncSectionStart = source.indexOf("  private renderSyncSection(");
+    const automaticSectionStart = source.indexOf("  private renderAutomaticSection(");
+    const aboutSectionStart = source.indexOf("  private renderAboutSection(");
+    const syncSection = source.slice(syncSectionStart, automaticSectionStart);
+    const automaticSection = source.slice(automaticSectionStart, aboutSectionStart);
+    const enabledTriggerSettings = automaticSection.slice(
+      automaticSection.indexOf("if (this.plugin.syncInterval > 0)"),
+    );
 
-    expect(syncScopeStart).toBeGreaterThanOrEqual(0);
-    expect(exclusionStart).toBeGreaterThan(syncScopeStart);
-    expect(handlingStart).toBeGreaterThan(exclusionStart);
-    expect(autoSyncStart).toBeGreaterThan(handlingStart);
-    expect(autoSyncStart).toBeGreaterThanOrEqual(0);
-    expect(scopeAction).toBeGreaterThan(handlingStart);
-    expect(scopeAction).toBeLessThan(autoSyncStart);
-    expect(autoSyncToggle).toBeGreaterThan(autoSyncStart);
-    expect(source).toContain('setButtonText(t("settings.automaticHandling.button"))');
-    expect(source).toContain('t("settings.automaticHandling.open")');
-    expect(source).toContain('setAttribute(\n            "aria-label"');
-    expect(source).not.toContain(".addExtraButton");
-    expect(source).not.toContain('setName(t("settings.autoMerge.name"))');
+    expect(displaySource.indexOf("this.renderSyncSection(t)")).toBeLessThan(
+      displaySource.indexOf("this.renderAutomaticSection(t)"),
+    );
+    expect(syncSection).toContain('setHeading(t("settings.group.sync"))');
+    expect(syncSection).toContain('.setName(t("settings.syncScope.name"))');
+    expect(syncSection).toContain('.setName(t("settings.syncExclusion.name"))');
+    expect(syncSection).toContain('.setName(t("settings.maxFileSize.name"))');
+    expect(syncSection).not.toContain('t("settings.automaticHandling.name")');
+    expect(syncSection).not.toContain('t("settings.autoSync.name")');
+    expect(syncSection).not.toContain('t("settings.syncInterval.name")');
+
+    expect(automaticSection).toContain('t("settings.group.automatic")');
+    expect(automaticSection).toContain('setName(t("settings.automaticHandling.name"))');
+    expect(automaticSection).toContain('setName(t("settings.autoSync.name"))');
+    expect(automaticSection).toContain('setName(t("settings.syncInterval.name"))');
+    expect(automaticSection).toContain(
+      'setName(t("settings.autoSyncChangeDelay.name"))',
+    );
+    expect(automaticSection).toContain(".setLimits(1, 10, 1)");
+    expect(automaticSection).toContain(
+      "this.plugin.setAutoSyncChangeDelaySeconds(value)",
+    );
+    expect(enabledTriggerSettings).toContain(
+      'setName(t("settings.syncInterval.name"))',
+    );
+    expect(enabledTriggerSettings).toContain(
+      'setName(t("settings.autoSyncChangeDelay.name"))',
+    );
+    expect(automaticSection).not.toContain('t("settings.maxFileSize.name")');
+    expect(automaticSection).toContain(
+      'setButtonText(t("settings.automaticHandling.button"))',
+    );
+    expect(automaticSection).toContain('t("settings.automaticHandling.open")');
+    expect(automaticSection).toContain('setAttribute(\n            "aria-label"');
+    expect(automaticSection).not.toContain(".addExtraButton");
+    expect(automaticSection).not.toContain('setName(t("settings.autoMerge.name"))');
+    expect(zhCN["settings.group.automatic"]).toBe("自动");
+    expect(en["settings.group.automatic"]).toBe("Automatic");
+    expect(zhCN["settings.syncInterval.name"]).toBe("定时同步");
+    expect(zhCN["settings.syncInterval.desc"]).toBe(
+      "每 {minutes} 分钟同步一次。",
+    );
+    expect(zhCN["settings.autoSyncChangeDelay.name"]).toBe("修改后触发同步");
+    expect(zhCN["settings.autoSyncChangeDelay.desc"]).toBe(
+      "检测到本地变化后等待 {seconds} 秒；期间有新变化会重新计时。",
+    );
+    expect(en["settings.syncInterval.name"]).toBe("Scheduled sync");
+    expect(en["settings.autoSyncChangeDelay.name"]).toBe("Sync after changes");
   });
 
   it("uses a native folder picker and native settings for device-local exclusions", () => {
     const source = readFileSync("src/ui/sync-exclusion-modal.ts", "utf8");
     const settingsSource = readFileSync("src/ui/settings-tab.ts", "utf8");
 
-    expect(source).toContain("extends FuzzySuggestModal<TFolder>");
+    expect(source).toContain(
+      "extends FuzzySuggestModal<SyncExclusionFolderCandidate>",
+    );
     expect(source).toContain("getAllLoadedFiles");
     expect(source).toContain("instanceof TFolder");
+    expect(source).toContain("buildSyncExclusionFolderCandidates");
+    expect(source).toContain("createSyncExclusionFolderSnapshot");
+    expect(source).toContain("rebuildPlanReview");
     expect(source).toContain("updateExcludedFolders");
     expect(source).toContain("new Setting(");
     expect(source).toMatch(
@@ -115,6 +161,42 @@ describe("buildSettingsSyncButtonState", () => {
     expect(settingsSource).toContain("renderExcludedFolderChips");
     expect(settingsSource).toContain("setting.descEl.createDiv()");
     expect(settingsSource).toContain("updateExcludedFoldersFromUi");
+  });
+
+  it("mirrors the official hotkey chip geometry without depending on internal host classes", () => {
+    const source = readFileSync("src/ui/sync-exclusion-modal.ts", "utf8");
+    const styles = readFileSync("styles.css", "utf8");
+    const chipBlock = styles.match(
+      /\.easy-sync-exclusion-chip\s*\{([^}]*)\}/,
+    )?.[1] ?? "";
+    const removeBlock = styles.match(
+      /\.easy-sync-exclusion-chip-remove\.extra-setting-button\s*\{([^}]*)\}/,
+    )?.[1] ?? "";
+    const removeIconBlock = styles.match(
+      /\.easy-sync-exclusion-chip-remove \.svg-icon\s*\{([^}]*)\}/,
+    )?.[1] ?? "";
+    const labelBlock = styles.match(
+      /\.easy-sync-exclusion-chip-label\s*\{([^}]*)\}/,
+    )?.[1] ?? "";
+
+    expect(chipBlock).toContain("display: flex");
+    expect(chipBlock).toContain(
+      "font-family: -apple-system, BlinkMacSystemFont, var(--font-monospace)",
+    );
+    expect(chipBlock).toContain("font-size: var(--font-ui-small)");
+    expect(chipBlock).toContain("gap: var(--size-4-1)");
+    expect(chipBlock).toContain("padding: 2px 4px 2px 8px");
+    expect(chipBlock).toContain("color: var(--text-normal)");
+    expect(removeBlock).toContain("width: 16px");
+    expect(removeBlock).toContain("height: 16px");
+    expect(removeBlock).toContain("padding: 0");
+    expect(removeBlock).toContain("border-radius: 50%");
+    expect(removeIconBlock).toContain("width: 16px");
+    expect(removeIconBlock).toContain("height: 16px");
+    expect(removeIconBlock).toContain("stroke-width: 2px");
+    expect(removeIconBlock).toContain("opacity: 0.6");
+    expect(labelBlock).toContain("overflow-wrap: anywhere");
+    expect(source).not.toMatch(/setting-command-hotkeys|setting-hotkey-icon/);
   });
 
   it("keeps long settings modals within the viewport with one scroll surface", () => {
@@ -140,6 +222,672 @@ describe("buildSettingsSyncButtonState", () => {
     expect(source).toContain("updateSyncPathSettings");
     expect(source).not.toContain("saveSyncSettings");
     expect(source).not.toContain("applyPluginFilesSetting");
+  });
+
+  it("renders community plugin scope as native outer switches with always-available management", () => {
+    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    const styles = readFileSync("styles.css", "utf8");
+
+    expect(source).toContain("renderCommunityPluginScopeSetting(");
+    expect(source).toContain("updateAllCommunityPluginSelections(");
+    expect(source).toContain("selectionChipEl");
+    expect(source).toContain(
+      'setting.settingEl.addClass("easy-sync-community-plugin-scope-setting")',
+    );
+    expect(source).toMatch(
+      /setting\.nameEl\.createSpan\(\s*"easy-sync-plugin-selection-chip"/,
+    );
+    expect(source).toContain("appendExperimentalPluginDataChip(");
+    expect(source).toContain("this.titleEl");
+    expect(source).toContain("settings.communityPlugins.experimental");
+    expect(source).toContain("busyCommunityPluginScopeRows");
+    expect(source).toContain("pendingCommunityPluginScopeValues");
+    expect(source).toContain(
+      "!scopeEnabled",
+    );
+    expect(source).toContain("enabled && !busy");
+    expect(source).not.toContain("enabledCount === items.length");
+    expect(source).toContain('chipEl.removeClass("is-hidden")');
+    expect(source).not.toContain(
+      'controls.manageButton.buttonEl.toggleClass("is-hidden", !enabled)',
+    );
+    expect(source).toContain('.setIcon("settings")');
+    expect(source).toContain("setTooltip(t(");
+    expect(source).toContain('"aria-label"');
+    expect(source).toContain("settings.communityPlugins.selectionSummary");
+    expect(styles).toContain(
+      ".easy-sync-community-plugin-scope-setting .setting-item-name",
+    );
+    expect(styles).toContain(".easy-sync-plugin-selection-chip");
+    expect(styles).toMatch(
+      /\.easy-sync-plugin-selection-chip\.is-experimental\s*\{[^}]*color:\s*var\(--text-error\)/s,
+    );
+    expect(styles).toMatch(
+      /\.easy-sync-plugin-selection-chip\.is-hidden\s*\{[^}]*display:\s*none/s,
+    );
+    const selectionChipStyle = styles.match(
+      /\.easy-sync-plugin-selection-chip\s*\{(?<body>[^}]*)\}/,
+    )?.groups?.body ?? "";
+    expect(selectionChipStyle).toContain("max-width: 100%");
+    expect(selectionChipStyle).not.toContain("margin-inline-start");
+    expect(source).toContain(
+      '"notice.communityPlugins.enableFilesFirst"',
+    );
+    expect(styles).not.toContain("easy-sync-plugin-manage-button");
+    expect(zhCN["notice.communityPlugins.enableFilesFirst"]).toBe(
+      "请先开启“社区插件”。",
+    );
+    expect(en["notice.communityPlugins.enableFilesFirst"]).toBe(
+      "Turn on Community plugins first.",
+    );
+  });
+
+  it("uses historical data evidence when the outer plugin-data switch rejoins scope", async () => {
+    const confirmExperimentalPluginData = vi.fn().mockResolvedValue(true);
+    const applyOuterDataSwitch = async (historicalData: boolean) => {
+      const updateSyncPathSettings = vi.fn().mockResolvedValue(undefined);
+      const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+      Object.assign(modal as object, {
+        plugin: {
+          app: {},
+          i18n: { t: (key: string) => key },
+          syncCommunityPlugins: true,
+          syncPluginData: false,
+          communityPluginSyncPolicy: {
+            version: 1,
+            files: { mode: "all", pluginIds: [] },
+            data: { mode: "all", pluginIds: [] },
+          },
+          isCommunityPluginFilesParticipationEnabled: vi.fn()
+            .mockReturnValue(true),
+          getCommunityPluginInventory: vi.fn().mockResolvedValue([{
+            id: "calendar",
+            name: "Calendar",
+            version: null,
+            local: false,
+            remote: false,
+            dataLocally: false,
+            dataRemotely: false,
+            enabledLocally: null,
+            desktopOnly: false,
+            manifestIssue: false,
+            ...(historicalData ? { dataHistoricallyPresent: true } : {}),
+          }]),
+          updateSyncPathSettings,
+        },
+        scopeInventory: [],
+        scopeInventoryLoaded: false,
+        pendingCommunityPluginScopeValues: new Map(),
+        busyCommunityPluginScopeRows: new Set(),
+        confirmExperimentalPluginData,
+        refreshCommunityPluginScopeControls: vi.fn(),
+      });
+
+      await (modal as unknown as {
+        updateCommunityPluginScopeSetting(
+          column: "files" | "data",
+          value: boolean,
+        ): Promise<void>;
+      }).updateCommunityPluginScopeSetting("data", true);
+
+      expect(updateSyncPathSettings).toHaveBeenCalledOnce();
+      return updateSyncPathSettings.mock.calls[0]?.[0];
+    };
+
+    await expect(applyOuterDataSwitch(true)).resolves.toEqual({
+      syncCommunityPlugins: true,
+      syncPluginData: true,
+      communityPluginSyncPolicy: {
+        version: 1,
+        files: { mode: "all", pluginIds: [] },
+        data: {
+          mode: "all",
+          pluginIds: [],
+          restoringPluginIds: ["calendar"],
+        },
+      },
+    });
+    await expect(applyOuterDataSwitch(false)).resolves.toEqual({
+      syncCommunityPlugins: true,
+      syncPluginData: true,
+      communityPluginSyncPolicy: {
+        version: 1,
+        files: { mode: "all", pluginIds: [] },
+        data: { mode: "all", pluginIds: [] },
+      },
+    });
+    expect(confirmExperimentalPluginData).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the outer plugin-data scope disabled when experimental confirmation is cancelled", async () => {
+    const confirmExperimentalPluginData = vi.fn().mockResolvedValue(false);
+    const updateSyncPathSettings = vi.fn().mockResolvedValue(undefined);
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    const pendingCommunityPluginScopeValues = new Map();
+    const busyCommunityPluginScopeRows = new Set();
+    Object.assign(modal as object, {
+      plugin: {
+        app: {},
+        i18n: { t: (key: string) => key },
+        syncCommunityPlugins: true,
+        syncPluginData: false,
+        communityPluginSyncPolicy: {
+          version: 1,
+          files: { mode: "all", pluginIds: [] },
+          data: { mode: "all", pluginIds: [] },
+        },
+        isCommunityPluginFilesParticipationEnabled: vi.fn()
+          .mockReturnValue(true),
+        getCommunityPluginInventory: vi.fn().mockResolvedValue([{
+          id: "calendar",
+          name: "Calendar",
+          version: null,
+          local: true,
+          remote: false,
+          dataLocally: true,
+          dataRemotely: false,
+          enabledLocally: null,
+          desktopOnly: false,
+          manifestIssue: false,
+        }]),
+        updateSyncPathSettings,
+      },
+      scopeInventory: [],
+      scopeInventoryLoaded: false,
+      pendingCommunityPluginScopeValues,
+      busyCommunityPluginScopeRows,
+      confirmExperimentalPluginData,
+      refreshCommunityPluginScopeControls: vi.fn(),
+    });
+
+    await (modal as unknown as {
+      updateCommunityPluginScopeSetting(
+        column: "files" | "data",
+        value: boolean,
+      ): Promise<void>;
+    }).updateCommunityPluginScopeSetting("data", true);
+
+    expect(confirmExperimentalPluginData).toHaveBeenCalledOnce();
+    expect(updateSyncPathSettings).not.toHaveBeenCalled();
+    expect(pendingCommunityPluginScopeValues.size).toBe(0);
+    expect(busyCommunityPluginScopeRows.size).toBe(0);
+  });
+
+  it("routes every plugin-data row enable through the experimental confirmation gate", () => {
+    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+
+    expect(source).toContain('if (column === "data" && enabled)');
+    expect(source).toContain(
+      "void this.confirmPluginDataSelection(item, restricted);",
+    );
+    expect(source).not.toContain("confirmRestrictedDataSelection");
+    expect(source).toContain("settings.communityPlugins.data.experimentalItemMessage");
+    expect(source).toContain("settings.communityPlugins.data.experimentalItemWithFilesMessage");
+    expect(source).toContain("danger: true");
+  });
+
+  it("ignores a host repaint callback when the outer scope already matches committed state", async () => {
+    const updateSyncPathSettings = vi.fn().mockResolvedValue(undefined);
+    const refreshCommunityPluginScopeControls = vi.fn();
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    Object.assign(modal as object, {
+      plugin: {
+        syncCommunityPlugins: true,
+        syncPluginData: false,
+        communityPluginSyncPolicy: {
+          version: 1,
+          files: {
+            mode: "selected",
+            pluginIds: ["knomo", "realtime-transcription"],
+          },
+          data: { mode: "none", pluginIds: [] },
+        },
+        getCommunityPluginInventory: vi.fn(),
+        updateSyncPathSettings,
+      },
+      scopeInventory: [],
+      scopeInventoryLoaded: true,
+      pendingCommunityPluginScopeValues: new Map(),
+      busyCommunityPluginScopeRows: new Set(),
+      refreshCommunityPluginScopeControls,
+    });
+
+    await (modal as unknown as {
+      updateCommunityPluginScopeSetting(
+        column: "files" | "data",
+        value: boolean,
+      ): Promise<void>;
+    }).updateCommunityPluginScopeSetting("files", true);
+
+    expect(updateSyncPathSettings).not.toHaveBeenCalled();
+    expect(refreshCommunityPluginScopeControls).not.toHaveBeenCalled();
+  });
+
+  it("uses flat, immediate-save community plugin child modals", () => {
+    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    const styles = readFileSync("styles.css", "utf8");
+
+    expect(source.match(/extends Modal/g)).toHaveLength(1);
+    expect(source).toContain('"community-plugin-files"');
+    expect(source).toContain('"community-plugin-data"');
+    expect(source).toContain("openCommunityPluginManagerModal");
+    expect(source).toContain("new ConfigSyncModal(");
+    expect(source).not.toContain(".addDropdown");
+    expect(source).not.toContain("requestLeave");
+    expect(source).not.toContain("hasUnsavedPolicy");
+    expect(source).not.toContain("saveCommunityPluginPolicy");
+    expect(source).toContain("settingsUpdateQueue");
+    expect(source).toContain("this.settingsUpdateQueue.whenIdle()");
+    expect(source).toContain("pendingPluginValues");
+    expect(source).toContain("updateCommunityPluginFilesSelection(");
+    expect(source).toContain("updateAllCommunityPluginSelections(");
+    expect(source).toContain("enableCommunityPluginDataWithFiles(");
+    expect(source).toContain("new ConfirmModal(");
+    expect(source).toContain("getPendingCommunityPluginEnablementDecisions");
+    expect(source).toContain("resolveCommunityPluginEnablementDecision");
+    expect(source).toContain("inventoryLoadFailed");
+    expect(source).toContain('t("notice.communityPlugins.loadFailed")');
+    expect(source).toContain("isPluginEffectivelyEnabled(");
+    expect(source).toContain("toggle.toggleEl.setAttribute(");
+    expect(source).not.toContain(
+      '"notice.communityPlugins.saved"',
+    );
+    expect(source).not.toContain("easy-sync-plugin-manager-summary");
+    expect(source).not.toContain("easy-sync-plugin-manager-bulk-actions");
+    expect(source).toContain(
+      "this.remoteInventoryAvailable && item.remote && !item.local",
+    );
+    expect(styles).toMatch(
+      /\.easy-sync-plugin-list-scroll\s*\{[^}]*overflow-y: auto/s,
+    );
+    expect(styles.match(/\.easy-sync-plugin-list-scroll\s*\{([^}]*)\}/s)?.[1] ?? "")
+      .not.toMatch(/border|border-radius/);
+    expect(styles).not.toContain(".easy-sync-plugin-manager-footer");
+    expect(styles).not.toContain(".easy-sync-plugin-discard-guard");
+  });
+
+  it("renders actionable participation phases from the unified files read model", () => {
+    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    Object.assign(modal as object, {
+      plugin: { i18n: { t: (key: string) => key } },
+      remoteInventoryAvailable: true,
+    });
+    const describe = (reason: string, desktopOnly = false) =>
+      (modal as unknown as {
+        describeInventoryItem(
+          item: Record<string, unknown>,
+          column: "files",
+        ): string[];
+      }).describeInventoryItem({
+        id: "calendar",
+        name: "Calendar",
+        local: false,
+        remote: true,
+        dataLocally: false,
+        dataRemotely: false,
+        enabledLocally: null,
+        desktopOnly,
+        manifestIssue: false,
+        participationPhase: "blocked",
+        participationBlockedReason: reason,
+      }, "files");
+
+    expect(source).toContain("item.participationPhase");
+    expect(source).toContain(
+      '"settings.communityPlugins.status.joinRequested"',
+    );
+    expect(source).toContain(
+      '"settings.communityPlugins.status.restoreBlocked"',
+    );
+    expect(zhCN["settings.communityPlugins.status.joinRequested"])
+      .toBe("等待加入同步");
+    expect(zhCN["settings.communityPlugins.status.restoreBlocked"])
+      .toBe("恢复受阻，可稍后重试");
+    expect(en["settings.communityPlugins.status.joinRequested"])
+      .toBe("Waiting to join sync");
+    expect(en["settings.communityPlugins.status.restoreBlocked"])
+      .toBe("Restore blocked; try again later");
+    expect(zhCN["settings.communityPlugins.status.restoreIncompatible"])
+      .toBe("与当前设备或 Obsidian 版本不兼容");
+    expect(en["settings.communityPlugins.status.restoreIncompatible"])
+      .toBe("Not compatible with this device or Obsidian version");
+    expect(zhCN["settings.communityPlugins.status.restoreTargetChanged"])
+      .toBe("远端插件已变化，请关闭后重新开启以确认恢复");
+    expect(en["settings.communityPlugins.status.restoreTargetChanged"])
+      .toBe("Remote plugin changed; turn this off and on again to confirm restore");
+    expect(zhCN["settings.communityPlugins.status.restoreScopeChanged"])
+      .toBe("同步位置已变化，请关闭后重新开启以重新绑定");
+    expect(en["settings.communityPlugins.status.restoreScopeChanged"])
+      .toBe("Sync location changed; turn this off and on again to reconnect");
+    expect(zhCN["settings.communityPlugins.status.localBundleIncomplete"])
+      .toBe("本机插件文件不完整，请重新安装插件后同步");
+    expect(en["settings.communityPlugins.status.localBundleIncomplete"])
+      .toBe("Local plugin files are incomplete; reinstall the plugin, then sync");
+    expect(zhCN["settings.communityPlugins.status.remoteCatalogStale"])
+      .toBe("远端状态待重新确认");
+    expect(en["settings.communityPlugins.status.remoteCatalogStale"])
+      .toBe("Remote status needs to be checked again");
+    expect(zhCN["notice.communityPlugins.remoteCatalogFailed"])
+      .toBe("无法确认远端插件列表，请稍后重新打开。");
+    expect(en["notice.communityPlugins.remoteCatalogFailed"])
+      .toBe("Could not verify the remote plugin list. Reopen this page to try again.");
+    expect(source).toContain("item.participationBlockedReason");
+    expect(describe("manifest-incompatible", true)).toContain(
+      "settings.communityPlugins.status.restoreIncompatible",
+    );
+    expect(describe("manifest-incompatible", true)).not.toContain(
+      "settings.communityPlugins.status.desktopOnly",
+    );
+    expect(describe("remote-bundle-changed")).toContain(
+      "settings.communityPlugins.status.restoreTargetChanged",
+    );
+    expect(describe("scope-changed")).toContain(
+      "settings.communityPlugins.status.restoreScopeChanged",
+    );
+  });
+
+  it("refreshes the range-independent remote catalog only when the plugin manager opens", () => {
+    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+
+    expect(source).toContain("refreshCommunityPluginRemoteCatalog");
+    expect(source.indexOf("refreshCommunityPluginRemoteCatalog"))
+      .toBeGreaterThan(source.indexOf("openCommunityPluginManager("));
+  });
+
+  it("subscribes an open scope modal to community inventory revisions and unsubscribes on close", () => {
+    let onRevision: ((revision: number) => void) | undefined;
+    const unsubscribe = vi.fn();
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    const handleRevision = vi.fn();
+    Object.assign(modal as object, {
+      plugin: {
+        i18n: { t: (key: string) => key },
+        onCommunityPluginInventoryRevision: vi.fn(
+          (listener: (revision: number) => void) => {
+            onRevision = listener;
+            return unsubscribe;
+          },
+        ),
+      },
+      initialView: "scope",
+      destroyed: true,
+      loadGeneration: 0,
+      modalEl: { addClass: vi.fn() },
+      contentEl: { empty: vi.fn() },
+      settingsUpdateQueue: { whenIdle: vi.fn() },
+      renderScope: vi.fn(),
+      handleCommunityPluginInventoryRevision: handleRevision,
+    });
+
+    modal.onOpen();
+    expect(onRevision).toBeTypeOf("function");
+    onRevision?.(4);
+    expect(handleRevision).toHaveBeenCalledWith(4);
+
+    modal.onClose();
+    expect(unsubscribe).toHaveBeenCalledOnce();
+  });
+
+  it("freshly reloads and rerenders an open community plugin manager after a revision", async () => {
+    const nextInventory = [{
+      id: "calendar",
+      name: "Calendar",
+      version: null,
+      local: false,
+      remote: true,
+      dataLocally: false,
+      dataRemotely: false,
+      enabledLocally: null,
+      desktopOnly: false,
+      manifestIssue: false,
+    }];
+    const renderPluginListArea = vi.fn();
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    Object.assign(modal as object, {
+      plugin: {
+        getCommunityPluginInventory: vi.fn().mockResolvedValue(nextInventory),
+        hasTrustedCommunityPluginRemoteInventory: vi.fn().mockResolvedValue(true),
+        getPendingCommunityPluginEnablementDecisions: vi.fn().mockResolvedValue([]),
+      },
+      view: "community-plugin-files",
+      inventory: [],
+      pendingDecisions: [],
+      remoteInventoryAvailable: false,
+      inventoryLoading: false,
+      inventoryLoadFailed: false,
+      destroyed: false,
+      loadGeneration: 5,
+      renderPluginListArea,
+    });
+
+    await (modal as unknown as {
+      reloadCommunityPluginManager(
+        column: "files" | "data",
+        generation: number,
+      ): Promise<void>;
+    }).reloadCommunityPluginManager("files", 5);
+
+    expect((modal as unknown as { inventory: unknown[] }).inventory)
+      .toEqual(nextInventory);
+    expect((modal as unknown as { remoteInventoryAvailable: boolean })
+      .remoteInventoryAvailable).toBe(true);
+    expect(renderPluginListArea).toHaveBeenCalled();
+  });
+
+  it("coalesces a burst of inventory revisions into one in-flight load and one follow-up", async () => {
+    let releaseFirst!: (inventory: unknown[]) => void;
+    const firstInventory = new Promise<unknown[]>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const getCommunityPluginInventory = vi.fn()
+      .mockImplementationOnce(() => firstInventory)
+      .mockResolvedValue([]);
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    Object.assign(modal as object, {
+      plugin: {
+        getCommunityPluginInventory,
+        hasTrustedCommunityPluginRemoteInventory: vi.fn().mockResolvedValue(true),
+        getPendingCommunityPluginEnablementDecisions: vi.fn().mockResolvedValue([]),
+      },
+      view: "community-plugin-files",
+      inventory: [],
+      pendingDecisions: [],
+      remoteInventoryAvailable: false,
+      inventoryLoading: false,
+      inventoryLoadFailed: false,
+      inventoryRevisionRefreshRunning: false,
+      inventoryRevisionRefreshPending: false,
+      destroyed: false,
+      loadGeneration: 0,
+      renderPluginListArea: vi.fn(),
+      focusPendingDecisionIfRequested: vi.fn(),
+    });
+    const handleRevision = (modal as unknown as {
+      handleCommunityPluginInventoryRevision: (revision: number) => void;
+    }).handleCommunityPluginInventoryRevision.bind(modal);
+
+    handleRevision(1);
+    handleRevision(2);
+    handleRevision(3);
+    expect(getCommunityPluginInventory).toHaveBeenCalledOnce();
+
+    releaseFirst([]);
+    await vi.waitFor(() => {
+      expect(getCommunityPluginInventory).toHaveBeenCalledTimes(2);
+    });
+    await vi.waitFor(() => {
+      expect((modal as unknown as {
+        inventoryRevisionRefreshRunning: boolean;
+      }).inventoryRevisionRefreshRunning).toBe(false);
+    });
+    expect(getCommunityPluginInventory).toHaveBeenCalledTimes(2);
+  });
+
+  it("falls back to the distinguishable plugin id when no trusted display name exists", () => {
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    Object.assign(modal as object, {
+      plugin: {
+        i18n: { t: (key: string) => key },
+      },
+    });
+
+    const resolveDisplayName = (modal as unknown as {
+      getCommunityPluginDisplayName(
+        item: { id: string; name: string | null },
+      ): string;
+    }).getCommunityPluginDisplayName.bind(modal);
+
+    expect(resolveDisplayName({ id: "calendar", name: "Calendar" }))
+      .toBe("Calendar");
+    expect(resolveDisplayName({ id: "calendar", name: null }))
+      .toBe("calendar");
+  });
+
+  it("keeps the community plugin manager header compact and native", () => {
+    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    const styles = readFileSync("styles.css", "utf8");
+
+    expect(source).toContain("new SearchComponent(this.contentEl)");
+    expect(source).toContain(
+      '.setPlaceholder(t("settings.communityPlugins.search"))',
+    );
+    expect(source).not.toContain(".addSearch((search) =>");
+    expect(source).not.toContain("easy-sync-plugin-manager-intro");
+    expect(source).not.toContain("settings.communityPlugins.files.intro");
+    expect(source).not.toContain("settings.communityPlugins.data.intro");
+    expect(source).not.toContain("remoteInventoryNoteEl");
+    expect(source).not.toContain(
+      '"settings.communityPlugins.remoteUnavailable"',
+    );
+    expect(source).not.toContain("easy-sync-plugin-search-row");
+    expect(source).not.toContain("easy-sync-plugin-search-setting");
+    expect(source).not.toContain('"easy-sync-plugin-meta"');
+    expect(source).not.toContain("is-restricted");
+    expect(source).not.toContain(
+      '"settings.communityPlugins.status.dataFound"',
+    );
+    expect(source).not.toContain(
+      '"settings.communityPlugins.status.pluginNotSelected"',
+    );
+    expect(styles).toContain(".easy-sync-plugin-search");
+    expect(styles).toContain("margin-inline: var(--size-4-2)");
+    expect(styles).toMatch(
+      /body:not\(\.is-mobile\) \.easy-sync-plugin-search\s*\{[^}]*margin-block-start:\s*var\(--size-4-2\)/s,
+    );
+    expect(styles).not.toContain(".easy-sync-plugin-manager-intro");
+    expect(styles).not.toContain(".easy-sync-plugin-search-setting");
+    expect(styles).not.toContain(".easy-sync-plugin-remote-note");
+    expect(styles).not.toContain(".easy-sync-plugin-meta");
+    expect(styles).not.toContain(".easy-sync-plugin-row.is-restricted");
+    const pluginNameStyle = styles.match(
+      /\.easy-sync-plugin-name\s*\{(?<body>[^}]*)\}/,
+    )?.groups?.body ?? "";
+    expect(pluginNameStyle).toContain("font-weight: var(--font-normal)");
+    expect(pluginNameStyle).not.toContain("font-weight: var(--font-semibold)");
+  });
+
+  it("uses the approved community plugin terms and concise descriptions", () => {
+    expect(zhCN["settings.syncCommunityPlugins.name"]).toBe("社区插件");
+    expect(zhCN["settings.syncPluginData.name"]).toBe("社区插件数据");
+    expect(zhCN["settings.syncCommunityPlugins.desc"]).toBe(
+      "同步插件文件与启用状态。",
+    );
+    expect(zhCN["settings.syncPluginData.desc"]).toBe(
+      "同步所选插件的设置数据。此功能尚未充分测试，可能替换其他设备上的插件设置；请先备份。",
+    );
+    expect(zhCN["settings.communityPlugins.experimental"]).toBe("实验性");
+    expect(en["settings.communityPlugins.experimental"]).toBe("Experimental");
+    expect(zhCN["settings.communityPlugins.data.experimentalConfirmTitle"]).toBe(
+      "开启社区插件数据同步？",
+    );
+    expect(zhCN["settings.communityPlugins.data.experimentalConfirm"]).toBe(
+      "了解风险并开启",
+    );
+    expect(zhCN["settings.communityPlugins.data.experimentalWarning"]).toBe(
+      "请先备份各设备上的插件设置。",
+    );
+    expect(zhCN["settings.communityPlugins.manage.files"]).toBe(
+      "管理社区插件",
+    );
+    expect(zhCN["settings.communityPlugins.manage.data"]).toBe(
+      "管理社区插件数据",
+    );
+    expect(zhCN["settings.communityPlugins.selectionSummary"]).toBe(
+      "启用：{enabled}/{total}",
+    );
+    expect(en["settings.communityPlugins.manage.files"]).toBe(
+      "Manage community plugins",
+    );
+    expect(en["settings.communityPlugins.manage.data"]).toBe(
+      "Manage community plugin data",
+    );
+    expect(en["settings.communityPlugins.selectionSummary"]).toBe(
+      "Enabled: {enabled}/{total}",
+    );
+    expect(en["settings.communityPlugins.data.experimentalConfirm"]).toBe(
+      "I understand the risk — turn it on",
+    );
+    expect(zhCN["settings.communityPlugins.status.localOnly"]).toBe(
+      "插件仅本机有",
+    );
+    expect(zhCN["settings.communityPlugins.status.remoteOnly"]).toBe(
+      "插件仅远端有",
+    );
+    expect(zhCN["settings.communityPlugins.status.unavailable"]).toBe(
+      "未找到插件本体",
+    );
+    expect(zhCN["settings.communityPlugins.status.dataMissing"]).toBe(
+      "未发现 data.json",
+    );
+    expect(zhCN["settings.communityPlugins.status.desktopOnly"]).toBe(
+      "仅桌面可用",
+    );
+    expect(zhCN["settings.communityPlugins.status.manifestIssue"]).toBe(
+      "本机插件信息异常",
+    );
+    expect(zhCN["settings.communityPlugins.decisions.local"]).toBe(
+      "保留本机状态",
+    );
+    expect(zhCN["settings.communityPlugins.decisions.remote"]).toBe(
+      "保留远端状态",
+    );
+    expect(en["settings.communityPlugins.status.localOnly"]).toBe(
+      "Plugin files only on this device",
+    );
+    expect(en["settings.communityPlugins.status.remoteOnly"]).toBe(
+      "Plugin files only in the cloud",
+    );
+    expect(en["settings.communityPlugins.status.unavailable"]).toBe(
+      "Plugin files not found",
+    );
+    expect(en["settings.communityPlugins.status.dataMissing"]).toBe(
+      "No data.json found",
+    );
+    expect(en["settings.communityPlugins.status.desktopOnly"]).toBe(
+      "Only works on desktop",
+    );
+    expect(en["settings.communityPlugins.status.manifestIssue"]).toBe(
+      "Local plugin information issue",
+    );
+    expect(en["settings.communityPlugins.decisions.local"]).toBe(
+      "Keep local state",
+    );
+    expect(en["settings.communityPlugins.decisions.remote"]).toBe(
+      "Keep remote state",
+    );
+    expect(zhCN["notice.sync.communityPluginEnablement"]).toBe(
+      "有 {count} 个社区插件启用状态需要确认，本次同步未执行。",
+    );
+    expect(en["notice.sync.communityPluginEnablement"]).toBe(
+      "{count} community plugin enabled state(s) need review. This sync was not run.",
+    );
+    expect(zhCN["syncView.communityPlugins.pendingTitle"]).toBe(
+      "社区插件启用状态待确认（{count}）",
+    );
+    expect(en["syncView.communityPlugins.pendingTitle"]).toBe(
+      "Community plugin enabled state needs review ({count})",
+    );
   });
 
   it("keeps sync exclusion copy device-local and non-destructive in both locales", () => {

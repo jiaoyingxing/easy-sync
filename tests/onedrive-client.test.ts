@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as obsidian from "obsidian";
 import { OneDriveClient } from "../src/onedrive/client";
-import { OneDriveError, OneDriveErrorType } from "../src/onedrive/types";
+import {
+  OneDriveError,
+  OneDriveErrorType,
+  RemoteVaultScopeIdentityError,
+} from "../src/onedrive/types";
 
 describe("OneDriveClient run metrics", () => {
   afterEach(() => {
@@ -64,7 +68,12 @@ describe("OneDriveClient run metrics", () => {
           name: "note.md",
           size: content.byteLength,
           eTag: "etag-1",
-          file: {},
+          cTag: "ctag-1",
+          file: {
+            hashes: {
+              quickXorHash: "quickxor-1",
+            },
+          },
           parentReference: { id: "files-root-id" },
         },
       });
@@ -88,9 +97,17 @@ describe("OneDriveClient run metrics", () => {
         "file-id",
         content.byteLength,
       );
-      await client.getFileMetadata("testVault", "note.md", "downloadVersionVerify");
+      const metadata = await client.getFileMetadata(
+        "testVault",
+        "note.md",
+        "downloadVersionVerify",
+      );
       const summary = client.finishRunMetrics();
 
+      expect(metadata).toMatchObject({
+        cTag: "ctag-1",
+        quickXorHash: "quickxor-1",
+      });
       expect(summary).toMatchObject({
         schemaVersion: 2,
         metadataReasons: {
@@ -272,6 +289,123 @@ describe("OneDriveClient.downloadFile", () => {
       client.downloadFile("testVault", "recording.m4a", undefined, "file-id", 5 * 1024 * 1024),
     ).resolves.toBe(content);
     expect(requestSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it("cancels a pending CDN retry without waiting for the backoff timer", async () => {
+    vi.useFakeTimers();
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    const fetchSpy = vi.fn().mockResolvedValue(
+      new Response(new ArrayBuffer(0), { status: 503 }),
+    );
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      json: {
+        "@microsoft.graph.downloadUrl": "https://download.example/recording.m4a",
+      },
+    });
+    const controller = new AbortController();
+    const client = new OneDriveClient(async () => "token");
+    client.setAbortSignal(controller.signal);
+    let settled = false;
+
+    try {
+      const outcome = client.downloadFile(
+        "testVault",
+        "recording.m4a",
+        undefined,
+        "file-id",
+        5 * 1024 * 1024,
+      ).then(
+        () => ({ status: "resolved" as const }),
+        (error: unknown) => ({ status: "rejected" as const, error }),
+      ).finally(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(requestSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(settled).toBe(true);
+      await expect(outcome).resolves.toMatchObject({
+        status: "rejected",
+        error: { name: "AbortError" },
+      });
+      expect(requestSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+    }
+  });
+
+  it("cancels a pending streamed CDN retry without opening another transfer", async () => {
+    vi.useFakeTimers();
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    const fetchSpy = vi.fn().mockResolvedValue(
+      new Response(new ArrayBuffer(0), { status: 503 }),
+    );
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      json: {
+        "@microsoft.graph.downloadUrl": "https://download.example/recording.m4a",
+      },
+    });
+    const adapter = {
+      writeBinary: vi.fn().mockResolvedValue(undefined),
+      appendBinary: vi.fn().mockResolvedValue(undefined),
+      remove: vi.fn().mockResolvedValue(undefined),
+    };
+    const controller = new AbortController();
+    const client = new OneDriveClient(async () => "token");
+    client.setAbortSignal(controller.signal);
+    let settled = false;
+
+    try {
+      const outcome = client.downloadFileToPath(
+        "testVault",
+        "recording.m4a",
+        ".obsidian/plugins/easy-sync/tmp/downloads/recording.m4a.part",
+        adapter as never,
+        undefined,
+        "file-id",
+        5 * 1024 * 1024,
+      ).then(
+        () => ({ status: "resolved" as const }),
+        (error: unknown) => ({ status: "rejected" as const, error }),
+      ).finally(() => {
+        settled = true;
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(requestSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      controller.abort();
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(settled).toBe(true);
+      await expect(outcome).resolves.toMatchObject({
+        status: "rejected",
+        error: { name: "AbortError" },
+      });
+      expect(requestSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+    }
   });
 
   it("uses the 30% reserve for one late CDN retry", async () => {
@@ -811,6 +945,97 @@ describe("OneDriveClient CloudBootstrapV2 CAS", () => {
   });
 });
 
+describe("OneDriveClient shared V2 sync protocol", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("creates protocol-v2.json with create-only conflict behavior", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 201,
+      headers: {},
+      json: { id: "protocol-id", eTag: "etag-1" },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.createSharedSyncProtocolV2("testVault", "{}"))
+      .resolves.toEqual({ id: "protocol-id", eTag: "etag-1" });
+    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({
+      method: "PUT",
+      url: expect.stringContaining(
+        "protocol-v2.json:/content?@microsoft.graph.conflictBehavior=fail",
+      ),
+      headers: expect.not.objectContaining({
+        "If-Match": expect.anything(),
+      }),
+    }));
+  });
+
+  it("reads the protocol with its stable ID and eTag", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: { value: [{
+          id: "protocol-id",
+          name: "protocol-v2.json",
+          eTag: "etag-1",
+          file: {},
+          "@microsoft.graph.downloadUrl":
+            "https://download.example/protocol-v2.json",
+        }] },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        text: '{"protocolVersion":2}',
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.readSharedSyncProtocolV2("testVault"))
+      .resolves.toEqual({
+        id: "protocol-id",
+        eTag: "etag-1",
+        content: '{"protocolVersion":2}',
+      });
+    expect(requestSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not overlap a timed-out protocol downloadUrl with Graph content", async () => {
+    vi.useFakeTimers();
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: { value: [{
+          id: "protocol-id",
+          name: "protocol-v2.json",
+          eTag: "etag-1",
+          file: {},
+          "@microsoft.graph.downloadUrl":
+            "https://download.example/protocol-v2.json",
+        }] },
+      })
+      .mockImplementationOnce(() => new Promise(() => undefined))
+      .mockResolvedValue({
+        status: 200,
+        headers: {},
+        text: '{"protocolVersion":2}',
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    const result = client.readSharedSyncProtocolV2("testVault");
+    const rejection = expect(result).rejects.toMatchObject<
+      Partial<OneDriveError>
+    >({ type: OneDriveErrorType.NetworkError });
+    await vi.advanceTimersByTimeAsync(8000);
+
+    await rejection;
+    expect(requestSpy).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe("OneDriveClient.moveItemById", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -829,6 +1054,68 @@ describe("OneDriveClient.moveItemById", () => {
       headers: expect.objectContaining({ "If-Match": "etag-1" }),
       body: JSON.stringify({ name: "new.md", parentReference: { id: "folder-id" } }),
     }));
+  });
+});
+
+describe("OneDriveClient.listFolderChildrenById", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("consumes every Graph page before reporting an empty-delete precondition", async () => {
+    const nextLink = "https://graph.microsoft.com/v1.0/me/drive/items/folder-id/children?$skiptoken=next";
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: {
+          value: [{
+            id: "child-1",
+            name: "a.md",
+            file: {},
+            parentReference: { id: "folder-id" },
+          }],
+          "@odata.nextLink": nextLink,
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: {
+          value: [{
+            id: "child-2",
+            name: "Nested",
+            folder: {},
+            parentReference: { id: "folder-id" },
+          }],
+        },
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.listFolderChildrenById("folder-id"))
+      .resolves.toHaveLength(2);
+    expect(requestSpy).toHaveBeenCalledTimes(2);
+    expect(requestSpy.mock.calls[1][0]).toEqual(expect.objectContaining({
+      method: "GET",
+      url: nextLink,
+    }));
+  });
+
+  it("rejects a child page that crosses the requested parent identity", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      json: {
+        value: [{
+          id: "child",
+          name: "a.md",
+          file: {},
+          parentReference: { id: "other-folder" },
+        }],
+      },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.listFolderChildrenById("folder-id"))
+      .rejects.toThrow("different parent identity");
   });
 });
 
@@ -1525,7 +1812,6 @@ describe("OneDriveClient.uploadFile", () => {
       "/me/drive/items/drive-id/createUploadSession",
       { item: { "@microsoft.graph.conflictBehavior": "replace" } },
       undefined,
-      undefined,
       { extraHeaders: { "If-Match": "etag-old" } },
     );
   });
@@ -1632,6 +1918,94 @@ describe("OneDriveClient vault initialization", () => {
     expect(requestSpy.mock.calls[0][0].url).toContain(
       `/vaults/${encodedLegacyName}/files/probe.md:/content`,
     );
+  });
+
+  it("restores a committed legacy route from Graph identities when no cursor is usable", async () => {
+    const vaultName = "中文测试仓库";
+    const legacyName = encodeURIComponent(vaultName);
+    const encodedLegacyName = encodeURIComponent(legacyName);
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.endsWith("/me/drive/items/vault-folder-id")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            id: "vault-folder-id",
+            name: legacyName,
+            folder: {},
+            parentReference: { driveId: "drive-id", id: "vaults-root-id" },
+          },
+        };
+      }
+      if (options.url.endsWith("/me/drive/items/files-root-id")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            id: "files-root-id",
+            name: "files",
+            folder: {},
+            parentReference: { driveId: "drive-id", id: "vault-folder-id" },
+          },
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { id: "uploaded-id", eTag: "etag-uploaded" },
+      };
+    });
+    const client = new OneDriveClient(async () => "token");
+    const scope = {
+      driveId: "drive-id",
+      vaultFolderId: "vault-folder-id",
+      filesRootId: "files-root-id",
+    };
+
+    await expect(client.restoreVaultScopeByIdentity(vaultName, scope))
+      .resolves.toEqual(scope);
+    await client.uploadFile(vaultName, "probe.md", new ArrayBuffer(1));
+
+    expect(requestSpy.mock.calls[2][0].url).toContain(
+      `/vaults/${encodedLegacyName}/files/probe.md:/content`,
+    );
+  });
+
+  it("classifies reachable committed metadata that no longer represents the files root", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.endsWith("/me/drive/items/vault-folder-id")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            id: "vault-folder-id",
+            name: "testVault",
+            folder: {},
+            parentReference: { driveId: "drive-id", id: "vaults-root-id" },
+          },
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          id: "files-root-id",
+          name: "renamed-files-root",
+          folder: {},
+          parentReference: { driveId: "drive-id", id: "vault-folder-id" },
+        },
+      };
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.restoreVaultScopeByIdentity("testVault", {
+      driveId: "drive-id",
+      vaultFolderId: "vault-folder-id",
+      filesRootId: "files-root-id",
+    })).rejects.toMatchObject<RemoteVaultScopeIdentityError>({
+      name: "RemoteVaultScopeIdentityError",
+      reason: "files-root-invalid",
+    });
   });
 
   it("refuses to restore a scope when the cursor belongs to another vault route", () => {
@@ -2013,6 +2387,44 @@ describe("OneDriveClient request retry policy", () => {
     expect(requestSpy).toHaveBeenCalledTimes(2);
   });
 
+  it("cancels a pending Retry-After wait without issuing another request", async () => {
+    vi.useFakeTimers();
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockRejectedValueOnce({
+        status: 429,
+        headers: { "retry-after": "60" },
+        json: { error: { code: "tooManyRequests", message: "slow down" } },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: { id: "late-retry", name: "EasySync", folder: {} },
+      });
+    const controller = new AbortController();
+    const client = new OneDriveClient(async () => "token");
+    client.setAbortSignal(controller.signal);
+    let settled = false;
+
+    const outcome = client.getAppFolder().then(
+      () => ({ status: "resolved" as const }),
+      (error: unknown) => ({ status: "rejected" as const, error }),
+    ).finally(() => {
+      settled = true;
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(settled).toBe(true);
+    await expect(outcome).resolves.toMatchObject({
+      status: "rejected",
+      error: { name: "AbortError" },
+    });
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+  });
+
   it.each([500, 502, 503, 504])("stops after two retries for persistent HTTP %i", async (status) => {
     vi.useFakeTimers();
     vi.spyOn(Math, "random").mockReturnValue(0);
@@ -2095,6 +2507,44 @@ describe("OneDriveClient request retry policy", () => {
     await rejection;
     expect(requestSpy).toHaveBeenCalledTimes(1);
   });
+
+  it.each([
+    {
+      method: "POST",
+      run: (client: OneDriveClient) =>
+        client.createFolderByParentId("parent-id", "created"),
+    },
+    {
+      method: "PATCH",
+      run: (client: OneDriveClient) =>
+        client.renameItem("testVault", "old.md", "new.md", "file-id", "etag-1"),
+    },
+    {
+      method: "DELETE",
+      run: (client: OneDriveClient) =>
+        client.deleteItem("testVault", "deleted.md", "etag-1", "file-id"),
+    },
+  ])("does not immediately resend a $method mutation after status=0", async ({ method, run }) => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockRejectedValueOnce(Object.assign(new Error("transport result unknown"), { status: 0 }))
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: {
+          id: "duplicate-risk",
+          name: "new.md",
+          parentReference: { id: "parent-id" },
+          folder: {},
+        },
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(run(client)).rejects.toMatchObject<Partial<OneDriveError>>({
+      type: OneDriveErrorType.NetworkError,
+    });
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({ method }));
+  });
 });
 
 describe("OneDriveClient delta continuation", () => {
@@ -2116,5 +2566,93 @@ describe("OneDriveClient delta continuation", () => {
       url: "https://graph.example/delta-1",
       method: "GET",
     }));
+  });
+
+  it("starts a recovery delta from the exact folder identity and keeps pagination", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: {
+          value: [{ id: "a", name: "a.md", file: {} }],
+          "@odata.nextLink": "https://graph.example/folder-page-2",
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: {
+          value: [{ id: "b", name: "b.md", file: {} }],
+          "@odata.deltaLink": "https://graph.example/folder-delta",
+        },
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.getDeltaByFolderId("root/id")).resolves.toEqual({
+      value: [
+        expect.objectContaining({ id: "a" }),
+        expect.objectContaining({ id: "b" }),
+      ],
+      "@odata.deltaLink": "https://graph.example/folder-delta",
+    });
+
+    expect(requestSpy.mock.calls.map(([request]) => request.url)).toEqual([
+      expect.stringContaining("/me/drive/items/root%2Fid/delta"),
+      "https://graph.example/folder-page-2",
+    ]);
+  });
+});
+
+describe("OneDriveClient folder identity mutations", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("creates a child folder through the Graph parent children endpoint", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 201,
+      headers: {},
+      json: {
+        id: "folder-id",
+        name: "New Folder",
+        folder: {},
+        parentReference: { id: "parent/id" },
+        eTag: "folder-etag",
+      },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.createFolderByParentId("parent/id", "New Folder"))
+      .resolves.toMatchObject({
+        id: "folder-id",
+        parentReference: { id: "parent/id" },
+      });
+
+    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({
+      method: "POST",
+      url: expect.stringContaining("/me/drive/items/parent%2Fid/children"),
+      body: JSON.stringify({
+        name: "New Folder",
+        folder: {},
+        "@microsoft.graph.conflictBehavior": "fail",
+      }),
+    }));
+  });
+
+  it("rejects a create response that does not preserve the requested parent identity", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 201,
+      headers: {},
+      json: {
+        id: "folder-id",
+        name: "New Folder",
+        folder: {},
+        parentReference: { id: "different-parent" },
+      },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.createFolderByParentId("parent-id", "New Folder"))
+      .rejects.toThrow("metadata is incomplete or mismatched");
   });
 });

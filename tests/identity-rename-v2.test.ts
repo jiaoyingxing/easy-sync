@@ -59,6 +59,24 @@ describe("identity-safe V2 rename planning", () => {
     );
   });
 
+  it("uses a folder identity that is moving to the destination path in the same plan", () => {
+    expect(planIdentityRenamesV2(
+      envelope(),
+      [local("renamed/new.md")],
+      {
+        projectedFolderIdentities: [{
+          path: "renamed",
+          remoteId: "folder",
+        }],
+      },
+    )).toContainEqual(expect.objectContaining({
+      type: "move-remote",
+      remoteId: "file",
+      newName: "new.md",
+      newParentId: "folder",
+    }));
+  });
+
   it("blocks a local rename when remote content changed", () => {
     const state = envelope();
     state.remoteIndex.itemsById.file!.eTag = "e2";
@@ -89,14 +107,55 @@ describe("identity-safe V2 rename planning", () => {
     }]);
   });
 
-  it("does not transfer an anchor to a same-name object with a new remote ID", () => {
+  it("routes a same-path replacement into the dedicated identity reconciliation owner", () => {
     const state = envelope();
     delete state.remoteIndex.itemsById.file;
     state.remoteIndex.itemsById.rebuilt = {
-      id: "rebuilt", parentId: "root", name: "old.md", kind: "file", eTag: "e1", size: 4, contentHash: hash,
+      id: "rebuilt", parentId: "root", name: "old.md", kind: "file", eTag: "e2", size: 4, contentHash: hash,
+    };
+    expect(planIdentityRenamesV2(state, [local("old.md", "b".repeat(64))])).toEqual([{
+      type: "reconcile-remote-identity",
+      anchorId: "anchor",
+      previousRemoteId: "file",
+      remoteId: "rebuilt",
+      path: "old.md",
+      expectedRemoteETag: "e2",
+    }]);
+  });
+
+  it("does not confuse an ordinary remote deletion with a file move", () => {
+    const state = envelope();
+    delete state.remoteIndex.itemsById.file;
+    expect(planIdentityRenamesV2(state, [local("old.md")])).toEqual([]);
+  });
+
+  it("marks a same-path replacement plus local relocation as unknown instead of a move", () => {
+    const state = envelope();
+    delete state.remoteIndex.itemsById.file;
+    state.remoteIndex.itemsById.rebuilt = {
+      id: "rebuilt", parentId: "root", name: "old.md", kind: "file", eTag: "e2", size: 4, contentHash: hash,
     };
     expect(planIdentityRenamesV2(state, [local("new.md")])).toEqual([{
-      type: "conflict", anchorId: "anchor", path: "old.md", reason: "remote-identity-missing",
+      type: "conflict",
+      anchorId: "anchor",
+      path: "old.md",
+      relatedPath: "new.md",
+      reason: "replacement-with-local-relocation",
+    }]);
+  });
+
+  it("marks a copy occupying the anchor path while the old identity still exists", () => {
+    const state = envelope();
+    state.remoteIndex.itemsById.file!.name = "moved.md";
+    state.remoteIndex.itemsById.copy = {
+      id: "copy", parentId: "root", name: "old.md", kind: "file", eTag: "e2", size: 4, contentHash: hash,
+    };
+    expect(planIdentityRenamesV2(state, [local("old.md")])).toEqual([{
+      type: "conflict",
+      anchorId: "anchor",
+      path: "old.md",
+      relatedPath: "moved.md",
+      reason: "same-path-identity-occupied",
     }]);
   });
 });

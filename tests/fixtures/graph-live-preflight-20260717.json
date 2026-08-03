@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 2,
+  "environment": {
+    "vault": "<vault>",
+    "accountType": "OneDriveConsumer",
+    "namespace": "<probe-root>"
+  },
+  "preflight": {
+    "quota": "pass",
+    "namespaceCreate": "blocked"
+  },
+  "observations": {},
+  "deltaPageCount": 0,
+  "cleanup": {
+    "attempted": false,
+    "method": null,
+    "confirmedAbsent": false
+  },
+  "fatal": {
+    "status": 507,
+    "code": "quotaLimitReached",
+    "message": "create probe root: 507/quotaLimitReached Quota limit reached"
+  },
+  "readDiagnostics": {
+    "driveType": "personal",
+    "quotaState": "normal",
+    "remainingBucket": "ge-1GiB",
+    "usedRatioBucket": "lt-90pct",
+    "deletedPositive": false,
+    "appRootReportedChildCount": 1,
+    "appRootListedCountBucket": "lt-10",
+    "appRootHasNextPage": false
+  },
+  "fileCreateDiagnostic": {
+    "transport": "uploadSession",
+    "conflictBehavior": "fail",
+    "payloadBytes": 1,
+    "sessionStatus": 507,
+    "sessionCode": "quotaLimitReached",
+    "uploadStarted": false,
+    "itemCreated": false,
+    "cleanupRequired": false
+  },
+  "smallPutDiagnostic": {
+    "preflightStatus": 404,
+    "payloadBytes": 1,
+    "putStatus": 507,
+    "errorCodes": [
+      "quotaLimitReached"
+    ],
+    "detailCodes": [],
+    "hasRetryAfter": false,
+    "itemCreated": false,
+    "cleanupRequired": false,
+    "residualProbeCount": 0
+  },
+  "independentResidualCheck": {
+    "status": 200,
+    "probeCount": 0
+  }
+}

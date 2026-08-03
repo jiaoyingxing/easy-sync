@@ -3,6 +3,8 @@
  * Only exports what the sync module imports at runtime.
  */
 
+import { vi } from "vitest";
+
 // Vault mock — returned by app.vault
 export interface Vault {
   adapter: DataAdapter;
@@ -48,6 +50,8 @@ export const Platform = {
   isMobile: false,
   isDesktop: true,
 };
+
+export const requireApiVersion = vi.fn((_version: string) => true);
 
 // Notice — constructor shows a notification
 export class Notice {

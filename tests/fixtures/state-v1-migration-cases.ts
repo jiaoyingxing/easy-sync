@@ -21,6 +21,7 @@ export interface RemoteNodeFixture {
   path: string;
   kind: "file" | "folder";
   eTag?: string;
+  cTag?: string;
   size?: number;
   contentHash?: string;
 }
@@ -31,6 +32,7 @@ export interface CloudAnchorFixture {
   contentHash: string;
   size: number;
   remoteETag?: string;
+  remoteCTag?: string;
 }
 
 export interface MigrationFixture {
@@ -152,9 +154,9 @@ export const STATE_V1_MIGRATION_CASES: MigrationFixture[] = [
     local: [{ path: "cloud.md", hash: HASH_B, size: 20 }],
     remote: [
       root,
-      { id: "remote-cloud", parentId: "vault-root", name: "cloud.md", path: "cloud.md", kind: "file", eTag: "etag-cloud", size: 20, contentHash: HASH_B },
+      { id: "remote-cloud", parentId: "vault-root", name: "cloud.md", path: "cloud.md", kind: "file", eTag: "etag-cloud", cTag: "ctag-cloud", size: 20 },
     ],
-    cloudAnchors: [{ remoteId: "remote-cloud", lastPath: "cloud.md", contentHash: HASH_B, size: 20, remoteETag: "etag-cloud" }],
+    cloudAnchors: [{ remoteId: "remote-cloud", lastPath: "cloud.md", contentHash: HASH_B, size: 20, remoteETag: "etag-cloud", remoteCTag: "ctag-cloud" }],
   },
   {
     id: "invalid-delta-link",

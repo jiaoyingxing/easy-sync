@@ -1,10 +1,16 @@
 import { sha256Hex } from "../crypto";
-import type { BaseFileEntry } from "./types";
+import type {
+  BaseFileEntry,
+  ContentComparisonReceiptV1,
+  LocalFileEntry,
+  RemoteFileEntry,
+} from "./types";
 
 export type ContentEqualityProof =
   | "remoteSha256"
   | "baseETag"
   | "downloadedSha256"
+  | "quickXorMismatch"
   | "sizeMismatch"
   | "insufficientEvidence";
 
@@ -14,8 +20,13 @@ export interface ContentEqualityResult {
 }
 
 export interface ContentEqualityInput {
-  local: { hash: string; size: number };
-  remote: { sha256Hash?: string; size: number; eTag: string };
+  local: { hash: string; size: number; quickXorHash?: string };
+  remote: {
+    sha256Hash?: string;
+    quickXorHash?: string;
+    size: number;
+    eTag: string;
+  };
   base?: Pick<BaseFileEntry, "hash" | "size" | "eTag">;
   downloadedHash?: string;
 }
@@ -37,16 +48,24 @@ export function resolveContentEquality(
       : { status: "different", proof: "remoteSha256" };
   }
 
-  if (input.base?.eTag === input.remote.eTag) {
-    return input.local.hash === input.base.hash && input.local.size === input.base.size
-      ? { status: "equal", proof: "baseETag" }
-      : { status: "different", proof: "baseETag" };
-  }
-
   if (input.downloadedHash) {
     return input.local.hash === input.downloadedHash.toLowerCase()
       ? { status: "equal", proof: "downloadedSha256" }
       : { status: "different", proof: "downloadedSha256" };
+  }
+
+  if (
+    input.local.quickXorHash
+    && input.remote.quickXorHash
+    && input.local.quickXorHash !== input.remote.quickXorHash
+  ) {
+    return { status: "different", proof: "quickXorMismatch" };
+  }
+
+  if (input.base?.eTag === input.remote.eTag) {
+    return input.local.hash === input.base.hash && input.local.size === input.base.size
+      ? { status: "equal", proof: "baseETag" }
+      : { status: "different", proof: "baseETag" };
   }
 
   return { status: "unknown", proof: "insufficientEvidence" };
@@ -76,4 +95,38 @@ export async function compareContentBuffers(
     remoteHash,
     decodedTextEqual: new TextDecoder().decode(local) === new TextDecoder().decode(remote),
   };
+}
+
+/** Bind a completed byte-difference result to the exact compared versions. */
+export function createContentDifferenceReceipt(
+  local: Pick<LocalFileEntry, "hash" | "size">,
+  remote: Pick<RemoteFileEntry, "driveId" | "eTag" | "size">,
+  remoteHash: string,
+): ContentComparisonReceiptV1 {
+  return {
+    version: 1,
+    result: "different",
+    localHash: local.hash,
+    localSize: local.size,
+    remoteDriveId: remote.driveId,
+    remoteETag: remote.eTag,
+    remoteSize: remote.size,
+    remoteHash: remoteHash.toLowerCase(),
+  };
+}
+
+/** Only an exact version match may suppress another download comparison. */
+export function contentDifferenceReceiptMatches(
+  receipt: ContentComparisonReceiptV1 | undefined,
+  local: Pick<LocalFileEntry, "hash" | "size">,
+  remote: Pick<RemoteFileEntry, "driveId" | "eTag" | "size">,
+): boolean {
+  return receipt?.version === 1
+    && receipt.result === "different"
+    && receipt.localHash === local.hash
+    && receipt.localSize === local.size
+    && receipt.remoteDriveId === remote.driveId
+    && receipt.remoteETag === remote.eTag
+    && receipt.remoteSize === remote.size
+    && /^[0-9a-f]{64}$/i.test(receipt.remoteHash);
 }

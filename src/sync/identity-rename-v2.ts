@@ -1,8 +1,20 @@
-import { projectRemoteIndexV2 } from "./remote-index-v2";
+import {
+  canonicalPlannerStateFromEnvelopeV2,
+  type CanonicalPlannerStateV2,
+} from "./canonical-planner-state-v2";
+import type { RemoteNodeV2 } from "./remote-index-v2";
 import type { LocalFileEntry } from "./types";
 import type { SyncAnchorV2, SyncStateEnvelopeV2 } from "./state-envelope-v2";
 
 export type IdentityRenameActionV2 =
+  | {
+      type: "reconcile-remote-identity";
+      anchorId: string;
+      previousRemoteId: string;
+      remoteId: string;
+      path: string;
+      expectedRemoteETag: string;
+    }
   | {
       type: "move-remote";
       anchorId: string;
@@ -26,35 +38,136 @@ export type IdentityRenameActionV2 =
       type: "conflict";
       anchorId: string;
       path: string;
-      reason: "remote-identity-missing" | "remote-content-changed" | "local-identity-ambiguous" | "destination-occupied" | "destination-parent-missing" | "both-paths-diverged";
+      relatedPath?: string;
+      reason:
+        | "remote-identity-missing"
+        | "remote-content-changed"
+        | "local-identity-ambiguous"
+        | "destination-occupied"
+        | "destination-parent-missing"
+        | "both-paths-diverged"
+        | "replacement-with-local-relocation"
+        | "same-path-identity-occupied";
     };
+
+export interface IdentityRenamePlanOptionsV2 {
+  /**
+   * Folder identities whose paths will be established by an earlier folder
+   * move in the same SyncPlan. This does not mutate the committed envelope.
+   */
+  projectedFolderIdentities?: readonly {
+    path: string;
+    remoteId: string;
+  }[];
+}
 
 /** Plan only identity-proven moves. Execution still requires local/remote CAS. */
 export function planIdentityRenamesV2(
   envelope: SyncStateEnvelopeV2,
   localEntries: readonly LocalFileEntry[],
+  options: IdentityRenamePlanOptionsV2 = {},
 ): IdentityRenameActionV2[] {
-  const pathByRemoteId = projectRemoteIndexV2(envelope.remoteIndex);
+  return planIdentityRenamesFromStateV2(
+    canonicalPlannerStateFromEnvelopeV2(envelope),
+    localEntries,
+    options,
+  );
+}
+
+export function planIdentityRenamesFromStateV2(
+  state: CanonicalPlannerStateV2,
+  localEntries: readonly LocalFileEntry[],
+  options: IdentityRenamePlanOptionsV2 = {},
+): IdentityRenameActionV2[] {
+  const pathByRemoteId = state.remotePathById;
   const remoteIdByPath = new Map([...pathByRemoteId].map(([id, path]) => [normalizePath(path), id]));
   const localByPath = new Map(localEntries.map((entry) => [normalizePath(entry.path), entry]));
+  const localByContent = new Map<string, LocalFileEntry[]>();
+  for (const entry of localEntries) {
+    const key = localContentKey(entry.hash, entry.size);
+    const matches = localByContent.get(key) ?? [];
+    matches.push(entry);
+    localByContent.set(key, matches);
+  }
   const folderIdByPath = new Map<string, string>();
   for (const [id, path] of pathByRemoteId) {
-    if (envelope.remoteIndex.itemsById[id]?.kind === "folder") folderIdByPath.set(normalizePath(path), id);
+    if (state.remoteNodeById.get(id)?.kind === "folder") {
+      folderIdByPath.set(normalizePath(path), id);
+    }
+  }
+  for (const projected of options.projectedFolderIdentities ?? []) {
+    const node = state.remoteNodeById.get(projected.remoteId);
+    const key = normalizePath(projected.path);
+    const occupiedId = folderIdByPath.get(key);
+    if (node?.kind === "folder" && (!occupiedId || occupiedId === projected.remoteId)) {
+      folderIdByPath.set(key, projected.remoteId);
+    }
   }
 
   const actions: IdentityRenameActionV2[] = [];
-  for (const anchor of Object.values(envelope.anchors.byAnchorId)) {
+  for (const anchor of state.fileAnchors) {
     if (!anchor.remoteId) continue;
-    const remote = envelope.remoteIndex.itemsById[anchor.remoteId];
+    const remote = state.remoteNodeById.get(anchor.remoteId);
     const remotePath = pathByRemoteId.get(anchor.remoteId);
+    const anchorPathKey = normalizePath(anchor.lastPath);
+    const occupantId = remoteIdByPath.get(anchorPathKey);
+    const occupant = occupantId
+      ? state.remoteNodeById.get(occupantId)
+      : undefined;
+    const oldLocal = localByPath.get(anchorPathKey);
+    const matchingLocals = localByContent.get(
+      localContentKey(anchor.contentHash, anchor.size),
+    ) ?? [];
+
     if (!remote || remote.kind !== "file" || !remotePath) {
-      actions.push(conflict(anchor, anchor.lastPath, "remote-identity-missing"));
+      if (
+        occupantId
+        && occupantId !== anchor.remoteId
+        && occupant?.kind === "file"
+      ) {
+        if (!oldLocal && matchingLocals.length > 0) {
+          actions.push(conflict(
+            anchor,
+            anchor.lastPath,
+            "replacement-with-local-relocation",
+            matchingLocals.length === 1 ? matchingLocals[0]!.path : undefined,
+          ));
+        } else {
+          actions.push({
+            type: "reconcile-remote-identity",
+            anchorId: anchor.anchorId,
+            previousRemoteId: anchor.remoteId,
+            remoteId: occupantId,
+            path: anchor.lastPath,
+            expectedRemoteETag: occupant.eTag ?? "",
+          });
+        }
+        continue;
+      }
+      if (!oldLocal && matchingLocals.length > 0) {
+        actions.push(conflict(
+          anchor,
+          anchor.lastPath,
+          "remote-identity-missing",
+          matchingLocals.length === 1 ? matchingLocals[0]!.path : undefined,
+        ));
+      }
       continue;
     }
-    const oldLocal = localByPath.get(normalizePath(anchor.lastPath));
-    const matchingLocals = localEntries.filter((entry) =>
-      entry.hash === anchor.contentHash && entry.size === anchor.size,
-    );
+
+    if (
+      remotePath !== anchor.lastPath
+      && occupantId
+      && occupantId !== remote.id
+    ) {
+      actions.push(conflict(
+        anchor,
+        anchor.lastPath,
+        "same-path-identity-occupied",
+        remotePath,
+      ));
+      continue;
+    }
 
     // Remote identity moved while local stayed at the anchored path.
     if (remotePath !== anchor.lastPath && oldLocal) {
@@ -107,7 +220,7 @@ export function planIdentityRenamesV2(
       const slash = destination.path.lastIndexOf("/");
       const parentPath = slash === -1 ? "" : destination.path.slice(0, slash);
       const parentId = parentPath === ""
-        ? envelope.remoteIndex.filesRootId
+        ? state.remoteIndex.filesRootId
         : folderIdByPath.get(normalizePath(parentPath));
       if (!parentId) {
         actions.push(conflict(anchor, destination.path, "destination-parent-missing"));
@@ -129,7 +242,7 @@ export function planIdentityRenamesV2(
 }
 
 function remoteMatchesAnchor(
-  remote: SyncStateEnvelopeV2["remoteIndex"]["itemsById"][string],
+  remote: Readonly<RemoteNodeV2>,
   anchor: SyncAnchorV2,
 ): boolean {
   if (!remote.eTag || !anchor.remoteETag) return false;
@@ -147,10 +260,21 @@ function conflict(
   anchor: SyncAnchorV2,
   path: string,
   reason: Extract<IdentityRenameActionV2, { type: "conflict" }>["reason"],
+  relatedPath?: string,
 ): IdentityRenameActionV2 {
-  return { type: "conflict", anchorId: anchor.anchorId, path, reason };
+  return {
+    type: "conflict",
+    anchorId: anchor.anchorId,
+    path,
+    reason,
+    ...(relatedPath ? { relatedPath } : {}),
+  };
 }
 
 function normalizePath(path: string): string {
   return path.normalize("NFC").toLocaleLowerCase();
+}
+
+function localContentKey(hash: string, size: number): string {
+  return `${size}:${hash}`;
 }

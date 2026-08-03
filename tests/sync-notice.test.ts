@@ -11,6 +11,7 @@ import {
 } from "../src/ui/sync-notice";
 import type { SyncProgressState } from "../src/sync/sync-progress";
 import type { SyncResult } from "../src/sync/sync-executor";
+import { SyncActionType } from "../src/sync/types";
 
 function result(overrides: Partial<SyncResult> = {}): SyncResult {
   return {
@@ -44,6 +45,21 @@ describe("resolveSyncNoticeOutcome", () => {
     });
   });
 
+  it("also shows completion when the run only moved files or changed folders", () => {
+    expect(resolveSyncNoticeOutcome(result({ filesMoved: 1 }))).toEqual({
+      kind: "completed",
+      count: 0,
+    });
+    expect(resolveSyncNoticeOutcome(result({
+      foldersCreated: 1,
+      foldersMoved: 2,
+      foldersDeleted: 1,
+    }))).toEqual({
+      kind: "completed",
+      count: 0,
+    });
+  });
+
   it("does not call an incomplete no-change round completed", () => {
     expect(resolveSyncNoticeOutcome(result({ skippedLarge: 1 }))).toBeNull();
   });
@@ -59,12 +75,56 @@ describe("resolveSyncNoticeOutcome", () => {
     });
   });
 
+  it("distinguishes remote deletion confirmation from conflicts in the result notice", () => {
+    const remoteDelete = {
+      path: "deleted-remotely.md",
+      status: "conflict" as const,
+      actionType: SyncActionType.ConfirmLocalDelete,
+    };
+    const conflict = {
+      path: "edited-both-sides.md",
+      status: "conflict" as const,
+      actionType: SyncActionType.Conflict,
+    };
+
+    expect(resolveSyncNoticeOutcome(
+      result({ conflicts: 1 }),
+      {},
+      [remoteDelete],
+    )).toEqual({
+      kind: "remoteDeletes",
+      count: 1,
+    });
+    expect(resolveSyncNoticeOutcome(
+      result({ conflicts: 2 }),
+      {},
+      [remoteDelete, conflict],
+    )).toEqual({
+      kind: "mixedPending",
+      count: 1,
+      remoteDeletes: 1,
+    });
+  });
+
   it("uses failure when errors and conflicts occur in the same run", () => {
     expect(resolveSyncNoticeOutcome(result({
       success: false,
       errors: 1,
       conflicts: 2,
     }))).toEqual({ kind: "failed", count: 0 });
+  });
+
+  it("surfaces community plugin enablement review before generic failure", () => {
+    expect(resolveSyncNoticeOutcome(result({
+      success: false,
+      attention: {
+        reason: "community-plugin-enablement-decision-required",
+        count: 2,
+      },
+    }))).toEqual({
+      kind: "communityPluginEnablement",
+      count: 2,
+    });
   });
 
   it("keeps review, cancellation and auth expiry distinct from generic failure", () => {
@@ -210,6 +270,12 @@ describe("resolveSyncProgressNoticePresentation", () => {
       [progress({ phase: "checking" }), "☁️ 检查远端变更…"],
       [progress({ phase: "planning" }), "☁️ 生成同步计划…"],
       [progress({ phase: "executing", current: 3, total: 12 }), "☁️ 正在同步 3/12"],
+      [progress({
+        phase: "executing",
+        current: 3,
+        total: 12,
+        currentActionType: SyncActionType.MoveRemoteFolder,
+      }), "☁️ 正在移动或重命名远端文件夹 3/12"],
       [progress({ phase: "executing", cancelRequested: true }), "⛔ 正在取消同步…"],
     ] as const;
 

@@ -11,6 +11,10 @@
  */
 
 import { SyncActionType } from "./types";
+import {
+  resolveSyncActionPresentation,
+  type SyncActionProgressStatus,
+} from "./sync-action-presentation";
 
 /** High-level phase the sync is currently in */
 export type SyncPhase =
@@ -27,7 +31,9 @@ export type SyncPhase =
 /** Per-file completion status (for the completed-files list in the view) */
 export interface FileProgress {
   path: string;
-  status: "upload" | "download" | "delete" | "conflict" | "skip" | "error";
+  /** Previous path for an identity-preserving rename or move. */
+  sourcePath?: string;
+  status: SyncActionProgressStatus;
   actionType?: SyncActionType;
   reason?: string;
   fileSize?: number;
@@ -35,7 +41,7 @@ export interface FileProgress {
 
 export interface SyncProgressState {
   /** Which user-visible workflow owns the current progress/result snapshot. */
-  activityKind?: "fullSync" | "sideAction";
+  activityKind?: "fullSync" | "sideAction" | "mutationRecovery";
   phase: SyncPhase;
   /** Current item index (1-based during execution, 0 for phase-only steps) */
   current: number;
@@ -225,7 +231,9 @@ export class SyncProgressStore {
   }
 
   /** Mark the sync as started */
-  markStarted(activityKind: "fullSync" | "sideAction" = "fullSync"): void {
+  markStarted(
+    activityKind: "fullSync" | "sideAction" | "mutationRecovery" = "fullSync",
+  ): void {
     this._state.activityKind = activityKind;
     this._state.startedAt = Date.now();
     this._state.cancelRequested = false;
@@ -247,30 +255,13 @@ export class SyncProgressStore {
 
   /** Map a SyncActionType to a FileProgress status string */
   static actionToStatus(type: SyncActionType): FileProgress["status"] {
-    switch (type) {
-      case SyncActionType.Upload:
-        return "upload";
-      case SyncActionType.Download:
-        return "download";
-      case SyncActionType.DeleteRemote:
-      case SyncActionType.DeleteLocal:
-        return "delete";
-      case SyncActionType.RenameRemote:
-        return "upload";
-      case SyncActionType.Conflict:
-      case SyncActionType.ConfirmLocalDelete:
-        return "conflict";
-      case SyncActionType.SkipLargeFile:
-      case SyncActionType.SkipIgnoredPath:
-        return "skip";
-      default:
-        return "error";
-    }
+    return resolveSyncActionPresentation(type).progressStatus;
   }
 }
 
 function isSuccessfulFileProgress(file: FileProgress): boolean {
   return file.status === "upload"
     || file.status === "download"
+    || file.status === "folder"
     || file.status === "delete";
 }

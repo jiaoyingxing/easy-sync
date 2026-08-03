@@ -100,6 +100,23 @@ export class OneDriveError extends Error {
   }
 }
 
+export type RemoteVaultScopeIdentityFailureReason =
+  | "scope-incomplete"
+  | "vault-folder-invalid"
+  | "files-root-invalid"
+  | "drive-invalid";
+
+/** Stable client-side classification for committed Graph scope metadata that
+ * was reachable but no longer represents the committed vault/files tree. */
+export class RemoteVaultScopeIdentityError extends Error {
+  constructor(
+    readonly reason: RemoteVaultScopeIdentityFailureReason,
+  ) {
+    super(`Committed remote scope identity is invalid: ${reason}`);
+    this.name = "RemoteVaultScopeIdentityError";
+  }
+}
+
 /**
  * Encode a path for use in a Graph API URL.
  * Each path segment is encoded separately to preserve `/` separators.

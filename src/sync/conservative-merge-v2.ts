@@ -1,7 +1,25 @@
 import { sha256Hex } from "../crypto";
 import { threeWayMerge } from "./merge-engine";
+import {
+  isSyncScope,
+  sameSyncScope,
+  type BaseFileEntry,
+  type LocalFileEntry,
+  type RemoteFileEntry,
+  type SyncScope,
+  type TextMergeManualEvidenceReasonV1,
+  type TextMergeManualEvidenceV1,
+} from "./types";
 
 const MAX_MERGE_INPUT_BYTES = 2 * 1024 * 1024;
+const TEXT_MERGE_EVIDENCE_ALGORITHM =
+  "conservative-line-merge-v1" as const;
+const CACHEABLE_MANUAL_REASONS = new Set<TextMergeManualEvidenceReasonV1>([
+  "invalid-utf8",
+  "mixed-line-endings",
+  "too-large",
+  "overlap",
+]);
 
 export interface MergeVersionV2 {
   bytes: ArrayBuffer;
@@ -35,6 +53,67 @@ export type ConservativeMergeResultV2 =
       reason: "stale-version" | "recovery-pending" | "invalid-hash" | "invalid-utf8" | "mixed-line-endings" | "too-large" | "overlap";
       mutations: [];
     };
+
+export interface TextMergeEvidenceIdentityV1 {
+  scope: SyncScope;
+  ancestor: BaseFileEntry;
+  local: LocalFileEntry;
+  remote: RemoteFileEntry;
+}
+
+export function createTextMergeManualEvidenceV1(
+  identity: TextMergeEvidenceIdentityV1,
+  reason: Extract<
+    ConservativeMergeResultV2,
+    { status: "manual" }
+  >["reason"],
+  remoteHash: string,
+): TextMergeManualEvidenceV1 | null {
+  if (!isCacheableTextMergeManualReason(reason)) return null;
+  return {
+    version: 1,
+    algorithm: TEXT_MERGE_EVIDENCE_ALGORITHM,
+    result: "manual",
+    reason,
+    scope: { ...identity.scope },
+    ancestorHash: identity.ancestor.hash,
+    ancestorSize: identity.ancestor.size,
+    ancestorETag: identity.ancestor.eTag,
+    localHash: identity.local.hash,
+    localSize: identity.local.size,
+    remoteDriveId: identity.remote.driveId,
+    remoteETag: identity.remote.eTag,
+    remoteSize: identity.remote.size,
+    remoteHash,
+  };
+}
+
+export function matchingTextMergeManualEvidenceV1(
+  value: unknown,
+  identity: TextMergeEvidenceIdentityV1,
+): TextMergeManualEvidenceV1 | null {
+  const evidence = parseTextMergeManualEvidenceV1(value);
+  if (!evidence
+    || !sameSyncScope(evidence.scope, identity.scope)
+    || evidence.ancestorHash !== identity.ancestor.hash
+    || evidence.ancestorSize !== identity.ancestor.size
+    || evidence.ancestorETag !== identity.ancestor.eTag
+    || evidence.localHash !== identity.local.hash
+    || evidence.localSize !== identity.local.size
+    || evidence.remoteDriveId !== identity.remote.driveId
+    || evidence.remoteETag !== identity.remote.eTag
+    || evidence.remoteSize !== identity.remote.size
+    || (
+      identity.remote.sha256Hash !== undefined
+      && evidence.remoteHash !== identity.remote.sha256Hash.toLowerCase()
+    )) {
+    return null;
+  }
+  return {
+    ...evidence,
+    scope: { ...evidence.scope },
+  };
+}
 
 /**
  * Pure preflight for a conservative merge candidate. It never writes either
@@ -127,4 +206,46 @@ function manual(
   reason: Extract<ConservativeMergeResultV2, { status: "manual" }>["reason"],
 ): Extract<ConservativeMergeResultV2, { status: "manual" }> {
   return { status: "manual", reason, mutations: [] };
+}
+
+function isCacheableTextMergeManualReason(
+  value: unknown,
+): value is TextMergeManualEvidenceReasonV1 {
+  return typeof value === "string"
+    && CACHEABLE_MANUAL_REASONS.has(value as TextMergeManualEvidenceReasonV1);
+}
+
+function parseTextMergeManualEvidenceV1(
+  value: unknown,
+): TextMergeManualEvidenceV1 | null {
+  if (!value || typeof value !== "object") return null;
+  const evidence = value as Partial<TextMergeManualEvidenceV1>;
+  if (evidence.version !== 1
+    || evidence.algorithm !== TEXT_MERGE_EVIDENCE_ALGORITHM
+    || evidence.result !== "manual"
+    || !isCacheableTextMergeManualReason(evidence.reason)
+    || !isSyncScope(evidence.scope)
+    || !isSha256(evidence.ancestorHash)
+    || !isNonNegativeInteger(evidence.ancestorSize)
+    || typeof evidence.ancestorETag !== "string"
+    || evidence.ancestorETag.length === 0
+    || !isSha256(evidence.localHash)
+    || !isNonNegativeInteger(evidence.localSize)
+    || typeof evidence.remoteDriveId !== "string"
+    || evidence.remoteDriveId.length === 0
+    || typeof evidence.remoteETag !== "string"
+    || evidence.remoteETag.length === 0
+    || !isNonNegativeInteger(evidence.remoteSize)
+    || !isSha256(evidence.remoteHash)) {
+    return null;
+  }
+  return evidence as TextMergeManualEvidenceV1;
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function isNonNegativeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
 }

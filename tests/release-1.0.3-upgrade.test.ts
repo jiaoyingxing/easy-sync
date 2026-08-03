@@ -167,6 +167,7 @@ describe("release 1.0.3 in-place upgrade", () => {
     await expect(state.load()).resolves.toBeUndefined();
 
     expect(plugin.syncInterval).toBe(7);
+    expect(plugin.autoSyncChangeDelaySeconds).toBe(7);
     expect(plugin.syncPluginFiles).toBe(true);
     expect(plugin.autoSyncPaused).toBe(true);
     expect(plugin.automaticHandlingPolicy).toEqual({
@@ -187,7 +188,8 @@ describe("release 1.0.3 in-place upgrade", () => {
     expect(state.remoteSnapshot).toEqual([
       expect.objectContaining({ path: "notes/a.md", driveId: "remote-a" }),
     ]);
-    expect(state.getBaseContent("notes/a.md")).toBe("release baseline");
+    await expect(state.getBaseContent("notes/a.md"))
+      .resolves.toBe("release baseline");
     expect(state.legacyAutoSyncAllowed).toBe(true);
 
     await expect(state.setLastSyncTime(1_800_000_000_000)).resolves.toBeUndefined();
@@ -199,6 +201,7 @@ describe("release 1.0.3 in-place upgrade", () => {
         autoDeleteLocalFiles: false,
         mergeNonOverlappingText: false,
       },
+      "auto-sync-change-delay-seconds": 7,
       "easy-sync-cloud-baseline-dirty": true,
       "easy-sync-last-sync-time": 1_800_000_000_000,
       "release-1.0.3-unknown-key": { mustSurvive: true },

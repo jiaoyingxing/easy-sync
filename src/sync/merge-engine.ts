@@ -65,9 +65,9 @@ function extractHunks(diff: readonly DiffLine[]): Hunk[] {
   return hunks;
 }
 
-/** Advance basePos past a processed hunk. Insert-only hunks (baseEnd < baseStart)
+/** Advance past a processed hunk. Insert-only hunks (baseEnd < baseStart)
  *  consume no base lines — stay at baseStart. Replacement hunks skip past baseEnd. */
-function advancePast(basePos: number, hunk: Hunk): number {
+function advancePast(hunk: Hunk): number {
   return hunk.baseEnd >= hunk.baseStart ? hunk.baseEnd + 1 : hunk.baseStart;
 }
 
@@ -149,14 +149,14 @@ export function threeWayMerge(
       for (const line of lHunk.lines) {
         output.push(line);
       }
-      basePos = advancePast(basePos, lHunk);
+      basePos = advancePast(lHunk);
       localIdx++;
     } else if (rHunk && !localTouchesBase && remoteTouchesBase) {
       // Only remote changed — apply remote hunk
       for (const line of rHunk.lines) {
         output.push(line);
       }
-      basePos = advancePast(basePos, rHunk);
+      basePos = advancePast(rHunk);
       remoteIdx++;
     } else if (lHunk && rHunk) {
       // Both changed — conflict
@@ -173,8 +173,8 @@ export function threeWayMerge(
 
       // Advance past both hunks, using the larger range
       basePos = Math.max(
-        advancePast(basePos, lHunk),
-        advancePast(basePos, rHunk),
+        advancePast(lHunk),
+        advancePast(rHunk),
       );
       localIdx++;
       remoteIdx++;

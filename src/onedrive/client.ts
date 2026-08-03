@@ -26,6 +26,7 @@ import {
   type UploadResult,
   OneDriveError,
   OneDriveErrorType,
+  RemoteVaultScopeIdentityError,
   GRAPH_BASE_URL,
   APP_FOLDER_PATHS,
 } from "./types";
@@ -348,6 +349,102 @@ export class OneDriveClient {
     }
   }
 
+  /** Create one child folder under an already committed parent identity.
+   *  Unlike the bootstrap path helper, a name collision remains an error so
+   *  the mutation ledger can reconcile the exact outcome before retrying. */
+  async createFolderByParentId(
+    parentDriveItemId: string,
+    name: string,
+  ): Promise<DriveItem> {
+    const response = await this.request(
+      "POST",
+      `/me/drive/items/${encodeURIComponent(parentDriveItemId)}/children`,
+      {
+        name,
+        folder: {},
+        "@microsoft.graph.conflictBehavior": "fail",
+      },
+    );
+    const item = response.json as DriveItem;
+    if (
+      !item.id
+      || !item.folder
+      || item.name !== name
+      || item.parentReference?.id !== parentDriveItemId
+    ) {
+      throw new Error(`Created folder metadata is incomplete or mismatched: ${name}`);
+    }
+    return item;
+  }
+
+  /** Read any file/folder item by vault-relative path without conflating a
+   *  folder with a missing file. */
+  async getDriveItemMetadata(
+    vaultName: string,
+    itemPath: string,
+  ): Promise<DriveItem | null> {
+    try {
+      const apiPath = APP_FOLDER_PATHS.filePath(
+        this.getStorageVaultName(vaultName),
+        itemPath,
+      );
+      const response = await this.request(
+        "GET",
+        apiPath,
+        undefined,
+        undefined,
+        { metadataReason: "other", expectedNotFound: true },
+      );
+      return response.json as DriveItem;
+    } catch (error) {
+      if (error instanceof OneDriveError && error.type === OneDriveErrorType.NotFound) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /** Read a committed parent identity immediately before a create-only write. */
+  async getDriveItemMetadataById(driveItemId: string): Promise<DriveItem | null> {
+    try {
+      const response = await this.request(
+        "GET",
+        `/me/drive/items/${encodeURIComponent(driveItemId)}`,
+        undefined,
+        undefined,
+        { metadataReason: "other", expectedNotFound: true },
+      );
+      return response.json as DriveItem;
+    } catch (error) {
+      if (error instanceof OneDriveError && error.type === OneDriveErrorType.NotFound) {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  /** List every direct child of one committed folder identity.
+   *  Folder deletion callers use this immediately before DELETE and therefore
+   *  must consume every Graph page rather than trusting childCount metadata. */
+  async listFolderChildrenById(driveItemId: string): Promise<DriveItem[]> {
+    const children: DriveItem[] = [];
+    let url = `/me/drive/items/${encodeURIComponent(driveItemId)}/children`;
+    while (url) {
+      const response = await this.request("GET", url);
+      const data = response.json as {
+        value?: DriveItem[];
+        "@odata.nextLink"?: string;
+      };
+      const page = data.value ?? [];
+      if (page.some((item) => item.parentReference?.id !== driveItemId)) {
+        throw new Error(`Folder child listing returned a different parent identity: ${driveItemId}`);
+      }
+      children.push(...page);
+      url = data["@odata.nextLink"] ?? "";
+    }
+    return children;
+  }
+
   /** Initialize the App Folder directory structure and return Graph-owned identities.
    *  Read-only preview callers can require existing folders so this method
    *  uses GET only and never sends an idempotent create request. */
@@ -441,6 +538,62 @@ export class OneDriveClient {
     this.vaultScopes.set(vaultName, { ...scope });
     this.initializedVaults.add(vaultName);
     return true;
+  }
+
+  /**
+   * Restore a committed scope from Graph-owned identities when a delta cursor
+   * is missing or unusable. This is the authoritative fallback for legacy
+   * encoded vault directories: names choose presentation paths, IDs choose the
+   * actual storage tree.
+   */
+  async restoreVaultScopeByIdentity(
+    vaultName: string,
+    scope: RemoteVaultScope,
+  ): Promise<RemoteVaultScope> {
+    if (!scope.driveId || !scope.vaultFolderId || !scope.filesRootId) {
+      throw new RemoteVaultScopeIdentityError("scope-incomplete");
+    }
+    const [vaultResponse, filesResponse] = await Promise.all([
+      this.request(
+        "GET",
+        `/me/drive/items/${encodeURIComponent(scope.vaultFolderId)}`,
+      ),
+      this.request(
+        "GET",
+        `/me/drive/items/${encodeURIComponent(scope.filesRootId)}`,
+      ),
+    ]);
+    const vaultFolder = vaultResponse.json as DriveItem;
+    const filesFolder = filesResponse.json as DriveItem;
+    const allowedVaultNames = new Set([vaultName, encodeURIComponent(vaultName)]);
+    if (
+      vaultFolder.id !== scope.vaultFolderId
+      || !vaultFolder.folder
+      || !vaultFolder.name
+      || !allowedVaultNames.has(vaultFolder.name)
+    ) {
+      throw new RemoteVaultScopeIdentityError("vault-folder-invalid");
+    }
+    if (
+      filesFolder.id !== scope.filesRootId
+      || !filesFolder.folder
+      || filesFolder.name !== "files"
+      || filesFolder.parentReference?.id !== scope.vaultFolderId
+    ) {
+      throw new RemoteVaultScopeIdentityError("files-root-invalid");
+    }
+    const observedDriveIds = [
+      vaultFolder.parentReference?.driveId,
+      filesFolder.parentReference?.driveId,
+    ].filter((value): value is string => Boolean(value));
+    if (observedDriveIds.some((value) => value !== scope.driveId)) {
+      throw new RemoteVaultScopeIdentityError("drive-invalid");
+    }
+
+    this.storageVaultNames.set(vaultName, vaultFolder.name);
+    this.vaultScopes.set(vaultName, { ...scope });
+    this.initializedVaults.add(vaultName);
+    return { ...scope };
   }
 
   invalidateVaultScope(vaultName: string): void {
@@ -611,7 +764,6 @@ export class OneDriveClient {
       apiPath,
       content,
       "application/octet-stream",
-      undefined,
       { extraHeaders: headers },
     );
     onProgress?.(content.byteLength, content.byteLength);
@@ -637,7 +789,6 @@ export class OneDriveClient {
       {
         item: { "@microsoft.graph.conflictBehavior": driveItemId ? "replace" : "fail" },
       },
-      undefined,
       undefined,
       { extraHeaders },
     );
@@ -1054,7 +1205,7 @@ export class OneDriveClient {
             `downloadFile "${filePath}" — CDN retry ${attempt + 1}/${maxAttempts}, remainingMs=${remaining}`,
             requestErrorMessage(err),
           );
-          await sleep(RETRY_BASE_MS);
+          await sleepWithAbort(RETRY_BASE_MS, this.abortSignal);
         }
       }
       throw new OneDriveError(OneDriveErrorType.NetworkError, `Download failed for: ${filePath}`);
@@ -1122,7 +1273,6 @@ export class OneDriveClient {
         const metaResp = await this.request(
           "GET",
           `/me/drive/items/${driveItemId}?select=id,name,size,file,@microsoft.graph.downloadUrl`,
-          undefined,
           undefined,
           undefined,
           metaRequestOptions,
@@ -1316,7 +1466,7 @@ export class OneDriveClient {
             `downloadFileToPath "${filePath}" — CDN retry ${attempt + 1}/${maxAttempts}, remainingMs=${remaining}`,
             requestErrorMessage(err),
           );
-          await sleep(RETRY_BASE_MS);
+          await sleepWithAbort(RETRY_BASE_MS, this.abortSignal);
         }
       }
       throw new OneDriveError(OneDriveErrorType.NetworkError, `Download failed for: ${filePath}`);
@@ -1376,7 +1526,6 @@ export class OneDriveClient {
         const metaResp = await this.request(
           "GET",
           `/me/drive/items/${driveItemId}?select=id,name,size,file,@microsoft.graph.downloadUrl`,
-          undefined,
           undefined,
           undefined,
           metaRequestOptions,
@@ -1481,7 +1630,7 @@ export class OneDriveClient {
     const apiPath = driveItemId
       ? `/me/drive/items/${encodeURIComponent(driveItemId)}`
       : APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), itemPath);
-    await this.request("DELETE", apiPath, undefined, undefined, undefined, undefined, eTag);
+    await this.request("DELETE", apiPath, undefined, undefined, undefined, eTag);
   }
 
   /** Rename a file on OneDrive without re-uploading content.
@@ -1499,7 +1648,7 @@ export class OneDriveClient {
   ): Promise<DriveItem> {
     const apiPath = `/me/drive/items/${encodeURIComponent(driveItemId)}`;
     const newName = newPath.split("/").pop() || newPath;
-    const response = await this.request("PATCH", apiPath, { name: newName }, undefined, undefined, undefined, eTag);
+    const response = await this.request("PATCH", apiPath, { name: newName }, undefined, undefined, eTag);
     return response.json as DriveItem;
   }
 
@@ -1516,7 +1665,6 @@ export class OneDriveClient {
       { name: newName, parentReference: { id: newParentId } },
       undefined,
       undefined,
-      undefined,
       eTag,
     );
     return response.json as DriveItem;
@@ -1528,13 +1676,22 @@ export class OneDriveClient {
     vaultName: string,
     filePath: string,
     metadataReason: OneDriveMetadataReason = "other",
-  ): Promise<{ eTag: string; size: number; sha256Hash?: string; downloadUrl?: string; driveId: string; parentId?: string; mtime: number } | null> {
+  ): Promise<{
+    eTag: string;
+    cTag: string;
+    size: number;
+    sha256Hash?: string;
+    quickXorHash?: string;
+    downloadUrl?: string;
+    driveId: string;
+    parentId?: string;
+    mtime: number;
+  } | null> {
     try {
       const apiPath = APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), filePath);
       const response = await this.request(
         "GET",
         apiPath,
-        undefined,
         undefined,
         undefined,
         { metadataReason, expectedNotFound: true },
@@ -1543,8 +1700,10 @@ export class OneDriveClient {
       if (!item.file) return null;
       return {
         eTag: item.eTag ?? "",
+        cTag: item.cTag ?? "",
         size: item.size ?? 0,
         sha256Hash: item.file?.hashes?.sha256Hash?.toLowerCase(),
+        quickXorHash: item.file?.hashes?.quickXorHash,
         downloadUrl: item["@microsoft.graph.downloadUrl"],
         driveId: item.id,
         parentId: item.parentReference?.id,
@@ -1629,7 +1788,6 @@ export class OneDriveClient {
         `/me/drive/items/${baseline.id}/content`,
         undefined,
         undefined,
-        "json",
       );
       this.diag?.log("onedrive", "cloud baseline downloaded via direct item /content fallback");
       return responseToText(response);
@@ -1654,7 +1812,7 @@ export class OneDriveClient {
     const children = (childrenResp.json as { value?: DriveItem[] }).value ?? [];
     const item = children.find((entry) => entry.name === "bootstrap-v2.json" && entry.file);
     if (!item) return null;
-    return this.readCloudBootstrapItemV2(item);
+    return this.readPluginControlItemV2(item, "CloudBootstrapV2");
   }
 
   async readCloudBootstrapV2ById(
@@ -1664,7 +1822,10 @@ export class OneDriveClient {
       "GET",
       `/me/drive/items/${encodeURIComponent(id)}?select=id,name,eTag,file,@microsoft.graph.downloadUrl`,
     );
-    return this.readCloudBootstrapItemV2(metaResp.json as DriveItem);
+    return this.readPluginControlItemV2(
+      metaResp.json as DriveItem,
+      "CloudBootstrapV2",
+    );
   }
 
   async createCloudBootstrapV2(
@@ -1673,7 +1834,7 @@ export class OneDriveClient {
   ): Promise<{ id: string; eTag: string }> {
     const apiPath = `${APP_FOLDER_PATHS.pluginDir(this.getStorageVaultName(vaultName))}/bootstrap-v2.json:/content?@microsoft.graph.conflictBehavior=fail`;
     const response = await this.request("PUT", apiPath, content, "application/json");
-    return requireCloudBootstrapVersion(response.json);
+    return requirePluginControlFileVersion(response.json, "CloudBootstrapV2");
   }
 
   async updateCloudBootstrapV2(
@@ -1686,17 +1847,65 @@ export class OneDriveClient {
       `/me/drive/items/${encodeURIComponent(id)}/content`,
       content,
       "application/json",
-      undefined,
       {},
       eTag,
     );
-    return requireCloudBootstrapVersion(response.json);
+    return requirePluginControlFileVersion(response.json, "CloudBootstrapV2");
   }
 
-  private async readCloudBootstrapItemV2(
-    initial: DriveItem,
+  // ---- Shared Sync Protocol V2 ----
+
+  async readSharedSyncProtocolV2(
+    vaultName: string,
+  ): Promise<{ id: string; eTag: string; content: string } | null> {
+    const storageVaultName = this.getStorageVaultName(vaultName);
+    const childrenResp = await this.request(
+      "GET",
+      `${APP_FOLDER_PATHS.pluginDir(storageVaultName)}:/children`,
+    );
+    const children = (childrenResp.json as { value?: DriveItem[] }).value ?? [];
+    const item = children.find(
+      (entry) => entry.name === "protocol-v2.json" && entry.file,
+    );
+    if (!item) return null;
+    return this.readPluginControlItemV2(item, "SharedSyncProtocolV2");
+  }
+
+  async readSharedSyncProtocolV2ById(
+    id: string,
   ): Promise<{ id: string; eTag: string; content: string }> {
-    if (!initial.id) throw new Error("CloudBootstrapV2 item has no driveItem id");
+    const metaResp = await this.request(
+      "GET",
+      `/me/drive/items/${encodeURIComponent(id)}?select=id,name,eTag,file,@microsoft.graph.downloadUrl`,
+    );
+    return this.readPluginControlItemV2(
+      metaResp.json as DriveItem,
+      "SharedSyncProtocolV2",
+    );
+  }
+
+  async createSharedSyncProtocolV2(
+    vaultName: string,
+    content: string,
+  ): Promise<{ id: string; eTag: string }> {
+    const apiPath = `${APP_FOLDER_PATHS.pluginDir(this.getStorageVaultName(vaultName))}/protocol-v2.json:/content?@microsoft.graph.conflictBehavior=fail`;
+    const response = await this.request(
+      "PUT",
+      apiPath,
+      content,
+      "application/json",
+    );
+    return requirePluginControlFileVersion(
+      response.json,
+      "SharedSyncProtocolV2",
+    );
+  }
+
+  private async readPluginControlItemV2(
+    initial: DriveItem,
+    label: "CloudBootstrapV2" | "SharedSyncProtocolV2",
+  ): Promise<{ id: string; eTag: string; content: string }> {
+    if (!initial.id) throw new Error(`${label} item has no driveItem id`);
     let item = initial;
     if (!item.eTag || !item["@microsoft.graph.downloadUrl"]) {
       const metaResp = await this.request(
@@ -1705,7 +1914,7 @@ export class OneDriveClient {
       );
       item = metaResp.json as DriveItem;
     }
-    if (!item.eTag) throw new Error("CloudBootstrapV2 item has no eTag");
+    if (!item.eTag) throw new Error(`${label} item has no eTag`);
     if (item["@microsoft.graph.downloadUrl"]) {
       try {
         const response = await withTimeout(requestUrl({
@@ -1723,7 +1932,6 @@ export class OneDriveClient {
       `/me/drive/items/${encodeURIComponent(item.id)}/content`,
       undefined,
       undefined,
-      "json",
     );
     return { id: item.id, eTag: item.eTag, content: responseToText(response) };
   }
@@ -1771,13 +1979,30 @@ export class OneDriveClient {
     vaultName: string,
     deltaToken?: string,
   ): Promise<DeltaResponse> {
-    let url: string;
-    if (deltaToken) {
-      url = deltaToken;
-    } else {
-      url = APP_FOLDER_PATHS.filesDelta(this.getStorageVaultName(vaultName));
-    }
+    return this.collectDelta(
+      deltaToken
+        ?? APP_FOLDER_PATHS.filesDelta(this.getStorageVaultName(vaultName)),
+    );
+  }
 
+  /**
+   * Query a delta feed from one Graph-owned folder identity. Scope recovery
+   * uses this instead of a path endpoint so a concurrent replacement at the
+   * configured path cannot redirect the evidence scan to a different root.
+   */
+  async getDeltaByFolderId(
+    folderId: string,
+    deltaToken?: string,
+  ): Promise<DeltaResponse> {
+    if (!folderId) throw new Error("Missing folder identity for delta");
+    return this.collectDelta(
+      deltaToken
+        ?? `/me/drive/items/${encodeURIComponent(folderId)}/delta`,
+    );
+  }
+
+  private async collectDelta(initialUrl: string): Promise<DeltaResponse> {
+    let url = initialUrl;
     const allValues: DriveItem[] = [];
     let deltaLink: string | undefined;
     let nextLink: string | undefined;
@@ -1859,7 +2084,6 @@ export class OneDriveClient {
       apiPath,
       undefined,
       undefined,
-      "arraybuffer",
       { ...options, observationAttemptOffset: 1 },
     );
   }
@@ -1920,7 +2144,6 @@ export class OneDriveClient {
       apiPath,
       undefined,
       undefined,
-      "arraybuffer",
       { ...options, observationAttemptOffset: 1 },
     );
     return writeArrayBufferToBinaryFile(
@@ -1938,7 +2161,6 @@ export class OneDriveClient {
     apiPath: string,
     body?: unknown,
     contentType?: string,
-    responseType?: "json" | "arraybuffer",
     options: RequestOptions = {},
     ifMatch?: string,
   ): Promise<RequestUrlResponse> {
@@ -2068,7 +2290,7 @@ export class OneDriveClient {
         if (options.deadlineMs && Date.now() + waitMs >= options.deadlineMs) {
           throw error;
         }
-        await sleep(waitMs);
+        await sleepWithAbort(waitMs, this.abortSignal);
       }
     }
 
@@ -2574,10 +2796,17 @@ function requestErrorMessage(rawError: unknown): string {
   return message.replace(/https?:\/\/\S+/g, "[redacted-url]");
 }
 
-function requireCloudBootstrapVersion(value: unknown): { id: string; eTag: string } {
-  if (!value || typeof value !== "object") throw new Error("CloudBootstrapV2 write returned no metadata");
+function requirePluginControlFileVersion(
+  value: unknown,
+  label: "CloudBootstrapV2" | "SharedSyncProtocolV2",
+): { id: string; eTag: string } {
+  if (!value || typeof value !== "object") {
+    throw new Error(`${label} write returned no metadata`);
+  }
   const item = value as Partial<DriveItem>;
-  if (!item.id || !item.eTag) throw new Error("CloudBootstrapV2 write returned no id/eTag");
+  if (!item.id || !item.eTag) {
+    throw new Error(`${label} write returned no id/eTag`);
+  }
   return { id: item.id, eTag: item.eTag };
 }
 

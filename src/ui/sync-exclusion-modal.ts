@@ -14,31 +14,79 @@ import {
   normalizeExcludedFolders,
 } from "../sync/local-scanner";
 
-class SyncExclusionFolderPicker extends FuzzySuggestModal<TFolder> {
+export interface SyncExclusionFolderCandidate {
+  path: string;
+}
+
+export function buildSyncExclusionFolderCandidates(
+  localFolderPaths: readonly string[],
+  remoteFolderPaths: readonly string[],
+  excludedFolders: readonly string[],
+  configDir: string,
+): SyncExclusionFolderCandidate[] {
+  const unique = new Map<string, SyncExclusionFolderCandidate>();
+  for (const candidate of [...localFolderPaths, ...remoteFolderPaths]) {
+    const [normalized] = normalizeExcludedFolders([candidate], configDir);
+    if (
+      !normalized
+      || isPathExcludedByFolders(normalized, excludedFolders)
+    ) continue;
+    const key = normalized.toLocaleLowerCase();
+    if (!unique.has(key)) unique.set(key, { path: normalized });
+  }
+  return [...unique.values()].sort(
+    (left, right) => left.path.localeCompare(right.path),
+  );
+}
+
+export class SyncExclusionEditSession {
+  private savedChange = false;
+  private closePromise: Promise<void> | null = null;
+
+  constructor(private readonly hadPendingReview: boolean) {}
+
+  markSavedChange(): void {
+    this.savedChange = true;
+  }
+
+  close(recalculate: () => Promise<void>): Promise<void> {
+    this.closePromise ??=
+      this.savedChange && this.hadPendingReview
+        ? recalculate()
+        : Promise.resolve();
+    return this.closePromise;
+  }
+}
+
+class SyncExclusionFolderPicker
+  extends FuzzySuggestModal<SyncExclusionFolderCandidate> {
   constructor(
     private plugin: EasySyncPlugin,
-    private onChoose: (folder: TFolder) => void,
+    private remoteFolderPaths: readonly string[],
+    private onChoose: (folder: SyncExclusionFolderCandidate) => void,
   ) {
     super(plugin.app);
     this.setPlaceholder(plugin.i18n.t("settings.syncExclusion.pickerPlaceholder"));
   }
 
-  getItems(): TFolder[] {
+  getItems(): SyncExclusionFolderCandidate[] {
     const configDir = getConfigDir(this.plugin.app.vault);
-    return this.plugin.app.vault.getAllLoadedFiles()
+    const localFolderPaths = this.plugin.app.vault.getAllLoadedFiles()
       .filter((file): file is TFolder => file instanceof TFolder)
-      .filter((folder) =>
-        normalizeExcludedFolders([folder.path], configDir).length === 1
-        && !isPathExcludedByFolders(folder.path, this.plugin.excludedFolders),
-      )
-      .sort((left, right) => left.path.localeCompare(right.path));
+      .map((folder) => folder.path);
+    return buildSyncExclusionFolderCandidates(
+      localFolderPaths,
+      this.remoteFolderPaths,
+      this.plugin.excludedFolders,
+      configDir,
+    );
   }
 
-  getItemText(folder: TFolder): string {
+  getItemText(folder: SyncExclusionFolderCandidate): string {
     return folder.path;
   }
 
-  onChooseItem(folder: TFolder): void {
+  onChooseItem(folder: SyncExclusionFolderCandidate): void {
     this.onChoose(folder);
   }
 }
@@ -109,17 +157,67 @@ export async function updateExcludedFoldersFromUi(
 
 export class SyncExclusionModal extends Modal {
   private saving = false;
+  private initialized = false;
+  private closed = false;
+  private remoteFolderPaths: string[] = [];
+  private editSession: SyncExclusionEditSession | null = null;
+  private initialization: Promise<void> = Promise.resolve();
+  private activeSave: Promise<boolean> = Promise.resolve(false);
 
   constructor(private plugin: EasySyncPlugin) {
     super(plugin.app);
   }
 
   onOpen(): void {
+    this.closed = false;
+    this.initialized = false;
     this.render();
+    this.initialization = this.initialize();
   }
 
   onClose(): void {
+    this.closed = true;
     this.contentEl.empty();
+    void this.finalizeClose();
+  }
+
+  private async initialize(): Promise<void> {
+    try {
+      const snapshot = await this.plugin.createSyncExclusionFolderSnapshot();
+      this.remoteFolderPaths = snapshot.remoteFolderPaths;
+      this.editSession = new SyncExclusionEditSession(
+        snapshot.hadPendingReview,
+      );
+    } catch (error) {
+      this.remoteFolderPaths = [];
+      this.editSession = new SyncExclusionEditSession(
+        this.plugin.state?.planReviewActive ?? false,
+      );
+      this.plugin.diag.warn(
+        "state",
+        "failed to prepare cloud folder exclusion candidates",
+        error,
+      );
+    } finally {
+      this.initialized = true;
+      if (!this.closed) this.render();
+    }
+  }
+
+  private async finalizeClose(): Promise<void> {
+    try {
+      await this.initialization;
+      await this.activeSave;
+      await this.editSession?.close(
+        () => this.plugin.rebuildPlanReview(),
+      );
+    } catch (error) {
+      this.plugin.diag.warn(
+        "state",
+        "failed to recalculate the sync plan after exclusions changed",
+        error,
+      );
+    }
   }
 
   private render(): void {
@@ -137,10 +235,11 @@ export class SyncExclusionModal extends Modal {
       .addButton((button) => {
         button
           .setButtonText(t("settings.syncExclusion.add"))
-          .setDisabled(this.saving)
+          .setDisabled(this.saving || !this.initialized)
           .onClick(() => {
             new SyncExclusionFolderPicker(
               this.plugin,
+              this.remoteFolderPaths,
               (folder) => {
                 void this.addFolder(folder.path);
               },
@@ -172,13 +271,32 @@ export class SyncExclusionModal extends Modal {
   }
 
   private async updateFolders(paths: string[]): Promise<boolean> {
-    if (this.saving) return false;
+    if (this.saving || !this.initialized || this.closed || !this.editSession) {
+      return false;
+    }
     this.saving = true;
+    const save = (async () => {
+      const before = [...this.plugin.excludedFolders];
+      const saved = await updateExcludedFoldersFromUi(this.plugin, paths);
+      if (
+        saved
+        && (
+          before.length !== this.plugin.excludedFolders.length
+          || before.some(
+            (path, index) => path !== this.plugin.excludedFolders[index],
+          )
+        )
+      ) {
+        this.editSession?.markSavedChange();
+      }
+      return saved;
+    })();
+    this.activeSave = save;
     try {
-      return await updateExcludedFoldersFromUi(this.plugin, paths);
+      return await save;
     } finally {
       this.saving = false;
-      this.render();
+      if (!this.closed) this.render();
     }
   }
 }

@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 import { StateManager, type PluginDataStore } from "../src/sync/state-manager";
 import { SyncActionType } from "../src/sync/types";
+import { createCommunityPluginManifestObservation } from "../src/sync/community-plugin-bundle";
+import { buildRemoteCommunityPluginCatalog } from "../src/sync/community-plugin-remote-catalog";
+import type { DriveItem } from "../src/onedrive/types";
 import type {
   BaseFileEntry,
+  FolderMutationIntentV2,
   MutationIntentV1,
   MutationReceiptV1,
   RemoteFileEntry,
@@ -41,16 +45,212 @@ function makeState() {
     app: {
       vault: {
         adapter: {
+          exists: vi.fn().mockResolvedValue(false),
           read: vi.fn().mockRejectedValue(new Error("missing")),
           write: writeRemoteState,
+          remove: vi.fn().mockResolvedValue(undefined),
+          list: vi.fn().mockResolvedValue({ files: [], folders: [] }),
+          rmdir: vi.fn().mockResolvedValue(undefined),
+          stat: vi.fn().mockResolvedValue(null),
+          readBinary: vi.fn().mockRejectedValue(new Error("missing")),
+          writeBinary: vi.fn().mockResolvedValue(undefined),
         },
       },
     },
   };
-  return { state: new StateManager(plugin), saveData, writeRemoteState };
+  return {
+    state: new StateManager(plugin),
+    plugin,
+    saveData,
+    writeRemoteState,
+  };
 }
 
 describe("StateManager batch persistence", () => {
+  it("keeps public 1.1.3 base and remote evidence read-only before V2 activation", async () => {
+    const entry: BaseFileEntry = {
+      path: "note.md",
+      hash: "aa".repeat(32),
+      size: 10,
+      eTag: "etag-note",
+    };
+    const remote: RemoteFileEntry = {
+      path: "note.md",
+      driveId: "item-note",
+      parentId: TEST_SCOPE.filesRootId,
+      size: 10,
+      mtime: 1,
+      eTag: "etag-note",
+      cTag: "ctag-note",
+    };
+    const operations: Array<(state: StateManager) => Promise<unknown>> = [
+      (state) => state.upsertBaseEntries([entry]),
+      (state) => state.reconcileIdenticalConflict(entry),
+      (state) => state.removeBaseEntry(entry.path),
+      (state) => state.removeBaseEntries([entry.path]),
+      (state) => state.setBaseSnapshot([entry]),
+      (state) => state.setRemoteState([remote], "delta-1", TEST_SCOPE),
+      (state) => state.clearRemoteState(),
+      (state) => state.applyRemoteMutations([remote], []),
+    ];
+
+    for (const operation of operations) {
+      const { state, saveData, writeRemoteState } = makeState();
+      await expect(operation(state)).rejects.toThrow("active V2 state");
+      expect(saveData).not.toHaveBeenCalled();
+      expect(writeRemoteState).not.toHaveBeenCalled();
+      expect(state.baseSnapshot).toEqual([]);
+      expect(state.remoteSnapshot).toEqual([]);
+    }
+
+    const { state } = makeState();
+    state.cacheBaseContent(
+      entry.path,
+      new TextEncoder().encode("migration preview must stay read-only").buffer,
+    );
+    await expect(state.getBaseContent(entry.path)).resolves.toBeUndefined();
+  });
+
+  it("owns the disposable remote plugin catalog and drops corrupt cache on load", async () => {
+    const { state, plugin, saveData } = makeState();
+    const items: DriveItem[] = [
+      {
+        id: "config",
+        name: ".obsidian",
+        folder: {},
+        parentReference: { id: TEST_SCOPE.filesRootId },
+      },
+      {
+        id: "plugins",
+        name: "plugins",
+        folder: {},
+        parentReference: { id: "config" },
+      },
+      {
+        id: "calendar-root",
+        name: "calendar",
+        folder: {},
+        parentReference: { id: "plugins" },
+      },
+      {
+        id: "calendar-main",
+        name: "main.js",
+        size: 4,
+        file: { hashes: {} },
+        parentReference: { id: "calendar-root" },
+        eTag: "etag-main",
+        cTag: "ctag-main",
+      },
+      {
+        id: "calendar-manifest",
+        name: "manifest.json",
+        size: 8,
+        file: { hashes: {} },
+        parentReference: { id: "calendar-root" },
+        eTag: "etag-manifest",
+        cTag: "ctag-manifest",
+      },
+    ];
+    const catalog = await buildRemoteCommunityPluginCatalog({
+      scope: TEST_SCOPE,
+      configDir: ".obsidian",
+      items,
+      manifestObservations: [],
+      observedAt: 10,
+      previous: null,
+    });
+
+    await state.load();
+    await state.setRemoteCommunityPluginCatalog(catalog);
+    await state.setRemoteCommunityPluginCatalog(catalog);
+
+    expect(state.getRemoteCommunityPluginCatalog()).toEqual(catalog);
+    expect(saveData).toHaveBeenCalledTimes(1);
+    expect(saveData).toHaveBeenCalledWith(expect.objectContaining({
+      "remote-community-plugin-catalog": catalog,
+    }));
+
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "remote-community-plugin-catalog": catalog,
+    });
+    const validReopen = new StateManager(plugin);
+    await validReopen.load();
+    expect(validReopen.getRemoteCommunityPluginCatalog()).toEqual(catalog);
+
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "remote-community-plugin-catalog": {
+        ...catalog,
+        sourceDigest: "0".repeat(64),
+      },
+    });
+    const reopened = new StateManager(plugin);
+    await reopened.load();
+    expect(reopened.getRemoteCommunityPluginCatalog()).toBeNull();
+  });
+
+  it("owns disposable manifest observations and discards corrupt cached evidence on load", async () => {
+    const { state, plugin, saveData } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "community-plugin-manifest-observations": [{
+        version: 1,
+        scope: TEST_SCOPE,
+        pluginId: "calendar",
+        source: {
+          path: ".obsidian/plugins/calendar/manifest.json",
+          remoteId: "manifest-id",
+          eTag: "etag-1",
+          cTag: "ctag-1",
+          size: 40,
+          sha256Hash: null,
+          quickXorHash: null,
+          contentHash: "0".repeat(64),
+        },
+        manifestText: JSON.stringify({
+          id: "calendar",
+          version: "1.0.0",
+          isDesktopOnly: true,
+        }),
+      }],
+    });
+
+    await state.load();
+
+    expect(state.getCommunityPluginManifestObservations()).toEqual([]);
+    expect(saveData).not.toHaveBeenCalled();
+
+    const manifestText = JSON.stringify({
+      id: "calendar",
+      version: "1.0.0",
+      isDesktopOnly: true,
+    });
+    const content = new TextEncoder().encode(manifestText).buffer;
+    const observation = await createCommunityPluginManifestObservation(
+      TEST_SCOPE,
+      "calendar",
+      {
+        path: ".obsidian/plugins/calendar/manifest.json",
+        driveId: "manifest-id",
+        parentId: "plugin-folder-id",
+        size: content.byteLength,
+        mtime: 1,
+        eTag: "etag-1",
+        cTag: "ctag-1",
+      },
+      content,
+    );
+
+    await state.setCommunityPluginManifestObservations([observation]);
+    await state.setCommunityPluginManifestObservations([observation]);
+
+    expect(state.getCommunityPluginManifestObservations()).toEqual([
+      observation,
+    ]);
+    expect(saveData).toHaveBeenCalledTimes(1);
+    expect(saveData).toHaveBeenCalledWith(expect.objectContaining({
+      "community-plugin-manifest-observations": [observation],
+    }));
+  });
+
   it("commits sync-path settings with scoped pending state and invalidates the reviewed plan", async () => {
     const { state, saveData } = makeState();
     await state.upsertPendingConflicts([
@@ -103,6 +303,68 @@ describe("StateManager batch persistence", () => {
     }));
   });
 
+  it("retires out-of-scope operational state without deleting sync history", async () => {
+    const { state, saveData } = makeState();
+    const pluginPath = ".obsidian/plugins/yolo/main.js";
+    const notePath = "Notes/keep.md";
+    await state.upsertPendingConflicts([
+      conflict(pluginPath),
+      conflict(notePath),
+    ]);
+    await state.upsertPendingDeletes([
+      pendingDelete(pluginPath),
+      pendingDelete(notePath),
+    ]);
+    await state.reconcilePendingIssues([{
+      path: pluginPath,
+      actionType: SyncActionType.Download,
+      reason: "local write failed",
+      updatedAt: 1,
+    }, {
+      path: notePath,
+      actionType: SyncActionType.Upload,
+      reason: "network",
+      updatedAt: 1,
+    }], []);
+    await state.setPlanReviewBundle(
+      [conflict(pluginPath), conflict(notePath)],
+      { uploads: 0, downloads: 0, deletes: 0, conflicts: 2, skipped: 0 },
+      TEST_SCOPE,
+    );
+    await state.addSyncHistory({
+      id: "historical-yolo-failure",
+      mode: "manual",
+      status: "partial",
+      startedAt: 1,
+      endedAt: 2,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      skipped: 0,
+      errors: 1,
+      message: "partial",
+      files: [{ path: pluginPath, status: "error" }],
+    });
+    const priorRevision = state.planReviewRevision;
+    saveData.mockClear();
+
+    await state.retirePendingStateForPaths(
+      (path) => path.startsWith(".obsidian/plugins/yolo/"),
+    );
+
+    expect(state.pendingConflicts.map((item) => item.path)).toEqual([notePath]);
+    expect(state.pendingRemoteDeletes.map((item) => item.path)).toEqual([notePath]);
+    expect(state.pendingIssues.map((item) => item.path)).toEqual([notePath]);
+    expect(state.planReviewActive).toBe(false);
+    expect(state.planReviewItems).toEqual([]);
+    expect(state.planReviewRevision).toBe(priorRevision + 1);
+    expect(state.syncHistory[0]?.files).toEqual([
+      { path: pluginPath, status: "error" },
+    ]);
+    expect(saveData).toHaveBeenCalledTimes(1);
+  });
+
   it("does not publish scoped pending state when the combined settings write fails", async () => {
     const { state, saveData } = makeState();
     await state.upsertPendingConflicts([
@@ -132,7 +394,52 @@ describe("StateManager batch persistence", () => {
     expect(state.planReviewRevision).toBe(priorRevision);
   });
 
-  it("atomically commits an identical conflict as base and removes the pending item", async () => {
+  it("retires consumed folder move evidence with the local sync-path decision", async () => {
+    const { state, plugin, saveData } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-local-folder-move-hints": [{
+        version: 1,
+        scope: TEST_SCOPE,
+        remoteId: "plugin-folder-id",
+        fromPath: ".obsidian/plugins/calendar",
+        toPath: ".trash/.obsidian/plugins/calendar",
+        observedAt: 1,
+      }],
+    });
+    await state.load();
+    saveData.mockClear();
+
+    await state.commitSyncPathSettingsChange(
+      () => true,
+      (data) => {
+        data["community-plugin-sync-policy"] = {
+          version: 1,
+          files: { mode: "all", pluginIds: [], ignoredPluginIds: ["calendar"] },
+          data: { mode: "none", pluginIds: [] },
+        };
+      },
+      undefined,
+      {
+        previousSettingsFingerprint: "before",
+        targetSettingsFingerprint: "after",
+        expandedFolderPaths: [],
+        retireLocalFolderMoveHintRemoteIds: ["plugin-folder-id"],
+      },
+    );
+
+    expect(state.localFolderMoveHints).toEqual([]);
+    expect(saveData).toHaveBeenCalledTimes(1);
+    expect(saveData).toHaveBeenCalledWith(expect.objectContaining({
+      "easy-sync-local-folder-move-hints": [],
+      "community-plugin-sync-policy": expect.objectContaining({
+        files: expect.objectContaining({
+          ignoredPluginIds: ["calendar"],
+        }),
+      }),
+    }));
+  });
+
+  it("does not reconcile an identical conflict into public 1.1.3 state", async () => {
     const { state, saveData } = makeState();
     const path = "same.md";
     await state.upsertPendingConflicts([conflict(path)]);
@@ -149,17 +456,18 @@ describe("StateManager batch persistence", () => {
       size: 12,
       eTag: "etag-same",
     };
-    await state.reconcileIdenticalConflict(entry);
+    await expect(state.reconcileIdenticalConflict(entry))
+      .rejects.toThrow("active V2 state");
 
-    expect(state.baseSnapshot).toEqual([entry]);
-    expect(state.pendingConflicts).toEqual([]);
-    expect(state.planReviewActive).toBe(false);
-    expect(state.planReviewItems).toEqual([]);
-    expect(saveData).toHaveBeenCalledTimes(1);
+    expect(state.baseSnapshot).toEqual([]);
+    expect(state.pendingConflicts).toEqual([conflict(path)]);
+    expect(state.planReviewActive).toBe(true);
+    expect(state.planReviewItems).toEqual([conflict(path)]);
+    expect(saveData).not.toHaveBeenCalled();
   });
 
-  it("keeps a mutation receipt until base, remote, and pending checkpoints commit", async () => {
-    const { state } = makeState();
+  it("keeps a public mutation receipt until V2 can commit its checkpoint", async () => {
+    const { state, plugin } = makeState();
     const intent: MutationIntentV1 = {
       version: 1,
       operationId: "op-1",
@@ -194,21 +502,22 @@ describe("StateManager batch persistence", () => {
         pendingDeleteRemovals: ["note.md"],
       },
     };
-    await state.setRemoteState([], "https://graph.example/delta", TEST_SCOPE);
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-mutation-ledger": [{ intent, receipt }],
+    });
+    await state.load();
     await state.upsertPendingConflicts([conflict("note.md")]);
     await state.upsertPendingDeletes([pendingDelete("note.md")]);
 
-    await state.beginMutationIntent(intent);
-    await state.recordMutationReceipt(receipt);
-
     expect(state.mutationLedger).toEqual([{ intent, receipt }]);
     expect(state.baseSnapshot).toEqual([]);
-    await state.commitMutationCheckpoint(intent.operationId);
-    expect(state.mutationLedger).toEqual([]);
-    expect(state.baseSnapshot).toEqual(receipt.checkpoint.baseUpserts);
-    expect(state.remoteSnapshot).toEqual([remote]);
-    expect(state.pendingConflicts).toEqual([]);
-    expect(state.pendingRemoteDeletes).toEqual([]);
+    await expect(state.commitMutationCheckpoint(intent.operationId))
+      .rejects.toThrow("active V2 authority");
+    expect(state.mutationLedger).toEqual([{ intent, receipt }]);
+    expect(state.baseSnapshot).toEqual([]);
+    expect(state.remoteSnapshot).toEqual([]);
+    expect(state.pendingConflicts).toEqual([conflict("note.md")]);
+    expect(state.pendingRemoteDeletes).toEqual([pendingDelete("note.md")]);
   });
 
   it("loads only merge intents with an exact target version", async () => {
@@ -263,9 +572,84 @@ describe("StateManager batch persistence", () => {
     expect(corrupt.mutationLedger).toEqual([]);
   });
 
+  it("loads V2 folder move/delete checkpoints and their consumed local hints", async () => {
+    const intent: FolderMutationIntentV2 = {
+      version: 2,
+      operationId: "folder-move-1",
+      planRevision: 4,
+      scope: TEST_SCOPE,
+      action: "moveRemoteFolder",
+      path: "Archive",
+      sourcePath: "Notes",
+      folderId: "folder-notes",
+      expectedLocal: { exists: true },
+      expectedRemote: {
+        exists: true,
+        driveId: "folder-notes",
+        parentId: TEST_SCOPE.filesRootId,
+        eTag: "etag-notes",
+      },
+      expectedParent: {
+        driveId: TEST_SCOPE.filesRootId,
+        path: "",
+      },
+      createdAt: 1,
+    };
+    const receipt: MutationReceiptV1 = {
+      version: 1,
+      operationId: intent.operationId,
+      completedAt: 2,
+      checkpoint: {
+        baseUpserts: [],
+        baseRemovals: [],
+        remoteUpserts: [],
+        remoteDeletes: [],
+        pendingConflictRemovals: [],
+        pendingDeleteRemovals: [],
+        folderUpserts: [{
+          path: "Archive",
+          driveId: "folder-notes",
+          parentId: TEST_SCOPE.filesRootId,
+          name: "Archive",
+          eTag: "etag-archive",
+        }],
+        folderMoveHintRemovals: ["folder-notes"],
+      },
+    };
+    const plugin: PluginDataStore = {
+      loadData: vi.fn().mockResolvedValue({
+        "easy-sync-mutation-ledger": [{ intent, receipt }],
+        "easy-sync-local-folder-move-hints": [{
+          version: 1,
+          scope: TEST_SCOPE,
+          remoteId: "folder-notes",
+          fromPath: "Notes",
+          toPath: "Archive",
+          observedAt: 1,
+        }],
+      }),
+      updatePluginData: vi.fn().mockResolvedValue(undefined),
+      manifest: { id: "easy-sync", dir: ".obsidian/plugins/easy-sync" },
+      app: {
+        vault: {
+          adapter: {
+            read: vi.fn().mockRejectedValue(new Error("missing")),
+            write: vi.fn().mockResolvedValue(undefined),
+          },
+        },
+      },
+    };
+    const state = new StateManager(plugin);
+
+    await state.load();
+
+    expect(state.hasMutationLedgerCorruption).toBe(false);
+    expect(state.mutationLedger).toEqual([{ intent, receipt }]);
+    expect(state.localFolderMoveHints).toHaveLength(1);
+  });
+
   it("rejects a fresh remote cache mutation without a parent identity", async () => {
     const { state } = makeState();
-    await state.setRemoteState([], "https://graph.example/delta", TEST_SCOPE);
     const incomplete: RemoteFileEntry = {
       path: "note.md",
       driveId: "item-note",
@@ -281,8 +665,8 @@ describe("StateManager batch persistence", () => {
     expect(state.remoteSnapshot).toEqual([]);
   });
 
-  it("keeps a mutation receipt when its remote upsert lacks a parent identity", async () => {
-    const { state } = makeState();
+  it("keeps a malformed public receipt blocked before V2 activation", async () => {
+    const { state, plugin } = makeState();
     const intent: MutationIntentV1 = {
       version: 1,
       operationId: "op-incomplete-parent",
@@ -314,19 +698,20 @@ describe("StateManager batch persistence", () => {
         pendingDeleteRemovals: [],
       },
     };
-    await state.setRemoteState([], "https://graph.example/delta", TEST_SCOPE);
-    await state.beginMutationIntent(intent);
-    await state.recordMutationReceipt(receipt);
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-mutation-ledger": [{ intent, receipt }],
+    });
+    await state.load();
 
     await expect(state.commitMutationCheckpoint(intent.operationId))
-      .rejects.toThrow("parent identity");
+      .rejects.toThrow("active V2 authority");
 
     expect(state.mutationLedger).toEqual([{ intent, receipt }]);
     expect(state.remoteSnapshot).toEqual([]);
   });
 
-  it("preserves a receipt when its shared-state checkpoint save fails", async () => {
-    const { state, saveData } = makeState();
+  it("does not consume a public receipt before V2 activation", async () => {
+    const { state, saveData, plugin } = makeState();
     const intent: MutationIntentV1 = {
       version: 1,
       operationId: "op-failed-checkpoint",
@@ -357,17 +742,21 @@ describe("StateManager batch persistence", () => {
         pendingDeleteRemovals: [],
       },
     };
-    await state.beginMutationIntent(intent);
-    await state.recordMutationReceipt(receipt);
-    saveData.mockRejectedValueOnce(new Error("disk full"));
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-mutation-ledger": [{ intent, receipt }],
+    });
+    await state.load();
+    saveData.mockClear();
 
-    await expect(state.commitMutationCheckpoint(intent.operationId)).rejects.toThrow("disk full");
+    await expect(state.commitMutationCheckpoint(intent.operationId))
+      .rejects.toThrow("active V2 authority");
 
     expect(state.mutationLedger).toEqual([{ intent, receipt }]);
     expect(state.baseSnapshot).toEqual([]);
+    expect(saveData).not.toHaveBeenCalled();
   });
 
-  it("does not publish a failed base snapshot write into memory or a later save", async () => {
+  it("does not publish a base snapshot before V2 activation", async () => {
     const { state, saveData } = makeState();
     const entry: BaseFileEntry = {
       path: "failed.md",
@@ -375,11 +764,11 @@ describe("StateManager batch persistence", () => {
       size: 10,
       eTag: "etag-failed",
     };
-    saveData.mockRejectedValueOnce(new Error("disk full"));
-
-    await expect(state.upsertBaseEntries([entry])).rejects.toThrow("disk full");
+    await expect(state.upsertBaseEntries([entry]))
+      .rejects.toThrow("active V2 state");
 
     expect(state.baseSnapshot).toEqual([]);
+    expect(saveData).not.toHaveBeenCalled();
     await state.setLastSyncTime(123);
     expect(state.lastSyncTime).toBe(123);
     expect(saveData.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({
@@ -401,13 +790,14 @@ describe("StateManager batch persistence", () => {
     expect(state.lastSyncTime).toBe(0);
   });
 
-  it("Preflight Merge — caches a text ancestor received as ArrayBuffer", () => {
+  it("does not append preview content to the public ancestor cache", async () => {
     const { state } = makeState();
     const content = new TextEncoder().encode("base line 1\nbase line 2").buffer;
 
     state.cacheBaseContent("note.md", content);
 
-    expect(state.getBaseContent("note.md")).toBe("base line 1\nbase line 2");
+    await expect(state.getBaseContent("note.md"))
+      .resolves.toBeUndefined();
   });
 
   it("upserts a large conflict batch with one save", async () => {
@@ -550,7 +940,53 @@ describe("StateManager batch persistence", () => {
     expect(state.planReviewScope).toBeNull();
   });
 
-  it("persists the remote snapshot and delta link atomically", async () => {
+  it("binds a V2 review revision to the sealed canonical identity", async () => {
+    const { state, saveData } = makeState();
+    const counts = {
+      uploads: 0,
+      downloads: 0,
+      deletes: 0,
+      conflicts: 0,
+      skipped: 0,
+    };
+    const canonicalIdentity = {
+      version: 2 as const,
+      scope: TEST_SCOPE,
+      sourceCommitSeq: 12,
+      digest: "sealed-plan-12",
+    };
+
+    await state.setPlanReviewBundle(
+      [],
+      counts,
+      TEST_SCOPE,
+      canonicalIdentity,
+    );
+    const authorization = state.planReviewAuthorization;
+
+    expect(state.planReviewDigest).toBe("sealed-plan-12");
+    expect(state.planReviewCanonicalIdentity).toEqual(canonicalIdentity);
+    expect(authorization).toEqual({
+      revision: 1,
+      scope: TEST_SCOPE,
+      canonicalIdentity,
+    });
+    expect(saveData.mock.calls[0][0]).toEqual(expect.objectContaining({
+      "easy-sync-plan-review-canonical-identity-v2": canonicalIdentity,
+    }));
+
+    await expect(state.clearPlanReview({
+      ...authorization!,
+      canonicalIdentity: {
+        ...canonicalIdentity,
+        digest: "different-plan",
+      },
+    })).resolves.toBe(false);
+    expect(state.planReviewActive).toBe(true);
+    await expect(state.clearPlanReview(authorization!)).resolves.toBe(true);
+  });
+
+  it("does not replace the public remote snapshot before V2 activation", async () => {
     const { state, saveData, writeRemoteState } = makeState();
     const remote: RemoteFileEntry = {
       path: "note.md",
@@ -574,30 +1010,21 @@ describe("StateManager batch persistence", () => {
       parentId: "files-root-id",
       name: "Empty",
     };
-    await state.setRemoteState(
+    await expect(state.setRemoteState(
       [remote],
       "https://graph.example/delta-1",
       scope,
       [folder],
-    );
+    )).rejects.toThrow("active V2 state");
 
-    expect(state.hasRemoteState).toBe(true);
-    expect(state.remoteSnapshot).toEqual([remote]);
-    expect(state.remoteDeltaLink).toBe("https://graph.example/delta-1");
-    expect(state.remoteScope).toEqual(scope);
-    expect(state.remoteFolders).toEqual([folder]);
+    expect(state.hasRemoteState).toBe(false);
+    expect(state.remoteSnapshot).toEqual([]);
+    expect(state.remoteDeltaLink).toBeNull();
+    expect(state.remoteScope).toBeNull();
+    expect(state.remoteFolders).toEqual([]);
+    expect(state.hasCompleteRemoteFolderIndex).toBe(false);
     expect(saveData).not.toHaveBeenCalled();
-    expect(writeRemoteState).toHaveBeenCalledTimes(1);
-    expect(writeRemoteState.mock.calls[0][0]).toBe(
-      ".obsidian/plugins/easy-sync/remote-state.json",
-    );
-    expect(JSON.parse(writeRemoteState.mock.calls[0][1])).toMatchObject({
-      version: 1,
-      scope,
-      deltaLink: "https://graph.example/delta-1",
-      entries: { "note.md": remote },
-      folders: { "empty-folder-id": folder },
-    });
+    expect(writeRemoteState).not.toHaveBeenCalled();
   });
 
   it("loads a legacy remote cache without a files root identity", async () => {
@@ -635,6 +1062,7 @@ describe("StateManager batch persistence", () => {
     expect(state.remoteScope).toBeNull();
     expect(state.remoteSnapshot).toEqual([remote]);
     expect(state.remoteFolders).toEqual([]);
+    expect(state.hasCompleteRemoteFolderIndex).toBe(false);
   });
 
   it("ignores a corrupt persisted remote cache", async () => {
@@ -822,8 +1250,8 @@ describe("StateManager batch persistence", () => {
   });
 });
 
-describe("StateManager generation monotonic contract", () => {
-  it("reset preserves incremented generation instead of resetting to zero", async () => {
+describe("StateManager reset generation contract", () => {
+  it("reset clears the generation with the rest of the local sync records", async () => {
     const { state, saveData } = makeState();
     await state.load();
 
@@ -837,17 +1265,137 @@ describe("StateManager generation monotonic contract", () => {
     }
     expect(state.remoteGeneration).toBe(7);
 
-    // Reset: generation must increase, not reset to 0
+    // Reset returns the device to an unclassified local state.
     await state.reset();
-    expect(state.remoteGeneration).toBe(8);
+    expect(state.remoteGeneration).toBe(0);
 
-    // Another reset: keeps incrementing
+    // Repeating the idempotent cleanup stays fresh.
     await state.reset();
-    expect(state.remoteGeneration).toBe(9);
+    expect(state.remoteGeneration).toBe(0);
   });
 
   it("starts at zero on fresh install", () => {
     const { state } = makeState();
     expect(state.remoteGeneration).toBe(0);
+  });
+});
+
+describe("StateManager community plugin enablement state", () => {
+  it("binds anchors and decisions to the exact remote scope", async () => {
+    const { state, saveData } = makeState();
+    await state.setCommunityPluginEnablementState({
+      version: 1,
+      scope: TEST_SCOPE,
+      anchors: { calendar: false },
+      pending: [{
+        pluginId: "quickadd",
+        localEnabled: true,
+        remoteEnabled: false,
+      }],
+    });
+
+    expect(state.getCommunityPluginEnablementState(TEST_SCOPE)).toEqual({
+      version: 1,
+      scope: TEST_SCOPE,
+      anchors: { calendar: false },
+      pending: [{
+        pluginId: "quickadd",
+        localEnabled: true,
+        remoteEnabled: false,
+      }],
+    });
+    expect(state.getCommunityPluginEnablementState({
+      ...TEST_SCOPE,
+      vaultFolderId: "other-vault",
+    })).toEqual({
+      version: 1,
+      scope: { ...TEST_SCOPE, vaultFolderId: "other-vault" },
+      anchors: {},
+      pending: [],
+    });
+    expect(saveData).toHaveBeenLastCalledWith(expect.objectContaining({
+      "community-plugin-enablement-state": expect.objectContaining({
+        version: 1,
+        anchors: { calendar: false },
+      }),
+    }));
+  });
+
+  it("records a decision without advancing its shared anchor", async () => {
+    const { state } = makeState();
+    await state.setCommunityPluginEnablementState({
+      version: 1,
+      scope: TEST_SCOPE,
+      anchors: {},
+      pending: [{
+        pluginId: "calendar",
+        localEnabled: true,
+        remoteEnabled: false,
+      }],
+    });
+
+    await expect(state.resolveCommunityPluginEnablementDecision(
+      TEST_SCOPE,
+      "calendar",
+      true,
+    )).resolves.toBe(true);
+    expect(state.getCommunityPluginEnablementState(TEST_SCOPE)).toEqual({
+      version: 1,
+      scope: TEST_SCOPE,
+      anchors: {},
+      pending: [{
+        pluginId: "calendar",
+        localEnabled: true,
+        remoteEnabled: false,
+        resolvedEnabled: true,
+      }],
+    });
+  });
+
+  it("retires pending decisions for plugin ids that leave selected file scope", async () => {
+    const { state, saveData } = makeState();
+    await state.setCommunityPluginEnablementState({
+      version: 1,
+      scope: TEST_SCOPE,
+      anchors: { calendar: false, quickadd: true },
+      pending: [
+        {
+          pluginId: "calendar",
+          localEnabled: true,
+          remoteEnabled: false,
+        },
+        {
+          pluginId: "quickadd",
+          localEnabled: false,
+          remoteEnabled: true,
+        },
+      ],
+    });
+    saveData.mockClear();
+
+    await state.commitSyncPathSettingsChange(
+      () => true,
+      () => undefined,
+      ["calendar"],
+    );
+
+    expect(state.getCommunityPluginEnablementState(TEST_SCOPE)).toEqual({
+      version: 1,
+      scope: TEST_SCOPE,
+      anchors: { calendar: false, quickadd: true },
+      pending: [{
+        pluginId: "calendar",
+        localEnabled: true,
+        remoteEnabled: false,
+      }],
+    });
+    expect(saveData).toHaveBeenCalledTimes(1);
+
+    await state.commitSyncPathSettingsChange(
+      () => true,
+      () => undefined,
+      [],
+    );
+    expect(state.getCommunityPluginEnablementState(TEST_SCOPE).pending).toEqual([]);
   });
 });
