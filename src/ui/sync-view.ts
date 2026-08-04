@@ -56,7 +56,6 @@ interface StatusPanelState {
   canCancel: boolean;
   lastSyncTime: number;
   pendingCount: number;
-  communityPluginEnablementPending: number;
   planReviewActive: boolean;
   autoSyncPaused: boolean;
   mutationRecovery: MutationRecoveryDisplayState | null;
@@ -651,7 +650,6 @@ export class EasySyncSyncView extends ItemView {
       canCancel,
       lastSyncTime: syncState?.lastSyncTime ?? 0,
       pendingCount,
-      communityPluginEnablementPending,
       planReviewActive,
       autoSyncPaused: this.plugin.autoSyncPaused,
       mutationRecovery,
@@ -1092,7 +1090,6 @@ export class EasySyncSyncView extends ItemView {
     isRunning: boolean;
     lastSyncTime: number;
     pendingCount: number;
-    communityPluginEnablementPending: number;
     planReviewActive: boolean;
     autoSyncPaused: boolean;
     mutationRecovery: MutationRecoveryDisplayState | null;
@@ -1123,17 +1120,6 @@ export class EasySyncSyncView extends ItemView {
       case "syncing":
         return { status, label: this.getRunningStatusLabel(state.progress) };
       case "attention":
-        if (
-          state.communityPluginEnablementPending > 0
-          && state.pendingCount === state.communityPluginEnablementPending
-        ) {
-          return {
-            status,
-            label: t("syncView.communityPlugins.pendingTitle", {
-              count: state.communityPluginEnablementPending,
-            }),
-          };
-        }
         if (state.pendingCount > 0) {
           return { status, label: t("syncView.issues.title", { count: state.pendingCount }) };
         }

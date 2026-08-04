@@ -45,6 +45,10 @@ export interface SyncAnchorV2 {
   contentHash: string;
   size: number;
   remoteETag?: string;
+  /** Graph content version. Unlike eTag, metadata-only rename/move does not
+   *  change this value, so it can prove that a stable remote identity kept
+   *  the same file content across a path change. */
+  remoteCTag?: string;
   ancestorHash?: string;
   /** Ordered evidence of the same logical anchor binding to a new Graph ID. */
   remoteIdentityLineage?: RemoteIdentityLineageV2[];
@@ -1052,6 +1056,7 @@ function isAnchor(value: unknown, anchorId: string): value is SyncAnchorV2 {
     && isSha256(value.contentHash)
     && typeof value.size === "number" && Number.isSafeInteger(value.size) && value.size >= 0
     && optionalString(value.remoteETag)
+    && optionalString(value.remoteCTag)
     && (value.ancestorHash === undefined || isSha256(value.ancestorHash))
     && (
       value.remoteIdentityLineage === undefined

@@ -329,6 +329,7 @@ function applyBaseUpsert(
     contentHash: base.hash,
     size: base.size,
     remoteETag: base.eTag,
+    ...(remote.cTag ? { remoteCTag: remote.cTag } : {}),
     ancestorHash: preserveAncestor,
     ...(remoteIdentityLineage
       ? { remoteIdentityLineage }

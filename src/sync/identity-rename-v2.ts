@@ -35,10 +35,22 @@ export type IdentityRenameActionV2 =
       expectedLocalSize: number;
     }
   | {
+      /** Legacy anchors without content-version evidence must prove the exact
+       *  remote bytes before the public MoveLocalFile action can exist. */
+      type: "verify-move-local";
+      anchorId: string;
+      remoteId: string;
+      fromPath: string;
+      toPath: string;
+      expectedLocalHash: string;
+      expectedLocalSize: number;
+    }
+  | {
       type: "conflict";
       anchorId: string;
       path: string;
       relatedPath?: string;
+      relatedPaths?: string[];
       reason:
         | "remote-identity-missing"
         | "remote-content-changed"
@@ -131,6 +143,9 @@ export function planIdentityRenamesFromStateV2(
             anchor.lastPath,
             "replacement-with-local-relocation",
             matchingLocals.length === 1 ? matchingLocals[0]!.path : undefined,
+            matchingLocals.length > 1
+              ? matchingLocals.map((entry) => entry.path)
+              : undefined,
           ));
         } else {
           actions.push({
@@ -150,6 +165,9 @@ export function planIdentityRenamesFromStateV2(
           anchor.lastPath,
           "remote-identity-missing",
           matchingLocals.length === 1 ? matchingLocals[0]!.path : undefined,
+          matchingLocals.length > 1
+            ? matchingLocals.map((entry) => entry.path)
+            : undefined,
         ));
       }
       continue;
@@ -171,15 +189,50 @@ export function planIdentityRenamesFromStateV2(
 
     // Remote identity moved while local stayed at the anchored path.
     if (remotePath !== anchor.lastPath && oldLocal) {
+      const remoteHashKnown = remote.contentHash !== undefined;
+      const contentTagComparable =
+        !remoteHashKnown
+        && anchor.remoteCTag !== undefined
+        && remote.cTag !== undefined;
       if (!localMatchesAnchor(oldLocal, anchor)
-        || remote.contentHash !== anchor.contentHash
-        || remote.size !== anchor.size) {
-        actions.push(conflict(anchor, anchor.lastPath, "both-paths-diverged"));
+        || remote.size !== anchor.size
+        || (
+          remoteHashKnown
+          && remote.contentHash !== anchor.contentHash
+        )
+        || (
+          contentTagComparable
+          && remote.cTag !== anchor.remoteCTag
+        )) {
+        actions.push(conflict(
+          anchor,
+          anchor.lastPath,
+          "both-paths-diverged",
+          remotePath,
+        ));
       } else if (localByPath.has(normalizePath(remotePath))) {
-        actions.push(conflict(anchor, remotePath, "destination-occupied"));
-      } else {
+        actions.push(conflict(
+          anchor,
+          remotePath,
+          "destination-occupied",
+          anchor.lastPath,
+        ));
+      } else if (
+        remoteHashKnown
+        || contentTagComparable
+      ) {
         actions.push({
           type: "move-local",
+          anchorId: anchor.anchorId,
+          remoteId: remote.id,
+          fromPath: anchor.lastPath,
+          toPath: remotePath,
+          expectedLocalHash: oldLocal.hash,
+          expectedLocalSize: oldLocal.size,
+        });
+      } else {
+        actions.push({
+          type: "verify-move-local",
           anchorId: anchor.anchorId,
           remoteId: remote.id,
           fromPath: anchor.lastPath,
@@ -199,8 +252,17 @@ export function planIdentityRenamesFromStateV2(
     // Local disappeared from the anchor path: only a unique content-identical
     // candidate may authorize a remote identity move.
     if (!oldLocal) {
-      if (matchingLocals.length !== 1) {
-        actions.push(conflict(anchor, anchor.lastPath, "local-identity-ambiguous"));
+      if (matchingLocals.length === 0) {
+        continue;
+      }
+      if (matchingLocals.length > 1) {
+        actions.push(conflict(
+          anchor,
+          anchor.lastPath,
+          "local-identity-ambiguous",
+          undefined,
+          matchingLocals.map((entry) => entry.path),
+        ));
         continue;
       }
       const destination = matchingLocals[0]!;
@@ -209,12 +271,22 @@ export function planIdentityRenamesFromStateV2(
         continue;
       }
       if (!remoteMatchesAnchor(remote, anchor)) {
-        actions.push(conflict(anchor, anchor.lastPath, "remote-content-changed"));
+        actions.push(conflict(
+          anchor,
+          anchor.lastPath,
+          "remote-content-changed",
+          destination.path,
+        ));
         continue;
       }
       const occupiedId = remoteIdByPath.get(normalizePath(destination.path));
       if (occupiedId && occupiedId !== remote.id) {
-        actions.push(conflict(anchor, destination.path, "destination-occupied"));
+        actions.push(conflict(
+          anchor,
+          destination.path,
+          "destination-occupied",
+          anchor.lastPath,
+        ));
         continue;
       }
       const slash = destination.path.lastIndexOf("/");
@@ -223,7 +295,12 @@ export function planIdentityRenamesFromStateV2(
         ? state.remoteIndex.filesRootId
         : folderIdByPath.get(normalizePath(parentPath));
       if (!parentId) {
-        actions.push(conflict(anchor, destination.path, "destination-parent-missing"));
+        actions.push(conflict(
+          anchor,
+          destination.path,
+          "destination-parent-missing",
+          anchor.lastPath,
+        ));
         continue;
       }
       actions.push({
@@ -245,11 +322,18 @@ function remoteMatchesAnchor(
   remote: Readonly<RemoteNodeV2>,
   anchor: SyncAnchorV2,
 ): boolean {
-  if (!remote.eTag || !anchor.remoteETag) return false;
+  if (remote.size !== anchor.size) return false;
   if (remote.contentHash) {
-    return remote.contentHash === anchor.contentHash && remote.size === anchor.size;
+    return remote.contentHash === anchor.contentHash;
   }
-  return remote.eTag === anchor.remoteETag && remote.size === anchor.size;
+  if (remote.cTag && anchor.remoteCTag) {
+    return remote.cTag === anchor.remoteCTag;
+  }
+  return Boolean(
+    remote.eTag
+    && anchor.remoteETag
+    && remote.eTag === anchor.remoteETag,
+  );
 }
 
 function localMatchesAnchor(local: LocalFileEntry, anchor: SyncAnchorV2): boolean {
@@ -261,6 +345,7 @@ function conflict(
   path: string,
   reason: Extract<IdentityRenameActionV2, { type: "conflict" }>["reason"],
   relatedPath?: string,
+  relatedPaths?: string[],
 ): IdentityRenameActionV2 {
   return {
     type: "conflict",
@@ -268,6 +353,9 @@ function conflict(
     path,
     reason,
     ...(relatedPath ? { relatedPath } : {}),
+    ...(relatedPaths && relatedPaths.length > 0
+      ? { relatedPaths }
+      : {}),
   };
 }
 

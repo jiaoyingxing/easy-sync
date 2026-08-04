@@ -191,6 +191,7 @@ describe("V2 file-state controller", () => {
     expect(Object.values(withBase.anchors.byAnchorId)[0]).toMatchObject({
       remoteId: remoteA.driveId,
       lastPath: remoteA.path,
+      remoteCTag: remoteA.cTag,
       confirmedBy: "equal-read",
     });
     expect(Object.keys(updatedBase.anchors.byAnchorId)).toEqual(
@@ -295,6 +296,7 @@ describe("V2 file-state controller", () => {
     expect(reconciled.anchors.byAnchorId["file:file-b"]).toMatchObject({
       contentHash: baseB.hash,
       remoteETag: baseB.eTag,
+      remoteCTag: remoteB.cTag,
       confirmedAt: 3,
     });
     expect(projectStatePathViewV2(removed).baseEntries).toEqual([baseB]);

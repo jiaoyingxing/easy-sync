@@ -5,6 +5,7 @@ import {
   buildCompletedFilesRenderState,
   buildSyncPlanDisplayGroups,
   buildSyncViewContentKey,
+  EasySyncSyncView,
   formatFileProgressLabel,
   formatPendingIssueChipLabel,
   formatSyncHistoryCounts,
@@ -815,7 +816,7 @@ describe("buildSyncViewContentKey", () => {
     expect(modalSource).toContain("focusPendingDecisionIfRequested()");
     expect(modalSource).toContain('row.scrollIntoView({ block: "nearest" })');
     expect(modalSource).toContain(
-      '".easy-sync-plugin-decision-actions button"',
+      '".easy-sync-plugin-decision-trigger"',
     );
   });
 });
@@ -845,5 +846,32 @@ describe("resolveSyncViewBodyMode", () => {
       pendingCount: 0,
       sideActionResultsVisible: false,
     })).toBe("idle");
+  });
+});
+
+describe("sync view attention presentation", () => {
+  it("keeps the top status generic when only community plugin decisions remain", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as {
+      plugin: { i18n: I18n };
+      getStatusPresentation: (state: Record<string, unknown>) => {
+        status: string;
+        label: string;
+      };
+    };
+    view.plugin = { i18n: new I18n("zh-cn") };
+
+    expect(view.getStatusPresentation({
+      isLoggedIn: true,
+      isInitializing: false,
+      isPending: false,
+      isRunning: false,
+      lastSyncTime: 0,
+      pendingCount: 1,
+      communityPluginEnablementPending: 1,
+      planReviewActive: false,
+      autoSyncPaused: true,
+      mutationRecovery: null,
+      progress: { cancelRequested: false },
+    })).toEqual({ status: "attention", label: "需要处理 1" });
   });
 });

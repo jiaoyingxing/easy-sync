@@ -4164,6 +4164,7 @@ export class SyncExecutor {
                   ...canonicalPlanCandidate,
                   items: batch.map((item) => ({ ...item })),
                   identityReplacements: [],
+                  identityMoveVerifications: [],
                 },
                 envelope: sourceEnvelope,
                 vaultName: this.vaultName,
@@ -8966,12 +8967,12 @@ export class SyncExecutor {
           const fresh = await this.onedrive.getFileMetadata(this.vaultName, item.renameFrom);
           if (!this.canContinue(operationEpoch, result)) return { executed: false };
           if (!fresh) {
-            return this.queuePendingConflict({
-              type: SyncActionType.Conflict,
-              path: item.path,
-              local: item.local,
-              reason: "reason.remoteDeletedLocalModified",
-            }, result, operationEpoch);
+            result.deferred++;
+            return {
+              executed: false,
+              completionActionType: SyncActionType.RetryLater,
+              completionReason: this.t("syncView.fileStatus.deferred"),
+            };
           }
           const remoteEntry = this.toMetadataRemoteEntry(
             item.renameFrom,
@@ -8979,13 +8980,12 @@ export class SyncExecutor {
             item.remote.parentId,
           );
           remoteUpserts.push(remoteEntry);
-          return this.queuePendingConflict({
-            type: SyncActionType.Conflict,
-            path: item.path,
-            local: item.local,
-            remote: remoteEntry,
-            reason: "reason.bothSidesModified",
-          }, result, operationEpoch);
+          result.deferred++;
+          return {
+            executed: false,
+            completionActionType: SyncActionType.RetryLater,
+            completionReason: this.t("syncView.fileStatus.deferred"),
+          };
         }
         // Defer persistent base removal and upsert to batch flush in caller.
         // Caller will see baseRemoval + baseUpsert and do both after pool drain.

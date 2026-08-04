@@ -80,6 +80,19 @@ describe("StateEnvelopeV2Store", () => {
     expect(await store.hasRecoveryJournal()).toBe(false);
   });
 
+  it("round-trips optional remote content-version evidence without requiring it", async () => {
+    const { adapter } = makeAdapter();
+    const store = new StateEnvelopeV2Store(adapter, paths);
+    const committed = envelope();
+    committed.remoteIndex.itemsById.file!.cTag = "ctag-content-1";
+    committed.anchors.byAnchorId.anchor!.remoteCTag = "ctag-content-1";
+
+    await store.publish(committed);
+
+    expect((await store.load(committed.scope))!.anchors.byAnchorId.anchor)
+      .toMatchObject({ remoteCTag: "ctag-content-1" });
+  });
+
   it("round-trips device community-plugin participation inside the V2 envelope", async () => {
     const { adapter } = makeAdapter();
     const store = new StateEnvelopeV2Store(adapter, paths);

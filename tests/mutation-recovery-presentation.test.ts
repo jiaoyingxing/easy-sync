@@ -31,7 +31,7 @@ describe("mutation recovery presentation", () => {
       firstPath: "notes/a.md",
       blockReason: null,
     }, t, () => "20:30:00")).toBe(
-      "1 项仍待核对，将于 20:30:00 再次核对",
+      "1 项待核对，20:30:00 再次核对",
     );
 
     expect(mutationRecoveryStatusDetail({

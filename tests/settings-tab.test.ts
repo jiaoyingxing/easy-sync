@@ -467,7 +467,7 @@ describe("buildSettingsSyncButtonState", () => {
     const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
     const styles = readFileSync("styles.css", "utf8");
 
-    expect(source.match(/extends Modal/g)).toHaveLength(1);
+    expect(source.match(/extends Modal/g)).toHaveLength(2);
     expect(source).toContain('"community-plugin-files"');
     expect(source).toContain('"community-plugin-data"');
     expect(source).toContain("openCommunityPluginManagerModal");
@@ -504,6 +504,27 @@ describe("buildSettingsSyncButtonState", () => {
       .not.toMatch(/border|border-radius/);
     expect(styles).not.toContain(".easy-sync-plugin-manager-footer");
     expect(styles).not.toContain(".easy-sync-plugin-discard-guard");
+  });
+
+  it("moves plugin enablement decisions behind a native warning icon and compact modal", () => {
+    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    const styles = readFileSync("styles.css", "utf8");
+
+    expect(source).toContain("CommunityPluginEnablementDecisionModal");
+    expect(source).toContain("new ExtraButtonComponent(toggleCell)");
+    expect(source).toContain('.setIcon("triangle-alert")');
+    expect(source).toContain('.setTooltip(label)');
+    expect(source).toContain('"easy-sync-plugin-decision-trigger"');
+    expect(source).toMatch(
+      /querySelector<HTMLElement>\(\s*"\.easy-sync-plugin-decision-trigger"/s,
+    );
+    expect(source).not.toContain("renderInlineDecision");
+    expect(styles).toMatch(
+      /\.easy-sync-plugin-decision-trigger\s*\{[^}]*color:\s*var\(--text-warning\)/s,
+    );
+    expect(styles).not.toContain(".easy-sync-plugin-inline-decision");
+    expect(styles).not.toContain(".easy-sync-plugin-decision-state");
+    expect(styles).not.toContain(".easy-sync-plugin-decision-actions");
   });
 
   it("renders actionable participation phases from the unified files read model", () => {
@@ -852,6 +873,15 @@ describe("buildSettingsSyncButtonState", () => {
     expect(zhCN["settings.communityPlugins.decisions.remote"]).toBe(
       "保留远端状态",
     );
+    expect(zhCN["settings.communityPlugins.decisions.open"]).toBe(
+      "选择“{plugin}”的启用状态",
+    );
+    expect(zhCN["settings.communityPlugins.decisions.title"]).toBe(
+      "选择“{plugin}”的启用状态",
+    );
+    expect(zhCN["settings.communityPlugins.decisions.message"]).toBe(
+      "本机为“{local}”，远端为“{remote}”。请选择同步后保留哪一边。这个选择不会删除插件文件。",
+    );
     expect(en["settings.communityPlugins.status.localOnly"]).toBe(
       "Plugin files only on this device",
     );
@@ -876,6 +906,15 @@ describe("buildSettingsSyncButtonState", () => {
     expect(en["settings.communityPlugins.decisions.remote"]).toBe(
       "Keep remote state",
     );
+    expect(en["settings.communityPlugins.decisions.open"]).toBe(
+      "Choose the enabled state for “{plugin}”",
+    );
+    expect(en["settings.communityPlugins.decisions.title"]).toBe(
+      "Choose the enabled state for “{plugin}”",
+    );
+    expect(en["settings.communityPlugins.decisions.message"]).toBe(
+      "This device: {local}. Remote: {remote}. Choose which state to keep during sync. This choice will not delete the plugin files.",
+    );
     expect(zhCN["notice.sync.communityPluginEnablement"]).toBe(
       "有 {count} 个社区插件启用状态需要确认，本次同步未执行。",
     );
@@ -883,10 +922,20 @@ describe("buildSettingsSyncButtonState", () => {
       "{count} community plugin enabled state(s) need review. This sync was not run.",
     );
     expect(zhCN["syncView.communityPlugins.pendingTitle"]).toBe(
-      "社区插件启用状态待确认（{count}）",
+      "社区插件启用状态",
     );
     expect(en["syncView.communityPlugins.pendingTitle"]).toBe(
-      "Community plugin enabled state needs review ({count})",
+      "Community plugin enabled states",
+    );
+    expect(zhCN["syncView.communityPlugins.pendingDescription"]).toBe(
+      "有 {count} 个插件在本机和远端的启用状态不同，请选择同步后保留本机还是远端状态。",
+    );
+    expect(en["syncView.communityPlugins.pendingDescription"]).toBe(
+      "{count} community plugin(s) have different local and remote enabled states. Choose which state to keep during sync.",
+    );
+    expect(zhCN["syncView.communityPlugins.review"]).toBe("选择");
+    expect(en["syncView.communityPlugins.review"]).toBe(
+      "Choose",
     );
   });
 

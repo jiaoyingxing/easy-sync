@@ -1524,7 +1524,6 @@ export default class EasySyncPlugin extends Plugin {
       t,
       {
         message: t("syncPlan.migrationConfirmMessage"),
-        warning: t("syncPlan.migrationConfirmWarning"),
       },
     ).awaitConfirm();
   }

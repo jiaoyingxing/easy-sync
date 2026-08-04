@@ -1,5 +1,6 @@
 import {
   ButtonComponent,
+  ExtraButtonComponent,
   Modal,
   Notice,
   SearchComponent,
@@ -40,6 +41,84 @@ interface CommunityPluginScopeControls {
   selectionChipEl: HTMLElement;
 }
 
+type CommunityPluginDecisionSide = "local" | "remote";
+
+class CommunityPluginEnablementDecisionModal extends Modal {
+  private resolve: (
+    (choice: CommunityPluginDecisionSide | null) => void
+  ) | null = null;
+
+  constructor(
+    private plugin: EasySyncPlugin,
+    private pluginName: string,
+    private decision: PendingCommunityPluginEnablementDecision,
+  ) {
+    super(plugin.app);
+  }
+
+  awaitChoice(): Promise<CommunityPluginDecisionSide | null> {
+    return new Promise((resolve) => {
+      this.resolve = resolve;
+      this.open();
+    });
+  }
+
+  private finish(choice: CommunityPluginDecisionSide): void {
+    const resolve = this.resolve;
+    this.resolve = null;
+    this.close();
+    resolve?.(choice);
+  }
+
+  onOpen(): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const { contentEl } = this;
+    contentEl.empty();
+    this.setTitle(t("settings.communityPlugins.decisions.title", {
+      plugin: this.pluginName,
+    }));
+
+    const localState = t(
+      this.decision.localEnabled
+        ? "settings.communityPlugins.decisions.enabled"
+        : "settings.communityPlugins.decisions.disabled",
+    );
+    const remoteState = t(
+      this.decision.remoteEnabled
+        ? "settings.communityPlugins.decisions.enabled"
+        : "settings.communityPlugins.decisions.disabled",
+    );
+    contentEl.createEl("p", {
+      cls: "setting-item-description",
+      text: t("settings.communityPlugins.decisions.message", {
+        local: localState,
+        remote: remoteState,
+      }),
+    });
+
+    const buttonRow = contentEl.createDiv("modal-button-container");
+    const localButton = new ButtonComponent(buttonRow)
+      .setButtonText(t("settings.communityPlugins.decisions.local"))
+      .onClick(() => this.finish("local"));
+    const remoteButton = new ButtonComponent(buttonRow)
+      .setButtonText(t("settings.communityPlugins.decisions.remote"))
+      .onClick(() => this.finish("remote"));
+    if (this.decision.resolvedEnabled === this.decision.localEnabled) {
+      localButton.setCta();
+    } else if (
+      this.decision.resolvedEnabled === this.decision.remoteEnabled
+    ) {
+      remoteButton.setCta();
+    }
+  }
+
+  onClose(): void {
+    const resolve = this.resolve;
+    this.resolve = null;
+    resolve?.(null);
+  }
+}
+
 export class ConfigSyncModal extends Modal {
   private view: ConfigSyncView = "scope";
   private inventory: CommunityPluginInventoryItem[] = [];
@@ -66,6 +145,7 @@ export class ConfigSyncModal extends Modal {
   private confirmingDataRows = new Set<string>();
   private pendingPluginValues = new Map<string, boolean>();
   private busyDecisionIds = new Set<string>();
+  private decisionModal: CommunityPluginEnablementDecisionModal | null = null;
   private settingsUpdateQueue = new SequentialSettingsUpdateQueue();
   private unsubscribeCommunityPluginInventoryRevision: (() => void) | null =
     null;
@@ -102,6 +182,9 @@ export class ConfigSyncModal extends Modal {
     this.destroyed = true;
     this.loadGeneration += 1;
     this.inventoryRevisionRefreshPending = false;
+    const decisionModal = this.decisionModal;
+    this.decisionModal = null;
+    decisionModal?.close();
     this.unsubscribeCommunityPluginInventoryRevision?.();
     this.unsubscribeCommunityPluginInventoryRevision = null;
     this.contentEl.empty();
@@ -627,18 +710,19 @@ export class ConfigSyncModal extends Modal {
         text: statuses.join(" · "),
       });
     }
-    if (column === "files") {
-      const decision = this.pendingDecisions.find(
-        (candidate) => candidate.pluginId === item.id,
-      );
-      if (decision) this.renderInlineDecision(identity, decision);
-    }
-
     const rowKey = this.getRowKey(column, item.id);
     const busy = this.busyPluginRows.has(rowKey)
       || this.confirmingDataRows.has(item.id);
     const pendingValue = this.pendingPluginValues.get(rowKey);
     const toggleCell = row.createDiv("easy-sync-plugin-toggle-cell");
+    if (column === "files") {
+      const decision = this.pendingDecisions.find(
+        (candidate) => candidate.pluginId === item.id,
+      );
+      if (decision) {
+        this.renderDecisionTrigger(toggleCell, displayName, decision);
+      }
+    }
     const toggle = new ToggleComponent(toggleCell)
       .setValue(
         pendingValue
@@ -754,64 +838,46 @@ export class ConfigSyncModal extends Modal {
     return statuses;
   }
 
-  private renderInlineDecision(
-    identity: HTMLElement,
+  private renderDecisionTrigger(
+    toggleCell: HTMLElement,
+    pluginName: string,
     decision: PendingCommunityPluginEnablementDecision,
   ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    const container = identity.createDiv(
-      "easy-sync-plugin-inline-decision",
-    );
-    container.createDiv({
-      cls: "easy-sync-plugin-decision-state",
-      text: t("settings.communityPlugins.decisions.state", {
-        local: t(
-          decision.localEnabled
-            ? "settings.communityPlugins.decisions.enabled"
-            : "settings.communityPlugins.decisions.disabled",
-        ),
-        remote: t(
-          decision.remoteEnabled
-            ? "settings.communityPlugins.decisions.enabled"
-            : "settings.communityPlugins.decisions.disabled",
-        ),
-      }),
+    const label = t("settings.communityPlugins.decisions.open", {
+      plugin: pluginName,
     });
-    const actions = container.createDiv(
-      "easy-sync-plugin-decision-actions",
-    );
-    this.renderDecisionButton(
-      actions,
-      decision,
-      decision.localEnabled,
-      "local",
-    );
-    this.renderDecisionButton(
-      actions,
-      decision,
-      decision.remoteEnabled,
-      "remote",
-    );
-  }
-
-  private renderDecisionButton(
-    containerEl: HTMLElement,
-    decision: PendingCommunityPluginEnablementDecision,
-    enabled: boolean,
-    side: "local" | "remote",
-  ): void {
-    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    const button = new ButtonComponent(containerEl)
-      .setButtonText(t(
-        side === "local"
-          ? "settings.communityPlugins.decisions.local"
-          : "settings.communityPlugins.decisions.remote",
-      ))
+    const trigger = new ExtraButtonComponent(toggleCell)
+      .setIcon("triangle-alert")
+      .setTooltip(label)
       .setDisabled(this.busyDecisionIds.has(decision.pluginId))
       .onClick(() => {
-        void this.resolvePendingDecision(decision, enabled);
+        void this.openDecisionModal(pluginName, decision);
       });
-    if (decision.resolvedEnabled === enabled) button.setCta();
+    trigger.extraSettingsEl.addClass("easy-sync-plugin-decision-trigger");
+    trigger.extraSettingsEl.setAttribute("aria-label", label);
+  }
+
+  private async openDecisionModal(
+    pluginName: string,
+    decision: PendingCommunityPluginEnablementDecision,
+  ): Promise<void> {
+    if (this.destroyed || this.decisionModal) return;
+    const modal = new CommunityPluginEnablementDecisionModal(
+      this.plugin,
+      pluginName,
+      decision,
+    );
+    this.decisionModal = modal;
+    const choice = await modal.awaitChoice();
+    if (this.decisionModal === modal) this.decisionModal = null;
+    if (!choice || this.destroyed) return;
+    await this.resolvePendingDecision(
+      decision,
+      choice === "local"
+        ? decision.localEnabled
+        : decision.remoteEnabled,
+    );
   }
 
   private async resolvePendingDecision(
@@ -1046,8 +1112,8 @@ export class ConfigSyncModal extends Modal {
     )].find((item) => item.dataset.easySyncPluginId === pluginId);
     if (!row) return;
     row.scrollIntoView({ block: "nearest" });
-    row.querySelector<HTMLButtonElement>(
-      ".easy-sync-plugin-decision-actions button",
+    row.querySelector<HTMLElement>(
+      ".easy-sync-plugin-decision-trigger",
     )?.focus();
   }
 

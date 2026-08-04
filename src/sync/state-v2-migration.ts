@@ -653,6 +653,8 @@ function migrateBaseAnchor(
         base.size,
         base.eTag,
         now,
+        "migrated",
+        liveNode?.kind === "file" ? liveNode.cTag : undefined,
       );
     }
   }
@@ -674,6 +676,10 @@ function migrateBaseAnchor(
         base.size,
         base.eTag,
         now,
+        "migrated",
+        itemsById[interruptedDownloadRemoteId]?.kind === "file"
+          ? itemsById[interruptedDownloadRemoteId]!.cTag
+          : undefined,
       );
     }
     const pendingConflictRemoteId =
@@ -694,6 +700,10 @@ function migrateBaseAnchor(
         base.size,
         base.eTag,
         now,
+        "migrated",
+        itemsById[pendingConflictRemoteId]?.kind === "file"
+          ? itemsById[pendingConflictRemoteId]!.cTag
+          : undefined,
       );
     }
     const historicalRelocation = findExactHistoricalRelocation({
@@ -712,6 +722,10 @@ function migrateBaseAnchor(
         base.size,
         base.eTag,
         now,
+        "migrated",
+        itemsById[historicalRelocation.driveId]?.kind === "file"
+          ? itemsById[historicalRelocation.driveId]!.cTag
+          : undefined,
       );
     }
   }
@@ -734,6 +748,8 @@ function migrateBaseAnchor(
       base.size,
       base.eTag,
       now,
+      "migrated",
+      remoteAtPath.cTag,
     );
   }
 
@@ -744,7 +760,16 @@ function migrateBaseAnchor(
   if (localCandidates.length !== 1 || remoteCandidates.length !== 1) return null;
   const remotePath = pathById.get(remoteCandidates[0]!.id);
   if (!remotePath || remotePath !== localCandidates[0]!.path) return null;
-  return makeAnchor(remoteCandidates[0]!.id, remotePath, base.hash, base.size, remoteCandidates[0]!.eTag, now);
+  return makeAnchor(
+    remoteCandidates[0]!.id,
+    remotePath,
+    base.hash,
+    base.size,
+    remoteCandidates[0]!.eTag,
+    now,
+    "migrated",
+    remoteCandidates[0]!.cTag,
+  );
 }
 
 function findExactInterruptedDownloadRemoteId(input: {
@@ -974,7 +999,16 @@ function migrateCloudHint(
   if (local.hash !== hint.contentHash || local.size !== hint.size) return null;
   if (pathById.get(remote.id) !== hint.lastPath
     || !cloudBootstrapRemoteVersionMatches(remote, hint)) return null;
-  return makeAnchor(remote.id, hint.lastPath, hint.contentHash, hint.size, remote.eTag, now, "cloud");
+  return makeAnchor(
+    remote.id,
+    hint.lastPath,
+    hint.contentHash,
+    hint.size,
+    remote.eTag,
+    now,
+    "cloud",
+    remote.cTag,
+  );
 }
 
 function preserveUnscannedBaseAnchor(
@@ -994,6 +1028,9 @@ function preserveUnscannedBaseAnchor(
     contentHash: base.hash,
     size: base.size,
     remoteETag: base.eTag,
+    ...(remote?.kind === "file" && remote.cTag
+      ? { remoteCTag: remote.cTag }
+      : {}),
     confirmedAt: now,
     confirmedBy: "equal-read",
   };
@@ -1083,6 +1120,7 @@ function makeAnchor(
   remoteETag: string | undefined,
   now: number,
   prefix = "migrated",
+  remoteCTag?: string,
 ): SyncAnchorV2 {
   return {
     anchorId: `${prefix}:${remoteId}`,
@@ -1091,6 +1129,7 @@ function makeAnchor(
     contentHash: hash,
     size,
     remoteETag,
+    ...(remoteCTag ? { remoteCTag } : {}),
     confirmedAt: now,
     confirmedBy: "equal-read",
   };

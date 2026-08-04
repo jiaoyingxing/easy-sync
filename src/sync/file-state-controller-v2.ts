@@ -381,6 +381,7 @@ function createEqualReadAnchor(
     contentHash: entry.hash,
     size: entry.size,
     remoteETag: entry.eTag,
+    ...(remote?.cTag ? { remoteCTag: remote.cTag } : {}),
     ancestorHash: prior?.contentHash === entry.hash
       ? prior.ancestorHash
       : undefined,

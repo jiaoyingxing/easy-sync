@@ -136,9 +136,11 @@ export interface LocaleStrings {
   "settings.communityPlugins.status.remoteCatalogStale": string;
   "settings.communityPlugins.decisions.local": string;
   "settings.communityPlugins.decisions.remote": string;
+  "settings.communityPlugins.decisions.open": string;
+  "settings.communityPlugins.decisions.title": string;
+  "settings.communityPlugins.decisions.message": string;
   "settings.communityPlugins.decisions.enabled": string;
   "settings.communityPlugins.decisions.disabled": string;
-  "settings.communityPlugins.decisions.state": string;
   "settings.diagLog.name": string;
   "settings.diagLog.desc": string;
   "settings.diagReport.name": string;
@@ -510,7 +512,6 @@ export interface LocaleStrings {
   "syncPlan.confirmMigration": string;
   "syncPlan.migrationConfirmTitle": string;
   "syncPlan.migrationConfirmMessage": string;
-  "syncPlan.migrationConfirmWarning": string;
   "syncPlan.migrationConfirm": string;
   "confirm.deleteWarning": string;
 

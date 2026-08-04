@@ -211,6 +211,7 @@ export function buildRemoteScopeRecoveryCandidateV2(
       contentHash: local.hash,
       size: local.size,
       remoteETag: remote.eTag,
+      ...(remote.cTag ? { remoteCTag: remote.cTag } : {}),
       confirmedAt: now,
       confirmedBy: "equal-read",
     };
@@ -341,6 +342,7 @@ function refreshedFileAnchor(
     contentHash,
     size,
     remoteETag: remote.eTag,
+    remoteCTag: remote.cTag,
     remoteIdentityLineage: advanceRemoteIdentityLineageV2(prior, {
       remoteId: remote.id,
       path,

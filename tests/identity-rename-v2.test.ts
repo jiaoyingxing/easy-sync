@@ -82,13 +82,21 @@ describe("identity-safe V2 rename planning", () => {
     state.remoteIndex.itemsById.file!.eTag = "e2";
     state.remoteIndex.itemsById.file!.contentHash = "b".repeat(64);
     expect(planIdentityRenamesV2(state, [local("new.md")])).toEqual([{
-      type: "conflict", anchorId: "anchor", path: "old.md", reason: "remote-content-changed",
+      type: "conflict",
+      anchorId: "anchor",
+      path: "old.md",
+      relatedPath: "new.md",
+      reason: "remote-content-changed",
     }]);
   });
 
   it("blocks ambiguous same-content candidates and preserves remote identity", () => {
     expect(planIdentityRenamesV2(envelope(), [local("a.md"), local("b.md")])).toEqual([{
-      type: "conflict", anchorId: "anchor", path: "old.md", reason: "local-identity-ambiguous",
+      type: "conflict",
+      anchorId: "anchor",
+      path: "old.md",
+      relatedPaths: ["a.md", "b.md"],
+      reason: "local-identity-ambiguous",
     }]);
   });
 
@@ -104,6 +112,72 @@ describe("identity-safe V2 rename planning", () => {
       toPath: "sub/new.md",
       expectedLocalHash: hash,
       expectedLocalSize: 4,
+    }]);
+  });
+
+  it("prefers an exact remote SHA-256 over a changed content tag", () => {
+    const state = envelope();
+    const remote = state.remoteIndex.itemsById.file!;
+    remote.parentId = "folder";
+    remote.name = "new.md";
+    remote.cTag = "ctag-content-2";
+    state.anchors.byAnchorId.anchor!.remoteCTag = "ctag-content-1";
+
+    expect(planIdentityRenamesV2(state, [local("old.md")])).toEqual([
+      expect.objectContaining({ type: "move-local" }),
+    ]);
+  });
+
+  it("uses matching content tags when a moved remote file has no SHA-256", () => {
+    const state = envelope();
+    const remote = state.remoteIndex.itemsById.file!;
+    remote.parentId = "folder";
+    remote.name = "new.md";
+    delete remote.contentHash;
+    remote.cTag = "ctag-content-1";
+    state.anchors.byAnchorId.anchor!.remoteCTag = "ctag-content-1";
+
+    expect(planIdentityRenamesV2(state, [local("old.md")])).toEqual([
+      expect.objectContaining({
+        type: "move-local",
+        fromPath: "old.md",
+        toPath: "sub/new.md",
+      }),
+    ]);
+  });
+
+  it("requests strict content verification for a legacy moved anchor", () => {
+    const state = envelope();
+    const remote = state.remoteIndex.itemsById.file!;
+    remote.parentId = "folder";
+    remote.name = "new.md";
+    delete remote.contentHash;
+    remote.cTag = "ctag-content-1";
+
+    expect(planIdentityRenamesV2(state, [local("old.md")])).toEqual([
+      expect.objectContaining({
+        type: "verify-move-local",
+        fromPath: "old.md",
+        toPath: "sub/new.md",
+      }),
+    ]);
+  });
+
+  it("fails closed when a moved remote content version changed", () => {
+    const state = envelope();
+    const remote = state.remoteIndex.itemsById.file!;
+    remote.parentId = "folder";
+    remote.name = "new.md";
+    delete remote.contentHash;
+    remote.cTag = "ctag-content-2";
+    state.anchors.byAnchorId.anchor!.remoteCTag = "ctag-content-1";
+
+    expect(planIdentityRenamesV2(state, [local("old.md")])).toEqual([{
+      type: "conflict",
+      anchorId: "anchor",
+      path: "old.md",
+      relatedPath: "sub/new.md",
+      reason: "both-paths-diverged",
     }]);
   });
 

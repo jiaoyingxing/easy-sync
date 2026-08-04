@@ -217,6 +217,8 @@ describe("production-capable IndexedDB active state owner", () => {
       });
       expect(await harness.store.load()).toEqual(next);
       expect(await harness.store.rebuildRecoveryEnvelope()).toEqual(next);
+      expect((await harness.store.load()).anchors.byAnchorId["file:file-00000"])
+        .toMatchObject({ remoteCTag: "ctag-etag-next" });
     } finally {
       await harness.store.delete();
     }
@@ -653,12 +655,14 @@ function nextEnvelope(
     ...source.remoteIndex.itemsById["file-00000"]!,
     size: 2,
     eTag,
+    cTag: `ctag-${eTag}`,
     contentHash,
   };
   const nextAnchor = {
     ...source.anchors.byAnchorId["file:file-00000"]!,
     size: 2,
     remoteETag: eTag,
+    remoteCTag: `ctag-${eTag}`,
     contentHash,
     confirmedAt: committedAt,
     confirmedBy: "upload-cas" as const,

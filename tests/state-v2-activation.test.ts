@@ -7643,6 +7643,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(moved).toMatchObject({
       success: true,
       foldersMoved: 1,
+      filesMoved: 0,
       uploaded: 0,
       downloaded: 0,
       deleted: 0,
@@ -7742,6 +7743,14 @@ describe("V1 to V2 controlled production activation", () => {
       "Moved",
       "folder-archive",
     );
+    expect(await harness.executor.run("manual")).toMatchObject({
+      foldersMoved: 0,
+      filesMoved: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      errors: 0,
+    });
   });
 
   it("defers a cross-parent folder move when the target parent path changes after planning", async () => {
@@ -8391,9 +8400,12 @@ describe("V1 to V2 controlled production activation", () => {
       undefined,
       { activateV2State: true },
     )).success).toBe(true);
-    harness.remoteItemState.find((item) => item.id === "file-a")!.parentReference = {
+    const remote = harness.remoteItemState.find((item) => item.id === "file-a")!;
+    remote.parentReference = {
       id: "folder-archive",
     };
+    remote.eTag = "etag-a-moved";
+    remote.file = { hashes: {} };
 
     const moved = await harness.executor.run("manual");
 
@@ -8406,7 +8418,371 @@ describe("V1 to V2 controlled production activation", () => {
       errors: 0,
     });
     expect(harness.localEntryState[0].path).toBe("Archive/a.md");
-    expect((await harness.executor.run("manual")).filesMoved).toBe(0);
+    expect(harness.mutations.downloadFile).not.toHaveBeenCalled();
+    expect(harness.state.baseSnapshot).toContainEqual({
+      path: "Archive/a.md",
+      hash: hashA,
+      size: localA.size,
+      eTag: "etag-a-moved",
+    });
+    expect(
+      Object.values(
+        harness.state.getCommittedV2Envelope()!.anchors.byAnchorId,
+      )[0],
+    ).toMatchObject({
+      remoteId: "file-a",
+      lastPath: "Archive/a.md",
+      remoteETag: "etag-a-moved",
+      remoteCTag: "ctag-a",
+    });
+    expect(await harness.executor.run("manual")).toMatchObject({
+      filesMoved: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      errors: 0,
+    });
+  });
+
+  it("strictly verifies one legacy hashless move, commits its cTag, and converges", async () => {
+    const content = "0123456789";
+    const contentHash = await sha256Hex(new TextEncoder().encode(content));
+    const legacyLocal: LocalFileEntry = {
+      path: "Notes/a.md",
+      size: content.length,
+      mtime: 1,
+      hash: contentHash,
+      binary: false,
+    };
+    const harness = makeHarness({
+      base: [{
+        path: legacyLocal.path,
+        hash: legacyLocal.hash,
+        size: legacyLocal.size,
+        eTag: "etag-a",
+      }],
+      local: [legacyLocal],
+      localFolders: [{ path: "Notes" }, { path: "Archive" }],
+      initialFiles: { [legacyLocal.path]: content },
+      remoteFileContents: { "Archive/a.md": content },
+      remoteItems: [
+        {
+          id: "folder-notes",
+          name: "Notes",
+          folder: { childCount: 1 },
+          parentReference: { id: scope.filesRootId },
+          eTag: "etag-folder-notes",
+        },
+        {
+          id: "folder-archive",
+          name: "Archive",
+          folder: {},
+          parentReference: { id: scope.filesRootId },
+          eTag: "etag-folder-archive",
+        },
+        {
+          id: "file-a",
+          name: "a.md",
+          size: legacyLocal.size,
+          file: { hashes: { sha256Hash: contentHash } },
+          parentReference: { id: "folder-notes" },
+          lastModifiedDateTime: "2026-07-25T00:00:00.000Z",
+          eTag: "etag-a",
+        },
+      ],
+    });
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    expect(
+      Object.values(
+        harness.state.getCommittedV2Envelope()!.anchors.byAnchorId,
+      )[0]!.remoteCTag,
+    ).toBeUndefined();
+
+    const remote = harness.remoteItemState.find((item) => item.id === "file-a")!;
+    remote.parentReference = { id: "folder-archive" };
+    remote.eTag = "etag-a-moved";
+    remote.cTag = "ctag-a-content";
+    remote.file = { hashes: {} };
+
+    const moved = await harness.executor.run("manual");
+
+    expect(moved).toMatchObject({
+      success: true,
+      filesMoved: 1,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.mutations.downloadFile).toHaveBeenCalledOnce();
+    expect(harness.mutations.downloadFile).toHaveBeenCalledWith(
+      "testVault",
+      "Archive/a.md",
+      undefined,
+      "file-a",
+      content.length,
+    );
+    expect(harness.localEntryState[0].path).toBe("Archive/a.md");
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(
+      Object.values(
+        harness.state.getCommittedV2Envelope()!.anchors.byAnchorId,
+      )[0],
+    ).toMatchObject({
+      remoteId: "file-a",
+      lastPath: "Archive/a.md",
+      contentHash,
+      remoteETag: "etag-a-moved",
+      remoteCTag: "ctag-a-content",
+    });
+    expect(await harness.executor.run("manual")).toMatchObject({
+      filesMoved: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.mutations.downloadFile).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a local identity move when the remote version drifts after planning", async () => {
+    const harness = makeHarness({
+      localFolders: [{ path: "Notes" }, { path: "Archive" }],
+      remoteItems: [
+        ...remoteItems(),
+        {
+          id: "folder-archive",
+          name: "Archive",
+          folder: {},
+          parentReference: { id: scope.filesRootId },
+          eTag: "etag-folder-archive",
+        },
+      ],
+    });
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    const remote = harness.remoteItemState.find((item) => item.id === "file-a")!;
+    remote.parentReference = { id: "folder-archive" };
+    remote.eTag = "etag-a-moved";
+    remote.file = { hashes: {} };
+    const getFileMetadata = harness.client.getFileMetadata as ReturnType<typeof vi.fn>;
+    const originalGetFileMetadata = getFileMetadata.getMockImplementation()!;
+    let drifted = false;
+    getFileMetadata.mockImplementation(async (...args: unknown[]) => {
+      if (args[1] === "Archive/a.md" && !drifted) {
+        drifted = true;
+        remote.eTag = "etag-a-after-plan";
+      }
+      return originalGetFileMetadata(...args);
+    });
+
+    const deferred = await harness.executor.run("manual");
+
+    expect(deferred).toMatchObject({
+      success: true,
+      filesMoved: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      deferred: 1,
+      errors: 0,
+    });
+    expect(harness.localEntryState[0].path).toBe("Notes/a.md");
+    expect(harness.scanner.vault.rename).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("cancels a local identity move when the source changes after planning", async () => {
+    const harness = makeHarness({
+      localFolders: [{ path: "Notes" }, { path: "Archive" }],
+      remoteItems: [
+        ...remoteItems(),
+        {
+          id: "folder-archive",
+          name: "Archive",
+          folder: {},
+          parentReference: { id: scope.filesRootId },
+          eTag: "etag-folder-archive",
+        },
+      ],
+    });
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    const remote = harness.remoteItemState.find((item) => item.id === "file-a")!;
+    remote.parentReference = { id: "folder-archive" };
+    remote.eTag = "etag-a-moved";
+    remote.file = { hashes: {} };
+    const inspectFile = harness.scanner.inspectFile as ReturnType<typeof vi.fn>;
+    inspectFile.mockImplementationOnce(async (path: string) => {
+      harness.localEntryState[0].hash = hashB;
+      return {
+        status: "present" as const,
+        entry: { ...harness.localEntryState[0], path },
+      };
+    });
+
+    const deferred = await harness.executor.run("manual");
+
+    expect(deferred).toMatchObject({
+      success: true,
+      filesMoved: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      deferred: 1,
+      errors: 0,
+    });
+    expect(harness.localEntryState[0].path).toBe("Notes/a.md");
+    expect(harness.scanner.vault.rename).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("recovers a cancelled local identity move after a process restart", async () => {
+    const harness = makeHarness({
+      localFolders: [{ path: "Notes" }, { path: "Archive" }],
+      remoteItems: [
+        ...remoteItems(),
+        {
+          id: "folder-archive",
+          name: "Archive",
+          folder: {},
+          parentReference: { id: scope.filesRootId },
+          eTag: "etag-folder-archive",
+        },
+      ],
+    });
+    let restartedState: StateManager | null = null;
+    try {
+      await harness.state.load();
+      expect((await harness.executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        { activateV2State: true },
+      )).success).toBe(true);
+      const remote = harness.remoteItemState.find((item) => item.id === "file-a")!;
+      remote.parentReference = { id: "folder-archive" };
+      remote.eTag = "etag-a-moved";
+      remote.file = { hashes: {} };
+      const inspectFile = harness.scanner.inspectFile as ReturnType<typeof vi.fn>;
+      inspectFile.mockImplementationOnce(async (path: string) => {
+        harness.executor.cancel();
+        return {
+          status: "present" as const,
+          entry: { ...harness.localEntryState[0], path },
+        };
+      });
+
+      const cancelled = await harness.executor.run("manual");
+      expect(cancelled.message).toBe("result.cancelled");
+      expect(harness.localEntryState[0].path).toBe("Notes/a.md");
+      expect(harness.scanner.vault.rename).not.toHaveBeenCalled();
+
+      await harness.state.close();
+      restartedState = new StateManager(harness.plugin);
+      await restartedState.load();
+      const restartedExecutor = new SyncExecutor(
+        harness.client,
+        harness.scanner,
+        restartedState,
+        "testVault",
+        undefined,
+        undefined,
+        harness.diag as never,
+        harness.fileManager as never,
+      );
+      const recovered = await restartedExecutor.run("manual");
+
+      expect(recovered).toMatchObject({
+        success: true,
+        filesMoved: 1,
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+        errors: 0,
+      });
+      expect(harness.localEntryState[0].path).toBe("Archive/a.md");
+      expect(restartedState.mutationLedger).toEqual([]);
+      expect(harness.scanner.vault.rename).toHaveBeenCalledOnce();
+    } finally {
+      await restartedState?.close();
+      await harness.state.close();
+    }
+  });
+
+  it("defers a 412 remote file move and retries with the refreshed version", async () => {
+    const harness = makeHarness({
+      localFolders: [{ path: "Notes" }, { path: "Archive" }],
+      remoteItems: [
+        ...remoteItems(),
+        {
+          id: "folder-archive",
+          name: "Archive",
+          folder: {},
+          parentReference: { id: scope.filesRootId },
+          eTag: "etag-folder-archive",
+        },
+      ],
+    });
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    harness.localEntryState[0].path = "Archive/a.md";
+    harness.conflictFolderMoveOnce();
+
+    const deferred = await harness.executor.run("manual");
+    expect(deferred).toMatchObject({
+      success: true,
+      filesMoved: 0,
+      deferred: 1,
+      errors: 0,
+    });
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes/a.md")?.eTag)
+      .toBe("etag-a-advanced");
+    expect(harness.state.mutationLedger).toEqual([]);
+
+    const retried = await harness.executor.run("manual");
+    expect(retried).toMatchObject({
+      success: true,
+      filesMoved: 1,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      errors: 0,
+    });
+    expect(findRemoteItemByPath(harness.remoteItemState, "Archive/a.md")?.id)
+      .toBe("file-a");
   });
 
   it("recovers a lost local file-move response without moving the file twice", async () => {

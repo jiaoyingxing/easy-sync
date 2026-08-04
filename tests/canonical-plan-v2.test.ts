@@ -45,6 +45,7 @@ interface FileSpec {
   name: string;
   parentId?: string;
   hash?: string | null;
+  cTag?: string | null;
   size?: number;
 }
 
@@ -78,7 +79,9 @@ function envelope(input: {
       },
       size: file.size ?? 10,
       eTag: `etag-${file.id}`,
-      cTag: `ctag-${file.id}`,
+      cTag: file.cTag === null
+        ? undefined
+        : file.cTag ?? `ctag-${file.id}`,
     })),
   ];
   const result: SyncStateEnvelopeV2 = {
@@ -140,6 +143,7 @@ function fileAnchor(
   lastPath: string,
   hash = hashA,
   size = 10,
+  remoteCTag?: string,
 ): SyncAnchorV2 {
   return {
     anchorId: `file:${remoteId}`,
@@ -148,6 +152,7 @@ function fileAnchor(
     contentHash: hash,
     size,
     remoteETag: `etag-${remoteId}`,
+    ...(remoteCTag ? { remoteCTag } : {}),
     confirmedAt: 1,
     confirmedBy: "equal-read",
   };
@@ -428,6 +433,257 @@ describe("canonical V2 plan candidate", () => {
         reason: "reason.remoteDeletedLocalModified",
       }),
     ]);
+  });
+
+  it("moves a hashless remote identity directly when its content tag is unchanged", () => {
+    const state = envelope({
+      folders: [{ id: "folder", name: "sub" }],
+      files: [{
+        id: "file",
+        name: "new.md",
+        parentId: "folder",
+        hash: null,
+        cTag: "ctag-content-1",
+      }],
+      folderAnchors: [folderAnchor("folder", "sub")],
+      fileAnchors: [fileAnchor("file", "old.md", hashA, 10, "ctag-content-1")],
+    });
+
+    const candidate = build({
+      state,
+      localFiles: [localFile("old.md")],
+      localFolders: localFolders("sub"),
+    });
+
+    expect(candidate.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.MoveLocalFile,
+        path: "sub/new.md",
+        renameFrom: "old.md",
+      }),
+    ]);
+    expect(candidate.identityMoveVerifications).toEqual([]);
+  });
+
+  it.each([false, true])(
+    "strictly verifies a legacy moved anchor without exposing download or delete (auto delete %s)",
+    async (autoDeleteLocalFiles) => {
+      const state = envelope({
+        folders: [{ id: "folder", name: "sub" }],
+        files: [{
+          id: "file",
+          name: "new.md",
+          parentId: "folder",
+          hash: null,
+          cTag: "ctag-content-1",
+        }],
+        folderAnchors: [folderAnchor("folder", "sub")],
+        fileAnchors: [fileAnchor("file", "old.md")],
+      });
+      const candidate = build({
+        state,
+        localFiles: [localFile("old.md")],
+        localFolders: localFolders("sub"),
+      });
+      let reads = 0;
+
+      const finalized = await finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles,
+          mergeNonOverlappingText: false,
+        },
+        baselineReconstructionIncomplete: false,
+        resolveRemoteContentHash: async (_item, progress) => {
+          reads++;
+          expect(progress).toEqual({ current: 1, total: 1 });
+          return hashA;
+        },
+      });
+
+      expect(reads).toBe(1);
+      expect(finalized.items).toEqual([
+        expect.objectContaining({
+          type: SyncActionType.MoveLocalFile,
+          path: "sub/new.md",
+          renameFrom: "old.md",
+        }),
+      ]);
+      expect(finalized.items.some((item) => [
+        SyncActionType.Download,
+        SyncActionType.DeleteLocal,
+        SyncActionType.ConfirmLocalDelete,
+      ].includes(item.type))).toBe(false);
+    },
+  );
+
+  it("keeps both paths when legacy move verification differs or fails", async () => {
+    const state = envelope({
+      folders: [{ id: "folder", name: "sub" }],
+      files: [{
+        id: "file",
+        name: "new.md",
+        parentId: "folder",
+        hash: null,
+        cTag: "ctag-content-2",
+      }],
+      folderAnchors: [folderAnchor("folder", "sub")],
+      fileAnchors: [fileAnchor("file", "old.md")],
+    });
+    const candidate = build({
+      state,
+      localFiles: [localFile("old.md")],
+      localFolders: localFolders("sub"),
+    });
+    const finalize = (resolver: () => Promise<string>) =>
+      finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles: true,
+          mergeNonOverlappingText: false,
+        },
+        baselineReconstructionIncomplete: false,
+        resolveRemoteContentHash: resolver,
+      });
+
+    const different = await finalize(async () => hashB);
+    expect(different.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.FolderDeferred,
+        path: "sub/new.md",
+        reason: "reason.identityMove.deferred",
+      }),
+    ]);
+    const failed = await finalize(async () => {
+      throw new Error("offline");
+    });
+    expect(failed.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.FolderDeferred,
+        path: "sub/new.md",
+        reason: "reason.identityMove.deferred",
+      }),
+    ]);
+  });
+
+  it("lets identity conflicts own every involved path before ordinary file actions", () => {
+    const changedVersion = envelope({
+      folders: [{ id: "folder", name: "sub" }],
+      files: [{
+        id: "file",
+        name: "new.md",
+        parentId: "folder",
+        hash: null,
+        cTag: "ctag-content-2",
+      }],
+      folderAnchors: [folderAnchor("folder", "sub")],
+      fileAnchors: [fileAnchor("file", "old.md", hashA, 10, "ctag-content-1")],
+    });
+    const locallyModified = structuredClone(changedVersion);
+    locallyModified.anchors.byAnchorId["file:file"]!.remoteCTag = "ctag-content-2";
+    const targetOccupied = structuredClone(locallyModified);
+    const ambiguousLocalRename = envelope({
+      files: [{ id: "file", name: "old.md" }],
+      folderAnchors: [],
+      fileAnchors: [fileAnchor("file", "old.md")],
+    });
+
+    const candidates = [
+      build({
+        state: changedVersion,
+        localFiles: [localFile("old.md")],
+        localFolders: localFolders("sub"),
+      }),
+      build({
+        state: locallyModified,
+        localFiles: [localFile("old.md", hashB)],
+        localFolders: localFolders("sub"),
+      }),
+      build({
+        state: targetOccupied,
+        localFiles: [localFile("old.md"), localFile("sub/new.md", hashB)],
+        localFolders: localFolders("sub"),
+      }),
+      build({
+        state: ambiguousLocalRename,
+        localFiles: [localFile("a.md"), localFile("b.md")],
+      }),
+    ];
+
+    for (const candidate of candidates) {
+      expect(candidate.items).toHaveLength(1);
+      expect(candidate.items[0]).toMatchObject({
+        type: SyncActionType.FolderDeferred,
+        reason: "reason.identityMove.deferred",
+      });
+      expect(candidate.items.some((item) => [
+        SyncActionType.Upload,
+        SyncActionType.Download,
+        SyncActionType.DeleteRemote,
+        SyncActionType.DeleteLocal,
+        SyncActionType.ConfirmLocalDelete,
+      ].includes(item.type))).toBe(false);
+    }
+  });
+
+  it("keeps legacy move verification inside the shared ten-read budget", async () => {
+    const moves = Array.from({ length: 11 }, (_, index) => ({
+      id: `file-${index}`,
+      oldPath: `old-${index}.md`,
+      newName: `new-${index}.md`,
+    }));
+    const state = envelope({
+      folders: [{ id: "folder", name: "sub" }],
+      files: moves.map((entry) => ({
+        id: entry.id,
+        name: entry.newName,
+        parentId: "folder",
+        hash: null,
+      })),
+      folderAnchors: [folderAnchor("folder", "sub")],
+      fileAnchors: moves.map((entry) =>
+        fileAnchor(entry.id, entry.oldPath)),
+    });
+    const candidate = build({
+      state,
+      localFiles: moves.map((entry) => localFile(entry.oldPath)),
+      localFolders: localFolders("sub"),
+    });
+    let reads = 0;
+
+    const finalized = await finalizeCanonicalPlanCandidateV2({
+      candidate,
+      envelope: state,
+      vaultName: "Vault",
+      accountId: scope.accountId,
+      automaticHandlingPolicy: {
+        autoDeleteLocalFiles: true,
+        mergeNonOverlappingText: false,
+      },
+      baselineReconstructionIncomplete: false,
+      resolveRemoteContentHash: async (_item, progress) => {
+        reads++;
+        expect(progress.total).toBe(10);
+        return hashA;
+      },
+    });
+
+    expect(reads).toBe(10);
+    expect(finalized.items.filter((item) =>
+      item.type === SyncActionType.MoveLocalFile)).toHaveLength(10);
+    expect(finalized.items.filter((item) =>
+      item.type === SyncActionType.FolderDeferred)).toHaveLength(1);
+    expect(finalized.contentVerification).toMatchObject({
+      candidates: 11,
+      downloads: 10,
+      skippedDownloads: 1,
+    });
   });
 
   it("derives remote and ancestor file facts from one committed envelope", () => {

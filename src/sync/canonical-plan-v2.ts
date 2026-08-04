@@ -96,6 +96,9 @@ export interface CanonicalPlanCandidateV2 {
   folderPlan: FolderStatePlanV2;
   /** Same-path remote identity replacements owned by V2 finalization. */
   identityReplacements: CanonicalIdentityReplacementV2[];
+  /** Same-ID remote path changes that need one strict content read before a
+   *  public local-move action may enter the executable plan. */
+  identityMoveVerifications: CanonicalIdentityMoveVerificationV2[];
   /**
    * Non-executable exact-content candidates below leaf shared folders whose
    * identities are not anchored yet. These candidates may establish common
@@ -110,6 +113,16 @@ export interface CanonicalIdentityReplacementV2 {
   remoteId: string;
   path: string;
   local?: LocalFileEntry;
+  remote: RemoteFileEntry;
+  base: BaseFileEntry;
+}
+
+export interface CanonicalIdentityMoveVerificationV2 {
+  anchorId: string;
+  remoteId: string;
+  fromPath: string;
+  toPath: string;
+  local: LocalFileEntry;
   remote: RemoteFileEntry;
   base: BaseFileEntry;
 }
@@ -239,6 +252,7 @@ function composeCanonicalActionsV2(
     lastTotalFiles: input.lastTotalFiles,
     folderPlan,
     identityReplacements: [],
+    identityMoveVerifications: [],
     unanchoredDescendantEvidence: [],
   };
   if (folderPlan.status !== "planned") {
@@ -518,6 +532,7 @@ function composeCanonicalActionsV2(
 
   const identityItems: SyncPlanItem[] = [];
   const identityReplacements: CanonicalIdentityReplacementV2[] = [];
+  const identityMoveVerifications: CanonicalIdentityMoveVerificationV2[] = [];
   const includeFilePath = input.includeFilePath ?? (() => true);
   for (const action of planIdentityRenamesFromStateV2(
     state,
@@ -549,16 +564,9 @@ function composeCanonicalActionsV2(
       if (
         [...protectedRoots].some((root) =>
           isAtOrBelowPath(action.path, root))
-        || fileItems.some((candidate) =>
-          candidate.path === action.path
-          && (
-            candidate.type === SyncActionType.DeleteRemote
-            || candidate.type === SyncActionType.DeleteLocal
-            || candidate.type === SyncActionType.ConfirmLocalDelete
-          ))
       ) continue;
       const blockedPaths = new Set(
-        [action.path, action.relatedPath]
+        [action.path, action.relatedPath, ...(action.relatedPaths ?? [])]
           .filter((path): path is string => Boolean(path))
           .map(normalizeRemotePathKey),
       );
@@ -579,6 +587,52 @@ function composeCanonicalActionsV2(
         reason: identityReplacementConflict
           ? "reason.identityReplacement.ambiguous"
           : "reason.identityMove.deferred",
+      });
+      continue;
+    }
+
+    if (action.type === "verify-move-local") {
+      const anchor = state.fileAnchorById.get(action.anchorId);
+      const local = input.localFiles.find(
+        (entry) =>
+          normalizeRemotePathKey(entry.path)
+          === normalizeRemotePathKey(action.fromPath),
+      );
+      const remote = remoteFilesById.get(action.remoteId);
+      if (
+        !anchor
+        || anchor.remoteId !== action.remoteId
+        || !local
+        || local.hash !== action.expectedLocalHash
+        || local.size !== action.expectedLocalSize
+        || !remote
+      ) {
+        deferredItems.push(identityMovePendingItem(action.toPath));
+        continue;
+      }
+      const blockedPaths = new Set(
+        [action.fromPath, action.toPath].map(normalizeRemotePathKey),
+      );
+      fileItems = fileItems.filter(
+        (candidate) =>
+          !blockedPaths.has(normalizeRemotePathKey(candidate.path))
+          && !blockedPaths.has(
+            normalizeRemotePathKey(candidate.renameFrom ?? ""),
+          ),
+      );
+      identityMoveVerifications.push({
+        anchorId: action.anchorId,
+        remoteId: action.remoteId,
+        fromPath: action.fromPath,
+        toPath: action.toPath,
+        local,
+        remote,
+        base: {
+          path: anchor.lastPath,
+          hash: anchor.contentHash,
+          size: anchor.size,
+          eTag: anchor.remoteETag ?? "",
+        },
       });
       continue;
     }
@@ -646,11 +700,14 @@ function composeCanonicalActionsV2(
       });
       continue;
     }
+    const movedPaths = new Set(
+      [action.fromPath, action.toPath].map(normalizeRemotePathKey),
+    );
     fileItems = fileItems.filter(
       (candidate) =>
-        ![action.fromPath, action.toPath].includes(candidate.path)
-        && ![action.fromPath, action.toPath].includes(
-          candidate.renameFrom ?? "",
+        !movedPaths.has(normalizeRemotePathKey(candidate.path))
+        && !movedPaths.has(
+          normalizeRemotePathKey(candidate.renameFrom ?? ""),
         ),
     );
     identityItems.push(action.type === "move-remote"
@@ -689,6 +746,7 @@ function composeCanonicalActionsV2(
     ...base,
     status: "planned",
     identityReplacements,
+    identityMoveVerifications,
     unanchoredDescendantEvidence,
     items: [
       ...createItems,
@@ -727,6 +785,7 @@ export async function finalizeUnanchoredFolderEvidenceV2(
       ...input.candidate,
       items: input.candidate.unanchoredDescendantEvidence.map(clonePlanItem),
       identityReplacements: [],
+      identityMoveVerifications: [],
     },
   });
   return {
@@ -775,11 +834,87 @@ export async function finalizeCanonicalPlanCandidateV2(
   const identityItems: SyncPlanItem[] = [];
   const identityReplacements =
     input.candidate.identityReplacements ?? [];
+  const identityMoveVerifications =
+    input.candidate.identityMoveVerifications ?? [];
   let identityCachedEvidence = 0;
   let identityDownloads = 0;
   let remainingDownloadBudget = input.baselineReconstructionIncomplete
     ? Number.POSITIVE_INFINITY
     : 10;
+
+  const identityCandidateCount =
+    identityMoveVerifications.length + identityReplacements.length;
+  const identityProgressTotal = Math.min(
+    identityCandidateCount,
+    input.baselineReconstructionIncomplete
+      ? identityCandidateCount
+      : 10,
+  );
+
+  for (const verification of identityMoveVerifications) {
+    let remoteHash = verification.remote.sha256Hash?.toLowerCase();
+    let proof: ContentEqualityProof = remoteHash
+      ? "remoteSha256"
+      : "insufficientEvidence";
+    let downloadedThisRound = false;
+    if (remoteHash) {
+      identityCachedEvidence++;
+    } else if (remainingDownloadBudget > 0) {
+      remainingDownloadBudget--;
+      identityDownloads++;
+      downloadedThisRound = true;
+      try {
+        remoteHash = (
+          await input.resolveRemoteContentHash({
+            type: SyncActionType.Conflict,
+            path: verification.toPath,
+            local: verification.local,
+            remote: verification.remote,
+            reason: "reason.identityMove.deferred",
+          }, {
+            current: identityDownloads,
+            total: identityProgressTotal,
+          })
+        ).toLowerCase();
+        proof = "downloadedSha256";
+      } catch (error) {
+        identityItems.push(identityMovePendingItem(verification.toPath));
+        identityResults.push({
+          path: verification.toPath,
+          outcome: "failed",
+          downloaded: true,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        continue;
+      }
+    } else {
+      identityItems.push(identityMovePendingItem(verification.toPath));
+      continue;
+    }
+
+    const equal =
+      verification.local.hash === verification.base.hash
+      && verification.local.size === verification.base.size
+      && verification.remote.size === verification.base.size
+      && remoteHash === verification.base.hash;
+    if (equal) {
+      identityItems.push({
+        type: SyncActionType.MoveLocalFile,
+        path: verification.toPath,
+        renameFrom: verification.fromPath,
+        local: { ...verification.local },
+        remote: { ...verification.remote },
+      });
+    } else {
+      identityItems.push(identityMovePendingItem(verification.toPath));
+    }
+    identityResults.push({
+      path: verification.toPath,
+      outcome: equal ? "equal" : "different",
+      proof,
+      downloaded: downloadedThisRound,
+    });
+  }
 
   for (const replacement of identityReplacements) {
     const pendingReceipt = pendingByPath.get(replacement.path);
@@ -816,12 +951,7 @@ export async function finalizeCanonicalPlanCandidateV2(
             reason: "reason.identityReplacement.verificationPending",
           }, {
             current: identityDownloads,
-            total: Math.min(
-              identityReplacements.length,
-              input.baselineReconstructionIncomplete
-                ? identityReplacements.length
-                : 10,
-            ),
+            total: identityProgressTotal,
           })
         ).toLowerCase();
         proof = "downloadedSha256";
@@ -992,7 +1122,7 @@ export async function finalizeCanonicalPlanCandidateV2(
     baseUpserts,
     contentVerification: {
       candidates:
-        identityReplacements.length
+        identityCandidateCount
         + candidates.length,
       cachedEvidence:
         identityCachedEvidence
@@ -1001,7 +1131,7 @@ export async function finalizeCanonicalPlanCandidateV2(
         identityDownloads
         + downloadCandidates.length,
       skippedDownloads:
-        identityReplacements.length
+        identityCandidateCount
         - identityCachedEvidence
         - identityDownloads
         + candidates.length
@@ -1111,6 +1241,14 @@ function identityReplacementPendingItem(path: string): SyncPlanItem {
     type: SyncActionType.FolderDeferred,
     path,
     reason: "reason.identityReplacement.verificationPending",
+  };
+}
+
+function identityMovePendingItem(path: string): SyncPlanItem {
+  return {
+    type: SyncActionType.FolderDeferred,
+    path,
+    reason: "reason.identityMove.deferred",
   };
 }
 

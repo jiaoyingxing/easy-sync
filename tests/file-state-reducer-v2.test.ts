@@ -307,6 +307,7 @@ describe("pure V2 file-state reducer", () => {
         anchorId: `anchor:${oldRemote.driveId}`,
         remoteId: oldRemote.driveId,
         lastPath: movedRemote.path,
+        remoteCTag: movedRemote.cTag,
         confirmedBy: "rename-cas",
       }),
     ]);
