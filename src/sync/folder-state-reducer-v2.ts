@@ -148,6 +148,7 @@ export function acceptScopeExpansionFolderAnchorsV2(input: {
     additions.push({
       ...authorized,
       ...(node.eTag !== undefined ? { eTag: node.eTag } : {}),
+      ...(node.cTag !== undefined ? { cTag: node.cTag } : {}),
     });
   }
 
@@ -320,6 +321,7 @@ export function acceptConfirmedDescendantFolderAnchorsV2(input: {
           parentId: parent.parentId,
           name: parent.name,
           ...(parent.eTag !== undefined ? { eTag: parent.eTag } : {}),
+          ...(parent.cTag !== undefined ? { cTag: parent.cTag } : {}),
         });
       }
       expectedParentPath = parentPath(expectedParentPath);
@@ -470,6 +472,7 @@ export function reduceFolderStateEnvelopeV2(
       name: upsert.name,
       kind: "folder",
       eTag: upsert.eTag,
+      cTag: upsert.cTag,
     },
   };
   const nextRemoteIndex = {
@@ -491,6 +494,7 @@ export function reduceFolderStateEnvelopeV2(
     && existingNode.parentId === upsert.parentId
     && existingNode.name === upsert.name
     && existingNode.eTag === upsert.eTag
+    && existingNode.cTag === upsert.cTag
     && existingAnchor?.lastPath === upsert.path
     && existingAnchor.parentRemoteId === upsert.parentId
     && existingAnchor.remoteETag === upsert.eTag
@@ -593,6 +597,7 @@ function reduceFolderMove(
       parentId: upsert.parentId,
       name: upsert.name,
       eTag: upsert.eTag,
+      cTag: upsert.cTag,
     },
   };
   const nextRemoteIndex = {

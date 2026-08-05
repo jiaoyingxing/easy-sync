@@ -79,6 +79,8 @@ export interface RemoteFolderEntry {
   name: string;
   /** Graph metadata version for rename/move and create-parent guards. */
   eTag?: string;
+  /** Descendant-sensitive tag when the provider exposes it for folders. */
+  cTag?: string;
 }
 
 /** Complete identity boundary for every reusable sync artifact. */
@@ -386,9 +388,79 @@ export interface MutationReceiptV1 {
   checkpoint: MutationCheckpointV1;
 }
 
+export type ManualMutationResolutionChoiceV1 = "keep-local" | "keep-remote";
+
+/**
+ * A user-reviewed continuation of one otherwise blocked mutation record.
+ *
+ * The outer intent/receipt remain untouched so 1.2.1 and older compatible
+ * readers still see the original blocking evidence. Newer builds execute and
+ * checkpoint only this nested, current-facts-bound continuation.
+ */
+export interface ManualMutationResolutionV1 {
+  version: 1;
+  choice: ManualMutationResolutionChoiceV1;
+  factsDigest: string;
+  selectedAt: number;
+  /** False only when strict equality permits a state-only reconciliation. */
+  externalMutation: boolean;
+  intent: MutationIntentV1;
+  receipt: MutationReceiptV1 | null;
+}
+
 export interface MutationLedgerEntryV1 {
   intent: MutationIntent;
   receipt: MutationReceiptV1 | null;
+  manualResolution?: ManualMutationResolutionV1;
+}
+
+export interface ManualMutationResolutionAuditV1 {
+  version: 1;
+  sourceOperationId: string;
+  resolutionOperationId: string;
+  path: string;
+  choice: ManualMutationResolutionChoiceV1;
+  action: MutationAction;
+  externalMutation: boolean;
+  selectedAt: number;
+  completedAt: number;
+}
+
+export interface ManualMutationResolutionLocalFactV1 {
+  path: string;
+  exists: boolean;
+  hash?: string;
+  size?: number;
+}
+
+export interface ManualMutationResolutionRemoteFactV1 {
+  path: string;
+  exists: boolean;
+  driveId?: string;
+  eTag?: string;
+  hash?: string;
+  size?: number;
+}
+
+export interface ManualMutationResolutionOptionV1 {
+  available: boolean;
+  deletesOtherSide: boolean;
+}
+
+/** Read-only facts shown to the user and rechecked before a manual choice. */
+export interface ManualMutationResolutionSnapshotV1 {
+  version: 1;
+  sourceOperationId: string;
+  scope: SyncScope;
+  previousAction: MutationAction;
+  path: string;
+  sourcePath?: string;
+  local: ManualMutationResolutionLocalFactV1[];
+  remote: ManualMutationResolutionRemoteFactV1[];
+  factsDigest: string;
+  identical: boolean;
+  keepLocal: ManualMutationResolutionOptionV1;
+  keepRemote: ManualMutationResolutionOptionV1;
 }
 
 /**
@@ -412,6 +484,8 @@ export interface MutationRecoveryRunSummary {
   remaining: number;
   retryAfterSeconds: number | null;
   blockReason?: MutationRecoveryBlockReason;
+  /** First non-retryable root record that can be reviewed by the user. */
+  blockedOperationId?: string;
 }
 
 export interface MutationRecoveryHistory {
@@ -422,6 +496,7 @@ export interface MutationRecoveryHistory {
   updatedAt: number;
   retryAt?: number;
   blockReason?: MutationRecoveryBlockReason;
+  blockedOperationId?: string;
 }
 
 /**

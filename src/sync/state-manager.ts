@@ -210,6 +210,8 @@ import {
   type MutationIntentV1,
   type MutationReceiptV1,
   type MutationLedgerEntryV1,
+  type ManualMutationResolutionV1,
+  type ManualMutationResolutionAuditV1,
   type MutationRecoveryHistory,
   type SyncAttention,
   type LocalFolderMoveHintV1,
@@ -225,9 +227,11 @@ import {
   readCommunityPluginEnablementCommittedObservationV1,
   sameCommunityPluginEnablementCarrierScopeV2,
   sameCommunityPluginEnablementCommittedObservationV1,
+  sameCommunityPluginEnablementDecisionSet,
   sameCommunityPluginEnablementMigrationCarrierV2,
   sameCommunityPluginEnablementSourceV2,
   type CommunityPluginEnablementCommittedObservationV1,
+  type CommunityPluginEnablementDecisionResolution,
   type CommunityPluginEnablementMigrationCarrierV2,
   type CommunityPluginEnablementSourceV2,
   type PluginEnablementAnchorsV1,
@@ -381,6 +385,8 @@ const KEY_GENERATION = "easy-sync-generation";
 const KEY_BOUND_ACCOUNT = "easy-sync-bound-account";
 const KEY_PUBLIC_MUTATION_LEDGER = "easy-sync-mutation-ledger";
 const KEY_MUTATION_LEDGER = "easy-sync-v2-mutation-ledger";
+const KEY_MANUAL_MUTATION_RESOLUTION_AUDIT =
+  "easy-sync-v2-manual-mutation-resolution-audit";
 const KEY_V2_RECOVERY_QUARANTINE = "easy-sync-v2-recovery-quarantine";
 const KEY_LOCAL_FOLDER_MOVE_HINTS = "easy-sync-local-folder-move-hints";
 const KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE = "community-plugin-enablement-state";
@@ -436,6 +442,8 @@ export interface SyncHistoryEntry {
 export interface PendingIssue {
   path: string;
   actionType: SyncActionType;
+  /** Stable, localization-independent route for a supported resolution UI. */
+  issueCode?: "anchored-folder-missing-local";
   reason?: string;
   updatedAt: number;
   fileSize?: number;
@@ -451,6 +459,11 @@ export interface PendingCommunityPluginEnablementDecision {
   localEnabled: boolean;
   remoteEnabled: boolean;
   resolvedEnabled?: boolean;
+}
+
+export interface CommunityPluginEnablementDecisionSnapshot {
+  revision: string;
+  decisions: PendingCommunityPluginEnablementDecision[];
 }
 
 export interface CommunityPluginEnablementStateV1 {
@@ -480,6 +493,7 @@ interface PluginData {
   [KEY_BOUND_ACCOUNT]: string;
   [KEY_PUBLIC_MUTATION_LEDGER]: MutationLedgerEntryV1[];
   [KEY_MUTATION_LEDGER]: MutationLedgerEntryV1[];
+  [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]: ManualMutationResolutionAuditV1[];
   [KEY_V2_RECOVERY_QUARANTINE]: MutationRecoveryQuarantineEntryV2[];
   [KEY_LOCAL_FOLDER_MOVE_HINTS]: LocalFolderMoveHintV1[];
   [KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE]: CommunityPluginEnablementStateV1;
@@ -515,6 +529,7 @@ const DEFAULT_DATA: PluginData = {
   [KEY_BOUND_ACCOUNT]: "",
   [KEY_PUBLIC_MUTATION_LEDGER]: [],
   [KEY_MUTATION_LEDGER]: [],
+  [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]: [],
   [KEY_V2_RECOVERY_QUARANTINE]: [],
   [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
   [KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE]: createEmptyCommunityPluginEnablementState(),
@@ -545,6 +560,7 @@ function createDefaultData(generation = 0, planRevision = 0): PluginData {
     [KEY_BOUND_ACCOUNT]: "",
     [KEY_PUBLIC_MUTATION_LEDGER]: [],
     [KEY_MUTATION_LEDGER]: [],
+    [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]: [],
     [KEY_V2_RECOVERY_QUARANTINE]: [],
     [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
     [KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE]: createEmptyCommunityPluginEnablementState(),
@@ -768,6 +784,10 @@ export class StateManager {
         [KEY_BOUND_ACCOUNT]: saved[KEY_BOUND_ACCOUNT] ?? "",
         [KEY_PUBLIC_MUTATION_LEDGER]: publicMutationLedger,
         [KEY_MUTATION_LEDGER]: mutationLedger,
+        [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]:
+          parseManualMutationResolutionAudit(
+            saved[KEY_MANUAL_MUTATION_RESOLUTION_AUDIT],
+          ),
         [KEY_V2_RECOVERY_QUARANTINE]: recoveryQuarantine,
         [KEY_LOCAL_FOLDER_MOVE_HINTS]: parseLocalFolderMoveHints(
           saved[KEY_LOCAL_FOLDER_MOVE_HINTS],
@@ -2899,6 +2919,11 @@ export class StateManager {
     return publicLedger;
   }
 
+  get manualMutationResolutionAudit():
+    readonly ManualMutationResolutionAuditV1[] {
+    return this.data[KEY_MANUAL_MUTATION_RESOLUTION_AUDIT];
+  }
+
   /**
    * Bind the one published incomplete scope shape to the already committed
    * V2 authority without rewriting the retained public-1.1.3 evidence.
@@ -3151,6 +3176,168 @@ export class StateManager {
     });
   }
 
+  /**
+   * Attach one current-facts-bound user decision without replacing the
+   * original recovery evidence. Older compatible builds ignore the optional
+   * child and therefore continue to fail closed on the outer record.
+   */
+  async attachManualMutationResolution(
+    expectedRecord: Readonly<MutationLedgerEntryV1>,
+    resolution: Readonly<ManualMutationResolutionV1>,
+  ): Promise<boolean> {
+    if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
+      throw new Error("Manual mutation resolution requires active V2 authority");
+    }
+    if (
+      this.mutationLedgerCorrupt
+      || !isManualMutationResolution(resolution, expectedRecord.intent)
+      || !sameSyncScope(resolution.intent.scope, this.v2Envelope.scope)
+      || resolution.intent.operationId === expectedRecord.intent.operationId
+    ) {
+      throw new Error("Manual mutation resolution evidence is invalid");
+    }
+    let attached = false;
+    await this.commitPluginData((current) => {
+      const index = current[KEY_MUTATION_LEDGER].findIndex(
+        (entry) => entry.intent.operationId === expectedRecord.intent.operationId,
+      );
+      if (index < 0) return current;
+      const active = current[KEY_MUTATION_LEDGER][index];
+      if (
+        active.manualResolution
+        || JSON.stringify(active) !== JSON.stringify(expectedRecord)
+      ) return current;
+      const entries = [...current[KEY_MUTATION_LEDGER]];
+      entries[index] = {
+        ...active,
+        manualResolution: structuredClone(resolution),
+      };
+      attached = true;
+      return { ...current, [KEY_MUTATION_LEDGER]: entries };
+    });
+    return attached;
+  }
+
+  async recordManualMutationResolutionReceipt(
+    sourceOperationId: string,
+    receipt: Readonly<MutationReceiptV1>,
+  ): Promise<void> {
+    if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
+      throw new Error("Manual mutation receipt requires active V2 authority");
+    }
+    if (this.mutationLedgerCorrupt) {
+      throw new Error("Mutation recovery ledger is corrupt");
+    }
+    await this.commitPluginData((current) => {
+      const index = current[KEY_MUTATION_LEDGER].findIndex(
+        (entry) => entry.intent.operationId === sourceOperationId,
+      );
+      if (index < 0) {
+        throw new Error(`Mutation intent missing: ${sourceOperationId}`);
+      }
+      const active = current[KEY_MUTATION_LEDGER][index];
+      const manual = active.manualResolution;
+      if (!manual || receipt.operationId !== manual.intent.operationId) {
+        throw new Error(`Manual mutation intent missing: ${sourceOperationId}`);
+      }
+      if (manual.receipt) {
+        if (JSON.stringify(manual.receipt) === JSON.stringify(receipt)) return current;
+        throw new Error(`Manual mutation receipt changed: ${sourceOperationId}`);
+      }
+      const entries = [...current[KEY_MUTATION_LEDGER]];
+      entries[index] = {
+        ...active,
+        manualResolution: {
+          ...manual,
+          receipt: structuredClone(receipt),
+        },
+      };
+      return { ...current, [KEY_MUTATION_LEDGER]: entries };
+    });
+  }
+
+  /** Publish a reviewed continuation checkpoint, then retire its outer block. */
+  async commitManualMutationResolutionCheckpoint(
+    sourceOperationId: string,
+  ): Promise<void> {
+    if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
+      throw new Error("Manual mutation checkpoint requires active V2 authority");
+    }
+    const record = this.data[KEY_MUTATION_LEDGER].find(
+      (entry) => entry.intent.operationId === sourceOperationId,
+    );
+    const manual = record?.manualResolution;
+    if (!record || !manual?.receipt) {
+      throw new Error(`Manual mutation receipt missing: ${sourceOperationId}`);
+    }
+    if (!sameSyncScope(manual.intent.scope, this.v2Envelope.scope)) {
+      throw new Error(`Manual mutation scope no longer matches: ${sourceOperationId}`);
+    }
+    const checkpoint = manual.receipt.checkpoint;
+    assertRemoteUpsertsHaveParentIdentity(checkpoint.remoteUpserts);
+    const ancestorHashes = await this.publishPendingV2Ancestors(
+      checkpoint.baseUpserts,
+    );
+    await this.commitV2State((current) => {
+      const reduced = reduceFileStateEnvelopeV2(current, {
+        intent: manual.intent,
+        receipt: manual.receipt,
+      });
+      return Object.keys(ancestorHashes).length === 0
+        ? reduced
+        : attachBaseAncestorHashesV2(
+            current,
+            reduced,
+            checkpoint.baseUpserts,
+            ancestorHashes,
+          );
+    });
+    this.clearPendingV2AncestorContent(checkpoint.baseUpserts);
+    const audit: ManualMutationResolutionAuditV1 = {
+      version: 1,
+      sourceOperationId,
+      resolutionOperationId: manual.intent.operationId,
+      path: manual.intent.path,
+      choice: manual.choice,
+      action: manual.intent.action,
+      externalMutation: manual.externalMutation,
+      selectedAt: manual.selectedAt,
+      completedAt: manual.receipt.completedAt,
+    };
+    await this.commitPluginData((current) => {
+      const active = current[KEY_MUTATION_LEDGER].find(
+        (entry) => entry.intent.operationId === sourceOperationId,
+      );
+      if (!active) {
+        if (current[KEY_MANUAL_MUTATION_RESOLUTION_AUDIT].some(
+          (entry) => entry.resolutionOperationId === manual.intent.operationId,
+        )) return current;
+        throw new Error(`Manual mutation intent missing: ${sourceOperationId}`);
+      }
+      if (JSON.stringify(active.manualResolution) !== JSON.stringify(manual)) {
+        throw new Error(`Manual mutation changed before checkpoint: ${sourceOperationId}`);
+      }
+      return {
+        ...current,
+        [KEY_PENDING_CONFLICTS]: current[KEY_PENDING_CONFLICTS].filter(
+          (item) => !checkpoint.pendingConflictRemovals.includes(item.path),
+        ),
+        [KEY_PENDING_DELETES]: current[KEY_PENDING_DELETES].filter(
+          (item) => !checkpoint.pendingDeleteRemovals.includes(item.path),
+        ),
+        [KEY_MUTATION_LEDGER]: current[KEY_MUTATION_LEDGER].filter(
+          (entry) => entry.intent.operationId !== sourceOperationId,
+        ),
+        [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]: [
+          ...current[KEY_MANUAL_MUTATION_RESOLUTION_AUDIT].filter(
+            (entry) => entry.resolutionOperationId !== audit.resolutionOperationId,
+          ),
+          audit,
+        ].slice(-20),
+      };
+    });
+  }
+
   async recordMutationReceipt(receipt: MutationReceiptV1): Promise<void> {
     if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
       throw new Error("Mutation receipt requires active V2 authority");
@@ -3162,7 +3349,7 @@ export class StateManager {
       );
       if (index < 0) throw new Error(`Mutation intent missing: ${receipt.operationId}`);
       const entries = [...current[KEY_MUTATION_LEDGER]];
-      entries[index] = { intent: entries[index].intent, receipt };
+      entries[index] = { ...entries[index], receipt };
       return { ...current, [KEY_MUTATION_LEDGER]: entries };
     });
   }
@@ -3177,6 +3364,9 @@ export class StateManager {
         (entry) => entry.intent.operationId === operationId,
       );
       if (!current) return data;
+      if (current.manualResolution) {
+        throw new Error(`Cannot abandon reviewed mutation: ${operationId}`);
+      }
       if (current.receipt) throw new Error(`Cannot abandon receipted mutation: ${operationId}`);
       abandonedPath = current.intent.path;
       return {
@@ -3235,6 +3425,11 @@ export class StateManager {
       [KEY_PENDING_DELETES]: current[KEY_PENDING_DELETES].filter(
         (item) => !checkpoint.pendingDeleteRemovals.includes(item.path),
       ),
+      [KEY_PENDING_ISSUES]: isFolderMutationIntent(record.intent)
+        ? current[KEY_PENDING_ISSUES].filter(
+            (issue) => issue.path !== record.intent.path,
+          )
+        : current[KEY_PENDING_ISSUES],
       [KEY_MUTATION_LEDGER]: current[KEY_MUTATION_LEDGER].filter(
         (entry) => entry.intent.operationId !== operationId,
       ),
@@ -3699,13 +3894,15 @@ export class StateManager {
     );
   }
 
-  async resolveCommunityPluginEnablementDecision(
+  async resolveCommunityPluginEnablementDecisions(
     scope: SyncScope,
-    pluginId: string,
-    enabled: boolean,
-    expectedLocalEnabled?: boolean,
-    expectedRemoteEnabled?: boolean,
+    expectedRevision: string,
+    resolutions: readonly Readonly<
+      CommunityPluginEnablementDecisionResolution
+    >[],
   ): Promise<boolean> {
+    const snapshot = this.getCommunityPluginEnablementDecisionSnapshot(scope);
+    if (snapshot.revision !== expectedRevision) return false;
     const hold = this.activeV2MigrationHold;
     const carried = hold?.communityPluginEnablement;
     if (
@@ -3714,27 +3911,16 @@ export class StateManager {
       && sameCommunityPluginEnablementCarrierScopeV2(carried, scope)
       && this.migrationHoldStore
     ) {
-      if (
-        expectedLocalEnabled === undefined
-        || expectedRemoteEnabled === undefined
-      ) return false;
-      const pending = carried.pending.find((item) =>
-        item.pluginId === pluginId
-        && item.localEnabled === expectedLocalEnabled
-        && item.remoteEnabled === expectedRemoteEnabled
-      );
-      if (!pending) return false;
       const source = await this.readPublic113MigrationInput();
       if (
         await public113MigrationInputDigest(source)
         !== hold.sourceStateDigest
       ) return false;
       const resolved =
-        await this.migrationHoldStore.resolveCommunityPluginEnablementDecision(
+        await this.migrationHoldStore.resolveCommunityPluginEnablementDecisions(
           hold.revision,
           hold.canonicalIdentity,
-          pending,
-          enabled,
+          resolutions,
         );
       if (!resolved) return false;
       this.migrationHold = resolved;
@@ -3744,33 +3930,61 @@ export class StateManager {
     let resolved = false;
     await this.commitPluginData((current) => {
       const state = current[KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE];
-      if (!state.scope || !sameSyncScope(state.scope, scope)) return current;
-      const pending = state.pending.map((item) => {
-        if (
-          item.pluginId !== pluginId
-          || (
-            expectedLocalEnabled !== undefined
-            && item.localEnabled !== expectedLocalEnabled
-          )
-          || (
-            expectedRemoteEnabled !== undefined
-            && item.remoteEnabled !== expectedRemoteEnabled
-          )
-        ) return item;
-        resolved = true;
-        return { ...item, resolvedEnabled: enabled };
-      });
-      return resolved
-        ? {
-            ...current,
-            [KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE]: {
-              ...state,
-              pending,
-            },
-          }
-        : current;
+      if (
+        !state.scope
+        || !sameSyncScope(state.scope, scope)
+        || communityPluginEnablementDecisionRevision(
+          state.scope,
+          state.pending,
+        ) !== expectedRevision
+        || !sameCommunityPluginEnablementDecisionSet(
+          state.pending,
+          resolutions,
+        )
+      ) return current;
+      const enabledById = new Map(
+        resolutions.map((item) => [item.pluginId, item.enabled]),
+      );
+      resolved = true;
+      return {
+        ...current,
+        [KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE]: {
+          ...state,
+          pending: state.pending.map((item) => ({
+            ...item,
+            resolvedEnabled: enabledById.get(item.pluginId)!,
+          })),
+        },
+      };
     });
     return resolved;
+  }
+
+  getCommunityPluginEnablementDecisionSnapshot(
+    scope: SyncScope,
+  ): CommunityPluginEnablementDecisionSnapshot {
+    const hold = this.activeV2MigrationHold;
+    const carried = hold?.communityPluginEnablement;
+    if (
+      carried
+      && sameCommunityPluginEnablementCarrierScopeV2(carried, scope)
+    ) {
+      return {
+        revision: communityPluginEnablementMigrationDecisionRevision(
+          hold,
+          carried,
+        ),
+        decisions: carried.pending.map((item) => ({ ...item })),
+      };
+    }
+    const state = this.getCommunityPluginEnablementState(scope);
+    return {
+      revision: communityPluginEnablementDecisionRevision(
+        scope,
+        state.pending,
+      ),
+      decisions: state.pending.map((item) => ({ ...item })),
+    };
   }
 
   async setRemoteState(
@@ -6406,6 +6620,16 @@ function parseMutationLedger(value: unknown): MutationLedgerEntryV1[] {
   return value;
 }
 
+function parseManualMutationResolutionAudit(
+  value: unknown,
+): ManualMutationResolutionAuditV1[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || !value.every(isManualMutationResolutionAudit)) {
+    return [];
+  }
+  return value.slice(-20);
+}
+
 function parseMutationRecoveryQuarantine(
   value: unknown,
 ): MutationRecoveryQuarantineEntryV2[] {
@@ -6460,7 +6684,104 @@ function isMutationLedgerEntry(value: unknown): value is MutationLedgerEntryV1 {
   if (!value || typeof value !== "object") return false;
   const entry = value as Partial<MutationLedgerEntryV1>;
   return isMutationIntent(entry.intent)
-    && (entry.receipt === null || isMutationReceipt(entry.receipt, entry.intent.operationId));
+    && (entry.receipt === null || isMutationReceipt(entry.receipt, entry.intent.operationId))
+    && (entry.manualResolution === undefined
+      || isManualMutationResolution(entry.manualResolution, entry.intent));
+}
+
+function isManualMutationResolution(
+  value: unknown,
+  sourceIntent?: MutationIntent,
+): value is ManualMutationResolutionV1 {
+  if (!isRecord(value)) return false;
+  if (
+    value.version !== 1
+    || (value.choice !== "keep-local" && value.choice !== "keep-remote")
+    || typeof value.factsDigest !== "string"
+    || !/^[0-9a-f]{64}$/i.test(value.factsDigest)
+    || typeof value.selectedAt !== "number"
+    || !Number.isFinite(value.selectedAt)
+    || typeof value.externalMutation !== "boolean"
+    || !isMutationIntent(value.intent)
+    || value.intent.version !== 1
+    || !(value.intent.action === "upload"
+      || value.intent.action === "download"
+      || value.intent.action === "deleteRemote"
+      || value.intent.action === "renameRemote"
+      || value.intent.action === "moveLocal"
+      || value.intent.action === "deleteLocal")
+  ) return false;
+  if (
+    value.receipt !== null
+    && !isMutationReceipt(value.receipt, value.intent.operationId)
+  ) return false;
+  if (!value.externalMutation && value.receipt === null) return false;
+  const hasSourcePath = typeof value.intent.sourcePath === "string";
+  const semanticActionMatches = !value.externalMutation
+    ? !hasSourcePath && (
+        (value.intent.action === "upload"
+          && value.intent.expectedLocal.exists
+          && value.intent.expectedRemote.exists)
+        || (value.intent.action === "deleteLocal"
+          && !value.intent.expectedLocal.exists
+          && !value.intent.expectedRemote.exists)
+      )
+    : hasSourcePath
+      ? value.intent.expectedLocal.exists
+        && value.intent.expectedRemote.exists
+        && (
+          (value.choice === "keep-local" && value.intent.action === "renameRemote")
+          || (value.choice === "keep-remote" && value.intent.action === "moveLocal")
+        )
+      : value.choice === "keep-local"
+        ? value.intent.expectedLocal.exists
+          ? value.intent.action === "upload"
+          : value.intent.expectedRemote.exists
+            && value.intent.action === "deleteRemote"
+        : value.intent.expectedRemote.exists
+          ? value.intent.action === "download"
+          : value.intent.expectedLocal.exists
+            && value.intent.action === "deleteLocal";
+  if (!semanticActionMatches) return false;
+  if (!sourceIntent) return true;
+  if (
+    sourceIntent.version !== 1
+    || sourceIntent.operationId === value.intent.operationId
+    || !sameSyncScope(sourceIntent.scope, value.intent.scope)
+  ) return false;
+  const sourcePaths = [...new Set([
+    sourceIntent.path,
+    sourceIntent.sourcePath,
+  ].filter((path): path is string => Boolean(path)))].sort();
+  const resolutionPaths = [...new Set([
+    value.intent.path,
+    value.intent.sourcePath,
+  ].filter((path): path is string => Boolean(path)))].sort();
+  return JSON.stringify(sourcePaths) === JSON.stringify(resolutionPaths);
+}
+
+function isManualMutationResolutionAudit(
+  value: unknown,
+): value is ManualMutationResolutionAuditV1 {
+  if (!isRecord(value)) return false;
+  return value.version === 1
+    && typeof value.sourceOperationId === "string"
+    && value.sourceOperationId.length > 0
+    && typeof value.resolutionOperationId === "string"
+    && value.resolutionOperationId.length > 0
+    && isVaultRelativeMutationPath(value.path)
+    && (value.choice === "keep-local" || value.choice === "keep-remote")
+    && (value.action === "upload"
+      || value.action === "download"
+      || value.action === "deleteRemote"
+      || value.action === "renameRemote"
+      || value.action === "moveLocal"
+      || value.action === "deleteLocal")
+    && typeof value.externalMutation === "boolean"
+    && typeof value.selectedAt === "number"
+    && Number.isFinite(value.selectedAt)
+    && typeof value.completedAt === "number"
+    && Number.isFinite(value.completedAt);
 }
 
 function isMutationIntent(value: unknown): value is MutationIntent {
@@ -6679,7 +7000,8 @@ function isRemoteFolderEntry(value: unknown): value is RemoteFolderEntry {
     && typeof entry.driveId === "string"
     && typeof entry.parentId === "string"
     && typeof entry.name === "string"
-    && (entry.eTag === undefined || typeof entry.eTag === "string");
+    && (entry.eTag === undefined || typeof entry.eTag === "string")
+    && (entry.cTag === undefined || typeof entry.cTag === "string");
 }
 
 function readSyncScopeExpansionMarkerV1(
@@ -6920,7 +7242,40 @@ function samePendingIssues(left: PendingIssue[], right: PendingIssue[]): boolean
       const current = left[index];
       return current?.path === issue.path
         && current.actionType === issue.actionType
+        && current.issueCode === issue.issueCode
         && current.reason === issue.reason
         && current.updatedAt === issue.updatedAt;
     });
+}
+
+function communityPluginEnablementDecisionRevision(
+  scope: Readonly<SyncScope>,
+  pending: readonly Readonly<PendingCommunityPluginEnablementDecision>[],
+): string {
+  return JSON.stringify({
+    scope,
+    pending: [...pending]
+      .map((item) => ({ ...item }))
+      .sort((left, right) => left.pluginId.localeCompare(right.pluginId)),
+  });
+}
+
+function communityPluginEnablementMigrationDecisionRevision(
+  hold: Readonly<Pick<
+    MigrationHoldV2,
+    "revision" | "canonicalIdentity" | "sourceStateDigest"
+  >>,
+  carrier: Readonly<CommunityPluginEnablementMigrationCarrierV2>,
+): string {
+  return JSON.stringify({
+    kind: "migration",
+    holdRevision: hold.revision,
+    canonicalIdentity: hold.canonicalIdentity,
+    sourceStateDigest: hold.sourceStateDigest,
+    scope: carrier.scope,
+    source: carrier.source,
+    pending: [...carrier.pending]
+      .map((item) => ({ ...item }))
+      .sort((left, right) => left.pluginId.localeCompare(right.pluginId)),
+  });
 }

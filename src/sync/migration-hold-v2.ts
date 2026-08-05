@@ -25,11 +25,11 @@ import {
   type SharedSyncProtocolBindingV2,
 } from "./sync-protocol-v2";
 import {
-  resolveCommunityPluginEnablementMigrationDecisionV2,
+  resolveCommunityPluginEnablementMigrationDecisionsV2,
   sameCommunityPluginEnablementMigrationCarrierV2,
   validateCommunityPluginEnablementMigrationCarrierV2,
   type CommunityPluginEnablementMigrationCarrierV2,
-  type ObservedPluginEnablementDecision,
+  type CommunityPluginEnablementDecisionResolution,
 } from "./community-plugin-enablement";
 
 export interface MigrationHoldV2Paths {
@@ -170,11 +170,12 @@ export class MigrationHoldV2Store {
     });
   }
 
-  async resolveCommunityPluginEnablementDecision(
+  async resolveCommunityPluginEnablementDecisions(
     expectedRevision: number,
     expectedIdentity: CanonicalPlanIdentityV2,
-    expectedDecision: Readonly<ObservedPluginEnablementDecision>,
-    enabled: boolean,
+    resolutions: readonly Readonly<
+      CommunityPluginEnablementDecisionResolution
+    >[],
     now = Date.now(),
   ): Promise<MigrationHoldV2 | null> {
     const current = await this.load();
@@ -191,10 +192,9 @@ export class MigrationHoldV2Store {
       return null;
     }
     const communityPluginEnablement =
-      resolveCommunityPluginEnablementMigrationDecisionV2(
+      resolveCommunityPluginEnablementMigrationDecisionsV2(
         current.communityPluginEnablement,
-        expectedDecision,
-        enabled,
+        resolutions,
       );
     if (!communityPluginEnablement) return null;
     return this.publish({

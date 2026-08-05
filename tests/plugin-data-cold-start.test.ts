@@ -1438,7 +1438,7 @@ describe("plugin data cold-start cache", () => {
       },
       data: { mode: "none", pluginIds: [] },
     };
-    const resolveDecision = vi.fn().mockResolvedValue(true);
+    const resolveDecisions = vi.fn().mockResolvedValue(true);
     plugin.state = {
       remoteScope: {
         accountId: "account",
@@ -1463,7 +1463,22 @@ describe("plugin data cold-start cache", () => {
           },
         ],
       }),
-      resolveCommunityPluginEnablementDecision: resolveDecision,
+      getCommunityPluginEnablementDecisionSnapshot: vi.fn().mockReturnValue({
+        revision: "revision-1",
+        decisions: [
+          {
+            pluginId: "calendar",
+            localEnabled: true,
+            remoteEnabled: false,
+          },
+          {
+            pluginId: "quickadd",
+            localEnabled: false,
+            remoteEnabled: true,
+          },
+        ],
+      }),
+      resolveCommunityPluginEnablementDecisions: resolveDecisions,
     } as never;
     vi.spyOn(plugin as never, "ensureStateLoaded").mockResolvedValue(undefined);
 
@@ -1477,29 +1492,36 @@ describe("plugin data cold-start cache", () => {
       },
     ]);
     expect(plugin.getCommunityPluginEnablementPendingCount()).toBe(1);
-    await expect(
-      plugin.resolveCommunityPluginEnablementDecision("quickadd", true),
-    ).resolves.toBe(false);
-    expect(resolveDecision).not.toHaveBeenCalled();
-    await expect(
-      plugin.resolveCommunityPluginEnablementDecision(
-        "calendar",
-        true,
-        true,
-        false,
-      ),
-    ).resolves.toBe(true);
-    expect(resolveDecision).toHaveBeenCalledExactlyOnceWith(
+    await expect(plugin.resolveCommunityPluginEnablementDecisions(
+      "revision-1",
+      [{
+      pluginId: "calendar",
+      localEnabled: false,
+      remoteEnabled: true,
+      enabled: true,
+      }],
+    )).resolves.toBe(false);
+    expect(resolveDecisions).not.toHaveBeenCalled();
+    const batch = [{
+      pluginId: "calendar",
+      localEnabled: true,
+      remoteEnabled: false,
+      enabled: false,
+    }];
+    await expect(plugin.resolveCommunityPluginEnablementDecisions(
+      "revision-1",
+      batch,
+    ))
+      .resolves.toBe(true);
+    expect(resolveDecisions).toHaveBeenCalledExactlyOnceWith(
       {
         accountId: "account",
         driveId: "drive",
         vaultFolderId: "vault",
         filesRootId: "files",
       },
-      "calendar",
-      true,
-      true,
-      false,
+      "revision-1",
+      batch,
     );
   });
 

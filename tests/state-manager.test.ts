@@ -612,6 +612,7 @@ describe("StateManager batch persistence", () => {
           parentId: TEST_SCOPE.filesRootId,
           name: "Archive",
           eTag: "etag-archive",
+          cTag: "ctag-archive",
         }],
         folderMoveHintRemovals: ["folder-notes"],
       },
@@ -646,6 +647,95 @@ describe("StateManager batch persistence", () => {
     expect(state.hasMutationLedgerCorruption).toBe(false);
     expect(state.mutationLedger).toEqual([{ intent, receipt }]);
     expect(state.localFolderMoveHints).toHaveLength(1);
+
+    const legacyFolder = { ...receipt.checkpoint.folderUpserts![0] };
+    delete legacyFolder.cTag;
+    const legacyReceipt: MutationReceiptV1 = {
+      ...receipt,
+      checkpoint: {
+        ...receipt.checkpoint,
+        folderUpserts: [legacyFolder],
+      },
+    };
+    const legacyPlugin: PluginDataStore = {
+      ...plugin,
+      loadData: vi.fn().mockResolvedValue({
+        "easy-sync-mutation-ledger": [{ intent, receipt: legacyReceipt }],
+      }),
+    };
+    const legacyState = new StateManager(legacyPlugin);
+
+    await legacyState.load();
+
+    expect(legacyState.hasMutationLedgerCorruption).toBe(false);
+    expect(legacyState.mutationLedger).toEqual([{
+      intent,
+      receipt: legacyReceipt,
+    }]);
+  });
+
+  it("rejects a folder checkpoint with a malformed content tag", async () => {
+    const intent: FolderMutationIntentV2 = {
+      version: 2,
+      operationId: "folder-delete-invalid-ctag",
+      planRevision: 4,
+      scope: TEST_SCOPE,
+      action: "deleteRemoteFolder",
+      path: "Archive",
+      folderId: "folder-archive",
+      expectedLocal: { exists: false },
+      expectedRemote: {
+        exists: true,
+        driveId: "folder-archive",
+        parentId: TEST_SCOPE.filesRootId,
+        eTag: "etag-archive",
+      },
+      createdAt: 1,
+    };
+    const plugin: PluginDataStore = {
+      loadData: vi.fn().mockResolvedValue({
+        "easy-sync-mutation-ledger": [{
+          intent,
+          receipt: {
+            version: 1,
+            operationId: intent.operationId,
+            completedAt: 2,
+            checkpoint: {
+              baseUpserts: [],
+              baseRemovals: [],
+              remoteUpserts: [],
+              remoteDeletes: [],
+              pendingConflictRemovals: [],
+              pendingDeleteRemovals: [],
+              folderUpserts: [{
+                path: "Archive",
+                driveId: "folder-archive",
+                parentId: TEST_SCOPE.filesRootId,
+                name: "Archive",
+                eTag: "etag-archive",
+                cTag: 42,
+              }],
+            },
+          },
+        }],
+      }),
+      updatePluginData: vi.fn().mockResolvedValue(undefined),
+      manifest: { id: "easy-sync", dir: ".obsidian/plugins/easy-sync" },
+      app: {
+        vault: {
+          adapter: {
+            read: vi.fn().mockRejectedValue(new Error("missing")),
+            write: vi.fn().mockResolvedValue(undefined),
+          },
+        },
+      },
+    };
+    const state = new StateManager(plugin);
+
+    await state.load();
+
+    expect(state.hasMutationLedgerCorruption).toBe(true);
+    expect(state.mutationLedger).toEqual([]);
   });
 
   it("rejects a fresh remote cache mutation without a parent identity", async () => {
@@ -1321,35 +1411,207 @@ describe("StateManager community plugin enablement state", () => {
     }));
   });
 
-  it("records a decision without advancing its shared anchor", async () => {
-    const { state } = makeState();
+  it("commits every enablement choice together and rejects a stale batch", async () => {
+    const { state, saveData } = makeState();
+    const pending = [
+      {
+        pluginId: "calendar",
+        localEnabled: true,
+        remoteEnabled: false,
+      },
+      {
+        pluginId: "quickadd",
+        localEnabled: false,
+        remoteEnabled: true,
+      },
+    ];
     await state.setCommunityPluginEnablementState({
       version: 1,
       scope: TEST_SCOPE,
       anchors: {},
-      pending: [{
+      pending,
+    });
+    saveData.mockClear();
+    const revision = state.getCommunityPluginEnablementDecisionSnapshot(
+      TEST_SCOPE,
+    ).revision;
+
+    await expect(state.resolveCommunityPluginEnablementDecisions(
+      TEST_SCOPE,
+      revision,
+      [{
         pluginId: "calendar",
         localEnabled: true,
         remoteEnabled: false,
+        enabled: true,
       }],
-    });
+    )).resolves.toBe(false);
+    expect(saveData).not.toHaveBeenCalled();
+    expect(state.getCommunityPluginEnablementState(TEST_SCOPE).pending)
+      .toEqual(pending);
 
-    await expect(state.resolveCommunityPluginEnablementDecision(
+    await expect(state.resolveCommunityPluginEnablementDecisions(
       TEST_SCOPE,
-      "calendar",
-      true,
+      revision,
+      [
+        {
+          pluginId: "calendar",
+          localEnabled: true,
+          remoteEnabled: false,
+          enabled: true,
+        },
+        {
+          pluginId: "quickadd",
+          localEnabled: false,
+          remoteEnabled: false,
+          enabled: false,
+        },
+      ],
+    )).resolves.toBe(false);
+    expect(saveData).not.toHaveBeenCalled();
+
+    await expect(state.resolveCommunityPluginEnablementDecisions(
+      TEST_SCOPE,
+      revision,
+      [
+        {
+          pluginId: "calendar",
+          localEnabled: true,
+          remoteEnabled: false,
+          enabled: true,
+        },
+        {
+          pluginId: "quickadd",
+          localEnabled: false,
+          remoteEnabled: true,
+          enabled: false,
+        },
+      ],
     )).resolves.toBe(true);
-    expect(state.getCommunityPluginEnablementState(TEST_SCOPE)).toEqual({
+    expect(saveData).toHaveBeenCalledTimes(1);
+    expect(state.getCommunityPluginEnablementState(TEST_SCOPE).pending)
+      .toEqual([
+        { ...pending[0], resolvedEnabled: true },
+        { ...pending[1], resolvedEnabled: false },
+      ]);
+  });
+
+  it("keeps a batch valid when only the bound source version changed", async () => {
+    const { state, saveData } = makeState();
+    const pending = [{
+      pluginId: "calendar",
+      localEnabled: true,
+      remoteEnabled: false,
+    }];
+    const makeObservation = (eTag: string) => ({
+      version: 1 as const,
+      source: {
+        path: ".obsidian/community-plugins.json",
+        selectedPluginIds: ["calendar"],
+        local: {
+          exists: true,
+          contentHash: "a".repeat(64),
+        },
+        remote: {
+          exists: true,
+          contentHash: "b".repeat(64),
+          remoteId: "remote-community-plugins",
+          eTag,
+        },
+      },
+      localPluginIds: ["calendar"],
+      remotePluginIds: [],
+    });
+    await state.setCommunityPluginEnablementState({
       version: 1,
       scope: TEST_SCOPE,
       anchors: {},
-      pending: [{
+      pending,
+      observation: makeObservation("etag-1"),
+    });
+    const staleRevision = state.getCommunityPluginEnablementDecisionSnapshot(
+      TEST_SCOPE,
+    ).revision;
+    await state.setCommunityPluginEnablementState({
+      version: 1,
+      scope: TEST_SCOPE,
+      anchors: {},
+      pending,
+      observation: makeObservation("etag-2"),
+    });
+    saveData.mockClear();
+
+    await expect(state.resolveCommunityPluginEnablementDecisions(
+      TEST_SCOPE,
+      staleRevision,
+      [{
         pluginId: "calendar",
         localEnabled: true,
         remoteEnabled: false,
-        resolvedEnabled: true,
+        enabled: true,
       }],
+    )).resolves.toBe(true);
+    expect(saveData).toHaveBeenCalledOnce();
+    expect(state.getCommunityPluginEnablementState(TEST_SCOPE).pending)
+      .toEqual([{ ...pending[0], resolvedEnabled: true }]);
+  });
+
+  it("rechecks the whole visible decision batch inside the serialized commit", async () => {
+    const { state, saveData } = makeState();
+    const pending = [{
+      pluginId: "calendar",
+      localEnabled: true,
+      remoteEnabled: false,
+    }];
+    await state.setCommunityPluginEnablementState({
+      version: 1,
+      scope: TEST_SCOPE,
+      anchors: {},
+      pending,
     });
+    const revision = state.getCommunityPluginEnablementDecisionSnapshot(
+      TEST_SCOPE,
+    ).revision;
+    saveData.mockClear();
+    let releaseWrite: (() => void) | undefined;
+    let markWriteStarted: (() => void) | undefined;
+    const writeStarted = new Promise<void>((resolve) => {
+      markWriteStarted = resolve;
+    });
+    saveData.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+      markWriteStarted?.();
+    }));
+
+    const changedPending = [{
+      pluginId: "calendar",
+      localEnabled: false,
+      remoteEnabled: true,
+    }];
+    const update = state.setCommunityPluginEnablementState({
+      version: 1,
+      scope: TEST_SCOPE,
+      anchors: {},
+      pending: changedPending,
+    });
+    await writeStarted;
+    const resolveBatch = state.resolveCommunityPluginEnablementDecisions(
+      TEST_SCOPE,
+      revision,
+      [{
+        pluginId: "calendar",
+        localEnabled: true,
+        remoteEnabled: false,
+        enabled: true,
+      }],
+    );
+    releaseWrite?.();
+
+    await expect(update).resolves.toBeUndefined();
+    await expect(resolveBatch).resolves.toBe(false);
+    expect(saveData).toHaveBeenCalledOnce();
+    expect(state.getCommunityPluginEnablementState(TEST_SCOPE).pending)
+      .toEqual(changedPending);
   });
 
   it("retires pending decisions for plugin ids that leave selected file scope", async () => {

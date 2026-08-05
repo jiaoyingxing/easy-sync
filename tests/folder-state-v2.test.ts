@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DriveItem } from "../src/onedrive/types";
 import { planFolderStateV2 } from "../src/sync/folder-state-v2";
+import { buildEmptyFolderResolutionSnapshotV1 } from "../src/sync/empty-folder-resolution";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
 import { shouldPauseFilePlanForConfirmationV2 } from "../src/sync/file-decision-planner-v2";
 import type {
@@ -26,6 +27,7 @@ interface FolderSpec {
   id: string;
   name: string;
   parentId?: string;
+  cTag?: string | null;
 }
 
 interface FileSpec {
@@ -50,6 +52,9 @@ function envelope(input: {
       parentReference: { id: folder.parentId ?? scope.filesRootId },
       folder: {},
       eTag: `etag-${folder.id}`,
+      cTag: folder.cTag === null
+        ? undefined
+        : folder.cTag ?? `ctag-${folder.id}`,
     })),
     ...(input.files ?? []).map((file): DriveItem => ({
       id: file.id,
@@ -468,6 +473,116 @@ describe("V2 folder anchors and pure planner", () => {
       path: "Notes",
       reason: "anchored-folder-missing-local",
     })]);
+  });
+
+  it("offers explicit resolution only for a fully observed empty-folder ambiguity", () => {
+    const current = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      folderAnchors: [folderAnchor("notes", "Notes")],
+    });
+    const snapshot = buildEmptyFolderResolutionSnapshotV1("Notes", {
+      envelope: current,
+      localFiles: [],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    });
+
+    expect(snapshot).toMatchObject({
+      version: 1,
+      path: "Notes",
+      remoteId: "notes",
+      remoteETag: "etag-notes",
+      remoteCTag: "ctag-notes",
+      parentRemoteId: scope.filesRootId,
+      candidatePaths: ["Archive"],
+    });
+  });
+
+  it("keeps incomplete, non-empty, nested-remote and moved-remote cases fail closed", () => {
+    const empty = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      folderAnchors: [folderAnchor("notes", "Notes")],
+    });
+    expect(buildEmptyFolderResolutionSnapshotV1("Notes", {
+      envelope: empty,
+      localFiles: [],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: false,
+    })).toBeNull();
+    expect(buildEmptyFolderResolutionSnapshotV1("Notes", {
+      envelope: empty,
+      localFiles: [localFile("Archive/a.md")],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    })).toBeNull();
+    expect(buildEmptyFolderResolutionSnapshotV1("Notes", {
+      envelope: empty,
+      localFiles: [],
+      localFolders: localFolders("Archive", "Other"),
+      localFolderScanComplete: true,
+    })).toBeNull();
+
+    const nestedRemote = envelope({
+      folders: [
+        { id: "notes", name: "Notes" },
+        { id: "child", name: "Child", parentId: "notes" },
+      ],
+      folderAnchors: [
+        folderAnchor("notes", "Notes"),
+        folderAnchor("child", "Notes/Child", "notes"),
+      ],
+    });
+    expect(buildEmptyFolderResolutionSnapshotV1("Notes", {
+      envelope: nestedRemote,
+      localFiles: [],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    })).toBeNull();
+
+    const movedRemote = envelope({
+      folders: [{ id: "notes", name: "Cloud" }],
+      folderAnchors: [folderAnchor("notes", "Notes")],
+    });
+    expect(buildEmptyFolderResolutionSnapshotV1("Notes", {
+      envelope: movedRemote,
+      localFiles: [],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    })).toBeNull();
+  });
+
+  it("binds the review revision to the exact state and candidate set", () => {
+    const current = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      folderAnchors: [folderAnchor("notes", "Notes")],
+    });
+    const first = buildEmptyFolderResolutionSnapshotV1("Notes", {
+      envelope: current,
+      localFiles: [],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    });
+    const changedCandidates = buildEmptyFolderResolutionSnapshotV1("Notes", {
+      envelope: current,
+      localFiles: [],
+      localFolders: localFolders("Other"),
+      localFolderScanComplete: true,
+    });
+    const changedEnvelope = structuredClone(current);
+    changedEnvelope.meta.commitSeq++;
+    changedEnvelope.remoteIndex.itemsById.notes.eTag = "etag-notes-new";
+    const changedRemote = buildEmptyFolderResolutionSnapshotV1("Notes", {
+      envelope: changedEnvelope,
+      localFiles: [],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    });
+
+    expect(first).not.toBeNull();
+    expect(changedCandidates).not.toBeNull();
+    expect(changedRemote).not.toBeNull();
+    expect(first!.revision).not.toBe(changedCandidates!.revision);
+    expect(first!.revision).not.toBe(changedRemote!.revision);
   });
 
   it("never turns a case-only folder spelling change into a delete", () => {

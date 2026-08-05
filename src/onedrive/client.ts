@@ -1618,19 +1618,19 @@ export class OneDriveClient {
   }
 
   /** Delete a file or folder.
-   *  @param eTag  When set, the DELETE includes an If-Match header. If the
-   *               file has been modified remotely since the plan was generated,
-   *               the server returns 412 and the caller routes to conflict. */
+   *  @param matchTag  When set, the DELETE includes an If-Match header. Use a
+   *                   folder cTag for an empty-folder delete because its eTag
+   *                   does not reliably change when descendants change. */
   async deleteItem(
     vaultName: string,
     itemPath: string,
-    eTag?: string,
+    matchTag?: string,
     driveItemId?: string,
   ): Promise<void> {
     const apiPath = driveItemId
       ? `/me/drive/items/${encodeURIComponent(driveItemId)}`
       : APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), itemPath);
-    await this.request("DELETE", apiPath, undefined, undefined, undefined, eTag);
+    await this.request("DELETE", apiPath, undefined, undefined, undefined, matchTag);
   }
 
   /** Rename a file on OneDrive without re-uploading content.

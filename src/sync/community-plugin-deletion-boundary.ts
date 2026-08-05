@@ -298,7 +298,7 @@ export function protectCommunityPluginPlan(
         : false;
     if (
       item.type === SyncActionType.FolderDeferred
-      && item.reason === "reason.identityMove.deferred"
+      && item.reason?.startsWith("reason.identityMove.") === true
       && restoreWhollyAbsentLocal
     ) {
       const remote = currentRemoteByPath.get(item.path);

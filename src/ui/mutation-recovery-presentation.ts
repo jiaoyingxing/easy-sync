@@ -17,6 +17,9 @@ export interface MutationRecoveryDisplayState {
   retryAt: number | null;
   firstPath: string | null;
   blockReason: MutationRecoveryBlockReason | null;
+  blockedOperationId: string | null;
+  /** Synchronous path/intent eligibility only; no remote fact is inferred here. */
+  manualResolutionAvailable?: boolean;
 }
 
 type Translator = (

@@ -51,18 +51,23 @@ export function remoteContentMatchesBase(
   );
 }
 
-const OBSIDIAN_MANAGED_CONFIG_PATHS = new Set([
-  ".obsidian/app.json",
-  ".obsidian/appearance.json",
-  ".obsidian/hotkeys.json",
-  ".obsidian/core-plugins.json",
-  ".obsidian/community-plugins.json",
+const OBSIDIAN_MANAGED_CONFIG_FILES = new Set([
+  "app.json",
+  "appearance.json",
+  "hotkeys.json",
+  "core-plugins.json",
+  "community-plugins.json",
 ]);
 
-export function isObsidianManagedConfigPath(path: string): boolean {
+export function isObsidianManagedConfigPath(
+  path: string,
+  configDir = ".obsidian",
+): boolean {
   // These files are live host-owned state. Their absence is not a durable
   // delete signal, so the present side restores the missing side.
-  return OBSIDIAN_MANAGED_CONFIG_PATHS.has(path);
+  const normalizedDir = configDir.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  if (!normalizedDir || !path.startsWith(`${normalizedDir}/`)) return false;
+  return OBSIDIAN_MANAGED_CONFIG_FILES.has(path.slice(normalizedDir.length + 1));
 }
 
 /**

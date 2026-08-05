@@ -1,6 +1,7 @@
 import {
   ButtonComponent,
   ItemView,
+  Notice,
   TFile,
   WorkspaceLeaf,
   setIcon,
@@ -26,6 +27,8 @@ import {
 } from "../sync/sync-progress";
 import type { PendingIssue, SyncHistoryEntry } from "../sync/state-manager";
 import { ConfirmModal } from "./confirm-modal";
+import { EmptyFolderResolutionModal } from "./empty-folder-resolution-modal";
+import { MutationRecoveryResolutionModal } from "./mutation-recovery-resolution-modal";
 import { ConflictDetailModal } from "./conflict-detail-modal";
 import {
   RIBBON_STATUS_ICONS,
@@ -408,6 +411,18 @@ export function formatPendingIssueChipLabel(
   return t("syncView.fileStatus.error");
 }
 
+export function formatPendingIssueActionLabel(
+  actionType: SyncActionType,
+  t: (key: string) => string,
+): string {
+  return t(
+    actionType === SyncActionType.RetryLater
+      || actionType === SyncActionType.FolderDeferred
+      ? "syncView.issues.recheck"
+      : "syncView.issues.retry",
+  );
+}
+
 export const SYNC_VIEW_TYPE = "easy-sync-detail";
 
 export function buildSyncViewContentKey(
@@ -418,7 +433,7 @@ export function buildSyncViewContentKey(
   const runKey = `run:${input.isRunning ? 1 : 0}:${input.canCancel ? 1 : 0}`;
   const recovery = input.mutationRecovery;
   const recoveryKey = recovery
-    ? `recovery:${recovery.kind}:${recovery.total}:${recovery.settled}:${recovery.remaining}:${recovery.retryAt ?? ""}:${recovery.blockReason ?? ""}:${recovery.firstPath ?? ""}`
+    ? `recovery:${recovery.kind}:${recovery.total}:${recovery.settled}:${recovery.remaining}:${recovery.retryAt ?? ""}:${recovery.blockReason ?? ""}:${recovery.blockedOperationId ?? ""}:${recovery.manualResolutionAvailable ? 1 : 0}:${recovery.firstPath ?? ""}`
     : "recovery:none";
   const historyIds = input.history.map((entry) => {
     const itemRecovery = entry.recovery;
@@ -447,7 +462,7 @@ export function buildSyncViewContentKey(
   }
   if (input.bodyMode === "pending") {
     const issues = input.pendingIssues
-      .map((issue) => `${issue.actionType}:${issue.path}:${issue.updatedAt}:${issue.reason ?? ""}`)
+      .map((issue) => `${issue.actionType}:${issue.issueCode ?? ""}:${issue.path}:${issue.updatedAt}:${issue.reason ?? ""}`)
       .join("|");
     const conflicts = input.conflicts
       .map((item) => `${item.type}:${item.path}:${item.reason ?? ""}`)
@@ -528,6 +543,8 @@ export class EasySyncSyncView extends ItemView {
   private currentFileTextEl: HTMLElement | null = null;
   private currentByteProgressEl: HTMLElement | null = null;
   private statusDetailMode: "timestamp" | "current-file" | "recovery" | null = null;
+  private emptyFolderResolutionOpening = false;
+  private mutationRecoveryResolutionOpening = false;
 
   constructor(leaf: WorkspaceLeaf, plugin: EasySyncPlugin) {
     super(leaf);
@@ -947,13 +964,25 @@ export class EasySyncSyncView extends ItemView {
     } else if (state.isLoggedIn) {
       new ButtonComponent(actions)
         .setButtonText(t(
-          state.mutationRecovery
-            ? "syncView.recovery.checkAgain"
+          state.mutationRecovery?.kind === "blocked"
+            && state.mutationRecovery.blockReason === "facts-changed"
+            && state.mutationRecovery.manualResolutionAvailable === true
+            ? "syncView.recovery.reviewAndResolve"
+            : state.mutationRecovery
+              ? "syncView.recovery.checkAgain"
             : "command.syncNow",
         ))
         .setCta()
         .setDisabled(state.isInitializing)
         .onClick(() => {
+          if (
+            state.mutationRecovery?.kind === "blocked"
+            && state.mutationRecovery.blockReason === "facts-changed"
+            && state.mutationRecovery.manualResolutionAvailable === true
+          ) {
+            void this.openMutationRecoveryResolution();
+            return;
+          }
           void this.plugin.startManualSync();
         });
     } else {
@@ -1199,7 +1228,13 @@ export class EasySyncSyncView extends ItemView {
         communityPluginEnablementPending,
       );
     }
-    for (const issue of failures) this.renderPendingIssue(section, issue, true);
+    for (const issue of failures) {
+      this.renderPendingIssue(
+        section,
+        issue,
+        communityPluginEnablementPending === 0,
+      );
+    }
     for (const conflict of conflicts) this.renderConflictItem(section, conflict);
     if (pendingDeletes.length > 1) {
       const t = this.plugin.i18n.t.bind(this.plugin.i18n);
@@ -1288,9 +1323,116 @@ export class EasySyncSyncView extends ItemView {
       });
     }
     if (retryable) {
-      this.createActionChip(actions, t("syncView.issues.retry"), "accent", () => {
+      if (issue.issueCode === "anchored-folder-missing-local") {
+        this.createActionChip(
+          actions,
+          t("syncView.emptyFolder.resolve"),
+          "accent",
+          () => {
+            void this.openEmptyFolderResolution(issue.path);
+          },
+        );
+        return;
+      }
+      this.createActionChip(actions, formatPendingIssueActionLabel(
+        issue.actionType,
+        t,
+      ), "accent", () => {
         void this.plugin.startManualSync();
       });
+    }
+  }
+
+  private async openEmptyFolderResolution(path: string): Promise<void> {
+    if (this.emptyFolderResolutionOpening) return;
+    this.emptyFolderResolutionOpening = true;
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    try {
+      const snapshot = await this.plugin.getEmptyFolderResolutionSnapshot(path);
+      if (!snapshot) {
+        new Notice(t("notice.emptyFolder.changed", { path }));
+        return;
+      }
+      const choice = await new EmptyFolderResolutionModal(
+        this.plugin.app,
+        snapshot,
+        t,
+      ).awaitChoice();
+      if (!choice) return;
+      if (choice.action === "restore") {
+        await this.plugin.restoreReviewedEmptyFolder(snapshot);
+        return;
+      }
+      if (choice.action === "bind") {
+        await this.plugin.bindReviewedEmptyFolderRename(
+          snapshot,
+          choice.candidatePath,
+        );
+        return;
+      }
+      const confirmed = await new ConfirmModal(
+        this.plugin.app,
+        t("syncView.emptyFolder.deleteConfirmTitle", { path }),
+        null,
+        t("syncView.emptyFolder.deleteConfirm"),
+        t("confirm.cancel"),
+        t,
+        {
+          message: t("syncView.emptyFolder.deleteConfirmMessage", { path }),
+          warning: t("syncView.emptyFolder.deleteConfirmWarning"),
+          danger: true,
+        },
+      ).awaitConfirm();
+      if (!confirmed) return;
+      await this.plugin.deleteReviewedEmptyRemoteFolder(snapshot);
+    } finally {
+      this.emptyFolderResolutionOpening = false;
+    }
+  }
+
+  private async openMutationRecoveryResolution(): Promise<void> {
+    if (this.mutationRecoveryResolutionOpening) return;
+    this.mutationRecoveryResolutionOpening = true;
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    try {
+      const snapshot = await this.plugin.getMutationRecoveryResolutionSnapshot();
+      if (!snapshot) {
+        new Notice(t("notice.mutationResolution.unavailable"));
+        return;
+      }
+      const choice = await new MutationRecoveryResolutionModal(
+        this.plugin.app,
+        snapshot,
+        t,
+      ).awaitChoice();
+      if (!choice) return;
+      const option = choice === "keep-local"
+        ? snapshot.keepLocal
+        : snapshot.keepRemote;
+      if (option.deletesOtherSide) {
+        const confirmed = await new ConfirmModal(
+          this.plugin.app,
+          t("syncView.mutationResolution.deleteConfirmTitle"),
+          null,
+          t("syncView.mutationResolution.deleteConfirm"),
+          t("confirm.cancel"),
+          t,
+          {
+            message: t("syncView.mutationResolution.deleteConfirmMessage", {
+              path: snapshot.path,
+              choice: choice === "keep-local"
+                ? t("syncView.mutationResolution.keepLocal")
+                : t("syncView.mutationResolution.keepRemote"),
+            }),
+            warning: t("syncView.mutationResolution.deleteConfirmWarning"),
+            danger: true,
+          },
+        ).awaitConfirm();
+        if (!confirmed) return;
+      }
+      await this.plugin.resolveMutationRecovery(snapshot, choice);
+    } finally {
+      this.mutationRecoveryResolutionOpening = false;
     }
   }
 

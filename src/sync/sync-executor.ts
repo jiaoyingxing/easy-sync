@@ -55,6 +55,10 @@ import {
 } from "./file-decision-planner-v2";
 import { StateManager } from "./state-manager";
 import type { PendingIssue } from "./state-manager";
+import {
+  buildEmptyFolderResolutionSnapshotV1,
+  type EmptyFolderResolutionSnapshotV1,
+} from "./empty-folder-resolution";
 import type {
   BaseFileEntry,
   CloudBaseline,
@@ -73,6 +77,11 @@ import type {
   MutationCheckpointV1,
   MutationLedgerEntryV1,
   MutationRecoveryRunSummary,
+  ManualMutationResolutionChoiceV1,
+  ManualMutationResolutionSnapshotV1,
+  ManualMutationResolutionV1,
+  ManualMutationResolutionLocalFactV1,
+  ManualMutationResolutionRemoteFactV1,
   SyncAttention,
   V2ActivationReviewKind,
 } from "./types";
@@ -396,6 +405,11 @@ type RemoteFolderInspection =
   | { status: "missing" }
   | { status: "folder"; entry: RemoteFolderEntry }
   | { status: "file" };
+
+type ExactEmptyRemoteFolderInspection =
+  | { status: "exact"; entry: RemoteFolderEntry; contentTag?: string }
+  | { status: "not-empty" }
+  | { status: "changed" };
 
 const SMALL_UPLOAD_CONCURRENCY = 5;
 const CONCURRENT_UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
@@ -757,6 +771,256 @@ export class SyncExecutor {
       left.localeCompare(right));
   }
 
+  /** Cheap eligibility gate for the fixed recovery CTA; it grants no I/O or mutation. */
+  canResolveMutationRecovery(preferredOperationId?: string): boolean {
+    if (
+      !this.state.isV2StateActive
+      || this.state.hasMutationLedgerCorruption
+      || this.state.hasV2StateLoadRecoveryBlock
+      || this.state.hasV2RemoteScopeRecovery
+    ) return false;
+    const records = this.state.mutationLedger;
+    const record = preferredOperationId
+      ? records.find((entry) => entry.intent.operationId === preferredOperationId)
+      : records[0];
+    if (!record || record.manualResolution || isFolderMutationIntent(record.intent)) {
+      return false;
+    }
+    return this.manualResolutionPaths(record.intent).every((path) =>
+      this.isManualResolutionPathEligible(path));
+  }
+
+  /** Read-only facts for the narrow empty-folder resolution UI. */
+  async getEmptyFolderResolutionSnapshot(
+    path: string,
+  ): Promise<EmptyFolderResolutionSnapshotV1 | null> {
+    return this.buildCurrentEmptyFolderResolutionSnapshot(path);
+  }
+
+  /** Read and hash one root recovery item without authorizing a mutation. */
+  async getMutationRecoveryResolutionSnapshot(
+    preferredOperationId?: string,
+  ): Promise<ManualMutationResolutionSnapshotV1 | null> {
+    if (
+      this.running
+      || this.hasSideActionsInFlight
+      || !this.state.isV2StateActive
+      || this.state.hasMutationLedgerCorruption
+      || this.state.hasV2StateLoadRecoveryBlock
+      || this.state.hasV2RemoteScopeRecovery
+    ) return null;
+    const remoteScope = await this.onedrive.initVaultScope(this.vaultName);
+    const scope: SyncScope = {
+      accountId: this.state.boundAccountId,
+      ...remoteScope,
+    };
+    if (!this.state.remoteScope || !sameSyncScope(this.state.remoteScope, scope)) {
+      return null;
+    }
+    const records = this.state.mutationLedger;
+    const persisted = preferredOperationId
+      ? records.find((entry) => entry.intent.operationId === preferredOperationId)
+      : records[0];
+    if (!persisted || persisted.manualResolution) return null;
+    const record = this.state.prepareMutationRecoveryRecord(persisted, scope);
+    if (!record || isFolderMutationIntent(record.intent)) return null;
+    return this.buildCurrentMutationRecoveryResolutionSnapshot(record);
+  }
+
+  /** Persist and execute one exact user choice through the existing ledger. */
+  async resolveMutationRecovery(
+    reviewed: Readonly<ManualMutationResolutionSnapshotV1>,
+    choice: ManualMutationResolutionChoiceV1,
+  ): Promise<boolean> {
+    let resolved = false;
+    const localExists = reviewed.local.some((fact) => fact.exists);
+    const remoteExists = reviewed.remote.some((fact) => fact.exists);
+    const actionType = reviewed.sourcePath
+      ? choice === "keep-local"
+        ? SyncActionType.RenameRemote
+        : SyncActionType.MoveLocalFile
+      : choice === "keep-local"
+        ? localExists ? SyncActionType.Upload : SyncActionType.DeleteRemote
+        : remoteExists ? SyncActionType.Download : SyncActionType.DeleteLocal;
+    await this.enqueueSideAction(
+      reviewed.path,
+      actionType,
+      async (operationEpoch) => {
+        const persisted = this.state.mutationLedger.find(
+          (entry) => entry.intent.operationId === reviewed.sourceOperationId,
+        );
+        if (!persisted || persisted.manualResolution) return;
+        const record = this.activeSyncScope
+          ? this.state.prepareMutationRecoveryRecord(persisted, this.activeSyncScope)
+          : null;
+        if (!record || isFolderMutationIntent(record.intent)) return;
+        const current = await this.buildCurrentMutationRecoveryResolutionSnapshot(record);
+        const option = choice === "keep-local" ? current?.keepLocal : current?.keepRemote;
+        if (
+          !current
+          || current.factsDigest !== reviewed.factsDigest
+          || !option?.available
+          || !this.canContinue(operationEpoch)
+        ) {
+          this.notice("notice.mutationResolution.changed", { path: reviewed.path });
+          return;
+        }
+        const resolution = await this.buildManualMutationResolution(
+          record,
+          current,
+          choice,
+        );
+        if (!resolution) return;
+        if (!await this.state.attachManualMutationResolution(persisted, resolution)) {
+          this.notice("notice.mutationResolution.changed", { path: reviewed.path });
+          return;
+        }
+        const attached = this.state.mutationLedger.find(
+          (entry) => entry.intent.operationId === reviewed.sourceOperationId,
+        );
+        if (!attached?.manualResolution) return;
+        await this.resumeManualMutationResolution(attached, operationEpoch, true);
+        resolved = !this.state.mutationLedger.some(
+          (entry) => entry.intent.operationId === reviewed.sourceOperationId,
+        );
+        if (resolved) {
+          this.notice("notice.mutationResolution.completed", { path: reviewed.path });
+        }
+        return resolved;
+      },
+      undefined,
+      { skipMutationRecovery: true },
+    );
+    return resolved;
+  }
+
+  /** Restore the exact reviewed remote empty folder at its committed local path. */
+  async restoreReviewedEmptyFolder(
+    reviewed: Readonly<EmptyFolderResolutionSnapshotV1>,
+  ): Promise<void> {
+    if (this.stopSideActionForStateRecovery()) return;
+    return this.enqueueSideAction(
+      reviewed.path,
+      SyncActionType.CreateLocalFolder,
+      async (operationEpoch) => {
+        const current = await this.runReviewedEmptyFolderMutation(
+          reviewed,
+          "createLocalFolder",
+          operationEpoch,
+          async (latest) => {
+            await this.createLocalFolder(latest.path);
+            if (
+              (await this.inspectLocalFolder(latest.path)).status !== "present"
+              || !await this.isLocalFolderEmpty(latest.path)
+            ) {
+              throw new Error(`Local empty-folder restore read-back failed: ${latest.path}`);
+            }
+            return folderMutationCheckpoint({
+              path: latest.path,
+              driveId: latest.remoteId,
+              parentId: latest.parentRemoteId,
+              name: folderName(latest.path),
+              eTag: latest.remoteETag,
+              cTag: latest.remoteCTag,
+            });
+          },
+        );
+        if (!current) return;
+        this.notice("notice.emptyFolder.restored", { path: current.path });
+        return true;
+      },
+    );
+  }
+
+  /** Bind one explicitly selected empty local shell to the reviewed identity. */
+  async bindReviewedEmptyFolderRename(
+    reviewed: Readonly<EmptyFolderResolutionSnapshotV1>,
+    candidatePath: string,
+  ): Promise<boolean> {
+    if (this.stopSideActionForStateRecovery()) return false;
+    let bound = false;
+    await this.enqueueSideAction(
+      reviewed.path,
+      SyncActionType.MoveRemoteFolder,
+      async () => {
+        const current = await this.verifyReviewedEmptyFolderResolution(reviewed);
+        if (!current || !current.candidatePaths.includes(candidatePath)) return;
+        if (!await this.state.recordLocalFolderMoveHint(
+          current.path,
+          candidatePath,
+        )) {
+          this.notice("notice.emptyFolder.changed", { path: current.path });
+          return;
+        }
+        bound = true;
+        this.notice("notice.emptyFolder.bound", {
+          path: current.path,
+          target: candidatePath,
+        });
+        return true;
+      },
+    );
+    return bound;
+  }
+
+  /** Delete the exact reviewed remote empty folder after destructive confirmation. */
+  async deleteReviewedEmptyRemoteFolder(
+    reviewed: Readonly<EmptyFolderResolutionSnapshotV1>,
+  ): Promise<void> {
+    if (this.stopSideActionForStateRecovery()) return;
+    if (!reviewed.remoteCTag) {
+      this.notice("notice.emptyFolder.deleteUnavailable", {
+        path: reviewed.path,
+      });
+      return;
+    }
+    return this.enqueueSideAction(
+      reviewed.path,
+      SyncActionType.DeleteRemoteFolder,
+      async (operationEpoch) => {
+        const current = await this.runReviewedEmptyFolderMutation(
+          reviewed,
+          "deleteRemoteFolder",
+          operationEpoch,
+          async (latest) => {
+            if (!latest.remoteCTag) {
+              throw new MutationNotAppliedError(
+                this.t("notice.emptyFolder.deleteUnavailable", {
+                  path: latest.path,
+                }),
+              );
+            }
+            try {
+              await this.onedrive.deleteItem(
+                this.vaultName,
+                latest.path,
+                latest.remoteCTag,
+                latest.remoteId,
+              );
+            } catch (error) {
+              if (
+                error instanceof OneDriveError
+                && isRemoteMutationConflict(error)
+              ) {
+                throw new MutationNotAppliedError(
+                  this.t("notice.emptyFolder.changed"),
+                );
+              }
+              throw error;
+            }
+            if (await this.onedrive.getDriveItemMetadataById(latest.remoteId)) {
+              throw new Error(`Remote empty-folder delete read-back failed: ${latest.path}`);
+            }
+            return folderDeleteCheckpoint(latest.path, latest.remoteId);
+          },
+        );
+        if (!current) return;
+        this.notice("notice.emptyFolder.deleted", { path: current.path });
+        return true;
+      },
+    );
+  }
+
   get hasSideActionsInFlight(): boolean {
     return this.sideActionRunning || this.queuedSideActionPaths.size > 0;
   }
@@ -813,6 +1077,340 @@ export class SyncExecutor {
     return scanner.inspectFile(path);
   }
 
+  private async inspectManualResolutionRemote(
+    path: string,
+  ): Promise<{
+      fact: ManualMutationResolutionRemoteFactV1;
+      entry?: RemoteFileEntry;
+    }> {
+    const initial = await this.inspectRemotePath(path);
+    if (!initial) return { fact: { path, exists: false } };
+    let hash = initial.sha256Hash?.toLowerCase();
+    if (!hash) {
+      const bytes = await this.onedrive.downloadFile(
+        this.vaultName,
+        path,
+        initial.downloadUrl,
+        initial.driveId,
+        initial.size,
+      );
+      if (bytes.byteLength !== initial.size) {
+        throw new Error(`Remote recovery review size changed: ${path}`);
+      }
+      hash = await sha256Hex(bytes);
+      const verified = await this.inspectRemotePath(path);
+      if (
+        !verified
+        || verified.driveId !== initial.driveId
+        || verified.eTag !== initial.eTag
+        || verified.size !== initial.size
+      ) throw new Error(`Remote recovery review changed: ${path}`);
+    }
+    const entry = { ...initial, sha256Hash: hash };
+    return {
+      fact: {
+        path,
+        exists: true,
+        driveId: entry.driveId,
+        eTag: entry.eTag,
+        hash,
+        size: entry.size,
+      },
+      entry,
+    };
+  }
+
+  private async buildCurrentMutationRecoveryResolutionSnapshot(
+    record: Readonly<MutationLedgerEntryV1>,
+  ): Promise<ManualMutationResolutionSnapshotV1 | null> {
+    if (isFolderMutationIntent(record.intent)) return null;
+    const paths = this.manualResolutionPaths(record.intent);
+    if (paths.some((path) => !this.isManualResolutionPathEligible(path))) return null;
+    const local: ManualMutationResolutionLocalFactV1[] = [];
+    const remote: ManualMutationResolutionRemoteFactV1[] = [];
+    for (const path of paths) {
+      const [localInspection, remoteInspection] = await Promise.all([
+        this.inspectLocalPath(path),
+        this.inspectManualResolutionRemote(path),
+      ]);
+      if (!localInspection || localInspection.status === "uncertain") return null;
+      local.push(localInspection.status === "present" && localInspection.entry
+        ? {
+            path,
+            exists: true,
+            hash: localInspection.entry.hash,
+            size: localInspection.entry.size,
+          }
+        : { path, exists: false });
+      remote.push(remoteInspection.fact);
+    }
+
+    let keepLocal = { available: false, deletesOtherSide: false };
+    let keepRemote = { available: false, deletesOtherSide: false };
+    let identical = false;
+    if (!record.intent.sourcePath) {
+      const localFact = local[0];
+      const remoteFact = remote[0];
+      identical = localFact.exists === remoteFact.exists
+        && (!localFact.exists || (
+          localFact.hash === remoteFact.hash
+          && localFact.size === remoteFact.size
+        ));
+      keepLocal = {
+        available: true,
+        deletesOtherSide: !localFact.exists && remoteFact.exists,
+      };
+      keepRemote = {
+        available: true,
+        deletesOtherSide: localFact.exists && !remoteFact.exists,
+      };
+    } else {
+      const localPresent = local.filter((fact) => fact.exists);
+      const remotePresent = remote.filter((fact) => fact.exists);
+      const pureMove = localPresent.length === 1
+        && remotePresent.length === 1
+        && localPresent[0].path !== remotePresent[0].path
+        && localPresent[0].hash === remotePresent[0].hash
+        && localPresent[0].size === remotePresent[0].size;
+      keepLocal = { available: pureMove, deletesOtherSide: false };
+      keepRemote = { available: pureMove, deletesOtherSide: false };
+    }
+
+    const digestInput = {
+      version: 1 as const,
+      sourceOperationId: record.intent.operationId,
+      scope: record.intent.scope,
+      previousAction: record.intent.action,
+      path: record.intent.path,
+      sourcePath: record.intent.sourcePath ?? null,
+      local,
+      remote,
+    };
+    return {
+      version: 1,
+      sourceOperationId: digestInput.sourceOperationId,
+      scope: digestInput.scope,
+      previousAction: digestInput.previousAction,
+      path: digestInput.path,
+      ...(record.intent.sourcePath ? { sourcePath: record.intent.sourcePath } : {}),
+      local,
+      remote,
+      factsDigest: await sha256Hex(
+        new TextEncoder().encode(JSON.stringify(digestInput)).buffer,
+      ),
+      identical,
+      keepLocal,
+      keepRemote,
+    };
+  }
+
+  private manualResolutionPaths(intent: MutationIntent): string[] {
+    return [...new Set([
+      intent.sourcePath,
+      intent.path,
+    ].filter((path): path is string => Boolean(path)))].sort((left, right) =>
+      left.localeCompare(right));
+  }
+
+  private isManualResolutionPathEligible(path: string): boolean {
+    const configDir = getConfigDir(this.scanner.vault);
+    return this.shouldIncludeRemotePath(path)
+      && !isObsidianManagedConfigPath(path, configDir)
+      && !isEasySyncSelfSyncFilePath(path, configDir)
+      && classifyCommunityPluginManagedPath(path, configDir)?.kind === undefined;
+  }
+
+  private async buildCurrentEmptyFolderResolutionSnapshot(
+    path: string,
+  ): Promise<EmptyFolderResolutionSnapshotV1 | null> {
+    const pending = this.state.pendingIssues.find((issue) =>
+      issue.path === path
+        && issue.actionType === SyncActionType.FolderDeferred
+        && issue.issueCode === "anchored-folder-missing-local",
+    );
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!pending || !envelope) return null;
+
+    const scan = await this.scanner.scanAll();
+    if (!scan.complete || !scan.folderScanComplete) return null;
+    const configDir = getConfigDir(this.scanner.vault);
+    const policy = this.communityPluginSyncPolicy;
+    const structuredCommunityPluginPath = policy.files.mode !== "none"
+      ? `${configDir}/community-plugins.json`
+      : null;
+    const includeFilePath = (candidate: string): boolean =>
+      candidate !== structuredCommunityPluginPath
+        && this.shouldIncludeRemotePath(candidate)
+        && isCommunityPluginPathSelectedByPolicy(
+          candidate,
+          policy,
+          configDir,
+        );
+    const snapshot = buildEmptyFolderResolutionSnapshotV1(path, {
+      envelope,
+      localFiles: scan.entries.filter((entry) => includeFilePath(entry.path)),
+      localFolders: scan.folders,
+      localFolderScanComplete: scan.folderScanComplete,
+      localMoveHints: this.state.localFolderMoveHints,
+      includeFilePath,
+      includeFolderPath: (candidate) =>
+        this.scanner.shouldSyncFolderPath(candidate),
+      preserveFolderPath: (candidate) =>
+        !this.scanner.shouldSyncFolderPath(candidate)
+        || isCommunityPluginFolderPreservedByPolicy(
+          candidate,
+          policy,
+          configDir,
+          "easy-sync",
+        ),
+    });
+    if (!snapshot) return null;
+    const live = await this.inspectExactEmptyRemoteFolder(snapshot);
+    if (live.status !== "exact") return null;
+    if (!live.contentTag || snapshot.remoteCTag === live.contentTag) {
+      return snapshot;
+    }
+    return {
+      ...snapshot,
+      remoteCTag: live.contentTag,
+      revision: JSON.stringify({
+        baseRevision: snapshot.revision,
+        remoteCTag: live.contentTag,
+      }),
+    };
+  }
+
+  private async verifyReviewedEmptyFolderResolution(
+    reviewed: Readonly<EmptyFolderResolutionSnapshotV1>,
+  ): Promise<EmptyFolderResolutionSnapshotV1 | null> {
+    const current = await this.buildCurrentEmptyFolderResolutionSnapshot(
+      reviewed.path,
+    );
+    if (
+      !current
+      || current.revision !== reviewed.revision
+      || !this.activeSyncScope
+      || !sameSyncScope(current.scope, this.activeSyncScope)
+    ) {
+      this.notice("notice.emptyFolder.changed", { path: reviewed.path });
+      return null;
+    }
+    return current;
+  }
+
+  private async runReviewedEmptyFolderMutation(
+    reviewed: Readonly<EmptyFolderResolutionSnapshotV1>,
+    action: "createLocalFolder" | "deleteRemoteFolder",
+    operationEpoch: number,
+    mutate: (
+      current: Readonly<EmptyFolderResolutionSnapshotV1>,
+    ) => Promise<MutationCheckpointV1>,
+  ): Promise<EmptyFolderResolutionSnapshotV1 | null> {
+    const current = await this.verifyReviewedEmptyFolderResolution(reviewed);
+    if (!current || !this.activeSyncScope) return null;
+    const parent = this.currentRemoteFolderNode(current.parentRemoteId);
+    const intent: FolderMutationIntentV2 = {
+      version: 2,
+      operationId: `${Date.now()}-${++this.mutationSequence}-${action}`,
+      planRevision: this.state.planReviewRevision,
+      scope: { ...this.activeSyncScope },
+      action,
+      path: current.path,
+      folderId: current.remoteId,
+      expectedLocal: { exists: false },
+      expectedRemote: {
+        exists: true,
+        driveId: current.remoteId,
+        parentId: current.parentRemoteId,
+        eTag: current.remoteETag,
+      },
+      expectedParent: {
+        driveId: current.parentRemoteId,
+        path: current.parentPath,
+        eTag: parent?.eTag,
+      },
+      createdAt: Date.now(),
+    };
+    try {
+      const committed = await this.runDurableSideMutation(
+        intent,
+        operationEpoch,
+        async () => {
+          const latest = await this.buildCurrentEmptyFolderResolutionSnapshot(
+            current.path,
+          );
+          const local = await this.inspectLocalFolder(current.path);
+          if (
+            latest?.revision !== current.revision
+            || local.status !== "missing"
+          ) {
+            throw new MutationNotAppliedError(
+              this.t("notice.emptyFolder.changed"),
+            );
+          }
+          return mutate(current);
+        },
+      );
+      return committed ? current : null;
+    } catch (error) {
+      if (!(error instanceof MutationNotAppliedError)) throw error;
+      this.notice("notice.emptyFolder.changed", { path: current.path });
+      return null;
+    }
+  }
+
+  private currentRemoteFolderNode(remoteId: string):
+    { eTag?: string } | undefined {
+    const node = this.state.getCommittedV2Envelope()?.remoteIndex.itemsById[remoteId];
+    return node?.kind === "folder" ? node : undefined;
+  }
+
+  private async inspectExactEmptyRemoteFolder(
+    reviewed: Readonly<Pick<
+      EmptyFolderResolutionSnapshotV1,
+      "path" | "remoteId" | "remoteETag" | "remoteCTag" | "parentRemoteId"
+    >>,
+  ): Promise<ExactEmptyRemoteFolderInspection> {
+    const readExactIdentity = async (): Promise<DriveItem | null> => {
+      const [byId, byPath] = await Promise.all([
+        this.onedrive.getDriveItemMetadataById(reviewed.remoteId),
+        this.onedrive.getDriveItemMetadata(this.vaultName, reviewed.path),
+      ]);
+      if (
+        !byId?.folder
+        || !byPath?.folder
+        || byId.id !== reviewed.remoteId
+        || byPath.id !== reviewed.remoteId
+        || byId.parentReference?.id !== reviewed.parentRemoteId
+        || byPath.parentReference?.id !== reviewed.parentRemoteId
+        || byId.eTag !== reviewed.remoteETag
+        || byPath.eTag !== reviewed.remoteETag
+        || byId.cTag !== byPath.cTag
+        || (reviewed.remoteCTag !== undefined
+          && byId.cTag !== reviewed.remoteCTag)
+      ) return null;
+      return byId;
+    };
+
+    const first = await readExactIdentity();
+    if (!first) return { status: "changed" };
+    const children = await this.onedrive.listFolderChildrenById(
+      reviewed.remoteId,
+    );
+    if (children.length !== 0) return { status: "not-empty" };
+    const final = await readExactIdentity();
+    if (
+      !final
+      || final.eTag !== first.eTag
+      || final.cTag !== first.cTag
+    ) return { status: "changed" };
+    return {
+      status: "exact",
+      entry: toRemoteFolderEntry(reviewed.path, final),
+      ...(final.cTag ? { contentTag: final.cTag } : {}),
+    };
+  }
+
   private async inspectLocalFolder(path: string): Promise<LocalFolderInspection> {
     const vault = this.scanner.vault as LocalScanner["vault"] & {
       getAbstractFileByPath?: (folderPath: string) => unknown;
@@ -866,6 +1464,7 @@ export class SyncExecutor {
         parentId: item.parentReference.id,
         name: item.name,
         eTag: item.eTag,
+        cTag: item.cTag,
       },
     };
   }
@@ -1186,6 +1785,7 @@ export class SyncExecutor {
     item: SyncPlanItem,
     result: SyncResult,
     operationEpoch: number,
+    factsChangedPolicy: "defer" | "throw" = "defer",
   ): Promise<ItemExecutionResult | null> {
     const current = await this.inspectLocalPath(item.path);
     if (!current) return null;
@@ -1193,6 +1793,12 @@ export class SyncExecutor {
       throw new Error(`Local version could not be verified before write: ${item.path}`);
     }
     if (this.localExpectationMatches(item.local, current)) return null;
+
+    if (factsChangedPolicy === "throw") {
+      throw new MutationNotAppliedError(
+        new Error(`Manual download local facts changed: ${item.path}`),
+      );
+    }
 
     const currentEntry = current.status === "present" ? current.entry : undefined;
     if (currentEntry && item.remote) {
@@ -2934,6 +3540,7 @@ export class SyncExecutor {
         const mutationRecovery = await this.recoverMutationLedger(
           syncScope,
           automaticHandlingMetrics,
+          operationEpoch,
         );
         if (this.shouldStop(result, operationEpoch)) return result;
         if (this.localVersionRecoveredDuringLedger) {
@@ -2993,7 +3600,6 @@ export class SyncExecutor {
             "recovery-only V2 round stopped before baseline and planning",
             {
               ...result.mutationRecovery,
-              externalMutations: 0,
             },
           );
           return result;
@@ -4927,6 +5533,7 @@ export class SyncExecutor {
               await this.recoverMutationLedger(
                 syncScope,
                 automaticHandlingMetrics,
+                operationEpoch,
               );
               if (this.shouldStop(result, operationEpoch)) return result;
               if (this.state.mutationLedger.length > 0) {
@@ -5911,6 +6518,9 @@ export class SyncExecutor {
           pendingIssues.push({
             path: item.path,
             actionType: item.type,
+            ...(item.reason === "reason.folder.anchored-folder-missing-local"
+              ? { issueCode: "anchored-folder-missing-local" as const }
+              : {}),
             reason,
             updatedAt: Date.now(),
             fileSize,
@@ -6632,6 +7242,383 @@ export class SyncExecutor {
     };
   }
 
+  private manualLocalExpectation(
+    fact: Readonly<ManualMutationResolutionLocalFactV1>,
+  ): MutationIntentV1["expectedLocal"] {
+    return fact.exists
+      ? { exists: true, hash: fact.hash!, size: fact.size! }
+      : { exists: false };
+  }
+
+  private manualRemoteExpectation(
+    fact: Readonly<ManualMutationResolutionRemoteFactV1>,
+  ): MutationIntentV1["expectedRemote"] {
+    return fact.exists
+      ? {
+          exists: true,
+          driveId: fact.driveId!,
+          eTag: fact.eTag!,
+          size: fact.size!,
+          sha256Hash: fact.hash,
+        }
+      : { exists: false };
+  }
+
+  private async currentManualRemoteEntry(
+    fact: Readonly<ManualMutationResolutionRemoteFactV1>,
+  ): Promise<RemoteFileEntry | undefined> {
+    const current = await this.inspectRemotePath(fact.path);
+    if (!fact.exists) return undefined;
+    if (
+      !current
+      || current.driveId !== fact.driveId
+      || current.eTag !== fact.eTag
+      || current.size !== fact.size
+    ) return undefined;
+    return {
+      ...current,
+      parentId: this.requireKnownRemoteParentId(
+        fact.path,
+        current.parentId,
+      ),
+      sha256Hash: fact.hash,
+    };
+  }
+
+  private async buildManualMutationResolution(
+    record: Readonly<MutationLedgerEntryV1>,
+    snapshot: Readonly<ManualMutationResolutionSnapshotV1>,
+    choice: ManualMutationResolutionChoiceV1,
+  ): Promise<ManualMutationResolutionV1 | null> {
+    if (isFolderMutationIntent(record.intent)) return null;
+    const selectedAt = Date.now();
+    const createIntent = (
+      action: MutationIntentV1["action"],
+      path: string,
+      local: Readonly<ManualMutationResolutionLocalFactV1>,
+      remote: Readonly<ManualMutationResolutionRemoteFactV1>,
+      sourcePath?: string,
+    ): MutationIntentV1 => ({
+      version: 1,
+      operationId: `${selectedAt}-${++this.mutationSequence}-manual-${action}`,
+      planRevision: this.state.planReviewRevision,
+      scope: { ...snapshot.scope },
+      action,
+      path,
+      ...(sourcePath ? { sourcePath } : {}),
+      expectedLocal: this.manualLocalExpectation(local),
+      expectedRemote: this.manualRemoteExpectation(remote),
+      createdAt: selectedAt,
+    });
+    const withReceipt = (
+      intent: MutationIntentV1,
+      checkpoint: MutationCheckpointV1,
+    ): ManualMutationResolutionV1 => ({
+      version: 1,
+      choice,
+      factsDigest: snapshot.factsDigest,
+      selectedAt,
+      externalMutation: false,
+      intent,
+      receipt: {
+        version: 1,
+        operationId: intent.operationId,
+        completedAt: selectedAt,
+        checkpoint,
+      },
+    });
+    const withoutReceipt = (
+      intent: MutationIntentV1,
+    ): ManualMutationResolutionV1 => ({
+      version: 1,
+      choice,
+      factsDigest: snapshot.factsDigest,
+      selectedAt,
+      externalMutation: true,
+      intent,
+      receipt: null,
+    });
+
+    if (!snapshot.sourcePath) {
+      const local = snapshot.local[0];
+      const remote = snapshot.remote[0];
+      if (snapshot.identical) {
+        if (local.exists && remote.exists) {
+          const remoteEntry = await this.currentManualRemoteEntry(remote);
+          if (!remoteEntry) return null;
+          const intent = createIntent("upload", snapshot.path, local, remote);
+          const checkpoint = emptyMutationCheckpoint();
+          checkpoint.baseUpserts.push({
+            path: snapshot.path,
+            hash: local.hash!,
+            size: local.size!,
+            eTag: remote.eTag!,
+          });
+          checkpoint.remoteUpserts.push(remoteEntry);
+          return withReceipt(intent, checkpoint);
+        }
+        const staleRemote = this.state.remoteSnapshot.find(
+          (entry) => entry.path === snapshot.path,
+        );
+        const checkpoint = emptyMutationCheckpoint();
+        checkpoint.baseRemovals.push(snapshot.path);
+        if (staleRemote) {
+          const intent = createIntent("deleteLocal", snapshot.path, local, remote);
+          checkpoint.remoteDeletes.push(snapshot.path);
+          return withReceipt(intent, checkpoint);
+        }
+        return withReceipt(
+          createIntent("deleteLocal", snapshot.path, local, remote),
+          checkpoint,
+        );
+      }
+      const action = choice === "keep-local"
+        ? local.exists ? "upload" : "deleteRemote"
+        : remote.exists ? "download" : "deleteLocal";
+      return withoutReceipt(createIntent(action, snapshot.path, local, remote));
+    }
+
+    const local = snapshot.local.find((fact) => fact.exists);
+    const remote = snapshot.remote.find((fact) => fact.exists);
+    if (
+      !local
+      || !remote
+      || local.path === remote.path
+      || local.hash !== remote.hash
+      || local.size !== remote.size
+    ) return null;
+    return choice === "keep-local"
+      ? withoutReceipt(createIntent(
+          "renameRemote",
+          local.path,
+          local,
+          remote,
+          remote.path,
+        ))
+      : withoutReceipt(createIntent(
+          "moveLocal",
+          remote.path,
+          local,
+          remote,
+          local.path,
+        ));
+  }
+
+  private async resumeManualMutationResolution(
+    record: Readonly<MutationLedgerEntryV1>,
+    operationEpoch: number | undefined,
+    allowExternalMutation: boolean,
+    onExternalMutation?: () => void,
+  ): Promise<void> {
+    const manual = record.manualResolution;
+    if (!manual || isFolderMutationIntent(record.intent)) {
+      throw new Error(`Manual mutation resolution is unavailable: ${record.intent.operationId}`);
+    }
+    if (operationEpoch !== undefined && !this.canContinue(operationEpoch)) {
+      throw new Error(`Manual mutation resolution was cancelled: ${record.intent.operationId}`);
+    }
+    let receipt = manual.receipt;
+    if (receipt) {
+      const receiptMatches = manual.externalMutation
+        ? await this.verifyMutationReceipt({
+            intent: manual.intent,
+            receipt,
+          })
+        : await this.buildCurrentMutationRecoveryResolutionSnapshot(record)
+          .then((current) => current?.factsDigest === manual.factsDigest);
+      if (!receiptMatches) {
+        throw new Error(`Manual mutation receipt no longer matches: ${record.intent.operationId}`);
+      }
+    } else {
+      const outcome = await this.classifyUnreceiptedMutation(manual.intent);
+      if (outcome && outcome !== "not-applied") {
+        receipt = {
+          version: 1,
+          operationId: manual.intent.operationId,
+          completedAt: Date.now(),
+          checkpoint: outcome,
+        };
+      } else if (outcome === "not-applied") {
+        const current = await this.buildCurrentMutationRecoveryResolutionSnapshot(record);
+        if (!current || current.factsDigest !== manual.factsDigest) {
+          throw new Error(
+            `Manual mutation resolution facts changed: ${record.intent.operationId}`,
+          );
+        }
+        if (!allowExternalMutation || operationEpoch === undefined) {
+          throw new Error(`Manual mutation waits for its authorized continuation: ${record.intent.operationId}`);
+        }
+        onExternalMutation?.();
+        try {
+          const checkpoint = await this.executeManualMutationIntentWithCanonicalExecutor(
+            manual.intent,
+            operationEpoch,
+          );
+          receipt = {
+            version: 1,
+            operationId: manual.intent.operationId,
+            completedAt: Date.now(),
+            checkpoint,
+          };
+        } catch (error) {
+          const recovered = await this.classifyUnreceiptedMutation(manual.intent);
+          if (!recovered || recovered === "not-applied") throw error;
+          receipt = {
+            version: 1,
+            operationId: manual.intent.operationId,
+            completedAt: Date.now(),
+            checkpoint: recovered,
+          };
+        }
+      } else {
+        throw new Error(`Manual mutation outcome is ambiguous: ${record.intent.operationId}`);
+      }
+      await this.state.recordManualMutationResolutionReceipt(
+        record.intent.operationId,
+        receipt,
+      );
+    }
+    if (operationEpoch !== undefined && !this.canContinue(operationEpoch)) {
+      throw new Error(`Manual mutation checkpoint waits after cancellation: ${record.intent.operationId}`);
+    }
+    await this.state.commitManualMutationResolutionCheckpoint(
+      record.intent.operationId,
+    );
+  }
+
+  private async executeManualMutationIntentWithCanonicalExecutor(
+    intent: MutationIntentV1,
+    operationEpoch: number,
+  ): Promise<MutationCheckpointV1> {
+    if (!this.canContinue(operationEpoch)) {
+      throw new MutationNotAppliedError(new Error("Manual mutation was cancelled"));
+    }
+    const localEvidencePath = intent.action === "moveLocal"
+      ? intent.sourcePath
+      : intent.path;
+    const remoteEvidencePath = intent.action === "renameRemote"
+      ? intent.sourcePath
+      : intent.path;
+    if (!localEvidencePath || !remoteEvidencePath) {
+      throw new MutationNotAppliedError(new Error("Manual mutation evidence is incomplete"));
+    }
+
+    const [localInspection, remoteInspection] = await Promise.all([
+      this.inspectLocalPath(localEvidencePath),
+      this.inspectRemotePath(remoteEvidencePath),
+    ]);
+    if (
+      !localInspection
+      || !this.inspectionMatchesExpectation(localInspection, intent.expectedLocal)
+      || !this.remoteMatchesExpectation(remoteInspection, intent.expectedRemote)
+    ) {
+      throw new MutationNotAppliedError(new Error("Manual mutation facts changed"));
+    }
+
+    if (intent.action === "renameRemote") {
+      const targetRemote = await this.inspectRemotePath(intent.path);
+      if (targetRemote) {
+        throw new MutationNotAppliedError(new Error("Manual remote move target changed"));
+      }
+    }
+    if (intent.action === "moveLocal") {
+      const [targetLocal, sourceRemote] = await Promise.all([
+        this.inspectLocalPath(intent.path),
+        this.inspectRemotePath(intent.sourcePath!),
+      ]);
+      if (!targetLocal || targetLocal.status !== "missing" || sourceRemote) {
+        throw new MutationNotAppliedError(new Error("Manual local move target changed"));
+      }
+    }
+    if (!this.canContinue(operationEpoch)) {
+      throw new MutationNotAppliedError(new Error("Manual mutation was cancelled"));
+    }
+
+    const local = localInspection.status === "present"
+      ? localInspection.entry
+      : undefined;
+    const remote = remoteInspection;
+    const type = intent.action === "upload"
+      ? SyncActionType.Upload
+      : intent.action === "download"
+        ? SyncActionType.Download
+        : intent.action === "deleteRemote"
+          ? SyncActionType.DeleteRemote
+          : intent.action === "deleteLocal"
+            ? SyncActionType.DeleteLocal
+            : intent.action === "renameRemote"
+              ? SyncActionType.RenameRemote
+              : intent.action === "moveLocal"
+                ? SyncActionType.MoveLocalFile
+                : null;
+    if (!type) {
+      throw new MutationNotAppliedError(
+        new Error(`Manual mutation action is not supported: ${intent.action}`),
+      );
+    }
+    const item: SyncPlanItem = {
+      type,
+      path: intent.path,
+      local,
+      remote,
+      ...(intent.sourcePath ? { renameFrom: intent.sourcePath } : {}),
+      ...(intent.action === "renameRemote"
+        ? { targetParentRemoteId: this.requireKnownRemoteParentId(intent.path) }
+        : {}),
+      ...(intent.action === "upload" && intent.expectedRemote.exists
+        ? { baseEtag: intent.expectedRemote.eTag }
+        : {}),
+    };
+    const result: SyncResult = {
+      success: false,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      skippedLarge: 0,
+      skippedIgnored: 0,
+      errors: 0,
+      authExpired: false,
+      message: "",
+    };
+    const metrics: ExecutionMetrics = {
+      uploadBytes: 0,
+      uploadReadMs: 0,
+      uploadNetworkMs: 0,
+      activeUploads: 0,
+      peakUploads: 0,
+      fileTransfers: {
+        upload: createFileTransferMetrics(),
+        download: createFileTransferMetrics(),
+      },
+      automaticHandling: createAutomaticHandlingMetrics(this.automaticHandlingPolicy),
+    };
+    const remoteUpserts: RemoteFileEntry[] = [];
+    const remoteDeletes: string[] = [];
+    const executed = await this.executeItem(
+      item,
+      result,
+      remoteUpserts,
+      remoteDeletes,
+      metrics,
+      { onFileProgress: (bytes, total) => this.updateSideActionProgress(bytes, total) },
+      operationEpoch,
+      this.automaticHandlingPolicy,
+      undefined,
+      "throw",
+    );
+    if (!executed.executed || !executed.mutationApplied) {
+      throw new MutationNotAppliedError(new Error("Manual mutation was not applied"));
+    }
+    const checkpoint = emptyMutationCheckpoint();
+    checkpoint.remoteUpserts.push(...remoteUpserts);
+    checkpoint.remoteDeletes.push(...remoteDeletes);
+    if (executed.baseUpsert) checkpoint.baseUpserts.push(executed.baseUpsert);
+    if (executed.baseRemoval) checkpoint.baseRemovals.push(executed.baseRemoval);
+    return checkpoint;
+  }
+
   private async runDurableSideMutation(
     intent: MutationIntent,
     operationEpoch: number,
@@ -6764,6 +7751,7 @@ export class SyncExecutor {
   private async recoverMutationLedger(
     syncScope: SyncScope,
     automaticHandlingMetrics?: AutomaticHandlingMetrics,
+    operationEpoch?: number,
   ): Promise<MutationRecoveryRunSummary | null> {
     if (this.state.hasMutationLedgerCorruption) {
       const total = this.state.mutationLedger.length;
@@ -6796,6 +7784,7 @@ export class SyncExecutor {
     let notApplied = 0;
     let receiptCommitted = 0;
     let quarantined = 0;
+    let externalMutations = 0;
     for (const persistedRecord of persistedRecords) {
       const record = this.state.prepareMutationRecoveryRecord(
         persistedRecord,
@@ -6832,6 +7821,31 @@ export class SyncExecutor {
       }
       const isAutomaticMerge = record.intent.action === "merge";
       if (isAutomaticMerge && mergeRecovery) mergeRecovery.records++;
+      if (record.manualResolution) {
+        try {
+          await this.resumeManualMutationResolution(
+            record,
+            operationEpoch,
+            operationEpoch !== undefined,
+            () => { externalMutations++; },
+          );
+          settled++;
+          continue;
+        } catch (error) {
+          if (this.cancelled) throw error;
+          const retryable = isRetryableMutationRecoveryObservationError(error);
+          blocked.push({
+            operationId: record.intent.operationId,
+            reason: retryable
+              ? "observation-unavailable"
+              : "outcome-unresolved",
+            error: error instanceof Error ? error : new Error(String(error)),
+            retryable,
+          });
+          blockedIntents.push({ intent: record.intent, retryable });
+          continue;
+        }
+      }
       if (record.receipt) {
         let receiptMatches: boolean;
         try {
@@ -6891,6 +7905,7 @@ export class SyncExecutor {
             remaining: this.state.mutationLedger.length,
             retryAfterSeconds: null,
             blockReason: "facts-changed",
+            blockedOperationId: record.intent.operationId,
           }, new Error(
             `Mutation receipt no longer matches local/remote facts: ${record.intent.operationId}`,
           ));
@@ -7009,7 +8024,11 @@ export class SyncExecutor {
         remaining: this.state.mutationLedger.length,
         retryAfterSeconds,
         ...(!allBlockedRetryable && blocked.length > 0
-          ? { blockReason: "facts-changed" as const }
+          ? {
+              blockReason: "facts-changed" as const,
+              blockedOperationId: blocked.find((item) => !item.retryable)
+                ?.operationId,
+            }
           : {}),
       };
       const diagnosticSummary = {
@@ -7022,7 +8041,7 @@ export class SyncExecutor {
         blocked: blocked.length,
         blockedByReason,
         firstBlockedOperationId: blocked[0]?.operationId ?? null,
-        externalMutations: 0,
+        externalMutations,
       };
       if (blocked.length > 0) {
         this.diag?.warn(
@@ -7986,6 +9005,7 @@ export class SyncExecutor {
     operationEpoch: number,
     automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>,
     preparedDownload?: PreparedDownload,
+    factsChangedPolicy: "defer" | "throw" = "defer",
   ): Promise<ItemExecutionResult> {
     switch (item.type) {
       case SyncActionType.CreateRemoteFolder: {
@@ -8270,10 +9290,10 @@ export class SyncExecutor {
         }
         const [byId, byPath] = await Promise.all([
           this.onedrive.getDriveItemMetadataById(item.folder.remoteId),
-          this.inspectRemoteFolder(item.path),
+          this.onedrive.getDriveItemMetadata(this.vaultName, item.path),
         ]);
         if (!byId) {
-          if (byPath.status !== "missing") {
+          if (byPath !== null) {
             result.deferred++;
             return {
               executed: false,
@@ -8288,52 +9308,39 @@ export class SyncExecutor {
             folderDelete: { path: item.path, driveId: item.folder.remoteId },
           };
         }
-        if (
-          !byId.folder
-          || byId.parentReference?.id !== item.folder.sourceParentRemoteId
-          || byId.eTag !== item.folder.remoteETag
-          || byPath.status !== "folder"
-          || byPath.entry.driveId !== item.folder.remoteId
-          || byPath.entry.parentId !== item.folder.sourceParentRemoteId
-          || byPath.entry.eTag !== item.folder.remoteETag
-        ) {
+        const exact = await this.inspectExactEmptyRemoteFolder({
+          path: item.path,
+          remoteId: item.folder.remoteId,
+          remoteETag: item.folder.remoteETag,
+          parentRemoteId: item.folder.sourceParentRemoteId,
+        });
+        if (exact.status !== "exact") {
           result.deferred++;
           return {
             executed: false,
             completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.remote-version-changed"),
+            completionReason: this.t(exact.status === "not-empty"
+              ? "reason.folder.remote-subtree-changed"
+              : "reason.folder.remote-version-changed"),
           };
         }
-        const children = await this.onedrive.listFolderChildrenById(item.folder.remoteId);
-        if (!this.canContinue(operationEpoch, result)) return { executed: false };
-        if (children.length > 0) {
+        if (!exact.contentTag) {
           result.deferred++;
           return {
             executed: false,
             completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.remote-subtree-changed"),
+            completionReason: this.t(
+              "reason.folder.remote-content-version-unavailable",
+            ),
           };
         }
-        const [localBeforeDelete, current, currentByPath] = await Promise.all([
-          this.inspectLocalFolder(item.path),
-          this.onedrive.getDriveItemMetadataById(item.folder.remoteId),
-          this.inspectRemoteFolder(item.path),
-        ]);
-        if (
-          localBeforeDelete.status !== "missing"
-          || !current?.folder
-          || current.parentReference?.id !== item.folder.sourceParentRemoteId
-          || current.eTag !== item.folder.remoteETag
-          || currentByPath.status !== "folder"
-          || currentByPath.entry.driveId !== item.folder.remoteId
-          || currentByPath.entry.parentId !== item.folder.sourceParentRemoteId
-          || currentByPath.entry.eTag !== item.folder.remoteETag
-        ) {
+        const localBeforeDelete = await this.inspectLocalFolder(item.path);
+        if (localBeforeDelete.status !== "missing") {
           result.deferred++;
           return {
             executed: false,
             completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.remote-version-changed"),
+            completionReason: this.t("reason.folder.local-source-changed"),
           };
         }
         if (!this.canContinue(operationEpoch, result)) return { executed: false };
@@ -8341,7 +9348,7 @@ export class SyncExecutor {
           await this.onedrive.deleteItem(
             this.vaultName,
             item.path,
-            item.folder.remoteETag,
+            exact.contentTag,
             item.folder.remoteId,
           );
         } catch (error) {
@@ -8423,6 +9430,11 @@ export class SyncExecutor {
             sha256Hash: item.remote.sha256Hash,
           })
         ) {
+          if (factsChangedPolicy === "throw") {
+            throw new MutationNotAppliedError(
+              new Error(`Manual local move facts changed: ${item.path}`),
+            );
+          }
           result.deferred++;
           return {
             executed: false,
@@ -8476,6 +9488,11 @@ export class SyncExecutor {
         metrics.fileTransfers.upload.stagesMs.contentHash += Date.now() - hashStartedAt;
         if (actualHash !== item.local.hash) {
           this.diag?.warn("execute", `upload skipped — ${item.path} hash changed since scan (${item.local.hash.slice(0, 8)}… → ${actualHash.slice(0, 8)}…)`);
+          if (factsChangedPolicy === "throw") {
+            throw new MutationNotAppliedError(
+              new Error(`Manual upload source changed: ${item.path}`),
+            );
+          }
           result.deferred++;
           return {
             executed: false,
@@ -8509,6 +9526,10 @@ export class SyncExecutor {
             e instanceof OneDriveError
             && isRemoteMutationConflict(e)
           ) {
+            if (factsChangedPolicy === "throw") {
+              metrics.activeUploads--;
+              throw new MutationNotAppliedError(e);
+            }
             // Another device changed this file since we scanned remote.
             // Fetch current remote state and route to conflict.
             const fresh = await this.onedrive.getFileMetadata(
@@ -8638,7 +9659,12 @@ export class SyncExecutor {
         if (!item.remote) break;
         const usesLocalCas = typeof (this.scanner as LocalScanner & { inspectFile?: unknown }).inspectFile === "function";
         const firstLocalGuardStartedAt = Date.now();
-        const beforeDownload = await this.guardDownloadLocalVersion(item, result, operationEpoch);
+        const beforeDownload = await this.guardDownloadLocalVersion(
+          item,
+          result,
+          operationEpoch,
+          factsChangedPolicy,
+        );
         metrics.fileTransfers.download.stagesMs.localVersionGuard +=
           Date.now() - firstLocalGuardStartedAt;
         if (beforeDownload) return beforeDownload;
@@ -8711,8 +9737,32 @@ export class SyncExecutor {
           }
           return { executed: false };
         }
+        if (factsChangedPolicy === "throw") {
+          const currentRemote = await this.inspectRemotePath(item.path);
+          if (!this.remoteMatchesExpectation(currentRemote, {
+            exists: true,
+            driveId: item.remote.driveId,
+            eTag: item.remote.eTag,
+            size: item.remote.size,
+            sha256Hash: item.remote.sha256Hash,
+          })) {
+            if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
+            throw new MutationNotAppliedError(
+              new Error(`Manual download remote facts changed: ${item.path}`),
+            );
+          }
+          if (!this.canContinue(operationEpoch, result)) {
+            if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
+            throw new MutationNotAppliedError(new Error("Manual mutation was cancelled"));
+          }
+        }
         const secondLocalGuardStartedAt = Date.now();
-        const beforeWrite = await this.guardDownloadLocalVersion(item, result, operationEpoch);
+        const beforeWrite = await this.guardDownloadLocalVersion(
+          item,
+          result,
+          operationEpoch,
+          factsChangedPolicy,
+        );
         metrics.fileTransfers.download.stagesMs.localVersionGuard +=
           Date.now() - secondLocalGuardStartedAt;
         if (beforeWrite) {
@@ -8735,6 +9785,12 @@ export class SyncExecutor {
             const currentHash = await sha256Hex(currentContent);
             if (currentHash !== item.local.hash) {
               this.diag?.warn("execute", `download blocked — ${item.path} was modified locally since scan (${item.local.hash.slice(0, 8)}… → ${currentHash.slice(0, 8)}…)`);
+              if (factsChangedPolicy === "throw") {
+                if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
+                throw new MutationNotAppliedError(
+                  new Error(`Manual download local facts changed: ${item.path}`),
+                );
+              }
               if (this.localMatchesRemoteHash({ hash: currentHash, size: currentContent.byteLength }, item.remote)) {
                 if (tempDownloadPath) {
                   await this.removePathIfExists(tempDownloadPath);
@@ -8787,6 +9843,9 @@ export class SyncExecutor {
           } catch (writeErr) {
             this.diag?.warn("execute", `streamed download commit failed for ${item.path}, recovery attempted`, writeErr instanceof Error ? writeErr.message : String(writeErr));
             if (writeErr instanceof LocalCommitPreconditionError) {
+              if (factsChangedPolicy === "throw") {
+                throw new MutationNotAppliedError(writeErr);
+              }
               const guarded = await this.guardDownloadLocalVersion(item, result, operationEpoch);
               if (guarded) return guarded;
               result.deferred++;
@@ -8833,6 +9892,9 @@ export class SyncExecutor {
               await this.removePathIfExists(readyPath);
               this.diag?.warn("execute", `download write failed for ${item.path}, recovery attempted`, writeErr instanceof Error ? writeErr.message : String(writeErr));
               if (writeErr instanceof LocalCommitPreconditionError) {
+                if (factsChangedPolicy === "throw") {
+                  throw new MutationNotAppliedError(writeErr);
+                }
                 const guarded = await this.guardDownloadLocalVersion(item, result, operationEpoch);
                 if (guarded) return guarded;
                 result.deferred++;
@@ -8877,6 +9939,9 @@ export class SyncExecutor {
           );
         } catch (e) {
           if (e instanceof OneDriveError && isRemoteMutationConflict(e)) {
+            if (factsChangedPolicy === "throw") {
+              throw new MutationNotAppliedError(e);
+            }
             // File was modified remotely since plan — route to conflict
             this.diag?.warn("execute", `delete blocked — ${item.path} eTag changed since plan`);
             const fresh = await this.onedrive.getFileMetadata(
@@ -8911,7 +9976,7 @@ export class SyncExecutor {
 
       case SyncActionType.DeleteLocal: {
         if (!item.local) return { executed: false };
-        if (isObsidianManagedConfigPath(item.path)) {
+        if (isObsidianManagedConfigPath(item.path, getConfigDir(this.scanner.vault))) {
           throw new MutationNotAppliedError(
             new Error(this.t("notice.decisionExpired")),
           );
@@ -8964,6 +10029,9 @@ export class SyncExecutor {
               );
         } catch (error) {
           if (!(error instanceof OneDriveError) || !isRemoteMutationConflict(error)) throw error;
+          if (factsChangedPolicy === "throw") {
+            throw new MutationNotAppliedError(error);
+          }
           const fresh = await this.onedrive.getFileMetadata(this.vaultName, item.renameFrom);
           if (!this.canContinue(operationEpoch, result)) return { executed: false };
           if (!fresh) {
@@ -10971,6 +12039,7 @@ export class SyncExecutor {
           parentId: node.parentId,
           name: item.name,
           ...(item.eTag !== undefined ? { eTag: item.eTag } : {}),
+          ...(item.cTag !== undefined ? { cTag: item.cTag } : {}),
         });
         continue;
       }
@@ -11184,10 +12253,14 @@ export class SyncExecutor {
         // with the same stable identity/path. Preserve the newer version even
         // when there is no hierarchy change: later folder CAS must not retry a
         // stale eTag forever after a real 412.
-        if (change.eTag !== undefined && change.eTag !== previousFolder.eTag) {
+        if (
+          (change.eTag !== undefined && change.eTag !== previousFolder.eTag)
+          || (change.cTag !== undefined && change.cTag !== previousFolder.cTag)
+        ) {
           foldersById.set(change.id, {
             ...previousFolder,
-            eTag: change.eTag,
+            ...(change.eTag !== undefined ? { eTag: change.eTag } : {}),
+            ...(change.cTag !== undefined ? { cTag: change.cTag } : {}),
           });
         }
         continue;
@@ -11452,6 +12525,7 @@ export class SyncExecutor {
     actionType: SyncActionType,
     task: (operationEpoch: number) => Promise<boolean | void>,
     completionPresentation?: Pick<FileProgress, "status" | "reason">,
+    options?: { skipMutationRecovery?: boolean },
   ): Promise<void> {
     if (this.state.isV2StateActive === false) {
       this.notice("notice.v2MigrationRequired");
@@ -11528,7 +12602,9 @@ export class SyncExecutor {
             throw new Error("Reviewed action scope no longer matches the current Graph scope");
           }
           preparationPhase = "mutationRecovery";
-          await this.recoverMutationLedger(this.activeSyncScope);
+          if (!options?.skipMutationRecovery) {
+            await this.recoverMutationLedger(this.activeSyncScope);
+          }
           if (!this.canContinue(operationEpoch)) return;
           preparationPhase = "action";
           succeeded = await task(operationEpoch) === true;
@@ -12640,6 +13716,7 @@ function toRemoteFolderEntry(path: string, item: DriveItem): RemoteFolderEntry {
     parentId: item.parentReference.id,
     name: item.name,
     eTag: item.eTag,
+    cTag: item.cTag,
   };
 }
 

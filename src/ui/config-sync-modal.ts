@@ -14,6 +14,9 @@ import {
 import type EasySyncPlugin from "../main";
 import type { CommunityPluginInventoryItem } from "../sync/community-plugin-inventory";
 import type { PendingCommunityPluginEnablementDecision } from "../sync/state-manager";
+import type {
+  CommunityPluginEnablementDecisionResolution,
+} from "../sync/community-plugin-enablement";
 import {
   cloneCommunityPluginSyncPolicy,
   isPluginSelected,
@@ -43,76 +46,164 @@ interface CommunityPluginScopeControls {
 
 type CommunityPluginDecisionSide = "local" | "remote";
 
+interface CommunityPluginDecisionItem {
+  pluginName: string;
+  decision: PendingCommunityPluginEnablementDecision;
+}
+
 class CommunityPluginEnablementDecisionModal extends Modal {
   private resolve: (
-    (choice: CommunityPluginDecisionSide | null) => void
+    (
+      choices: CommunityPluginEnablementDecisionResolution[] | null,
+    ) => void
   ) | null = null;
+  private readonly choices = new Map<
+    string,
+    CommunityPluginDecisionSide
+  >();
+  private readonly optionButtons = new Map<string, {
+    local: ButtonComponent;
+    remote: ButtonComponent;
+  }>();
+  private saveButton: ButtonComponent | null = null;
 
   constructor(
     private plugin: EasySyncPlugin,
-    private pluginName: string,
-    private decision: PendingCommunityPluginEnablementDecision,
+    private items: readonly CommunityPluginDecisionItem[],
   ) {
     super(plugin.app);
+    for (const { decision } of items) {
+      if (decision.resolvedEnabled === decision.localEnabled) {
+        this.choices.set(decision.pluginId, "local");
+      } else if (decision.resolvedEnabled === decision.remoteEnabled) {
+        this.choices.set(decision.pluginId, "remote");
+      }
+    }
   }
 
-  awaitChoice(): Promise<CommunityPluginDecisionSide | null> {
+  awaitChoices(): Promise<
+    CommunityPluginEnablementDecisionResolution[] | null
+  > {
     return new Promise((resolve) => {
       this.resolve = resolve;
       this.open();
     });
   }
 
-  private finish(choice: CommunityPluginDecisionSide): void {
+  private finish(): void {
+    if (this.choices.size !== this.items.length) return;
+    const choices = this.items.map(({ decision }) => ({
+      pluginId: decision.pluginId,
+      localEnabled: decision.localEnabled,
+      remoteEnabled: decision.remoteEnabled,
+      enabled: this.choices.get(decision.pluginId) === "local"
+        ? decision.localEnabled
+        : decision.remoteEnabled,
+    }));
     const resolve = this.resolve;
     this.resolve = null;
     this.close();
-    resolve?.(choice);
+    resolve?.(choices);
   }
 
   onOpen(): void {
+    this.render();
+  }
+
+  private render(): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const { contentEl } = this;
     contentEl.empty();
+    this.optionButtons.clear();
+    this.modalEl.addClass("easy-sync-plugin-decisions-modal");
     this.setTitle(t("settings.communityPlugins.decisions.title", {
-      plugin: this.pluginName,
+      count: this.items.length,
     }));
-
-    const localState = t(
-      this.decision.localEnabled
-        ? "settings.communityPlugins.decisions.enabled"
-        : "settings.communityPlugins.decisions.disabled",
-    );
-    const remoteState = t(
-      this.decision.remoteEnabled
-        ? "settings.communityPlugins.decisions.enabled"
-        : "settings.communityPlugins.decisions.disabled",
-    );
     contentEl.createEl("p", {
       cls: "setting-item-description",
-      text: t("settings.communityPlugins.decisions.message", {
-        local: localState,
-        remote: remoteState,
-      }),
+      text: t("settings.communityPlugins.decisions.message"),
     });
 
-    const buttonRow = contentEl.createDiv("modal-button-container");
-    const localButton = new ButtonComponent(buttonRow)
+    const list = contentEl.createDiv("easy-sync-plugin-decisions-list");
+    for (const item of this.items) {
+      this.renderDecision(list, item);
+    }
+
+    const buttonRow = contentEl.createDiv(
+      "modal-button-container easy-sync-plugin-decisions-actions",
+    );
+    new ButtonComponent(buttonRow)
+      .setButtonText(t("confirm.cancel"))
+      .onClick(() => this.close());
+    this.saveButton = new ButtonComponent(buttonRow)
+      .setButtonText(t("settings.communityPlugins.decisions.saveAndSync"))
+      .setCta()
+      .setDisabled(this.choices.size !== this.items.length)
+      .onClick(() => this.finish());
+  }
+
+  private renderDecision(
+    container: HTMLElement,
+    item: CommunityPluginDecisionItem,
+  ): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const { decision } = item;
+    const row = container.createDiv("easy-sync-plugin-decision-row");
+    row.createDiv("easy-sync-plugin-decision-name").setText(item.pluginName);
+    row.createDiv("easy-sync-plugin-decision-state").setText(
+      t("settings.communityPlugins.decisions.state", {
+        local: t(
+          decision.localEnabled
+            ? "settings.communityPlugins.decisions.enabled"
+            : "settings.communityPlugins.decisions.disabled",
+        ),
+        remote: t(
+          decision.remoteEnabled
+            ? "settings.communityPlugins.decisions.enabled"
+            : "settings.communityPlugins.decisions.disabled",
+        ),
+      }),
+    );
+    const actions = row.createDiv("easy-sync-plugin-decision-options");
+    const localButton = new ButtonComponent(actions)
       .setButtonText(t("settings.communityPlugins.decisions.local"))
-      .onClick(() => this.finish("local"));
-    const remoteButton = new ButtonComponent(buttonRow)
+      .onClick(() => this.choose(decision.pluginId, "local"));
+    const remoteButton = new ButtonComponent(actions)
       .setButtonText(t("settings.communityPlugins.decisions.remote"))
-      .onClick(() => this.finish("remote"));
-    if (this.decision.resolvedEnabled === this.decision.localEnabled) {
-      localButton.setCta();
-    } else if (
-      this.decision.resolvedEnabled === this.decision.remoteEnabled
-    ) {
-      remoteButton.setCta();
+      .onClick(() => this.choose(decision.pluginId, "remote"));
+    this.optionButtons.set(decision.pluginId, {
+      local: localButton,
+      remote: remoteButton,
+    });
+    this.refreshChoice(decision.pluginId);
+  }
+
+  private choose(
+    pluginId: string,
+    side: CommunityPluginDecisionSide,
+  ): void {
+    this.choices.set(pluginId, side);
+    this.refreshChoice(pluginId);
+    this.saveButton?.setDisabled(this.choices.size !== this.items.length);
+  }
+
+  private refreshChoice(pluginId: string): void {
+    const buttons = this.optionButtons.get(pluginId);
+    if (!buttons) return;
+    const selected = this.choices.get(pluginId);
+    for (const [side, button] of Object.entries(buttons) as Array<[
+      CommunityPluginDecisionSide,
+      ButtonComponent,
+    ]>) {
+      const pressed = selected === side;
+      button.buttonEl.classList.toggle("mod-cta", pressed);
+      button.buttonEl.setAttribute("aria-pressed", String(pressed));
     }
   }
 
   onClose(): void {
+    this.optionButtons.clear();
+    this.saveButton = null;
     const resolve = this.resolve;
     this.resolve = null;
     resolve?.(null);
@@ -125,6 +216,7 @@ export class ConfigSyncModal extends Modal {
   private scopeInventory: CommunityPluginInventoryItem[] = [];
   private scopeInventoryLoaded = false;
   private pendingDecisions: PendingCommunityPluginEnablementDecision[] = [];
+  private pendingDecisionRevision = "";
   private remoteInventoryAvailable = false;
   private inventoryLoading = false;
   private inventoryLoadFailed = false;
@@ -144,7 +236,7 @@ export class ConfigSyncModal extends Modal {
   private busyPluginRows = new Set<string>();
   private confirmingDataRows = new Set<string>();
   private pendingPluginValues = new Map<string, boolean>();
-  private busyDecisionIds = new Set<string>();
+  private decisionBatchSaving = false;
   private decisionModal: CommunityPluginEnablementDecisionModal | null = null;
   private settingsUpdateQueue = new SequentialSettingsUpdateQueue();
   private unsubscribeCommunityPluginInventoryRevision: (() => void) | null =
@@ -506,6 +598,7 @@ export class ConfigSyncModal extends Modal {
       : "community-plugin-data";
     this.inventory = [];
     this.pendingDecisions = [];
+    this.pendingDecisionRevision = "";
     this.remoteInventoryAvailable = false;
     this.inventoryLoading = true;
     this.inventoryLoadFailed = false;
@@ -532,13 +625,13 @@ export class ConfigSyncModal extends Modal {
     this.inventoryLoadFailed = false;
     this.renderPluginListArea();
     try {
-      const [inventory, remoteInventoryAvailable, pendingDecisions] =
+      const [inventory, remoteInventoryAvailable, pendingSnapshot] =
         await Promise.all([
           this.plugin.getCommunityPluginInventory(),
           this.plugin.hasTrustedCommunityPluginRemoteInventory(column),
           column === "files"
-            ? this.plugin.getPendingCommunityPluginEnablementDecisions()
-            : Promise.resolve([]),
+            ? this.plugin.getCommunityPluginEnablementDecisionSnapshot()
+            : Promise.resolve({ revision: "", decisions: [] }),
         ]);
       if (
         generation !== this.loadGeneration
@@ -547,7 +640,8 @@ export class ConfigSyncModal extends Modal {
       ) return;
       this.inventory = inventory;
       this.remoteInventoryAvailable = remoteInventoryAvailable;
-      this.pendingDecisions = pendingDecisions;
+      this.pendingDecisions = pendingSnapshot.decisions;
+      this.pendingDecisionRevision = pendingSnapshot.revision;
     } catch {
       if (generation !== this.loadGeneration || this.destroyed) return;
       this.inventoryLoadFailed = true;
@@ -703,11 +797,11 @@ export class ConfigSyncModal extends Modal {
       cls: "easy-sync-plugin-name",
       text: displayName,
     });
-    const statuses = this.describeInventoryItem(item, column);
-    if (statuses.length > 0) {
+    const status = this.describeInventoryItem(item, column);
+    if (status) {
       identity.createDiv({
         cls: "easy-sync-plugin-status",
-        text: statuses.join(" · "),
+        text: status,
       });
     }
     const rowKey = this.getRowKey(column, item.id);
@@ -765,40 +859,10 @@ export class ConfigSyncModal extends Modal {
   private describeInventoryItem(
     item: CommunityPluginInventoryItem,
     column: PluginColumn,
-  ): string[] {
+  ): string | null {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    const statuses: string[] = [];
     const restricted = column === "data"
       && !this.isPluginEffectivelyEnabled(item.id, "files");
-    if (
-      !restricted
-      && column === "data"
-      && !item.dataLocally
-      && !(this.remoteInventoryAvailable && item.dataRemotely)
-    ) {
-      statuses.push(t("settings.communityPlugins.status.dataMissing"));
-    }
-    if (this.remoteInventoryAvailable && item.local && !item.remote) {
-      statuses.push(t("settings.communityPlugins.status.localOnly"));
-    }
-    if (
-      this.remoteInventoryAvailable && item.remote && !item.local
-      && !item.remoteCatalogStale
-    ) {
-      statuses.push(t("settings.communityPlugins.status.remoteOnly"));
-    }
-    if (column === "files" && item.remoteCatalogStale) {
-      statuses.push(t("settings.communityPlugins.status.remoteCatalogStale"));
-    }
-    if (
-      column === "files"
-      && (
-        item.participationPhase === "join-requested"
-        || item.participationPhase === "restoring"
-      )
-    ) {
-      statuses.push(t("settings.communityPlugins.status.joinRequested"));
-    }
     if (
       column === "files"
       && item.participationPhase === "blocked"
@@ -813,9 +877,27 @@ export class ConfigSyncModal extends Modal {
               : item.participationBlockedReason === "scope-changed"
                 ? "settings.communityPlugins.status.restoreScopeChanged"
                 : "settings.communityPlugins.status.restoreBlocked";
-      statuses.push(t(
-        blockedStatusKey,
-      ));
+      return t(blockedStatusKey);
+    }
+    if (
+      column === "files"
+      && (
+        item.participationPhase === "join-requested"
+        || item.participationPhase === "restoring"
+      )
+    ) {
+      return t("settings.communityPlugins.status.joinRequested");
+    }
+    if (column === "files" && item.remoteCatalogStale) {
+      return t("settings.communityPlugins.status.remoteCatalogStale");
+    }
+    if (
+      !restricted
+      && column === "data"
+      && !item.dataLocally
+      && !(this.remoteInventoryAvailable && item.dataRemotely)
+    ) {
+      return t("settings.communityPlugins.status.dataMissing");
     }
     if (
       !item.local
@@ -824,24 +906,33 @@ export class ConfigSyncModal extends Modal {
       && item.participationPhase !== "restoring"
       && item.participationPhase !== "blocked"
     ) {
-      statuses.push(t("settings.communityPlugins.status.unavailable"));
+      return t("settings.communityPlugins.status.unavailable");
     }
     if (
       item.desktopOnly
       && item.participationBlockedReason !== "manifest-incompatible"
     ) {
-      statuses.push(t("settings.communityPlugins.status.desktopOnly"));
+      return t("settings.communityPlugins.status.desktopOnly");
     }
     if (item.manifestIssue) {
-      statuses.push(t("settings.communityPlugins.status.manifestIssue"));
+      return t("settings.communityPlugins.status.manifestIssue");
     }
-    return statuses;
+    if (this.remoteInventoryAvailable && item.local && !item.remote) {
+      return t("settings.communityPlugins.status.localOnly");
+    }
+    if (
+      this.remoteInventoryAvailable && item.remote && !item.local
+      && !item.remoteCatalogStale
+    ) {
+      return t("settings.communityPlugins.status.remoteOnly");
+    }
+    return null;
   }
 
   private renderDecisionTrigger(
     toggleCell: HTMLElement,
     pluginName: string,
-    decision: PendingCommunityPluginEnablementDecision,
+    _decision: PendingCommunityPluginEnablementDecision,
   ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const label = t("settings.communityPlugins.decisions.open", {
@@ -850,67 +941,78 @@ export class ConfigSyncModal extends Modal {
     const trigger = new ExtraButtonComponent(toggleCell)
       .setIcon("triangle-alert")
       .setTooltip(label)
-      .setDisabled(this.busyDecisionIds.has(decision.pluginId))
+      .setDisabled(this.decisionBatchSaving)
       .onClick(() => {
-        void this.openDecisionModal(pluginName, decision);
+        void this.openDecisionModal();
       });
     trigger.extraSettingsEl.addClass("easy-sync-plugin-decision-trigger");
     trigger.extraSettingsEl.setAttribute("aria-label", label);
   }
 
-  private async openDecisionModal(
-    pluginName: string,
-    decision: PendingCommunityPluginEnablementDecision,
-  ): Promise<void> {
-    if (this.destroyed || this.decisionModal) return;
+  private async openDecisionModal(): Promise<void> {
+    if (
+      this.destroyed
+      || this.decisionModal
+      || this.decisionBatchSaving
+      || this.pendingDecisions.length === 0
+    ) return;
     const modal = new CommunityPluginEnablementDecisionModal(
       this.plugin,
-      pluginName,
-      decision,
+      this.pendingDecisions.map((decision) => ({
+        decision,
+        pluginName: this.getCommunityPluginDecisionDisplayName(decision),
+      })),
     );
+    const expectedRevision = this.pendingDecisionRevision;
     this.decisionModal = modal;
-    const choice = await modal.awaitChoice();
+    const choices = await modal.awaitChoices();
     if (this.decisionModal === modal) this.decisionModal = null;
-    if (!choice || this.destroyed) return;
-    await this.resolvePendingDecision(
-      decision,
-      choice === "local"
-        ? decision.localEnabled
-        : decision.remoteEnabled,
-    );
+    if (!choices || this.destroyed) return;
+    await this.resolvePendingDecisions(expectedRevision, choices);
   }
 
-  private async resolvePendingDecision(
-    decision: PendingCommunityPluginEnablementDecision,
-    enabled: boolean,
+  private async resolvePendingDecisions(
+    expectedRevision: string,
+    choices: readonly CommunityPluginEnablementDecisionResolution[],
   ): Promise<void> {
-    const { pluginId } = decision;
-    if (this.busyDecisionIds.has(pluginId)) return;
-    this.busyDecisionIds.add(pluginId);
+    if (this.decisionBatchSaving) return;
+    this.decisionBatchSaving = true;
     this.renderPluginListArea();
     let resolved = false;
     try {
-      resolved = await this.plugin.resolveCommunityPluginEnablementDecision(
-        pluginId,
-        enabled,
-        decision.localEnabled,
-        decision.remoteEnabled,
+      resolved = await this.plugin.resolveCommunityPluginEnablementDecisions(
+        expectedRevision,
+        choices,
       );
     } catch {
       resolved = false;
     } finally {
-      this.busyDecisionIds.delete(pluginId);
+      this.decisionBatchSaving = false;
     }
     if (!resolved) {
       new Notice(this.plugin.i18n.t(
         "notice.communityPlugins.decisionUnavailable",
       ));
+      this.requestCommunityPluginInventoryRefresh();
     } else {
-      this.pendingDecisions = this.pendingDecisions.filter(
-        (decision) => decision.pluginId !== pluginId,
-      );
+      this.pendingDecisions = [];
+      this.pendingDecisionRevision = "";
+      this.close();
+      await this.plugin.startManualSync();
+      return;
     }
     if (!this.destroyed) this.renderPluginListArea();
+  }
+
+  private getCommunityPluginDecisionDisplayName(
+    decision: PendingCommunityPluginEnablementDecision,
+  ): string {
+    const item = this.inventory.find(
+      (candidate) => candidate.id === decision.pluginId,
+    );
+    return item
+      ? this.getCommunityPluginDisplayName(item)
+      : decision.pluginId;
   }
 
   private async confirmPluginDataSelection(
@@ -1103,18 +1205,9 @@ export class ConfigSyncModal extends Modal {
       !this.focusPendingDecision
       || this.getManagerColumn() !== "files"
       || this.pendingDecisions.length === 0
-      || !this.listScrollEl
     ) return;
     this.focusPendingDecision = false;
-    const pluginId = this.pendingDecisions[0].pluginId;
-    const row = [...this.listScrollEl.querySelectorAll<HTMLElement>(
-      ".easy-sync-plugin-row",
-    )].find((item) => item.dataset.easySyncPluginId === pluginId);
-    if (!row) return;
-    row.scrollIntoView({ block: "nearest" });
-    row.querySelector<HTMLElement>(
-      ".easy-sync-plugin-decision-trigger",
-    )?.focus();
+    void this.openDecisionModal();
   }
 
   private showSyncPathSettingsError(error: unknown): void {

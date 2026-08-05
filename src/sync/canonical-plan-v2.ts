@@ -30,7 +30,10 @@ import {
   attachBaseAncestorHashesV2,
   upsertBaseStateEnvelopeV2,
 } from "./file-state-controller-v2";
-import { planIdentityRenamesFromStateV2 } from "./identity-rename-v2";
+import {
+  planIdentityRenamesFromStateV2,
+  type IdentityRenameActionV2,
+} from "./identity-rename-v2";
 import {
   validateEnvelope,
   type SyncStateEnvelopeV2,
@@ -586,7 +589,7 @@ function composeCanonicalActionsV2(
         path: action.path,
         reason: identityReplacementConflict
           ? "reason.identityReplacement.ambiguous"
-          : "reason.identityMove.deferred",
+          : identityMoveConflictReason(action.reason),
       });
       continue;
     }
@@ -607,7 +610,10 @@ function composeCanonicalActionsV2(
         || local.size !== action.expectedLocalSize
         || !remote
       ) {
-        deferredItems.push(identityMovePendingItem(action.toPath));
+        deferredItems.push(identityMovePendingItem(
+          action.toPath,
+          "reason.identityMove.factsChanged",
+        ));
         continue;
       }
       const blockedPaths = new Set(
@@ -696,7 +702,7 @@ function composeCanonicalActionsV2(
       deferredItems.push({
         type: SyncActionType.FolderDeferred,
         path: action.toPath,
-        reason: "reason.identityMove.deferred",
+        reason: "reason.identityMove.factsChanged",
       });
       continue;
     }
@@ -870,7 +876,7 @@ export async function finalizeCanonicalPlanCandidateV2(
             path: verification.toPath,
             local: verification.local,
             remote: verification.remote,
-            reason: "reason.identityMove.deferred",
+            reason: "reason.identityMove.verificationFailed",
           }, {
             current: identityDownloads,
             total: identityProgressTotal,
@@ -878,7 +884,10 @@ export async function finalizeCanonicalPlanCandidateV2(
         ).toLowerCase();
         proof = "downloadedSha256";
       } catch (error) {
-        identityItems.push(identityMovePendingItem(verification.toPath));
+        identityItems.push(identityMovePendingItem(
+          verification.toPath,
+          "reason.identityMove.verificationFailed",
+        ));
         identityResults.push({
           path: verification.toPath,
           outcome: "failed",
@@ -888,7 +897,10 @@ export async function finalizeCanonicalPlanCandidateV2(
         continue;
       }
     } else {
-      identityItems.push(identityMovePendingItem(verification.toPath));
+      identityItems.push(identityMovePendingItem(
+        verification.toPath,
+        "reason.identityMove.verificationFailed",
+      ));
       continue;
     }
 
@@ -906,7 +918,10 @@ export async function finalizeCanonicalPlanCandidateV2(
         remote: { ...verification.remote },
       });
     } else {
-      identityItems.push(identityMovePendingItem(verification.toPath));
+      identityItems.push(identityMovePendingItem(
+        verification.toPath,
+        "reason.identityMove.contentChanged",
+      ));
     }
     identityResults.push({
       path: verification.toPath,
@@ -1244,11 +1259,40 @@ function identityReplacementPendingItem(path: string): SyncPlanItem {
   };
 }
 
-function identityMovePendingItem(path: string): SyncPlanItem {
+type IdentityRenameConflictReasonV2 = Extract<
+  IdentityRenameActionV2,
+  { type: "conflict" }
+>["reason"];
+
+function identityMoveConflictReason(
+  reason: IdentityRenameConflictReasonV2,
+): string {
+  switch (reason) {
+    case "local-destination-occupied":
+      return "reason.identityMove.localTargetOccupied";
+    case "remote-destination-occupied":
+      return "reason.identityMove.remoteTargetOccupied";
+    case "remote-content-changed":
+      return "reason.identityMove.contentChanged";
+    case "both-paths-diverged":
+      return "reason.identityMove.bothSidesChanged";
+    case "local-identity-ambiguous":
+      return "reason.identityMove.multipleCandidates";
+    case "destination-parent-missing":
+      return "reason.identityMove.parentUnavailable";
+    default:
+      return "reason.identityMove.deferred";
+  }
+}
+
+function identityMovePendingItem(
+  path: string,
+  reason: string,
+): SyncPlanItem {
   return {
     type: SyncActionType.FolderDeferred,
     path,
-    reason: "reason.identityMove.deferred",
+    reason,
   };
 }
 

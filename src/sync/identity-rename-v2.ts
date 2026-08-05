@@ -55,7 +55,8 @@ export type IdentityRenameActionV2 =
         | "remote-identity-missing"
         | "remote-content-changed"
         | "local-identity-ambiguous"
-        | "destination-occupied"
+        | "local-destination-occupied"
+        | "remote-destination-occupied"
         | "destination-parent-missing"
         | "both-paths-diverged"
         | "replacement-with-local-relocation"
@@ -214,7 +215,7 @@ export function planIdentityRenamesFromStateV2(
         actions.push(conflict(
           anchor,
           remotePath,
-          "destination-occupied",
+          "local-destination-occupied",
           anchor.lastPath,
         ));
       } else if (
@@ -284,7 +285,7 @@ export function planIdentityRenamesFromStateV2(
         actions.push(conflict(
           anchor,
           destination.path,
-          "destination-occupied",
+          "remote-destination-occupied",
           anchor.lastPath,
         ));
         continue;

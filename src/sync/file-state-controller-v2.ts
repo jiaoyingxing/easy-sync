@@ -39,6 +39,7 @@ export function projectStatePathViewV2(
       parentId: node.parentId,
       name: node.name,
       ...(node.eTag !== undefined ? { eTag: node.eTag } : {}),
+      ...(node.cTag !== undefined ? { cTag: node.cTag } : {}),
     }))
     .sort(comparePath);
   return {
@@ -73,6 +74,7 @@ export function replaceRemoteStateEnvelopeV2(
       name: folder.name,
       kind: "folder",
       ...(folder.eTag !== undefined ? { eTag: folder.eTag } : {}),
+      ...(folder.cTag !== undefined ? { cTag: folder.cTag } : {}),
     };
     const current = envelope.remoteIndex.itemsById[folder.driveId];
     itemsById[folder.driveId] =

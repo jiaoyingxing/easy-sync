@@ -26,8 +26,13 @@ import {
 } from "./sync/local-scanner";
 import {
   StateManager,
+  type CommunityPluginEnablementDecisionSnapshot,
   type PendingCommunityPluginEnablementDecision,
 } from "./sync/state-manager";
+import {
+  sameCommunityPluginEnablementDecisionSet,
+  type CommunityPluginEnablementDecisionResolution,
+} from "./sync/community-plugin-enablement";
 import {
   IndexedDbPublic113StateStore,
   public113IndexedDbDatabaseName,
@@ -45,6 +50,9 @@ import {
   type SyncRunOptions,
   type ReviewedContentEqualityProof,
 } from "./sync/sync-executor";
+import type {
+  EmptyFolderResolutionSnapshotV1,
+} from "./sync/empty-folder-resolution";
 import {
   isAnySyncActivityRunning,
   SyncProgressStore,
@@ -64,6 +72,8 @@ import type {
   MutationRecoveryBlockReason,
   MutationRecoveryHistory,
   MutationRecoveryRunSummary,
+  ManualMutationResolutionChoiceV1,
+  ManualMutationResolutionSnapshotV1,
   PlanReviewAuthorization,
   ScanConfig,
   SyncPlan,
@@ -825,7 +835,11 @@ export default class EasySyncPlugin extends Plugin {
 
   private async runSideActionIntent(
     path: string,
-    failureKey: "notice.conflict.failed" | "notice.delete.failed",
+    failureKey:
+      | "notice.conflict.failed"
+      | "notice.delete.failed"
+      | "notice.emptyFolder.failed"
+      | "notice.mutationResolution.failed",
     action: (executor: SyncExecutor, state: StateManager) => Promise<void>,
     requireIdleSideActions = false,
   ): Promise<boolean> {
@@ -952,6 +966,92 @@ export default class EasySyncPlugin extends Plugin {
           .map((item) => item.path);
         return executor.confirmRemoteDeletes(currentPaths);
       },
+    );
+  }
+
+  async getEmptyFolderResolutionSnapshot(
+    path: string,
+  ): Promise<EmptyFolderResolutionSnapshotV1 | null> {
+    await this.ensureStateLoaded();
+    if (!this.syncExecutor || !this.state?.isV2StateActive) return null;
+    return this.syncExecutor.getEmptyFolderResolutionSnapshot(path);
+  }
+
+  async getMutationRecoveryResolutionSnapshot():
+    Promise<ManualMutationResolutionSnapshotV1 | null> {
+    await this.ensureStateLoaded();
+    const executor = this.syncExecutor;
+    const display = this.getMutationRecoveryDisplayState();
+    if (
+      !executor
+      || executor.isRunning
+      || executor.hasSideActionsInFlight
+      || !this.state?.isV2StateActive
+      || display?.kind !== "blocked"
+      || display.blockReason !== "facts-changed"
+    ) return null;
+    if (!await this.checkAccountBinding()) return null;
+    return executor.getMutationRecoveryResolutionSnapshot(
+      display.blockedOperationId ?? undefined,
+    );
+  }
+
+  async resolveMutationRecovery(
+    reviewed: Readonly<ManualMutationResolutionSnapshotV1>,
+    choice: ManualMutationResolutionChoiceV1,
+  ): Promise<boolean> {
+    let resolved = false;
+    const admitted = await this.runSideActionIntent(
+      reviewed.path,
+      "notice.mutationResolution.failed",
+      async (executor) => {
+        resolved = await executor.resolveMutationRecovery(reviewed, choice);
+      },
+      true,
+    );
+    if (!admitted || !resolved || !this.state) return false;
+    this.mutationRecoveryBlockReason = null;
+    await this.startManualSync();
+    return true;
+  }
+
+  restoreReviewedEmptyFolder(
+    reviewed: Readonly<EmptyFolderResolutionSnapshotV1>,
+  ): Promise<boolean> {
+    return this.runSideActionIntent(
+      reviewed.path,
+      "notice.emptyFolder.failed",
+      (executor) => executor.restoreReviewedEmptyFolder(reviewed),
+    );
+  }
+
+  async bindReviewedEmptyFolderRename(
+    reviewed: Readonly<EmptyFolderResolutionSnapshotV1>,
+    candidatePath: string,
+  ): Promise<boolean> {
+    let bound = false;
+    const admitted = await this.runSideActionIntent(
+      reviewed.path,
+      "notice.emptyFolder.failed",
+      async (executor) => {
+        bound = await executor.bindReviewedEmptyFolderRename(
+          reviewed,
+          candidatePath,
+        );
+      },
+    );
+    if (!admitted || !bound) return false;
+    await this.startManualSync();
+    return true;
+  }
+
+  deleteReviewedEmptyRemoteFolder(
+    reviewed: Readonly<EmptyFolderResolutionSnapshotV1>,
+  ): Promise<boolean> {
+    return this.runSideActionIntent(
+      reviewed.path,
+      "notice.emptyFolder.failed",
+      (executor) => executor.deleteReviewedEmptyRemoteFolder(reviewed),
     );
   }
 
@@ -2302,6 +2402,9 @@ export default class EasySyncPlugin extends Plugin {
           summary.blockReason
           ?? this.mutationRecoveryBlockReason
           ?? "unknown",
+        ...(summary.blockedOperationId
+          ? { blockedOperationId: summary.blockedOperationId }
+          : {}),
       };
     }
     const retryAt =
@@ -2365,6 +2468,16 @@ export default class EasySyncPlugin extends Plugin {
         ?? historyRecovery?.blockReason
         ?? "unknown"
       : null;
+    const blockedOperationId = kind === "blocked"
+      ? historyRecovery?.blockedOperationId
+        ?? mutationLedger[0]?.intent.operationId
+        ?? null
+      : null;
+    const firstBlockedRecord = blockedOperationId
+      ? mutationLedger.find(
+          (entry) => entry.intent.operationId === blockedOperationId,
+        )
+      : undefined;
     return {
       kind,
       total,
@@ -2374,8 +2487,16 @@ export default class EasySyncPlugin extends Plugin {
       ),
       remaining,
       retryAt,
-      firstPath: mutationLedger[0]?.intent.path ?? null,
+      firstPath: firstBlockedRecord?.intent.path
+        ?? mutationLedger[0]?.intent.path
+        ?? null,
       blockReason,
+      blockedOperationId,
+      manualResolutionAvailable: kind === "blocked"
+        && blockReason === "facts-changed"
+        && this.syncExecutor?.canResolveMutationRecovery(
+          blockedOperationId ?? undefined,
+        ) === true,
     };
   }
 
@@ -2425,6 +2546,9 @@ export default class EasySyncPlugin extends Plugin {
           ...(display.blockReason !== null
             ? { blockReason: display.blockReason }
             : {}),
+          ...(display.blockedOperationId !== null
+            ? { blockedOperationId: display.blockedOperationId }
+            : {}),
         }
       : null);
     if (!seed) return;
@@ -2442,6 +2566,7 @@ export default class EasySyncPlugin extends Plugin {
       && recovery.remaining === existingRecovery.remaining
       && recovery.retryAt === existingRecovery.retryAt
       && recovery.blockReason === existingRecovery.blockReason
+      && recovery.blockedOperationId === existingRecovery.blockedOperationId
     ) return;
     try {
       await state.addSyncHistory({
@@ -2604,6 +2729,7 @@ export default class EasySyncPlugin extends Plugin {
         remaining: display.remaining,
         updatedAt: Date.now(),
         blockReason: reason,
+        blockedOperationId: previous.blockedOperationId,
       }));
     }
     this.showMutationRecoveryBlockedNotice();
@@ -4728,6 +4854,13 @@ export default class EasySyncPlugin extends Plugin {
   async getPendingCommunityPluginEnablementDecisions(): Promise<
     PendingCommunityPluginEnablementDecision[]
   > {
+    return (await this.getCommunityPluginEnablementDecisionSnapshot())
+      .decisions;
+  }
+
+  async getCommunityPluginEnablementDecisionSnapshot(): Promise<
+    CommunityPluginEnablementDecisionSnapshot
+  > {
     await this.ensureStateLoaded();
     const scope =
       this.state?.activeV2MigrationHold?.communityPluginEnablement?.scope
@@ -4736,13 +4869,16 @@ export default class EasySyncPlugin extends Plugin {
       !scope
       || !this.state
       || !this.syncCommunityPlugins
-    ) return [];
-    return this.state.getCommunityPluginEnablementState(scope).pending.filter(
-      (item) => isPluginSelected(
+    ) return { revision: "", decisions: [] };
+    const snapshot =
+      this.state.getCommunityPluginEnablementDecisionSnapshot(scope);
+    return {
+      revision: snapshot.revision,
+      decisions: snapshot.decisions.filter((item) => isPluginSelected(
         this.communityPluginSyncPolicy.files,
         item.pluginId,
-      ),
-    );
+      )),
+    };
   }
 
   getCommunityPluginEnablementPendingCount(): number {
@@ -4766,11 +4902,11 @@ export default class EasySyncPlugin extends Plugin {
     this.settingsTab?.openCommunityPluginEnablementReview();
   }
 
-  async resolveCommunityPluginEnablementDecision(
-    pluginId: string,
-    enabled: boolean,
-    expectedLocalEnabled?: boolean,
-    expectedRemoteEnabled?: boolean,
+  async resolveCommunityPluginEnablementDecisions(
+    expectedRevision: string,
+    resolutions: readonly Readonly<
+      CommunityPluginEnablementDecisionResolution
+    >[],
   ): Promise<boolean> {
     await this.ensureStateLoaded();
     const scope =
@@ -4780,18 +4916,24 @@ export default class EasySyncPlugin extends Plugin {
       !scope
       || !this.state
       || !this.syncCommunityPlugins
-      || !isPluginSelected(
+      || resolutions.length === 0
+      || resolutions.some((item) => !isPluginSelected(
         this.communityPluginSyncPolicy.files,
-        pluginId,
-      )
+        item.pluginId,
+      ))
     ) return false;
-    const resolved = await this.state.resolveCommunityPluginEnablementDecision(
-      scope,
-      pluginId,
-      enabled,
-      expectedLocalEnabled,
-      expectedRemoteEnabled,
-    );
+    const snapshot = await this.getCommunityPluginEnablementDecisionSnapshot();
+    const pending = snapshot.decisions;
+    if (snapshot.revision !== expectedRevision) return false;
+    if (!sameCommunityPluginEnablementDecisionSet(pending, resolutions)) {
+      return false;
+    }
+    const resolved =
+      await this.state.resolveCommunityPluginEnablementDecisions(
+        scope,
+        expectedRevision,
+        resolutions,
+      );
     if (resolved) this.advanceCommunityPluginInventoryRevision();
     return resolved;
   }
@@ -5195,6 +5337,10 @@ export default class EasySyncPlugin extends Plugin {
         mutationRecoveryScheduler.automaticObservations,
       automaticRecoverySchedulerState:
         mutationRecoveryScheduler.state,
+      manualResolutionAuditCount:
+        reportState?.manualMutationResolutionAudit.length ?? 0,
+      latestManualResolution:
+        reportState?.manualMutationResolutionAudit.slice(-1)[0] ?? null,
       autoSyncPaused: this.autoSyncPaused,
     };
     const latestPhaseSummary = findLatestPhaseSummary(diagAll);

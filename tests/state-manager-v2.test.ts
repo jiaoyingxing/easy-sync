@@ -13,6 +13,7 @@ import {
 import type { SyncStateEnvelopeV2 } from "../src/sync/state-envelope-v2";
 import type {
   FolderMutationIntentV2,
+  ManualMutationResolutionV1,
   MutationIntentV1,
   MutationReceiptV1,
   RemoteFileEntry,
@@ -1317,6 +1318,178 @@ describe("StateManager V2 production controller", () => {
     expect(state.remoteSnapshot).toContainEqual(remote);
     expect(state.baseSnapshot).toContainEqual(receipt.checkpoint.baseUpserts[0]);
     expect(harness.readCommitted().meta.commitSeq).toBe(4);
+  });
+
+  it("keeps the original blocker across restart and atomically checkpoints its reviewed continuation", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const mutation = uploadMutation();
+    await state.beginMutationIntent(mutation.intent);
+    const expectedRecord = structuredClone(state.mutationLedger[0]);
+    const manualIntent: MutationIntentV1 = {
+      ...mutation.intent,
+      operationId: "manual-upload-new",
+      createdAt: 30,
+    };
+    const resolution: ManualMutationResolutionV1 = {
+      version: 1,
+      choice: "keep-local",
+      factsDigest: "c".repeat(64),
+      selectedAt: 30,
+      externalMutation: true,
+      intent: manualIntent,
+      receipt: null,
+    };
+
+    await expect(state.attachManualMutationResolution(expectedRecord, resolution))
+      .resolves.toBe(true);
+    expect(state.mutationLedger[0]).toMatchObject({
+      intent: mutation.intent,
+      receipt: null,
+      manualResolution: resolution,
+    });
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    expect(restarted.mutationLedger[0]).toMatchObject({
+      intent: mutation.intent,
+      receipt: null,
+      manualResolution: resolution,
+    });
+
+    const receipt: MutationReceiptV1 = {
+      ...mutation.receipt,
+      operationId: manualIntent.operationId,
+    };
+    await restarted.recordManualMutationResolutionReceipt(
+      mutation.intent.operationId,
+      receipt,
+    );
+    await restarted.commitManualMutationResolutionCheckpoint(
+      mutation.intent.operationId,
+    );
+
+    expect(restarted.mutationLedger).toEqual([]);
+    expect(restarted.remoteSnapshot).toContainEqual(mutation.remote);
+    expect(restarted.baseSnapshot).toContainEqual(
+      mutation.receipt.checkpoint.baseUpserts[0],
+    );
+    expect(restarted.manualMutationResolutionAudit).toEqual([
+      expect.objectContaining({
+        sourceOperationId: mutation.intent.operationId,
+        resolutionOperationId: manualIntent.operationId,
+        choice: "keep-local",
+        action: "upload",
+        externalMutation: true,
+      }),
+    ]);
+  });
+
+  it("rejects a persisted manual choice whose action contradicts that choice", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const mutation = uploadMutation();
+    await state.beginMutationIntent(mutation.intent);
+    const contradictory: ManualMutationResolutionV1 = {
+      version: 1,
+      choice: "keep-remote",
+      factsDigest: "e".repeat(64),
+      selectedAt: 30,
+      externalMutation: true,
+      intent: {
+        ...mutation.intent,
+        operationId: "manual-contradictory-upload",
+        createdAt: 30,
+      },
+      receipt: null,
+    };
+
+    await expect(state.attachManualMutationResolution(
+      structuredClone(state.mutationLedger[0]),
+      contradictory,
+    )).rejects.toThrow("evidence is invalid");
+    expect(state.mutationLedger).toEqual([{
+      intent: mutation.intent,
+      receipt: null,
+    }]);
+  });
+
+  it("retries reviewed checkpoint cleanup after the V2 commit survives a plugin-data failure", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const mutation = uploadMutation();
+    await state.beginMutationIntent(mutation.intent);
+    const manualIntent: MutationIntentV1 = {
+      ...mutation.intent,
+      operationId: "manual-crash-window",
+      createdAt: 30,
+    };
+    const manualReceipt: MutationReceiptV1 = {
+      ...mutation.receipt,
+      operationId: manualIntent.operationId,
+    };
+    await state.attachManualMutationResolution(state.mutationLedger[0], {
+      version: 1,
+      choice: "keep-local",
+      factsDigest: "d".repeat(64),
+      selectedAt: 30,
+      externalMutation: true,
+      intent: manualIntent,
+      receipt: manualReceipt,
+    });
+    harness.plugin.updatePluginData = vi.fn().mockRejectedValueOnce(
+      new Error("crash after V2 commit"),
+    );
+
+    await expect(state.commitManualMutationResolutionCheckpoint(
+      mutation.intent.operationId,
+    )).rejects.toThrow("crash after V2 commit");
+    expect(harness.readCommitted().remoteIndex.itemsById[mutation.remote.driveId])
+      .toBeDefined();
+    expect(state.mutationLedger).toHaveLength(1);
+
+    harness.plugin.updatePluginData = vi.fn(async (mutator) => mutator(harness.pluginData));
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    await expect(restarted.commitManualMutationResolutionCheckpoint(
+      mutation.intent.operationId,
+    )).resolves.toBeUndefined();
+    expect(restarted.mutationLedger).toEqual([]);
+    expect(restarted.manualMutationResolutionAudit).toHaveLength(1);
+  });
+
+  it("drops malformed local audit history and bounds valid history to the latest twenty records", async () => {
+    const valid = Array.from({ length: 23 }, (_, index) => ({
+      version: 1,
+      sourceOperationId: `source-${index}`,
+      resolutionOperationId: `resolution-${index}`,
+      path: `note-${index}.md`,
+      choice: "keep-local",
+      action: "upload",
+      externalMutation: true,
+      selectedAt: index,
+      completedAt: index + 1,
+    }));
+    const boundedHarness = makeHarness({
+      pluginData: {
+        "easy-sync-v2-manual-mutation-resolution-audit": valid,
+      },
+    });
+    const bounded = new StateManager(boundedHarness.plugin);
+    await bounded.load();
+    expect(bounded.manualMutationResolutionAudit).toHaveLength(20);
+    expect(bounded.manualMutationResolutionAudit[0].sourceOperationId).toBe("source-3");
+
+    const malformedHarness = makeHarness({
+      pluginData: {
+        "easy-sync-v2-manual-mutation-resolution-audit": [{ version: 1 }],
+      },
+    });
+    const malformed = new StateManager(malformedHarness.plugin);
+    await malformed.load();
+    expect(malformed.manualMutationResolutionAudit).toEqual([]);
   });
 
   it("keeps JSON authority when IndexedDB selection hits quota", async () => {

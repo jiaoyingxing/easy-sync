@@ -326,9 +326,24 @@ describe("MigrationHoldV2Store", () => {
     });
   });
 
-  it("resolves an exact enablement observation through the same hold CAS", async () => {
+  it("publishes a complete enablement batch in one hold revision", async () => {
     const { adapter } = makeAdapter();
     const store = new MigrationHoldV2Store(adapter, paths);
+    const carrier: CommunityPluginEnablementMigrationCarrierV2 = {
+      ...communityPluginEnablement,
+      source: {
+        ...communityPluginEnablement.source,
+        selectedPluginIds: ["calendar", "quickadd"],
+      },
+      pending: [
+        ...communityPluginEnablement.pending,
+        {
+          pluginId: "quickadd",
+          localEnabled: true,
+          remoteEnabled: false,
+        },
+      ],
+    };
     const pending = await store.publishPending({
       candidate: candidate(),
       sourceStateDigest,
@@ -336,50 +351,35 @@ describe("MigrationHoldV2Store", () => {
       canonicalReview: review,
       items,
       lastTotalFiles: 1,
-      communityPluginEnablement,
+      communityPluginEnablement: carrier,
       now: 2000,
     });
+    const resolutions = carrier.pending.map((item) => ({
+      ...item,
+      enabled: item.pluginId === "calendar",
+    }));
 
-    await expect(store.resolveCommunityPluginEnablementDecision(
+    await expect(store.resolveCommunityPluginEnablementDecisions(
       pending.revision,
       pending.canonicalIdentity,
-      {
-        pluginId: "calendar",
-        localEnabled: true,
-        remoteEnabled: false,
-      },
-      true,
+      resolutions.slice(0, 1),
     )).resolves.toBeNull();
-    const resolved = await store.resolveCommunityPluginEnablementDecision(
+    const resolved = await store.resolveCommunityPluginEnablementDecisions(
       pending.revision,
       pending.canonicalIdentity,
-      communityPluginEnablement.pending[0]!,
-      true,
+      resolutions,
       2100,
     );
-
     expect(resolved).toMatchObject({
       revision: pending.revision + 1,
-      phase: "pending",
-      updatedAt: 2100,
       communityPluginEnablement: {
-        source: communityPluginEnablement.source,
-        anchors: {},
         pending: [],
-        resolved: [{
-          pluginId: "calendar",
-          localEnabled: false,
-          remoteEnabled: true,
-          resolvedEnabled: true,
-        }],
+        resolved: [
+          { pluginId: "calendar", resolvedEnabled: true },
+          { pluginId: "quickadd", resolvedEnabled: false },
+        ],
       },
     });
-    await expect(store.confirm(
-      pending.revision,
-      pending.canonicalIdentity,
-      protocolBinding,
-    )).resolves.toBeNull();
-    await expect(store.load()).resolves.toEqual(resolved);
   });
 
   it("does not confirm a migration hold while enablement choices remain", async () => {

@@ -557,7 +557,7 @@ describe("canonical V2 plan candidate", () => {
       expect.objectContaining({
         type: SyncActionType.FolderDeferred,
         path: "sub/new.md",
-        reason: "reason.identityMove.deferred",
+        reason: "reason.identityMove.contentChanged",
       }),
     ]);
     const failed = await finalize(async () => {
@@ -567,7 +567,7 @@ describe("canonical V2 plan candidate", () => {
       expect.objectContaining({
         type: SyncActionType.FolderDeferred,
         path: "sub/new.md",
-        reason: "reason.identityMove.deferred",
+        reason: "reason.identityMove.verificationFailed",
       }),
     ]);
   });
@@ -595,32 +595,44 @@ describe("canonical V2 plan candidate", () => {
     });
 
     const candidates = [
-      build({
+      {
+        candidate: build({
         state: changedVersion,
         localFiles: [localFile("old.md")],
         localFolders: localFolders("sub"),
-      }),
-      build({
+        }),
+        reason: "reason.identityMove.bothSidesChanged",
+      },
+      {
+        candidate: build({
         state: locallyModified,
         localFiles: [localFile("old.md", hashB)],
         localFolders: localFolders("sub"),
-      }),
-      build({
+        }),
+        reason: "reason.identityMove.bothSidesChanged",
+      },
+      {
+        candidate: build({
         state: targetOccupied,
         localFiles: [localFile("old.md"), localFile("sub/new.md", hashB)],
         localFolders: localFolders("sub"),
-      }),
-      build({
+        }),
+        reason: "reason.identityMove.localTargetOccupied",
+      },
+      {
+        candidate: build({
         state: ambiguousLocalRename,
         localFiles: [localFile("a.md"), localFile("b.md")],
-      }),
+        }),
+        reason: "reason.identityMove.multipleCandidates",
+      },
     ];
 
-    for (const candidate of candidates) {
+    for (const { candidate, reason } of candidates) {
       expect(candidate.items).toHaveLength(1);
       expect(candidate.items[0]).toMatchObject({
         type: SyncActionType.FolderDeferred,
-        reason: "reason.identityMove.deferred",
+        reason,
       });
       expect(candidate.items.some((item) => [
         SyncActionType.Upload,
@@ -679,6 +691,10 @@ describe("canonical V2 plan candidate", () => {
       item.type === SyncActionType.MoveLocalFile)).toHaveLength(10);
     expect(finalized.items.filter((item) =>
       item.type === SyncActionType.FolderDeferred)).toHaveLength(1);
+    expect(finalized.items.find((item) =>
+      item.type === SyncActionType.FolderDeferred)).toMatchObject({
+      reason: "reason.identityMove.verificationFailed",
+    });
     expect(finalized.contentVerification).toMatchObject({
       candidates: 11,
       downloads: 10,

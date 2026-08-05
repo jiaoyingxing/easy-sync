@@ -22,6 +22,13 @@ export interface ObservedPluginEnablementDecision {
   resolvedEnabled?: boolean;
 }
 
+export interface CommunityPluginEnablementDecisionResolution {
+  pluginId: string;
+  localEnabled: boolean;
+  remoteEnabled: boolean;
+  enabled: boolean;
+}
+
 export interface PreparedCommunityPluginEnablement {
   status: "ready" | "decision-required";
   local: string[];
@@ -356,25 +363,28 @@ export function sameCommunityPluginEnablementMigrationCarrierV2(
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-export function resolveCommunityPluginEnablementMigrationDecisionV2(
+export function resolveCommunityPluginEnablementMigrationDecisionsV2(
   carrier: Readonly<CommunityPluginEnablementMigrationCarrierV2>,
-  expected: Readonly<ObservedPluginEnablementDecision>,
-  enabled: boolean,
+  resolutions: readonly Readonly<
+    CommunityPluginEnablementDecisionResolution
+  >[],
 ): CommunityPluginEnablementMigrationCarrierV2 | null {
-  const pending = carrier.pending.find((item) =>
-    item.pluginId === expected.pluginId
-    && item.localEnabled === expected.localEnabled
-    && item.remoteEnabled === expected.remoteEnabled
+  if (!sameCommunityPluginEnablementDecisionSet(
+    carrier.pending,
+    resolutions,
+  )) return null;
+  const enabledById = new Map(
+    resolutions.map((item) => [item.pluginId, item.enabled]),
   );
-  if (!pending) return null;
   return {
     ...structuredClone(carrier),
-    pending: carrier.pending
-      .filter((item) => item.pluginId !== pending.pluginId)
-      .map((item) => ({ ...item })),
+    pending: [],
     resolved: [
       ...carrier.resolved.map((item) => ({ ...item })),
-      { ...pending, resolvedEnabled: enabled },
+      ...carrier.pending.map((item) => ({
+        ...item,
+        resolvedEnabled: enabledById.get(item.pluginId)!,
+      })),
     ].sort((left, right) => compareText(left.pluginId, right.pluginId)),
   };
 }
@@ -491,6 +501,28 @@ function samePluginIdSet(
   const normalizedRight = [...new Set(right)].sort(compareText);
   return normalizedLeft.length === normalizedRight.length
     && normalizedLeft.every((value, index) => value === normalizedRight[index]);
+}
+
+export function sameCommunityPluginEnablementDecisionSet(
+  pending: readonly Readonly<ObservedPluginEnablementDecision>[],
+  resolutions: readonly Readonly<
+    CommunityPluginEnablementDecisionResolution
+  >[],
+): boolean {
+  if (pending.length === 0 || pending.length !== resolutions.length) {
+    return false;
+  }
+  const resolutionsById = new Map(
+    resolutions.map((item) => [item.pluginId, item]),
+  );
+  if (resolutionsById.size !== resolutions.length) return false;
+  return pending.every((item) => {
+    const resolution = resolutionsById.get(item.pluginId);
+    return resolution
+      && typeof resolution.enabled === "boolean"
+      && resolution.localEnabled === item.localEnabled
+      && resolution.remoteEnabled === item.remoteEnabled;
+  });
 }
 
 function isSafePluginId(value: string): boolean {

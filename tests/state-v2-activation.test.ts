@@ -239,6 +239,7 @@ function remoteItems(hash = hashA): DriveItem[] {
       folder: { childCount: 1 },
       parentReference: { id: scope.filesRootId },
       eTag: "etag-folder-notes",
+      cTag: "ctag-folder-notes",
     },
     {
       id: "file-a",
@@ -880,7 +881,11 @@ function makeHarness(input?: {
           412,
         );
       }
-      if (eTag && remoteItemState[index].eTag !== eTag) {
+      if (
+        eTag
+        && remoteItemState[index].eTag !== eTag
+        && remoteItemState[index].cTag !== eTag
+      ) {
         throw new Error("delete precondition failed");
       }
       remoteItemState.splice(index, 1);
@@ -1061,6 +1066,7 @@ function makeHarness(input?: {
         folder: {},
         parentReference: { id: parentDriveItemId },
         eTag: `etag-created-${remoteItemState.length + 1}`,
+        cTag: `ctag-created-${remoteItemState.length + 1}`,
       };
       remoteItemState.push(created);
       if (loseNextFolderCreateResponse) {
@@ -1278,6 +1284,61 @@ async function activateV2WithFolderScopeDisabled(
   return () => {
     enabled = true;
   };
+}
+
+async function prepareAmbiguousEmptyFolderHarness(
+  options: { contentTag?: string | null } = {},
+) {
+  const contentTag = options.contentTag === null
+    ? undefined
+    : options.contentTag ?? "ctag-folder-notes";
+  const harness = makeHarness({
+    base: [],
+    local: [],
+    localFolders: [{ path: "Notes" }],
+    remoteItems: [{
+      id: "folder-notes",
+      name: "Notes",
+      folder: {},
+      parentReference: { id: scope.filesRootId },
+      eTag: "etag-folder-notes",
+      ...(contentTag ? { cTag: contentTag } : {}),
+    }],
+  });
+  await harness.state.load();
+  expect((await harness.executor.run(
+    "manual",
+    {},
+    false,
+    undefined,
+    { activateV2State: true },
+  )).success).toBe(true);
+  harness.localFolderPaths.delete("Notes");
+  harness.localFolderPaths.add("Archive");
+  const deferred = await harness.executor.run("manual");
+  expect(deferred).toMatchObject({
+    success: true,
+    foldersCreated: 0,
+    foldersMoved: 0,
+    foldersDeleted: 0,
+    deferred: 1,
+    errors: 0,
+  });
+  expect(harness.state.pendingIssues).toEqual([
+    expect.objectContaining({
+      path: "Notes",
+      issueCode: "anchored-folder-missing-local",
+    }),
+  ]);
+  const reviewed = await harness.executor.getEmptyFolderResolutionSnapshot("Notes");
+  expect(reviewed).toMatchObject({
+    path: "Notes",
+    remoteId: "folder-notes",
+    remoteETag: "etag-folder-notes",
+    ...(contentTag ? { remoteCTag: contentTag } : {}),
+    candidatePaths: ["Archive"],
+  });
+  return { harness, reviewed: reviewed! };
 }
 
 async function stageConfirmedDescendantWithoutFolderAnchors(
@@ -6518,12 +6579,45 @@ describe("V1 to V2 controlled production activation", () => {
         remoteEnabled: true,
       },
     ]);
-    await expect(restarted.resolveCommunityPluginEnablementDecision(
+    const decisionRevision = restarted
+      .getCommunityPluginEnablementDecisionSnapshot(scope).revision;
+    const originalPendingHold = restarted.activeV2MigrationHold!;
+    const replacedPendingHold = structuredClone(originalPendingHold);
+    replacedPendingHold.revision += 1;
+    replacedPendingHold.canonicalIdentity = {
+      ...replacedPendingHold.canonicalIdentity,
+      digest: `${replacedPendingHold.canonicalIdentity.digest}-changed`,
+    };
+    replacedPendingHold.communityPluginEnablement!.source.remote = {
+      ...replacedPendingHold.communityPluginEnablement!.source.remote,
+      eTag: "etag-community-plugins-replaced-hold",
+    };
+    const stateWithMigrationHold = restarted as unknown as {
+      migrationHold: typeof originalPendingHold;
+    };
+    stateWithMigrationHold.migrationHold = replacedPendingHold;
+    expect(restarted.getCommunityPluginEnablementDecisionSnapshot(scope).revision)
+      .not.toBe(decisionRevision);
+    await expect(restarted.resolveCommunityPluginEnablementDecisions(
       scope,
-      "calendar",
-      false,
-      false,
-      true,
+      decisionRevision,
+      [{
+        pluginId: "calendar",
+        localEnabled: false,
+        remoteEnabled: true,
+        enabled: false,
+      }],
+    )).resolves.toBe(false);
+    stateWithMigrationHold.migrationHold = originalPendingHold;
+    await expect(restarted.resolveCommunityPluginEnablementDecisions(
+      scope,
+      decisionRevision,
+      [{
+        pluginId: "calendar",
+        localEnabled: false,
+        remoteEnabled: true,
+        enabled: false,
+      }],
     )).resolves.toBe(true);
     expect(restarted.getCommunityPluginEnablementState(scope)).toMatchObject({
       anchors: { calendar: false },
@@ -6740,12 +6834,17 @@ describe("V1 to V2 controlled production activation", () => {
     await harness.state.load();
     await harness.executor.run("manual");
     const originalHold = harness.state.activeV2MigrationHold!;
-    await expect(harness.state.resolveCommunityPluginEnablementDecision(
+    const decisionRevision = harness.state
+      .getCommunityPluginEnablementDecisionSnapshot(scope).revision;
+    await expect(harness.state.resolveCommunityPluginEnablementDecisions(
       scope,
-      "calendar",
-      true,
-      false,
-      true,
+      decisionRevision,
+      [{
+        pluginId: "calendar",
+        localEnabled: false,
+        remoteEnabled: true,
+        enabled: true,
+      }],
     )).resolves.toBe(true);
     const authorization = harness.state.planReviewAuthorization!;
 
@@ -7415,6 +7514,206 @@ describe("V1 to V2 controlled production activation", () => {
       errors: 0,
       deferred: 0,
     });
+  });
+
+  it("restores an explicitly reviewed remote empty folder locally and settles", async () => {
+    const { harness, reviewed } = await prepareAmbiguousEmptyFolderHarness();
+
+    await harness.executor.restoreReviewedEmptyFolder(reviewed);
+
+    expect(harness.localFolderPaths.has("Notes")).toBe(true);
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(harness.mutations.moveItemById).not.toHaveBeenCalled();
+    expect((await harness.executor.run("manual"))).toMatchObject({
+      foldersCreated: 1,
+      deferred: 0,
+      errors: 0,
+    });
+    expect((await harness.executor.run("manual"))).toMatchObject({
+      foldersCreated: 0,
+      foldersMoved: 0,
+      foldersDeleted: 0,
+      deferred: 0,
+      errors: 0,
+    });
+  });
+
+  it("binds one explicitly selected empty rename through the existing move hint", async () => {
+    const { harness, reviewed } = await prepareAmbiguousEmptyFolderHarness();
+
+    expect(await harness.executor.bindReviewedEmptyFolderRename(
+      reviewed,
+      "Archive",
+    )).toBe(true);
+    expect(harness.state.localFolderMoveHints).toEqual([
+      expect.objectContaining({
+        remoteId: "folder-notes",
+        fromPath: "Notes",
+        toPath: "Archive",
+      }),
+    ]);
+
+    const moved = await harness.executor.run("manual");
+    expect(moved).toMatchObject({
+      foldersMoved: 1,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(findRemoteItemByPath(harness.remoteItemState, "Archive")?.id)
+      .toBe("folder-notes");
+    expect(harness.state.localFolderMoveHints).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect((await harness.executor.run("manual"))).toMatchObject({
+      foldersCreated: 0,
+      foldersMoved: 0,
+      foldersDeleted: 0,
+      deferred: 0,
+      errors: 0,
+    });
+  });
+
+  it("deletes only the explicitly reviewed remote empty identity and settles", async () => {
+    const { harness, reviewed } = await prepareAmbiguousEmptyFolderHarness();
+
+    await harness.executor.deleteReviewedEmptyRemoteFolder(reviewed);
+
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes")).toBeNull();
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.mutations.deleteItem).toHaveBeenCalledOnce();
+    expect(harness.mutations.deleteItem).toHaveBeenCalledWith(
+      "testVault",
+      "Notes",
+      "ctag-folder-notes",
+      "folder-notes",
+    );
+    expect((await harness.executor.run("manual"))).toMatchObject({
+      foldersCreated: 1,
+      deferred: 0,
+      errors: 0,
+    });
+    expect((await harness.executor.run("manual"))).toMatchObject({
+      foldersCreated: 0,
+      foldersMoved: 0,
+      foldersDeleted: 0,
+      deferred: 0,
+      errors: 0,
+    });
+  });
+
+  it("expires an empty-folder choice when local candidates or remote versions change", async () => {
+    const localChanged = await prepareAmbiguousEmptyFolderHarness();
+    localChanged.harness.localFolderPaths.add("Archive/Child");
+
+    await localChanged.harness.executor.restoreReviewedEmptyFolder(
+      localChanged.reviewed,
+    );
+    expect(localChanged.harness.localFolderPaths.has("Notes")).toBe(false);
+    expect(localChanged.harness.state.localFolderMoveHints).toEqual([]);
+    expect(localChanged.harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(localChanged.harness.state.mutationLedger).toEqual([]);
+
+    const remoteChanged = await prepareAmbiguousEmptyFolderHarness();
+    const remote = remoteChanged.harness.remoteItemState.find(
+      (item) => item.id === "folder-notes",
+    )!;
+    remote.eTag = "etag-folder-notes-new";
+    await remoteChanged.harness.executor.deleteReviewedEmptyRemoteFolder(
+      remoteChanged.reviewed,
+    );
+    expect(findRemoteItemByPath(remoteChanged.harness.remoteItemState, "Notes"))
+      .not.toBeNull();
+    expect(remoteChanged.harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(remoteChanged.harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("keeps a reviewed delete mutation-free when a child arrives after the empty listing", async () => {
+    const { harness, reviewed } = await prepareAmbiguousEmptyFolderHarness();
+    let inserted = false;
+    vi.mocked(harness.client.listFolderChildrenById).mockImplementation(
+      async (driveItemId: string) => {
+        const children = harness.remoteItemState.filter(
+          (item) => item.parentReference?.id === driveItemId,
+        );
+        if (!inserted && driveItemId === "folder-notes") {
+          inserted = true;
+          const folder = harness.remoteItemState.find(
+            (item) => item.id === "folder-notes",
+          )!;
+          folder.cTag = "ctag-folder-notes-with-child";
+          harness.remoteItemState.push({
+            id: "late-child",
+            name: "late.md",
+            file: { hashes: { sha256Hash: "a".repeat(64) } },
+            size: 1,
+            parentReference: { id: "folder-notes" },
+            eTag: "etag-late-child",
+            cTag: "ctag-late-child",
+          });
+        }
+        return children;
+      },
+    );
+
+    await harness.executor.deleteReviewedEmptyRemoteFolder(reviewed);
+
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes")?.folder)
+      .toBeTruthy();
+    expect(harness.remoteItemState.some((item) => item.id === "late-child"))
+      .toBe(true);
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("does not offer direct cloud deletion without a descendant-sensitive tag", async () => {
+    const { harness, reviewed } = await prepareAmbiguousEmptyFolderHarness({
+      contentTag: null,
+    });
+    expect(reviewed.remoteCTag).toBeUndefined();
+
+    await harness.executor.deleteReviewedEmptyRemoteFolder(reviewed);
+
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes")?.folder)
+      .toBeTruthy();
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingIssues).toHaveLength(1);
+  });
+
+  it("recovers reviewed empty-folder create and delete response loss without repetition", async () => {
+    const restoring = await prepareAmbiguousEmptyFolderHarness();
+    restoring.harness.loseLocalFolderCreateResponseOnce();
+    await restoring.harness.executor.restoreReviewedEmptyFolder(restoring.reviewed);
+    expect(restoring.harness.localFolderPaths.has("Notes")).toBe(true);
+    expect(restoring.harness.scanner.vault.createFolder).toHaveBeenCalledOnce();
+    expect(restoring.harness.state.mutationLedger).toEqual([]);
+
+    const deleting = await prepareAmbiguousEmptyFolderHarness();
+    deleting.harness.loseFolderDeleteResponseOnce();
+    await deleting.harness.executor.deleteReviewedEmptyRemoteFolder(deleting.reviewed);
+    expect(findRemoteItemByPath(deleting.harness.remoteItemState, "Notes"))
+      .toBeNull();
+    expect(deleting.harness.mutations.deleteItem).toHaveBeenCalledOnce();
+    expect(deleting.harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("abandons a reviewed empty-folder delete when Graph rejects the exact version", async () => {
+    const { harness, reviewed } = await prepareAmbiguousEmptyFolderHarness();
+    harness.conflictFolderDeleteOnce();
+
+    await harness.executor.deleteReviewedEmptyRemoteFolder(reviewed);
+
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes")).not.toBeNull();
+    expect(harness.mutations.deleteItem).toHaveBeenCalledOnce();
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([
+      expect.objectContaining({
+        path: "Notes",
+        issueCode: "anchored-folder-missing-local",
+      }),
+    ]);
   });
 
   it("uses the adapter only for a hidden config-directory create", async () => {
@@ -9181,6 +9480,7 @@ describe("V1 to V2 controlled production activation", () => {
         folder: {},
         parentReference: { id: scope.filesRootId },
         eTag: "etag-folder-empty",
+        cTag: "ctag-folder-empty",
       }],
     });
     await harness.state.load();
@@ -9207,6 +9507,43 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.mutations.deleteItem).toHaveBeenCalledOnce();
   });
 
+  it("keeps an automatic remote empty-folder delete fail-closed without a folder cTag", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [{ path: "Empty" }],
+      remoteItems: [{
+        id: "folder-empty",
+        name: "Empty",
+        folder: {},
+        parentReference: { id: scope.filesRootId },
+        eTag: "etag-folder-empty",
+      }],
+    });
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    harness.localFolderPaths.delete("Empty");
+
+    const deferred = await harness.executor.run("manual");
+
+    expect(deferred).toMatchObject({
+      success: true,
+      foldersDeleted: 0,
+      deferred: 1,
+      errors: 0,
+    });
+    expect(findRemoteItemByPath(harness.remoteItemState, "Empty")?.folder)
+      .toBeTruthy();
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
   it("retries a failed folder-delete checkpoint without deleting twice", async () => {
     const harness = makeHarness({
       base: [],
@@ -9218,6 +9555,7 @@ describe("V1 to V2 controlled production activation", () => {
         folder: {},
         parentReference: { id: scope.filesRootId },
         eTag: "etag-folder-empty",
+        cTag: "ctag-folder-empty",
       }],
     });
     await harness.state.load();

@@ -7,6 +7,7 @@ import {
   buildSyncViewContentKey,
   EasySyncSyncView,
   formatFileProgressLabel,
+  formatPendingIssueActionLabel,
   formatPendingIssueChipLabel,
   formatSyncHistoryCounts,
   resolveFileProgressPresentation,
@@ -118,6 +119,33 @@ describe("buildSyncViewContentKey", () => {
 
     expect(empty).not.toBe(withEntry);
     expect(withEntry).toContain("run-1");
+  });
+
+  it("rebuilds a pending row when a stable resolution code appears", () => {
+    const legacy = buildSyncViewContentKey(false, {
+      ...baseInput,
+      bodyMode: "pending",
+      pendingIssues: [{
+        path: "Notes",
+        actionType: SyncActionType.FolderDeferred,
+        reason: "folder missing",
+        updatedAt: 1,
+      }],
+    });
+    const actionable = buildSyncViewContentKey(false, {
+      ...baseInput,
+      bodyMode: "pending",
+      pendingIssues: [{
+        path: "Notes",
+        actionType: SyncActionType.FolderDeferred,
+        issueCode: "anchored-folder-missing-local",
+        reason: "folder missing",
+        updatedAt: 1,
+      }],
+    });
+
+    expect(actionable).not.toBe(legacy);
+    expect(actionable).toContain("anchored-folder-missing-local");
   });
 
   it("changes when auth initialization finishes so the action button can rebuild", () => {
@@ -549,6 +577,16 @@ describe("buildSyncViewContentKey", () => {
     expect(label(SyncActionType.AuthExpired)).toBeNull();
   });
 
+  it("keeps real retries distinct from safe rechecks", () => {
+    const zh = new I18n("zh-cn");
+    const label = (type: SyncActionType) =>
+      formatPendingIssueActionLabel(type, zh.t.bind(zh));
+
+    expect(label(SyncActionType.FolderDeferred)).toBe("重新检查");
+    expect(label(SyncActionType.RetryLater)).toBe("重新检查");
+    expect(label(SyncActionType.Upload)).toBe("再次同步");
+  });
+
   it("extracts gray directories only for measured overflow with real benefit", () => {
     const measured = (
       paths: string[],
@@ -770,6 +808,43 @@ describe("buildSyncViewContentKey", () => {
     expect(modalSource).toContain("plugin.reconcileIdenticalConflict");
   });
 
+  it("keeps facts-changed handling in the fixed top action and opens one neutral review modal", () => {
+    const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
+    const modalSource = readFileSync(
+      "src/ui/mutation-recovery-resolution-modal.ts",
+      "utf8",
+    );
+    const styles = readFileSync("styles.css", "utf8");
+    const openStart = viewSource.indexOf(
+      "  private async openMutationRecoveryResolution()",
+    );
+    const openEnd = viewSource.indexOf(
+      "\n  private renderHistorySection",
+      openStart,
+    );
+    const openMethod = viewSource.slice(openStart, openEnd);
+
+    expect(viewSource).toContain('"syncView.recovery.reviewAndResolve"');
+    expect(viewSource).toContain('state.mutationRecovery.blockReason === "facts-changed"');
+    expect(viewSource).toContain("state.mutationRecovery.manualResolutionAvailable === true");
+    expect(viewSource).toContain('? "syncView.recovery.reviewAndResolve"');
+    expect(viewSource).toContain('? "syncView.recovery.checkAgain"');
+    expect(openMethod).toContain("if (this.mutationRecoveryResolutionOpening) return");
+    expect(openMethod.match(/new MutationRecoveryResolutionModal\(/g)).toHaveLength(1);
+    expect(openMethod).toContain("option.deletesOtherSide");
+    expect(openMethod).toContain("new ConfirmModal(");
+    expect(openMethod.indexOf("option.deletesOtherSide")).toBeLessThan(
+      openMethod.indexOf("new ConfirmModal("),
+    );
+    expect(openMethod).toContain("this.plugin.resolveMutationRecovery(snapshot, choice)");
+    expect(modalSource).toContain('createDiv("easy-sync-mutation-resolution-facts")');
+    expect(modalSource).toContain('createEl("details"');
+    expect(modalSource).not.toContain(".setCta()");
+    expect(styles).toMatch(
+      /body\.is-mobile \.easy-sync-mutation-resolution-actions button\s*\{[^}]*width:\s*100%/s,
+    );
+  });
+
   it("requires a native confirmation and reuses the full-width primary action style for batch deletes", () => {
     const source = readFileSync("src/ui/sync-view.ts", "utf8");
     const sectionStart = source.indexOf("private renderPendingSection");
@@ -810,13 +885,16 @@ describe("buildSyncViewContentKey", () => {
     expect(viewSource).toContain(
       "plugin.openCommunityPluginEnablementReview()",
     );
+    expect(viewSource).toContain(
+      "communityPluginEnablementPending === 0",
+    );
     expect(settingsSource).toContain(
       'new ConfigSyncModal(\n      this.plugin,\n      "community-plugin-files",\n      true,',
     );
     expect(modalSource).toContain("focusPendingDecisionIfRequested()");
-    expect(modalSource).toContain('row.scrollIntoView({ block: "nearest" })');
+    expect(modalSource).toContain("void this.openDecisionModal()");
     expect(modalSource).toContain(
-      '".easy-sync-plugin-decision-trigger"',
+      '"easy-sync-plugin-decision-trigger"',
     );
   });
 });

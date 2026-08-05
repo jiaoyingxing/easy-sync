@@ -314,6 +314,25 @@ describe("community plugin deletion boundary", () => {
       remote: remoteManifest,
     }]);
     expect(protectCommunityPluginPlan(
+      [{
+        ...deferred,
+        reason: "reason.identityMove.contentChanged",
+      }],
+      restoring,
+      CONFIG_DIR,
+      [],
+      "easy-sync",
+      {
+        remoteEntries: [remoteManifest],
+        anchoredRemoteIdByPath: new Map([[manifest, remoteManifest.driveId]]),
+        restoringFilePluginIds: ["calendar"],
+      },
+    )).toEqual([{
+      type: SyncActionType.Download,
+      path: manifest,
+      remote: remoteManifest,
+    }]);
+    expect(protectCommunityPluginPlan(
       [deferred],
       restoring,
       CONFIG_DIR,

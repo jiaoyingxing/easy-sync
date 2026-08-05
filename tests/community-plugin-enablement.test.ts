@@ -6,11 +6,82 @@ import {
   prepareCommunityPluginEnablement,
   prepareCommunityPluginEnablementFromObservations,
   projectCommunityPluginEnablementCarrierStateV2,
+  resolveCommunityPluginEnablementMigrationDecisionsV2,
   serializeCommunityPluginEnablementJson,
   validateCommunityPluginEnablementMigrationCarrierV2,
 } from "../src/sync/community-plugin-enablement";
 
 describe("selected community plugin enablement merge", () => {
+  it("resolves a complete observed batch and rejects stale or partial batches", () => {
+    const carrier = {
+      version: 1 as const,
+      scope: {
+        accountId: "account",
+        driveId: "drive",
+        vaultFolderId: "vault",
+        filesRootId: "files",
+      },
+      source: {
+        path: ".obsidian/community-plugins.json",
+        selectedPluginIds: ["calendar", "quickadd"],
+        local: { exists: true, contentHash: "a".repeat(64) },
+        remote: {
+          exists: true,
+          contentHash: "b".repeat(64),
+          remoteId: "remote",
+          eTag: "etag",
+        },
+      },
+      anchors: {},
+      pending: [
+        { pluginId: "calendar", localEnabled: true, remoteEnabled: false },
+        { pluginId: "quickadd", localEnabled: false, remoteEnabled: true },
+      ],
+      resolved: [],
+    };
+    const resolutions = [
+      {
+        pluginId: "calendar",
+        localEnabled: true,
+        remoteEnabled: false,
+        enabled: true,
+      },
+      {
+        pluginId: "quickadd",
+        localEnabled: false,
+        remoteEnabled: true,
+        enabled: true,
+      },
+    ];
+
+    expect(resolveCommunityPluginEnablementMigrationDecisionsV2(
+      carrier,
+      resolutions,
+    )).toMatchObject({
+      pending: [],
+      resolved: [
+        { pluginId: "calendar", resolvedEnabled: true },
+        { pluginId: "quickadd", resolvedEnabled: true },
+      ],
+    });
+    expect(resolveCommunityPluginEnablementMigrationDecisionsV2(
+      carrier,
+      resolutions.slice(0, 1),
+    )).toBeNull();
+    expect(resolveCommunityPluginEnablementMigrationDecisionsV2(
+      carrier,
+      resolutions.map((item) => item.pluginId === "quickadd"
+        ? { ...item, remoteEnabled: false }
+        : item),
+    )).toBeNull();
+    expect(resolveCommunityPluginEnablementMigrationDecisionsV2(
+      carrier,
+      resolutions.map((item) => item.pluginId === "quickadd"
+        ? { ...item, enabled: undefined as unknown as boolean }
+        : item),
+    )).toBeNull();
+  });
+
   it("keeps a dangling unselected anchor as passive migration history", () => {
     const carrier = {
       version: 1 as const,

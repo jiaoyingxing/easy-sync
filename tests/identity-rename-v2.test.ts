@@ -115,6 +115,38 @@ describe("identity-safe V2 rename planning", () => {
     }]);
   });
 
+  it("identifies a local file occupying the remote move target", () => {
+    const state = envelope();
+    state.remoteIndex.itemsById.file!.parentId = "folder";
+    state.remoteIndex.itemsById.file!.name = "new.md";
+
+    expect(planIdentityRenamesV2(state, [
+      local("old.md"),
+      local("sub/new.md", "b".repeat(64)),
+    ])).toEqual([{
+      type: "conflict",
+      anchorId: "anchor",
+      path: "sub/new.md",
+      relatedPath: "old.md",
+      reason: "local-destination-occupied",
+    }]);
+  });
+
+  it("identifies a remote file occupying the local move target", () => {
+    const state = envelope();
+    state.remoteIndex.itemsById.copy = {
+      id: "copy", parentId: "root", name: "new.md", kind: "file", eTag: "e2", size: 4, contentHash: "b".repeat(64),
+    };
+
+    expect(planIdentityRenamesV2(state, [local("new.md")])).toEqual([{
+      type: "conflict",
+      anchorId: "anchor",
+      path: "new.md",
+      relatedPath: "old.md",
+      reason: "remote-destination-occupied",
+    }]);
+  });
+
   it("prefers an exact remote SHA-256 over a changed content tag", () => {
     const state = envelope();
     const remote = state.remoteIndex.itemsById.file!;

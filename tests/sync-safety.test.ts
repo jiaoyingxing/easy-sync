@@ -13,13 +13,16 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect, vi } from "vitest";
 import * as obsidian from "obsidian";
-import { Platform, type Plugin } from "obsidian";
+import { Platform, TFile, type Plugin } from "obsidian";
 import { sha256Hex } from "../src/crypto";
 import { sameSyncScope, SyncActionType } from "../src/sync/types";
 import { planDigest } from "../src/sync/types";
 import type {
   BaseFileEntry,
   LocalFileEntry,
+  ManualMutationResolutionV1,
+  MutationLedgerEntryV1,
+  MutationReceiptV1,
   RemoteFileEntry,
   RemoteFolderEntry,
   SyncPlan,
@@ -409,6 +412,57 @@ function makeActiveV2State(
     state.baseSnapshot = baseSnapshot;
     state.remoteSnapshot = remoteSnapshot;
     state.remoteFolders = remoteFolders;
+    state.remoteDeltaLink = projection.deltaLink;
+    state.remoteScope = projection.scope;
+    state.mutationLedger.splice(index, 1);
+  });
+  state.attachManualMutationResolution = vi.fn(async (
+    expectedRecord: MutationLedgerEntryV1,
+    resolution: ManualMutationResolutionV1,
+  ) => {
+    const record = state.mutationLedger.find(
+      (candidate) => candidate.intent.operationId === expectedRecord.intent.operationId,
+    ) as MutationLedgerEntryV1 | undefined;
+    if (
+      !record
+      || record.manualResolution
+      || JSON.stringify(record) !== JSON.stringify(expectedRecord)
+    ) return false;
+    record.manualResolution = structuredClone(resolution);
+    return true;
+  });
+  state.recordManualMutationResolutionReceipt = vi.fn(async (
+    sourceOperationId: string,
+    receipt: MutationReceiptV1,
+  ) => {
+    const record = state.mutationLedger.find(
+      (candidate) => candidate.intent.operationId === sourceOperationId,
+    ) as MutationLedgerEntryV1 | undefined;
+    if (!record?.manualResolution) throw new Error("manual resolution missing");
+    record.manualResolution.receipt = structuredClone(receipt);
+  });
+  state.commitManualMutationResolutionCheckpoint = vi.fn(async (
+    sourceOperationId: string,
+  ) => {
+    const index = state.mutationLedger.findIndex(
+      (record) => record.intent.operationId === sourceOperationId,
+    );
+    const record = state.mutationLedger[index] as MutationLedgerEntryV1 | undefined;
+    if (index < 0 || !record?.manualResolution?.receipt) {
+      throw new Error(`Manual mutation receipt missing: ${sourceOperationId}`);
+    }
+    envelope = reduceFileStateEnvelopeV2(envelope, {
+      intent: record.manualResolution.intent,
+      receipt: record.manualResolution.receipt,
+    });
+    commitSeq = envelope.meta.commitSeq;
+    committedAt = envelope.meta.committedAt;
+    const projection = projectStatePathViewV2(envelope);
+    baseSnapshot = projection.baseEntries;
+    remoteSnapshot = projection.remoteEntries;
+    state.baseSnapshot = baseSnapshot;
+    state.remoteSnapshot = remoteSnapshot;
+    state.remoteFolders = projection.remoteFolders;
     state.remoteDeltaLink = projection.deltaLink;
     state.remoteScope = projection.scope;
     state.mutationLedger.splice(index, 1);
@@ -2976,6 +3030,705 @@ describe("Persistent remote delta state", () => {
     } as unknown as LocalScanner;
   }
 
+  async function makeManualResolutionHarness(input: {
+    local?: Record<string, string>;
+    remote?: Record<string, string>;
+    sourcePath?: string;
+    path: string;
+    configDir?: string;
+  }) {
+    const encoder = new TextEncoder();
+    const localBytes = new Map<string, ArrayBuffer>();
+    for (const [path, value] of Object.entries(input.local ?? {})) {
+      localBytes.set(path, encoder.encode(value).buffer);
+    }
+    let version = 1;
+    const remoteFoldersByPath = new Map<string, RemoteFolderEntry>();
+    const ensureRemoteFolder = (path: string): string => {
+      if (!path) return TEST_SYNC_SCOPE.filesRootId;
+      const existing = remoteFoldersByPath.get(path);
+      if (existing) return existing.driveId;
+      const separator = path.lastIndexOf("/");
+      const parent = separator < 0 ? "" : path.slice(0, separator);
+      const entry: RemoteFolderEntry = {
+        path,
+        driveId: `folder-${path}`,
+        parentId: ensureRemoteFolder(parent),
+        name: separator < 0 ? path : path.slice(separator + 1),
+      };
+      remoteFoldersByPath.set(path, entry);
+      return entry.driveId;
+    };
+    const remoteFiles = new Map<string, {
+      entry: RemoteFileEntry;
+      bytes: ArrayBuffer;
+    }>();
+    for (const [path, value] of Object.entries(input.remote ?? {})) {
+      const bytes = encoder.encode(value).buffer;
+      const separator = path.lastIndexOf("/");
+      const parentPath = separator < 0 ? "" : path.slice(0, separator);
+      remoteFiles.set(path, {
+        entry: {
+          path,
+          driveId: `remote-${path}`,
+          parentId: ensureRemoteFolder(parentPath),
+          size: bytes.byteLength,
+          mtime: 1,
+          eTag: `etag-${version++}`,
+          cTag: `ctag-${version}`,
+          sha256Hash: await sha256Hex(bytes),
+        },
+        bytes,
+      });
+    }
+    const inspectLocal = vi.fn(async (path: string) => {
+      const bytes = localBytes.get(path);
+      return bytes
+        ? {
+            status: "present" as const,
+            entry: {
+              path,
+              hash: await sha256Hex(bytes),
+              size: bytes.byteLength,
+              mtime: 1,
+              binary: false,
+            },
+          }
+        : { status: "missing" as const };
+    });
+    const adapter = makeMockAdapter({
+      exists: vi.fn(async (path: string) => localBytes.has(path)),
+      stat: vi.fn(async (path: string) => {
+        const bytes = localBytes.get(path);
+        return bytes ? { type: "file", size: bytes.byteLength, mtime: 1, ctime: 1 } : null;
+      }),
+      readBinary: vi.fn(async (path: string) => {
+        const bytes = localBytes.get(path);
+        if (!bytes) throw new Error(`missing local: ${path}`);
+        return bytes.slice(0);
+      }),
+      writeBinary: vi.fn(async (path: string, bytes: ArrayBuffer) => {
+        localBytes.set(path, bytes.slice(0));
+      }),
+      remove: vi.fn(async (path: string) => {
+        localBytes.delete(path);
+      }),
+      rename: vi.fn(async (source: string, target: string) => {
+        const bytes = localBytes.get(source);
+        if (!bytes) throw new Error(`missing local: ${source}`);
+        localBytes.set(target, bytes);
+        localBytes.delete(source);
+      }),
+    });
+    const metadata = (path: string) => {
+      const current = remoteFiles.get(path);
+      return current ? {
+        eTag: current.entry.eTag,
+        cTag: current.entry.cTag,
+        size: current.entry.size,
+        sha256Hash: current.entry.sha256Hash,
+        driveId: current.entry.driveId,
+        parentId: current.entry.parentId,
+        mtime: current.entry.mtime,
+      } : null;
+    };
+    const uploadFile = vi.fn(async (
+      _vault: string,
+      path: string,
+      bytes: ArrayBuffer,
+    ) => {
+      const previous = remoteFiles.get(path)?.entry;
+      const entry: RemoteFileEntry = {
+        path,
+        driveId: previous?.driveId ?? `uploaded-${path}`,
+        parentId: TEST_SYNC_SCOPE.filesRootId,
+        size: bytes.byteLength,
+        mtime: version,
+        eTag: `etag-${version++}`,
+        cTag: `ctag-${version}`,
+        sha256Hash: await sha256Hex(bytes),
+      };
+      remoteFiles.set(path, { entry, bytes: bytes.slice(0) });
+      return {
+        id: entry.driveId,
+        eTag: entry.eTag,
+        cTag: entry.cTag,
+        size: entry.size,
+        parentReference: { id: entry.parentId },
+      };
+    });
+    const deleteItem = vi.fn(async (
+      _vault: string,
+      path: string,
+      eTag?: string,
+      driveId?: string,
+    ) => {
+      const current = remoteFiles.get(path);
+      if (!current || current.entry.eTag !== eTag || current.entry.driveId !== driveId) {
+        throw new Error(`remote delete precondition changed: ${path}`);
+      }
+      remoteFiles.delete(path);
+    });
+    const moveItemById = vi.fn(async (
+      driveId: string,
+      eTag: string,
+      newName: string,
+      parentId: string,
+    ) => {
+      const source = [...remoteFiles.entries()].find(
+        ([, current]) => current.entry.driveId === driveId,
+      );
+      if (!source || source[1].entry.eTag !== eTag) throw new Error("move precondition changed");
+      const [sourcePath, current] = source;
+      const targetPath = newName;
+      const nextEntry = {
+        ...current.entry,
+        path: targetPath,
+        parentId,
+        eTag: `etag-${version++}`,
+      };
+      remoteFiles.delete(sourcePath);
+      remoteFiles.set(targetPath, { entry: nextEntry, bytes: current.bytes });
+      return {
+        id: driveId,
+        name: newName,
+        size: nextEntry.size,
+        eTag: nextEntry.eTag,
+        cTag: nextEntry.cTag,
+        parentReference: { id: parentId },
+        file: { hashes: { sha256Hash: nextEntry.sha256Hash } },
+      };
+    });
+    const remoteEntries = [...remoteFiles.values()].map((item) => item.entry);
+    const scope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const ledger: MutationLedgerEntryV1[] = [{
+      intent: {
+        version: 1,
+        operationId: "blocked-operation",
+        planRevision: 1,
+        scope,
+        action: input.sourcePath ? "renameRemote" : "upload",
+        path: input.path,
+        ...(input.sourcePath ? { sourcePath: input.sourcePath } : {}),
+        expectedLocal: { exists: false },
+        expectedRemote: { exists: false },
+        createdAt: 1,
+      },
+      receipt: null,
+    }];
+    const state = makeActiveV2State(remoteEntries, [], {
+      mutationLedger: ledger,
+      remoteFolders: [...remoteFoldersByPath.values()],
+    });
+    const onedrive = makeMockOneDrive({
+      uploadFile,
+      deleteItem,
+      moveItemById,
+      getFileMetadata: vi.fn(async (_vault: string, path: string) => metadata(path)),
+      getDriveItemMetadataById: vi.fn(async (driveId: string) => {
+        const found = [...remoteFiles.values()].find(
+          (current) => current.entry.driveId === driveId,
+        );
+        return found ? { id: driveId, eTag: found.entry.eTag } : null;
+      }),
+      downloadFile: vi.fn(async (_vault: string, path: string) => {
+        const current = remoteFiles.get(path);
+        if (!current) throw new Error(`missing remote: ${path}`);
+        return current.bytes.slice(0);
+      }),
+    });
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault: {
+          configDir: input.configDir ?? ".obsidian",
+          adapter,
+          getAbstractFileByPath: vi.fn((path: string) =>
+            localBytes.has(path) ? new TFile(path) : null),
+          getFileByPath: vi.fn().mockReturnValue(null),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+          rename: vi.fn(async (file: TFile, target: string) => {
+            await adapter.rename(file.path, target);
+          }),
+        },
+        inspectFile: inspectLocal,
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    return {
+      adapter,
+      deleteItem,
+      executor,
+      inspectLocal,
+      localBytes,
+      moveItemById,
+      remoteFiles,
+      state,
+      uploadFile,
+    };
+  }
+
+  it("resolves a facts-changed record by keeping the exact current local file", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "note.md",
+      local: { "note.md": "local" },
+      remote: { "note.md": "cloud" },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot(
+      "blocked-operation",
+    );
+
+    expect(reviewed).toMatchObject({
+      path: "note.md",
+      identical: false,
+      keepLocal: { available: true, deletesOtherSide: false },
+      keepRemote: { available: true, deletesOtherSide: false },
+    });
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(true);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect(new TextDecoder().decode(harness.remoteFiles.get("note.md")!.bytes))
+      .toBe("local");
+    expect(harness.state.baseSnapshot).toEqual([
+      expect.objectContaining({
+        path: "note.md",
+        hash: await sha256Hex(new TextEncoder().encode("local").buffer),
+      }),
+    ]);
+  });
+
+  it("resolves a facts-changed record by keeping the exact current cloud file", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "note.md",
+      local: { "note.md": "local" },
+      remote: { "note.md": "cloud" },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-remote"))
+      .toBe(true);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(new TextDecoder().decode(harness.localBytes.get("note.md")!)).toBe("cloud");
+  });
+
+  it("supports both explicit deletion directions without guessing from absence", async () => {
+    const deleteRemote = await makeManualResolutionHarness({
+      path: "remote-only.md",
+      remote: { "remote-only.md": "cloud" },
+    });
+    const remoteReview = await deleteRemote.executor
+      .getMutationRecoveryResolutionSnapshot();
+    expect(remoteReview?.keepLocal).toEqual({
+      available: true,
+      deletesOtherSide: true,
+    });
+    expect(await deleteRemote.executor.resolveMutationRecovery(
+      remoteReview!,
+      "keep-local",
+    )).toBe(true);
+    expect(deleteRemote.remoteFiles.has("remote-only.md")).toBe(false);
+    expect(deleteRemote.deleteItem).toHaveBeenCalledOnce();
+
+    const deleteLocal = await makeManualResolutionHarness({
+      path: "local-only.md",
+      local: { "local-only.md": "local" },
+    });
+    const localReview = await deleteLocal.executor
+      .getMutationRecoveryResolutionSnapshot();
+    expect(localReview?.keepRemote).toEqual({
+      available: true,
+      deletesOtherSide: true,
+    });
+    expect(await deleteLocal.executor.resolveMutationRecovery(
+      localReview!,
+      "keep-remote",
+    )).toBe(true);
+    expect(deleteLocal.localBytes.has("local-only.md")).toBe(false);
+    expect(deleteLocal.adapter.remove).toHaveBeenCalledWith("local-only.md");
+  });
+
+  it("turns strict identical facts into a state-only checkpoint", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "same.md",
+      local: { "same.md": "same" },
+      remote: { "same.md": "same" },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+
+    expect(reviewed?.identical).toBe(true);
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(true);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
+    expect(harness.adapter.writeBinary).not.toHaveBeenCalled();
+    expect(harness.adapter.rename).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("performs zero writes when facts change after the user review", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "changed.md",
+      local: { "changed.md": "local" },
+      remote: { "changed.md": "cloud" },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    harness.localBytes.set(
+      "changed.md",
+      new TextEncoder().encode("newer local").buffer,
+    );
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(false);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
+    expect(harness.state.attachManualMutationResolution).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toHaveLength(1);
+
+    const remoteChanged = await makeManualResolutionHarness({
+      path: "remote-changed.md",
+      local: { "remote-changed.md": "local" },
+      remote: { "remote-changed.md": "cloud" },
+    });
+    const remoteReview = await remoteChanged.executor
+      .getMutationRecoveryResolutionSnapshot();
+    const current = remoteChanged.remoteFiles.get("remote-changed.md")!;
+    remoteChanged.remoteFiles.set("remote-changed.md", {
+      entry: { ...current.entry, eTag: "etag-newer" },
+      bytes: new TextEncoder().encode("newer cloud").buffer,
+    });
+    expect(await remoteChanged.executor.resolveMutationRecovery(
+      remoteReview!,
+      "keep-local",
+    )).toBe(false);
+    expect(remoteChanged.uploadFile).not.toHaveBeenCalled();
+    expect(remoteChanged.state.attachManualMutationResolution)
+      .not.toHaveBeenCalled();
+  });
+
+  it("does not bypass managed-config or community-plugin ownership boundaries", async () => {
+    const managedConfig = await makeManualResolutionHarness({
+      path: ".obsidian/app.json",
+      local: { ".obsidian/app.json": "{}" },
+      remote: { ".obsidian/app.json": "{\"x\":1}" },
+    });
+    expect(await managedConfig.executor.getMutationRecoveryResolutionSnapshot())
+      .toBeNull();
+
+    const pluginFile = await makeManualResolutionHarness({
+      path: ".obsidian/plugins/example/main.js",
+      local: { ".obsidian/plugins/example/main.js": "local" },
+      remote: { ".obsidian/plugins/example/main.js": "cloud" },
+    });
+    expect(await pluginFile.executor.getMutationRecoveryResolutionSnapshot())
+      .toBeNull();
+    expect(pluginFile.uploadFile).not.toHaveBeenCalled();
+
+    for (const fileName of ["main.js", "manifest.json", "styles.css"]) {
+      const path = `.obsidian/plugins/easy-sync/${fileName}`;
+      const selfSyncFile = await makeManualResolutionHarness({
+        path,
+        local: { [path]: "local" },
+        remote: { [path]: "cloud" },
+      });
+      expect(await selfSyncFile.executor.getMutationRecoveryResolutionSnapshot())
+        .toBeNull();
+      expect(selfSyncFile.uploadFile).not.toHaveBeenCalled();
+    }
+
+    const customConfig = await makeManualResolutionHarness({
+      configDir: ".config",
+      path: ".config/app.json",
+      local: { ".config/app.json": "{}" },
+      remote: { ".config/app.json": "{\"x\":1}" },
+    });
+    expect(await customConfig.executor.getMutationRecoveryResolutionSnapshot())
+      .toBeNull();
+    expect(customConfig.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("cancels after the final reviewed inspection without starting a write", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "cancel-before-write.md",
+      local: { "cancel-before-write.md": "local" },
+      remote: { "cancel-before-write.md": "cloud" },
+    });
+    const currentRemote = harness.remoteFiles.get("cancel-before-write.md")!.entry;
+    const localBytes = harness.localBytes.get("cancel-before-write.md")!;
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "manual-cancel-before-write",
+      planRevision: 1,
+      scope: { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+      action: "upload",
+      path: "cancel-before-write.md",
+      expectedLocal: {
+        exists: true,
+        hash: await sha256Hex(localBytes),
+        size: localBytes.byteLength,
+      },
+      expectedRemote: {
+        exists: true,
+        driveId: currentRemote.driveId,
+        eTag: currentRemote.eTag,
+        size: currentRemote.size,
+        sha256Hash: currentRemote.sha256Hash,
+      },
+      createdAt: 1,
+    };
+    const inspect = harness.inspectLocal.getMockImplementation()!;
+    harness.inspectLocal.mockImplementationOnce(async (path: string) => {
+      const current = await inspect(path);
+      harness.executor.cancel();
+      return current;
+    });
+    const epoch = (harness.executor as unknown as {
+      lifecycle: { capture(): number };
+    }).lifecycle.capture();
+
+    await expect((harness.executor as unknown as {
+      executeManualMutationIntentWithCanonicalExecutor(
+        intent: MutationIntentV1,
+        operationEpoch: number,
+      ): Promise<MutationCheckpointV1>;
+    }).executeManualMutationIntentWithCanonicalExecutor(intent, epoch))
+      .rejects.toThrow("cancelled");
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
+    expect(harness.adapter.writeBinary).not.toHaveBeenCalled();
+    expect(harness.adapter.rename).not.toHaveBeenCalled();
+  });
+
+  it("resolves a pure move in either direction and rejects composite moves", async () => {
+    const keepLocal = await makeManualResolutionHarness({
+      sourcePath: "old.md",
+      path: "new.md",
+      local: { "new.md": "same" },
+      remote: { "old.md": "same" },
+    });
+    const localReview = await keepLocal.executor.getMutationRecoveryResolutionSnapshot();
+    expect(localReview?.keepLocal.available).toBe(true);
+    expect(await keepLocal.executor.resolveMutationRecovery(localReview!, "keep-local"))
+      .toBe(true);
+    expect(keepLocal.remoteFiles.has("old.md")).toBe(false);
+    expect(keepLocal.remoteFiles.has("new.md")).toBe(true);
+    expect(keepLocal.moveItemById).toHaveBeenCalledOnce();
+
+    const keepRemote = await makeManualResolutionHarness({
+      sourcePath: "old.md",
+      path: "new.md",
+      local: { "old.md": "same" },
+      remote: { "new.md": "same" },
+    });
+    const remoteReview = await keepRemote.executor.getMutationRecoveryResolutionSnapshot();
+    expect(remoteReview?.keepRemote.available).toBe(true);
+    expect(await keepRemote.executor.resolveMutationRecovery(remoteReview!, "keep-remote"))
+      .toBe(true);
+    expect(keepRemote.localBytes.has("old.md")).toBe(false);
+    expect(keepRemote.localBytes.has("new.md")).toBe(true);
+
+    const composite = await makeManualResolutionHarness({
+      sourcePath: "old.md",
+      path: "new.md",
+      local: { "new.md": "local" },
+      remote: { "old.md": "cloud" },
+    });
+    const compositeReview = await composite.executor
+      .getMutationRecoveryResolutionSnapshot();
+    expect(compositeReview?.keepLocal.available).toBe(false);
+    expect(compositeReview?.keepRemote.available).toBe(false);
+  });
+
+  it("recovers an upload response loss without repeating the remote write", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "response-lost.md",
+      local: { "response-lost.md": "local" },
+      remote: { "response-lost.md": "cloud" },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    const upload = harness.uploadFile.getMockImplementation()!;
+    harness.uploadFile.mockImplementationOnce(async (...args: unknown[]) => {
+      await upload(...args);
+      throw new Error("upload response lost");
+    });
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(true);
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(new TextDecoder().decode(harness.remoteFiles.get("response-lost.md")!.bytes))
+      .toBe("local");
+  });
+
+  it("replays only the receipt after a crash window following the remote write", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "receipt-crash.md",
+      local: { "receipt-crash.md": "local" },
+      remote: { "receipt-crash.md": "cloud" },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    vi.mocked(harness.state.recordManualMutationResolutionReceipt)
+      .mockRejectedValueOnce(new Error("receipt persistence interrupted"));
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(false);
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect((harness.state.mutationLedger[0] as MutationLedgerEntryV1).manualResolution)
+      .toMatchObject({ receipt: null });
+
+    const epoch = (harness.executor as unknown as {
+      lifecycle: { capture(): number };
+    }).lifecycle.capture();
+    await (harness.executor as unknown as {
+      recoverMutationLedger(
+        scope: SyncScope,
+        metrics: undefined,
+        operationEpoch: number,
+      ): Promise<unknown>;
+    }).recoverMutationLedger(
+      { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+      undefined,
+      epoch,
+    );
+
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("keeps a receipt and defers the checkpoint when cancellation lands after the write", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "cancelled.md",
+      local: { "cancelled.md": "local" },
+      remote: { "cancelled.md": "cloud" },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    const upload = harness.uploadFile.getMockImplementation()!;
+    harness.uploadFile.mockImplementationOnce(async (...args: unknown[]) => {
+      const result = await upload(...args);
+      harness.executor.cancel();
+      return result;
+    });
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(false);
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect((harness.state.mutationLedger[0] as MutationLedgerEntryV1).manualResolution)
+      .toMatchObject({ receipt: expect.objectContaining({ version: 1 }) });
+    expect(harness.state.commitManualMutationResolutionCheckpoint)
+      .not.toHaveBeenCalled();
+
+    (harness.executor as unknown as { cancelled: boolean }).cancelled = false;
+    const epoch = (harness.executor as unknown as {
+      lifecycle: { capture(): number };
+    }).lifecycle.capture();
+    await (harness.executor as unknown as {
+      recoverMutationLedger(
+        scope: SyncScope,
+        metrics: undefined,
+        operationEpoch: number,
+      ): Promise<unknown>;
+    }).recoverMutationLedger(
+      { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+      undefined,
+      epoch,
+    );
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("retains the reviewed continuation when a network failure proves no write", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "offline.md",
+      local: { "offline.md": "local" },
+      remote: { "offline.md": "cloud" },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    harness.uploadFile.mockRejectedValueOnce(new OneDriveError(
+      OneDriveErrorType.NetworkError,
+      "offline",
+    ));
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(false);
+    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect((harness.state.mutationLedger[0] as MutationLedgerEntryV1).manualResolution)
+      .toMatchObject({
+        choice: "keep-local",
+        externalMutation: true,
+        receipt: null,
+      });
+    expect(new TextDecoder().decode(harness.remoteFiles.get("offline.md")!.bytes))
+      .toBe("cloud");
+  });
+
+  it("keeps a reviewed overwrite blocked after a 412 instead of applying stale facts", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "raced.md",
+      local: { "raced.md": "local" },
+      remote: { "raced.md": "cloud" },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    harness.uploadFile.mockRejectedValueOnce(new OneDriveError(
+      OneDriveErrorType.PreconditionFailed,
+      "etag changed",
+      412,
+    ));
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(false);
+    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect((harness.state.mutationLedger[0] as MutationLedgerEntryV1).manualResolution)
+      .toMatchObject({ receipt: null });
+    expect(new TextDecoder().decode(harness.remoteFiles.get("raced.md")!.bytes))
+      .toBe("cloud");
+  });
+
+  it("resumes a durable reviewed continuation after the interrupted side action", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "resume.md",
+      local: { "resume.md": "local" },
+      remote: { "resume.md": "cloud" },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    harness.uploadFile.mockRejectedValueOnce(new OneDriveError(
+      OneDriveErrorType.NetworkError,
+      "offline",
+    ));
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(false);
+    expect(harness.state.mutationLedger).toHaveLength(1);
+
+    const epoch = (harness.executor as unknown as {
+      lifecycle: { capture(): number };
+    }).lifecycle.capture();
+    const summary = await (harness.executor as unknown as {
+      recoverMutationLedger(
+        scope: SyncScope,
+        metrics: undefined,
+        operationEpoch: number,
+      ): Promise<unknown>;
+    }).recoverMutationLedger(
+      { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+      undefined,
+      epoch,
+    );
+
+    expect(summary).toMatchObject({
+      state: "settled",
+      total: 1,
+      settled: 1,
+      remaining: 0,
+    });
+    expect(harness.uploadFile).toHaveBeenCalledTimes(2);
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
   it("blocks planning when an unresolved mutation intent contradicts current remote identity", async () => {
     const expectedHash = "aa".repeat(32);
     const currentHash = "bb".repeat(32);
@@ -3063,6 +3816,7 @@ describe("Persistent remote delta state", () => {
       remaining: 1,
       retryAfterSeconds: null,
       blockReason: "facts-changed",
+      blockedOperationId: "op-unresolved",
     });
   });
 
