@@ -570,7 +570,7 @@ export class CorruptStatePublicationV2Store {
       staged = await this.readControlRecordRequired(
         this.paths.publicationNext,
       );
-    } catch (error) {
+    } catch (_error) {
       if (!committed) {
         await this.removeIfExists(this.paths.publicationNext);
         return null;

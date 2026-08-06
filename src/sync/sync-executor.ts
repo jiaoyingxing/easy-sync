@@ -96,7 +96,11 @@ import type {
 } from "./state-envelope-v2";
 import type { CanonicalPlannerStateV2 } from "./canonical-planner-state-v2";
 import type { I18n } from "../i18n/index";
-import { SyncProgressStore, type FileProgress } from "./sync-progress";
+import {
+  SyncProgressStore,
+  type FileProgress,
+  type RemoteScopeRecoveryVerificationSummary,
+} from "./sync-progress";
 import { OperationLifecycle } from "./operation-lifecycle";
 import { EasySyncNoticeCenter, NOTICE_PRIORITY } from "../ui/notice-center";
 import { LocalRecoveryJournal } from "./local-recovery-journal";
@@ -157,9 +161,15 @@ import {
 import {
   createOneDriveSharedSyncProtocolTransportV2,
   ensureSharedSyncProtocolV2,
-  type SharedSyncProtocolBindingV2,
   type SharedSyncProtocolTransportV2,
 } from "./sync-protocol-v2";
+import {
+  createOneDriveSharedSyncProtocolTransportV3,
+  ensureSharedSyncProtocolV3,
+  type SharedSyncProtocolBinding,
+  type SharedSyncProtocolBindingV3,
+  type SharedSyncProtocolTransportV3,
+} from "./sync-protocol-v3";
 import {
   buildRemoteScopeRecoveryCandidateV2,
 } from "./remote-scope-recovery-v2";
@@ -269,6 +279,8 @@ export interface SyncResult {
    *  after a transient Graph failure, or reached a stable fail-closed
    *  boundary. */
   mutationRecovery?: MutationRecoveryRunSummary;
+  /** Aggregated GET-only remote-scope proof progress, never file mutations. */
+  remoteScopeRecovery?: RemoteScopeRecoveryVerificationSummary;
   metrics?: ExecutionMetrics;
 }
 
@@ -669,6 +681,23 @@ function availableSharedSyncProtocolTransportV2(
     : null;
 }
 
+function availableSharedSyncProtocolTransportV3(
+  client: OneDriveClient,
+  vaultName: string,
+): SharedSyncProtocolTransportV3 | null {
+  const candidate = client as OneDriveClient & {
+    readSharedSyncProtocolV3?: OneDriveClient["readSharedSyncProtocolV3"];
+    createSharedSyncProtocolV3?: OneDriveClient["createSharedSyncProtocolV3"];
+    readSharedSyncProtocolV3ById?:
+      OneDriveClient["readSharedSyncProtocolV3ById"];
+  };
+  return typeof candidate.readSharedSyncProtocolV3 === "function"
+    && typeof candidate.createSharedSyncProtocolV3 === "function"
+    && typeof candidate.readSharedSyncProtocolV3ById === "function"
+    ? createOneDriveSharedSyncProtocolTransportV3(candidate, vaultName)
+    : null;
+}
+
 export class SyncExecutor {
   private running = false;
   private sideActionRunning = false;
@@ -743,10 +772,6 @@ export class SyncExecutor {
     }
     if (this.state.hasV2RemoteScopeRecovery) {
       this.notice("result.v2ScopeRecoveryPending");
-      return true;
-    }
-    if (this.state.legacyAutoSyncAllowed === false && !this.state.isV2StateActive) {
-      this.notice("result.legacyStateDisabled");
       return true;
     }
     return false;
@@ -3111,13 +3136,7 @@ export class SyncExecutor {
     if (this.running || this.sideActionRunning || this.queuedSideActionPaths.size > 0) {
       return { success: false, uploaded: 0, downloaded: 0, deleted: 0, conflicts: 0, deferred: 0, skippedLarge: 0, skippedIgnored: 0, errors: 0, authExpired: false, message: this.t("result.alreadyRunning") };
     }
-    if (
-      this.state.legacyAutoSyncAllowed === false
-      && !this.state.isV2StateActive
-      && !this.state.hasV2StateLoadRecoveryBlock
-    ) {
-      return { success: false, uploaded: 0, downloaded: 0, deleted: 0, conflicts: 0, deferred: 0, skippedLarge: 0, skippedIgnored: 0, errors: 1, authExpired: false, message: this.t("result.legacyStateDisabled") };
-    }
+
     if (options.recoveryOnly === true && !this.state.isV2StateActive) {
       return {
         success: false,
@@ -5458,14 +5477,31 @@ export class SyncExecutor {
               );
               return result;
             }
-            protocolBinding = protocol.binding;
+            const scopeFreeProtocol =
+              await this.ensureScopeFreeSharedProtocol(
+                protocol.binding,
+              );
+            if (scopeFreeProtocol.status !== "ready") {
+              result.errors = 1;
+              result.message = this.t("result.v2ProtocolBlocked");
+              this.diag?.error(
+                "state",
+                "scope-free shared protocol could not be established before authority commit",
+                {
+                  reason: scopeFreeProtocol.reason,
+                  mutations: 0,
+                },
+              );
+              return result;
+            }
+            protocolBinding = scopeFreeProtocol.binding;
             this.diag?.log(
               "state",
-              `shared V2 sync protocol joined from ${protocol.source}`,
+              `scope-free shared protocol joined from ${scopeFreeProtocol.source}`,
               {
-                protocolVersion: protocol.binding.protocolVersion,
+                protocolVersion: scopeFreeProtocol.binding.protocolVersion,
                 migrationGeneration:
-                  protocol.binding.migrationGeneration.slice(0, 12),
+                  scopeFreeProtocol.binding.migrationGeneration.slice(0, 12),
                 mutations: 0,
               },
             );
@@ -6320,12 +6356,6 @@ export class SyncExecutor {
     const uploadConc = Platform.isMobile ? MOBILE_SMALL_UPLOAD_CONCURRENCY : SMALL_UPLOAD_CONCURRENCY;
     const largeUploadConc = Platform.isMobile ? MOBILE_LARGE_UPLOAD_CONCURRENCY : LARGE_UPLOAD_CONCURRENCY;
     const downloadPolicy = new DownloadConcurrencyPolicy();
-
-    // M11: mobile file-size guard — warn when the configured limit exceeds the
-    // validated safe ceiling (100 MiB). Real-device stair-step validation pending.
-    if (Platform.isMobile && this.scanner.getMaxFileSize() > 100 * 1024 * 1024) {
-      this.diag?.warn("execute", `mobile maxFileSize=${this.scanner.getMaxFileSize()} exceeds validated 100 MiB ceiling — large files may OOM or timeout`);
-    }
 
     // M19: anti-downgrade guard for EasySync self-sync.
     // Before any plugin files are downloaded, fetch remote manifest.json and
@@ -8705,7 +8735,10 @@ export class SyncExecutor {
           return this.t("syncView.failure.remote");
       }
     }
-    return this.t("syncView.failure.local");
+    if (error instanceof Error) {
+      return error.message || this.t("syncView.failure.unknown");
+    }
+    return this.t("syncView.failure.unknown");
   }
 
   private stopSideActionForAuthFailure(path: string, error: unknown): boolean {
@@ -8734,7 +8767,7 @@ export class SyncExecutor {
     if (item.local.binary) {
       return recordAutomaticMergeManual(automaticMetrics, "binary-file");
     }
-    if (isObsidianManagedConfigPath(item.path)) {
+    if (isObsidianManagedConfigPath(item.path, getConfigDir(this.scanner.vault))) {
       return recordAutomaticMergeManual(automaticMetrics, "protected-config");
     }
     if (!isAutomaticTextMergeCandidatePath(
@@ -10990,6 +11023,69 @@ export class SyncExecutor {
     return result;
   }
 
+  private async ensureScopeFreeSharedProtocol(
+    expectedBinding: SharedSyncProtocolBinding,
+  ): Promise<
+    | { status: "ready"; binding: SharedSyncProtocolBindingV3; source: string }
+    | { status: "blocked"; reason: string }
+  > {
+    const protocolTransportV3 = availableSharedSyncProtocolTransportV3(
+      this.onedrive,
+      this.vaultName,
+    );
+    if (!protocolTransportV3) {
+      return { status: "blocked", reason: "v3-transport-unavailable" };
+    }
+    if (expectedBinding.protocolVersion === 3) {
+      const v3 = await ensureSharedSyncProtocolV3(protocolTransportV3, {
+        expectedBinding,
+        allowCreate: true,
+      });
+      return v3.status === "ready"
+        ? { status: "ready", binding: v3.binding, source: v3.source }
+        : { status: "blocked", reason: v3.reason };
+    }
+
+    const protocolTransportV2 = availableSharedSyncProtocolTransportV2(
+      this.onedrive,
+      this.vaultName,
+    );
+    if (!protocolTransportV2) {
+      return { status: "blocked", reason: "v2-transport-unavailable" };
+    }
+    let predecessor;
+    try {
+      predecessor = await protocolTransportV2.read();
+    } catch {
+      return { status: "blocked", reason: "v2-read-failed" };
+    }
+    if (
+      predecessor
+      && (
+        predecessor.id !== expectedBinding.recordId
+        || predecessor.eTag !== expectedBinding.recordETag
+      )
+    ) {
+      return { status: "blocked", reason: "v2-identity-mismatch" };
+    }
+    if (!predecessor) {
+      // A V2 binding does not contain the original protocol bytes. Creating
+      // a lookalike V2 record in the new control directory would invent a new
+      // predecessor digest/createdAt and could fork V3 lineage across devices.
+      // Only the exact readable V2 object, or an already-bound V3 object, can
+      // authorize this transition.
+      return { status: "blocked", reason: "v2-predecessor-missing" };
+    }
+    const v3 = await ensureSharedSyncProtocolV3(protocolTransportV3, {
+      predecessor,
+      expectedBinding,
+      allowCreate: true,
+    });
+    return v3.status === "ready"
+      ? { status: "ready", binding: v3.binding, source: v3.source }
+      : { status: "blocked", reason: v3.reason };
+  }
+
   private async runV2RemoteScopeRecovery(input: {
     result: SyncResult;
     callbacks: SyncCallbacks;
@@ -11197,7 +11293,100 @@ export class SyncExecutor {
     this.activeSyncScope = observedScope;
     if (this.shouldStop(result, operationEpoch)) return result;
 
+    // Protocol compatibility is a control-plane prerequisite, not a commit
+    // detail. Resolve it before local enumeration or any remote file body is
+    // read so a permanent conflict cannot waste an entire verification pass.
+    const sourceProtocolBinding =
+      await this.state.getActiveV2ProtocolBinding();
+    const recoveryVerification: RemoteScopeRecoveryVerificationSummary = {
+      schemaVersion: 1,
+      operationFingerprint:
+        sourceProtocolBinding?.migrationGeneration.slice(0, 12) ?? "unbound",
+      protocolPreflight: "blocked",
+      total: 0,
+      verifiedThisRun: 0,
+      reused: 0,
+      invalidated: 0,
+      remaining: 0,
+    };
+    const publishRecoveryVerification = (
+      patch: Partial<RemoteScopeRecoveryVerificationSummary> = {},
+    ): void => {
+      Object.assign(recoveryVerification, patch);
+      result.remoteScopeRecovery = structuredClone(recoveryVerification);
+      this.progressStore?.setRecoveryVerification(recoveryVerification);
+    };
+    publishRecoveryVerification();
+    let nextProtocolBinding: SharedSyncProtocolBinding | undefined;
+    if (!sourceProtocolBinding) {
+      result.errors = 1;
+      result.message = this.t("result.v2ScopeRecoveryProtocolBlocked");
+      this.diag?.error(
+        "state",
+        "remote scope recovery has no bound shared protocol",
+        { downloadedForRecovery: 0, mutations: 0 },
+      );
+      publishRecoveryVerification({ failureStage: "protocol-preflight" });
+      return result;
+    }
+    const protocol = await this.ensureScopeFreeSharedProtocol(
+      sourceProtocolBinding,
+    );
+    if (protocol.status !== "ready") {
+      result.errors = 1;
+      result.message = this.t("result.v2ScopeRecoveryProtocolBlocked");
+      this.diag?.error(
+        "state",
+        "scope-free shared protocol preflight blocked remote scope recovery",
+        {
+          reason: protocol.reason,
+          downloadedForRecovery: 0,
+          mutations: 0,
+        },
+      );
+      publishRecoveryVerification({ failureStage: "protocol-preflight" });
+      return result;
+    }
+    nextProtocolBinding = protocol.binding;
+    publishRecoveryVerification({ protocolPreflight: "ready" });
+    this.diag?.log(
+      "state",
+      `scope-free shared protocol preflight completed from ${protocol.source}`,
+      {
+        protocolVersion: protocol.binding.protocolVersion,
+        migrationGeneration:
+          protocol.binding.migrationGeneration.slice(0, 12),
+        mutations: 0,
+      },
+    );
+    let evidenceOperation;
+    try {
+      evidenceOperation = await this.state.beginRemoteScopeRecoveryEvidence(
+        observedScope,
+        protocol.binding,
+      );
+    } catch (error) {
+      result.errors = 1;
+      result.message = this.t("result.v2ScopeRecoveryEvidenceUnavailable");
+      publishRecoveryVerification({ failureStage: "evidence-preflight" });
+      this.diag?.error(
+        "state",
+        "remote scope recovery evidence persistence preflight failed",
+        {
+          error: error instanceof Error ? error.message : String(error),
+          downloadedForRecovery: 0,
+          mutations: 0,
+        },
+      );
+      return result;
+    }
+    publishRecoveryVerification({
+      operationFingerprint: evidenceOperation.operationId.slice(0, 12),
+    });
+    if (this.shouldStop(result, operationEpoch)) return result;
+
     enterPhase("scan");
+    publishRecoveryVerification({ failureStage: "scan" });
     this.progressStore?.setPhase("scanning");
     callbacks.onProgress?.(0, 1, this.t("progress.scanningLocal"));
     const scan = await this.scanner.scanAll();
@@ -11210,9 +11399,11 @@ export class SyncExecutor {
       result.message = this.t("result.scanIncomplete");
       return result;
     }
+    publishRecoveryVerification({ failureStage: undefined });
     if (this.shouldStop(result, operationEpoch)) return result;
 
     enterPhase("remoteChanges");
+    publishRecoveryVerification({ failureStage: "remote-snapshot" });
     this.progressStore?.setPhase("checking");
     callbacks.onProgress?.(0, 1, this.t("progress.checkingRemote"));
     const firstDelta = await this.onedrive.getDeltaByFolderId(
@@ -11262,41 +11453,159 @@ export class SyncExecutor {
         ? [{ node, path }]
         : [];
     });
+    const verificationVersions = verificationCandidates.map(({ node }) => {
+      const item = itemById.get(node.id);
+      if (!item?.eTag || typeof node.size !== "number") {
+        throw new Error(
+          `V2 scope recovery remote version is incomplete: ${node.id}`,
+        );
+      }
+      return {
+        remoteId: node.id,
+        size: node.size,
+        eTag: item.eTag,
+        ...(item.cTag ? { cTag: item.cTag } : {}),
+      };
+    });
+    let reusableEvidence;
+    try {
+      reusableEvidence =
+        await this.state.readValidRemoteScopeRecoveryEvidence(
+          evidenceOperation.operationId,
+          verificationVersions,
+        );
+    } catch (error) {
+      result.errors = 1;
+      result.message = this.t("result.v2ScopeRecoveryEvidenceUnavailable");
+      publishRecoveryVerification({ failureStage: "evidence-preflight" });
+      this.diag?.error(
+        "state",
+        "remote scope recovery evidence could not be read",
+        { error: error instanceof Error ? error.message : String(error), mutations: 0 },
+      );
+      return result;
+    }
+    for (const receipt of reusableEvidence.receiptsByRemoteId.values()) {
+      verifiedRemoteHashesById[receipt.remoteId] = receipt.sha256;
+    }
+    const pendingVerificationCandidates = verificationCandidates.filter(
+      ({ node }) => !reusableEvidence.receiptsByRemoteId.has(node.id),
+    );
+    publishRecoveryVerification({
+      total: verificationCandidates.length,
+      reused: reusableEvidence.receiptsByRemoteId.size,
+      invalidated: reusableEvidence.invalidated,
+      remaining: pendingVerificationCandidates.length,
+      failureStage: undefined,
+      firstFailurePath: undefined,
+    });
     let verifiedCount = 0;
-    for (const { node, path } of verificationCandidates) {
+    for (const { node, path } of pendingVerificationCandidates) {
+      if (this.shouldStop(result, operationEpoch)) return result;
       verifiedCount++;
       this.progressStore?.setPhase("verifying");
       this.progressStore?.setProgress(
         verifiedCount,
-        verificationCandidates.length,
+        pendingVerificationCandidates.length,
         path,
       );
       callbacks.onProgress?.(
         verifiedCount,
-        verificationCandidates.length,
+        pendingVerificationCandidates.length,
         this.t("progress.verifyingFiles", {
           current: verifiedCount,
-          total: verificationCandidates.length,
+          total: pendingVerificationCandidates.length,
         }),
       );
       const item = itemById.get(node.id);
       if (!item) {
         throw new Error(`V2 scope recovery remote item disappeared: ${node.id}`);
       }
-      const content = await this.onedrive.downloadFile(
-        this.vaultName,
-        path,
-        item["@microsoft.graph.downloadUrl"],
-        node.id,
-        node.size,
-      );
-      const hash = await sha256Hex(content);
-      await this.verifyDownloadedPayload(
-        path,
-        this.toRemoteEntry(item, path, node.parentId),
-        { size: content.byteLength, hash },
-      );
+      let content: ArrayBuffer;
+      let hash: string;
+      try {
+        content = await this.onedrive.downloadFile(
+          this.vaultName,
+          path,
+          item["@microsoft.graph.downloadUrl"],
+          node.id,
+          node.size,
+        );
+        hash = await sha256Hex(content);
+        await this.verifyDownloadedPayload(
+          path,
+          this.toRemoteEntry(item, path, node.parentId),
+          { size: content.byteLength, hash },
+        );
+      } catch (error) {
+        result.errors = 1;
+        const completed = recoveryVerification.reused
+          + recoveryVerification.verifiedThisRun;
+        result.message = this.t(
+          "result.v2ScopeRecoveryVerificationInterrupted",
+          { path },
+        );
+        publishRecoveryVerification({
+          remaining: Math.max(0, recoveryVerification.total - completed),
+          failureStage: "body-verification",
+          firstFailurePath: path,
+        });
+        this.diag?.error(
+          "state",
+          "remote scope recovery body verification stopped",
+          {
+            path,
+            verifiedThisRun: recoveryVerification.verifiedThisRun,
+            reused: recoveryVerification.reused,
+            error: error instanceof Error ? error.message : String(error),
+            mutations: 0,
+          },
+        );
+        return result;
+      }
       verifiedRemoteHashesById[node.id] = hash;
+      try {
+        await this.state.putVerifiedRemoteScopeRecoveryEvidence({
+          schemaVersion: 1,
+          operationId: evidenceOperation.operationId,
+          remoteId: node.id,
+          size: node.size!,
+          eTag: item.eTag!,
+          ...(item.cTag ? { cTag: item.cTag } : {}),
+          sha256: hash,
+          verifiedAt: Date.now(),
+        });
+      } catch (error) {
+        result.errors = 1;
+        const completed = recoveryVerification.reused
+          + recoveryVerification.verifiedThisRun;
+        result.message = this.t(
+          "result.v2ScopeRecoveryVerificationInterrupted",
+          { path },
+        );
+        publishRecoveryVerification({
+          remaining: Math.max(0, recoveryVerification.total - completed),
+          failureStage: "body-verification",
+          firstFailurePath: path,
+        });
+        this.diag?.error(
+          "state",
+          "remote scope recovery receipt could not be persisted",
+          {
+            remoteId: node.id,
+            path,
+            verifiedThisRun: verifiedCount,
+            reused: reusableEvidence.receiptsByRemoteId.size,
+            error: error instanceof Error ? error.message : String(error),
+            mutations: 0,
+          },
+        );
+        return result;
+      }
+      publishRecoveryVerification({
+        verifiedThisRun: recoveryVerification.verifiedThisRun + 1,
+        remaining: Math.max(0, recoveryVerification.remaining - 1),
+      });
       if (this.shouldStop(result, operationEpoch)) return result;
     }
 
@@ -11314,13 +11623,23 @@ export class SyncExecutor {
       );
       return result;
     }
+    publishRecoveryVerification({ failureStage: "stability-check" });
     const stabilityDelta = await this.onedrive.getDeltaByFolderId(
       observedScope.filesRootId,
       firstDeltaLink,
     );
     if (stabilityDelta.value.length > 0) {
       result.deferred = Math.max(1, stabilityDelta.value.length);
-      result.message = this.t("result.generationMismatch");
+      result.message = this.t("result.v2ScopeRecoveryChanged", {
+        count: stabilityDelta.value.length,
+      });
+      publishRecoveryVerification({
+        remaining: Math.max(
+          recoveryVerification.remaining,
+          stabilityDelta.value.length,
+        ),
+        failureStage: "stability-check",
+      });
       this.diag?.warn(
         "state",
         "V2 remote scope recovery live tree changed during proof collection; candidate discarded",
@@ -11329,6 +11648,7 @@ export class SyncExecutor {
           mutations: 0,
         },
       );
+      publishRecoveryVerification({ failureStage: "stability-check" });
       return result;
     }
     const finalPathBinding = await this.recheckV2RecoveryPathBinding(
@@ -11346,6 +11666,7 @@ export class SyncExecutor {
       );
       return result;
     }
+    publishRecoveryVerification({ failureStage: undefined });
 
     const prepared = buildRemoteScopeRecoveryCandidateV2({
       sourceEnvelope,
@@ -11371,10 +11692,12 @@ export class SyncExecutor {
           mutations: 0,
         },
       );
+      publishRecoveryVerification({ failureStage: "planning" });
       return result;
     }
 
     enterPhase("planning");
+    publishRecoveryVerification({ failureStage: "planning" });
     this.progressStore?.setPhase("planning");
     const configDir = getConfigDir(this.scanner.vault);
     const structuredCommunityPluginPath =
@@ -11428,6 +11751,7 @@ export class SyncExecutor {
           mutations: 0,
         },
       );
+      publishRecoveryVerification({ failureStage: "planning" });
       return result;
     }
     canonical = {
@@ -11486,43 +11810,34 @@ export class SyncExecutor {
     }
 
     enterPhase("commit");
-    const sourceProtocolBinding =
-      await this.state.getActiveV2ProtocolBinding();
-    let nextProtocolBinding: SharedSyncProtocolBindingV2 | undefined;
-    if (sourceProtocolBinding) {
-      const relocatedProtocol = await ensureSharedSyncProtocolV2(
-        createOneDriveSharedSyncProtocolTransportV2(
-          this.onedrive,
-          this.vaultName,
-        ),
-        {
-          scope: prepared.envelope.scope,
-          acknowledgeMigrationRisk: false,
-          expectedBinding: sourceProtocolBinding,
-        },
+    publishRecoveryVerification({ failureStage: "authority-commit" });
+    let committed: SyncStateEnvelopeV2;
+    try {
+      committed = await this.state.commitV2RemoteScopeRecoveryCandidate(
+        prepared.envelope,
+        Date.now(),
+        nextProtocolBinding,
       );
-      if (relocatedProtocol.status !== "ready") {
-        result.errors = 1;
-        result.message = this.t("result.v2ProtocolBlocked");
-        this.diag?.error(
-          "state",
-          "shared V2 sync protocol could not follow the recovered scope",
-          {
-            reason: relocatedProtocol.status === "blocked"
-              ? relocatedProtocol.reason
-              : "acknowledgement-required",
-            mutations: 0,
-          },
-        );
-        return result;
-      }
-      nextProtocolBinding = relocatedProtocol.binding;
+    } catch (error) {
+      publishRecoveryVerification({ failureStage: "authority-commit" });
+      throw error;
     }
-    const committed = await this.state.commitV2RemoteScopeRecoveryCandidate(
-      prepared.envelope,
-      Date.now(),
-      nextProtocolBinding,
-    );
+    publishRecoveryVerification({
+      remaining: 0,
+      failureStage: undefined,
+      firstFailurePath: undefined,
+    });
+    try {
+      await this.state.retireRemoteScopeRecoveryEvidence(
+        evidenceOperation.operationId,
+      );
+    } catch (error) {
+      this.diag?.warn(
+        "state",
+        "committed remote scope recovery left disposable evidence for later pruning",
+        { error: error instanceof Error ? error.message : String(error), mutations: 0 },
+      );
+    }
     const sealed = sealCanonicalPlanV2({
       finalized,
       sourceEnvelope: prepared.envelope,
@@ -12746,7 +13061,7 @@ export class SyncExecutor {
     path: string,
     conflict: SyncPlanItem | undefined,
   ): Promise<boolean> {
-    if (!isObsidianManagedConfigPath(path)) return false;
+    if (!isObsidianManagedConfigPath(path, getConfigDir(this.scanner.vault))) return false;
     // Older builds persisted one-sided managed-config conflicts whose buttons
     // meant delete. Retire those decisions and let the next plan use the
     // current non-destructive restore/create policy.
@@ -12993,7 +13308,7 @@ export class SyncExecutor {
         return;
       }
       try {
-        const managedConfig = isObsidianManagedConfigPath(path);
+        const managedConfig = isObsidianManagedConfigPath(path, getConfigDir(this.scanner.vault));
         if (!this.guardDecisionToken(queuedConflict, "notice.conflict.failed")) return;
         if (!managedConfig
           && !await this.guardReviewedLocalVersion(path, queuedConflict.local, "notice.conflict.failed")) return;
@@ -13104,7 +13419,7 @@ export class SyncExecutor {
         return;
       }
       try {
-        const managedConfig = isObsidianManagedConfigPath(path);
+        const managedConfig = isObsidianManagedConfigPath(path, getConfigDir(this.scanner.vault));
         if (!this.guardDecisionToken(queuedConflict, "notice.conflict.failed")) return;
         if (!managedConfig
           && !await this.guardReviewedLocalVersion(path, queuedConflict.local, "notice.conflict.failed")) return;

@@ -39,6 +39,9 @@ import {
 } from "../src/sync/indexeddb-public-1-1-3-state";
 import { StateV2IndexedDbActiveStore } from "../src/sync/state-v2-indexeddb-active";
 import {
+  IndexedDbRemoteScopeRecoveryEvidenceStore,
+} from "../src/sync/remote-scope-recovery-evidence-store";
+import {
   StateV2IndexedDbRecoveryStore,
   stateV2IndexedDbRecoveryEnvelopeDigest,
 } from "../src/sync/state-v2-indexeddb-recovery";
@@ -86,6 +89,7 @@ const baseA: BaseFileEntry = {
   eTag: "etag-a",
 };
 const communityPluginPath = ".obsidian/community-plugins.json";
+let harnessVaultInstanceSequence = 0;
 
 interface ActivationTestRunOptions extends SyncRunOptions {
   /**
@@ -754,11 +758,16 @@ function makeHarness(input?: {
     }),
   };
   const adapter = rawAdapter as unknown as DataAdapter;
+  const indexedDbVaultInstanceId = input?.indexedDbVaultInstanceId
+    ?? (++harnessVaultInstanceSequence).toString(16).padStart(32, "0");
   const plugin: PluginDataStore = {
     loadData: vi.fn(async () => pluginData),
     updatePluginData: vi.fn(async (mutator) => mutator(pluginData)),
     app: { vault: { adapter, configDir: ".obsidian" } },
     manifest: { id: "easy-sync", dir: paths.pluginDir },
+    indexedDbVaultInstanceId,
+    createRemoteScopeRecoveryEvidenceStore: (vaultInstanceId) =>
+      new IndexedDbRemoteScopeRecoveryEvidenceStore(vaultInstanceId),
     ...(input?.createPublic113IndexedDbCandidateStore
       ? {
           createPublic113IndexedDbCandidateStore:
@@ -767,8 +776,6 @@ function makeHarness(input?: {
       : {}),
     ...(input?.createStateV2IndexedDbActiveStore
       ? {
-          indexedDbVaultInstanceId:
-            input.indexedDbVaultInstanceId ?? "1".repeat(32),
           createStateV2IndexedDbActiveStore:
             input.createStateV2IndexedDbActiveStore,
         }
@@ -938,6 +945,12 @@ function makeHarness(input?: {
     content: string;
   } | null = null;
   let sharedProtocolCreateCount = 0;
+  let sharedProtocolV3Object: {
+    id: string;
+    eTag: string;
+    content: string;
+  } | null = null;
+  let sharedProtocolV3CreateCount = 0;
   const cloudBootstrap = {
     read: vi.fn(async () => cloudBootstrapObject),
     create: vi.fn(async (_vaultName: string, content: string) => {
@@ -1010,6 +1023,31 @@ function makeHarness(input?: {
         throw new Error("protocol missing");
       }
       return sharedProtocolObject;
+    }),
+    readSharedSyncProtocolV3: vi.fn(async () => sharedProtocolV3Object),
+    createSharedSyncProtocolV3: vi.fn(async (
+      _vaultName: string,
+      content: string,
+    ) => {
+      if (sharedProtocolV3Object) throw new Error("protocol conflict");
+      sharedProtocolV3CreateCount++;
+      sharedProtocolV3Object = {
+        id: sharedProtocolV3CreateCount === 1
+          ? "protocol-v3-id"
+          : `protocol-v3-id-${sharedProtocolV3CreateCount}`,
+        eTag: "protocol-v3-etag",
+        content,
+      };
+      return {
+        id: sharedProtocolV3Object.id,
+        eTag: sharedProtocolV3Object.eTag,
+      };
+    }),
+    readSharedSyncProtocolV3ById: vi.fn(async (id: string) => {
+      if (!sharedProtocolV3Object || sharedProtocolV3Object.id !== id) {
+        throw new Error("protocol missing");
+      }
+      return sharedProtocolV3Object;
     }),
     fullScan: vi.fn(async () => [...remoteItemState]),
     getFileMetadata: vi.fn(async (_vaultName: string, path: string) => {
@@ -1231,6 +1269,7 @@ function makeHarness(input?: {
     runOnNextDelta: (callback: () => void) => { onNextDelta = callback; },
     clearSharedProtocolForRecoveredScope: () => {
       sharedProtocolObject = null;
+      sharedProtocolV3Object = null;
     },
     seedSharedProtocol: (protocolScope: SyncScope = scope) => {
       sharedProtocolObject = {
@@ -1248,6 +1287,14 @@ function makeHarness(input?: {
         }),
       };
     },
+    seedSharedProtocolV3: (content: string) => {
+      sharedProtocolV3Object = {
+        id: "protocol-v3-conflict-id",
+        eTag: "protocol-v3-conflict-etag",
+        content,
+      };
+    },
+    getSharedProtocolV3: () => sharedProtocolV3Object,
   };
 }
 
@@ -2417,9 +2464,9 @@ describe("V1 to V2 controlled production activation", () => {
     )).toMatchObject({
       protocolBinding: {
         schemaVersion: 1,
-        protocolVersion: 2,
+        protocolVersion: 3,
         migrationGeneration: expect.stringMatching(/^[a-f0-9]{64}$/),
-        recordId: "protocol-id",
+        recordId: "protocol-v3-id",
       },
     });
 
@@ -2842,7 +2889,14 @@ describe("V1 to V2 controlled production activation", () => {
       expect(JSON.parse(
         harness.files.get(paths.stateV2AuthorityWitnessFile)!,
       )).toMatchObject({
-        protocolBinding,
+        protocolBinding: {
+          protocolVersion: 3,
+          migrationGeneration: protocolBinding.migrationGeneration,
+          predecessorConfirmedAllDevicesUpdatedAt:
+            protocolBinding.confirmedAllDevicesUpdatedAt,
+          recordId: "protocol-v3-id",
+          recordETag: "protocol-v3-etag",
+        },
         storageAuthority: {
           kind: "indexeddb",
           databaseId: expect.stringMatching(/^[a-f0-9]{32}$/),
@@ -5274,10 +5328,10 @@ describe("V1 to V2 controlled production activation", () => {
     )).toMatchObject({
       protocolBinding: {
         schemaVersion: 1,
-        protocolVersion: 2,
+        protocolVersion: 3,
         migrationGeneration: expect.stringMatching(/^[a-f0-9]{64}$/),
-        recordId: "protocol-id",
-        recordETag: "protocol-etag",
+        recordId: "protocol-v3-id",
+        recordETag: "protocol-v3-etag",
       },
     });
     expect(findRemoteItemByPath(harness.remoteItemState, "Empty")?.folder)
@@ -5362,8 +5416,9 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.state.activeV2MigrationHold).toMatchObject({
       phase: "confirmed",
       protocolBinding: {
+        protocolVersion: 3,
         migrationGeneration: expect.stringMatching(/^[a-f0-9]{64}$/),
-        recordId: "protocol-id",
+        recordId: "protocol-v3-id",
       },
     });
 
@@ -5376,11 +5431,12 @@ describe("V1 to V2 controlled production activation", () => {
       harness.files.get(paths.stateV2AuthorityWitnessFile)!,
     )).toMatchObject({
       protocolBinding: {
+        protocolVersion: 3,
         migrationGeneration:
           harness.state.activeV2MigrationHold!.protocolBinding!
             .migrationGeneration,
-        recordId: "protocol-id",
-        recordETag: "protocol-etag",
+        recordId: "protocol-v3-id",
+        recordETag: "protocol-v3-etag",
       },
     });
   });
@@ -11252,7 +11308,10 @@ describe("V1 to V2 controlled production activation", () => {
 
     const interrupted = await harness.executor.run("manual");
 
-    expect(interrupted).toMatchObject({ success: false, errors: 1 });
+    expect(interrupted).toMatchObject({
+      success: false,
+      errors: 1,
+    });
     expect(harness.state.activeSyncScopeExpansion).not.toBeNull();
     const committedSeq =
       harness.state.getCommittedV2Envelope()!.meta.commitSeq;
@@ -12626,13 +12685,425 @@ describe("V1 to V2 controlled production activation", () => {
       harness.files.get(paths.stateV2AuthorityWitnessFile)!,
     )).toMatchObject({
       protocolBinding: {
+        protocolVersion: 3,
         migrationGeneration: originalProtocolBinding.migrationGeneration,
-        confirmedAllDevicesUpdatedAt:
-          originalProtocolBinding.confirmedAllDevicesUpdatedAt,
-        recordId: "protocol-id-2",
+        predecessorConfirmedAllDevicesUpdatedAt:
+          originalProtocolBinding.predecessorConfirmedAllDevicesUpdatedAt,
+        recordId: "protocol-v3-id-2",
       },
     });
     expectNoFileMutations(harness.mutations);
+  });
+
+  it("recovers a changed scope while preserving the existing old-scope V2 protocol", async () => {
+    const content = "0123456789";
+    const contentHash = await sha256Hex(new TextEncoder().encode(content));
+    const local = {
+      ...localA,
+      hash: contentHash,
+    };
+    const base = {
+      ...baseA,
+      hash: contentHash,
+    };
+    const harness = makeHarness({
+      base: [base],
+      local: [local],
+      remoteHash: contentHash,
+      remoteFileContents: { [local.path]: content },
+    });
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    const existingProtocol = await harness.client.readSharedSyncProtocolV2(
+      "testVault",
+    );
+    expect(existingProtocol).not.toBeNull();
+
+    const replacementScope = {
+      driveId: "drive-live",
+      vaultFolderId: "vault-live",
+      filesRootId: "root-live",
+    };
+    const restoreReplacement = vi.fn()
+      .mockRejectedValueOnce(
+        new RemoteVaultScopeIdentityError("files-root-invalid"),
+      )
+      .mockResolvedValue(replacementScope);
+    (harness.client as unknown as {
+      restoreVaultScopeByIdentity: typeof restoreReplacement;
+    }).restoreVaultScopeByIdentity = restoreReplacement;
+    vi.mocked(harness.client.initVaultScope).mockResolvedValue(replacementScope);
+
+    expect((await harness.executor.run("auto")).message)
+      .toBe("result.v2ScopeRecoveryPending");
+
+    const rootFolder = harness.remoteItemState.find(
+      (item) => item.id === "folder-notes",
+    )!;
+    rootFolder.parentReference = { id: replacementScope.filesRootId };
+    const remoteFile = harness.remoteItemState.find(
+      (item) => item.id === "file-a",
+    )!;
+    remoteFile.file = { hashes: {} };
+    vi.mocked(harness.client.getFileMetadata).mockResolvedValue({
+      driveId: remoteFile.id,
+      parentId: remoteFile.parentReference!.id!,
+      size: remoteFile.size!,
+      mtime: new Date(remoteFile.lastModifiedDateTime!).getTime(),
+      eTag: remoteFile.eTag!,
+      cTag: remoteFile.cTag!,
+      downloadUrl: remoteFile["@microsoft.graph.downloadUrl"],
+    });
+    harness.getDelta.mockReset();
+    harness.getDelta
+      .mockResolvedValueOnce({
+        value: [...harness.remoteItemState],
+        "@odata.deltaLink": "https://graph.example/recovery-snapshot",
+      })
+      .mockResolvedValueOnce({
+        value: [],
+        "@odata.deltaLink": "https://graph.example/recovery-stable",
+      });
+    vi.mocked(harness.mutations.downloadFile).mockClear();
+
+    const recovered = await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { recoverV2RemoteScope: true },
+    );
+
+    expect(recovered).toMatchObject({
+      success: true,
+      errors: 0,
+      message: "result.synced",
+    });
+    expect(harness.mutations.downloadFile).toHaveBeenCalledTimes(1);
+    expect(harness.state.hasV2RemoteScopeRecovery).toBe(false);
+    expect(harness.state.remoteScope).toEqual({
+      accountId: scope.accountId,
+      ...replacementScope,
+    });
+    await expect(harness.client.readSharedSyncProtocolV2("testVault"))
+      .resolves.toEqual(existingProtocol);
+    expect(harness.getSharedProtocolV3()).not.toBeNull();
+    expect(JSON.parse(harness.getSharedProtocolV3()!.content))
+      .not.toHaveProperty("scope");
+    expect(JSON.parse(
+      harness.files.get(paths.stateV2AuthorityWitnessFile)!,
+    )).toMatchObject({
+      protocolBinding: {
+        protocolVersion: 3,
+        migrationGeneration: JSON.parse(existingProtocol!.content)
+          .migrationGeneration,
+      },
+    });
+    expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
+    expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(harness.mutations.renameItem).not.toHaveBeenCalled();
+  });
+
+  it("blocks a conflicting V3 protocol before recovery scan or file download", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    const replacementScope = {
+      driveId: "drive-live",
+      vaultFolderId: "vault-live",
+      filesRootId: "root-live",
+    };
+    const restoreReplacement = vi.fn()
+      .mockRejectedValueOnce(
+        new RemoteVaultScopeIdentityError("files-root-invalid"),
+      )
+      .mockResolvedValue(replacementScope);
+    (harness.client as unknown as {
+      restoreVaultScopeByIdentity: typeof restoreReplacement;
+    }).restoreVaultScopeByIdentity = restoreReplacement;
+    vi.mocked(harness.client.initVaultScope).mockResolvedValue(replacementScope);
+    expect((await harness.executor.run("auto")).message)
+      .toBe("result.v2ScopeRecoveryPending");
+
+    const conflicting = JSON.parse(harness.getSharedProtocolV3()!.content);
+    conflicting.migrationGeneration = "f".repeat(64);
+    harness.seedSharedProtocolV3(JSON.stringify(conflicting));
+    vi.mocked(harness.scanner.scanAll).mockClear();
+    vi.mocked(harness.mutations.downloadFile).mockClear();
+    harness.getDelta.mockClear();
+
+    const blocked = await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { recoverV2RemoteScope: true },
+    );
+
+    expect(blocked).toMatchObject({
+      success: false,
+      errors: 1,
+      message: "result.v2ScopeRecoveryProtocolBlocked",
+    });
+    expect(harness.scanner.scanAll).not.toHaveBeenCalled();
+    expect(harness.getDelta).not.toHaveBeenCalled();
+    expect(harness.mutations.downloadFile).not.toHaveBeenCalled();
+    expect(harness.state.hasV2RemoteScopeRecovery).toBe(true);
+  });
+
+  it("resumes after receipt persistence and body failures without redownloading valid receipts", async () => {
+    const contents = {
+      "Notes/a.md": "aaaaaaaaaa",
+      "Notes/b.md": "bbbbbbbbbb",
+      "Notes/c.md": "cccccccccc",
+    };
+    const hashes = Object.fromEntries(await Promise.all(
+      Object.entries(contents).map(async ([path, content]) => [
+        path,
+        await sha256Hex(new TextEncoder().encode(content)),
+      ]),
+    ));
+    const local = Object.entries(contents).map(([path, content], index) => ({
+      path,
+      size: content.length,
+      mtime: index + 1,
+      hash: hashes[path]!,
+      binary: false,
+    }));
+    const base = local.map((entry, index) => ({
+      path: entry.path,
+      hash: entry.hash,
+      size: entry.size,
+      eTag: `etag-${index + 1}`,
+    }));
+    const remote: DriveItem[] = [
+      {
+        id: "folder-notes",
+        name: "Notes",
+        folder: {},
+        parentReference: { id: scope.filesRootId },
+        eTag: "etag-notes",
+        cTag: "ctag-notes",
+      },
+      ...local.map((entry, index) => ({
+        id: `file-${index + 1}`,
+        name: entry.path.split("/").at(-1)!,
+        size: entry.size,
+        file: { hashes: { sha256Hash: entry.hash } },
+        parentReference: { id: "folder-notes" },
+        lastModifiedDateTime: "2026-08-05T00:00:00.000Z",
+        eTag: `etag-${index + 1}`,
+        cTag: `ctag-${index + 1}`,
+      })),
+    ];
+    const harness = makeHarness({
+      base,
+      local,
+      remoteItems: remote,
+      remoteFileContents: contents,
+    });
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    const replacementScope = {
+      driveId: "drive-live",
+      vaultFolderId: "vault-live",
+      filesRootId: "root-live",
+    };
+    const restoreReplacement = vi.fn()
+      .mockRejectedValueOnce(
+        new RemoteVaultScopeIdentityError("files-root-invalid"),
+      )
+      .mockResolvedValue(replacementScope);
+    (harness.client as unknown as {
+      restoreVaultScopeByIdentity: typeof restoreReplacement;
+    }).restoreVaultScopeByIdentity = restoreReplacement;
+    vi.mocked(harness.client.initVaultScope).mockResolvedValue(replacementScope);
+    expect((await harness.executor.run("auto")).message)
+      .toBe("result.v2ScopeRecoveryPending");
+
+    harness.remoteItemState.find((item) => item.id === "folder-notes")!
+      .parentReference = { id: replacementScope.filesRootId };
+    for (const item of harness.remoteItemState) {
+      if (item.file) item.file = { hashes: {} };
+    }
+    vi.mocked(harness.client.getFileMetadata).mockImplementation(
+      async (_vaultName: string, path: string) => {
+        const item = harness.remoteItemState.find((candidate) =>
+          candidate.file && candidate.name === path.split("/").at(-1));
+        return item ? {
+          driveId: item.id,
+          parentId: item.parentReference!.id!,
+          size: item.size!,
+          mtime: new Date(item.lastModifiedDateTime!).getTime(),
+          eTag: item.eTag!,
+          cTag: item.cTag!,
+          downloadUrl: item["@microsoft.graph.downloadUrl"],
+        } : null;
+      },
+    );
+    harness.getDelta.mockReset();
+    harness.getDelta
+      .mockResolvedValueOnce({
+        value: [...harness.remoteItemState],
+        "@odata.deltaLink": "https://graph.example/recovery-first",
+      })
+      .mockResolvedValueOnce({
+        value: [...harness.remoteItemState],
+        "@odata.deltaLink": "https://graph.example/recovery-second",
+      })
+      .mockResolvedValueOnce({
+        value: [...harness.remoteItemState],
+        "@odata.deltaLink": "https://graph.example/recovery-third",
+      })
+      .mockResolvedValueOnce({
+        value: [],
+        "@odata.deltaLink": "https://graph.example/recovery-stable",
+      });
+    vi.mocked(harness.mutations.downloadFile).mockClear();
+    const putVerified = harness.state.putVerifiedRemoteScopeRecoveryEvidence
+      .bind(harness.state);
+    let receiptWrites = 0;
+    vi.spyOn(harness.state, "putVerifiedRemoteScopeRecoveryEvidence")
+      .mockImplementation(async (receipt) => {
+        receiptWrites++;
+        if (receiptWrites === 2) {
+          throw new Error("injected receipt quota failure");
+        }
+        await putVerified(receipt);
+      });
+    let failLastOnce = true;
+    vi.mocked(harness.mutations.downloadFile).mockImplementation(
+      async (_vaultName: string, path: string) => {
+        if (path === "Notes/c.md" && failLastOnce) {
+          failLastOnce = false;
+          throw new Error("injected final verification failure");
+        }
+        return new TextEncoder().encode(contents[path as keyof typeof contents])
+          .buffer;
+      },
+    );
+
+    const interrupted = await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { recoverV2RemoteScope: true },
+    );
+    expect(interrupted).toMatchObject({
+      success: false,
+      errors: 1,
+      remoteScopeRecovery: {
+        total: 3,
+        verifiedThisRun: 1,
+        reused: 0,
+        remaining: 2,
+        failureStage: "body-verification",
+        firstFailurePath: "Notes/b.md",
+      },
+    });
+    expect(harness.mutations.downloadFile.mock.calls.map((call) => call[1]))
+      .toEqual(["Notes/a.md", "Notes/b.md"]);
+
+    await harness.state.close();
+    const restartedState = new StateManager(harness.plugin);
+    await restartedState.load();
+    const restartedExecutor = new SyncExecutor(
+      harness.client as never,
+      harness.scanner,
+      restartedState,
+      "testVault",
+    );
+    const interruptedAgain = await restartedExecutor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { recoverV2RemoteScope: true },
+    );
+
+    expect(interruptedAgain).toMatchObject({
+      success: false,
+      errors: 1,
+      remoteScopeRecovery: {
+        total: 3,
+        verifiedThisRun: 1,
+        reused: 1,
+        remaining: 1,
+        failureStage: "body-verification",
+        firstFailurePath: "Notes/c.md",
+      },
+    });
+    expect(harness.mutations.downloadFile.mock.calls.map((call) => call[1]))
+      .toEqual([
+        "Notes/a.md",
+        "Notes/b.md",
+        "Notes/b.md",
+        "Notes/c.md",
+      ]);
+
+    await restartedState.close();
+    const finalState = new StateManager(harness.plugin);
+    await finalState.load();
+    const finalExecutor = new SyncExecutor(
+      harness.client as never,
+      harness.scanner,
+      finalState,
+      "testVault",
+    );
+    const recovered = await finalExecutor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { recoverV2RemoteScope: true },
+    );
+
+    expect(recovered).toMatchObject({
+      success: true,
+      errors: 0,
+      message: "result.synced",
+      remoteScopeRecovery: {
+        total: 3,
+        verifiedThisRun: 1,
+        reused: 2,
+        remaining: 0,
+      },
+    });
+    expect(harness.mutations.downloadFile.mock.calls.map((call) => call[1]))
+      .toEqual([
+        "Notes/a.md",
+        "Notes/b.md",
+        "Notes/b.md",
+        "Notes/c.md",
+        "Notes/c.md",
+      ]);
+    expect(finalState.hasV2RemoteScopeRecovery).toBe(false);
+    expectNoFileMutations({
+      ...harness.mutations,
+      downloadFile: vi.fn(),
+    });
   });
 
   it("keeps V2 active without staging scope recovery on a transient identity lookup failure", async () => {

@@ -6,9 +6,10 @@ import {
 } from "./types";
 import type { StateV2Manifest } from "./state-v2-migration";
 import {
-  isSharedSyncProtocolBindingV2,
-  type SharedSyncProtocolBindingV2,
-} from "./sync-protocol-v2";
+  isSharedSyncProtocolBinding,
+  isSharedSyncProtocolBindingTransitionAllowed,
+  type SharedSyncProtocolBinding,
+} from "./sync-protocol-v3";
 
 export interface StateV2ActiveAuthorityWitness {
   schemaVersion: 1;
@@ -25,7 +26,7 @@ export interface StateV2ActiveAuthorityWitness {
    */
   storageAuthority?: StateV2IndexedDbStorageAuthority;
   /** Required for every production V1→V2 cutover created after V2-50. */
-  protocolBinding?: SharedSyncProtocolBindingV2;
+  protocolBinding?: SharedSyncProtocolBinding;
 }
 
 export interface StateV2IndexedDbStorageAuthorityV1 {
@@ -153,7 +154,7 @@ export class StateV2AuthorityWitnessStore {
   async publishActive(
     manifest: StateV2Manifest,
     now = Date.now(),
-    protocolBinding?: SharedSyncProtocolBindingV2,
+    protocolBinding?: SharedSyncProtocolBinding,
   ): Promise<StateV2ActiveAuthorityWitness> {
     const current = await this.load();
     if (current) {
@@ -195,7 +196,7 @@ export class StateV2AuthorityWitnessStore {
     expectedManifest: StateV2Manifest;
     expectedRevision: number;
     nextManifest: StateV2Manifest;
-    nextProtocolBinding?: SharedSyncProtocolBindingV2;
+    nextProtocolBinding?: SharedSyncProtocolBinding;
     now?: number;
   }): Promise<StateV2ActiveAuthorityWitness> {
     const current = await this.load();
@@ -529,7 +530,7 @@ export function validateStateV2AuthorityWitness(
     || !isManifest(value.manifest)
     || (
       value.protocolBinding !== undefined
-      && !isSharedSyncProtocolBindingV2(value.protocolBinding)
+      && !isSharedSyncProtocolBinding(value.protocolBinding)
     )
     || (
       value.storageAuthority !== undefined
@@ -581,8 +582,8 @@ function sameWitness(
 }
 
 function sameProtocolBinding(
-  left: SharedSyncProtocolBindingV2 | undefined,
-  right: SharedSyncProtocolBindingV2,
+  left: SharedSyncProtocolBinding | undefined,
+  right: SharedSyncProtocolBinding,
 ): boolean {
   return left !== undefined && JSON.stringify(left) === JSON.stringify(right);
 }
@@ -680,14 +681,11 @@ function storageAuthorityTransitionAllowed(
 }
 
 function protocolBindingTransitionAllowed(
-  current: SharedSyncProtocolBindingV2 | undefined,
-  next: SharedSyncProtocolBindingV2 | undefined,
+  current: SharedSyncProtocolBinding | undefined,
+  next: SharedSyncProtocolBinding | undefined,
 ): boolean {
   if (!current || !next) return current === undefined && next === undefined;
-  return current.protocolVersion === next.protocolVersion
-    && current.migrationGeneration === next.migrationGeneration
-    && current.confirmedAllDevicesUpdatedAt
-      === next.confirmedAllDevicesUpdatedAt;
+  return isSharedSyncProtocolBindingTransitionAllowed(current, next);
 }
 
 function activeManifestTransitionAllowed(

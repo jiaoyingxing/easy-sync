@@ -118,6 +118,13 @@ function attachParticipationState(
   initial: DeviceCommunityPluginParticipationV1,
 ) {
   let participation = structuredClone(initial);
+  const updateCommunityPluginParticipation = vi.fn(async (command) => {
+    participation = reduceDeviceCommunityPluginParticipation(
+      participation,
+      command,
+    );
+    return true;
+  });
   const state = {
     isV2StateActive: true,
     hasV2StateLoadRecoveryBlock: false,
@@ -125,23 +132,34 @@ function attachParticipationState(
     hasMutationLedgerCorruption: false,
     hasMutationRecoveryQuarantineCorruption: false,
     mutationLedger: [],
+    activeV2MigrationHold: null,
+    hasCompleteRemoteFolderIndex: false,
+    remoteFolders: [],
     getCommunityPluginParticipation: vi.fn(() =>
       structuredClone(participation)
     ),
-    updateCommunityPluginParticipation: vi.fn(async (command) => {
-      participation = reduceDeviceCommunityPluginParticipation(
-        participation,
-        command,
-      );
+    updateCommunityPluginParticipation,
+    updateCommunityPluginParticipationBatch: vi.fn(async (commands) => {
+      for (const command of commands) {
+        await updateCommunityPluginParticipation(command);
+      }
       return true;
     }),
     retirePendingStateForPaths: vi.fn().mockResolvedValue(undefined),
+    commitSyncPathSettingsChange: vi.fn(async (
+      _isPathInScope: (path: string) => boolean,
+      persistSettings: (data: Record<string, unknown>) => void,
+    ) => persistSettings({})),
   };
   plugin.state = state as never;
   plugin.scanner = {
     shouldSyncPath: vi.fn().mockReturnValue(true),
     shouldSyncFolderPath: vi.fn().mockReturnValue(true),
     setConfig: vi.fn(),
+  } as never;
+  plugin.syncExecutor = {
+    hasActivityInFlight: false,
+    setCommunityPluginSyncPolicy: vi.fn(),
   } as never;
   vi.spyOn(plugin as never, "updateStatusBar")
     .mockImplementation(() => undefined);
@@ -435,6 +453,8 @@ describe("main sync entry guards", () => {
     });
     expect(participation.state.updateCommunityPluginParticipation)
       .toHaveBeenCalledTimes(2);
+    expect(participation.state.commitSyncPathSettingsChange)
+      .toHaveBeenCalledOnce();
     expect(deleteItem).not.toHaveBeenCalled();
   });
 
@@ -475,6 +495,8 @@ describe("main sync entry guards", () => {
       joinedGeneration: 4,
       lastConfirmedLocalBundleDigest: "a".repeat(64),
     });
+    expect(participation.state.commitSyncPathSettingsChange)
+      .toHaveBeenCalledTimes(2);
   });
 
   it("repairs a missed uninstall from the shared startup reconciliation entry", async () => {

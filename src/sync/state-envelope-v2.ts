@@ -480,40 +480,34 @@ export class StateEnvelopeV2Store {
     };
     await this.adapter.write(this.paths.recovery, JSON.stringify(recovery));
 
+    await this.removeIfExists(this.paths.next);
+    await this.adapter.write(this.paths.next, JSON.stringify(candidate));
+    const staged = await this.readEnvelopeRequired(this.paths.next);
+    if (!sameEnvelope(candidate, staged)) {
+      throw new Error("V2 staged state differs from the publication candidate");
+    }
+
+    await this.removeIfExists(this.paths.previous);
+    if (current) await this.adapter.rename(this.paths.committed, this.paths.previous);
     try {
-      await this.removeIfExists(this.paths.next);
-      await this.adapter.write(this.paths.next, JSON.stringify(candidate));
-      const staged = await this.readEnvelopeRequired(this.paths.next);
-      if (!sameEnvelope(candidate, staged)) {
-        throw new Error("V2 staged state differs from the publication candidate");
-      }
-
-      await this.removeIfExists(this.paths.previous);
-      if (current) await this.adapter.rename(this.paths.committed, this.paths.previous);
-      try {
-        await this.adapter.rename(this.paths.next, this.paths.committed);
-      } catch (error) {
-        await this.restorePrevious();
-        throw error;
-      }
-
-      try {
-        const published = await this.readEnvelopeRequired(this.paths.committed);
-        if (!sameEnvelope(candidate, published)) {
-          throw new Error("V2 committed state failed read-back verification");
-        }
-      } catch (error) {
-        await this.removeIfExists(this.paths.committed);
-        await this.restorePrevious();
-        throw error;
-      }
-
-      await this.cleanupPublishedArtifacts();
+      await this.adapter.rename(this.paths.next, this.paths.committed);
     } catch (error) {
-      // A recovery record is intentionally retained. The caller must stop the
-      // mutation chain; the next run can inspect external facts before retrying.
+      await this.restorePrevious();
       throw error;
     }
+
+    try {
+      const published = await this.readEnvelopeRequired(this.paths.committed);
+      if (!sameEnvelope(candidate, published)) {
+        throw new Error("V2 committed state failed read-back verification");
+      }
+    } catch (error) {
+      await this.removeIfExists(this.paths.committed);
+      await this.restorePrevious();
+      throw error;
+    }
+
+    await this.cleanupPublishedArtifacts();
   }
 
   /**

@@ -1901,9 +1901,60 @@ export class OneDriveClient {
     );
   }
 
+  // ---- Shared Sync Protocol V3 ----
+
+  async readSharedSyncProtocolV3(
+    vaultName: string,
+  ): Promise<{ id: string; eTag: string; content: string } | null> {
+    const storageVaultName = this.getStorageVaultName(vaultName);
+    const childrenResp = await this.request(
+      "GET",
+      `${APP_FOLDER_PATHS.pluginDir(storageVaultName)}:/children`,
+    );
+    const children = (childrenResp.json as { value?: DriveItem[] }).value ?? [];
+    const item = children.find(
+      (entry) => entry.name === "protocol-v3.json" && entry.file,
+    );
+    if (!item) return null;
+    return this.readPluginControlItemV2(item, "SharedSyncProtocolV3");
+  }
+
+  async readSharedSyncProtocolV3ById(
+    id: string,
+  ): Promise<{ id: string; eTag: string; content: string }> {
+    const metaResp = await this.request(
+      "GET",
+      `/me/drive/items/${encodeURIComponent(id)}?select=id,name,eTag,file,@microsoft.graph.downloadUrl`,
+    );
+    return this.readPluginControlItemV2(
+      metaResp.json as DriveItem,
+      "SharedSyncProtocolV3",
+    );
+  }
+
+  async createSharedSyncProtocolV3(
+    vaultName: string,
+    content: string,
+  ): Promise<{ id: string; eTag: string }> {
+    const apiPath = `${APP_FOLDER_PATHS.pluginDir(this.getStorageVaultName(vaultName))}/protocol-v3.json:/content?@microsoft.graph.conflictBehavior=fail`;
+    const response = await this.request(
+      "PUT",
+      apiPath,
+      content,
+      "application/json",
+    );
+    return requirePluginControlFileVersion(
+      response.json,
+      "SharedSyncProtocolV3",
+    );
+  }
+
   private async readPluginControlItemV2(
     initial: DriveItem,
-    label: "CloudBootstrapV2" | "SharedSyncProtocolV2",
+    label:
+      | "CloudBootstrapV2"
+      | "SharedSyncProtocolV2"
+      | "SharedSyncProtocolV3",
   ): Promise<{ id: string; eTag: string; content: string }> {
     if (!initial.id) throw new Error(`${label} item has no driveItem id`);
     let item = initial;
@@ -2798,7 +2849,10 @@ function requestErrorMessage(rawError: unknown): string {
 
 function requirePluginControlFileVersion(
   value: unknown,
-  label: "CloudBootstrapV2" | "SharedSyncProtocolV2",
+  label:
+    | "CloudBootstrapV2"
+    | "SharedSyncProtocolV2"
+    | "SharedSyncProtocolV3",
 ): { id: string; eTag: string } {
   if (!value || typeof value !== "object") {
     throw new Error(`${label} write returned no metadata`);

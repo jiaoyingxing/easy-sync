@@ -242,6 +242,7 @@ export interface LocaleStrings {
   "progress.loadingBaseline": string;
   "progress.generatingPlan": string;
   "progress.verifyingFiles": string;
+  "progress.remoteScopeRecovery": string;
   "progress.recoveringMutation": string;
 
   // ---- Sync Results ----
@@ -267,6 +268,10 @@ export interface LocaleStrings {
   "result.v2RecoveryBlocked": string;
   "result.v2StateLoadBlocked": string;
   "result.v2ScopeRecoveryPending": string;
+  "result.v2ScopeRecoveryProtocolBlocked": string;
+  "result.v2ScopeRecoveryEvidenceUnavailable": string;
+  "result.v2ScopeRecoveryVerificationInterrupted": string;
+  "result.v2ScopeRecoveryChanged": string;
   "reason.remoteScopeRecreate": string;
   "result.communityPluginEnablementInvalid": string;
   "result.communityPluginEnablementDecisionRequired": string;
@@ -291,6 +296,7 @@ export interface LocaleStrings {
   "notice.sync.start": string;
   "notice.sync.stage": string;
   "notice.sync.progress": string;
+  "notice.sync.remoteScopeRecovery": string;
   "notice.sync.actionProgress": string;
   "notice.sync.cancelling": string;
   "notice.sync.completed": string;
@@ -507,6 +513,8 @@ export interface LocaleStrings {
   "syncView.progress.current": string;
   "syncView.progress.items": string;
   "syncView.progress.completed": string;
+  "syncView.progress.remoteScopeRecoveryFailed": string;
+  "syncView.progress.remoteScopeRecoveryStopped": string;
   "syncView.cancelSync": string;
   "syncView.cancelling": string;
   "syncView.failure.contentUnavailable": string;
@@ -518,6 +526,7 @@ export interface LocaleStrings {
   "syncView.failure.remoteChangedDuringDownload": string;
   "syncView.failure.localChangedBeforeDelete": string;
   "syncView.failure.local": string;
+  "syncView.failure.unknown": string;
   "syncView.status.synced": string;
   "syncView.recovery.checking": string;
   "syncView.recovery.waitingNetwork": string;
@@ -581,6 +590,8 @@ export interface LocaleStrings {
   // ---- Sync Plan Alert & Review ----
   "syncPlan.readyTitle": string;
   "syncPlan.readyMessage": string;
+  "syncPlan.reviewUpdatedTitle": string;
+  "syncPlan.reviewUpdatedMessage": string;
   "syncPlan.viewButton": string;
   "syncPlan.sectionTitle": string;
   "syncPlan.confirmExecute": string;

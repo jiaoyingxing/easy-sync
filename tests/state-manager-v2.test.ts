@@ -379,6 +379,37 @@ describe("StateManager V2 production controller", () => {
         phase: "join-requested",
         operationId: "join-remote-only",
       });
+
+      await restarted.updateCommunityPluginParticipationBatch([{
+        type: "set-scope-enabled",
+        enabled: false,
+      }, {
+        type: "confirm-excluded",
+        pluginId: "installed",
+      }], 12);
+      expect(restarted.getCommunityPluginParticipation()).toMatchObject({
+        scopeEnabled: false,
+        pluginsById: {
+          installed: { phase: "excluded" },
+          "remote-only": { phase: "join-requested" },
+        },
+      });
+
+      const beforeRejectedBatch =
+        restarted.getCommunityPluginParticipation();
+      await expect(restarted.updateCommunityPluginParticipationBatch([{
+        type: "set-scope-enabled",
+        enabled: true,
+      }, {
+        type: "block",
+        pluginId: "installed",
+        reason: " ",
+      }], 13)).rejects.toThrow(
+        "Device community-plugin blocked reason is required",
+      );
+      expect(restarted.getCommunityPluginParticipation()).toEqual(
+        beforeRejectedBatch,
+      );
     } finally {
       await (restarted ?? state).close();
       if (databaseId) {

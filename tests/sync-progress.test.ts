@@ -105,4 +105,31 @@ describe("SyncProgressStore retention", () => {
     expect(isAnySyncActivityRunning(progress.state, true, false)).toBe(true);
   });
 
+  it("keeps recovery proof separate from mutations until the next run", () => {
+    const progress = new SyncProgressStore();
+    progress.markStarted();
+    progress.setRecoveryVerification({
+      operationFingerprint: "abcdef123456",
+      protocolPreflight: "ready",
+      total: 3,
+      verifiedThisRun: 1,
+      reused: 1,
+      invalidated: 0,
+      remaining: 1,
+      failureStage: "body-verification",
+      firstFailurePath: "Notes/c.md",
+    });
+
+    progress.finish();
+    expect(progress.state.recoveryVerification).toMatchObject({
+      verifiedThisRun: 1,
+      reused: 1,
+      remaining: 1,
+    });
+    expect(progress.state.completedFiles).toEqual([]);
+
+    progress.markStarted();
+    expect(progress.state.recoveryVerification).toBeUndefined();
+  });
+
 });

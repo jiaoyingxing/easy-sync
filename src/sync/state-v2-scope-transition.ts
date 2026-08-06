@@ -15,9 +15,10 @@ import {
 } from "./state-v2-migration";
 import { isSyncScope, sameSyncScope } from "./types";
 import {
-  isSharedSyncProtocolBindingV2,
-  type SharedSyncProtocolBindingV2,
-} from "./sync-protocol-v2";
+  isSharedSyncProtocolBinding,
+  isSharedSyncProtocolBindingTransitionAllowed,
+  type SharedSyncProtocolBinding,
+} from "./sync-protocol-v3";
 
 export interface StateV2ScopeTransitionPaths {
   stateCommitted: string;
@@ -39,7 +40,7 @@ export interface StateV2ScopeTransitionRecord {
   candidate: SyncStateEnvelopeV2;
   sourceManifest: StateV2Manifest;
   sourceWitnessRevision: number;
-  nextProtocolBinding?: SharedSyncProtocolBindingV2;
+  nextProtocolBinding?: SharedSyncProtocolBinding;
 }
 
 export type StateV2ScopeTransitionFailureReason =
@@ -76,7 +77,7 @@ export class StateV2ScopeTransitionStore {
     candidate: SyncStateEnvelopeV2;
     sourceManifest: StateV2Manifest;
     sourceWitness: StateV2ActiveAuthorityWitness;
-    nextProtocolBinding?: SharedSyncProtocolBindingV2;
+    nextProtocolBinding?: SharedSyncProtocolBinding;
     now?: number;
   }): Promise<SyncStateEnvelopeV2> {
     const existing = await this.loadControlRecord();
@@ -419,7 +420,7 @@ export function validateTransitionRecord(
     || !("sourceManifest" in value)
     || (
       value.nextProtocolBinding !== undefined
-      && !isSharedSyncProtocolBindingV2(value.nextProtocolBinding)
+      && !isSharedSyncProtocolBinding(value.nextProtocolBinding)
     )
   ) {
     throw new Error("V2 scope transition control record is incomplete");
@@ -452,14 +453,11 @@ export function validateTransitionRecord(
 }
 
 function protocolBindingTransitionAllowed(
-  current: SharedSyncProtocolBindingV2 | undefined,
-  next: SharedSyncProtocolBindingV2 | undefined,
+  current: SharedSyncProtocolBinding | undefined,
+  next: SharedSyncProtocolBinding | undefined,
 ): boolean {
   if (!current || !next) return current === undefined && next === undefined;
-  return current.protocolVersion === next.protocolVersion
-    && current.migrationGeneration === next.migrationGeneration
-    && current.confirmedAllDevicesUpdatedAt
-      === next.confirmedAllDevicesUpdatedAt;
+  return isSharedSyncProtocolBindingTransitionAllowed(current, next);
 }
 
 function targetManifestFor(

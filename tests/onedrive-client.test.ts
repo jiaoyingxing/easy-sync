@@ -1034,6 +1034,57 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     await rejection;
     expect(requestSpy).toHaveBeenCalledTimes(2);
   });
+
+  it("creates protocol-v3.json with create-only conflict behavior", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 201,
+      headers: {},
+      json: { id: "protocol-v3-id", eTag: "etag-v3" },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.createSharedSyncProtocolV3("testVault", "{}"))
+      .resolves.toEqual({ id: "protocol-v3-id", eTag: "etag-v3" });
+    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({
+      method: "PUT",
+      url: expect.stringContaining(
+        "protocol-v3.json:/content?@microsoft.graph.conflictBehavior=fail",
+      ),
+      headers: expect.not.objectContaining({
+        "If-Match": expect.anything(),
+      }),
+    }));
+  });
+
+  it("reads protocol-v3.json with its stable ID and eTag", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: { value: [{
+          id: "protocol-v3-id",
+          name: "protocol-v3.json",
+          eTag: "etag-v3",
+          file: {},
+          "@microsoft.graph.downloadUrl":
+            "https://download.example/protocol-v3.json",
+        }] },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        text: '{"protocolVersion":3}',
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.readSharedSyncProtocolV3("testVault"))
+      .resolves.toEqual({
+        id: "protocol-v3-id",
+        eTag: "etag-v3",
+        content: '{"protocolVersion":3}',
+      });
+    expect(requestSpy).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("OneDriveClient.moveItemById", () => {

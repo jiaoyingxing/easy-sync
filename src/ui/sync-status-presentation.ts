@@ -46,6 +46,12 @@ export function resolveSyncActivityPresentation(
       labelKey: "progress.recoveringMutation",
     };
   }
+  if (progress.recoveryVerification) {
+    return {
+      kind: "verifying",
+      labelKey: "progress.remoteScopeRecovery",
+    };
+  }
 
   switch (progress.phase) {
     case "scanning":

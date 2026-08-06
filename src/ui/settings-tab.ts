@@ -9,7 +9,11 @@
  *   - About (关于)
  */
 
-import { PluginSettingTab, Setting, SettingGroup } from "obsidian";
+import {
+  PluginSettingTab,
+  Setting,
+  SettingGroup,
+} from "obsidian";
 import type EasySyncPlugin from "../main";
 import { isAnySyncActivityRunning } from "../sync/sync-progress";
 import {

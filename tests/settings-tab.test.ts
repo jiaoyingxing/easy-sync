@@ -823,6 +823,97 @@ describe("buildSettingsSyncButtonState", () => {
     expect(renderPluginListArea).toHaveBeenCalled();
   });
 
+  it("keeps a populated plugin list mounted while a background revision reload is pending", async () => {
+    let releaseInventory!: (inventory: unknown[]) => void;
+    const inventoryPromise = new Promise<unknown[]>((resolve) => {
+      releaseInventory = resolve;
+    });
+    const renderPluginListArea = vi.fn();
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    Object.assign(modal as object, {
+      plugin: {
+        getCommunityPluginInventory: vi.fn(() => inventoryPromise),
+        hasTrustedCommunityPluginRemoteInventory: vi.fn().mockResolvedValue(true),
+        getCommunityPluginEnablementDecisionSnapshot: vi.fn().mockResolvedValue({
+          revision: "",
+          decisions: [],
+        }),
+      },
+      view: "community-plugin-files",
+      inventory: [{ id: "calendar" }],
+      pendingDecisions: [],
+      remoteInventoryAvailable: true,
+      inventoryLoading: false,
+      inventoryLoadFailed: false,
+      destroyed: false,
+      loadGeneration: 6,
+      renderPluginListArea,
+      focusPendingDecisionIfRequested: vi.fn(),
+    });
+
+    const reload = (modal as unknown as {
+      reloadCommunityPluginManager(
+        column: "files" | "data",
+        generation: number,
+      ): Promise<void>;
+    }).reloadCommunityPluginManager("files", 6);
+
+    await Promise.resolve();
+    expect(renderPluginListArea).not.toHaveBeenCalled();
+
+    releaseInventory([{ id: "calendar" }, { id: "dataview" }]);
+    await reload;
+    expect(renderPluginListArea).toHaveBeenCalledOnce();
+  });
+
+  it("does not clear a populated plugin list when a queued row update settles during background loading", async () => {
+    let releaseCommit!: () => void;
+    const commit = new Promise<void>((resolve) => {
+      releaseCommit = resolve;
+    });
+    const listScrollEl = {
+      scrollTop: 480,
+      empty: vi.fn(() => {
+        listScrollEl.scrollTop = 0;
+      }),
+      createEl: vi.fn(),
+    };
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    Object.assign(modal as object, {
+      plugin: { i18n: { t: (key: string) => key } },
+      view: "community-plugin-files",
+      inventory: [{ id: "calendar" }],
+      inventoryLoading: true,
+      listScrollEl,
+      destroyed: false,
+      busyPluginRows: new Set<string>(),
+      pendingPluginValues: new Map<string, boolean>(),
+      settingsUpdateQueue: {
+        enqueue: vi.fn(async (task: () => Promise<void>) => await task()),
+      },
+      showSyncPathSettingsError: vi.fn(),
+    });
+
+    (modal as unknown as {
+      queueSelectionUpdate(
+        rowKey: string,
+        pendingValue: boolean,
+        commit: () => Promise<void>,
+      ): void;
+    }).queueSelectionUpdate("files:calendar", true, () => commit);
+
+    expect(listScrollEl.empty).not.toHaveBeenCalled();
+    expect(listScrollEl.scrollTop).toBe(480);
+
+    releaseCommit();
+    await vi.waitFor(() => {
+      expect((modal as unknown as { busyPluginRows: Set<string> })
+        .busyPluginRows.size).toBe(0);
+    });
+    expect(listScrollEl.empty).not.toHaveBeenCalled();
+    expect(listScrollEl.scrollTop).toBe(480);
+  });
+
   it("coalesces a burst of inventory revisions into one in-flight load and one follow-up", async () => {
     let releaseFirst!: (inventory: unknown[]) => void;
     const firstInventory = new Promise<unknown[]>((resolve) => {
@@ -1007,10 +1098,10 @@ describe("buildSettingsSyncButtonState", () => {
       "处理包含“{plugin}”在内的启用状态差异",
     );
     expect(zhCN["settings.communityPlugins.decisions.title"]).toBe(
-      "处理社区插件启用状态（{count}）",
+      "社区插件启用状态",
     );
     expect(zhCN["settings.communityPlugins.decisions.message"]).toBe(
-      "请为每个插件选择同步后保留本机还是远端的启用状态。全部保存后，EasySync 会继续一次同步；这些选择不会删除插件文件。",
+      "为每个插件选择要保留的启用状态。保存后将继续同步，不会删除插件文件。",
     );
     expect(en["settings.communityPlugins.status.localOnly"]).toBe(
       "Plugin files only on this device",
@@ -1040,10 +1131,10 @@ describe("buildSettingsSyncButtonState", () => {
       "Review enabled-state differences including “{plugin}”",
     );
     expect(en["settings.communityPlugins.decisions.title"]).toBe(
-      "Review community plugin states ({count})",
+      "Community plugin enabled states",
     );
     expect(en["settings.communityPlugins.decisions.message"]).toBe(
-      "Choose whether to keep the local or remote enabled state for every plugin. After all choices are saved, EasySync will continue with one sync. These choices do not delete plugin files.",
+      "Choose the enabled state to keep for each plugin. Saving will continue sync and will not delete plugin files.",
     );
     expect(zhCN["notice.sync.communityPluginEnablement"]).toBe(
       "有 {count} 个社区插件启用状态需要确认，本次同步未执行。",
@@ -1058,14 +1149,14 @@ describe("buildSettingsSyncButtonState", () => {
       "Community plugin enabled states",
     );
     expect(zhCN["syncView.communityPlugins.pendingDescription"]).toBe(
-      "同步计划已暂停。请一次处理这 {count} 个插件的启用状态；保存后，EasySync 会继续一次同步，再核对相关配置文件夹。",
+      "有 {count} 个插件在本机和远端的启用状态不同，请选择同步后保留的状态。",
     );
     expect(en["syncView.communityPlugins.pendingDescription"]).toBe(
-      "Planning is paused. Review all {count} plugin enabled-state differences together. After saving, EasySync will run one sync and then check the related configuration folders.",
+      "{count} plugins have different enabled states on this device and in the cloud. Choose which state to keep after syncing.",
     );
-    expect(zhCN["syncView.communityPlugins.review"]).toBe("处理");
+    expect(zhCN["syncView.communityPlugins.review"]).toBe("选择");
     expect(en["syncView.communityPlugins.review"]).toBe(
-      "Review",
+      "Choose",
     );
   });
 

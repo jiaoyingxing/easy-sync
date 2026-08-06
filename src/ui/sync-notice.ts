@@ -7,6 +7,7 @@ import {
 import {
   syncProgressPercent,
   type FileProgress,
+  type RemoteScopeRecoveryVerificationProgress,
   type SyncProgressState,
 } from "../sync/sync-progress";
 import type { EasySyncNoticeMessage } from "./notice-center";
@@ -33,6 +34,7 @@ export interface SyncNoticeOutcome {
   kind: SyncNoticeOutcomeKind;
   count: number;
   remoteDeletes?: number;
+  message?: string;
 }
 
 export function shouldSuppressSyncNoticeForVisibleSidebar(input: {
@@ -46,6 +48,7 @@ export function shouldSuppressSyncNoticeForVisibleSidebar(input: {
 export type SyncProgressNoticeKind =
   | "starting"
   | "stage"
+  | "recovery"
   | "progress"
   | "cancelling";
 
@@ -57,23 +60,37 @@ export interface SyncProgressNoticePresentation {
   percent: number;
   current: number;
   total: number;
+  recoveryVerification?: RemoteScopeRecoveryVerificationProgress;
 }
 
 export function resolveSyncProgressNoticePresentation(
   progress: Readonly<SyncProgressState>,
 ): SyncProgressNoticePresentation {
   const activity = resolveSyncActivityPresentation(progress);
-  const determinate = progress.total > 0;
+  const recoveryVerification = progress.recoveryVerification;
+  const recoveryCurrent = recoveryVerification
+    ? recoveryVerification.reused + recoveryVerification.verifiedThisRun
+    : 0;
+  const recoveryDeterminate = Boolean(
+    recoveryVerification && recoveryVerification.total > 0,
+  );
+  const current = recoveryDeterminate ? recoveryCurrent : progress.current;
+  const total = recoveryDeterminate
+    ? recoveryVerification!.total
+    : progress.total;
+  const determinate = total > 0;
   const percent = !determinate
     ? 0
-    : progress.phase === "verifying"
-      ? Math.min(100, Math.max(0, Math.round((progress.current / progress.total) * 100)))
+    : recoveryDeterminate || progress.phase === "verifying"
+      ? Math.min(100, Math.max(0, Math.round((current / total) * 100)))
       : syncProgressPercent(progress);
   let kind: SyncProgressNoticeKind = "stage";
   if (activity.kind === "cancelling") {
     kind = "cancelling";
   } else if (activity.kind === "starting") {
     kind = "starting";
+  } else if (recoveryDeterminate) {
+    kind = "recovery";
   } else if (determinate && progress.phase === "executing") {
     kind = "progress";
   }
@@ -83,11 +100,14 @@ export function resolveSyncProgressNoticePresentation(
     // Pre-execution stages currently expose status only. Show the bar only
     // after verification or file execution provides a concrete item total.
     showProgressBar: determinate
-      && (progress.phase === "verifying" || progress.phase === "executing"),
+      && (recoveryDeterminate
+        || progress.phase === "verifying"
+        || progress.phase === "executing"),
     determinate,
     percent,
-    current: progress.current,
-    total: progress.total,
+    current,
+    total,
+    ...(recoveryVerification ? { recoveryVerification } : {}),
   };
 }
 
@@ -112,6 +132,13 @@ export function formatSyncProgressNoticeLabel(
         current: presentation.current,
         total: presentation.total,
       });
+    case "recovery": {
+      const recovery = presentation.recoveryVerification!;
+      return t("notice.sync.remoteScopeRecovery", {
+        current: recovery.reused + recovery.verifiedThisRun,
+        total: recovery.total,
+      });
+    }
     case "stage":
       return t("notice.sync.stage", {
         stage: translateSyncActivity(presentation.activity, t),
@@ -139,7 +166,15 @@ export function resolveSyncNoticeOutcome(
   }
   if (context.pausedForReview) return { kind: "review", count: 0 };
   if (context.cancelled) return { kind: "cancelled", count: 0 };
-  if (result.errors > 0 || !result.success) return { kind: "failed", count: 0 };
+  if (result.errors > 0 || !result.success) {
+    return {
+      kind: "failed",
+      count: 0,
+      ...(result.remoteScopeRecovery?.failureStage && result.message
+        ? { message: result.message }
+        : {}),
+    };
+  }
   if (result.conflicts > 0) {
     const pending = resolveSyncPendingAttentionCounts(
       result.conflicts,

@@ -39,6 +39,9 @@ import {
 } from "./sync/indexeddb-public-1-1-3-state";
 import { StateV2IndexedDbActiveStore } from "./sync/state-v2-indexeddb-active";
 import {
+  IndexedDbRemoteScopeRecoveryEvidenceStore,
+} from "./sync/remote-scope-recovery-evidence-store";
+import {
   loadOrCreateIndexedDbVaultInstanceId,
   readIndexedDbVaultInstanceId,
 } from "./sync/indexeddb-vault-namespace";
@@ -162,6 +165,7 @@ import {
 import {
   createEmptyDeviceCommunityPluginParticipation,
   isDeviceCommunityPluginEnabled,
+  reduceDeviceCommunityPluginParticipation,
   type DeviceCommunityPluginParticipationCommand,
   type DeviceCommunityPluginParticipationV1,
 } from "./sync/community-plugin-participation";
@@ -609,6 +613,8 @@ export default class EasySyncPlugin extends Plugin {
               ),
             createStateV2IndexedDbActiveStore: (databaseId, recovery) =>
               new StateV2IndexedDbActiveStore(databaseId, recovery),
+            createRemoteScopeRecoveryEvidenceStore: (vaultInstanceId) =>
+              new IndexedDbRemoteScopeRecoveryEvidenceStore(vaultInstanceId),
           }
         : {}),
     });
@@ -1634,7 +1640,7 @@ export default class EasySyncPlugin extends Plugin {
    * in the sidebar. Returns false to indicate the sync should pause.
    */
   private async showPlanAlert(
-    _kind: "firstSync" | "threshold",
+    kind: "firstSync" | "threshold",
     plan: SyncPlan,
   ): Promise<boolean> {
     const t = this.i18n.t.bind(this.i18n);
@@ -1661,6 +1667,11 @@ export default class EasySyncPlugin extends Plugin {
     if (!plan.scope) {
       throw new Error("Cannot persist a plan review without a complete sync scope");
     }
+    // Capture the previous canonical identity before it is overwritten by
+    // setPlanReviewBundle below. When the plan did not actually change the
+    // regenerated alert can be skipped entirely — the sidebar still holds the
+    // same review from the previous round.
+    const previousIdentity = this.state?.planReviewCanonicalIdentity ?? null;
     if (plan.reviewKind !== undefined) {
       const hold = this.state!.activeV2MigrationHold;
       if (
@@ -1688,11 +1699,32 @@ export default class EasySyncPlugin extends Plugin {
     this.updateStatusBar();
     this.syncView?.render();
 
-    // Show lightweight alert (non-blocking)
+    // When a regenerated plan is byte-for-byte identical to the review that
+    // was already sitting in the sidebar there is nothing new to show. The
+    // user still needs to confirm in the sidebar, so we still pause.
+    if (
+      kind === "threshold"
+      && previousIdentity
+      && plan.canonicalIdentity
+      && sameCanonicalPlanIdentityV2(previousIdentity, plan.canonicalIdentity)
+    ) {
+      this.diag?.log(
+        "state",
+        "regenerated plan review is identical — skipping repeat alert",
+        { mutations: 0 },
+      );
+      return false;
+    }
+
+    const firstTime = kind === "firstSync";
     const modal = new SyncPlanAlertModal(
       this.app,
-      t("syncPlan.readyTitle"),
-      t("syncPlan.readyMessage"),
+      t(firstTime
+        ? "syncPlan.readyTitle"
+        : "syncPlan.reviewUpdatedTitle"),
+      t(firstTime
+        ? "syncPlan.readyMessage"
+        : "syncPlan.reviewUpdatedMessage"),
       t("syncPlan.viewButton"),
       () => { void this.activateSyncView(); },
     );
@@ -1855,10 +1887,13 @@ export default class EasySyncPlugin extends Plugin {
     };
     this.noticeCenter.show({
       key: `sync-result:${outcome.kind}`,
-      message: this.i18n.t(messageKeys[outcome.kind], {
-        count: outcome.count,
-        remoteDeletes: outcome.remoteDeletes ?? 0,
-      }),
+      message: outcome.message ?? this.i18n.t(
+        messageKeys[outcome.kind],
+        {
+          count: outcome.count,
+          remoteDeletes: outcome.remoteDeletes ?? 0,
+        },
+      ),
       priority: priorities[outcome.kind],
       durationMs: SYNC_RESULT_NOTICE_DURATION_MS,
       className: "easy-sync-notice-result",
@@ -2370,6 +2405,7 @@ export default class EasySyncPlugin extends Plugin {
         uploadNetworkMs: result.metrics?.uploadNetworkMs,
         peakUploads: result.metrics?.peakUploads,
         recovery: newRecovery ?? priorRecoveryWithoutEntry,
+        remoteScopeRecovery: result.remoteScopeRecovery,
       });
     } catch (error) {
       this.diag.warn(
@@ -4290,6 +4326,7 @@ export default class EasySyncPlugin extends Plugin {
       {
         allowedLockHolder: input.allowedLockHolder,
         expectedParticipation: participation,
+        commitSyncPathSettingsTransition: true,
       },
     );
     this.diag?.log(
@@ -4379,11 +4416,14 @@ export default class EasySyncPlugin extends Plugin {
       catalog,
       scope: state.remoteScope,
     });
-    for (const command of planned.commands) {
-      await state.updateCommunityPluginParticipation(command);
-    }
-    const committed = state.getCommunityPluginParticipation();
-    if (committed) this.applyCommunityPluginParticipationProjection(committed);
+    await this.commitCommunityPluginParticipationCommands(
+      planned.commands,
+      {
+        allowedLockHolder: "sync",
+        expectedParticipation: initial,
+        commitSyncPathSettingsTransition: true,
+      },
+    );
     return { authorizations: planned.authorizations };
   }
 
@@ -4418,9 +4458,12 @@ export default class EasySyncPlugin extends Plugin {
       || phase === undefined
     )) return;
     if (!enabled) {
-      await this.commitCommunityPluginParticipationCommand({
+      await this.commitCommunityPluginParticipationCommands([{
         type: "confirm-excluded",
         pluginId,
+      }], {
+        expectedParticipation: current,
+        commitSyncPathSettingsTransition: true,
       });
       return;
     }
@@ -4467,10 +4510,6 @@ export default class EasySyncPlugin extends Plugin {
     if (!state || !await this.ensureCommunityPluginParticipationInitialized()) {
       throw new SyncPathSettingsUpdateError("recovery");
     }
-    const previousSyncPathSettings =
-      options.commitSyncPathSettingsTransition
-        ? this.captureSyncPathSettings()
-        : null;
     if (this.syncExecutor?.hasActivityInFlight) {
       throw new SyncPathSettingsUpdateError("busy");
     }
@@ -4499,30 +4538,36 @@ export default class EasySyncPlugin extends Plugin {
         throw new SyncPathSettingsUpdateError("busy");
       }
       const previousParticipation = state.getCommunityPluginParticipation();
-      for (const command of commands) {
-        await state.updateCommunityPluginParticipation(command);
-      }
-      const committed = state.getCommunityPluginParticipation();
-      if (!committed) {
+      if (!previousParticipation) {
         throw new Error("Community-plugin participation commit disappeared");
       }
-      this.applyCommunityPluginParticipationProjection(committed);
-      const participationScopeChanged =
-        JSON.stringify(previousParticipation)
-          !== JSON.stringify(committed);
-      await this.retireExcludedCommunityPluginPendingState(
-        committed,
-        participationScopeChanged,
-      );
-      const candidateSyncPathSettings = previousSyncPathSettings
-        ? this.captureSyncPathSettings()
-        : null;
+      let targetParticipation = previousParticipation;
+      for (const command of commands) {
+        targetParticipation = reduceDeviceCommunityPluginParticipation(
+          targetParticipation,
+          command,
+          this.manifest.id,
+        );
+      }
+      const previousSyncPathSettings =
+        options.commitSyncPathSettingsTransition
+          ? this.captureSyncPathSettings()
+          : null;
+      let candidateSyncPathSettings: SyncPathSettings | null = null;
+      if (previousSyncPathSettings) {
+        this.applyCommunityPluginParticipationProjection(targetParticipation);
+        candidateSyncPathSettings = this.captureSyncPathSettings();
+        this.applyCommunityPluginParticipationProjection(previousParticipation);
+      }
       const requiresSyncPathSettingsCommit = Boolean(
         previousSyncPathSettings
         && candidateSyncPathSettings
         && syncPathSettingsFingerprint(previousSyncPathSettings)
           !== syncPathSettingsFingerprint(candidateSyncPathSettings),
       );
+      const participationStateChanged =
+        JSON.stringify(previousParticipation)
+          !== JSON.stringify(targetParticipation);
       if (
         requiresSyncPathSettingsCommit
         && previousSyncPathSettings
@@ -4533,20 +4578,34 @@ export default class EasySyncPlugin extends Plugin {
           candidateSyncPathSettings,
         );
       } else {
+        await this.retireExcludedCommunityPluginPendingState(
+          targetParticipation,
+          participationStateChanged,
+        );
+      }
+      await state.updateCommunityPluginParticipationBatch(commands);
+      const committed = state.getCommunityPluginParticipation();
+      if (!committed) {
+        throw new Error("Community-plugin participation commit disappeared");
+      }
+      this.applyCommunityPluginParticipationProjection(committed);
+      if (!requiresSyncPathSettingsCommit) {
         this.advanceCommunityPluginInventoryRevision();
         this.updateStatusBar();
         this.syncView?.render();
         this.settingsTab?.refreshSyncState();
       }
     } catch (error) {
-      if (previousSyncPathSettings) {
-        const durableParticipation =
-          state.getCommunityPluginParticipation();
-        if (durableParticipation) {
-          this.applyCommunityPluginParticipationProjection(
-            durableParticipation,
-          );
-        }
+      const durableParticipation =
+        state.getCommunityPluginParticipation();
+      if (durableParticipation) {
+        this.applyCommunityPluginParticipationProjection(
+          durableParticipation,
+        );
+        this.advanceCommunityPluginInventoryRevision();
+        this.updateStatusBar();
+        this.syncView?.render();
+        this.settingsTab?.refreshSyncState();
       }
       throw error;
     } finally {
@@ -5172,6 +5231,25 @@ export default class EasySyncPlugin extends Plugin {
     lines.push(`**社区插件策略指纹**: ${communityPluginSummary.policyFingerprint}`);
     lines.push("");
 
+    const remoteScopeRecoverySummary =
+      this.progressStore.state.recoveryVerification
+      ?? reportState?.syncHistory.find(
+        (entry) => entry.remoteScopeRecovery !== undefined,
+      )?.remoteScopeRecovery;
+    lines.push("## 远端 Scope 恢复");
+    lines.push("");
+    lines.push(`**当前状态**: ${v2RemoteScopeRecovery ? "等待或正在恢复" : "无待恢复项"}`);
+    if (remoteScopeRecoverySummary) {
+      lines.push(`**操作指纹**: ${remoteScopeRecoverySummary.operationFingerprint}`);
+      lines.push(`**协议预检**: ${remoteScopeRecoverySummary.protocolPreflight === "ready" ? "通过" : "受阻"}`);
+      lines.push(`**正文核验**: 总数 ${remoteScopeRecoverySummary.total} / 本轮新增 ${remoteScopeRecoverySummary.verifiedThisRun} / 复用 ${remoteScopeRecoverySummary.reused} / 失效 ${remoteScopeRecoverySummary.invalidated} / 剩余 ${remoteScopeRecoverySummary.remaining}`);
+      lines.push(`**终止阶段**: ${remoteScopeRecoverySummary.failureStage ?? "无"}`);
+      lines.push(`**首个失败对象**: ${remoteScopeRecoverySummary.firstFailurePath ?? "—"}`);
+    } else {
+      lines.push("**最近核验证据**: 无");
+    }
+    lines.push("");
+
     // ── Sync History ──
     const history = this.state?.syncHistory ?? [];
     lines.push("## 近期同步记录");
@@ -5325,6 +5403,8 @@ export default class EasySyncPlugin extends Plugin {
       v2RemoteScopeObserved:
         v2RemoteScopeRecovery?.observedScope !== null
           && v2RemoteScopeRecovery?.observedScope !== undefined,
+      remoteScopeRecoveryVerification:
+        remoteScopeRecoverySummary ?? null,
       automaticRecoveryState:
         mutationRecoveryDisplay?.kind ?? "inactive",
       automaticRecoveryRemaining:

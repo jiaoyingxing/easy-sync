@@ -35,6 +35,52 @@ describe("syncViewProgressPercent", () => {
   });
 });
 
+describe("sync view status copy and scrolling layout", () => {
+  it("keeps verification copy and the adjacent item count non-duplicative", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+
+    expect(zh.t("progress.verifyingFiles", { current: 2, total: 5 }))
+      .toBe("验证文件一致性…");
+    expect(zh.t("syncView.progress.items", { current: 2, total: 5 }))
+      .toBe("2/5项");
+    expect(en.t("progress.verifyingFiles", { current: 2, total: 5 }))
+      .toBe("Verifying file consistency…");
+    expect(en.t("syncView.progress.items", { current: 2, total: 5 }))
+      .toBe("2/5 items");
+  });
+
+  it("keeps the sidebar toolbar fixed above one independent content scroller", () => {
+    const styles = readFileSync("styles.css", "utf8");
+    const viewBlock = styles.match(
+      /\.view-content\.easy-sync-view\s*\{([^}]*)\}/s,
+    )?.[1] ?? "";
+    const toolbarBlock = styles.match(
+      /\.view-content\.easy-sync-view > \.nav-header\s*\{([^}]*)\}/s,
+    )?.[1] ?? "";
+    const desktopToolbarBlock = styles.match(
+      /body:not\(\.is-mobile\) \.view-content\.easy-sync-view > \.nav-header\s*\{([^}]*)\}/s,
+    )?.[1] ?? "";
+    const contentBlock = styles.match(
+      /\.easy-sync-view-content\s*\{([^}]*)\}/s,
+    )?.[1] ?? "";
+
+    expect(viewBlock).toContain("display: flex");
+    expect(viewBlock).toContain("flex-direction: column");
+    expect(viewBlock).toContain("overflow: hidden");
+    expect(toolbarBlock).toContain("position: sticky");
+    expect(toolbarBlock).toContain("top: 0");
+    expect(toolbarBlock).toContain("background: var(--background-primary)");
+    expect(desktopToolbarBlock).toContain("background: transparent");
+    expect(styles).not.toMatch(
+      /body\.is-mobile \.view-content\.easy-sync-view > \.nav-header\s*\{[^}]*background:\s*transparent/s,
+    );
+    expect(contentBlock).toContain("flex: 1 1 auto");
+    expect(contentBlock).toContain("min-height: 0");
+    expect(contentBlock).toContain("overflow-y: auto");
+  });
+});
+
 describe("buildSyncViewContentKey", () => {
   const baseInput = {
     isLoggedIn: false,
@@ -95,6 +141,42 @@ describe("buildSyncViewContentKey", () => {
     });
 
     expect(withoutTotal).not.toBe(withTotal);
+  });
+
+  it("tracks resumable remote-scope verification even when all work is reused", () => {
+    const withoutEvidence = buildSyncViewContentKey(false, {
+      ...baseInput,
+      progress: {
+        ...baseInput.progress,
+        phase: "checking",
+        current: 0,
+        total: 0,
+        currentFile: "",
+      },
+    });
+    const withEvidence = buildSyncViewContentKey(false, {
+      ...baseInput,
+      progress: {
+        ...baseInput.progress,
+        phase: "checking",
+        current: 0,
+        total: 0,
+        currentFile: "",
+        recoveryVerification: {
+          operationFingerprint: "abcdef123456",
+          protocolPreflight: "ready",
+          total: 3,
+          verifiedThisRun: 0,
+          reused: 3,
+          invalidated: 0,
+          remaining: 0,
+        },
+      },
+    });
+
+    expect(withEvidence).not.toBe(withoutEvidence);
+    expect(withEvidence).toContain("determinate");
+    expect(withEvidence).toContain("abcdef123456:ready:3:0:3:0:0");
   });
 
   it("tracks history ids when the expanded list changes", () => {

@@ -142,4 +142,68 @@ describe("S03 — state-neutral local recovery journal", () => {
     expect(raw).not.toMatch(/baseline|delta|etag|manifest/i);
     expect(isEasySyncInternalPath(`${path}.easy-sync-recovery`)).toBe(true);
   });
+
+  it("writeIntent uses .next staging then renames to the canonical path", async () => {
+    const downloaded = bytes(9);
+    const { adapter, files, spies } = makeMemoryAdapter();
+    const journal = new LocalRecoveryJournal(adapter, ".obsidian/plugins/easy-sync/tmp");
+    const nextPath = `${journal.intentPath}.next`;
+
+    await journal.prepareRenamedOriginal("note.md", undefined, "note.md.easy-sync-recovery", {
+      hash: await sha256Hex(downloaded),
+      size: downloaded.byteLength,
+    });
+
+    // After successful staging: .json exists, .next is gone (renamed).
+    expect(typeof files.get(journal.intentPath)).toBe("string");
+    expect(files.has(nextPath)).toBe(false);
+    expect(spies.rename).toHaveBeenCalledWith(nextPath, journal.intentPath);
+  });
+
+  it("readIntent recovers an orphaned .next file after a crash before rename", async () => {
+    const downloaded = bytes(9);
+    const { adapter, files } = makeMemoryAdapter();
+    const journal = new LocalRecoveryJournal(adapter, ".obsidian/plugins/easy-sync/tmp");
+    const nextPath = `${journal.intentPath}.next`;
+
+    // Simulate crash: write .next but never rename to .json
+    files.set(nextPath, JSON.stringify({
+      version: 1,
+      targetPath: "note.md",
+      recoveryPath: "note.md.easy-sync-recovery",
+      recoveryMode: "rename" as const,
+      expected: null,
+      downloaded: { hash: await sha256Hex(downloaded), size: downloaded.byteLength },
+      createdAt: Date.now(),
+    }));
+
+    // readIntent must recover the orphan .next → .json, then recover()
+    // runs normally (writes target file, restores, cleans up intent).
+    const recovered = await new LocalRecoveryJournal(adapter, ".obsidian/plugins/easy-sync/tmp")
+      .recover();
+    expect(recovered).toBe("restored");
+    // Both .next and .json cleaned up after successful recovery
+    expect(files.has(nextPath)).toBe(false);
+    expect(files.has(journal.intentPath)).toBe(false);
+  });
+
+  it("writeIntent falls back to direct write when rename throws", async () => {
+    const downloaded = bytes(9);
+    const { adapter, files } = makeMemoryAdapter();
+    const brokenRename = vi.fn(async () => { throw new Error("rename unsupported"); });
+    const hybridAdapter = {
+      ...adapter,
+      rename: brokenRename,
+    } as unknown as DataAdapter;
+    const journal = new LocalRecoveryJournal(hybridAdapter, ".obsidian/plugins/easy-sync/tmp");
+
+    await journal.prepareRenamedOriginal("note.md", undefined, "note.md.easy-sync-recovery", {
+      hash: await sha256Hex(downloaded),
+      size: downloaded.byteLength,
+    });
+
+    // Fallback: .json must exist with correct content despite rename throwing.
+    expect(brokenRename).toHaveBeenCalled();
+    expect(typeof files.get(journal.intentPath)).toBe("string");
+  });
 });

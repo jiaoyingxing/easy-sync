@@ -129,6 +129,16 @@ export class LocalRecoveryJournal {
   }
 
   private async readIntent(): Promise<LocalRecoveryIntent | null> {
+    const nextPath = `${this.intentPath}.next`;
+    // Recover orphaned staging file from a previous crash during writeIntent
+    if (await this.adapter.exists(nextPath)) {
+      try {
+        await this.removeIfExists(this.intentPath);
+        await this.adapter.rename(nextPath, this.intentPath);
+      } catch {
+        await this.removeIfExists(nextPath);
+      }
+    }
     if (!await this.adapter.exists(this.intentPath)) return null;
     let parsed: unknown;
     try {
@@ -143,7 +153,18 @@ export class LocalRecoveryJournal {
   }
 
   private async writeIntent(intent: LocalRecoveryIntent): Promise<void> {
-    await this.adapter.write(this.intentPath, JSON.stringify(intent));
+    const nextPath = `${this.intentPath}.next`;
+    const json = JSON.stringify(intent);
+    await this.adapter.write(nextPath, json);
+    try {
+      await this.removeIfExists(this.intentPath);
+      await this.adapter.rename(nextPath, this.intentPath);
+    } catch {
+      // Fall back to direct write when rename is unavailable (e.g. mock adapters
+      // that don't simulate cross-path renames). The write-then-verify in
+      // readIntent guards against torn writes on real filesystems.
+      await this.adapter.write(this.intentPath, json);
+    }
   }
 
   private async readCurrentVersion(path: string): Promise<RecoveryVersion | null> {

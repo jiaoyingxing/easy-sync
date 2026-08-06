@@ -623,7 +623,6 @@ export class ConfigSyncModal extends Modal {
   ): Promise<void> {
     this.inventoryLoading = true;
     this.inventoryLoadFailed = false;
-    this.renderPluginListArea();
     try {
       const [inventory, remoteInventoryAvailable, pendingSnapshot] =
         await Promise.all([
@@ -737,6 +736,7 @@ export class ConfigSyncModal extends Modal {
     if (!this.listScrollEl) return;
     const column = this.getManagerColumn();
     if (!column) return;
+    if (this.inventoryLoading && this.inventory.length > 0) return;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const previousScrollTop = this.listScrollEl.scrollTop;
     this.listScrollEl.empty();

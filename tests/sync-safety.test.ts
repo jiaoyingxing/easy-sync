@@ -139,6 +139,7 @@ function remoteStateStub() {
     pendingIssues: [],
     cacheBaseContent: vi.fn(),
     getBaseContent: vi.fn().mockReturnValue(undefined),
+    getBaseEntry: vi.fn((path: string) => undefined),
     mutationLedger: [],
     hasMutationLedgerCorruption: false,
     beginMutationIntent: vi.fn().mockResolvedValue(undefined),

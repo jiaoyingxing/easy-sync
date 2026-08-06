@@ -102,6 +102,16 @@ export interface SyncViewContentKeyInput {
   mutationRecovery: MutationRecoveryDisplayState | null;
 }
 
+function remoteScopeRecoveryPercent(
+  state: Readonly<SyncProgressState>,
+): number | null {
+  const recovery = state.recoveryVerification;
+  if (!recovery || recovery.total <= 0) return null;
+  return Math.min(100, Math.max(0, Math.round(
+    ((recovery.reused + recovery.verifiedThisRun) / recovery.total) * 100,
+  )));
+}
+
 const FILE_STATUS_ICONS: Record<FileProgress["status"], string> = {
   upload: "arrow-up",
   download: "arrow-down",
@@ -437,12 +447,16 @@ export function buildSyncViewContentKey(
     : "recovery:none";
   const historyIds = input.history.map((entry) => {
     const itemRecovery = entry.recovery;
+    const scopeRecovery = entry.remoteScopeRecovery;
     const attention = entry.attention
       ? `${entry.attention.reason}:${entry.attention.count}`
       : "";
+    const scopeRecoveryKey = scopeRecovery
+      ? `${scopeRecovery.operationFingerprint}:${scopeRecovery.protocolPreflight}:${scopeRecovery.total}:${scopeRecovery.verifiedThisRun}:${scopeRecovery.reused}:${scopeRecovery.invalidated}:${scopeRecovery.remaining}:${scopeRecovery.failureStage ?? ""}:${scopeRecovery.firstFailurePath ?? ""}`
+      : "";
     return itemRecovery
-      ? `${entry.id}:${entry.status}:${itemRecovery.state}:${itemRecovery.total}:${itemRecovery.settled}:${itemRecovery.remaining}:${itemRecovery.retryAt ?? ""}:${itemRecovery.blockReason ?? ""}:${attention}`
-      : `${entry.id}:${entry.status}:${attention}`;
+      ? `${entry.id}:${entry.status}:${itemRecovery.state}:${itemRecovery.total}:${itemRecovery.settled}:${itemRecovery.remaining}:${itemRecovery.retryAt ?? ""}:${itemRecovery.blockReason ?? ""}:${attention}:${scopeRecoveryKey}`
+      : `${entry.id}:${entry.status}:${attention}:${scopeRecoveryKey}`;
   }).join("|");
   const historyKey = historyExpanded ? `history:open:${historyIds}` : "history:closed";
   if (input.bodyMode === "plan") {
@@ -455,10 +469,15 @@ export function buildSyncViewContentKey(
     return `plan:${authKey}:${runKey}:${recoveryKey}:${counts}:${items}:${historyKey}`;
   }
   if (input.bodyMode === "progress") {
+    const scopeRecovery = input.progress.recoveryVerification;
     const progressStructure = input.progress.total > 0
+      || (scopeRecovery?.total ?? 0) > 0
       ? "determinate"
       : "indeterminate";
-    return `progress:${authKey}:${recoveryKey}:${input.progress.phase}:${progressStructure}:${historyKey}`;
+    const scopeRecoveryKey = scopeRecovery
+      ? `${scopeRecovery.operationFingerprint}:${scopeRecovery.protocolPreflight}:${scopeRecovery.total}:${scopeRecovery.verifiedThisRun}:${scopeRecovery.reused}:${scopeRecovery.invalidated}:${scopeRecovery.remaining}:${scopeRecovery.failureStage ?? ""}:${scopeRecovery.firstFailurePath ?? ""}`
+      : "none";
+    return `progress:${authKey}:${runKey}:${recoveryKey}:${input.progress.phase}:${progressStructure}:scope-proof:${scopeRecoveryKey}:${historyKey}`;
   }
   if (input.bodyMode === "pending") {
     const issues = input.pendingIssues
@@ -542,7 +561,8 @@ export class EasySyncSyncView extends ItemView {
   private statusDetailEl: HTMLElement | null = null;
   private currentFileTextEl: HTMLElement | null = null;
   private currentByteProgressEl: HTMLElement | null = null;
-  private statusDetailMode: "timestamp" | "current-file" | "recovery" | null = null;
+  private statusDetailMode:
+    "timestamp" | "current-file" | "recovery" | "scope-recovery" | null = null;
   private emptyFolderResolutionOpening = false;
   private mutationRecoveryResolutionOpening = false;
 
@@ -746,8 +766,11 @@ export class EasySyncSyncView extends ItemView {
       // Same visible content — keep DOM, only patch the bits that changed.
       this.updateStatusPanel(statusState);
       if (isRunning) {
-        if (this.progressFillEl && progress.total > 0) {
-          this.progressFillEl.style.width = `${syncViewProgressPercent(progress)}%`;
+        if (this.progressFillEl) {
+          const recoveryPercent = remoteScopeRecoveryPercent(progress);
+          this.progressFillEl.style.width = `${
+            recoveryPercent ?? syncViewProgressPercent(progress)
+          }%`;
         }
         this.appendNewFileRows(progress.completedFiles);
       }
@@ -1016,7 +1039,12 @@ export class EasySyncSyncView extends ItemView {
     }
     this.statusTextEl?.setText(presentation.label);
 
-    if (state.isRunning && state.progress.total > 0) {
+    const recoveryProgress = state.progress.recoveryVerification;
+    const progressCurrent = recoveryProgress
+      ? recoveryProgress.reused + recoveryProgress.verifiedThisRun
+      : state.progress.current;
+    const progressTotal = recoveryProgress?.total ?? state.progress.total;
+    if (state.isRunning && progressTotal > 0) {
       if (!this.statusCounterEl) {
         const statusLine = this.contentEl.querySelector(".easy-sync-status-line");
         if (statusLine instanceof HTMLElement) {
@@ -1025,8 +1053,8 @@ export class EasySyncSyncView extends ItemView {
       }
       this.statusCounterEl?.setText(
         t("syncView.progress.items", {
-          current: state.progress.current,
-          total: state.progress.total,
+          current: progressCurrent,
+          total: progressTotal,
         }),
       );
     } else if (this.statusCounterEl) {
@@ -1070,6 +1098,25 @@ export class EasySyncSyncView extends ItemView {
       }
       this.currentFileTextEl.setText(state.progress.currentFile);
       this.updateByteProgress(state.progress);
+      return;
+    }
+
+    const scopeRecovery = state.progress.recoveryVerification;
+    if (scopeRecovery?.failureStage) {
+      if (this.statusDetailMode !== "scope-recovery") {
+        this.statusDetailEl.empty();
+        this.statusDetailEl.removeClass("is-current-file");
+        this.currentFileTextEl = null;
+        this.currentByteProgressEl = null;
+        this.statusDetailMode = "scope-recovery";
+      }
+      this.statusDetailEl.setText(
+        scopeRecovery.firstFailurePath
+          ? t("syncView.progress.remoteScopeRecoveryFailed", {
+              path: scopeRecovery.firstFailurePath,
+            })
+          : t("syncView.progress.remoteScopeRecoveryStopped"),
+      );
       return;
     }
 
@@ -1186,14 +1233,21 @@ export class EasySyncSyncView extends ItemView {
     container: HTMLElement,
     state: Readonly<SyncProgressState>,
   ): void {
-    if (state.total <= 0 && state.completedFiles.length === 0) return;
+    if (
+      state.total <= 0
+      && state.completedFiles.length === 0
+      && !state.recoveryVerification
+    ) return;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const panel = container.createDiv("easy-sync-progress-panel");
     this.progressPanelEl = panel;
-    if (state.total > 0) {
+    const recoveryPercent = remoteScopeRecoveryPercent(state);
+    if (state.total > 0 || recoveryPercent !== null) {
       const bar = panel.createDiv("easy-sync-progress-bar");
       this.progressFillEl = bar.createDiv("easy-sync-progress-fill");
-      this.progressFillEl.style.width = `${syncViewProgressPercent(state)}%`;
+      this.progressFillEl.style.width = `${
+        recoveryPercent ?? syncViewProgressPercent(state)
+      }%`;
     }
     if (state.completedFiles.length > 0) {
       this.progressSubtitleEl = panel.createDiv("easy-sync-progress-subtitle");

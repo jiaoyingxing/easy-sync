@@ -81,7 +81,11 @@ import {
   StateV2ScopeTransitionStore,
   type StateV2ScopeTransitionFailureReason,
 } from "./state-v2-scope-transition";
-import { retainFileProgress, type FileProgress } from "./sync-progress";
+import {
+  retainFileProgress,
+  type FileProgress,
+  type RemoteScopeRecoveryVerificationSummary,
+} from "./sync-progress";
 import {
   commitReviewedStateV2MigrationCandidate,
   readStateV2Manifest,
@@ -106,7 +110,16 @@ import {
   CorruptStatePublicationV2Store,
   type CorruptStatePublicationV2FailureReason,
 } from "./corrupt-state-publication-v2";
-import type { SharedSyncProtocolBindingV2 } from "./sync-protocol-v2";
+import type { SharedSyncProtocolBinding } from "./sync-protocol-v3";
+import {
+  remoteScopeRecoveryProtocolBindingDigest,
+  type RemoteScopeRecoveryEvidenceOperationV1,
+  type RemoteScopeRecoveryEvidenceReceiptV1,
+  type RemoteScopeRecoveryEvidenceStore,
+  type RemoteScopeRecoveryEvidenceStoreFactory,
+  type RemoteScopeRecoveryEvidenceSummaryV1,
+  type RemoteScopeRecoveryRemoteVersionV1,
+} from "./remote-scope-recovery-evidence-store";
 import {
   createPublic113BackupSnapshot,
   createPublic113MigrationInput,
@@ -154,6 +167,8 @@ export interface PluginDataStore {
     databaseId: string,
     recovery: StateV2IndexedDbRecoveryStore,
   ) => StateV2IndexedDbActiveStore;
+  createRemoteScopeRecoveryEvidenceStore?:
+    RemoteScopeRecoveryEvidenceStoreFactory;
 }
 
 export type V2StateLoadBlockReason =
@@ -437,6 +452,8 @@ export interface SyncHistoryEntry {
   recovery?: MutationRecoveryHistory;
   /** Stable reason for a user decision that stopped this run. */
   attention?: SyncAttention;
+  /** Aggregated GET-only scope proof; not included in file action counts. */
+  remoteScopeRecovery?: RemoteScopeRecoveryVerificationSummary;
 }
 
 export interface PendingIssue {
@@ -610,7 +627,7 @@ function corruptionLoadBlockReason(
 function protocolBindingForManifest(
   hold: MigrationHoldV2 | null,
   manifest: StateV2Manifest,
-): SharedSyncProtocolBindingV2 | undefined {
+): SharedSyncProtocolBinding | undefined {
   if (
     !hold?.protocolBinding
     || !sameSyncScope(hold.scope, manifest.scope)
@@ -645,6 +662,8 @@ export class StateManager {
   private v2PathView: StatePathViewV2 | null = null;
   private v2Store: StateEnvelopeV2Store | null = null;
   private v2IndexedDbStore: StateV2IndexedDbActiveStore | null = null;
+  private remoteScopeRecoveryEvidenceStore:
+    RemoteScopeRecoveryEvidenceStore | null = null;
   private v2AuthorityWitnessStore: StateV2AuthorityWitnessStore | null = null;
   private v2ScopeTransitionStore: StateV2ScopeTransitionStore | null = null;
   private v2StateCommitQueue: Promise<void> = Promise.resolve();
@@ -676,7 +695,9 @@ export class StateManager {
 
   async close(): Promise<void> {
     await this.v2IndexedDbStore?.close();
+    await this.remoteScopeRecoveryEvidenceStore?.close();
     this.v2IndexedDbStore = null;
+    this.remoteScopeRecoveryEvidenceStore = null;
   }
 
   /** Bump the generation counter and persist immediately. Called by reset() before clearing
@@ -691,10 +712,12 @@ export class StateManager {
   /** Load all state from plugin data */
   async load(): Promise<void> {
     await this.v2IndexedDbStore?.close();
+    await this.remoteScopeRecoveryEvidenceStore?.close();
     this.v2Envelope = null;
     this.v2PathView = null;
     this.v2Store = null;
     this.v2IndexedDbStore = null;
+    this.remoteScopeRecoveryEvidenceStore = null;
     this.v2AuthorityWitnessStore = null;
     this.v2ScopeTransitionStore = null;
     this.migrationHoldStore = null;
@@ -2317,7 +2340,7 @@ export class StateManager {
   async commitV2RemoteScopeRecoveryCandidate(
     candidate: SyncStateEnvelopeV2,
     now = Date.now(),
-    nextProtocolBinding?: SharedSyncProtocolBindingV2,
+    nextProtocolBinding?: SharedSyncProtocolBinding,
   ): Promise<SyncStateEnvelopeV2> {
     let committed: SyncStateEnvelopeV2 | null = null;
     const task = this.v2StateCommitQueue.then(async () => {
@@ -5115,7 +5138,7 @@ export class StateManager {
     canonicalIdentity: CanonicalPlanIdentityV2;
     communityPluginEnablement:
       CommunityPluginEnablementMigrationCarrierV2 | undefined;
-    protocolBinding: SharedSyncProtocolBindingV2;
+    protocolBinding: SharedSyncProtocolBinding;
     now?: number;
   }): Promise<MigrationHoldV2 | null> {
     if (!await this.isCurrentV2MigrationAuthorization(input)) return null;
@@ -6066,17 +6089,28 @@ export class StateManager {
     command: Readonly<DeviceCommunityPluginParticipationCommand>,
     now = Date.now(),
   ): Promise<boolean> {
+    return this.updateCommunityPluginParticipationBatch([command], now);
+  }
+
+  async updateCommunityPluginParticipationBatch(
+    commands: readonly Readonly<DeviceCommunityPluginParticipationCommand>[],
+    now = Date.now(),
+  ): Promise<boolean> {
+    if (commands.length === 0) return false;
     return this.commitV2State((current) => {
       if (!current.communityPluginParticipation) {
         throw new Error(
           "Community-plugin participation must be migrated before update",
         );
       }
-      const next = reduceDeviceCommunityPluginParticipation(
-        current.communityPluginParticipation,
-        command,
-        this.plugin.manifest.id,
-      );
+      let next = current.communityPluginParticipation;
+      for (const command of commands) {
+        next = reduceDeviceCommunityPluginParticipation(
+          next,
+          command,
+          this.plugin.manifest.id,
+        );
+      }
       if (
         JSON.stringify(next)
           === JSON.stringify(current.communityPluginParticipation)
@@ -6094,7 +6128,7 @@ export class StateManager {
   }
 
   async getActiveV2ProtocolBinding():
-    Promise<SharedSyncProtocolBindingV2 | null> {
+    Promise<SharedSyncProtocolBinding | null> {
     if (
       !this.v2Envelope
       || !this.v2AuthorityWitnessStore
@@ -6104,6 +6138,97 @@ export class StateManager {
     return witness?.protocolBinding
       ? structuredClone(witness.protocolBinding)
       : null;
+  }
+
+  /**
+   * Open and durably probe the disposable evidence cache for the exact
+   * active-authority/observed-scope/protocol tuple.
+   */
+  async beginRemoteScopeRecoveryEvidence(
+    observedScope: SyncScope,
+    protocolBinding: SharedSyncProtocolBinding,
+    now = Date.now(),
+  ): Promise<RemoteScopeRecoveryEvidenceOperationV1> {
+    const source = this.v2Envelope;
+    if (
+      !source
+      || !source.remoteScopeRecovery
+      || !source.remoteScopeRecovery.observedScope
+      || !sameSyncScope(
+        source.remoteScopeRecovery.observedScope,
+        observedScope,
+      )
+    ) {
+      throw new Error(
+        "Remote scope recovery evidence source is not the active hold",
+      );
+    }
+    const vaultInstanceId = this.currentIndexedDbVaultInstanceId();
+    const factory = this.plugin.createRemoteScopeRecoveryEvidenceStore;
+    if (!vaultInstanceId || !factory) {
+      throw new Error(
+        "Remote scope recovery evidence persistence is unavailable",
+      );
+    }
+    const store = this.remoteScopeRecoveryEvidenceStore
+      ?? factory(vaultInstanceId);
+    this.remoteScopeRecoveryEvidenceStore = store;
+    const sourceStateDigest =
+      await stateV2IndexedDbRecoveryEnvelopeDigest(source);
+    const protocolBindingDigest =
+      await remoteScopeRecoveryProtocolBindingDigest(protocolBinding);
+    return store.begin({
+      vaultInstanceId,
+      sourceDatabaseId:
+        this.v2IndexedDbStore?.databaseId ?? "json-authority",
+      sourceStateDigest,
+      sourceCommitSeq: source.meta.commitSeq,
+      sourceLifecycleEpoch: source.meta.lifecycleEpoch,
+      sourceScope: structuredClone(source.scope),
+      observedScope: structuredClone(observedScope),
+      protocolBindingDigest,
+    }, now);
+  }
+
+  async readValidRemoteScopeRecoveryEvidence(
+    operationId: string,
+    versions: readonly RemoteScopeRecoveryRemoteVersionV1[],
+  ): Promise<{
+    receiptsByRemoteId: ReadonlyMap<
+      string,
+      RemoteScopeRecoveryEvidenceReceiptV1
+    >;
+    invalidated: number;
+  }> {
+    if (!this.remoteScopeRecoveryEvidenceStore) {
+      throw new Error("Remote scope recovery evidence store is not open");
+    }
+    return this.remoteScopeRecoveryEvidenceStore.readValidReceipts(
+      operationId,
+      versions,
+    );
+  }
+
+  async putVerifiedRemoteScopeRecoveryEvidence(
+    receipt: RemoteScopeRecoveryEvidenceReceiptV1,
+  ): Promise<void> {
+    if (!this.remoteScopeRecoveryEvidenceStore) {
+      throw new Error("Remote scope recovery evidence store is not open");
+    }
+    await this.remoteScopeRecoveryEvidenceStore.putVerified(receipt);
+  }
+
+  async summarizeRemoteScopeRecoveryEvidence(
+    operationId: string,
+  ): Promise<RemoteScopeRecoveryEvidenceSummaryV1> {
+    if (!this.remoteScopeRecoveryEvidenceStore) {
+      return { operationId, receipts: 0, updatedAt: 0 };
+    }
+    return this.remoteScopeRecoveryEvidenceStore.summarize(operationId);
+  }
+
+  async retireRemoteScopeRecoveryEvidence(operationId: string): Promise<void> {
+    await this.remoteScopeRecoveryEvidenceStore?.retire(operationId);
   }
 
   async hasV2RecoveryJournal(): Promise<boolean> {

@@ -21,9 +21,9 @@ import {
   summarizeCanonicalPlanReviewV2,
 } from "./canonical-plan-v2";
 import {
-  isSharedSyncProtocolBindingV2,
-  type SharedSyncProtocolBindingV2,
-} from "./sync-protocol-v2";
+  isSharedSyncProtocolBinding,
+  type SharedSyncProtocolBinding,
+} from "./sync-protocol-v3";
 import {
   resolveCommunityPluginEnablementMigrationDecisionsV2,
   sameCommunityPluginEnablementMigrationCarrierV2,
@@ -63,7 +63,7 @@ export interface MigrationHoldV2 {
   reviewKind?: V2ActivationReviewKind;
   communityPluginEnablement?: CommunityPluginEnablementMigrationCarrierV2;
   /** Present from user confirmation onward, before the V2 manifest commits. */
-  protocolBinding?: SharedSyncProtocolBindingV2;
+  protocolBinding?: SharedSyncProtocolBinding;
 }
 
 export interface PendingMigrationHoldV2Input {
@@ -237,10 +237,10 @@ export class MigrationHoldV2Store {
   async confirm(
     expectedRevision: number,
     expectedIdentity: CanonicalPlanIdentityV2,
-    protocolBinding: SharedSyncProtocolBindingV2,
+    protocolBinding: SharedSyncProtocolBinding,
     now = Date.now(),
   ): Promise<MigrationHoldV2 | null> {
-    if (!isSharedSyncProtocolBindingV2(protocolBinding)) return null;
+    if (!isSharedSyncProtocolBinding(protocolBinding)) return null;
     const current = await this.load();
     if (
       !current
@@ -383,13 +383,13 @@ export function validateMigrationHoldV2(
       value.phase === "confirmed"
       || value.phase === "authority-committed"
     )
-    && !isSharedSyncProtocolBindingV2(value.protocolBinding)
+    && !isSharedSyncProtocolBinding(value.protocolBinding)
   ) {
     throw new Error("V2 migration hold lacks its shared protocol binding");
   }
   if (
     value.protocolBinding !== undefined
-    && !isSharedSyncProtocolBindingV2(value.protocolBinding)
+    && !isSharedSyncProtocolBinding(value.protocolBinding)
   ) {
     throw new Error("V2 migration hold protocol binding is invalid");
   }

@@ -114,6 +114,30 @@ describe("resolveSyncNoticeOutcome", () => {
     }))).toEqual({ kind: "failed", count: 0 });
   });
 
+  it("keeps the structured recovery failure message for the terminal notice", () => {
+    expect(resolveSyncNoticeOutcome(result({
+      success: false,
+      errors: 1,
+      message: "verified 2/3; failed at Notes/c.md",
+      remoteScopeRecovery: {
+        schemaVersion: 1,
+        operationFingerprint: "abcdef123456",
+        protocolPreflight: "ready",
+        total: 3,
+        verifiedThisRun: 2,
+        reused: 0,
+        invalidated: 0,
+        remaining: 1,
+        failureStage: "body-verification",
+        firstFailurePath: "Notes/c.md",
+      },
+    }))).toEqual({
+      kind: "failed",
+      count: 0,
+      message: "verified 2/3; failed at Notes/c.md",
+    });
+  });
+
   it("surfaces community plugin enablement review before generic failure", () => {
     expect(resolveSyncNoticeOutcome(result({
       success: false,
@@ -258,6 +282,35 @@ describe("resolveSyncProgressNoticePresentation", () => {
       determinate: true,
       percent: 40,
     });
+  });
+
+  it("uses resumable remote-scope proof counts across recovery phases", () => {
+    const state = progress({
+      phase: "checking",
+      recoveryVerification: {
+        operationFingerprint: "abcdef123456",
+        protocolPreflight: "ready",
+        total: 10,
+        verifiedThisRun: 2,
+        reused: 5,
+        invalidated: 1,
+        remaining: 3,
+      },
+    });
+    const presentation = resolveSyncProgressNoticePresentation(state);
+
+    expect(presentation).toMatchObject({
+      kind: "recovery",
+      showProgressBar: true,
+      determinate: true,
+      percent: 70,
+      current: 7,
+      total: 10,
+    });
+    expect(formatSyncProgressNoticeLabel(
+      presentation,
+      new I18n("zh-cn").t.bind(new I18n("zh-cn")),
+    )).toBe("☁️ 正在核验云端文件 7/10");
   });
 
   it("formats the visible lifecycle sequence with concise localized text", () => {

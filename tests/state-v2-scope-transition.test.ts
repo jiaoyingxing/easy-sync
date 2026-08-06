@@ -151,10 +151,18 @@ const sourceProtocolBinding = {
   recordId: "protocol-old",
   recordETag: "protocol-old-etag",
 };
-const nextProtocolBinding = {
-  ...sourceProtocolBinding,
-  recordId: "protocol-new",
-  recordETag: "protocol-new-etag",
+const nextProtocolBindingV3 = {
+  schemaVersion: 1 as const,
+  protocolVersion: 3 as const,
+  migrationGeneration: sourceProtocolBinding.migrationGeneration,
+  predecessorProtocolVersion: 2 as const,
+  predecessorContentSha256: "b".repeat(64),
+  predecessorConfirmedAllDevicesUpdatedAt:
+    sourceProtocolBinding.confirmedAllDevicesUpdatedAt,
+  createdAt: 10,
+  contentSha256: "c".repeat(64),
+  recordId: "protocol-v3-new",
+  recordETag: "protocol-v3-new-etag",
 };
 
 async function harness(withProtocolBinding = false) {
@@ -212,7 +220,7 @@ describe("StateV2ScopeTransitionStore", () => {
     expect(h.memory.files.has(paths.statePrevious)).toBe(false);
   });
 
-  it("preserves one migration generation while rebinding the recovered scope record", async () => {
+  it("preserves one migration generation while upgrading a recovered scope to V3", async () => {
     const h = await harness(true);
 
     await h.store.commit({
@@ -220,13 +228,13 @@ describe("StateV2ScopeTransitionStore", () => {
       candidate,
       sourceManifest,
       sourceWitness: h.witness,
-      nextProtocolBinding,
+      nextProtocolBinding: nextProtocolBindingV3,
       now: 100,
     });
 
     expect(await h.witnessStore.load()).toMatchObject({
       revision: 2,
-      protocolBinding: nextProtocolBinding,
+      protocolBinding: nextProtocolBindingV3,
     });
     expect(JSON.parse(
       h.memory.files.get(paths.transitionCommitted) ?? "null",

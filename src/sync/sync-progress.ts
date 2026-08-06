@@ -39,6 +39,33 @@ export interface FileProgress {
   fileSize?: number;
 }
 
+export type RemoteScopeRecoveryFailureStage =
+  | "protocol-preflight"
+  | "evidence-preflight"
+  | "scan"
+  | "remote-snapshot"
+  | "body-verification"
+  | "stability-check"
+  | "planning"
+  | "authority-commit";
+
+export interface RemoteScopeRecoveryVerificationProgress {
+  operationFingerprint: string;
+  protocolPreflight: "ready" | "blocked";
+  total: number;
+  verifiedThisRun: number;
+  reused: number;
+  invalidated: number;
+  remaining: number;
+  failureStage?: RemoteScopeRecoveryFailureStage;
+  firstFailurePath?: string;
+}
+
+export interface RemoteScopeRecoveryVerificationSummary
+extends RemoteScopeRecoveryVerificationProgress {
+  schemaVersion: 1;
+}
+
 export interface SyncProgressState {
   /** Which user-visible workflow owns the current progress/result snapshot. */
   activityKind?: "fullSync" | "sideAction" | "mutationRecovery";
@@ -60,6 +87,8 @@ export interface SyncProgressState {
   cancelRequested: boolean;
   /** Recently completed files (newest last, capped at 50 to avoid unbounded growth) */
   completedFiles: FileProgress[];
+  /** Read-only proof progress; these are not completed sync mutations. */
+  recoveryVerification?: RemoteScopeRecoveryVerificationProgress;
   /** Epoch ms when the sync started, 0 when idle */
   startedAt: number;
 }
@@ -230,6 +259,12 @@ export class SyncProgressStore {
     this._state.currentItemComplete = true;
   }
 
+  setRecoveryVerification(
+    progress: RemoteScopeRecoveryVerificationProgress,
+  ): void {
+    this._state.recoveryVerification = structuredClone(progress);
+  }
+
   /** Mark the sync as started */
   markStarted(
     activityKind: "fullSync" | "sideAction" | "mutationRecovery" = "fullSync",
@@ -238,6 +273,7 @@ export class SyncProgressStore {
     this._state.startedAt = Date.now();
     this._state.cancelRequested = false;
     this._state.completedFiles = [];
+    this._state.recoveryVerification = undefined;
   }
 
   /** Resume the visible side-action result batch without erasing earlier decisions. */
