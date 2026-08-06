@@ -331,6 +331,11 @@ export class ConfigSyncModal extends Modal {
         patch: (value) => ({ syncHotkeys: value }),
       },
       {
+        key: "settings.syncBookmarks",
+        get: () => this.plugin.syncBookmarks,
+        patch: (value) => ({ syncBookmarks: value }),
+      },
+      {
         key: "settings.syncCorePlugins",
         get: () => this.plugin.syncCorePlugins,
         patch: (value) => ({ syncCorePlugins: value }),

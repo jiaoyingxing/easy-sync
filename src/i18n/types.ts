@@ -98,6 +98,8 @@ export interface LocaleStrings {
   "settings.syncHotkeys.desc": string;
   "settings.syncCorePlugins.name": string;
   "settings.syncCorePlugins.desc": string;
+  "settings.syncBookmarks.name": string;
+  "settings.syncBookmarks.desc": string;
   "settings.syncCommunityPlugins.name": string;
   "settings.syncCommunityPlugins.desc": string;
   "settings.syncPluginData.name": string;

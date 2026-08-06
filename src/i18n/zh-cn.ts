@@ -81,6 +81,8 @@ const zhCN: LocaleStrings = {
   "settings.syncHotkeys.desc": "同步自定义快捷键（hotkeys.json）。",
   "settings.syncCorePlugins.name": "核心插件",
   "settings.syncCorePlugins.desc": "同步内置插件的启用状态（core-plugins.json）。核心插件是 Obsidian 自带的，无独立代码文件。",
+  "settings.syncBookmarks.name": "书签",
+  "settings.syncBookmarks.desc": "同步 Obsidian 书签列表（bookmarks.json）。",
   "settings.syncCommunityPlugins.name": "社区插件",
   "settings.syncCommunityPlugins.desc": "同步插件文件与启用状态。",
   "settings.syncPluginData.name": "社区插件数据",

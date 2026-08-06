@@ -90,6 +90,46 @@ describe("community plugin local reconciliation", () => {
         ["dataview", "absent"],
       ]),
       operationId: () => "unused",
-    })).toEqual({ commands: [], followUpPluginIds: [] });
+    })).toEqual({
+      commands: [],
+      followUpPluginIds: [],
+      autoParticipatedPluginIds: [],
+    });
+  });
+
+  it("auto-participates complete local installs only when there is no prior opt-out", () => {
+    const participation = reduceDeviceCommunityPluginParticipation(
+      reduceDeviceCommunityPluginParticipation(
+        createEmptyDeviceCommunityPluginParticipation(true),
+        { type: "mark-never-participated", pluginId: "calendar" },
+      ),
+      { type: "confirm-excluded", pluginId: "dataview" },
+    );
+
+    const planned = planCommunityPluginLocalReconciliation({
+      participation,
+      localBundleFacts: new Map([
+        ["calendar", "complete"],
+        ["dataview", "complete"],
+        ["quickadd", "complete"],
+        ["partial-local", "partial"],
+      ]),
+      operationId: () => "unused",
+      autoParticipatePluginIds: [
+        "calendar",
+        "dataview",
+        "quickadd",
+        "partial-local",
+      ],
+    });
+
+    expect(planned.commands).toEqual([
+      { type: "confirm-participating", pluginId: "calendar" },
+      { type: "confirm-participating", pluginId: "quickadd" },
+    ]);
+    expect(planned.autoParticipatedPluginIds).toEqual([
+      "calendar",
+      "quickadd",
+    ]);
   });
 });

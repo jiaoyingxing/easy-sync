@@ -10364,6 +10364,7 @@ describe("V1 to V2 controlled production activation", () => {
       syncThemes: false,
       syncHotkeys: false,
       syncCorePlugins: false,
+      syncBookmarks: false,
       syncCommunityPlugins: true,
       syncPluginData: false,
       communityPluginSyncPolicy: {

@@ -1030,6 +1030,17 @@ describe("buildSettingsSyncButtonState", () => {
   });
 
   it("uses the approved community plugin terms and concise descriptions", () => {
+    expect(zhCN["settings.syncBookmarks.name"]).toBe("书签");
+    expect(zhCN["settings.syncBookmarks.desc"]).toBe(
+      "同步 Obsidian 书签列表（bookmarks.json）。",
+    );
+    const configSource = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    expect(configSource.indexOf('key: "settings.syncHotkeys"')).toBeLessThan(
+      configSource.indexOf('key: "settings.syncBookmarks"'),
+    );
+    expect(configSource.indexOf('key: "settings.syncBookmarks"')).toBeLessThan(
+      configSource.indexOf('key: "settings.syncCorePlugins"'),
+    );
     expect(zhCN["settings.syncCommunityPlugins.name"]).toBe("社区插件");
     expect(zhCN["settings.syncPluginData.name"]).toBe("社区插件数据");
     expect(zhCN["settings.syncCommunityPlugins.desc"]).toBe(

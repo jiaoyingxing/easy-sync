@@ -82,6 +82,8 @@ const en: LocaleStrings = {
   "settings.syncHotkeys.desc": "Sync custom keyboard shortcuts (hotkeys.json).",
   "settings.syncCorePlugins.name": "Core plugins",
   "settings.syncCorePlugins.desc": "Sync which built-in plugins are enabled (core-plugins.json). Core plugins are part of Obsidian and have no separate code files.",
+  "settings.syncBookmarks.name": "Bookmarks",
+  "settings.syncBookmarks.desc": "Sync Obsidian bookmarks (bookmarks.json).",
   "settings.syncCommunityPlugins.name": "Community plugins",
   "settings.syncCommunityPlugins.desc": "Sync plugin files and enabled state.",
   "settings.syncPluginData.name": "Community plugin data",

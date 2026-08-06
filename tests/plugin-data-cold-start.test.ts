@@ -1302,6 +1302,23 @@ describe("plugin data cold-start cache", () => {
     }));
   });
 
+  it("adds bookmarks as one exact Obsidian config owner", () => {
+    const plugin = new EasySyncPlugin();
+    const setConfig = vi.fn();
+    plugin.scanner = { setConfig } as never;
+    plugin.syncBookmarks = true;
+
+    (plugin as unknown as { applySyncPathSettings(): void })
+      .applySyncPathSettings();
+
+    const config = setConfig.mock.calls.at(-1)?.[0] as {
+      includePaths?: string[];
+    };
+    expect(config.includePaths).toContain(".obsidian/bookmarks.json");
+    expect(config.includePaths).not.toContain(".obsidian/graph.json");
+    expect(config.includePaths).not.toContain(".obsidian/");
+  });
+
   it("marks an effective community-plugin selection expansion for a complete remote identity refresh", async () => {
     const plugin = new EasySyncPlugin();
     plugin.syncCommunityPlugins = true;

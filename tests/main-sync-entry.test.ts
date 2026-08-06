@@ -520,6 +520,87 @@ describe("main sync entry guards", () => {
       .toBe("excluded");
   });
 
+  it("auto-participates complete local installs without reviving exclusions", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 0;
+    const localFiles = new Set([
+      ".obsidian/plugins/new-plugin/main.js",
+      ".obsidian/plugins/new-plugin/manifest.json",
+      ".obsidian/plugins/old-plugin/main.js",
+      ".obsidian/plugins/old-plugin/manifest.json",
+    ]);
+    plugin.app.vault.adapter.exists = vi.fn(async (path: string) =>
+      path === ".obsidian/plugins" || localFiles.has(path)
+    );
+    plugin.app.vault.adapter.list = vi.fn(async (path: string) =>
+      path === ".obsidian/plugins"
+        ? {
+            files: [],
+            folders: [
+              ".obsidian/plugins/new-plugin",
+              ".obsidian/plugins/old-plugin",
+            ],
+          }
+        : { files: [], folders: [] }
+    );
+    const initial = reduceDeviceCommunityPluginParticipation(
+      createEmptyDeviceCommunityPluginParticipation(true),
+      { type: "confirm-excluded", pluginId: "old-plugin" },
+    );
+    const participation = attachParticipationState(plugin, initial);
+
+    await (plugin as never as {
+      scheduleCommunityPluginLocalReconciliation: (
+        trigger: string,
+      ) => Promise<void>;
+    }).scheduleCommunityPluginLocalReconciliation("state-loaded");
+
+    expect(participation.current().pluginsById["new-plugin"]).toEqual({
+      pluginId: "new-plugin",
+      phase: "participating",
+    });
+    expect(participation.current().pluginsById["old-plugin"]).toEqual({
+      pluginId: "old-plugin",
+      phase: "excluded",
+    });
+    expect(participation.state.commitSyncPathSettingsChange)
+      .toHaveBeenCalledOnce();
+  });
+
+  it("uses local plugin file create events as an auto-participation hint", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 0;
+    const localFiles = new Set([
+      ".obsidian/plugins/new-plugin/main.js",
+      ".obsidian/plugins/new-plugin/manifest.json",
+    ]);
+    plugin.app.vault.adapter.exists = vi.fn(async (path: string) =>
+      localFiles.has(path)
+    );
+    const participation = attachParticipationState(
+      plugin,
+      createEmptyDeviceCommunityPluginParticipation(true),
+    );
+
+    (plugin as never as {
+      handleLocalVaultChange: (
+        file: { path: string },
+        kind: "create",
+      ) => void;
+    }).handleLocalVaultChange(
+      { path: ".obsidian/plugins/new-plugin/manifest.json" },
+      "create",
+    );
+    await (plugin as never as {
+      communityPluginLocalReconciliationQueue: Promise<void>;
+    }).communityPluginLocalReconciliationQueue;
+
+    expect(participation.current().pluginsById["new-plugin"]).toEqual({
+      pluginId: "new-plugin",
+      phase: "participating",
+    });
+  });
+
   it("does not infer participation before V2 activation", async () => {
     const plugin = makePlugin();
     plugin.state = { isV2StateActive: false } as never;

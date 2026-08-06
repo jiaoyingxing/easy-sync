@@ -52,32 +52,36 @@ describe("sync view status copy and scrolling layout", () => {
 
   it("keeps the sidebar toolbar fixed above one independent content scroller", () => {
     const styles = readFileSync("styles.css", "utf8");
-    const viewBlock = styles.match(
-      /\.view-content\.easy-sync-view\s*\{([^}]*)\}/s,
+    const desktopViewBlock = styles.match(
+      /body:not\(\.is-mobile\) \.view-content\.easy-sync-view\s*\{([^}]*)\}/s,
     )?.[1] ?? "";
     const toolbarBlock = styles.match(
-      /\.view-content\.easy-sync-view > \.nav-header\s*\{([^}]*)\}/s,
-    )?.[1] ?? "";
-    const desktopToolbarBlock = styles.match(
       /body:not\(\.is-mobile\) \.view-content\.easy-sync-view > \.nav-header\s*\{([^}]*)\}/s,
     )?.[1] ?? "";
-    const contentBlock = styles.match(
-      /\.easy-sync-view-content\s*\{([^}]*)\}/s,
+    const mobileViewBlock = styles.match(
+      /body\.is-mobile \.view-content\.easy-sync-view\s*\{([^}]*)\}/s,
+    )?.[1] ?? "";
+    const mobileToolbarBlock = styles.match(
+      /body\.is-mobile \.view-content\.easy-sync-view > \.nav-header\s*\{([^}]*)\}/s,
+    )?.[1] ?? "";
+    const desktopContentBlock = styles.match(
+      /body:not\(\.is-mobile\) \.easy-sync-view-content\s*\{([^}]*)\}/s,
     )?.[1] ?? "";
 
-    expect(viewBlock).toContain("display: flex");
-    expect(viewBlock).toContain("flex-direction: column");
-    expect(viewBlock).toContain("overflow: hidden");
+    expect(desktopViewBlock).toContain("display: flex");
+    expect(desktopViewBlock).toContain("flex-direction: column");
+    expect(desktopViewBlock).toContain("overflow: hidden");
     expect(toolbarBlock).toContain("position: sticky");
     expect(toolbarBlock).toContain("top: 0");
-    expect(toolbarBlock).toContain("background: var(--background-primary)");
-    expect(desktopToolbarBlock).toContain("background: transparent");
+    expect(toolbarBlock).toContain("background: transparent");
+    expect(mobileViewBlock).toContain("padding-bottom: max(var(--safe-area-inset-bottom), var(--size-4-8))");
+    expect(mobileToolbarBlock).toContain("background: var(--background-primary)");
+    expect(desktopContentBlock).toContain("flex: 1 1 auto");
+    expect(desktopContentBlock).toContain("min-height: 0");
+    expect(desktopContentBlock).toContain("overflow-y: auto");
     expect(styles).not.toMatch(
-      /body\.is-mobile \.view-content\.easy-sync-view > \.nav-header\s*\{[^}]*background:\s*transparent/s,
+      /body\.is-mobile \.view-content\.easy-sync-view > \.nav-header\s*\{[^}]*position:\s*sticky/s,
     );
-    expect(contentBlock).toContain("flex: 1 1 auto");
-    expect(contentBlock).toContain("min-height: 0");
-    expect(contentBlock).toContain("overflow-y: auto");
   });
 });
 

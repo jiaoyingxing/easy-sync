@@ -198,6 +198,7 @@ const KEY_SYNC_APPEARANCE = "sync-appearance";
 const KEY_SYNC_THEMES = "sync-themes";
 const KEY_SYNC_HOTKEYS = "sync-hotkeys";
 const KEY_SYNC_CORE_PLUGINS = "sync-core-plugins";
+const KEY_SYNC_BOOKMARKS = "sync-bookmarks";
 const KEY_SYNC_COMMUNITY_PLUGINS = "sync-community-plugins";
 const KEY_SYNC_PLUGIN_DATA = "sync-plugin-data";
 const KEY_COMMUNITY_PLUGIN_SYNC_POLICY = "community-plugin-sync-policy";
@@ -221,6 +222,7 @@ export interface SyncPathSettings {
   syncThemes: boolean;
   syncHotkeys: boolean;
   syncCorePlugins: boolean;
+  syncBookmarks: boolean;
   syncCommunityPlugins: boolean;
   syncPluginData: boolean;
   communityPluginSyncPolicy: CommunityPluginSyncPolicyV1;
@@ -239,6 +241,7 @@ function syncPathSettingsFingerprint(
     syncThemes: settings.syncThemes,
     syncHotkeys: settings.syncHotkeys,
     syncCorePlugins: settings.syncCorePlugins,
+    syncBookmarks: settings.syncBookmarks,
     syncCommunityPlugins: settings.syncCommunityPlugins,
     syncPluginData: settings.syncPluginData,
     communityPluginSyncPolicy: {
@@ -337,6 +340,7 @@ function syncPathSettingsExpandFileScope(
     || (!previous.syncThemes && candidate.syncThemes)
     || (!previous.syncHotkeys && candidate.syncHotkeys)
     || (!previous.syncCorePlugins && candidate.syncCorePlugins)
+    || (!previous.syncBookmarks && candidate.syncBookmarks)
   ) return true;
 
   const previousCommunityPolicy = createEffectiveCommunityPluginSyncPolicy(
@@ -439,6 +443,7 @@ export default class EasySyncPlugin extends Plugin {
   syncThemes = false;
   syncHotkeys = false;
   syncCorePlugins = false;
+  syncBookmarks = false;
   syncCommunityPlugins = false;
   syncPluginData = false;
   communityPluginSyncPolicy = cloneCommunityPluginSyncPolicy(
@@ -3042,22 +3047,29 @@ export default class EasySyncPlugin extends Plugin {
   ): void {
     const pluginId = this.parseCommunityPluginManagedPathPluginId(path);
     if (!pluginId) return;
+    if (
+      !this.syncCommunityPlugins
+      && this.communityPluginParticipation?.scopeEnabled !== true
+    ) return;
     this.communityPluginReconciliationToken += 1;
     this.pendingCommunityPluginReconciliationIds.delete(pluginId);
+    const phase =
+      this.communityPluginParticipation?.pluginsById[pluginId]?.phase;
     if (
-      this.communityPluginParticipation?.pluginsById[pluginId]?.phase
-        === "exit-requested"
+      phase === "exit-requested"
+      || phase === "never-participated"
+      || phase === undefined
     ) {
       this.queueCommunityPluginLocalReconciliation(pluginId);
       void this.flushCommunityPluginLocalReconciliation();
     }
   }
 
-  private scheduleCommunityPluginLocalReconciliation(
+  private async scheduleCommunityPluginLocalReconciliation(
     trigger: string,
   ): Promise<void> {
     const participation = this.communityPluginParticipation;
-    if (!participation?.scopeEnabled) return Promise.resolve();
+    if (!participation?.scopeEnabled) return;
     for (const entry of Object.values(participation.pluginsById)) {
       if (
         entry.phase === "participating"
@@ -3066,8 +3078,14 @@ export default class EasySyncPlugin extends Plugin {
         this.queueCommunityPluginLocalReconciliation(entry.pluginId);
       }
     }
+    for (const pluginId of await this.listLocalCommunityPluginIdsForParticipation()) {
+      const phase = participation.pluginsById[pluginId]?.phase;
+      if (phase === undefined || phase === "never-participated") {
+        this.queueCommunityPluginLocalReconciliation(pluginId);
+      }
+    }
     if (this.pendingCommunityPluginReconciliationIds.size === 0) {
-      return Promise.resolve();
+      return;
     }
     this.diag?.log(
       "state",
@@ -3075,6 +3093,30 @@ export default class EasySyncPlugin extends Plugin {
       { trigger, mutations: 0 },
     );
     return this.flushCommunityPluginLocalReconciliation();
+  }
+
+  private async listLocalCommunityPluginIdsForParticipation():
+    Promise<string[]> {
+    const configDir = getConfigDir(this.app.vault).replace(/\/+$/, "");
+    const pluginRoot = `${configDir}/plugins`;
+    const adapter = this.app.vault.adapter;
+    try {
+      if (!await adapter.exists(pluginRoot)) return [];
+      const listed = await adapter.list(pluginRoot);
+      return normalizePluginIds(
+        listed.folders.map((path) =>
+          path.replace(/\/+$/, "").split("/").pop() ?? ""
+        ),
+        this.manifest.id,
+      );
+    } catch (error) {
+      this.diag.warn(
+        "state",
+        "community plugin local participation inventory unavailable",
+        error instanceof Error ? error.message : String(error),
+      );
+      return [];
+    }
   }
 
   private flushCommunityPluginLocalReconciliation(): Promise<void> {
@@ -3452,6 +3494,7 @@ export default class EasySyncPlugin extends Plugin {
       if (typeof data[KEY_SYNC_THEMES] === "boolean") this.syncThemes = data[KEY_SYNC_THEMES];
       if (typeof data[KEY_SYNC_HOTKEYS] === "boolean") this.syncHotkeys = data[KEY_SYNC_HOTKEYS];
       if (typeof data[KEY_SYNC_CORE_PLUGINS] === "boolean") this.syncCorePlugins = data[KEY_SYNC_CORE_PLUGINS];
+      if (typeof data[KEY_SYNC_BOOKMARKS] === "boolean") this.syncBookmarks = data[KEY_SYNC_BOOKMARKS];
       this.syncCommunityPlugins =
         data[KEY_SYNC_COMMUNITY_PLUGINS] === true;
       this.syncPluginData = this.syncCommunityPlugins
@@ -3603,6 +3646,7 @@ export default class EasySyncPlugin extends Plugin {
       syncThemes: this.syncThemes,
       syncHotkeys: this.syncHotkeys,
       syncCorePlugins: this.syncCorePlugins,
+      syncBookmarks: this.syncBookmarks,
       syncCommunityPlugins: this.syncCommunityPlugins,
       syncPluginData: this.syncPluginData,
       communityPluginSyncPolicy: cloneCommunityPluginSyncPolicy(
@@ -3622,6 +3666,7 @@ export default class EasySyncPlugin extends Plugin {
     data[KEY_SYNC_THEMES] = settings.syncThemes;
     data[KEY_SYNC_HOTKEYS] = settings.syncHotkeys;
     data[KEY_SYNC_CORE_PLUGINS] = settings.syncCorePlugins;
+    data[KEY_SYNC_BOOKMARKS] = settings.syncBookmarks;
     data[KEY_SYNC_PLUGIN_DATA] = settings.syncPluginData;
     if (!this.communityPluginParticipation) {
       data[KEY_SYNC_COMMUNITY_PLUGINS] = settings.syncCommunityPlugins;
@@ -3652,6 +3697,7 @@ export default class EasySyncPlugin extends Plugin {
     this.syncThemes = settings.syncThemes;
     this.syncHotkeys = settings.syncHotkeys;
     this.syncCorePlugins = settings.syncCorePlugins;
+    this.syncBookmarks = settings.syncBookmarks;
     this.syncCommunityPlugins = settings.syncCommunityPlugins;
     this.syncPluginData = settings.syncPluginData;
     this.communityPluginSyncPolicy = cloneCommunityPluginSyncPolicy(
@@ -3744,6 +3790,7 @@ export default class EasySyncPlugin extends Plugin {
       && previous.syncThemes === candidate.syncThemes
       && previous.syncHotkeys === candidate.syncHotkeys
       && previous.syncCorePlugins === candidate.syncCorePlugins
+      && previous.syncBookmarks === candidate.syncBookmarks
       && previous.syncCommunityPlugins === candidate.syncCommunityPlugins
       && previous.syncPluginData === candidate.syncPluginData
       && sameCommunityPluginSyncPolicy(
@@ -4093,6 +4140,9 @@ export default class EasySyncPlugin extends Plugin {
     // Core plugins (built-in enable states only, no code files)
     if (settings.syncCorePlugins) paths.add(`${configDir}/core-plugins.json`);
 
+    // Bookmarks
+    if (settings.syncBookmarks) paths.add(`${configDir}/bookmarks.json`);
+
     // Community plugins (enable list + code files, no data.json).
     // Selected mode keeps the plugin root observable while the scanner owns
     // the per-plugin file filter.
@@ -4300,17 +4350,32 @@ export default class EasySyncPlugin extends Plugin {
       await this.ensureCommunityPluginParticipationInitialized();
     if (!participation?.scopeEnabled) return { followUpPluginIds: [] };
     const requested = input.pluginIds
-      ? new Set(input.pluginIds)
+      ? new Set(normalizePluginIds(input.pluginIds, this.manifest.id))
       : null;
-    const candidates = Object.values(participation.pluginsById).filter(
-      (entry) =>
+    const candidatePluginIds = new Set<string>();
+    for (const entry of Object.values(participation.pluginsById)) {
+      if (
         (entry.phase === "participating"
           || entry.phase === "exit-requested")
-        && (!requested || requested.has(entry.pluginId)),
-    );
-    if (candidates.length === 0) return { followUpPluginIds: [] };
+        && (!requested || requested.has(entry.pluginId))
+      ) {
+        candidatePluginIds.add(entry.pluginId);
+      }
+    }
+    const localPluginIds = requested
+      ? [...requested]
+      : await this.listLocalCommunityPluginIdsForParticipation();
+    const autoParticipatePluginIds: string[] = [];
+    for (const pluginId of localPluginIds) {
+      const phase = participation.pluginsById[pluginId]?.phase;
+      if (phase === undefined || phase === "never-participated") {
+        candidatePluginIds.add(pluginId);
+        autoParticipatePluginIds.push(pluginId);
+      }
+    }
+    if (candidatePluginIds.size === 0) return { followUpPluginIds: [] };
     const localBundleFacts = await this.observeCommunityPluginLocalBundleFacts(
-      candidates.map((entry) => entry.pluginId),
+      [...candidatePluginIds],
     );
     const planned = planCommunityPluginLocalReconciliation({
       participation,
@@ -4319,6 +4384,7 @@ export default class EasySyncPlugin extends Plugin {
         `exit-${pluginId}-${Date.now()}-${
           ++this.communityPluginParticipationOperationSequence
         }`,
+      autoParticipatePluginIds,
     });
     if (planned.commands.length === 0) return planned;
     await this.commitCommunityPluginParticipationCommands(
@@ -4336,9 +4402,25 @@ export default class EasySyncPlugin extends Plugin {
         trigger: input.trigger,
         commands: planned.commands.length,
         followUps: planned.followUpPluginIds.length,
+        autoParticipated: planned.autoParticipatedPluginIds.length,
         mutations: 0,
       },
     );
+    if (
+      planned.autoParticipatedPluginIds.length > 0
+      && this.syncInterval > 0
+      && !this.autoSyncPaused
+      && this.autoSyncDirtyHint.mark()
+    ) {
+      this.diag.log(
+        "execute",
+        "local community plugin install scheduled normal auto sync",
+        {
+          debounceMs: this.autoSyncChangeDelaySeconds * 1_000,
+          plugins: planned.autoParticipatedPluginIds.length,
+        },
+      );
+    }
     for (const pluginId of planned.followUpPluginIds) {
       this.queueCommunityPluginLocalReconciliation(pluginId);
     }
@@ -5189,6 +5271,7 @@ export default class EasySyncPlugin extends Plugin {
       [this.syncAppearance, "外观"],
       [this.syncThemes, "主题"],
       [this.syncHotkeys, "快捷键"],
+      [this.syncBookmarks, "书签"],
       [this.syncCorePlugins, "核心插件"],
       [this.syncCommunityPlugins, "社区插件"],
       [this.syncPluginData, "插件数据"],
