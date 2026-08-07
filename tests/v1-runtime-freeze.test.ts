@@ -115,7 +115,6 @@ const FILE_SYNC_V1_DEBT: DebtGuard[] = [
     label: "legacy or dual-state writer calls",
     pattern: /\bthis\.state\.(?:clearRemoteState|applyRemoteMutations|upsertBaseEntries|removeBaseEntries|setRemoteState|commitMutationCheckpoint)\s*\(/g,
     expected: {
-      "src/main.ts": 1,
       "src/sync/sync-executor.ts": 9,
     },
   },
@@ -123,7 +122,9 @@ const FILE_SYNC_V1_DEBT: DebtGuard[] = [
     label: "active mutation recovery ledger calls",
     pattern: /\bthis\.state\.(?:beginMutationIntent|recordMutationReceipt|abandonMutationIntent|commitMutationCheckpoint)\s*\(/g,
     expected: {
-      "src/sync/sync-executor.ts": 12,
+      // Two additional V2-only receipt writes rebind a completed upload to a
+      // replacement folder identity. They do not add a V1 runtime path.
+      "src/sync/sync-executor.ts": 14,
     },
   },
 ];

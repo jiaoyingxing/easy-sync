@@ -7858,6 +7858,166 @@ describe("V1 to V2 controlled production activation", () => {
     expectNoFileMutations(harness.mutations);
   });
 
+  it("retires an explicitly reviewed file replacement lineage without changing either side", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    harness.localEntryState[0]!.path = "Notes/moved.md";
+    const oldRemoteIndex = harness.remoteItemState.findIndex(
+      (item) => item.id === "file-a",
+    );
+    harness.remoteItemState.splice(oldRemoteIndex, 1, {
+      id: "file-replacement",
+      name: "a.md",
+      size: 8,
+      file: { hashes: { sha256Hash: hashB } },
+      parentReference: { id: "folder-notes" },
+      lastModifiedDateTime: "2026-08-07T00:00:00.000Z",
+      eTag: "etag-replacement",
+      cTag: "ctag-replacement",
+    });
+
+    expect(await harness.executor.run("manual")).toMatchObject({
+      success: true,
+      deferred: 1,
+      errors: 0,
+    });
+    expect(harness.state.pendingIssues).toEqual([
+      expect.objectContaining({
+        path: "Notes/a.md",
+        issueCode: "identity-replacement-ambiguous",
+      }),
+    ]);
+    const reviewed = await harness.executor.getStaleIdentityResolutionSnapshot(
+      "Notes/a.md",
+    );
+    expect(reviewed).toMatchObject({
+      kind: "file-replacement",
+      relatedPaths: ["Notes/moved.md"],
+      primaryRemote: { remoteId: "file-a", status: "missing" },
+    });
+
+    expect(await harness.executor.retireReviewedStaleIdentity(reviewed!)).toBe(true);
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(harness.state.getCommittedV2Envelope()!.anchors.byAnchorId).toEqual({});
+    expect(harness.localEntryState.map((entry) => entry.path)).toEqual([
+      "Notes/moved.md",
+    ]);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes/a.md")?.id)
+      .toBe("file-replacement");
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("rejects stale identity retirement when Graph facts change after review", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    harness.localEntryState[0]!.path = "Notes/moved.md";
+    const oldRemoteIndex = harness.remoteItemState.findIndex(
+      (item) => item.id === "file-a",
+    );
+    harness.remoteItemState.splice(oldRemoteIndex, 1, {
+      id: "file-replacement",
+      name: "a.md",
+      size: 8,
+      file: { hashes: { sha256Hash: hashB } },
+      parentReference: { id: "folder-notes" },
+      eTag: "etag-replacement",
+      cTag: "ctag-replacement",
+    });
+    expect((await harness.executor.run("manual")).deferred).toBe(1);
+    const reviewed = await harness.executor.getStaleIdentityResolutionSnapshot(
+      "Notes/a.md",
+    );
+    expect(reviewed).not.toBeNull();
+    harness.remoteItemState.find((item) => item.id === "file-replacement")!.eTag =
+      "etag-changed-after-review";
+
+    expect(await harness.executor.retireReviewedStaleIdentity(reviewed!)).toBe(false);
+    expect(harness.state.pendingIssues).toHaveLength(1);
+    expect(Object.values(
+      harness.state.getCommittedV2Envelope()!.anchors.byAnchorId,
+    )).toEqual([
+      expect.objectContaining({ remoteId: "file-a", lastPath: "Notes/a.md" }),
+    ]);
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("retires an explicitly reviewed missing remote folder lineage without changing either side", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    expect(await harness.state.recordLocalFolderMoveHint(
+      "Notes",
+      "Archive",
+    )).toBe(true);
+    harness.localFolderPaths.delete("Notes");
+    harness.localFolderPaths.add("Archive");
+    harness.localEntryState[0]!.path = "Archive/a.md";
+    harness.remoteItemState.splice(0, harness.remoteItemState.length);
+
+    expect(await harness.executor.run("manual")).toMatchObject({
+      success: true,
+      deferred: 2,
+      errors: 0,
+    });
+    expect(harness.state.pendingIssues).toEqual([
+      expect.objectContaining({
+        path: "Notes",
+        issueCode: "anchored-folder-missing-remote",
+      }),
+      expect.objectContaining({
+        path: "Notes/a.md",
+        issueCode: "identity-replacement-ambiguous",
+      }),
+    ]);
+    const reviewed = await harness.executor.getStaleIdentityResolutionSnapshot(
+      "Notes",
+    );
+    expect(reviewed).toMatchObject({
+      kind: "folder-missing-remote",
+      relatedPaths: ["Archive"],
+      primaryRemote: { remoteId: "folder-notes", status: "missing" },
+      fileAnchors: [{ remoteId: "file-a" }],
+      folderAnchors: [{ remoteId: "folder-notes" }],
+    });
+
+    expect(await harness.executor.retireReviewedStaleIdentity(reviewed!)).toBe(true);
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(harness.state.getCommittedV2Envelope()!.anchors.byAnchorId).toEqual({});
+    expect(
+      harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+    ).toEqual({});
+    expect(harness.state.localFolderMoveHints).toEqual([]);
+    expect(harness.localFolderPaths.has("Archive")).toBe(true);
+    expect(harness.localEntryState.map((entry) => entry.path)).toEqual([
+      "Archive/a.md",
+    ]);
+    expect(harness.remoteItemState).toEqual([]);
+    expectNoFileMutations(harness.mutations);
+  });
+
   it("binds one explicitly selected empty rename through the existing move hint", async () => {
     const { harness, reviewed } = await prepareAmbiguousEmptyFolderHarness();
 

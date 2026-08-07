@@ -5904,6 +5904,129 @@ describe("Persistent remote delta state", () => {
     }));
   });
 
+  it("rebinds an upload receipt after the remote folder identity is replaced", async () => {
+    const hash = "ab".repeat(32);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const folder: RemoteFolderEntry = {
+      path: "plugins",
+      driveId: "plugins-folder-current",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      name: "plugins",
+    };
+    const remote: RemoteFileEntry = {
+      path: "plugins/note.md",
+      driveId: "item-note-current",
+      parentId: folder.driveId,
+      size: 3,
+      mtime: 1,
+      eTag: "etag-note-current",
+      cTag: "ctag-note-current",
+      sha256Hash: hash,
+    };
+    const staleReceiptRemote = { ...remote, parentId: "plugins-folder-old" };
+    const base = {
+      path: remote.path,
+      hash,
+      size: remote.size,
+      eTag: remote.eTag,
+    };
+    const state = makeActiveV2State([remote], [], {
+      remoteFolders: [folder],
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-replaced-parent",
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload",
+          path: remote.path,
+          expectedLocal: { exists: true, hash, size: remote.size },
+          expectedRemote: { exists: false },
+          createdAt: 1,
+        },
+        receipt: {
+          version: 1,
+          operationId: "op-replaced-parent",
+          completedAt: 2,
+          checkpoint: {
+            baseUpserts: [base],
+            baseRemovals: [],
+            remoteUpserts: [staleReceiptRemote],
+            remoteDeletes: [],
+            pendingConflictRemovals: [],
+            pendingDeleteRemovals: [],
+          },
+        },
+      }],
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [
+        graphFolder(folder.driveId, folder.name, folder.parentId),
+        driveItem(remote.path, hash, {
+          id: remote.driveId,
+          eTag: remote.eTag,
+          cTag: remote.cTag,
+          parentReference: { id: folder.driveId },
+        }),
+      ],
+      "@odata.deltaLink": "https://graph.example/delta-next",
+    });
+    const getFileMetadata = vi.fn().mockResolvedValue(remote);
+    const local: LocalFileEntry = {
+      path: remote.path,
+      hash,
+      size: remote.size,
+      mtime: 1,
+      binary: false,
+    };
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getDelta, getFileMetadata }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [local],
+          folders: [{ path: folder.path }],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(state.mutationLedger).toEqual([]);
+    expect(state.remoteSnapshot).toContainEqual(expect.objectContaining({
+      path: remote.path,
+      driveId: remote.driveId,
+      parentId: folder.driveId,
+      eTag: remote.eTag,
+    }));
+    expect(state.recordMutationReceipt).toHaveBeenCalledWith(expect.objectContaining({
+      operationId: "op-replaced-parent",
+      checkpoint: expect.objectContaining({
+        remoteUpserts: [expect.objectContaining({
+          path: remote.path,
+          parentId: folder.driveId,
+        })],
+      }),
+    }));
+  });
+
   it("recovers a cancelled post-upload receipt without uploading the file twice", async () => {
     const content = new Uint8Array([1, 2, 3]).buffer;
     const hash = await sha256Hex(content);

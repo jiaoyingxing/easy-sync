@@ -565,6 +565,7 @@ export class EasySyncSyncView extends ItemView {
     "timestamp" | "current-file" | "recovery" | "scope-recovery" | null = null;
   private emptyFolderResolutionOpening = false;
   private sharedFolderIdentityResolutionOpening = false;
+  private staleIdentityResolutionOpening = false;
   private mutationRecoveryResolutionOpening = false;
 
   constructor(leaf: WorkspaceLeaf, plugin: EasySyncPlugin) {
@@ -1378,6 +1379,20 @@ export class EasySyncSyncView extends ItemView {
       });
     }
     if (retryable) {
+      if (
+        issue.issueCode === "identity-replacement-ambiguous"
+        || issue.issueCode === "anchored-folder-missing-remote"
+      ) {
+        this.createActionChip(
+          actions,
+          t("syncView.staleIdentity.resolve"),
+          "accent",
+          () => {
+            void this.openStaleIdentityResolution(issue.path);
+          },
+        );
+        return;
+      }
       if (issue.issueCode === "unanchored-shared-folder") {
         this.createActionChip(
           actions,
@@ -1406,6 +1421,40 @@ export class EasySyncSyncView extends ItemView {
       ), "accent", () => {
         void this.plugin.startManualSync();
       });
+    }
+  }
+
+  private async openStaleIdentityResolution(path: string): Promise<void> {
+    if (this.staleIdentityResolutionOpening) return;
+    this.staleIdentityResolutionOpening = true;
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    try {
+      const snapshot =
+        await this.plugin.getStaleIdentityResolutionSnapshot(path);
+      if (!snapshot) {
+        new Notice(t("notice.staleIdentity.changed", { path }));
+        return;
+      }
+      const confirmed = await new ConfirmModal(
+        this.plugin.app,
+        t("syncView.staleIdentity.confirmTitle"),
+        null,
+        t("syncView.staleIdentity.confirm"),
+        t("confirm.cancel"),
+        t,
+        {
+          message: t(
+            snapshot.kind === "folder-missing-remote"
+              ? "syncView.staleIdentity.folderMessage"
+              : "syncView.staleIdentity.fileMessage",
+            { path },
+          ),
+        },
+      ).awaitConfirm();
+      if (!confirmed) return;
+      await this.plugin.retireReviewedStaleIdentity(snapshot);
+    } finally {
+      this.staleIdentityResolutionOpening = false;
     }
   }
 

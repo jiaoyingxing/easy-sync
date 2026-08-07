@@ -59,6 +59,9 @@ import type {
 import type {
   SharedFolderIdentityResolutionSnapshotV1,
 } from "./sync/shared-folder-identity-resolution";
+import type {
+  StaleIdentityResolutionSnapshotV1,
+} from "./sync/stale-identity-resolution";
 import {
   isAnySyncActivityRunning,
   SyncProgressStore,
@@ -854,6 +857,7 @@ export default class EasySyncPlugin extends Plugin {
       | "notice.delete.failed"
       | "notice.emptyFolder.failed"
       | "notice.sharedFolderIdentity.failed"
+      | "notice.staleIdentity.failed"
       | "notice.mutationResolution.failed",
     action: (executor: SyncExecutor, state: StateManager) => Promise<void>,
     requireIdleSideActions = false,
@@ -1000,6 +1004,14 @@ export default class EasySyncPlugin extends Plugin {
     return this.syncExecutor.getSharedFolderIdentityResolutionSnapshot(path);
   }
 
+  async getStaleIdentityResolutionSnapshot(
+    path: string,
+  ): Promise<StaleIdentityResolutionSnapshotV1 | null> {
+    await this.ensureStateLoaded();
+    if (!this.syncExecutor || !this.state?.isV2StateActive) return null;
+    return this.syncExecutor.getStaleIdentityResolutionSnapshot(path);
+  }
+
   async getMutationRecoveryResolutionSnapshot():
     Promise<ManualMutationResolutionSnapshotV1 | null> {
     await this.ensureStateLoaded();
@@ -1080,6 +1092,22 @@ export default class EasySyncPlugin extends Plugin {
       },
     );
     if (!admitted || !accepted) return false;
+    await this.startManualSync();
+    return true;
+  }
+
+  async retireReviewedStaleIdentity(
+    reviewed: Readonly<StaleIdentityResolutionSnapshotV1>,
+  ): Promise<boolean> {
+    let retired = false;
+    const admitted = await this.runSideActionIntent(
+      reviewed.path,
+      "notice.staleIdentity.failed",
+      async (executor) => {
+        retired = await executor.retireReviewedStaleIdentity(reviewed);
+      },
+    );
+    if (!admitted || !retired) return false;
     await this.startManualSync();
     return true;
   }
@@ -4053,10 +4081,6 @@ export default class EasySyncPlugin extends Plugin {
         ),
       );
       assertOperationCurrent();
-      if (!this.state.isV2StateActive) {
-        await this.state.clearRemoteState();
-        assertOperationCurrent();
-      }
       this.publishSyncPathSettings(candidate);
       const expandedFolderPaths = v2RemoteFolderPaths.filter(
         (path) =>

@@ -52,6 +52,10 @@ import type {
   SharedFolderIdentityResolutionSnapshotV1,
 } from "./shared-folder-identity-resolution";
 import {
+  retireReviewedStaleIdentityV2,
+  type StaleIdentityResolutionSnapshotV1,
+} from "./stale-identity-resolution";
+import {
   StateEnvelopeV2LoadError,
   StateEnvelopeV2Store,
   type RemoteScopeRecoveryV2,
@@ -317,6 +321,18 @@ export type ReviewedSharedFolderIdentityAcceptance =
   | { status: "blocked" | "stale"; accepted: 0 }
   | { status: "accepted"; accepted: number };
 
+export type ReviewedStaleIdentityRetirement =
+  | {
+      status: "blocked" | "stale";
+      retiredFileAnchors: 0;
+      retiredFolderAnchors: 0;
+    }
+  | {
+      status: "accepted";
+      retiredFileAnchors: number;
+      retiredFolderAnchors: number;
+    };
+
 export type ConfirmedDescendantFolderAcceptance =
   | { status: "none" | "blocked"; accepted: 0; evidenceFiles: 0 }
   | {
@@ -469,6 +485,8 @@ export interface PendingIssue {
   /** Stable, localization-independent route for a supported resolution UI. */
   issueCode?:
     | "anchored-folder-missing-local"
+    | "anchored-folder-missing-remote"
+    | "identity-replacement-ambiguous"
     | "unanchored-shared-folder";
   reason?: string;
   updatedAt: number;
@@ -4387,6 +4405,114 @@ export class StateManager {
   }
 
   /**
+   * Retire an exact stale file/folder identity lineage after explicit review.
+   * This updates V2 authority only: no Vault or Graph object is changed, and
+   * all current objects return to the ordinary canonical planner afterwards.
+   */
+  async retireReviewedStaleIdentity(input: {
+    reviewed: Readonly<StaleIdentityResolutionSnapshotV1>;
+    now?: number;
+  }): Promise<ReviewedStaleIdentityRetirement> {
+    const envelope = this.v2Envelope;
+    if (
+      !envelope
+      || envelope.meta.commitSeq !== input.reviewed.sourceCommitSeq
+      || envelope.meta.lifecycleEpoch !== input.reviewed.sourceLifecycleEpoch
+      || await this.confirmedDescendantEvidenceBlocked(input.reviewed.scope)
+    ) {
+      return {
+        status: "blocked",
+        retiredFileAnchors: 0,
+        retiredFolderAnchors: 0,
+      };
+    }
+    const retiredAt = input.now ?? Date.now();
+    const preview = retireReviewedStaleIdentityV2(
+      envelope,
+      input.reviewed,
+      retiredAt,
+    );
+    if (preview.status !== "accepted") {
+      return {
+        status: "stale",
+        retiredFileAnchors: 0,
+        retiredFolderAnchors: 0,
+      };
+    }
+
+    const expectedCommitSeq = envelope.meta.commitSeq;
+    const staleCommit = new Error(
+      "Reviewed stale identity changed before state commit",
+    );
+    try {
+      await this.commitV2State((current) => {
+        if (
+          current.meta.commitSeq !== expectedCommitSeq
+          || current.meta.lifecycleEpoch !== input.reviewed.sourceLifecycleEpoch
+          || !sameSyncScope(current.scope, input.reviewed.scope)
+        ) throw staleCommit;
+        const currentRetirement = retireReviewedStaleIdentityV2(
+          current,
+          input.reviewed,
+          retiredAt,
+        );
+        if (
+          currentRetirement.status !== "accepted"
+          || currentRetirement.retiredFileAnchors
+            !== preview.retiredFileAnchors
+          || currentRetirement.retiredFolderAnchors
+            !== preview.retiredFolderAnchors
+        ) throw staleCommit;
+        return currentRetirement.envelope;
+      });
+    } catch (error) {
+      if (error === staleCommit) {
+        return {
+          status: "stale",
+          retiredFileAnchors: 0,
+          retiredFolderAnchors: 0,
+        };
+      }
+      throw error;
+    }
+
+    const roots = uniqueIdentityPaths([
+      input.reviewed.path,
+      ...input.reviewed.relatedPaths,
+    ]);
+    const retiredFolderRemoteIds = new Set(
+      input.reviewed.folderAnchors.map((anchor) => anchor.remoteId),
+    );
+    await this.commitPluginData((current) => {
+      const isRetiredPath = (path: string): boolean => roots.some((root) =>
+        isFolderIdentityPathAtOrBelow(path, root));
+      const cleared = clearPlanReviewData({
+        ...current,
+        [KEY_PENDING_CONFLICTS]: current[KEY_PENDING_CONFLICTS].filter(
+          (item) => !isRetiredPath(item.path),
+        ),
+        [KEY_PENDING_DELETES]: current[KEY_PENDING_DELETES].filter(
+          (item) => !isRetiredPath(item.path),
+        ),
+        [KEY_PENDING_ISSUES]: current[KEY_PENDING_ISSUES].filter(
+          (item) => !isRetiredPath(item.path),
+        ),
+        [KEY_LOCAL_FOLDER_MOVE_HINTS]: current[KEY_LOCAL_FOLDER_MOVE_HINTS]
+          .filter((hint) => !retiredFolderRemoteIds.has(hint.remoteId)),
+      });
+      return {
+        ...cleared,
+        [KEY_PLAN_REVIEW_REVISION]: current[KEY_PLAN_REVIEW_REVISION] + 1,
+      };
+    });
+    return {
+      status: "accepted",
+      retiredFileAnchors: preview.retiredFileAnchors,
+      retiredFolderAnchors: preview.retiredFolderAnchors,
+    };
+  }
+
+  /**
    * Publish exact common file state that may subsequently prove a missing
    * folder-identity chain. This remains a StateManager-owned, state-only
    * checkpoint and is blocked by the same recovery facts as folder repair.
@@ -6548,6 +6674,22 @@ function parseLocalFolderMoveHints(value: unknown): LocalFolderMoveHintV1[] {
 
 function normalizeFolderIdentityPath(path: string): string {
   return path.normalize("NFC").toLocaleLowerCase();
+}
+
+function uniqueIdentityPaths(paths: readonly string[]): string[] {
+  const byIdentity = new Map<string, string>();
+  for (const path of paths) {
+    const identity = normalizeFolderIdentityPath(path);
+    if (!byIdentity.has(identity)) byIdentity.set(identity, path);
+  }
+  return [...byIdentity.values()].sort((left, right) => left.localeCompare(right));
+}
+
+function isFolderIdentityPathAtOrBelow(path: string, root: string): boolean {
+  const normalizedPath = normalizeFolderIdentityPath(path);
+  const normalizedRoot = normalizeFolderIdentityPath(root);
+  return normalizedPath === normalizedRoot
+    || normalizedPath.startsWith(`${normalizedRoot}/`);
 }
 
 function isSameOrDescendantPath(path: string, root: string): boolean {

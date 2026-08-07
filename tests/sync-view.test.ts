@@ -81,6 +81,34 @@ describe("sync view status copy and scrolling layout", () => {
     })).not.toContain("raw-provider-error");
   });
 
+  it("keeps stale-identity retirement state-only and hides raw failures", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+    const zhMessage = zh.t("syncView.staleIdentity.fileMessage", {
+      path: "Notes/a.md",
+    });
+    const enMessage = en.t("syncView.staleIdentity.fileMessage", {
+      path: "Notes/a.md",
+    });
+
+    expect(zh.t("syncView.staleIdentity.resolve"))
+      .toBe("保留双方并重新对账");
+    expect(zhMessage).toContain("继续只会解除这条失效的历史身份");
+    expect(zhMessage).toContain("不会上传、下载、覆盖或删除任何文件");
+    expect(en.t("syncView.staleIdentity.resolve"))
+      .toBe("Keep both and reconcile");
+    expect(enMessage).toContain("only detaches that stale historical identity");
+    expect(enMessage).toContain("does not upload, download, overwrite, or delete");
+    expect(zh.t("notice.staleIdentity.failed", {
+      path: "Notes/a.md",
+      reason: "raw-provider-error",
+    })).not.toContain("raw-provider-error");
+    expect(en.t("notice.staleIdentity.failed", {
+      path: "Notes/a.md",
+      reason: "raw-provider-error",
+    })).not.toContain("raw-provider-error");
+  });
+
   it("keeps the sidebar toolbar fixed above one independent content scroller", () => {
     const styles = readFileSync("styles.css", "utf8");
     const desktopViewBlock = styles.match(
@@ -731,6 +759,18 @@ describe("buildSyncViewContentKey", () => {
     expect(label(SyncActionType.Upload)).toBe("再次同步");
   });
 
+  it("explains a folder scope crossing as a safe user action", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+
+    expect(zh.t("reason.folder.scope-crossing")).toBe(
+      "这个文件夹被移动、删除，或已不在当前同步设置中。为避免误删，EasySync 已暂停处理；请确认文件夹位置和同步设置后重新检查。",
+    );
+    expect(en.t("reason.folder.scope-crossing")).toBe(
+      "This folder was moved, deleted, or is no longer included by the current sync settings. EasySync paused it to prevent unintended deletion; confirm the folder location and sync settings, then check again.",
+    );
+  });
+
   it("extracts gray directories only for measured overflow with real benefit", () => {
     const measured = (
       paths: string[],
@@ -951,6 +991,9 @@ describe("buildSyncViewContentKey", () => {
     expect(viewSource).toContain(
       "plugin.confirmReviewedSharedFolderIdentity(snapshot)",
     );
+    expect(viewSource).toContain(
+      "plugin.retireReviewedStaleIdentity(snapshot)",
+    );
     expect(viewSource).not.toContain(
       "syncExecutor.confirmReviewedSharedFolderIdentity",
     );
@@ -988,6 +1031,36 @@ describe("buildSyncViewContentKey", () => {
     expect(source).not.toContain(
       "syncExecutor.confirmReviewedSharedFolderIdentity",
     );
+  });
+
+  it("keeps stale identity retirement explicit, state-only, and local to its pending row", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const rowStart = source.indexOf("  private renderPendingIssue(");
+    const openStart = source.indexOf(
+      "  private async openStaleIdentityResolution(",
+      rowStart,
+    );
+    const openEnd = source.indexOf(
+      "\n  private async openSharedFolderIdentityResolution(",
+      openStart,
+    );
+    const row = source.slice(rowStart, openStart);
+    const openMethod = source.slice(openStart, openEnd);
+
+    expect(row).toContain('issue.issueCode === "identity-replacement-ambiguous"');
+    expect(row).toContain('issue.issueCode === "anchored-folder-missing-remote"');
+    expect(row).toContain('t("syncView.staleIdentity.resolve")');
+    expect(openMethod).toContain(
+      "if (this.staleIdentityResolutionOpening) return",
+    );
+    expect(openMethod.match(/new ConfirmModal\(/g)).toHaveLength(1);
+    expect(openMethod).toContain('"syncView.staleIdentity.folderMessage"');
+    expect(openMethod).toContain('"syncView.staleIdentity.fileMessage"');
+    expect(openMethod).toContain("if (!confirmed) return");
+    expect(openMethod).toContain(
+      "this.plugin.retireReviewedStaleIdentity(snapshot)",
+    );
+    expect(source).not.toContain("syncExecutor.retireReviewedStaleIdentity");
   });
 
   it("keeps facts-changed handling in the fixed top action and opens one neutral review modal", () => {

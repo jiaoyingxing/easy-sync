@@ -63,6 +63,12 @@ import {
   buildSharedFolderIdentityResolutionSnapshotV1,
   type SharedFolderIdentityResolutionSnapshotV1,
 } from "./shared-folder-identity-resolution";
+import {
+  buildStaleIdentityResolutionSnapshotV1,
+  type StaleIdentityIssueCodeV1,
+  type StaleIdentityRemoteFactV1,
+  type StaleIdentityResolutionSnapshotV1,
+} from "./stale-identity-resolution";
 import type {
   BaseFileEntry,
   CloudBaseline,
@@ -843,6 +849,22 @@ export class SyncExecutor {
       ?.snapshot ?? null;
   }
 
+  /** Read-only facts for explicitly retiring one unreachable old identity. */
+  async getStaleIdentityResolutionSnapshot(
+    path: string,
+  ): Promise<StaleIdentityResolutionSnapshotV1 | null> {
+    if (
+      this.running
+      || this.hasSideActionsInFlight
+      || !this.state.isV2StateActive
+      || this.state.hasMutationLedgerCorruption
+      || this.state.hasV2StateLoadRecoveryBlock
+      || this.state.hasV2RemoteScopeRecovery
+    ) return null;
+    return (await this.buildCurrentStaleIdentityResolutionReview(path))
+      ?.snapshot ?? null;
+  }
+
   /** Read and hash one root recovery item without authorizing a mutation. */
   async getMutationRecoveryResolutionSnapshot(
     preferredOperationId?: string,
@@ -1063,6 +1085,60 @@ export class SyncExecutor {
       { skipMutationRecovery: true },
     );
     return accepted;
+  }
+
+  /**
+   * Retire one explicitly reviewed stale lineage without changing either side.
+   * The caller starts an ordinary sync afterwards so current objects are
+   * planned independently under the existing safety and review rules.
+   */
+  async retireReviewedStaleIdentity(
+    reviewed: Readonly<StaleIdentityResolutionSnapshotV1>,
+  ): Promise<boolean> {
+    if (this.stopSideActionForStateRecovery()) return false;
+    let retired = false;
+    await this.enqueueSideAction(
+      reviewed.path,
+      SyncActionType.FolderDeferred,
+      async (operationEpoch) => {
+        const current = await this.buildCurrentStaleIdentityResolutionReview(
+          reviewed.path,
+        );
+        if (
+          !current
+          || current.snapshot.revision !== reviewed.revision
+          || !this.activeSyncScope
+          || !sameSyncScope(current.snapshot.scope, this.activeSyncScope)
+          || !this.canContinue(operationEpoch)
+        ) {
+          this.notice("notice.staleIdentity.changed", { path: reviewed.path });
+          return;
+        }
+        const publication = await this.state.retireReviewedStaleIdentity({
+          reviewed: current.snapshot,
+        });
+        if (publication.status !== "accepted") {
+          this.notice("notice.staleIdentity.changed", { path: reviewed.path });
+          return;
+        }
+        retired = true;
+        this.diag?.log(
+          "state",
+          "reviewed stale identity lineage retired without external mutation",
+          {
+            kind: reviewed.kind,
+            path: reviewed.path,
+            fileAnchors: publication.retiredFileAnchors,
+            folderAnchors: publication.retiredFolderAnchors,
+          },
+        );
+        this.notice("notice.staleIdentity.retired", { path: reviewed.path });
+        return true;
+      },
+      reviewed.kind === "folder-missing-remote" ? { status: "folder" } : undefined,
+      { skipMutationRecovery: true },
+    );
+    return retired;
   }
 
   /** Delete the exact reviewed remote empty folder after destructive confirmation. */
@@ -1458,6 +1534,91 @@ export class SyncExecutor {
       localFiles,
       localFolders: scan.folders,
     };
+  }
+
+  private async buildCurrentStaleIdentityResolutionReview(
+    path: string,
+  ): Promise<{
+    snapshot: StaleIdentityResolutionSnapshotV1;
+  } | null> {
+    const pending = this.state.pendingIssues.find((issue) =>
+      issue.path === path
+        && issue.actionType === SyncActionType.FolderDeferred
+        && (
+          issue.issueCode === "identity-replacement-ambiguous"
+          || issue.issueCode === "anchored-folder-missing-remote"
+        ),
+    );
+    const issueCode = pending?.issueCode as StaleIdentityIssueCodeV1 | undefined;
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!issueCode || !envelope || envelope.remoteIndex.complete !== true) {
+      return null;
+    }
+
+    const scan = await this.scanner.scanAll();
+    if (!scan.complete || !scan.folderScanComplete) return null;
+    const configDir = getConfigDir(this.scanner.vault);
+    const policy = this.communityPluginSyncPolicy;
+    const structuredCommunityPluginPath = policy.files.mode !== "none"
+      ? `${configDir}/community-plugins.json`
+      : null;
+    const includeFilePath = (candidate: string): boolean =>
+      candidate !== structuredCommunityPluginPath
+        && this.shouldIncludeRemotePath(candidate)
+        && isCommunityPluginPathSelectedByPolicy(
+          candidate,
+          policy,
+          configDir,
+        );
+    const snapshot = buildStaleIdentityResolutionSnapshotV1(
+      path,
+      issueCode,
+      {
+        envelope,
+        localFiles: scan.entries.filter((entry) => includeFilePath(entry.path)),
+        localFolders: scan.folders,
+        localFolderScanComplete: scan.folderScanComplete,
+        skippedLarge: scan.skippedLarge,
+        localMoveHints: this.state.localFolderMoveHints,
+        includeFilePath,
+        includeFolderPath: (candidate) =>
+          this.scanner.shouldSyncFolderPath(candidate),
+        preserveFolderPath: (candidate) =>
+          !this.scanner.shouldSyncFolderPath(candidate)
+          || isCommunityPluginFolderPreservedByPolicy(
+            candidate,
+            policy,
+            configDir,
+            "easy-sync",
+          ),
+        configDir,
+        automaticDeleteLocalFiles:
+          this.automaticHandlingPolicy.autoDeleteLocalFiles,
+      },
+    );
+    if (!snapshot || !await this.staleIdentityLiveFactsMatch(snapshot)) {
+      return null;
+    }
+    return { snapshot };
+  }
+
+  private async staleIdentityLiveFactsMatch(
+    reviewed: Readonly<StaleIdentityResolutionSnapshotV1>,
+  ): Promise<boolean> {
+    const [primary, ...pathItems] = await Promise.all([
+      this.onedrive.getDriveItemMetadataById(reviewed.primaryRemote.remoteId),
+      ...reviewed.pathFacts.map((fact) =>
+        this.onedrive.getDriveItemMetadata(this.vaultName, fact.path)),
+    ]);
+    if (!driveItemMatchesStaleIdentityFact(primary, reviewed.primaryRemote)) {
+      return false;
+    }
+    return reviewed.pathFacts.every((fact, index) => {
+      const live = pathItems[index] ?? null;
+      return fact.remote === null
+        ? live === null
+        : driveItemMatchesStaleIdentityFact(live, fact.remote);
+    });
   }
 
   private async verifyReviewedEmptyFolderResolution(
@@ -6768,6 +6929,10 @@ export class SyncExecutor {
             actionType: item.type,
             ...(item.reason === "reason.folder.anchored-folder-missing-local"
               ? { issueCode: "anchored-folder-missing-local" as const }
+              : item.reason === "reason.folder.anchored-folder-missing-remote"
+                ? { issueCode: "anchored-folder-missing-remote" as const }
+              : item.reason === "reason.identityReplacement.ambiguous"
+                ? { issueCode: "identity-replacement-ambiguous" as const }
               : item.reason === "reason.folder.unanchored-shared-folder"
                 ? { issueCode: "unanchored-shared-folder" as const }
               : {}),
@@ -6853,9 +7018,32 @@ export class SyncExecutor {
           }
         } else if (activeIntent && activeRecord?.receipt) {
           try {
-            await this.commitMutationCheckpoint(
-              activeIntent.operationId,
-            );
+            if (isV2RemoteUpsertParentMismatchError(e)) {
+              // The hierarchy may have changed after this run's initial
+              // scan. Refresh the committed identity tree once, then retry
+              // the exact receipt against that new tree. This is read-only
+              // recovery; it never rewrites the plan or relaxes the reducer.
+              if (this.activeSyncScope) {
+                await this.rebuildRemoteStateFromIdentitySnapshot(
+                  operationEpoch,
+                  result,
+                  this.activeSyncScope,
+                );
+              }
+              const refreshedRecord = this.state.mutationLedger.find(
+                (entry) => entry.intent.operationId === activeIntent.operationId,
+              ) ?? activeRecord;
+              const rebasedReceipt = await this.rebaseReceiptedUploadParent(refreshedRecord);
+              if (rebasedReceipt) {
+                await this.state.recordMutationReceipt(rebasedReceipt);
+                this.diag?.log(
+                  "state",
+                  `rebound same-action upload receipt after remote hierarchy refresh — ${activeIntent.path}`,
+                  { operationId: activeIntent.operationId, mutations: 0 },
+                );
+              }
+            }
+            await this.commitMutationCheckpoint(activeIntent.operationId);
             this.diag?.warn(
               "execute",
               `recorded mutation checkpoint retried in the same action — ${activeIntent.path}`,
@@ -8099,7 +8287,25 @@ export class SyncExecutor {
       if (record.receipt) {
         let receiptMatches: boolean;
         try {
-          receiptMatches = await this.verifyMutationReceipt(record);
+          // A remote hierarchy rebuild can legitimately replace a folder
+          // identity while the upload's durable receipt still carries the
+          // response's older parentReference. Rebind only that parent after
+          // the current path, version, content, and committed folder tree
+          // agree. The reducer remains strict and still rejects every other
+          // identity mismatch.
+          const rebasedReceipt = await this.rebaseReceiptedUploadParent(record);
+          if (rebasedReceipt) {
+            await this.state.recordMutationReceipt(rebasedReceipt);
+            this.diag?.log(
+              "state",
+              `rebound upload receipt to the current remote parent — ${record.intent.path}`,
+              { operationId: record.intent.operationId, mutations: 0 },
+            );
+          }
+          const recoveryRecord = rebasedReceipt
+            ? { ...record, receipt: rebasedReceipt }
+            : record;
+          receiptMatches = await this.verifyMutationReceipt(recoveryRecord);
         } catch (error) {
           if (
             this.cancelled
@@ -8349,6 +8555,76 @@ export class SyncExecutor {
       : null;
   }
 
+  /**
+   * Return the parent identity currently committed for a file path.
+   *
+   * This is deliberately derived from the V2 folder index instead of from a
+   * plan item or an older receipt. A receipt may outlive a remote folder
+   * replacement; the current committed tree is the only parent authority a
+   * checkpoint may use.
+   */
+  private committedRemoteParentId(path: string): string | undefined {
+    const separator = path.lastIndexOf("/");
+    const parentPath = separator >= 0 ? path.slice(0, separator) : "";
+    if (!parentPath) {
+      return this.activeSyncScope?.filesRootId
+        ?? this.state.remoteScope?.filesRootId;
+    }
+    return this.state.remoteFolders.find((folder) =>
+      normalizeRemotePathKey(folder.path) === normalizeRemotePathKey(parentPath),
+    )?.driveId;
+  }
+
+  /**
+   * Rebind only the parent field of a completed upload receipt when the
+   * remote object itself is unchanged and the live parent is already bound to
+   * the current V2 folder tree. This repairs a stale Graph parentReference
+   * after a folder identity rebuild without turning a path-only observation
+   * into an anchor. Any missing or conflicting fact returns null and leaves
+   * the original receipt fail-closed.
+   */
+  private async rebaseReceiptedUploadParent(
+    record: MutationLedgerEntryV1,
+  ): Promise<MutationReceiptV1 | null> {
+    if (record.intent.action !== "upload" || !record.receipt) return null;
+    const upserts = record.receipt.checkpoint.remoteUpserts.filter(
+      (entry) => entry.path === record.intent.path,
+    );
+    if (upserts.length !== 1) return null;
+    const [upsert] = upserts;
+    const expectedParentId = this.committedRemoteParentId(record.intent.path);
+    if (!expectedParentId || upsert.parentId === expectedParentId) return null;
+    const current = await this.inspectRemotePath(record.intent.path);
+    if (
+      !current
+      || current.driveId !== upsert.driveId
+      || current.eTag !== upsert.eTag
+      || current.size !== upsert.size
+    ) return null;
+    if (
+      current.parentId !== expectedParentId
+    ) return null;
+    if (
+      upsert.sha256Hash
+      && current.sha256Hash
+      && upsert.sha256Hash.toLowerCase() !== current.sha256Hash.toLowerCase()
+    ) return null;
+    const base = record.receipt.checkpoint.baseUpserts.find(
+      (entry) => entry.path === record.intent.path,
+    );
+    if (!base) return null;
+    const checkpoint = structuredClone(record.receipt.checkpoint);
+    checkpoint.remoteUpserts = checkpoint.remoteUpserts.map((entry) =>
+      entry.path === record.intent.path
+        ? { ...entry, parentId: expectedParentId }
+        : entry,
+    );
+    return {
+      ...record.receipt,
+      checkpoint,
+    };
+  }
+
   private async verifyMutationReceipt(record: MutationLedgerEntryV1): Promise<boolean> {
     const receipt = record.receipt;
     if (!receipt) return false;
@@ -8460,9 +8736,12 @@ export class SyncExecutor {
     }
     const remote = await this.inspectRemotePath(intent.path);
     const upsert = receipt.checkpoint.remoteUpserts.find((entry) => entry.path === intent.path);
+    const committedParentId = this.committedRemoteParentId(intent.path);
     if (!base || !upsert || !remote
       || remote.driveId !== upsert.driveId
-      || remote.eTag !== upsert.eTag) return false;
+      || remote.eTag !== upsert.eTag
+      || !committedParentId
+      || remote.parentId !== committedParentId) return false;
     if (this.inspectionMatchesVersion(local, base)) return true;
     if (local.status !== "missing") return false;
     return this.restoreReceiptedUploadLocal(intent.path, remote, base);
@@ -14124,6 +14403,11 @@ function isRetryableMutationRecoveryObservationError(
     );
 }
 
+function isV2RemoteUpsertParentMismatchError(error: unknown): boolean {
+  return error instanceof Error
+    && error.message.includes("V2 remote upsert parent does not match path");
+}
+
 function mutationRecoveryIntentsOverlap(
   left: MutationIntent,
   right: MutationIntent,
@@ -14292,6 +14576,24 @@ function toRemoteFolderEntry(path: string, item: DriveItem): RemoteFolderEntry {
     eTag: item.eTag,
     cTag: item.cTag,
   };
+}
+
+function driveItemMatchesStaleIdentityFact(
+  item: DriveItem | null,
+  fact: Readonly<StaleIdentityRemoteFactV1>,
+): boolean {
+  if (fact.status === "missing") return item === null;
+  if (
+    !item
+    || item.id !== fact.remoteId
+    || item.name !== fact.name
+    || item.parentReference?.id !== fact.parentRemoteId
+    || (fact.kind === "folder" ? !item.folder : !item.file)
+    || (fact.eTag !== undefined && item.eTag !== fact.eTag)
+    || (fact.cTag !== undefined && item.cTag !== fact.cTag)
+    || (fact.size !== undefined && item.size !== fact.size)
+  ) return false;
+  return true;
 }
 
 function collectCorruptSourceAncestorHashes(rawEnvelope: string): string[] {

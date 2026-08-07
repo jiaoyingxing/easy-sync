@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import EasySyncPlugin, { SyncPathSettingsUpdateError } from "../src/main";
 import { sha256Hex } from "../src/crypto";
+import { StateManager } from "../src/sync/state-manager";
 import {
   createCommunityPluginManifestObservation,
 } from "../src/sync/community-plugin-bundle";
@@ -1140,48 +1141,86 @@ describe("plugin data cold-start cache", () => {
     expect(clearPlanReview).toHaveBeenCalledTimes(1);
   });
 
-  it("changes sync paths only after clearing remote cache and commits settings with scoped pending state", async () => {
+  it("changes sync paths before first V2 activation without rewriting legacy remote state", async () => {
     const plugin = new EasySyncPlugin();
-    const events: string[] = [];
+    let persistedData: Record<string, unknown> = {};
     let activeExcluded: string[] = [];
-    let savedData: Record<string, unknown> = {};
+    Object.defineProperty(plugin, "app", {
+      configurable: true,
+      value: {
+        vault: {
+          adapter: {
+            read: vi.fn().mockResolvedValue(JSON.stringify({
+              version: 1,
+              generation: 4,
+              deltaLink: "https://graph.example/public-1.1.3",
+              scope: {
+                accountId: "account-id",
+                driveId: "drive-id",
+                vaultFolderId: "vault-folder-id",
+                filesRootId: "files-root-id",
+              },
+              entries: {
+                "Notes/keep.md": {
+                  path: "Notes/keep.md",
+                  driveId: "note-id",
+                  parentId: "files-root-id",
+                  size: 4,
+                  mtime: 1,
+                  eTag: "etag-note",
+                  cTag: "ctag-note",
+                },
+              },
+            })),
+            write: vi.fn().mockResolvedValue(undefined),
+          },
+          configDir: ".obsidian",
+        },
+        workspace: { getLeavesOfType: vi.fn().mockReturnValue([]) },
+      },
+    });
+    Object.defineProperty(plugin, "manifest", {
+      configurable: true,
+      value: {
+        id: "easy-sync",
+        dir: ".obsidian/plugins/easy-sync",
+      },
+    });
+    vi.spyOn(plugin, "loadData").mockImplementation(
+      async () => structuredClone(persistedData),
+    );
+    vi.spyOn(plugin, "saveData").mockImplementation(async (data) => {
+      persistedData = structuredClone(data as Record<string, unknown>);
+    });
     plugin.scanner = {
       setConfig: vi.fn((config: { excludedFolders?: string[] }) => {
         activeExcluded = [...(config.excludedFolders ?? [])];
-        events.push(activeExcluded.length > 0 ? "apply-candidate" : "apply-previous");
       }),
       shouldSyncPath: vi.fn((path: string) =>
         !activeExcluded.some((folder) =>
           path === folder || path.startsWith(`${folder}/`),
         )),
+      shouldSyncFolderPath: vi.fn().mockReturnValue(true),
     } as never;
-    plugin.state = {
-      hasMutationLedgerCorruption: false,
-      mutationLedger: [],
-      clearRemoteState: vi.fn(async () => {
-        events.push("clear-remote");
-      }),
-      commitSyncPathSettingsChange: vi.fn(async (
-        isPathInScope: (path: string) => boolean,
-        persistSettings: (data: Record<string, unknown>) => void,
-        selectedCommunityPluginIds?: readonly string[],
-      ) => {
-        events.push("commit");
-        expect(isPathInScope("Private/note.md")).toBe(false);
-        expect(isPathInScope("Notes/note.md")).toBe(true);
-        expect(selectedCommunityPluginIds).toEqual([]);
-        persistSettings(savedData);
-      }),
-    } as never;
+    const state = new StateManager(plugin as never);
+    await state.load();
+    plugin.state = state;
     plugin.syncExecutor = { hasActivityInFlight: false } as never;
     vi.spyOn(plugin as never, "ensureStateLoaded").mockResolvedValue(undefined);
     vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
 
     await plugin.updateExcludedFolders(["Private"]);
 
-    expect(events).toEqual(["clear-remote", "apply-candidate", "commit"]);
+    expect(state.isV2StateActive).toBe(false);
+    expect(state.hasRemoteState).toBe(true);
     expect(plugin.excludedFolders).toEqual(["Private"]);
-    expect(savedData["sync-excluded-folders"]).toEqual(["Private"]);
+    expect(persistedData["sync-excluded-folders"]).toEqual(["Private"]);
+    expect(state.remoteScope).toEqual({
+      accountId: "account-id",
+      driveId: "drive-id",
+      vaultFolderId: "vault-folder-id",
+      filesRootId: "files-root-id",
+    });
     expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
   });
 
@@ -1517,9 +1556,6 @@ describe("plugin data cold-start cache", () => {
         activeHold = null;
         return true;
       }),
-      clearRemoteState: vi.fn(async () => {
-        events.push("clear-remote");
-      }),
       commitSyncPathSettingsChange: vi.fn(async (
         _isPathInScope: (path: string) => boolean,
         persistSettings: (data: Record<string, unknown>) => void,
@@ -1540,7 +1576,6 @@ describe("plugin data cold-start cache", () => {
 
     expect(events).toEqual([
       "retire-migration-review",
-      "clear-remote",
       "apply-candidate",
       "commit",
     ]);

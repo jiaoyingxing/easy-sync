@@ -212,6 +212,11 @@ export interface LocaleStrings {
   "syncView.sharedFolderIdentity.confirmTitle": string;
   "syncView.sharedFolderIdentity.confirmMessage": string;
   "syncView.sharedFolderIdentity.confirm": string;
+  "syncView.staleIdentity.resolve": string;
+  "syncView.staleIdentity.confirmTitle": string;
+  "syncView.staleIdentity.fileMessage": string;
+  "syncView.staleIdentity.folderMessage": string;
+  "syncView.staleIdentity.confirm": string;
   "syncView.mutationResolution.title": string;
   "syncView.mutationResolution.description": string;
   "syncView.mutationResolution.previousAction": string;
@@ -292,6 +297,9 @@ export interface LocaleStrings {
   "notice.sharedFolderIdentity.changed": string;
   "notice.sharedFolderIdentity.accepted": string;
   "notice.sharedFolderIdentity.failed": string;
+  "notice.staleIdentity.changed": string;
+  "notice.staleIdentity.retired": string;
+  "notice.staleIdentity.failed": string;
   "notice.emptyFolder.restored": string;
   "notice.emptyFolder.bound": string;
   "notice.emptyFolder.deleted": string;
