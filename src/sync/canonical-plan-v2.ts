@@ -520,11 +520,10 @@ function composeCanonicalActionsV2(
       folderPathDepth(right.path) - folderPathDepth(left.path)
       || left.path.localeCompare(right.path))
     .map(clonePlanItem);
-  const unanchoredDescendantEvidence =
-    unanchoredEvidenceCandidates.length
-      <= MAX_UNANCHORED_DESCENDANT_EVIDENCE
-      ? unanchoredEvidenceCandidates
-      : [];
+  const unanchoredDescendantEvidence = unanchoredEvidenceCandidates.slice(
+    0,
+    MAX_UNANCHORED_DESCENDANT_EVIDENCE,
+  );
 
   let fileItems = input.fileItems.filter((candidate) =>
     ![candidate.path, candidate.renameFrom]

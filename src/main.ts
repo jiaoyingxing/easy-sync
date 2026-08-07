@@ -56,6 +56,9 @@ import {
 import type {
   EmptyFolderResolutionSnapshotV1,
 } from "./sync/empty-folder-resolution";
+import type {
+  SharedFolderIdentityResolutionSnapshotV1,
+} from "./sync/shared-folder-identity-resolution";
 import {
   isAnySyncActivityRunning,
   SyncProgressStore,
@@ -850,6 +853,7 @@ export default class EasySyncPlugin extends Plugin {
       | "notice.conflict.failed"
       | "notice.delete.failed"
       | "notice.emptyFolder.failed"
+      | "notice.sharedFolderIdentity.failed"
       | "notice.mutationResolution.failed",
     action: (executor: SyncExecutor, state: StateManager) => Promise<void>,
     requireIdleSideActions = false,
@@ -988,6 +992,14 @@ export default class EasySyncPlugin extends Plugin {
     return this.syncExecutor.getEmptyFolderResolutionSnapshot(path);
   }
 
+  async getSharedFolderIdentityResolutionSnapshot(
+    path: string,
+  ): Promise<SharedFolderIdentityResolutionSnapshotV1 | null> {
+    await this.ensureStateLoaded();
+    if (!this.syncExecutor || !this.state?.isV2StateActive) return null;
+    return this.syncExecutor.getSharedFolderIdentityResolutionSnapshot(path);
+  }
+
   async getMutationRecoveryResolutionSnapshot():
     Promise<ManualMutationResolutionSnapshotV1 | null> {
     await this.ensureStateLoaded();
@@ -1052,6 +1064,22 @@ export default class EasySyncPlugin extends Plugin {
       },
     );
     if (!admitted || !bound) return false;
+    await this.startManualSync();
+    return true;
+  }
+
+  async confirmReviewedSharedFolderIdentity(
+    reviewed: Readonly<SharedFolderIdentityResolutionSnapshotV1>,
+  ): Promise<boolean> {
+    let accepted = false;
+    const admitted = await this.runSideActionIntent(
+      reviewed.path,
+      "notice.sharedFolderIdentity.failed",
+      async (executor) => {
+        accepted = await executor.confirmReviewedSharedFolderIdentity(reviewed);
+      },
+    );
+    if (!admitted || !accepted) return false;
     await this.startManualSync();
     return true;
   }

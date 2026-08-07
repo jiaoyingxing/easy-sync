@@ -208,6 +208,10 @@ export interface LocaleStrings {
   "syncView.emptyFolder.deleteConfirm": string;
   "syncView.emptyFolder.deleteConfirmMessage": string;
   "syncView.emptyFolder.deleteConfirmWarning": string;
+  "syncView.sharedFolderIdentity.resolve": string;
+  "syncView.sharedFolderIdentity.confirmTitle": string;
+  "syncView.sharedFolderIdentity.confirmMessage": string;
+  "syncView.sharedFolderIdentity.confirm": string;
   "syncView.mutationResolution.title": string;
   "syncView.mutationResolution.description": string;
   "syncView.mutationResolution.previousAction": string;
@@ -285,6 +289,9 @@ export interface LocaleStrings {
   "notice.communityPlugins.globalDeleteUnavailable": string;
   "notice.emptyFolder.changed": string;
   "notice.emptyFolder.failed": string;
+  "notice.sharedFolderIdentity.changed": string;
+  "notice.sharedFolderIdentity.accepted": string;
+  "notice.sharedFolderIdentity.failed": string;
   "notice.emptyFolder.restored": string;
   "notice.emptyFolder.bound": string;
   "notice.emptyFolder.deleted": string;

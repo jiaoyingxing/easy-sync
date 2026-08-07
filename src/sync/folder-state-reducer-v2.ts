@@ -133,6 +133,7 @@ export function acceptScopeExpansionFolderAnchorsV2(input: {
       || node.kind !== "folder"
       || remotePaths.get(authorized.driveId) !== authorized.path
       || node.parentId !== authorized.parentId
+      || (authorized.eTag !== undefined && node.eTag !== authorized.eTag)
     ) return reject("remote-identity-changed");
 
     const exact = currentAnchors.find((anchor) =>

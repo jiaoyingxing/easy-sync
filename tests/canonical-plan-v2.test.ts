@@ -855,7 +855,12 @@ describe("canonical V2 plan candidate", () => {
         path: ".obsidian/plugins/easy-sync",
       }),
     ]);
-    expect(candidate.unanchoredDescendantEvidence).toEqual([]);
+    expect(candidate.unanchoredDescendantEvidence).toHaveLength(10);
+    expect(candidate.unanchoredDescendantEvidence.map((item) => item.path))
+      .toEqual(Array.from({ length: 11 }, (_, index) =>
+        `.obsidian/plugins/easy-sync/file-${index}.json`)
+        .sort((left, right) => left.localeCompare(right))
+        .slice(0, 10));
   });
 
   it("applies the file scope before both classification and identity planning", () => {

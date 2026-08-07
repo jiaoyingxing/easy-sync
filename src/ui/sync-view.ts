@@ -564,6 +564,7 @@ export class EasySyncSyncView extends ItemView {
   private statusDetailMode:
     "timestamp" | "current-file" | "recovery" | "scope-recovery" | null = null;
   private emptyFolderResolutionOpening = false;
+  private sharedFolderIdentityResolutionOpening = false;
   private mutationRecoveryResolutionOpening = false;
 
   constructor(leaf: WorkspaceLeaf, plugin: EasySyncPlugin) {
@@ -1377,6 +1378,17 @@ export class EasySyncSyncView extends ItemView {
       });
     }
     if (retryable) {
+      if (issue.issueCode === "unanchored-shared-folder") {
+        this.createActionChip(
+          actions,
+          t("syncView.sharedFolderIdentity.resolve"),
+          "accent",
+          () => {
+            void this.openSharedFolderIdentityResolution(issue.path);
+          },
+        );
+        return;
+      }
       if (issue.issueCode === "anchored-folder-missing-local") {
         this.createActionChip(
           actions,
@@ -1394,6 +1406,35 @@ export class EasySyncSyncView extends ItemView {
       ), "accent", () => {
         void this.plugin.startManualSync();
       });
+    }
+  }
+
+  private async openSharedFolderIdentityResolution(path: string): Promise<void> {
+    if (this.sharedFolderIdentityResolutionOpening) return;
+    this.sharedFolderIdentityResolutionOpening = true;
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    try {
+      const snapshot =
+        await this.plugin.getSharedFolderIdentityResolutionSnapshot(path);
+      if (!snapshot) {
+        new Notice(t("notice.sharedFolderIdentity.changed", { path }));
+        return;
+      }
+      const confirmed = await new ConfirmModal(
+        this.plugin.app,
+        t("syncView.sharedFolderIdentity.confirmTitle"),
+        null,
+        t("syncView.sharedFolderIdentity.confirm"),
+        t("confirm.cancel"),
+        t,
+        {
+          message: t("syncView.sharedFolderIdentity.confirmMessage", { path }),
+        },
+      ).awaitConfirm();
+      if (!confirmed) return;
+      await this.plugin.confirmReviewedSharedFolderIdentity(snapshot);
+    } finally {
+      this.sharedFolderIdentityResolutionOpening = false;
     }
   }
 

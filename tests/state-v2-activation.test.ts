@@ -45,6 +45,7 @@ import {
   StateV2IndexedDbRecoveryStore,
   stateV2IndexedDbRecoveryEnvelopeDigest,
 } from "../src/sync/state-v2-indexeddb-recovery";
+import { ensureSharedSyncProtocolV3 } from "../src/sync/sync-protocol-v3";
 import {
   SyncActionType,
   type BaseFileEntry,
@@ -1308,6 +1309,35 @@ function expectNoFileMutations(
   expect(mutations.renameItem).not.toHaveBeenCalled();
 }
 
+async function seedExactScopeFreeProtocol(
+  harness: ReturnType<typeof makeHarness>,
+) {
+  const predecessor = await harness.client.readSharedSyncProtocolV2(
+    "testVault",
+  );
+  if (!predecessor) throw new Error("shared V2 predecessor is missing");
+  const seeded = await ensureSharedSyncProtocolV3(
+    {
+      read: () => harness.client.readSharedSyncProtocolV3("testVault"),
+      createOnly: (content) =>
+        harness.client.createSharedSyncProtocolV3("testVault", content),
+      readById: (id) => harness.client.readSharedSyncProtocolV3ById(id),
+    },
+    {
+      predecessor,
+      allowCreate: true,
+    },
+  );
+  if (seeded.status !== "ready") {
+    throw new Error(`failed to seed exact V3 protocol: ${seeded.reason}`);
+  }
+  vi.mocked(harness.client.readSharedSyncProtocolV2).mockClear();
+  vi.mocked(harness.client.readSharedSyncProtocolV3).mockClear();
+  vi.mocked(harness.client.createSharedSyncProtocolV3).mockClear();
+  vi.mocked(harness.client.readSharedSyncProtocolV3ById).mockClear();
+  return seeded.binding;
+}
+
 async function activateV2WithFolderScopeDisabled(
   harness: ReturnType<typeof makeHarness>,
   isDisabledPath: (path: string) => boolean,
@@ -1384,6 +1414,55 @@ async function prepareAmbiguousEmptyFolderHarness(
     remoteETag: "etag-folder-notes",
     ...(contentTag ? { remoteCTag: contentTag } : {}),
     candidatePaths: ["Archive"],
+  });
+  return { harness, reviewed: reviewed! };
+}
+
+async function prepareUnanchoredSharedFolderHarness() {
+  const folderPaths = [".obsidian", ".obsidian/plugins"];
+  const harness = makeHarness();
+  await harness.state.load();
+  expect((await harness.executor.run(
+    "manual",
+    {},
+    false,
+    undefined,
+    { activateV2State: true },
+  )).success).toBe(true);
+  for (const path of folderPaths) harness.localFolderPaths.add(path);
+  harness.remoteItemState.push(...remoteFolderTree(folderPaths));
+
+  const deferred = await harness.executor.run(
+    "manual",
+  );
+  expect(deferred).toMatchObject({
+    success: true,
+    foldersCreated: 0,
+    foldersMoved: 0,
+    foldersDeleted: 0,
+    deferred: 2,
+    errors: 0,
+  });
+  expect(harness.state.pendingIssues).toEqual([
+    expect.objectContaining({
+      path: ".obsidian",
+      issueCode: "unanchored-shared-folder",
+    }),
+    expect.objectContaining({
+      path: ".obsidian/plugins",
+      issueCode: "unanchored-shared-folder",
+    }),
+  ]);
+  const reviewed =
+    await harness.executor.getSharedFolderIdentityResolutionSnapshot(
+      ".obsidian/plugins",
+    );
+  expect(reviewed).toMatchObject({
+    path: ".obsidian/plugins",
+    folders: [
+      { path: ".obsidian" },
+      { path: ".obsidian/plugins" },
+    ],
   });
   return { harness, reviewed: reviewed! };
 }
@@ -2303,6 +2382,100 @@ describe("V1 to V2 controlled production activation", () => {
     expectNoFileMutations(harness.mutations);
   });
 
+  it("joins an exact existing V3 lineage when a fresh device observes another V2 scope", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    harness.seedSharedProtocol({
+      ...scope,
+      filesRootId: "previous-files-root",
+    });
+    const seededBinding = await seedExactScopeFreeProtocol(harness);
+    await harness.state.load();
+    const previewCallback = vi.fn().mockResolvedValue(false);
+
+    const preview = await harness.executor.run(
+      "manual",
+      { onConfirmThreshold: previewCallback },
+    );
+
+    expect(preview.message).toBe("result.pausedForReview");
+    expect(previewCallback.mock.calls[0]?.[0]).toMatchObject({
+      reviewKind: "v2-cloud-join",
+      items: [],
+    });
+    expect(harness.state.isV2StateActive).toBe(false);
+    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+
+    await harness.state.close();
+    const restartedState = new StateManager(harness.plugin);
+    await restartedState.load();
+    const restartedExecutor = new SyncExecutor(
+      harness.client,
+      harness.scanner,
+      restartedState,
+      "testVault",
+      undefined,
+      undefined,
+      harness.diag as never,
+      harness.fileManager as never,
+    );
+    const authorization = restartedState.planReviewAuthorization;
+    expect(authorization?.reviewKind).toBe("v2-cloud-join");
+
+    const executed = await restartedExecutor.run(
+      "manual",
+      {},
+      true,
+      authorization!,
+    );
+
+    expect(executed).toMatchObject({
+      success: true,
+      errors: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+    });
+    expect(restartedState.isV2StateActive).toBe(true);
+    expect(restartedState.remoteScope).toEqual(scope);
+    expect(JSON.parse(
+      harness.files.get(paths.stateV2AuthorityWitnessFile)!,
+    )).toMatchObject({
+      protocolBinding: {
+        protocolVersion: 3,
+        migrationGeneration: seededBinding.migrationGeneration,
+        predecessorContentSha256:
+          seededBinding.predecessorContentSha256,
+        contentSha256: seededBinding.contentSha256,
+      },
+    });
+    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+
+    const stable = await restartedExecutor.run("manual");
+    expect(stable).toMatchObject({
+      success: true,
+      errors: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+    });
+    expectNoFileMutations(harness.mutations);
+  });
+
   it("classifies an empty device and empty cloud as first V2 sync", async () => {
     const harness = makeHarness({
       base: [],
@@ -2377,6 +2550,54 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.state.activeV2MigrationHold).toBeNull();
     expect(harness.state.isV2StateActive).toBe(false);
     expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("fails closed when the exact V3 lineage changes after fresh cross-scope review", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    harness.seedSharedProtocol({
+      ...scope,
+      filesRootId: "previous-files-root",
+    });
+    await seedExactScopeFreeProtocol(harness);
+    await harness.state.load();
+    await harness.executor.run("manual");
+    const authorization = harness.state.planReviewAuthorization;
+    expect(authorization?.reviewKind).toBe("v2-cloud-join");
+
+    const changedProtocol = JSON.parse(
+      harness.getSharedProtocolV3()!.content,
+    );
+    changedProtocol.predecessor.contentSha256 = "f".repeat(64);
+    harness.seedSharedProtocolV3(JSON.stringify(changedProtocol));
+    vi.mocked(harness.client.createSharedSyncProtocolV3).mockClear();
+
+    const blocked = await harness.executor.run(
+      "manual",
+      {},
+      true,
+      authorization!,
+    );
+
+    expect(blocked).toMatchObject({
+      success: false,
+      errors: 1,
+      message: "result.v2ProtocolBlocked",
+    });
+    expect(harness.state.isV2StateActive).toBe(false);
+    expect(harness.files.has(paths.stateV2AuthorityWitnessFile)).toBe(false);
+    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
     expectNoFileMutations(harness.mutations);
   });
 
@@ -7594,6 +7815,47 @@ describe("V1 to V2 controlled production activation", () => {
       deferred: 0,
       errors: 0,
     });
+  });
+
+  it("accepts an explicitly reviewed shared-folder identity chain and settles", async () => {
+    const { harness, reviewed } = await prepareUnanchoredSharedFolderHarness();
+
+    expect(
+      await harness.executor.confirmReviewedSharedFolderIdentity(reviewed),
+    ).toBe(true);
+    expect(Object.values(
+      harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+    ).map((anchor) => anchor.lastPath).sort()).toEqual([
+      ".obsidian",
+      ".obsidian/plugins",
+      "Notes",
+    ]);
+    expectNoFileMutations(harness.mutations);
+
+    expect(await harness.executor.run("manual")).toMatchObject({
+      success: true,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.state.pendingIssues).toEqual([]);
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("keeps reviewed shared-folder identity state-only and rejects changed facts", async () => {
+    const { harness, reviewed } = await prepareUnanchoredSharedFolderHarness();
+    const remote = findRemoteItemByPath(
+      harness.remoteItemState,
+      ".obsidian/plugins",
+    )!;
+    remote.eTag = "changed-after-review";
+
+    expect(
+      await harness.executor.confirmReviewedSharedFolderIdentity(reviewed),
+    ).toBe(false);
+    expect(Object.values(
+      harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+    ).map((anchor) => anchor.lastPath)).toEqual(["Notes"]);
+    expectNoFileMutations(harness.mutations);
   });
 
   it("binds one explicitly selected empty rename through the existing move hint", async () => {

@@ -48,6 +48,9 @@ import {
   reduceFolderStateEnvelopeV2,
   type ConfirmedDescendantFolderRejectionReasonV2,
 } from "./folder-state-reducer-v2";
+import type {
+  SharedFolderIdentityResolutionSnapshotV1,
+} from "./shared-folder-identity-resolution";
 import {
   StateEnvelopeV2LoadError,
   StateEnvelopeV2Store,
@@ -310,6 +313,10 @@ export type SyncScopeExpansionAcceptance =
   | { status: "none" | "blocked" | "stale"; accepted: 0 }
   | { status: "accepted"; accepted: number };
 
+export type ReviewedSharedFolderIdentityAcceptance =
+  | { status: "blocked" | "stale"; accepted: 0 }
+  | { status: "accepted"; accepted: number };
+
 export type ConfirmedDescendantFolderAcceptance =
   | { status: "none" | "blocked"; accepted: 0; evidenceFiles: 0 }
   | {
@@ -460,7 +467,9 @@ export interface PendingIssue {
   path: string;
   actionType: SyncActionType;
   /** Stable, localization-independent route for a supported resolution UI. */
-  issueCode?: "anchored-folder-missing-local";
+  issueCode?:
+    | "anchored-folder-missing-local"
+    | "unanchored-shared-folder";
   reason?: string;
   updatedAt: number;
   fileSize?: number;
@@ -4300,6 +4309,80 @@ export class StateManager {
       }).envelope;
     });
     await this.clearSyncScopeExpansion(marker.revision);
+    return { status: "accepted", accepted: reduced.accepted };
+  }
+
+  /**
+   * Commit an exact folder chain that the user explicitly reviewed as one
+   * shared identity. The review is authority only for these folders: it does
+   * not create a file/folder mutation or broaden the current sync scope.
+   */
+  async acceptReviewedSharedFolderIdentity(input: {
+    reviewed: Readonly<SharedFolderIdentityResolutionSnapshotV1>;
+    localFiles: readonly LocalFileEntry[];
+    localFolders: readonly LocalFolderEntry[];
+    localFolderScanComplete: boolean;
+    remoteIdentityComplete: boolean;
+    now?: number;
+  }): Promise<ReviewedSharedFolderIdentityAcceptance> {
+    const envelope = this.v2Envelope;
+    if (
+      !envelope
+      || envelope.meta.commitSeq !== input.reviewed.sourceCommitSeq
+      || !sameSyncScope(envelope.scope, input.reviewed.scope)
+      || await this.confirmedDescendantEvidenceBlocked(input.reviewed.scope)
+    ) {
+      return { status: "blocked", accepted: 0 };
+    }
+    const confirmedAt = input.now ?? Date.now();
+    const reduced = acceptScopeExpansionFolderAnchorsV2({
+      envelope,
+      localFiles: input.localFiles,
+      localFolders: input.localFolders,
+      localFolderScanComplete: input.localFolderScanComplete,
+      remoteIdentityComplete: input.remoteIdentityComplete,
+      authorizedFolders: input.reviewed.folders,
+      confirmedAt,
+    });
+    if (reduced.status !== "accepted") {
+      return { status: "stale", accepted: 0 };
+    }
+
+    const expectedCommitSeq = envelope.meta.commitSeq;
+    const staleCommit = new Error(
+      "Reviewed shared-folder identity changed before state commit",
+    );
+    try {
+      await this.commitV2State((current) => {
+        if (
+          current.meta.commitSeq !== expectedCommitSeq
+          || !sameSyncScope(current.scope, input.reviewed.scope)
+        ) {
+          throw staleCommit;
+        }
+        const currentReduction = acceptScopeExpansionFolderAnchorsV2({
+          envelope: current,
+          localFiles: input.localFiles,
+          localFolders: input.localFolders,
+          localFolderScanComplete: input.localFolderScanComplete,
+          remoteIdentityComplete: input.remoteIdentityComplete,
+          authorizedFolders: input.reviewed.folders,
+          confirmedAt,
+        });
+        if (
+          currentReduction.status !== "accepted"
+          || currentReduction.accepted !== reduced.accepted
+        ) {
+          throw staleCommit;
+        }
+        return currentReduction.envelope;
+      });
+    } catch (error) {
+      if (error === staleCommit) {
+        return { status: "stale", accepted: 0 };
+      }
+      throw error;
+    }
     return { status: "accepted", accepted: reduced.accepted };
   }
 

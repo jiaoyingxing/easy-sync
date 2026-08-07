@@ -59,10 +59,15 @@ import {
   buildEmptyFolderResolutionSnapshotV1,
   type EmptyFolderResolutionSnapshotV1,
 } from "./empty-folder-resolution";
+import {
+  buildSharedFolderIdentityResolutionSnapshotV1,
+  type SharedFolderIdentityResolutionSnapshotV1,
+} from "./shared-folder-identity-resolution";
 import type {
   BaseFileEntry,
   CloudBaseline,
   LocalFileEntry,
+  LocalFolderEntry,
   RemoteFileEntry,
   RemoteFolderEntry,
   SyncDecisionToken,
@@ -822,6 +827,22 @@ export class SyncExecutor {
     return this.buildCurrentEmptyFolderResolutionSnapshot(path);
   }
 
+  /** Read-only facts for an explicit shared-folder identity confirmation. */
+  async getSharedFolderIdentityResolutionSnapshot(
+    path: string,
+  ): Promise<SharedFolderIdentityResolutionSnapshotV1 | null> {
+    if (
+      this.running
+      || this.hasSideActionsInFlight
+      || !this.state.isV2StateActive
+      || this.state.hasMutationLedgerCorruption
+      || this.state.hasV2StateLoadRecoveryBlock
+      || this.state.hasV2RemoteScopeRecovery
+    ) return null;
+    return (await this.buildCurrentSharedFolderIdentityResolutionReview(path))
+      ?.snapshot ?? null;
+  }
+
   /** Read and hash one root recovery item without authorizing a mutation. */
   async getMutationRecoveryResolutionSnapshot(
     preferredOperationId?: string,
@@ -986,6 +1007,62 @@ export class SyncExecutor {
       },
     );
     return bound;
+  }
+
+  /**
+   * Accept one explicitly reviewed local/remote folder chain as shared V2
+   * identity. This is a state-only authority update; normal sync replans all
+   * files afterwards and retains every existing mutation safety check.
+   */
+  async confirmReviewedSharedFolderIdentity(
+    reviewed: Readonly<SharedFolderIdentityResolutionSnapshotV1>,
+  ): Promise<boolean> {
+    if (this.stopSideActionForStateRecovery()) return false;
+    let accepted = false;
+    await this.enqueueSideAction(
+      reviewed.path,
+      SyncActionType.FolderDeferred,
+      async (operationEpoch) => {
+        const current =
+          await this.buildCurrentSharedFolderIdentityResolutionReview(
+            reviewed.path,
+          );
+        if (
+          !current
+          || current.snapshot.revision !== reviewed.revision
+          || !this.activeSyncScope
+          || !sameSyncScope(current.snapshot.scope, this.activeSyncScope)
+          || !this.canContinue(operationEpoch)
+        ) {
+          this.notice("notice.sharedFolderIdentity.changed", {
+            path: reviewed.path,
+          });
+          return;
+        }
+        const publication =
+          await this.state.acceptReviewedSharedFolderIdentity({
+            reviewed: current.snapshot,
+            localFiles: current.localFiles,
+            localFolders: current.localFolders,
+            localFolderScanComplete: true,
+            remoteIdentityComplete: this.state.hasCompleteRemoteFolderIndex,
+          });
+        if (publication.status !== "accepted") {
+          this.notice("notice.sharedFolderIdentity.changed", {
+            path: reviewed.path,
+          });
+          return;
+        }
+        accepted = true;
+        this.notice("notice.sharedFolderIdentity.accepted", {
+          path: reviewed.path,
+        });
+        return true;
+      },
+      { status: "folder" },
+      { skipMutationRecovery: true },
+    );
+    return accepted;
   }
 
   /** Delete the exact reviewed remote empty folder after destructive confirmation. */
@@ -1302,6 +1379,84 @@ export class SyncExecutor {
         baseRevision: snapshot.revision,
         remoteCTag: live.contentTag,
       }),
+    };
+  }
+
+  private async buildCurrentSharedFolderIdentityResolutionReview(
+    path: string,
+  ): Promise<{
+    snapshot: SharedFolderIdentityResolutionSnapshotV1;
+    localFiles: LocalFileEntry[];
+    localFolders: LocalFolderEntry[];
+  } | null> {
+    const pending = this.state.pendingIssues.find((issue) =>
+      issue.path === path
+        && issue.actionType === SyncActionType.FolderDeferred
+        && issue.issueCode === "unanchored-shared-folder",
+    );
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!pending || !envelope || !this.state.hasCompleteRemoteFolderIndex) {
+      return null;
+    }
+
+    const scan = await this.scanner.scanAll();
+    if (!scan.complete || !scan.folderScanComplete) return null;
+    const configDir = getConfigDir(this.scanner.vault);
+    const policy = this.communityPluginSyncPolicy;
+    const structuredCommunityPluginPath = policy.files.mode !== "none"
+      ? `${configDir}/community-plugins.json`
+      : null;
+    const includeFilePath = (candidate: string): boolean =>
+      candidate !== structuredCommunityPluginPath
+        && this.shouldIncludeRemotePath(candidate)
+        && isCommunityPluginPathSelectedByPolicy(
+          candidate,
+          policy,
+          configDir,
+        );
+    const localFiles = scan.entries.filter(
+      (entry) => includeFilePath(entry.path),
+    );
+    const snapshot = buildSharedFolderIdentityResolutionSnapshotV1(path, {
+      envelope,
+      localFiles,
+      localFolders: scan.folders,
+      localFolderScanComplete: scan.folderScanComplete,
+      localMoveHints: this.state.localFolderMoveHints,
+      includeFilePath,
+      includeFolderPath: (candidate) =>
+        this.scanner.shouldSyncFolderPath(candidate),
+      preserveFolderPath: (candidate) =>
+        !this.scanner.shouldSyncFolderPath(candidate)
+        || isCommunityPluginFolderPreservedByPolicy(
+          candidate,
+          policy,
+          configDir,
+          "easy-sync",
+        ),
+    });
+    if (!snapshot) return null;
+
+    for (const folder of snapshot.folders) {
+      const [byId, byPath] = await Promise.all([
+        this.onedrive.getDriveItemMetadataById(folder.driveId),
+        this.onedrive.getDriveItemMetadata(this.vaultName, folder.path),
+      ]);
+      if (
+        !byId?.folder
+        || !byPath?.folder
+        || byId.id !== folder.driveId
+        || byPath.id !== folder.driveId
+        || byId.parentReference?.id !== folder.parentId
+        || byPath.parentReference?.id !== folder.parentId
+        || byId.eTag !== folder.eTag
+        || byPath.eTag !== folder.eTag
+      ) return null;
+    }
+    return {
+      snapshot,
+      localFiles,
+      localFolders: scan.folders,
     };
   }
 
@@ -3183,6 +3338,8 @@ export class SyncExecutor {
       prepareV2MigrationCandidate && public113MigrationEvidence
         ? "v2-migration"
         : null;
+    let freshCrossScopeProtocolBinding: SharedSyncProtocolBindingV3 | null =
+      null;
     const takeOverPublic113MutationLedger =
       prepareV2MigrationCandidate
       && public113MigrationEvidence
@@ -3532,6 +3689,35 @@ export class SyncExecutor {
             "state",
             "fresh V2 device classified as the first device for this sync state",
             { mutations: 0 },
+          );
+        } else if (protocol.reason === "scope-mismatch") {
+          const scopeFreeProtocol =
+            await this.adoptExistingScopeFreeSharedProtocolForFreshActivation();
+          if (scopeFreeProtocol.status !== "ready") {
+            result.errors = 1;
+            result.message = this.t("result.v2ProtocolBlocked");
+            this.diag?.error(
+              "state",
+              "fresh V2 activation could not adopt the existing scope-free protocol after a V2 scope mismatch",
+              { reason: scopeFreeProtocol.reason, mutations: 0 },
+            );
+            return result;
+          }
+          activationReviewKind = "v2-cloud-join";
+          freshCrossScopeProtocolBinding = scopeFreeProtocol.binding;
+          this.diag?.log(
+            "state",
+            "fresh device adopted existing scope-free protocol from exact V2 predecessor",
+            {
+              protocolVersion: scopeFreeProtocol.binding.protocolVersion,
+              migrationGeneration:
+                scopeFreeProtocol.binding.migrationGeneration.slice(0, 12),
+              predecessorContentSha256:
+                scopeFreeProtocol.binding.predecessorContentSha256.slice(0, 12),
+              contentSha256:
+                scopeFreeProtocol.binding.contentSha256.slice(0, 12),
+              mutations: 0,
+            },
           );
         } else {
           result.errors = 1;
@@ -5421,6 +5607,38 @@ export class SyncExecutor {
             existingConfirmed?.phase === "confirmed"
               ? existingConfirmed.protocolBinding
               : undefined;
+          if (
+            reviewedMigrationStillCurrent
+            && reviewKind === "v2-cloud-join"
+            && freshCrossScopeProtocolBinding
+            && !protocolBinding
+          ) {
+            const scopeFreeProtocol =
+              await this.adoptExistingScopeFreeSharedProtocolForFreshActivation(
+                freshCrossScopeProtocolBinding,
+              );
+            if (scopeFreeProtocol.status !== "ready") {
+              result.errors = 1;
+              result.message = this.t("result.v2ProtocolBlocked");
+              this.diag?.error(
+                "state",
+                "reviewed cross-scope cloud join could not revalidate the exact scope-free protocol before authority commit",
+                { reason: scopeFreeProtocol.reason, mutations: 0 },
+              );
+              return result;
+            }
+            protocolBinding = scopeFreeProtocol.binding;
+            this.diag?.log(
+              "state",
+              "reviewed cross-scope cloud join revalidated the exact scope-free protocol before authority commit",
+              {
+                protocolVersion: scopeFreeProtocol.binding.protocolVersion,
+                migrationGeneration:
+                  scopeFreeProtocol.binding.migrationGeneration.slice(0, 12),
+                mutations: 0,
+              },
+            );
+          }
           if (reviewedMigrationStillCurrent && !protocolBinding) {
             // Public 1.1.3 migration alone needs the dedicated upgrade-risk
             // acknowledgement. A reviewed first-sync plan may create the
@@ -6550,6 +6768,8 @@ export class SyncExecutor {
             actionType: item.type,
             ...(item.reason === "reason.folder.anchored-folder-missing-local"
               ? { issueCode: "anchored-folder-missing-local" as const }
+              : item.reason === "reason.folder.unanchored-shared-folder"
+                ? { issueCode: "unanchored-shared-folder" as const }
               : {}),
             reason,
             updatedAt: Date.now(),
@@ -11083,6 +11303,45 @@ export class SyncExecutor {
     });
     return v3.status === "ready"
       ? { status: "ready", binding: v3.binding, source: v3.source }
+      : { status: "blocked", reason: v3.reason };
+  }
+
+  private async adoptExistingScopeFreeSharedProtocolForFreshActivation(
+    expectedBinding?: SharedSyncProtocolBindingV3,
+  ): Promise<
+    | { status: "ready"; binding: SharedSyncProtocolBindingV3 }
+    | { status: "blocked"; reason: string }
+  > {
+    const protocolTransportV2 = availableSharedSyncProtocolTransportV2(
+      this.onedrive,
+      this.vaultName,
+    );
+    if (!protocolTransportV2) {
+      return { status: "blocked", reason: "v2-transport-unavailable" };
+    }
+    const protocolTransportV3 = availableSharedSyncProtocolTransportV3(
+      this.onedrive,
+      this.vaultName,
+    );
+    if (!protocolTransportV3) {
+      return { status: "blocked", reason: "v3-transport-unavailable" };
+    }
+    let predecessor;
+    try {
+      predecessor = await protocolTransportV2.read();
+    } catch {
+      return { status: "blocked", reason: "v2-read-failed" };
+    }
+    if (!predecessor) {
+      return { status: "blocked", reason: "v2-predecessor-missing" };
+    }
+    const v3 = await ensureSharedSyncProtocolV3(protocolTransportV3, {
+      predecessor,
+      ...(expectedBinding ? { expectedBinding } : {}),
+      allowCreate: false,
+    });
+    return v3.status === "ready"
+      ? { status: "ready", binding: v3.binding }
       : { status: "blocked", reason: v3.reason };
   }
 

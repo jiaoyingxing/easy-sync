@@ -50,6 +50,37 @@ describe("sync view status copy and scrolling layout", () => {
       .toBe("2/5 items");
   });
 
+  it("separates shared-folder identity recording from the following sync", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+    const zhMessage = zh.t("syncView.sharedFolderIdentity.confirmMessage", {
+      path: ".obsidian/plugins",
+    });
+    const enMessage = en.t("syncView.sharedFolderIdentity.confirmMessage", {
+      path: ".obsidian/plugins",
+    });
+
+    expect(zh.t("syncView.sharedFolderIdentity.resolve"))
+      .toBe("确认是同一文件夹");
+    expect(zhMessage).toContain("请只在你确认两边原本就是同一个文件夹时继续");
+    expect(zhMessage).toContain("尚未确认的上级文件夹");
+    expect(zhMessage).toContain("记录身份这一步不会上传、下载或删除文件");
+    expect(zhMessage).toContain("随后会立即按当前设置重新同步");
+    expect(en.t("syncView.sharedFolderIdentity.resolve"))
+      .toBe("Confirm same folder");
+    expect(enMessage).toContain("Continue only if you know they were originally the same folder");
+    expect(enMessage).toContain("any unconfirmed parent folders");
+    expect(enMessage).toContain("It will then sync immediately using the current settings");
+    expect(zh.t("notice.sharedFolderIdentity.failed", {
+      path: ".obsidian/plugins",
+      reason: "raw-provider-error",
+    })).not.toContain("raw-provider-error");
+    expect(en.t("notice.sharedFolderIdentity.failed", {
+      path: ".obsidian/plugins",
+      reason: "raw-provider-error",
+    })).not.toContain("raw-provider-error");
+  });
+
   it("keeps the sidebar toolbar fixed above one independent content scroller", () => {
     const styles = readFileSync("styles.css", "utf8");
     const desktopViewBlock = styles.match(
@@ -232,6 +263,33 @@ describe("buildSyncViewContentKey", () => {
 
     expect(actionable).not.toBe(legacy);
     expect(actionable).toContain("anchored-folder-missing-local");
+  });
+
+  it("rebuilds an unanchored shared-folder row for explicit identity review", () => {
+    const legacy = buildSyncViewContentKey(false, {
+      ...baseInput,
+      bodyMode: "pending",
+      pendingIssues: [{
+        path: ".obsidian/plugins",
+        actionType: SyncActionType.FolderDeferred,
+        reason: "folder identity pending",
+        updatedAt: 1,
+      }],
+    });
+    const actionable = buildSyncViewContentKey(false, {
+      ...baseInput,
+      bodyMode: "pending",
+      pendingIssues: [{
+        path: ".obsidian/plugins",
+        actionType: SyncActionType.FolderDeferred,
+        issueCode: "unanchored-shared-folder",
+        reason: "folder identity pending",
+        updatedAt: 1,
+      }],
+    });
+
+    expect(actionable).not.toBe(legacy);
+    expect(actionable).toContain("unanchored-shared-folder");
   });
 
   it("changes when auth initialization finishes so the action button can rebuild", () => {
@@ -890,8 +948,46 @@ describe("buildSyncViewContentKey", () => {
     expect(viewSource).toContain("plugin.resolveConflictKeepLocal");
     expect(viewSource).toContain("plugin.confirmRemoteDelete");
     expect(viewSource).toContain("plugin.confirmRemoteDeletes");
+    expect(viewSource).toContain(
+      "plugin.confirmReviewedSharedFolderIdentity(snapshot)",
+    );
+    expect(viewSource).not.toContain(
+      "syncExecutor.confirmReviewedSharedFolderIdentity",
+    );
     expect(modalSource).toContain("plugin.dismissConflict");
     expect(modalSource).toContain("plugin.reconcileIdenticalConflict");
+  });
+
+  it("keeps shared-folder identity confirmation local to its pending row", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const rowStart = source.indexOf("  private renderPendingIssue(");
+    const openStart = source.indexOf(
+      "  private async openSharedFolderIdentityResolution(",
+      rowStart,
+    );
+    const openEnd = source.indexOf(
+      "\n  private async openEmptyFolderResolution(",
+      openStart,
+    );
+    const row = source.slice(rowStart, openStart);
+    const openMethod = source.slice(openStart, openEnd);
+
+    expect(row).toContain('issue.issueCode === "unanchored-shared-folder"');
+    expect(row).toContain('t("syncView.sharedFolderIdentity.resolve")');
+    expect(openMethod).toContain(
+      "if (this.sharedFolderIdentityResolutionOpening) return",
+    );
+    expect(openMethod.match(/new ConfirmModal\(/g)).toHaveLength(1);
+    expect(openMethod).toContain(
+      't("syncView.sharedFolderIdentity.confirmMessage", { path })',
+    );
+    expect(openMethod).toContain("if (!confirmed) return");
+    expect(openMethod).toContain(
+      "this.plugin.confirmReviewedSharedFolderIdentity(snapshot)",
+    );
+    expect(source).not.toContain(
+      "syncExecutor.confirmReviewedSharedFolderIdentity",
+    );
   });
 
   it("keeps facts-changed handling in the fixed top action and opens one neutral review modal", () => {
