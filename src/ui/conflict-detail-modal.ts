@@ -12,7 +12,6 @@
  * degrades to metadata + a bounded local preview without guessing the cause.
  */
 
-import { Modal } from "obsidian";
 import type EasySyncPlugin from "../main";
 import type { SyncPlanItem } from "../sync/types";
 import { compareContentBuffers } from "../sync/content-equality";
@@ -27,6 +26,7 @@ import {
   summarizeConflictDetail,
 } from "./conflict-detail-presentation";
 import type { ConflictDetailSummaryEvidence } from "./conflict-detail-presentation";
+import { FileComparisonModal } from "./file-comparison-modal";
 
 const MAX_TEXT_DIFF_BYTES_PER_SIDE = 8 * 1024 * 1024;
 const MAX_FALLBACK_PREVIEW_LINES = 200;
@@ -62,12 +62,12 @@ export function getDiffLineNumberWidth(
   return `${Math.max(2, String(maxLineNumber).length)}ch`;
 }
 
-export class ConflictDetailModal extends Modal {
+export class ConflictDetailModal extends FileComparisonModal {
   private onResolved: (() => void) | undefined;
 
   constructor(
-    private plugin: EasySyncPlugin,
-    private item: SyncPlanItem,
+    private readonly plugin: EasySyncPlugin,
+    private readonly item: SyncPlanItem,
   ) {
     super(plugin.app);
   }
@@ -78,14 +78,10 @@ export class ConflictDetailModal extends Modal {
     return this;
   }
 
-  async onOpen(): Promise<void> {
+  protected async renderComparison(): Promise<void> {
     const t = (key: string, params?: Record<string, string | number>) =>
       this.plugin.i18n.t(key, params);
-    const container = this.contentEl;
-    container.addClass("easy-sync-conflict-detail");
-
-    // ── Scrollable body ──
-    const body = container.createDiv("easy-sync-conflict-body");
+    const body = this.comparisonBodyEl;
 
     // ---- Title ----
     body.createEl("h3", {
@@ -132,7 +128,7 @@ export class ConflictDetailModal extends Modal {
           errorKind: getErrorKind(e),
         });
         loadingEl.setText(t("conflictDetail.localReadUnavailable"));
-        this.renderActionButtons(container, t);
+        this.renderActionButtons(t);
         return;
       }
       const localWithinTextBudget = localRaw.byteLength <= MAX_TEXT_DIFF_BYTES_PER_SIDE;
@@ -286,7 +282,7 @@ export class ConflictDetailModal extends Modal {
     }
 
     // ---- Action buttons (fixed footer, outside scroll body) ----
-    this.renderActionButtons(container, t);
+    this.renderActionButtons(t);
   }
 
   /** Render the metadata comparison table */
@@ -294,25 +290,6 @@ export class ConflictDetailModal extends Modal {
     container: HTMLElement,
     t: (key: string, params?: Record<string, string | number>) => string,
   ): void {
-    const table = container.createEl("table", "easy-sync-metadata-table");
-    const thead = table.createEl("thead");
-    const headerRow = thead.createEl("tr");
-    headerRow.createEl("th");
-    headerRow.createEl("th", {
-      text: t("conflictDetail.localLabel"),
-      cls: "easy-sync-meta-col-local",
-    });
-    headerRow.createEl("th", {
-      text: t("conflictDetail.remoteLabel"),
-      cls: "easy-sync-meta-col-remote",
-    });
-
-    const tbody = table.createEl("tbody");
-
-    // --- Modified time row ---
-    const mtimeRow = tbody.createEl("tr");
-    mtimeRow.createEl("td", { text: t("conflictDetail.modifiedTime") });
-
     const localTime = this.item.local?.mtime
       ? new Date(this.item.local.mtime)
       : null;
@@ -323,53 +300,44 @@ export class ConflictDetailModal extends Modal {
       localTime && remoteTime && localTime > remoteTime;
     const remoteIsNewer =
       localTime && remoteTime && remoteTime > localTime;
-
-    const localTimeCell = mtimeRow.createEl("td", "easy-sync-meta-col-local");
-    localTimeCell.setText(
-      localTime
-        ? localTime.toLocaleString() +
-            (localIsNewer ? ` ${t("conflictDetail.newer")}` : "")
-        : "—",
-    );
-    if (localIsNewer) localTimeCell.addClass("easy-sync-meta-highlight");
-
-    const remoteTimeCell = mtimeRow.createEl("td", "easy-sync-meta-col-remote");
-    remoteTimeCell.setText(
-      remoteTime
-        ? remoteTime.toLocaleString() +
-            (remoteIsNewer ? ` ${t("conflictDetail.newer")}` : "")
-        : "—",
-    );
-    if (remoteIsNewer) remoteTimeCell.addClass("easy-sync-meta-highlight");
-
-    // --- Size row ---
-    const sizeRow = tbody.createEl("tr");
-    sizeRow.createEl("td", { text: t("conflictDetail.fileSize") });
-
     const localSize = this.item.local?.size;
     const remoteSize = this.item.remote?.size;
     const localLarger =
       localSize != null && remoteSize != null && localSize > remoteSize;
     const remoteLarger =
       localSize != null && remoteSize != null && remoteSize > localSize;
-
-    const localSizeCell = sizeRow.createEl("td", "easy-sync-meta-col-local");
-    localSizeCell.setText(
-      localSize != null
-        ? formatSize(localSize) +
-            (localLarger ? ` ${t("conflictDetail.larger")}` : "")
-        : "—",
+    this.renderComparisonTable(
+      t("conflictDetail.localLabel"),
+      t("conflictDetail.remoteLabel"),
+      [
+        {
+          label: t("conflictDetail.modifiedTime"),
+          local: localTime
+            ? localTime.toLocaleString()
+              + (localIsNewer ? ` ${t("conflictDetail.newer")}` : "")
+            : "—",
+          remote: remoteTime
+            ? remoteTime.toLocaleString()
+              + (remoteIsNewer ? ` ${t("conflictDetail.newer")}` : "")
+            : "—",
+          localHighlighted: Boolean(localIsNewer),
+          remoteHighlighted: Boolean(remoteIsNewer),
+        },
+        {
+          label: t("conflictDetail.fileSize"),
+          local: localSize != null
+            ? formatSize(localSize)
+              + (localLarger ? ` ${t("conflictDetail.larger")}` : "")
+            : "—",
+          remote: remoteSize != null
+            ? formatSize(remoteSize)
+              + (remoteLarger ? ` ${t("conflictDetail.larger")}` : "")
+            : "—",
+          localHighlighted: localLarger,
+          remoteHighlighted: remoteLarger,
+        },
+      ],
     );
-    if (localLarger) localSizeCell.addClass("easy-sync-meta-highlight");
-
-    const remoteSizeCell = sizeRow.createEl("td", "easy-sync-meta-col-remote");
-    remoteSizeCell.setText(
-      remoteSize != null
-        ? formatSize(remoteSize) +
-            (remoteLarger ? ` ${t("conflictDetail.larger")}` : "")
-        : "—",
-    );
-    if (remoteLarger) remoteSizeCell.addClass("easy-sync-meta-highlight");
   }
 
   /** Render bounded exact hunks and clearly marked summary regions. */
@@ -478,47 +446,42 @@ export class ConflictDetailModal extends Modal {
 
   /** Render the bottom action buttons */
   private renderActionButtons(
-    container: HTMLElement,
     t: (key: string, params?: Record<string, string | number>) => string,
   ): void {
-    const btnRow = container.createDiv("easy-sync-detail-actions");
-
-    // Keep local — close immediately, resolve in background
-    const keepLocalBtn = btnRow.createEl("button", {
-      text: t("syncView.conflict.keepLocal"),
-    });
-    keepLocalBtn.addClass("easy-sync-detail-action-local");
-    keepLocalBtn.addEventListener("click", () => {
-      this.close();
-      void (async () => {
-        await this.plugin.resolveConflictKeepLocal(this.item.path);
-        this.onResolved?.();
-      })();
-    });
-
-    // Keep remote — close immediately, resolve in background
-    const keepRemoteBtn = btnRow.createEl("button", {
-      text: t("syncView.conflict.keepRemote"),
-    });
-    keepRemoteBtn.addClass("easy-sync-detail-action-remote");
-    keepRemoteBtn.addEventListener("click", () => {
-      this.close();
-      void (async () => {
-        await this.plugin.resolveConflictKeepRemote(this.item.path);
-        this.onResolved?.();
-      })();
-    });
-
-    // Skip — close immediately, remove from queue in background
-    btnRow.createEl("button", {
-      text: t("syncView.conflict.skip"),
-    }).addEventListener("click", () => {
-      this.close();
-      void (async () => {
-        await this.plugin.dismissConflict(this.item.path);
-        this.onResolved?.();
-      })();
-    });
+    this.renderFileComparisonActions([
+      {
+        label: t("syncView.conflict.keepLocal"),
+        className: "easy-sync-detail-action-local",
+        onClick: () => {
+          this.close();
+          void (async () => {
+            await this.plugin.resolveConflictKeepLocal(this.item.path);
+            this.onResolved?.();
+          })();
+        },
+      },
+      {
+        label: t("syncView.conflict.keepRemote"),
+        className: "easy-sync-detail-action-remote",
+        onClick: () => {
+          this.close();
+          void (async () => {
+            await this.plugin.resolveConflictKeepRemote(this.item.path);
+            this.onResolved?.();
+          })();
+        },
+      },
+      {
+        label: t("syncView.conflict.skip"),
+        onClick: () => {
+          this.close();
+          void (async () => {
+            await this.plugin.dismissConflict(this.item.path);
+            this.onResolved?.();
+          })();
+        },
+      },
+    ]);
   }
 }
 

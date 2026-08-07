@@ -3037,6 +3037,7 @@ describe("Persistent remote delta state", () => {
     sourcePath?: string;
     path: string;
     configDir?: string;
+    receiptedRenameAnchorCollision?: boolean;
   }) {
     const encoder = new TextEncoder();
     const localBytes = new Map<string, ArrayBuffer>();
@@ -3200,38 +3201,114 @@ describe("Persistent remote delta state", () => {
         file: { hashes: { sha256Hash: nextEntry.sha256Hash } },
       };
     });
-    const remoteEntries = [...remoteFiles.values()].map((item) => item.entry);
     const scope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
-    const ledger: MutationLedgerEntryV1[] = [{
-      intent: {
-        version: 1,
-        operationId: "blocked-operation",
-        planRevision: 1,
-        scope,
-        action: input.sourcePath ? "renameRemote" : "upload",
+    const committedRemoteEntries = [...remoteFiles.values()].map((item) => item.entry);
+    const committedBaseEntries: BaseFileEntry[] = [];
+    let blockedIntent: MutationIntentV1 = {
+      version: 1,
+      operationId: "blocked-operation",
+      planRevision: 1,
+      scope,
+      action: input.sourcePath ? "renameRemote" : "upload",
+      path: input.path,
+      ...(input.sourcePath ? { sourcePath: input.sourcePath } : {}),
+      expectedLocal: { exists: false },
+      expectedRemote: { exists: false },
+      createdAt: 1,
+    };
+    let blockedReceipt: MutationReceiptV1 | null = null;
+    if (input.receiptedRenameAnchorCollision) {
+      if (!input.sourcePath) throw new Error("collision harness requires a source path");
+      const targetBytes = localBytes.get(input.path);
+      if (!targetBytes) throw new Error("collision harness requires the local target");
+      const hash = await sha256Hex(targetBytes);
+      const sourceSeparator = input.sourcePath.lastIndexOf("/");
+      const sourceParentPath = sourceSeparator < 0 ? "" : input.sourcePath.slice(0, sourceSeparator);
+      const targetSeparator = input.path.lastIndexOf("/");
+      const targetParentPath = targetSeparator < 0 ? "" : input.path.slice(0, targetSeparator);
+      const staleSource: RemoteFileEntry = {
+        path: input.sourcePath,
+        driveId: `stale-source-${input.sourcePath}`,
+        parentId: ensureRemoteFolder(sourceParentPath),
+        size: targetBytes.byteLength,
+        mtime: 1,
+        eTag: "etag-stale-source",
+        cTag: "ctag-stale-source",
+        sha256Hash: hash,
+      };
+      const moved: RemoteFileEntry = {
+        ...staleSource,
         path: input.path,
-        ...(input.sourcePath ? { sourcePath: input.sourcePath } : {}),
-        expectedLocal: { exists: false },
-        expectedRemote: { exists: false },
-        createdAt: 1,
-      },
-      receipt: null,
+        parentId: ensureRemoteFolder(targetParentPath),
+        eTag: "etag-receipted-move",
+      };
+      committedRemoteEntries.splice(0, committedRemoteEntries.length, staleSource);
+      committedBaseEntries.push(
+        {
+          path: input.sourcePath,
+          hash,
+          size: targetBytes.byteLength,
+          eTag: staleSource.eTag,
+        },
+        {
+          path: input.path,
+          hash: "f".repeat(64),
+          size: 1,
+          eTag: "etag-stale-target",
+        },
+      );
+      blockedIntent = {
+        ...blockedIntent,
+        action: "renameRemote",
+        sourcePath: input.sourcePath,
+        expectedLocal: { exists: true, hash, size: targetBytes.byteLength },
+        expectedRemote: {
+          exists: true,
+          driveId: staleSource.driveId,
+          eTag: staleSource.eTag,
+          size: staleSource.size,
+          sha256Hash: hash,
+        },
+      };
+      blockedReceipt = {
+        version: 1,
+        operationId: blockedIntent.operationId,
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [{
+            path: input.path,
+            hash,
+            size: targetBytes.byteLength,
+            eTag: moved.eTag,
+          }],
+          baseRemovals: [input.sourcePath],
+          remoteUpserts: [moved],
+          remoteDeletes: [input.sourcePath],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      };
+    }
+    const ledger: MutationLedgerEntryV1[] = [{
+      intent: blockedIntent,
+      receipt: blockedReceipt,
     }];
-    const state = makeActiveV2State(remoteEntries, [], {
+    const state = makeActiveV2State(committedRemoteEntries, committedBaseEntries, {
       mutationLedger: ledger,
       remoteFolders: [...remoteFoldersByPath.values()],
+    });
+    const getDriveItemMetadataById = vi.fn(async (driveId: string) => {
+      const found = [...remoteFiles.values()].find(
+        (current) => current.entry.driveId === driveId,
+      );
+      return found ? { id: driveId, eTag: found.entry.eTag } : null;
     });
     const onedrive = makeMockOneDrive({
       uploadFile,
       deleteItem,
       moveItemById,
       getFileMetadata: vi.fn(async (_vault: string, path: string) => metadata(path)),
-      getDriveItemMetadataById: vi.fn(async (driveId: string) => {
-        const found = [...remoteFiles.values()].find(
-          (current) => current.entry.driveId === driveId,
-        );
-        return found ? { id: driveId, eTag: found.entry.eTag } : null;
-      }),
+      getDriveItemMetadataById,
       downloadFile: vi.fn(async (_vault: string, path: string) => {
         const current = remoteFiles.get(path);
         if (!current) throw new Error(`missing remote: ${path}`);
@@ -3262,6 +3339,7 @@ describe("Persistent remote delta state", () => {
       adapter,
       deleteItem,
       executor,
+      getDriveItemMetadataById,
       inspectLocal,
       localBytes,
       moveItemById,
@@ -3543,6 +3621,218 @@ describe("Persistent remote delta state", () => {
       .getMutationRecoveryResolutionSnapshot();
     expect(compositeReview?.keepLocal.available).toBe(false);
     expect(compositeReview?.keepRemote.available).toBe(false);
+  });
+
+  it("recovers a receipted rename target-anchor collision by creating the reviewed local target", async () => {
+    const harness = await makeManualResolutionHarness({
+      sourcePath: "old.xmind",
+      path: "new.xmind",
+      local: { "new.xmind": "binary-xmind" },
+      receiptedRenameAnchorCollision: true,
+    });
+
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    expect(reviewed).toMatchObject({
+      previousAction: "renameRemote",
+      sourcePath: "old.xmind",
+      path: "new.xmind",
+      keepLocal: { available: true, deletesOtherSide: false },
+      keepRemote: { available: false, deletesOtherSide: false },
+      recoveryEvidence: {
+        kind: "receipted-rename-target-anchor-collision",
+      },
+    });
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(true);
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect(harness.moveItemById).not.toHaveBeenCalled();
+    expect(harness.remoteFiles.has("old.xmind")).toBe(false);
+    expect(harness.remoteFiles.get("new.xmind")?.entry.driveId).toBe("uploaded-new.xmind");
+    expect(harness.state.baseSnapshot.map((entry) => entry.path)).toEqual(["new.xmind"]);
+    expect(harness.state.remoteSnapshot.map((entry) => entry.path)).toEqual(["new.xmind"]);
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("blocks a future remote rename before Graph when the target already owns another anchor", async () => {
+    const harness = await makeManualResolutionHarness({
+      sourcePath: "old.xmind",
+      path: "new.xmind",
+      local: { "new.xmind": "binary-xmind" },
+      receiptedRenameAnchorCollision: true,
+    });
+    const committedSource = harness.state.remoteSnapshot[0];
+    const bytes = harness.localBytes.get("new.xmind")!;
+    harness.remoteFiles.set("old.xmind", {
+      entry: committedSource,
+      bytes: bytes.slice(0),
+    });
+    const localHash = await sha256Hex(bytes);
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "preflight-collision",
+      planRevision: 1,
+      scope: { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+      action: "renameRemote",
+      path: "new.xmind",
+      sourcePath: "old.xmind",
+      expectedLocal: { exists: true, hash: localHash, size: bytes.byteLength },
+      expectedRemote: {
+        exists: true,
+        driveId: committedSource.driveId,
+        eTag: committedSource.eTag,
+        size: committedSource.size,
+        sha256Hash: committedSource.sha256Hash,
+      },
+      createdAt: 3,
+    };
+    const epoch = (harness.executor as unknown as {
+      lifecycle: { capture(): number };
+    }).lifecycle.capture();
+
+    await expect((harness.executor as unknown as {
+      executeManualMutationIntentWithCanonicalExecutor(
+        intent: MutationIntentV1,
+        operationEpoch: number,
+      ): Promise<MutationCheckpointV1>;
+    }).executeManualMutationIntentWithCanonicalExecutor(intent, epoch))
+      .rejects.toThrow("target is owned by another V2 anchor");
+    expect(harness.moveItemById).not.toHaveBeenCalled();
+    expect(harness.remoteFiles.has("old.xmind")).toBe(true);
+    expect(harness.remoteFiles.has("new.xmind")).toBe(false);
+  });
+
+  it("does zero writes when a stale remote identity reappears after reviewing the collision", async () => {
+    const harness = await makeManualResolutionHarness({
+      sourcePath: "old.xmind",
+      path: "new.xmind",
+      local: { "new.xmind": "binary-xmind" },
+      receiptedRenameAnchorCollision: true,
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    const staleId = reviewed?.recoveryEvidence?.staleRemoteIds[0];
+    expect(staleId).toBeTruthy();
+    const bytes = new TextEncoder().encode("reappeared").buffer;
+    harness.remoteFiles.set("elsewhere.xmind", {
+      entry: {
+        path: "elsewhere.xmind",
+        driveId: staleId!,
+        parentId: TEST_SYNC_SCOPE.filesRootId,
+        size: bytes.byteLength,
+        mtime: 3,
+        eTag: "etag-reappeared",
+        cTag: "ctag-reappeared",
+        sha256Hash: await sha256Hex(bytes),
+      },
+      bytes,
+    });
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(false);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toHaveLength(1);
+  });
+
+  it("keeps the receipted collision blocked when a stale identity reappears after upload", async () => {
+    const harness = await makeManualResolutionHarness({
+      sourcePath: "old.xmind",
+      path: "new.xmind",
+      local: { "new.xmind": "binary-xmind" },
+      receiptedRenameAnchorCollision: true,
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    const staleId = reviewed!.recoveryEvidence!.staleRemoteIds[0];
+    const upload = harness.uploadFile.getMockImplementation()!;
+    harness.uploadFile.mockImplementationOnce(async (...args: unknown[]) => {
+      const result = await upload(...args);
+      const bytes = new TextEncoder().encode("reappeared-after-upload").buffer;
+      harness.remoteFiles.set("elsewhere.xmind", {
+        entry: {
+          path: "elsewhere.xmind",
+          driveId: staleId,
+          parentId: TEST_SYNC_SCOPE.filesRootId,
+          size: bytes.byteLength,
+          mtime: 4,
+          eTag: "etag-reappeared-after-upload",
+          cTag: "ctag-reappeared-after-upload",
+          sha256Hash: await sha256Hex(bytes),
+        },
+        bytes,
+      });
+      return result;
+    });
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(false);
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect((harness.state.mutationLedger[0] as MutationLedgerEntryV1).manualResolution)
+      .toMatchObject({ receipt: expect.objectContaining({ version: 1 }) });
+    expect(harness.state.commitManualMutationResolutionCheckpoint)
+      .not.toHaveBeenCalled();
+  });
+
+  it("recovers a lost upload response for the collision without repeating the write", async () => {
+    const harness = await makeManualResolutionHarness({
+      sourcePath: "old.xmind",
+      path: "new.xmind",
+      local: { "new.xmind": "binary-xmind" },
+      receiptedRenameAnchorCollision: true,
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    const upload = harness.uploadFile.getMockImplementation()!;
+    harness.uploadFile.mockImplementationOnce(async (...args: unknown[]) => {
+      await upload(...args);
+      throw new Error("upload response lost");
+    });
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(true);
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect(harness.state.baseSnapshot.map((entry) => entry.path)).toEqual(["new.xmind"]);
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("replays only the collision checkpoint after V2 publication survives ledger cleanup failure", async () => {
+    const harness = await makeManualResolutionHarness({
+      sourcePath: "old.xmind",
+      path: "new.xmind",
+      local: { "new.xmind": "binary-xmind" },
+      receiptedRenameAnchorCollision: true,
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    const commit = vi.mocked(harness.state.commitManualMutationResolutionCheckpoint)
+      .getMockImplementation()!;
+    vi.mocked(harness.state.commitManualMutationResolutionCheckpoint)
+      .mockImplementationOnce(async (sourceOperationId: string) => {
+        const retained = structuredClone(harness.state.mutationLedger[0]);
+        await commit(sourceOperationId);
+        (harness.state.mutationLedger as MutationLedgerEntryV1[]).push(retained);
+        throw new Error("ledger cleanup interrupted");
+      });
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(false);
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect(harness.state.remoteSnapshot.map((entry) => entry.path)).toEqual(["new.xmind"]);
+
+    const epoch = (harness.executor as unknown as {
+      lifecycle: { capture(): number };
+    }).lifecycle.capture();
+    await (harness.executor as unknown as {
+      recoverMutationLedger(
+        scope: SyncScope,
+        metrics: undefined,
+        operationEpoch: number,
+      ): Promise<unknown>;
+    }).recoverMutationLedger(
+      { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+      undefined,
+      epoch,
+    );
+
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect(harness.state.mutationLedger).toEqual([]);
   });
 
   it("recovers an upload response loss without repeating the remote write", async () => {

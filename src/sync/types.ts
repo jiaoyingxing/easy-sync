@@ -390,11 +390,23 @@ export interface MutationReceiptV1 {
 
 export type ManualMutationResolutionChoiceV1 = "keep-local" | "keep-remote";
 
+/** Exact V2 state evidence for recovering one receipted remote rename whose
+ * checkpoint is blocked by a distinct anchor already owning the target path. */
+export interface ReceiptedRenameAnchorCollisionEvidenceV1 {
+  kind: "receipted-rename-target-anchor-collision";
+  lifecycleEpoch: number;
+  sourceCommitSeq: number;
+  sourceAnchorId: string;
+  targetAnchorId: string;
+  /** Every stale Graph identity that must remain absent through publication. */
+  staleRemoteIds: string[];
+}
+
 /**
  * A user-reviewed continuation of one otherwise blocked mutation record.
  *
- * The outer intent/receipt remain untouched so 1.2.1 and older compatible
- * readers still see the original blocking evidence. Newer builds execute and
+ * The outer intent/receipt remain untouched so downgrade readers fail closed
+ * without losing the original blocking evidence. Newer builds execute and
  * checkpoint only this nested, current-facts-bound continuation.
  */
 export interface ManualMutationResolutionV1 {
@@ -404,6 +416,7 @@ export interface ManualMutationResolutionV1 {
   selectedAt: number;
   /** False only when strict equality permits a state-only reconciliation. */
   externalMutation: boolean;
+  recoveryEvidence?: ReceiptedRenameAnchorCollisionEvidenceV1;
   intent: MutationIntentV1;
   receipt: MutationReceiptV1 | null;
 }
@@ -457,6 +470,7 @@ export interface ManualMutationResolutionSnapshotV1 {
   sourcePath?: string;
   local: ManualMutationResolutionLocalFactV1[];
   remote: ManualMutationResolutionRemoteFactV1[];
+  recoveryEvidence?: ReceiptedRenameAnchorCollisionEvidenceV1;
   factsDigest: string;
   identical: boolean;
   keepLocal: ManualMutationResolutionOptionV1;

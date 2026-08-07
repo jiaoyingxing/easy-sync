@@ -1,21 +1,33 @@
-import { ButtonComponent, Modal, Setting, type App } from "obsidian";
+import type { App } from "obsidian";
 import type {
   ManualMutationResolutionChoiceV1,
+  ManualMutationResolutionLocalFactV1,
+  ManualMutationResolutionRemoteFactV1,
   ManualMutationResolutionSnapshotV1,
 } from "../sync/types";
 import type { I18nFn } from "./confirm-modal";
+import {
+  FileComparisonModal,
+  type FileComparisonRow,
+} from "./file-comparison-modal";
 
 function fileFactText(
-  exists: boolean,
-  size: number | undefined,
+  fact: Readonly<
+    ManualMutationResolutionLocalFactV1 | ManualMutationResolutionRemoteFactV1
+  > | undefined,
   t: I18nFn,
 ): string {
-  return exists
-    ? t("syncView.mutationResolution.present", { size: size ?? 0 })
+  return fact?.exists
+    ? t("syncView.mutationResolution.present", { size: fact.size ?? 0 })
     : t("syncView.mutationResolution.missing");
 }
 
-export class MutationRecoveryResolutionModal extends Modal {
+/**
+ * Recovery-specific adapter for the shared local/cloud comparison surface.
+ * It only returns a reviewed choice; the ledger recheck and mutations remain
+ * in SyncExecutor.
+ */
+export class MutationRecoveryResolutionModal extends FileComparisonModal {
   private resolve:
     ((choice: ManualMutationResolutionChoiceV1 | null) => void) | null = null;
 
@@ -34,47 +46,32 @@ export class MutationRecoveryResolutionModal extends Modal {
     });
   }
 
-  private finish(choice: ManualMutationResolutionChoiceV1 | null): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    this.close();
-    resolve?.(choice);
-  }
-
-  onOpen(): void {
-    const { contentEl, modalEl } = this;
-    contentEl.empty();
-    modalEl.addClass("easy-sync-mutation-resolution-modal");
-    this.setTitle(this.t("syncView.mutationResolution.title"));
-    contentEl.createEl("p", {
+  protected renderComparison(): void {
+    const body = this.comparisonBodyEl;
+    body.createEl("h3", {
+      text: this.t("syncView.mutationResolution.title"),
+    });
+    body.createEl("p", {
       text: this.t("syncView.mutationResolution.description", {
         path: this.snapshot.path,
       }),
-      cls: "setting-item-description",
+      cls: "easy-sync-detail-reason",
+    });
+    body.createEl("p", {
+      text: `${this.t("syncView.mutationResolution.previousAction")}：${this.t(
+        `syncView.mutationResolution.action.${this.snapshot.previousAction}`,
+      )}`,
+      cls: "easy-sync-comparison-previous-action",
     });
 
-    new Setting(contentEl)
-      .setName(this.t("syncView.mutationResolution.previousAction"))
-      .setDesc(this.t(`syncView.mutationResolution.action.${this.snapshot.previousAction}`));
+    this.renderComparisonTable(
+      this.t("syncView.mutationResolution.localTitle"),
+      this.t("syncView.mutationResolution.remoteTitle"),
+      this.buildComparisonRows(),
+    );
 
-    const facts = contentEl.createDiv("easy-sync-mutation-resolution-facts");
-    const local = facts.createDiv("easy-sync-mutation-resolution-side");
-    local.createEl("h3", { text: this.t("syncView.mutationResolution.localTitle") });
-    for (const fact of this.snapshot.local) {
-      new Setting(local)
-        .setName(fact.path)
-        .setDesc(fileFactText(fact.exists, fact.size, this.t));
-    }
-    const remote = facts.createDiv("easy-sync-mutation-resolution-side");
-    remote.createEl("h3", { text: this.t("syncView.mutationResolution.remoteTitle") });
-    for (const fact of this.snapshot.remote) {
-      new Setting(remote)
-        .setName(fact.path)
-        .setDesc(fileFactText(fact.exists, fact.size, this.t));
-    }
-
-    const details = contentEl.createEl("details", {
-      cls: "easy-sync-mutation-resolution-details",
+    const details = body.createEl("details", {
+      cls: "easy-sync-comparison-evidence",
     });
     details.createEl("summary", {
       text: this.t("syncView.mutationResolution.technicalDetails"),
@@ -97,42 +94,66 @@ export class MutationRecoveryResolutionModal extends Modal {
     }
 
     if (this.snapshot.identical) {
-      contentEl.createEl("p", {
+      body.createEl("p", {
         text: this.t("syncView.mutationResolution.identical"),
-        cls: "setting-item-description easy-sync-mutation-resolution-identical",
+        cls: "easy-sync-detail-identical",
       });
     }
-
-    const actions = contentEl.createDiv(
-      "modal-button-container easy-sync-mutation-resolution-actions",
-    );
-    const localButton = new ButtonComponent(actions)
-      .setButtonText(this.t("syncView.mutationResolution.keepLocal"))
-      .setDisabled(!this.snapshot.keepLocal.available);
-    if (this.snapshot.keepLocal.available) {
-      localButton.onClick(() => this.finish("keep-local"));
-    }
-    const remoteButton = new ButtonComponent(actions)
-      .setButtonText(this.t("syncView.mutationResolution.keepRemote"))
-      .setDisabled(!this.snapshot.keepRemote.available);
-    if (this.snapshot.keepRemote.available) {
-      remoteButton.onClick(() => this.finish("keep-remote"));
-    }
-    new ButtonComponent(actions)
-      .setButtonText(this.t("confirm.cancel"))
-      .onClick(() => this.finish(null));
-
     if (!this.snapshot.keepLocal.available || !this.snapshot.keepRemote.available) {
-      contentEl.createEl("p", {
+      body.createEl("p", {
         text: this.t("syncView.mutationResolution.unavailable"),
-        cls: "setting-item-description",
+        cls: "easy-sync-comparison-unavailable",
       });
     }
+
+    this.renderFileComparisonActions([
+      {
+        label: this.t("syncView.mutationResolution.keepLocal"),
+        className: "easy-sync-detail-action-local",
+        disabled: !this.snapshot.keepLocal.available,
+        onClick: () => this.finish("keep-local"),
+      },
+      {
+        label: this.t("syncView.mutationResolution.keepRemote"),
+        className: "easy-sync-detail-action-remote",
+        disabled: !this.snapshot.keepRemote.available,
+        onClick: () => this.finish("keep-remote"),
+      },
+      {
+        label: this.t("confirm.cancel"),
+        onClick: () => this.finish(null),
+      },
+    ]);
   }
 
   onClose(): void {
     const resolve = this.resolve;
     this.resolve = null;
     resolve?.(null);
+  }
+
+  private buildComparisonRows(): FileComparisonRow[] {
+    const paths = new Set([
+      ...this.snapshot.local.map((fact) => fact.path),
+      ...this.snapshot.remote.map((fact) => fact.path),
+    ]);
+    return [...paths].map((path) => ({
+      label: path,
+      local: fileFactText(
+        this.snapshot.local.find((fact) => fact.path === path),
+        this.t,
+      ),
+      remote: fileFactText(
+        this.snapshot.remote.find((fact) => fact.path === path),
+        this.t,
+      ),
+    }));
+  }
+
+  private finish(choice: ManualMutationResolutionChoiceV1 | null): void {
+    const resolve = this.resolve;
+    this.resolve = null;
+    this.close();
+    resolve?.(choice);
   }
 }

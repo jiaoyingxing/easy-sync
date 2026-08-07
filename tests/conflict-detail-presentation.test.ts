@@ -144,12 +144,14 @@ describe("conflict detail presentation", () => {
 
   it("restores the f3e0bbe metadata hierarchy with neutral headers and colored data columns", () => {
     const source = readFileSync("src/ui/conflict-detail-modal.ts", "utf8");
+    const sharedSource = readFileSync("src/ui/file-comparison-modal.ts", "utf8");
     const styles = readFileSync("styles.css", "utf8");
 
-    expect(source).toContain('headerRow.createEl("th");');
+    expect(sharedSource).toContain('headerRow.createEl("th");');
+    expect(source).toContain("this.renderComparisonTable(");
     expect(source).not.toContain('t("conflictDetail.legendLabel")');
-    expect(source.match(/createEl\("td", "easy-sync-meta-col-local"\)/g)).toHaveLength(2);
-    expect(source.match(/createEl\("td", "easy-sync-meta-col-remote"\)/g)).toHaveLength(2);
+    expect(sharedSource.match(/createEl\("td", "easy-sync-meta-col-local"\)/g)).toHaveLength(1);
+    expect(sharedSource.match(/createEl\("td", "easy-sync-meta-col-remote"\)/g)).toHaveLength(1);
     expect(styles).toMatch(
       /\.easy-sync-metadata-table th\s*\{[^}]*background:\s*var\(--background-secondary\);[^}]*font-weight:\s*600;/s,
     );
@@ -162,9 +164,12 @@ describe("conflict detail presentation", () => {
 
   it("restores accent color and weight for newer/larger metadata", () => {
     const source = readFileSync("src/ui/conflict-detail-modal.ts", "utf8");
+    const sharedSource = readFileSync("src/ui/file-comparison-modal.ts", "utf8");
     const styles = readFileSync("styles.css", "utf8");
 
-    expect(source.match(/addClass\("easy-sync-meta-highlight"\)/g)).toHaveLength(4);
+    expect(source).toContain("localHighlighted: Boolean(localIsNewer)");
+    expect(source).toContain("remoteHighlighted: Boolean(remoteIsNewer)");
+    expect(sharedSource.match(/addClass\("easy-sync-meta-highlight"\)/g)).toHaveLength(2);
     expect(styles).toMatch(
       /\.easy-sync-meta-highlight\s*\{[^}]*color:\s*var\(--text-accent\);[^}]*font-weight:\s*600;/s,
     );
@@ -203,8 +208,9 @@ describe("conflict detail presentation", () => {
     const source = readFileSync("src/ui/conflict-detail-modal.ts", "utf8");
     const styles = readFileSync("styles.css", "utf8");
 
-    expect(source).toContain('keepLocalBtn.addClass("easy-sync-detail-action-local")');
-    expect(source).toContain('keepRemoteBtn.addClass("easy-sync-detail-action-remote")');
+    expect(source).toContain('className: "easy-sync-detail-action-local"');
+    expect(source).toContain('className: "easy-sync-detail-action-remote"');
+    expect(source).toContain("this.renderFileComparisonActions([");
     expect(styles).toMatch(
       /\.easy-sync-detail-actions \.easy-sync-detail-action-local\s*\{[^}]*background-color:\s*rgba\(var\(--color-red-rgb\),\s*0\.18\);[^}]*color:\s*var\(--color-red\);/s,
     );

@@ -1416,6 +1416,205 @@ describe("StateManager V2 production controller", () => {
     ]);
   });
 
+  it("persists and atomically checkpoints the exact receipted-rename collision recovery", async () => {
+    const sourcePath = remoteA.path;
+    const targetPath = "Notes/b.md";
+    const committed = envelope();
+    committed.anchors.byAnchorId["file:stale-target"] = {
+      anchorId: "file:stale-target",
+      remoteId: "stale-target",
+      lastPath: targetPath,
+      contentHash: hashB,
+      size: 12,
+      remoteETag: "etag-stale-target",
+      confirmedAt: 1,
+      confirmedBy: "equal-read",
+    };
+    const harness = makeHarness({ committed });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const sourceIntent: MutationIntentV1 = {
+      version: 1,
+      operationId: "blocked-receipted-rename",
+      planRevision: 2,
+      scope,
+      action: "renameRemote",
+      path: targetPath,
+      sourcePath,
+      expectedLocal: { exists: true, hash: hashA, size: remoteA.size },
+      expectedRemote: {
+        exists: true,
+        driveId: remoteA.driveId,
+        eTag: remoteA.eTag,
+        size: remoteA.size,
+        sha256Hash: hashA,
+      },
+      createdAt: 10,
+    };
+    const movedRemote: RemoteFileEntry = {
+      ...remoteA,
+      path: targetPath,
+      eTag: "etag-moved",
+    };
+    const sourceReceipt: MutationReceiptV1 = {
+      version: 1,
+      operationId: sourceIntent.operationId,
+      completedAt: 20,
+      checkpoint: {
+        baseUpserts: [{
+          path: targetPath,
+          hash: hashA,
+          size: remoteA.size,
+          eTag: movedRemote.eTag,
+        }],
+        baseRemovals: [sourcePath],
+        remoteUpserts: [movedRemote],
+        remoteDeletes: [sourcePath],
+        pendingConflictRemovals: [],
+        pendingDeleteRemovals: [],
+      },
+    };
+    await state.beginMutationIntent(sourceIntent);
+    await state.recordMutationReceipt(sourceReceipt);
+
+    const manualIntent: MutationIntentV1 = {
+      ...sourceIntent,
+      operationId: "manual-replacement-upload",
+      action: "upload",
+      expectedRemote: { exists: false },
+      createdAt: 30,
+    };
+    const recoveryEvidence = {
+      kind: "receipted-rename-target-anchor-collision" as const,
+      lifecycleEpoch: committed.meta.lifecycleEpoch,
+      sourceCommitSeq: committed.meta.commitSeq,
+      sourceAnchorId: `file:${remoteA.driveId}`,
+      targetAnchorId: "file:stale-target",
+      staleRemoteIds: [remoteA.driveId, "stale-target"].sort(),
+    };
+    const resolution: ManualMutationResolutionV1 = {
+      version: 1,
+      choice: "keep-local",
+      factsDigest: "9".repeat(64),
+      selectedAt: 30,
+      externalMutation: true,
+      recoveryEvidence,
+      intent: manualIntent,
+      receipt: null,
+    };
+    await expect(state.attachManualMutationResolution(
+      structuredClone(state.mutationLedger[0]),
+      resolution,
+    )).resolves.toBe(true);
+
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    expect(restarted.mutationLedger[0]?.manualResolution).toMatchObject({
+      recoveryEvidence,
+      intent: { action: "upload", sourcePath, path: targetPath },
+    });
+
+    const uploaded: RemoteFileEntry = {
+      ...movedRemote,
+      driveId: "replacement-upload",
+      eTag: "etag-uploaded",
+      cTag: "ctag-uploaded",
+    };
+    const manualReceipt: MutationReceiptV1 = {
+      version: 1,
+      operationId: manualIntent.operationId,
+      completedAt: 40,
+      checkpoint: {
+        baseUpserts: [{
+          path: targetPath,
+          hash: hashA,
+          size: remoteA.size,
+          eTag: uploaded.eTag,
+        }],
+        baseRemovals: [sourcePath],
+        remoteUpserts: [uploaded],
+        remoteDeletes: [sourcePath],
+        pendingConflictRemovals: [],
+        pendingDeleteRemovals: [],
+      },
+    };
+    await restarted.recordManualMutationResolutionReceipt(
+      sourceIntent.operationId,
+      manualReceipt,
+    );
+    await restarted.commitManualMutationResolutionCheckpoint(sourceIntent.operationId);
+
+    expect(restarted.mutationLedger).toEqual([]);
+    expect(restarted.remoteSnapshot).toEqual([uploaded]);
+    expect(restarted.baseSnapshot).toEqual(manualReceipt.checkpoint.baseUpserts);
+    expect(Object.values(harness.readCommitted().anchors.byAnchorId)).toEqual([
+      expect.objectContaining({ remoteId: uploaded.driveId, lastPath: targetPath }),
+    ]);
+  });
+
+  it("rejects collision recovery evidence when the outer rename has no receipt", async () => {
+    const committed = envelope();
+    committed.anchors.byAnchorId["file:stale-target"] = {
+      anchorId: "file:stale-target",
+      remoteId: "stale-target",
+      lastPath: "Notes/b.md",
+      contentHash: hashB,
+      size: 12,
+      remoteETag: "etag-stale-target",
+      confirmedAt: 1,
+      confirmedBy: "equal-read",
+    };
+    const harness = makeHarness({ committed });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const sourceIntent: MutationIntentV1 = {
+      version: 1,
+      operationId: "unreceipted-rename",
+      planRevision: 2,
+      scope,
+      action: "renameRemote",
+      path: "Notes/b.md",
+      sourcePath: remoteA.path,
+      expectedLocal: { exists: true, hash: hashA, size: remoteA.size },
+      expectedRemote: {
+        exists: true,
+        driveId: remoteA.driveId,
+        eTag: remoteA.eTag,
+        size: remoteA.size,
+      },
+      createdAt: 10,
+    };
+    await state.beginMutationIntent(sourceIntent);
+    const resolution: ManualMutationResolutionV1 = {
+      version: 1,
+      choice: "keep-local",
+      factsDigest: "8".repeat(64),
+      selectedAt: 30,
+      externalMutation: true,
+      recoveryEvidence: {
+        kind: "receipted-rename-target-anchor-collision",
+        lifecycleEpoch: committed.meta.lifecycleEpoch,
+        sourceCommitSeq: committed.meta.commitSeq,
+        sourceAnchorId: `file:${remoteA.driveId}`,
+        targetAnchorId: "file:stale-target",
+        staleRemoteIds: [remoteA.driveId, "stale-target"].sort(),
+      },
+      intent: {
+        ...sourceIntent,
+        operationId: "invalid-manual-upload",
+        action: "upload",
+        expectedRemote: { exists: false },
+        createdAt: 30,
+      },
+      receipt: null,
+    };
+
+    await expect(state.attachManualMutationResolution(
+      structuredClone(state.mutationLedger[0]),
+      resolution,
+    )).rejects.toThrow("evidence is invalid");
+  });
+
   it("rejects a persisted manual choice whose action contradicts that choice", async () => {
     const harness = makeHarness();
     const state = new StateManager(harness.plugin);

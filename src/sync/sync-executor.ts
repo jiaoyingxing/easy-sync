@@ -93,6 +93,7 @@ import type {
   ManualMutationResolutionV1,
   ManualMutationResolutionLocalFactV1,
   ManualMutationResolutionRemoteFactV1,
+  ReceiptedRenameAnchorCollisionEvidenceV1,
   SyncAttention,
   V2ActivationReviewKind,
 } from "./types";
@@ -101,6 +102,12 @@ import {
   remoteStateProjectionMatchesEnvelopeV2,
   upsertBaseStateEnvelopeV2,
 } from "./file-state-controller-v2";
+import {
+  inspectReceiptedRenameAnchorCollisionV2,
+  inspectRenameTargetAnchorCollisionV2,
+  reduceFileStateEnvelopeV2,
+  type ReceiptedRenameAnchorCollisionV2,
+} from "./file-state-reducer-v2";
 import type {
   StateEnvelopeV2CorruptionEvidence,
   SyncStateEnvelopeV2,
@@ -903,13 +910,15 @@ export class SyncExecutor {
     let resolved = false;
     const localExists = reviewed.local.some((fact) => fact.exists);
     const remoteExists = reviewed.remote.some((fact) => fact.exists);
-    const actionType = reviewed.sourcePath
-      ? choice === "keep-local"
-        ? SyncActionType.RenameRemote
-        : SyncActionType.MoveLocalFile
-      : choice === "keep-local"
-        ? localExists ? SyncActionType.Upload : SyncActionType.DeleteRemote
-        : remoteExists ? SyncActionType.Download : SyncActionType.DeleteLocal;
+    const actionType = reviewed.recoveryEvidence
+      ? SyncActionType.Upload
+      : reviewed.sourcePath
+        ? choice === "keep-local"
+          ? SyncActionType.RenameRemote
+          : SyncActionType.MoveLocalFile
+        : choice === "keep-local"
+          ? localExists ? SyncActionType.Upload : SyncActionType.DeleteRemote
+          : remoteExists ? SyncActionType.Download : SyncActionType.DeleteLocal;
     await this.enqueueSideAction(
       reviewed.path,
       actionType,
@@ -1326,6 +1335,7 @@ export class SyncExecutor {
     let keepLocal = { available: false, deletesOtherSide: false };
     let keepRemote = { available: false, deletesOtherSide: false };
     let identical = false;
+    let recoveryEvidence: ReceiptedRenameAnchorCollisionEvidenceV1 | undefined;
     if (!record.intent.sourcePath) {
       const localFact = local[0];
       const remoteFact = remote[0];
@@ -1352,6 +1362,23 @@ export class SyncExecutor {
         && localPresent[0].size === remotePresent[0].size;
       keepLocal = { available: pureMove, deletesOtherSide: false };
       keepRemote = { available: pureMove, deletesOtherSide: false };
+      const sourceLocal = local.find((fact) => fact.path === record.intent.sourcePath);
+      const targetLocal = local.find((fact) => fact.path === record.intent.path);
+      const sourceRemote = remote.find((fact) => fact.path === record.intent.sourcePath);
+      const targetRemote = remote.find((fact) => fact.path === record.intent.path);
+      if (
+        !pureMove
+        && sourceLocal?.exists === false
+        && targetLocal?.exists === true
+        && sourceRemote?.exists === false
+        && targetRemote?.exists === false
+      ) {
+        const collision = this.currentReceiptedRenameAnchorCollision(record);
+        if (collision && await this.areRemoteIdentitiesAbsent(collision.evidence.staleRemoteIds)) {
+          recoveryEvidence = collision.evidence;
+          keepLocal = { available: true, deletesOtherSide: false };
+        }
+      }
     }
 
     const digestInput = {
@@ -1363,6 +1390,7 @@ export class SyncExecutor {
       sourcePath: record.intent.sourcePath ?? null,
       local,
       remote,
+      recoveryEvidence: recoveryEvidence ?? null,
     };
     return {
       version: 1,
@@ -1373,6 +1401,7 @@ export class SyncExecutor {
       ...(record.intent.sourcePath ? { sourcePath: record.intent.sourcePath } : {}),
       local,
       remote,
+      ...(recoveryEvidence ? { recoveryEvidence } : {}),
       factsDigest: await sha256Hex(
         new TextEncoder().encode(JSON.stringify(digestInput)).buffer,
       ),
@@ -1380,6 +1409,50 @@ export class SyncExecutor {
       keepLocal,
       keepRemote,
     };
+  }
+
+  private currentReceiptedRenameAnchorCollision(
+    record: Readonly<MutationLedgerEntryV1>,
+  ): ReceiptedRenameAnchorCollisionV2 | null {
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!envelope) return null;
+    return inspectReceiptedRenameAnchorCollisionV2(envelope, record);
+  }
+
+  private async areRemoteIdentitiesAbsent(remoteIds: readonly string[]): Promise<boolean> {
+    if (remoteIds.length === 0) return false;
+    const observations = await Promise.all(remoteIds.map((remoteId) =>
+      this.onedrive.getDriveItemMetadataById(remoteId)));
+    return observations.every((item) => item === null);
+  }
+
+  private manualCollisionRecoveryStateMatches(
+    record: Readonly<MutationLedgerEntryV1>,
+  ): boolean {
+    const manual = record.manualResolution;
+    const evidence = manual?.recoveryEvidence;
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!manual || !evidence || !envelope) return false;
+    const collision = inspectReceiptedRenameAnchorCollisionV2(envelope, record);
+    if (collision && this.sameCollisionRecoveryEvidence(collision.evidence, evidence)) {
+      return true;
+    }
+    if (!manual.receipt) return false;
+    try {
+      return reduceFileStateEnvelopeV2(envelope, {
+        intent: manual.intent,
+        receipt: manual.receipt,
+      }) === envelope;
+    } catch {
+      return false;
+    }
+  }
+
+  private sameCollisionRecoveryEvidence(
+    left: Readonly<ReceiptedRenameAnchorCollisionEvidenceV1>,
+    right: Readonly<ReceiptedRenameAnchorCollisionEvidenceV1>,
+  ): boolean {
+    return JSON.stringify(left) === JSON.stringify(right);
   }
 
   private manualResolutionPaths(intent: MutationIntent): string[] {
@@ -7767,12 +7840,14 @@ export class SyncExecutor {
     });
     const withoutReceipt = (
       intent: MutationIntentV1,
+      recoveryEvidence?: ReceiptedRenameAnchorCollisionEvidenceV1,
     ): ManualMutationResolutionV1 => ({
       version: 1,
       choice,
       factsDigest: snapshot.factsDigest,
       selectedAt,
       externalMutation: true,
+      ...(recoveryEvidence ? { recoveryEvidence } : {}),
       intent,
       receipt: null,
     });
@@ -7816,6 +7891,27 @@ export class SyncExecutor {
       return withoutReceipt(createIntent(action, snapshot.path, local, remote));
     }
 
+    if (snapshot.recoveryEvidence) {
+      if (choice !== "keep-local") return null;
+      const sourceLocal = snapshot.local.find((fact) => fact.path === snapshot.sourcePath);
+      const targetLocal = snapshot.local.find((fact) => fact.path === snapshot.path);
+      const sourceRemote = snapshot.remote.find((fact) => fact.path === snapshot.sourcePath);
+      const targetRemote = snapshot.remote.find((fact) => fact.path === snapshot.path);
+      if (
+        sourceLocal?.exists !== false
+        || targetLocal?.exists !== true
+        || sourceRemote?.exists !== false
+        || targetRemote?.exists !== false
+      ) return null;
+      return withoutReceipt(createIntent(
+        "upload",
+        snapshot.path,
+        targetLocal,
+        targetRemote,
+        snapshot.sourcePath,
+      ), snapshot.recoveryEvidence);
+    }
+
     const local = snapshot.local.find((fact) => fact.exists);
     const remote = snapshot.remote.find((fact) => fact.exists);
     if (
@@ -7854,6 +7950,14 @@ export class SyncExecutor {
     }
     if (operationEpoch !== undefined && !this.canContinue(operationEpoch)) {
       throw new Error(`Manual mutation resolution was cancelled: ${record.intent.operationId}`);
+    }
+    if (manual.recoveryEvidence && (
+      !this.manualCollisionRecoveryStateMatches(record)
+      || !await this.areRemoteIdentitiesAbsent(manual.recoveryEvidence.staleRemoteIds)
+    )) {
+      throw new Error(
+        `Manual mutation collision evidence no longer matches: ${record.intent.operationId}`,
+      );
     }
     let receipt = manual.receipt;
     if (receipt) {
@@ -7919,6 +8023,17 @@ export class SyncExecutor {
     if (operationEpoch !== undefined && !this.canContinue(operationEpoch)) {
       throw new Error(`Manual mutation checkpoint waits after cancellation: ${record.intent.operationId}`);
     }
+    if (manual.recoveryEvidence && (
+      !this.manualCollisionRecoveryStateMatches({
+        ...record,
+        manualResolution: { ...manual, receipt },
+      })
+      || !await this.areRemoteIdentitiesAbsent(manual.recoveryEvidence.staleRemoteIds)
+    )) {
+      throw new Error(
+        `Manual mutation collision evidence no longer matches: ${record.intent.operationId}`,
+      );
+    }
     await this.state.commitManualMutationResolutionCheckpoint(
       record.intent.operationId,
     );
@@ -7957,6 +8072,17 @@ export class SyncExecutor {
       const targetRemote = await this.inspectRemotePath(intent.path);
       if (targetRemote) {
         throw new MutationNotAppliedError(new Error("Manual remote move target changed"));
+      }
+    }
+    if (intent.action === "upload" && intent.sourcePath) {
+      const [sourceLocal, sourceRemote] = await Promise.all([
+        this.inspectLocalPath(intent.sourcePath),
+        this.inspectRemotePath(intent.sourcePath),
+      ]);
+      if (!sourceLocal || sourceLocal.status !== "missing" || sourceRemote) {
+        throw new MutationNotAppliedError(
+          new Error("Manual collision-recovery source changed"),
+        );
       }
     }
     if (intent.action === "moveLocal") {
@@ -8054,6 +8180,10 @@ export class SyncExecutor {
     checkpoint.remoteDeletes.push(...remoteDeletes);
     if (executed.baseUpsert) checkpoint.baseUpserts.push(executed.baseUpsert);
     if (executed.baseRemoval) checkpoint.baseRemovals.push(executed.baseRemoval);
+    if (intent.action === "upload" && intent.sourcePath) {
+      checkpoint.baseRemovals.push(intent.sourcePath);
+      checkpoint.remoteDeletes.push(intent.sourcePath);
+    }
     return checkpoint;
   }
 
@@ -8734,6 +8864,13 @@ export class SyncExecutor {
     if (intent.action !== "upload") {
       return assertNeverMutationAction(intent.action);
     }
+    if (intent.sourcePath) {
+      const [sourceLocal, sourceRemote] = await Promise.all([
+        this.inspectLocalPath(intent.sourcePath),
+        this.inspectRemotePath(intent.sourcePath),
+      ]);
+      if (!sourceLocal || sourceLocal.status !== "missing" || sourceRemote) return false;
+    }
     const remote = await this.inspectRemotePath(intent.path);
     const upsert = receipt.checkpoint.remoteUpserts.find((entry) => entry.path === intent.path);
     const committedParentId = this.committedRemoteParentId(intent.path);
@@ -8946,6 +9083,13 @@ export class SyncExecutor {
         || local.entry.hash !== intent.expectedLocal.hash
         || local.entry.size !== intent.expectedLocal.size
       ) return null;
+      if (intent.sourcePath) {
+        const [sourceLocal, sourceRemote] = await Promise.all([
+          this.inspectLocalPath(intent.sourcePath),
+          this.inspectRemotePath(intent.sourcePath),
+        ]);
+        if (!sourceLocal || sourceLocal.status !== "missing" || sourceRemote) return null;
+      }
       const current = await this.inspectRemotePath(intent.path);
       if (
         !current
@@ -8953,6 +9097,10 @@ export class SyncExecutor {
       ) return null;
       checkpoint.baseUpserts.push(StateManager.toBaseEntry(local.entry, current));
       checkpoint.remoteUpserts.push(current);
+      if (intent.sourcePath) {
+        checkpoint.baseRemovals.push(intent.sourcePath);
+        checkpoint.remoteDeletes.push(intent.sourcePath);
+      }
       return checkpoint;
     }
     if (intent.action === "download") {
@@ -10543,6 +10691,17 @@ export class SyncExecutor {
       case SyncActionType.RenameRemote: {
         if (!item.renameFrom || !item.local || !item.remote) return { executed: false };
         if (!this.canContinue(operationEpoch, result)) return { executed: false };
+        const envelope = this.state.getCommittedV2Envelope();
+        if (envelope && inspectRenameTargetAnchorCollisionV2(envelope, {
+          sourcePath: item.renameFrom,
+          path: item.path,
+          movedRemoteId: item.remote.driveId,
+          scope: envelope.scope,
+        })) {
+          throw new MutationNotAppliedError(
+            new Error(`Remote file move target is owned by another V2 anchor: ${item.path}`),
+          );
+        }
         let updated: DriveItem;
         try {
           updated = item.targetParentRemoteId

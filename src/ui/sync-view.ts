@@ -28,8 +28,8 @@ import {
 import type { PendingIssue, SyncHistoryEntry } from "../sync/state-manager";
 import { ConfirmModal } from "./confirm-modal";
 import { EmptyFolderResolutionModal } from "./empty-folder-resolution-modal";
-import { MutationRecoveryResolutionModal } from "./mutation-recovery-resolution-modal";
 import { ConflictDetailModal } from "./conflict-detail-modal";
+import { MutationRecoveryResolutionModal } from "./mutation-recovery-resolution-modal";
 import {
   RIBBON_STATUS_ICONS,
   resolveRibbonStatus,

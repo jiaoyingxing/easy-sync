@@ -40,7 +40,10 @@ import {
   upsertBaseStateEnvelopeV2,
   type StatePathViewV2,
 } from "./file-state-controller-v2";
-import { reduceFileStateEnvelopeV2 } from "./file-state-reducer-v2";
+import {
+  inspectReceiptedRenameAnchorCollisionV2,
+  reduceFileStateEnvelopeV2,
+} from "./file-state-reducer-v2";
 import {
   acceptConfirmedDescendantFolderAnchorsV2,
   acceptScopeExpansionFolderAnchorsV2,
@@ -234,6 +237,7 @@ import {
   type MutationLedgerEntryV1,
   type ManualMutationResolutionV1,
   type ManualMutationResolutionAuditV1,
+  type ReceiptedRenameAnchorCollisionEvidenceV1,
   type MutationRecoveryHistory,
   type SyncAttention,
   type LocalFolderMoveHintV1,
@@ -3240,11 +3244,27 @@ export class StateManager {
     }
     if (
       this.mutationLedgerCorrupt
-      || !isManualMutationResolution(resolution, expectedRecord.intent)
+      || !isManualMutationResolution(
+        resolution,
+        expectedRecord.intent,
+        expectedRecord.receipt,
+      )
       || !sameSyncScope(resolution.intent.scope, this.v2Envelope.scope)
       || resolution.intent.operationId === expectedRecord.intent.operationId
     ) {
       throw new Error("Manual mutation resolution evidence is invalid");
+    }
+    if (resolution.recoveryEvidence) {
+      const collision = inspectReceiptedRenameAnchorCollisionV2(
+        this.v2Envelope,
+        expectedRecord,
+      );
+      if (
+        !collision
+        || JSON.stringify(collision.evidence) !== JSON.stringify(resolution.recoveryEvidence)
+      ) {
+        throw new Error("Manual mutation resolution evidence is invalid");
+      }
     }
     let attached = false;
     await this.commitPluginData((current) => {
@@ -7036,12 +7056,13 @@ function isMutationLedgerEntry(value: unknown): value is MutationLedgerEntryV1 {
   return isMutationIntent(entry.intent)
     && (entry.receipt === null || isMutationReceipt(entry.receipt, entry.intent.operationId))
     && (entry.manualResolution === undefined
-      || isManualMutationResolution(entry.manualResolution, entry.intent));
+      || isManualMutationResolution(entry.manualResolution, entry.intent, entry.receipt));
 }
 
 function isManualMutationResolution(
   value: unknown,
   sourceIntent?: MutationIntent,
+  sourceReceipt?: MutationReceiptV1 | null,
 ): value is ManualMutationResolutionV1 {
   if (!isRecord(value)) return false;
   if (
@@ -7065,8 +7086,21 @@ function isManualMutationResolution(
     value.receipt !== null
     && !isMutationReceipt(value.receipt, value.intent.operationId)
   ) return false;
+  if (
+    value.recoveryEvidence !== undefined
+    && !isReceiptedRenameAnchorCollisionEvidence(value.recoveryEvidence)
+  ) return false;
   if (!value.externalMutation && value.receipt === null) return false;
   const hasSourcePath = typeof value.intent.sourcePath === "string";
+  const isCollisionRecovery = Boolean(
+    value.recoveryEvidence
+    && value.externalMutation
+    && value.choice === "keep-local"
+    && hasSourcePath
+    && value.intent.action === "upload"
+    && value.intent.expectedLocal.exists
+    && !value.intent.expectedRemote.exists,
+  );
   const semanticActionMatches = !value.externalMutation
     ? !hasSourcePath && (
         (value.intent.action === "upload"
@@ -7077,12 +7111,15 @@ function isManualMutationResolution(
           && !value.intent.expectedRemote.exists)
       )
     : hasSourcePath
-      ? value.intent.expectedLocal.exists
-        && value.intent.expectedRemote.exists
-        && (
-          (value.choice === "keep-local" && value.intent.action === "renameRemote")
-          || (value.choice === "keep-remote" && value.intent.action === "moveLocal")
-        )
+      ? isCollisionRecovery || (
+        value.recoveryEvidence === undefined
+          && value.intent.expectedLocal.exists
+          && value.intent.expectedRemote.exists
+          && (
+            (value.choice === "keep-local" && value.intent.action === "renameRemote")
+            || (value.choice === "keep-remote" && value.intent.action === "moveLocal")
+          )
+      )
       : value.choice === "keep-local"
         ? value.intent.expectedLocal.exists
           ? value.intent.action === "upload"
@@ -7093,6 +7130,7 @@ function isManualMutationResolution(
           : value.intent.expectedLocal.exists
             && value.intent.action === "deleteLocal";
   if (!semanticActionMatches) return false;
+  if (value.recoveryEvidence !== undefined && !isCollisionRecovery) return false;
   if (!sourceIntent) return true;
   if (
     sourceIntent.version !== 1
@@ -7107,7 +7145,51 @@ function isManualMutationResolution(
     value.intent.path,
     value.intent.sourcePath,
   ].filter((path): path is string => Boolean(path)))].sort();
-  return JSON.stringify(sourcePaths) === JSON.stringify(resolutionPaths);
+  if (JSON.stringify(sourcePaths) !== JSON.stringify(resolutionPaths)) return false;
+  if (!isCollisionRecovery) return true;
+  if (
+    sourceIntent.action !== "renameRemote"
+    || !sourceIntent.sourcePath
+    || !sourceIntent.expectedLocal.exists
+    || !sourceIntent.expectedRemote.exists
+    || !sourceReceipt
+  ) return false;
+  const checkpoint = sourceReceipt.checkpoint;
+  return sourceReceipt.operationId === sourceIntent.operationId
+    && checkpoint.baseUpserts.length === 1
+    && checkpoint.baseUpserts[0]?.path === sourceIntent.path
+    && checkpoint.baseRemovals.length === 1
+    && checkpoint.baseRemovals[0] === sourceIntent.sourcePath
+    && checkpoint.remoteUpserts.length === 1
+    && checkpoint.remoteUpserts[0]?.path === sourceIntent.path
+    && checkpoint.remoteUpserts[0]?.driveId === sourceIntent.expectedRemote.driveId
+    && checkpoint.remoteDeletes.length === 1
+    && checkpoint.remoteDeletes[0] === sourceIntent.sourcePath;
+}
+
+function isReceiptedRenameAnchorCollisionEvidence(
+  value: unknown,
+): value is ReceiptedRenameAnchorCollisionEvidenceV1 {
+  if (!isRecord(value)) return false;
+  const staleRemoteIds = value.staleRemoteIds;
+  return value.kind === "receipted-rename-target-anchor-collision"
+    && Number.isSafeInteger(value.lifecycleEpoch)
+    && (value.lifecycleEpoch as number) >= 0
+    && Number.isSafeInteger(value.sourceCommitSeq)
+    && (value.sourceCommitSeq as number) >= 1
+    && typeof value.sourceAnchorId === "string"
+    && value.sourceAnchorId.length > 0
+    && typeof value.targetAnchorId === "string"
+    && value.targetAnchorId.length > 0
+    && value.sourceAnchorId !== value.targetAnchorId
+    && Array.isArray(staleRemoteIds)
+    && staleRemoteIds.length > 0
+    && staleRemoteIds.every((remoteId) =>
+      typeof remoteId === "string" && remoteId.length > 0)
+    && new Set(staleRemoteIds).size === staleRemoteIds.length
+    && [...staleRemoteIds].sort().every(
+      (remoteId, index) => remoteId === staleRemoteIds[index],
+    );
 }
 
 function isManualMutationResolutionAudit(

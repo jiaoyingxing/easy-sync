@@ -1063,12 +1063,13 @@ describe("buildSyncViewContentKey", () => {
     expect(source).not.toContain("syncExecutor.retireReviewedStaleIdentity");
   });
 
-  it("keeps facts-changed handling in the fixed top action and opens one neutral review modal", () => {
+  it("keeps facts-changed handling in the fixed top action and reuses the shared comparison surface", () => {
     const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
     const modalSource = readFileSync(
       "src/ui/mutation-recovery-resolution-modal.ts",
       "utf8",
     );
+    const sharedSource = readFileSync("src/ui/file-comparison-modal.ts", "utf8");
     const styles = readFileSync("styles.css", "utf8");
     const openStart = viewSource.indexOf(
       "  private async openMutationRecoveryResolution()",
@@ -1086,17 +1087,33 @@ describe("buildSyncViewContentKey", () => {
     expect(viewSource).toContain('? "syncView.recovery.checkAgain"');
     expect(openMethod).toContain("if (this.mutationRecoveryResolutionOpening) return");
     expect(openMethod.match(/new MutationRecoveryResolutionModal\(/g)).toHaveLength(1);
+    expect(openMethod).toContain(".awaitChoice()");
     expect(openMethod).toContain("option.deletesOtherSide");
     expect(openMethod).toContain("new ConfirmModal(");
     expect(openMethod.indexOf("option.deletesOtherSide")).toBeLessThan(
       openMethod.indexOf("new ConfirmModal("),
     );
     expect(openMethod).toContain("this.plugin.resolveMutationRecovery(snapshot, choice)");
-    expect(modalSource).toContain('createDiv("easy-sync-mutation-resolution-facts")');
-    expect(modalSource).toContain('createEl("details"');
+    expect(modalSource).toContain("extends FileComparisonModal");
+    expect(modalSource).toContain("this.renderComparisonTable(");
+    expect(modalSource).toContain("this.renderFileComparisonActions([");
+    expect(modalSource).toContain("disabled: !this.snapshot.keepLocal.available");
+    expect(modalSource).toContain("disabled: !this.snapshot.keepRemote.available");
+    expect(modalSource).not.toContain("extends Modal");
+    expect(modalSource).not.toContain("easy-sync-mutation-resolution-");
+    expect(sharedSource).toContain('this.contentEl.addClass("easy-sync-conflict-detail")');
+    expect(sharedSource).toContain('createDiv("easy-sync-conflict-body")');
+    expect(sharedSource).toContain('createEl("table", "easy-sync-metadata-table")');
+    expect(sharedSource).toContain('createDiv("easy-sync-detail-actions")');
     expect(modalSource).not.toContain(".setCta()");
     expect(styles).toMatch(
-      /body\.is-mobile \.easy-sync-mutation-resolution-actions button\s*\{[^}]*width:\s*100%/s,
+      /\.easy-sync-metadata-table\s*\{[^}]*table-layout:\s*fixed;/s,
+    );
+    expect(styles).toMatch(
+      /\.easy-sync-metadata-table th,\s*\.easy-sync-metadata-table td\s*\{[^}]*overflow-wrap:\s*anywhere;/s,
+    );
+    expect(styles).toMatch(
+      /body\.is-mobile \.easy-sync-detail-actions button\s*\{[^}]*width:\s*100%/s,
     );
   });
 

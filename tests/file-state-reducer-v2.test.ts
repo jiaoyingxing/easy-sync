@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
+  inspectReceiptedRenameAnchorCollisionV2,
+  inspectRenameTargetAnchorCollisionV2,
   projectFileStatePathViewV2,
   reduceFileStateEnvelopeV2,
 } from "../src/sync/file-state-reducer-v2";
@@ -272,6 +274,88 @@ describe("pure V2 file-state reducer", () => {
       lastPath: "Archive/a.md",
       confirmedBy: "rename-cas",
     });
+  });
+
+  it("identifies the exact receipted rename target-anchor collision and accepts its cleanup upload", () => {
+    const initial = envelope([oldRemote], [oldBase]);
+    initial.anchors.byAnchorId["anchor:stale-target"] = {
+      anchorId: "anchor:stale-target",
+      remoteId: "stale-target",
+      lastPath: "Archive/a.md",
+      contentHash: hashB,
+      size: 20,
+      remoteETag: "etag-stale-target",
+      confirmedAt: 1,
+      confirmedBy: "equal-read",
+    };
+    const movedRemote = remote(
+      "Archive/a.md",
+      oldRemote.driveId,
+      archiveFolder.id,
+      hashA,
+      "etag-renamed",
+    );
+    const blocked = ledger("renameRemote", movedRemote.path, checkpoint({
+      remoteDeletes: [oldRemote.path],
+      remoteUpserts: [movedRemote],
+      baseRemovals: [oldRemote.path],
+      baseUpserts: [base(movedRemote.path, hashA, movedRemote.eTag)],
+    }), oldRemote.path);
+    blocked.intent.expectedLocal = { exists: true, hash: hashA, size: 10 };
+    blocked.intent.expectedRemote = {
+      exists: true,
+      driveId: oldRemote.driveId,
+      eTag: oldRemote.eTag,
+      size: oldRemote.size,
+      sha256Hash: hashA,
+    };
+
+    expect(inspectRenameTargetAnchorCollisionV2(initial, {
+      sourcePath: oldRemote.path,
+      path: movedRemote.path,
+      movedRemoteId: oldRemote.driveId,
+      scope,
+    })).toMatchObject({
+      movedRemoteId: oldRemote.driveId,
+      targetAnchor: { anchorId: "anchor:stale-target" },
+    });
+
+    expect(() => reduceFileStateEnvelopeV2(initial, blocked))
+      .toThrow("V2 base upsert would replace another anchor");
+    const collision = inspectReceiptedRenameAnchorCollisionV2(initial, blocked);
+    expect(collision).toMatchObject({
+      movedRemoteId: oldRemote.driveId,
+      sourceAnchor: { anchorId: `anchor:${oldRemote.driveId}`, lastPath: oldRemote.path },
+      targetAnchor: { anchorId: "anchor:stale-target", lastPath: movedRemote.path },
+    });
+
+    const uploaded = remote(
+      movedRemote.path,
+      "replacement-upload",
+      archiveFolder.id,
+      hashA,
+      "etag-uploaded",
+    );
+    const replacement = ledger("upload", movedRemote.path, checkpoint({
+      remoteDeletes: [oldRemote.path],
+      remoteUpserts: [uploaded],
+      baseRemovals: [oldRemote.path],
+      baseUpserts: [base(movedRemote.path, hashA, uploaded.eTag)],
+    }), oldRemote.path);
+    replacement.intent.expectedLocal = { exists: true, hash: hashA, size: 10 };
+
+    const recovered = reduceFileStateEnvelopeV2(initial, replacement);
+    expect(projectFileStatePathViewV2(recovered)).toEqual({
+      baseEntries: [base(movedRemote.path, hashA, uploaded.eTag)],
+      remoteEntries: [uploaded],
+    });
+    expect(Object.values(recovered.anchors.byAnchorId)).toEqual([
+      expect.objectContaining({
+        remoteId: uploaded.driveId,
+        lastPath: uploaded.path,
+        contentHash: hashA,
+      }),
+    ]);
   });
 
   it("commits a recovered local move against the already-moved remote identity", () => {

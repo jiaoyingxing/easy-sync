@@ -11,12 +11,153 @@ import {
   type MutationAction,
   type MutationCheckpointV1,
   type MutationLedgerEntryV1,
+  type ReceiptedRenameAnchorCollisionEvidenceV1,
   type RemoteFileEntry,
 } from "./types";
 
 export interface FileStatePathViewV2 {
   baseEntries: BaseFileEntry[];
   remoteEntries: RemoteFileEntry[];
+}
+
+export interface ReceiptedRenameAnchorCollisionV2 {
+  evidence: ReceiptedRenameAnchorCollisionEvidenceV1;
+  movedRemoteId: string;
+  sourceAnchor: SyncAnchorV2;
+  targetAnchor: SyncAnchorV2;
+}
+
+export interface RenameTargetAnchorCollisionV2 {
+  movedRemoteId: string;
+  sourceAnchor: SyncAnchorV2;
+  targetAnchor: SyncAnchorV2;
+}
+
+export interface RenameTargetAnchorInspectionInputV2 {
+  sourcePath: string;
+  path: string;
+  movedRemoteId: string;
+  scope: SyncStateEnvelopeV2["scope"];
+}
+
+/** Detect a target anchor that would make every receipt for this rename
+ * uncommittable. Executors use this as a zero-write preflight. */
+export function inspectRenameTargetAnchorCollisionV2(
+  envelope: SyncStateEnvelopeV2,
+  input: Readonly<RenameTargetAnchorInspectionInputV2>,
+): RenameTargetAnchorCollisionV2 | null {
+  validateEnvelope(envelope);
+  if (
+    !input.sourcePath
+    || input.sourcePath === input.path
+    || !sameSyncScope(input.scope, envelope.scope)
+  ) return null;
+  const pathById = projectRemoteIndexV2(envelope.remoteIndex);
+  if (
+    pathById.get(input.movedRemoteId) !== input.sourcePath
+    || findNodeIdByPath(pathById, input.path) !== undefined
+  ) return null;
+  const anchors = Object.values(envelope.anchors.byAnchorId);
+  const sourceAnchor = anchors.find((anchor) =>
+    anchor.remoteId === input.movedRemoteId
+      && anchor.lastPath === input.sourcePath);
+  const targetAnchor = anchors.find((anchor) =>
+    anchor.lastPath === input.path
+      && anchor.remoteId !== input.movedRemoteId);
+  if (!sourceAnchor || !targetAnchor || sourceAnchor.anchorId === targetAnchor.anchorId) {
+    return null;
+  }
+  return {
+    movedRemoteId: input.movedRemoteId,
+    sourceAnchor: structuredClone(sourceAnchor),
+    targetAnchor: structuredClone(targetAnchor),
+  };
+}
+
+/**
+ * Recognize only the historical crash window where Graph accepted a remote
+ * rename but its receipt cannot replace a different V2 anchor at the target.
+ * This does not authorize recovery by itself; callers must still prove the
+ * current local/path/Graph-ID facts before offering or executing a choice.
+ */
+export function inspectReceiptedRenameAnchorCollisionV2(
+  envelope: SyncStateEnvelopeV2,
+  ledgerEntry: Readonly<MutationLedgerEntryV1>,
+): ReceiptedRenameAnchorCollisionV2 | null {
+  validateEnvelope(envelope);
+  const { intent, receipt } = ledgerEntry;
+  if (
+    intent.version !== 1
+    || intent.action !== "renameRemote"
+    || !intent.sourcePath
+    || intent.sourcePath === intent.path
+    || !intent.expectedLocal.exists
+    || !intent.expectedRemote.exists
+    || !receipt
+    || receipt.operationId !== intent.operationId
+    || !sameSyncScope(intent.scope, envelope.scope)
+  ) return null;
+  try {
+    assertFileReceiptShape(intent.action, intent.path, intent.sourcePath, receipt.checkpoint);
+  } catch {
+    return null;
+  }
+
+  const base = receipt.checkpoint.baseUpserts[0];
+  const moved = receipt.checkpoint.remoteUpserts[0];
+  if (
+    !base
+    || !moved
+    || moved.driveId !== intent.expectedRemote.driveId
+    || moved.sha256Hash?.toLowerCase() !== base.hash.toLowerCase()
+    || moved.size !== base.size
+    || intent.expectedLocal.hash.toLowerCase() !== base.hash.toLowerCase()
+    || intent.expectedLocal.size !== base.size
+  ) return null;
+
+  const preflight = inspectRenameTargetAnchorCollisionV2(envelope, {
+    sourcePath: intent.sourcePath,
+    path: intent.path,
+    movedRemoteId: intent.expectedRemote.driveId,
+    scope: intent.scope,
+  });
+  if (!preflight || preflight.movedRemoteId !== moved.driveId) return null;
+  const originalAnchors = Object.values(envelope.anchors.byAnchorId);
+  const sourceAnchor = preflight.sourceAnchor;
+  const remainingAnchors = Object.fromEntries(
+    originalAnchors
+      .filter((anchor) => anchor.lastPath !== intent.sourcePath)
+      .map((anchor) => [anchor.anchorId, anchor]),
+  );
+  const { prior, pathCollision } = findBaseUpsertAnchorContext(
+    originalAnchors,
+    remainingAnchors,
+    intent.path,
+    moved.driveId,
+  );
+  if (
+    prior?.anchorId !== sourceAnchor.anchorId
+    || !pathCollision
+    || pathCollision.anchorId !== preflight.targetAnchor.anchorId
+  ) return null;
+
+  const staleRemoteIds = [...new Set([
+    moved.driveId,
+    pathCollision.remoteId,
+  ].filter((id): id is string => Boolean(id)))].sort();
+  return {
+    evidence: {
+      kind: "receipted-rename-target-anchor-collision",
+      lifecycleEpoch: envelope.meta.lifecycleEpoch,
+      sourceCommitSeq: envelope.meta.commitSeq,
+      sourceAnchorId: sourceAnchor.anchorId,
+      targetAnchorId: pathCollision.anchorId,
+      staleRemoteIds,
+    },
+    movedRemoteId: moved.driveId,
+    sourceAnchor: structuredClone(sourceAnchor),
+    targetAnchor: structuredClone(pathCollision),
+  };
 }
 
 /**
@@ -230,9 +371,9 @@ function assertFileReceiptShape(
   switch (action) {
     case "upload":
       expectPaths(baseUpsertPaths, [path], "base upserts");
-      expectPaths(checkpoint.baseRemovals, [], "base removals");
+      expectPaths(checkpoint.baseRemovals, sourcePath ? [sourcePath] : [], "base removals");
       expectPaths(remoteUpsertPaths, [path], "remote upserts");
-      expectPaths(checkpoint.remoteDeletes, [], "remote deletes");
+      expectPaths(checkpoint.remoteDeletes, sourcePath ? [sourcePath] : [], "remote deletes");
       return;
     case "download":
       expectPaths(baseUpsertPaths, [path], "base upserts");
@@ -291,10 +432,11 @@ function applyBaseUpsert(
     throw new Error(`V2 base upsert remote version mismatch: ${base.path}`);
   }
 
-  const prior = originalAnchors.find((anchor) => anchor.remoteId === remoteId)
-    ?? originalAnchors.find((anchor) => anchor.lastPath === base.path);
-  const pathCollision = Object.values(anchors).find(
-    (anchor) => anchor.lastPath === base.path && anchor.remoteId !== remoteId,
+  const { prior, pathCollision } = findBaseUpsertAnchorContext(
+    originalAnchors,
+    anchors,
+    base.path,
+    remoteId,
   );
   if (pathCollision && pathCollision.anchorId !== prior?.anchorId) {
     throw new Error(`V2 base upsert would replace another anchor: ${base.path}`);
@@ -337,6 +479,20 @@ function applyBaseUpsert(
     confirmedAt: completedAt,
     confirmedBy,
   };
+}
+
+function findBaseUpsertAnchorContext(
+  originalAnchors: readonly SyncAnchorV2[],
+  anchors: Readonly<Record<string, SyncAnchorV2>>,
+  path: string,
+  remoteId: string,
+): { prior: SyncAnchorV2 | undefined; pathCollision: SyncAnchorV2 | undefined } {
+  const prior = originalAnchors.find((anchor) => anchor.remoteId === remoteId)
+    ?? originalAnchors.find((anchor) => anchor.lastPath === path);
+  const pathCollision = Object.values(anchors).find(
+    (anchor) => anchor.lastPath === path && anchor.remoteId !== remoteId,
+  );
+  return { prior, pathCollision };
 }
 
 function confirmationFor(action: MutationAction): SyncAnchorV2["confirmedBy"] {
