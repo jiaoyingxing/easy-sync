@@ -13,9 +13,9 @@ import { StateManager, type PluginDataStore } from "../src/sync/state-manager";
 import {
   buildStateV2MigrationCandidate,
   commitReviewedStateV2MigrationCandidate,
+  isStateV2Manifest,
   migrateV1ToV2,
   readStateV2Manifest,
-  v1BackupCleanupAllowed,
   type StateV2MigrationInput,
   type StateV2MigrationPaths,
 } from "../src/sync/state-v2-migration";
@@ -101,6 +101,26 @@ function toInput(fixture: MigrationFixture): StateV2MigrationInput {
 }
 
 describe("production V1 to V2 migration", () => {
+  it("uses one strict manifest validator for every V2 control record", () => {
+    const manifest = {
+      schemaVersion: 2,
+      activeState: "state-v2.json",
+      stateCommitSeq: 1,
+      lifecycleEpoch: 1,
+      scope: {
+        accountId: "account",
+        driveId: "drive",
+        vaultFolderId: "vault",
+        filesRootId: "root",
+      },
+      migratedAt: 1,
+      legacyAutoSyncAllowed: false,
+    };
+    expect(isStateV2Manifest(manifest)).toBe(true);
+    expect(isStateV2Manifest({ ...manifest, migratedAt: Number.NaN }))
+      .toBe(false);
+  });
+
   it.each(STATE_V1_MIGRATION_CASES.map((fixture) => [fixture.id, fixture] as const))(
     "runs %s through real V2 serialization with no user-file mutation",
     async (id, fixture) => {
@@ -863,21 +883,6 @@ describe("production V1 to V2 migration", () => {
     expect(files.has(paths.manifest)).toBe(false);
     expect(files.has(paths.v1Backup)).toBe(true);
     expect(files.has(paths.committed)).toBe(true);
-  });
-
-  it("does not clean V1 backup until every recovery gate is healthy", () => {
-    expect(v1BackupCleanupAllowed({
-      desktopHealthy: true,
-      mobileHealthy: true,
-      cloudBootstrapV2Published: true,
-      recoveryJournalsEmpty: false,
-    })).toBe(false);
-    expect(v1BackupCleanupAllowed({
-      desktopHealthy: true,
-      mobileHealthy: true,
-      cloudBootstrapV2Published: true,
-      recoveryJournalsEmpty: true,
-    })).toBe(true);
   });
 
   it("loads a manifest-selected envelope and lets explicit reset discard only local sync state", async () => {

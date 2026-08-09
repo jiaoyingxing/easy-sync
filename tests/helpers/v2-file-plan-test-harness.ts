@@ -1,7 +1,10 @@
 import {
   generateFileDecisionPlanV2,
-  shouldPauseFilePlanForConfirmationV2,
 } from "../../src/sync/file-decision-planner-v2";
+import {
+  shouldPauseCanonicalPlanForReviewV2,
+  summarizeCanonicalPlanReviewV2,
+} from "../../src/sync/canonical-plan-v2";
 import type {
   BaseFileEntry,
   LocalFileEntry,
@@ -29,6 +32,9 @@ export class V2FilePlanTestHarness {
   }
 
   requiresReview(plan: SyncPlan): boolean {
-    return shouldPauseFilePlanForConfirmationV2(plan);
+    return shouldPauseCanonicalPlanForReviewV2(
+      summarizeCanonicalPlanReviewV2(plan.items).impactCount,
+      plan.lastTotalFiles,
+    );
   }
 }

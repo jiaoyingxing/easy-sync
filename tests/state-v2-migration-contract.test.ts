@@ -5,7 +5,6 @@ import {
 } from "./fixtures/state-v1-migration-cases";
 import {
   simulateV1ToV2Migration,
-  v1BackupCleanupAllowed,
 } from "./helpers/state-v2-migration-model";
 
 describe("V1 to V2 migration preflight model", () => {
@@ -96,18 +95,4 @@ describe("V1 to V2 migration preflight model", () => {
     }
   });
 
-  it("retains the V1 backup until desktop, mobile, cloud, and journal gates all pass", () => {
-    expect(v1BackupCleanupAllowed({
-      desktopHealthy: true,
-      mobileHealthy: true,
-      cloudBootstrapV2Published: true,
-      recoveryJournalsEmpty: true,
-    })).toBe(true);
-    expect(v1BackupCleanupAllowed({
-      desktopHealthy: true,
-      mobileHealthy: false,
-      cloudBootstrapV2Published: true,
-      recoveryJournalsEmpty: true,
-    })).toBe(false);
-  });
 });

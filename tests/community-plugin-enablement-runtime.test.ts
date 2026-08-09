@@ -378,6 +378,39 @@ function makeState(
     state.remoteDeltaLink = projection.deltaLink;
     state.mutationLedger.splice(index, 1);
   });
+  state.commitMutationCheckpoints = vi.fn(async (operationIds) => {
+    const records = operationIds.map((operationId) => {
+      const record = state.mutationLedger.find(
+        (entry) => entry.intent.operationId === operationId,
+      );
+      if (!record?.receipt) {
+        throw new Error(`Mutation receipt missing: ${operationId}`);
+      }
+      return record;
+    });
+    const sourceCommitSeq = envelope.meta.commitSeq;
+    const sourceCommittedAt = envelope.meta.committedAt;
+    for (const record of records) {
+      envelope = reduceFileStateEnvelopeV2(envelope, record as never);
+    }
+    envelope = {
+      ...envelope,
+      meta: {
+        ...envelope.meta,
+        commitSeq: sourceCommitSeq + 1,
+        committedAt: sourceCommittedAt + 1,
+      },
+    };
+    const projection = projectFileStatePathViewV2(envelope);
+    state.baseSnapshot = projection.baseEntries;
+    state.remoteSnapshot = projection.remoteEntries;
+    state.remoteFolders = projection.remoteFolders;
+    state.remoteDeltaLink = projection.deltaLink;
+    const committedIds = new Set(operationIds);
+    state.mutationLedger = state.mutationLedger.filter(
+      (entry) => !committedIds.has(entry.intent.operationId),
+    );
+  });
   state.setRemoteState = vi.fn(async (
     entries: RemoteFileEntry[],
     deltaLink: string | null,

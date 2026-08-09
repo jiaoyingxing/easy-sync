@@ -325,6 +325,41 @@ function uploadMutation(): {
   return { intent, receipt, remote };
 }
 
+function uploadMutationAt(index: number): ReturnType<typeof uploadMutation> {
+  const mutation = uploadMutation();
+  const path = `Notes/batch-${index}.md`;
+  const driveId = `file-batch-${index}`;
+  const remote = {
+    ...mutation.remote,
+    path,
+    driveId,
+    eTag: `etag-batch-${index}`,
+    cTag: `ctag-batch-${index}`,
+  };
+  const intent: MutationIntentV1 = {
+    ...mutation.intent,
+    operationId: `upload-batch-${index}`,
+    path,
+  };
+  const receipt: MutationReceiptV1 = {
+    ...mutation.receipt,
+    operationId: intent.operationId,
+    checkpoint: {
+      ...mutation.receipt.checkpoint,
+      baseUpserts: [{
+        path,
+        hash: hashB,
+        size: remote.size,
+        eTag: remote.eTag,
+      }],
+      remoteUpserts: [remote],
+      pendingConflictRemovals: [path],
+      pendingDeleteRemovals: [path],
+    },
+  };
+  return { intent, receipt, remote };
+}
+
 describe("StateManager V2 production controller", () => {
   it("owns device community-plugin participation in active IndexedDB across restart", async () => {
     const harness = makeHarness({ indexedDbActive: true });
@@ -1343,12 +1378,81 @@ describe("StateManager V2 production controller", () => {
 
     await state.beginMutationIntent(intent);
     await state.recordMutationReceipt(receipt);
-    await state.commitMutationCheckpoint(intent.operationId);
+    const metrics = await state.commitMutationCheckpoint(intent.operationId);
 
     expect(state.mutationLedger).toEqual([]);
     expect(state.remoteSnapshot).toContainEqual(remote);
     expect(state.baseSnapshot).toContainEqual(receipt.checkpoint.baseUpserts[0]);
     expect(harness.readCommitted().meta.commitSeq).toBe(4);
+    expect(metrics).toEqual({
+      operations: 1,
+      ancestorPublishMs: expect.any(Number),
+      v2CommitMs: expect.any(Number),
+      ledgerClearMs: expect.any(Number),
+      totalMs: expect.any(Number),
+    });
+    expect(metrics.totalMs).toBeGreaterThanOrEqual(
+      metrics.ancestorPublishMs + metrics.v2CommitMs + metrics.ledgerClearMs,
+    );
+  });
+
+  it("commits independent durable receipts in one V2 revision", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const sourceCommitSeq = harness.readCommitted().meta.commitSeq;
+    const mutations = [0, 1, 2].map(uploadMutationAt);
+    for (const mutation of mutations) {
+      await state.beginMutationIntent(mutation.intent);
+      await state.recordMutationReceipt(mutation.receipt);
+    }
+
+    const metrics = await state.commitMutationCheckpoints(
+      mutations.map((mutation) => mutation.intent.operationId),
+    );
+
+    expect(state.mutationLedger).toEqual([]);
+    expect(state.remoteSnapshot).toEqual(expect.arrayContaining(
+      mutations.map((mutation) => mutation.remote),
+    ));
+    expect(state.baseSnapshot).toEqual(expect.arrayContaining(
+      mutations.flatMap((mutation) => mutation.receipt.checkpoint.baseUpserts),
+    ));
+    expect(harness.readCommitted().meta.commitSeq).toBe(sourceCommitSeq + 1);
+    expect(metrics.operations).toBe(3);
+  });
+
+  it("retries only batch ledger cleanup when the shared V2 commit survived", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const sourceCommitSeq = harness.readCommitted().meta.commitSeq;
+    const mutations = [0, 1].map(uploadMutationAt);
+    for (const mutation of mutations) {
+      await state.beginMutationIntent(mutation.intent);
+      await state.recordMutationReceipt(mutation.receipt);
+    }
+    const operationIds = mutations.map(
+      (mutation) => mutation.intent.operationId,
+    );
+    harness.plugin.updatePluginData = vi.fn().mockRejectedValueOnce(
+      new Error("crash after batch V2 commit"),
+    );
+
+    await expect(state.commitMutationCheckpoints(operationIds))
+      .rejects.toThrow("crash after batch V2 commit");
+    expect(harness.readCommitted().meta.commitSeq).toBe(sourceCommitSeq + 1);
+    expect(state.mutationLedger).toHaveLength(2);
+
+    harness.plugin.updatePluginData = vi.fn(
+      async (mutator) => mutator(harness.pluginData),
+    );
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    await expect(restarted.commitMutationCheckpoints(operationIds))
+      .resolves.toMatchObject({ operations: 2 });
+    expect(restarted.mutationLedger).toEqual([]);
+    expect(harness.readCommitted().meta.commitSeq).toBe(sourceCommitSeq + 1);
   });
 
   it("keeps the original blocker across restart and atomically checkpoints its reviewed continuation", async () => {

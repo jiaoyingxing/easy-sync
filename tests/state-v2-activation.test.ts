@@ -11,7 +11,10 @@ import {
   type DriveItem,
 } from "../src/onedrive/types";
 import { sha256Hex } from "../src/crypto";
-import { getEasySyncPaths } from "../src/obsidian-compat";
+import {
+  getEasySyncLegacyPaths,
+  getEasySyncPaths,
+} from "../src/obsidian-compat";
 import {
   createFolderSyncScopeSnapshotV1,
   isFolderPathInSyncScopeSnapshot,
@@ -60,6 +63,7 @@ import {
 import { injectActiveCommitCompletionFault } from "./helpers/indexeddb-completion-fault";
 
 const paths = getEasySyncPaths(".obsidian");
+const legacyPaths = getEasySyncLegacyPaths(".obsidian");
 const scope = {
   accountId: "account",
   driveId: "drive",
@@ -840,7 +844,10 @@ function makeHarness(input?: {
     },
     scanAll: vi.fn(async () => ({
       entries: localEntryState.map((entry) => ({ ...entry })),
-      folders: [...localFolderPaths].sort().map((path) => ({ path })),
+      folders: [...localFolderPaths]
+        .filter((path) => !path.startsWith(paths.pluginDirPrefix))
+        .sort()
+        .map((path) => ({ path })),
       folderScanComplete: input?.folderScanComplete ?? true,
       folderScanFailures: [],
       skippedLarge: [],
@@ -1770,7 +1777,7 @@ function public113CleanFixtureInput(): NonNullable<
   pluginData["easy-sync-pending-remote-deletes"] = [];
 
   const remoteState = structuredClone(
-    normalized.sidecars[paths.remoteStateFile],
+    normalized.sidecars[legacyPaths.remoteStateFile],
   ) as {
     entries: Record<string, {
       path: string;
@@ -1803,10 +1810,10 @@ function public113CleanFixtureInput(): NonNullable<
   };
 
   const baseContent = structuredClone(
-    normalized.sidecars[paths.baseContentFile],
+    normalized.sidecars[legacyPaths.baseContentFile],
   ) as Record<string, string>;
   const scanCache = structuredClone(
-    normalized.sidecars[paths.scanCacheFile],
+    normalized.sidecars[legacyPaths.scanCacheFile],
   ) as {
     format: number;
     entries: Record<string, {
@@ -5771,7 +5778,7 @@ describe("V1 to V2 controlled production activation", () => {
       }>)[0],
     );
     const legacyIntent = legacyRecord.intent;
-    const remoteState = normalized.sidecars[paths.remoteStateFile] as {
+    const remoteState = normalized.sidecars[legacyPaths.remoteStateFile] as {
       entries: Record<string, {
         path: string;
         driveId: string;
@@ -12211,6 +12218,10 @@ describe("V1 to V2 controlled production activation", () => {
       0,
       1024 * 1024,
     );
+    const publishEvidence = vi.spyOn(
+      harness.state,
+      "acceptConfirmedDescendantFileEvidence",
+    );
 
     const first = await harness.executor.run("manual");
 
@@ -12223,6 +12234,9 @@ describe("V1 to V2 controlled production activation", () => {
     expect(first.continueAfterConfirmedDescendantFileReconstruction)
       .toBeUndefined();
     expect(harness.mutations.downloadFile).toHaveBeenCalledTimes(12);
+    expect(publishEvidence).toHaveBeenCalledTimes(3);
+    expect(publishEvidence.mock.calls.map(([input]) => input.entries.length))
+      .toEqual([4, 4, 4]);
   });
 
   it("keeps slow reconstruction comparisons in one visible sync", async () => {
@@ -12295,7 +12309,7 @@ describe("V1 to V2 controlled production activation", () => {
       .not.toBeNull();
     expect(
       allPaths.filter((path) => harness.state.getBaseEntry(path)).length,
-    ).toBe(3);
+    ).toBe(4);
 
     const restartedState = new StateManager(harness.plugin);
     await restartedState.load();
@@ -12317,7 +12331,9 @@ describe("V1 to V2 controlled production activation", () => {
       deferred: 0,
       errors: 0,
     });
-    expect(harness.mutations.downloadFile).toHaveBeenCalledTimes(9);
+    // Cancellation lets the already-started read-only verification wave finish
+    // and checkpoint; restart resumes only the eight untouched candidates.
+    expect(harness.mutations.downloadFile).toHaveBeenCalledTimes(8);
     expect(restartedState.confirmedDescendantFileReconstruction).toBeNull();
     expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
     expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
@@ -12363,13 +12379,13 @@ describe("V1 to V2 controlled production activation", () => {
     });
     expect(
       allPaths.filter((path) => harness.state.getBaseEntry(path)).length,
-    ).toBe(10);
+    ).toBe(8);
 
     expect(harness.state.confirmedDescendantFileReconstruction)
       .not.toBeNull();
     expect(
       allPaths.filter((path) => harness.state.getBaseEntry(path)).length,
-    ).toBe(10);
+    ).toBe(8);
 
     const restartedState = new StateManager(harness.plugin);
     await restartedState.load();
@@ -12391,7 +12407,9 @@ describe("V1 to V2 controlled production activation", () => {
       deferred: 0,
       errors: 0,
     });
-    expect(harness.mutations.downloadFile).toHaveBeenCalledTimes(5);
+    // The failed four-file wave is not partially published. Restart verifies
+    // that whole wave again plus the final three untouched files.
+    expect(harness.mutations.downloadFile).toHaveBeenCalledTimes(7);
     expect(
       allPaths.filter((path) => restartedState.getBaseEntry(path)).length,
     ).toBe(15);

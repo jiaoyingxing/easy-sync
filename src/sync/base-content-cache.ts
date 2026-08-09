@@ -5,7 +5,7 @@
  * successful upload/download. Used by the merge engine when both sides
  * modify the same file independently.
  *
- * Persisted to `base-content.json` in the plugin directory (outside
+ * Persisted to the registered base-content path (outside
  * Obsidian's PluginData API, to keep data.json lean).
  */
 
@@ -25,9 +25,6 @@ const MAX_CACHE_SIZE = 2 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 10 * 1024 * 1024;
 /** M15: maximum number of cached entries. */
 const MAX_ENTRIES = 5000;
-
-/** File name for the cache on disk. */
-const CACHE_FILE = "base-content.json";
 
 function stringRecordToMap(record: Record<string, string>): Map<string, string> {
   const map = new Map<string, string>();
@@ -121,9 +118,19 @@ export class BaseContentCache {
   }
 
   /** Load the cache from disk. Safe to call when the file doesn't exist yet. */
-  async load(adapter: DataAdapter, pluginDir: string): Promise<void> {
+  async load(
+    adapter: DataAdapter,
+    cachePath: string,
+    legacyCachePath?: string,
+  ): Promise<void> {
     try {
-      const raw = await adapter.read(`${pluginDir}/${CACHE_FILE}`);
+      let raw: string;
+      try {
+        raw = await adapter.read(cachePath);
+      } catch {
+        if (!legacyCachePath) throw new Error("base cache missing");
+        raw = await adapter.read(legacyCachePath);
+      }
       const parsed: unknown = JSON.parse(raw);
       const nextStore: Map<string, string> = isStringRecord(parsed)
         ? stringRecordToMap(parsed)
@@ -137,14 +144,14 @@ export class BaseContentCache {
   }
 
   /** Persist the cache to disk. No-op if unchanged. */
-  async save(adapter: DataAdapter, pluginDir: string): Promise<void> {
+  async save(adapter: DataAdapter, cachePath: string): Promise<void> {
     if (!this.dirty) return;
     const obj: Record<string, string> = {};
     for (const [path, content] of this.store) {
       obj[path] = content;
     }
     await adapter.write(
-      `${pluginDir}/${CACHE_FILE}`,
+      cachePath,
       JSON.stringify(obj),
     );
     this.dirty = false;

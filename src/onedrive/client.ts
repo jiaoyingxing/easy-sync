@@ -405,14 +405,17 @@ export class OneDriveClient {
   }
 
   /** Read a committed parent identity immediately before a create-only write. */
-  async getDriveItemMetadataById(driveItemId: string): Promise<DriveItem | null> {
+  async getDriveItemMetadataById(
+    driveItemId: string,
+    metadataReason: OneDriveMetadataReason = "other",
+  ): Promise<DriveItem | null> {
     try {
       const response = await this.request(
         "GET",
         `/me/drive/items/${encodeURIComponent(driveItemId)}`,
         undefined,
         undefined,
-        { metadataReason: "other", expectedNotFound: true },
+        { metadataReason, expectedNotFound: true },
       );
       return response.json as DriveItem;
     } catch (error) {
@@ -421,6 +424,87 @@ export class OneDriveClient {
       }
       throw error;
     }
+  }
+
+  /** Read up to 20 independent driveItem identities per Graph JSON batch.
+   *  Every sub-response is checked independently; retryable or malformed
+   *  sub-responses fall back through the ordinary single-item GET contract. */
+  async getDriveItemMetadataByIds(
+    driveItemIds: readonly string[],
+    metadataReason: OneDriveMetadataReason = "other",
+  ): Promise<Map<string, DriveItem | null>> {
+    const uniqueIds = [...new Set(driveItemIds.filter(Boolean))];
+    const resolved = new Map<string, DriveItem | null>();
+    for (let offset = 0; offset < uniqueIds.length; offset += 20) {
+      const batchIds = uniqueIds.slice(offset, offset + 20);
+      const response = await this.request(
+        "POST",
+        "/$batch",
+        {
+          requests: batchIds.map((driveItemId, index) => ({
+            id: String(index + 1),
+            method: "GET",
+            url: `/me/drive/items/${encodeURIComponent(driveItemId)}`,
+          })),
+        },
+        undefined,
+        { metadataReason },
+      );
+      const body = isRecord(response.json) ? response.json : {};
+      const rawSubresponses = Array.isArray(body.responses)
+        ? body.responses
+        : [];
+      const subresponses = new Map(
+        rawSubresponses.filter(isRecord).map((item) => [
+          typeof item.id === "string" ? item.id : "",
+          item as {
+          id?: string;
+          status?: number;
+          headers?: Record<string, string>;
+          body?: unknown;
+          },
+        ]),
+      );
+      for (let index = 0; index < batchIds.length; index++) {
+        const driveItemId = batchIds[index];
+        const subresponse = subresponses.get(String(index + 1));
+        if (subresponse?.status === 200 && isRecord(subresponse.body)) {
+          const item = subresponse.body as unknown as DriveItem;
+          if (item.id === driveItemId) {
+            resolved.set(driveItemId, item);
+            continue;
+          }
+        }
+        if (subresponse?.status === 404) {
+          resolved.set(driveItemId, null);
+          continue;
+        }
+        if (subresponse?.status === 401 || subresponse?.status === 403) {
+          throw this.classifyError({
+            status: subresponse.status,
+            headers: subresponse.headers ?? {},
+            json: isRecord(subresponse.body) ? subresponse.body : {},
+          } as RequestUrlResponse);
+        }
+        if (
+          subresponse?.status === 429
+          || (typeof subresponse?.status === "number"
+            && [500, 502, 503, 504].includes(subresponse.status))
+        ) {
+          const error = this.classifyError({
+            status: subresponse.status,
+            headers: subresponse.headers ?? {},
+            json: isRecord(subresponse.body) ? subresponse.body : {},
+          } as RequestUrlResponse);
+          await sleepWithAbort(retryDelayMs(error, 1), this.abortSignal);
+        }
+        resolved.set(
+          driveItemId,
+          await this.getDriveItemMetadataById(driveItemId, metadataReason),
+        );
+      }
+    }
+    return resolved;
   }
 
   /** List every direct child of one committed folder identity.
@@ -1104,6 +1188,293 @@ export class OneDriveClient {
     }
   }
 
+  /** Keep route selection identical while each public entry owns its sink. */
+  private async downloadWithWaterfall<T>(input: {
+    operationName: "downloadFile" | "downloadFileToPath";
+    vaultName: string;
+    filePath: string;
+    downloadUrl?: string;
+    driveItemId?: string;
+    fileSize: number;
+    onProgress?: (downloaded: number, total: number) => void;
+    loadDownloadUrl: (
+      url: string,
+      signal: AbortSignal,
+    ) => Promise<{ value: T; bytes: number }>;
+    loadRequestUrlResponse: (
+      response: RequestUrlResponse,
+    ) => Promise<{ value: T; bytes: number }>;
+    loadContent: (
+      apiPath: string,
+      requestOptions: RequestOptions,
+    ) => Promise<T>;
+    afterContentShortcut?: (value: T) => void;
+    afterHintDownload?: (value: T) => void;
+  }): Promise<T> {
+    throwIfAborted(this.abortSignal);
+    let metadataAuthError: OneDriveError | null = null;
+    const primaryTimeoutMs = downloadTimeoutMs(input.fileSize);
+    const failureReserveMs = Math.ceil(
+      primaryTimeoutMs * DOWNLOAD_FAILURE_RESERVE_RATIO,
+    );
+    const timeoutMs = primaryTimeoutMs + failureReserveMs;
+    const deadlineMs = Date.now() + timeoutMs;
+    const remainingMs = () =>
+      ensureDownloadBudget(deadlineMs, input.filePath);
+    const loadDownloadUrl = async (
+      url: string,
+      maxAttempts: number,
+    ): Promise<T> => {
+      let observedAttempt = 0;
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        observedAttempt++;
+        const fetchStartedAt = this.beginMetricAttempt("downloadUrl");
+        try {
+          const result = await withAbortableTimeout(
+            (signal) => input.loadDownloadUrl(url, signal),
+            remainingMs(),
+            this.abortSignal,
+          );
+          this.finishMetricAttempt(
+            "downloadUrl",
+            "success",
+            fetchStartedAt,
+            result.bytes,
+            observedAttempt > 1 ? result.bytes : 0,
+          );
+          return result.value;
+        } catch (error) {
+          this.finishMetricAttempt(
+            "downloadUrl",
+            rawAttemptStatus(error, this.abortSignal),
+            fetchStartedAt,
+            0,
+            0,
+            transferredBytesFromError(error),
+          );
+          if (isAbortError(error)) throw error;
+          let err = error;
+          if (
+            err instanceof TypeError
+            || (err as { status?: number }).status === 0
+          ) {
+            observedAttempt++;
+            const fallbackStartedAt = this.beginMetricAttempt("downloadUrl");
+            try {
+              throwIfAborted(this.abortSignal);
+              const response = await withTimeout(
+                requestUrl({ url, method: "GET" }),
+                remainingMs(),
+              );
+              const result = await input.loadRequestUrlResponse(response);
+              this.finishMetricAttempt(
+                "downloadUrl",
+                "success",
+                fallbackStartedAt,
+                result.bytes,
+                observedAttempt > 1 ? result.bytes : 0,
+              );
+              return result.value;
+            } catch (fallbackErr) {
+              this.finishMetricAttempt(
+                "downloadUrl",
+                rawAttemptStatus(fallbackErr, this.abortSignal),
+                fallbackStartedAt,
+              );
+              err = fallbackErr;
+            }
+          }
+          if (isUncancellableRequestTimeout(err)) {
+            throw downloadTimeoutError(input.filePath);
+          }
+          if (
+            attempt === maxAttempts
+            || !isTransientDownloadUrlError(err)
+          ) {
+            throw err;
+          }
+          const remaining = remainingMs();
+          if (remaining <= RETRY_BASE_MS) throw err;
+          this.diag?.warn(
+            "onedrive",
+            `${input.operationName} "${input.filePath}" — CDN retry ${attempt + 1}/${maxAttempts}, remainingMs=${remaining}`,
+            requestErrorMessage(err),
+          );
+          await sleepWithAbort(RETRY_BASE_MS, this.abortSignal);
+        }
+      }
+      throw new OneDriveError(
+        OneDriveErrorType.NetworkError,
+        `Download failed for: ${input.filePath}`,
+      );
+    };
+    const contentRequestOptions: RequestOptions = {
+      deadlineMs,
+      maxAttempts: 2,
+      perRequestTimeoutMs: DOWNLOAD_MAX_TIMEOUT_MS,
+    };
+    const metaRequestOptions: RequestOptions = {
+      deadlineMs,
+      maxAttempts: 1,
+      metadataReason: "downloadUrlRefresh",
+    };
+    this.diag?.log(
+      "onedrive",
+      `${input.operationName} "${input.filePath}" — size=${input.fileSize}, primaryMs=${primaryTimeoutMs}, reserveMs=${failureReserveMs}, budgetMs=${timeoutMs}, hint=${this.downloadMethod ?? "none"}`,
+    );
+    input.onProgress?.(0, input.fileSize);
+
+    if (this.downloadMethod === "content" && input.driveItemId) {
+      const tierStartMs = Date.now();
+      try {
+        const apiPath = `${APP_FOLDER_PATHS.filePath(
+          this.getStorageVaultName(input.vaultName),
+          input.filePath,
+        )}:/content`;
+        const value = await input.loadContent(apiPath, contentRequestOptions);
+        input.afterContentShortcut?.(value);
+        return value;
+      } catch (err) {
+        if (isUncancellableRequestTimeout(err)) {
+          throw downloadTimeoutError(input.filePath);
+        }
+        if (isAuthExpired(err)) throw err;
+        this.diag?.warn(
+          "onedrive",
+          `${input.operationName} "${input.filePath}" — content shortcut failed, falling back to full waterfall`,
+          { ...downloadErrorData(err), tierMs: Date.now() - tierStartMs },
+        );
+      }
+    }
+
+    if (input.downloadUrl && !this.cdnFailedThisRound) {
+      const tierStartMs = Date.now();
+      try {
+        const value = await loadDownloadUrl(input.downloadUrl, 1);
+        this.downloadMethod = "downloadUrl";
+        input.afterHintDownload?.(value);
+        return value;
+      } catch (err) {
+        this.diag?.warn(
+          "onedrive",
+          `${input.operationName} "${input.filePath}" — downloadUrl failed, trying item metadata`,
+          { ...downloadErrorData(err), tierMs: Date.now() - tierStartMs },
+        );
+        this.cdnFailedThisRound = true;
+        remainingMs();
+      }
+    }
+
+    if (input.driveItemId) {
+      const tierStartMs = Date.now();
+      try {
+        throwIfAborted(this.abortSignal);
+        const metaResp = await this.request(
+          "GET",
+          `/me/drive/items/${input.driveItemId}?select=id,name,size,file,@microsoft.graph.downloadUrl`,
+          undefined,
+          undefined,
+          metaRequestOptions,
+        );
+        const meta = metaResp.json as {
+          "@microsoft.graph.downloadUrl"?: string;
+        };
+        if (meta["@microsoft.graph.downloadUrl"]) {
+          const value = await loadDownloadUrl(
+            meta["@microsoft.graph.downloadUrl"],
+            input.downloadUrl ? 1 : 2,
+          );
+          this.downloadMethod = "downloadUrl";
+          return value;
+        }
+      } catch (err) {
+        if (isAuthExpired(err)) metadataAuthError = err;
+        this.diag?.warn(
+          "onedrive",
+          `${input.operationName} "${input.filePath}" — item metadata downloadUrl failed, trying path /content`,
+          { ...downloadErrorData(err), tierMs: Date.now() - tierStartMs },
+        );
+        this.cdnFailedThisRound = true;
+        remainingMs();
+      }
+    }
+
+    if (this.contentFailedThisRound) {
+      this.diag?.log(
+        "onedrive",
+        `${input.operationName} "${input.filePath}" — /content blocked this round, no fallback available`,
+      );
+      throw new OneDriveError(
+        OneDriveErrorType.NetworkError,
+        `Content endpoint unavailable for: ${input.filePath}`,
+      );
+    }
+
+    const pathTierStartMs = Date.now();
+    try {
+      this.diag?.log(
+        "onedrive",
+        `${input.operationName} "${input.filePath}" — executing path /content fallback, remainingMs=${remainingMs()}`,
+      );
+      const apiPath = `${APP_FOLDER_PATHS.filePath(
+        this.getStorageVaultName(input.vaultName),
+        input.filePath,
+      )}:/content`;
+      const value = await input.loadContent(apiPath, contentRequestOptions);
+      this.downloadMethod = "content";
+      return value;
+    } catch (err) {
+      if (isUncancellableRequestTimeout(err)) {
+        throw downloadTimeoutError(input.filePath);
+      }
+      if (isAuthExpired(err)) {
+        throw metadataAuthError
+          ?? asFileDownloadUnauthorized(err, input.filePath);
+      }
+      this.diag?.warn(
+        "onedrive",
+        `${input.operationName} "${input.filePath}" — path /content failed, trying item ID /content`,
+        { ...downloadErrorData(err), tierMs: Date.now() - pathTierStartMs },
+      );
+      remainingMs();
+    }
+
+    if (input.driveItemId) {
+      const itemTierStartMs = Date.now();
+      try {
+        throwIfAborted(this.abortSignal);
+        this.diag?.log(
+          "onedrive",
+          `${input.operationName} "${input.filePath}" — executing item ID /content fallback, remainingMs=${remainingMs()}`,
+        );
+        const value = await input.loadContent(
+          `/me/drive/items/${input.driveItemId}/content`,
+          contentRequestOptions,
+        );
+        this.downloadMethod = "content";
+        return value;
+      } catch (err) {
+        if (isAuthExpired(err)) {
+          throw metadataAuthError
+            ?? asFileDownloadUnauthorized(err, input.filePath);
+        }
+        this.diag?.warn(
+          "onedrive",
+          `${input.operationName} "${input.filePath}" — item ID /content failed, no remaining fallback`,
+          { ...downloadErrorData(err), tierMs: Date.now() - itemTierStartMs },
+        );
+        this.contentFailedThisRound = true;
+        throw err;
+      }
+    }
+
+    this.contentFailedThisRound = true;
+    throw new OneDriveError(
+      OneDriveErrorType.NotFound,
+      `No download method available for: ${input.filePath}`,
+    );
+  }
+
   /** Download file content as ArrayBuffer.
    *
    *  Download strategy (in priority order):
@@ -1122,238 +1493,35 @@ export class OneDriveClient {
     fileSize = 0,
     onProgress?: (downloaded: number, total: number) => void,
   ): Promise<ArrayBuffer> {
-    throwIfAborted(this.abortSignal);
-    let metadataAuthError: OneDriveError | null = null;
-    const primaryTimeoutMs = downloadTimeoutMs(fileSize);
-    const failureReserveMs = Math.ceil(primaryTimeoutMs * DOWNLOAD_FAILURE_RESERVE_RATIO);
-    const timeoutMs = primaryTimeoutMs + failureReserveMs;
-    let deadlineMs = Date.now() + timeoutMs;
-    const remainingMs = () => ensureDownloadBudget(deadlineMs, filePath);
-    const fetchDownloadUrl = async (
-      url: string,
-      maxAttempts: number,
-      onDlProgress?: (downloaded: number, total: number) => void,
-    ): Promise<RequestUrlResponse> => {
-      let observedAttempt = 0;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        observedAttempt++;
-        const fetchStartedAt = this.beginMetricAttempt("downloadUrl");
-        try {
-          const response = await withAbortableTimeout(
-            (signal) => downloadUrlFetch(url, onDlProgress, signal),
-            remainingMs(),
-            this.abortSignal,
-          );
-          const bytes = responsePayloadByteLength(response);
-          this.finishMetricAttempt(
-            "downloadUrl",
-            "success",
-            fetchStartedAt,
-            bytes,
-            observedAttempt > 1 ? bytes : 0,
-          );
-          return response;
-        } catch (error) {
-          this.finishMetricAttempt(
-            "downloadUrl",
-            rawAttemptStatus(error, this.abortSignal),
-            fetchStartedAt,
-            0,
-            0,
-            transferredBytesFromError(error),
-          );
-          if (isAbortError(error)) throw error;
-          let err = error;
-          // fetch CORS/network error → fall back to requestUrl
-          if (err instanceof TypeError || (err as { status?: number }).status === 0) {
-            observedAttempt++;
-            const fallbackStartedAt = this.beginMetricAttempt("downloadUrl");
-            try {
-              throwIfAborted(this.abortSignal);
-              const response = await withTimeout(
-                requestUrl({ url, method: "GET" }),
-                remainingMs(),
-              );
-              const bytes = responsePayloadByteLength(response);
-              this.finishMetricAttempt(
-                "downloadUrl",
-                "success",
-                fallbackStartedAt,
-                bytes,
-                observedAttempt > 1 ? bytes : 0,
-              );
-              return response;
-            } catch (fallbackErr) {
-              this.finishMetricAttempt(
-                "downloadUrl",
-                rawAttemptStatus(fallbackErr, this.abortSignal),
-                fallbackStartedAt,
-              );
-              err = fallbackErr;
-            }
-          }
-          if (isUncancellableRequestTimeout(err)) {
-            throw downloadTimeoutError(filePath);
-          }
-          if (attempt === maxAttempts || !isTransientDownloadUrlError(err)) {
-            throw err;
-          }
-          const remaining = remainingMs();
-          if (remaining <= RETRY_BASE_MS) throw err;
-          this.diag?.warn(
-            "onedrive",
-            `downloadFile "${filePath}" — CDN retry ${attempt + 1}/${maxAttempts}, remainingMs=${remaining}`,
-            requestErrorMessage(err),
-          );
-          await sleepWithAbort(RETRY_BASE_MS, this.abortSignal);
-        }
-      }
-      throw new OneDriveError(OneDriveErrorType.NetworkError, `Download failed for: ${filePath}`);
-    };
-    // content endpoints need longer per-request timeout for large files
-    const contentRequestOptions: RequestOptions = {
-      deadlineMs,
-      maxAttempts: 2,
-      perRequestTimeoutMs: DOWNLOAD_MAX_TIMEOUT_MS,
-    };
-    const metaRequestOptions: RequestOptions = {
-      deadlineMs,
-      maxAttempts: 1,
-      metadataReason: "downloadUrlRefresh",
-    };
-    this.diag?.log(
-      "onedrive",
-      `downloadFile "${filePath}" — size=${fileSize}, primaryMs=${primaryTimeoutMs}, reserveMs=${failureReserveMs}, budgetMs=${timeoutMs}, hint=${this.downloadMethod ?? "none"}`,
-    );
-    // Report initial progress immediately so the sidebar shows 0/total
-    // even before the first byte arrives (all sub-paths update from here).
-    onProgress?.(0, fileSize);
-
-    // If this round already learned that download URLs are blocked,
-    // skip the CDN tiers and go straight to the Graph /content API.
-    if (this.downloadMethod === "content" && driveItemId) {
-      const tier0StartMs = Date.now();
-      try {
-        const apiPath = `${APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), filePath)}:/content`;
-        const response = await this.contentGet(apiPath, contentRequestOptions, onProgress);
-        const buf = response.arrayBuffer;
-        onProgress?.(0, fileSize || buf.byteLength);
-        onProgress?.(buf.byteLength, fileSize || buf.byteLength);
-        return buf;
-      } catch (err) {
-        if (isUncancellableRequestTimeout(err)) throw downloadTimeoutError(filePath);
-        if (isAuthExpired(err)) throw err;
-        this.diag?.warn("onedrive", `downloadFile "${filePath}" — content shortcut failed, falling back to full waterfall`, { ...downloadErrorData(err), tierMs: Date.now() - tier0StartMs });
-        // Continue to full waterfall as last resort
-      }
-    }
-
-    // Primary: pre-signed download URL. Skip if CDN was confirmed
-    // unreachable earlier this round — saves budget for /content.
-    if (downloadUrl && !this.cdnFailedThisRound) {
-      const tier2StartMs = Date.now();
-      try {
-        const response = await fetchDownloadUrl(downloadUrl, 1, onProgress);
-        this.downloadMethod = "downloadUrl";
-        const buf = response.arrayBuffer;
-        onProgress?.(buf.byteLength, fileSize || buf.byteLength);
-        return buf;
-      } catch (err) {
-        this.diag?.warn("onedrive", `downloadFile "${filePath}" — downloadUrl failed, trying item metadata`, { ...downloadErrorData(err), tierMs: Date.now() - tier2StartMs });
-        this.cdnFailedThisRound = true;
-        remainingMs();
-      }
-    }
-
-    // Secondary: fetch downloadUrl from item metadata, then use it
-    if (driveItemId) {
-      const tier3StartMs = Date.now();
-      try {
-        throwIfAborted(this.abortSignal);
-        const metaResp = await this.request(
-          "GET",
-          `/me/drive/items/${driveItemId}?select=id,name,size,file,@microsoft.graph.downloadUrl`,
-          undefined,
-          undefined,
-          metaRequestOptions,
-        );
-        const meta = metaResp.json as { "@microsoft.graph.downloadUrl"?: string };
-        if (meta["@microsoft.graph.downloadUrl"]) {
-          const dlResp = await fetchDownloadUrl(
-            meta["@microsoft.graph.downloadUrl"],
-            downloadUrl ? 1 : 2,
-            onProgress,
-          );
-          this.downloadMethod = "downloadUrl";
-          return dlResp.arrayBuffer;
-        }
-      } catch (err) {
-        if (isAuthExpired(err)) {
-          metadataAuthError = err;
-        }
-        this.diag?.warn("onedrive", `downloadFile "${filePath}" — item metadata downloadUrl failed, trying path /content`, { ...downloadErrorData(err), tierMs: Date.now() - tier3StartMs });
-        this.cdnFailedThisRound = true;
-        remainingMs();
-      }
-    }
-
-    // M13: if /content was confirmed broken earlier this round, skip both tiers
-    if (this.contentFailedThisRound) {
-      this.diag?.log("onedrive", `downloadFile "${filePath}" — /content blocked this round, no fallback available`);
-      throw new OneDriveError(OneDriveErrorType.NetworkError, `Content endpoint unavailable for: ${filePath}`);
-    }
-
-    // Tertiary: path-based /content endpoint
-    const tier4StartMs = Date.now();
-    try {
-      this.diag?.log(
-        "onedrive",
-        `downloadFile "${filePath}" — executing path /content fallback, remainingMs=${remainingMs()}`,
-      );
-      const apiPath = `${APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), filePath)}:/content`;
-
-      const response = await this.contentGet(apiPath, contentRequestOptions, onProgress);
-      this.downloadMethod = "content";
-      return response.arrayBuffer;
-    } catch (err) {
-      if (isUncancellableRequestTimeout(err)) throw downloadTimeoutError(filePath);
-      if (isAuthExpired(err)) {
-        throw metadataAuthError ?? asFileDownloadUnauthorized(err, filePath);
-      }
-      this.diag?.warn("onedrive", `downloadFile "${filePath}" — path /content failed, trying item ID /content`, { ...downloadErrorData(err), tierMs: Date.now() - tier4StartMs });
-      remainingMs();
-    }
-
-    // Last resort: item ID /content endpoint
-    if (driveItemId) {
-      const tier5StartMs = Date.now();
-      try {
-        throwIfAborted(this.abortSignal);
-        this.diag?.log(
-          "onedrive",
-          `downloadFile "${filePath}" — executing item ID /content fallback, remainingMs=${remainingMs()}`,
-        );
-        const apiPath = `/me/drive/items/${driveItemId}/content`;
-        const response = await this.contentGet(apiPath, contentRequestOptions, onProgress);
-        this.downloadMethod = "content";
-        return response.arrayBuffer;
-      } catch (err) {
-        if (isAuthExpired(err)) {
-          throw metadataAuthError ?? asFileDownloadUnauthorized(err, filePath);
-        }
-        this.diag?.warn("onedrive", `downloadFile "${filePath}" — item ID /content failed, no remaining fallback`, { ...downloadErrorData(err), tierMs: Date.now() - tier5StartMs });
-        // M13: both /content tiers failed — mark broken for remainder of this round
-        this.contentFailedThisRound = true;
-        throw err;
-      }
-    }
-
-    // M13: both /content tiers failed or no driveItemId for tier 5 — mark broken
-    this.contentFailedThisRound = true;
-    throw new OneDriveError(
-      OneDriveErrorType.NotFound,
-      `No download method available for: ${filePath}`,
-    );
+    return this.downloadWithWaterfall({
+      operationName: "downloadFile",
+      vaultName,
+      filePath,
+      downloadUrl,
+      driveItemId,
+      fileSize,
+      onProgress,
+      loadDownloadUrl: async (url, signal) => {
+        const response = await downloadUrlFetch(url, onProgress, signal);
+        return {
+          value: response.arrayBuffer,
+          bytes: responsePayloadByteLength(response),
+        };
+      },
+      loadRequestUrlResponse: async (response) => ({
+        value: response.arrayBuffer,
+        bytes: responsePayloadByteLength(response),
+      }),
+      loadContent: async (apiPath, requestOptions) =>
+        (await this.contentGet(apiPath, requestOptions, onProgress)).arrayBuffer,
+      afterContentShortcut: (buffer) => {
+        onProgress?.(0, fileSize || buffer.byteLength);
+        onProgress?.(buffer.byteLength, fileSize || buffer.byteLength);
+      },
+      afterHintDownload: (buffer) => {
+        onProgress?.(buffer.byteLength, fileSize || buffer.byteLength);
+      },
+    });
   }
 
   /** Download directly to a local temp file.
@@ -1371,250 +1539,46 @@ export class OneDriveClient {
     expectedSha256?: string,
     onProgress?: (downloaded: number, total: number) => void,
   ): Promise<DownloadToPathResult> {
-    throwIfAborted(this.abortSignal);
-    let metadataAuthError: OneDriveError | null = null;
-    const primaryTimeoutMs = downloadTimeoutMs(fileSize);
-    const failureReserveMs = Math.ceil(primaryTimeoutMs * DOWNLOAD_FAILURE_RESERVE_RATIO);
-    const timeoutMs = primaryTimeoutMs + failureReserveMs;
-    let deadlineMs = Date.now() + timeoutMs;
-    const remainingMs = () => ensureDownloadBudget(deadlineMs, filePath);
-    const writeDownloadUrl = async (
-      url: string,
-      maxAttempts: number,
-      onDlProgress?: (downloaded: number, total: number) => void,
-    ): Promise<DownloadToPathResult> => {
-      let observedAttempt = 0;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        observedAttempt++;
-        const fetchStartedAt = this.beginMetricAttempt("downloadUrl");
-        try {
-          const result = await withAbortableTimeout(
-            (signal) => downloadUrlFetchToBinaryFile(
-              url,
-              adapter,
-              localPath,
-              expectedSha256,
-              onDlProgress,
-              signal,
-            ),
-            remainingMs(),
-            this.abortSignal,
-          );
-          this.finishMetricAttempt(
-            "downloadUrl",
-            "success",
-            fetchStartedAt,
-            result.size,
-            observedAttempt > 1 ? result.size : 0,
-          );
-          return result;
-        } catch (error) {
-          this.finishMetricAttempt(
-            "downloadUrl",
-            rawAttemptStatus(error, this.abortSignal),
-            fetchStartedAt,
-            0,
-            0,
-            transferredBytesFromError(error),
-          );
-          if (isAbortError(error)) throw error;
-          let err = error;
-          if (err instanceof TypeError || (err as { status?: number }).status === 0) {
-            observedAttempt++;
-            const fallbackStartedAt = this.beginMetricAttempt("downloadUrl");
-            try {
-              throwIfAborted(this.abortSignal);
-              const response = await withTimeout(
-                requestUrl({ url, method: "GET" }),
-                remainingMs(),
-              );
-              const result = await writeArrayBufferToBinaryFile(
-                adapter,
-                localPath,
-                response.arrayBuffer,
-                expectedSha256,
-                fileSize,
-                onDlProgress,
-              );
-              this.finishMetricAttempt(
-                "downloadUrl",
-                "success",
-                fallbackStartedAt,
-                result.size,
-                observedAttempt > 1 ? result.size : 0,
-              );
-              return result;
-            } catch (fallbackErr) {
-              this.finishMetricAttempt(
-                "downloadUrl",
-                rawAttemptStatus(fallbackErr, this.abortSignal),
-                fallbackStartedAt,
-              );
-              err = fallbackErr;
-            }
-          }
-          if (isUncancellableRequestTimeout(err)) {
-            throw downloadTimeoutError(filePath);
-          }
-          if (attempt === maxAttempts || !isTransientDownloadUrlError(err)) {
-            throw err;
-          }
-          const remaining = remainingMs();
-          if (remaining <= RETRY_BASE_MS) throw err;
-          this.diag?.warn(
-            "onedrive",
-            `downloadFileToPath "${filePath}" — CDN retry ${attempt + 1}/${maxAttempts}, remainingMs=${remaining}`,
-            requestErrorMessage(err),
-          );
-          await sleepWithAbort(RETRY_BASE_MS, this.abortSignal);
-        }
-      }
-      throw new OneDriveError(OneDriveErrorType.NetworkError, `Download failed for: ${filePath}`);
-    };
-    const contentRequestOptions: RequestOptions = {
-      deadlineMs,
-      maxAttempts: 2,
-      perRequestTimeoutMs: DOWNLOAD_MAX_TIMEOUT_MS,
-    };
-    const metaRequestOptions: RequestOptions = {
-      deadlineMs,
-      maxAttempts: 1,
-      metadataReason: "downloadUrlRefresh",
-    };
-    this.diag?.log(
-      "onedrive",
-      `downloadFileToPath "${filePath}" — size=${fileSize}, primaryMs=${primaryTimeoutMs}, reserveMs=${failureReserveMs}, budgetMs=${timeoutMs}, hint=${this.downloadMethod ?? "none"}`,
-    );
-    onProgress?.(0, fileSize);
-
-    if (this.downloadMethod === "content" && driveItemId) {
-      const tier0StartMs = Date.now();
-      try {
-        const apiPath = `${APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), filePath)}:/content`;
-        return await this.contentGetToPath(
+    return this.downloadWithWaterfall({
+      operationName: "downloadFileToPath",
+      vaultName,
+      filePath,
+      downloadUrl,
+      driveItemId,
+      fileSize,
+      onProgress,
+      loadDownloadUrl: async (url, signal) => {
+        const result = await downloadUrlFetchToBinaryFile(
+          url,
+          adapter,
+          localPath,
+          expectedSha256,
+          onProgress,
+          signal,
+        );
+        return { value: result, bytes: result.size };
+      },
+      loadRequestUrlResponse: async (response) => {
+        const result = await writeArrayBufferToBinaryFile(
+          adapter,
+          localPath,
+          response.arrayBuffer,
+          expectedSha256,
+          fileSize,
+          onProgress,
+        );
+        return { value: result, bytes: result.size };
+      },
+      loadContent: (apiPath, requestOptions) =>
+        this.contentGetToPath(
           apiPath,
           adapter,
           localPath,
           expectedSha256,
-          contentRequestOptions,
+          requestOptions,
           onProgress,
-        );
-      } catch (err) {
-        if (isUncancellableRequestTimeout(err)) throw downloadTimeoutError(filePath);
-        if (isAuthExpired(err)) throw err;
-        this.diag?.warn("onedrive", `downloadFileToPath "${filePath}" — content shortcut failed, falling back to full waterfall`, { ...downloadErrorData(err), tierMs: Date.now() - tier0StartMs });
-      }
-    }
-
-    if (downloadUrl && !this.cdnFailedThisRound) {
-      const tier1StartMs = Date.now();
-      try {
-        const result = await writeDownloadUrl(downloadUrl, 1, onProgress);
-        this.downloadMethod = "downloadUrl";
-        return result;
-      } catch (err) {
-        this.diag?.warn("onedrive", `downloadFileToPath "${filePath}" — downloadUrl failed, trying item metadata`, { ...downloadErrorData(err), tierMs: Date.now() - tier1StartMs });
-        this.cdnFailedThisRound = true;
-        remainingMs();
-      }
-    }
-
-    if (driveItemId) {
-      const tier2StartMs = Date.now();
-      try {
-        throwIfAborted(this.abortSignal);
-        const metaResp = await this.request(
-          "GET",
-          `/me/drive/items/${driveItemId}?select=id,name,size,file,@microsoft.graph.downloadUrl`,
-          undefined,
-          undefined,
-          metaRequestOptions,
-        );
-        const meta = metaResp.json as { "@microsoft.graph.downloadUrl"?: string };
-        if (meta["@microsoft.graph.downloadUrl"]) {
-          const result = await writeDownloadUrl(
-            meta["@microsoft.graph.downloadUrl"],
-            downloadUrl ? 1 : 2,
-            onProgress,
-          );
-          this.downloadMethod = "downloadUrl";
-          return result;
-        }
-      } catch (err) {
-        if (isAuthExpired(err)) {
-          metadataAuthError = err;
-        }
-        this.diag?.warn("onedrive", `downloadFileToPath "${filePath}" — item metadata downloadUrl failed, trying path /content`, { ...downloadErrorData(err), tierMs: Date.now() - tier2StartMs });
-        this.cdnFailedThisRound = true;
-        remainingMs();
-      }
-    }
-
-    if (this.contentFailedThisRound) {
-      this.diag?.log("onedrive", `downloadFileToPath "${filePath}" — /content blocked this round, no fallback available`);
-      throw new OneDriveError(OneDriveErrorType.NetworkError, `Content endpoint unavailable for: ${filePath}`);
-    }
-
-    const tier3StartMs = Date.now();
-    try {
-      this.diag?.log(
-        "onedrive",
-        `downloadFileToPath "${filePath}" — executing path /content fallback, remainingMs=${remainingMs()}`,
-      );
-      const apiPath = `${APP_FOLDER_PATHS.filePath(this.getStorageVaultName(vaultName), filePath)}:/content`;
-      const result = await this.contentGetToPath(
-        apiPath,
-        adapter,
-        localPath,
-        expectedSha256,
-        contentRequestOptions,
-        onProgress,
-      );
-      this.downloadMethod = "content";
-      return result;
-    } catch (err) {
-      if (isUncancellableRequestTimeout(err)) throw downloadTimeoutError(filePath);
-      if (isAuthExpired(err)) {
-        throw metadataAuthError ?? asFileDownloadUnauthorized(err, filePath);
-      }
-      this.diag?.warn("onedrive", `downloadFileToPath "${filePath}" — path /content failed, trying item ID /content`, { ...downloadErrorData(err), tierMs: Date.now() - tier3StartMs });
-      remainingMs();
-    }
-
-    if (driveItemId) {
-      const tier4StartMs = Date.now();
-      try {
-        throwIfAborted(this.abortSignal);
-        this.diag?.log(
-          "onedrive",
-          `downloadFileToPath "${filePath}" — executing item ID /content fallback, remainingMs=${remainingMs()}`,
-        );
-        const apiPath = `/me/drive/items/${driveItemId}/content`;
-        const result = await this.contentGetToPath(
-          apiPath,
-          adapter,
-          localPath,
-          expectedSha256,
-          contentRequestOptions,
-          onProgress,
-        );
-        this.downloadMethod = "content";
-        return result;
-      } catch (err) {
-        if (isAuthExpired(err)) {
-          throw metadataAuthError ?? asFileDownloadUnauthorized(err, filePath);
-        }
-        this.diag?.warn("onedrive", `downloadFileToPath "${filePath}" — item ID /content failed, no remaining fallback`, { ...downloadErrorData(err), tierMs: Date.now() - tier4StartMs });
-        this.contentFailedThisRound = true;
-        throw err;
-      }
-    }
-
-    this.contentFailedThisRound = true;
-    throw new OneDriveError(
-      OneDriveErrorType.NotFound,
-      `No download method available for: ${filePath}`,
-    );
+        ),
+    });
   }
 
   /** Delete a file or folder.

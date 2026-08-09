@@ -11,8 +11,10 @@ import type { DataAdapter } from "obsidian";
 import { sha256Hex } from "../crypto";
 import type { RemoteNodeV2 } from "./remote-index-v2";
 import {
+  stateV2EnvelopeHeader,
   validateEnvelope,
   type FolderAnchorV2,
+  type StateV2EnvelopeHeader,
   type SyncAnchorV2,
   type SyncStateEnvelopeV2,
 } from "./state-envelope-v2";
@@ -34,18 +36,6 @@ interface StateV2IndexedDbRecoveryCheckpointV1 {
   recordDigest: string;
 }
 
-interface StoredEnvelopeHeader {
-  meta: SyncStateEnvelopeV2["meta"];
-  scope: SyncStateEnvelopeV2["scope"];
-  remoteIndex: Omit<SyncStateEnvelopeV2["remoteIndex"], "itemsById">;
-  anchorsSchemaVersion: 2;
-  folderAnchorsPresent: boolean;
-  folderAnchorsSchemaVersion?: 2;
-  remoteScopeRecovery?: SyncStateEnvelopeV2["remoteScopeRecovery"];
-  communityPluginParticipation?:
-    SyncStateEnvelopeV2["communityPluginParticipation"];
-}
-
 interface StateV2IndexedDbRecoveryDeltaV1 {
   schemaVersion: 1;
   kind: "indexeddb-recovery-delta";
@@ -53,7 +43,7 @@ interface StateV2IndexedDbRecoveryDeltaV1 {
   nextCommitSeq: number;
   previousEnvelopeDigest: string;
   nextEnvelopeDigest: string;
-  nextHeader: StoredEnvelopeHeader;
+  nextHeader: StateV2EnvelopeHeader;
   remoteNodeUpserts: RemoteNodeV2[];
   remoteNodeDeletes: string[];
   anchorUpserts: SyncAnchorV2[];
@@ -238,7 +228,7 @@ export class StateV2IndexedDbRecoveryStore {
       previousEnvelopeDigest,
       nextEnvelopeDigest:
         await digestValidatedEnvelope(next),
-      nextHeader: envelopeHeader(next),
+      nextHeader: stateV2EnvelopeHeader(next),
       remoteNodeUpserts: remoteNodes.upserts,
       remoteNodeDeletes: remoteNodes.deletes,
       anchorUpserts: anchors.upserts,
@@ -992,39 +982,6 @@ function applyDelta(
   return next;
 }
 
-function envelopeHeader(
-  envelope: SyncStateEnvelopeV2,
-): StoredEnvelopeHeader {
-  const { itemsById: _itemsById, ...remoteIndex } = envelope.remoteIndex;
-  return {
-    meta: structuredClone(envelope.meta),
-    scope: structuredClone(envelope.scope),
-    remoteIndex: structuredClone(remoteIndex),
-    anchorsSchemaVersion: envelope.anchors.schemaVersion,
-    folderAnchorsPresent: envelope.folderAnchors !== undefined,
-    ...(envelope.folderAnchors
-      ? {
-          folderAnchorsSchemaVersion:
-            envelope.folderAnchors.schemaVersion,
-        }
-      : {}),
-    ...(envelope.remoteScopeRecovery
-      ? {
-          remoteScopeRecovery: structuredClone(
-            envelope.remoteScopeRecovery,
-          ),
-        }
-      : {}),
-    ...(envelope.communityPluginParticipation
-      ? {
-          communityPluginParticipation: structuredClone(
-            envelope.communityPluginParticipation,
-          ),
-        }
-      : {}),
-  };
-}
-
 function diffRows<T>(
   previous: Readonly<Record<string, T>>,
   next: Readonly<Record<string, T>>,
@@ -1068,7 +1025,7 @@ function canonicalEnvelopeDigestJson(
   return [
     "{\"schemaVersion\":1,\"kind\":\"state-v2-indexeddb-envelope\",",
     "\"header\":",
-    canonicalJson(envelopeHeader(envelope)),
+    canonicalJson(stateV2EnvelopeHeader(envelope)),
     ",\"remoteNodes\":",
     canonicalRowEntries(envelope.remoteIndex.itemsById),
     ",\"anchors\":",

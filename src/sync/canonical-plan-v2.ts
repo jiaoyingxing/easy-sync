@@ -567,6 +567,35 @@ function composeCanonicalActionsV2(
         [...protectedRoots].some((root) =>
           isAtOrBelowPath(action.path, root))
       ) continue;
+      if (action.reason === "local-identity-ambiguous") {
+        const oldPathKey = normalizeRemotePathKey(action.path);
+        const ordinaryOldPathDecision = fileItems.find((candidate) =>
+          normalizeRemotePathKey(candidate.path) === oldPathKey
+          && (
+            candidate.type === SyncActionType.Conflict
+            || candidate.type === SyncActionType.DeleteRemote
+          )
+        );
+        if (ordinaryOldPathDecision?.type === SyncActionType.Conflict) {
+          // The file planner already keeps the old cloud path behind a normal
+          // decision while uploading every distinct local path. Preserve that
+          // safe plan instead of turning same-content copies into a global
+          // identity deferral.
+          continue;
+        }
+        if (ordinaryOldPathDecision?.type === SyncActionType.DeleteRemote) {
+          fileItems = fileItems.filter(
+            (candidate) => candidate !== ordinaryOldPathDecision,
+          );
+          fileItems.push({
+            type: SyncActionType.Conflict,
+            path: action.path,
+            remote: ordinaryOldPathDecision.remote,
+            reason: "reason.renameIdentityAmbiguous",
+          });
+          continue;
+        }
+      }
       const blockedPaths = new Set(
         [action.path, action.relatedPath, ...(action.relatedPaths ?? [])]
           .filter((path): path is string => Boolean(path))
@@ -1620,7 +1649,7 @@ function emptyContentVerification(): CanonicalContentVerificationV2 {
   };
 }
 
-function shouldPauseCanonicalPlanForReviewV2(
+export function shouldPauseCanonicalPlanForReviewV2(
   impactCount: number,
   lastTotalFiles: number,
 ): boolean {

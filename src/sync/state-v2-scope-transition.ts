@@ -10,10 +10,11 @@ import {
   type StateV2AuthorityWitnessPaths,
 } from "./state-v2-authority-witness";
 import {
+  isStateV2Manifest,
   readStateV2Manifest,
   type StateV2Manifest,
 } from "./state-v2-migration";
-import { isSyncScope, sameSyncScope } from "./types";
+import { sameSyncScope } from "./types";
 import {
   isSharedSyncProtocolBinding,
   isSharedSyncProtocolBindingTransitionAllowed,
@@ -427,7 +428,7 @@ export function validateTransitionRecord(
   }
   validateEnvelope(value.sourceEnvelope);
   validateEnvelope(value.candidate);
-  if (!isManifest(value.sourceManifest)) {
+  if (!isStateV2Manifest(value.sourceManifest)) {
     throw new Error("V2 scope transition source manifest is invalid");
   }
   const source = value.sourceEnvelope;
@@ -475,19 +476,6 @@ function targetManifestFor(
     ),
     legacyAutoSyncAllowed: false,
   };
-}
-
-function isManifest(value: unknown): value is StateV2Manifest {
-  return isRecord(value)
-    && value.schemaVersion === 2
-    && value.activeState === "state-v2.json"
-    && Number.isSafeInteger(value.stateCommitSeq)
-    && Number(value.stateCommitSeq) >= 1
-    && Number.isSafeInteger(value.lifecycleEpoch)
-    && Number(value.lifecycleEpoch) >= 0
-    && isSyncScope(value.scope)
-    && Number.isFinite(value.migratedAt)
-    && value.legacyAutoSyncAllowed === false;
 }
 
 function sameEnvelope(

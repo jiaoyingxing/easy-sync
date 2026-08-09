@@ -1,10 +1,12 @@
 import type { DataAdapter } from "obsidian";
 import { isRecord } from "../obsidian-compat";
 import {
-  isSyncScope,
   sameSyncScope,
 } from "./types";
-import type { StateV2Manifest } from "./state-v2-migration";
+import {
+  isStateV2Manifest,
+  type StateV2Manifest,
+} from "./state-v2-migration";
 import {
   isSharedSyncProtocolBinding,
   isSharedSyncProtocolBindingTransitionAllowed,
@@ -527,7 +529,7 @@ export function validateStateV2AuthorityWitness(
     || !Number.isFinite(value.createdAt)
     || !Number.isFinite(value.updatedAt)
     || Number(value.updatedAt) < Number(value.createdAt)
-    || !isManifest(value.manifest)
+    || !isStateV2Manifest(value.manifest)
     || (
       value.protocolBinding !== undefined
       && !isSharedSyncProtocolBinding(value.protocolBinding)
@@ -552,19 +554,6 @@ export function sameStateV2AuthorityManifest(
   manifest: StateV2Manifest,
 ): boolean {
   return sameManifest(witness.manifest, manifest);
-}
-
-function isManifest(value: unknown): value is StateV2Manifest {
-  return isRecord(value)
-    && value.schemaVersion === 2
-    && value.activeState === "state-v2.json"
-    && Number.isSafeInteger(value.stateCommitSeq)
-    && Number(value.stateCommitSeq) >= 1
-    && Number.isSafeInteger(value.lifecycleEpoch)
-    && Number(value.lifecycleEpoch) >= 0
-    && isSyncScope(value.scope)
-    && Number.isFinite(value.migratedAt)
-    && value.legacyAutoSyncAllowed === false;
 }
 
 function sameManifest(

@@ -1,11 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as obsidian from "obsidian";
+import { getEasySyncPaths } from "../src/obsidian-compat";
 import { OneDriveClient } from "../src/onedrive/client";
 import {
   OneDriveError,
   OneDriveErrorType,
   RemoteVaultScopeIdentityError,
 } from "../src/onedrive/types";
+
+const EASY_SYNC_TMP_DIR = getEasySyncPaths(".obsidian").tmpDir;
 
 describe("OneDriveClient run metrics", () => {
   afterEach(() => {
@@ -158,6 +161,57 @@ describe("OneDriveClient run metrics", () => {
       failed: 0,
     });
     expect(diag.warn).not.toHaveBeenCalled();
+  });
+
+  it("reads independent driveItem metadata through one checked Graph batch", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: {
+        responses: [
+          {
+            id: "1",
+            status: 200,
+            headers: {},
+            body: {
+              id: "file-a",
+              name: "a.md",
+              eTag: "etag-a",
+              file: {},
+              "@microsoft.graph.downloadUrl": "https://download.example/a",
+            },
+          },
+          {
+            id: "2",
+            status: 404,
+            headers: {},
+            body: { error: { code: "itemNotFound", message: "missing" } },
+          },
+        ],
+      },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    const result = await client.getDriveItemMetadataByIds(
+      ["file-a", "file-b", "file-a"],
+      "downloadUrlRefresh",
+    );
+
+    expect(result.get("file-a")).toMatchObject({
+      id: "file-a",
+      eTag: "etag-a",
+      "@microsoft.graph.downloadUrl": "https://download.example/a",
+    });
+    expect(result.get("file-b")).toBeNull();
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+    const request = requestSpy.mock.calls[0][0];
+    expect(request.url).toBe("https://graph.microsoft.com/v1.0/$batch");
+    expect(JSON.parse(request.body as string)).toEqual({
+      requests: [
+        { id: "1", method: "GET", url: "/me/drive/items/file-a" },
+        { id: "2", method: "GET", url: "/me/drive/items/file-b" },
+      ],
+    });
   });
 });
 
@@ -374,7 +428,7 @@ describe("OneDriveClient.downloadFile", () => {
       const outcome = client.downloadFileToPath(
         "testVault",
         "recording.m4a",
-        ".obsidian/plugins/easy-sync/tmp/downloads/recording.m4a.part",
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
         adapter as never,
         undefined,
         "file-id",
@@ -587,7 +641,7 @@ describe("OneDriveClient.downloadFile", () => {
       const result = await client.downloadFileToPath(
         "testVault",
         "recording.m4a",
-        ".obsidian/plugins/easy-sync/tmp/downloads/recording.m4a.part",
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
         adapter as never,
         "https://download.example/recording.m4a",
         undefined,
@@ -660,7 +714,7 @@ describe("OneDriveClient.downloadFile", () => {
       await expect(client.downloadFileToPath(
         "testVault",
         "recording.m4a",
-        ".obsidian/plugins/easy-sync/tmp/downloads/recording.m4a.part",
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
         adapter as never,
         "https://download.example/recording.m4a",
         undefined,
@@ -677,7 +731,7 @@ describe("OneDriveClient.downloadFile", () => {
       });
       expect(summary?.totals.failedBytes).toBe(partial.byteLength);
       expect(adapter.remove).toHaveBeenCalledWith(
-        ".obsidian/plugins/easy-sync/tmp/downloads/recording.m4a.part",
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
       );
     } finally {
       if (originalWindow === undefined) {

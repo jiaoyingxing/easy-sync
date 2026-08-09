@@ -54,7 +54,10 @@ import {
   remoteContentMatchesBase,
 } from "./file-decision-planner-v2";
 import { StateManager } from "./state-manager";
-import type { PendingIssue } from "./state-manager";
+import type {
+  MutationCheckpointCommitMetrics,
+  PendingIssue,
+} from "./state-manager";
 import {
   buildEmptyFolderResolutionSnapshotV1,
   type EmptyFolderResolutionSnapshotV1,
@@ -155,6 +158,10 @@ import {
   ADAPTIVE_DOWNLOAD_MAX_BYTES,
   DownloadConcurrencyPolicy,
 } from "./download-concurrency-policy";
+import {
+  ADAPTIVE_UPLOAD_MAX_BYTES,
+  UploadConcurrencyPolicy,
+} from "./upload-concurrency-policy";
 import {
   contentDifferenceReceiptMatches,
   resolveContentEquality,
@@ -441,14 +448,12 @@ type ExactEmptyRemoteFolderInspection =
   | { status: "not-empty" }
   | { status: "changed" };
 
-const SMALL_UPLOAD_CONCURRENCY = 5;
-const CONCURRENT_UPLOAD_MAX_BYTES = 8 * 1024 * 1024;
-const LARGE_UPLOAD_CONCURRENCY = 2;
-
-const MOBILE_SMALL_UPLOAD_CONCURRENCY = 2;
-const MOBILE_LARGE_UPLOAD_CONCURRENCY = 1;
 const MOBILE_STREAM_DOWNLOAD_MIN_BYTES = 8 * 1024 * 1024;
 const MOBILE_PLUGIN_MANIFEST_PREFLIGHT_CONCURRENCY = 3;
+const DESKTOP_RECONSTRUCTION_BATCH_FILES = 4;
+const MOBILE_RECONSTRUCTION_BATCH_FILES = 2;
+const DESKTOP_RECONSTRUCTION_BATCH_BYTES = 32 * 1024 * 1024;
+const MOBILE_RECONSTRUCTION_BATCH_BYTES = 8 * 1024 * 1024;
 const ANDROID_TEMP_WRITE_MAX_ATTEMPTS = 3;
 
 interface PreparedDownload {
@@ -585,7 +590,26 @@ export interface ExecutionMetrics {
     upload: FileTransferMetrics;
     download: FileTransferMetrics;
   };
+  mutationPersistence: MutationPersistenceMetrics;
   automaticHandling: AutomaticHandlingMetrics;
+}
+
+export interface MutationPersistenceMetrics {
+  intentWrites: number;
+  receiptWrites: number;
+  /** Logical mutation receipts covered by successful checkpoint commits. */
+  checkpointOperations: number;
+  /** Physical V2 checkpoint commits, after any safe batching. */
+  checkpointCommits: number;
+  checkpointFailures: number;
+  stagesMs: {
+    intentPersist: number;
+    receiptPersist: number;
+    checkpointAncestorPublish: number;
+    checkpointV2Commit: number;
+    checkpointLedgerClear: number;
+    checkpointTotal: number;
+  };
 }
 
 type SyncRunPhase =
@@ -620,6 +644,46 @@ function createFileTransferMetrics(): FileTransferMetrics {
       localCommit: 0,
     },
   };
+}
+
+function createMutationPersistenceMetrics(): MutationPersistenceMetrics {
+  return {
+    intentWrites: 0,
+    receiptWrites: 0,
+    checkpointOperations: 0,
+    checkpointCommits: 0,
+    checkpointFailures: 0,
+    stagesMs: {
+      intentPersist: 0,
+      receiptPersist: 0,
+      checkpointAncestorPublish: 0,
+      checkpointV2Commit: 0,
+      checkpointLedgerClear: 0,
+      checkpointTotal: 0,
+    },
+  };
+}
+
+function recordCheckpointMetrics(
+  target: MutationPersistenceMetrics,
+  detail: MutationCheckpointCommitMetrics | undefined,
+  elapsedMs: number,
+): void {
+  target.checkpointCommits++;
+  target.checkpointOperations += detail?.operations ?? 1;
+  target.stagesMs.checkpointTotal += detail?.totalMs ?? elapsedMs;
+  target.stagesMs.checkpointAncestorPublish += detail?.ancestorPublishMs ?? 0;
+  target.stagesMs.checkpointV2Commit += detail?.v2CommitMs ?? 0;
+  target.stagesMs.checkpointLedgerClear += detail?.ledgerClearMs ?? 0;
+}
+
+interface DeferredMutationCompletion {
+  operationId: string;
+  path: string;
+  actionType: SyncActionType;
+  reason?: string;
+  fileSize?: number;
+  renameFrom?: string;
 }
 
 function createAutomaticHandlingMetrics(
@@ -1471,6 +1535,35 @@ export class SyncExecutor {
       && classifyCommunityPluginManagedPath(path, configDir)?.kind === undefined;
   }
 
+  private currentManualResolutionScanScope(): {
+    configDir: string;
+    includeFilePath: (path: string) => boolean;
+    includeFolderPath: (path: string) => boolean;
+    preserveFolderPath: (path: string) => boolean;
+  } {
+    const configDir = getConfigDir(this.scanner.vault);
+    const policy = this.communityPluginSyncPolicy;
+    const structuredCommunityPluginPath = policy.files.mode !== "none"
+      ? `${configDir}/community-plugins.json`
+      : null;
+    return {
+      configDir,
+      includeFilePath: (path) =>
+        path !== structuredCommunityPluginPath
+          && this.shouldIncludeRemotePath(path)
+          && isCommunityPluginPathSelectedByPolicy(path, policy, configDir),
+      includeFolderPath: (path) => this.scanner.shouldSyncFolderPath(path),
+      preserveFolderPath: (path) =>
+        !this.scanner.shouldSyncFolderPath(path)
+        || isCommunityPluginFolderPreservedByPolicy(
+          path,
+          policy,
+          configDir,
+          "easy-sync",
+        ),
+    };
+  }
+
   private async buildCurrentEmptyFolderResolutionSnapshot(
     path: string,
   ): Promise<EmptyFolderResolutionSnapshotV1 | null> {
@@ -1484,36 +1577,17 @@ export class SyncExecutor {
 
     const scan = await this.scanner.scanAll();
     if (!scan.complete || !scan.folderScanComplete) return null;
-    const configDir = getConfigDir(this.scanner.vault);
-    const policy = this.communityPluginSyncPolicy;
-    const structuredCommunityPluginPath = policy.files.mode !== "none"
-      ? `${configDir}/community-plugins.json`
-      : null;
-    const includeFilePath = (candidate: string): boolean =>
-      candidate !== structuredCommunityPluginPath
-        && this.shouldIncludeRemotePath(candidate)
-        && isCommunityPluginPathSelectedByPolicy(
-          candidate,
-          policy,
-          configDir,
-        );
+    const scope = this.currentManualResolutionScanScope();
     const snapshot = buildEmptyFolderResolutionSnapshotV1(path, {
       envelope,
-      localFiles: scan.entries.filter((entry) => includeFilePath(entry.path)),
+      localFiles: scan.entries.filter((entry) =>
+        scope.includeFilePath(entry.path)),
       localFolders: scan.folders,
       localFolderScanComplete: scan.folderScanComplete,
       localMoveHints: this.state.localFolderMoveHints,
-      includeFilePath,
-      includeFolderPath: (candidate) =>
-        this.scanner.shouldSyncFolderPath(candidate),
-      preserveFolderPath: (candidate) =>
-        !this.scanner.shouldSyncFolderPath(candidate)
-        || isCommunityPluginFolderPreservedByPolicy(
-          candidate,
-          policy,
-          configDir,
-          "easy-sync",
-        ),
+      includeFilePath: scope.includeFilePath,
+      includeFolderPath: scope.includeFolderPath,
+      preserveFolderPath: scope.preserveFolderPath,
     });
     if (!snapshot) return null;
     const live = await this.inspectExactEmptyRemoteFolder(snapshot);
@@ -1550,21 +1624,9 @@ export class SyncExecutor {
 
     const scan = await this.scanner.scanAll();
     if (!scan.complete || !scan.folderScanComplete) return null;
-    const configDir = getConfigDir(this.scanner.vault);
-    const policy = this.communityPluginSyncPolicy;
-    const structuredCommunityPluginPath = policy.files.mode !== "none"
-      ? `${configDir}/community-plugins.json`
-      : null;
-    const includeFilePath = (candidate: string): boolean =>
-      candidate !== structuredCommunityPluginPath
-        && this.shouldIncludeRemotePath(candidate)
-        && isCommunityPluginPathSelectedByPolicy(
-          candidate,
-          policy,
-          configDir,
-        );
+    const scope = this.currentManualResolutionScanScope();
     const localFiles = scan.entries.filter(
-      (entry) => includeFilePath(entry.path),
+      (entry) => scope.includeFilePath(entry.path),
     );
     const snapshot = buildSharedFolderIdentityResolutionSnapshotV1(path, {
       envelope,
@@ -1572,17 +1634,9 @@ export class SyncExecutor {
       localFolders: scan.folders,
       localFolderScanComplete: scan.folderScanComplete,
       localMoveHints: this.state.localFolderMoveHints,
-      includeFilePath,
-      includeFolderPath: (candidate) =>
-        this.scanner.shouldSyncFolderPath(candidate),
-      preserveFolderPath: (candidate) =>
-        !this.scanner.shouldSyncFolderPath(candidate)
-        || isCommunityPluginFolderPreservedByPolicy(
-          candidate,
-          policy,
-          configDir,
-          "easy-sync",
-        ),
+      includeFilePath: scope.includeFilePath,
+      includeFolderPath: scope.includeFolderPath,
+      preserveFolderPath: scope.preserveFolderPath,
     });
     if (!snapshot) return null;
 
@@ -1630,41 +1684,22 @@ export class SyncExecutor {
 
     const scan = await this.scanner.scanAll();
     if (!scan.complete || !scan.folderScanComplete) return null;
-    const configDir = getConfigDir(this.scanner.vault);
-    const policy = this.communityPluginSyncPolicy;
-    const structuredCommunityPluginPath = policy.files.mode !== "none"
-      ? `${configDir}/community-plugins.json`
-      : null;
-    const includeFilePath = (candidate: string): boolean =>
-      candidate !== structuredCommunityPluginPath
-        && this.shouldIncludeRemotePath(candidate)
-        && isCommunityPluginPathSelectedByPolicy(
-          candidate,
-          policy,
-          configDir,
-        );
+    const scope = this.currentManualResolutionScanScope();
     const snapshot = buildStaleIdentityResolutionSnapshotV1(
       path,
       issueCode,
       {
         envelope,
-        localFiles: scan.entries.filter((entry) => includeFilePath(entry.path)),
+        localFiles: scan.entries.filter((entry) =>
+          scope.includeFilePath(entry.path)),
         localFolders: scan.folders,
         localFolderScanComplete: scan.folderScanComplete,
         skippedLarge: scan.skippedLarge,
         localMoveHints: this.state.localFolderMoveHints,
-        includeFilePath,
-        includeFolderPath: (candidate) =>
-          this.scanner.shouldSyncFolderPath(candidate),
-        preserveFolderPath: (candidate) =>
-          !this.scanner.shouldSyncFolderPath(candidate)
-          || isCommunityPluginFolderPreservedByPolicy(
-            candidate,
-            policy,
-            configDir,
-            "easy-sync",
-          ),
-        configDir,
+        includeFilePath: scope.includeFilePath,
+        includeFolderPath: scope.includeFolderPath,
+        preserveFolderPath: scope.preserveFolderPath,
+        configDir: scope.configDir,
         automaticDeleteLocalFiles:
           this.automaticHandlingPolicy.autoDeleteLocalFiles,
       },
@@ -2066,9 +2101,7 @@ export class SyncExecutor {
   private createDecisionToken(item: SyncPlanItem): SyncDecisionToken {
     const scope = this.activeSyncScope ?? this.state.remoteScope;
     if (!scope) throw new Error("Cannot bind a decision token without a complete sync scope");
-    const ancestor = typeof this.state.getBaseEntry === "function"
-      ? this.state.getBaseEntry(item.path)
-      : this.state.baseSnapshot.find((entry) => entry.path === item.path);
+    const ancestor = this.state.getBaseEntry(item.path);
     return {
       version: 1,
       vaultName: this.vaultName,
@@ -5170,10 +5203,27 @@ export class SyncExecutor {
             if (unresolved.length === 0) break;
             const next = unresolved[0];
             if (!next) break;
-            const batch = [next];
+            const batchFileLimit = Platform.isMobile
+              ? MOBILE_RECONSTRUCTION_BATCH_FILES
+              : DESKTOP_RECONSTRUCTION_BATCH_FILES;
+            const batchByteLimit = Platform.isMobile
+              ? MOBILE_RECONSTRUCTION_BATCH_BYTES
+              : DESKTOP_RECONSTRUCTION_BATCH_BYTES;
+            const batch: SyncPlanItem[] = [];
+            let batchBytes = 0;
+            for (const candidate of unresolved) {
+              if (batch.length >= batchFileLimit) break;
+              const candidateBytes = candidate.remote?.size ?? 0;
+              if (
+                batch.length > 0
+                && batchBytes + candidateBytes > batchByteLimit
+              ) break;
+              batch.push(candidate);
+              batchBytes += candidateBytes;
+            }
             batches++;
             const reconstructionProgress = {
-              current: verified + 1,
+              current: verified + batch.length,
               total: initialCandidates.length,
             };
             this.progressStore?.setProgress(
@@ -5186,12 +5236,13 @@ export class SyncExecutor {
               reconstructionProgress.total,
               this.t("progress.verifyingFiles", reconstructionProgress),
             );
-            const batchNeedsDownload =
-              reconstructionEvidenceStatus(next) === "unknown";
-            if (batchNeedsDownload) {
-              const size = next.remote?.size ?? 0;
-              downloadBytes += size;
-            }
+            const downloadCandidates = batch.filter((item) =>
+              reconstructionEvidenceStatus(item) === "unknown"
+            );
+            downloadBytes += downloadCandidates.reduce(
+              (total, item) => total + (item.remote?.size ?? 0),
+              0,
+            );
             verifiedBytes += batch.reduce(
               (total, item) => total + (item.remote?.size ?? 0),
               0,
@@ -5203,6 +5254,25 @@ export class SyncExecutor {
                 "Descendant file reconstruction lost V2 authority",
               );
             }
+            const prefetchedRemoteHashes = new Map<
+              string,
+              { hash?: string; error?: unknown }
+            >();
+            await Promise.all(downloadCandidates.map(async (item, index) => {
+              try {
+                const hash = await resolveCanonicalRemoteContentHash(
+                  item,
+                  {
+                    current: verified + index + 1,
+                    total: initialCandidates.length,
+                  },
+                  false,
+                );
+                prefetchedRemoteHashes.set(item.path, { hash });
+              } catch (error) {
+                prefetchedRemoteHashes.set(item.path, { error });
+              }
+            }));
             const finalizedBatch =
               await finalizeCanonicalPlanCandidateV2({
                 candidate: {
@@ -5221,12 +5291,16 @@ export class SyncExecutor {
                     path: item.path,
                     contentComparison: item.contentComparison,
                   })),
-                resolveRemoteContentHash: (item) =>
-                  resolveCanonicalRemoteContentHash(
+                resolveRemoteContentHash: async (item) => {
+                  const prefetched = prefetchedRemoteHashes.get(item.path);
+                  if (prefetched?.error) throw prefetched.error;
+                  if (prefetched?.hash) return prefetched.hash;
+                  return resolveCanonicalRemoteContentHash(
                     item,
                     reconstructionProgress,
                     false,
-                  ),
+                  );
+                },
               });
             downloads += finalizedBatch.contentVerification.downloads;
             const failures =
@@ -5470,7 +5544,10 @@ export class SyncExecutor {
       // keep skipping on stale breaker state; auto sync keeps the guardrail.
       const breakerMap = new Map<string, PendingIssue>();
       for (const issue of this.state.pendingIssues) {
-        if ((issue.consecutiveFailures ?? 0) >= 3) {
+        if (
+          issue.actionType !== SyncActionType.FolderDeferred
+          && (issue.consecutiveFailures ?? 0) >= 3
+        ) {
           breakerMap.set(issue.path, issue);
         }
       }
@@ -6496,6 +6573,16 @@ export class SyncExecutor {
         await this.publishHealthyCloudBootstrapV2(
           operationEpoch,
         );
+        // Older test doubles and pre-migration state holders do not expose
+        // the optional local layout cleanup hook; sync correctness must not
+        // depend on this housekeeping step.
+        if (typeof (this.state as StateManager & {
+          noteHealthySync?: () => Promise<void>;
+        }).noteHealthySync === "function") {
+          await (this.state as StateManager & {
+            noteHealthySync: () => Promise<void>;
+          }).noteHealthySync();
+        }
       }
 
       result.success = !result.authExpired
@@ -6594,10 +6681,11 @@ export class SyncExecutor {
       }
       if (result.metrics) {
         this.diag?.log("execute", "sync file transfer summary", {
-          schemaVersion: 2,
+          schemaVersion: 3,
           platform: Platform.isMobile ? "mobile" : "desktop",
           upload: result.metrics.fileTransfers.upload,
           download: result.metrics.fileTransfers.download,
+          mutationPersistence: result.metrics.mutationPersistence,
         });
       }
       automaticHandlingMetrics.recoveryPendingAtEnd = {
@@ -6761,6 +6849,7 @@ export class SyncExecutor {
         upload: createFileTransferMetrics(),
         download: createFileTransferMetrics(),
       },
+      mutationPersistence: createMutationPersistenceMetrics(),
       automaticHandling: automaticHandlingMetrics,
     };
     // Attach the live accumulator immediately so cancellations and early
@@ -6768,10 +6857,10 @@ export class SyncExecutor {
     result.metrics = metrics;
     const isSmallUpload = (i: SyncPlanItem) =>
       i.type === SyncActionType.Upload && Boolean(i.local)
-      && i.local!.size <= CONCURRENT_UPLOAD_MAX_BYTES;
+      && i.local!.size <= ADAPTIVE_UPLOAD_MAX_BYTES;
     const isLargeUpload = (i: SyncPlanItem) =>
       i.type === SyncActionType.Upload && Boolean(i.local)
-      && i.local!.size > CONCURRENT_UPLOAD_MAX_BYTES;
+      && i.local!.size > ADAPTIVE_UPLOAD_MAX_BYTES;
     const isDownload = (i: SyncPlanItem) =>
       i.type === SyncActionType.Download
       || i.type === SyncActionType.RenameRemote
@@ -6804,9 +6893,7 @@ export class SyncExecutor {
         ? cleanupItems.filter((item) => item.type === SyncActionType.DeleteLocal).length
         : 0;
 
-    // Effective concurrency — cap lower on mobile to avoid memory-pressure kills
-    const uploadConc = Platform.isMobile ? MOBILE_SMALL_UPLOAD_CONCURRENCY : SMALL_UPLOAD_CONCURRENCY;
-    const largeUploadConc = Platform.isMobile ? MOBILE_LARGE_UPLOAD_CONCURRENCY : LARGE_UPLOAD_CONCURRENCY;
+    const uploadPolicy = new UploadConcurrencyPolicy(Platform.isMobile);
     const downloadPolicy = new DownloadConcurrencyPolicy();
 
     // M19: anti-downgrade guard for EasySync self-sync.
@@ -6834,13 +6921,14 @@ export class SyncExecutor {
     callbacks.onProgress?.(0, total, "");
     this.diag?.log(
       "execute",
-      `pools — folders=${folderCreates.length} small=${smallUploads.length}(${uploadConc}) large=${largeUploads.length}(${largeUploadConc}) download=${downloads.length}(adaptive 1→3 desktop small files) passthrough=${passthroughItems.length} cleanup=${cleanupItems.length}`,
+      `pools — folders=${folderCreates.length} small=${smallUploads.length}(adaptive ${uploadPolicy.limit}→${Platform.isMobile ? 2 : 4}) large=${largeUploads.length}(1) download=${downloads.length}(adaptive 1→3 desktop small files) passthrough=${passthroughItems.length} cleanup=${cleanupItems.length}`,
     );
 
     const executePlanItem = async (
       item: SyncPlanItem,
       preparedDownload?: PreparedDownload,
-    ): Promise<void> => {
+      deferUploadCheckpoint = false,
+    ): Promise<DeferredMutationCompletion | undefined> => {
       if (!this.canContinue(operationEpoch, result)) return;
       const position = ++started;
       this.progressStore?.setProgress(position, total, item.path, item.type);
@@ -6850,8 +6938,9 @@ export class SyncExecutor {
       const localHash = item.local?.hash;
       const remoteETag = item.remote?.eTag;
       let mutationIntent: MutationIntent | null = null;
-      const remoteUpsertStart = remoteUpserts.length;
-      const remoteDeleteStart = remoteDeletes.length;
+      let deferredMutationOperationId: string | null = null;
+      const itemRemoteUpserts: RemoteFileEntry[] = [];
+      const itemRemoteDeletes: string[] = [];
       const transferDirection = item.type === SyncActionType.Upload
         ? "upload"
         : item.type === SyncActionType.Download
@@ -6896,12 +6985,18 @@ export class SyncExecutor {
           && !item.requiresConfirmation
           ? this.createMutationIntent(item, plan.scope)
           : null;
-        if (mutationIntent) await this.state.beginMutationIntent(mutationIntent);
+        if (mutationIntent) {
+          const intentStartedAt = Date.now();
+          await this.state.beginMutationIntent(mutationIntent);
+          metrics.mutationPersistence.intentWrites++;
+          metrics.mutationPersistence.stagesMs.intentPersist +=
+            Date.now() - intentStartedAt;
+        }
         const itemResult = await this.executeItem(
           item,
           result,
-          remoteUpserts,
-          remoteDeletes,
+          itemRemoteUpserts,
+          itemRemoteDeletes,
           metrics,
           callbacks,
           operationEpoch,
@@ -6913,8 +7008,8 @@ export class SyncExecutor {
         }
         if (mutationIntent && itemResult.mutationApplied) {
           const checkpoint = emptyMutationCheckpoint();
-          checkpoint.remoteUpserts.push(...remoteUpserts.splice(remoteUpsertStart));
-          checkpoint.remoteDeletes.push(...remoteDeletes.splice(remoteDeleteStart));
+          checkpoint.remoteUpserts.push(...itemRemoteUpserts.splice(0));
+          checkpoint.remoteDeletes.push(...itemRemoteDeletes.splice(0));
           if (itemResult.baseUpsert) checkpoint.baseUpserts.push(itemResult.baseUpsert);
           if (itemResult.baseRemoval) checkpoint.baseRemovals.push(itemResult.baseRemoval);
           if (itemResult.folderUpsert) checkpoint.folderUpserts = [itemResult.folderUpsert];
@@ -6940,9 +7035,32 @@ export class SyncExecutor {
             completedAt: Date.now(),
             checkpoint,
           };
+          const receiptStartedAt = Date.now();
           await this.state.recordMutationReceipt(receipt);
+          metrics.mutationPersistence.receiptWrites++;
+          metrics.mutationPersistence.stagesMs.receiptPersist +=
+            Date.now() - receiptStartedAt;
           if (!this.canContinue(operationEpoch, result)) return;
-          await this.commitMutationCheckpoint(mutationIntent.operationId);
+          if (deferUploadCheckpoint && item.type === SyncActionType.Upload) {
+            deferredMutationOperationId = mutationIntent.operationId;
+          } else {
+            const checkpointStartedAt = Date.now();
+            try {
+              const checkpointMetrics = await this.commitMutationCheckpoint(
+                mutationIntent.operationId,
+              );
+              recordCheckpointMetrics(
+                metrics.mutationPersistence,
+                checkpointMetrics,
+                Date.now() - checkpointStartedAt,
+              );
+            } catch (error) {
+              metrics.mutationPersistence.checkpointFailures++;
+              metrics.mutationPersistence.stagesMs.checkpointTotal +=
+                Date.now() - checkpointStartedAt;
+              throw error;
+            }
+          }
           if (item.type === SyncActionType.DeleteLocal) {
             metrics.automaticHandling.deleteLocal.completed++;
             automaticDeleteCompleted = true;
@@ -6950,6 +7068,8 @@ export class SyncExecutor {
           itemResult.baseUpsert = undefined;
           itemResult.baseRemoval = undefined;
         }
+        remoteUpserts.push(...itemRemoteUpserts);
+        remoteDeletes.push(...itemRemoteDeletes);
         if (!this.canContinue(operationEpoch, result)) return;
         if (!itemResult.executed) {
           transferOutcome = transferMetrics ? "skipped" : null;
@@ -7014,7 +7134,9 @@ export class SyncExecutor {
             fileSize,
             localHash,
             remoteETag,
-            consecutiveFailures: 1,
+            ...(item.type === SyncActionType.RetryLater
+              ? { consecutiveFailures: 1 }
+              : {}),
           });
           callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize);
           return;
@@ -7045,6 +7167,16 @@ export class SyncExecutor {
           item,
           completionActionType,
         );
+        if (deferredMutationOperationId) {
+          return {
+            operationId: deferredMutationOperationId,
+            path: item.path,
+            actionType: completionActionType,
+            reason: itemResult.completionReason,
+            fileSize: completionFileSize,
+            renameFrom: item.renameFrom,
+          };
+        }
         if (item.renameFrom) {
           callbacks.onFileComplete?.(
             item.path,
@@ -7108,7 +7240,11 @@ export class SyncExecutor {
               ) ?? activeRecord;
               const rebasedReceipt = await this.rebaseReceiptedUploadParent(refreshedRecord);
               if (rebasedReceipt) {
+                const receiptStartedAt = Date.now();
                 await this.state.recordMutationReceipt(rebasedReceipt);
+                metrics.mutationPersistence.receiptWrites++;
+                metrics.mutationPersistence.stagesMs.receiptPersist +=
+                  Date.now() - receiptStartedAt;
                 this.diag?.log(
                   "state",
                   `rebound same-action upload receipt after remote hierarchy refresh — ${activeIntent.path}`,
@@ -7116,7 +7252,22 @@ export class SyncExecutor {
                 );
               }
             }
-            await this.commitMutationCheckpoint(activeIntent.operationId);
+            const checkpointStartedAt = Date.now();
+            try {
+              const checkpointMetrics = await this.commitMutationCheckpoint(
+                activeIntent.operationId,
+              );
+              recordCheckpointMetrics(
+                metrics.mutationPersistence,
+                checkpointMetrics,
+                Date.now() - checkpointStartedAt,
+              );
+            } catch (checkpointError) {
+              metrics.mutationPersistence.checkpointFailures++;
+              metrics.mutationPersistence.stagesMs.checkpointTotal +=
+                Date.now() - checkpointStartedAt;
+              throw checkpointError;
+            }
             this.diag?.warn(
               "execute",
               `recorded mutation checkpoint retried in the same action — ${activeIntent.path}`,
@@ -7311,9 +7462,108 @@ export class SyncExecutor {
         operationEpoch,
       );
 
-    // Step 3a — uploads remain serial while every mutation owns one durable
-    // intent/receipt checkpoint.
-    for (const item of uploadItems) {
+    const commitDeferredUploadBatch = async (
+      completions: readonly DeferredMutationCompletion[],
+    ): Promise<void> => {
+      if (completions.length === 0) return;
+      const operationIds = completions.map((completion) => completion.operationId);
+      const commit = () => operationIds.length === 1
+        ? this.commitMutationCheckpoint(operationIds[0])
+        : this.commitMutationCheckpoints(operationIds);
+      let checkpointError: unknown;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const checkpointStartedAt = Date.now();
+        try {
+          const checkpointMetrics = await commit();
+          recordCheckpointMetrics(
+            metrics.mutationPersistence,
+            checkpointMetrics,
+            Date.now() - checkpointStartedAt,
+          );
+          checkpointError = undefined;
+          break;
+        } catch (error) {
+          checkpointError = error;
+          metrics.mutationPersistence.checkpointFailures++;
+          metrics.mutationPersistence.stagesMs.checkpointTotal +=
+            Date.now() - checkpointStartedAt;
+          this.diag?.warn(
+            "state",
+            `upload checkpoint batch attempt ${attempt + 1} failed`,
+            {
+              operations: operationIds.length,
+              error: error instanceof Error ? error.message : String(error),
+              mutations: 0,
+            },
+          );
+        }
+      }
+      if (checkpointError !== undefined) {
+        const reason = this.failureReason(checkpointError);
+        for (const completion of completions) {
+          callbacks.onFileComplete?.(
+            completion.path,
+            completion.actionType,
+            false,
+            reason,
+            completion.fileSize,
+            completion.renameFrom,
+          );
+        }
+        throw checkpointError;
+      }
+      for (const completion of completions) {
+        callbacks.onFileComplete?.(
+          completion.path,
+          completion.actionType,
+          true,
+          completion.reason,
+          completion.fileSize,
+          completion.renameFrom,
+        );
+      }
+    };
+
+    // Step 3a — independent small uploads overlap only through receipt
+    // persistence. A wave becomes visible as successful only after one shared
+    // V2 checkpoint covers every durable receipt in that wave.
+    for (let index = 0; index < smallUploads.length;) {
+      if (!this.canContinue(operationEpoch, result)) break;
+      const batchStartedAt = Date.now();
+      const errorsBefore = result.errors;
+      const concurrency = uploadPolicy.limit;
+      const batch = smallUploads.slice(index, index + concurrency);
+      const completions = (await Promise.all(batch.map(async (item) => {
+        const preflightError = communityPluginUploadErrors.get(item.path);
+        return executePlanItem(
+          item,
+          preflightError === undefined ? undefined : { error: preflightError },
+          true,
+        );
+      }))).filter(
+        (completion): completion is DeferredMutationCompletion =>
+          completion !== undefined,
+      );
+      if (!this.canContinue(operationEpoch, result)) break;
+      await commitDeferredUploadBatch(completions);
+      uploadPolicy.observeBatch({
+        files: batch.length,
+        elapsedMs: Date.now() - batchStartedAt,
+        failed: result.errors > errorsBefore,
+      });
+      this.diag?.log("execute", "adaptive upload batch", {
+        schemaVersion: 1,
+        files: batch.length,
+        elapsedMs: Math.max(0, Date.now() - batchStartedAt),
+        failed: result.errors > errorsBefore,
+        nextConcurrency: uploadPolicy.limit,
+        lockedSerial: uploadPolicy.isLockedSerial,
+      });
+      index += batch.length;
+    }
+
+    // Large uploads retain exclusive transfer and per-file checkpointing.
+    for (const item of largeUploads) {
       if (!this.canContinue(operationEpoch, result)) break;
       const preflightError = communityPluginUploadErrors.get(item.path);
       await executePlanItem(
@@ -7378,6 +7628,49 @@ export class SyncExecutor {
       }
 
       const batchStartedAt = Date.now();
+      const metadataBatchClient = this.onedrive as OneDriveClient & {
+        getDriveItemMetadataByIds?: (
+          driveItemIds: readonly string[],
+          metadataReason?: "downloadUrlRefresh" | "downloadVersionVerify" | "other",
+        ) => Promise<Map<string, DriveItem | null>>;
+      };
+      const canBatchMetadata =
+        typeof metadataBatchClient.getDriveItemMetadataByIds === "function";
+      const missingDownloadUrl = batch.filter((item) =>
+        !item.remote?.downloadUrl && Boolean(item.remote?.driveId)
+      );
+      const shouldBatchVersionVerification = canBatchMetadata
+        && batch.filter((item) => !item.remote?.sha256Hash).length > 1;
+      const refreshedDownloadUrls = new Map<string, string>();
+      const metadataPreparationErrors = new Map<string, unknown>();
+      if (canBatchMetadata && missingDownloadUrl.length > 1) {
+        try {
+          const refreshed = await metadataBatchClient.getDriveItemMetadataByIds!(
+            missingDownloadUrl.map((item) => item.remote!.driveId),
+            "downloadUrlRefresh",
+          );
+          for (const item of missingDownloadUrl) {
+            const current = refreshed.get(item.remote!.driveId);
+            if (
+              !current
+              || current.id !== item.remote!.driveId
+              || current.eTag !== item.remote!.eTag
+            ) {
+              metadataPreparationErrors.set(
+                item.path,
+                new DownloadRemoteVersionChangedError(item.path),
+              );
+              continue;
+            }
+            const downloadUrl = current["@microsoft.graph.downloadUrl"];
+            if (downloadUrl) refreshedDownloadUrls.set(item.remote!.driveId, downloadUrl);
+          }
+        } catch (error) {
+          for (const item of missingDownloadUrl) {
+            metadataPreparationErrors.set(item.path, error);
+          }
+        }
+      }
       let activePrefetch = 0;
       const prepared = await Promise.all(batch.map(async (item): Promise<PreparedDownload> => {
         metrics.fileTransfers.download.started++;
@@ -7388,13 +7681,16 @@ export class SyncExecutor {
           activePrefetch,
         );
         try {
+          const metadataPreparationError = metadataPreparationErrors.get(item.path);
+          if (metadataPreparationError) throw metadataPreparationError;
           let content: ArrayBuffer;
           const transferStartedAt = Date.now();
           try {
             content = await this.onedrive.downloadFile(
               this.vaultName,
               item.path,
-              item.remote!.downloadUrl,
+              item.remote!.downloadUrl
+                ?? refreshedDownloadUrls.get(item.remote!.driveId),
               item.remote!.driveId,
               item.remote!.size,
               undefined,
@@ -7409,12 +7705,16 @@ export class SyncExecutor {
             hash: await sha256Hex(content),
           };
           metrics.fileTransfers.download.stagesMs.contentHash += Date.now() - hashStartedAt;
-          const remoteVerifyStartedAt = Date.now();
-          try {
-            await this.verifyDownloadedPayload(item.path, item.remote!, downloaded);
-          } finally {
-            metrics.fileTransfers.download.stagesMs.remoteVersionVerify +=
-              Date.now() - remoteVerifyStartedAt;
+          const needsBatchVersionVerification = shouldBatchVersionVerification
+            && !item.remote!.sha256Hash;
+          if (!needsBatchVersionVerification) {
+            const remoteVerifyStartedAt = Date.now();
+            try {
+              await this.verifyDownloadedPayload(item.path, item.remote!, downloaded);
+            } finally {
+              metrics.fileTransfers.download.stagesMs.remoteVersionVerify +=
+                Date.now() - remoteVerifyStartedAt;
+            }
           }
           return { content, downloaded };
         } catch (error) {
@@ -7427,6 +7727,50 @@ export class SyncExecutor {
           );
         }
       }));
+      const hashlessVerificationIndexes = prepared.flatMap((preparedItem, index) =>
+        preparedItem.error === undefined
+          && preparedItem.downloaded
+          && !batch[index].remote?.sha256Hash
+          ? [index]
+          : []
+      );
+      if (shouldBatchVersionVerification && hashlessVerificationIndexes.length > 0) {
+        const remoteVerifyStartedAt = Date.now();
+        try {
+          const currentById = await metadataBatchClient.getDriveItemMetadataByIds!(
+            hashlessVerificationIndexes.map((index) => batch[index].remote!.driveId),
+            "downloadVersionVerify",
+          );
+          for (const index of hashlessVerificationIndexes) {
+            const item = batch[index];
+            const current = currentById.get(item.remote!.driveId);
+            try {
+              if (
+                !current
+                || current.id !== item.remote!.driveId
+                || current.eTag !== item.remote!.eTag
+              ) {
+                throw new DownloadRemoteVersionChangedError(item.path);
+              }
+              await this.verifyDownloadedPayload(
+                item.path,
+                item.remote!,
+                prepared[index].downloaded!,
+                true,
+              );
+            } catch (error) {
+              prepared[index] = { error };
+            }
+          }
+        } catch (error) {
+          for (const index of hashlessVerificationIndexes) {
+            prepared[index] = { error };
+          }
+        } finally {
+          metrics.fileTransfers.download.stagesMs.remoteVersionVerify +=
+            Date.now() - remoteVerifyStartedAt;
+        }
+      }
       const failed = prepared.some((item) => item.error !== undefined);
       const downloadedBytes = prepared.reduce(
         (sum, item) => sum + (item.downloaded?.size ?? 0),
@@ -7514,7 +7858,7 @@ export class SyncExecutor {
     await this.state.reconcilePendingIssues(pendingIssues, resolvedIssuePaths);
     this.diag?.log(
       "execute",
-      `upload summary — files=${result.uploaded}, bytes=${metrics.uploadBytes}, peak=${metrics.peakUploads}/${uploadConc}, readMs=${metrics.uploadReadMs}, networkMs=${metrics.uploadNetworkMs}, elapsedMs=${Date.now() - startedAt}`,
+      `upload summary — files=${result.uploaded}, bytes=${metrics.uploadBytes}, peak=${metrics.peakUploads}/${Platform.isMobile ? 2 : 4}, readMs=${metrics.uploadReadMs}, networkMs=${metrics.uploadNetworkMs}, elapsedMs=${Date.now() - startedAt}`,
     );
 
   }
@@ -8156,6 +8500,7 @@ export class SyncExecutor {
         upload: createFileTransferMetrics(),
         download: createFileTransferMetrics(),
       },
+      mutationPersistence: createMutationPersistenceMetrics(),
       automaticHandling: createAutomaticHandlingMetrics(this.automaticHandlingPolicy),
     };
     const remoteUpserts: RemoteFileEntry[] = [];
@@ -9424,9 +9769,7 @@ export class SyncExecutor {
       return recordAutomaticMergeManual(automaticMetrics, "unsupported-text-path");
     }
 
-    const base = typeof this.state.getBaseEntry === "function"
-      ? this.state.getBaseEntry(item.path)
-      : this.state.baseSnapshot.find((entry) => entry.path === item.path);
+    const base = this.state.getBaseEntry(item.path);
     const activeScope = this.activeSyncScope ?? this.state.remoteScope;
     const evidenceIdentity: TextMergeEvidenceIdentityV1 | null =
       base && activeScope
@@ -13062,8 +13405,16 @@ export class SyncExecutor {
     return { entries, folders };
   }
 
-  private async commitMutationCheckpoint(operationId: string): Promise<void> {
-    await this.state.commitMutationCheckpoint(operationId);
+  private async commitMutationCheckpoint(
+    operationId: string,
+  ): Promise<MutationCheckpointCommitMetrics | undefined> {
+    return this.state.commitMutationCheckpoint(operationId);
+  }
+
+  private async commitMutationCheckpoints(
+    operationIds: readonly string[],
+  ): Promise<MutationCheckpointCommitMetrics | undefined> {
+    return this.state.commitMutationCheckpoints(operationIds);
   }
 
   private selectFilesRootDescendants(

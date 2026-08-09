@@ -346,6 +346,44 @@ describe("main sync entry guards", () => {
     plugin.stopAutoSync();
   });
 
+  it("does not schedule local-change sync when its delay is set to zero", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.autoSyncPaused = false;
+    plugin.setAutoSyncChangeDelaySeconds(0);
+    const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")
+      .mockResolvedValue(true);
+
+    (plugin as never as { markLocalDirtyHint: (path: string) => void })
+      .markLocalDirtyHint("notes/a.md");
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(runAutomaticSync).not.toHaveBeenCalled();
+    expect(plugin.diag.log).not.toHaveBeenCalledWith(
+      "execute",
+      "local dirty hint scheduled normal auto sync",
+      expect.anything(),
+    );
+  });
+
+  it("cancels an already pending local-change sync when set to zero", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.autoSyncPaused = false;
+    const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")
+      .mockResolvedValue(true);
+
+    (plugin as never as { markLocalDirtyHint: (path: string) => void })
+      .markLocalDirtyHint("notes/a.md");
+    await vi.advanceTimersByTimeAsync(1_000);
+    plugin.setAutoSyncChangeDelaySeconds(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(runAutomaticSync).not.toHaveBeenCalled();
+  });
+
   it("does not schedule a dirty run for EasySync internal state", async () => {
     vi.useFakeTimers();
     const plugin = makePlugin();

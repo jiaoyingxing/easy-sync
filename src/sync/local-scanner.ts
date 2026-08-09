@@ -13,6 +13,7 @@ import {
   DEFAULT_CONFIG_DIR,
   getConfigDir,
   getEasySyncPaths,
+  getEasySyncLegacyPaths,
   isEasySyncSelfSyncFilePath,
   isRecord,
 } from "../obsidian-compat";
@@ -122,12 +123,10 @@ export function isPathExcludedByFolders(
   });
 }
 
-export function isEasySyncInternalPath(
+function isEasySyncInternalPathForPaths(
   path: string,
-  configDir = DEFAULT_CONFIG_DIR,
-  pluginId = "easy-sync",
+  paths: ReturnType<typeof getEasySyncPaths>,
 ): boolean {
-  const paths = getEasySyncPaths(configDir, pluginId);
   return path.endsWith(".easy-sync-recovery")
     || path === paths.dataFile
     || (
@@ -174,6 +173,20 @@ export function isEasySyncInternalPath(
     || path.startsWith(`${paths.logsDir}/`)
     || path === paths.tmpDir
     || path.startsWith(`${paths.tmpDir}/`);
+}
+
+export function isEasySyncInternalPath(
+  path: string,
+  configDir = DEFAULT_CONFIG_DIR,
+  pluginId = "easy-sync",
+): boolean {
+  return isEasySyncInternalPathForPaths(
+    path,
+    getEasySyncPaths(configDir, pluginId),
+  ) || isEasySyncInternalPathForPaths(
+    path,
+    getEasySyncLegacyPaths(configDir, pluginId),
+  );
 }
 
 /** Heuristic binary detection: check for null bytes in the first 8KB */
@@ -244,16 +257,17 @@ function isExcluded(path: string, config: ScanConfig, configDir: string, pluginI
 
 function isExcludedDirectory(path: string, config: ScanConfig, configDir: string, pluginId: string): boolean {
   const paths = getEasySyncPaths(configDir, pluginId);
-  if (
-    path === paths.logsDir
-    || path.startsWith(`${paths.logsDir}/`)
-    || path === paths.tmpDir
-    || path.startsWith(`${paths.tmpDir}/`)
-    || path === paths.ancestorsV2Dir
-    || path.startsWith(`${paths.ancestorsV2Dir}/`)
-    || path === paths.stateV2IndexedDbRecoveryDir
-    || path.startsWith(`${paths.stateV2IndexedDbRecoveryDir}/`)
-  ) return true;
+  const legacyPaths = getEasySyncLegacyPaths(configDir, pluginId);
+  const isInternalDirectory = (candidate: ReturnType<typeof getEasySyncPaths>): boolean =>
+    path === candidate.logsDir
+    || path.startsWith(`${candidate.logsDir}/`)
+    || path === candidate.tmpDir
+    || path.startsWith(`${candidate.tmpDir}/`)
+    || path === candidate.ancestorsV2Dir
+    || path.startsWith(`${candidate.ancestorsV2Dir}/`)
+    || path === candidate.stateV2IndexedDbRecoveryDir
+    || path.startsWith(`${candidate.stateV2IndexedDbRecoveryDir}/`);
+  if (isInternalDirectory(paths) || isInternalDirectory(legacyPaths)) return true;
   if (isPathExcludedByFolders(path, config.excludedFolders)) return true;
 
   if (path === paths.pluginDir) {
@@ -485,8 +499,19 @@ export class LocalScanner {
   private async loadScanCache(): Promise<void> {
     if (this.scanCacheLoaded) return;
     const { scanCacheFile } = getEasySyncPaths(this.configDir, this.pluginId);
+    const legacyScanCacheFile = getEasySyncLegacyPaths(
+      this.configDir,
+      this.pluginId,
+    ).scanCacheFile;
     try {
-      const json = await this.vault.adapter.read(scanCacheFile);
+      let json: string;
+      try {
+        json = await this.vault.adapter.read(scanCacheFile);
+      } catch {
+        // Public 1.1.3 cache is valid migration input until the state loader
+        // has had a chance to copy it into the new runtime tree.
+        json = await this.vault.adapter.read(legacyScanCacheFile);
+      }
       const parsed: unknown = JSON.parse(json);
       if (
         isRecord(parsed)

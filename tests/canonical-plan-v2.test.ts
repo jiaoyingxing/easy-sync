@@ -572,7 +572,7 @@ describe("canonical V2 plan candidate", () => {
     ]);
   });
 
-  it("lets identity conflicts own every involved path before ordinary file actions", () => {
+  it("lets unresolved identity moves own every involved path before ordinary file actions", () => {
     const changedVersion = envelope({
       folders: [{ id: "folder", name: "sub" }],
       files: [{
@@ -588,12 +588,6 @@ describe("canonical V2 plan candidate", () => {
     const locallyModified = structuredClone(changedVersion);
     locallyModified.anchors.byAnchorId["file:file"]!.remoteCTag = "ctag-content-2";
     const targetOccupied = structuredClone(locallyModified);
-    const ambiguousLocalRename = envelope({
-      files: [{ id: "file", name: "old.md" }],
-      folderAnchors: [],
-      fileAnchors: [fileAnchor("file", "old.md")],
-    });
-
     const candidates = [
       {
         candidate: build({
@@ -619,13 +613,6 @@ describe("canonical V2 plan candidate", () => {
         }),
         reason: "reason.identityMove.localTargetOccupied",
       },
-      {
-        candidate: build({
-        state: ambiguousLocalRename,
-        localFiles: [localFile("a.md"), localFile("b.md")],
-        }),
-        reason: "reason.identityMove.multipleCandidates",
-      },
     ];
 
     for (const { candidate, reason } of candidates) {
@@ -642,6 +629,67 @@ describe("canonical V2 plan candidate", () => {
         SyncActionType.ConfirmLocalDelete,
       ].includes(item.type))).toBe(false);
     }
+  });
+
+  it("uploads same-content copies while keeping the old cloud path as a normal decision", () => {
+    const ambiguousLocalRename = envelope({
+      files: [{ id: "file", name: "old.md" }],
+      folderAnchors: [],
+      fileAnchors: [fileAnchor("file", "old.md")],
+    });
+
+    const candidate = build({
+      state: ambiguousLocalRename,
+      localFiles: [localFile("a.md"), localFile("b.md")],
+    });
+
+    expect(candidate.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.Upload,
+        path: "a.md",
+      }),
+      expect.objectContaining({
+        type: SyncActionType.Upload,
+        path: "b.md",
+      }),
+      expect.objectContaining({
+        type: SyncActionType.Conflict,
+        path: "old.md",
+        reason: "reason.renameIdentityAmbiguous",
+      }),
+    ]);
+    expect(candidate.items).not.toContainEqual(expect.objectContaining({
+      type: SyncActionType.FolderDeferred,
+    }));
+  });
+
+  it("keeps the old cloud path as a decision after every copy is committed", () => {
+    const committedCopies = envelope({
+      files: [
+        { id: "old", name: "old.md" },
+        { id: "copy-a", name: "a.md" },
+        { id: "copy-b", name: "b.md" },
+      ],
+      folderAnchors: [],
+      fileAnchors: [
+        fileAnchor("old", "old.md"),
+        fileAnchor("copy-a", "a.md"),
+        fileAnchor("copy-b", "b.md"),
+      ],
+    });
+
+    const candidate = build({
+      state: committedCopies,
+      localFiles: [localFile("a.md"), localFile("b.md")],
+    });
+
+    expect(candidate.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.Conflict,
+        path: "old.md",
+        reason: "reason.renameIdentityAmbiguous",
+      }),
+    ]);
   });
 
   it("keeps legacy move verification inside the shared ten-read budget", async () => {

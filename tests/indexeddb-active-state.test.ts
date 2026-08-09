@@ -7,7 +7,6 @@ import { describe, expect, it } from "vitest";
 import {
   StateV2IndexedDbActiveStateError,
   StateV2IndexedDbActiveStore,
-  createStateV2ActiveIndexedDbDatabaseId,
   deriveStateV2ActiveIndexedDbDatabaseId,
 } from "../src/sync/state-v2-indexeddb-active";
 import {
@@ -20,6 +19,14 @@ import {
   injectActiveCommitCompletionFault,
   type ActiveCommitCompletionFaultName,
 } from "./helpers/indexeddb-completion-fault";
+
+function createStateV2ActiveIndexedDbDatabaseId(): string {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return [...bytes]
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("");
+}
 
 class MemoryRecoveryAdapter {
   readonly files = new Map<string, string>();
@@ -595,6 +602,52 @@ describe("production-capable IndexedDB active state owner", () => {
         preparedDeltaBytes: deltaBytes,
         commitWitnessBytes: witnessBytes,
         totalCommitBytes: deltaBytes + witnessBytes,
+      }));
+    } finally {
+      await harness.store.delete();
+    }
+  }, 60_000);
+
+  it("reports the current cost of 20 sequential commits over 5k identities", async () => {
+    let current = createLargeV2Envelope(5_000);
+    const sourceCommitSeq = current.meta.commitSeq;
+    const harness = createHarness();
+    try {
+      await harness.store.initialize(current);
+      const commitTimesMs: number[] = [];
+      let logicalWrites = 0;
+      for (let index = 0; index < 20; index++) {
+        const next = nextEnvelope(
+          current,
+          (index + 1).toString(16).padStart(64, "0"),
+          `etag-sequential-${index}`,
+        );
+        const startedAt = performance.now();
+        const committed = await harness.store.commit(current, next);
+        commitTimesMs.push(performance.now() - startedAt);
+        logicalWrites += committed.logicalWrites;
+        current = next;
+      }
+
+      expect(current.meta.commitSeq).toBe(sourceCommitSeq + 20);
+      expect(logicalWrites).toBe(60);
+      expect(await harness.store.inspect()).toMatchObject({
+        phase: "ready",
+        commitSeq: sourceCommitSeq + 20,
+      });
+
+      const totalMs = commitTimesMs.reduce((sum, value) => sum + value, 0);
+      console.log("[indexeddb-active-state-sequential-5k]", JSON.stringify({
+        schemaVersion: 1,
+        files: 5_000,
+        commits: commitTimesMs.length,
+        totalMs: Number(totalMs.toFixed(3)),
+        medianMs: Number(
+          [...commitTimesMs].sort((left, right) => left - right)[
+            Math.floor(commitTimesMs.length / 2)
+          ].toFixed(3),
+        ),
+        logicalWrites,
       }));
     } finally {
       await harness.store.delete();

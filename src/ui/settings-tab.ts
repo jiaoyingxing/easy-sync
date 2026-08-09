@@ -321,6 +321,10 @@ export class EasySyncSettingTab extends PluginSettingTab {
   ): void {
     if (!this.automaticSectionEl) return;
     this.automaticSectionEl.empty();
+    const describeAutoSyncChangeDelay = (seconds: number): string =>
+      seconds === 0
+        ? t("settings.autoSyncChangeDelay.disabledDesc")
+        : t("settings.autoSyncChangeDelay.desc", { seconds });
     const automaticGroup = new SettingGroup(this.automaticSectionEl).setHeading(
       t("settings.group.automatic"),
     );
@@ -392,12 +396,12 @@ export class EasySyncSettingTab extends PluginSettingTab {
       automaticGroup.addSetting((setting) => {
         setting
           .setName(t("settings.autoSyncChangeDelay.name"))
-          .setDesc(t("settings.autoSyncChangeDelay.desc", {
-            seconds: this.plugin.autoSyncChangeDelaySeconds,
-          }))
+          .setDesc(describeAutoSyncChangeDelay(
+            this.plugin.autoSyncChangeDelaySeconds,
+          ))
           .addSlider((slider) => {
             slider
-              .setLimits(1, 10, 1)
+              .setLimits(0, 10, 1)
               .setValue(this.plugin.autoSyncChangeDelaySeconds)
               .onChange(async (value) => {
                 this.plugin.setAutoSyncChangeDelaySeconds(value);
@@ -406,9 +410,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
                   .closest(".setting-item")
                   ?.querySelector(".setting-item-description");
                 if (desc) {
-                  desc.textContent = t("settings.autoSyncChangeDelay.desc", {
-                    seconds: value,
-                  });
+                  desc.textContent = describeAutoSyncChangeDelay(value);
                 }
               });
           });

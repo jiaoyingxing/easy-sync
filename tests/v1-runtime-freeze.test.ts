@@ -113,18 +113,19 @@ const FILE_SYNC_V1_DEBT: DebtGuard[] = [
   },
   {
     label: "legacy or dual-state writer calls",
-    pattern: /\bthis\.state\.(?:clearRemoteState|applyRemoteMutations|upsertBaseEntries|removeBaseEntries|setRemoteState|commitMutationCheckpoint)\s*\(/g,
+    pattern: /\bthis\.state\.(?:clearRemoteState|applyRemoteMutations|upsertBaseEntries|removeBaseEntries|setRemoteState|commitMutationCheckpoints?)\s*\(/g,
     expected: {
-      "src/sync/sync-executor.ts": 9,
+      "src/sync/sync-executor.ts": 10,
     },
   },
   {
     label: "active mutation recovery ledger calls",
-    pattern: /\bthis\.state\.(?:beginMutationIntent|recordMutationReceipt|abandonMutationIntent|commitMutationCheckpoint)\s*\(/g,
+    pattern: /\bthis\.state\.(?:beginMutationIntent|recordMutationReceipt|abandonMutationIntent|commitMutationCheckpoints?)\s*\(/g,
     expected: {
       // Two additional V2-only receipt writes rebind a completed upload to a
-      // replacement folder identity. They do not add a V1 runtime path.
-      "src/sync/sync-executor.ts": 14,
+      // replacement folder identity. The extra checkpoint owner is the
+      // V2-only independent upload batch gateway, not a V1 runtime path.
+      "src/sync/sync-executor.ts": 15,
     },
   },
 ];
@@ -161,20 +162,13 @@ const V2_70_BOUNDARY_OWNERS: BoundaryOwnerGuard[] = [
     label: "remote-state artifact",
     disposition: "pre-v2-70-safety-boundary",
     literal: "remote-state.json",
-    expectedFiles: [
-      "src/obsidian-compat.ts",
-      "src/sync/state-manager.ts",
-    ],
+    expectedFiles: ["src/obsidian-compat.ts"],
   },
   {
     label: "base-content artifact",
     disposition: "pre-v2-70-safety-boundary",
     literal: "base-content.json",
-    expectedFiles: [
-      "src/obsidian-compat.ts",
-      "src/sync/base-content-cache.ts",
-      "src/sync/state-manager.ts",
-    ],
+    expectedFiles: ["src/obsidian-compat.ts", "src/sync/state-manager.ts"],
   },
   {
     label: "public mutation ledger key",

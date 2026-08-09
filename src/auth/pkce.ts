@@ -4,9 +4,8 @@
  * Generates a cryptographically random code_verifier and its
  * S256 code_challenge for the OAuth 2.0 Authorization Code + PKCE flow.
  *
- * Two challenge generators are provided:
- *  - generateCodeChallenge()     — async, uses Web Crypto (crypto.subtle)
- *  - generateCodeChallengeSync() — synchronous SHA-256; required on iOS
+ * The challenge generator is synchronous because iOS requires browser
+ * opening to remain on the original click-handler chain.
  *    where any await between the user click and window.open() causes
  *    WKWebView to block the browser popup
  */
@@ -22,22 +21,8 @@ export function generateCodeVerifier(): string {
 }
 
 /**
- * Generate the S256 code challenge from a code verifier.
- * SHA-256 hash → base64url without padding.
- */
-export async function generateCodeChallenge(
-  verifier: string,
-): Promise<string> {
-  const encoder = new TextEncoder();
-  const data = encoder.encode(verifier);
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  return base64UrlEncode(new Uint8Array(hash));
-}
-
-/**
- * Synchronous S256 code challenge — functionally identical to
- * generateCodeChallenge() but uses an inline SHA-256 so the
- * entire PKCE flow stays on the synchronous click-handler chain.
+ * Synchronous S256 code challenge. Uses an inline SHA-256 so the entire PKCE
+ * flow stays on the synchronous click-handler chain.
  *
  * Required on iOS WKWebView: any await between the user tap and
  * window.open() causes the system to treat the window opening as

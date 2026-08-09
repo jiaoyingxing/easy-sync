@@ -3,7 +3,10 @@ import type { DriveItem } from "../src/onedrive/types";
 import { planFolderStateV2 } from "../src/sync/folder-state-v2";
 import { buildEmptyFolderResolutionSnapshotV1 } from "../src/sync/empty-folder-resolution";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
-import { shouldPauseFilePlanForConfirmationV2 } from "../src/sync/file-decision-planner-v2";
+import {
+  shouldPauseCanonicalPlanForReviewV2,
+  summarizeCanonicalPlanReviewV2,
+} from "../src/sync/canonical-plan-v2";
 import type {
   FolderAnchorV2,
   SyncAnchorV2,
@@ -854,16 +857,16 @@ describe("V2 folder anchors and pure planner", () => {
   });
 
   it("uses grouped subtree impact in the existing bulk-change review gate", () => {
-    expect(shouldPauseFilePlanForConfirmationV2({
-      items: [{
+    const items = [{
         type: SyncActionType.MoveRemoteFolder,
         path: "Archive",
         renameFrom: "Notes",
         reviewImpactCount: 6,
         folder: { parentPath: "", remoteId: "notes" },
-      }],
-      lastTotalFiles: 10,
-      confirmed: false,
-    })).toBe(true);
+      }];
+    expect(shouldPauseCanonicalPlanForReviewV2(
+      summarizeCanonicalPlanReviewV2(items).impactCount,
+      10,
+    )).toBe(true);
   });
 });

@@ -15,6 +15,7 @@ import { describe, it, expect, vi } from "vitest";
 import * as obsidian from "obsidian";
 import { Platform, TFile, type Plugin } from "obsidian";
 import { sha256Hex } from "../src/crypto";
+import { getEasySyncPaths } from "../src/obsidian-compat";
 import { sameSyncScope, SyncActionType } from "../src/sync/types";
 import { planDigest } from "../src/sync/types";
 import type {
@@ -67,6 +68,7 @@ const TEST_SYNC_SCOPE = {
   vaultFolderId: "vault-folder-id",
   filesRootId: "files-root-id",
 };
+const EASY_SYNC_TMP_DIR = getEasySyncPaths(".obsidian").tmpDir;
 
 function makeMockAdapter(overrides: Record<string, unknown> = {}) {
   return {
@@ -146,6 +148,7 @@ function remoteStateStub() {
     recordMutationReceipt: vi.fn().mockResolvedValue(undefined),
     abandonMutationIntent: vi.fn().mockResolvedValue(undefined),
     commitMutationCheckpoint: vi.fn().mockResolvedValue(undefined),
+    commitMutationCheckpoints: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -393,17 +396,29 @@ function makeActiveV2State(
     );
     if (index >= 0) state.mutationLedger.splice(index, 1);
   });
-  state.commitMutationCheckpoint = vi.fn(async (operationId) => {
-    const index = state.mutationLedger.findIndex(
-      (record) => record.intent.operationId === operationId,
-    );
-    if (index < 0 || !state.mutationLedger[index].receipt) {
-      throw new Error(`Mutation receipt missing: ${operationId}`);
+  const applyMutationCheckpoint = (operationIds: readonly string[]) => {
+    const records = operationIds.map((operationId) => {
+      const record = state.mutationLedger.find(
+        (candidate) => candidate.intent.operationId === operationId,
+      );
+      if (!record?.receipt) {
+        throw new Error(`Mutation receipt missing: ${operationId}`);
+      }
+      return record;
+    });
+    const sourceCommitSeq = envelope.meta.commitSeq;
+    for (const record of records) {
+      envelope = reduceFileStateEnvelopeV2(envelope, record as never);
     }
-    envelope = reduceFileStateEnvelopeV2(
-      envelope,
-      state.mutationLedger[index] as never,
-    );
+    if (records.length > 1) {
+      envelope = {
+        ...envelope,
+        meta: {
+          ...envelope.meta,
+          commitSeq: sourceCommitSeq + 1,
+        },
+      };
+    }
     commitSeq = envelope.meta.commitSeq;
     committedAt = envelope.meta.committedAt;
     const projection = projectStatePathViewV2(envelope);
@@ -415,7 +430,27 @@ function makeActiveV2State(
     state.remoteFolders = remoteFolders;
     state.remoteDeltaLink = projection.deltaLink;
     state.remoteScope = projection.scope;
-    state.mutationLedger.splice(index, 1);
+    const operationIdSet = new Set(operationIds);
+    state.mutationLedger.splice(
+      0,
+      state.mutationLedger.length,
+      ...state.mutationLedger.filter(
+        (record) => !operationIdSet.has(record.intent.operationId),
+      ),
+    );
+    return {
+      operations: records.length,
+      ancestorPublishMs: 0,
+      v2CommitMs: 0,
+      ledgerClearMs: 0,
+      totalMs: 0,
+    };
+  };
+  state.commitMutationCheckpoint = vi.fn(async (operationId) => {
+    return applyMutationCheckpoint([operationId]);
+  });
+  state.commitMutationCheckpoints = vi.fn(async (operationIds) => {
+    return applyMutationCheckpoint(operationIds);
   });
   state.attachManualMutationResolution = vi.fn(async (
     expectedRecord: MutationLedgerEntryV1,
@@ -1527,7 +1562,10 @@ describe("D7 read-only preview contract", () => {
 });
 
 describe("M17 circuit breaker retry semantics", () => {
-  function makeBreakerExecutor(mode: "manual" | "auto") {
+  function makeBreakerExecutor(
+    mode: "manual" | "auto",
+    pendingActionType = SyncActionType.Download,
+  ) {
     const downloadFile = vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3]).buffer);
     const remote: RemoteFileEntry = {
       path: "stuck.m4a",
@@ -1541,7 +1579,7 @@ describe("M17 circuit breaker retry semantics", () => {
     const mockState = makeActiveV2State([remote], [], {
       pendingIssues: [{
         path: remote.path,
-        actionType: SyncActionType.Download,
+        actionType: pendingActionType,
         reason: "syncView.failure.contentUnavailable",
         updatedAt: 1,
         fileSize: remote.size,
@@ -1602,6 +1640,19 @@ describe("M17 circuit breaker retry semantics", () => {
     expect(result.downloaded).toBe(0);
     expect(result.errors).toBe(1);
     expect(downloadFile).not.toHaveBeenCalled();
+  });
+
+  it("does not treat an earlier user-decision deferral as a transfer failure", async () => {
+    const { executor, downloadFile, mode } = makeBreakerExecutor(
+      "auto",
+      SyncActionType.FolderDeferred,
+    );
+
+    const result = await executor.run(mode, {});
+
+    expect(result.downloaded).toBe(1);
+    expect(result.errors).toBe(0);
+    expect(downloadFile).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -2112,11 +2163,11 @@ describe("Cloud baseline bootstrap safety", () => {
       undefined,
     );
     expect(writeBinary).toHaveBeenCalledWith(
-      ".obsidian/plugins/easy-sync/tmp/downloads/note.md.part.ready",
+      `${EASY_SYNC_TMP_DIR}/downloads/note.md.part.ready`,
       expect.any(ArrayBuffer),
     );
     expect(adapter.rename).toHaveBeenCalledWith(
-      ".obsidian/plugins/easy-sync/tmp/downloads/note.md.part.ready",
+      `${EASY_SYNC_TMP_DIR}/downloads/note.md.part.ready`,
       "note.md",
     );
     expect(await sha256Hex(files.get("note.md")!)).toBe(downloadedHash);
@@ -2199,7 +2250,7 @@ describe("Cloud baseline bootstrap safety", () => {
     Platform.isDesktop = !mobile;
     Platform.isAndroidApp = android;
     const path = "android-retry.md";
-    const readyPath = ".obsidian/plugins/easy-sync/tmp/downloads/android-retry.md.part.ready";
+    const readyPath = `${EASY_SYNC_TMP_DIR}/downloads/android-retry.md.part.ready`;
     const downloaded = new TextEncoder().encode("android temp retry").buffer;
     const downloadedHash = await sha256Hex(downloaded);
     const files = new Map<string, ArrayBuffer>();
@@ -2386,7 +2437,7 @@ describe("Cloud baseline bootstrap safety", () => {
       expect(downloadFileToPath).toHaveBeenCalledWith(
         "testVault",
         "recording.m4a",
-        ".obsidian/plugins/easy-sync/tmp/downloads/recording.m4a.part",
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
         expect.any(Object),
         undefined,
         "item-recording",
@@ -2396,7 +2447,7 @@ describe("Cloud baseline bootstrap safety", () => {
       );
       expect(downloadFile).not.toHaveBeenCalled();
       expect(rename).toHaveBeenCalledWith(
-        ".obsidian/plugins/easy-sync/tmp/downloads/recording.m4a.part",
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
         "recording.m4a",
       );
     } finally {
@@ -2528,11 +2579,11 @@ describe("File download failure isolation", () => {
     expect(result.downloaded).toBe(1);
     expect(downloadFile).toHaveBeenCalledTimes(2);
     expect(writeBinary).toHaveBeenCalledWith(
-      ".obsidian/plugins/easy-sync/tmp/downloads/second.md.part.ready",
+      `${EASY_SYNC_TMP_DIR}/downloads/second.md.part.ready`,
       content,
     );
     expect(adapter.rename).toHaveBeenCalledWith(
-      ".obsidian/plugins/easy-sync/tmp/downloads/second.md.part.ready",
+      `${EASY_SYNC_TMP_DIR}/downloads/second.md.part.ready`,
       "second.md",
     );
     expect(await sha256Hex(files.get("second.md")!)).toBe(contentHash);
@@ -2767,7 +2818,7 @@ describe("Download integrity gate", () => {
     expect(result.result.errors).toBe(1);
     expect(result.rename).not.toHaveBeenCalled();
     expect(result.remove).toHaveBeenCalledWith(
-      ".obsidian/plugins/easy-sync/tmp/downloads/large.bin.part",
+      `${EASY_SYNC_TMP_DIR}/downloads/large.bin.part`,
     );
     expect(result.state.recordMutationReceipt).not.toHaveBeenCalled();
   });
@@ -2794,7 +2845,7 @@ describe("Download integrity gate", () => {
     expect(result.result.errors).toBe(1);
     expect(result.rename).not.toHaveBeenCalled();
     expect(result.remove).toHaveBeenCalledWith(
-      ".obsidian/plugins/easy-sync/tmp/downloads/large.bin.part",
+      `${EASY_SYNC_TMP_DIR}/downloads/large.bin.part`,
     );
   });
 });
@@ -10273,7 +10324,7 @@ describe("Execute-time file race safety", () => {
 });
 
 describe("Bounded small-file upload concurrency", () => {
-  it("serializes file mutations until every intent has a durable receipt checkpoint", async () => {
+  it("checkpoints each independent small-upload wave after every receipt is durable", async () => {
     const smallContent = new ArrayBuffer(8);
     const smallHash = await sha256Hex(smallContent);
     const largeContent = new Uint8Array(9 * 1024 * 1024).fill(1).buffer;
@@ -10364,13 +10415,102 @@ describe("Bounded small-file upload concurrency", () => {
       cancelled: 0,
       skipped: 0,
       logicalBytes: largeContent.byteLength + smallContent.byteLength * smallEntries.length,
-      peakConcurrency: 1,
+      peakConcurrency: 3,
     });
-    expect(peakUploads).toBe(1);
+    expect(result.metrics?.mutationPersistence).toMatchObject({
+      intentWrites: 9,
+      receiptWrites: 9,
+      checkpointOperations: 9,
+      checkpointCommits: 5,
+      checkpointFailures: 0,
+    });
+    expect(
+      result.metrics?.mutationPersistence.stagesMs.checkpointTotal,
+    ).toBeGreaterThanOrEqual(0);
+    expect(peakUploads).toBe(3);
     expect(events.indexOf("start:large.bin")).toBeGreaterThan(events.indexOf("end:small-7.md"));
     expect(state.mutationLedger).toEqual([]);
     expect(state.remoteSnapshot).toHaveLength(localEntries.length);
     expect(state.baseSnapshot).toHaveLength(localEntries.length);
+  });
+
+  it("keeps every durable receipt when a shared upload checkpoint cannot commit", async () => {
+    const content = new ArrayBuffer(8);
+    const hash = await sha256Hex(content);
+    const localEntries = ["first.md", "second.md"].map(
+      (path, index): LocalFileEntry => ({
+        path,
+        hash,
+        size: content.byteLength,
+        mtime: index + 1,
+        binary: false,
+      }),
+    );
+    const uploadFile = vi.fn().mockImplementation(async (
+      _vault: string,
+      path: string,
+    ) => ({
+      id: `id:${path}`,
+      eTag: `etag:${path}`,
+      parentReference: { id: TEST_SYNC_SCOPE.filesRootId },
+    }));
+    const state = makeActiveV2State([], []);
+    const commitMutationCheckpoints = vi.fn().mockRejectedValue(
+      new Error("shared checkpoint failed"),
+    );
+    state.commitMutationCheckpoints = commitMutationCheckpoints;
+    const onFileComplete = vi.fn();
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ uploadFile }),
+      {
+        vault: {
+          adapter: makeMockAdapter({
+            readBinary: vi.fn().mockResolvedValue(content),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: localEntries,
+          folders: [],
+          folderScanComplete: true,
+          folderScanFailures: [],
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        scanFile: vi.fn().mockImplementation(async (path: string) =>
+          localEntries.find((entry) => entry.path === path) ?? null),
+        inspectFile: vi.fn().mockImplementation(async (path: string) => {
+          const entry = localEntries.find((candidate) => candidate.path === path);
+          return entry ? { status: "present", entry } : { status: "missing" };
+        }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", { onFileComplete });
+
+    expect(result.success).toBe(false);
+    expect(result.uploaded).toBe(2);
+    expect(result.errors).toBe(1);
+    expect(uploadFile).toHaveBeenCalledTimes(2);
+    expect(commitMutationCheckpoints).toHaveBeenCalledTimes(2);
+    expect(state.commitMutationCheckpoint).not.toHaveBeenCalled();
+    expect(state.mutationLedger).toHaveLength(2);
+    expect(state.mutationLedger.every((record) => record.receipt !== null)).toBe(true);
+    expect(result.metrics?.mutationPersistence).toMatchObject({
+      intentWrites: 2,
+      receiptWrites: 2,
+      checkpointOperations: 0,
+      checkpointCommits: 0,
+      checkpointFailures: 2,
+    });
+    expect(onFileComplete).toHaveBeenCalledTimes(2);
+    expect(onFileComplete.mock.calls.every((call) => call[2] === false)).toBe(true);
   });
 
   it("serializes concurrent state saves", async () => {
@@ -10635,6 +10775,92 @@ describe("Conservative desktop small-file download concurrency", () => {
       expect(state.mutationLedger).toEqual([]);
       expect(state.baseSnapshot).toHaveLength(remoteEntries.length);
       expect(localStore.files.size).toBe(remoteEntries.length);
+    } finally {
+      Platform.isMobile = previousMobile;
+    }
+  });
+
+  it("batches missing download URLs and hashless version checks without weakening verification", async () => {
+    const previousMobile = Platform.isMobile;
+    Platform.isMobile = false;
+    try {
+      const buffer = new Uint8Array(256 * 1024).fill(9).buffer;
+      const hash = await sha256Hex(buffer);
+      const remoteEntries = Array.from({ length: 6 }, (_, index): RemoteFileEntry => ({
+        path: `metadata-batch-${index}.bin`,
+        driveId: `metadata-id-${index}`,
+        parentId: TEST_SYNC_SCOPE.filesRootId,
+        size: buffer.byteLength,
+        mtime: index,
+        eTag: `metadata-etag-${index}`,
+        cTag: `metadata-ctag-${index}`,
+        ...(index < 2 ? { sha256Hash: hash } : {}),
+      }));
+      const remoteById = new Map(remoteEntries.map((entry) => [entry.driveId, entry]));
+      const getDriveItemMetadataByIds = vi.fn(async (ids: readonly string[]) =>
+        new Map(ids.map((id) => {
+          const remote = remoteById.get(id)!;
+          return [id, {
+            id,
+            name: remote.path,
+            size: remote.size,
+            eTag: remote.eTag,
+            cTag: remote.cTag,
+            file: {},
+            parentReference: { id: remote.parentId },
+            "@microsoft.graph.downloadUrl": `https://download.example/${id}`,
+          }];
+        })),
+      );
+      const downloadFile = vi.fn().mockResolvedValue(buffer.slice(0));
+      const localStore = makeDownloadLocalStore();
+      const state = makeActiveV2State(remoteEntries, []);
+      const executor = new SyncExecutor(
+        makeMockOneDrive({
+          downloadFile,
+          getDriveItemMetadataByIds,
+          hasDegradedDownloadPathThisRound: vi.fn().mockReturnValue(false),
+        }),
+        {
+          vault: {
+            adapter: localStore.adapter,
+            getFiles: vi.fn().mockReturnValue([]),
+            getName: vi.fn().mockReturnValue("testVault"),
+          },
+          scanAll: vi.fn().mockResolvedValue({
+            entries: [],
+            folders: [],
+            folderScanComplete: true,
+            folderScanFailures: [],
+            skippedLarge: [],
+            failedPaths: [],
+            skippedCount: 0,
+            complete: true,
+          }),
+          scanFile: vi.fn().mockResolvedValue(null),
+          inspectFile: localStore.inspectFile,
+          shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+        } as unknown as LocalScanner,
+        state,
+        "testVault",
+      );
+
+      const result = await executor.run("manual", {});
+
+      expect(result.downloaded).toBe(remoteEntries.length);
+      expect(result.errors).toBe(0);
+      expect(getDriveItemMetadataByIds).toHaveBeenCalledTimes(4);
+      expect(getDriveItemMetadataByIds.mock.calls.map((call) => call[1])).toEqual([
+        "downloadUrlRefresh",
+        "downloadVersionVerify",
+        "downloadUrlRefresh",
+        "downloadVersionVerify",
+      ]);
+      expect(downloadFile.mock.calls.slice(2).every((call) =>
+        typeof call[2] === "string" && call[2].startsWith("https://download.example/"),
+      )).toBe(true);
+      expect(state.mutationLedger).toEqual([]);
+      expect(state.baseSnapshot).toHaveLength(remoteEntries.length);
     } finally {
       Platform.isMobile = previousMobile;
     }
@@ -12759,7 +12985,7 @@ describe("S1a — sync run phase observability", () => {
       "execute",
       "sync file transfer summary",
       expect.objectContaining({
-        schemaVersion: 2,
+        schemaVersion: 3,
         platform: expect.stringMatching(/^(desktop|mobile)$/),
         upload: expect.objectContaining({
           stagesMs: expect.objectContaining({
@@ -12775,6 +13001,20 @@ describe("S1a — sync run phase observability", () => {
             remoteVersionVerify: expect.any(Number),
             localVersionGuard: expect.any(Number),
             localCommit: expect.any(Number),
+          }),
+        }),
+        mutationPersistence: expect.objectContaining({
+          intentWrites: expect.any(Number),
+          receiptWrites: expect.any(Number),
+          checkpointOperations: expect.any(Number),
+          checkpointCommits: expect.any(Number),
+          checkpointFailures: expect.any(Number),
+          stagesMs: expect.objectContaining({
+            intentPersist: expect.any(Number),
+            receiptPersist: expect.any(Number),
+            checkpointV2Commit: expect.any(Number),
+            checkpointLedgerClear: expect.any(Number),
+            checkpointTotal: expect.any(Number),
           }),
         }),
       }),

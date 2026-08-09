@@ -1021,11 +1021,43 @@ describe("plugin data cold-start cache", () => {
     expect(clampedPlugin.autoSyncChangeDelaySeconds).toBe(10);
     expect(clampedSave).not.toHaveBeenCalled();
 
-    clampedPlugin.setAutoSyncChangeDelaySeconds(1);
+    const disabledPlugin = new EasySyncPlugin();
+    vi.spyOn(disabledPlugin, "loadData").mockResolvedValue({
+      "auto-sync-change-delay-seconds": 0,
+    });
+
+    await disabledPlugin.loadSyncSettings();
+
+    expect(disabledPlugin.autoSyncChangeDelaySeconds).toBe(0);
+
+    clampedPlugin.setAutoSyncChangeDelaySeconds(0);
     await clampedPlugin.saveSyncSettings();
     expect(clampedSave).toHaveBeenCalledWith(expect.objectContaining({
-      "auto-sync-change-delay-seconds": 1,
+      "auto-sync-change-delay-seconds": 0,
     }));
+  });
+
+  it("keeps an explicit community-plugin join working when local-change sync is off", async () => {
+    vi.useFakeTimers();
+    try {
+      const plugin = new EasySyncPlugin();
+      const runAutomaticSync = vi.spyOn(
+        plugin as never,
+        "runAutomaticSync",
+      ).mockResolvedValue(true);
+      plugin.setAutoSyncChangeDelaySeconds(0);
+      const scheduler = plugin as unknown as {
+        scheduleCommunityPluginJoinSync(trigger?: string): void;
+      };
+
+      scheduler.scheduleCommunityPluginJoinSync("explicit-switch");
+      await vi.advanceTimersByTimeAsync(7_000);
+
+      expect(runAutomaticSync).toHaveBeenCalledOnce();
+      expect(runAutomaticSync).toHaveBeenCalledWith("dirty");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("migrates public booleans to outer switches with retained default-all policies", async () => {

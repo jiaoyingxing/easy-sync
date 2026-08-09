@@ -83,6 +83,14 @@ export function formatDiagnosticAutomaticSyncSummary(input: {
       "**修改后触发同步**: 未启用（自动同步已关闭）",
     ];
   }
+  if (input.changeDelaySeconds <= 0) {
+    return [
+      `**自动同步**: ${input.paused
+        ? "已暂停"
+        : `运行中（每 ${input.intervalMinutes} 分钟）`}`,
+      "**修改后触发同步**: 已关闭",
+    ];
+  }
   return [
     `**自动同步**: ${input.paused
       ? "已暂停"

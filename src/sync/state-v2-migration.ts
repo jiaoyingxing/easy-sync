@@ -539,25 +539,13 @@ export async function readStateV2Manifest(
       "V2 state manifest is unreadable",
     );
   }
-  if (!isManifest(value)) {
+  if (!isStateV2Manifest(value)) {
     throw new StateV2ManifestLoadError(
       "manifest-unsupported",
       "V2 state manifest has an unsupported format",
     );
   }
   return value;
-}
-
-export function v1BackupCleanupAllowed(input: {
-  desktopHealthy: boolean;
-  mobileHealthy: boolean;
-  cloudBootstrapV2Published: boolean;
-  recoveryJournalsEmpty: boolean;
-}): boolean {
-  return input.desktopHealthy
-    && input.mobileHealthy
-    && input.cloudBootstrapV2Published
-    && input.recoveryJournalsEmpty;
 }
 
 async function publishManifest(
@@ -1135,13 +1123,13 @@ function makeAnchor(
   };
 }
 
-function isManifest(value: unknown): value is StateV2Manifest {
+export function isStateV2Manifest(value: unknown): value is StateV2Manifest {
   return isRecord(value)
     && value.schemaVersion === 2
     && value.activeState === "state-v2.json"
     && Number.isSafeInteger(value.stateCommitSeq) && (value.stateCommitSeq as number) >= 1
     && Number.isSafeInteger(value.lifecycleEpoch) && (value.lifecycleEpoch as number) >= 0
     && isSyncScope(value.scope)
-    && typeof value.migratedAt === "number"
+    && Number.isFinite(value.migratedAt)
     && value.legacyAutoSyncAllowed === false;
 }

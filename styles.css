@@ -1114,6 +1114,18 @@ body:not(.is-mobile) .easy-sync-view-content {
   font-size: var(--font-ui-smaller);
 }
 
+.easy-sync-plan-virtual-list {
+  position: relative;
+  min-width: 0;
+}
+
+.easy-sync-plan-virtual-window {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+}
+
 .easy-sync-history-omitted,
 .easy-sync-empty-state {
   padding: 2px 4px;

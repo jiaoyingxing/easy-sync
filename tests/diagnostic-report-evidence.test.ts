@@ -59,6 +59,17 @@ describe("diagnostic report evidence", () => {
       "**自动同步**: 运行中（每 3 分钟）",
       "**修改后触发同步**: 本地变化后等待 7 秒（已有待处理变化）/ 当前状态：同步中",
     ]);
+
+    expect(formatDiagnosticAutomaticSyncSummary({
+      intervalMinutes: 3,
+      paused: false,
+      changeDelaySeconds: 0,
+      dirtyPending: false,
+      activity: "空闲",
+    })).toEqual([
+      "**自动同步**: 运行中（每 3 分钟）",
+      "**修改后触发同步**: 已关闭",
+    ]);
   });
 
   it("projects every file and folder action count for the diagnostic history table", () => {

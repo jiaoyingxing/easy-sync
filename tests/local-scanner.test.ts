@@ -73,6 +73,9 @@ function makeScanner(
         ".obsidian/plugins/easy-sync/logs",
         ".obsidian/plugins/easy-sync/tmp",
         ".obsidian/plugins/easy-sync/ancestors-v2",
+        ".obsidian/plugins/easy-sync/state",
+        ".obsidian/plugins/easy-sync/objects",
+        ".obsidian/plugins/easy-sync/runtime",
       ],
     },
     ".obsidian/plugins/easy-sync/logs": {
@@ -86,6 +89,21 @@ function makeScanner(
     ".obsidian/plugins/easy-sync/ancestors-v2": {
       files: [`.obsidian/plugins/easy-sync/ancestors-v2/${"a".repeat(64)}.txt`],
       folders: [],
+    },
+    ".obsidian/plugins/easy-sync/state": {
+      files: [],
+      folders: [
+        ".obsidian/plugins/easy-sync/state/legacy",
+        ".obsidian/plugins/easy-sync/state/v2",
+      ],
+    },
+    ".obsidian/plugins/easy-sync/objects": {
+      files: [],
+      folders: [".obsidian/plugins/easy-sync/objects/ancestors-v2"],
+    },
+    ".obsidian/plugins/easy-sync/runtime": {
+      files: [],
+      folders: [".obsidian/plugins/easy-sync/runtime/cache"],
     },
   };
 
@@ -196,6 +214,9 @@ describe("LocalScanner plugin config paths", () => {
     );
     expect(adapter.list).not.toHaveBeenCalledWith(".obsidian/plugins/easy-sync/logs");
     expect(adapter.list).not.toHaveBeenCalledWith(".obsidian/plugins/easy-sync/tmp");
+    expect(adapter.list).not.toHaveBeenCalledWith(".obsidian/plugins/easy-sync/state");
+    expect(adapter.list).not.toHaveBeenCalledWith(".obsidian/plugins/easy-sync/objects");
+    expect(adapter.list).not.toHaveBeenCalledWith(".obsidian/plugins/easy-sync/runtime");
     expect(adapter.list).not.toHaveBeenCalledWith(".obsidian/plugins/example-plugin/runtime");
     expect(adapter.list).toHaveBeenCalledTimes(3);
   });

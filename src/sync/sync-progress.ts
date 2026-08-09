@@ -295,7 +295,7 @@ export class SyncProgressStore {
   }
 }
 
-function isSuccessfulFileProgress(file: FileProgress): boolean {
+export function isSuccessfulFileProgress(file: FileProgress): boolean {
   return file.status === "upload"
     || file.status === "download"
     || file.status === "folder"

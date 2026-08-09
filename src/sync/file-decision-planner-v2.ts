@@ -15,7 +15,6 @@
 import { isEasySyncSelfSyncFilePath } from "../obsidian-compat";
 
 import {
-  CHANGE_THRESHOLD_RATIO,
   type BaseFileEntry,
   type LocalFileEntry,
   type RemoteFileEntry,
@@ -429,28 +428,6 @@ export function orderSyncPlanItemsV2(
     (left, right) =>
       (priority[left.type] ?? 99) - (priority[right.type] ?? 99),
   );
-}
-
-export function shouldPauseFilePlanForConfirmationV2(
-  plan: SyncPlan,
-): boolean {
-  if (plan.lastTotalFiles === 0) return false;
-
-  const changeCount = plan.items.reduce(
-    (count, item) =>
-      item.type !== SyncActionType.SkipLargeFile
-      && item.type !== SyncActionType.SkipIgnoredPath
-      && item.type !== SyncActionType.RetryLater
-      && item.type !== SyncActionType.FolderDeferred
-      && item.type !== SyncActionType.RenameRemote
-      && item.type !== SyncActionType.Conflict
-      && item.type !== SyncActionType.ConfirmLocalDelete
-        ? count + Math.max(1, item.reviewImpactCount ?? 1)
-        : count,
-    0,
-  );
-
-  return changeCount / plan.lastTotalFiles > CHANGE_THRESHOLD_RATIO;
 }
 
 function remoteVersionMatchesBase(

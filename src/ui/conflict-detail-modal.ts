@@ -103,7 +103,7 @@ export class ConflictDetailModal extends FileComparisonModal {
       : { kind: "reason" });
 
     // ---- Metadata table ----
-    this.renderMetadata(body, t);
+    this.renderMetadata(t);
 
     body.createEl("hr");
 
@@ -287,7 +287,6 @@ export class ConflictDetailModal extends FileComparisonModal {
 
   /** Render the metadata comparison table */
   private renderMetadata(
-    container: HTMLElement,
     t: (key: string, params?: Record<string, string | number>) => string,
   ): void {
     const localTime = this.item.local?.mtime

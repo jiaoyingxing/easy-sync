@@ -112,6 +112,7 @@ import {
 import {
   AutoSyncDirtyHint,
   DEFAULT_AUTO_SYNC_CHANGE_DELAY_SECONDS,
+  LOCAL_DIRTY_DEBOUNCE_MS,
   normalizeAutoSyncChangeDelaySeconds,
 } from "./sync/auto-sync-dirty-hint";
 import {
@@ -609,6 +610,7 @@ export default class EasySyncPlugin extends Plugin {
       loadData: () => this.loadPluginData(),
       updatePluginData: (mutator) => this.updatePluginData(mutator),
       app: this.app,
+      layoutMigrationStorage: this.app,
       manifest: this.manifest,
       ...(indexedDbVaultInstanceId
         ? {
@@ -3007,7 +3009,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private markLocalDirtyHint(path: string, oldPath?: string): void {
-    if (this.syncInterval <= 0 || this.autoSyncPaused) return;
+    if (!this.canScheduleLocalChangeAutoSync()) return;
     const currentIncluded = this.scanner?.shouldSyncPath(path) === true;
     const previousIncluded = oldPath !== undefined
       && this.scanner?.shouldSyncPath(oldPath) === true;
@@ -3021,7 +3023,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private markLocalDirtyFolderHint(path: string, oldPath?: string): void {
-    if (this.syncInterval <= 0 || this.autoSyncPaused) return;
+    if (!this.canScheduleLocalChangeAutoSync()) return;
     const currentIncluded =
       this.scanner?.shouldSyncFolderPath(path) === true;
     const previousIncluded = oldPath !== undefined
@@ -3526,9 +3528,23 @@ export default class EasySyncPlugin extends Plugin {
     this.startAutoSync();
   }
 
+  private canScheduleLocalChangeAutoSync(): boolean {
+    return this.syncInterval > 0
+      && !this.autoSyncPaused
+      && this.autoSyncChangeDelaySeconds > 0;
+  }
+
   setAutoSyncChangeDelaySeconds(value: unknown): void {
     this.autoSyncChangeDelaySeconds =
       normalizeAutoSyncChangeDelaySeconds(value);
+    if (this.autoSyncChangeDelaySeconds === 0) {
+      this.autoSyncDirtyHint.cancel();
+      this.autoSyncDirtyHint.setDelayMs(LOCAL_DIRTY_DEBOUNCE_MS);
+      this.schedulePersistedCommunityPluginJoinSync(
+        "local-change-trigger-disabled",
+      );
+      return;
+    }
     this.autoSyncDirtyHint.setDelayMs(
       this.autoSyncChangeDelaySeconds * 1_000,
     );
@@ -4460,8 +4476,7 @@ export default class EasySyncPlugin extends Plugin {
     );
     if (
       planned.autoParticipatedPluginIds.length > 0
-      && this.syncInterval > 0
-      && !this.autoSyncPaused
+      && this.canScheduleLocalChangeAutoSync()
       && this.autoSyncDirtyHint.mark()
     ) {
       this.diag.log(
@@ -5223,7 +5238,10 @@ export default class EasySyncPlugin extends Plugin {
         : 0,
       pending: communityPluginEnablementState?.pending.length ?? 0,
     });
-    const { pluginDir } = getEasySyncPaths(this.app.vault, this.manifest.id);
+    const { pluginDir, storageLayoutVersion } = getEasySyncPaths(
+      this.app.vault,
+      this.manifest.id,
+    );
     let buildFingerprint = "不可用";
     try {
       const mainPath = `${pluginDir}/main.js`;
@@ -5341,6 +5359,7 @@ export default class EasySyncPlugin extends Plugin {
     lines.push("## 技术状态证据");
     lines.push("");
     lines.push(`**构筑物指纹**: ${buildFingerprint}`);
+    lines.push(`**本地存储布局**: v${storageLayoutVersion}`);
     lines.push(
       `**同步状态权威**: ${v2StateLoadBlock
         ? `${v2StateLoadBlock.authority}（加载受阻：${v2StateLoadBlock.reason}）`

@@ -23,6 +23,7 @@ import {
 import {
   type FileProgress,
   isAnySyncActivityRunning,
+  isSuccessfulFileProgress,
   type SyncProgressState,
 } from "../sync/sync-progress";
 import type { PendingIssue, SyncHistoryEntry } from "../sync/state-manager";
@@ -96,7 +97,7 @@ export interface SyncViewContentKeyInput {
   pendingDeletes: SyncPlanItem[];
   communityPluginEnablementPending: number;
   planReviewCounts: { uploads: number; downloads: number; folders?: number; deletes: number; conflicts: number; skipped: number } | null;
-  planReviewItems: PlanReviewItem[];
+  planReviewRevision: number;
   history: SyncHistoryEntry[];
   lastSyncTime: number;
   mutationRecovery: MutationRecoveryDisplayState | null;
@@ -257,6 +258,83 @@ export interface SyncPlanDisplayGroup {
   items: PlanReviewItem[];
 }
 
+export function shouldAutoRebuildPlanReview(
+  counts: SyncViewContentKeyInput["planReviewCounts"],
+  items: readonly PlanReviewItem[],
+): boolean {
+  if (!counts || items.length > 0) return false;
+  return counts.uploads
+    + counts.downloads
+    + (counts.folders ?? 0)
+    + counts.deletes
+    + counts.conflicts
+    + counts.skipped > 0;
+}
+
+export const SYNC_PLAN_VIRTUAL_OVERSCAN = 6;
+
+export function buildSyncPlanVirtualOffsets(
+  items: readonly Pick<PlanReviewItem, "reason">[],
+  rowHeight: number,
+  reasonRowHeight: number,
+): number[] {
+  const safeRowHeight = Math.max(1, rowHeight);
+  const safeReasonRowHeight = Math.max(safeRowHeight, reasonRowHeight);
+  const offsets = [0];
+  for (const item of items) {
+    offsets.push(
+      offsets[offsets.length - 1]
+      + (item.reason ? safeReasonRowHeight : safeRowHeight),
+    );
+  }
+  return offsets;
+}
+
+export function buildSyncPlanVirtualWindow(input: Readonly<{
+  offsets: readonly number[];
+  listTop: number;
+  viewportTop: number;
+  viewportBottom: number;
+  overscan?: number;
+}>): { start: number; end: number; offset: number; totalHeight: number } {
+  const itemCount = Math.max(0, input.offsets.length - 1);
+  const overscan = Math.max(0, Math.trunc(input.overscan ?? SYNC_PLAN_VIRTUAL_OVERSCAN));
+  const totalHeight = input.offsets[itemCount] ?? 0;
+  const visibleTop = Math.max(0, input.viewportTop - input.listTop);
+  const visibleBottom = Math.min(totalHeight, input.viewportBottom - input.listTop);
+  if (itemCount === 0 || visibleBottom <= 0 || visibleTop >= totalHeight) {
+    return { start: 0, end: 0, offset: 0, totalHeight };
+  }
+  let start = 0;
+  let startUpper = itemCount;
+  while (start < startUpper) {
+    const middle = Math.floor((start + startUpper) / 2);
+    if ((input.offsets[middle + 1] ?? totalHeight) <= visibleTop) {
+      start = middle + 1;
+    } else {
+      startUpper = middle;
+    }
+  }
+  let end = start;
+  let endUpper = itemCount;
+  while (end < endUpper) {
+    const middle = Math.floor((end + endUpper) / 2);
+    if ((input.offsets[middle] ?? 0) < visibleBottom) {
+      end = middle + 1;
+    } else {
+      endUpper = middle;
+    }
+  }
+  start = Math.max(0, start - overscan);
+  end = Math.min(itemCount, end + overscan);
+  return {
+    start,
+    end,
+    offset: input.offsets[start] ?? 0,
+    totalHeight,
+  };
+}
+
 export function buildSyncPlanDisplayGroups(
   items: readonly PlanReviewItem[],
 ): SyncPlanDisplayGroup[] {
@@ -272,9 +350,7 @@ export function buildSyncPlanDisplayGroups(
       group: presentation.group,
       labelKey: presentation.groupLabelKey,
       order: presentation.groupOrder,
-      open: presentation.group !== "upload"
-        && presentation.group !== "deferred"
-        && presentation.group !== "skip",
+      open: false,
       items: [item],
     });
   }
@@ -309,6 +385,19 @@ export function formatSyncHistoryCounts(
     .filter(([, count]) => count > 0)
     .map(([key, count]) => `${t(key)} ${count}`)
     .join(" · ");
+}
+
+export function countOmittedSyncHistorySuccessfulFiles(
+  entry: SyncHistoryEntry,
+): number {
+  const successfulActionTotal = entry.uploaded + entry.downloaded
+    + (entry.filesMoved ?? 0) + (entry.foldersCreated ?? 0)
+    + (entry.foldersMoved ?? 0) + (entry.foldersDeleted ?? 0)
+    + entry.deleted;
+  const retainedSuccessfulTotal = entry.files
+    .filter(isSuccessfulFileProgress)
+    .length;
+  return Math.max(0, successfulActionTotal - retainedSuccessfulTotal);
 }
 
 export function resolveFileProgressPresentation(
@@ -463,10 +552,7 @@ export function buildSyncViewContentKey(
     const counts = input.planReviewCounts
       ? `${input.planReviewCounts.uploads},${input.planReviewCounts.downloads},${input.planReviewCounts.folders ?? 0},${input.planReviewCounts.deletes},${input.planReviewCounts.conflicts},${input.planReviewCounts.skipped}`
       : "";
-    const items = input.planReviewItems
-      .map((item) => `${item.type}:${item.path}:${item.reason ?? ""}`)
-      .join("|");
-    return `plan:${authKey}:${runKey}:${recoveryKey}:${counts}:${items}:${historyKey}`;
+    return `plan:${authKey}:${runKey}:${recoveryKey}:${counts}:revision:${input.planReviewRevision}:${historyKey}`;
   }
   if (input.bodyMode === "progress") {
     const scopeRecovery = input.progress.recoveryVerification;
@@ -542,6 +628,11 @@ export class EasySyncSyncView extends ItemView {
   plugin: EasySyncPlugin;
   private historyExpanded = false;
   private allCollapsed = false;
+  private planGroupsCollapsed = true;
+  private planExpandedGroups = new Set<SyncActionGroup>();
+  private renderedBodyMode: SyncViewBodyMode = "idle";
+  private renderedPlanReviewRevision = -1;
+  private autoRebuiltPlanReviewRevision = -1;
   // P0: incremental render — frame merging + diffed file list
   private renderFrameId: AnimationFrameHandle | null = null;
   private lastContentKey: string | null = null;
@@ -552,6 +643,8 @@ export class EasySyncSyncView extends ItemView {
   private fileListEl: HTMLElement | null = null;
   private completedFilesRenderKey: string | null = null;
   private pathLayoutFrameId: AnimationFrameHandle | null = null;
+  private planViewportFrameId: AnimationFrameHandle | null = null;
+  private planVirtualRenderers = new Set<() => void>();
   private pathLayoutObserver: ResizeObserver | null = null;
   private pathLayoutObservedWidth = -1;
   private statusLineEl: HTMLElement | null = null;
@@ -593,12 +686,18 @@ export class EasySyncSyncView extends ItemView {
       true,
     );
     window.addEventListener("resize", this.handlePathLayoutResize);
+    this.contentEl.ownerDocument.addEventListener(
+      "scroll",
+      this.handlePlanViewportScroll,
+      true,
+    );
     if (typeof ResizeObserver !== "undefined") {
       this.pathLayoutObserver = new ResizeObserver((entries) => {
         const width = entries[0]?.contentRect.width ?? -1;
         if (Math.abs(width - this.pathLayoutObservedWidth) < 0.5) return;
         this.pathLayoutObservedWidth = width;
         this.scheduleAdaptivePathLayout();
+        this.schedulePlanViewportRender();
       });
       this.pathLayoutObserver.observe(this.contentEl);
     }
@@ -614,6 +713,11 @@ export class EasySyncSyncView extends ItemView {
       compatCancelAnimationFrame(this.pathLayoutFrameId);
       this.pathLayoutFrameId = null;
     }
+    if (this.planViewportFrameId !== null) {
+      compatCancelAnimationFrame(this.planViewportFrameId);
+      this.planViewportFrameId = null;
+    }
+    this.planVirtualRenderers.clear();
     this.pathLayoutObserver?.disconnect();
     this.pathLayoutObserver = null;
     this.contentEl.removeEventListener(
@@ -622,6 +726,11 @@ export class EasySyncSyncView extends ItemView {
       true,
     );
     window.removeEventListener("resize", this.handlePathLayoutResize);
+    this.contentEl.ownerDocument.removeEventListener(
+      "scroll",
+      this.handlePlanViewportScroll,
+      true,
+    );
   }
 
   private readonly handlePathLayoutToggle = (): void => {
@@ -630,7 +739,20 @@ export class EasySyncSyncView extends ItemView {
 
   private readonly handlePathLayoutResize = (): void => {
     this.scheduleAdaptivePathLayout();
+    this.schedulePlanViewportRender();
   };
+
+  private readonly handlePlanViewportScroll = (): void => {
+    this.schedulePlanViewportRender();
+  };
+
+  private schedulePlanViewportRender(): void {
+    if (this.planViewportFrameId !== null) return;
+    this.planViewportFrameId = compatRequestAnimationFrame(() => {
+      this.planViewportFrameId = null;
+      for (const renderWindow of this.planVirtualRenderers) renderWindow();
+    });
+  }
 
   /** Public entry point — merges multiple calls within the same animation frame. */
   render(): void {
@@ -679,6 +801,33 @@ export class EasySyncSyncView extends ItemView {
       pendingCount,
       sideActionResultsVisible,
     });
+    let preservedPlanScrollTop = this.renderedBodyMode === "plan"
+      && bodyMode === "plan"
+      ? container.querySelector<HTMLElement>(".easy-sync-view-content")?.scrollTop ?? null
+      : null;
+    if (bodyMode === "plan" && syncState) {
+      if (this.renderedPlanReviewRevision !== syncState.planReviewRevision) {
+        this.planGroupsCollapsed = true;
+        this.planExpandedGroups.clear();
+        preservedPlanScrollTop = null;
+        this.renderedPlanReviewRevision = syncState.planReviewRevision;
+      }
+    }
+    this.renderedBodyMode = bodyMode;
+    const planReviewCounts = syncState?.planReviewCounts ?? null;
+    const planReviewItems = bodyMode === "plan"
+      ? syncState?.planReviewItems ?? []
+      : [];
+    if (
+      bodyMode === "plan"
+      && syncState
+      && shouldAutoRebuildPlanReview(planReviewCounts, planReviewItems)
+      && this.autoRebuiltPlanReviewRevision !== syncState.planReviewRevision
+      && !(this.plugin.syncExecutor?.isRunning ?? false)
+    ) {
+      this.autoRebuiltPlanReviewRevision = syncState.planReviewRevision;
+      void this.plugin.rebuildPlanReview();
+    }
 
     // Phase change or not running → full rebuild
     const statusState: StatusPanelState = {
@@ -708,14 +857,19 @@ export class EasySyncSyncView extends ItemView {
       conflicts,
       pendingDeletes,
       communityPluginEnablementPending,
-      planReviewCounts: syncState?.planReviewCounts ?? null,
-      planReviewItems: syncState?.planReviewItems ?? [],
+      planReviewCounts,
+      planReviewRevision: syncState?.planReviewRevision ?? 0,
       history: syncState?.syncHistory ?? [],
       lastSyncTime: syncState?.lastSyncTime ?? 0,
       mutationRecovery,
     });
 
     if (this.lastContentKey !== contentKey) {
+      this.planVirtualRenderers.clear();
+      if (this.planViewportFrameId !== null) {
+        compatCancelAnimationFrame(this.planViewportFrameId);
+        this.planViewportFrameId = null;
+      }
       this.progressPanelEl = null;
       this.progressFillEl = null;
       this.progressSubtitleEl = null;
@@ -740,8 +894,8 @@ export class EasySyncSyncView extends ItemView {
       if (bodyMode === "plan" && syncState) {
         this.renderPlanReviewSection(
           content,
-          syncState.planReviewCounts,
-          syncState.planReviewItems,
+          planReviewCounts,
+          planReviewItems,
           conflicts,
           pendingDeletes,
         );
@@ -762,8 +916,12 @@ export class EasySyncSyncView extends ItemView {
         this.renderHistorySection(content, syncState?.syncHistory ?? []);
       }
 
-      // ponytail: re-apply collapsed state after full rebuild — fresh DOM has all <details> closed
+      // Re-apply the toolbar state while retaining groups the user opened in
+      // this exact reviewed revision.
       this.toggleAllDetails();
+      if (preservedPlanScrollTop !== null) {
+        content.scrollTop = preservedPlanScrollTop;
+      }
     } else {
       // Same visible content — keep DOM, only patch the bits that changed.
       this.updateStatusPanel(statusState);
@@ -914,24 +1072,44 @@ export class EasySyncSyncView extends ItemView {
 
   private renderCollapseToggle(container: HTMLElement): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    const icon = this.allCollapsed ? "chevrons-up-down" : "chevrons-down-up";
-    const label = this.allCollapsed ? t("syncView.expandAll") : t("syncView.collapseAll");
+    const isCollapsed = this.areAllDetailsCollapsed();
+    const icon = isCollapsed ? "chevrons-up-down" : "chevrons-down-up";
+    const label = isCollapsed ? t("syncView.expandAll") : t("syncView.collapseAll");
 
     const button = this.createIconButton(container, icon, label, () => {
-      this.allCollapsed = !this.allCollapsed;
+      if (this.renderedBodyMode === "plan") {
+        this.planGroupsCollapsed = !this.planGroupsCollapsed;
+        if (this.planGroupsCollapsed) this.planExpandedGroups.clear();
+      } else {
+        this.allCollapsed = !this.allCollapsed;
+      }
       this.toggleAllDetails();
-      const newIcon = this.allCollapsed ? "chevrons-up-down" : "chevrons-down-up";
-      const newLabel = this.allCollapsed ? t("syncView.expandAll") : t("syncView.collapseAll");
+      const collapsed = this.areAllDetailsCollapsed();
+      const newIcon = collapsed ? "chevrons-up-down" : "chevrons-down-up";
+      const newLabel = collapsed ? t("syncView.expandAll") : t("syncView.collapseAll");
       setIcon(button, newIcon);
       setTooltip(button, newLabel);
       button.ariaLabel = newLabel;
     });
   }
 
+  private areAllDetailsCollapsed(): boolean {
+    return this.renderedBodyMode === "plan"
+      ? this.planGroupsCollapsed
+      : this.allCollapsed;
+  }
+
   private toggleAllDetails(): void {
     const details = this.contentEl.querySelectorAll<HTMLDetailsElement>(".easy-sync-tree-item");
-    if (this.allCollapsed) {
+    if (this.areAllDetailsCollapsed()) {
+      const expandedPlanGroups = new Set(this.planExpandedGroups);
       for (const d of details) d.removeAttribute("open");
+      if (this.renderedBodyMode === "plan") {
+        for (const d of details) {
+          const group = d.dataset.easySyncPlanGroup as SyncActionGroup | undefined;
+          if (group && expandedPlanGroups.has(group)) d.setAttribute("open", "");
+        }
+      }
     } else {
       for (const d of details) d.setAttribute("open", "");
     }
@@ -983,9 +1161,17 @@ export class EasySyncSyncView extends ItemView {
         .setButtonText(t("syncView.conflict.processing"))
         .setDisabled(true);
     } else if (state.isLoggedIn && state.planReviewActive) {
+      const reviewKind = this.plugin.state?.planReviewAuthorization?.reviewKind;
       new ButtonComponent(actions)
-        .setButtonText(t("command.syncNow"))
-        .setDisabled(true);
+        .setButtonText(t(
+          reviewKind === "v2-migration"
+            ? "syncPlan.confirmMigration"
+            : "syncPlan.confirmExecute",
+        ))
+        .setCta()
+        .onClick(() => {
+          void this.plugin.executePlanReview();
+        });
     } else if (state.isLoggedIn) {
       new ButtonComponent(actions)
         .setButtonText(t(
@@ -1634,13 +1820,7 @@ export class EasySyncSyncView extends ItemView {
       if (entry.files.length > 0) {
         this.renderFileResults(body, entry.files, false);
       }
-      const retainedTotal = entry.files.length;
-      const actionTotal = entry.uploaded + entry.downloaded + (entry.filesMoved ?? 0)
-        + (entry.foldersCreated ?? 0) + (entry.foldersMoved ?? 0)
-        + (entry.foldersDeleted ?? 0) + entry.deleted
-        + entry.conflicts + entry.skipped
-        + (entry.recovery ? 0 : entry.errors);
-      const omitted = Math.max(0, actionTotal - retainedTotal);
+      const omitted = countOmittedSyncHistorySuccessfulFiles(entry);
       if (omitted > 0) {
         body.createDiv("easy-sync-history-omitted").setText(
           t("syncView.history.omitted", { count: omitted }),
@@ -1717,23 +1897,6 @@ export class EasySyncSyncView extends ItemView {
       panel.createDiv("easy-sync-empty-state").setText(t("syncPlan.detailsUnavailable"));
     }
 
-    const actions = panel.createDiv("easy-sync-plan-execute");
-    new ButtonComponent(actions)
-      .setButtonText(t("syncPlan.recalculate"))
-      .onClick(() => {
-        void this.plugin.rebuildPlanReview();
-      });
-    new ButtonComponent(actions)
-      .setButtonText(t(
-        activationReviewKind === "v2-migration"
-          ? "syncPlan.confirmMigration"
-          : "syncPlan.confirmExecute",
-      ))
-      .setCta()
-      .setDisabled(this.plugin.syncExecutor?.isRunning ?? false)
-      .onClick(() => {
-        void this.plugin.executePlanReview();
-      });
   }
 
   private renderPlanGroups(
@@ -1748,30 +1911,150 @@ export class EasySyncSyncView extends ItemView {
     const groups = buildSyncPlanDisplayGroups(items);
 
     for (const group of groups) {
+      const open = !this.planGroupsCollapsed
+        || this.planExpandedGroups.has(group.group);
       const body = this.createTreeGroup(
         container,
         t(group.labelKey),
         group.items.length,
-        group.open,
+        open,
       );
       body.addClass("easy-sync-path-layout");
-      for (const item of group.items) {
-        if (item.type === SyncActionType.Conflict && conflictByPath.has(item.path)) {
-          this.renderConflictItem(body, conflictByPath.get(item.path)!);
-        } else if (item.type === SyncActionType.ConfirmLocalDelete && deleteByPath.has(item.path)) {
-          this.renderDeleteItem(body, deleteByPath.get(item.path)!);
-        } else {
-          const action = resolveSyncActionPresentation(item.type);
-          const row = body.createDiv("easy-sync-file-row");
-          const icon = row.createSpan("easy-sync-file-icon");
-          setIcon(icon, action.icon);
-          const pathEl = row.createSpan("easy-sync-file-path");
-          configureFilePath(row, pathEl, item.path, true);
-          if (item.reason) {
-            row.createDiv("easy-sync-file-reason").setText(t(item.reason));
+      const details = body.parentElement as HTMLDetailsElement;
+      details.dataset.easySyncPlanGroup = group.group;
+      details.addEventListener("toggle", () => {
+        if (details.open) this.planExpandedGroups.add(group.group);
+        else this.planExpandedGroups.delete(group.group);
+      });
+      const hasInlineDecisions = group.items.some((item) =>
+        item.type === SyncActionType.Conflict
+        || item.type === SyncActionType.ConfirmLocalDelete);
+      if (hasInlineDecisions) {
+        let rendered = false;
+        const renderInlineDecisions = (): void => {
+          if (!details.open || rendered) return;
+          rendered = true;
+          for (const item of group.items) {
+            this.renderPlanReviewItem(body, item, conflictByPath, deleteByPath);
           }
-        }
+          this.scheduleAdaptivePathLayout();
+        };
+        details.addEventListener("toggle", renderInlineDecisions);
+        renderInlineDecisions();
+        continue;
       }
+
+      const virtualList = body.createDiv("easy-sync-plan-virtual-list");
+      let virtualOffsets: number[] | null = null;
+      let renderedKey = "";
+      const renderWindow = (): void => {
+        if (!details.open) {
+          if (renderedKey) virtualList.empty();
+          renderedKey = "";
+          return;
+        }
+        if (!virtualOffsets) {
+          const rowHeights = this.measurePlanRowHeights(body);
+          virtualOffsets = buildSyncPlanVirtualOffsets(
+            group.items,
+            rowHeights.rowHeight,
+            rowHeights.reasonRowHeight,
+          );
+          virtualList.style.height = `${virtualOffsets[virtualOffsets.length - 1] ?? 0}px`;
+        }
+        const listRect = virtualList.getBoundingClientRect();
+        const viewportRect = this.resolvePlanViewportRect();
+        const windowState = buildSyncPlanVirtualWindow({
+          offsets: virtualOffsets,
+          listTop: listRect.top,
+          viewportTop: viewportRect.top,
+          viewportBottom: viewportRect.bottom,
+        });
+        const nextKey = `${windowState.start}:${windowState.end}`;
+        if (nextKey === renderedKey) return;
+        renderedKey = nextKey;
+        virtualList.empty();
+        if (windowState.end <= windowState.start) return;
+        const visible = virtualList.createDiv("easy-sync-plan-virtual-window");
+        visible.style.transform = `translateY(${windowState.offset}px)`;
+        for (let index = windowState.start; index < windowState.end; index++) {
+          this.renderPlanReviewItem(
+            visible,
+            group.items[index],
+            conflictByPath,
+            deleteByPath,
+          );
+        }
+        this.scheduleAdaptivePathLayout();
+      };
+      this.planVirtualRenderers.add(renderWindow);
+      details.addEventListener("toggle", renderWindow);
+      renderWindow();
+    }
+  }
+
+  private measurePlanRowHeights(container: HTMLElement): {
+    rowHeight: number;
+    reasonRowHeight: number;
+  } {
+    const probe = container.createDiv("easy-sync-file-row");
+    probe.style.visibility = "hidden";
+    probe.style.pointerEvents = "none";
+    const icon = probe.createSpan("easy-sync-file-icon");
+    setIcon(icon, "arrow-up");
+    probe.createSpan("easy-sync-file-path").setText("measure.md");
+    const rowHeight = probe.getBoundingClientRect().height;
+    probe.createDiv("easy-sync-file-reason").setText("measure");
+    const reasonRowHeight = probe.getBoundingClientRect().height;
+    probe.remove();
+    return {
+      rowHeight: rowHeight > 0 ? rowHeight : 20,
+      reasonRowHeight: reasonRowHeight > 0 ? reasonRowHeight : 42,
+    };
+  }
+
+  private resolvePlanViewportRect(): { top: number; bottom: number } {
+    const content = this.contentEl.querySelector<HTMLElement>(
+      ".easy-sync-view-content",
+    );
+    const leaf = this.contentEl.closest<HTMLElement>(".workspace-leaf-content");
+    const candidate = content
+      && content.clientHeight > 0
+      && content.scrollHeight > content.clientHeight
+      ? content
+      : leaf ?? this.contentEl;
+    const rect = candidate.getBoundingClientRect();
+    const viewportHeight = this.contentEl.ownerDocument.defaultView?.innerHeight
+      ?? rect.bottom;
+    return {
+      top: Math.max(0, rect.top),
+      bottom: Math.min(viewportHeight, rect.bottom),
+    };
+  }
+
+  private renderPlanReviewItem(
+    container: HTMLElement,
+    item: PlanReviewItem,
+    conflictByPath: ReadonlyMap<string, SyncPlanItem>,
+    deleteByPath: ReadonlyMap<string, SyncPlanItem>,
+  ): void {
+    if (item.type === SyncActionType.Conflict && conflictByPath.has(item.path)) {
+      this.renderConflictItem(container, conflictByPath.get(item.path)!);
+      return;
+    }
+    if (item.type === SyncActionType.ConfirmLocalDelete && deleteByPath.has(item.path)) {
+      this.renderDeleteItem(container, deleteByPath.get(item.path)!);
+      return;
+    }
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const action = resolveSyncActionPresentation(item.type);
+    const row = container.createDiv("easy-sync-file-row");
+    const icon = row.createSpan("easy-sync-file-icon");
+    setIcon(icon, action.icon);
+    const pathEl = row.createSpan("easy-sync-file-path");
+    configureFilePath(row, pathEl, item.path, true);
+    if (item.reason) {
+      row.createDiv("easy-sync-file-reason").setText(t(item.reason));
     }
   }
 

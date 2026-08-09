@@ -172,17 +172,6 @@ export async function ensureSharedSyncProtocolV3(
   );
 }
 
-export function parseSharedSyncProtocolV3(
-  content: string,
-): SharedSyncProtocolV3 | null {
-  try {
-    const value: unknown = JSON.parse(content);
-    return isSharedSyncProtocolV3(value) ? value : null;
-  } catch {
-    return null;
-  }
-}
-
 export function isSharedSyncProtocolBinding(
   value: unknown,
 ): value is SharedSyncProtocolBinding {

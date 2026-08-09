@@ -228,15 +228,3 @@ export function simulateV1ToV2Migration(
     legacyAutoSyncAllowed: false,
   };
 }
-
-export function v1BackupCleanupAllowed(input: {
-  desktopHealthy: boolean;
-  mobileHealthy: boolean;
-  cloudBootstrapV2Published: boolean;
-  recoveryJournalsEmpty: boolean;
-}): boolean {
-  return input.desktopHealthy
-    && input.mobileHealthy
-    && input.cloudBootstrapV2Published
-    && input.recoveryJournalsEmpty;
-}

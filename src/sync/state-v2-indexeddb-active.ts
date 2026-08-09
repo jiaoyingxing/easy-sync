@@ -8,8 +8,10 @@ import { sha256Hex } from "../crypto";
 import { isIndexedDbVaultInstanceId } from "./indexeddb-vault-namespace";
 import type { RemoteNodeV2 } from "./remote-index-v2";
 import {
+  stateV2EnvelopeHeader,
   validateEnvelope,
   type FolderAnchorV2,
+  type StateV2EnvelopeHeader,
   type SyncAnchorV2,
   type SyncStateEnvelopeV2,
 } from "./state-envelope-v2";
@@ -27,18 +29,6 @@ const DATABASE_ID_PATTERN = /^[a-f0-9]{32}$/;
 
 type ActiveStatePhase = "preparing" | "ready";
 
-interface StoredEnvelopeHeader {
-  meta: SyncStateEnvelopeV2["meta"];
-  scope: SyncStateEnvelopeV2["scope"];
-  remoteIndex: Omit<SyncStateEnvelopeV2["remoteIndex"], "itemsById">;
-  anchorsSchemaVersion: 2;
-  folderAnchorsPresent: boolean;
-  folderAnchorsSchemaVersion?: 2;
-  remoteScopeRecovery?: SyncStateEnvelopeV2["remoteScopeRecovery"];
-  communityPluginParticipation?:
-    SyncStateEnvelopeV2["communityPluginParticipation"];
-}
-
 interface StoredActiveStateMeta {
   schemaVersion: 1;
   kind: "state-v2-indexeddb-owner";
@@ -46,7 +36,7 @@ interface StoredActiveStateMeta {
   databaseId: string;
   stateDigest: string;
   expectedCounts: StateV2IndexedDbActiveCounts;
-  header: StoredEnvelopeHeader;
+  header: StateV2EnvelopeHeader;
   readyAt?: number;
 }
 
@@ -237,7 +227,7 @@ export class StateV2IndexedDbActiveStore {
       databaseId: this.databaseId,
       stateDigest,
       expectedCounts,
-      header: envelopeHeader(envelope),
+      header: stateV2EnvelopeHeader(envelope),
     };
     const db = await this.open();
     const startTx = db.transaction(
@@ -503,7 +493,7 @@ export class StateV2IndexedDbActiveStore {
       ...meta,
       stateDigest: prepared.nextEnvelopeDigest,
       expectedCounts: envelopeCounts(next),
-      header: envelopeHeader(next),
+      header: stateV2EnvelopeHeader(next),
     };
     const db = await this.open();
     const tx = db.transaction(
@@ -752,14 +742,6 @@ export function stateV2ActiveIndexedDbDatabaseName(
   return `${DATABASE_NAME_PREFIX}${databaseId}`;
 }
 
-export function createStateV2ActiveIndexedDbDatabaseId(): string {
-  const bytes = new Uint8Array(16);
-  globalThis.crypto.getRandomValues(bytes);
-  return [...bytes]
-    .map((value) => value.toString(16).padStart(2, "0"))
-    .join("");
-}
-
 /**
  * Derive a retry-stable identity for a StateManager selection boundary.
  *
@@ -801,39 +783,6 @@ export async function deriveStateV2ActiveIndexedDbDatabaseId(input: {
   return (
     await sha256Hex(new TextEncoder().encode(seed).buffer)
   ).slice(0, 32);
-}
-
-function envelopeHeader(
-  envelope: SyncStateEnvelopeV2,
-): StoredEnvelopeHeader {
-  const { itemsById: _itemsById, ...remoteIndex } = envelope.remoteIndex;
-  return {
-    meta: structuredClone(envelope.meta),
-    scope: structuredClone(envelope.scope),
-    remoteIndex: structuredClone(remoteIndex),
-    anchorsSchemaVersion: envelope.anchors.schemaVersion,
-    folderAnchorsPresent: envelope.folderAnchors !== undefined,
-    ...(envelope.folderAnchors
-      ? {
-          folderAnchorsSchemaVersion:
-            envelope.folderAnchors.schemaVersion,
-        }
-      : {}),
-    ...(envelope.remoteScopeRecovery
-      ? {
-          remoteScopeRecovery: structuredClone(
-            envelope.remoteScopeRecovery,
-          ),
-        }
-      : {}),
-    ...(envelope.communityPluginParticipation
-      ? {
-          communityPluginParticipation: structuredClone(
-            envelope.communityPluginParticipation,
-          ),
-        }
-      : {}),
-  };
 }
 
 function envelopeCounts(

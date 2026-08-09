@@ -2,9 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   generateFileDecisionPlanV2,
   protectEasySyncSelfSyncPlan,
-  shouldPauseFilePlanForConfirmationV2,
   type FileDecisionFactsV2,
 } from "../src/sync/file-decision-planner-v2";
+import {
+  shouldPauseCanonicalPlanForReviewV2,
+  summarizeCanonicalPlanReviewV2,
+} from "../src/sync/canonical-plan-v2";
 import {
   type BaseFileEntry,
   type LocalFileEntry,
@@ -326,7 +329,13 @@ describe("V2 pure file decision planner", () => {
       confirmed: false,
     };
 
-    expect(shouldPauseFilePlanForConfirmationV2(belowThreshold)).toBe(false);
-    expect(shouldPauseFilePlanForConfirmationV2(aboveThreshold)).toBe(true);
+    expect(shouldPauseCanonicalPlanForReviewV2(
+      summarizeCanonicalPlanReviewV2(belowThreshold.items).impactCount,
+      belowThreshold.lastTotalFiles,
+    )).toBe(false);
+    expect(shouldPauseCanonicalPlanForReviewV2(
+      summarizeCanonicalPlanReviewV2(aboveThreshold.items).impactCount,
+      aboveThreshold.lastTotalFiles,
+    )).toBe(true);
   });
 });

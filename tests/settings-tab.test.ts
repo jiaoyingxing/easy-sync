@@ -104,7 +104,7 @@ describe("buildSettingsSyncButtonState", () => {
     expect(automaticSection).toContain(
       'setName(t("settings.autoSyncChangeDelay.name"))',
     );
-    expect(automaticSection).toContain(".setLimits(1, 10, 1)");
+    expect(automaticSection).toContain(".setLimits(0, 10, 1)");
     expect(automaticSection).toContain(
       "this.plugin.setAutoSyncChangeDelaySeconds(value)",
     );
@@ -132,8 +132,14 @@ describe("buildSettingsSyncButtonState", () => {
     expect(zhCN["settings.autoSyncChangeDelay.desc"]).toBe(
       "检测到本地变化后等待 {seconds} 秒；期间有新变化会重新计时。",
     );
+    expect(zhCN["settings.autoSyncChangeDelay.disabledDesc"]).toBe(
+      "已关闭；本地变化不会自动触发同步。",
+    );
     expect(en["settings.syncInterval.name"]).toBe("Scheduled sync");
     expect(en["settings.autoSyncChangeDelay.name"]).toBe("Sync after changes");
+    expect(en["settings.autoSyncChangeDelay.disabledDesc"]).toBe(
+      "Off. Local changes will not trigger sync automatically.",
+    );
   });
 
   it("uses a native folder picker and native settings for device-local exclusions", () => {

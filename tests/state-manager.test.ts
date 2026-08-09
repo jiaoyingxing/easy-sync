@@ -1301,6 +1301,24 @@ describe("StateManager batch persistence", () => {
     ]);
   });
 
+  it("does not count stable user-decision deferrals as transfer failures", async () => {
+    const { state } = makeState();
+    const issue = {
+      path: "old.md",
+      actionType: SyncActionType.FolderDeferred,
+      reason: "needs a decision",
+      updatedAt: 1,
+    };
+
+    await state.reconcilePendingIssues([issue], []);
+    await state.reconcilePendingIssues([{ ...issue, updatedAt: 2 }], []);
+
+    expect(state.pendingIssues).toEqual([{
+      ...issue,
+      updatedAt: 2,
+    }]);
+  });
+
   it("loads persisted sync history after a plugin restart", async () => {
     const savedEntry = {
       id: "saved",

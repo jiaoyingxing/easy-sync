@@ -4,14 +4,19 @@ import {
   buildAdaptivePathLayout,
   buildCompletedFilesRenderState,
   buildSyncPlanDisplayGroups,
+  buildSyncPlanVirtualOffsets,
+  buildSyncPlanVirtualWindow,
   buildSyncViewContentKey,
   EasySyncSyncView,
+  countOmittedSyncHistorySuccessfulFiles,
   formatFileProgressLabel,
   formatPendingIssueActionLabel,
   formatPendingIssueChipLabel,
   formatSyncHistoryCounts,
   resolveFileProgressPresentation,
   resolveSyncViewBodyMode,
+  shouldAutoRebuildPlanReview,
+  SYNC_PLAN_VIRTUAL_OVERSCAN,
   syncViewProgressPercent,
   trimFilePathPrefix,
 } from "../src/ui/sync-view";
@@ -36,6 +41,16 @@ describe("syncViewProgressPercent", () => {
 });
 
 describe("sync view status copy and scrolling layout", () => {
+  it("explains same-content copies through the existing cloud-location decision", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+
+    expect(zh.t("reason.renameIdentityAmbiguous"))
+      .toBe("发现多个内容相同的文件，请选择是否保留云端原位置。");
+    expect(en.t("reason.renameIdentityAmbiguous"))
+      .toBe("Multiple files have the same content. Choose whether to keep the original cloud location.");
+  });
+
   it("keeps verification copy and the adjacent item count non-duplicative", () => {
     const zh = new I18n("zh-cn");
     const en = new I18n("en");
@@ -168,7 +183,7 @@ describe("buildSyncViewContentKey", () => {
     pendingDeletes: [],
     communityPluginEnablementPending: 0,
     planReviewCounts: null,
-    planReviewItems: [],
+    planReviewRevision: 0,
     history: [],
     lastSyncTime: 0,
     mutationRecovery: null,
@@ -402,10 +417,7 @@ describe("buildSyncViewContentKey", () => {
         conflicts: 0,
         skipped: 0,
       },
-      planReviewItems: [{
-        type: "upload",
-        path: "foo.md",
-      }],
+      planReviewRevision: 1,
     });
     const pausedPlan = buildSyncViewContentKey(false, {
       ...baseInput,
@@ -425,10 +437,7 @@ describe("buildSyncViewContentKey", () => {
         conflicts: 0,
         skipped: 0,
       },
-      planReviewItems: [{
-        type: "upload",
-        path: "foo.md",
-      }],
+      planReviewRevision: 1,
     });
 
     expect(runningPlan).not.toBe(pausedPlan);
@@ -548,6 +557,31 @@ describe("buildSyncViewContentKey", () => {
     });
 
     expect(oneFolder).not.toBe(twoFolders);
+  });
+
+  it("keeps large plan keys bounded and refreshes by the persisted revision", () => {
+    const plan = {
+      ...baseInput,
+      bodyMode: "plan" as const,
+      planReviewActive: true,
+      planReviewRevision: 7,
+      planReviewCounts: {
+        uploads: 50_000,
+        downloads: 0,
+        deletes: 0,
+        conflicts: 0,
+        skipped: 0,
+      },
+    };
+    const first = buildSyncViewContentKey(false, plan);
+    const updated = buildSyncViewContentKey(false, {
+      ...plan,
+      planReviewRevision: 8,
+    });
+
+    expect(first.length).toBeLessThan(300);
+    expect(first).toContain("revision:7");
+    expect(updated).not.toBe(first);
   });
 
   it("keeps pending body mode while a side action is processing", () => {
@@ -889,6 +923,74 @@ describe("buildSyncViewContentKey", () => {
       .toEqual([SyncActionType.SkipLargeFile, SyncActionType.SkipIgnoredPath]);
     expect(byGroup.get("remotePreparation")?.items.map((item) => item.type))
       .toEqual([SyncActionType.RecreateRemoteScope]);
+    expect(groups.every((group) => group.open === false)).toBe(true);
+  });
+
+  it("keeps a 50k plan DOM window bounded to the visible rows plus overscan", () => {
+    const offsets = buildSyncPlanVirtualOffsets(
+      Array.from({ length: 50_000 }, () => ({ reason: undefined })),
+      20,
+      42,
+    );
+    const window = buildSyncPlanVirtualWindow({
+      offsets,
+      listTop: 100,
+      viewportTop: 10_100,
+      viewportBottom: 10_820,
+    });
+    const visibleRows = Math.ceil(720 / 20);
+
+    expect(window.end - window.start)
+      .toBeLessThanOrEqual(visibleRows + SYNC_PLAN_VIRTUAL_OVERSCAN * 2 + 1);
+    expect(window.start).toBeGreaterThan(0);
+    expect(window.end).toBeLessThan(50_000);
+    expect(window.offset).toBe(offsets[window.start]);
+    expect(window.totalHeight).toBe(offsets[offsets.length - 1]);
+  });
+
+  it("automatically rebuilds only a legacy plan that has counts but no details", () => {
+    const counts = {
+      uploads: 1,
+      downloads: 0,
+      folders: 0,
+      deletes: 0,
+      conflicts: 0,
+      skipped: 0,
+    };
+    expect(shouldAutoRebuildPlanReview(counts, [])).toBe(true);
+    expect(shouldAutoRebuildPlanReview(counts, [{
+      type: SyncActionType.Upload,
+      path: "ready.md",
+    }])).toBe(false);
+    expect(shouldAutoRebuildPlanReview({ ...counts, uploads: 0 }, [])).toBe(false);
+    expect(shouldAutoRebuildPlanReview(null, [])).toBe(false);
+  });
+
+  it("renders no plan rows when a virtual group is outside the viewport", () => {
+    const offsets = buildSyncPlanVirtualOffsets(
+      Array.from({ length: 50_000 }, () => ({ reason: undefined })),
+      20,
+      42,
+    );
+    expect(buildSyncPlanVirtualWindow({
+      offsets,
+      listTop: 2_000,
+      viewportTop: 0,
+      viewportBottom: 800,
+    })).toEqual({
+      start: 0,
+      end: 0,
+      offset: 0,
+      totalHeight: 50_000 * 20,
+    });
+  });
+
+  it("uses the existing compact row heights when reasons make individual rows taller", () => {
+    expect(buildSyncPlanVirtualOffsets([
+      { reason: undefined },
+      { reason: "syncReason.test" },
+      { reason: undefined },
+    ], 20, 42)).toEqual([0, 20, 62, 82]);
   });
 
   it("reports folder creation and folder movement as different history actions", () => {
@@ -918,6 +1020,50 @@ describe("buildSyncViewContentKey", () => {
       "文件移动/重命名 1 · 文件夹移动/重命名 2 · 删除文件夹 1",
     );
     expect(counts).not.toContain("创建文件夹");
+  });
+
+  it("does not report a failed run as omitted successful file details", () => {
+    expect(countOmittedSyncHistorySuccessfulFiles({
+      id: "failed-before-transfer",
+      mode: "first",
+      status: "partial",
+      startedAt: 1,
+      endedAt: 2,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      skipped: 0,
+      errors: 1,
+      message: "missing runtime directory",
+      files: [],
+    })).toBe(0);
+  });
+
+  it("counts only successful records when reporting retained history details", () => {
+    expect(countOmittedSyncHistorySuccessfulFiles({
+      id: "retained-successes",
+      mode: "manual",
+      status: "partial",
+      startedAt: 1,
+      endedAt: 2,
+      uploaded: 120,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 1,
+      skipped: 1,
+      errors: 1,
+      message: "partial",
+      files: [
+        ...Array.from({ length: 100 }, (_, index) => ({
+          path: `note-${index}.md`,
+          status: "upload" as const,
+        })),
+        { path: "conflict.md", status: "conflict" as const },
+        { path: "skipped.bin", status: "skip" as const },
+        { path: "failed.md", status: "error" as const },
+      ],
+    })).toBe(20);
   });
 
   it("reports remote deletion confirmation separately from real conflicts in history", () => {
@@ -953,28 +1099,45 @@ describe("buildSyncViewContentKey", () => {
     expect(counts).toBe("冲突 1 · 远端删除待确认 1");
   });
 
-  it("keeps plan review actions spaced, right aligned, and mobile safe", () => {
+  it("keeps plan confirmation in the fixed primary action and plan details lazy", () => {
     const styles = readFileSync("styles.css", "utf8");
-    const actionBlock = styles.match(/\.easy-sync-plan-execute\s*\{([^}]*)\}/)?.[1] ?? "";
-    expect(actionBlock).toContain("display: flex");
-    expect(actionBlock).toContain("flex-wrap: wrap");
-    expect(actionBlock).toContain("justify-content: flex-end");
-    expect(actionBlock).toContain("gap: var(--size-4-2)");
-
-    const mobileBlock = styles.match(/body\.is-mobile \.easy-sync-plan-execute\s*\{([^}]*)\}/)?.[1] ?? "";
-    expect(mobileBlock).toContain("flex-direction: column");
-    expect(mobileBlock).toContain("align-items: stretch");
-    expect(styles).toMatch(/body\.is-mobile \.easy-sync-plan-execute button\s*\{[^}]*width:\s*100%/);
-
     const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const statusStart = source.indexOf("private renderStatusPanel");
+    const statusEnd = source.indexOf("private updateStatusPanel", statusStart);
+    const status = source.slice(statusStart, statusEnd);
     const sectionStart = source.indexOf("private renderPlanReviewSection");
     const sectionEnd = source.indexOf("private renderPlanGroups", sectionStart);
     const section = source.slice(sectionStart, sectionEnd);
-    expect(section).toContain('"syncPlan.confirmMigration"');
-    expect(section).toContain('"syncPlan.confirmExecute"');
-    expect(section.indexOf('t("syncPlan.recalculate")')).toBeLessThan(
-      section.indexOf('? "syncPlan.confirmMigration"'),
-    );
+    const groupsEnd = source.indexOf("private renderPlanReviewItem", sectionEnd);
+    const groups = source.slice(sectionEnd, groupsEnd);
+
+    expect(status).toContain('"syncPlan.confirmMigration"');
+    expect(status).toContain('"syncPlan.confirmExecute"');
+    expect(status).toContain("this.plugin.executePlanReview()");
+    expect(status).toContain(".setCta()");
+    expect(section).not.toContain('t("syncPlan.recalculate")');
+    expect(section).not.toContain("this.plugin.rebuildPlanReview()");
+    expect(section).not.toContain("this.plugin.executePlanReview()");
+    expect(groups).toContain('details.addEventListener("toggle"');
+    expect(groups).toContain("this.measurePlanRowHeights(body)");
+    expect(groups).toContain("buildSyncPlanVirtualWindow({");
+    expect(groups).toContain("this.planVirtualRenderers.add(renderWindow)");
+    expect(groups).toContain("hasInlineDecisions");
+    expect(styles).toMatch(/\.easy-sync-plan-virtual-window\s*\{[^}]*position:\s*absolute/s);
+    expect(styles).not.toMatch(/\.easy-sync-plan-virtual-window > \.easy-sync-file-row\s*\{/s);
+  });
+
+  it("preserves an opened plan group and scroll position across side-action rerenders", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+
+    expect(source).toContain("private planExpandedGroups = new Set<SyncActionGroup>()");
+    expect(source).toContain("this.planExpandedGroups.clear();\n        preservedPlanScrollTop = null;");
+    expect(source).toContain("details.dataset.easySyncPlanGroup = group.group");
+    expect(source).toContain("this.planExpandedGroups.add(group.group)");
+    expect(source).toContain("expandedPlanGroups.has(group)");
+    expect(source).toContain("this.planExpandedGroups.has(group.group)");
+    expect(source).toContain("renderInlineDecisions();");
+    expect(source).toContain("content.scrollTop = preservedPlanScrollTop");
   });
 
   it("submits UI decisions only through the plugin gateway", () => {

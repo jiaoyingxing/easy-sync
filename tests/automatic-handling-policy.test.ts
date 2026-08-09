@@ -5,7 +5,10 @@ import {
   isAutomaticTextMergeCandidatePath,
   readAutomaticHandlingPolicy,
 } from "../src/sync/automatic-handling-policy";
-import { shouldPauseFilePlanForConfirmationV2 } from "../src/sync/file-decision-planner-v2";
+import {
+  shouldPauseCanonicalPlanForReviewV2,
+  summarizeCanonicalPlanReviewV2,
+} from "../src/sync/canonical-plan-v2";
 import { SyncActionType, type SyncPlanItem } from "../src/sync/types";
 
 describe("automatic handling policy", () => {
@@ -68,11 +71,14 @@ describe("automatic handling policy", () => {
   });
 
   it("counts an executable local delete toward the large-change safety threshold", () => {
-    expect(shouldPauseFilePlanForConfirmationV2({
-      items: [{ type: SyncActionType.DeleteLocal, path: "deleted-remotely.md" }],
-      lastTotalFiles: 1,
-      confirmed: false,
-    })).toBe(true);
+    const items = [{
+      type: SyncActionType.DeleteLocal,
+      path: "deleted-remotely.md",
+    }] satisfies SyncPlanItem[];
+    expect(shouldPauseCanonicalPlanForReviewV2(
+      summarizeCanonicalPlanReviewV2(items).impactCount,
+      1,
+    )).toBe(true);
   });
 
   it("keeps Obsidian config, plugin data, and plugin artifacts out of automatic text merge", () => {

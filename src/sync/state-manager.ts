@@ -13,10 +13,16 @@ import type { DataAdapter } from "obsidian";
 import { sha256Hex } from "../crypto";
 import {
   getEasySyncPaths,
-  getPluginDir,
+  getEasySyncLegacyPaths,
   isRecord,
   isStringRecord,
 } from "../obsidian-compat";
+import {
+  ensureEasySyncRuntimeLayoutMigration,
+  clearEasySyncLegacyRuntimeLayout,
+  noteHealthySyncAndCleanupEasySyncRuntimeLayout,
+  type EasySyncLayoutMigrationStorage,
+} from "./runtime-layout-migration";
 import { AncestorStoreV2 } from "./ancestor-store-v2";
 import {
   migrateLegacyCommunityPluginParticipation,
@@ -61,6 +67,7 @@ import {
 import {
   StateEnvelopeV2LoadError,
   StateEnvelopeV2Store,
+  validateEnvelope,
   type RemoteScopeRecoveryV2,
   type FolderAnchorV2,
   type StateEnvelopeV2CorruptionEvidence,
@@ -168,6 +175,7 @@ export interface PluginDataStore {
   loadData(): Promise<Record<string, unknown> | null>;
   updatePluginData(mutator: (data: Record<string, unknown>) => void): Promise<void>;
   app: { vault: { adapter: DataAdapter; configDir: string } };
+  layoutMigrationStorage?: EasySyncLayoutMigrationStorage;
   manifest: { dir?: string; id: string };
   indexedDbVaultInstanceId?: string;
   readIndexedDbVaultInstanceId?: () => string | null;
@@ -179,6 +187,14 @@ export interface PluginDataStore {
   ) => StateV2IndexedDbActiveStore;
   createRemoteScopeRecoveryEvidenceStore?:
     RemoteScopeRecoveryEvidenceStoreFactory;
+}
+
+export interface MutationCheckpointCommitMetrics {
+  operations: number;
+  ancestorPublishMs: number;
+  v2CommitMs: number;
+  ledgerClearMs: number;
+  totalMs: number;
 }
 
 export type V2StateLoadBlockReason =
@@ -446,8 +462,6 @@ const KEY_SYNC_PATH_SETTINGS_FINGERPRINT =
   "easy-sync-sync-path-settings-fingerprint";
 const KEY_SYNC_SCOPE_EXPANSION =
   "easy-sync-sync-scope-expansion";
-const REMOTE_STATE_FILE = "remote-state.json";
-
 export type SyncHistoryStatus = "success" | "partial" | "cancelled" | "authExpired" | "failed";
 
 export interface SyncHistoryEntry {
@@ -764,6 +778,20 @@ export class StateManager {
     this.remoteState = null;
     this.ancestorStoreV2 = null;
     this.pendingV2AncestorContent.clear();
+    const layoutPaths = getEasySyncPaths(
+      this.plugin.app.vault,
+      this.plugin.manifest.id,
+    );
+    const legacyLayoutPaths = getEasySyncLegacyPaths(
+      this.plugin.app.vault,
+      this.plugin.manifest.id,
+    );
+    await ensureEasySyncRuntimeLayoutMigration(
+      this.plugin.app.vault.adapter,
+      layoutPaths,
+      legacyLayoutPaths,
+      this.plugin.layoutMigrationStorage,
+    );
     const saved = await this.plugin.loadData();
     if (saved) {
       const rawPublicMutationLedger = saved[KEY_PUBLIC_MUTATION_LEDGER];
@@ -772,24 +800,13 @@ export class StateManager {
       );
       const rawMutationLedger = saved[KEY_MUTATION_LEDGER];
       const mutationLedger = parseMutationLedger(rawMutationLedger);
-      this.mutationLedgerCorrupt = (
-        rawPublicMutationLedger !== undefined
-        && (
-          !Array.isArray(rawPublicMutationLedger)
-          || publicMutationLedger.length !== rawPublicMutationLedger.length
-        )
-      ) || (
-        rawMutationLedger !== undefined
-        && (
-          !Array.isArray(rawMutationLedger)
-          || mutationLedger.length !== rawMutationLedger.length
-        )
-      ) || (
-        publicMutationLedger.length > 0
-        && mutationLedger.length > 0
-        && JSON.stringify(publicMutationLedger)
-          !== JSON.stringify(mutationLedger)
-      );
+      this.mutationLedgerCorrupt = isMalformedMutationLedger(
+        rawPublicMutationLedger,
+        publicMutationLedger,
+      ) || isMalformedMutationLedger(
+        rawMutationLedger,
+        mutationLedger,
+      ) || mutationLedgersDisagree(publicMutationLedger, mutationLedger);
       const rawRecoveryQuarantine = saved[KEY_V2_RECOVERY_QUARANTINE];
       const recoveryQuarantine = parseMutationRecoveryQuarantine(
         rawRecoveryQuarantine,
@@ -1246,7 +1263,14 @@ export class StateManager {
         return;
       }
       this.legacyStateAllowed = true;
-      await this.baseContentCache.load(adapter, this.pluginDir);
+      await this.baseContentCache.load(
+        adapter,
+        paths.baseContentFile,
+        getEasySyncLegacyPaths(
+          this.plugin.app.vault,
+          this.plugin.manifest.id,
+        ).baseContentFile,
+      );
       this.remoteState = await this.loadRemoteState();
       return;
     } else {
@@ -1255,8 +1279,34 @@ export class StateManager {
       this.migrationHold = null;
     }
     this.legacyStateAllowed = true;
-    await this.baseContentCache.load(adapter, this.pluginDir);
+    await this.baseContentCache.load(
+      adapter,
+      paths.baseContentFile,
+      getEasySyncLegacyPaths(
+        this.plugin.app.vault,
+        this.plugin.manifest.id,
+      ).baseContentFile,
+    );
     this.remoteState = await this.loadRemoteState();
+  }
+
+  /** Record one fully healthy round and retire old layout files after the
+   * small, local-only migration grace period. Cleanup never affects sync. */
+  async noteHealthySync(): Promise<void> {
+    const current = getEasySyncPaths(
+      this.plugin.app.vault,
+      this.plugin.manifest.id,
+    );
+    const legacy = getEasySyncLegacyPaths(
+      this.plugin.app.vault,
+      this.plugin.manifest.id,
+    );
+    await noteHealthySyncAndCleanupEasySyncRuntimeLayout(
+      this.plugin.app.vault.adapter,
+      current,
+      legacy,
+      this.plugin.layoutMigrationStorage,
+    );
   }
 
   private setV2StateLoadBlock(
@@ -1377,18 +1427,16 @@ export class StateManager {
     const publicLedger = this.data[KEY_PUBLIC_MUTATION_LEDGER];
     const activeLedger = this.data[KEY_MUTATION_LEDGER];
     if (publicLedger.length === 0) return;
-    if (
-      activeLedger.length > 0
-      && JSON.stringify(publicLedger) !== JSON.stringify(activeLedger)
-    ) {
+    if (mutationLedgersDisagree(publicLedger, activeLedger)) {
       throw new Error("Public and V2 mutation ledgers disagree");
     }
     await this.commitPluginData((current) => ({
       ...current,
       [KEY_PUBLIC_MUTATION_LEDGER]: [],
-      [KEY_MUTATION_LEDGER]: activeLedger.length > 0
-        ? activeLedger
-        : publicLedger,
+      [KEY_MUTATION_LEDGER]: selectActiveMutationLedger(
+        publicLedger,
+        activeLedger,
+      ),
     }));
   }
 
@@ -1422,22 +1470,28 @@ export class StateManager {
     });
   }
 
-  private get pluginDir(): string {
-    return this.plugin.manifest.dir
-      ?? getPluginDir(this.plugin.app.vault, this.plugin.manifest.id);
-  }
-
   private async loadRemoteState(): Promise<RemoteSyncState | null> {
-    try {
-      const json = await this.plugin.app.vault.adapter.read(this.remoteStatePath);
-      return parseRemoteState(JSON.parse(json));
-    } catch {
-      return null;
+    const adapter = this.plugin.app.vault.adapter;
+    const legacyPath = getEasySyncLegacyPaths(
+      this.plugin.app.vault,
+      this.plugin.manifest.id,
+    ).remoteStateFile;
+    for (const path of [this.remoteStatePath, legacyPath]) {
+      try {
+        const json = await adapter.read(path);
+        return parseRemoteState(JSON.parse(json));
+      } catch {
+        // Try the public 1.1.3 path only when the new path is absent/unreadable.
+      }
     }
+    return null;
   }
 
   private get remoteStatePath(): string {
-    return `${this.pluginDir}/${REMOTE_STATE_FILE}`;
+    return getEasySyncPaths(
+      this.plugin.app.vault,
+      this.plugin.manifest.id,
+    ).remoteStateFile;
   }
 
   private activateV2Envelope(envelope: SyncStateEnvelopeV2): void {
@@ -2501,12 +2555,22 @@ export class StateManager {
       "missing";
     let baseContentRaw: string | null = null;
     let baseContentEntries: Record<string, string> = {};
-    const baseContentPath = `${this.pluginDir}/base-content.json`;
+    const baseContentPath = getEasySyncPaths(
+      this.plugin.app.vault,
+      this.plugin.manifest.id,
+    ).baseContentFile;
+    const legacyBaseContentPath = getEasySyncLegacyPaths(
+      this.plugin.app.vault,
+      this.plugin.manifest.id,
+    ).baseContentFile;
     try {
-      if (await this.plugin.app.vault.adapter.exists(baseContentPath)) {
+      const readablePath = await this.plugin.app.vault.adapter.exists(baseContentPath)
+        ? baseContentPath
+        : legacyBaseContentPath;
+      if (await this.plugin.app.vault.adapter.exists(readablePath)) {
         try {
           baseContentRaw =
-            await this.plugin.app.vault.adapter.read(baseContentPath);
+            await this.plugin.app.vault.adapter.read(readablePath);
           const parsed: unknown = JSON.parse(baseContentRaw);
           if (isStringRecord(parsed)) {
             baseContentStatus = "valid";
@@ -2830,8 +2894,7 @@ export class StateManager {
           this.mutationLedger.length === 0
           || legacyMutationLedger.length
             !== this.mutationLedger.length
-          || JSON.stringify(legacyMutationLedger)
-            !== JSON.stringify(this.mutationLedger)
+          || !sameMutationLedger(legacyMutationLedger, this.mutationLedger)
         )
       )
     ) {
@@ -2966,9 +3029,7 @@ export class StateManager {
     if (this.v2Envelope || !this.legacyStateAllowed) {
       // Existing V2 builds used the public key for active recovery. Keep the
       // evidence visible while a load block prevents its one-time migration.
-      return activeLedger.length === 0 && publicLedger.length > 0
-        ? publicLedger
-        : activeLedger;
+      return selectActiveMutationLedger(publicLedger, activeLedger);
     }
     return publicLedger;
   }
@@ -3450,63 +3511,178 @@ export class StateManager {
   }
 
   /** Publish a receipted mutation's base/remote/pending checkpoint, then clear it. */
-  async commitMutationCheckpoint(operationId: string): Promise<void> {
+  async commitMutationCheckpoint(
+    operationId: string,
+  ): Promise<MutationCheckpointCommitMetrics> {
+    return this.commitMutationCheckpoints([operationId]);
+  }
+
+  /** Publish independent receipted mutations in one V2 revision, then clear them together. */
+  async commitMutationCheckpoints(
+    operationIds: readonly string[],
+  ): Promise<MutationCheckpointCommitMetrics> {
+    const totalStartedAt = Date.now();
     if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
       throw new Error("Mutation checkpoint requires active V2 authority");
     }
-    const record = this.data[KEY_MUTATION_LEDGER].find(
-      (entry) => entry.intent.operationId === operationId,
-    );
-    if (!record?.receipt) throw new Error(`Mutation receipt missing: ${operationId}`);
-    const checkpoint = record.receipt.checkpoint;
-    assertRemoteUpsertsHaveParentIdentity(checkpoint.remoteUpserts);
-
-    const recoveryRecord = this.prepareMutationRecoveryRecord(
-      record,
-      this.v2Envelope.scope,
-    );
-    if (!recoveryRecord) {
-      throw new Error(
-        `Mutation scope no longer matches: ${record.intent.operationId}`,
-      );
+    if (operationIds.length === 0 || operationIds.length > 32) {
+      throw new Error("Mutation checkpoint batch must contain 1 to 32 operations");
     }
-    const ancestorHashes = isFolderMutationIntent(record.intent)
+    if (new Set(operationIds).size !== operationIds.length) {
+      throw new Error("Mutation checkpoint batch contains duplicate operations");
+    }
+    const records = operationIds.map((operationId) => {
+      const record = this.data[KEY_MUTATION_LEDGER].find(
+        (entry) => entry.intent.operationId === operationId,
+      );
+      if (!record?.receipt) {
+        throw new Error(`Mutation receipt missing: ${operationId}`);
+      }
+      assertRemoteUpsertsHaveParentIdentity(record.receipt.checkpoint.remoteUpserts);
+      const recoveryRecord = this.prepareMutationRecoveryRecord(
+        record,
+        this.v2Envelope!.scope,
+      );
+      if (!recoveryRecord) {
+        throw new Error(
+          `Mutation scope no longer matches: ${record.intent.operationId}`,
+        );
+      }
+      return recoveryRecord;
+    });
+    this.assertIndependentMutationCheckpointBatch(records);
+    const checkpoints = records.map((record) => record.receipt!.checkpoint);
+    const baseUpserts = checkpoints.flatMap((checkpoint) => checkpoint.baseUpserts);
+    const ancestorStartedAt = Date.now();
+    const ancestorHashes = records.some((record) => isFolderMutationIntent(record.intent))
       ? {}
-      : await this.publishPendingV2Ancestors(checkpoint.baseUpserts);
+      : await this.publishPendingV2Ancestors(baseUpserts);
+    const ancestorPublishMs = Date.now() - ancestorStartedAt;
+    const v2CommitStartedAt = Date.now();
     await this.commitV2State((current) => {
-      const reduced = isFolderMutationIntent(record.intent)
-        ? reduceFolderStateEnvelopeV2(current, recoveryRecord)
-        : reduceFileStateEnvelopeV2(current, recoveryRecord);
-      return Object.keys(ancestorHashes).length === 0
-        ? reduced
-        : attachBaseAncestorHashesV2(
-            current,
-            reduced,
+      let reduced = current;
+      let changed = false;
+      let committedAt = current.meta.committedAt;
+      for (const record of records) {
+        const before = reduced;
+        const checkpoint = record.receipt!.checkpoint;
+        let next = isFolderMutationIntent(record.intent)
+          ? reduceFolderStateEnvelopeV2(before, record)
+          : reduceFileStateEnvelopeV2(before, record);
+        if (Object.keys(ancestorHashes).length > 0) {
+          next = attachBaseAncestorHashesV2(
+            before,
+            next,
             checkpoint.baseUpserts,
             ancestorHashes,
           );
+        }
+        if (next !== before) changed = true;
+        reduced = next;
+        committedAt = Math.max(committedAt, record.receipt!.completedAt);
+      }
+      if (!changed) return current;
+      const candidate: SyncStateEnvelopeV2 = {
+        ...reduced,
+        meta: {
+          ...reduced.meta,
+          commitSeq: current.meta.commitSeq + 1,
+          committedAt,
+        },
+      };
+      validateEnvelope(candidate);
+      return candidate;
     });
-    this.clearPendingV2AncestorContent(checkpoint.baseUpserts);
+    const v2CommitMs = Date.now() - v2CommitStartedAt;
+    this.clearPendingV2AncestorContent(baseUpserts);
+    const operationIdSet = new Set(operationIds);
+    const conflictRemovals = new Set(
+      checkpoints.flatMap((checkpoint) => checkpoint.pendingConflictRemovals),
+    );
+    const deleteRemovals = new Set(
+      checkpoints.flatMap((checkpoint) => checkpoint.pendingDeleteRemovals),
+    );
+    const folderIssuePaths = new Set(
+      records
+        .filter((record) => isFolderMutationIntent(record.intent))
+        .map((record) => record.intent.path),
+    );
+    const folderMoveHintRemovals = new Set(
+      checkpoints.flatMap((checkpoint) => checkpoint.folderMoveHintRemovals ?? []),
+    );
+    const ledgerClearStartedAt = Date.now();
     await this.commitPluginData((current) => ({
       ...current,
       [KEY_PENDING_CONFLICTS]: current[KEY_PENDING_CONFLICTS].filter(
-        (item) => !checkpoint.pendingConflictRemovals.includes(item.path),
+        (item) => !conflictRemovals.has(item.path),
       ),
       [KEY_PENDING_DELETES]: current[KEY_PENDING_DELETES].filter(
-        (item) => !checkpoint.pendingDeleteRemovals.includes(item.path),
+        (item) => !deleteRemovals.has(item.path),
       ),
-      [KEY_PENDING_ISSUES]: isFolderMutationIntent(record.intent)
-        ? current[KEY_PENDING_ISSUES].filter(
-            (issue) => issue.path !== record.intent.path,
-          )
-        : current[KEY_PENDING_ISSUES],
+      [KEY_PENDING_ISSUES]: current[KEY_PENDING_ISSUES].filter(
+        (issue) => !folderIssuePaths.has(issue.path),
+      ),
       [KEY_MUTATION_LEDGER]: current[KEY_MUTATION_LEDGER].filter(
-        (entry) => entry.intent.operationId !== operationId,
+        (entry) => !operationIdSet.has(entry.intent.operationId),
       ),
       [KEY_LOCAL_FOLDER_MOVE_HINTS]: current[KEY_LOCAL_FOLDER_MOVE_HINTS].filter(
-        (hint) => !(checkpoint.folderMoveHintRemovals ?? []).includes(hint.remoteId),
+        (hint) => !folderMoveHintRemovals.has(hint.remoteId),
       ),
     }));
+    const ledgerClearMs = Date.now() - ledgerClearStartedAt;
+    return {
+      operations: records.length,
+      ancestorPublishMs,
+      v2CommitMs,
+      ledgerClearMs,
+      totalMs: Date.now() - totalStartedAt,
+    };
+  }
+
+  private assertIndependentMutationCheckpointBatch(
+    records: readonly MutationLedgerEntryV1[],
+  ): void {
+    if (records.length <= 1) return;
+    if (records.some(
+      (record) => isFolderMutationIntent(record.intent) || record.manualResolution,
+    )) {
+      throw new Error(
+        "Mutation checkpoint batches support only independent file operations",
+      );
+    }
+    const pathOwners = new Map<string, string>();
+    const remoteIdOwners = new Map<string, string>();
+    for (const record of records) {
+      const operationId = record.intent.operationId;
+      const checkpoint = record.receipt!.checkpoint;
+      const paths = new Set([
+        record.intent.path,
+        record.intent.sourcePath,
+        ...checkpoint.baseUpserts.map((entry) => entry.path),
+        ...checkpoint.baseRemovals,
+        ...checkpoint.remoteUpserts.map((entry) => entry.path),
+        ...checkpoint.remoteDeletes,
+        ...checkpoint.pendingConflictRemovals,
+        ...checkpoint.pendingDeleteRemovals,
+      ].filter((path): path is string => Boolean(path)));
+      for (const path of paths) {
+        const key = path.toLowerCase();
+        const owner = pathOwners.get(key);
+        if (owner && owner !== operationId) {
+          throw new Error(`Mutation checkpoint batch paths overlap: ${path}`);
+        }
+        pathOwners.set(key, operationId);
+      }
+      for (const remote of checkpoint.remoteUpserts) {
+        const owner = remoteIdOwners.get(remote.driveId);
+        if (owner && owner !== operationId) {
+          throw new Error(
+            `Mutation checkpoint batch remote identities overlap: ${remote.driveId}`,
+          );
+        }
+        remoteIdOwners.set(remote.driveId, operationId);
+      }
+    }
   }
 
   // ---- Base Snapshot (per-file persistence) ----
@@ -5125,6 +5301,11 @@ export class StateManager {
       for (const issue of issues) {
         const nextIssue = { ...issue };
         const existing = byPath.get(issue.path);
+        if (issue.actionType === SyncActionType.FolderDeferred) {
+          delete nextIssue.consecutiveFailures;
+          byPath.set(issue.path, nextIssue);
+          continue;
+        }
         // M17: merge consecutive failures — same version increments counter.
         // === handles undefined correctly: both undefined → same version.
         if (
@@ -6549,6 +6730,13 @@ export class StateManager {
         }
       }
       await this.removeRemainingLocalSyncArtifacts(paths);
+      await clearEasySyncLegacyRuntimeLayout(
+        adapter,
+        getEasySyncLegacyPaths(
+          this.plugin.app.vault,
+          this.plugin.manifest.id,
+        ),
+      );
     } catch (error) {
       await this.load().catch(() => undefined);
       throw error;
@@ -6988,6 +7176,40 @@ function parseMutationLedger(value: unknown): MutationLedgerEntryV1[] {
   if (value === undefined) return [];
   if (!Array.isArray(value) || !value.every(isMutationLedgerEntry)) return [];
   return value;
+}
+
+function isMalformedMutationLedger(
+  raw: unknown,
+  parsed: readonly MutationLedgerEntryV1[],
+): boolean {
+  return raw !== undefined
+    && (!Array.isArray(raw) || parsed.length !== raw.length);
+}
+
+function sameMutationLedger(
+  left: readonly MutationLedgerEntryV1[],
+  right: readonly MutationLedgerEntryV1[],
+): boolean {
+  return left.length === right.length
+    && JSON.stringify(left) === JSON.stringify(right);
+}
+
+function mutationLedgersDisagree(
+  publicLedger: readonly MutationLedgerEntryV1[],
+  activeLedger: readonly MutationLedgerEntryV1[],
+): boolean {
+  return publicLedger.length > 0
+    && activeLedger.length > 0
+    && !sameMutationLedger(publicLedger, activeLedger);
+}
+
+function selectActiveMutationLedger(
+  publicLedger: MutationLedgerEntryV1[],
+  activeLedger: MutationLedgerEntryV1[],
+): MutationLedgerEntryV1[] {
+  return activeLedger.length === 0 && publicLedger.length > 0
+    ? publicLedger
+    : activeLedger;
 }
 
 function parseManualMutationResolutionAudit(

@@ -173,6 +173,48 @@ export interface SyncStateEnvelopeV2 {
   communityPluginParticipation?: DeviceCommunityPluginParticipationV1;
 }
 
+export interface StateV2EnvelopeHeader {
+  meta: SyncStateEnvelopeV2["meta"];
+  scope: SyncStateEnvelopeV2["scope"];
+  remoteIndex: Omit<SyncStateEnvelopeV2["remoteIndex"], "itemsById">;
+  anchorsSchemaVersion: 2;
+  folderAnchorsPresent: boolean;
+  folderAnchorsSchemaVersion?: 2;
+  remoteScopeRecovery?: SyncStateEnvelopeV2["remoteScopeRecovery"];
+  communityPluginParticipation?:
+    SyncStateEnvelopeV2["communityPluginParticipation"];
+}
+
+export function stateV2EnvelopeHeader(
+  envelope: SyncStateEnvelopeV2,
+): StateV2EnvelopeHeader {
+  const { itemsById: _itemsById, ...remoteIndex } = envelope.remoteIndex;
+  return {
+    meta: structuredClone(envelope.meta),
+    scope: structuredClone(envelope.scope),
+    remoteIndex: structuredClone(remoteIndex),
+    anchorsSchemaVersion: envelope.anchors.schemaVersion,
+    folderAnchorsPresent: envelope.folderAnchors !== undefined,
+    ...(envelope.folderAnchors
+      ? { folderAnchorsSchemaVersion: envelope.folderAnchors.schemaVersion }
+      : {}),
+    ...(envelope.remoteScopeRecovery
+      ? {
+          remoteScopeRecovery: structuredClone(
+            envelope.remoteScopeRecovery,
+          ),
+        }
+      : {}),
+    ...(envelope.communityPluginParticipation
+      ? {
+          communityPluginParticipation: structuredClone(
+            envelope.communityPluginParticipation,
+          ),
+        }
+      : {}),
+  };
+}
+
 export interface StateEnvelopeV2Paths {
   committed: string;
   next: string;

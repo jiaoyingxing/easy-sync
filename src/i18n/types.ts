@@ -154,6 +154,7 @@ export interface LocaleStrings {
   "settings.syncInterval.desc": string;
   "settings.autoSyncChangeDelay.name": string;
   "settings.autoSyncChangeDelay.desc": string;
+  "settings.autoSyncChangeDelay.disabledDesc": string;
   "settings.maxFileSize.name": string;
   "settings.maxFileSize.desc": string;
   "settings.reset.name": string;

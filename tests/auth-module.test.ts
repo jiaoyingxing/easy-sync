@@ -294,7 +294,11 @@ describe("generateCodeChallengeSync", () => {
 
     const verifier = "test-verifier-string-12345";
     const syncResult = actual.generateCodeChallengeSync(verifier);
-    const asyncResult = await actual.generateCodeChallenge(verifier);
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(verifier),
+    );
+    const asyncResult = Buffer.from(digest).toString("base64url");
 
     expect(syncResult).toBe(asyncResult);
     // Should be 43 chars (32 bytes of SHA-256 → base64url without padding)
