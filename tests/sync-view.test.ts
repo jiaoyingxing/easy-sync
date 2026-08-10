@@ -1120,10 +1120,17 @@ describe("buildSyncViewContentKey", () => {
     expect(section).not.toContain("this.plugin.executePlanReview()");
     expect(groups).toContain('details.addEventListener("toggle"');
     expect(groups).toContain("this.measurePlanRowHeights(body)");
+    expect(groups).toContain(
+      '"easy-sync-file-row easy-sync-plan-measure-probe"',
+    );
+    expect(groups).not.toContain("probe.style.");
     expect(groups).toContain("buildSyncPlanVirtualWindow({");
     expect(groups).toContain("this.planVirtualRenderers.add(renderWindow)");
     expect(groups).toContain("hasInlineDecisions");
     expect(styles).toMatch(/\.easy-sync-plan-virtual-window\s*\{[^}]*position:\s*absolute/s);
+    expect(styles).toMatch(
+      /\.easy-sync-plan-measure-probe\s*\{[^}]*visibility:\s*hidden;[^}]*pointer-events:\s*none;/s,
+    );
     expect(styles).not.toMatch(/\.easy-sync-plan-virtual-window > \.easy-sync-file-row\s*\{/s);
   });
 

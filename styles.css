@@ -1126,6 +1126,11 @@ body:not(.is-mobile) .easy-sync-view-content {
   left: 0;
 }
 
+.easy-sync-plan-measure-probe {
+  visibility: hidden;
+  pointer-events: none;
+}
+
 .easy-sync-history-omitted,
 .easy-sync-empty-state {
   padding: 2px 4px;

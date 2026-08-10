@@ -1997,9 +1997,9 @@ export class EasySyncSyncView extends ItemView {
     rowHeight: number;
     reasonRowHeight: number;
   } {
-    const probe = container.createDiv("easy-sync-file-row");
-    probe.style.visibility = "hidden";
-    probe.style.pointerEvents = "none";
+    const probe = container.createDiv(
+      "easy-sync-file-row easy-sync-plan-measure-probe",
+    );
     const icon = probe.createSpan("easy-sync-file-icon");
     setIcon(icon, "arrow-up");
     probe.createSpan("easy-sync-file-path").setText("measure.md");
