@@ -189,6 +189,17 @@ describe("shared sidebar detail controls", () => {
 });
 
 describe("sync view status copy and scrolling layout", () => {
+  it("keeps expanded history details subordinate to the summary with host UI tokens", () => {
+    const styles = readFileSync("styles.css", "utf8");
+
+    expect(styles).toMatch(
+      /\.easy-sync-history-detail\s*\{[^}]*font-size:\s*var\(--font-ui-smaller\);[^}]*line-height:\s*var\(--line-height-tight\);/s,
+    );
+    expect(styles).not.toMatch(
+      /\.easy-sync-history-detail\s*\{[^}]*(?:font-size|line-height):\s*\d+(?:\.\d+)?(?:px|rem|em);/s,
+    );
+  });
+
   it("keeps upgrade, recovery, and unavailable-state copy concise and factual", () => {
     const zh = new I18n("zh-cn");
     const en = new I18n("en");
@@ -1824,6 +1835,11 @@ describe("buildSyncViewContentKey", () => {
     expect(viewSource).toContain("this.renderMutationRecoverySection(");
     expect(viewSource).not.toContain('"syncView.recovery.reviewAndResolve"');
     expect(openMethod).toContain("if (this.mutationRecoveryResolutionOpening) return");
+    expect(openMethod).toContain("shouldAutoSettleIdenticalRecovery(snapshot)");
+    expect(openMethod).toContain(
+      'await this.plugin.resolveMutationRecovery(snapshot, "keep-local")',
+    );
+    expect(openMethod).toContain("this.plugin.updateStatusBar()");
     expect(openMethod.match(/new MutationRecoveryResolutionModal\(/g)).toHaveLength(1);
     expect(openMethod).toContain(".awaitChoice()");
     expect(openMethod).toContain("confirmMutationResolutionDeletion(snapshot, choice)");
@@ -1849,6 +1865,19 @@ describe("buildSyncViewContentKey", () => {
     expect(sharedSource).toContain('createEl("table", "easy-sync-metadata-table")');
     expect(sharedSource).toContain('createDiv("easy-sync-detail-actions")');
     expect(modalSource).not.toContain(".setCta()");
+    // Slice B: ordinary entries keep only executable actions and one short path.
+    expect(modalSource).not.toContain("syncView.mutationResolution.unavailable");
+    expect(modalSource).not.toContain(": !snapshot.keepLocal.available");
+    expect(modalSource).not.toContain(": !snapshot.keepRemote.available");
+    expect(modalSource).toContain("bundle && snapshot.identical");
+    expect(modalSource).toContain("syncView.mutationResolution.singleActionHint");
+    expect(modalSource.indexOf("syncView.mutationResolution.previousAction")).toBeGreaterThan(
+      modalSource.indexOf("syncView.mutationResolution.technicalDetails"),
+    );
+    expect(modalSource.indexOf("syncView.mutationResolution.description")).toBeGreaterThan(
+      modalSource.indexOf("syncView.mutationResolution.technicalDetails"),
+    );
+    expect(styles).not.toContain("easy-sync-comparison-previous-action");
     expect(styles).toMatch(
       /\.easy-sync-comparison-path-table\s*\{[^}]*table-layout:\s*fixed;/s,
     );

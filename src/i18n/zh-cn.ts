@@ -29,7 +29,7 @@ const zhCN: LocaleStrings = {
   "ribbon.ready": "立即同步",
 
   // ---- 设置分组 ----
-  "settings.group.sync": "同步",
+  "settings.group.scope": "范围",
   "settings.group.automatic": "自动",
   "settings.group.maintenance": "维护",
   "settings.group.about": "关于",
@@ -52,7 +52,6 @@ const zhCN: LocaleStrings = {
   "settings.account.loginSuccess": "登录成功",
   "settings.account.logout": "退出登录",
   "settings.firstSync.name": "立即同步",
-  "settings.firstSync.desc": "首次会先预览同步计划，之后按当前状态同步。",
   "settings.firstSync.start": "开始同步",
   "settings.firstSync.sync": "同步",
   "settings.syncScope.name": "同步范围",
@@ -150,11 +149,11 @@ const zhCN: LocaleStrings = {
   "settings.maxFileSize.name": "单个文件限制",
   "settings.maxFileSize.desc": "超过 {size} 的文件不会参与同步。大文件会占用较多内存和流量。",
   "settings.reset.name": "重置同步状态",
-  "settings.reset.desc": "先核对未完成操作。能够安全结算的会清理；若只剩一个可安全隔离的普通文件仍未决，会保留并隔离该文件，同时重置其余可再生同步状态。同步设置与诊断日志会保留。",
+  "settings.reset.desc": "清除这台设备的同步基线、历史、待处理记录和缓存。如有未完成操作会先核对，能安全处理的才继续，否则中止。同步设置与诊断日志会保留，本地与云端文件不受影响。",
   "settings.reset.button": "重置",
   "settings.reset.confirmTitle": "确认重置同步状态",
-  "settings.reset.confirmMessage": "这会先核对未完成操作。能够安全结算的会清理；若只剩一个可安全隔离的普通文件仍未决，会保留并隔离该文件，同时重置其余可再生同步状态。同步设置与诊断日志会保留。",
-  "settings.reset.confirmWarning": "重置本身不会删除本地或云端文件。单个普通文件的未决证据能被安全隔离时会原样保留；其他无法安全结算或隔离的证据仍会让重置停止。重置成功后，这台设备会在下次同步时重建同步状态。",
+  "settings.reset.confirmMessage": "将清除这台设备记录的同步状态，并在下次同步时重新建立。",
+  "settings.reset.confirmWarning": "此操作不会删除本地或云端文件。如有未完成操作且无法安全处理，重置会中止。",
   "settings.reset.confirm": "确认重置",
   "settings.reset.done": "本机同步状态已重置，诊断日志已保留",
   "settings.reset.failed": "重置未完成。本地和云端文件未被重置操作删除；请完全重开 Obsidian 后再次重置，仍失败时导出诊断报告。",
@@ -164,10 +163,6 @@ const zhCN: LocaleStrings = {
   "settings.about.author.desc": "焦应行（Jiao Yingxing）。使用中遇到问题，可在 GitHub 提交 Issue，或通过小红书私信联系作者。",
   "settings.about.contact.github": "GitHub",
   "settings.about.contact.xiaohongshu": "小红书",
-  "settings.about.usage.name": "使用建议",
-  "settings.about.usage.desc": "请勿让 OneDrive 客户端、iCloud、Dropbox、Syncthing 等其他同步工具同时管理同一个本地仓库。首次同步或文件较多时可能需要更长时间，可在侧栏查看进度。",
-  "settings.about.disclaimer.name": "数据安全",
-  "settings.about.disclaimer.desc": "同步过程中，EasySync 可能上传、下载或删除本地及 OneDrive 中的文件。重要内容请保留独立备份；同步不能替代备份。",
 
   // ---- 同步视图 ----
   "syncView.title": "EasySync",
@@ -234,7 +229,7 @@ const zhCN: LocaleStrings = {
   "syncView.staleIdentity.fileMessage": "“{path}”的旧云端身份已无法与当前本机和云端对象唯一对应。继续只会解除这条失效的历史身份，不会上传、下载、覆盖或删除任何文件；随后会立即根据当前事实重新计算同步动作，现有两边内容都会保留。",
   "syncView.staleIdentity.folderMessage": "“{path}”此前同步的云端文件夹身份已不可达，而本机存在改动后的文件夹。继续只会解除这一旧目录树的失效历史身份，不会上传、下载、覆盖或删除任何内容；随后会立即根据当前事实重新计算同步动作，现有两边内容都会保留。",
   "syncView.staleIdentity.confirm": "保留双方并重新同步",
-  "syncView.mutationResolution.title": "核对未完成操作",
+  "syncView.mutationResolution.title": "选择保留的内容",
   "syncView.mutationResolution.description": "上次对“{path}”的操作结果已无法自动确认。请核对当前状态，并选择要保留的一侧。",
   "syncView.mutationResolution.previousAction": "上次操作：{action}",
   "syncView.mutationResolution.localTitle": "当前本机",
@@ -246,7 +241,7 @@ const zhCN: LocaleStrings = {
   "syncView.mutationResolution.identical": "本机与云端内容完全一致。任一选择都只会确认状态，不会再次改动文件。",
   "syncView.mutationResolution.keepLocal": "保留当前本机",
   "syncView.mutationResolution.keepRemote": "保留当前云端",
-  "syncView.mutationResolution.unavailable": "当前状态不支持部分处理方式，相关选择已禁用。",
+  "syncView.mutationResolution.singleActionHint": "当前状态只支持一个处理方向。",
   "syncView.mutationResolution.deleteConfirmTitle": "确认删除另一侧内容？",
   "syncView.mutationResolution.deleteConfirm": "确认并继续",
   "syncView.mutationResolution.deleteConfirmMessage": "选择“{choice}”后，“{path}”在所选一侧不存在。继续会删除另一侧现有的副本。",
@@ -347,7 +342,7 @@ const zhCN: LocaleStrings = {
   "notice.emptyFolder.deleteUnavailable": "当前云端无法安全确认空文件夹内容未变化，请在 OneDrive 中检查后删除：{path}",
   "notice.mutationResolution.unavailable": "当前记录无法确定处理方式，请先导出诊断报告。",
   "notice.mutationResolution.changed": "文件或云端状态已经变化，本次未执行任何操作：{path}",
-  "notice.mutationResolution.completed": "已按你的选择完成处置：{path}",
+  "notice.mutationResolution.completed": "未完成操作已完成处置：{path}",
   "notice.mutationResolution.failed": "无法处理未完成操作“{path}”：{reason}",
 
   // ---- 同步生命周期提示 ----
@@ -501,6 +496,8 @@ const zhCN: LocaleStrings = {
   // ---- 同步计划提醒与审查 ----
   "syncPlan.readyTitle": "同步计划就绪",
   "syncPlan.readyMessage": "同步计划已生成，请在侧边栏查看详情并确认执行。",
+  "syncPlan.firstUseUsage": "请勿让 OneDrive 客户端、iCloud、Dropbox、Syncthing 等其他同步工具同时管理同一个本地仓库。首次同步或文件较多时可能需要更长时间，可在侧栏查看进度。",
+  "syncPlan.firstUseSafety": "同步过程中，EasySync 可能上传、下载或删除本地及 OneDrive 中的文件。重要内容请保留独立备份；同步不能替代备份。",
   "syncPlan.reviewUpdatedTitle": "同步计划已更新",
   "syncPlan.reviewUpdatedMessage": "同步范围或文件发生变化，计划已重新生成。请在侧边栏查看最新内容。",
   "syncPlan.viewButton": "查看计划",

@@ -7,7 +7,9 @@ import {
   mutationRecoveryStatusDetail,
   mutationRecoveryStatusLabel,
   mutationRecoveryTopStatusLabel,
+  shouldAutoSettleIdenticalRecovery,
 } from "../src/ui/mutation-recovery-presentation";
+import type { ManualMutationResolutionSnapshotV1 } from "../src/sync/types";
 
 describe("mutation recovery presentation", () => {
   it("keeps checking, network wait, and stable block semantically distinct", () => {
@@ -140,5 +142,40 @@ describe("mutation recovery presentation", () => {
     }, t)).toBe(
       "Automatically recovered 3 item(s), then continued syncing",
     );
+  });
+});
+
+describe("shouldAutoSettleIdenticalRecovery", () => {
+  const snapshot = (
+    overrides: Partial<ManualMutationResolutionSnapshotV1>,
+  ): ManualMutationResolutionSnapshotV1 => ({
+    version: 1,
+    sourceOperationId: "op-1",
+    scope: { accountId: "a" },
+    previousAction: "upload",
+    path: "note.md",
+    local: [{ path: "note.md", exists: true, hash: "h", size: 1 }],
+    remote: [{ path: "note.md", exists: true, hash: "h", size: 1 }],
+    factsDigest: "digest",
+    identical: true,
+    keepLocal: { available: true, deletesOtherSide: false },
+    keepRemote: { available: true, deletesOtherSide: false },
+    ...overrides,
+  }) as ManualMutationResolutionSnapshotV1;
+
+  it("auto-settles an identical ordinary snapshot", () => {
+    expect(shouldAutoSettleIdenticalRecovery(snapshot({}))).toBe(true);
+  });
+
+  it("never auto-settles a bundle review snapshot", () => {
+    const bundle = snapshot({});
+    (bundle as { bundleReview?: unknown }).bundleReview = {};
+    expect(shouldAutoSettleIdenticalRecovery(bundle)).toBe(false);
+  });
+
+  it("never auto-settles a non-identical snapshot", () => {
+    expect(shouldAutoSettleIdenticalRecovery(
+      snapshot({ identical: false }),
+    )).toBe(false);
   });
 });

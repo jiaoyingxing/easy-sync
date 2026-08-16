@@ -1,5 +1,6 @@
 import type { LocaleStrings } from "../i18n/types";
 import type {
+  ManualMutationResolutionSnapshotV1,
   MutationRecoveryBlockReason,
   MutationRecoveryHistory,
 } from "../sync/types";
@@ -40,6 +41,15 @@ const BLOCK_REASON_KEYS: Record<
     "mutationRecovery.reason.automaticBudgetExhausted",
   unknown: "mutationRecovery.reason.unknown",
 };
+
+export function shouldAutoSettleIdenticalRecovery(
+  snapshot: Readonly<ManualMutationResolutionSnapshotV1>,
+): boolean {
+  // Ordinary identical facts leave no keep-side decision for the user.
+  // Whole-bundle reviews carry their own member-level identity semantics
+  // and must keep their explicit confirmation flow.
+  return snapshot.identical && snapshot.bundleReview === undefined;
+}
 
 export function mutationRecoveryBlockReasonText(
   reason: MutationRecoveryBlockReason | null | undefined,

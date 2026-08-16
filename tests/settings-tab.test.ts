@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { ConfigSyncModal } from "../src/ui/config-sync-modal";
+import { SyncPlanAlertModal } from "../src/ui/confirm-modal";
 import { buildSettingsSyncButtonState } from "../src/ui/settings-tab";
 import en from "../src/i18n/en";
 import zhCN from "../src/i18n/zh-cn";
@@ -72,30 +73,41 @@ describe("buildSettingsSyncButtonState", () => {
     });
   });
 
-  it("places automatic handling and both automatic triggers in the Automatic group", () => {
+  it("keeps account actions unheaded and separates range from automatic settings", () => {
     const source = readFileSync("src/ui/settings-tab.ts", "utf8");
     const displayStart = source.indexOf("  display(): void {");
     const refreshStart = source.indexOf("  refreshAuthState(): void {", displayStart);
     const displaySource = source.slice(displayStart, refreshStart);
-    const syncSectionStart = source.indexOf("  private renderSyncSection(");
+    const accountSectionStart = source.indexOf("  private renderAccountSection(");
+    const rangeSectionStart = source.indexOf("  private renderRangeSection(");
     const automaticSectionStart = source.indexOf("  private renderAutomaticSection(");
     const aboutSectionStart = source.indexOf("  private renderAboutSection(");
-    const syncSection = source.slice(syncSectionStart, automaticSectionStart);
+    const accountSection = source.slice(accountSectionStart, rangeSectionStart);
+    const rangeSection = source.slice(rangeSectionStart, automaticSectionStart);
     const automaticSection = source.slice(automaticSectionStart, aboutSectionStart);
     const enabledTriggerSettings = automaticSection.slice(
       automaticSection.indexOf("if (this.plugin.syncInterval > 0)"),
     );
 
-    expect(displaySource.indexOf("this.renderSyncSection(t)")).toBeLessThan(
+    expect(displaySource.indexOf("this.renderAccountSection(t)")).toBeLessThan(
+      displaySource.indexOf("this.renderRangeSection(t)"),
+    );
+    expect(displaySource.indexOf("this.renderRangeSection(t)")).toBeLessThan(
       displaySource.indexOf("this.renderAutomaticSection(t)"),
     );
-    expect(syncSection).toContain('setHeading(t("settings.group.sync"))');
-    expect(syncSection).toContain('.setName(t("settings.syncScope.name"))');
-    expect(syncSection).toContain('.setName(t("settings.syncExclusion.name"))');
-    expect(syncSection).toContain('.setName(t("settings.maxFileSize.name"))');
-    expect(syncSection).not.toContain('t("settings.automaticHandling.name")');
-    expect(syncSection).not.toContain('t("settings.autoSync.name")');
-    expect(syncSection).not.toContain('t("settings.syncInterval.name")');
+    expect(accountSection).toContain("new SettingGroup(this.accountSectionEl)");
+    expect(accountSection).not.toContain(".setHeading(");
+    expect(accountSection).toContain('.setName(t("settings.firstSync.name"))');
+    expect(accountSection).not.toContain('t("settings.firstSync.desc")');
+    expect(rangeSection).toContain(".setHeading(");
+    expect(rangeSection).toContain('t("settings.group.scope")');
+    expect(rangeSection).toContain('.setName(t("settings.syncScope.name"))');
+    expect(rangeSection).toContain('.setName(t("settings.syncExclusion.name"))');
+    expect(rangeSection).toContain('.setName(t("settings.maxFileSize.name"))');
+    expect(rangeSection).not.toContain('t("settings.firstSync.name")');
+    expect(rangeSection).not.toContain('t("settings.automaticHandling.name")');
+    expect(rangeSection).not.toContain('t("settings.autoSync.name")');
+    expect(rangeSection).not.toContain('t("settings.syncInterval.name")');
 
     expect(automaticSection).toContain('t("settings.group.automatic")');
     expect(automaticSection).toContain('setName(t("settings.automaticHandling.name"))');
@@ -122,6 +134,8 @@ describe("buildSettingsSyncButtonState", () => {
     expect(automaticSection).toContain('setAttribute(\n            "aria-label"');
     expect(automaticSection).not.toContain(".addExtraButton");
     expect(automaticSection).not.toContain('setName(t("settings.autoMerge.name"))');
+    expect(zhCN["settings.group.scope"]).toBe("范围");
+    expect(en["settings.group.scope"]).toBe("Scope");
     expect(zhCN["settings.group.automatic"]).toBe("自动");
     expect(en["settings.group.automatic"]).toBe("Automatic");
     expect(zhCN["settings.syncInterval.name"]).toBe("定时同步");
@@ -1051,28 +1065,70 @@ describe("buildSettingsSyncButtonState", () => {
     expect(en["settings.syncExclusion.intro"]).toContain("will not be deleted");
   });
 
-  it("keeps about guidance actionable, safety-specific, and equivalent across locales", () => {
+  it("moves first-use guidance into the first plan alert and keeps About lightweight", () => {
+    const settingsSource = readFileSync("src/ui/settings-tab.ts", "utf8");
+    const mainSource = readFileSync("src/main.ts", "utf8");
+    const alertSource = readFileSync("src/ui/confirm-modal.ts", "utf8");
+
     expect(zhCN["settings.about.author.desc"]).toBe(
       "焦应行（Jiao Yingxing）。使用中遇到问题，可在 GitHub 提交 Issue，或通过小红书私信联系作者。",
     );
-    expect(zhCN["settings.about.usage.name"]).toBe("使用建议");
-    expect(zhCN["settings.about.usage.desc"]).toBe(
+    expect(zhCN["syncPlan.firstUseUsage"]).toBe(
       "请勿让 OneDrive 客户端、iCloud、Dropbox、Syncthing 等其他同步工具同时管理同一个本地仓库。首次同步或文件较多时可能需要更长时间，可在侧栏查看进度。",
     );
-    expect(zhCN["settings.about.disclaimer.name"]).toBe("数据安全");
-    expect(zhCN["settings.about.disclaimer.desc"]).toBe(
+    expect(zhCN["syncPlan.firstUseSafety"]).toBe(
       "同步过程中，EasySync 可能上传、下载或删除本地及 OneDrive 中的文件。重要内容请保留独立备份；同步不能替代备份。",
     );
 
     expect(en["settings.about.author.desc"]).toBe(
       "Jiao Yingxing. If you run into a problem, open an issue on GitHub or contact the author on Xiaohongshu.",
     );
-    expect(en["settings.about.usage.name"]).toBe("Usage tips");
-    expect(en["settings.about.usage.desc"]).toContain("another sync tool");
-    expect(en["settings.about.usage.desc"]).toContain("progress is available in the sidebar");
-    expect(en["settings.about.disclaimer.name"]).toBe("Data safety");
-    expect(en["settings.about.disclaimer.desc"]).toContain("upload, download, or delete");
-    expect(en["settings.about.disclaimer.desc"]).toContain("sync is not a backup");
+    expect(en["syncPlan.firstUseUsage"]).toContain("another sync tool");
+    expect(en["syncPlan.firstUseUsage"]).toContain("progress is available in the sidebar");
+    expect(en["syncPlan.firstUseSafety"]).toContain("upload, download, or delete");
+    expect(en["syncPlan.firstUseSafety"]).toContain("sync is not a backup");
+
+    expect(settingsSource).not.toContain("settings.about.usage");
+    expect(settingsSource).not.toContain("settings.about.disclaimer");
+    expect(mainSource).toContain('t("syncPlan.firstUseUsage")');
+    expect(mainSource).toContain('t("syncPlan.firstUseSafety")');
+    expect(alertSource).toContain("for (const message of this.messages)");
+  });
+
+  it("renders every first-use message in the existing plan alert", () => {
+    const paragraphs: string[] = [];
+    const onViewPlan = vi.fn();
+    const close = vi.fn();
+    let click: (() => void) | undefined;
+    const modal = Object.create(SyncPlanAlertModal.prototype) as SyncPlanAlertModal;
+    Object.assign(modal as object, {
+      title: "同步计划就绪",
+      messages: ["计划说明", "使用建议", "数据安全"],
+      buttonLabel: "查看计划",
+      onViewPlan,
+      close,
+      setTitle: vi.fn(),
+      contentEl: {
+        empty: vi.fn(),
+        createEl: (_tag: string, options: { text: string }) => {
+          paragraphs.push(options.text);
+          return {};
+        },
+        createDiv: () => ({
+          createEl: () => ({
+            addEventListener: (_event: string, handler: () => void) => {
+              click = handler;
+            },
+          }),
+        }),
+      },
+    });
+
+    modal.onOpen();
+    expect(paragraphs).toEqual(["计划说明", "使用建议", "数据安全"]);
+    click?.();
+    expect(onViewPlan).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
   });
 
   it("renders both automatic handling choices as native toggles without triggering sync", () => {

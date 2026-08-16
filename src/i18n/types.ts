@@ -32,7 +32,7 @@ export interface LocaleStrings {
   "ribbon.ready": string;
 
   // ---- Settings Groups ----
-  "settings.group.sync": string;
+  "settings.group.scope": string;
   "settings.group.automatic": string;
   "settings.group.maintenance": string;
   "settings.group.about": string;
@@ -55,7 +55,6 @@ export interface LocaleStrings {
   "settings.account.checking": string;
   "settings.account.logout": string;
   "settings.firstSync.name": string;
-  "settings.firstSync.desc": string;
   "settings.firstSync.start": string;
   "settings.firstSync.sync": string;
   "settings.autoSync.name": string;
@@ -167,10 +166,6 @@ export interface LocaleStrings {
   "settings.about.author.desc": string;
   "settings.about.contact.github": string;
   "settings.about.contact.xiaohongshu": string;
-  "settings.about.usage.name": string;
-  "settings.about.usage.desc": string;
-  "settings.about.disclaimer.name": string;
-  "settings.about.disclaimer.desc": string;
 
   // ---- Sync View ----
   "syncView.title": string;
@@ -249,7 +244,7 @@ export interface LocaleStrings {
   "syncView.mutationResolution.identical": string;
   "syncView.mutationResolution.keepLocal": string;
   "syncView.mutationResolution.keepRemote": string;
-  "syncView.mutationResolution.unavailable": string;
+  "syncView.mutationResolution.singleActionHint": string;
   "syncView.mutationResolution.deleteConfirmTitle": string;
   "syncView.mutationResolution.deleteConfirm": string;
   "syncView.mutationResolution.deleteConfirmMessage": string;
@@ -664,6 +659,8 @@ export interface LocaleStrings {
   // ---- Sync Plan Alert & Review ----
   "syncPlan.readyTitle": string;
   "syncPlan.readyMessage": string;
+  "syncPlan.firstUseUsage": string;
+  "syncPlan.firstUseSafety": string;
   "syncPlan.reviewUpdatedTitle": string;
   "syncPlan.reviewUpdatedMessage": string;
   "syncPlan.viewButton": string;
