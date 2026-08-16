@@ -142,6 +142,26 @@ describe("conflict detail presentation", () => {
     expect(zhCN).toContain("未能下载远端版本，本次未作更改");
   });
 
+  it("keeps the conflict title static and renders the path as an independent wrapping fact", () => {
+    const source = readFileSync("src/ui/conflict-detail-modal.ts", "utf8");
+    const zhCN = readFileSync("src/i18n/zh-cn.ts", "utf8");
+    const en = readFileSync("src/i18n/en.ts", "utf8");
+    const styles = readFileSync("styles.css", "utf8");
+
+    expect(zhCN).toContain('"conflictDetail.title": "冲突详情"');
+    expect(en).toContain('"conflictDetail.title": "Conflict details"');
+    expect(source).toContain('text: t("conflictDetail.title")');
+    expect(source).toContain('t("conflictDetail.path")');
+    expect(source).toContain('"easy-sync-detail-path-value"');
+    expect(source).not.toContain('t("conflictDetail.title", { path: this.item.path })');
+    expect(styles).toMatch(
+      /\.easy-sync-detail-path-value\s*\{[^}]*overflow-wrap:\s*anywhere;/s,
+    );
+    expect(styles).not.toMatch(
+      /\.easy-sync-conflict-detail h3\s*\{[^}]*word-break:\s*break-all;/s,
+    );
+  });
+
   it("restores the f3e0bbe metadata hierarchy with neutral headers and colored data columns", () => {
     const source = readFileSync("src/ui/conflict-detail-modal.ts", "utf8");
     const sharedSource = readFileSync("src/ui/file-comparison-modal.ts", "utf8");

@@ -1,5 +1,11 @@
 import { sha256Hex } from "../crypto";
 import type { DiagEntry } from "./diagnostic-logger";
+import { isRecord } from "../obsidian-compat";
+import {
+  SHARED_SYNC_PROTOCOL_PROFILE_DIAGNOSTIC_EVENT,
+  type SharedSyncProtocolInconsistencyEvidence,
+  type SharedSyncProtocolInconsistencyReason,
+} from "./shared-sync-protocol-profile";
 import { resolveContentEquality } from "./content-equality";
 import type { CommunityPluginInventoryItem } from "./community-plugin-inventory";
 import {
@@ -187,6 +193,58 @@ export function findLatestAutomaticHandlingSummary(
   );
 }
 
+const SHARED_PROTOCOL_REASONS = new Set<SharedSyncProtocolInconsistencyReason>([
+  "invalid-v2",
+  "unsupported-v2",
+  "invalid-v3",
+  "unsupported-v3",
+  "v2-scope-mismatch",
+  "v3-only-unbound",
+  "recovery-proof-incomplete",
+  "binding-mismatch",
+  "generation-mismatch",
+  "predecessor-mismatch",
+  "target-slot-occupied",
+]);
+
+/** Read only the fixed, already-redacted protocol profile diagnostic event. */
+export function findLatestSharedProtocolProfileSummary(
+  entries: readonly DiagEntry[],
+): SharedSyncProtocolInconsistencyEvidence | undefined {
+  for (const entry of [...entries].reverse()) {
+    if (
+      entry.cat !== "state"
+      || entry.msg !== SHARED_SYNC_PROTOCOL_PROFILE_DIAGNOSTIC_EVENT
+      || !isRecord(entry.data)
+      || entry.data.status !== "inconsistent"
+      || typeof entry.data.reason !== "string"
+      || !SHARED_PROTOCOL_REASONS.has(
+        entry.data.reason as SharedSyncProtocolInconsistencyReason,
+      )
+      || !isGenerationSummary(entry.data.v2Generation)
+      || !isGenerationSummary(entry.data.v3Generation)
+      || (
+        entry.data.predecessor !== "match"
+        && entry.data.predecessor !== "mismatch"
+        && entry.data.predecessor !== "unavailable"
+      )
+    ) continue;
+    return {
+      status: "inconsistent",
+      reason: entry.data.reason as SharedSyncProtocolInconsistencyReason,
+      v2Generation: entry.data.v2Generation,
+      v3Generation: entry.data.v3Generation,
+      predecessor: entry.data.predecessor,
+    };
+  }
+  return undefined;
+}
+
+function isGenerationSummary(value: unknown): value is string {
+  return value === "—"
+    || (typeof value === "string" && /^[0-9a-f]{12}$/.test(value));
+}
+
 export interface MutationRecoverySummary {
   total: number;
   intentOnly: number;
@@ -247,7 +305,6 @@ export interface CommunityPluginSyncDiagnosticSummary {
     remoteOnly: number;
     manifestIssues: number;
   };
-  enablement: { anchors: number; pending: number };
   remoteInventoryTrusted: boolean;
   policyFingerprint: string;
 }
@@ -257,8 +314,6 @@ export async function summarizeCommunityPluginSync(input: {
   policy: Readonly<CommunityPluginSyncPolicyV1>;
   inventory: readonly CommunityPluginInventoryItem[];
   remoteInventoryTrusted: boolean;
-  anchors: number;
-  pending: number;
 }): Promise<CommunityPluginSyncDiagnosticSummary> {
   const effectiveDataIgnoredIds = new Set(
     input.policy.data.ignoredPluginIds ?? [],
@@ -317,10 +372,6 @@ export async function summarizeCommunityPluginSync(input: {
       localOnly: input.inventory.filter((item) => item.local && !item.remote).length,
       remoteOnly: input.inventory.filter((item) => !item.local && item.remote).length,
       manifestIssues: input.inventory.filter((item) => item.manifestIssue).length,
-    },
-    enablement: {
-      anchors: Math.max(0, input.anchors),
-      pending: Math.max(0, input.pending),
     },
     remoteInventoryTrusted: input.remoteInventoryTrusted,
     policyFingerprint,

@@ -285,6 +285,92 @@ describe("V2 folder-create reducer", () => {
     expect(reduceFolderStateEnvelopeV2(next, record)).toBe(next);
   });
 
+  it("rebases reviewed two-sided moves from the last committed path", () => {
+    const current = envelope([
+      {
+        id: "folder",
+        name: "Cloud",
+        folder: {},
+        parentReference: { id: scope.filesRootId },
+        eTag: "etag-cloud",
+      },
+      {
+        id: "file",
+        name: "a.md",
+        file: { hashes: { sha256Hash: "a".repeat(64) } },
+        size: 10,
+        parentReference: { id: "folder" },
+        eTag: "etag-file",
+        cTag: "ctag-file",
+      },
+    ]);
+    current.folderAnchors!.byAnchorId = {
+      "folder:folder": {
+        anchorId: "folder:folder",
+        remoteId: "folder",
+        lastPath: "Notes",
+        parentRemoteId: scope.filesRootId,
+        remoteETag: "etag-notes",
+        confirmedGeneration: 3,
+        confirmedAt: 1,
+      },
+    };
+    current.anchors.byAnchorId = {
+      "file:file": {
+        anchorId: "file:file",
+        remoteId: "file",
+        lastPath: "Notes/a.md",
+        contentHash: "a".repeat(64),
+        size: 10,
+        remoteETag: "etag-file",
+        confirmedAt: 1,
+        confirmedBy: "equal-read",
+      },
+    };
+    const moved: RemoteFolderEntry = {
+      path: "Archive",
+      driveId: "folder",
+      parentId: scope.filesRootId,
+      name: "Archive",
+      eTag: "etag-archive",
+    };
+    const moveIntent: FolderMutationIntentV2 = {
+      ...intent("moveRemoteFolder", moved.path, {
+        ...moved,
+        path: "Cloud",
+        name: "Cloud",
+        eTag: "etag-cloud",
+      }),
+      sourcePath: "Cloud",
+      folderId: "folder",
+      expectedLocal: { exists: true },
+      reviewedLocationMove: {
+        version: 1,
+        sourceCommitSeq: 3,
+        sourceLifecycleEpoch: 1,
+        sourceAnchorPath: "Notes",
+      },
+    };
+    const record = receipt(moveIntent, moved);
+
+    const next = reduceFolderStateEnvelopeV2(current, record);
+
+    expect(next.folderAnchors!.byAnchorId["folder:folder"]).toMatchObject({
+      lastPath: "Archive",
+      remoteETag: "etag-archive",
+    });
+    expect(next.anchors.byAnchorId["file:file"]).toMatchObject({
+      lastPath: "Archive/a.md",
+      confirmedBy: "folder-move-cas",
+    });
+    expect(reduceFolderStateEnvelopeV2(next, record)).toBe(next);
+
+    const changed = structuredClone(current);
+    changed.meta.commitSeq = 4;
+    expect(() => reduceFolderStateEnvelopeV2(changed, record))
+      .toThrow("Reviewed folder location source changed");
+  });
+
   it("retires only an empty folder identity and replays safely", () => {
     const current = envelope([{
       id: "empty",

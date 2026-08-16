@@ -186,6 +186,36 @@ export class StateV2AuthorityWitnessStore {
     }) as Promise<StateV2ActiveAuthorityWitness>;
   }
 
+  /** Advance only the protocol binding for one unchanged active manifest. */
+  async upgradeProtocolBinding(input: {
+    expectedManifest: StateV2Manifest;
+    expectedRevision: number;
+    expectedBinding: SharedSyncProtocolBinding;
+    nextBinding: SharedSyncProtocolBinding;
+    now?: number;
+  }): Promise<StateV2ActiveAuthorityWitness> {
+    const current = await this.load();
+    if (current?.status === "active"
+      && sameManifest(current.manifest, input.expectedManifest)
+      && sameProtocolBinding(current.protocolBinding, input.nextBinding)) return current;
+    if (
+      !current
+      || current.status !== "active"
+      || current.revision !== input.expectedRevision
+      || !sameManifest(current.manifest, input.expectedManifest)
+      || !sameProtocolBinding(current.protocolBinding, input.expectedBinding)
+      || !isSharedSyncProtocolBindingTransitionAllowed(input.expectedBinding, input.nextBinding)
+    ) {
+      throw new Error("V2 shared protocol binding upgrade is not authorized");
+    }
+    return this.publish({
+      ...current,
+      revision: current.revision + 1,
+      updatedAt: Math.max(input.now ?? Date.now(), current.updatedAt),
+      protocolBinding: structuredClone(input.nextBinding),
+    }) as Promise<StateV2ActiveAuthorityWitness>;
+  }
+
   /**
    * Advance an already-active V2 authority to a newer manifest generation.
    *
@@ -597,11 +627,25 @@ function witnessTransitionAllowed(
       current.storageAuthority,
       staged.storageAuthority,
     );
-  return (manifestTransition || storageTransition)
+  const protocolTransition = sameManifest(current.manifest, staged.manifest)
+    && sameStorageAuthorityOptional(current.storageAuthority, staged.storageAuthority)
+    && current.protocolBinding !== undefined
+    && staged.protocolBinding !== undefined
+    && isSharedSyncProtocolBindingTransitionAllowed(current.protocolBinding, staged.protocolBinding);
+  return (manifestTransition || storageTransition || protocolTransition)
     && protocolBindingTransitionAllowed(
     current.protocolBinding,
     staged.protocolBinding,
   );
+}
+
+function sameStorageAuthorityOptional(
+  left: StateV2IndexedDbStorageAuthority | undefined,
+  right: StateV2IndexedDbStorageAuthority | undefined,
+): boolean {
+  return left === undefined
+    ? right === undefined
+    : right !== undefined && sameStorageAuthority(left, right);
 }
 
 function isIndexedDbStorageAuthority(

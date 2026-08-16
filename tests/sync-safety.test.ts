@@ -194,6 +194,7 @@ function makeActiveV2State(
     ...remoteStateStub(),
     legacyAutoSyncAllowed: false,
     isV2StateActive: true,
+    retireAllFirstSyncVerificationEvidence: vi.fn().mockResolvedValue(0),
     hasV2StateLoadRecoveryBlock: false,
     hasV2RemoteScopeRecovery: false,
     hasMutationRecoveryQuarantineCorruption: false,
@@ -224,6 +225,7 @@ function makeActiveV2State(
       },
       currentScope: SyncScope,
     ) => sameSyncScope(record.intent.scope, currentScope) ? record : null),
+    retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
     getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
     getBaseEntry: vi.fn((path: string) =>
       baseSnapshot.find((entry) => entry.path === path)),
@@ -396,6 +398,27 @@ function makeActiveV2State(
     );
     if (index >= 0) state.mutationLedger.splice(index, 1);
   });
+  state.retireUnreceiptedMutationIntentsForScopeExit = vi.fn(async (
+    expectedRecords: MutationLedgerEntryV1[],
+  ) => {
+    if (expectedRecords.some((expected) => {
+      const active = state.mutationLedger.find(
+        (record) => record.intent.operationId === expected.intent.operationId,
+      );
+      return !active || JSON.stringify(active) !== JSON.stringify(expected);
+    })) throw new Error("Mutation changed before scope exit");
+    const operationIds = new Set(
+      expectedRecords.map((record) => record.intent.operationId),
+    );
+    state.mutationLedger.splice(
+      0,
+      state.mutationLedger.length,
+      ...state.mutationLedger.filter(
+        (record) => !operationIds.has(record.intent.operationId),
+      ),
+    );
+    return expectedRecords.length;
+  });
   const applyMutationCheckpoint = (operationIds: readonly string[]) => {
     const records = operationIds.map((operationId) => {
       const record = state.mutationLedger.find(
@@ -502,6 +525,95 @@ function makeActiveV2State(
     state.remoteDeltaLink = projection.deltaLink;
     state.remoteScope = projection.scope;
     state.mutationLedger.splice(index, 1);
+  });
+  state.beginCommunityPluginBundleSettlement = vi.fn(async (
+    expectedRecords: MutationLedgerEntryV1[],
+    expectedConflicts: SyncPlanItem[],
+    entry: MutationLedgerEntryV1,
+  ) => {
+    const expectedIds = new Set(
+      expectedRecords.map((record) => record.intent.operationId),
+    );
+    if (expectedRecords.some((expected) => {
+      const active = state.mutationLedger.find(
+        (candidate) => candidate.intent.operationId === expected.intent.operationId,
+      );
+      return !active || JSON.stringify(active) !== JSON.stringify(expected);
+    }) || expectedConflicts.some((expected) => {
+      const active = state.pendingConflicts.find(
+        (candidate) => candidate.path === expected.path,
+      );
+      return !active || JSON.stringify(active) !== JSON.stringify(expected);
+    }) || state.mutationLedger.some((candidate) =>
+      candidate.intent.operationId === entry.intent.operationId
+      && !expectedIds.has(candidate.intent.operationId))) return false;
+    state.mutationLedger.push(structuredClone(entry));
+    return true;
+  });
+  state.recordCommunityPluginBundleSettlementReceipts = vi.fn(async (
+    expectedEntry: MutationLedgerEntryV1,
+    receipts: MutationReceiptV1[],
+  ) => {
+    const active = state.mutationLedger.find(
+      (candidate) => candidate.intent.operationId === expectedEntry.intent.operationId,
+    ) as MutationLedgerEntryV1 | undefined;
+    if (
+      !active
+      || JSON.stringify(active) !== JSON.stringify(expectedEntry)
+      || active.manualResolution?.version !== 2
+    ) return false;
+    const receiptById = new Map(
+      receipts.map((receipt) => [receipt.operationId, receipt]),
+    );
+    active.manualResolution.members = active.manualResolution.members.map(
+      (member) => ({
+        ...member,
+        receipt: receiptById.has(member.intent.operationId)
+          ? structuredClone(receiptById.get(member.intent.operationId)!)
+          : member.receipt,
+      }),
+    );
+    return true;
+  });
+  state.commitCommunityPluginBundleSettlementCheckpoint = vi.fn(async (
+    expectedEntry: MutationLedgerEntryV1,
+  ) => {
+    if (expectedEntry.manualResolution?.version !== 2) {
+      throw new Error("bundle settlement missing");
+    }
+    for (const member of expectedEntry.manualResolution.members) {
+      if (!member.receipt) throw new Error("bundle receipt missing");
+      envelope = reduceFileStateEnvelopeV2(envelope, {
+        intent: member.intent,
+        receipt: member.receipt,
+      });
+    }
+    const projection = projectStatePathViewV2(envelope);
+    baseSnapshot = projection.baseEntries;
+    remoteSnapshot = projection.remoteEntries;
+    state.baseSnapshot = baseSnapshot;
+    state.remoteSnapshot = remoteSnapshot;
+    const retired = new Set([
+      expectedEntry.intent.operationId,
+      ...expectedEntry.manualResolution.predecessorOperationIds,
+    ]);
+    const conflictPaths = new Set(
+      expectedEntry.manualResolution.conflictDecisions.map((item) => item.path),
+    );
+    state.mutationLedger.splice(
+      0,
+      state.mutationLedger.length,
+      ...state.mutationLedger.filter(
+        (candidate) => !retired.has(candidate.intent.operationId),
+      ),
+    );
+    state.pendingConflicts.splice(
+      0,
+      state.pendingConflicts.length,
+      ...state.pendingConflicts.filter(
+        (candidate) => !conflictPaths.has(candidate.path),
+      ),
+    );
   });
 
   return state;
@@ -3085,10 +3197,16 @@ describe("Persistent remote delta state", () => {
   async function makeManualResolutionHarness(input: {
     local?: Record<string, string>;
     remote?: Record<string, string>;
+    action?: MutationIntentV1["action"];
+    expectedLocalAtIntent?: boolean;
+    localExcludedByCurrentScope?: boolean;
+    remoteExcludedByCurrentScope?: boolean;
     sourcePath?: string;
     path: string;
     configDir?: string;
     receiptedRenameAnchorCollision?: boolean;
+    pendingConflictPaths?: string[];
+    withLedger?: boolean;
   }) {
     const encoder = new TextEncoder();
     const localBytes = new Map<string, ArrayBuffer>();
@@ -3134,7 +3252,16 @@ describe("Persistent remote delta state", () => {
         bytes,
       });
     }
-    const inspectLocal = vi.fn(async (path: string) => {
+    const inspectLocal = vi.fn(async (
+      path: string,
+      options: Readonly<{ allowExcludedForRecovery?: boolean }> = {},
+    ) => {
+      if (
+        input.localExcludedByCurrentScope
+        && !options.allowExcludedForRecovery
+      ) {
+        return { status: "uncertain" as const, reason: "excluded" as const };
+      }
       const bytes = localBytes.get(path);
       return bytes
         ? {
@@ -3159,6 +3286,14 @@ describe("Persistent remote delta state", () => {
         const bytes = localBytes.get(path);
         if (!bytes) throw new Error(`missing local: ${path}`);
         return bytes.slice(0);
+      }),
+      read: vi.fn(async (path: string) => {
+        const bytes = localBytes.get(path);
+        if (!bytes) throw new Error(`missing local: ${path}`);
+        return new TextDecoder().decode(bytes);
+      }),
+      write: vi.fn(async (path: string, value: string) => {
+        localBytes.set(path, encoder.encode(value).buffer);
       }),
       writeBinary: vi.fn(async (path: string, bytes: ArrayBuffer) => {
         localBytes.set(path, bytes.slice(0));
@@ -3191,10 +3326,12 @@ describe("Persistent remote delta state", () => {
       bytes: ArrayBuffer,
     ) => {
       const previous = remoteFiles.get(path)?.entry;
+      const separator = path.lastIndexOf("/");
+      const parentPath = separator < 0 ? "" : path.slice(0, separator);
       const entry: RemoteFileEntry = {
         path,
         driveId: previous?.driveId ?? `uploaded-${path}`,
-        parentId: TEST_SYNC_SCOPE.filesRootId,
+        parentId: previous?.parentId ?? ensureRemoteFolder(parentPath),
         size: bytes.byteLength,
         mtime: version,
         eTag: `etag-${version++}`,
@@ -3253,20 +3390,48 @@ describe("Persistent remote delta state", () => {
       };
     });
     const scope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
-    const committedRemoteEntries = [...remoteFiles.values()].map((item) => item.entry);
+    const committedRemoteEntries = input.remoteExcludedByCurrentScope
+      ? []
+      : [...remoteFiles.values()].map((item) => item.entry);
     const committedBaseEntries: BaseFileEntry[] = [];
     let blockedIntent: MutationIntentV1 = {
       version: 1,
       operationId: "blocked-operation",
       planRevision: 1,
       scope,
-      action: input.sourcePath ? "renameRemote" : "upload",
+      action: input.sourcePath ? "renameRemote" : input.action ?? "upload",
       path: input.path,
       ...(input.sourcePath ? { sourcePath: input.sourcePath } : {}),
       expectedLocal: { exists: false },
       expectedRemote: { exists: false },
       createdAt: 1,
     };
+    if (input.expectedLocalAtIntent) {
+      const expectedLocal = localBytes.get(input.path);
+      if (!expectedLocal) throw new Error("local intent harness requires a local file");
+      blockedIntent = {
+        ...blockedIntent,
+        expectedLocal: {
+          exists: true,
+          hash: await sha256Hex(expectedLocal),
+          size: expectedLocal.byteLength,
+        },
+      };
+    }
+    if (input.action === "download") {
+      const expectedRemote = remoteFiles.get(input.path)?.entry;
+      if (!expectedRemote) throw new Error("download harness requires a remote file");
+      blockedIntent = {
+        ...blockedIntent,
+        expectedRemote: {
+          exists: true,
+          driveId: expectedRemote.driveId,
+          eTag: expectedRemote.eTag,
+          size: expectedRemote.size,
+          sha256Hash: expectedRemote.sha256Hash,
+        },
+      };
+    }
     let blockedReceipt: MutationReceiptV1 | null = null;
     if (input.receiptedRenameAnchorCollision) {
       if (!input.sourcePath) throw new Error("collision harness requires a source path");
@@ -3340,12 +3505,52 @@ describe("Persistent remote delta state", () => {
         },
       };
     }
-    const ledger: MutationLedgerEntryV1[] = [{
-      intent: blockedIntent,
-      receipt: blockedReceipt,
-    }];
+    const ledger: MutationLedgerEntryV1[] = input.withLedger === false
+      ? []
+      : [{
+          intent: blockedIntent,
+          receipt: blockedReceipt,
+        }];
+    const pendingConflicts: SyncPlanItem[] = [];
+    for (const path of input.pendingConflictPaths ?? []) {
+      const local = localBytes.get(path);
+      const remote = remoteFiles.get(path)?.entry;
+      if (!local || !remote) {
+        throw new Error(`pending conflict harness requires both sides: ${path}`);
+      }
+      pendingConflicts.push({
+        type: SyncActionType.Conflict,
+        path,
+        local: {
+          path,
+          hash: await sha256Hex(local),
+          size: local.byteLength,
+          mtime: 1,
+          binary: false,
+        },
+        remote,
+        decisionToken: {
+          version: 1,
+          vaultName: "testVault",
+          accountId: scope.accountId,
+          scope,
+          local: {
+            exists: true,
+            hash: await sha256Hex(local),
+            size: local.byteLength,
+          },
+          remote: {
+            exists: true,
+            driveId: remote.driveId,
+            eTag: remote.eTag,
+          },
+          ancestorHash: null,
+        },
+      });
+    }
     const state = makeActiveV2State(committedRemoteEntries, committedBaseEntries, {
       mutationLedger: ledger,
+      pendingConflicts,
       remoteFolders: [...remoteFoldersByPath.values()],
     });
     const getDriveItemMetadataById = vi.fn(async (driveId: string) => {
@@ -3354,17 +3559,18 @@ describe("Persistent remote delta state", () => {
       );
       return found ? { id: driveId, eTag: found.entry.eTag } : null;
     });
+    const downloadFile = vi.fn(async (_vault: string, path: string) => {
+      const current = remoteFiles.get(path);
+      if (!current) throw new Error(`missing remote: ${path}`);
+      return current.bytes.slice(0);
+    });
     const onedrive = makeMockOneDrive({
       uploadFile,
       deleteItem,
       moveItemById,
       getFileMetadata: vi.fn(async (_vault: string, path: string) => metadata(path)),
       getDriveItemMetadataById,
-      downloadFile: vi.fn(async (_vault: string, path: string) => {
-        const current = remoteFiles.get(path);
-        if (!current) throw new Error(`missing remote: ${path}`);
-        return current.bytes.slice(0);
-      }),
+      downloadFile,
     });
     const executor = new SyncExecutor(
       onedrive,
@@ -3389,6 +3595,7 @@ describe("Persistent remote delta state", () => {
     return {
       adapter,
       deleteItem,
+      downloadFile,
       executor,
       getDriveItemMetadataById,
       inspectLocal,
@@ -3418,8 +3625,7 @@ describe("Persistent remote delta state", () => {
     });
     expect(harness.uploadFile).not.toHaveBeenCalled();
 
-    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
-      .toBe(true);
+    const resolved = await harness.executor.resolveMutationRecovery(reviewed!, "keep-local");
     expect(harness.state.mutationLedger).toEqual([]);
     expect(harness.uploadFile).toHaveBeenCalledOnce();
     expect(new TextDecoder().decode(harness.remoteFiles.get("note.md")!.bytes))
@@ -3492,8 +3698,10 @@ describe("Persistent remote delta state", () => {
     const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
 
     expect(reviewed?.identical).toBe(true);
-    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
-      .toBe(true);
+    const resolved = await harness.executor.resolveMutationRecovery(
+      reviewed!,
+      "keep-local",
+    );
     expect(harness.uploadFile).not.toHaveBeenCalled();
     expect(harness.deleteItem).not.toHaveBeenCalled();
     expect(harness.adapter.writeBinary).not.toHaveBeenCalled();
@@ -3552,12 +3760,31 @@ describe("Persistent remote delta state", () => {
 
     const pluginFile = await makeManualResolutionHarness({
       path: ".obsidian/plugins/example/main.js",
+      expectedLocalAtIntent: true,
       local: { ".obsidian/plugins/example/main.js": "local" },
       remote: { ".obsidian/plugins/example/main.js": "cloud" },
     });
     expect(await pluginFile.executor.getMutationRecoveryResolutionSnapshot())
-      .toBeNull();
+      .toMatchObject({
+        bundleReview: {
+          pluginId: "example",
+          local: { available: false, reason: "bundle-incomplete" },
+          remote: { available: false, reason: "bundle-incomplete" },
+          executionReady: false,
+        },
+        keepLocal: { available: false },
+        keepRemote: { available: false },
+      });
     expect(pluginFile.uploadFile).not.toHaveBeenCalled();
+
+    const pluginDataUpload = await makeManualResolutionHarness({
+      path: ".obsidian/plugins/example/data.json",
+      local: { ".obsidian/plugins/example/data.json": "local" },
+      remote: { ".obsidian/plugins/example/data.json": "cloud" },
+    });
+    expect(await pluginDataUpload.executor.getMutationRecoveryResolutionSnapshot())
+      .toBeNull();
+    expect(pluginDataUpload.uploadFile).not.toHaveBeenCalled();
 
     for (const fileName of ["main.js", "manifest.json", "styles.css"]) {
       const path = `.obsidian/plugins/easy-sync/${fileName}`;
@@ -3580,6 +3807,855 @@ describe("Persistent remote delta state", () => {
     expect(await customConfig.executor.getMutationRecoveryResolutionSnapshot())
       .toBeNull();
     expect(customConfig.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("replaces one reviewed plugin bundle from the cloud and retires its older evidence together", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const path = `${root}/main.js`;
+    const localManifest = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "0.9.13",
+      minAppVersion: "1.0.0",
+    });
+    const remoteManifest = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "0.9.12",
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path,
+      expectedLocalAtIntent: true,
+      pendingConflictPaths: [
+        `${root}/manifest.json`,
+      ],
+      local: {
+        [path]: "current local plugin code",
+        [`${root}/manifest.json`]: localManifest,
+        [`${root}/styles.css`]: "current local styles",
+      },
+      remote: {
+        [path]: "older remote plugin code",
+        [`${root}/manifest.json`]: remoteManifest,
+      },
+    });
+
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+
+    expect(reviewed).toMatchObject({
+      path,
+      previousAction: "upload",
+      bundleReview: {
+        kind: "community-plugin-bundle",
+        pluginId: "resojot",
+        displayName: "Resojot",
+        memberPaths: [
+          `${root}/main.js`,
+          `${root}/manifest.json`,
+          `${root}/styles.css`,
+        ],
+        conflictPaths: [
+          `${root}/manifest.json`,
+        ],
+        predecessorOperationIds: ["blocked-operation"],
+        executionReady: true,
+        executableChoices: ["keep-local", "keep-remote"],
+      },
+      local: [
+        expect.objectContaining({ path: `${root}/main.js`, exists: true }),
+        expect.objectContaining({ path: `${root}/manifest.json`, exists: true }),
+        expect.objectContaining({ path: `${root}/styles.css`, exists: true }),
+      ],
+      remote: [
+        expect.objectContaining({ path: `${root}/main.js`, exists: true }),
+        expect.objectContaining({ path: `${root}/manifest.json`, exists: true }),
+        expect.objectContaining({ path: `${root}/styles.css`, exists: false }),
+      ],
+      keepLocal: { available: true, deletesOtherSide: false },
+      keepRemote: { available: true, deletesOtherSide: true },
+    });
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-remote"))
+      .toBe(true);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
+    expect(harness.moveItemById).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingConflicts).toEqual([]);
+    expect(new TextDecoder().decode(harness.localBytes.get(path)!))
+      .toBe("older remote plugin code");
+    expect(new TextDecoder().decode(
+      harness.localBytes.get(`${root}/manifest.json`)! as ArrayBuffer,
+    )).toBe(remoteManifest);
+    expect(harness.localBytes.has(`${root}/styles.css`)).toBe(false);
+    expect(new TextDecoder().decode(harness.remoteFiles.get(path)!.bytes))
+      .toBe("older remote plugin code");
+    expect(new TextDecoder().decode(
+      harness.remoteFiles.get(`${root}/manifest.json`)!.bytes,
+    )).toBe(remoteManifest);
+  });
+
+  it("publishes one reviewed local plugin bundle member by member and closes its older evidence", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const paths = [
+      `${root}/main.js`,
+      `${root}/manifest.json`,
+      `${root}/styles.css`,
+    ];
+    const localManifest = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "1.0.1",
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: paths[0],
+      expectedLocalAtIntent: true,
+      pendingConflictPaths: paths,
+      local: {
+        [paths[0]]: "new local code",
+        [paths[1]]: localManifest,
+        [paths[2]]: "new local styles",
+      },
+      remote: {
+        [paths[0]]: "old remote code",
+        [paths[1]]: JSON.stringify({
+          id: "resojot",
+          name: "Resojot",
+          version: "1.0.0",
+          minAppVersion: "1.0.0",
+        }),
+        [paths[2]]: "old remote styles",
+      },
+    });
+
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+
+    expect(reviewed?.bundleReview?.executableChoices)
+      .toEqual(["keep-local", "keep-remote"]);
+    const resolved = await harness.executor.resolveMutationRecovery(
+      reviewed!,
+      "keep-local",
+    );
+    expect(harness.uploadFile).toHaveBeenCalledTimes(3);
+    expect(harness.uploadFile.mock.calls.map(([, path]) => path))
+      .toEqual([paths[0], paths[2], paths[1]]);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingConflicts).toEqual([]);
+    for (const path of paths) {
+      expect(new Uint8Array(harness.remoteFiles.get(path)!.bytes))
+        .toEqual(new Uint8Array(harness.localBytes.get(path)!));
+    }
+    expect(resolved).toBe(true);
+  });
+
+  it("removes a cloud-only optional plugin member when the reviewed local bundle is kept", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const stylesPath = `${root}/styles.css`;
+    const harness = await makeManualResolutionHarness({
+      path: `${root}/main.js`,
+      expectedLocalAtIntent: true,
+      pendingConflictPaths: [`${root}/manifest.json`],
+      local: {
+        [`${root}/main.js`]: "new local code",
+        [`${root}/manifest.json`]: JSON.stringify({
+          id: "resojot",
+          name: "Resojot",
+          version: "1.0.1",
+        }),
+      },
+      remote: {
+        [`${root}/main.js`]: "old remote code",
+        [`${root}/manifest.json`]: JSON.stringify({
+          id: "resojot",
+          name: "Resojot",
+          version: "1.0.0",
+        }),
+        [stylesPath]: "obsolete remote styles",
+      },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+
+    expect(reviewed?.keepLocal).toEqual({
+      available: true,
+      deletesOtherSide: true,
+    });
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(true);
+    expect(harness.deleteItem).toHaveBeenCalledWith(
+      "testVault",
+      stylesPath,
+      expect.any(String),
+      expect.any(String),
+    );
+    expect(harness.remoteFiles.has(stylesPath)).toBe(false);
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("keeps a reviewed plugin bundle at zero writes when cloud facts change", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const path = `${root}/main.js`;
+    const manifestPath = `${root}/manifest.json`;
+    const manifest = (version: string) => JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version,
+    });
+    const harness = await makeManualResolutionHarness({
+      path,
+      expectedLocalAtIntent: true,
+      local: {
+        [path]: "local code",
+        [manifestPath]: manifest("1.0.1"),
+      },
+      remote: {
+        [path]: "remote code",
+        [manifestPath]: manifest("1.0.0"),
+      },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    const remote = harness.remoteFiles.get(path)!;
+    harness.remoteFiles.set(path, {
+      entry: { ...remote.entry, eTag: "etag-after-review" },
+      bytes: new TextEncoder().encode("newer remote code").buffer,
+    });
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-remote"))
+      .toBe(false);
+    expect(harness.state.beginCommunityPluginBundleSettlement)
+      .not.toHaveBeenCalled();
+    expect(harness.adapter.writeBinary).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toHaveLength(1);
+  });
+
+  it("resumes a persisted whole-plugin choice after local replacement but before receipts", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const path = `${root}/main.js`;
+    const manifestPath = `${root}/manifest.json`;
+    const manifest = (version: string) => JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version,
+    });
+    const harness = await makeManualResolutionHarness({
+      path,
+      expectedLocalAtIntent: true,
+      local: {
+        [path]: "local code",
+        [manifestPath]: manifest("1.0.1"),
+      },
+      remote: {
+        [path]: "remote code",
+        [manifestPath]: manifest("1.0.0"),
+      },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    vi.mocked(harness.state.recordCommunityPluginBundleSettlementReceipts)
+      .mockRejectedValueOnce(new Error("simulated close after local replacement"));
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-remote"))
+      .toBe(false);
+    expect(new TextDecoder().decode(harness.localBytes.get(path)!))
+      .toBe("remote code");
+    expect(harness.state.mutationLedger).toHaveLength(2);
+    const writesAfterReplacement = vi.mocked(harness.adapter.writeBinary).mock.calls
+      .filter(([target]) => target === path || target === manifestPath).length;
+
+    await (harness.executor as unknown as {
+      recoverMutationLedger(scope: SyncScope): Promise<unknown>;
+    }).recoverMutationLedger({ ...TEST_SYNC_SCOPE, accountId: "account-id" });
+
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(vi.mocked(harness.adapter.writeBinary).mock.calls
+      .filter(([target]) => target === path || target === manifestPath))
+      .toHaveLength(writesAfterReplacement);
+    await expect((harness.executor as unknown as {
+      recoverMutationLedger(scope: SyncScope): Promise<unknown>;
+    }).recoverMutationLedger({ ...TEST_SYNC_SCOPE, accountId: "account-id" }))
+      .resolves.toBeNull();
+  });
+
+  it("resumes the same whole-plugin local choice after one member receipt is interrupted", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const paths = [
+      `${root}/main.js`,
+      `${root}/manifest.json`,
+      `${root}/styles.css`,
+    ];
+    const manifest = (version: string) => JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version,
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: paths[0],
+      expectedLocalAtIntent: true,
+      pendingConflictPaths: paths,
+      local: {
+        [paths[0]]: "new local code",
+        [paths[1]]: manifest("1.0.1"),
+        [paths[2]]: "new local styles",
+      },
+      remote: {
+        [paths[0]]: "old remote code",
+        [paths[1]]: manifest("1.0.0"),
+        [paths[2]]: "old remote styles",
+      },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    const recordReceipts = vi.mocked(
+      harness.state.recordCommunityPluginBundleSettlementReceipts,
+    );
+    const persistReceipt = recordReceipts.getMockImplementation();
+    if (!persistReceipt) throw new Error("bundle receipt fixture is missing");
+    recordReceipts
+      .mockImplementationOnce(persistReceipt)
+      .mockRejectedValueOnce(new Error("simulated close after second upload"));
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(false);
+    expect(harness.uploadFile.mock.calls.map(([, path]) => path))
+      .toEqual([paths[0], paths[2]]);
+    const interrupted = harness.state.mutationLedger.find(
+      (record) => record.manualResolution?.version === 2,
+    );
+    expect(interrupted?.manualResolution?.version === 2
+      ? interrupted.manualResolution.members.filter((member) => member.receipt)
+      : []).toHaveLength(1);
+
+    const recovery = harness.executor as unknown as {
+      lifecycle: { capture(): number };
+      recoverMutationLedger(
+        scope: SyncScope,
+        metrics: undefined,
+        operationEpoch: number,
+      ): Promise<unknown>;
+    };
+    await recovery.recoverMutationLedger(
+      { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+      undefined,
+      recovery.lifecycle.capture(),
+    );
+
+    expect(harness.uploadFile.mock.calls.map(([, path]) => path))
+      .toEqual([paths[0], paths[2], paths[1]]);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingConflicts).toEqual([]);
+    for (const path of paths) {
+      expect(new Uint8Array(harness.remoteFiles.get(path)!.bytes))
+        .toEqual(new Uint8Array(harness.localBytes.get(path)!));
+    }
+  });
+
+  it("settles ordinary conflicts for one selected plugin as one whole bundle", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const paths = [
+      `${root}/main.js`,
+      `${root}/manifest.json`,
+      `${root}/styles.css`,
+    ];
+    const manifest = (version: string) => JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version,
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: paths[0],
+      withLedger: false,
+      pendingConflictPaths: paths,
+      local: {
+        [paths[0]]: "local code",
+        [paths[1]]: manifest("1.0.1"),
+        [paths[2]]: "local styles",
+      },
+      remote: {
+        [paths[0]]: "remote code",
+        [paths[1]]: manifest("1.0.0"),
+        [paths[2]]: "remote styles",
+      },
+    });
+
+    const reviewed = await harness.executor
+      .getCommunityPluginBundleReviewSnapshot("resojot");
+
+    expect(reviewed).toMatchObject({
+      previousAction: "merge",
+      bundleReview: {
+        kind: "community-plugin-bundle",
+        pluginId: "resojot",
+        displayName: "Resojot",
+        conflictPaths: paths,
+        predecessorOperationIds: [],
+        local: { available: true },
+        remote: { available: true },
+        executionReady: true,
+        executableChoices: ["keep-local", "keep-remote"],
+      },
+      keepLocal: { available: true },
+      keepRemote: { available: true },
+    });
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.adapter.writeBinary).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
+
+    harness.executor.setCommunityPluginSyncPolicy({
+      version: 1,
+      files: { mode: "none", pluginIds: [] },
+      data: { mode: "none", pluginIds: [] },
+    });
+    expect(await harness.executor
+      .getCommunityPluginBundleReviewSnapshot("resojot"))
+      .toBeNull();
+    harness.executor.setCommunityPluginSyncPolicy({
+      version: 1,
+      files: { mode: "all", pluginIds: [] },
+      data: { mode: "none", pluginIds: [] },
+    });
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-remote"))
+      .toBe(true);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingConflicts).toEqual([]);
+    for (const path of paths) {
+      expect(new Uint8Array(harness.localBytes.get(path)!))
+        .toEqual(new Uint8Array(harness.remoteFiles.get(path)!.bytes));
+    }
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
+  });
+
+  it("offers the complete cloud bundle when an ordinary conflict starts from partial local files", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const mainPath = `${root}/main.js`;
+    const manifestPath = `${root}/manifest.json`;
+    const manifest = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: mainPath,
+      withLedger: false,
+      pendingConflictPaths: [mainPath],
+      local: { [mainPath]: "partial local code" },
+      remote: {
+        [mainPath]: "complete remote code",
+        [manifestPath]: manifest,
+      },
+    });
+
+    const reviewed = await harness.executor
+      .getCommunityPluginBundleReviewSnapshot("resojot");
+
+    expect(reviewed).toMatchObject({
+      bundleReview: {
+        pluginId: "resojot",
+        conflictPaths: [mainPath],
+        local: { available: false, reason: "bundle-incomplete" },
+        remote: { available: true },
+        executableChoices: ["keep-remote"],
+      },
+      keepLocal: { available: false },
+      keepRemote: { available: true },
+    });
+    expect(await harness.executor.resolveMutationRecovery(
+      reviewed!,
+      "keep-remote",
+    )).toBe(true);
+    expect(new Uint8Array(harness.localBytes.get(manifestPath)!))
+      .toEqual(new Uint8Array(harness.remoteFiles.get(manifestPath)!.bytes));
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("keeps separate plugin-code recovery choices isolated by plugin", async () => {
+    const firstRoot = ".obsidian/plugins/resojot";
+    const secondRoot = ".obsidian/plugins/dataview";
+    const firstPath = `${firstRoot}/main.js`;
+    const secondPath = `${secondRoot}/main.js`;
+    const manifest = (id: string, name: string, version: string) => JSON.stringify({
+      id,
+      name,
+      version,
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: firstPath,
+      expectedLocalAtIntent: true,
+      local: {
+        [firstPath]: "current resojot code",
+        [`${firstRoot}/manifest.json`]: manifest("resojot", "Resojot", "1.0.1"),
+        [secondPath]: "current dataview code",
+        [`${secondRoot}/manifest.json`]: manifest("dataview", "Dataview", "1.0.1"),
+      },
+      remote: {
+        [firstPath]: "older resojot code",
+        [`${firstRoot}/manifest.json`]: manifest("resojot", "Resojot", "1.0.0"),
+        [secondPath]: "older dataview code",
+        [`${secondRoot}/manifest.json`]: manifest("dataview", "Dataview", "1.0.0"),
+      },
+    });
+    const secondBytes = harness.localBytes.get(secondPath)!;
+    const firstEntry = harness.state.mutationLedger[0] as MutationLedgerEntryV1;
+    (harness.state.mutationLedger as MutationLedgerEntryV1[]).push({
+      intent: {
+        ...firstEntry.intent,
+        operationId: "blocked-operation-2",
+        path: secondPath,
+        expectedLocal: {
+          exists: true,
+          hash: await sha256Hex(secondBytes),
+          size: secondBytes.byteLength,
+        },
+        createdAt: 2,
+      },
+      receipt: null,
+    });
+
+    const firstReview = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    expect(firstReview).toMatchObject({
+      sourceOperationId: "blocked-operation",
+      path: firstPath,
+      bundleReview: {
+        kind: "community-plugin-bundle",
+        pluginId: "resojot",
+        predecessorOperationIds: ["blocked-operation"],
+        executionReady: true,
+        executableChoices: ["keep-local", "keep-remote"],
+      },
+      keepLocal: { available: true },
+      keepRemote: { available: true },
+    });
+    expect(await harness.executor.resolveMutationRecovery(firstReview!, "keep-remote"))
+      .toBe(true);
+    expect(harness.state.mutationLedger.map((entry) => entry.intent.operationId))
+      .toEqual(["blocked-operation-2"]);
+    expect(new Uint8Array(harness.localBytes.get(firstPath)!))
+      .toEqual(new Uint8Array(harness.remoteFiles.get(firstPath)!.bytes));
+    expect(new TextDecoder().decode(harness.localBytes.get(secondPath)!))
+      .toBe("current dataview code");
+    const secondReview = await harness.executor.getMutationRecoveryResolutionSnapshot(
+      "blocked-operation-2",
+    );
+    expect(secondReview).toMatchObject({
+      sourceOperationId: "blocked-operation-2",
+      path: secondPath,
+      bundleReview: {
+        kind: "community-plugin-bundle",
+        pluginId: "dataview",
+        predecessorOperationIds: ["blocked-operation-2"],
+        executionReady: true,
+        executableChoices: ["keep-local", "keep-remote"],
+      },
+      keepLocal: { available: true },
+      keepRemote: { available: true },
+    });
+    expect(await harness.executor.resolveMutationRecovery(secondReview!, "keep-remote"))
+      .toBe(true);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(new Uint8Array(harness.localBytes.get(secondPath)!))
+      .toEqual(new Uint8Array(harness.remoteFiles.get(secondPath)!.bytes));
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
+  });
+
+  it("reviews an explicit older local plugin choice without applying the automatic downgrade rule", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const path = `${root}/main.js`;
+    const manifest = (version: string) => JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version,
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path,
+      expectedLocalAtIntent: true,
+      local: {
+        [path]: "older local plugin code",
+        [`${root}/manifest.json`]: manifest("0.9.12"),
+      },
+      remote: {
+        [path]: "newer remote plugin code",
+        [`${root}/manifest.json`]: manifest("0.9.13"),
+      },
+    });
+
+    expect(await harness.executor.getMutationRecoveryResolutionSnapshot())
+      .toMatchObject({
+        bundleReview: {
+          pluginId: "resojot",
+          local: { available: true },
+          remote: { available: true },
+          executionReady: true,
+          executableChoices: ["keep-local", "keep-remote"],
+        },
+        keepLocal: { available: true },
+        keepRemote: { available: true },
+      });
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toHaveLength(1);
+  });
+
+  it("returns a stable bundle review when only the cloud bundle is complete", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const path = `${root}/main.js`;
+    const manifest = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path,
+      expectedLocalAtIntent: true,
+      local: { [path]: "partial local code" },
+      remote: {
+        [path]: "complete remote code",
+        [`${root}/manifest.json`]: manifest,
+      },
+    });
+
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+
+    expect(reviewed).toMatchObject({
+      bundleReview: {
+        pluginId: "resojot",
+        local: { available: false, reason: "bundle-incomplete" },
+        remote: { available: true },
+        executionReady: true,
+        executableChoices: ["keep-remote"],
+      },
+      keepLocal: { available: false },
+      keepRemote: { available: true },
+    });
+    expect(await harness.executor.getMutationRecoveryResolutionSnapshot())
+      .toMatchObject({ factsDigest: reviewed?.factsDigest });
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.adapter.writeBinary).not.toHaveBeenCalled();
+  });
+
+  it("fails both bundle directions closed when manifest identities disagree", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const path = `${root}/main.js`;
+    const manifest = (id: string) => JSON.stringify({
+      id,
+      name: id,
+      version: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path,
+      expectedLocalAtIntent: true,
+      local: {
+        [path]: "local code",
+        [`${root}/manifest.json`]: manifest("resojot"),
+      },
+      remote: {
+        [path]: "remote code",
+        [`${root}/manifest.json`]: manifest("another-plugin"),
+      },
+    });
+
+    expect(await harness.executor.getMutationRecoveryResolutionSnapshot())
+      .toMatchObject({
+        bundleReview: {
+          pluginId: "resojot",
+          local: { available: false, reason: "identity-mismatch" },
+          remote: { available: false, reason: "identity-mismatch" },
+          executionReady: false,
+        },
+        keepLocal: { available: false },
+        keepRemote: { available: false },
+      });
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.adapter.writeBinary).not.toHaveBeenCalled();
+  });
+
+  it("retires an intent-only plugin-code upload when its owner explicitly exits this device scope", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const path = `${root}/main.js`;
+    const harness = await makeManualResolutionHarness({
+      path,
+      expectedLocalAtIntent: true,
+      local: {
+        [path]: "older local plugin code",
+        [`${root}/manifest.json`]: JSON.stringify({
+          id: "resojot",
+          name: "Resojot",
+          version: "0.9.12",
+        }),
+      },
+      remote: {
+        [path]: "newer remote plugin code",
+        [`${root}/manifest.json`]: JSON.stringify({
+          id: "resojot",
+          name: "Resojot",
+          version: "0.9.13",
+        }),
+      },
+    });
+    const localBefore = new TextDecoder().decode(harness.localBytes.get(path)!);
+    const remoteBefore = new TextDecoder().decode(harness.remoteFiles.get(path)!.bytes);
+
+    await expect(
+      harness.executor.retireSelectedPluginCodeUploadRecoveriesForScopeExit(
+        (pluginId) => pluginId === "resojot",
+      ),
+    ).resolves.toBe(true);
+
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.downloadFile).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
+    expect(new TextDecoder().decode(harness.localBytes.get(path)!))
+      .toBe(localBefore);
+    expect(new TextDecoder().decode(harness.remoteFiles.get(path)!.bytes))
+      .toBe(remoteBefore);
+  });
+
+  it("does not retire unrelated recovery during plugin scope exit", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "note.md",
+      expectedLocalAtIntent: true,
+      local: { "note.md": "local" },
+      remote: { "note.md": "cloud" },
+    });
+
+    await expect(
+      harness.executor.retireSelectedPluginCodeUploadRecoveriesForScopeExit(
+        () => true,
+      ),
+    ).resolves.toBe(false);
+
+    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.downloadFile).not.toHaveBeenCalled();
+  });
+
+  it("offers strict manual settlement for a persisted plugin-data download while data remains selected", async () => {
+    const path = ".obsidian/plugins/sheet-plus/data.json";
+    const harness = await makeManualResolutionHarness({
+      action: "download",
+      path,
+      local: { [path]: "local-after-unknown-download" },
+      remote: { [path]: "cloud" },
+    });
+
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+
+    expect(reviewed).toMatchObject({
+      path,
+      previousAction: "download",
+      keepLocal: { available: true },
+      keepRemote: { available: true },
+    });
+  });
+
+  it("still settles only the persisted plugin-data download after data scope is disabled", async () => {
+    const path = ".obsidian/plugins/sheet-plus/data.json";
+    const harness = await makeManualResolutionHarness({
+      action: "download",
+      path,
+      local: { [path]: "local-after-unknown-download" },
+      remote: { [path]: "cloud" },
+      localExcludedByCurrentScope: true,
+      remoteExcludedByCurrentScope: true,
+    });
+    harness.executor.setCommunityPluginSyncPolicy({
+      version: 1,
+      files: { mode: "selected", pluginIds: ["sheet-plus"] },
+      data: { mode: "none", pluginIds: [] },
+    });
+
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+
+    expect(reviewed).toMatchObject({
+      path,
+      previousAction: "download",
+      keepLocal: { available: true },
+      keepRemote: { available: true },
+    });
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-remote"))
+      .toBe(true);
+    expect(new TextDecoder().decode(harness.localBytes.get(path)!)).toBe("cloud");
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.baseSnapshot).toEqual([]);
+    expect(harness.state.remoteSnapshot).toEqual([]);
+    expect(harness.inspectLocal).toHaveBeenCalledWith(
+      path,
+      { allowExcludedForRecovery: true },
+    );
+  });
+
+  it("keeps an excluded plugin-data settlement outside ordinary V2 state", async () => {
+    const path = ".obsidian/plugins/sheet-plus/data.json";
+    const harness = await makeManualResolutionHarness({
+      action: "download",
+      path,
+      local: { [path]: "local-after-unknown-download" },
+      remote: { [path]: "cloud" },
+      localExcludedByCurrentScope: true,
+      remoteExcludedByCurrentScope: true,
+    });
+    harness.executor.setCommunityPluginSyncPolicy({
+      version: 1,
+      files: { mode: "selected", pluginIds: ["sheet-plus"] },
+      data: { mode: "none", pluginIds: [] },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    const originalRemote = structuredClone(harness.state.remoteSnapshot);
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(true);
+    expect(new TextDecoder().decode(harness.remoteFiles.get(path)!.bytes))
+      .toBe("local-after-unknown-download");
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.baseSnapshot).toEqual([]);
+    expect(harness.state.remoteSnapshot).toEqual(originalRemote);
+  });
+
+  it("resumes an excluded plugin-data settlement after the write without repeating it", async () => {
+    const path = ".obsidian/plugins/sheet-plus/data.json";
+    const harness = await makeManualResolutionHarness({
+      action: "download",
+      path,
+      local: { [path]: "local-after-unknown-download" },
+      remote: { [path]: "cloud" },
+      localExcludedByCurrentScope: true,
+      remoteExcludedByCurrentScope: true,
+    });
+    harness.executor.setCommunityPluginSyncPolicy({
+      version: 1,
+      files: { mode: "selected", pluginIds: ["sheet-plus"] },
+      data: { mode: "none", pluginIds: [] },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+    vi.mocked(harness.state.recordManualMutationResolutionReceipt)
+      .mockRejectedValueOnce(new Error("receipt persistence interrupted"));
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-remote"))
+      .toBe(false);
+    expect(harness.downloadFile).toHaveBeenCalledOnce();
+
+    const epoch = (harness.executor as unknown as {
+      lifecycle: { capture(): number };
+    }).lifecycle.capture();
+    await (harness.executor as unknown as {
+      recoverMutationLedger(
+        scope: SyncScope,
+        metrics: undefined,
+        operationEpoch: number,
+      ): Promise<unknown>;
+    }).recoverMutationLedger(
+      { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+      undefined,
+      epoch,
+    );
+
+    expect(harness.downloadFile).toHaveBeenCalledOnce();
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.baseSnapshot).toEqual([]);
   });
 
   it("cancels after the final reviewed inspection without starting a write", async () => {
@@ -4071,39 +5147,60 @@ describe("Persistent remote delta state", () => {
     expect(harness.state.mutationLedger).toEqual([]);
   });
 
-  it("blocks planning when an unresolved mutation intent contradicts current remote identity", async () => {
+  it("isolates independent unresolved ordinary files while syncing an unrelated file", async () => {
     const expectedHash = "aa".repeat(32);
     const currentHash = "bb".repeat(32);
+    const unrelatedBytes = new TextEncoder().encode("new note").buffer;
+    const unrelatedHash = await sha256Hex(unrelatedBytes);
     const activeScope = {
       ...TEST_SYNC_SCOPE,
       accountId: "account-id",
     };
     const state = makeActiveV2State([], [], {
-      mutationLedger: [{
+      mutationLedger: ["note-a.md", "note-b.md"].map((path, index) => ({
         intent: {
-          version: 1,
-          operationId: "op-unresolved",
+          version: 1 as const,
+          operationId: `op-unresolved-${index}`,
           planRevision: 1,
           scope: activeScope,
-          action: "upload",
-          path: "note.md",
-          expectedLocal: { exists: true, hash: expectedHash, size: 3 },
-          expectedRemote: { exists: false },
+          action: "upload" as const,
+          path,
+          expectedLocal: {
+            exists: true as const,
+            hash: expectedHash,
+            size: 3,
+          },
+          expectedRemote: { exists: false as const },
           createdAt: 1,
         },
         receipt: null,
-      }],
+      })),
     });
     const local: LocalFileEntry = {
-      path: "note.md",
+      path: "note-a.md",
       hash: currentHash,
       size: 3,
       mtime: 2,
       binary: false,
     };
-    const uploadFile = vi.fn().mockResolvedValue({ id: "new-id", eTag: "new-etag" });
+    const secondLocal: LocalFileEntry = {
+      ...local,
+      path: "note-b.md",
+    };
+    const unrelated: LocalFileEntry = {
+      path: "other.md",
+      hash: unrelatedHash,
+      size: unrelatedBytes.byteLength,
+      mtime: 2,
+      binary: false,
+    };
+    const uploadFile = vi.fn().mockResolvedValue({
+      id: "other-id",
+      eTag: "other-etag",
+      parentReference: { id: activeScope.filesRootId },
+    });
     const scanAll = vi.fn().mockResolvedValue({
-      entries: [local],
+      entries: [local, secondLocal, unrelated],
       folders: [],
       folderScanComplete: true,
       skippedLarge: [],
@@ -4114,22 +5211,33 @@ describe("Persistent remote delta state", () => {
     const executor = new SyncExecutor(
       makeMockOneDrive({
         uploadFile,
-        getFileMetadata: vi.fn().mockResolvedValue({
-          path: "note.md",
+        getFileMetadata: vi.fn().mockImplementation(async (
+          _vaultName: string,
+          path: string,
+        ) => ({
+          path,
           driveId: "unexpected-id",
           size: 3,
           mtime: 1,
           eTag: "unexpected-etag",
-        }),
+        })),
       }),
       {
         vault: {
-          adapter: makeMockAdapter({ readBinary: vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3]).buffer) }),
+          adapter: makeMockAdapter({
+            readBinary: vi.fn().mockImplementation(async (path: string) =>
+              path === unrelated.path
+                ? unrelatedBytes
+                : new Uint8Array([1, 2, 3]).buffer),
+          }),
           getFiles: vi.fn().mockReturnValue([]),
           getName: vi.fn().mockReturnValue("testVault"),
         },
         scanAll,
-        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+        inspectFile: vi.fn().mockImplementation(async (path: string) => ({
+          status: "present",
+          entry: path === secondLocal.path ? secondLocal : local,
+        })),
         shouldSyncFolderPath: vi.fn().mockReturnValue(true),
       } as unknown as LocalScanner,
       state,
@@ -4144,22 +5252,298 @@ describe("Persistent remote delta state", () => {
 
     const result = await executor.run("manual", {});
 
-    expect(result.success).toBe(false);
-    expect(result.message).toBe(
-      "failed:Mutation outcome requires manual review: op-unresolved",
-    );
+    expect(result.success).toBe(true);
     expect(scanAll).toHaveBeenCalledOnce();
-    expect(uploadFile).not.toHaveBeenCalled();
-    expect(state.mutationLedger).toHaveLength(1);
-    expect(result.mutationRecovery).toEqual({
+    expect(uploadFile).toHaveBeenCalledOnce();
+    expect(uploadFile.mock.calls[0]?.[1]).toBe(unrelated.path);
+    expect(state.mutationLedger.map((entry) => entry.intent.operationId)).toEqual([
+      "op-unresolved-0",
+      "op-unresolved-1",
+    ]);
+    expect(result.mutationRecovery).toMatchObject({
       state: "blocked",
-      total: 1,
+      total: 2,
       settled: 0,
-      remaining: 1,
+      remaining: 2,
       retryAfterSeconds: null,
       blockReason: "facts-changed",
-      blockedOperationId: "op-unresolved",
+      blockedOperationId: "op-unresolved-0",
+      isolated: true,
     });
+  });
+
+  it("rebuilds a capsule-shaped state without leaking either path of the retained remote identity", async () => {
+    const baseHash = "aa".repeat(32);
+    const localHash = "bb".repeat(32);
+    const unrelatedBytes = new TextEncoder().encode("new note").buffer;
+    const unrelatedHash = await sha256Hex(unrelatedBytes);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const originalFolder: RemoteFolderEntry = {
+      path: "Notes",
+      driveId: "folder-notes",
+      parentId: activeScope.filesRootId,
+      name: "Notes",
+    };
+    const originalRemote: RemoteFileEntry = {
+      path: "Notes/note.md",
+      driveId: "protected-id",
+      parentId: originalFolder.driveId,
+      size: 3,
+      mtime: 1,
+      eTag: "protected-etag",
+      cTag: "protected-ctag",
+      sha256Hash: baseHash,
+    };
+    const base: BaseFileEntry = {
+      path: originalRemote.path,
+      hash: baseHash,
+      size: originalRemote.size,
+      eTag: originalRemote.eTag,
+    };
+    const state = makeActiveV2State([], [base], {
+      remoteFolders: [],
+      remoteDeltaLink: null,
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-moved-unresolved",
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload",
+          path: originalRemote.path,
+          expectedLocal: {
+            exists: true,
+            hash: baseHash,
+            size: originalRemote.size,
+          },
+          expectedRemote: {
+            exists: true,
+            driveId: originalRemote.driveId,
+            eTag: originalRemote.eTag,
+            size: originalRemote.size,
+            sha256Hash: baseHash,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    vi.mocked(state.getCommittedV2Envelope).mockImplementation(() => {
+      const movedEnvelope = createFileStateShadowEnvelopeV2({
+        scope: activeScope,
+        lifecycleEpoch: 2,
+        commitSeq: 2,
+        committedAt: 2,
+        remoteEntries: state.remoteSnapshot,
+        remoteFolders: state.remoteFolders,
+        baseEntries: [],
+      });
+      movedEnvelope.anchors.byAnchorId = {
+        "file:protected-id": {
+          anchorId: "file:protected-id",
+          remoteId: originalRemote.driveId,
+          lastPath: originalRemote.path,
+          contentHash: base.hash,
+          size: base.size,
+          remoteETag: base.eTag,
+          confirmedAt: 1,
+          confirmedBy: "equal-read",
+        },
+      };
+      movedEnvelope.folderAnchors = {
+        schemaVersion: 2,
+        byAnchorId: {},
+      };
+      return movedEnvelope;
+    });
+    const local: LocalFileEntry = {
+      path: originalRemote.path,
+      hash: localHash,
+      size: 3,
+      mtime: 2,
+      binary: false,
+    };
+    const unrelated: LocalFileEntry = {
+      path: "other.md",
+      hash: unrelatedHash,
+      size: unrelatedBytes.byteLength,
+      mtime: 2,
+      binary: false,
+    };
+    const uploadFile = vi.fn().mockResolvedValue({
+      id: "other-id",
+      eTag: "other-etag",
+      parentReference: { id: activeScope.filesRootId },
+    });
+    const downloadFile = vi.fn().mockResolvedValue(
+      new Uint8Array([4, 5, 6]).buffer,
+    );
+    const movedFolder: RemoteFolderEntry = {
+      path: "Archive",
+      driveId: "folder-archive",
+      parentId: activeScope.filesRootId,
+      name: "Archive",
+    };
+    const movedPath = `${movedFolder.path}/note.md`;
+    const replacementRemote: RemoteFileEntry = {
+      path: originalRemote.path,
+      driveId: "replacement-at-old-path",
+      parentId: originalFolder.driveId,
+      size: 3,
+      mtime: 1,
+      eTag: "replacement-etag",
+    };
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        uploadFile,
+        downloadFile,
+        getDelta: vi.fn().mockResolvedValue({
+          value: [{
+            id: originalFolder.driveId,
+            name: originalFolder.name,
+            folder: { childCount: 1 },
+            parentReference: { id: originalFolder.parentId },
+          }, {
+            id: movedFolder.driveId,
+            name: movedFolder.name,
+            folder: { childCount: 1 },
+            parentReference: { id: movedFolder.parentId },
+          }, {
+            id: originalRemote.driveId,
+            name: "note.md",
+            size: originalRemote.size,
+            eTag: "moved-etag",
+            cTag: "moved-ctag",
+            file: {},
+            parentReference: { id: movedFolder.driveId },
+            fileSystemInfo: {
+              lastModifiedDateTime: "2026-08-16T00:00:00.000Z",
+            },
+          }, {
+            id: replacementRemote.driveId,
+            name: "note.md",
+            size: replacementRemote.size,
+            eTag: replacementRemote.eTag,
+            file: {},
+            parentReference: { id: replacementRemote.parentId },
+            fileSystemInfo: {
+              lastModifiedDateTime: "2026-08-16T00:00:00.000Z",
+            },
+          }],
+          "@odata.deltaLink": "delta-after-move",
+        }),
+        getFileMetadata: vi.fn().mockResolvedValue(replacementRemote),
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter({
+            readBinary: vi.fn().mockImplementation(async (path: string) =>
+              path === unrelated.path
+                ? unrelatedBytes
+                : new Uint8Array([1, 2, 3]).buffer),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [local, unrelated],
+          folders: [{ path: originalFolder.path }],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({
+          status: "present",
+          entry: local,
+        }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+      {
+        t: (key: string, params?: Record<string, string | number>) =>
+          key === "result.syncFailed"
+            ? `failed:${params?.message}`
+            : key,
+      } as I18n,
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result).toMatchObject({ success: true });
+    expect(uploadFile).toHaveBeenCalledOnce();
+    expect(uploadFile.mock.calls[0]?.[1]).toBe(unrelated.path);
+    expect(downloadFile).not.toHaveBeenCalled();
+    expect(result.foldersCreated).toBe(0);
+    expect(result.foldersMoved).toBe(0);
+    expect(result.foldersDeleted).toBe(0);
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(state.remoteSnapshot).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: originalRemote.path,
+        driveId: replacementRemote.driveId,
+      }),
+      expect.objectContaining({
+        path: movedPath,
+        driveId: originalRemote.driveId,
+      }),
+    ]));
+    expect(state.baseSnapshot).not.toContainEqual(
+      expect.objectContaining({
+        path: originalRemote.path,
+        eTag: replacementRemote.eTag,
+      }),
+    );
+    expect(state.baseSnapshot).not.toContainEqual(
+      expect.objectContaining({ path: movedPath }),
+    );
+    expect(result.mutationRecovery).toMatchObject({
+      state: "blocked",
+      blockReason: "facts-changed",
+      blockedOperationId: "op-moved-unresolved",
+      isolated: true,
+    });
+
+    const boundary = executor as unknown as {
+      isPathProtectedByIsolatedRecovery(
+        path: string,
+        records: readonly Readonly<MutationLedgerEntryV1>[],
+      ): boolean;
+      isFolderProtectedByIsolatedRecovery(
+        path: string,
+        records: readonly Readonly<MutationLedgerEntryV1>[],
+      ): boolean;
+    };
+    const retainedRecords = state.mutationLedger as MutationLedgerEntryV1[];
+    vi.mocked(state.getCommittedV2Envelope).mockClear();
+    for (let index = 0; index < 200; index++) {
+      expect(boundary.isPathProtectedByIsolatedRecovery(
+        index % 2 === 0 ? originalRemote.path : movedPath,
+        retainedRecords,
+      )).toBe(true);
+    }
+    expect(boundary.isPathProtectedByIsolatedRecovery(
+      originalFolder.path,
+      retainedRecords,
+    )).toBe(true);
+    expect(boundary.isPathProtectedByIsolatedRecovery(
+      `${originalRemote.path}/replacement-child.md`,
+      retainedRecords,
+    )).toBe(true);
+    expect(boundary.isFolderProtectedByIsolatedRecovery(
+      `${originalRemote.path}/replacement-folder`,
+      retainedRecords,
+    )).toBe(true);
+    expect(boundary.isPathProtectedByIsolatedRecovery(
+      `${originalFolder.path}/sibling.md`,
+      retainedRecords,
+    )).toBe(false);
+    expect(state.getCommittedV2Envelope).toHaveBeenCalledOnce();
   });
 
   it("settles an active V2 ledger in recovery-only mode without entering planning or healthy commit", async () => {
@@ -4263,6 +5647,416 @@ describe("Persistent remote delta state", () => {
     expect(executePlan).not.toHaveBeenCalled();
     expect(state.setLastSyncTime).not.toHaveBeenCalled();
     expect(state.incrementRemoteGeneration).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "different-path intent-only records", receipted: false },
+    { name: "byte-identical reflected records", receipted: true },
+  ])("admits reset observation before touching duplicate operation IDs in $name", async ({ receipted }) => {
+    const content = new Uint8Array([41, 42, 43]).buffer;
+    const hash = await sha256Hex(content);
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const operationId = receipted
+      ? "op-duplicate-reflected"
+      : "op-duplicate-not-applied";
+    const makeRecord = (path: string): MutationLedgerEntryV1 => ({
+      intent: {
+        version: 1,
+        operationId,
+        planRevision: 1,
+        scope: activeScope,
+        action: receipted ? "deleteLocal" : "upload",
+        path,
+        expectedLocal: {
+          exists: true,
+          hash,
+          size: content.byteLength,
+        },
+        expectedRemote: { exists: false },
+        createdAt: 1,
+      },
+      receipt: receipted ? {
+        version: 1,
+        operationId,
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [],
+          baseRemovals: [path],
+          remoteUpserts: [],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [path],
+        },
+      } : null,
+    });
+    const first = makeRecord("duplicate-a.md");
+    const records = receipted
+      ? [first, structuredClone(first)]
+      : [first, makeRecord("duplicate-b.md")];
+    const originalLedger = structuredClone(records);
+    const state = makeActiveV2State([], [], {
+      mutationLedger: records,
+      pendingConflicts: [{ path: "must-stay-conflict.md" }],
+      pendingRemoteDeletes: [{ path: records[0].intent.path }],
+    });
+    if (receipted) {
+      vi.mocked(state.retireMutationCheckpointIfReflected)
+        .mockResolvedValue(true);
+    }
+    const uploadFile = vi.fn();
+    const deleteItem = vi.fn();
+    const downloadFile = vi.fn();
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ uploadFile, deleteItem, downloadFile }),
+      Object.assign(emptyScanner(), {
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({ status: "missing" }),
+      }),
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      {
+        recoveryOnly: true,
+        mutationRecoveryObservationOnly: true,
+      },
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.mutationRecovery).toMatchObject({
+      state: "blocked",
+      blockReason: "evidence-corrupt",
+      settled: 0,
+    });
+    expect(state.mutationLedger).toEqual(originalLedger);
+    expect(state.pendingConflicts).toEqual([{ path: "must-stay-conflict.md" }]);
+    expect(state.pendingRemoteDeletes).toEqual([{ path: records[0].intent.path }]);
+    expect(state.abandonMutationIntent).not.toHaveBeenCalled();
+    expect(state.recordMutationReceipt).not.toHaveBeenCalled();
+    expect(state.commitMutationCheckpoint).not.toHaveBeenCalled();
+    expect(state.retireMutationCheckpointIfReflected).not.toHaveBeenCalled();
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(deleteItem).not.toHaveBeenCalled();
+    expect(downloadFile).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "reset observation", observationOnly: true },
+    { name: "ordinary cold recovery", observationOnly: false },
+  ])("rejects a parser-readable ordinary receipt whose content is not bound to its intent before $name cleanup", async ({ observationOnly }) => {
+    const content = new Uint8Array([44, 45, 46]).buffer;
+    const receiptHash = await sha256Hex(content);
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const path = "semantic-mismatch.md";
+    const operationId = "op-semantic-mismatch";
+    const remote: RemoteFileEntry = {
+      path,
+      driveId: "semantic-remote",
+      parentId: activeScope.filesRootId,
+      size: content.byteLength,
+      mtime: 2,
+      eTag: "semantic-etag",
+      cTag: "semantic-ctag",
+      sha256Hash: receiptHash,
+    };
+    const record: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId,
+        planRevision: 1,
+        scope: activeScope,
+        action: "upload",
+        path,
+        expectedLocal: {
+          exists: true,
+          hash: "f".repeat(64),
+          size: content.byteLength,
+        },
+        expectedRemote: { exists: false },
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1,
+        operationId,
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [{
+            path,
+            hash: receiptHash,
+            size: content.byteLength,
+            eTag: remote.eTag,
+          }],
+          baseRemovals: [],
+          remoteUpserts: [remote],
+          remoteDeletes: [],
+          pendingConflictRemovals: [path],
+          pendingDeleteRemovals: [],
+        },
+      },
+    };
+    const state = makeActiveV2State([remote], [], {
+      mutationLedger: [record],
+      pendingConflicts: [{ path }],
+    });
+    vi.mocked(state.retireMutationCheckpointIfReflected)
+      .mockResolvedValue(true);
+    const executor = new SyncExecutor(
+      makeMockOneDrive(),
+      emptyScanner(),
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      {
+        recoveryOnly: true,
+        mutationRecoveryObservationOnly: observationOnly,
+      },
+    );
+
+    expect(result.success).toBe(false);
+    expect(result.mutationRecovery).toMatchObject({
+      state: "blocked",
+      blockReason: "evidence-corrupt",
+      settled: 0,
+      remaining: 1,
+    });
+    expect(state.mutationLedger).toEqual([record]);
+    expect(state.pendingConflicts).toEqual([{ path }]);
+    expect(state.retireMutationCheckpointIfReflected).not.toHaveBeenCalled();
+    expect(state.commitMutationCheckpoint).not.toHaveBeenCalled();
+  });
+
+  it("does not reuse a post-checkpoint commit sequence as the remote rebuild lineage", async () => {
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const contents = [
+      new Uint8Array([51, 52, 53]).buffer,
+      new Uint8Array([61, 62, 63]).buffer,
+    ];
+    const hashes = await Promise.all(contents.map((bytes) => sha256Hex(bytes)));
+    const locals: LocalFileEntry[] = hashes.map((hash, index) => ({
+      path: `lineage-${index}.md`,
+      hash,
+      size: contents[index].byteLength,
+      mtime: index + 1,
+      binary: false,
+    }));
+    const remotes: RemoteFileEntry[] = locals.map((local, index) => ({
+      path: local.path,
+      driveId: `lineage-remote-${index}`,
+      parentId: activeScope.filesRootId,
+      size: local.size,
+      mtime: index + 10,
+      eTag: `lineage-etag-${index}`,
+      cTag: `lineage-ctag-${index}`,
+      sha256Hash: local.hash,
+    }));
+    const records: MutationLedgerEntryV1[] = locals.map((local, index) => ({
+      intent: {
+        version: 1,
+        operationId: `op-lineage-${index}`,
+        planRevision: 1,
+        scope: activeScope,
+        action: "download",
+        path: local.path,
+        expectedLocal: { exists: false },
+        expectedRemote: {
+          exists: true,
+          driveId: remotes[index].driveId,
+          eTag: remotes[index].eTag,
+          size: remotes[index].size,
+          sha256Hash: remotes[index].sha256Hash,
+        },
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1,
+        operationId: `op-lineage-${index}`,
+        completedAt: index + 2,
+        checkpoint: {
+          baseUpserts: [{
+            path: local.path,
+            hash: local.hash,
+            size: local.size,
+            eTag: remotes[index].eTag,
+          }],
+          baseRemovals: [],
+          remoteUpserts: [],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      },
+    }));
+    const firstOperationId = records[0].intent.operationId;
+    const secondOperationId = records[1].intent.operationId;
+    const state = makeActiveV2State(remotes, [], { mutationLedger: records });
+    const retire = vi.mocked(state.retireMutationCheckpointIfReflected);
+    retire.mockImplementation(async (operationId) => operationId === secondOperationId);
+    const adapter = makeMockAdapter({
+      readBinary: vi.fn(async (path: string) => {
+        const index = locals.findIndex((entry) => entry.path === path);
+        if (index < 0) throw new Error(`missing ${path}`);
+        return contents[index];
+      }),
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getDelta: vi.fn().mockResolvedValue({
+          value: remotes.map((remote, index) => driveItem(remote.path, remote.sha256Hash, {
+            id: remote.driveId,
+            eTag: remote.eTag,
+            cTag: remote.cTag,
+            size: remote.size,
+            mtime: remote.mtime,
+          })),
+          "@odata.deltaLink": "lineage-delta",
+        }),
+        getFileMetadata: vi.fn(async (_vault: string, path: string) =>
+          remotes.find((entry) => entry.path === path) ?? null),
+      }),
+      {
+        vault: {
+          adapter,
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: locals,
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn(async (path: string) => ({
+          status: "present",
+          entry: locals.find((entry) => entry.path === path)!,
+        })),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      {
+        recoveryOnly: true,
+        mutationRecoveryObservationOnly: true,
+      },
+    );
+
+    expect(result.success).toBe(true);
+    expect(retire).toHaveBeenCalledTimes(1);
+    expect(retire.mock.calls[0][0]).toBe(firstOperationId);
+    expect(state.commitMutationCheckpoint).toHaveBeenCalledTimes(2);
+    expect(state.mutationLedger).toEqual([]);
+  });
+
+  it("carries the rebuild lineage only across consecutive reflected-retirement CAS revisions", async () => {
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const hash = "a".repeat(64);
+    const records: MutationLedgerEntryV1[] = [0, 1].map((index) => {
+      const path = `reflected-lineage-${index}.md`;
+      const operationId = `op-reflected-lineage-${index}`;
+      return {
+        intent: {
+          version: 1,
+          operationId,
+          planRevision: 1,
+          scope: activeScope,
+          action: "deleteLocal",
+          path,
+          expectedLocal: { exists: true, hash, size: 3 },
+          expectedRemote: { exists: false },
+          createdAt: 1,
+        },
+        receipt: {
+          version: 1,
+          operationId,
+          completedAt: index + 2,
+          checkpoint: {
+            baseUpserts: [],
+            baseRemovals: [path],
+            remoteUpserts: [],
+            remoteDeletes: [],
+            pendingConflictRemovals: [],
+            pendingDeleteRemovals: [path],
+          },
+        },
+      };
+    });
+    const state = makeActiveV2State([], [], { mutationLedger: records });
+    let reflectedEnvelope = state.getCommittedV2Envelope()!;
+    const rebuildCommitSeq = reflectedEnvelope.meta.commitSeq;
+    state.getCommittedV2Envelope = vi.fn(() => structuredClone(reflectedEnvelope));
+    const retire = vi.mocked(state.retireMutationCheckpointIfReflected);
+    retire.mockImplementation(async (operationId, expectedCommitSeq) => {
+      if (reflectedEnvelope.meta.commitSeq !== expectedCommitSeq) return false;
+      const index = state.mutationLedger.findIndex(
+        (record) => record.intent.operationId === operationId,
+      );
+      if (index < 0) return false;
+      state.mutationLedger.splice(index, 1);
+      reflectedEnvelope = {
+        ...reflectedEnvelope,
+        meta: {
+          ...reflectedEnvelope.meta,
+          commitSeq: reflectedEnvelope.meta.commitSeq + 1,
+        },
+      };
+      return true;
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive(),
+      emptyScanner(),
+      state,
+      "testVault",
+    );
+
+    const summary = await (executor as unknown as {
+      recoverMutationLedger(
+        scope: SyncScope,
+        metrics: undefined,
+        operationEpoch: undefined,
+        observationOnly: boolean,
+        remoteObservationCommitSeq: number,
+      ): Promise<unknown>;
+    }).recoverMutationLedger(
+      activeScope,
+      undefined,
+      undefined,
+      true,
+      rebuildCommitSeq,
+    );
+
+    expect(summary).toMatchObject({ state: "settled", settled: 2, remaining: 0 });
+    expect(retire.mock.calls.map((call) => call[1]))
+      .toEqual([rebuildCommitSeq, rebuildCommitSeq + 1]);
+    expect(state.commitMutationCheckpoint).not.toHaveBeenCalled();
+    expect(state.mutationLedger).toEqual([]);
   });
 
   it("rejects recovery-only mode before scan and Graph when public precommit is still authoritative", async () => {
@@ -4494,7 +6288,7 @@ describe("Persistent remote delta state", () => {
     expect(state.incrementRemoteGeneration).not.toHaveBeenCalled();
   });
 
-  it("independently settles later public 1.1.3 intents while the first unresolved upload still blocks planning", async () => {
+  it("settles a public 1.1.3 batch and isolates its one remaining ordinary file", async () => {
     const activeScope = {
       ...TEST_SYNC_SCOPE,
       accountId: "account-id",
@@ -4598,10 +6392,16 @@ describe("Persistent remote delta state", () => {
         graphCode: null,
       },
     });
-    expect(result.success).toBe(false);
-    expect(result.message).toBe(
-      "failed:Mutation outcome requires manual review: sanitized-network-op-1",
-    );
+    expect(result.success).toBe(true);
+    expect(result.mutationRecovery).toMatchObject({
+      state: "blocked",
+      total: 23,
+      settled: 22,
+      remaining: 1,
+      blockReason: "facts-changed",
+      blockedOperationId: "sanitized-network-op-1",
+      isolated: true,
+    });
     expect(scanAll).toHaveBeenCalledOnce();
     expect(uploadFile).not.toHaveBeenCalled();
     expect(state.mutationLedger.map(
@@ -4609,7 +6409,10 @@ describe("Persistent remote delta state", () => {
     )).toEqual(["sanitized-network-op-1"]);
     expect(state.recordMutationReceipt).toHaveBeenCalledTimes(11);
     expect(state.commitMutationCheckpoint).toHaveBeenCalledTimes(11);
-    expect(state.abandonMutationIntent).toHaveBeenCalledTimes(11);
+    // Eleven known-not-applied recovery records are retired first. The same
+    // paths are then reconsidered by the ordinary planner; their live remote
+    // preflight makes those new intents no-ops and retires them as well.
+    expect(state.abandonMutationIntent).toHaveBeenCalledTimes(22);
     expect(recoveryWarn).toHaveBeenCalledWith(
       "execute",
       "mutation recovery batch summary",
@@ -5316,6 +7119,31 @@ describe("Persistent remote delta state", () => {
       state,
       "testVault",
     );
+
+    const observation = await executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      {
+        recoveryOnly: true,
+        mutationRecoveryObservationOnly: true,
+      },
+    );
+
+    expect(observation.success).toBe(false);
+    expect(observation.mutationRecovery).toMatchObject({
+      state: "blocked",
+      remaining: 1,
+    });
+    expect(files.has(local.path)).toBe(false);
+    expect(downloadFile).not.toHaveBeenCalled();
+    expect(adapter.writeBinary).not.toHaveBeenCalled();
+    expect(adapter.rename).not.toHaveBeenCalled();
+    expect(state.mutationLedger).toHaveLength(1);
+    scanAll.mockClear();
+    downloadFile.mockClear();
+    getDelta.mockClear();
 
     const result = await executor.run("manual", {});
 
@@ -6039,6 +7867,161 @@ describe("Persistent remote delta state", () => {
       size: local.size,
       eTag: remote.eTag,
     });
+  });
+
+  it("recovers an applied local-only download without forging ordinary V2 state", async () => {
+    const content = new Uint8Array([7, 8, 9]).buffer;
+    const hash = await sha256Hex(content);
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const targetPath = ".obsidian/plugins/example/main.js";
+    const sourcePath = `community-plugin-content-v1/plugins/6578616d706c65/generations/1/objects/${hash}.bin`;
+    const local: LocalFileEntry = {
+      path: targetPath,
+      hash,
+      size: content.byteLength,
+      mtime: 4,
+      binary: true,
+    };
+    const source: RemoteFileEntry = {
+      path: sourcePath,
+      driveId: "generation-object-main",
+      parentId: "generation-objects",
+      size: content.byteLength,
+      mtime: 3,
+      eTag: "etag-generation-main",
+      cTag: "ctag-generation-main",
+      sha256Hash: hash,
+    };
+    const state = makeActiveV2State([], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-generation-local-only-receipt-lost",
+          planRevision: 1,
+          scope: activeScope,
+          action: "download",
+          path: targetPath,
+          sourcePath,
+          stateEffect: "local-only",
+          expectedLocal: { exists: false },
+          expectedRemote: {
+            exists: true,
+            driveId: source.driveId,
+            eTag: source.eTag,
+            size: source.size,
+            sha256Hash: hash,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getDriveItemMetadataById: vi.fn().mockResolvedValue({
+          id: source.driveId,
+          name: `${hash}.bin`,
+          file: {},
+          size: source.size,
+          eTag: source.eTag,
+          cTag: source.cTag,
+          parentReference: { id: source.parentId },
+        }),
+        downloadFile: vi.fn(),
+      }),
+      Object.assign(emptyScanner(), {
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+      }),
+      state,
+      "testVault",
+    );
+
+    await (executor as unknown as {
+      recoverMutationLedger(scope: SyncScope): Promise<void>;
+    }).recoverMutationLedger(activeScope);
+
+    expect(state.mutationLedger).toEqual([]);
+    expect(state.baseSnapshot).toEqual([]);
+    expect(state.remoteSnapshot).toEqual([]);
+  });
+
+  it("keeps a receipted local-only download blocked when its sealed source version changes", async () => {
+    const content = new Uint8Array([10, 11, 12]).buffer;
+    const hash = await sha256Hex(content);
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const targetPath = ".obsidian/plugins/example/main.js";
+    const sourcePath = `community-plugin-content-v1/plugins/6578616d706c65/generations/1/objects/${hash}.bin`;
+    const local: LocalFileEntry = {
+      path: targetPath,
+      hash,
+      size: content.byteLength,
+      mtime: 4,
+      binary: true,
+    };
+    const operationId = "op-generation-local-only-source-changed";
+    const state = makeActiveV2State([], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId,
+          planRevision: 1,
+          scope: activeScope,
+          action: "download",
+          path: targetPath,
+          sourcePath,
+          stateEffect: "local-only",
+          expectedLocal: { exists: false },
+          expectedRemote: {
+            exists: true,
+            driveId: "generation-object-main",
+            eTag: "etag-generation-main",
+            size: content.byteLength,
+            sha256Hash: hash,
+          },
+          createdAt: 1,
+        },
+        receipt: {
+          version: 1,
+          operationId,
+          completedAt: 2,
+          checkpoint: {
+            baseUpserts: [],
+            baseRemovals: [],
+            remoteUpserts: [],
+            remoteDeletes: [],
+            pendingConflictRemovals: [],
+            pendingDeleteRemovals: [],
+          },
+        },
+      }],
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getDriveItemMetadataById: vi.fn().mockResolvedValue({
+          id: "generation-object-main",
+          name: `${hash}.bin`,
+          file: {},
+          size: content.byteLength,
+          eTag: "etag-generation-main-changed",
+          cTag: "ctag-generation-main-changed",
+          parentReference: { id: "generation-objects" },
+        }),
+      }),
+      Object.assign(emptyScanner(), {
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+      }),
+      state,
+      "testVault",
+    );
+
+    await expect((executor as unknown as {
+      recoverMutationLedger(scope: SyncScope): Promise<void>;
+    }).recoverMutationLedger(activeScope)).rejects.toThrow(
+      "Mutation receipt no longer matches",
+    );
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(state.baseSnapshot).toEqual([]);
+    expect(state.remoteSnapshot).toEqual([]);
   });
 
   it("recovers an unreceipted download by stable readback when Graph omits SHA-256", async () => {
@@ -11101,6 +13084,7 @@ describe("Large file boundary — base file exceeds 50MB", () => {
     ".obsidian/hotkeys.json",
     ".obsidian/core-plugins.json",
     ".obsidian/community-plugins.json",
+    ".OBSIDIAN/APP.JSON",
   ] as const;
 
   function baseEntry(path: string, overrides: Partial<BaseFileEntry> = {}): BaseFileEntry {

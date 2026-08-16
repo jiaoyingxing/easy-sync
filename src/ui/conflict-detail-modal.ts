@@ -26,7 +26,10 @@ import {
   summarizeConflictDetail,
 } from "./conflict-detail-presentation";
 import type { ConflictDetailSummaryEvidence } from "./conflict-detail-presentation";
-import { FileComparisonModal } from "./file-comparison-modal";
+import {
+  FileComparisonModal,
+  formatFileSize,
+} from "./file-comparison-modal";
 
 const MAX_TEXT_DIFF_BYTES_PER_SIDE = 8 * 1024 * 1024;
 const MAX_FALLBACK_PREVIEW_LINES = 200;
@@ -41,16 +44,6 @@ function decodeUtf8(content: ArrayBuffer): string | null {
 
 function sameVisibleText(local: string, remote: string): boolean {
   return local === remote || local.replace(/\r\n?/g, "\n") === remote.replace(/\r\n?/g, "\n");
-}
-
-/**
- * Format a byte count into a human-readable string.
- * e.g. 1234 → "1.2 KB", 1048576 → "1.0 MB"
- */
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /** Keep both line-number columns only as wide as the largest number in this diff. */
@@ -85,8 +78,13 @@ export class ConflictDetailModal extends FileComparisonModal {
 
     // ---- Title ----
     body.createEl("h3", {
-      text: t("conflictDetail.title", { path: this.item.path }),
+      text: t("conflictDetail.title"),
     });
+    const pathFact = body.createDiv("easy-sync-detail-path");
+    pathFact.createSpan("easy-sync-detail-path-label").setText(
+      t("conflictDetail.path"),
+    );
+    pathFact.createSpan("easy-sync-detail-path-value").setText(this.item.path);
 
     // ---- Current comparison summary ----
     const reasonEl = body.createDiv("easy-sync-detail-reason");
@@ -183,7 +181,7 @@ export class ConflictDetailModal extends FileComparisonModal {
             setSummary({ kind: "content-different" });
             body.createDiv("easy-sync-diff-truncated").setText(
               t("conflictDetail.textDiffByteLimit", {
-                limit: formatSize(MAX_TEXT_DIFF_BYTES_PER_SIDE),
+                limit: formatFileSize(MAX_TEXT_DIFF_BYTES_PER_SIDE),
               }),
             );
             if (localContent != null) {
@@ -235,7 +233,7 @@ export class ConflictDetailModal extends FileComparisonModal {
           if (!localWithinTextBudget) {
             body.createDiv("easy-sync-diff-truncated").setText(
               t("conflictDetail.textDiffByteLimit", {
-                limit: formatSize(MAX_TEXT_DIFF_BYTES_PER_SIDE),
+                limit: formatFileSize(MAX_TEXT_DIFF_BYTES_PER_SIDE),
               }),
             );
           } else if (localContent == null) {
@@ -260,7 +258,7 @@ export class ConflictDetailModal extends FileComparisonModal {
         if (!localWithinTextBudget) {
           body.createDiv("easy-sync-diff-truncated").setText(
             t("conflictDetail.textDiffByteLimit", {
-              limit: formatSize(MAX_TEXT_DIFF_BYTES_PER_SIDE),
+              limit: formatFileSize(MAX_TEXT_DIFF_BYTES_PER_SIDE),
             }),
           );
         } else if (localContent == null) {
@@ -325,11 +323,11 @@ export class ConflictDetailModal extends FileComparisonModal {
         {
           label: t("conflictDetail.fileSize"),
           local: localSize != null
-            ? formatSize(localSize)
+            ? formatFileSize(localSize)
               + (localLarger ? ` ${t("conflictDetail.larger")}` : "")
             : "—",
           remote: remoteSize != null
-            ? formatSize(remoteSize)
+            ? formatFileSize(remoteSize)
               + (remoteLarger ? ` ${t("conflictDetail.larger")}` : "")
             : "—",
           localHighlighted: localLarger,

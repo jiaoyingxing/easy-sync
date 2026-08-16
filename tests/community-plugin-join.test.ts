@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   createCommunityPluginJoinAuthorization,
-  isCommunityPluginJoinBlockRetryable,
+  communityPluginJoinBlockRequiresTargetRebind,
+  isCommunityPluginJoinBlockRecheckable,
+  planCommunityPluginJoins,
   validateCommunityPluginJoinAuthorization,
 } from "../src/sync/community-plugin-join";
 import type { RemoteCommunityPluginCatalogV1 } from
@@ -56,18 +58,61 @@ function catalog(): RemoteCommunityPluginCatalogV1 {
 }
 
 describe("community-plugin join authorization", () => {
-  it("retries recoverable facts but not a changed or incompatible target", () => {
-    expect(isCommunityPluginJoinBlockRetryable("catalog-unavailable"))
+  it("routes a partial local bundle through the exact remote restore authorization", () => {
+    expect(planCommunityPluginJoins({
+      entries: [{
+        pluginId: "calendar",
+        phase: "join-requested",
+        operationId: "join-calendar-partial",
+      }],
+      localBundleFacts: new Map([["calendar", "partial"]]),
+      catalog: catalog(),
+      scope,
+    })).toMatchObject({
+      commands: [
+        {
+          type: "request-join",
+          pluginId: "calendar",
+          operationId: "join-calendar-partial",
+          targetCatalogRevision: 7,
+          targetBundleDigest: "a".repeat(64),
+        },
+        {
+          type: "begin-restore",
+          pluginId: "calendar",
+          operationId: "join-calendar-partial",
+        },
+      ],
+      authorizations: [{
+        pluginId: "calendar",
+        operationId: "join-calendar-partial",
+        targetCatalogRevision: 7,
+        targetBundleDigest: "a".repeat(64),
+      }],
+    });
+  });
+
+  it("rechecks known blockers and only rebinds an invalidated target", () => {
+    expect(isCommunityPluginJoinBlockRecheckable("catalog-unavailable"))
       .toBe(true);
-    expect(isCommunityPluginJoinBlockRetryable("remote-bundle-incomplete"))
+    expect(isCommunityPluginJoinBlockRecheckable("remote-bundle-incomplete"))
       .toBe(true);
-    expect(isCommunityPluginJoinBlockRetryable("local-bundle-incomplete"))
+    expect(isCommunityPluginJoinBlockRecheckable("local-bundle-incomplete"))
       .toBe(true);
-    expect(isCommunityPluginJoinBlockRetryable("remote-bundle-changed"))
-      .toBe(false);
-    expect(isCommunityPluginJoinBlockRetryable("manifest-incompatible"))
-      .toBe(false);
-    expect(isCommunityPluginJoinBlockRetryable(undefined)).toBe(false);
+    expect(isCommunityPluginJoinBlockRecheckable("remote-bundle-changed"))
+      .toBe(true);
+    expect(isCommunityPluginJoinBlockRecheckable("manifest-incompatible"))
+      .toBe(true);
+    expect(isCommunityPluginJoinBlockRecheckable(undefined)).toBe(false);
+    expect(communityPluginJoinBlockRequiresTargetRebind(
+      "remote-bundle-changed",
+    )).toBe(true);
+    expect(communityPluginJoinBlockRequiresTargetRebind(
+      "manifest-incompatible",
+    )).toBe(false);
+    expect(communityPluginJoinBlockRequiresTargetRebind(
+      "remote-bundle-incomplete",
+    )).toBe(false);
   });
 
   it("binds a restore only to one fresh complete remote bundle", () => {

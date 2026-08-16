@@ -7,15 +7,6 @@
 
 import type { PluginScopeSelection } from "./community-plugin-sync-policy";
 
-export type SyncAttentionReason =
-  | "community-plugin-enablement-decision-required";
-
-/** Stable, localization-independent attention emitted by one sync run. */
-export interface SyncAttention {
-  reason: SyncAttentionReason;
-  count: number;
-}
-
 // ---- File Metadata ----
 
 /** Local file snapshot entry */
@@ -165,6 +156,35 @@ export interface SyncPlanFolder {
   sourceParentRemoteId?: string;
 }
 
+/**
+ * Immutable lifecycle facts that authorize one sealed-generation download.
+ * The ordinary `remote` field retains the source object's exact Graph facts;
+ * this binding proves which participant, generation and sealed manifest made
+ * that source eligible for a local-only restore.
+ */
+export interface CommunityPluginGenerationRestoreBindingV1 {
+  schemaVersion: 1;
+  pluginId: string;
+  participant: {
+    participantId: string;
+    incarnation: string;
+  };
+  generation: number;
+  joinNonce: string;
+  controlRecordId: string;
+  fenceEpoch: number;
+  sealRevision: number;
+  manifestObject: {
+    objectPath: string;
+    remoteId: string;
+    parentId: string;
+    size: number;
+    eTag: string;
+    cTag: string;
+    sha256Hash: string;
+  };
+}
+
 export interface SyncPlanItem {
   type: SyncActionType;
   /** Vault-relative file path */
@@ -188,6 +208,8 @@ export interface SyncPlanItem {
   requiresConfirmation?: boolean;
   /** Grouped identity action weight used by the existing bulk-change review gate. */
   reviewImpactCount?: number;
+  /** Present only for a sealed community-plugin generation local restore. */
+  generationRestore?: CommunityPluginGenerationRestoreBindingV1;
   /** Exact versions authorized by a user-facing pending decision. */
   decisionToken?: SyncDecisionToken;
   /**
@@ -319,6 +341,23 @@ export type MutationRemoteExpectation =
   | { exists: false }
   | { exists: true; driveId: string; eTag: string; size: number; sha256Hash?: string };
 
+/**
+ * Additive V1 recovery semantics which deliberately do not establish or alter
+ * the ordinary files-root base/remote state. `local-only` restores a target
+ * from a generation source; `settlement-only` closes one old out-of-scope
+ * operation; `bundle-settlement` applies one reviewed whole-plugin choice.
+ */
+export type MutationStateEffectV1 =
+  | "local-only"
+  | "settlement-only"
+  /**
+   * A reviewed plugin-bundle member adopts one side selected for the bundle.
+   * Its receipt reconciles the V2 base and remote index only after that member
+   * reaches the selected target.
+   * This effect is valid only inside CommunityPluginBundleSettlementV2.
+   */
+  | "bundle-settlement";
+
 /** Durable fact written before any local or remote file mutation. */
 export interface MutationIntentV1 {
   version: 1;
@@ -328,11 +367,39 @@ export interface MutationIntentV1 {
   action: MutationAction;
   path: string;
   sourcePath?: string;
+  stateEffect?: MutationStateEffectV1;
   expectedLocal: MutationLocalExpectation;
   expectedRemote: MutationRemoteExpectation;
   /** Exact result bytes persisted in merge-ready storage before a merge mutates either side. */
   target?: { hash: string; size: number };
   createdAt: number;
+}
+
+/**
+ * Durable proof that one non-empty cloud subtree was explicitly reviewed as a
+ * single deletion object. The root cTag seals every descendant change; the
+ * committed source facts let recovery retire exactly the reviewed identities
+ * after an unknown DELETE response without storing a second subtree state.
+ */
+export interface ReviewedFolderSubtreeDeleteBindingV1 {
+  version: 1;
+  sourceCommitSeq: number;
+  sourceLifecycleEpoch: number;
+  rootCTag: string;
+  memberCount: number;
+}
+
+/**
+ * Durable proof that one reviewed two-sided folder move is rebasing the
+ * committed projection from the last common path. The actual mutation source
+ * remains `sourcePath`; this binding exists only so the receipt can translate
+ * the older committed anchors after that exact move succeeds.
+ */
+export interface ReviewedFolderLocationMoveBindingV1 {
+  version: 1;
+  sourceCommitSeq: number;
+  sourceLifecycleEpoch: number;
+  sourceAnchorPath: string;
 }
 
 export interface FolderMutationIntentV2 {
@@ -360,6 +427,10 @@ export interface FolderMutationIntentV2 {
     path: string;
     eTag?: string;
   };
+  /** Present only for an explicit reviewed non-empty subtree deletion. */
+  reviewedSubtreeDelete?: ReviewedFolderSubtreeDeleteBindingV1;
+  /** Present only for an explicit reviewed two-sided folder move. */
+  reviewedLocationMove?: ReviewedFolderLocationMoveBindingV1;
   createdAt: number;
 }
 
@@ -421,10 +492,46 @@ export interface ManualMutationResolutionV1 {
   receipt: MutationReceiptV1 | null;
 }
 
+export interface CommunityPluginBundleSettlementMemberV2 {
+  intent: MutationIntentV1;
+  receipt: MutationReceiptV1 | null;
+}
+
+export interface CommunityPluginBundleConflictDecisionV2 {
+  path: string;
+  decisionToken: SyncDecisionToken;
+}
+
+/**
+ * Durable whole-bundle continuation for one explicitly reviewed community
+ * plugin. Version 2 is intentionally not readable as the older single-file
+ * manual resolution: old builds reject the ledger and therefore fail closed.
+ */
+export interface CommunityPluginBundleSettlementV2 {
+  version: 2;
+  kind: "community-plugin-bundle-settlement";
+  choice: ManualMutationResolutionChoiceV1;
+  factsDigest: string;
+  selectedAt: number;
+  externalMutation: true;
+  /** Non-executable coordinator intent retained for the shared ledger shape. */
+  intent: MutationIntentV1;
+  receipt: null;
+  pluginId: string;
+  pluginRoot: string;
+  predecessorOperationIds: string[];
+  conflictDecisions: CommunityPluginBundleConflictDecisionV2[];
+  members: CommunityPluginBundleSettlementMemberV2[];
+}
+
+export type ManualMutationResolution =
+  | ManualMutationResolutionV1
+  | CommunityPluginBundleSettlementV2;
+
 export interface MutationLedgerEntryV1 {
   intent: MutationIntent;
   receipt: MutationReceiptV1 | null;
-  manualResolution?: ManualMutationResolutionV1;
+  manualResolution?: ManualMutationResolution;
 }
 
 export interface ManualMutationResolutionAuditV1 {
@@ -460,6 +567,39 @@ export interface ManualMutationResolutionOptionV1 {
   deletesOtherSide: boolean;
 }
 
+export type CommunityPluginBundleReviewBlockReasonV1 =
+  | "bundle-incomplete"
+  | "facts-unavailable"
+  | "manifest-invalid"
+  | "identity-mismatch"
+  | "platform-incompatible"
+  | "predecessor-mismatch";
+
+export interface CommunityPluginBundleDirectionReviewV1 {
+  available: boolean;
+  reason?: CommunityPluginBundleReviewBlockReasonV1;
+}
+
+/**
+ * Ephemeral, read-only facts for reviewing one physical community-plugin
+ * bundle. This is not a persisted transaction and grants no mutation.
+ */
+export interface CommunityPluginBundleReviewV1 {
+  kind: "community-plugin-bundle";
+  pluginId: string;
+  displayName: string | null;
+  memberPaths: string[];
+  /** Ordinary conflicts currently represented by this whole-bundle review. */
+  conflictPaths: string[];
+  predecessorOperationIds: string[];
+  local: CommunityPluginBundleDirectionReviewV1;
+  remote: CommunityPluginBundleDirectionReviewV1;
+  /** True when at least one whole-bundle direction has an implemented path. */
+  executionReady: boolean;
+  /** Exact reviewed directions available to the current build. */
+  executableChoices?: ManualMutationResolutionChoiceV1[];
+}
+
 /** Read-only facts shown to the user and rechecked before a manual choice. */
 export interface ManualMutationResolutionSnapshotV1 {
   version: 1;
@@ -475,6 +615,7 @@ export interface ManualMutationResolutionSnapshotV1 {
   identical: boolean;
   keepLocal: ManualMutationResolutionOptionV1;
   keepRemote: ManualMutationResolutionOptionV1;
+  bundleReview?: CommunityPluginBundleReviewV1;
 }
 
 /**
@@ -500,6 +641,17 @@ export interface MutationRecoveryRunSummary {
   blockReason?: MutationRecoveryBlockReason;
   /** First non-retryable root record that can be reviewed by the user. */
   blockedOperationId?: string;
+  /** The unresolved record is still protected, but ordinary work outside its
+   * exact object boundary may continue. This never means the record settled. */
+  isolated?: boolean;
+}
+
+/** Monotonic facts emitted by a sync executor run. Persisted history may omit
+ * this object only for records created before the contract existed. */
+export interface SyncRunFacts {
+  termination: "normal" | "cancelled";
+  ordinaryPlanning: "not-entered" | "entered";
+  userFileChanges: "none" | "performed" | "unknown";
 }
 
 export interface MutationRecoveryHistory {
@@ -643,6 +795,26 @@ export function planDigest(items: readonly SyncPlanItem[]): string {
       i.folder?.parentRemoteETag ?? "",
       i.requiresConfirmation ? "confirm" : "",
       i.reviewImpactCount ?? 1,
+      i.generationRestore
+        ? [
+            i.generationRestore.schemaVersion,
+            i.generationRestore.pluginId,
+            i.generationRestore.participant.participantId,
+            i.generationRestore.participant.incarnation,
+            i.generationRestore.generation,
+            i.generationRestore.joinNonce,
+            i.generationRestore.controlRecordId,
+            i.generationRestore.fenceEpoch,
+            i.generationRestore.sealRevision,
+            i.generationRestore.manifestObject.objectPath,
+            i.generationRestore.manifestObject.remoteId,
+            i.generationRestore.manifestObject.parentId,
+            i.generationRestore.manifestObject.size,
+            i.generationRestore.manifestObject.eTag,
+            i.generationRestore.manifestObject.cTag,
+            i.generationRestore.manifestObject.sha256Hash,
+          ].join(":")
+        : "",
     ].join("|"))
     .sort();
   return normalized.join("\n");

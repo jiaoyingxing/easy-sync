@@ -4,7 +4,9 @@ import { forceCloseDatabase } from "fake-indexeddb";
 import { openDB, unwrap } from "idb";
 import { describe, expect, it } from "vitest";
 import {
+  firstSyncVerificationEvidenceOperationId,
   IndexedDbRemoteScopeRecoveryEvidenceStore,
+  type FirstSyncVerificationEvidenceOperationIdentityV2,
   type RemoteScopeRecoveryEvidenceOperationIdentityV1,
 } from "../src/sync/remote-scope-recovery-evidence-store";
 
@@ -31,6 +33,28 @@ function identity(
       filesRootId: "root-new",
     },
     protocolBindingDigest: "b".repeat(64),
+    ...patch,
+  };
+}
+
+function firstSyncIdentity(
+  vaultInstanceId: string,
+  patch: Partial<FirstSyncVerificationEvidenceOperationIdentityV2> = {},
+): FirstSyncVerificationEvidenceOperationIdentityV2 {
+  return {
+    operationKind: "first-sync-verification",
+    vaultInstanceId,
+    scope: {
+      accountId: "account",
+      driveId: "drive",
+      vaultFolderId: "vault",
+      filesRootId: "root",
+    },
+    protocolBindingDigest: "e".repeat(64),
+    sourceCohort: {
+      kind: "public-1.1.3",
+      sourceStateDigest: "f".repeat(64),
+    },
     ...patch,
   };
 }
@@ -75,6 +99,211 @@ describe("remote scope recovery evidence store", () => {
       await restarted.close();
     } finally {
       await first.delete();
+    }
+  });
+
+  it("keeps the public V1 recovery operation readable beside a V2 first-sync operation", async () => {
+    const vaultInstanceId = "9".repeat(32);
+    const first = new IndexedDbRemoteScopeRecoveryEvidenceStore(
+      vaultInstanceId,
+    );
+    try {
+      const recovery = await first.begin(identity(vaultInstanceId), 100);
+      const verification = await first.beginFirstSyncVerification(
+        firstSyncIdentity(vaultInstanceId),
+        110,
+      );
+      expect(recovery.schemaVersion).toBe(1);
+      expect(verification).toMatchObject({
+        schemaVersion: 2,
+        operationKind: "first-sync-verification",
+      });
+      expect(verification.operationId).not.toBe(recovery.operationId);
+      await first.putVerified({
+        schemaVersion: 1,
+        operationId: recovery.operationId,
+        remoteId: "recovery-file",
+        size: 10,
+        eTag: "recovery-etag",
+        sha256: "a".repeat(64),
+        verifiedAt: 120,
+      });
+      await first.putVerified({
+        schemaVersion: 1,
+        operationId: verification.operationId,
+        remoteId: "first-sync-file",
+        size: 20,
+        eTag: "first-sync-etag",
+        sha256: "b".repeat(64),
+        verifiedAt: 130,
+      });
+      await first.close();
+
+      const restarted = new IndexedDbRemoteScopeRecoveryEvidenceStore(
+        vaultInstanceId,
+      );
+      const sameRecovery = await restarted.begin(identity(vaultInstanceId), 140);
+      const sameVerification = await restarted.beginFirstSyncVerification(
+        firstSyncIdentity(vaultInstanceId),
+        150,
+      );
+      expect(sameRecovery.operationId).toBe(recovery.operationId);
+      expect(sameVerification.operationId).toBe(verification.operationId);
+      await expect(restarted.summarize(recovery.operationId)).resolves
+        .toMatchObject({ receipts: 1 });
+      await expect(restarted.summarize(verification.operationId)).resolves
+        .toMatchObject({ receipts: 1 });
+      await restarted.close();
+    } finally {
+      await first.delete();
+    }
+  });
+
+  it("isolates first-sync receipts by scope, protocol binding, and source cohort", async () => {
+    const vaultInstanceId = "a".repeat(32);
+    const store = new IndexedDbRemoteScopeRecoveryEvidenceStore(
+      vaultInstanceId,
+    );
+    try {
+      const original = await store.beginFirstSyncVerification(
+        firstSyncIdentity(vaultInstanceId),
+        100,
+      );
+      const sourceIdentity = firstSyncIdentity(vaultInstanceId);
+      const reorderedIdentity: FirstSyncVerificationEvidenceOperationIdentityV2 = {
+        sourceCohort: structuredClone(sourceIdentity.sourceCohort),
+        protocolBindingDigest: sourceIdentity.protocolBindingDigest,
+        scope: {
+          filesRootId: sourceIdentity.scope.filesRootId,
+          vaultFolderId: sourceIdentity.scope.vaultFolderId,
+          driveId: sourceIdentity.scope.driveId,
+          accountId: sourceIdentity.scope.accountId,
+        },
+        vaultInstanceId: sourceIdentity.vaultInstanceId,
+        operationKind: "first-sync-verification",
+      };
+      await expect(firstSyncVerificationEvidenceOperationId(reorderedIdentity))
+        .resolves.toBe(original.operationId);
+      await store.putVerified({
+        schemaVersion: 1,
+        operationId: original.operationId,
+        remoteId: "remote-a",
+        size: 10,
+        eTag: "etag-a",
+        sha256: "c".repeat(64),
+        verifiedAt: 110,
+      });
+      const changedScopeId = await firstSyncVerificationEvidenceOperationId(
+        firstSyncIdentity(vaultInstanceId, {
+          scope: {
+            ...firstSyncIdentity(vaultInstanceId).scope,
+            filesRootId: "another-root",
+          },
+        }),
+      );
+      const changedAccountId = await firstSyncVerificationEvidenceOperationId(
+        firstSyncIdentity(vaultInstanceId, {
+          scope: {
+            ...firstSyncIdentity(vaultInstanceId).scope,
+            accountId: "another-account",
+          },
+        }),
+      );
+      const changedDriveId = await firstSyncVerificationEvidenceOperationId(
+        firstSyncIdentity(vaultInstanceId, {
+          scope: {
+            ...firstSyncIdentity(vaultInstanceId).scope,
+            driveId: "another-drive",
+          },
+        }),
+      );
+      const changedProtocolId = await firstSyncVerificationEvidenceOperationId(
+        firstSyncIdentity(vaultInstanceId, {
+          protocolBindingDigest: "d".repeat(64),
+        }),
+      );
+      const changedCohortId = await firstSyncVerificationEvidenceOperationId(
+        firstSyncIdentity(vaultInstanceId, {
+          sourceCohort: { kind: "fresh" },
+        }),
+      );
+
+      expect(new Set([
+        original.operationId,
+        changedScopeId,
+        changedAccountId,
+        changedDriveId,
+        changedProtocolId,
+        changedCohortId,
+      ]).size).toBe(6);
+      const unavailable = await store.readValidReceipts(
+        changedScopeId,
+        [{ remoteId: "remote-a", size: 10, eTag: "etag-a" }],
+      );
+      expect(unavailable.receiptsByRemoteId.size).toBe(0);
+      const reusable = await store.readValidReceipts(
+        original.operationId,
+        [{ remoteId: "remote-a", size: 10, eTag: "etag-a" }],
+      );
+      expect(reusable.receiptsByRemoteId.get("remote-a")?.sha256)
+        .toBe("c".repeat(64));
+    } finally {
+      await store.delete();
+    }
+  });
+
+  it("fails closed on a corrupt first-sync operation and clears its orphaned receipts on replacement", async () => {
+    const vaultInstanceId = "b".repeat(32);
+    const store = new IndexedDbRemoteScopeRecoveryEvidenceStore(
+      vaultInstanceId,
+    );
+    try {
+      const identityValue = firstSyncIdentity(vaultInstanceId);
+      const operation = await store.beginFirstSyncVerification(
+        identityValue,
+        100,
+      );
+      await store.putVerified({
+        schemaVersion: 1,
+        operationId: operation.operationId,
+        remoteId: "remote-a",
+        size: 10,
+        eTag: "etag-a",
+        sha256: "c".repeat(64),
+        verifiedAt: 110,
+      });
+      await store.close();
+      const raw = await openDB(store.databaseName, 1);
+      await raw.put("operations", {
+        ...operation,
+        scope: { ...operation.scope, driveId: "" },
+      });
+      raw.close();
+
+      const restarted = new IndexedDbRemoteScopeRecoveryEvidenceStore(
+        vaultInstanceId,
+      );
+      const hidden = await restarted.readValidReceipts(
+        operation.operationId,
+        [{ remoteId: "remote-a", size: 10, eTag: "etag-a" }],
+      );
+      expect(hidden.receiptsByRemoteId.size).toBe(0);
+      await expect(restarted.summarize(operation.operationId)).resolves
+        .toEqual({
+          operationId: operation.operationId,
+          receipts: 0,
+          updatedAt: 0,
+        });
+      const replacement = await restarted.beginFirstSyncVerification(
+        identityValue,
+        120,
+      );
+      expect(replacement.operationId).toBe(operation.operationId);
+      await expect(restarted.summarize(operation.operationId)).resolves
+        .toMatchObject({ receipts: 0, updatedAt: 120 });
+      await restarted.close();
+    } finally {
+      await store.delete();
     }
   });
 
@@ -169,6 +398,39 @@ describe("remote scope recovery evidence store", () => {
         .toEqual({ operationId: first.operationId, receipts: 0, updatedAt: 0 });
       await expect(store.summarize(second.operationId)).resolves
         .toMatchObject({ operationId: second.operationId, updatedAt: 200 });
+    } finally {
+      await store.delete();
+    }
+  });
+
+  it("retires every first-sync operation without touching scope recovery", async () => {
+    const vaultInstanceId = "d".repeat(32);
+    const store = new IndexedDbRemoteScopeRecoveryEvidenceStore(
+      vaultInstanceId,
+    );
+    try {
+      const recovery = await store.begin(identity(vaultInstanceId), 100);
+      const first = await store.beginFirstSyncVerification(
+        firstSyncIdentity(vaultInstanceId),
+        110,
+      );
+      const second = await store.beginFirstSyncVerification(
+        firstSyncIdentity(vaultInstanceId, {
+          sourceCohort: { kind: "fresh" },
+        }),
+        120,
+      );
+
+      await expect(store.retireFirstSyncVerificationOperations())
+        .resolves.toBe(2);
+      await expect(store.summarize(recovery.operationId)).resolves
+        .toMatchObject({ operationId: recovery.operationId, updatedAt: 100 });
+      await expect(store.summarize(first.operationId)).resolves
+        .toEqual({ operationId: first.operationId, receipts: 0, updatedAt: 0 });
+      await expect(store.summarize(second.operationId)).resolves
+        .toEqual({ operationId: second.operationId, receipts: 0, updatedAt: 0 });
+      await expect(store.retireFirstSyncVerificationOperations())
+        .resolves.toBe(0);
     } finally {
       await store.delete();
     }

@@ -15,6 +15,7 @@ import type {
   FolderMutationIntentV2,
   ManualMutationResolutionV1,
   MutationIntentV1,
+  MutationLedgerEntryV1,
   MutationReceiptV1,
   RemoteFileEntry,
   RemoteFolderEntry,
@@ -25,6 +26,7 @@ import {
   StateV2IndexedDbActiveStore,
   stateV2ActiveIndexedDbDatabaseName,
 } from "../src/sync/state-v2-indexeddb-active";
+import { MergeReadyStore } from "../src/sync/merge-ready-store";
 
 const paths = getEasySyncPaths(".obsidian");
 const scope = {
@@ -177,6 +179,11 @@ function makeHarness(input?: {
       if (value === undefined) throw new Error(`missing ${path}`);
       return value;
     }),
+    readBinary: vi.fn(async (path: string) => {
+      const value = files.get(path);
+      if (value === undefined) throw new Error(`missing ${path}`);
+      return new TextEncoder().encode(value).buffer;
+    }),
     write: vi.fn(async (path: string, value: string) => {
       if (
         failNextIndexedDbWitnessWrite
@@ -189,6 +196,9 @@ function makeHarness(input?: {
         throw new Error("indexeddb witness write failed");
       }
       files.set(path, value);
+    }),
+    writeBinary: vi.fn(async (path: string, value: ArrayBuffer) => {
+      files.set(path, new TextDecoder().decode(value));
     }),
     process: vi.fn(async (
       path: string,
@@ -358,6 +368,295 @@ function uploadMutationAt(index: number): ReturnType<typeof uploadMutation> {
     },
   };
   return { intent, receipt, remote };
+}
+
+function localOnlyDownloadMutation(): {
+  intent: MutationIntentV1;
+  receipt: MutationReceiptV1;
+} {
+  const intent: MutationIntentV1 = {
+    version: 1,
+    operationId: "restore-generation-main",
+    planRevision: 4,
+    scope,
+    action: "download",
+    path: ".obsidian/plugins/example/main.js",
+    sourcePath: `.easy-sync/community-plugin-content-v1/objects/${hashB}.bin`,
+    stateEffect: "local-only",
+    expectedLocal: { exists: false },
+    expectedRemote: {
+      exists: true,
+      driveId: "generation-object-main",
+      eTag: "etag-generation-main",
+      size: 11,
+      sha256Hash: hashB,
+    },
+    createdAt: 10,
+  };
+  return {
+    intent,
+    receipt: {
+      version: 1,
+      operationId: intent.operationId,
+      completedAt: 20,
+      checkpoint: {
+        baseUpserts: [],
+        baseRemovals: [],
+        remoteUpserts: [],
+        remoteDeletes: [],
+        pendingConflictRemovals: [],
+        pendingDeleteRemovals: [],
+      },
+    },
+  };
+}
+
+function pluginBundleConflict(): SyncPlanItem {
+  const path = ".obsidian/plugins/resojot/manifest.json";
+  return {
+    type: SyncActionType.Conflict,
+    path,
+    local: { path, hash: hashA, size: 20, mtime: 20 },
+    remote: {
+      path,
+      driveId: "remote-resojot-manifest",
+      parentId: "remote-resojot-root",
+      size: 24,
+      mtime: 30,
+      eTag: "etag-resojot-manifest",
+      cTag: "ctag-resojot-manifest",
+      sha256Hash: hashB,
+    },
+    decisionToken: {
+      version: 1,
+      vaultName: "vault",
+      accountId: scope.accountId,
+      scope,
+      local: { exists: true, hash: hashA, size: 20 },
+      remote: {
+        exists: true,
+        driveId: "remote-resojot-manifest",
+        eTag: "etag-resojot-manifest",
+      },
+      ancestorHash: null,
+    },
+  };
+}
+
+function pluginBundleSettlementEntry(
+  predecessorIntent: MutationIntentV1,
+  conflict: SyncPlanItem,
+): MutationLedgerEntryV1 {
+  const pluginRoot = ".obsidian/plugins/resojot";
+  const anchorIntent: MutationIntentV1 = {
+    version: 1,
+    operationId: "bundle-resojot-keep-remote",
+    planRevision: 3,
+    scope,
+    action: "download",
+    path: pluginRoot,
+    stateEffect: "settlement-only",
+    expectedLocal: { exists: false },
+    expectedRemote: { exists: false },
+    createdAt: 40,
+  };
+  return {
+    intent: anchorIntent,
+    receipt: null,
+    manualResolution: {
+      version: 2,
+      kind: "community-plugin-bundle-settlement",
+      choice: "keep-remote",
+      factsDigest: "d".repeat(64),
+      selectedAt: 40,
+      externalMutation: true,
+      intent: anchorIntent,
+      receipt: null,
+      pluginId: "resojot",
+      pluginRoot,
+      predecessorOperationIds: [predecessorIntent.operationId],
+      conflictDecisions: [{
+        path: conflict.path,
+        decisionToken: conflict.decisionToken,
+      }],
+      members: [
+        {
+          intent: {
+            version: 1,
+            operationId: "bundle-resojot-main-download",
+            planRevision: 3,
+            scope,
+            action: "download",
+            path: `${pluginRoot}/main.js`,
+            stateEffect: "bundle-settlement",
+            expectedLocal: predecessorIntent.expectedLocal,
+            expectedRemote: {
+              exists: true,
+              driveId: "remote-resojot-main",
+              eTag: "etag-resojot-main",
+              size: 11,
+              sha256Hash: hashA,
+            },
+            createdAt: 40,
+          },
+          receipt: null,
+        },
+        {
+          intent: {
+            version: 1,
+            operationId: "bundle-resojot-manifest-download",
+            planRevision: 3,
+            scope,
+            action: "download",
+            path: conflict.path,
+            stateEffect: "bundle-settlement",
+            expectedLocal: conflict.decisionToken!.local,
+            expectedRemote: conflict.remote
+              ? {
+                  exists: true,
+                  driveId: conflict.remote.driveId,
+                  eTag: conflict.remote.eTag,
+                  size: conflict.remote.size,
+                  sha256Hash: conflict.remote.sha256Hash!,
+                }
+              : { exists: false },
+            createdAt: 40,
+          },
+          receipt: null,
+        },
+      ],
+    },
+  };
+}
+
+function keepLocalPluginBundleSettlementEntry(
+  predecessorIntent: MutationIntentV1,
+  conflict: SyncPlanItem,
+): MutationLedgerEntryV1 {
+  const entry = pluginBundleSettlementEntry(predecessorIntent, conflict);
+  const settlement = entry.manualResolution;
+  if (!settlement || settlement.version !== 2) throw new Error("bundle fixture missing");
+  const anchorIntent: MutationIntentV1 = {
+    ...settlement.intent,
+    operationId: "bundle-resojot-keep-local",
+    action: "upload",
+  };
+  return {
+    intent: anchorIntent,
+    receipt: null,
+    manualResolution: {
+      ...settlement,
+      choice: "keep-local",
+      intent: anchorIntent,
+      members: settlement.members.map((member) => ({
+        ...member,
+        intent: {
+          ...member.intent,
+          operationId: member.intent.operationId.replace("download", "upload"),
+          action: "upload",
+        },
+      })),
+    },
+  };
+}
+
+function pluginBundleEnvelope(): SyncStateEnvelopeV2 {
+  const current = envelope();
+  const folders = [
+    { id: "folder-config", parentId: scope.filesRootId, name: ".obsidian" },
+    { id: "folder-plugins", parentId: "folder-config", name: "plugins" },
+    { id: "remote-resojot-root", parentId: "folder-plugins", name: "resojot" },
+  ];
+  for (const entry of folders) {
+    current.remoteIndex.itemsById[entry.id] = {
+      ...entry,
+      kind: "folder",
+    };
+  }
+  current.remoteIndex.itemsById["remote-resojot-main"] = {
+    id: "remote-resojot-main",
+    parentId: "remote-resojot-root",
+    name: "main.js",
+    kind: "file",
+    size: 11,
+    mtime: 30,
+    eTag: "etag-resojot-main",
+    cTag: "ctag-resojot-main",
+    contentHash: hashA,
+  };
+  current.remoteIndex.itemsById["remote-resojot-manifest"] = {
+    id: "remote-resojot-manifest",
+    parentId: "remote-resojot-root",
+    name: "manifest.json",
+    kind: "file",
+    size: 24,
+    mtime: 30,
+    eTag: "etag-resojot-manifest",
+    cTag: "ctag-resojot-manifest",
+    contentHash: hashB,
+  };
+  return current;
+}
+
+function receiptedPluginBundleSettlementEntry(
+  predecessorIntent: MutationIntentV1,
+  conflict: SyncPlanItem,
+): MutationLedgerEntryV1 {
+  const entry = pluginBundleSettlementEntry(predecessorIntent, conflict);
+  const settlement = entry.manualResolution;
+  if (!settlement || settlement.version !== 2) throw new Error("bundle fixture missing");
+  const remoteByPath = new Map<string, RemoteFileEntry>([
+    [".obsidian/plugins/resojot/main.js", {
+      path: ".obsidian/plugins/resojot/main.js",
+      driveId: "remote-resojot-main",
+      parentId: "remote-resojot-root",
+      size: 11,
+      mtime: 30,
+      eTag: "etag-resojot-main",
+      cTag: "ctag-resojot-main",
+      sha256Hash: hashA,
+    }],
+    [".obsidian/plugins/resojot/manifest.json", {
+      path: ".obsidian/plugins/resojot/manifest.json",
+      driveId: "remote-resojot-manifest",
+      parentId: "remote-resojot-root",
+      size: 24,
+      mtime: 30,
+      eTag: "etag-resojot-manifest",
+      cTag: "ctag-resojot-manifest",
+      sha256Hash: hashB,
+    }],
+  ]);
+  return {
+    ...entry,
+    manualResolution: {
+      ...settlement,
+      members: settlement.members.map((member, index) => {
+        const remote = remoteByPath.get(member.intent.path)!;
+        return {
+          ...member,
+          receipt: {
+            version: 1,
+            operationId: member.intent.operationId,
+            completedAt: 50 + index,
+            checkpoint: {
+              baseUpserts: [{
+                path: remote.path,
+                hash: remote.sha256Hash!,
+                size: remote.size,
+                eTag: remote.eTag,
+              }],
+              baseRemovals: [],
+              remoteUpserts: [remote],
+              remoteDeletes: [],
+              pendingConflictRemovals: [],
+              pendingDeleteRemovals: [],
+            },
+          },
+        };
+      }),
+    },
+  };
 }
 
 describe("StateManager V2 production controller", () => {
@@ -1012,6 +1311,192 @@ describe("StateManager V2 production controller", () => {
     });
   });
 
+  it.each([
+    {
+      name: "different-path intent-only records",
+      records: (() => {
+        const first = uploadMutation();
+        const second = uploadMutationAt(1);
+        second.intent.operationId = first.intent.operationId;
+        return [
+          { intent: first.intent, receipt: null },
+          { intent: second.intent, receipt: null },
+        ];
+      })(),
+    },
+    {
+      name: "byte-identical receipted records",
+      records: (() => {
+        const mutation = uploadMutation();
+        const record = { intent: mutation.intent, receipt: mutation.receipt };
+        return [record, structuredClone(record)];
+      })(),
+    },
+  ])("fails closed on persisted duplicate operation IDs in $name without rewriting evidence", async ({ records }) => {
+    const pendingConflicts = [{ path: records[0].intent.path }];
+    const pendingDeletes = [{ path: records[1].intent.path }];
+    const pluginData = {
+      "easy-sync-bound-account": scope.accountId,
+      "easy-sync-v2-mutation-ledger": records,
+      "easy-sync-pending-conflicts": pendingConflicts,
+      "easy-sync-pending-remote-deletes": pendingDeletes,
+    };
+    const before = JSON.stringify(pluginData);
+    const harness = makeHarness({ pluginData });
+    const state = new StateManager(harness.plugin);
+
+    await state.load();
+
+    expect(state.hasMutationLedgerCorruption).toBe(true);
+    expect(state.mutationLedger).toEqual([]);
+    expect(JSON.stringify(harness.pluginData)).toBe(before);
+    expect(harness.pluginData["easy-sync-v2-mutation-ledger"])
+      .toEqual(records);
+    expect(harness.pluginData["easy-sync-pending-conflicts"])
+      .toEqual(pendingConflicts);
+    expect(harness.pluginData["easy-sync-pending-remote-deletes"])
+      .toEqual(pendingDeletes);
+    expect(harness.plugin.updatePluginData).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    "abandon",
+    "record-receipt",
+    "checkpoint",
+    "reflected-retirement",
+    "quarantine",
+  ] as const)("keeps exact evidence when the %s owner encounters a duplicate operation ID", async (owner) => {
+    const mutation = uploadMutation();
+    mutation.receipt.checkpoint.pendingDeleteRemovals = [];
+    const record: MutationLedgerEntryV1 = {
+      intent: mutation.intent,
+      receipt: owner === "abandon" || owner === "record-receipt"
+        ? null
+        : mutation.receipt,
+    };
+    const harness = makeHarness({
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [record],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    (state.mutationLedger as MutationLedgerEntryV1[])
+      .push(structuredClone(record));
+    vi.mocked(harness.plugin.updatePluginData).mockClear();
+    const ledgerBefore = structuredClone(state.mutationLedger);
+    const envelopeBefore = structuredClone(state.getCommittedV2Envelope());
+
+    const action = owner === "abandon"
+      ? state.abandonMutationIntent(record.intent.operationId)
+      : owner === "record-receipt"
+        ? state.recordMutationReceipt(mutation.receipt)
+        : owner === "checkpoint"
+          ? state.commitMutationCheckpoint(record.intent.operationId)
+          : owner === "reflected-retirement"
+            ? state.retireMutationCheckpointIfReflected(
+                record.intent.operationId,
+                state.getCommittedV2Envelope()!.meta.commitSeq,
+              )
+            : state.quarantineUnreachableUploadReceipt({
+                record,
+                remoteId: mutation.remote.driveId,
+                localMissing: true,
+                graphItemMissing: true,
+              });
+
+    await expect(action).rejects.toThrow(/duplicate mutation operation/i);
+    expect(state.mutationLedger).toEqual(ledgerBefore);
+    expect(state.getCommittedV2Envelope()).toEqual(envelopeBefore);
+    expect(harness.plugin.updatePluginData).not.toHaveBeenCalled();
+  });
+
+  it("refuses to abandon a parser-readable ordinary intent with invalid action expectations", async () => {
+    const mutation = uploadMutation();
+    const malformed: MutationLedgerEntryV1 = {
+      intent: {
+        ...mutation.intent,
+        operationId: "invalid-direct-abandon",
+        action: "deleteLocal",
+        expectedLocal: { exists: false },
+        expectedRemote: { exists: false },
+      },
+      receipt: null,
+    };
+    const harness = makeHarness({
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [malformed],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    vi.mocked(harness.plugin.updatePluginData).mockClear();
+    const before = structuredClone(state.getCommittedV2Envelope());
+
+    await expect(state.abandonMutationIntent(malformed.intent.operationId))
+      .rejects.toThrow(/abandon evidence is invalid/i);
+
+    expect(state.mutationLedger).toEqual([malformed]);
+    expect(state.getCommittedV2Envelope()).toEqual(before);
+    expect(harness.plugin.updatePluginData).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "restore old bytes", expectedExists: true },
+    { name: "remove a newly downloaded target", expectedExists: false },
+  ])("keeps full reset read-only when a local journal would $name", async ({ expectedExists }) => {
+    const targetPath = expectedExists
+      ? "Notes/journal-restore.md"
+      : "Notes/journal-remove.md";
+    const oldBytes = "old user bytes";
+    const downloadedBytes = "interrupted download";
+    const oldBuffer = new TextEncoder().encode(oldBytes).buffer;
+    const downloadedBuffer = new TextEncoder().encode(downloadedBytes).buffer;
+    const recoveryPath = `${paths.tmpDir}/recovery/original.bin`;
+    const journalPath = `${paths.tmpDir}/recovery/intent.json`;
+    const journal = JSON.stringify({
+      version: 1,
+      targetPath,
+      recoveryPath,
+      recoveryMode: "copy",
+      expected: expectedExists
+        ? { hash: await sha256Hex(oldBuffer), size: oldBuffer.byteLength }
+        : null,
+      downloaded: {
+        hash: await sha256Hex(downloadedBuffer),
+        size: downloadedBuffer.byteLength,
+      },
+      createdAt: 1,
+    });
+    const harness = makeHarness({
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-history": [{ id: "must-stay" }],
+      },
+    });
+    harness.files.set(targetPath, downloadedBytes);
+    harness.files.set(journalPath, journal);
+    if (expectedExists) harness.files.set(recoveryPath, oldBytes);
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const pluginDataBefore = JSON.stringify(harness.pluginData);
+    const manifestBefore = harness.files.get(paths.stateV2ManifestFile);
+    const stateBefore = harness.files.get(paths.stateV2File);
+
+    await expect(state.reset()).rejects.toThrow(/local file recovery/i);
+
+    expect(harness.files.get(targetPath)).toBe(downloadedBytes);
+    expect(harness.files.get(journalPath)).toBe(journal);
+    expect(harness.files.get(recoveryPath))
+      .toBe(expectedExists ? oldBytes : undefined);
+    expect(JSON.stringify(harness.pluginData)).toBe(pluginDataBefore);
+    expect(harness.files.get(paths.stateV2ManifestFile)).toBe(manifestBefore);
+    expect(harness.files.get(paths.stateV2File)).toBe(stateBefore);
+    expect(harness.plugin.updatePluginData).not.toHaveBeenCalled();
+  });
+
   it("clears every local V2 baseline and record while preserving logs, settings carriers, plugin assets, and user files", async () => {
     const harness = makeHarness({
       indexedDbActive: true,
@@ -1092,6 +1577,1259 @@ describe("StateManager V2 production controller", () => {
         paths.logsDir,
         true,
       );
+    } finally {
+      await state.close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
+  it.each([
+    { authorityKind: "indexeddb" as const, indexedDbActive: true },
+    { authorityKind: "json" as const, indexedDbActive: false },
+  ])("keeps one isolated ordinary-file ledger in the active V2 $authorityKind authority while resetting every other regenerable state", async ({ authorityKind, indexedDbActive }) => {
+    const ancestorText = "0123456789";
+    const ancestorHash = await sha256Hex(
+      new TextEncoder().encode(ancestorText).buffer,
+    );
+    const committed = envelope();
+    const retainedAnchor = committed.anchors.byAnchorId["file:file-a"];
+    const retainedNode = committed.remoteIndex.itemsById[remoteA.driveId];
+    if (!retainedAnchor || !retainedNode || retainedNode.kind !== "file") {
+      throw new Error("fixture retained identity is missing");
+    }
+    retainedAnchor.contentHash = ancestorHash;
+    retainedAnchor.ancestorHash = ancestorHash;
+    retainedNode.contentHash = ancestorHash;
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "op-conservative-reset",
+        planRevision: 1,
+        scope,
+        action: "upload",
+        path: remoteA.path,
+        expectedLocal: {
+          exists: true,
+          hash: hashB,
+          size: remoteA.size,
+        },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: remoteA.eTag,
+          sha256Hash: ancestorHash,
+          size: remoteA.size,
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const harness = makeHarness({
+      committed,
+      indexedDbActive,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+        "easy-sync-pending-conflicts": [{ path: "stale-conflict.md" }],
+        "easy-sync-pending-deletes": [{ path: "stale-delete.md" }],
+        "easy-sync-pending-issues": [{
+          path: "stale-issue.md",
+          actionType: SyncActionType.Upload,
+          updatedAt: 1,
+        }],
+        "easy-sync-history": [{
+          id: "history-before-reset",
+          mode: "manual",
+          status: "failed",
+          startedAt: 1,
+          endedAt: 2,
+          uploaded: 0,
+          downloaded: 0,
+          deleted: 0,
+          conflicts: 0,
+          skipped: 0,
+          errors: 1,
+          message: "old",
+          files: [],
+        }],
+        "sync-interval": 15,
+        "easy-sync-diagnostic-log": true,
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    let reopened: StateManager | null = null;
+    let databaseId = "";
+    try {
+      harness.folders.add(paths.ancestorsV2Dir);
+      harness.files.set(
+        `${paths.ancestorsV2Dir}/${ancestorHash}.txt`,
+        ancestorText,
+      );
+      harness.files.set(paths.ancestorManifestV2File, JSON.stringify({
+        schemaVersion: 2,
+        textHashes: [ancestorHash],
+      }));
+      await state.load();
+      databaseId = state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+      expect(state.activeV2StorageAuthorityEvidence.kind).toBe(authorityKind);
+      const before = state.getCommittedV2Envelope()!;
+      harness.folders.add(paths.tmpDir);
+      harness.folders.add(paths.logsDir);
+      harness.files.set(`${paths.tmpDir}/downloads/note.md.part`, "partial");
+      harness.files.set(`${paths.logsDir}/2026-08-16.jsonl`, "diagnostic");
+      harness.files.set(paths.baseContentFile, JSON.stringify({
+        [remoteA.path]: "base",
+      }));
+      harness.files.set(paths.scanCacheFile, "{}");
+      harness.files.set(`${paths.pluginDir}/main.js`, "plugin");
+      harness.files.set("Notes/user.md", "user");
+
+      await state.resetPreservingIsolatedMutationRecovery([retained]);
+
+      const after = state.getCommittedV2Envelope()!;
+      expect(state.isV2StateActive).toBe(true);
+      expect(after.scope).toEqual(before.scope);
+      expect(after.meta.lifecycleEpoch).toBe(before.meta.lifecycleEpoch + 1);
+      expect(after.meta.commitSeq).toBe(before.meta.commitSeq + 1);
+      expect(after.remoteIndex.itemsById).toEqual({});
+      expect(after.remoteIndex.deltaLink).toBeNull();
+      expect(after.anchors.byAnchorId).toEqual(
+        before.anchors.byAnchorId,
+      );
+      expect(after.folderAnchors?.byAnchorId).toEqual({});
+      expect(after.communityPluginParticipation).toBeUndefined();
+      expect(state.mutationLedger).toEqual([retained]);
+      expect(state.boundAccountId).toBe(scope.accountId);
+      expect(state.pendingConflicts).toEqual([]);
+      expect(state.pendingRemoteDeletes).toEqual([]);
+      expect(state.pendingIssues).toEqual([]);
+      expect(state.syncHistory).toEqual([]);
+      expect(state.activeV2StorageAuthorityEvidence.databaseId)
+        .toBe(indexedDbActive ? databaseId : null);
+      expect(harness.pluginData["sync-interval"]).toBe(15);
+      expect(harness.pluginData["easy-sync-diagnostic-log"]).toBe(true);
+      expect(harness.files.get(`${paths.logsDir}/2026-08-16.jsonl`))
+        .toBe("diagnostic");
+      expect(harness.files.get(`${paths.pluginDir}/main.js`)).toBe("plugin");
+      expect(harness.files.get("Notes/user.md")).toBe("user");
+      expect(harness.files.has(paths.baseContentFile)).toBe(false);
+      expect(harness.files.has(paths.scanCacheFile)).toBe(false);
+      expect(harness.files.get(
+        `${paths.ancestorsV2Dir}/${ancestorHash}.txt`,
+      )).toBe(ancestorText);
+      expect(JSON.parse(
+        harness.files.get(paths.ancestorManifestV2File)!,
+      )).toEqual({
+        schemaVersion: 2,
+        textHashes: [ancestorHash],
+      });
+      expect([...harness.files.keys()].some((path) =>
+        path.startsWith(`${paths.tmpDir}/`)
+      )).toBe(false);
+
+      await state.close();
+      reopened = new StateManager(harness.plugin);
+      await reopened.load();
+      expect(reopened.isV2StateActive).toBe(true);
+      expect(reopened.mutationLedger).toEqual([retained]);
+      expect(reopened.getCommittedV2Envelope()).toEqual(after);
+      expect(await reopened.getBaseContent(remoteA.path)).toBe(ancestorText);
+      expect(reopened.activeV2StorageAuthorityEvidence.kind).toBe(authorityKind);
+      expect(reopened.activeV2StorageAuthorityEvidence.databaseId)
+        .toBe(indexedDbActive ? databaseId : null);
+    } finally {
+      await (reopened ?? state).close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
+  it.each([
+    { authorityKind: "indexeddb" as const, indexedDbActive: true },
+    { authorityKind: "json" as const, indexedDbActive: false },
+  ])("preserves an exact ordered multi-record R3 capsule across a cold $authorityKind reopen", async ({ authorityKind, indexedDbActive }) => {
+    const committed = envelope();
+    const overwrite: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "r3-overwrite",
+        planRevision: 1,
+        scope,
+        action: "upload",
+        path: remoteA.path,
+        expectedLocal: { exists: true, hash: hashB, size: remoteA.size },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: remoteA.eTag,
+          size: remoteA.size,
+          sha256Hash: hashA,
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const createdRemote: RemoteFileEntry = {
+      path: "Notes/created.md",
+      driveId: "file-created",
+      parentId: folder.driveId,
+      size: 12,
+      mtime: 2,
+      eTag: "etag-created",
+      cTag: "ctag-created",
+      sha256Hash: hashB,
+    };
+    const created: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "r3-created-receipt",
+        planRevision: 1,
+        scope,
+        action: "upload",
+        path: createdRemote.path,
+        expectedLocal: { exists: true, hash: hashB, size: 12 },
+        expectedRemote: { exists: false },
+        createdAt: 2,
+      },
+      receipt: {
+        version: 1,
+        operationId: "r3-created-receipt",
+        completedAt: 3,
+        checkpoint: {
+          baseUpserts: [{
+            path: createdRemote.path,
+            hash: hashB,
+            size: 12,
+            eTag: createdRemote.eTag,
+          }],
+          baseRemovals: [],
+          remoteUpserts: [createdRemote],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      },
+    };
+    const deletedLocally: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "r3-delete-local-post-state",
+        planRevision: 1,
+        scope,
+        action: "deleteLocal",
+        path: "Notes/deleted.md",
+        expectedLocal: { exists: true, hash: hashA, size: 9 },
+        expectedRemote: { exists: false },
+        createdAt: 4,
+      },
+      receipt: {
+        version: 1,
+        operationId: "r3-delete-local-post-state",
+        completedAt: 5,
+        checkpoint: {
+          baseUpserts: [],
+          baseRemovals: ["Notes/deleted.md"],
+          remoteUpserts: [],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: ["Notes/deleted.md"],
+        },
+      },
+    };
+    const ledger = [overwrite, created, deletedLocally];
+    const harness = makeHarness({
+      committed,
+      indexedDbActive,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": ledger,
+        "easy-sync-pending-conflicts": [{ path: "stale.md" }],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    let reopened: StateManager | null = null;
+    let databaseId = "";
+    try {
+      await state.load();
+      databaseId = state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+
+      await state.resetPreservingIsolatedMutationRecovery(ledger);
+
+      const capsule = state.getCommittedV2Envelope()!;
+      expect(capsule.remoteIndex.itemsById).toEqual({});
+      expect(capsule.anchors.byAnchorId).toEqual({
+        "file:file-a": committed.anchors.byAnchorId["file:file-a"],
+      });
+      expect(state.mutationLedger).toEqual(ledger);
+      expect(state.pendingConflicts).toEqual([]);
+      await state.close();
+
+      reopened = new StateManager(harness.plugin);
+      await reopened.load();
+      expect(reopened.activeV2StorageAuthorityEvidence.kind)
+        .toBe(authorityKind);
+      expect(reopened.getCommittedV2Envelope()).toEqual(capsule);
+      expect(reopened.mutationLedger).toEqual(ledger);
+    } finally {
+      await (reopened ?? state).close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
+  it("rejects a stale same-identity anchor before conservative reset commits", async () => {
+    const committed = envelope();
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "r3-stale-anchor",
+        planRevision: 1,
+        scope,
+        action: "upload",
+        path: remoteA.path,
+        expectedLocal: { exists: true, hash: hashB, size: remoteA.size },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: "etag-not-the-anchor",
+          size: remoteA.size,
+          sha256Hash: hashA,
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const harness = makeHarness({
+      committed,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+        "easy-sync-pending-conflicts": [{ path: "must-stay.md" }],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    try {
+      await state.load();
+      const before = structuredClone(state.getCommittedV2Envelope()!);
+
+      await expect(
+        state.resetPreservingIsolatedMutationRecovery([retained]),
+      ).rejects.toThrow(/isolated|capsule|evidence/i);
+
+      expect(state.getCommittedV2Envelope()).toEqual(before);
+      expect(state.mutationLedger).toEqual([retained]);
+      expect(state.pendingConflicts).toEqual([{ path: "must-stay.md" }]);
+    } finally {
+      await state.close();
+    }
+  });
+
+  it("keeps reset read-only while a local replacement journal is pending", async () => {
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "r3-pending-local-journal",
+        planRevision: 1,
+        scope,
+        action: "upload",
+        path: remoteA.path,
+        expectedLocal: { exists: true, hash: hashB, size: remoteA.size },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: remoteA.eTag,
+          size: remoteA.size,
+          sha256Hash: hashA,
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const harness = makeHarness({
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+      },
+    });
+    const journalPath = `${paths.tmpDir}/recovery/intent.json`;
+    harness.files.set(journalPath, "pending");
+    const state = new StateManager(harness.plugin);
+    try {
+      await state.load();
+      const before = structuredClone(state.getCommittedV2Envelope()!);
+
+      await expect(
+        state.resetPreservingIsolatedMutationRecovery([retained]),
+      ).rejects.toThrow(/local file recovery/i);
+
+      expect(harness.files.get(journalPath)).toBe("pending");
+      expect(state.getCommittedV2Envelope()).toEqual(before);
+      expect(state.mutationLedger).toEqual([retained]);
+    } finally {
+      await state.close();
+    }
+  });
+
+  it("retires an already-reflected upload checkpoint without replaying stale remote facts", async () => {
+    const committed = envelope();
+    const anchor = committed.anchors.byAnchorId["file:file-a"]!;
+    const node = committed.remoteIndex.itemsById[remoteA.driveId];
+    if (!node || node.kind !== "file") throw new Error("file fixture missing");
+    anchor.contentHash = hashB;
+    anchor.size = remoteA.size;
+    anchor.remoteETag = "etag-receipt";
+    node.eTag = "etag-newer";
+    node.contentHash = hashA;
+    const receiptRemote: RemoteFileEntry = {
+      ...remoteA,
+      eTag: "etag-receipt",
+      sha256Hash: hashB,
+    };
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "r3-upload-checkpoint-reflected",
+        planRevision: 1,
+        scope,
+        action: "upload",
+        path: remoteA.path,
+        expectedLocal: { exists: true, hash: hashB, size: remoteA.size },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: remoteA.eTag,
+          size: remoteA.size,
+          sha256Hash: hashA,
+        },
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1,
+        operationId: "r3-upload-checkpoint-reflected",
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [{
+            path: remoteA.path,
+            hash: hashB,
+            size: remoteA.size,
+            eTag: receiptRemote.eTag,
+          }],
+          baseRemovals: [],
+          remoteUpserts: [receiptRemote],
+          remoteDeletes: [],
+          pendingConflictRemovals: [remoteA.path],
+          pendingDeleteRemovals: [],
+        },
+      },
+    };
+    const harness = makeHarness({
+      committed,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+        "easy-sync-pending-conflicts": [{ path: remoteA.path }],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    try {
+      await state.load();
+      const before = structuredClone(state.getCommittedV2Envelope()!);
+
+      expect(await state.retireMutationCheckpointIfReflected(
+        retained.intent.operationId,
+        before.meta.commitSeq,
+      )).toBe(true);
+
+      expect(state.mutationLedger).toEqual([]);
+      expect(state.pendingConflicts).toEqual([]);
+      const after = state.getCommittedV2Envelope()!;
+      expect(after.meta.commitSeq).toBe(before.meta.commitSeq + 1);
+      expect(after.meta.lifecycleEpoch).toBe(before.meta.lifecycleEpoch);
+      expect(after.remoteIndex).toEqual(before.remoteIndex);
+      expect(after.anchors).toEqual(before.anchors);
+      expect(after.remoteIndex.itemsById[remoteA.driveId])
+        .toMatchObject({ eTag: "etag-newer", contentHash: hashA });
+    } finally {
+      await state.close();
+    }
+  });
+
+  it.each([
+    { name: "receipt content does not match the intent", mismatchContent: true },
+    { name: "receipt removes unrelated pending evidence", mismatchContent: false },
+  ])("keeps a reflected checkpoint when $name", async ({ mismatchContent }) => {
+    const committed = envelope();
+    const anchor = committed.anchors.byAnchorId["file:file-a"]!;
+    anchor.contentHash = hashB;
+    anchor.size = remoteA.size;
+    anchor.remoteETag = "etag-receipt";
+    const receiptRemote: RemoteFileEntry = {
+      ...remoteA,
+      eTag: "etag-receipt",
+      sha256Hash: hashB,
+    };
+    const unrelatedPath = "Notes/unrelated.md";
+    const operationId = mismatchContent
+      ? "r3-reflected-semantic-content-mismatch"
+      : "r3-reflected-unrelated-pending-removal";
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId,
+        planRevision: 1,
+        scope,
+        action: "upload",
+        path: remoteA.path,
+        expectedLocal: {
+          exists: true,
+          hash: mismatchContent ? hashA : hashB,
+          size: remoteA.size,
+        },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: remoteA.eTag,
+          size: remoteA.size,
+          sha256Hash: hashA,
+        },
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1,
+        operationId,
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [{
+            path: remoteA.path,
+            hash: hashB,
+            size: remoteA.size,
+            eTag: receiptRemote.eTag,
+          }],
+          baseRemovals: [],
+          remoteUpserts: [receiptRemote],
+          remoteDeletes: [],
+          pendingConflictRemovals: [
+            mismatchContent ? remoteA.path : unrelatedPath,
+          ],
+          pendingDeleteRemovals: [],
+        },
+      },
+    };
+    const pendingConflicts = [
+      { path: remoteA.path },
+      { path: unrelatedPath },
+    ];
+    const harness = makeHarness({
+      committed,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+        "easy-sync-pending-conflicts": pendingConflicts,
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const before = structuredClone(state.getCommittedV2Envelope()!);
+
+    expect(await state.retireMutationCheckpointIfReflected(
+      operationId,
+      before.meta.commitSeq,
+    )).toBe(false);
+    await expect(state.commitMutationCheckpoint(operationId))
+      .rejects.toThrow(/checkpoint evidence is invalid/i);
+
+    expect(state.mutationLedger).toEqual([retained]);
+    expect(state.pendingConflicts).toEqual(pendingConflicts);
+    expect(state.getCommittedV2Envelope()).toEqual(before);
+  });
+
+  it("retires an already-reflected zero-anchor deleteLocal checkpoint", async () => {
+    const committed = envelope();
+    delete committed.anchors.byAnchorId["file:file-a"];
+    delete committed.remoteIndex.itemsById[remoteA.driveId];
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "r3-delete-local-checkpoint-reflected",
+        planRevision: 1,
+        scope,
+        action: "deleteLocal",
+        path: remoteA.path,
+        expectedLocal: { exists: true, hash: hashA, size: remoteA.size },
+        expectedRemote: { exists: false },
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1,
+        operationId: "r3-delete-local-checkpoint-reflected",
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [],
+          baseRemovals: [remoteA.path],
+          remoteUpserts: [],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [remoteA.path],
+        },
+      },
+    };
+    const harness = makeHarness({
+      committed,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+        "easy-sync-pending-deletes": [{ path: remoteA.path }],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    try {
+      await state.load();
+      const before = structuredClone(state.getCommittedV2Envelope()!);
+
+      expect(await state.retireMutationCheckpointIfReflected(
+        retained.intent.operationId,
+        before.meta.commitSeq,
+      )).toBe(true);
+
+      expect(state.mutationLedger).toEqual([]);
+      expect(state.pendingRemoteDeletes).toEqual([]);
+      const after = state.getCommittedV2Envelope()!;
+      expect(after.meta.commitSeq).toBe(before.meta.commitSeq + 1);
+      expect(after.meta.lifecycleEpoch).toBe(before.meta.lifecycleEpoch);
+      expect(after.remoteIndex).toEqual(before.remoteIndex);
+      expect(after.anchors).toEqual(before.anchors);
+    } finally {
+      await state.close();
+    }
+  });
+
+  it.each([
+    { authorityKind: "json" as const, indexedDbActive: false },
+    { authorityKind: "indexeddb" as const, indexedDbActive: true },
+  ])("keeps a reflected checkpoint when its $authorityKind authority disappears", async ({ indexedDbActive }) => {
+    const committed = envelope();
+    delete committed.anchors.byAnchorId["file:file-a"];
+    delete committed.remoteIndex.itemsById[remoteA.driveId];
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "r3-reflected-authority-missing",
+        planRevision: 1,
+        scope,
+        action: "deleteLocal",
+        path: remoteA.path,
+        expectedLocal: { exists: true, hash: hashA, size: remoteA.size },
+        expectedRemote: { exists: false },
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1,
+        operationId: "r3-reflected-authority-missing",
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [],
+          baseRemovals: [remoteA.path],
+          remoteUpserts: [],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [remoteA.path],
+        },
+      },
+    };
+    const harness = makeHarness({
+      committed,
+      indexedDbActive,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+        "easy-sync-pending-deletes": [{ path: remoteA.path }],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    let databaseId = "";
+    try {
+      await state.load();
+      databaseId = state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+      const before = structuredClone(state.getCommittedV2Envelope()!);
+      harness.files.delete(paths.stateV2ManifestFile);
+
+      await expect(state.retireMutationCheckpointIfReflected(
+        retained.intent.operationId,
+        before.meta.commitSeq,
+      )).rejects.toThrow(/manifest|authority/i);
+
+      expect(state.mutationLedger).toEqual([retained]);
+    } finally {
+      await state.close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
+  it("retries reflected checkpoint retirement after PluginData persistence fails", async () => {
+    const committed = envelope();
+    delete committed.anchors.byAnchorId["file:file-a"];
+    delete committed.remoteIndex.itemsById[remoteA.driveId];
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "r3-reflected-plugin-data-retry",
+        planRevision: 1,
+        scope,
+        action: "deleteLocal",
+        path: remoteA.path,
+        expectedLocal: { exists: true, hash: hashA, size: remoteA.size },
+        expectedRemote: { exists: false },
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1,
+        operationId: "r3-reflected-plugin-data-retry",
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [],
+          baseRemovals: [remoteA.path],
+          remoteUpserts: [],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [remoteA.path],
+        },
+      },
+    };
+    const harness = makeHarness({
+      committed,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+      },
+    });
+    const active = new StateManager(harness.plugin);
+    let reopened: StateManager | null = null;
+    try {
+      await active.load();
+      vi.mocked(harness.plugin.updatePluginData)
+        .mockRejectedValueOnce(new Error("interrupted ledger cleanup"));
+
+      await expect(active.retireMutationCheckpointIfReflected(
+        retained.intent.operationId,
+        active.getCommittedV2Envelope()!.meta.commitSeq,
+      )).rejects.toThrow("interrupted ledger cleanup");
+      expect(active.mutationLedger).toEqual([retained]);
+      await active.close();
+
+      reopened = new StateManager(harness.plugin);
+      await reopened.load();
+      expect(await reopened.retireMutationCheckpointIfReflected(
+        retained.intent.operationId,
+        reopened.getCommittedV2Envelope()!.meta.commitSeq,
+      )).toBe(true);
+      expect(reopened.mutationLedger).toEqual([]);
+    } finally {
+      await (reopened ?? active).close();
+    }
+  });
+
+  it("preserves the one exact merge-ready payload and rejects a missing payload before authority commit", async () => {
+    const committed = envelope();
+    const anchor = committed.anchors.byAnchorId["file:file-a"]!;
+    anchor.ancestorHash = hashA;
+    const targetBytes = new TextEncoder().encode("merged-r3").buffer;
+    const target = {
+      hash: await sha256Hex(targetBytes),
+      size: targetBytes.byteLength,
+    };
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "r3-merge-ready",
+        planRevision: 1,
+        scope,
+        action: "merge",
+        path: remoteA.path,
+        expectedLocal: { exists: true, hash: hashB, size: remoteA.size },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: remoteA.eTag,
+          size: remoteA.size,
+          sha256Hash: hashA,
+        },
+        target,
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const harness = makeHarness({
+      indexedDbActive: true,
+      committed,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    let databaseId = "";
+    try {
+      const store = new MergeReadyStore(
+        harness.plugin.app.vault.adapter,
+        paths.tmpDir,
+      );
+      await store.prepare(retained.intent.operationId, targetBytes, target);
+      await state.load();
+      databaseId = state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+
+      await state.resetPreservingIsolatedMutationRecovery([retained]);
+
+      expect(await store.read(retained.intent.operationId, target))
+        .not.toBeNull();
+      expect(state.mutationLedger).toEqual([retained]);
+
+      await store.complete(retained.intent.operationId);
+      const before = state.getCommittedV2Envelope();
+      await expect(
+        state.resetPreservingIsolatedMutationRecovery([retained]),
+      ).rejects.toThrow(/merge payload/i);
+      expect(state.getCommittedV2Envelope()).toEqual(before);
+      expect(state.mutationLedger).toEqual([retained]);
+    } finally {
+      await state.close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
+  it("preserves a receipted remote-only merge payload across conservative reset", async () => {
+    const committed = envelope();
+    const targetBytes = new TextEncoder().encode("merged-r3-receipt").buffer;
+    const target = {
+      hash: await sha256Hex(targetBytes),
+      size: targetBytes.byteLength,
+    };
+    const receiptRemote: RemoteFileEntry = {
+      ...remoteA,
+      size: target.size,
+      eTag: "etag-merged-receipt",
+      cTag: "ctag-merged-receipt",
+      sha256Hash: target.hash,
+    };
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "r3-receipted-merge-ready",
+        planRevision: 1,
+        scope,
+        action: "merge",
+        path: remoteA.path,
+        expectedLocal: { exists: true, hash: hashB, size: remoteA.size },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: remoteA.eTag,
+          size: remoteA.size,
+          sha256Hash: hashA,
+        },
+        target,
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1,
+        operationId: "r3-receipted-merge-ready",
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [],
+          baseRemovals: [],
+          remoteUpserts: [receiptRemote],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      },
+    };
+    const harness = makeHarness({
+      indexedDbActive: true,
+      committed,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    let databaseId = "";
+    try {
+      const store = new MergeReadyStore(
+        harness.plugin.app.vault.adapter,
+        paths.tmpDir,
+      );
+      await store.prepare(retained.intent.operationId, targetBytes, target);
+      await state.load();
+      databaseId = state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+
+      await state.resetPreservingIsolatedMutationRecovery([retained]);
+
+      expect(await store.read(retained.intent.operationId, target))
+        .not.toBeNull();
+      expect(state.mutationLedger).toEqual([retained]);
+      expect(await state.retireMutationCheckpointIfReflected(
+        retained.intent.operationId,
+        state.getCommittedV2Envelope()!.meta.commitSeq,
+      )).toBe(false);
+    } finally {
+      await state.close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
+  it("retries the conservative reset from its committed V2 capsule after PluginData cleanup was interrupted", async () => {
+    const remoteChanged = envelope();
+    const currentRemote = remoteChanged.remoteIndex.itemsById[remoteA.driveId];
+    if (!currentRemote || currentRemote.kind !== "file") {
+      throw new Error("fixture remote file is missing");
+    }
+    currentRemote.eTag = "etag-b";
+    currentRemote.cTag = "ctag-b";
+    currentRemote.contentHash = hashB;
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "op-conservative-reset-retry",
+        planRevision: 1,
+        scope,
+        action: "download",
+        path: remoteA.path,
+        expectedLocal: {
+          exists: true,
+          hash: hashA,
+          size: remoteA.size,
+        },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: "etag-b",
+          size: remoteA.size,
+          sha256Hash: hashB,
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const harness = makeHarness({
+      committed: remoteChanged,
+      indexedDbActive: true,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+        "easy-sync-pending-conflicts": [{ path: "stale.md" }],
+      },
+    });
+    const active = new StateManager(harness.plugin);
+    let retry: StateManager | null = null;
+    let databaseId = "";
+    try {
+      await active.load();
+      databaseId = active.activeV2StorageAuthorityEvidence.databaseId ?? "";
+      const source = active.getCommittedV2Envelope()!;
+      vi.mocked(harness.plugin.updatePluginData)
+        .mockRejectedValueOnce(new Error("interrupted PluginData cleanup"));
+
+      await expect(
+        active.resetPreservingIsolatedMutationRecovery([retained]),
+      ).rejects.toThrow("interrupted PluginData cleanup");
+
+      const committedCapsule = active.getCommittedV2Envelope()!;
+      expect(committedCapsule.meta.lifecycleEpoch)
+        .toBe(source.meta.lifecycleEpoch + 1);
+      expect(committedCapsule.remoteIndex.itemsById).toEqual({});
+      expect(active.mutationLedger).toEqual([retained]);
+      await active.close();
+
+      retry = new StateManager(harness.plugin);
+      await retry.load();
+      expect(retry.getCommittedV2Envelope()).toEqual(committedCapsule);
+      expect(retry.mutationLedger).toEqual([retained]);
+
+      await retry.resetPreservingIsolatedMutationRecovery([retained]);
+
+      expect(retry.getCommittedV2Envelope()?.meta)
+        .toEqual(committedCapsule.meta);
+      expect(retry.pendingConflicts).toEqual([]);
+      expect(retry.mutationLedger).toEqual([retained]);
+    } finally {
+      await (retry ?? active).close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
+  it("drops a missing merge ancestor without blocking the exact file identity capsule", async () => {
+    const ancestorText = "0123456789";
+    const ancestorHash = await sha256Hex(
+      new TextEncoder().encode(ancestorText).buffer,
+    );
+    const committed = envelope();
+    const retainedAnchor = committed.anchors.byAnchorId["file:file-a"];
+    const retainedNode = committed.remoteIndex.itemsById[remoteA.driveId];
+    if (!retainedAnchor || !retainedNode || retainedNode.kind !== "file") {
+      throw new Error("fixture retained identity is missing");
+    }
+    retainedAnchor.contentHash = ancestorHash;
+    retainedAnchor.ancestorHash = ancestorHash;
+    retainedNode.contentHash = ancestorHash;
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "op-missing-ancestor-cache",
+        planRevision: 1,
+        scope,
+        action: "upload",
+        path: remoteA.path,
+        expectedLocal: {
+          exists: true,
+          hash: hashB,
+          size: remoteA.size,
+        },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: remoteA.eTag,
+          size: remoteA.size,
+          sha256Hash: ancestorHash,
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const harness = makeHarness({
+      committed,
+      indexedDbActive: true,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    let reopened: StateManager | null = null;
+    let databaseId = "";
+    try {
+      harness.folders.add(paths.ancestorsV2Dir);
+      const ancestorPath =
+        `${paths.ancestorsV2Dir}/${ancestorHash}.txt`;
+      harness.files.set(ancestorPath, ancestorText);
+      harness.files.set(paths.ancestorManifestV2File, JSON.stringify({
+        schemaVersion: 2,
+        textHashes: [ancestorHash],
+      }));
+      await state.load();
+      databaseId = state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+
+      // The active IndexedDB envelope remains healthy if this optional merge
+      // cache disappears. Reset must retain the file identity, not turn the
+      // missing regenerable body into a permanent blocker.
+      harness.files.delete(ancestorPath);
+      harness.files.delete(paths.ancestorManifestV2File);
+      await state.resetPreservingIsolatedMutationRecovery([retained]);
+
+      expect(state.getCommittedV2Envelope()?.anchors.byAnchorId[
+        "file:file-a"
+      ]?.ancestorHash).toBeUndefined();
+      expect(state.mutationLedger).toEqual([retained]);
+      await state.close();
+
+      reopened = new StateManager(harness.plugin);
+      await reopened.load();
+      expect(reopened.isV2StateActive).toBe(true);
+      expect(reopened.mutationLedger).toEqual([retained]);
+      expect(await reopened.getBaseContent(remoteA.path)).toBeUndefined();
+    } finally {
+      await (reopened ?? state).close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
+  it("does not require a regenerable folder-anchor chain for one exact file capsule", async () => {
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "op-missing-parent-capsule",
+        planRevision: 1,
+        scope,
+        action: "upload",
+        path: remoteA.path,
+        expectedLocal: {
+          exists: true,
+          hash: hashA,
+          size: remoteA.size,
+        },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: remoteA.eTag,
+          size: remoteA.size,
+          sha256Hash: remoteA.sha256Hash,
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const committed = envelope();
+    committed.folderAnchors = {
+      schemaVersion: 2,
+      byAnchorId: {},
+    };
+    const harness = makeHarness({
+      committed,
+      indexedDbActive: true,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    let databaseId = "";
+    try {
+      await state.load();
+      databaseId = state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+      await state.resetPreservingIsolatedMutationRecovery([retained]);
+
+      expect(state.getCommittedV2Envelope()?.remoteIndex.itemsById)
+        .toEqual({});
+      expect(state.getCommittedV2Envelope()?.anchors.byAnchorId)
+        .toHaveProperty("file:file-a");
+      expect(state.getCommittedV2Envelope()?.folderAnchors?.byAnchorId)
+        .toEqual({});
+      expect(state.mutationLedger).toEqual([retained]);
+    } finally {
+      await state.close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
+  it.each([
+    ["manifest", paths.stateV2ManifestFile],
+    ["authority witness", paths.stateV2AuthorityWitnessFile],
+  ])("does not start a conservative reset after the durable V2 %s disappears", async (_label, authorityPath) => {
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "op-authority-preflight",
+        planRevision: 1,
+        scope,
+        action: "upload",
+        path: remoteA.path,
+        expectedLocal: {
+          exists: true,
+          hash: hashB,
+          size: remoteA.size,
+        },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: remoteA.eTag,
+          size: remoteA.size,
+          sha256Hash: hashA,
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const harness = makeHarness({
+      indexedDbActive: true,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+        "easy-sync-pending-conflicts": [{ path: "must-stay.md" }],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    let databaseId = "";
+    try {
+      await state.load();
+      databaseId = state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+      const before = state.getCommittedV2Envelope();
+      harness.files.delete(authorityPath);
+
+      await expect(
+        state.resetPreservingIsolatedMutationRecovery([retained]),
+      ).rejects.toThrow(/authority|manifest/i);
+
+      expect(state.getCommittedV2Envelope()).toEqual(before);
+      expect(state.mutationLedger).toEqual([retained]);
+      expect(state.pendingConflicts).toEqual([{ path: "must-stay.md" }]);
+    } finally {
+      await state.close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
+  it("does not report success when the V2 manifest disappears after the capsule commit", async () => {
+    const retained: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "op-authority-postcondition",
+        planRevision: 1,
+        scope,
+        action: "upload",
+        path: remoteA.path,
+        expectedLocal: {
+          exists: true,
+          hash: hashB,
+          size: remoteA.size,
+        },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: remoteA.eTag,
+          size: remoteA.size,
+          sha256Hash: hashA,
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const harness = makeHarness({
+      indexedDbActive: true,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "easy-sync-v2-mutation-ledger": [retained],
+        "easy-sync-pending-conflicts": [{ path: "stale.md" }],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    let databaseId = "";
+    try {
+      await state.load();
+      databaseId = state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+      vi.mocked(harness.plugin.updatePluginData).mockImplementation(
+        async (mutator) => {
+          mutator(harness.pluginData);
+          harness.files.delete(paths.stateV2ManifestFile);
+        },
+      );
+
+      await expect(
+        state.resetPreservingIsolatedMutationRecovery([retained]),
+      ).rejects.toThrow("final authority reload");
+
+      expect(state.isV2StateActive).toBe(false);
+      expect(state.v2StateLoadRecoveryBlock).toMatchObject({
+        authority: "v2",
+        reason: "authority-witness-manifest-missing",
+      });
+      expect(state.mutationLedger).toEqual([retained]);
     } finally {
       await state.close();
       if (databaseId) {
@@ -1351,6 +3089,178 @@ describe("StateManager V2 production controller", () => {
     expect(state.mutationRecoveryQuarantine).toEqual([]);
   });
 
+  it("retires exact intent-only uploads for an explicit scope exit without changing V2 file state", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const intent = uploadMutation().intent;
+    await state.beginMutationIntent(intent);
+    const sourceCommitSeq = harness.readCommitted().meta.commitSeq;
+    const expected = structuredClone(state.mutationLedger);
+
+    await expect(
+      state.retireUnreceiptedMutationIntentsForScopeExit(expected),
+    ).resolves.toBe(1);
+
+    expect(state.mutationLedger).toEqual([]);
+    expect(harness.pluginData["easy-sync-mutation-ledger"]).toEqual([]);
+    expect(harness.pluginData["easy-sync-v2-mutation-ledger"]).toEqual([]);
+    expect(harness.readCommitted().meta.commitSeq).toBe(sourceCommitSeq);
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    expect(restarted.mutationLedger).toEqual([]);
+  });
+
+  it("checkpoints a narrower scope while retaining its exact unresolved upload evidence", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const intent = uploadMutation().intent;
+    await state.beginMutationIntent(intent);
+    const expected = structuredClone(state.mutationLedger);
+    const sourceCommitSeq = harness.readCommitted().meta.commitSeq;
+
+    await state.commitSyncPathSettingsChange(
+      () => false,
+      (data) => {
+        data["sync-community-plugins"] = false;
+      },
+      [],
+      {
+        previousSettingsFingerprint: "scope-open",
+        targetSettingsFingerprint: "scope-closed",
+        expandedFolderPaths: [],
+        retainedMutationRecoveryScopeExit: expected,
+      },
+    );
+
+    expect(state.syncPathSettingsFingerprint).toBe("scope-closed");
+    expect(state.mutationLedger).toEqual(expected);
+    expect(harness.readCommitted().meta.commitSeq).toBe(sourceCommitSeq);
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    expect(restarted.syncPathSettingsFingerprint).toBe("scope-closed");
+    expect(restarted.mutationLedger).toEqual(expected);
+  });
+
+  it("allows an unrelated scope change while an ordinary file recovery remains included", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    await state.beginMutationIntent(uploadMutation().intent);
+    const expected = structuredClone(state.mutationLedger);
+    const sourceCommitSeq = harness.readCommitted().meta.commitSeq;
+
+    await state.commitSyncPathSettingsChange(
+      (path) => path === "Notes/new.md" || !path.startsWith("Private/"),
+      (data) => {
+        data["sync-excluded-folders"] = ["Private"];
+      },
+      undefined,
+      {
+        previousSettingsFingerprint: "before-unrelated-change",
+        targetSettingsFingerprint: "after-unrelated-change",
+        expandedFolderPaths: [],
+      },
+    );
+
+    expect(state.syncPathSettingsFingerprint).toBe("after-unrelated-change");
+    expect(state.mutationLedger).toEqual(expected);
+    expect(harness.readCommitted().meta.commitSeq).toBe(sourceCommitSeq);
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    expect(restarted.syncPathSettingsFingerprint).toBe("after-unrelated-change");
+    expect(restarted.mutationLedger).toEqual(expected);
+  });
+
+  it("still rejects a normal settings change that excludes the recovery path", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    await state.beginMutationIntent(uploadMutation().intent);
+    const expected = structuredClone(state.mutationLedger);
+
+    await expect(state.commitSyncPathSettingsChange(
+      () => false,
+      () => undefined,
+      undefined,
+      {
+        previousSettingsFingerprint: "scope-open",
+        targetSettingsFingerprint: "scope-excludes-recovery",
+        expandedFolderPaths: [],
+      },
+    )).rejects.toThrow(
+      "Cannot change sync paths while mutation recovery is unresolved",
+    );
+
+    expect(state.mutationLedger).toEqual(expected);
+    expect(state.syncPathSettingsFingerprint).not.toBe(
+      "scope-excludes-recovery",
+    );
+  });
+
+  it("keeps folder recovery as a global settings lock", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const intent: FolderMutationIntentV2 = {
+      version: 2,
+      operationId: "pending-folder-create",
+      planRevision: 1,
+      scope,
+      action: "createRemoteFolder",
+      path: "Notes/New",
+      expectedLocal: { exists: true },
+      expectedRemote: { exists: false },
+      expectedParent: {
+        driveId: folder.driveId,
+        path: folder.path,
+      },
+      createdAt: 1,
+    };
+    await state.beginMutationIntent(intent);
+
+    await expect(state.commitSyncPathSettingsChange(
+      () => true,
+      () => undefined,
+      undefined,
+      {
+        previousSettingsFingerprint: "before-folder-recovery",
+        targetSettingsFingerprint: "after-folder-recovery",
+        expandedFolderPaths: [],
+      },
+    )).rejects.toThrow(
+      "Cannot change sync paths while mutation recovery is unresolved",
+    );
+
+    expect(state.mutationLedger).toEqual([{ intent, receipt: null }]);
+  });
+
+  it("refuses a retained recovery checkpoint when the unresolved path remains in scope", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    await state.beginMutationIntent(uploadMutation().intent);
+    const expected = structuredClone(state.mutationLedger);
+
+    await expect(state.commitSyncPathSettingsChange(
+      () => true,
+      () => undefined,
+      undefined,
+      {
+        previousSettingsFingerprint: "scope-open",
+        targetSettingsFingerprint: "scope-open",
+        expandedFolderPaths: [],
+        retainedMutationRecoveryScopeExit: expected,
+      },
+    )).rejects.toThrow(
+      "Cannot change sync paths while mutation recovery is unresolved",
+    );
+
+    expect(state.syncPathSettingsFingerprint).not.toBe("scope-open");
+    expect(state.mutationLedger).toEqual(expected);
+  });
+
   it("fails closed when a persisted V2 recovery quarantine is malformed", async () => {
     const harness = makeHarness({
       pluginData: {
@@ -1394,6 +3304,65 @@ describe("StateManager V2 production controller", () => {
     expect(metrics.totalMs).toBeGreaterThanOrEqual(
       metrics.ancestorPublishMs + metrics.v2CommitMs + metrics.ledgerClearMs,
     );
+  });
+
+  it("loads and clears a receipted local-only download without changing ordinary V2 state", async () => {
+    const mutation = localOnlyDownloadMutation();
+    const harness = makeHarness({
+      pluginData: {
+        "easy-sync-mutation-ledger": [{
+          intent: mutation.intent,
+          receipt: mutation.receipt,
+        }],
+      },
+    });
+    const before = harness.readCommitted();
+    const state = new StateManager(harness.plugin);
+
+    await state.load();
+
+    expect(state.hasMutationLedgerCorruption).toBe(false);
+    expect(state.mutationLedger).toEqual([mutation]);
+    const baseBefore = structuredClone(state.baseSnapshot);
+    const remoteBefore = structuredClone(state.remoteSnapshot);
+    await state.commitMutationCheckpoint(mutation.intent.operationId);
+    expect(state.mutationLedger).toEqual([]);
+    expect(harness.readCommitted()).toEqual(before);
+    expect(state.baseSnapshot).toEqual(baseBefore);
+    expect(state.remoteSnapshot).toEqual(remoteBefore);
+  });
+
+  it("fails closed on an unknown or unbound file-intent state effect", async () => {
+    const valid = localOnlyDownloadMutation();
+    const candidates: unknown[] = [
+      {
+        ...valid.intent,
+        stateEffect: "unknown-effect",
+      },
+      {
+        ...valid.intent,
+        sourcePath: "../escaped-object.bin",
+      },
+      {
+        ...valid.intent,
+        expectedRemote: {
+          ...valid.intent.expectedRemote,
+          sha256Hash: undefined,
+        },
+      },
+    ];
+
+    for (const intent of candidates) {
+      const harness = makeHarness({
+        pluginData: {
+          "easy-sync-mutation-ledger": [{ intent, receipt: null }],
+        },
+      });
+      const state = new StateManager(harness.plugin);
+      await state.load();
+      expect(state.hasMutationLedgerCorruption).toBe(true);
+      expect(state.mutationLedger).toEqual([]);
+    }
   });
 
   it("commits independent durable receipts in one V2 revision", async () => {
@@ -1518,6 +3487,291 @@ describe("StateManager V2 production controller", () => {
         externalMutation: true,
       }),
     ]);
+  });
+
+  it("atomically persists one keep-remote plugin bundle choice without retiring its predecessors", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const pluginRoot = ".obsidian/plugins/resojot";
+    const predecessorIntent: MutationIntentV1 = {
+      ...uploadMutation().intent,
+      operationId: "unknown-resojot-main-upload",
+      path: `${pluginRoot}/main.js`,
+      createdAt: 10,
+    };
+    await state.beginMutationIntent(predecessorIntent);
+    const conflict = pluginBundleConflict();
+    await state.upsertPendingConflicts([conflict]);
+    const bundleEntry = pluginBundleSettlementEntry(
+      predecessorIntent,
+      conflict,
+    );
+    const expectedPredecessors = structuredClone(state.mutationLedger);
+
+    await expect(state.beginCommunityPluginBundleSettlement(
+      expectedPredecessors,
+      [structuredClone(conflict)],
+      bundleEntry,
+    )).resolves.toBe(true);
+
+    expect(state.mutationLedger).toEqual([
+      { intent: predecessorIntent, receipt: null },
+      bundleEntry,
+    ]);
+    expect(state.pendingConflicts).toEqual([conflict]);
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    expect(restarted.hasMutationLedgerCorruption).toBe(false);
+    expect(restarted.mutationLedger).toEqual(state.mutationLedger);
+    expect(restarted.pendingConflicts).toEqual([conflict]);
+    await expect(restarted.beginCommunityPluginBundleSettlement(
+      expectedPredecessors,
+      [structuredClone(conflict)],
+      bundleEntry,
+    )).resolves.toBe(true);
+    expect(restarted.mutationLedger).toHaveLength(2);
+  });
+
+  it("persists one keep-local plugin choice and its member receipts incrementally", async () => {
+    const harness = makeHarness({ committed: pluginBundleEnvelope() });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const predecessorIntent: MutationIntentV1 = {
+      ...uploadMutation().intent,
+      operationId: "unknown-resojot-main-upload",
+      path: ".obsidian/plugins/resojot/main.js",
+      createdAt: 10,
+    };
+    await state.beginMutationIntent(predecessorIntent);
+    const conflict = pluginBundleConflict();
+    await state.upsertPendingConflicts([conflict]);
+    const entry = keepLocalPluginBundleSettlementEntry(
+      predecessorIntent,
+      conflict,
+    );
+    await state.beginCommunityPluginBundleSettlement(
+      [{ intent: predecessorIntent, receipt: null }],
+      [structuredClone(conflict)],
+      entry,
+    );
+    const remoteReceipts = receiptedPluginBundleSettlementEntry(
+      predecessorIntent,
+      conflict,
+    ).manualResolution;
+    const settlement = entry.manualResolution;
+    if (
+      !settlement
+      || settlement.version !== 2
+      || !remoteReceipts
+      || remoteReceipts.version !== 2
+    ) throw new Error("bundle fixture missing");
+    const receipts = settlement.members.map((member, index) => ({
+      ...remoteReceipts.members[index].receipt!,
+      operationId: member.intent.operationId,
+    }));
+
+    await expect(state.recordCommunityPluginBundleSettlementReceipts(
+      entry,
+      [receipts[0]],
+    )).resolves.toBe(true);
+    const partiallyReceipted = state.mutationLedger.find(
+      (candidate) => candidate.intent.operationId === entry.intent.operationId,
+    )!;
+    expect(partiallyReceipted.manualResolution?.version === 2
+      ? partiallyReceipted.manualResolution.members.map((member) => Boolean(member.receipt))
+      : []).toEqual([true, false]);
+
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    expect(restarted.hasMutationLedgerCorruption).toBe(false);
+    const persisted = restarted.mutationLedger.find(
+      (candidate) => candidate.intent.operationId === entry.intent.operationId,
+    )!;
+    await expect(restarted.recordCommunityPluginBundleSettlementReceipts(
+      persisted,
+      [receipts[1]],
+    )).resolves.toBe(true);
+    const completed = restarted.mutationLedger.find(
+      (candidate) => candidate.intent.operationId === entry.intent.operationId,
+    )!;
+    expect(completed.manualResolution?.version === 2
+      ? completed.manualResolution.members.map((member) => Boolean(member.receipt))
+      : []).toEqual([true, true]);
+  });
+
+  it("fails closed when a future plugin bundle settlement version is unreadable", async () => {
+    const predecessorIntent: MutationIntentV1 = {
+      ...uploadMutation().intent,
+      operationId: "future-bundle-predecessor",
+      path: ".obsidian/plugins/resojot/main.js",
+    };
+    const conflict = pluginBundleConflict();
+    const future = structuredClone(
+      pluginBundleSettlementEntry(predecessorIntent, conflict),
+    ) as unknown as { manualResolution: { version: number } };
+    future.manualResolution.version = 99;
+    const harness = makeHarness({
+      pluginData: {
+        "easy-sync-v2-mutation-ledger": [
+          { intent: predecessorIntent, receipt: null },
+          future,
+        ],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+
+    await state.load();
+
+    expect(state.hasMutationLedgerCorruption).toBe(true);
+    expect(state.mutationLedger).toEqual([]);
+  });
+
+  it("keeps plugin bundle predecessors and conflicts when the bundle choice write fails", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const predecessorIntent: MutationIntentV1 = {
+      ...uploadMutation().intent,
+      operationId: "unknown-plugin-upload",
+      path: ".obsidian/plugins/resojot/main.js",
+    };
+    await state.beginMutationIntent(predecessorIntent);
+    const conflict = pluginBundleConflict();
+    await state.upsertPendingConflicts([conflict]);
+    const beforeLedger = structuredClone(state.mutationLedger);
+    const beforeConflicts = structuredClone(state.pendingConflicts);
+    harness.plugin.updatePluginData = vi.fn().mockRejectedValueOnce(
+      new Error("plugin data write failed"),
+    );
+
+    await expect(state.beginCommunityPluginBundleSettlement(
+      beforeLedger,
+      beforeConflicts,
+      pluginBundleSettlementEntry(predecessorIntent, conflict),
+    )).rejects.toThrow("plugin data write failed");
+
+    expect(state.mutationLedger).toEqual(beforeLedger);
+    expect(state.pendingConflicts).toEqual(beforeConflicts);
+  });
+
+  it("persists all plugin bundle receipts together and checkpoints one reviewed remote bundle", async () => {
+    const harness = makeHarness({ committed: pluginBundleEnvelope() });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const pluginRoot = ".obsidian/plugins/resojot";
+    const predecessorIntent: MutationIntentV1 = {
+      ...uploadMutation().intent,
+      operationId: "unknown-resojot-main-upload",
+      path: `${pluginRoot}/main.js`,
+      createdAt: 10,
+    };
+    const unrelatedIntent: MutationIntentV1 = {
+      ...uploadMutation().intent,
+      operationId: "unrelated-note-upload",
+      createdAt: 11,
+    };
+    await state.beginMutationIntent(predecessorIntent);
+    await state.beginMutationIntent(unrelatedIntent);
+    const conflict = pluginBundleConflict();
+    await state.upsertPendingConflicts([conflict]);
+    const unreceipted = pluginBundleSettlementEntry(
+      predecessorIntent,
+      conflict,
+    );
+    await expect(state.beginCommunityPluginBundleSettlement(
+      [{ intent: predecessorIntent, receipt: null }],
+      [structuredClone(conflict)],
+      unreceipted,
+    )).resolves.toBe(true);
+    expect(state.mutationLedger.map((entry) => entry.intent.operationId))
+      .toEqual([
+        predecessorIntent.operationId,
+        unrelatedIntent.operationId,
+        unreceipted.intent.operationId,
+      ]);
+
+    const receipted = receiptedPluginBundleSettlementEntry(
+      predecessorIntent,
+      conflict,
+    );
+    const settlement = receipted.manualResolution;
+    if (!settlement || settlement.version !== 2) throw new Error("bundle fixture missing");
+    await expect(state.recordCommunityPluginBundleSettlementReceipts(
+      unreceipted,
+      settlement.members.map((member) => member.receipt!),
+    )).resolves.toBe(true);
+    expect(state.mutationLedger.find(
+      (entry) => entry.intent.operationId === unreceipted.intent.operationId,
+    )).toEqual(receipted);
+
+    await state.commitCommunityPluginBundleSettlementCheckpoint(receipted);
+
+    expect(state.mutationLedger).toEqual([
+      { intent: unrelatedIntent, receipt: null },
+    ]);
+    expect(state.pendingConflicts).toEqual([]);
+    expect(state.baseSnapshot).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: `${pluginRoot}/main.js`,
+        hash: hashA,
+        eTag: "etag-resojot-main",
+      }),
+      expect.objectContaining({
+        path: `${pluginRoot}/manifest.json`,
+        hash: hashB,
+        eTag: "etag-resojot-manifest",
+      }),
+    ]));
+    expect(harness.readCommitted().meta.commitSeq).toBe(4);
+  });
+
+  it("keeps the complete plugin bundle settlement when one bound conflict changes", async () => {
+    const harness = makeHarness({ committed: pluginBundleEnvelope() });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const predecessorIntent: MutationIntentV1 = {
+      ...uploadMutation().intent,
+      operationId: "changed-conflict-predecessor",
+      path: ".obsidian/plugins/resojot/main.js",
+    };
+    await state.beginMutationIntent(predecessorIntent);
+    const conflict = pluginBundleConflict();
+    await state.upsertPendingConflicts([conflict]);
+    const unreceipted = pluginBundleSettlementEntry(
+      predecessorIntent,
+      conflict,
+    );
+    await state.beginCommunityPluginBundleSettlement(
+      [{ intent: predecessorIntent, receipt: null }],
+      [structuredClone(conflict)],
+      unreceipted,
+    );
+    const receipted = receiptedPluginBundleSettlementEntry(
+      predecessorIntent,
+      conflict,
+    );
+    const settlement = receipted.manualResolution;
+    if (!settlement || settlement.version !== 2) throw new Error("bundle fixture missing");
+    await state.recordCommunityPluginBundleSettlementReceipts(
+      unreceipted,
+      settlement.members.map((member) => member.receipt!),
+    );
+    await state.upsertPendingConflicts([{
+      ...conflict,
+      decisionToken: {
+        ...conflict.decisionToken!,
+        ancestorHash: "changed",
+      },
+    }]);
+
+    await expect(state.commitCommunityPluginBundleSettlementCheckpoint(
+      receipted,
+    )).rejects.toThrow("conflict changed");
+
+    expect(state.mutationLedger).toHaveLength(2);
+    expect(state.pendingConflicts).toHaveLength(1);
+    expect(harness.readCommitted().meta.commitSeq).toBe(3);
   });
 
   it("persists and atomically checkpoints the exact receipted-rename collision recovery", async () => {

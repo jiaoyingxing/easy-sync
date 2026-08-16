@@ -5,6 +5,7 @@ import {
   findLatestAutomaticHandlingSummary,
   findLatestNetworkSummary,
   findLatestPhaseSummary,
+  findLatestSharedProtocolProfileSummary,
   findLatestTransferSummary,
   fingerprintOpaqueValue,
   formatDiagnosticAutomaticSyncSummary,
@@ -177,6 +178,40 @@ describe("diagnostic report evidence", () => {
     expect(latest?.data).toEqual({ run: 2 });
   });
 
+  it("selects only bounded shared protocol profile diagnostics", () => {
+    const rawSecrets = {
+      recordId: "record-secret",
+      recordETag: "etag-secret",
+      fullHash: "f".repeat(64),
+    };
+    const latest = findLatestSharedProtocolProfileSummary([
+      {
+        ts: 1,
+        cat: "state",
+        lvl: "error",
+        msg: "shared-sync-protocol-profile-inconsistent",
+        data: {
+          status: "inconsistent",
+          reason: "generation-mismatch",
+          v2Generation: "aaaaaaaaaaaa",
+          v3Generation: "bbbbbbbbbbbb",
+          predecessor: "match",
+          ...rawSecrets,
+        },
+      },
+    ]);
+
+    expect(latest).toEqual({
+      status: "inconsistent",
+      reason: "generation-mismatch",
+      v2Generation: "aaaaaaaaaaaa",
+      v3Generation: "bbbbbbbbbbbb",
+      predecessor: "match",
+    });
+    expect(JSON.stringify(latest)).not.toContain("secret");
+    expect(JSON.stringify(latest)).not.toContain("f".repeat(64));
+  });
+
   it("summarizes recovery records without exposing paths or remote identities", () => {
     const makeEntry = (
       action: MutationLedgerEntryV1["intent"]["action"],
@@ -255,7 +290,6 @@ describe("diagnostic report evidence", () => {
           version: "1.0.0",
           local: true,
           remote: false,
-          enabledLocally: true,
           desktopOnly: false,
           manifestIssue: false,
         },
@@ -265,14 +299,11 @@ describe("diagnostic report evidence", () => {
           version: null,
           local: false,
           remote: true,
-          enabledLocally: null,
           desktopOnly: false,
           manifestIssue: false,
         },
       ],
       remoteInventoryTrusted: true,
-      anchors: 1,
-      pending: 1,
     });
 
     expect(summary).toMatchObject({
@@ -286,7 +317,6 @@ describe("diagnostic report evidence", () => {
         remoteOnly: 1,
         manifestIssues: 0,
       },
-      enablement: { anchors: 1, pending: 1 },
       remoteInventoryTrusted: true,
     });
     expect(summary.policyFingerprint).toMatch(/^[0-9a-f]{12}$/);
@@ -308,6 +338,7 @@ describe("diagnostic report evidence", () => {
       "**社区插件精细化范围**",
       "**社区插件过渡或受阻项**",
       "## 自动处理与恢复摘要",
+      "## V2／V3 协议组合核对",
       "## 最近一轮阶段耗时与请求摘要",
     ]) {
       expect(source).toContain(label);
@@ -332,6 +363,7 @@ describe("diagnostic report evidence", () => {
     expect(source).toContain("findLatestNetworkSummary(diagAll)");
     expect(source).toContain("findLatestTransferSummary(diagAll)");
     expect(source).toContain("findLatestAutomaticHandlingSummary(diagAll)");
+    expect(source).toContain("findLatestSharedProtocolProfileSummary(diagAll)");
     expect(source).toContain("**文件传输与本地处理**");
     expect(source).toContain("summarizeMutationRecovery(");
     expect(source).toContain("automaticRecoverySchedulerState");

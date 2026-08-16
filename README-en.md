@@ -126,7 +126,7 @@ Enable other options only when you need them:
 | --- | --- |
 | Sync exclusions | Apply only to the current device; excluded folders are neither uploaded nor downloaded, and existing files are not deleted merely because of the exclusion |
 | Sync scope | Editor settings, appearance, themes and snippets, hotkeys, bookmarks, and core plugins can be controlled separately |
-| Community plugins | Plugin files and enabled state can be controlled per plugin; when the overall scope is on, complete plugins installed later on this device join automatically, while explicitly disabled items stay disabled |
+| Community plugins | Plugin files can be selected individually; each device keeps its own enabled state in Obsidian. Each plugin's `data.json` is controlled separately by “Community plugin data” |
 | Community plugin data | Each plugin's `data.json` can be selected separately; this feature is still experimental, so back up plugin settings on every device first |
 | EasySync self-sync | Off by default; enable it only if EasySync updates should propagate to other devices |
 | Auto sync | Scheduled sync and sync-after-change can be configured separately; **Sync now** remains available when both are off |

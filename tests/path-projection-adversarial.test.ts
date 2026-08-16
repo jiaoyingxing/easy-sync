@@ -223,6 +223,7 @@ function makeOneDrive(
     deleteItem: vi.fn(),
   };
   let sharedProtocol: { id: string; eTag: string; content: string } | null = null;
+  let sharedProtocolV3: { id: string; eTag: string; content: string } | null = null;
   return {
     client: {
       downloadBaseline: vi.fn().mockResolvedValue(null),
@@ -235,6 +236,10 @@ function makeOneDrive(
       getDelta,
       fullScan: vi.fn().mockResolvedValue([]),
       getFileMetadata: vi.fn().mockResolvedValue(null),
+      readSharedSyncProtocolObjects: vi.fn(async () => ({
+        v2: sharedProtocol,
+        v3: sharedProtocolV3,
+      })),
       readSharedSyncProtocolV2: vi.fn(async () => sharedProtocol),
       createSharedSyncProtocolV2: vi.fn(async (
         _vaultName: string,
@@ -252,6 +257,24 @@ function makeOneDrive(
           throw new Error("protocol missing");
         }
         return sharedProtocol;
+      }),
+      readSharedSyncProtocolV3: vi.fn(async () => sharedProtocolV3),
+      createSharedSyncProtocolV3: vi.fn(async (
+        _vaultName: string,
+        content: string,
+      ) => {
+        sharedProtocolV3 = {
+          id: "protocol-v3-id",
+          eTag: "protocol-v3-etag",
+          content,
+        };
+        return { id: sharedProtocolV3.id, eTag: sharedProtocolV3.eTag };
+      }),
+      readSharedSyncProtocolV3ById: vi.fn(async (id: string) => {
+        if (!sharedProtocolV3 || sharedProtocolV3.id !== id) {
+          throw new Error("protocol V3 missing");
+        }
+        return sharedProtocolV3;
       }),
       ...mutations,
     } as unknown as OneDriveClient,

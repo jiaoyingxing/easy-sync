@@ -8,6 +8,8 @@ import {
   OneDriveError,
   OneDriveErrorType,
   RemoteVaultScopeIdentityError,
+  SharedSyncProtocolObservationError,
+  SyntheticRequestTimeoutError,
   type DriveItem,
 } from "../src/onedrive/types";
 import { sha256Hex } from "../src/crypto";
@@ -57,6 +59,8 @@ import {
   type MutationLedgerEntryV1,
   type MutationReceiptV1,
   type PlanReviewAuthorization,
+  type RemoteFileEntry,
+  type RemoteFolderEntry,
   type SyncPlan,
   type SyncScope,
 } from "../src/sync/types";
@@ -435,6 +439,21 @@ function findRemoteItemByPath(
   return items.find((item) => pathFor(item) === targetPath) ?? null;
 }
 
+function applyRemoteUpload(
+  items: DriveItem[],
+  targetPath: string,
+  size: number,
+  hash: string,
+  eTag: string,
+): DriveItem {
+  const remote = findRemoteItemByPath(items, targetPath)!;
+  remote.size = size;
+  remote.file = { hashes: { sha256Hash: hash } };
+  remote.eTag = eTag;
+  remote.cTag = `ctag-${eTag}`;
+  return { ...remote, parentReference: { ...remote.parentReference } };
+}
+
 function parentPath(path: string): string {
   const separator = path.lastIndexOf("/");
   return separator < 0 ? "" : path.slice(0, separator);
@@ -722,6 +741,20 @@ function makeHarness(input?: {
     mkdir: vi.fn(async (path: string) => {
       localFolderPaths.add(path);
     }),
+    rmdir: vi.fn(async (path: string, recursive = false) => {
+      if (recursive) {
+        for (const file of [...files.keys()]) {
+          if (file.startsWith(`${path}/`)) files.delete(file);
+        }
+        for (const folder of [...localFolderPaths]) {
+          if (folder === path || folder.startsWith(`${path}/`)) {
+            localFolderPaths.delete(folder);
+          }
+        }
+        return;
+      }
+      localFolderPaths.delete(path);
+    }),
     stat: vi.fn(async (path: string) => localFolderPaths.has(path)
       ? { type: "folder", ctime: 1, mtime: 1, size: 0 }
       : files.has(path)
@@ -826,6 +859,11 @@ function makeHarness(input?: {
               entry.path = `${targetPath}${entry.path.slice(sourcePath.length)}`;
             }
           }
+          for (const [path, content] of [...files]) {
+            if (!path.startsWith(`${sourcePath}/`)) continue;
+            files.delete(path);
+            files.set(`${targetPath}${path.slice(sourcePath.length)}`, content);
+          }
           if (loseNextLocalFolderMoveResponse) {
             loseNextLocalFolderMoveResponse = false;
             throw new Error("local folder move response lost");
@@ -903,7 +941,26 @@ function makeHarness(input?: {
       ) {
         throw new Error("delete precondition failed");
       }
-      remoteItemState.splice(index, 1);
+      const deletedIds = new Set([remoteItemState[index].id]);
+      let expanded = true;
+      while (expanded) {
+        expanded = false;
+        for (const item of remoteItemState) {
+          if (
+            item.parentReference?.id
+            && deletedIds.has(item.parentReference.id)
+            && !deletedIds.has(item.id)
+          ) {
+            deletedIds.add(item.id);
+            expanded = true;
+          }
+        }
+      }
+      for (let itemIndex = remoteItemState.length - 1; itemIndex >= 0; itemIndex--) {
+        if (deletedIds.has(remoteItemState[itemIndex].id)) {
+          remoteItemState.splice(itemIndex, 1);
+        }
+      }
       if (loseNextFolderDeleteResponse) {
         loseNextFolderDeleteResponse = false;
         throw new Error("folder delete response lost");
@@ -959,6 +1016,8 @@ function makeHarness(input?: {
     content: string;
   } | null = null;
   let sharedProtocolV3CreateCount = 0;
+  const readSharedSyncProtocolV2 = vi.fn(async () => sharedProtocolObject);
+  const readSharedSyncProtocolV3 = vi.fn(async () => sharedProtocolV3Object);
   const cloudBootstrap = {
     read: vi.fn(async () => cloudBootstrapObject),
     create: vi.fn(async (_vaultName: string, content: string) => {
@@ -1007,7 +1066,7 @@ function makeHarness(input?: {
     resetDownloadStrategy: vi.fn(),
     getDelta,
     getDeltaByFolderId: getDelta,
-    readSharedSyncProtocolV2: vi.fn(async () => sharedProtocolObject),
+    readSharedSyncProtocolV2,
     createSharedSyncProtocolV2: vi.fn(async (
       _vaultName: string,
       content: string,
@@ -1032,7 +1091,14 @@ function makeHarness(input?: {
       }
       return sharedProtocolObject;
     }),
-    readSharedSyncProtocolV3: vi.fn(async () => sharedProtocolV3Object),
+    readSharedSyncProtocolV3,
+    readSharedSyncProtocolObjects: vi.fn(async (vaultName: string) => {
+      const [v2, v3] = await Promise.all([
+        readSharedSyncProtocolV2(vaultName),
+        readSharedSyncProtocolV3(vaultName),
+      ]);
+      return { v2, v3 };
+    }),
     createSharedSyncProtocolV3: vi.fn(async (
       _vaultName: string,
       content: string,
@@ -1148,7 +1214,11 @@ function makeHarness(input?: {
     ) => {
       const index = remoteItemState.findIndex((item) => item.id === driveItemId);
       if (index < 0) return;
-      if (eTag && remoteItemState[index].eTag !== eTag) {
+      if (
+        eTag
+        && remoteItemState[index].eTag !== eTag
+        && remoteItemState[index].cTag !== eTag
+      ) {
         throw new Error("delete precondition failed");
       }
       remoteItemState.splice(index, 1);
@@ -1279,6 +1349,9 @@ function makeHarness(input?: {
       sharedProtocolObject = null;
       sharedProtocolV3Object = null;
     },
+    clearSharedProtocolV3: () => {
+      sharedProtocolV3Object = null;
+    },
     seedSharedProtocol: (protocolScope: SyncScope = scope) => {
       sharedProtocolObject = {
         id: protocolBinding.recordId,
@@ -1293,6 +1366,13 @@ function makeHarness(input?: {
             protocolBinding.confirmedAllDevicesUpdatedAt,
           createdAt: protocolBinding.confirmedAllDevicesUpdatedAt,
         }),
+      };
+    },
+    seedSharedProtocolContent: (content: string) => {
+      sharedProtocolObject = {
+        id: "protocol-recovered-id",
+        eTag: "protocol-recovered-etag",
+        content,
       };
     },
     seedSharedProtocolV3: (content: string) => {
@@ -1316,6 +1396,54 @@ function expectNoFileMutations(
   expect(mutations.renameItem).not.toHaveBeenCalled();
 }
 
+async function prepareMovedFolderContinuationHarness() {
+  const initialContent = "0123456789";
+  const initialBytes = new TextEncoder().encode(initialContent);
+  const initialHash = await sha256Hex(initialBytes);
+  const harness = makeHarness({
+    base: [{
+      ...baseA,
+      hash: initialHash,
+      size: initialBytes.byteLength,
+    }],
+    local: [{
+      ...localA,
+      hash: initialHash,
+      size: initialBytes.byteLength,
+    }],
+    remoteItems: remoteItems(initialHash),
+    initialFiles: { "Notes/a.md": initialContent },
+  });
+  await harness.state.load();
+  expect((await harness.executor.run(
+    "manual",
+    {},
+    false,
+    undefined,
+    { activateV2State: true },
+  )).success).toBe(true);
+  await (harness.scanner.vault as unknown as {
+    rename: (file: TFolder, target: string) => Promise<void>;
+  }).rename(new TFolder("Notes"), "Archive");
+  harness.files.set("Archive/a.md", initialContent);
+  harness.files.delete("Notes/a.md");
+  expect(await harness.state.recordLocalFolderMoveHint("Notes", "Archive"))
+    .toBe(true);
+  const moveRemoteFolder = vi.mocked(
+    harness.mutations.moveItemById,
+  ).getMockImplementation()!;
+  return {
+    harness,
+    afterMove(mutate: () => void | Promise<void>): void {
+      harness.mutations.moveItemById.mockImplementationOnce(async (...args) => {
+        const moved = await moveRemoteFolder(...args);
+        await mutate();
+        return moved;
+      });
+    },
+  };
+}
+
 async function seedExactScopeFreeProtocol(
   harness: ReturnType<typeof makeHarness>,
 ) {
@@ -1323,16 +1451,19 @@ async function seedExactScopeFreeProtocol(
     "testVault",
   );
   if (!predecessor) throw new Error("shared V2 predecessor is missing");
+  const transport = {
+    read: () => harness.client.readSharedSyncProtocolV3("testVault"),
+    createOnly: (content: string) =>
+      harness.client.createSharedSyncProtocolV3("testVault", content),
+    readById: (id: string) => harness.client.readSharedSyncProtocolV3ById(id),
+  };
   const seeded = await ensureSharedSyncProtocolV3(
-    {
-      read: () => harness.client.readSharedSyncProtocolV3("testVault"),
-      createOnly: (content) =>
-        harness.client.createSharedSyncProtocolV3("testVault", content),
-      readById: (id) => harness.client.readSharedSyncProtocolV3ById(id),
-    },
+    transport,
     {
       predecessor,
       allowCreate: true,
+      observedCurrent: await transport.read(),
+      observeAfterCreateFailure: () => transport.read(),
     },
   );
   if (seeded.status !== "ready") {
@@ -1368,6 +1499,72 @@ async function activateV2WithFolderScopeDisabled(
   return () => {
     enabled = true;
   };
+}
+
+async function prepareReviewedFolderSubtreeHarness() {
+  const content = "reviewed cloud subtree";
+  const bytes = new TextEncoder().encode(content);
+  const hash = await sha256Hex(bytes);
+  const paths = ["Issues", "Issues/CAD"];
+  const initialFolderPaths = [
+    ".obsidian",
+    ".obsidian/plugins",
+    ".obsidian/plugins/easy-sync",
+    ...paths,
+  ];
+  const folders = remoteFolderTree(initialFolderPaths);
+  for (const folder of folders) {
+    folder.cTag = `ctag-${folder.id}`;
+  }
+  const filePath = "Issues/CAD/drawing.md";
+  const harness = makeHarness({
+    base: [{ path: filePath, size: bytes.byteLength, hash, eTag: "etag-drawing" }],
+    local: [{
+      path: filePath,
+      size: bytes.byteLength,
+      mtime: 1,
+      hash,
+      binary: false,
+    }],
+    localFolders: initialFolderPaths.map((path) => ({ path })),
+    remoteItems: [
+      ...folders,
+      {
+        id: "drawing",
+        name: "drawing.md",
+        file: { hashes: { sha256Hash: hash } },
+        size: bytes.byteLength,
+        parentReference: {
+          id: findRemoteItemByPath(folders, "Issues/CAD")!.id,
+        },
+        eTag: "etag-drawing",
+        cTag: "ctag-drawing",
+      },
+    ],
+    initialFiles: { [filePath]: content },
+    remoteFileContents: { [filePath]: content },
+  });
+  await harness.state.load();
+  expect((await harness.executor.run(
+    "manual",
+    {},
+    false,
+    undefined,
+    { activateV2State: true },
+  )).success).toBe(true);
+  harness.localEntryState.splice(0);
+  harness.files.delete(filePath);
+  harness.localFolderPaths.delete("Issues/CAD");
+  harness.localFolderPaths.delete("Issues");
+  harness.localFolderPaths.add("Archive");
+  expect(await harness.executor.run("manual")).toMatchObject({
+    deferred: 2,
+    errors: 0,
+  });
+  const reviewed = await harness.executor
+    .getFolderSubtreeReviewSnapshot("Issues");
+  expect(reviewed).not.toBeNull();
+  return { harness, reviewed: reviewed!, filePath, content, hash };
 }
 
 async function prepareAmbiguousEmptyFolderHarness(
@@ -2386,6 +2583,13 @@ describe("V1 to V2 controlled production activation", () => {
     expect(executed.success).toBe(true);
     expect(harness.state.isV2StateActive).toBe(true);
     expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).toHaveBeenCalledOnce();
+    expect(JSON.parse(harness.getSharedProtocolV3()!.content))
+      .toMatchObject({
+        migrationGeneration: JSON.parse(
+          (await harness.client.readSharedSyncProtocolV2("testVault"))!.content,
+        ).migrationGeneration,
+      });
     expectNoFileMutations(harness.mutations);
   });
 
@@ -2483,6 +2687,183 @@ describe("V1 to V2 controlled production activation", () => {
     expectNoFileMutations(harness.mutations);
   });
 
+  it("retains a reviewed cross-scope join when revalidation is temporarily unavailable", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    harness.seedSharedProtocol({
+      ...scope,
+      filesRootId: "previous-files-root",
+    });
+    await seedExactScopeFreeProtocol(harness);
+    const profile = {
+      v2: await harness.client.readSharedSyncProtocolV2("testVault"),
+      v3: harness.getSharedProtocolV3(),
+    };
+    await harness.state.load();
+    await harness.executor.run("manual");
+    const authorization = structuredClone(
+      harness.state.planReviewAuthorization!,
+    );
+    const readProfile = vi.mocked(
+      harness.client.readSharedSyncProtocolObjects,
+    );
+    readProfile.mockReset()
+      .mockResolvedValueOnce(profile)
+      .mockRejectedValueOnce(new SyntheticRequestTimeoutError(15_000))
+      .mockResolvedValue(profile);
+    vi.mocked(harness.client.createSharedSyncProtocolV2).mockClear();
+    vi.mocked(harness.client.createSharedSyncProtocolV3).mockClear();
+
+    const unavailable = await harness.executor.run(
+      "manual",
+      {},
+      true,
+      authorization,
+    );
+
+    expect(unavailable).toMatchObject({
+      success: false,
+      errors: 1,
+      message: "result.sharedControlReadUnavailable",
+      runFacts: {
+        ordinaryPlanning: "entered",
+      },
+    });
+    expect(unavailable.disposition).toBeUndefined();
+    expect(harness.state.isV2StateActive).toBe(false);
+    expect(harness.state.planReviewAuthorization).toEqual(authorization);
+    expect(readProfile).toHaveBeenCalledTimes(2);
+    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+
+    const joined = await harness.executor.run(
+      "manual",
+      {},
+      true,
+      authorization,
+    );
+    expect(joined).toMatchObject({ success: true, errors: 0 });
+    expect(harness.state.isV2StateActive).toBe(true);
+    expect(readProfile).toHaveBeenCalledTimes(4);
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("does not reclassify a fresh V3 join from a current failed sync history", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    harness.seedSharedProtocol({
+      ...scope,
+      filesRootId: "previous-files-root",
+    });
+    await seedExactScopeFreeProtocol(harness);
+    await harness.state.load();
+    const firstPreviewCallback = vi.fn().mockResolvedValue(false);
+    await harness.executor.run(
+      "manual",
+      { onConfirmThreshold: firstPreviewCallback },
+    );
+    expect(firstPreviewCallback.mock.calls[0]?.[0]).toMatchObject({
+      reviewKind: "v2-cloud-join",
+    });
+    await harness.state.addSyncHistory({
+      id: "current-join-profile-timeout",
+      mode: "manual",
+      status: "failed",
+      startedAt: 1,
+      endedAt: 2,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      skipped: 0,
+      errors: 1,
+      message: "result.v2ProtocolBlocked",
+      files: [],
+    });
+    await harness.state.close();
+    const restartedState = new StateManager(harness.plugin);
+    await restartedState.load();
+    const restartedExecutor = new SyncExecutor(
+      harness.client,
+      harness.scanner,
+      restartedState,
+      "testVault",
+      undefined,
+      undefined,
+      harness.diag as never,
+      harness.fileManager as never,
+    );
+    const previewCallback = vi.fn().mockResolvedValue(false);
+    expect(restartedState.syncHistory[0]?.id)
+      .toBe("current-join-profile-timeout");
+
+    const preview = await restartedExecutor.run(
+      "manual",
+      { onConfirmThreshold: previewCallback },
+    );
+
+    expect(preview).toMatchObject({
+      success: false,
+      message: "result.pausedForReview",
+      errors: 0,
+    });
+    expect(previewCallback.mock.calls[0]?.[0]).toMatchObject({
+      reviewKind: "v2-cloud-join",
+      items: [],
+    });
+    expect(restartedState.planReviewAuthorization?.reviewKind)
+      .toBe("v2-cloud-join");
+    expect(restartedState.isV2StateActive).toBe(false);
+    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+
+    const executed = await restartedExecutor.run(
+      "manual",
+      {},
+      true,
+      restartedState.planReviewAuthorization!,
+    );
+    expect(executed).toMatchObject({
+      success: true,
+      errors: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+    });
+    expect(restartedState.isV2StateActive).toBe(true);
+    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+    const stable = await restartedExecutor.run("manual");
+    expect(stable).toMatchObject({
+      success: true,
+      errors: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+    });
+    expectNoFileMutations(harness.mutations);
+  });
+
   it("classifies an empty device and empty cloud as first V2 sync", async () => {
     const harness = makeHarness({
       base: [],
@@ -2522,6 +2903,585 @@ describe("V1 to V2 controlled production activation", () => {
     expect(executed.success).toBe(true);
     expect(harness.state.isV2StateActive).toBe(true);
     expect(harness.client.createSharedSyncProtocolV2).toHaveBeenCalledOnce();
+    expect(harness.client.createSharedSyncProtocolV3).toHaveBeenCalledOnce();
+    expect(JSON.parse(harness.getSharedProtocolV3()!.content))
+      .toMatchObject({
+        migrationGeneration: JSON.parse(
+          (await harness.client.readSharedSyncProtocolV2("testVault"))!.content,
+        ).migrationGeneration,
+      });
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("resumes a checkpointed reviewed first-sync authorization after a cold restart and post-write protocol observation timeout", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    await harness.state.load();
+    expect((await harness.executor.run("manual")).message)
+      .toBe("result.pausedForReview");
+    const authorization = structuredClone(
+      harness.state.planReviewAuthorization!,
+    );
+    expect(authorization.reviewKind).toBe("v2-first-sync");
+
+    const readProfile = vi.mocked(
+      harness.client.readSharedSyncProtocolObjects,
+    );
+    const defaultReadProfile = readProfile.getMockImplementation()!;
+    let failPostV3Observation = true;
+    readProfile.mockImplementation(async (...args) => {
+      const observed = await defaultReadProfile(...args);
+      if (
+        failPostV3Observation
+        && vi.mocked(harness.client.createSharedSyncProtocolV3).mock.calls.length
+          > 0
+      ) {
+        failPostV3Observation = false;
+        throw new SyntheticRequestTimeoutError(15_000);
+      }
+      return observed;
+    });
+
+    const unavailable = await harness.executor.run(
+      "manual",
+      {},
+      true,
+      authorization,
+    );
+
+    expect(unavailable).toMatchObject({
+      success: false,
+      errors: 1,
+      message: "result.sharedControlReadUnavailable",
+    });
+    expect(unavailable.disposition).toBeUndefined();
+    expect(harness.state.isV2StateActive).toBe(false);
+    const checkpointedAuthorization = structuredClone(
+      harness.state.planReviewAuthorization!,
+    );
+    expect(checkpointedAuthorization).toEqual({
+      ...authorization,
+      revision: authorization.revision + 1,
+    });
+    const checkpointedHold = structuredClone(
+      harness.state.activeV2MigrationHold!,
+    );
+    expect(checkpointedHold).toMatchObject({
+      phase: "pending",
+      reviewKind: "v2-first-sync",
+      revision: authorization.revision + 1,
+    });
+    const createdProtocol = await harness.client.readSharedSyncProtocolV2(
+      "testVault",
+    );
+    expect(createdProtocol).not.toBeNull();
+    const createdProtocolContent = JSON.parse(createdProtocol!.content);
+    expect(checkpointedHold.protocolBinding).toEqual({
+      schemaVersion: 1,
+      protocolVersion: 2,
+      migrationGeneration: createdProtocolContent.migrationGeneration,
+      confirmedAllDevicesUpdatedAt:
+        createdProtocolContent.confirmedAllDevicesUpdatedAt,
+      recordId: createdProtocol!.id,
+      recordETag: createdProtocol!.eTag,
+    });
+    expect(harness.client.createSharedSyncProtocolV2).toHaveBeenCalledOnce();
+    expect(harness.client.createSharedSyncProtocolV3).toHaveBeenCalledOnce();
+    expectNoFileMutations(harness.mutations);
+
+    readProfile.mockImplementation(defaultReadProfile);
+    await harness.state.close();
+    const restartedState = new StateManager(harness.plugin);
+    await restartedState.load();
+    const restartedExecutor = createRestartedExecutor(
+      harness,
+      restartedState,
+    );
+    const refreshedAuthorization = structuredClone(
+      restartedState.planReviewAuthorization!,
+    );
+    expect(refreshedAuthorization).toEqual(checkpointedAuthorization);
+
+    const resumed = await restartedExecutor.run(
+      "manual",
+      {},
+      true,
+      refreshedAuthorization,
+    );
+
+    expect(resumed).toMatchObject({ success: true, errors: 0 });
+    expect(restartedState.isV2StateActive).toBe(true);
+    expect(harness.client.createSharedSyncProtocolV2).toHaveBeenCalledOnce();
+    expect(harness.client.createSharedSyncProtocolV3).toHaveBeenCalledOnce();
+    expectNoFileMutations(harness.mutations);
+    await restartedState.close();
+  });
+
+  it("rejects a checkpointed first-sync authorization when same-scope V2 identity is replaced", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    await harness.state.load();
+    expect((await harness.executor.run("manual")).message)
+      .toBe("result.pausedForReview");
+    const initialAuthorization = structuredClone(
+      harness.state.planReviewAuthorization!,
+    );
+    expect(initialAuthorization.reviewKind).toBe("v2-first-sync");
+
+    const readProfile = vi.mocked(
+      harness.client.readSharedSyncProtocolObjects,
+    );
+    const defaultReadProfile = readProfile.getMockImplementation()!;
+    let failPostV3Observation = true;
+    readProfile.mockImplementation(async (...args) => {
+      const observed = await defaultReadProfile(...args);
+      if (
+        failPostV3Observation
+        && vi.mocked(harness.client.createSharedSyncProtocolV3).mock.calls.length
+          > 0
+      ) {
+        failPostV3Observation = false;
+        throw new SyntheticRequestTimeoutError(15_000);
+      }
+      return observed;
+    });
+
+    expect(await harness.executor.run(
+      "manual",
+      {},
+      true,
+      initialAuthorization,
+    )).toMatchObject({
+      success: false,
+      errors: 1,
+      message: "result.sharedControlReadUnavailable",
+    });
+    const staleAuthorization = structuredClone(
+      harness.state.planReviewAuthorization!,
+    );
+    expect(staleAuthorization).toEqual({
+      ...initialAuthorization,
+      revision: initialAuthorization.revision + 1,
+    });
+    const createdProtocol = await harness.client.readSharedSyncProtocolV2(
+      "testVault",
+    );
+    expect(createdProtocol).not.toBeNull();
+    harness.seedSharedProtocolContent(createdProtocol!.content);
+    const replacementProtocol =
+      await harness.client.readSharedSyncProtocolV2("testVault");
+    expect(replacementProtocol).toMatchObject({
+      id: "protocol-recovered-id",
+      eTag: "protocol-recovered-etag",
+      content: createdProtocol!.content,
+    });
+    expect(replacementProtocol!.id).not.toBe(createdProtocol!.id);
+    expect(replacementProtocol!.eTag).not.toBe(createdProtocol!.eTag);
+
+    readProfile.mockImplementation(defaultReadProfile);
+    await harness.state.close();
+    const restartedState = new StateManager(harness.plugin);
+    await restartedState.load();
+    const restartedExecutor = createRestartedExecutor(
+      harness,
+      restartedState,
+    );
+    expect(restartedState.planReviewAuthorization).toEqual(staleAuthorization);
+
+    const rejected = await restartedExecutor.run(
+      "manual",
+      {},
+      true,
+      staleAuthorization,
+    );
+
+    expect(rejected).toMatchObject({
+      success: false,
+      errors: 0,
+      message: "result.pausedForReview",
+    });
+    expect(restartedState.isV2StateActive).toBe(false);
+    expect(harness.files.has(paths.stateV2AuthorityWitnessFile)).toBe(false);
+    expect(restartedState.planReviewAuthorization).toMatchObject({
+      reviewKind: "v2-cloud-join",
+      revision: staleAuthorization.revision + 1,
+    });
+    expect(restartedState.planReviewAuthorization).not.toEqual(
+      staleAuthorization,
+    );
+    expect(harness.client.createSharedSyncProtocolV2).toHaveBeenCalledOnce();
+    expect(harness.client.createSharedSyncProtocolV3).toHaveBeenCalledOnce();
+    expectNoFileMutations(harness.mutations);
+    await restartedState.close();
+  });
+
+  it.each([
+    [
+      "synthetic timeout",
+      () => new SyntheticRequestTimeoutError(15_000),
+    ],
+    [
+      "native status-0 transport failure",
+      () => new OneDriveError(
+        OneDriveErrorType.NetworkError,
+        "requestUrl failed without an HTTP response",
+      ),
+    ],
+  ] as const)(
+    "does not checkpoint a reviewed first-sync create after cancellation and a late %s readback",
+    async (_label, lateError) => {
+      const harness = makeHarness({
+        base: [],
+        local: [],
+        localFolders: [],
+        remoteItems: [],
+        pluginData: {
+          "easy-sync-generation": 0,
+          "easy-sync-last-sync-time": 0,
+        },
+      });
+      await harness.state.load();
+      expect((await harness.executor.run("manual")).message)
+        .toBe("result.pausedForReview");
+      const authorization = structuredClone(
+        harness.state.planReviewAuthorization!,
+      );
+      const holdBefore = structuredClone(harness.state.activeV2MigrationHold!);
+      expect(holdBefore).toMatchObject({
+        phase: "pending",
+        reviewKind: "v2-first-sync",
+      });
+      expect(holdBefore.protocolBinding).toBeUndefined();
+
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      let rejectLate!: (reason?: unknown) => void;
+      const pending = new Promise<never>((_resolve, reject) => {
+        rejectLate = reject;
+      });
+      vi.mocked(harness.client.readSharedSyncProtocolV2ById)
+        .mockImplementationOnce(() => {
+          markStarted();
+          return pending;
+        });
+
+      const pendingRun = harness.executor.run(
+        "manual",
+        {},
+        true,
+        authorization,
+      );
+      await started;
+      harness.executor.cancel();
+      rejectLate(lateError());
+      const cancelled = await pendingRun;
+
+      expect(cancelled).toMatchObject({
+        success: false,
+        errors: 0,
+        message: "result.cancelled",
+        runFacts: {
+          termination: "cancelled",
+        },
+      });
+      expect(cancelled.disposition).toBeUndefined();
+      expect(harness.state.isV2StateActive).toBe(false);
+      expect(harness.state.planReviewAuthorization).toEqual(authorization);
+      expect(harness.state.activeV2MigrationHold).toEqual(holdBefore);
+      expect(harness.client.createSharedSyncProtocolV2).toHaveBeenCalledOnce();
+      expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+      expectNoFileMutations(harness.mutations);
+      await harness.state.close();
+    },
+  );
+
+  it("does not commit reviewed first-sync authority when cancellation lands during final post-V3 profile completion", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    await harness.state.load();
+    expect((await harness.executor.run("manual")).message)
+      .toBe("result.pausedForReview");
+    const authorization = structuredClone(
+      harness.state.planReviewAuthorization!,
+    );
+    let markFinalV3Ready!: () => void;
+    const finalV3Ready = new Promise<void>((resolve) => {
+      markFinalV3Ready = resolve;
+    });
+    let releaseFinalV3!: () => void;
+    const finalV3Gate = new Promise<void>((resolve) => {
+      releaseFinalV3 = resolve;
+    });
+    const executorInternals = harness.executor as unknown as {
+      ensureSharedSyncProtocolV3FromObservation: (
+        ...args: unknown[]
+      ) => Promise<{ status: string }>;
+    };
+    const finishV3 =
+      executorInternals.ensureSharedSyncProtocolV3FromObservation.bind(
+        harness.executor,
+      );
+    vi.spyOn(
+      executorInternals,
+      "ensureSharedSyncProtocolV3FromObservation",
+    ).mockImplementation(async (...args) => {
+      const outcome = await finishV3(...args);
+      if (
+        outcome.status === "ready"
+        && vi.mocked(harness.client.createSharedSyncProtocolV3).mock.calls.length
+          > 0
+      ) {
+        markFinalV3Ready();
+        await finalV3Gate;
+      }
+      return outcome;
+    });
+    const commitAuthority = vi.spyOn(
+      harness.state,
+      "commitConfirmedV2MigrationHold",
+    );
+
+    const pendingRun = harness.executor.run(
+      "manual",
+      {},
+      true,
+      authorization,
+    );
+    await finalV3Ready;
+    harness.executor.cancel();
+    releaseFinalV3();
+    const cancelled = await pendingRun;
+
+    expect(cancelled).toMatchObject({
+      success: false,
+      errors: 0,
+      message: "result.cancelled",
+      runFacts: {
+        termination: "cancelled",
+      },
+    });
+    expect(commitAuthority).not.toHaveBeenCalled();
+    expect(harness.state.activeV2MigrationHold?.phase).toBe("pending");
+    expect(harness.state.isV2StateActive).toBe(false);
+    expect(harness.files.has(paths.stateV2ManifestFile)).toBe(false);
+    expect(harness.files.has(paths.stateV2AuthorityWitnessFile)).toBe(false);
+    expect(harness.client.createSharedSyncProtocolV2).toHaveBeenCalledOnce();
+    expect(harness.client.createSharedSyncProtocolV3).toHaveBeenCalledOnce();
+    expectNoFileMutations(harness.mutations);
+    await harness.state.close();
+  });
+
+  it("does not start authority commit when cancellation lands during reviewed first-sync state revalidation", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    await harness.state.load();
+    expect((await harness.executor.run("manual")).message)
+      .toBe("result.pausedForReview");
+    const authorization = structuredClone(
+      harness.state.planReviewAuthorization!,
+    );
+    let markRevalidationStarted!: () => void;
+    const revalidationStarted = new Promise<void>((resolve) => {
+      markRevalidationStarted = resolve;
+    });
+    let releaseRevalidation!: () => void;
+    const revalidationGate = new Promise<void>((resolve) => {
+      releaseRevalidation = resolve;
+    });
+    const currentAuthorization = harness.state.isCurrentV2MigrationAuthorization
+      .bind(harness.state);
+    let heldFinalRevalidation = false;
+    vi.spyOn(harness.state, "isCurrentV2MigrationAuthorization")
+      .mockImplementation(async (input) => {
+        if (
+          !heldFinalRevalidation
+          && vi.mocked(harness.client.createSharedSyncProtocolV3).mock.calls
+            .length > 0
+        ) {
+          heldFinalRevalidation = true;
+          markRevalidationStarted();
+          await revalidationGate;
+        }
+        return currentAuthorization(input);
+      });
+    const commitAuthority = vi.spyOn(
+      harness.state,
+      "commitConfirmedV2MigrationHold",
+    );
+
+    const pendingRun = harness.executor.run(
+      "manual",
+      {},
+      true,
+      authorization,
+    );
+    await revalidationStarted;
+    harness.executor.cancel();
+    releaseRevalidation();
+    const cancelled = await pendingRun;
+
+    expect(cancelled).toMatchObject({
+      success: false,
+      errors: 0,
+      message: "result.cancelled",
+      runFacts: {
+        termination: "cancelled",
+      },
+    });
+    expect(commitAuthority).not.toHaveBeenCalled();
+    expect(["pending", "confirmed"]).toContain(
+      harness.state.activeV2MigrationHold?.phase,
+    );
+    expect(harness.state.isV2StateActive).toBe(false);
+    expect(harness.files.has(paths.stateV2ManifestFile)).toBe(false);
+    expect(harness.files.has(paths.stateV2AuthorityWitnessFile)).toBe(false);
+    expect(harness.client.createSharedSyncProtocolV2).toHaveBeenCalledOnce();
+    expect(harness.client.createSharedSyncProtocolV3).toHaveBeenCalledOnce();
+    expectNoFileMutations(harness.mutations);
+    await harness.state.close();
+  });
+
+  it.each([
+    ["generation", (protocol: Record<string, unknown>) => ({
+      ...protocol,
+      migrationGeneration: "f".repeat(64),
+    })],
+    ["predecessor", (protocol: Record<string, unknown>) => ({
+      ...protocol,
+      predecessor: {
+        protocolVersion: 2,
+        contentSha256: "f".repeat(64),
+      },
+    })],
+  ] as const)("fails before review for an initial %s mismatch", async (
+    _label,
+    changeProtocol,
+  ) => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    harness.seedSharedProtocol();
+    await seedExactScopeFreeProtocol(harness);
+    const changedProtocol = changeProtocol(
+      JSON.parse(harness.getSharedProtocolV3()!.content),
+    );
+    harness.seedSharedProtocolV3(JSON.stringify(changedProtocol));
+    await harness.state.load();
+    const previewCallback = vi.fn().mockResolvedValue(false);
+
+    const result = await harness.executor.run(
+      "manual",
+      { onConfirmThreshold: previewCallback },
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      errors: 1,
+      message: "result.v2ProtocolBlocked",
+    });
+    expect(previewCallback).not.toHaveBeenCalled();
+    expect(harness.state.planReviewAuthorization).toBeNull();
+    expect(harness.state.isV2StateActive).toBe(false);
+    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expect(harness.diag.error).toHaveBeenCalledWith(
+      "state",
+      "shared-sync-protocol-profile-inconsistent",
+      expect.objectContaining({
+        status: "inconsistent",
+        reason: `${_label}-mismatch`,
+        v2Generation: expect.stringMatching(/^[0-9a-f]{12}$/),
+        v3Generation: expect.stringMatching(/^[0-9a-f]{12}$/),
+        predecessor: _label === "generation" ? "match" : "mismatch",
+      }),
+    );
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("does not create a protocol when an empty reviewed profile changes", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    await harness.state.load();
+    expect((await harness.executor.run("manual")).message)
+      .toBe("result.pausedForReview");
+    const authorization = harness.state.planReviewAuthorization;
+    expect(authorization?.reviewKind).toBe("v2-first-sync");
+    harness.seedSharedProtocolV3(JSON.stringify({
+      schemaVersion: 1,
+      kind: "easy-sync-generation-protocol",
+      protocolVersion: 3,
+      migrationGeneration: "a".repeat(64),
+      predecessor: {
+        protocolVersion: 2,
+        contentSha256: "b".repeat(64),
+      },
+      createdAt: 1,
+    }));
+
+    const result = await harness.executor.run(
+      "manual",
+      {},
+      true,
+      authorization!,
+    );
+
+    expect(result).toMatchObject({
+      success: false,
+      errors: 1,
+      message: "result.v2ProtocolBlocked",
+    });
+    expect(harness.state.isV2StateActive).toBe(false);
+    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
     expectNoFileMutations(harness.mutations);
   });
 
@@ -2916,6 +3876,10 @@ describe("V1 to V2 controlled production activation", () => {
       },
     });
     let restartedState: StateManager | null = null;
+    const retireFirstSyncEvidence = vi.spyOn(
+      harness.state,
+      "retireFirstSyncVerificationEvidence",
+    );
     try {
       const equalBootstrapAnchors = equalPaths.map((path) => {
         const local = fixtureInput.local!.find((entry) =>
@@ -3081,6 +4045,7 @@ describe("V1 to V2 controlled production activation", () => {
         conflicts: 1,
       });
       expect(harness.state.isV2StateActive).toBe(true);
+      expect(retireFirstSyncEvidence).toHaveBeenCalledOnce();
       expect(harness.state.legacyAutoSyncAllowed).toBe(false);
       expect(harness.state.activeV2StorageAuthorityEvidence).toMatchObject({
         kind: "indexeddb",
@@ -3205,6 +4170,9 @@ describe("V1 to V2 controlled production activation", () => {
         for (const store of stores) await store.close();
         await stores[0]?.delete();
       }
+      await new IndexedDbRemoteScopeRecoveryEvidenceStore(
+        indexedDbVaultInstanceId,
+      ).delete();
       await new IndexedDbPublic113StateStore(candidateDatabaseName).delete();
     }
   }, 30_000);
@@ -3306,7 +4274,7 @@ describe("V1 to V2 controlled production activation", () => {
         .map((call) => call[1]);
       for (const path of equalPaths) {
         expect(allGetPaths.filter((candidate) => candidate === path))
-          .toHaveLength(2);
+          .toHaveLength(1);
       }
       expect(allGetPaths.filter((path) => remoteOnlyPaths.includes(path)).sort())
         .toEqual([...remoteOnlyPaths].sort());
@@ -3367,6 +4335,310 @@ describe("V1 to V2 controlled production activation", () => {
         await stores[0]?.delete();
       }
       await new IndexedDbPublic113StateStore(candidateDatabaseName).delete();
+    }
+  }, 30_000);
+
+  it("reuses completed missing-bootstrap body verification after an interrupted first-sync preview", async () => {
+    const interruptedDatabaseName =
+      `easy-sync-activation:interrupted-body-verification:${crypto.randomUUID()}`;
+    const controlDatabaseName =
+      `easy-sync-activation:control-body-verification:${crypto.randomUUID()}`;
+    const fixture = await public113ReinstalledMixedVersionFixtureInput();
+    const interruptedHarness = makeHarness({
+      ...fixture.fixtureInput,
+      createPublic113IndexedDbCandidateStore: () =>
+        new IndexedDbPublic113StateStore(interruptedDatabaseName),
+    });
+    const controlHarness = makeHarness({
+      ...fixture.fixtureInput,
+      createPublic113IndexedDbCandidateStore: () =>
+        new IndexedDbPublic113StateStore(controlDatabaseName),
+    });
+    const equalPathSet = new Set(fixture.equalPaths);
+    const completedBeforeInterruption: string[] = [];
+    const stopAfter = 17;
+    let restartedState: StateManager | null = null;
+    try {
+      interruptedHarness.mutations.downloadFile.mockImplementation(async (
+        _vaultName: string,
+        path: string,
+      ) => {
+        if (equalPathSet.has(path)) {
+          if (completedBeforeInterruption.length >= stopAfter) {
+            throw new Error("injected first-sync verification interruption");
+          }
+          completedBeforeInterruption.push(path);
+        }
+        const content = fixture.fixtureInput.remoteFileContents?.[path];
+        return content === undefined
+          ? new ArrayBuffer(0)
+          : new TextEncoder().encode(content).buffer;
+      });
+      await interruptedHarness.state.load();
+
+      const interrupted = await interruptedHarness.executor.run("manual");
+
+      expect(interrupted).toMatchObject({
+        success: false,
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+      });
+      expect(completedBeforeInterruption).toHaveLength(stopAfter);
+      expect(interruptedHarness.state.isV2StateActive).toBe(false);
+      expect(interruptedHarness.mutations.uploadFile).not.toHaveBeenCalled();
+      expect(interruptedHarness.mutations.downloadFileToPath)
+        .not.toHaveBeenCalled();
+      expect(interruptedHarness.mutations.deleteItem).not.toHaveBeenCalled();
+      expect(interruptedHarness.mutations.renameItem).not.toHaveBeenCalled();
+      expect(interruptedHarness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+      expect(interruptedHarness.fileManager.trashFile).not.toHaveBeenCalled();
+      expect(interruptedHarness.files.has(paths.stateV2ManifestFile)).toBe(false);
+
+      await interruptedHarness.state.close();
+      interruptedHarness.mutations.downloadFile.mockClear();
+      interruptedHarness.mutations.downloadFile.mockImplementation(async (
+        _vaultName: string,
+        path: string,
+      ) => {
+        const content = fixture.fixtureInput.remoteFileContents?.[path];
+        return content === undefined
+          ? new ArrayBuffer(0)
+          : new TextEncoder().encode(content).buffer;
+      });
+      restartedState = new StateManager(interruptedHarness.plugin);
+      await restartedState.load();
+      const restartedExecutor = new SyncExecutor(
+        interruptedHarness.client,
+        interruptedHarness.scanner,
+        restartedState,
+        "testVault",
+        undefined,
+        undefined,
+        interruptedHarness.diag as never,
+        interruptedHarness.fileManager as never,
+      );
+
+      const resumedPreview = await restartedExecutor.run("manual");
+
+      expect(resumedPreview).toMatchObject({
+        success: false,
+        message: "result.pausedForReview",
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+      });
+      const resumedGetPaths = interruptedHarness.mutations.downloadFile.mock.calls
+        .map((call) => call[1]);
+      expect(resumedGetPaths).toHaveLength(
+        fixture.equalPaths.length - completedBeforeInterruption.length,
+      );
+      for (const path of completedBeforeInterruption) {
+        expect(resumedGetPaths).not.toContain(path);
+      }
+      expect([...completedBeforeInterruption, ...resumedGetPaths].sort())
+        .toEqual([...fixture.equalPaths].sort());
+      expect(interruptedHarness.mutations.uploadFile).not.toHaveBeenCalled();
+      expect(interruptedHarness.mutations.downloadFileToPath)
+        .not.toHaveBeenCalled();
+      expect(interruptedHarness.mutations.deleteItem).not.toHaveBeenCalled();
+      expect(interruptedHarness.mutations.renameItem).not.toHaveBeenCalled();
+      expect(interruptedHarness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+      expect(interruptedHarness.fileManager.trashFile).not.toHaveBeenCalled();
+      expect(interruptedHarness.files.has(paths.stateV2ManifestFile)).toBe(false);
+
+      controlHarness.mutations.downloadFile.mockImplementation(async (
+        _vaultName: string,
+        path: string,
+      ) => {
+        const content = fixture.fixtureInput.remoteFileContents?.[path];
+        return content === undefined
+          ? new ArrayBuffer(0)
+          : new TextEncoder().encode(content).buffer;
+      });
+      await controlHarness.state.load();
+      const controlPreview = await controlHarness.executor.run("manual");
+      expect(controlPreview).toMatchObject({
+        success: false,
+        message: "result.pausedForReview",
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+      });
+      expect(restartedState.planReviewAuthorization?.canonicalIdentity?.digest)
+        .toBe(controlHarness.state.planReviewAuthorization
+          ?.canonicalIdentity?.digest);
+      expect(restartedState.activeV2MigrationHold?.items)
+        .toEqual(controlHarness.state.activeV2MigrationHold?.items);
+      expect(controlHarness.mutations.uploadFile).not.toHaveBeenCalled();
+      expect(controlHarness.mutations.downloadFileToPath).not.toHaveBeenCalled();
+      expect(controlHarness.mutations.deleteItem).not.toHaveBeenCalled();
+      expect(controlHarness.mutations.renameItem).not.toHaveBeenCalled();
+      expect(controlHarness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+      expect(controlHarness.fileManager.trashFile).not.toHaveBeenCalled();
+      expect(controlHarness.files.has(paths.stateV2ManifestFile)).toBe(false);
+    } finally {
+      await restartedState?.close();
+      await interruptedHarness.state.close();
+      await controlHarness.state.close();
+      await new IndexedDbRemoteScopeRecoveryEvidenceStore(
+        interruptedHarness.plugin.indexedDbVaultInstanceId!,
+      ).delete();
+      await new IndexedDbRemoteScopeRecoveryEvidenceStore(
+        controlHarness.plugin.indexedDbVaultInstanceId!,
+      ).delete();
+      await new IndexedDbPublic113StateStore(interruptedDatabaseName).delete();
+      await new IndexedDbPublic113StateStore(controlDatabaseName).delete();
+    }
+  }, 30_000);
+
+  it("invalidates only a changed remote receipt and rechecks current local hashes", async () => {
+    const { fixtureInput, equalPaths, differentPath } =
+      await public113ReinstalledMixedVersionFixtureInput({
+        baseCount: 1,
+        equalCount: 4,
+        remoteOnlyCount: 0,
+        folderCount: 0,
+      });
+    const harness = makeHarness(fixtureInput);
+    try {
+      await harness.state.load();
+      expect((await harness.executor.run("manual")).message)
+        .toBe("result.pausedForReview");
+      expect(harness.mutations.downloadFile.mock.calls.map((call) => call[1]))
+        .toEqual(equalPaths);
+
+      const changedRemotePath = equalPaths[0]!;
+      const changedRemote = harness.remoteItemState.find((item) =>
+        item.name === changedRemotePath)!;
+      changedRemote.cTag = `${changedRemote.cTag}-changed`;
+      changedRemote.eTag = `${changedRemote.eTag}-changed`;
+      harness.mutations.downloadFile.mockClear();
+
+      expect((await harness.executor.run("manual")).message)
+        .toBe("result.pausedForReview");
+      expect(harness.mutations.downloadFile.mock.calls.map((call) => call[1]))
+        .toEqual([changedRemotePath]);
+
+      const eTagOnlyPath = equalPaths[1]!;
+      const eTagOnlyRemote = harness.remoteItemState.find((item) =>
+        item.name === eTagOnlyPath)!;
+      eTagOnlyRemote.eTag = `${eTagOnlyRemote.eTag}-metadata-only`;
+      harness.mutations.downloadFile.mockClear();
+
+      expect((await harness.executor.run("manual")).message)
+        .toBe("result.pausedForReview");
+      expect(harness.mutations.downloadFile).not.toHaveBeenCalled();
+
+      const locallyChangedPath = equalPaths[2]!;
+      const locallyChanged = harness.localEntryState.find((entry) =>
+        entry.path === locallyChangedPath)!;
+      const changedBytes = new TextEncoder().encode(
+        "x".repeat(locallyChanged.size),
+      );
+      locallyChanged.hash = await sha256Hex(changedBytes);
+      locallyChanged.mtime++;
+      harness.mutations.downloadFile.mockClear();
+
+      expect((await harness.executor.run("manual")).message)
+        .toBe("result.pausedForReview");
+      expect(harness.mutations.downloadFile).not.toHaveBeenCalled();
+      expect(harness.state.activeV2MigrationHold!.items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: SyncActionType.Conflict,
+            path: differentPath,
+          }),
+          expect.objectContaining({
+            type: SyncActionType.Conflict,
+            path: locallyChangedPath,
+          }),
+        ]),
+      );
+      expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
+      expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
+      expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+      expect(harness.mutations.renameItem).not.toHaveBeenCalled();
+    } finally {
+      await harness.state.close();
+      await new IndexedDbRemoteScopeRecoveryEvidenceStore(
+        harness.plugin.indexedDbVaultInstanceId!,
+      ).delete();
+    }
+  }, 30_000);
+
+  it("falls back to complete first-sync verification when evidence storage is unavailable", async () => {
+    const { fixtureInput, equalPaths } =
+      await public113ReinstalledMixedVersionFixtureInput({
+        baseCount: 1,
+        equalCount: 4,
+        remoteOnlyCount: 0,
+        folderCount: 0,
+      });
+    const harness = makeHarness(fixtureInput);
+    vi.spyOn(harness.state, "beginFirstSyncVerificationEvidence")
+      .mockRejectedValue(new Error("evidence storage unavailable"));
+    try {
+      await harness.state.load();
+      const preview = await harness.executor.run("manual");
+
+      expect(preview.message).toBe("result.pausedForReview");
+      expect(harness.mutations.downloadFile.mock.calls.map((call) => call[1]))
+        .toEqual(equalPaths);
+      expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
+      expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
+      expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+      expect(harness.mutations.renameItem).not.toHaveBeenCalled();
+    } finally {
+      await harness.state.close();
+    }
+  }, 30_000);
+
+  it("removes disposable first-sync verification evidence during an explicit reset", async () => {
+    const { fixtureInput } = await public113ReinstalledMixedVersionFixtureInput({
+      baseCount: 1,
+      equalCount: 4,
+      remoteOnlyCount: 0,
+      folderCount: 0,
+    });
+    const harness = makeHarness(fixtureInput);
+    const originalBegin = harness.state.beginFirstSyncVerificationEvidence
+      .bind(harness.state);
+    let operationId = "";
+    vi.spyOn(harness.state, "beginFirstSyncVerificationEvidence")
+      .mockImplementation(async (scope, source, protocolBinding, now) => {
+        const operation = await originalBegin(
+          scope,
+          source,
+          protocolBinding,
+          now,
+        );
+        operationId = operation.operationId;
+        return operation;
+      });
+    const evidenceStore = new IndexedDbRemoteScopeRecoveryEvidenceStore(
+      harness.plugin.indexedDbVaultInstanceId!,
+    );
+    try {
+      await harness.state.load();
+      expect((await harness.executor.run("manual")).message)
+        .toBe("result.pausedForReview");
+      expect(operationId).not.toBe("");
+      await expect(evidenceStore.summarize(operationId)).resolves.toMatchObject({
+        receipts: 4,
+      });
+      await evidenceStore.close();
+
+      await harness.state.reset();
+
+      expect((await indexedDB.databases()).map((entry) => entry.name))
+        .not.toContain(evidenceStore.databaseName);
+      await expect(evidenceStore.summarize(operationId)).resolves.toMatchObject({
+        receipts: 0,
+      });
+    } finally {
+      await harness.state.close();
+      await evidenceStore.delete();
     }
   }, 30_000);
 
@@ -4102,6 +5374,98 @@ describe("V1 to V2 controlled production activation", () => {
       .toBe(reviewedCommitSeq);
     expect(harness.state.remoteDeltaLink)
       .toBe("https://graph.example/replayed-cursor-1");
+    expect(harness.getDelta).toHaveBeenCalledTimes(2);
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("executes a reviewed plugin restore when a complete identity scan is projection-identical", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    const activated = await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    );
+    expect(activated.success).toBe(true);
+    expect(harness.state.isV2StateActive).toBe(true);
+
+    let cursorRevision = 0;
+    harness.getDelta.mockImplementation(async () => ({
+      value: [...harness.remoteItemState],
+      "@odata.deltaLink":
+        `https://graph.example/complete-review-${++cursorRevision}`,
+    }));
+    harness.getDelta.mockClear();
+    const forceCompleteIdentityAuthorization = {
+      pluginId: "reviewed-restore",
+      operationId: "join-reviewed-restore",
+      targetCatalogRevision: 1,
+      targetBundleDigest: "b".repeat(64),
+      scope,
+      members: [],
+    };
+
+    let reviewedPlan: SyncPlan | null = null;
+    const publishReview = vi.fn(async (candidate: SyncPlan) => {
+      reviewedPlan = candidate;
+      await harness.state.setPlanReviewBundle(
+        candidate.items,
+        candidate.canonicalReview!.counts,
+        candidate.scope!,
+        candidate.canonicalIdentity,
+      );
+      return false;
+    });
+    const preview = await harness.executor.run(
+      "first",
+      { onFirstSyncPreview: publishReview },
+      false,
+      undefined,
+      {
+        communityPluginJoinAuthorizations: [
+          forceCompleteIdentityAuthorization,
+        ],
+      },
+    );
+
+    expect(preview.message).toBe("result.pausedForReview");
+    expect(reviewedPlan).toMatchObject({
+      canonicalIdentity: expect.any(Object),
+      items: [],
+    });
+    const authorization = structuredClone(
+      harness.state.planReviewAuthorization!,
+    );
+    const reviewedCommitSeq =
+      authorization.canonicalIdentity!.sourceCommitSeq;
+    expect(harness.state.getCommittedV2Envelope()?.meta.commitSeq)
+      .toBe(reviewedCommitSeq);
+
+    const executed = await harness.executor.run(
+      "manual",
+      {},
+      true,
+      authorization,
+      {
+        communityPluginJoinAuthorizations: [
+          forceCompleteIdentityAuthorization,
+        ],
+      },
+    );
+
+    expect(executed).toMatchObject({
+      success: true,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      errors: 0,
+    });
+    expect(harness.state.planReviewActive).toBe(false);
+    expect(harness.state.getCommittedV2Envelope()?.meta.commitSeq)
+      .toBe(reviewedCommitSeq);
     expect(harness.getDelta).toHaveBeenCalledTimes(2);
     expectNoFileMutations(harness.mutations);
   });
@@ -6034,6 +7398,105 @@ describe("V1 to V2 controlled production activation", () => {
     );
   });
 
+  it("abandons a proven not-applied public-1.1.3 intent with an empty account without rewriting its durable evidence", async () => {
+    const { fixtureInput, releaseCompatibleLedger } =
+      public113ReceiptedEmptyAccountFixtureInput();
+    const rawRecord = structuredClone(
+      releaseCompatibleLedger[0],
+    ) as unknown as MutationLedgerEntryV1;
+    rawRecord.receipt = null;
+    fixtureInput.pluginData!["easy-sync-mutation-ledger"] = [rawRecord];
+    const harness = makeHarness(fixtureInput);
+    await harness.state.load();
+    const preview = await harness.executor.run("manual");
+    expect(preview.message).toBe("result.pausedForReview");
+    for (const folder of [...harness.localFolderPaths]) {
+      if (folder.startsWith(".obsidian")) harness.localFolderPaths.delete(folder);
+    }
+
+    const confirmation = await harness.executor.run(
+      "manual",
+      {},
+      true,
+      harness.state.planReviewAuthorization!,
+      { acknowledgeMigrationRisk: true },
+    );
+
+    expect(confirmation).toMatchObject({
+      success: true,
+      errors: 0,
+      continueAfterStateOnlyMigrationRecovery: true,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+    });
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.pluginData[KEY_PUBLIC_113_CUTOVER]).toMatchObject({
+      importedLegacyMutationRecords: 1,
+    });
+    const backup = JSON.parse(
+      harness.files.get(paths.stateV1BackupFile)!,
+    ) as { snapshot: { pluginData: Record<string, unknown> } };
+    expect(backup.snapshot.pluginData["easy-sync-mutation-ledger"])
+      .toEqual([rawRecord]);
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("records and checkpoints an applied public-1.1.3 intent with an empty account while preserving the cutover source", async () => {
+    const {
+      fixtureInput,
+      ledger,
+      base,
+      currentHash,
+      currentETag,
+    } = await public113InterruptedAnchoredDownloadFixtureInput();
+    ledger[0].intent.scope.accountId = "";
+    fixtureInput.pluginData!["easy-sync-mutation-ledger"] = ledger;
+    const rawLedger = structuredClone(ledger);
+    const harness = makeHarness(fixtureInput);
+    await harness.state.load();
+    const preview = await harness.executor.run("manual");
+    expect(preview.message).toBe("result.pausedForReview");
+    for (const folder of [...harness.localFolderPaths]) {
+      if (folder.startsWith(".obsidian")) harness.localFolderPaths.delete(folder);
+    }
+
+    const confirmation = await harness.executor.run(
+      "manual",
+      {},
+      true,
+      harness.state.planReviewAuthorization!,
+      { acknowledgeMigrationRisk: true },
+    );
+
+    expect(confirmation).toMatchObject({
+      success: true,
+      errors: 0,
+      continueAfterStateOnlyMigrationRecovery: true,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+    });
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.baseSnapshot).toContainEqual(expect.objectContaining({
+      path: base.path,
+      hash: currentHash,
+      eTag: currentETag,
+    }));
+    expect(harness.pluginData[KEY_PUBLIC_113_CUTOVER]).toMatchObject({
+      importedLegacyMutationRecords: 1,
+    });
+    const backup = JSON.parse(
+      harness.files.get(paths.stateV1BackupFile)!,
+    ) as { snapshot: { pluginData: Record<string, unknown> } };
+    expect(backup.snapshot.pluginData["easy-sync-mutation-ledger"])
+      .toEqual(rawLedger);
+    expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(harness.mutations.renameItem).not.toHaveBeenCalled();
+    expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
+  });
+
   it("keeps an anchored public download in V1 when the remote version changed after its intent", async () => {
     const { fixtureInput, ledger } =
       await public113InterruptedAnchoredDownloadFixtureInput();
@@ -6681,506 +8144,6 @@ describe("V1 to V2 controlled production activation", () => {
     ]);
     expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
     expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
-  });
-
-  it("holds V1 authority without applying structured file mutations during migration planning", async () => {
-    const localContent = "[]";
-    const remoteContent = "[\"calendar\"]";
-    const localBytes = new TextEncoder().encode(localContent);
-    const remoteBytes = new TextEncoder().encode(remoteContent);
-    const localCommunityPluginState: LocalFileEntry = {
-      path: communityPluginPath,
-      size: localBytes.byteLength,
-      mtime: 1,
-      hash: await sha256Hex(localBytes),
-      binary: false,
-    };
-    const pluginBundle = await sharedCalendarPluginBundleFixture();
-    const harness = makeHarness({
-      base: [baseA, ...pluginBundle.base],
-      local: [localA, localCommunityPluginState, ...pluginBundle.local],
-      localFolders: [
-        { path: "Notes" },
-        { path: ".obsidian" },
-        ...pluginBundle.localFolders,
-      ],
-      remoteItems: [
-        ...remoteItemsWithCommunityPluginState(
-          await sha256Hex(remoteBytes),
-          remoteBytes.byteLength,
-        ),
-        ...pluginBundle.remoteItems,
-      ],
-      initialFiles: {
-        [communityPluginPath]: localContent,
-        ...pluginBundle.initialFiles,
-      },
-      remoteFileContents: {
-        [communityPluginPath]: remoteContent,
-        ...pluginBundle.remoteFileContents,
-      },
-      pluginData: {
-        "community-plugin-enablement-state": {
-          version: 1,
-          scope,
-          anchors: {
-            calendar: true,
-            "startup-optimizer": false,
-          },
-          pending: [],
-        },
-      },
-    });
-    harness.executor.setCommunityPluginSyncPolicy({
-      version: 1,
-      files: { mode: "selected", pluginIds: ["calendar"] },
-      data: { mode: "none", pluginIds: [] },
-    });
-    await harness.state.load();
-
-    const result = await harness.executor.run(
-      "manual",
-      {},
-    );
-
-    expect(result.success).toBe(false);
-    expect(result.message).toBe("result.pausedForReview");
-    expect(result.uploaded).toBe(0);
-    expect(harness.state.isV2StateActive).toBe(false);
-    expect(harness.state.activeV2MigrationHold).toMatchObject({
-      phase: "pending",
-      communityPluginEnablement: {
-        source: { selectedPluginIds: ["calendar"] },
-        anchors: {
-          calendar: false,
-          "startup-optimizer": false,
-        },
-      },
-    });
-    expect(harness.files.has(paths.stateV2ManifestFile)).toBe(false);
-    expect(harness.files.has(paths.stateV2File)).toBe(false);
-    expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
-  });
-
-  it("carries a public-1.1.3 enablement decision in the source-bound migration hold", async () => {
-    const localContent = "[]";
-    const remoteContent = "[\"calendar\"]";
-    const localBytes = new TextEncoder().encode(localContent);
-    const remoteBytes = new TextEncoder().encode(remoteContent);
-    const pluginBundle = await sharedCalendarPluginBundleFixture();
-    const remoteFileContents = {
-      [communityPluginPath]: remoteContent,
-      ...pluginBundle.remoteFileContents,
-    };
-    const localCommunityPluginState: LocalFileEntry = {
-      path: communityPluginPath,
-      size: localBytes.byteLength,
-      mtime: 1,
-      hash: await sha256Hex(localBytes),
-      binary: false,
-    };
-    const harness = makeHarness({
-      base: [baseA, ...pluginBundle.base],
-      local: [localA, localCommunityPluginState, ...pluginBundle.local],
-      localFolders: [
-        { path: "Notes" },
-        { path: ".obsidian" },
-        ...pluginBundle.localFolders,
-      ],
-      remoteItems: [
-        ...remoteItemsWithCommunityPluginState(
-          await sha256Hex(remoteBytes),
-          remoteBytes.byteLength,
-        ),
-        ...pluginBundle.remoteItems,
-      ],
-      initialFiles: {
-        [communityPluginPath]: localContent,
-        ...pluginBundle.initialFiles,
-      },
-      remoteFileContents,
-    });
-    harness.executor.setCommunityPluginSyncPolicy({
-      version: 1,
-      files: { mode: "selected", pluginIds: ["calendar"] },
-      data: { mode: "none", pluginIds: [] },
-    });
-    await harness.state.load();
-
-    const first = await harness.executor.run("manual");
-
-    expect(first).toMatchObject({
-      success: false,
-      uploaded: 0,
-      downloaded: 0,
-      attention: {
-        reason: "community-plugin-enablement-decision-required",
-        count: 1,
-      },
-    });
-    expect(harness.state.activeV2MigrationHold).toMatchObject({
-      phase: "pending",
-      communityPluginEnablement: {
-        version: 1,
-        scope,
-        source: {
-          path: communityPluginPath,
-          selectedPluginIds: ["calendar"],
-          local: {
-            exists: true,
-            contentHash: await sha256Hex(localBytes),
-          },
-          remote: {
-            exists: true,
-            contentHash: await sha256Hex(remoteBytes),
-            remoteId: "file-community-plugins",
-          },
-        },
-        anchors: {},
-        pending: [{
-          pluginId: "calendar",
-          localEnabled: false,
-          remoteEnabled: true,
-        }],
-      },
-    });
-    expect(harness.state.planReviewActive).toBe(false);
-    expect(harness.pluginData["community-plugin-enablement-state"])
-      .toBeUndefined();
-    expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
-    expect(harness.mutations.downloadFile).toHaveBeenCalledOnce();
-    expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
-    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
-    expect(harness.mutations.renameItem).not.toHaveBeenCalled();
-    expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
-
-    const restarted = new StateManager(harness.plugin);
-    await restarted.load();
-    expect(restarted.getCommunityPluginEnablementState(scope).pending).toEqual([
-      {
-        pluginId: "calendar",
-        localEnabled: false,
-        remoteEnabled: true,
-      },
-    ]);
-    const decisionRevision = restarted
-      .getCommunityPluginEnablementDecisionSnapshot(scope).revision;
-    const originalPendingHold = restarted.activeV2MigrationHold!;
-    const replacedPendingHold = structuredClone(originalPendingHold);
-    replacedPendingHold.revision += 1;
-    replacedPendingHold.canonicalIdentity = {
-      ...replacedPendingHold.canonicalIdentity,
-      digest: `${replacedPendingHold.canonicalIdentity.digest}-changed`,
-    };
-    replacedPendingHold.communityPluginEnablement!.source.remote = {
-      ...replacedPendingHold.communityPluginEnablement!.source.remote,
-      eTag: "etag-community-plugins-replaced-hold",
-    };
-    const stateWithMigrationHold = restarted as unknown as {
-      migrationHold: typeof originalPendingHold;
-    };
-    stateWithMigrationHold.migrationHold = replacedPendingHold;
-    expect(restarted.getCommunityPluginEnablementDecisionSnapshot(scope).revision)
-      .not.toBe(decisionRevision);
-    await expect(restarted.resolveCommunityPluginEnablementDecisions(
-      scope,
-      decisionRevision,
-      [{
-        pluginId: "calendar",
-        localEnabled: false,
-        remoteEnabled: true,
-        enabled: false,
-      }],
-    )).resolves.toBe(false);
-    stateWithMigrationHold.migrationHold = originalPendingHold;
-    await expect(restarted.resolveCommunityPluginEnablementDecisions(
-      scope,
-      decisionRevision,
-      [{
-        pluginId: "calendar",
-        localEnabled: false,
-        remoteEnabled: true,
-        enabled: false,
-      }],
-    )).resolves.toBe(true);
-    expect(restarted.getCommunityPluginEnablementState(scope)).toMatchObject({
-      anchors: { calendar: false },
-      pending: [],
-    });
-    expect(restarted.planReviewActive).toBe(true);
-    expect(harness.pluginData["community-plugin-enablement-state"])
-      .toBeUndefined();
-
-    const restartedExecutor = new V2ActivationTestExecutor(
-      harness.client,
-      harness.scanner,
-      restarted,
-      "testVault",
-      harness.diag as never,
-      harness.fileManager as never,
-      harness.localFolderPaths,
-    );
-    restartedExecutor.setCommunityPluginSyncPolicy({
-      version: 1,
-      files: { mode: "selected", pluginIds: ["calendar"] },
-      data: { mode: "none", pluginIds: [] },
-    });
-    vi.mocked(harness.mutations.uploadFile).mockImplementation(
-      async (_vaultName, path, content) => {
-        const bytes = new Uint8Array(content);
-        const remote = findRemoteItemByPath(
-          harness.remoteItemState,
-          path,
-        )!;
-        remote.size = bytes.byteLength;
-        remote.eTag = "etag-community-plugins-local-choice";
-        remote.cTag = "ctag-community-plugins-local-choice";
-        remote.file!.hashes = { sha256Hash: await sha256Hex(bytes) };
-        remoteFileContents[path] = new TextDecoder().decode(bytes);
-        return {
-          id: remote.id,
-          eTag: remote.eTag,
-          cTag: remote.cTag,
-          size: remote.size,
-          parentReference: { id: remote.parentReference!.id },
-        };
-      },
-    );
-    vi.mocked(harness.plugin.updatePluginData).mockImplementationOnce(
-      async (mutator) => {
-        mutator(harness.pluginData);
-        throw new Error(
-          "enablement carrier cutover response lost after durable write",
-        );
-      },
-    );
-    const interrupted = await restartedExecutor.run(
-      "manual",
-      {},
-      false,
-      undefined,
-      { activateV2State: true },
-    );
-
-    expect(interrupted).toMatchObject({
-      success: false,
-      uploaded: 0,
-      downloaded: 0,
-      errors: 1,
-      deferred: 0,
-    });
-    expect(restarted.isV2StateActive).toBe(true);
-    expect(restarted.v2StateLoadRecoveryBlock).toMatchObject({
-      authority: "v2",
-      reason: "public-1.1.3-cutover-finalization-failed",
-    });
-    expect(harness.pluginData["community-plugin-enablement-state"]).toEqual({
-      version: 1,
-      scope,
-      anchors: {},
-      pending: [{
-        pluginId: "calendar",
-        localEnabled: false,
-        remoteEnabled: true,
-        resolvedEnabled: false,
-      }],
-    });
-    expect(harness.files.get(communityPluginPath)).toBe(localContent);
-    expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
-
-    const recoveredState = new StateManager(harness.plugin);
-    await recoveredState.load();
-    expect(recoveredState.isV2StateActive).toBe(true);
-    expect(recoveredState.v2StateLoadRecoveryBlock).toBeNull();
-    expect(recoveredState.getCommunityPluginEnablementState(scope))
-      .toMatchObject({
-        anchors: { calendar: false },
-        pending: [],
-      });
-    const recoveredExecutor = new V2ActivationTestExecutor(
-      harness.client,
-      harness.scanner,
-      recoveredState,
-      "testVault",
-      harness.diag as never,
-      harness.fileManager as never,
-      harness.localFolderPaths,
-    );
-    recoveredExecutor.setCommunityPluginSyncPolicy({
-      version: 1,
-      files: { mode: "selected", pluginIds: ["calendar"] },
-      data: { mode: "none", pluginIds: [] },
-    });
-    vi.mocked(harness.mutations.uploadFile).mockRejectedValueOnce(
-      new Error("structured enablement upload failed"),
-    );
-    const failedApply = await recoveredExecutor.run(
-      "manual",
-      {},
-      true,
-      recoveredState.planReviewAuthorization!,
-    );
-    expect(failedApply).toMatchObject({
-      success: false,
-      uploaded: 0,
-      downloaded: 0,
-      errors: 1,
-      deferred: 0,
-    });
-    expect(recoveredState.activeV2MigrationHold).toBeNull();
-    expect(harness.mutations.uploadFile).toHaveBeenCalledOnce();
-    expect(recoveredState.getCommunityPluginEnablementState(scope))
-      .toMatchObject({
-        anchors: {},
-        pending: [{
-          pluginId: "calendar",
-          localEnabled: false,
-          remoteEnabled: true,
-          resolvedEnabled: false,
-        }],
-      });
-
-    const recovered = await recoveredExecutor.run("manual");
-    expect(recovered).toMatchObject({
-      success: true,
-      uploaded: 1,
-      downloaded: 0,
-      errors: 0,
-      deferred: 0,
-    });
-    expect(harness.mutations.uploadFile).toHaveBeenCalledTimes(2);
-    expect(recoveredState.getCommunityPluginEnablementState(scope))
-      .toMatchObject({
-        anchors: { calendar: false },
-        pending: [],
-      });
-
-    const stable = await recoveredExecutor.run("manual");
-    expect(stable).toMatchObject({
-      success: true,
-      uploaded: 0,
-      downloaded: 0,
-      errors: 0,
-      deferred: 0,
-    });
-  });
-
-  it("replaces a resolved enablement carrier before protocol I/O when its observed file version changed", async () => {
-    const localContent = "[]";
-    const originalRemoteContent = "[\"calendar\"]";
-    const changedRemoteContent = "[]";
-    const localBytes = new TextEncoder().encode(localContent);
-    const originalRemoteBytes = new TextEncoder().encode(
-      originalRemoteContent,
-    );
-    const changedRemoteBytes = new TextEncoder().encode(changedRemoteContent);
-    const pluginBundle = await sharedCalendarPluginBundleFixture();
-    const remoteFileContents = {
-      [communityPluginPath]: originalRemoteContent,
-      ...pluginBundle.remoteFileContents,
-    };
-    const harness = makeHarness({
-      base: [baseA, ...pluginBundle.base],
-      local: [
-        localA,
-        {
-          path: communityPluginPath,
-          size: localBytes.byteLength,
-          mtime: 1,
-          hash: await sha256Hex(localBytes),
-          binary: false,
-        },
-        ...pluginBundle.local,
-      ],
-      localFolders: [
-        { path: "Notes" },
-        { path: ".obsidian" },
-        ...pluginBundle.localFolders,
-      ],
-      remoteItems: [
-        ...remoteItemsWithCommunityPluginState(
-          await sha256Hex(originalRemoteBytes),
-          originalRemoteBytes.byteLength,
-        ),
-        ...pluginBundle.remoteItems,
-      ],
-      initialFiles: {
-        [communityPluginPath]: localContent,
-        ...pluginBundle.initialFiles,
-      },
-      remoteFileContents,
-    });
-    harness.executor.setCommunityPluginSyncPolicy({
-      version: 1,
-      files: { mode: "selected", pluginIds: ["calendar"] },
-      data: { mode: "none", pluginIds: [] },
-    });
-    await harness.state.load();
-    await harness.executor.run("manual");
-    const originalHold = harness.state.activeV2MigrationHold!;
-    const decisionRevision = harness.state
-      .getCommunityPluginEnablementDecisionSnapshot(scope).revision;
-    await expect(harness.state.resolveCommunityPluginEnablementDecisions(
-      scope,
-      decisionRevision,
-      [{
-        pluginId: "calendar",
-        localEnabled: false,
-        remoteEnabled: true,
-        enabled: true,
-      }],
-    )).resolves.toBe(true);
-    const authorization = harness.state.planReviewAuthorization!;
-
-    remoteFileContents[communityPluginPath] = changedRemoteContent;
-    const remoteEnablement = findRemoteItemByPath(
-      harness.remoteItemState,
-      communityPluginPath,
-    )!;
-    remoteEnablement.size = changedRemoteBytes.byteLength;
-    remoteEnablement.eTag = "etag-community-plugins-changed";
-    remoteEnablement.cTag = "ctag-community-plugins-changed";
-    remoteEnablement.file!.hashes = {
-      sha256Hash: await sha256Hex(changedRemoteBytes),
-    };
-
-    const represented = await harness.executor.run(
-      "manual",
-      {},
-      true,
-      authorization,
-      { acknowledgeMigrationRisk: true },
-    );
-
-    expect(represented).toMatchObject({
-      success: false,
-      message: "result.pausedForReview",
-      uploaded: 0,
-      downloaded: 0,
-      errors: 0,
-    });
-    expect(harness.state.isV2StateActive).toBe(false);
-    expect(harness.files.has(paths.stateV2ManifestFile)).toBe(false);
-    expect(harness.state.activeV2MigrationHold).toMatchObject({
-      phase: "pending",
-      communityPluginEnablement: {
-        anchors: { calendar: false },
-        pending: [],
-        source: {
-          remote: {
-            contentHash: await sha256Hex(changedRemoteBytes),
-            eTag: "etag-community-plugins-changed",
-          },
-        },
-      },
-    });
-    expect(harness.state.activeV2MigrationHold!.revision)
-      .toBeGreaterThan(originalHold.revision);
-    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
-    expect(harness.pluginData["community-plugin-enablement-state"])
-      .toBeUndefined();
-    expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
-    expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
   });
 
   it("cuts authority only on a zero plan and the next V2 round stays zero", async () => {
@@ -8167,6 +9130,245 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.state.pendingIssues).toHaveLength(1);
   });
 
+  it("reads one exact subtree snapshot for nested missing-local folder issues", async () => {
+    const paths = ["Issues", "Issues/CAD"];
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: paths.map((path) => ({ path })),
+      remoteItems: remoteFolderTree(paths),
+    });
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    harness.localFolderPaths.clear();
+    harness.localFolderPaths.add("Archive");
+    const deferred = await harness.executor.run("manual");
+    expect(deferred.deferred).toBe(2);
+    expect(harness.state.pendingIssues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        path: "Issues",
+        issueCode: "anchored-folder-missing-local",
+      }),
+      expect.objectContaining({
+        path: "Issues/CAD",
+        issueCode: "anchored-folder-missing-local",
+      }),
+    ]));
+
+    const fromRoot = await harness.executor
+      .getFolderSubtreeReviewSnapshot("Issues");
+    const fromChild = await harness.executor
+      .getFolderSubtreeReviewSnapshot("Issues/CAD");
+    expect(fromRoot).toMatchObject({
+      path: "Issues",
+      issuePaths: ["Issues", "Issues/CAD"],
+      members: [
+        { path: "Issues", kind: "folder" },
+        { path: "Issues/CAD", kind: "folder" },
+      ],
+    });
+    expect(fromChild).toEqual(fromRoot);
+    expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
+    expect(harness.mutations.downloadFile).not.toHaveBeenCalled();
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+  });
+
+  it("restores one reviewed cloud subtree through the ordinary V2 mutation chain", async () => {
+    const { harness, reviewed, filePath, content, hash } =
+      await prepareReviewedFolderSubtreeHarness();
+    expect(reviewed).toMatchObject({
+      path: "Issues",
+      members: [
+        { path: "Issues", kind: "folder" },
+        { path: "Issues/CAD", kind: "folder" },
+        { path: filePath, kind: "file", contentHash: hash },
+      ],
+    });
+
+    expect(await harness.executor.restoreReviewedFolderSubtree(reviewed!))
+      .toBe(true);
+    expectNoFileMutations(harness.mutations);
+    expect(harness.localFolderPaths.has("Issues")).toBe(false);
+    expect(harness.state.pendingIssues).toEqual([]);
+
+    expect(await harness.executor.run("manual")).toMatchObject({
+      success: true,
+      foldersCreated: 3,
+      downloaded: 1,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.localFolderPaths.has("Issues")).toBe(true);
+    expect(harness.localFolderPaths.has("Issues/CAD")).toBe(true);
+    expect(harness.scanner.vault.createFolder).toHaveBeenCalledTimes(2);
+    expect(harness.client.createFolderByParentId).toHaveBeenCalledTimes(1);
+    expect(harness.files.get(filePath)).toBe(content);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(Object.values(
+      harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+    ).map((anchor) => anchor.lastPath).sort()).toEqual([
+      ".obsidian",
+      ".obsidian/plugins",
+      ".obsidian/plugins/easy-sync",
+      "Archive",
+      "Issues",
+      "Issues/CAD",
+    ]);
+    harness.mutations.downloadFile.mockClear();
+    harness.scanner.vault.createFolder.mockClear();
+    harness.client.createFolderByParentId.mockClear();
+    expect(await harness.executor.run("manual")).toMatchObject({
+      downloaded: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.mutations.downloadFile).not.toHaveBeenCalled();
+    expect(harness.scanner.vault.createFolder).not.toHaveBeenCalled();
+    expect(harness.client.createFolderByParentId).not.toHaveBeenCalled();
+  });
+
+  it("keeps a reviewed cloud subtree unchanged when any remote member drifts", async () => {
+    const { harness, reviewed } = await prepareReviewedFolderSubtreeHarness();
+    const cad = findRemoteItemByPath(harness.remoteItemState, "Issues/CAD")!;
+    harness.remoteItemState.push({
+      id: "late-file",
+      name: "late.md",
+      file: { hashes: { sha256Hash: "c".repeat(64) } },
+      size: 1,
+      parentReference: { id: cad.id },
+      eTag: "etag-late-file",
+      cTag: "ctag-late-file",
+    });
+    const before = harness.state.getCommittedV2Envelope()!.meta.commitSeq;
+
+    expect(await harness.executor.restoreReviewedFolderSubtree(reviewed))
+      .toBe(false);
+    expect(harness.state.getCommittedV2Envelope()!.meta.commitSeq).toBe(before);
+    expect(harness.state.pendingIssues).not.toEqual([]);
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("deletes one reviewed cloud subtree with the exact root cTag and converges", async () => {
+    const { harness, reviewed } = await prepareReviewedFolderSubtreeHarness();
+    const root = reviewed.members[0];
+    expect(root).toMatchObject({
+      path: "Issues",
+      kind: "folder",
+      remoteCTag: expect.any(String),
+    });
+    const deleted = await harness.executor.deleteReviewedFolderSubtree(reviewed);
+    expect({
+      deleted,
+      deleteCalls: harness.mutations.deleteItem.mock.calls.length,
+      ledger: harness.state.mutationLedger,
+      pendingIssues: harness.state.pendingIssues,
+      remoteRoot: findRemoteItemByPath(harness.remoteItemState, "Issues"),
+    }).toMatchObject({
+      deleted: true,
+      deleteCalls: 1,
+      ledger: [],
+      pendingIssues: [],
+      remoteRoot: null,
+    });
+    expect(harness.mutations.deleteItem).toHaveBeenCalledTimes(1);
+    expect(harness.mutations.deleteItem).toHaveBeenCalledWith(
+      "testVault",
+      "Issues",
+      root.remoteCTag,
+      root.remoteId,
+    );
+    expect(findRemoteItemByPath(harness.remoteItemState, "Issues")).toBeNull();
+    expect(findRemoteItemByPath(
+      harness.remoteItemState,
+      "Issues/CAD/drawing.md",
+    )).toBeNull();
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([]);
+    const envelope = harness.state.getCommittedV2Envelope()!;
+    expect(envelope.remoteIndex.itemsById[root.remoteId]).toBeUndefined();
+
+    harness.mutations.deleteItem.mockClear();
+    expect(await harness.executor.run("manual")).toMatchObject({
+      deleted: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+  });
+
+  it("keeps a reviewed cloud subtree when its root content tag drifts", async () => {
+    const { harness, reviewed } = await prepareReviewedFolderSubtreeHarness();
+    const root = findRemoteItemByPath(harness.remoteItemState, "Issues")!;
+    root.cTag = `${root.cTag}-changed`;
+    const before = harness.state.getCommittedV2Envelope()!.meta.commitSeq;
+
+    expect(await harness.executor.deleteReviewedFolderSubtree(reviewed))
+      .toBe(false);
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(harness.state.getCommittedV2Envelope()!.meta.commitSeq).toBe(before);
+    expect(harness.state.pendingIssues).not.toEqual([]);
+  });
+
+  it("settles a reviewed cloud subtree delete after the response is lost", async () => {
+    const { harness, reviewed } = await prepareReviewedFolderSubtreeHarness();
+    harness.loseFolderDeleteResponseOnce();
+
+    expect(await harness.executor.deleteReviewedFolderSubtree(reviewed))
+      .toBe(true);
+    expect(harness.mutations.deleteItem).toHaveBeenCalledTimes(1);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Issues")).toBeNull();
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([]);
+
+    const reopened = harness.state.getCommittedV2Envelope()!;
+    expect(Object.values(reopened.remoteIndex.itemsById).some(
+      (item) => item.parentId === reviewed.members[0].remoteId,
+    )).toBe(false);
+  });
+
+  it("continues a reviewed cloud subtree restore after a cold reopen", async () => {
+    const { harness, reviewed, filePath, content } =
+      await prepareReviewedFolderSubtreeHarness();
+    expect(await harness.executor.restoreReviewedFolderSubtree(reviewed))
+      .toBe(true);
+    await harness.state.close();
+
+    const restartedState = new StateManager(harness.plugin);
+    await restartedState.load();
+    const restartedExecutor = new SyncExecutor(
+      harness.client,
+      harness.scanner,
+      restartedState,
+      "testVault",
+      undefined,
+      undefined,
+      harness.diag as never,
+      harness.fileManager as never,
+    );
+    expect(await restartedExecutor.run("manual")).toMatchObject({
+      success: true,
+      downloaded: 1,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.files.get(filePath)).toBe(content);
+    harness.mutations.downloadFile.mockClear();
+    expect(await restartedExecutor.run("manual")).toMatchObject({
+      downloaded: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.mutations.downloadFile).not.toHaveBeenCalled();
+    await restartedState.close();
+  });
+
   it("recovers reviewed empty-folder create and delete response loss without repetition", async () => {
     const restoring = await prepareAmbiguousEmptyFolderHarness();
     restoring.harness.loseLocalFolderCreateResponseOnce();
@@ -8283,6 +9485,591 @@ describe("V1 to V2 controlled production activation", () => {
       uploaded: 0,
       downloaded: 0,
       deleted: 0,
+      errors: 0,
+    });
+  });
+
+  it("lets one reviewed root-location choice settle a two-sided folder move", async () => {
+    for (const choice of ["keep-local", "keep-remote"] as const) {
+      const harness = makeHarness();
+      await harness.state.load();
+      expect((await harness.executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        { activateV2State: true },
+      )).success).toBe(true);
+
+      await (harness.scanner.vault as unknown as {
+        rename: (file: TFolder, target: string) => Promise<void>;
+      }).rename(new TFolder("Notes"), "Archive");
+      expect(await harness.state.recordLocalFolderMoveHint("Notes", "Archive"))
+        .toBe(true);
+      const remoteFolder = findRemoteItemByPath(harness.remoteItemState, "Notes")!;
+      remoteFolder.name = "Cloud";
+      remoteFolder.eTag = `etag-folder-cloud-${choice}`;
+
+      const blocked = await harness.executor.run("manual");
+      expect(blocked).toMatchObject({
+        success: true,
+        foldersMoved: 0,
+        deferred: 1,
+      });
+      expect(harness.state.pendingIssues).toEqual([
+        expect.objectContaining({
+          path: "Notes",
+          issueCode: "folder-location-choice",
+        }),
+      ]);
+
+      const reviewed = await (harness.executor as unknown as {
+        getFolderLocationResolutionSnapshot: (path: string) => Promise<{
+          revision: string;
+          localPath: string;
+          remotePath: string;
+        } | null>;
+        resolveReviewedFolderLocation: (
+          reviewed: { revision: string; localPath: string; remotePath: string },
+          choice: "keep-local" | "keep-remote",
+        ) => Promise<boolean>;
+      }).getFolderLocationResolutionSnapshot("Notes");
+      expect(reviewed).toMatchObject({
+        localPath: "Archive",
+        remotePath: "Cloud",
+      });
+      const resolved = await (harness.executor as unknown as {
+        resolveReviewedFolderLocation: (
+          reviewed: NonNullable<typeof reviewed>,
+          choice: "keep-local" | "keep-remote",
+        ) => Promise<boolean>;
+      }).resolveReviewedFolderLocation(reviewed!, choice);
+      expect(resolved).toBe(true);
+
+      const finalPath = choice === "keep-local" ? "Archive" : "Cloud";
+      expect(findRemoteItemByPath(harness.remoteItemState, finalPath)?.id)
+        .toBe("folder-notes");
+      expect(harness.localFolderPaths.has(finalPath)).toBe(true);
+      expect(harness.state.localFolderMoveHints).toEqual([]);
+      expect(harness.state.mutationLedger).toEqual([]);
+      expect(harness.state.pendingIssues).toEqual([]);
+      expect(await harness.executor.run("manual")).toMatchObject({
+        foldersMoved: 0,
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+        conflicts: 0,
+        deferred: 0,
+        errors: 0,
+      });
+    }
+  });
+
+  it("does not apply an expired two-sided folder location choice", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    await (harness.scanner.vault as unknown as {
+      rename: (file: TFolder, target: string) => Promise<void>;
+    }).rename(new TFolder("Notes"), "Archive");
+    expect(await harness.state.recordLocalFolderMoveHint("Notes", "Archive"))
+      .toBe(true);
+    const remoteFolder = findRemoteItemByPath(harness.remoteItemState, "Notes")!;
+    remoteFolder.name = "Cloud";
+    remoteFolder.eTag = "etag-folder-cloud-reviewed";
+    await harness.executor.run("manual");
+    const internal = harness.executor as unknown as {
+      getFolderLocationResolutionSnapshot: (path: string) => Promise<{
+        revision: string;
+        localPath: string;
+        remotePath: string;
+      } | null>;
+      resolveReviewedFolderLocation: (
+        reviewed: { revision: string; localPath: string; remotePath: string },
+        choice: "keep-local",
+      ) => Promise<boolean>;
+    };
+    const reviewed = await internal.getFolderLocationResolutionSnapshot("Notes");
+    expect(reviewed).not.toBeNull();
+    remoteFolder.eTag = "etag-folder-cloud-changed-after-review";
+
+    expect(await internal.resolveReviewedFolderLocation(reviewed!, "keep-local"))
+      .toBe(false);
+    expect(harness.mutations.moveItemById).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingIssues).toHaveLength(1);
+  });
+
+  it("commits an exact local folder move before acting on a changed carried file", async () => {
+    const harness = makeHarness();
+    const changedContent = "changed while moving the containing folder";
+    const changedBytes = new TextEncoder().encode(changedContent);
+    const changedHash = await sha256Hex(changedBytes);
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    await (harness.scanner.vault as unknown as {
+      rename: (file: TFolder, target: string) => Promise<void>;
+    }).rename(new TFolder("Notes"), "Archive");
+    harness.files.set("Archive/a.md", changedContent);
+    harness.localEntryState[0]!.hash = changedHash;
+    harness.localEntryState[0]!.size = changedBytes.byteLength;
+    harness.localEntryState[0]!.mtime++;
+    expect(await harness.state.recordLocalFolderMoveHint("Notes", "Archive")).toBe(true);
+    harness.mutations.uploadFile.mockImplementationOnce(async () =>
+      applyRemoteUpload(
+        harness.remoteItemState,
+        "Archive/a.md",
+        changedBytes.byteLength,
+        changedHash,
+        "etag-carried-file-uploaded",
+      ));
+
+    const moved = await harness.executor.run("manual");
+    expect(moved).toMatchObject({
+      success: true,
+      foldersMoved: 1,
+      filesMoved: 0,
+      uploaded: 1,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.mutations.moveItemById).toHaveBeenCalledTimes(1);
+    expect(harness.mutations.uploadFile).toHaveBeenCalledTimes(1);
+    expect(
+      harness.mutations.moveItemById.mock.invocationCallOrder[0],
+    ).toBeLessThan(harness.mutations.uploadFile.mock.invocationCallOrder[0]!);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Archive")?.id)
+      .toBe("folder-notes");
+    expect(findRemoteItemByPath(harness.remoteItemState, "Archive/a.md")?.file?.hashes)
+      .toMatchObject({ sha256Hash: changedHash });
+    expect(harness.state.localFolderMoveHints).toHaveLength(0);
+    expect(harness.state.mutationLedger).toHaveLength(0);
+    expect(harness.state.pendingConflicts).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(Object.values(
+      harness.state.getCommittedV2Envelope()!.anchors.byAnchorId,
+    )).toContainEqual(expect.objectContaining({
+      remoteId: "file-a",
+      lastPath: "Archive/a.md",
+      contentHash: changedHash,
+    }));
+    expect(await harness.executor.run("manual")).toMatchObject({
+      foldersMoved: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      errors: 0,
+    });
+  });
+
+  it("commits an exact local folder move before uploading a new carried file", async () => {
+    const harness = makeHarness();
+    const newContent = "created while moving the containing folder";
+    const newBytes = new TextEncoder().encode(newContent);
+    const newHash = await sha256Hex(newBytes);
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    await (harness.scanner.vault as unknown as {
+      rename: (file: TFolder, target: string) => Promise<void>;
+    }).rename(new TFolder("Notes"), "Archive");
+    harness.files.set("Archive/new.md", newContent);
+    harness.localEntryState.push({
+      path: "Archive/new.md",
+      size: newBytes.byteLength,
+      mtime: 2,
+      hash: newHash,
+      binary: false,
+    });
+    expect(await harness.state.recordLocalFolderMoveHint("Notes", "Archive")).toBe(true);
+    harness.mutations.uploadFile.mockImplementationOnce(async () => {
+      const uploaded: DriveItem = {
+        id: "file-new-carried",
+        name: "new.md",
+        size: newBytes.byteLength,
+        file: { hashes: { sha256Hash: newHash } },
+        parentReference: { id: "folder-notes" },
+        eTag: "etag-new-carried-file-uploaded",
+        cTag: "ctag-new-carried-file-uploaded",
+      };
+      harness.remoteItemState.push(uploaded);
+      return uploaded;
+    });
+
+    const moved = await harness.executor.run("manual");
+    expect(harness.diag.error).not.toHaveBeenCalled();
+    expect(moved).toMatchObject({
+      success: true,
+      foldersMoved: 1,
+      uploaded: 1,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.mutations.moveItemById).toHaveBeenCalledTimes(1);
+    expect(harness.mutations.uploadFile).toHaveBeenCalledTimes(1);
+    expect(
+      harness.mutations.moveItemById.mock.invocationCallOrder[0],
+    ).toBeLessThan(harness.mutations.uploadFile.mock.invocationCallOrder[0]!);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Archive")?.id)
+      .toBe("folder-notes");
+    expect(findRemoteItemByPath(harness.remoteItemState, "Archive/new.md")?.file?.hashes)
+      .toMatchObject({ sha256Hash: newHash });
+    expect(harness.state.localFolderMoveHints).toHaveLength(0);
+    expect(harness.state.mutationLedger).toHaveLength(0);
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(await harness.executor.run("manual")).toMatchObject({
+      foldersMoved: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      errors: 0,
+    });
+  });
+
+  it("commits an exact remote folder move before downloading a changed carried file", async () => {
+    const localContent = "0123456789";
+    const localBytes = new TextEncoder().encode(localContent);
+    const localHash = await sha256Hex(localBytes);
+    const localEntry: LocalFileEntry = {
+      ...localA,
+      size: localBytes.byteLength,
+      hash: localHash,
+    };
+    const harness = makeHarness({
+      base: [{
+        path: localEntry.path,
+        size: localEntry.size,
+        hash: localEntry.hash,
+        eTag: "etag-a",
+      }],
+      local: [localEntry],
+      remoteHash: localHash,
+      initialFiles: { [localEntry.path]: localContent },
+    });
+    const remoteContent = "changed while moving the containing cloud folder";
+    const remoteBytes = new TextEncoder().encode(remoteContent);
+    const remoteHash = await sha256Hex(remoteBytes);
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    const remoteFolder = findRemoteItemByPath(harness.remoteItemState, "Notes")!;
+    remoteFolder.name = "Archive";
+    remoteFolder.eTag = "etag-folder-notes-moved-remotely";
+    applyRemoteUpload(
+      harness.remoteItemState,
+      "Archive/a.md",
+      remoteBytes.byteLength,
+      remoteHash,
+      "etag-carried-file-changed-remotely",
+    );
+    harness.mutations.downloadFile.mockResolvedValue(remoteBytes.buffer);
+
+    const moved = await harness.executor.run("manual");
+
+    expect(moved).toMatchObject({
+      success: true,
+      foldersMoved: 1,
+      uploaded: 0,
+      downloaded: 1,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.scanner.vault.rename).toHaveBeenCalledOnce();
+    expect(harness.mutations.downloadFile).toHaveBeenCalledOnce();
+    expect(harness.localFolderPaths.has("Notes")).toBe(false);
+    expect(harness.localFolderPaths.has("Archive")).toBe(true);
+    expect(harness.files.get("Archive/a.md")).toBe(remoteContent);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(await harness.executor.run("manual")).toMatchObject({
+      foldersMoved: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      errors: 0,
+    });
+  });
+
+  it("cold-starts from a committed folder move when bounded continuation was incomplete", async () => {
+    const harness = makeHarness();
+    const changedContent = "changed before the bounded scan became incomplete";
+    const changedBytes = new TextEncoder().encode(changedContent);
+    const changedHash = await sha256Hex(changedBytes);
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    await (harness.scanner.vault as unknown as {
+      rename: (file: TFolder, target: string) => Promise<void>;
+    }).rename(new TFolder("Notes"), "Archive");
+    harness.files.set("Archive/a.md", changedContent);
+    harness.localEntryState[0]!.hash = changedHash;
+    harness.localEntryState[0]!.size = changedBytes.byteLength;
+    harness.localEntryState[0]!.mtime++;
+    expect(await harness.state.recordLocalFolderMoveHint("Notes", "Archive")).toBe(true);
+    harness.mutations.uploadFile.mockImplementationOnce(async () =>
+      applyRemoteUpload(
+        harness.remoteItemState,
+        "Archive/a.md",
+        changedBytes.byteLength,
+        changedHash,
+        "etag-upload-after-cold-restart",
+      ));
+    const scanAll = vi.mocked(harness.scanner.scanAll);
+    const completeScan = scanAll.getMockImplementation()!;
+    scanAll.mockImplementation(async () => {
+      const scan = await completeScan();
+      return harness.mutations.moveItemById.mock.calls.length === 1
+        ? { ...scan, complete: false, failedPaths: ["Archive/a.md"] }
+        : scan;
+    });
+
+    expect(await harness.executor.run("manual")).toMatchObject({
+      success: true,
+      foldersMoved: 1,
+      uploaded: 0,
+      deferred: 1,
+      errors: 0,
+    });
+    expect(harness.state.localFolderMoveHints).toHaveLength(0);
+    expect(harness.state.mutationLedger).toHaveLength(0);
+    expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
+
+    scanAll.mockImplementation(completeScan);
+    await harness.state.close();
+    const restartedState = new StateManager(harness.plugin);
+    await restartedState.load();
+    const restartedExecutor = new SyncExecutor(
+      harness.client,
+      harness.scanner,
+      restartedState,
+      "testVault",
+      undefined,
+      undefined,
+      harness.diag as never,
+      harness.fileManager as never,
+    );
+    expect(await restartedExecutor.run("manual")).toMatchObject({
+      success: true,
+      foldersMoved: 0,
+      uploaded: 1,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(findRemoteItemByPath(harness.remoteItemState, "Archive/a.md")?.file?.hashes)
+      .toMatchObject({ sha256Hash: changedHash });
+    expect(await restartedExecutor.run("manual")).toMatchObject({
+      foldersMoved: 0,
+      uploaded: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    await restartedState.close();
+  });
+
+  it("reclassifies a remote edit observed after the folder checkpoint", async () => {
+    const { harness, afterMove } =
+      await prepareMovedFolderContinuationHarness();
+    const remoteContent = "remote edit observed after the folder moved";
+    const remoteBytes = new TextEncoder().encode(remoteContent);
+    const remoteHash = await sha256Hex(remoteBytes);
+    afterMove(() => {
+      applyRemoteUpload(
+        harness.remoteItemState,
+        "Archive/a.md",
+        remoteBytes.byteLength,
+        remoteHash,
+        "etag-remote-edit-after-folder-move",
+      );
+    });
+    harness.mutations.downloadFile.mockResolvedValue(remoteBytes.buffer);
+
+    expect(await harness.executor.run("manual")).toMatchObject({
+      success: true,
+      foldersMoved: 1,
+      uploaded: 0,
+      downloaded: 1,
+      conflicts: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.mutations.moveItemById).toHaveBeenCalledOnce();
+    expect(harness.mutations.downloadFile).toHaveBeenCalledOnce();
+    expect(harness.files.get("Archive/a.md")).toBe(remoteContent);
+    expect(await harness.executor.run("manual")).toMatchObject({
+      foldersMoved: 0,
+      uploaded: 0,
+      downloaded: 0,
+      conflicts: 0,
+      errors: 0,
+    });
+  });
+
+  it.each([
+    "local-new",
+    "remote-new",
+    "local-delete",
+    "remote-delete",
+    "both-edit",
+  ] as const)("routes %s after the folder checkpoint through ordinary file semantics", async (scenario) => {
+    const { harness, afterMove } =
+      await prepareMovedFolderContinuationHarness();
+    const changedContent = `${scenario}-content`;
+    const changedBytes = new TextEncoder().encode(changedContent);
+    const changedHash = await sha256Hex(changedBytes);
+    const remoteConflictBytes = new TextEncoder().encode(
+      `remote-${changedContent}`,
+    );
+    const remoteConflictHash = await sha256Hex(remoteConflictBytes);
+    afterMove(() => {
+      if (scenario === "local-new") {
+        harness.files.set("Archive/new.md", changedContent);
+        harness.localEntryState.push({
+          path: "Archive/new.md",
+          size: changedBytes.byteLength,
+          mtime: 2,
+          hash: changedHash,
+          binary: false,
+        });
+      } else if (scenario === "remote-new") {
+        harness.remoteItemState.push({
+          id: "file-new",
+          name: "new.md",
+          size: changedBytes.byteLength,
+          file: { hashes: { sha256Hash: changedHash } },
+          parentReference: { id: "folder-notes" },
+          eTag: "etag-remote-new-after-folder-move",
+          cTag: "ctag-remote-new-after-folder-move",
+        });
+      } else if (scenario === "local-delete") {
+        harness.localEntryState.splice(0, 1);
+        harness.files.delete("Archive/a.md");
+      } else if (scenario === "remote-delete") {
+        const index = harness.remoteItemState.findIndex(
+          (item) => item.id === "file-a",
+        );
+        harness.remoteItemState.splice(index, 1, {
+          id: "file-a",
+          name: "a.md",
+          parentReference: { id: "folder-notes" },
+          deleted: { state: "deleted" },
+        });
+      } else {
+        harness.files.set("Archive/a.md", changedContent);
+        Object.assign(harness.localEntryState[0]!, {
+          size: changedBytes.byteLength,
+          mtime: 2,
+          hash: changedHash,
+        });
+        applyRemoteUpload(
+          harness.remoteItemState,
+          "Archive/a.md",
+          remoteConflictBytes.byteLength,
+          remoteConflictHash,
+          "etag-remote-conflict-after-folder-move",
+        );
+      }
+    });
+    harness.mutations.downloadFile.mockResolvedValue(
+      scenario === "both-edit"
+        ? remoteConflictBytes.buffer
+        : changedBytes.buffer,
+    );
+    if (scenario === "local-new") {
+      harness.mutations.uploadFile.mockImplementationOnce(async () => {
+        const remote: DriveItem = {
+          id: "file-new",
+          name: "new.md",
+          size: changedBytes.byteLength,
+          file: { hashes: { sha256Hash: changedHash } },
+          parentReference: { id: "folder-notes" },
+          eTag: "etag-local-new-after-folder-move",
+          cTag: "ctag-local-new-after-folder-move",
+        };
+        harness.remoteItemState.push(remote);
+        return remote;
+      });
+    }
+    const result = await harness.executor.run("manual");
+    expect(result).toMatchObject({
+      success: true,
+      foldersMoved: 1,
+      uploaded: scenario === "local-new" ? 1 : 0,
+      downloaded: scenario === "remote-new" ? 1 : 0,
+      deleted: scenario === "local-delete"
+        ? 1
+        : 0,
+      conflicts:
+        scenario === "both-edit" || scenario === "remote-delete" ? 1 : 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.mutations.moveItemById).toHaveBeenCalledOnce();
+    if (scenario === "both-edit") {
+      expect(harness.state.pendingConflicts).toEqual([
+        expect.objectContaining({
+          type: SyncActionType.Conflict,
+          path: "Archive/a.md",
+        }),
+      ]);
+      expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
+      expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+      return;
+    }
+    if (scenario === "remote-delete") {
+      expect(harness.state.pendingRemoteDeletes).toEqual([
+        expect.objectContaining({
+          type: SyncActionType.ConfirmLocalDelete,
+          path: "Archive/a.md",
+        }),
+      ]);
+      expect(harness.fileManager.trashFile).not.toHaveBeenCalled();
+      return;
+    }
+    expect(await harness.executor.run("manual")).toMatchObject({
+      foldersMoved: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
       errors: 0,
     });
   });
@@ -8588,6 +10375,9 @@ describe("V1 to V2 controlled production activation", () => {
 
   it("recovers a lost folder move response without repeating the move", async () => {
     const harness = makeHarness();
+    const changedContent = "changed before a lost folder move response";
+    const changedBytes = new TextEncoder().encode(changedContent);
+    const changedHash = await sha256Hex(changedBytes);
     await harness.state.load();
     expect((await harness.executor.run(
       "manual",
@@ -8599,21 +10389,40 @@ describe("V1 to V2 controlled production activation", () => {
     await (harness.scanner.vault as unknown as {
       rename: (file: TFolder, target: string) => Promise<void>;
     }).rename(new TFolder("Notes"), "Archive");
+    harness.files.set("Archive/a.md", changedContent);
+    harness.localEntryState[0]!.hash = changedHash;
+    harness.localEntryState[0]!.size = changedBytes.byteLength;
+    harness.localEntryState[0]!.mtime++;
     expect(await harness.state.recordLocalFolderMoveHint("Notes", "Archive")).toBe(true);
     harness.loseFolderMoveResponseOnce();
+    harness.mutations.uploadFile.mockImplementationOnce(async () =>
+      applyRemoteUpload(
+        harness.remoteItemState,
+        "Archive/a.md",
+        changedBytes.byteLength,
+        changedHash,
+        "etag-upload-after-move-recovery",
+      ));
 
     const recovered = await harness.executor.run("manual");
 
     expect(recovered).toMatchObject({
       success: true,
       foldersMoved: 1,
+      uploaded: 1,
       errors: 0,
     });
     expect(harness.mutations.moveItemById).toHaveBeenCalledOnce();
+    expect(harness.mutations.uploadFile).toHaveBeenCalledOnce();
     expect(harness.state.mutationLedger).toHaveLength(0);
     expect(harness.state.localFolderMoveHints).toHaveLength(0);
-    expect((await harness.executor.run("manual")).foldersMoved).toBe(0);
+    expect(await harness.executor.run("manual")).toMatchObject({
+      foldersMoved: 0,
+      uploaded: 0,
+      errors: 0,
+    });
     expect(harness.mutations.moveItemById).toHaveBeenCalledOnce();
+    expect(harness.mutations.uploadFile).toHaveBeenCalledOnce();
   });
 
   it("recovers a lost local folder-move response without moving it twice", async () => {
@@ -8648,6 +10457,9 @@ describe("V1 to V2 controlled production activation", () => {
 
   it("defers a 412 folder move and retains its local identity hint for retry", async () => {
     const harness = makeHarness();
+    const changedContent = "changed before the folder move was rejected";
+    const changedBytes = new TextEncoder().encode(changedContent);
+    const changedHash = await sha256Hex(changedBytes);
     await harness.state.load();
     expect((await harness.executor.run(
       "manual",
@@ -8659,6 +10471,10 @@ describe("V1 to V2 controlled production activation", () => {
     await (harness.scanner.vault as unknown as {
       rename: (file: TFolder, target: string) => Promise<void>;
     }).rename(new TFolder("Notes"), "Archive");
+    harness.files.set("Archive/a.md", changedContent);
+    harness.localEntryState[0]!.hash = changedHash;
+    harness.localEntryState[0]!.size = changedBytes.byteLength;
+    harness.localEntryState[0]!.mtime++;
     expect(await harness.state.recordLocalFolderMoveHint("Notes", "Archive")).toBe(true);
     harness.conflictFolderMoveOnce();
 
@@ -8676,6 +10492,7 @@ describe("V1 to V2 controlled production activation", () => {
       .toBe("etag-folder-notes-advanced");
     expect(harness.state.localFolderMoveHints).toHaveLength(1);
     expect(harness.state.mutationLedger).toHaveLength(0);
+    expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
     expect(harness.mutations.moveItemById).toHaveBeenNthCalledWith(
       1,
       "folder-notes",
@@ -8683,11 +10500,20 @@ describe("V1 to V2 controlled production activation", () => {
       "Archive",
       scope.filesRootId,
     );
+    harness.mutations.uploadFile.mockImplementationOnce(async () =>
+      applyRemoteUpload(
+        harness.remoteItemState,
+        "Archive/a.md",
+        changedBytes.byteLength,
+        changedHash,
+        "etag-upload-after-folder-retry",
+      ));
 
     const retried = await harness.executor.run("manual");
     expect(retried).toMatchObject({
       success: true,
       foldersMoved: 1,
+      uploaded: 1,
       errors: 0,
     });
     expect(harness.mutations.moveItemById).toHaveBeenNthCalledWith(
@@ -9746,6 +11572,73 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.fileManager.trashFile).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    { label: "unreceipted", receipted: false },
+    { label: "receipted", receipted: true },
+  ])("keeps a $label deleteLocal unresolved when its old remote ID moved", async ({ receipted }) => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    const remote = harness.remoteItemState.find((item) => item.id === "file-a")!;
+    harness.remoteItemState.push({
+      id: "folder-archive-delete-local",
+      name: "Archive",
+      folder: { childCount: 1 },
+      parentReference: { id: scope.filesRootId },
+      eTag: "etag-archive-delete-local",
+    });
+    remote.parentReference = { id: "folder-archive-delete-local" };
+    remote.name = "moved.md";
+    harness.localEntryState.splice(0);
+    harness.files.delete(localA.path);
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: `delete-local-id-moved-${receipted}`,
+      planRevision: 1,
+      scope,
+      action: "deleteLocal",
+      path: localA.path,
+      expectedLocal: {
+        exists: true,
+        hash: localA.hash,
+        size: localA.size,
+      },
+      expectedRemote: { exists: false },
+      createdAt: 10,
+    };
+    await harness.state.beginMutationIntent(intent);
+    const receipt: MutationReceiptV1 | null = receipted
+      ? {
+          version: 1,
+          operationId: intent.operationId,
+          completedAt: 11,
+          checkpoint: {
+            baseUpserts: [],
+            baseRemovals: [intent.path],
+            remoteUpserts: [],
+            remoteDeletes: [],
+            pendingConflictRemovals: [],
+            pendingDeleteRemovals: [intent.path],
+          },
+        }
+      : null;
+    if (receipt) await harness.state.recordMutationReceipt(receipt);
+
+    await expect((harness.executor as unknown as {
+      recoverMutationLedger(currentScope: typeof scope): Promise<void>;
+    }).recoverMutationLedger(scope)).rejects.toThrow(/manual review|no longer matches/i);
+
+    expect(harness.state.mutationLedger).toEqual([{ intent, receipt }]);
+    expect(harness.fileManager.trashFile).not.toHaveBeenCalled();
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+  });
+
   it("deletes a local folder only after its remote-deleted children and a second local empty check", async () => {
     const harness = makeHarness();
     await harness.state.load();
@@ -10678,21 +12571,22 @@ describe("V1 to V2 controlled production activation", () => {
   });
 
   it("joins a remote-only community plugin through the original settings journey without a second manual sync", async () => {
-    const pluginId = "calendar";
+    const pluginId = "obsidian-pkmer";
+    const manifestId = "pkmer";
     const pluginRoot = `.obsidian/plugins/${pluginId}`;
     const mainPath = `${pluginRoot}/main.js`;
     const manifestPath = `${pluginRoot}/manifest.json`;
     const stylesPath = `${pluginRoot}/styles.css`;
     const manifestContent = JSON.stringify({
-      id: pluginId,
-      name: "Calendar",
+      id: manifestId,
+      name: "PKMer",
       version: "2.0.0",
       minAppVersion: "1.5.0",
     });
     const remoteContents = {
-      [mainPath]: "calendar-main",
+      [mainPath]: "pkmer-main",
       [manifestPath]: manifestContent,
-      [stylesPath]: "calendar-styles",
+      [stylesPath]: "pkmer-styles",
     };
     const pluginFolders = remoteFolderTree([
       ".obsidian",
@@ -10716,11 +12610,7 @@ describe("V1 to V2 controlled production activation", () => {
       }),
     );
     const harness = makeHarness({
-      localFolders: [
-        { path: "Notes" },
-        { path: ".obsidian" },
-        { path: ".obsidian/plugins" },
-      ],
+      localFolders: [{ path: "Notes" }],
       remoteItems: [
         ...remoteItems(),
         ...pluginFolders,
@@ -10728,10 +12618,29 @@ describe("V1 to V2 controlled production activation", () => {
       ],
       remoteFileContents: remoteContents,
     });
-    const enablePluginScope = await activateV2WithFolderScopeDisabled(
-      harness,
-      (path) => path === pluginRoot || path.startsWith(`${pluginRoot}/`),
+    let pluginScopeEnabled = false;
+    let selectedPluginEnabled = false;
+    vi.mocked(harness.scanner.shouldSyncPath).mockImplementation(
+      (path) => !path.startsWith(".obsidian")
+        || (selectedPluginEnabled
+          && (path === pluginRoot || path.startsWith(`${pluginRoot}/`))),
     );
+    vi.mocked(harness.scanner.shouldSyncFolderPath).mockImplementation(
+      (path) => !path.startsWith(".obsidian")
+        || (pluginScopeEnabled
+          && (path === ".obsidian" || path === ".obsidian/plugins"))
+        || (selectedPluginEnabled && path === pluginRoot),
+    );
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    harness.localFolderPaths.add(".obsidian");
+    harness.localFolderPaths.add(".obsidian/plugins");
     await harness.state.setRemoteCommunityPluginCatalog(
       await buildRemoteCommunityPluginCatalog({
         scope: harness.state.remoteScope!,
@@ -10765,13 +12674,11 @@ describe("V1 to V2 controlled production activation", () => {
         includePluginCode?: boolean;
         pluginCodeSelection?: Parameters<typeof isPluginSelected>[0];
       }) => {
-        if (
-          config.includePluginCode
-          && config.pluginCodeSelection
-          && isPluginSelected(config.pluginCodeSelection, pluginId)
-        ) {
-          enablePluginScope();
-        }
+        pluginScopeEnabled = config.includePluginCode === true;
+        selectedPluginEnabled = Boolean(
+          config.pluginCodeSelection
+          && isPluginSelected(config.pluginCodeSelection, pluginId),
+        );
       }),
     });
     const settingsPlugin = new EasySyncPlugin();
@@ -10794,14 +12701,13 @@ describe("V1 to V2 controlled production activation", () => {
       syncHotkeys: false,
       syncCorePlugins: false,
       syncBookmarks: false,
-      syncCommunityPlugins: true,
+      syncCommunityPlugins: false,
       syncPluginData: false,
       communityPluginSyncPolicy: {
         version: 1,
         files: {
-          mode: "all",
+          mode: "none",
           pluginIds: [],
-          ignoredPluginIds: [pluginId],
         },
         data: { mode: "none", pluginIds: [] },
       },
@@ -10831,6 +12737,11 @@ describe("V1 to V2 controlled production activation", () => {
       },
     });
 
+    await settingsPlugin.updateCommunityPluginFilesScope(true);
+    expect(harness.state.activeSyncScopeExpansion?.folders.map(
+      (folder) => folder.path,
+    )).toEqual([".obsidian", ".obsidian/plugins"]);
+
     (modal as unknown as {
       queuePluginSelectionUpdate(
         column: "files" | "data",
@@ -10839,6 +12750,9 @@ describe("V1 to V2 controlled production activation", () => {
       ): void;
     }).queuePluginSelectionUpdate("files", pluginId, true);
     await settingsUpdateQueue.whenIdle();
+    expect(harness.state.activeSyncScopeExpansion?.folders.map(
+      (folder) => folder.path,
+    )).toEqual([".obsidian", ".obsidian/plugins"]);
 
     expect(settingsUpdateError).toBeUndefined();
     expect(settingsPlugin.communityPluginSyncPolicy.files).toEqual({
@@ -10867,6 +12781,21 @@ describe("V1 to V2 controlled production activation", () => {
       deferred: 0,
       errors: 0,
     });
+    expect(harness.state.activeSyncScopeExpansion).toBeNull();
+    expect(
+      Object.values(
+        harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+      ).map((anchor) => anchor.lastPath),
+    ).toEqual(expect.arrayContaining([
+      ".obsidian",
+      ".obsidian/plugins",
+    ]));
+    expect(
+      Object.values(
+        harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+      ).map((anchor) => anchor.lastPath),
+    ).toContain(pluginRoot);
+    expect(harness.state.confirmedDescendantFileReconstruction).toBeNull();
     const restoredBeforeManualRun = [mainPath, manifestPath, stylesPath]
       .every((path) => harness.files.has(path));
 
@@ -10910,6 +12839,11 @@ describe("V1 to V2 controlled production activation", () => {
       deferred: 0,
       errors: 0,
     });
+    expect(
+      Object.values(
+        restartedState.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+      ).map((anchor) => anchor.lastPath),
+    ).toContain(pluginRoot);
 
     expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
     expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
@@ -10928,6 +12862,77 @@ describe("V1 to V2 controlled production activation", () => {
       restoredBeforeManualRun: true,
       enabledMissingHasActionablePhase: true,
     });
+  });
+
+  it.each([
+    {
+      label: "a required local parent is missing",
+      localFolderPaths: [".obsidian"],
+      remoteId: "current",
+    },
+    {
+      label: "the bound remote root changed",
+      localFolderPaths: [".obsidian", ".obsidian/plugins"],
+      remoteId: "replacement-root",
+      expandedFolderPaths: [".obsidian/plugins/remote-plugin"],
+    },
+    {
+      label: "the plugin root was not authorized by this scope change",
+      localFolderPaths: [".obsidian", ".obsidian/plugins"],
+      remoteId: "current",
+      expandedFolderPaths: [".obsidian"],
+    },
+  ])("keeps join ancestor identity fail-closed when $label", async ({
+    localFolderPaths,
+    remoteId,
+    expandedFolderPaths = [".obsidian/plugins/remote-plugin"],
+  }) => {
+    const pluginRoot = ".obsidian/plugins/remote-plugin";
+    const folders = remoteFolderTree([
+      ".obsidian",
+      ".obsidian/plugins",
+      pluginRoot,
+    ]);
+    const remoteRoot = folders.at(-1)!;
+    const harness = makeHarness({
+      remoteItems: [...remoteItems(), ...folders],
+    });
+    const enableScope = await activateV2WithFolderScopeDisabled(
+      harness,
+      (path) => path.startsWith(".obsidian"),
+    );
+    enableScope();
+    for (const path of localFolderPaths) harness.localFolderPaths.add(path);
+    await harness.state.commitSyncPathSettingsChange(
+      () => true,
+      () => undefined,
+      ["remote-plugin"],
+      {
+        previousSettingsFingerprint: "community-plugins:off",
+        targetSettingsFingerprint: "community-plugins:remote-plugin",
+        expandedFolderPaths,
+        requiresCompleteRemoteIdentitySnapshot: true,
+      },
+    );
+
+    const accepted = await harness.state.acceptSyncScopeExpansionFolders({
+      expectedRevision: 1,
+      scope,
+      localFiles: [],
+      localFolders: localFolderPaths.map((path) => ({ path })),
+      localFolderScanComplete: true,
+      remoteIdentityComplete: true,
+      sourceBoundCommunityPluginJoinRoots: [{
+        path: pluginRoot,
+        remoteId: remoteId === "current" ? remoteRoot.id : remoteId,
+      }],
+    });
+
+    expect(accepted).toEqual({ status: "stale", accepted: 0 });
+    expect(Object.values(
+      harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+    ).map((anchor) => anchor.lastPath)).toEqual(["Notes"]);
+    expectNoFileMutations(harness.mutations);
   });
 
   it("keeps a desktop-only empty plugin root non-participating when mobile scope is enabled from off", async () => {
@@ -11494,29 +13499,62 @@ describe("V1 to V2 controlled production activation", () => {
     expectNoFileMutations(harness.mutations);
   });
 
-  it("combines consecutive unconsumed scope expansions into one production authorization", async () => {
-    const firstExpansion = [
+  it("UJ-003 merges consecutive settings changes into one sync and stays stable after a cold reopen", async () => {
+    const allExpandedPaths = [
       ".obsidian",
+      ".obsidian/themes",
+      ".obsidian/snippets",
       ".obsidian/plugins",
       ".obsidian/plugins/easy-sync",
     ];
-    const secondExpansion = [
-      ".obsidian/themes",
-    ];
-    const allExpandedPaths = [...firstExpansion, ...secondExpansion];
+    const ownPluginPath = ".obsidian/plugins/easy-sync/main.js";
+    const remoteFolders = remoteFolderTree(allExpandedPaths);
     const harness = makeHarness({
-      remoteItems: [
-        ...remoteItems(),
-        ...remoteFolderTree(allExpandedPaths),
-      ],
+      remoteItems: [...remoteItems(), ...remoteFolders],
     });
-    const includedFolderPaths = new Set<string>();
-    vi.mocked(harness.scanner.shouldSyncPath).mockImplementation(
-      (path) => !path.startsWith(".obsidian/") || includedFolderPaths.has(path),
+    let activeConfig: Parameters<LocalScanner["setConfig"]>[0] = {
+      includePaths: [],
+      includeOwnPluginCode: false,
+      includePluginCode: false,
+      includePluginData: false,
+    };
+    let activeFolderScope = createFolderSyncScopeSnapshotV1(
+      activeConfig,
+      ".obsidian",
+      "easy-sync",
     );
+    const setConfig = vi.fn(
+      (config: Parameters<LocalScanner["setConfig"]>[0]) => {
+        activeConfig = {
+          ...activeConfig,
+          ...config,
+          includePaths: [...(config.includePaths ?? activeConfig.includePaths ?? [])],
+        };
+        activeFolderScope = createFolderSyncScopeSnapshotV1(
+          activeConfig,
+          ".obsidian",
+          "easy-sync",
+        );
+      },
+    );
+    Object.assign(harness.scanner as object, { setConfig });
     vi.mocked(harness.scanner.shouldSyncFolderPath).mockImplementation(
-      (path) => !path.startsWith(".obsidian") || includedFolderPaths.has(path),
+      (path) => !path.startsWith(".obsidian")
+        || isFolderPathInSyncScopeSnapshot(activeFolderScope, path),
     );
+    vi.mocked(harness.scanner.shouldSyncPath).mockImplementation((path) => {
+      if (!path.startsWith(".obsidian/")) return true;
+      if (
+        path === ".obsidian/plugins/easy-sync"
+        || path.startsWith(".obsidian/plugins/easy-sync/")
+      ) return activeConfig.includeOwnPluginCode === true;
+      return (activeConfig.includePaths ?? []).some((includedPath) => {
+        const normalized = includedPath.replace(/\/+$/, "");
+        return includedPath.endsWith("/")
+          ? path === normalized || path.startsWith(`${normalized}/`)
+          : path === normalized;
+      });
+    });
     await harness.state.load();
     expect((await harness.executor.run(
       "manual",
@@ -11525,106 +13563,167 @@ describe("V1 to V2 controlled production activation", () => {
       undefined,
       { activateV2State: true },
     )).success).toBe(true);
-
-    for (const path of firstExpansion) {
-      includedFolderPaths.add(path);
-      harness.localFolderPaths.add(path);
-    }
-    await harness.state.commitSyncPathSettingsChange(
-      (path) => harness.scanner.shouldSyncPath(path),
-      () => undefined,
-      undefined,
-      {
-        previousSettingsFingerprint: "all-config:off",
-        targetSettingsFingerprint: "easy-sync:on",
-        expandedFolderPaths: firstExpansion,
-        includedFolderPaths: firstExpansion,
-        folderScopeTransition: {
-          previous: createFolderSyncScopeSnapshotV1({ includePaths: [] }),
-          target: createFolderSyncScopeSnapshotV1({
-            includePaths: [".obsidian/plugins/easy-sync/"],
-            includeOwnPluginCode: true,
-          }),
-        },
-        requiresCompleteRemoteIdentitySnapshot: true,
-      },
-    );
-
-    for (const path of secondExpansion) {
-      includedFolderPaths.add(path);
-      harness.localFolderPaths.add(path);
-    }
-    await harness.state.commitSyncPathSettingsChange(
-      (path) => harness.scanner.shouldSyncPath(path),
-      () => undefined,
-      undefined,
-      {
-        previousSettingsFingerprint: "easy-sync:on",
-        targetSettingsFingerprint: "easy-sync+themes:on",
-        expandedFolderPaths: secondExpansion,
-        includedFolderPaths: allExpandedPaths,
-        folderScopeTransition: {
-          previous: createFolderSyncScopeSnapshotV1({
-            includePaths: [".obsidian/plugins/easy-sync/"],
-            includeOwnPluginCode: true,
-          }),
-          target: createFolderSyncScopeSnapshotV1({
-            includePaths: [
-              ".obsidian/plugins/easy-sync/",
-              ".obsidian/themes/",
-            ],
-            includeOwnPluginCode: true,
-          }),
-        },
-        requiresCompleteRemoteIdentitySnapshot: true,
-      },
-    );
-
-    expect(harness.state.activeSyncScopeExpansion).toMatchObject({
-      revision: 2,
-      previousSettingsFingerprint: "all-config:off",
-      targetSettingsFingerprint: "easy-sync+themes:on",
-      requiresCompleteRemoteIdentitySnapshot: true,
-    });
-    expect(isFolderPathInSyncScopeSnapshot(
-      harness.state.activeSyncScopeExpansion!.folderScopeTransition!.previous,
-      ".obsidian/plugins/easy-sync",
-    )).toBe(false);
-    expect(isFolderPathInSyncScopeSnapshot(
-      harness.state.activeSyncScopeExpansion!.folderScopeTransition!.target,
-      ".obsidian/themes",
-    )).toBe(true);
-    expect(
-      harness.state.activeSyncScopeExpansion?.folders.map((folder) => folder.path),
-    ).toEqual(expect.arrayContaining(allExpandedPaths));
-    expect(harness.state.activeSyncScopeExpansion?.folders).toHaveLength(
-      allExpandedPaths.length,
-    );
-
-    const restartedState = new StateManager(harness.plugin);
-    await restartedState.load();
-    const restartedExecutor = createRestartedExecutor(harness, restartedState);
+    for (const path of allExpandedPaths) harness.localFolderPaths.add(path);
     for (const mutation of Object.values(harness.mutations)) mutation.mockClear();
+    harness.getDelta.mockClear();
 
-    const recovered = await restartedExecutor.run("manual");
+    const settingsPlugin = new EasySyncPlugin();
+    Object.assign(settingsPlugin as object, {
+      app: {
+        ...harness.plugin.app,
+        workspace: { getLeavesOfType: vi.fn().mockReturnValue([]) },
+      },
+      manifest: harness.plugin.manifest,
+      scanner: harness.scanner,
+      state: harness.state,
+      syncExecutor: harness.executor,
+      onedrive: harness.plugin.onedrive,
+      syncPluginFiles: false,
+      syncEditorSettings: false,
+      syncAppearance: false,
+      syncThemes: false,
+      syncHotkeys: false,
+      syncCorePlugins: false,
+      syncBookmarks: false,
+      syncCommunityPlugins: false,
+      syncPluginData: false,
+      communityPluginSyncPolicy: {
+        version: 1,
+        files: { mode: "selected", pluginIds: [] },
+        data: { mode: "none", pluginIds: [] },
+      },
+      excludedFolders: [],
+    });
+    vi.spyOn(settingsPlugin as never, "ensureStateLoaded")
+      .mockResolvedValue(undefined);
+    vi.spyOn(settingsPlugin as never, "updateStatusBar")
+      .mockImplementation(() => undefined);
+    settingsPlugin.applySyncPathSettings();
 
-    expect(recovered).toMatchObject({
+    await settingsPlugin.updateSyncPathSettings({ syncEditorSettings: true });
+    await settingsPlugin.updateSyncPathSettings({ syncAppearance: true });
+    await settingsPlugin.updateSyncPathSettings({ syncThemes: true });
+    await settingsPlugin.updateSyncPathSettings({ syncHotkeys: true });
+    await settingsPlugin.updateSyncPathSettings({ syncCorePlugins: true });
+    await settingsPlugin.updateCommunityPluginFilesScope(true);
+    expect(harness.scanner.shouldSyncPath(ownPluginPath)).toBe(false);
+    await settingsPlugin.updateSyncPathSettings({ syncPluginFiles: true });
+
+    const pendingScope = harness.state.activeSyncScopeExpansion!;
+    expect(pendingScope.revision).toBeGreaterThanOrEqual(7);
+    expect(pendingScope.requiresCompleteRemoteIdentitySnapshot).toBe(true);
+    expect(pendingScope.folderScopeTransition!.previous).toMatchObject({
+      includePaths: [],
+      includeOwnPluginCode: false,
+      includePluginCode: false,
+    });
+    for (const path of allExpandedPaths) {
+      expect(isFolderPathInSyncScopeSnapshot(
+        pendingScope.folderScopeTransition!.target,
+        path,
+      )).toBe(true);
+    }
+    expect(pendingScope.folders.map((folder) => folder.path)).toEqual(
+      expect.arrayContaining(allExpandedPaths),
+    );
+    expect(harness.scanner.shouldSyncPath(ownPluginPath)).toBe(true);
+    expect(activeConfig.includePluginCode).toBe(true);
+    expect(activeConfig.includeOwnPluginCode).toBe(true);
+    expect(harness.getDelta).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+
+    const first = await (settingsPlugin as unknown as {
+      dispatchSyncRun(request: { mode: "manual" }): Promise<SyncResult | null>;
+    }).dispatchSyncRun({ mode: "manual" });
+    expect(first).toMatchObject({
       success: true,
       uploaded: 0,
       downloaded: 0,
       deleted: 0,
-      foldersCreated: 0,
-      foldersMoved: 0,
-      foldersDeleted: 0,
       errors: 0,
     });
-    expect(restartedState.activeSyncScopeExpansion).toBeNull();
+    expect(harness.state.activeSyncScopeExpansion).toBeNull();
+    expect(harness.state.pendingIssues).toEqual([]);
     expect(
       Object.values(
-        restartedState.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+        harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
       ).map((anchor) => anchor.lastPath),
     ).toEqual(expect.arrayContaining(allExpandedPaths));
     expectNoFileMutations(harness.mutations);
+
+    await harness.state.close();
+    const restartedState = new StateManager(harness.plugin);
+    await restartedState.load();
+    const restartedExecutor = createRestartedExecutor(harness, restartedState);
+    const reopenedSettings = new EasySyncPlugin();
+    Object.assign(reopenedSettings as object, {
+      app: settingsPlugin.app,
+      manifest: settingsPlugin.manifest,
+      scanner: harness.scanner,
+      state: restartedState,
+      syncExecutor: restartedExecutor,
+      onedrive: harness.plugin.onedrive,
+    });
+    vi.spyOn(reopenedSettings, "loadData").mockResolvedValue(
+      structuredClone(harness.pluginData),
+    );
+    vi.spyOn(reopenedSettings as never, "ensureStateLoaded")
+      .mockResolvedValue(undefined);
+    vi.spyOn(reopenedSettings as never, "updateStatusBar")
+      .mockImplementation(() => undefined);
+    await reopenedSettings.loadSyncSettings();
+    for (const mutation of Object.values(harness.mutations)) mutation.mockClear();
+
+    const stable = await (reopenedSettings as unknown as {
+      dispatchSyncRun(request: { mode: "manual" }): Promise<SyncResult | null>;
+    }).dispatchSyncRun({ mode: "manual" });
+    expect(stable).toMatchObject({
+      success: true,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(reopenedSettings).toMatchObject({
+      syncPluginFiles: true,
+      syncEditorSettings: true,
+      syncAppearance: true,
+      syncThemes: true,
+      syncHotkeys: true,
+      syncCorePlugins: true,
+      syncCommunityPlugins: true,
+    });
+    expect(restartedState.activeSyncScopeExpansion).toBeNull();
+    expect(restartedState.mutationLedger).toEqual([]);
+    expectNoFileMutations(harness.mutations);
+
+    await reopenedSettings.updateSyncPathSettings({ syncThemes: false });
+    expect(reopenedSettings).toMatchObject({
+      syncThemes: false,
+      syncPluginFiles: true,
+      syncCommunityPlugins: true,
+    });
+    expect(harness.scanner.shouldSyncFolderPath(".obsidian/themes")).toBe(false);
+    expect(harness.scanner.shouldSyncFolderPath(
+      ".obsidian/plugins/easy-sync",
+    )).toBe(true);
+    for (const mutation of Object.values(harness.mutations)) mutation.mockClear();
+    const contracted = await (reopenedSettings as unknown as {
+      dispatchSyncRun(request: { mode: "manual" }): Promise<SyncResult | null>;
+    }).dispatchSyncRun({ mode: "manual" });
+    expect(contracted).toMatchObject({
+      success: true,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      errors: 0,
+    });
+    expect(restartedState.activeSyncScopeExpansion).toBeNull();
+    expectNoFileMutations(harness.mutations);
+    settingsPlugin.stopAutoSync();
+    reopenedSettings.stopAutoSync();
+    await restartedState.close();
   });
 
   it("filters an unconsumed scope expansion through the final contracted scope", async () => {
@@ -11699,6 +13798,72 @@ describe("V1 to V2 controlled production activation", () => {
     expect(
       harness.state.activeSyncScopeExpansion?.folders.map((folder) => folder.path),
     ).toEqual(finalIncludedPaths);
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("does not merge a continuous settings chain when the anchored identity digest changed", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    await harness.state.commitSyncPathSettingsChange(
+      () => true,
+      () => undefined,
+      undefined,
+      {
+        previousSettingsFingerprint: "config:off",
+        targetSettingsFingerprint: "editor:on",
+        expandedFolderPaths: [],
+        folderScopeTransition: {
+          previous: createFolderSyncScopeSnapshotV1({ includePaths: [] }),
+          target: createFolderSyncScopeSnapshotV1({
+            includePaths: [".obsidian/app.json"],
+          }),
+        },
+        requiresCompleteRemoteIdentitySnapshot: true,
+      },
+    );
+    const marker = harness.state.activeSyncScopeExpansion!;
+    const saved = harness.pluginData["easy-sync-sync-scope-expansion"] as {
+      source: { commitSeq: number; anchorFingerprint: string };
+    };
+    saved.source.commitSeq -= 1;
+    saved.source.anchorFingerprint = "changed-identity-digest";
+    await harness.state.commitSyncPathSettingsChange(
+      () => true,
+      () => undefined,
+      undefined,
+      {
+        previousSettingsFingerprint: "editor:on",
+        targetSettingsFingerprint: "editor+themes:on",
+        expandedFolderPaths: [],
+        folderScopeTransition: {
+          previous: createFolderSyncScopeSnapshotV1({
+            includePaths: [".obsidian/app.json"],
+          }),
+          target: createFolderSyncScopeSnapshotV1({
+            includePaths: [
+              ".obsidian/app.json",
+              ".obsidian/themes/",
+            ],
+          }),
+        },
+        requiresCompleteRemoteIdentitySnapshot: true,
+      },
+    );
+
+    expect(harness.state.activeSyncScopeExpansion).toMatchObject({
+      revision: 2,
+      previousSettingsFingerprint: "editor:on",
+      targetSettingsFingerprint: "editor+themes:on",
+    });
+    expect(harness.state.activeSyncScopeExpansion?.createdAt)
+      .toBeGreaterThanOrEqual(marker.createdAt);
     expectNoFileMutations(harness.mutations);
   });
 
@@ -12924,6 +15089,8 @@ describe("V1 to V2 controlled production activation", () => {
     );
     expect(activated.success).toBe(true);
     expect(harness.state.isV2StateActive).toBe(true);
+    vi.mocked(harness.client.createSharedSyncProtocolV2).mockClear();
+    vi.mocked(harness.client.createSharedSyncProtocolV3).mockClear();
 
     const stable = await harness.executor.run("manual");
 
@@ -12940,6 +15107,8 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.files.has(paths.stateV2ManifestFile)).toBe(true);
     expect(harness.files.has(paths.stateV2RetiredManifestFile)).toBe(false);
     expect(harness.files.has(paths.stateV2RollbackFile)).toBe(false);
+    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
     expectNoFileMutations(harness.mutations);
 
     const restartedState = new StateManager(harness.plugin);
@@ -12948,6 +15117,1172 @@ describe("V1 to V2 controlled production activation", () => {
     expect(restartedState.baseSnapshot).toEqual(harness.state.baseSnapshot);
     expect(restartedState.remoteSnapshot).toEqual(harness.state.remoteSnapshot);
   });
+
+  it("conservatively resets independent unresolved downloads, cold-rebuilds unrelated work, then retires every record and stays zero", async () => {
+    const initialContent = "0123456789";
+    const remoteContent = "abcdefghij";
+    const changedAfterIntent = "klmnopqrst";
+    const unrelatedContent = "unrelated";
+    const initialHash = await sha256Hex(
+      new TextEncoder().encode(initialContent).buffer,
+    );
+    const remoteHash = await sha256Hex(
+      new TextEncoder().encode(remoteContent).buffer,
+    );
+    const unrelatedHash = await sha256Hex(
+      new TextEncoder().encode(unrelatedContent).buffer,
+    );
+    const changedAfterIntentHash = await sha256Hex(
+      new TextEncoder().encode(changedAfterIntent).buffer,
+    );
+    const initialLocal: LocalFileEntry = {
+      ...localA,
+      hash: initialHash,
+      size: initialContent.length,
+    };
+    const initialBase: BaseFileEntry = {
+      ...baseA,
+      hash: initialHash,
+      size: initialContent.length,
+    };
+    const secondLocal: LocalFileEntry = {
+      ...initialLocal,
+      path: "Notes/b.md",
+    };
+    const secondBase: BaseFileEntry = {
+      ...initialBase,
+      path: secondLocal.path,
+    };
+    const initialRemoteItems = remoteItems(initialHash);
+    const notesItem = initialRemoteItems.find((item) => item.id === "folder-notes")!;
+    notesItem.folder = { childCount: 2 };
+    initialRemoteItems.push({
+      id: "file-b",
+      name: "b.md",
+      size: secondLocal.size,
+      file: { hashes: { sha256Hash: initialHash } },
+      parentReference: { id: "folder-notes" },
+      lastModifiedDateTime: "2026-07-25T00:00:00.000Z",
+      eTag: "etag-a-b",
+      cTag: "ctag-a-b",
+    });
+    const harness = makeHarness({
+      base: [initialBase, secondBase],
+      local: [initialLocal, secondLocal],
+      remoteItems: initialRemoteItems,
+      initialFiles: {
+        [initialLocal.path]: initialContent,
+        [secondLocal.path]: initialContent,
+      },
+      remoteFileContents: {
+        [initialLocal.path]: remoteContent,
+        [secondLocal.path]: remoteContent,
+      },
+      createStateV2IndexedDbActiveStore: (databaseId, recovery) =>
+        new StateV2IndexedDbActiveStore(databaseId, recovery),
+    });
+    let coldState: StateManager | null = null;
+    let stableState: StateManager | null = null;
+    let finalState: StateManager | null = null;
+    let zeroState: StateManager | null = null;
+    try {
+      await harness.state.load();
+      expect((await harness.executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        { activateV2State: true },
+      )).success).toBe(true);
+      expect(harness.state.activeV2StorageAuthorityEvidence)
+        .toMatchObject({ kind: "indexeddb" });
+
+      const notesFolder: RemoteFolderEntry = {
+        path: "Notes",
+        driveId: "folder-notes",
+        parentId: scope.filesRootId,
+        name: "Notes",
+        eTag: "etag-folder-notes",
+        cTag: "ctag-folder-notes",
+      };
+      const observedRemote: RemoteFileEntry = {
+        path: initialLocal.path,
+        driveId: "file-a",
+        parentId: notesFolder.driveId,
+        size: remoteContent.length,
+        mtime: Date.parse("2026-08-16T00:00:00.000Z"),
+        eTag: "etag-b",
+        cTag: "ctag-b",
+        sha256Hash: remoteHash,
+      };
+      const observedSecondRemote: RemoteFileEntry = {
+        ...observedRemote,
+        path: secondLocal.path,
+        driveId: "file-b",
+        eTag: "etag-b-second",
+        cTag: "ctag-b-second",
+      };
+      const target = harness.remoteItemState.find(
+        (item) => item.id === observedRemote.driveId,
+      )!;
+      const secondTarget = harness.remoteItemState.find(
+        (item) => item.id === observedSecondRemote.driveId,
+      )!;
+      target.size = observedRemote.size;
+      target.eTag = observedRemote.eTag;
+      target.cTag = observedRemote.cTag;
+      target.file = { hashes: { sha256Hash: remoteHash } };
+      secondTarget.size = observedSecondRemote.size;
+      secondTarget.eTag = observedSecondRemote.eTag;
+      secondTarget.cTag = observedSecondRemote.cTag;
+      secondTarget.file = { hashes: { sha256Hash: remoteHash } };
+      await harness.state.setRemoteState(
+        [observedRemote, observedSecondRemote],
+        "https://graph.example/download-intent",
+        scope,
+        [notesFolder],
+      );
+      const retained: MutationLedgerEntryV1 = {
+        intent: {
+          version: 1,
+          operationId: "op-conservative-download",
+          planRevision: harness.state.planReviewRevision,
+          scope,
+          action: "download",
+          path: initialLocal.path,
+          expectedLocal: {
+            exists: true,
+            hash: initialHash,
+            size: initialLocal.size,
+          },
+          expectedRemote: {
+            exists: true,
+            driveId: observedRemote.driveId,
+            eTag: observedRemote.eTag,
+            size: observedRemote.size,
+            sha256Hash: remoteHash,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      };
+      const secondRetained: MutationLedgerEntryV1 = {
+        intent: {
+          ...retained.intent,
+          operationId: "op-conservative-download-second",
+          path: secondLocal.path,
+          expectedRemote: {
+            exists: true,
+            driveId: observedSecondRemote.driveId,
+            eTag: observedSecondRemote.eTag,
+            size: observedSecondRemote.size,
+            sha256Hash: remoteHash,
+          },
+        },
+        receipt: null,
+      };
+      await harness.state.beginMutationIntent(retained.intent);
+      await harness.state.beginMutationIntent(secondRetained.intent);
+      harness.files.set(initialLocal.path, changedAfterIntent);
+      harness.files.set(secondLocal.path, changedAfterIntent);
+      for (const localPath of [initialLocal.path, secondLocal.path]) {
+        Object.assign(harness.localEntryState.find(
+          (entry) => entry.path === localPath,
+        )!, {
+          hash: changedAfterIntentHash,
+          size: changedAfterIntent.length,
+          mtime: initialLocal.mtime + 1,
+        });
+      }
+
+      const archive: DriveItem = {
+        id: "folder-archive",
+        name: "Archive",
+        folder: { childCount: 1 },
+        parentReference: { id: scope.filesRootId },
+        eTag: "etag-folder-archive",
+        cTag: "ctag-folder-archive",
+      };
+      harness.remoteItemState.push(archive);
+      target.parentReference = { id: archive.id };
+      target.eTag = "etag-b-moved";
+      target.cTag = "ctag-b-moved";
+      harness.remoteItemState.push({
+        id: "replacement-at-old-path",
+        name: "a.md",
+        size: initialLocal.size,
+        file: { hashes: { sha256Hash: initialHash } },
+        parentReference: { id: notesFolder.driveId },
+        lastModifiedDateTime: "2026-08-16T00:00:00.000Z",
+        eTag: "etag-replacement",
+        cTag: "ctag-replacement",
+      });
+      harness.localEntryState.push({
+        path: "other.md",
+        size: unrelatedContent.length,
+        mtime: 2,
+        hash: unrelatedHash,
+        binary: false,
+      });
+      harness.files.set("other.md", unrelatedContent);
+
+      const observed = await harness.executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        { recoveryOnly: true },
+      );
+      expect(observed.mutationRecovery).toMatchObject({
+        state: "blocked",
+        blockReason: "facts-changed",
+        blockedOperationId: retained.intent.operationId,
+        isolated: true,
+      });
+      expect(harness.state.mutationLedger).toEqual([retained, secondRetained]);
+
+      await harness.state.resetPreservingIsolatedMutationRecovery([
+        retained,
+        secondRetained,
+      ]);
+      const capsule = harness.state.getCommittedV2Envelope()!;
+      expect(capsule.remoteIndex.itemsById).toEqual({});
+      expect(Object.values(capsule.anchors.byAnchorId)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            remoteId: observedRemote.driveId,
+            lastPath: initialLocal.path,
+            contentHash: initialHash,
+          }),
+          expect.objectContaining({
+            remoteId: observedSecondRemote.driveId,
+            lastPath: secondLocal.path,
+            contentHash: initialHash,
+          }),
+        ]),
+      );
+      expect(Object.keys(capsule.anchors.byAnchorId)).toHaveLength(2);
+      expect(capsule.folderAnchors?.byAnchorId).toEqual({});
+      expect(harness.state.mutationLedger).toEqual([retained, secondRetained]);
+      await harness.state.close();
+      for (const folderPath of [...harness.localFolderPaths]) {
+        if (folderPath.startsWith(".obsidian")) {
+          harness.localFolderPaths.delete(folderPath);
+        }
+      }
+
+      const uploadedOther: DriveItem = {
+        id: "uploaded-other",
+        name: "other.md",
+        size: unrelatedContent.length,
+        file: { hashes: { sha256Hash: unrelatedHash } },
+        parentReference: { id: scope.filesRootId },
+        lastModifiedDateTime: "2026-08-16T00:00:00.000Z",
+        eTag: "etag-uploaded-other",
+        cTag: "ctag-uploaded-other",
+      };
+      harness.mutations.uploadFile.mockImplementationOnce(async () => {
+        harness.remoteItemState.push(uploadedOther);
+        return uploadedOther;
+      });
+      vi.mocked(harness.mutations.downloadFile).mockClear();
+      coldState = new StateManager(harness.plugin);
+      await coldState.load();
+      const coldExecutor = new SyncExecutor(
+        harness.client,
+        harness.scanner,
+        coldState,
+        "testVault",
+        undefined,
+        undefined,
+        harness.diag as never,
+        harness.fileManager as never,
+      );
+      const completedPaths: Array<{ path: string; action: SyncActionType }> = [];
+      const unrelatedRun = await coldExecutor.run("manual", {
+        onFileComplete: (path, action) => {
+          completedPaths.push({ path, action });
+        },
+      });
+      expect(harness.client.createFolderByParentId).not.toHaveBeenCalled();
+      expect(completedPaths).toEqual([
+        { path: "other.md", action: SyncActionType.Upload },
+      ]);
+      expect(unrelatedRun).toMatchObject({
+        success: true,
+        uploaded: 1,
+        downloaded: 0,
+        deleted: 0,
+        foldersCreated: 0,
+        foldersMoved: 0,
+        foldersDeleted: 0,
+      });
+      expect(unrelatedRun.mutationRecovery).toMatchObject({
+        state: "blocked",
+        isolated: true,
+      });
+      expect(harness.mutations.uploadFile).toHaveBeenCalledOnce();
+      expect(harness.mutations.downloadFile).not.toHaveBeenCalled();
+      expect(coldState.mutationLedger).toEqual([retained, secondRetained]);
+      expect(coldState.baseSnapshot).toContainEqual(
+        expect.objectContaining({ path: "other.md", hash: unrelatedHash }),
+      );
+      expect(coldState.baseSnapshot).not.toContainEqual(
+        expect.objectContaining({
+          path: "Archive/a.md",
+          eTag: target.eTag,
+        }),
+      );
+      await coldState.close();
+      coldState = null;
+
+      stableState = new StateManager(harness.plugin);
+      await stableState.load();
+      const stableExecutor = new SyncExecutor(
+        harness.client,
+        harness.scanner,
+        stableState,
+        "testVault",
+        undefined,
+        undefined,
+        harness.diag as never,
+        harness.fileManager as never,
+      );
+      vi.mocked(harness.mutations.uploadFile).mockClear();
+      const isolatedZero = await stableExecutor.run("manual");
+      expect(isolatedZero).toMatchObject({
+        success: true,
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+        conflicts: 0,
+        errors: 0,
+      });
+      expect(stableState.mutationLedger).toEqual([retained, secondRetained]);
+
+      const replacementIndex = harness.remoteItemState.findIndex(
+        (item) => item.id === "replacement-at-old-path",
+      );
+      harness.remoteItemState.splice(replacementIndex, 1);
+      const archiveIndex = harness.remoteItemState.findIndex(
+        (item) => item.id === archive.id,
+      );
+      harness.remoteItemState.splice(archiveIndex, 1);
+      target.name = "a.md";
+      target.parentReference = { id: notesFolder.driveId };
+      target.eTag = observedRemote.eTag;
+      target.cTag = observedRemote.cTag;
+      harness.files.set(initialLocal.path, initialContent);
+      harness.files.set(secondLocal.path, initialContent);
+      for (const localPath of [initialLocal.path, secondLocal.path]) {
+        Object.assign(harness.localEntryState.find(
+          (entry) => entry.path === localPath,
+        )!, {
+          hash: initialHash,
+          size: initialLocal.size,
+          mtime: initialLocal.mtime + 2,
+        });
+      }
+      vi.mocked(harness.mutations.downloadFile).mockClear();
+
+      const retired = await stableExecutor.run("manual");
+      expect(retired).toMatchObject({
+        success: true,
+        uploaded: 0,
+        downloaded: 1,
+        errors: 0,
+      });
+      expect(stableState.mutationLedger).toEqual([]);
+      expect(stableState.baseSnapshot).toContainEqual(
+        expect.objectContaining({
+          path: initialLocal.path,
+          hash: remoteHash,
+          eTag: observedRemote.eTag,
+        }),
+      );
+      expect(stableState.baseSnapshot).toContainEqual(
+        expect.objectContaining({
+          path: secondLocal.path,
+          hash: initialHash,
+          eTag: "etag-a-b",
+        }),
+      );
+      await stableState.close();
+      stableState = null;
+
+      finalState = new StateManager(harness.plugin);
+      await finalState.load();
+      const finalExecutor = new SyncExecutor(
+        harness.client,
+        harness.scanner,
+        finalState,
+        "testVault",
+        undefined,
+        undefined,
+        harness.diag as never,
+        harness.fileManager as never,
+      );
+      vi.mocked(harness.mutations.downloadFile).mockClear();
+      const secondRetirementRun = await finalExecutor.run("manual");
+      expect(secondRetirementRun).toMatchObject({
+        success: true,
+        uploaded: 0,
+        downloaded: 1,
+        deleted: 0,
+        conflicts: 0,
+        errors: 0,
+      });
+      expect(finalState.mutationLedger).toEqual([]);
+      expect(finalState.baseSnapshot).toContainEqual(
+        expect.objectContaining({
+          path: secondLocal.path,
+          hash: remoteHash,
+          eTag: observedSecondRemote.eTag,
+        }),
+      );
+      await finalState.close();
+      finalState = null;
+
+      zeroState = new StateManager(harness.plugin);
+      await zeroState.load();
+      const zeroExecutor = new SyncExecutor(
+        harness.client,
+        harness.scanner,
+        zeroState,
+        "testVault",
+        undefined,
+        undefined,
+        harness.diag as never,
+        harness.fileManager as never,
+      );
+      vi.mocked(harness.mutations.downloadFile).mockClear();
+      const finalZero = await zeroExecutor.run("manual");
+      expect(finalZero).toMatchObject({
+        success: true,
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+        conflicts: 0,
+        errors: 0,
+      });
+      expect(zeroState.mutationLedger).toEqual([]);
+      expect(harness.mutations.downloadFile).not.toHaveBeenCalled();
+    } finally {
+      await zeroState?.close();
+      await finalState?.close();
+      await stableState?.close();
+      await coldState?.close();
+      await harness.state.close();
+    }
+  });
+
+  it("upgrades an active public V2-only authority to V3 on an ordinary round", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    const activated = await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    );
+    expect(activated.success).toBe(true);
+    const predecessor = await harness.client.readSharedSyncProtocolV2(
+      "testVault",
+    );
+    expect(predecessor).not.toBeNull();
+    const publicV2 = JSON.parse(predecessor!.content);
+    const witness = JSON.parse(
+      harness.files.get(paths.stateV2AuthorityWitnessFile)!,
+    );
+    witness.protocolBinding = {
+      schemaVersion: 1,
+      protocolVersion: 2,
+      migrationGeneration: publicV2.migrationGeneration,
+      confirmedAllDevicesUpdatedAt:
+        publicV2.confirmedAllDevicesUpdatedAt,
+      recordId: predecessor!.id,
+      recordETag: predecessor!.eTag,
+    };
+    harness.files.set(
+      paths.stateV2AuthorityWitnessFile,
+      JSON.stringify(witness),
+    );
+    harness.clearSharedProtocolV3();
+    vi.mocked(harness.client.createSharedSyncProtocolV2).mockClear();
+    vi.mocked(harness.client.createSharedSyncProtocolV3).mockClear();
+    const restartedState = new StateManager(harness.plugin);
+    await restartedState.load();
+    const restartedExecutor = new SyncExecutor(
+      harness.client,
+      harness.scanner,
+      restartedState,
+      "testVault",
+    );
+
+    const upgraded = await restartedExecutor.run("manual");
+
+    expect(upgraded).toMatchObject({ success: true, errors: 0 });
+    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).toHaveBeenCalledOnce();
+    expect(await harness.client.readSharedSyncProtocolV2("testVault"))
+      .toEqual(predecessor);
+    expect(await restartedState.getActiveV2ProtocolBinding()).toMatchObject({
+      protocolVersion: 3,
+      migrationGeneration: publicV2.migrationGeneration,
+    });
+    expectNoFileMutations(harness.mutations);
+
+    const committedWitness = JSON.parse(
+      harness.files.get(paths.stateV2AuthorityWitnessFile)!,
+    );
+    committedWitness.revision += 1;
+    committedWitness.updatedAt += 1;
+    committedWitness.protocolBinding = witness.protocolBinding;
+    harness.files.set(
+      paths.stateV2AuthorityWitnessFile,
+      JSON.stringify(committedWitness),
+    );
+    vi.mocked(harness.client.createSharedSyncProtocolV3).mockClear();
+    const resumedState = new StateManager(harness.plugin);
+    await resumedState.load();
+    const resumed = await new SyncExecutor(
+      harness.client,
+      harness.scanner,
+      resumedState,
+      "testVault",
+    ).run("manual");
+    expect(resumed).toMatchObject({ success: true, errors: 0 });
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expect(await resumedState.getActiveV2ProtocolBinding()).toMatchObject({
+      protocolVersion: 3,
+      migrationGeneration: publicV2.migrationGeneration,
+    });
+  });
+
+  it("keeps an active authority unchanged when the V3 object identity no longer matches", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    const witnessBefore = harness.files.get(paths.stateV2AuthorityWitnessFile);
+    const v3Content = harness.getSharedProtocolV3()!.content;
+    harness.seedSharedProtocolV3(v3Content);
+    vi.mocked(harness.client.createSharedSyncProtocolV2).mockClear();
+    vi.mocked(harness.client.createSharedSyncProtocolV3).mockClear();
+
+    const blocked = await harness.executor.run("manual");
+
+    expect(blocked).toMatchObject({
+      success: false,
+      errors: 1,
+      message: "result.v2ProtocolBlocked",
+    });
+    expect(harness.files.get(paths.stateV2AuthorityWitnessFile))
+      .toBe(witnessBefore);
+    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expect(blocked.disposition).toBeUndefined();
+    expect(harness.diag.error).toHaveBeenCalledWith(
+      "state",
+      "shared-sync-protocol-profile-inconsistent",
+      expect.objectContaining({
+        reason: "binding-mismatch",
+        predecessor: "match",
+      }),
+    );
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("stops before a new plan on a transient profile timeout and succeeds from a fresh next-round observation", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    const profile = {
+      v2: await harness.client.readSharedSyncProtocolV2("testVault"),
+      v3: harness.getSharedProtocolV3(),
+    };
+    expect(profile.v2).not.toBeNull();
+    expect(profile.v3).not.toBeNull();
+
+    const readProfile = vi.mocked(
+      harness.client.readSharedSyncProtocolObjects,
+    );
+    readProfile.mockReset()
+      .mockRejectedValueOnce(new SyntheticRequestTimeoutError(15_000))
+      .mockResolvedValue(profile);
+    vi.mocked(harness.client.readSharedSyncProtocolV2).mockClear();
+    vi.mocked(harness.client.readSharedSyncProtocolV3).mockClear();
+    harness.getDelta.mockClear();
+    expectNoFileMutations(harness.mutations);
+
+    const unavailable = await harness.executor.run("auto");
+
+    expect(unavailable).toMatchObject({
+      success: false,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      errors: 1,
+      message: "result.sharedControlReadUnavailable",
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "not-entered",
+      },
+      disposition: {
+        kind: "retryable-observation",
+        phase: "remotePrepare",
+        code: "shared-control-read-unavailable",
+        retry: "next-sync",
+        component: "directory",
+      },
+    });
+    expect(readProfile).toHaveBeenCalledOnce();
+    expect(harness.client.readSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.readSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expect(harness.getDelta).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+
+    const recovered = await harness.executor.run("auto");
+
+    expect(recovered).toMatchObject({
+      success: true,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      errors: 0,
+    });
+    expect(recovered.disposition).toBeUndefined();
+    expect(readProfile).toHaveBeenCalledTimes(2);
+    expect(harness.client.readSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.readSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("does not reinterpret a transient profile timeout as a cached-scope failure or observe twice in one round", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    await harness.state.setRemoteState(
+      harness.state.remoteSnapshot,
+      "https://graph.example/cached-delta",
+      scope,
+      harness.state.remoteFolders,
+    );
+    expect(harness.state.remoteDeltaLink).toBeTruthy();
+    const profile = {
+      v2: await harness.client.readSharedSyncProtocolV2("testVault"),
+      v3: harness.getSharedProtocolV3(),
+    };
+    expect(profile.v2).not.toBeNull();
+    expect(profile.v3).not.toBeNull();
+
+    vi.mocked(harness.client.restoreVaultScope).mockReturnValue(true);
+    const restoreByIdentity = vi.fn().mockResolvedValue({
+      driveId: scope.driveId,
+      vaultFolderId: scope.vaultFolderId,
+      filesRootId: scope.filesRootId,
+    });
+    (harness.client as typeof harness.client & {
+      restoreVaultScopeByIdentity: typeof restoreByIdentity;
+    }).restoreVaultScopeByIdentity = restoreByIdentity;
+    const readProfile = vi.mocked(
+      harness.client.readSharedSyncProtocolObjects,
+    );
+    readProfile.mockReset()
+      .mockRejectedValueOnce(new SyntheticRequestTimeoutError(15_000))
+      .mockResolvedValue(profile);
+    harness.getDelta.mockClear();
+
+    const unavailable = await harness.executor.run("auto");
+
+    expect(unavailable).toMatchObject({
+      success: false,
+      errors: 1,
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "not-entered",
+      },
+      disposition: {
+        kind: "retryable-observation",
+        code: "shared-control-read-unavailable",
+      },
+    });
+    expect(readProfile).toHaveBeenCalledOnce();
+    expect(restoreByIdentity).not.toHaveBeenCalled();
+    expect(harness.getDelta).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+
+    expect((await harness.executor.run("auto"))).toMatchObject({
+      success: true,
+      errors: 0,
+    });
+    expect(readProfile).toHaveBeenCalledTimes(2);
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("does not reinterpret an invalid control-directory observation as a cached-scope failure", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    await harness.state.setRemoteState(
+      harness.state.remoteSnapshot,
+      "https://graph.example/cached-delta",
+      scope,
+      harness.state.remoteFolders,
+    );
+    vi.mocked(harness.client.restoreVaultScope).mockReturnValue(true);
+    const restoreByIdentity = vi.fn().mockResolvedValue({
+      driveId: scope.driveId,
+      vaultFolderId: scope.vaultFolderId,
+      filesRootId: scope.filesRootId,
+    });
+    (harness.client as typeof harness.client & {
+      restoreVaultScopeByIdentity: typeof restoreByIdentity;
+    }).restoreVaultScopeByIdentity = restoreByIdentity;
+    const readProfile = vi.mocked(
+      harness.client.readSharedSyncProtocolObjects,
+    );
+    readProfile.mockReset().mockRejectedValueOnce(
+      new SharedSyncProtocolObservationError(
+        "directory",
+        new Error("protocol slot metadata is incomplete"),
+      ),
+    );
+    harness.getDelta.mockClear();
+
+    const blocked = await harness.executor.run("auto");
+
+    expect(blocked).toMatchObject({
+      success: false,
+      errors: 1,
+      message: "result.v2ProtocolBlocked",
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "not-entered",
+      },
+    });
+    expect(blocked.disposition).toBeUndefined();
+    expect(readProfile).toHaveBeenCalledOnce();
+    expect(restoreByIdentity).not.toHaveBeenCalled();
+    expect(harness.getDelta).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("preserves OneDrive authentication expiry from the composite profile observation", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    vi.mocked(harness.client.readSharedSyncProtocolObjects)
+      .mockRejectedValueOnce(new OneDriveError(
+        OneDriveErrorType.AuthExpired,
+        "access token expired",
+        401,
+      ));
+    harness.getDelta.mockClear();
+
+    const expired = await harness.executor.run("auto");
+
+    expect(expired).toMatchObject({
+      success: false,
+      authExpired: true,
+      errors: 0,
+      message: "result.authExpired",
+      runFacts: {
+        ordinaryPlanning: "not-entered",
+      },
+    });
+    expect(expired.disposition).toBeUndefined();
+    expect(harness.getDelta).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("settles an existing ledger record before a transient profile failure without replaying it next round", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    const profile = {
+      v2: await harness.client.readSharedSyncProtocolV2("testVault"),
+      v3: harness.getSharedProtocolV3(),
+    };
+    expect(profile.v2).not.toBeNull();
+    expect(profile.v3).not.toBeNull();
+
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "settle-before-profile-timeout",
+      planRevision: 1,
+      scope,
+      action: "upload",
+      path: "Notes/not-applied-before-profile.md",
+      expectedLocal: { exists: true, hash: hashB, size: 10 },
+      expectedRemote: { exists: false },
+      createdAt: 10,
+    };
+    await harness.state.beginMutationIntent(intent);
+    const abandonMutationIntent = vi.spyOn(
+      harness.state,
+      "abandonMutationIntent",
+    );
+    const readProfile = vi.mocked(
+      harness.client.readSharedSyncProtocolObjects,
+    );
+    readProfile.mockReset()
+      .mockImplementationOnce(async () => {
+        expect(harness.state.mutationLedger).toEqual([]);
+        throw new SyntheticRequestTimeoutError(15_000);
+      })
+      .mockResolvedValue(profile);
+    vi.mocked(harness.client.readSharedSyncProtocolV2).mockClear();
+    vi.mocked(harness.client.readSharedSyncProtocolV3).mockClear();
+    harness.getDelta.mockClear();
+    expectNoFileMutations(harness.mutations);
+
+    const unavailable = await harness.executor.run("auto");
+
+    expect(unavailable).toMatchObject({
+      success: false,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      errors: 1,
+      message: "result.sharedControlReadUnavailable",
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "not-entered",
+      },
+      disposition: {
+        kind: "retryable-observation",
+        phase: "remotePrepare",
+        code: "shared-control-read-unavailable",
+        retry: "next-sync",
+        component: "directory",
+      },
+    });
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(abandonMutationIntent).toHaveBeenCalledOnce();
+    expect(abandonMutationIntent).toHaveBeenCalledWith(intent.operationId);
+    expect(readProfile).toHaveBeenCalledOnce();
+    expect(harness.client.readSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.readSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+
+    const recovered = await harness.executor.run("auto");
+
+    expect(recovered).toMatchObject({
+      success: true,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      errors: 0,
+    });
+    expect(recovered.disposition).toBeUndefined();
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(abandonMutationIntent).toHaveBeenCalledOnce();
+    expect(readProfile).toHaveBeenCalledTimes(2);
+    expect(harness.client.readSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.readSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it.each([
+    [
+      "synthetic timeout",
+      () => new SyntheticRequestTimeoutError(15_000),
+    ],
+    [
+      "native status-0 transport failure",
+      () => new OneDriveError(
+        OneDriveErrorType.NetworkError,
+        "requestUrl failed without an HTTP response",
+      ),
+    ],
+  ] as const)(
+    "keeps cancellation authoritative when an uncancellable profile request reports a late %s",
+    async (_label, lateError) => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    const profile = {
+      v2: await harness.client.readSharedSyncProtocolV2("testVault"),
+      v3: harness.getSharedProtocolV3(),
+    };
+    expect(profile.v2).not.toBeNull();
+    expect(profile.v3).not.toBeNull();
+
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let rejectLate!: (reason?: unknown) => void;
+    const pending = new Promise<never>((_resolve, reject) => {
+      rejectLate = reject;
+    });
+    const readProfile = vi.mocked(
+      harness.client.readSharedSyncProtocolObjects,
+    );
+    readProfile.mockReset()
+      .mockImplementationOnce(() => {
+        markStarted();
+        return pending;
+      })
+      .mockResolvedValue(profile);
+    const finishRetryableObservation = vi.spyOn(
+      harness.executor as unknown as {
+        finishRetryableSharedControlObservation: (...args: unknown[]) => SyncResult;
+      },
+      "finishRetryableSharedControlObservation",
+    );
+    vi.mocked(harness.client.readSharedSyncProtocolV2).mockClear();
+    vi.mocked(harness.client.readSharedSyncProtocolV3).mockClear();
+    harness.getDelta.mockClear();
+    expectNoFileMutations(harness.mutations);
+
+    const pendingRun = harness.executor.run("auto");
+    await started;
+    harness.executor.cancel();
+    rejectLate(lateError());
+    const cancelled = await pendingRun;
+
+    expect(cancelled).toMatchObject({
+      success: false,
+      errors: 0,
+      message: "result.cancelled",
+      runFacts: {
+        termination: "cancelled",
+        ordinaryPlanning: "not-entered",
+      },
+    });
+    expect(cancelled.disposition).toBeUndefined();
+    expect(finishRetryableObservation).not.toHaveBeenCalled();
+    expect(readProfile).toHaveBeenCalledOnce();
+    expect(harness.getDelta).not.toHaveBeenCalled();
+    expect(harness.client.readSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.readSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+
+    const recovered = await harness.executor.run("auto");
+
+    expect(recovered).toMatchObject({
+      success: true,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      errors: 0,
+      runFacts: {
+        termination: "normal",
+      },
+    });
+    expect(recovered.disposition).toBeUndefined();
+    expect(readProfile).toHaveBeenCalledTimes(2);
+    expect(harness.client.readSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.readSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+    },
+  );
+
+  it.each(["v2", "v3"] as const)(
+    "keeps a partial %s body observation typed and out of planning",
+    async (component) => {
+      const harness = makeHarness();
+      await harness.state.load();
+      expect((await harness.executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        { activateV2State: true },
+      )).success).toBe(true);
+      vi.mocked(harness.client.readSharedSyncProtocolObjects)
+        .mockRejectedValueOnce(new SharedSyncProtocolObservationError(
+          component,
+          new OneDriveError(
+            OneDriveErrorType.NetworkError,
+            `${component} body unavailable`,
+          ),
+        ));
+      harness.getDelta.mockClear();
+
+      const unavailable = await harness.executor.run("auto");
+
+      expect(unavailable).toMatchObject({
+        success: false,
+        errors: 1,
+        disposition: {
+          kind: "retryable-observation",
+          code: "shared-control-read-unavailable",
+          component,
+        },
+      });
+      expect(harness.getDelta).not.toHaveBeenCalled();
+      expectNoFileMutations(harness.mutations);
+      await harness.state.close();
+    },
+  );
+
+  it.each(["v2", "v3"] as const)(
+    "retries a stale %s body snapshot on the next full observation",
+    async (component) => {
+      const harness = makeHarness();
+      await harness.state.load();
+      expect((await harness.executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        { activateV2State: true },
+      )).success).toBe(true);
+      const profile = {
+        v2: await harness.client.readSharedSyncProtocolV2("testVault"),
+        v3: harness.getSharedProtocolV3(),
+      };
+      const readProfile = vi.mocked(
+        harness.client.readSharedSyncProtocolObjects,
+      );
+      readProfile.mockReset()
+        .mockRejectedValueOnce(new SharedSyncProtocolObservationError(
+          component,
+          new OneDriveError(
+            OneDriveErrorType.NotFound,
+            `${component} snapshot body no longer exists`,
+            404,
+          ),
+        ))
+        .mockResolvedValue(profile);
+      harness.getDelta.mockClear();
+
+      const stale = await harness.executor.run("auto");
+
+      expect(stale).toMatchObject({
+        success: false,
+        errors: 1,
+        runFacts: {
+          ordinaryPlanning: "not-entered",
+        },
+        disposition: {
+          kind: "retryable-observation",
+          code: "shared-control-read-unavailable",
+          component,
+        },
+      });
+      expect(readProfile).toHaveBeenCalledOnce();
+      expect(harness.getDelta).not.toHaveBeenCalled();
+      expectNoFileMutations(harness.mutations);
+
+      expect((await harness.executor.run("auto"))).toMatchObject({
+        success: true,
+        errors: 0,
+      });
+      expect(readProfile).toHaveBeenCalledTimes(2);
+      expectNoFileMutations(harness.mutations);
+    },
+  );
+
+  it.each([
+    [
+      "synthetic timeout",
+      () => new SyntheticRequestTimeoutError(15_000),
+    ],
+    [
+      "native status-0 transport failure",
+      () => new OneDriveError(
+        OneDriveErrorType.NetworkError,
+        "requestUrl failed without an HTTP response",
+      ),
+    ],
+  ] as const)(
+    "keeps cancellation authoritative when a protocol create readback reports a late %s",
+    async (_label, lateError) => {
+      const harness = makeHarness();
+      await harness.state.load();
+      let markStarted!: () => void;
+      const started = new Promise<void>((resolve) => {
+        markStarted = resolve;
+      });
+      let rejectLate!: (reason?: unknown) => void;
+      const pending = new Promise<never>((_resolve, reject) => {
+        rejectLate = reject;
+      });
+      vi.mocked(harness.client.readSharedSyncProtocolV2ById)
+        .mockImplementationOnce(() => {
+          markStarted();
+          return pending;
+        });
+
+      const pendingRun = harness.executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        { activateV2State: true },
+      );
+      await started;
+      harness.getDelta.mockClear();
+      harness.executor.cancel();
+      rejectLate(lateError());
+      const cancelled = await pendingRun;
+
+      expect(cancelled).toMatchObject({
+        success: false,
+        errors: 0,
+        message: "result.cancelled",
+        runFacts: {
+          termination: "cancelled",
+          ordinaryPlanning: "entered",
+        },
+      });
+      expect(cancelled.disposition).toBeUndefined();
+      expect(harness.state.isV2StateActive).toBe(false);
+      expect(harness.getDelta).not.toHaveBeenCalled();
+      expectNoFileMutations(harness.mutations);
+    },
+  );
 
   it("never re-enters the legacy cloud baseline after V2 becomes authoritative", async () => {
     const harness = makeHarness({
@@ -12995,6 +16330,9 @@ describe("V1 to V2 controlled production activation", () => {
     );
     expect(activated.success).toBe(true);
     expect(harness.state.isV2StateActive).toBe(true);
+    expect((await harness.executor.run("manual")).success).toBe(true);
+    expect(harness.state.remoteDeltaLink).toBeTruthy();
+    vi.mocked(harness.client.restoreVaultScope).mockReturnValue(true);
     const originalProtocolBinding = JSON.parse(
       harness.files.get(paths.stateV2AuthorityWitnessFile)!,
     ).protocolBinding;
@@ -13010,6 +16348,13 @@ describe("V1 to V2 controlled production activation", () => {
       new RemoteVaultScopeIdentityError("files-root-invalid"),
     );
     vi.mocked(harness.client.initVaultScope).mockResolvedValue(replacementScope);
+    vi.mocked(harness.client.readSharedSyncProtocolObjects).mockRejectedValueOnce(
+      new OneDriveError(
+        OneDriveErrorType.NotFound,
+        "protocol path no longer exists",
+        404,
+      ),
+    );
     harness.getDelta.mockClear();
 
     const paused = await harness.executor.run("auto");
@@ -13035,6 +16380,14 @@ describe("V1 to V2 controlled production activation", () => {
         ...replacementScope,
       },
     });
+    expect(harness.client.restoreVaultScopeByIdentity).toHaveBeenCalledWith(
+      "testVault",
+      {
+        driveId: scope.driveId,
+        vaultFolderId: scope.vaultFolderId,
+        filesRootId: scope.filesRootId,
+      },
+    );
     expect(harness.files.has(paths.stateV2ManifestFile)).toBe(true);
     expect(harness.files.has(paths.stateV2RetiredManifestFile)).toBe(false);
     expect(harness.files.has(paths.stateV2RollbackFile)).toBe(false);
@@ -13134,6 +16487,151 @@ describe("V1 to V2 controlled production activation", () => {
       },
     });
     expectNoFileMutations(harness.mutations);
+  });
+
+  it("publishes a complete recovered lineage that a zero-state device joins", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    const generationA = JSON.parse(
+      harness.files.get(paths.stateV2AuthorityWitnessFile)!,
+    ).protocolBinding.migrationGeneration;
+    const replacementScope = {
+      driveId: "drive-live",
+      vaultFolderId: "vault-live",
+      filesRootId: "root-live",
+    };
+    const restoreReplacement = vi.fn()
+      .mockRejectedValueOnce(
+        new RemoteVaultScopeIdentityError("files-root-invalid"),
+      )
+      .mockResolvedValue(replacementScope);
+    (harness.client as unknown as {
+      restoreVaultScopeByIdentity: typeof restoreReplacement;
+    }).restoreVaultScopeByIdentity = restoreReplacement;
+    vi.mocked(harness.client.initVaultScope).mockResolvedValue(replacementScope);
+    expect((await harness.executor.run("auto")).message)
+      .toBe("result.v2ScopeRecoveryPending");
+    harness.clearSharedProtocolForRecoveredScope();
+    harness.getDelta.mockReset();
+    harness.getDelta
+      .mockResolvedValueOnce({
+        value: [],
+        "@odata.deltaLink": "https://graph.example/recovery-snapshot",
+      })
+      .mockResolvedValueOnce({
+        value: [],
+        "@odata.deltaLink": "https://graph.example/recovery-stable",
+      });
+    vi.mocked(harness.scanner.scanAll).mockResolvedValueOnce({
+      entries: [],
+      folders: [],
+      folderScanComplete: true,
+      folderScanFailures: [],
+      skippedLarge: [],
+      failedPaths: [],
+      skippedCount: 0,
+      complete: true,
+    });
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { recoverV2RemoteScope: true },
+    )).success).toBe(true);
+    const recoveredV2 = await harness.client.readSharedSyncProtocolV2(
+      "testVault",
+    );
+    expect(recoveredV2).not.toBeNull();
+    expect(JSON.parse(recoveredV2!.content))
+      .toMatchObject({ migrationGeneration: generationA });
+    expect(JSON.parse(harness.getSharedProtocolV3()!.content))
+      .toMatchObject({ migrationGeneration: generationA });
+
+    const recoveredV3Content = harness.getSharedProtocolV3()!.content;
+    const coldHarness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    coldHarness.seedSharedProtocolContent(recoveredV2!.content);
+    coldHarness.seedSharedProtocolV3(recoveredV3Content);
+    vi.mocked(coldHarness.client.initVaultScope)
+      .mockResolvedValue(replacementScope);
+    await coldHarness.state.load();
+
+    const previewCallback = vi.fn().mockResolvedValue(false);
+    const preview = await coldHarness.executor.run(
+      "manual",
+      { onConfirmThreshold: previewCallback },
+    );
+    expect(preview.message).toBe("result.pausedForReview");
+    expect(previewCallback.mock.calls[0]?.[0]).toMatchObject({
+      reviewKind: "v2-cloud-join",
+      items: [],
+    });
+    const joined = await coldHarness.executor.run(
+      "manual",
+      {},
+      true,
+      coldHarness.state.planReviewAuthorization!,
+    );
+    expect(joined.success).toBe(true);
+    expect(coldHarness.state.remoteScope).toEqual({
+      accountId: scope.accountId,
+      ...replacementScope,
+    });
+    expect(JSON.parse(
+      coldHarness.files.get(paths.stateV2AuthorityWitnessFile)!,
+    )).toMatchObject({
+      protocolBinding: { migrationGeneration: generationA },
+    });
+    expect(coldHarness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(coldHarness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expect(JSON.parse(coldHarness.getSharedProtocolV3()!.content))
+      .toMatchObject({ migrationGeneration: generationA });
+    expectNoFileMutations(coldHarness.mutations);
+
+    vi.mocked(coldHarness.client.createSharedSyncProtocolV2).mockClear();
+    vi.mocked(coldHarness.client.createSharedSyncProtocolV3).mockClear();
+    await coldHarness.state.close();
+    const reopenedState = new StateManager(coldHarness.plugin);
+    await reopenedState.load();
+    const reopenedExecutor = new SyncExecutor(
+      coldHarness.client,
+      coldHarness.scanner,
+      reopenedState,
+      "testVault",
+    );
+    for (let round = 0; round < 2; round += 1) {
+      expect(await reopenedExecutor.run("manual")).toMatchObject({
+        success: true,
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+        conflicts: 0,
+        errors: 0,
+      });
+    }
+    expect(await reopenedState.getActiveV2ProtocolBinding()).toMatchObject({
+      migrationGeneration: generationA,
+    });
+    expect(coldHarness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(coldHarness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expectNoFileMutations(coldHarness.mutations);
+    await reopenedState.close();
   });
 
   it("recovers a changed scope while preserving the existing old-scope V2 protocol", async () => {
@@ -13304,6 +16802,100 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.getDelta).not.toHaveBeenCalled();
     expect(harness.mutations.downloadFile).not.toHaveBeenCalled();
     expect(harness.state.hasV2RemoteScopeRecovery).toBe(true);
+  });
+
+  it("retains remote-scope recovery when protocol preflight is temporarily unavailable", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    const replacementScope = {
+      driveId: "drive-live",
+      vaultFolderId: "vault-live",
+      filesRootId: "root-live",
+    };
+    const restoreReplacement = vi.fn()
+      .mockRejectedValueOnce(
+        new RemoteVaultScopeIdentityError("files-root-invalid"),
+      )
+      .mockResolvedValue(replacementScope);
+    (harness.client as unknown as {
+      restoreVaultScopeByIdentity: typeof restoreReplacement;
+    }).restoreVaultScopeByIdentity = restoreReplacement;
+    vi.mocked(harness.client.initVaultScope).mockResolvedValue(replacementScope);
+    expect((await harness.executor.run("auto")).message)
+      .toBe("result.v2ScopeRecoveryPending");
+
+    const readProfile = vi.mocked(
+      harness.client.readSharedSyncProtocolObjects,
+    );
+    const defaultReadProfile = readProfile.getMockImplementation()!;
+    readProfile.mockReset()
+      .mockRejectedValueOnce(new SyntheticRequestTimeoutError(15_000));
+    vi.mocked(harness.scanner.scanAll).mockClear();
+    harness.getDelta.mockClear();
+
+    const unavailable = await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { recoverV2RemoteScope: true },
+    );
+
+    expect(unavailable).toMatchObject({
+      success: false,
+      errors: 1,
+      message: "result.sharedControlReadUnavailable",
+      remoteScopeRecovery: {
+        protocolPreflight: "blocked",
+        failureStage: "protocol-preflight",
+      },
+    });
+    expect(unavailable.disposition).toBeUndefined();
+    expect(harness.state.hasV2RemoteScopeRecovery).toBe(true);
+    expect(harness.scanner.scanAll).not.toHaveBeenCalled();
+    expect(harness.getDelta).not.toHaveBeenCalled();
+    expect(readProfile).toHaveBeenCalledOnce();
+    expectNoFileMutations(harness.mutations);
+
+    harness.clearSharedProtocolForRecoveredScope();
+    readProfile.mockImplementation(defaultReadProfile);
+    vi.mocked(harness.scanner.scanAll).mockResolvedValueOnce({
+      entries: [],
+      folders: [],
+      folderScanComplete: true,
+      folderScanFailures: [],
+      skippedLarge: [],
+      failedPaths: [],
+      skippedCount: 0,
+      complete: true,
+    });
+    harness.getDelta.mockReset();
+    harness.getDelta
+      .mockResolvedValueOnce({
+        value: [],
+        "@odata.deltaLink": "https://graph.example/recovery-snapshot",
+      })
+      .mockResolvedValueOnce({
+        value: [],
+        "@odata.deltaLink": "https://graph.example/recovery-stable",
+      });
+    const recovered = await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { recoverV2RemoteScope: true },
+    );
+    expect(recovered).toMatchObject({ success: true, errors: 0 });
+    expect(harness.state.hasV2RemoteScopeRecovery).toBe(false);
+    expect(readProfile.mock.calls.length).toBeGreaterThan(1);
   });
 
   it("resumes after receipt persistence and body failures without redownloading valid receipts", async () => {

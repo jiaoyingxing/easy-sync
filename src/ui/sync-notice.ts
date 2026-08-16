@@ -24,7 +24,6 @@ export type SyncNoticeOutcomeKind =
   | "conflicts"
   | "remoteDeletes"
   | "mixedPending"
-  | "communityPluginEnablement"
   | "review"
   | "cancelled"
   | "failed"
@@ -155,15 +154,6 @@ export function resolveSyncNoticeOutcome(
   completedFiles: readonly Pick<FileProgress, "actionType">[] = [],
 ): SyncNoticeOutcome | null {
   if (result.authExpired) return { kind: "authExpired", count: 0 };
-  if (
-    result.attention?.reason
-      === "community-plugin-enablement-decision-required"
-  ) {
-    return {
-      kind: "communityPluginEnablement",
-      count: result.attention.count,
-    };
-  }
   if (context.pausedForReview) return { kind: "review", count: 0 };
   if (context.cancelled) return { kind: "cancelled", count: 0 };
   if (result.errors > 0 || !result.success) {

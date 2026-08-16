@@ -72,7 +72,10 @@ export function isCommunityPluginPathSelectedByPolicy(
     ownPluginId,
   );
   if (!classified) return true;
-  if (classified.kind === "enablement") return policy.files.mode !== "none";
+  // Obsidian's enabled-plugin list is device-local runtime state. Plugin code
+  // participation must never pull community-plugins.json into EasySync's file
+  // scope, even when community plugin bundles are selected.
+  if (classified.kind === "enablement") return false;
   return classified.kind === "data"
     ? isCommunityPluginDataSelected(policy, classified.pluginId)
     : isPluginSelected(policy.files, classified.pluginId);

@@ -114,7 +114,6 @@ describe("community plugin inventory", () => {
         remote: true,
         dataLocally: true,
         dataRemotely: false,
-        enabledLocally: true,
         desktopOnly: false,
         manifestIssue: false,
       },
@@ -126,10 +125,46 @@ describe("community plugin inventory", () => {
         remote: true,
         dataLocally: false,
         dataRemotely: true,
-        enabledLocally: null,
         desktopOnly: false,
         manifestIssue: false,
       },
+    ]);
+  });
+
+  it("uses the physical directory as the selection key", async () => {
+    const directoryId = "obsidian-pkmer";
+    const manifestPath = `.obsidian/plugins/${directoryId}/manifest.json`;
+    const files = new Map<string, string>([
+      [".obsidian/community-plugins.json", JSON.stringify(["pkmer"])],
+      [manifestPath, JSON.stringify({
+        id: "pkmer",
+        name: "PKMer",
+        version: "1.0.0",
+      })],
+    ]);
+    const adapter = {
+      exists: vi.fn(async (path: string) =>
+        path === ".obsidian/plugins" || files.has(path)
+      ),
+      list: vi.fn(async () => ({
+        files: [],
+        folders: [`.obsidian/plugins/${directoryId}`],
+      })),
+      read: vi.fn(async (path: string) => {
+        const value = files.get(path);
+        if (value === undefined) throw new Error("missing");
+        return value;
+      }),
+    } as unknown as DataAdapter;
+
+    const result = await buildCommunityPluginInventory(adapter, ".obsidian");
+
+    expect(result).toEqual([
+      expect.objectContaining({
+        id: directoryId,
+        name: "PKMer",
+        manifestIssue: false,
+      }),
     ]);
   });
 
@@ -332,7 +367,6 @@ describe("community plugin inventory", () => {
         remote: false,
         dataLocally: false,
         dataRemotely: false,
-        enabledLocally: null,
         desktopOnly: false,
         manifestIssue: false,
       },

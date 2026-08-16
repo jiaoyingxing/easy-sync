@@ -1,0 +1,354 @@
+{
+  "schemaVersion": 1,
+  "policy": {
+    "currentPublicRelease": "1.2.7",
+    "directUpgradeBaseline": "1.2.7",
+    "currentRuntimeProfile": "v2-with-local-layout-v2",
+    "historicalMigrationFloor": "1.1.3",
+    "unpublishedBuildsArePermanentInputs": false,
+    "breakingChangesRequireAdjacentMigration": true,
+    "ordinaryFeatureChangesRequireGlobalVersionBump": false
+  },
+  "versionAxes": {
+    "pluginRelease": "manifest/package version only",
+    "fileStateModel": "V2 planner, executor, envelope and recovery contract",
+    "activeDatabaseSchema": "IndexedDB physical schema",
+    "generationProtocol": "immutable remote generation lineage",
+    "storageLayout": "device-local EasySync path contract",
+    "featureState": "owner-specific schema or version"
+  },
+  "families": [
+    {
+      "id": "public-1.1.3-import",
+      "class": "legacy-authority-input",
+      "owner": "src/sync/public-1-1-3-state-import.ts",
+      "currentVersion": "public-1.1.3-format-1",
+      "compatibility": "read-only import; never a runtime writer"
+    },
+    {
+      "id": "v2-file-state-envelope",
+      "class": "authority",
+      "owner": "src/sync/state-envelope-v2.ts",
+      "currentVersion": 2,
+      "compatibility": "strict read; compatible optional fields may be absent; breaking semantics require a new adjacent migration"
+    },
+    {
+      "id": "v2-active-indexeddb",
+      "class": "authority-storage",
+      "owner": "src/sync/state-v2-indexeddb-active.ts",
+      "currentVersion": 1,
+      "compatibility": "copy into a new database candidate before authority selection; no destructive in-place upgrade"
+    },
+    {
+      "id": "v2-authority-witness",
+      "class": "authority-selection",
+      "owner": "src/sync/state-v2-authority-witness.ts",
+      "currentVersion": 1,
+      "acceptedNestedVersions": {
+        "indexedDbStorageAuthority": [1, 2]
+      },
+      "compatibility": "single-direction CAS selection; schema 2 storage binding never falls back to schema 1"
+    },
+    {
+      "id": "protocol-v2",
+      "class": "remote-control-record",
+      "owner": "src/sync/sync-protocol-v2.ts",
+      "currentVersion": 2,
+      "recordSchemaVersion": 1,
+      "compatibility": "immutable read/create-only predecessor input"
+    },
+    {
+      "id": "protocol-v3",
+      "class": "remote-control-record",
+      "owner": "src/sync/sync-protocol-v3.ts",
+      "currentVersion": 3,
+      "recordSchemaVersion": 1,
+      "compatibility": "immutable generation lineage with exact V2 predecessor digest"
+    },
+    {
+      "id": "cloud-bootstrap-v2",
+      "class": "remote-nonauthoritative-evidence",
+      "owner": "src/sync/cloud-bootstrap-v2.ts",
+      "currentVersion": 2,
+      "acceptedNestedVersions": {
+        "publicationCheckpoint": [1]
+      },
+      "compatibility": "strict per-item evidence only; failure falls back to canonical verification, never to guessed equality"
+    },
+    {
+      "id": "community-plugin-participation",
+      "class": "device-local-feature-authority",
+      "owner": "src/sync/community-plugin-participation.ts",
+      "currentVersion": 1,
+      "compatibility": "stored inside the selected V2 envelope; not a cloud device roster"
+    },
+    {
+      "id": "community-plugin-lifecycle-control",
+      "class": "unpublished-remote-control-record",
+      "owner": "src/sync/community-plugin-lifecycle-v1.ts",
+      "currentVersion": 2,
+      "status": "development-unpublished",
+      "compatibility": "schema 1 remains readable observation-only input; explicit legacy migration confirmation upgrades it atomically to schema 2, which adds irreversible legacy-writer consent; neither version is attached to a public release profile"
+    },
+    {
+      "id": "community-plugin-lifecycle-device-observation",
+      "class": "unpublished-device-local-recovery-state",
+      "owner": "src/sync/community-plugin-lifecycle-device-v1.ts",
+      "currentVersion": 1,
+      "status": "development-unpublished",
+      "acceptedNestedVersions": {
+        "observationCheckpoint": [1],
+        "controlMutationCheckpoint": [1],
+        "bundlePublicationCheckpoint": [1],
+        "generationCleanupCheckpoint": [1]
+      },
+      "compatibility": "App-local identity plus separate response-unknown checkpoints for observation, bundle publication, generation cleanup and explicit generation join, legacy consent or seal control mutations; corruption or identity loss never transfers old-generation authority"
+    },
+    {
+      "id": "v2-recovery-control-records",
+      "class": "recovery-evidence",
+      "owner": "src/sync/state-manager.ts",
+      "currentVersion": "member-specific",
+      "acceptedNestedVersions": {
+        "fileMutationIntent": [1],
+        "folderMutationIntent": [2],
+        "communityPluginBundleSettlement": [2],
+        "mutationReceipt": [1],
+        "recoveryQuarantine": [2],
+        "otherListedControlRecords": [1]
+      },
+      "acceptedOptionalSemantics": {
+        "fileMutationIntentV1StateEffect": ["local-only", "settlement-only"]
+      },
+      "members": [
+        "migration hold",
+        "scope transition",
+        "corrupt-state publication",
+        "corrupt-state recovery hold",
+        "mutation ledger and receipts",
+        "IndexedDB recovery delta"
+      ],
+      "compatibility": "must be resumed, proven not to have occurred, or explicitly retired; never cleared as a cache; local-only and settlement-only effects do not publish ordinary files-root state; community-plugin bundle settlement is a versioned manual-resolution branch, so public 1.2.7 rejects the ledger instead of ignoring the whole-bundle choice"
+    },
+    {
+      "id": "remote-scope-recovery-evidence-db",
+      "class": "nonauthoritative-recovery-evidence",
+      "owner": "src/sync/remote-scope-recovery-evidence-store.ts",
+      "currentVersion": 1,
+      "acceptedNestedVersions": {
+        "operationRecord": [1, 2],
+        "receipt": [1]
+      },
+      "compatibility": "physical database schema 1 keeps public remote-scope operation v1 readable and adds first-sync operation v2; receipts remain exact-version v1; loss only causes more verification and never authorizes a mutation"
+    },
+    {
+      "id": "plugin-data-settings-and-local-intent",
+      "class": "device-local-feature-state",
+      "owner": "src/main.ts",
+      "currentVersion": "versionless-keyed",
+      "compatibility": "owner-specific defaults and one-way key migrations; never infer remote authority from absence"
+    },
+    {
+      "id": "easy-sync-runtime-layout",
+      "class": "device-local-storage-layout",
+      "owner": "src/obsidian-compat.ts",
+      "currentVersion": 2,
+      "acceptedNestedVersions": {
+        "legacyReadAndMigrationSource": [1]
+      },
+      "compatibility": "verified local copy then stable-round cleanup; not a remote protocol upgrade"
+    },
+    {
+      "id": "rebuildable-caches-and-presentation",
+      "class": "disposable-cache",
+      "owner": "src/sync/state-manager.ts",
+      "currentVersion": "owner-specific",
+      "members": [
+        "scan cache",
+        "remote inventory cache",
+        "community-plugin catalog and manifest observations",
+        "profile cache",
+        "sync history and progress presentation"
+      ],
+      "compatibility": "may be rebuilt only when it is not the sole evidence for a pending authority or mutation decision"
+    }
+  ],
+  "profiles": {
+    "v2-initial": {
+      "fileStateModel": 2,
+      "activeDatabaseSchema": 1,
+      "authorityWitnessSchema": 1,
+      "protocolV2": 2,
+      "protocolV3": null,
+      "communityPluginParticipation": 1,
+      "remoteScopeRecoveryEvidenceDb": null,
+      "storageLayout": 1
+    },
+    "v2-with-generation-lineage": {
+      "fileStateModel": 2,
+      "activeDatabaseSchema": 1,
+      "authorityWitnessSchema": 1,
+      "protocolV2": 2,
+      "protocolV3": 3,
+      "communityPluginParticipation": 1,
+      "remoteScopeRecoveryEvidenceDb": 1,
+      "storageLayout": 1
+    },
+    "v2-with-local-layout-v2": {
+      "fileStateModel": 2,
+      "activeDatabaseSchema": 1,
+      "authorityWitnessSchema": 1,
+      "protocolV2": 2,
+      "protocolV3": 3,
+      "communityPluginParticipation": 1,
+      "remoteScopeRecoveryEvidenceDb": 1,
+      "storageLayout": 2
+    }
+  },
+  "releases": [
+    {
+      "version": "1.1.3",
+      "commit": "01a4ac30936a89c53ddbf521e7ea9399d71e79c4",
+      "profile": "public-1.1.3-import-only",
+      "proves": "exact public V1 PluginData and sidecar import input; not a V2 runtime fixture",
+      "sourceBlobs": {
+        "manifest": "1bd051669e1d479b92513c440dc0440856b45039",
+        "main": "ae9712264c638a1ce2add5b09cae1c870bf93c4d",
+        "syncEngine": "946152683ce0926c74e26d461aaa0cadefd71d39",
+        "syncExecutor": "b7fcce3aeafdc78ea3e3c1effddfee41fecf2134",
+        "stateManager": "1d3572a080f00b5eca584073a3e380aa57e4b022",
+        "types": "f9ef3f95ad182859bc4a8304e285dd458193d735",
+        "localScanner": "0417c922c42768da1803944e8ffbb5205bc61314",
+        "runtimeLayout": "cba592e4fea838f31c7be41877489d9094d2005b"
+      }
+    },
+    {
+      "version": "1.2.0",
+      "commit": "cd49d129808028f48a46e3340704eb501daa7e50",
+      "profile": "v2-initial",
+      "proves": "first public V2/IndexedDB authority, Protocol V2 and device-local plugin participation",
+      "sourceBlobs": {
+        "stateEnvelope": "d850644b724654b3e406532ac8c84c3aee25bdb1",
+        "activeIndexedDb": "21bbe6799528c33107bfc07737565499a454bf44",
+        "authorityWitness": "40fadb6910fd924fb74cf95fd45dbfc4ef5b49cf",
+        "protocolV2": "4e7041855a001ee002b287f3417fb31347891a7e",
+        "protocolV3": null,
+        "participation": "025a03927539b3fe8ec7653fd1292bfd39d18c90",
+        "remoteScopeRecoveryEvidenceDb": null,
+        "runtimeLayout": "21c7d995da530bc513b559dbbb659463a65827cd"
+      }
+    },
+    {
+      "version": "1.2.1",
+      "commit": "accb17a81027ca3c24fc47f1b212e6f46f8d06bf",
+      "profile": "v2-initial",
+      "proves": "same persistent version vector as 1.2.0; user-facing fixes did not create a new state generation",
+      "sourceBlobs": {
+        "stateEnvelope": "825bd5d533dfffe9a82acae0ee66753c119797bc",
+        "activeIndexedDb": "21bbe6799528c33107bfc07737565499a454bf44",
+        "authorityWitness": "40fadb6910fd924fb74cf95fd45dbfc4ef5b49cf",
+        "protocolV2": "4e7041855a001ee002b287f3417fb31347891a7e",
+        "protocolV3": null,
+        "participation": "025a03927539b3fe8ec7653fd1292bfd39d18c90",
+        "remoteScopeRecoveryEvidenceDb": null,
+        "runtimeLayout": "21c7d995da530bc513b559dbbb659463a65827cd"
+      }
+    },
+    {
+      "version": "1.2.2",
+      "commit": "ef3c85f67c68eeccc5122acf72f5eb54bb317130",
+      "profile": "v2-with-generation-lineage",
+      "proves": "adds exact Protocol V3 lineage and recovery-evidence storage without replacing the V2 file-state authority",
+      "sourceBlobs": {
+        "stateEnvelope": "f3640ac32463cd36d393669a3fa1d2d0e6216140",
+        "activeIndexedDb": "21bbe6799528c33107bfc07737565499a454bf44",
+        "authorityWitness": "76c9b6855a1781a4c082ff62088f03c2c3bb7266",
+        "protocolV2": "4e7041855a001ee002b287f3417fb31347891a7e",
+        "protocolV3": "a03c7eb7b278297dcd826a98072aeb3899a96325",
+        "participation": "025a03927539b3fe8ec7653fd1292bfd39d18c90",
+        "remoteScopeRecoveryEvidenceDb": "e63d5c6f1183bf852e641905067d97dcb57050ba",
+        "runtimeLayout": "21c7d995da530bc513b559dbbb659463a65827cd"
+      }
+    },
+    {
+      "version": "1.2.3",
+      "commit": "469f22660bb830fa91431d4f1aea8c9dbe6ed79c",
+      "profile": "v2-with-generation-lineage",
+      "proves": "same persistent version vector as 1.2.2",
+      "sourceBlobs": {
+        "stateEnvelope": "f3640ac32463cd36d393669a3fa1d2d0e6216140",
+        "activeIndexedDb": "21bbe6799528c33107bfc07737565499a454bf44",
+        "authorityWitness": "76c9b6855a1781a4c082ff62088f03c2c3bb7266",
+        "protocolV2": "4e7041855a001ee002b287f3417fb31347891a7e",
+        "protocolV3": "a03c7eb7b278297dcd826a98072aeb3899a96325",
+        "participation": "025a03927539b3fe8ec7653fd1292bfd39d18c90",
+        "remoteScopeRecoveryEvidenceDb": "e63d5c6f1183bf852e641905067d97dcb57050ba",
+        "runtimeLayout": "21c7d995da530bc513b559dbbb659463a65827cd"
+      }
+    },
+    {
+      "version": "1.2.4",
+      "commit": "484cf06819b478500fc66d52e8b107d72bb865a8",
+      "profile": "v2-with-generation-lineage",
+      "proves": "same persistent version vector as 1.2.2",
+      "sourceBlobs": {
+        "stateEnvelope": "f3640ac32463cd36d393669a3fa1d2d0e6216140",
+        "activeIndexedDb": "21bbe6799528c33107bfc07737565499a454bf44",
+        "authorityWitness": "76c9b6855a1781a4c082ff62088f03c2c3bb7266",
+        "protocolV2": "4e7041855a001ee002b287f3417fb31347891a7e",
+        "protocolV3": "a03c7eb7b278297dcd826a98072aeb3899a96325",
+        "participation": "025a03927539b3fe8ec7653fd1292bfd39d18c90",
+        "remoteScopeRecoveryEvidenceDb": "e63d5c6f1183bf852e641905067d97dcb57050ba",
+        "runtimeLayout": "21c7d995da530bc513b559dbbb659463a65827cd"
+      }
+    },
+    {
+      "version": "1.2.5",
+      "commit": "2f809f32197be37232d3df4775c2f25b912120ea",
+      "profile": "v2-with-generation-lineage",
+      "proves": "same persistent version vector as 1.2.2",
+      "sourceBlobs": {
+        "stateEnvelope": "f3640ac32463cd36d393669a3fa1d2d0e6216140",
+        "activeIndexedDb": "21bbe6799528c33107bfc07737565499a454bf44",
+        "authorityWitness": "76c9b6855a1781a4c082ff62088f03c2c3bb7266",
+        "protocolV2": "4e7041855a001ee002b287f3417fb31347891a7e",
+        "protocolV3": "a03c7eb7b278297dcd826a98072aeb3899a96325",
+        "participation": "025a03927539b3fe8ec7653fd1292bfd39d18c90",
+        "remoteScopeRecoveryEvidenceDb": "e63d5c6f1183bf852e641905067d97dcb57050ba",
+        "runtimeLayout": "21c7d995da530bc513b559dbbb659463a65827cd"
+      }
+    },
+    {
+      "version": "1.2.6",
+      "commit": "5ce55575e18c68e90ca58b3efe65541340b7c225",
+      "profile": "v2-with-local-layout-v2",
+      "proves": "keeps the V2/Protocol V3 version vector and adds verified device-local runtime layout v2 with layout v1 as migration input",
+      "sourceBlobs": {
+        "stateEnvelope": "aa90ddcd0d2127897d82a95b0e2cdebefce7316f",
+        "activeIndexedDb": "17b8db515dc08c96b61da6f3f3a45b07912da793",
+        "authorityWitness": "cf46be9706d7bc2a2c43eb8ff2ff8c1ab7dcff14",
+        "protocolV2": "4e7041855a001ee002b287f3417fb31347891a7e",
+        "protocolV3": "c30294abc200ea81a6d0a9cab979b4a00ab3911a",
+        "participation": "025a03927539b3fe8ec7653fd1292bfd39d18c90",
+        "remoteScopeRecoveryEvidenceDb": "e63d5c6f1183bf852e641905067d97dcb57050ba",
+        "runtimeLayout": "c0e240342c6dd8a56fe1c94a5b72d30358eaaa8d"
+      }
+    },
+    {
+      "version": "1.2.7",
+      "commit": "af6f3afb2a0347096d0cd596c1f9a887772d3aa0",
+      "profile": "v2-with-local-layout-v2",
+      "proves": "same persistent version vector as 1.2.6; release changes only the official static-style lint boundary",
+      "sourceBlobs": {
+        "stateEnvelope": "aa90ddcd0d2127897d82a95b0e2cdebefce7316f",
+        "activeIndexedDb": "17b8db515dc08c96b61da6f3f3a45b07912da793",
+        "authorityWitness": "cf46be9706d7bc2a2c43eb8ff2ff8c1ab7dcff14",
+        "protocolV2": "4e7041855a001ee002b287f3417fb31347891a7e",
+        "protocolV3": "c30294abc200ea81a6d0a9cab979b4a00ab3911a",
+        "participation": "025a03927539b3fe8ec7653fd1292bfd39d18c90",
+        "remoteScopeRecoveryEvidenceDb": "e63d5c6f1183bf852e641905067d97dcb57050ba",
+        "runtimeLayout": "c0e240342c6dd8a56fe1c94a5b72d30358eaaa8d"
+      }
+    }
+  ]
+}

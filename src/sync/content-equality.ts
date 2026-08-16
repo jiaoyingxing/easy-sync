@@ -8,6 +8,7 @@ import type {
 
 export type ContentEqualityProof =
   | "remoteSha256"
+  | "verifiedRemoteReceipt"
   | "baseETag"
   | "downloadedSha256"
   | "quickXorMismatch"
@@ -28,6 +29,7 @@ export interface ContentEqualityInput {
     eTag: string;
   };
   base?: Pick<BaseFileEntry, "hash" | "size" | "eTag">;
+  verifiedRemoteHash?: string;
   downloadedHash?: string;
 }
 
@@ -46,6 +48,12 @@ export function resolveContentEquality(
     return input.local.hash === input.remote.sha256Hash.toLowerCase()
       ? { status: "equal", proof: "remoteSha256" }
       : { status: "different", proof: "remoteSha256" };
+  }
+
+  if (input.verifiedRemoteHash) {
+    return input.local.hash === input.verifiedRemoteHash.toLowerCase()
+      ? { status: "equal", proof: "verifiedRemoteReceipt" }
+      : { status: "different", proof: "verifiedRemoteReceipt" };
   }
 
   if (input.downloadedHash) {

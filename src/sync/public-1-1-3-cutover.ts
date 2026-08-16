@@ -1,8 +1,4 @@
 import { isRecord } from "../obsidian-compat";
-import {
-  validateCommunityPluginEnablementMigrationCarrierV2,
-  type CommunityPluginEnablementMigrationCarrierV2,
-} from "./community-plugin-enablement";
 
 export const KEY_PUBLIC_113_CUTOVER =
   "easy-sync-public-1.1.3-cutover-v2";
@@ -53,25 +49,12 @@ export function finalizePublic113PluginDataCutover(input: {
   pluginData: Readonly<Record<string, unknown>>;
   sourceStateDigest: string;
   finalizedAt: number;
-  communityPluginEnablement?: Readonly<
-    CommunityPluginEnablementMigrationCarrierV2
-  >;
 }): {
   pluginData: Record<string, unknown>;
   marker: Public113CutoverMarkerV2;
 } {
   if (!/^[a-f0-9]{64}$/.test(input.sourceStateDigest)) {
     throw new Error("Public 1.1.3 cutover requires a valid source digest");
-  }
-  if (input.communityPluginEnablement) {
-    validateCommunityPluginEnablementMigrationCarrierV2(
-      input.communityPluginEnablement,
-    );
-  }
-  if ((input.communityPluginEnablement?.pending.length ?? 0) > 0) {
-    throw new Error(
-      "Public 1.1.3 cutover cannot publish unresolved community plugin decisions",
-    );
   }
   const existing = readPublic113CutoverMarker(
     input.pluginData[KEY_PUBLIC_113_CUTOVER],
@@ -86,6 +69,7 @@ export function finalizePublic113PluginDataCutover(input: {
       input.pluginData,
     ) as Record<string, unknown>;
     pluginData[KEY_BASE_SNAPSHOT] = {};
+    delete pluginData[KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE];
     migrateMutationLedgerKey(pluginData);
     return { pluginData, marker: existing };
   }
@@ -124,17 +108,8 @@ export function finalizePublic113PluginDataCutover(input: {
   pluginData[KEY_PLAN_REVIEW_SCOPE] = null;
   pluginData[KEY_PLAN_REVIEW_CANONICAL_IDENTITY] = null;
   pluginData[KEY_LOCAL_FOLDER_MOVE_HINTS] = [];
+  delete pluginData[KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE];
   migrateMutationLedgerKey(pluginData);
-  if (input.communityPluginEnablement) {
-    pluginData[KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE] = {
-      version: 1,
-      scope: { ...input.communityPluginEnablement.scope },
-      anchors: { ...input.communityPluginEnablement.anchors },
-      pending: input.communityPluginEnablement.resolved.map((item) => ({
-        ...item,
-      })),
-    };
-  }
   pluginData[KEY_PUBLIC_113_CUTOVER] = marker;
   return { pluginData, marker };
 }

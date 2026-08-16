@@ -138,19 +138,6 @@ describe("resolveSyncNoticeOutcome", () => {
     });
   });
 
-  it("surfaces community plugin enablement review before generic failure", () => {
-    expect(resolveSyncNoticeOutcome(result({
-      success: false,
-      attention: {
-        reason: "community-plugin-enablement-decision-required",
-        count: 2,
-      },
-    }))).toEqual({
-      kind: "communityPluginEnablement",
-      count: 2,
-    });
-  });
-
   it("keeps review, cancellation and auth expiry distinct from generic failure", () => {
     expect(resolveSyncNoticeOutcome(result({ success: false }), { pausedForReview: true }))
       .toEqual({ kind: "review", count: 0 });

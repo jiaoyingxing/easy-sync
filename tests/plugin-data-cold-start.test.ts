@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import EasySyncPlugin, { SyncPathSettingsUpdateError } from "../src/main";
 import { sha256Hex } from "../src/crypto";
-import { StateManager } from "../src/sync/state-manager";
+import {
+  StateManager,
+  SyncPathMutationRecoveryError,
+} from "../src/sync/state-manager";
 import {
   createCommunityPluginManifestObservation,
 } from "../src/sync/community-plugin-bundle";
@@ -33,6 +36,7 @@ function makeCommunityPluginScopeSwitchHarness(
 } {
   const plugin = new EasySyncPlugin();
   const commitOrder: string[] = [];
+  let committedFingerprint = "";
   let participation = reduceDeviceCommunityPluginParticipation(
     createEmptyDeviceCommunityPluginParticipation(false),
     { type: "confirm-participating", pluginId: "calendar" },
@@ -51,10 +55,13 @@ function makeCommunityPluginScopeSwitchHarness(
   const commitSyncPathSettingsChange = vi.fn(async (
     _isPathInScope: (path: string) => boolean,
     persistSettings: (data: Record<string, unknown>) => void,
+    _selectedCommunityPluginIds?: readonly string[],
+    scopeChange?: { targetSettingsFingerprint?: string },
   ) => {
     commitOrder.push("scope");
     if (checkpointError) throw checkpointError;
     persistSettings({});
+    committedFingerprint = scopeChange?.targetSettingsFingerprint ?? "";
   });
   const applyParticipationCommand = vi.fn(async (command) => {
     participation = reduceDeviceCommunityPluginParticipation(
@@ -89,6 +96,9 @@ function makeCommunityPluginScopeSwitchHarness(
     hasCompleteRemoteFolderIndex: true,
     remoteFolders: [],
     commitSyncPathSettingsChange,
+    get syncPathSettingsFingerprint() {
+      return committedFingerprint;
+    },
   } as never;
   plugin.scanner = {
     setConfig: vi.fn(),
@@ -452,6 +462,68 @@ describe("plugin data cold-start cache", () => {
     )).toBe(true);
   });
 
+  it("persists the community-plugin switch before V2 activation without recovery or sync", async () => {
+    const plugin = new EasySyncPlugin();
+    const persisted: Record<string, unknown> = {};
+    const commitSyncPathSettingsChange = vi.fn(async (
+      _isPathInScope: (path: string) => boolean,
+      persistSettings: (data: Record<string, unknown>) => void,
+    ) => {
+      persistSettings(persisted);
+    });
+    Object.defineProperty(plugin, "app", {
+      configurable: true,
+      value: {
+        vault: {
+          configDir: ".obsidian",
+          adapter: { exists: vi.fn().mockResolvedValue(false) },
+        },
+        workspace: { getLeavesOfType: vi.fn().mockReturnValue([]) },
+      },
+    });
+    Object.defineProperty(plugin, "manifest", {
+      configurable: true,
+      value: { id: "easy-sync" },
+    });
+    plugin.state = {
+      isV2StateActive: false,
+      activeV2MigrationHold: null,
+      hasCompleteRemoteFolderIndex: false,
+      remoteFolders: [],
+      mutationLedger: [],
+      commitSyncPathSettingsChange,
+    } as never;
+    plugin.scanner = {
+      setConfig: vi.fn(),
+      shouldSyncPath: vi.fn().mockReturnValue(true),
+      shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+    } as never;
+    plugin.syncExecutor = {
+      hasActivityInFlight: false,
+      setCommunityPluginSyncPolicy: vi.fn(),
+    } as never;
+    const ensureParticipation = vi.spyOn(
+      plugin as never,
+      "ensureCommunityPluginParticipationInitialized",
+    );
+    const runAutomaticSync = vi.spyOn(
+      plugin as never,
+      "runAutomaticSync",
+    );
+    vi.spyOn(plugin as never, "ensureStateLoaded").mockResolvedValue(undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(
+      () => undefined,
+    );
+
+    await expect(plugin.updateCommunityPluginFilesScope(true)).resolves.toBeUndefined();
+
+    expect(persisted["sync-community-plugins"]).toBe(true);
+    expect(plugin.syncCommunityPlugins).toBe(true);
+    expect(ensureParticipation).not.toHaveBeenCalled();
+    expect(runAutomaticSync).not.toHaveBeenCalled();
+    expect(commitSyncPathSettingsChange).toHaveBeenCalledOnce();
+  });
+
   it("routes a participating plugin exclusion through the same scope transaction", async () => {
     const {
       plugin,
@@ -523,6 +595,132 @@ describe("plugin data cold-start cache", () => {
     expect(updateCommunityPluginParticipationBatch).toHaveBeenCalledOnce();
     expect(getParticipation().scopeEnabled).toBe(false);
     expect(plugin.syncCommunityPlugins).toBe(false);
+  });
+
+  it("commits an explicit plugin-scope exit before settling its owned intent-only code upload", async () => {
+    const {
+      plugin,
+      getParticipation,
+      commitSyncPathSettingsChange,
+      updateCommunityPluginParticipationBatch,
+      commitOrder,
+    } = makeCommunityPluginScopeSwitchHarness();
+    const state = plugin.state as never as {
+      mutationLedger: Array<{ intent: { operationId: string } }>;
+    };
+    state.mutationLedger.push({
+      intent: { operationId: "resojot-main-upload" },
+    });
+    const inspect = vi.fn((
+      isPluginExcluded: (pluginId: string) => boolean,
+    ) => {
+      expect(isPluginExcluded("calendar")).toBe(true);
+      return [...state.mutationLedger];
+    });
+    const retire = vi.fn(async (
+      isPluginExcluded: (pluginId: string) => boolean,
+    ) => {
+      expect(isPluginExcluded("calendar")).toBe(true);
+      state.mutationLedger.splice(0);
+      commitOrder.push("recovery-exit");
+      return true;
+    });
+    Object.assign(plugin.syncExecutor as object, {
+      inspectSelectedPluginCodeUploadRecoveriesForScopeExit: inspect,
+      retireSelectedPluginCodeUploadRecoveriesForScopeExit: retire,
+    });
+
+    await expect(plugin.updateCommunityPluginFilesScope(false)).resolves.toBeUndefined();
+
+    expect(inspect).toHaveBeenCalledTimes(2);
+    expect(retire).toHaveBeenCalledOnce();
+    expect(commitSyncPathSettingsChange).toHaveBeenCalledOnce();
+    expect(updateCommunityPluginParticipationBatch).toHaveBeenCalledOnce();
+    expect(getParticipation().scopeEnabled).toBe(false);
+    expect(plugin.syncCommunityPlugins).toBe(false);
+    expect(commitOrder).toEqual([
+      "participation",
+      "scope",
+      "recovery-exit",
+      "pending",
+    ]);
+  });
+
+  it("keeps the plugin excluded and the recovery evidence when the exit checkpoint fails", async () => {
+    const {
+      plugin,
+      getParticipation,
+      updateCommunityPluginParticipationBatch,
+      commitOrder,
+    } = makeCommunityPluginScopeSwitchHarness(
+      new Error("checkpoint write interrupted"),
+    );
+    const state = plugin.state as never as {
+      mutationLedger: Array<{ intent: { operationId: string } }>;
+    };
+    state.mutationLedger.push({
+      intent: { operationId: "resojot-main-upload" },
+    });
+    const inspect = vi.fn().mockReturnValue([...state.mutationLedger]);
+    const retire = vi.fn().mockResolvedValue(false);
+    Object.assign(plugin.syncExecutor as object, {
+      inspectSelectedPluginCodeUploadRecoveriesForScopeExit: inspect,
+      retireSelectedPluginCodeUploadRecoveriesForScopeExit: retire,
+    });
+
+    await expect(plugin.updateCommunityPluginFilesScope(false))
+      .rejects.toThrow("checkpoint write interrupted");
+
+    expect(updateCommunityPluginParticipationBatch).toHaveBeenCalledOnce();
+    expect(getParticipation().scopeEnabled).toBe(false);
+    expect(plugin.syncCommunityPlugins).toBe(false);
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(retire).not.toHaveBeenCalled();
+    expect(commitOrder).toEqual(["participation", "scope"]);
+  });
+
+  it("resumes a durably excluded plugin scope before retiring old recovery evidence", async () => {
+    const {
+      plugin,
+      getParticipation,
+      commitSyncPathSettingsChange,
+      commitOrder,
+    } = makeCommunityPluginScopeSwitchHarness();
+    const participation = getParticipation();
+    const state = plugin.state as never as {
+      mutationLedger: Array<{ intent: { operationId: string } }>;
+    };
+    state.mutationLedger.push({
+      intent: { operationId: "resojot-main-upload" },
+    });
+    const inspect = vi.fn().mockReturnValue([...state.mutationLedger]);
+    const retire = vi.fn(async () => {
+      state.mutationLedger.splice(0);
+      commitOrder.push("recovery-exit");
+      return true;
+    });
+    Object.assign(plugin.syncExecutor as object, {
+      inspectSelectedPluginCodeUploadRecoveriesForScopeExit: inspect,
+      retireSelectedPluginCodeUploadRecoveriesForScopeExit: retire,
+    });
+    (plugin as unknown as {
+      applyCommunityPluginParticipationProjection(
+        value: typeof participation,
+      ): void;
+    }).applyCommunityPluginParticipationProjection(participation);
+
+    await expect((plugin as unknown as {
+      resumeExcludedCommunityPluginCodeRecoveryScopeExit(
+        value: typeof participation,
+      ): Promise<boolean>;
+    }).resumeExcludedCommunityPluginCodeRecoveryScopeExit(participation))
+      .resolves.toBe(true);
+
+    expect(inspect).toHaveBeenCalledOnce();
+    expect(commitSyncPathSettingsChange).toHaveBeenCalledOnce();
+    expect(retire).toHaveBeenCalledOnce();
+    expect(state.mutationLedger).toEqual([]);
+    expect(commitOrder).toEqual(["scope", "recovery-exit"]);
   });
 
   it("keeps the prior participation authoritative when pending retirement fails before a metadata-only transition", async () => {
@@ -731,7 +929,7 @@ describe("plugin data cold-start cache", () => {
     ]);
     expect(participation.pluginsById["realtime-transcription"]).toMatchObject({
       phase: "blocked",
-      blockedReason: "manifest-incompatible",
+      blockedReason: "remote-bundle-missing",
       operationId: "join-realtime-1",
     });
     expect(participation.pluginsById.calendar?.phase).toBe("restoring");
@@ -775,12 +973,13 @@ describe("plugin data cold-start cache", () => {
 
     expect(participation.pluginsById.calendar).toMatchObject({
       phase: "participating",
-      joinedGeneration: 4,
       lastConfirmedLocalBundleDigest: "a".repeat(64),
     });
+    expect(participation.pluginsById.calendar?.joinedGeneration)
+      .toBeUndefined();
     expect((plugin as unknown as {
       hasPendingCommunityPluginJoin(): boolean;
-    }).hasPendingCommunityPluginJoin()).toBe(false);
+    }).hasPendingCommunityPluginJoin()).toBe(true);
     await expect((plugin as unknown as {
       prepareCommunityPluginJoinsForSync(): Promise<{
         authorizations: Array<{ pluginId: string }>;
@@ -1798,105 +1997,6 @@ describe("plugin data cold-start cache", () => {
     expect(commitSyncPathSettingsChange).toHaveBeenCalledTimes(2);
   });
 
-  it("exposes and resolves enablement decisions for active all-mode plugins only", async () => {
-    const plugin = new EasySyncPlugin();
-    plugin.syncCommunityPlugins = true;
-    plugin.communityPluginSyncPolicy = {
-      version: 1,
-      files: {
-        mode: "all",
-        pluginIds: [],
-        ignoredPluginIds: ["quickadd"],
-      },
-      data: { mode: "none", pluginIds: [] },
-    };
-    const resolveDecisions = vi.fn().mockResolvedValue(true);
-    plugin.state = {
-      remoteScope: {
-        accountId: "account",
-        driveId: "drive",
-        vaultFolderId: "vault",
-        filesRootId: "files",
-      },
-      getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-        version: 1,
-        scope: null,
-        anchors: {},
-        pending: [
-          {
-            pluginId: "calendar",
-            localEnabled: true,
-            remoteEnabled: false,
-          },
-          {
-            pluginId: "quickadd",
-            localEnabled: false,
-            remoteEnabled: true,
-          },
-        ],
-      }),
-      getCommunityPluginEnablementDecisionSnapshot: vi.fn().mockReturnValue({
-        revision: "revision-1",
-        decisions: [
-          {
-            pluginId: "calendar",
-            localEnabled: true,
-            remoteEnabled: false,
-          },
-          {
-            pluginId: "quickadd",
-            localEnabled: false,
-            remoteEnabled: true,
-          },
-        ],
-      }),
-      resolveCommunityPluginEnablementDecisions: resolveDecisions,
-    } as never;
-    vi.spyOn(plugin as never, "ensureStateLoaded").mockResolvedValue(undefined);
-
-    await expect(
-      plugin.getPendingCommunityPluginEnablementDecisions(),
-    ).resolves.toEqual([
-      {
-        pluginId: "calendar",
-        localEnabled: true,
-        remoteEnabled: false,
-      },
-    ]);
-    expect(plugin.getCommunityPluginEnablementPendingCount()).toBe(1);
-    await expect(plugin.resolveCommunityPluginEnablementDecisions(
-      "revision-1",
-      [{
-      pluginId: "calendar",
-      localEnabled: false,
-      remoteEnabled: true,
-      enabled: true,
-      }],
-    )).resolves.toBe(false);
-    expect(resolveDecisions).not.toHaveBeenCalled();
-    const batch = [{
-      pluginId: "calendar",
-      localEnabled: true,
-      remoteEnabled: false,
-      enabled: false,
-    }];
-    await expect(plugin.resolveCommunityPluginEnablementDecisions(
-      "revision-1",
-      batch,
-    ))
-      .resolves.toBe(true);
-    expect(resolveDecisions).toHaveBeenCalledExactlyOnceWith(
-      {
-        accountId: "account",
-        driveId: "drive",
-        vaultFolderId: "vault",
-        filesRootId: "files",
-      },
-      "revision-1",
-      batch,
-    );
-  });
-
   it("does not expose remote-only plugins from a complete legacy folder index without a catalog", async () => {
     const plugin = new EasySyncPlugin();
     const adapter = {
@@ -2295,6 +2395,14 @@ describe("plugin data cold-start cache", () => {
     plugin.state = {
       hasMutationLedgerCorruption: false,
       mutationLedger: [{}],
+      activeV2MigrationHold: null,
+      isV2StateActive: true,
+      hasCompleteRemoteFolderIndex: false,
+      remoteFolders: [],
+      syncPathSettingsFingerprint: "before",
+      commitSyncPathSettingsChange: vi.fn().mockRejectedValue(
+        new SyncPathMutationRecoveryError(),
+      ),
     } as never;
 
     await expect(plugin.updateExcludedFolders(["Private"]))

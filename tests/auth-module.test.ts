@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as obsidian from "obsidian";
 import { AuthModule, type AuthPluginContext } from "../src/auth/auth-module";
 import { createAuthBrowserLauncher } from "../src/auth/auth-browser";
+import { MS_AUTH_CONFIG } from "../src/auth/types";
 
 // We mock generateCodeChallengeSync (the sync path now used by login()).
 // generateCodeChallenge (async) is kept unmocked for other test paths.
@@ -32,6 +33,17 @@ function makeContext(overrides: Partial<AuthPluginContext> = {}): AuthPluginCont
     openUrl: vi.fn(),
     ...overrides,
   };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
 }
 
 describe("AuthModule.login", () => {
@@ -72,6 +84,14 @@ describe("AuthModule.login", () => {
       expect.stringContaining("state=state-fixed"),
       "_blank",
     );
+    const authUrl = new URL(openWindow.mock.calls[0][0]);
+    expect(authUrl.searchParams.get("scope")).toBe(MS_AUTH_CONFIG.scopes.join(" "));
+    expect(MS_AUTH_CONFIG.scopes).toEqual([
+      "User.Read",
+      "offline_access",
+      "Files.ReadWrite.AppFolder",
+      "Files.Read",
+    ]);
     expect(openWindow).not.toHaveBeenCalledWith("about:blank", "_blank");
     expect(auth.pendingAuthUrl).toBe(openWindow.mock.calls[0][0]);
     expect(auth.isPending).toBe(true);
@@ -157,6 +177,96 @@ describe("AuthModule.login", () => {
     );
     expect(auth.authState.accountId).toBe("manual-account");
     expect(auth.pendingAuthUrl).toBeNull();
+  });
+
+  it("records the provider error details when the token exchange is rejected", async () => {
+    let callback: ((params: Record<string, string>) => void) | undefined;
+    const diag = {
+      log: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 400,
+      headers: {},
+      json: {
+        error: "invalid_scope",
+        error_description: "The requested permission is not valid for this account.",
+        trace_id: "trace-123",
+        correlation_id: "corr-456",
+      },
+    });
+    const auth = new AuthModule(makeContext({
+      diag: diag as never,
+      registerProtocolHandler: (_action, handler) => {
+        callback = handler;
+      },
+    }));
+
+    await auth.initialize();
+    await auth.login();
+    callback?.({ code: "auth-code", state: "state-fixed" });
+
+    await vi.waitFor(() => expect(diag.error).toHaveBeenCalled());
+    expect(obsidian.requestUrl).toHaveBeenCalledWith(expect.objectContaining({
+      throw: false,
+    }));
+    const entries = diag.error.mock.calls.map(([, message, data]) => ({ message, data }));
+    expect(entries).toContainEqual({
+      message: "token endpoint rejected OAuth request",
+      data: {
+        status: 400,
+        error: "invalid_scope",
+        errorDescription: "The requested permission is not valid for this account.",
+        traceId: "trace-123",
+        correlationId: "corr-456",
+      },
+    });
+    expect(entries).toContainEqual({
+      message: "OAuth callback error",
+      data: expect.objectContaining({
+        name: "AuthError",
+        type: "ProviderError",
+        message: expect.stringContaining("invalid_scope"),
+      }),
+    });
+    expect(auth.authState.isLoggedIn).toBe(false);
+  });
+
+  it("keeps token transport failures separate from provider rejections", async () => {
+    let callback: ((params: Record<string, string>) => void) | undefined;
+    const diag = {
+      log: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+    vi.spyOn(obsidian, "requestUrl").mockRejectedValue(new Error("offline"));
+    const auth = new AuthModule(makeContext({
+      diag: diag as never,
+      registerProtocolHandler: (_action, handler) => {
+        callback = handler;
+      },
+    }));
+
+    await auth.initialize();
+    await auth.login();
+    callback?.({ code: "auth-code", state: "state-fixed" });
+
+    await vi.waitFor(() => expect(diag.error).toHaveBeenCalled());
+    expect(diag.error).not.toHaveBeenCalledWith(
+      "auth",
+      "token endpoint rejected OAuth request",
+      expect.anything(),
+    );
+    expect(diag.error).toHaveBeenCalledWith(
+      "auth",
+      "OAuth callback error",
+      expect.objectContaining({
+        name: "AuthError",
+        type: "NetworkError",
+      }),
+    );
+    expect(auth.authState.isLoggedIn).toBe(false);
   });
 });
 
@@ -282,6 +392,141 @@ describe("AuthModule account identity", () => {
     expect(request.mock.calls[1][0].url).toContain("/me?");
     expect(auth.authState.accountId).toBe("current-account");
     expect(cacheSet).not.toHaveBeenCalled();
+  });
+});
+
+describe("AuthModule credential concurrency", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("shares one token request between concurrent refresh callers", async () => {
+    const token = deferred<obsidian.RequestUrlResponse>();
+    const request = vi.spyOn(obsidian, "requestUrl").mockReturnValue(token.promise);
+    const auth = new AuthModule(makeContext());
+
+    const first = auth.refreshAccessToken("refresh-token");
+    const second = auth.refreshAccessToken("refresh-token");
+    expect(request).toHaveBeenCalledTimes(1);
+
+    token.resolve({
+      status: 200,
+      headers: {},
+      json: { access_token: "new-access-token", expires_in: 3600 },
+    });
+
+    await expect(first).resolves.toBe("new-access-token");
+    await expect(second).resolves.toBe("new-access-token");
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("serializes logout after a rotated refresh token write and removes it", async () => {
+    const secretSet = deferred<void>();
+    let storedToken: string | null = "old-refresh-token";
+    const set = vi.fn(async (_key: string, value: string) => {
+      await secretSet.promise;
+      storedToken = value;
+    });
+    const remove = vi.fn(async () => {
+      storedToken = null;
+    });
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      json: {
+        access_token: "stale-access-token",
+        refresh_token: "rotated-refresh-token",
+        expires_in: 3600,
+      },
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set,
+        get: vi.fn(async () => storedToken),
+        remove,
+      },
+    }));
+
+    const refresh = auth.refreshAccessToken("old-refresh-token");
+    await vi.waitFor(() => expect(set).toHaveBeenCalledOnce());
+    const logout = auth.logout();
+    secretSet.resolve();
+
+    await expect(refresh).rejects.toMatchObject({
+      name: "AuthOperationInvalidatedError",
+    });
+    await expect(logout).resolves.toBe(true);
+    expect(remove).toHaveBeenCalledOnce();
+    expect(storedToken).toBeNull();
+    expect(auth.authState.isLoggedIn).toBe(false);
+  });
+
+  it("does not commit an OAuth callback after logout invalidates the attempt", async () => {
+    const token = deferred<obsidian.RequestUrlResponse>();
+    let callback: ((params: Record<string, string>) => void) | undefined;
+    const secretSet = vi.fn().mockResolvedValue(undefined);
+    vi.spyOn(obsidian, "requestUrl").mockReturnValue(token.promise);
+    const auth = new AuthModule(makeContext({
+      registerProtocolHandler: (_action, handler) => {
+        callback = handler;
+      },
+      secretStorage: {
+        set: secretSet,
+        get: vi.fn().mockResolvedValue(null),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      diag: {
+        log: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      } as never,
+    }));
+
+    await auth.initialize();
+    await auth.login();
+    callback?.({ code: "auth-code", state: "state-fixed" });
+    await vi.waitFor(() => expect(obsidian.requestUrl).toHaveBeenCalledOnce());
+    await expect(auth.logout()).resolves.toBe(true);
+
+    token.resolve({
+      status: 200,
+      headers: {},
+      json: {
+        access_token: "stale-access-token",
+        refresh_token: "stale-refresh-token",
+        expires_in: 3600,
+      },
+    });
+    await vi.waitFor(() => expect(auth.isPending).toBe(false));
+
+    expect(secretSet).not.toHaveBeenCalled();
+    expect(auth.authState.isLoggedIn).toBe(false);
+  });
+
+  it("does not report logout success when refresh-token removal is unverified", async () => {
+    const get = vi.fn().mockResolvedValue("persisted-refresh-token");
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      json: { access_token: "access-token", expires_in: 3600 },
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get,
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      diag: {
+        log: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+      } as never,
+    }));
+    await auth.refreshAccessToken("persisted-refresh-token");
+
+    await expect(auth.logout()).resolves.toBe(false);
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(get).toHaveBeenCalled();
   });
 });
 

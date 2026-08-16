@@ -136,15 +136,10 @@ export interface LocaleStrings {
   "settings.communityPlugins.status.restoreScopeChanged": string;
   "settings.communityPlugins.status.localBundleIncomplete": string;
   "settings.communityPlugins.status.remoteCatalogStale": string;
-  "settings.communityPlugins.decisions.local": string;
-  "settings.communityPlugins.decisions.remote": string;
-  "settings.communityPlugins.decisions.open": string;
-  "settings.communityPlugins.decisions.title": string;
-  "settings.communityPlugins.decisions.message": string;
-  "settings.communityPlugins.decisions.state": string;
-  "settings.communityPlugins.decisions.saveAndSync": string;
-  "settings.communityPlugins.decisions.enabled": string;
-  "settings.communityPlugins.decisions.disabled": string;
+  "settings.communityPlugins.guidance.reviewIncomplete": string;
+  "settings.communityPlugins.guidance.reinstall": string;
+  "settings.communityPlugins.guidance.reconfirm": string;
+  "settings.communityPlugins.guidance.retry": string;
   "settings.diagLog.name": string;
   "settings.diagLog.desc": string;
   "settings.diagReport.name": string;
@@ -194,8 +189,32 @@ export interface LocaleStrings {
   "syncView.delete.reject": string;
   "syncView.delete.reason": string;
   "syncView.emptyFolder.resolve": string;
+  "syncView.folderSubtree.review": string;
+  "syncView.folderSubtree.title": string;
+  "syncView.folderSubtree.description": string;
+  "syncView.folderSubtree.affectedFolders": string;
+  "syncView.folderSubtree.summary": string;
+  "syncView.folderSubtree.restoreTitle": string;
+  "syncView.folderSubtree.restoreDescription": string;
+  "syncView.folderSubtree.restore": string;
+  "syncView.folderSubtree.deleteTitle": string;
+  "syncView.folderSubtree.deleteDescription": string;
+  "syncView.folderSubtree.delete": string;
+  "syncView.folderSubtree.deleteUnavailableTitle": string;
+  "syncView.folderSubtree.deleteUnavailableDescription": string;
+  "syncView.folderSubtree.deleteConfirmTitle": string;
+  "syncView.folderSubtree.deleteConfirmMessage": string;
+  "syncView.folderSubtree.deleteConfirmWarning": string;
+  "syncView.folderLocation.resolve": string;
+  "syncView.folderLocation.title": string;
+  "syncView.folderLocation.description": string;
+  "syncView.folderLocation.localTitle": string;
+  "syncView.folderLocation.keepLocal": string;
+  "syncView.folderLocation.remoteTitle": string;
+  "syncView.folderLocation.keepRemote": string;
   "syncView.emptyFolder.title": string;
   "syncView.emptyFolder.description": string;
+  "syncView.emptyFolder.restoreTitle": string;
   "syncView.emptyFolder.restore": string;
   "syncView.emptyFolder.restoreDescription": string;
   "syncView.emptyFolder.bindTitle": string;
@@ -242,6 +261,23 @@ export interface LocaleStrings {
   "syncView.mutationResolution.action.moveLocal": string;
   "syncView.mutationResolution.action.deleteLocal": string;
   "syncView.mutationResolution.action.merge": string;
+  "syncView.pluginBundleReview.title": string;
+  "syncView.pluginBundleReview.description": string;
+  "syncView.pluginBundleReview.loading": string;
+  "syncView.pluginBundleReview.loadUnavailable": string;
+  "syncView.pluginBundleReview.conflictSummary": string;
+  "syncView.pluginBundleReview.open": string;
+  "syncView.pluginBundleReview.keepLocal": string;
+  "syncView.pluginBundleReview.keepRemote": string;
+  "syncView.pluginBundleReview.identical": string;
+  "syncView.pluginBundleReview.readOnly": string;
+  "syncView.pluginBundleReview.directionUnavailable": string;
+  "syncView.pluginBundleReview.reason.bundle-incomplete": string;
+  "syncView.pluginBundleReview.reason.facts-unavailable": string;
+  "syncView.pluginBundleReview.reason.manifest-invalid": string;
+  "syncView.pluginBundleReview.reason.identity-mismatch": string;
+  "syncView.pluginBundleReview.reason.platform-incompatible": string;
+  "syncView.pluginBundleReview.reason.predecessor-mismatch": string;
 
   // ---- Commands ----
   "command.syncNow": string;
@@ -284,17 +320,24 @@ export interface LocaleStrings {
   "result.v2ScopeRecoveryEvidenceUnavailable": string;
   "result.v2ScopeRecoveryVerificationInterrupted": string;
   "result.v2ScopeRecoveryChanged": string;
+  "result.sharedControlReadUnavailable": string;
   "reason.remoteScopeRecreate": string;
-  "result.communityPluginEnablementInvalid": string;
-  "result.communityPluginEnablementDecisionRequired": string;
   "result.communityPluginLocalIgnoreFailed": string;
   "notice.communityPlugins.loadFailed": string;
   "notice.communityPlugins.remoteCatalogFailed": string;
+  "notice.communityPlugins.enablementRetired": string;
   "notice.communityPlugins.enableFilesFirst": string;
   "notice.communityPlugins.decisionUnavailable": string;
   "notice.communityPlugins.globalDeleteUnavailable": string;
   "notice.emptyFolder.changed": string;
   "notice.emptyFolder.failed": string;
+  "notice.folderSubtree.changed": string;
+  "notice.folderSubtree.accepted": string;
+  "notice.folderSubtree.deleted": string;
+  "notice.folderSubtree.failed": string;
+  "notice.folderLocation.changed": string;
+  "notice.folderLocation.accepted": string;
+  "notice.folderLocation.failed": string;
   "notice.sharedFolderIdentity.changed": string;
   "notice.sharedFolderIdentity.accepted": string;
   "notice.sharedFolderIdentity.failed": string;
@@ -321,7 +364,6 @@ export interface LocaleStrings {
   "notice.sync.conflicts": string;
   "notice.sync.remoteDeletes": string;
   "notice.sync.mixedPending": string;
-  "notice.sync.communityPluginEnablement": string;
   "notice.sync.review": string;
   "notice.sync.cancelled": string;
   "notice.sync.failed": string;
@@ -329,7 +371,6 @@ export interface LocaleStrings {
   "notice.sync.recoveryWaiting": string;
   "notice.sync.recoveryRecovered": string;
   "notice.sync.recoveryBlocked": string;
-  "notice.sync.recoveryBlockedNoPath": string;
   "notice.sync.recoveryResetBlocked": string;
   "notice.accountMismatch": string;
   "notice.diagnosticReportGenerated": string;
@@ -413,6 +454,7 @@ export interface LocaleStrings {
 
   // ---- Conflict Detail Modal ----
   "conflictDetail.title": string;
+  "conflictDetail.path": string;
   "conflictDetail.modifiedTime": string;
   "conflictDetail.fileSize": string;
   "conflictDetail.localLabel": string;
@@ -531,8 +573,9 @@ export interface LocaleStrings {
   "syncView.progress.current": string;
   "syncView.progress.items": string;
   "syncView.progress.completed": string;
-  "syncView.progress.remoteScopeRecoveryFailed": string;
-  "syncView.progress.remoteScopeRecoveryStopped": string;
+  "syncView.progress.remoteScopeRecoveryFailureTitle": string;
+  "syncView.progress.remoteScopeRecoveryFailureSummary": string;
+  "syncView.progress.remoteScopeRecoveryFailureNextStep": string;
   "syncView.cancelSync": string;
   "syncView.cancelling": string;
   "syncView.failure.contentUnavailable": string;
@@ -546,15 +589,28 @@ export interface LocaleStrings {
   "syncView.failure.local": string;
   "syncView.failure.unknown": string;
   "syncView.status.synced": string;
+  "syncView.status.awaitingLogin": string;
   "syncView.recovery.checking": string;
+  "syncView.recovery.checkingTop": string;
   "syncView.recovery.waitingNetwork": string;
   "syncView.recovery.blocked": string;
   "syncView.recovery.detail.pending": string;
   "syncView.recovery.detail.retryAt": string;
   "syncView.recovery.detail.blocked": string;
   "syncView.recovery.detail.blockedPath": string;
+  "syncView.recovery.sectionTitle": string;
+  "syncView.recovery.summary.checking": string;
+  "syncView.recovery.summary.waitingNetwork": string;
+  "syncView.recovery.summary.blocked": string;
+  "syncView.recovery.field.path": string;
+  "syncView.recovery.field.reason": string;
+  "syncView.recovery.field.retryAt": string;
+  "syncView.recovery.nextStep.checking": string;
+  "syncView.recovery.nextStep.waitingNetwork": string;
+  "syncView.recovery.nextStep.review": string;
+  "syncView.recovery.nextStep.recheck": string;
   "syncView.recovery.checkAgain": string;
-  "syncView.recovery.reviewAndResolve": string;
+  "syncView.recovery.reviewDetails": string;
   "mutationRecovery.reason.factsChanged": string;
   "mutationRecovery.reason.scopeChanged": string;
   "mutationRecovery.reason.accountChanged": string;
@@ -574,6 +630,7 @@ export interface LocaleStrings {
   "syncView.history.title": string;
   "syncView.openSettings": string;
   "syncView.history.empty": string;
+  "syncView.history.noFileChanges": string;
   "syncView.history.omitted": string;
   "syncView.history.status.success": string;
   "syncView.history.status.partial": string;
@@ -587,10 +644,6 @@ export interface LocaleStrings {
   "syncView.history.mode.auto": string;
   "syncView.history.mode.first": string;
   "syncView.history.duration": string;
-  "syncView.communityPlugins.pendingTitle": string;
-  "syncView.communityPlugins.pendingDescription": string;
-  "syncView.communityPlugins.review": string;
-  "syncView.communityPlugins.history": string;
 
   // ---- Confirm Modal ----
   "confirm.firstSyncTitle": string;
@@ -603,6 +656,9 @@ export interface LocaleStrings {
   "syncPlan.migrationConfirmTitle": string;
   "syncPlan.migrationConfirmMessage": string;
   "syncPlan.migrationConfirm": string;
+  "syncPlan.remoteScopeRecreateConfirmTitle": string;
+  "syncPlan.remoteScopeRecreateConfirmMessage": string;
+  "syncPlan.remoteScopeRecreateConfirm": string;
   "confirm.deleteWarning": string;
 
   // ---- Sync Plan Alert & Review ----
@@ -615,7 +671,10 @@ export interface LocaleStrings {
   "syncPlan.confirmExecute": string;
   "syncPlan.recalculate": string;
   "syncPlan.detailsUnavailable": string;
+  "syncPlan.restoringDetails": string;
+  "syncPlan.restoreDetails": string;
   "syncPlan.noChanges": string;
+  "syncPlan.remoteScopeRecreateSummary": string;
 
   // ---- Status Bar Plan Review ----
   "status.planReview": string;

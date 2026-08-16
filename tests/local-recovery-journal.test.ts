@@ -103,6 +103,103 @@ describe("S03 — state-neutral local recovery journal", () => {
     expect(new Uint8Array(files.get(path) as ArrayBuffer)).toEqual(new Uint8Array(newer));
   });
 
+  it("rolls back a partially written plugin bundle as one recovery unit", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const mainPath = `${root}/main.js`;
+    const manifestPath = `${root}/manifest.json`;
+    const stylesPath = `${root}/styles.css`;
+    const oldMain = bytes(1);
+    const oldManifest = bytes(2);
+    const newMain = bytes(3);
+    const newManifest = bytes(4);
+    const newStyles = bytes(5);
+    const { adapter, files } = makeMemoryAdapter({
+      [mainPath]: oldMain,
+      [manifestPath]: oldManifest,
+    });
+    const journal = new LocalRecoveryJournal(
+      adapter,
+      ".obsidian/plugins/easy-sync/tmp",
+    );
+
+    await journal.prepareCopiedBundleOriginals([
+      {
+        targetPath: mainPath,
+        expected: await entry(mainPath, oldMain),
+        original: oldMain,
+        downloaded: { hash: await sha256Hex(newMain), size: newMain.byteLength },
+      },
+      {
+        targetPath: stylesPath,
+        expected: undefined,
+        original: null,
+        downloaded: { hash: await sha256Hex(newStyles), size: newStyles.byteLength },
+      },
+      {
+        targetPath: manifestPath,
+        expected: await entry(manifestPath, oldManifest),
+        original: oldManifest,
+        downloaded: { hash: await sha256Hex(newManifest), size: newManifest.byteLength },
+      },
+    ]);
+    await adapter.writeBinary(mainPath, newMain);
+    await adapter.writeBinary(stylesPath, newStyles);
+
+    expect(await journal.recover()).toBe("restored");
+    expect(new Uint8Array(files.get(mainPath) as ArrayBuffer))
+      .toEqual(new Uint8Array(oldMain));
+    expect(new Uint8Array(files.get(manifestPath) as ArrayBuffer))
+      .toEqual(new Uint8Array(oldManifest));
+    expect(files.has(stylesPath)).toBe(false);
+    expect(files.has(journal.intentPath)).toBe(false);
+  });
+
+  it("preserves a third bundle member version while rolling back the others", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const mainPath = `${root}/main.js`;
+    const manifestPath = `${root}/manifest.json`;
+    const oldMain = bytes(1);
+    const oldManifest = bytes(2);
+    const newMain = bytes(3);
+    const newManifest = bytes(4);
+    const userManifest = bytes(9);
+    const { adapter, files } = makeMemoryAdapter({
+      [mainPath]: oldMain,
+      [manifestPath]: oldManifest,
+    });
+    const journal = new LocalRecoveryJournal(
+      adapter,
+      ".obsidian/plugins/easy-sync/tmp",
+    );
+
+    await journal.prepareCopiedBundleOriginals([
+      {
+        targetPath: mainPath,
+        expected: await entry(mainPath, oldMain),
+        original: oldMain,
+        downloaded: { hash: await sha256Hex(newMain), size: newMain.byteLength },
+      },
+      {
+        targetPath: manifestPath,
+        expected: await entry(manifestPath, oldManifest),
+        original: oldManifest,
+        downloaded: {
+          hash: await sha256Hex(newManifest),
+          size: newManifest.byteLength,
+        },
+      },
+    ]);
+    await adapter.writeBinary(mainPath, newMain);
+    await adapter.writeBinary(manifestPath, newManifest);
+    await adapter.writeBinary(manifestPath, userManifest);
+
+    expect(await journal.recover()).toBe("preserved-newer");
+    expect(new Uint8Array(files.get(mainPath) as ArrayBuffer))
+      .toEqual(new Uint8Array(oldMain));
+    expect(new Uint8Array(files.get(manifestPath) as ArrayBuffer))
+      .toEqual(new Uint8Array(userManifest));
+  });
+
   it("keeps the intent and fails closed when the recovery copy cannot be read", async () => {
     const path = "note.md";
     const oldContent = bytes(1);

@@ -3,8 +3,10 @@ import { I18n } from "../src/i18n";
 import {
   formatMutationRecoveryHistory,
   mutationRecoveryBlockReasonText,
+  mutationRecoveryBodyPresentation,
   mutationRecoveryStatusDetail,
   mutationRecoveryStatusLabel,
+  mutationRecoveryTopStatusLabel,
 } from "../src/ui/mutation-recovery-presentation";
 
 describe("mutation recovery presentation", () => {
@@ -21,6 +23,27 @@ describe("mutation recovery presentation", () => {
       firstPath: "notes/a.md",
       blockReason: null,
     }, t)).toBe("正在核对上次未完成的操作");
+
+    expect(mutationRecoveryTopStatusLabel({
+      kind: "checking",
+      total: 2,
+      settled: 0,
+      remaining: 2,
+      retryAt: null,
+      firstPath: "notes/a.md",
+      blockReason: null,
+    }, t)).toBe("正在核对");
+
+    const en = new I18n("en");
+    expect(mutationRecoveryTopStatusLabel({
+      kind: "checking",
+      total: 2,
+      settled: 0,
+      remaining: 2,
+      retryAt: null,
+      firstPath: "notes/a.md",
+      blockReason: null,
+    }, en.t.bind(en))).toBe("Checking");
 
     expect(mutationRecoveryStatusDetail({
       kind: "waiting-network",
@@ -66,6 +89,32 @@ describe("mutation recovery presentation", () => {
       expect(mutationRecoveryBlockReasonText(reason, en.t.bind(en)))
         .not.toBe(reason);
     }
+  });
+
+  it("separates the short top status from persistent reason, path, and next step", () => {
+    const zh = new I18n("zh-cn");
+    const t = zh.t.bind(zh);
+    const state = {
+      kind: "blocked" as const,
+      total: 2,
+      settled: 1,
+      remaining: 1,
+      retryAt: null,
+      firstPath: ".obsidian/plugins/dataview/data.json",
+      blockReason: "facts-changed" as const,
+      blockedOperationId: "op-1",
+      manualResolutionAvailable: true,
+    };
+
+    expect(mutationRecoveryStatusLabel(state, t)).toBe("未完成操作");
+    expect(mutationRecoveryBodyPresentation(state, t, () => "")).toEqual({
+      summary: "为避免覆盖或删除结果不明确的内容，EasySync 已暂停后续同步。",
+      path: ".obsidian/plugins/dataview/data.json",
+      reason: "文件或云端状态已经变化",
+      retryAt: null,
+      nextStep: "核对本机与云端内容并选择保留哪一侧。完成后会自动继续同步。",
+      actionKey: "syncView.recovery.reviewDetails",
+    });
   });
 
   it("describes one continuing history event without inventing separate failures", () => {

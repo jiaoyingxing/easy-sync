@@ -7,6 +7,7 @@ import {
   type StateV2IndexedDbStorageAuthority,
 } from "../src/sync/state-v2-authority-witness";
 import type { StateV2Manifest } from "../src/sync/state-v2-migration";
+import type { SharedSyncProtocolBinding } from "../src/sync/sync-protocol-v3";
 
 const paths = getEasySyncPaths(".obsidian");
 const scope = {
@@ -32,6 +33,26 @@ const indexedDbStorage: StateV2IndexedDbStorageAuthority = {
   lifecycleEpoch: 7,
   stateDigest: "b".repeat(64),
   selectedAt: 30,
+};
+const protocolV2: SharedSyncProtocolBinding = {
+  schemaVersion: 1,
+  protocolVersion: 2,
+  migrationGeneration: "c".repeat(64),
+  confirmedAllDevicesUpdatedAt: 11,
+  recordId: "v2-id",
+  recordETag: "v2-etag",
+};
+const protocolV3: SharedSyncProtocolBinding = {
+  schemaVersion: 1,
+  protocolVersion: 3,
+  migrationGeneration: "c".repeat(64),
+  predecessorProtocolVersion: 2,
+  predecessorContentSha256: "d".repeat(64),
+  predecessorConfirmedAllDevicesUpdatedAt: 11,
+  createdAt: 11,
+  contentSha256: "e".repeat(64),
+  recordId: "v3-id",
+  recordETag: "v3-etag",
 };
 
 function makeHarness() {
@@ -250,6 +271,31 @@ describe("StateV2AuthorityWitnessStore", () => {
     );
     expect(harness.rawAdapter.rename).not.toHaveBeenCalled();
     expect(harness.files.has(paths.stateV2AuthorityWitnessNextFile)).toBe(false);
+  });
+
+  it("upgrades only the protocol binding on an unchanged active witness", async () => {
+    const harness = makeHarness();
+    const active = await harness.store.publishActive(manifest, 20, protocolV2);
+
+    const upgraded = await harness.store.upgradeProtocolBinding({
+      expectedManifest: manifest,
+      expectedRevision: active.revision,
+      expectedBinding: protocolV2,
+      nextBinding: protocolV3,
+      now: 30,
+    });
+
+    expect(upgraded).toMatchObject({
+      revision: active.revision + 1,
+      manifest,
+      protocolBinding: protocolV3,
+    });
+    await expect(harness.store.upgradeProtocolBinding({
+      expectedManifest: manifest,
+      expectedRevision: upgraded.revision,
+      expectedBinding: protocolV3,
+      nextBinding: { ...protocolV3, migrationGeneration: "f".repeat(64) },
+    })).rejects.toThrow("binding upgrade is not authorized");
   });
 
   it("does not overwrite a witness that changes during its atomic update", async () => {

@@ -12,7 +12,10 @@
  * and keeps the observable decisions under the same behavior contract.
  */
 
-import { isEasySyncSelfSyncFilePath } from "../obsidian-compat";
+import {
+  isEasySyncSelfSyncFilePath,
+  normalizeVaultPathKey,
+} from "../obsidian-compat";
 
 import {
   type BaseFileEntry,
@@ -64,9 +67,13 @@ export function isObsidianManagedConfigPath(
 ): boolean {
   // These files are live host-owned state. Their absence is not a durable
   // delete signal, so the present side restores the missing side.
-  const normalizedDir = configDir.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-  if (!normalizedDir || !path.startsWith(`${normalizedDir}/`)) return false;
-  return OBSIDIAN_MANAGED_CONFIG_FILES.has(path.slice(normalizedDir.length + 1));
+  const normalizedDir = normalizeVaultPathKey(configDir)
+    .replace(/^\/+|\/+$/g, "");
+  const normalizedPath = normalizeVaultPathKey(path);
+  if (!normalizedDir || !normalizedPath.startsWith(`${normalizedDir}/`)) return false;
+  return OBSIDIAN_MANAGED_CONFIG_FILES.has(
+    normalizedPath.slice(normalizedDir.length + 1),
+  );
 }
 
 /**

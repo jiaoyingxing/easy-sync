@@ -32,10 +32,13 @@ import {
   OneDriveError,
   OneDriveErrorType,
   RemoteVaultScopeIdentityError,
+  SharedSyncProtocolObservationError,
+  SyntheticRequestTimeoutError,
 } from "../onedrive/types";
 import type {
   DriveItem,
   RemoteVaultScopeIdentityFailureReason,
+  SharedSyncProtocolObservationComponent,
   UploadResult,
 } from "../onedrive/types";
 import { AuthError } from "../auth/types";
@@ -60,7 +63,12 @@ import type {
 } from "./state-manager";
 import {
   buildEmptyFolderResolutionSnapshotV1,
+  buildFolderLocationResolutionSnapshotV1,
+  buildFolderSubtreeReviewSnapshotV1,
   type EmptyFolderResolutionSnapshotV1,
+  type FolderLocationResolutionChoiceV1,
+  type FolderLocationResolutionSnapshotV1,
+  type FolderSubtreeReviewSnapshotV1,
 } from "./empty-folder-resolution";
 import {
   buildSharedFolderIdentityResolutionSnapshotV1,
@@ -91,14 +99,18 @@ import type {
   MutationCheckpointV1,
   MutationLedgerEntryV1,
   MutationRecoveryRunSummary,
+  SyncRunFacts,
   ManualMutationResolutionChoiceV1,
   ManualMutationResolutionSnapshotV1,
   ManualMutationResolutionV1,
   ManualMutationResolutionLocalFactV1,
   ManualMutationResolutionRemoteFactV1,
   ReceiptedRenameAnchorCollisionEvidenceV1,
-  SyncAttention,
   V2ActivationReviewKind,
+  CommunityPluginGenerationRestoreBindingV1,
+  CommunityPluginBundleReviewV1,
+  CommunityPluginBundleReviewBlockReasonV1,
+  CommunityPluginBundleSettlementV2,
 } from "./types";
 import type { DiagnosticLogger } from "./diagnostic-logger";
 import {
@@ -126,6 +138,15 @@ import { OperationLifecycle } from "./operation-lifecycle";
 import { EasySyncNoticeCenter, NOTICE_PRIORITY } from "../ui/notice-center";
 import { LocalRecoveryJournal } from "./local-recovery-journal";
 import { MergeReadyStore } from "./merge-ready-store";
+import {
+  areIndependentConservativeResetRecords,
+  buildConservativeResetRecordFootprints,
+  conservativeResetRecordPaths,
+  conservativeResetRecordRemoteIds,
+  conservativeResetFootprintsOverlap,
+  type ConservativeResetRecordFootprint,
+  isOrdinaryFileRecoveryRecord,
+} from "./conservative-reset-recovery";
 import {
   createTextMergeManualEvidenceV1,
   evaluateConservativeMergeV2,
@@ -184,17 +205,26 @@ import {
   type MigrationHoldV2,
 } from "./migration-hold-v2";
 import {
-  createOneDriveSharedSyncProtocolTransportV2,
+  ensureCanonicalSharedSyncProtocolV2,
   ensureSharedSyncProtocolV2,
-  type SharedSyncProtocolTransportV2,
+  type SharedSyncProtocolBindingV2,
+  type SharedSyncProtocolMutationTransportV2,
+  type SharedSyncProtocolObjectV2,
+  type SharedSyncProtocolV2,
 } from "./sync-protocol-v2";
 import {
-  createOneDriveSharedSyncProtocolTransportV3,
   ensureSharedSyncProtocolV3,
   type SharedSyncProtocolBinding,
   type SharedSyncProtocolBindingV3,
-  type SharedSyncProtocolTransportV3,
+  type SharedSyncProtocolMutationTransportV3,
+  type SharedSyncProtocolObjectV3,
 } from "./sync-protocol-v3";
+import {
+  classifySharedSyncProtocolProfile,
+  SHARED_SYNC_PROTOCOL_PROFILE_DIAGNOSTIC_EVENT,
+  type SharedSyncProtocolInconsistencyEvidence,
+  type SharedSyncProtocolProfile,
+} from "./shared-sync-protocol-profile";
 import {
   buildRemoteScopeRecoveryCandidateV2,
 } from "./remote-scope-recovery-v2";
@@ -210,15 +240,14 @@ import {
   cloneCommunityPluginSyncPolicy,
   DEFAULT_COMMUNITY_PLUGIN_SYNC_POLICY,
   getRestoringPluginIds,
+  isCommunityPluginDataSelected,
   isPluginSelected,
   type CommunityPluginRestoreSet,
   type CommunityPluginSyncPolicyV1,
-  type PluginScopeSelection,
 } from "./community-plugin-sync-policy";
 import {
   applyCommunityPluginLocalIgnores,
   classifyCommunityPluginManagedPath,
-  collectCommunityPluginIdsForEnablement,
   detectCommunityPluginDataLocalIgnores,
   detectCommunityPluginLocalIgnores,
   isCommunityPluginFolderPreservedByPolicy,
@@ -227,30 +256,62 @@ import {
   type CommunityPluginLocalIgnores,
 } from "./community-plugin-deletion-boundary";
 import {
-  parseCommunityPluginEnablementJson,
-  prepareCommunityPluginEnablementFromObservations,
-  sameCommunityPluginEnablementMigrationCarrierV2,
-  serializeCommunityPluginEnablementJson,
-  type CommunityPluginEnablementCommittedObservationV1,
-  type CommunityPluginEnablementMigrationCarrierV2,
-  type CommunityPluginEnablementSourceV2,
-  type PreparedCommunityPluginEnablement,
-} from "./community-plugin-enablement";
-import {
   assessCommunityPluginManifestCompatibility,
+  assertCommunityPluginManifestIdentityStable,
   compareCommunityPluginVersions,
   communityPluginManifestObservationMatchesRemote,
   communityPluginManifestRemoteSourceKey,
   createCommunityPluginManifestObservation,
+  findCommunityPluginManifestIdentityCollisions,
   parseCommunityPluginBundleManifest,
   parseCommunityPluginBundlePath,
+  type CommunityPluginBundleManifest,
   type CommunityPluginManifestObservationV1,
 } from "./community-plugin-bundle";
+import {
+  createCommunityPluginGenerationRestoreProjectionV1,
+  parseCommunityPluginGenerationObjectPathV1,
+  projectCommunityPluginGenerationRestorePlanItemsV1,
+  validateCommunityPluginGenerationRestoreProjectionV1,
+  type CommunityPluginGenerationBundleFileNameV1,
+  type CommunityPluginGenerationRestoreProjectionV1,
+} from "./community-plugin-generation-content-v1";
+import {
+  createOneDriveCommunityPluginGenerationContentTransportV1,
+} from "./community-plugin-generation-content-cloud-v1";
+import {
+  createOneDriveCommunityPluginLifecycleTransportV1,
+  readCommunityPluginLifecycleControlV1,
+} from "./community-plugin-lifecycle-cloud-v1";
+import type {
+  CommunityPluginLifecycleDeviceObserverV1,
+} from "./community-plugin-lifecycle-device-v1";
+import {
+  communityPluginAuthoritativePublishedBundleV1,
+  communityPluginParticipantKeyV1,
+} from "./community-plugin-lifecycle-v1";
 import {
   validateCommunityPluginJoinAuthorization,
   type CommunityPluginJoinAuthorization,
   type CommunityPluginJoinBlock,
 } from "./community-plugin-join";
+
+export interface RetryableObservationDisposition {
+  kind: "retryable-observation";
+  phase: "remotePrepare";
+  code: "shared-control-read-unavailable";
+  retry: "next-sync";
+  component: SharedSyncProtocolObservationComponent;
+}
+
+export type SyncRunDisposition = RetryableObservationDisposition;
+
+/** Monotonic execution facts owned by the executor. Presentation and
+ * scheduling must not reconstruct these facts from aggregate counters. */
+export type RetryableObservationResultClassification =
+  | { kind: "absent" }
+  | { kind: "valid"; disposition: RetryableObservationDisposition }
+  | { kind: "contradictory"; disposition: RetryableObservationDisposition };
 
 /** Result of a sync run */
 export interface SyncResult {
@@ -274,13 +335,19 @@ export interface SyncResult {
   errors: number;
   authExpired: boolean;
   message: string;
-  /** Stable user-attention reason; presentation must not infer this from message text. */
-  attention?: SyncAttention;
+  /** Stable machine semantics for narrow run outcomes that Main must not
+   * infer from localized copy or aggregate counters. */
+  disposition?: SyncRunDisposition;
+  /** Explicit run facts for new executor results. Optional only for legacy
+   * persisted data and older test doubles. */
+  runFacts?: SyncRunFacts;
   /** Device-local plugin opt-outs inferred from a prior shared item disappearing locally. */
   communityPluginLocalIgnores?: CommunityPluginLocalIgnores;
   /** Explicit device-local rejoin authorizations whose remote content is now
    *  durably present again and may be retired from settings. */
   communityPluginRestoresCompleted?: CommunityPluginRestoreSet;
+  /** Lifecycle generation confirmed by an exact sealed-generation restore. */
+  communityPluginRestoreGenerationByPluginId?: Record<string, number>;
   /** Persisted device join operations rejected before plugin mutation. */
   communityPluginJoinBlocks?: CommunityPluginJoinBlock[];
   /** Internal one-shot handoff: V2 authority imported and settled a public
@@ -307,6 +374,44 @@ export interface SyncResult {
   /** Aggregated GET-only remote-scope proof progress, never file mutations. */
   remoteScopeRecovery?: RemoteScopeRecoveryVerificationSummary;
   metrics?: ExecutionMetrics;
+}
+
+export function classifyRetryableObservationResult(
+  result: SyncResult,
+  context: Readonly<{ completedFileCount?: number }> = {},
+): RetryableObservationResultClassification {
+  const disposition = result.disposition;
+  if (!disposition) return { kind: "absent" };
+  const structurallyValid =
+    disposition.kind === "retryable-observation"
+    && disposition.phase === "remotePrepare"
+    && disposition.code === "shared-control-read-unavailable"
+    && disposition.retry === "next-sync"
+    && (
+      disposition.component === "directory"
+      || disposition.component === "v2"
+      || disposition.component === "v3"
+    )
+    && result.runFacts?.termination === "normal"
+    && result.runFacts.ordinaryPlanning === "not-entered"
+    && !result.success
+    && result.errors > 0
+    && result.uploaded === 0
+    && result.downloaded === 0
+    && result.deleted === 0
+    && (result.foldersCreated ?? 0) === 0
+    && (result.foldersMoved ?? 0) === 0
+    && (result.foldersDeleted ?? 0) === 0
+    && (result.filesMoved ?? 0) === 0
+    && result.conflicts === 0
+    && result.deferred === 0
+    // skippedLarge belongs to the complete scan before remote preparation.
+    && result.skippedIgnored === 0
+    && !result.authExpired
+    && (context.completedFileCount ?? 0) === 0;
+  return structurallyValid
+    ? { kind: "valid", disposition }
+    : { kind: "contradictory", disposition };
 }
 
 /** Result of executing a single plan item — caller collects baseUpsert/baseRemoval for batch persistence. */
@@ -347,6 +452,10 @@ export interface SyncRunOptions {
   /** Observe and settle only the active V2 mutation ledger. Even when all
    *  records settle, return before baseline loading, planning, or mutation. */
   recoveryOnly?: boolean;
+  /** Reset-owned recovery may publish receipts/checkpoints but must not touch
+   * user files or Graph. A pending local journal or an outcome that requires
+   * continuation remains blocked for an ordinary sync round. */
+  mutationRecoveryObservationOnly?: boolean;
   /** Internal, device-local restore authorities derived from persisted V2
    * participation plus a fresh, complete remote plugin catalog. */
   communityPluginJoinAuthorizations?: readonly CommunityPluginJoinAuthorization[];
@@ -371,24 +480,6 @@ function excludeSelectedCommunityPluginFiles(
       ),
     },
   };
-}
-
-interface PreparedCommunityPluginEnablementWork {
-  path: string;
-  selectedPluginIds: string[];
-  observedLocal: LocalFileEntry | undefined;
-  observedLocalIds: string[];
-  observedRemote: RemoteFileEntry | undefined;
-  observedRemoteIds: string[];
-  observation: CommunityPluginEnablementCommittedObservationV1;
-  prepared: PreparedCommunityPluginEnablement;
-  migrationCarrier: CommunityPluginEnablementMigrationCarrierV2;
-}
-
-class CommunityPluginEnablementVersionChangedError extends Error {
-  constructor(readonly side: "local" | "remote") {
-    super(`Community plugin enablement ${side} version changed`);
-  }
 }
 
 type StreamDownloadAdapter = DataAdapter & {
@@ -449,7 +540,7 @@ type ExactEmptyRemoteFolderInspection =
   | { status: "changed" };
 
 const MOBILE_STREAM_DOWNLOAD_MIN_BYTES = 8 * 1024 * 1024;
-const MOBILE_PLUGIN_MANIFEST_PREFLIGHT_CONCURRENCY = 3;
+const COMMUNITY_PLUGIN_MANIFEST_PREFLIGHT_CONCURRENCY = 3;
 const DESKTOP_RECONSTRUCTION_BATCH_FILES = 4;
 const MOBILE_RECONSTRUCTION_BATCH_FILES = 2;
 const DESKTOP_RECONSTRUCTION_BATCH_BYTES = 32 * 1024 * 1024;
@@ -460,6 +551,18 @@ interface PreparedDownload {
   content?: ArrayBuffer;
   downloaded?: { size: number; hash: string };
   error?: unknown;
+}
+
+interface PreparedCommunityPluginLegacyBundle {
+  pluginId: string;
+  files: Array<{
+    fileName: CommunityPluginGenerationBundleFileNameV1;
+    path: string;
+    size: number;
+    hash: string;
+    content: ArrayBuffer;
+  }>;
+  stylesPresent: boolean;
 }
 
 export interface ReviewedContentEqualityProof {
@@ -749,36 +852,247 @@ export interface SyncCallbacks {
 function availableSharedSyncProtocolTransportV2(
   client: OneDriveClient,
   vaultName: string,
-): SharedSyncProtocolTransportV2 | null {
+): SharedSyncProtocolMutationTransportV2 | null {
   const candidate = client as OneDriveClient & {
-    readSharedSyncProtocolV2?: OneDriveClient["readSharedSyncProtocolV2"];
     createSharedSyncProtocolV2?: OneDriveClient["createSharedSyncProtocolV2"];
     readSharedSyncProtocolV2ById?:
       OneDriveClient["readSharedSyncProtocolV2ById"];
   };
-  return typeof candidate.readSharedSyncProtocolV2 === "function"
-    && typeof candidate.createSharedSyncProtocolV2 === "function"
+  return typeof candidate.createSharedSyncProtocolV2 === "function"
     && typeof candidate.readSharedSyncProtocolV2ById === "function"
-    ? createOneDriveSharedSyncProtocolTransportV2(candidate, vaultName)
+    ? {
+        createOnly: (content) =>
+          candidate.createSharedSyncProtocolV2!(vaultName, content),
+        readById: (id) => candidate.readSharedSyncProtocolV2ById!(id),
+      }
     : null;
 }
 
 function availableSharedSyncProtocolTransportV3(
   client: OneDriveClient,
   vaultName: string,
-): SharedSyncProtocolTransportV3 | null {
+): SharedSyncProtocolMutationTransportV3 | null {
   const candidate = client as OneDriveClient & {
-    readSharedSyncProtocolV3?: OneDriveClient["readSharedSyncProtocolV3"];
     createSharedSyncProtocolV3?: OneDriveClient["createSharedSyncProtocolV3"];
     readSharedSyncProtocolV3ById?:
       OneDriveClient["readSharedSyncProtocolV3ById"];
   };
-  return typeof candidate.readSharedSyncProtocolV3 === "function"
-    && typeof candidate.createSharedSyncProtocolV3 === "function"
+  return typeof candidate.createSharedSyncProtocolV3 === "function"
     && typeof candidate.readSharedSyncProtocolV3ById === "function"
-    ? createOneDriveSharedSyncProtocolTransportV3(candidate, vaultName)
+    ? {
+        createOnly: (content) =>
+          candidate.createSharedSyncProtocolV3!(vaultName, content),
+        readById: (id) => candidate.readSharedSyncProtocolV3ById!(id),
+      }
     : null;
 }
+
+type SharedSyncProtocolObjects = {
+  v2: SharedSyncProtocolObjectV2 | null;
+  v3: SharedSyncProtocolObjectV3 | null;
+};
+
+function sharedSyncProtocolV2MatchesBinding(
+  object: SharedSyncProtocolObjectV2,
+  protocol: SharedSyncProtocolV2,
+  binding: SharedSyncProtocolBindingV2,
+  scope: SyncScope,
+): boolean {
+  return object.id === binding.recordId
+    && object.eTag === binding.recordETag
+    && protocol.migrationGeneration === binding.migrationGeneration
+    && protocol.confirmedAllDevicesUpdatedAt
+      === binding.confirmedAllDevicesUpdatedAt
+    && sameSyncScope(protocol.scope, scope);
+}
+
+type SharedSyncProtocolObservationFailure =
+  | {
+    component: SharedSyncProtocolObservationComponent;
+    retryable: true;
+    reason:
+      | "synthetic-timeout"
+      | "network-unavailable"
+      | "service-unavailable"
+      | "snapshot-stale";
+    cause: unknown;
+  }
+  | {
+    component: SharedSyncProtocolObservationComponent;
+    retryable: false;
+    reason: "observation-invalid" | "control-directory-not-found";
+    cause: unknown;
+  };
+
+function classifySharedSyncProtocolObservationFailure(
+  error: unknown,
+): SharedSyncProtocolObservationFailure {
+  const component = error instanceof SharedSyncProtocolObservationError
+    ? error.component
+    : "directory";
+  const cause = error instanceof SharedSyncProtocolObservationError
+    ? error.observationCause
+    : error;
+  if (
+    cause instanceof OneDriveError
+    && cause.type === OneDriveErrorType.NotFound
+  ) {
+    return component === "directory"
+      ? {
+          component,
+          retryable: false,
+          reason: "control-directory-not-found",
+          cause,
+        }
+      : {
+          component,
+          retryable: true,
+          reason: "snapshot-stale",
+          cause,
+        };
+  }
+  if (cause instanceof SyntheticRequestTimeoutError) {
+    return {
+      component,
+      retryable: true,
+      reason: "synthetic-timeout",
+      cause,
+    };
+  }
+  if (cause instanceof OneDriveError) {
+    if (cause.type === OneDriveErrorType.NetworkError || cause.statusCode === 408) {
+      return {
+        component,
+        retryable: true,
+        reason: "network-unavailable",
+        cause,
+      };
+    }
+    if (
+      cause.type === OneDriveErrorType.RateLimited
+      || cause.type === OneDriveErrorType.ServerError
+    ) {
+      return {
+        component,
+        retryable: true,
+        reason: "service-unavailable",
+        cause,
+      };
+    }
+  }
+  return {
+    component,
+    retryable: false,
+    reason: "observation-invalid",
+    cause,
+  };
+}
+
+function throwIfSharedSyncProtocolObservationIsTerminal(
+  failure: SharedSyncProtocolObservationFailure,
+): void {
+  if (failure.cause instanceof AuthError) throw failure.cause;
+  if (
+    failure.cause instanceof OneDriveError
+    && failure.cause.type === OneDriveErrorType.AuthExpired
+  ) {
+    throw failure.cause;
+  }
+  if (
+    failure.cause instanceof Error
+    && failure.cause.name === "AbortError"
+  ) {
+    throw failure.cause;
+  }
+}
+
+type SharedSyncProtocolUnavailable = {
+  status: "unavailable";
+  reason:
+    | "synthetic-timeout"
+    | "network-unavailable"
+    | "service-unavailable"
+    | "snapshot-stale";
+  component: SharedSyncProtocolObservationComponent;
+};
+
+type SharedSyncProtocolObservationResult =
+  | { status: "ready"; objects: SharedSyncProtocolObjects }
+  | SharedSyncProtocolUnavailable
+  | {
+    status: "blocked";
+    reason: "protocol-read-failed" | "control-directory-not-found";
+  };
+
+type SharedSyncProtocolObserved = Extract<
+  SharedSyncProtocolObservationResult,
+  { status: "ready" }
+>;
+type SharedSyncProtocolObservationStop = Exclude<
+  SharedSyncProtocolObservationResult,
+  { status: "ready" }
+>;
+
+class SharedSyncProtocolObservationStoppedError extends Error {
+  constructor(readonly observation: SharedSyncProtocolObservationStop) {
+    super(`Shared sync protocol observation stopped: ${observation.status}`);
+    this.name = "SharedSyncProtocolObservationStoppedError";
+  }
+}
+
+type SharedSyncProtocolStepResult<T> =
+  | {
+    status: "ready";
+    value: T;
+    observation: SharedSyncProtocolObserved;
+  }
+  | SharedSyncProtocolObservationStop
+  | { status: "blocked"; reason: string };
+
+type SharedSyncProtocolMutationReady = {
+  status: "ready";
+  source: "existing" | "created" | "create-race";
+};
+type SharedSyncProtocolMutationOutcome<
+  T extends SharedSyncProtocolMutationReady,
+> =
+  | T
+  | { status: "acknowledgement-required" }
+  | { status: "blocked"; reason: string };
+
+type EnsureSharedSyncProtocolReadyV2 = Extract<
+  Awaited<ReturnType<typeof ensureSharedSyncProtocolV2>>,
+  { status: "ready" }
+>;
+type EnsureCanonicalSharedSyncProtocolReadyV2 = Extract<
+  Awaited<ReturnType<typeof ensureCanonicalSharedSyncProtocolV2>>,
+  { status: "ready" }
+>;
+type EnsureSharedSyncProtocolReadyV3 = Extract<
+  Awaited<ReturnType<typeof ensureSharedSyncProtocolV3>>,
+  { status: "ready" }
+>;
+
+type FreshSharedSyncProtocolProfileObservationResult =
+  | {
+    status: "ready";
+    objects: SharedSyncProtocolObjects;
+    profile: SharedSyncProtocolProfile;
+  }
+  | SharedSyncProtocolUnavailable
+  | {
+    status: "blocked";
+    reason: "protocol-read-failed" | "control-directory-not-found";
+  };
+
+type ScopeFreeSharedProtocolResult =
+  | { status: "ready"; binding: SharedSyncProtocolBindingV3; source: string }
+  | SharedSyncProtocolUnavailable
+  | {
+    status: "blocked";
+    reason: string;
+    evidence?: SharedSyncProtocolInconsistencyEvidence;
+  };
 
 export class SyncExecutor {
   private running = false;
@@ -795,17 +1109,24 @@ export class SyncExecutor {
   private remoteRecoveryPreviewRequired = false;
   private localVersionRecoveredDuringLedger = false;
   private completeRemoteItems: DriveItem[] | null = null;
+  private isolatedMutationRecoveryPathCache: {
+    records: readonly Readonly<MutationLedgerEntryV1>[];
+    exactPathKeys: ReadonlySet<string>;
+    folderShellKeys: ReadonlySet<string>;
+  } | null = null;
+  private staleFirstSyncEvidenceChecked = false;
   private automaticHandlingPolicy: AutomaticHandlingPolicy = {
     ...DEFAULT_AUTOMATIC_HANDLING_POLICY,
   };
   private communityPluginSyncPolicy = cloneCommunityPluginSyncPolicy(
     DEFAULT_COMMUNITY_PLUGIN_SYNC_POLICY,
   );
-  private mobileCommunityPluginPreparedManifests = new Map<string, {
+  private communityPluginPreparedManifests = new Map<string, {
     sourceKey: string;
     prepared: PreparedDownload;
   }>();
   private mobileDesktopOnlyPluginIds = new Set<string>();
+  private communityPluginIdentityBlockedDirectoryIds = new Set<string>();
 
   constructor(
     private onedrive: OneDriveClient,
@@ -819,6 +1140,8 @@ export class SyncExecutor {
     private onProgressUpdate?: () => void,
     private lifecycle: OperationLifecycle = new OperationLifecycle(),
     private noticeCenter: EasySyncNoticeCenter = new EasySyncNoticeCenter(),
+    private communityPluginLifecycleDeviceObserver:
+      CommunityPluginLifecycleDeviceObserverV1 | null = null,
   ) {}
 
   private t(key: string, params?: Record<string, string | number>): string {
@@ -893,8 +1216,7 @@ export class SyncExecutor {
     if (!record || record.manualResolution || isFolderMutationIntent(record.intent)) {
       return false;
     }
-    return this.manualResolutionPaths(record.intent).every((path) =>
-      this.isManualResolutionPathEligible(path));
+    return this.isManualResolutionIntentEligible(record.intent);
   }
 
   /** Read-only facts for the narrow empty-folder resolution UI. */
@@ -902,6 +1224,20 @@ export class SyncExecutor {
     path: string,
   ): Promise<EmptyFolderResolutionSnapshotV1 | null> {
     return this.buildCurrentEmptyFolderResolutionSnapshot(path);
+  }
+
+  /** Read-only complete-subtree facts for one nested missing-local review. */
+  async getFolderSubtreeReviewSnapshot(
+    path: string,
+  ): Promise<FolderSubtreeReviewSnapshotV1 | null> {
+    return this.buildCurrentFolderSubtreeReviewSnapshot(path);
+  }
+
+  /** Read-only facts for choosing one final root after a two-sided move. */
+  async getFolderLocationResolutionSnapshot(
+    path: string,
+  ): Promise<FolderLocationResolutionSnapshotV1 | null> {
+    return this.buildCurrentFolderLocationResolutionSnapshot(path);
   }
 
   /** Read-only facts for an explicit shared-folder identity confirmation. */
@@ -966,11 +1302,117 @@ export class SyncExecutor {
     return this.buildCurrentMutationRecoveryResolutionSnapshot(record);
   }
 
+  /**
+   * Read the complete current bundle behind ordinary per-file conflicts.
+   * This is an ephemeral review only; it never authorizes a file mutation.
+   */
+  async getCommunityPluginBundleReviewSnapshot(
+    pluginId: string,
+  ): Promise<ManualMutationResolutionSnapshotV1 | null> {
+    if (
+      this.running
+      || this.hasSideActionsInFlight
+      || !this.state.isV2StateActive
+      || this.state.hasMutationLedgerCorruption
+      || this.state.hasV2StateLoadRecoveryBlock
+      || this.state.hasV2RemoteScopeRecovery
+      || pluginId === "easy-sync"
+      || !isPluginSelected(this.communityPluginSyncPolicy.files, pluginId)
+    ) return null;
+    const remoteScope = await this.onedrive.initVaultScope(this.vaultName);
+    const scope: SyncScope = {
+      accountId: this.state.boundAccountId,
+      ...remoteScope,
+    };
+    if (!this.state.remoteScope || !sameSyncScope(this.state.remoteScope, scope)) {
+      return null;
+    }
+    const configDir = getConfigDir(this.scanner.vault);
+    const matchingRecords = this.state.mutationLedger.filter((candidate) =>
+      !isFolderMutationIntent(candidate.intent)
+      && parseCommunityPluginBundlePath(candidate.intent.path, configDir)
+        ?.pluginId === pluginId);
+    if (matchingRecords.length > 0) {
+      const persisted = matchingRecords[0];
+      if (persisted.manualResolution) return null;
+      const record = this.state.prepareMutationRecoveryRecord(persisted, scope);
+      return record && !isFolderMutationIntent(record.intent)
+        ? this.buildCurrentPluginBundleReviewSnapshot(record)
+        : null;
+    }
+    if (this.state.mutationLedger.length > 0) return null;
+    return this.buildCurrentPluginBundleReviewSnapshot(null, pluginId, scope);
+  }
+
+  /**
+   * Inspect whether the complete current ledger belongs to exact intent-only
+   * plugin-code uploads that are leaving this device's scope. The returned
+   * records are an ephemeral compare-and-swap authorization; no state changes.
+   */
+  inspectSelectedPluginCodeUploadRecoveriesForScopeExit(
+    isPluginExcluded: (pluginId: string) => boolean,
+  ): MutationLedgerEntryV1[] | null {
+    if (
+      this.running
+      || this.hasSideActionsInFlight
+      || !this.state.isV2StateActive
+      || this.state.hasMutationLedgerCorruption
+      || this.state.hasMutationRecoveryQuarantineCorruption
+      || this.state.hasV2StateLoadRecoveryBlock
+      || this.state.hasV2RemoteScopeRecovery
+    ) return null;
+    const records = [...this.state.mutationLedger];
+    if (records.length === 0) return [];
+    const configDir = getConfigDir(this.scanner.vault);
+    for (const record of records) {
+      if (
+        record.receipt !== null
+        || record.manualResolution !== undefined
+        || !this.isPersistedSelectedPluginCodeUploadRecovery(record.intent)
+      ) return null;
+      const managed = classifyCommunityPluginManagedPath(
+        record.intent.path,
+        configDir,
+      );
+      if (managed?.kind !== "files" || !isPluginExcluded(managed.pluginId)) {
+        return null;
+      }
+    }
+    return structuredClone(records);
+  }
+
+  /**
+   * Retire only the exact ledger already proven to belong to a durable plugin
+   * scope exit. This never mutates either file side and refuses partial use.
+   */
+  async retireSelectedPluginCodeUploadRecoveriesForScopeExit(
+    isPluginExcluded: (pluginId: string) => boolean,
+  ): Promise<boolean> {
+    const records = this
+      .inspectSelectedPluginCodeUploadRecoveriesForScopeExit(
+        isPluginExcluded,
+      );
+    if (!records) return false;
+    if (records.length === 0) return true;
+    const retired = await this.state
+      .retireUnreceiptedMutationIntentsForScopeExit(records);
+    this.diag?.log(
+      "state",
+      "explicit plugin scope exit retired intent-only code uploads without file mutation",
+      { records: retired, mutations: 0 },
+    );
+    return retired === records.length;
+  }
+
   /** Persist and execute one exact user choice through the existing ledger. */
   async resolveMutationRecovery(
     reviewed: Readonly<ManualMutationResolutionSnapshotV1>,
     choice: ManualMutationResolutionChoiceV1,
   ): Promise<boolean> {
+    if (reviewed.bundleReview) {
+      if (!reviewed.bundleReview.executableChoices?.includes(choice)) return false;
+      return this.resolveCommunityPluginBundleReview(reviewed, choice);
+    }
     let resolved = false;
     const localExists = reviewed.local.some((fact) => fact.exists);
     const remoteExists = reviewed.remote.some((fact) => fact.exists);
@@ -1035,6 +1477,171 @@ export class SyncExecutor {
     return resolved;
   }
 
+  private async resolveCommunityPluginBundleReview(
+    reviewed: Readonly<ManualMutationResolutionSnapshotV1>,
+    choice: ManualMutationResolutionChoiceV1,
+  ): Promise<boolean> {
+    const bundle = reviewed.bundleReview;
+    if (!bundle || !bundle.executableChoices?.includes(choice)) return false;
+    let resolved = false;
+    const pluginRoot = `${getConfigDir(this.scanner.vault)}/plugins/${bundle.pluginId}`;
+    await this.enqueueSideAction(
+      pluginRoot,
+      choice === "keep-local" ? SyncActionType.Upload : SyncActionType.Download,
+      async (operationEpoch) => {
+        if (!this.activeSyncScope) return;
+        const pluginRecords = this.pluginBundlePredecessorRecords(bundle.pluginId);
+        const record = pluginRecords[0] ?? null;
+        const current = await this.buildCurrentPluginBundleReviewSnapshot(
+          record,
+          record ? undefined : bundle.pluginId,
+          record ? undefined : this.activeSyncScope,
+        );
+        if (
+          !current?.bundleReview
+          || current.factsDigest !== reviewed.factsDigest
+          || !current.bundleReview.executableChoices?.includes(choice)
+          || !this.canContinue(operationEpoch)
+        ) {
+          this.notice("notice.mutationResolution.changed", { path: pluginRoot });
+          return;
+        }
+        const conflicts = this.pluginBundleConflicts(bundle.pluginId);
+        const entry = this.buildCommunityPluginBundleSettlementEntry(
+          current,
+          pluginRecords,
+          conflicts,
+          choice,
+        );
+        if (!entry) return;
+        if (!await this.state.beginCommunityPluginBundleSettlement(
+          pluginRecords,
+          conflicts,
+          entry,
+        )) return;
+        const persisted = this.state.mutationLedger.find(
+          (candidate) => candidate.intent.operationId === entry.intent.operationId,
+        );
+        if (!persisted?.manualResolution || persisted.manualResolution.version !== 2) {
+          return;
+        }
+        const predecessorOperationIds = new Set(
+          persisted.manualResolution.predecessorOperationIds,
+        );
+        await this.resumeCommunityPluginBundleSettlement(
+          persisted,
+          operationEpoch,
+          true,
+        );
+        resolved = !this.state.mutationLedger.some((candidate) =>
+          candidate.intent.operationId === entry.intent.operationId
+          || predecessorOperationIds.has(candidate.intent.operationId));
+        if (resolved) {
+          this.notice("notice.mutationResolution.completed", { path: pluginRoot });
+        }
+        return resolved;
+      },
+      undefined,
+      { skipMutationRecovery: true },
+    );
+    return resolved;
+  }
+
+  private pluginBundlePredecessorRecords(
+    pluginId: string,
+  ): MutationLedgerEntryV1[] {
+    const configDir = getConfigDir(this.scanner.vault);
+    return this.state.mutationLedger.filter((candidate) =>
+      !candidate.manualResolution
+      && !isFolderMutationIntent(candidate.intent)
+      && parseCommunityPluginBundlePath(candidate.intent.path, configDir)?.pluginId
+        === pluginId);
+  }
+
+  private pluginBundleConflicts(pluginId: string): SyncPlanItem[] {
+    const configDir = getConfigDir(this.scanner.vault);
+    return this.state.pendingConflicts.filter((candidate) =>
+      parseCommunityPluginBundlePath(candidate.path, configDir)?.pluginId
+        === pluginId);
+  }
+
+  private buildCommunityPluginBundleSettlementEntry(
+    reviewed: Readonly<ManualMutationResolutionSnapshotV1>,
+    predecessors: readonly Readonly<MutationLedgerEntryV1>[],
+    conflicts: readonly Readonly<SyncPlanItem>[],
+    choice: ManualMutationResolutionChoiceV1,
+  ): MutationLedgerEntryV1 | null {
+    const bundle = reviewed.bundleReview;
+    if (
+      !bundle
+      || !bundle.executableChoices?.includes(choice)
+      || conflicts.some((conflict) => !conflict.decisionToken)
+    ) return null;
+    const selectedAt = Date.now();
+    const pluginRoot = `${getConfigDir(this.scanner.vault)}/plugins/${bundle.pluginId}`;
+    const outerIntent: MutationIntentV1 = {
+      version: 1,
+      operationId: `${selectedAt}-${++this.mutationSequence}-plugin-bundle`,
+      planRevision: this.state.planReviewRevision,
+      scope: { ...reviewed.scope },
+      action: choice === "keep-local" ? "upload" : "download",
+      path: pluginRoot,
+      stateEffect: "settlement-only",
+      expectedLocal: { exists: false },
+      expectedRemote: { exists: false },
+      createdAt: selectedAt,
+    };
+    const members = bundle.memberPaths.map((path) => {
+      const local = reviewed.local.find((fact) => fact.path === path);
+      const remote = reviewed.remote.find((fact) => fact.path === path);
+      if (!local || !remote) return null;
+      const intent: MutationIntentV1 = {
+        version: 1,
+        operationId: `${selectedAt}-${++this.mutationSequence}-plugin-member`,
+        planRevision: outerIntent.planRevision,
+        scope: { ...reviewed.scope },
+        action: choice === "keep-local"
+          ? local.exists ? "upload" : "deleteRemote"
+          : remote.exists ? "download" : "deleteLocal",
+        path,
+        stateEffect: "bundle-settlement",
+        expectedLocal: this.manualLocalExpectation(local),
+        expectedRemote: this.manualRemoteExpectation(remote),
+        createdAt: selectedAt,
+      };
+      return { intent, receipt: null };
+    });
+    if (members.some((member) => !member)) return null;
+    const settlement: CommunityPluginBundleSettlementV2 = {
+      version: 2,
+      kind: "community-plugin-bundle-settlement",
+      choice,
+      factsDigest: reviewed.factsDigest,
+      selectedAt,
+      externalMutation: true,
+      intent: outerIntent,
+      receipt: null,
+      pluginId: bundle.pluginId,
+      pluginRoot,
+      predecessorOperationIds: predecessors
+        .map((record) => record.intent.operationId)
+        .sort((left, right) => left.localeCompare(right)),
+      conflictDecisions: conflicts
+        .map((conflict) => ({
+          path: conflict.path,
+          decisionToken: structuredClone(conflict.decisionToken!),
+        }))
+        .sort((left, right) => left.path.localeCompare(right.path)),
+      members: (members as CommunityPluginBundleSettlementV2["members"])
+        .sort((left, right) => left.intent.path.localeCompare(right.intent.path)),
+    };
+    return {
+      intent: outerIntent,
+      receipt: null,
+      manualResolution: settlement,
+    };
+  }
+
   /** Restore the exact reviewed remote empty folder at its committed local path. */
   async restoreReviewedEmptyFolder(
     reviewed: Readonly<EmptyFolderResolutionSnapshotV1>,
@@ -1071,6 +1678,353 @@ export class SyncExecutor {
         return true;
       },
     );
+  }
+
+  /**
+   * Apply one reviewed final folder location through the existing folder move
+   * executor and durable mutation ledger. Descendant contents are deliberately
+   * left to the ordinary sync that Main starts after this root checkpoint.
+   */
+  async resolveReviewedFolderLocation(
+    reviewed: Readonly<FolderLocationResolutionSnapshotV1>,
+    choice: FolderLocationResolutionChoiceV1,
+  ): Promise<boolean> {
+    if (this.stopSideActionForStateRecovery()) return false;
+    let resolved = false;
+    const actionType = choice === "keep-local"
+      ? SyncActionType.MoveRemoteFolder
+      : SyncActionType.MoveLocalFolder;
+    await this.enqueueSideAction(
+      reviewed.path,
+      actionType,
+      async (operationEpoch) => {
+        const current = await this.buildCurrentFolderLocationResolutionSnapshot(
+          reviewed.path,
+        );
+        if (
+          !current
+          || current.revision !== reviewed.revision
+          || !this.activeSyncScope
+          || !sameSyncScope(current.scope, this.activeSyncScope)
+          || !this.canContinue(operationEpoch)
+        ) {
+          this.notice("notice.folderLocation.changed", { path: reviewed.path });
+          return;
+        }
+        const item: SyncPlanItem = choice === "keep-local"
+          ? {
+              type: SyncActionType.MoveRemoteFolder,
+              path: current.localPath,
+              renameFrom: current.remotePath,
+              folder: {
+                remoteId: current.remoteId,
+                remoteETag: current.remoteETag,
+                parentRemoteId: current.localTargetParentId,
+                parentPath: current.localTargetParentPath,
+                sourceParentRemoteId: current.remoteSourceParentId,
+              },
+            }
+          : {
+              type: SyncActionType.MoveLocalFolder,
+              path: current.remotePath,
+              renameFrom: current.localPath,
+              folder: {
+                remoteId: current.remoteId,
+                remoteETag: current.remoteETag,
+                parentRemoteId: current.remoteSourceParentId,
+                parentPath: parentFolderPath(current.remotePath),
+                sourceParentRemoteId: current.remoteSourceParentId,
+              },
+            };
+        const intent = this.createMutationIntent(item, this.activeSyncScope);
+        if (!isFolderMutationIntent(intent)) {
+          throw new Error(`Reviewed folder location did not create a folder intent: ${current.path}`);
+        }
+        intent.reviewedLocationMove = {
+          version: 1,
+          sourceCommitSeq: current.sourceCommitSeq,
+          sourceLifecycleEpoch: current.sourceLifecycleEpoch,
+          sourceAnchorPath: current.path,
+        };
+        try {
+          const committed = await this.runDurableSideMutation(
+            intent,
+            operationEpoch,
+            async () => {
+              const latest = await this.buildCurrentFolderLocationResolutionSnapshot(
+                current.path,
+              );
+              if (
+                !latest
+                || latest.revision !== current.revision
+                || !this.canContinue(operationEpoch)
+              ) {
+                throw new MutationNotAppliedError(
+                  this.t("notice.folderLocation.changed", { path: current.path }),
+                );
+              }
+              const result: SyncResult = {
+                success: false,
+                uploaded: 0,
+                downloaded: 0,
+                foldersCreated: 0,
+                foldersMoved: 0,
+                foldersDeleted: 0,
+                filesMoved: 0,
+                deleted: 0,
+                conflicts: 0,
+                deferred: 0,
+                skippedLarge: 0,
+                skippedIgnored: 0,
+                errors: 0,
+                authExpired: false,
+                message: "",
+              };
+              const metrics: ExecutionMetrics = {
+                uploadBytes: 0,
+                uploadReadMs: 0,
+                uploadNetworkMs: 0,
+                activeUploads: 0,
+                peakUploads: 0,
+                fileTransfers: {
+                  upload: createFileTransferMetrics(),
+                  download: createFileTransferMetrics(),
+                },
+                mutationPersistence: createMutationPersistenceMetrics(),
+                automaticHandling: createAutomaticHandlingMetrics(
+                  this.automaticHandlingPolicy,
+                ),
+              };
+              const executed = await this.executeItem(
+                item,
+                result,
+                [],
+                [],
+                metrics,
+                {},
+                operationEpoch,
+                this.automaticHandlingPolicy,
+              );
+              if (!executed.mutationApplied || !executed.folderUpsert) {
+                throw new MutationNotAppliedError(
+                  this.t("notice.folderLocation.changed", { path: current.path }),
+                );
+              }
+              return folderMutationCheckpoint(
+                executed.folderUpsert,
+                current.remoteId,
+              );
+            },
+          );
+          if (!committed) return;
+          await this.state.retirePendingIssues([current.path]);
+          resolved = true;
+          this.notice("notice.folderLocation.accepted", {
+            path: choice === "keep-local" ? current.localPath : current.remotePath,
+          });
+          return true;
+        } catch (error) {
+          if (!(error instanceof MutationNotAppliedError)) throw error;
+          this.notice("notice.folderLocation.changed", { path: current.path });
+          return;
+        }
+      },
+      { status: "folder" },
+    );
+    return resolved;
+  }
+
+  /**
+   * Accept one complete remote subtree as the user's chosen source of truth.
+   * This action is state-only. The ordinary V2 planner performs every local
+   * folder create and file download afterwards through its existing ledger.
+   */
+  async restoreReviewedFolderSubtree(
+    reviewed: Readonly<FolderSubtreeReviewSnapshotV1>,
+  ): Promise<boolean> {
+    if (this.stopSideActionForStateRecovery()) return false;
+    let accepted = false;
+    await this.enqueueSideAction(
+      reviewed.path,
+      SyncActionType.FolderDeferred,
+      async (operationEpoch) => {
+        const current = await this.buildCurrentFolderSubtreeReviewSnapshot(
+          reviewed.path,
+        );
+        if (
+          !current
+          || current.revision !== reviewed.revision
+          || !this.activeSyncScope
+          || !sameSyncScope(current.scope, this.activeSyncScope)
+          || !this.canContinue(operationEpoch)
+          || !await this.liveFolderSubtreeMatches(current)
+          || !this.canContinue(operationEpoch)
+        ) {
+          this.notice("notice.folderSubtree.changed", { path: reviewed.path });
+          return;
+        }
+        const publication = await this.state.acceptReviewedFolderSubtreeRestore({
+          reviewed: current,
+        });
+        if (publication.status !== "accepted") {
+          this.notice("notice.folderSubtree.changed", { path: reviewed.path });
+          return;
+        }
+        accepted = true;
+        this.diag?.log(
+          "state",
+          "reviewed cloud folder subtree selected for ordinary local restore",
+          {
+            path: reviewed.path,
+            members: reviewed.members.length,
+            fileAnchors: publication.retiredFileAnchors,
+            folderAnchors: publication.retiredFolderAnchors,
+            mutations: 0,
+          },
+        );
+        this.notice("notice.folderSubtree.accepted", { path: reviewed.path });
+        return true;
+      },
+      { status: "folder" },
+    );
+    return accepted;
+  }
+
+  /**
+   * Delete one explicitly reviewed cloud subtree as a single Graph object.
+   * The root cTag is descendant-sensitive, so one If-Match protects every
+   * member shown in the review while the existing folder ledger handles an
+   * unknown response, receipt and V2 checkpoint.
+   */
+  async deleteReviewedFolderSubtree(
+    reviewed: Readonly<FolderSubtreeReviewSnapshotV1>,
+  ): Promise<boolean> {
+    if (this.stopSideActionForStateRecovery()) return false;
+    let deleted = false;
+    await this.enqueueSideAction(
+      reviewed.path,
+      SyncActionType.DeleteRemoteFolder,
+      async (operationEpoch) => {
+        const current = await this.buildCurrentFolderSubtreeReviewSnapshot(
+          reviewed.path,
+        );
+        const root = current?.members[0];
+        if (
+          !current
+          || current.revision !== reviewed.revision
+          || root?.kind !== "folder"
+          || !root.remoteETag
+          || !root.remoteCTag
+          || !this.activeSyncScope
+          || !sameSyncScope(current.scope, this.activeSyncScope)
+          || !this.canContinue(operationEpoch)
+          || !await this.liveFolderSubtreeMatches(current)
+          || !this.canContinue(operationEpoch)
+        ) {
+          this.notice("notice.folderSubtree.changed", { path: reviewed.path });
+          return;
+        }
+        const intent: FolderMutationIntentV2 = {
+          version: 2,
+          operationId: `${Date.now()}-${++this.mutationSequence}-delete-reviewed-subtree`,
+          planRevision: this.state.planReviewRevision,
+          scope: { ...this.activeSyncScope },
+          action: "deleteRemoteFolder",
+          path: current.path,
+          folderId: root.remoteId,
+          expectedLocal: { exists: false },
+          expectedRemote: {
+            exists: true,
+            driveId: root.remoteId,
+            parentId: root.parentRemoteId,
+            eTag: root.remoteETag,
+          },
+          expectedParent: {
+            driveId: root.parentRemoteId,
+            path: parentFolderPath(current.path),
+            eTag: this.currentRemoteFolderNode(root.parentRemoteId)?.eTag,
+          },
+          reviewedSubtreeDelete: {
+            version: 1,
+            sourceCommitSeq: current.sourceCommitSeq,
+            sourceLifecycleEpoch: current.sourceLifecycleEpoch,
+            rootCTag: root.remoteCTag,
+            memberCount: current.members.length,
+          },
+          createdAt: Date.now(),
+        };
+        try {
+          const committed = await this.runDurableSideMutation(
+            intent,
+            operationEpoch,
+            async () => {
+              const latest = await this.buildCurrentFolderSubtreeReviewSnapshot(
+                current.path,
+              );
+              const latestRoot = latest?.members[0];
+              if (
+                !latest
+                || latest.revision !== current.revision
+                || latestRoot?.kind !== "folder"
+                || latestRoot.remoteId !== root.remoteId
+                || latestRoot.remoteCTag !== root.remoteCTag
+                || !this.canContinue(operationEpoch)
+                || !await this.liveFolderSubtreeMatches(latest)
+              ) {
+                throw new MutationNotAppliedError(
+                  this.t("notice.folderSubtree.changed", { path: current.path }),
+                );
+              }
+              try {
+                await this.onedrive.deleteItem(
+                  this.vaultName,
+                  current.path,
+                  root.remoteCTag,
+                  root.remoteId,
+                );
+              } catch (error) {
+                if (error instanceof OneDriveError && isRemoteMutationConflict(error)) {
+                  throw new MutationNotAppliedError(
+                    this.t("notice.folderSubtree.changed", { path: current.path }),
+                  );
+                }
+                throw error;
+              }
+              if (await this.onedrive.getDriveItemMetadataById(root.remoteId)) {
+                throw new Error(`Reviewed remote subtree delete read-back failed: ${current.path}`);
+              }
+              const checkpoint = folderDeleteCheckpoint(
+                current.path,
+                root.remoteId,
+              );
+              checkpoint.folderMoveHintRemovals = current.members
+                .filter((member) => member.kind === "folder")
+                .map((member) => member.remoteId);
+              return checkpoint;
+            },
+          );
+          if (!committed) return;
+          deleted = true;
+          this.diag?.log(
+            "execute",
+            "reviewed cloud folder subtree deleted by root identity and content tag",
+            {
+              path: current.path,
+              members: current.members.length,
+              mutations: 1,
+            },
+          );
+          this.notice("notice.folderSubtree.deleted", { path: current.path });
+          return true;
+        } catch (error) {
+          if (!(error instanceof MutationNotAppliedError)) throw error;
+          this.notice("notice.folderSubtree.changed", { path: current.path });
+          return;
+        }
+      },
+      { status: "folder" },
+    );
+    return deleted;
   }
 
   /** Bind one explicitly selected empty local shell to the reviewed identity. */
@@ -1296,6 +2250,7 @@ export class SyncExecutor {
 
   private markCancelled(result: SyncResult): void {
     result.message = this.t("result.cancelled");
+    if (result.runFacts) result.runFacts.termination = "cancelled";
   }
 
   private canContinue(epoch: number, result?: SyncResult): boolean {
@@ -1320,12 +2275,30 @@ export class SyncExecutor {
     }).status === "equal";
   }
 
-  private async inspectLocalPath(path: string): Promise<LocalFileInspection | null> {
+  private async inspectLocalPath(
+    path: string,
+    options: Readonly<{ allowExcludedForRecovery?: boolean }> = {},
+  ): Promise<LocalFileInspection | null> {
     const scanner = this.scanner as LocalScanner & {
-      inspectFile?: (filePath: string) => Promise<LocalFileInspection>;
+      inspectFile?: (
+        filePath: string,
+        inspectionOptions?: Readonly<{ allowExcludedForRecovery?: boolean }>,
+      ) => Promise<LocalFileInspection>;
     };
     if (typeof scanner.inspectFile !== "function") return null;
-    return scanner.inspectFile(path);
+    return scanner.inspectFile(path, options);
+  }
+
+  private inspectLocalPathForMutation(
+    path: string,
+    intent: MutationIntent,
+  ): Promise<LocalFileInspection | null> {
+    return this.inspectLocalPath(
+      path,
+      this.isPersistedPluginDataDownloadSettlement(intent)
+        ? { allowExcludedForRecovery: true }
+        : undefined,
+    );
   }
 
   private async inspectManualResolutionRemote(
@@ -1371,17 +2344,323 @@ export class SyncExecutor {
     };
   }
 
+  private async readReviewedPluginLocalManifest(
+    path: string,
+    fact: Readonly<ManualMutationResolutionLocalFactV1>,
+  ): Promise<CommunityPluginBundleManifest | null> {
+    if (!fact.exists || !fact.hash || fact.size === undefined) return null;
+    const bytes = await this.scanner.vault.adapter.readBinary(path);
+    if (
+      bytes.byteLength !== fact.size
+      || await sha256Hex(bytes) !== fact.hash
+    ) return null;
+    const current = await this.inspectLocalPath(path);
+    if (
+      current?.status !== "present"
+      || !current.entry
+      || current.entry.hash !== fact.hash
+      || current.entry.size !== fact.size
+    ) return null;
+    return parseCommunityPluginBundleManifest(
+      new TextDecoder().decode(bytes),
+      parseCommunityPluginBundlePath(path, getConfigDir(this.scanner.vault))!
+        .pluginId,
+    );
+  }
+
+  private async readReviewedPluginRemoteManifest(
+    path: string,
+    fact: Readonly<ManualMutationResolutionRemoteFactV1>,
+    entry: Readonly<RemoteFileEntry> | undefined,
+  ): Promise<CommunityPluginBundleManifest | null> {
+    if (
+      !fact.exists
+      || !fact.hash
+      || fact.size === undefined
+      || !fact.driveId
+      || !fact.eTag
+      || !entry
+    ) return null;
+    const bytes = await this.onedrive.downloadFile(
+      this.vaultName,
+      path,
+      entry.downloadUrl,
+      fact.driveId,
+      fact.size,
+    );
+    if (
+      bytes.byteLength !== fact.size
+      || await sha256Hex(bytes) !== fact.hash
+    ) return null;
+    const current = await this.inspectRemotePath(path);
+    if (
+      !current
+      || current.driveId !== fact.driveId
+      || current.eTag !== fact.eTag
+      || current.size !== fact.size
+    ) return null;
+    return parseCommunityPluginBundleManifest(
+      new TextDecoder().decode(bytes),
+      parseCommunityPluginBundlePath(path, getConfigDir(this.scanner.vault))!
+        .pluginId,
+    );
+  }
+
+  private async buildCurrentPluginBundleReviewSnapshot(
+    record: Readonly<MutationLedgerEntryV1> | null,
+    requestedPluginId?: string,
+    requestedScope?: Readonly<SyncScope>,
+  ): Promise<ManualMutationResolutionSnapshotV1 | null> {
+    if (record && isFolderMutationIntent(record.intent)) return null;
+    const configDir = getConfigDir(this.scanner.vault);
+    const parsed = record
+      ? parseCommunityPluginBundlePath(record.intent.path, configDir)
+      : requestedPluginId
+        ? { pluginId: requestedPluginId }
+        : null;
+    if (
+      !parsed
+      || parsed.pluginId === "easy-sync"
+      || !isPluginSelected(this.communityPluginSyncPolicy.files, parsed.pluginId)
+      || (record && !this.isPersistedSelectedPluginCodeUploadRecovery(record.intent))
+      || (!record && !requestedScope)
+    ) {
+      return null;
+    }
+    const root = `${configDir}/plugins/${parsed.pluginId}`;
+    const allPaths = [
+      `${root}/main.js`,
+      `${root}/manifest.json`,
+      `${root}/styles.css`,
+    ];
+    const localByPath = new Map<string, ManualMutationResolutionLocalFactV1>();
+    const remoteByPath = new Map<string, ManualMutationResolutionRemoteFactV1>();
+    const remoteEntryByPath = new Map<string, RemoteFileEntry>();
+    let localReason: CommunityPluginBundleReviewBlockReasonV1 | undefined;
+    let remoteReason: CommunityPluginBundleReviewBlockReasonV1 | undefined;
+
+    for (const path of allPaths) {
+      const [localInspection, remoteInspection] = await Promise.all([
+        this.inspectLocalPath(path),
+        this.inspectManualResolutionRemote(path),
+      ]);
+      if (!localInspection || localInspection.status === "uncertain") {
+        localReason = "facts-unavailable";
+      } else {
+        localByPath.set(path, localInspection.status === "present"
+          && localInspection.entry
+          ? {
+              path,
+              exists: true,
+              hash: localInspection.entry.hash,
+              size: localInspection.entry.size,
+            }
+          : { path, exists: false });
+      }
+      remoteByPath.set(path, remoteInspection.fact);
+      if (remoteInspection.entry) {
+        remoteEntryByPath.set(path, remoteInspection.entry);
+      }
+    }
+
+    const manifestPath = `${root}/manifest.json`;
+    const mainPath = `${root}/main.js`;
+    let localManifest: CommunityPluginBundleManifest | null = null;
+    let remoteManifest: CommunityPluginBundleManifest | null = null;
+    const localManifestFact = localByPath.get(manifestPath);
+    const remoteManifestFact = remoteByPath.get(manifestPath);
+    if (localManifestFact?.exists) {
+      try {
+        localManifest = await this.readReviewedPluginLocalManifest(
+          manifestPath,
+          localManifestFact,
+        );
+        if (!localManifest) localReason = "facts-unavailable";
+      } catch {
+        localReason = "manifest-invalid";
+      }
+    }
+    if (remoteManifestFact?.exists) {
+      try {
+        remoteManifest = await this.readReviewedPluginRemoteManifest(
+          manifestPath,
+          remoteManifestFact,
+          remoteEntryByPath.get(manifestPath),
+        );
+        if (!remoteManifest) remoteReason = "facts-unavailable";
+      } catch {
+        remoteReason = "manifest-invalid";
+      }
+    }
+
+    const pluginRecords = this.state.mutationLedger.filter((candidate) => {
+      if (isFolderMutationIntent(candidate.intent)) return false;
+      return parseCommunityPluginBundlePath(candidate.intent.path, configDir)
+        ?.pluginId === parsed.pluginId;
+    });
+    const pluginConflicts = this.state.pendingConflicts.filter((candidate) =>
+      parseCommunityPluginBundlePath(candidate.path, configDir)?.pluginId
+        === parsed.pluginId);
+    const conflictPaths = [...new Set(
+      pluginConflicts.map((candidate) => candidate.path),
+    )].sort((left, right) => left.localeCompare(right));
+    if (!record && conflictPaths.length === 0) return null;
+    if (pluginRecords.some((candidate) =>
+      candidate.manualResolution
+      || !this.isPersistedSelectedPluginCodeUploadRecovery(candidate.intent))) {
+      localReason = "predecessor-mismatch";
+      remoteReason = "predecessor-mismatch";
+    }
+    if (
+      localManifest
+      && remoteManifest
+      && localManifest.id !== remoteManifest.id
+    ) {
+      localReason = "identity-mismatch";
+      remoteReason = "identity-mismatch";
+    }
+
+    const localComplete = !localReason
+      && localByPath.get(mainPath)?.exists === true
+      && localManifest !== null;
+    let remoteComplete = !remoteReason
+      && remoteByPath.get(mainPath)?.exists === true
+      && remoteManifest !== null;
+    if (remoteComplete && remoteManifest) {
+      const incompatibility = assessCommunityPluginManifestCompatibility(
+        remoteManifest,
+        {
+          localVersion: null,
+          isMobile: Platform.isMobile,
+          apiVersionSupported: remoteManifest.minAppVersion
+            ? requireApiVersion(remoteManifest.minAppVersion)
+            : true,
+        },
+      );
+      if (incompatibility) {
+        remoteComplete = false;
+        remoteReason = "platform-incompatible";
+      }
+    }
+    if (!localComplete && !localReason) localReason = "bundle-incomplete";
+    if (!remoteComplete && !remoteReason) remoteReason = "bundle-incomplete";
+
+    const stylesPath = `${root}/styles.css`;
+    const memberPaths = allPaths.filter((path) =>
+      path !== stylesPath
+      || localByPath.get(path)?.exists === true
+      || remoteByPath.get(path)?.exists === true);
+    const currentFactsComplete = memberPaths.every((path) =>
+      localByPath.has(path) && remoteByPath.has(path))
+      && pluginConflicts.every((conflict) => Boolean(conflict.decisionToken));
+    const keepLocalExecutionReady = localComplete && currentFactsComplete;
+    const keepRemoteExecutionReady = remoteComplete && currentFactsComplete;
+    const local = memberPaths.flatMap((path) => {
+      const fact = localByPath.get(path);
+      return fact ? [fact] : [];
+    });
+    const remote = memberPaths.flatMap((path) => {
+      const fact = remoteByPath.get(path);
+      return fact ? [fact] : [];
+    });
+    const identical = memberPaths.every((path) => {
+      const localFact = localByPath.get(path);
+      const remoteFact = remoteByPath.get(path);
+      return localFact && remoteFact
+        && localFact.exists === remoteFact.exists
+        && (!localFact.exists || (
+          localFact.hash === remoteFact.hash
+          && localFact.size === remoteFact.size
+        ));
+    });
+    const bundleReview: CommunityPluginBundleReviewV1 = {
+      kind: "community-plugin-bundle",
+      pluginId: parsed.pluginId,
+      displayName: localManifest?.name ?? remoteManifest?.name ?? null,
+      memberPaths,
+      conflictPaths,
+      predecessorOperationIds: pluginRecords
+        .map((candidate) => candidate.intent.operationId)
+        .sort((left, right) => left.localeCompare(right)),
+      local: {
+        available: localComplete,
+        ...(localReason ? { reason: localReason } : {}),
+      },
+      remote: {
+        available: remoteComplete,
+        ...(remoteReason ? { reason: remoteReason } : {}),
+      },
+      executionReady: keepLocalExecutionReady || keepRemoteExecutionReady,
+      ...((keepLocalExecutionReady || keepRemoteExecutionReady)
+        ? {
+            executableChoices: [
+              ...(keepLocalExecutionReady ? ["keep-local" as const] : []),
+              ...(keepRemoteExecutionReady ? ["keep-remote" as const] : []),
+            ],
+          }
+        : {}),
+    };
+    const digestInput = {
+      version: 1 as const,
+      sourceOperationId: record?.intent.operationId
+        ?? `pending-conflicts:${parsed.pluginId}`,
+      scope: record?.intent.scope ?? requestedScope!,
+      previousAction: record?.intent.version === 1
+        ? record.intent.action
+        : "merge",
+      path: record?.intent.path ?? manifestPath,
+      local,
+      remote,
+      bundleReview,
+    };
+    return {
+      version: 1,
+      sourceOperationId: digestInput.sourceOperationId,
+      scope: digestInput.scope,
+      previousAction: digestInput.previousAction,
+      path: digestInput.path,
+      local,
+      remote,
+      factsDigest: await sha256Hex(
+        new TextEncoder().encode(JSON.stringify(digestInput)).buffer,
+      ),
+      identical,
+      keepLocal: {
+        available: localComplete,
+        deletesOtherSide: localComplete && memberPaths.some((path) =>
+          localByPath.get(path)?.exists === false
+          && remoteByPath.get(path)?.exists === true),
+      },
+      keepRemote: {
+        available: remoteComplete,
+        deletesOtherSide: remoteComplete && memberPaths.some((path) =>
+          remoteByPath.get(path)?.exists === false
+          && localByPath.get(path)?.exists === true),
+      },
+      bundleReview,
+    };
+  }
+
   private async buildCurrentMutationRecoveryResolutionSnapshot(
     record: Readonly<MutationLedgerEntryV1>,
   ): Promise<ManualMutationResolutionSnapshotV1 | null> {
     if (isFolderMutationIntent(record.intent)) return null;
     const paths = this.manualResolutionPaths(record.intent);
-    if (paths.some((path) => !this.isManualResolutionPathEligible(path))) return null;
+    if (!this.isManualResolutionIntentEligible(record.intent)) return null;
+    const resumesSelectedPluginCodeUpload =
+      this.isPersistedSelectedPluginCodeUploadRecovery(record.intent);
+    if (resumesSelectedPluginCodeUpload) {
+      return this.buildCurrentPluginBundleReviewSnapshot(record);
+    }
+    const settlesExcludedPluginData =
+      this.isPersistedPluginDataDownloadSettlement(record.intent);
     const local: ManualMutationResolutionLocalFactV1[] = [];
     const remote: ManualMutationResolutionRemoteFactV1[] = [];
     for (const path of paths) {
       const [localInspection, remoteInspection] = await Promise.all([
-        this.inspectLocalPath(path),
+        this.inspectLocalPath(path, settlesExcludedPluginData
+          ? { allowExcludedForRecovery: true }
+          : undefined),
         this.inspectManualResolutionRemote(path),
       ]);
       if (!localInspection || localInspection.status === "uncertain") return null;
@@ -1416,6 +2695,16 @@ export class SyncExecutor {
         available: true,
         deletesOtherSide: localFact.exists && !remoteFact.exists,
       };
+      if (resumesSelectedPluginCodeUpload) {
+        // Plugin-code recovery only resumes the direction which the user had
+        // already authorized. Reversing one bundle member would bypass the
+        // normal complete-bundle download gate and could mix plugin versions.
+        keepLocal = {
+          available: localFact.exists,
+          deletesOtherSide: false,
+        };
+        keepRemote = { available: false, deletesOtherSide: false };
+      }
     } else {
       const localPresent = local.filter((fact) => fact.exists);
       const remotePresent = remote.filter((fact) => fact.exists);
@@ -1494,9 +2783,10 @@ export class SyncExecutor {
     record: Readonly<MutationLedgerEntryV1>,
   ): boolean {
     const manual = record.manualResolution;
-    const evidence = manual?.recoveryEvidence;
+    if (!manual || manual.version !== 1) return false;
+    const evidence = manual.recoveryEvidence;
     const envelope = this.state.getCommittedV2Envelope();
-    if (!manual || !evidence || !envelope) return false;
+    if (!evidence || !envelope) return false;
     const collision = inspectReceiptedRenameAnchorCollisionV2(envelope, record);
     if (collision && this.sameCollisionRecoveryEvidence(collision.evidence, evidence)) {
       return true;
@@ -1527,12 +2817,242 @@ export class SyncExecutor {
       left.localeCompare(right));
   }
 
-  private isManualResolutionPathEligible(path: string): boolean {
+  private isManualResolutionIntentEligible(intent: MutationIntent): boolean {
     const configDir = getConfigDir(this.scanner.vault);
-    return this.shouldIncludeRemotePath(path)
+    const paths = this.manualResolutionPaths(intent);
+    if (this.isPersistedSelectedPluginCodeUploadRecovery(intent)) {
+      return true;
+    }
+    if (this.isPersistedPluginDataDownloadSettlement(intent)) {
+      // This is not new scope authorization. A persisted, exact plugin-data
+      // download may be settled even if the user later disables that scope.
+      // The surrounding recovery path still binds the original scope and
+      // strictly rechecks both current file identities before any mutation.
+      return true;
+    }
+    return paths.every((path) =>
+      this.shouldIncludeRemotePath(path)
       && !isObsidianManagedConfigPath(path, configDir)
       && !isEasySyncSelfSyncFilePath(path, configDir)
-      && classifyCommunityPluginManagedPath(path, configDir)?.kind === undefined;
+      && classifyCommunityPluginManagedPath(path, configDir)?.kind === undefined);
+  }
+
+  private isPersistedSelectedPluginCodeUploadRecovery(
+    intent: MutationIntent,
+  ): boolean {
+    if (
+      isFolderMutationIntent(intent)
+      || intent.stateEffect !== undefined
+      || intent.action !== "upload"
+      || intent.sourcePath !== undefined
+      || !intent.expectedLocal.exists
+    ) return false;
+    const paths = this.manualResolutionPaths(intent);
+    if (paths.length !== 1 || !this.shouldIncludeRemotePath(paths[0])) return false;
+    const managed = classifyCommunityPluginManagedPath(
+      paths[0],
+      getConfigDir(this.scanner.vault),
+    );
+    return managed?.kind === "files"
+      && isPluginSelected(this.communityPluginSyncPolicy.files, managed.pluginId);
+  }
+
+  private isPersistedPluginDataDownloadSettlement(
+    intent: MutationIntent,
+  ): intent is MutationIntentV1 {
+    if (isFolderMutationIntent(intent)) return false;
+    const paths = this.manualResolutionPaths(intent);
+    if (paths.length !== 1) return false;
+    const managed = classifyCommunityPluginManagedPath(
+      paths[0],
+      getConfigDir(this.scanner.vault),
+    );
+    if (managed?.kind !== "data" || intent.sourcePath !== undefined) return false;
+    if (intent.stateEffect === "settlement-only") {
+      return intent.action === "upload"
+        || intent.action === "download"
+        || intent.action === "deleteRemote"
+        || intent.action === "deleteLocal";
+    }
+    return intent.stateEffect === undefined
+      && intent.action === "download"
+      && intent.expectedRemote.exists;
+  }
+
+  /**
+   * Independent ordinary-file records may keep their exact unknown results
+   * without owning the rest of the Vault. Managed configuration, folders,
+   * reviewed settlements, unbounded receipts and overlapping file records
+   * remain global until their dedicated owner resolves them.
+   */
+  private isolatableOrdinaryFileRecovery(
+    summary: Readonly<MutationRecoveryRunSummary>,
+    syncScope: Readonly<SyncScope>,
+  ): MutationLedgerEntryV1[] | null {
+    const records = this.state.mutationLedger;
+    if (
+      summary.state !== "blocked"
+      || summary.blockReason !== "facts-changed"
+      || !summary.blockedOperationId
+      || records.length < 1
+      || !records.some((record) => record.intent.operationId
+        === summary.blockedOperationId)
+    ) return null;
+    const configDir = getConfigDir(this.scanner.vault);
+    for (const record of records) {
+      const intent = record.intent;
+      const paths = conservativeResetRecordPaths(record);
+      if (
+        !isOrdinaryFileRecoveryRecord(record, syncScope)
+        || paths.some((path) =>
+          !this.shouldIncludeRemotePath(path)
+          || isObsidianManagedConfigPath(path, configDir)
+          || isEasySyncSelfSyncFilePath(path, configDir)
+          || classifyCommunityPluginManagedPath(path, configDir) !== null)
+      ) return null;
+    }
+    const envelope = this.state.getCommittedV2Envelope();
+    const currentPathByRemoteId = envelope
+      ? projectRemoteIndexV2(envelope.remoteIndex)
+      : new Map<string, string>();
+    if (!areIndependentConservativeResetRecords(
+      records,
+      currentPathByRemoteId,
+      Object.values(envelope?.anchors.byAnchorId ?? {}),
+    )) return null;
+    return structuredClone([...records]);
+  }
+
+  private isPathProtectedByIsolatedRecovery(
+    path: string,
+    records: readonly Readonly<MutationLedgerEntryV1>[],
+  ): boolean {
+    return this.isNamespaceProtectedByIsolatedRecovery(path, records);
+  }
+
+  private isFolderProtectedByIsolatedRecovery(
+    path: string,
+    records: readonly Readonly<MutationLedgerEntryV1>[],
+  ): boolean {
+    return this.isNamespaceProtectedByIsolatedRecovery(path, records);
+  }
+
+  private isNamespaceProtectedByIsolatedRecovery(
+    path: string,
+    records: readonly Readonly<MutationLedgerEntryV1>[],
+  ): boolean {
+    const boundary = this.isolatedMutationRecoveryBoundary(records);
+    let key = normalizeRemotePathKey(path);
+    if (boundary.folderShellKeys.has(key)) return true;
+    while (key.includes("/")) {
+      key = key.slice(0, key.lastIndexOf("/"));
+      if (boundary.exactPathKeys.has(key)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * An isolated record protects both its intent path and every current path
+   * still bound to the same committed file anchor. This matters after a
+   * conservative reset: a complete remote identity rebuild may observe that
+   * the response-unknown object moved, but that new path must not re-enter the
+   * ordinary planner under a different spelling.
+   */
+  private isolatedMutationRecoveryBoundary(
+    records: readonly Readonly<MutationLedgerEntryV1>[],
+  ): {
+    exactPathKeys: ReadonlySet<string>;
+    folderShellKeys: ReadonlySet<string>;
+  } {
+    if (records.length === 0) {
+      return { exactPathKeys: new Set(), folderShellKeys: new Set() };
+    }
+    if (this.isolatedMutationRecoveryPathCache?.records === records) {
+      return this.isolatedMutationRecoveryPathCache;
+    }
+    const protectedPaths = new Map<string, string>();
+    const add = (path: string | undefined): void => {
+      if (path === undefined) return;
+      const key = normalizeRemotePathKey(path);
+      if (!protectedPaths.has(key)) protectedPaths.set(key, path);
+    };
+    const envelope = this.state.getCommittedV2Envelope();
+    const currentPathByRemoteId = envelope
+      ? projectRemoteIndexV2(envelope.remoteIndex)
+      : new Map<string, string>();
+    for (const record of records) {
+      const recordPaths = conservativeResetRecordPaths(record);
+      const remoteIds = conservativeResetRecordRemoteIds(record);
+      for (const path of recordPaths) add(path);
+      if (!envelope) continue;
+      const intent = record.intent;
+      if (
+        remoteIds.size === 0
+        && intent.version === 1
+        && intent.action === "deleteLocal"
+        && intent.expectedLocal.exists
+      ) {
+        const expectedLocal = intent.expectedLocal;
+        const candidates = Object.values(envelope.anchors.byAnchorId).filter(
+          (anchor) => anchor.remoteId !== undefined
+            && normalizeRemotePathKey(anchor.lastPath)
+              === normalizeRemotePathKey(intent.path)
+            && anchor.contentHash === expectedLocal.hash
+            && anchor.size === expectedLocal.size,
+        );
+        if (candidates.length === 1 && candidates[0].remoteId) {
+          remoteIds.add(candidates[0].remoteId);
+        }
+      }
+      for (const remoteId of remoteIds) add(currentPathByRemoteId.get(remoteId));
+      for (const anchor of Object.values(envelope.anchors.byAnchorId)) {
+        const bindsExpectedIdentity = anchor.remoteId !== undefined
+          && remoteIds.has(anchor.remoteId);
+        if (!bindsExpectedIdentity) continue;
+        add(anchor.lastPath);
+        if (anchor.remoteId) add(currentPathByRemoteId.get(anchor.remoteId));
+      }
+    }
+    const exactPathKeys = new Set(protectedPaths.keys());
+    const folderShellKeys = new Set<string>();
+    for (const path of protectedPaths.values()) {
+      let folder = path;
+      while (true) {
+        folderShellKeys.add(normalizeRemotePathKey(folder));
+        const parent = parentFolderPath(folder);
+        if (parent === folder) break;
+        folder = parent;
+      }
+    }
+    this.isolatedMutationRecoveryPathCache = {
+      records,
+      exactPathKeys,
+      folderShellKeys,
+    };
+    return this.isolatedMutationRecoveryPathCache;
+  }
+
+  private sameRetainedMutationRecovery(
+    current: readonly Readonly<MutationLedgerEntryV1>[],
+    expected: readonly Readonly<MutationLedgerEntryV1>[],
+  ): boolean {
+    return expected.length > 0
+      && JSON.stringify(current) === JSON.stringify(expected);
+  }
+
+  private planItemIntersectsIsolatedRecovery(
+    item: Readonly<SyncPlanItem>,
+    records: readonly Readonly<MutationLedgerEntryV1>[],
+  ): boolean {
+    if (
+      this.isPathProtectedByIsolatedRecovery(item.path, records)
+      || (item.renameFrom !== undefined
+        && this.isPathProtectedByIsolatedRecovery(item.renameFrom, records))
+    ) return true;
+    if (!item.folder) return false;
+    return this.isFolderProtectedByIsolatedRecovery(item.path, records)
+      || (item.renameFrom !== undefined
+        && this.isFolderProtectedByIsolatedRecovery(item.renameFrom, records));
   }
 
   private currentManualResolutionScanScope(): {
@@ -1543,14 +3063,10 @@ export class SyncExecutor {
   } {
     const configDir = getConfigDir(this.scanner.vault);
     const policy = this.communityPluginSyncPolicy;
-    const structuredCommunityPluginPath = policy.files.mode !== "none"
-      ? `${configDir}/community-plugins.json`
-      : null;
     return {
       configDir,
       includeFilePath: (path) =>
-        path !== structuredCommunityPluginPath
-          && this.shouldIncludeRemotePath(path)
+        this.shouldIncludeRemotePath(path)
           && isCommunityPluginPathSelectedByPolicy(path, policy, configDir),
       includeFolderPath: (path) => this.scanner.shouldSyncFolderPath(path),
       preserveFolderPath: (path) =>
@@ -1603,6 +3119,152 @@ export class SyncExecutor {
         remoteCTag: live.contentTag,
       }),
     };
+  }
+
+  private async buildCurrentFolderSubtreeReviewSnapshot(
+    path: string,
+  ): Promise<FolderSubtreeReviewSnapshotV1 | null> {
+    const pending = this.state.pendingIssues.some((issue) =>
+      issue.actionType === SyncActionType.FolderDeferred
+        && issue.issueCode === "anchored-folder-missing-local"
+        && (
+          issue.path === path
+          || issue.path.startsWith(`${path}/`)
+          || path.startsWith(`${issue.path}/`)
+        ),
+    );
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!pending || !envelope || envelope.remoteIndex.complete !== true) return null;
+
+    const scan = await this.scanner.scanAll();
+    if (!scan.complete || !scan.folderScanComplete) return null;
+    const scope = this.currentManualResolutionScanScope();
+    const snapshot = buildFolderSubtreeReviewSnapshotV1(path, {
+      envelope,
+      localFiles: scan.entries.filter((entry) =>
+        scope.includeFilePath(entry.path)),
+      localFolders: scan.folders,
+      localFolderScanComplete: scan.folderScanComplete,
+      localMoveHints: this.state.localFolderMoveHints,
+      includeFilePath: scope.includeFilePath,
+      includeFolderPath: scope.includeFolderPath,
+      preserveFolderPath: scope.preserveFolderPath,
+    });
+    return snapshot;
+  }
+
+  private async buildCurrentFolderLocationResolutionSnapshot(
+    path: string,
+  ): Promise<FolderLocationResolutionSnapshotV1 | null> {
+    const pending = this.state.pendingIssues.find((issue) =>
+      issue.path === path
+        && issue.actionType === SyncActionType.FolderDeferred
+        && issue.issueCode === "folder-location-choice",
+    );
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!pending || !envelope || envelope.remoteIndex.complete !== true) {
+      return null;
+    }
+
+    const scan = await this.scanner.scanAll();
+    if (!scan.complete || !scan.folderScanComplete) return null;
+    const scope = this.currentManualResolutionScanScope();
+    const snapshot = buildFolderLocationResolutionSnapshotV1(path, {
+      envelope,
+      localFiles: scan.entries.filter((entry) =>
+        scope.includeFilePath(entry.path)),
+      localFolders: scan.folders,
+      localFolderScanComplete: scan.folderScanComplete,
+      localMoveHints: this.state.localFolderMoveHints,
+      includeFilePath: scope.includeFilePath,
+      includeFolderPath: scope.includeFolderPath,
+      preserveFolderPath: scope.preserveFolderPath,
+    });
+    if (!snapshot || !await this.liveFolderLocationMatches(snapshot)) return null;
+    return snapshot;
+  }
+
+  private async liveFolderLocationMatches(
+    reviewed: Readonly<FolderLocationResolutionSnapshotV1>,
+  ): Promise<boolean> {
+    const [byId, atRemotePath, atLocalPath, targetParentById, targetParentByPath] =
+      await Promise.all([
+        this.onedrive.getDriveItemMetadataById(reviewed.remoteId),
+        this.onedrive.getDriveItemMetadata(this.vaultName, reviewed.remotePath),
+        this.onedrive.getDriveItemMetadata(this.vaultName, reviewed.localPath),
+        this.onedrive.getDriveItemMetadataById(reviewed.localTargetParentId),
+        reviewed.localTargetParentPath === ""
+          ? Promise.resolve(null)
+          : this.onedrive.getDriveItemMetadata(
+            this.vaultName,
+            reviewed.localTargetParentPath,
+          ),
+      ]);
+    return Boolean(
+      byId?.folder
+        && atRemotePath?.folder
+        && byId.id === reviewed.remoteId
+        && atRemotePath.id === reviewed.remoteId
+        && byId.parentReference?.id === reviewed.remoteSourceParentId
+        && atRemotePath.parentReference?.id === reviewed.remoteSourceParentId
+        && byId.eTag === reviewed.remoteETag
+        && atRemotePath.eTag === reviewed.remoteETag
+        && atLocalPath === null
+        && targetParentById?.folder
+        && targetParentById.id === reviewed.localTargetParentId
+        && (reviewed.localTargetParentPath === ""
+          || (targetParentByPath?.folder
+            && targetParentByPath.id === reviewed.localTargetParentId)),
+    );
+  }
+
+  private async liveFolderSubtreeMatches(
+    reviewed: Readonly<FolderSubtreeReviewSnapshotV1>,
+  ): Promise<boolean> {
+    const root = reviewed.members[0];
+    if (!root || root.kind !== "folder" || root.path !== reviewed.path) {
+      return false;
+    }
+    const [rootById, rootByPath] = await Promise.all([
+      this.onedrive.getDriveItemMetadataById(root.remoteId),
+      this.onedrive.getDriveItemMetadata(this.vaultName, root.path),
+    ]);
+    if (
+      !rootById
+      || !rootByPath
+      || rootById.id !== rootByPath.id
+      || !folderSubtreeMemberMatchesDriveItem(root, rootById)
+      || !folderSubtreeMemberMatchesDriveItem(root, rootByPath)
+    ) return false;
+
+    const expectedById = new Map(
+      reviewed.members.map((member) => [member.remoteId, member]),
+    );
+    const expectedChildrenByParent = new Map<string, typeof reviewed.members>();
+    for (const member of reviewed.members.slice(1)) {
+      const children = expectedChildrenByParent.get(member.parentRemoteId) ?? [];
+      expectedChildrenByParent.set(member.parentRemoteId, [...children, member]);
+    }
+    for (const folder of reviewed.members.filter((member) =>
+      member.kind === "folder")) {
+      const children = await this.onedrive.listFolderChildrenById(
+        folder.remoteId,
+      );
+      const expectedChildren = expectedChildrenByParent.get(folder.remoteId) ?? [];
+      if (children.length !== expectedChildren.length) return false;
+      const actualIds = new Set(children.map((child) => child.id));
+      if (actualIds.size !== children.length) return false;
+      for (const expected of expectedChildren) {
+        const child = children.find((item) => item.id === expected.remoteId);
+        if (
+          !child
+          || !expectedById.has(child.id)
+          || child.name !== folderSubtreeLeafName(expected.path)
+          || !folderSubtreeMemberMatchesDriveItem(expected, child)
+        ) return false;
+      }
+    }
+    return true;
   }
 
   private async buildCurrentSharedFolderIdentityResolutionReview(
@@ -2063,6 +3725,7 @@ export class SyncExecutor {
       Platform.isMobile
       || item.type !== SyncActionType.Download
       || !item.remote
+      || Boolean(item.generationRestore)
       || item.remote.size > ADAPTIVE_DOWNLOAD_MAX_BYTES
     ) return false;
     const current = await this.inspectLocalPath(item.path);
@@ -2233,8 +3896,14 @@ export class SyncExecutor {
     result: SyncResult,
     operationEpoch: number,
     factsChangedPolicy: "defer" | "throw" = "defer",
+    allowExcludedForRecovery = false,
   ): Promise<ItemExecutionResult | null> {
-    const current = await this.inspectLocalPath(item.path);
+    const current = await this.inspectLocalPath(
+      item.path,
+      allowExcludedForRecovery
+        ? { allowExcludedForRecovery: true }
+        : undefined,
+    );
     if (!current) return null;
     if (current.status === "uncertain") {
       throw new Error(`Local version could not be verified before write: ${item.path}`);
@@ -2248,6 +3917,20 @@ export class SyncExecutor {
     }
 
     const currentEntry = current.status === "present" ? current.entry : undefined;
+    if (item.generationRestore) {
+      if (currentEntry && item.remote && this.localMatchesRemoteHash(
+        currentEntry,
+        item.remote,
+      )) {
+        return { executed: true };
+      }
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.RetryLater,
+        completionReason: this.t("syncView.fileStatus.deferred"),
+      };
+    }
     if (currentEntry && item.remote) {
       const base = this.state.baseSnapshot.find((entry) => entry.path === item.path);
       let equality = resolveContentEquality({
@@ -2338,6 +4021,84 @@ export class SyncExecutor {
     }
   }
 
+  private async inspectGenerationRestoreSource(
+    sourcePath: string,
+    expected: Extract<MutationIntentV1["expectedRemote"], { exists: true }>,
+  ): Promise<DriveItem | null> {
+    const parsed = parseCommunityPluginGenerationObjectPathV1(sourcePath);
+    if (
+      !parsed
+      || !expected.sha256Hash
+      || parsed.sha256Hash !== expected.sha256Hash.toLowerCase()
+    ) return null;
+    const current = await this.onedrive.getDriveItemMetadataById(
+      expected.driveId,
+      "downloadVersionVerify",
+    );
+    const expectedName = sourcePath.slice(sourcePath.lastIndexOf("/") + 1);
+    return current
+      && current.id === expected.driveId
+      && Boolean(current.file)
+      && current.name === expectedName
+      && current.size === expected.size
+      && (current.eTag ?? "") === expected.eTag
+      ? current
+      : null;
+  }
+
+  private async generationSourceMatchesExpectation(
+    sourcePath: string,
+    expected: MutationIntentV1["expectedRemote"],
+  ): Promise<boolean> {
+    if (!expected.exists) return false;
+    return Boolean(await this.inspectGenerationRestoreSource(sourcePath, expected));
+  }
+
+  private async verifyGenerationRestoreSourceVersion(
+    item: Readonly<SyncPlanItem>,
+    downloaded?: Readonly<{ size: number; hash: string }>,
+  ): Promise<void> {
+    const binding = item.generationRestore;
+    const remote = item.remote;
+    if (!binding || !remote || item.type !== SyncActionType.Download || item.local) {
+      throw new Error(`Generation restore source binding is invalid: ${item.path}`);
+    }
+    const source = parseCommunityPluginGenerationObjectPathV1(remote.path);
+    const target = parseCommunityPluginBundlePath(
+      item.path,
+      getConfigDir(this.scanner.vault),
+    );
+    if (
+      !source
+      || !target
+      || target.pluginId !== binding.pluginId
+      || source.pluginId !== binding.pluginId
+      || source.generation !== binding.generation
+      || !remote.sha256Hash
+      || source.sha256Hash !== remote.sha256Hash.toLowerCase()
+      || (downloaded && (
+        downloaded.size !== remote.size
+        || downloaded.hash !== remote.sha256Hash.toLowerCase()
+      ))
+    ) {
+      throw new Error(`Generation restore source does not match its sealed plan: ${item.path}`);
+    }
+    const current = await this.inspectGenerationRestoreSource(remote.path, {
+      exists: true,
+      driveId: remote.driveId,
+      eTag: remote.eTag,
+      size: remote.size,
+      sha256Hash: remote.sha256Hash,
+    });
+    if (
+      !current
+      || current.parentReference?.id !== remote.parentId
+      || (remote.cTag && (current.cTag ?? "") !== remote.cTag)
+    ) {
+      throw new DownloadRemoteVersionChangedError(item.path);
+    }
+  }
+
   private getStreamDownloadAdapter(fileSize: number): StreamDownloadAdapter | null {
     if (!Platform.isMobile || fileSize < MOBILE_STREAM_DOWNLOAD_MIN_BYTES) {
       return null;
@@ -2365,454 +4126,81 @@ export class SyncExecutor {
     );
   }
 
-  private async prepareCommunityPluginEnablementWork(
-    path: string,
-    selection: Readonly<PluginScopeSelection>,
-    localEntries: LocalFileEntry[],
-    remoteEntries: RemoteFileEntry[],
-    scope: SyncScope,
-  ): Promise<PreparedCommunityPluginEnablementWork> {
-    const observedLocal = localEntries.find((entry) => entry.path === path);
-    const observedRemote = remoteEntries.find((entry) => entry.path === path);
-    const carriedOrStored =
-      this.state.getCommunityPluginEnablementState(scope);
-    const configDir = getConfigDir(this.scanner.vault);
-    const discoveredPluginIds = [...localEntries, ...remoteEntries].flatMap(
-      (entry) => {
-        const managed = classifyCommunityPluginManagedPath(
-          entry.path,
-          configDir,
-        );
-        return managed?.kind === "files" ? [managed.pluginId] : [];
-      },
-    );
-    const cachedObservation = carriedOrStored.observation;
-    const cachedSource = cachedObservation?.source;
-    const canReuseLocal = Boolean(
-      cachedObservation
-      && cachedSource?.path === path
-      && (
-        observedLocal
-          ? cachedSource.local.exists
-            && cachedSource.local.contentHash === observedLocal.hash
-          : !cachedSource.local.exists
-      ),
-    );
-    const canReuseRemote = Boolean(
-      cachedObservation
-      && cachedSource?.path === path
-      && (
-        observedRemote
-          ? cachedSource.remote.exists
-            && cachedSource.remote.remoteId === observedRemote.driveId
-            && cachedSource.remote.eTag === observedRemote.eTag
-          : !cachedSource.remote.exists
-      ),
-    );
-
-    const observedLocalBytes = observedLocal && !canReuseLocal
-      ? await this.readObservedCommunityPluginEnablementLocal(
-          path,
-          observedLocal,
-        )
-      : null;
-    const remoteBytes = observedRemote && !canReuseRemote
-      ? await this.onedrive.downloadFile(
-          this.vaultName,
-          path,
-          observedRemote.downloadUrl,
-          observedRemote.driveId,
-          observedRemote.size,
-        )
-      : null;
-    const observedRemoteHash = observedRemote
-      ? canReuseRemote
-        ? cachedSource?.remote.contentHash
-        : remoteBytes
-          ? await sha256Hex(remoteBytes)
-          : undefined
-      : undefined;
-    if (observedRemote && !canReuseRemote && !remoteBytes) {
-      throw new Error(
-        "Community plugin enablement remote content is unavailable",
-      );
-    }
-    if (observedRemote && remoteBytes && observedRemoteHash) {
-      await this.verifyDownloadedPayload(path, observedRemote, {
-        size: remoteBytes.byteLength,
-        hash: observedRemoteHash,
-      });
-    }
-
-    const observedLocalIds = canReuseLocal && cachedObservation
-      ? [...cachedObservation.localPluginIds]
-      : parseCommunityPluginEnablementJson(
-        observedLocalBytes
-          ? new TextDecoder().decode(observedLocalBytes)
-          : "[]",
-      );
-    const observedRemoteIds = canReuseRemote && cachedObservation
-      ? [...cachedObservation.remotePluginIds]
-      : parseCommunityPluginEnablementJson(
-        remoteBytes
-          ? new TextDecoder().decode(remoteBytes)
-          : "[]",
-      );
-    const selectedPluginIds = collectCommunityPluginIdsForEnablement(
-      selection,
-      [
-        ...discoveredPluginIds,
-        ...selection.pluginIds,
-        ...observedLocalIds,
-        ...observedRemoteIds,
-        ...Object.keys(carriedOrStored.anchors),
-      ],
-      discoveredPluginIds,
-    );
-    const source: CommunityPluginEnablementSourceV2 = {
-      path,
-      selectedPluginIds: [...selectedPluginIds],
-      local: observedLocal
-        ? {
-            exists: true,
-            contentHash: observedLocal.hash,
-          }
-        : { exists: false },
-      remote: observedRemote && observedRemoteHash
-        ? {
-            exists: true,
-            contentHash: observedRemoteHash,
-            remoteId: observedRemote.driveId,
-            eTag: observedRemote.eTag,
-          }
-        : { exists: false },
-    };
-    const observation: CommunityPluginEnablementCommittedObservationV1 = {
-      version: 1,
-      source: {
-        ...source,
-        selectedPluginIds: [...source.selectedPluginIds],
-        local: { ...source.local },
-        remote: { ...source.remote },
-      },
-      localPluginIds: [...observedLocalIds],
-      remotePluginIds: [...observedRemoteIds],
-    };
-    const sourceAwareState = this.state as StateManager & {
-      getCommunityPluginEnablementStateForMigrationSource?:
-        StateManager["getCommunityPluginEnablementStateForMigrationSource"];
-    };
-    const current =
-      typeof sourceAwareState
-        .getCommunityPluginEnablementStateForMigrationSource === "function"
-        ? sourceAwareState.getCommunityPluginEnablementStateForMigrationSource(
-            scope,
-            source,
-          )
-        : carriedOrStored;
-    const prepared = prepareCommunityPluginEnablementFromObservations(
-      { exists: observedLocal !== undefined, pluginIds: observedLocalIds },
-      { exists: observedRemote !== undefined, pluginIds: observedRemoteIds },
-      selectedPluginIds,
-      current.anchors,
-      current.pending,
-    );
-    const resolved = current.pending.flatMap((item) =>
-      typeof item.resolvedEnabled === "boolean"
-        ? [{ ...item, resolvedEnabled: item.resolvedEnabled }]
-        : []
-    );
-    const carrierAnchors = { ...prepared.anchors };
-    for (const item of resolved) delete carrierAnchors[item.pluginId];
-    return {
-      path,
-      selectedPluginIds: [...selectedPluginIds],
-      observedLocal,
-      observedLocalIds,
-      observedRemote,
-      observedRemoteIds,
-      observation,
-      prepared,
-      migrationCarrier: {
-        version: 1,
-        scope: { ...scope },
-        source,
-        anchors: carrierAnchors,
-        pending: prepared.pending.map((item) => ({ ...item })),
-        resolved,
-      },
-    };
-  }
-
-  private async applyCommunityPluginEnablementWork(
-    work: PreparedCommunityPluginEnablementWork,
-    scope: SyncScope,
-    result: SyncResult,
-    callbacks: SyncCallbacks,
-    operationEpoch: number,
-  ): Promise<void> {
-    await this.assertCommunityPluginEnablementBundlesReady(work);
-    if (!this.canContinue(operationEpoch, result)) return;
-    const actionCount = Number(work.prepared.remoteChanged)
-      + Number(work.prepared.localChanged);
-    const baseTotal = this.progressStore?.state.total ?? 0;
-    const visibleTotal = baseTotal + actionCount;
-    let visibleCurrent = baseTotal;
-    const beginVisibleAction = (actionType: SyncActionType): void => {
-      visibleCurrent++;
-      this.progressStore?.setProgress(
-        visibleCurrent,
-        visibleTotal,
-        work.path,
-        actionType,
-      );
-      callbacks.onProgress?.(visibleCurrent, visibleTotal, work.path);
-    };
-
-    if (work.prepared.remoteChanged) {
-      await this.assertCommunityPluginEnablementLocalUnchanged(work);
-      if (!this.canContinue(operationEpoch, result)) return;
-      const content = serializeCommunityPluginEnablementJson(
-        work.prepared.remote,
-      );
-      if (!this.canContinue(operationEpoch, result)) return;
-      beginVisibleAction(SyncActionType.Upload);
-      const uploadResult = await this.onedrive.uploadFile(
-        this.vaultName,
-        work.path,
-        content,
-        callbacks.onFileProgress,
-        work.observedRemote?.eTag,
-        work.observedRemote?.driveId,
-      );
-      if (!this.canContinue(operationEpoch, result)) return;
-      const hash = await sha256Hex(content);
-      if (!this.canContinue(operationEpoch, result)) return;
-      const uploaded = this.toUploadedRemoteEntry(
-        work.path,
-        {
-          path: work.path,
-          size: content.byteLength,
-          mtime: Date.now(),
-          hash,
-          binary: false,
-        },
-        uploadResult,
-        work.observedRemote?.parentId,
-      );
-      await this.state.applyRemoteMutations([uploaded], []);
-      if (!this.canContinue(operationEpoch, result)) return;
-      work.observedRemote = uploaded;
-      work.observedRemoteIds = [...work.prepared.remote];
-      work.observation.source.remote = {
-        exists: true,
-        contentHash: hash,
-        remoteId: uploaded.driveId,
-        eTag: uploaded.eTag,
-      };
-      work.observation.remotePluginIds = [...work.prepared.remote];
-      result.uploaded++;
-      callbacks.onFileComplete?.(
-        work.path,
-        SyncActionType.Upload,
-        true,
-        undefined,
-        content.byteLength,
-      );
-    }
-
-    if (work.prepared.localChanged) {
-      const content = serializeCommunityPluginEnablementJson(
-        work.prepared.local,
-      );
-      beginVisibleAction(SyncActionType.Download);
-      if (!await this.commitCommunityPluginEnablementLocal(
-        work,
-        content,
-        result,
-        operationEpoch,
-      )) return;
-      work.observation.source.local = {
-        exists: true,
-        contentHash: await sha256Hex(content),
-      };
-      work.observation.localPluginIds = [...work.prepared.local];
-      result.downloaded++;
-      callbacks.onFileComplete?.(
-        work.path,
-        SyncActionType.Download,
-        true,
-        undefined,
-        content.byteLength,
-      );
-    }
-
-    if (!this.canContinue(operationEpoch, result)) return;
-    await this.state.setCommunityPluginEnablementState({
-      version: 1,
-      scope,
-      anchors: work.prepared.anchors,
-      pending: [],
-      observation: work.observation,
-    });
-    if (!this.canContinue(operationEpoch, result)) return;
-    this.diag?.log(
-      "execute",
-      "community plugin enablement structured sync committed",
-      {
-        selected: work.selectedPluginIds.length,
-        anchors: Object.keys(work.prepared.anchors).length,
-        localChanged: work.prepared.localChanged,
-        remoteChanged: work.prepared.remoteChanged,
-      },
-    );
-  }
-
-  private async readObservedCommunityPluginEnablementLocal(
-    path: string,
-    expected: LocalFileEntry,
-  ): Promise<ArrayBuffer> {
-    const content = await this.scanner.vault.adapter.readBinary(path);
-    if (
-      content.byteLength !== expected.size
-      || await sha256Hex(content) !== expected.hash
-    ) {
-      throw new CommunityPluginEnablementVersionChangedError("local");
-    }
-    return content;
-  }
-
-  private async assertCommunityPluginEnablementLocalUnchanged(
-    work: PreparedCommunityPluginEnablementWork,
-  ): Promise<void> {
-    const adapter = this.scanner.vault.adapter;
-    if (!work.observedLocal) {
-      if (await adapter.stat(work.path)) {
-        throw new CommunityPluginEnablementVersionChangedError("local");
-      }
-      return;
-    }
-    await this.readObservedCommunityPluginEnablementLocal(
-      work.path,
-      work.observedLocal,
-    );
-  }
-
-  private async commitCommunityPluginEnablementLocal(
-    work: PreparedCommunityPluginEnablementWork,
-    content: ArrayBuffer,
-    result: SyncResult,
-    operationEpoch: number,
-  ): Promise<boolean> {
-    await this.assertCommunityPluginEnablementLocalUnchanged(work);
-    if (!this.canContinue(operationEpoch, result)) return false;
-    const adapter = this.scanner.vault.adapter;
-    const expected = work.observedLocal;
-    const original = expected
-      ? await this.readObservedCommunityPluginEnablementLocal(work.path, expected)
-      : null;
-    if (!this.canContinue(operationEpoch, result)) return false;
-    const downloaded = {
-      size: content.byteLength,
-      hash: await sha256Hex(content),
-    };
-    if (!this.canContinue(operationEpoch, result)) return false;
-    const journal = this.getRecoveryJournal();
-    await journal.prepareCopiedOriginal(
-      work.path,
-      expected,
-      original,
-      downloaded,
-    );
-    if (!this.canContinue(operationEpoch, result)) return false;
+  private async readCommunityPluginManifestText(path: string): Promise<string> {
     try {
-      await this.assertCommunityPluginEnablementLocalUnchanged(work);
-      if (!this.canContinue(operationEpoch, result)) return false;
-      await adapter.writeBinary(work.path, content);
-      if (!this.canContinue(operationEpoch, result)) return false;
-      const committed = await adapter.readBinary(work.path);
-      if (!this.canContinue(operationEpoch, result)) return false;
-      if (
-        committed.byteLength !== downloaded.size
-        || await sha256Hex(committed) !== downloaded.hash
-      ) {
-        throw new Error("Community plugin enablement local verification failed");
-      }
-      if (!this.canContinue(operationEpoch, result)) return false;
-      await journal.complete();
-      return this.canContinue(operationEpoch, result);
-    } catch (error) {
-      await journal.recover();
-      throw error;
+      return await this.scanner.vault.adapter.read(path);
+    } catch {
+      return new TextDecoder().decode(
+        await this.scanner.vault.adapter.readBinary(path),
+      );
     }
   }
 
-  private async assertCommunityPluginEnablementBundlesReady(
-    work: PreparedCommunityPluginEnablementWork,
-  ): Promise<void> {
-    const localBefore = new Set(work.observedLocalIds);
-    const remoteBefore = new Set(work.observedRemoteIds);
-    const localAfter = new Set(work.prepared.local);
-    const remoteAfter = new Set(work.prepared.remote);
-    const localToEnable = work.selectedPluginIds.filter(
-      (pluginId) => !localBefore.has(pluginId) && localAfter.has(pluginId),
-    );
-    const remoteToEnable = work.selectedPluginIds.filter(
-      (pluginId) => !remoteBefore.has(pluginId) && remoteAfter.has(pluginId),
-    );
-    const configDir = getConfigDir(this.scanner.vault);
-    const adapter = this.scanner.vault.adapter;
-
-    for (const pluginId of localToEnable) {
-      const root = `${configDir}/plugins/${pluginId}`;
+  /** Validate selected bundle identities without consulting device-local enablement. */
+  private async prepareCommunityPluginBundleIdentities(input: Readonly<{
+    policy: Readonly<CommunityPluginSyncPolicyV1>;
+    configDir: string;
+    localEntries: readonly LocalFileEntry[];
+    remoteEntries: readonly RemoteFileEntry[];
+    manifestObservations: readonly CommunityPluginManifestObservationV1[];
+  }>): Promise<void> {
+    const selectedDirectoryIds = new Set<string>();
+    const localManifestPaths = new Set<string>();
+    for (const entry of input.localEntries) {
+      const parsed = parseCommunityPluginBundlePath(entry.path, input.configDir);
       if (
-        !await adapter.exists(`${root}/main.js`)
-        || !await adapter.exists(`${root}/manifest.json`)
-      ) {
-        throw new Error(`Selected plugin bundle is incomplete locally: ${pluginId}`);
+        !parsed
+        || parsed.pluginId === "easy-sync"
+        || !isPluginSelected(input.policy.files, parsed.pluginId)
+      ) continue;
+      selectedDirectoryIds.add(parsed.pluginId);
+      if (parsed.fileName === "manifest.json") {
+        localManifestPaths.add(parsed.pluginId);
       }
-      let manifest;
+    }
+    for (const entry of input.remoteEntries) {
+      const parsed = parseCommunityPluginBundlePath(entry.path, input.configDir);
+      if (
+        parsed
+        && parsed.pluginId !== "easy-sync"
+        && isPluginSelected(input.policy.files, parsed.pluginId)
+      ) selectedDirectoryIds.add(parsed.pluginId);
+    }
+    const remoteObservationByDirectory = new Map(
+      input.manifestObservations.map((observation) => [
+        observation.pluginId,
+        observation,
+      ]),
+    );
+    const identities: Array<{ directoryId: string; manifestId: string }> = [];
+    for (const directoryId of selectedDirectoryIds) {
+      const manifests = [];
       try {
-        manifest = parseCommunityPluginBundleManifest(
-          await adapter.read(`${root}/manifest.json`),
-          pluginId,
-        );
-      } catch (error) {
-        throw new Error(
-          error instanceof Error
-            ? `${error.message} (local)`
-            : `Selected plugin manifest is unreadable locally: ${pluginId}`,
-        );
-      }
-      const incompatibility = assessCommunityPluginManifestCompatibility(
-        manifest,
-        {
-          localVersion: null,
-          isMobile: Platform.isMobile,
-          apiVersionSupported: manifest.minAppVersion
-            ? requireApiVersion(manifest.minAppVersion)
-            : true,
-        },
-      );
-      if (incompatibility) {
-        throw new Error(
-          `Selected plugin cannot be enabled locally (${incompatibility}): ${pluginId}`,
-        );
+        if (localManifestPaths.has(directoryId)) {
+          manifests.push(parseCommunityPluginBundleManifest(
+            await this.readCommunityPluginManifestText(
+              `${input.configDir}/plugins/${directoryId}/manifest.json`,
+            ),
+            directoryId,
+          ));
+        }
+        const remoteObservation = remoteObservationByDirectory.get(directoryId);
+        if (remoteObservation) {
+          manifests.push(parseCommunityPluginBundleManifest(
+            remoteObservation.manifestText,
+            directoryId,
+          ));
+        }
+        if (manifests.length === 0) continue;
+        assertCommunityPluginManifestIdentityStable(directoryId, manifests);
+        identities.push({ directoryId, manifestId: manifests[0]!.id });
+      } catch {
+        this.communityPluginIdentityBlockedDirectoryIds.add(directoryId);
       }
     }
-
-    const remotePaths = new Set(
-      this.state.remoteSnapshot.map((entry) => entry.path),
-    );
-    for (const pluginId of remoteToEnable) {
-      const root = `${configDir}/plugins/${pluginId}`;
-      if (
-        !remotePaths.has(`${root}/main.js`)
-        || !remotePaths.has(`${root}/manifest.json`)
-      ) {
-        throw new Error(`Selected plugin bundle is incomplete remotely: ${pluginId}`);
-      }
-    }
+    for (const directoryId of findCommunityPluginManifestIdentityCollisions(
+      identities,
+    )) this.communityPluginIdentityBlockedDirectoryIds.add(directoryId);
   }
 
   /**
@@ -2821,7 +4209,7 @@ export class SyncExecutor {
    * bundle staging and retained as disposable, source-bound name evidence.
    * Never download a manifest solely to improve inventory presentation.
    */
-  private async prepareMobileCommunityPluginManifestEvidence(input: {
+  private async prepareCommunityPluginManifestEvidence(input: {
     policy: Readonly<CommunityPluginSyncPolicyV1>;
     configDir: string;
     localEntries: readonly LocalFileEntry[];
@@ -2836,8 +4224,8 @@ export class SyncExecutor {
     observations: CommunityPluginManifestObservationV1[];
   }> {
     this.mobileDesktopOnlyPluginIds.clear();
-    this.mobileCommunityPluginPreparedManifests.clear();
-    if (!Platform.isMobile || input.policy.files.mode === "none") {
+    this.communityPluginPreparedManifests.clear();
+    if (input.policy.files.mode === "none") {
       return {
         desktopOnlyPluginIds: [],
         incompatiblePluginIds: [],
@@ -2847,6 +4235,7 @@ export class SyncExecutor {
 
     const startedAt = Date.now();
     const localPaths = new Set(input.localEntries.map((entry) => entry.path));
+    const joiningPluginIds = new Set(input.joiningPluginIds ?? []);
     const remoteBundles = new Map<string, {
       main?: RemoteFileEntry;
       manifest?: RemoteFileEntry;
@@ -2875,6 +4264,7 @@ export class SyncExecutor {
     }> = [];
     for (const [pluginId, bundle] of remoteBundles) {
       if (!bundle.main || !bundle.manifest) continue;
+      if (!Platform.isMobile && !joiningPluginIds.has(pluginId)) continue;
       const root = `${input.configDir.replace(/\/+$/, "")}/plugins/${pluginId}`;
       if (
         localPaths.has(`${root}/manifest.json`)
@@ -2914,7 +4304,7 @@ export class SyncExecutor {
     let peakManifestReads = 0;
     let manifestReads = 0;
     const workerCount = Math.min(
-      MOBILE_PLUGIN_MANIFEST_PREFLIGHT_CONCURRENCY,
+      COMMUNITY_PLUGIN_MANIFEST_PREFLIGHT_CONCURRENCY,
       misses.length,
     );
     const workers = Array.from({ length: workerCount }, async () => {
@@ -2949,7 +4339,7 @@ export class SyncExecutor {
             content,
           );
           observationsByPlugin.set(candidate.pluginId, observation);
-          this.mobileCommunityPluginPreparedManifests.set(
+          this.communityPluginPreparedManifests.set(
             candidate.manifest.path,
             {
               sourceKey: communityPluginManifestRemoteSourceKey(
@@ -2967,13 +4357,13 @@ export class SyncExecutor {
     const settled = await Promise.allSettled(workers);
     this.diag?.log(
       "execute",
-      "mobile community plugin manifest participation preflight",
+      "community plugin manifest participation preflight",
       {
         schemaVersion: 1,
         candidates: candidates.length,
         cacheHits,
         manifestReads,
-        concurrencyLimit: MOBILE_PLUGIN_MANIFEST_PREFLIGHT_CONCURRENCY,
+        concurrencyLimit: COMMUNITY_PLUGIN_MANIFEST_PREFLIGHT_CONCURRENCY,
         peakConcurrency: peakManifestReads,
         elapsedMs: Date.now() - startedAt,
       },
@@ -2999,9 +4389,6 @@ export class SyncExecutor {
       .sort((left, right) => left.pluginId.localeCompare(right.pluginId));
     const desktopOnlyPluginIds: string[] = [];
     const incompatiblePluginIds: string[] = [];
-    const joiningPluginIds = new Set(
-      input.joiningPluginIds ?? [],
-    );
     for (const candidate of candidates) {
       const observation = observationsByPlugin.get(candidate.pluginId);
       if (!observation) {
@@ -3017,7 +4404,7 @@ export class SyncExecutor {
         manifest,
         {
           localVersion: null,
-          isMobile: true,
+          isMobile: Platform.isMobile,
           apiVersionSupported: manifest.minAppVersion
             ? requireApiVersion(manifest.minAppVersion)
             : true,
@@ -3064,6 +4451,557 @@ export class SyncExecutor {
     }
   }
 
+  private async prepareLocalCommunityPluginLegacyBundle(
+    pluginId: string,
+    localEntries: readonly Readonly<LocalFileEntry>[],
+    configDir: string,
+  ): Promise<PreparedCommunityPluginLegacyBundle | null> {
+    const entriesByName = new Map<
+      CommunityPluginGenerationBundleFileNameV1,
+      Readonly<LocalFileEntry>
+    >();
+    for (const entry of localEntries) {
+      const parsed = parseCommunityPluginBundlePath(entry.path, configDir);
+      if (
+        parsed?.pluginId === pluginId
+      ) {
+        entriesByName.set(parsed.fileName, entry);
+      }
+    }
+    if (!entriesByName.has("main.js") || !entriesByName.has("manifest.json")) {
+      return null;
+    }
+    const files: PreparedCommunityPluginLegacyBundle["files"] = [];
+    for (const fileName of ["main.js", "manifest.json", "styles.css"] as const) {
+      const entry = entriesByName.get(fileName);
+      if (!entry) continue;
+      const content = await this.scanner.vault.adapter.readBinary(entry.path);
+      if (
+        content.byteLength !== entry.size
+        || await sha256Hex(content) !== entry.hash
+      ) return null;
+      files.push({
+        fileName,
+        path: entry.path,
+        size: entry.size,
+        hash: entry.hash,
+        content,
+      });
+    }
+    const manifest = files.find((file) => file.fileName === "manifest.json");
+    if (!manifest) return null;
+    try {
+      parseCommunityPluginBundleManifest(
+        new TextDecoder("utf-8", { fatal: true }).decode(manifest.content),
+        pluginId,
+      );
+    } catch {
+      return null;
+    }
+    return {
+      pluginId,
+      files,
+      stylesPresent: entriesByName.has("styles.css"),
+    };
+  }
+
+  private async localCommunityPluginLegacyBundleStillMatches(
+    bundle: Readonly<PreparedCommunityPluginLegacyBundle>,
+    configDir: string,
+  ): Promise<boolean> {
+    try {
+      for (const file of bundle.files) {
+        const content = await this.scanner.vault.adapter.readBinary(file.path);
+        if (
+          content.byteLength !== file.size
+          || await sha256Hex(content) !== file.hash
+        ) return false;
+      }
+      const stylesPath = `${configDir}/plugins/${bundle.pluginId}/styles.css`;
+      return await this.scanner.vault.adapter.exists(stylesPath)
+        === bundle.stylesPresent;
+    } catch {
+      return false;
+    }
+  }
+
+  private async prepareCommunityPluginGenerationRestores(input: Readonly<{
+    authorizations: readonly Readonly<CommunityPluginJoinAuthorization>[];
+    joinedGenerationByPluginId: ReadonlyMap<string, number>;
+    localEntries: readonly Readonly<LocalFileEntry>[];
+    policy: Readonly<CommunityPluginSyncPolicyV1>;
+    scope: Readonly<SyncScope>;
+    configDir: string;
+    readOnlyPreview: boolean;
+    result: SyncResult;
+    operationEpoch: number;
+  }>): Promise<{
+    sealedPluginIds: string[];
+    observedGenerationByPluginId: Map<string, number>;
+    projectionsByPluginId: Map<
+      string,
+      CommunityPluginGenerationRestoreProjectionV1
+    >;
+    blocks: CommunityPluginJoinBlock[];
+  }> {
+    const projectionsByPluginId = new Map<
+      string,
+      CommunityPluginGenerationRestoreProjectionV1
+    >();
+    const observedGenerationByPluginId = new Map<string, number>();
+    const durableGenerationPluginIds = [
+      ...input.joinedGenerationByPluginId.keys(),
+    ];
+    const participation = typeof this.state.getCommunityPluginParticipation
+      === "function"
+      ? this.state.getCommunityPluginParticipation()
+      : null;
+    // Historical participation/consent is only a parse-compatible record.
+    // It is not an authorization to migrate a local bundle or reopen a
+    // generation during ordinary V2 sync. Explicit remote-only authorizations
+    // remain the sole entry into this legacy read-only compatibility path.
+    const legacySourcePluginIds: string[] = [];
+    if (
+      input.authorizations.length === 0
+      && durableGenerationPluginIds.length === 0
+      && legacySourcePluginIds.length === 0
+    ) {
+      return {
+        sealedPluginIds: [],
+        observedGenerationByPluginId,
+        projectionsByPluginId,
+        blocks: [],
+      };
+    }
+    const lifecycleClient = this.onedrive as OneDriveClient & {
+      readCommunityPluginLifecycleV1?: OneDriveClient["readCommunityPluginLifecycleV1"];
+      readCommunityPluginLifecycleV1ById?: OneDriveClient["readCommunityPluginLifecycleV1ById"];
+    };
+    if (
+      typeof lifecycleClient.readCommunityPluginLifecycleV1 !== "function"
+      || typeof lifecycleClient.readCommunityPluginLifecycleV1ById !== "function"
+    ) {
+      return {
+        sealedPluginIds: durableGenerationPluginIds,
+        observedGenerationByPluginId,
+        projectionsByPluginId,
+        blocks: [],
+      };
+    }
+    const canMutate = () =>
+      !input.readOnlyPreview
+      && this.canContinue(input.operationEpoch, input.result);
+    const lifecycleTransport =
+      createOneDriveCommunityPluginLifecycleTransportV1(
+        this.onedrive,
+        this.vaultName,
+        canMutate,
+      );
+    let current = await readCommunityPluginLifecycleControlV1(
+      lifecycleTransport,
+      input.scope,
+    );
+    if (current.status === "missing") {
+      return {
+        sealedPluginIds: durableGenerationPluginIds,
+        observedGenerationByPluginId,
+        projectionsByPluginId,
+        blocks: [],
+      };
+    }
+    if (current.status !== "ready") {
+      return {
+        sealedPluginIds: durableGenerationPluginIds,
+        observedGenerationByPluginId,
+        projectionsByPluginId,
+        blocks: input.authorizations.map((authorization) => ({
+          pluginId: authorization.pluginId,
+          operationId: authorization.operationId,
+          reason: "catalog-unavailable",
+        })),
+      };
+    }
+    const sealedAuthorizations = input.authorizations.filter((authorization) =>
+      current.status === "ready"
+      && current.state.pluginsById[authorization.pluginId]
+        ?.legacyAuthoritySeal !== undefined
+    );
+    const legacyMigrationPluginIds = current.state.legacyMigrationConsent
+      ? legacySourcePluginIds
+      : [];
+    const sealedPluginIds = [...new Set([
+      ...durableGenerationPluginIds,
+      ...sealedAuthorizations.map((item) => item.pluginId),
+      ...legacyMigrationPluginIds.filter((pluginId) =>
+        current.status === "ready"
+        && current.state.pluginsById[pluginId]?.legacyAuthoritySeal !== undefined
+      ),
+    ])];
+    for (const [pluginId, generation] of input.joinedGenerationByPluginId) {
+      const lifecycle = current.state.pluginsById[pluginId];
+      if (
+        communityPluginAuthoritativePublishedBundleV1(lifecycle) === null
+        || lifecycle.currentGeneration?.generation !== generation
+      ) {
+        this.diag?.warn(
+          "plan",
+          "sealed community plugin local authority no longer matches lifecycle control",
+          { pluginId, generation, mutations: 0 },
+        );
+      }
+    }
+    if (input.readOnlyPreview) {
+      return {
+        sealedPluginIds,
+        observedGenerationByPluginId,
+        projectionsByPluginId,
+        blocks: [],
+      };
+    }
+    if (
+      sealedAuthorizations.length === 0
+      && legacyMigrationPluginIds.length === 0
+    ) {
+      return {
+        sealedPluginIds,
+        observedGenerationByPluginId,
+        projectionsByPluginId,
+        blocks: [],
+      };
+    }
+    const observer = this.communityPluginLifecycleDeviceObserver;
+    if (!observer) {
+      return {
+        sealedPluginIds,
+        observedGenerationByPluginId,
+        projectionsByPluginId,
+        blocks: sealedAuthorizations.map((authorization) => ({
+          pluginId: authorization.pluginId,
+          operationId: authorization.operationId,
+          reason: "catalog-unavailable",
+        })),
+      };
+    }
+    const observation = await observer.observe(
+      lifecycleTransport,
+      input.scope,
+      Date.now(),
+    );
+    if (
+      observation.status !== "ready"
+      || observation.recordId !== current.recordId
+    ) {
+      return {
+        sealedPluginIds,
+        observedGenerationByPluginId,
+        projectionsByPluginId,
+        blocks: sealedAuthorizations.map((authorization) => ({
+          pluginId: authorization.pluginId,
+          operationId: authorization.operationId,
+          reason: "catalog-unavailable",
+        })),
+      };
+    }
+    current = {
+      status: "ready",
+      state: observation.state,
+      recordId: observation.recordId,
+      recordETag: observation.recordETag,
+    };
+    const participant = observer.getParticipantIdentity();
+    if (!participant) {
+      return {
+        sealedPluginIds,
+        observedGenerationByPluginId,
+        projectionsByPluginId,
+        blocks: sealedAuthorizations.map((authorization) => ({
+          pluginId: authorization.pluginId,
+          operationId: authorization.operationId,
+          reason: "catalog-unavailable",
+        })),
+      };
+    }
+    const contentTransport =
+      createOneDriveCommunityPluginGenerationContentTransportV1(
+        this.onedrive,
+        this.vaultName,
+        canMutate,
+      );
+    const blocks: CommunityPluginJoinBlock[] = [];
+    for (const pluginId of legacyMigrationPluginIds) {
+      if (!this.canContinue(input.operationEpoch, input.result)) break;
+      const bundle = await this.prepareLocalCommunityPluginLegacyBundle(
+        pluginId,
+        input.localEntries,
+        input.configDir,
+      );
+      if (!bundle) continue;
+      try {
+        let control = current.state;
+        let lifecycle = control.pluginsById[pluginId];
+        let generation = lifecycle?.currentGeneration;
+        if (generation?.phase === "closing") {
+          throw new Error("generation is closing");
+        }
+        const participantKey = communityPluginParticipantKeyV1(participant);
+        let member = generation?.membersByKey[participantKey];
+        if (!member || member.phase !== "joined") {
+          const targetGeneration = generation?.phase === "open"
+            ? generation.generation
+            : (lifecycle?.generationHighWatermark ?? 0) + 1;
+          const joined = await observer.joinPluginGeneration(
+            lifecycleTransport,
+            {
+              scope: input.scope,
+              pluginId,
+              targetGeneration,
+              joinNonce:
+                `${Date.now()}-${++this.mutationSequence}-legacy-${pluginId}`,
+              joinEvidence: "user-confirmed",
+              ...(generation?.phase === "closed"
+                ? { observedClosedRevision: control.revision }
+                : {}),
+              joinedAt: Date.now(),
+            },
+          );
+          if (joined.status !== "ready" || joined.recordId !== current.recordId) {
+            throw new Error("legacy generation join was not committed");
+          }
+          current = {
+            status: "ready",
+            state: joined.state,
+            recordId: joined.recordId,
+            recordETag: joined.recordETag,
+          };
+          control = current.state;
+          lifecycle = control.pluginsById[pluginId];
+          generation = lifecycle?.currentGeneration;
+          member = generation?.membersByKey[participantKey];
+        }
+        if (!generation || generation.phase !== "open" || member?.phase !== "joined") {
+          throw new Error("joined legacy generation is unavailable");
+        }
+
+        let authoritativeBundle =
+          communityPluginAuthoritativePublishedBundleV1(lifecycle);
+        if (!authoritativeBundle) {
+          const migrated = await observer.migratePluginLegacyBundle(
+            lifecycleTransport,
+            contentTransport,
+            {
+              control,
+              pluginId,
+              files: bundle.files.map((file) => ({
+                fileName: file.fileName,
+                content: file.content,
+              })),
+              revalidateSource: () =>
+                this.localCommunityPluginLegacyBundleStillMatches(
+                  bundle,
+                  input.configDir,
+                ),
+              at: Date.now(),
+            },
+          );
+          if (migrated.status !== "ready") {
+            throw new Error(
+              `legacy bundle migration ${migrated.status}:${migrated.phase}`,
+            );
+          }
+          current = {
+            ...current,
+            state: migrated.state,
+          };
+          lifecycle = current.state.pluginsById[pluginId];
+          generation = lifecycle?.currentGeneration;
+          authoritativeBundle =
+            communityPluginAuthoritativePublishedBundleV1(lifecycle);
+        } else {
+          const manifestObject = authoritativeBundle.manifestObject;
+          const manifest = await contentTransport.readById(
+            manifestObject.remoteId,
+            manifestObject.size,
+          );
+          const expectedName = manifestObject.objectPath.split("/").pop();
+          if (
+            manifest.id !== manifestObject.remoteId
+            || manifest.name !== expectedName
+            || manifest.parentId !== manifestObject.parentId
+            || manifest.size !== manifestObject.size
+            || manifest.eTag !== manifestObject.eTag
+            || manifest.cTag !== manifestObject.cTag
+          ) throw new Error("sealed manifest identity changed");
+          const projection =
+            await createCommunityPluginGenerationRestoreProjectionV1({
+              control: current.state,
+              scope: input.scope,
+              participant,
+              pluginId,
+              configDir: input.configDir,
+              controlRecordId: current.recordId,
+              manifestContent: manifest.content,
+            });
+          if (projection.status !== "ready") {
+            throw new Error(`sealed generation projection blocked: ${projection.reason}`);
+          }
+          const localByName = new Map(
+            bundle.files.map((file) => [file.fileName, file]),
+          );
+          if (
+            projection.projection.members.length !== bundle.files.length
+            || projection.projection.members.some((item) => {
+              const local = localByName.get(item.fileName);
+              return !local
+                || local.size !== item.source.size
+                || local.hash !== item.source.sha256Hash;
+            })
+          ) throw new Error("local legacy bundle differs from sealed generation");
+        }
+        if (!authoritativeBundle || !generation) {
+          throw new Error("legacy authority was not sealed");
+        }
+        const sealedGeneration = generation.generation;
+        if (!sealedPluginIds.includes(pluginId)) sealedPluginIds.push(pluginId);
+        observedGenerationByPluginId.set(pluginId, sealedGeneration);
+        this.diag?.log(
+          "state",
+          "community plugin legacy bundle joined sealed generation",
+          {
+            pluginId,
+            generation: sealedGeneration,
+            userFileMutations: 0,
+          },
+        );
+      } catch (error) {
+        const sealed = current.state.pluginsById[pluginId]
+          ?.legacyAuthoritySeal !== undefined;
+        if (sealed) {
+          if (!sealedPluginIds.includes(pluginId)) sealedPluginIds.push(pluginId);
+          blocks.push({ pluginId, reason: "remote-bundle-changed" });
+        }
+        this.diag?.warn(
+          "state",
+          sealed
+            ? "sealed community plugin legacy bundle requires review"
+            : "community plugin legacy bundle remains on the fixed-path fallback",
+          {
+            pluginId,
+            error: error instanceof Error ? error.message : String(error),
+            userFileMutations: 0,
+          },
+        );
+      }
+    }
+    for (const authorization of sealedAuthorizations) {
+      if (!this.canContinue(input.operationEpoch, input.result)) break;
+      try {
+        let control = current.state;
+        let generation = control.pluginsById[authorization.pluginId]
+          ?.currentGeneration;
+        let publishedBundle = communityPluginAuthoritativePublishedBundleV1(
+          control.pluginsById[authorization.pluginId],
+        );
+        if (
+          !generation
+          || generation.phase !== "open"
+          || !publishedBundle
+        ) {
+          throw new Error("sealed generation is no longer current");
+        }
+        const participantKey = communityPluginParticipantKeyV1(participant);
+        const member = generation.membersByKey[participantKey];
+        if (!member || member.phase !== "joined") {
+          const joined = await observer.joinPluginGeneration(
+            lifecycleTransport,
+            {
+              scope: input.scope,
+              pluginId: authorization.pluginId,
+              targetGeneration: generation.generation,
+              joinNonce: authorization.operationId,
+              joinEvidence: "user-confirmed",
+              joinedAt: Date.now(),
+            },
+          );
+          if (joined.status !== "ready" || joined.recordId !== current.recordId) {
+            throw new Error("generation join was not committed");
+          }
+          current = {
+            status: "ready",
+            state: joined.state,
+            recordId: joined.recordId,
+            recordETag: joined.recordETag,
+          };
+          control = current.state;
+          generation = control.pluginsById[authorization.pluginId]
+            ?.currentGeneration;
+          publishedBundle = communityPluginAuthoritativePublishedBundleV1(
+            control.pluginsById[authorization.pluginId],
+          );
+          if (!generation || generation.phase !== "open" || !publishedBundle) {
+            throw new Error("joined generation is no longer current");
+          }
+        }
+        const manifestObject = publishedBundle.manifestObject;
+        const manifest = await contentTransport.readById(
+          manifestObject.remoteId,
+          manifestObject.size,
+        );
+        const objectPathSegments = manifestObject.objectPath.split("/");
+        const expectedName = objectPathSegments[objectPathSegments.length - 1];
+        if (
+          manifest.id !== manifestObject.remoteId
+          || manifest.name !== expectedName
+          || manifest.parentId !== manifestObject.parentId
+          || manifest.size !== manifestObject.size
+          || manifest.eTag !== manifestObject.eTag
+          || manifest.cTag !== manifestObject.cTag
+        ) {
+          throw new Error("sealed manifest identity changed");
+        }
+        const projection =
+          await createCommunityPluginGenerationRestoreProjectionV1({
+            control,
+            scope: input.scope,
+            participant,
+            pluginId: authorization.pluginId,
+            configDir: input.configDir,
+            controlRecordId: current.recordId,
+            manifestContent: manifest.content,
+          });
+        if (projection.status !== "ready") {
+          throw new Error(`sealed generation projection blocked: ${projection.reason}`);
+        }
+        projectionsByPluginId.set(
+          authorization.pluginId,
+          projection.projection,
+        );
+      } catch (error) {
+        blocks.push({
+          pluginId: authorization.pluginId,
+          operationId: authorization.operationId,
+          reason: error instanceof OneDriveError
+            ? "catalog-unavailable"
+            : "remote-bundle-changed",
+        });
+        this.diag?.warn(
+          "plan",
+          "sealed community plugin generation restore was stopped",
+          {
+            pluginId: authorization.pluginId,
+            error: error instanceof Error ? error.message : String(error),
+            mutations: 0,
+          },
+        );
+      }
+    }
+    return {
+      sealedPluginIds,
+      observedGenerationByPluginId,
+      projectionsByPluginId,
+      blocks,
+    };
+  }
+
   /**
    * Stage every changed file for each selected community-plugin bundle before
    * the first target write. This cannot make several filesystem replacements
@@ -3076,6 +5014,10 @@ export class SyncExecutor {
     metrics: ExecutionMetrics,
     result: SyncResult,
     operationEpoch: number,
+    generationRestores: ReadonlyMap<
+      string,
+      CommunityPluginGenerationRestoreProjectionV1
+    >,
     onBundleProgress?: (
       root: string,
       downloaded: number,
@@ -3104,11 +5046,13 @@ export class SyncExecutor {
     const adapter = this.scanner.vault.adapter;
 
     const stageRemote = async (
-      path: string,
-      remote: RemoteFileEntry,
+      item: SyncPlanItem,
       countAsPlanTransfer: boolean,
       onProgress?: (downloaded: number, total: number) => void,
     ): Promise<PreparedDownload> => {
+      const path = item.path;
+      const remote = item.remote;
+      if (!remote) throw new Error(`Selected plugin download has no source: ${path}`);
       if (countAsPlanTransfer) {
         transferMetrics.activeConcurrency++;
         transferMetrics.peakConcurrency = Math.max(
@@ -3118,7 +5062,7 @@ export class SyncExecutor {
       }
       try {
         const preflightPrepared =
-          this.mobileCommunityPluginPreparedManifests.get(path);
+          this.communityPluginPreparedManifests.get(path);
         if (
           preflightPrepared
           && this.activeSyncScope
@@ -3128,7 +5072,13 @@ export class SyncExecutor {
               remote,
             )
         ) {
-          this.mobileCommunityPluginPreparedManifests.delete(path);
+          this.communityPluginPreparedManifests.delete(path);
+          if (item.generationRestore) {
+            await this.verifyGenerationRestoreSourceVersion(
+              item,
+              preflightPrepared.prepared.downloaded,
+            );
+          }
           onProgress?.(remote.size, remote.size);
           return preflightPrepared.prepared;
         }
@@ -3137,7 +5087,7 @@ export class SyncExecutor {
         try {
           content = await this.onedrive.downloadFile(
             this.vaultName,
-            path,
+            remote.path,
             remote.downloadUrl,
             remote.driveId,
             remote.size,
@@ -3159,7 +5109,10 @@ export class SyncExecutor {
         }
         const verifyStartedAt = Date.now();
         try {
-          await this.verifyDownloadedPayload(path, remote, downloaded);
+          await this.verifyDownloadedPayload(remote.path, remote, downloaded);
+          if (item.generationRestore) {
+            await this.verifyGenerationRestoreSourceVersion(item, downloaded);
+          }
         } finally {
           if (countAsPlanTransfer) {
             transferMetrics.stagesMs.remoteVersionVerify +=
@@ -3223,8 +5176,72 @@ export class SyncExecutor {
       let groupPrepared: Array<[SyncPlanItem, PreparedDownload]> = [];
       transferMetrics.started += items.length;
       try {
-        const remoteMain = remoteByPath.get(mainPath);
-        const remoteManifest = remoteByPath.get(manifestPath);
+        const generationItems = items.filter((item) => item.generationRestore);
+        if (
+          generationItems.length === 0
+          && this.communityPluginIdentityBlockedDirectoryIds.has(pluginId)
+        ) {
+          throw new Error(`Selected plugin identity is ambiguous: ${pluginId}`);
+        }
+        if (generationItems.length > 0 && generationItems.length !== items.length) {
+          throw new Error(
+            `Selected plugin restore mixes legacy and generation sources: ${pluginId}`,
+          );
+        }
+        if (
+          generationItems.length > 1
+          && generationItems.slice(1).some((item) =>
+            !sameGenerationRestoreBinding(
+              generationItems[0].generationRestore!,
+              item.generationRestore!,
+            ))
+        ) {
+          throw new Error(
+            `Selected plugin restore spans several generation authorities: ${pluginId}`,
+          );
+        }
+        const generationProjection = generationRestores.get(pluginId);
+        if (generationItems.length > 0) {
+          if (!generationProjection || !this.activeSyncScope) {
+            throw new Error(
+              `Selected plugin restore has no current lifecycle evidence: ${pluginId}`,
+            );
+          }
+          const lifecycleTransport =
+            createOneDriveCommunityPluginLifecycleTransportV1(
+              this.onedrive,
+              this.vaultName,
+              () => false,
+            );
+          const currentControl =
+            await readCommunityPluginLifecycleControlV1(
+              lifecycleTransport,
+              this.activeSyncScope,
+              generationProjection.controlRecordId,
+            );
+          if (
+            currentControl.status !== "ready"
+            || validateCommunityPluginGenerationRestoreProjectionV1(
+              generationProjection,
+              currentControl.state,
+              currentControl.recordId,
+            ).status !== "valid"
+          ) {
+            throw new Error(
+              `Selected plugin restore lifecycle changed: ${pluginId}`,
+            );
+          }
+        }
+        const generationMain = generationItems.find((item) => item.path === mainPath);
+        const generationManifest = generationItems.find(
+          (item) => item.path === manifestPath,
+        );
+        const remoteMain = generationItems.length > 0
+          ? generationMain?.remote
+          : remoteByPath.get(mainPath);
+        const remoteManifest = generationItems.length > 0
+          ? generationManifest?.remote
+          : remoteByPath.get(manifestPath);
         if (!remoteMain || !remoteManifest) {
           throw new Error(`Selected plugin bundle is incomplete remotely: ${pluginId}`);
         }
@@ -3235,8 +5252,7 @@ export class SyncExecutor {
               return [
                 item,
                 await stageRemote(
-                  item.path,
-                  item.remote!,
+                  item,
                   true,
                   (downloaded, total) =>
                     reportFileProgress(item.path, downloaded, total),
@@ -3258,18 +5274,50 @@ export class SyncExecutor {
           return preparedByPath;
         }
 
+        if (generationItems.length > 0) {
+          for (const [item, prepared] of groupPrepared) {
+            if (!prepared.downloaded) {
+              throw new Error(
+                `Selected plugin generation bytes are unavailable: ${pluginId}`,
+              );
+            }
+            if (!await adapter.exists(item.path)) continue;
+            let local: ArrayBuffer;
+            try {
+              local = await adapter.readBinary(item.path);
+            } catch {
+              throw new Error(
+                `Selected plugin local target cannot be verified: ${item.path}`,
+              );
+            }
+            if (
+              local.byteLength !== prepared.downloaded.size
+              || await sha256Hex(local) !== prepared.downloaded.hash
+            ) {
+              throw new Error(
+                `Selected plugin local target changed: ${item.path}`,
+              );
+            }
+          }
+        }
+
         const plannedManifest = groupPrepared.find(
           ([item]) => item.path === manifestPath,
         )?.[1];
         const manifestPrepared = plannedManifest
-          ?? await stageRemote(
-            manifestPath,
-            remoteManifest,
-            false,
-            (downloaded, total) =>
-              reportFileProgress(manifestPath, downloaded, total),
-          );
-        if (!manifestPrepared.content) {
+          ?? (generationItems.length > 0
+            ? null
+            : await stageRemote(
+              {
+                type: SyncActionType.Download,
+                path: manifestPath,
+                remote: remoteManifest,
+              },
+              false,
+              (downloaded, total) =>
+                reportFileProgress(manifestPath, downloaded, total),
+            ));
+        if (!manifestPrepared?.content) {
           throw new Error(`Selected plugin manifest download failed: ${pluginId}`);
         }
         const manifest = parseCommunityPluginBundleManifest(
@@ -3279,10 +5327,15 @@ export class SyncExecutor {
 
         let localVersion: string | null = null;
         if (await adapter.exists(manifestPath)) {
-          localVersion = parseCommunityPluginBundleManifest(
+          const localManifest = parseCommunityPluginBundleManifest(
             await adapter.read(manifestPath),
             pluginId,
-          ).version;
+          );
+          assertCommunityPluginManifestIdentityStable(pluginId, [
+            manifest,
+            localManifest,
+          ]);
+          localVersion = localManifest.version;
         }
         const incompatibility = assessCommunityPluginManifestCompatibility(
           manifest,
@@ -3305,7 +5358,9 @@ export class SyncExecutor {
         this.diag?.log("execute", "selected plugin bundle preflight passed", {
           schemaVersion: 1,
           files: items.length,
-          hasStyles: remoteByPath.has(`${root}/styles.css`),
+          hasStyles: generationItems.length > 0
+            ? generationItems.some((item) => item.path === `${root}/styles.css`)
+            : remoteByPath.has(`${root}/styles.css`),
         });
       } catch (error) {
         for (const item of items) {
@@ -3326,11 +5381,76 @@ export class SyncExecutor {
   }
 
   /** Validate selected plugin upload sources and prevent remote downgrades. */
+  private async assertCommunityPluginUploadPreflight(
+    pluginId: string,
+    remoteManifestEntry: Readonly<RemoteFileEntry> | undefined,
+    files: number,
+  ): Promise<void> {
+    const configDir = getConfigDir(this.scanner.vault);
+    const root = `${configDir}/plugins/${pluginId}`;
+    const mainPath = `${root}/main.js`;
+    const manifestPath = `${root}/manifest.json`;
+    const adapter = this.scanner.vault.adapter;
+    if (this.communityPluginIdentityBlockedDirectoryIds.has(pluginId)) {
+      throw new Error(`Selected plugin identity is ambiguous: ${pluginId}`);
+    }
+    if (!await adapter.exists(mainPath) || !await adapter.exists(manifestPath)) {
+      throw new Error(`Selected plugin bundle is incomplete locally: ${pluginId}`);
+    }
+    const localManifest = parseCommunityPluginBundleManifest(
+      await adapter.read(manifestPath),
+      pluginId,
+    );
+    if (!remoteManifestEntry) return;
+    const remotePrepared = await this.onedrive.downloadFile(
+      this.vaultName,
+      manifestPath,
+      remoteManifestEntry.downloadUrl,
+      remoteManifestEntry.driveId,
+      remoteManifestEntry.size,
+    );
+    await this.verifyDownloadedPayload(
+      manifestPath,
+      remoteManifestEntry,
+      {
+        size: remotePrepared.byteLength,
+        hash: await sha256Hex(remotePrepared),
+      },
+    );
+    const remoteManifest = parseCommunityPluginBundleManifest(
+      new TextDecoder().decode(remotePrepared),
+      pluginId,
+    );
+    assertCommunityPluginManifestIdentityStable(pluginId, [
+      localManifest,
+      remoteManifest,
+    ]);
+    if (localManifest.version === remoteManifest.version) return;
+    const comparison = compareCommunityPluginVersions(
+      localManifest.version,
+      remoteManifest.version,
+    );
+    if (comparison === null) {
+      this.diag?.log(
+        "execute",
+        "selected plugin raw versions are not both SemVer; automatic downgrade judgment was skipped",
+        { schemaVersion: 1, files },
+      );
+    }
+    if (comparison !== null && comparison < 0) {
+      throw new Error(
+        `Selected plugin upload would downgrade remote bundle: ${pluginId}`,
+      );
+    }
+  }
+
+  /** Validate selected plugin upload sources and prevent remote downgrades. */
   private async prepareCommunityPluginBundleUploads(
     uploads: readonly SyncPlanItem[],
     policy: Readonly<CommunityPluginSyncPolicyV1>,
     result: SyncResult,
     operationEpoch: number,
+    remoteEntries: readonly Readonly<RemoteFileEntry>[] = this.state.remoteSnapshot,
   ): Promise<Map<string, unknown>> {
     const errorsByPath = new Map<string, unknown>();
     if (policy.files.mode === "none") return errorsByPath;
@@ -3347,68 +5467,18 @@ export class SyncExecutor {
     }
     if (groups.size === 0) return errorsByPath;
 
-    const adapter = this.scanner.vault.adapter;
     const remoteByPath = new Map(
-      this.state.remoteSnapshot.map((entry) => [entry.path, entry]),
+      remoteEntries.map((entry) => [entry.path, entry]),
     );
     for (const [pluginId, items] of groups) {
       const root = `${configDir}/plugins/${pluginId}`;
-      const mainPath = `${root}/main.js`;
       const manifestPath = `${root}/manifest.json`;
       try {
-        if (
-          !await adapter.exists(mainPath)
-          || !await adapter.exists(manifestPath)
-        ) {
-          throw new Error(`Selected plugin bundle is incomplete locally: ${pluginId}`);
-        }
-        const localManifest = parseCommunityPluginBundleManifest(
-          await adapter.read(manifestPath),
+        await this.assertCommunityPluginUploadPreflight(
           pluginId,
+          remoteByPath.get(manifestPath),
+          items.length,
         );
-        const remoteManifestEntry = remoteByPath.get(manifestPath);
-        if (remoteManifestEntry) {
-          const remotePrepared = await this.onedrive.downloadFile(
-            this.vaultName,
-            manifestPath,
-            remoteManifestEntry.downloadUrl,
-            remoteManifestEntry.driveId,
-            remoteManifestEntry.size,
-          );
-          await this.verifyDownloadedPayload(
-            manifestPath,
-            remoteManifestEntry,
-            {
-              size: remotePrepared.byteLength,
-              hash: await sha256Hex(remotePrepared),
-            },
-          );
-          const remoteManifest = parseCommunityPluginBundleManifest(
-            new TextDecoder().decode(remotePrepared),
-            pluginId,
-          );
-          if (localManifest.version !== remoteManifest.version) {
-            const comparison = compareCommunityPluginVersions(
-              localManifest.version,
-              remoteManifest.version,
-            );
-            if (comparison === null) {
-              this.diag?.log(
-                "execute",
-                "selected plugin raw versions are not both SemVer; automatic downgrade judgment was skipped",
-                {
-                  schemaVersion: 1,
-                  files: items.length,
-                },
-              );
-            }
-            if (comparison !== null && comparison < 0) {
-              throw new Error(
-                `Selected plugin upload would downgrade remote bundle: ${pluginId}`,
-              );
-            }
-          }
-        }
         if (!this.canContinue(operationEpoch, result)) return errorsByPath;
         this.diag?.log("execute", "selected plugin upload preflight passed", {
           schemaVersion: 1,
@@ -3574,12 +5644,22 @@ export class SyncExecutor {
         message: this.t("result.v2RecoveryBlocked"),
       };
     }
+    if (
+      options.mutationRecoveryObservationOnly === true
+      && options.recoveryOnly !== true
+    ) {
+      throw new Error(
+        "Mutation recovery observation-only mode requires recovery-only",
+      );
+    }
 
     this.running = true;
     this.cancelled = false;
     this.remoteRecoveryPreviewRequired = false;
     this.localVersionRecoveredDuringLedger = false;
     this.completeRemoteItems = null;
+    this.isolatedMutationRecoveryPathCache = null;
+    this.communityPluginIdentityBlockedDirectoryIds.clear();
     this.cancelController = new AbortController();
     const operationEpoch = this.lifecycle.capture();
     const automaticHandlingPolicy = { ...this.automaticHandlingPolicy };
@@ -3594,6 +5674,37 @@ export class SyncExecutor {
     const prepareV2MigrationCandidate =
       this.state.legacyAutoSyncAllowed
       && !this.state.isV2StateActive;
+    if (
+      this.state.isV2StateActive
+      && !this.staleFirstSyncEvidenceChecked
+    ) {
+      try {
+        const retired =
+          await this.state.retireAllFirstSyncVerificationEvidence();
+        this.staleFirstSyncEvidenceChecked = true;
+        if (retired > 0) {
+          this.diag?.log(
+            "state",
+            "retired stale first-sync evidence after V2 authority recovery",
+            {
+              operationKind: "first-sync-verification",
+              retired,
+              mutations: 0,
+            },
+          );
+        }
+      } catch (error) {
+        this.diag?.warn(
+          "state",
+          "stale first-sync evidence cleanup will retry later",
+          {
+            operationKind: "first-sync-verification",
+            error: error instanceof Error ? error.message : String(error),
+            mutations: 0,
+          },
+        );
+      }
+    }
     const public113MigrationInput = prepareV2MigrationCandidate
       ? await this.state.readPublic113MigrationInput()
       : null;
@@ -3605,8 +5716,23 @@ export class SyncExecutor {
       prepareV2MigrationCandidate && public113MigrationEvidence
         ? "v2-migration"
         : null;
-    let freshCrossScopeProtocolBinding: SharedSyncProtocolBindingV3 | null =
+    const pendingActivationHold = this.state.activeV2MigrationHold;
+    const pendingFirstSyncProtocolBinding: SharedSyncProtocolBindingV2 | null =
+      reviewedAuthorization?.reviewKind === "v2-first-sync"
+      && pendingActivationHold?.phase === "pending"
+      && migrationHoldReviewKindV2(pendingActivationHold) === "v2-first-sync"
+      && pendingActivationHold.protocolBinding?.protocolVersion === 2
+      && reviewedAuthorization.revision === pendingActivationHold.revision
+      && sameSyncScope(reviewedAuthorization.scope, pendingActivationHold.scope)
+      && sameCanonicalPlanIdentityV2(
+        reviewedAuthorization.canonicalIdentity,
+        pendingActivationHold.canonicalIdentity,
+      )
+        ? pendingActivationHold.protocolBinding
+        : null;
+    let freshSharedProtocolBinding: SharedSyncProtocolBindingV3 | null =
       null;
+    let firstSyncVerificationProtocolBinding: unknown = null;
     const takeOverPublic113MutationLedger =
       prepareV2MigrationCandidate
       && public113MigrationEvidence
@@ -3623,11 +5749,13 @@ export class SyncExecutor {
       options.recoveryOnly === true
       && this.state.isV2StateActive
       && !prepareV2MigrationCandidate;
+    const mutationRecordsAtRunStart = this.state.mutationLedger.length;
     const recoveryRecordsAtStart = recoveryOnly
-      ? this.state.mutationLedger.length
+      ? mutationRecordsAtRunStart
       : 0;
     let migrationAuthorityCommittedThisRun = false;
     let migrationExecutionHold: MigrationHoldV2 | null = null;
+    let isolatedMutationRecoveryRecords: MutationLedgerEntryV1[] = [];
     this.startGeneration = this.state.remoteGeneration;
     this.onedrive.resetDownloadStrategy();
     this.onedrive.setAbortSignal(this.cancelController.signal);
@@ -3650,6 +5778,11 @@ export class SyncExecutor {
       errors: 0,
       authExpired: false,
       message: "",
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "not-entered",
+        userFileChanges: "unknown",
+      },
     };
     const runStartedAt = Date.now();
     const phasesMs: SyncRunPhaseDurations = {
@@ -3690,7 +5823,23 @@ export class SyncExecutor {
       // Step 0: finish rollback from any interrupted local replacement before
       // scanning. This journal is independent of sync/base/remote state.
       try {
-        const recoveryOutcome = await this.getRecoveryJournal().recover();
+        const journal = this.getRecoveryJournal();
+        if (
+          options.mutationRecoveryObservationOnly === true
+          && await journal.hasPendingRecovery()
+        ) {
+          result.errors = 1;
+          result.message = this.t("result.localRecoveryFailed");
+          this.diag?.warn(
+            "execute",
+            "reset observation kept a pending local recovery journal",
+            { mutations: 0 },
+          );
+          return result;
+        }
+        const recoveryOutcome = options.mutationRecoveryObservationOnly === true
+          ? "none"
+          : await journal.recover();
         if (recoveryOutcome !== "none") {
           this.diag?.warn("execute", `interrupted local write recovery completed — ${recoveryOutcome}`);
         }
@@ -3844,7 +5993,7 @@ export class SyncExecutor {
       const canRestoreCommittedScope = Boolean(this.state.boundAccountId)
         && committedScope?.accountId === this.state.boundAccountId
         && Boolean(committedScope);
-      let restoredCommittedScope = canRestoreCommittedScope
+      const restoredCommittedScopeFromDeltaCache = canRestoreCommittedScope
         && Boolean(committedDeltaLink)
         && this.onedrive.restoreVaultScope(
           this.vaultName,
@@ -3855,6 +6004,7 @@ export class SyncExecutor {
           },
           committedDeltaLink!,
         );
+      let restoredCommittedScope = restoredCommittedScopeFromDeltaCache;
       if (
         canRestoreCommittedScope
         && !restoredCommittedScope
@@ -3919,62 +6069,167 @@ export class SyncExecutor {
       this.activeSyncScope = syncScope;
       if (this.shouldStop(result, operationEpoch)) return result;
       if (prepareV2MigrationCandidate && activationReviewKind === null) {
-        const protocolTransport = availableSharedSyncProtocolTransportV2(
-          this.onedrive,
-          this.vaultName,
-        );
-        if (!protocolTransport) {
+        const protocolObservation =
+          await this.readFreshSharedProtocolProfile(syncScope);
+        if (protocolObservation.status === "unavailable") {
+          return this.finishRetryableSharedControlObservation(
+            result,
+            protocolObservation,
+            operationEpoch,
+          );
+        }
+        if (protocolObservation.status === "blocked") {
           result.errors = 1;
           result.message = this.t("result.v2ProtocolBlocked");
-          this.diag?.error(
-            "state",
-            "shared V2 sync protocol transport is unavailable during activation classification",
-          );
           return result;
         }
-        const protocol = await ensureSharedSyncProtocolV2(
-          protocolTransport,
-          {
-            scope: syncScope,
-            acknowledgeMigrationRisk: false,
-          },
-        );
-        if (protocol.status === "ready") {
-          activationReviewKind = "v2-cloud-join";
-          this.diag?.log(
-            "state",
-            "fresh V2 device classified as joining an existing shared sync state",
-            {
-              migrationGeneration:
-                protocol.binding.migrationGeneration.slice(0, 12),
-              mutations: 0,
-            },
-          );
-        } else if (protocol.status === "acknowledgement-required") {
+        const protocolProfile = protocolObservation.profile;
+        const initialProtocolObservation: SharedSyncProtocolObserved = {
+          status: "ready",
+          objects: protocolObservation.objects,
+        };
+        if (protocolProfile.status === "empty") {
+          if (pendingFirstSyncProtocolBinding) {
+            result.errors = 1;
+            result.message = this.t("result.v2ProtocolBlocked");
+            this.diag?.error(
+              "state",
+              "reviewed first-sync protocol checkpoint is missing from the fresh control-directory observation",
+              { mutations: 0 },
+            );
+            return result;
+          }
           activationReviewKind = "v2-first-sync";
           this.diag?.log(
             "state",
             "fresh V2 device classified as the first device for this sync state",
             { mutations: 0 },
           );
-        } else if (protocol.reason === "scope-mismatch") {
-          const scopeFreeProtocol =
-            await this.adoptExistingScopeFreeSharedProtocolForFreshActivation();
-          if (scopeFreeProtocol.status !== "ready") {
+        } else if (protocolProfile.status === "legacy-v2") {
+          const protocolTransportV2 = availableSharedSyncProtocolTransportV2(
+            this.onedrive,
+            this.vaultName,
+          );
+          if (!protocolTransportV2) {
+            result.errors = 1;
+            result.message = this.t("result.v2ProtocolBlocked");
+            return result;
+          }
+          const protocol = await this.ensureSharedSyncProtocolV2FromObservation(
+            protocolTransportV2,
+            initialProtocolObservation,
+            {
+              scope: syncScope,
+              acknowledgeMigrationRisk: false,
+              ...(pendingFirstSyncProtocolBinding
+                ? {
+                    expectedBinding: pendingFirstSyncProtocolBinding,
+                    requireExactBinding: true,
+                  }
+                : {}),
+            },
+          );
+          if (protocol.status === "unavailable") {
+            return this.finishRetryableSharedControlObservation(
+              result,
+              protocol,
+              operationEpoch,
+            );
+          }
+          if (
+            protocol.status !== "ready"
+            || protocol.value.binding.migrationGeneration
+              !== protocolProfile.migrationGeneration
+            || protocol.value.binding.recordId
+              !== protocolProfile.protocolV2Object.id
+            || protocol.value.binding.recordETag
+              !== protocolProfile.protocolV2Object.eTag
+          ) {
             result.errors = 1;
             result.message = this.t("result.v2ProtocolBlocked");
             this.diag?.error(
               "state",
-              "fresh V2 activation could not adopt the existing scope-free protocol after a V2 scope mismatch",
-              { reason: scopeFreeProtocol.reason, mutations: 0 },
+              "legacy V2 protocol changed during activation classification",
+              {
+                reason: protocol.status === "ready"
+                    ? "identity-mismatch"
+                    : protocol.reason,
+                mutations: 0,
+              },
             );
             return result;
           }
-          activationReviewKind = "v2-cloud-join";
-          freshCrossScopeProtocolBinding = scopeFreeProtocol.binding;
+          const resumesReviewedFirstSync = Boolean(
+            pendingFirstSyncProtocolBinding
+            && sharedSyncProtocolV2MatchesBinding(
+              protocolProfile.protocolV2Object,
+              protocolProfile.protocolV2,
+              pendingFirstSyncProtocolBinding,
+              syncScope,
+            )
+          );
+          activationReviewKind = resumesReviewedFirstSync
+            ? "v2-first-sync"
+            : "v2-cloud-join";
+          firstSyncVerificationProtocolBinding = protocol.value.binding;
           this.diag?.log(
             "state",
-            "fresh device adopted existing scope-free protocol from exact V2 predecessor",
+            resumesReviewedFirstSync
+              ? "reviewed first-sync resumed from its exact pending V2 protocol checkpoint"
+              : "fresh device classified as joining a legacy V2 shared sync state",
+            {
+              migrationGeneration:
+                protocol.value.binding.migrationGeneration.slice(0, 12),
+              mutations: 0,
+            },
+          );
+        } else if (protocolProfile.status === "healthy") {
+          const scopeFreeProtocol =
+            await this.inspectExistingScopeFreeSharedProtocolForFreshActivation(
+              initialProtocolObservation,
+            );
+          if (
+            scopeFreeProtocol.status !== "ready"
+            || scopeFreeProtocol.binding.migrationGeneration
+              !== protocolProfile.migrationGeneration
+            || scopeFreeProtocol.binding.recordId
+              !== protocolProfile.protocolV3Object.id
+            || scopeFreeProtocol.binding.recordETag
+              !== protocolProfile.protocolV3Object.eTag
+          ) {
+            result.errors = 1;
+            result.message = this.t("result.v2ProtocolBlocked");
+            this.diag?.error(
+              "state",
+              "healthy shared protocol profile changed during activation classification",
+              {
+                reason: scopeFreeProtocol.status === "ready"
+                  ? "generation-mismatch"
+                  : scopeFreeProtocol.reason,
+                mutations: 0,
+              },
+            );
+            return result;
+          }
+          const resumesReviewedFirstSync = Boolean(
+            pendingFirstSyncProtocolBinding
+            && sharedSyncProtocolV2MatchesBinding(
+              protocolProfile.protocolV2Object,
+              protocolProfile.protocolV2,
+              pendingFirstSyncProtocolBinding,
+              syncScope,
+            )
+          );
+          activationReviewKind = resumesReviewedFirstSync
+            ? "v2-first-sync"
+            : "v2-cloud-join";
+          freshSharedProtocolBinding = scopeFreeProtocol.binding;
+          firstSyncVerificationProtocolBinding = scopeFreeProtocol.binding;
+          this.diag?.log(
+            "state",
+            resumesReviewedFirstSync
+              ? "reviewed first-sync resumed from its exact healthy protocol lineage"
+              : "fresh device classified as joining an existing healthy shared protocol profile",
             {
               protocolVersion: scopeFreeProtocol.binding.protocolVersion,
               migrationGeneration:
@@ -3989,15 +6244,28 @@ export class SyncExecutor {
         } else {
           result.errors = 1;
           result.message = this.t("result.v2ProtocolBlocked");
+          if (protocolProfile.status === "inconsistent") {
+            this.diag?.error(
+              "state",
+              SHARED_SYNC_PROTOCOL_PROFILE_DIAGNOSTIC_EVENT,
+              protocolProfile.evidence,
+            );
+          }
           this.diag?.error(
             "state",
-            "fresh V2 activation could not classify the shared sync state safely",
-            { reason: protocol.reason, mutations: 0 },
+            "fresh activation could not classify the shared protocol profile safely",
+            {
+              reason: protocolProfile.status === "inconsistent"
+                ? protocolProfile.reason
+                : "recovery-proof-required",
+              mutations: 0,
+            },
           );
           return result;
         }
       }
       if (!takeOverPublic113MutationLedger) {
+        let recoveryObservationCommitSeq: number | undefined;
         if (
           this.state.isV2StateActive
           && this.state.mutationLedger.length > 0
@@ -4008,12 +6276,44 @@ export class SyncExecutor {
             syncScope,
           );
           if (this.shouldStop(result, operationEpoch)) return result;
+          const observedEnvelope = this.state.getCommittedV2Envelope();
+          if (observedEnvelope?.remoteIndex.complete === true) {
+            recoveryObservationCommitSeq = observedEnvelope.meta.commitSeq;
+          }
         }
-        const mutationRecovery = await this.recoverMutationLedger(
-          syncScope,
-          automaticHandlingMetrics,
-          operationEpoch,
-        );
+        let mutationRecovery: MutationRecoveryRunSummary | null = null;
+        try {
+          mutationRecovery = await this.recoverMutationLedger(
+            syncScope,
+            automaticHandlingMetrics,
+            operationEpoch,
+            options.mutationRecoveryObservationOnly === true,
+            recoveryObservationCommitSeq,
+          );
+        } catch (error) {
+          if (!(error instanceof MutationRecoveryBlockedError)) throw error;
+          const isolated = this.isolatableOrdinaryFileRecovery(
+            error.summary,
+            syncScope,
+          );
+          if (!isolated) throw error;
+          isolatedMutationRecoveryRecords = isolated;
+          const isolatedSummary: MutationRecoveryRunSummary = {
+            ...error.summary,
+            isolated: true,
+          };
+          mutationRecovery = isolatedSummary;
+          result.mutationRecovery = isolatedSummary;
+          this.diag?.warn(
+            "execute",
+            "unresolved ordinary files were isolated from unrelated planning",
+            {
+              records: isolated.length,
+              operationIds: isolated.map((record) => record.intent.operationId),
+              mutations: 0,
+            },
+          );
+        }
         if (this.shouldStop(result, operationEpoch)) return result;
         if (this.localVersionRecoveredDuringLedger) {
           const recoveredScan = await this.scanner.scanAll();
@@ -4050,6 +6350,9 @@ export class SyncExecutor {
             retryAfterSeconds: null,
           };
           result.success = this.state.mutationLedger.length === 0;
+          result.runFacts!.userFileChanges = mutationRecordsAtRunStart === 0
+            ? "none"
+            : "unknown";
           result.message = this.t(
             result.success ? "result.synced" : "result.syncFailed",
             result.success
@@ -4076,6 +6379,112 @@ export class SyncExecutor {
           );
           return result;
         }
+      }
+      if (
+        this.state.isV2StateActive
+        && !this.state.activeSyncScopeExpansion
+        && this.state.activeV2MigrationHold === null
+        && options.readOnlyPreview !== true
+      ) {
+        const expectedBinding = await this.state.getActiveV2ProtocolBinding();
+        let protocol = expectedBinding
+          ? await this.ensureScopeFreeSharedProtocol(
+              expectedBinding,
+              syncScope,
+            )
+          : { status: "blocked" as const, reason: "binding-missing" };
+        if (
+          protocol.status === "blocked"
+          && protocol.reason === "control-directory-not-found"
+          && restoredCommittedScopeFromDeltaCache
+          && committedScope
+          && typeof this.onedrive.restoreVaultScopeByIdentity === "function"
+        ) {
+          try {
+            const restored = await this.onedrive.restoreVaultScopeByIdentity(
+              this.vaultName,
+              {
+                driveId: committedScope.driveId,
+                vaultFolderId: committedScope.vaultFolderId,
+                filesRootId: committedScope.filesRootId,
+              },
+            );
+            if (
+              restored.driveId !== committedScope.driveId
+              || restored.vaultFolderId !== committedScope.vaultFolderId
+              || restored.filesRootId !== committedScope.filesRootId
+            ) {
+              throw new RemoteVaultScopeIdentityError("scope-incomplete");
+            }
+          } catch (error) {
+            const scopeLoss = await this.resolveV2CommittedScopeLoss(
+              committedScope,
+              error,
+            );
+            await this.stageV2CommittedScopeRecovery(result, scopeLoss);
+            if (mode === "auto") return result;
+            const recoveryResult = await this.runV2RemoteScopeRecovery({
+              result,
+              callbacks,
+              operationEpoch,
+              automaticHandlingPolicy,
+              communityPluginSyncPolicy,
+              enterPhase,
+            });
+            if (recoveryResult) return recoveryResult;
+            result.deferred = 0;
+            result.message = "";
+            protocol = expectedBinding
+              ? await this.ensureScopeFreeSharedProtocol(
+                  expectedBinding,
+                  syncScope,
+                )
+              : { status: "blocked" as const, reason: "binding-missing" };
+          }
+        }
+        if (protocol.status !== "ready") {
+          if (protocol.status === "unavailable") {
+            return this.finishRetryableSharedControlObservation(
+              result,
+              protocol,
+              operationEpoch,
+            );
+          }
+          result.errors = 1;
+          result.message = this.t("result.v2ProtocolBlocked");
+          if (protocol.evidence) {
+            this.diag?.error(
+              "state",
+              SHARED_SYNC_PROTOCOL_PROFILE_DIAGNOSTIC_EVENT,
+              protocol.evidence,
+            );
+          }
+          this.diag?.error(
+            "state",
+            "active V2 shared protocol profile could not converge safely",
+            { reason: protocol.reason, mutations: 0 },
+          );
+          return result;
+        }
+        if (expectedBinding && protocol.binding !== expectedBinding) {
+          if (this.shouldStop(result, operationEpoch)) return result;
+          try {
+            await this.state.upgradeActiveV2ProtocolBinding({
+              expectedBinding,
+              nextBinding: protocol.binding,
+            });
+          } catch (error) {
+            result.errors = 1;
+            result.message = this.t("result.v2ProtocolBlocked");
+            this.diag?.error(
+              "state",
+              "active V2 shared protocol binding changed before adjacent migration committed",
+              error instanceof Error ? error.message : String(error),
+            );
+            return result;
+          }
+        }
+        if (this.shouldStop(result, operationEpoch)) return result;
       }
       const scopeExpansionState = this.state as StateManager & Partial<
         Pick<StateManager, "prepareSyncScopeExpansion">
@@ -4116,39 +6525,6 @@ export class SyncExecutor {
         prepareV2MigrationCandidate
         || scopeExpansionPreparation.status === "ready"
         || (options.communityPluginJoinAuthorizations?.length ?? 0) > 0;
-      const structuredCommunityPluginPathForIdentity =
-        communityPluginSyncPolicy.files.mode !== "none"
-          ? `${getConfigDir(this.scanner.vault)}/community-plugins.json`
-          : null;
-      const enablementObservation = structuredCommunityPluginPathForIdentity
-        ? this.state.getCommunityPluginEnablementState(syncScope).observation
-        : undefined;
-      const structuredRemoteIdentityMissing = Boolean(
-        this.state.isV2StateActive
-        && this.state.hasRemoteState
-        && this.state.remoteDeltaLink
-        && structuredCommunityPluginPathForIdentity
-        && !this.state.remoteSnapshot.some(
-          (entry) => entry.path === structuredCommunityPluginPathForIdentity,
-        )
-        && enablementObservation
-          ?.source.path === structuredCommunityPluginPathForIdentity
-        && enablementObservation.source.remote.exists
-        && enablementObservation.source.remote.contentHash
-        && enablementObservation.source.remote.remoteId
-        && enablementObservation.source.remote.eTag,
-      );
-      if (structuredRemoteIdentityMissing) {
-        forceCompleteRemoteIdentitySnapshot = true;
-        this.diag?.warn(
-          "onedrive",
-          "committed community plugin enablement observation is missing from the V2 remote identity snapshot; rebuilding once before structured sync",
-          {
-            path: structuredCommunityPluginPathForIdentity,
-            mutations: 0,
-          },
-        );
-      }
       if (
         this.state.remoteDeltaLink
         && !this.onedrive.isDeltaLinkForVault(
@@ -4274,6 +6650,37 @@ export class SyncExecutor {
         return result;
       }
       if (scopeExpansionPreparation.status === "ready") {
+        const sourceBoundCommunityPluginJoinRoots = [
+          ...(options.communityPluginJoinAuthorizations ?? []),
+        ].flatMap((authorization) => {
+          if (
+            validateCommunityPluginJoinAuthorization(
+              authorization,
+              remoteEntries,
+              syncScope,
+            ).status !== "valid"
+          ) return [];
+          const firstMemberPath = authorization.members[0]?.path ?? "";
+          const pluginRoot = firstMemberPath.slice(
+            0,
+            firstMemberPath.lastIndexOf("/"),
+          );
+          const remoteRoot = this.state.remoteFolders.find(
+            (folder) => folder.path === pluginRoot,
+          );
+          if (
+            !pluginRoot
+            || !remoteRoot
+            || authorization.members.some((member) =>
+              member.path.slice(0, member.path.lastIndexOf("/")) !== pluginRoot
+            )
+            || authorization.members.some((member) =>
+              member.parentId !== remoteRoot.driveId
+            )
+            || localFolders.some((folder) => folder.path === pluginRoot)
+          ) return [];
+          return [{ path: pluginRoot, remoteId: remoteRoot.driveId }];
+        });
         const accepted = await this.state.acceptSyncScopeExpansionFolders({
           expectedRevision: scopeExpansionPreparation.revision,
           scope: syncScope,
@@ -4283,6 +6690,7 @@ export class SyncExecutor {
           remoteIdentityComplete:
             this.completeRemoteItems !== null
             && this.state.hasCompleteRemoteFolderIndex,
+          sourceBoundCommunityPluginJoinRoots,
         });
         if (accepted.status === "accepted") {
           this.diag?.log(
@@ -4454,6 +6862,38 @@ export class SyncExecutor {
           },
         );
       }
+      const joinedGenerationByPluginId = new Map<string, number>(
+        [],
+      );
+      const preparedCommunityPluginGenerationRestores =
+        await this.prepareCommunityPluginGenerationRestores({
+          authorizations: [...joinAuthorizationsByPluginId.values()],
+          joinedGenerationByPluginId,
+          localEntries,
+          policy: communityPluginSyncPolicy,
+          scope: syncScope,
+          configDir,
+          readOnlyPreview: options.readOnlyPreview === true,
+          result,
+          operationEpoch,
+        });
+      recordCommunityPluginJoinBlocks(
+        preparedCommunityPluginGenerationRestores.blocks,
+      );
+      for (const block of preparedCommunityPluginGenerationRestores.blocks) {
+        joinAuthorizationsByPluginId.delete(block.pluginId);
+      }
+      const generationRestoreProjectionsByPluginId =
+        preparedCommunityPluginGenerationRestores.projectionsByPluginId;
+      const observedGenerationByPluginId =
+        preparedCommunityPluginGenerationRestores
+          .observedGenerationByPluginId;
+      // Historical lifecycle state is not, by itself, a generation restore.
+      // Keep ordinary V2 file actions unless this round produced a validated
+      // restore projection for that plugin.
+      const generationRestorePluginIds = new Set(
+        generationRestoreProjectionsByPluginId.keys(),
+      );
       const detectedCommunityPluginLocalIgnores: CommunityPluginLocalIgnores =
         prepareV2MigrationCandidate
           ? detectCommunityPluginLocalIgnores({
@@ -4499,16 +6939,30 @@ export class SyncExecutor {
         );
       }
       const communityPluginManifestEvidence =
-        await this.prepareMobileCommunityPluginManifestEvidence({
-          policy: communityPluginSyncPolicy,
+        await this.prepareCommunityPluginManifestEvidence({
+          policy: generationRestorePluginIds.size > 0
+            ? excludeSelectedCommunityPluginFiles(
+                communityPluginSyncPolicy,
+                [...generationRestorePluginIds],
+              )
+            : communityPluginSyncPolicy,
           configDir,
           localEntries,
           remoteEntries,
           scope: syncScope,
           result,
           operationEpoch,
-          joiningPluginIds: [...joinAuthorizationsByPluginId.keys()],
+          joiningPluginIds: [...joinAuthorizationsByPluginId.keys()].filter(
+            (pluginId) => !generationRestorePluginIds.has(pluginId),
+          ),
         });
+      await this.prepareCommunityPluginBundleIdentities({
+        policy: communityPluginSyncPolicy,
+        configDir,
+        localEntries,
+        remoteEntries,
+        manifestObservations: communityPluginManifestEvidence.observations,
+      });
       const manifestCompatibilityBlocks =
         communityPluginManifestEvidence.incompatiblePluginIds.flatMap(
           (pluginId): CommunityPluginJoinBlock[] => {
@@ -4604,79 +7058,9 @@ export class SyncExecutor {
         )
       );
 
-      const structuredCommunityPluginPath = communityPluginSyncPolicy.files.mode !== "none"
-        ? `${getConfigDir(this.scanner.vault)}/community-plugins.json`
-        : null;
-      let communityPluginEnablementWork: PreparedCommunityPluginEnablementWork | null = null;
-      let communityPluginEnablementDecisionRequired = false;
-      if (structuredCommunityPluginPath) {
-        try {
-          communityPluginEnablementWork =
-            await this.prepareCommunityPluginEnablementWork(
-              structuredCommunityPluginPath,
-              communityPluginSyncPolicy.files,
-              localEntries,
-              remoteEntries,
-              syncScope,
-            );
-        } catch (error) {
-          if (error instanceof CommunityPluginEnablementVersionChangedError) {
-            result.deferred = 1;
-            result.message = this.t("result.deferred", { deferred: 1 });
-            this.diag?.warn(
-              "execute",
-              "community plugin enablement changed during preparation; deferred",
-              { side: error.side, mutations: 0 },
-            );
-            return result;
-          }
-          result.errors = 1;
-          result.message = this.t("result.communityPluginEnablementInvalid");
-          this.diag?.error(
-            "execute",
-            "community plugin enablement preparation failed closed",
-            error instanceof Error ? error.message : String(error),
-          );
-          return result;
-        }
-        if (this.shouldStop(result, operationEpoch)) return result;
-        if (communityPluginEnablementWork.prepared.status === "decision-required") {
-          if (!prepareV2MigrationCandidate) {
-            await this.state.setCommunityPluginEnablementState({
-              version: 1,
-              scope: syncScope,
-              anchors: communityPluginEnablementWork.prepared.anchors,
-              pending: communityPluginEnablementWork.prepared.pending,
-              observation: communityPluginEnablementWork.observation,
-            });
-          } else {
-            communityPluginEnablementDecisionRequired = true;
-          }
-          result.attention = {
-            reason: "community-plugin-enablement-decision-required",
-            count: communityPluginEnablementWork.prepared.pending.length,
-          };
-          result.message = this.t("result.communityPluginEnablementDecisionRequired");
-          this.diag?.warn(
-            "plan",
-            prepareV2MigrationCandidate
-              ? "public 1.1.3 community plugin enablement requires a V2 migration decision; legacy state left unchanged"
-              : "community plugin enablement requires an explicit first observation decision",
-            {
-              pluginIds: communityPluginEnablementWork.prepared.pending.map(
-                (item) => item.pluginId,
-              ),
-              mutations: 0,
-            },
-          );
-          if (!prepareV2MigrationCandidate) return result;
-        }
-      }
-
-      const planningLocalEntries = structuredCommunityPluginPath
-        ? localEntries.filter((entry) => entry.path !== structuredCommunityPluginPath)
-        : localEntries;
+      const planningLocalEntries = localEntries;
       // Step 5: Generate sync plan
+      result.runFacts!.ordinaryPlanning = "entered";
       enterPhase("planning");
       this.progressStore?.setPhase("planning");
       callbacks.onProgress?.(0, 1, this.t("progress.generatingPlan"));
@@ -4703,16 +7087,28 @@ export class SyncExecutor {
         }
         const migrationBaseByPath = new Map(
           public113MigrationInput!.baseEntries
-            .filter((entry) => entry.path !== structuredCommunityPluginPath)
+            .filter((entry) => isCommunityPluginPathSelectedByPolicy(
+              entry.path,
+              communityPluginSyncPolicy,
+              configDir,
+            ))
             .map((entry) => [entry.path, { ...entry }]),
         );
         for (const entry of seededBaseEntries) {
-          if (entry.path !== structuredCommunityPluginPath) {
+          if (isCommunityPluginPathSelectedByPolicy(
+            entry.path,
+            communityPluginSyncPolicy,
+            configDir,
+          )) {
             migrationBaseByPath.set(entry.path, { ...entry });
           }
         }
         for (const entry of eTagUpdates) {
-          if (entry.path !== structuredCommunityPluginPath) {
+          if (isCommunityPluginPathSelectedByPolicy(
+            entry.path,
+            communityPluginSyncPolicy,
+            configDir,
+          )) {
             migrationBaseByPath.set(entry.path, { ...entry });
           }
         }
@@ -4746,8 +7142,7 @@ export class SyncExecutor {
           v1Base: [...migrationBaseByPath.values()],
           v1RemoteEntries: migrationSourceRemoteEntries.filter(
             (entry) =>
-              entry.path !== structuredCommunityPluginPath
-              && isCommunityPluginPathSelectedByPolicy(
+              isCommunityPluginPathSelectedByPolicy(
                 entry.path,
                 communityPluginSyncPolicy,
                 configDir,
@@ -4808,12 +7203,24 @@ export class SyncExecutor {
       let canonicalSourceEnvelope =
         committedV2Envelope ?? migrationCandidateEnvelope;
       const includeCanonicalFilePath = (path: string): boolean =>
-        path !== structuredCommunityPluginPath
-        && this.shouldIncludeRemotePath(path);
+        this.shouldIncludeRemotePath(path)
+        && !this.isPathProtectedByIsolatedRecovery(
+          path,
+          isolatedMutationRecoveryRecords,
+        )
+        && isCommunityPluginPathSelectedByPolicy(
+          path,
+          communityPluginSyncPolicy,
+          configDir,
+        );
       const includeCanonicalFolderPath = (path: string): boolean =>
         this.scanner.shouldSyncFolderPath(path);
       const preserveCanonicalFolderPath = (path: string): boolean =>
         !includeCanonicalFolderPath(path)
+        || this.isFolderProtectedByIsolatedRecovery(
+          path,
+          isolatedMutationRecoveryRecords,
+        )
         || isCommunityPluginFolderPreservedByPolicy(
           path,
           communityPluginSyncPolicy,
@@ -4821,6 +7228,61 @@ export class SyncExecutor {
           "easy-sync",
           [...joinAuthorizationsByPluginId.keys()],
         );
+      let firstSyncVerificationOperationId: string | null = null;
+      let verifiedFirstSyncRemoteHashesById: ReadonlyMap<string, string> =
+        new Map();
+      if (prepareV2MigrationCandidate) {
+        try {
+          const operation = await this.state.beginFirstSyncVerificationEvidence(
+            syncScope,
+            public113MigrationEvidence ? public113MigrationInput : null,
+            firstSyncVerificationProtocolBinding,
+          );
+          firstSyncVerificationOperationId = operation.operationId;
+          const versionsByRemoteId = new Map(remoteEntries.map((entry) => [
+            entry.driveId,
+            {
+              remoteId: entry.driveId,
+              size: entry.size,
+              eTag: entry.eTag,
+              ...(entry.cTag ? { cTag: entry.cTag } : {}),
+            },
+          ]));
+          const cached = await this.state.readValidFirstSyncVerificationEvidence(
+            operation.operationId,
+            [...versionsByRemoteId.values()],
+          );
+          verifiedFirstSyncRemoteHashesById = new Map(
+            [...cached.receiptsByRemoteId].map(([remoteId, receipt]) => [
+              remoteId,
+              receipt.sha256,
+            ]),
+          );
+          if (cached.receiptsByRemoteId.size > 0 || cached.invalidated > 0) {
+            this.diag?.log(
+              "plan",
+              "loaded version-bound first-sync content evidence",
+              {
+                operationKind: "first-sync-verification",
+                total: versionsByRemoteId.size,
+                reusable: cached.receiptsByRemoteId.size,
+                invalidated: cached.invalidated,
+                unverified:
+                  versionsByRemoteId.size - cached.receiptsByRemoteId.size,
+                mutations: 0,
+              },
+            );
+          }
+        } catch (error) {
+          firstSyncVerificationOperationId = null;
+          verifiedFirstSyncRemoteHashesById = new Map();
+          this.diag?.warn(
+            "plan",
+            "first-sync content evidence is unavailable; falling back to full verification",
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
       const resolveCanonicalRemoteContentHash = async (
         item: Readonly<SyncPlanItem>,
         progress: { current: number; total: number },
@@ -4855,7 +7317,46 @@ export class SyncExecutor {
           size: remoteContent.byteLength,
           hash: downloadedHash,
         });
+        if (firstSyncVerificationOperationId) {
+          try {
+            await this.state.putVerifiedFirstSyncVerificationEvidence({
+              schemaVersion: 1,
+              operationId: firstSyncVerificationOperationId,
+              remoteId: remote.driveId,
+              size: remote.size,
+              eTag: remote.eTag,
+              ...(remote.cTag ? { cTag: remote.cTag } : {}),
+              sha256: downloadedHash,
+              verifiedAt: Date.now(),
+            });
+          } catch (error) {
+            firstSyncVerificationOperationId = null;
+            this.diag?.warn(
+              "plan",
+              "first-sync content evidence could not be persisted; continuing with verified bytes",
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+        }
         return downloadedHash;
+      };
+      const retireFirstSyncVerificationEvidence = async (): Promise<void> => {
+        const operationId = firstSyncVerificationOperationId;
+        if (!operationId) return;
+        firstSyncVerificationOperationId = null;
+        try {
+          await this.state.retireFirstSyncVerificationEvidence(operationId);
+        } catch (error) {
+          this.diag?.warn(
+            "state",
+            "committed V2 authority left disposable first-sync evidence for later pruning",
+            {
+              operationKind: "first-sync-verification",
+              error: error instanceof Error ? error.message : String(error),
+              mutations: 0,
+            },
+          );
+        }
       };
       if (migrationPlannerState) {
         canonicalPlanCandidate = buildCanonicalPlanCandidateFromStateV2({
@@ -5536,6 +8037,32 @@ export class SyncExecutor {
         ),
         configDir,
       );
+      if (generationRestorePluginIds.size > 0) {
+        plan.items = plan.items.filter((item) => {
+          const classified = classifyCommunityPluginManagedPath(
+            item.path,
+            configDir,
+          );
+          return !classified
+            || classified.kind !== "files"
+            || !generationRestorePluginIds.has(classified.pluginId);
+        });
+        for (const projection of
+          generationRestoreProjectionsByPluginId.values()) {
+          plan.items.push(
+            ...projectCommunityPluginGenerationRestorePlanItemsV1(projection),
+          );
+        }
+      }
+      if (plan.items.some((item) =>
+        this.planItemIntersectsIsolatedRecovery(
+          item,
+          isolatedMutationRecoveryRecords,
+        ))) {
+        throw new Error(
+          "Canonical plan intersects isolated mutation recovery",
+        );
+      }
       plan.scope = syncScope;
       this.diag?.log("plan", `plan generated — ${plan.items.length} actions (up/down/del/conflict: ${plan.items.filter(i=>i.type===SyncActionType.Upload).length}/${plan.items.filter(i=>i.type===SyncActionType.Download).length}/${plan.items.filter(i=>i.type===SyncActionType.Conflict).length})`);
       if (this.shouldStop(result, operationEpoch)) return result;
@@ -5629,6 +8156,8 @@ export class SyncExecutor {
               contentComparison: item.contentComparison,
             }),
           ),
+          verifiedRemoteContentHashesById:
+            verifiedFirstSyncRemoteHashesById,
           resolveRemoteContentHash: resolveCanonicalRemoteContentHash,
         });
         contentEqualityBaseUpserts = finalizedCanonicalPlan.baseUpserts;
@@ -5869,50 +8398,19 @@ export class SyncExecutor {
           );
         }
         const reviewKind = activationReviewKind;
-        const migrationCommunityPluginEnablement =
-          communityPluginEnablementWork?.migrationCarrier;
-        if (communityPluginEnablementDecisionRequired) {
-          const hold = await this.state.stageV2MigrationHold({
-            candidate: migrationCandidateEnvelope,
-            source: public113MigrationInput!,
-            reviewKind,
-            plan,
-            communityPluginEnablement:
-              migrationCommunityPluginEnablement,
-          });
-          this.diag?.warn(
-            "state",
-            "V2 migration held on source-bound community plugin enablement decisions",
-            {
-              phase: "activation",
-              holdRevision: hold.revision,
-              decisions:
-                migrationCommunityPluginEnablement?.pending.length ?? 0,
-              mutations: 0,
-            },
-          );
-          return result;
-        }
+        let activeReviewedAuthorization = reviewedAuthorization;
         plan.reviewKind = reviewKind;
         if (
           skipConfirmation
-          && reviewedAuthorization?.reviewKind === reviewKind
+          && activeReviewedAuthorization?.reviewKind === reviewKind
         ) {
           const existingConfirmed = this.state.activeV2MigrationHold;
           const reviewedMigrationStillCurrent =
-            (
-              existingConfirmed?.phase === "confirmed"
-              && sameCommunityPluginEnablementMigrationCarrierV2(
-                existingConfirmed.communityPluginEnablement,
-                migrationCommunityPluginEnablement,
-              )
-            )
+            existingConfirmed?.phase === "confirmed"
             || await this.state.isCurrentV2MigrationAuthorization({
-              authorization: reviewedAuthorization,
+              authorization: activeReviewedAuthorization,
               candidate: migrationCandidateEnvelope,
               canonicalIdentity: plan.canonicalIdentity,
-              communityPluginEnablement:
-                migrationCommunityPluginEnablement,
             });
           let protocolBinding =
             existingConfirmed?.phase === "confirmed"
@@ -5921,13 +8419,23 @@ export class SyncExecutor {
           if (
             reviewedMigrationStillCurrent
             && reviewKind === "v2-cloud-join"
-            && freshCrossScopeProtocolBinding
+            && freshSharedProtocolBinding
             && !protocolBinding
           ) {
             const scopeFreeProtocol =
               await this.adoptExistingScopeFreeSharedProtocolForFreshActivation(
-                freshCrossScopeProtocolBinding,
+                freshSharedProtocolBinding,
               );
+            if (scopeFreeProtocol.status === "unavailable") {
+              result.errors = 1;
+              result.message = this.t("result.sharedControlReadUnavailable");
+              this.diag?.warn(
+                "state",
+                "reviewed cross-scope cloud join retained its authorization because the shared protocol is temporarily unavailable",
+                { reason: scopeFreeProtocol.reason, mutations: 0 },
+              );
+              return result;
+            }
             if (scopeFreeProtocol.status !== "ready") {
               result.errors = 1;
               result.message = this.t("result.v2ProtocolBlocked");
@@ -5979,24 +8487,82 @@ export class SyncExecutor {
               );
               return result;
             }
-            const protocol = await ensureSharedSyncProtocolV2(
-              protocolTransport,
-              {
-                scope: syncScope,
-                acknowledgeMigrationRisk:
-                  reviewKind !== "v2-cloud-join",
-              },
-            );
-            if (protocol.status === "acknowledgement-required") {
+            const protocolObservation =
+              await this.observeSharedSyncProtocolObjects();
+            if (protocolObservation.status === "unavailable") {
+              result.errors = 1;
+              result.message = this.t("result.sharedControlReadUnavailable");
+              this.diag?.warn(
+                "state",
+                "reviewed V2 activation retained its authorization because the shared protocol is temporarily unavailable",
+                { reason: protocolObservation.reason, mutations: 0 },
+              );
+              return result;
+            }
+            if (protocolObservation.status !== "ready") {
               result.errors = 1;
               result.message = this.t("result.v2ProtocolBlocked");
               this.diag?.error(
                 "state",
-                "reviewed cloud V2 join lost its shared protocol before authority commit",
+                "shared V2 sync protocol could not be observed before authority commit",
+                { reason: protocolObservation.reason, mutations: 0 },
               );
               return result;
             }
-            if (protocol.status === "blocked") {
+            const protocol = await this.ensureSharedSyncProtocolV2FromObservation(
+              protocolTransport,
+              protocolObservation,
+              {
+                scope: syncScope,
+                acknowledgeMigrationRisk:
+                  reviewKind !== "v2-cloud-join",
+                ...(reviewKind === "v2-first-sync"
+                    && existingConfirmed?.phase === "pending"
+                    && existingConfirmed.protocolBinding?.protocolVersion === 2
+                  ? {
+                      expectedBinding: existingConfirmed.protocolBinding,
+                      requireExactBinding: true,
+                    }
+                  : {}),
+              },
+              async (settled) => {
+                if (
+                  reviewKind !== "v2-first-sync"
+                  || settled.source !== "created"
+                  || !activeReviewedAuthorization
+                ) return;
+                const checkpointed =
+                  await this.state.checkpointPendingFirstSyncProtocolBinding({
+                    authorization: activeReviewedAuthorization,
+                    candidate: migrationCandidateEnvelope,
+                    canonicalIdentity: plan.canonicalIdentity!,
+                    protocolBinding: settled.binding,
+                  });
+                if (!checkpointed) return;
+                const refreshedAuthorization =
+                  this.state.planReviewAuthorization;
+                if (
+                  !refreshedAuthorization
+                  || refreshedAuthorization.reviewKind !== "v2-first-sync"
+                ) {
+                  throw new Error(
+                    "First-sync protocol checkpoint lost its reviewed authorization",
+                  );
+                }
+                activeReviewedAuthorization = refreshedAuthorization;
+              },
+            );
+            if (protocol.status === "unavailable") {
+              result.errors = 1;
+              result.message = this.t("result.sharedControlReadUnavailable");
+              this.diag?.warn(
+                "state",
+                "reviewed V2 activation retained its authorization because post-write protocol observation is temporarily unavailable",
+                { reason: protocol.reason, mutations: 0 },
+              );
+              return result;
+            }
+            if (protocol.status !== "ready") {
               result.errors = 1;
               result.message = this.t("result.v2ProtocolBlocked");
               this.diag?.error(
@@ -6007,9 +8573,21 @@ export class SyncExecutor {
               return result;
             }
             const scopeFreeProtocol =
-              await this.ensureScopeFreeSharedProtocol(
-                protocol.binding,
+              await this.ensureScopeFreeSharedProtocolFromObservation(
+                protocol.value.binding,
+                syncScope,
+                protocol.observation,
               );
+            if (scopeFreeProtocol.status === "unavailable") {
+              result.errors = 1;
+              result.message = this.t("result.sharedControlReadUnavailable");
+              this.diag?.warn(
+                "state",
+                "reviewed V2 activation retained its authorization because scope-free protocol observation is temporarily unavailable",
+                { reason: scopeFreeProtocol.reason, mutations: 0 },
+              );
+              return result;
+            }
             if (scopeFreeProtocol.status !== "ready") {
               result.errors = 1;
               result.message = this.t("result.v2ProtocolBlocked");
@@ -6039,13 +8617,14 @@ export class SyncExecutor {
           if (reviewedMigrationStillCurrent) {
             confirmed = (
               existingConfirmed?.phase === "confirmed"
-              && reviewedAuthorization.revision === existingConfirmed.revision
+              && activeReviewedAuthorization.revision
+                === existingConfirmed.revision
               && sameSyncScope(
-                reviewedAuthorization.scope,
+                activeReviewedAuthorization.scope,
                 existingConfirmed.scope,
               )
               && sameCanonicalPlanIdentityV2(
-                reviewedAuthorization.canonicalIdentity,
+                activeReviewedAuthorization.canonicalIdentity,
                 existingConfirmed.canonicalIdentity,
               )
               && sameCanonicalPlanIdentityV2(
@@ -6056,21 +8635,19 @@ export class SyncExecutor {
                 migrationCandidateEnvelope,
                 existingConfirmed.candidate,
               )
-              && sameCommunityPluginEnablementMigrationCarrierV2(
-                migrationCommunityPluginEnablement,
-                existingConfirmed.communityPluginEnablement,
-              )
             )
               ? existingConfirmed
               : await this.state.confirmV2MigrationHold({
-                  authorization: reviewedAuthorization,
+                  authorization: activeReviewedAuthorization,
                   candidate: migrationCandidateEnvelope,
                   canonicalIdentity: plan.canonicalIdentity,
-                  communityPluginEnablement:
-                    migrationCommunityPluginEnablement,
                   protocolBinding: protocolBinding!,
                 });
           }
+          // Revalidating the pending hold may await storage/source evidence.
+          // Cancellation remains authoritative until authority commit begins;
+          // a confirmed hold is durable and can resume on the next run.
+          this.throwIfSharedSyncProtocolOperationWasCancelled();
           if (confirmed) {
             const committed =
               await this.state.commitConfirmedV2MigrationHold(
@@ -6081,6 +8658,7 @@ export class SyncExecutor {
                   : "ordinary",
             );
             migrationAuthorityCommittedThisRun = true;
+            await retireFirstSyncVerificationEvidence();
             await publishCommunityPluginPostAuthorityState();
             migrationExecutionHold = committed.hold;
             plan.confirmed = true;
@@ -6137,8 +8715,6 @@ export class SyncExecutor {
               source: public113MigrationInput!,
               reviewKind,
               plan,
-              communityPluginEnablement:
-                migrationCommunityPluginEnablement,
             });
             this.diag?.warn(
               "state",
@@ -6163,8 +8739,6 @@ export class SyncExecutor {
             source: public113MigrationInput!,
             reviewKind,
             plan,
-            communityPluginEnablement:
-              migrationCommunityPluginEnablement,
           });
           this.diag?.warn(
             "state",
@@ -6364,13 +8938,9 @@ export class SyncExecutor {
       // authorized this exact zero-plan round. A declined first-sync preview
       // or a forced recovery preview must leave V1 authoritative.
       if (attemptV2Activation && !migrationAuthorityCommittedThisRun) {
-        const structuredFileMutationPending =
-          communityPluginEnablementWork?.prepared.localChanged === true
-          || communityPluginEnablementWork?.prepared.remoteChanged === true;
         const activationReady = plan.items.length === 0
           && result.skippedLarge === 0
           && result.skippedIgnored === 0
-          && !structuredFileMutationPending
           && localFolderScanComplete
           && this.state.mutationLedger.length === 0
           && !this.state.hasMutationLedgerCorruption
@@ -6395,6 +8965,7 @@ export class SyncExecutor {
           if (migration.status !== "committed" && migration.status !== "already-committed") {
             throw new Error(`V2 state activation aborted: ${migration.reason ?? "unknown"}`);
           }
+          await retireFirstSyncVerificationEvidence();
           await publishCommunityPluginPostAuthorityState();
           if (
             this.state.planReviewActive
@@ -6408,7 +8979,6 @@ export class SyncExecutor {
             planItems: plan.items.length,
             skippedLarge: result.skippedLarge,
             skippedIgnored: result.skippedIgnored,
-            structuredFileMutationPending,
             localFolderScanComplete,
             planReviewActive: this.state.planReviewActive,
             pendingConflicts: this.state.pendingConflicts.length,
@@ -6429,32 +8999,71 @@ export class SyncExecutor {
       // archive the original public-1.1.3 snapshot before retiring stale UI.
       if (this.shouldStop(result, operationEpoch)) return result;
       await this.state.prunePendingConflicts(
-        plan.items
-          .filter((item) => item.type === SyncActionType.Conflict)
-          .map((item) => item.path),
+        [
+          ...plan.items
+            .filter((item) => item.type === SyncActionType.Conflict)
+            .map((item) => item.path),
+          ...this.state.pendingConflicts
+            .filter((item) => this.isPathProtectedByIsolatedRecovery(
+              item.path,
+              isolatedMutationRecoveryRecords,
+            ))
+            .map((item) => item.path),
+        ],
       );
       if (this.shouldStop(result, operationEpoch)) return result;
       await this.state.prunePendingDeletes(
-        plan.items
-          .filter((item) => item.type === SyncActionType.ConfirmLocalDelete
+        [
+          ...plan.items
+            .filter((item) => item.type === SyncActionType.ConfirmLocalDelete
             || item.type === SyncActionType.DeleteLocal
             || (
               item.type === SyncActionType.DeleteLocalFolder
               && item.requiresConfirmation
             ))
-          .map((item) => item.path),
+            .map((item) => item.path),
+          ...this.state.pendingRemoteDeletes
+            .filter((item) => this.isPathProtectedByIsolatedRecovery(
+              item.path,
+              isolatedMutationRecoveryRecords,
+            ))
+            .map((item) => item.path),
+        ],
       );
       if (this.shouldStop(result, operationEpoch)) return result;
       await this.state.prunePendingIssues(
-        plan.items
-          .filter((item) => isPendingIssueAction(item.type))
-          .map((item) => item.path),
+        [
+          ...plan.items
+            .filter((item) => isPendingIssueAction(item.type))
+            .map((item) => item.path),
+          ...this.state.pendingIssues
+            .filter((item) => this.isPathProtectedByIsolatedRecovery(
+              item.path,
+              isolatedMutationRecoveryRecords,
+            ))
+            .map((item) => item.path),
+        ],
       );
       if (this.shouldStop(result, operationEpoch)) return result;
 
       // Step 8: Execute plan items
       enterPhase("transfer");
       this.progressStore?.setPhase("executing");
+      const stagedFolderMoves = plan.items.filter(
+        (item) => item.type === SyncActionType.MoveRemoteFolder
+          || item.type === SyncActionType.MoveLocalFolder,
+      );
+      const stagedFolderMove =
+        stagedFolderMoves.length === 1
+        && canonicalPlanCandidate?.folderPlan.items.length === 1
+        && (
+          canonicalPlanCandidate.folderPlan.items[0]?.type === "move-remote"
+          || canonicalPlanCandidate.folderPlan.items[0]?.type === "move-local"
+        )
+        && plan.canonicalIdentity
+          ? stagedFolderMoves[0]
+          : null;
+      const foldersMovedBeforeExecution = result.foldersMoved ?? 0;
       await this.executePlan(
         plan,
         result,
@@ -6463,7 +9072,201 @@ export class SyncExecutor {
         automaticHandlingPolicy,
         automaticHandlingMetrics,
         communityPluginSyncPolicy,
+        generationRestoreProjectionsByPluginId,
+        isolatedMutationRecoveryRecords,
       );
+      // A folder move is a topology transaction in either direction. Only
+      // after its receipt/checkpoint has advanced the authority may one fresh
+      // scan produce a single bounded descendant plan; never recurse into run().
+      if (
+        stagedFolderMove
+        && (result.foldersMoved ?? 0) === foldersMovedBeforeExecution + 1
+        && result.errors === 0
+        && result.conflicts === 0
+        && result.deferred === 0
+        && this.state.mutationLedger.length === 0
+        && !this.shouldStop(result, operationEpoch)
+      ) {
+        let continuationSettled = false;
+        const targetRoot = stagedFolderMove.path;
+        const sourceRoot = stagedFolderMove.renameFrom;
+        const remoteId = stagedFolderMove.folder?.remoteId;
+        const sourceCommitSeq = plan.canonicalIdentity!.sourceCommitSeq;
+        const checkpointEnvelope = this.state.getCommittedV2Envelope();
+        const committedFolderAnchor = remoteId && checkpointEnvelope
+          ? Object.values(
+              checkpointEnvelope.folderAnchors?.byAnchorId ?? {},
+            ).find((anchor) => anchor.remoteId === remoteId)
+          : null;
+        const moveAuthorizationSettled = stagedFolderMove.type
+          === SyncActionType.MoveLocalFolder
+          || (remoteId
+            ? !this.state.localFolderMoveHints.some((hint) =>
+                hint.remoteId === remoteId
+                || (
+                  sourceRoot !== undefined
+                  && hint.fromPath === sourceRoot
+                  && hint.toPath === targetRoot
+                ))
+            : false);
+        if (
+          checkpointEnvelope
+          && remoteId
+          && committedFolderAnchor?.lastPath === targetRoot
+          && checkpointEnvelope.meta.commitSeq > sourceCommitSeq
+          && moveAuthorizationSettled
+        ) {
+          const continuationScan = await this.scanner.scanAll();
+          const continuationScanComplete = continuationScan.complete !== false
+            && continuationScan.failedPaths.length === 0
+            && continuationScan.folderScanComplete === true;
+          let continuationEnvelope: SyncStateEnvelopeV2 | null =
+            checkpointEnvelope;
+          if (
+            continuationScanComplete
+            && this.state.mutationLedger.length === 0
+            && !this.shouldStop(result, operationEpoch)
+          ) {
+            const continuationRemote = await this.tryDeltaOrFullScan(
+              operationEpoch,
+              result,
+              plan.scope,
+              continuationScan.entries,
+            );
+            continuationEnvelope = this.state.getCommittedV2Envelope();
+            const refreshedFolderAnchor = remoteId && continuationEnvelope
+              ? Object.values(
+                  continuationEnvelope.folderAnchors?.byAnchorId ?? {},
+                ).find((anchor) => anchor.remoteId === remoteId)
+              : null;
+            if (
+              !continuationEnvelope
+              || !sameSyncScope(continuationRemote.scope, plan.scope)
+              || refreshedFolderAnchor?.lastPath !== targetRoot
+              || this.state.mutationLedger.length > 0
+              || this.shouldStop(result, operationEpoch)
+            ) {
+              continuationEnvelope = null;
+            }
+          } else {
+            continuationEnvelope = null;
+          }
+          const includeContinuationFilePath = (path: string): boolean =>
+            includeCanonicalFilePath(path)
+            && isAtOrBelowPath(
+              normalizeRemotePathKey(path),
+              normalizeRemotePathKey(targetRoot),
+            );
+          let continuationCandidate = continuationEnvelope
+            ? buildCanonicalPlanCandidateV2({
+                envelope: continuationEnvelope,
+                localFiles: continuationScan.entries,
+                localFolders: continuationScan.folders ?? [],
+                localFolderScanComplete: true,
+                skippedLarge: continuationScan.skippedLarge,
+                localMoveHints: this.state.localFolderMoveHints,
+                includeFilePath: includeContinuationFilePath,
+                includeFolderPath: includeCanonicalFolderPath,
+                preserveFolderPath: preserveCanonicalFolderPath,
+                configDir,
+                automaticDeleteLocalFiles:
+                  automaticHandlingPolicy.autoDeleteLocalFiles,
+              })
+            : null;
+          const continuationSourceEnvelope = continuationEnvelope;
+          if (
+            continuationSourceEnvelope
+            && continuationCandidate?.status === "planned"
+            && continuationCandidate.folderPlan.items.length === 0
+          ) {
+            const continuationItems = protectEasySyncSelfSyncPlan(
+              protectCommunityPluginPlan(
+                continuationCandidate.items,
+                communityPluginSyncPolicy,
+                configDir,
+                continuationScan.entries,
+              ),
+              configDir,
+            );
+            continuationCandidate = {
+              ...continuationCandidate,
+              items: continuationItems,
+            };
+            const finalizedContinuation =
+              await finalizeCanonicalPlanCandidateV2({
+                candidate: continuationCandidate,
+                envelope: continuationSourceEnvelope,
+                vaultName: this.vaultName,
+                accountId: this.state.boundAccountId ?? "",
+                automaticHandlingPolicy,
+                baselineReconstructionIncomplete: false,
+                pendingContentComparisons: this.state.pendingConflicts.map(
+                  (item) => ({
+                    path: item.path,
+                    contentComparison: item.contentComparison,
+                  }),
+                ),
+                resolveRemoteContentHash: resolveCanonicalRemoteContentHash,
+              });
+            const latestEnvelope = this.state.getCommittedV2Envelope();
+            if (
+              finalizedContinuation.baseUpserts.length === 0
+              && latestEnvelope?.meta.commitSeq
+                === continuationSourceEnvelope.meta.commitSeq
+            ) {
+              const sealedContinuation = sealCanonicalPlanV2({
+                finalized: finalizedContinuation,
+                sourceEnvelope: continuationSourceEnvelope,
+                committedEnvelope: latestEnvelope,
+              });
+              if (sealedContinuation.items.length === 0) {
+                continuationSettled = true;
+              } else {
+                // The reviewed folder move already counted the complete
+                // affected subtree. Reuse that authorization instead of
+                // showing a second threshold prompt for the same operation.
+                this.diag?.log(
+                  "plan",
+                  "V2 folder checkpoint continued with one bounded descendant plan",
+                  {
+                    root: targetRoot,
+                    actions: sealedContinuation.items.length,
+                    sourceCommitSeq,
+                    continuationCommitSeq: latestEnvelope.meta.commitSeq,
+                    mutations: 0,
+                  },
+                );
+                await this.executePlan(
+                  {
+                    items: sealedContinuation.items,
+                    lastTotalFiles: sealedContinuation.lastTotalFiles,
+                    confirmed: true,
+                    scope: { ...sealedContinuation.scope },
+                    canonicalIdentity: sealedContinuation.canonicalIdentity,
+                    canonicalReview: sealedContinuation.canonicalReview,
+                  },
+                  result,
+                  callbacks,
+                  operationEpoch,
+                  automaticHandlingPolicy,
+                  automaticHandlingMetrics,
+                  communityPluginSyncPolicy,
+                  generationRestoreProjectionsByPluginId,
+                );
+                continuationSettled = true;
+              }
+            }
+          }
+        }
+        if (!continuationSettled) {
+          result.deferred = Math.max(1, result.deferred);
+          this.diag?.warn(
+            "plan",
+            "V2 folder checkpoint committed but descendant continuation was not fully proven",
+            { root: targetRoot, mutations: 0 },
+          );
+        }
+      }
       if (
         migrationExecutionHold
         && result.errors === 0
@@ -6481,48 +9284,6 @@ export class SyncExecutor {
         }
         migrationExecutionHold = completed;
       }
-      if (
-        communityPluginEnablementWork
-        && result.errors === 0
-        && result.conflicts === 0
-        && result.deferred === 0
-        && !this.shouldStop(result, operationEpoch)
-      ) {
-        try {
-          await this.applyCommunityPluginEnablementWork(
-            communityPluginEnablementWork,
-            syncScope,
-            result,
-            callbacks,
-            operationEpoch,
-          );
-        } catch (error) {
-          if (
-            error instanceof CommunityPluginEnablementVersionChangedError
-            || (error instanceof OneDriveError && isRemoteMutationConflict(error))
-          ) {
-            result.deferred++;
-            this.diag?.warn(
-              "execute",
-              "community plugin enablement changed during transfer; deferred",
-              {
-                side: error instanceof CommunityPluginEnablementVersionChangedError
-                  ? error.side
-                  : "remote",
-                mutations: 0,
-              },
-            );
-          } else {
-            result.errors++;
-            result.message = this.t("result.communityPluginEnablementInvalid");
-            this.diag?.error(
-              "execute",
-              "community plugin enablement apply failed closed",
-              error instanceof Error ? error.message : String(error),
-            );
-          }
-        }
-      }
       enterPhase("commit");
       if (this.shouldStop(result, operationEpoch)) return result;
 
@@ -6532,19 +9293,59 @@ export class SyncExecutor {
         return result;
       }
 
-      const completedCommunityPluginRestores =
+      const detectedCommunityPluginRestores =
         await this.detectCompletedCommunityPluginRestores(
           communityPluginSyncPolicy,
           remoteEntries,
           configDir,
           [...joinAuthorizationsByPluginId.keys()],
+          generationRestoreProjectionsByPluginId,
         );
+      const completedCommunityPluginFiles =
+        await this.checkpointCompletedCommunityPluginJoinRoots({
+          pluginIds: detectedCommunityPluginRestores.files,
+          authorizationsByPluginId: joinAuthorizationsByPluginId,
+          remoteEntries,
+          scope: syncScope,
+          localFolderScanComplete,
+        });
+      if (
+        completedCommunityPluginFiles.length
+        !== detectedCommunityPluginRestores.files.length
+      ) {
+        result.deferred += detectedCommunityPluginRestores.files.length
+          - completedCommunityPluginFiles.length;
+      }
+      const completedCommunityPluginRestores = {
+        files: completedCommunityPluginFiles,
+        data: detectedCommunityPluginRestores.data,
+      };
       if (
         completedCommunityPluginRestores.files.length > 0
         || completedCommunityPluginRestores.data.length > 0
       ) {
         result.communityPluginRestoresCompleted =
           completedCommunityPluginRestores;
+      }
+      const completedLifecycleGenerations = new Map(
+        observedGenerationByPluginId,
+      );
+      if (generationRestoreProjectionsByPluginId.size > 0) {
+        const completed = new Set(completedCommunityPluginRestores.files);
+        for (const [pluginId, projection] of
+          generationRestoreProjectionsByPluginId) {
+          if (completed.has(pluginId)) {
+            completedLifecycleGenerations.set(
+              pluginId,
+              projection.generation,
+            );
+          }
+        }
+      }
+      if (completedLifecycleGenerations.size > 0) {
+        result.communityPluginRestoreGenerationByPluginId = Object.fromEntries(
+          completedLifecycleGenerations,
+        );
       }
 
       // Step 9: Mark healthy sync — only when no conflicts, pending deletes,
@@ -6588,6 +9389,21 @@ export class SyncExecutor {
       result.success = !result.authExpired
         && !this.cancelled
         && result.errors === 0;
+      const completedUserFileActions =
+        result.uploaded
+        + result.downloaded
+        + result.deleted
+        + (result.foldersCreated ?? 0)
+        + (result.foldersMoved ?? 0)
+        + (result.foldersDeleted ?? 0)
+        + (result.filesMoved ?? 0);
+      result.runFacts!.userFileChanges = completedUserFileActions > 0
+        ? "performed"
+        : result.success
+          && mutationRecordsAtRunStart === 0
+          && this.state.mutationLedger.length === 0
+          ? "none"
+          : "unknown";
       // Preserve message set by executePlan (e.g. auth expired, cancelled)
       if (!result.message) {
         const skipped = result.skippedLarge + result.skippedIgnored;
@@ -6616,7 +9432,7 @@ export class SyncExecutor {
       }
 
     } catch (e) {
-      if (e instanceof AuthError) {
+      if (isAuthFailure(e)) {
         this.invalidateLifecycle("auth-expired");
         result.authExpired = true;
         result.message = this.t("result.authExpired");
@@ -6747,6 +9563,10 @@ export class SyncExecutor {
     remoteEntries: readonly RemoteFileEntry[],
     configDir: string,
     restoringFilePluginIds: readonly string[],
+    generationRestores: ReadonlyMap<
+      string,
+      CommunityPluginGenerationRestoreProjectionV1
+    > = new Map(),
   ): Promise<{ files: string[]; data: string[] }> {
     const restoringFiles = new Set(restoringFilePluginIds);
     const restoringData = new Set(getRestoringPluginIds(policy.data));
@@ -6796,6 +9616,24 @@ export class SyncExecutor {
 
     const files: string[] = [];
     for (const pluginId of [...restoringFiles].sort()) {
+      const generationRestore = generationRestores.get(pluginId);
+      if (generationRestore) {
+        const matches = await Promise.all(
+          generationRestore.members.map(async (member) => {
+            try {
+              const content = await this.scanner.vault.adapter.readBinary(
+                member.targetPath,
+              );
+              return content.byteLength === member.source.size
+                && await sha256Hex(content) === member.source.sha256Hash;
+            } catch {
+              return false;
+            }
+          }),
+        );
+        if (matches.every(Boolean)) files.push(pluginId);
+        continue;
+      }
       const entries = remoteFiles.get(pluginId) ?? [];
       if (entries.length === 0) continue;
       const names = new Set(entries.map((entry) =>
@@ -6818,6 +9656,108 @@ export class SyncExecutor {
     return { files, data };
   }
 
+  /**
+   * Close the identity gap between an explicit remote-only bundle download and
+   * the next ordinary sync. The completed file receipts already prove the
+   * current bundle bytes; re-read those exact members, then reuse the existing
+   * confirmed-descendant reducer to bind only their authorized folder chain.
+   * Participation is not completed unless the plugin root is durably anchored.
+   */
+  private async checkpointCompletedCommunityPluginJoinRoots(input: Readonly<{
+    pluginIds: readonly string[];
+    authorizationsByPluginId: ReadonlyMap<
+      string,
+      Readonly<CommunityPluginJoinAuthorization>
+    >;
+    remoteEntries: readonly RemoteFileEntry[];
+    scope: Readonly<SyncScope>;
+    localFolderScanComplete: boolean;
+  }>): Promise<string[]> {
+    if (input.pluginIds.length === 0 || !input.localFolderScanComplete) return [];
+    const completed: string[] = [];
+    for (const pluginId of [...input.pluginIds].sort()) {
+      const authorization = input.authorizationsByPluginId.get(pluginId);
+      if (
+        !authorization
+        || validateCommunityPluginJoinAuthorization(
+          authorization,
+          input.remoteEntries,
+          input.scope,
+        ).status !== "valid"
+      ) continue;
+      const pluginRoot = parentFolderPath(authorization.members[0]?.path ?? "");
+      const remoteRoot = this.state.remoteFolders.find(
+        (folder) => folder.path === pluginRoot,
+      );
+      if (
+        !pluginRoot
+        || !remoteRoot
+        || authorization.members.some((member) =>
+          parentFolderPath(member.path) !== pluginRoot
+          || member.parentId !== remoteRoot.driveId
+        )
+      ) continue;
+
+      const memberPaths = new Set(
+        authorization.members.map((member) => member.path),
+      );
+      const localFiles: LocalFileEntry[] = [];
+      for (const member of authorization.members) {
+        const local = await this.inspectLocalPath(member.path);
+        if (local?.status !== "present" || !local.entry) break;
+        localFiles.push(local.entry);
+      }
+      if (localFiles.length !== authorization.members.length) continue;
+
+      const folderPaths = new Set<string>();
+      let current = pluginRoot;
+      while (current) {
+        folderPaths.add(current);
+        current = parentFolderPath(current);
+      }
+      const accepted = await this.state.acceptConfirmedDescendantFolderAnchors({
+        scope: input.scope,
+        localFiles,
+        localFolders: [...folderPaths].map((path) => ({ path })),
+        localFolderScanComplete: true,
+        remoteIdentityComplete: this.state.hasCompleteRemoteFolderIndex,
+        includeFilePath: (path) => memberPaths.has(path),
+        includeFolderPath: (path) => folderPaths.has(path),
+        recordReconstructionCheckpoint: false,
+      });
+      const anchored = Object.values(
+        this.state.getCommittedV2Envelope()?.folderAnchors?.byAnchorId ?? {},
+      ).some((anchor) =>
+        anchor.lastPath === pluginRoot
+        && anchor.remoteId === remoteRoot.driveId
+        && anchor.parentRemoteId === remoteRoot.parentId
+      );
+      if (anchored) {
+        completed.push(pluginId);
+        this.diag?.log(
+          "state",
+          "explicit community plugin join committed its root identity",
+          {
+            pluginId,
+            status: accepted.status,
+            mutations: 0,
+          },
+        );
+      } else {
+        this.diag?.warn(
+          "state",
+          "explicit community plugin join root identity remained unconfirmed",
+          {
+            pluginId,
+            status: accepted.status,
+            mutations: 0,
+          },
+        );
+      }
+    }
+    return completed;
+  }
+
   /** Execute plan items with per-file persistence */
   private async executePlan(
     plan: SyncPlan,
@@ -6827,6 +9767,11 @@ export class SyncExecutor {
     automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>,
     automaticHandlingMetrics: AutomaticHandlingMetrics,
     communityPluginSyncPolicy: Readonly<CommunityPluginSyncPolicyV1>,
+    communityPluginGenerationRestores: ReadonlyMap<
+      string,
+      CommunityPluginGenerationRestoreProjectionV1
+    > = new Map(),
+    retainedMutationRecovery: readonly Readonly<MutationLedgerEntryV1>[] = [],
   ): Promise<void> {
     const startedAt = Date.now();
     let total = plan.items.length;
@@ -7128,6 +10073,8 @@ export class SyncExecutor {
                 ? { issueCode: "identity-replacement-ambiguous" as const }
               : item.reason === "reason.folder.unanchored-shared-folder"
                 ? { issueCode: "unanchored-shared-folder" as const }
+              : item.reason === "reason.folder.both-sides-moved"
+                ? { issueCode: "folder-location-choice" as const }
               : {}),
             reason,
             updatedAt: Date.now(),
@@ -7580,6 +10527,7 @@ export class SyncExecutor {
         metrics,
         result,
         operationEpoch,
+        communityPluginGenerationRestores,
         (root, downloaded, totalBytes) => {
           if (visibleBundleRoot !== root) {
             visibleBundleRoot = root;
@@ -7823,7 +10771,13 @@ export class SyncExecutor {
       result.message = this.t("result.cancelled");
       return;
     }
-    if ((this.state.mutationLedger?.length ?? 0) > 0) {
+    if (
+      (this.state.mutationLedger?.length ?? 0) > 0
+      && !this.sameRetainedMutationRecovery(
+        this.state.mutationLedger,
+        retainedMutationRecovery,
+      )
+    ) {
       throw new Error("Mutation recovery is unresolved; shared state checkpoint stopped");
     }
 
@@ -8004,6 +10958,17 @@ export class SyncExecutor {
         createdAt: Date.now(),
       };
     }
+    if (item.generationRestore) {
+      if (
+        item.type !== SyncActionType.Download
+        || !item.remote
+        || item.local
+        || item.remote.path === item.path
+        || !item.remote.eTag
+      ) {
+        throw new Error(`Generation restore plan item is invalid: ${item.path}`);
+      }
+    }
     return {
       version: 1,
       operationId: `${Date.now()}-${++this.mutationSequence}-${item.type}`,
@@ -8021,7 +10986,8 @@ export class SyncExecutor {
             ? "download"
             : "upload",
       path: item.path,
-      sourcePath: item.renameFrom,
+      sourcePath: item.generationRestore ? item.remote?.path : item.renameFrom,
+      stateEffect: item.generationRestore ? "local-only" : undefined,
       expectedLocal: item.local
         ? { exists: true, hash: item.local.hash, size: item.local.size }
         : { exists: false },
@@ -8147,6 +11113,17 @@ export class SyncExecutor {
   ): Promise<ManualMutationResolutionV1 | null> {
     if (isFolderMutationIntent(record.intent)) return null;
     const selectedAt = Date.now();
+    const managed = classifyCommunityPluginManagedPath(
+      snapshot.path,
+      getConfigDir(this.scanner.vault),
+    );
+    const settlementOnly =
+      this.isPersistedPluginDataDownloadSettlement(record.intent)
+      && managed?.kind === "data"
+      && !isCommunityPluginDataSelected(
+        this.communityPluginSyncPolicy,
+        managed.pluginId,
+      );
     const createIntent = (
       action: MutationIntentV1["action"],
       path: string,
@@ -8163,6 +11140,9 @@ export class SyncExecutor {
       ...(sourcePath ? { sourcePath } : {}),
       expectedLocal: this.manualLocalExpectation(local),
       expectedRemote: this.manualRemoteExpectation(remote),
+      ...(settlementOnly
+        ? { stateEffect: "settlement-only" as const }
+        : {}),
       createdAt: selectedAt,
     });
     const withReceipt = (
@@ -8179,7 +11159,7 @@ export class SyncExecutor {
         version: 1,
         operationId: intent.operationId,
         completedAt: selectedAt,
-        checkpoint,
+        checkpoint: settlementOnly ? emptyMutationCheckpoint() : checkpoint,
       },
     });
     const withoutReceipt = (
@@ -8289,7 +11269,11 @@ export class SyncExecutor {
     onExternalMutation?: () => void,
   ): Promise<void> {
     const manual = record.manualResolution;
-    if (!manual || isFolderMutationIntent(record.intent)) {
+    if (
+      !manual
+      || manual.version !== 1
+      || isFolderMutationIntent(record.intent)
+    ) {
       throw new Error(`Manual mutation resolution is unavailable: ${record.intent.operationId}`);
     }
     if (operationEpoch !== undefined && !this.canContinue(operationEpoch)) {
@@ -8309,14 +11293,18 @@ export class SyncExecutor {
         ? await this.verifyMutationReceipt({
             intent: manual.intent,
             receipt,
-          })
+          }, false, false)
         : await this.buildCurrentMutationRecoveryResolutionSnapshot(record)
           .then((current) => current?.factsDigest === manual.factsDigest);
       if (!receiptMatches) {
         throw new Error(`Manual mutation receipt no longer matches: ${record.intent.operationId}`);
       }
     } else {
-      const outcome = await this.classifyUnreceiptedMutation(manual.intent);
+      const outcome = await this.classifyUnreceiptedMutation(
+        manual.intent,
+        false,
+        false,
+      );
       if (outcome && outcome !== "not-applied") {
         receipt = {
           version: 1,
@@ -8383,6 +11371,569 @@ export class SyncExecutor {
     );
   }
 
+  /**
+   * Continue one reviewed whole-plugin choice without splitting its members
+   * into independent user decisions. Cloud-to-local replacement keeps its
+   * local rollback journal; local-to-cloud publication receipts each member
+   * before proceeding so an interruption resumes the same chosen direction.
+   */
+  private async resumeCommunityPluginBundleSettlement(
+    record: Readonly<MutationLedgerEntryV1>,
+    operationEpoch: number | undefined,
+    allowExternalMutation: boolean,
+    onExternalMutation?: () => void,
+  ): Promise<void> {
+    const settlement = record.manualResolution;
+    if (
+      !settlement
+      || settlement.version !== 2
+      || settlement.kind !== "community-plugin-bundle-settlement"
+      || isFolderMutationIntent(record.intent)
+    ) {
+      throw new Error(
+        `Community plugin bundle settlement is unavailable: ${record.intent.operationId}`,
+      );
+    }
+    const receipts = settlement.members.map((member) => member.receipt);
+    if (settlement.choice === "keep-local") {
+      await this.resumeCommunityPluginKeepLocalSettlement(
+        record,
+        settlement,
+        operationEpoch,
+        allowExternalMutation,
+        onExternalMutation,
+      );
+      return;
+    }
+    if (receipts.some(Boolean) && receipts.some((receipt) => !receipt)) {
+      throw new Error(
+        `Community plugin bundle receipts are incomplete: ${record.intent.operationId}`,
+      );
+    }
+
+    if (receipts.every(Boolean)) {
+      await this.verifyCommunityPluginBundleSettlementTarget(record);
+      await this.state.commitCommunityPluginBundleSettlementCheckpoint(record);
+      return;
+    }
+
+    const localByPath = new Map<string, LocalFileInspection>();
+    const remoteByPath = new Map<string, RemoteFileEntry | undefined>();
+    for (const member of settlement.members) {
+      const local = await this.inspectLocalPath(member.intent.path, {
+        allowExcludedForRecovery: true,
+      });
+      if (!local || local.status === "uncertain") {
+        throw new Error(
+          `Community plugin bundle local facts are unavailable: ${member.intent.path}`,
+        );
+      }
+      localByPath.set(member.intent.path, local);
+      remoteByPath.set(
+        member.intent.path,
+        await this.inspectCommunityPluginBundleRemote(member.intent),
+      );
+    }
+
+    const allOriginal = settlement.members.every((member) =>
+      this.inspectionMatchesExpectation(
+        localByPath.get(member.intent.path)!,
+        member.intent.expectedLocal,
+      ));
+    const allTarget = settlement.members.every((member) =>
+      this.communityPluginBundleLocalMatchesTarget(
+        localByPath.get(member.intent.path)!,
+        member.intent,
+      ));
+    if (!allOriginal && !allTarget) {
+      throw new Error(
+        `Community plugin bundle facts changed: ${record.intent.operationId}`,
+      );
+    }
+
+    if (!allTarget) {
+      if (
+        !allOriginal
+        || !allowExternalMutation
+        || operationEpoch === undefined
+        || !this.canContinue(operationEpoch)
+      ) {
+        throw new Error(
+          `Community plugin bundle waits for its authorized continuation: ${record.intent.operationId}`,
+        );
+      }
+      const downloadedByPath = new Map<string, ArrayBuffer>();
+      for (const member of settlement.members) {
+        const remote = remoteByPath.get(member.intent.path);
+        if (!remote) continue;
+        const expected = member.intent.expectedRemote;
+        if (!expected.exists || !expected.sha256Hash) {
+          throw new Error(
+            `Community plugin bundle remote proof is incomplete: ${member.intent.path}`,
+          );
+        }
+        const bytes = await this.onedrive.downloadFile(
+          this.vaultName,
+          member.intent.path,
+          remote.downloadUrl,
+          remote.driveId,
+          remote.size,
+        );
+        const hash = await sha256Hex(bytes);
+        if (bytes.byteLength !== expected.size || hash !== expected.sha256Hash) {
+          throw new Error(
+            `Community plugin bundle download verification failed: ${member.intent.path}`,
+          );
+        }
+        downloadedByPath.set(member.intent.path, bytes);
+      }
+
+      // The reviewed remote identities and every local source must still be
+      // exact after all network reads and immediately before the first write.
+      for (const member of settlement.members) {
+        await this.inspectCommunityPluginBundleRemote(member.intent);
+        const local = await this.inspectLocalPath(member.intent.path, {
+          allowExcludedForRecovery: true,
+        });
+        if (
+          !local
+          || local.status === "uncertain"
+          || !this.inspectionMatchesExpectation(local, member.intent.expectedLocal)
+        ) {
+          throw new Error(
+            `Community plugin bundle changed before replacement: ${member.intent.path}`,
+          );
+        }
+        localByPath.set(member.intent.path, local);
+      }
+      if (!this.canContinue(operationEpoch)) {
+        throw new Error(
+          `Community plugin bundle replacement was cancelled: ${record.intent.operationId}`,
+        );
+      }
+
+      const originalByPath = new Map<string, ArrayBuffer | null>();
+      for (const member of settlement.members) {
+        const local = localByPath.get(member.intent.path)!;
+        if (local.status !== "present") {
+          originalByPath.set(member.intent.path, null);
+          continue;
+        }
+        if (!local.entry) {
+          throw new Error(
+            `Community plugin bundle local proof is incomplete: ${member.intent.path}`,
+          );
+        }
+        const bytes = await this.scanner.vault.adapter.readBinary(member.intent.path);
+        if (
+          bytes.byteLength !== local.entry.size
+          || await sha256Hex(bytes) !== local.entry.hash
+        ) {
+          throw new Error(
+            `Community plugin bundle local source changed: ${member.intent.path}`,
+          );
+        }
+        originalByPath.set(member.intent.path, bytes);
+      }
+
+      const journal = this.getRecoveryJournal();
+      await journal.prepareCopiedBundleOriginals(settlement.members.map((member) => {
+        const local = localByPath.get(member.intent.path)!;
+        const expected = local.status === "present" ? local.entry : undefined;
+        const remote = member.intent.expectedRemote;
+        return {
+          targetPath: member.intent.path,
+          expected,
+          original: originalByPath.get(member.intent.path) ?? null,
+          downloaded: remote.exists
+            ? { hash: remote.sha256Hash!, size: remote.size }
+            : null,
+        };
+      }));
+      onExternalMutation?.();
+      try {
+        const membersInCommitOrder = [...settlement.members].sort((left, right) => {
+          const leftManifest = left.intent.path.endsWith("/manifest.json") ? 1 : 0;
+          const rightManifest = right.intent.path.endsWith("/manifest.json") ? 1 : 0;
+          return leftManifest - rightManifest
+            || left.intent.path.localeCompare(right.intent.path);
+        });
+        for (const member of membersInCommitOrder) {
+          const content = downloadedByPath.get(member.intent.path);
+          if (content) {
+            await this.ensureParentDirs(member.intent.path);
+            await this.writeBinaryTempFileWithAndroidZeroByteRetry(
+              member.intent.path,
+              member.intent.path,
+              content,
+            );
+          } else if (await this.scanner.vault.adapter.exists(member.intent.path)) {
+            await this.scanner.vault.adapter.remove(member.intent.path);
+          }
+        }
+        for (const member of settlement.members) {
+          const local = await this.inspectLocalPath(member.intent.path, {
+            allowExcludedForRecovery: true,
+          });
+          if (
+            !local
+            || local.status === "uncertain"
+            || !this.communityPluginBundleLocalMatchesTarget(local, member.intent)
+          ) {
+            throw new Error(
+              `Community plugin bundle local read-back failed: ${member.intent.path}`,
+            );
+          }
+        }
+        await journal.complete();
+      } catch (error) {
+        await journal.recover();
+        throw error;
+      }
+    }
+
+    const nextReceipts = await this.buildCommunityPluginBundleSettlementReceipts(
+      settlement,
+    );
+    if (!await this.state.recordCommunityPluginBundleSettlementReceipts(
+      record,
+      nextReceipts,
+    )) {
+      throw new Error(
+        `Community plugin bundle receipts were not persisted: ${record.intent.operationId}`,
+      );
+    }
+    const updated = this.state.mutationLedger.find(
+      (candidate) => candidate.intent.operationId === record.intent.operationId,
+    );
+    if (
+      !updated?.manualResolution
+      || updated.manualResolution.version !== 2
+    ) {
+      throw new Error(
+        `Community plugin bundle settlement disappeared: ${record.intent.operationId}`,
+      );
+    }
+    await this.verifyCommunityPluginBundleSettlementTarget(updated);
+    await this.state.commitCommunityPluginBundleSettlementCheckpoint(updated);
+  }
+
+  private async resumeCommunityPluginKeepLocalSettlement(
+    initialRecord: Readonly<MutationLedgerEntryV1>,
+    settlement: Readonly<CommunityPluginBundleSettlementV2>,
+    operationEpoch: number | undefined,
+    allowExternalMutation: boolean,
+    onExternalMutation?: () => void,
+  ): Promise<void> {
+    let record = initialRecord;
+    const membersInCommitOrder = [...settlement.members].sort((left, right) => {
+      const leftManifest = left.intent.path.endsWith("/manifest.json") ? 1 : 0;
+      const rightManifest = right.intent.path.endsWith("/manifest.json") ? 1 : 0;
+      return leftManifest - rightManifest
+        || left.intent.path.localeCompare(right.intent.path);
+    });
+    for (const originalMember of membersInCommitOrder) {
+      const currentSettlement = record.manualResolution;
+      if (!currentSettlement || currentSettlement.version !== 2) {
+        throw new Error(
+          `Community plugin bundle settlement disappeared: ${record.intent.operationId}`,
+        );
+      }
+      const member = currentSettlement.members.find(
+        (candidate) => candidate.intent.operationId
+          === originalMember.intent.operationId,
+      );
+      if (!member) {
+        throw new Error(
+          `Community plugin bundle member disappeared: ${originalMember.intent.path}`,
+        );
+      }
+      if (member.receipt) continue;
+
+      const recovered = await this.recoverCommunityPluginKeepLocalMemberReceipt(
+        member.intent,
+      );
+      let receipt = recovered;
+      if (!receipt) {
+        if (
+          !allowExternalMutation
+          || operationEpoch === undefined
+          || !this.canContinue(operationEpoch)
+        ) {
+          throw new Error(
+            `Community plugin bundle waits for its authorized continuation: ${record.intent.operationId}`,
+          );
+        }
+        onExternalMutation?.();
+        const checkpoint = await this.executeManualMutationIntentWithCanonicalExecutor(
+          member.intent,
+          operationEpoch,
+        );
+        receipt = {
+          version: 1,
+          operationId: member.intent.operationId,
+          completedAt: Date.now(),
+          checkpoint,
+        };
+        if (!await this.communityPluginKeepLocalTargetMatches(
+          member.intent,
+          await this.inspectRemotePath(member.intent.path),
+        )) {
+          throw new Error(
+            `Community plugin bundle remote read-back failed: ${member.intent.path}`,
+          );
+        }
+      }
+      if (!await this.state.recordCommunityPluginBundleSettlementReceipts(
+        record,
+        [receipt],
+      )) {
+        throw new Error(
+          `Community plugin bundle receipt was not persisted: ${member.intent.operationId}`,
+        );
+      }
+      const updated = this.state.mutationLedger.find(
+        (candidate) => candidate.intent.operationId === record.intent.operationId,
+      );
+      if (!updated?.manualResolution || updated.manualResolution.version !== 2) {
+        throw new Error(
+          `Community plugin bundle settlement disappeared: ${record.intent.operationId}`,
+        );
+      }
+      record = updated;
+    }
+    await this.verifyCommunityPluginBundleSettlementTarget(record);
+    await this.state.commitCommunityPluginBundleSettlementCheckpoint(record);
+  }
+
+  private async recoverCommunityPluginKeepLocalMemberReceipt(
+    intent: Readonly<MutationIntentV1>,
+  ): Promise<MutationReceiptV1 | null> {
+    const local = await this.inspectLocalPath(intent.path, {
+      allowExcludedForRecovery: true,
+    });
+    const remote = await this.inspectRemotePath(intent.path);
+    if (
+      !local
+      || local.status === "uncertain"
+      || !this.inspectionMatchesExpectation(local, intent.expectedLocal)
+    ) {
+      throw new Error(`Community plugin bundle local facts changed: ${intent.path}`);
+    }
+    if (await this.communityPluginKeepLocalTargetMatches(intent, remote)) {
+      return {
+        version: 1,
+        operationId: intent.operationId,
+        completedAt: Date.now(),
+        checkpoint: await this.buildCommunityPluginKeepLocalCheckpoint(
+          intent,
+          local,
+          remote,
+        ),
+      };
+    }
+    if (!this.remoteMatchesExpectation(remote, intent.expectedRemote)) {
+      throw new Error(`Community plugin bundle remote facts changed: ${intent.path}`);
+    }
+    return null;
+  }
+
+  private async communityPluginKeepLocalTargetMatches(
+    intent: Readonly<MutationIntentV1>,
+    remote: RemoteFileEntry | undefined,
+  ): Promise<boolean> {
+    if (!intent.expectedLocal.exists) return remote === undefined;
+    return Boolean(remote && await this.remoteMatchesTarget(
+      remote,
+      intent.expectedLocal,
+      true,
+    ));
+  }
+
+  private async buildCommunityPluginKeepLocalCheckpoint(
+    intent: Readonly<MutationIntentV1>,
+    local: LocalFileInspection,
+    remote: RemoteFileEntry | undefined,
+  ): Promise<MutationCheckpointV1> {
+    const checkpoint = emptyMutationCheckpoint();
+    if (!intent.expectedLocal.exists) {
+      checkpoint.baseRemovals.push(intent.path);
+      checkpoint.remoteDeletes.push(intent.path);
+      return checkpoint;
+    }
+    if (local.status !== "present" || !local.entry || !remote) {
+      throw new Error(
+        `Community plugin bundle target proof is incomplete: ${intent.path}`,
+      );
+    }
+    const bytes = await this.scanner.vault.adapter.readBinary(intent.path);
+    if (
+      bytes.byteLength !== intent.expectedLocal.size
+      || await sha256Hex(bytes) !== intent.expectedLocal.hash
+    ) {
+      throw new Error(`Community plugin bundle local source changed: ${intent.path}`);
+    }
+    const remoteEntry = { ...remote, sha256Hash: intent.expectedLocal.hash };
+    checkpoint.baseUpserts.push({
+      path: intent.path,
+      hash: intent.expectedLocal.hash,
+      size: intent.expectedLocal.size,
+      eTag: remote.eTag,
+    });
+    checkpoint.remoteUpserts.push(remoteEntry);
+    return checkpoint;
+  }
+
+  private communityPluginBundleLocalMatchesTarget(
+    local: LocalFileInspection,
+    intent: Readonly<MutationIntentV1>,
+  ): boolean {
+    if (!intent.expectedRemote.exists) return local.status === "missing";
+    return Boolean(
+      intent.expectedRemote.sha256Hash
+      && this.inspectionMatchesVersion(local, {
+        hash: intent.expectedRemote.sha256Hash,
+        size: intent.expectedRemote.size,
+      }),
+    );
+  }
+
+  private async inspectCommunityPluginBundleRemote(
+    intent: Readonly<MutationIntentV1>,
+  ): Promise<RemoteFileEntry | undefined> {
+    const current = await this.inspectRemotePath(intent.path);
+    if (!this.remoteMatchesExpectation(current, intent.expectedRemote)) {
+      throw new Error(`Community plugin bundle remote facts changed: ${intent.path}`);
+    }
+    if (!intent.expectedRemote.exists) return undefined;
+    if (
+      !current
+      || !intent.expectedRemote.sha256Hash
+      || current.size !== intent.expectedRemote.size
+    ) {
+      throw new Error(`Community plugin bundle remote proof is incomplete: ${intent.path}`);
+    }
+    return {
+      ...current,
+      parentId: this.requireKnownRemoteParentId(intent.path, current.parentId),
+      sha256Hash: intent.expectedRemote.sha256Hash,
+    };
+  }
+
+  private async buildCommunityPluginBundleSettlementReceipts(
+    settlement: Readonly<CommunityPluginBundleSettlementV2>,
+  ): Promise<MutationReceiptV1[]> {
+    const receipts: MutationReceiptV1[] = [];
+    for (const member of settlement.members) {
+      const local = await this.inspectLocalPath(member.intent.path, {
+        allowExcludedForRecovery: true,
+      });
+      const remote = await this.inspectCommunityPluginBundleRemote(member.intent);
+      if (
+        !local
+        || local.status === "uncertain"
+        || !this.communityPluginBundleLocalMatchesTarget(local, member.intent)
+      ) {
+        throw new Error(
+          `Community plugin bundle target changed: ${member.intent.path}`,
+        );
+      }
+      const checkpoint = emptyMutationCheckpoint();
+      if (member.intent.expectedRemote.exists && remote) {
+        const bytes = await this.scanner.vault.adapter.readBinary(member.intent.path);
+        const hash = await sha256Hex(bytes);
+        if (
+          bytes.byteLength !== member.intent.expectedRemote.size
+          || hash !== member.intent.expectedRemote.sha256Hash
+        ) {
+          throw new Error(
+            `Community plugin bundle target verification failed: ${member.intent.path}`,
+          );
+        }
+        checkpoint.baseUpserts.push({
+          path: member.intent.path,
+          hash,
+          size: bytes.byteLength,
+          eTag: remote.eTag,
+        });
+        checkpoint.remoteUpserts.push(remote);
+        this.state.cacheBaseContent(member.intent.path, bytes);
+      } else {
+        checkpoint.baseRemovals.push(member.intent.path);
+        checkpoint.remoteDeletes.push(member.intent.path);
+      }
+      receipts.push({
+        version: 1,
+        operationId: member.intent.operationId,
+        completedAt: Date.now(),
+        checkpoint,
+      });
+    }
+    return receipts;
+  }
+
+  private async verifyCommunityPluginBundleSettlementTarget(
+    record: Readonly<MutationLedgerEntryV1>,
+  ): Promise<void> {
+    const settlement = record.manualResolution;
+    if (!settlement || settlement.version !== 2) {
+      throw new Error(
+        `Community plugin bundle settlement is unavailable: ${record.intent.operationId}`,
+      );
+    }
+    for (const member of settlement.members) {
+      if (!member.receipt) {
+        throw new Error(
+          `Community plugin bundle receipt is missing: ${member.intent.path}`,
+        );
+      }
+      const local = await this.inspectLocalPath(member.intent.path, {
+        allowExcludedForRecovery: true,
+      });
+      const remote = settlement.choice === "keep-local"
+        ? await this.inspectRemotePath(member.intent.path)
+        : await this.inspectCommunityPluginBundleRemote(member.intent);
+      if (
+        !local
+        || local.status === "uncertain"
+        || (settlement.choice === "keep-local"
+          ? !this.inspectionMatchesExpectation(local, member.intent.expectedLocal)
+            || !await this.communityPluginKeepLocalTargetMatches(
+              member.intent,
+              remote,
+            )
+          : !this.communityPluginBundleLocalMatchesTarget(local, member.intent))
+      ) {
+        throw new Error(
+          `Community plugin bundle receipt no longer matches: ${member.intent.path}`,
+        );
+      }
+      if (settlement.choice === "keep-local" && member.intent.expectedLocal.exists) {
+        const bytes = await this.scanner.vault.adapter.readBinary(member.intent.path);
+        if (
+          bytes.byteLength !== member.intent.expectedLocal.size
+          || await sha256Hex(bytes) !== member.intent.expectedLocal.hash
+        ) {
+          throw new Error(
+            `Community plugin bundle receipt content changed: ${member.intent.path}`,
+          );
+        }
+        this.state.cacheBaseContent(member.intent.path, bytes);
+      } else if (settlement.choice === "keep-remote" && member.intent.expectedRemote.exists) {
+        const bytes = await this.scanner.vault.adapter.readBinary(member.intent.path);
+        if (
+          bytes.byteLength !== member.intent.expectedRemote.size
+          || await sha256Hex(bytes) !== member.intent.expectedRemote.sha256Hash
+        ) {
+          throw new Error(
+            `Community plugin bundle receipt content changed: ${member.intent.path}`,
+          );
+        }
+        this.state.cacheBaseContent(member.intent.path, bytes);
+      }
+    }
+  }
+
   private async executeManualMutationIntentWithCanonicalExecutor(
     intent: MutationIntentV1,
     operationEpoch: number,
@@ -8401,7 +11952,7 @@ export class SyncExecutor {
     }
 
     const [localInspection, remoteInspection] = await Promise.all([
-      this.inspectLocalPath(localEvidencePath),
+      this.inspectLocalPathForMutation(localEvidencePath, intent),
       this.inspectRemotePath(remoteEvidencePath),
     ]);
     if (
@@ -8505,6 +12056,35 @@ export class SyncExecutor {
     };
     const remoteUpserts: RemoteFileEntry[] = [];
     const remoteDeletes: string[] = [];
+    if (this.isPersistedSelectedPluginCodeUploadRecovery(intent)) {
+      const bundle = parseCommunityPluginBundlePath(
+        intent.path,
+        getConfigDir(this.scanner.vault),
+      );
+      if (!bundle) {
+        throw new MutationNotAppliedError(
+          new Error("Manual plugin upload no longer has a bundle owner"),
+        );
+      }
+      const currentRemoteManifest = await this.inspectRemotePath(
+        `${getConfigDir(this.scanner.vault)}/plugins/${bundle.pluginId}/manifest.json`,
+      );
+      const preflightErrors = await this.prepareCommunityPluginBundleUploads(
+        [item],
+        this.communityPluginSyncPolicy,
+        result,
+        operationEpoch,
+        currentRemoteManifest ? [currentRemoteManifest] : [],
+      );
+      const preflightError = preflightErrors.get(intent.path);
+      if (preflightError !== undefined) {
+        throw new MutationNotAppliedError(
+          preflightError instanceof Error
+            ? preflightError
+            : new Error(String(preflightError)),
+        );
+      }
+    }
     const executed = await this.executeItem(
       item,
       result,
@@ -8516,9 +12096,13 @@ export class SyncExecutor {
       this.automaticHandlingPolicy,
       undefined,
       "throw",
+      this.isPersistedPluginDataDownloadSettlement(intent),
     );
     if (!executed.executed || !executed.mutationApplied) {
       throw new MutationNotAppliedError(new Error("Manual mutation was not applied"));
+    }
+    if (intent.stateEffect === "settlement-only") {
+      return emptyMutationCheckpoint();
     }
     const checkpoint = emptyMutationCheckpoint();
     checkpoint.remoteUpserts.push(...remoteUpserts);
@@ -8665,6 +12249,8 @@ export class SyncExecutor {
     syncScope: SyncScope,
     automaticHandlingMetrics?: AutomaticHandlingMetrics,
     operationEpoch?: number,
+    observationOnly = false,
+    remoteObservationCommitSeq?: number,
   ): Promise<MutationRecoveryRunSummary | null> {
     if (this.state.hasMutationLedgerCorruption) {
       const total = this.state.mutationLedger.length;
@@ -8679,6 +12265,75 @@ export class SyncExecutor {
     }
     const mergeRecovery = automaticHandlingMetrics?.mergeRecovery;
     const persistedRecords = [...(this.state.mutationLedger ?? [])];
+    const operationIds = new Set<string>();
+    for (const persistedRecord of persistedRecords) {
+      const operationId = persistedRecord.intent.operationId;
+      if (operationIds.has(operationId)) {
+        throw new MutationRecoveryBlockedError({
+          state: "blocked",
+          total: persistedRecords.length,
+          settled: 0,
+          remaining: persistedRecords.length,
+          retryAfterSeconds: null,
+          blockReason: "evidence-corrupt",
+        }, new Error(`Mutation recovery operation is not unique: ${operationId}`));
+      }
+      operationIds.add(operationId);
+      const prepared = this.state.prepareMutationRecoveryRecord(
+        persistedRecord,
+        syncScope,
+      );
+      if (!prepared) {
+        throw new MutationRecoveryBlockedError({
+          state: "blocked",
+          total: persistedRecords.length,
+          settled: 0,
+          remaining: persistedRecords.length,
+          retryAfterSeconds: null,
+          blockReason: "scope-changed",
+        }, new Error(`Mutation scope no longer matches: ${operationId}`));
+      }
+      const ordinaryV1 = !isFolderMutationIntent(prepared.intent)
+        && prepared.intent.version === 1
+        && prepared.intent.stateEffect === undefined
+        && prepared.manualResolution === undefined;
+      if (ordinaryV1 && !isOrdinaryFileRecoveryRecord(prepared, syncScope)) {
+        throw new MutationRecoveryBlockedError({
+          state: "blocked",
+          total: persistedRecords.length,
+          settled: 0,
+          remaining: persistedRecords.length,
+          retryAfterSeconds: null,
+          blockReason: "evidence-corrupt",
+        }, new Error(`Mutation recovery evidence is invalid: ${operationId}`));
+      }
+    }
+    const recoveryEnvelope = persistedRecords.length > 0
+      ? this.state.getCommittedV2Envelope()
+      : null;
+    let reflectedCheckpointRetirementCommitSeq =
+      remoteObservationCommitSeq !== undefined
+      && recoveryEnvelope?.remoteIndex.complete === true
+      && recoveryEnvelope.meta.commitSeq === remoteObservationCommitSeq
+        ? remoteObservationCommitSeq
+        : undefined;
+    const recoveryCurrentPathByRemoteId = recoveryEnvelope
+      ? projectRemoteIndexV2(recoveryEnvelope.remoteIndex)
+      : new Map<string, string>();
+    const recoveryFootprints = buildConservativeResetRecordFootprints(
+      persistedRecords,
+      recoveryCurrentPathByRemoteId,
+      Object.values(recoveryEnvelope?.anchors.byAnchorId ?? {}),
+    );
+    const bundleSettlements = persistedRecords.filter((record) =>
+      record.manualResolution?.version === 2
+      && record.manualResolution.kind === "community-plugin-bundle-settlement");
+    const bundlePredecessorIds = new Set(
+      bundleSettlements.flatMap((record) =>
+        record.manualResolution?.version === 2
+          ? record.manualResolution.predecessorOperationIds
+          : []),
+    );
     const blocked: Array<{
       operationId: string;
       reason:
@@ -8688,8 +12343,9 @@ export class SyncExecutor {
       error: Error;
       retryable: boolean;
     }> = [];
-    const blockedIntents: Array<{
-      intent: MutationIntent;
+    const blockedRecords: Array<{
+      record: MutationLedgerEntryV1;
+      footprint: ConservativeResetRecordFootprint;
       retryable: boolean;
     }> = [];
     let settled = 0;
@@ -8698,7 +12354,14 @@ export class SyncExecutor {
     let receiptCommitted = 0;
     let quarantined = 0;
     let externalMutations = 0;
-    for (const persistedRecord of persistedRecords) {
+    for (const [recordIndex, persistedRecord] of persistedRecords.entries()) {
+      const currentFootprint = recoveryFootprints[recordIndex];
+      // A bundle coordinator owns these exact older records until its single
+      // checkpoint retires them. Processing them independently would recreate
+      // the very per-file deadlock the reviewed whole-bundle choice replaces.
+      if (bundlePredecessorIds.has(persistedRecord.intent.operationId)) {
+        continue;
+      }
       const record = this.state.prepareMutationRecoveryRecord(
         persistedRecord,
         syncScope,
@@ -8715,8 +12378,15 @@ export class SyncExecutor {
           `Mutation scope no longer matches: ${persistedRecord.intent.operationId}`,
         ));
       }
-      const blockingDependency = blockedIntents.find((blockedIntent) =>
-        mutationRecoveryIntentsOverlap(blockedIntent.intent, record.intent));
+      const blockingDependency = blockedRecords.find((blockedRecord) =>
+        mutationRecoveryIntentsOverlap(
+          blockedRecord.record.intent,
+          record.intent,
+        )
+        || conservativeResetFootprintsOverlap(
+          blockedRecord.footprint,
+          currentFootprint,
+        ));
       if (blockingDependency) {
         blocked.push({
           operationId: record.intent.operationId,
@@ -8726,8 +12396,9 @@ export class SyncExecutor {
           ),
           retryable: blockingDependency.retryable,
         });
-        blockedIntents.push({
-          intent: record.intent,
+        blockedRecords.push({
+          record,
+          footprint: currentFootprint,
           retryable: blockingDependency.retryable,
         });
         continue;
@@ -8735,6 +12406,52 @@ export class SyncExecutor {
       const isAutomaticMerge = record.intent.action === "merge";
       if (isAutomaticMerge && mergeRecovery) mergeRecovery.records++;
       if (record.manualResolution) {
+        if (observationOnly) {
+          blocked.push({
+            operationId: record.intent.operationId,
+            reason: "outcome-unresolved",
+            error: new Error(
+              `Manual mutation continuation is not executed during reset: ${record.intent.operationId}`,
+            ),
+            retryable: false,
+          });
+          blockedRecords.push({
+            record,
+            footprint: currentFootprint,
+            retryable: false,
+          });
+          continue;
+        }
+        if (record.manualResolution.version === 2) {
+          try {
+            const predecessorCount = record.manualResolution
+              .predecessorOperationIds.length;
+            await this.resumeCommunityPluginBundleSettlement(
+              record,
+              operationEpoch,
+              operationEpoch !== undefined,
+              () => { externalMutations++; },
+            );
+            settled += 1 + predecessorCount;
+          } catch (error) {
+            if (this.cancelled) throw error;
+            const retryable = isRetryableMutationRecoveryObservationError(error);
+            blocked.push({
+              operationId: record.intent.operationId,
+              reason: retryable
+                ? "observation-unavailable"
+                : "outcome-unresolved",
+              error: error instanceof Error ? error : new Error(String(error)),
+              retryable,
+            });
+            blockedRecords.push({
+              record,
+              footprint: currentFootprint,
+              retryable,
+            });
+          }
+          continue;
+        }
         try {
           await this.resumeManualMutationResolution(
             record,
@@ -8755,11 +12472,41 @@ export class SyncExecutor {
             error: error instanceof Error ? error : new Error(String(error)),
             retryable,
           });
-          blockedIntents.push({ intent: record.intent, retryable });
+          blockedRecords.push({
+            record,
+            footprint: currentFootprint,
+            retryable,
+          });
           continue;
         }
       }
       if (record.receipt) {
+        const reflectedCommitSeq = reflectedCheckpointRetirementCommitSeq;
+        const currentEnvelope = reflectedCommitSeq !== undefined
+          ? this.state.getCommittedV2Envelope()
+          : null;
+        if (
+          currentEnvelope?.remoteIndex.complete === true
+          && currentEnvelope.meta.commitSeq === reflectedCommitSeq
+          && await this.state.retireMutationCheckpointIfReflected(
+            record.intent.operationId,
+            reflectedCommitSeq,
+          )
+        ) {
+          const successor = this.state.getCommittedV2Envelope();
+          reflectedCheckpointRetirementCommitSeq =
+            successor?.remoteIndex.complete === true
+            && successor.meta.commitSeq === reflectedCommitSeq + 1
+              ? successor.meta.commitSeq
+              : undefined;
+          receiptCommitted++;
+          settled++;
+          if (isAutomaticMerge) {
+            if (mergeRecovery) mergeRecovery.receiptCommitted++;
+            await this.getMergeReadyStore().complete(record.intent.operationId);
+          }
+          continue;
+        }
         let receiptMatches: boolean;
         try {
           // A remote hierarchy rebuild can legitimately replace a folder
@@ -8780,7 +12527,10 @@ export class SyncExecutor {
           const recoveryRecord = rebasedReceipt
             ? { ...record, receipt: rebasedReceipt }
             : record;
-          receiptMatches = await this.verifyMutationReceipt(recoveryRecord);
+          receiptMatches = await this.verifyMutationReceipt(
+            recoveryRecord,
+            observationOnly,
+          );
         } catch (error) {
           if (
             this.cancelled
@@ -8792,8 +12542,9 @@ export class SyncExecutor {
             error,
             retryable: true,
           });
-          blockedIntents.push({
-            intent: record.intent,
+          blockedRecords.push({
+            record,
+            footprint: currentFootprint,
             retryable: true,
           });
           if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
@@ -8829,19 +12580,23 @@ export class SyncExecutor {
             continue;
           }
           if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
-          throw new MutationRecoveryBlockedError({
-            state: "blocked",
-            total: persistedRecords.length,
-            settled,
-            remaining: this.state.mutationLedger.length,
-            retryAfterSeconds: null,
-            blockReason: "facts-changed",
-            blockedOperationId: record.intent.operationId,
-          }, new Error(
-            `Mutation receipt no longer matches local/remote facts: ${record.intent.operationId}`,
-          ));
+          blocked.push({
+            operationId: record.intent.operationId,
+            reason: "outcome-unresolved",
+            error: new Error(
+              `Mutation receipt no longer matches local/remote facts: ${record.intent.operationId}`,
+            ),
+            retryable: false,
+          });
+          blockedRecords.push({
+            record,
+            footprint: currentFootprint,
+            retryable: false,
+          });
+          continue;
         }
         await this.commitMutationCheckpoint(record.intent.operationId);
+        reflectedCheckpointRetirementCommitSeq = undefined;
         receiptCommitted++;
         settled++;
         if (isAutomaticMerge) {
@@ -8853,7 +12608,10 @@ export class SyncExecutor {
 
       let outcome: "not-applied" | MutationCheckpointV1 | null;
       try {
-        outcome = await this.classifyUnreceiptedMutation(record.intent);
+        outcome = await this.classifyUnreceiptedMutation(
+          record.intent,
+          observationOnly,
+        );
       } catch (error) {
         if (
           this.cancelled
@@ -8865,8 +12623,9 @@ export class SyncExecutor {
           error,
           retryable: true,
         });
-        blockedIntents.push({
-          intent: record.intent,
+        blockedRecords.push({
+          record,
+          footprint: currentFootprint,
           retryable: true,
         });
         if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
@@ -8892,8 +12651,9 @@ export class SyncExecutor {
           ),
           retryable: false,
         });
-        blockedIntents.push({
-          intent: record.intent,
+        blockedRecords.push({
+          record,
+          footprint: currentFootprint,
           retryable: false,
         });
         continue;
@@ -8913,6 +12673,7 @@ export class SyncExecutor {
       };
       await this.state.recordMutationReceipt(receipt);
       await this.commitMutationCheckpoint(record.intent.operationId);
+      reflectedCheckpointRetirementCommitSeq = undefined;
       applied++;
       settled++;
       if (isAutomaticMerge) {
@@ -9100,7 +12861,34 @@ export class SyncExecutor {
     };
   }
 
-  private async verifyMutationReceipt(record: MutationLedgerEntryV1): Promise<boolean> {
+  private committedDeleteLocalRemoteId(
+    intent: Readonly<MutationIntentV1>,
+  ): string | null {
+    if (
+      intent.action !== "deleteLocal"
+      || !intent.expectedLocal.exists
+      || intent.expectedRemote.exists
+    ) return null;
+    const expectedLocal = intent.expectedLocal;
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!envelope || !sameSyncScope(envelope.scope, intent.scope)) return null;
+    const candidates = Object.values(envelope.anchors.byAnchorId).filter(
+      (anchor) => anchor.remoteId !== undefined
+        && normalizeRemotePathKey(anchor.lastPath)
+          === normalizeRemotePathKey(intent.path)
+        && anchor.contentHash === expectedLocal.hash
+        && anchor.size === expectedLocal.size,
+    );
+    return candidates.length === 1
+      ? candidates[0].remoteId ?? null
+      : null;
+  }
+
+  private async verifyMutationReceipt(
+    record: MutationLedgerEntryV1,
+    observationOnly = false,
+    requireDeleteLocalRemoteAbsence = true,
+  ): Promise<boolean> {
     const receipt = record.receipt;
     if (!receipt) return false;
     const intent = record.intent;
@@ -9145,17 +12933,40 @@ export class SyncExecutor {
       }
       return true;
     }
-    const local = await this.inspectLocalPath(intent.path);
+    const local = await this.inspectLocalPathForMutation(intent.path, intent);
     if (local === null || local.status === "uncertain") return false;
+    if (intent.stateEffect === "settlement-only") {
+      const outcome = await this.classifySettlementOnlyMutation(intent, local);
+      return outcome !== null && outcome !== "not-applied";
+    }
     const base = receipt.checkpoint.baseUpserts.find((entry) => entry.path === intent.path);
 
     if (intent.action === "download") {
+      if (intent.stateEffect === "local-only") {
+        if (
+          !intent.sourcePath
+          || !intent.expectedRemote.exists
+          || !intent.expectedRemote.sha256Hash
+          || !this.inspectionMatchesVersion(local, {
+            hash: intent.expectedRemote.sha256Hash,
+            size: intent.expectedRemote.size,
+          })
+        ) return false;
+        return this.generationSourceMatchesExpectation(
+          intent.sourcePath,
+          intent.expectedRemote,
+        );
+      }
       if (!base || !this.inspectionMatchesVersion(local, base)) return false;
       const remote = await this.inspectRemotePath(intent.path);
       return this.remoteMatchesExpectation(remote, intent.expectedRemote);
     }
     if (intent.action === "deleteLocal") {
-      return local.status === "missing";
+      if (!requireDeleteLocalRemoteAbsence) return local.status === "missing";
+      const remoteId = this.committedDeleteLocalRemoteId(intent);
+      return local.status === "missing"
+        && remoteId !== null
+        && await this.onedrive.getDriveItemMetadataById(remoteId) === null;
     }
     if (intent.action === "deleteRemote") {
       if (!intent.expectedRemote.exists) return false;
@@ -9226,6 +13037,7 @@ export class SyncExecutor {
       || remote.parentId !== committedParentId) return false;
     if (this.inspectionMatchesVersion(local, base)) return true;
     if (local.status !== "missing") return false;
+    if (observationOnly) return false;
     return this.restoreReceiptedUploadLocal(intent.path, remote, base);
   }
 
@@ -9310,12 +13122,41 @@ export class SyncExecutor {
 
   private async classifyUnreceiptedMutation(
     intent: MutationIntent,
+    observationOnly = false,
+    requireDeleteLocalRemoteAbsence = true,
   ): Promise<"not-applied" | MutationCheckpointV1 | null> {
     if (isFolderMutationIntent(intent)) {
       return this.classifyUnreceiptedFolderMutation(intent);
     }
-    const local = await this.inspectLocalPath(intent.path);
+    const local = await this.inspectLocalPathForMutation(intent.path, intent);
     if (local === null || local.status === "uncertain") return null;
+    const localStillExpected = this.inspectionMatchesExpectation(
+      local,
+      intent.expectedLocal,
+    );
+    if (intent.stateEffect === "local-only") {
+      if (
+        intent.action !== "download"
+        || !intent.sourcePath
+        || intent.expectedLocal.exists
+        || !intent.expectedRemote.exists
+        || !intent.expectedRemote.sha256Hash
+      ) return null;
+      if (!await this.generationSourceMatchesExpectation(
+        intent.sourcePath,
+        intent.expectedRemote,
+      )) return null;
+      if (local.status === "missing") return "not-applied";
+      return this.inspectionMatchesVersion(local, {
+        hash: intent.expectedRemote.sha256Hash,
+        size: intent.expectedRemote.size,
+      })
+        ? emptyMutationCheckpoint()
+        : null;
+    }
+    if (intent.stateEffect === "settlement-only") {
+      return this.classifySettlementOnlyMutation(intent, local);
+    }
     if (intent.action === "moveLocal") {
       if (!intent.sourcePath || !intent.expectedLocal.exists || !intent.expectedRemote.exists) {
         return null;
@@ -9347,6 +13188,10 @@ export class SyncExecutor {
         || sourceRemote !== undefined
         || !remoteStillExpected
         || !targetRemote
+        || !await this.remoteMatchesTarget(
+          targetRemote,
+          intent.expectedLocal,
+        )
       ) return null;
       const checkpoint = emptyMutationCheckpoint();
       checkpoint.baseRemovals.push(intent.sourcePath);
@@ -9364,7 +13209,6 @@ export class SyncExecutor {
       ? intent.sourcePath ?? intent.path
       : intent.path;
     const remote = await this.inspectRemotePath(remotePath);
-    const localStillExpected = this.inspectionMatchesExpectation(local, intent.expectedLocal);
     const remoteStillExpected = this.remoteMatchesExpectation(remote, intent.expectedRemote);
     if (intent.action === "merge") {
       if (!intent.target || !intent.expectedLocal.exists || !intent.expectedRemote.exists) return null;
@@ -9384,6 +13228,7 @@ export class SyncExecutor {
 
       let currentLocal = local;
       if (localStillExpected) {
+        if (observationOnly) return null;
         const payload = await this.getMergeReadyStore().read(intent.operationId, intent.target);
         if (!payload) return null;
         await this.commitMergeLocally(intent.path, intent.expectedLocal, intent.target, payload);
@@ -9415,7 +13260,19 @@ export class SyncExecutor {
       );
       if (exactRemote !== null) return null;
     }
-    if ((intent.action === "download" || intent.action === "deleteLocal") && localStillExpected) {
+    if (intent.action === "deleteLocal") {
+      if (!requireDeleteLocalRemoteAbsence) {
+        if (localStillExpected) return "not-applied";
+      } else {
+      const remoteId = this.committedDeleteLocalRemoteId(intent);
+      if (
+        remoteId === null
+        || await this.onedrive.getDriveItemMetadataById(remoteId) !== null
+      ) return null;
+      if (localStillExpected) return "not-applied";
+      }
+    }
+    if (intent.action === "download" && localStillExpected) {
       return "not-applied";
     }
 
@@ -9493,6 +13350,7 @@ export class SyncExecutor {
     ]);
     if (source || !target || target.driveId !== intent.expectedRemote.driveId) return null;
     if (!intent.expectedLocal.exists || local.status !== "present" || !local.entry) return null;
+    if (!await this.remoteMatchesTarget(target, intent.expectedLocal)) return null;
     checkpoint.baseRemovals.push(intent.sourcePath);
     checkpoint.baseUpserts.push({
       path: intent.path,
@@ -9503,6 +13361,74 @@ export class SyncExecutor {
     checkpoint.remoteDeletes.push(intent.sourcePath);
     checkpoint.remoteUpserts.push(target);
     return checkpoint;
+  }
+
+  private async classifySettlementOnlyMutation(
+    intent: MutationIntentV1,
+    local: LocalFileInspection,
+  ): Promise<"not-applied" | MutationCheckpointV1 | null> {
+    if (
+      intent.stateEffect !== "settlement-only"
+      || intent.sourcePath
+      || !(intent.action === "upload"
+        || intent.action === "download"
+        || intent.action === "deleteRemote"
+        || intent.action === "deleteLocal")
+    ) return null;
+    const remote = await this.inspectRemotePath(intent.path);
+    const localStillExpected = this.inspectionMatchesExpectation(
+      local,
+      intent.expectedLocal,
+    );
+    const remoteStillExpected = this.remoteMatchesExpectation(
+      remote,
+      intent.expectedRemote,
+    );
+    if (localStillExpected && remoteStillExpected) return "not-applied";
+
+    if (intent.action === "download") {
+      if (!intent.expectedRemote.exists || !remoteStillExpected) return null;
+      const target = intent.expectedRemote.sha256Hash
+        ? {
+            hash: intent.expectedRemote.sha256Hash.toLowerCase(),
+            size: intent.expectedRemote.size,
+          }
+        : null;
+      if (target) {
+        return this.inspectionMatchesVersion(local, target)
+          ? emptyMutationCheckpoint()
+          : null;
+      }
+      if (local.status !== "present" || !local.entry || !remote) return null;
+      return await this.remoteMatchesTarget(remote, local.entry, true)
+        ? emptyMutationCheckpoint()
+        : null;
+    }
+
+    if (intent.action === "upload") {
+      if (!intent.expectedLocal.exists || !localStillExpected || !remote) return null;
+      if (remoteStillExpected) return "not-applied";
+      return await this.remoteMatchesTarget(remote, intent.expectedLocal, true)
+        ? emptyMutationCheckpoint()
+        : null;
+    }
+
+    if (intent.action === "deleteRemote") {
+      if (!intent.expectedRemote.exists || !localStillExpected) return null;
+      if (remoteStillExpected) return "not-applied";
+      if (remote) return null;
+      return await this.onedrive.getDriveItemMetadataById(
+        intent.expectedRemote.driveId,
+      ) === null
+        ? emptyMutationCheckpoint()
+        : null;
+    }
+
+    if (!intent.expectedLocal.exists || !remoteStillExpected) return null;
+    if (localStillExpected) return "not-applied";
+    return local.status === "missing"
+      ? emptyMutationCheckpoint()
+      : null;
   }
 
   private async classifyUnreceiptedFolderMutation(
@@ -10029,6 +13955,7 @@ export class SyncExecutor {
     automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>,
     preparedDownload?: PreparedDownload,
     factsChangedPolicy: "defer" | "throw" = "defer",
+    allowExcludedForRecovery = false,
   ): Promise<ItemExecutionResult> {
     switch (item.type) {
       case SyncActionType.CreateRemoteFolder: {
@@ -10680,6 +14607,11 @@ export class SyncExecutor {
 
       case SyncActionType.Download: {
         if (!item.remote) break;
+        if (item.generationRestore && !preparedDownload?.downloaded) {
+          throw new Error(
+            `Generation restore requires complete bundle preflight: ${item.path}`,
+          );
+        }
         const usesLocalCas = typeof (this.scanner as LocalScanner & { inspectFile?: unknown }).inspectFile === "function";
         const firstLocalGuardStartedAt = Date.now();
         const beforeDownload = await this.guardDownloadLocalVersion(
@@ -10687,6 +14619,7 @@ export class SyncExecutor {
           result,
           operationEpoch,
           factsChangedPolicy,
+          allowExcludedForRecovery,
         );
         metrics.fileTransfers.download.stagesMs.localVersionGuard +=
           Date.now() - firstLocalGuardStartedAt;
@@ -10722,7 +14655,7 @@ export class SyncExecutor {
           try {
             content = await this.onedrive.downloadFile(
               this.vaultName,
-              item.path,
+              item.remote.path,
               item.remote.downloadUrl,
               item.remote.driveId,
               item.remote.size,
@@ -10745,7 +14678,11 @@ export class SyncExecutor {
         if (!preparedDownload?.downloaded) {
           const remoteVerifyStartedAt = Date.now();
           try {
-            await this.verifyDownloadedPayload(item.path, item.remote, downloaded);
+            await this.verifyDownloadedPayload(
+              item.remote.path,
+              item.remote,
+              downloaded,
+            );
           } catch (error) {
             if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
             throw error;
@@ -10753,6 +14690,9 @@ export class SyncExecutor {
             metrics.fileTransfers.download.stagesMs.remoteVersionVerify +=
               Date.now() - remoteVerifyStartedAt;
           }
+        }
+        if (item.generationRestore) {
+          await this.verifyGenerationRestoreSourceVersion(item, downloaded);
         }
         if (!this.canContinue(operationEpoch, result)) {
           if (tempDownloadPath) {
@@ -10785,6 +14725,7 @@ export class SyncExecutor {
           result,
           operationEpoch,
           factsChangedPolicy,
+          allowExcludedForRecovery,
         );
         metrics.fileTransfers.download.stagesMs.localVersionGuard +=
           Date.now() - secondLocalGuardStartedAt;
@@ -10936,8 +14877,14 @@ export class SyncExecutor {
 
         const hash = downloaded.hash;
         result.downloaded++;
-        if (content) {
+        if (content && !item.generationRestore) {
           this.state.cacheBaseContent(item.path, content);
+        }
+        if (item.generationRestore) {
+          return {
+            executed: true,
+            mutationApplied: true,
+          };
         }
         return {
           executed: true,
@@ -11853,13 +15800,8 @@ export class SyncExecutor {
     enterPhase("planning");
     this.progressStore?.setPhase("planning");
     const configDir = getConfigDir(this.scanner.vault);
-    const structuredCommunityPluginPath =
-      communityPluginSyncPolicy.files.mode !== "none"
-        ? `${configDir}/community-plugins.json`
-        : null;
     const planningLocalEntries = scan.entries.filter((entry) =>
-      entry.path !== structuredCommunityPluginPath
-      && this.shouldIncludeRemotePath(entry.path)
+      this.shouldIncludeRemotePath(entry.path)
       && isCommunityPluginPathSelectedByPolicy(
         entry.path,
         communityPluginSyncPolicy,
@@ -11873,8 +15815,7 @@ export class SyncExecutor {
       skippedLarge: scan.skippedLarge,
       localMoveHints: [],
       includeFilePath: (path) =>
-        path !== structuredCommunityPluginPath
-        && this.shouldIncludeRemotePath(path)
+        this.shouldIncludeRemotePath(path)
         && isCommunityPluginPathSelectedByPolicy(
           path,
           communityPluginSyncPolicy,
@@ -12024,12 +15965,229 @@ export class SyncExecutor {
     return result;
   }
 
+  private async observeSharedSyncProtocolObjects(): Promise<
+    SharedSyncProtocolObservationResult
+  > {
+    try {
+      const objects = await this.onedrive.readSharedSyncProtocolObjects(
+        this.vaultName,
+      );
+      this.throwIfSharedSyncProtocolOperationWasCancelled();
+      return {
+        status: "ready",
+        objects,
+      };
+    } catch (error) {
+      this.throwIfSharedSyncProtocolOperationWasCancelled();
+      const failure = classifySharedSyncProtocolObservationFailure(error);
+      throwIfSharedSyncProtocolObservationIsTerminal(failure);
+      return failure.retryable
+        ? {
+            status: "unavailable",
+            reason: failure.reason,
+            component: failure.component,
+          }
+        : {
+            status: "blocked",
+            reason: failure.reason === "control-directory-not-found"
+              ? "control-directory-not-found"
+              : "protocol-read-failed",
+          };
+    }
+  }
+
+  private throwIfSharedSyncProtocolOperationWasCancelled(): void {
+    if (!this.cancelled) return;
+    const error = new Error("Shared sync protocol operation was cancelled");
+    error.name = "AbortError";
+    throw error;
+  }
+
+  private async runSharedSyncProtocolMutationStep<
+    K extends keyof SharedSyncProtocolObjects,
+    T extends SharedSyncProtocolMutationReady,
+  >(
+    initialObservation: SharedSyncProtocolObserved,
+    slot: K,
+    execute: (
+      observedCurrent: SharedSyncProtocolObjects[K],
+      observeAfterCreateFailure: () => Promise<SharedSyncProtocolObjects[K]>,
+    ) => Promise<SharedSyncProtocolMutationOutcome<T>>,
+    onSettled?: (value: T) => Promise<void>,
+  ): Promise<SharedSyncProtocolStepResult<T>> {
+    const postWrite: { observation?: SharedSyncProtocolObserved } = {};
+    let value: SharedSyncProtocolMutationOutcome<T>;
+    try {
+      value = await execute(
+        initialObservation.objects[slot],
+        async () => {
+          const observation = await this.observeSharedSyncProtocolObjects();
+          if (observation.status !== "ready") {
+            throw new SharedSyncProtocolObservationStoppedError(observation);
+          }
+          postWrite.observation = observation;
+          return observation.objects[slot];
+        },
+      );
+      // create/readById uses requestUrl and can settle only after cancel() has
+      // invalidated this run. Lifecycle state outranks a late timeout or
+      // status-0 transport result, including helpers that fail closed by
+      // returning a readback mismatch instead of throwing.
+      this.throwIfSharedSyncProtocolOperationWasCancelled();
+    } catch (error) {
+      this.throwIfSharedSyncProtocolOperationWasCancelled();
+      if (error instanceof SharedSyncProtocolObservationStoppedError) {
+        return error.observation;
+      }
+      throw error;
+    }
+    if (value.status !== "ready") {
+      return {
+        status: "blocked",
+        reason: value.status === "acknowledgement-required"
+          ? "acknowledgement-required"
+          : value.reason,
+      };
+    }
+    await onSettled?.(value);
+    this.throwIfSharedSyncProtocolOperationWasCancelled();
+    if (value.source === "create-race") {
+      return postWrite.observation
+        ? { status: "ready", value, observation: postWrite.observation }
+        : { status: "blocked", reason: "post-write-observation-missing" };
+    }
+    if (value.source === "created") {
+      const observation = await this.observeSharedSyncProtocolObjects();
+      if (observation.status !== "ready") return observation;
+      return { status: "ready", value, observation };
+    }
+    return { status: "ready", value, observation: initialObservation };
+  }
+
+  private async ensureSharedSyncProtocolV2FromObservation(
+    transport: SharedSyncProtocolMutationTransportV2,
+    initialObservation: SharedSyncProtocolObserved,
+    input: Omit<
+      Parameters<typeof ensureSharedSyncProtocolV2>[1],
+      "observedCurrent" | "observeAfterCreateFailure"
+    >,
+    onSettled?: (value: EnsureSharedSyncProtocolReadyV2) => Promise<void>,
+  ): Promise<SharedSyncProtocolStepResult<EnsureSharedSyncProtocolReadyV2>> {
+    return this.runSharedSyncProtocolMutationStep<
+      "v2",
+      EnsureSharedSyncProtocolReadyV2
+    >(
+      initialObservation,
+      "v2",
+      (observedCurrent, observeAfterCreateFailure) =>
+        ensureSharedSyncProtocolV2(transport, {
+          ...input,
+          observedCurrent,
+          observeAfterCreateFailure,
+        }),
+      onSettled,
+    );
+  }
+
+  private async ensureCanonicalSharedSyncProtocolV2FromObservation(
+    transport: SharedSyncProtocolMutationTransportV2,
+    initialObservation: SharedSyncProtocolObserved,
+    input: Omit<
+      Parameters<typeof ensureCanonicalSharedSyncProtocolV2>[1],
+      "observedCurrent" | "observeAfterCreateFailure"
+    >,
+  ): Promise<
+    SharedSyncProtocolStepResult<EnsureCanonicalSharedSyncProtocolReadyV2>
+  > {
+    return this.runSharedSyncProtocolMutationStep<
+      "v2",
+      EnsureCanonicalSharedSyncProtocolReadyV2
+    >(
+      initialObservation,
+      "v2",
+      (observedCurrent, observeAfterCreateFailure) =>
+        ensureCanonicalSharedSyncProtocolV2(transport, {
+          ...input,
+          observedCurrent,
+          observeAfterCreateFailure,
+        }),
+    );
+  }
+
+  private async ensureSharedSyncProtocolV3FromObservation(
+    transport: SharedSyncProtocolMutationTransportV3,
+    initialObservation: SharedSyncProtocolObserved,
+    input: Omit<
+      Parameters<typeof ensureSharedSyncProtocolV3>[1],
+      "observedCurrent" | "observeAfterCreateFailure"
+    >,
+  ): Promise<SharedSyncProtocolStepResult<EnsureSharedSyncProtocolReadyV3>> {
+    return this.runSharedSyncProtocolMutationStep<
+      "v3",
+      EnsureSharedSyncProtocolReadyV3
+    >(
+      initialObservation,
+      "v3",
+      (observedCurrent, observeAfterCreateFailure) =>
+        ensureSharedSyncProtocolV3(transport, {
+          ...input,
+          observedCurrent,
+          observeAfterCreateFailure,
+        }),
+    );
+  }
+
+  private finishRetryableSharedControlObservation(
+    result: SyncResult,
+    unavailable: SharedSyncProtocolUnavailable,
+    operationEpoch: number,
+  ): SyncResult {
+    // requestUrl cannot be cancelled once dispatched. Lifecycle state is
+    // authoritative when its later timeout/error races with a user cancel.
+    if (this.shouldStop(result, operationEpoch)) {
+      delete result.disposition;
+      return result;
+    }
+    result.errors = Math.max(1, result.errors);
+    result.message = this.t("result.sharedControlReadUnavailable");
+    result.disposition = {
+      kind: "retryable-observation",
+      phase: "remotePrepare",
+      code: "shared-control-read-unavailable",
+      retry: "next-sync",
+      component: unavailable.component,
+    };
+    this.diag?.warn(
+      "state",
+      "shared protocol observation is temporarily unavailable before ordinary planning",
+      {
+        reason: unavailable.reason,
+        component: unavailable.component,
+        ordinaryPlanning: result.runFacts?.ordinaryPlanning ?? "unknown",
+        retry: "next-sync",
+      },
+    );
+    return result;
+  }
+
   private async ensureScopeFreeSharedProtocol(
     expectedBinding: SharedSyncProtocolBinding,
-  ): Promise<
-    | { status: "ready"; binding: SharedSyncProtocolBindingV3; source: string }
-    | { status: "blocked"; reason: string }
-  > {
+    syncScope: SyncScope,
+  ): Promise<ScopeFreeSharedProtocolResult> {
+    const observation = await this.observeSharedSyncProtocolObjects();
+    if (observation.status !== "ready") return observation;
+    return this.ensureScopeFreeSharedProtocolFromObservation(
+      expectedBinding,
+      syncScope,
+      observation,
+    );
+  }
+
+  private async ensureScopeFreeSharedProtocolFromObservation(
+    expectedBinding: SharedSyncProtocolBinding,
+    syncScope: SyncScope,
+    observation: SharedSyncProtocolObserved,
+  ): Promise<ScopeFreeSharedProtocolResult> {
     const protocolTransportV3 = availableSharedSyncProtocolTransportV3(
       this.onedrive,
       this.vaultName,
@@ -12037,28 +16195,27 @@ export class SyncExecutor {
     if (!protocolTransportV3) {
       return { status: "blocked", reason: "v3-transport-unavailable" };
     }
+    const predecessor = observation.objects.v2;
+    const currentV3 = observation.objects.v3;
     if (expectedBinding.protocolVersion === 3) {
-      const v3 = await ensureSharedSyncProtocolV3(protocolTransportV3, {
+      const profile = await classifySharedSyncProtocolProfile({
+        v2: predecessor,
+        v3: currentV3,
+        targetScope: syncScope,
         expectedBinding,
-        allowCreate: true,
       });
-      return v3.status === "ready"
-        ? { status: "ready", binding: v3.binding, source: v3.source }
-        : { status: "blocked", reason: v3.reason };
-    }
-
-    const protocolTransportV2 = availableSharedSyncProtocolTransportV2(
-      this.onedrive,
-      this.vaultName,
-    );
-    if (!protocolTransportV2) {
-      return { status: "blocked", reason: "v2-transport-unavailable" };
-    }
-    let predecessor;
-    try {
-      predecessor = await protocolTransportV2.read();
-    } catch {
-      return { status: "blocked", reason: "v2-read-failed" };
+      this.throwIfSharedSyncProtocolOperationWasCancelled();
+      return profile.status === "healthy"
+        ? { status: "ready", binding: expectedBinding, source: "existing" }
+        : {
+            status: "blocked",
+            reason: profile.status === "inconsistent"
+              ? profile.reason
+              : "profile-not-healthy",
+            ...(profile.status === "inconsistent"
+              ? { evidence: profile.evidence }
+              : {}),
+          };
     }
     if (
       predecessor
@@ -12077,29 +16234,180 @@ export class SyncExecutor {
       // authorize this transition.
       return { status: "blocked", reason: "v2-predecessor-missing" };
     }
-    const v3 = await ensureSharedSyncProtocolV3(protocolTransportV3, {
-      predecessor,
-      expectedBinding,
-      allowCreate: true,
+    const profile = await classifySharedSyncProtocolProfile({
+      v2: predecessor,
+      v3: currentV3,
+      targetScope: syncScope,
     });
-    return v3.status === "ready"
-      ? { status: "ready", binding: v3.binding, source: v3.source }
-      : { status: "blocked", reason: v3.reason };
+    this.throwIfSharedSyncProtocolOperationWasCancelled();
+    if (
+      (profile.status !== "legacy-v2" && profile.status !== "healthy")
+      || profile.migrationGeneration !== expectedBinding.migrationGeneration
+      || profile.protocolV2.confirmedAllDevicesUpdatedAt
+        !== expectedBinding.confirmedAllDevicesUpdatedAt
+    ) {
+      return {
+        status: "blocked",
+        reason: profile.status === "inconsistent"
+          ? profile.reason
+          : "v2-binding-mismatch",
+        ...(profile.status === "inconsistent"
+          ? { evidence: profile.evidence }
+          : {}),
+      };
+    }
+    const v3 = await this.ensureSharedSyncProtocolV3FromObservation(
+      protocolTransportV3,
+      observation,
+      {
+        predecessor: profile.protocolV2Object,
+        expectedBinding,
+        allowCreate: profile.status === "legacy-v2",
+      },
+    );
+    if (v3.status !== "ready") return v3;
+    const verified = await classifySharedSyncProtocolProfile({
+      v2: v3.observation.objects.v2,
+      v3: v3.observation.objects.v3,
+      targetScope: syncScope,
+      expectedBinding: v3.value.binding,
+    });
+    this.throwIfSharedSyncProtocolOperationWasCancelled();
+    return verified.status === "healthy"
+      ? {
+          status: "ready",
+          binding: v3.value.binding,
+          source: v3.value.source,
+        }
+      : {
+          status: "blocked",
+          reason: verified.status === "inconsistent"
+            ? verified.reason
+            : "profile-not-healthy",
+          ...(verified.status === "inconsistent"
+            ? { evidence: verified.evidence }
+            : {}),
+        };
   }
 
-  private async adoptExistingScopeFreeSharedProtocolForFreshActivation(
-    expectedBinding?: SharedSyncProtocolBindingV3,
-  ): Promise<
-    | { status: "ready"; binding: SharedSyncProtocolBindingV3 }
-    | { status: "blocked"; reason: string }
-  > {
+  private async ensureRecoveredScopeSharedProtocol(
+    expectedBinding: SharedSyncProtocolBinding,
+    predecessorScope: SyncScope,
+    targetScope: SyncScope,
+  ): Promise<ScopeFreeSharedProtocolResult> {
+    if (expectedBinding.protocolVersion !== 3) {
+      return { status: "blocked", reason: "v3-binding-required" };
+    }
     const protocolTransportV2 = availableSharedSyncProtocolTransportV2(
       this.onedrive,
       this.vaultName,
     );
-    if (!protocolTransportV2) {
-      return { status: "blocked", reason: "v2-transport-unavailable" };
+    const protocolTransportV3 = availableSharedSyncProtocolTransportV3(
+      this.onedrive,
+      this.vaultName,
+    );
+    if (!protocolTransportV2 || !protocolTransportV3) {
+      return { status: "blocked", reason: "protocol-transport-unavailable" };
     }
+
+    const canonical = await classifySharedSyncProtocolProfile({
+      v2: null,
+      v3: null,
+      targetScope,
+      expectedBinding,
+      predecessorScope,
+    });
+    this.throwIfSharedSyncProtocolOperationWasCancelled();
+    if (canonical.status !== "recoverable") {
+      return {
+        status: "blocked",
+        reason: canonical.status === "inconsistent"
+          ? canonical.reason
+          : "recovery-proof-incomplete",
+      };
+    }
+
+    const initialObservation = await this.observeSharedSyncProtocolObjects();
+    if (initialObservation.status !== "ready") return initialObservation;
+    if (
+      (
+        initialObservation.objects.v2
+        && initialObservation.objects.v2.content !== canonical.canonicalV2Content
+      )
+      || (
+        initialObservation.objects.v3
+        && initialObservation.objects.v3.content !== canonical.canonicalV3Content
+      )
+    ) {
+      return { status: "blocked", reason: "target-slot-occupied" };
+    }
+
+    const v2 = await this.ensureCanonicalSharedSyncProtocolV2FromObservation(
+      protocolTransportV2,
+      initialObservation,
+      {
+        canonicalContent: canonical.canonicalV2Content,
+        expectedMigrationGeneration: expectedBinding.migrationGeneration,
+        expectedContentSha256: expectedBinding.predecessorContentSha256,
+      },
+    );
+    if (v2.status !== "ready") {
+      return v2.status === "blocked"
+        ? { status: "blocked", reason: `v2-${v2.reason}` }
+        : v2;
+    }
+    const v3 = await this.ensureSharedSyncProtocolV3FromObservation(
+      protocolTransportV3,
+      v2.observation,
+      {
+        predecessor: v2.value.object,
+        expectedBinding,
+        allowCreate: true,
+      },
+    );
+    if (v3.status !== "ready") {
+      return v3.status === "blocked"
+        ? { status: "blocked", reason: `v3-${v3.reason}` }
+        : v3;
+    }
+
+    const verified = await classifySharedSyncProtocolProfile({
+      v2: v3.observation.objects.v2,
+      v3: v3.observation.objects.v3,
+      targetScope,
+      expectedBinding: v3.value.binding,
+      predecessorScope,
+    });
+    this.throwIfSharedSyncProtocolOperationWasCancelled();
+    return verified.status === "healthy"
+      ? {
+          status: "ready",
+          binding: v3.value.binding,
+          source: `${v2.value.source}+${v3.value.source}`,
+        }
+      : {
+          status: "blocked",
+          reason: verified.status === "inconsistent"
+            ? verified.reason
+            : "profile-not-healthy",
+        };
+  }
+
+  private async adoptExistingScopeFreeSharedProtocolForFreshActivation(
+    expectedBinding?: SharedSyncProtocolBindingV3,
+  ): Promise<ScopeFreeSharedProtocolResult> {
+    const observation = await this.observeSharedSyncProtocolObjects();
+    if (observation.status !== "ready") return observation;
+    return this.inspectExistingScopeFreeSharedProtocolForFreshActivation(
+      observation,
+      expectedBinding,
+    );
+  }
+
+  private async inspectExistingScopeFreeSharedProtocolForFreshActivation(
+    observation: SharedSyncProtocolObserved,
+    expectedBinding?: SharedSyncProtocolBindingV3,
+  ): Promise<ScopeFreeSharedProtocolResult> {
     const protocolTransportV3 = availableSharedSyncProtocolTransportV3(
       this.onedrive,
       this.vaultName,
@@ -12107,23 +16415,44 @@ export class SyncExecutor {
     if (!protocolTransportV3) {
       return { status: "blocked", reason: "v3-transport-unavailable" };
     }
-    let predecessor;
-    try {
-      predecessor = await protocolTransportV2.read();
-    } catch {
-      return { status: "blocked", reason: "v2-read-failed" };
-    }
+    const predecessor = observation.objects.v2;
     if (!predecessor) {
       return { status: "blocked", reason: "v2-predecessor-missing" };
     }
-    const v3 = await ensureSharedSyncProtocolV3(protocolTransportV3, {
-      predecessor,
-      ...(expectedBinding ? { expectedBinding } : {}),
-      allowCreate: false,
-    });
+    const v3 = await this.ensureSharedSyncProtocolV3FromObservation(
+      protocolTransportV3,
+      observation,
+      {
+        predecessor,
+        ...(expectedBinding ? { expectedBinding } : {}),
+        allowCreate: false,
+      },
+    );
     return v3.status === "ready"
-      ? { status: "ready", binding: v3.binding }
-      : { status: "blocked", reason: v3.reason };
+      ? {
+          status: "ready",
+          binding: v3.value.binding,
+          source: v3.value.source,
+        }
+      : v3;
+  }
+
+  private async readFreshSharedProtocolProfile(
+    syncScope: SyncScope,
+  ): Promise<FreshSharedSyncProtocolProfileObservationResult> {
+    const observation = await this.observeSharedSyncProtocolObjects();
+    if (observation.status !== "ready") return observation;
+    const profile = await classifySharedSyncProtocolProfile({
+      v2: observation.objects.v2,
+      v3: observation.objects.v3,
+      targetScope: syncScope,
+    });
+    this.throwIfSharedSyncProtocolOperationWasCancelled();
+    return {
+      status: "ready",
+      objects: observation.objects,
+      profile,
+    };
   }
 
   private async runV2RemoteScopeRecovery(input: {
@@ -12369,9 +16698,26 @@ export class SyncExecutor {
       publishRecoveryVerification({ failureStage: "protocol-preflight" });
       return result;
     }
-    const protocol = await this.ensureScopeFreeSharedProtocol(
+    const protocol = await this.ensureRecoveredScopeSharedProtocol(
       sourceProtocolBinding,
+      sourceEnvelope.scope,
+      observedScope,
     );
+    if (protocol.status === "unavailable") {
+      result.errors = 1;
+      result.message = this.t("result.sharedControlReadUnavailable");
+      this.diag?.warn(
+        "state",
+        "remote scope recovery retained its hold because the shared protocol is temporarily unavailable",
+        {
+          reason: protocol.reason,
+          downloadedForRecovery: 0,
+          mutations: 0,
+        },
+      );
+      publishRecoveryVerification({ failureStage: "protocol-preflight" });
+      return result;
+    }
     if (protocol.status !== "ready") {
       result.errors = 1;
       result.message = this.t("result.v2ScopeRecoveryProtocolBlocked");
@@ -12740,13 +17086,8 @@ export class SyncExecutor {
     publishRecoveryVerification({ failureStage: "planning" });
     this.progressStore?.setPhase("planning");
     const configDir = getConfigDir(this.scanner.vault);
-    const structuredCommunityPluginPath =
-      communityPluginSyncPolicy.files.mode !== "none"
-        ? `${configDir}/community-plugins.json`
-        : null;
     const planningLocalEntries = scan.entries.filter((entry) =>
-      entry.path !== structuredCommunityPluginPath
-      && this.shouldIncludeRemotePath(entry.path)
+      this.shouldIncludeRemotePath(entry.path)
       && isCommunityPluginPathSelectedByPolicy(
         entry.path,
         communityPluginSyncPolicy,
@@ -12760,8 +17101,7 @@ export class SyncExecutor {
       skippedLarge: scan.skippedLarge,
       localMoveHints: [],
       includeFilePath: (path) =>
-        path !== structuredCommunityPluginPath
-        && this.shouldIncludeRemotePath(path)
+        this.shouldIncludeRemotePath(path)
         && isCommunityPluginPathSelectedByPolicy(
           path,
           communityPluginSyncPolicy,
@@ -13109,6 +17449,7 @@ export class SyncExecutor {
     folders: RemoteFolderEntry[] = [],
   ): Promise<void> {
     await this.state.setRemoteState(entries, deltaLink, scope, folders);
+    this.isolatedMutationRecoveryPathCache = null;
   }
 
   /** Use persisted remote state for incremental delta, rebuilding on failure. */
@@ -13123,6 +17464,48 @@ export class SyncExecutor {
   ): Promise<{ entries: RemoteFileEntry[]; scope: SyncScope }> {
     let currentScope = syncScope;
     let { filesRootId } = currentScope;
+    const persistRemoteProjection = async (input: Readonly<{
+      entries: RemoteFileEntry[];
+      folders: RemoteFolderEntry[];
+      deltaLink: string | null;
+      scope: SyncScope;
+      source: "incremental" | "complete-delta" | "full-scan" | "not-found";
+      observedItems: number;
+    }>): Promise<void> => {
+      const currentEnvelope = this.state.getCommittedV2Envelope();
+      const preserveReviewedProjection = Boolean(
+        preserveReviewedSourceCommitSeq !== undefined
+        && currentEnvelope
+        && currentEnvelope.meta.commitSeq === preserveReviewedSourceCommitSeq
+        && remoteStateProjectionMatchesEnvelopeV2(
+          currentEnvelope,
+          {
+            entries: input.entries,
+            folders: input.folders,
+            scope: input.scope,
+          },
+        )
+      );
+      if (persistPreparedState && !preserveReviewedProjection) {
+        await this.commitPreparedRemoteState(
+          input.entries,
+          input.deltaLink,
+          input.scope,
+          input.folders,
+        );
+      } else if (preserveReviewedProjection) {
+        this.diag?.log(
+          "state",
+          "deferred a projection-identical remote checkpoint until the sealed reviewed plan is resolved",
+          {
+            sourceCommitSeq: preserveReviewedSourceCommitSeq,
+            source: input.source,
+            observedItems: input.observedItems,
+            mutations: 0,
+          },
+        );
+      }
+    };
     if (!forceCompleteIdentitySnapshot
       && this.state.hasRemoteState
       && this.state.remoteDeltaLink) {
@@ -13179,39 +17562,14 @@ export class SyncExecutor {
         );
         const entries = projection.entries;
         if (!this.canContinue(operationEpoch, result)) return { entries, scope: currentScope };
-        const currentEnvelope = this.state.getCommittedV2Envelope();
-        const preserveReviewedCursorOnly = Boolean(
-          preserveReviewedSourceCommitSeq !== undefined
-          && currentEnvelope
-          && currentEnvelope.meta.commitSeq
-            === preserveReviewedSourceCommitSeq
-          && remoteStateProjectionMatchesEnvelopeV2(
-            currentEnvelope,
-            {
-              entries,
-              folders: projection.folders,
-              scope: currentScope,
-            },
-          )
-        );
-        if (persistPreparedState && !preserveReviewedCursorOnly) {
-          await this.commitPreparedRemoteState(
-            entries,
-            delta["@odata.deltaLink"] ?? null,
-            currentScope,
-            projection.folders,
-          );
-        } else if (preserveReviewedCursorOnly) {
-          this.diag?.log(
-            "state",
-            "deferred a projection-identical delta cursor checkpoint until the sealed reviewed plan is resolved",
-            {
-              sourceCommitSeq: preserveReviewedSourceCommitSeq,
-              replayedNotifications: delta.value.length,
-              mutations: 0,
-            },
-          );
-        }
+        await persistRemoteProjection({
+          entries,
+          folders: projection.folders,
+          deltaLink: delta["@odata.deltaLink"] ?? null,
+          scope: currentScope,
+          source: "incremental",
+          observedItems: delta.value.length,
+        });
         this.diag?.log("onedrive", `incremental delta returned ${delta.value.length} change(s) → ${entries.length} cached remote entries`);
         return { entries, scope: currentScope };
       } catch (e) {
@@ -13290,14 +17648,14 @@ export class SyncExecutor {
       const projection = this.projectCompleteRemoteSnapshot(delta.value, filesRootId);
       const entries = projection.entries;
       if (!this.canContinue(operationEpoch, result)) return { entries, scope: currentScope };
-      if (persistPreparedState) {
-        await this.commitPreparedRemoteState(
-          entries,
-          delta["@odata.deltaLink"] ?? null,
-          currentScope,
-          projection.folders,
-        );
-      }
+      await persistRemoteProjection({
+        entries,
+        folders: projection.folders,
+        deltaLink: delta["@odata.deltaLink"] ?? null,
+        scope: currentScope,
+        source: "complete-delta",
+        observedItems: delta.value.length,
+      });
       this.diag?.log("onedrive", `delta returned ${delta.value.length} items → ${entries.length} remote entries`);
       return { entries, scope: currentScope };
     } catch (e) {
@@ -13309,14 +17667,14 @@ export class SyncExecutor {
         const projection = this.projectCompleteRemoteSnapshot(items, filesRootId);
         const entries = projection.entries;
         if (!this.canContinue(operationEpoch, result)) return { entries, scope: currentScope };
-        if (persistPreparedState) {
-          await this.commitPreparedRemoteState(
-            entries,
-            null,
-            currentScope,
-            projection.folders,
-          );
-        }
+        await persistRemoteProjection({
+          entries,
+          folders: projection.folders,
+          deltaLink: null,
+          scope: currentScope,
+          source: "full-scan",
+          observedItems: items.length,
+        });
         this.diag?.log("onedrive", `full scan returned ${items.length} items → ${entries.length} remote entries`);
         return { entries, scope: currentScope };
       } catch (e2) {
@@ -13324,9 +17682,14 @@ export class SyncExecutor {
         // Both delta and full scan failed — if NotFound, the vault folder is empty/new
         if (e2 instanceof OneDriveError && e2.type === OneDriveErrorType.NotFound) {
           if (!this.canContinue(operationEpoch, result)) return { entries: [], scope: currentScope };
-          if (persistPreparedState) {
-            await this.commitPreparedRemoteState([], null, currentScope);
-          }
+          await persistRemoteProjection({
+            entries: [],
+            folders: [],
+            deltaLink: null,
+            scope: currentScope,
+            source: "not-found",
+            observedItems: 0,
+          });
           return { entries: [], scope: currentScope };
         }
         throw e2;
@@ -15043,6 +19406,55 @@ function emptyMutationCheckpoint(): MutationCheckpointV1 {
     pendingConflictRemovals: [],
     pendingDeleteRemovals: [],
   };
+}
+
+function sameGenerationRestoreBinding(
+  left: Readonly<CommunityPluginGenerationRestoreBindingV1>,
+  right: Readonly<CommunityPluginGenerationRestoreBindingV1>,
+): boolean {
+  return left.schemaVersion === right.schemaVersion
+    && left.pluginId === right.pluginId
+    && left.participant.participantId === right.participant.participantId
+    && left.participant.incarnation === right.participant.incarnation
+    && left.generation === right.generation
+    && left.joinNonce === right.joinNonce
+    && left.controlRecordId === right.controlRecordId
+    && left.fenceEpoch === right.fenceEpoch
+    && left.sealRevision === right.sealRevision
+    && left.manifestObject.objectPath === right.manifestObject.objectPath
+    && left.manifestObject.remoteId === right.manifestObject.remoteId
+    && left.manifestObject.parentId === right.manifestObject.parentId
+    && left.manifestObject.size === right.manifestObject.size
+    && left.manifestObject.eTag === right.manifestObject.eTag
+    && left.manifestObject.cTag === right.manifestObject.cTag
+    && left.manifestObject.sha256Hash === right.manifestObject.sha256Hash;
+}
+
+function folderSubtreeMemberMatchesDriveItem(
+  expected: Readonly<FolderSubtreeReviewSnapshotV1["members"][number]>,
+  actual: Readonly<DriveItem>,
+): boolean {
+  if (
+    actual.id !== expected.remoteId
+    || actual.parentReference?.id !== expected.parentRemoteId
+    || actual.eTag !== expected.remoteETag
+    || (expected.remoteCTag !== undefined
+      && actual.cTag !== expected.remoteCTag)
+  ) return false;
+  if (expected.kind === "folder") return Boolean(actual.folder) && !actual.file;
+  return Boolean(actual.file)
+    && !actual.folder
+    && actual.size === expected.size
+    && (expected.contentHash === undefined
+      || actual.file?.hashes?.sha256Hash?.toLowerCase()
+        === expected.contentHash.toLowerCase())
+    && (expected.quickXorHash === undefined
+      || actual.file?.hashes?.quickXorHash === expected.quickXorHash);
+}
+
+function folderSubtreeLeafName(path: string): string {
+  const separator = path.lastIndexOf("/");
+  return separator >= 0 ? path.slice(separator + 1) : path;
 }
 
 function assertNeverMutationAction(action: never): never {

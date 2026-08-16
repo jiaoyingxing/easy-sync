@@ -115,7 +115,7 @@ const FILE_SYNC_V1_DEBT: DebtGuard[] = [
     label: "legacy or dual-state writer calls",
     pattern: /\bthis\.state\.(?:clearRemoteState|applyRemoteMutations|upsertBaseEntries|removeBaseEntries|setRemoteState|commitMutationCheckpoints?)\s*\(/g,
     expected: {
-      "src/sync/sync-executor.ts": 10,
+      "src/sync/sync-executor.ts": 9,
     },
   },
   {
@@ -218,6 +218,7 @@ const V2_70_BOUNDARY_OWNERS: BoundaryOwnerGuard[] = [
     disposition: "v2-70-state-source-migration",
     literal: "MutationLedgerEntryV1",
     expectedFiles: [
+      "src/sync/conservative-reset-recovery.ts",
       "src/sync/diagnostic-report-evidence.ts",
       "src/sync/file-state-reducer-v2.ts",
       "src/sync/folder-state-reducer-v2.ts",

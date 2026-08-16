@@ -102,7 +102,6 @@ export class EasySyncSettingTab extends PluginSettingTab {
   private automaticSectionEl: HTMLElement | null = null;
   private aboutSectionEl: HTMLElement | null = null;
   private maintenanceSectionEl: HTMLElement | null = null;
-  private communityPluginEnablementReviewModal: ConfigSyncModal | null = null;
 
   constructor(plugin: EasySyncPlugin) {
     super(plugin.app, plugin);
@@ -162,23 +161,6 @@ export class EasySyncSettingTab extends PluginSettingTab {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     this.renderSyncSection(t);
     this.renderAutomaticSection(t);
-  }
-
-  openCommunityPluginEnablementReview(): void {
-    if (this.communityPluginEnablementReviewModal) return;
-    let modal: ConfigSyncModal | null = null;
-    modal = new ConfigSyncModal(
-      this.plugin,
-      "community-plugin-files",
-      true,
-      () => {
-        if (this.communityPluginEnablementReviewModal === modal) {
-          this.communityPluginEnablementReviewModal = null;
-        }
-      },
-    );
-    this.communityPluginEnablementReviewModal = modal;
-    modal.open();
   }
 
   hide(): void {

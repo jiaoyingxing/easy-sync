@@ -5,9 +5,22 @@ import {
   buildCanonicalPlanCandidateV2,
   canonicalPlanDigestV2,
   finalizeCanonicalPlanCandidateV2,
+  isAtOrBelowPath,
+  isProtectedFolderDeletePath,
   orderCanonicalPlanItemsV2,
   sealCanonicalPlanV2,
 } from "../src/sync/canonical-plan-v2";
+
+describe("cross-device path identity", () => {
+  it("treats OneDrive case aliases as the same protected subtree", () => {
+    expect(isAtOrBelowPath(".OBSIDIAN/Plugins/Example", ".obsidian/plugins"))
+      .toBe(true);
+    expect(isProtectedFolderDeletePath(".OBSIDIAN/Plugins", ".obsidian"))
+      .toBe(true);
+    expect(isAtOrBelowPath(".obsidian-other", ".obsidian"))
+      .toBe(false);
+  });
+});
 import {
   attachBaseAncestorHashesV2,
   upsertBaseStateEnvelopeV2,
@@ -19,6 +32,7 @@ import type {
   SyncStateEnvelopeV2,
 } from "../src/sync/state-envelope-v2";
 import {
+  planDigest,
   SyncActionType,
   type LocalFileEntry,
   type LocalFolderEntry,
@@ -663,7 +677,7 @@ describe("canonical V2 plan candidate", () => {
     }));
   });
 
-  it("keeps the old cloud path as a decision after every copy is committed", () => {
+  it("treats the old path as deleted after every copy has its own identity", () => {
     const committedCopies = envelope({
       files: [
         { id: "old", name: "old.md" },
@@ -685,9 +699,48 @@ describe("canonical V2 plan candidate", () => {
 
     expect(candidate.items).toEqual([
       expect.objectContaining({
-        type: SyncActionType.Conflict,
+        type: SyncActionType.DeleteRemote,
         path: "old.md",
-        reason: "reason.renameIdentityAmbiguous",
+        reason: "reason.fileDeletedLocally",
+      }),
+    ]);
+  });
+
+  it("does not infer a deleted synced copy from another anchored file", () => {
+    const committedCopies = envelope({
+      files: [
+        { id: "original", name: "report.md", parentId: "original-folder" },
+        { id: "copy", name: "report.md", parentId: "copy-folder" },
+      ],
+      folders: [
+        { id: "original-folder", name: "Original" },
+        { id: "copy-folder", name: "Copy" },
+      ],
+      folderAnchors: [
+        folderAnchor("original-folder", "Original"),
+        folderAnchor("copy-folder", "Copy"),
+      ],
+      fileAnchors: [
+        fileAnchor("original", "Original/report.md"),
+        fileAnchor("copy", "Copy/report.md"),
+      ],
+    });
+
+    const candidate = build({
+      state: committedCopies,
+      localFiles: [localFile("Original/report.md")],
+      localFolders: localFolders("Original"),
+    });
+
+    expect(candidate.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.DeleteRemote,
+        path: "Copy/report.md",
+        reason: "reason.fileDeletedLocally",
+      }),
+      expect.objectContaining({
+        type: SyncActionType.DeleteRemoteFolder,
+        path: "Copy",
       }),
     ]);
   });
@@ -1432,6 +1485,51 @@ describe("canonical V2 plan candidate", () => {
       digest(changedDrive),
       digest(changedParent),
     ]).size).toBe(4);
+
+    const generationDownload: SyncPlanItem = {
+      type: SyncActionType.Download,
+      path: ".obsidian/plugins/calendar/main.js",
+      remote: {
+        path: "community-plugin-content-v1/plugins/aa/generations/1/objects/bb.bin",
+        driveId: "generation-object",
+        parentId: "generation-parent",
+        size: 10,
+        mtime: 0,
+        eTag: "generation-etag",
+        cTag: "generation-ctag",
+        sha256Hash: hashA,
+      },
+      generationRestore: {
+        schemaVersion: 1,
+        pluginId: "calendar",
+        participant: {
+          participantId: "participant-a",
+          incarnation: "incarnation-a",
+        },
+        generation: 1,
+        joinNonce: "join-nonce-a",
+        controlRecordId: "lifecycle-control-id",
+        fenceEpoch: 0,
+        sealRevision: 7,
+        manifestObject: {
+          objectPath: "community-plugin-content-v1/plugins/aa/generations/1/manifests/cc.json",
+          remoteId: "manifest-object",
+          parentId: "manifest-parent",
+          size: 20,
+          eTag: "manifest-etag",
+          cTag: "manifest-ctag",
+          sha256Hash: hashB,
+        },
+      },
+    };
+    const changedGenerationBinding = structuredClone(generationDownload);
+    changedGenerationBinding.generationRestore!.joinNonce = "join-nonce-b";
+    expect(digest([generationDownload])).not.toBe(
+      digest([changedGenerationBinding]),
+    );
+    expect(planDigest([generationDownload])).not.toBe(
+      planDigest([changedGenerationBinding]),
+    );
 
     const reviewedConflict: SyncPlanItem = {
       type: SyncActionType.Conflict,

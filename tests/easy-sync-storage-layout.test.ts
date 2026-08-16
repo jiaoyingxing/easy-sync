@@ -40,6 +40,7 @@ describe("EasySync local storage layout registry", () => {
     expect(isEasySyncSelfSyncFilePath(".obsidian/plugins/easy-sync/data.json")).toBe(false);
     expect(isEasySyncSelfSyncFilePath(".obsidian/plugins/easy-sync/state-v2.json")).toBe(false);
     expect(isEasySyncSelfSyncFilePath(".obsidian/plugins/easy-sync/state-v2/other.js")).toBe(false);
+    expect(isEasySyncSelfSyncFilePath(".OBSIDIAN/PLUGINS/EASY-SYNC/MAIN.JS")).toBe(true);
   });
 
   it("derives all instances from the same registry regardless of config dir or plugin id", () => {

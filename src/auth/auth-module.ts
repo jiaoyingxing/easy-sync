@@ -32,6 +32,13 @@ import {
 import { generateCodeVerifier, generateCodeChallengeSync, generateState } from "./pkce";
 import type { DiagnosticLogger } from "../sync/diagnostic-logger";
 
+class AuthOperationInvalidatedError extends Error {
+  constructor() {
+    super("Authentication operation was invalidated");
+    this.name = "AuthOperationInvalidatedError";
+  }
+}
+
 /** Minimal interface for the Obsidian plugin context used by auth */
 export interface AuthPluginContext {
   /** Obsidian SecretStorage for refresh token persistence */
@@ -75,6 +82,22 @@ export class AuthModule {
   /** Pending OAuth flow state */
   private pending: PendingAuth | null = null;
 
+  /** Monotonic fence for login, refresh, initialize and logout races. */
+  private authGeneration = 0;
+
+  /** Generation that owns the current pending OAuth browser attempt. */
+  private pendingGeneration: number | null = null;
+
+  /** One refresh request per auth generation. */
+  private refreshInFlight: {
+    generation: number;
+    promise: Promise<string>;
+  } | null = null;
+
+  /** Serialize credential/profile persistence so logout cannot be overtaken. */
+  private secretStorageTail: Promise<void> = Promise.resolve();
+  private profileCacheTail: Promise<void> = Promise.resolve();
+
   /** True while initialize() is running its async work (token refresh + profile fetch) */
   private _initializing = false;
 
@@ -103,6 +126,24 @@ export class AuthModule {
     return this.t?.(key, params) ?? fallback;
   }
 
+  private assertGeneration(generation: number): void {
+    if (generation !== this.authGeneration) {
+      throw new AuthOperationInvalidatedError();
+    }
+  }
+
+  private enqueueSecretStorage<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.secretStorageTail.then(operation, operation);
+    this.secretStorageTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private enqueueProfileCache<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.profileCacheTail.then(operation, operation);
+    this.profileCacheTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
   /** Current auth state (no tokens) */
   get authState(): AuthState {
     return { ...this.state };
@@ -115,6 +156,7 @@ export class AuthModule {
     if (Date.now() - this.pending.createdAt > 5 * 60 * 1000) {
       this.diag?.warn("auth", "OAuth pending auth expired after 5 minutes — no callback received");
       this.pending = null;
+      this.pendingGeneration = null;
       this.stopPolling();
       return false;
     }
@@ -190,7 +232,7 @@ export class AuthModule {
     try {
       this.ctx.registerProtocolHandler("easy-sync-auth", (params) => {
         this.handleCallback(params).catch((e) => {
-          this.diag?.error("auth", "OAuth callback error", e);
+          this.diag?.error("auth", "OAuth callback error", authErrorDiagData(e));
         });
       });
       this.diag?.log("auth", "protocol handler registered");
@@ -199,26 +241,38 @@ export class AuthModule {
     }
 
     this._initializing = true;
+    const generation = this.authGeneration;
 
     try {
-      const stored = await this.ctx.secretStorage.get(SS_REFRESH_TOKEN);
+      const stored = await this.getStoredRefreshToken();
+      this.assertGeneration(generation);
       if (stored) {
         // Refresh token exists — try to get a fresh access token
-        await this.refreshAccessToken(stored);
-        this.state.isLoggedIn = true;
+        await this.refreshAccessTokenForGeneration(stored, generation);
+        this.assertGeneration(generation);
         // Fetch user profile (displayName, accountId) for UI display
-        await this.fetchUserProfile();
+        await this.fetchUserProfile(generation, this.accessToken);
+        this.assertGeneration(generation);
         this.diag?.log("auth", "restored auth session from SecretStorage");
       }
     } catch (e) {
-      if (e instanceof AuthError && e.type === AuthErrorType.SecretStorageUnavailable) {
+      if (e instanceof AuthOperationInvalidatedError) {
+        this.diag?.log("auth", "session restore invalidated by a newer auth action");
+      } else if (
+        e instanceof AuthError
+        && e.type === AuthErrorType.SecretStorageUnavailable
+      ) {
         this.diag?.warn("auth", "SecretStorage not available, auth disabled");
       } else {
         this.diag?.warn("auth", "failed to restore auth session", e);
       }
     }
-    this._initializing = false;
-    this.notifyChange();
+    if (generation === this.authGeneration) {
+      this._initializing = false;
+      this.notifyChange();
+    } else {
+      this._initializing = false;
+    }
   }
 
   /** Start the OAuth login flow.
@@ -242,6 +296,7 @@ export class AuthModule {
     // ---- Synchronous block: entire PKCE + URL construction and browser open ----
     // No await is allowed here. Mobile WebViews require window.open() to stay
     // on the same synchronous chain as the user tap.
+    const generation = ++this.authGeneration;
     const codeVerifier = generateCodeVerifier();
     const codeChallenge = generateCodeChallengeSync(codeVerifier);
     const state = generateState();
@@ -267,6 +322,7 @@ export class AuthModule {
       authUrl,
       createdAt: Date.now(),
     };
+    this.pendingGeneration = generation;
 
     // Open the completed URL exactly once. Android WebView can leave a
     // pre-opened about:blank page unchanged without throwing on location
@@ -286,19 +342,27 @@ export class AuthModule {
   private async handleCallback(params: Record<string, string>): Promise<void> {
     const { code, state, error, error_description } = params;
 
-    if (!this.pending) {
+    const pending = this.pending;
+    const generation = this.pendingGeneration;
+    if (!pending || generation === null) {
       this.diag?.warn("auth", "OAuth callback received but no pending auth");
       return;
     }
 
     // Validate state for CSRF protection
-    if (state !== this.pending.state) {
-      this.pending = null;
+    if (state !== pending.state) {
+      if (this.pending === pending) {
+        this.pending = null;
+        this.pendingGeneration = null;
+      }
       throw new AuthError(AuthErrorType.StateMismatch, this.tr("auth.error.stateMismatch", "OAuth state mismatch."));
     }
 
     if (error) {
-      this.pending = null;
+      if (this.pending === pending) {
+        this.pending = null;
+        this.pendingGeneration = null;
+      }
       throw new AuthError(
         AuthErrorType.ProviderError,
         this.tr("auth.error.providerError", `Microsoft error: ${error}`, { details: error_description || error }),
@@ -306,21 +370,31 @@ export class AuthModule {
     }
 
     if (!code) {
-      this.pending = null;
+      if (this.pending === pending) {
+        this.pending = null;
+        this.pendingGeneration = null;
+      }
       throw new AuthError(AuthErrorType.ProviderError, this.tr("auth.error.noCode", "No authorization code received"));
     }
 
     try {
+      this.assertGeneration(generation);
       // Exchange code for tokens
       const tokenResponse = await this.exchangeCodeForTokens(
         code,
-        this.pending.codeVerifier,
+        pending.codeVerifier,
       );
+      this.assertGeneration(generation);
 
       // Store refresh token in SecretStorage
       if (tokenResponse.refresh_token) {
-        await this.ctx.secretStorage.set(SS_REFRESH_TOKEN, tokenResponse.refresh_token);
+        const stored = await this.storeRefreshTokenIfCurrent(
+          tokenResponse.refresh_token,
+          generation,
+        );
+        if (!stored) throw new AuthOperationInvalidatedError();
       }
+      this.assertGeneration(generation);
 
       // Update in-memory state
       this.accessToken = tokenResponse.access_token;
@@ -329,17 +403,21 @@ export class AuthModule {
       this.state.isLoggedIn = true;
 
       // Fetch user profile (displayName, accountId) for UI display
-      await this.fetchUserProfile();
+      await this.fetchUserProfile(generation, tokenResponse.access_token);
+      this.assertGeneration(generation);
 
       this.diag?.log("auth", "OAuth login successful");
       // Fresh auth may have new scope — let listeners reset dependent state
       this.ctx.onFreshLogin?.();
     } finally {
-      this.pending = null;
-      this.stopPolling();
+      if (this.pending === pending) {
+        this.pending = null;
+        this.pendingGeneration = null;
+        this.stopPolling();
+      }
     }
 
-    this.notifyChange();
+    if (generation === this.authGeneration) this.notifyChange();
   }
 
   /** Exchange authorization code for access + refresh tokens */
@@ -360,7 +438,41 @@ export class AuthModule {
 
   /** Refresh an expired access token */
   async refreshAccessToken(refreshToken?: string): Promise<string> {
+    return this.refreshAccessTokenForGeneration(
+      refreshToken,
+      this.authGeneration,
+    );
+  }
+
+  private async refreshAccessTokenForGeneration(
+    refreshToken: string | undefined,
+    generation: number,
+  ): Promise<string> {
+    if (
+      this.refreshInFlight
+      && this.refreshInFlight.generation === generation
+    ) {
+      return this.refreshInFlight.promise;
+    }
+
+    const promise = this.performRefreshAccessToken(refreshToken, generation);
+    this.refreshInFlight = { generation, promise };
+    try {
+      return await promise;
+    } finally {
+      if (this.refreshInFlight?.promise === promise) {
+        this.refreshInFlight = null;
+      }
+    }
+  }
+
+  private async performRefreshAccessToken(
+    refreshToken: string | undefined,
+    generation: number,
+  ): Promise<string> {
+    this.assertGeneration(generation);
     const rt = refreshToken ?? (await this.getStoredRefreshToken());
+    this.assertGeneration(generation);
     if (!rt) {
       throw new AuthError(AuthErrorType.NoRefreshToken, this.tr("auth.error.noRefreshToken", "No refresh token available"));
     }
@@ -373,11 +485,17 @@ export class AuthModule {
 
     try {
       const tokenResponse = await this.tokenRequest(body);
+      this.assertGeneration(generation);
 
       // Update stored refresh token if a new one was returned
       if (tokenResponse.refresh_token) {
-        await this.ctx.secretStorage.set(SS_REFRESH_TOKEN, tokenResponse.refresh_token);
+        const stored = await this.storeRefreshTokenIfCurrent(
+          tokenResponse.refresh_token,
+          generation,
+        );
+        if (!stored) throw new AuthOperationInvalidatedError();
       }
+      this.assertGeneration(generation);
 
       this.accessToken = tokenResponse.access_token;
       this.state.accessTokenExpiry =
@@ -385,9 +503,8 @@ export class AuthModule {
       this.state.isLoggedIn = true;
 
       return this.accessToken;
-    } catch {
-      this.state.isLoggedIn = false;
-      this.notifyChange();
+    } catch (error) {
+      if (error instanceof AuthOperationInvalidatedError) throw error;
       throw new AuthError(
         AuthErrorType.RefreshFailed,
         this.tr("auth.error.refreshFailed", "Token refresh failed."),
@@ -416,26 +533,50 @@ export class AuthModule {
     try {
       return await this.refreshAccessToken();
     } catch (e) {
+      if (e instanceof AuthOperationInvalidatedError) {
+        throw new AuthError(
+          AuthErrorType.NoRefreshToken,
+          this.tr("auth.error.notLoggedIn", "Not logged in"),
+        );
+      }
       this.diag?.warn("auth", `token refresh failed, transitioning to logged-out: ${e instanceof Error ? e.message : String(e)}`);
       await this.logout();
       throw e;
     }
   }
 
-  /** Log out: clear tokens from SecretStorage and memory */
-  async logout(): Promise<void> {
+  /** Log out only after SecretStorage confirms the refresh token is absent. */
+  async logout(): Promise<boolean> {
+    const generation = ++this.authGeneration;
+    this.pending = null;
+    this.pendingGeneration = null;
     this.stopPolling();
-    try {
-      await this.ctx.secretStorage.remove(SS_REFRESH_TOKEN);
-    } catch {
-      // Ignore removal errors
+    const refreshTokenRemoved = await this.enqueueSecretStorage(async () => {
+      try {
+        await this.ctx.secretStorage.remove(SS_REFRESH_TOKEN);
+        return (await this.ctx.secretStorage.get(SS_REFRESH_TOKEN)) === null;
+      } catch (error) {
+        this.diag?.error("auth", "failed to verify refresh token removal", error);
+        return false;
+      }
+    });
+    if (generation !== this.authGeneration) return false;
+    if (!refreshTokenRemoved) {
+      this.diag?.warn("auth", "logout incomplete — refresh token removal was not confirmed");
+      this.notifyChange();
+      return false;
     }
+
     // Clear cached user profile so next login fetches fresh data
     try {
-      await this.ctx.profileCache?.clear();
+      await this.enqueueProfileCache(async () => {
+        if (generation !== this.authGeneration) return;
+        await this.ctx.profileCache?.clear();
+      });
     } catch {
       // Ignore cache clear errors
     }
+    if (generation !== this.authGeneration) return false;
     this.accessToken = "";
     this.state = {
       accessTokenExpiry: 0,
@@ -445,6 +586,7 @@ export class AuthModule {
     };
     this.notifyChange();
     this.diag?.log("auth", "logged out");
+    return true;
   }
 
   /** Make a POST request to the Microsoft token endpoint */
@@ -458,6 +600,10 @@ export class AuthModule {
           "Content-Type": "application/x-www-form-urlencoded",
         },
         body: body.toString(),
+        // OAuth failures are structured JSON responses. Keep them available
+        // for redacted provider diagnostics instead of letting requestUrl
+        // convert every HTTP 400+ response into an opaque network exception.
+        throw: false,
       });
     } catch (e) {
       throw new AuthError(
@@ -467,10 +613,15 @@ export class AuthModule {
     }
 
     if (response.status !== 200) {
-      const errorData = response.json as Record<string, unknown> | undefined;
+      const errorData = getOAuthErrorData(response.json);
+      const details = formatOAuthProviderDetails(errorData);
+      this.diag?.error("auth", "token endpoint rejected OAuth request", {
+        status: response.status,
+        ...errorData,
+      });
       throw new AuthError(
         AuthErrorType.ProviderError,
-        this.tr("auth.error.providerError", `Token endpoint returned ${response.status}`, { details: String(errorData?.error || "unknown") }),
+        this.tr("auth.error.providerError", `Token endpoint returned ${response.status}: ${details}`, { details }),
       );
     }
 
@@ -480,6 +631,7 @@ export class AuthModule {
   /** Get the stored refresh token from SecretStorage */
   private async getStoredRefreshToken(): Promise<string | null> {
     try {
+      await this.secretStorageTail;
       return await this.ctx.secretStorage.get(SS_REFRESH_TOKEN);
     } catch {
       throw new AuthError(
@@ -489,11 +641,28 @@ export class AuthModule {
     }
   }
 
+  private storeRefreshTokenIfCurrent(
+    refreshToken: string,
+    generation: number,
+  ): Promise<boolean> {
+    return this.enqueueSecretStorage(async () => {
+      if (generation !== this.authGeneration) return false;
+      await this.ctx.secretStorage.set(SS_REFRESH_TOKEN, refreshToken);
+      return generation === this.authGeneration;
+    });
+  }
+
   /** Fetch user profile from Microsoft Graph to populate displayName and accountId.
    *  Cached profile data is display-only: account authorization must always be
    *  anchored to /me for the current access token. */
-  private async fetchUserProfile(): Promise<void> {
-    const cached = await this.ctx.profileCache?.get();
+  private async fetchUserProfile(
+    generation: number,
+    accessToken: string,
+  ): Promise<void> {
+    const cached = await this.enqueueProfileCache(
+      async () => this.ctx.profileCache?.get(),
+    );
+    this.assertGeneration(generation);
     if (cached) {
       this.state.displayName = cached.displayName;
       this.diag?.log("auth", `profile display cache hit: ${cached.displayName}`);
@@ -506,9 +675,10 @@ export class AuthModule {
         url: "https://graph.microsoft.com/v1.0/me?$select=displayName,id",
         method: "GET",
         headers: {
-          Authorization: `Bearer ${this.accessToken}`,
+          Authorization: `Bearer ${accessToken}`,
         },
       });
+      this.assertGeneration(generation);
 
       if (response.status === 200) {
         const data = response.json as { displayName?: string; id?: string };
@@ -525,13 +695,19 @@ export class AuthModule {
             || cached.accountId !== this.state.accountId
           )
         ) {
-          await this.ctx.profileCache?.set({
+          const profile = {
             displayName: this.state.displayName,
             accountId: this.state.accountId,
+          };
+          await this.enqueueProfileCache(async () => {
+            if (generation !== this.authGeneration) return;
+            await this.ctx.profileCache?.set(profile);
           });
+          this.assertGeneration(generation);
         }
       }
     } catch (e) {
+      if (e instanceof AuthOperationInvalidatedError) throw e;
       // The refreshed token remains available, but sync authorization stays
       // closed because accountId is empty until /me succeeds.
       this.diag?.warn("auth", "failed to verify current token account", e);
@@ -543,4 +719,46 @@ export class AuthModule {
       this.onChange();
     }
   }
+}
+
+/** Keep provider diagnostics useful without ever retaining tokens or codes. */
+function getOAuthErrorData(value: unknown): {
+  error?: string;
+  errorDescription?: string;
+  traceId?: string;
+  correlationId?: string;
+} {
+  if (!value || typeof value !== "object") return {};
+  const record = value as Record<string, unknown>;
+  const text = (candidate: unknown, max = 320): string | undefined => {
+    if (typeof candidate !== "string" || candidate.length === 0) return undefined;
+    return candidate.replace(/[\r\n]+/g, " ").slice(0, max);
+  };
+  return {
+    ...(text(record.error) ? { error: text(record.error) } : {}),
+    ...(text(record.error_description) ? { errorDescription: text(record.error_description) } : {}),
+    ...(text(record.trace_id, 96) ? { traceId: text(record.trace_id, 96) } : {}),
+    ...(text(record.correlation_id, 96) ? { correlationId: text(record.correlation_id, 96) } : {}),
+  };
+}
+
+function formatOAuthProviderDetails(data: ReturnType<typeof getOAuthErrorData>): string {
+  return [data.error, data.errorDescription].filter(Boolean).join(": ") || "unknown";
+}
+
+function authErrorDiagData(error: unknown): Record<string, unknown> {
+  if (error instanceof AuthError) {
+    return {
+      name: error.name,
+      type: error.type,
+      message: error.message.replace(/[\r\n]+/g, " ").slice(0, 500),
+    };
+  }
+  if (error instanceof Error) {
+    return {
+      name: error.name,
+      message: error.message.replace(/[\r\n]+/g, " ").slice(0, 500),
+    };
+  }
+  return { message: String(error).replace(/[\r\n]+/g, " ").slice(0, 500) };
 }

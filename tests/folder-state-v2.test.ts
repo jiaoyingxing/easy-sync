@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { DriveItem } from "../src/onedrive/types";
 import { planFolderStateV2 } from "../src/sync/folder-state-v2";
-import { buildEmptyFolderResolutionSnapshotV1 } from "../src/sync/empty-folder-resolution";
+import {
+  acceptReviewedFolderSubtreeRestoreV2,
+  buildEmptyFolderResolutionSnapshotV1,
+  buildFolderLocationResolutionSnapshotV1,
+  buildFolderSubtreeReviewSnapshotV1,
+} from "../src/sync/empty-folder-resolution";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
 import {
   shouldPauseCanonicalPlanForReviewV2,
@@ -202,6 +207,63 @@ describe("V2 folder anchors and pure planner", () => {
     expect(report.reviewImpact).toEqual({ actions: 1, files: 0, folders: 1, bytes: 0 });
   });
 
+  it("plans the exact remote folder move before reconciling a changed remote child", () => {
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Archive" }],
+        files: [{
+          id: "file-a",
+          name: "a.md",
+          parentId: "notes",
+          hash: "b".repeat(64),
+        }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+        fileAnchors: [fileAnchor("file-a", "Notes/a.md")],
+      }),
+      localFiles: [localFile("Notes/a.md")],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "move-local",
+      sourcePath: "Notes",
+      targetPath: "Archive",
+      remoteId: "notes",
+    })]);
+    expect(report.counts).toMatchObject({
+      moveLocal: 1,
+      conflicts: 0,
+    });
+  });
+
+  it("does not let a remote folder move overwrite a concurrent local child edit", () => {
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Archive" }],
+        files: [{
+          id: "file-a",
+          name: "a.md",
+          parentId: "notes",
+          hash: "b".repeat(64),
+        }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+        fileAnchors: [fileAnchor("file-a", "Notes/a.md")],
+      }),
+      localFiles: [localFile("Notes/a.md", "c".repeat(64))],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "conflict",
+      path: "Notes",
+      reason: "local-subtree-changed",
+      remoteId: "notes",
+    })]);
+    expect(report.counts.moveLocal).toBe(0);
+  });
+
   it("infers one remote move only from a unique unchanged anchored file subtree", () => {
     const report = planFolderStateV2({
       envelope: envelope({
@@ -245,7 +307,71 @@ describe("V2 folder anchors and pure planner", () => {
     })]);
   });
 
-  it("groups a folder move with a concurrent child edit instead of moving the subtree", () => {
+  it("projects one exact root-location choice when both sides moved", () => {
+    const current = envelope({
+      folders: [{ id: "notes", name: "Cloud" }],
+      files: [{ id: "file-a", name: "a.md", parentId: "notes" }],
+      folderAnchors: [folderAnchor("notes", "Notes")],
+      fileAnchors: [fileAnchor("file-a", "Notes/a.md")],
+    });
+
+    const reviewed = buildFolderLocationResolutionSnapshotV1("Notes", {
+      envelope: current,
+      localFiles: [localFile("Archive/a.md")],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    });
+
+    expect(reviewed).toMatchObject({
+      version: 1,
+      path: "Notes",
+      remoteId: "notes",
+      remoteETag: "etag-notes",
+      remoteSourceParentId: scope.filesRootId,
+      localTargetParentId: scope.filesRootId,
+      localTargetParentPath: "",
+      localPath: "Archive",
+      remotePath: "Cloud",
+    });
+  });
+
+  it("keeps occupied targets, scope crossings and incomplete scans out of root choice", () => {
+    const current = envelope({
+      folders: [
+        { id: "notes", name: "Cloud" },
+        { id: "occupied", name: "Archive" },
+      ],
+      files: [{ id: "file-a", name: "a.md", parentId: "notes" }],
+      folderAnchors: [folderAnchor("notes", "Notes")],
+      fileAnchors: [fileAnchor("file-a", "Notes/a.md")],
+    });
+    const facts = {
+      envelope: current,
+      localFiles: [localFile("Archive/a.md")],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    };
+
+    expect(buildFolderLocationResolutionSnapshotV1("Notes", facts)).toBeNull();
+    const unoccupied = envelope({
+      folders: [{ id: "notes", name: "Cloud" }],
+      files: [{ id: "file-a", name: "a.md", parentId: "notes" }],
+      folderAnchors: [folderAnchor("notes", "Notes")],
+      fileAnchors: [fileAnchor("file-a", "Notes/a.md")],
+    });
+    expect(buildFolderLocationResolutionSnapshotV1("Notes", {
+      ...facts,
+      envelope: unoccupied,
+      localFolderScanComplete: false,
+    })).toBeNull();
+    expect(buildFolderLocationResolutionSnapshotV1("Notes", {
+      ...facts,
+      envelope: unoccupied,
+      includeFolderPath: (path) => path !== "Archive",
+    })).toBeNull();
+  });
+
+  it("plans an exact folder move before a changed carried child", () => {
     const current = envelope({
       folders: [{ id: "notes", name: "Notes" }],
       files: [{ id: "file-a", name: "a.md", parentId: "notes" }],
@@ -268,11 +394,54 @@ describe("V2 folder anchors and pure planner", () => {
     });
 
     expect(report.items).toEqual([expect.objectContaining({
-      type: "conflict",
-      path: "Notes",
-      reason: "local-subtree-changed",
+      type: "move-remote",
+      path: "Archive",
+      sourcePath: "Notes",
+      targetPath: "Archive",
       remoteId: "notes",
     })]);
+    expect(report.counts).toMatchObject({
+      moveRemote: 1,
+      conflicts: 0,
+    });
+  });
+
+  it("plans an exact folder move before reconciling a changed carried child set", () => {
+    const current = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      files: [{ id: "file-a", name: "a.md", parentId: "notes" }],
+      folderAnchors: [folderAnchor("notes", "Notes")],
+      fileAnchors: [fileAnchor("file-a", "Notes/a.md")],
+    });
+    const report = planFolderStateV2({
+      envelope: current,
+      localFiles: [
+        localFile("Archive/a.md"),
+        localFile("Archive/new.md"),
+      ],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+      localMoveHints: [{
+        version: 1,
+        scope,
+        remoteId: "notes",
+        fromPath: "Notes",
+        toPath: "Archive",
+        observedAt: 10,
+      }],
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "move-remote",
+      path: "Archive",
+      sourcePath: "Notes",
+      targetPath: "Archive",
+      remoteId: "notes",
+    })]);
+    expect(report.counts).toMatchObject({
+      moveRemote: 1,
+      conflicts: 0,
+    });
   });
 
   it("allows an explicitly renamed folder to receive uniquely anchored unchanged files", () => {
@@ -349,7 +518,7 @@ describe("V2 folder anchors and pure planner", () => {
     });
   });
 
-  it("still blocks a renamed folder when an incoming anchored file changed content", () => {
+  it("keeps an exact folder move independent from a changed incoming file", () => {
     const current = envelope({
       folders: [{ id: "text", name: "text" }],
       files: [{ id: "report", name: "report.md", parentId: scope.filesRootId }],
@@ -372,14 +541,14 @@ describe("V2 folder anchors and pure planner", () => {
     });
 
     expect(report.items).toEqual([expect.objectContaining({
-      type: "conflict",
-      path: "text",
-      reason: "local-subtree-changed",
+      type: "move-remote",
+      sourcePath: "text",
+      targetPath: "text-renamed",
       remoteId: "text",
     })]);
   });
 
-  it("still blocks a renamed folder when the incoming file is a copy", () => {
+  it("keeps an exact folder move independent from a copied descendant", () => {
     const current = envelope({
       folders: [{ id: "text", name: "text" }],
       files: [{ id: "report", name: "report.md", parentId: scope.filesRootId }],
@@ -405,11 +574,47 @@ describe("V2 folder anchors and pure planner", () => {
     });
 
     expect(report.items).toEqual([expect.objectContaining({
-      type: "conflict",
-      path: "text",
-      reason: "local-subtree-changed",
+      type: "move-remote",
+      sourcePath: "text",
+      targetPath: "text-renamed",
       remoteId: "text",
     })]);
+  });
+
+  it("does not infer a deleted synced copy into another anchored folder", () => {
+    const current = envelope({
+      folders: [
+        { id: "notes", name: "Notes" },
+        { id: "notes-copy", name: "Notes - Copy" },
+      ],
+      files: [
+        { id: "report", name: "report.md", parentId: "notes" },
+        { id: "report-copy", name: "report.md", parentId: "notes-copy" },
+      ],
+      folderAnchors: [
+        folderAnchor("notes", "Notes"),
+        folderAnchor("notes-copy", "Notes - Copy"),
+      ],
+      fileAnchors: [
+        fileAnchor("report", "Notes/report.md"),
+        fileAnchor("report-copy", "Notes - Copy/report.md"),
+      ],
+    });
+    const report = planFolderStateV2({
+      envelope: current,
+      localFiles: [localFile("Notes/report.md")],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "delete-remote",
+      path: "Notes - Copy",
+      remoteId: "notes-copy",
+    })]);
+    expect(report.items).not.toContainEqual(expect.objectContaining({
+      remoteId: "notes",
+    }));
   });
 
   it("fails closed on target occupancy, scope crossing and missing destination parents", () => {
@@ -499,6 +704,156 @@ describe("V2 folder anchors and pure planner", () => {
       parentRemoteId: scope.filesRootId,
       candidatePaths: ["Archive"],
     });
+  });
+
+  it("projects nested missing-local folders as one complete remote subtree review", () => {
+    const current = envelope({
+      folders: [
+        { id: "issues", name: "Issues" },
+        { id: "cad", name: "CAD", parentId: "issues" },
+      ],
+      files: [{
+        id: "drawing",
+        name: "drawing.md",
+        parentId: "cad",
+        hash: "b".repeat(64),
+        size: 42,
+      }],
+      folderAnchors: [
+        folderAnchor("issues", "Issues"),
+        folderAnchor("cad", "Issues/CAD", "issues"),
+      ],
+    });
+
+    const fromRoot = buildFolderSubtreeReviewSnapshotV1("Issues", {
+      envelope: current,
+      localFiles: [],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    });
+    const fromChild = buildFolderSubtreeReviewSnapshotV1("Issues/CAD", {
+      envelope: current,
+      localFiles: [],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    });
+
+    expect(fromRoot).toMatchObject({
+      version: 1,
+      path: "Issues",
+      issuePaths: ["Issues", "Issues/CAD"],
+      members: [
+        { path: "Issues", kind: "folder", remoteId: "issues" },
+        { path: "Issues/CAD", kind: "folder", remoteId: "cad" },
+        {
+          path: "Issues/CAD/drawing.md",
+          kind: "file",
+          remoteId: "drawing",
+          size: 42,
+          contentHash: "b".repeat(64),
+        },
+      ],
+    });
+    expect(fromChild).toEqual(fromRoot);
+  });
+
+  it("retires only the reviewed subtree anchors so ordinary planning restores cloud truth", () => {
+    const current = envelope({
+      folders: [
+        { id: "issues", name: "Issues" },
+        { id: "cad", name: "CAD", parentId: "issues" },
+        { id: "archive", name: "Archive" },
+      ],
+      files: [{
+        id: "drawing",
+        name: "drawing.md",
+        parentId: "cad",
+        hash: "b".repeat(64),
+        size: 42,
+      }],
+      folderAnchors: [
+        folderAnchor("issues", "Issues"),
+        folderAnchor("cad", "Issues/CAD", "issues"),
+        folderAnchor("archive", "Archive"),
+      ],
+      fileAnchors: [
+        fileAnchor("drawing", "Issues/CAD/drawing.md", "b".repeat(64), 42),
+      ],
+    });
+    const reviewed = buildFolderSubtreeReviewSnapshotV1("Issues", {
+      envelope: current,
+      localFiles: [],
+      localFolders: localFolders("Archive", "Other"),
+      localFolderScanComplete: true,
+    });
+    expect(reviewed).not.toBeNull();
+
+    const accepted = acceptReviewedFolderSubtreeRestoreV2(
+      current,
+      reviewed!,
+      2,
+    );
+    expect(accepted).toMatchObject({
+      status: "accepted",
+      retiredFileAnchors: 1,
+      retiredFolderAnchors: 2,
+    });
+    if (accepted.status !== "accepted") return;
+    expect(Object.values(accepted.envelope.anchors.byAnchorId)).toEqual([]);
+    expect(Object.values(accepted.envelope.folderAnchors!.byAnchorId))
+      .toEqual([expect.objectContaining({ lastPath: "Archive" })]);
+
+    const plan = planFolderStateV2({
+      envelope: accepted.envelope,
+      localFiles: [],
+      localFolders: localFolders("Archive", "Other"),
+      localFolderScanComplete: true,
+    });
+    expect(plan).toMatchObject({
+      status: "planned",
+      items: expect.arrayContaining([
+        expect.objectContaining({ type: "create-local", path: "Issues" }),
+        expect.objectContaining({ type: "create-local", path: "Issues/CAD" }),
+      ]),
+    });
+  });
+
+  it("refuses subtree review when local or scope facts are incomplete", () => {
+    const current = envelope({
+      folders: [
+        { id: "issues", name: "Issues" },
+        { id: "cad", name: "CAD", parentId: "issues" },
+      ],
+      files: [{ id: "drawing", name: "drawing.md", parentId: "cad" }],
+      folderAnchors: [
+        folderAnchor("issues", "Issues"),
+        folderAnchor("cad", "Issues/CAD", "issues"),
+      ],
+    });
+    const facts = {
+      envelope: current,
+      localFiles: [] as LocalFileEntry[],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    };
+
+    expect(buildFolderSubtreeReviewSnapshotV1("Issues", {
+      ...facts,
+      localFolderScanComplete: false,
+    })).toBeNull();
+    expect(buildFolderSubtreeReviewSnapshotV1("Issues", {
+      ...facts,
+      localFiles: [{
+        path: "Issues/CAD/local.md",
+        size: 1,
+        mtime: 1,
+        hash: hashA,
+      }],
+    })).toBeNull();
+    expect(buildFolderSubtreeReviewSnapshotV1("Issues", {
+      ...facts,
+      includeFilePath: (path) => path !== "Issues/CAD/drawing.md",
+    })).toBeNull();
   });
 
   it("keeps incomplete, non-empty, nested-remote and moved-remote cases fail closed", () => {

@@ -92,6 +92,8 @@ describe("shared V3 sync protocol", () => {
       predecessor: old,
       expectedBinding: v2Binding(),
       allowCreate: true,
+      observedCurrent: await harness.transport.read(),
+      observeAfterCreateFailure: () => harness.transport.read(),
     });
 
     expect(result).toMatchObject({
@@ -115,6 +117,7 @@ describe("shared V3 sync protocol", () => {
       contentSha256: await digest(old.content),
     });
     expect(harness.readById).toHaveBeenCalledWith("protocol-v3-id");
+    expect(harness.read).toHaveBeenCalledTimes(1);
   });
 
   it("adopts an exact existing record without overwriting", async () => {
@@ -123,6 +126,8 @@ describe("shared V3 sync protocol", () => {
       predecessor: predecessor(),
       expectedBinding: v2Binding(),
       allowCreate: true,
+      observedCurrent: await seed.transport.read(),
+      observeAfterCreateFailure: () => seed.transport.read(),
     });
     expect(created.status).toBe("ready");
     const harness = transportWith(seed.current());
@@ -131,8 +136,11 @@ describe("shared V3 sync protocol", () => {
       predecessor: predecessor(),
       expectedBinding: v2Binding(),
       allowCreate: false,
+      observedCurrent: await harness.transport.read(),
+      observeAfterCreateFailure: () => harness.transport.read(),
     })).resolves.toMatchObject({ status: "ready", source: "existing" });
     expect(harness.createOnly).not.toHaveBeenCalled();
+    expect(harness.read).toHaveBeenCalledTimes(1);
   });
 
   it("recreates the exact protocol from an already-bound V3 authority", async () => {
@@ -141,6 +149,8 @@ describe("shared V3 sync protocol", () => {
       predecessor: predecessor(),
       expectedBinding: v2Binding(),
       allowCreate: true,
+      observedCurrent: await first.transport.read(),
+      observeAfterCreateFailure: () => first.transport.read(),
     });
     if (created.status !== "ready") throw new Error("fixture creation failed");
     const target = transportWith(null);
@@ -148,6 +158,8 @@ describe("shared V3 sync protocol", () => {
     const recreated = await ensureSharedSyncProtocolV3(target.transport, {
       expectedBinding: created.binding,
       allowCreate: true,
+      observedCurrent: await target.transport.read(),
+      observeAfterCreateFailure: () => target.transport.read(),
     });
 
     expect(recreated).toMatchObject({
@@ -168,6 +180,8 @@ describe("shared V3 sync protocol", () => {
       predecessor: predecessor(),
       expectedBinding: v2Binding(),
       allowCreate: true,
+      observedCurrent: await seed.transport.read(),
+      observeAfterCreateFailure: () => seed.transport.read(),
     });
     const winner = seed.current();
     const read = vi.fn()
@@ -183,7 +197,10 @@ describe("shared V3 sync protocol", () => {
       predecessor: predecessor(),
       expectedBinding: v2Binding(),
       allowCreate: true,
+      observedCurrent: await transport.read(),
+      observeAfterCreateFailure: () => transport.read(),
     })).resolves.toMatchObject({ status: "ready", source: "create-race" });
+    expect(read).toHaveBeenCalledTimes(2);
   });
 
   it("fails closed when create read-back changes the immutable content", async () => {
@@ -204,6 +221,8 @@ describe("shared V3 sync protocol", () => {
       predecessor: predecessor(),
       expectedBinding: v2Binding(),
       allowCreate: true,
+      observedCurrent: await transport.read(),
+      observeAfterCreateFailure: () => transport.read(),
     })).resolves.toEqual({ status: "blocked", reason: "readback-mismatch" });
   });
 
@@ -211,6 +230,8 @@ describe("shared V3 sync protocol", () => {
     const harness = transportWith(null);
     await expect(ensureSharedSyncProtocolV3(harness.transport, {
       allowCreate: true,
+      observedCurrent: await harness.transport.read(),
+      observeAfterCreateFailure: () => harness.transport.read(),
     })).resolves.toEqual({
       status: "blocked",
       reason: "predecessor-required",
@@ -227,6 +248,8 @@ describe("shared V3 sync protocol", () => {
       },
       expectedBinding: v2Binding(),
       allowCreate: true,
+      observedCurrent: await harness.transport.read(),
+      observeAfterCreateFailure: () => harness.transport.read(),
     })).resolves.toEqual({
       status: "blocked",
       reason: "predecessor-mismatch",
@@ -240,27 +263,35 @@ describe("shared V3 sync protocol", () => {
       predecessor: predecessor(),
       expectedBinding: v2Binding(),
       allowCreate: true,
+      observedCurrent: await first.transport.read(),
+      observeAfterCreateFailure: () => first.transport.read(),
     });
     const conflicting = JSON.parse(first.current()!.content);
     conflicting.migrationGeneration = generationB;
-    await expect(ensureSharedSyncProtocolV3(transportWith({
+    const generationConflict = transportWith({
       ...first.current()!,
       content: JSON.stringify(conflicting),
-    }).transport, {
+    });
+    await expect(ensureSharedSyncProtocolV3(generationConflict.transport, {
       predecessor: predecessor(),
       expectedBinding: v2Binding(),
       allowCreate: false,
+      observedCurrent: await generationConflict.transport.read(),
+      observeAfterCreateFailure: () => generationConflict.transport.read(),
     })).resolves.toEqual({ status: "blocked", reason: "generation-mismatch" });
 
     conflicting.migrationGeneration = generationA;
     conflicting.scope = { filesRootId: "must-not-exist" };
-    await expect(ensureSharedSyncProtocolV3(transportWith({
+    const nonCanonical = transportWith({
       ...first.current()!,
       content: JSON.stringify(conflicting),
-    }).transport, {
+    });
+    await expect(ensureSharedSyncProtocolV3(nonCanonical.transport, {
       predecessor: predecessor(),
       expectedBinding: v2Binding(),
       allowCreate: false,
+      observedCurrent: await nonCanonical.transport.read(),
+      observeAfterCreateFailure: () => nonCanonical.transport.read(),
     })).resolves.toEqual({ status: "blocked", reason: "invalid-current" });
   });
 
@@ -270,6 +301,8 @@ describe("shared V3 sync protocol", () => {
       predecessor: predecessor(),
       expectedBinding: v2Binding(),
       allowCreate: true,
+      observedCurrent: await harness.transport.read(),
+      observeAfterCreateFailure: () => harness.transport.read(),
     });
     if (result.status !== "ready") throw new Error("fixture creation failed");
     const v3 = result.binding;
@@ -290,6 +323,8 @@ describe("shared V3 sync protocol", () => {
       predecessor: predecessor(),
       expectedBinding: v2Binding(),
       allowCreate: true,
+      observedCurrent: await first.transport.read(),
+      observeAfterCreateFailure: () => first.transport.read(),
     });
     if (created.status !== "ready") throw new Error("fixture creation failed");
     const moved = transportWith({
@@ -301,6 +336,8 @@ describe("shared V3 sync protocol", () => {
     const adopted = await ensureSharedSyncProtocolV3(moved.transport, {
       expectedBinding: created.binding,
       allowCreate: false,
+      observedCurrent: await moved.transport.read(),
+      observeAfterCreateFailure: () => moved.transport.read(),
     });
     expect(adopted).toMatchObject({
       status: "ready",

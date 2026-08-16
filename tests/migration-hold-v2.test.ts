@@ -34,6 +34,19 @@ const protocolBinding = {
   recordId: "protocol-id",
   recordETag: "protocol-etag",
 };
+const protocolBindingV3 = {
+  schemaVersion: 1 as const,
+  protocolVersion: 3 as const,
+  migrationGeneration: protocolBinding.migrationGeneration,
+  predecessorProtocolVersion: 2 as const,
+  predecessorContentSha256: "b".repeat(64),
+  predecessorConfirmedAllDevicesUpdatedAt:
+    protocolBinding.confirmedAllDevicesUpdatedAt,
+  createdAt: 1950,
+  contentSha256: "c".repeat(64),
+  recordId: "protocol-v3-id",
+  recordETag: "protocol-v3-etag",
+};
 
 function makeAdapter() {
   const files = new Map<string, string>();
@@ -220,6 +233,162 @@ describe("MigrationHoldV2Store", () => {
     expect((await store.load())?.reviewKind).toBe("v2-cloud-join");
   });
 
+  it("checkpoints the exact V2 binding on a pending first-sync hold and keeps an exact repeat idempotent", async () => {
+    const { adapter, spies } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    const pending = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      reviewKind: "v2-first-sync",
+      now: 2000,
+    });
+
+    const checkpoint = await store.checkpointPendingProtocolBinding(
+      pending.revision,
+      pending.canonicalIdentity,
+      protocolBinding,
+      2100,
+    );
+
+    expect(checkpoint).toMatchObject({
+      phase: "pending",
+      reviewKind: "v2-first-sync",
+      revision: pending.revision + 1,
+      createdAt: pending.createdAt,
+      updatedAt: 2100,
+      protocolBinding,
+    });
+    expect(await store.load()).toEqual(checkpoint);
+    const writesAfterCheckpoint = spies.write.mock.calls.length;
+
+    const repeated = await store.checkpointPendingProtocolBinding(
+      checkpoint!.revision,
+      checkpoint!.canonicalIdentity,
+      protocolBinding,
+      2200,
+    );
+
+    expect(repeated).toEqual(checkpoint);
+    expect(repeated?.revision).toBe(pending.revision + 1);
+    expect(spies.write).toHaveBeenCalledTimes(writesAfterCheckpoint);
+  });
+
+  it("rejects a stale checkpoint revision and a different binding without changing the pending hold", async () => {
+    const { adapter, spies } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    const pending = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      reviewKind: "v2-first-sync",
+      now: 2000,
+    });
+
+    await expect(store.checkpointPendingProtocolBinding(
+      pending.revision - 1,
+      pending.canonicalIdentity,
+      protocolBinding,
+      2050,
+    )).resolves.toBeNull();
+    const checkpoint = await store.checkpointPendingProtocolBinding(
+      pending.revision,
+      pending.canonicalIdentity,
+      protocolBinding,
+      2100,
+    );
+    const writesAfterCheckpoint = spies.write.mock.calls.length;
+
+    await expect(store.checkpointPendingProtocolBinding(
+      checkpoint!.revision,
+      checkpoint!.canonicalIdentity,
+      {
+        ...protocolBinding,
+        recordETag: "different-protocol-etag",
+      },
+      2200,
+    )).resolves.toBeNull();
+    expect(await store.load()).toEqual(checkpoint);
+    expect(spies.write).toHaveBeenCalledTimes(writesAfterCheckpoint);
+  });
+
+  it("rejects a pending protocol checkpoint outside a first-sync V2 transaction", async () => {
+    const { adapter } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    const cloudJoin = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      reviewKind: "v2-cloud-join",
+      now: 2000,
+    });
+
+    await expect(store.checkpointPendingProtocolBinding(
+      cloudJoin.revision,
+      cloudJoin.canonicalIdentity,
+      protocolBinding,
+      2100,
+    )).resolves.toBeNull();
+    expect(await store.load()).toEqual(cloudJoin);
+
+    const firstSync = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      reviewKind: "v2-first-sync",
+      now: 2200,
+    });
+    await expect(store.checkpointPendingProtocolBinding(
+      firstSync.revision,
+      firstSync.canonicalIdentity,
+      protocolBindingV3 as never,
+      2300,
+    )).resolves.toBeNull();
+    expect(await store.load()).toEqual(firstSync);
+  });
+
+  it.each([
+    [
+      "a non-first-sync review kind",
+      { reviewKind: "v2-cloud-join", protocolBinding },
+    ],
+    [
+      "a V3 checkpoint binding",
+      { reviewKind: "v2-first-sync", protocolBinding: protocolBindingV3 },
+    ],
+  ] as const)("rejects a persisted pending hold with %s", async (_label, patch) => {
+    const { adapter, files } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    const pending = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      reviewKind: "v2-first-sync",
+      now: 2000,
+    });
+    files.set(paths.committed, JSON.stringify({
+      ...pending,
+      ...patch,
+    }));
+
+    await expect(store.load()).rejects.toThrow();
+  });
+
   it("does not create a new revision for the same semantic candidate", async () => {
     const { adapter, spies } = makeAdapter();
     const store = new MigrationHoldV2Store(adapter, paths);
@@ -326,7 +495,7 @@ describe("MigrationHoldV2Store", () => {
     });
   });
 
-  it("publishes a complete enablement batch in one hold revision", async () => {
+  it("retires a legacy enablement carrier without changing the review", async () => {
     const { adapter } = makeAdapter();
     const store = new MigrationHoldV2Store(adapter, paths);
     const carrier: CommunityPluginEnablementMigrationCarrierV2 = {
@@ -354,35 +523,17 @@ describe("MigrationHoldV2Store", () => {
       communityPluginEnablement: carrier,
       now: 2000,
     });
-    const resolutions = carrier.pending.map((item) => ({
-      ...item,
-      enabled: item.pluginId === "calendar",
-    }));
-
-    await expect(store.resolveCommunityPluginEnablementDecisions(
-      pending.revision,
-      pending.canonicalIdentity,
-      resolutions.slice(0, 1),
-    )).resolves.toBeNull();
-    const resolved = await store.resolveCommunityPluginEnablementDecisions(
-      pending.revision,
-      pending.canonicalIdentity,
-      resolutions,
-      2100,
-    );
-    expect(resolved).toMatchObject({
+    const retired = await store.retireCommunityPluginEnablementCarrier(2100);
+    expect(retired).toMatchObject({
       revision: pending.revision + 1,
-      communityPluginEnablement: {
-        pending: [],
-        resolved: [
-          { pluginId: "calendar", resolvedEnabled: true },
-          { pluginId: "quickadd", resolvedEnabled: false },
-        ],
-      },
+      canonicalIdentity: pending.canonicalIdentity,
+      canonicalReview: pending.canonicalReview,
+      items: pending.items,
     });
+    expect(retired?.communityPluginEnablement).toBeUndefined();
   });
 
-  it("does not confirm a migration hold while enablement choices remain", async () => {
+  it("confirms after the legacy enablement carrier is retired", async () => {
     const { adapter } = makeAdapter();
     const store = new MigrationHoldV2Store(adapter, paths);
     const pending = await store.publishPending({
@@ -395,12 +546,12 @@ describe("MigrationHoldV2Store", () => {
       communityPluginEnablement,
     });
 
+    const retired = await store.retireCommunityPluginEnablementCarrier();
     await expect(store.confirm(
-      pending.revision,
-      pending.canonicalIdentity,
+      retired!.revision,
+      retired!.canonicalIdentity,
       protocolBinding,
-    )).resolves.toBeNull();
-    await expect(store.load()).resolves.toEqual(pending);
+    )).resolves.toMatchObject({ phase: "confirmed" });
   });
 
   it("recovers a newer staged revision after interruption", async () => {

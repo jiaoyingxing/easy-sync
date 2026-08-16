@@ -25,11 +25,13 @@ import {
   type SharedSyncProtocolBinding,
 } from "./sync-protocol-v3";
 import {
-  resolveCommunityPluginEnablementMigrationDecisionsV2,
+  isSharedSyncProtocolBindingV2,
+  type SharedSyncProtocolBindingV2,
+} from "./sync-protocol-v2";
+import {
   sameCommunityPluginEnablementMigrationCarrierV2,
   validateCommunityPluginEnablementMigrationCarrierV2,
   type CommunityPluginEnablementMigrationCarrierV2,
-  type CommunityPluginEnablementDecisionResolution,
 } from "./community-plugin-enablement";
 
 export interface MigrationHoldV2Paths {
@@ -62,7 +64,11 @@ export interface MigrationHoldV2 {
   /** Missing only on holds written before activation entry classification. */
   reviewKind?: V2ActivationReviewKind;
   communityPluginEnablement?: CommunityPluginEnablementMigrationCarrierV2;
-  /** Present from user confirmation onward, before the V2 manifest commits. */
+  /**
+   * Exact protocol preparation checkpoint. A pending first-sync hold may
+   * carry only the V2 binding proven by create + exact readback; confirmed
+   * and authority-committed holds always carry their final binding.
+   */
   protocolBinding?: SharedSyncProtocolBinding;
 }
 
@@ -170,38 +176,25 @@ export class MigrationHoldV2Store {
     });
   }
 
-  async resolveCommunityPluginEnablementDecisions(
-    expectedRevision: number,
-    expectedIdentity: CanonicalPlanIdentityV2,
-    resolutions: readonly Readonly<
-      CommunityPluginEnablementDecisionResolution
-    >[],
+  /**
+   * Public 1.2.7 may have persisted a source-bound community-plugin
+   * enablement carrier. Enablement is device-local now, so retain the exact
+   * migration candidate/review/protocol facts while retiring only that
+   * optional carrier. This store owns no user-file or Graph capability.
+   */
+  async retireCommunityPluginEnablementCarrier(
     now = Date.now(),
   ): Promise<MigrationHoldV2 | null> {
     const current = await this.load();
-    if (
-      !current
-      || current.phase !== "pending"
-      || current.revision !== expectedRevision
-      || !sameCanonicalPlanIdentityV2(
-        current.canonicalIdentity,
-        expectedIdentity,
-      )
-      || !current.communityPluginEnablement
-    ) {
-      return null;
-    }
-    const communityPluginEnablement =
-      resolveCommunityPluginEnablementMigrationDecisionsV2(
-        current.communityPluginEnablement,
-        resolutions,
-      );
-    if (!communityPluginEnablement) return null;
+    if (!current?.communityPluginEnablement) return current;
+    const {
+      communityPluginEnablement: _retired,
+      ...preserved
+    } = current;
     return this.publish({
-      ...current,
+      ...preserved,
       revision: current.revision + 1,
       updatedAt: now,
-      communityPluginEnablement,
     });
   }
 
@@ -244,7 +237,6 @@ export class MigrationHoldV2Store {
     const current = await this.load();
     if (
       !current
-      || (current.communityPluginEnablement?.pending.length ?? 0) > 0
       || current.revision !== expectedRevision
       || !sameCanonicalPlanIdentityV2(
         current.canonicalIdentity,
@@ -258,6 +250,45 @@ export class MigrationHoldV2Store {
       ...current,
       revision: current.revision + 1,
       phase: "confirmed",
+      updatedAt: now,
+      protocolBinding: structuredClone(protocolBinding),
+    });
+  }
+
+  async checkpointPendingProtocolBinding(
+    expectedRevision: number,
+    expectedIdentity: CanonicalPlanIdentityV2,
+    protocolBinding: SharedSyncProtocolBindingV2,
+    now = Date.now(),
+  ): Promise<MigrationHoldV2 | null> {
+    if (!isSharedSyncProtocolBindingV2(protocolBinding)) return null;
+    const current = await this.load();
+    if (
+      !current
+      || current.phase !== "pending"
+      || migrationHoldReviewKindV2(current) !== "v2-first-sync"
+      || current.revision !== expectedRevision
+      || !sameCanonicalPlanIdentityV2(
+        current.canonicalIdentity,
+        expectedIdentity,
+      )
+    ) {
+      return null;
+    }
+    if (current.protocolBinding !== undefined) {
+      return isSharedSyncProtocolBindingV2(current.protocolBinding)
+        && current.protocolBinding.migrationGeneration
+          === protocolBinding.migrationGeneration
+        && current.protocolBinding.confirmedAllDevicesUpdatedAt
+          === protocolBinding.confirmedAllDevicesUpdatedAt
+        && current.protocolBinding.recordId === protocolBinding.recordId
+        && current.protocolBinding.recordETag === protocolBinding.recordETag
+        ? current
+        : null;
+    }
+    return this.publish({
+      ...current,
+      revision: current.revision + 1,
       updatedAt: now,
       protocolBinding: structuredClone(protocolBinding),
     });
@@ -392,6 +423,18 @@ export function validateMigrationHoldV2(
     && !isSharedSyncProtocolBinding(value.protocolBinding)
   ) {
     throw new Error("V2 migration hold protocol binding is invalid");
+  }
+  if (
+    value.phase === "pending"
+    && value.protocolBinding !== undefined
+    && (
+      value.reviewKind !== "v2-first-sync"
+      || !isSharedSyncProtocolBindingV2(value.protocolBinding)
+    )
+  ) {
+    throw new Error(
+      "Only a pending first-sync hold may carry a V2 protocol checkpoint",
+    );
   }
 }
 

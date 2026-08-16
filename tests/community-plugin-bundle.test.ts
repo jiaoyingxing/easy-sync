@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   assessCommunityPluginManifestCompatibility,
+  assertCommunityPluginManifestIdentityStable,
   compareCommunityPluginVersions,
+  findCommunityPluginManifestIdentityCollisions,
   parseCommunityPluginBundleManifest,
   parseCommunityPluginBundlePath,
 } from "../src/sync/community-plugin-bundle";
@@ -22,7 +24,7 @@ describe("community plugin bundle safety", () => {
     )).toBeNull();
   });
 
-  it("requires the manifest identity and a non-empty raw version used by the plugin directory", () => {
+  it("accepts a safe manifest identity alias and requires a non-empty raw version", () => {
     expect(parseCommunityPluginBundleManifest(
       JSON.stringify({
         id: "calendar",
@@ -39,10 +41,14 @@ describe("community plugin bundle safety", () => {
       minAppVersion: "1.5.0",
       isDesktopOnly: false,
     });
+    expect(parseCommunityPluginBundleManifest(
+      JSON.stringify({ id: "pkmer", name: "PKMer", version: "2.1.0" }),
+      "obsidian-pkmer",
+    )).toMatchObject({ id: "pkmer", name: "PKMer" });
     expect(() => parseCommunityPluginBundleManifest(
-      JSON.stringify({ id: "other", version: "2.1.0" }),
+      JSON.stringify({ id: "../other", version: "2.1.0" }),
       "calendar",
-    )).toThrow("manifest identity differs");
+    )).toThrow("manifest identity is invalid");
     expect(() => parseCommunityPluginBundleManifest(
       JSON.stringify({ id: "calendar" }),
       "calendar",
@@ -65,6 +71,22 @@ describe("community plugin bundle safety", () => {
     ).name).toBeNull();
     expect(compareCommunityPluginVersions("1.5.12.11", "1.5.12.10"))
       .toBeNull();
+  });
+
+  it("blocks identity changes within one directory and duplicate logical ids across directories", () => {
+    const pkmer = parseCommunityPluginBundleManifest(
+      JSON.stringify({ id: "pkmer", version: "1.0.0" }),
+      "obsidian-pkmer",
+    );
+    expect(() => assertCommunityPluginManifestIdentityStable(
+      "obsidian-pkmer",
+      [pkmer, { ...pkmer, id: "other" }],
+    )).toThrow("identity changed within directory");
+    expect(findCommunityPluginManifestIdentityCollisions([
+      { directoryId: "obsidian-pkmer", manifestId: "pkmer" },
+      { directoryId: "pkmer-copy", manifestId: "pkmer" },
+      { directoryId: "obsidian42-brat", manifestId: "obsidian42-brat" },
+    ])).toEqual(new Set(["obsidian-pkmer", "pkmer-copy"]));
   });
 
   it("compares release and prerelease versions without lexicographic downgrade errors", () => {

@@ -15,6 +15,13 @@ export interface FileComparisonAction {
   onClick: () => void;
 }
 
+/** Keep file sizes consistent across every shared comparison surface. */
+export function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 /**
  * Shared visual host for current-local/current-cloud decisions.
  *
@@ -30,6 +37,11 @@ export abstract class FileComparisonModal extends Modal {
   }
 
   async onOpen(): Promise<void> {
+    await this.refreshComparison();
+  }
+
+  /** Rebuild only the modal's shared comparison surface in place. */
+  protected async refreshComparison(): Promise<void> {
     this.contentEl.empty();
     this.contentEl.addClass("easy-sync-conflict-detail");
     this.comparisonBodyEl = this.contentEl.createDiv("easy-sync-conflict-body");
@@ -42,7 +54,7 @@ export abstract class FileComparisonModal extends Modal {
     localTitle: string,
     remoteTitle: string,
     rows: readonly FileComparisonRow[],
-  ): void {
+  ): HTMLTableElement {
     const table = this.comparisonBodyEl.createEl("table", "easy-sync-metadata-table");
     const thead = table.createEl("thead");
     const headerRow = thead.createEl("tr");
@@ -67,11 +79,12 @@ export abstract class FileComparisonModal extends Modal {
       remoteCell.setText(row.remote);
       if (row.remoteHighlighted) remoteCell.addClass("easy-sync-meta-highlight");
     }
+    return table;
   }
 
   protected renderFileComparisonActions(
     actions: readonly FileComparisonAction[],
-  ): void {
+  ): HTMLDivElement {
     const btnRow = this.contentEl.createDiv("easy-sync-detail-actions");
     for (const action of actions) {
       const button = btnRow.createEl("button", { text: action.label });
@@ -79,5 +92,6 @@ export abstract class FileComparisonModal extends Modal {
       if (action.className) button.addClass(action.className);
       if (!action.disabled) button.addEventListener("click", action.onClick);
     }
+    return btnRow;
   }
 }

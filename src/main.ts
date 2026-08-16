@@ -25,14 +25,10 @@ import {
   normalizeExcludedFolders,
 } from "./sync/local-scanner";
 import {
+  ConservativeResetBlockedError,
   StateManager,
-  type CommunityPluginEnablementDecisionSnapshot,
-  type PendingCommunityPluginEnablementDecision,
+  SyncPathMutationRecoveryError,
 } from "./sync/state-manager";
-import {
-  sameCommunityPluginEnablementDecisionSet,
-  type CommunityPluginEnablementDecisionResolution,
-} from "./sync/community-plugin-enablement";
 import {
   IndexedDbPublic113StateStore,
   public113IndexedDbDatabaseName,
@@ -46,6 +42,7 @@ import {
   readIndexedDbVaultInstanceId,
 } from "./sync/indexeddb-vault-namespace";
 import {
+  classifyRetryableObservationResult,
   SyncExecutor,
   type SyncCallbacks,
   type SyncMode,
@@ -55,6 +52,9 @@ import {
 } from "./sync/sync-executor";
 import type {
   EmptyFolderResolutionSnapshotV1,
+  FolderLocationResolutionChoiceV1,
+  FolderLocationResolutionSnapshotV1,
+  FolderSubtreeReviewSnapshotV1,
 } from "./sync/empty-folder-resolution";
 import type {
   SharedFolderIdentityResolutionSnapshotV1,
@@ -69,7 +69,11 @@ import {
 import { resolveSyncActionPresentation } from "./sync/sync-action-presentation";
 import { DiagnosticLogger } from "./sync/diagnostic-logger";
 import { EasySyncSettingTab } from "./ui/settings-tab";
-import { EasySyncSyncView, SYNC_VIEW_TYPE } from "./ui/sync-view";
+import {
+  EasySyncSyncView,
+  shouldAutoRebuildPlanReview,
+  SYNC_VIEW_TYPE,
+} from "./ui/sync-view";
 import {
   RIBBON_STATUS_ICONS,
   resolveRibbonStatus,
@@ -86,6 +90,7 @@ import type {
   PlanReviewAuthorization,
   ScanConfig,
   SyncPlan,
+  SyncScope,
 } from "./sync/types";
 import {
   sameCanonicalPlanIdentityV2,
@@ -133,6 +138,7 @@ import {
   findLatestAutomaticHandlingSummary,
   findLatestNetworkSummary,
   findLatestPhaseSummary,
+  findLatestSharedProtocolProfileSummary,
   findLatestTransferSummary,
   fingerprintOpaqueValue,
   formatDiagnosticAutomaticSyncSummary,
@@ -183,7 +189,8 @@ import {
   type RemoteCommunityPluginCatalogV1,
 } from "./sync/community-plugin-remote-catalog";
 import {
-  isCommunityPluginJoinBlockRetryable,
+  communityPluginJoinBlockRequiresTargetRebind,
+  isCommunityPluginJoinBlockRecheckable,
   planCommunityPluginJoins,
   type CommunityPluginJoinAuthorization,
   type CommunityPluginJoinBlock,
@@ -192,6 +199,9 @@ import {
 import {
   planCommunityPluginLocalReconciliation,
 } from "./sync/community-plugin-local-reconciliation";
+import {
+  CommunityPluginLifecycleDeviceObserverV1,
+} from "./sync/community-plugin-lifecycle-device-v1";
 import { StartupPerformanceTracker } from "./startup-performance";
 
 /** Plugin data keys for sync settings */
@@ -381,6 +391,15 @@ function syncPathSettingsExpandFileScope(
   });
 }
 
+type ConservativeResetEntries = Parameters<
+  StateManager["resetPreservingIsolatedMutationRecovery"]
+>[0];
+
+type ResetMutationRecoveryDisposition =
+  | { kind: "settled" }
+  | { kind: "isolated"; entries: ConservativeResetEntries }
+  | { kind: "blocked" };
+
 export class SyncPathSettingsUpdateError extends Error {
   constructor(readonly code: "busy" | "recovery") {
     super(code);
@@ -469,7 +488,7 @@ export default class EasySyncPlugin extends Plugin {
   private readonly mutationRecoveryScheduler = new MutationRecoveryScheduler(
     () => this.runScheduledMutationRecovery(),
     () => {
-      void this.pauseAfterMutationRecoveryBudget();
+      void this.handleMutationRecoveryBudgetExhausted();
     },
     Math.random,
     (snapshot) => {
@@ -506,6 +525,8 @@ export default class EasySyncPlugin extends Plugin {
   private communityPluginParticipationOperationSequence = 0;
   private remoteCommunityPluginCatalogRefreshPromise:
     Promise<RemoteCommunityPluginCatalogV1 | null> | null = null;
+  private communityPluginLifecycleDeviceObserver:
+    CommunityPluginLifecycleDeviceObserverV1 | null = null;
 
   /** Set to true after state.load() completes. Public so settings-tab
    *  can guard the "Reset" button with it. */
@@ -605,6 +626,12 @@ export default class EasySyncPlugin extends Plugin {
         "Vault-local IndexedDB namespace is unavailable; new selection is disabled and an existing binding will fail closed",
       );
     }
+    this.communityPluginLifecycleDeviceObserver = indexedDbVaultInstanceId
+      ? new CommunityPluginLifecycleDeviceObserverV1(
+          this.app,
+          indexedDbVaultInstanceId,
+        )
+      : null;
 
     this.state = new StateManager({
       loadData: () => this.loadPluginData(),
@@ -665,6 +692,7 @@ export default class EasySyncPlugin extends Plugin {
       },
       this.operationLifecycle,
       this.noticeCenter,
+      this.communityPluginLifecycleDeviceObserver,
     );
     this.syncExecutor.setAutomaticHandlingPolicy(this.automaticHandlingPolicy);
     this.syncExecutor.setCommunityPluginSyncPolicy(
@@ -810,6 +838,7 @@ export default class EasySyncPlugin extends Plugin {
     // Sever the UI gateway immediately. The invalidated executor object stays
     // alive only for already-captured async work to drain safely.
     this.syncExecutor = null;
+    this.communityPluginLifecycleDeviceObserver = null;
     this.communityPluginInventoryRevisionListeners.clear();
     this.pendingCommunityPluginReconciliationIds.clear();
     this.communityPluginReconciliationRetryOnLockRelease = false;
@@ -858,6 +887,8 @@ export default class EasySyncPlugin extends Plugin {
       | "notice.conflict.failed"
       | "notice.delete.failed"
       | "notice.emptyFolder.failed"
+      | "notice.folderLocation.failed"
+      | "notice.folderSubtree.failed"
       | "notice.sharedFolderIdentity.failed"
       | "notice.staleIdentity.failed"
       | "notice.mutationResolution.failed",
@@ -918,7 +949,16 @@ export default class EasySyncPlugin extends Plugin {
       }
       if (!await this.checkAccountBinding()) return false;
       if (rejectBusy()) return false;
+      const hadPendingDecision =
+        (state.pendingIssues?.length ?? 0) > 0
+        || (state.pendingConflicts?.length ?? 0) > 0
+        || (state.pendingRemoteDeletes?.length ?? 0) > 0;
       await action(executor, state);
+      await this.maybeResumeAutoSyncAfterResolvedDecisions(
+        state,
+        executor,
+        hadPendingDecision,
+      );
       this.updateStatusBar();
       this.syncView?.render();
       this.settingsTab?.refreshSyncState();
@@ -937,6 +977,61 @@ export default class EasySyncPlugin extends Plugin {
       this.settingsTab?.refreshSyncState();
       return false;
     }
+  }
+
+  /**
+   * A conflict-only round pauses automatic sync until the user has handled its
+   * decisions. Once the last durable decision is gone, that pause no longer
+   * describes current state. Keep the historical partial run intact and only
+   * release the pause when no other blocker or failed result still owns it.
+   */
+  private async maybeResumeAutoSyncAfterResolvedDecisions(
+    state: StateManager,
+    executor: SyncExecutor,
+    hadPendingDecision: boolean,
+  ): Promise<void> {
+    if (
+      !hadPendingDecision
+      || !this.autoSyncPaused
+      || executor.isRunning
+      || executor.hasSideActionsInFlight
+      || state.planReviewActive
+      || (state.pendingIssues?.length ?? 0) > 0
+      || (state.pendingConflicts?.length ?? 0) > 0
+      || (state.pendingRemoteDeletes?.length ?? 0) > 0
+      || state.hasV2StateLoadRecoveryBlock
+      || state.hasV2RemoteScopeRecovery
+      || this.getMutationRecoveryDisplayState() !== null
+    ) return;
+
+    const latestHistory = state.syncHistory[0];
+    if (
+      !latestHistory
+      || latestHistory.status !== "partial"
+      || latestHistory.errors !== 0
+      || latestHistory.conflicts <= 0
+      || (latestHistory.recovery !== undefined
+        && latestHistory.recovery.state !== "recovered")
+    ) return;
+
+    this.autoSyncPaused = false;
+    try {
+      await this.saveSyncSettings();
+    } catch (error) {
+      this.autoSyncPaused = true;
+      this.diag.warn(
+        "state",
+        "failed to release automatic pause after pending decisions settled",
+        error,
+      );
+      return;
+    }
+    this.startAutoSync();
+    this.diag.log(
+      "execute",
+      "released conflict-owned automatic pause after pending decisions settled",
+      { historyId: latestHistory.id, mutations: 0 },
+    );
   }
 
   resolveConflictKeepLocal(path: string): Promise<boolean> {
@@ -998,6 +1093,22 @@ export default class EasySyncPlugin extends Plugin {
     return this.syncExecutor.getEmptyFolderResolutionSnapshot(path);
   }
 
+  async getFolderSubtreeReviewSnapshot(
+    path: string,
+  ): Promise<FolderSubtreeReviewSnapshotV1 | null> {
+    await this.ensureStateLoaded();
+    if (!this.syncExecutor || !this.state?.isV2StateActive) return null;
+    return this.syncExecutor.getFolderSubtreeReviewSnapshot(path);
+  }
+
+  async getFolderLocationResolutionSnapshot(
+    path: string,
+  ): Promise<FolderLocationResolutionSnapshotV1 | null> {
+    await this.ensureStateLoaded();
+    if (!this.syncExecutor || !this.state?.isV2StateActive) return null;
+    return this.syncExecutor.getFolderLocationResolutionSnapshot(path);
+  }
+
   async getSharedFolderIdentityResolutionSnapshot(
     path: string,
   ): Promise<SharedFolderIdentityResolutionSnapshotV1 | null> {
@@ -1033,6 +1144,21 @@ export default class EasySyncPlugin extends Plugin {
     );
   }
 
+  async getCommunityPluginBundleReviewSnapshot(
+    pluginId: string,
+  ): Promise<ManualMutationResolutionSnapshotV1 | null> {
+    await this.ensureStateLoaded();
+    const executor = this.syncExecutor;
+    if (
+      !executor
+      || executor.isRunning
+      || executor.hasSideActionsInFlight
+      || !this.state?.isV2StateActive
+    ) return null;
+    if (!await this.checkAccountBinding()) return null;
+    return executor.getCommunityPluginBundleReviewSnapshot(pluginId);
+  }
+
   async resolveMutationRecovery(
     reviewed: Readonly<ManualMutationResolutionSnapshotV1>,
     choice: ManualMutationResolutionChoiceV1,
@@ -1060,6 +1186,56 @@ export default class EasySyncPlugin extends Plugin {
       "notice.emptyFolder.failed",
       (executor) => executor.restoreReviewedEmptyFolder(reviewed),
     );
+  }
+
+  async restoreReviewedFolderSubtree(
+    reviewed: Readonly<FolderSubtreeReviewSnapshotV1>,
+  ): Promise<boolean> {
+    let accepted = false;
+    const admitted = await this.runSideActionIntent(
+      reviewed.path,
+      "notice.folderSubtree.failed",
+      async (executor) => {
+        accepted = await executor.restoreReviewedFolderSubtree(reviewed);
+      },
+    );
+    if (!admitted || !accepted) return false;
+    await this.startManualSync();
+    return true;
+  }
+
+  async resolveReviewedFolderLocation(
+    reviewed: Readonly<FolderLocationResolutionSnapshotV1>,
+    choice: FolderLocationResolutionChoiceV1,
+  ): Promise<boolean> {
+    let resolved = false;
+    const admitted = await this.runSideActionIntent(
+      reviewed.path,
+      "notice.folderLocation.failed",
+      async (executor) => {
+        resolved = await executor.resolveReviewedFolderLocation(
+          reviewed,
+          choice,
+        );
+      },
+    );
+    if (!admitted || !resolved) return false;
+    await this.startManualSync();
+    return true;
+  }
+
+  async deleteReviewedFolderSubtree(
+    reviewed: Readonly<FolderSubtreeReviewSnapshotV1>,
+  ): Promise<boolean> {
+    let deleted = false;
+    const admitted = await this.runSideActionIntent(
+      reviewed.path,
+      "notice.folderSubtree.failed",
+      async (executor) => {
+        deleted = await executor.deleteReviewedFolderSubtree(reviewed);
+      },
+    );
+    return admitted && deleted;
   }
 
   async bindReviewedEmptyFolderRename(
@@ -1181,6 +1357,7 @@ export default class EasySyncPlugin extends Plugin {
     options?: SyncRunOptions;
     logLabel?: string;
     renderAfter?: boolean;
+    resultOwner?: "sync" | "reset";
   }): Promise<SyncResult | null> {
     if (!this.syncExecutor) return null;
     await this.preparePublic113MigrationSettings(request.options);
@@ -1192,7 +1369,9 @@ export default class EasySyncPlugin extends Plugin {
     }
     const preparedCommunityPluginJoins = request.options?.recoveryOnly === true
       ? { authorizations: [] }
-      : await this.prepareCommunityPluginJoinsForSync();
+      : await this.prepareCommunityPluginJoinsForSync(
+          request.reviewedAuthorization,
+        );
     const runOptions: SyncRunOptions = {
       ...(request.options ?? {}),
       ...(preparedCommunityPluginJoins.authorizations.length > 0
@@ -1283,12 +1462,16 @@ export default class EasySyncPlugin extends Plugin {
     const joinBlocks = result.communityPluginJoinBlocks ?? [];
     const hasCommunityPluginJoinOutcome = joinBlocks.length > 0
       || (completedRestores?.files.length ?? 0) > 0
-      || (completedRestores?.data.length ?? 0) > 0;
+      || (completedRestores?.data.length ?? 0) > 0
+      || Object.keys(
+        result.communityPluginRestoreGenerationByPluginId ?? {},
+      ).length > 0;
     if (hasCommunityPluginJoinOutcome) {
       try {
         await this.persistCommunityPluginJoinOutcomes(
           completedRestores ?? { files: [], data: [] },
           joinBlocks,
+          result.communityPluginRestoreGenerationByPluginId ?? {},
         );
       } catch (error) {
         result.success = false;
@@ -1362,12 +1545,35 @@ export default class EasySyncPlugin extends Plugin {
     } else if (!this.state?.confirmedDescendantFileReconstruction) {
       this.descendantFileReconstructionFailures = 0;
     }
-    await this.handleSyncResult(
-      result,
-      request.mode,
-      request.options?.recoveryOnly === true,
-      recoveryContext,
-    );
+    if (request.resultOwner === "reset") {
+      // Reset owns the visible outcome and must not persist ordinary sync
+      // outcomes or change the user's automatic-sync pause state. Keep the
+      // canonical recovery history because it is the existing durable fact
+      // that makes a blocked manual resolution reachable in the sidebar.
+      this.mutationRecoveryBlockReason =
+        result.mutationRecovery?.state === "blocked"
+          ? result.mutationRecovery.blockReason ?? "unknown"
+          : null;
+      if (result.mutationRecovery) {
+        await this.recordSyncHistory(
+          result,
+          request.mode,
+          true,
+          recoveryContext,
+        );
+      }
+      this.clearSyncLifecycleNotice();
+      this.clearRibbonSuccess();
+      this.updateStatusBar();
+      this.syncView?.render();
+    } else {
+      await this.handleSyncResult(
+        result,
+        request.mode,
+        request.options?.recoveryOnly === true,
+        recoveryContext,
+      );
+    }
     this.advanceCommunityPluginInventoryRevision();
     if (
       scheduleReconstructionContinuation
@@ -1444,11 +1650,22 @@ export default class EasySyncPlugin extends Plugin {
   /** Execute a sync after the user has reviewed the plan in the sidebar.
    *  The reviewed digest may become stale before execution; in that case the
    *  executor sends the replacement plan back through the normal alert path. */
-  async executePlanReview(): Promise<void> {
+  async executePlanReview(expectedRevision?: number): Promise<void> {
     if (!this.syncExecutor || !this.state) return;
     if (this.acquireOpLock("sync")) return;
     try {
     await this.ensureStateLoaded();
+    if (
+      (expectedRevision !== undefined
+        && this.state.planReviewRevision !== expectedRevision)
+      || shouldAutoRebuildPlanReview(
+        this.state.planReviewCounts ?? null,
+        this.state.planReviewItems ?? [],
+      )
+    ) {
+      this.syncView?.render();
+      return;
+    }
     if (await this.dispatchV2StateLoadBlockIfPresent(
       "manual",
       "blocked plan review execution result",
@@ -1457,6 +1674,13 @@ export default class EasySyncPlugin extends Plugin {
       if (!await this.checkAccountBinding()) return;
       const reviewedAuthorization =
         this.state.planReviewAuthorization ?? undefined;
+      const createsRemoteScope = (this.state.planReviewItems ?? []).some(
+        (item) => item.type === SyncActionType.RecreateRemoteScope,
+      );
+      if (
+        createsRemoteScope
+        && !await this.acknowledgeRemoteScopeCreation()
+      ) return;
       await this.dispatchSyncRun({
         mode: "manual",
         skipConfirmation: reviewedAuthorization !== undefined,
@@ -1575,6 +1799,13 @@ export default class EasySyncPlugin extends Plugin {
   async ensureStateLoaded(): Promise<void> {
     if (this._stateLoaded || !this.state) return;
     this.stateLoadPromise ??= this.state.load().then(async () => {
+      if (this.state?.consumeCommunityPluginEnablementRetiredThisLoad()) {
+        this.noticeCenter.show({
+          key: "community-plugin-enablement-retired",
+          message: this.i18n.t("notice.communityPlugins.enablementRetired"),
+          priority: NOTICE_PRIORITY.info,
+        });
+      }
       try {
         await this.ensureCommunityPluginParticipationInitialized();
       } catch (error) {
@@ -1658,10 +1889,15 @@ export default class EasySyncPlugin extends Plugin {
       reviewedAuthorization?.reviewKind === "v2-migration";
     const createFirstV2Protocol =
       reviewedAuthorization?.reviewKind === "v2-first-sync";
+    const createsRemoteScope = skipConfirmation
+      && (this.state?.planReviewItems ?? []).some(
+        (item) => item.type === SyncActionType.RecreateRemoteScope,
+      );
     if (
       acknowledgeMigrationRisk
       && !await this.acknowledgeV2MigrationRisk()
     ) return;
+    if (createsRemoteScope && !await this.acknowledgeRemoteScopeCreation()) return;
 
     await this.dispatchSyncRun({
       mode: "manual",
@@ -1693,6 +1929,21 @@ export default class EasySyncPlugin extends Plugin {
       t,
       {
         message: t("syncPlan.migrationConfirmMessage"),
+      },
+    ).awaitConfirm();
+  }
+
+  private async acknowledgeRemoteScopeCreation(): Promise<boolean> {
+    const t = this.i18n.t.bind(this.i18n);
+    return new ConfirmModal(
+      this.app,
+      t("syncPlan.remoteScopeRecreateConfirmTitle"),
+      null,
+      t("syncPlan.remoteScopeRecreateConfirm"),
+      t("confirm.cancel"),
+      t,
+      {
+        message: t("syncPlan.remoteScopeRecreateConfirmMessage"),
       },
     ).awaitConfirm();
   }
@@ -1911,18 +2162,9 @@ export default class EasySyncPlugin extends Plugin {
       pausedForReview: result.message === this.i18n.t("result.pausedForReview"),
       cancelled: result.message === this.i18n.t("result.cancelled"),
     }, this.progressStore.state.completedFiles);
-    const equivalentCommunityPluginSidebar =
-      outcome?.kind === "communityPluginEnablement"
-      && this.getCommunityPluginEnablementPendingCount() > 0;
     if (
       !outcome
-      || (
-        suppressNotice
-        && (
-          outcome.kind !== "communityPluginEnablement"
-          || equivalentCommunityPluginSidebar
-        )
-      )
+      || suppressNotice
     ) return;
 
     const messageKeys: Record<SyncNoticeOutcomeKind, string> = {
@@ -1930,8 +2172,6 @@ export default class EasySyncPlugin extends Plugin {
       conflicts: "notice.sync.conflicts",
       remoteDeletes: "notice.sync.remoteDeletes",
       mixedPending: "notice.sync.mixedPending",
-      communityPluginEnablement:
-        "notice.sync.communityPluginEnablement",
       review: "notice.sync.review",
       cancelled: "notice.sync.cancelled",
       failed: "notice.sync.failed",
@@ -1942,7 +2182,6 @@ export default class EasySyncPlugin extends Plugin {
       conflicts: NOTICE_PRIORITY.attention,
       remoteDeletes: NOTICE_PRIORITY.attention,
       mixedPending: NOTICE_PRIORITY.attention,
-      communityPluginEnablement: NOTICE_PRIORITY.attention,
       review: NOTICE_PRIORITY.attention,
       cancelled: NOTICE_PRIORITY.action,
       failed: NOTICE_PRIORITY.failure,
@@ -2058,10 +2297,6 @@ export default class EasySyncPlugin extends Plugin {
   /** Reset sync state safely — cancels running sync, acquires lock, clears state. */
   async resetSyncState(): Promise<void> {
     await this.ensureStateLoaded();
-    if (this.hasResetBlockingRecovery()) {
-      this.showMutationRecoveryResetBlockedNotice();
-      return;
-    }
     if (!await this.invalidateAndDrainSyncActivity("reset")) {
       this.noticeCenter.show({
         key: "reset-lock-busy",
@@ -2081,14 +2316,32 @@ export default class EasySyncPlugin extends Plugin {
     }
     try {
       await this.ensureStateLoaded();
+      let isolatedRecoveries: ConservativeResetEntries | null = null;
       if (this.hasResetBlockingRecovery()) {
-        this.showMutationRecoveryResetBlockedNotice();
-        return;
+        const disposition = await this.settleResetBlockingRecovery();
+        if (disposition.kind === "blocked") {
+          this.showMutationRecoveryResetBlockedNotice();
+          return;
+        }
+        if (disposition.kind === "isolated") {
+          isolatedRecoveries = disposition.entries;
+        }
       }
       try {
-        await this.state?.reset();
+        if (isolatedRecoveries) {
+          await this.state?.resetPreservingIsolatedMutationRecovery(
+            isolatedRecoveries,
+          );
+        } else {
+          await this.state?.reset();
+        }
       } catch (error) {
-        if (this.hasResetBlockingRecovery()) {
+        if (error instanceof ConservativeResetBlockedError) {
+          this.diag.warn(
+            "state",
+            "conservative local reset kept unresolved recovery evidence",
+            error instanceof Error ? error.message : String(error),
+          );
           this.showMutationRecoveryResetBlockedNotice();
           return;
         }
@@ -2128,6 +2381,95 @@ export default class EasySyncPlugin extends Plugin {
       this.syncView?.render();
     } finally {
       this.releaseOpLock();
+    }
+  }
+
+  /**
+   * A reset owns the shared operation lock for one recovery-only observation.
+   * The canonical executor may settle existing evidence, but it cannot enter
+   * ordinary planning. Any remaining, corrupt, quarantined, or unavailable
+   * evidence keeps the reset fail-closed and retryable.
+   */
+  private async settleResetBlockingRecovery():
+    Promise<ResetMutationRecoveryDisposition> {
+    const state = this.state;
+    if (!state || !this.hasResetBlockingRecovery()) {
+      return { kind: "settled" };
+    }
+    if (
+      !this.syncExecutor
+      || !state.isV2StateActive
+      || state.hasV2StateLoadRecoveryBlock
+      || state.hasV2RemoteScopeRecovery
+      || state.hasMutationLedgerCorruption
+      || state.hasMutationRecoveryQuarantineCorruption
+      || (state.mutationRecoveryQuarantine?.length ?? 0) > 0
+      || (state.mutationLedger?.length ?? 0) === 0
+    ) return { kind: "blocked" };
+
+    try {
+      if (!await this.checkAccountBinding({
+        suppressNotice: true,
+        allowInitialBind: false,
+      })) return { kind: "blocked" };
+
+      this.diag.log(
+        "execute",
+        "reset preflight started one recovery-only observation",
+        {
+          remaining: state.mutationLedger.length,
+          mutations: 0,
+        },
+      );
+      const result = await this.dispatchSyncRun({
+        mode: "manual",
+        options: {
+          recoveryOnly: true,
+          mutationRecoveryObservationOnly: true,
+        },
+        logLabel: "reset preflight mutation recovery result",
+        resultOwner: "reset",
+      });
+      // The reset owns the final user-facing outcome. Remove the ordinary
+      // recovery result (for example, "continuing sync") before showing the
+      // reset-specific success or retained-evidence notice.
+      this.clearSyncLifecycleNotice();
+      const settled = result?.mutationRecovery?.state === "settled"
+        && !this.hasResetBlockingRecovery();
+      if (settled) return { kind: "settled" };
+      const remaining = state.mutationLedger;
+      if (
+        result?.mutationRecovery?.state === "blocked"
+        && result.mutationRecovery.isolated === true
+        && result.mutationRecovery.blockReason === "facts-changed"
+        && remaining.length > 0
+        && result.mutationRecovery.blockedOperationId !== undefined
+        && remaining.some((record) => record.intent.operationId
+          === result.mutationRecovery?.blockedOperationId)
+      ) {
+        return {
+          kind: "isolated",
+          entries: structuredClone(remaining),
+        };
+      }
+      this.diag.warn(
+        "execute",
+        "reset preflight kept unresolved mutation recovery evidence",
+        {
+          remaining: state.mutationLedger.length,
+          recoveryState: result?.mutationRecovery?.state ?? "unavailable",
+          mutations: 0,
+        },
+      );
+      return { kind: "blocked" };
+    } catch (error) {
+      this.clearSyncLifecycleNotice();
+      this.diag.warn(
+        "execute",
+        "reset preflight mutation recovery failed",
+        error instanceof Error ? error.message : String(error),
+      );
+      return { kind: "blocked" };
     }
   }
 
@@ -2203,10 +2545,48 @@ export default class EasySyncPlugin extends Plugin {
       && !result.authExpired
       && result.message !== this.i18n.t("result.cancelled")
       && !(this.state?.planReviewActive ?? false);
+    const isolatedMutationRecovery =
+      result.mutationRecovery?.state === "blocked"
+      && result.mutationRecovery.isolated === true
+      && result.errors === 0
+      && !result.authExpired
+      && result.message !== this.i18n.t("result.cancelled")
+      && (
+        recoveryOnly
+        || (
+          result.success
+          && result.conflicts === 0
+          && result.deferred === 0
+          && result.message !== this.i18n.t("result.pausedForReview")
+          && !(this.state?.planReviewActive ?? false)
+        )
+      );
     const blockedMutationRecovery =
       result.mutationRecovery?.state === "blocked"
+      && result.mutationRecovery.isolated !== true
       && !result.authExpired
       && result.message !== this.i18n.t("result.cancelled");
+
+    if (isolatedMutationRecovery) {
+      this.clearSyncLifecycleNotice();
+      this.mutationRecoveryBlockReason =
+        result.mutationRecovery?.blockReason ?? "unknown";
+      await this.recordSyncHistory(
+        result,
+        mode,
+        recoveryOnly,
+        recoveryContext,
+      );
+      if (!recoveryOnly && result.success && this.autoSyncPaused) {
+        this.autoSyncPaused = false;
+        await this.saveSyncSettings();
+        this.startAutoSync();
+      }
+      this.clearRibbonSuccess();
+      this.updateStatusBar();
+      this.syncView?.render();
+      return;
+    }
 
     if (retryableMutationRecovery) {
       this.clearSyncLifecycleNotice();
@@ -2267,6 +2647,55 @@ export default class EasySyncPlugin extends Plugin {
       );
       this.showMutationRecoveryRecoveredNotice(
         result.mutationRecovery.settled,
+      );
+      this.clearRibbonSuccess();
+      this.updateStatusBar();
+      this.syncView?.render();
+      return;
+    }
+
+    const observationClassification = classifyRetryableObservationResult(
+      result,
+      { completedFileCount: this.progressStore.state.completedFiles.length },
+    );
+    const retryableObservation =
+      observationClassification.kind === "valid"
+      && !(this.state?.planReviewActive ?? false);
+    if (
+      observationClassification.kind === "contradictory"
+      || (
+        observationClassification.kind === "valid"
+        && !retryableObservation
+      )
+    ) {
+      this.diag.error(
+        "execute",
+        "retryable observation disposition contradicted the sync result; preserving fail-closed pause",
+        {
+          success: result.success,
+          errors: result.errors,
+          uploaded: result.uploaded,
+          downloaded: result.downloaded,
+          deleted: result.deleted,
+          conflicts: result.conflicts,
+          deferred: result.deferred,
+          termination: result.runFacts?.termination ?? "unknown",
+          ordinaryPlanning: result.runFacts?.ordinaryPlanning ?? "unknown",
+          completedFiles: this.progressStore.state.completedFiles.length,
+        },
+      );
+    }
+    if (retryableObservation) {
+      this.finishSyncNotice(result);
+      await this.recordSyncHistory(
+        result,
+        mode,
+        recoveryOnly,
+        recoveryContext,
+      );
+      this.diag.warn(
+        "execute",
+        `sync stopped before ordinary planning; the next normal sync will observe again (${result.disposition?.component ?? "unknown"})`,
       );
       this.clearRibbonSuccess();
       this.updateStatusBar();
@@ -2423,7 +2852,9 @@ export default class EasySyncPlugin extends Plugin {
     }
 
     const status = resolveSyncHistoryStatus(result, {
-      cancelled: result.message === this.i18n.t("result.cancelled"),
+      cancelled: result.runFacts?.termination === "cancelled"
+        || result.message === this.i18n.t("result.cancelled"),
+      completedFileCount: progress.completedFiles.length,
     });
     const newRecovery = recoveryContext.newRemaining > 0
       && result.mutationRecovery
@@ -2461,7 +2892,6 @@ export default class EasySyncPlugin extends Plugin {
         skippedIgnored: result.skippedIgnored,
         errors: result.errors,
         message: result.message,
-        attention: result.attention,
         files: [...progress.completedFiles],
         uploadBytes: result.metrics?.uploadBytes,
         uploadReadMs: result.metrics?.uploadReadMs,
@@ -2469,6 +2899,9 @@ export default class EasySyncPlugin extends Plugin {
         peakUploads: result.metrics?.peakUploads,
         recovery: newRecovery ?? priorRecoveryWithoutEntry,
         remoteScopeRecovery: result.remoteScopeRecovery,
+        runFacts: result.runFacts
+          ? structuredClone(result.runFacts)
+          : undefined,
       });
     } catch (error) {
       this.diag.warn(
@@ -2552,11 +2985,16 @@ export default class EasySyncPlugin extends Plugin {
     const retryAt = scheduler.state === "scheduled"
       ? scheduler.nextObservationAt
       : null;
+    const waitingForNetwork =
+      (retryAt !== null && retryAt > Date.now())
+      || scheduler.state === "exhausted"
+      || historyRecovery?.state === "waiting-network";
     const kind = checking
       ? "checking"
-      : retryAt !== null && retryAt > Date.now()
+      : waitingForNetwork
         ? "waiting-network"
         : this.autoSyncPaused
+            || this.mutationRecoveryBlockReason !== null
             || corruptEvidence
             || historyRecovery?.state === "blocked"
           ? "blocked"
@@ -2781,23 +3219,9 @@ export default class EasySyncPlugin extends Plugin {
 
   private showMutationRecoveryBlockedNotice(): void {
     if (this.shouldSuppressSyncNotice()) return;
-    const recovery = this.getMutationRecoveryDisplayState();
-    const reason = mutationRecoveryBlockReasonText(
-      recovery?.blockReason,
-      this.i18n.t.bind(this.i18n),
-    );
     this.noticeCenter.show({
       key: "sync-result:recovery-blocked",
-      message: recovery?.firstPath
-        ? this.i18n.t("notice.sync.recoveryBlocked", {
-            reason,
-            remaining: recovery.remaining,
-            path: recovery.firstPath,
-          })
-        : this.i18n.t("notice.sync.recoveryBlockedNoPath", {
-            reason,
-            remaining: recovery?.remaining ?? 1,
-          }),
+      message: this.i18n.t("notice.sync.recoveryBlocked"),
       priority: NOTICE_PRIORITY.attention,
       durationMs: 8_000,
       className: "easy-sync-notice-result",
@@ -2869,7 +3293,16 @@ export default class EasySyncPlugin extends Plugin {
       return false;
     }
     if (this.state.mutationLedger.length === 0) return false;
-    const scheduled = this.mutationRecoveryScheduler.requestObservation();
+    const canWakeExhaustedRecovery =
+      trigger === "foreground"
+      || trigger === "auth-state"
+      || trigger === "interval"
+      || trigger === "auto-start";
+    const scheduled =
+      this.mutationRecoveryScheduler.budgetExhausted
+      && canWakeExhaustedRecovery
+        ? this.mutationRecoveryScheduler.requestObservationAfterExhaustion()
+        : this.mutationRecoveryScheduler.requestObservation();
     if (scheduled) {
       this.diag.log(
         "execute",
@@ -2900,6 +3333,7 @@ export default class EasySyncPlugin extends Plugin {
     }
     if (this.acquireOpLock("mutation-recovery")) return { state: "busy" };
     let settled = false;
+    let continueAfterIsolatedRecovery = false;
     try {
       await this.ensureStateLoaded();
       if (
@@ -2952,6 +3386,10 @@ export default class EasySyncPlugin extends Plugin {
           retryAfterSeconds: recovery.retryAfterSeconds,
         };
       }
+      if (recovery.state === "blocked" && recovery.isolated === true) {
+        continueAfterIsolatedRecovery = true;
+        return { state: "inactive" };
+      }
       if (recovery.state === "blocked") return { state: "blocked" };
       settled = recovery.remaining === 0;
       if (!settled) {
@@ -2975,13 +3413,15 @@ export default class EasySyncPlugin extends Plugin {
     } finally {
       this.releaseOpLock();
       if (
-        settled
+        (settled || continueAfterIsolatedRecovery)
         && this.syncInterval > 0
         && !this.autoSyncPaused
       ) {
         this.diag.log(
           "execute",
-          "mutation recovery settled; continuing through a new canonical V2 round",
+          settled
+            ? "mutation recovery settled; continuing through a new canonical V2 round"
+            : "isolated mutation recovery retained; continuing unrelated canonical work",
           { mutations: 0 },
         );
         void this.runAutomaticSync("recovery-continuation");
@@ -2989,7 +3429,7 @@ export default class EasySyncPlugin extends Plugin {
     }
   }
 
-  private async pauseAfterMutationRecoveryBudget(): Promise<void> {
+  private async handleMutationRecoveryBudgetExhausted(): Promise<void> {
     if (
       this.autoSyncPaused
       || !this.state?.isV2StateActive
@@ -2997,15 +3437,23 @@ export default class EasySyncPlugin extends Plugin {
     ) return;
     this.diag.warn(
       "execute",
-      "automatic mutation recovery budget exhausted; evidence retained",
+      "fast mutation recovery budget exhausted; waiting for an external observation trigger",
       {
         remaining: this.state.mutationLedger.length,
         mutations: 0,
       },
     );
-    await this.pauseForMutationRecoveryBlock(
-      "automatic-budget-exhausted",
-    );
+    this.mutationRecoveryBlockReason = null;
+    await this.updateActiveMutationRecoveryHistory((previous) => ({
+      ...previous,
+      state: "waiting-network",
+      retryAt: undefined,
+      blockReason: undefined,
+      updatedAt: Date.now(),
+    }));
+    this.clearRibbonSuccess();
+    this.updateStatusBar();
+    this.syncView?.render();
   }
 
   private markLocalDirtyHint(path: string, oldPath?: string): void {
@@ -3519,7 +3967,7 @@ export default class EasySyncPlugin extends Plugin {
         entry.phase === "join-requested"
         || entry.phase === "restoring"
         || (entry.phase === "blocked"
-          && isCommunityPluginJoinBlockRetryable(entry.blockedReason))
+          && isCommunityPluginJoinBlockRecheckable(entry.blockedReason))
       );
   }
 
@@ -3888,7 +4336,6 @@ export default class EasySyncPlugin extends Plugin {
       || this.state?.hasV2RemoteScopeRecovery
       || this.state?.hasMutationLedgerCorruption
       || this.state?.hasMutationRecoveryQuarantineCorruption
-      || (this.state?.mutationLedger.length ?? 0) > 0
     ) {
       throw new SyncPathSettingsUpdateError("recovery");
     }
@@ -3905,6 +4352,11 @@ export default class EasySyncPlugin extends Plugin {
       await this.commitSyncPathSettingsCandidate(previous, candidate, {
         operationEpoch,
       });
+    } catch (error) {
+      if (error instanceof SyncPathMutationRecoveryError) {
+        throw new SyncPathSettingsUpdateError("recovery");
+      }
+      throw error;
     } finally {
       this.releaseOpLock();
     }
@@ -3980,6 +4432,7 @@ export default class EasySyncPlugin extends Plugin {
   private async persistCommunityPluginJoinOutcomes(
     completed: Readonly<CommunityPluginRestoreSet>,
     blocks: readonly Readonly<CommunityPluginJoinBlock>[],
+    generationByPluginId: Readonly<Record<string, number>> = {},
   ): Promise<void> {
     const state = this.state;
     const participation = state?.getCommunityPluginParticipation?.() ?? null;
@@ -3992,7 +4445,11 @@ export default class EasySyncPlugin extends Plugin {
         ?.pluginsById[block.pluginId];
       if (
         !current
-        || (current.phase !== "join-requested" && current.phase !== "restoring")
+        || (
+          current.phase !== "join-requested"
+          && current.phase !== "restoring"
+          && !(current.phase === "participating" && !block.operationId)
+        )
         || (block.operationId && current.operationId !== block.operationId)
       ) continue;
       await state.updateCommunityPluginParticipation({
@@ -4002,14 +4459,31 @@ export default class EasySyncPlugin extends Plugin {
         operationId: block.operationId,
       });
     }
+    for (const [pluginId, joinedGeneration] of Object.entries(
+      generationByPluginId,
+    )) {
+      const current = state.getCommunityPluginParticipation()
+        ?.pluginsById[pluginId];
+      if (
+        current?.phase !== "participating"
+        || current.joinedGeneration === joinedGeneration
+      ) continue;
+      await state.updateCommunityPluginParticipation({
+        type: "confirm-participating",
+        pluginId,
+        joinedGeneration,
+        localBundleDigest: current.lastConfirmedLocalBundleDigest,
+      });
+    }
     for (const pluginId of completed.files) {
       const current = state.getCommunityPluginParticipation()
         ?.pluginsById[pluginId];
       if (current?.phase !== "restoring") continue;
+      const joinedGeneration = generationByPluginId[pluginId];
       await state.updateCommunityPluginParticipation({
         type: "confirm-participating",
         pluginId,
-        joinedGeneration: Math.max(1, state.remoteGeneration),
+        ...(joinedGeneration !== undefined ? { joinedGeneration } : {}),
         localBundleDigest: current.targetBundleDigest,
       });
     }
@@ -4215,7 +4689,6 @@ export default class EasySyncPlugin extends Plugin {
     // Selected mode keeps the plugin root observable while the scanner owns
     // the per-plugin file filter.
     if (settings.syncCommunityPlugins) {
-      paths.add(`${configDir}/community-plugins.json`);
       paths.add(`${configDir}/plugins/`);
     }
 
@@ -4324,8 +4797,9 @@ export default class EasySyncPlugin extends Plugin {
     ) return null;
     const existing = state.getCommunityPluginParticipation();
     if (existing) {
-      await this.retireExcludedCommunityPluginPendingState(existing);
       this.applyCommunityPluginParticipationProjection(existing);
+      await this.resumeExcludedCommunityPluginCodeRecoveryScopeExit(existing);
+      await this.retireExcludedCommunityPluginPendingState(existing);
       return this.getCommunityPluginParticipation();
     }
     if (typeof state.initializeCommunityPluginParticipation !== "function") {
@@ -4368,13 +4842,87 @@ export default class EasySyncPlugin extends Plugin {
         incompleteLocalBundlePluginIds,
         historicallyParticipatedPluginIds: historicalPluginIds,
       });
-      await this.retireExcludedCommunityPluginPendingState(initialized.state);
       this.applyCommunityPluginParticipationProjection(initialized.state);
+      await this.resumeExcludedCommunityPluginCodeRecoveryScopeExit(
+        initialized.state,
+      );
+      await this.retireExcludedCommunityPluginPendingState(initialized.state);
       return this.getCommunityPluginParticipation();
     })().finally(() => {
       this.communityPluginParticipationInitializationPromise = null;
     });
     return this.communityPluginParticipationInitializationPromise;
+  }
+
+  private async resumeExcludedCommunityPluginCodeRecoveryScopeExit(
+    participation: Readonly<DeviceCommunityPluginParticipationV1>,
+  ): Promise<boolean> {
+    const state = this.state;
+    if (
+      !state
+      || !this.scanner
+      || !this.syncExecutor
+      || (state.mutationLedger?.length ?? 0) === 0
+    ) return false;
+    const isPluginExcluded = (pluginId: string): boolean =>
+      !participation.scopeEnabled
+      || !isDeviceCommunityPluginEnabled(participation, pluginId);
+    const records = this.syncExecutor
+      .inspectSelectedPluginCodeUploadRecoveriesForScopeExit(
+        isPluginExcluded,
+      );
+    if (!records || records.length === 0) return false;
+    const settings = this.captureSyncPathSettings();
+    const targetSettingsFingerprint = syncPathSettingsFingerprint(settings);
+    if (state.syncPathSettingsFingerprint !== targetSettingsFingerprint) {
+      const filesPolicy =
+        this.getEffectiveCommunityPluginSyncPolicy(settings).files;
+      const remoteFolderPaths = state.isV2StateActive
+        && state.hasCompleteRemoteFolderIndex
+          ? state.remoteFolders.map((folder) => folder.path)
+          : [];
+      await state.commitSyncPathSettingsChange(
+        (path) => this.scanner!.shouldSyncPath(path),
+        (data) => this.writeSyncPathSettingsData(data, settings),
+        filesPolicy.mode === "all"
+          ? undefined
+          : filesPolicy.mode === "selected"
+            ? filesPolicy.pluginIds.filter(
+                (pluginId) => isPluginSelected(filesPolicy, pluginId),
+              )
+            : [],
+        {
+          previousSettingsFingerprint: state.syncPathSettingsFingerprint,
+          targetSettingsFingerprint,
+          expandedFolderPaths: [],
+          includedFolderPaths: remoteFolderPaths.filter(
+            (path) => this.scanner!.shouldSyncFolderPath(path),
+          ),
+          requiresCompleteRemoteIdentitySnapshot: false,
+          retainedMutationRecoveryScopeExit: records,
+        },
+      );
+    }
+    if (
+      JSON.stringify(state.getCommunityPluginParticipation())
+        !== JSON.stringify(participation)
+      || state.syncPathSettingsFingerprint !== targetSettingsFingerprint
+    ) {
+      throw new Error("Community-plugin scope exit is not durably committed");
+    }
+    const retired = await this.syncExecutor
+      .retireSelectedPluginCodeUploadRecoveriesForScopeExit(
+        isPluginExcluded,
+      );
+    if (!retired || (state.mutationLedger?.length ?? 0) > 0) {
+      throw new Error("Community-plugin scope exit recovery remains pending");
+    }
+    this.diag?.log(
+      "state",
+      "resumed durable community plugin scope exit before retiring old recovery evidence",
+      { records: records.length, mutations: 0 },
+    );
+    return true;
   }
 
   private async observeCommunityPluginLocalBundleFacts(
@@ -4497,7 +5045,9 @@ export default class EasySyncPlugin extends Plugin {
     return planned;
   }
 
-  private async prepareCommunityPluginJoinsForSync(): Promise<{
+  private async prepareCommunityPluginJoinsForSync(
+    reviewedAuthorization?: Readonly<PlanReviewAuthorization>,
+  ): Promise<{
     authorizations: CommunityPluginJoinAuthorization[];
   }> {
     const state = this.state;
@@ -4505,37 +5055,55 @@ export default class EasySyncPlugin extends Plugin {
     if (typeof state.getCommunityPluginParticipation !== "function") {
       return { authorizations: [] };
     }
+    const currentReview = state.planReviewAuthorization;
+    const isExecutingCurrentReviewedPlan = Boolean(
+      state.planReviewActive
+      && reviewedAuthorization
+      && currentReview
+      && reviewedAuthorization.revision === currentReview.revision
+      && sameSyncScope(reviewedAuthorization.scope, currentReview.scope)
+      && sameCanonicalPlanIdentityV2(
+        reviewedAuthorization.canonicalIdentity,
+        currentReview.canonicalIdentity,
+      ),
+    );
     if (
       state.hasV2StateLoadRecoveryBlock
       || state.hasV2RemoteScopeRecovery
       || state.hasMutationLedgerCorruption
       || state.hasMutationRecoveryQuarantineCorruption
       || state.mutationLedger.length > 0
-      || state.planReviewActive
+      || (state.planReviewActive && !isExecutingCurrentReviewedPlan)
     ) return { authorizations: [] };
     const initial = await this.ensureCommunityPluginParticipationInitialized();
     if (!initial?.scopeEnabled) return { authorizations: [] };
     const pending = Object.values(initial.pluginsById).filter((entry) =>
-      entry.phase === "join-requested"
-      || entry.phase === "restoring"
-      || (entry.phase === "blocked"
-        && isCommunityPluginJoinBlockRetryable(entry.blockedReason))
+      isExecutingCurrentReviewedPlan
+        ? entry.phase === "restoring"
+        : entry.phase === "join-requested"
+          || entry.phase === "restoring"
+          || (entry.phase === "blocked"
+            && isCommunityPluginJoinBlockRecheckable(entry.blockedReason))
     );
     if (pending.length === 0) return { authorizations: [] };
 
-    const retryEntries = pending.map((entry) => entry.phase === "blocked"
-      ? {
+    const retryEntries = pending.map((entry) => {
+      if (entry.phase !== "blocked") return entry;
+      const rebindTarget = communityPluginJoinBlockRequiresTargetRebind(
+        entry.blockedReason,
+      );
+      return {
           pluginId: entry.pluginId,
           phase: "join-requested" as const,
           ...(entry.operationId ? { operationId: entry.operationId } : {}),
-          ...(entry.targetCatalogRevision !== undefined
+          ...(!rebindTarget && entry.targetCatalogRevision !== undefined
             ? { targetCatalogRevision: entry.targetCatalogRevision }
             : {}),
-          ...(entry.targetBundleDigest
+          ...(!rebindTarget && entry.targetBundleDigest
             ? { targetBundleDigest: entry.targetBundleDigest }
             : {}),
-        }
-      : entry);
+        };
+    });
 
     const localBundleFacts = await this.observeCommunityPluginLocalBundleFacts(
       retryEntries.map((entry) => entry.pluginId),
@@ -4544,9 +5112,17 @@ export default class EasySyncPlugin extends Plugin {
     let catalog = this.getCurrentRemoteCommunityPluginCatalog();
     const remoteRequired = retryEntries.some((entry) =>
       entry.phase === "restoring"
-      || localBundleFacts.get(entry.pluginId) === "absent"
+      || localBundleFacts.get(entry.pluginId) !== "complete"
     );
-    if (remoteRequired && (!catalog || catalog.stale)) {
+    const freshTargetRequired = pending.some((entry) =>
+      entry.phase === "blocked"
+      && communityPluginJoinBlockRequiresTargetRebind(entry.blockedReason)
+      && localBundleFacts.get(entry.pluginId) === "absent"
+    );
+    if (
+      remoteRequired
+      && (freshTargetRequired || !catalog || catalog.stale)
+    ) {
       try {
         catalog = await this.refreshCommunityPluginRemoteCatalog();
       } catch (error) {
@@ -4565,6 +5141,17 @@ export default class EasySyncPlugin extends Plugin {
       catalog,
       scope: state.remoteScope,
     });
+    if (isExecutingCurrentReviewedPlan && planned.commands.length > 0) {
+      this.diag.warn(
+        "plan",
+        "reviewed community plugin restore authorization changed before execution",
+        {
+          commands: planned.commands.length,
+          mutations: 0,
+        },
+      );
+      return { authorizations: [] };
+    }
     await this.commitCommunityPluginParticipationCommands(
       planned.commands,
       {
@@ -4577,11 +5164,23 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   async updateCommunityPluginFilesScope(enabled: boolean): Promise<void> {
+    await this.ensureStateLoaded();
+    const state = this.state;
+    if (
+      !state?.isV2StateActive
+      || typeof state.getCommunityPluginParticipation !== "function"
+    ) {
+      await this.updateSyncPathSettings({
+        syncCommunityPlugins: enabled,
+      });
+      return;
+    }
     await this.commitCommunityPluginParticipationCommands([{
       type: "set-scope-enabled",
       enabled,
     }], {
       commitSyncPathSettingsTransition: true,
+      allowPluginCodeRecoveryScopeExit: !enabled,
     });
   }
 
@@ -4613,6 +5212,7 @@ export default class EasySyncPlugin extends Plugin {
       }], {
         expectedParticipation: current,
         commitSyncPathSettingsTransition: true,
+        allowPluginCodeRecoveryScopeExit: true,
       });
       return;
     }
@@ -4651,6 +5251,7 @@ export default class EasySyncPlugin extends Plugin {
       allowedLockHolder?: string;
       expectedParticipation?: Readonly<DeviceCommunityPluginParticipationV1>;
       commitSyncPathSettingsTransition?: boolean;
+      allowPluginCodeRecoveryScopeExit?: boolean;
     }> = {},
   ): Promise<void> {
     if (commands.length === 0) return;
@@ -4667,7 +5268,6 @@ export default class EasySyncPlugin extends Plugin {
       || state.hasV2RemoteScopeRecovery
       || state.hasMutationLedgerCorruption
       || state.hasMutationRecoveryQuarantineCorruption
-      || (state.mutationLedger?.length ?? 0) > 0
     ) {
       throw new SyncPathSettingsUpdateError("recovery");
     }
@@ -4697,6 +5297,45 @@ export default class EasySyncPlugin extends Plugin {
           command,
           this.manifest.id,
         );
+      }
+      const isPluginExcludedByTarget = (pluginId: string): boolean =>
+        !targetParticipation.scopeEnabled
+        || !isDeviceCommunityPluginEnabled(
+          targetParticipation,
+          pluginId,
+        );
+      const recoveryScopeExitRecords = (state.mutationLedger?.length ?? 0) > 0
+        && options.allowPluginCodeRecoveryScopeExit === true
+        && this.syncExecutor
+          ? this.syncExecutor
+              .inspectSelectedPluginCodeUploadRecoveriesForScopeExit(
+                isPluginExcludedByTarget,
+              )
+          : (state.mutationLedger?.length ?? 0) === 0 ? [] : null;
+      if (!recoveryScopeExitRecords) {
+        throw new SyncPathSettingsUpdateError("recovery");
+      }
+      if (recoveryScopeExitRecords.length > 0) {
+        await state.updateCommunityPluginParticipationBatch(commands);
+        const committed = state.getCommunityPluginParticipation();
+        if (
+          !committed
+          || JSON.stringify(committed) !== JSON.stringify(targetParticipation)
+        ) {
+          throw new Error("Community-plugin scope exit commit disappeared");
+        }
+        this.applyCommunityPluginParticipationProjection(committed);
+        if (!await this.resumeExcludedCommunityPluginCodeRecoveryScopeExit(
+          committed,
+        )) {
+          throw new SyncPathSettingsUpdateError("recovery");
+        }
+        await this.retireExcludedCommunityPluginPendingState(committed, true);
+        this.advanceCommunityPluginInventoryRevision();
+        this.updateStatusBar();
+        this.syncView?.render();
+        this.settingsTab?.refreshSyncState();
+        return;
       }
       const previousSyncPathSettings =
         options.commitSyncPathSettingsTransition
@@ -4846,14 +5485,6 @@ export default class EasySyncPlugin extends Plugin {
           )?.kind === "data"
         )
       : [];
-    const enablementScope =
-      this.state?.activeV2MigrationHold?.communityPluginEnablement?.scope
-      ?? remoteScope;
-    const pendingPluginIds = enablementScope && this.state
-      ? this.state.getCommunityPluginEnablementState(enablementScope).pending.map(
-          (item) => item.pluginId,
-        )
-      : [];
     const configDir = getConfigDir(this.app.vault);
     const historicalManagedPlugins = (this.state?.baseSnapshot ?? []).flatMap(
       (entry) => {
@@ -4897,7 +5528,6 @@ export default class EasySyncPlugin extends Plugin {
         ...(this.communityPluginSyncPolicy.data.restoringPluginIds ?? []),
         ...participationPluginIds,
         ...catalogPluginIds,
-        ...pendingPluginIds,
         ...historicalPluginIds,
       ],
       [...catalogRemoteEntries, ...legacyRemoteDataEntries],
@@ -5026,7 +5656,6 @@ export default class EasySyncPlugin extends Plugin {
     isFolder: boolean,
   ): boolean {
     const configDir = getConfigDir(this.app.vault).replace(/\/+$/, "");
-    if (path === `${configDir}/community-plugins.json`) return true;
     const pluginsRoot = `${configDir}/plugins`;
     if (path === pluginsRoot) return isFolder && kind !== "modify";
     const prefix = `${pluginsRoot}/`;
@@ -5057,93 +5686,6 @@ export default class EasySyncPlugin extends Plugin {
     if (column === "files") return Boolean(catalog && !catalog.stale);
     return this.state?.remoteScope != null
       && this.state.hasCompleteRemoteFolderIndex;
-  }
-
-  async getPendingCommunityPluginEnablementDecisions(): Promise<
-    PendingCommunityPluginEnablementDecision[]
-  > {
-    return (await this.getCommunityPluginEnablementDecisionSnapshot())
-      .decisions;
-  }
-
-  async getCommunityPluginEnablementDecisionSnapshot(): Promise<
-    CommunityPluginEnablementDecisionSnapshot
-  > {
-    await this.ensureStateLoaded();
-    const scope =
-      this.state?.activeV2MigrationHold?.communityPluginEnablement?.scope
-      ?? this.state?.remoteScope;
-    if (
-      !scope
-      || !this.state
-      || !this.syncCommunityPlugins
-    ) return { revision: "", decisions: [] };
-    const snapshot =
-      this.state.getCommunityPluginEnablementDecisionSnapshot(scope);
-    return {
-      revision: snapshot.revision,
-      decisions: snapshot.decisions.filter((item) => isPluginSelected(
-        this.communityPluginSyncPolicy.files,
-        item.pluginId,
-      )),
-    };
-  }
-
-  getCommunityPluginEnablementPendingCount(): number {
-    const scope =
-      this.state?.activeV2MigrationHold?.communityPluginEnablement?.scope
-      ?? this.state?.remoteScope;
-    if (
-      !scope
-      || !this.state
-      || !this.syncCommunityPlugins
-    ) return 0;
-    return this.state.getCommunityPluginEnablementState(scope).pending.filter(
-      (item) => isPluginSelected(
-        this.communityPluginSyncPolicy.files,
-        item.pluginId,
-      ),
-    ).length;
-  }
-
-  openCommunityPluginEnablementReview(): void {
-    this.settingsTab?.openCommunityPluginEnablementReview();
-  }
-
-  async resolveCommunityPluginEnablementDecisions(
-    expectedRevision: string,
-    resolutions: readonly Readonly<
-      CommunityPluginEnablementDecisionResolution
-    >[],
-  ): Promise<boolean> {
-    await this.ensureStateLoaded();
-    const scope =
-      this.state?.activeV2MigrationHold?.communityPluginEnablement?.scope
-      ?? this.state?.remoteScope;
-    if (
-      !scope
-      || !this.state
-      || !this.syncCommunityPlugins
-      || resolutions.length === 0
-      || resolutions.some((item) => !isPluginSelected(
-        this.communityPluginSyncPolicy.files,
-        item.pluginId,
-      ))
-    ) return false;
-    const snapshot = await this.getCommunityPluginEnablementDecisionSnapshot();
-    const pending = snapshot.decisions;
-    if (snapshot.revision !== expectedRevision) return false;
-    if (!sameCommunityPluginEnablementDecisionSet(pending, resolutions)) {
-      return false;
-    }
-    const resolved =
-      await this.state.resolveCommunityPluginEnablementDecisions(
-        scope,
-        expectedRevision,
-        resolutions,
-      );
-    if (resolved) this.advanceCommunityPluginInventoryRevision();
-    return resolved;
   }
 
   /** Apply diagnostic logging setting. Public so settings-tab can call it. */
@@ -5226,17 +5768,10 @@ export default class EasySyncPlugin extends Plugin {
         error instanceof Error ? error.message : String(error),
       );
     }
-    const communityPluginEnablementState = reportScope && reportState
-      ? reportState.getCommunityPluginEnablementState(reportScope)
-      : null;
     const communityPluginSummary = await summarizeCommunityPluginSync({
       policy: this.getEffectiveCommunityPluginSyncPolicy(),
       inventory: communityPluginInventory,
       remoteInventoryTrusted: communityPluginRemoteInventoryTrusted,
-      anchors: communityPluginEnablementState
-        ? Object.keys(communityPluginEnablementState.anchors).length
-        : 0,
-      pending: communityPluginEnablementState?.pending.length ?? 0,
     });
     const { pluginDir, storageLayoutVersion } = getEasySyncPaths(
       this.app.vault,
@@ -5309,7 +5844,7 @@ export default class EasySyncPlugin extends Plugin {
         ? "全部"
         : "关闭"}（本机不同步 ${scope.ignoredOnDevice} 个）`;
     lines.push(
-      `**社区插件精细化范围**: 文件 ${describePluginScope(communityPluginSummary.files)} / 数据 ${describePluginScope(communityPluginSummary.data)} / 清单 ${communityPluginSummary.inventory.total} 个（本地 ${communityPluginSummary.inventory.local}、远端 ${communityPluginSummary.inventory.remote}、清单异常 ${communityPluginSummary.inventory.manifestIssues}） / 远端清单 ${communityPluginSummary.remoteInventoryTrusted ? "可信" : "不可用"} / 启用锚点 ${communityPluginSummary.enablement.anchors} / 待决策 ${communityPluginSummary.enablement.pending}`,
+      `**社区插件精细化范围**: 文件 ${describePluginScope(communityPluginSummary.files)} / 数据 ${describePluginScope(communityPluginSummary.data)} / 清单 ${communityPluginSummary.inventory.total} 个（本地 ${communityPluginSummary.inventory.local}、远端 ${communityPluginSummary.inventory.remote}、清单异常 ${communityPluginSummary.inventory.manifestIssues}） / 远端清单 ${communityPluginSummary.remoteInventoryTrusted ? "可信" : "不可用"}`,
     );
     const inventoryById = new Map(
       communityPluginInventory.map((item) => [item.id, item]),
@@ -5580,6 +6115,31 @@ export default class EasySyncPlugin extends Plugin {
     const latestPhaseSummary = findLatestPhaseSummary(diagAll);
     const latestNetworkSummary = findLatestNetworkSummary(diagAll);
     const latestTransferSummary = findLatestTransferSummary(diagAll);
+    const latestSharedProtocolProfileSummary =
+      findLatestSharedProtocolProfileSummary(diagAll);
+    lines.push("## V2／V3 协议组合核对");
+    lines.push("");
+    if (latestSharedProtocolProfileSummary) {
+      const reasonText: Record<string, string> = {
+        "generation-mismatch": "V2 与 V3 的同步代次不一致",
+        "predecessor-mismatch": "V3 记录的 V2 前身与当前 V2 不一致",
+        "binding-mismatch": "本机记录与当前云端协议对象不一致",
+        "target-slot-occupied": "云端协议位置已被其他内容占用",
+      };
+      const predecessorText = {
+        match: "一致",
+        mismatch: "不一致",
+        unavailable: "无法核对",
+      }[latestSharedProtocolProfileSummary.predecessor];
+      lines.push("**状态**: 组合不一致");
+      lines.push(`**失败原因**: ${reasonText[latestSharedProtocolProfileSummary.reason] ?? "协议证据不完整或不受支持"}（${latestSharedProtocolProfileSummary.reason}）`);
+      lines.push(`**V2 generation 摘要**: ${latestSharedProtocolProfileSummary.v2Generation}`);
+      lines.push(`**V3 generation 摘要**: ${latestSharedProtocolProfileSummary.v3Generation}`);
+      lines.push(`**前身校验**: ${predecessorText}`);
+    } else {
+      lines.push("*近期没有协议组合错配记录。*");
+    }
+    lines.push("");
     lines.push("## 自动处理与恢复摘要");
     lines.push("");
     lines.push("**当前恢复账本**:");
@@ -5808,7 +6368,6 @@ export default class EasySyncPlugin extends Plugin {
         || (this.state?.pendingIssues.length ?? 0) > 0
         || (this.state?.pendingConflicts.length ?? 0) > 0
         || (this.state?.pendingRemoteDeletes.length ?? 0) > 0
-        || this.getCommunityPluginEnablementPendingCount() > 0
         || this.getMutationRecoveryDisplayState() !== null,
       recentSuccess: this.ribbonSuccessVisible,
     });

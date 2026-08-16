@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   buildAdaptivePathLayout,
   buildCompletedFilesRenderState,
@@ -12,9 +12,15 @@ import {
   formatFileProgressLabel,
   formatPendingIssueActionLabel,
   formatPendingIssueChipLabel,
+  groupCommunityPluginConflictReviews,
+  groupPendingIssuesForReview,
   formatSyncHistoryCounts,
   resolveFileProgressPresentation,
+  resolvePlanReviewDetailsState,
+  resolveRemoteScopeRecoveryFailurePresentation,
   resolveSyncViewBodyMode,
+  resolveSyncViewStatusDetailMode,
+  shouldExpandAllVisibleDetails,
   shouldAutoRebuildPlanReview,
   SYNC_PLAN_VIRTUAL_OVERSCAN,
   syncViewProgressPercent,
@@ -22,6 +28,60 @@ import {
 } from "../src/ui/sync-view";
 import { I18n } from "../src/i18n";
 import { SyncActionType } from "../src/sync/types";
+import { ConfirmModal } from "../src/ui/confirm-modal";
+import { formatFileSize } from "../src/ui/file-comparison-modal";
+
+interface FakeHistoryElement {
+  tag: string;
+  className: string;
+  text: string;
+  open: boolean;
+  children: FakeHistoryElement[];
+  createDiv(className?: string): FakeHistoryElement;
+  createSpan(className?: string): FakeHistoryElement;
+  createEl(tag: string, className?: string): FakeHistoryElement;
+  setText(text: string): FakeHistoryElement;
+}
+
+function createFakeHistoryElement(
+  tag = "div",
+  className = "",
+): FakeHistoryElement {
+  const element: FakeHistoryElement = {
+    tag,
+    className,
+    text: "",
+    open: false,
+    children: [],
+    createDiv(childClass = "") {
+      const child = createFakeHistoryElement("div", childClass);
+      this.children.push(child);
+      return child;
+    },
+    createSpan(childClass = "") {
+      const child = createFakeHistoryElement("span", childClass);
+      this.children.push(child);
+      return child;
+    },
+    createEl(childTag, childClass = "") {
+      const child = createFakeHistoryElement(childTag, childClass);
+      this.children.push(child);
+      return child;
+    },
+    setText(text) {
+      this.text = text;
+      return this;
+    },
+  };
+  return element;
+}
+
+function collectFakeHistoryText(element: FakeHistoryElement): string[] {
+  return [
+    ...(element.text ? [element.text] : []),
+    ...element.children.flatMap(collectFakeHistoryText),
+  ];
+}
 
 describe("syncViewProgressPercent", () => {
   it("keeps sidebar file-count progress separate from floating byte-folded progress", () => {
@@ -40,7 +100,230 @@ describe("syncViewProgressPercent", () => {
   });
 });
 
+describe("shared sidebar detail controls", () => {
+  it("collapses nested missing-local folder issues into one root review", () => {
+    const issue = (path: string, issueCode?: "anchored-folder-missing-local") => ({
+      path,
+      actionType: SyncActionType.FolderDeferred,
+      issueCode,
+      updatedAt: 1,
+    });
+    const grouped = groupPendingIssuesForReview([
+      issue("Issues/CAD", "anchored-folder-missing-local"),
+      issue("Other"),
+      issue("Issues", "anchored-folder-missing-local"),
+      issue("Issues/CAD/Parts", "anchored-folder-missing-local"),
+    ]);
+
+    expect(grouped).toHaveLength(2);
+    expect(grouped[0]).toMatchObject({ issue: { path: "Other" } });
+    expect(grouped[1]).toMatchObject({
+      issue: { path: "Issues" },
+      nestedIssues: [
+        { path: "Issues/CAD" },
+        { path: "Issues/CAD/Parts" },
+      ],
+    });
+  });
+
+  it("groups one plugin bundle into one review row without absorbing other conflicts", () => {
+    const conflict = (path: string) => ({
+      type: SyncActionType.Conflict,
+      path,
+    });
+    const grouped = groupCommunityPluginConflictReviews([
+      conflict(".obsidian/plugins/resojot/main.js"),
+      conflict("note.md"),
+      conflict(".obsidian/plugins/resojot/manifest.json"),
+      conflict(".obsidian/plugins/resojot/styles.css"),
+      conflict(".obsidian/plugins/easy-sync/main.js"),
+      conflict(".obsidian/plugins/resojot/data.json"),
+    ], ".obsidian");
+
+    expect(grouped.map((entry) => entry.kind)).toEqual([
+      "community-plugin-bundle",
+      "file",
+      "file",
+      "file",
+    ]);
+    expect(grouped[0]).toMatchObject({
+      kind: "community-plugin-bundle",
+      pluginId: "resojot",
+      items: [
+        { path: ".obsidian/plugins/resojot/main.js" },
+        { path: ".obsidian/plugins/resojot/manifest.json" },
+        { path: ".obsidian/plugins/resojot/styles.css" },
+      ],
+    });
+  });
+
+  it("uses the current visible state to choose the next global action", () => {
+    expect(shouldExpandAllVisibleDetails([true, true])).toBe(false);
+    expect(shouldExpandAllVisibleDetails([true, false])).toBe(true);
+    expect(shouldExpandAllVisibleDetails([false, false])).toBe(true);
+  });
+
+  it("uses one human-readable file-size contract across comparison modals", () => {
+    expect(formatFileSize(0)).toBe("0 B");
+    expect(formatFileSize(1024)).toBe("1.0 KB");
+    expect(formatFileSize(1024 * 1024)).toBe("1.0 MB");
+  });
+
+  it("applies an explicit plan-wide expand action to lazily rendered decisions", () => {
+    const detail = { setAttribute: vi.fn() };
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      planGroupsCollapsed: false,
+      collapseToggleButtonEl: null,
+    });
+    const container = {
+      querySelectorAll: vi.fn().mockReturnValue([detail]),
+    } as unknown as HTMLElement;
+
+    (view as unknown as {
+      applyPlanDetailsExpandOverride(container: HTMLElement): void;
+    }).applyPlanDetailsExpandOverride(container);
+
+    expect(detail.setAttribute).toHaveBeenCalledWith("open", "");
+  });
+});
+
 describe("sync view status copy and scrolling layout", () => {
+  it("keeps upgrade, recovery, and unavailable-state copy concise and factual", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+
+    expect(zh.t("syncPlan.detailsUnavailable"))
+      .toBe("暂时无法显示同步计划明细。");
+    expect(en.t("syncPlan.detailsUnavailable"))
+      .toBe("Sync plan details are temporarily unavailable.");
+    expect(zh.t("syncPlan.restoringDetails")).toBe("正在恢复计划明细");
+    expect(zh.t("syncPlan.restoreDetails")).toBe("恢复计划明细");
+    expect(zh.t("syncPlan.remoteScopeRecreateSummary"))
+      .toBe("原远端同步目录无法继续使用，需要重新创建后核对内容。");
+    expect(en.t("syncPlan.remoteScopeRecreateSummary"))
+      .toContain("previous remote sync folder");
+    expect(zh.t("result.sharedControlReadUnavailable"))
+      .toBe("暂时无法读取云端同步状态，本轮未进入新的文件同步计划；EasySync 会在下次同步时重新检查。");
+    expect(en.t("result.sharedControlReadUnavailable"))
+      .toBe("The cloud sync state is temporarily unavailable, so this run did not enter a new file sync plan. EasySync will check again on the next sync.");
+    expect(zh.t("syncView.history.noFileChanges"))
+      .toBe("本轮没有文件变更。");
+    expect(en.t("syncView.history.noFileChanges"))
+      .toBe("No files changed in this sync.");
+
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    expect(source).not.toContain("CommunityPluginLegacyMigration");
+    expect(source).not.toContain("syncView.communityPlugins.migration");
+  });
+
+  it("states unfinished-operation direction and details without engineering copy", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+    const zhDelete = zh.t("syncView.mutationResolution.deleteConfirmMessage", {
+      choice: "保留当前本机",
+      path: "note.md",
+    });
+
+    expect(zhDelete).toContain("在所选一侧不存在");
+    expect(zhDelete).toContain("删除另一侧现有的副本");
+    expect(zh.t("syncView.mutationResolution.previousAction", { action: "上传本机文件" }))
+      .toBe("上次操作：上传本机文件");
+    expect(en.t("syncView.mutationResolution.previousAction", { action: "Upload local file" }))
+      .toBe("Previous operation: Upload local file");
+    expect(zh.t("syncView.mutationResolution.present", { size: "1.0 KB" }))
+      .toBe("1.0 KB");
+    expect(en.t("syncView.mutationResolution.present", { size: "1.0 KB" }))
+      .toBe("1.0 KB");
+    expect(zh.t("syncView.mutationResolution.technicalDetails")).toBe("查看技术详情");
+    expect(en.t("syncView.mutationResolution.technicalDetails")).toBe("View technical details");
+    expect([
+      zh.t("syncView.mutationResolution.unavailable"),
+      zh.t("notice.mutationResolution.unavailable"),
+      en.t("syncView.mutationResolution.unavailable"),
+      en.t("notice.mutationResolution.unavailable"),
+    ].join("\n")).not.toMatch(/安全归并|reduced safely|verification evidence/);
+
+    const modalSource = readFileSync(
+      "src/ui/mutation-recovery-resolution-modal.ts",
+      "utf8",
+    );
+    expect(modalSource).toContain("formatFileSize(fact.size ?? 0)");
+    expect(modalSource).not.toContain(")：${");
+  });
+
+  it("separates empty-folder situations from actions without exposing folder internals", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+    const modalSource = readFileSync(
+      "src/ui/empty-folder-resolution-modal.ts",
+      "utf8",
+    );
+
+    expect([
+      zh.t("syncView.emptyFolder.deleteUnavailableDescription"),
+      zh.t("syncView.emptyFolder.deleteConfirmWarning"),
+    ].join("\n")).not.toMatch(/版本凭据|身份和版本/);
+    expect([
+      en.t("syncView.emptyFolder.deleteUnavailableDescription"),
+      en.t("syncView.emptyFolder.deleteConfirmWarning"),
+    ].join("\n")).not.toMatch(/folder version|identity and version/i);
+    expect(modalSource).toContain(
+      '.setName(this.t("syncView.emptyFolder.restoreTitle"))',
+    );
+    expect(modalSource).toContain(
+      '.setButtonText(this.t("syncView.emptyFolder.restore"))',
+    );
+    expect(modalSource).toContain(
+      '.setName(this.snapshot.remoteCTag\n        ? this.t("syncView.emptyFolder.delete")',
+    );
+    expect(modalSource).toContain(
+      '.setButtonText(this.t("syncView.emptyFolder.deleteConfirm"))',
+    );
+    expect(zh.t("syncView.folderSubtree.review")).toBe("核对文件夹");
+    expect(zh.t("syncView.folderSubtree.description", { path: "问题" }))
+      .toContain("上次同步确认的云端内容");
+    expect(en.t("syncView.folderSubtree.description", { path: "Issues" }))
+      .toContain("cloud contents confirmed by the last sync");
+    expect([
+      zh.t("syncView.folderSubtree.deleteUnavailableDescription"),
+      en.t("syncView.folderSubtree.deleteUnavailableDescription"),
+    ].join("\n")).not.toMatch(/版本凭据|version proof/i);
+    expect(modalSource).toContain('if ("members" in this.snapshot)');
+    expect(modalSource).toContain('this.renderSubtreeReview(contentEl)');
+    expect(modalSource).toContain(
+      '.setName(this.t("syncView.folderSubtree.restoreTitle"))',
+    );
+    expect(modalSource).toContain(
+      '.setButtonText(this.t("syncView.folderSubtree.restore"))',
+    );
+    expect(modalSource).toContain(
+      '.setName(root?.remoteCTag\n        ? this.t("syncView.folderSubtree.deleteTitle")',
+    );
+    expect(modalSource).toContain(
+      '.setButtonText(this.t("syncView.folderSubtree.delete"))',
+    );
+    expect(zh.t("syncView.folderLocation.resolve")).toBe("选择位置");
+    expect(zh.t("syncView.folderLocation.description", { path: "原文件夹" }))
+      .toContain("请选择同步后使用的位置");
+    expect(en.t("syncView.folderLocation.description", { path: "Original" }))
+      .toContain("Choose the location to use after syncing");
+    expect(modalSource).toContain('if ("localPath" in this.snapshot)');
+    expect(modalSource).toContain('this.renderLocationReview(contentEl)');
+    expect(modalSource).toContain(
+      '.setButtonText(this.t("syncView.folderLocation.keepLocal"))',
+    );
+    expect(modalSource).toContain(
+      '.setButtonText(this.t("syncView.folderLocation.keepRemote"))',
+    );
+    expect([
+      zh.t("syncView.folderLocation.title"),
+      zh.t("syncView.folderLocation.description", { path: "原文件夹" }),
+      en.t("syncView.folderLocation.title"),
+      en.t("syncView.folderLocation.description", { path: "Original" }),
+    ].join("\n")).not.toMatch(/锚点|身份|eTag|anchor|identity/i);
+  });
+
   it("explains same-content copies through the existing cloud-location decision", () => {
     const zh = new I18n("zh-cn");
     const en = new I18n("en");
@@ -124,7 +407,7 @@ describe("sync view status copy and scrolling layout", () => {
     })).not.toContain("raw-provider-error");
   });
 
-  it("keeps the sidebar toolbar fixed above one independent content scroller", () => {
+  it("keeps the sidebar toolbar and primary action fixed above one independent content scroller", () => {
     const styles = readFileSync("styles.css", "utf8");
     const desktopViewBlock = styles.match(
       /body:not\(\.is-mobile\) \.view-content\.easy-sync-view\s*\{([^}]*)\}/s,
@@ -141,6 +424,15 @@ describe("sync view status copy and scrolling layout", () => {
     const desktopContentBlock = styles.match(
       /body:not\(\.is-mobile\) \.easy-sync-view-content\s*\{([^}]*)\}/s,
     )?.[1] ?? "";
+    const statusBlock = styles.match(
+      /\.easy-sync-status-panel\s*\{([^}]*)\}/s,
+    )?.[1] ?? "";
+    const mobileStatusBlock = styles.match(
+      /body\.is-mobile \.view-content\.easy-sync-view > \.easy-sync-status-panel\s*\{([^}]*)\}/s,
+    )?.[1] ?? "";
+    const darkMobileStatusBlock = styles.match(
+      /body\.theme-dark\.is-mobile \.view-content\.easy-sync-view > \.easy-sync-status-panel\s*\{([^}]*)\}/s,
+    )?.[1] ?? "";
 
     expect(desktopViewBlock).toContain("display: flex");
     expect(desktopViewBlock).toContain("flex-direction: column");
@@ -149,12 +441,27 @@ describe("sync view status copy and scrolling layout", () => {
     expect(toolbarBlock).toContain("top: 0");
     expect(toolbarBlock).toContain("background: transparent");
     expect(mobileViewBlock).toContain("padding-bottom: max(var(--safe-area-inset-bottom), var(--size-4-8))");
-    expect(mobileToolbarBlock).toContain("background: var(--background-primary)");
+    expect(mobileViewBlock).not.toMatch(/background(?:-color)?:/);
+    expect(mobileToolbarBlock).not.toMatch(/background(?:-color)?:/);
     expect(desktopContentBlock).toContain("flex: 1 1 auto");
     expect(desktopContentBlock).toContain("min-height: 0");
     expect(desktopContentBlock).toContain("overflow-y: auto");
+    expect(statusBlock).toContain("flex: 0 0 auto");
+    expect(statusBlock).not.toMatch(/background(?:-color)?:/);
+    expect(mobileStatusBlock).toContain("position: sticky");
+    expect(mobileStatusBlock).toContain("top: 0");
+    expect(mobileStatusBlock).toContain("z-index: 1");
+    expect(mobileStatusBlock).toContain(
+      "background-color: var(--mobile-sidebar-background, var(--background-primary))",
+    );
+    expect(darkMobileStatusBlock).toContain(
+      "background-color: var(--mobile-sidebar-background, var(--background-secondary))",
+    );
     expect(styles).not.toMatch(
       /body\.is-mobile \.view-content\.easy-sync-view > \.nav-header\s*\{[^}]*position:\s*sticky/s,
+    );
+    expect(styles).not.toMatch(
+      /body\.is-mobile \.easy-sync-view-content\s*\{[^}]*overflow(?:-y)?:/s,
     );
   });
 });
@@ -178,6 +485,7 @@ describe("buildSyncViewContentKey", () => {
       cancelRequested: false,
     },
     planReviewActive: false,
+    planReviewDetailsState: "ready" as const,
     pendingIssues: [],
     conflicts: [],
     pendingDeletes: [],
@@ -279,6 +587,34 @@ describe("buildSyncViewContentKey", () => {
 
     expect(empty).not.toBe(withEntry);
     expect(withEntry).toContain("run-1");
+  });
+
+  it("refreshes expanded history when a persisted run message changes", () => {
+    const entry = {
+      id: "run-message",
+      mode: "auto" as const,
+      status: "failed" as const,
+      startedAt: 1,
+      endedAt: 2,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      skipped: 0,
+      errors: 1,
+      message: "first reason",
+      files: [],
+    };
+    const first = buildSyncViewContentKey(true, {
+      ...baseInput,
+      history: [entry],
+    });
+    const updated = buildSyncViewContentKey(true, {
+      ...baseInput,
+      history: [{ ...entry, message: "updated reason" }],
+    });
+
+    expect(updated).not.toBe(first);
   });
 
   it("rebuilds a pending row when a stable resolution code appears", () => {
@@ -384,24 +720,6 @@ describe("buildSyncViewContentKey", () => {
     expect(loggedOut).not.toBe(pending);
   });
 
-  it("changes when a persistent community plugin decision appears", () => {
-    const empty = buildSyncViewContentKey(false, baseInput);
-    const pending = buildSyncViewContentKey(false, {
-      ...baseInput,
-      isLoggedIn: true,
-      isRunning: false,
-      bodyMode: "pending",
-      communityPluginEnablementPending: 2,
-      progress: {
-        ...baseInput.progress,
-        phase: "idle",
-      },
-    });
-
-    expect(empty).not.toBe(pending);
-    expect(pending).toContain("community-plugins:2");
-  });
-
   it("changes when a reviewed plan settles from running to paused so action buttons rebuild", () => {
     const runningPlan = buildSyncViewContentKey(false, {
       ...baseInput,
@@ -450,7 +768,7 @@ describe("buildSyncViewContentKey", () => {
       ...baseInput,
       isLoggedIn: true,
       isRunning: false,
-      bodyMode: "idle",
+      bodyMode: "recovery",
       mutationRecovery: {
         kind: "waiting-network",
         total: 2,
@@ -465,7 +783,7 @@ describe("buildSyncViewContentKey", () => {
       ...baseInput,
       isLoggedIn: true,
       isRunning: false,
-      bodyMode: "idle",
+      bodyMode: "recovery",
       mutationRecovery: {
         kind: "blocked",
         total: 2,
@@ -964,6 +1282,90 @@ describe("buildSyncViewContentKey", () => {
     }])).toBe(false);
     expect(shouldAutoRebuildPlanReview({ ...counts, uploads: 0 }, [])).toBe(false);
     expect(shouldAutoRebuildPlanReview(null, [])).toBe(false);
+    expect(resolvePlanReviewDetailsState(false, false)).toBe("ready");
+    expect(resolvePlanReviewDetailsState(true, true)).toBe("recovering");
+    expect(resolvePlanReviewDetailsState(true, false)).toBe("retry");
+  });
+
+  it("single-flights automatic detail recovery and permits an explicit retry", async () => {
+    const rebuildPlanReview = vi.fn()
+      .mockRejectedValueOnce(new Error("temporary"))
+      .mockResolvedValueOnce(undefined);
+    const render = vi.fn();
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      closed: false,
+      planReviewDetailsRecoveryInFlight: false,
+      autoRebuiltPlanReviewRevision: -1,
+      plugin: {
+        rebuildPlanReview,
+        state: {
+          planReviewRevision: 7,
+          planReviewCounts: {
+            uploads: 1,
+            downloads: 0,
+            folders: 0,
+            deletes: 0,
+            conflicts: 0,
+            skipped: 0,
+          },
+          planReviewItems: [],
+        },
+        diag: { warn: vi.fn() },
+      },
+      render,
+    });
+    const recover = (force = false) => (
+      view as unknown as {
+        recoverPlanReviewDetails(revision: number, force?: boolean): void;
+      }
+    ).recoverPlanReviewDetails(7, force);
+
+    recover();
+    recover();
+    expect(rebuildPlanReview).toHaveBeenCalledTimes(1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    recover();
+    expect(rebuildPlanReview).toHaveBeenCalledTimes(1);
+    recover(true);
+    expect(rebuildPlanReview).toHaveBeenCalledTimes(2);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(render).toHaveBeenCalled();
+  });
+
+  it("ignores a stale detail-recovery control after the reviewed revision changes", () => {
+    const rebuildPlanReview = vi.fn();
+    const render = vi.fn();
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      closed: false,
+      planReviewDetailsRecoveryInFlight: false,
+      autoRebuiltPlanReviewRevision: 7,
+      plugin: {
+        rebuildPlanReview,
+        state: {
+          planReviewRevision: 8,
+          planReviewCounts: {
+            uploads: 1,
+            downloads: 0,
+            folders: 0,
+            deletes: 0,
+            conflicts: 0,
+            skipped: 0,
+          },
+          planReviewItems: [{ type: SyncActionType.Upload, path: "ready.md" }],
+        },
+        diag: { warn: vi.fn() },
+      },
+      render,
+    });
+
+    (view as unknown as {
+      recoverPlanReviewDetails(revision: number, force?: boolean): void;
+    }).recoverPlanReviewDetails(7, true);
+
+    expect(rebuildPlanReview).not.toHaveBeenCalled();
+    expect(render).not.toHaveBeenCalled();
   });
 
   it("renders no plan rows when a virtual group is outside the viewport", () => {
@@ -1020,6 +1422,116 @@ describe("buildSyncViewContentKey", () => {
       "文件移动/重命名 1 · 文件夹移动/重命名 2 · 删除文件夹 1",
     );
     expect(counts).not.toContain("创建文件夹");
+  });
+
+  it("renders a persisted run reason and an explicit zero-change success without fake file rows", () => {
+    const root = createFakeHistoryElement();
+    const section = createFakeHistoryElement("section");
+    root.children.push(section);
+    const renderFileResults = vi.fn();
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      plugin: { i18n: new I18n("zh-cn") },
+      createSection: vi.fn(() => section),
+      addCollapseIcon: vi.fn(),
+      renderFileResults,
+    });
+
+    (view as unknown as {
+      renderHistorySection(
+        container: HTMLElement,
+        history: Array<Record<string, unknown>>,
+      ): void;
+    }).renderHistorySection(root as unknown as HTMLElement, [
+      {
+        id: "failed-observation",
+        mode: "auto",
+        status: "failed",
+        startedAt: 1,
+        endedAt: 2,
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+        conflicts: 0,
+        deferred: 0,
+        skipped: 0,
+        errors: 1,
+        message: "暂时无法读取云端同步状态。",
+        files: [],
+        runFacts: {
+          termination: "normal",
+          ordinaryPlanning: "not-entered",
+          userFileChanges: "unknown",
+        },
+      },
+      {
+        id: "explicit-zero-change",
+        mode: "auto",
+        status: "success",
+        startedAt: 3,
+        endedAt: 4,
+        uploaded: 0,
+        downloaded: 0,
+        foldersCreated: 0,
+        foldersMoved: 0,
+        foldersDeleted: 0,
+        filesMoved: 0,
+        deleted: 0,
+        conflicts: 0,
+        deferred: 0,
+        skipped: 0,
+        errors: 0,
+        message: "同步完成",
+        files: [],
+        runFacts: {
+          termination: "normal",
+          ordinaryPlanning: "entered",
+          userFileChanges: "none",
+        },
+      },
+    ]);
+
+    const text = collectFakeHistoryText(root);
+    expect(text).toContain("暂时无法读取云端同步状态。");
+    expect(text).toContain("本轮没有文件变更。");
+    expect(renderFileResults).not.toHaveBeenCalled();
+  });
+
+  it("does not infer zero file changes for a legacy history entry without run facts", () => {
+    const root = createFakeHistoryElement();
+    const section = createFakeHistoryElement("section");
+    root.children.push(section);
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      plugin: { i18n: new I18n("zh-cn") },
+      createSection: vi.fn(() => section),
+      addCollapseIcon: vi.fn(),
+      renderFileResults: vi.fn(),
+    });
+
+    (view as unknown as {
+      renderHistorySection(
+        container: HTMLElement,
+        history: Array<Record<string, unknown>>,
+      ): void;
+    }).renderHistorySection(root as unknown as HTMLElement, [{
+      id: "legacy-empty-success",
+      mode: "auto",
+      status: "success",
+      startedAt: 1,
+      endedAt: 2,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      skipped: 0,
+      errors: 0,
+      message: "同步完成",
+      files: [],
+    }]);
+
+    expect(collectFakeHistoryText(root)).not.toContain("本轮没有文件变更。");
   });
 
   it("does not report a failed run as omitted successful file details", () => {
@@ -1113,11 +1625,19 @@ describe("buildSyncViewContentKey", () => {
 
     expect(status).toContain('"syncPlan.confirmMigration"');
     expect(status).toContain('"syncPlan.confirmExecute"');
-    expect(status).toContain("this.plugin.executePlanReview()");
+    expect(status).toContain('"syncPlan.restoringDetails"');
+    expect(status).toContain('"syncPlan.restoreDetails"');
+    expect(status.indexOf("state.planReviewDetailsState")).toBeLessThan(
+      status.indexOf("this.plugin.executePlanReview(state.planReviewRevision)"),
+    );
+    expect(status).not.toContain('"syncPlan.remoteScopeRecreateConfirm"');
+    expect(status).toContain("this.plugin.executePlanReview(state.planReviewRevision)");
+    expect(status).toContain("this.recoverPlanReviewDetails(");
     expect(status).toContain(".setCta()");
     expect(section).not.toContain('t("syncPlan.recalculate")');
     expect(section).not.toContain("this.plugin.rebuildPlanReview()");
     expect(section).not.toContain("this.plugin.executePlanReview()");
+    expect(section).toContain('t("syncPlan.remoteScopeRecreateSummary")');
     expect(groups).toContain('details.addEventListener("toggle"');
     expect(groups).toContain("this.measurePlanRowHeights(body)");
     expect(groups).toContain(
@@ -1138,13 +1658,18 @@ describe("buildSyncViewContentKey", () => {
     const source = readFileSync("src/ui/sync-view.ts", "utf8");
 
     expect(source).toContain("private planExpandedGroups = new Set<SyncActionGroup>()");
-    expect(source).toContain("this.planExpandedGroups.clear();\n        preservedPlanScrollTop = null;");
+    expect(source).toContain("this.planExpandedGroups.clear();\n        preservedContentScrollTop = null;");
     expect(source).toContain("details.dataset.easySyncPlanGroup = group.group");
     expect(source).toContain("this.planExpandedGroups.add(group.group)");
     expect(source).toContain("expandedPlanGroups.has(group)");
     expect(source).toContain("this.planExpandedGroups.has(group.group)");
     expect(source).toContain("renderInlineDecisions();");
-    expect(source).toContain("content.scrollTop = preservedPlanScrollTop");
+    expect(source).toContain(
+      '(bodyMode === "plan" || bodyMode === "recovery" || bodyMode === "idle")',
+    );
+    expect(source).toContain("content.scrollTop = preservedContentScrollTop");
+    expect(source).toContain("container.scrollTop = preservedHostScrollTop");
+    expect(source).toContain("this.updateCollapseTogglePresentation();");
   });
 
   it("submits UI decisions only through the plugin gateway", () => {
@@ -1163,6 +1688,9 @@ describe("buildSyncViewContentKey", () => {
     );
     expect(viewSource).toContain(
       "plugin.retireReviewedStaleIdentity(snapshot)",
+    );
+    expect(viewSource).toContain(
+      "plugin.resolveReviewedFolderLocation(",
     );
     expect(viewSource).not.toContain(
       "syncExecutor.confirmReviewedSharedFolderIdentity",
@@ -1203,6 +1731,32 @@ describe("buildSyncViewContentKey", () => {
     );
   });
 
+  it("routes a two-sided folder move to one existing folder modal", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const modalSource = readFileSync(
+      "src/ui/empty-folder-resolution-modal.ts",
+      "utf8",
+    );
+    const rowStart = source.indexOf("  private renderPendingIssue(");
+    const openStart = source.indexOf(
+      "  private async openFolderLocationResolution(",
+      rowStart,
+    );
+    const row = source.slice(rowStart, source.indexOf(
+      "  private async openStaleIdentityResolution(",
+      rowStart,
+    ));
+    const openMethod = source.slice(openStart, source.indexOf("\n  private ", openStart + 5));
+
+    expect(row).toContain('issue.issueCode === "folder-location-choice"');
+    expect(row).toContain('t("syncView.folderLocation.resolve")');
+    expect(openMethod).toContain("new EmptyFolderResolutionModal(");
+    expect(openMethod).toContain('choice?.action === "keep-local-location"');
+    expect(openMethod).toContain('choice?.action === "keep-remote-location"');
+    expect(openMethod).toContain("this.plugin.resolveReviewedFolderLocation(");
+    expect(modalSource).not.toContain("class FolderLocationResolutionModal");
+  });
+
   it("keeps stale identity retirement explicit, state-only, and local to its pending row", () => {
     const source = readFileSync("src/ui/sync-view.ts", "utf8");
     const rowStart = source.indexOf("  private renderPendingIssue(");
@@ -1239,36 +1793,55 @@ describe("buildSyncViewContentKey", () => {
       "src/ui/mutation-recovery-resolution-modal.ts",
       "utf8",
     );
+    const conflictSource = readFileSync(
+      "src/ui/conflict-detail-modal.ts",
+      "utf8",
+    );
     const sharedSource = readFileSync("src/ui/file-comparison-modal.ts", "utf8");
     const styles = readFileSync("styles.css", "utf8");
     const openStart = viewSource.indexOf(
       "  private async openMutationRecoveryResolution()",
     );
     const openEnd = viewSource.indexOf(
-      "\n  private renderHistorySection",
+      "\n  private async openCommunityPluginBundleReview",
       openStart,
     );
     const openMethod = viewSource.slice(openStart, openEnd);
+    const confirmStart = viewSource.indexOf(
+      "  private async confirmMutationResolutionDeletion",
+    );
+    const confirmEnd = viewSource.indexOf(
+      "\n  private renderHistorySection",
+      confirmStart,
+    );
+    const confirmMethod = viewSource.slice(confirmStart, confirmEnd);
 
-    expect(viewSource).toContain('"syncView.recovery.reviewAndResolve"');
-    expect(viewSource).toContain('state.mutationRecovery.blockReason === "facts-changed"');
-    expect(viewSource).toContain("state.mutationRecovery.manualResolutionAvailable === true");
-    expect(viewSource).toContain('? "syncView.recovery.reviewAndResolve"');
-    expect(viewSource).toContain('? "syncView.recovery.checkAgain"');
+    expect(viewSource).toContain('"syncView.recovery.reviewDetails"');
+    expect(viewSource).toContain("mutationRecoveryPrimaryActionKey(");
+    expect(viewSource).toContain(
+      'recoveryActionKey === "syncView.recovery.reviewDetails"',
+    );
+    expect(viewSource).toContain("this.renderMutationRecoverySection(");
+    expect(viewSource).not.toContain('"syncView.recovery.reviewAndResolve"');
     expect(openMethod).toContain("if (this.mutationRecoveryResolutionOpening) return");
     expect(openMethod.match(/new MutationRecoveryResolutionModal\(/g)).toHaveLength(1);
     expect(openMethod).toContain(".awaitChoice()");
-    expect(openMethod).toContain("option.deletesOtherSide");
-    expect(openMethod).toContain("new ConfirmModal(");
-    expect(openMethod.indexOf("option.deletesOtherSide")).toBeLessThan(
-      openMethod.indexOf("new ConfirmModal("),
+    expect(openMethod).toContain("confirmMutationResolutionDeletion(snapshot, choice)");
+    expect(confirmMethod).toContain("option.deletesOtherSide");
+    expect(confirmMethod).toContain("new ConfirmModal(");
+    expect(confirmMethod.indexOf("option.deletesOtherSide")).toBeLessThan(
+      confirmMethod.indexOf("new ConfirmModal("),
     );
     expect(openMethod).toContain("this.plugin.resolveMutationRecovery(snapshot, choice)");
     expect(modalSource).toContain("extends FileComparisonModal");
     expect(modalSource).toContain("this.renderComparisonTable(");
+    expect(modalSource).toContain('.addClass("easy-sync-comparison-path-table")');
     expect(modalSource).toContain("this.renderFileComparisonActions([");
-    expect(modalSource).toContain("disabled: !this.snapshot.keepLocal.available");
-    expect(modalSource).toContain("disabled: !this.snapshot.keepRemote.available");
+    expect(modalSource).not.toContain("easy-sync-detail-actions-mobile-stacked");
+    expect(conflictSource).not.toContain("easy-sync-detail-actions-mobile-stacked");
+    expect(conflictSource).not.toContain("easy-sync-comparison-path-table");
+    expect(modalSource).toContain('!executableChoices.includes("keep-local")');
+    expect(modalSource).toContain('!executableChoices.includes("keep-remote")');
     expect(modalSource).not.toContain("extends Modal");
     expect(modalSource).not.toContain("easy-sync-mutation-resolution-");
     expect(sharedSource).toContain('this.contentEl.addClass("easy-sync-conflict-detail")');
@@ -1277,14 +1850,63 @@ describe("buildSyncViewContentKey", () => {
     expect(sharedSource).toContain('createDiv("easy-sync-detail-actions")');
     expect(modalSource).not.toContain(".setCta()");
     expect(styles).toMatch(
+      /\.easy-sync-comparison-path-table\s*\{[^}]*table-layout:\s*fixed;/s,
+    );
+    expect(styles).toMatch(
+      /\.easy-sync-comparison-path-table th,\s*\.easy-sync-comparison-path-table td\s*\{[^}]*overflow-wrap:\s*anywhere;/s,
+    );
+    expect(styles).not.toContain("easy-sync-detail-actions-mobile-stacked");
+    expect(styles).not.toMatch(
+      /body\.is-mobile \.easy-sync-detail-actions(?:\s|\{)/,
+    );
+    expect(styles).not.toMatch(
       /\.easy-sync-metadata-table\s*\{[^}]*table-layout:\s*fixed;/s,
     );
-    expect(styles).toMatch(
-      /\.easy-sync-metadata-table th,\s*\.easy-sync-metadata-table td\s*\{[^}]*overflow-wrap:\s*anywhere;/s,
+  });
+
+  it("reuses the comparison modal and shared confirmation for one plugin bundle", () => {
+    const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
+    const modalSource = readFileSync(
+      "src/ui/mutation-recovery-resolution-modal.ts",
+      "utf8",
     );
-    expect(styles).toMatch(
-      /body\.is-mobile \.easy-sync-detail-actions button\s*\{[^}]*width:\s*100%/s,
+    const start = viewSource.indexOf(
+      "  private async openCommunityPluginBundleReview",
     );
+    const end = viewSource.indexOf("\n  private renderHistorySection", start);
+    const method = viewSource.slice(start, end);
+
+    expect(method).toContain("if (this.mutationRecoveryResolutionOpening) return");
+    expect(method.match(/new MutationRecoveryResolutionModal\(/g)).toHaveLength(1);
+    expect(method).toContain(".getCommunityPluginBundleReviewSnapshot(pluginId)");
+    expect(method).toContain("const snapshotPromise = this.plugin");
+    expect(method).toContain("snapshotPromise,");
+    expect(method.indexOf("new MutationRecoveryResolutionModal(")).toBeLessThan(
+      method.indexOf("const snapshot = await snapshotPromise"),
+    );
+    expect(method).not.toContain("resolveConflictKeepLocal");
+    expect(method).not.toContain("resolveConflictKeepRemote");
+    expect(method).toContain("resolveMutationRecovery(snapshot, choice)");
+    expect(method).toContain("confirmMutationResolutionDeletion(snapshot, choice)");
+    expect(modalSource).toContain("bundle.executableChoices ?? []");
+    expect(modalSource).toContain("Promise<MutationResolutionSnapshot | null>");
+    expect(modalSource).toContain("await this.refreshComparison()");
+    expect(modalSource).toContain('"syncView.pluginBundleReview.loading"');
+    expect(modalSource).toContain('"syncView.pluginBundleReview.keepLocal"');
+    expect(modalSource).toContain('"syncView.pluginBundleReview.keepRemote"');
+    expect(viewSource).not.toContain("CommunityPluginBundleReviewModal");
+
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+    expect(zh.t("syncView.pluginBundleReview.open")).toBe("核对插件");
+    expect(zh.t("syncView.pluginBundleReview.keepLocal")).toBe("保留本机插件");
+    expect(zh.t("syncView.pluginBundleReview.keepRemote")).toBe("保留云端插件");
+    expect(zh.t("syncView.mutationResolution.present", { size: "2.6 MB" }))
+      .toBe("2.6 MB");
+    expect(zh.t("syncView.pluginBundleReview.description", { name: "Resojot" }))
+      .toContain("选择最终保留的版本");
+    expect(en.t("syncView.pluginBundleReview.description", { name: "Resojot" }))
+      .toContain("choose which version to keep");
   });
 
   it("requires a native confirmation and reuses the full-width primary action style for batch deletes", () => {
@@ -1309,35 +1931,23 @@ describe("buildSyncViewContentKey", () => {
       section.indexOf("plugin.confirmRemoteDeletes"),
     );
   });
+});
 
-  it("routes community plugin attention from one sidebar summary to the existing manager", () => {
-    const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
-    const settingsSource = readFileSync("src/ui/settings-tab.ts", "utf8");
-    const modalSource = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+describe("resolveSyncViewStatusDetailMode", () => {
+  it("keeps the current full-sync file visible while its mutation receipt is in flight", () => {
+    expect(resolveSyncViewStatusDetailMode({
+      isRunning: true,
+      activityKind: "fullSync",
+      mutationRecoveryVisible: true,
+    })).toBe("current-file");
+  });
 
-    expect(viewSource).toContain(
-      "plugin.getCommunityPluginEnablementPendingCount()",
-    );
-    expect(viewSource).toContain(
-      '"syncView.communityPlugins.pendingTitle"',
-    );
-    expect(viewSource).toContain(
-      '"syncView.communityPlugins.pendingDescription"',
-    );
-    expect(viewSource).toContain(
-      "plugin.openCommunityPluginEnablementReview()",
-    );
-    expect(viewSource).toContain(
-      "communityPluginEnablementPending === 0",
-    );
-    expect(settingsSource).toContain(
-      'new ConfigSyncModal(\n      this.plugin,\n      "community-plugin-files",\n      true,',
-    );
-    expect(modalSource).toContain("focusPendingDecisionIfRequested()");
-    expect(modalSource).toContain("void this.openDecisionModal()");
-    expect(modalSource).toContain(
-      '"easy-sync-plugin-decision-trigger"',
-    );
+  it("keeps dedicated mutation recovery out of the fixed current-file slot", () => {
+    expect(resolveSyncViewStatusDetailMode({
+      isRunning: true,
+      activityKind: "mutationRecovery",
+      mutationRecoveryVisible: true,
+    })).toBe("recovery");
   });
 });
 
@@ -1365,11 +1975,194 @@ describe("resolveSyncViewBodyMode", () => {
       fullSyncRunning: false,
       pendingCount: 0,
       sideActionResultsVisible: false,
+      mutationRecoveryVisible: false,
     })).toBe("idle");
+  });
+
+  it("gives a stable recovery its own body without displacing higher-priority content", () => {
+    expect(resolveSyncViewBodyMode({
+      planReviewActive: false,
+      hasSyncState: true,
+      fullSyncRunning: false,
+      pendingCount: 0,
+      sideActionResultsVisible: false,
+      mutationRecoveryVisible: true,
+    })).toBe("recovery");
+
+    expect(resolveSyncViewBodyMode({
+      planReviewActive: false,
+      hasSyncState: true,
+      fullSyncRunning: false,
+      pendingCount: 1,
+      sideActionResultsVisible: false,
+      mutationRecoveryVisible: true,
+    })).toBe("pending");
+  });
+
+  it("keeps a finished cloud verification failure in the progress body", () => {
+    expect(resolveSyncViewBodyMode({
+      planReviewActive: false,
+      hasSyncState: true,
+      fullSyncRunning: false,
+      pendingCount: 0,
+      sideActionResultsVisible: false,
+      mutationRecoveryVisible: false,
+      remoteScopeRecoveryFailureVisible: true,
+    })).toBe("progress");
+
+    expect(resolveSyncViewBodyMode({
+      planReviewActive: false,
+      hasSyncState: true,
+      fullSyncRunning: false,
+      pendingCount: 0,
+      sideActionResultsVisible: false,
+      mutationRecoveryVisible: true,
+      remoteScopeRecoveryFailureVisible: true,
+    })).toBe("recovery");
+  });
+});
+
+describe("remote scope recovery failure presentation", () => {
+  it("moves the failure path and next step into persistent body content", () => {
+    const i18n = new I18n("zh-cn");
+
+    expect(resolveRemoteScopeRecoveryFailurePresentation({
+      operationFingerprint: "operation-1",
+      protocolPreflight: "ready",
+      total: 3,
+      verifiedThisRun: 1,
+      reused: 0,
+      invalidated: 0,
+      remaining: 2,
+      failureStage: "body-verification",
+      firstFailurePath: "Resources/long/path/file.md",
+    }, i18n.t.bind(i18n))).toEqual({
+      title: "云端核验",
+      summary: "云端文件核验未完成，本轮同步已停止。",
+      path: "Resources/long/path/file.md",
+      nextStep: "请重新同步。已安全记录的核验进度会继续保留。",
+    });
   });
 });
 
 describe("sync view attention presentation", () => {
+  it("keeps pending sign-in and recovery checking concise in the fixed top status", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as {
+      plugin: { i18n: I18n };
+      getStatusPresentation: (state: Record<string, unknown>) => {
+        status: string;
+        label: string;
+      };
+    };
+    view.plugin = { i18n: new I18n("zh-cn") };
+    const baseState = {
+      isInitializing: false,
+      isRunning: false,
+      lastSyncTime: 0,
+      pendingCount: 0,
+      planReviewActive: false,
+      autoSyncPaused: false,
+      progress: { cancelRequested: false },
+    };
+
+    expect(view.getStatusPresentation({
+      ...baseState,
+      isLoggedIn: false,
+      isPending: true,
+      mutationRecovery: null,
+    })).toEqual({ status: "loggedOut", label: "等待登录" });
+
+    expect(view.getStatusPresentation({
+      ...baseState,
+      isLoggedIn: true,
+      isPending: false,
+      mutationRecovery: {
+        kind: "checking",
+        total: 2,
+        settled: 0,
+        remaining: 2,
+        retryAt: null,
+        firstPath: "notes/a.md",
+        blockReason: null,
+      },
+    })).toEqual({ status: "attention", label: "正在核对" });
+  });
+
+  it("uses the verification phase without exposing exact execution actions in the fixed top status", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as {
+      plugin: { i18n: I18n };
+      getStatusPresentation: (state: Record<string, unknown>) => {
+        status: string;
+        label: string;
+      };
+    };
+    view.plugin = { i18n: new I18n("zh-cn") };
+
+    expect(view.getStatusPresentation({
+      isLoggedIn: true,
+      isInitializing: false,
+      isPending: false,
+      isRunning: true,
+      lastSyncTime: 0,
+      pendingCount: 0,
+      planReviewActive: false,
+      autoSyncPaused: false,
+      mutationRecovery: null,
+      progress: {
+        phase: "executing",
+        currentActionType: SyncActionType.MoveRemoteFolder,
+        cancelRequested: false,
+      },
+    })).toEqual({ status: "syncing", label: "同步进行中…" });
+
+    expect(view.getStatusPresentation({
+      isLoggedIn: true,
+      isInitializing: false,
+      isPending: false,
+      isRunning: true,
+      lastSyncTime: 0,
+      pendingCount: 0,
+      planReviewActive: true,
+      autoSyncPaused: false,
+      mutationRecovery: null,
+      progress: {
+        phase: "verifying",
+        current: 46,
+        total: 58,
+        cancelRequested: false,
+      },
+    })).toEqual({ status: "syncing", label: "验证文件一致性…" });
+  });
+
+  it("shows the current state as synced after resolved decisions release their pause", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as {
+      plugin: { i18n: I18n };
+      getStatusPresentation: (state: Record<string, unknown>) => {
+        status: string;
+        label: string;
+      };
+    };
+    view.plugin = { i18n: new I18n("zh-cn") };
+
+    expect(view.getStatusPresentation({
+      isLoggedIn: true,
+      isInitializing: false,
+      isPending: false,
+      isRunning: false,
+      lastSyncTime: 1,
+      pendingCount: 0,
+      planReviewActive: false,
+      autoSyncPaused: false,
+      mutationRecovery: null,
+      latestHistory: {
+        status: "partial",
+        conflicts: 2,
+        errors: 0,
+      },
+      progress: { cancelRequested: false },
+    })).toEqual({ status: "success", label: "已同步" });
+  });
+
   it("keeps the top status generic when only community plugin decisions remain", () => {
     const view = Object.create(EasySyncSyncView.prototype) as {
       plugin: { i18n: I18n };

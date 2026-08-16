@@ -11,6 +11,7 @@ import {
   type MutationAction,
   type MutationCheckpointV1,
   type MutationLedgerEntryV1,
+  type MutationStateEffectV1,
   type ReceiptedRenameAnchorCollisionEvidenceV1,
   type RemoteFileEntry,
 } from "./types";
@@ -98,7 +99,13 @@ export function inspectReceiptedRenameAnchorCollisionV2(
     || !sameSyncScope(intent.scope, envelope.scope)
   ) return null;
   try {
-    assertFileReceiptShape(intent.action, intent.path, intent.sourcePath, receipt.checkpoint);
+    assertFileReceiptShape(
+      intent.action,
+      intent.path,
+      intent.sourcePath,
+      intent.stateEffect,
+      receipt.checkpoint,
+    );
   } catch {
     return null;
   }
@@ -188,7 +195,13 @@ export function reduceFileStateEnvelopeV2(
   }
 
   const checkpoint = receipt.checkpoint;
-  assertFileReceiptShape(intent.action, intent.path, intent.sourcePath, checkpoint);
+  assertFileReceiptShape(
+    intent.action,
+    intent.path,
+    intent.sourcePath,
+    intent.stateEffect,
+    checkpoint,
+  );
   const originalPathById = projectRemoteIndexV2(envelope.remoteIndex);
   const remoteDeletes = new Set(checkpoint.remoteDeletes);
   const nextItemsById: Record<string, RemoteNodeV2> = {
@@ -261,6 +274,43 @@ export function reduceFileStateEnvelopeV2(
   };
   validateEnvelope(next);
   return next;
+}
+
+/**
+ * Validate only the durable, action-specific shape of one ordinary-file
+ * receipt. This deliberately does not read or mutate an envelope, so reset
+ * admission can reject malformed recovery evidence before changing authority.
+ */
+export function assertFileMutationReceiptShapeV1(
+  ledgerEntry: Readonly<MutationLedgerEntryV1>,
+): void {
+  const { intent, receipt } = ledgerEntry;
+  if (isFolderMutationIntentForReceiptValidation(intent)) {
+    throw new Error("V2 file receipt validator received a folder mutation");
+  }
+  if (!receipt) return;
+  if (intent.version !== 1 || receipt.version !== 1) {
+    throw new Error("V2 reducer received an unsupported mutation version");
+  }
+  if (receipt.operationId !== intent.operationId) {
+    throw new Error(`V2 reducer receipt does not match intent: ${intent.operationId}`);
+  }
+  if (!Number.isFinite(receipt.completedAt)) {
+    throw new Error("V2 reducer receipt completion time is invalid");
+  }
+  assertFileReceiptShape(
+    intent.action,
+    intent.path,
+    intent.sourcePath,
+    intent.stateEffect,
+    receipt.checkpoint,
+  );
+}
+
+function isFolderMutationIntentForReceiptValidation(
+  intent: MutationLedgerEntryV1["intent"],
+): intent is Extract<MutationLedgerEntryV1["intent"], { version: 2 }> {
+  return intent.version === 2;
 }
 
 /**
@@ -344,6 +394,7 @@ function assertFileReceiptShape(
   action: MutationAction,
   path: string,
   sourcePath: string | undefined,
+  stateEffect: MutationStateEffectV1 | undefined,
   checkpoint: MutationCheckpointV1,
 ): void {
   if (
@@ -367,6 +418,59 @@ function assertFileReceiptShape(
       throw new Error(`V2 ${action} receipt has invalid ${label}: ${path}`);
     }
   };
+
+  if (stateEffect === "local-only") {
+    if (action !== "download" || !sourcePath) {
+      throw new Error(`V2 local-only receipt is not a source-bound download: ${path}`);
+    }
+    expectPaths(baseUpsertPaths, [], "base upserts");
+    expectPaths(checkpoint.baseRemovals, [], "base removals");
+    expectPaths(remoteUpsertPaths, [], "remote upserts");
+    expectPaths(checkpoint.remoteDeletes, [], "remote deletes");
+    expectPaths(checkpoint.pendingConflictRemovals, [], "pending conflict removals");
+    expectPaths(checkpoint.pendingDeleteRemovals, [], "pending delete removals");
+    return;
+  }
+  if (stateEffect === "settlement-only") {
+    if (
+      sourcePath
+      || !(action === "upload"
+        || action === "download"
+        || action === "deleteRemote"
+        || action === "deleteLocal")
+    ) {
+      throw new Error(`V2 settlement-only receipt is not a single-path side choice: ${path}`);
+    }
+    expectPaths(baseUpsertPaths, [], "base upserts");
+    expectPaths(checkpoint.baseRemovals, [], "base removals");
+    expectPaths(remoteUpsertPaths, [], "remote upserts");
+    expectPaths(checkpoint.remoteDeletes, [], "remote deletes");
+    expectPaths(checkpoint.pendingConflictRemovals, [], "pending conflict removals");
+    expectPaths(checkpoint.pendingDeleteRemovals, [], "pending delete removals");
+    return;
+  }
+  if (stateEffect === "bundle-settlement") {
+    if (sourcePath || !(action === "upload"
+      || action === "download"
+      || action === "deleteRemote"
+      || action === "deleteLocal")) {
+      throw new Error(`V2 bundle-settlement receipt has invalid action: ${path}`);
+    }
+    if (action === "download" || action === "upload") {
+      expectPaths(baseUpsertPaths, [path], "base upserts");
+      expectPaths(checkpoint.baseRemovals, [], "base removals");
+      expectPaths(remoteUpsertPaths, [path], "remote upserts");
+      expectPaths(checkpoint.remoteDeletes, [], "remote deletes");
+    } else {
+      expectPaths(baseUpsertPaths, [], "base upserts");
+      expectPaths(checkpoint.baseRemovals, [path], "base removals");
+      expectPaths(remoteUpsertPaths, [], "remote upserts");
+      expectPaths(checkpoint.remoteDeletes, [path], "remote deletes");
+    }
+    expectPaths(checkpoint.pendingConflictRemovals, [], "pending conflict removals");
+    expectPaths(checkpoint.pendingDeleteRemovals, [], "pending delete removals");
+    return;
+  }
 
   switch (action) {
     case "upload":

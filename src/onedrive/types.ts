@@ -62,6 +62,17 @@ export interface UploadResult {
   parentReference?: DriveItem["parentReference"];
 }
 
+/** Strict byte read-back for one immutable object below the plugin-control root. */
+export interface CommunityPluginGenerationCloudObjectV1 {
+  id: string;
+  name: string;
+  parentId: string;
+  size: number;
+  eTag: string;
+  cTag: string;
+  content: ArrayBuffer;
+}
+
 /** OneDrive-specific error types for classification */
 export enum OneDriveErrorType {
   Unauthorized = "Unauthorized",
@@ -97,6 +108,44 @@ export class OneDriveError extends Error {
     this.statusCode = statusCode;
     this.retryAfterSeconds = retryAfterSeconds;
     this.graphCode = graphCode;
+  }
+}
+
+/** A client-side deadline elapsed while Obsidian's requestUrl promise may
+ * still be running. This is not an HTTP response and must never be reported
+ * as status 0 or used to authorize an in-call resend. */
+export class SyntheticRequestTimeoutError extends Error {
+  constructor(
+    public readonly timeoutMs: number,
+    public readonly source: "deadline" | "prior-request-in-flight" = "deadline",
+  ) {
+    super(source === "deadline"
+      ? `Request timed out after ${timeoutMs}ms`
+      : `Previous requestUrl is still running after its ${timeoutMs}ms local deadline`);
+    this.name = "SyntheticRequestTimeoutError";
+  }
+}
+
+export type SharedSyncProtocolObservationComponent =
+  | "directory"
+  | "v2"
+  | "v3";
+
+/** Preserve which part of one logical V2+V3 observation failed without
+ * making the Graph client responsible for protocol-lineage decisions. */
+export class SharedSyncProtocolObservationError extends Error {
+  constructor(
+    public readonly component: SharedSyncProtocolObservationComponent,
+    public readonly observationCause: unknown,
+  ) {
+    super(
+      `Shared sync protocol ${component} observation failed: ${
+        observationCause instanceof Error
+          ? observationCause.message
+          : String(observationCause)
+      }`,
+    );
+    this.name = "SharedSyncProtocolObservationError";
   }
 }
 
@@ -139,6 +188,9 @@ export const APP_FOLDER_PATHS = {
   /** Plugin state directory: /vaults/<vault-name>/.easy-sync/ */
   pluginDir: (vaultName: string) =>
     `/me/drive/special/approot:/vaults/${encodeUrlPath(vaultName)}/.easy-sync`,
+  /** Immutable generation content below the plugin state directory. */
+  pluginItem: (vaultName: string, relativePath: string) =>
+    `/me/drive/special/approot:/vaults/${encodeUrlPath(vaultName)}/.easy-sync/${encodeUrlPath(relativePath)}`,
   /** Delta endpoint for files directory */
   filesDelta: (vaultName: string) =>
     `/me/drive/special/approot:/vaults/${encodeUrlPath(vaultName)}/files:/delta`,

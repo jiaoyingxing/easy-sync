@@ -83,26 +83,30 @@ describe("A0-P zero-change performance contract", () => {
   });
 
   it("uses one Graph page for a valid single-page zero-change delta", async () => {
+      const currentDelta =
+        "https://graph.microsoft.com/v1.0/drives/drive-id/items/files-root-id/delta?token=current";
+      const nextDelta =
+        "https://graph.microsoft.com/v1.0/drives/drive-id/items/files-root-id/delta?token=next";
       const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
         status: 200,
         headers: {},
         json: {
           value: [],
-          "@odata.deltaLink": "https://graph.example/delta-next",
+          "@odata.deltaLink": nextDelta,
         },
       });
       const client = new OneDriveClient(async () => "token");
 
       const result = await client.getDelta(
         "testVault",
-        "https://graph.example/delta-current",
+        currentDelta,
       );
 
       expect(result.value).toEqual([]);
       expect(requestSpy).toHaveBeenCalledTimes(1);
       expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({
         method: "GET",
-        url: "https://graph.example/delta-current",
+        url: currentDelta,
       }));
       requestSpy.mockRestore();
   });

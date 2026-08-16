@@ -3,13 +3,19 @@ import { Platform, requireApiVersion } from "obsidian";
 import { sha256Hex } from "../src/crypto";
 import type { OneDriveClient } from "../src/onedrive/client";
 import { OneDriveError, OneDriveErrorType } from "../src/onedrive/types";
-import { SyncExecutor } from "../src/sync/sync-executor";
+import {
+  SyncExecutor,
+  type AutomaticHandlingMetrics,
+  type SyncResult,
+} from "../src/sync/sync-executor";
 import type { LocalScanner } from "../src/sync/local-scanner";
 import type { StateManager } from "../src/sync/state-manager";
 import {
-  projectFileStatePathViewV2,
   reduceFileStateEnvelopeV2,
 } from "../src/sync/file-state-reducer-v2";
+import { projectStatePathViewV2 } from "../src/sync/file-state-controller-v2";
+import { acceptConfirmedDescendantFolderAnchorsV2 } from
+  "../src/sync/folder-state-reducer-v2";
 import { createFileStateShadowEnvelopeV2 } from "./helpers/file-state-shadow-v2";
 import {
   readCommunityPluginSyncPolicy,
@@ -26,13 +32,36 @@ import type {
 import type {
   CommunityPluginJoinAuthorization,
 } from "../src/sync/community-plugin-join";
+import { validateCommunityPluginJoinAuthorization } from "../src/sync/community-plugin-join";
 import type {
   BaseFileEntry,
   LocalFileEntry,
   LocalFolderEntry,
   RemoteFileEntry,
   RemoteFolderEntry,
+  SyncPlan,
+  SyncPlanItem,
 } from "../src/sync/types";
+import { SyncActionType } from "../src/sync/types";
+import {
+  communityPluginGenerationObjectPathV1,
+  createCommunityPluginBundlePublicationCommandV1,
+  createCommunityPluginGenerationContentGrantV1,
+  prepareCommunityPluginGenerationBundleManifestV1,
+} from "../src/sync/community-plugin-generation-content-v1";
+import {
+  createCommunityPluginLifecycleControlV1,
+  reduceCommunityPluginLifecycleV1,
+  type CommunityPluginLifecycleCommandV1,
+  type CommunityPluginLifecycleControlV1,
+  type CommunityPluginParticipantIdentityV1,
+} from "../src/sync/community-plugin-lifecycle-v1";
+import {
+  CommunityPluginLifecycleDeviceObserverV1,
+  loadOrCreateCommunityPluginLifecycleDeviceIdentityV1,
+} from "../src/sync/community-plugin-lifecycle-device-v1";
+import type { VaultLocalStorage } from
+  "../src/sync/indexeddb-vault-namespace";
 
 const SCOPE = {
   accountId: "account-id",
@@ -175,6 +204,28 @@ function joinAuthorization(
   };
 }
 
+function applyLifecycleCommand(
+  state: CommunityPluginLifecycleControlV1,
+  input: Omit<
+    CommunityPluginLifecycleCommandV1,
+    "scope" | "expectedRevision" | "at" | "operationId"
+  >,
+  operationId: string,
+  at: number,
+): CommunityPluginLifecycleControlV1 {
+  const reduced = reduceCommunityPluginLifecycleV1(state, {
+    ...input,
+    operationId,
+    expectedRevision: state.revision,
+    scope: SCOPE,
+    at,
+  } as CommunityPluginLifecycleCommandV1);
+  if (reduced.status !== "applied") {
+    throw new Error(`lifecycle fixture blocked: ${reduced.reason}`);
+  }
+  return reduced.state;
+}
+
 function makeMemoryAdapter(initial: Record<string, ArrayBuffer | string>) {
   const binary = new Map<string, ArrayBuffer>();
   const text = new Map<string, string>();
@@ -234,6 +285,23 @@ function makeMemoryAdapter(initial: Record<string, ArrayBuffer | string>) {
   };
 }
 
+function makeVaultLocalStorage(): VaultLocalStorage & {
+  values: Map<string, unknown>;
+} {
+  const values = new Map<string, unknown>();
+  return {
+    values,
+    loadLocalStorage(key) {
+      const value = values.get(key);
+      return value === undefined ? null : structuredClone(value);
+    },
+    saveLocalStorage(key, value) {
+      if (value === null) values.delete(key);
+      else values.set(key, structuredClone(value));
+    },
+  };
+}
+
 function makeState(
   remoteEntries: RemoteFileEntry[],
   baseEntries: BaseFileEntry[] = [],
@@ -285,6 +353,7 @@ function makeState(
   const state = {
     legacyAutoSyncAllowed: false,
     isV2StateActive: true,
+    retireAllFirstSyncVerificationEvidence: vi.fn().mockResolvedValue(0),
     boundAccountId: SCOPE.accountId,
     hasRemoteState: true,
     remoteScope: SCOPE,
@@ -305,6 +374,33 @@ function makeState(
     planReviewScope: null,
     planReviewDigest: "",
     getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
+    acceptConfirmedDescendantFolderAnchors: vi.fn(async (input) => {
+      const reduced = acceptConfirmedDescendantFolderAnchorsV2({
+        envelope,
+        localFiles: input.localFiles,
+        localFolders: input.localFolders,
+        localFolderScanComplete: input.localFolderScanComplete,
+        remoteIdentityComplete: input.remoteIdentityComplete,
+        includeFilePath: input.includeFilePath,
+        includeFolderPath: input.includeFolderPath,
+        confirmedAt: input.now ?? Date.now(),
+      });
+      if (reduced.status === "accepted" && reduced.accepted > 0) {
+        envelope = reduced.envelope;
+      }
+      return reduced.status === "rejected"
+        ? {
+            status: "rejected" as const,
+            reason: reduced.reason,
+            accepted: 0,
+            evidenceFiles: 0,
+          }
+        : {
+            status: reduced.accepted > 0 ? "accepted" as const : "none" as const,
+            accepted: reduced.accepted,
+            evidenceFiles: reduced.evidenceFiles,
+          };
+    }),
     getBaseEntry: vi.fn((path: string) =>
       state.baseSnapshot.find((entry) => entry.path === path)),
     getBaseContent: vi.fn().mockResolvedValue(undefined),
@@ -371,7 +467,7 @@ function makeState(
     }
     const record = state.mutationLedger[index];
     envelope = reduceFileStateEnvelopeV2(envelope, record as never);
-    const projection = projectFileStatePathViewV2(envelope);
+    const projection = projectStatePathViewV2(envelope);
     state.baseSnapshot = projection.baseEntries;
     state.remoteSnapshot = projection.remoteEntries;
     state.remoteFolders = projection.remoteFolders;
@@ -401,7 +497,7 @@ function makeState(
         committedAt: sourceCommittedAt + 1,
       },
     };
-    const projection = projectFileStatePathViewV2(envelope);
+    const projection = projectStatePathViewV2(envelope);
     state.baseSnapshot = projection.baseEntries;
     state.remoteSnapshot = projection.remoteEntries;
     state.remoteFolders = projection.remoteFolders;
@@ -477,6 +573,7 @@ function makeExecutor(options: {
   shouldSyncFolderPath?: (path: string) => boolean;
   diag?: ConstructorParameters<typeof SyncExecutor>[6];
   progressStore?: SyncProgressStore;
+  lifecycleObserver?: ConstructorParameters<typeof SyncExecutor>[11];
 }): {
   executor: SyncExecutor;
   state: StateManager;
@@ -507,6 +604,20 @@ function makeExecutor(options: {
       skippedCount: 0,
       complete: true,
     }),
+    inspectFile: vi.fn(async (path: string) => {
+      const stat = await options.adapter.stat(path);
+      if (!stat) return { status: "missing" as const };
+      const content = await options.adapter.readBinary(path);
+      return {
+        status: "present" as const,
+        entry: {
+          path,
+          size: stat.size,
+          mtime: stat.mtime,
+          hash: await sha256Hex(content),
+        },
+      };
+    }),
     shouldSyncPath: vi.fn().mockReturnValue(true),
     shouldSyncFolderPath: vi.fn(
       options.shouldSyncFolderPath ?? (() => true),
@@ -521,6 +632,11 @@ function makeExecutor(options: {
     undefined,
     options.progressStore,
     options.diag,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    options.lifecycleObserver,
   );
   executor.setCommunityPluginSyncPolicy(options.policy ?? {
     version: 1,
@@ -531,6 +647,1658 @@ function makeExecutor(options: {
 }
 
 describe("community plugin enablement runtime", () => {
+  it("restores a sealed generation through the ordinary bundle and local-only ledger chain", async () => {
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const mainContent = bytes("generation-main");
+    const manifestContent = bytes(PLUGIN_MANIFEST_TEXT);
+    const mainHash = await sha256Hex(mainContent);
+    const manifestHash = await sha256Hex(manifestContent);
+    const sourceRoot =
+      "community-plugin-content-v1/plugins/63616c656e646172/generations/1/objects";
+    const remoteMain = await remoteEntry(
+      `${sourceRoot}/${mainHash}.bin`,
+      mainContent,
+      {
+        driveId: "generation-main-id",
+        parentId: "generation-objects-parent",
+        eTag: "generation-main-etag",
+        cTag: "generation-main-ctag",
+      },
+    );
+    const remoteManifest = await remoteEntry(
+      `${sourceRoot}/${manifestHash}.bin`,
+      manifestContent,
+      {
+        driveId: "generation-manifest-id",
+        parentId: "generation-objects-parent",
+        eTag: "generation-manifest-etag",
+        cTag: "generation-manifest-ctag",
+      },
+    );
+    const generationRestore = {
+      schemaVersion: 1 as const,
+      pluginId: "calendar",
+      participant: {
+        participantId: "participant-a",
+        incarnation: "incarnation-a",
+      },
+      generation: 1,
+      joinNonce: "join-nonce-a",
+      controlRecordId: "lifecycle-control-id",
+      fenceEpoch: 4,
+      sealRevision: 9,
+      manifestObject: {
+        objectPath:
+          "community-plugin-content-v1/plugins/63616c656e646172/generations/1/manifests/"
+          + `${"d".repeat(64)}.json`,
+        remoteId: "bundle-manifest-id",
+        parentId: "generation-manifests-parent",
+        size: 100,
+        eTag: "bundle-manifest-etag",
+        cTag: "bundle-manifest-ctag",
+        sha256Hash: "d".repeat(64),
+      },
+    };
+    const participantKey = "participant-a::incarnation-a";
+    const publishedBundle = {
+      publicationRevision: 8,
+      publisher: { ...generationRestore.participant },
+      publisherJoinNonce: generationRestore.joinNonce,
+      publishedAt: 8,
+      publishedFenceEpoch: 3,
+      manifestObject: { ...generationRestore.manifestObject },
+    };
+    const lifecycleControl = {
+      schemaVersion: 2 as const,
+      kind: "community-plugin-lifecycle-control" as const,
+      scope: { ...SCOPE },
+      revision: 9,
+      fenceEpoch: generationRestore.fenceEpoch,
+      participantsByKey: {
+        [participantKey]: {
+          identity: { ...generationRestore.participant },
+          registeredAt: 1,
+          lastObservedAt: 9,
+          registeredFenceEpoch: 0,
+        },
+      },
+      pluginsById: {
+        calendar: {
+          pluginId: "calendar",
+          generationHighWatermark: 1,
+          currentGeneration: {
+            generation: 1,
+            phase: "open" as const,
+            openedAt: 2,
+            membersByKey: {
+              [participantKey]: {
+                identity: { ...generationRestore.participant },
+                phase: "joined" as const,
+                joinNonce: generationRestore.joinNonce,
+                joinEvidence: "user-confirmed" as const,
+                joinedAt: 3,
+                joinedFenceEpoch: 0,
+              },
+            },
+            publishedBundle,
+          },
+          closedTombstones: [],
+          legacyAuthoritySeal: {
+            generation: 1,
+            sealedBy: { ...generationRestore.participant },
+            sealedAt: 9,
+            sealedRevision: generationRestore.sealRevision,
+            sealedFenceEpoch: generationRestore.fenceEpoch,
+            consentRevision: 6,
+            publishedBundle,
+          },
+        },
+      },
+      legacyMigrationConsent: {
+        confirmedBy: { ...generationRestore.participant },
+        confirmedAt: 6,
+        confirmedRevision: 6,
+        confirmedFenceEpoch: 2,
+        evidence: "user-confirmed-legacy-devices-upgraded-or-retired" as const,
+      },
+    };
+    const generationProjection = {
+      schemaVersion: 1 as const,
+      capability: "restore-sealed-generation-bundle" as const,
+      scope: { ...SCOPE },
+      participant: { ...generationRestore.participant },
+      pluginId: "calendar",
+      generation: 1,
+      joinNonce: generationRestore.joinNonce,
+      controlRecordId: generationRestore.controlRecordId,
+      observedControlRevision: lifecycleControl.revision,
+      fenceEpoch: generationRestore.fenceEpoch,
+      sealRevision: generationRestore.sealRevision,
+      configDir: ".obsidian",
+      manifestObject: { ...generationRestore.manifestObject },
+      members: [
+        {
+          fileName: "main.js" as const,
+          targetPath: mainPath,
+          source: {
+            fileName: "main.js" as const,
+            objectPath: remoteMain.path,
+            remoteId: remoteMain.driveId,
+            parentId: remoteMain.parentId,
+            size: remoteMain.size,
+            eTag: remoteMain.eTag,
+            cTag: remoteMain.cTag!,
+            sha256Hash: mainHash,
+          },
+        },
+        {
+          fileName: "manifest.json" as const,
+          targetPath: manifestPath,
+          source: {
+            fileName: "manifest.json" as const,
+            objectPath: remoteManifest.path,
+            remoteId: remoteManifest.driveId,
+            parentId: remoteManifest.parentId,
+            size: remoteManifest.size,
+            eTag: remoteManifest.eTag,
+            cTag: remoteManifest.cTag!,
+            sha256Hash: manifestHash,
+          },
+        },
+      ],
+    };
+    const items: SyncPlanItem[] = [
+      {
+        type: SyncActionType.Download,
+        path: mainPath,
+        remote: remoteMain,
+        generationRestore: structuredClone(generationRestore),
+      },
+      {
+        type: SyncActionType.Download,
+        path: manifestPath,
+        remote: remoteManifest,
+        generationRestore: structuredClone(generationRestore),
+      },
+    ];
+    const contentById = new Map([
+      [remoteMain.driveId, mainContent],
+      [remoteManifest.driveId, manifestContent],
+    ]);
+    const sourceById = new Map([
+      [remoteMain.driveId, remoteMain],
+      [remoteManifest.driveId, remoteManifest],
+    ]);
+    const downloadFile = vi.fn(async (
+      _vaultName: string,
+      _path: string,
+      _downloadUrl: string | undefined,
+      driveId: string,
+    ) => contentById.get(driveId)?.slice(0) ?? new ArrayBuffer(0));
+    const getDriveItemMetadataById = vi.fn(async (driveId: string) => {
+      const source = sourceById.get(driveId);
+      return source
+        ? {
+            id: source.driveId,
+            name: source.path.slice(source.path.lastIndexOf("/") + 1),
+            size: source.size,
+            file: {},
+            eTag: source.eTag,
+            cTag: source.cTag,
+            parentReference: { id: source.parentId },
+          }
+        : null;
+    });
+    const memory = makeMemoryAdapter({});
+    const state = makeState([], []);
+    const { executor } = makeExecutor({
+      localEntries: [],
+      remoteEntries: [],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, {
+        downloadFile,
+        getDriveItemMetadataById,
+        readCommunityPluginLifecycleV1ById: vi.fn().mockResolvedValue({
+          id: generationRestore.controlRecordId,
+          eTag: "lifecycle-etag",
+          content: JSON.stringify(lifecycleControl),
+        }),
+      }),
+    });
+    const result: SyncResult = {
+      success: true,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      skippedLarge: 0,
+      skippedIgnored: 0,
+      errors: 0,
+      authExpired: false,
+      message: "",
+    };
+    const automaticPolicy = {
+      autoDeleteLocalFiles: false,
+      mergeNonOverlappingText: true,
+    };
+    const automaticMetrics: AutomaticHandlingMetrics = {
+      policy: automaticPolicy,
+      deleteLocal: { candidates: 0, completed: 0, failed: 0 },
+      textMerge: {
+        candidates: 0,
+        completed: 0,
+        keptManual: 0,
+        failed: 0,
+        cancelled: 0,
+        manualReasons: {},
+      },
+      mergeRecovery: {
+        records: 0,
+        receiptCommitted: 0,
+        notApplied: 0,
+        remoteCommittedLocalRecovered: 0,
+        remoteCommittedLocalPending: 0,
+        unresolved: 0,
+      },
+      recoveryPendingAtEnd: { deleteLocal: 0, merge: 0 },
+    };
+    const internal = executor as unknown as {
+      activeSyncScope: typeof SCOPE;
+      lifecycle: { capture(): number };
+      executePlan(
+        plan: SyncPlan,
+        result: SyncResult,
+        callbacks: Record<string, never>,
+        epoch: number,
+        policy: typeof automaticPolicy,
+        metrics: AutomaticHandlingMetrics,
+        pluginPolicy: CommunityPluginSyncPolicyV1,
+        generationRestores: ReadonlyMap<string, typeof generationProjection>,
+      ): Promise<void>;
+    };
+    internal.activeSyncScope = SCOPE;
+    await internal.executePlan(
+      {
+        items,
+        lastTotalFiles: 0,
+        confirmed: true,
+        scope: SCOPE,
+      },
+      result,
+      {},
+      internal.lifecycle.capture(),
+      automaticPolicy,
+      automaticMetrics,
+      {
+        version: 1,
+        files: { mode: "selected", pluginIds: ["calendar"] },
+        data: { mode: "none", pluginIds: [] },
+      },
+      new Map([["calendar", generationProjection]]),
+    );
+
+    expect(result).toMatchObject({ downloaded: 2, errors: 0, deferred: 0 });
+    expect(new Uint8Array(memory.binary.get(mainPath)!)).toEqual(
+      new Uint8Array(mainContent),
+    );
+    expect(new Uint8Array(memory.binary.get(manifestPath)!)).toEqual(
+      new Uint8Array(manifestContent),
+    );
+    expect(downloadFile.mock.calls.map((call) => call[1])).toEqual([
+      remoteMain.path,
+      remoteManifest.path,
+    ]);
+    expect(getDriveItemMetadataById).toHaveBeenCalledTimes(4);
+    expect(state.beginMutationIntent).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(state.beginMutationIntent).mock.calls.map(
+      ([intent]) => intent,
+    )).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        action: "download",
+        path: mainPath,
+        sourcePath: remoteMain.path,
+        stateEffect: "local-only",
+      }),
+      expect.objectContaining({
+        action: "download",
+        path: manifestPath,
+        sourcePath: remoteManifest.path,
+        stateEffect: "local-only",
+      }),
+    ]));
+    expect(state.mutationLedger).toEqual([]);
+    expect(state.baseSnapshot).toEqual([]);
+    expect(state.remoteSnapshot).toEqual([]);
+
+    const blockedMemory = makeMemoryAdapter({});
+    const blockedState = makeState([], []);
+    const { executor: blockedExecutor } = makeExecutor({
+      localEntries: [],
+      remoteEntries: [],
+      remoteContent: null,
+      adapter: blockedMemory.adapter,
+      state: blockedState,
+      oneDrive: makeOneDrive(null, {
+        downloadFile,
+        getDriveItemMetadataById: vi.fn(async (driveId: string) => {
+          const source = sourceById.get(driveId);
+          return source
+            ? {
+                id: source.driveId,
+                name: source.path.slice(source.path.lastIndexOf("/") + 1),
+                size: source.size,
+                file: {},
+                eTag: source.eTag,
+                cTag: driveId === remoteMain.driveId
+                  ? "generation-main-ctag-changed"
+                  : source.cTag,
+                parentReference: { id: source.parentId },
+              }
+            : null;
+        }),
+      }),
+    });
+    const blockedResult: SyncResult = {
+      success: true,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      skippedLarge: 0,
+      skippedIgnored: 0,
+      errors: 0,
+      authExpired: false,
+      message: "",
+    };
+    const blockedInternal = blockedExecutor as unknown as typeof internal;
+    blockedInternal.activeSyncScope = SCOPE;
+    await blockedInternal.executePlan(
+      {
+        items,
+        lastTotalFiles: 0,
+        confirmed: true,
+        scope: SCOPE,
+      },
+      blockedResult,
+      {},
+      blockedInternal.lifecycle.capture(),
+      automaticPolicy,
+      structuredClone(automaticMetrics),
+      {
+        version: 1,
+        files: { mode: "selected", pluginIds: ["calendar"] },
+        data: { mode: "none", pluginIds: [] },
+      },
+    );
+    expect(blockedResult).toMatchObject({ downloaded: 0, errors: 2 });
+    expect(blockedMemory.binary.size).toBe(0);
+    expect(blockedState.beginMutationIntent).not.toHaveBeenCalled();
+    expect(blockedState.mutationLedger).toEqual([]);
+    expect(blockedState.baseSnapshot).toEqual([]);
+    expect(blockedState.remoteSnapshot).toEqual([]);
+  });
+
+  it("resumes a second-device sealed-generation join without trusting changed legacy files", async () => {
+    const publisher: CommunityPluginParticipantIdentityV1 = {
+      participantId: "publisher-device",
+      incarnation: "publisher-incarnation",
+    };
+    const recipient: CommunityPluginParticipantIdentityV1 = {
+      participantId: "recipient-device",
+      incarnation: "recipient-incarnation",
+    };
+    let control = createCommunityPluginLifecycleControlV1(SCOPE);
+    control = applyLifecycleCommand(
+      control,
+      { type: "register-participant", participant: publisher },
+      "register-publisher",
+      10,
+    );
+    control = applyLifecycleCommand(control, {
+      type: "confirm-legacy-migration",
+      actor: publisher,
+      evidence: "user-confirmed-legacy-devices-upgraded-or-retired",
+    }, "confirm-legacy-migration", 11);
+    control = applyLifecycleCommand(control, {
+      type: "join-plugin",
+      participant: publisher,
+      pluginId: "calendar",
+      targetGeneration: 1,
+      joinNonce: "publisher-join-nonce",
+      joinEvidence: "host-install",
+    }, "join-publisher", 12);
+    const grant = createCommunityPluginGenerationContentGrantV1({
+      control,
+      scope: SCOPE,
+      participant: publisher,
+      pluginId: "calendar",
+    });
+    expect(grant.status).toBe("ready");
+    if (grant.status !== "ready") throw new Error("publisher grant missing");
+    const mainContent = bytes("sealed-main");
+    const pluginManifestContent = bytes(PLUGIN_MANIFEST_TEXT);
+    const mainHash = await sha256Hex(mainContent);
+    const pluginManifestHash = await sha256Hex(pluginManifestContent);
+    const memberReceipts = [
+      {
+        fileName: "main.js" as const,
+        objectPath: communityPluginGenerationObjectPathV1(grant.grant, mainHash),
+        remoteId: "sealed-main-id",
+        parentId: "sealed-object-parent",
+        size: mainContent.byteLength,
+        eTag: "sealed-main-etag",
+        cTag: "sealed-main-ctag",
+        sha256Hash: mainHash,
+      },
+      {
+        fileName: "manifest.json" as const,
+        objectPath: communityPluginGenerationObjectPathV1(
+          grant.grant,
+          pluginManifestHash,
+        ),
+        remoteId: "sealed-plugin-manifest-id",
+        parentId: "sealed-object-parent",
+        size: pluginManifestContent.byteLength,
+        eTag: "sealed-plugin-manifest-etag",
+        cTag: "sealed-plugin-manifest-ctag",
+        sha256Hash: pluginManifestHash,
+      },
+    ];
+    const canonicalManifest =
+      await prepareCommunityPluginGenerationBundleManifestV1(
+        grant.grant,
+        memberReceipts,
+      );
+    const manifestObject = {
+      objectPath: canonicalManifest.objectPath,
+      remoteId: "sealed-canonical-manifest-id",
+      parentId: "sealed-manifest-parent",
+      size: canonicalManifest.bytes.byteLength,
+      eTag: "sealed-canonical-manifest-etag",
+      cTag: "sealed-canonical-manifest-ctag",
+      sha256Hash: canonicalManifest.sha256Hash,
+    };
+    const publication = await createCommunityPluginBundlePublicationCommandV1({
+      grant: grant.grant,
+      control,
+      prepared: canonicalManifest,
+      manifestObject,
+      operationId: "publish-calendar-generation",
+      at: 13,
+    });
+    const published = reduceCommunityPluginLifecycleV1(control, publication);
+    expect(published.status).toBe("applied");
+    if (published.status !== "applied") throw new Error("publication failed");
+    control = published.state;
+    const publishedBundle = control.pluginsById.calendar.currentGeneration
+      ?.publishedBundle;
+    if (!publishedBundle) throw new Error("published bundle missing");
+    control = applyLifecycleCommand(control, {
+      type: "seal-plugin-legacy-authority",
+      actor: publisher,
+      pluginId: "calendar",
+      generation: 1,
+      publishedBundle,
+    }, "seal-calendar-generation", 14);
+    const sealedControl = structuredClone(control);
+    const observedControl = applyLifecycleCommand(
+      control,
+      { type: "register-participant", participant: recipient },
+      "register-recipient",
+      15,
+    );
+    const joinedControl = applyLifecycleCommand(observedControl, {
+      type: "join-plugin",
+      participant: recipient,
+      pluginId: "calendar",
+      targetGeneration: 1,
+      joinNonce: "join-calendar-1",
+      joinEvidence: "user-confirmed",
+    }, "join-recipient", 16);
+    const lifecycleObserver = {
+      observe: vi.fn().mockResolvedValue({
+        status: "ready",
+        source: "updated",
+        state: observedControl,
+        recordId: "lifecycle-record-id",
+        recordETag: "lifecycle-observed-etag",
+      }),
+      getParticipantIdentity: vi.fn().mockReturnValue(recipient),
+      joinPluginGeneration: vi.fn().mockResolvedValue({
+        status: "ready",
+        source: "updated",
+        state: joinedControl,
+        recordId: "lifecycle-record-id",
+        recordETag: "lifecycle-joined-etag",
+      }),
+    } as unknown as NonNullable<ConstructorParameters<typeof SyncExecutor>[11]>;
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const pluginManifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const legacyMain = await remoteEntry(mainPath, bytes("changed-legacy-main"), {
+      driveId: "legacy-main-id",
+    });
+    const legacyManifest = await remoteEntry(
+      pluginManifestPath,
+      pluginManifestContent,
+      { driveId: "legacy-manifest-id" },
+    );
+    const memberById = new Map(memberReceipts.map((receipt) => [
+      receipt.remoteId,
+      receipt,
+    ]));
+    const contentById = new Map([
+      [memberReceipts[0].remoteId, mainContent],
+      [memberReceipts[1].remoteId, pluginManifestContent],
+    ]);
+    const downloadFile = vi.fn(async (
+      _vaultName: string,
+      _path: string,
+      _downloadUrl: string | undefined,
+      driveId: string,
+    ) => contentById.get(driveId)?.slice(0) ?? new ArrayBuffer(0));
+    const getDriveItemMetadataById = vi.fn(async (driveId: string) => {
+      const source = memberById.get(driveId);
+      return source
+        ? {
+            id: source.remoteId,
+            name: source.objectPath.slice(source.objectPath.lastIndexOf("/") + 1),
+            size: source.size,
+            file: {},
+            eTag: source.eTag,
+            cTag: source.cTag,
+            parentReference: { id: source.parentId },
+          }
+        : null;
+    });
+    const memory = makeMemoryAdapter({});
+    const state = makeState([legacyMain, legacyManifest], []);
+    const oneDrive = makeOneDrive(null, {
+      readCommunityPluginLifecycleV1: vi.fn().mockResolvedValue({
+        id: "lifecycle-record-id",
+        eTag: "lifecycle-sealed-etag",
+        content: JSON.stringify(sealedControl),
+      }),
+      readCommunityPluginLifecycleV1ById: vi.fn().mockResolvedValue({
+        id: "lifecycle-record-id",
+        eTag: "lifecycle-joined-etag",
+        content: JSON.stringify(joinedControl),
+      }),
+      readCommunityPluginGenerationObjectV1ById: vi.fn()
+        .mockRejectedValueOnce(new OneDriveError(
+          OneDriveErrorType.NetworkError,
+          "offline after generation join",
+        ))
+        .mockResolvedValue({
+          id: manifestObject.remoteId,
+          name: manifestObject.objectPath.slice(
+            manifestObject.objectPath.lastIndexOf("/") + 1,
+          ),
+          parentId: manifestObject.parentId,
+          size: manifestObject.size,
+          eTag: manifestObject.eTag,
+          cTag: manifestObject.cTag,
+          content: canonicalManifest.bytes,
+        }),
+      getDelta: vi.fn().mockResolvedValue({
+        value: completeRemoteItems([legacyMain, legacyManifest]),
+        "@odata.deltaLink": "delta-token-next",
+      }),
+      downloadFile,
+      getDriveItemMetadataById,
+      uploadFile: vi.fn(),
+      deleteItem: vi.fn(),
+    });
+    const { executor } = makeExecutor({
+      localEntries: [],
+      remoteEntries: [legacyMain, legacyManifest],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive,
+      lifecycleObserver,
+    });
+
+    const authorization = joinAuthorization([legacyMain, legacyManifest]);
+    expect(validateCommunityPluginJoinAuthorization(
+      authorization,
+      [legacyMain, legacyManifest],
+      SCOPE,
+    )).toEqual({ status: "valid" });
+    const interrupted = await executor.run("manual", {}, false, undefined, {
+      communityPluginJoinAuthorizations: [authorization],
+    });
+
+    expect(interrupted).toMatchObject({
+      downloaded: 0,
+      deferred: 1,
+      errors: 0,
+      communityPluginJoinBlocks: [{
+        pluginId: "calendar",
+        operationId: "join-calendar-1",
+        reason: "catalog-unavailable",
+      }],
+    });
+    expect(lifecycleObserver.joinPluginGeneration).toHaveBeenCalledTimes(1);
+    expect(memory.binary.size).toBe(0);
+    expect(state.beginMutationIntent).not.toHaveBeenCalled();
+
+    const resumedLifecycleObserver = {
+      observe: vi.fn().mockResolvedValue({
+        status: "ready",
+        source: "updated",
+        state: joinedControl,
+        recordId: "lifecycle-record-id",
+        recordETag: "lifecycle-joined-etag",
+      }),
+      getParticipantIdentity: vi.fn().mockReturnValue(recipient),
+      joinPluginGeneration: vi.fn(),
+    } as unknown as NonNullable<ConstructorParameters<typeof SyncExecutor>[11]>;
+    const resumed = makeExecutor({
+      localEntries: [],
+      remoteEntries: [legacyMain, legacyManifest],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive,
+      lifecycleObserver: resumedLifecycleObserver,
+    });
+    const result = await resumed.executor.run("manual", {}, false, undefined, {
+      communityPluginJoinAuthorizations: [authorization],
+    });
+
+    expect(result).toMatchObject({
+      success: true,
+      downloaded: 2,
+      deferred: 0,
+      errors: 0,
+      communityPluginRestoresCompleted: { files: ["calendar"], data: [] },
+      communityPluginRestoreGenerationByPluginId: { calendar: 1 },
+    });
+    expect(lifecycleObserver.observe).toHaveBeenCalledTimes(1);
+    expect(lifecycleObserver.joinPluginGeneration).toHaveBeenCalledTimes(1);
+    expect(resumedLifecycleObserver.observe).toHaveBeenCalledTimes(1);
+    expect(resumedLifecycleObserver.joinPluginGeneration).not.toHaveBeenCalled();
+    expect(oneDrive.readCommunityPluginLifecycleV1ById).toHaveBeenCalledWith(
+      "lifecycle-record-id",
+    );
+    expect(downloadFile.mock.calls.map((call) => call[1])).toEqual(
+      expect.arrayContaining(memberReceipts.map((item) => item.objectPath)),
+    );
+    expect(downloadFile.mock.calls.map((call) => call[3])).not.toContain(
+      "legacy-main-id",
+    );
+    expect(memory.binary.has(mainPath)).toBe(true);
+    expect(memory.binary.has(pluginManifestPath)).toBe(true);
+    expect(new Uint8Array(memory.binary.get(mainPath)!)).toEqual(
+      new Uint8Array(mainContent),
+    );
+    expect(state.baseSnapshot).toEqual([]);
+    expect(state.remoteSnapshot).toEqual([legacyMain, legacyManifest]);
+    expect(vi.mocked(oneDrive.uploadFile)).not.toHaveBeenCalled();
+    expect(vi.mocked(oneDrive.deleteItem)).not.toHaveBeenCalled();
+
+    const offlineEdit = bytes("local-offline-edit");
+    await memory.adapter.writeBinary(mainPath, offlineEdit);
+    downloadFile.mockClear();
+    const blocked = await resumed.executor.run("manual", {}, false, undefined, {
+      communityPluginJoinAuthorizations: [authorization],
+    });
+    expect(blocked).toMatchObject({ downloaded: 0, errors: 2 });
+    expect(new Uint8Array(memory.binary.get(mainPath)!)).toEqual(
+      new Uint8Array(offlineEdit),
+    );
+    expect(new Uint8Array(memory.binary.get(pluginManifestPath)!)).toEqual(
+      new Uint8Array(pluginManifestContent),
+    );
+    expect(state.beginMutationIntent).toHaveBeenCalledTimes(2);
+
+    state.getCommunityPluginParticipation = vi.fn().mockReturnValue({
+      schemaVersion: 1,
+      kind: "device-community-plugin-participation",
+      scopeEnabled: true,
+      pluginsById: {
+        calendar: {
+          pluginId: "calendar",
+          phase: "participating",
+          joinedGeneration: 1,
+        },
+      },
+    });
+    downloadFile.mockClear();
+    vi.mocked(oneDrive.uploadFile).mockClear();
+    const restoredRemoteMain = await remoteEntry(mainPath, mainContent, {
+      driveId: "restored-fixed-main-id",
+    });
+    const restoredRemoteManifest = await remoteEntry(
+      pluginManifestPath,
+      pluginManifestContent,
+      { driveId: "restored-fixed-manifest-id" },
+    );
+    state.baseSnapshot = [
+      sharedBaseEntry(
+        await localEntry(mainPath, mainContent),
+        restoredRemoteMain,
+      ),
+      sharedBaseEntry(
+        await localEntry(pluginManifestPath, pluginManifestContent),
+        restoredRemoteManifest,
+      ),
+    ];
+    state.remoteSnapshot = [restoredRemoteMain, restoredRemoteManifest];
+    const ordinaryMain = bytes("post-restore-local-edit");
+    const ordinaryManifest = pluginManifestContent;
+    const ordinaryState = makeState(
+      [restoredRemoteMain, restoredRemoteManifest],
+      [
+        sharedBaseEntry(
+          await localEntry(mainPath, mainContent),
+          restoredRemoteMain,
+        ),
+        sharedBaseEntry(
+          await localEntry(pluginManifestPath, ordinaryManifest),
+          restoredRemoteManifest,
+        ),
+      ],
+      {
+        getCommunityPluginParticipation: vi.fn().mockReturnValue({
+          schemaVersion: 1,
+          kind: "device-community-plugin-participation",
+          scopeEnabled: true,
+          pluginsById: {
+            calendar: {
+              pluginId: "calendar",
+              phase: "participating",
+              joinedGeneration: 1,
+            },
+          },
+        }),
+      },
+    );
+    const ordinaryMemory = makeMemoryAdapter({
+      [mainPath]: ordinaryMain,
+      [pluginManifestPath]: PLUGIN_MANIFEST_TEXT,
+    });
+    const ordinaryUpload = vi.fn().mockResolvedValue({
+      id: restoredRemoteMain.driveId,
+      eTag: "ordinary-post-restore-etag",
+      size: ordinaryMain.byteLength,
+      parentReference: { id: restoredRemoteMain.parentId },
+    });
+    const ordinaryRemoteDownload = vi.fn(async (
+      _vaultName: string,
+      path: string,
+    ) => path === pluginManifestPath
+      ? pluginManifestContent.slice(0)
+      : new ArrayBuffer(0));
+    const { executor: ordinaryExecutor } = makeExecutor({
+      localEntries: [
+        await localEntry(mainPath, ordinaryMain),
+        await localEntry(pluginManifestPath, ordinaryManifest),
+      ],
+      remoteEntries: [restoredRemoteMain, restoredRemoteManifest],
+      remoteContent: null,
+      adapter: ordinaryMemory.adapter,
+      state: ordinaryState,
+      oneDrive: makeOneDrive(null, {
+        uploadFile: ordinaryUpload,
+        downloadFile: ordinaryRemoteDownload,
+      }),
+    });
+    ordinaryMemory.binary.set(pluginManifestPath, pluginManifestContent.slice(0));
+    const stable = await ordinaryExecutor.run("manual", {}, false);
+    expect(stable).toMatchObject({
+      success: true,
+      uploaded: 1,
+      downloaded: 0,
+      errors: 0,
+    });
+    expect(ordinaryRemoteDownload).toHaveBeenCalledWith(
+      "testVault",
+      pluginManifestPath,
+      restoredRemoteManifest.downloadUrl,
+      restoredRemoteManifest.driveId,
+      restoredRemoteManifest.size,
+    );
+    expect(ordinaryUpload).toHaveBeenCalled();
+    expect(new Uint8Array(ordinaryMemory.binary.get(mainPath)!)).toEqual(
+      new Uint8Array(ordinaryMain),
+    );
+  });
+
+  it("migrates a confirmed local legacy bundle and removes its fixed-path upload", async () => {
+    const participant: CommunityPluginParticipantIdentityV1 = {
+      participantId: "source-device",
+      incarnation: "source-incarnation",
+    };
+    let initial = createCommunityPluginLifecycleControlV1(SCOPE);
+    initial = applyLifecycleCommand(
+      initial,
+      { type: "register-participant", participant },
+      "register-source",
+      10,
+    );
+    initial = applyLifecycleCommand(initial, {
+      type: "confirm-legacy-migration",
+      actor: participant,
+      evidence: "user-confirmed-legacy-devices-upgraded-or-retired",
+    }, "confirm-legacy", 11);
+    const joined = applyLifecycleCommand(initial, {
+      type: "join-plugin",
+      participant,
+      pluginId: "calendar",
+      targetGeneration: 1,
+      joinNonce: "source-join-nonce",
+      joinEvidence: "user-confirmed",
+    }, "join-source", 12);
+    const grant = createCommunityPluginGenerationContentGrantV1({
+      control: joined,
+      scope: SCOPE,
+      participant,
+      pluginId: "calendar",
+    });
+    if (grant.status !== "ready") throw new Error("source grant missing");
+    const mainContent = bytes("local-main");
+    const manifestContent = bytes(PLUGIN_MANIFEST_TEXT);
+    const mainHash = await sha256Hex(mainContent);
+    const manifestHash = await sha256Hex(manifestContent);
+    const receipts = [
+      {
+        fileName: "main.js" as const,
+        objectPath: communityPluginGenerationObjectPathV1(grant.grant, mainHash),
+        remoteId: "source-main-id",
+        parentId: "source-objects-parent",
+        size: mainContent.byteLength,
+        eTag: "source-main-etag",
+        cTag: "source-main-ctag",
+        sha256Hash: mainHash,
+      },
+      {
+        fileName: "manifest.json" as const,
+        objectPath: communityPluginGenerationObjectPathV1(
+          grant.grant,
+          manifestHash,
+        ),
+        remoteId: "source-manifest-id",
+        parentId: "source-objects-parent",
+        size: manifestContent.byteLength,
+        eTag: "source-manifest-etag",
+        cTag: "source-manifest-ctag",
+        sha256Hash: manifestHash,
+      },
+    ];
+    const canonical = await prepareCommunityPluginGenerationBundleManifestV1(
+      grant.grant,
+      receipts,
+    );
+    const manifestObject = {
+      objectPath: canonical.objectPath,
+      remoteId: "source-canonical-manifest-id",
+      parentId: "source-manifests-parent",
+      size: canonical.bytes.byteLength,
+      eTag: "source-canonical-etag",
+      cTag: "source-canonical-ctag",
+      sha256Hash: canonical.sha256Hash,
+    };
+    const publication = await createCommunityPluginBundlePublicationCommandV1({
+      grant: grant.grant,
+      control: joined,
+      prepared: canonical,
+      manifestObject,
+      operationId: "publish-source-bundle",
+      at: 13,
+    });
+    const published = reduceCommunityPluginLifecycleV1(joined, publication);
+    if (published.status !== "applied") throw new Error("source publication failed");
+    const publishedBundle = published.state.pluginsById.calendar
+      .currentGeneration?.publishedBundle;
+    if (!publishedBundle) throw new Error("source publication missing");
+    const sealed = applyLifecycleCommand(published.state, {
+      type: "seal-plugin-legacy-authority",
+      actor: participant,
+      pluginId: "calendar",
+      generation: 1,
+      publishedBundle,
+    }, "seal-source", 14);
+    const lifecycleObserver = {
+      observe: vi.fn().mockResolvedValue({
+        status: "ready",
+        source: "existing",
+        state: initial,
+        recordId: "lifecycle-record-id",
+        recordETag: "lifecycle-initial-etag",
+      }),
+      getParticipantIdentity: vi.fn().mockReturnValue(participant),
+      joinPluginGeneration: vi.fn().mockResolvedValue({
+        status: "ready",
+        source: "updated",
+        state: joined,
+        recordId: "lifecycle-record-id",
+        recordETag: "lifecycle-joined-etag",
+      }),
+      migratePluginLegacyBundle: vi.fn().mockImplementation(async (
+        _lifecycleTransport,
+        _contentTransport,
+        input: { revalidateSource?: () => Promise<boolean> },
+      ) => input.revalidateSource && await input.revalidateSource()
+        ? { status: "ready", state: sealed }
+        : { status: "blocked", phase: "seal", reason: "source-changed" }),
+    } as unknown as NonNullable<ConstructorParameters<typeof SyncExecutor>[11]>;
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const localEntries = [
+      await localEntry(mainPath, mainContent),
+      await localEntry(manifestPath, manifestContent),
+    ];
+    const memory = makeMemoryAdapter({
+      [mainPath]: mainContent,
+      [manifestPath]: PLUGIN_MANIFEST_TEXT,
+    });
+    memory.binary.set(manifestPath, manifestContent.slice(0));
+    const participation = {
+      schemaVersion: 1 as const,
+      kind: "device-community-plugin-participation" as const,
+      scopeEnabled: true,
+      pluginsById: {
+        calendar: { pluginId: "calendar", phase: "participating" as const },
+      },
+    };
+    const state = makeState([], [], {
+      getCommunityPluginParticipation: vi.fn(() => structuredClone(participation)),
+    });
+    const uploadFile = vi.fn(async (
+      _vaultName: string,
+      path: string,
+      content: ArrayBuffer,
+    ) => ({
+      id: `ordinary-calendar-${path.split("/").at(-1)}-id`,
+      eTag: `ordinary-calendar-${path.split("/").at(-1)}-etag`,
+      size: content.byteLength,
+      parentReference: { id: "plugin-folder-id" },
+    }));
+    const oneDrive = makeOneDrive(null, {
+      readCommunityPluginLifecycleV1: vi.fn().mockResolvedValue({
+        id: "lifecycle-record-id",
+        eTag: "lifecycle-initial-etag",
+        content: JSON.stringify(initial),
+      }),
+      readCommunityPluginLifecycleV1ById: vi.fn().mockResolvedValue({
+        id: "lifecycle-record-id",
+        eTag: "lifecycle-sealed-etag",
+        content: JSON.stringify(sealed),
+      }),
+      uploadFile,
+    });
+    const { executor } = makeExecutor({
+      localEntries,
+      remoteEntries: [],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive,
+      lifecycleObserver,
+    });
+
+    const result = await executor.run("manual");
+    expect(result).toMatchObject({
+      success: true,
+      uploaded: 2,
+      downloaded: 0,
+      errors: 0,
+    });
+    expect(lifecycleObserver.joinPluginGeneration).not.toHaveBeenCalled();
+    expect(lifecycleObserver.migratePluginLegacyBundle).not.toHaveBeenCalled();
+    expect(uploadFile).toHaveBeenCalledTimes(2);
+  });
+
+  it("reopens a cleaned plugin in the next generation without reading the deleted legacy manifest", async () => {
+    const participant: CommunityPluginParticipantIdentityV1 = {
+      participantId: "reopen-device",
+      incarnation: "reopen-incarnation",
+    };
+    let control = createCommunityPluginLifecycleControlV1(SCOPE);
+    control = applyLifecycleCommand(
+      control,
+      { type: "register-participant", participant },
+      "register-reopen-device",
+      10,
+    );
+    control = applyLifecycleCommand(control, {
+      type: "confirm-legacy-migration",
+      actor: participant,
+      evidence: "user-confirmed-legacy-devices-upgraded-or-retired",
+    }, "confirm-reopen-legacy", 11);
+    control = applyLifecycleCommand(control, {
+      type: "join-plugin",
+      participant,
+      pluginId: "calendar",
+      targetGeneration: 1,
+      joinNonce: "reopen-generation-one",
+      joinEvidence: "user-confirmed",
+    }, "join-reopen-generation-one", 12);
+    const mainContent = bytes("reopened-local-main");
+    const manifestContent = bytes(PLUGIN_MANIFEST_TEXT);
+    const publishGeneration = async (
+      source: CommunityPluginLifecycleControlV1,
+      suffix: string,
+      at: number,
+    ) => {
+      const grant = createCommunityPluginGenerationContentGrantV1({
+        control: source,
+        scope: SCOPE,
+        participant,
+        pluginId: "calendar",
+      });
+      if (grant.status !== "ready") throw new Error("reopen grant missing");
+      const mainHash = await sha256Hex(mainContent);
+      const manifestHash = await sha256Hex(manifestContent);
+      const receipts = [
+        {
+          fileName: "main.js" as const,
+          objectPath: communityPluginGenerationObjectPathV1(grant.grant, mainHash),
+          remoteId: `${suffix}-main-id`,
+          parentId: `${suffix}-objects-parent`,
+          size: mainContent.byteLength,
+          eTag: `${suffix}-main-etag`,
+          cTag: `${suffix}-main-ctag`,
+          sha256Hash: mainHash,
+        },
+        {
+          fileName: "manifest.json" as const,
+          objectPath: communityPluginGenerationObjectPathV1(
+            grant.grant,
+            manifestHash,
+          ),
+          remoteId: `${suffix}-plugin-manifest-id`,
+          parentId: `${suffix}-objects-parent`,
+          size: manifestContent.byteLength,
+          eTag: `${suffix}-plugin-manifest-etag`,
+          cTag: `${suffix}-plugin-manifest-ctag`,
+          sha256Hash: manifestHash,
+        },
+      ];
+      const canonical = await prepareCommunityPluginGenerationBundleManifestV1(
+        grant.grant,
+        receipts,
+      );
+      const publication = await createCommunityPluginBundlePublicationCommandV1({
+        grant: grant.grant,
+        control: source,
+        prepared: canonical,
+        manifestObject: {
+          objectPath: canonical.objectPath,
+          remoteId: `${suffix}-canonical-manifest-id`,
+          parentId: `${suffix}-manifests-parent`,
+          size: canonical.bytes.byteLength,
+          eTag: `${suffix}-canonical-etag`,
+          cTag: `${suffix}-canonical-ctag`,
+          sha256Hash: canonical.sha256Hash,
+        },
+        operationId: `publish-${suffix}`,
+        at,
+      });
+      const published = reduceCommunityPluginLifecycleV1(source, publication);
+      if (published.status !== "applied") throw new Error("reopen publish failed");
+      return published.state;
+    };
+
+    control = await publishGeneration(control, "generation-one", 13);
+    const generationOneBundle = control.pluginsById.calendar
+      .currentGeneration?.publishedBundle;
+    if (!generationOneBundle) throw new Error("generation one bundle missing");
+    control = applyLifecycleCommand(control, {
+      type: "seal-plugin-legacy-authority",
+      actor: participant,
+      pluginId: "calendar",
+      generation: 1,
+      publishedBundle: generationOneBundle,
+    }, "seal-reopen-generation-one", 14);
+    control = applyLifecycleCommand(control, {
+      type: "exit-plugin",
+      participant,
+      pluginId: "calendar",
+      generation: 1,
+    }, "exit-reopen-generation-one", 15);
+    control = applyLifecycleCommand(control, {
+      type: "begin-close",
+      actor: participant,
+      pluginId: "calendar",
+      generation: 1,
+    }, "begin-close-reopen-generation-one", 16);
+    control = applyLifecycleCommand(control, {
+      type: "complete-close",
+      actor: participant,
+      pluginId: "calendar",
+      generation: 1,
+      cleanupReceiptDigest: "f".repeat(64),
+    }, "complete-close-reopen-generation-one", 17);
+    const closed = control;
+    const joined = applyLifecycleCommand(closed, {
+      type: "join-plugin",
+      participant,
+      pluginId: "calendar",
+      targetGeneration: 2,
+      joinNonce: "reopen-generation-two",
+      joinEvidence: "user-confirmed",
+      observedClosedRevision: closed.revision,
+    }, "join-reopen-generation-two", 18);
+    const republished = await publishGeneration(joined, "generation-two", 19);
+    expect(republished.pluginsById.calendar.legacyAuthoritySeal?.generation)
+      .toBe(1);
+    expect(republished.pluginsById.calendar.currentGeneration).toMatchObject({
+      generation: 2,
+      phase: "open",
+      publishedBundle: { publicationRevision: 1 },
+    });
+
+    const lifecycleObserver = {
+      observe: vi.fn().mockResolvedValue({
+        status: "ready",
+        source: "existing",
+        state: closed,
+        recordId: "reopen-lifecycle-record-id",
+        recordETag: "reopen-closed-etag",
+      }),
+      getParticipantIdentity: vi.fn().mockReturnValue(participant),
+      joinPluginGeneration: vi.fn().mockResolvedValue({
+        status: "ready",
+        source: "updated",
+        state: joined,
+        recordId: "reopen-lifecycle-record-id",
+        recordETag: "reopen-joined-etag",
+      }),
+      migratePluginLegacyBundle: vi.fn().mockResolvedValue({
+        status: "ready",
+        state: republished,
+      }),
+    } as unknown as NonNullable<ConstructorParameters<typeof SyncExecutor>[11]>;
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const localEntries = [
+      await localEntry(mainPath, mainContent),
+      await localEntry(manifestPath, manifestContent),
+    ];
+    const memory = makeMemoryAdapter({
+      [mainPath]: mainContent,
+      [manifestPath]: PLUGIN_MANIFEST_TEXT,
+    });
+    memory.binary.set(manifestPath, manifestContent.slice(0));
+    const state = makeState([], [], {
+      getCommunityPluginParticipation: vi.fn(() => ({
+        schemaVersion: 1 as const,
+        kind: "device-community-plugin-participation" as const,
+        scopeEnabled: true,
+        pluginsById: {
+          calendar: { pluginId: "calendar", phase: "participating" as const },
+        },
+      })),
+    });
+    const readGenerationObject = vi.fn().mockRejectedValue(
+      new Error("the deleted generation-one manifest must not be read"),
+    );
+    const uploadFile = vi.fn(async (
+      _vaultName: string,
+      path: string,
+      content: ArrayBuffer,
+    ) => ({
+      id: `ordinary-calendar-${path.split("/").at(-1)}-id`,
+      eTag: `ordinary-calendar-${path.split("/").at(-1)}-etag`,
+      size: content.byteLength,
+      parentReference: { id: "plugin-folder-id" },
+    }));
+    const oneDrive = makeOneDrive(null, {
+      readCommunityPluginLifecycleV1: vi.fn().mockResolvedValue({
+        id: "reopen-lifecycle-record-id",
+        eTag: "reopen-closed-etag",
+        content: JSON.stringify(closed),
+      }),
+      readCommunityPluginLifecycleV1ById: vi.fn().mockResolvedValue({
+        id: "reopen-lifecycle-record-id",
+        eTag: "reopen-published-etag",
+        content: JSON.stringify(republished),
+      }),
+      readCommunityPluginGenerationObjectV1ById: readGenerationObject,
+      uploadFile,
+    });
+    const { executor } = makeExecutor({
+      localEntries,
+      remoteEntries: [],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive,
+      lifecycleObserver,
+    });
+
+    const result = await executor.run("manual");
+
+    expect(result).toMatchObject({
+      success: true,
+      uploaded: 2,
+      downloaded: 0,
+      errors: 0,
+    });
+    expect(lifecycleObserver.joinPluginGeneration).not.toHaveBeenCalled();
+    expect(lifecycleObserver.migratePluginLegacyBundle).not.toHaveBeenCalled();
+    expect(readGenerationObject).not.toHaveBeenCalled();
+    expect(uploadFile).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps an exited generation open and untouched during ordinary sync", async () => {
+    const storage = makeVaultLocalStorage();
+    const vaultInstanceId = "d".repeat(32);
+    const identity = loadOrCreateCommunityPluginLifecycleDeviceIdentityV1(
+      storage,
+      vaultInstanceId,
+      10,
+    )!;
+    const participant = identity.participant;
+    let lifecycleState = createCommunityPluginLifecycleControlV1(SCOPE);
+    lifecycleState = applyLifecycleCommand(
+      lifecycleState,
+      { type: "register-participant", participant },
+      "register-cleanup-device",
+      10,
+    );
+    lifecycleState = applyLifecycleCommand(lifecycleState, {
+      type: "confirm-legacy-migration",
+      actor: participant,
+      evidence: "user-confirmed-legacy-devices-upgraded-or-retired",
+    }, "confirm-cleanup-legacy", 11);
+    lifecycleState = applyLifecycleCommand(lifecycleState, {
+      type: "join-plugin",
+      participant,
+      pluginId: "calendar",
+      targetGeneration: 1,
+      joinNonce: "cleanup-join",
+      joinEvidence: "user-confirmed",
+    }, "join-cleanup-device", 12);
+    const grant = createCommunityPluginGenerationContentGrantV1({
+      control: lifecycleState,
+      scope: SCOPE,
+      participant,
+      pluginId: "calendar",
+    });
+    if (grant.status !== "ready") throw new Error("cleanup grant missing");
+    const mainContent = bytes("cleanup-main");
+    const manifestContent = bytes(PLUGIN_MANIFEST_TEXT);
+    const mainHash = await sha256Hex(mainContent);
+    const manifestHash = await sha256Hex(manifestContent);
+    const members = [
+      {
+        fileName: "main.js" as const,
+        objectPath: communityPluginGenerationObjectPathV1(grant.grant, mainHash),
+        remoteId: "cleanup-main-id",
+        parentId: "cleanup-objects-parent",
+        size: mainContent.byteLength,
+        eTag: "cleanup-main-etag",
+        cTag: "cleanup-main-ctag",
+        sha256Hash: mainHash,
+      },
+      {
+        fileName: "manifest.json" as const,
+        objectPath: communityPluginGenerationObjectPathV1(
+          grant.grant,
+          manifestHash,
+        ),
+        remoteId: "cleanup-plugin-manifest-id",
+        parentId: "cleanup-objects-parent",
+        size: manifestContent.byteLength,
+        eTag: "cleanup-plugin-manifest-etag",
+        cTag: "cleanup-plugin-manifest-ctag",
+        sha256Hash: manifestHash,
+      },
+    ];
+    const canonical = await prepareCommunityPluginGenerationBundleManifestV1(
+      grant.grant,
+      members,
+    );
+    const manifestObject = {
+      objectPath: canonical.objectPath,
+      remoteId: "cleanup-canonical-manifest-id",
+      parentId: "cleanup-manifests-parent",
+      size: canonical.bytes.byteLength,
+      eTag: "cleanup-canonical-etag",
+      cTag: "cleanup-canonical-ctag",
+      sha256Hash: canonical.sha256Hash,
+    };
+    const publication = await createCommunityPluginBundlePublicationCommandV1({
+      grant: grant.grant,
+      control: lifecycleState,
+      prepared: canonical,
+      manifestObject,
+      operationId: "publish-cleanup-bundle",
+      at: 13,
+    });
+    const published = reduceCommunityPluginLifecycleV1(
+      lifecycleState,
+      publication,
+    );
+    if (published.status !== "applied") throw new Error("cleanup publish failed");
+    const publishedBundle = published.state.pluginsById.calendar
+      .currentGeneration?.publishedBundle;
+    if (!publishedBundle) throw new Error("cleanup publication missing");
+    lifecycleState = applyLifecycleCommand(published.state, {
+      type: "seal-plugin-legacy-authority",
+      actor: participant,
+      pluginId: "calendar",
+      generation: 1,
+      publishedBundle,
+    }, "seal-cleanup-bundle", 14);
+
+    const generationObjects = new Map([
+      [members[0].remoteId, {
+        id: members[0].remoteId,
+        name: members[0].objectPath.split("/").at(-1)!,
+        parentId: members[0].parentId,
+        size: members[0].size,
+        eTag: members[0].eTag,
+        cTag: members[0].cTag,
+        content: mainContent,
+      }],
+      [members[1].remoteId, {
+        id: members[1].remoteId,
+        name: members[1].objectPath.split("/").at(-1)!,
+        parentId: members[1].parentId,
+        size: members[1].size,
+        eTag: members[1].eTag,
+        cTag: members[1].cTag,
+        content: manifestContent,
+      }],
+      [manifestObject.remoteId, {
+        id: manifestObject.remoteId,
+        name: manifestObject.objectPath.split("/").at(-1)!,
+        parentId: manifestObject.parentId,
+        size: manifestObject.size,
+        eTag: manifestObject.eTag,
+        cTag: manifestObject.cTag,
+        content: canonical.bytes,
+      }],
+    ]);
+    let lifecycleObject = {
+      id: "cleanup-lifecycle-id",
+      eTag: "cleanup-lifecycle-etag-0",
+      content: JSON.stringify(lifecycleState),
+    };
+    let lifecycleWrite = 0;
+    const updateLifecycle = vi.fn(async (
+      id: string,
+      eTag: string,
+      content: string,
+    ) => {
+      if (id !== lifecycleObject.id || eTag !== lifecycleObject.eTag) {
+        throw new Error("lifecycle CAS mismatch");
+      }
+      lifecycleWrite++;
+      lifecycleObject = {
+        id,
+        eTag: `cleanup-lifecycle-etag-${lifecycleWrite}`,
+        content,
+      };
+      return { id, eTag: lifecycleObject.eTag };
+    });
+    const initialEnablement = bytes('["calendar"]');
+    let remoteEnablement = initialEnablement.slice(0);
+    const localCommunity = await localEntry(COMMUNITY_PATH, initialEnablement);
+    const remoteCommunity = await remoteEntry(
+      COMMUNITY_PATH,
+      remoteEnablement,
+      {
+        driveId: "cleanup-enablement-id",
+        eTag: "cleanup-enablement-etag-0",
+      },
+    );
+    const memory = makeMemoryAdapter({ [COMMUNITY_PATH]: initialEnablement });
+    const deleteItem = vi.fn(async (
+      _vaultName: string,
+      _path: string,
+      eTag: string,
+      id: string,
+    ) => {
+      const object = generationObjects.get(id);
+      if (!object || object.eTag !== eTag) throw new Error("cleanup CAS mismatch");
+      generationObjects.delete(id);
+    });
+    const uploadFile = vi.fn(async (
+      _vaultName: string,
+      path: string,
+      content: ArrayBuffer,
+    ) => {
+      if (path !== COMMUNITY_PATH) throw new Error("unexpected upload");
+      remoteEnablement = content.slice(0);
+      remoteCommunity.size = content.byteLength;
+      remoteCommunity.sha256Hash = await sha256Hex(content);
+      remoteCommunity.eTag = "cleanup-enablement-etag-1";
+      return {
+        id: remoteCommunity.driveId,
+        eTag: remoteCommunity.eTag,
+        size: content.byteLength,
+        parentReference: { id: remoteCommunity.parentId },
+      };
+    });
+    const oneDrive = makeOneDrive(remoteEnablement, {
+      downloadFile: vi.fn(async (
+        _vaultName: string,
+        path: string,
+      ) => path === COMMUNITY_PATH
+        ? remoteEnablement.slice(0)
+        : new ArrayBuffer(0)),
+      uploadFile,
+      readCommunityPluginLifecycleV1: vi.fn(async () =>
+        structuredClone(lifecycleObject)),
+      readCommunityPluginLifecycleV1ById: vi.fn(async (id: string) => {
+        if (id !== lifecycleObject.id) throw new Error("lifecycle missing");
+        return structuredClone(lifecycleObject);
+      }),
+      updateCommunityPluginLifecycleV1: updateLifecycle,
+      readCommunityPluginGenerationObjectV1ById: vi.fn(async (id: string) => {
+        const object = generationObjects.get(id);
+        if (!object) throw new Error("generation object missing");
+        return structuredClone(object);
+      }),
+      getDriveItemMetadataById: vi.fn(async (id: string) => {
+        const object = generationObjects.get(id);
+        return object
+          ? {
+              id: object.id,
+              name: object.name,
+              size: object.size,
+              eTag: object.eTag,
+              cTag: object.cTag,
+              file: {},
+              parentReference: { id: object.parentId },
+            }
+          : null;
+      }),
+      deleteItem,
+    });
+    const participation = {
+      schemaVersion: 1 as const,
+      kind: "device-community-plugin-participation" as const,
+      scopeEnabled: false,
+      pluginsById: {
+        calendar: { pluginId: "calendar", phase: "excluded" as const },
+      },
+    };
+    const state = makeState(
+      [remoteCommunity],
+      [],
+      {
+        getCommunityPluginParticipation: vi.fn(() =>
+          structuredClone(participation)),
+        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
+          version: 1,
+          scope: SCOPE,
+          anchors: { calendar: true },
+          pending: [],
+        }),
+      },
+      REMOTE_FOLDERS.slice(0, 2),
+    );
+    const lifecycleObserver = new CommunityPluginLifecycleDeviceObserverV1(
+      storage,
+      vaultInstanceId,
+    );
+    const { executor } = makeExecutor({
+      localEntries: [localCommunity],
+      remoteEntries: [remoteCommunity],
+      remoteContent: remoteEnablement,
+      adapter: memory.adapter,
+      state,
+      oneDrive,
+      lifecycleObserver,
+      policy: {
+        version: 1,
+        files: { mode: "none", pluginIds: [] },
+        data: { mode: "none", pluginIds: [] },
+      },
+      localFolders: REMOTE_FOLDERS.slice(0, 2).map((folder) => ({
+        path: folder.path,
+        mtime: 1,
+      })),
+      remoteFolders: REMOTE_FOLDERS.slice(0, 2),
+    });
+
+    await executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { readOnlyPreview: true },
+    );
+    expect(updateLifecycle).not.toHaveBeenCalled();
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(deleteItem).not.toHaveBeenCalled();
+    expect(JSON.parse(lifecycleObject.content).pluginsById.calendar
+      .currentGeneration.phase).toBe("open");
+
+    const prepared = await executor.run("manual");
+    expect(prepared).toMatchObject({ success: true, errors: 0 });
+    expect(JSON.parse(lifecycleObject.content).pluginsById.calendar
+      .currentGeneration.phase).toBe("open");
+    expect(deleteItem).not.toHaveBeenCalled();
+    expect(new TextDecoder().decode(memory.binary.get(COMMUNITY_PATH)!))
+      .toBe('["calendar"]');
+
+    const completed = await executor.run("manual");
+    expect(completed).toMatchObject({ success: true, errors: 0 });
+    expect(new TextDecoder().decode(memory.binary.get(COMMUNITY_PATH)!))
+      .toBe('["calendar"]');
+    expect(new TextDecoder().decode(remoteEnablement)).toBe('["calendar"]');
+    expect(deleteItem).not.toHaveBeenCalled();
+    expect(generationObjects.size).toBe(3);
+    expect(JSON.parse(lifecycleObject.content).pluginsById.calendar
+      .currentGeneration.phase).toBe("open");
+
+    localCommunity.size = 3;
+    localCommunity.hash = await sha256Hex(bytes("[]\n"));
+    uploadFile.mockClear();
+    deleteItem.mockClear();
+    const stable = await executor.run("manual");
+    expect(stable).toMatchObject({ success: true, errors: 0 });
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(deleteItem).not.toHaveBeenCalled();
+  });
+
+  it("keeps ordinary file transfer independent from retired lifecycle housekeeping", async () => {
+    const storage = makeVaultLocalStorage();
+    const vaultInstanceId = "e".repeat(32);
+    loadOrCreateCommunityPluginLifecycleDeviceIdentityV1(
+      storage,
+      vaultInstanceId,
+      10,
+    );
+    const enablement = bytes('["calendar"]');
+    const noteContent = bytes("ordinary-note");
+    const localCommunity = await localEntry(COMMUNITY_PATH, enablement);
+    const remoteCommunity = await remoteEntry(COMMUNITY_PATH, enablement);
+    const localNote = await localEntry("ordinary.md", noteContent);
+    const memory = makeMemoryAdapter({
+      [COMMUNITY_PATH]: enablement,
+      "ordinary.md": noteContent,
+    });
+    const uploadFile = vi.fn().mockResolvedValue({
+      id: "ordinary-note-id",
+      eTag: "ordinary-note-etag",
+      size: noteContent.byteLength,
+      parentReference: { id: SCOPE.filesRootId },
+    });
+    const readLifecycle = vi.fn().mockRejectedValue(
+      new Error("lifecycle temporarily unavailable"),
+    );
+    const state = makeState(
+      [remoteCommunity],
+      [],
+      {
+        getCommunityPluginParticipation: vi.fn(() => ({
+          schemaVersion: 1 as const,
+          kind: "device-community-plugin-participation" as const,
+          scopeEnabled: false,
+          pluginsById: {
+            calendar: { pluginId: "calendar", phase: "excluded" as const },
+          },
+        })),
+        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
+          version: 1,
+          scope: SCOPE,
+          anchors: { calendar: true },
+          pending: [{
+            pluginId: "calendar",
+            localEnabled: true,
+            remoteEnabled: false,
+          }],
+        }),
+      },
+      REMOTE_FOLDERS.slice(0, 2),
+    );
+    const { executor } = makeExecutor({
+      localEntries: [localCommunity, localNote],
+      remoteEntries: [remoteCommunity],
+      remoteContent: enablement,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(enablement, {
+        uploadFile,
+        readCommunityPluginLifecycleV1: readLifecycle,
+      }),
+      lifecycleObserver: new CommunityPluginLifecycleDeviceObserverV1(
+        storage,
+        vaultInstanceId,
+      ),
+      policy: {
+        version: 1,
+        files: { mode: "none", pluginIds: [] },
+        data: { mode: "none", pluginIds: [] },
+      },
+      localFolders: REMOTE_FOLDERS.slice(0, 2).map((folder) => ({
+        path: folder.path,
+        mtime: 1,
+      })),
+      remoteFolders: REMOTE_FOLDERS.slice(0, 2),
+    });
+
+    const result = await executor.run("manual");
+
+    expect(result).toMatchObject({ success: true, uploaded: 1, errors: 0 });
+    expect(result.attention).toBeUndefined();
+    expect(result.message).not.toBe(
+      "result.communityPluginEnablementDecisionRequired",
+    );
+    expect(uploadFile).toHaveBeenCalledWith(
+      "testVault",
+      "ordinary.md",
+      noteContent,
+      undefined,
+      undefined,
+      undefined,
+    );
+    expect(readLifecycle).not.toHaveBeenCalled();
+  });
+
   it("keeps a device-excluded plugin in cloud without executor participation inference", async () => {
     const localEnablement = bytes("[]");
     const remoteEnablement = bytes("[\"calendar\"]");
@@ -560,6 +2328,12 @@ describe("community plugin enablement runtime", () => {
     const memory = makeMemoryAdapter({ [COMMUNITY_PATH]: localEnablement });
     const deleteItem = vi.fn();
     const uploadFile = vi.fn();
+    const lifecycleObserver = {
+      observe: vi.fn(),
+      joinPluginGeneration: vi.fn(),
+      migratePluginLegacyBundle: vi.fn(),
+      sealPluginLegacyAuthority: vi.fn(),
+    } as unknown as NonNullable<ConstructorParameters<typeof SyncExecutor>[11]>;
     const state = makeState(
       [remoteCommunity, remoteMain, remoteManifest],
       baseEntries,
@@ -586,6 +2360,7 @@ describe("community plugin enablement runtime", () => {
           path: string,
         ) => path === COMMUNITY_PATH ? remoteEnablement : new ArrayBuffer(0)),
       }),
+      lifecycleObserver,
       policy: {
         version: 1,
         files: { mode: "selected", pluginIds: [] },
@@ -608,6 +2383,293 @@ describe("community plugin enablement runtime", () => {
       [],
       expect.any(Set),
     );
+    expect(lifecycleObserver.observe).not.toHaveBeenCalled();
+    expect(lifecycleObserver.joinPluginGeneration).not.toHaveBeenCalled();
+    expect(lifecycleObserver.migratePluginLegacyBundle).not.toHaveBeenCalled();
+    expect(lifecycleObserver.sealPluginLegacyAuthority).not.toHaveBeenCalled();
+  });
+
+  it("keeps an ordinary V2 upload for a participating generation plugin after local code changes", async () => {
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const oldMain = bytes("old-main");
+    const changedMain = bytes("changed-local-main");
+    const manifest = bytes(PLUGIN_MANIFEST_TEXT);
+    const remoteMain = await remoteEntry(mainPath, oldMain);
+    const remoteManifest = await remoteEntry(manifestPath, manifest);
+    const localMain = await localEntry(mainPath, changedMain);
+    const localManifest = await localEntry(manifestPath, manifest);
+    const state = makeState(
+      [remoteMain, remoteManifest],
+      [
+        sharedBaseEntry(await localEntry(mainPath, oldMain), remoteMain),
+        sharedBaseEntry(localManifest, remoteManifest),
+      ],
+      {
+        getCommunityPluginParticipation: vi.fn().mockReturnValue({
+          schemaVersion: 1,
+          kind: "device-community-plugin-participation",
+          scopeEnabled: true,
+          pluginsById: {
+            calendar: {
+              pluginId: "calendar",
+              phase: "participating",
+              joinedGeneration: 1,
+            },
+          },
+        }),
+      },
+    );
+    const memory = makeMemoryAdapter({
+      [mainPath]: changedMain,
+      [manifestPath]: PLUGIN_MANIFEST_TEXT,
+    });
+    const uploadFile = vi.fn().mockResolvedValue({
+      id: remoteMain.driveId,
+      eTag: "etag:changed-local-main",
+      size: changedMain.byteLength,
+      parentReference: { id: remoteMain.parentId },
+    });
+    const lifecycleObserver = {
+      observe: vi.fn(),
+      joinPluginGeneration: vi.fn(),
+      migratePluginLegacyBundle: vi.fn(),
+      sealPluginLegacyAuthority: vi.fn(),
+    } as unknown as NonNullable<ConstructorParameters<typeof SyncExecutor>[11]>;
+    const { executor } = makeExecutor({
+      localEntries: [localMain, localManifest],
+      remoteEntries: [remoteMain, remoteManifest],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, {
+        uploadFile,
+        downloadFile: vi.fn(async (
+          _vaultName: string,
+          path: string,
+        ) => path === manifestPath ? manifest : new ArrayBuffer(0)),
+      }),
+      lifecycleObserver,
+      policy: {
+        version: 1,
+        files: { mode: "selected", pluginIds: ["calendar"] },
+        data: { mode: "none", pluginIds: [] },
+      },
+    });
+
+    const result = await executor.run("manual");
+
+    expect(result.success).toBe(true);
+    expect(result.uploaded).toBe(1);
+    expect(result.errors).toBe(0);
+    expect(uploadFile).toHaveBeenCalledWith(
+      "testVault",
+      mainPath,
+      changedMain,
+      undefined,
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(lifecycleObserver.observe).not.toHaveBeenCalled();
+    expect(lifecycleObserver.joinPluginGeneration).not.toHaveBeenCalled();
+    expect(lifecycleObserver.migratePluginLegacyBundle).not.toHaveBeenCalled();
+    expect(lifecycleObserver.sealPluginLegacyAuthority).not.toHaveBeenCalled();
+  });
+
+  it("keeps an ordinary V2 download for a participating generation plugin after remote code changes", async () => {
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const oldMain = bytes("old-main");
+    const changedMain = bytes("changed-remote-main");
+    const manifest = bytes(PLUGIN_MANIFEST_TEXT);
+    const remoteMain = await remoteEntry(mainPath, changedMain);
+    const remoteManifest = await remoteEntry(manifestPath, manifest);
+    const localMain = await localEntry(mainPath, oldMain);
+    const localManifest = await localEntry(manifestPath, manifest);
+    const state = makeState(
+      [remoteMain, remoteManifest],
+      [
+        sharedBaseEntry(localMain, await remoteEntry(mainPath, oldMain)),
+        sharedBaseEntry(localManifest, remoteManifest),
+      ],
+      {
+        getCommunityPluginParticipation: vi.fn().mockReturnValue({
+          schemaVersion: 1,
+          kind: "device-community-plugin-participation",
+          scopeEnabled: true,
+          pluginsById: {
+            calendar: {
+              pluginId: "calendar",
+              phase: "participating",
+              joinedGeneration: 1,
+            },
+          },
+        }),
+      },
+    );
+    const memory = makeMemoryAdapter({
+      [mainPath]: oldMain,
+      [manifestPath]: PLUGIN_MANIFEST_TEXT,
+    });
+    const downloadFile = vi.fn(async (
+      _vaultName: string,
+      path: string,
+    ) => path === mainPath ? changedMain : manifest);
+    const { executor } = makeExecutor({
+      localEntries: [localMain, localManifest],
+      remoteEntries: [remoteMain, remoteManifest],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, { downloadFile }),
+      policy: {
+        version: 1,
+        files: { mode: "selected", pluginIds: ["calendar"] },
+        data: { mode: "none", pluginIds: [] },
+      },
+    });
+
+    const result = await executor.run("manual");
+
+    expect(result.success).toBe(true);
+    expect(result.downloaded).toBe(1);
+    expect(result.errors).toBe(0);
+    expect(downloadFile).toHaveBeenCalledWith(
+      "testVault",
+      mainPath,
+      undefined,
+      expect.anything(),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(memory.binary.get(mainPath)).toEqual(changedMain);
+  });
+
+  it("keeps a two-sided participating generation change in the ordinary conflict path", async () => {
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const oldMain = bytes("old-main");
+    const changedLocalMain = bytes("changed-local-main");
+    const changedRemoteMain = bytes("changed-remote-main");
+    const manifest = bytes(PLUGIN_MANIFEST_TEXT);
+    const remoteMain = await remoteEntry(mainPath, changedRemoteMain);
+    const remoteManifest = await remoteEntry(manifestPath, manifest);
+    const localMain = await localEntry(mainPath, changedLocalMain);
+    const localManifest = await localEntry(manifestPath, manifest);
+    const oldRemoteMain = await remoteEntry(mainPath, oldMain);
+    const state = makeState(
+      [remoteMain, remoteManifest],
+      [
+        sharedBaseEntry(await localEntry(mainPath, oldMain), oldRemoteMain),
+        sharedBaseEntry(localManifest, remoteManifest),
+      ],
+      {
+        getCommunityPluginParticipation: vi.fn().mockReturnValue({
+          schemaVersion: 1,
+          kind: "device-community-plugin-participation",
+          scopeEnabled: true,
+          pluginsById: {
+            calendar: {
+              pluginId: "calendar",
+              phase: "participating",
+              joinedGeneration: 1,
+            },
+          },
+        }),
+      },
+    );
+    const memory = makeMemoryAdapter({
+      [mainPath]: changedLocalMain,
+      [manifestPath]: PLUGIN_MANIFEST_TEXT,
+    });
+    const downloadFile = vi.fn(async (
+      _vaultName: string,
+      path: string,
+    ) => path === mainPath ? changedRemoteMain : manifest);
+    const uploadFile = vi.fn();
+    const { executor } = makeExecutor({
+      localEntries: [localMain, localManifest],
+      remoteEntries: [remoteMain, remoteManifest],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, { downloadFile, uploadFile }),
+      policy: {
+        version: 1,
+        files: { mode: "selected", pluginIds: ["calendar"] },
+        data: { mode: "none", pluginIds: [] },
+      },
+    });
+
+    const result = await executor.run("manual");
+
+    expect(result.success).toBe(true);
+    expect(result.conflicts).toBeGreaterThan(0);
+    expect(result.conflicts).toBe(1);
+    expect(result.deferred).toBe(0);
+    expect(result.uploaded).toBe(0);
+    expect(result.downloaded).toBe(0);
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(memory.binary.get(mainPath)).toEqual(changedLocalMain);
+  });
+
+  it("keeps cloud plugin code when this device exits participation", async () => {
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const main = bytes("cloud-main");
+    const manifest = bytes(PLUGIN_MANIFEST_TEXT);
+    const remoteMain = await remoteEntry(mainPath, main);
+    const remoteManifest = await remoteEntry(manifestPath, manifest);
+    const localMain = await localEntry(mainPath, main);
+    const localManifest = await localEntry(manifestPath, manifest);
+    const state = makeState(
+      [remoteMain, remoteManifest],
+      [
+        sharedBaseEntry(localMain, remoteMain),
+        sharedBaseEntry(localManifest, remoteManifest),
+      ],
+      {
+        getCommunityPluginParticipation: vi.fn().mockReturnValue({
+          schemaVersion: 1,
+          kind: "device-community-plugin-participation",
+          scopeEnabled: false,
+          pluginsById: {
+            calendar: {
+              pluginId: "calendar",
+              phase: "excluded",
+              joinedGeneration: 1,
+            },
+          },
+        }),
+      },
+    );
+    const memory = makeMemoryAdapter({
+      [mainPath]: main,
+      [manifestPath]: manifest,
+    });
+    const deleteItem = vi.fn();
+    const { executor } = makeExecutor({
+      localEntries: [localMain, localManifest],
+      remoteEntries: [remoteMain, remoteManifest],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, { deleteItem }),
+      policy: {
+        version: 1,
+        files: { mode: "selected", pluginIds: ["calendar"] },
+        data: { mode: "none", pluginIds: [] },
+      },
+    });
+
+    const result = await executor.run("manual");
+
+    expect(result.success).toBe(true);
+    expect(result.deleted).toBe(0);
+    expect(result.errors).toBe(0);
+    expect(deleteItem).not.toHaveBeenCalled();
+    expect(memory.binary.get(mainPath)).toEqual(main);
+    expect(memory.binary.get(manifestPath)).toEqual(manifest);
   });
 
   it("does not download a remote manifest solely for desktop inventory display", async () => {
@@ -944,10 +3006,7 @@ describe("community plugin enablement runtime", () => {
     );
     expect(deleteItem).not.toHaveBeenCalled();
     expect(uploadFile).not.toHaveBeenCalled();
-    expect(downloadFile.mock.calls.map((call) => call[1])).toEqual([
-      COMMUNITY_PATH,
-      COMMUNITY_PATH,
-    ]);
+    expect(downloadFile).not.toHaveBeenCalled();
     expect(memory.adapter.writeBinary).not.toHaveBeenCalled();
     expect(memory.adapter.mkdir).not.toHaveBeenCalled();
     expect(memory.adapter.remove).not.toHaveBeenCalled();
@@ -977,9 +3036,8 @@ describe("community plugin enablement runtime", () => {
     expect(restored.deferred).toBe(0);
     expect(restored.downloaded).toBe(1);
     expect(downloadFile.mock.calls.map((call) => call[1])).toContain(mainPath);
-    expect(memory.adapter.writeBinary).toHaveBeenCalledWith(
-      mainPath,
-      expect.any(ArrayBuffer),
+    expect(new Uint8Array(memory.binary.get(mainPath)!)).toEqual(
+      new Uint8Array(bytes("main")),
     );
   });
 
@@ -1106,17 +3164,14 @@ describe("community plugin enablement runtime", () => {
     );
     expect(deleteItem).not.toHaveBeenCalled();
     expect(uploadFile).not.toHaveBeenCalled();
-    expect(memory.adapter.writeBinary).toHaveBeenCalledWith(
-      mainPath,
-      expect.any(ArrayBuffer),
+    expect(new Uint8Array(memory.binary.get(mainPath)!)).toEqual(
+      new Uint8Array(bytes("main")),
     );
-    expect(memory.adapter.writeBinary).toHaveBeenCalledWith(
-      manifestPath,
-      expect.any(ArrayBuffer),
+    expect(new Uint8Array(memory.binary.get(manifestPath)!)).toEqual(
+      new Uint8Array(bytes(PLUGIN_MANIFEST_TEXT)),
     );
-    expect(memory.adapter.writeBinary).toHaveBeenCalledWith(
-      stylesPath,
-      expect.any(ArrayBuffer),
+    expect(new Uint8Array(memory.binary.get(stylesPath)!)).toEqual(
+      new Uint8Array(bytes("styles")),
     );
     expect(memory.adapter.mkdir).toHaveBeenCalledWith(
       ".obsidian/plugins/calendar",
@@ -1184,9 +3239,7 @@ describe("community plugin enablement runtime", () => {
     });
     expect(stable.communityPluginLocalIgnores).toBeUndefined();
     expect(stable.communityPluginRestoresCompleted).toBeUndefined();
-    expect(coldDownloadFile.mock.calls.map((call) => call[1])).toEqual([
-      COMMUNITY_PATH,
-    ]);
+    expect(coldDownloadFile).not.toHaveBeenCalled();
     expect(memory.adapter.writeBinary).not.toHaveBeenCalled();
     expect(deleteItem).not.toHaveBeenCalled();
     expect(uploadFile).not.toHaveBeenCalled();
@@ -1293,9 +3346,7 @@ describe("community plugin enablement runtime", () => {
         reason: "remote-bundle-changed",
       }],
     });
-    expect(downloadFile.mock.calls.map((call) => call[1])).toEqual([
-      COMMUNITY_PATH,
-    ]);
+    expect(downloadFile).not.toHaveBeenCalled();
     expect(deleteItem).not.toHaveBeenCalled();
     expect(uploadFile).not.toHaveBeenCalled();
     expect(memory.adapter.writeBinary).not.toHaveBeenCalled();
@@ -2200,7 +4251,7 @@ describe("community plugin enablement runtime", () => {
         ));
       expect(log).toHaveBeenCalledWith(
         "execute",
-        "mobile community plugin manifest participation preflight",
+        "community plugin manifest participation preflight",
         expect.objectContaining({
           candidates: pluginIds.length,
           cacheHits: 0,
@@ -2490,13 +4541,11 @@ describe("community plugin enablement runtime", () => {
       expect(restored.errors).toBe(0);
       expect(restored.deferred).toBe(0);
       expect(restored.downloaded).toBe(2);
-      expect(memory.adapter.writeBinary).toHaveBeenCalledWith(
-        manifestPath,
-        expect.any(ArrayBuffer),
+      expect(new Uint8Array(memory.binary.get(manifestPath)!)).toEqual(
+        new Uint8Array(mobileManifestBytes),
       );
-      expect(memory.adapter.writeBinary).toHaveBeenCalledWith(
-        mainPath,
-        expect.any(ArrayBuffer),
+      expect(new Uint8Array(memory.binary.get(mainPath)!)).toEqual(
+        new Uint8Array(mainBytes),
       );
       expect(observedManifestContents).toEqual([
         new TextDecoder().decode(desktopManifestBytes),
@@ -2507,11 +4556,11 @@ describe("community plugin enablement runtime", () => {
     }
   });
 
-  it("blocks a selected plugin upload when its local manifest identity differs", async () => {
+  it("blocks a selected plugin upload when its manifest identity is unsafe", async () => {
     const manifestPath = ".obsidian/plugins/calendar/manifest.json";
     const mainPath = ".obsidian/plugins/calendar/main.js";
     const localManifestText = JSON.stringify({
-      id: "other",
+      id: "../other",
       version: "2.0.0",
       minAppVersion: "1.5.0",
     });
@@ -2528,6 +4577,61 @@ describe("community plugin enablement runtime", () => {
       remoteContent: null,
       adapter: memory.adapter,
       oneDrive: makeOneDrive(null, { uploadFile }),
+    });
+
+    const result = await executor.run("manual");
+
+    expect(result.errors).toBeGreaterThan(0);
+    expect(uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("blocks both selected directories when they claim the same manifest id", async () => {
+    const directoryIds = ["pkmer-copy-a", "pkmer-copy-b"];
+    const manifestText = JSON.stringify({
+      id: "pkmer",
+      name: "PKMer",
+      version: "1.0.0",
+    });
+    const localEntries: LocalFileEntry[] = [];
+    const memoryFiles: Record<string, ArrayBuffer | string> = {};
+    const remoteFolders = [...REMOTE_FOLDERS.slice(0, 2)];
+    for (const [index, directoryId] of directoryIds.entries()) {
+      const root = `.obsidian/plugins/${directoryId}`;
+      const mainPath = `${root}/main.js`;
+      const manifestPath = `${root}/manifest.json`;
+      localEntries.push(
+        await localEntry(mainPath, bytes(`main-${index}`)),
+        await localEntry(manifestPath, bytes(manifestText)),
+      );
+      memoryFiles[mainPath] = bytes(`main-${index}`);
+      memoryFiles[manifestPath] = manifestText;
+      remoteFolders.push({
+        path: root,
+        driveId: `plugin-folder-${index}`,
+        parentId: "plugins-folder-id",
+        name: directoryId,
+      });
+    }
+    const memory = makeMemoryAdapter(memoryFiles);
+    const uploadFile = vi.fn();
+    const state = makeState([], [], {}, remoteFolders);
+    const { executor } = makeExecutor({
+      localEntries,
+      localFolders: remoteFolders.map((folder) => ({
+        path: folder.path,
+        mtime: 1,
+      })),
+      remoteEntries: [],
+      remoteFolders,
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, { uploadFile }),
+      policy: {
+        version: 1,
+        files: { mode: "selected", pluginIds: directoryIds },
+        data: { mode: "none", pluginIds: [] },
+      },
     });
 
     const result = await executor.run("manual");
@@ -2628,140 +4732,28 @@ describe("community plugin enablement runtime", () => {
     );
   });
 
-  it("repairs a missing structured enablement identity once after V2 cold reload", async () => {
-    const content = bytes("[\"calendar\"]");
-    const mainPath = ".obsidian/plugins/calendar/main.js";
-    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
-    const mainBytes = bytes("plugin");
-    const manifestBytes = bytes(PLUGIN_MANIFEST_TEXT);
-    const local = await localEntry(COMMUNITY_PATH, content);
-    const localMain = await localEntry(mainPath, mainBytes);
-    const localManifest = await localEntry(manifestPath, manifestBytes);
-    const remote = await remoteEntry(COMMUNITY_PATH, content);
-    const remoteMain = await remoteEntry(mainPath, mainBytes);
-    const remoteManifest = await remoteEntry(manifestPath, manifestBytes);
-    const memory = makeMemoryAdapter({
-      [COMMUNITY_PATH]: content,
-      [mainPath]: mainBytes,
-      [manifestPath]: manifestBytes,
+  it("keeps community-plugins.json completely outside sync even when both sides differ", async () => {
+    const localContent = bytes("[\"calendar\"]");
+    const remoteContent = bytes("[]");
+    const local = await localEntry(COMMUNITY_PATH, localContent);
+    const remote = await remoteEntry(COMMUNITY_PATH, remoteContent);
+    const memory = makeMemoryAdapter({ [COMMUNITY_PATH]: localContent });
+    const state = makeState([remote], [], {
+      getCommunityPluginEnablementState: vi.fn().mockReturnValue({
+        version: 1,
+        scope: SCOPE,
+        anchors: { calendar: false },
+        pending: [],
+      }),
     });
-    const enablementState = {
-      version: 1 as const,
-      scope: SCOPE,
-      anchors: { calendar: true },
-      pending: [],
-      observation: {
-        version: 1 as const,
-        source: {
-          path: COMMUNITY_PATH,
-          selectedPluginIds: ["calendar"],
-          local: {
-            exists: true,
-            contentHash: local.hash,
-          },
-          remote: {
-            exists: true,
-            contentHash: remote.sha256Hash!,
-            remoteId: remote.driveId,
-            eTag: remote.eTag,
-          },
-        },
-        localPluginIds: ["calendar"],
-        remotePluginIds: ["calendar"],
-      },
-    };
-    const state = makeState(
-      [remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-      {
-        getCommunityPluginEnablementState: vi.fn(
-          () => structuredClone(enablementState),
-        ),
-      },
-    );
-    const completeItems = completeRemoteItems([
-      remote,
-      remoteMain,
-      remoteManifest,
-    ]);
-    const getDelta = vi.fn(async (
-      _vaultName: string,
-      deltaLink?: string,
-    ) => deltaLink
-      ? {
-          value: [],
-          "@odata.deltaLink": "delta-token-stable",
-        }
-      : {
-          value: completeItems,
-          "@odata.deltaLink": "delta-token-repaired",
-        });
-    const uploadFile = vi.fn().mockRejectedValue(new OneDriveError(
-      OneDriveErrorType.Conflict,
-      "already exists",
-      409,
-    ));
-    const downloadFile = vi.fn();
-    const oneDrive = makeOneDrive(content, {
-      getDelta,
-      uploadFile,
-      downloadFile,
-    });
-    const { executor } = makeExecutor({
-      localEntries: [local, localMain, localManifest],
-      remoteEntries: [remoteMain, remoteManifest],
-      remoteContent: content,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-    });
-
-    const repaired = await executor.run("manual");
-    const stable = await executor.run("manual");
-
-    expect(repaired).toMatchObject({
-      success: true,
-      deferred: 0,
-      errors: 0,
-    });
-    expect(stable).toMatchObject({
-      success: true,
-      deferred: 0,
-      errors: 0,
-    });
-    expect(getDelta.mock.calls).toEqual([
-      ["testVault"],
-      ["testVault", "delta-token-repaired"],
-    ]);
-    expect(state.setRemoteState).toHaveBeenCalledWith(
-      expect.arrayContaining([
-        expect.objectContaining({
-          path: COMMUNITY_PATH,
-          driveId: remote.driveId,
-          eTag: remote.eTag,
-        }),
-      ]),
-      "delta-token-repaired",
-      SCOPE,
-      expect.any(Array),
-    );
-    expect(downloadFile).not.toHaveBeenCalled();
-    expect(uploadFile).not.toHaveBeenCalled();
-  });
-
-  it("removes community-plugins.json from the ordinary file plan", async () => {
-    const content = bytes("[\"calendar\"]");
-    const local = await localEntry(COMMUNITY_PATH, content);
-    const remote = await remoteEntry(COMMUNITY_PATH, content);
-    const memory = makeMemoryAdapter({ [COMMUNITY_PATH]: content });
+    const downloadFile = vi.fn().mockResolvedValue(remoteContent);
     const { executor, oneDrive } = makeExecutor({
       localEntries: [local],
       remoteEntries: [remote],
-      remoteContent: content,
+      remoteContent,
       adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(remoteContent, { downloadFile }),
     });
 
     const result = await executor.run("manual");
@@ -2770,7 +4762,14 @@ describe("community plugin enablement runtime", () => {
     expect(result.uploaded).toBe(0);
     expect(result.downloaded).toBe(0);
     expect(result.deleted).toBe(0);
+    expect(result.attention).toBeUndefined();
     expect(oneDrive.uploadFile).not.toHaveBeenCalled();
+    expect(downloadFile).not.toHaveBeenCalled();
+    expect(memory.adapter.writeBinary).not.toHaveBeenCalled();
+    expect(state.setCommunityPluginEnablementState).not.toHaveBeenCalled();
+    expect(new TextDecoder().decode(memory.binary.get(COMMUNITY_PATH))).toBe(
+      new TextDecoder().decode(localContent),
+    );
   });
 
   it("preserves a dangling enablement id without propagating it or failing a zero-file plan", async () => {
@@ -2819,16 +4818,7 @@ describe("community plugin enablement runtime", () => {
     expect(new TextDecoder().decode(memory.binary.get(COMMUNITY_PATH))).toBe(
       new TextDecoder().decode(localContent),
     );
-    expect(state.setCommunityPluginEnablementState).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        anchors: { [pluginId]: false },
-        pending: [],
-        observation: expect.objectContaining({
-          localPluginIds: [pluginId],
-          remotePluginIds: [],
-        }),
-      }),
-    );
+    expect(state.setCommunityPluginEnablementState).not.toHaveBeenCalled();
   });
 
   it("keeps an explicitly requested partial bundle actionable so preflight still fails closed", async () => {
@@ -2874,31 +4864,53 @@ describe("community plugin enablement runtime", () => {
     expect(memory.adapter.writeBinary).not.toHaveBeenCalled();
   });
 
-  it("returns to normal enablement propagation when a complete bundle exists on one side", async () => {
-    const localContent = bytes("[\"calendar\"]");
+  it("uses a valid manifest id alias when propagating a complete local bundle", async () => {
+    const directoryId = "obsidian-pkmer";
+    const manifestId = "pkmer";
+    const aliasManifestText = JSON.stringify({
+      id: manifestId,
+      name: "PKMer",
+      version: "1.0.0",
+      minAppVersion: "1.5.0",
+    });
+    const localContent = bytes(`["${manifestId}"]`);
     const remoteContent = bytes("[]");
-    const mainPath = ".obsidian/plugins/calendar/main.js";
-    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const mainPath = `.obsidian/plugins/${directoryId}/main.js`;
+    const manifestPath = `.obsidian/plugins/${directoryId}/manifest.json`;
     const mainBytes = bytes("plugin");
-    const manifestBytes = bytes(PLUGIN_MANIFEST_TEXT);
+    const manifestBytes = bytes(aliasManifestText);
     const local = await localEntry(COMMUNITY_PATH, localContent);
     const remote = await remoteEntry(COMMUNITY_PATH, remoteContent);
     const localMain = await localEntry(mainPath, mainBytes);
     const localManifest = await localEntry(manifestPath, manifestBytes);
+    const remoteFolders = [
+      ...REMOTE_FOLDERS.slice(0, 2),
+      {
+        path: `.obsidian/plugins/${directoryId}`,
+        driveId: "plugin-folder-id",
+        parentId: "plugins-folder-id",
+        name: directoryId,
+      },
+    ];
     const memory = makeMemoryAdapter({
       [COMMUNITY_PATH]: localContent,
       [mainPath]: mainBytes,
       [manifestPath]: manifestBytes,
     });
-    memory.text.set(manifestPath, PLUGIN_MANIFEST_TEXT);
-    const state = makeState([remote], [], {
-      getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-        version: 1,
-        scope: SCOPE,
-        anchors: { calendar: false },
-        pending: [],
-      }),
-    });
+    memory.text.set(manifestPath, aliasManifestText);
+    const state = makeState(
+      [remote],
+      [],
+      {
+        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
+          version: 1,
+          scope: SCOPE,
+          anchors: { [directoryId]: false },
+          pending: [],
+        }),
+      },
+      remoteFolders,
+    );
     const uploadedByPath = new Map<string, string>();
     const uploadFile = vi.fn(async (
       _vaultName: string,
@@ -2923,6 +4935,11 @@ describe("community plugin enablement runtime", () => {
       remoteContent,
       adapter: memory.adapter,
       state,
+      remoteFolders,
+      localFolders: remoteFolders.map((folder) => ({
+        path: folder.path,
+        mtime: 1,
+      })),
       oneDrive: makeOneDrive(remoteContent, { uploadFile }),
       policy: {
         version: 1,
@@ -2940,965 +4957,8 @@ describe("community plugin enablement runtime", () => {
       deferred: 0,
     });
     expect(uploadedByPath.get(mainPath)).toBe("plugin");
-    expect(uploadedByPath.get(manifestPath)).toBe(PLUGIN_MANIFEST_TEXT);
-    expect(uploadedByPath.get(COMMUNITY_PATH)).toBe(
-      "[\n  \"calendar\"\n]\n",
-    );
-    expect(state.setCommunityPluginEnablementState).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        anchors: { calendar: true },
-        pending: [],
-      }),
-    );
-  });
-
-  it("reuses a version-bound enablement observation on a stable second round", async () => {
-    const content = bytes("[\"calendar\"]");
-    const mainPath = ".obsidian/plugins/calendar/main.js";
-    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
-    const mainBytes = bytes("plugin");
-    const manifestBytes = bytes(PLUGIN_MANIFEST_TEXT);
-    const local = await localEntry(COMMUNITY_PATH, content);
-    const remote = await remoteEntry(COMMUNITY_PATH, content);
-    const localMain = await localEntry(mainPath, mainBytes);
-    const localManifest = await localEntry(manifestPath, manifestBytes);
-    const remoteMain = await remoteEntry(mainPath, mainBytes);
-    const remoteManifest = await remoteEntry(manifestPath, manifestBytes);
-    const memory = makeMemoryAdapter({
-      [COMMUNITY_PATH]: content,
-      [mainPath]: mainBytes,
-      [manifestPath]: manifestBytes,
-    });
-    let enablementState:
-      ReturnType<StateManager["getCommunityPluginEnablementState"]> = {
-      version: 1 as const,
-      scope: SCOPE,
-      anchors: {},
-      pending: [],
-    };
-    const getCommunityPluginEnablementState = vi.fn(
-      () => structuredClone(enablementState),
-    );
-    const setCommunityPluginEnablementState = vi.fn(async (
-      next: ReturnType<StateManager["getCommunityPluginEnablementState"]>,
-    ) => {
-      enablementState = structuredClone(next);
-    });
-    const state = makeState(
-      [remote, remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(local, remote),
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-      {
-        getCommunityPluginEnablementState,
-        setCommunityPluginEnablementState,
-      },
-    );
-    const downloadFile = vi.fn().mockResolvedValue(content);
-    const oneDrive = makeOneDrive(content, { downloadFile });
-    const { executor } = makeExecutor({
-      localEntries: [local, localMain, localManifest],
-      remoteEntries: [remote, remoteMain, remoteManifest],
-      remoteContent: content,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-    });
-
-    const first = await executor.run("manual");
-    const second = await executor.run("manual");
-
-    expect(first.success).toBe(true);
-    expect(second.success).toBe(true);
-    expect(downloadFile).toHaveBeenCalledOnce();
-    expect(memory.adapter.readBinary).toHaveBeenCalledOnce();
-    expect(setCommunityPluginEnablementState).toHaveBeenCalled();
-    expect(enablementState).toMatchObject({
-      anchors: { calendar: true },
-      observation: {
-        localPluginIds: ["calendar"],
-        remotePluginIds: ["calendar"],
-        source: {
-          local: { contentHash: local.hash },
-          remote: {
-            remoteId: remote.driveId,
-            eTag: remote.eTag,
-          },
-        },
-      },
-    });
-  });
-
-  it("re-reads a changed remote enablement eTag before deriving pending decisions", async () => {
-    const localContent = bytes("[\"calendar\"]");
-    const priorRemoteContent = bytes("[\"calendar\"]");
-    const changedRemoteContent = bytes("[]");
-    const local = await localEntry(COMMUNITY_PATH, localContent);
-    const priorRemote = await remoteEntry(
-      COMMUNITY_PATH,
-      priorRemoteContent,
-    );
-    const changedRemote = await remoteEntry(
-      COMMUNITY_PATH,
-      changedRemoteContent,
-      { driveId: priorRemote.driveId, eTag: "etag:changed" },
-    );
-    const mainPath = ".obsidian/plugins/calendar/main.js";
-    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
-    const mainBytes = bytes("plugin");
-    const manifestBytes = bytes(PLUGIN_MANIFEST_TEXT);
-    const localMain = await localEntry(mainPath, mainBytes);
-    const localManifest = await localEntry(manifestPath, manifestBytes);
-    const remoteMain = await remoteEntry(mainPath, mainBytes);
-    const remoteManifest = await remoteEntry(manifestPath, manifestBytes);
-    const memory = makeMemoryAdapter({
-      [COMMUNITY_PATH]: localContent,
-      [mainPath]: mainBytes,
-      [manifestPath]: manifestBytes,
-    });
-    const state = makeState(
-      [changedRemote, remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-      {
-        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-          version: 1,
-          scope: SCOPE,
-          anchors: {},
-          pending: [],
-          observation: {
-            version: 1,
-            source: {
-              path: COMMUNITY_PATH,
-              selectedPluginIds: ["calendar"],
-              local: { exists: true, contentHash: local.hash },
-              remote: {
-                exists: true,
-                contentHash: priorRemote.sha256Hash,
-                remoteId: priorRemote.driveId,
-                eTag: priorRemote.eTag,
-              },
-            },
-            localPluginIds: ["calendar"],
-            remotePluginIds: ["calendar"],
-          },
-        }),
-      },
-    );
-    const downloadFile = vi.fn().mockResolvedValue(changedRemoteContent);
-    const { executor } = makeExecutor({
-      localEntries: [local, localMain, localManifest],
-      remoteEntries: [changedRemote, remoteMain, remoteManifest],
-      remoteContent: changedRemoteContent,
-      adapter: memory.adapter,
-      state,
-      oneDrive: makeOneDrive(changedRemoteContent, { downloadFile }),
-    });
-
-    const result = await executor.run("manual");
-
-    expect(downloadFile).toHaveBeenCalledOnce();
-    expect(result.attention).toEqual({
-      reason: "community-plugin-enablement-decision-required",
-      count: 1,
-    });
-    expect(state.setCommunityPluginEnablementState).toHaveBeenCalledWith(
-      expect.objectContaining({
-        pending: [{
-          pluginId: "calendar",
-          localEnabled: true,
-          remoteEnabled: false,
-        }],
-        observation: expect.objectContaining({
-          remotePluginIds: [],
-          source: expect.objectContaining({
-            remote: expect.objectContaining({
-              eTag: "etag:changed",
-            }),
-          }),
-        }),
-      }),
-    );
-  });
-
-  it("anchors disabled plugins discovered by the complete default-all inventory", async () => {
-    const enablement = bytes("[]");
-    const mainBytes = bytes("plugin");
-    const manifestBytes = bytes(PLUGIN_MANIFEST_TEXT);
-    const mainPath = ".obsidian/plugins/calendar/main.js";
-    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
-    const localEnablement = await localEntry(COMMUNITY_PATH, enablement);
-    const localMain = await localEntry(mainPath, mainBytes);
-    const localManifest = await localEntry(manifestPath, manifestBytes);
-    const remoteEnablement = await remoteEntry(COMMUNITY_PATH, enablement);
-    const remoteMain = await remoteEntry(mainPath, mainBytes);
-    const remoteManifest = await remoteEntry(manifestPath, manifestBytes);
-    const state = makeState(
-      [remoteEnablement, remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(localEnablement, remoteEnablement),
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-    );
-    const memory = makeMemoryAdapter({
-      [COMMUNITY_PATH]: enablement,
-      [mainPath]: mainBytes,
-      [manifestPath]: manifestBytes,
-    });
-    const { executor } = makeExecutor({
-      localEntries: [localEnablement, localMain, localManifest],
-      remoteEntries: [remoteEnablement, remoteMain, remoteManifest],
-      remoteContent: enablement,
-      adapter: memory.adapter,
-      state,
-      policy: {
-        version: 1,
-        files: { mode: "all", pluginIds: [] },
-        data: { mode: "all", pluginIds: [] },
-      },
-    });
-
-    const result = await executor.run("manual");
-
-    expect(result.success).toBe(true);
-    expect(result.message).not.toBe(
-      "result.communityPluginEnablementDecisionRequired",
-    );
-    expect(state.setCommunityPluginEnablementState).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        version: 1,
-        scope: SCOPE,
-        anchors: { calendar: false },
-        pending: [],
-      }),
-    );
-  });
-
-  it("stops before planning when first observations differ", async () => {
-    const localContent = bytes("[\"calendar\"]");
-    const remoteContent = bytes("[]");
-    const mainPath = ".obsidian/plugins/calendar/main.js";
-    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
-    const mainBytes = bytes("plugin");
-    const manifestBytes = bytes(PLUGIN_MANIFEST_TEXT);
-    const local = await localEntry(COMMUNITY_PATH, localContent);
-    const remote = await remoteEntry(COMMUNITY_PATH, remoteContent);
-    const localMain = await localEntry(mainPath, mainBytes);
-    const localManifest = await localEntry(manifestPath, manifestBytes);
-    const remoteMain = await remoteEntry(mainPath, mainBytes);
-    const remoteManifest = await remoteEntry(manifestPath, manifestBytes);
-    const memory = makeMemoryAdapter({
-      [COMMUNITY_PATH]: localContent,
-      [mainPath]: mainBytes,
-      [manifestPath]: manifestBytes,
-    });
-    const state = makeState(
-      [remote, remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-    );
-    const { executor, oneDrive } = makeExecutor({
-      localEntries: [local, localMain, localManifest],
-      remoteEntries: [remote, remoteMain, remoteManifest],
-      remoteContent,
-      adapter: memory.adapter,
-      state,
-    });
-
-    const result = await executor.run("manual");
-
-    expect(result.message).toBe("result.communityPluginEnablementDecisionRequired");
-    expect(result.attention).toEqual({
-      reason: "community-plugin-enablement-decision-required",
-      count: 1,
-    });
-    expect(oneDrive.uploadFile).not.toHaveBeenCalled();
-    expect(memory.adapter.writeBinary).not.toHaveBeenCalled();
-    expect(state.setCommunityPluginEnablementState).toHaveBeenCalledWith(
-      expect.objectContaining({
-        version: 1,
-        scope: SCOPE,
-        anchors: {},
-        pending: [{
-          pluginId: "calendar",
-          localEnabled: true,
-          remoteEnabled: false,
-        }],
-      }),
-    );
-  });
-
-  it("does not publish a first-observation decision after cancellation during preparation", async () => {
-    const localContent = bytes("[\"calendar\"]");
-    const remoteContent = bytes("[]");
-    const local = await localEntry(COMMUNITY_PATH, localContent);
-    const remote = await remoteEntry(COMMUNITY_PATH, remoteContent);
-    const memory = makeMemoryAdapter({ [COMMUNITY_PATH]: localContent });
-    const downloadStarted = deferred<void>();
-    const downloadResult = deferred<ArrayBuffer>();
-    const downloadFile = vi.fn(() => {
-      downloadStarted.resolve();
-      return downloadResult.promise;
-    });
-    const oneDrive = makeOneDrive(remoteContent, { downloadFile });
-    const state = makeState([remote]);
-    const { executor } = makeExecutor({
-      localEntries: [local],
-      remoteEntries: [remote],
-      remoteContent,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-    });
-
-    const run = executor.run("manual");
-    await downloadStarted.promise;
-    executor.cancel();
-    downloadResult.resolve(remoteContent);
-    const result = await run;
-
-    expect(result.message).toBe("result.cancelled");
+    expect(uploadedByPath.get(manifestPath)).toBe(aliasManifestText);
+    expect(uploadedByPath.has(COMMUNITY_PATH)).toBe(false);
     expect(state.setCommunityPluginEnablementState).not.toHaveBeenCalled();
-  });
-
-  it("uses the exact config-folder identity when creating the remote enablement file", async () => {
-    const localContent = bytes("[\"calendar\"]");
-    const pluginMain = bytes("plugin");
-    const pluginManifest = bytes(PLUGIN_MANIFEST_TEXT);
-    const local = await localEntry(COMMUNITY_PATH, localContent);
-    const remoteMain = await remoteEntry(
-      ".obsidian/plugins/calendar/main.js",
-      pluginMain,
-    );
-    const remoteManifest = await remoteEntry(
-      ".obsidian/plugins/calendar/manifest.json",
-      pluginManifest,
-    );
-    const localMain = await localEntry(remoteMain.path, pluginMain);
-    const localManifest = await localEntry(remoteManifest.path, pluginManifest);
-    const memory = makeMemoryAdapter({
-      [COMMUNITY_PATH]: localContent,
-      [remoteMain.path]: pluginMain,
-      [remoteManifest.path]: PLUGIN_MANIFEST_TEXT,
-    });
-    const uploadFile = vi.fn().mockResolvedValue({
-      id: "community-file-id",
-      eTag: "etag:new",
-      size: localContent.byteLength,
-    });
-    const oneDrive = makeOneDrive(null, { uploadFile });
-    const state = makeState(
-      [remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-      {
-      getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-        version: 1,
-        scope: SCOPE,
-        anchors: { calendar: true },
-        pending: [],
-      }),
-      },
-    );
-    const { executor } = makeExecutor({
-      localEntries: [local, localMain, localManifest],
-      remoteEntries: [remoteMain, remoteManifest],
-      remoteContent: null,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-    });
-
-    const result = await executor.run("manual");
-
-    expect(result.success).toBe(true);
-    expect(state.applyRemoteMutations).toHaveBeenCalledWith([
-      expect.objectContaining({
-        path: COMMUNITY_PATH,
-        parentId: "obsidian-folder-id",
-      }),
-    ], []);
-  });
-
-  it("uses remote ETag CAS and advances anchors only after the write", async () => {
-    const localContent = bytes("[\"calendar\"]");
-    const remoteContent = bytes("[]");
-    const pluginMain = bytes("plugin");
-    const pluginManifest = bytes(PLUGIN_MANIFEST_TEXT);
-    const local = await localEntry(COMMUNITY_PATH, localContent);
-    const remote = await remoteEntry(COMMUNITY_PATH, remoteContent, {
-      driveId: "community-file-id",
-      eTag: "etag:observed",
-    });
-    const remoteMain = await remoteEntry(
-      ".obsidian/plugins/calendar/main.js",
-      pluginMain,
-    );
-    const remoteManifest = await remoteEntry(
-      ".obsidian/plugins/calendar/manifest.json",
-      pluginManifest,
-    );
-    const localMain = await localEntry(remoteMain.path, pluginMain);
-    const localManifest = await localEntry(remoteManifest.path, pluginManifest);
-    const memory = makeMemoryAdapter({
-      [COMMUNITY_PATH]: localContent,
-      [remoteMain.path]: pluginMain,
-      [remoteManifest.path]: PLUGIN_MANIFEST_TEXT,
-    });
-    const progressStore = new SyncProgressStore();
-    progressStore.markStarted();
-    let progressAtUpload: {
-      phase: string;
-      current: number;
-      total: number;
-      currentFile: string;
-      currentActionType?: string;
-    } | null = null;
-    const uploadFile = vi.fn(async (
-      _vaultName: string,
-      _path: string,
-      _content: ArrayBuffer,
-      onProgress?: (downloaded: number, total: number) => void,
-    ) => {
-      progressAtUpload = {
-        phase: progressStore.state.phase,
-        current: progressStore.state.current,
-        total: progressStore.state.total,
-        currentFile: progressStore.state.currentFile,
-        currentActionType: progressStore.state.currentActionType,
-      };
-      onProgress?.(0, localContent.byteLength);
-      onProgress?.(localContent.byteLength, localContent.byteLength);
-      return {
-        id: "community-file-id",
-        eTag: "etag:new",
-        size: localContent.byteLength,
-        parentReference: { id: SCOPE.filesRootId },
-      };
-    });
-    const oneDrive = makeOneDrive(remoteContent, { uploadFile });
-    const state = makeState(
-      [remote, remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-      {
-        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-          version: 1,
-          scope: SCOPE,
-          anchors: { calendar: false },
-          pending: [],
-        }),
-      },
-    );
-    const { executor } = makeExecutor({
-      localEntries: [local, localMain, localManifest],
-      remoteEntries: [remote, remoteMain, remoteManifest],
-      remoteContent,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-      progressStore,
-    });
-
-    const result = await executor.run("manual", {
-      onFileProgress: (downloaded, total) =>
-        progressStore.setByteProgress(downloaded, total),
-    });
-
-    expect(result.success).toBe(true);
-    expect(uploadFile).toHaveBeenCalledWith(
-      "testVault",
-      COMMUNITY_PATH,
-      expect.any(ArrayBuffer),
-      expect.any(Function),
-      "etag:observed",
-      "community-file-id",
-    );
-    expect(progressAtUpload).toEqual({
-      phase: "executing",
-      current: 1,
-      total: 1,
-      currentFile: COMMUNITY_PATH,
-      currentActionType: "upload",
-    });
-    expect(state.applyRemoteMutations).toHaveBeenCalledWith([
-      expect.objectContaining({
-        path: COMMUNITY_PATH,
-        driveId: "community-file-id",
-        eTag: "etag:new",
-      }),
-    ], []);
-    expect(state.setCommunityPluginEnablementState).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        version: 1,
-        scope: SCOPE,
-        anchors: { calendar: true },
-        pending: [],
-      }),
-    );
-  });
-
-  it("seeds a missing remote enablement file from the existing local observation", async () => {
-    const localContent = bytes("[\"calendar\"]");
-    const pluginMain = bytes("plugin");
-    const pluginManifest = bytes(PLUGIN_MANIFEST_TEXT);
-    const local = await localEntry(COMMUNITY_PATH, localContent);
-    const remoteMain = await remoteEntry(
-      ".obsidian/plugins/calendar/main.js",
-      pluginMain,
-    );
-    const remoteManifest = await remoteEntry(
-      ".obsidian/plugins/calendar/manifest.json",
-      pluginManifest,
-    );
-    const localMain = await localEntry(remoteMain.path, pluginMain);
-    const localManifest = await localEntry(remoteManifest.path, pluginManifest);
-    const memory = makeMemoryAdapter({
-      [COMMUNITY_PATH]: localContent,
-      [remoteMain.path]: pluginMain,
-      [remoteManifest.path]: PLUGIN_MANIFEST_TEXT,
-    });
-    const state = makeState(
-      [remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-      {
-        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-          version: 1,
-          scope: SCOPE,
-          anchors: { calendar: true },
-          pending: [],
-        }),
-      },
-    );
-    const uploadFile = vi.fn().mockResolvedValue({
-      id: "community-file-id",
-      eTag: "etag:new",
-      size: localContent.byteLength,
-      parentReference: { id: "obsidian-folder-id" },
-    });
-    const oneDrive = makeOneDrive(null, { uploadFile });
-    const { executor } = makeExecutor({
-      localEntries: [local, localMain, localManifest],
-      remoteEntries: [remoteMain, remoteManifest],
-      remoteContent: null,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-    });
-
-    const result = await executor.run("manual");
-
-    expect(result.success).toBe(true);
-    expect(uploadFile).toHaveBeenCalledWith(
-      "testVault",
-      COMMUNITY_PATH,
-      expect.any(ArrayBuffer),
-      undefined,
-      undefined,
-      undefined,
-    );
-    expect(memory.adapter.writeBinary).not.toHaveBeenCalled();
-    expect(state.setCommunityPluginEnablementState).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        version: 1,
-        scope: SCOPE,
-        anchors: { calendar: true },
-        pending: [],
-      }),
-    );
-  });
-
-  it("seeds a missing local enablement file from the existing remote observation", async () => {
-    const remoteContent = bytes("[\"calendar\"]");
-    const pluginMain = bytes("plugin");
-    const pluginManifestText = PLUGIN_MANIFEST_TEXT;
-    const remote = await remoteEntry(COMMUNITY_PATH, remoteContent);
-    const remoteMain = await remoteEntry(
-      ".obsidian/plugins/calendar/main.js",
-      pluginMain,
-    );
-    const remoteManifest = await remoteEntry(
-      ".obsidian/plugins/calendar/manifest.json",
-      bytes(pluginManifestText),
-    );
-    const localMain = await localEntry(remoteMain.path, pluginMain);
-    const localManifest = await localEntry(
-      remoteManifest.path,
-      bytes(pluginManifestText),
-    );
-    const memory = makeMemoryAdapter({
-      ".obsidian/plugins/calendar/main.js": pluginMain,
-      ".obsidian/plugins/calendar/manifest.json": pluginManifestText,
-    });
-    const state = makeState(
-      [remote, remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-      {
-        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-          version: 1,
-          scope: SCOPE,
-          anchors: { calendar: true },
-          pending: [],
-        }),
-      },
-    );
-    const progressStore = new SyncProgressStore();
-    progressStore.markStarted();
-    let progressAtCompletion: {
-      phase: string;
-      current: number;
-      total: number;
-      currentFile: string;
-      currentActionType?: string;
-    } | null = null;
-    const { executor, oneDrive } = makeExecutor({
-      localEntries: [localMain, localManifest],
-      remoteEntries: [remote, remoteMain, remoteManifest],
-      remoteContent,
-      adapter: memory.adapter,
-      state,
-      progressStore,
-    });
-
-    const result = await executor.run("manual", {
-      onFileComplete: () => {
-        progressAtCompletion = {
-          phase: progressStore.state.phase,
-          current: progressStore.state.current,
-          total: progressStore.state.total,
-          currentFile: progressStore.state.currentFile,
-          currentActionType: progressStore.state.currentActionType,
-        };
-      },
-    });
-
-    expect(result.success).toBe(true);
-    expect(new TextDecoder().decode(memory.binary.get(COMMUNITY_PATH))).toBe(
-      "[\n  \"calendar\"\n]\n",
-    );
-    expect(oneDrive.uploadFile).not.toHaveBeenCalled();
-    expect(progressAtCompletion).toEqual({
-      phase: "executing",
-      current: 1,
-      total: 1,
-      currentFile: COMMUNITY_PATH,
-      currentActionType: "download",
-    });
-    expect(state.setCommunityPluginEnablementState).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        version: 1,
-        scope: SCOPE,
-        anchors: { calendar: true },
-        pending: [],
-      }),
-    );
-  });
-
-  it("does not publish a remote enablement write after cancellation invalidates the run", async () => {
-    const localContent = bytes("[\"calendar\"]");
-    const remoteContent = bytes("[]");
-    const pluginMain = bytes("plugin");
-    const pluginManifest = bytes(PLUGIN_MANIFEST_TEXT);
-    const local = await localEntry(COMMUNITY_PATH, localContent);
-    const remote = await remoteEntry(COMMUNITY_PATH, remoteContent);
-    const remoteMain = await remoteEntry(
-      ".obsidian/plugins/calendar/main.js",
-      pluginMain,
-    );
-    const remoteManifest = await remoteEntry(
-      ".obsidian/plugins/calendar/manifest.json",
-      pluginManifest,
-    );
-    const localMain = await localEntry(remoteMain.path, pluginMain);
-    const localManifest = await localEntry(remoteManifest.path, pluginManifest);
-    const memory = makeMemoryAdapter({
-      [COMMUNITY_PATH]: localContent,
-      [remoteMain.path]: pluginMain,
-      [remoteManifest.path]: PLUGIN_MANIFEST_TEXT,
-    });
-    const uploadStarted = deferred<void>();
-    const uploadResult = deferred<{
-      id: string;
-      eTag: string;
-      size: number;
-      parentReference: { id: string };
-    }>();
-    const uploadFile = vi.fn(() => {
-      uploadStarted.resolve();
-      return uploadResult.promise;
-    });
-    const oneDrive = makeOneDrive(remoteContent, { uploadFile });
-    const state = makeState(
-      [remote, remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-      {
-        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-          version: 1,
-          scope: SCOPE,
-          anchors: { calendar: false },
-          pending: [],
-        }),
-      },
-    );
-    const { executor } = makeExecutor({
-      localEntries: [local, localMain, localManifest],
-      remoteEntries: [remote, remoteMain, remoteManifest],
-      remoteContent,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-    });
-
-    const run = executor.run("manual");
-    await uploadStarted.promise;
-    executor.cancel();
-    uploadResult.resolve({
-      id: "community-file-id",
-      eTag: "etag:new",
-      size: localContent.byteLength,
-      parentReference: { id: "obsidian-folder-id" },
-    });
-    const result = await run;
-
-    expect(result.message).toBe("result.cancelled");
-    expect(state.applyRemoteMutations).not.toHaveBeenCalled();
-    expect(state.setCommunityPluginEnablementState).not.toHaveBeenCalled();
-  });
-
-  it("leaves local recovery authoritative and does not advance anchors after cancellation", async () => {
-    const remoteContent = bytes("[\"calendar\"]");
-    const pluginMain = bytes("plugin");
-    const pluginManifestText = PLUGIN_MANIFEST_TEXT;
-    const remote = await remoteEntry(COMMUNITY_PATH, remoteContent);
-    const remoteMain = await remoteEntry(
-      ".obsidian/plugins/calendar/main.js",
-      pluginMain,
-    );
-    const remoteManifest = await remoteEntry(
-      ".obsidian/plugins/calendar/manifest.json",
-      bytes(pluginManifestText),
-    );
-    const localMain = await localEntry(remoteMain.path, pluginMain);
-    const localManifest = await localEntry(
-      remoteManifest.path,
-      bytes(pluginManifestText),
-    );
-    const memory = makeMemoryAdapter({
-      ".obsidian/plugins/calendar/main.js": pluginMain,
-      ".obsidian/plugins/calendar/manifest.json": pluginManifestText,
-    });
-    const writeStarted = deferred<void>();
-    const releaseWrite = deferred<void>();
-    memory.adapter.writeBinary.mockImplementation(
-      async (path: string, value: ArrayBuffer) => {
-        if (path === COMMUNITY_PATH) {
-          writeStarted.resolve();
-          await releaseWrite.promise;
-        }
-        memory.binary.set(path, value.slice(0));
-      },
-    );
-    const state = makeState(
-      [remote, remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-      {
-        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-          version: 1,
-          scope: SCOPE,
-          anchors: { calendar: true },
-          pending: [],
-        }),
-      },
-    );
-    const { executor } = makeExecutor({
-      localEntries: [localMain, localManifest],
-      remoteEntries: [remote, remoteMain, remoteManifest],
-      remoteContent,
-      adapter: memory.adapter,
-      state,
-    });
-
-    const run = executor.run("manual");
-    await writeStarted.promise;
-    executor.cancel();
-    releaseWrite.resolve();
-    const result = await run;
-
-    expect(result.message).toBe("result.cancelled");
-    expect(state.setCommunityPluginEnablementState).not.toHaveBeenCalled();
-    expect(
-      [...memory.text.keys()].some((path) => path.endsWith("/recovery/intent.json")),
-    ).toBe(true);
-  });
-
-  it("does not advance anchors when the remote ETag changes in flight", async () => {
-    const localContent = bytes("[\"calendar\"]");
-    const remoteContent = bytes("[]");
-    const pluginMain = bytes("plugin");
-    const pluginManifest = bytes(PLUGIN_MANIFEST_TEXT);
-    const local = await localEntry(COMMUNITY_PATH, localContent);
-    const remote = await remoteEntry(COMMUNITY_PATH, remoteContent);
-    const remoteMain = await remoteEntry(
-      ".obsidian/plugins/calendar/main.js",
-      pluginMain,
-    );
-    const remoteManifest = await remoteEntry(
-      ".obsidian/plugins/calendar/manifest.json",
-      pluginManifest,
-    );
-    const localMain = await localEntry(remoteMain.path, pluginMain);
-    const localManifest = await localEntry(remoteManifest.path, pluginManifest);
-    const memory = makeMemoryAdapter({
-      [COMMUNITY_PATH]: localContent,
-      [remoteMain.path]: pluginMain,
-      [remoteManifest.path]: PLUGIN_MANIFEST_TEXT,
-    });
-    const uploadFile = vi.fn().mockRejectedValue(new OneDriveError(
-      OneDriveErrorType.PreconditionFailed,
-      "changed",
-      412,
-    ));
-    const oneDrive = makeOneDrive(remoteContent, { uploadFile });
-    const state = makeState(
-      [remote, remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-      {
-        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-          version: 1,
-          scope: SCOPE,
-          anchors: { calendar: false },
-          pending: [],
-        }),
-      },
-    );
-    const { executor } = makeExecutor({
-      localEntries: [local, localMain, localManifest],
-      remoteEntries: [remote, remoteMain, remoteManifest],
-      remoteContent,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-    });
-
-    const result = await executor.run("manual");
-
-    expect(result.deferred).toBe(1);
-    expect(state.applyRemoteMutations).not.toHaveBeenCalled();
-    expect(state.setCommunityPluginEnablementState).not.toHaveBeenCalled();
-  });
-
-  it("fails closed before planning when either enablement file is invalid", async () => {
-    const localContent = bytes("{broken");
-    const remoteContent = bytes("[]");
-    const local = await localEntry(COMMUNITY_PATH, localContent);
-    const remote = await remoteEntry(COMMUNITY_PATH, remoteContent);
-    const memory = makeMemoryAdapter({ [COMMUNITY_PATH]: localContent });
-    const { executor, oneDrive } = makeExecutor({
-      localEntries: [local],
-      remoteEntries: [remote],
-      remoteContent,
-      adapter: memory.adapter,
-    });
-
-    const result = await executor.run("manual");
-
-    expect(result.errors).toBe(1);
-    expect(result.message).toBe("result.communityPluginEnablementInvalid");
-    expect(oneDrive.uploadFile).not.toHaveBeenCalled();
-    expect(memory.adapter.writeBinary).not.toHaveBeenCalled();
-  });
-
-  it("checks the downloaded plugin bundle before enabling it locally", async () => {
-    const localContent = bytes("[]");
-    const remoteContent = bytes("[\"calendar\"]");
-    const pluginMain = bytes("plugin");
-    const manifestText = JSON.stringify({
-      id: "calendar",
-      version: "2.0.0",
-      minAppVersion: "1.5.0",
-    });
-    const pluginManifest = bytes(manifestText);
-    const local = await localEntry(COMMUNITY_PATH, localContent);
-    const remote = await remoteEntry(COMMUNITY_PATH, remoteContent);
-    const remoteMain = await remoteEntry(
-      ".obsidian/plugins/calendar/main.js",
-      pluginMain,
-    );
-    const remoteManifest = await remoteEntry(
-      ".obsidian/plugins/calendar/manifest.json",
-      pluginManifest,
-    );
-    const localMain = await localEntry(remoteMain.path, pluginMain);
-    const localManifest = await localEntry(remoteManifest.path, pluginManifest);
-    const memory = makeMemoryAdapter({
-      [COMMUNITY_PATH]: localContent,
-      ".obsidian/plugins/calendar/main.js": pluginMain,
-      ".obsidian/plugins/calendar/manifest.json": manifestText,
-    });
-    const state = makeState(
-      [remote, remoteMain, remoteManifest],
-      [
-        sharedBaseEntry(localMain, remoteMain),
-        sharedBaseEntry(localManifest, remoteManifest),
-      ],
-      {
-        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-          version: 1,
-          scope: SCOPE,
-          anchors: { calendar: false },
-          pending: [],
-        }),
-      },
-    );
-    const { executor, oneDrive } = makeExecutor({
-      localEntries: [local, localMain, localManifest],
-      remoteEntries: [remote, remoteMain, remoteManifest],
-      remoteContent,
-      adapter: memory.adapter,
-      state,
-    });
-
-    const result = await executor.run("manual");
-
-    expect(result.success).toBe(true);
-    expect(result.downloaded).toBe(1);
-    expect(new TextDecoder().decode(memory.binary.get(COMMUNITY_PATH))).toBe(
-      "[\n  \"calendar\"\n]\n",
-    );
-    expect(oneDrive.uploadFile).not.toHaveBeenCalled();
-    expect(state.setCommunityPluginEnablementState).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        version: 1,
-        scope: SCOPE,
-        anchors: { calendar: true },
-        pending: [],
-      }),
-    );
   });
 });

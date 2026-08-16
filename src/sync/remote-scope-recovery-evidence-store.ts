@@ -35,6 +35,31 @@ export type RemoteScopeRecoveryEvidenceOperationIdentityV1 = Omit<
   "schemaVersion" | "operationId" | "startedAt" | "updatedAt"
 >;
 
+export type FirstSyncVerificationSourceCohortV2 =
+  | { kind: "fresh" }
+  | { kind: "public-1.1.3"; sourceStateDigest: string };
+
+export interface FirstSyncVerificationEvidenceOperationV2 {
+  schemaVersion: 2;
+  operationKind: "first-sync-verification";
+  operationId: string;
+  vaultInstanceId: string;
+  scope: SyncScope;
+  protocolBindingDigest: string;
+  sourceCohort: FirstSyncVerificationSourceCohortV2;
+  startedAt: number;
+  updatedAt: number;
+}
+
+export type FirstSyncVerificationEvidenceOperationIdentityV2 = Omit<
+  FirstSyncVerificationEvidenceOperationV2,
+  "schemaVersion" | "operationId" | "startedAt" | "updatedAt"
+>;
+
+type RemoteContentVerificationEvidenceOperation =
+  | RemoteScopeRecoveryEvidenceOperationV1
+  | FirstSyncVerificationEvidenceOperationV2;
+
 export interface RemoteScopeRecoveryEvidenceReceiptV1 {
   schemaVersion: 1;
   operationId: string;
@@ -62,7 +87,7 @@ export interface RemoteScopeRecoveryEvidenceSummaryV1 {
 interface RemoteScopeRecoveryEvidenceDb extends DBSchema {
   operations: {
     key: string;
-    value: RemoteScopeRecoveryEvidenceOperationV1;
+    value: RemoteContentVerificationEvidenceOperation;
   };
   receipts: {
     key: [string, string];
@@ -73,10 +98,15 @@ interface RemoteScopeRecoveryEvidenceDb extends DBSchema {
 
 export interface RemoteScopeRecoveryEvidenceStore {
   close(): Promise<void>;
+  delete(): Promise<void>;
   begin(
     identity: RemoteScopeRecoveryEvidenceOperationIdentityV1,
     now?: number,
   ): Promise<RemoteScopeRecoveryEvidenceOperationV1>;
+  beginFirstSyncVerification(
+    identity: FirstSyncVerificationEvidenceOperationIdentityV2,
+    now?: number,
+  ): Promise<FirstSyncVerificationEvidenceOperationV2>;
   readValidReceipts(
     operationId: string,
     versions: readonly RemoteScopeRecoveryRemoteVersionV1[],
@@ -92,6 +122,7 @@ export interface RemoteScopeRecoveryEvidenceStore {
   ): Promise<void>;
   summarize(operationId: string): Promise<RemoteScopeRecoveryEvidenceSummaryV1>;
   retire(operationId: string): Promise<void>;
+  retireFirstSyncVerificationOperations(): Promise<number>;
 }
 
 export type RemoteScopeRecoveryEvidenceStoreFactory = (
@@ -170,6 +201,55 @@ implements RemoteScopeRecoveryEvidenceStore {
     return structuredClone(operation);
   }
 
+  async beginFirstSyncVerification(
+    identity: FirstSyncVerificationEvidenceOperationIdentityV2,
+    now = Date.now(),
+  ): Promise<FirstSyncVerificationEvidenceOperationV2> {
+    validateFirstSyncVerificationIdentity(identity);
+    if (!Number.isFinite(now) || now < 0) {
+      throw new Error("First-sync verification operation time is invalid");
+    }
+    const operationId = await firstSyncVerificationEvidenceOperationId(
+      identity,
+    );
+    const db = await this.open();
+    const tx = db.transaction(["operations", "receipts"], "readwrite", {
+      durability: "strict",
+    });
+    const current = await tx.objectStore("operations").get(operationId);
+    const canReuse = current
+      && isFirstSyncVerificationEvidenceOperationV2(current)
+      && sameFirstSyncVerificationIdentity(current, identity);
+    if (current && !canReuse) {
+      await this.deleteOperationInTransaction(tx, operationId);
+    }
+    const operation: FirstSyncVerificationEvidenceOperationV2 = canReuse
+      ? { ...current, updatedAt: Math.max(now, current.updatedAt) }
+      : {
+          schemaVersion: 2,
+          operationKind: "first-sync-verification",
+          operationId,
+          vaultInstanceId: identity.vaultInstanceId,
+          scope: structuredClone(identity.scope),
+          protocolBindingDigest: identity.protocolBindingDigest,
+          sourceCohort: structuredClone(identity.sourceCohort),
+          startedAt: now,
+          updatedAt: now,
+        };
+    await tx.objectStore("operations").put(operation);
+    await this.pruneInTransaction(tx, operationId, now);
+    await tx.done;
+
+    const verified = await db.get("operations", operationId);
+    if (
+      !isFirstSyncVerificationEvidenceOperationV2(verified)
+      || JSON.stringify(verified) !== JSON.stringify(operation)
+    ) {
+      throw new Error("First-sync verification evidence preflight read-back failed");
+    }
+    return structuredClone(operation);
+  }
+
   async readValidReceipts(
     operationId: string,
     versions: readonly RemoteScopeRecoveryRemoteVersionV1[],
@@ -194,7 +274,7 @@ implements RemoteScopeRecoveryEvidenceStore {
 
     const db = await this.open();
     const operation = await db.get("operations", operationId);
-    if (!isRemoteScopeRecoveryEvidenceOperationV1(operation)) {
+    if (!isRemoteContentVerificationEvidenceOperation(operation)) {
       return { receiptsByRemoteId: new Map(), invalidated: 0 };
     }
     const tx = db.transaction("receipts", "readwrite", {
@@ -239,7 +319,7 @@ implements RemoteScopeRecoveryEvidenceStore {
       durability: "strict",
     });
     const operation = await tx.objectStore("operations").get(receipt.operationId);
-    if (!isRemoteScopeRecoveryEvidenceOperationV1(operation)) {
+    if (!isRemoteContentVerificationEvidenceOperation(operation)) {
       throw new Error("Remote scope recovery operation is unavailable");
     }
     await tx.objectStore("receipts").put(structuredClone(receipt));
@@ -268,7 +348,7 @@ implements RemoteScopeRecoveryEvidenceStore {
     }
     const db = await this.open();
     const operation = await db.get("operations", operationId);
-    if (!isRemoteScopeRecoveryEvidenceOperationV1(operation)) {
+    if (!isRemoteContentVerificationEvidenceOperation(operation)) {
       return { operationId, receipts: 0, updatedAt: 0 };
     }
     const receipts = await db.countFromIndex(
@@ -287,6 +367,30 @@ implements RemoteScopeRecoveryEvidenceStore {
     });
     await this.deleteOperationInTransaction(tx, operationId);
     await tx.done;
+  }
+
+  async retireFirstSyncVerificationOperations(): Promise<number> {
+    const db = await this.open();
+    const tx = db.transaction(["operations", "receipts"], "readwrite", {
+      durability: "strict",
+    });
+    let retired = 0;
+    let cursor = await tx.objectStore("operations").openCursor();
+    while (cursor) {
+      if (
+        isRecord(cursor.value)
+        && cursor.value.operationKind === "first-sync-verification"
+      ) {
+        await this.deleteOperationInTransaction(
+          tx,
+          String(cursor.primaryKey),
+        );
+        retired++;
+      }
+      cursor = await cursor.continue();
+    }
+    await tx.done;
+    return retired;
   }
 
   private open(): Promise<IDBPDatabase<RemoteScopeRecoveryEvidenceDb>> {
@@ -363,7 +467,7 @@ implements RemoteScopeRecoveryEvidenceStore {
     now: number,
   ): Promise<void> {
     const operations = (await tx.objectStore("operations").getAll())
-      .filter(isRemoteScopeRecoveryEvidenceOperationV1)
+      .filter(isRemoteContentVerificationEvidenceOperation)
       .sort((left, right) => right.updatedAt - left.updatedAt);
     const retainedOtherIds = new Set(
       operations
@@ -408,6 +512,15 @@ export async function remoteScopeRecoveryEvidenceOperationId(
 ): Promise<string> {
   validateOperationIdentity(identity);
   return sha256Text(JSON.stringify({ schemaVersion: 1, ...identity }));
+}
+
+export async function firstSyncVerificationEvidenceOperationId(
+  identity: FirstSyncVerificationEvidenceOperationIdentityV2,
+): Promise<string> {
+  validateFirstSyncVerificationIdentity(identity);
+  return sha256Text(JSON.stringify(firstSyncVerificationIdentityPayload(
+    identity,
+  )));
 }
 
 export async function remoteScopeRecoveryProtocolBindingDigest(
@@ -464,6 +577,68 @@ function isRemoteScopeRecoveryEvidenceOperationV1(
     && Number(value.startedAt) >= 0
     && Number.isFinite(value.updatedAt)
     && Number(value.updatedAt) >= Number(value.startedAt);
+}
+
+function validateFirstSyncVerificationIdentity(
+  value: FirstSyncVerificationEvidenceOperationIdentityV2,
+): void {
+  if (
+    value.operationKind !== "first-sync-verification"
+    || !isIndexedDbVaultInstanceId(value.vaultInstanceId)
+    || !isSyncScope(value.scope)
+    || !isSha256(value.protocolBindingDigest)
+    || !isFirstSyncVerificationSourceCohortV2(value.sourceCohort)
+  ) {
+    throw new Error("First-sync verification operation identity is invalid");
+  }
+}
+
+function isFirstSyncVerificationSourceCohortV2(
+  value: unknown,
+): value is FirstSyncVerificationSourceCohortV2 {
+  if (!isRecord(value)) return false;
+  if (value.kind === "fresh") {
+    return hasExactKeys(value, ["kind"]);
+  }
+  return value.kind === "public-1.1.3"
+    && hasExactKeys(value, ["kind", "sourceStateDigest"])
+    && isSha256(value.sourceStateDigest);
+}
+
+function isFirstSyncVerificationEvidenceOperationV2(
+  value: unknown,
+): value is FirstSyncVerificationEvidenceOperationV2 {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "schemaVersion",
+    "operationKind",
+    "operationId",
+    "vaultInstanceId",
+    "scope",
+    "protocolBindingDigest",
+    "sourceCohort",
+    "startedAt",
+    "updatedAt",
+  ])) return false;
+  try {
+    validateFirstSyncVerificationIdentity(
+      value as unknown as FirstSyncVerificationEvidenceOperationIdentityV2,
+    );
+  } catch {
+    return false;
+  }
+  return value.schemaVersion === 2
+    && isSha256(value.operationId)
+    && Number.isFinite(value.startedAt)
+    && Number(value.startedAt) >= 0
+    && Number.isFinite(value.updatedAt)
+    && Number(value.updatedAt) >= Number(value.startedAt);
+}
+
+function isRemoteContentVerificationEvidenceOperation(
+  value: unknown,
+): value is RemoteContentVerificationEvidenceOperation {
+  return isRemoteScopeRecoveryEvidenceOperationV1(value)
+    || isFirstSyncVerificationEvidenceOperationV2(value);
 }
 
 function isRemoteScopeRecoveryEvidenceReceiptV1(
@@ -540,6 +715,37 @@ function sameOperationIdentity(
     ...currentIdentity
   } = operation;
   return JSON.stringify(currentIdentity) === JSON.stringify(identity);
+}
+
+function sameFirstSyncVerificationIdentity(
+  operation: FirstSyncVerificationEvidenceOperationV2,
+  identity: FirstSyncVerificationEvidenceOperationIdentityV2,
+): boolean {
+  return JSON.stringify(firstSyncVerificationIdentityPayload(operation))
+    === JSON.stringify(firstSyncVerificationIdentityPayload(identity));
+}
+
+function firstSyncVerificationIdentityPayload(
+  identity: FirstSyncVerificationEvidenceOperationIdentityV2,
+): Record<string, unknown> {
+  return {
+    schemaVersion: 2,
+    operationKind: "first-sync-verification",
+    vaultInstanceId: identity.vaultInstanceId,
+    scope: {
+      accountId: identity.scope.accountId,
+      driveId: identity.scope.driveId,
+      vaultFolderId: identity.scope.vaultFolderId,
+      filesRootId: identity.scope.filesRootId,
+    },
+    protocolBindingDigest: identity.protocolBindingDigest,
+    sourceCohort: identity.sourceCohort.kind === "fresh"
+      ? { kind: "fresh" }
+      : {
+          kind: "public-1.1.3",
+          sourceStateDigest: identity.sourceCohort.sourceStateDigest,
+        },
+  };
 }
 
 function hasExactKeys(value: Record<string, unknown>, keys: string[]): boolean {

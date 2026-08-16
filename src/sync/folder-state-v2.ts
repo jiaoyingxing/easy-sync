@@ -205,6 +205,11 @@ export function planFolderStateFromViewV2(
   });
   const anchoredRemoteIds = new Set(anchors.map((anchor) => anchor.remoteId));
   const anchoredLastPaths = new Set(anchors.map((anchor) => identityPath(anchor.lastPath)));
+  const occupiedAnchoredLocalIdentities = new Set(
+    anchors
+      .map((anchor) => identityPath(anchor.lastPath))
+      .filter((path) => localFoldersByIdentity.has(path)),
+  );
   const consumedLocalPaths = new Set<string>();
   const candidates: PlannedCandidate[] = [];
   let unresolvedLocalIdentity = false;
@@ -261,6 +266,7 @@ export function planFolderStateFromViewV2(
         input.state.fileAnchors,
         input.localFiles,
         localFoldersExact,
+        occupiedAnchoredLocalIdentities,
         includeFilePath,
       );
     if (inferred) inferredLocalByRemoteId.set(anchor.remoteId, inferred);
@@ -434,7 +440,7 @@ export function planFolderStateFromViewV2(
       continue;
     }
 
-    const localUnchanged = localSubtreeMatchesAnchors(
+    const localSubtreeComparison = compareLocalSubtreeToAnchors(
       anchor.lastPath,
       inferredLocalPath,
       input.state,
@@ -443,20 +449,29 @@ export function planFolderStateFromViewV2(
       includeFilePath,
       includeFolderPath,
     );
-    const hasSupportedLocalMoveHint = validLocalMoveHints.some(
-      (hint) => (
-        hint.remoteId === anchor.remoteId
+    const localUnchanged = localSubtreeComparison.contentMatches;
+    const hasExactLocalMoveHint = validLocalMoveHints.some(
+      (hint) => hint.remoteId === anchor.remoteId
         && nfcPath(hint.fromPath) === nfcPath(anchor.lastPath)
-        && nfcPath(hint.toPath) === nfcPath(inferredLocalPath)
-      ) || (
+        && nfcPath(hint.toPath) === nfcPath(inferredLocalPath),
+    );
+    const hasSupportedLocalMoveHint = hasExactLocalMoveHint
+      || validLocalMoveHints.some((hint) => (
         isDescendant(anchor.lastPath, hint.fromPath)
         && nfcPath(translatePath(
           anchor.lastPath,
           hint.fromPath,
           hint.toPath,
         )) === nfcPath(inferredLocalPath)
-      ),
-    );
+      ));
+    // Exact TFolder evidence settles the root identity independently from its
+    // current members. The canonical folder root protects every descendant
+    // until the folder checkpoint, then the ordinary planner reads the new
+    // active topology and reconciles added, removed, or changed members.
+    const localTopologyMoveSafe = !localUnchanged
+      && localMoved
+      && !remoteMoved
+      && hasExactLocalMoveHint;
     const localCompositionSafe = !localUnchanged
       && localMoved
       && !remoteMoved
@@ -478,7 +493,14 @@ export function planFolderStateFromViewV2(
       includeFilePath,
       includeFolderPath,
     );
-    if (!localUnchanged && !localCompositionSafe) {
+    // The remote folder ID is the exact identity evidence for its root move.
+    // Descendant changes do not invalidate that root identity: the protected
+    // folder checkpoint moves the local tree first, then the ordinary planner
+    // re-reads and reconciles the descendants under the committed target.
+    const remoteTopologyMoveSafe = !remoteUnchanged
+      && remoteMoved
+      && !localMoved;
+    if (!localUnchanged && !localTopologyMoveSafe && !localCompositionSafe) {
       candidates.push(conflictCandidate(
         anchor.lastPath,
         "local-subtree-changed",
@@ -489,7 +511,7 @@ export function planFolderStateFromViewV2(
       ));
       continue;
     }
-    if (!remoteUnchanged) {
+    if (!remoteUnchanged && !remoteTopologyMoveSafe) {
       candidates.push(conflictCandidate(
         anchor.lastPath,
         "remote-subtree-changed",
@@ -674,6 +696,7 @@ function inferMovedLocalFolder(
   fileAnchors: readonly Readonly<SyncAnchorV2>[],
   localFiles: readonly LocalFileEntry[],
   localFoldersExact: ReadonlySet<string>,
+  occupiedAnchoredLocalIdentities: ReadonlySet<string>,
   includeFilePath: (path: string) => boolean,
 ): string | undefined {
   const descendants = fileAnchors
@@ -691,7 +714,9 @@ function inferMovedLocalFolder(
         .flatMap((file) => nfcPath(file.path).endsWith(nfcPath(suffix))
           ? [file.path.slice(0, file.path.length - suffix.length)]
           : [])
-        .filter((root) => root.length > 0 && localFoldersExact.has(nfcPath(root))),
+        .filter((root) => root.length > 0
+          && localFoldersExact.has(nfcPath(root))
+          && !occupiedAnchoredLocalIdentities.has(identityPath(root))),
     );
     if (candidates === null) {
       candidates = roots;
@@ -706,7 +731,7 @@ function inferMovedLocalFolder(
   return candidates && candidates.size === 1 ? [...candidates][0] : undefined;
 }
 
-function localSubtreeMatchesAnchors(
+function compareLocalSubtreeToAnchors(
   oldRoot: string,
   currentRoot: string,
   state: CanonicalPlannerStateV2,
@@ -714,7 +739,7 @@ function localSubtreeMatchesAnchors(
   localFolders: readonly LocalFolderEntry[],
   includeFilePath: (path: string) => boolean,
   includeFolderPath: (path: string) => boolean,
-): boolean {
+): { topologyMatches: boolean; contentMatches: boolean } {
   const expectedFiles = new Map<string, SyncAnchorV2>();
   for (const anchor of state.fileAnchors) {
     if (isDescendant(anchor.lastPath, oldRoot) && includeFilePath(anchor.lastPath)) {
@@ -724,10 +749,16 @@ function localSubtreeMatchesAnchors(
   const actualFiles = localFiles.filter(
     (entry) => isDescendant(entry.path, currentRoot) && includeFilePath(entry.path),
   );
-  if (actualFiles.length !== expectedFiles.size) return false;
+  if (actualFiles.length !== expectedFiles.size) {
+    return { topologyMatches: false, contentMatches: false };
+  }
+  let contentMatches = true;
   for (const file of actualFiles) {
     const anchor = expectedFiles.get(identityPath(relativePath(file.path, currentRoot)));
-    if (!anchor || anchor.contentHash !== file.hash || anchor.size !== file.size) return false;
+    if (!anchor) return { topologyMatches: false, contentMatches: false };
+    if (anchor.contentHash !== file.hash || anchor.size !== file.size) {
+      contentMatches = false;
+    }
   }
 
   const expectedFolders = new Set(
@@ -742,7 +773,10 @@ function localSubtreeMatchesAnchors(
         && includeFolderPath(folder.path))
       .map((folder) => identityPath(relativePath(folder.path, currentRoot))),
   );
-  return sameStringSet(expectedFolders, actualFolders);
+  if (!sameStringSet(expectedFolders, actualFolders)) {
+    return { topologyMatches: false, contentMatches: false };
+  }
+  return { topologyMatches: true, contentMatches };
 }
 
 /**

@@ -83,35 +83,38 @@ export function parseCommunityPluginBundlePath(
 
 export function parseCommunityPluginBundleManifest(
   text: string,
-  expectedPluginId: string,
+  directoryId: string,
 ): CommunityPluginBundleManifest {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new Error(`Selected plugin manifest is unreadable: ${expectedPluginId}`);
+    throw new Error(`Selected plugin manifest is unreadable: ${directoryId}`);
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`Selected plugin manifest is unreadable: ${expectedPluginId}`);
+    throw new Error(`Selected plugin manifest is unreadable: ${directoryId}`);
   }
   const manifest = parsed as Record<string, unknown>;
-  if (manifest.id !== expectedPluginId) {
-    throw new Error(`Selected plugin manifest identity differs: ${expectedPluginId}`);
+  if (
+    typeof manifest.id !== "string"
+    || !SAFE_PLUGIN_ID.test(manifest.id)
+  ) {
+    throw new Error(`Selected plugin manifest identity is invalid: ${directoryId}`);
   }
   if (
     typeof manifest.version !== "string"
     || manifest.version.trim().length === 0
   ) {
-    throw new Error(`Selected plugin manifest version is missing or invalid: ${expectedPluginId}`);
+    throw new Error(`Selected plugin manifest version is missing or invalid: ${directoryId}`);
   }
   if (
     manifest.minAppVersion !== undefined
     && typeof manifest.minAppVersion !== "string"
   ) {
-    throw new Error(`Selected plugin minimum app version is invalid: ${expectedPluginId}`);
+    throw new Error(`Selected plugin minimum app version is invalid: ${directoryId}`);
   }
   return {
-    id: expectedPluginId,
+    id: manifest.id,
     name: typeof manifest.name === "string"
       ? manifest.name.trim() || null
       : null,
@@ -121,6 +124,49 @@ export function parseCommunityPluginBundleManifest(
       : null,
     isDesktopOnly: manifest.isDesktopOnly === true,
   };
+}
+
+/**
+ * A physical plugin directory may be an official distribution alias for the
+ * logical manifest id. The alias is safe only while every observed copy under
+ * that directory describes the same logical plugin.
+ */
+export function assertCommunityPluginManifestIdentityStable(
+  directoryId: string,
+  manifests: readonly Readonly<CommunityPluginBundleManifest>[],
+): void {
+  const manifestIds = [...new Set(manifests.map((manifest) => manifest.id))];
+  if (manifestIds.length > 1) {
+    throw new Error(
+      `Selected plugin manifest identity changed within directory: ${directoryId}`,
+    );
+  }
+}
+
+/**
+ * Two selected physical directories must never control the same logical
+ * plugin id. Callers can block only the affected bundles without guessing
+ * which directory is authoritative.
+ */
+export function findCommunityPluginManifestIdentityCollisions(
+  identities: readonly Readonly<{
+    directoryId: string;
+    manifestId: string;
+  }>[],
+): Set<string> {
+  const directoriesByManifestId = new Map<string, Set<string>>();
+  for (const identity of identities) {
+    const directories = directoriesByManifestId.get(identity.manifestId)
+      ?? new Set<string>();
+    directories.add(identity.directoryId);
+    directoriesByManifestId.set(identity.manifestId, directories);
+  }
+  const collisions = new Set<string>();
+  for (const directories of directoriesByManifestId.values()) {
+    if (directories.size < 2) continue;
+    for (const directoryId of directories) collisions.add(directoryId);
+  }
+  return collisions;
 }
 
 function optionalHash(value: unknown): string | null | undefined {

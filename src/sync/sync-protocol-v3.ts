@@ -7,6 +7,7 @@ import {
   type SharedSyncProtocolBindingV2,
   type SharedSyncProtocolObjectV2,
 } from "./sync-protocol-v2";
+import { rethrowTerminalSharedSyncProtocolTransportError } from "./shared-sync-protocol-transport";
 
 export const SYNC_PROTOCOL_V3_VERSION = 3;
 
@@ -33,6 +34,11 @@ export interface SharedSyncProtocolTransportV3 {
   createOnly(content: string): Promise<{ id: string; eTag: string }>;
   readById(id: string): Promise<SharedSyncProtocolObjectV3>;
 }
+
+export type SharedSyncProtocolMutationTransportV3 = Pick<
+  SharedSyncProtocolTransportV3,
+  "createOnly" | "readById"
+>;
 
 /**
  * Device-local proof of the immutable, scope-free generation protocol.
@@ -66,7 +72,6 @@ export type EnsureSharedSyncProtocolResultV3 =
   | {
     status: "blocked";
     reason:
-      | "read-failed"
       | "invalid-current"
       | "unsupported-protocol"
       | "predecessor-required"
@@ -97,11 +102,15 @@ export function createOneDriveSharedSyncProtocolTransportV3(
  * or an already-bound V3 protocol. No path or scope is stored in V3.
  */
 export async function ensureSharedSyncProtocolV3(
-  transport: SharedSyncProtocolTransportV3,
+  transport: SharedSyncProtocolMutationTransportV3,
   input: {
     predecessor?: SharedSyncProtocolObjectV2;
     expectedBinding?: SharedSyncProtocolBinding;
     allowCreate: boolean;
+    observedCurrent: SharedSyncProtocolObjectV3 | null;
+    observeAfterCreateFailure: () => Promise<
+      SharedSyncProtocolObjectV3 | null
+    >;
   },
 ): Promise<EnsureSharedSyncProtocolResultV3> {
   if (
@@ -114,12 +123,7 @@ export async function ensureSharedSyncProtocolV3(
   const desired = await deriveDesiredProtocol(input);
   if (desired.status === "blocked") return desired;
 
-  let current: SharedSyncProtocolObjectV3 | null;
-  try {
-    current = await transport.read();
-  } catch {
-    return { status: "blocked", reason: "read-failed" };
-  }
+  const current = input.observedCurrent;
   if (current) {
     return inspectProtocolObject(
       current,
@@ -137,20 +141,17 @@ export async function ensureSharedSyncProtocolV3(
   let created: { id: string; eTag: string };
   try {
     created = await transport.createOnly(content);
-  } catch {
-    try {
-      const raced = await transport.read();
-      if (raced) {
-        return inspectProtocolObject(
-          raced,
-          desired.protocol,
-          desired.predecessorConfirmedAllDevicesUpdatedAt,
-          "create-race",
-          input.expectedBinding,
-        );
-      }
-    } catch {
-      // Preserve the conservative write-failed classification.
+  } catch (error) {
+    rethrowTerminalSharedSyncProtocolTransportError(error);
+    const raced = await input.observeAfterCreateFailure();
+    if (raced) {
+      return inspectProtocolObject(
+        raced,
+        desired.protocol,
+        desired.predecessorConfirmedAllDevicesUpdatedAt,
+        "create-race",
+        input.expectedBinding,
+      );
     }
     return { status: "blocked", reason: "write-failed" };
   }
@@ -158,7 +159,8 @@ export async function ensureSharedSyncProtocolV3(
   let verified: SharedSyncProtocolObjectV3;
   try {
     verified = await transport.readById(created.id);
-  } catch {
+  } catch (error) {
+    rethrowTerminalSharedSyncProtocolTransportError(error);
     return { status: "blocked", reason: "readback-mismatch" };
   }
   if (verified.id !== created.id || verified.content !== content) {
@@ -177,6 +179,17 @@ export function isSharedSyncProtocolBinding(
 ): value is SharedSyncProtocolBinding {
   return isSharedSyncProtocolBindingV2(value)
     || isSharedSyncProtocolBindingV3(value);
+}
+
+export function parseSharedSyncProtocolV3(
+  content: string,
+): SharedSyncProtocolV3 | null {
+  try {
+    const value: unknown = JSON.parse(content);
+    return isSharedSyncProtocolV3(value) ? value : null;
+  } catch {
+    return null;
+  }
 }
 
 export function isSharedSyncProtocolBindingV3(

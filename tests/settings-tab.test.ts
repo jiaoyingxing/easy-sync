@@ -248,6 +248,8 @@ describe("buildSettingsSyncButtonState", () => {
     expect(source).toContain("settings.communityPlugins.experimental");
     expect(source).toContain("busyCommunityPluginScopeRows");
     expect(source).toContain("pendingCommunityPluginScopeValues");
+    expect(source).toContain("const scopeDisabled = !this.getCommunityPluginScopeEnabled(column)");
+    expect(source).toContain(".setDisabled(busy || scopeDisabled)");
     expect(source).toContain(
       "!scopeEnabled",
     );
@@ -314,7 +316,6 @@ describe("buildSettingsSyncButtonState", () => {
             remote: false,
             dataLocally: false,
             dataRemotely: false,
-            enabledLocally: null,
             desktopOnly: false,
             manifestIssue: false,
             ...(historicalData ? { dataHistoricallyPresent: true } : {}),
@@ -392,7 +393,6 @@ describe("buildSettingsSyncButtonState", () => {
           remote: false,
           dataLocally: true,
           dataRemotely: false,
-          enabledLocally: null,
           desktopOnly: false,
           manifestIssue: false,
         }]),
@@ -473,7 +473,7 @@ describe("buildSettingsSyncButtonState", () => {
     const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
     const styles = readFileSync("styles.css", "utf8");
 
-    expect(source.match(/extends Modal/g)).toHaveLength(2);
+    expect(source.match(/extends Modal/g)).toHaveLength(1);
     expect(source).toContain('"community-plugin-files"');
     expect(source).toContain('"community-plugin-data"');
     expect(source).toContain("openCommunityPluginManagerModal");
@@ -489,8 +489,8 @@ describe("buildSettingsSyncButtonState", () => {
     expect(source).toContain("updateAllCommunityPluginSelections(");
     expect(source).toContain("enableCommunityPluginDataWithFiles(");
     expect(source).toContain("new ConfirmModal(");
-    expect(source).toContain("getCommunityPluginEnablementDecisionSnapshot");
-    expect(source).toContain("resolveCommunityPluginEnablementDecisions");
+    expect(source).not.toContain("getCommunityPluginEnablementDecisionSnapshot");
+    expect(source).not.toContain("resolveCommunityPluginEnablementDecisions");
     expect(source).toContain("inventoryLoadFailed");
     expect(source).toContain('t("notice.communityPlugins.loadFailed")');
     expect(source).toContain("isPluginEffectivelyEnabled(");
@@ -510,144 +510,8 @@ describe("buildSettingsSyncButtonState", () => {
       .not.toMatch(/border|border-radius/);
     expect(styles).not.toContain(".easy-sync-plugin-manager-footer");
     expect(styles).not.toContain(".easy-sync-plugin-discard-guard");
-  });
-
-  it("reviews plugin enablement decisions in one scrollable atomic batch", () => {
-    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
-    const styles = readFileSync("styles.css", "utf8");
-
-    expect(source).toContain("CommunityPluginEnablementDecisionModal");
-    expect(source).toContain("new ExtraButtonComponent(toggleCell)");
-    expect(source).toContain('.setIcon("triangle-alert")');
-    expect(source).toContain('.setTooltip(label)');
-    expect(source).toContain('"easy-sync-plugin-decision-trigger"');
-    expect(source).toContain("awaitChoices()");
-    expect(source).toContain("resolveCommunityPluginEnablementDecisions");
-    expect(source).toContain("await this.plugin.startManualSync()");
-    expect(source).toContain("this.choices.size !== this.items.length");
-    expect(source).toContain("this.refreshChoice(pluginId)");
-    expect(source).toContain('setAttribute("aria-pressed", String(pressed))');
-    const chooseStart = source.indexOf("  private choose(");
-    const refreshChoiceStart = source.indexOf(
-      "  private refreshChoice(",
-      chooseStart,
-    );
-    expect(source.slice(chooseStart, refreshChoiceStart))
-      .not.toContain("this.render()");
-    expect(source).not.toContain("renderInlineDecision");
-    expect(styles).toMatch(
-      /\.easy-sync-plugin-decision-trigger\s*\{[^}]*color:\s*var\(--text-warning\)/s,
-    );
-    expect(styles).not.toContain(".easy-sync-plugin-inline-decision");
-    expect(styles).toMatch(
-      /\.easy-sync-plugin-decisions-list\s*\{[^}]*overflow-y:\s*auto/s,
-    );
-    expect(styles).toContain(".easy-sync-plugin-decisions-actions");
-  });
-
-  it("keeps the plugin enablement review launcher single-instance", () => {
-    const source = readFileSync("src/ui/settings-tab.ts", "utf8");
-    const start = source.indexOf(
-      "  openCommunityPluginEnablementReview(): void {",
-    );
-    const end = source.indexOf("\n  hide(): void {", start);
-    const method = source.slice(start, end);
-
-    expect(source).toContain(
-      "private communityPluginEnablementReviewModal: ConfigSyncModal | null",
-    );
-    expect(method).toContain(
-      "if (this.communityPluginEnablementReviewModal) return;",
-    );
-    expect(method).toContain(
-      "this.communityPluginEnablementReviewModal = null;",
-    );
-    expect(method.match(/new ConfigSyncModal\(/g)).toHaveLength(1);
-  });
-
-  it("continues exactly one sync only after the whole decision batch saves", async () => {
-    const resolveBatch = vi.fn().mockResolvedValue(true);
-    const startManualSync = vi.fn().mockResolvedValue(undefined);
-    const close = vi.fn();
-    const renderPluginListArea = vi.fn();
-    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
-    Object.assign(modal as object, {
-      plugin: {
-        resolveCommunityPluginEnablementDecisions: resolveBatch,
-        startManualSync,
-        i18n: { t: (key: string) => key },
-      },
-      decisionBatchSaving: false,
-      pendingDecisionRevision: "revision-1",
-      pendingDecisions: [{ pluginId: "calendar" }],
-      destroyed: false,
-      close,
-      renderPluginListArea,
-      requestCommunityPluginInventoryRefresh: vi.fn(),
-    });
-    const choices = [{
-      pluginId: "calendar",
-      localEnabled: true,
-      remoteEnabled: false,
-      enabled: true,
-    }];
-
-    await (modal as unknown as {
-      resolvePendingDecisions(
-        expectedRevision: string,
-        input: typeof choices,
-      ): Promise<void>;
-    }).resolvePendingDecisions("revision-1", choices);
-
-    expect(resolveBatch).toHaveBeenCalledExactlyOnceWith(
-      "revision-1",
-      choices,
-    );
-    expect(close).toHaveBeenCalledOnce();
-    expect(startManualSync).toHaveBeenCalledOnce();
-    expect((modal as unknown as { pendingDecisions: unknown[] })
-      .pendingDecisions).toEqual([]);
-  });
-
-  it("keeps the entire decision batch pending when its facts changed", async () => {
-    const resolveBatch = vi.fn().mockResolvedValue(false);
-    const startManualSync = vi.fn();
-    const refresh = vi.fn();
-    const pendingDecisions = [{ pluginId: "calendar" }];
-    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
-    Object.assign(modal as object, {
-      plugin: {
-        resolveCommunityPluginEnablementDecisions: resolveBatch,
-        startManualSync,
-        i18n: { t: (key: string) => key },
-      },
-      decisionBatchSaving: false,
-      pendingDecisionRevision: "revision-1",
-      pendingDecisions,
-      destroyed: false,
-      close: vi.fn(),
-      renderPluginListArea: vi.fn(),
-      requestCommunityPluginInventoryRefresh: refresh,
-    });
-
-    await (modal as unknown as {
-      resolvePendingDecisions(expectedRevision: string, input: Array<{
-        pluginId: string;
-        localEnabled: boolean;
-        remoteEnabled: boolean;
-        enabled: boolean;
-      }>): Promise<void>;
-    }).resolvePendingDecisions("revision-1", [{
-      pluginId: "calendar",
-      localEnabled: true,
-      remoteEnabled: false,
-      enabled: true,
-    }]);
-
-    expect(startManualSync).not.toHaveBeenCalled();
-    expect(refresh).toHaveBeenCalledOnce();
-    expect((modal as unknown as { pendingDecisions: unknown[] })
-      .pendingDecisions).toBe(pendingDecisions);
+    expect(source).not.toContain("CommunityPluginLegacyMigration");
+    expect(source).not.toContain("communityPlugins.migration");
   });
 
   it("renders actionable participation phases from the unified files read model", () => {
@@ -674,7 +538,6 @@ describe("buildSettingsSyncButtonState", () => {
         remote: true,
         dataLocally: false,
         dataRemotely: false,
-        enabledLocally: null,
         desktopOnly,
         manifestIssue: false,
         participationPhase: "blocked",
@@ -692,27 +555,27 @@ describe("buildSettingsSyncButtonState", () => {
     expect(zhCN["settings.communityPlugins.status.joinRequested"])
       .toBe("等待加入同步");
     expect(zhCN["settings.communityPlugins.status.restoreBlocked"])
-      .toBe("恢复受阻，可稍后重试");
+      .toBe("恢复受阻");
     expect(en["settings.communityPlugins.status.joinRequested"])
       .toBe("Waiting to join sync");
     expect(en["settings.communityPlugins.status.restoreBlocked"])
-      .toBe("Restore blocked; try again later");
+      .toBe("Restore blocked");
     expect(zhCN["settings.communityPlugins.status.restoreIncompatible"])
       .toBe("与当前设备或 Obsidian 版本不兼容");
     expect(en["settings.communityPlugins.status.restoreIncompatible"])
       .toBe("Not compatible with this device or Obsidian version");
     expect(zhCN["settings.communityPlugins.status.restoreTargetChanged"])
-      .toBe("远端插件已变化，请关闭后重新开启以确认恢复");
+      .toBe("远端插件已变化");
     expect(en["settings.communityPlugins.status.restoreTargetChanged"])
-      .toBe("Remote plugin changed; turn this off and on again to confirm restore");
+      .toBe("Remote plugin changed");
     expect(zhCN["settings.communityPlugins.status.restoreScopeChanged"])
-      .toBe("同步位置已变化，请关闭后重新开启以重新绑定");
+      .toBe("同步位置已变化");
     expect(en["settings.communityPlugins.status.restoreScopeChanged"])
-      .toBe("Sync location changed; turn this off and on again to reconnect");
+      .toBe("Sync location changed");
     expect(zhCN["settings.communityPlugins.status.localBundleIncomplete"])
-      .toBe("插件文件不完整，请重新安装");
+      .toBe("插件文件不完整");
     expect(en["settings.communityPlugins.status.localBundleIncomplete"])
-      .toBe("Plugin files are incomplete; reinstall the plugin");
+      .toBe("Plugin files are incomplete");
     expect(zhCN["settings.communityPlugins.status.remoteCatalogStale"])
       .toBe("远端状态待重新确认");
     expect(en["settings.communityPlugins.status.remoteCatalogStale"])
@@ -736,6 +599,52 @@ describe("buildSettingsSyncButtonState", () => {
       remote: false,
       manifestIssue: true,
     })).toBe("settings.communityPlugins.status.localBundleIncomplete");
+
+    const describeGuidance = (modal as unknown as {
+      describeInventoryGuidance(
+        items: Array<Record<string, unknown>>,
+        column: "files" | "data",
+      ): string[];
+    }).describeInventoryGuidance.bind(modal);
+    const guidanceItems = [
+      {
+        participationPhase: "blocked",
+        participationBlockedReason: "local-bundle-incomplete",
+        manifestIssue: true,
+      },
+      {
+        participationPhase: "blocked",
+        participationBlockedReason: "remote-bundle-changed",
+        manifestIssue: false,
+      },
+      {
+        participationPhase: "blocked",
+        participationBlockedReason: "temporary-failure",
+        manifestIssue: false,
+      },
+    ];
+    expect(describeGuidance(guidanceItems, "files")).toEqual([
+      "settings.communityPlugins.guidance.reviewIncomplete",
+      "settings.communityPlugins.guidance.reconfirm",
+      "settings.communityPlugins.guidance.retry",
+    ]);
+    expect(describeGuidance(guidanceItems, "data")).toEqual([]);
+    expect(describeGuidance([{
+      participationPhase: "blocked",
+      participationBlockedReason: "manifest-incompatible",
+      manifestIssue: true,
+    }], "files")).toEqual([]);
+    expect(source.indexOf("describeInventoryGuidance(visibleItems, column)"))
+      .toBeLessThan(source.indexOf("this.renderPluginRow(item, column)"));
+    expect(source).toContain("easy-sync-plugin-list-guidance");
+    expect(zhCN["settings.communityPlugins.guidance.reviewIncomplete"])
+      .toBe("插件文件不完整时，将在下次同步中核对本机和云端内容。");
+    expect(zhCN["settings.communityPlugins.guidance.reinstall"])
+      .toBe("本机插件清单无法读取时，请重新安装对应插件。");
+    expect(zhCN["settings.communityPlugins.guidance.reconfirm"])
+      .toBe("远端插件或同步位置变化时，将在下次同步时重新核对。");
+    expect(zhCN["settings.communityPlugins.guidance.retry"])
+      .toBe("恢复受阻时，请稍后重新同步。");
   });
 
   it("refreshes the range-independent remote catalog only when the plugin manager opens", () => {
@@ -789,7 +698,6 @@ describe("buildSettingsSyncButtonState", () => {
       remote: true,
       dataLocally: false,
       dataRemotely: false,
-      enabledLocally: null,
       desktopOnly: false,
       manifestIssue: false,
     }];
@@ -1050,7 +958,7 @@ describe("buildSettingsSyncButtonState", () => {
     expect(zhCN["settings.syncCommunityPlugins.name"]).toBe("社区插件");
     expect(zhCN["settings.syncPluginData.name"]).toBe("社区插件数据");
     expect(zhCN["settings.syncCommunityPlugins.desc"]).toBe(
-      "同步插件文件与启用状态。",
+      "同步社区插件文件；启用状态保留在各设备。",
     );
     expect(zhCN["settings.syncPluginData.desc"]).toBe(
       "同步所选插件的设置数据。此功能尚未充分测试，可能替换其他设备上的插件设置；请先备份。",
@@ -1073,7 +981,7 @@ describe("buildSettingsSyncButtonState", () => {
       "管理社区插件数据",
     );
     expect(zhCN["settings.communityPlugins.selectionSummary"]).toBe(
-      "启用：{enabled}/{total}",
+      "同步：{enabled}/{total}",
     );
     expect(en["settings.communityPlugins.manage.files"]).toBe(
       "Manage community plugins",
@@ -1082,7 +990,7 @@ describe("buildSettingsSyncButtonState", () => {
       "Manage community plugin data",
     );
     expect(en["settings.communityPlugins.selectionSummary"]).toBe(
-      "Enabled: {enabled}/{total}",
+      "Syncing: {enabled}/{total}",
     );
     expect(en["settings.communityPlugins.data.experimentalConfirm"]).toBe(
       "I understand the risk — turn it on",
@@ -1103,22 +1011,7 @@ describe("buildSettingsSyncButtonState", () => {
       "仅桌面可用",
     );
     expect(zhCN["settings.communityPlugins.status.manifestIssue"]).toBe(
-      "插件文件不完整，请重新安装",
-    );
-    expect(zhCN["settings.communityPlugins.decisions.local"]).toBe(
-      "保留本机状态",
-    );
-    expect(zhCN["settings.communityPlugins.decisions.remote"]).toBe(
-      "保留远端状态",
-    );
-    expect(zhCN["settings.communityPlugins.decisions.open"]).toBe(
-      "处理包含“{plugin}”在内的启用状态差异",
-    );
-    expect(zhCN["settings.communityPlugins.decisions.title"]).toBe(
-      "社区插件启用状态",
-    );
-    expect(zhCN["settings.communityPlugins.decisions.message"]).toBe(
-      "为每个插件选择要保留的启用状态。保存后将继续同步，不会删除插件文件。",
+      "插件文件不完整",
     );
     expect(en["settings.communityPlugins.status.localOnly"]).toBe(
       "Plugin files only on this device",
@@ -1136,44 +1029,7 @@ describe("buildSettingsSyncButtonState", () => {
       "Only works on desktop",
     );
     expect(en["settings.communityPlugins.status.manifestIssue"]).toBe(
-      "Plugin files are incomplete; reinstall the plugin",
-    );
-    expect(en["settings.communityPlugins.decisions.local"]).toBe(
-      "Keep local state",
-    );
-    expect(en["settings.communityPlugins.decisions.remote"]).toBe(
-      "Keep remote state",
-    );
-    expect(en["settings.communityPlugins.decisions.open"]).toBe(
-      "Review enabled-state differences including “{plugin}”",
-    );
-    expect(en["settings.communityPlugins.decisions.title"]).toBe(
-      "Community plugin enabled states",
-    );
-    expect(en["settings.communityPlugins.decisions.message"]).toBe(
-      "Choose the enabled state to keep for each plugin. Saving will continue sync and will not delete plugin files.",
-    );
-    expect(zhCN["notice.sync.communityPluginEnablement"]).toBe(
-      "有 {count} 个社区插件启用状态需要确认，本次同步未执行。",
-    );
-    expect(en["notice.sync.communityPluginEnablement"]).toBe(
-      "{count} community plugin enabled state(s) need review. This sync was not run.",
-    );
-    expect(zhCN["syncView.communityPlugins.pendingTitle"]).toBe(
-      "社区插件启用状态",
-    );
-    expect(en["syncView.communityPlugins.pendingTitle"]).toBe(
-      "Community plugin enabled states",
-    );
-    expect(zhCN["syncView.communityPlugins.pendingDescription"]).toBe(
-      "有 {count} 个插件在本机和远端的启用状态不同，请选择同步后保留的状态。",
-    );
-    expect(en["syncView.communityPlugins.pendingDescription"]).toBe(
-      "{count} plugins have different enabled states on this device and in the cloud. Choose which state to keep after syncing.",
-    );
-    expect(zhCN["syncView.communityPlugins.review"]).toBe("选择");
-    expect(en["syncView.communityPlugins.review"]).toBe(
-      "Choose",
+      "Plugin files are incomplete",
     );
   });
 

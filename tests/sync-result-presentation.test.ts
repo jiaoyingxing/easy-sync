@@ -43,7 +43,7 @@ describe("sync result presentation", () => {
     }
   });
 
-  it("keeps cancellation, login expiry, partial failure and hard failure distinct", () => {
+  it("keeps cancellation, login expiry, zero-action failure and partial failure distinct", () => {
     expect(resolveSyncHistoryStatus(
       result({ success: false }),
       { cancelled: true },
@@ -53,19 +53,50 @@ describe("sync result presentation", () => {
     )).toBe("authExpired");
     expect(resolveSyncHistoryStatus(
       result({ success: false, errors: 1 }),
+    )).toBe("failed");
+    expect(resolveSyncHistoryStatus(
+      result({ success: false, uploaded: 1, errors: 1 }),
     )).toBe("partial");
     expect(resolveSyncHistoryStatus(
       result({ success: false }),
     )).toBe("failed");
   });
 
-  it("keeps a community plugin decision as dedicated partial attention", () => {
+  it("shows a pre-plan retryable observation failure as failed without flattening ordinary partial runs", () => {
+    const disposition: NonNullable<SyncResult["disposition"]> = {
+      kind: "retryable-observation",
+      phase: "remotePrepare",
+      code: "shared-control-read-unavailable",
+      retry: "next-sync",
+      component: "v2",
+    };
     expect(resolveSyncHistoryStatus(result({
       success: false,
-      attention: {
-        reason: "community-plugin-enablement-decision-required",
-        count: 2,
+      errors: 1,
+      skippedLarge: 1,
+      message: "result.sharedControlReadUnavailable",
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "not-entered",
+        userFileChanges: "unknown",
       },
+      disposition,
+    }))).toBe("failed");
+    expect(resolveSyncHistoryStatus(result({
+      success: false,
+      errors: 1,
+      message: "result.sharedControlReadUnavailable",
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "entered",
+        userFileChanges: "unknown",
+      },
+      disposition,
+    }))).toBe("failed");
+    expect(resolveSyncHistoryStatus(result({
+      success: false,
+      uploaded: 1,
+      errors: 1,
     }))).toBe("partial");
   });
 

@@ -61,7 +61,7 @@ describe("MutationRecoveryScheduler", () => {
     expect(observe).toHaveBeenCalledTimes(2);
   });
 
-  it("stops after the automatic observation budget instead of polling forever", async () => {
+  it("sleeps after the fast budget and permits one externally triggered probe", async () => {
     vi.useFakeTimers();
     const observe = vi.fn().mockResolvedValue({
       state: "retry",
@@ -84,6 +84,14 @@ describe("MutationRecoveryScheduler", () => {
     expect(scheduler.budgetExhausted).toBe(true);
     expect(scheduler.pending).toBe(false);
     expect(scheduler.requestObservation()).toBe(false);
+    expect(scheduler.requestObservationAfterExhaustion()).toBe(true);
+    await vi.runAllTimersAsync();
+    expect(observe).toHaveBeenCalledTimes(
+      MUTATION_RECOVERY_MAX_AUTOMATIC_OBSERVATIONS + 1,
+    );
+    expect(exhausted).toHaveBeenCalledTimes(2);
+    expect(scheduler.budgetExhausted).toBe(true);
+    expect(scheduler.pending).toBe(false);
   });
 
   it("does not count a busy operation gate against the recovery budget", async () => {

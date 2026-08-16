@@ -64,6 +64,76 @@ export function mutationRecoveryStatusLabel(
   }
 }
 
+export function mutationRecoveryTopStatusLabel(
+  state: Readonly<MutationRecoveryDisplayState>,
+  t: Translator,
+): string {
+  if (state.kind === "checking") {
+    return t("syncView.recovery.checkingTop");
+  }
+  return mutationRecoveryStatusLabel(state, t);
+}
+
+export interface MutationRecoveryBodyPresentation {
+  summary: string;
+  path: string | null;
+  reason: string | null;
+  retryAt: string | null;
+  nextStep: string;
+  actionKey: keyof LocaleStrings | null;
+}
+
+export function mutationRecoveryPrimaryActionKey(
+  state: Readonly<MutationRecoveryDisplayState>,
+): keyof LocaleStrings {
+  return state.kind === "blocked"
+    && state.blockReason === "facts-changed"
+    && state.manualResolutionAvailable === true
+    ? "syncView.recovery.reviewDetails"
+    : "syncView.recovery.checkAgain";
+}
+
+export function mutationRecoveryBodyPresentation(
+  state: Readonly<MutationRecoveryDisplayState>,
+  t: Translator,
+  formatTime: (timestamp: number) => string,
+): MutationRecoveryBodyPresentation {
+  if (state.kind === "checking") {
+    return {
+      summary: t("syncView.recovery.summary.checking"),
+      path: state.firstPath,
+      reason: null,
+      retryAt: null,
+      nextStep: t("syncView.recovery.nextStep.checking"),
+      actionKey: mutationRecoveryPrimaryActionKey(state),
+    };
+  }
+  if (state.kind === "waiting-network") {
+    return {
+      summary: t("syncView.recovery.summary.waitingNetwork"),
+      path: state.firstPath,
+      reason: null,
+      retryAt: state.retryAt === null ? null : formatTime(state.retryAt),
+      nextStep: t("syncView.recovery.nextStep.waitingNetwork"),
+      actionKey: "syncView.recovery.checkAgain",
+    };
+  }
+  const actionKey = mutationRecoveryPrimaryActionKey(state);
+  const canReview = actionKey === "syncView.recovery.reviewDetails";
+  return {
+    summary: t("syncView.recovery.summary.blocked"),
+    path: state.firstPath,
+    reason: mutationRecoveryBlockReasonText(state.blockReason, t),
+    retryAt: null,
+    nextStep: t(
+      canReview
+        ? "syncView.recovery.nextStep.review"
+        : "syncView.recovery.nextStep.recheck",
+    ),
+    actionKey,
+  };
+}
+
 export function mutationRecoveryStatusDetail(
   state: Readonly<MutationRecoveryDisplayState>,
   t: Translator,

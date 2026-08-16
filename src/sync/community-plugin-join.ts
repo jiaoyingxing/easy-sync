@@ -22,21 +22,39 @@ export type CommunityPluginJoinBlockReason =
   | "local-bundle-incomplete"
   | "manifest-incompatible";
 
-const RETRYABLE_COMMUNITY_PLUGIN_JOIN_BLOCK_REASONS = new Set<string>([
+const RECHECKABLE_COMMUNITY_PLUGIN_JOIN_BLOCK_REASONS = new Set<string>([
   "catalog-unavailable",
   "catalog-stale",
+  "scope-changed",
   "remote-bundle-missing",
   "remote-bundle-incomplete",
+  "remote-bundle-changed",
   "local-bundle-incomplete",
+  "manifest-incompatible",
 ]);
 
-/** Retry only facts that can recover without silently changing the user's
- *  bound plugin target. Unknown and permanent reasons fail closed. */
-export function isCommunityPluginJoinBlockRetryable(
+const COMMUNITY_PLUGIN_JOIN_BLOCK_REASONS_REQUIRING_TARGET_REBIND =
+  new Set<string>([
+    "scope-changed",
+    "remote-bundle-changed",
+  ]);
+
+/** A selected plugin remains user-authorized after a failed attempt. Known
+ *  facts are rechecked by the next shared sync; unknown reasons fail closed. */
+export function isCommunityPluginJoinBlockRecheckable(
   reason: string | undefined,
 ): boolean {
   return reason !== undefined
-    && RETRYABLE_COMMUNITY_PLUGIN_JOIN_BLOCK_REASONS.has(reason);
+    && RECHECKABLE_COMMUNITY_PLUGIN_JOIN_BLOCK_REASONS.has(reason);
+}
+
+/** These failures invalidate only the old one-shot target. The next sync may
+ *  bind a fresh target after rebuilding the current remote catalog. */
+export function communityPluginJoinBlockRequiresTargetRebind(
+  reason: string | undefined,
+): boolean {
+  return reason !== undefined
+    && COMMUNITY_PLUGIN_JOIN_BLOCK_REASONS_REQUIRING_TARGET_REBIND.has(reason);
 }
 
 export interface CommunityPluginJoinAuthorization {
@@ -83,15 +101,6 @@ export function planCommunityPluginJoins(input: Readonly<{
       });
       continue;
     }
-    if (original.phase === "join-requested" && local === "partial") {
-      commands.push({
-        type: "block",
-        pluginId: original.pluginId,
-        reason: "local-bundle-incomplete",
-      });
-      continue;
-    }
-
     let current = original;
     const catalogEntry = input.catalog?.entries.find(
       (entry) => entry.pluginId === original.pluginId,

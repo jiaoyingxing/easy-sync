@@ -11,6 +11,7 @@ import {
   generateFileDecisionPlanV2,
   isObsidianManagedConfigPath,
 } from "./file-decision-planner-v2";
+import { normalizeVaultPathKey } from "../obsidian-compat";
 import {
   planFolderStateFromViewV2,
   type FolderPlanConflictReasonV2,
@@ -170,6 +171,7 @@ export interface FinalizeCanonicalPlanInputV2 {
   automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
   baselineReconstructionIncomplete: boolean;
   pendingContentComparisons?: readonly PendingContentComparisonV2[];
+  verifiedRemoteContentHashesById?: ReadonlyMap<string, string>;
   resolveRemoteContentHash: (
     item: Readonly<SyncPlanItem>,
     progress: { current: number; total: number },
@@ -890,6 +892,12 @@ export async function finalizeCanonicalPlanCandidateV2(
     let proof: ContentEqualityProof = remoteHash
       ? "remoteSha256"
       : "insufficientEvidence";
+    if (!remoteHash) {
+      remoteHash = input.verifiedRemoteContentHashesById
+        ?.get(verification.remote.driveId)
+        ?.toLowerCase();
+      if (remoteHash) proof = "verifiedRemoteReceipt";
+    }
     let downloadedThisRound = false;
     if (remoteHash) {
       identityCachedEvidence++;
@@ -965,6 +973,12 @@ export async function finalizeCanonicalPlanCandidateV2(
     let proof: ContentEqualityProof = remoteHash
       ? "remoteSha256"
       : "insufficientEvidence";
+    if (!remoteHash) {
+      remoteHash = input.verifiedRemoteContentHashesById
+        ?.get(replacement.remote.driveId)
+        ?.toLowerCase();
+      if (remoteHash) proof = "verifiedRemoteReceipt";
+    }
     let downloadedThisRound = false;
     if (
       !remoteHash
@@ -1050,6 +1064,8 @@ export async function finalizeCanonicalPlanCandidateV2(
       local: item.local,
       remote: item.remote,
       base: baseByPath.get(item.path),
+      verifiedRemoteHash: input.verifiedRemoteContentHashesById
+        ?.get(item.remote.driveId),
     });
     if (equality.status !== "unknown") return true;
     const receipt = pendingByPath.get(item.path);
@@ -1068,6 +1084,8 @@ export async function finalizeCanonicalPlanCandidateV2(
       local: item.local!,
       remote: item.remote!,
       base: baseByPath.get(item.path),
+      verifiedRemoteHash: input.verifiedRemoteContentHashesById
+        ?.get(item.remote!.driveId),
     }).status !== "unknown");
   const evidencePaths = new Set(
     evidenceCandidates.map((item) => item.path),
@@ -1094,6 +1112,8 @@ export async function finalizeCanonicalPlanCandidateV2(
       local,
       remote,
       base: baseByPath.get(item.path),
+      verifiedRemoteHash: input.verifiedRemoteContentHashesById
+        ?.get(remote.driveId),
     });
     let downloadedHash: string | undefined;
     try {
@@ -1636,6 +1656,9 @@ function clonePlanItem(item: SyncPlanItem): SyncPlanItem {
     ...(item.textMergeEvidence
       ? { textMergeEvidence: structuredClone(item.textMergeEvidence) }
       : {}),
+    ...(item.generationRestore
+      ? { generationRestore: structuredClone(item.generationRestore) }
+      : {}),
   };
 }
 
@@ -1709,6 +1732,26 @@ function canonicalPlanItemFactsV2(item: SyncPlanItem): unknown[] {
     item.targetParentRemoteId ?? null,
     item.requiresConfirmation ?? false,
     item.reviewImpactCount ?? 1,
+    item.generationRestore
+      ? [
+          item.generationRestore.schemaVersion,
+          item.generationRestore.pluginId,
+          item.generationRestore.participant.participantId,
+          item.generationRestore.participant.incarnation,
+          item.generationRestore.generation,
+          item.generationRestore.joinNonce,
+          item.generationRestore.controlRecordId,
+          item.generationRestore.fenceEpoch,
+          item.generationRestore.sealRevision,
+          item.generationRestore.manifestObject.objectPath,
+          item.generationRestore.manifestObject.remoteId,
+          item.generationRestore.manifestObject.parentId,
+          item.generationRestore.manifestObject.size,
+          item.generationRestore.manifestObject.eTag,
+          item.generationRestore.manifestObject.cTag,
+          item.generationRestore.manifestObject.sha256Hash,
+        ]
+      : null,
     token
       ? [
           token.version,
@@ -1900,12 +1943,12 @@ function projectFolderIdentitiesForMove(
 
 /** Match OneDrive's case-insensitive namespace while preserving display paths. */
 export function normalizeRemotePathKey(path: string): string {
-  return path.normalize("NFC").toLocaleLowerCase();
+  return normalizeVaultPathKey(path);
 }
 
 export function isAtOrBelowPath(path: string, root: string): boolean {
-  const normalizedPath = path.normalize("NFC");
-  const normalizedRoot = root.normalize("NFC");
+  const normalizedPath = normalizeRemotePathKey(path);
+  const normalizedRoot = normalizeRemotePathKey(root);
   return normalizedPath === normalizedRoot
     || normalizedPath.startsWith(`${normalizedRoot}/`);
 }

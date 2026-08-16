@@ -1,8 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
+import { sha256Hex } from "../src/crypto";
+import { OneDriveError, OneDriveErrorType } from "../src/onedrive/types";
 import type { SyncScope } from "../src/sync/types";
 import {
   createMigrationGenerationV2,
+  ensureCanonicalSharedSyncProtocolV2,
   ensureSharedSyncProtocolV2,
+  serializeSharedSyncProtocolV2,
   type SharedSyncProtocolObjectV2,
   type SharedSyncProtocolTransportV2,
   type SharedSyncProtocolV2,
@@ -76,11 +80,151 @@ function transportWith(
   };
 }
 
+async function ensureObservedV2(
+  transport: SharedSyncProtocolTransportV2,
+  input: Omit<
+    Parameters<typeof ensureSharedSyncProtocolV2>[1],
+    "observedCurrent" | "observeAfterCreateFailure"
+  >,
+) {
+  const observedCurrent = await transport.read();
+  return ensureSharedSyncProtocolV2(transport, {
+    ...input,
+    observedCurrent,
+    observeAfterCreateFailure: () => transport.read(),
+  });
+}
+
+async function ensureObservedCanonicalV2(
+  transport: SharedSyncProtocolTransportV2,
+  input: Omit<
+    Parameters<typeof ensureCanonicalSharedSyncProtocolV2>[1],
+    "observedCurrent" | "observeAfterCreateFailure"
+  >,
+) {
+  const observedCurrent = await transport.read();
+  return ensureCanonicalSharedSyncProtocolV2(transport, {
+    ...input,
+    observedCurrent,
+    observeAfterCreateFailure: () => transport.read(),
+  });
+}
+
 describe("shared V2 sync protocol", () => {
+  it("keeps the published canonical V2 bytes unchanged", () => {
+    expect(serializeSharedSyncProtocolV2(protocol())).toBe(
+      `{"schemaVersion":1,"kind":"easy-sync-v2-protocol","protocolVersion":2,"migrationGeneration":"${generationA}","scope":{"accountId":"account","driveId":"drive","vaultFolderId":"vault","filesRootId":"files"},"confirmedAllDevicesUpdatedAt":100,"createdAt":100}`,
+    );
+  });
+
+  it("publishes or adopts only the exact proven canonical predecessor", async () => {
+    const content = serializeSharedSyncProtocolV2(protocol());
+    const contentSha256 = await sha256Hex(
+      new TextEncoder().encode(content).buffer,
+    );
+    for (const [initial, source] of [
+      [objectFor(protocol()), "existing"],
+      [null, "created"],
+    ] as const) {
+      const harness = transportWith(initial);
+      await expect(ensureObservedCanonicalV2(
+        harness.transport,
+        {
+          canonicalContent: content,
+          expectedMigrationGeneration: generationA,
+          expectedContentSha256: contentSha256,
+        },
+      )).resolves.toMatchObject({
+        status: "ready",
+        source,
+        object: { content },
+        protocol: { migrationGeneration: generationA },
+      });
+      expect(harness.spies.readById).toHaveBeenCalledOnce();
+      expect(harness.spies.read).toHaveBeenCalledOnce();
+    }
+  });
+
+  it("adopts only an exact create-race winner by identity readback", async () => {
+    const content = serializeSharedSyncProtocolV2(protocol());
+    const contentSha256 = await sha256Hex(
+      new TextEncoder().encode(content).buffer,
+    );
+    const winner = objectFor(protocol(), "winner-id");
+    const read = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(winner);
+    const readById = vi.fn().mockResolvedValue(winner);
+    const transport: SharedSyncProtocolTransportV2 = {
+      read,
+      createOnly: vi.fn().mockRejectedValue(new Error("unknown outcome")),
+      readById,
+    };
+
+    await expect(ensureObservedCanonicalV2(transport, {
+      canonicalContent: content,
+      expectedMigrationGeneration: generationA,
+      expectedContentSha256: contentSha256,
+    })).resolves.toMatchObject({ status: "ready", source: "create-race" });
+    expect(readById).toHaveBeenCalledWith("winner-id");
+    expect(read).toHaveBeenCalledTimes(2);
+
+    const wrong = objectFor(protocol({ migrationGeneration: generationB }));
+    read.mockReset().mockResolvedValueOnce(null).mockResolvedValueOnce(wrong);
+    await expect(ensureObservedCanonicalV2(transport, {
+      canonicalContent: content,
+      expectedMigrationGeneration: generationA,
+      expectedContentSha256: contentSha256,
+    })).resolves.toEqual({
+      status: "blocked",
+      reason: "target-slot-occupied",
+    });
+  });
+
+  it("blocks invalid proof, occupied slots, and changed identity readback", async () => {
+    const content = serializeSharedSyncProtocolV2(protocol());
+    const contentSha256 = await sha256Hex(
+      new TextEncoder().encode(content).buffer,
+    );
+    const input = {
+      canonicalContent: content,
+      expectedMigrationGeneration: generationA,
+      expectedContentSha256: contentSha256,
+    };
+    await expect(ensureObservedCanonicalV2(
+      transportWith(null).transport,
+      { ...input, expectedContentSha256: "f".repeat(64) },
+    )).resolves.toEqual({
+      status: "blocked",
+      reason: "canonical-proof-mismatch",
+    });
+    await expect(ensureObservedCanonicalV2(
+      transportWith(objectFor(protocol({ migrationGeneration: generationB })))
+        .transport,
+      input,
+    )).resolves.toEqual({
+      status: "blocked",
+      reason: "target-slot-occupied",
+    });
+
+    const changedReadback = transportWith(objectFor(protocol()));
+    changedReadback.spies.readById.mockResolvedValueOnce({
+      ...objectFor(protocol()),
+      eTag: "changed-etag",
+    });
+    await expect(ensureObservedCanonicalV2(
+      changedReadback.transport,
+      input,
+    )).resolves.toEqual({
+      status: "blocked",
+      reason: "readback-mismatch",
+    });
+  });
+
   it("requires explicit migration-risk acknowledgement before first creation", async () => {
     const harness = transportWith(null);
 
-    await expect(ensureSharedSyncProtocolV2(harness.transport, {
+    await expect(ensureObservedV2(harness.transport, {
       scope,
       acknowledgeMigrationRisk: false,
     })).resolves.toEqual({ status: "acknowledgement-required" });
@@ -91,7 +235,7 @@ describe("shared V2 sync protocol", () => {
   it("creates one immutable generation and verifies the exact content by ID", async () => {
     const harness = transportWith(null);
 
-    await expect(ensureSharedSyncProtocolV2(harness.transport, {
+    await expect(ensureObservedV2(harness.transport, {
       scope,
       acknowledgeMigrationRisk: true,
       now: 100,
@@ -119,7 +263,7 @@ describe("shared V2 sync protocol", () => {
   it("adopts an existing compatible generation without overwriting it", async () => {
     const harness = transportWith(objectFor(protocol()));
 
-    await expect(ensureSharedSyncProtocolV2(harness.transport, {
+    await expect(ensureObservedV2(harness.transport, {
       scope,
       acknowledgeMigrationRisk: false,
       createMigrationGeneration: () => generationB,
@@ -130,6 +274,7 @@ describe("shared V2 sync protocol", () => {
       binding: { migrationGeneration: generationA },
     });
     expect(harness.spies.createOnly).not.toHaveBeenCalled();
+    expect(harness.spies.read).toHaveBeenCalledOnce();
   });
 
   it("adopts the compatible winner of a create-only race", async () => {
@@ -143,7 +288,7 @@ describe("shared V2 sync protocol", () => {
       readById: vi.fn(),
     };
 
-    await expect(ensureSharedSyncProtocolV2(transport, {
+    await expect(ensureObservedV2(transport, {
       scope,
       acknowledgeMigrationRisk: true,
       now: 200,
@@ -168,7 +313,7 @@ describe("shared V2 sync protocol", () => {
         eTag: "etag",
         content: value,
       });
-      await expect(ensureSharedSyncProtocolV2(harness.transport, {
+      await expect(ensureObservedV2(harness.transport, {
         scope,
         acknowledgeMigrationRisk: true,
       })).resolves.toEqual({ status: "blocked", reason });
@@ -186,7 +331,7 @@ describe("shared V2 sync protocol", () => {
       })),
     }));
 
-    await expect(ensureSharedSyncProtocolV2(harness.transport, {
+    await expect(ensureObservedV2(harness.transport, {
       scope,
       acknowledgeMigrationRisk: true,
       now: 100,
@@ -195,6 +340,38 @@ describe("shared V2 sync protocol", () => {
       status: "blocked",
       reason: "readback-mismatch",
     });
+  });
+
+  it("preserves authentication and cancellation semantics during create and exact readback", async () => {
+    const abortError = new Error("cancelled");
+    abortError.name = "AbortError";
+    const authExpired = new OneDriveError(
+      OneDriveErrorType.AuthExpired,
+      "token expired",
+      401,
+    );
+
+    for (const terminalError of [abortError, authExpired]) {
+      const createHarness = transportWith(null);
+      createHarness.spies.createOnly.mockRejectedValueOnce(terminalError);
+      await expect(ensureObservedV2(createHarness.transport, {
+        scope,
+        acknowledgeMigrationRisk: true,
+        now: 100,
+        createMigrationGeneration: () => generationA,
+      })).rejects.toBe(terminalError);
+      expect(createHarness.spies.read).toHaveBeenCalledOnce();
+
+      const readbackHarness = transportWith(null);
+      readbackHarness.spies.readById.mockRejectedValueOnce(terminalError);
+      await expect(ensureObservedV2(readbackHarness.transport, {
+        scope,
+        acknowledgeMigrationRisk: true,
+        now: 100,
+        createMigrationGeneration: () => generationA,
+      })).rejects.toBe(terminalError);
+      expect(readbackHarness.spies.read).toHaveBeenCalledOnce();
+    }
   });
 
   it("relocates the same generation into a recovered scope without another user confirmation", async () => {
@@ -208,7 +385,7 @@ describe("shared V2 sync protocol", () => {
       recordETag: "old-protocol-etag",
     };
 
-    await expect(ensureSharedSyncProtocolV2(harness.transport, {
+    await expect(ensureObservedV2(harness.transport, {
       scope: { ...scope, vaultFolderId: "recovered-vault" },
       acknowledgeMigrationRisk: false,
       expectedBinding,
@@ -235,7 +412,7 @@ describe("shared V2 sync protocol", () => {
       migrationGeneration: generationB,
     })));
 
-    await expect(ensureSharedSyncProtocolV2(harness.transport, {
+    await expect(ensureObservedV2(harness.transport, {
       scope,
       acknowledgeMigrationRisk: false,
       expectedBinding: {

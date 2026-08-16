@@ -13,6 +13,7 @@ import {
   type LocalFileEntry,
   type LocalFolderEntry,
   type MutationLedgerEntryV1,
+  type MutationReceiptV1,
   type RemoteFolderEntry,
 } from "./types";
 
@@ -591,6 +592,36 @@ function reduceFolderMove(
     throw new Error(`V2 folder move would replace another identity: ${upsert.path}`);
   }
 
+  const reviewedMove = intent.reviewedLocationMove;
+  const projectionSourcePath = reviewedMove?.sourceAnchorPath ?? intent.sourcePath;
+  const alreadyMoved = originalPathById.get(upsert.driveId) === intent.path
+    && Object.values(envelope.folderAnchors!.byAnchorId).some(
+      (anchor) => anchor.remoteId === intent.folderId
+        && anchor.lastPath === intent.path
+        && anchor.parentRemoteId === upsert.parentId
+        && anchor.remoteETag === upsert.eTag,
+    );
+  if (alreadyMoved) return envelope;
+  if (reviewedMove) {
+    const rootAnchors = Object.values(envelope.folderAnchors!.byAnchorId).filter(
+      (anchor) => anchor.remoteId === intent.folderId,
+    );
+    const currentRemotePath = originalPathById.get(upsert.driveId);
+    const expectedRemotePath = intent.action === "moveRemoteFolder"
+      ? intent.sourcePath
+      : intent.path;
+    if (
+      envelope.meta.commitSeq !== reviewedMove.sourceCommitSeq
+      || envelope.meta.lifecycleEpoch !== reviewedMove.sourceLifecycleEpoch
+      || rootAnchors.length !== 1
+      || rootAnchors[0].lastPath !== reviewedMove.sourceAnchorPath
+      || reviewedMove.sourceAnchorPath === intent.path
+      || currentRemotePath !== expectedRemotePath
+    ) {
+      throw new Error(`Reviewed folder location source changed: ${intent.path}`);
+    }
+  }
+
   const nextItemsById: Record<string, RemoteNodeV2> = {
     ...envelope.remoteIndex.itemsById,
     [upsert.driveId]: {
@@ -610,7 +641,7 @@ function reduceFolderMove(
     throw new Error(`V2 folder move projection differs from receipt: ${upsert.path}`);
   }
 
-  const sourcePath = intent.sourcePath;
+  const sourcePath = projectionSourcePath;
   const nextCommitSeq = envelope.meta.commitSeq + 1;
   const nextFolderAnchors = { ...envelope.folderAnchors!.byAnchorId };
   let movedFolderAnchors = 0;
@@ -636,14 +667,14 @@ function reduceFolderMove(
     movedFolderAnchors++;
   }
   if (movedFolderAnchors === 0) {
-    const alreadyMoved = Object.values(nextFolderAnchors).some(
+    const receiptAlreadyApplied = Object.values(nextFolderAnchors).some(
       (anchor) => anchor.remoteId === intent.folderId
         && anchor.lastPath === intent.path
         && anchor.parentRemoteId === upsert.parentId
         && anchor.remoteETag === upsert.eTag,
     );
-    if (alreadyMoved) return envelope;
-    throw new Error(`V2 folder move has no committed source anchor: ${intent.sourcePath}`);
+    if (receiptAlreadyApplied) return envelope;
+    throw new Error(`V2 folder move has no committed source anchor: ${sourcePath}`);
   }
 
   const nextFileAnchors = { ...envelope.anchors.byAnchorId };
@@ -688,6 +719,9 @@ function reduceFolderDelete(
 ): SyncStateEnvelopeV2 {
   const intent = ledgerEntry.intent as FolderMutationIntentV2;
   const receipt = ledgerEntry.receipt!;
+  if (intent.reviewedSubtreeDelete) {
+    return reduceReviewedFolderSubtreeDelete(envelope, intent, receipt);
+  }
   const deletes = receipt.checkpoint.folderDeletes ?? [];
   if (
     !intent.folderId
@@ -745,6 +779,90 @@ function reduceFolderDelete(
   }
   if (!removed && !currentNode) return envelope;
 
+  const next: SyncStateEnvelopeV2 = {
+    ...envelope,
+    meta: {
+      ...envelope.meta,
+      commitSeq: envelope.meta.commitSeq + 1,
+      committedAt: receipt.completedAt,
+    },
+    remoteIndex: {
+      ...envelope.remoteIndex,
+      itemsById: sortRecord(nextItemsById),
+    },
+    anchors: {
+      schemaVersion: 2,
+      byAnchorId: sortRecord(nextFileAnchors),
+    },
+    folderAnchors: {
+      schemaVersion: 2,
+      byAnchorId: sortRecord(nextFolderAnchors),
+    },
+  };
+  validateEnvelope(next);
+  return next;
+}
+
+function reduceReviewedFolderSubtreeDelete(
+  envelope: SyncStateEnvelopeV2,
+  intent: FolderMutationIntentV2,
+  receipt: MutationReceiptV1,
+): SyncStateEnvelopeV2 {
+  const binding = intent.reviewedSubtreeDelete!;
+  const deletes = receipt.checkpoint.folderDeletes ?? [];
+  if (
+    !intent.folderId
+    || !intent.expectedRemote.exists
+    || deletes.length !== 1
+    || deletes[0].driveId !== intent.folderId
+    || deletes[0].path !== intent.path
+  ) {
+    throw new Error(`Reviewed subtree delete receipt is incomplete: ${intent.path}`);
+  }
+
+  const pathById = projectRemoteIndexV2(envelope.remoteIndex);
+  const memberIds = [...pathById.entries()]
+    .filter(([, path]) => isAtOrBelow(path, intent.path))
+    .map(([remoteId]) => remoteId);
+  const anchoredAtOrBelow = [
+    ...Object.values(envelope.anchors.byAnchorId),
+    ...Object.values(envelope.folderAnchors!.byAnchorId),
+  ].some((anchor) => isAtOrBelow(anchor.lastPath, intent.path));
+  if (memberIds.length === 0 && !anchoredAtOrBelow) return envelope;
+
+  if (
+    envelope.remoteIndex.complete !== true
+    || envelope.meta.commitSeq !== binding.sourceCommitSeq
+    || envelope.meta.lifecycleEpoch !== binding.sourceLifecycleEpoch
+    || memberIds.length !== binding.memberCount
+    || pathById.get(intent.folderId) !== intent.path
+  ) {
+    throw new Error(`Reviewed subtree delete source changed: ${intent.path}`);
+  }
+  const root = envelope.remoteIndex.itemsById[intent.folderId];
+  if (
+    root?.kind !== "folder"
+    || root.parentId !== intent.expectedRemote.parentId
+    || root.eTag !== intent.expectedRemote.eTag
+    || root.cTag !== binding.rootCTag
+    || intent.expectedRemote.driveId !== intent.folderId
+  ) {
+    throw new Error(`Reviewed subtree delete root changed: ${intent.path}`);
+  }
+
+  const retiredIds = new Set(memberIds);
+  const nextItemsById = Object.fromEntries(
+    Object.entries(envelope.remoteIndex.itemsById)
+      .filter(([remoteId]) => !retiredIds.has(remoteId)),
+  );
+  const nextFileAnchors = Object.fromEntries(
+    Object.entries(envelope.anchors.byAnchorId)
+      .filter(([, anchor]) => !isAtOrBelow(anchor.lastPath, intent.path)),
+  );
+  const nextFolderAnchors = Object.fromEntries(
+    Object.entries(envelope.folderAnchors!.byAnchorId)
+      .filter(([, anchor]) => !isAtOrBelow(anchor.lastPath, intent.path)),
+  );
   const next: SyncStateEnvelopeV2 = {
     ...envelope,
     meta: {

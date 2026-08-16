@@ -1,0 +1,41 @@
+{
+  "community-plugin-enablement-state": {
+    "version": 1,
+    "scope": {
+      "accountId": "account-id",
+      "driveId": "drive-id",
+      "vaultFolderId": "vault-folder-id",
+      "filesRootId": "files-root-id"
+    },
+    "anchors": {
+      "calendar": false
+    },
+    "pending": [
+      {
+        "pluginId": "calendar",
+        "localEnabled": true,
+        "remoteEnabled": false
+      }
+    ]
+  },
+  "easy-sync-pending-conflicts": [
+    {
+      "type": "Conflict",
+      "path": ".obsidian/community-plugins.json"
+    },
+    {
+      "type": "Conflict",
+      "path": "keep.md"
+    }
+  ],
+  "easy-sync-pending-remote-deletes": [],
+  "easy-sync-pending-issues": [],
+  "easy-sync-plan-review-active": true,
+  "easy-sync-plan-review-items": [
+    {
+      "type": "Conflict",
+      "path": ".obsidian/community-plugins.json"
+    }
+  ],
+  "easy-sync-plan-review-revision": 7
+}

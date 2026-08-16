@@ -3,41 +3,8 @@ import {
   finalizePublic113PluginDataCutover,
   KEY_PUBLIC_113_CUTOVER,
 } from "../src/sync/public-1-1-3-cutover";
-import type {
-  CommunityPluginEnablementMigrationCarrierV2,
-} from "../src/sync/community-plugin-enablement";
 
 const digest = "a".repeat(64);
-const scope = {
-  accountId: "account",
-  driveId: "drive",
-  vaultFolderId: "vault",
-  filesRootId: "files",
-};
-const resolvedEnablement: CommunityPluginEnablementMigrationCarrierV2 = {
-  version: 1,
-  scope,
-  source: {
-    path: ".obsidian/community-plugins.json",
-    selectedPluginIds: ["calendar"],
-    local: { exists: true, contentHash: "b".repeat(64) },
-    remote: {
-      exists: true,
-      contentHash: "c".repeat(64),
-      remoteId: "community-plugins",
-      eTag: "etag-community-plugins",
-    },
-  },
-  anchors: {},
-  pending: [],
-  resolved: [{
-    pluginId: "calendar",
-    localEnabled: false,
-    remoteEnabled: true,
-    resolvedEnabled: false,
-  }],
-};
-
 describe("public 1.1.3 PluginData cutover", () => {
   it("retires stale decisions and moves the public ledger to the V2 recovery key", () => {
     const mutationLedger = [{
@@ -180,72 +147,20 @@ describe("public 1.1.3 PluginData cutover", () => {
     expect(migrated.marker).toEqual(first.marker);
   });
 
-  it("publishes resolved enablement work without inventing an anchor", () => {
+  it("does not publish the retired enablement projection", () => {
     const result = finalizePublic113PluginDataCutover({
-      pluginData: {},
-      sourceStateDigest: digest,
-      finalizedAt: 1,
-      communityPluginEnablement: resolvedEnablement,
-    });
-
-    expect(result.pluginData["community-plugin-enablement-state"]).toEqual({
-      version: 1,
-      scope,
-      anchors: {},
-      pending: [{
-        pluginId: "calendar",
-        localEnabled: false,
-        remoteEnabled: true,
-        resolvedEnabled: false,
-      }],
-    });
-    expect(result.pluginData[KEY_PUBLIC_113_CUTOVER]).toEqual(result.marker);
-    expect(() => finalizePublic113PluginDataCutover({
-      pluginData: {},
-      sourceStateDigest: digest,
-      finalizedAt: 1,
-      communityPluginEnablement: {
-        ...resolvedEnablement,
-        anchors: {},
-        pending: [{
-          pluginId: "calendar",
-          localEnabled: false,
-          remoteEnabled: true,
-        }],
-        resolved: [],
-      },
-    })).toThrow(/unresolved community plugin decisions/);
-    expect(() => finalizePublic113PluginDataCutover({
-      pluginData: {},
-      sourceStateDigest: digest,
-      finalizedAt: 1,
-      communityPluginEnablement: {
-        ...resolvedEnablement,
-        source: {
-          ...resolvedEnablement.source,
-          local: {
-            ...resolvedEnablement.source.local,
-            remoteId: "must-not-be-local",
-          },
+      pluginData: {
+        "community-plugin-enablement-state": {
+          version: 1,
+          anchors: { "startup-optimizer": false },
+          pending: [],
         },
-      } as CommunityPluginEnablementMigrationCarrierV2,
-    })).toThrow(/migration carrier is invalid/);
-  });
-
-  it("preserves a passive dangling anchor across the public cutover", () => {
-    const result = finalizePublic113PluginDataCutover({
-      pluginData: {},
+      },
       sourceStateDigest: digest,
       finalizedAt: 1,
-      communityPluginEnablement: {
-        ...resolvedEnablement,
-        anchors: { "startup-optimizer": false },
-      },
     });
 
     expect(result.pluginData["community-plugin-enablement-state"])
-      .toMatchObject({
-        anchors: { "startup-optimizer": false },
-      });
+      .toBeUndefined();
   });
 });

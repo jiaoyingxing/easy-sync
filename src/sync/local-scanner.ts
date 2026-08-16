@@ -1034,8 +1034,14 @@ export class LocalScanner {
 
   /** Read the current local version for a write-time compare-and-swap check.
    *  Unlike scanFile(), missing and unreadable are never conflated. */
-  async inspectFile(path: string): Promise<LocalFileInspection> {
-    if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
+  async inspectFile(
+    path: string,
+    options: Readonly<{ allowExcludedForRecovery?: boolean }> = {},
+  ): Promise<LocalFileInspection> {
+    if (
+      !options.allowExcludedForRecovery
+      && isExcluded(path, this.config, this.configDir, this.pluginId)
+    ) {
       return { status: "uncertain", reason: "excluded" };
     }
 

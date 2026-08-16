@@ -20,7 +20,6 @@ export interface CommunityPluginInventoryItem {
   remote: boolean;
   dataLocally: boolean;
   dataRemotely: boolean;
-  enabledLocally: boolean | null;
   desktopOnly: boolean;
   manifestIssue: boolean;
   /** Current device intent. Absent only before the one-time V2 migration. */
@@ -58,10 +57,6 @@ export async function buildCommunityPluginInventory(
     remoteFiles,
     `${pluginRoot}/`,
     ownPluginId,
-  );
-  const enabledIds = await readEnabledPluginIds(
-    adapter,
-    `${configDir}/community-plugins.json`,
   );
   const remoteDataIds = collectRemoteDataIds(
     remoteFiles,
@@ -101,7 +96,7 @@ export async function buildCommunityPluginInventory(
   return Promise.all(allIds.map(async (id) => {
     const localDirectory = localIds.has(id);
     const manifest = localDirectory
-      ? await readPluginManifest(adapter, `${pluginRoot}/${id}/manifest.json`, id)
+      ? await readPluginManifest(adapter, `${pluginRoot}/${id}/manifest.json`)
       : null;
     const local = localDirectory
       && !(
@@ -120,7 +115,6 @@ export async function buildCommunityPluginInventory(
       dataLocally: local
         && await adapter.exists(`${pluginRoot}/${id}/data.json`),
       dataRemotely: remoteDataIds.has(id),
-      enabledLocally: local ? enabledIds?.has(id) ?? null : null,
       desktopOnly: manifest?.manifest.isDesktopOnly === true
         || mobileDesktopOnlyIds.has(id),
       manifestIssue: local && manifest === null,
@@ -263,32 +257,17 @@ function collectRemotePluginIds(
   return ids;
 }
 
-async function readEnabledPluginIds(
-  adapter: DataAdapter,
-  path: string,
-): Promise<Set<string> | null> {
-  try {
-    const parsed: unknown = JSON.parse(await adapter.read(path));
-    if (!Array.isArray(parsed)) return null;
-    return new Set(parsed.filter((value): value is string =>
-      typeof value === "string" && isSafePluginId(value)
-    ));
-  } catch {
-    return null;
-  }
-}
-
 async function readPluginManifest(
   adapter: DataAdapter,
   path: string,
-  expectedId: string,
 ): Promise<{ manifest: PluginManifest } | null> {
   try {
     const parsed: unknown = JSON.parse(await adapter.read(path));
     if (!parsed || typeof parsed !== "object") return null;
     const manifest = parsed as Partial<PluginManifest>;
     if (
-      manifest.id !== expectedId
+      typeof manifest.id !== "string"
+      || !isSafePluginId(manifest.id)
       || typeof manifest.name !== "string"
       || manifest.name.trim().length === 0
       || typeof manifest.version !== "string"

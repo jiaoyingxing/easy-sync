@@ -546,6 +546,57 @@ describe("pure V2 file-state reducer", () => {
     expect(() => reduceFileStateEnvelopeV2(initial, malformedMove))
       .toThrow("invalid remote deletes");
   });
+
+  it("accepts only an empty V2 checkpoint for a source-bound local-only download", () => {
+    const initial = envelope([oldRemote], [oldBase]);
+    const localOnly = ledger(
+      "download",
+      ".obsidian/plugins/example/main.js",
+      checkpoint({}),
+      `.easy-sync/community-plugin-content-v1/objects/${hashB}.bin`,
+    );
+    localOnly.intent.stateEffect = "local-only";
+    localOnly.intent.expectedRemote = {
+      exists: true,
+      driveId: "generation-object-main",
+      eTag: "etag-generation-main",
+      size: 10,
+      sha256Hash: hashB,
+    };
+
+    expect(reduceFileStateEnvelopeV2(initial, localOnly)).toBe(initial);
+
+    const malformed = structuredClone(localOnly);
+    malformed.receipt!.checkpoint.baseUpserts.push(
+      base(localOnly.intent.path, hashB, "etag-generation-main"),
+    );
+    expect(() => reduceFileStateEnvelopeV2(initial, malformed))
+      .toThrow("invalid base upserts");
+
+    const pendingMutation = structuredClone(localOnly);
+    pendingMutation.receipt!.checkpoint.pendingConflictRemovals.push(
+      localOnly.intent.path,
+    );
+    expect(() => reduceFileStateEnvelopeV2(initial, pendingMutation))
+      .toThrow("invalid pending conflict removals");
+  });
+
+  it("accepts only an empty checkpoint for an explicit settlement-only side choice", () => {
+    const initial = envelope([oldRemote], [oldBase]);
+    const settlement = ledger(
+      "download",
+      ".obsidian/plugins/example/data.json",
+      checkpoint({}),
+    );
+    settlement.intent.stateEffect = "settlement-only";
+
+    expect(reduceFileStateEnvelopeV2(initial, settlement)).toBe(initial);
+
+    const malformed = structuredClone(settlement);
+    malformed.receipt!.checkpoint.baseUpserts.push(oldBase);
+    expect(() => reduceFileStateEnvelopeV2(initial, malformed))
+      .toThrow("invalid base upserts");
+  });
 });
 
 function comparePath(left: { path: string }, right: { path: string }): number {

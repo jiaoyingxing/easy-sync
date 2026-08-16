@@ -1,4 +1,7 @@
-import type { SyncResult } from "../sync/sync-executor";
+import {
+  classifyRetryableObservationResult,
+  type SyncResult,
+} from "../sync/sync-executor";
 import type { FileProgress } from "../sync/sync-progress";
 import type { SyncHistoryStatus } from "../sync/state-manager";
 import { SyncActionType } from "../sync/types";
@@ -83,12 +86,26 @@ export function isSyncResultFullyComplete(result: SyncResult): boolean {
 
 export function resolveSyncHistoryStatus(
   result: SyncResult,
-  context: { cancelled?: boolean } = {},
+  context: { cancelled?: boolean; completedFileCount?: number } = {},
 ): SyncHistoryStatus {
-  if (context.cancelled) return "cancelled";
+  if (context.cancelled || result.runFacts?.termination === "cancelled") {
+    return "cancelled";
+  }
   if (result.authExpired) return "authExpired";
-  if (result.errors > 0) return "partial";
-  if (result.attention) return "partial";
+  const observation = classifyRetryableObservationResult(result, context);
+  if (observation.kind === "valid") return "failed";
+  if (result.errors > 0) {
+    const completedActions =
+      result.uploaded
+      + result.downloaded
+      + result.deleted
+      + (result.foldersCreated ?? 0)
+      + (result.foldersMoved ?? 0)
+      + (result.foldersDeleted ?? 0)
+      + (result.filesMoved ?? 0)
+      + (context.completedFileCount ?? 0);
+    return completedActions > 0 ? "partial" : "failed";
+  }
   if (!result.success) return "failed";
   return isSyncResultFullyComplete(result) ? "success" : "partial";
 }

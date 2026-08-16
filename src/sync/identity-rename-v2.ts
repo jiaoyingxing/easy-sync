@@ -95,12 +95,19 @@ export function planIdentityRenamesFromStateV2(
   const pathByRemoteId = state.remotePathById;
   const remoteIdByPath = new Map([...pathByRemoteId].map(([id, path]) => [normalizePath(path), id]));
   const localByPath = new Map(localEntries.map((entry) => [normalizePath(entry.path), entry]));
-  const localByContent = new Map<string, LocalFileEntry[]>();
+  const occupiedAnchoredLocalPaths = new Set(
+    state.fileAnchors
+      .filter((anchor) => anchor.remoteId)
+      .map((anchor) => normalizePath(anchor.lastPath))
+      .filter((path) => localByPath.has(path)),
+  );
+  const unanchoredLocalByContent = new Map<string, LocalFileEntry[]>();
   for (const entry of localEntries) {
+    if (occupiedAnchoredLocalPaths.has(normalizePath(entry.path))) continue;
     const key = localContentKey(entry.hash, entry.size);
-    const matches = localByContent.get(key) ?? [];
+    const matches = unanchoredLocalByContent.get(key) ?? [];
     matches.push(entry);
-    localByContent.set(key, matches);
+    unanchoredLocalByContent.set(key, matches);
   }
   const folderIdByPath = new Map<string, string>();
   for (const [id, path] of pathByRemoteId) {
@@ -128,7 +135,7 @@ export function planIdentityRenamesFromStateV2(
       ? state.remoteNodeById.get(occupantId)
       : undefined;
     const oldLocal = localByPath.get(anchorPathKey);
-    const matchingLocals = localByContent.get(
+    const matchingLocals = unanchoredLocalByContent.get(
       localContentKey(anchor.contentHash, anchor.size),
     ) ?? [];
 

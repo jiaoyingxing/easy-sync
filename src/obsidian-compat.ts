@@ -103,6 +103,16 @@ export function getConfigDir(vault: Pick<Vault, "configDir">): string {
   return vault.configDir || DEFAULT_CONFIG_DIR;
 }
 
+/**
+ * Cross-device path identity used by EasySync and OneDrive. Display casing is
+ * preserved elsewhere, but identity follows OneDrive's case-insensitive NFC
+ * namespace so a path cannot bypass protection on Windows or macOS and then
+ * collide when another device syncs it.
+ */
+export function normalizeVaultPathKey(path: string): string {
+  return path.replace(/\\/g, "/").normalize("NFC").toLocaleLowerCase();
+}
+
 export function getPluginDir(
   vaultOrConfigDir: Pick<Vault, "configDir"> | string,
   pluginId: string,
@@ -237,9 +247,12 @@ export function isEasySyncSelfSyncFilePath(
   configDir = DEFAULT_CONFIG_DIR,
   pluginId = "easy-sync",
 ): boolean {
-  const prefix = getEasySyncPaths(configDir, pluginId).pluginDirPrefix;
-  if (!path.startsWith(prefix)) return false;
-  const relativePath = path.slice(prefix.length);
+  const prefix = normalizeVaultPathKey(
+    getEasySyncPaths(configDir, pluginId).pluginDirPrefix,
+  );
+  const normalizedPath = normalizeVaultPathKey(path);
+  if (!normalizedPath.startsWith(prefix)) return false;
+  const relativePath = normalizedPath.slice(prefix.length);
   return !relativePath.includes("/")
     && EASY_SYNC_SELF_SYNC_FILE_NAMES.has(relativePath);
 }

@@ -91,6 +91,22 @@ export class MutationRecoveryScheduler {
   }
 
   /**
+   * After the fast retry window is exhausted, a later foreground, auth, or
+   * periodic trigger may ask for one fresh read-only observation. A failed
+   * probe returns directly to the exhausted state instead of reopening the
+   * full retry burst.
+   */
+  requestObservationAfterExhaustion(): boolean {
+    if (!this.exhausted) return this.requestObservation();
+    if (this.running || this.timer !== null) return false;
+    this.exhausted = false;
+    this.automaticObservations =
+      MUTATION_RECOVERY_MAX_AUTOMATIC_OBSERVATIONS - 1;
+    this.schedule(0);
+    return true;
+  }
+
+  /**
    * Record a retryable failure produced outside this scheduler (for example a
    * normal automatic round that persisted a new mutation intent).
    */
