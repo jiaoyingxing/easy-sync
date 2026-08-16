@@ -2,16 +2,15 @@
  * EasySync Settings Tab
  *
  * Settings page organized by groups (aligned with Obsidian's native SettingGroup style):
- *   - Account (no heading, always visible)
- *   - Sync (同步)
+ *   - Account and sync action (no heading, always visible)
+ *   - Scope (范围)
  *   - Automatic (自动)
- *   - Maintenance (维护)
  *   - About (关于)
+ *   - Maintenance (维护)
  */
 
 import {
   PluginSettingTab,
-  Setting,
   SettingGroup,
 } from "obsidian";
 import type EasySyncPlugin from "../main";
@@ -98,7 +97,7 @@ export function buildSettingsSyncButtonState(
 export class EasySyncSettingTab extends PluginSettingTab {
   plugin: EasySyncPlugin;
   private accountSectionEl: HTMLElement | null = null;
-  private syncSectionEl: HTMLElement | null = null;
+  private rangeSectionEl: HTMLElement | null = null;
   private automaticSectionEl: HTMLElement | null = null;
   private aboutSectionEl: HTMLElement | null = null;
   private maintenanceSectionEl: HTMLElement | null = null;
@@ -114,7 +113,9 @@ export class EasySyncSettingTab extends PluginSettingTab {
     containerEl.addClass("easy-sync-settings-tab");
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     this.accountSectionEl = containerEl.createDiv("easy-sync-settings-account");
-    this.syncSectionEl = containerEl.createDiv("easy-sync-settings-group-host easy-sync-settings-sync");
+    this.rangeSectionEl = containerEl.createDiv(
+      "easy-sync-settings-group-host easy-sync-settings-range",
+    );
     this.automaticSectionEl = containerEl.createDiv(
       "easy-sync-settings-group-host easy-sync-settings-automatic",
     );
@@ -124,14 +125,14 @@ export class EasySyncSettingTab extends PluginSettingTab {
     );
 
     // ========================================================================
-    // Account — no heading, always visible
+    // Account and sync action — one unheaded group
     // ========================================================================
     this.renderAccountSection(t);
 
     // ========================================================================
-    // Sync group
+    // Scope group
     // ========================================================================
-    this.renderSyncSection(t);
+    this.renderRangeSection(t);
 
     // ========================================================================
     // Automatic group
@@ -150,23 +151,27 @@ export class EasySyncSettingTab extends PluginSettingTab {
   }
 
   refreshAuthState(): void {
-    if (!this.accountSectionEl?.isConnected || !this.syncSectionEl?.isConnected) return;
+    if (!this.accountSectionEl?.isConnected) return;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     this.renderAccountSection(t);
-    this.renderSyncSection(t);
   }
 
   refreshSyncState(): void {
-    if (!this.syncSectionEl?.isConnected && !this.automaticSectionEl?.isConnected) return;
+    if (
+      !this.accountSectionEl?.isConnected
+      && !this.rangeSectionEl?.isConnected
+      && !this.automaticSectionEl?.isConnected
+    ) return;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    this.renderSyncSection(t);
+    this.renderAccountSection(t);
+    this.renderRangeSection(t);
     this.renderAutomaticSection(t);
   }
 
   hide(): void {
     super.hide();
     this.accountSectionEl = null;
-    this.syncSectionEl = null;
+    this.rangeSectionEl = null;
     this.automaticSectionEl = null;
     this.aboutSectionEl = null;
     this.maintenanceSectionEl = null;
@@ -177,14 +182,11 @@ export class EasySyncSettingTab extends PluginSettingTab {
   ): void {
     if (!this.accountSectionEl) return;
     this.accountSectionEl.empty();
-    this.renderAccount(this.accountSectionEl, t);
-  }
+    const accountGroup = new SettingGroup(this.accountSectionEl);
+    this.renderAccount(accountGroup, t);
 
-  private renderSyncSection(
-    t: (key: string, params?: Record<string, string | number>) => string,
-  ): void {
-    if (!this.syncSectionEl) return;
-    this.syncSectionEl.empty();
+    if (!this.plugin.auth?.authState.isLoggedIn) return;
+
     const hasCompletedSync = this.plugin.hasCompletedSyncState();
     const fullSyncRunning = this.plugin.syncExecutor?.isRunning ?? false;
     const sideActionRunning = this.plugin.syncExecutor?.hasSideActionsInFlight ?? false;
@@ -199,46 +201,51 @@ export class EasySyncSettingTab extends PluginSettingTab {
       canCancel: fullSyncRunning,
       planReviewActive: this.plugin.state?.planReviewActive ?? false,
     });
-    const syncGroup = new SettingGroup(this.syncSectionEl).setHeading(t("settings.group.sync"));
+    accountGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.firstSync.name"))
+        .addButton((btn) => {
+          if (buttonState.cta) {
+            btn.setCta();
+          }
+          if (buttonState.warning) {
+            btn.buttonEl.classList.add("mod-warning");
+          }
+          btn
+            .setButtonText(t(buttonState.labelKey))
+            .setDisabled(buttonState.disabled)
+            .onClick(() => {
+              switch (buttonState.action) {
+                case "start-manual":
+                  void this.plugin.startManualSync?.();
+                  return;
+                case "start-first":
+                  void this.plugin.startFirstSync?.();
+                  return;
+                case "confirm-plan":
+                  void this.plugin.executePlanReview?.();
+                  return;
+                case "cancel-sync":
+                  void this.plugin.cancelSync?.();
+                  return;
+                case "processing":
+                  return;
+              }
+            });
+        });
+    });
+  }
 
-    if (this.plugin.auth?.authState.isLoggedIn) {
-      syncGroup.addSetting((setting) => {
-        setting
-          .setName(t("settings.firstSync.name"))
-          .setDesc(t("settings.firstSync.desc"))
-          .addButton((btn) => {
-            if (buttonState.cta) {
-              btn.setCta();
-            }
-            if (buttonState.warning) {
-              btn.buttonEl.classList.add("mod-warning");
-            }
-            btn
-              .setButtonText(t(buttonState.labelKey))
-              .setDisabled(buttonState.disabled)
-              .onClick(() => {
-                switch (buttonState.action) {
-                  case "start-manual":
-                    void this.plugin.startManualSync?.();
-                    return;
-                  case "start-first":
-                    void this.plugin.startFirstSync?.();
-                    return;
-                  case "confirm-plan":
-                    void this.plugin.executePlanReview?.();
-                    return;
-                  case "cancel-sync":
-                    void this.plugin.cancelSync?.();
-                    return;
-                  case "processing":
-                    return;
-                }
-              });
-          });
-      });
-    }
+  private renderRangeSection(
+    t: (key: string, params?: Record<string, string | number>) => string,
+  ): void {
+    if (!this.rangeSectionEl) return;
+    this.rangeSectionEl.empty();
+    const rangeGroup = new SettingGroup(this.rangeSectionEl).setHeading(
+      t("settings.group.scope"),
+    );
 
-    syncGroup.addSetting((setting) => {
+    rangeGroup.addSetting((setting) => {
       setting
         .setName(t("settings.syncScope.name"))
         .setDesc(t("settings.syncScope.desc"))
@@ -250,7 +257,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
         });
     });
 
-    syncGroup.addSetting((setting) => {
+    rangeGroup.addSetting((setting) => {
       setting
         .setName(t("settings.syncExclusion.name"))
         .setDesc(t("settings.syncExclusion.desc"))
@@ -274,7 +281,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
       }
     });
 
-    syncGroup.addSetting((setting) => {
+    rangeGroup.addSetting((setting) => {
       setting
         .setName(t("settings.maxFileSize.name"))
         .setDesc(t("settings.maxFileSize.desc", { size: `${this.plugin.syncMaxFileSizeMb} MB` }))
@@ -295,7 +302,6 @@ export class EasySyncSettingTab extends PluginSettingTab {
             });
         });
     });
-
   }
 
   private renderAutomaticSection(
@@ -430,18 +436,6 @@ export class EasySyncSettingTab extends PluginSettingTab {
             });
         });
     });
-
-    aboutGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.about.usage.name"))
-        .setDesc(t("settings.about.usage.desc"));
-    });
-
-    aboutGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.about.disclaimer.name"))
-        .setDesc(t("settings.about.disclaimer.desc"));
-    });
   }
 
   private renderMaintenanceSection(
@@ -510,9 +504,9 @@ export class EasySyncSettingTab extends PluginSettingTab {
     });
   }
 
-  /** Render the account login/logout section (no group heading) */
+  /** Render the account login/logout row inside the unheaded top group. */
   private renderAccount(
-    containerEl: HTMLElement,
+    accountGroup: SettingGroup,
     t: (key: string, params?: Record<string, string | number>) => string,
   ): void {
     const auth = this.plugin.auth;
@@ -520,34 +514,36 @@ export class EasySyncSettingTab extends PluginSettingTab {
       isInitializing: auth?.isInitializing ?? false,
       isPending: auth?.isPending ?? false,
     });
-    new Setting(containerEl)
-      .setName(t("settings.account.name"))
-      .setDesc(
-        auth?.authState.isLoggedIn
-          ? t("settings.account.desc.loggedIn", {
-            name: auth.authState.displayName || t("general.unknown"),
-          })
-          : t(authEntry.descriptionKey),
-      )
-      .addButton((btn) => {
-        if (auth?.authState.isLoggedIn) {
-          btn.setButtonText(t("settings.account.logout")).onClick(() => {
-            void (async () => {
-              await this.plugin.logoutUser();
-              this.refreshAuthState();
-            })();
-          });
-        } else {
-          btn.setButtonText(t(authEntry.labelKey));
-          if (authEntry.cta) btn.setCta();
-          if (authEntry.disabled) {
-            btn.setDisabled(true);
-          } else {
-            btn.onClick(() => {
-              void handleAuthEntryAction(this.plugin);
+    accountGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.account.name"))
+        .setDesc(
+          auth?.authState.isLoggedIn
+            ? t("settings.account.desc.loggedIn", {
+              name: auth.authState.displayName || t("general.unknown"),
+            })
+            : t(authEntry.descriptionKey),
+        )
+        .addButton((btn) => {
+          if (auth?.authState.isLoggedIn) {
+            btn.setButtonText(t("settings.account.logout")).onClick(() => {
+              void (async () => {
+                await this.plugin.logoutUser();
+                this.refreshAuthState();
+              })();
             });
+          } else {
+            btn.setButtonText(t(authEntry.labelKey));
+            if (authEntry.cta) btn.setCta();
+            if (authEntry.disabled) {
+              btn.setDisabled(true);
+            } else {
+              btn.onClick(() => {
+                void handleAuthEntryAction(this.plugin);
+              });
+            }
           }
-        }
-      });
+        });
+    });
   }
 }

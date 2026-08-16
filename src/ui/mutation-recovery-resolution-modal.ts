@@ -10,6 +10,7 @@ import type { I18nFn } from "./confirm-modal";
 import {
   FileComparisonModal,
   formatFileSize,
+  type FileComparisonAction,
   type FileComparisonRow,
 } from "./file-comparison-modal";
 
@@ -119,24 +120,12 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
         ? "syncView.pluginBundleReview.title"
         : "syncView.mutationResolution.title"),
     });
-    body.createEl("p", {
-      text: bundle
-        ? this.t("syncView.pluginBundleReview.description", {
-            name: bundle.displayName ?? bundle.pluginId,
-          })
-        : this.t("syncView.mutationResolution.description", {
-            path: snapshot.path,
-          }),
-      cls: "easy-sync-detail-reason",
-    });
-    if (!bundle) {
+    if (bundle) {
       body.createEl("p", {
-        text: this.t("syncView.mutationResolution.previousAction", {
-          action: this.t(
-            `syncView.mutationResolution.action.${snapshot.previousAction}`,
-          ),
+        text: this.t("syncView.pluginBundleReview.description", {
+          name: bundle.displayName ?? bundle.pluginId,
         }),
-        cls: "easy-sync-comparison-previous-action",
+        cls: "easy-sync-detail-reason",
       });
     }
 
@@ -155,6 +144,18 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
     const detailList = details.createEl("ul");
     if (!bundle) {
       detailList.createEl("li", {
+        text: this.t("syncView.mutationResolution.description", {
+          path: snapshot.path,
+        }),
+      });
+      detailList.createEl("li", {
+        text: this.t("syncView.mutationResolution.previousAction", {
+          action: this.t(
+            `syncView.mutationResolution.action.${snapshot.previousAction}`,
+          ),
+        }),
+      });
+      detailList.createEl("li", {
         text: this.t("syncView.mutationResolution.operationId", {
           value: snapshot.sourceOperationId,
         }),
@@ -171,11 +172,9 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
       });
     }
 
-    if (snapshot.identical) {
+    if (bundle && snapshot.identical) {
       body.createEl("p", {
-        text: this.t(bundle
-          ? "syncView.pluginBundleReview.identical"
-          : "syncView.mutationResolution.identical"),
+        text: this.t("syncView.pluginBundleReview.identical"),
         cls: "easy-sync-detail-identical",
       });
     }
@@ -204,42 +203,55 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
           cls: "easy-sync-comparison-unavailable",
         });
       }
-    } else if (
-      !snapshot.keepLocal.available
-      || !snapshot.keepRemote.available
-    ) {
-      body.createEl("p", {
-        text: this.t("syncView.mutationResolution.unavailable"),
-        cls: "easy-sync-comparison-unavailable",
-      });
+      const executableChoices = bundle.executableChoices ?? [];
+      this.renderFileComparisonActions([
+        {
+          label: this.t("syncView.pluginBundleReview.keepLocal"),
+          className: "easy-sync-detail-action-local",
+          disabled: !executableChoices.includes("keep-local")
+            || !snapshot.keepLocal.available,
+          onClick: () => this.finish("keep-local"),
+        },
+        {
+          label: this.t("syncView.pluginBundleReview.keepRemote"),
+          className: "easy-sync-detail-action-remote",
+          disabled: !executableChoices.includes("keep-remote")
+            || !snapshot.keepRemote.available,
+          onClick: () => this.finish("keep-remote"),
+        },
+        {
+          label: this.t("confirm.cancel"),
+          onClick: () => this.finish(null),
+        },
+      ]);
+      return;
     }
 
-    const executableChoices = bundle
-      ? bundle.executableChoices ?? []
-      : ["keep-local", "keep-remote"];
-    this.renderFileComparisonActions([
-      {
-        label: this.t(bundle
-          ? "syncView.pluginBundleReview.keepLocal"
-          : "syncView.mutationResolution.keepLocal"),
+    // Ordinary entries only keep the executable actions; the unavailable
+    // side is not rendered as a disabled button.
+    const ordinaryActions: FileComparisonAction[] = [];
+    if (snapshot.keepLocal.available) {
+      ordinaryActions.push({
+        label: this.t("syncView.mutationResolution.keepLocal"),
         className: "easy-sync-detail-action-local",
-        disabled: bundle
-          ? !executableChoices.includes("keep-local")
-            || !snapshot.keepLocal.available
-          : !snapshot.keepLocal.available,
         onClick: () => this.finish("keep-local"),
-      },
-      {
-        label: this.t(bundle
-          ? "syncView.pluginBundleReview.keepRemote"
-          : "syncView.mutationResolution.keepRemote"),
+      });
+    }
+    if (snapshot.keepRemote.available) {
+      ordinaryActions.push({
+        label: this.t("syncView.mutationResolution.keepRemote"),
         className: "easy-sync-detail-action-remote",
-        disabled: bundle
-          ? !executableChoices.includes("keep-remote")
-            || !snapshot.keepRemote.available
-          : !snapshot.keepRemote.available,
         onClick: () => this.finish("keep-remote"),
-      },
+      });
+    }
+    if (ordinaryActions.length === 1) {
+      body.createEl("p", {
+        text: this.t("syncView.mutationResolution.singleActionHint"),
+        cls: "easy-sync-detail-reason",
+      });
+    }
+    this.renderFileComparisonActions([
+      ...ordinaryActions,
       {
         label: this.t("confirm.cancel"),
         onClick: () => this.finish(null),

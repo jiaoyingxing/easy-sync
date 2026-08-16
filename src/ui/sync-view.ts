@@ -52,6 +52,7 @@ import {
   mutationRecoveryBodyPresentation,
   mutationRecoveryPrimaryActionKey,
   mutationRecoveryTopStatusLabel,
+  shouldAutoSettleIdenticalRecovery,
   type MutationRecoveryDisplayState,
 } from "./mutation-recovery-presentation";
 import { resolveSyncPendingAttentionCounts } from "./sync-result-presentation";
@@ -2071,6 +2072,14 @@ export class EasySyncSyncView extends ItemView {
       const snapshot = await this.plugin.getMutationRecoveryResolutionSnapshot();
       if (!snapshot) {
         new Notice(t("notice.mutationResolution.unavailable"));
+        return;
+      }
+      if (shouldAutoSettleIdenticalRecovery(snapshot)) {
+        // Identical facts leave no decision for the user: settle through the
+        // existing chain, which rechecks facts and digests before any write.
+        await this.plugin.resolveMutationRecovery(snapshot, "keep-local");
+        this.plugin.updateStatusBar();
+        this.render();
         return;
       }
       const choice = await new MutationRecoveryResolutionModal(

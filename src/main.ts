@@ -2031,14 +2031,19 @@ export default class EasySyncPlugin extends Plugin {
     }
 
     const firstTime = kind === "firstSync";
+    const messages = firstTime
+      ? [
+          t("syncPlan.readyMessage"),
+          t("syncPlan.firstUseUsage"),
+          t("syncPlan.firstUseSafety"),
+        ]
+      : [t("syncPlan.reviewUpdatedMessage")];
     const modal = new SyncPlanAlertModal(
       this.app,
       t(firstTime
         ? "syncPlan.readyTitle"
         : "syncPlan.reviewUpdatedTitle"),
-      t(firstTime
-        ? "syncPlan.readyMessage"
-        : "syncPlan.reviewUpdatedMessage"),
+      messages,
       t("syncPlan.viewButton"),
       () => { void this.activateSyncView(); },
     );

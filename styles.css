@@ -354,10 +354,6 @@ body.is-mobile .easy-sync-empty-folder-actions button {
   margin-bottom: 12px;
 }
 
-.easy-sync-comparison-previous-action {
-  margin-bottom: var(--size-4-3);
-}
-
 .easy-sync-comparison-evidence {
   margin-block: var(--size-4-3);
   color: var(--text-muted);
@@ -944,6 +940,8 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
 
 .easy-sync-history-detail {
   padding: 0 4px 6px 22px;
+  font-size: var(--font-ui-smaller);
+  line-height: var(--line-height-tight);
 }
 
 .easy-sync-item-reason,

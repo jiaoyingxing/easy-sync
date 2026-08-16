@@ -30,7 +30,7 @@ const en: LocaleStrings = {
   "ribbon.ready": "Sync now",
 
   // ---- Settings Groups ----
-  "settings.group.sync": "Sync",
+  "settings.group.scope": "Scope",
   "settings.group.automatic": "Automatic",
   "settings.group.maintenance": "Maintenance",
   "settings.group.about": "About",
@@ -53,7 +53,6 @@ const en: LocaleStrings = {
   "settings.account.loginSuccess": "Login successful",
   "settings.account.logout": "Log out",
   "settings.firstSync.name": "Sync now",
-  "settings.firstSync.desc": "The first run shows a preview. Later runs sync the current state directly.",
   "settings.firstSync.start": "Start sync",
   "settings.firstSync.sync": "Sync",
   "settings.syncScope.name": "Sync scope",
@@ -151,11 +150,11 @@ const en: LocaleStrings = {
   "settings.maxFileSize.name": "Max file size",
   "settings.maxFileSize.desc": "Files larger than {size} will not be synced. Large files use more memory and data.",
   "settings.reset.name": "Reset sync state",
-  "settings.reset.desc": "Check unfinished operations first. Safely settled work is cleared; if one unresolved ordinary file can be safely isolated, that file is kept aside while other regenerable sync state is reset. Sync settings and diagnostic logs are kept.",
+  "settings.reset.desc": "Clears this device's sync baseline, history, pending records, and cache. Unfinished operations are checked first, and reset only continues when they can be handled safely. Sync settings and diagnostic logs are kept, and local and cloud files are not affected.",
   "settings.reset.button": "Reset",
   "settings.reset.confirmTitle": "Reset sync state",
-  "settings.reset.confirmMessage": "This checks unfinished operations first. Safely settled work is cleared; if one unresolved ordinary file can be safely isolated, that file is kept aside while other regenerable sync state is reset. Sync settings and diagnostic logs are kept.",
-  "settings.reset.confirmWarning": "Reset itself does not delete local or cloud files. Evidence for one ordinary file is kept when it can be safely isolated; other evidence that cannot be safely settled or isolated still stops reset. After a successful reset, this device rebuilds its sync state on the next sync.",
+  "settings.reset.confirmMessage": "This clears the sync state recorded on this device and rebuilds it on the next sync.",
+  "settings.reset.confirmWarning": "This does not delete local or cloud files. If there are unfinished operations that cannot be handled safely, reset will stop.",
   "settings.reset.confirm": "Reset",
   "settings.reset.done": "Local sync state reset; diagnostic logs were kept",
   "settings.reset.failed": "Reset did not finish. The reset did not delete local or cloud files. Fully restart Obsidian and reset again; export a diagnostic report if it still fails.",
@@ -165,10 +164,6 @@ const en: LocaleStrings = {
   "settings.about.author.desc": "Jiao Yingxing. If you run into a problem, open an issue on GitHub or contact the author on Xiaohongshu.",
   "settings.about.contact.github": "GitHub",
   "settings.about.contact.xiaohongshu": "Xiaohongshu",
-  "settings.about.usage.name": "Usage tips",
-  "settings.about.usage.desc": "Do not let the OneDrive desktop app, iCloud, Dropbox, Syncthing, or another sync tool manage the same local vault. The first sync, or a sync with many files, may take longer; progress is available in the sidebar.",
-  "settings.about.disclaimer.name": "Data safety",
-  "settings.about.disclaimer.desc": "During sync, EasySync may upload, download, or delete files locally and in OneDrive. Keep an independent backup of important content; sync is not a backup.",
 
   // ---- Sync View ----
   "syncView.title": "EasySync",
@@ -235,7 +230,7 @@ const en: LocaleStrings = {
   "syncView.staleIdentity.fileMessage": "The old cloud identity for “{path}” can no longer be matched uniquely to the current local and cloud objects. Continuing only detaches that stale historical identity; it does not upload, download, overwrite, or delete any file. EasySync then replans from the current facts and preserves the existing content on both sides.",
   "syncView.staleIdentity.folderMessage": "The previously synced cloud folder identity for “{path}” is unreachable while a changed folder exists locally. Continuing only detaches the stale identity for that old folder tree; it does not upload, download, overwrite, or delete any content. EasySync then replans from the current facts and preserves the existing content on both sides.",
   "syncView.staleIdentity.confirm": "Keep both and sync again",
-  "syncView.mutationResolution.title": "Review unfinished operation",
+  "syncView.mutationResolution.title": "Choose which side to keep",
   "syncView.mutationResolution.description": "EasySync can no longer confirm the result of the previous operation on “{path}”. Review the current state and choose which side to keep.",
   "syncView.mutationResolution.previousAction": "Previous operation: {action}",
   "syncView.mutationResolution.localTitle": "Current device",
@@ -247,7 +242,7 @@ const en: LocaleStrings = {
   "syncView.mutationResolution.identical": "The local and cloud content is identical. Either choice will only confirm the state and will not modify the file again.",
   "syncView.mutationResolution.keepLocal": "Keep current local",
   "syncView.mutationResolution.keepRemote": "Keep current cloud",
-  "syncView.mutationResolution.unavailable": "Some actions are not supported by the current state, so those choices are disabled.",
+  "syncView.mutationResolution.singleActionHint": "Only one resolution is available for the current state.",
   "syncView.mutationResolution.deleteConfirmTitle": "Delete the copy on the other side?",
   "syncView.mutationResolution.deleteConfirm": "Confirm and continue",
   "syncView.mutationResolution.deleteConfirmMessage": "After choosing “{choice}”, “{path}” is absent on the selected side. Continuing will delete the copy that currently exists on the other side.",
@@ -348,7 +343,7 @@ const en: LocaleStrings = {
   "notice.emptyFolder.deleteUnavailable": "The cloud cannot safely prove that this folder stayed empty. Check and delete it in OneDrive: {path}",
   "notice.mutationResolution.unavailable": "EasySync cannot determine how to handle this record. Export a diagnostic report before proceeding.",
   "notice.mutationResolution.changed": "The local or cloud state changed. No operation was performed: {path}",
-  "notice.mutationResolution.completed": "Resolved using your selected side: {path}",
+  "notice.mutationResolution.completed": "Unfinished operation resolved: {path}",
   "notice.mutationResolution.failed": "Could not resolve unfinished operation “{path}”: {reason}",
 
   // ---- Sync Lifecycle Notices ----
@@ -502,6 +497,8 @@ const en: LocaleStrings = {
   // ---- Sync Plan Alert & Review ----
   "syncPlan.readyTitle": "Sync plan ready",
   "syncPlan.readyMessage": "Your sync plan is ready. Review the details in the sidebar before proceeding.",
+  "syncPlan.firstUseUsage": "Do not let the OneDrive desktop app, iCloud, Dropbox, Syncthing, or another sync tool manage the same local vault. The first sync, or a sync with many files, may take longer; progress is available in the sidebar.",
+  "syncPlan.firstUseSafety": "During sync, EasySync may upload, download, or delete files locally and in OneDrive. Keep an independent backup of important content; sync is not a backup.",
   "syncPlan.reviewUpdatedTitle": "Sync plan updated",
   "syncPlan.reviewUpdatedMessage": "Your sync scope or files have changed, so the plan was regenerated. Review the updated details in the sidebar.",
   "syncPlan.viewButton": "View plan",

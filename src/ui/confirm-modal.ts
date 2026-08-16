@@ -2,7 +2,7 @@
  * SyncPlanAlertModal — lightweight, non-blocking notification.
  *
  * Used after generating a sync plan that needs review (first sync or
- * threshold exceeded). Shows a message and a single button that opens
+ * threshold exceeded). Shows one or more messages and a single button that opens
  * the sidebar. The plan is already persisted to state — dismissing the
  * alert does not discard it.
  */
@@ -10,7 +10,7 @@ export class SyncPlanAlertModal extends Modal {
   constructor(
     app: App,
     private title: string,
-    private message: string,
+    private messages: readonly string[],
     private buttonLabel: string,
     private onViewPlan: () => void,
   ) {
@@ -22,10 +22,12 @@ export class SyncPlanAlertModal extends Modal {
     contentEl.empty();
     this.setTitle(this.title);
 
-    contentEl.createEl("p", {
-      text: this.message,
-      cls: "setting-item-description",
-    });
+    for (const message of this.messages) {
+      contentEl.createEl("p", {
+        text: message,
+        cls: "setting-item-description",
+      });
+    }
 
     const btnRow = contentEl.createDiv("modal-button-container");
     const viewBtn = btnRow.createEl("button", {
