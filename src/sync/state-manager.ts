@@ -9151,11 +9151,13 @@ function isManualMutationResolution(
     && !value.intent.expectedRemote.exists,
   );
   const semanticActionMatches = !value.externalMutation
-    ? !hasSourcePath && (
+    ? (
         (value.intent.action === "upload"
           && value.intent.expectedLocal.exists
-          && value.intent.expectedRemote.exists)
+          && value.intent.expectedRemote.exists
+          && (!hasSourcePath || value.intent.sourcePath !== value.intent.path))
         || (value.intent.action === "deleteLocal"
+          && !hasSourcePath
           && !value.intent.expectedLocal.exists
           && !value.intent.expectedRemote.exists)
       )

@@ -244,7 +244,12 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
         onClick: () => this.finish("keep-remote"),
       });
     }
-    if (ordinaryActions.length === 1) {
+    if (ordinaryActions.length === 0) {
+      body.createEl("p", {
+        text: this.t("syncView.mutationResolution.noAvailableActions"),
+        cls: "easy-sync-detail-reason",
+      });
+    } else if (ordinaryActions.length === 1) {
       body.createEl("p", {
         text: this.t("syncView.mutationResolution.singleActionHint"),
         cls: "easy-sync-detail-reason",

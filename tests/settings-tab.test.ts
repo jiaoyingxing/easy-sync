@@ -963,16 +963,28 @@ describe("buildSettingsSyncButtonState", () => {
       "同步 Obsidian 书签列表（bookmarks.json）。",
     );
     const configSource = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    expect(configSource.indexOf('key: "settings.syncPluginFiles"')).toBeLessThan(
+      configSource.indexOf('key: "settings.syncCorePlugins"'),
+    );
+    expect(configSource.indexOf('key: "settings.syncCorePlugins"')).toBeLessThan(
+      configSource.indexOf('"settings.syncCommunityPlugins"'),
+    );
+    expect(configSource.indexOf('"settings.syncCommunityPlugins"')).toBeLessThan(
+      configSource.indexOf('"settings.syncPluginData"'),
+    );
+    expect(configSource.indexOf('"settings.syncPluginData"')).toBeLessThan(
+      configSource.indexOf('key: "settings.syncEditor"'),
+    );
     expect(configSource.indexOf('key: "settings.syncHotkeys"')).toBeLessThan(
       configSource.indexOf('key: "settings.syncBookmarks"'),
-    );
-    expect(configSource.indexOf('key: "settings.syncBookmarks"')).toBeLessThan(
-      configSource.indexOf('key: "settings.syncCorePlugins"'),
     );
     expect(zhCN["settings.syncCommunityPlugins.name"]).toBe("社区插件");
     expect(zhCN["settings.syncPluginData.name"]).toBe("社区插件数据");
     expect(zhCN["settings.syncCommunityPlugins.desc"]).toBe(
-      "同步社区插件文件；启用状态保留在各设备。",
+      "同步社区插件安装时下载的文件（main.js、manifest.json、styles.css）；不同步启用状态。",
+    );
+    expect(en["settings.syncCommunityPlugins.desc"]).toBe(
+      "Sync the files downloaded when installing a community plugin (main.js, manifest.json, styles.css); enabled state is not synced.",
     );
     expect(zhCN["settings.syncPluginData.desc"]).toBe(
       "同步所选插件的设置数据。此功能尚未充分测试，可能替换其他设备上的插件设置；请先备份。",

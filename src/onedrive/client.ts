@@ -960,7 +960,7 @@ export class OneDriveClient {
 
   // ---- File Operations ----
 
-  /** Upload a file, using an upload session above 10 MiB.
+  /** Upload a file, using an upload session above 4 MiB.
    *
    *  @param eTag  When set, the upload includes an If-Match header. OneDrive
    *               rejects the request with 412 if the remote eTag has changed,
@@ -1000,7 +1000,14 @@ export class OneDriveClient {
       apiPath,
       content,
       "application/octet-stream",
-      { extraHeaders: headers },
+      {
+        extraHeaders: headers,
+        // A single non-resumable PUT must outlive slow uploads. The flat 15s
+        // REQUEST_TIMEOUT_MS misclassified slow-but-successful uploads as
+        // network failures, so reuse the upload-session transfer budget (min
+        // 30s, rate-scaled, capped 5min). Timeout outcome stays non-retryable.
+        perRequestTimeoutMs: uploadSessionChunkTimeoutMs(content.byteLength, null),
+      },
     );
     onProgress?.(content.byteLength, content.byteLength);
     return response.json as UploadResult;

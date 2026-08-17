@@ -3709,6 +3709,41 @@ describe("Persistent remote delta state", () => {
     expect(harness.state.mutationLedger).toEqual([]);
   });
 
+  it("turns a converged sourcePath rename into a state-only checkpoint", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "new.md",
+      sourcePath: "old.md",
+      local: { "new.md": "same" },
+      remote: { "new.md": "same" },
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+
+    expect(reviewed?.identical).toBe(true);
+    expect(reviewed?.keepLocal.available).toBe(false);
+    expect(reviewed?.keepRemote.available).toBe(false);
+    await harness.executor.resolveMutationRecovery(reviewed!, "keep-local");
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
+    expect(harness.adapter.writeBinary).not.toHaveBeenCalled();
+    expect(harness.adapter.rename).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toEqual([]);
+
+    // The built state-only resolution must carry the source path so the real
+    // attach validator (isManualMutationResolution path-set equality) accepts
+    // it, and its checkpoint must retire the source from both snapshots.
+    const attach = vi.mocked(harness.state.attachManualMutationResolution);
+    expect(attach).toHaveBeenCalledTimes(1);
+    const resolution = attach.mock.calls[0][1] as ManualMutationResolutionV1;
+    expect(resolution.externalMutation).toBe(false);
+    expect(resolution.intent).toMatchObject({
+      action: "upload",
+      path: "new.md",
+      sourcePath: "old.md",
+    });
+    expect(resolution.receipt?.checkpoint.baseRemovals).toEqual(["old.md"]);
+    expect(resolution.receipt?.checkpoint.remoteDeletes).toEqual(["old.md"]);
+  });
+
   it("performs zero writes when facts change after the user review", async () => {
     const harness = await makeManualResolutionHarness({
       path: "changed.md",
