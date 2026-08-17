@@ -1439,10 +1439,11 @@ export class SyncExecutor {
         if (!record || isFolderMutationIntent(record.intent)) return;
         const current = await this.buildCurrentMutationRecoveryResolutionSnapshot(record);
         const option = choice === "keep-local" ? current?.keepLocal : current?.keepRemote;
+        const autoSettle = current?.identical === true && current.bundleReview === undefined;
         if (
           !current
           || current.factsDigest !== reviewed.factsDigest
-          || !option?.available
+          || (!autoSettle && !option?.available)
           || !this.canContinue(operationEpoch)
         ) {
           this.notice("notice.mutationResolution.changed", { path: reviewed.path });
@@ -2711,6 +2712,14 @@ export class SyncExecutor {
       const pureMove = localPresent.length === 1
         && remotePresent.length === 1
         && localPresent[0].path !== remotePresent[0].path
+        && localPresent[0].hash === remotePresent[0].hash
+        && localPresent[0].size === remotePresent[0].size;
+      // A completed rename/move converges both sides onto the same path with
+      // the same content. There is no keep-side decision left: settle it the
+      // same zero-write way as the single-path identical case.
+      identical = localPresent.length === 1
+        && remotePresent.length === 1
+        && localPresent[0].path === remotePresent[0].path
         && localPresent[0].hash === remotePresent[0].hash
         && localPresent[0].size === remotePresent[0].size;
       keepLocal = { available: pureMove, deletesOtherSide: false };
@@ -11213,6 +11222,37 @@ export class SyncExecutor {
         ? local.exists ? "upload" : "deleteRemote"
         : remote.exists ? "download" : "deleteLocal";
       return withoutReceipt(createIntent(action, snapshot.path, local, remote));
+    }
+
+    if (snapshot.identical) {
+      // sourcePath converged: both sides now hold the same file at the same
+      // path. Settle as a state-only receipt, mirroring the single-path case,
+      // while retiring the abandoned source path from both snapshots.
+      const convergedLocal = snapshot.local.find((fact) => fact.exists);
+      const convergedRemote = snapshot.remote.find((fact) => fact.exists);
+      if (!convergedLocal || !convergedRemote || !snapshot.sourcePath) {
+        return null;
+      }
+      const remoteEntry = await this.currentManualRemoteEntry(convergedRemote);
+      if (!remoteEntry) return null;
+      const intent = createIntent(
+        "upload",
+        convergedLocal.path,
+        convergedLocal,
+        convergedRemote,
+        snapshot.sourcePath,
+      );
+      const checkpoint = emptyMutationCheckpoint();
+      checkpoint.baseUpserts.push({
+        path: convergedLocal.path,
+        hash: convergedLocal.hash!,
+        size: convergedLocal.size!,
+        eTag: convergedRemote.eTag!,
+      });
+      checkpoint.remoteUpserts.push(remoteEntry);
+      checkpoint.baseRemovals.push(snapshot.sourcePath);
+      checkpoint.remoteDeletes.push(snapshot.sourcePath);
+      return withReceipt(intent, checkpoint);
     }
 
     if (snapshot.recoveryEvidence) {

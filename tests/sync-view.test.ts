@@ -1871,6 +1871,7 @@ describe("buildSyncViewContentKey", () => {
     expect(modalSource).not.toContain(": !snapshot.keepRemote.available");
     expect(modalSource).toContain("bundle && snapshot.identical");
     expect(modalSource).toContain("syncView.mutationResolution.singleActionHint");
+    expect(modalSource).toContain("syncView.mutationResolution.noAvailableActions");
     expect(modalSource.indexOf("syncView.mutationResolution.previousAction")).toBeGreaterThan(
       modalSource.indexOf("syncView.mutationResolution.technicalDetails"),
     );

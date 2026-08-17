@@ -1,6 +1,9 @@
 const MIB = 1024 * 1024;
 
-export const UPLOAD_SESSION_THRESHOLD_BYTES = 10 * MIB;
+// Microsoft recommends resumable upload sessions for files larger than 4 MiB;
+// keep simple PUT /content for the small-file band and switch to a resumable
+// session above this threshold.
+export const UPLOAD_SESSION_THRESHOLD_BYTES = 4 * MIB;
 export const UPLOAD_CHUNK_ALIGNMENT_BYTES = 320 * 1024;
 export const UPLOAD_CHUNK_NORMAL_BYTES = 10 * MIB;
 export const UPLOAD_CHUNK_SLOW_BYTES = 5 * MIB;

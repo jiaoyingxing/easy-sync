@@ -12,7 +12,7 @@ import {
 } from "../src/onedrive/upload-session-policy";
 
 describe("OneDrive upload-session policy", () => {
-  it("uses resumable upload above 10 MiB", () => {
+  it("uses resumable upload above 4 MiB", () => {
     expect(shouldUseUploadSession(UPLOAD_SESSION_THRESHOLD_BYTES)).toBe(false);
     expect(shouldUseUploadSession(UPLOAD_SESSION_THRESHOLD_BYTES + 1)).toBe(true);
   });

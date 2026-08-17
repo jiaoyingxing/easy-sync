@@ -245,6 +245,7 @@ export interface LocaleStrings {
   "syncView.mutationResolution.keepLocal": string;
   "syncView.mutationResolution.keepRemote": string;
   "syncView.mutationResolution.singleActionHint": string;
+  "syncView.mutationResolution.noAvailableActions": string;
   "syncView.mutationResolution.deleteConfirmTitle": string;
   "syncView.mutationResolution.deleteConfirm": string;
   "syncView.mutationResolution.deleteConfirmMessage": string;

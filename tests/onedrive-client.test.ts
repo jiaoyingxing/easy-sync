@@ -2681,6 +2681,30 @@ describe("OneDriveClient.uploadFile", () => {
     expect(progress).toEqual([[0, 1024], [1024, 1024]]);
   });
 
+  it("gives a large simple upload a size-scaled timeout beyond the flat 15s", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(() => new Promise((resolve) => {
+      // Resolve only after a slow 20s transfer: the old flat 15s deadline
+      // would have cut this off; the size-scaled budget must let it finish.
+      setTimeout(() => resolve({
+        status: 200,
+        headers: {},
+        json: { id: "big-id", size: 2_579_235, eTag: "big-etag" },
+      }), 20_000);
+    }));
+    const client = new OneDriveClient(async () => "token");
+
+    const pending = client.uploadFile(
+      "testVault",
+      "big.md",
+      new ArrayBuffer(2_579_235),
+    );
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    await expect(pending).resolves.toMatchObject({ id: "big-id" });
+    vi.useRealTimers();
+  });
+
   it("Preflight P0 — create-only simple upload uses conflictBehavior=fail", async () => {
     const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
       status: 201,

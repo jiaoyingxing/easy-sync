@@ -34,6 +34,12 @@ export type ConfigSyncView =
 
 type PluginColumn = CommunityPluginSelectionColumn;
 
+interface ScopeToggleConfig {
+  key: string;
+  get: () => boolean;
+  patch: (value: boolean) => Partial<SyncPathSettings>;
+}
+
 interface CommunityPluginScopeControls {
   toggle: ToggleComponent;
   manageButton: ButtonComponent;
@@ -122,16 +128,33 @@ export class ConfigSyncModal extends Modal {
     this.contentEl.removeClass("easy-sync-community-plugin-page");
     this.setTitle(t("settings.syncScope.title"));
 
-    const toggles: Array<{
-      key: string;
-      get: () => boolean;
-      patch: (value: boolean) => Partial<SyncPathSettings>;
-    }> = [
+    const leadingToggles: ScopeToggleConfig[] = [
       {
         key: "settings.syncPluginFiles",
         get: () => this.plugin.syncPluginFiles,
         patch: (value) => ({ syncPluginFiles: value }),
       },
+      {
+        key: "settings.syncCorePlugins",
+        get: () => this.plugin.syncCorePlugins,
+        patch: (value) => ({ syncCorePlugins: value }),
+      },
+    ];
+
+    for (const toggleConfig of leadingToggles) {
+      this.renderScopeToggle(toggleConfig);
+    }
+
+    this.renderCommunityPluginScopeSetting(
+      "files",
+      "settings.syncCommunityPlugins",
+    );
+    this.renderCommunityPluginScopeSetting(
+      "data",
+      "settings.syncPluginData",
+    );
+
+    const trailingToggles: ScopeToggleConfig[] = [
       {
         key: "settings.syncEditor",
         get: () => this.plugin.syncEditorSettings,
@@ -157,46 +180,38 @@ export class ConfigSyncModal extends Modal {
         get: () => this.plugin.syncBookmarks,
         patch: (value) => ({ syncBookmarks: value }),
       },
-      {
-        key: "settings.syncCorePlugins",
-        get: () => this.plugin.syncCorePlugins,
-        patch: (value) => ({ syncCorePlugins: value }),
-      },
     ];
 
-    for (const toggleConfig of toggles) {
-      new Setting(this.contentEl)
-        .setName(t(`${toggleConfig.key}.name`))
-        .setDesc(t(`${toggleConfig.key}.desc`))
-        .addToggle((toggle) => {
-          toggle
-            .setValue(toggleConfig.get())
-            .onChange(async (value) => {
-              const previous = toggleConfig.get();
-              toggle.setDisabled(true);
-              try {
-                await this.plugin.updateSyncPathSettings(
-                  toggleConfig.patch(value),
-                );
-              } catch (error) {
-                toggle.setValue(previous);
-                this.showSyncPathSettingsError(error);
-              } finally {
-                toggle.setDisabled(false);
-              }
-            });
-        });
+    for (const toggleConfig of trailingToggles) {
+      this.renderScopeToggle(toggleConfig);
     }
 
-    this.renderCommunityPluginScopeSetting(
-      "files",
-      "settings.syncCommunityPlugins",
-    );
-    this.renderCommunityPluginScopeSetting(
-      "data",
-      "settings.syncPluginData",
-    );
     this.requestCommunityPluginInventoryRefresh();
+  }
+
+  private renderScopeToggle(toggleConfig: ScopeToggleConfig): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    new Setting(this.contentEl)
+      .setName(t(`${toggleConfig.key}.name`))
+      .setDesc(t(`${toggleConfig.key}.desc`))
+      .addToggle((toggle) => {
+        toggle
+          .setValue(toggleConfig.get())
+          .onChange(async (value) => {
+            const previous = toggleConfig.get();
+            toggle.setDisabled(true);
+            try {
+              await this.plugin.updateSyncPathSettings(
+                toggleConfig.patch(value),
+              );
+            } catch (error) {
+              toggle.setValue(previous);
+              this.showSyncPathSettingsError(error);
+            } finally {
+              toggle.setDisabled(false);
+            }
+          });
+      });
   }
 
   private renderCommunityPluginScopeSetting(
