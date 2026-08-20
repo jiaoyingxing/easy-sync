@@ -7999,6 +7999,257 @@ describe("Persistent remote delta state", () => {
     expect(state.setLastSyncTime).not.toHaveBeenCalled();
   });
 
+  it("keeps syncing unrelated files while a retryable recovery stays protected", async () => {
+    const stuckBytes = new TextEncoder().encode("stuck note").buffer;
+    const stuckHash = await sha256Hex(stuckBytes);
+    const unrelatedBytes = new TextEncoder().encode("new note").buffer;
+    const unrelatedHash = await sha256Hex(unrelatedBytes);
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const stuckLocal: LocalFileEntry = {
+      path: "stuck-upload.md",
+      hash: stuckHash,
+      size: stuckBytes.byteLength,
+      mtime: 1,
+      binary: false,
+    };
+    const unrelated: LocalFileEntry = {
+      path: "other.md",
+      hash: unrelatedHash,
+      size: unrelatedBytes.byteLength,
+      mtime: 1,
+      binary: false,
+    };
+    const state = makeActiveV2State([], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1 as const,
+          operationId: "op-stuck-upload",
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload" as const,
+          path: stuckLocal.path,
+          expectedLocal: {
+            exists: true as const,
+            hash: stuckHash,
+            size: stuckBytes.byteLength,
+          },
+          expectedRemote: { exists: false as const },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const uploadFile = vi.fn().mockImplementation(async (
+      _vaultName: string,
+      path: string,
+    ) => {
+      if (path === stuckLocal.path) {
+        throw new OneDriveError(
+          OneDriveErrorType.NetworkError,
+          "upload response lost",
+        );
+      }
+      return {
+        id: "unrelated-id",
+        eTag: "unrelated-etag",
+        parentReference: { id: activeScope.filesRootId },
+      };
+    });
+    const getFileMetadata = vi.fn().mockRejectedValue(new OneDriveError(
+      OneDriveErrorType.RateLimited,
+      "recovery observation unavailable",
+      429,
+      7,
+    ));
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "https://graph.example/delta-protected-continue",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ uploadFile, getFileMetadata, getDelta }),
+      {
+        vault: {
+          adapter: makeMockAdapter({
+            readBinary: vi.fn().mockImplementation(async (path: string) =>
+              path === unrelated.path ? unrelatedBytes : stuckBytes),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [stuckLocal, unrelated],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({
+          status: "present",
+          entry: stuckLocal,
+        }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    // The retryable recovery must not freeze the Vault: the unrelated file
+    // still uploads while the unresolved record keeps owning its path.
+    expect(result.success).toBe(true);
+    expect(result.errors).toBe(0);
+    expect(result.uploaded).toBe(1);
+    expect(result.mutationRecovery).toMatchObject({
+      state: "network-unavailable",
+      total: 1,
+      settled: 0,
+      remaining: 1,
+      retryAfterSeconds: 7,
+    });
+    expect(uploadFile).toHaveBeenCalledTimes(1);
+    expect(uploadFile.mock.calls[0]?.[1]).toBe(unrelated.path);
+    expect(state.mutationLedger.map(
+      (record) => record.intent.operationId,
+    )).toEqual(["op-stuck-upload"]);
+    expect(state.mutationLedger[0].receipt).toBeNull();
+  });
+
+  it("defers plan items intersecting protected recovery instead of failing the run", async () => {
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const protectedRecord: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "op-protected",
+        planRevision: 1,
+        scope: activeScope,
+        action: "upload",
+        path: "frozen/note.md",
+        expectedLocal: {
+          exists: true,
+          hash: "aa".repeat(32),
+          size: 3,
+        },
+        expectedRemote: { exists: false },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const state = makeActiveV2State([], [], {
+      mutationLedger: [protectedRecord],
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive(),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({ status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    const warn = vi.fn();
+    (executor as unknown as { diag: { warn: typeof warn } }).diag = { warn };
+    const plan: SyncPlan = {
+      items: [
+        {
+          type: SyncActionType.Upload,
+          path: "frozen/note.md",
+          local: {
+            path: "frozen/note.md",
+            hash: "aa".repeat(32),
+            size: 3,
+            mtime: 1,
+            binary: false,
+          },
+        },
+        {
+          type: SyncActionType.RenameRemote,
+          path: "elsewhere/note.md",
+          renameFrom: "frozen/note.md",
+          local: {
+            path: "elsewhere/note.md",
+            hash: "aa".repeat(32),
+            size: 3,
+            mtime: 1,
+            binary: false,
+          },
+        },
+        {
+          type: SyncActionType.Upload,
+          path: "other.md",
+          local: {
+            path: "other.md",
+            hash: "bb".repeat(32),
+            size: 3,
+            mtime: 1,
+            binary: false,
+          },
+        },
+      ],
+      lastTotalFiles: 0,
+      confirmed: false,
+      scope: activeScope,
+    };
+    const result: SyncResult = {
+      success: false,
+      uploaded: 0,
+      downloaded: 0,
+      foldersCreated: 0,
+      foldersMoved: 0,
+      foldersDeleted: 0,
+      filesMoved: 0,
+      deleted: 0,
+      conflicts: 0,
+      deferred: 0,
+      skippedLarge: 0,
+      skippedIgnored: 0,
+      errors: 0,
+      authExpired: false,
+      message: "",
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "entered",
+        userFileChanges: "unknown",
+      },
+    };
+
+    (executor as unknown as {
+      deferPlanItemsIntersectingRecovery(
+        plan: SyncPlan,
+        result: SyncResult,
+        records: readonly Readonly<MutationLedgerEntryV1>[],
+      ): void;
+    }).deferPlanItemsIntersectingRecovery(plan, result, [protectedRecord]);
+
+    expect(plan.items.map((item) => item.path)).toEqual(["other.md"]);
+    expect(result.deferred).toBe(2);
+    expect(warn).toHaveBeenCalledWith(
+      "plan",
+      "plan items deferred by protected mutation recovery",
+      expect.objectContaining({
+        deferred: 2,
+        remainingPlanItems: 1,
+        protectedRecords: 1,
+      }),
+    );
+  });
+
   it("recovers an applied unreceipted download without downloading the file again", async () => {
     const content = new Uint8Array([4, 5, 6]).buffer;
     const hash = await sha256Hex(content);

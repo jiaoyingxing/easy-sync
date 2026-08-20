@@ -1,7 +1,7 @@
 {
   "id": "easy-sync",
   "name": "EasySync",
-  "version": "1.3.3",
+  "version": "1.3.4",
   "minAppVersion": "1.11.4",
   "description": "Keep your vault in sync across computers, phones, and tablets with a simple OneDrive setup.",
   "author": "Jiao Yingxing",
