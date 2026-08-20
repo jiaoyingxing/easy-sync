@@ -611,6 +611,89 @@ export class OneDriveClient {
     return resolved;
   }
 
+  /** Read up to 20 vault-relative file paths per Graph JSON batch and return
+   *  presence per path (null = provably absent). Every sub-response is checked
+   *  independently; retryable or malformed sub-responses fall back through the
+   *  ordinary single-item GET contract. */
+  async getFileMetadataByPaths(
+    vaultName: string,
+    filePaths: readonly string[],
+    metadataReason: OneDriveMetadataReason = "other",
+  ): Promise<Map<string, DriveItem | null>> {
+    const uniquePaths = [...new Set(filePaths.filter(Boolean))];
+    const resolved = new Map<string, DriveItem | null>();
+    for (let offset = 0; offset < uniquePaths.length; offset += 20) {
+      const batchPaths = uniquePaths.slice(offset, offset + 20);
+      const response = await this.request(
+        "POST",
+        "/$batch",
+        {
+          requests: batchPaths.map((path, index) => ({
+            id: String(index + 1),
+            method: "GET",
+            url: APP_FOLDER_PATHS.filePath(
+              this.getStorageVaultName(vaultName),
+              path,
+            ),
+          })),
+        },
+        undefined,
+        { metadataReason },
+      );
+      const body = isRecord(response.json) ? response.json : {};
+      const rawSubresponses = Array.isArray(body.responses)
+        ? body.responses
+        : [];
+      const subresponses = new Map(
+        rawSubresponses.filter(isRecord).map((item) => [
+          typeof item.id === "string" ? item.id : "",
+          item as {
+          id?: string;
+          status?: number;
+          headers?: Record<string, string>;
+          body?: unknown;
+          },
+        ]),
+      );
+      for (let index = 0; index < batchPaths.length; index++) {
+        const path = batchPaths[index];
+        const subresponse = subresponses.get(String(index + 1));
+        if (subresponse?.status === 200 && isRecord(subresponse.body)) {
+          resolved.set(path, subresponse.body as unknown as DriveItem);
+          continue;
+        }
+        if (subresponse?.status === 404) {
+          resolved.set(path, null);
+          continue;
+        }
+        if (subresponse?.status === 401 || subresponse?.status === 403) {
+          throw this.classifyError({
+            status: subresponse.status,
+            headers: subresponse.headers ?? {},
+            json: isRecord(subresponse.body) ? subresponse.body : {},
+          } as RequestUrlResponse);
+        }
+        if (
+          subresponse?.status === 429
+          || (typeof subresponse?.status === "number"
+            && [500, 502, 503, 504].includes(subresponse.status))
+        ) {
+          const error = this.classifyError({
+            status: subresponse.status,
+            headers: subresponse.headers ?? {},
+            json: isRecord(subresponse.body) ? subresponse.body : {},
+          } as RequestUrlResponse);
+          await sleepWithAbort(retryDelayMs(error, 1), this.abortSignal);
+        }
+        resolved.set(
+          path,
+          await this.getDriveItemMetadata(vaultName, path),
+        );
+      }
+    }
+    return resolved;
+  }
+
   /** List every direct child of one committed folder identity.
    *  Folder deletion callers use this immediately before DELETE and therefore
    *  must consume every Graph page rather than trusting childCount metadata. */
@@ -2209,6 +2292,14 @@ export class OneDriveClient {
         && error.source === "deadline"
       ) {
         localDeadlineElapsed = true;
+        // Release ownership at the local deadline so the next sync round can
+        // re-dispatch instead of being permanently blocked when the underlying
+        // requestUrl promise never settles. The identity check keeps a newer
+        // owner intact; the late settlement then only logs (its value is never
+        // returned to a later observation).
+        if (this.sharedSyncProtocolRequestsInFlight.get(requestKey) === rawRequest) {
+          this.sharedSyncProtocolRequestsInFlight.delete(requestKey);
+        }
       }
       throw error;
     });

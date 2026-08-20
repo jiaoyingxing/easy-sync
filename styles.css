@@ -368,7 +368,6 @@ body.is-mobile .easy-sync-empty-folder-actions button {
 }
 
 .easy-sync-detail-identical {
-  color: var(--text-success);
   margin-block: var(--size-4-3);
 }
 

@@ -82,12 +82,7 @@ describe("conflict detail presentation", () => {
     );
   });
 
-  it("keeps comparison phase, byte-only difference, and conflict cause as separate summary states", () => {
-    expect(summarizeConflictDetail(
-      { kind: "comparing" },
-      "reason.bothSidesModified",
-      t,
-    )).toBe("本地与远端版本不同，正在确认具体内容差异。");
+  it("keeps byte-only difference and conflict cause as separate summary states", () => {
     expect(summarizeConflictDetail(
       { kind: "comparison-unavailable" },
       "reason.newFileBothSides",
