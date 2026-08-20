@@ -470,7 +470,6 @@ export interface LocaleStrings {
   "conflictDetail.summaryDifferent": string;
   "conflictDetail.summaryBytesDifferentNoLineDiff": string;
   "conflictDetail.remoteComparisonUnavailable": string;
-  "conflictDetail.loading": string;
   "conflictDetail.fetchingRemote": string;
   "conflictDetail.computingDiff": string;
   "conflictDetail.localReadUnavailable": string;

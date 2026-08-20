@@ -1514,17 +1514,14 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     expect(requestSpy).toHaveBeenCalledTimes(2);
   });
 
-  it("bounds a timed-out control-directory request across rounds and never reuses its late result", async () => {
+  it("re-dispatches after a deadlined control-directory request and never reuses its late result", async () => {
     vi.useFakeTimers();
     let resolveLate: ((value: never) => void) | undefined;
     const lateRequest = new Promise<never>((resolve) => {
       resolveLate = resolve;
     });
     const requestSpy = vi.spyOn(obsidian, "requestUrl")
-      .mockImplementationOnce(() => lateRequest)
-      .mockImplementation(() => {
-        throw new Error("duplicate raw request dispatched while the first is pending");
-      });
+      .mockImplementationOnce(() => lateRequest);
     const diag = { log: vi.fn(), warn: vi.fn() };
     const client = new OneDriveClient(async () => "token", diag as never);
 
@@ -1547,17 +1544,18 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     expect(warningText).toContain("HTTP status unavailable");
     expect(warningText).not.toContain("status=0");
 
-    const second = await client.readSharedSyncProtocolObjects("testVault")
-      .then(
-        () => ({ error: null }),
-        (secondError: unknown) => ({ error: secondError }),
-      );
-    expect(second.error).toBeInstanceOf(SyntheticRequestTimeoutError);
-    expect(second.error).toMatchObject({
-      source: "prior-request-in-flight",
-    });
-    expect(requestSpy).toHaveBeenCalledTimes(1);
+    // Ownership is released at the deadline: the next round re-dispatches and
+    // reads a fresh (empty) listing instead of being blocked.
+    requestSpy.mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      json: { value: [] },
+    } as never);
+    await expect(client.readSharedSyncProtocolObjects("testVault"))
+      .resolves.toEqual({ v2: null, v3: null });
+    expect(requestSpy).toHaveBeenCalledTimes(2);
 
+    // The stale late value still only logs; it never feeds the new observation.
     resolveLate?.({
       status: 200,
       headers: {},
@@ -1574,7 +1572,7 @@ describe("OneDriveClient shared V2 sync protocol", () => {
       },
     } as never);
     await vi.advanceTimersByTimeAsync(0);
-    expect(requestSpy).toHaveBeenCalledTimes(1);
+    expect(requestSpy).toHaveBeenCalledTimes(2);
     expect(diag.log).toHaveBeenCalledWith(
       "onedrive",
       "shared protocol request settled after its local deadline",
@@ -1584,6 +1582,24 @@ describe("OneDriveClient shared V2 sync protocol", () => {
         outcome: "fulfilled",
       },
     );
+  });
+
+  it("re-dispatches after a deadlined control-directory request and still records its late rejection", async () => {
+    vi.useFakeTimers();
+    let rejectLate: ((reason: unknown) => void) | undefined;
+    const lateRequest = new Promise<never>((_resolve, reject) => {
+      rejectLate = reject;
+    });
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementationOnce(() => lateRequest);
+    const diag = { log: vi.fn(), warn: vi.fn() };
+    const client = new OneDriveClient(async () => "token", diag as never);
+
+    const first = client.readSharedSyncProtocolObjects("testVault").catch(
+      (error: unknown) => error,
+    );
+    await vi.advanceTimersByTimeAsync(15_000);
+    await expect(first).resolves.toBeInstanceOf(SyntheticRequestTimeoutError);
 
     requestSpy.mockResolvedValueOnce({
       status: 200,
@@ -1593,30 +1609,6 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     await expect(client.readSharedSyncProtocolObjects("testVault"))
       .resolves.toEqual({ v2: null, v3: null });
     expect(requestSpy).toHaveBeenCalledTimes(2);
-  });
-
-  it("clears a timed-out control-directory owner after a handled late rejection", async () => {
-    vi.useFakeTimers();
-    let rejectLate: ((reason: unknown) => void) | undefined;
-    const lateRequest = new Promise<never>((_resolve, reject) => {
-      rejectLate = reject;
-    });
-    const requestSpy = vi.spyOn(obsidian, "requestUrl")
-      .mockImplementationOnce(() => lateRequest)
-      .mockImplementation(() => {
-        throw new Error("duplicate raw request dispatched while the first is pending");
-      });
-    const diag = { log: vi.fn(), warn: vi.fn() };
-    const client = new OneDriveClient(async () => "token", diag as never);
-
-    const first = client.readSharedSyncProtocolObjects("testVault").catch(
-      (error: unknown) => error,
-    );
-    await vi.advanceTimersByTimeAsync(15_000);
-    await expect(first).resolves.toBeInstanceOf(SyntheticRequestTimeoutError);
-    await expect(client.readSharedSyncProtocolObjects("testVault"))
-      .rejects.toBeInstanceOf(SyntheticRequestTimeoutError);
-    expect(requestSpy).toHaveBeenCalledTimes(1);
 
     rejectLate?.(new Error("late transport rejection"));
     await vi.advanceTimersByTimeAsync(0);
@@ -1629,15 +1621,50 @@ describe("OneDriveClient shared V2 sync protocol", () => {
         outcome: "rejected",
       },
     );
+    expect(requestSpy).toHaveBeenCalledTimes(2);
+  });
 
-    requestSpy.mockResolvedValueOnce({
+  it("re-dispatches the next round when a deadlined requestUrl never settles", async () => {
+    vi.useFakeTimers();
+    const neverSettling = new Promise<never>(() => {});
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementationOnce(() => neverSettling)
+      .mockImplementation(() => {
+        throw new Error("duplicate raw request dispatched while the first is pending");
+      });
+    const diag = { log: vi.fn(), warn: vi.fn() };
+    const client = new OneDriveClient(async () => "token", diag as never);
+
+    const first = client.readSharedSyncProtocolObjects("testVault")
+      .then(
+        () => ({ error: null }),
+        (error: unknown) => ({ error }),
+      );
+    await vi.advanceTimersByTimeAsync(15_000);
+    const firstError = (await first).error;
+    expect(firstError).toBeInstanceOf(SyntheticRequestTimeoutError);
+    expect(firstError).toMatchObject({
+      source: "deadline",
+      timeoutMs: 15_000,
+    });
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+
+    // The hung request never settles, but ownership was already released at
+    // the deadline — the next round re-dispatches and recovers without a
+    // client restart.
+    requestSpy.mockImplementationOnce(async () => ({
       status: 200,
       headers: {},
       json: { value: [] },
-    } as never);
+    }) as never);
     await expect(client.readSharedSyncProtocolObjects("testVault"))
       .resolves.toEqual({ v2: null, v3: null });
     expect(requestSpy).toHaveBeenCalledTimes(2);
+    expect(diag.log).not.toHaveBeenCalledWith(
+      "onedrive",
+      "shared protocol request settled after its local deadline",
+      expect.anything(),
+    );
   });
 
   it("bounds a timed-out protocol-body request by slot and requires a fresh body read", async () => {
@@ -1695,11 +1722,8 @@ describe("OneDriveClient shared V2 sync protocol", () => {
         () => ({ error: null }),
         (error: unknown) => ({ error }),
       );
-    expect(second.error).toMatchObject({
-      component: "v2",
-      observationCause: expect.any(SyntheticRequestTimeoutError),
-    });
-    expect(bodyDispatches).toBe(1);
+    expect(second.error).toBeNull();
+    expect(bodyDispatches).toBe(2);
 
     resolveLateBody?.({
       status: 200,
@@ -1726,8 +1750,8 @@ describe("OneDriveClient shared V2 sync protocol", () => {
         },
         v3: null,
       });
-    expect(bodyDispatches).toBe(2);
-    expect(requestSpy).toHaveBeenCalledTimes(5);
+    expect(bodyDispatches).toBe(3);
+    expect(requestSpy).toHaveBeenCalledTimes(6);
   });
 
   it("keeps a native no-response failure distinct from a synthetic local deadline", async () => {

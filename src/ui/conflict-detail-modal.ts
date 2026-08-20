@@ -96,9 +96,10 @@ export class ConflictDetailModal extends FileComparisonModal {
         ? { kind: "comparison-unavailable" }
         : { kind: "reason" });
     };
-    setSummary(this.item.local && this.item.remote
-      ? { kind: "comparing" }
-      : { kind: "reason" });
+    // The comparing phase is not a top-level conclusion: the overview keeps
+    // the plan reason until content evidence arrives, and the comparing
+    // sentence is the middle progress line below.
+    setSummary({ kind: "reason" });
 
     // ---- Metadata table ----
     this.renderMetadata(t);
@@ -107,7 +108,7 @@ export class ConflictDetailModal extends FileComparisonModal {
 
     // ---- Loading indicator ----
     const loadingEl = body.createDiv("easy-sync-detail-loading");
-    loadingEl.setText(t("conflictDetail.loading"));
+    loadingEl.setText(t("conflictDetail.summaryComparing"));
 
     // ---- Content section ----
     const isBinary = this.item.local?.binary;
@@ -151,7 +152,10 @@ export class ConflictDetailModal extends FileComparisonModal {
           loadingEl.setText(t("conflictDetail.computingDiff"));
           const contentComparison = await compareContentBuffers(localRaw, remoteRaw);
           if (contentComparison.status === "equal") {
-            diffHeaderEl.setText(t("conflictDetail.diffTitle"));
+            // The "comparing" summary above is stale once equality is proven:
+            // leave only the identical conclusion, without a diff section.
+            reasonEl.remove();
+            diffHeaderEl.remove();
             body.createDiv("easy-sync-detail-identical").setText(
               t("conflictDetail.identical"),
             );

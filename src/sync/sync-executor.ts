@@ -1213,7 +1213,16 @@ export class SyncExecutor {
     const record = preferredOperationId
       ? records.find((entry) => entry.intent.operationId === preferredOperationId)
       : records[0];
-    if (!record || record.manualResolution || isFolderMutationIntent(record.intent)) {
+    if (!record || isFolderMutationIntent(record.intent)) {
+      return false;
+    }
+    const manual = record.manualResolution;
+    if (
+      manual
+      && (manual.version !== 1 || manual.recoveryEvidence !== undefined)
+    ) {
+      // Whole-bundle settlements and collision-evidence continuations keep
+      // their own review contracts; a stale v1 manual resolution is re-reviewable.
       return false;
     }
     return this.isManualResolutionIntentEligible(record.intent);
@@ -1296,7 +1305,14 @@ export class SyncExecutor {
     const persisted = preferredOperationId
       ? records.find((entry) => entry.intent.operationId === preferredOperationId)
       : records[0];
-    if (!persisted || persisted.manualResolution) return null;
+    if (!persisted) return null;
+    if (
+      persisted.manualResolution
+      && (
+        persisted.manualResolution.version !== 1
+        || persisted.manualResolution.recoveryEvidence !== undefined
+      )
+    ) return null;
     const record = this.state.prepareMutationRecoveryRecord(persisted, scope);
     if (!record || isFolderMutationIntent(record.intent)) return null;
     return this.buildCurrentMutationRecoveryResolutionSnapshot(record);
@@ -1432,7 +1448,19 @@ export class SyncExecutor {
         const persisted = this.state.mutationLedger.find(
           (entry) => entry.intent.operationId === reviewed.sourceOperationId,
         );
-        if (!persisted || persisted.manualResolution) return;
+        if (!persisted) return;
+        const staleManual = persisted.manualResolution;
+        if (
+          staleManual
+          && (
+            staleManual.version !== 1
+            || staleManual.recoveryEvidence !== undefined
+          )
+        ) {
+          // Whole-bundle settlements and collision-evidence continuations are
+          // not replaceable through the ordinary re-review flow.
+          return;
+        }
         const record = this.activeSyncScope
           ? this.state.prepareMutationRecoveryRecord(persisted, this.activeSyncScope)
           : null;
@@ -1455,7 +1483,16 @@ export class SyncExecutor {
           choice,
         );
         if (!resolution) return;
-        if (!await this.state.attachManualMutationResolution(persisted, resolution)) {
+        const didAttach = staleManual
+          ? await this.state.replaceManualMutationResolution(
+              persisted,
+              resolution,
+            )
+          : await this.state.attachManualMutationResolution(
+              persisted,
+              resolution,
+            );
+        if (!didAttach) {
           this.notice("notice.mutationResolution.changed", { path: reviewed.path });
           return;
         }
@@ -12443,6 +12480,38 @@ export class SyncExecutor {
         });
         continue;
       }
+      // A same-path delete-recreate can replace the remote object with an
+      // identical one under a new Graph identity. With complete evidence this
+      // settles as a state-only anchor rebind before any other recovery rule
+      // replays or blocks the record. It performs no Vault or Graph mutation,
+      // so it also runs during reset observation-only rounds.
+      try {
+        if (await this.trySettleReplacedIdentityUpload(
+          persistedRecord,
+          record,
+          operationEpoch,
+        )) {
+          settled++;
+          continue;
+        }
+      } catch (error) {
+        if (this.cancelled) throw error;
+        const retryable = isRetryableMutationRecoveryObservationError(error);
+        blocked.push({
+          operationId: record.intent.operationId,
+          reason: retryable
+            ? "observation-unavailable"
+            : "outcome-unresolved",
+          error: error instanceof Error ? error : new Error(String(error)),
+          retryable,
+        });
+        blockedRecords.push({
+          record,
+          footprint: currentFootprint,
+          retryable,
+        });
+        continue;
+      }
       const isAutomaticMerge = record.intent.action === "merge";
       if (isAutomaticMerge && mergeRecovery) mergeRecovery.records++;
       if (record.manualResolution) {
@@ -12901,6 +12970,136 @@ export class SyncExecutor {
     };
   }
 
+  /**
+   * Recover one stuck upload whose remote object was replaced by an
+   * identical object under a new Graph identity (same-path delete-recreate).
+   * Every precondition must hold at decision time:
+   * - the local file still matches the original intent exactly;
+   * - the current remote object at the path is content-identical;
+   * - the old identity is provably gone by exact id;
+   * - no other ledger record or pending delete depends on the path;
+   * - the envelope anchor is ready for an equal-read rebind (or already
+   *   carries the rebind lineage from an interrupted publication).
+   * The settle is state-only: the equal-read controller CAS remains the
+   * final arbiter and any incomplete fact returns false, leaving the record
+   * on its existing recovery path.
+   */
+  private async trySettleReplacedIdentityUpload(
+    persistedRecord: Readonly<MutationLedgerEntryV1>,
+    record: Readonly<MutationLedgerEntryV1>,
+    operationEpoch: number | undefined,
+  ): Promise<boolean> {
+    const intent = record.intent;
+    if (isFolderMutationIntent(intent) || intent.version !== 1) {
+      return false;
+    }
+    const fileIntent: MutationIntentV1 = intent;
+    // Evaluated as a plain boolean before the guard chain: this helper is a
+    // type predicate and aliased-predicate narrowing would exclude every
+    // remaining type when the alias appears negated in the chain.
+    const settlesPluginData: boolean =
+      this.isPersistedPluginDataDownloadSettlement(fileIntent);
+    if (
+      fileIntent.action !== "upload"
+      || fileIntent.sourcePath !== undefined
+      || fileIntent.stateEffect !== undefined
+      || !fileIntent.expectedLocal.exists
+      || !fileIntent.expectedRemote.exists
+      || !this.isManualResolutionIntentEligible(fileIntent)
+      || this.isPersistedSelectedPluginCodeUploadRecovery(fileIntent)
+      || settlesPluginData
+    ) return false;
+    if (operationEpoch !== undefined && !this.canContinue(operationEpoch)) {
+      throw new Error(`Mutation recovery was cancelled: ${fileIntent.operationId}`);
+    }
+    const local = await this.inspectLocalPathForMutation(
+      fileIntent.path,
+      fileIntent,
+    );
+    if (!local || local.status !== "present" || !local.entry) return false;
+    if (
+      local.entry.hash !== fileIntent.expectedLocal.hash
+      || local.entry.size !== fileIntent.expectedLocal.size
+    ) return false;
+    const current = await this.inspectRemotePath(fileIntent.path);
+    if (!current) return false;
+    const oldRemoteId = fileIntent.expectedRemote.driveId;
+    if (current.driveId === oldRemoteId) return false;
+    if (!await this.remoteMatchesTarget(
+      current,
+      { hash: local.entry.hash, size: local.entry.size },
+    )) return false;
+    if (await this.onedrive.getDriveItemMetadataById(oldRemoteId) !== null) {
+      return false;
+    }
+    if (this.state.mutationLedger.some((entry) =>
+      entry.intent.operationId !== fileIntent.operationId
+      && mutationRecoveryIntentsOverlap(entry.intent, fileIntent),
+    )) return false;
+    if (this.state.pendingRemoteDeletes.some((item) =>
+      item.path === fileIntent.path
+      && item.decisionToken?.remote.exists === true
+      && item.decisionToken.remote.driveId !== oldRemoteId,
+    )) return false;
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!envelope) return false;
+    const anchors = Object.values(envelope.anchors.byAnchorId);
+    const pathAnchor = anchors.find((anchor) =>
+      anchor.lastPath === fileIntent.path
+      && (
+        anchor.remoteId === oldRemoteId
+        || (
+          anchor.remoteId === current.driveId
+          && anchor.remoteIdentityLineage?.some((entry) =>
+            entry.fromRemoteId === oldRemoteId
+            && entry.toRemoteId === current.driveId)
+        )
+      ));
+    if (!pathAnchor) return false;
+    const foreignAnchor = anchors.find((anchor) =>
+      anchor.remoteId === current.driveId
+      && anchor.lastPath !== fileIntent.path);
+    if (foreignAnchor) {
+      this.diag?.warn(
+        "execute",
+        "replaced-identity upload rebind blocked by an anchor at another path",
+        {
+          operationId: fileIntent.operationId,
+          path: fileIntent.path,
+          fromRemoteId: oldRemoteId,
+          toRemoteId: current.driveId,
+          foreignAnchorPath: foreignAnchor.lastPath,
+          mutations: 0,
+        },
+      );
+      return false;
+    }
+    const settled = await this.state.settleReplacedIdentityUploadResolved({
+      expectedRecord: persistedRecord,
+      entry: {
+        path: fileIntent.path,
+        hash: local.entry.hash,
+        size: local.entry.size,
+        eTag: current.eTag,
+      },
+      oldRemoteId,
+    });
+    if (settled) {
+      this.diag?.log(
+        "execute",
+        "state-only identity rebind settled replaced-identity upload",
+        {
+          operationId: fileIntent.operationId,
+          path: fileIntent.path,
+          fromRemoteId: oldRemoteId,
+          toRemoteId: current.driveId,
+          mutations: 0,
+        },
+      );
+    }
+    return settled;
+  }
+
   private committedDeleteLocalRemoteId(
     intent: Readonly<MutationIntentV1>,
   ): string | null {
@@ -13333,10 +13532,17 @@ export class SyncExecutor {
         if (!sourceLocal || sourceLocal.status !== "missing" || sourceRemote) return null;
       }
       const current = await this.inspectRemotePath(intent.path);
+      if (!current) return null;
       if (
-        !current
-        || !await this.remoteMatchesTarget(current, intent.expectedLocal)
+        intent.expectedRemote.exists
+        && current.driveId !== intent.expectedRemote.driveId
+        && await this.onedrive.getDriveItemMetadataById(
+          intent.expectedRemote.driveId,
+        ) !== null
       ) return null;
+      if (!await this.remoteMatchesTarget(current, intent.expectedLocal)) {
+        return null;
+      }
       checkpoint.baseUpserts.push(StateManager.toBaseEntry(local.entry, current));
       checkpoint.remoteUpserts.push(current);
       if (intent.sourcePath) {
@@ -18995,11 +19201,65 @@ export class SyncExecutor {
       }
       return leftPath.localeCompare(rightPath);
     });
-    await Promise.all(uniquePaths.map((path) => this.confirmRemoteDelete(path, false)));
+    const filePaths = uniquePaths.filter(
+      (path) => !pendingByPath.get(path)?.folder,
+    );
+    const folderPaths = uniquePaths.filter((path) =>
+      Boolean(pendingByPath.get(path)?.folder),
+    );
+    // One batched absence read covers the whole file batch; each item then
+    // skips its per-item remote re-check. Read failures degrade to an empty
+    // set so every item still verifies individually.
+    const preverifiedAbsent = filePaths.length === 0
+      ? new Set<string>()
+      : await this.verifyRemoteDeleteBatchAbsence(filePaths);
+    await Promise.all([
+      ...filePaths.map((path) =>
+        this.confirmRemoteDelete(path, false, {
+          preverifiedAbsent: preverifiedAbsent.has(path),
+        })),
+      ...folderPaths.map((path) => this.confirmRemoteDelete(path, false)),
+    ]);
+  }
+
+  /**
+   * One batched remote-absence read for a whole confirmed-delete batch.
+   * Returns the subset of paths proven absent; any read failure degrades to
+   * an empty set so each item re-verifies through its ordinary per-item guard.
+   */
+  private async verifyRemoteDeleteBatchAbsence(
+    paths: readonly string[],
+  ): Promise<Set<string>> {
+    try {
+      const byPath = await this.onedrive.getFileMetadataByPaths(
+        this.vaultName,
+        paths,
+      );
+      const absent = new Set<string>();
+      for (const path of paths) {
+        if (byPath.get(path) === null) absent.add(path);
+      }
+      return absent;
+    } catch (error) {
+      this.diag?.warn(
+        "execute",
+        "batch remote-delete absence verification unavailable — per-item checks continue",
+        {
+          reason: error instanceof Error ? error.message : String(error),
+          count: paths.length,
+          mutations: 0,
+        },
+      );
+      return new Set();
+    }
   }
 
   /** Confirm a remote delete: delete local file */
-  async confirmRemoteDelete(path: string, showSuccessNotice = true): Promise<void> {
+  async confirmRemoteDelete(
+    path: string,
+    showSuccessNotice = true,
+    options?: { preverifiedAbsent?: boolean },
+  ): Promise<void> {
     if (this.stopSideActionForStateRecovery()) return;
     const initialPending = this.state.pendingRemoteDeletes.find((item) => item.path === path);
     if (await this.expireOutOfScopeDeleteDecision(
@@ -19096,7 +19356,14 @@ export class SyncExecutor {
         }
         if (!this.guardDecisionToken(pending, "notice.delete.failed")) return;
         if (!await this.guardReviewedLocalVersion(path, pending.local, "notice.delete.failed")) return;
-        if (!await this.guardReviewedRemoteVersion(pending, "notice.delete.failed", "delete")) return;
+        if (
+          options?.preverifiedAbsent !== true
+          && !await this.guardReviewedRemoteVersion(
+            pending,
+            "notice.delete.failed",
+            "delete",
+          )
+        ) return;
         if (!this.canContinue(operationEpoch)) return;
         const intent = this.createSideMutationIntent(pending, "deleteLocal");
         const committed = await this.runDurableSideMutation(intent, operationEpoch, async () => {
@@ -19560,7 +19827,7 @@ function driveItemMatchesStaleIdentityFact(
 
 function collectCorruptSourceAncestorHashes(rawEnvelope: string): string[] {
   try {
-    const raw = JSON.parse(rawEnvelope);
+    const raw: unknown = JSON.parse(rawEnvelope);
     if (!isRecord(raw) || !isRecord(raw.anchors)) return [];
     const byAnchorId = raw.anchors.byAnchorId;
     if (!isRecord(byAnchorId)) return [];

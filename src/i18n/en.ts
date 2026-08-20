@@ -466,7 +466,6 @@ const en: LocaleStrings = {
   "conflictDetail.summaryDifferent": "The local and remote content differs.",
   "conflictDetail.summaryBytesDifferentNoLineDiff": "The local and remote file bytes differ, but there is no displayable line-level difference.",
   "conflictDetail.remoteComparisonUnavailable": "The remote content could not be fetched or compared. Showing the local version only.",
-  "conflictDetail.loading": "Loading…",
   "conflictDetail.fetchingRemote": "Fetching remote content…",
   "conflictDetail.computingDiff": "Computing diff…",
   "conflictDetail.localReadUnavailable": "The local file could not be read, so its content cannot be compared right now.",

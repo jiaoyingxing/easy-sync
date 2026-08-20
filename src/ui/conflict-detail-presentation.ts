@@ -17,7 +17,6 @@ type Translate = (
 ) => string;
 
 export type ConflictDetailSummaryEvidence =
-  | { kind: "comparing" }
   | { kind: "comparison-unavailable" }
   | { kind: "reason" }
   | { kind: "content-different" }
@@ -51,9 +50,6 @@ export function summarizeConflictDetail(
   reason: string | undefined,
   t: Translate,
 ): string {
-  if (evidence.kind === "comparing") {
-    return t("conflictDetail.summaryComparing");
-  }
   if (evidence.kind === "comparison-unavailable") {
     return t("conflictDetail.summaryComparisonUnavailable");
   }

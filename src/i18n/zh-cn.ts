@@ -465,7 +465,6 @@ const zhCN: LocaleStrings = {
   "conflictDetail.summaryDifferent": "本地与远端内容不同。",
   "conflictDetail.summaryBytesDifferentNoLineDiff": "本地与远端文件字节不同，但没有可显示的逐行差异。",
   "conflictDetail.remoteComparisonUnavailable": "未能获取或比较远端内容，仅显示本地版本。",
-  "conflictDetail.loading": "加载中…",
   "conflictDetail.fetchingRemote": "正在获取远端内容…",
   "conflictDetail.computingDiff": "正在计算差异…",
   "conflictDetail.localReadUnavailable": "未能读取本地文件，暂时无法比较内容。",

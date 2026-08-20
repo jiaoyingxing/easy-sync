@@ -3771,6 +3771,56 @@ export class StateManager {
     return attached;
   }
 
+  /**
+   * Replace one stale reviewed continuation with a fresh current-facts-bound
+   * decision. The whole record, including its previous manual resolution, must
+   * still be byte-identical to the reviewed expectation; otherwise the ledger
+   * is left untouched. Whole-bundle settlements (version 2) are not accepted
+   * here — they keep their own continuation contract.
+   */
+  async replaceManualMutationResolution(
+    expectedRecord: Readonly<MutationLedgerEntryV1>,
+    resolution: Readonly<ManualMutationResolutionV1>,
+  ): Promise<boolean> {
+    if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
+      throw new Error("Manual mutation replacement requires active V2 authority");
+    }
+    if (
+      this.mutationLedgerCorrupt
+      || !isManualMutationResolution(
+        resolution,
+        expectedRecord.intent,
+        expectedRecord.receipt,
+      )
+      || !sameSyncScope(resolution.intent.scope, this.v2Envelope.scope)
+      || resolution.intent.operationId === expectedRecord.intent.operationId
+      || resolution.recoveryEvidence !== undefined
+    ) {
+      throw new Error("Manual mutation replacement evidence is invalid");
+    }
+    let replaced = false;
+    await this.commitPluginData((current) => {
+      const index = findUniqueMutationLedgerRecordIndex(
+        current[KEY_MUTATION_LEDGER],
+        expectedRecord.intent.operationId,
+      );
+      if (index < 0) return current;
+      const active = current[KEY_MUTATION_LEDGER][index];
+      if (
+        !active.manualResolution
+        || JSON.stringify(active) !== JSON.stringify(expectedRecord)
+      ) return current;
+      const entries = [...current[KEY_MUTATION_LEDGER]];
+      entries[index] = {
+        ...active,
+        manualResolution: structuredClone(resolution),
+      };
+      replaced = true;
+      return { ...current, [KEY_MUTATION_LEDGER]: entries };
+    });
+    return replaced;
+  }
+
   async recordManualMutationResolutionReceipt(
     sourceOperationId: string,
     receipt: Readonly<MutationReceiptV1>,
@@ -3902,6 +3952,73 @@ export class StateManager {
         ].slice(-20),
       };
     });
+  }
+
+  /**
+   * Settle one stuck upload whose remote object was replaced by an identical
+   * object under a new Graph identity. State-only: the envelope anchor is
+   * rebound through the equal-read controller (identity lineage advance,
+   * stable anchorId, eTag/path-collision CAS) and the exact ledger record is
+   * retired with its stale pending delete in the same commit. No Vault or
+   * Graph mutation is performed. A record changed since review returns false
+   * and leaves the envelope publication in place for the next recovery round.
+   */
+  async settleReplacedIdentityUploadResolved(input: {
+    expectedRecord: Readonly<MutationLedgerEntryV1>;
+    entry: BaseFileEntry;
+    oldRemoteId: string;
+  }): Promise<boolean> {
+    if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
+      throw new Error("Replaced-identity rebind requires active V2 authority");
+    }
+    if (this.mutationLedgerCorrupt) {
+      throw new Error("Mutation recovery ledger is corrupt");
+    }
+    await this.commitV2State((current) =>
+      upsertBaseStateEnvelopeV2(current, [input.entry]));
+    const operationId = input.expectedRecord.intent.operationId;
+    const audit: ManualMutationResolutionAuditV1 = {
+      version: 1,
+      sourceOperationId: operationId,
+      resolutionOperationId: `${operationId}-identical-rebind`,
+      path: input.entry.path,
+      choice: "keep-local",
+      action: "upload",
+      externalMutation: false,
+      selectedAt: Date.now(),
+      completedAt: Date.now(),
+    };
+    let retired = false;
+    await this.commitPluginData((current) => {
+      const index = findUniqueMutationLedgerRecordIndex(
+        current[KEY_MUTATION_LEDGER],
+        operationId,
+      );
+      if (index < 0) return current;
+      if (JSON.stringify(current[KEY_MUTATION_LEDGER][index])
+        !== JSON.stringify(input.expectedRecord)) return current;
+      retired = true;
+      return {
+        ...current,
+        [KEY_MUTATION_LEDGER]: current[KEY_MUTATION_LEDGER].filter(
+          (_entry, entryIndex) => entryIndex !== index,
+        ),
+        [KEY_PENDING_DELETES]: current[KEY_PENDING_DELETES].filter(
+          (item) => !(
+            item.path === input.entry.path
+            && item.decisionToken?.remote.exists === true
+            && item.decisionToken.remote.driveId === input.oldRemoteId
+          ),
+        ),
+        [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]: [
+          ...current[KEY_MANUAL_MUTATION_RESOLUTION_AUDIT].filter(
+            (entry) => entry.resolutionOperationId !== audit.resolutionOperationId,
+          ),
+          audit,
+        ].slice(-20),
+      };
+    });
+    return retired;
   }
 
   async recordMutationReceipt(receipt: MutationReceiptV1): Promise<void> {

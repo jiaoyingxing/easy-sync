@@ -50,6 +50,7 @@ import {
   replaceBaseStateEnvelopeV2,
   upsertBaseStateEnvelopeV2,
 } from "../src/sync/file-state-controller-v2";
+import type { SyncAnchorV2 } from "../src/sync/state-envelope-v2";
 import { createFileStateShadowEnvelopeV2 } from "./helpers/file-state-shadow-v2";
 import {
   makePublic113InterruptedUploadBatch,
@@ -117,6 +118,7 @@ function makeMockOneDrive(overrides: Record<string, unknown> = {}) {
     resetDownloadStrategy: vi.fn(),
     setAbortSignal: vi.fn(),
     getFileMetadata: vi.fn().mockResolvedValue(null),
+    getFileMetadataByPaths: vi.fn().mockResolvedValue(new Map()),
     getDriveItemMetadataById: vi.fn().mockResolvedValue(null),
     getDelta: vi.fn().mockResolvedValue({ value: [], "@odata.deltaLink": "tok" }),
     fullScan: vi.fn().mockResolvedValue([]),
@@ -189,6 +191,34 @@ function makeActiveV2State(
     schemaVersion: 2,
     byAnchorId: {},
   };
+  if (Array.isArray(overrides.staleFileAnchors)) {
+    // Test-only device-state modeling: a committed anchor may keep a Graph id
+    // that the current remote index no longer maps to the same path (a
+    // same-path delete-recreate replaced the object identity).
+    const staleByPath = new Map(
+      (overrides.staleFileAnchors as Array<{
+        path: string;
+        remoteId: string;
+        eTag?: string;
+      }>).map((entry) => [entry.path, entry]),
+    );
+    const rebound: Record<string, SyncAnchorV2> = {};
+    for (const anchor of Object.values(envelope.anchors.byAnchorId)) {
+      const stale = staleByPath.get(anchor.lastPath);
+      const nextAnchor = stale
+        ? {
+            ...anchor,
+            anchorId: `shadow:${stale.remoteId}`,
+            remoteId: stale.remoteId,
+            ...(stale.eTag !== undefined
+              ? { remoteETag: stale.eTag }
+              : {}),
+          }
+        : anchor;
+      rebound[nextAnchor.anchorId] = nextAnchor;
+    }
+    envelope.anchors.byAnchorId = rebound;
+  }
 
   const state = {
     ...remoteStateStub(),
@@ -398,6 +428,40 @@ function makeActiveV2State(
     );
     if (index >= 0) state.mutationLedger.splice(index, 1);
   });
+  state.settleReplacedIdentityUploadResolved = vi.fn(async (input: {
+    expectedRecord: MutationLedgerEntryV1;
+    entry: BaseFileEntry;
+    oldRemoteId: string;
+  }) => {
+    const index = state.mutationLedger.findIndex(
+      (record) => record.intent.operationId
+        === input.expectedRecord.intent.operationId,
+    );
+    if (index < 0) return false;
+    if (JSON.stringify(state.mutationLedger[index])
+      !== JSON.stringify(input.expectedRecord)) {
+      return false;
+    }
+    const current = envelope;
+    envelope = upsertBaseStateEnvelopeV2(
+      current,
+      [input.entry],
+      committedAt + 1,
+    );
+    commitSeq = envelope.meta.commitSeq;
+    committedAt = envelope.meta.committedAt;
+    baseSnapshot = [
+      ...baseSnapshot.filter((entry) => entry.path !== input.entry.path),
+      { ...input.entry },
+    ].sort((left, right) => left.path.localeCompare(right.path));
+    state.baseSnapshot = baseSnapshot;
+    state.mutationLedger.splice(index, 1);
+    state.pendingRemoteDeletes = state.pendingRemoteDeletes.filter((item) =>
+      !(item.path === input.entry.path
+        && item.decisionToken?.remote.exists === true
+        && item.decisionToken.remote.driveId === input.oldRemoteId));
+    return true;
+  });
   state.retireUnreceiptedMutationIntentsForScopeExit = vi.fn(async (
     expectedRecords: MutationLedgerEntryV1[],
   ) => {
@@ -485,6 +549,21 @@ function makeActiveV2State(
     if (
       !record
       || record.manualResolution
+      || JSON.stringify(record) !== JSON.stringify(expectedRecord)
+    ) return false;
+    record.manualResolution = structuredClone(resolution);
+    return true;
+  });
+  state.replaceManualMutationResolution = vi.fn(async (
+    expectedRecord: MutationLedgerEntryV1,
+    resolution: ManualMutationResolutionV1,
+  ) => {
+    const record = state.mutationLedger.find(
+      (candidate) => candidate.intent.operationId === expectedRecord.intent.operationId,
+    ) as MutationLedgerEntryV1 | undefined;
+    if (
+      !record
+      || !record.manualResolution
       || JSON.stringify(record) !== JSON.stringify(expectedRecord)
     ) return false;
     record.manualResolution = structuredClone(resolution);
@@ -3606,6 +3685,128 @@ describe("Persistent remote delta state", () => {
       uploadFile,
     };
   }
+
+  it("reopens review for a stale manual resolution and replaces it with a fresh choice", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "stale-review.md",
+      local: { "stale-review.md": "local" },
+      remote: { "stale-review.md": "cloud" },
+    });
+    const blocked = harness.state.mutationLedger[0] as MutationLedgerEntryV1;
+    blocked.manualResolution = {
+      version: 1,
+      choice: "keep-local",
+      factsDigest: "stale-digest",
+      selectedAt: 1,
+      externalMutation: false,
+      intent: {
+        ...(blocked.intent as MutationIntentV1),
+        operationId: "stale-manual",
+      },
+      receipt: null,
+    };
+
+    expect(harness.executor.canResolveMutationRecovery("blocked-operation"))
+      .toBe(true);
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot(
+      "blocked-operation",
+    );
+    expect(reviewed).not.toBeNull();
+    expect(reviewed!.identical).toBe(false);
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(true);
+    expect(harness.state.replaceManualMutationResolution)
+      .toHaveBeenCalledTimes(1);
+    expect(harness.uploadFile).toHaveBeenCalledOnce();
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("keeps whole-bundle and collision-evidence resolutions out of the re-review gate", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "gated.md",
+      local: { "gated.md": "local" },
+      remote: { "gated.md": "cloud" },
+    });
+    const blocked = harness.state.mutationLedger[0] as MutationLedgerEntryV1;
+    const baseIntent = blocked.intent as MutationIntentV1;
+    blocked.manualResolution = {
+      version: 2,
+      kind: "community-plugin-bundle-settlement",
+      choice: "keep-local",
+      factsDigest: "bundle-digest",
+      selectedAt: 1,
+      externalMutation: true,
+      intent: { ...baseIntent, operationId: "bundle-manual" },
+      receipt: null,
+      pluginId: "some-plugin",
+      pluginRoot: ".obsidian/plugins/some-plugin",
+      predecessorOperationIds: [],
+      conflictDecisions: [],
+      members: [],
+    };
+    expect(harness.executor.canResolveMutationRecovery("blocked-operation"))
+      .toBe(false);
+    expect(await harness.executor.getMutationRecoveryResolutionSnapshot(
+      "blocked-operation",
+    )).toBeNull();
+
+    blocked.manualResolution = {
+      version: 1,
+      choice: "keep-local",
+      factsDigest: "collision-digest",
+      selectedAt: 2,
+      externalMutation: false,
+      recoveryEvidence: {
+        kind: "receipted-rename-target-anchor-collision",
+        lifecycleEpoch: 1,
+        sourceCommitSeq: 1,
+        sourceAnchorId: "a",
+        targetAnchorId: "b",
+        staleRemoteIds: ["stale"],
+      },
+      intent: { ...baseIntent, operationId: "collision-manual" },
+      receipt: null,
+    };
+    expect(harness.executor.canResolveMutationRecovery("blocked-operation"))
+      .toBe(false);
+    expect(await harness.executor.getMutationRecoveryResolutionSnapshot(
+      "blocked-operation",
+    )).toBeNull();
+  });
+
+  it("keeps the stale resolution when the record changed before replacement", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "raced-replace.md",
+      local: { "raced-replace.md": "local" },
+      remote: { "raced-replace.md": "cloud" },
+    });
+    const blocked = harness.state.mutationLedger[0] as MutationLedgerEntryV1;
+    blocked.manualResolution = {
+      version: 1,
+      choice: "keep-local",
+      factsDigest: "stale-digest",
+      selectedAt: 1,
+      externalMutation: false,
+      intent: {
+        ...(blocked.intent as MutationIntentV1),
+        operationId: "stale-manual",
+      },
+      receipt: null,
+    };
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot(
+      "blocked-operation",
+    );
+    vi.mocked(harness.state.replaceManualMutationResolution)
+      .mockResolvedValueOnce(false);
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-local"))
+      .toBe(false);
+    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect((harness.state.mutationLedger[0] as MutationLedgerEntryV1)
+      .manualResolution).toMatchObject({ factsDigest: "stale-digest" });
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+  });
 
   it("resolves a facts-changed record by keeping the exact current local file", async () => {
     const harness = await makeManualResolutionHarness({
@@ -15233,5 +15434,611 @@ describe("S1a — sync run phase observability", () => {
           healthTimeCommitsPerRun: setLastSyncTime.mock.calls.length / 10,
         },
       }));
+  });
+});
+
+describe("replaced-identity upload state-only rebind", () => {
+  interface ReplacedIdentityUploadInput {
+    path?: string;
+    localContent?: string;
+    remoteContent?: string;
+    withStaleReceipt?: boolean;
+    withStaleManualResolution?: boolean;
+    oldIdentityPresentAtPath?: string;
+    pendingDeleteDriveId?: string | null;
+    staleFileAnchors?: Array<{ path: string; remoteId: string; eTag?: string }>;
+    extraBasePaths?: string[];
+    dependentFolderAtRoot?: boolean;
+  }
+
+  async function makeReplacedIdentityUploadHarness(
+    input: ReplacedIdentityUploadInput = {},
+  ) {
+    const path = input.path ?? "note.md";
+    const localContent = input.localContent ?? "local";
+    const remoteContent = input.remoteContent ?? localContent;
+    const encoder = new TextEncoder();
+    const localBytes = encoder.encode(localContent).buffer;
+    const remoteBytes = encoder.encode(remoteContent).buffer;
+    const localHash = await sha256Hex(localBytes);
+    const remoteHash = await sha256Hex(remoteBytes);
+    const oldRemoteId = "old-id";
+    const newRemoteId = "new-id";
+    const scope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+
+    const localBytesByPath = new Map<string, ArrayBuffer>([[path, localBytes]]);
+    const adapter = makeMockAdapter({
+      exists: vi.fn(async (candidate: string) =>
+        localBytesByPath.has(candidate)),
+      stat: vi.fn(async (candidate: string) => {
+        const bytes = localBytesByPath.get(candidate);
+        return bytes
+          ? { type: "file", size: bytes.byteLength, mtime: 1, ctime: 1 }
+          : null;
+      }),
+      readBinary: vi.fn(async (candidate: string) => {
+        const bytes = localBytesByPath.get(candidate);
+        if (!bytes) throw new Error(`missing local: ${candidate}`);
+        return bytes.slice(0);
+      }),
+    });
+
+    const remoteFiles = new Map<string, {
+      entry: RemoteFileEntry;
+      bytes: ArrayBuffer;
+    }>();
+    remoteFiles.set(path, {
+      entry: {
+        path,
+        driveId: newRemoteId,
+        parentId: scope.filesRootId,
+        size: remoteBytes.byteLength,
+        mtime: 2,
+        eTag: "etag-new",
+        cTag: "ctag-new",
+        sha256Hash: remoteHash,
+      },
+      bytes: remoteBytes,
+    });
+    if (input.oldIdentityPresentAtPath) {
+      remoteFiles.set(input.oldIdentityPresentAtPath, {
+        entry: {
+          path: input.oldIdentityPresentAtPath,
+          driveId: oldRemoteId,
+          parentId: scope.filesRootId,
+          size: remoteBytes.byteLength,
+          mtime: 1,
+          eTag: "etag-old",
+          cTag: "ctag-old",
+          sha256Hash: remoteHash,
+        },
+        bytes: remoteBytes,
+      });
+    }
+
+    const committedRemoteEntries = [...remoteFiles.values()]
+      .map((item) => item.entry);
+    const committedBaseEntries: BaseFileEntry[] = [{
+      path,
+      hash: localHash,
+      size: localBytes.byteLength,
+      eTag: "etag-old",
+    }];
+    for (const extra of input.extraBasePaths ?? []) {
+      committedBaseEntries.push({
+        path: extra,
+        hash: "f".repeat(64),
+        size: 1,
+        eTag: "etag-extra",
+      });
+    }
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "blocked-operation",
+      planRevision: 1,
+      scope,
+      action: "upload",
+      path,
+      expectedLocal: {
+        exists: true,
+        hash: localHash,
+        size: localBytes.byteLength,
+      },
+      expectedRemote: {
+        exists: true,
+        driveId: oldRemoteId,
+        eTag: "etag-old",
+        size: localBytes.byteLength,
+        sha256Hash: localHash,
+      },
+      createdAt: 1,
+    };
+    const staleReceipt: MutationReceiptV1 = {
+      version: 1,
+      operationId: intent.operationId,
+      completedAt: 2,
+      checkpoint: {
+        baseUpserts: [{
+          path,
+          hash: localHash,
+          size: localBytes.byteLength,
+          eTag: "etag-old",
+        }],
+        baseRemovals: [],
+        remoteUpserts: [{
+          path,
+          driveId: oldRemoteId,
+          parentId: scope.filesRootId,
+          size: localBytes.byteLength,
+          mtime: 1,
+          eTag: "etag-old",
+          cTag: "ctag-old",
+          sha256Hash: localHash,
+        }],
+        remoteDeletes: [],
+        pendingConflictRemovals: [],
+        pendingDeleteRemovals: [],
+      },
+    };
+    const staleManualResolution: ManualMutationResolutionV1 = {
+      version: 1,
+      choice: "keep-local",
+      factsDigest: "stale-digest",
+      selectedAt: 3,
+      externalMutation: false,
+      intent: { ...intent, operationId: "blocked-operation-manual" },
+      receipt: null,
+    };
+    const ledger: MutationLedgerEntryV1[] = [{
+      intent,
+      receipt: input.withStaleReceipt ? staleReceipt : null,
+      ...(input.withStaleManualResolution
+        ? { manualResolution: staleManualResolution }
+        : {}),
+    }];
+    if (input.dependentFolderAtRoot) {
+      ledger.push({
+        intent: {
+          version: 2,
+          operationId: "dependent-folder",
+          planRevision: 1,
+          scope,
+          action: "deleteLocalFolder",
+          path,
+          folderId: "folder-dep",
+          expectedLocal: { exists: false },
+          expectedRemote: { exists: false },
+          expectedParent: { driveId: scope.filesRootId, path: "" },
+          createdAt: 1,
+        },
+        receipt: null,
+      });
+    }
+
+    const pendingRemoteDeletes: SyncPlanItem[] = [];
+    if (input.pendingDeleteDriveId !== null) {
+      const tokenRemoteId = input.pendingDeleteDriveId ?? oldRemoteId;
+      pendingRemoteDeletes.push({
+        type: SyncActionType.DeleteRemote,
+        path,
+        decisionToken: {
+          version: 1,
+          vaultName: "testVault",
+          accountId: scope.accountId,
+          scope,
+          local: { exists: false },
+          remote: {
+            exists: true,
+            driveId: tokenRemoteId,
+            eTag: "etag-any",
+          },
+          ancestorHash: null,
+        },
+      } as unknown as SyncPlanItem);
+    }
+
+    const state = makeActiveV2State(
+      committedRemoteEntries,
+      committedBaseEntries,
+      {
+        mutationLedger: ledger,
+        pendingRemoteDeletes,
+        staleFileAnchors: input.staleFileAnchors ?? [{
+          path,
+          remoteId: oldRemoteId,
+          eTag: "etag-old",
+        }],
+      },
+    );
+    const getDriveItemMetadataById = vi.fn(async (driveId: string) => {
+      const found = [...remoteFiles.values()].find(
+        (current) => current.entry.driveId === driveId,
+      );
+      return found ? { id: driveId, eTag: found.entry.eTag } : null;
+    });
+    const downloadFile = vi.fn(async (_vault: string, candidate: string) => {
+      const current = remoteFiles.get(candidate);
+      if (!current) throw new Error(`missing remote: ${candidate}`);
+      return current.bytes.slice(0);
+    });
+    const onedrive = makeMockOneDrive({
+      getFileMetadata: vi.fn(async (_vault: string, candidate: string) => {
+        const current = remoteFiles.get(candidate);
+        return current ? {
+          eTag: current.entry.eTag,
+          cTag: current.entry.cTag,
+          size: current.entry.size,
+          sha256Hash: current.entry.sha256Hash,
+          driveId: current.entry.driveId,
+          parentId: current.entry.parentId,
+          mtime: current.entry.mtime,
+        } : null;
+      }),
+      getDriveItemMetadataById,
+      downloadFile,
+    });
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault: {
+          configDir: ".obsidian",
+          adapter,
+          getAbstractFileByPath: vi.fn((candidate: string) =>
+            localBytesByPath.has(candidate) ? new TFile(candidate) : null),
+          getFileByPath: vi.fn().mockReturnValue(null),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+          rename: vi.fn(),
+        },
+        inspectFile: vi.fn(async (candidate: string) => {
+          const bytes = localBytesByPath.get(candidate);
+          return bytes
+            ? {
+                status: "present" as const,
+                entry: {
+                  path: candidate,
+                  hash: await sha256Hex(bytes),
+                  size: bytes.byteLength,
+                  mtime: 1,
+                  binary: false,
+                },
+              }
+            : { status: "missing" as const };
+        }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    const recover = (observationOnly = false) => {
+      const epoch = (executor as unknown as {
+        lifecycle: { capture(): number };
+      }).lifecycle.capture();
+      return (executor as unknown as {
+        recoverMutationLedger(
+          scope: SyncScope,
+          metrics: undefined,
+          operationEpoch: number,
+          observationOnly: boolean,
+        ): Promise<unknown>;
+      }).recoverMutationLedger(scope, undefined, epoch, observationOnly);
+    };
+    const anchorForPath = () => {
+      const envelope = state.getCommittedV2Envelope();
+      return Object.values(envelope.anchors.byAnchorId).find(
+        (anchor) => anchor.lastPath === path,
+      );
+    };
+    return {
+      executor,
+      getDriveItemMetadataById,
+      onedrive,
+      recover,
+      state,
+      anchorForPath,
+      path,
+      oldRemoteId,
+      newRemoteId,
+      localHash,
+    };
+  }
+
+  it("settles an unreceipted upload after a same-path identity replacement", async () => {
+    const harness = await makeReplacedIdentityUploadHarness();
+    const priorAnchorId = harness.anchorForPath()!.anchorId;
+
+    await harness.recover();
+
+    expect(harness.state.settleReplacedIdentityUploadResolved)
+      .toHaveBeenCalledTimes(1);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingRemoteDeletes).toEqual([]);
+    const anchor = harness.anchorForPath()!;
+    expect(anchor.anchorId).toBe(priorAnchorId);
+    expect(anchor.remoteId).toBe(harness.newRemoteId);
+    expect(anchor.remoteETag).toBe("etag-new");
+    expect(anchor.contentHash).toBe(harness.localHash);
+    expect(anchor.remoteIdentityLineage).toEqual([expect.objectContaining({
+      fromRemoteId: harness.oldRemoteId,
+      toRemoteId: harness.newRemoteId,
+      path: harness.path,
+      contentHash: harness.localHash,
+      fromRemoteETag: "etag-old",
+      toRemoteETag: "etag-new",
+      confirmedBy: "equal-read",
+    })]);
+    expect(harness.onedrive.uploadFile).not.toHaveBeenCalled();
+    expect(harness.onedrive.deleteItem).not.toHaveBeenCalled();
+  });
+
+  it("retires a stale receipt and manual resolution without replaying them", async () => {
+    const harness = await makeReplacedIdentityUploadHarness({
+      withStaleReceipt: true,
+      withStaleManualResolution: true,
+    });
+
+    await harness.recover();
+
+    expect(harness.state.settleReplacedIdentityUploadResolved)
+      .toHaveBeenCalledTimes(1);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.anchorForPath()!.remoteId).toBe(harness.newRemoteId);
+    expect(harness.onedrive.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("keeps the record blocked when the replacement content differs", async () => {
+    const harness = await makeReplacedIdentityUploadHarness({
+      remoteContent: "different",
+    });
+
+    await expect(harness.recover()).rejects.toThrow();
+    expect(harness.state.settleReplacedIdentityUploadResolved)
+      .not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect(harness.anchorForPath()!.remoteId).toBe(harness.oldRemoteId);
+  });
+
+  it("does not rebind while the old identity still exists anywhere", async () => {
+    const harness = await makeReplacedIdentityUploadHarness({
+      oldIdentityPresentAtPath: "elsewhere.md",
+    });
+
+    await expect(harness.recover()).rejects.toThrow();
+    expect(harness.state.settleReplacedIdentityUploadResolved)
+      .not.toHaveBeenCalled();
+    expect(harness.anchorForPath()!.remoteId).toBe(harness.oldRemoteId);
+    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect(harness.onedrive.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the new identity is anchored at another path", async () => {
+    const harness = await makeReplacedIdentityUploadHarness({
+      extraBasePaths: ["other.md"],
+      staleFileAnchors: [
+        { path: "note.md", remoteId: "old-id", eTag: "etag-old" },
+        { path: "other.md", remoteId: "new-id", eTag: "etag-extra" },
+      ],
+    });
+
+    await expect(harness.recover()).rejects.toThrow();
+    expect(harness.state.settleReplacedIdentityUploadResolved)
+      .not.toHaveBeenCalled();
+    expect(harness.anchorForPath()!.remoteId).toBe(harness.oldRemoteId);
+    expect(harness.state.mutationLedger).toHaveLength(1);
+  });
+
+  it("declines the state-only settle when a pending delete references another identity", async () => {
+    const harness = await makeReplacedIdentityUploadHarness({
+      pendingDeleteDriveId: "third-id",
+    });
+
+    await harness.recover();
+
+    expect(harness.state.settleReplacedIdentityUploadResolved)
+      .not.toHaveBeenCalled();
+    expect(harness.state.pendingRemoteDeletes).toHaveLength(1);
+  });
+
+  it("declines the rebind while another ledger record depends on the path", async () => {
+    const harness = await makeReplacedIdentityUploadHarness({
+      dependentFolderAtRoot: true,
+    });
+
+    await expect(harness.recover()).rejects.toThrow();
+    expect(harness.state.settleReplacedIdentityUploadResolved)
+      .not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect(harness.state.mutationLedger[0].intent.operationId)
+      .toBe("dependent-folder");
+  });
+
+  it("converges after an interruption between envelope publication and ledger retirement", async () => {
+    const harness = await makeReplacedIdentityUploadHarness();
+    const settle = vi.mocked(harness.state.settleReplacedIdentityUploadResolved)
+      .getMockImplementation()!;
+    let first = true;
+    vi.mocked(harness.state.settleReplacedIdentityUploadResolved)
+      .mockImplementation(async (args: never) => {
+        if (first) {
+          first = false;
+          await harness.state.upsertBaseEntries([args.entry]);
+          return true;
+        }
+        return settle(args);
+      });
+
+    await harness.recover();
+    expect(harness.anchorForPath()!.remoteId).toBe(harness.newRemoteId);
+    expect(harness.state.mutationLedger).toHaveLength(1);
+
+    await harness.recover();
+    expect(harness.state.mutationLedger).toEqual([]);
+    const lineage = harness.anchorForPath()!.remoteIdentityLineage ?? [];
+    expect(lineage).toHaveLength(1);
+    expect(lineage[0]).toMatchObject({
+      fromRemoteId: harness.oldRemoteId,
+      toRemoteId: harness.newRemoteId,
+    });
+  });
+
+  it("settles the state-only rebind during reset observation-only rounds", async () => {
+    const harness = await makeReplacedIdentityUploadHarness();
+
+    await harness.recover(true);
+
+    expect(harness.state.settleReplacedIdentityUploadResolved)
+      .toHaveBeenCalledTimes(1);
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.anchorForPath()!.remoteId).toBe(harness.newRemoteId);
+  });
+});
+
+describe("batch remote-delete absence verification", () => {
+  async function makeDeleteConfirmHarness(input: {
+    paths: readonly string[];
+    batchAbsent?: (paths: readonly string[]) => Promise<Map<string, unknown>>;
+    batchError?: Error;
+    remotePresentPaths?: readonly string[];
+  }) {
+    const scope = { ...TEST_SYNC_SCOPE, accountId: "account-test" };
+    const localEntries = input.paths.map((path, index) => ({
+      path,
+      hash: `local-hash-${index}`.padEnd(64, "0"),
+      size: 10 + index,
+      mtime: 1,
+      binary: false,
+    }));
+    const pendingRemoteDeletes: SyncPlanItem[] = localEntries.map((local) => ({
+      type: SyncActionType.ConfirmLocalDelete,
+      path: local.path,
+      local,
+      decisionToken: {
+        version: 1,
+        vaultName: "testVault",
+        accountId: scope.accountId,
+        scope,
+        local: { exists: true, hash: local.hash, size: local.size },
+        remote: { exists: false },
+        ancestorHash: null,
+      },
+    } as unknown as SyncPlanItem));
+    const removedPaths: string[] = [];
+    const adapter = makeMockAdapter({
+      remove: vi.fn(async (path: string) => {
+        removedPaths.push(path);
+      }),
+    });
+    const state = {
+      ...remoteStateStub(),
+      isV2StateActive: true,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+      hasMutationLedgerCorruption: false,
+      mutationLedger: [],
+      boundAccountId: scope.accountId,
+      remoteScope: scope,
+      pendingRemoteDeletes,
+      planReviewRevision: 0,
+      baseSnapshot: [],
+      removePendingDelete: vi.fn().mockResolvedValue(undefined),
+      addPendingConflict: vi.fn().mockResolvedValue(undefined),
+      getCommittedV2Envelope: vi.fn(() => null),
+      retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
+    } as unknown as StateManager;
+    const getFileMetadata = vi.fn(async (_vault: string, path: string) =>
+      input.remotePresentPaths?.includes(path)
+        ? { eTag: "etag-new", cTag: "ctag-new", size: 1, driveId: "reappeared-id", parentId: scope.filesRootId, mtime: 2, sha256Hash: "aa".repeat(32) }
+        : null);
+    const getFileMetadataByPaths = input.batchError
+      ? vi.fn(async () => { throw input.batchError; })
+      : input.batchAbsent
+        ? vi.fn(async (_vault: string, paths: readonly string[]) =>
+            input.batchAbsent!(paths))
+        : vi.fn(async (_vault: string, paths: readonly string[]) =>
+            new Map(paths.map((path) => [path, null])));
+    const onedrive = makeMockOneDrive({
+      getFileMetadata,
+      getFileMetadataByPaths,
+    });
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault: {
+          configDir: ".obsidian",
+          adapter,
+          getFileByPath: vi.fn().mockReturnValue(null),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        inspectFile: vi.fn(async (path: string) => {
+          const local = localEntries.find((entry) => entry.path === path);
+          return local ? { status: "present" as const, entry: local } : { status: "missing" as const };
+        }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    return {
+      executor,
+      getFileMetadata,
+      getFileMetadataByPaths,
+      removedPaths,
+      state,
+    };
+  }
+
+  it("pre-verifies the whole confirm batch once and skips per-item remote checks", async () => {
+    const paths = Array.from({ length: 25 }, (_unused, index) => `d-${index}.md`);
+    const harness = await makeDeleteConfirmHarness({ paths });
+
+    await harness.executor.confirmRemoteDeletes(paths);
+
+    expect(harness.getFileMetadataByPaths).toHaveBeenCalledTimes(1);
+    expect(harness.getFileMetadataByPaths.mock.calls).toEqual([
+      ["testVault", [...paths].sort()],
+    ]);
+    expect(harness.getFileMetadata).not.toHaveBeenCalled();
+    expect(harness.removedPaths.sort()).toEqual([...paths].sort());
+    expect(harness.executor.hasSideActionsInFlight).toBe(false);
+  });
+
+  it("falls back to per-item verification when the batch read fails", async () => {
+    const paths = Array.from({ length: 4 }, (_unused, index) => `f-${index}.md`);
+    const harness = await makeDeleteConfirmHarness({
+      paths,
+      batchError: new OneDriveError(OneDriveErrorType.NetworkError, "offline"),
+    });
+
+    await harness.executor.confirmRemoteDeletes(paths);
+
+    expect(harness.getFileMetadata).toHaveBeenCalledTimes(paths.length);
+    expect(harness.removedPaths.sort()).toEqual([...paths].sort());
+  });
+
+  it("re-verifies a reappeared path individually and blocks only that item", async () => {
+    const harness = await makeDeleteConfirmHarness({
+      paths: ["a.md", "b.md"],
+      remotePresentPaths: ["b.md"],
+      batchAbsent: async (paths: readonly string[]) =>
+        new Map(paths.map((path) => [path, path === "b.md" ? { id: "reappeared" } : null])),
+    });
+
+    await harness.executor.confirmRemoteDeletes(["a.md", "b.md"]);
+
+    expect(harness.removedPaths).toEqual(["a.md"]);
+    expect(harness.getFileMetadata.mock.calls).toEqual([["testVault", "b.md", "other"]]);
+  });
+
+  it("accepts the batch-verified absence window when a file reappears after the batch read", async () => {
+    const harness = await makeDeleteConfirmHarness({
+      paths: ["a.md", "b.md"],
+      remotePresentPaths: ["b.md"],
+    });
+
+    await harness.executor.confirmRemoteDeletes(["a.md", "b.md"]);
+
+    // The batch proved both absent; a reappearance inside the window is
+    // adopted by the next ordinary round instead of a per-item re-check.
+    expect(harness.removedPaths.sort()).toEqual(["a.md", "b.md"]);
+    expect(harness.getFileMetadata).not.toHaveBeenCalled();
   });
 });
