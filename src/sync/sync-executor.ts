@@ -3101,6 +3101,36 @@ export class SyncExecutor {
         && this.isFolderProtectedByIsolatedRecovery(item.renameFrom, records));
   }
 
+  /**
+   * Items whose paths are still owned by unresolved mutation recovery must
+   * never execute. Deferring them keeps the freeze local instead of failing
+   * the whole run: the rest of the Vault keeps syncing, and the next round
+   * retries them once recovery settles their paths.
+   */
+  private deferPlanItemsIntersectingRecovery(
+    plan: SyncPlan,
+    result: SyncResult,
+    records: readonly Readonly<MutationLedgerEntryV1>[],
+  ): void {
+    if (records.length === 0) return;
+    const intersecting = plan.items.filter((item) =>
+      this.planItemIntersectsIsolatedRecovery(item, records));
+    if (intersecting.length === 0) return;
+    const intersectingSet = new Set(intersecting);
+    plan.items = plan.items.filter((item) => !intersectingSet.has(item));
+    result.deferred += intersecting.length;
+    this.diag?.warn(
+      "plan",
+      "plan items deferred by protected mutation recovery",
+      {
+        deferred: intersecting.length,
+        remainingPlanItems: plan.items.length,
+        protectedRecords: records.length,
+        mutations: 0,
+      },
+    );
+  }
+
   private currentManualResolutionScanScope(): {
     configDir: string;
     includeFilePath: (path: string) => boolean;
@@ -5801,7 +5831,7 @@ export class SyncExecutor {
       : 0;
     let migrationAuthorityCommittedThisRun = false;
     let migrationExecutionHold: MigrationHoldV2 | null = null;
-    let isolatedMutationRecoveryRecords: MutationLedgerEntryV1[] = [];
+    let protectedMutationRecoveryRecords: MutationLedgerEntryV1[] = [];
     this.startGeneration = this.state.remoteGeneration;
     this.onedrive.resetDownloadStrategy();
     this.onedrive.setAbortSignal(this.cancelController.signal);
@@ -6342,23 +6372,46 @@ export class SyncExecutor {
             error.summary,
             syncScope,
           );
-          if (!isolated) throw error;
-          isolatedMutationRecoveryRecords = isolated;
-          const isolatedSummary: MutationRecoveryRunSummary = {
-            ...error.summary,
-            isolated: true,
-          };
-          mutationRecovery = isolatedSummary;
-          result.mutationRecovery = isolatedSummary;
-          this.diag?.warn(
-            "execute",
-            "unresolved ordinary files were isolated from unrelated planning",
-            {
-              records: isolated.length,
-              operationIds: isolated.map((record) => record.intent.operationId),
-              mutations: 0,
-            },
-          );
+          if (!isolated) {
+            if (error.summary.state !== "network-unavailable") throw error;
+            // Every remaining record still owns its paths, but a retryable
+            // network outage must not freeze the rest of the Vault. Keep the
+            // remaining records protected from ordinary planning and let the
+            // run sync everything else; the recovery keeps owning those paths.
+            mutationRecovery = error.summary;
+            result.mutationRecovery = error.summary;
+            protectedMutationRecoveryRecords = structuredClone([
+              ...this.state.mutationLedger,
+            ]);
+            this.diag?.warn(
+              "execute",
+              "mutation recovery is network-unavailable; protected paths stay frozen while the rest of the vault continues",
+              {
+                records: protectedMutationRecoveryRecords.length,
+                operationIds: protectedMutationRecoveryRecords.map(
+                  (record) => record.intent.operationId,
+                ),
+                mutations: 0,
+              },
+            );
+          } else {
+            protectedMutationRecoveryRecords = isolated;
+            const isolatedSummary: MutationRecoveryRunSummary = {
+              ...error.summary,
+              isolated: true,
+            };
+            mutationRecovery = isolatedSummary;
+            result.mutationRecovery = isolatedSummary;
+            this.diag?.warn(
+              "execute",
+              "unresolved ordinary files were isolated from unrelated planning",
+              {
+                records: isolated.length,
+                operationIds: isolated.map((record) => record.intent.operationId),
+                mutations: 0,
+              },
+            );
+          }
         }
         if (this.shouldStop(result, operationEpoch)) return result;
         if (this.localVersionRecoveredDuringLedger) {
@@ -7252,7 +7305,7 @@ export class SyncExecutor {
         this.shouldIncludeRemotePath(path)
         && !this.isPathProtectedByIsolatedRecovery(
           path,
-          isolatedMutationRecoveryRecords,
+          protectedMutationRecoveryRecords,
         )
         && isCommunityPluginPathSelectedByPolicy(
           path,
@@ -7265,7 +7318,7 @@ export class SyncExecutor {
         !includeCanonicalFolderPath(path)
         || this.isFolderProtectedByIsolatedRecovery(
           path,
-          isolatedMutationRecoveryRecords,
+          protectedMutationRecoveryRecords,
         )
         || isCommunityPluginFolderPreservedByPolicy(
           path,
@@ -8100,15 +8153,11 @@ export class SyncExecutor {
           );
         }
       }
-      if (plan.items.some((item) =>
-        this.planItemIntersectsIsolatedRecovery(
-          item,
-          isolatedMutationRecoveryRecords,
-        ))) {
-        throw new Error(
-          "Canonical plan intersects isolated mutation recovery",
-        );
-      }
+      this.deferPlanItemsIntersectingRecovery(
+        plan,
+        result,
+        protectedMutationRecoveryRecords,
+      );
       plan.scope = syncScope;
       this.diag?.log("plan", `plan generated — ${plan.items.length} actions (up/down/del/conflict: ${plan.items.filter(i=>i.type===SyncActionType.Upload).length}/${plan.items.filter(i=>i.type===SyncActionType.Download).length}/${plan.items.filter(i=>i.type===SyncActionType.Conflict).length})`);
       if (this.shouldStop(result, operationEpoch)) return result;
@@ -9052,7 +9101,7 @@ export class SyncExecutor {
           ...this.state.pendingConflicts
             .filter((item) => this.isPathProtectedByIsolatedRecovery(
               item.path,
-              isolatedMutationRecoveryRecords,
+              protectedMutationRecoveryRecords,
             ))
             .map((item) => item.path),
         ],
@@ -9071,7 +9120,7 @@ export class SyncExecutor {
           ...this.state.pendingRemoteDeletes
             .filter((item) => this.isPathProtectedByIsolatedRecovery(
               item.path,
-              isolatedMutationRecoveryRecords,
+              protectedMutationRecoveryRecords,
             ))
             .map((item) => item.path),
         ],
@@ -9085,7 +9134,7 @@ export class SyncExecutor {
           ...this.state.pendingIssues
             .filter((item) => this.isPathProtectedByIsolatedRecovery(
               item.path,
-              isolatedMutationRecoveryRecords,
+              protectedMutationRecoveryRecords,
             ))
             .map((item) => item.path),
         ],
@@ -9119,7 +9168,7 @@ export class SyncExecutor {
         automaticHandlingMetrics,
         communityPluginSyncPolicy,
         generationRestoreProjectionsByPluginId,
-        isolatedMutationRecoveryRecords,
+        protectedMutationRecoveryRecords,
       );
       // A folder move is a topology transaction in either direction. Only
       // after its receipt/checkpoint has advanced the authority may one fresh
