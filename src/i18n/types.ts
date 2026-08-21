@@ -345,6 +345,7 @@ export interface LocaleStrings {
   "result.v2ScopeRecoveryVerificationInterrupted": string;
   "result.v2ScopeRecoveryChanged": string;
   "result.sharedControlReadUnavailable": string;
+  "result.ordinaryRemoteReadUnavailable": string;
   "reason.remoteScopeRecreate": string;
   "result.communityPluginLocalIgnoreFailed": string;
   "notice.communityPlugins.loadFailed": string;
@@ -607,6 +608,10 @@ export interface LocaleStrings {
   "syncView.failure.storageFull": string;
   "syncView.failure.authExpired": string;
   "syncView.failure.remote": string;
+  "syncView.failure.remoteInvalidNameChar": string;
+  "syncView.failure.remoteInvalidNameTrailingDot": string;
+  "syncView.failure.remoteInvalidNameTrailingSpace": string;
+  "syncView.failure.remoteInvalidNameControlChar": string;
   "syncView.failure.remoteChangedDuringDownload": string;
   "syncView.failure.localChangedBeforeDelete": string;
   "syncView.failure.local": string;

@@ -12267,6 +12267,65 @@ describe("Execute-time file race safety", () => {
     );
   });
 
+  it("surfaces an actionable reason when an upload fails 400 on a OneDrive-invalid file name", async () => {
+    const content = new TextEncoder().encode("pdf payload");
+    const state = makeActiveV2State([], []);
+    const executor = new SyncExecutor(
+      makeMockOneDrive(),
+      {
+        vault: {
+          adapter: makeMockAdapter({ readBinary: vi.fn().mockResolvedValue(content) }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          folderScanFailures: [],
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({ status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    const failureReason = (executor as unknown as {
+      failureReason(error: unknown, path?: string): string;
+    }).failureReason.bind(executor);
+
+    const invalidName =
+      new OneDriveError(OneDriveErrorType.Unknown, "name contains unsupported characters", 400);
+    expect(failureReason(invalidName, "03-Travel/澳大利亚/assets/🇦🇺澳大利亚十四日游.pdf?="))
+      .toBe("syncView.failure.remoteInvalidNameChar");
+
+    // The specific failure modes are distinguished for the user.
+    expect(failureReason(invalidName, "note.md."))
+      .toBe("syncView.failure.remoteInvalidNameTrailingDot");
+    expect(failureReason(invalidName, "note.md "))
+      .toBe("syncView.failure.remoteInvalidNameTrailingSpace");
+    expect(failureReason(invalidName, "a\u0001b"))
+      .toBe("syncView.failure.remoteInvalidNameControlChar");
+
+    // The same 400 on a validly-named file keeps the generic reason.
+    expect(failureReason(invalidName, "note.md"))
+      .toBe("syncView.failure.remote");
+
+    // Without a path we cannot classify, so it also stays generic.
+    expect(failureReason(invalidName))
+      .toBe("syncView.failure.remote");
+
+    // A non-400 failure (e.g. a network error) is not mislabelled, even when
+    // the file name is invalid — the branch is specifically about an HTTP 400
+    // that proves the name cannot be stored.
+    const networkErr = new OneDriveError(OneDriveErrorType.NetworkError, "offline");
+    expect(failureReason(networkErr, "pdf?=name")).toBe("syncView.failure.network");
+  });
+
   it("uses one version-bound readback when an If-Match upload race only exposes QuickXor", async () => {
     const content = new TextEncoder().encode("same bytes from another client");
     const hash = await sha256Hex(content.buffer);
@@ -13626,14 +13685,27 @@ describe("Conservative desktop small-file download concurrency", () => {
 
       expect(result.downloaded).toBe(remoteEntries.length);
       expect(result.errors).toBe(0);
-      expect(getDriveItemMetadataByIds).toHaveBeenCalledTimes(4);
-      expect(getDriveItemMetadataByIds.mock.calls.map((call) => call[1])).toEqual([
-        "downloadUrlRefresh",
-        "downloadVersionVerify",
-        "downloadUrlRefresh",
-        "downloadVersionVerify",
-      ]);
-      expect(downloadFile.mock.calls.slice(2).every((call) =>
+      // Contract: regardless of how the adaptive policy splits batches under
+      // load, every entry lacking a downloadUrl is refreshed through the batch
+      // metadata endpoint, and every hashless download is version-verified
+      // against the current remote ID/eTag. Assert coverage, not batch shape.
+      const refreshedIds = getDriveItemMetadataByIds.mock.calls
+        .filter((call) => call[1] === "downloadUrlRefresh")
+        .flatMap((call) => call[0]);
+      expect([...refreshedIds].sort()).toEqual(
+        remoteEntries.map((entry) => entry.driveId).sort(),
+      );
+      const verifiedIds = getDriveItemMetadataByIds.mock.calls
+        .filter((call) => call[1] === "downloadVersionVerify")
+        .flatMap((call) => call[0]);
+      expect([...verifiedIds].sort()).toEqual(
+        remoteEntries.filter((entry) => !entry.sha256Hash)
+          .map((entry) => entry.driveId).sort(),
+      );
+      expect(getDriveItemMetadataByIds.mock.calls.every((call) =>
+        call[1] === "downloadUrlRefresh" || call[1] === "downloadVersionVerify",
+      )).toBe(true);
+      expect(downloadFile.mock.calls.every((call) =>
         typeof call[2] === "string" && call[2].startsWith("https://download.example/"),
       )).toBe(true);
       expect(state.mutationLedger).toEqual([]);

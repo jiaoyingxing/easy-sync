@@ -2443,6 +2443,53 @@ describe("main sync entry guards", () => {
     plugin.stopAutoSync();
   });
 
+  it("keeps the normal interval alive after a retryable ordinary remote read failure before planning", async () => {
+    vi.useFakeTimers();
+    const plugin = new EasySyncPlugin();
+    plugin.syncInterval = 3;
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync");
+    const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")
+      .mockResolvedValue(true);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    plugin.startAutoSync();
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: false,
+      errors: 1,
+      message: "result.ordinaryRemoteReadUnavailable",
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "not-entered",
+        userFileChanges: "unknown",
+      },
+      disposition: {
+        kind: "retryable-observation",
+        phase: "remotePrepare",
+        code: "ordinary-remote-read-unavailable",
+        retry: "next-sync",
+        component: "ordinary-remote",
+      },
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(stopAutoSync).not.toHaveBeenCalled();
+    expect(saveSyncSettings).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(3 * 60 * 1000);
+    expect(runAutomaticSync).toHaveBeenCalledOnce();
+    expect(runAutomaticSync).toHaveBeenCalledWith("interval");
+    plugin.stopAutoSync();
+  });
+
   it("persists a retryable shared-control observation as one failed run before the next interval succeeds", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-16T12:00:00+08:00"));

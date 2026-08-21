@@ -15894,6 +15894,90 @@ describe("V1 to V2 controlled production activation", () => {
     expectNoFileMutations(harness.mutations);
   });
 
+  it("keeps the next normal round observing after a transient ordinary delta read failure before planning", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    await harness.state.setRemoteState(
+      harness.state.remoteSnapshot,
+      "https://graph.example/cached-delta",
+      scope,
+      harness.state.remoteFolders,
+    );
+    harness.getDelta.mockRejectedValueOnce(new OneDriveError(
+      OneDriveErrorType.NetworkError,
+      "request timed out after 15000ms",
+    ));
+
+    const unavailable = await harness.executor.run("auto");
+
+    expect(unavailable).toMatchObject({
+      success: false,
+      errors: 1,
+      message: "result.ordinaryRemoteReadUnavailable",
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "not-entered",
+      },
+      disposition: {
+        kind: "retryable-observation",
+        phase: "remotePrepare",
+        code: "ordinary-remote-read-unavailable",
+        retry: "next-sync",
+        component: "ordinary-remote",
+      },
+    });
+    expect(unavailable.uploaded).toBe(0);
+    expect(unavailable.downloaded).toBe(0);
+    expectNoFileMutations(harness.mutations);
+
+    // The next normal round re-observes with the default healthy delta.
+    const recovered = await harness.executor.run("auto");
+    expect(recovered).toMatchObject({
+      success: true,
+      errors: 0,
+    });
+    expect(recovered.disposition).toBeUndefined();
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("keeps a hard failure when the pre-planning delta read fails with a non-transient error", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    await harness.state.setRemoteState(
+      harness.state.remoteSnapshot,
+      "https://graph.example/cached-delta",
+      scope,
+      harness.state.remoteFolders,
+    );
+    harness.getDelta.mockRejectedValueOnce(new OneDriveError(
+      OneDriveErrorType.Unknown,
+      "remote cache is ambiguous",
+      400,
+    ));
+
+    const failed = await harness.executor.run("auto");
+
+    expect(failed.success).toBe(false);
+    expect(failed.errors).toBeGreaterThan(0);
+    expect(failed.disposition).toBeUndefined();
+    expect(failed.message).toBe("result.syncFailed");
+    expectNoFileMutations(harness.mutations);
+  });
+
   it("preserves OneDrive authentication expiry from the composite profile observation", async () => {
     const harness = makeHarness();
     await harness.state.load();

@@ -175,6 +175,49 @@ function encodeUrlPath(path: string): string {
   return path.split("/").map((s) => encodeURIComponent(s)).join("/");
 }
 
+/**
+ * Characters OneDrive / SharePoint does not accept in an item (file or folder)
+ * name. Even when percent-encoded in a Graph URL (`%3F` for `?`, `%23` for `#`,
+ * …), the server rejects the item because the decoded name is invalid, so the
+ * request can never succeed regardless of client-side encoding.
+ *
+ * Surface (the `?` etc. literally break) plus trailing-space / trailing-dot /
+ * reserved range that Microsoft documents as invalid in a file name.
+ */
+const ONE_DRIVE_INVALID_NAME_CHARACTERS = new Set([
+  '"', "*", ":", "<", ">", "?", "/", "\\", "|",
+]);
+
+/** What exactly makes a OneDrive item name unacceptable. */
+export type OneDriveInvalidNameIssue =
+  /** A visible reserved character, e.g. `?`, `:`, `"`. The offending char is returned for display. */
+  | { kind: "char"; char: string }
+  /** The name ends with a dot (`.`), which OneDrive treats as an extension-signature. */
+  | { kind: "trailing-dot" }
+  /** The name ends with a space. */
+  | { kind: "trailing-space" }
+  /** An ASCII control character that cannot even be shown to the user. */
+  | { kind: "control-char" };
+
+/** Find the first reason a *name* (not path) can never be stored on OneDrive, or null when storable. */
+export function findOneDriveInvalidNameIssue(fileName: string): OneDriveInvalidNameIssue | null {
+  for (const char of fileName) {
+    if (ONE_DRIVE_INVALID_NAME_CHARACTERS.has(char)) return { kind: "char", char };
+  }
+  // Reserved by OneDrive: a name may not end with a dot or a space, and may not
+  // contain ASCII control characters.
+  if (fileName.endsWith(".")) return { kind: "trailing-dot" };
+  if (fileName.endsWith(" ")) return { kind: "trailing-space" };
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(fileName)) return { kind: "control-char" };
+  return null;
+}
+
+/** True when the file/directory *name* (not path) can never be stored on OneDrive. */
+export function hasOneDriveInvalidNameCharacters(fileName: string): boolean {
+  return findOneDriveInvalidNameIssue(fileName) !== null;
+}
+
 /** App Folder directory structure */
 export const APP_FOLDER_PATHS = {
   /** App Folder root, accessed via /me/drive/special/approot */
