@@ -34,6 +34,7 @@ import {
   RemoteVaultScopeIdentityError,
   SharedSyncProtocolObservationError,
   SyntheticRequestTimeoutError,
+  findOneDriveInvalidNameIssue,
 } from "../onedrive/types";
 import type {
   DriveItem,
@@ -299,9 +300,13 @@ import {
 export interface RetryableObservationDisposition {
   kind: "retryable-observation";
   phase: "remotePrepare";
-  code: "shared-control-read-unavailable";
+  code:
+    | "shared-control-read-unavailable"
+    | "ordinary-remote-read-unavailable";
   retry: "next-sync";
-  component: SharedSyncProtocolObservationComponent;
+  component:
+    | SharedSyncProtocolObservationComponent
+    | "ordinary-remote";
 }
 
 export type SyncRunDisposition = RetryableObservationDisposition;
@@ -385,13 +390,10 @@ export function classifyRetryableObservationResult(
   const structurallyValid =
     disposition.kind === "retryable-observation"
     && disposition.phase === "remotePrepare"
-    && disposition.code === "shared-control-read-unavailable"
-    && disposition.retry === "next-sync"
     && (
-      disposition.component === "directory"
-      || disposition.component === "v2"
-      || disposition.component === "v3"
+      isValidRetryableObservationCodeComponent(disposition)
     )
+    && disposition.retry === "next-sync"
     && result.runFacts?.termination === "normal"
     && result.runFacts.ordinaryPlanning === "not-entered"
     && !result.success
@@ -412,6 +414,26 @@ export function classifyRetryableObservationResult(
   return structurallyValid
     ? { kind: "valid", disposition }
     : { kind: "contradictory", disposition };
+}
+
+/**
+ * A retryable-observation disposition must pair its code with a matching
+ * component: the shared-control read is owned by a protocol component
+ * (directory/v2/v3), while an ordinary remote read has no protocol owner.
+ * Wrong pairings are treated as contradictory rather than silently valid.
+ */
+function isValidRetryableObservationCodeComponent(
+  disposition: RetryableObservationDisposition,
+): boolean {
+  if (disposition.code === "shared-control-read-unavailable") {
+    return disposition.component === "directory"
+      || disposition.component === "v2"
+      || disposition.component === "v3";
+  }
+  if (disposition.code === "ordinary-remote-read-unavailable") {
+    return disposition.component === "ordinary-remote";
+  }
+  return false;
 }
 
 /** Result of executing a single plan item — caller collects baseUpsert/baseRemoval for batch persistence. */
@@ -6733,9 +6755,31 @@ export class SyncExecutor {
             : undefined,
         );
       } catch (error) {
-        if (!(error instanceof V2CommittedScopeUnreachableError)) throw error;
-        await this.stageV2CommittedScopeRecovery(result, error);
-        return result;
+        if (error instanceof V2CommittedScopeUnreachableError) {
+          await this.stageV2CommittedScopeRecovery(result, error);
+          return result;
+        }
+        if (this.isRetryableOrdinaryRemoteReadFailure(error, result)) {
+          result.errors = Math.max(1, result.errors);
+          result.message = this.t("result.ordinaryRemoteReadUnavailable");
+          result.disposition = {
+            kind: "retryable-observation",
+            phase: "remotePrepare",
+            code: "ordinary-remote-read-unavailable",
+            retry: "next-sync",
+            component: "ordinary-remote",
+          };
+          this.diag?.warn(
+            "execute",
+            "ordinary remote read unavailable before ordinary planning; the next normal sync will observe again",
+            {
+              ordinaryPlanning: result.runFacts?.ordinaryPlanning ?? "unknown",
+              retry: "next-sync",
+            },
+          );
+          return result;
+        }
+        throw error;
       }
       let remoteEntries = remotePreparation.entries;
       syncScope = remotePreparation.scope;
@@ -10423,7 +10467,7 @@ export class SyncExecutor {
           result.authExpired = true;
           result.message = this.t("result.authExpired");
           this.invalidateLifecycle("auth-expired");
-          callbacks.onFileComplete?.(item.path, item.type, false, this.failureReason(e), fileSize);
+          callbacks.onFileComplete?.(item.path, item.type, false, this.failureReason(e, item.path), fileSize);
           return;
         }
         result.errors++;
@@ -10452,7 +10496,7 @@ export class SyncExecutor {
                     ),
           };
         }
-        const reason = this.failureReason(e);
+        const reason = this.failureReason(e, item.path);
         pendingIssues.push({
           path: item.path,
           actionType: item.type,
@@ -10683,10 +10727,10 @@ export class SyncExecutor {
         !item.remote?.downloadUrl && Boolean(item.remote?.driveId)
       );
       const shouldBatchVersionVerification = canBatchMetadata
-        && batch.filter((item) => !item.remote?.sha256Hash).length > 1;
+        && batch.filter((item) => !item.remote?.sha256Hash).length >= 1;
       const refreshedDownloadUrls = new Map<string, string>();
       const metadataPreparationErrors = new Map<string, unknown>();
-      if (canBatchMetadata && missingDownloadUrl.length > 1) {
+      if (canBatchMetadata && missingDownloadUrl.length >= 1) {
         try {
           const refreshed = await metadataBatchClient.getDriveItemMetadataByIds!(
             missingDownloadUrl.map((item) => item.remote!.driveId),
@@ -13921,9 +13965,9 @@ export class SyncExecutor {
     }
   }
 
-  private failureReason(error: unknown): string {
+  private failureReason(error: unknown, path?: string): string {
     if (error instanceof MutationNotAppliedError) {
-      return this.failureReason(error.original);
+      return this.failureReason(error.original, path);
     }
     if (error instanceof LocalVersionChangedBeforeDeleteError) {
       return this.t("syncView.failure.localChangedBeforeDelete");
@@ -13932,6 +13976,27 @@ export class SyncExecutor {
       return this.t("syncView.failure.remoteChangedDuringDownload");
     }
     if (error instanceof OneDriveError) {
+      // A Graph 400 on a file whose name contains characters OneDrive can never
+      // store (e.g. `?`) can never succeed, no matter how many times we retry or
+      // how correctly we encode the URL. Surface the exact offending character
+      // instead of the generic "remote request failed" so the user knows which
+      // part of the name to fix.
+      if (path && error.type === OneDriveErrorType.Unknown && error.statusCode === 400) {
+        for (const segment of path.split("/")) {
+          const issue = findOneDriveInvalidNameIssue(segment);
+          if (!issue) continue;
+          switch (issue.kind) {
+            case "char":
+              return this.t("syncView.failure.remoteInvalidNameChar", { char: issue.char });
+            case "trailing-dot":
+              return this.t("syncView.failure.remoteInvalidNameTrailingDot");
+            case "trailing-space":
+              return this.t("syncView.failure.remoteInvalidNameTrailingSpace");
+            case "control-char":
+              return this.t("syncView.failure.remoteInvalidNameControlChar");
+          }
+        }
+      }
       switch (error.type) {
         case OneDriveErrorType.Unauthorized:
         case OneDriveErrorType.Forbidden:
@@ -16430,6 +16495,42 @@ export class SyncExecutor {
           observeAfterCreateFailure,
         }),
     );
+  }
+
+  /**
+   * The ordinary remote file-list read (delta/projection) is a read-only
+   * observation that runs before ordinary planning. A transient Graph read
+   * failure here (network timeout, rate limit, or retryable server error) with
+   * no file action and no mutation-in-progress means the run never reached a
+   * decision: it should keep the auto-sync timer alive and re-observe on the
+   * next normal sync instead of permanently pausing. Scope loss and stable
+   * protocol/identity failures are handled by their own paths, not this one.
+   */
+  private isRetryableOrdinaryRemoteReadFailure(
+    error: unknown,
+    result: SyncResult,
+  ): boolean {
+    if (!(error instanceof OneDriveError)) return false;
+    if (
+      error.type !== OneDriveErrorType.NetworkError
+      && error.type !== OneDriveErrorType.RateLimited
+      && error.type !== OneDriveErrorType.ServerError
+    ) {
+      return false;
+    }
+    if (result.authExpired) return false;
+    if (result.disposition) return false;
+    if (this.state.mutationLedger.length > 0) return false;
+    if (result.runFacts?.ordinaryPlanning !== "not-entered") return false;
+    return result.uploaded === 0
+      && result.downloaded === 0
+      && result.deleted === 0
+      && (result.foldersCreated ?? 0) === 0
+      && (result.foldersMoved ?? 0) === 0
+      && (result.foldersDeleted ?? 0) === 0
+      && (result.filesMoved ?? 0) === 0
+      && result.conflicts === 0
+      && result.deferred === 0;
   }
 
   private finishRetryableSharedControlObservation(

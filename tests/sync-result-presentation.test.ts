@@ -203,4 +203,44 @@ describe("sync result presentation", () => {
       zh.t.bind(zh),
     )).toBe(zh.t("result.pausedForReview"));
   });
+
+  it("shows a pre-plan ordinary remote read failure as a failed run, not a partial flatten", () => {
+    const disposition: NonNullable<SyncResult["disposition"]> = {
+      kind: "retryable-observation",
+      phase: "remotePrepare",
+      code: "ordinary-remote-read-unavailable",
+      retry: "next-sync",
+      component: "ordinary-remote",
+    };
+    expect(resolveSyncHistoryStatus(result({
+      success: false,
+      errors: 1,
+      message: "result.ordinaryRemoteReadUnavailable",
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "not-entered",
+        userFileChanges: "unknown",
+      },
+      disposition,
+    }))).toBe("failed");
+    // A transient read failure that already produced file work is not a
+    // retryable observation; it must remain a partial run.
+    expect(resolveSyncHistoryStatus(result({
+      success: false,
+      downloaded: 1,
+      errors: 1,
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "not-entered",
+        userFileChanges: "performed",
+      },
+      disposition: {
+        kind: "retryable-observation",
+        phase: "remotePrepare",
+        code: "ordinary-remote-read-unavailable",
+        retry: "next-sync",
+        component: "ordinary-remote",
+      },
+    }))).toBe("partial");
+  });
 });
