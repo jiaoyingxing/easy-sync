@@ -530,6 +530,568 @@ describe("AuthModule credential concurrency", () => {
   });
 });
 
+describe("AuthModule device code flow", () => {
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const DEVICE_CODE_RESPONSE = {
+    status: 200,
+    headers: {},
+    json: {
+      device_code: "device-secret-1",
+      user_code: "ABCDEFGHI",
+      verification_uri: "https://microsoft.com/devicelogin",
+      // Microsoft currently does NOT return verification_uri_complete
+      // (official docs: "not included or supported at this time").
+      expires_in: 900,
+      interval: 5,
+    },
+  };
+
+  function pendingTokenResponse(): {
+    status: number;
+    headers: Record<string, never>;
+    json: Record<string, string>;
+  } {
+    return {
+      status: 400,
+      headers: {},
+      json: { error: "authorization_pending" },
+    };
+  }
+
+  function makeAuth(requestMock: typeof obsidian.requestUrl): AuthModule {
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(requestMock);
+    return new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn().mockResolvedValue(null),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+    }));
+  }
+
+  it("issues a devicecode request, exposes the attempt, and polls on the provider interval", async () => {
+    vi.useFakeTimers();
+    const tokenCalls: string[] = [];
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        tokenCalls.push(String(options.body));
+        return pendingTokenResponse() as obsidian.RequestUrlResponse;
+      }
+      throw new Error("unexpected request");
+    });
+
+    const attempt = await auth.beginDeviceCodeLogin();
+
+    expect(attempt).toEqual({
+      userCode: "ABCDEFGHI",
+      verificationUri: "https://microsoft.com/devicelogin",
+      verificationUriComplete: null,
+      expiresAt: expect.any(Number),
+      phase: "waiting",
+    });
+    expect(auth.deviceAttempt?.userCode).toBe("ABCDEFGHI");
+    expect(auth.isPending).toBe(true);
+    expect(auth.pendingAuthUrl).toBeNull();
+    expect(auth.authStatus).toBe("pending");
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(tokenCalls).toHaveLength(1);
+    expect(tokenCalls[0]).toContain("grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code");
+    expect(tokenCalls[0]).toContain("device_code=device-secret-1");
+    expect(tokenCalls[0]).not.toContain("code_verifier");
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(tokenCalls).toHaveLength(2);
+    expect(auth.deviceAttempt?.phase).toBe("waiting");
+  });
+
+  it("keeps the provider's pre-filled verification URI when it is returned", async () => {
+    vi.useFakeTimers();
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return {
+          ...DEVICE_CODE_RESPONSE,
+          json: {
+            ...DEVICE_CODE_RESPONSE.json,
+            verification_uri_complete:
+              "https://microsoft.com/devicelogin?otc=ABCDEFGHI",
+          },
+        } as obsidian.RequestUrlResponse;
+      }
+      return pendingTokenResponse() as obsidian.RequestUrlResponse;
+    });
+
+    const attempt = await auth.beginDeviceCodeLogin();
+
+    expect(attempt.verificationUriComplete).toBe(
+      "https://microsoft.com/devicelogin?otc=ABCDEFGHI",
+    );
+    expect(auth.deviceAttempt?.verificationUriComplete).toBe(
+      "https://microsoft.com/devicelogin?otc=ABCDEFGHI",
+    );
+    await vi.advanceTimersByTimeAsync(5000); // drain the first poll tick
+  });
+
+  it("completes the shared login tail when the poll returns tokens", async () => {
+    vi.useFakeTimers();
+    const secretSet = vi.fn().mockResolvedValue(undefined);
+    const onFreshLogin = vi.fn();
+    const ctx = makeContext({
+      secretStorage: {
+        set: secretSet,
+        get: vi.fn().mockResolvedValue(null),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      onFreshLogin,
+    });
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            access_token: "device-access-token",
+            refresh_token: "device-refresh-token",
+            expires_in: 3600,
+            scope: "User.Read offline_access",
+          },
+        } as obsidian.RequestUrlResponse;
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "Device User", id: "device-account" },
+      } as obsidian.RequestUrlResponse;
+    });
+    const auth = new AuthModule(ctx);
+
+    await auth.beginDeviceCodeLogin();
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(secretSet).toHaveBeenCalledWith(
+      "easy-sync-onedrive-refresh-token",
+      "device-refresh-token",
+    );
+    expect(onFreshLogin).toHaveBeenCalledOnce();
+    expect(auth.authState).toMatchObject({
+      isLoggedIn: true,
+      accountId: "device-account",
+      displayName: "Device User",
+    });
+    expect(auth.deviceAttempt).toBeNull();
+    expect(auth.isPending).toBe(false);
+  });
+
+  it("marks the attempt declined when the provider reports authorization_declined", async () => {
+    vi.useFakeTimers();
+    let tokenCalls = 0;
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      tokenCalls += 1;
+      return {
+        status: 400,
+        headers: {},
+        json: { error: "authorization_declined" },
+      } as obsidian.RequestUrlResponse;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(auth.deviceAttempt?.phase).toBe("declined");
+    expect(auth.isPending).toBe(false);
+    const callsAfterDecline = tokenCalls;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(tokenCalls).toBe(callsAfterDecline);
+  });
+
+  it("marks the attempt expired once the code deadline passes", async () => {
+    vi.useFakeTimers();
+    let tokenCalls = 0;
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return {
+          ...DEVICE_CODE_RESPONSE,
+          json: { ...DEVICE_CODE_RESPONSE.json, expires_in: 12 },
+        } as obsidian.RequestUrlResponse;
+      }
+      tokenCalls += 1;
+      return pendingTokenResponse() as obsidian.RequestUrlResponse;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    await vi.advanceTimersByTimeAsync(5000); // poll 1 (still valid)
+    await vi.advanceTimersByTimeAsync(5000); // poll 2 (still valid)
+    expect(tokenCalls).toBe(2);
+
+    await vi.advanceTimersByTimeAsync(5000); // tick at 15s — deadline passed
+    expect(auth.deviceAttempt?.phase).toBe("expired");
+    expect(auth.isPending).toBe(false);
+    expect(tokenCalls).toBe(2);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(tokenCalls).toBe(2);
+  });
+
+  it("grows the poll interval on slow_down", async () => {
+    vi.useFakeTimers();
+    const tokenCalls: number[] = [];
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      tokenCalls.push(Date.now());
+      return {
+        status: 400,
+        headers: {},
+        json: { error: tokenCalls.length === 1 ? "slow_down" : "authorization_pending" },
+      } as obsidian.RequestUrlResponse;
+    });
+
+    const start = Date.now();
+    await auth.beginDeviceCodeLogin();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(tokenCalls).toHaveLength(1);
+
+    // interval grew 5000 → 10000ms; nothing more at t+5s
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(tokenCalls).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(tokenCalls).toHaveLength(2);
+    expect(tokenCalls[1] - start).toBe(15_000);
+  });
+
+  it("keeps polling through transient network errors and completes afterwards", async () => {
+    vi.useFakeTimers();
+    let tokenCalls = 0;
+    const auth = new AuthModule(makeContext());
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      tokenCalls += 1;
+      if (tokenCalls === 1) throw new Error("offline");
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            access_token: "device-access-token",
+            refresh_token: "device-refresh-token",
+            expires_in: 3600,
+            scope: "User.Read offline_access",
+          },
+        } as obsidian.RequestUrlResponse;
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "Device User", id: "device-account" },
+      } as obsidian.RequestUrlResponse;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    await vi.advanceTimersByTimeAsync(5000); // poll 1 — network error
+    expect(auth.deviceAttempt?.phase).toBe("waiting");
+    await vi.advanceTimersByTimeAsync(5000); // poll 2 — success
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(auth.deviceAttempt).toBeNull();
+  });
+
+  it("marks mismatch when the provider reports bad_verification_code", async () => {
+    vi.useFakeTimers();
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      return {
+        status: 400,
+        headers: {},
+        json: { error: "bad_verification_code" },
+      } as obsidian.RequestUrlResponse;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(auth.deviceAttempt?.phase).toBe("mismatch");
+    expect(auth.isPending).toBe(false);
+  });
+
+  it("marks expired when the provider reports expired_token", async () => {
+    vi.useFakeTimers();
+    let tokenCalls = 0;
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      tokenCalls += 1;
+      return {
+        status: 400,
+        headers: {},
+        json: { error: "expired_token" },
+      } as obsidian.RequestUrlResponse;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(auth.deviceAttempt?.phase).toBe("expired");
+    expect(auth.isPending).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(tokenCalls).toBe(1);
+  });
+
+  it("stops polling with a generic failure phase on unexpected provider errors", async () => {
+    vi.useFakeTimers();
+    let tokenCalls = 0;
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      tokenCalls += 1;
+      return {
+        status: 500,
+        headers: {},
+        json: { error: "server_error" },
+      } as obsidian.RequestUrlResponse;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(auth.deviceAttempt?.phase).toBe("failed");
+    expect(auth.isPending).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(tokenCalls).toBe(1);
+  });
+
+  it("cancels the attempt and stops all polling", async () => {
+    vi.useFakeTimers();
+    let tokenCalls = 0;
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      tokenCalls += 1;
+      return pendingTokenResponse() as obsidian.RequestUrlResponse;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    auth.cancelPendingLogin();
+
+    expect(auth.deviceAttempt).toBeNull();
+    expect(auth.isPending).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(tokenCalls).toBe(0);
+  });
+
+  it("replaces the previous attempt when regenerating", async () => {
+    vi.useFakeTimers();
+    const tokenCalls: string[] = [];
+    let deviceCodeRequests = 0;
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        deviceCodeRequests += 1;
+        return {
+          ...DEVICE_CODE_RESPONSE,
+          json: {
+            ...DEVICE_CODE_RESPONSE.json,
+            device_code: `device-secret-${deviceCodeRequests}`,
+            user_code: deviceCodeRequests === 1 ? "ABCDEFGHI" : "JKLMNOPQR",
+          },
+        } as obsidian.RequestUrlResponse;
+      }
+      tokenCalls.push(String(options.body));
+      return pendingTokenResponse() as obsidian.RequestUrlResponse;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    await auth.beginDeviceCodeLogin();
+
+    expect(deviceCodeRequests).toBe(2);
+    expect(auth.deviceAttempt?.userCode).toBe("JKLMNOPQR");
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(tokenCalls).toHaveLength(1);
+    expect(tokenCalls[0]).toContain("device_code=device-secret-2");
+  });
+
+  it("clears a device attempt on logout and stops polling", async () => {
+    vi.useFakeTimers();
+    let tokenCalls = 0;
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      tokenCalls += 1;
+      return pendingTokenResponse() as obsidian.RequestUrlResponse;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    await expect(auth.logout()).resolves.toBe(true);
+
+    expect(auth.deviceAttempt).toBeNull();
+    expect(auth.isPending).toBe(false);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(tokenCalls).toBe(0);
+  });
+
+  it("does not commit a stale poll result after the attempt is replaced", async () => {
+    vi.useFakeTimers();
+    const secretSet = vi.fn().mockResolvedValue(undefined);
+    const token = deferred<obsidian.RequestUrlResponse>();
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: secretSet,
+        get: vi.fn().mockResolvedValue(null),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+    }));
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      return token.promise;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    await vi.advanceTimersByTimeAsync(5000); // poll in flight
+    auth.cancelPendingLogin();
+    token.resolve({
+      status: 200,
+      headers: {},
+      json: {
+        access_token: "stale-device-token",
+        refresh_token: "stale-device-refresh",
+        expires_in: 3600,
+        scope: "User.Read offline_access",
+      },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(secretSet).not.toHaveBeenCalled();
+    expect(auth.authState.isLoggedIn).toBe(false);
+    expect(auth.deviceAttempt).toBeNull();
+  });
+
+  it("runs an immediate poll on manual check and keeps the chain alive", async () => {
+    vi.useFakeTimers();
+    let tokenCalls = 0;
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      tokenCalls += 1;
+      return pendingTokenResponse() as obsidian.RequestUrlResponse;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    expect(tokenCalls).toBe(0);
+
+    await expect(auth.checkDeviceCodeNow()).resolves.toBe(true);
+    expect(tokenCalls).toBe(1);
+    expect(auth.deviceAttempt?.phase).toBe("waiting");
+
+    // The one-shot chain rescheduled itself after the manual tick.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(tokenCalls).toBe(2);
+  });
+
+  it("respects a minimum gap between immediate checks against focus storms", async () => {
+    vi.useFakeTimers();
+    let tokenCalls = 0;
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      tokenCalls += 1;
+      return pendingTokenResponse() as obsidian.RequestUrlResponse;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    await expect(auth.checkDeviceCodeNow()).resolves.toBe(true);
+    expect(tokenCalls).toBe(1);
+
+    // Immediately after a tick the manual check is a no-op — no provider spam.
+    await expect(auth.checkDeviceCodeNow()).resolves.toBe(false);
+    expect(tokenCalls).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(2000);
+    await expect(auth.checkDeviceCodeNow()).resolves.toBe(true);
+    expect(tokenCalls).toBe(2);
+  });
+
+  it("awaits an in-flight tick instead of racing a manual check", async () => {
+    vi.useFakeTimers();
+    const token = deferred<obsidian.RequestUrlResponse>();
+    let tokenCalls = 0;
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      tokenCalls += 1;
+      return token.promise;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    const check = auth.checkDeviceCodeNow();
+    const racing = auth.checkDeviceCodeNow(); // shares the in-flight tick
+    expect(tokenCalls).toBe(1);
+
+    token.resolve(pendingTokenResponse());
+    await expect(check).resolves.toBe(true);
+    await expect(racing).resolves.toBe(false);
+    expect(tokenCalls).toBe(1);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(tokenCalls).toBe(2);
+  });
+
+  it("skips manual checks without a waiting device attempt", async () => {
+    const auth = makeAuth(async () => {
+      throw new Error("unexpected request");
+    });
+
+    await expect(auth.checkDeviceCodeNow()).resolves.toBe(false);
+  });
+
+  it("does not poll a terminal attempt on manual check", async () => {
+    vi.useFakeTimers();
+    let tokenCalls = 0;
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      tokenCalls += 1;
+      return {
+        status: 400,
+        headers: {},
+        json: { error: "authorization_declined" },
+      } as obsidian.RequestUrlResponse;
+    });
+
+    await auth.beginDeviceCodeLogin();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(auth.deviceAttempt?.phase).toBe("declined");
+
+    await expect(auth.checkDeviceCodeNow()).resolves.toBe(false);
+    expect(tokenCalls).toBe(1);
+  });
+});
+
 describe("generateCodeChallengeSync", () => {
   it("produces the same result as the async Web Crypto version", async () => {
     // Import the ACTUAL module (bypass vi.mock) to get the real functions

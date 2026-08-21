@@ -513,6 +513,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
     const authEntry = resolveAuthEntryPresentation({
       isInitializing: auth?.isInitializing ?? false,
       isPending: auth?.isPending ?? false,
+      isDevicePending: (auth?.deviceAttempt ?? null) !== null,
     });
     accountGroup.addSetting((setting) => {
       setting

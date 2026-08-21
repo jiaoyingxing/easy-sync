@@ -6,7 +6,7 @@ import {
 } from "../src/ui/auth-entry-flow";
 
 const modalState = vi.hoisted(() => ({
-  action: "dismiss" as "recheck" | "reopen" | "dismiss",
+  action: "dismiss" as "recheck" | "reopen" | "cancel" | "dismiss",
   copy: false,
 }));
 
@@ -22,6 +22,7 @@ vi.mock("../src/ui/auth-pending-modal", () => ({
       _recheckLabel: string,
       _copyLabel: string,
       _reopenLabel: string,
+      _cancelLabel: string,
       onCopy?: () => void | Promise<void>,
       onReopen?: () => void,
     ) {
@@ -37,31 +38,115 @@ vi.mock("../src/ui/auth-pending-modal", () => ({
   },
 }));
 
+const methodModalState = vi.hoisted(() => ({
+  action: "dismiss" as "browser" | "device" | "dismiss",
+  deviceRejects: false,
+  captured: null as null | {
+    browser: { title: string; description: string };
+    device: { title: string; description: string };
+    onBrowserSelect: () => void | Promise<void>;
+    onDeviceSelect: () => Promise<unknown>;
+  },
+}));
+
+vi.mock("../src/ui/auth-method-modal", () => ({
+  AuthMethodModal: class {
+    constructor(
+      _app: unknown,
+      browser: { title: string; description: string },
+      device: { title: string; description: string },
+      onBrowserSelect: () => void | Promise<void>,
+      onDeviceSelect: () => Promise<unknown>,
+    ) {
+      methodModalState.captured = {
+        browser,
+        device,
+        onBrowserSelect,
+        onDeviceSelect,
+      };
+    }
+
+    async awaitAction(): Promise<{ action: "browser" | "device" | "dismiss" }> {
+      if (methodModalState.action === "browser") {
+        // The real modal invokes the callback inside the option's click
+        // handler — before any await — so login stays on the gesture chain.
+        await methodModalState.captured?.onBrowserSelect();
+        return { action: "browser" };
+      }
+      if (methodModalState.action === "device") {
+        if (methodModalState.deviceRejects) {
+          try {
+            await methodModalState.captured?.onDeviceSelect();
+          } catch {
+            // The real modal stays open with the option re-enabled; the
+            // entry-flow promise therefore never settles in this case.
+            return new Promise(() => undefined);
+          }
+        } else {
+          await methodModalState.captured?.onDeviceSelect();
+          return { action: "device" };
+        }
+      }
+      return { action: "dismiss" };
+    }
+  },
+}));
+
+const deviceModalState = vi.hoisted(() => ({
+  opened: [] as Array<{ app: unknown; deps: Record<string, unknown> }>,
+}));
+
+vi.mock("../src/ui/auth-device-code-modal", () => ({
+  AuthDeviceCodeModal: class {
+    constructor(app: unknown, deps: Record<string, unknown>) {
+      deviceModalState.opened.push({ app, deps });
+    }
+
+    open(): void {}
+  },
+}));
+
 function makeHost(input: {
   isInitializing?: boolean;
   isLoggedIn?: boolean;
   isPending?: boolean;
   pendingAuthUrl?: string | null;
+  deviceAttempt?: Record<string, unknown> | null;
   checkAuthStatus?: boolean;
   login?: ReturnType<typeof vi.fn>;
+  beginDeviceCodeLogin?: ReturnType<typeof vi.fn>;
+  cancelPendingLogin?: ReturnType<typeof vi.fn>;
 } = {}): {
   host: AuthEntryFlowHost;
   login: ReturnType<typeof vi.fn>;
   checkAuthStatus: ReturnType<typeof vi.fn>;
   showNotice: ReturnType<typeof vi.fn>;
+  pendingFlag: { value: boolean };
 } {
-  const login = input.login ?? vi.fn().mockResolvedValue(undefined);
+  const pendingFlag = { value: input.isPending ?? false };
+  const login = input.login ?? vi.fn().mockImplementation(() => {
+    // Mirror AuthModule.login(): the browser opens synchronously, so the
+    // attempt becomes pending before the promise settles.
+    pendingFlag.value = true;
+    return Promise.resolve();
+  });
   const checkAuthStatus = vi.fn(() => input.checkAuthStatus ?? false);
   const showNotice = vi.fn();
   const auth = {
     isInitializing: input.isInitializing ?? false,
-    isPending: input.isPending ?? false,
+    get isPending() {
+      return pendingFlag.value;
+    },
     pendingAuthUrl: input.pendingAuthUrl ?? null,
+    deviceAttempt: input.deviceAttempt ?? null,
     authState: {
       isLoggedIn: input.isLoggedIn ?? false,
     },
     login,
     checkAuthStatus,
+    beginDeviceCodeLogin: input.beginDeviceCodeLogin
+      ?? vi.fn().mockResolvedValue({}),
+    cancelPendingLogin: input.cancelPendingLogin ?? vi.fn(),
   };
   return {
     host: {
@@ -77,6 +162,7 @@ function makeHost(input: {
     login,
     checkAuthStatus,
     showNotice,
+    pendingFlag,
   };
 }
 
@@ -95,8 +181,18 @@ describe("resolveAuthEntryPresentation", () => {
       isInitializing: false,
       isPending: true,
     })).toEqual({
-      labelKey: "settings.account.checking",
+      labelKey: "settings.account.confirmAfterBrowser",
       descriptionKey: "settings.account.desc.pending",
+      disabled: false,
+      cta: true,
+    });
+    expect(resolveAuthEntryPresentation({
+      isInitializing: false,
+      isPending: true,
+      isDevicePending: true,
+    })).toEqual({
+      labelKey: "settings.account.resumeDevice",
+      descriptionKey: "settings.account.desc.devicePending",
       disabled: false,
       cta: true,
     });
@@ -116,25 +212,112 @@ describe("handleAuthEntryAction", () => {
   beforeEach(() => {
     modalState.action = "dismiss";
     modalState.copy = false;
+    methodModalState.action = "dismiss";
+    methodModalState.deviceRejects = false;
+    methodModalState.captured = null;
+    deviceModalState.opened.length = 0;
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
   });
 
-  it("starts a fresh login synchronously with the UI click chain", async () => {
-    let actionReturned = false;
-    const login = vi.fn(() => {
-      expect(actionReturned).toBe(false);
-      return Promise.resolve();
-    });
-    const { host } = makeHost({ login });
+  it("presents the method chooser before any fresh login", async () => {
+    const { host, login } = makeHost();
+
+    await handleAuthEntryAction(host);
+
+    expect(methodModalState.captured).not.toBeNull();
+    expect(methodModalState.captured?.browser.title).toBe(
+      "settings.account.method.browser.name",
+    );
+    expect(methodModalState.captured?.browser.description).toBe(
+      "settings.account.method.browser.desc",
+    );
+    expect(methodModalState.captured?.device.title).toBe(
+      "settings.account.method.device.name",
+    );
+    expect(login).not.toHaveBeenCalled();
+  });
+
+  it("starts the browser login synchronously and guides the user back (D4)", async () => {
+    methodModalState.action = "browser";
+    const { host, login, showNotice, pendingFlag } = makeHost();
 
     const result = handleAuthEntryAction(host);
-    actionReturned = true;
+    // The browser opens synchronously inside the option click chain:
+    // the attempt is already pending before the action promise settles.
+    expect(pendingFlag.value).toBe(true);
     await result;
 
     expect(login).toHaveBeenCalledOnce();
+    expect(deviceModalState.opened).toHaveLength(0);
+    expect(showNotice).toHaveBeenCalledWith({
+      key: "settings-login-browser-opened",
+      message: "settings.account.browserOpened",
+      priority: 30,
+    });
+  });
+
+  it("issues the devicecode request and opens the waiting modal on success", async () => {
+    methodModalState.action = "device";
+    const beginDeviceCodeLogin = vi.fn().mockResolvedValue({
+      userCode: "ABCDEFGHI",
+    });
+    const cancelPendingLogin = vi.fn();
+    const { host, login, showNotice } = makeHost({
+      beginDeviceCodeLogin,
+      cancelPendingLogin,
+    });
+
+    await handleAuthEntryAction(host);
+
+    expect(beginDeviceCodeLogin).toHaveBeenCalledOnce();
+    expect(login).not.toHaveBeenCalled();
+    expect(deviceModalState.opened).toHaveLength(1);
+    expect(deviceModalState.opened[0].deps.auth).toBe(host.auth);
+    expect(showNotice).not.toHaveBeenCalled();
+    expect(cancelPendingLogin).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a devicecode request failure and keeps the chooser open", async () => {
+    methodModalState.action = "device";
+    methodModalState.deviceRejects = true;
+    const beginDeviceCodeLogin = vi.fn().mockRejectedValue(
+      new Error("offline"),
+    );
+    const cancelPendingLogin = vi.fn();
+    const { host, showNotice } = makeHost({
+      beginDeviceCodeLogin,
+      cancelPendingLogin,
+    });
+
+    // The chooser stays open on failure, so the entry-flow promise never
+    // settles; give the microtask chain a chance to run.
+    const pending = handleAuthEntryAction(host);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(beginDeviceCodeLogin).toHaveBeenCalledOnce();
+    expect(showNotice).toHaveBeenCalledWith(expect.objectContaining({
+      key: "auth-login-error",
+      message: "offline",
+      priority: 50,
+    }));
+    expect(deviceModalState.opened).toHaveLength(0);
+    expect(cancelPendingLogin).not.toHaveBeenCalled();
+
+    // Keep the never-settling promise from surfacing an unhandled state.
+    void pending;
+  });
+
+  it("cancels a dismissed chooser so an in-flight devicecode request cannot commit", async () => {
+    const cancelPendingLogin = vi.fn();
+    const { host } = makeHost({ cancelPendingLogin });
+
+    await handleAuthEntryAction(host);
+
+    expect(cancelPendingLogin).toHaveBeenCalledOnce();
   });
 
   it("rechecks a pending login through the shared modal without opening another browser", async () => {
@@ -172,6 +355,40 @@ describe("handleAuthEntryAction", () => {
     await result;
 
     expect(login).toHaveBeenCalledOnce();
+  });
+
+  it("cancels a pending login and reopens the method chooser so the user can switch methods", async () => {
+    modalState.action = "cancel";
+    const cancelPendingLogin = vi.fn();
+    const { host, login } = makeHost({
+      isPending: true,
+      cancelPendingLogin,
+    });
+
+    await handleAuthEntryAction(host);
+
+    // First call abandons the pending attempt; the reopened chooser then
+    // resolves to "dismiss", whose guard calls cancel again (idempotent).
+    expect(cancelPendingLogin).toHaveBeenCalledTimes(2);
+    expect(login).not.toHaveBeenCalled();
+    expect(methodModalState.captured).not.toBeNull();
+  });
+
+  it("reopens the same device-code attempt instead of issuing a new code", async () => {
+    const beginDeviceCodeLogin = vi.fn();
+    const { host } = makeHost({
+      isPending: true,
+      deviceAttempt: { userCode: "ABCDEFGHI", phase: "waiting" },
+      beginDeviceCodeLogin,
+    });
+
+    await handleAuthEntryAction(host);
+
+    // Re-entry reopens the waiting modal bound to the SAME attempt — no new
+    // devicecode request, no browser pending modal, no method chooser.
+    expect(deviceModalState.opened).toHaveLength(1);
+    expect(beginDeviceCodeLogin).not.toHaveBeenCalled();
+    expect(methodModalState.captured).toBeNull();
   });
 
   it("copies the exact current pending URL without starting another login", async () => {

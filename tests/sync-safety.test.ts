@@ -13,7 +13,7 @@
 import { readFileSync } from "node:fs";
 import { describe, it, expect, vi } from "vitest";
 import * as obsidian from "obsidian";
-import { Platform, TFile, type Plugin } from "obsidian";
+import { Platform, TFile, TFolder, type Plugin } from "obsidian";
 import { sha256Hex } from "../src/crypto";
 import { getEasySyncPaths } from "../src/obsidian-compat";
 import { sameSyncScope, SyncActionType } from "../src/sync/types";
@@ -9928,6 +9928,313 @@ describe("Persistent remote delta state", () => {
     expect(state.remoteDeltaLink).toBe("https://graph.example/delta-rebuilt");
   });
 
+  it("removes a cached empty remote folder incrementally when its delta reports deletion", async () => {
+    const state = makeActiveV2State([], [], {
+      remoteFolders: [{
+        path: "old-folder",
+        driveId: "folder-id",
+        parentId: TEST_SYNC_SCOPE.filesRootId,
+        name: "old-folder",
+      }],
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [{
+        id: "folder-id",
+        deleted: { state: "deleted" },
+      }],
+      "@odata.deltaLink": "https://graph.example/delta-2",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getDelta }),
+      {
+        ...emptyScanner(),
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(getDelta).toHaveBeenCalledTimes(1);
+    expect(getDelta).toHaveBeenCalledWith("testVault", "delta-token");
+    expect(state.remoteFolders).toEqual([]);
+    expect(state.remoteDeltaLink).toBe("https://graph.example/delta-2");
+  });
+
+  it("removes a cached remote folder subtree incrementally when the delta deletes only the top folder", async () => {
+    const state = makeActiveV2State([{
+      path: "old-folder/child.md",
+      driveId: "child-id",
+      parentId: "folder-id",
+      size: 3,
+      mtime: 1,
+      eTag: "etag-child",
+      cTag: "ctag-child",
+      sha256Hash: "aa".repeat(32),
+    }, {
+      path: "old-folder/nested/deep.md",
+      driveId: "deep-id",
+      parentId: "nested-id",
+      size: 3,
+      mtime: 1,
+      eTag: "etag-deep",
+      cTag: "ctag-deep",
+      sha256Hash: "bb".repeat(32),
+    }], [], {
+      remoteFolders: [
+        {
+          path: "old-folder",
+          driveId: "folder-id",
+          parentId: TEST_SYNC_SCOPE.filesRootId,
+          name: "old-folder",
+        },
+        {
+          path: "old-folder/nested",
+          driveId: "nested-id",
+          parentId: "folder-id",
+          name: "nested",
+        },
+      ],
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [{
+        id: "folder-id",
+        deleted: { state: "deleted" },
+      }],
+      "@odata.deltaLink": "https://graph.example/delta-2",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getDelta }),
+      {
+        ...emptyScanner(),
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(getDelta).toHaveBeenCalledTimes(1);
+    expect(state.remoteSnapshot).toEqual([]);
+    expect(state.remoteFolders).toEqual([]);
+    expect(state.remoteDeltaLink).toBe("https://graph.example/delta-2");
+  });
+
+  it("removes nested cached folders incrementally when the delta reports each deletion", async () => {
+    const state = makeActiveV2State([{
+      path: "old-folder/child.md",
+      driveId: "child-id",
+      parentId: "folder-id",
+      size: 3,
+      mtime: 1,
+      eTag: "etag-child",
+      cTag: "ctag-child",
+      sha256Hash: "aa".repeat(32),
+    }, {
+      path: "old-folder/nested/deep.md",
+      driveId: "deep-id",
+      parentId: "nested-id",
+      size: 3,
+      mtime: 1,
+      eTag: "etag-deep",
+      cTag: "ctag-deep",
+      sha256Hash: "bb".repeat(32),
+    }], [], {
+      remoteFolders: [
+        {
+          path: "old-folder",
+          driveId: "folder-id",
+          parentId: TEST_SYNC_SCOPE.filesRootId,
+          name: "old-folder",
+        },
+        {
+          path: "old-folder/nested",
+          driveId: "nested-id",
+          parentId: "folder-id",
+          name: "nested",
+        },
+      ],
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [
+        { id: "child-id", deleted: { state: "deleted" } },
+        { id: "nested-id", deleted: { state: "deleted" } },
+        { id: "folder-id", deleted: { state: "deleted" } },
+      ],
+      "@odata.deltaLink": "https://graph.example/delta-2",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getDelta }),
+      {
+        ...emptyScanner(),
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(getDelta).toHaveBeenCalledTimes(1);
+    expect(state.remoteSnapshot).toEqual([]);
+    expect(state.remoteFolders).toEqual([]);
+    expect(state.remoteDeltaLink).toBe("https://graph.example/delta-2");
+  });
+
+  it("still rebuilds when a live descendant arrives in the same delta batch", async () => {
+    const state = makeActiveV2State([{
+      path: "old-folder/child.md",
+      driveId: "child-id",
+      parentId: "folder-id",
+      size: 3,
+      mtime: 1,
+      eTag: "etag-child",
+      cTag: "ctag-child",
+      sha256Hash: "aa".repeat(32),
+    }], [], {
+      remoteFolders: [{
+        path: "old-folder",
+        driveId: "folder-id",
+        parentId: TEST_SYNC_SCOPE.filesRootId,
+        name: "old-folder",
+      }],
+    });
+    const getDelta = vi.fn()
+      .mockResolvedValueOnce({
+        value: [
+          driveItem("old-folder/child.md", "cc".repeat(32), {
+            id: "child-id",
+            parentReference: { id: "folder-id" },
+            eTag: "etag-child-new",
+          }),
+          { id: "folder-id", deleted: { state: "deleted" } },
+        ],
+        "@odata.deltaLink": "https://graph.example/delta-unsafe",
+      })
+      .mockResolvedValueOnce({
+        value: [],
+        "@odata.deltaLink": "https://graph.example/delta-rebuilt",
+      });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getDelta }),
+      {
+        ...emptyScanner(),
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(getDelta.mock.calls.map((call) => call[1])).toEqual([
+      "delta-token",
+      undefined,
+    ]);
+    expect(state.remoteSnapshot).toEqual([]);
+    expect(state.remoteDeltaLink).toBe("https://graph.example/delta-rebuilt");
+  });
+
+  it("still rebuilds when the same delta batch creates an item inside the deleted subtree", async () => {
+    const state = makeActiveV2State([{
+      path: "old-folder/child.md",
+      driveId: "child-id",
+      parentId: "folder-id",
+      size: 3,
+      mtime: 1,
+      eTag: "etag-child",
+      cTag: "ctag-child",
+      sha256Hash: "aa".repeat(32),
+    }], [], {
+      remoteFolders: [{
+        path: "old-folder",
+        driveId: "folder-id",
+        parentId: TEST_SYNC_SCOPE.filesRootId,
+        name: "old-folder",
+      }],
+    });
+    const getDelta = vi.fn()
+      .mockResolvedValueOnce({
+        value: [
+          { id: "folder-id", deleted: { state: "deleted" } },
+          driveItem("old-folder/new.md", "dd".repeat(32), {
+            id: "new-id",
+            parentReference: { id: "folder-id" },
+          }),
+        ],
+        "@odata.deltaLink": "https://graph.example/delta-unsafe",
+      })
+      .mockResolvedValueOnce({
+        value: [],
+        "@odata.deltaLink": "https://graph.example/delta-rebuilt",
+      });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getDelta }),
+      {
+        ...emptyScanner(),
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(getDelta.mock.calls.map((call) => call[1])).toEqual([
+      "delta-token",
+      undefined,
+    ]);
+    expect(state.remoteSnapshot).toEqual([]);
+    expect(state.remoteDeltaLink).toBe("https://graph.example/delta-rebuilt");
+  });
+
   it("projects a complete Graph-shaped snapshot from the known files root only", async () => {
     const fixture = JSON.parse(readFileSync(
       new URL("./fixtures/graph-live-contract-success-20260717.json", import.meta.url),
@@ -16291,5 +16598,377 @@ describe("batch remote-delete absence verification", () => {
     // adopted by the next ordinary round instead of a per-item re-check.
     expect(harness.removedPaths.sort()).toEqual(["a.md", "b.md"]);
     expect(harness.getFileMetadata).not.toHaveBeenCalled();
+  });
+});
+
+describe("folder confirm-delete batch absence verification", () => {
+  interface FolderDeleteConfirmInput {
+    paths: readonly string[];
+    batchAbsent?: (paths: readonly string[]) => Promise<Map<string, unknown>>;
+    batchError?: Error;
+    /** Folder paths whose per-item by-path remote check reports the folder still present. */
+    remotePresentPaths?: readonly string[];
+    /** Folder anchor remoteIds reported present by the by-ID metadata guard. */
+    remotePresentByIds?: readonly string[];
+  }
+
+  async function makeFolderDeleteConfirmHarness(input: FolderDeleteConfirmInput) {
+    const scope = { ...TEST_SYNC_SCOPE, accountId: "account-test" };
+    const parentRemoteId = "committed-parent-id";
+
+    // One pending folder delete per path. `folder.remoteId` truthy routes the
+    // confirm through the deleteLocalFolder branch.
+    const pendingRemoteDeletes: SyncPlanItem[] = input.paths.map((path, index) => ({
+      type: SyncActionType.ConfirmLocalDelete,
+      path,
+      folder: {
+        remoteId: `remote-${index}`,
+        parentRemoteId,
+        parentPath: "",
+        childCount: 0,
+      },
+    } as unknown as SyncPlanItem));
+
+    // Build a committed V2 envelope whose folder anchors resolve each pending
+    // folder by remoteId AND lastPath, matching the deleteLocalFolder lookup.
+    const baseEntries: BaseFileEntry[] = [];
+    const remoteEntries: RemoteFileEntry[] = [];
+    const remoteFolders: RemoteFolderEntry[] = [];
+    const envelope = createFileStateShadowEnvelopeV2({
+      scope,
+      lifecycleEpoch: 1,
+      commitSeq: 1,
+      committedAt: 1,
+      remoteEntries,
+      remoteFolders,
+      baseEntries,
+    });
+    const byAnchorId: Record<string, import("../src/sync/state-envelope-v2").FolderAnchorV2> = {};
+    input.paths.forEach((path, index) => {
+      const anchorId = `folder-anchor-${index}`;
+      byAnchorId[anchorId] = {
+        anchorId,
+        remoteId: `remote-${index}`,
+        lastPath: path,
+        parentRemoteId,
+        confirmedGeneration: 1,
+        confirmedAt: 1,
+      };
+    });
+    envelope.folderAnchors = {
+      schemaVersion: 2,
+      byAnchorId,
+    };
+
+    // `trashFile` flips the folder to absent so the read-back passes.
+    const trashed = new Set<string>();
+    const trashFile = vi.fn(async (folder: unknown) => {
+      trashed.add((folder as { path?: string }).path ?? "");
+    });
+    const vault = {
+      configDir: ".obsidian",
+      adapter: makeMockAdapter({
+        exists: vi.fn().mockResolvedValue(false),
+        list: vi.fn(async () => ({ files: [], folders: [] })),
+      }),
+      getFileByPath: vi.fn().mockReturnValue(null),
+      getFiles: vi.fn().mockReturnValue([]),
+      getName: vi.fn().mockReturnValue("testVault"),
+      getAbstractFileByPath: vi.fn((path: string) =>
+        trashed.has(path) ? null : new TFolder(path)),
+    };
+
+    const state = {
+      ...remoteStateStub(),
+      isV2StateActive: true,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+      hasMutationLedgerCorruption: false,
+      mutationLedger: [],
+      boundAccountId: scope.accountId,
+      remoteScope: scope,
+      pendingRemoteDeletes,
+      planReviewRevision: 0,
+      baseSnapshot: [],
+      removePendingDelete: vi.fn().mockResolvedValue(undefined),
+      addPendingConflict: vi.fn().mockResolvedValue(undefined),
+      getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
+      retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
+    } as unknown as StateManager;
+
+    // Per-item by-path remote check backing `inspectRemoteFolder`. Aliased as
+    // `getDriveItemMetadata` (which `inspectRemoteFolder` actually calls) and
+    // exposed as `getFileMetadata` for the batch-fallback assertions.
+    const getFileMetadata = vi.fn(async (_vaultName: string, path: string) => {
+      if (input.remotePresentPaths?.includes(path)) {
+        return {
+          eTag: "etag-reappeared",
+          cTag: "ctag-reappeared",
+          size: 1,
+          driveId: "reappeared-id",
+          parentId: scope.filesRootId,
+          mtime: 2,
+          sha256Hash: "aa".repeat(32),
+        };
+      }
+      return null;
+    });
+    const getDriveItemMetadata = getFileMetadata;
+    const getDriveItemMetadataById = vi.fn(async (driveItemId: string) => {
+      if (input.remotePresentByIds?.includes(driveItemId)) {
+        return {
+          id: driveItemId,
+          eTag: "etag-by-id",
+          name: "still-present",
+          parentReference: { id: parentRemoteId },
+        } as DriveItem;
+      }
+      return null;
+    });
+    const getFileMetadataByPaths = input.batchError
+      ? vi.fn(async () => { throw input.batchError; })
+      : input.batchAbsent
+        ? vi.fn(async (_vaultName: string, paths: readonly string[]) =>
+            input.batchAbsent!(paths))
+        : vi.fn(async (_vaultName: string, paths: readonly string[]) =>
+            new Map(paths.map((path) => [path, null])));
+    const onedrive = makeMockOneDrive({
+      getFileMetadata,
+      getDriveItemMetadata,
+      getFileMetadataByPaths,
+      getDriveItemMetadataById,
+    });
+
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault,
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+        inspectFile: vi.fn(async () => ({ status: "missing" as const })),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+      undefined,
+      undefined,
+      undefined,
+      { trashFile } as unknown as import("obsidian").FileManager,
+    );
+
+    return {
+      executor,
+      getFileMetadata,
+      getFileMetadataByPaths,
+      getDriveItemMetadataById,
+      trashFile,
+      trashed,
+      state,
+      vault,
+      scope,
+    };
+  }
+
+  it("pre-verifies a whole folder batch once and skips per-item by-path remote checks", async () => {
+    const paths = Array.from({ length: 25 }, (_unused, index) => `Folder-${index}`);
+    const harness = await makeFolderDeleteConfirmHarness({ paths });
+
+    await harness.executor.confirmRemoteDeletes(paths);
+
+    expect(harness.getFileMetadataByPaths).toHaveBeenCalledTimes(1);
+    expect(harness.getFileMetadataByPaths.mock.calls).toEqual([
+      ["testVault", [...paths].sort()],
+    ]);
+    expect(harness.getFileMetadata).not.toHaveBeenCalled();
+    expect(harness.trashFile).toHaveBeenCalledTimes(25);
+    expect([...harness.trashed].sort()).toEqual([...paths].sort());
+    expect(harness.executor.hasSideActionsInFlight).toBe(false);
+  });
+
+  it("falls back to per-item remote checks for folders when the batch read fails", async () => {
+    const paths = Array.from({ length: 4 }, (_unused, index) => `Folder-${index}`);
+    const harness = await makeFolderDeleteConfirmHarness({
+      paths,
+      batchError: new OneDriveError(OneDriveErrorType.NetworkError, "offline"),
+    });
+
+    await harness.executor.confirmRemoteDeletes(paths);
+
+    expect(harness.getFileMetadata).toHaveBeenCalledTimes(paths.length);
+    expect(harness.getFileMetadata.mock.calls.map((call) => call[1]).sort())
+      .toEqual([...paths].sort());
+    expect(harness.trashFile).toHaveBeenCalledTimes(paths.length);
+  });
+
+  it("skips only the by-path check while still guarding by ID for a preverified folder", async () => {
+    const paths = ["FolderA"];
+    const harness = await makeFolderDeleteConfirmHarness({
+      paths,
+      remotePresentByIds: ["remote-0"],
+    });
+
+    await harness.executor.confirmRemoteDeletes(paths);
+
+    expect(harness.getDriveItemMetadataById).toHaveBeenCalledWith("remote-0");
+    expect(harness.getFileMetadata).not.toHaveBeenCalled();
+    expect(harness.trashFile).not.toHaveBeenCalled();
+  });
+
+  it("blocks a preverified folder whose path reappeared in the batch", async () => {
+    const paths = ["FolderA", "FolderB"];
+    const harness = await makeFolderDeleteConfirmHarness({
+      paths,
+      remotePresentPaths: ["FolderB"],
+      batchAbsent: async (batchPaths: readonly string[]) =>
+        new Map(batchPaths.map((path) =>
+          [path, path === "FolderB" ? { id: "reappeared" } : null])),
+    });
+
+    await harness.executor.confirmRemoteDeletes(paths);
+
+    expect([...harness.trashed].sort()).toEqual(["FolderA"]);
+    expect(harness.getFileMetadata.mock.calls).toEqual([["testVault", "FolderB"]]);
+  });
+
+  it("handles a mixed file+folder batch with one shared batch read", async () => {
+    const paths = ["note-a.md", "FolderA", "note-b.md", "Parent/Child"];
+    // Two entries are files (pending.folder absent) and two are folders.
+    const pendingByKind: Record<string, "file" | "folder"> = {
+      "note-a.md": "file",
+      "note-b.md": "file",
+      "FolderA": "folder",
+      "Parent/Child": "folder",
+    };
+    const scope = { ...TEST_SYNC_SCOPE, accountId: "account-test" };
+    const parentRemoteId = "committed-parent-id";
+    const pendingRemoteDeletes: SyncPlanItem[] = paths.map((path, index) => {
+      const kind = pendingByKind[path];
+      if (kind === "folder") {
+        return {
+          type: SyncActionType.ConfirmLocalDelete,
+          path,
+          folder: {
+            remoteId: `remote-${index}`,
+            parentRemoteId,
+            parentPath: "",
+            childCount: 0,
+          },
+        } as unknown as SyncPlanItem;
+      }
+      return {
+        type: SyncActionType.ConfirmLocalDelete,
+        path,
+        local: { path, hash: "aa".repeat(32), size: 1, mtime: 1, binary: false },
+      } as unknown as SyncPlanItem;
+    });
+    const batchPaths = new Set<string>();
+    const getFileMetadataByPaths = vi.fn(async (_vaultName: string, batch: readonly string[]) => {
+      for (const path of batch) batchPaths.add(path);
+      return new Map(batch.map((path) => [path, null]));
+    });
+    const getFileMetadata = vi.fn(async () => null);
+    const getDriveItemMetadataById = vi.fn(async () => null);
+    const trashed = new Set<string>();
+    const trashFile = vi.fn(async (folder: unknown) => {
+      trashed.add((folder as { path?: string }).path ?? "");
+    });
+    const adapter = makeMockAdapter({
+      exists: vi.fn().mockResolvedValue(false),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      remove: vi.fn(async (path: string) => {
+        trashed.add(path);
+      }),
+    });
+    const envelope = createFileStateShadowEnvelopeV2({
+      scope,
+      lifecycleEpoch: 1,
+      commitSeq: 1,
+      committedAt: 1,
+      remoteEntries: [],
+      remoteFolders: [],
+      baseEntries: [],
+    });
+    const byAnchorId: Record<string, import("../src/sync/state-envelope-v2").FolderAnchorV2> = {};
+    paths.forEach((path, index) => {
+      if (pendingByKind[path] !== "folder") return;
+      const anchorId = `folder-anchor-${index}`;
+      byAnchorId[anchorId] = {
+        anchorId,
+        remoteId: `remote-${index}`,
+        lastPath: path,
+        parentRemoteId,
+        confirmedGeneration: 1,
+        confirmedAt: 1,
+      };
+    });
+    envelope.folderAnchors = { schemaVersion: 2, byAnchorId };
+    const state = {
+      ...remoteStateStub(),
+      isV2StateActive: true,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+      hasMutationLedgerCorruption: false,
+      mutationLedger: [],
+      boundAccountId: scope.accountId,
+      remoteScope: scope,
+      pendingRemoteDeletes,
+      planReviewRevision: 0,
+      baseSnapshot: [],
+      removePendingDelete: vi.fn().mockResolvedValue(undefined),
+      addPendingConflict: vi.fn().mockResolvedValue(undefined),
+      getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
+      retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
+    } as unknown as StateManager;
+    const vault = {
+      configDir: ".obsidian",
+      adapter,
+      getFileByPath: vi.fn().mockReturnValue(null),
+      getFiles: vi.fn().mockReturnValue([]),
+      getName: vi.fn().mockReturnValue("testVault"),
+      getAbstractFileByPath: vi.fn((path: string) =>
+        trashed.has(path) ? null : new TFolder(path)),
+    };
+    const onedrive = makeMockOneDrive({
+      getFileMetadata,
+      getDriveItemMetadata: getFileMetadata,
+      getFileMetadataByPaths,
+      getDriveItemMetadataById,
+    });
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault,
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+        inspectFile: vi.fn(async (path: string) => ({
+          status: "present" as const,
+          entry: { path, hash: "aa".repeat(32), size: 1, mtime: 1, binary: false },
+        })),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+      undefined,
+      undefined,
+      undefined,
+      { trashFile } as unknown as import("obsidian").FileManager,
+    );
+
+    await executor.confirmRemoteDeletes(paths);
+
+    expect(getFileMetadataByPaths).toHaveBeenCalledTimes(1);
+    expect(batchPaths.size).toBe(paths.length);
+    for (const path of paths) {
+      expect(batchPaths.has(path)).toBe(true);
+    }
+    // Single shared read followed by no fallback per-item by-path checks.
+    expect(getFileMetadata).not.toHaveBeenCalled();
+  });
+
+  it("performs the per-item by-path remote check for a single non-batch folder confirm", async () => {
+    const paths = ["FolderA"];
+    const harness = await makeFolderDeleteConfirmHarness({ paths });
+
+    await harness.executor.confirmRemoteDelete("FolderA");
+
+    expect(harness.getFileMetadata).toHaveBeenCalledTimes(1);
+    expect(harness.getFileMetadata.mock.calls).toEqual([["testVault", "FolderA"]]);
+    expect(harness.trashFile).toHaveBeenCalledTimes(1);
   });
 });

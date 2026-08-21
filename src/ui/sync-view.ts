@@ -1396,6 +1396,8 @@ export class EasySyncSyncView extends ItemView {
       const authEntry = resolveAuthEntryPresentation({
         isInitializing: state.isInitializing,
         isPending: state.isPending,
+        isDevicePending:
+          (this.plugin.auth?.deviceAttempt ?? null) !== null,
       });
       const button = new ButtonComponent(actions)
         .setButtonText(t(authEntry.labelKey));

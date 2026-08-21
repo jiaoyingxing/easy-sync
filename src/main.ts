@@ -820,7 +820,13 @@ export default class EasySyncPlugin extends Plugin {
         this.requestDescendantFileReconstructionContinuation("foreground");
         this.scheduleCommunityPluginLocalReconciliation("foreground");
         this.schedulePersistedCommunityPluginJoinSync("foreground");
+        // Device-code login: check the token endpoint immediately on return
+        // instead of waiting for the next (possibly throttled) poll tick.
+        void this.auth?.checkDeviceCodeNow();
       }
+    });
+    this.registerDomEvent(window, "focus", () => {
+      void this.auth?.checkDeviceCodeNow();
     });
     this.startAutoSync();
 

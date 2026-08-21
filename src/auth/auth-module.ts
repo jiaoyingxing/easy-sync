@@ -13,8 +13,11 @@
 
 import {
   compatClearInterval,
+  compatClearTimeout,
   compatSetInterval,
+  compatSetTimeout,
   IntervalHandle,
+  TimeoutHandle,
 } from "../obsidian-compat";
 import {
   requestUrl,
@@ -22,7 +25,10 @@ import {
 } from "obsidian";
 import {
   type AuthState,
+  type DeviceCodeAttemptView,
+  type DeviceCodeResponse,
   type PendingAuth,
+  type PendingDeviceAuth,
   type TokenResponse,
   AuthError,
   AuthErrorType,
@@ -38,6 +44,17 @@ class AuthOperationInvalidatedError extends Error {
     this.name = "AuthOperationInvalidatedError";
   }
 }
+
+/** Classification of a single device-code token poll. */
+type DevicePollResult =
+  | { status: "pending" }
+  | { status: "slowDown" }
+  | { status: "networkError" }
+  | { status: "declined" }
+  | { status: "expired" }
+  | { status: "mismatch" }
+  | { status: "error" }
+  | { status: "success"; tokens: TokenResponse };
 
 /** Minimal interface for the Obsidian plugin context used by auth */
 export interface AuthPluginContext {
@@ -104,6 +121,19 @@ export class AuthModule {
   /** Polling timer for auto-detecting OAuth callback completion */
   private pollTimer: IntervalHandle | null = null;
 
+  /** One-shot chain timer for device code token polling */
+  private devicePollTimer: TimeoutHandle | null = null;
+
+  /** In-flight poll tick so manual/immediate checks never race a timer tick */
+  private deviceTickPromise: Promise<void> | null = null;
+
+  /** Start time of the last poll tick — immediate checks respect a gap so a
+   *  focus storm cannot hammer the provider faster than its interval */
+  private lastDeviceTickAt = 0;
+
+  /** Poll tick counter for per-tick diagnostics */
+  private deviceTickCount = 0;
+
   /** Callback when auth state changes */
   private onChange: (() => void) | null = null;
 
@@ -149,10 +179,16 @@ export class AuthModule {
     return { ...this.state };
   }
 
-  /** Whether an OAuth flow is in progress (browser opened, awaiting callback).
-   *  Auto-clears after 5 minutes to prevent stale pending state. */
+  /** Whether an OAuth flow is in progress (browser opened awaiting callback,
+   *  or a device code still waiting for approval).
+   *  Browser attempts auto-clear after 5 minutes to prevent stale pending
+   *  state; device attempts stay until success, cancel or a terminal phase. */
   get isPending(): boolean {
     if (!this.pending) return false;
+    if (this.pending.kind === "device") {
+      // Still waiting unless the poll loop reached a terminal phase.
+      return this.pending.phase === undefined;
+    }
     if (Date.now() - this.pending.createdAt > 5 * 60 * 1000) {
       this.diag?.warn("auth", "OAuth pending auth expired after 5 minutes — no callback received");
       this.pending = null;
@@ -163,11 +199,25 @@ export class AuthModule {
     return true;
   }
 
-  /** Exact URL for the current unexpired login attempt.
+  /** Exact URL for the current unexpired browser login attempt.
    *  Kept in memory only so the UI can offer a manual browser fallback. */
   get pendingAuthUrl(): string | null {
     if (!this.isPending) return null;
-    return this.pending?.authUrl ?? null;
+    return this.pending?.kind === "browser" ? this.pending.authUrl : null;
+  }
+
+  /** Live view of the current device-code attempt for the waiting modal.
+   *  null when no device attempt is active (or after it was cancelled). */
+  get deviceAttempt(): DeviceCodeAttemptView | null {
+    const pending = this.pending;
+    if (!pending || pending.kind !== "device") return null;
+    return {
+      userCode: pending.userCode,
+      verificationUri: pending.verificationUri,
+      verificationUriComplete: pending.verificationUriComplete,
+      expiresAt: pending.expiresAt,
+      phase: pending.phase ?? "waiting",
+    };
   }
 
   /** True while initialize() is restoring a session from SecretStorage.
@@ -317,6 +367,7 @@ export class AuthModule {
     // Store the exact URL before opening it so a manual copy uses the same
     // state and PKCE verifier as the callback that this attempt expects.
     this.pending = {
+      kind: "browser",
       codeVerifier,
       state,
       authUrl,
@@ -338,14 +389,330 @@ export class AuthModule {
     this.diag?.log("auth", "polling started");
   }
 
+  /** Start a device code login (RFC 8628).
+   *
+   *  Issues a devicecode request and begins token polling. No browser popup
+   *  is opened here, so this may be awaited freely — the "open verification
+   *  page" action happens later on its own user click inside the modal.
+   *
+   *  Returns the attempt view for the waiting modal; on failure the previous
+   *  attempt is left untouched only if the request itself failed before
+   *  replacing it (the caller decides whether to retry). */
+  async beginDeviceCodeLogin(): Promise<DeviceCodeAttemptView> {
+    this.diag?.log("auth", `beginDeviceCodeLogin() called, isLoggedIn=${this.state.isLoggedIn}, isPending=${!!this.pending}`);
+
+    if (!MS_AUTH_CONFIG.clientId) {
+      throw new AuthError(
+        AuthErrorType.ProviderError,
+        this.tr("auth.error.clientNotConfigured", "OneDrive client ID not configured."),
+      );
+    }
+
+    const generation = ++this.authGeneration;
+    // Replace any previous attempt of either kind.
+    this.pending = null;
+    this.pendingGeneration = null;
+    this.stopPolling();
+    this.stopDevicePolling();
+
+    const body = new URLSearchParams({
+      client_id: MS_AUTH_CONFIG.clientId,
+      scope: MS_AUTH_CONFIG.scopes.join(" "),
+    });
+
+    let response: RequestUrlResponse;
+    try {
+      response = await requestUrl({
+        url: MS_AUTH_CONFIG.deviceCodeEndpoint,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: body.toString(),
+        throw: false,
+      });
+    } catch (e) {
+      throw new AuthError(
+        AuthErrorType.NetworkError,
+        this.tr("auth.error.networkError", "Network error during authentication.", { details: e instanceof Error ? e.message : "unknown" }),
+      );
+    }
+    this.assertGeneration(generation);
+
+    if (response.status !== 200) {
+      const errorData = getOAuthErrorData(response.json);
+      const details = formatOAuthProviderDetails(errorData);
+      this.diag?.error("auth", "devicecode endpoint rejected request", {
+        status: response.status,
+        ...errorData,
+      });
+      throw new AuthError(
+        AuthErrorType.ProviderError,
+        this.tr("auth.error.providerError", `Device code endpoint returned ${response.status}: ${details}`, { details }),
+      );
+    }
+
+    const data = response.json as DeviceCodeResponse;
+    if (
+      !data.user_code
+      || !data.device_code
+      || !data.verification_uri
+      || !data.expires_in
+    ) {
+      this.diag?.error("auth", "devicecode endpoint returned an incomplete response");
+      throw new AuthError(
+        AuthErrorType.ProviderError,
+        this.tr("auth.error.providerError", "Device code response was incomplete."),
+      );
+    }
+
+    // Microsoft currently does not return verification_uri_complete; treat it
+    // as an optional enhancement and fall back to the plain verification page.
+    const pending: PendingDeviceAuth = {
+      kind: "device",
+      deviceCode: data.device_code,
+      userCode: data.user_code,
+      verificationUri: data.verification_uri,
+      verificationUriComplete: data.verification_uri_complete ?? null,
+      expiresAt: Date.now() + data.expires_in * 1000,
+      pollIntervalMs: Math.max(1000, (data.interval ?? 5) * 1000),
+      createdAt: Date.now(),
+    };
+    this.pending = pending;
+    this.pendingGeneration = generation;
+    this.deviceTickCount = 0;
+    this.lastDeviceTickAt = 0;
+
+    this.scheduleDevicePoll(pending.pollIntervalMs);
+    this.notifyChange();
+    this.diag?.log("auth", "device code request accepted, polling started");
+
+    return {
+      userCode: pending.userCode,
+      verificationUri: pending.verificationUri,
+      verificationUriComplete: pending.verificationUriComplete,
+      expiresAt: pending.expiresAt,
+      phase: "waiting",
+    };
+  }
+
+  /** Cancel the current pending login attempt of either kind (modal close,
+   *  cancel button, chooser dismissal). Bumps the generation so an in-flight
+   *  request cannot commit a dangling attempt after cancellation. */
+  cancelPendingLogin(): void {
+    ++this.authGeneration;
+    const hadAttempt = this.pending !== null;
+    if (hadAttempt) this.diag?.log("auth", "pending login cancelled by user");
+    this.pending = null;
+    this.pendingGeneration = null;
+    this.stopDevicePolling();
+    if (hadAttempt) this.notifyChange();
+  }
+
+  /** Immediate one-shot poll for the current waiting device attempt — used by
+   *  the modal's manual "check now" button and by window focus / foreground
+   *  re-checks so a throttled background timer never leaves the modal
+   *  unresponsive after the user returns. Awaits an in-flight tick instead of
+   *  racing it, and respects a 2s gap since the last tick against focus
+   *  storms. Resolves true only when a fresh tick actually ran. */
+  checkDeviceCodeNow(): Promise<boolean> {
+    const pending = this.pending;
+    if (!pending || pending.kind !== "device" || pending.phase !== undefined) {
+      return Promise.resolve(false);
+    }
+    if (this.deviceTickPromise) {
+      return this.deviceTickPromise.then(() => false);
+    }
+    if (Date.now() - this.lastDeviceTickAt < 2000) {
+      return Promise.resolve(false);
+    }
+    this.stopDevicePolling();
+    return this.runDevicePollTick().then(() => true);
+  }
+
+  /** Open a URL in the system browser (delegates to the plugin launcher).
+   *  The device-code modal uses this for the pre-filled verification page;
+   *  the call must happen inside a user click to survive iOS popup rules. */
+  openUrl(url: string): void {
+    this.ctx.openUrl(url);
+  }
+
+  /** One-shot chain timer so slow_down can grow the interval and mobile
+   *  suspension automatically resumes against the expiresAt deadline. */
+  private scheduleDevicePoll(delayMs: number): void {
+    this.devicePollTimer = compatSetTimeout(() => {
+      this.devicePollTimer = null;
+      void this.runDevicePollTick();
+    }, delayMs);
+  }
+
+  private stopDevicePolling(): void {
+    compatClearTimeout(this.devicePollTimer);
+    this.devicePollTimer = null;
+  }
+
+  /** Run one poll tick, deduped: a scheduled timer tick, a manual check and a
+   *  focus re-check all await the same in-flight tick instead of racing it. */
+  private runDevicePollTick(): Promise<void> {
+    if (this.deviceTickPromise) return this.deviceTickPromise;
+    this.deviceTickPromise = this.doDevicePollTick().finally(() => {
+      this.deviceTickPromise = null;
+    });
+    return this.deviceTickPromise;
+  }
+
+  private async doDevicePollTick(): Promise<void> {
+    const pending = this.pending;
+    const generation = this.pendingGeneration;
+    if (
+      !pending
+      || pending.kind !== "device"
+      || generation === null
+      || generation !== this.authGeneration
+      || pending.phase !== undefined
+    ) {
+      return;
+    }
+
+    this.lastDeviceTickAt = Date.now();
+    this.deviceTickCount += 1;
+
+    if (Date.now() >= pending.expiresAt) {
+      pending.phase = "expired";
+      this.diag?.warn("auth", "device code expired before approval");
+      this.notifyChange();
+      return;
+    }
+
+    const result = await this.deviceTokenPoll(pending.deviceCode);
+
+    // The attempt may have been cancelled, regenerated or logged out while
+    // the request was in flight — only commit against the same attempt.
+    if (this.pending !== pending || this.pendingGeneration !== generation) {
+      return;
+    }
+
+    // Every tick leaves a log line so an unresponsive modal is diagnosable:
+    // a steady "pending" cadence proves the chain is alive and the provider
+    // still waits for approval; a gap proves the chain died.
+    this.diag?.log(
+      "auth",
+      `device code poll tick ${this.deviceTickCount}: ${result.status}`,
+    );
+
+    switch (result.status) {
+      case "pending":
+      case "networkError":
+        this.scheduleDevicePoll(pending.pollIntervalMs);
+        break;
+      case "slowDown":
+        pending.pollIntervalMs = Math.min(pending.pollIntervalMs + 5000, 60_000);
+        this.scheduleDevicePoll(pending.pollIntervalMs);
+        break;
+      case "declined":
+        pending.phase = "declined";
+        this.diag?.warn("auth", "device code authorization declined by user");
+        this.notifyChange();
+        break;
+      case "expired":
+        pending.phase = "expired";
+        this.diag?.warn("auth", "device code expired per provider");
+        this.notifyChange();
+        break;
+      case "mismatch":
+        pending.phase = "mismatch";
+        this.diag?.warn("auth", "device code verification mismatch reported by provider");
+        this.notifyChange();
+        break;
+      case "error":
+        pending.phase = "failed";
+        this.notifyChange();
+        break;
+      case "success": {
+        try {
+          await this.completeFreshLogin(result.tokens, generation);
+        } catch (e) {
+          if (e instanceof AuthOperationInvalidatedError) return;
+          this.diag?.error("auth", "device code login completion failed", authErrorDiagData(e));
+          if (this.pending === pending && pending.phase === undefined) {
+            pending.phase = "failed";
+          }
+          this.notifyChange();
+          return;
+        }
+        if (this.pending === pending) {
+          this.pending = null;
+          this.pendingGeneration = null;
+          this.notifyChange();
+        }
+        break;
+      }
+    }
+  }
+
+  /** One token-endpoint poll for a device code. Never throws: transport
+   *  failures become networkError (retried next tick), provider errors are
+   *  classified into the terminal/transient states. */
+  private async deviceTokenPoll(deviceCode: string): Promise<DevicePollResult> {
+    const body = new URLSearchParams({
+      client_id: MS_AUTH_CONFIG.clientId,
+      grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      device_code: deviceCode,
+    });
+
+    let response: RequestUrlResponse;
+    try {
+      response = await requestUrl({
+        url: MS_AUTH_CONFIG.tokenEndpoint,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: body.toString(),
+        throw: false,
+      });
+    } catch (e) {
+      this.diag?.warn("auth", "device code poll network error", authErrorDiagData(e));
+      return { status: "networkError" };
+    }
+
+    if (response.status !== 200) {
+      const errorData = getOAuthErrorData(response.json);
+      switch (errorData.error) {
+        case "authorization_pending":
+          return { status: "pending" };
+        case "slow_down":
+          return { status: "slowDown" };
+        case "authorization_declined":
+          return { status: "declined" };
+        case "expired_token":
+          return { status: "expired" };
+        case "bad_verification_code":
+          return { status: "mismatch" };
+        default:
+          break;
+      }
+      if (response.status === 429) {
+        return { status: "networkError" };
+      }
+      this.diag?.error("auth", "device code poll rejected", {
+        status: response.status,
+        ...errorData,
+      });
+      return { status: "error" };
+    }
+
+    return { status: "success", tokens: response.json as TokenResponse };
+  }
+
   /** Handle the OAuth redirect callback */
   private async handleCallback(params: Record<string, string>): Promise<void> {
     const { code, state, error, error_description } = params;
 
     const pending = this.pending;
     const generation = this.pendingGeneration;
-    if (!pending || generation === null) {
-      this.diag?.warn("auth", "OAuth callback received but no pending auth");
+    if (!pending || pending.kind !== "browser" || generation === null) {
+      this.diag?.warn("auth", "OAuth callback received but no pending browser auth");
       return;
     }
 
@@ -386,29 +753,7 @@ export class AuthModule {
       );
       this.assertGeneration(generation);
 
-      // Store refresh token in SecretStorage
-      if (tokenResponse.refresh_token) {
-        const stored = await this.storeRefreshTokenIfCurrent(
-          tokenResponse.refresh_token,
-          generation,
-        );
-        if (!stored) throw new AuthOperationInvalidatedError();
-      }
-      this.assertGeneration(generation);
-
-      // Update in-memory state
-      this.accessToken = tokenResponse.access_token;
-      this.state.accessTokenExpiry =
-        Date.now() + (tokenResponse.expires_in - 60) * 1000; // 60s buffer
-      this.state.isLoggedIn = true;
-
-      // Fetch user profile (displayName, accountId) for UI display
-      await this.fetchUserProfile(generation, tokenResponse.access_token);
-      this.assertGeneration(generation);
-
-      this.diag?.log("auth", "OAuth login successful");
-      // Fresh auth may have new scope — let listeners reset dependent state
-      this.ctx.onFreshLogin?.();
+      await this.completeFreshLogin(tokenResponse, generation);
     } finally {
       if (this.pending === pending) {
         this.pending = null;
@@ -418,6 +763,38 @@ export class AuthModule {
     }
 
     if (generation === this.authGeneration) this.notifyChange();
+  }
+
+  /** Shared completion tail for every fresh login path (browser callback and
+   *  device code success): persist the refresh token, activate the access
+   *  token, bind /me identity, and let listeners reset dependent state. */
+  private async completeFreshLogin(
+    tokenResponse: TokenResponse,
+    generation: number,
+  ): Promise<void> {
+    // Store refresh token in SecretStorage
+    if (tokenResponse.refresh_token) {
+      const stored = await this.storeRefreshTokenIfCurrent(
+        tokenResponse.refresh_token,
+        generation,
+      );
+      if (!stored) throw new AuthOperationInvalidatedError();
+    }
+    this.assertGeneration(generation);
+
+    // Update in-memory state
+    this.accessToken = tokenResponse.access_token;
+    this.state.accessTokenExpiry =
+      Date.now() + (tokenResponse.expires_in - 60) * 1000; // 60s buffer
+    this.state.isLoggedIn = true;
+
+    // Fetch user profile (displayName, accountId) for UI display
+    await this.fetchUserProfile(generation, tokenResponse.access_token);
+    this.assertGeneration(generation);
+
+    this.diag?.log("auth", "OAuth login successful");
+    // Fresh auth may have new scope — let listeners reset dependent state
+    this.ctx.onFreshLogin?.();
   }
 
   /** Exchange authorization code for access + refresh tokens */
@@ -551,6 +928,7 @@ export class AuthModule {
     this.pending = null;
     this.pendingGeneration = null;
     this.stopPolling();
+    this.stopDevicePolling();
     const refreshTokenRemoved = await this.enqueueSecretStorage(async () => {
       try {
         await this.ctx.secretStorage.remove(SS_REFRESH_TOKEN);

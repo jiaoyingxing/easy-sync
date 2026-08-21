@@ -18253,8 +18253,60 @@ export class SyncExecutor {
           byPath.delete(previous.path);
           driveIdByPathKey.delete(normalizeRemotePathKey(previous.path));
           byDriveId.delete(change.id);
-        } else if (foldersById.has(change.id)) {
+          continue;
+        }
+        if (!foldersById.has(change.id)) continue;
+        const deletedFolderPath = folderPathById.get(change.id);
+        if (deletedFolderPath === undefined) {
           throw new IncrementalRemoteHierarchyError(`Remote hierarchy deleted known folder ${change.id}`);
+        }
+        // A deleted known folder removes its whole remote subtree. The delta
+        // feed since the last cursor is the complete change record, so the
+        // cached subtree can be dropped incrementally as long as no live entry
+        // in the same batch contradicts a subtree member (an edited, moved or
+        // restored descendant, or a new item created inside it). The cached
+        // folder and file indexes are path-consistent (validated above), so a
+        // path-prefix scan selects exactly the descendants the cache holds.
+        const subtreeIds = new Set<string>([change.id]);
+        for (const entry of byDriveId.values()) {
+          if (entry.path === deletedFolderPath
+            || entry.path.startsWith(`${deletedFolderPath}/`)) {
+            subtreeIds.add(entry.driveId);
+          }
+        }
+        for (const folder of foldersById.values()) {
+          if (folder.driveId !== change.id
+            && (folder.path === deletedFolderPath
+              || folder.path.startsWith(`${deletedFolderPath}/`))) {
+            subtreeIds.add(folder.driveId);
+          }
+        }
+        for (const other of latestById.values()) {
+          if (other.deleted) continue;
+          if (subtreeIds.has(other.id)) {
+            throw new IncrementalRemoteHierarchyError(`Remote hierarchy deleted known folder ${change.id}`);
+          }
+          const otherParentId = other.parentReference?.id;
+          if (otherParentId && subtreeIds.has(otherParentId)) {
+            throw new IncrementalRemoteHierarchyError(`Remote hierarchy deleted known folder ${change.id}`);
+          }
+        }
+        for (const entry of [...byDriveId.values()]) {
+          if (entry.path === deletedFolderPath
+            || entry.path.startsWith(`${deletedFolderPath}/`)) {
+            byPath.delete(entry.path);
+            driveIdByPathKey.delete(normalizeRemotePathKey(entry.path));
+            byDriveId.delete(entry.driveId);
+          }
+        }
+        for (const folder of [...foldersById.values()]) {
+          if (folder.driveId === change.id
+            || folder.path === deletedFolderPath
+            || folder.path.startsWith(`${deletedFolderPath}/`)) {
+            foldersById.delete(folder.driveId);
+            folderPathById.delete(folder.driveId);
+            folderIdByPathKey.delete(normalizeRemotePathKey(folder.path));
+          }
         }
         continue;
       }
@@ -19256,18 +19308,22 @@ export class SyncExecutor {
     const folderPaths = uniquePaths.filter((path) =>
       Boolean(pendingByPath.get(path)?.folder),
     );
-    // One batched absence read covers the whole file batch; each item then
-    // skips its per-item remote re-check. Read failures degrade to an empty
-    // set so every item still verifies individually.
-    const preverifiedAbsent = filePaths.length === 0
+    // One batched absence read covers the whole batch (files and folders); each
+    // item then skips its per-item remote re-check. Read failures degrade to an
+    // empty set so every item still verifies individually.
+    const preverifyPaths = [...filePaths, ...folderPaths];
+    const preverifiedAbsent = preverifyPaths.length === 0
       ? new Set<string>()
-      : await this.verifyRemoteDeleteBatchAbsence(filePaths);
+      : await this.verifyRemoteDeleteBatchAbsence(preverifyPaths);
     await Promise.all([
       ...filePaths.map((path) =>
         this.confirmRemoteDelete(path, false, {
           preverifiedAbsent: preverifiedAbsent.has(path),
         })),
-      ...folderPaths.map((path) => this.confirmRemoteDelete(path, false)),
+      ...folderPaths.map((path) =>
+        this.confirmRemoteDelete(path, false, {
+          preverifiedAbsent: preverifiedAbsent.has(path),
+        })),
     ]);
   }
 
@@ -19379,7 +19435,11 @@ export class SyncExecutor {
             async () => {
               const [remoteById, remoteByPath, local] = await Promise.all([
                 this.onedrive.getDriveItemMetadataById(anchor.remoteId),
-                this.inspectRemoteFolder(path),
+                // A batch-proven path absence skips the redundant per-item
+                // by-path re-check; the by-ID guard and local guard still run.
+                options?.preverifiedAbsent === true
+                  ? Promise.resolve<RemoteFolderInspection>({ status: "missing" })
+                  : this.inspectRemoteFolder(path),
                 this.inspectLocalFolder(path),
               ]);
               if (

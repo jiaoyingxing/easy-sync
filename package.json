@@ -1,6 +1,6 @@
 {
   "name": "easy-sync",
-  "version": "1.3.4",
+  "version": "1.3.5",
   "description": "EasySync / 易同步 — Obsidian OneDrive sync with minimal setup, clear status, and controlled conflict handling",
   "main": "main.js",
   "scripts": {
