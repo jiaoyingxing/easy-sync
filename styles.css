@@ -1157,6 +1157,111 @@ body.is-mobile .easy-sync-auth-pending-actions button {
   width: 100%;
 }
 
+/* Auth method chooser modal (first login) — light list rows, not capsule buttons */
+.easy-sync-auth-method-modal {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-4-2);
+}
+
+.easy-sync-auth-method-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--size-4-3);
+  width: 100%;
+  height: auto;
+  padding: var(--size-4-3);
+  text-align: left;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.easy-sync-auth-method-option:hover {
+  background-color: var(--background-modifier-hover);
+}
+
+.easy-sync-auth-method-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--size-2-2);
+  min-width: 0;
+}
+
+.easy-sync-auth-method-title {
+  font-weight: var(--font-semibold);
+  font-size: var(--font-ui-medium);
+}
+
+.easy-sync-auth-method-desc {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  white-space: normal;
+}
+
+.easy-sync-auth-method-chevron {
+  display: flex;
+  align-items: center;
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+/* Device code waiting modal */
+.easy-sync-device-code {
+  font-family: var(--font-monospace);
+  font-size: calc(var(--font-ui-large) * 1.5);
+  font-weight: var(--font-semibold);
+  letter-spacing: 0.08em;
+  text-align: center;
+  padding: var(--size-4-4);
+  margin-bottom: var(--size-4-2);
+  background-color: var(--background-modifier-hover);
+  border-radius: var(--radius-s);
+  cursor: pointer;
+  user-select: all;
+  -webkit-user-select: all;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.easy-sync-device-code-hint {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  margin-bottom: var(--size-4-4);
+}
+
+.easy-sync-device-actions {
+  flex-wrap: wrap;
+}
+
+body.is-mobile .easy-sync-device-actions {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+body.is-mobile .easy-sync-device-actions button {
+  width: 100%;
+}
+
+.easy-sync-device-status {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  margin-top: var(--size-4-2);
+}
+
+.easy-sync-device-security {
+  margin-top: var(--size-4-4);
+  text-align: center;
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
 .easy-sync-ribbon[data-easy-sync-status="loggedOut"] {
   color: var(--color-red);
 }

@@ -24,8 +24,14 @@ export interface AuthState {
   isLoggedIn: boolean;
 }
 
-/** OAuth flow state for CSRF protection */
-export interface PendingAuth {
+/** OAuth flow state for CSRF protection.
+ *  Discriminated by kind: the browser (authorization code + PKCE) attempt
+ *  keeps its CSRF state, the device-code attempt keeps its polling state. */
+export type PendingAuth = PendingBrowserAuth | PendingDeviceAuth;
+
+/** In-flight browser (authorization code + PKCE) login attempt */
+export interface PendingBrowserAuth {
+  kind: "browser";
   /** PKCE code verifier */
   codeVerifier: string;
   /** Random state value for CSRF protection */
@@ -34,6 +40,59 @@ export interface PendingAuth {
   authUrl: string;
   /** Timestamp when this auth attempt was started */
   createdAt: number;
+}
+
+/** In-flight device code login attempt (RFC 8628) */
+export interface PendingDeviceAuth {
+  kind: "device";
+  /** Server-side device code used only for token polling (never displayed) */
+  deviceCode: string;
+  /** 9-character code shown to the user */
+  userCode: string;
+  /** Verification page URL (code not embedded) */
+  verificationUri: string;
+  /** Verification page URL with the code embedded, when the provider
+   *  returns it. Microsoft currently does NOT return this field (official
+   *  docs: "not included or supported at this time"), so the same-device
+   *  path falls back to copy-then-paste on the plain verification page. */
+  verificationUriComplete: string | null;
+  /** Absolute deadline for this code (epoch ms) */
+  expiresAt: number;
+  /** Token poll interval in ms; grows on slow_down */
+  pollIntervalMs: number;
+  /** Terminal failure phase once polling stops without success */
+  phase?: DeviceCodeAttemptPhase;
+  /** Timestamp when this auth attempt was started */
+  createdAt: number;
+}
+
+/** Terminal device-code failure states surfaced to the waiting modal */
+export type DeviceCodeAttemptPhase =
+  | "declined"
+  | "expired"
+  | "mismatch"
+  | "failed";
+
+/** Live view of the current device-code attempt for the waiting modal */
+export interface DeviceCodeAttemptView {
+  userCode: string;
+  verificationUri: string;
+  verificationUriComplete: string | null;
+  expiresAt: number;
+  phase: DeviceCodeAttemptPhase | "waiting";
+}
+
+/** Response from the devicecode endpoint (RFC 8628).
+ *  verification_uri_complete is optional per the standard and is currently
+ *  not returned by Microsoft. */
+export interface DeviceCodeResponse {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  verification_uri_complete?: string;
+  expires_in: number;
+  interval?: number;
+  message?: string;
 }
 
 /** Errors that can occur during authentication */
@@ -71,6 +130,9 @@ export const MS_AUTH_CONFIG = {
     "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
   /** Token endpoint */
   tokenEndpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+  /** Device code endpoint (RFC 8628) */
+  deviceCodeEndpoint:
+    "https://login.microsoftonline.com/common/oauth2/v2.0/devicecode",
   /** Client ID — replaced during Entra app registration */
   clientId: "7d9ac248-9c51-422f-8cba-49e0a6a1ed67",
   /** Redirect URI registered in Entra */

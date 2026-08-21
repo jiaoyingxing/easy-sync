@@ -1,9 +1,10 @@
 /**
  * AuthPendingModal — shown when the user clicks "检查登录状态" during an
- * in-progress OAuth flow. Gives them three options:
+ * in-progress OAuth flow. Gives them four options:
  *  1. "重新检查" — check if auth completed since last poll tick
  *  2. "复制登录链接" — copy the current attempt without closing the modal
  *  3. "重新打开授权" — re-open the browser for a fresh login attempt
+ *  4. "取消登录" — abandon this attempt and re-choose the login method
  *
  * This is the fallback mechanism: if auto-polling doesn't detect completion,
  * or the user closed their browser, this gives them a clear recovery path
@@ -15,6 +16,7 @@ import { Modal, type App } from "obsidian";
 export type PendingModalResult =
   | { action: "recheck" }
   | { action: "reopen" }
+  | { action: "cancel" }
   | { action: "dismiss" };
 
 export class AuthPendingModal extends Modal {
@@ -27,6 +29,7 @@ export class AuthPendingModal extends Modal {
     private recheckLabel: string,
     private copyLabel: string,
     private reopenLabel: string,
+    private cancelLabel: string,
     private onCopy?: () => void,
     private onReopen?: () => void,
   ) {
@@ -83,6 +86,13 @@ export class AuthPendingModal extends Modal {
     reopenBtn.addEventListener("click", () => {
       this.onReopen?.();
       this.finish({ action: "reopen" });
+    });
+
+    const cancelBtn = btnRow.createEl("button", {
+      text: this.cancelLabel,
+    });
+    cancelBtn.addEventListener("click", () => {
+      this.finish({ action: "cancel" });
     });
   }
 

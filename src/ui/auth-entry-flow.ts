@@ -1,7 +1,10 @@
 import type { App } from "obsidian";
 import type { AuthModule } from "../auth/auth-module";
+import type { DeviceCodeAttemptView } from "../auth/types";
 import type { I18n } from "../i18n";
 import { AuthPendingModal } from "./auth-pending-modal";
+import { AuthMethodModal } from "./auth-method-modal";
+import { AuthDeviceCodeModal } from "./auth-device-code-modal";
 import {
   NOTICE_PRIORITY,
   type EasySyncNoticeCenter,
@@ -9,11 +12,14 @@ import {
 
 export type AuthEntryLabelKey =
   | "settings.account.checking"
+  | "settings.account.confirmAfterBrowser"
+  | "settings.account.resumeDevice"
   | "settings.account.login";
 
 export type AuthEntryDescriptionKey =
   | "settings.account.desc.connecting"
   | "settings.account.desc.pending"
+  | "settings.account.desc.devicePending"
   | "settings.account.desc.notLoggedIn";
 
 export interface AuthEntryPresentation {
@@ -33,6 +39,9 @@ export interface AuthEntryFlowHost {
 export function resolveAuthEntryPresentation(input: {
   isInitializing: boolean;
   isPending: boolean;
+  /** True when the pending attempt is a waiting device code whose
+   *  verification cycle outlives the modal. */
+  isDevicePending?: boolean;
 }): AuthEntryPresentation {
   if (input.isInitializing) {
     return {
@@ -43,8 +52,16 @@ export function resolveAuthEntryPresentation(input: {
     };
   }
   if (input.isPending) {
+    if (input.isDevicePending) {
+      return {
+        labelKey: "settings.account.resumeDevice",
+        descriptionKey: "settings.account.desc.devicePending",
+        disabled: false,
+        cta: true,
+      };
+    }
     return {
-      labelKey: "settings.account.checking",
+      labelKey: "settings.account.confirmAfterBrowser",
       descriptionKey: "settings.account.desc.pending",
       disabled: false,
       cta: true,
@@ -61,9 +78,10 @@ export function resolveAuthEntryPresentation(input: {
 /**
  * Shared logged-out account action used by settings and the sync sidebar.
  *
- * Keep the first login call synchronous with the click handler. In particular,
- * do not await anything before AuthModule.login() opens the browser because
- * iOS WebView requires the popup to remain user initiated.
+ * A fresh login opens the method chooser first; the selected option's click
+ * synchronously starts its flow. In particular, do not await anything before
+ * AuthModule.login() opens the browser because iOS WebView requires the
+ * popup to remain user initiated.
  */
 export function handleAuthEntryAction(host: AuthEntryFlowHost): Promise<void> {
   const auth = host.auth;
@@ -71,12 +89,95 @@ export function handleAuthEntryAction(host: AuthEntryFlowHost): Promise<void> {
     return Promise.resolve();
   }
   if (!auth.isPending) {
-    return startLogin(host, auth);
+    return chooseAuthMethod(host, auth);
+  }
+  if (auth.deviceAttempt) {
+    // A waiting device code outlives its modal: re-entering reopens the SAME
+    // code and countdown instead of issuing a new one.
+    openDeviceCodeModal(host, auth);
+    return Promise.resolve();
   }
   if (auth.checkAuthStatus()) {
     return Promise.resolve();
   }
   return handlePendingAuth(host, auth);
+}
+
+/**
+ * First-login method chooser. The device option waits for its devicecode
+ * request inside the chooser (busy state) so a failed request keeps the
+ * chooser open for a retry; the browser option opens the popup directly in
+ * the option's click handler to preserve the iOS gesture chain.
+ */
+async function chooseAuthMethod(
+  host: AuthEntryFlowHost,
+  auth: AuthModule,
+): Promise<void> {
+  const t = host.i18n.t.bind(host.i18n);
+  let browserPromise: Promise<void> | null = null;
+  const result = await new AuthMethodModal(
+    host.app,
+    {
+      title: t("settings.account.method.browser.name"),
+      description: t("settings.account.method.browser.desc"),
+    },
+    {
+      title: t("settings.account.method.device.name"),
+      description: t("settings.account.method.device.desc"),
+    },
+    () => {
+      browserPromise = startLogin(host, auth);
+    },
+    () => beginDeviceCodeFlow(host, auth),
+  ).awaitAction();
+
+  if (result.action === "browser" && browserPromise) {
+    await browserPromise;
+    return;
+  }
+  if (result.action === "device") {
+    openDeviceCodeModal(host, auth);
+    return;
+  }
+  // Dismissed: make sure an in-flight devicecode request cannot commit a
+  // dangling attempt after the chooser closes.
+  auth.cancelPendingLogin();
+}
+
+/** Issue the devicecode request; on failure surface the error and rethrow
+ *  so the chooser can re-enable the option for another try. */
+function beginDeviceCodeFlow(
+  host: AuthEntryFlowHost,
+  auth: AuthModule,
+): Promise<DeviceCodeAttemptView> {
+  const t = host.i18n.t.bind(host.i18n);
+  return auth.beginDeviceCodeLogin().catch((error: unknown) => {
+    if (isAuthOperationInvalidated(error)) throw error;
+    host.noticeCenter.show({
+      key: "auth-login-error",
+      message: error instanceof Error ? error.message : t("general.unknown"),
+      priority: NOTICE_PRIORITY.failure,
+    });
+    throw error;
+  });
+}
+
+/** Open the waiting room for the current device-code attempt. The modal
+ *  drives everything from here: polling already runs inside AuthModule. */
+function openDeviceCodeModal(
+  host: AuthEntryFlowHost,
+  auth: AuthModule,
+): void {
+  new AuthDeviceCodeModal(host.app, {
+    auth,
+    noticeCenter: host.noticeCenter,
+    t: host.i18n.t.bind(host.i18n),
+  }).open();
+}
+
+function isAuthOperationInvalidated(error: unknown): boolean {
+  return error instanceof Error
+    && error.name === "AuthOperationInvalidatedError";
 }
 
 async function handlePendingAuth(
@@ -92,6 +193,7 @@ async function handlePendingAuth(
     t("settings.account.recheck"),
     t("settings.account.copyAuthLink"),
     t("settings.account.reopenAuth"),
+    t("settings.account.cancelLogin"),
     () => {
       void copyPendingAuthUrl(host, auth);
     },
@@ -100,6 +202,12 @@ async function handlePendingAuth(
     },
   ).awaitAction();
 
+  if (result.action === "cancel") {
+    // Abandon this attempt and let the user switch methods (e.g. from the
+    // broken redirect flow to code login) without restarting Obsidian.
+    auth.cancelPendingLogin();
+    return chooseAuthMethod(host, auth);
+  }
   if (result.action === "recheck") {
     const loggedIn = auth.checkAuthStatus();
     host.noticeCenter.show({
@@ -161,7 +269,17 @@ function startLogin(
   auth: AuthModule,
 ): Promise<void> {
   const t = host.i18n.t.bind(host.i18n);
-  return auth.login().catch((error: unknown) => {
+  // login() opens the browser synchronously inside this call; when it did,
+  // guide the user that returning to Obsidian completes the flow (D4).
+  const loginPromise = auth.login();
+  if (auth.isPending) {
+    host.noticeCenter.show({
+      key: "settings-login-browser-opened",
+      message: t("settings.account.browserOpened"),
+      priority: NOTICE_PRIORITY.action,
+    });
+  }
+  return loginPromise.catch((error: unknown) => {
     host.noticeCenter.show({
       key: "auth-login-error",
       message: error instanceof Error ? error.message : t("general.unknown"),
