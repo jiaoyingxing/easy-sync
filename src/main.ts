@@ -184,8 +184,10 @@ import {
 } from "./sync/community-plugin-participation";
 import {
   buildRemoteCommunityPluginCatalog,
+  COMMUNITY_PLUGIN_CATALOG_STALE_FAILURE_THRESHOLD,
   markRemoteCommunityPluginCatalogStale,
   remoteCommunityPluginCatalogEntries,
+  shouldMarkCommunityPluginCatalogStale,
   type RemoteCommunityPluginCatalogV1,
 } from "./sync/community-plugin-remote-catalog";
 import {
@@ -231,6 +233,8 @@ const DESCENDANT_FILE_RECONSTRUCTION_CONTINUATION_DELAY_MS = 250;
 const COMMUNITY_PLUGIN_FILE_DELETE_UNINSTALL_DELAY_MS = 150;
 const DESCENDANT_FILE_RECONSTRUCTION_RETRY_DELAYS_MS =
   [5_000, 15_000, 30_000] as const;
+/** Consecutive catalog refresh failures reset after this quiet window. */
+const COMMUNITY_PLUGIN_CATALOG_REFRESH_FAILURE_WINDOW_MS = 10 * 60 * 1000;
 
 export interface SyncPathSettings {
   syncPluginFiles: boolean;
@@ -525,6 +529,10 @@ export default class EasySyncPlugin extends Plugin {
   private communityPluginParticipationOperationSequence = 0;
   private remoteCommunityPluginCatalogRefreshPromise:
     Promise<RemoteCommunityPluginCatalogV1 | null> | null = null;
+  /** Consecutive catalog refresh failures since the last success (memory
+   *  only; the persisted catalog keeps its own `lastRefreshFailedAt`). */
+  private communityPluginCatalogRefreshConsecutiveFailures = 0;
+  private communityPluginCatalogLastRefreshFailureAt = 0;
   private communityPluginLifecycleDeviceObserver:
     CommunityPluginLifecycleDeviceObserverV1 | null = null;
 
@@ -2754,8 +2762,11 @@ export default class EasySyncPlugin extends Plugin {
     // Reset the auto-sync timer after a successful auto-sync so the
     // full interval gap is guaranteed (prevents back-to-back cycles on
     // slow mobile networks where sync duration approaches the interval).
+    // Use the timer-only reset here: re-arming a persisted community-plugin
+    // join would let a permanently blocked join re-trigger "修改后同步" at the
+    // end of every sync (~10s loop) even with no user edits.
     if (result.success && mode === "auto") {
-      this.startAutoSync();
+      this.resetAutoSyncTimer();
     }
     if (isSyncResultFullyComplete(result)) this.showRibbonSuccess();
     else this.clearRibbonSuccess();
@@ -3933,17 +3944,31 @@ export default class EasySyncPlugin extends Plugin {
     }
   }
 
-  startAutoSync(): void {
+  /** Only clear + restart the interval-auto-sync timer. Intentionally does NOT
+   *  arm the persisted community-plugin join: after a successful auto run we
+   *  only reset the interval gap, whereas arming the join here lets a
+   *  permanently blocked join (e.g. remote-bundle-missing, which stays
+   *  recheckable forever) re-arm the local-change debounce at the end of every
+   *  sync — a ~10s infinite loop with no user edits. Join rechecks stay driven
+   *  by real lifecycle entries (start / foreground / settings / resume) and by
+   *  the next interval sync. */
+  private resetAutoSyncTimer(): void {
     if (this.autoSyncTimer) {
       compatClearInterval(this.autoSyncTimer);
       this.autoSyncTimer = null;
     }
     if (this.autoSyncPaused) return;
-    this.schedulePersistedCommunityPluginJoinSync("auto-start");
     if (this.syncInterval <= 0) return;
     this.autoSyncTimer = compatSetInterval(() => {
       void this.runAutomaticSync("interval");
     }, this.syncInterval * 60 * 1000);
+  }
+
+  startAutoSync(): void {
+    this.resetAutoSyncTimer();
+    if (this.autoSyncPaused) return;
+    this.schedulePersistedCommunityPluginJoinSync("auto-start");
+    if (this.syncInterval <= 0) return;
     this.requestMutationRecoveryObservation("auto-start");
   }
 
@@ -5587,18 +5612,40 @@ export default class EasySyncPlugin extends Plugin {
           ownPluginId: this.manifest.id,
         });
         await state.setRemoteCommunityPluginCatalog(catalog);
+        this.communityPluginCatalogRefreshConsecutiveFailures = 0;
+        this.communityPluginCatalogLastRefreshFailureAt = 0;
         this.advanceCommunityPluginInventoryRevision();
         return catalog;
       } catch (error) {
+        const now = Date.now();
+        if (
+          now - this.communityPluginCatalogLastRefreshFailureAt
+          > COMMUNITY_PLUGIN_CATALOG_REFRESH_FAILURE_WINDOW_MS
+        ) {
+          this.communityPluginCatalogRefreshConsecutiveFailures = 0;
+        }
+        this.communityPluginCatalogRefreshConsecutiveFailures++;
+        this.communityPluginCatalogLastRefreshFailureAt = now;
         if (previous && sameSyncScope(previous.scope, state.remoteScope)) {
-          try {
-            await state.setRemoteCommunityPluginCatalog(
-              markRemoteCommunityPluginCatalogStale(previous, Date.now()),
+          if (shouldMarkCommunityPluginCatalogStale(
+            previous,
+            this.communityPluginCatalogRefreshConsecutiveFailures,
+          )) {
+            try {
+              await state.setRemoteCommunityPluginCatalog(
+                markRemoteCommunityPluginCatalogStale(previous, now),
+              );
+              this.advanceCommunityPluginInventoryRevision();
+            } catch {
+              // The previous complete cache remains in memory. A disposable
+              // catalog failure must never become an empty-cloud assertion.
+            }
+          } else {
+            this.diag?.warn(
+              "state",
+              `community plugin catalog refresh failed — keeping the last trusted catalog (${this.communityPluginCatalogRefreshConsecutiveFailures}/${COMMUNITY_PLUGIN_CATALOG_STALE_FAILURE_THRESHOLD})`,
+              error instanceof Error ? error.message : String(error),
             );
-            this.advanceCommunityPluginInventoryRevision();
-          } catch {
-            // The previous complete cache remains in memory. A disposable
-            // catalog failure must never become an empty-cloud assertion.
           }
         }
         throw error;

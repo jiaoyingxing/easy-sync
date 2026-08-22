@@ -240,6 +240,20 @@ export function markRemoteCommunityPluginCatalogStale(
   };
 }
 
+/** Consecutive refresh failures required before a previously trusted catalog
+ *  is downgraded to stale. A single transient failure stays re-observable and
+ *  keeps the last trusted inventory usable instead of blocking the UI. */
+export const COMMUNITY_PLUGIN_CATALOG_STALE_FAILURE_THRESHOLD = 2;
+
+export function shouldMarkCommunityPluginCatalogStale(
+  previous: Readonly<RemoteCommunityPluginCatalogV1> | null,
+  consecutiveRefreshFailures: number,
+): boolean {
+  if (!previous) return true;
+  if (previous.stale) return true;
+  return consecutiveRefreshFailures >= COMMUNITY_PLUGIN_CATALOG_STALE_FAILURE_THRESHOLD;
+}
+
 export function remoteCommunityPluginCatalogEntries(
   catalog: Readonly<RemoteCommunityPluginCatalogV1>,
 ): RemoteFileEntry[] {

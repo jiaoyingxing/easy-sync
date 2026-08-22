@@ -138,6 +138,7 @@ export interface LocaleStrings {
   "settings.communityPlugins.experimental": string;
   "settings.communityPlugins.selectionSummary": string;
   "settings.communityPlugins.search": string;
+  "settings.communityPlugins.retry": string;
   "settings.communityPlugins.loading": string;
   "settings.communityPlugins.empty": string;
   "settings.communityPlugins.noMatch": string;
@@ -429,6 +430,7 @@ export interface LocaleStrings {
   "reason.folder.parent-version-changed": string;
   "reason.folder.remote-version-changed": string;
   "reason.folder.remote-content-version-unavailable": string;
+  "reason.folder.local-create-unconfirmed": string;
   "reason.folder.local-inspection-failed": string;
   "reason.identityMove.deferred": string;
   "reason.identityMove.localTargetOccupied": string;

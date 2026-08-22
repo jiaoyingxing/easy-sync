@@ -208,7 +208,7 @@ export function findOneDriveInvalidNameIssue(fileName: string): OneDriveInvalidN
   // contain ASCII control characters.
   if (fileName.endsWith(".")) return { kind: "trailing-dot" };
   if (fileName.endsWith(" ")) return { kind: "trailing-space" };
-  // eslint-disable-next-line no-control-regex
+  // eslint-disable-next-line no-control-regex -- the class intentionally spans ASCII control characters (U+0000-U+001F, U+007F), which OneDrive forbids in item names
   if (/[\u0000-\u001f\u007f]/.test(fileName)) return { kind: "control-char" };
   return null;
 }

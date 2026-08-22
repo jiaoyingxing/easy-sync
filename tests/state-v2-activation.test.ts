@@ -8639,6 +8639,218 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.scanner.vault.createFolder).toHaveBeenCalledOnce();
   });
 
+  it("confirms a mobile folder create once adapter/index visibility settles", async () => {
+    const previousMobile = Platform.isMobile;
+    const previousDesktop = Platform.isDesktop;
+    Platform.isMobile = true;
+    Platform.isDesktop = false;
+    try {
+      const harness = makeHarness();
+      await harness.state.load();
+      expect((await harness.executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        { activateV2State: true },
+      )).success).toBe(true);
+
+      harness.remoteItemState.push({
+        id: "folder-cloud-settled",
+        name: "SettledCloud",
+        folder: {},
+        parentReference: { id: scope.filesRootId },
+        eTag: "etag-settled-cloud",
+      });
+
+      // Simulate mobile index/adapter lag: the created folder only becomes
+      // visible shortly after createFolder resolves.
+      let indexVisible = false;
+      const originalCreateFolder =
+        harness.scanner.vault.createFolder.getMockImplementation()!;
+      harness.scanner.vault.createFolder.mockImplementation(async (
+        path: string,
+      ) => {
+        await originalCreateFolder(path);
+        setTimeout(() => {
+          if (path === "SettledCloud") indexVisible = true;
+        }, 120);
+      });
+      const originalAbstract =
+        harness.scanner.vault.getAbstractFileByPath.getMockImplementation()!;
+      harness.scanner.vault.getAbstractFileByPath.mockImplementation(
+        (path: string) => {
+          if (path === "SettledCloud" && !indexVisible) return null;
+          return originalAbstract(path);
+        },
+      );
+      const originalStat =
+        harness.scanner.vault.adapter.stat.getMockImplementation()!;
+      harness.scanner.vault.adapter.stat.mockImplementation(async (
+        path: string,
+      ) => {
+        if (path === "SettledCloud" && !indexVisible) return null;
+        return originalStat(path);
+      });
+
+      const created = await harness.executor.run("manual");
+
+      expect(created).toMatchObject({
+        success: true,
+        foldersCreated: 1,
+        errors: 0,
+      });
+      expect(harness.scanner.vault.createFolder).toHaveBeenCalledOnce();
+      expect(harness.localFolderPaths.has("SettledCloud")).toBe(true);
+      expect(harness.state.mutationLedger).toEqual([]);
+      expect((await harness.executor.run("manual")).foldersCreated).toBe(0);
+    } finally {
+      Platform.isMobile = previousMobile;
+      Platform.isDesktop = previousDesktop;
+    }
+  });
+
+  it("keeps the fail-closed path when a mobile folder create never becomes visible", async () => {
+    const previousMobile = Platform.isMobile;
+    const previousDesktop = Platform.isDesktop;
+    Platform.isMobile = true;
+    Platform.isDesktop = false;
+    try {
+      const harness = makeHarness();
+      await harness.state.load();
+      expect((await harness.executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        { activateV2State: true },
+      )).success).toBe(true);
+
+      harness.remoteItemState.push({
+        id: "folder-cloud-settled",
+        name: "SettledCloud",
+        folder: {},
+        parentReference: { id: scope.filesRootId },
+        eTag: "etag-settled-cloud",
+      });
+
+      // The index/adapter never exposes the created folder.
+      const originalAbstract =
+        harness.scanner.vault.getAbstractFileByPath.getMockImplementation()!;
+      harness.scanner.vault.getAbstractFileByPath.mockImplementation(
+        (path: string) => {
+          if (path === "SettledCloud") return null;
+          return originalAbstract(path);
+        },
+      );
+      const originalStat =
+        harness.scanner.vault.adapter.stat.getMockImplementation()!;
+      harness.scanner.vault.adapter.stat.mockImplementation(async (
+        path: string,
+      ) => {
+        if (path === "SettledCloud") return null;
+        return originalStat(path);
+      });
+
+      const failed = await harness.executor.run("manual");
+
+      expect(failed).toMatchObject({
+        success: false,
+        errors: 1,
+        foldersCreated: 0,
+      });
+      expect(harness.scanner.vault.createFolder).toHaveBeenCalledOnce();
+      expect(harness.state.mutationLedger).toEqual([]);
+      expect(harness.state.pendingIssues).toEqual([
+        expect.objectContaining({
+          path: "SettledCloud",
+          actionType: SyncActionType.CreateLocalFolder,
+          reason: "reason.folder.local-create-unconfirmed",
+        }),
+      ]);
+    } finally {
+      Platform.isMobile = previousMobile;
+      Platform.isDesktop = previousDesktop;
+    }
+  });
+
+  it("keeps the not-applied classification when the local folder create itself throws", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    harness.remoteItemState.push({
+      id: "folder-cloud-refused",
+      name: "RefusedCloud",
+      folder: {},
+      parentReference: { id: scope.filesRootId },
+      eTag: "etag-refused-cloud",
+    });
+    harness.scanner.vault.createFolder.mockImplementation(async () => {
+      throw new Error("local folder create refused");
+    });
+
+    const failed = await harness.executor.run("manual");
+
+    expect(failed).toMatchObject({
+      success: false,
+      errors: 1,
+      foldersCreated: 0,
+    });
+    expect(harness.scanner.vault.createFolder).toHaveBeenCalledOnce();
+    expect(harness.localFolderPaths.has("RefusedCloud")).toBe(false);
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("retries the remote folder create read-back once after a network failure", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    // Local-only empty folder → create-remote. Inject one lost read-back GET
+    // (the parent check is call #1, the receipt read-back starts at #2).
+    harness.localFolderPaths.add("Empty");
+    let metadataCalls = 0;
+    const originalMetadata =
+      harness.client.getDriveItemMetadataById.getMockImplementation()!;
+    harness.client.getDriveItemMetadataById.mockImplementation(async (
+      ...args: Parameters<typeof originalMetadata>
+    ) => {
+      metadataCalls++;
+      if (metadataCalls === 2) {
+        throw new OneDriveError(
+          OneDriveErrorType.NetworkError,
+          "read-back lost",
+          0,
+        );
+      }
+      return originalMetadata(...args);
+    });
+
+    const created = await harness.executor.run("manual");
+
+    expect(created).toMatchObject({
+      success: true,
+      foldersCreated: 1,
+      errors: 0,
+    });
+    expect(harness.client.createFolderByParentId).toHaveBeenCalledOnce();
+    expect(metadataCalls).toBeGreaterThanOrEqual(3);
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
   it("retries a failed folder checkpoint without repeating the remote create", async () => {
     const harness = makeHarness();
     await harness.state.load();

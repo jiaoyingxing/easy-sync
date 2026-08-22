@@ -341,6 +341,50 @@ describe("main sync entry guards", () => {
     await expect(autoCallbacks.onConfirmThreshold?.(plan)).resolves.toBe(false);
   });
 
+  it("keeps the last trusted catalog on one refresh failure and downgrades on consecutive failures", async () => {
+    const plugin = makePlugin();
+    const setRemote = vi.fn().mockResolvedValue(undefined);
+    const state = {
+      isV2StateActive: true,
+      remoteScope: COMMUNITY_PLUGIN_SCOPE,
+      getCommunityPluginManifestObservations: vi.fn(() => []),
+      getRemoteCommunityPluginCatalog: vi.fn(() => remoteCalendarCatalog()),
+      setRemoteCommunityPluginCatalog: setRemote,
+    };
+    plugin.state = state as never;
+    const delta = vi.fn()
+      .mockRejectedValueOnce(new Error("delta timed out"))
+      .mockRejectedValueOnce(new Error("delta timed out"))
+      .mockResolvedValueOnce({
+        value: [],
+        "@odata.deltaLink": "fresh",
+      });
+    plugin.onedrive = { getDeltaByFolderId: delta } as never;
+    const refresh = (plugin as never as {
+      refreshCommunityPluginRemoteCatalog(): Promise<unknown>;
+    }).refreshCommunityPluginRemoteCatalog.bind(plugin);
+
+    // First failure: the previously trusted catalog stays trusted.
+    await expect(refresh()).rejects.toThrow("delta timed out");
+    expect(setRemote).not.toHaveBeenCalled();
+
+    // Second consecutive failure: downgrade to stale.
+    await expect(refresh()).rejects.toThrow("delta timed out");
+    expect(setRemote).toHaveBeenCalledTimes(1);
+    expect(setRemote.mock.calls[0]?.[0]).toMatchObject({ stale: true });
+
+    // A success resets the counter; the next single failure keeps trust.
+    await expect(refresh()).resolves.toMatchObject({ stale: false });
+    const afterSuccess = vi.fn().mockRejectedValueOnce(
+      new Error("delta timed out"),
+    );
+    plugin.onedrive = { getDeltaByFolderId: afterSuccess } as never;
+    await expect(refresh()).rejects.toThrow("delta timed out");
+    // Two writes total: the stale downgrade and the successful refresh. The
+    // single failure after success must not write again.
+    expect(setRemote).toHaveBeenCalledTimes(2);
+  });
+
   it("delegates non-busy settings changes with pending file recovery to the state transaction", async () => {
     const plugin = makePlugin();
     const commitSyncPathSettingsChange = vi.fn().mockResolvedValue(undefined);
@@ -3199,7 +3243,8 @@ describe("main sync entry guards", () => {
     vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
     const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
     const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
-    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    const resetAutoSyncTimer = vi.spyOn(plugin as never, "resetAutoSyncTimer")
+      .mockImplementation(() => undefined);
     vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
     vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
 
@@ -3214,7 +3259,54 @@ describe("main sync entry guards", () => {
     expect(plugin.autoSyncPaused).toBe(false);
     expect(stopAutoSync).not.toHaveBeenCalled();
     expect(saveSyncSettings).not.toHaveBeenCalled();
-    expect(startAutoSync).toHaveBeenCalledOnce();
+    expect(resetAutoSyncTimer).toHaveBeenCalledOnce();
+  });
+
+  it("does not re-arm a persisted community plugin join after a successful automatic sync", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.syncInterval = 3;
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    // A pending join — even one permanently blocked but recheckable like
+    // remote-bundle-missing — must not re-arm the dirty trigger here.
+    vi.spyOn(plugin as never, "hasPendingCommunityPluginJoin").mockReturnValue(true);
+    const scheduleCommunityPluginJoinSync = vi.spyOn(
+      plugin as never,
+      "scheduleCommunityPluginJoinSync",
+    );
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({ ...okResult() }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(stopAutoSync).not.toHaveBeenCalled();
+    expect(saveSyncSettings).not.toHaveBeenCalled();
+    // The successful automatic run only resets the interval gap; re-arming the
+    // join here was what produced the observed ~10s infinite "修改后同步" loop.
+    expect(scheduleCommunityPluginJoinSync).not.toHaveBeenCalled();
+  });
+
+  it("still arms a persisted community plugin join on the lifecycle start entry", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.syncInterval = 0;
+    plugin.autoSyncPaused = false;
+    vi.spyOn(plugin as never, "hasPendingCommunityPluginJoin").mockReturnValue(true);
+    const schedulePersistedJoinSync = vi.spyOn(
+      plugin as never,
+      "schedulePersistedCommunityPluginJoinSync",
+    ).mockImplementation(() => undefined);
+
+    plugin.startAutoSync();
+
+    expect(schedulePersistedJoinSync).toHaveBeenCalledWith("auto-start");
   });
 
   it("pauses automatic sync after an otherwise successful run leaves pending conflicts", async () => {
