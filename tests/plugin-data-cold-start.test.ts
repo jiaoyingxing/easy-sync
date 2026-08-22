@@ -238,6 +238,27 @@ describe("plugin data cold-start cache", () => {
     await expect(plugin.refreshCommunityPluginRemoteCatalog())
       .rejects.toThrow("offline");
 
+    // A single transient failure keeps the last trusted catalog usable.
+    expect(downloadFile).not.toHaveBeenCalled();
+    expect(catalog).toEqual(expect.objectContaining({
+      complete: true,
+      stale: false,
+      entries: [expect.objectContaining({ pluginId: "calendar" })],
+    }));
+    await expect(plugin.getCommunityPluginInventory()).resolves.toEqual([
+      expect.objectContaining({
+        id: "calendar",
+        remote: true,
+      }),
+    ]);
+    await expect(plugin.hasTrustedCommunityPluginRemoteInventory("files"))
+      .resolves.toBe(true);
+
+    // Only consecutive failures downgrade the catalog to stale.
+    getDeltaByFolderId.mockRejectedValueOnce(new Error("offline"));
+    await expect(plugin.refreshCommunityPluginRemoteCatalog())
+      .rejects.toThrow("offline");
+
     expect(downloadFile).not.toHaveBeenCalled();
     expect(catalog).toEqual(expect.objectContaining({
       complete: true,

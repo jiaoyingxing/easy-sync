@@ -62,6 +62,7 @@ import {
 } from "../src/sync/community-plugin-lifecycle-device-v1";
 import type { VaultLocalStorage } from
   "../src/sync/indexeddb-vault-namespace";
+import { getEasySyncPaths } from "../src/obsidian-compat";
 
 const SCOPE = {
   accountId: "account-id",
@@ -4960,5 +4961,65 @@ describe("community plugin enablement runtime", () => {
     expect(uploadedByPath.get(manifestPath)).toBe(aliasManifestText);
     expect(uploadedByPath.has(COMMUNITY_PATH)).toBe(false);
     expect(state.setCommunityPluginEnablementState).not.toHaveBeenCalled();
+  });
+
+  it("materializes preflighted bundle content for the mobile streamed commit (>= 8 MiB selected plugin)", async () => {
+    const previousMobile = Platform.isMobile;
+    const previousDesktop = Platform.isDesktop;
+    Platform.isMobile = true;
+    Platform.isDesktop = false;
+    try {
+      const mainPath = ".obsidian/plugins/calendar/main.js";
+      const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+      const mainContent = bytes("m".repeat(9 * 1024 * 1024));
+      const manifestContent = bytes(PLUGIN_MANIFEST_TEXT);
+      const remoteMain = await remoteEntry(mainPath, mainContent);
+      const remoteManifest = await remoteEntry(manifestPath, manifestContent);
+      const downloadFile = vi.fn(async (
+        _vaultName: string,
+        path: string,
+      ) => {
+        if (path === mainPath) return mainContent;
+        if (path === manifestPath) return manifestContent;
+        throw new Error(`unexpected bundle download: ${path}`);
+      });
+      const memory = makeMemoryAdapter({});
+      const { executor } = makeExecutor({
+        localEntries: [],
+        localFolders: REMOTE_FOLDERS.map((folder) => ({
+          path: folder.path,
+          mtime: 1,
+        })),
+        remoteEntries: [remoteManifest, remoteMain],
+        remoteContent: null,
+        adapter: memory.adapter,
+        oneDrive: makeOneDrive(null, { downloadFile }),
+        policy: {
+          version: 1,
+          files: { mode: "selected", pluginIds: ["calendar"] },
+          data: { mode: "none", pluginIds: [] },
+        },
+      });
+
+      const result = await executor.run("manual");
+
+      expect(result.success).toBe(true);
+      expect(result.errors).toBe(0);
+      expect(result.downloaded).toBe(2);
+      const committed = memory.binary.get(mainPath);
+      expect(committed?.byteLength).toBe(mainContent.byteLength);
+      expect(await sha256Hex(committed!)).toBe(await sha256Hex(mainContent));
+      // The preflighted content must land in the streaming temp path before
+      // the commit gate verifies it — no appendBinary fan-out for staged bytes.
+      expect(memory.adapter.appendBinary).not.toHaveBeenCalled();
+      expect(
+        memory.binary.get(
+          `${getEasySyncPaths(".obsidian").tmpDir}/downloads/${mainPath}.part`,
+        ),
+      ).toBeUndefined();
+    } finally {
+      Platform.isMobile = previousMobile;
+      Platform.isDesktop = previousDesktop;
+    }
   });
 });

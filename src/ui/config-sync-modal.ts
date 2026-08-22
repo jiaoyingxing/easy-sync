@@ -54,6 +54,7 @@ export class ConfigSyncModal extends Modal {
   private remoteInventoryAvailable = false;
   private inventoryLoading = false;
   private inventoryLoadFailed = false;
+  private remoteCatalogRefreshFailed = false;
   private searchQuery = "";
   private loadGeneration = 0;
   private destroyed = false;
@@ -449,9 +450,12 @@ export class ConfigSyncModal extends Modal {
       typeof this.plugin.refreshCommunityPluginRemoteCatalog === "function"
     ) {
       void this.plugin.refreshCommunityPluginRemoteCatalog().catch(() => {
-        new Notice(this.plugin.i18n.t(
-          "notice.communityPlugins.remoteCatalogFailed",
-        ));
+        if (this.destroyed) return;
+        // Inline retry affordance instead of a one-shot blocking Notice: a
+        // transient delta failure must not turn the fine-grained manager into
+        // "reopen to retry the same failing request".
+        this.remoteCatalogRefreshFailed = true;
+        this.renderPluginListArea();
       });
     }
   }
@@ -475,6 +479,7 @@ export class ConfigSyncModal extends Modal {
       ) return;
       this.inventory = inventory;
       this.remoteInventoryAvailable = remoteInventoryAvailable;
+      this.remoteCatalogRefreshFailed = false;
     } catch {
       if (generation !== this.loadGeneration || this.destroyed) return;
       this.inventoryLoadFailed = true;
@@ -615,6 +620,25 @@ export class ConfigSyncModal extends Modal {
         cls: "setting-item-description easy-sync-plugin-list-guidance",
         text: guidance.join(" "),
       });
+    }
+
+    if (this.remoteCatalogRefreshFailed) {
+      const row = this.listScrollEl.createDiv(
+        "setting-item-description easy-sync-plugin-list-guidance",
+      );
+      row.setText(t("notice.communityPlugins.remoteCatalogFailed"));
+      new ButtonComponent(row)
+        .setButtonText(t("settings.communityPlugins.retry"))
+        .onClick(() => {
+          if (this.destroyed) return;
+          this.remoteCatalogRefreshFailed = false;
+          this.renderPluginListArea();
+          void this.plugin.refreshCommunityPluginRemoteCatalog().catch(() => {
+            if (this.destroyed) return;
+            this.remoteCatalogRefreshFailed = true;
+            this.renderPluginListArea();
+          });
+        });
     }
 
     for (const item of visibleItems) {

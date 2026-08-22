@@ -5,6 +5,8 @@ import {
   markRemoteCommunityPluginCatalogStale,
   readRemoteCommunityPluginCatalog,
   remoteCommunityPluginCatalogEntries,
+  shouldMarkCommunityPluginCatalogStale,
+  type RemoteCommunityPluginCatalogV1,
 } from "../src/sync/community-plugin-remote-catalog";
 import type { DriveItem } from "../src/onedrive/types";
 import type { RemoteFileEntry, SyncScope } from "../src/sync/types";
@@ -182,5 +184,26 @@ describe("remote community-plugin catalog", () => {
     })).resolves.toBeNull();
     await expect(readRemoteCommunityPluginCatalog(catalog))
       .resolves.toEqual(catalog);
+  });
+
+  it("downgrades a trusted catalog to stale only after consecutive failures", () => {
+    const trusted: RemoteCommunityPluginCatalogV1 = {
+      version: 1,
+      scope: SCOPE,
+      complete: true,
+      stale: false,
+      revision: 3,
+      observedAt: 10,
+      sourceDigest: "a".repeat(64),
+      entries: [],
+    };
+    expect(shouldMarkCommunityPluginCatalogStale(null, 1)).toBe(true);
+    expect(shouldMarkCommunityPluginCatalogStale(trusted, 0)).toBe(false);
+    expect(shouldMarkCommunityPluginCatalogStale(trusted, 1)).toBe(false);
+    expect(shouldMarkCommunityPluginCatalogStale(trusted, 2)).toBe(true);
+    expect(shouldMarkCommunityPluginCatalogStale({
+      ...trusted,
+      stale: true,
+    }, 1)).toBe(true);
   });
 });

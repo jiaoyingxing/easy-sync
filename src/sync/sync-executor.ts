@@ -568,6 +568,12 @@ const MOBILE_RECONSTRUCTION_BATCH_FILES = 2;
 const DESKTOP_RECONSTRUCTION_BATCH_BYTES = 32 * 1024 * 1024;
 const MOBILE_RECONSTRUCTION_BATCH_BYTES = 8 * 1024 * 1024;
 const ANDROID_TEMP_WRITE_MAX_ATTEMPTS = 3;
+/** Mobile-only bounded settle re-reads after a local folder create. */
+const MOBILE_FOLDER_CREATE_READBACK_SETTLE_ATTEMPTS = 3;
+const FOLDER_CREATE_READBACK_SETTLE_MS = 400;
+/** Bounded re-read attempts for a remote folder create receipt (slow links). */
+const REMOTE_FOLDER_READBACK_ATTEMPTS = 2;
+const REMOTE_FOLDER_READBACK_RETRY_MS = 500;
 
 interface PreparedDownload {
   content?: ArrayBuffer;
@@ -635,6 +641,16 @@ class DownloadRemoteVersionChangedError extends Error {
   constructor(path: string) {
     super(`Remote version changed during download: ${path}`);
     this.name = "DownloadRemoteVersionChangedError";
+  }
+}
+
+/** A local folder create was invoked but its result could not be confirmed
+ *  after bounded settle re-reads. The failure-classification chain still
+ *  re-reads both sides before deciding not-applied vs checkpoint. */
+class LocalFolderCreateUnconfirmedError extends Error {
+  constructor(path: string) {
+    super(`Local folder create read-back failed: ${path}`);
+    this.name = "LocalFolderCreateUnconfirmedError";
   }
 }
 
@@ -3703,6 +3719,32 @@ export class SyncExecutor {
       return;
     }
     await vault.adapter.mkdir(path);
+  }
+
+  /**
+   * Mobile Obsidian's index and adapter can lag one beat behind a newly
+   * created folder (the iOS diagnostic report shows the same adapter
+   * divergence as per-round `stat = null` on hosted config files). After a
+   * local folder create, settle re-read with a bounded budget: visible means
+   * the normal receipt/checkpoint close runs; still invisible falls through
+   * to the existing failure-classification chain instead of failing the
+   * round on a mere read-back lag.
+   */
+  private async inspectLocalFolderAfterFolderCreate(
+    path: string,
+  ): Promise<LocalFolderInspection> {
+    const attempts = Platform.isMobile
+      ? MOBILE_FOLDER_CREATE_READBACK_SETTLE_ATTEMPTS
+      : 1;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const inspection = await this.inspectLocalFolder(path);
+      if (inspection.status === "present" || attempt === attempts) {
+        return inspection;
+      }
+      await new Promise<void>((resolve) =>
+        compatSetTimeout(() => resolve(), FOLDER_CREATE_READBACK_SETTLE_MS));
+    }
+    return { status: "uncertain" };
   }
 
   private async renameLocalFolder(sourcePath: string, targetPath: string): Promise<void> {
@@ -11002,27 +11044,71 @@ export class SyncExecutor {
       parentRemoteId,
       folderName(path),
     );
-    const readBack = await this.onedrive.getDriveItemMetadataById(created.id);
-    if (
-      !readBack?.folder
-      || readBack.id !== created.id
-      || readBack.name !== folderName(path)
-      || readBack.parentReference?.id !== parentRemoteId
-      || !readBack.eTag
-    ) {
-      throw new Error(`Created remote folder read-back is incomplete or mismatched: ${path}`);
-    }
-    if (created.eTag && created.eTag !== readBack.eTag) {
-      this.diag?.log(
-        "onedrive",
-        `folder create version advanced before receipt — ${path}`,
-        {
-          driveItemId: readBack.id,
-          responseVersionChanged: true,
-        },
-      );
-    }
+    const readBack = await this.readRemoteFolderCreatedIdentity(
+      path,
+      created.id,
+      parentRemoteId,
+      created.eTag,
+    );
     return toRemoteFolderEntry(path, readBack);
+  }
+
+  /**
+   * Bounded exact-ID read-back for a remote folder create. On slow links the
+   * receipt GET can time out just like the create POST; the create already
+   * happened, so a read failure must not drop the receipt outright. Retry
+   * once with a short settle; persistent failure keeps the original error so
+   * the existing createRemoteFolder classifier reconciles the same round.
+   */
+  private async readRemoteFolderCreatedIdentity(
+    path: string,
+    createdId: string,
+    parentRemoteId: string,
+    createdETag: string | undefined,
+  ): Promise<DriveItem> {
+    let readBack: DriveItem | null = null;
+    for (
+      let attempt = 1;
+      attempt <= REMOTE_FOLDER_READBACK_ATTEMPTS;
+      attempt++
+    ) {
+      try {
+        readBack = await this.onedrive.getDriveItemMetadataById(createdId);
+      } catch (error) {
+        readBack = null;
+        this.diag?.warn(
+          "execute",
+          `remote folder create read-back failed (attempt ${attempt}/${REMOTE_FOLDER_READBACK_ATTEMPTS}) — ${path}`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      if (
+        readBack?.folder
+        && readBack.id === createdId
+        && readBack.name === folderName(path)
+        && readBack.parentReference?.id === parentRemoteId
+        && readBack.eTag
+      ) {
+        if (createdETag && createdETag !== readBack.eTag) {
+          this.diag?.log(
+            "onedrive",
+            `folder create version advanced before receipt — ${path}`,
+            {
+              driveItemId: readBack.id,
+              responseVersionChanged: true,
+            },
+          );
+        }
+        return readBack;
+      }
+      if (attempt < REMOTE_FOLDER_READBACK_ATTEMPTS) {
+        await new Promise<void>((resolve) =>
+          compatSetTimeout(() => resolve(), REMOTE_FOLDER_READBACK_RETRY_MS));
+      }
+    }
+    throw new Error(
+      `Created remote folder read-back is incomplete or mismatched: ${path}`,
+    );
   }
 
   private createMutationIntent(item: SyncPlanItem, scope: SyncScope): MutationIntent {
@@ -13969,6 +14055,9 @@ export class SyncExecutor {
     if (error instanceof MutationNotAppliedError) {
       return this.failureReason(error.original, path);
     }
+    if (error instanceof LocalFolderCreateUnconfirmedError) {
+      return this.t("reason.folder.local-create-unconfirmed");
+    }
     if (error instanceof LocalVersionChangedBeforeDeleteError) {
       return this.t("syncView.failure.localChangedBeforeDelete");
     }
@@ -14431,9 +14520,11 @@ export class SyncExecutor {
         }
         if (local.status === "missing") {
           await this.createLocalFolder(item.path);
-          const readback = await this.inspectLocalFolder(item.path);
+          const readback = await this.inspectLocalFolderAfterFolderCreate(
+            item.path,
+          );
           if (readback.status !== "present") {
-            throw new Error(`Local folder create read-back failed: ${item.path}`);
+            throw new LocalFolderCreateUnconfirmedError(item.path);
           }
         }
         result.foldersCreated = (result.foldersCreated ?? 0) + 1;
@@ -14990,6 +15081,20 @@ export class SyncExecutor {
         let content: ArrayBuffer | null = preparedDownload?.content ?? null;
         if (preparedDownload?.downloaded) {
           streamedDownload = preparedDownload.downloaded;
+          // 社区插件整包预下载把内容保存在内存里，从未写过流式临时文件；而
+          // 提交门 commitDownloadedTempFile 会按临时文件字节校验。移动端
+          // ≥8MiB 的被选插件下载若直接进入该门，临时文件不存在将稳定判定
+          // “Downloaded temp file verification failed”。这里用一次有界写入
+          // 把预下载内容落到临时路径，再交给既有的提交门做完整字节核对。
+          if (streamAdapter && tempDownloadPath && content) {
+            await this.ensureParentDirs(tempDownloadPath);
+            await this.removePathIfExists(tempDownloadPath);
+            await this.writeBinaryTempFileWithAndroidZeroByteRetry(
+              item.path,
+              tempDownloadPath,
+              content,
+            );
+          }
         } else if (streamAdapter && tempDownloadPath) {
           await this.ensureParentDirs(tempDownloadPath);
           this.diag?.log("execute", `download streaming to temp file — ${item.path}`);
