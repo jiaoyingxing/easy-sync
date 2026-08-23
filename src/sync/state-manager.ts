@@ -6215,11 +6215,22 @@ export class StateManager {
     });
   }
 
-  async prunePendingIssues(activePaths: Iterable<string>): Promise<void> {
+  /**
+   * Retire pending issue rows whose path is no longer produced by the fresh
+   * plan. With `onlyIssueCodes`, only rows carrying one of the given planner-
+   * derived issue codes are eligible for retirement; execution-phase rows
+   * (RetryLater / SkipLargeFile) keep their retry semantics.
+   */
+  async prunePendingIssues(
+    activePaths: Iterable<string>,
+    options: { onlyIssueCodes?: ReadonlySet<string> } = {},
+  ): Promise<void> {
     const active = new Set(activePaths);
+    const restrict = options.onlyIssueCodes;
     await this.save((current) => {
       const next = current[KEY_PENDING_ISSUES].filter((issue) =>
-        active.has(issue.path),
+        active.has(issue.path)
+        || (restrict ? !restrict.has(issue.issueCode ?? "") : false),
       );
       return next.length === current[KEY_PENDING_ISSUES].length
         ? current

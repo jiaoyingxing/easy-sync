@@ -2230,6 +2230,135 @@ describe("main sync entry guards", () => {
     });
   });
 
+  it("self-heals a transient V2 state load block by reloading before a manual sync", async () => {
+    const plugin = makePlugin();
+    let blocked = true;
+    const load = vi.fn(async () => {
+      blocked = false;
+    });
+    plugin.state = {
+      get hasV2StateLoadRecoveryBlock() {
+        return blocked;
+      },
+      get v2StateLoadRecoveryBlock() {
+        return blocked
+          ? {
+              version: 2,
+              kind: "v2-state-load-block",
+              authority: "v2",
+              reason: "manifest-presence-unreadable",
+              detectedAt: 1,
+            }
+          : null;
+      },
+      load,
+      lastSyncTime: 1,
+      baseSnapshot: [{ path: "old.md" }],
+    } as never;
+    vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(plugin, "activateSyncView").mockResolvedValue(undefined);
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    await plugin.startManualSync();
+
+    expect(load).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledOnce();
+    expect(run.mock.calls[0]?.[0]).toBe("manual");
+    expect(run.mock.calls[0]?.[4]).not.toEqual(
+      expect.objectContaining({ recoverV2CorruptState: true }),
+    );
+  });
+
+  it("retries a transient V2 state load block with bounded backoff until it heals", async () => {
+    vi.useFakeTimers();
+    try {
+      const plugin = makePlugin();
+      let blocked = true;
+      let failures = 0;
+      const load = vi.fn(async () => {
+        failures += 1;
+        if (failures >= 2) blocked = false;
+      });
+      plugin.state = {
+        get hasV2StateLoadRecoveryBlock() {
+          return blocked;
+        },
+        get v2StateLoadRecoveryBlock() {
+          return blocked
+            ? {
+                version: 2,
+                kind: "v2-state-load-block",
+                authority: "v2",
+                reason: "migration-hold-unreadable",
+                detectedAt: 1,
+              }
+            : null;
+        },
+        load,
+        lastSyncTime: 1,
+        baseSnapshot: [{ path: "old.md" }],
+      } as never;
+      vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+      vi.spyOn(plugin, "activateSyncView").mockResolvedValue(undefined);
+      const run = vi.fn().mockResolvedValue(okResult());
+      plugin.syncExecutor = { isRunning: false, run } as never;
+
+      await plugin.startManualSync();
+
+      // First attempt failed; a backoff retry was scheduled.
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(blocked).toBe(true);
+
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      // The backoff retry reloaded and the block cleared.
+      expect(load).toHaveBeenCalledTimes(2);
+      expect(blocked).toBe(false);
+      expect(run).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not schedule reload retries for a durable V2 state load block", async () => {
+    vi.useFakeTimers();
+    try {
+      const plugin = makePlugin();
+      const load = vi.fn().mockResolvedValue(undefined);
+      plugin.state = {
+        hasV2StateLoadRecoveryBlock: true,
+        v2StateLoadRecoveryBlock: {
+          version: 2,
+          kind: "v2-state-load-block",
+          authority: "v2",
+          reason: "authority-witness-mismatch",
+          detectedAt: 1,
+        },
+        load,
+        v2CorruptStateRecoveryEvidence: null,
+        lastSyncTime: 1,
+        baseSnapshot: [{ path: "old.md" }],
+      } as never;
+      vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+      vi.spyOn(plugin, "activateSyncView").mockResolvedValue(undefined);
+      const run = vi.fn().mockResolvedValue(okResult());
+      plugin.syncExecutor = { isRunning: false, run } as never;
+
+      await plugin.startManualSync();
+
+      expect(load).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(60_000);
+
+      // No backoff retry for a durable reason; the blocked dispatch still ran.
+      expect(load).toHaveBeenCalledTimes(1);
+      expect(run).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("passes an exact reviewed corrupt-state authorization back to the recovery control plane", async () => {
     const plugin = makePlugin();
     const authorization = {

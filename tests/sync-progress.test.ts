@@ -23,6 +23,32 @@ describe("SyncProgressStore retention", () => {
     expect(progress.state.completedFiles.find((file) => file.path === "note-20.md")).toBeDefined();
   });
 
+  it("counts every completed file beyond the retained display cap", () => {
+    const progress = new SyncProgressStore();
+    for (let index = 0; index < 150; index++) {
+      progress.addCompletedFile({ path: `note-${index}.md`, status: "upload" });
+    }
+
+    expect(progress.state.completedFiles.length).toBe(100);
+    expect(progress.state.completedCount).toBe(150);
+  });
+
+  it("resets the completed count together with the retained list", () => {
+    const progress = new SyncProgressStore();
+    progress.addCompletedFile({ path: "a.md", status: "upload" });
+    progress.addCompletedFile({ path: "b.md", status: "error" });
+    expect(progress.state.completedCount).toBe(2);
+
+    progress.setPhase("executing");
+    expect(progress.state.completedCount).toBe(0);
+
+    progress.addCompletedFile({ path: "c.md", status: "upload" });
+    expect(progress.state.completedCount).toBe(1);
+
+    progress.markStarted();
+    expect(progress.state.completedCount).toBe(0);
+  });
+
   it("tracks the active action and cancellation until the run settles", () => {
     const progress = new SyncProgressStore();
 

@@ -202,16 +202,14 @@ export function planIdentityRenamesFromStateV2(
         !remoteHashKnown
         && anchor.remoteCTag !== undefined
         && remote.cTag !== undefined;
-      if (!localMatchesAnchor(oldLocal, anchor)
-        || remote.size !== anchor.size
-        || (
-          remoteHashKnown
-          && remote.contentHash !== anchor.contentHash
-        )
-        || (
-          contentTagComparable
-          && remote.cTag !== anchor.remoteCTag
-        )) {
+      const localChanged = !localMatchesAnchor(oldLocal, anchor);
+      // A unilateral remote move+edit (local unchanged, remote content version
+      // advanced) is not a divergence: follow the remote move here and let the
+      // ordinary same-path content decision converge the bytes afterwards
+      // (file-decision-planner-v2 downloads when local matches the anchor, so
+      // the remote version wins). Only a local-side change keeps the fail-
+      // closed conflict for the moved path.
+      if (localChanged) {
         actions.push(conflict(
           anchor,
           anchor.lastPath,

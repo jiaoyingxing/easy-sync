@@ -1201,6 +1201,7 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
       autoDeleteLocalFiles?: boolean;
       inspectFile?: ReturnType<typeof vi.fn>;
       getFileMetadata?: ReturnType<typeof vi.fn>;
+      deleteItem?: ReturnType<typeof vi.fn>;
       adapterOverrides?: Record<string, unknown>;
       recordMutationReceipt?: ReturnType<typeof vi.fn>;
     } = {},
@@ -1249,7 +1250,7 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
     ];
     const failedPaths = facts.failedPaths ?? [];
     const complete = facts.complete ?? failedPaths.length === 0;
-    const mockDeleteItem = vi.fn().mockResolvedValue(undefined);
+    const mockDeleteItem = options.deleteItem ?? vi.fn().mockResolvedValue(undefined);
     const mockDownloadFile = vi.fn().mockResolvedValue(new ArrayBuffer(1));
     const mockInitVaultScope = vi.fn().mockResolvedValue({
       driveId: "drive-id",
@@ -1402,6 +1403,38 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
       failedPaths: ["failed.txt"],
     });
     expect(mockDeleteItem).not.toHaveBeenCalled();
+  });
+
+  it("overlaps remote file deletes through the cleanup pool instead of serial round trips", async () => {
+    const previousMobile = Platform.isMobile;
+    Platform.isMobile = false;
+    try {
+      let activeDeletes = 0;
+      let peakDeletes = 0;
+      const deleteItem = vi.fn().mockImplementation(async () => {
+        activeDeletes++;
+        peakDeletes = Math.max(peakDeletes, activeDeletes);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        activeDeletes--;
+      });
+      const entries = Array.from({ length: 9 }, (_, index) => base(`del-${index}.md`));
+      const { result, mockDeleteItem } = await runWithV2Facts({
+        baseEntries: entries,
+        remoteEntries: entries.map((entry) => remote(entry)),
+      }, {
+        deleteItem,
+      });
+
+      expect(result.deleted).toBe(entries.length);
+      expect(result.errors).toBe(0);
+      expect(mockDeleteItem).toHaveBeenCalledTimes(entries.length);
+      // Serial execution keeps at most one delete in flight; the cleanup
+      // pool must overlap the independent round trips so bulk local-delete
+      // rounds do not cost one remote RTT per file.
+      expect(peakDeletes).toBeGreaterThanOrEqual(2);
+    } finally {
+      Platform.isMobile = previousMobile;
+    }
   });
 
   it("blocks ConfirmLocalDelete — pending delete batch stays empty when scan unhealthy", async () => {

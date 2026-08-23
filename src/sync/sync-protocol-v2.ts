@@ -36,12 +36,23 @@ export interface SharedSyncProtocolObjectV2 {
 export interface SharedSyncProtocolTransportV2 {
   read(): Promise<SharedSyncProtocolObjectV2 | null>;
   createOnly(content: string): Promise<{ id: string; eTag: string }>;
+  /** In-place CAS overwrite of the existing record's content. */
+  overwriteOnly(
+    id: string,
+    eTag: string,
+    content: string,
+  ): Promise<{ id: string; eTag: string }>;
   readById(id: string): Promise<SharedSyncProtocolObjectV2>;
 }
 
 export type SharedSyncProtocolMutationTransportV2 = Pick<
   SharedSyncProtocolTransportV2,
   "createOnly" | "readById"
+>;
+
+export type SharedSyncProtocolRepairTransportV2 = Pick<
+  SharedSyncProtocolTransportV2,
+  "overwriteOnly" | "readById"
 >;
 
 /**
@@ -104,6 +115,8 @@ export function createOneDriveSharedSyncProtocolTransportV2(
     read: () => client.readSharedSyncProtocolV2(vaultName),
     createOnly: (content) =>
       client.createSharedSyncProtocolV2(vaultName, content),
+    overwriteOnly: (id, eTag, content) =>
+      client.overwriteSharedSyncProtocolV2(vaultName, id, eTag, content),
     readById: (id) => client.readSharedSyncProtocolV2ById(id),
   };
 }
@@ -275,6 +288,63 @@ export async function ensureCanonicalSharedSyncProtocolV2(
   );
 }
 
+/**
+ * Repair an already-occupied V2 predecessor slot whose bytes deviate from a
+ * proven canonical content. The caller must have derived and proven the
+ * canonical content from a validated V3 binding; this function only performs
+ * the CAS overwrite + read-back verification.
+ */
+export async function repairCanonicalSharedSyncProtocolV2(
+  transport: SharedSyncProtocolRepairTransportV2,
+  input: {
+    observedCurrent: SharedSyncProtocolObjectV2;
+    canonicalContent: string;
+    expectedMigrationGeneration: string;
+    expectedContentSha256: string;
+  },
+): Promise<EnsureCanonicalSharedSyncProtocolResultV2> {
+  const protocol = parseSharedSyncProtocolV2(input.canonicalContent);
+  if (!protocol) return { status: "blocked", reason: "invalid-canonical" };
+  if (
+    protocol.migrationGeneration !== input.expectedMigrationGeneration
+    || await sha256Text(input.canonicalContent)
+      !== input.expectedContentSha256
+  ) {
+    return { status: "blocked", reason: "canonical-proof-mismatch" };
+  }
+  if (input.observedCurrent.content === input.canonicalContent) {
+    return verifyCanonicalObject(
+      transport,
+      input.observedCurrent,
+      input.canonicalContent,
+      protocol,
+      "existing",
+    );
+  }
+  let overwritten: { id: string; eTag: string };
+  try {
+    overwritten = await transport.overwriteOnly(
+      input.observedCurrent.id,
+      input.observedCurrent.eTag,
+      input.canonicalContent,
+    );
+  } catch (error) {
+    rethrowTerminalSharedSyncProtocolTransportError(error);
+    return { status: "blocked", reason: "write-failed" };
+  }
+  return verifyCanonicalObject(
+    transport,
+    {
+      id: overwritten.id,
+      eTag: overwritten.eTag,
+      content: input.canonicalContent,
+    },
+    input.canonicalContent,
+    protocol,
+    "created",
+  );
+}
+
 export function parseSharedSyncProtocolV2(
   content: string,
 ): SharedSyncProtocolV2 | null {
@@ -417,7 +487,7 @@ function readyResult(
 }
 
 async function verifyCanonicalObject(
-  transport: SharedSyncProtocolMutationTransportV2,
+  transport: Pick<SharedSyncProtocolTransportV2, "readById">,
   observed: SharedSyncProtocolObjectV2,
   canonicalContent: string,
   protocol: SharedSyncProtocolV2,

@@ -87,6 +87,8 @@ export interface SyncProgressState {
   cancelRequested: boolean;
   /** Recently completed files (newest last, capped at 50 to avoid unbounded growth) */
   completedFiles: FileProgress[];
+  /** True number of completed file actions this run; the retained list above is capped for display. */
+  completedCount: number;
   /** Read-only proof progress; these are not completed sync mutations. */
   recoveryVerification?: RemoteScopeRecoveryVerificationProgress;
   /** Epoch ms when the sync started, 0 when idle */
@@ -157,6 +159,7 @@ export class SyncProgressStore {
       currentItemComplete: false,
       cancelRequested: false,
       completedFiles: [],
+      completedCount: 0,
       startedAt: 0,
     };
   }
@@ -177,6 +180,7 @@ export class SyncProgressStore {
       currentItemComplete: false,
       cancelRequested: false,
       completedFiles: [],
+      completedCount: 0,
       startedAt: 0,
     };
   }
@@ -193,6 +197,7 @@ export class SyncProgressStore {
     this._state.currentActionType = undefined;
     if (phase === "executing") {
       this._state.completedFiles = [];
+      this._state.completedCount = 0;
     }
   }
 
@@ -237,6 +242,7 @@ export class SyncProgressStore {
       ...this._state.completedFiles,
       file,
     ]);
+    this._state.completedCount++;
   }
 
   /** Update byte-level progress for the current file */
@@ -273,6 +279,7 @@ export class SyncProgressStore {
     this._state.startedAt = Date.now();
     this._state.cancelRequested = false;
     this._state.completedFiles = [];
+    this._state.completedCount = 0;
     this._state.recoveryVerification = undefined;
   }
 

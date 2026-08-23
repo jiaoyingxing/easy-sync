@@ -20,6 +20,7 @@ function progress(
     currentItemComplete: false,
     cancelRequested: false,
     completedFiles: [],
+    completedCount: 0,
     startedAt: 1,
     ...overrides,
   };

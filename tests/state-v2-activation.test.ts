@@ -1091,6 +1091,26 @@ function makeHarness(input?: {
       }
       return sharedProtocolObject;
     }),
+    overwriteSharedSyncProtocolV2: vi.fn(async (
+      _vaultName: string,
+      id: string,
+      eTag: string,
+      content: string,
+    ) => {
+      if (
+        !sharedProtocolObject
+        || sharedProtocolObject.id !== id
+        || sharedProtocolObject.eTag !== eTag
+      ) {
+        throw new Error("protocol overwrite conflict");
+      }
+      sharedProtocolObject = {
+        id,
+        eTag: `${eTag}-overwritten`,
+        content,
+      };
+      return { id, eTag: sharedProtocolObject.eTag };
+    }),
     readSharedSyncProtocolV3,
     readSharedSyncProtocolObjects: vi.fn(async (vaultName: string) => {
       const [v2, v3] = await Promise.all([
@@ -1383,6 +1403,7 @@ function makeHarness(input?: {
       };
     },
     getSharedProtocolV3: () => sharedProtocolV3Object,
+    getSharedProtocolV2: () => sharedProtocolObject,
   };
 }
 
@@ -11885,6 +11906,64 @@ describe("V1 to V2 controlled production activation", () => {
     expect((await harness.executor.run("manual")).foldersDeleted).toBe(0);
   });
 
+  it("overlaps remote folder deletes at the same depth while keeping child-first layers", async () => {
+    const paths = ["DelA", "DelB", "DelC", "DelA/Sub"];
+    const folderItems = remoteFolderTree(paths).map((item, index) => ({
+      ...item,
+      cTag: `scope-folder-ctag-${index + 1}`,
+    }));
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: paths.map((path) => ({ path })),
+      remoteItems: folderItems,
+    });
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    const originalDeleteImpl = harness.mutations.deleteItem.getMockImplementation();
+    let activeDeletes = 0;
+    let peakDeletes = 0;
+    const deleteOrder: string[] = [];
+    (
+      harness.mutations.deleteItem as unknown as {
+        mockImplementation: (
+          impl: (...args: Parameters<NonNullable<typeof originalDeleteImpl>>) => Promise<void>,
+        ) => void;
+      }
+    ).mockImplementation(async (...args: Parameters<NonNullable<typeof originalDeleteImpl>>) => {
+      activeDeletes++;
+      peakDeletes = Math.max(peakDeletes, activeDeletes);
+      try {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        deleteOrder.push(args[1]);
+        await originalDeleteImpl!(...args);
+      } finally {
+        activeDeletes--;
+      }
+    });
+
+    harness.localFolderPaths.clear();
+    const result = await harness.executor.run("manual");
+
+    expect(result.success).toBe(true);
+    expect(result.foldersDeleted).toBe(paths.length);
+    expect(result.deferred).toBe(0);
+    expect(result.errors).toBe(0);
+    // Child-first: the nested folder settles before its parent.
+    expect(deleteOrder.indexOf("DelA/Sub")).toBeLessThan(deleteOrder.indexOf("DelA"));
+    // Same-depth sibling folders overlap instead of serial round trips.
+    expect(peakDeletes).toBeGreaterThanOrEqual(2);
+    // Idempotent: a second round has nothing left.
+    expect((await harness.executor.run("manual")).foldersDeleted).toBe(0);
+  });
+
   it("retires an anchored folder without confirmation when both the local and remote tree are already absent", async () => {
     const harness = makeHarness();
     await harness.state.load();
@@ -20686,5 +20765,131 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.files.has(paths.stateV2ManifestFile)).toBe(false);
     expect(harness.files.has(paths.stateV1BackupFile)).toBe(false);
     expectNoFileMutations(harness.mutations);
+  });
+});
+
+describe("planner-derived pending issue self-healing", () => {
+  it("retires a stale planner-derived issue row even when a review gate pauses the round", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    await harness.state.reconcilePendingIssues([
+      {
+        path: "Notes",
+        actionType: SyncActionType.FolderDeferred,
+        issueCode: "anchored-folder-missing-local",
+        reason: "folder missing locally",
+        updatedAt: 1,
+      },
+      {
+        path: "retry.md",
+        actionType: SyncActionType.RetryLater,
+        reason: "network",
+        updatedAt: 1,
+      },
+    ], []);
+    expect(harness.state.pendingIssues).toHaveLength(2);
+
+    const paused = await harness.executor.run(
+      "first",
+      { onFirstSyncPreview: vi.fn(async () => false) },
+    );
+    expect(paused.message).toBe("result.pausedForReview");
+
+    // The stale planner-derived row retired under the gate; the execution-
+    // phase transient keeps its retry semantics.
+    expect(harness.state.pendingIssues).toEqual([
+      {
+        path: "retry.md",
+        actionType: SyncActionType.RetryLater,
+        reason: "network",
+        updatedAt: 1,
+      },
+    ]);
+  });
+});
+
+describe("shared protocol V2 slot self-healing", () => {
+  it("repairs a deviant V2 predecessor slot from a validated V3 binding", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    const originalV2 = harness.getSharedProtocolV2();
+    expect(originalV2).not.toBeNull();
+
+    // Deviate the V2 slot in place: same scope/createdAt, different
+    // migration generation (the luyi generation-mismatch shape).
+    harness.seedSharedProtocolContent(JSON.stringify({
+      schemaVersion: 1,
+      kind: "easy-sync-v2-protocol",
+      protocolVersion: 2,
+      migrationGeneration: hashB,
+      scope,
+      confirmedAllDevicesUpdatedAt:
+        protocolBinding.confirmedAllDevicesUpdatedAt,
+      createdAt: protocolBinding.confirmedAllDevicesUpdatedAt,
+    }));
+
+    const result = await harness.executor.run("manual");
+    expect(result.success).toBe(true);
+    expect(result.errors).toBe(0);
+
+    const repairedV2 = harness.getSharedProtocolV2();
+    expect(repairedV2).not.toBeNull();
+    expect(repairedV2!.content).toBe(originalV2!.content);
+    expect(repairedV2!.eTag).toBe("protocol-recovered-etag-overwritten");
+  });
+
+  it("keeps the fail-closed result when the V3 slot cannot validate the binding", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    const originalV3 = harness.getSharedProtocolV3();
+    expect(originalV3).not.toBeNull();
+
+    // Deviate BOTH slots so no binding evidence can prove a canonical side.
+    harness.seedSharedProtocolContent(JSON.stringify({
+      schemaVersion: 1,
+      kind: "easy-sync-v2-protocol",
+      protocolVersion: 2,
+      migrationGeneration: hashB,
+      scope,
+      confirmedAllDevicesUpdatedAt:
+        protocolBinding.confirmedAllDevicesUpdatedAt,
+      createdAt: protocolBinding.confirmedAllDevicesUpdatedAt,
+    }));
+    harness.seedSharedProtocolV3(JSON.stringify({
+      ...JSON.parse(originalV3!.content),
+      migrationGeneration: hashB,
+    }));
+
+    const result = await harness.executor.run("manual");
+    expect(result.success).toBe(false);
+    expect(result.message).toBe("result.v2ProtocolBlocked");
+
+    // No repair happened: both slots keep their deviant contents.
+    const v2After = harness.getSharedProtocolV2();
+    expect(JSON.parse(v2After!.content).migrationGeneration).toBe(hashB);
   });
 });

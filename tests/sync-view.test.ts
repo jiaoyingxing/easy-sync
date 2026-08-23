@@ -95,6 +95,7 @@ describe("syncViewProgressPercent", () => {
       currentItemComplete: false,
       cancelRequested: false,
       completedFiles: [],
+      completedCount: 0,
       startedAt: 1,
     })).toBe(25);
   });
@@ -491,6 +492,7 @@ describe("buildSyncViewContentKey", () => {
       total: 3,
       currentFile: "note.md",
       completedFiles: [],
+      completedCount: 0,
       currentItemBytes: 0,
       currentItemTotalBytes: 0,
       cancelRequested: false,
@@ -1188,6 +1190,49 @@ describe("buildSyncViewContentKey", () => {
       { displayPath: "Projects/Alpha/one.md", directory: null, directoryKind: null },
       { displayPath: "Projects/Alpha/two.md", directory: null, directoryKind: null },
     ]);
+  });
+
+  it("applies the adaptive path layout in the same task that updated the rows (no two-frame flicker)", () => {
+    const prototype = EasySyncSyncView.prototype as unknown as {
+      applyAdaptivePathLayout: () => void;
+    };
+    const applySpy = vi.spyOn(prototype, "applyAdaptivePathLayout");
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      closed: false,
+      pathLayoutFrameId: null,
+      contentEl: {
+        querySelectorAll: () => [],
+      } as unknown as HTMLElement,
+    });
+    try {
+      (
+        view as unknown as { scheduleAdaptivePathLayout(): void }
+      ).scheduleAdaptivePathLayout();
+      // The extraction must already be applied in this task. Deferring to a
+      // later animation frame makes the browser paint the full-path rows
+      // first and re-paint the extracted rows one frame later — a visible
+      // two-frame jump while many rows are refreshed quickly (deletion sync
+      // or receiving files), matching the reported flicker.
+      expect(applySpy).toHaveBeenCalledTimes(1);
+    } finally {
+      applySpy.mockRestore();
+    }
+  });
+
+  it("shows the true completed count instead of the retained list length", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const progressPanel = source.slice(
+      source.indexOf("private renderProgressPanel"),
+      source.indexOf("private renderRemoteScopeRecoveryFailure"),
+    );
+    expect(progressPanel).toContain("{ count: state.completedCount }");
+    const append = source.slice(
+      source.indexOf("private appendNewFileRows"),
+      source.indexOf("private renderToolbar"),
+    );
+    expect(append).toContain("state.completedCount");
+    expect(append).not.toContain("count: files.length");
   });
 
   it("keeps ordinary plan rows chip-free and excludes history from adaptive directories", () => {

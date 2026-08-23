@@ -208,13 +208,17 @@ import {
 import {
   ensureCanonicalSharedSyncProtocolV2,
   ensureSharedSyncProtocolV2,
+  parseSharedSyncProtocolV2,
+  repairCanonicalSharedSyncProtocolV2,
   type SharedSyncProtocolBindingV2,
   type SharedSyncProtocolMutationTransportV2,
   type SharedSyncProtocolObjectV2,
+  type SharedSyncProtocolRepairTransportV2,
   type SharedSyncProtocolV2,
 } from "./sync-protocol-v2";
 import {
   ensureSharedSyncProtocolV3,
+  parseSharedSyncProtocolV3,
   type SharedSyncProtocolBinding,
   type SharedSyncProtocolBindingV3,
   type SharedSyncProtocolMutationTransportV3,
@@ -574,6 +578,10 @@ const FOLDER_CREATE_READBACK_SETTLE_MS = 400;
 /** Bounded re-read attempts for a remote folder create receipt (slow links). */
 const REMOTE_FOLDER_READBACK_ATTEMPTS = 2;
 const REMOTE_FOLDER_READBACK_RETRY_MS = 500;
+/** File-delete cleanup pool batch size: each delete is an independent
+ *  identity/eTag-guarded remote round trip, so a bounded batch overlaps the
+ *  latency instead of costing one RTT per file serially. */
+const DELETE_CLEANUP_BATCH = Platform.isMobile ? 4 : 8;
 
 interface PreparedDownload {
   content?: ArrayBuffer;
@@ -901,6 +909,31 @@ function availableSharedSyncProtocolTransportV2(
     ? {
         createOnly: (content) =>
           candidate.createSharedSyncProtocolV2!(vaultName, content),
+        readById: (id) => candidate.readSharedSyncProtocolV2ById!(id),
+      }
+    : null;
+}
+
+function availableSharedSyncProtocolRepairTransportV2(
+  client: OneDriveClient,
+  vaultName: string,
+): SharedSyncProtocolRepairTransportV2 | null {
+  const candidate = client as OneDriveClient & {
+    overwriteSharedSyncProtocolV2?:
+      OneDriveClient["overwriteSharedSyncProtocolV2"];
+    readSharedSyncProtocolV2ById?:
+      OneDriveClient["readSharedSyncProtocolV2ById"];
+  };
+  return typeof candidate.overwriteSharedSyncProtocolV2 === "function"
+    && typeof candidate.readSharedSyncProtocolV2ById === "function"
+    ? {
+        overwriteOnly: (id, eTag, content) =>
+          candidate.overwriteSharedSyncProtocolV2!(
+            vaultName,
+            id,
+            eTag,
+            content,
+          ),
         readById: (id) => candidate.readSharedSyncProtocolV2ById!(id),
       }
     : null;
@@ -3019,6 +3052,32 @@ export class SyncExecutor {
     records: readonly Readonly<MutationLedgerEntryV1>[],
   ): boolean {
     return this.isNamespaceProtectedByIsolatedRecovery(path, records);
+  }
+
+  /**
+   * Planner-derived pending issue rows are pure UI state. Retire the rows the
+   * fresh plan no longer produces even when a review gate holds the round;
+   * execution-phase transients (RetryLater / SkipLargeFile) and isolated-
+   * recovery-protected paths keep their existing semantics.
+   */
+  private async prunePlannerDerivedStaleIssues(
+    plan: SyncPlan,
+    protectedMutationRecoveryRecords: readonly Readonly<MutationLedgerEntryV1>[],
+  ): Promise<void> {
+    await this.state.prunePendingIssues(
+      [
+        ...plan.items
+          .filter((item) => isPendingIssueAction(item.type))
+          .map((item) => item.path),
+        ...this.state.pendingIssues
+          .filter((item) => this.isPathProtectedByIsolatedRecovery(
+            item.path,
+            protectedMutationRecoveryRecords,
+          ))
+          .map((item) => item.path),
+      ],
+      { onlyIssueCodes: PLANNER_DERIVED_PENDING_ISSUE_CODES },
+    );
   }
 
   private isNamespaceProtectedByIsolatedRecovery(
@@ -9002,6 +9061,17 @@ export class SyncExecutor {
         return result;
       }
 
+      // Planner-derived issue rows are pure UI state. Retire the rows the
+      // fresh plan no longer produces even when a review gate is about to
+      // hold this round, so stale "核对文件夹"-style rows cannot outlive the
+      // plan that created them. Conflict/delete rows stay behind the gates:
+      // they carry confirmation semantics and planning authority.
+      await this.prunePlannerDerivedStaleIssues(
+        plan,
+        protectedMutationRecoveryRecords,
+      );
+      if (this.shouldStop(result, operationEpoch)) return result;
+
       // If the user is executing a reviewed plan, verify the digest after all
       // pre-execution rewrites (scan health and dedup). The
       // reviewed bundle stays in state until this point so stale plans re-pause.
@@ -10934,17 +11004,50 @@ export class SyncExecutor {
       }
     }
 
-    // Step 4 — serial cleanup (deletes after all uploads/downloads)
-    for (const item of cleanupItems) {
+    // Step 4 — cleanup (file deletes) after all uploads/downloads. Each
+    // delete is an independent identity/eTag-guarded round trip, so run a
+    // bounded batch to overlap the latency — the previous strict serial loop
+    // made bulk local-delete rounds cost one remote RTT per file. Per-item
+    // fail-closed semantics are unchanged (remote-version changes route to
+    // conflict/defer) and shared state commits stay serialized by the state
+    // queues; folder shells keep their child-first serial order in Step 5.
+    for (
+      let index = 0;
+      index < cleanupItems.length;
+      index += DELETE_CLEANUP_BATCH
+    ) {
       if (!this.canContinue(operationEpoch, result)) break;
-      await executePlanItem(item);
+      const batch = cleanupItems.slice(index, index + DELETE_CLEANUP_BATCH);
+      await Promise.all(batch.map((item) => executePlanItem(item)));
     }
 
     // Step 5 — directory shells are removed child-first only after every file
-    // action settled. Each executor branch re-lists the target immediately.
-    for (const item of folderDeletes) {
+    // action settled. Deletes at the same path depth are independent, so
+    // each depth layer runs as a bounded batch and a folder is only
+    // attempted after every deeper layer in the plan settled — the previous
+    // strict serial loop serialized sibling folders that share nothing and
+    // paid several round trips per folder on slower links. Each executor
+    // branch still re-lists the target immediately (fail-closed semantics
+    // unchanged; non-empty or drifted folders defer as before).
+    const folderDeleteDepth = (path: string): number => path.split("/").length;
+    const maxFolderDeleteDepth = folderDeletes.reduce(
+      (max, item) => Math.max(max, folderDeleteDepth(item.path)),
+      0,
+    );
+    for (let depth = maxFolderDeleteDepth; depth >= 1; depth--) {
       if (!this.canContinue(operationEpoch, result)) break;
-      await executePlanItem(item);
+      const layer = folderDeletes.filter(
+        (item) => folderDeleteDepth(item.path) === depth,
+      );
+      for (
+        let index = 0;
+        index < layer.length;
+        index += DELETE_CLEANUP_BATCH
+      ) {
+        if (!this.canContinue(operationEpoch, result)) break;
+        const batch = layer.slice(index, index + DELETE_CLEANUP_BATCH);
+        await Promise.all(batch.map((item) => executePlanItem(item)));
+      }
     }
 
     if (!this.canContinue(operationEpoch, result)) {
@@ -16706,17 +16809,41 @@ export class SyncExecutor {
         expectedBinding,
       });
       this.throwIfSharedSyncProtocolOperationWasCancelled();
-      return profile.status === "healthy"
-        ? { status: "ready", binding: expectedBinding, source: "existing" }
-        : {
-            status: "blocked",
-            reason: profile.status === "inconsistent"
-              ? profile.reason
-              : "profile-not-healthy",
-            ...(profile.status === "inconsistent"
-              ? { evidence: profile.evidence }
-              : {}),
+      if (profile.status === "healthy") {
+        return {
+          status: "ready",
+          binding: expectedBinding,
+          source: "existing",
+        };
+      }
+      if (profile.status === "inconsistent" && predecessor && currentV3) {
+        // Self-heal: a validated V3 binding proves the canonical V2
+        // predecessor bytes, so a deviant V2 slot can be CAS-repaired in
+        // place without user action. Without that proof the fail-closed
+        // result below stays authoritative.
+        const repaired = await this.tryRepairDeviantSharedSyncProtocolV2Slot({
+          expectedBinding,
+          predecessor,
+          currentV3,
+          targetScope: syncScope,
+        });
+        if (repaired.status === "ready") {
+          return {
+            status: "ready",
+            binding: expectedBinding,
+            source: "repaired-v2",
           };
+        }
+      }
+      return {
+        status: "blocked",
+        reason: profile.status === "inconsistent"
+          ? profile.reason
+          : "profile-not-healthy",
+        ...(profile.status === "inconsistent"
+          ? { evidence: profile.evidence }
+          : {}),
+      };
     }
     if (
       predecessor
@@ -16789,6 +16916,105 @@ export class SyncExecutor {
             ? { evidence: verified.evidence }
             : {}),
         };
+  }
+
+  /**
+   * Binding-authorized self-heal for a deviant V2 predecessor slot. The local
+   * V3 binding must validate the observed V3 slot field by field; the current
+   * V2's scope then derives the canonical predecessor bytes, whose digest the
+   * binding proves. Only then is the deviant V2 slot CAS-overwritten in place
+   * and read back. See DECISIONS 2026-08-23 (self-heal first, manual exits
+   * separately).
+   */
+  private async tryRepairDeviantSharedSyncProtocolV2Slot(input: {
+    expectedBinding: SharedSyncProtocolBindingV3;
+    predecessor: SharedSyncProtocolObjectV2;
+    currentV3: SharedSyncProtocolObjectV3;
+    targetScope: SyncScope;
+  }): Promise<
+    | { status: "ready" }
+    | { status: "blocked"; reason: string }
+  > {
+    const { expectedBinding, predecessor, currentV3, targetScope } = input;
+    const parsedV3 = parseSharedSyncProtocolV3(currentV3.content);
+    if (!parsedV3) {
+      return { status: "blocked", reason: "repair-v3-unreadable" };
+    }
+    const parsedV2 = parseSharedSyncProtocolV2(predecessor.content);
+    if (!parsedV2) {
+      return { status: "blocked", reason: "repair-v2-unreadable" };
+    }
+    // The binding must prove the observed V3 slot exactly (same record, eTag,
+    // generation, predecessor digest, createdAt and content digest) before it
+    // can authorize a V2 overwrite. Otherwise neither side is provably
+    // canonical and the fail-closed result stays authoritative.
+    const v3ValidatesBinding =
+      currentV3.id === expectedBinding.recordId
+      && currentV3.eTag === expectedBinding.recordETag
+      && parsedV3.migrationGeneration === expectedBinding.migrationGeneration
+      && parsedV3.predecessor.contentSha256
+        === expectedBinding.predecessorContentSha256
+      && parsedV3.createdAt === expectedBinding.createdAt
+      && await sha256Hex(
+        new TextEncoder().encode(currentV3.content).buffer,
+      ) === expectedBinding.contentSha256;
+    if (!v3ValidatesBinding) {
+      return { status: "blocked", reason: "repair-v3-unproven" };
+    }
+    const canonical = await classifySharedSyncProtocolProfile({
+      v2: null,
+      v3: null,
+      targetScope,
+      expectedBinding,
+      predecessorScope: parsedV2.scope,
+    });
+    this.throwIfSharedSyncProtocolOperationWasCancelled();
+    if (canonical.status !== "recoverable") {
+      return {
+        status: "blocked",
+        reason: canonical.status === "inconsistent"
+          ? canonical.reason
+          : "repair-proof-incomplete",
+      };
+    }
+    if (predecessor.content === canonical.canonicalV2Content) {
+      return { status: "blocked", reason: "repair-not-needed" };
+    }
+    const transport = availableSharedSyncProtocolRepairTransportV2(
+      this.onedrive,
+      this.vaultName,
+    );
+    if (!transport) {
+      return { status: "blocked", reason: "repair-transport-unavailable" };
+    }
+    const repaired = await repairCanonicalSharedSyncProtocolV2(transport, {
+      observedCurrent: predecessor,
+      canonicalContent: canonical.canonicalV2Content,
+      expectedMigrationGeneration: expectedBinding.migrationGeneration,
+      expectedContentSha256: expectedBinding.predecessorContentSha256,
+    });
+    if (repaired.status !== "ready") {
+      return { status: "blocked", reason: `repair-v2-${repaired.reason}` };
+    }
+    const verified = await classifySharedSyncProtocolProfile({
+      v2: repaired.object,
+      v3: currentV3,
+      targetScope,
+      expectedBinding,
+    });
+    this.throwIfSharedSyncProtocolOperationWasCancelled();
+    if (verified.status !== "healthy") {
+      return { status: "blocked", reason: "repair-verification-failed" };
+    }
+    this.diag?.warn(
+      "state",
+      "shared protocol V2 predecessor slot repaired from a validated V3 binding",
+      {
+        reason: "generation-mismatch",
+        mutations: 0,
+      },
+    );
+    return { status: "ready" };
   }
 
   private async ensureRecoveredScopeSharedProtocol(
@@ -19854,6 +20080,21 @@ function fileSizeForAction(
   }
   return item.local?.size ?? item.remote?.size;
 }
+
+/**
+ * Issue codes emitted by the folder/identity planners. Rows carrying one of
+ * these are pure UI state derived from the fresh plan, so they can be retired
+ * as soon as the plan stops producing them — even while a review gate holds.
+ */
+const PLANNER_DERIVED_PENDING_ISSUE_CODES: ReadonlySet<
+  NonNullable<PendingIssue["issueCode"]>
+> = new Set([
+  "anchored-folder-missing-local",
+  "anchored-folder-missing-remote",
+  "identity-replacement-ambiguous",
+  "unanchored-shared-folder",
+  "folder-location-choice",
+]);
 
 function isPendingIssueAction(type: SyncActionType): boolean {
   return type === SyncActionType.Upload

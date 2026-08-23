@@ -195,7 +195,7 @@ describe("identity-safe V2 rename planning", () => {
     ]);
   });
 
-  it("fails closed when a moved remote content version changed", () => {
+  it("follows a unilateral remote move with a changed content tag", () => {
     const state = envelope();
     const remote = state.remoteIndex.itemsById.file!;
     remote.parentId = "folder";
@@ -204,7 +204,57 @@ describe("identity-safe V2 rename planning", () => {
     remote.cTag = "ctag-content-2";
     state.anchors.byAnchorId.anchor!.remoteCTag = "ctag-content-1";
 
-    expect(planIdentityRenamesV2(state, [local("old.md")])).toEqual([{
+    expect(planIdentityRenamesV2(state, [local("old.md")])).toEqual([
+      expect.objectContaining({
+        type: "move-local",
+        fromPath: "old.md",
+        toPath: "sub/new.md",
+      }),
+    ]);
+  });
+
+  it("follows a unilateral remote move+edit when the local side is unchanged", () => {
+    const state = envelope();
+    const remote = state.remoteIndex.itemsById.file!;
+    remote.parentId = "folder";
+    remote.name = "new.md";
+    remote.eTag = "e2";
+    remote.contentHash = "b".repeat(64);
+
+    expect(planIdentityRenamesV2(state, [local("old.md")])).toEqual([
+      expect.objectContaining({
+        type: "move-local",
+        fromPath: "old.md",
+        toPath: "sub/new.md",
+        expectedLocalHash: hash,
+      }),
+    ]);
+  });
+
+  it("keeps the conflict when both sides diverged on a moved path", () => {
+    const state = envelope();
+    const remote = state.remoteIndex.itemsById.file!;
+    remote.parentId = "folder";
+    remote.name = "new.md";
+    remote.eTag = "e2";
+    remote.contentHash = "b".repeat(64);
+
+    expect(planIdentityRenamesV2(state, [local("old.md", "c".repeat(64))])).toEqual([{
+      type: "conflict",
+      anchorId: "anchor",
+      path: "old.md",
+      relatedPath: "sub/new.md",
+      reason: "both-paths-diverged",
+    }]);
+  });
+
+  it("keeps the conflict when only the local side changed on a moved path", () => {
+    const state = envelope();
+    const remote = state.remoteIndex.itemsById.file!;
+    remote.parentId = "folder";
+    remote.name = "new.md";
+
+    expect(planIdentityRenamesV2(state, [local("old.md", "c".repeat(64))])).toEqual([{
       type: "conflict",
       anchorId: "anchor",
       path: "old.md",

@@ -6,6 +6,7 @@ import {
   createMigrationGenerationV2,
   ensureCanonicalSharedSyncProtocolV2,
   ensureSharedSyncProtocolV2,
+  repairCanonicalSharedSyncProtocolV2,
   serializeSharedSyncProtocolV2,
   type SharedSyncProtocolObjectV2,
   type SharedSyncProtocolTransportV2,
@@ -54,6 +55,7 @@ function transportWith(
   spies: {
     read: ReturnType<typeof vi.fn>;
     createOnly: ReturnType<typeof vi.fn>;
+    overwriteOnly: ReturnType<typeof vi.fn>;
     readById: ReturnType<typeof vi.fn>;
   };
   current: () => SharedSyncProtocolObjectV2 | null;
@@ -69,13 +71,24 @@ function transportWith(
     };
     return { id: current.id, eTag: current.eTag };
   });
+  const overwriteOnly = vi.fn(async (
+    id: string,
+    eTag: string,
+    content: string,
+  ) => {
+    if (!current || current.id !== id || current.eTag !== eTag) {
+      throw new Error("overwrite conflict");
+    }
+    current = { id, eTag: `${eTag}-overwritten`, content };
+    return { id: current.id, eTag: current.eTag };
+  });
   const readById = vi.fn(async (id: string) => {
     if (!current || current.id !== id) throw new Error("not found");
     return current;
   });
   return {
-    transport: { read, createOnly, readById },
-    spies: { read, createOnly, readById },
+    transport: { read, createOnly, overwriteOnly, readById },
+    spies: { read, createOnly, overwriteOnly, readById },
     current: () => current,
   };
 }
@@ -433,5 +446,122 @@ describe("shared V2 sync protocol", () => {
   it("generates a cryptographically random lowercase 256-bit identifier", () => {
     expect(createMigrationGenerationV2()).toMatch(/^[a-f0-9]{64}$/);
     expect(createMigrationGenerationV2()).not.toBe(createMigrationGenerationV2());
+  });
+});
+
+describe("shared V2 protocol slot repair", () => {
+  async function canonicalOf(
+    patch: Partial<SharedSyncProtocolV2> = {},
+  ): Promise<string> {
+    return serializeSharedSyncProtocolV2(protocol(patch));
+  }
+
+  it("CAS-overwrites a deviant occupied slot and verifies the read-back", async () => {
+    const canonicalContent = await canonicalOf();
+    const harness = transportWith(objectFor(protocol({
+      migrationGeneration: generationB,
+    })));
+    const observed = await harness.transport.read();
+
+    const result = await repairCanonicalSharedSyncProtocolV2(
+      harness.transport,
+      {
+        observedCurrent: observed!,
+        canonicalContent,
+        expectedMigrationGeneration: generationA,
+        expectedContentSha256:
+          await sha256Hex(new TextEncoder().encode(canonicalContent).buffer),
+      },
+    );
+
+    expect(result).toMatchObject({
+      status: "ready",
+      source: "created",
+      object: {
+        id: "protocol-id",
+        eTag: "protocol-etag-overwritten",
+        content: canonicalContent,
+      },
+    });
+    expect(harness.spies.overwriteOnly).toHaveBeenCalledOnce();
+    expect(harness.spies.overwriteOnly.mock.calls[0]).toEqual([
+      "protocol-id",
+      "protocol-etag",
+      canonicalContent,
+    ]);
+  });
+
+  it("keeps an already-canonical slot without overwriting", async () => {
+    const canonicalContent = await canonicalOf();
+    const harness = transportWith(objectFor(JSON.parse(canonicalContent)));
+
+    const result = await repairCanonicalSharedSyncProtocolV2(
+      harness.transport,
+      {
+        observedCurrent: (await harness.transport.read())!,
+        canonicalContent,
+        expectedMigrationGeneration: generationA,
+        expectedContentSha256:
+          await sha256Hex(new TextEncoder().encode(canonicalContent).buffer),
+      },
+    );
+
+    expect(result).toMatchObject({
+      status: "ready",
+      source: "existing",
+    });
+    expect(harness.spies.overwriteOnly).not.toHaveBeenCalled();
+  });
+
+  it("rejects canonical content that fails the generation proof", async () => {
+    const canonicalContent = await canonicalOf({ migrationGeneration: generationB });
+    const harness = transportWith(objectFor(protocol({
+      migrationGeneration: generationB,
+    })));
+
+    const result = await repairCanonicalSharedSyncProtocolV2(
+      harness.transport,
+      {
+        observedCurrent: (await harness.transport.read())!,
+        canonicalContent,
+        expectedMigrationGeneration: generationA,
+        expectedContentSha256:
+          await sha256Hex(new TextEncoder().encode(canonicalContent).buffer),
+      },
+    );
+
+    expect(result).toEqual({
+      status: "blocked",
+      reason: "canonical-proof-mismatch",
+    });
+    expect(harness.spies.overwriteOnly).not.toHaveBeenCalled();
+  });
+
+  it("fails closed when the CAS overwrite loses its race", async () => {
+    const canonicalContent = await canonicalOf();
+    const harness = transportWith(objectFor(protocol({
+      migrationGeneration: generationB,
+    })));
+    const observed = await harness.transport.read();
+    // Another writer changes the eTag before the repair's overwrite lands.
+    harness.spies.overwriteOnly.mockRejectedValueOnce(
+      new Error("overwrite conflict"),
+    );
+
+    const result = await repairCanonicalSharedSyncProtocolV2(
+      harness.transport,
+      {
+        observedCurrent: observed!,
+        canonicalContent,
+        expectedMigrationGeneration: generationA,
+        expectedContentSha256:
+          await sha256Hex(new TextEncoder().encode(canonicalContent).buffer),
+      },
+    );
+
+    expect(result).toEqual({
+      status: "blocked",
+      reason: "write-failed",
+    });
   });
 });

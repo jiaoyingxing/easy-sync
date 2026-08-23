@@ -2351,6 +2351,26 @@ export class OneDriveClient {
     );
   }
 
+  async overwriteSharedSyncProtocolV2(
+    vaultName: string,
+    id: string,
+    eTag: string,
+    content: string,
+  ): Promise<{ id: string; eTag: string }> {
+    const response = await this.request(
+      "PUT",
+      `/me/drive/items/${encodeURIComponent(id)}/content`,
+      content,
+      "application/json",
+      undefined,
+      eTag,
+    );
+    return requirePluginControlFileVersion(
+      response.json,
+      "SharedSyncProtocolV2",
+    );
+  }
+
   // ---- Shared Sync Protocol V3 ----
 
   async readSharedSyncProtocolV3(

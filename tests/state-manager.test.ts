@@ -1267,6 +1267,71 @@ describe("StateManager batch persistence", () => {
     expect(state.pendingIssues).toEqual([]);
   });
 
+  it("prunes only planner-derived issue rows when an issue-code restriction is set", async () => {
+    const { state } = makeState();
+
+    await state.reconcilePendingIssues([
+      {
+        path: "missing-local-folder",
+        actionType: SyncActionType.FolderDeferred,
+        issueCode: "anchored-folder-missing-local",
+        reason: "folder missing",
+        updatedAt: 1,
+      },
+      {
+        path: "stale-location.md",
+        actionType: SyncActionType.FolderDeferred,
+        issueCode: "folder-location-choice",
+        reason: "location needs a decision",
+        updatedAt: 1,
+      },
+      {
+        path: "retry.md",
+        actionType: SyncActionType.RetryLater,
+        reason: "network",
+        updatedAt: 1,
+      },
+      {
+        path: "large.bin",
+        actionType: SyncActionType.SkipLargeFile,
+        reason: "too large",
+        updatedAt: 1,
+      },
+    ], []);
+
+    await state.prunePendingIssues(["stale-location.md"], {
+      onlyIssueCodes: new Set([
+        "anchored-folder-missing-local",
+        "anchored-folder-missing-remote",
+        "identity-replacement-ambiguous",
+        "unanchored-shared-folder",
+        "folder-location-choice",
+      ]),
+    });
+
+    expect(state.pendingIssues).toEqual([
+      {
+        path: "stale-location.md",
+        actionType: SyncActionType.FolderDeferred,
+        issueCode: "folder-location-choice",
+        reason: "location needs a decision",
+        updatedAt: 1,
+      },
+      {
+        path: "retry.md",
+        actionType: SyncActionType.RetryLater,
+        reason: "network",
+        updatedAt: 1,
+      },
+      {
+        path: "large.bin",
+        actionType: SyncActionType.SkipLargeFile,
+        reason: "too large",
+        updatedAt: 1,
+      },
+    ]);
+  });
+
   it("increments consecutive failures even when remoteETag is missing", async () => {
     const { state } = makeState();
 

@@ -602,15 +602,28 @@ describe("canonical V2 plan candidate", () => {
     const locallyModified = structuredClone(changedVersion);
     locallyModified.anchors.byAnchorId["file:file"]!.remoteCTag = "ctag-content-2";
     const targetOccupied = structuredClone(locallyModified);
+
+    // A unilateral remote move+edit (local unchanged) converges as a move
+    // instead of an unresolved conflict; the bytes follow next round.
+    const unilateral = build({
+      state: changedVersion,
+      localFiles: [localFile("old.md")],
+      localFolders: localFolders("sub"),
+    });
+    expect(unilateral.items).toHaveLength(1);
+    expect(unilateral.items[0]).toMatchObject({
+      type: SyncActionType.MoveLocalFile,
+      path: "sub/new.md",
+    });
+    expect(unilateral.items.some((item) => [
+      SyncActionType.Upload,
+      SyncActionType.Download,
+      SyncActionType.DeleteRemote,
+      SyncActionType.DeleteLocal,
+      SyncActionType.ConfirmLocalDelete,
+    ].includes(item.type))).toBe(false);
+
     const candidates = [
-      {
-        candidate: build({
-        state: changedVersion,
-        localFiles: [localFile("old.md")],
-        localFolders: localFolders("sub"),
-        }),
-        reason: "reason.identityMove.bothSidesChanged",
-      },
       {
         candidate: build({
         state: locallyModified,

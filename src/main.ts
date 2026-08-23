@@ -28,6 +28,7 @@ import {
   ConservativeResetBlockedError,
   StateManager,
   SyncPathMutationRecoveryError,
+  type V2StateLoadBlockReason,
 } from "./sync/state-manager";
 import {
   IndexedDbPublic113StateStore,
@@ -235,6 +236,44 @@ const DESCENDANT_FILE_RECONSTRUCTION_RETRY_DELAYS_MS =
   [5_000, 15_000, 30_000] as const;
 /** Consecutive catalog refresh failures reset after this quiet window. */
 const COMMUNITY_PLUGIN_CATALOG_REFRESH_FAILURE_WINDOW_MS = 10 * 60 * 1000;
+
+/** Bounded in-session V2 state reloads before the durable pause engages. */
+const V2_STATE_RELOAD_MAX_ATTEMPTS = 4;
+const V2_STATE_RELOAD_BACKOFF_MS = [2_000, 8_000, 30_000];
+
+/**
+ * Reasons that can succeed on a later reload (transient IO) keep retrying
+ * with bounded backoff; durable corruption/identity evidence keeps the
+ * existing fail-closed pause and diagnostic export.
+ */
+function isTransientV2StateLoadBlockReason(
+  reason: V2StateLoadBlockReason,
+): boolean {
+  switch (reason) {
+    case "envelope-unreadable":
+    case "publication-journal-unreadable":
+    case "manifest-unreadable":
+    case "manifest-presence-unreadable":
+    case "migration-hold-unreadable":
+    case "authority-witness-presence-unreadable":
+    case "authority-witness-unreadable":
+    case "authority-witness-save-failed":
+    case "scope-transition-unreadable":
+    case "corrupt-state-publication-presence-unreadable":
+    case "corrupt-state-publication-unreadable":
+    case "corrupt-state-recovery-hold-unreadable":
+    case "indexeddb-authority-load-failed":
+    case "indexeddb-authority-recovery-failed":
+    case "migration-authority-commit-interrupted":
+    case "public-1.1.3-cutover-backup-unreadable":
+    case "public-1.1.3-cutover-finalization-failed":
+    case "v2-mutation-ledger-migration-failed":
+    case "v2-state-load-failed":
+      return true;
+    default:
+      return false;
+  }
+}
 
 export interface SyncPathSettings {
   syncPluginFiles: boolean;
@@ -500,6 +539,9 @@ export default class EasySyncPlugin extends Plugin {
     },
   );
   private mutationRecoveryBlockReason: MutationRecoveryBlockReason | null = null;
+  private v2StateReloadInFlight = false;
+  private v2StateReloadAttempts = 0;
+  private v2StateReloadRetryTimer: TimeoutHandle | null = null;
   private statusBarEl: HTMLElement | null = null;
   private ribbonEl: HTMLElement | null = null;
   private ribbonSuccessTimer: TimeoutHandle | null = null;
@@ -860,6 +902,8 @@ export default class EasySyncPlugin extends Plugin {
     this.communityPluginInventoryRefreshTimer = null;
     compatClearTimeout(this.communityPluginLocalReconciliationTimer);
     this.communityPluginLocalReconciliationTimer = null;
+    compatClearTimeout(this.v2StateReloadRetryTimer);
+    this.v2StateReloadRetryTimer = null;
     this.stopAutoSync();
     this.cancelDescendantFileReconstructionContinuation();
     compatClearTimeout(this.ribbonSuccessTimer);
@@ -1627,6 +1671,84 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   /**
+   * One bounded in-session V2 state reload (self-heal). load() re-derives the
+   * load block from scratch, so a transient failure clears itself without any
+   * user action; surviving transient reasons keep a bounded backoff retry,
+   * and only a durable block stays paused for diagnostics.
+   */
+  private async attemptV2StateReloadSelfHeal(): Promise<void> {
+    if (
+      this.v2StateReloadInFlight
+      || this.v2StateReloadRetryTimer
+      || !this.state?.hasV2StateLoadRecoveryBlock
+    ) return;
+    this.v2StateReloadInFlight = true;
+    this.v2StateReloadAttempts += 1;
+    const attempt = this.v2StateReloadAttempts;
+    try {
+      await this.state.load();
+    } catch (error) {
+      this.diag?.warn(
+        "state",
+        `V2 state reload self-heal attempt ${attempt} failed`,
+        error instanceof Error ? error.message : String(error),
+      );
+    } finally {
+      this.v2StateReloadInFlight = false;
+    }
+    if (!this.state?.hasV2StateLoadRecoveryBlock) {
+      this.v2StateReloadAttempts = 0;
+      this.diag?.log(
+        "state",
+        "V2 state load block cleared by in-session reload",
+        { attempts: attempt, mutations: 0 },
+      );
+      if (this.mutationRecoveryBlockReason === "state-unavailable") {
+        this.mutationRecoveryBlockReason = null;
+        this.autoSyncPaused = false;
+        await this.saveSyncSettings().catch((error) => {
+          this.diag?.error(
+            "state",
+            "failed to persist auto sync resume after V2 state reload",
+            error,
+          );
+        });
+        this.startAutoSync();
+      }
+      this.updateStatusBar();
+      this.syncView?.render();
+      return;
+    }
+    const block = this.state.v2StateLoadRecoveryBlock;
+    if (!block) return;
+    if (
+      this.v2StateReloadAttempts < V2_STATE_RELOAD_MAX_ATTEMPTS
+      && isTransientV2StateLoadBlockReason(block.reason)
+    ) {
+      this.v2StateReloadRetryTimer = compatSetTimeout(() => {
+        this.v2StateReloadRetryTimer = null;
+        void this.attemptV2StateReloadSelfHeal();
+      }, V2_STATE_RELOAD_BACKOFF_MS[
+        Math.min(
+          this.v2StateReloadAttempts - 1,
+          V2_STATE_RELOAD_BACKOFF_MS.length - 1,
+        )
+      ]);
+      this.diag?.log(
+        "state",
+        `V2 state load block retry scheduled — attempt=${attempt} reason=${block.reason}`,
+        { mutations: 0 },
+      );
+    } else {
+      this.diag?.warn(
+        "state",
+        `V2 state load block survived ${attempt} reload attempt(s) — reason=${block.reason}`,
+        { mutations: 0 },
+      );
+    }
+  }
+
+  /**
    * A manifest-selected V2 state that cannot load must still enter the normal
    * result/diagnostic path. Stable identity/anchor corruption gets one
    * explicit manual GET-only evidence pass after account verification;
@@ -1637,6 +1759,11 @@ export default class EasySyncPlugin extends Plugin {
     logLabel: string,
   ): Promise<boolean> {
     if (!this.state?.hasV2StateLoadRecoveryBlock) return false;
+    // Self-heal first: a bounded in-session reload re-derives the block from
+    // scratch, so a transient failure clears without user action and the
+    // round continues normally.
+    await this.attemptV2StateReloadSelfHeal();
+    if (!this.state.hasV2StateLoadRecoveryBlock) return false;
     if (mode !== "auto") await this.activateSyncView();
     const recoverV2CorruptState =
       mode !== "auto"
@@ -2675,7 +2802,7 @@ export default class EasySyncPlugin extends Plugin {
 
     const observationClassification = classifyRetryableObservationResult(
       result,
-      { completedFileCount: this.progressStore.state.completedFiles.length },
+      { completedFileCount: this.progressStore.state.completedCount },
     );
     const retryableObservation =
       observationClassification.kind === "valid"
@@ -2876,7 +3003,7 @@ export default class EasySyncPlugin extends Plugin {
     const status = resolveSyncHistoryStatus(result, {
       cancelled: result.runFacts?.termination === "cancelled"
         || result.message === this.i18n.t("result.cancelled"),
-      completedFileCount: progress.completedFiles.length,
+      completedFileCount: progress.completedCount,
     });
     const newRecovery = recoveryContext.newRemaining > 0
       && result.mutationRecovery
@@ -3307,7 +3434,10 @@ export default class EasySyncPlugin extends Plugin {
       return false;
     }
     if (this.state.hasV2StateLoadRecoveryBlock) {
-      void this.pauseForMutationRecoveryBlock("state-unavailable");
+      // Self-heal: one bounded in-session reload attempt per observation
+      // gate. The reload re-derives the block from scratch, so a transient
+      // failure clears itself; only a surviving block stays paused.
+      void this.attemptV2StateReloadSelfHeal();
       return false;
     }
     if (this.state.hasV2RemoteScopeRecovery) {
@@ -3371,8 +3501,15 @@ export default class EasySyncPlugin extends Plugin {
         return { state: "blocked" };
       }
       if (this.state.hasV2StateLoadRecoveryBlock) {
-        await this.pauseForMutationRecoveryBlock("state-unavailable");
-        return { state: "blocked" };
+        if (this.v2StateReloadInFlight || this.v2StateReloadRetryTimer) {
+          return { state: "inactive" };
+        }
+        await this.attemptV2StateReloadSelfHeal();
+        if (this.state.hasV2StateLoadRecoveryBlock) {
+          await this.pauseForMutationRecoveryBlock("state-unavailable");
+          return { state: "blocked" };
+        }
+        // Block cleared by the reload; fall through to the ordinary flow.
       }
       if (this.state.hasV2RemoteScopeRecovery) {
         await this.pauseForMutationRecoveryBlock("scope-changed");

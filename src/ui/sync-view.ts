@@ -781,7 +781,6 @@ export class EasySyncSyncView extends ItemView {
   private progressSubtitleEl: HTMLElement | null = null;
   private fileListEl: HTMLElement | null = null;
   private completedFilesRenderKey: string | null = null;
-  private pathLayoutFrameId: AnimationFrameHandle | null = null;
   private planViewportFrameId: AnimationFrameHandle | null = null;
   private planVirtualRenderers = new Set<() => void>();
   private pathLayoutObserver: ResizeObserver | null = null;
@@ -850,10 +849,6 @@ export class EasySyncSyncView extends ItemView {
     if (this.renderFrameId !== null) {
       compatCancelAnimationFrame(this.renderFrameId);
       this.renderFrameId = null;
-    }
-    if (this.pathLayoutFrameId !== null) {
-      compatCancelAnimationFrame(this.pathLayoutFrameId);
-      this.pathLayoutFrameId = null;
     }
     if (this.planViewportFrameId !== null) {
       compatCancelAnimationFrame(this.planViewportFrameId);
@@ -1103,12 +1098,17 @@ export class EasySyncSyncView extends ItemView {
     this.scheduleAdaptivePathLayout();
   }
 
+  /**
+   * Apply the adaptive path extraction in the same task that updated the
+   * rows. Deferring to a later animation frame makes the browser paint the
+   * full-path rows first and re-paint the extracted rows one frame later — a
+   * visible two-frame jump while many rows are refreshed quickly (deletion
+   * sync or receiving files). Every call site runs after its DOM update, so
+   * a synchronous apply still measures the real rendered width and never
+   * shows an intermediate full-path state.
+   */
   private scheduleAdaptivePathLayout(): void {
-    if (this.pathLayoutFrameId !== null) return;
-    this.pathLayoutFrameId = compatRequestAnimationFrame(() => {
-      this.pathLayoutFrameId = null;
-      this.applyAdaptivePathLayout();
-    });
+    this.applyAdaptivePathLayout();
   }
 
   private applyAdaptivePathLayout(): void {
@@ -1201,7 +1201,9 @@ export class EasySyncSyncView extends ItemView {
     if (!this.fileListEl) {
       this.progressSubtitleEl = this.progressPanelEl.createDiv("easy-sync-progress-subtitle");
       this.progressSubtitleEl.setText(
-        this.plugin.i18n.t("syncView.progress.completed", { count: files.length }),
+        this.plugin.i18n.t("syncView.progress.completed", {
+          count: this.plugin.progressStore.state.completedCount,
+        }),
       );
     }
     const nextState = buildCompletedFilesRenderState(files);
@@ -1213,7 +1215,9 @@ export class EasySyncSyncView extends ItemView {
       this.renderFileResults(this.progressPanelEl, [...files], true);
     }
     this.progressSubtitleEl?.setText(
-      this.plugin.i18n.t("syncView.progress.completed", { count: files.length }),
+      this.plugin.i18n.t("syncView.progress.completed", {
+        count: this.plugin.progressStore.state.completedCount,
+      }),
     );
   }
 
@@ -1651,7 +1655,7 @@ export class EasySyncSyncView extends ItemView {
     if (state.completedFiles.length > 0) {
       this.progressSubtitleEl = panel.createDiv("easy-sync-progress-subtitle");
       this.progressSubtitleEl.setText(
-        t("syncView.progress.completed", { count: state.completedFiles.length }),
+        t("syncView.progress.completed", { count: state.completedCount }),
       );
       this.renderFileResults(panel, state.completedFiles, true);
     }
