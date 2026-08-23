@@ -54,6 +54,26 @@ export interface CommunityPluginManifestObservationV1 {
   manifestText: string;
 }
 
+/**
+ * Deterministic community-plugin manifest identity failures. Nothing was
+ * written and only an observed-fact change can clear the block, so these are
+ * safe to retry without pausing the whole auto-sync round.
+ */
+export type CommunityPluginIdentityBlockKind =
+  | "parse" // manifest unreadable, unsafe identity, or missing version
+  | "identity-changed" // same directory observed different ids (local vs remote)
+  | "identity-ambiguous"; // two selected directories declare the same id
+
+export class CommunityPluginIdentityBlockError extends Error {
+  constructor(
+    message: string,
+    readonly kind: CommunityPluginIdentityBlockKind,
+  ) {
+    super(message);
+    this.name = "CommunityPluginIdentityBlockError";
+  }
+}
+
 const SAFE_PLUGIN_ID = /^[a-z0-9][a-z0-9_-]*$/i;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const BUNDLE_FILES = new Set<CommunityPluginBundleFileName>([
@@ -89,29 +109,44 @@ export function parseCommunityPluginBundleManifest(
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new Error(`Selected plugin manifest is unreadable: ${directoryId}`);
+    throw new CommunityPluginIdentityBlockError(
+      `Selected plugin manifest is unreadable: ${directoryId}`,
+      "parse",
+    );
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`Selected plugin manifest is unreadable: ${directoryId}`);
+    throw new CommunityPluginIdentityBlockError(
+      `Selected plugin manifest is unreadable: ${directoryId}`,
+      "parse",
+    );
   }
   const manifest = parsed as Record<string, unknown>;
   if (
     typeof manifest.id !== "string"
     || !SAFE_PLUGIN_ID.test(manifest.id)
   ) {
-    throw new Error(`Selected plugin manifest identity is invalid: ${directoryId}`);
+    throw new CommunityPluginIdentityBlockError(
+      `Selected plugin manifest identity is invalid: ${directoryId}`,
+      "parse",
+    );
   }
   if (
     typeof manifest.version !== "string"
     || manifest.version.trim().length === 0
   ) {
-    throw new Error(`Selected plugin manifest version is missing or invalid: ${directoryId}`);
+    throw new CommunityPluginIdentityBlockError(
+      `Selected plugin manifest version is missing or invalid: ${directoryId}`,
+      "parse",
+    );
   }
   if (
     manifest.minAppVersion !== undefined
     && typeof manifest.minAppVersion !== "string"
   ) {
-    throw new Error(`Selected plugin minimum app version is invalid: ${directoryId}`);
+    throw new CommunityPluginIdentityBlockError(
+      `Selected plugin minimum app version is invalid: ${directoryId}`,
+      "parse",
+    );
   }
   return {
     id: manifest.id,
@@ -137,8 +172,9 @@ export function assertCommunityPluginManifestIdentityStable(
 ): void {
   const manifestIds = [...new Set(manifests.map((manifest) => manifest.id))];
   if (manifestIds.length > 1) {
-    throw new Error(
+    throw new CommunityPluginIdentityBlockError(
       `Selected plugin manifest identity changed within directory: ${directoryId}`,
+      "identity-changed",
     );
   }
 }

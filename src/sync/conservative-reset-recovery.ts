@@ -305,25 +305,6 @@ export function conservativeResetFootprintsOverlap(
     leftFootprint.remoteIds.has(remoteId));
 }
 
-/** Records sharing a path or Graph item identity cannot be reset separately. */
-export function conservativeResetRecordsOverlap(
-  left: Readonly<MutationLedgerEntryV1>,
-  right: Readonly<MutationLedgerEntryV1>,
-  currentPathByRemoteId: ReadonlyMap<string, string> = new Map(),
-  anchors: readonly Readonly<SyncAnchorV2>[] = [],
-): boolean {
-  const [leftFootprint, rightFootprint] =
-    buildConservativeResetRecordFootprints(
-      [left, right],
-      currentPathByRemoteId,
-      anchors,
-    );
-  return conservativeResetFootprintsOverlap(
-    leftFootprint,
-    rightFootprint,
-  );
-}
-
 export function areIndependentConservativeResetRecords(
   records: readonly Readonly<MutationLedgerEntryV1>[],
   currentPathByRemoteId: ReadonlyMap<string, string> = new Map(),

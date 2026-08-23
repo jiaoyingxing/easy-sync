@@ -11,16 +11,16 @@ import type { DisplayDiffResult } from "../src/ui/diff-engine";
 
 const t = (key: string, params?: Record<string, string | number>): string => {
   const templates: Record<string, string> = {
-    "conflictDetail.summaryComparing": "本地与远端版本不同，正在确认具体内容差异。",
-    "conflictDetail.summaryComparisonUnavailable": "暂时无法确认本地与远端的具体内容差异。",
-    "conflictDetail.summaryLocalExtra": "本地比远端多 {count} 行。",
-    "conflictDetail.summaryRemoteExtra": "远端比本地多 {count} 行。",
-    "conflictDetail.summaryBothModified": "本地和远端都有修改。",
-    "conflictDetail.summaryBothExistDifferent": "本地和远端都存在这个文件，但内容不同。",
-    "conflictDetail.summaryDifferent": "本地与远端内容不同。",
-    "conflictDetail.summaryBytesDifferentNoLineDiff": "本地与远端文件字节不同，但没有可显示的逐行差异。",
-    "reason.localDeletedRemoteModified": "已在本地删除，但远端有新的修改",
-    "reason.newFileBothSides": "本地和远端都存在这个文件。",
+    "conflictDetail.summaryComparing": "本机与云端版本不同，正在确认具体内容差异。",
+    "conflictDetail.summaryComparisonUnavailable": "暂时无法确认本机与云端的具体内容差异。",
+    "conflictDetail.summaryLocalExtra": "本机比云端多 {count} 行。",
+    "conflictDetail.summaryRemoteExtra": "云端比本机多 {count} 行。",
+    "conflictDetail.summaryBothModified": "本机和云端都有修改。",
+    "conflictDetail.summaryBothExistDifferent": "本机和云端都存在这个文件，但内容不同。",
+    "conflictDetail.summaryDifferent": "本机与云端内容不同。",
+    "conflictDetail.summaryBytesDifferentNoLineDiff": "本机与云端文件字节不同，但没有可显示的逐行差异。",
+    "reason.localDeletedRemoteModified": "已在本机删除，但云端有新的修改",
+    "reason.newFileBothSides": "本机和云端都存在这个文件。",
     "syncView.conflict.defaultReason": "冲突",
   };
   let text = templates[key] ?? key;
@@ -54,7 +54,7 @@ describe("conflict detail presentation", () => {
       "reason.bothSidesModified",
       t,
     )).toBe(
-      "本地比远端多 20 行。",
+      "本机比云端多 20 行。",
     );
   });
 
@@ -64,21 +64,21 @@ describe("conflict detail presentation", () => {
       "reason.newFileBothSides",
       t,
     )).toBe(
-      "远端比本地多 12 行。",
+      "云端比本机多 12 行。",
     );
     expect(summarizeConflictDetail(
       { kind: "text-diff", diff: displayResult(7, 5) },
       "reason.bothSidesModified",
       t,
     )).toBe(
-      "本地和远端都有修改。",
+      "本机和云端都有修改。",
     );
     expect(summarizeConflictDetail(
       { kind: "text-diff", diff: displayResult(0, 0, false, 3) },
       "reason.newFileBothSides",
       t,
     )).toBe(
-      "本地和远端都存在这个文件，但内容不同。",
+      "本机和云端都存在这个文件，但内容不同。",
     );
   });
 
@@ -87,27 +87,27 @@ describe("conflict detail presentation", () => {
       { kind: "comparison-unavailable" },
       "reason.newFileBothSides",
       t,
-    )).toBe("暂时无法确认本地与远端的具体内容差异。");
+    )).toBe("暂时无法确认本机与云端的具体内容差异。");
     expect(summarizeConflictDetail(
       { kind: "bytes-different-no-line-diff" },
       "reason.bothSidesModified",
       t,
-    )).toBe("本地与远端文件字节不同，但没有可显示的逐行差异。");
+    )).toBe("本机与云端文件字节不同，但没有可显示的逐行差异。");
     expect(summarizeConflictDetail(
       { kind: "reason" },
       "reason.localDeletedRemoteModified",
       t,
-    )).toBe("已在本地删除，但远端有新的修改");
+    )).toBe("已在本机删除，但云端有新的修改");
     expect(summarizeConflictDetail(
       { kind: "reason" },
       "reason.newFileBothSides",
       t,
-    )).toBe("本地和远端都存在这个文件。");
+    )).toBe("本机和云端都存在这个文件。");
     expect(summarizeConflictDetail(
       { kind: "content-different" },
       undefined,
       t,
-    )).toBe("本地与远端内容不同。");
+    )).toBe("本机与云端内容不同。");
   });
 
   it("removes unique-line and region-count claims from the top summary path", () => {
@@ -131,10 +131,10 @@ describe("conflict detail presentation", () => {
     const zhCN = readFileSync("src/i18n/zh-cn.ts", "utf8");
 
     expect(source).not.toContain('t("conflictDetail.loadFailed"');
-    expect(zhCN).not.toContain("远端内容暂不可用（可能是网络限制）");
+    expect(zhCN).not.toContain("云端内容暂不可用（可能是网络限制）");
     expect(zhCN).not.toContain('"conflictDetail.loadFailed"');
-    expect(zhCN).not.toContain("请尝试保留本地版本");
-    expect(zhCN).toContain("未能下载远端版本，本次未作更改");
+    expect(zhCN).not.toContain("请尝试保留本机版本");
+    expect(zhCN).toContain("未能下载云端版本，本次未作更改");
   });
 
   it("keeps the conflict title static and renders the path as an independent wrapping fact", () => {

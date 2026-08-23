@@ -1,6 +1,5 @@
 import {
   ButtonComponent,
-  ExtraButtonComponent,
   Modal,
   Notice,
   SearchComponent,

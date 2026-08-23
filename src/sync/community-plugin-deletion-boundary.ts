@@ -380,32 +380,6 @@ export function protectCommunityPluginPlan(
   });
 }
 
-/**
- * Enablement is actionable only while the plugin has at least one current
- * bundle member on either side. A zero-member ID is dangling host metadata and
- * remains untouched in each side's raw list. Any partial bundle still
- * participates so the existing completeness preflight can fail closed.
- */
-export function collectCommunityPluginIdsForEnablement(
-  policy: Readonly<PluginScopeSelection>,
-  candidates: readonly string[],
-  bundleParticipantIds: readonly string[],
-  ownPluginId = "easy-sync",
-): string[] {
-  const normalized = policy.mode === "selected"
-    ? normalizePluginIds(policy.pluginIds, ownPluginId)
-    : policy.mode === "all"
-      ? normalizePluginIds(candidates, ownPluginId)
-      : [];
-  const bundleParticipants = new Set(
-    normalizePluginIds(bundleParticipantIds, ownPluginId),
-  );
-  return normalized.filter((pluginId) =>
-    bundleParticipants.has(pluginId)
-    && isPluginSelected(policy, pluginId)
-  );
-}
-
 function withLocalIgnores(
   selection: Readonly<PluginScopeSelection>,
   additions: readonly string[],

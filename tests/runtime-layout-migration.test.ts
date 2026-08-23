@@ -191,9 +191,9 @@ describe("EasySync runtime layout migration", () => {
     await ensureEasySyncRuntimeLayoutMigration(adapter, current, legacy, storage);
     files.set(current.baseContentFile, "current-layout-update");
 
-    const first = await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, current, legacy, storage);
-    const second = await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, current, legacy, storage);
-    const third = await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, current, legacy, storage);
+    const first = await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, legacy, storage);
+    const second = await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, legacy, storage);
+    const third = await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, legacy, storage);
     expect(first.stableSyncs).toBe(1);
     expect(second.stableSyncs).toBe(2);
     expect(third.cleaned).toBe(true);
@@ -204,7 +204,7 @@ describe("EasySync runtime layout migration", () => {
       completed: true,
     });
 
-    const silent = await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, current, legacy, storage);
+    const silent = await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, legacy, storage);
     expect(silent.stableSyncs).toBe(0);
     expect(silent.remaining).toEqual([]);
     expect(EASY_SYNC_LAYOUT_CLEANUP_STABLE_SYNC_THRESHOLD).toBe(3);
@@ -227,9 +227,9 @@ describe("EasySync runtime layout migration", () => {
 
     await ensureEasySyncRuntimeLayoutMigration(adapter, current, legacy, storage);
 
-    await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, current, legacy, storage);
-    await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, current, legacy, storage);
-    const result = await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, current, legacy, storage);
+    await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, legacy, storage);
+    await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, legacy, storage);
+    const result = await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, legacy, storage);
 
     expect(result.cleaned).toBe(true);
     expect(files.has(legacy.baseContentFile)).toBe(false);
@@ -255,7 +255,6 @@ describe("EasySync runtime layout migration", () => {
 
     const result = await noteHealthySyncAndCleanupEasySyncRuntimeLayout(
       adapter,
-      current,
       legacy,
       storage,
     );

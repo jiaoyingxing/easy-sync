@@ -6328,6 +6328,421 @@ describe("Persistent remote delta state", () => {
     expect(state.mutationLedger).toEqual([]);
   });
 
+  it("observes mutation recovery through the committed delta cursor instead of rebuilding the complete feed", async () => {
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const content = new Uint8Array([1, 2, 3]).buffer;
+    const hash = await sha256Hex(content);
+    const local: LocalFileEntry = {
+      path: "observe-incremental.md",
+      hash,
+      size: content.byteLength,
+      mtime: 2,
+      binary: false,
+    };
+    const state = makeActiveV2State([], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-observe-incremental",
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload",
+          path: local.path,
+          expectedLocal: { exists: true, hash, size: local.size },
+          expectedRemote: { exists: false },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "incremental-tok",
+    });
+    const uploadFile = vi.fn().mockResolvedValue({
+      id: "observe-uploaded-id",
+      eTag: "observe-uploaded-etag",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getDelta,
+        uploadFile,
+        getFileMetadata: vi.fn().mockResolvedValue(null),
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter({
+            readBinary: vi.fn().mockResolvedValue(content),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [local],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({
+          status: "present",
+          entry: local,
+        }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(state.mutationLedger).toEqual([]);
+    expect(getDelta).toHaveBeenCalledTimes(2);
+    // The recovery observation consumed the committed delta cursor (1st call)
+    // and the ordinary remote scan followed from the fresh cursor (2nd call).
+    // It must not request the token-less complete feed first.
+    expect(getDelta.mock.calls[0][1]).toBe("delta-token");
+    expect(getDelta.mock.calls[1][1]).toBe("incremental-tok");
+  });
+
+  it("falls back to the token-less complete feed when the committed envelope cannot serve an incremental recovery observation", async () => {
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const content = new Uint8Array([1, 2, 3]).buffer;
+    const hash = await sha256Hex(content);
+    const local: LocalFileEntry = {
+      path: "observe-fallback.md",
+      hash,
+      size: content.byteLength,
+      mtime: 2,
+      binary: false,
+    };
+    const state = makeActiveV2State([], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-observe-fallback",
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload",
+          path: local.path,
+          expectedLocal: { exists: true, hash, size: local.size },
+          expectedRemote: { exists: false },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+      // Cursor/incremental prerequisites are not all present: the committed
+      // folder index is incomplete, so the recovery observation must rebuild.
+      hasCompleteRemoteFolderIndex: false,
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "fallback-tok",
+    });
+    const uploadFile = vi.fn().mockResolvedValue({
+      id: "fallback-uploaded-id",
+      eTag: "fallback-uploaded-etag",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getDelta,
+        uploadFile,
+        getFileMetadata: vi.fn().mockResolvedValue(null),
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter({
+            readBinary: vi.fn().mockResolvedValue(content),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [local],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({
+          status: "present",
+          entry: local,
+        }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(state.mutationLedger).toEqual([]);
+    // The first delta request must be the token-less complete feed.
+    expect(getDelta.mock.calls[0][1]).toBeUndefined();
+  });
+
+  it("falls back to the complete feed when the incremental recovery observation cannot prove the hierarchy", async () => {
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const content = new Uint8Array([1, 2, 3]).buffer;
+    const hash = await sha256Hex(content);
+    const local: LocalFileEntry = {
+      path: "observe-orphan.md",
+      hash,
+      size: content.byteLength,
+      mtime: 2,
+      binary: false,
+    };
+    const state = makeActiveV2State([], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-observe-orphan",
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload",
+          path: local.path,
+          expectedLocal: { exists: true, hash, size: local.size },
+          expectedRemote: { exists: false },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    // A live change whose parent identity is unknown cannot be applied onto
+    // the committed snapshot (IncrementalRemoteHierarchyError), so the
+    // recovery observation must fall back to the token-less complete feed
+    // (which filters the orphan out as a non-descendant).
+    const orphanItem = {
+      id: "orphan-item-id",
+      name: "orphan.md",
+      size: 1,
+      eTag: "etag-orphan",
+      parentReference: { id: "unknown-parent-id" },
+      file: {},
+    } as DriveItem;
+    const getDelta = vi.fn().mockImplementation(
+      async (_vaultName: string, deltaToken?: string) => {
+        if (deltaToken) {
+          return { value: [orphanItem], "@odata.deltaLink": "bad-tok" };
+        }
+        return { value: [], "@odata.deltaLink": "full-tok" };
+      },
+    );
+    const uploadFile = vi.fn().mockResolvedValue({
+      id: "orphan-uploaded-id",
+      eTag: "orphan-uploaded-etag",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getDelta,
+        uploadFile,
+        getFileMetadata: vi.fn().mockResolvedValue(null),
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter({
+            readBinary: vi.fn().mockResolvedValue(content),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [local],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({
+          status: "present",
+          entry: local,
+        }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(state.mutationLedger).toEqual([]);
+    expect(getDelta.mock.calls.length).toBeGreaterThanOrEqual(2);
+    // The incremental attempt consumed the committed cursor first…
+    expect(getDelta.mock.calls[0][1]).toBe("delta-token");
+    // …and the fallback returned to the token-less complete feed.
+    expect(getDelta.mock.calls[1][1]).toBeUndefined();
+  });
+
+  it("keeps the reset preflight recovery observation on the token-less complete feed", async () => {
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const hash = "a".repeat(64);
+    const state = makeActiveV2State([], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-observe-preflight",
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload",
+          path: "observe-preflight.md",
+          expectedLocal: { exists: true, hash, size: 3 },
+          expectedRemote: { exists: false },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "preflight-tok",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getDelta,
+        // Remote observation is rate-limited: the mutation recovery blocks
+        // retryably, which is enough to prove the observation request shape.
+        getFileMetadata: vi.fn().mockRejectedValue(new OneDriveError(
+          OneDriveErrorType.RateLimited,
+          "recovery observation rate limited",
+          429,
+          12,
+        )),
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({ status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      {
+        recoveryOnly: true,
+        mutationRecoveryObservationOnly: true,
+      },
+    );
+
+    expect(result.success).toBe(false);
+    expect(getDelta).toHaveBeenCalledTimes(1);
+    // The reset preflight must observe the remote independently of the
+    // committed snapshot and cursor: token-less complete feed first.
+    expect(getDelta.mock.calls[0][1]).toBeUndefined();
+  });
+
+  it("retires reflected receipts through the incremental recovery observation commitSeq", async () => {
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const hash = "a".repeat(64);
+    const records: MutationLedgerEntryV1[] = [{
+      intent: {
+        version: 1,
+        operationId: "op-reflected-run",
+        planRevision: 1,
+        scope: activeScope,
+        action: "deleteRemote",
+        path: "reflected-run.md",
+        expectedLocal: { exists: false },
+        expectedRemote: {
+          exists: true,
+          driveId: "remote-id",
+          eTag: "remote-etag",
+        },
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1,
+        operationId: "op-reflected-run",
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [],
+          baseRemovals: ["reflected-run.md"],
+          remoteUpserts: [],
+          remoteDeletes: ["reflected-run.md"],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      },
+    }];
+    const state = makeActiveV2State([], [], { mutationLedger: records });
+    const retire = vi.mocked(state.retireMutationCheckpointIfReflected);
+    retire.mockImplementation(async (operationId) => {
+      if (operationId !== "op-reflected-run") return false;
+      const index = state.mutationLedger.findIndex(
+        (record) => record.intent.operationId === operationId,
+      );
+      if (index < 0) return false;
+      state.mutationLedger.splice(index, 1);
+      return true;
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "reflected-tok",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getDelta,
+        getFileMetadata: vi.fn().mockResolvedValue(null),
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({ status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(state.mutationLedger).toEqual([]);
+    expect(retire).toHaveBeenCalledTimes(1);
+    // The retirement gate must see the observation commitSeq produced by the
+    // incremental projection (the committed envelope's next commitSeq).
+    expect(retire.mock.calls[0][1]).toBe(2);
+    expect(getDelta.mock.calls[0][1]).toBe("delta-token");
+  });
+
   it("rejects recovery-only mode before scan and Graph when public precommit is still authoritative", async () => {
     const scanAll = vi.fn();
     const initVaultScope = vi.fn();
@@ -8389,160 +8804,6 @@ describe("Persistent remote delta state", () => {
     });
   });
 
-  it("recovers an applied local-only download without forging ordinary V2 state", async () => {
-    const content = new Uint8Array([7, 8, 9]).buffer;
-    const hash = await sha256Hex(content);
-    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
-    const targetPath = ".obsidian/plugins/example/main.js";
-    const sourcePath = `community-plugin-content-v1/plugins/6578616d706c65/generations/1/objects/${hash}.bin`;
-    const local: LocalFileEntry = {
-      path: targetPath,
-      hash,
-      size: content.byteLength,
-      mtime: 4,
-      binary: true,
-    };
-    const source: RemoteFileEntry = {
-      path: sourcePath,
-      driveId: "generation-object-main",
-      parentId: "generation-objects",
-      size: content.byteLength,
-      mtime: 3,
-      eTag: "etag-generation-main",
-      cTag: "ctag-generation-main",
-      sha256Hash: hash,
-    };
-    const state = makeActiveV2State([], [], {
-      mutationLedger: [{
-        intent: {
-          version: 1,
-          operationId: "op-generation-local-only-receipt-lost",
-          planRevision: 1,
-          scope: activeScope,
-          action: "download",
-          path: targetPath,
-          sourcePath,
-          stateEffect: "local-only",
-          expectedLocal: { exists: false },
-          expectedRemote: {
-            exists: true,
-            driveId: source.driveId,
-            eTag: source.eTag,
-            size: source.size,
-            sha256Hash: hash,
-          },
-          createdAt: 1,
-        },
-        receipt: null,
-      }],
-    });
-    const executor = new SyncExecutor(
-      makeMockOneDrive({
-        getDriveItemMetadataById: vi.fn().mockResolvedValue({
-          id: source.driveId,
-          name: `${hash}.bin`,
-          file: {},
-          size: source.size,
-          eTag: source.eTag,
-          cTag: source.cTag,
-          parentReference: { id: source.parentId },
-        }),
-        downloadFile: vi.fn(),
-      }),
-      Object.assign(emptyScanner(), {
-        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
-      }),
-      state,
-      "testVault",
-    );
-
-    await (executor as unknown as {
-      recoverMutationLedger(scope: SyncScope): Promise<void>;
-    }).recoverMutationLedger(activeScope);
-
-    expect(state.mutationLedger).toEqual([]);
-    expect(state.baseSnapshot).toEqual([]);
-    expect(state.remoteSnapshot).toEqual([]);
-  });
-
-  it("keeps a receipted local-only download blocked when its sealed source version changes", async () => {
-    const content = new Uint8Array([10, 11, 12]).buffer;
-    const hash = await sha256Hex(content);
-    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
-    const targetPath = ".obsidian/plugins/example/main.js";
-    const sourcePath = `community-plugin-content-v1/plugins/6578616d706c65/generations/1/objects/${hash}.bin`;
-    const local: LocalFileEntry = {
-      path: targetPath,
-      hash,
-      size: content.byteLength,
-      mtime: 4,
-      binary: true,
-    };
-    const operationId = "op-generation-local-only-source-changed";
-    const state = makeActiveV2State([], [], {
-      mutationLedger: [{
-        intent: {
-          version: 1,
-          operationId,
-          planRevision: 1,
-          scope: activeScope,
-          action: "download",
-          path: targetPath,
-          sourcePath,
-          stateEffect: "local-only",
-          expectedLocal: { exists: false },
-          expectedRemote: {
-            exists: true,
-            driveId: "generation-object-main",
-            eTag: "etag-generation-main",
-            size: content.byteLength,
-            sha256Hash: hash,
-          },
-          createdAt: 1,
-        },
-        receipt: {
-          version: 1,
-          operationId,
-          completedAt: 2,
-          checkpoint: {
-            baseUpserts: [],
-            baseRemovals: [],
-            remoteUpserts: [],
-            remoteDeletes: [],
-            pendingConflictRemovals: [],
-            pendingDeleteRemovals: [],
-          },
-        },
-      }],
-    });
-    const executor = new SyncExecutor(
-      makeMockOneDrive({
-        getDriveItemMetadataById: vi.fn().mockResolvedValue({
-          id: "generation-object-main",
-          name: `${hash}.bin`,
-          file: {},
-          size: content.byteLength,
-          eTag: "etag-generation-main-changed",
-          cTag: "ctag-generation-main-changed",
-          parentReference: { id: "generation-objects" },
-        }),
-      }),
-      Object.assign(emptyScanner(), {
-        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
-      }),
-      state,
-      "testVault",
-    );
-
-    await expect((executor as unknown as {
-      recoverMutationLedger(scope: SyncScope): Promise<void>;
-    }).recoverMutationLedger(activeScope)).rejects.toThrow(
-      "Mutation receipt no longer matches",
-    );
-    expect(state.mutationLedger).toHaveLength(1);
-    expect(state.baseSnapshot).toEqual([]);
-    expect(state.remoteSnapshot).toEqual([]);
-  });
 
   it("recovers an unreceipted download by stable readback when Graph omits SHA-256", async () => {
     const content = new Uint8Array([4, 5, 6]).buffer;

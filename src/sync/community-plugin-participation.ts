@@ -19,7 +19,6 @@ export interface DeviceCommunityPluginParticipationEntryV1 {
   operationId?: string;
   targetCatalogRevision?: number;
   targetBundleDigest?: string;
-  joinedGeneration?: number;
   lastConfirmedLocalBundleDigest?: string;
   blockedReason?: string;
 }
@@ -44,7 +43,6 @@ export type DeviceCommunityPluginParticipationCommand =
   | {
       type: "confirm-participating";
       pluginId: string;
-      joinedGeneration?: number;
       localBundleDigest?: string;
     }
   | { type: "request-exit"; pluginId: string; operationId?: string }
@@ -171,7 +169,6 @@ export function reduceDeviceCommunityPluginParticipation(
       entry = {
         pluginId,
         phase: "participating",
-        ...optionalGeneration(command.joinedGeneration),
         ...optionalDigest(
           "lastConfirmedLocalBundleDigest",
           command.localBundleDigest,
@@ -184,7 +181,6 @@ export function reduceDeviceCommunityPluginParticipation(
         pluginId,
         phase: "exit-requested",
         ...optionalOperationId(command.operationId),
-        ...optionalGeneration(previous?.joinedGeneration),
         ...optionalDigest(
           "lastConfirmedLocalBundleDigest",
           previous?.lastConfirmedLocalBundleDigest,
@@ -297,6 +293,8 @@ function isParticipationEntry(
     || !isOptionalNonEmptyString(value.operationId)
     || !isOptionalSafeInteger(value.targetCatalogRevision, 0)
     || !isOptionalDigest(value.targetBundleDigest)
+    // Legacy joinedGeneration from the retired lifecycle line is tolerated on
+    // read and dropped by the next reducer rewrite (lazy migration).
     || !isOptionalSafeInteger(value.joinedGeneration, 1)
     || !isOptionalDigest(value.lastConfirmedLocalBundleDigest)) {
     return false;
@@ -369,15 +367,6 @@ function optionalRevision(value: number | undefined):
     throw new Error("Device community-plugin catalog revision is invalid");
   }
   return { targetCatalogRevision: value };
-}
-
-function optionalGeneration(value: number | undefined):
-  { joinedGeneration?: number } {
-  if (value === undefined) return {};
-  if (!Number.isSafeInteger(value) || value < 1) {
-    throw new Error("Device community-plugin generation is invalid");
-  }
-  return { joinedGeneration: value };
 }
 
 function optionalDigest<Key extends

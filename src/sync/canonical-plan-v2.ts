@@ -1656,9 +1656,6 @@ function clonePlanItem(item: SyncPlanItem): SyncPlanItem {
     ...(item.textMergeEvidence
       ? { textMergeEvidence: structuredClone(item.textMergeEvidence) }
       : {}),
-    ...(item.generationRestore
-      ? { generationRestore: structuredClone(item.generationRestore) }
-      : {}),
   };
 }
 
@@ -1732,26 +1729,6 @@ function canonicalPlanItemFactsV2(item: SyncPlanItem): unknown[] {
     item.targetParentRemoteId ?? null,
     item.requiresConfirmation ?? false,
     item.reviewImpactCount ?? 1,
-    item.generationRestore
-      ? [
-          item.generationRestore.schemaVersion,
-          item.generationRestore.pluginId,
-          item.generationRestore.participant.participantId,
-          item.generationRestore.participant.incarnation,
-          item.generationRestore.generation,
-          item.generationRestore.joinNonce,
-          item.generationRestore.controlRecordId,
-          item.generationRestore.fenceEpoch,
-          item.generationRestore.sealRevision,
-          item.generationRestore.manifestObject.objectPath,
-          item.generationRestore.manifestObject.remoteId,
-          item.generationRestore.manifestObject.parentId,
-          item.generationRestore.manifestObject.size,
-          item.generationRestore.manifestObject.eTag,
-          item.generationRestore.manifestObject.cTag,
-          item.generationRestore.manifestObject.sha256Hash,
-        ]
-      : null,
     token
       ? [
           token.version,

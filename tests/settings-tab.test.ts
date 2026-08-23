@@ -144,10 +144,10 @@ describe("buildSettingsSyncButtonState", () => {
     );
     expect(zhCN["settings.autoSyncChangeDelay.name"]).toBe("修改后触发同步");
     expect(zhCN["settings.autoSyncChangeDelay.desc"]).toBe(
-      "检测到本地变化后等待 {seconds} 秒；期间有新变化会重新计时。",
+      "检测到本机变化后等待 {seconds} 秒；期间有新变化会重新计时。",
     );
     expect(zhCN["settings.autoSyncChangeDelay.disabledDesc"]).toBe(
-      "已关闭；本地变化不会自动触发同步。",
+      "已关闭；本机变化不会自动触发同步。",
     );
     expect(en["settings.syncInterval.name"]).toBe("Scheduled sync");
     expect(en["settings.autoSyncChangeDelay.name"]).toBe("Sync after changes");
@@ -579,7 +579,7 @@ describe("buildSettingsSyncButtonState", () => {
     expect(en["settings.communityPlugins.status.restoreIncompatible"])
       .toBe("Not compatible with this device or Obsidian version");
     expect(zhCN["settings.communityPlugins.status.restoreTargetChanged"])
-      .toBe("远端插件已变化");
+      .toBe("云端插件已变化");
     expect(en["settings.communityPlugins.status.restoreTargetChanged"])
       .toBe("Remote plugin changed");
     expect(zhCN["settings.communityPlugins.status.restoreScopeChanged"])
@@ -591,11 +591,11 @@ describe("buildSettingsSyncButtonState", () => {
     expect(en["settings.communityPlugins.status.localBundleIncomplete"])
       .toBe("Plugin files are incomplete");
     expect(zhCN["settings.communityPlugins.status.remoteCatalogStale"])
-      .toBe("远端状态待重新确认");
+      .toBe("云端状态待重新确认");
     expect(en["settings.communityPlugins.status.remoteCatalogStale"])
       .toBe("Remote status needs to be checked again");
     expect(zhCN["notice.communityPlugins.remoteCatalogFailed"])
-      .toBe("无法确认远端插件列表，请稍后重新打开。");
+      .toBe("无法确认云端插件列表，请稍后重新打开。");
     expect(en["notice.communityPlugins.remoteCatalogFailed"])
       .toBe("Could not verify the remote plugin list. Reopen this page to try again.");
     expect(source).toContain("item.participationBlockedReason");
@@ -656,7 +656,7 @@ describe("buildSettingsSyncButtonState", () => {
     expect(zhCN["settings.communityPlugins.guidance.reinstall"])
       .toBe("本机插件清单无法读取时，请重新安装对应插件。");
     expect(zhCN["settings.communityPlugins.guidance.reconfirm"])
-      .toBe("远端插件或同步位置变化时，将在下次同步时重新核对。");
+      .toBe("云端插件或同步位置变化时，将在下次同步时重新核对。");
     expect(zhCN["settings.communityPlugins.guidance.retry"])
       .toBe("恢复受阻时，请稍后重新同步。");
   });
@@ -1025,7 +1025,7 @@ describe("buildSettingsSyncButtonState", () => {
       "插件仅本机有",
     );
     expect(zhCN["settings.communityPlugins.status.remoteOnly"]).toBe(
-      "插件仅远端有",
+      "插件仅云端有",
     );
     expect(zhCN["settings.communityPlugins.status.unavailable"]).toBe(
       "未找到插件本体",
@@ -1077,33 +1077,38 @@ describe("buildSettingsSyncButtonState", () => {
     expect(en["settings.syncExclusion.intro"]).toContain("will not be deleted");
   });
 
-  it("moves first-use guidance into the first plan alert and keeps About lightweight", () => {
-    const settingsSource = readFileSync("src/ui/settings-tab.ts", "utf8");
+  it("moves first-use guidance to the login notice and keeps the plan alert single-purpose", () => {
     const mainSource = readFileSync("src/main.ts", "utf8");
+    const entrySource = readFileSync("src/ui/auth-entry-flow.ts", "utf8");
     const alertSource = readFileSync("src/ui/confirm-modal.ts", "utf8");
 
-    expect(zhCN["settings.about.author.desc"]).toBe(
-      "焦应行（Jiao Yingxing）。使用中遇到问题，可在 GitHub 提交 Issue，或通过小红书私信联系作者。",
+    expect(zhCN["auth.notice.title"]).toBe("登录前须知");
+    expect(zhCN["auth.notice.line1"]).toBe(
+      "1. 在另一台设备创建同名仓库即可同步；同步无需安装 OneDrive 客户端",
     );
-    expect(zhCN["syncPlan.firstUseUsage"]).toBe(
-      "请勿让 OneDrive 客户端、iCloud、Dropbox、Syncthing 等其他同步工具同时管理同一个本地仓库。首次同步或文件较多时可能需要更长时间，可在侧栏查看进度。",
+    expect(zhCN["auth.notice.line2"]).toBe(
+      "2. 同步的文件保存在你自己的 OneDrive 账号中，可通过网页版或 OneDrive 客户端查看",
     );
-    expect(zhCN["syncPlan.firstUseSafety"]).toBe(
-      "同步过程中，EasySync 可能上传、下载或删除本地及 OneDrive 中的文件。重要内容请保留独立备份；同步不能替代备份。",
+    expect(zhCN["auth.notice.line3"]).toBe(
+      "3. 让 EasySync 单独管理同步；不要把仓库放进 OneDrive、iCloud、Dropbox 等同步文件夹",
     );
+    expect(zhCN["auth.notice.continue"]).toBe("继续登录");
 
-    expect(en["settings.about.author.desc"]).toBe(
-      "Jiao Yingxing. If you run into a problem, open an issue on GitHub or contact the author on Xiaohongshu.",
-    );
-    expect(en["syncPlan.firstUseUsage"]).toContain("another sync tool");
-    expect(en["syncPlan.firstUseUsage"]).toContain("progress is available in the sidebar");
-    expect(en["syncPlan.firstUseSafety"]).toContain("upload, download, or delete");
-    expect(en["syncPlan.firstUseSafety"]).toContain("sync is not a backup");
+    expect(en["auth.notice.line1"]).toContain("same name on another device");
+    expect(en["auth.notice.line1"]).toContain("no OneDrive client required");
+    expect(en["auth.notice.line2"]).toContain("your own OneDrive account");
+    expect(en["auth.notice.line3"]).toContain("sync folders");
+    expect(en["auth.notice.continue"]).toBe("Continue");
 
-    expect(settingsSource).not.toContain("settings.about.usage");
-    expect(settingsSource).not.toContain("settings.about.disclaimer");
-    expect(mainSource).toContain('t("syncPlan.firstUseUsage")');
-    expect(mainSource).toContain('t("syncPlan.firstUseSafety")');
+    // The education now lives in the login gate; the first plan alert is
+    // single-purpose (plan generated → review in the sidebar).
+    expect(entrySource).toContain('t("auth.notice.title")');
+    expect(entrySource).toContain('t("auth.notice.line3")');
+    expect(mainSource).not.toContain("syncPlan.firstUseUsage");
+    expect(mainSource).not.toContain("syncPlan.firstUseSafety");
+    expect(zhCN["syncPlan.readyMessage"]).toBe(
+      "同步计划已生成，请在侧边栏查看详情并确认执行。",
+    );
     expect(alertSource).toContain("for (const message of this.messages)");
   });
 
@@ -1162,16 +1167,16 @@ describe("buildSettingsSyncButtonState", () => {
       "选项从下一次同步起生效，不会立即改动文件。",
     );
     expect(zhCN["settings.automaticHandling.autoDeleteLocalFiles.name"]).toBe(
-      "将远端删除同步到本地",
+      "将云端删除同步到本机",
     );
     expect(zhCN["settings.automaticHandling.autoDeleteLocalFiles.desc"]).toBe(
-      "远端文件已删除且本地自上次同步后未修改时，删除本地对应文件。EasySync 不保留额外副本。",
+      "云端文件已删除且本机自上次同步后未修改时，删除本机对应文件。EasySync 不保留额外副本。",
     );
     expect(zhCN["settings.automaticHandling.mergeNonOverlappingText.name"]).toBe(
       "合并不重叠的文本修改",
     );
     expect(zhCN["settings.automaticHandling.mergeNonOverlappingText.desc"]).toBe(
-      "本地和远端修改同一份已同步文本、且修改内容互不重叠时，将两边修改合并并同步到两端；无法安全合并时留待手动处理。",
+      "本机和云端修改同一份已同步文本、且修改内容互不重叠时，将两边修改合并并同步到两端；无法安全合并时留待手动处理。",
     );
     expect(en["settings.automaticHandling.autoDeleteLocalFiles.name"]).toBe(
       "Apply remote deletions locally",

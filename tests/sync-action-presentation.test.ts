@@ -15,42 +15,42 @@ const EXPECTED: Record<
   [SyncActionType.Download]: { group: "download", zh: "下载", en: "Download" },
   [SyncActionType.RecreateRemoteScope]: {
     group: "remotePreparation",
-    zh: "准备远端同步目录",
+    zh: "准备云端同步目录",
     en: "Prepare remote sync folder",
   },
   [SyncActionType.CreateRemoteFolder]: {
     group: "folderCreate",
-    zh: "创建远端文件夹",
+    zh: "创建云端文件夹",
     en: "Create remote folder",
   },
   [SyncActionType.CreateLocalFolder]: {
     group: "folderCreate",
-    zh: "创建本地文件夹",
+    zh: "创建本机文件夹",
     en: "Create local folder",
   },
   [SyncActionType.MoveRemoteFolder]: {
     group: "moveRename",
-    zh: "移动/重命名远端文件夹",
+    zh: "移动/重命名云端文件夹",
     en: "Move/Rename remote folder",
   },
   [SyncActionType.MoveLocalFolder]: {
     group: "moveRename",
-    zh: "移动/重命名本地文件夹",
+    zh: "移动/重命名本机文件夹",
     en: "Move/Rename local folder",
   },
   [SyncActionType.DeleteRemoteFolder]: {
     group: "delete",
-    zh: "删除远端文件夹",
+    zh: "删除云端文件夹",
     en: "Delete remote folder",
   },
   [SyncActionType.DeleteLocalFolder]: {
     group: "delete",
-    zh: "删除本地文件夹",
+    zh: "删除本机文件夹",
     en: "Delete local folder",
   },
   [SyncActionType.MoveLocalFile]: {
     group: "moveRename",
-    zh: "移动/重命名本地文件",
+    zh: "移动/重命名本机文件",
     en: "Move/Rename local file",
   },
   [SyncActionType.FolderDeferred]: {
@@ -60,22 +60,22 @@ const EXPECTED: Record<
   },
   [SyncActionType.DeleteRemote]: {
     group: "delete",
-    zh: "删除远端文件",
+    zh: "删除云端文件",
     en: "Delete remote file",
   },
   [SyncActionType.DeleteLocal]: {
     group: "delete",
-    zh: "删除本地文件",
+    zh: "删除本机文件",
     en: "Delete local file",
   },
   [SyncActionType.ConfirmLocalDelete]: {
     group: "delete",
-    zh: "确认删除本地文件",
+    zh: "确认删除本机文件",
     en: "Confirm local file deletion",
   },
   [SyncActionType.RenameRemote]: {
     group: "moveRename",
-    zh: "移动/重命名远端文件",
+    zh: "移动/重命名云端文件",
     en: "Move/Rename remote file",
   },
   [SyncActionType.Conflict]: {
@@ -134,10 +134,10 @@ describe("sync action presentation", () => {
       zh.t(resolveSyncActionPresentation(type).activeLabelKey));
 
     expect(labels).toEqual([
-      "正在移动或重命名远端文件夹…",
-      "正在移动或重命名本地文件夹…",
-      "正在移动或重命名远端文件…",
-      "正在移动或重命名本地文件…",
+      "正在移动或重命名云端文件夹…",
+      "正在移动或重命名本机文件夹…",
+      "正在移动或重命名云端文件…",
+      "正在移动或重命名本机文件…",
     ]);
   });
 

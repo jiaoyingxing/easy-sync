@@ -47,11 +47,14 @@ function resolveLocale(rawLang: string): keyof LocaleMap {
 }
 
 export class I18n {
+  /** Resolved locale key ("en" | "zh-cn") — read for locale-sensitive logic. */
+  readonly language: keyof LocaleMap;
   private locale: LocaleStrings;
 
   constructor(language?: string) {
     const lang = language ?? "en";
     const key = resolveLocale(lang);
+    this.language = key;
     this.locale = LOCALES[key] ?? en;
   }
 
@@ -75,11 +78,6 @@ export class I18n {
     }
 
     return template;
-  }
-
-  /** Get the current locale object (for advanced use) */
-  getLocale(): LocaleStrings {
-    return this.locale;
   }
 
   /** Static helper: read Obsidian's language setting */

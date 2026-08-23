@@ -1092,7 +1092,6 @@ function makeHarness(input?: {
       return sharedProtocolObject;
     }),
     overwriteSharedSyncProtocolV2: vi.fn(async (
-      _vaultName: string,
       id: string,
       eTag: string,
       content: string,
@@ -2705,6 +2704,247 @@ describe("V1 to V2 controlled production activation", () => {
       deleted: 0,
       conflicts: 0,
     });
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("requests the binding-proven V3 slot on the per-round protocol observation and stays healthy", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    harness.seedSharedProtocol({
+      ...scope,
+      filesRootId: "previous-files-root",
+    });
+    const seededBinding = await seedExactScopeFreeProtocol(harness);
+    await harness.state.load();
+    const preview = await harness.executor.run("manual", {
+      onConfirmThreshold: vi.fn().mockResolvedValue(false),
+    });
+    expect(preview.message).toBe("result.pausedForReview");
+    await harness.state.close();
+    const restartedState = new StateManager(harness.plugin);
+    await restartedState.load();
+    const restartedExecutor = new SyncExecutor(
+      harness.client,
+      harness.scanner,
+      restartedState,
+      "testVault",
+      undefined,
+      undefined,
+      harness.diag as never,
+      harness.fileManager as never,
+    );
+    const authorization = restartedState.planReviewAuthorization;
+    const executed = await restartedExecutor.run(
+      "manual",
+      {},
+      true,
+      authorization!,
+    );
+    expect(executed.success).toBe(true);
+
+    // Per-round observation: capture the expected V3 slot identity the
+    // executor asks for and simulate the client's binding-proven skip (slot
+    // with content: null).
+    const observedSlotArgs: Array<{ id: string; eTag: string } | undefined> =
+      [];
+    vi.mocked(harness.client.readSharedSyncProtocolObjects).mockImplementation(
+      async (
+        vaultName: string,
+        expectedV3Slot?: { id: string; eTag: string },
+      ) => {
+        observedSlotArgs.push(expectedV3Slot);
+        return {
+          v2: await harness.client.readSharedSyncProtocolV2(vaultName),
+          v3: expectedV3Slot
+            ? {
+                id: expectedV3Slot.id,
+                eTag: expectedV3Slot.eTag,
+                content: null,
+              }
+            : await harness.client.readSharedSyncProtocolV3(vaultName),
+        };
+      },
+    );
+
+    const stable = await restartedExecutor.run("manual");
+    expect(stable).toMatchObject({
+      success: true,
+      errors: 0,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 0,
+    });
+    // The per-round ensure requested the exact committed binding identity…
+    expect(observedSlotArgs.at(-1)).toEqual({
+      id: seededBinding.recordId,
+      eTag: seededBinding.recordETag,
+    });
+    // …and the binding-proven slot (content: null) was materialized into a
+    // healthy profile without any protocol creation or repair.
+    expect(harness.client.createSharedSyncProtocolV3).not.toHaveBeenCalled();
+    expect(harness.client.createSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expect(harness.client.overwriteSharedSyncProtocolV2).not.toHaveBeenCalled();
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("overlaps the per-round protocol observation with the remote scan instead of running them in sequence", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    harness.seedSharedProtocol({
+      ...scope,
+      filesRootId: "previous-files-root",
+    });
+    await seedExactScopeFreeProtocol(harness);
+    await harness.state.load();
+    const preview = await harness.executor.run("manual", {
+      onConfirmThreshold: vi.fn().mockResolvedValue(false),
+    });
+    expect(preview.message).toBe("result.pausedForReview");
+    await harness.state.close();
+    const restartedState = new StateManager(harness.plugin);
+    await restartedState.load();
+    const restartedExecutor = new SyncExecutor(
+      harness.client,
+      harness.scanner,
+      restartedState,
+      "testVault",
+      undefined,
+      undefined,
+      harness.diag as never,
+      harness.fileManager as never,
+    );
+    const authorization = restartedState.planReviewAuthorization;
+    const executed = await restartedExecutor.run(
+      "manual",
+      {},
+      true,
+      authorization!,
+    );
+    expect(executed.success).toBe(true);
+
+    // Order the two read paths: the protocol observation marks both its start
+    // and its end; the delta marks only its start. The remote scan must run
+    // while the (slow) observation is still in flight.
+    const order: string[] = [];
+    vi.mocked(harness.client.readSharedSyncProtocolObjects).mockImplementation(
+      async (vaultName: string) => {
+        order.push("observe-start");
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        order.push("observe-end");
+        return {
+          v2: await harness.client.readSharedSyncProtocolV2(vaultName),
+          v3: await harness.client.readSharedSyncProtocolV3(vaultName),
+        };
+      },
+    );
+    const getDelta = vi.fn().mockImplementation(async () => {
+      order.push("delta-start");
+      order.push("delta-end");
+      return { value: [], "@odata.deltaLink": "overlap-tok" };
+    });
+    vi.mocked(harness.client.getDelta).mockImplementation(getDelta);
+    if (harness.client.getDeltaByFolderId) {
+      vi.mocked(harness.client.getDeltaByFolderId).mockImplementation(
+        getDelta,
+      );
+    }
+
+    const stable = await restartedExecutor.run("manual");
+    expect(stable.success).toBe(true);
+    expect(order.indexOf("delta-start")).toBeLessThan(
+      order.indexOf("observe-end"),
+    );
+  });
+
+  it("commits the remote projection before reporting a failed protocol convergence and keeps the next round healthy", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [],
+      remoteItems: [],
+      pluginData: {
+        "easy-sync-generation": 0,
+        "easy-sync-last-sync-time": 0,
+      },
+    });
+    harness.seedSharedProtocol({
+      ...scope,
+      filesRootId: "previous-files-root",
+    });
+    await seedExactScopeFreeProtocol(harness);
+    await harness.state.load();
+    const preview = await harness.executor.run("manual", {
+      onConfirmThreshold: vi.fn().mockResolvedValue(false),
+    });
+    expect(preview.message).toBe("result.pausedForReview");
+    await harness.state.close();
+    const restartedState = new StateManager(harness.plugin);
+    await restartedState.load();
+    const restartedExecutor = new SyncExecutor(
+      harness.client,
+      harness.scanner,
+      restartedState,
+      "testVault",
+      undefined,
+      undefined,
+      harness.diag as never,
+      harness.fileManager as never,
+    );
+    const authorization = restartedState.planReviewAuthorization;
+    const executed = await restartedExecutor.run(
+      "manual",
+      {},
+      true,
+      authorization!,
+    );
+    expect(executed.success).toBe(true);
+
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "commit-before-block-tok",
+    });
+    vi.mocked(harness.client.getDelta).mockImplementation(getDelta);
+    if (harness.client.getDeltaByFolderId) {
+      vi.mocked(harness.client.getDeltaByFolderId).mockImplementation(
+        getDelta,
+      );
+    }
+    vi.mocked(harness.client.readSharedSyncProtocolObjects)
+      .mockRejectedValueOnce(new Error("protocol read failed"))
+      .mockImplementation(async (vaultName: string) => ({
+        v2: await harness.client.readSharedSyncProtocolV2(vaultName),
+        v3: await harness.client.readSharedSyncProtocolV3(vaultName),
+      }));
+
+    const failed = await restartedExecutor.run("manual");
+    expect(failed.message).toBe("result.v2ProtocolBlocked");
+    expect(failed.errors).toBe(1);
+    // The remote scan ran while the protocol observation was in flight and
+    // is already committed when the protocol failure is reported.
+    expect(getDelta).toHaveBeenCalled();
+    expect(restartedState.remoteDeltaLink).toBe("commit-before-block-tok");
+
+    // The committed observation-only projection must not disturb the next
+    // round: it continues from the fresh cursor and converges normally.
+    const recovered = await restartedExecutor.run("manual");
+    expect(recovered.success).toBe(true);
     expectNoFileMutations(harness.mutations);
   });
 
@@ -16043,7 +16283,11 @@ describe("V1 to V2 controlled production activation", () => {
     expect(readProfile).toHaveBeenCalledOnce();
     expect(harness.client.readSharedSyncProtocolV2).not.toHaveBeenCalled();
     expect(harness.client.readSharedSyncProtocolV3).not.toHaveBeenCalled();
-    expect(harness.getDelta).not.toHaveBeenCalled();
+    // E (protocol observation overlaps the remote scan): the delta already
+    // ran while the observation was in flight — the round outcome above
+    // (retryable disposition, planning not-entered, no mutations) is the
+    // contract, not the request ordering.
+    expect(harness.getDelta).toHaveBeenCalled();
     expectNoFileMutations(harness.mutations);
 
     const recovered = await harness.executor.run("auto");
@@ -16120,7 +16364,9 @@ describe("V1 to V2 controlled production activation", () => {
     });
     expect(readProfile).toHaveBeenCalledOnce();
     expect(restoreByIdentity).not.toHaveBeenCalled();
-    expect(harness.getDelta).not.toHaveBeenCalled();
+    // E: the delta overlapped the observation (see sibling tests); the
+    // round outcome above is the contract.
+    expect(harness.getDelta).toHaveBeenCalled();
     expectNoFileMutations(harness.mutations);
 
     expect((await harness.executor.run("auto"))).toMatchObject({
@@ -16181,7 +16427,9 @@ describe("V1 to V2 controlled production activation", () => {
     expect(blocked.disposition).toBeUndefined();
     expect(readProfile).toHaveBeenCalledOnce();
     expect(restoreByIdentity).not.toHaveBeenCalled();
-    expect(harness.getDelta).not.toHaveBeenCalled();
+    // E: the delta overlapped the observation; the v2ProtocolBlocked outcome
+    // above is the contract.
+    expect(harness.getDelta).toHaveBeenCalled();
     expectNoFileMutations(harness.mutations);
   });
 
@@ -16299,7 +16547,10 @@ describe("V1 to V2 controlled production activation", () => {
       },
     });
     expect(expired.disposition).toBeUndefined();
-    expect(harness.getDelta).not.toHaveBeenCalled();
+    // E: the remote scan overlapped the observation and already ran before
+    // the auth expiry surfaced; the authExpired outcome above is the
+    // contract.
+    expect(harness.getDelta).toHaveBeenCalled();
     expectNoFileMutations(harness.mutations);
   });
 
@@ -16535,7 +16786,9 @@ describe("V1 to V2 controlled production activation", () => {
           component,
         },
       });
-      expect(harness.getDelta).not.toHaveBeenCalled();
+      // E: the remote scan overlapped the partial-body observation; the
+      // retryable disposition above is the contract.
+      expect(harness.getDelta).toHaveBeenCalled();
       expectNoFileMutations(harness.mutations);
       await harness.state.close();
     },
@@ -16587,7 +16840,9 @@ describe("V1 to V2 controlled production activation", () => {
         },
       });
       expect(readProfile).toHaveBeenCalledOnce();
-      expect(harness.getDelta).not.toHaveBeenCalled();
+      // E: the delta overlapped the stale-body observation; the retryable
+      // disposition above is the contract.
+      expect(harness.getDelta).toHaveBeenCalled();
       expectNoFileMutations(harness.mutations);
 
       expect((await harness.executor.run("auto"))).toMatchObject({
@@ -16770,7 +17025,9 @@ describe("V1 to V2 controlled production activation", () => {
       "testVault",
       { createMissing: false },
     );
-    expect(harness.getDelta).not.toHaveBeenCalled();
+    // E: the remote scan overlapped the observation; the scope-recovery
+    // staging outcome above is the contract.
+    expect(harness.getDelta).toHaveBeenCalled();
     expectNoFileMutations(harness.mutations);
 
     const restartedState = new StateManager(harness.plugin);

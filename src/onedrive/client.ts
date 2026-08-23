@@ -24,7 +24,6 @@ import {
   type DeltaResponse,
   type RemoteVaultScope,
   type UploadResult,
-  type CommunityPluginGenerationCloudObjectV1,
   OneDriveError,
   OneDriveErrorType,
   RemoteVaultScopeIdentityError,
@@ -53,15 +52,34 @@ export interface SharedSyncProtocolControlObject {
   content: string;
 }
 
+/** A control-directory slot whose content the caller can prove unchanged from
+ *  its V3 binding (same id + eTag ⇒ same bytes under the Graph versioning
+ *  contract). `content: null` marks that binding proof; only callers holding
+ *  the binding may materialize it. */
+export interface SharedSyncProtocolBindingProvenObject {
+  id: string;
+  eTag: string;
+  content: null;
+}
+
 export interface SharedSyncProtocolObjectsObservation {
   v2: SharedSyncProtocolControlObject | null;
-  v3: SharedSyncProtocolControlObject | null;
+  v3:
+    | SharedSyncProtocolControlObject
+    | SharedSyncProtocolBindingProvenObject
+    | null;
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_REQUEST_ATTEMPTS = 3;
 const RETRY_BASE_MS = 500;
 const RETRY_JITTER_MS = 250;
+/** Self-built delta feeds request a larger first page (Graph official: the
+ *  driveItem delta method supports the $top OData query parameter). This
+ *  reduces serial pagination round trips on complete feeds (first sync,
+ *  full identity rebuilds). Server-issued @odata.deltaLink/nextLink URLs are
+ *  never modified. */
+const DELTA_PAGE_SIZE_TOP = 1000;
 const DOWNLOAD_BASE_TIMEOUT_MS = 30_000;  // 30s base — covers slow/unstable connections
 const DOWNLOAD_PER_MIB_TIMEOUT_MS = 3_000;  // 3s/MiB — slower connections need more headroom
 const DOWNLOAD_MAX_TIMEOUT_MS = 300_000; // 5min hard cap — slow connections may need minutes, not seconds
@@ -72,7 +90,6 @@ const MAX_REMOTE_FILE_BYTES = 2 * 1024 * 1024 * 1024;
 const MAX_LEGACY_BASELINE_BYTES = 64 * 1024 * 1024;
 const MAX_CLOUD_BOOTSTRAP_BYTES = 64 * 1024 * 1024;
 const MAX_SHARED_PROTOCOL_BYTES = 1024 * 1024;
-const MAX_COMMUNITY_PLUGIN_LIFECYCLE_BYTES = 8 * 1024 * 1024;
 const ONEDRIVE_PERSONAL_DRIVE_ID_PATTERN = /^[0-9a-f]{16}$/i;
 
 function isSameGraphDriveId(actual: string, expected: string): boolean {
@@ -2121,6 +2138,7 @@ export class OneDriveClient {
    * body reads may run in parallel only after every directory page is known. */
   async readSharedSyncProtocolObjects(
     vaultName: string,
+    expectedV3Slot?: { id: string; eTag: string },
   ): Promise<SharedSyncProtocolObjectsObservation> {
     const storageVaultName = this.getStorageVaultName(vaultName);
     const requestOwnerPrefix = `sharedProtocol:${storageVaultName}`;
@@ -2137,6 +2155,18 @@ export class OneDriveClient {
     } catch (error) {
       throw new SharedSyncProtocolObservationError("directory", error);
     }
+    const v3ProvenItem = expectedV3Slot
+      && v3Item
+      && v3Item.id === expectedV3Slot.id
+      && v3Item.eTag === expectedV3Slot.eTag
+      ? v3Item
+      : null;
+    if (v3ProvenItem) {
+      this.diag?.log(
+        "onedrive",
+        "shared protocol V3 slot unchanged since the committed binding; skipping its content read",
+      );
+    }
 
     const [v2, v3] = await Promise.all([
       v2Item
@@ -2150,14 +2180,32 @@ export class OneDriveClient {
           })
         : null,
       v3Item
-        ? this.readObservedSharedSyncProtocolItem(
-          v3Item,
-          "SharedSyncProtocolV3",
-          `${requestOwnerPrefix}:v3`,
-        )
-          .catch((error: unknown) => {
-            throw new SharedSyncProtocolObservationError("v3", error);
-          })
+        ? v3ProvenItem
+          ? (() => {
+              // selectSharedSyncProtocolSlot already ran the same identity
+              // gate; these narrow the DriveItem optionals for the proven
+              // marker without weakening that gate.
+              const provenId = v3ProvenItem.id;
+              const provenETag = v3ProvenItem.eTag;
+              if (!provenId || !provenETag) {
+                throw new Error(
+                  "Shared sync protocol slot protocol-v3.json metadata is incomplete",
+                );
+              }
+              return Promise.resolve<SharedSyncProtocolBindingProvenObject>({
+                id: provenId,
+                eTag: provenETag,
+                content: null,
+              });
+            })()
+          : this.readObservedSharedSyncProtocolItem(
+              v3Item,
+              "SharedSyncProtocolV3",
+              `${requestOwnerPrefix}:v3`,
+            )
+              .catch((error: unknown) => {
+                throw new SharedSyncProtocolObservationError("v3", error);
+              })
         : null,
     ]);
     return { v2, v3 };
@@ -2352,7 +2400,6 @@ export class OneDriveClient {
   }
 
   async overwriteSharedSyncProtocolV2(
-    vaultName: string,
     id: string,
     eTag: string,
     content: string,
@@ -2419,248 +2466,13 @@ export class OneDriveClient {
     );
   }
 
-  // ---- Community-plugin lifecycle V1 ----
-
-  async readCommunityPluginLifecycleV1(
-    vaultName: string,
-  ): Promise<{ id: string; eTag: string; content: string } | null> {
-    const storageVaultName = this.getStorageVaultName(vaultName);
-    const childrenResp = await this.request(
-      "GET",
-      `${APP_FOLDER_PATHS.pluginDir(storageVaultName)}:/children`,
-    );
-    const children = (childrenResp.json as { value?: DriveItem[] }).value ?? [];
-    const item = children.find(
-      (entry) => entry.name === "community-plugin-lifecycle-v1.json" && entry.file,
-    );
-    if (!item) return null;
-    return this.readPluginControlItemV2(item, "CommunityPluginLifecycleV1");
-  }
-
-  async readCommunityPluginLifecycleV1ById(
-    id: string,
-  ): Promise<{ id: string; eTag: string; content: string }> {
-    const metaResp = await this.request(
-      "GET",
-      `/me/drive/items/${encodeURIComponent(id)}?select=id,name,size,eTag,file,@microsoft.graph.downloadUrl`,
-    );
-    return this.readPluginControlItemV2(
-      metaResp.json as DriveItem,
-      "CommunityPluginLifecycleV1",
-    );
-  }
-
-  async createCommunityPluginLifecycleV1(
-    vaultName: string,
-    content: string,
-  ): Promise<{ id: string; eTag: string }> {
-    const apiPath = `${APP_FOLDER_PATHS.pluginDir(this.getStorageVaultName(vaultName))}/community-plugin-lifecycle-v1.json:/content?@microsoft.graph.conflictBehavior=fail`;
-    const response = await this.request("PUT", apiPath, content, "application/json");
-    return requirePluginControlFileVersion(response.json, "CommunityPluginLifecycleV1");
-  }
-
-  async updateCommunityPluginLifecycleV1(
-    id: string,
-    eTag: string,
-    content: string,
-  ): Promise<{ id: string; eTag: string }> {
-    const response = await this.request(
-      "PUT",
-      `/me/drive/items/${encodeURIComponent(id)}/content`,
-      content,
-      "application/json",
-      {},
-      eTag,
-    );
-    return requirePluginControlFileVersion(response.json, "CommunityPluginLifecycleV1");
-  }
-
-  // ---- Community-plugin generation immutable content ----
-
-  /**
-   * Create one immutable generation object below `.easy-sync`. Parent folders
-   * are resolved by exact identity first; the object write itself always uses
-   * Graph conflictBehavior=fail and therefore never overwrites existing bytes.
-   */
-  async createCommunityPluginGenerationObjectV1(
-    vaultName: string,
-    objectPath: string,
-    content: ArrayBuffer,
-  ): Promise<UploadResult> {
-    const segments = communityPluginGenerationObjectSegments(objectPath);
-    await this.ensureCommunityPluginGenerationParentV1(
-      vaultName,
-      segments.slice(0, -1),
-    );
-    const targetPath = APP_FOLDER_PATHS.pluginItem(
-      this.getStorageVaultName(vaultName),
-      objectPath,
-    );
-    if (shouldUseUploadSession(content.byteLength)) {
-      return this.uploadLargeFile(
-        objectPath,
-        `${targetPath}:/createUploadSession`,
-        content,
-        undefined,
-        undefined,
-        "fail",
-      );
-    }
-    const response = await this.request(
-      "PUT",
-      `${targetPath}:/content?@microsoft.graph.conflictBehavior=fail`,
-      content,
-      "application/octet-stream",
-    );
-    return response.json as UploadResult;
-  }
-
-  /** Resolve an immutable object by its canonical control-root path. */
-  async readCommunityPluginGenerationObjectV1(
-    vaultName: string,
-    objectPath: string,
-    maxBytes: number,
-  ): Promise<CommunityPluginGenerationCloudObjectV1 | null> {
-    const segments = communityPluginGenerationObjectSegments(objectPath);
-    const expectedName = segments[segments.length - 1];
-    try {
-      const response = await this.request(
-        "GET",
-        `${APP_FOLDER_PATHS.pluginItem(
-          this.getStorageVaultName(vaultName),
-          objectPath,
-        )}?select=id,name,size,eTag,cTag,file,parentReference,@microsoft.graph.downloadUrl`,
-        undefined,
-        undefined,
-        { metadataReason: "other", expectedNotFound: true },
-      );
-      const item = response.json as DriveItem;
-      if (item.name !== expectedName) {
-        throw new Error(`Immutable generation object name mismatch: ${objectPath}`);
-      }
-      return this.readCommunityPluginGenerationObjectItemV1(item, maxBytes);
-    } catch (error) {
-      if (error instanceof OneDriveError && error.type === OneDriveErrorType.NotFound) {
-        return null;
-      }
-      throw error;
-    }
-  }
-
-  /** Resolve immutable bytes only by the driveItem identity captured at create. */
-  async readCommunityPluginGenerationObjectV1ById(
-    id: string,
-    maxBytes: number,
-  ): Promise<CommunityPluginGenerationCloudObjectV1> {
-    if (!id || id.length > 512) throw new Error("Immutable generation object ID is invalid");
-    const response = await this.request(
-      "GET",
-      `/me/drive/items/${encodeURIComponent(id)}?select=id,name,size,eTag,cTag,file,parentReference,@microsoft.graph.downloadUrl`,
-      undefined,
-      undefined,
-      { metadataReason: "other" },
-    );
-    const item = response.json as DriveItem;
-    if (item.id !== id) throw new Error("Immutable generation object identity changed");
-    return this.readCommunityPluginGenerationObjectItemV1(item, maxBytes);
-  }
-
-  private async ensureCommunityPluginGenerationParentV1(
-    vaultName: string,
-    segments: readonly string[],
-  ): Promise<DriveItem> {
-    const storageVaultName = this.getStorageVaultName(vaultName);
-    let parentPath = APP_FOLDER_PATHS.pluginDir(storageVaultName);
-    let parent = (await this.request("GET", parentPath)).json as DriveItem;
-    if (!parent.id || !parent.folder) {
-      throw new Error("Plugin control root identity is invalid");
-    }
-    for (const segment of segments) {
-      const childPath = `${parentPath}/${encodeURIComponent(segment)}`;
-      const created = await this.createFolder(childPath);
-      const child = created ?? (await this.request("GET", childPath)).json as DriveItem;
-      if (
-        !child.id
-        || !child.folder
-        || child.name !== segment
-        || child.parentReference?.id !== parent.id
-      ) {
-        throw new Error(`Immutable generation parent identity mismatch: ${segment}`);
-      }
-      parent = child;
-      parentPath = childPath;
-    }
-    return parent;
-  }
-
-  private async readCommunityPluginGenerationObjectItemV1(
-    item: DriveItem,
-    maxBytes: number,
-  ): Promise<CommunityPluginGenerationCloudObjectV1> {
-    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > MAX_REMOTE_FILE_BYTES) {
-      throw new Error("Immutable generation object byte budget is invalid");
-    }
-    if (
-      !item.id
-      || !item.file
-      || !item.name
-      || !item.parentReference?.id
-      || !Number.isSafeInteger(item.size)
-      || Number(item.size) < 0
-      || (!item.eTag && !item.cTag)
-    ) {
-      throw new Error("Immutable generation object metadata is incomplete");
-    }
-    assertDeclaredRemoteSize(item.size, maxBytes, "CommunityPluginGenerationObjectV1");
-    let content: ArrayBuffer | null = null;
-    if (item["@microsoft.graph.downloadUrl"]) {
-      try {
-        const response = await withAbortableTimeout(
-          (signal) => downloadUrlFetch(
-            item["@microsoft.graph.downloadUrl"]!,
-            maxBytes,
-            "CommunityPluginGenerationObjectV1",
-            undefined,
-            signal,
-          ),
-          downloadTimeoutMs(Number(item.size)),
-          this.abortSignal,
-        );
-        content = response.arrayBuffer;
-      } catch (error) {
-        if (isResponseByteBudgetError(error)) throw error;
-        rethrowUncancellableRequestTimeout(error);
-      }
-    }
-    if (!content) {
-      content = (await this.contentGet(
-        `/me/drive/items/${encodeURIComponent(item.id)}/content`,
-        {
-          maxAttempts: 2,
-          maxResponseBytes: maxBytes,
-          responseLabel: "CommunityPluginGenerationObjectV1",
-        },
-      )).arrayBuffer;
-    }
-    assertByteBudget(content.byteLength, maxBytes, "CommunityPluginGenerationObjectV1");
-    return {
-      id: item.id,
-      name: item.name,
-      parentId: item.parentReference.id,
-      size: Number(item.size),
-      eTag: item.eTag ?? "",
-      cTag: item.cTag ?? "",
-      content,
-    };
-  }
 
   private async readPluginControlItemV2(
     initial: DriveItem,
     label:
       | "CloudBootstrapV2"
       | "SharedSyncProtocolV2"
-      | "SharedSyncProtocolV3"
-      | "CommunityPluginLifecycleV1",
+      | "SharedSyncProtocolV3",
   ): Promise<{ id: string; eTag: string; content: string }> {
     if (!initial.id) throw new Error(`${label} item has no driveItem id`);
     const maxResponseBytes = pluginControlByteBudget(label);
@@ -2751,7 +2563,9 @@ export class OneDriveClient {
   ): Promise<DeltaResponse> {
     return this.collectDelta(
       deltaToken
-        ?? APP_FOLDER_PATHS.filesDelta(this.getStorageVaultName(vaultName)),
+        ?? this.deltaInitialUrl(
+          APP_FOLDER_PATHS.filesDelta(this.getStorageVaultName(vaultName)),
+        ),
     );
   }
 
@@ -2767,8 +2581,16 @@ export class OneDriveClient {
     if (!folderId) throw new Error("Missing folder identity for delta");
     return this.collectDelta(
       deltaToken
-        ?? `/me/drive/items/${encodeURIComponent(folderId)}/delta`,
+        ?? this.deltaInitialUrl(
+          `/me/drive/items/${encodeURIComponent(folderId)}/delta`,
+        ),
     );
+  }
+
+  /** First-page URL for a self-constructed delta endpoint. Continuation URLs
+   *  returned by the server (nextLink/deltaLink) are never rewritten. */
+  private deltaInitialUrl(path: string): string {
+    return `${path}?$top=${DELTA_PAGE_SIZE_TOP}`;
   }
 
   private async collectDelta(initialUrl: string): Promise<DeltaResponse> {
@@ -3298,26 +3120,6 @@ function requestPayloadByteLength(body: ArrayBuffer | string | undefined): numbe
   return typeof body === "string" ? new TextEncoder().encode(body).byteLength : 0;
 }
 
-function communityPluginGenerationObjectSegments(objectPath: string): string[] {
-  if (
-    typeof objectPath !== "string"
-    || objectPath.length === 0
-    || objectPath.length > 2_048
-    || objectPath.includes("\\")
-  ) {
-    throw new Error("Immutable generation object path is invalid");
-  }
-  const segments = objectPath.split("/");
-  if (
-    segments.length < 2
-    || segments[0] !== "community-plugin-content-v1"
-    || segments.some((segment) => !/^[a-z0-9][a-z0-9.-]*$/.test(segment))
-  ) {
-    throw new Error("Immutable generation object path is invalid");
-  }
-  return segments;
-}
-
 function responsePayloadByteLength(response: RequestUrlResponse): number {
   if (response.arrayBuffer instanceof ArrayBuffer) return response.arrayBuffer.byteLength;
   if (typeof response.text === "string") {
@@ -3344,13 +3146,9 @@ function pluginControlByteBudget(
   label:
     | "CloudBootstrapV2"
     | "SharedSyncProtocolV2"
-    | "SharedSyncProtocolV3"
-    | "CommunityPluginLifecycleV1",
+    | "SharedSyncProtocolV3",
 ): number {
   if (label === "CloudBootstrapV2") return MAX_CLOUD_BOOTSTRAP_BYTES;
-  if (label === "CommunityPluginLifecycleV1") {
-    return MAX_COMMUNITY_PLUGIN_LIFECYCLE_BYTES;
-  }
   return MAX_SHARED_PROTOCOL_BYTES;
 }
 
@@ -3774,8 +3572,7 @@ function requirePluginControlFileVersion(
   label:
     | "CloudBootstrapV2"
     | "SharedSyncProtocolV2"
-    | "SharedSyncProtocolV3"
-    | "CommunityPluginLifecycleV1",
+    | "SharedSyncProtocolV3",
 ): { id: string; eTag: string } {
   if (!value || typeof value !== "object") {
     throw new Error(`${label} write returned no metadata`);

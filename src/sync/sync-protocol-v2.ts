@@ -1,5 +1,4 @@
 import { sha256Hex } from "../crypto";
-import type { OneDriveClient } from "../onedrive/client";
 import { isRecord } from "../obsidian-compat";
 import {
   isSyncScope,
@@ -106,20 +105,6 @@ export type EnsureCanonicalSharedSyncProtocolResultV2 =
       | "write-failed"
       | "readback-mismatch";
   };
-
-export function createOneDriveSharedSyncProtocolTransportV2(
-  client: OneDriveClient,
-  vaultName: string,
-): SharedSyncProtocolTransportV2 {
-  return {
-    read: () => client.readSharedSyncProtocolV2(vaultName),
-    createOnly: (content) =>
-      client.createSharedSyncProtocolV2(vaultName, content),
-    overwriteOnly: (id, eTag, content) =>
-      client.overwriteSharedSyncProtocolV2(vaultName, id, eTag, content),
-    readById: (id) => client.readSharedSyncProtocolV2ById(id),
-  };
-}
 
 /**
  * Join or create the shared V2 migration generation.

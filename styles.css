@@ -465,6 +465,9 @@ body.is-mobile .easy-sync-empty-folder-actions button {
   min-height: 1.5em;
 }
 
+/* Added/removed line tint — reused by the renderer via `easy-sync-diff-${line.type}`
+   (restored 2026-08: removed by dfa4397c's literal-scan cleanup, which missed the
+   template-literal class construction in conflict-detail-modal.ts) */
 .easy-sync-diff-added {
   background-color: rgba(var(--color-green-rgb), 0.15);
 }
@@ -498,12 +501,20 @@ body.is-mobile .easy-sync-empty-folder-actions button {
   word-break: break-all;
 }
 
+/* Added/removed line text color — pair with the tint rules above */
 .easy-sync-diff-added .easy-sync-diff-content {
   color: var(--color-green);
 }
 
 .easy-sync-diff-removed .easy-sync-diff-content {
   color: var(--color-red);
+}
+
+/* Login notice gate: large lines so the agreement is readable at a glance */
+.easy-sync-login-notice-line {
+  font-size: var(--font-ui-large);
+  line-height: 1.55;
+  margin: 0.85em 0;
 }
 
 /* Diff gap / ellipsis between non-adjacent hunks */

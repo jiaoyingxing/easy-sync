@@ -91,7 +91,6 @@ import type {
   PlanReviewAuthorization,
   ScanConfig,
   SyncPlan,
-  SyncScope,
 } from "./sync/types";
 import {
   sameCanonicalPlanIdentityV2,
@@ -128,7 +127,6 @@ import {
 } from "./sync/mutation-recovery-scheduler";
 import {
   formatMutationRecoveryHistory,
-  mutationRecoveryBlockReasonText,
   mutationRecoveryStatusDetail,
   mutationRecoveryStatusLabel,
   type MutationRecoveryDisplayState,
@@ -202,9 +200,6 @@ import {
 import {
   planCommunityPluginLocalReconciliation,
 } from "./sync/community-plugin-local-reconciliation";
-import {
-  CommunityPluginLifecycleDeviceObserverV1,
-} from "./sync/community-plugin-lifecycle-device-v1";
 import { StartupPerformanceTracker } from "./startup-performance";
 
 /** Plugin data keys for sync settings */
@@ -575,8 +570,6 @@ export default class EasySyncPlugin extends Plugin {
    *  only; the persisted catalog keeps its own `lastRefreshFailedAt`). */
   private communityPluginCatalogRefreshConsecutiveFailures = 0;
   private communityPluginCatalogLastRefreshFailureAt = 0;
-  private communityPluginLifecycleDeviceObserver:
-    CommunityPluginLifecycleDeviceObserverV1 | null = null;
 
   /** Set to true after state.load() completes. Public so settings-tab
    *  can guard the "Reset" button with it. */
@@ -676,12 +669,6 @@ export default class EasySyncPlugin extends Plugin {
         "Vault-local IndexedDB namespace is unavailable; new selection is disabled and an existing binding will fail closed",
       );
     }
-    this.communityPluginLifecycleDeviceObserver = indexedDbVaultInstanceId
-      ? new CommunityPluginLifecycleDeviceObserverV1(
-          this.app,
-          indexedDbVaultInstanceId,
-        )
-      : null;
 
     this.state = new StateManager({
       loadData: () => this.loadPluginData(),
@@ -742,7 +729,6 @@ export default class EasySyncPlugin extends Plugin {
       },
       this.operationLifecycle,
       this.noticeCenter,
-      this.communityPluginLifecycleDeviceObserver,
     );
     this.syncExecutor.setAutomaticHandlingPolicy(this.automaticHandlingPolicy);
     this.syncExecutor.setCommunityPluginSyncPolicy(
@@ -789,66 +775,72 @@ export default class EasySyncPlugin extends Plugin {
     });
     this.startupPerformance.markUiReady();
 
-    // ════ ⑤ Background auth init (non-blocking) ════
-
-    void this.auth.initialize()
-      .then(() => {
-        const authState = this.auth?.authState;
-        this.startupPerformance.markAuthReady({
-          outcome: "ready",
-          loggedIn: authState?.isLoggedIn === true,
-          accountVerified:
-            typeof authState?.accountId === "string"
-            && authState.accountId.length > 0,
+    // ════ ⑤ Background auth init + state load ════
+    // Official load-time guide: heavy startup work belongs in onLayoutReady,
+    // which runs only after Obsidian finishes loading. Deferring keeps the
+    // envelope materialization from competing with Obsidian's own layout
+    // rendering for the main thread during the interaction-blocked loading
+    // phase, so the app becomes usable sooner.
+    this.app.workspace.onLayoutReady(() => {
+      void this.auth!.initialize()
+        .then(() => {
+          const authState = this.auth?.authState;
+          this.startupPerformance.markAuthReady({
+            outcome: "ready",
+            loggedIn: authState?.isLoggedIn === true,
+            accountVerified:
+              typeof authState?.accountId === "string"
+              && authState.accountId.length > 0,
+          });
+          this.emitColdStartSummaryIfReady();
+          this.schedulePersistedCommunityPluginJoinSync("auth-ready");
+        })
+        .catch((e) => {
+          this.startupPerformance.markAuthReady({
+            outcome: "failed",
+            loggedIn: false,
+            accountVerified: false,
+          });
+          this.emitColdStartSummaryIfReady();
+          this.diag.warn("lifecycle", "background auth init failed", e);
         });
-        this.emitColdStartSummaryIfReady();
-        this.schedulePersistedCommunityPluginJoinSync("auth-ready");
-      })
-      .catch((e) => {
-        this.startupPerformance.markAuthReady({
-          outcome: "failed",
-          loggedIn: false,
-          accountVerified: false,
+      // onStateChange callback fires when complete → UI auto-refreshes
+      void this.ensureStateLoaded()
+        .then(() => {
+          const state = this.state;
+          const block = state?.v2StateLoadRecoveryBlock ?? null;
+          this.startupPerformance.markStateReady({
+            outcome: "ready",
+            activeV2: state?.isV2StateActive === true,
+            authorityBlocked: block !== null,
+            blockReason: block?.reason ?? null,
+            remoteFiles: state?.remoteSnapshot.length ?? 0,
+            remoteFolders: state?.remoteFolders.length ?? 0,
+            mutationLedger: state?.mutationLedger.length ?? 0,
+            pendingReview: state?.planReviewActive === true,
+          });
+          this.emitColdStartSummaryIfReady();
+          this.updateStatusBar();
+          this.requestMutationRecoveryObservation("state-loaded");
+          this.requestDescendantFileReconstructionContinuation("state-loaded");
+          this.scheduleCommunityPluginLocalReconciliation("state-loaded");
+          this.schedulePersistedCommunityPluginJoinSync("state-loaded");
+        })
+        .catch((e) => {
+          this.startupPerformance.markStateReady({
+            outcome: "failed",
+            activeV2: false,
+            authorityBlocked: true,
+            blockReason: "state-load-rejected",
+            remoteFiles: 0,
+            remoteFolders: 0,
+            mutationLedger: 0,
+            pendingReview: false,
+          });
+          this.emitColdStartSummaryIfReady();
+          this.diag.warn("state", "background state load failed", e);
         });
-        this.emitColdStartSummaryIfReady();
-        this.diag.warn("lifecycle", "background auth init failed", e);
-      });
-    // onStateChange callback fires when complete → UI auto-refreshes
-    void this.ensureStateLoaded()
-      .then(() => {
-        const state = this.state;
-        const block = state?.v2StateLoadRecoveryBlock ?? null;
-        this.startupPerformance.markStateReady({
-          outcome: "ready",
-          activeV2: state?.isV2StateActive === true,
-          authorityBlocked: block !== null,
-          blockReason: block?.reason ?? null,
-          remoteFiles: state?.remoteSnapshot.length ?? 0,
-          remoteFolders: state?.remoteFolders.length ?? 0,
-          mutationLedger: state?.mutationLedger.length ?? 0,
-          pendingReview: state?.planReviewActive === true,
-        });
-        this.emitColdStartSummaryIfReady();
-        this.updateStatusBar();
-        this.requestMutationRecoveryObservation("state-loaded");
-        this.requestDescendantFileReconstructionContinuation("state-loaded");
-        this.scheduleCommunityPluginLocalReconciliation("state-loaded");
-        this.schedulePersistedCommunityPluginJoinSync("state-loaded");
-      })
-      .catch((e) => {
-        this.startupPerformance.markStateReady({
-          outcome: "failed",
-          activeV2: false,
-          authorityBlocked: true,
-          blockReason: "state-load-rejected",
-          remoteFiles: 0,
-          remoteFolders: 0,
-          mutationLedger: 0,
-          pendingReview: false,
-        });
-        this.emitColdStartSummaryIfReady();
-        this.diag.warn("state", "background state load failed", e);
-      });
+    });
 
     // ════ ⑥ Auto-sync timer (skips until auth is ready) ════
 
@@ -894,7 +886,6 @@ export default class EasySyncPlugin extends Plugin {
     // Sever the UI gateway immediately. The invalidated executor object stays
     // alive only for already-captured async work to drain safely.
     this.syncExecutor = null;
-    this.communityPluginLifecycleDeviceObserver = null;
     this.communityPluginInventoryRevisionListeners.clear();
     this.pendingCommunityPluginReconciliationIds.clear();
     this.communityPluginReconciliationRetryOnLockRelease = false;
@@ -1520,16 +1511,12 @@ export default class EasySyncPlugin extends Plugin {
     const joinBlocks = result.communityPluginJoinBlocks ?? [];
     const hasCommunityPluginJoinOutcome = joinBlocks.length > 0
       || (completedRestores?.files.length ?? 0) > 0
-      || (completedRestores?.data.length ?? 0) > 0
-      || Object.keys(
-        result.communityPluginRestoreGenerationByPluginId ?? {},
-      ).length > 0;
+      || (completedRestores?.data.length ?? 0) > 0;
     if (hasCommunityPluginJoinOutcome) {
       try {
         await this.persistCommunityPluginJoinOutcomes(
           completedRestores ?? { files: [], data: [] },
           joinBlocks,
-          result.communityPluginRestoreGenerationByPluginId ?? {},
         );
       } catch (error) {
         result.success = false;
@@ -2172,12 +2159,10 @@ export default class EasySyncPlugin extends Plugin {
     }
 
     const firstTime = kind === "firstSync";
+    // First-use education (no competing sync tools / not a backup) moved to
+    // the login gate; the plan alert stays single-purpose.
     const messages = firstTime
-      ? [
-          t("syncPlan.readyMessage"),
-          t("syncPlan.firstUseUsage"),
-          t("syncPlan.firstUseSafety"),
-        ]
+      ? [t("syncPlan.readyMessage")]
       : [t("syncPlan.reviewUpdatedMessage")];
     const modal = new SyncPlanAlertModal(
       this.app,
@@ -2852,12 +2837,20 @@ export default class EasySyncPlugin extends Plugin {
     const retryingDescendantFileReconstruction =
       result.continueAfterConfirmedDescendantFileReconstruction === true
       && result.descendantFileReconstructionRetryableFailure === true;
+    // Deterministic community-plugin identity blocks stay visible in
+    // `errors` (history and failure details stay honest) but must not pause
+    // the whole auto-sync round: nothing was written and only an
+    // observed-fact change can clear the block. Exemptions apply only to the
+    // failure branches those blocks can trigger (non-success / errors);
+    // conflicts, auth, cancellation and review pauses keep pausing.
+    const identityBlockedOnly = (result.identityBlockedErrors ?? 0) > 0
+      && (result.identityBlockedErrors ?? 0) === result.errors;
     const pauseAutoSync =
       !retryableMutationRecovery
       && !retryingDescendantFileReconstruction
       && (
-      (!result.success && !harmlessRejectedRun)
-      || result.errors > 0
+      ((!result.success && !harmlessRejectedRun) && !identityBlockedOnly)
+      || (result.errors > 0 && !identityBlockedOnly)
       || result.conflicts > 0
       || result.authExpired
       || result.message === this.i18n.t("result.cancelled")
@@ -4605,7 +4598,6 @@ export default class EasySyncPlugin extends Plugin {
   private async persistCommunityPluginJoinOutcomes(
     completed: Readonly<CommunityPluginRestoreSet>,
     blocks: readonly Readonly<CommunityPluginJoinBlock>[],
-    generationByPluginId: Readonly<Record<string, number>> = {},
   ): Promise<void> {
     const state = this.state;
     const participation = state?.getCommunityPluginParticipation?.() ?? null;
@@ -4632,31 +4624,13 @@ export default class EasySyncPlugin extends Plugin {
         operationId: block.operationId,
       });
     }
-    for (const [pluginId, joinedGeneration] of Object.entries(
-      generationByPluginId,
-    )) {
-      const current = state.getCommunityPluginParticipation()
-        ?.pluginsById[pluginId];
-      if (
-        current?.phase !== "participating"
-        || current.joinedGeneration === joinedGeneration
-      ) continue;
-      await state.updateCommunityPluginParticipation({
-        type: "confirm-participating",
-        pluginId,
-        joinedGeneration,
-        localBundleDigest: current.lastConfirmedLocalBundleDigest,
-      });
-    }
     for (const pluginId of completed.files) {
       const current = state.getCommunityPluginParticipation()
         ?.pluginsById[pluginId];
       if (current?.phase !== "restoring") continue;
-      const joinedGeneration = generationByPluginId[pluginId];
       await state.updateCommunityPluginParticipation({
         type: "confirm-participating",
         pluginId,
-        ...(joinedGeneration !== undefined ? { joinedGeneration } : {}),
         localBundleDigest: current.targetBundleDigest,
       });
     }
@@ -6030,7 +6004,7 @@ export default class EasySyncPlugin extends Plugin {
       lines.push("**未完成操作核对**: 无");
     }
     lines.push(`**计划审阅**: ${reportState?.planReviewActive ? `等待确认（revision ${reportState.planReviewRevision}）` : "无"}`);
-    lines.push(`**自动处理配置**: 将远端删除同步到本地 ${this.automaticHandlingPolicy.autoDeleteLocalFiles ? "开启" : "关闭"} / 合并不重叠的文本修改 ${this.automaticHandlingPolicy.mergeNonOverlappingText ? "开启" : "关闭"}`);
+    lines.push(`**自动处理配置**: 将云端删除同步到本机 ${this.automaticHandlingPolicy.autoDeleteLocalFiles ? "开启" : "关闭"} / 合并不重叠的文本修改 ${this.automaticHandlingPolicy.mergeNonOverlappingText ? "开启" : "关闭"}`);
     const describePluginScope = (
       scope: typeof communityPluginSummary.files,
     ): string => `${scope.mode === "selected"
@@ -6039,7 +6013,7 @@ export default class EasySyncPlugin extends Plugin {
         ? "全部"
         : "关闭"}（本机不同步 ${scope.ignoredOnDevice} 个）`;
     lines.push(
-      `**社区插件精细化范围**: 文件 ${describePluginScope(communityPluginSummary.files)} / 数据 ${describePluginScope(communityPluginSummary.data)} / 清单 ${communityPluginSummary.inventory.total} 个（本地 ${communityPluginSummary.inventory.local}、远端 ${communityPluginSummary.inventory.remote}、清单异常 ${communityPluginSummary.inventory.manifestIssues}） / 远端清单 ${communityPluginSummary.remoteInventoryTrusted ? "可信" : "不可用"}`,
+      `**社区插件精细化范围**: 文件 ${describePluginScope(communityPluginSummary.files)} / 数据 ${describePluginScope(communityPluginSummary.data)} / 清单 ${communityPluginSummary.inventory.total} 个（本机 ${communityPluginSummary.inventory.local}、云端 ${communityPluginSummary.inventory.remote}、清单异常 ${communityPluginSummary.inventory.manifestIssues}） / 云端清单 ${communityPluginSummary.remoteInventoryTrusted ? "可信" : "不可用"}`,
     );
     const inventoryById = new Map(
       communityPluginInventory.map((item) => [item.id, item]),
@@ -6089,7 +6063,7 @@ export default class EasySyncPlugin extends Plugin {
     lines.push("## 技术状态证据");
     lines.push("");
     lines.push(`**构筑物指纹**: ${buildFingerprint}`);
-    lines.push(`**本地存储布局**: v${storageLayoutVersion}`);
+    lines.push(`**本机存储布局**: v${storageLayoutVersion}`);
     lines.push(
       `**同步状态权威**: ${v2StateLoadBlock
         ? `${v2StateLoadBlock.authority}（加载受阻：${v2StateLoadBlock.reason}）`
@@ -6108,8 +6082,8 @@ export default class EasySyncPlugin extends Plugin {
         : v2StorageAuthority,
     )}`);
     lines.push(`**同步范围指纹**: account ${accountFingerprint} / drive ${driveFingerprint} / vault ${vaultFingerprint} / files ${filesRootFingerprint}`);
-    lines.push(`**远端快照**: generation ${reportState?.remoteGeneration ?? 0}`);
-    lines.push(`**状态规模**: 基线 ${reportState?.baseSnapshot.length ?? 0} / 远端文件 ${reportState?.remoteSnapshot.length ?? 0} / 远端目录 ${reportState?.remoteFolders.length ?? 0} / 冲突 ${reportState?.pendingConflicts.length ?? 0} / 待删除 ${reportState?.pendingRemoteDeletes.length ?? 0} / 待处理项 ${reportState?.pendingIssues.length ?? 0}`);
+    lines.push(`**云端快照**: generation ${reportState?.remoteGeneration ?? 0}`);
+    lines.push(`**状态规模**: 基线 ${reportState?.baseSnapshot.length ?? 0} / 云端文件 ${reportState?.remoteSnapshot.length ?? 0} / 云端目录 ${reportState?.remoteFolders.length ?? 0} / 冲突 ${reportState?.pendingConflicts.length ?? 0} / 待删除 ${reportState?.pendingRemoteDeletes.length ?? 0} / 待处理项 ${reportState?.pendingIssues.length ?? 0}`);
     lines.push(`**增量游标**: ${reportState?.remoteDeltaLink ? "已保存" : "无"}`);
     lines.push(`**最近同步记录 ID**: ${reportState?.syncHistory?.[0]?.id ?? "—"}`);
     lines.push(`**社区插件策略指纹**: ${communityPluginSummary.policyFingerprint}`);
@@ -6120,7 +6094,7 @@ export default class EasySyncPlugin extends Plugin {
       ?? reportState?.syncHistory.find(
         (entry) => entry.remoteScopeRecovery !== undefined,
       )?.remoteScopeRecovery;
-    lines.push("## 远端 Scope 恢复");
+    lines.push("## 云端 Scope 恢复");
     lines.push("");
     lines.push(`**当前状态**: ${v2RemoteScopeRecovery ? "等待或正在恢复" : "无待恢复项"}`);
     if (remoteScopeRecoverySummary) {
@@ -6141,7 +6115,7 @@ export default class EasySyncPlugin extends Plugin {
     if (history.length === 0) {
       lines.push("*暂无同步记录*");
     } else {
-      lines.push("| 时间 | 模式 | 状态 | 未完成操作核对 | 耗时 | 上传 | 下载 | 文件移动 | 文件夹创建 | 文件夹移动 | 文件夹删除 | 文件删除 | 冲突 | 远端删除待确认 | 延后 | 跳过(L/I) | 错误 |");
+      lines.push("| 时间 | 模式 | 状态 | 未完成操作核对 | 耗时 | 上传 | 下载 | 文件移动 | 文件夹创建 | 文件夹移动 | 文件夹删除 | 文件删除 | 冲突 | 云端删除待确认 | 延后 | 跳过(L/I) | 错误 |");
       lines.push("|------|------|------|----------------|------|------|------|----------|------------|------------|------------|----------|------|------------------|------|-----------|------|");
       for (const h of history) {
         const mode = h.mode === "manual" ? "手动" : h.mode === "auto" ? "自动" : "首次";
@@ -6238,8 +6212,8 @@ export default class EasySyncPlugin extends Plugin {
         const reasonText = c.reason ? this.i18n.t(c.reason) : "冲突";
         lines.push(`- \`${c.path}\` — ${reasonText} (${reasonCode})`);
         lines.push(`  - 判等证据: ${evidence.equalityStatus} / ${evidence.equalityProof}; decision token: ${evidence.hasDecisionToken ? "有" : "无"}`);
-        lines.push(`  - 本地: ${formatSize(evidence.localSize)}, mtime ${fmt(evidence.localMtime ?? 0)}, sha256 ${evidence.localHash}`);
-        lines.push(`  - 远端: ${formatSize(evidence.remoteSize)}, mtime ${fmt(evidence.remoteMtime ?? 0)}, sha256 ${evidence.remoteSha256}, eTag ${eTagFingerprint}`);
+        lines.push(`  - 本机: ${formatSize(evidence.localSize)}, mtime ${fmt(evidence.localMtime ?? 0)}, sha256 ${evidence.localHash}`);
+        lines.push(`  - 云端: ${formatSize(evidence.remoteSize)}, mtime ${fmt(evidence.remoteMtime ?? 0)}, sha256 ${evidence.remoteSha256}, eTag ${eTagFingerprint}`);
       }
     } else {
       lines.push("### 待处理冲突（0）");
@@ -6251,7 +6225,7 @@ export default class EasySyncPlugin extends Plugin {
     if (deletes.length > 0) {
       lines.push(`### 待确认删除（${deletes.length}）`);
       lines.push("");
-      for (const d of deletes) lines.push(`- \`${d.path}\` — ${(d as { reason?: string }).reason ?? "已在远端删除"}`);
+      for (const d of deletes) lines.push(`- \`${d.path}\` — ${(d as { reason?: string }).reason ?? "已在云端删除"}`);
     } else {
       lines.push("### 待确认删除（0）");
       lines.push("");
@@ -6375,7 +6349,7 @@ export default class EasySyncPlugin extends Plugin {
     }
     if (latestTransferSummary) {
       lines.push("");
-      lines.push(`**文件传输与本地处理**（${fmt(latestTransferSummary.ts)}）:`);
+      lines.push(`**文件传输与本机处理**（${fmt(latestTransferSummary.ts)}）:`);
       lines.push("```json");
       lines.push(formatDiagData(latestTransferSummary.data));
       lines.push("```");

@@ -8,6 +8,34 @@ import {
 } from "../src/sync/community-plugin-participation";
 
 describe("device community-plugin participation", () => {
+  it("tolerates a legacy joinedGeneration on read and drops it on the next rewrite", () => {
+    const legacy = {
+      schemaVersion: 1,
+      kind: "device-community-plugin-participation",
+      scopeEnabled: true,
+      pluginsById: {
+        calendar: {
+          pluginId: "calendar",
+          phase: "participating",
+          joinedGeneration: 4,
+          lastConfirmedLocalBundleDigest: "a".repeat(64),
+        },
+      },
+    } as never as Parameters<typeof readDeviceCommunityPluginParticipation>[0];
+    const parsed = readDeviceCommunityPluginParticipation(legacy);
+    expect(parsed.pluginsById.calendar?.phase).toBe("participating");
+    const rewritten = reduceDeviceCommunityPluginParticipation(parsed, {
+      type: "confirm-participating",
+      pluginId: "calendar",
+      localBundleDigest: "b".repeat(64),
+    });
+    expect(rewritten.pluginsById.calendar).toEqual({
+      pluginId: "calendar",
+      phase: "participating",
+      lastConfirmedLocalBundleDigest: "b".repeat(64),
+    });
+  });
+
   it("keeps plugin participation as a pure, explicit state machine", () => {
     const empty = createEmptyDeviceCommunityPluginParticipation(false);
     const scopeEnabled = reduceDeviceCommunityPluginParticipation(empty, {
@@ -29,7 +57,6 @@ describe("device community-plugin participation", () => {
     const participating = reduceDeviceCommunityPluginParticipation(restoring, {
       type: "confirm-participating",
       pluginId: "calendar",
-      joinedGeneration: 4,
       localBundleDigest: "b".repeat(64),
     });
     const exiting = reduceDeviceCommunityPluginParticipation(participating, {
@@ -58,7 +85,6 @@ describe("device community-plugin participation", () => {
     expect(participating.pluginsById.calendar).toEqual({
       pluginId: "calendar",
       phase: "participating",
-      joinedGeneration: 4,
       lastConfirmedLocalBundleDigest: "b".repeat(64),
     });
     expect(exiting.pluginsById.calendar).toMatchObject({

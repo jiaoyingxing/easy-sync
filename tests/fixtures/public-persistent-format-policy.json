@@ -83,28 +83,6 @@
       "compatibility": "stored inside the selected V2 envelope; not a cloud device roster"
     },
     {
-      "id": "community-plugin-lifecycle-control",
-      "class": "unpublished-remote-control-record",
-      "owner": "src/sync/community-plugin-lifecycle-v1.ts",
-      "currentVersion": 2,
-      "status": "development-unpublished",
-      "compatibility": "schema 1 remains readable observation-only input; explicit legacy migration confirmation upgrades it atomically to schema 2, which adds irreversible legacy-writer consent; neither version is attached to a public release profile"
-    },
-    {
-      "id": "community-plugin-lifecycle-device-observation",
-      "class": "unpublished-device-local-recovery-state",
-      "owner": "src/sync/community-plugin-lifecycle-device-v1.ts",
-      "currentVersion": 1,
-      "status": "development-unpublished",
-      "acceptedNestedVersions": {
-        "observationCheckpoint": [1],
-        "controlMutationCheckpoint": [1],
-        "bundlePublicationCheckpoint": [1],
-        "generationCleanupCheckpoint": [1]
-      },
-      "compatibility": "App-local identity plus separate response-unknown checkpoints for observation, bundle publication, generation cleanup and explicit generation join, legacy consent or seal control mutations; corruption or identity loss never transfers old-generation authority"
-    },
-    {
       "id": "v2-recovery-control-records",
       "class": "recovery-evidence",
       "owner": "src/sync/state-manager.ts",

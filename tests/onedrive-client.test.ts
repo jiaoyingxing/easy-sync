@@ -1338,6 +1338,141 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     expect(requestSpy).toHaveBeenCalledTimes(3);
   });
 
+  it("skips the V3 content read when the listed slot matches the expected binding identity", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementation(async (options) => {
+        const url = String(options.url);
+        if (url.includes(".easy-sync:/children")) {
+          return {
+            status: 200,
+            headers: {},
+            json: {
+              value: [
+                {
+                  id: "protocol-v2-id",
+                  name: "protocol-v2.json",
+                  size: 21,
+                  eTag: "protocol-v2-etag",
+                  file: {},
+                  "@microsoft.graph.downloadUrl":
+                    "https://download.example/protocol-v2.json",
+                },
+                {
+                  id: "protocol-v3-id",
+                  name: "protocol-v3.json",
+                  size: 21,
+                  eTag: "protocol-v3-etag",
+                  file: {},
+                  "@microsoft.graph.downloadUrl":
+                    "https://download.example/protocol-v3.json",
+                },
+              ],
+            },
+          } as never;
+        }
+        if (url.endsWith("/protocol-v2.json")) {
+          return {
+            status: 200,
+            headers: {},
+            text: '{"protocolVersion":2}',
+          } as never;
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.readSharedSyncProtocolObjects("testVault", {
+      id: "protocol-v3-id",
+      eTag: "protocol-v3-etag",
+    })).resolves.toEqual({
+      v2: {
+        id: "protocol-v2-id",
+        eTag: "protocol-v2-etag",
+        content: '{"protocolVersion":2}',
+      },
+      // Binding-proven marker: the caller holding the binding substitutes the
+      // canonical record bytes instead of downloading them again.
+      v3: {
+        id: "protocol-v3-id",
+        eTag: "protocol-v3-etag",
+        content: null,
+      },
+    });
+    // Listing + V2 content only — the V3 content URL was never requested.
+    expect(requestSpy).toHaveBeenCalledTimes(2);
+    expect(requestSpy.mock.calls.filter(([options]) =>
+      String(options.url).includes("protocol-v3.json"),
+    )).toHaveLength(0);
+  });
+
+  it("keeps reading the V3 content when the listed slot drifted from the expected binding identity", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementation(async (options) => {
+        const url = String(options.url);
+        if (url.includes(".easy-sync:/children")) {
+          return {
+            status: 200,
+            headers: {},
+            json: {
+              value: [
+                {
+                  id: "protocol-v2-id",
+                  name: "protocol-v2.json",
+                  size: 21,
+                  eTag: "protocol-v2-etag",
+                  file: {},
+                  "@microsoft.graph.downloadUrl":
+                    "https://download.example/protocol-v2.json",
+                },
+                {
+                  id: "protocol-v3-id",
+                  name: "protocol-v3.json",
+                  size: 21,
+                  eTag: "protocol-v3-etag",
+                  file: {},
+                  "@microsoft.graph.downloadUrl":
+                    "https://download.example/protocol-v3.json",
+                },
+              ],
+            },
+          } as never;
+        }
+        if (url.endsWith("/protocol-v2.json")) {
+          return {
+            status: 200,
+            headers: {},
+            text: '{"protocolVersion":2}',
+          } as never;
+        }
+        if (url.endsWith("/protocol-v3.json")) {
+          return {
+            status: 200,
+            headers: {},
+            text: '{"protocolVersion":3}',
+          } as never;
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.readSharedSyncProtocolObjects("testVault", {
+      id: "protocol-v3-id",
+      eTag: "an-other-etag",
+    })).resolves.toEqual({
+      v2: {
+        id: "protocol-v2-id",
+        eTag: "protocol-v2-etag",
+        content: '{"protocolVersion":2}',
+      },
+      v3: {
+        id: "protocol-v3-id",
+        eTag: "protocol-v3-etag",
+        content: '{"protocolVersion":3}',
+      },
+    });
+    expect(requestSpy).toHaveBeenCalledTimes(3);
+  });
+
   it("finishes the control-directory pagination before selecting protocol slots", async () => {
     const nextLink =
       "https://graph.microsoft.com/v1.0/me/drive/items/control-id/children?$skiptoken=next";
@@ -1782,236 +1917,6 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     expect(warningText).toContain("request transport failed");
     expect(warningText).toContain("HTTP status unavailable");
     expect(warningText).not.toContain("status=0");
-  });
-});
-
-describe("OneDriveClient community-plugin lifecycle control", () => {
-  afterEach(() => {
-    vi.useRealTimers();
-    vi.restoreAllMocks();
-  });
-
-  it("creates the lifecycle record with create-only conflict behavior", async () => {
-    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
-      status: 201,
-      headers: {},
-      json: { id: "lifecycle-id", eTag: "etag-1" },
-    });
-    const client = new OneDriveClient(async () => "token");
-
-    await expect(client.createCommunityPluginLifecycleV1("testVault", "{}"))
-      .resolves.toEqual({ id: "lifecycle-id", eTag: "etag-1" });
-    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({
-      method: "PUT",
-      url: expect.stringContaining(
-        "community-plugin-lifecycle-v1.json:/content?@microsoft.graph.conflictBehavior=fail",
-      ),
-      headers: expect.not.objectContaining({ "If-Match": expect.anything() }),
-    }));
-  });
-
-  it("updates the lifecycle record by stable ID with If-Match", async () => {
-    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      json: { id: "lifecycle-id", eTag: "etag-2" },
-    });
-    const client = new OneDriveClient(async () => "token");
-
-    await expect(client.updateCommunityPluginLifecycleV1(
-      "lifecycle-id",
-      "etag-1",
-      "{}",
-    )).resolves.toEqual({ id: "lifecycle-id", eTag: "etag-2" });
-    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({
-      method: "PUT",
-      url: expect.stringContaining("/me/drive/items/lifecycle-id/content"),
-      headers: expect.objectContaining({ "If-Match": "etag-1" }),
-    }));
-  });
-
-  it("reads the lifecycle record with its stable ID and eTag", async () => {
-    const requestSpy = vi.spyOn(obsidian, "requestUrl")
-      .mockResolvedValueOnce({
-        status: 200,
-        headers: {},
-        json: { value: [{
-          id: "lifecycle-id",
-          name: "community-plugin-lifecycle-v1.json",
-          eTag: "etag-1",
-          file: {},
-          "@microsoft.graph.downloadUrl":
-            "https://download.example/community-plugin-lifecycle-v1.json",
-        }] },
-      })
-      .mockResolvedValueOnce({
-        status: 200,
-        headers: {},
-        text: '{"schemaVersion":1}',
-      });
-    const client = new OneDriveClient(async () => "token");
-
-    await expect(client.readCommunityPluginLifecycleV1("testVault"))
-      .resolves.toEqual({
-        id: "lifecycle-id",
-        eTag: "etag-1",
-        content: '{"schemaVersion":1}',
-      });
-    expect(requestSpy).toHaveBeenCalledTimes(2);
-  });
-
-  it("rejects an oversized lifecycle record before downloading its body", async () => {
-    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
-      status: 200,
-      headers: {},
-      json: { value: [{
-        id: "lifecycle-id",
-        name: "community-plugin-lifecycle-v1.json",
-        size: 8 * 1024 * 1024 + 1,
-        eTag: "etag-1",
-        file: {},
-        "@microsoft.graph.downloadUrl":
-          "https://download.example/community-plugin-lifecycle-v1.json",
-      }] },
-    });
-    const client = new OneDriveClient(async () => "token");
-
-    await expect(client.readCommunityPluginLifecycleV1("testVault"))
-      .rejects.toMatchObject({
-        name: "ResponseByteBudgetError",
-        message: expect.stringContaining("CommunityPluginLifecycleV1"),
-      });
-    expect(requestSpy).toHaveBeenCalledTimes(1);
-  });
-});
-
-describe("OneDriveClient community-plugin generation objects", () => {
-  afterEach(() => {
-    vi.useRealTimers();
-    vi.restoreAllMocks();
-  });
-
-  it("creates canonical parent folders and writes the immutable object create-only", async () => {
-    const hash = "a".repeat(64);
-    const objectPath = `community-plugin-content-v1/plugins/63616c656e646172/generations/1/objects/${hash}.bin`;
-    const folderNames = [
-      "community-plugin-content-v1",
-      "plugins",
-      "63616c656e646172",
-      "generations",
-      "1",
-      "objects",
-    ];
-    let folderIndex = 0;
-    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockImplementation(
-      async (options) => {
-        if (options.method === "GET") {
-          return {
-            status: 200,
-            headers: {},
-            json: { id: "control-root", name: ".easy-sync", folder: {} },
-          } as never;
-        }
-        if (typeof options.body === "string") {
-          const body = JSON.parse(options.body);
-          if (body.folder) {
-            const index = folderIndex++;
-            return {
-              status: 201,
-              headers: {},
-              json: {
-                id: `folder-${index}`,
-                name: folderNames[index],
-                folder: {},
-                parentReference: {
-                  id: index === 0 ? "control-root" : `folder-${index - 1}`,
-                },
-              },
-            } as never;
-          }
-        }
-        return {
-          status: 201,
-          headers: {},
-          json: {
-            id: "object-id",
-            name: `${hash}.bin`,
-            size: 3,
-            eTag: "object-etag",
-            cTag: "object-ctag",
-            parentReference: { id: "folder-5" },
-          },
-        } as never;
-      },
-    );
-    const client = new OneDriveClient(async () => "token");
-
-    await expect(client.createCommunityPluginGenerationObjectV1(
-      "testVault",
-      objectPath,
-      new Uint8Array([1, 2, 3]).buffer,
-    )).resolves.toMatchObject({ id: "object-id", eTag: "object-etag" });
-    expect(folderIndex).toBe(folderNames.length);
-    expect(requestSpy).toHaveBeenLastCalledWith(expect.objectContaining({
-      method: "PUT",
-      url: expect.stringContaining(
-        `${hash}.bin:/content?@microsoft.graph.conflictBehavior=fail`,
-      ),
-      body: expect.any(ArrayBuffer),
-    }));
-  });
-
-  it("reads immutable bytes only by the requested driveItem identity", async () => {
-    const content = new Uint8Array([4, 5, 6]).buffer;
-    const requestSpy = vi.spyOn(obsidian, "requestUrl")
-      .mockResolvedValueOnce({
-        status: 200,
-        headers: {},
-        json: {
-          id: "object-id",
-          name: "hash.bin",
-          size: content.byteLength,
-          eTag: "object-etag",
-          cTag: "object-ctag",
-          file: {},
-          parentReference: { id: "parent-id" },
-        },
-      })
-      .mockResolvedValueOnce({
-        status: 200,
-        headers: {},
-        arrayBuffer: content,
-      });
-    const client = new OneDriveClient(async () => "token");
-
-    await expect(client.readCommunityPluginGenerationObjectV1ById(
-      "object-id",
-      content.byteLength,
-    )).resolves.toEqual({
-      id: "object-id",
-      name: "hash.bin",
-      parentId: "parent-id",
-      size: content.byteLength,
-      eTag: "object-etag",
-      cTag: "object-ctag",
-      content,
-    });
-    expect(requestSpy).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      method: "GET",
-      url: expect.stringContaining("/me/drive/items/object-id/content"),
-    }));
-  });
-
-  it("rejects noncanonical or escaping object paths before Graph", async () => {
-    const requestSpy = vi.spyOn(obsidian, "requestUrl");
-    const client = new OneDriveClient(async () => "token");
-
-    await expect(client.createCommunityPluginGenerationObjectV1(
-      "testVault",
-      "community-plugin-content-v1/../protocol-v3.json",
-      new ArrayBuffer(0),
-    )).rejects.toThrow("path is invalid");
-    expect(requestSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -3846,6 +3751,70 @@ describe("OneDriveClient delta continuation", () => {
     expect(requestSpy.mock.calls.map(([request]) => request.url)).toEqual([
       expect.stringContaining("/me/drive/items/root%2Fid/delta"),
       "https://graph.microsoft.com/v1.0/drives/drive-id/items/root-id/delta?token=page-2",
+    ]);
+  });
+
+  it("requests a larger first page on the self-built delta feed and leaves server continuations untouched", async () => {
+    const nextLink = "https://graph.microsoft.com/v1.0/drives/drive-id/items/root-id/delta?token=page-2";
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: {
+          value: [{ id: "a", name: "a.md", file: {} }],
+          "@odata.nextLink": nextLink,
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: {
+          value: [],
+          "@odata.deltaLink": "https://graph.microsoft.com/v1.0/drives/drive-id/items/root-id/delta?token=stable",
+        },
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    await client.getDelta("testVault");
+
+    expect(requestSpy.mock.calls.map(([request]) => request.url)).toEqual([
+      `https://graph.microsoft.com/v1.0/me/drive/special/approot:/vaults/testVault/files:/delta?$top=1000`,
+      nextLink,
+    ]);
+  });
+
+  it("never rewrites a persisted server delta link with the page-size hint", async () => {
+    const initialLink = "https://graph.microsoft.com/v1.0/drives/drive-id/items/root-id/delta?token=1";
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      json: { value: [], "@odata.deltaLink": initialLink },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await client.getDelta("testVault", initialLink);
+
+    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({
+      url: initialLink,
+      method: "GET",
+    }));
+  });
+
+  it("requests a larger first page on the folder-identity recovery delta", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      json: {
+        value: [],
+        "@odata.deltaLink": "https://graph.microsoft.com/v1.0/drives/drive-id/items/root-id/delta?token=stable",
+      },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await client.getDeltaByFolderId("root/id");
+
+    expect(requestSpy.mock.calls.map(([request]) => request.url)).toEqual([
+      "https://graph.microsoft.com/v1.0/me/drive/items/root%2Fid/delta?$top=1000",
     ]);
   });
 });

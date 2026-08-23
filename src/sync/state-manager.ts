@@ -288,9 +288,6 @@ import {
   sameSyncScope,
 } from "./types";
 import { BaseContentCache, isTextFile } from "./base-content-cache";
-import {
-  type CommunityPluginEnablementMigrationCarrierV2,
-} from "./community-plugin-enablement";
 
 export class SyncPathMutationRecoveryError extends Error {
   constructor(message = "Cannot change sync paths while mutation recovery is unresolved") {
@@ -1325,17 +1322,12 @@ export class StateManager {
   /** Record one fully healthy round and retire old layout files after the
    * small, local-only migration grace period. Cleanup never affects sync. */
   async noteHealthySync(): Promise<void> {
-    const current = getEasySyncPaths(
-      this.plugin.app.vault,
-      this.plugin.manifest.id,
-    );
     const legacy = getEasySyncLegacyPaths(
       this.plugin.app.vault,
       this.plugin.manifest.id,
     );
     await noteHealthySyncAndCleanupEasySyncRuntimeLayout(
       this.plugin.app.vault.adapter,
-      current,
       legacy,
       this.plugin.layoutMigrationStorage,
     );
@@ -4918,7 +4910,7 @@ export class StateManager {
   async commitSyncPathSettingsChange(
     isPathInScope: (path: string) => boolean,
     persistSettings: (data: Record<string, unknown>) => void,
-    selectedCommunityPluginIds?: readonly string[],
+    _selectedCommunityPluginIds?: readonly string[],
     scopeChange?: Readonly<SyncPathSettingsScopeChangeV1>,
   ): Promise<void> {
     const retainedScopeExit =
@@ -8855,11 +8847,6 @@ function readConfirmedDescendantFileReconstructionCheckpointV1(
     roots: deduplicateReconstructionRoots(roots),
     startedAt: candidate.startedAt,
   };
-}
-
-function isSafeCommunityPluginId(pluginId: string): boolean {
-  return /^[a-z0-9][a-z0-9_-]*$/i.test(pluginId)
-    && pluginId.toLowerCase() !== "easy-sync";
 }
 
 function parseRemoteState(value: unknown): RemoteSyncState | null {

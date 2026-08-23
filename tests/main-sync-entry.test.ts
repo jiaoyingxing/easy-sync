@@ -250,7 +250,6 @@ function participating(pluginId = "calendar") {
     {
       type: "confirm-participating",
       pluginId,
-      joinedGeneration: 4,
       localBundleDigest: "a".repeat(64),
     },
   );
@@ -615,7 +614,7 @@ describe("main sync entry guards", () => {
     }).dispatchSyncRun({ mode: "manual" });
 
     expect(result?.conflicts).toBe(1);
-    expect(result?.message).toBe("本轮有 1 项远端删除待确认");
+    expect(result?.message).toBe("本轮有 1 项云端删除待确认");
   });
 
   it("keeps the old path for move-result presentation and does not mark safe deferrals as failures", () => {
@@ -844,7 +843,6 @@ describe("main sync entry guards", () => {
 
     expect(participation.current().pluginsById.calendar).toMatchObject({
       phase: "exit-requested",
-      joinedGeneration: 4,
       lastConfirmedLocalBundleDigest: "a".repeat(64),
     });
     expect(plugin.isCommunityPluginFilesParticipationEnabled("calendar"))
@@ -866,7 +864,7 @@ describe("main sync entry guards", () => {
     expect(deleteItem).not.toHaveBeenCalled();
   });
 
-  it("persists the sealed plugin lifecycle generation after restore completion", async () => {
+  it("persists an ordinary restore completion without lifecycle generation", async () => {
     const plugin = makePlugin();
     let restoring = reduceDeviceCommunityPluginParticipation(
       createEmptyDeviceCommunityPluginParticipation(true),
@@ -888,18 +886,15 @@ describe("main sync entry guards", () => {
       persistCommunityPluginJoinOutcomes: (
         completed: { files: string[]; data: string[] },
         blocks: unknown[],
-        generationByPluginId: Record<string, number>,
       ) => Promise<void>;
     }).persistCommunityPluginJoinOutcomes(
       { files: ["calendar"], data: [] },
       [],
-      { calendar: 3 },
     );
 
     expect(participation.current().pluginsById.calendar).toEqual({
       pluginId: "calendar",
       phase: "participating",
-      joinedGeneration: 3,
       lastConfirmedLocalBundleDigest: "b".repeat(64),
     });
   });
@@ -1003,7 +998,7 @@ describe("main sync entry guards", () => {
       .not.toHaveBeenCalled();
   });
 
-  it("persists a source plugin generation without requiring a download", async () => {
+  it("persists an ordinary participating entry without lifecycle generation", async () => {
     const plugin = makePlugin();
     const participation = attachParticipationState(
       plugin,
@@ -1017,18 +1012,15 @@ describe("main sync entry guards", () => {
       persistCommunityPluginJoinOutcomes: (
         completed: { files: string[]; data: string[] },
         blocks: unknown[],
-        generationByPluginId: Record<string, number>,
       ) => Promise<void>;
     }).persistCommunityPluginJoinOutcomes(
       { files: [], data: [] },
       [],
-      { calendar: 2 },
     );
 
     expect(participation.current().pluginsById.calendar).toEqual({
       pluginId: "calendar",
       phase: "participating",
-      joinedGeneration: 2,
     });
   });
 
@@ -1066,7 +1058,6 @@ describe("main sync entry guards", () => {
     expect(participation.current().pluginsById.calendar).toEqual({
       pluginId: "calendar",
       phase: "participating",
-      joinedGeneration: 4,
       lastConfirmedLocalBundleDigest: "a".repeat(64),
     });
     expect(participation.state.commitSyncPathSettingsChange)
@@ -4721,5 +4712,63 @@ describe("main sync entry guards", () => {
     expect(invalidateLifecycle).toHaveBeenCalledWith("unload");
     expect(plugin.syncExecutor).toBeNull();
     await expect(plugin.resolveConflictKeepLocal("note.md")).resolves.toBe(false);
+  });
+
+  it("does not pause auto sync when every failure is a community-plugin identity block", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: false,
+      errors: 3,
+      identityBlockedErrors: 3,
+      message: "syncFailed",
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(stopAutoSync).not.toHaveBeenCalled();
+    expect(saveSyncSettings).not.toHaveBeenCalled();
+    expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("keeps pausing auto sync when identity blocks are mixed with ordinary failures", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: false,
+      errors: 3,
+      identityBlockedErrors: 1,
+      message: "syncFailed",
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(true);
+    expect(stopAutoSync).toHaveBeenCalledOnce();
+    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    expect(startAutoSync).not.toHaveBeenCalled();
   });
 });

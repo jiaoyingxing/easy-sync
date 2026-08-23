@@ -1,5 +1,4 @@
 import { sha256Hex } from "../crypto";
-import type { OneDriveClient } from "../onedrive/client";
 import { isRecord } from "../obsidian-compat";
 import {
   isSharedSyncProtocolBindingV2,
@@ -81,18 +80,6 @@ export type EnsureSharedSyncProtocolResultV3 =
       | "write-failed"
       | "readback-mismatch";
   };
-
-export function createOneDriveSharedSyncProtocolTransportV3(
-  client: OneDriveClient,
-  vaultName: string,
-): SharedSyncProtocolTransportV3 {
-  return {
-    read: () => client.readSharedSyncProtocolV3(vaultName),
-    createOnly: (content) =>
-      client.createSharedSyncProtocolV3(vaultName, content),
-    readById: (id) => client.readSharedSyncProtocolV3ById(id),
-  };
-}
 
 /**
  * Join or create the immutable scope-free generation protocol.

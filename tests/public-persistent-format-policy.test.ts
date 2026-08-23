@@ -120,31 +120,11 @@ describe("public persistent-format compatibility policy", () => {
       "protocol-v2",
       "protocol-v3",
       "community-plugin-participation",
-      "community-plugin-lifecycle-control",
-      "community-plugin-lifecycle-device-observation",
       "v2-recovery-control-records",
       "remote-scope-recovery-evidence-db",
       "easy-sync-runtime-layout",
       "rebuildable-caches-and-presentation",
     ]));
-    expect(fixture.families.find(
-      (family) => family.id === "community-plugin-lifecycle-control",
-    )).toMatchObject({
-      currentVersion: 2,
-      status: "development-unpublished",
-    });
-    expect(fixture.families.find(
-      (family) => family.id === "community-plugin-lifecycle-device-observation",
-    )).toMatchObject({
-      currentVersion: 1,
-      status: "development-unpublished",
-      acceptedNestedVersions: {
-        observationCheckpoint: [1],
-        controlMutationCheckpoint: [1],
-        bundlePublicationCheckpoint: [1],
-        generationCleanupCheckpoint: [1],
-      },
-    });
     expect(fixture.families.find(
       (family) => family.id === "v2-recovery-control-records",
     )?.acceptedOptionalSemantics).toEqual({

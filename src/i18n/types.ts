@@ -198,7 +198,6 @@ export interface LocaleStrings {
 
   // ---- Sync View ----
   "syncView.title": string;
-  "syncView.lastSync": string;
   "syncView.never": string;
   "syncView.progress": string;
   "syncView.conflict.keepLocal": string;
@@ -212,7 +211,6 @@ export interface LocaleStrings {
   "syncView.delete.confirmAllWarning": string;
   "syncView.delete.reject": string;
   "syncView.delete.reason": string;
-  "syncView.emptyFolder.resolve": string;
   "syncView.folderSubtree.review": string;
   "syncView.folderSubtree.title": string;
   "syncView.folderSubtree.description": string;
@@ -270,7 +268,6 @@ export interface LocaleStrings {
   "syncView.mutationResolution.missing": string;
   "syncView.mutationResolution.technicalDetails": string;
   "syncView.mutationResolution.operationId": string;
-  "syncView.mutationResolution.identical": string;
   "syncView.mutationResolution.keepLocal": string;
   "syncView.mutationResolution.keepRemote": string;
   "syncView.mutationResolution.singleActionHint": string;
@@ -326,8 +323,6 @@ export interface LocaleStrings {
   "result.conflictsAndRemoteDeletesPending": string;
   "result.deferred": string;
   "result.skipped": string;
-  "result.firstSyncCancelled": string;
-  "result.thresholdDeclined": string;
   "result.authExpired": string;
   "result.syncFailed": string;
   "result.alreadyRunning": string;
@@ -353,7 +348,6 @@ export interface LocaleStrings {
   "notice.communityPlugins.remoteCatalogFailed": string;
   "notice.communityPlugins.enablementRetired": string;
   "notice.communityPlugins.enableFilesFirst": string;
-  "notice.communityPlugins.decisionUnavailable": string;
   "notice.communityPlugins.globalDeleteUnavailable": string;
   "notice.emptyFolder.changed": string;
   "notice.emptyFolder.failed": string;
@@ -413,7 +407,6 @@ export interface LocaleStrings {
   "reason.fileDeletedFromRemote": string;
   "reason.bothSidesModified": string;
   "reason.renameIdentityAmbiguous": string;
-  "reason.scanUnhealthy": string;
   "reason.folder.anchored-folder-missing-local": string;
   "reason.folder.anchored-folder-missing-remote": string;
   "reason.folder.both-sides-moved": string;
@@ -455,9 +448,15 @@ export interface LocaleStrings {
   "auth.error.secretStorageUnavailable": string;
   "auth.error.refreshFailed": string;
 
+  // ---- Login Notice (shown before every fresh login) ----
+  "auth.notice.title": string;
+  "auth.notice.line1": string;
+  "auth.notice.line2": string;
+  "auth.notice.line3": string;
+  "auth.notice.continue": string;
+
   // ---- General ----
   "general.unknown": string;
-  "general.notYetImplemented": string;
 
 
   // ---- Conflict/Delete Feedback Notices ----
@@ -528,7 +527,6 @@ export interface LocaleStrings {
   "syncView.fileStatus.create": string;
   "syncView.fileStatus.rename": string;
   "syncView.fileStatus.move": string;
-  "syncView.fileStatus.folder": string;
   "syncView.fileStatus.delete": string;
   "syncView.fileStatus.conflict": string;
   "syncView.fileStatus.pendingConfirmation": string;
@@ -596,7 +594,6 @@ export interface LocaleStrings {
   "syncAction.summary.deferred": string;
   "syncAction.summary.skipped": string;
   "syncAction.summary.errors": string;
-  "syncView.progress.current": string;
   "syncView.progress.items": string;
   "syncView.progress.completed": string;
   "syncView.progress.remoteScopeRecoveryFailureTitle": string;
@@ -618,6 +615,80 @@ export interface LocaleStrings {
   "syncView.failure.localChangedBeforeDelete": string;
   "syncView.failure.local": string;
   "syncView.failure.unknown": string;
+  "error.present.plugin.identityAmbiguous": string;
+  "error.present.plugin.identityChangedInDirectory": string;
+  "error.present.plugin.manifestUnreadable": string;
+  "error.present.plugin.manifestIdentityInvalid": string;
+  "error.present.plugin.manifestVersionInvalid": string;
+  "error.present.plugin.manifestMinAppVersionInvalid": string;
+  "error.present.plugin.bundleIncompleteLocal": string;
+  "error.present.plugin.bundleIncompleteRemote": string;
+  "error.present.plugin.downgradeRemote": string;
+  "error.present.plugin.manifestDownloadFailed": string;
+  "error.present.plugin.incompatibleDowngrade": string;
+  "error.present.plugin.incompatibleDesktopOnly": string;
+  "error.present.plugin.incompatibleMinAppVersion": string;
+  "error.present.plugin.localTargetChanged": string;
+  "error.present.file.downloadHashMismatch": string;
+  "error.present.file.downloadSizeMismatch": string;
+  "error.present.file.downloadTargetVerification": string;
+  "error.present.file.downloadTempVerification": string;
+  "error.present.file.localMergedCommit": string;
+  "error.present.file.configMoveFile": string;
+  "error.present.file.configMoveFolder": string;
+  "error.present.file.emptyFolderRestoreReadback": string;
+  "error.present.file.localIdentityBeforeMove": string;
+  "error.present.file.localMoveReadback": string;
+  "error.present.file.trashMove": string;
+  "error.present.file.folderMissingRemoteIdentity": string;
+  "error.present.file.localFolderDeleteReadback": string;
+  "error.present.file.localFolderIdentityBeforeMove": string;
+  "error.present.file.folderNotConfirmedEmpty": string;
+  "error.present.file.localFolderMoveReadback": string;
+  "error.present.file.localMergeVerify": string;
+  "error.present.file.writeLocalVerify": string;
+  "error.present.file.mergeVerify": string;
+  "error.present.file.autoMergeRemoteReadback": string;
+  "error.present.file.uploadMissingVersion": string;
+  "error.present.file.remoteCacheMissingParent": string;
+  "error.present.file.remoteEmptyFolderDeleteReadback": string;
+  "error.present.file.remoteMoveLostIdentity": string;
+  "error.present.file.remoteFileMoveReadback": string;
+  "error.present.file.remoteFolderDeleteReadback": string;
+  "error.present.file.remoteFolderIdentityIncomplete": string;
+  "error.present.file.remoteFolderMoveReadback": string;
+  "error.present.file.remoteFolderReadbackIncomplete": string;
+  "error.present.file.remoteRecreateParentChanged": string;
+  "error.present.file.remoteIdentityIncomplete": string;
+  "error.present.file.recoveryReviewChanged": string;
+  "error.present.file.recoveryReviewSizeChanged": string;
+  "error.present.file.folderLocationNoIntent": string;
+  "error.present.file.folderLocationSourceChanged": string;
+  "error.present.file.subtreeDeleteReadback": string;
+  "error.present.file.subtreeDeleteReceiptIncomplete": string;
+  "error.present.file.subtreeDeleteRootChanged": string;
+  "error.present.file.subtreeDeleteSourceChanged": string;
+  "error.present.file.scopeRecoveryItemDisappeared": string;
+  "error.present.file.pluginDownloadNoSource": string;
+  "error.present.file.pluginManifestEncoding": string;
+  "error.present.file.missingDriveIdentity": string;
+  "error.present.file.missingInitializedScope": string;
+  "error.present.file.mutationAlreadyPending": string;
+  "error.present.file.recoverySourceMissing": string;
+  "error.present.file.recoveryVerifyFailed": string;
+  "error.present.file.catalogFieldInvalid": string;
+  "error.present.file.catalogScopeInvalid": string;
+  "error.present.file.catalogItemAnotherDrive": string;
+  "error.present.file.catalogScopeChanged": string;
+  "error.present.file.catalogMemberInvalid": string;
+  "error.present.file.catalogMemberNoVersion": string;
+  "error.present.file.catalogPathMissing": string;
+  "error.present.file.pluginBundleLocalFactsChanged": string;
+  "error.present.file.pluginBundleLocalSourceChanged": string;
+  "error.present.file.pluginBundleRemoteFactsChanged": string;
+  "error.present.file.pluginBundleRemoteProofIncomplete": string;
+  "error.present.file.protectedConfigDelete": string;
+  "error.present.internal": string;
   "syncView.status.synced": string;
   "syncView.status.awaitingLogin": string;
   "syncView.recovery.checking": string;
@@ -649,12 +720,10 @@ export interface LocaleStrings {
   "mutationRecovery.reason.automaticBudgetExhausted": string;
   "mutationRecovery.reason.unknown": string;
   "syncView.issues.title": string;
-  "syncView.issues.notSynced": string;
   "syncView.issues.lastAttempt": string;
   "syncView.issues.openFile": string;
   "syncView.issues.retry": string;
   "syncView.issues.recheck": string;
-  "syncView.issues.awaitingConfirmation": string;
   "syncView.collapseAll": string;
   "syncView.expandAll": string;
   "syncView.history.title": string;
@@ -676,9 +745,6 @@ export interface LocaleStrings {
   "syncView.history.duration": string;
 
   // ---- Confirm Modal ----
-  "confirm.firstSyncTitle": string;
-  "confirm.thresholdTitle": string;
-  "confirm.confirm": string;
   "confirm.cancel": string;
   "syncPlan.migrationSummary": string;
   "syncPlan.cloudJoinSummary": string;
@@ -694,14 +760,11 @@ export interface LocaleStrings {
   // ---- Sync Plan Alert & Review ----
   "syncPlan.readyTitle": string;
   "syncPlan.readyMessage": string;
-  "syncPlan.firstUseUsage": string;
-  "syncPlan.firstUseSafety": string;
   "syncPlan.reviewUpdatedTitle": string;
   "syncPlan.reviewUpdatedMessage": string;
   "syncPlan.viewButton": string;
   "syncPlan.sectionTitle": string;
   "syncPlan.confirmExecute": string;
-  "syncPlan.recalculate": string;
   "syncPlan.detailsUnavailable": string;
   "syncPlan.restoringDetails": string;
   "syncPlan.restoreDetails": string;

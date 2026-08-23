@@ -5,6 +5,7 @@ import type { I18n } from "../i18n";
 import { AuthPendingModal } from "./auth-pending-modal";
 import { AuthMethodModal } from "./auth-method-modal";
 import { AuthDeviceCodeModal } from "./auth-device-code-modal";
+import { AuthLoginNoticeModal } from "./auth-login-notice-modal";
 import {
   NOTICE_PRIORITY,
   type EasySyncNoticeCenter,
@@ -89,7 +90,13 @@ export function handleAuthEntryAction(host: AuthEntryFlowHost): Promise<void> {
     return Promise.resolve();
   }
   if (!auth.isPending) {
-    return chooseAuthMethod(host, auth);
+    // Login-gate notice: every fresh login first shows the short agreement
+    // (data destination, backup, no competing sync tools). Dismissing it
+    // cancels the login flow entirely — the chooser is not opened.
+    return showLoginNotice(host).then((noticed) => {
+      if (!noticed) return;
+      return chooseAuthMethod(host, auth);
+    });
   }
   if (auth.deviceAttempt) {
     // A waiting device code outlives its modal: re-entering reopens the SAME
@@ -101,6 +108,21 @@ export function handleAuthEntryAction(host: AuthEntryFlowHost): Promise<void> {
     return Promise.resolve();
   }
   return handlePendingAuth(host, auth);
+}
+
+/** Agreement gate before any fresh login. Each new login shows it again. */
+async function showLoginNotice(host: AuthEntryFlowHost): Promise<boolean> {
+  const t = host.i18n.t.bind(host.i18n);
+  return new AuthLoginNoticeModal(
+    host.app,
+    t("auth.notice.title"),
+    [
+      t("auth.notice.line1"),
+      t("auth.notice.line2"),
+      t("auth.notice.line3"),
+    ],
+    t("auth.notice.continue"),
+  ).awaitContinue();
 }
 
 /**

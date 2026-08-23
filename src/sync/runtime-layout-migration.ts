@@ -443,7 +443,6 @@ function writeMarker(storage: EasySyncLayoutMigrationStorage | undefined, marker
 
 export async function noteHealthySyncAndCleanupEasySyncRuntimeLayout(
   adapter: DataAdapter,
-  current: EasySyncPathSet,
   legacy: EasySyncPathSet,
   storage: EasySyncLayoutMigrationStorage | undefined,
 ): Promise<{ cleaned: boolean; stableSyncs: number; remaining: string[] }> {

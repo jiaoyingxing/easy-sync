@@ -42,7 +42,6 @@ export function planCommunityPluginLocalReconciliation(input: Readonly<{
     commands.push({
       type: "confirm-participating",
       pluginId: entry.pluginId,
-      joinedGeneration: entry.joinedGeneration,
       localBundleDigest: entry.lastConfirmedLocalBundleDigest,
     });
   }

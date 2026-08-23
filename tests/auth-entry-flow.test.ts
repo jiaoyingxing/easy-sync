@@ -38,6 +38,34 @@ vi.mock("../src/ui/auth-pending-modal", () => ({
   },
 }));
 
+const noticeState = vi.hoisted(() => ({
+  confirmed: true,
+  captured: null as null | {
+    title: string;
+    lines: string[];
+    continueLabel: string;
+  },
+}));
+
+vi.mock("../src/ui/auth-login-notice-modal", () => ({
+  AuthLoginNoticeModal: class {
+    constructor(
+      _app: unknown,
+      title: string,
+      lines: string[],
+      continueLabel: string,
+    ) {
+      noticeState.captured = { title, lines, continueLabel };
+    }
+
+    async awaitContinue(): Promise<boolean> {
+      return noticeState.confirmed;
+    }
+
+    open(): void {}
+  },
+}));
+
 const methodModalState = vi.hoisted(() => ({
   action: "dismiss" as "browser" | "device" | "dismiss",
   deviceRejects: false,
@@ -212,6 +240,8 @@ describe("handleAuthEntryAction", () => {
   beforeEach(() => {
     modalState.action = "dismiss";
     modalState.copy = false;
+    noticeState.confirmed = true;
+    noticeState.captured = null;
     methodModalState.action = "dismiss";
     methodModalState.deviceRejects = false;
     methodModalState.captured = null;
@@ -220,6 +250,35 @@ describe("handleAuthEntryAction", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  it("shows the agreed login notice before the method chooser on every fresh login", async () => {
+    const { host, login } = makeHost();
+
+    await handleAuthEntryAction(host);
+
+    expect(noticeState.captured).not.toBeNull();
+    expect(noticeState.captured?.title).toBe("auth.notice.title");
+    expect(noticeState.captured?.lines).toEqual([
+      "auth.notice.line1",
+      "auth.notice.line2",
+      "auth.notice.line3",
+    ]);
+    expect(noticeState.captured?.continueLabel).toBe("auth.notice.continue");
+    expect(methodModalState.captured).not.toBeNull();
+    expect(login).not.toHaveBeenCalled();
+  });
+
+  it("cancels the whole login flow when the login notice is dismissed", async () => {
+    noticeState.confirmed = false;
+    const { host, login, showNotice } = makeHost();
+
+    await handleAuthEntryAction(host);
+
+    expect(noticeState.captured).not.toBeNull();
+    expect(methodModalState.captured).toBeNull();
+    expect(login).not.toHaveBeenCalled();
+    expect(showNotice).not.toHaveBeenCalled();
   });
 
   it("presents the method chooser before any fresh login", async () => {
@@ -244,11 +303,11 @@ describe("handleAuthEntryAction", () => {
     methodModalState.action = "browser";
     const { host, login, showNotice, pendingFlag } = makeHost();
 
-    const result = handleAuthEntryAction(host);
-    // The browser opens synchronously inside the option click chain:
-    // the attempt is already pending before the action promise settles.
+    // The login gate resolves first; the browser then opens synchronously
+    // inside the option click chain, so the attempt is pending before the
+    // action promise settles.
+    await handleAuthEntryAction(host);
     expect(pendingFlag.value).toBe(true);
-    await result;
 
     expect(login).toHaveBeenCalledOnce();
     expect(deviceModalState.opened).toHaveLength(0);
@@ -293,10 +352,11 @@ describe("handleAuthEntryAction", () => {
     });
 
     // The chooser stays open on failure, so the entry-flow promise never
-    // settles; give the microtask chain a chance to run.
+    // settles; flush the login-gate + chooser microtask chain first.
     const pending = handleAuthEntryAction(host);
-    await Promise.resolve();
-    await Promise.resolve();
+    for (let i = 0; i < 6; i += 1) {
+      await Promise.resolve();
+    }
 
     expect(beginDeviceCodeLogin).toHaveBeenCalledOnce();
     expect(showNotice).toHaveBeenCalledWith(expect.objectContaining({
@@ -331,6 +391,7 @@ describe("handleAuthEntryAction", () => {
 
     expect(checkAuthStatus).toHaveBeenCalledTimes(2);
     expect(login).not.toHaveBeenCalled();
+    expect(noticeState.captured).toBeNull();
     expect(showNotice).toHaveBeenCalledWith(expect.objectContaining({
       key: "settings-login-pending",
       message: "settings.account.desc.pending",
@@ -385,10 +446,12 @@ describe("handleAuthEntryAction", () => {
     await handleAuthEntryAction(host);
 
     // Re-entry reopens the waiting modal bound to the SAME attempt — no new
-    // devicecode request, no browser pending modal, no method chooser.
+    // devicecode request, no browser pending modal, no method chooser, and
+    // no login notice (this is a continuation, not a fresh login).
     expect(deviceModalState.opened).toHaveLength(1);
     expect(beginDeviceCodeLogin).not.toHaveBeenCalled();
     expect(methodModalState.captured).toBeNull();
+    expect(noticeState.captured).toBeNull();
   });
 
   it("copies the exact current pending URL without starting another login", async () => {

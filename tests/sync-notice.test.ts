@@ -306,9 +306,9 @@ describe("resolveSyncProgressNoticePresentation", () => {
     const t = i18n.t.bind(i18n);
     const cases = [
       [progress(), "☁️ 开始同步"],
-      [progress({ phase: "scanning" }), "☁️ 扫描本地文件…"],
-      [progress({ phase: "preparing" }), "☁️ 准备远端存储…"],
-      [progress({ phase: "checking" }), "☁️ 检查远端变更…"],
+      [progress({ phase: "scanning" }), "☁️ 扫描本机文件…"],
+      [progress({ phase: "preparing" }), "☁️ 准备云端存储…"],
+      [progress({ phase: "checking" }), "☁️ 检查云端变更…"],
       [progress({ phase: "planning" }), "☁️ 生成同步计划…"],
       [progress({ phase: "executing", current: 3, total: 12 }), "☁️ 正在同步 3/12"],
       [progress({
@@ -316,7 +316,7 @@ describe("resolveSyncProgressNoticePresentation", () => {
         current: 3,
         total: 12,
         currentActionType: SyncActionType.MoveRemoteFolder,
-      }), "☁️ 正在移动或重命名远端文件夹 3/12"],
+      }), "☁️ 正在移动或重命名云端文件夹 3/12"],
       [progress({ phase: "executing", cancelRequested: true }), "⛔ 正在取消同步…"],
     ] as const;
 

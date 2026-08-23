@@ -58,7 +58,7 @@ describe("diagnostic report evidence", () => {
       activity: "同步中",
     })).toEqual([
       "**自动同步**: 运行中（每 3 分钟）",
-      "**修改后触发同步**: 本地变化后等待 7 秒（已有待处理变化）/ 当前状态：同步中",
+      "**修改后触发同步**: 本机变化后等待 7 秒（已有待处理变化）/ 当前状态：同步中",
     ]);
 
     expect(formatDiagnosticAutomaticSyncSummary({
@@ -358,17 +358,17 @@ describe("diagnostic report evidence", () => {
     expect(source.indexOf("**V2 状态存储权威**"))
       .toBeGreaterThan(technicalStart);
     expect(source.indexOf("**同步范围指纹**")).toBeGreaterThan(technicalStart);
-    expect(source.indexOf("**远端快照**")).toBeGreaterThan(technicalStart);
+    expect(source.indexOf("**云端快照**")).toBeGreaterThan(technicalStart);
     expect(source).toContain("findLatestPhaseSummary(diagAll)");
     expect(source).toContain("findLatestNetworkSummary(diagAll)");
     expect(source).toContain("findLatestTransferSummary(diagAll)");
     expect(source).toContain("findLatestAutomaticHandlingSummary(diagAll)");
     expect(source).toContain("findLatestSharedProtocolProfileSummary(diagAll)");
-    expect(source).toContain("**文件传输与本地处理**");
+    expect(source).toContain("**文件传输与本机处理**");
     expect(source).toContain("summarizeMutationRecovery(");
     expect(source).toContain("automaticRecoverySchedulerState");
     expect(source).toContain("formatMutationRecoveryHistory(");
-    expect(source).toContain("远端删除待确认");
+    expect(source).toContain("云端删除待确认");
     expect(source).toContain("resolveSyncPendingAttentionCounts(");
     expect(source).toContain("summarizeCommunityPluginSync(");
     expect(source).toContain(

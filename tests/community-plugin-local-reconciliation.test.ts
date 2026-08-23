@@ -13,7 +13,6 @@ function participatingState() {
     {
       type: "confirm-participating",
       pluginId: "calendar",
-      joinedGeneration: 4,
       localBundleDigest: "a".repeat(64),
     },
   );
@@ -40,7 +39,6 @@ describe("community plugin local reconciliation", () => {
     );
     expect(exiting.pluginsById.calendar).toMatchObject({
       phase: "exit-requested",
-      joinedGeneration: 4,
       lastConfirmedLocalBundleDigest: "a".repeat(64),
     });
     expect(planCommunityPluginLocalReconciliation({
@@ -71,7 +69,6 @@ describe("community plugin local reconciliation", () => {
       }).commands).toEqual([{
         type: "confirm-participating",
         pluginId: "calendar",
-        joinedGeneration: 4,
         localBundleDigest: "a".repeat(64),
       }]);
     }

@@ -101,7 +101,7 @@ export function formatDiagnosticAutomaticSyncSummary(input: {
     `**自动同步**: ${input.paused
       ? "已暂停"
       : `运行中（每 ${input.intervalMinutes} 分钟）`}`,
-    `**修改后触发同步**: 本地变化后等待 ${input.changeDelaySeconds} 秒（${input.dirtyPending
+    `**修改后触发同步**: 本机变化后等待 ${input.changeDelaySeconds} 秒（${input.dirtyPending
       ? "已有待处理变化"
       : "当前无待处理变化"}）/ 当前状态：${input.activity}`,
   ];

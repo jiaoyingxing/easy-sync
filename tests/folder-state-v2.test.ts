@@ -1224,4 +1224,102 @@ describe("V2 folder anchors and pure planner", () => {
       10,
     )).toBe(true);
   });
+
+  // ---- Interleaved-round locks (A2 2026-08-24 定界)：remote-subtree-changed 唯一触发 =
+  // localMoved=true + 远端子树内容变；本地未动的跨轮形状必须保持安全收敛。----
+
+  it("keeps an unchanged local folder out of remote-subtree-changed after a committed move", () => {
+    // Round N committed root move Notes -> Archive（folder/file anchors 已平移）。
+    // Round N+1：远端在 Archive 子树内编辑了文件内容，本地从未移动。
+    const current = envelope({
+      folders: [{ id: "notes", name: "Archive" }],
+      files: [{ id: "file-a", name: "a.md", parentId: "notes", hash: "b".repeat(64) }],
+      folderAnchors: [folderAnchor("notes", "Archive")],
+      fileAnchors: [fileAnchor("file-a", "Archive/a.md")],
+    });
+    const report = planFolderStateV2({
+      envelope: current,
+      localFiles: [localFile("Archive/a.md")],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items.every((item) =>
+      (item as { reason?: string }).reason !== "remote-subtree-changed")).toBe(true);
+    expect(report.items).toEqual([]);
+  });
+
+  it("carries a changed child on a second remote move instead of remote-subtree-changed", () => {
+    // Round N committed Notes -> Archive；Round N+1 远端再次移动 Archive -> NewHome
+    // 且携带的子文件内容也已变化；本地未动。
+    const current = envelope({
+      folders: [{ id: "notes", name: "NewHome" }],
+      files: [
+        { id: "file-a", name: "a.md", parentId: "notes", hash: "b".repeat(64) },
+        { id: "file-b", name: "b.md", parentId: "notes" },
+      ],
+      folderAnchors: [folderAnchor("notes", "Archive")],
+      fileAnchors: [fileAnchor("file-a", "Archive/a.md"), fileAnchor("file-b", "Archive/b.md")],
+    });
+    const report = planFolderStateV2({
+      envelope: current,
+      localFiles: [localFile("Archive/a.md"), localFile("Archive/b.md")],
+      localFolders: localFolders("Archive"),
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "move-local",
+      path: "NewHome",
+      remoteId: "notes",
+    })]);
+  });
+
+  it("conflicts when the local folder moved and the remote subtree changed (remote root unmoved)", () => {
+    // 只有本地侧存在移动信号（localMoved=true）+ 远端子树内容变化才触发
+    // remote-subtree-changed——双方都在动，fail-closed 交给用户决策。
+    const current = envelope({
+      folders: [{ id: "notes", name: "Archive" }],
+      files: [{ id: "file-a", name: "a.md", parentId: "notes", hash: "b".repeat(64) }],
+      folderAnchors: [folderAnchor("notes", "Archive")],
+      fileAnchors: [fileAnchor("file-a", "Archive/a.md")],
+    });
+    const report = planFolderStateV2({
+      envelope: current,
+      localFiles: [localFile("Notes/a.md")],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "conflict",
+      path: "Archive",
+      reason: "remote-subtree-changed",
+      remoteId: "notes",
+    })]);
+  });
+
+  it("conflicts when the anchored local root is gone, a same-content copy exists and remote edited", () => {
+    // inferMovedLocalFolder 把"本地根消失 + 别处同内容副本"推断为本地移动；
+    // 叠加远端内容变化时同样走 remote-subtree-changed（不自动跟随任一侧）。
+    const current = envelope({
+      folders: [{ id: "notes", name: "Archive" }],
+      files: [{ id: "file-a", name: "a.md", parentId: "notes", hash: "b".repeat(64) }],
+      folderAnchors: [folderAnchor("notes", "Archive")],
+      fileAnchors: [fileAnchor("file-a", "Archive/a.md")],
+    });
+    const report = planFolderStateV2({
+      envelope: current,
+      localFiles: [localFile("Backup/a.md")],
+      localFolders: localFolders("Backup"),
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "conflict",
+      path: "Archive",
+      reason: "remote-subtree-changed",
+      remoteId: "notes",
+    })]);
+  });
 });

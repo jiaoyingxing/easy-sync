@@ -145,7 +145,7 @@ describe("sync result presentation", () => {
       }),
       [remoteDelete],
       zh.t.bind(zh),
-    )).toBe("本轮有 1 项远端删除待确认");
+    )).toBe("本轮有 1 项云端删除待确认");
     expect(formatSyncResultMessage(
       result({
         conflicts: 1,
@@ -162,7 +162,7 @@ describe("sync result presentation", () => {
       }),
       [remoteDelete, conflict],
       zh.t.bind(zh),
-    )).toBe("本轮有 1 项冲突待处理，1 项远端删除待确认");
+    )).toBe("本轮有 1 项冲突待处理，1 项云端删除待确认");
     expect(formatSyncResultMessage(
       result({
         conflicts: 2,

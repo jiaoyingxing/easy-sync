@@ -115,7 +115,6 @@ describe("production-capable IndexedDB active state owner", () => {
         calendar: {
           pluginId: "calendar",
           phase: "participating",
-          joinedGeneration: 3,
           lastConfirmedLocalBundleDigest: "c".repeat(64),
         },
       },

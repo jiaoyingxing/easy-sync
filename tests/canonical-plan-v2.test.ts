@@ -1499,51 +1499,6 @@ describe("canonical V2 plan candidate", () => {
       digest(changedParent),
     ]).size).toBe(4);
 
-    const generationDownload: SyncPlanItem = {
-      type: SyncActionType.Download,
-      path: ".obsidian/plugins/calendar/main.js",
-      remote: {
-        path: "community-plugin-content-v1/plugins/aa/generations/1/objects/bb.bin",
-        driveId: "generation-object",
-        parentId: "generation-parent",
-        size: 10,
-        mtime: 0,
-        eTag: "generation-etag",
-        cTag: "generation-ctag",
-        sha256Hash: hashA,
-      },
-      generationRestore: {
-        schemaVersion: 1,
-        pluginId: "calendar",
-        participant: {
-          participantId: "participant-a",
-          incarnation: "incarnation-a",
-        },
-        generation: 1,
-        joinNonce: "join-nonce-a",
-        controlRecordId: "lifecycle-control-id",
-        fenceEpoch: 0,
-        sealRevision: 7,
-        manifestObject: {
-          objectPath: "community-plugin-content-v1/plugins/aa/generations/1/manifests/cc.json",
-          remoteId: "manifest-object",
-          parentId: "manifest-parent",
-          size: 20,
-          eTag: "manifest-etag",
-          cTag: "manifest-ctag",
-          sha256Hash: hashB,
-        },
-      },
-    };
-    const changedGenerationBinding = structuredClone(generationDownload);
-    changedGenerationBinding.generationRestore!.joinNonce = "join-nonce-b";
-    expect(digest([generationDownload])).not.toBe(
-      digest([changedGenerationBinding]),
-    );
-    expect(planDigest([generationDownload])).not.toBe(
-      planDigest([changedGenerationBinding]),
-    );
-
     const reviewedConflict: SyncPlanItem = {
       type: SyncActionType.Conflict,
       path: "conflict.md",

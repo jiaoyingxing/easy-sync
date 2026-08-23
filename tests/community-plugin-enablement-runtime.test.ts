@@ -43,25 +43,6 @@ import type {
   SyncPlanItem,
 } from "../src/sync/types";
 import { SyncActionType } from "../src/sync/types";
-import {
-  communityPluginGenerationObjectPathV1,
-  createCommunityPluginBundlePublicationCommandV1,
-  createCommunityPluginGenerationContentGrantV1,
-  prepareCommunityPluginGenerationBundleManifestV1,
-} from "../src/sync/community-plugin-generation-content-v1";
-import {
-  createCommunityPluginLifecycleControlV1,
-  reduceCommunityPluginLifecycleV1,
-  type CommunityPluginLifecycleCommandV1,
-  type CommunityPluginLifecycleControlV1,
-  type CommunityPluginParticipantIdentityV1,
-} from "../src/sync/community-plugin-lifecycle-v1";
-import {
-  CommunityPluginLifecycleDeviceObserverV1,
-  loadOrCreateCommunityPluginLifecycleDeviceIdentityV1,
-} from "../src/sync/community-plugin-lifecycle-device-v1";
-import type { VaultLocalStorage } from
-  "../src/sync/indexeddb-vault-namespace";
 import { getEasySyncPaths } from "../src/obsidian-compat";
 
 const SCOPE = {
@@ -205,28 +186,6 @@ function joinAuthorization(
   };
 }
 
-function applyLifecycleCommand(
-  state: CommunityPluginLifecycleControlV1,
-  input: Omit<
-    CommunityPluginLifecycleCommandV1,
-    "scope" | "expectedRevision" | "at" | "operationId"
-  >,
-  operationId: string,
-  at: number,
-): CommunityPluginLifecycleControlV1 {
-  const reduced = reduceCommunityPluginLifecycleV1(state, {
-    ...input,
-    operationId,
-    expectedRevision: state.revision,
-    scope: SCOPE,
-    at,
-  } as CommunityPluginLifecycleCommandV1);
-  if (reduced.status !== "applied") {
-    throw new Error(`lifecycle fixture blocked: ${reduced.reason}`);
-  }
-  return reduced.state;
-}
-
 function makeMemoryAdapter(initial: Record<string, ArrayBuffer | string>) {
   const binary = new Map<string, ArrayBuffer>();
   const text = new Map<string, string>();
@@ -282,23 +241,6 @@ function makeMemoryAdapter(initial: Record<string, ArrayBuffer | string>) {
           ? null
           : { size: new TextEncoder().encode(textValue).byteLength, mtime: 1 };
       }),
-    },
-  };
-}
-
-function makeVaultLocalStorage(): VaultLocalStorage & {
-  values: Map<string, unknown>;
-} {
-  const values = new Map<string, unknown>();
-  return {
-    values,
-    loadLocalStorage(key) {
-      const value = values.get(key);
-      return value === undefined ? null : structuredClone(value);
-    },
-    saveLocalStorage(key, value) {
-      if (value === null) values.delete(key);
-      else values.set(key, structuredClone(value));
     },
   };
 }
@@ -574,7 +516,6 @@ function makeExecutor(options: {
   shouldSyncFolderPath?: (path: string) => boolean;
   diag?: ConstructorParameters<typeof SyncExecutor>[6];
   progressStore?: SyncProgressStore;
-  lifecycleObserver?: ConstructorParameters<typeof SyncExecutor>[11];
 }): {
   executor: SyncExecutor;
   state: StateManager;
@@ -637,7 +578,6 @@ function makeExecutor(options: {
     undefined,
     undefined,
     undefined,
-    options.lifecycleObserver,
   );
   executor.setCommunityPluginSyncPolicy(options.policy ?? {
     version: 1,
@@ -648,1657 +588,6 @@ function makeExecutor(options: {
 }
 
 describe("community plugin enablement runtime", () => {
-  it("restores a sealed generation through the ordinary bundle and local-only ledger chain", async () => {
-    const mainPath = ".obsidian/plugins/calendar/main.js";
-    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
-    const mainContent = bytes("generation-main");
-    const manifestContent = bytes(PLUGIN_MANIFEST_TEXT);
-    const mainHash = await sha256Hex(mainContent);
-    const manifestHash = await sha256Hex(manifestContent);
-    const sourceRoot =
-      "community-plugin-content-v1/plugins/63616c656e646172/generations/1/objects";
-    const remoteMain = await remoteEntry(
-      `${sourceRoot}/${mainHash}.bin`,
-      mainContent,
-      {
-        driveId: "generation-main-id",
-        parentId: "generation-objects-parent",
-        eTag: "generation-main-etag",
-        cTag: "generation-main-ctag",
-      },
-    );
-    const remoteManifest = await remoteEntry(
-      `${sourceRoot}/${manifestHash}.bin`,
-      manifestContent,
-      {
-        driveId: "generation-manifest-id",
-        parentId: "generation-objects-parent",
-        eTag: "generation-manifest-etag",
-        cTag: "generation-manifest-ctag",
-      },
-    );
-    const generationRestore = {
-      schemaVersion: 1 as const,
-      pluginId: "calendar",
-      participant: {
-        participantId: "participant-a",
-        incarnation: "incarnation-a",
-      },
-      generation: 1,
-      joinNonce: "join-nonce-a",
-      controlRecordId: "lifecycle-control-id",
-      fenceEpoch: 4,
-      sealRevision: 9,
-      manifestObject: {
-        objectPath:
-          "community-plugin-content-v1/plugins/63616c656e646172/generations/1/manifests/"
-          + `${"d".repeat(64)}.json`,
-        remoteId: "bundle-manifest-id",
-        parentId: "generation-manifests-parent",
-        size: 100,
-        eTag: "bundle-manifest-etag",
-        cTag: "bundle-manifest-ctag",
-        sha256Hash: "d".repeat(64),
-      },
-    };
-    const participantKey = "participant-a::incarnation-a";
-    const publishedBundle = {
-      publicationRevision: 8,
-      publisher: { ...generationRestore.participant },
-      publisherJoinNonce: generationRestore.joinNonce,
-      publishedAt: 8,
-      publishedFenceEpoch: 3,
-      manifestObject: { ...generationRestore.manifestObject },
-    };
-    const lifecycleControl = {
-      schemaVersion: 2 as const,
-      kind: "community-plugin-lifecycle-control" as const,
-      scope: { ...SCOPE },
-      revision: 9,
-      fenceEpoch: generationRestore.fenceEpoch,
-      participantsByKey: {
-        [participantKey]: {
-          identity: { ...generationRestore.participant },
-          registeredAt: 1,
-          lastObservedAt: 9,
-          registeredFenceEpoch: 0,
-        },
-      },
-      pluginsById: {
-        calendar: {
-          pluginId: "calendar",
-          generationHighWatermark: 1,
-          currentGeneration: {
-            generation: 1,
-            phase: "open" as const,
-            openedAt: 2,
-            membersByKey: {
-              [participantKey]: {
-                identity: { ...generationRestore.participant },
-                phase: "joined" as const,
-                joinNonce: generationRestore.joinNonce,
-                joinEvidence: "user-confirmed" as const,
-                joinedAt: 3,
-                joinedFenceEpoch: 0,
-              },
-            },
-            publishedBundle,
-          },
-          closedTombstones: [],
-          legacyAuthoritySeal: {
-            generation: 1,
-            sealedBy: { ...generationRestore.participant },
-            sealedAt: 9,
-            sealedRevision: generationRestore.sealRevision,
-            sealedFenceEpoch: generationRestore.fenceEpoch,
-            consentRevision: 6,
-            publishedBundle,
-          },
-        },
-      },
-      legacyMigrationConsent: {
-        confirmedBy: { ...generationRestore.participant },
-        confirmedAt: 6,
-        confirmedRevision: 6,
-        confirmedFenceEpoch: 2,
-        evidence: "user-confirmed-legacy-devices-upgraded-or-retired" as const,
-      },
-    };
-    const generationProjection = {
-      schemaVersion: 1 as const,
-      capability: "restore-sealed-generation-bundle" as const,
-      scope: { ...SCOPE },
-      participant: { ...generationRestore.participant },
-      pluginId: "calendar",
-      generation: 1,
-      joinNonce: generationRestore.joinNonce,
-      controlRecordId: generationRestore.controlRecordId,
-      observedControlRevision: lifecycleControl.revision,
-      fenceEpoch: generationRestore.fenceEpoch,
-      sealRevision: generationRestore.sealRevision,
-      configDir: ".obsidian",
-      manifestObject: { ...generationRestore.manifestObject },
-      members: [
-        {
-          fileName: "main.js" as const,
-          targetPath: mainPath,
-          source: {
-            fileName: "main.js" as const,
-            objectPath: remoteMain.path,
-            remoteId: remoteMain.driveId,
-            parentId: remoteMain.parentId,
-            size: remoteMain.size,
-            eTag: remoteMain.eTag,
-            cTag: remoteMain.cTag!,
-            sha256Hash: mainHash,
-          },
-        },
-        {
-          fileName: "manifest.json" as const,
-          targetPath: manifestPath,
-          source: {
-            fileName: "manifest.json" as const,
-            objectPath: remoteManifest.path,
-            remoteId: remoteManifest.driveId,
-            parentId: remoteManifest.parentId,
-            size: remoteManifest.size,
-            eTag: remoteManifest.eTag,
-            cTag: remoteManifest.cTag!,
-            sha256Hash: manifestHash,
-          },
-        },
-      ],
-    };
-    const items: SyncPlanItem[] = [
-      {
-        type: SyncActionType.Download,
-        path: mainPath,
-        remote: remoteMain,
-        generationRestore: structuredClone(generationRestore),
-      },
-      {
-        type: SyncActionType.Download,
-        path: manifestPath,
-        remote: remoteManifest,
-        generationRestore: structuredClone(generationRestore),
-      },
-    ];
-    const contentById = new Map([
-      [remoteMain.driveId, mainContent],
-      [remoteManifest.driveId, manifestContent],
-    ]);
-    const sourceById = new Map([
-      [remoteMain.driveId, remoteMain],
-      [remoteManifest.driveId, remoteManifest],
-    ]);
-    const downloadFile = vi.fn(async (
-      _vaultName: string,
-      _path: string,
-      _downloadUrl: string | undefined,
-      driveId: string,
-    ) => contentById.get(driveId)?.slice(0) ?? new ArrayBuffer(0));
-    const getDriveItemMetadataById = vi.fn(async (driveId: string) => {
-      const source = sourceById.get(driveId);
-      return source
-        ? {
-            id: source.driveId,
-            name: source.path.slice(source.path.lastIndexOf("/") + 1),
-            size: source.size,
-            file: {},
-            eTag: source.eTag,
-            cTag: source.cTag,
-            parentReference: { id: source.parentId },
-          }
-        : null;
-    });
-    const memory = makeMemoryAdapter({});
-    const state = makeState([], []);
-    const { executor } = makeExecutor({
-      localEntries: [],
-      remoteEntries: [],
-      remoteContent: null,
-      adapter: memory.adapter,
-      state,
-      oneDrive: makeOneDrive(null, {
-        downloadFile,
-        getDriveItemMetadataById,
-        readCommunityPluginLifecycleV1ById: vi.fn().mockResolvedValue({
-          id: generationRestore.controlRecordId,
-          eTag: "lifecycle-etag",
-          content: JSON.stringify(lifecycleControl),
-        }),
-      }),
-    });
-    const result: SyncResult = {
-      success: true,
-      uploaded: 0,
-      downloaded: 0,
-      deleted: 0,
-      conflicts: 0,
-      deferred: 0,
-      skippedLarge: 0,
-      skippedIgnored: 0,
-      errors: 0,
-      authExpired: false,
-      message: "",
-    };
-    const automaticPolicy = {
-      autoDeleteLocalFiles: false,
-      mergeNonOverlappingText: true,
-    };
-    const automaticMetrics: AutomaticHandlingMetrics = {
-      policy: automaticPolicy,
-      deleteLocal: { candidates: 0, completed: 0, failed: 0 },
-      textMerge: {
-        candidates: 0,
-        completed: 0,
-        keptManual: 0,
-        failed: 0,
-        cancelled: 0,
-        manualReasons: {},
-      },
-      mergeRecovery: {
-        records: 0,
-        receiptCommitted: 0,
-        notApplied: 0,
-        remoteCommittedLocalRecovered: 0,
-        remoteCommittedLocalPending: 0,
-        unresolved: 0,
-      },
-      recoveryPendingAtEnd: { deleteLocal: 0, merge: 0 },
-    };
-    const internal = executor as unknown as {
-      activeSyncScope: typeof SCOPE;
-      lifecycle: { capture(): number };
-      executePlan(
-        plan: SyncPlan,
-        result: SyncResult,
-        callbacks: Record<string, never>,
-        epoch: number,
-        policy: typeof automaticPolicy,
-        metrics: AutomaticHandlingMetrics,
-        pluginPolicy: CommunityPluginSyncPolicyV1,
-        generationRestores: ReadonlyMap<string, typeof generationProjection>,
-      ): Promise<void>;
-    };
-    internal.activeSyncScope = SCOPE;
-    await internal.executePlan(
-      {
-        items,
-        lastTotalFiles: 0,
-        confirmed: true,
-        scope: SCOPE,
-      },
-      result,
-      {},
-      internal.lifecycle.capture(),
-      automaticPolicy,
-      automaticMetrics,
-      {
-        version: 1,
-        files: { mode: "selected", pluginIds: ["calendar"] },
-        data: { mode: "none", pluginIds: [] },
-      },
-      new Map([["calendar", generationProjection]]),
-    );
-
-    expect(result).toMatchObject({ downloaded: 2, errors: 0, deferred: 0 });
-    expect(new Uint8Array(memory.binary.get(mainPath)!)).toEqual(
-      new Uint8Array(mainContent),
-    );
-    expect(new Uint8Array(memory.binary.get(manifestPath)!)).toEqual(
-      new Uint8Array(manifestContent),
-    );
-    expect(downloadFile.mock.calls.map((call) => call[1])).toEqual([
-      remoteMain.path,
-      remoteManifest.path,
-    ]);
-    expect(getDriveItemMetadataById).toHaveBeenCalledTimes(4);
-    expect(state.beginMutationIntent).toHaveBeenCalledTimes(2);
-    expect(vi.mocked(state.beginMutationIntent).mock.calls.map(
-      ([intent]) => intent,
-    )).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        action: "download",
-        path: mainPath,
-        sourcePath: remoteMain.path,
-        stateEffect: "local-only",
-      }),
-      expect.objectContaining({
-        action: "download",
-        path: manifestPath,
-        sourcePath: remoteManifest.path,
-        stateEffect: "local-only",
-      }),
-    ]));
-    expect(state.mutationLedger).toEqual([]);
-    expect(state.baseSnapshot).toEqual([]);
-    expect(state.remoteSnapshot).toEqual([]);
-
-    const blockedMemory = makeMemoryAdapter({});
-    const blockedState = makeState([], []);
-    const { executor: blockedExecutor } = makeExecutor({
-      localEntries: [],
-      remoteEntries: [],
-      remoteContent: null,
-      adapter: blockedMemory.adapter,
-      state: blockedState,
-      oneDrive: makeOneDrive(null, {
-        downloadFile,
-        getDriveItemMetadataById: vi.fn(async (driveId: string) => {
-          const source = sourceById.get(driveId);
-          return source
-            ? {
-                id: source.driveId,
-                name: source.path.slice(source.path.lastIndexOf("/") + 1),
-                size: source.size,
-                file: {},
-                eTag: source.eTag,
-                cTag: driveId === remoteMain.driveId
-                  ? "generation-main-ctag-changed"
-                  : source.cTag,
-                parentReference: { id: source.parentId },
-              }
-            : null;
-        }),
-      }),
-    });
-    const blockedResult: SyncResult = {
-      success: true,
-      uploaded: 0,
-      downloaded: 0,
-      deleted: 0,
-      conflicts: 0,
-      deferred: 0,
-      skippedLarge: 0,
-      skippedIgnored: 0,
-      errors: 0,
-      authExpired: false,
-      message: "",
-    };
-    const blockedInternal = blockedExecutor as unknown as typeof internal;
-    blockedInternal.activeSyncScope = SCOPE;
-    await blockedInternal.executePlan(
-      {
-        items,
-        lastTotalFiles: 0,
-        confirmed: true,
-        scope: SCOPE,
-      },
-      blockedResult,
-      {},
-      blockedInternal.lifecycle.capture(),
-      automaticPolicy,
-      structuredClone(automaticMetrics),
-      {
-        version: 1,
-        files: { mode: "selected", pluginIds: ["calendar"] },
-        data: { mode: "none", pluginIds: [] },
-      },
-    );
-    expect(blockedResult).toMatchObject({ downloaded: 0, errors: 2 });
-    expect(blockedMemory.binary.size).toBe(0);
-    expect(blockedState.beginMutationIntent).not.toHaveBeenCalled();
-    expect(blockedState.mutationLedger).toEqual([]);
-    expect(blockedState.baseSnapshot).toEqual([]);
-    expect(blockedState.remoteSnapshot).toEqual([]);
-  });
-
-  it("resumes a second-device sealed-generation join without trusting changed legacy files", async () => {
-    const publisher: CommunityPluginParticipantIdentityV1 = {
-      participantId: "publisher-device",
-      incarnation: "publisher-incarnation",
-    };
-    const recipient: CommunityPluginParticipantIdentityV1 = {
-      participantId: "recipient-device",
-      incarnation: "recipient-incarnation",
-    };
-    let control = createCommunityPluginLifecycleControlV1(SCOPE);
-    control = applyLifecycleCommand(
-      control,
-      { type: "register-participant", participant: publisher },
-      "register-publisher",
-      10,
-    );
-    control = applyLifecycleCommand(control, {
-      type: "confirm-legacy-migration",
-      actor: publisher,
-      evidence: "user-confirmed-legacy-devices-upgraded-or-retired",
-    }, "confirm-legacy-migration", 11);
-    control = applyLifecycleCommand(control, {
-      type: "join-plugin",
-      participant: publisher,
-      pluginId: "calendar",
-      targetGeneration: 1,
-      joinNonce: "publisher-join-nonce",
-      joinEvidence: "host-install",
-    }, "join-publisher", 12);
-    const grant = createCommunityPluginGenerationContentGrantV1({
-      control,
-      scope: SCOPE,
-      participant: publisher,
-      pluginId: "calendar",
-    });
-    expect(grant.status).toBe("ready");
-    if (grant.status !== "ready") throw new Error("publisher grant missing");
-    const mainContent = bytes("sealed-main");
-    const pluginManifestContent = bytes(PLUGIN_MANIFEST_TEXT);
-    const mainHash = await sha256Hex(mainContent);
-    const pluginManifestHash = await sha256Hex(pluginManifestContent);
-    const memberReceipts = [
-      {
-        fileName: "main.js" as const,
-        objectPath: communityPluginGenerationObjectPathV1(grant.grant, mainHash),
-        remoteId: "sealed-main-id",
-        parentId: "sealed-object-parent",
-        size: mainContent.byteLength,
-        eTag: "sealed-main-etag",
-        cTag: "sealed-main-ctag",
-        sha256Hash: mainHash,
-      },
-      {
-        fileName: "manifest.json" as const,
-        objectPath: communityPluginGenerationObjectPathV1(
-          grant.grant,
-          pluginManifestHash,
-        ),
-        remoteId: "sealed-plugin-manifest-id",
-        parentId: "sealed-object-parent",
-        size: pluginManifestContent.byteLength,
-        eTag: "sealed-plugin-manifest-etag",
-        cTag: "sealed-plugin-manifest-ctag",
-        sha256Hash: pluginManifestHash,
-      },
-    ];
-    const canonicalManifest =
-      await prepareCommunityPluginGenerationBundleManifestV1(
-        grant.grant,
-        memberReceipts,
-      );
-    const manifestObject = {
-      objectPath: canonicalManifest.objectPath,
-      remoteId: "sealed-canonical-manifest-id",
-      parentId: "sealed-manifest-parent",
-      size: canonicalManifest.bytes.byteLength,
-      eTag: "sealed-canonical-manifest-etag",
-      cTag: "sealed-canonical-manifest-ctag",
-      sha256Hash: canonicalManifest.sha256Hash,
-    };
-    const publication = await createCommunityPluginBundlePublicationCommandV1({
-      grant: grant.grant,
-      control,
-      prepared: canonicalManifest,
-      manifestObject,
-      operationId: "publish-calendar-generation",
-      at: 13,
-    });
-    const published = reduceCommunityPluginLifecycleV1(control, publication);
-    expect(published.status).toBe("applied");
-    if (published.status !== "applied") throw new Error("publication failed");
-    control = published.state;
-    const publishedBundle = control.pluginsById.calendar.currentGeneration
-      ?.publishedBundle;
-    if (!publishedBundle) throw new Error("published bundle missing");
-    control = applyLifecycleCommand(control, {
-      type: "seal-plugin-legacy-authority",
-      actor: publisher,
-      pluginId: "calendar",
-      generation: 1,
-      publishedBundle,
-    }, "seal-calendar-generation", 14);
-    const sealedControl = structuredClone(control);
-    const observedControl = applyLifecycleCommand(
-      control,
-      { type: "register-participant", participant: recipient },
-      "register-recipient",
-      15,
-    );
-    const joinedControl = applyLifecycleCommand(observedControl, {
-      type: "join-plugin",
-      participant: recipient,
-      pluginId: "calendar",
-      targetGeneration: 1,
-      joinNonce: "join-calendar-1",
-      joinEvidence: "user-confirmed",
-    }, "join-recipient", 16);
-    const lifecycleObserver = {
-      observe: vi.fn().mockResolvedValue({
-        status: "ready",
-        source: "updated",
-        state: observedControl,
-        recordId: "lifecycle-record-id",
-        recordETag: "lifecycle-observed-etag",
-      }),
-      getParticipantIdentity: vi.fn().mockReturnValue(recipient),
-      joinPluginGeneration: vi.fn().mockResolvedValue({
-        status: "ready",
-        source: "updated",
-        state: joinedControl,
-        recordId: "lifecycle-record-id",
-        recordETag: "lifecycle-joined-etag",
-      }),
-    } as unknown as NonNullable<ConstructorParameters<typeof SyncExecutor>[11]>;
-    const mainPath = ".obsidian/plugins/calendar/main.js";
-    const pluginManifestPath = ".obsidian/plugins/calendar/manifest.json";
-    const legacyMain = await remoteEntry(mainPath, bytes("changed-legacy-main"), {
-      driveId: "legacy-main-id",
-    });
-    const legacyManifest = await remoteEntry(
-      pluginManifestPath,
-      pluginManifestContent,
-      { driveId: "legacy-manifest-id" },
-    );
-    const memberById = new Map(memberReceipts.map((receipt) => [
-      receipt.remoteId,
-      receipt,
-    ]));
-    const contentById = new Map([
-      [memberReceipts[0].remoteId, mainContent],
-      [memberReceipts[1].remoteId, pluginManifestContent],
-    ]);
-    const downloadFile = vi.fn(async (
-      _vaultName: string,
-      _path: string,
-      _downloadUrl: string | undefined,
-      driveId: string,
-    ) => contentById.get(driveId)?.slice(0) ?? new ArrayBuffer(0));
-    const getDriveItemMetadataById = vi.fn(async (driveId: string) => {
-      const source = memberById.get(driveId);
-      return source
-        ? {
-            id: source.remoteId,
-            name: source.objectPath.slice(source.objectPath.lastIndexOf("/") + 1),
-            size: source.size,
-            file: {},
-            eTag: source.eTag,
-            cTag: source.cTag,
-            parentReference: { id: source.parentId },
-          }
-        : null;
-    });
-    const memory = makeMemoryAdapter({});
-    const state = makeState([legacyMain, legacyManifest], []);
-    const oneDrive = makeOneDrive(null, {
-      readCommunityPluginLifecycleV1: vi.fn().mockResolvedValue({
-        id: "lifecycle-record-id",
-        eTag: "lifecycle-sealed-etag",
-        content: JSON.stringify(sealedControl),
-      }),
-      readCommunityPluginLifecycleV1ById: vi.fn().mockResolvedValue({
-        id: "lifecycle-record-id",
-        eTag: "lifecycle-joined-etag",
-        content: JSON.stringify(joinedControl),
-      }),
-      readCommunityPluginGenerationObjectV1ById: vi.fn()
-        .mockRejectedValueOnce(new OneDriveError(
-          OneDriveErrorType.NetworkError,
-          "offline after generation join",
-        ))
-        .mockResolvedValue({
-          id: manifestObject.remoteId,
-          name: manifestObject.objectPath.slice(
-            manifestObject.objectPath.lastIndexOf("/") + 1,
-          ),
-          parentId: manifestObject.parentId,
-          size: manifestObject.size,
-          eTag: manifestObject.eTag,
-          cTag: manifestObject.cTag,
-          content: canonicalManifest.bytes,
-        }),
-      getDelta: vi.fn().mockResolvedValue({
-        value: completeRemoteItems([legacyMain, legacyManifest]),
-        "@odata.deltaLink": "delta-token-next",
-      }),
-      downloadFile,
-      getDriveItemMetadataById,
-      uploadFile: vi.fn(),
-      deleteItem: vi.fn(),
-    });
-    const { executor } = makeExecutor({
-      localEntries: [],
-      remoteEntries: [legacyMain, legacyManifest],
-      remoteContent: null,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-      lifecycleObserver,
-    });
-
-    const authorization = joinAuthorization([legacyMain, legacyManifest]);
-    expect(validateCommunityPluginJoinAuthorization(
-      authorization,
-      [legacyMain, legacyManifest],
-      SCOPE,
-    )).toEqual({ status: "valid" });
-    const interrupted = await executor.run("manual", {}, false, undefined, {
-      communityPluginJoinAuthorizations: [authorization],
-    });
-
-    expect(interrupted).toMatchObject({
-      downloaded: 0,
-      deferred: 1,
-      errors: 0,
-      communityPluginJoinBlocks: [{
-        pluginId: "calendar",
-        operationId: "join-calendar-1",
-        reason: "catalog-unavailable",
-      }],
-    });
-    expect(lifecycleObserver.joinPluginGeneration).toHaveBeenCalledTimes(1);
-    expect(memory.binary.size).toBe(0);
-    expect(state.beginMutationIntent).not.toHaveBeenCalled();
-
-    const resumedLifecycleObserver = {
-      observe: vi.fn().mockResolvedValue({
-        status: "ready",
-        source: "updated",
-        state: joinedControl,
-        recordId: "lifecycle-record-id",
-        recordETag: "lifecycle-joined-etag",
-      }),
-      getParticipantIdentity: vi.fn().mockReturnValue(recipient),
-      joinPluginGeneration: vi.fn(),
-    } as unknown as NonNullable<ConstructorParameters<typeof SyncExecutor>[11]>;
-    const resumed = makeExecutor({
-      localEntries: [],
-      remoteEntries: [legacyMain, legacyManifest],
-      remoteContent: null,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-      lifecycleObserver: resumedLifecycleObserver,
-    });
-    const result = await resumed.executor.run("manual", {}, false, undefined, {
-      communityPluginJoinAuthorizations: [authorization],
-    });
-
-    expect(result).toMatchObject({
-      success: true,
-      downloaded: 2,
-      deferred: 0,
-      errors: 0,
-      communityPluginRestoresCompleted: { files: ["calendar"], data: [] },
-      communityPluginRestoreGenerationByPluginId: { calendar: 1 },
-    });
-    expect(lifecycleObserver.observe).toHaveBeenCalledTimes(1);
-    expect(lifecycleObserver.joinPluginGeneration).toHaveBeenCalledTimes(1);
-    expect(resumedLifecycleObserver.observe).toHaveBeenCalledTimes(1);
-    expect(resumedLifecycleObserver.joinPluginGeneration).not.toHaveBeenCalled();
-    expect(oneDrive.readCommunityPluginLifecycleV1ById).toHaveBeenCalledWith(
-      "lifecycle-record-id",
-    );
-    expect(downloadFile.mock.calls.map((call) => call[1])).toEqual(
-      expect.arrayContaining(memberReceipts.map((item) => item.objectPath)),
-    );
-    expect(downloadFile.mock.calls.map((call) => call[3])).not.toContain(
-      "legacy-main-id",
-    );
-    expect(memory.binary.has(mainPath)).toBe(true);
-    expect(memory.binary.has(pluginManifestPath)).toBe(true);
-    expect(new Uint8Array(memory.binary.get(mainPath)!)).toEqual(
-      new Uint8Array(mainContent),
-    );
-    expect(state.baseSnapshot).toEqual([]);
-    expect(state.remoteSnapshot).toEqual([legacyMain, legacyManifest]);
-    expect(vi.mocked(oneDrive.uploadFile)).not.toHaveBeenCalled();
-    expect(vi.mocked(oneDrive.deleteItem)).not.toHaveBeenCalled();
-
-    const offlineEdit = bytes("local-offline-edit");
-    await memory.adapter.writeBinary(mainPath, offlineEdit);
-    downloadFile.mockClear();
-    const blocked = await resumed.executor.run("manual", {}, false, undefined, {
-      communityPluginJoinAuthorizations: [authorization],
-    });
-    expect(blocked).toMatchObject({ downloaded: 0, errors: 2 });
-    expect(new Uint8Array(memory.binary.get(mainPath)!)).toEqual(
-      new Uint8Array(offlineEdit),
-    );
-    expect(new Uint8Array(memory.binary.get(pluginManifestPath)!)).toEqual(
-      new Uint8Array(pluginManifestContent),
-    );
-    expect(state.beginMutationIntent).toHaveBeenCalledTimes(2);
-
-    state.getCommunityPluginParticipation = vi.fn().mockReturnValue({
-      schemaVersion: 1,
-      kind: "device-community-plugin-participation",
-      scopeEnabled: true,
-      pluginsById: {
-        calendar: {
-          pluginId: "calendar",
-          phase: "participating",
-          joinedGeneration: 1,
-        },
-      },
-    });
-    downloadFile.mockClear();
-    vi.mocked(oneDrive.uploadFile).mockClear();
-    const restoredRemoteMain = await remoteEntry(mainPath, mainContent, {
-      driveId: "restored-fixed-main-id",
-    });
-    const restoredRemoteManifest = await remoteEntry(
-      pluginManifestPath,
-      pluginManifestContent,
-      { driveId: "restored-fixed-manifest-id" },
-    );
-    state.baseSnapshot = [
-      sharedBaseEntry(
-        await localEntry(mainPath, mainContent),
-        restoredRemoteMain,
-      ),
-      sharedBaseEntry(
-        await localEntry(pluginManifestPath, pluginManifestContent),
-        restoredRemoteManifest,
-      ),
-    ];
-    state.remoteSnapshot = [restoredRemoteMain, restoredRemoteManifest];
-    const ordinaryMain = bytes("post-restore-local-edit");
-    const ordinaryManifest = pluginManifestContent;
-    const ordinaryState = makeState(
-      [restoredRemoteMain, restoredRemoteManifest],
-      [
-        sharedBaseEntry(
-          await localEntry(mainPath, mainContent),
-          restoredRemoteMain,
-        ),
-        sharedBaseEntry(
-          await localEntry(pluginManifestPath, ordinaryManifest),
-          restoredRemoteManifest,
-        ),
-      ],
-      {
-        getCommunityPluginParticipation: vi.fn().mockReturnValue({
-          schemaVersion: 1,
-          kind: "device-community-plugin-participation",
-          scopeEnabled: true,
-          pluginsById: {
-            calendar: {
-              pluginId: "calendar",
-              phase: "participating",
-              joinedGeneration: 1,
-            },
-          },
-        }),
-      },
-    );
-    const ordinaryMemory = makeMemoryAdapter({
-      [mainPath]: ordinaryMain,
-      [pluginManifestPath]: PLUGIN_MANIFEST_TEXT,
-    });
-    const ordinaryUpload = vi.fn().mockResolvedValue({
-      id: restoredRemoteMain.driveId,
-      eTag: "ordinary-post-restore-etag",
-      size: ordinaryMain.byteLength,
-      parentReference: { id: restoredRemoteMain.parentId },
-    });
-    const ordinaryRemoteDownload = vi.fn(async (
-      _vaultName: string,
-      path: string,
-    ) => path === pluginManifestPath
-      ? pluginManifestContent.slice(0)
-      : new ArrayBuffer(0));
-    const { executor: ordinaryExecutor } = makeExecutor({
-      localEntries: [
-        await localEntry(mainPath, ordinaryMain),
-        await localEntry(pluginManifestPath, ordinaryManifest),
-      ],
-      remoteEntries: [restoredRemoteMain, restoredRemoteManifest],
-      remoteContent: null,
-      adapter: ordinaryMemory.adapter,
-      state: ordinaryState,
-      oneDrive: makeOneDrive(null, {
-        uploadFile: ordinaryUpload,
-        downloadFile: ordinaryRemoteDownload,
-      }),
-    });
-    ordinaryMemory.binary.set(pluginManifestPath, pluginManifestContent.slice(0));
-    const stable = await ordinaryExecutor.run("manual", {}, false);
-    expect(stable).toMatchObject({
-      success: true,
-      uploaded: 1,
-      downloaded: 0,
-      errors: 0,
-    });
-    expect(ordinaryRemoteDownload).toHaveBeenCalledWith(
-      "testVault",
-      pluginManifestPath,
-      restoredRemoteManifest.downloadUrl,
-      restoredRemoteManifest.driveId,
-      restoredRemoteManifest.size,
-    );
-    expect(ordinaryUpload).toHaveBeenCalled();
-    expect(new Uint8Array(ordinaryMemory.binary.get(mainPath)!)).toEqual(
-      new Uint8Array(ordinaryMain),
-    );
-  });
-
-  it("migrates a confirmed local legacy bundle and removes its fixed-path upload", async () => {
-    const participant: CommunityPluginParticipantIdentityV1 = {
-      participantId: "source-device",
-      incarnation: "source-incarnation",
-    };
-    let initial = createCommunityPluginLifecycleControlV1(SCOPE);
-    initial = applyLifecycleCommand(
-      initial,
-      { type: "register-participant", participant },
-      "register-source",
-      10,
-    );
-    initial = applyLifecycleCommand(initial, {
-      type: "confirm-legacy-migration",
-      actor: participant,
-      evidence: "user-confirmed-legacy-devices-upgraded-or-retired",
-    }, "confirm-legacy", 11);
-    const joined = applyLifecycleCommand(initial, {
-      type: "join-plugin",
-      participant,
-      pluginId: "calendar",
-      targetGeneration: 1,
-      joinNonce: "source-join-nonce",
-      joinEvidence: "user-confirmed",
-    }, "join-source", 12);
-    const grant = createCommunityPluginGenerationContentGrantV1({
-      control: joined,
-      scope: SCOPE,
-      participant,
-      pluginId: "calendar",
-    });
-    if (grant.status !== "ready") throw new Error("source grant missing");
-    const mainContent = bytes("local-main");
-    const manifestContent = bytes(PLUGIN_MANIFEST_TEXT);
-    const mainHash = await sha256Hex(mainContent);
-    const manifestHash = await sha256Hex(manifestContent);
-    const receipts = [
-      {
-        fileName: "main.js" as const,
-        objectPath: communityPluginGenerationObjectPathV1(grant.grant, mainHash),
-        remoteId: "source-main-id",
-        parentId: "source-objects-parent",
-        size: mainContent.byteLength,
-        eTag: "source-main-etag",
-        cTag: "source-main-ctag",
-        sha256Hash: mainHash,
-      },
-      {
-        fileName: "manifest.json" as const,
-        objectPath: communityPluginGenerationObjectPathV1(
-          grant.grant,
-          manifestHash,
-        ),
-        remoteId: "source-manifest-id",
-        parentId: "source-objects-parent",
-        size: manifestContent.byteLength,
-        eTag: "source-manifest-etag",
-        cTag: "source-manifest-ctag",
-        sha256Hash: manifestHash,
-      },
-    ];
-    const canonical = await prepareCommunityPluginGenerationBundleManifestV1(
-      grant.grant,
-      receipts,
-    );
-    const manifestObject = {
-      objectPath: canonical.objectPath,
-      remoteId: "source-canonical-manifest-id",
-      parentId: "source-manifests-parent",
-      size: canonical.bytes.byteLength,
-      eTag: "source-canonical-etag",
-      cTag: "source-canonical-ctag",
-      sha256Hash: canonical.sha256Hash,
-    };
-    const publication = await createCommunityPluginBundlePublicationCommandV1({
-      grant: grant.grant,
-      control: joined,
-      prepared: canonical,
-      manifestObject,
-      operationId: "publish-source-bundle",
-      at: 13,
-    });
-    const published = reduceCommunityPluginLifecycleV1(joined, publication);
-    if (published.status !== "applied") throw new Error("source publication failed");
-    const publishedBundle = published.state.pluginsById.calendar
-      .currentGeneration?.publishedBundle;
-    if (!publishedBundle) throw new Error("source publication missing");
-    const sealed = applyLifecycleCommand(published.state, {
-      type: "seal-plugin-legacy-authority",
-      actor: participant,
-      pluginId: "calendar",
-      generation: 1,
-      publishedBundle,
-    }, "seal-source", 14);
-    const lifecycleObserver = {
-      observe: vi.fn().mockResolvedValue({
-        status: "ready",
-        source: "existing",
-        state: initial,
-        recordId: "lifecycle-record-id",
-        recordETag: "lifecycle-initial-etag",
-      }),
-      getParticipantIdentity: vi.fn().mockReturnValue(participant),
-      joinPluginGeneration: vi.fn().mockResolvedValue({
-        status: "ready",
-        source: "updated",
-        state: joined,
-        recordId: "lifecycle-record-id",
-        recordETag: "lifecycle-joined-etag",
-      }),
-      migratePluginLegacyBundle: vi.fn().mockImplementation(async (
-        _lifecycleTransport,
-        _contentTransport,
-        input: { revalidateSource?: () => Promise<boolean> },
-      ) => input.revalidateSource && await input.revalidateSource()
-        ? { status: "ready", state: sealed }
-        : { status: "blocked", phase: "seal", reason: "source-changed" }),
-    } as unknown as NonNullable<ConstructorParameters<typeof SyncExecutor>[11]>;
-    const mainPath = ".obsidian/plugins/calendar/main.js";
-    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
-    const localEntries = [
-      await localEntry(mainPath, mainContent),
-      await localEntry(manifestPath, manifestContent),
-    ];
-    const memory = makeMemoryAdapter({
-      [mainPath]: mainContent,
-      [manifestPath]: PLUGIN_MANIFEST_TEXT,
-    });
-    memory.binary.set(manifestPath, manifestContent.slice(0));
-    const participation = {
-      schemaVersion: 1 as const,
-      kind: "device-community-plugin-participation" as const,
-      scopeEnabled: true,
-      pluginsById: {
-        calendar: { pluginId: "calendar", phase: "participating" as const },
-      },
-    };
-    const state = makeState([], [], {
-      getCommunityPluginParticipation: vi.fn(() => structuredClone(participation)),
-    });
-    const uploadFile = vi.fn(async (
-      _vaultName: string,
-      path: string,
-      content: ArrayBuffer,
-    ) => ({
-      id: `ordinary-calendar-${path.split("/").at(-1)}-id`,
-      eTag: `ordinary-calendar-${path.split("/").at(-1)}-etag`,
-      size: content.byteLength,
-      parentReference: { id: "plugin-folder-id" },
-    }));
-    const oneDrive = makeOneDrive(null, {
-      readCommunityPluginLifecycleV1: vi.fn().mockResolvedValue({
-        id: "lifecycle-record-id",
-        eTag: "lifecycle-initial-etag",
-        content: JSON.stringify(initial),
-      }),
-      readCommunityPluginLifecycleV1ById: vi.fn().mockResolvedValue({
-        id: "lifecycle-record-id",
-        eTag: "lifecycle-sealed-etag",
-        content: JSON.stringify(sealed),
-      }),
-      uploadFile,
-    });
-    const { executor } = makeExecutor({
-      localEntries,
-      remoteEntries: [],
-      remoteContent: null,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-      lifecycleObserver,
-    });
-
-    const result = await executor.run("manual");
-    expect(result).toMatchObject({
-      success: true,
-      uploaded: 2,
-      downloaded: 0,
-      errors: 0,
-    });
-    expect(lifecycleObserver.joinPluginGeneration).not.toHaveBeenCalled();
-    expect(lifecycleObserver.migratePluginLegacyBundle).not.toHaveBeenCalled();
-    expect(uploadFile).toHaveBeenCalledTimes(2);
-  });
-
-  it("reopens a cleaned plugin in the next generation without reading the deleted legacy manifest", async () => {
-    const participant: CommunityPluginParticipantIdentityV1 = {
-      participantId: "reopen-device",
-      incarnation: "reopen-incarnation",
-    };
-    let control = createCommunityPluginLifecycleControlV1(SCOPE);
-    control = applyLifecycleCommand(
-      control,
-      { type: "register-participant", participant },
-      "register-reopen-device",
-      10,
-    );
-    control = applyLifecycleCommand(control, {
-      type: "confirm-legacy-migration",
-      actor: participant,
-      evidence: "user-confirmed-legacy-devices-upgraded-or-retired",
-    }, "confirm-reopen-legacy", 11);
-    control = applyLifecycleCommand(control, {
-      type: "join-plugin",
-      participant,
-      pluginId: "calendar",
-      targetGeneration: 1,
-      joinNonce: "reopen-generation-one",
-      joinEvidence: "user-confirmed",
-    }, "join-reopen-generation-one", 12);
-    const mainContent = bytes("reopened-local-main");
-    const manifestContent = bytes(PLUGIN_MANIFEST_TEXT);
-    const publishGeneration = async (
-      source: CommunityPluginLifecycleControlV1,
-      suffix: string,
-      at: number,
-    ) => {
-      const grant = createCommunityPluginGenerationContentGrantV1({
-        control: source,
-        scope: SCOPE,
-        participant,
-        pluginId: "calendar",
-      });
-      if (grant.status !== "ready") throw new Error("reopen grant missing");
-      const mainHash = await sha256Hex(mainContent);
-      const manifestHash = await sha256Hex(manifestContent);
-      const receipts = [
-        {
-          fileName: "main.js" as const,
-          objectPath: communityPluginGenerationObjectPathV1(grant.grant, mainHash),
-          remoteId: `${suffix}-main-id`,
-          parentId: `${suffix}-objects-parent`,
-          size: mainContent.byteLength,
-          eTag: `${suffix}-main-etag`,
-          cTag: `${suffix}-main-ctag`,
-          sha256Hash: mainHash,
-        },
-        {
-          fileName: "manifest.json" as const,
-          objectPath: communityPluginGenerationObjectPathV1(
-            grant.grant,
-            manifestHash,
-          ),
-          remoteId: `${suffix}-plugin-manifest-id`,
-          parentId: `${suffix}-objects-parent`,
-          size: manifestContent.byteLength,
-          eTag: `${suffix}-plugin-manifest-etag`,
-          cTag: `${suffix}-plugin-manifest-ctag`,
-          sha256Hash: manifestHash,
-        },
-      ];
-      const canonical = await prepareCommunityPluginGenerationBundleManifestV1(
-        grant.grant,
-        receipts,
-      );
-      const publication = await createCommunityPluginBundlePublicationCommandV1({
-        grant: grant.grant,
-        control: source,
-        prepared: canonical,
-        manifestObject: {
-          objectPath: canonical.objectPath,
-          remoteId: `${suffix}-canonical-manifest-id`,
-          parentId: `${suffix}-manifests-parent`,
-          size: canonical.bytes.byteLength,
-          eTag: `${suffix}-canonical-etag`,
-          cTag: `${suffix}-canonical-ctag`,
-          sha256Hash: canonical.sha256Hash,
-        },
-        operationId: `publish-${suffix}`,
-        at,
-      });
-      const published = reduceCommunityPluginLifecycleV1(source, publication);
-      if (published.status !== "applied") throw new Error("reopen publish failed");
-      return published.state;
-    };
-
-    control = await publishGeneration(control, "generation-one", 13);
-    const generationOneBundle = control.pluginsById.calendar
-      .currentGeneration?.publishedBundle;
-    if (!generationOneBundle) throw new Error("generation one bundle missing");
-    control = applyLifecycleCommand(control, {
-      type: "seal-plugin-legacy-authority",
-      actor: participant,
-      pluginId: "calendar",
-      generation: 1,
-      publishedBundle: generationOneBundle,
-    }, "seal-reopen-generation-one", 14);
-    control = applyLifecycleCommand(control, {
-      type: "exit-plugin",
-      participant,
-      pluginId: "calendar",
-      generation: 1,
-    }, "exit-reopen-generation-one", 15);
-    control = applyLifecycleCommand(control, {
-      type: "begin-close",
-      actor: participant,
-      pluginId: "calendar",
-      generation: 1,
-    }, "begin-close-reopen-generation-one", 16);
-    control = applyLifecycleCommand(control, {
-      type: "complete-close",
-      actor: participant,
-      pluginId: "calendar",
-      generation: 1,
-      cleanupReceiptDigest: "f".repeat(64),
-    }, "complete-close-reopen-generation-one", 17);
-    const closed = control;
-    const joined = applyLifecycleCommand(closed, {
-      type: "join-plugin",
-      participant,
-      pluginId: "calendar",
-      targetGeneration: 2,
-      joinNonce: "reopen-generation-two",
-      joinEvidence: "user-confirmed",
-      observedClosedRevision: closed.revision,
-    }, "join-reopen-generation-two", 18);
-    const republished = await publishGeneration(joined, "generation-two", 19);
-    expect(republished.pluginsById.calendar.legacyAuthoritySeal?.generation)
-      .toBe(1);
-    expect(republished.pluginsById.calendar.currentGeneration).toMatchObject({
-      generation: 2,
-      phase: "open",
-      publishedBundle: { publicationRevision: 1 },
-    });
-
-    const lifecycleObserver = {
-      observe: vi.fn().mockResolvedValue({
-        status: "ready",
-        source: "existing",
-        state: closed,
-        recordId: "reopen-lifecycle-record-id",
-        recordETag: "reopen-closed-etag",
-      }),
-      getParticipantIdentity: vi.fn().mockReturnValue(participant),
-      joinPluginGeneration: vi.fn().mockResolvedValue({
-        status: "ready",
-        source: "updated",
-        state: joined,
-        recordId: "reopen-lifecycle-record-id",
-        recordETag: "reopen-joined-etag",
-      }),
-      migratePluginLegacyBundle: vi.fn().mockResolvedValue({
-        status: "ready",
-        state: republished,
-      }),
-    } as unknown as NonNullable<ConstructorParameters<typeof SyncExecutor>[11]>;
-    const mainPath = ".obsidian/plugins/calendar/main.js";
-    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
-    const localEntries = [
-      await localEntry(mainPath, mainContent),
-      await localEntry(manifestPath, manifestContent),
-    ];
-    const memory = makeMemoryAdapter({
-      [mainPath]: mainContent,
-      [manifestPath]: PLUGIN_MANIFEST_TEXT,
-    });
-    memory.binary.set(manifestPath, manifestContent.slice(0));
-    const state = makeState([], [], {
-      getCommunityPluginParticipation: vi.fn(() => ({
-        schemaVersion: 1 as const,
-        kind: "device-community-plugin-participation" as const,
-        scopeEnabled: true,
-        pluginsById: {
-          calendar: { pluginId: "calendar", phase: "participating" as const },
-        },
-      })),
-    });
-    const readGenerationObject = vi.fn().mockRejectedValue(
-      new Error("the deleted generation-one manifest must not be read"),
-    );
-    const uploadFile = vi.fn(async (
-      _vaultName: string,
-      path: string,
-      content: ArrayBuffer,
-    ) => ({
-      id: `ordinary-calendar-${path.split("/").at(-1)}-id`,
-      eTag: `ordinary-calendar-${path.split("/").at(-1)}-etag`,
-      size: content.byteLength,
-      parentReference: { id: "plugin-folder-id" },
-    }));
-    const oneDrive = makeOneDrive(null, {
-      readCommunityPluginLifecycleV1: vi.fn().mockResolvedValue({
-        id: "reopen-lifecycle-record-id",
-        eTag: "reopen-closed-etag",
-        content: JSON.stringify(closed),
-      }),
-      readCommunityPluginLifecycleV1ById: vi.fn().mockResolvedValue({
-        id: "reopen-lifecycle-record-id",
-        eTag: "reopen-published-etag",
-        content: JSON.stringify(republished),
-      }),
-      readCommunityPluginGenerationObjectV1ById: readGenerationObject,
-      uploadFile,
-    });
-    const { executor } = makeExecutor({
-      localEntries,
-      remoteEntries: [],
-      remoteContent: null,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-      lifecycleObserver,
-    });
-
-    const result = await executor.run("manual");
-
-    expect(result).toMatchObject({
-      success: true,
-      uploaded: 2,
-      downloaded: 0,
-      errors: 0,
-    });
-    expect(lifecycleObserver.joinPluginGeneration).not.toHaveBeenCalled();
-    expect(lifecycleObserver.migratePluginLegacyBundle).not.toHaveBeenCalled();
-    expect(readGenerationObject).not.toHaveBeenCalled();
-    expect(uploadFile).toHaveBeenCalledTimes(2);
-  });
-
-  it("keeps an exited generation open and untouched during ordinary sync", async () => {
-    const storage = makeVaultLocalStorage();
-    const vaultInstanceId = "d".repeat(32);
-    const identity = loadOrCreateCommunityPluginLifecycleDeviceIdentityV1(
-      storage,
-      vaultInstanceId,
-      10,
-    )!;
-    const participant = identity.participant;
-    let lifecycleState = createCommunityPluginLifecycleControlV1(SCOPE);
-    lifecycleState = applyLifecycleCommand(
-      lifecycleState,
-      { type: "register-participant", participant },
-      "register-cleanup-device",
-      10,
-    );
-    lifecycleState = applyLifecycleCommand(lifecycleState, {
-      type: "confirm-legacy-migration",
-      actor: participant,
-      evidence: "user-confirmed-legacy-devices-upgraded-or-retired",
-    }, "confirm-cleanup-legacy", 11);
-    lifecycleState = applyLifecycleCommand(lifecycleState, {
-      type: "join-plugin",
-      participant,
-      pluginId: "calendar",
-      targetGeneration: 1,
-      joinNonce: "cleanup-join",
-      joinEvidence: "user-confirmed",
-    }, "join-cleanup-device", 12);
-    const grant = createCommunityPluginGenerationContentGrantV1({
-      control: lifecycleState,
-      scope: SCOPE,
-      participant,
-      pluginId: "calendar",
-    });
-    if (grant.status !== "ready") throw new Error("cleanup grant missing");
-    const mainContent = bytes("cleanup-main");
-    const manifestContent = bytes(PLUGIN_MANIFEST_TEXT);
-    const mainHash = await sha256Hex(mainContent);
-    const manifestHash = await sha256Hex(manifestContent);
-    const members = [
-      {
-        fileName: "main.js" as const,
-        objectPath: communityPluginGenerationObjectPathV1(grant.grant, mainHash),
-        remoteId: "cleanup-main-id",
-        parentId: "cleanup-objects-parent",
-        size: mainContent.byteLength,
-        eTag: "cleanup-main-etag",
-        cTag: "cleanup-main-ctag",
-        sha256Hash: mainHash,
-      },
-      {
-        fileName: "manifest.json" as const,
-        objectPath: communityPluginGenerationObjectPathV1(
-          grant.grant,
-          manifestHash,
-        ),
-        remoteId: "cleanup-plugin-manifest-id",
-        parentId: "cleanup-objects-parent",
-        size: manifestContent.byteLength,
-        eTag: "cleanup-plugin-manifest-etag",
-        cTag: "cleanup-plugin-manifest-ctag",
-        sha256Hash: manifestHash,
-      },
-    ];
-    const canonical = await prepareCommunityPluginGenerationBundleManifestV1(
-      grant.grant,
-      members,
-    );
-    const manifestObject = {
-      objectPath: canonical.objectPath,
-      remoteId: "cleanup-canonical-manifest-id",
-      parentId: "cleanup-manifests-parent",
-      size: canonical.bytes.byteLength,
-      eTag: "cleanup-canonical-etag",
-      cTag: "cleanup-canonical-ctag",
-      sha256Hash: canonical.sha256Hash,
-    };
-    const publication = await createCommunityPluginBundlePublicationCommandV1({
-      grant: grant.grant,
-      control: lifecycleState,
-      prepared: canonical,
-      manifestObject,
-      operationId: "publish-cleanup-bundle",
-      at: 13,
-    });
-    const published = reduceCommunityPluginLifecycleV1(
-      lifecycleState,
-      publication,
-    );
-    if (published.status !== "applied") throw new Error("cleanup publish failed");
-    const publishedBundle = published.state.pluginsById.calendar
-      .currentGeneration?.publishedBundle;
-    if (!publishedBundle) throw new Error("cleanup publication missing");
-    lifecycleState = applyLifecycleCommand(published.state, {
-      type: "seal-plugin-legacy-authority",
-      actor: participant,
-      pluginId: "calendar",
-      generation: 1,
-      publishedBundle,
-    }, "seal-cleanup-bundle", 14);
-
-    const generationObjects = new Map([
-      [members[0].remoteId, {
-        id: members[0].remoteId,
-        name: members[0].objectPath.split("/").at(-1)!,
-        parentId: members[0].parentId,
-        size: members[0].size,
-        eTag: members[0].eTag,
-        cTag: members[0].cTag,
-        content: mainContent,
-      }],
-      [members[1].remoteId, {
-        id: members[1].remoteId,
-        name: members[1].objectPath.split("/").at(-1)!,
-        parentId: members[1].parentId,
-        size: members[1].size,
-        eTag: members[1].eTag,
-        cTag: members[1].cTag,
-        content: manifestContent,
-      }],
-      [manifestObject.remoteId, {
-        id: manifestObject.remoteId,
-        name: manifestObject.objectPath.split("/").at(-1)!,
-        parentId: manifestObject.parentId,
-        size: manifestObject.size,
-        eTag: manifestObject.eTag,
-        cTag: manifestObject.cTag,
-        content: canonical.bytes,
-      }],
-    ]);
-    let lifecycleObject = {
-      id: "cleanup-lifecycle-id",
-      eTag: "cleanup-lifecycle-etag-0",
-      content: JSON.stringify(lifecycleState),
-    };
-    let lifecycleWrite = 0;
-    const updateLifecycle = vi.fn(async (
-      id: string,
-      eTag: string,
-      content: string,
-    ) => {
-      if (id !== lifecycleObject.id || eTag !== lifecycleObject.eTag) {
-        throw new Error("lifecycle CAS mismatch");
-      }
-      lifecycleWrite++;
-      lifecycleObject = {
-        id,
-        eTag: `cleanup-lifecycle-etag-${lifecycleWrite}`,
-        content,
-      };
-      return { id, eTag: lifecycleObject.eTag };
-    });
-    const initialEnablement = bytes('["calendar"]');
-    let remoteEnablement = initialEnablement.slice(0);
-    const localCommunity = await localEntry(COMMUNITY_PATH, initialEnablement);
-    const remoteCommunity = await remoteEntry(
-      COMMUNITY_PATH,
-      remoteEnablement,
-      {
-        driveId: "cleanup-enablement-id",
-        eTag: "cleanup-enablement-etag-0",
-      },
-    );
-    const memory = makeMemoryAdapter({ [COMMUNITY_PATH]: initialEnablement });
-    const deleteItem = vi.fn(async (
-      _vaultName: string,
-      _path: string,
-      eTag: string,
-      id: string,
-    ) => {
-      const object = generationObjects.get(id);
-      if (!object || object.eTag !== eTag) throw new Error("cleanup CAS mismatch");
-      generationObjects.delete(id);
-    });
-    const uploadFile = vi.fn(async (
-      _vaultName: string,
-      path: string,
-      content: ArrayBuffer,
-    ) => {
-      if (path !== COMMUNITY_PATH) throw new Error("unexpected upload");
-      remoteEnablement = content.slice(0);
-      remoteCommunity.size = content.byteLength;
-      remoteCommunity.sha256Hash = await sha256Hex(content);
-      remoteCommunity.eTag = "cleanup-enablement-etag-1";
-      return {
-        id: remoteCommunity.driveId,
-        eTag: remoteCommunity.eTag,
-        size: content.byteLength,
-        parentReference: { id: remoteCommunity.parentId },
-      };
-    });
-    const oneDrive = makeOneDrive(remoteEnablement, {
-      downloadFile: vi.fn(async (
-        _vaultName: string,
-        path: string,
-      ) => path === COMMUNITY_PATH
-        ? remoteEnablement.slice(0)
-        : new ArrayBuffer(0)),
-      uploadFile,
-      readCommunityPluginLifecycleV1: vi.fn(async () =>
-        structuredClone(lifecycleObject)),
-      readCommunityPluginLifecycleV1ById: vi.fn(async (id: string) => {
-        if (id !== lifecycleObject.id) throw new Error("lifecycle missing");
-        return structuredClone(lifecycleObject);
-      }),
-      updateCommunityPluginLifecycleV1: updateLifecycle,
-      readCommunityPluginGenerationObjectV1ById: vi.fn(async (id: string) => {
-        const object = generationObjects.get(id);
-        if (!object) throw new Error("generation object missing");
-        return structuredClone(object);
-      }),
-      getDriveItemMetadataById: vi.fn(async (id: string) => {
-        const object = generationObjects.get(id);
-        return object
-          ? {
-              id: object.id,
-              name: object.name,
-              size: object.size,
-              eTag: object.eTag,
-              cTag: object.cTag,
-              file: {},
-              parentReference: { id: object.parentId },
-            }
-          : null;
-      }),
-      deleteItem,
-    });
-    const participation = {
-      schemaVersion: 1 as const,
-      kind: "device-community-plugin-participation" as const,
-      scopeEnabled: false,
-      pluginsById: {
-        calendar: { pluginId: "calendar", phase: "excluded" as const },
-      },
-    };
-    const state = makeState(
-      [remoteCommunity],
-      [],
-      {
-        getCommunityPluginParticipation: vi.fn(() =>
-          structuredClone(participation)),
-        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-          version: 1,
-          scope: SCOPE,
-          anchors: { calendar: true },
-          pending: [],
-        }),
-      },
-      REMOTE_FOLDERS.slice(0, 2),
-    );
-    const lifecycleObserver = new CommunityPluginLifecycleDeviceObserverV1(
-      storage,
-      vaultInstanceId,
-    );
-    const { executor } = makeExecutor({
-      localEntries: [localCommunity],
-      remoteEntries: [remoteCommunity],
-      remoteContent: remoteEnablement,
-      adapter: memory.adapter,
-      state,
-      oneDrive,
-      lifecycleObserver,
-      policy: {
-        version: 1,
-        files: { mode: "none", pluginIds: [] },
-        data: { mode: "none", pluginIds: [] },
-      },
-      localFolders: REMOTE_FOLDERS.slice(0, 2).map((folder) => ({
-        path: folder.path,
-        mtime: 1,
-      })),
-      remoteFolders: REMOTE_FOLDERS.slice(0, 2),
-    });
-
-    await executor.run(
-      "manual",
-      {},
-      false,
-      undefined,
-      { readOnlyPreview: true },
-    );
-    expect(updateLifecycle).not.toHaveBeenCalled();
-    expect(uploadFile).not.toHaveBeenCalled();
-    expect(deleteItem).not.toHaveBeenCalled();
-    expect(JSON.parse(lifecycleObject.content).pluginsById.calendar
-      .currentGeneration.phase).toBe("open");
-
-    const prepared = await executor.run("manual");
-    expect(prepared).toMatchObject({ success: true, errors: 0 });
-    expect(JSON.parse(lifecycleObject.content).pluginsById.calendar
-      .currentGeneration.phase).toBe("open");
-    expect(deleteItem).not.toHaveBeenCalled();
-    expect(new TextDecoder().decode(memory.binary.get(COMMUNITY_PATH)!))
-      .toBe('["calendar"]');
-
-    const completed = await executor.run("manual");
-    expect(completed).toMatchObject({ success: true, errors: 0 });
-    expect(new TextDecoder().decode(memory.binary.get(COMMUNITY_PATH)!))
-      .toBe('["calendar"]');
-    expect(new TextDecoder().decode(remoteEnablement)).toBe('["calendar"]');
-    expect(deleteItem).not.toHaveBeenCalled();
-    expect(generationObjects.size).toBe(3);
-    expect(JSON.parse(lifecycleObject.content).pluginsById.calendar
-      .currentGeneration.phase).toBe("open");
-
-    localCommunity.size = 3;
-    localCommunity.hash = await sha256Hex(bytes("[]\n"));
-    uploadFile.mockClear();
-    deleteItem.mockClear();
-    const stable = await executor.run("manual");
-    expect(stable).toMatchObject({ success: true, errors: 0 });
-    expect(uploadFile).not.toHaveBeenCalled();
-    expect(deleteItem).not.toHaveBeenCalled();
-  });
-
-  it("keeps ordinary file transfer independent from retired lifecycle housekeeping", async () => {
-    const storage = makeVaultLocalStorage();
-    const vaultInstanceId = "e".repeat(32);
-    loadOrCreateCommunityPluginLifecycleDeviceIdentityV1(
-      storage,
-      vaultInstanceId,
-      10,
-    );
-    const enablement = bytes('["calendar"]');
-    const noteContent = bytes("ordinary-note");
-    const localCommunity = await localEntry(COMMUNITY_PATH, enablement);
-    const remoteCommunity = await remoteEntry(COMMUNITY_PATH, enablement);
-    const localNote = await localEntry("ordinary.md", noteContent);
-    const memory = makeMemoryAdapter({
-      [COMMUNITY_PATH]: enablement,
-      "ordinary.md": noteContent,
-    });
-    const uploadFile = vi.fn().mockResolvedValue({
-      id: "ordinary-note-id",
-      eTag: "ordinary-note-etag",
-      size: noteContent.byteLength,
-      parentReference: { id: SCOPE.filesRootId },
-    });
-    const readLifecycle = vi.fn().mockRejectedValue(
-      new Error("lifecycle temporarily unavailable"),
-    );
-    const state = makeState(
-      [remoteCommunity],
-      [],
-      {
-        getCommunityPluginParticipation: vi.fn(() => ({
-          schemaVersion: 1 as const,
-          kind: "device-community-plugin-participation" as const,
-          scopeEnabled: false,
-          pluginsById: {
-            calendar: { pluginId: "calendar", phase: "excluded" as const },
-          },
-        })),
-        getCommunityPluginEnablementState: vi.fn().mockReturnValue({
-          version: 1,
-          scope: SCOPE,
-          anchors: { calendar: true },
-          pending: [{
-            pluginId: "calendar",
-            localEnabled: true,
-            remoteEnabled: false,
-          }],
-        }),
-      },
-      REMOTE_FOLDERS.slice(0, 2),
-    );
-    const { executor } = makeExecutor({
-      localEntries: [localCommunity, localNote],
-      remoteEntries: [remoteCommunity],
-      remoteContent: enablement,
-      adapter: memory.adapter,
-      state,
-      oneDrive: makeOneDrive(enablement, {
-        uploadFile,
-        readCommunityPluginLifecycleV1: readLifecycle,
-      }),
-      lifecycleObserver: new CommunityPluginLifecycleDeviceObserverV1(
-        storage,
-        vaultInstanceId,
-      ),
-      policy: {
-        version: 1,
-        files: { mode: "none", pluginIds: [] },
-        data: { mode: "none", pluginIds: [] },
-      },
-      localFolders: REMOTE_FOLDERS.slice(0, 2).map((folder) => ({
-        path: folder.path,
-        mtime: 1,
-      })),
-      remoteFolders: REMOTE_FOLDERS.slice(0, 2),
-    });
-
-    const result = await executor.run("manual");
-
-    expect(result).toMatchObject({ success: true, uploaded: 1, errors: 0 });
-    expect(result.attention).toBeUndefined();
-    expect(result.message).not.toBe(
-      "result.communityPluginEnablementDecisionRequired",
-    );
-    expect(uploadFile).toHaveBeenCalledWith(
-      "testVault",
-      "ordinary.md",
-      noteContent,
-      undefined,
-      undefined,
-      undefined,
-    );
-    expect(readLifecycle).not.toHaveBeenCalled();
-  });
 
   it("keeps a device-excluded plugin in cloud without executor participation inference", async () => {
     const localEnablement = bytes("[]");
@@ -2329,12 +618,6 @@ describe("community plugin enablement runtime", () => {
     const memory = makeMemoryAdapter({ [COMMUNITY_PATH]: localEnablement });
     const deleteItem = vi.fn();
     const uploadFile = vi.fn();
-    const lifecycleObserver = {
-      observe: vi.fn(),
-      joinPluginGeneration: vi.fn(),
-      migratePluginLegacyBundle: vi.fn(),
-      sealPluginLegacyAuthority: vi.fn(),
-    } as unknown as NonNullable<ConstructorParameters<typeof SyncExecutor>[11]>;
     const state = makeState(
       [remoteCommunity, remoteMain, remoteManifest],
       baseEntries,
@@ -2361,7 +644,6 @@ describe("community plugin enablement runtime", () => {
           path: string,
         ) => path === COMMUNITY_PATH ? remoteEnablement : new ArrayBuffer(0)),
       }),
-      lifecycleObserver,
       policy: {
         version: 1,
         files: { mode: "selected", pluginIds: [] },
@@ -2384,10 +666,6 @@ describe("community plugin enablement runtime", () => {
       [],
       expect.any(Set),
     );
-    expect(lifecycleObserver.observe).not.toHaveBeenCalled();
-    expect(lifecycleObserver.joinPluginGeneration).not.toHaveBeenCalled();
-    expect(lifecycleObserver.migratePluginLegacyBundle).not.toHaveBeenCalled();
-    expect(lifecycleObserver.sealPluginLegacyAuthority).not.toHaveBeenCalled();
   });
 
   it("keeps an ordinary V2 upload for a participating generation plugin after local code changes", async () => {
@@ -2415,7 +693,6 @@ describe("community plugin enablement runtime", () => {
             calendar: {
               pluginId: "calendar",
               phase: "participating",
-              joinedGeneration: 1,
             },
           },
         }),
@@ -2431,12 +708,6 @@ describe("community plugin enablement runtime", () => {
       size: changedMain.byteLength,
       parentReference: { id: remoteMain.parentId },
     });
-    const lifecycleObserver = {
-      observe: vi.fn(),
-      joinPluginGeneration: vi.fn(),
-      migratePluginLegacyBundle: vi.fn(),
-      sealPluginLegacyAuthority: vi.fn(),
-    } as unknown as NonNullable<ConstructorParameters<typeof SyncExecutor>[11]>;
     const { executor } = makeExecutor({
       localEntries: [localMain, localManifest],
       remoteEntries: [remoteMain, remoteManifest],
@@ -2450,7 +721,6 @@ describe("community plugin enablement runtime", () => {
           path: string,
         ) => path === manifestPath ? manifest : new ArrayBuffer(0)),
       }),
-      lifecycleObserver,
       policy: {
         version: 1,
         files: { mode: "selected", pluginIds: ["calendar"] },
@@ -2471,10 +741,6 @@ describe("community plugin enablement runtime", () => {
       expect.anything(),
       expect.anything(),
     );
-    expect(lifecycleObserver.observe).not.toHaveBeenCalled();
-    expect(lifecycleObserver.joinPluginGeneration).not.toHaveBeenCalled();
-    expect(lifecycleObserver.migratePluginLegacyBundle).not.toHaveBeenCalled();
-    expect(lifecycleObserver.sealPluginLegacyAuthority).not.toHaveBeenCalled();
   });
 
   it("keeps an ordinary V2 download for a participating generation plugin after remote code changes", async () => {
@@ -2502,7 +768,6 @@ describe("community plugin enablement runtime", () => {
             calendar: {
               pluginId: "calendar",
               phase: "participating",
-              joinedGeneration: 1,
             },
           },
         }),
@@ -2573,7 +838,6 @@ describe("community plugin enablement runtime", () => {
             calendar: {
               pluginId: "calendar",
               phase: "participating",
-              joinedGeneration: 1,
             },
           },
         }),
@@ -5021,5 +3285,384 @@ describe("community plugin enablement runtime", () => {
       Platform.isMobile = previousMobile;
       Platform.isDesktop = previousDesktop;
     }
+  });
+
+  it("surfaces a same-directory manifest identity drift as identity-changed", async () => {
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const localManifestText = JSON.stringify({
+      id: "calendar",
+      version: "2.0.0",
+      minAppVersion: "1.5.0",
+    });
+    const remoteManifestBytes = bytes(JSON.stringify({
+      id: "calendar-ng",
+      version: "1.0.0",
+      minAppVersion: "1.5.0",
+    }));
+    const localManifest = await localEntry(
+      manifestPath,
+      bytes(localManifestText),
+    );
+    const localMain = await localEntry(mainPath, bytes("local-main"));
+    const remoteManifest = await remoteEntry(manifestPath, remoteManifestBytes);
+    const remoteMain = await remoteEntry(mainPath, bytes("remote-main"));
+    const memory = makeMemoryAdapter({
+      [manifestPath]: localManifestText,
+      [mainPath]: bytes("local-main"),
+    });
+    const state = makeState(
+      [remoteManifest, remoteMain],
+      [
+        {
+          path: manifestPath,
+          size: remoteManifest.size,
+          hash: remoteManifest.sha256Hash!,
+          eTag: remoteManifest.eTag,
+        },
+        {
+          path: mainPath,
+          size: remoteMain.size,
+          hash: remoteMain.sha256Hash!,
+          eTag: remoteMain.eTag,
+        },
+      ],
+    );
+    const downloadFile = vi.fn(async (_vaultName: string, path: string) =>
+      path === manifestPath ? remoteManifestBytes : bytes("remote-main"));
+    const diag = { error: vi.fn(), warn: vi.fn(), log: vi.fn() } as never;
+    const { executor } = makeExecutor({
+      localEntries: [localManifest, localMain],
+      remoteEntries: [remoteManifest, remoteMain],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, { downloadFile }),
+      diag,
+    });
+
+    const result = await executor.run("manual");
+
+    expect(result.errors).toBeGreaterThan(0);
+    expect(result.identityBlockedErrors).toBe(result.errors);
+    const logText = (diag.error as unknown as ReturnType<typeof vi.fn>)
+      .mock.calls
+      .map((call) => String(call[1]))
+      .join("\n");
+    expect(logText).toContain("identity changed within directory: calendar");
+    expect(logText).not.toContain("identity is ambiguous");
+  });
+
+  it("blocks every directory in a same-id collision and surfaces identity-ambiguous", async () => {
+    const manifestText = (id: string, version: string) => JSON.stringify({
+      id,
+      version,
+      minAppVersion: "1.5.0",
+    });
+    const calendarManifest = ".obsidian/plugins/calendar/manifest.json";
+    const calendarMain = ".obsidian/plugins/calendar/main.js";
+    const copyManifest = ".obsidian/plugins/calendar-copy/manifest.json";
+    const copyMain = ".obsidian/plugins/calendar-copy/main.js";
+    const localCalendarManifest = await localEntry(
+      calendarManifest,
+      bytes(manifestText("calendar", "2.0.0")),
+    );
+    const localCalendarMain = await localEntry(calendarMain, bytes("local-main"));
+    const localCopyManifest = await localEntry(
+      copyManifest,
+      bytes(manifestText("calendar", "2.0.0")),
+    );
+    const localCopyMain = await localEntry(copyMain, bytes("local-main"));
+    const remoteCalendarManifest = await remoteEntry(
+      calendarManifest,
+      bytes(manifestText("calendar", "1.0.0")),
+    );
+    const remoteCalendarMain = await remoteEntry(calendarMain, bytes("remote-main"));
+    const memory = makeMemoryAdapter({
+      [calendarManifest]: manifestText("calendar", "2.0.0"),
+      [calendarMain]: bytes("local-main"),
+      [copyManifest]: manifestText("calendar", "2.0.0"),
+      [copyMain]: bytes("local-main"),
+    });
+    const state = makeState(
+      [remoteCalendarManifest, remoteCalendarMain],
+      [
+        {
+          path: calendarManifest,
+          size: remoteCalendarManifest.size,
+          hash: remoteCalendarManifest.sha256Hash!,
+          eTag: remoteCalendarManifest.eTag,
+        },
+        {
+          path: calendarMain,
+          size: remoteCalendarMain.size,
+          hash: remoteCalendarMain.sha256Hash!,
+          eTag: remoteCalendarMain.eTag,
+        },
+      ],
+    );
+    const downloadFile = vi.fn(async (_vaultName: string, path: string) =>
+      path === calendarManifest
+        ? bytes(manifestText("calendar", "1.0.0"))
+        : bytes("remote-main"));
+    const diag = { error: vi.fn(), warn: vi.fn(), log: vi.fn() } as never;
+    const { executor } = makeExecutor({
+      localEntries: [
+        localCalendarManifest,
+        localCalendarMain,
+        localCopyManifest,
+        localCopyMain,
+      ],
+      remoteEntries: [remoteCalendarManifest, remoteCalendarMain],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, { downloadFile }),
+      diag,
+      policy: {
+        version: 1,
+        files: { mode: "selected", pluginIds: ["calendar", "calendar-copy"] },
+        data: { mode: "none", pluginIds: [] },
+      },
+    });
+
+    const result = await executor.run("manual");
+
+    expect(result.errors).toBeGreaterThan(0);
+    expect(result.identityBlockedErrors).toBe(result.errors);
+    const logText = (diag.error as unknown as ReturnType<typeof vi.fn>)
+      .mock.calls
+      .map((call) => String(call[1]))
+      .join("\n");
+    expect(logText).toContain("identity is ambiguous: calendar");
+    expect(logText).toContain("identity is ambiguous: calendar-copy");
+  });
+
+  it("surfaces an unreadable manifest as a parse block", async () => {
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const remoteManifestBytes = bytes(JSON.stringify({
+      id: "calendar",
+      version: "1.0.0",
+      minAppVersion: "1.5.0",
+    }));
+    const localMain = await localEntry(mainPath, bytes("local-main"));
+    const remoteManifest = await remoteEntry(manifestPath, remoteManifestBytes);
+    const remoteMain = await remoteEntry(mainPath, bytes("remote-main"));
+    const memory = makeMemoryAdapter({
+      [manifestPath]: "{ broken",
+      [mainPath]: bytes("local-main"),
+    });
+    const state = makeState(
+      [remoteManifest, remoteMain],
+      [
+        {
+          path: manifestPath,
+          size: remoteManifest.size,
+          hash: remoteManifest.sha256Hash!,
+          eTag: remoteManifest.eTag,
+        },
+        {
+          path: mainPath,
+          size: remoteMain.size,
+          hash: remoteMain.sha256Hash!,
+          eTag: remoteMain.eTag,
+        },
+      ],
+    );
+    const downloadFile = vi.fn(async (_vaultName: string, path: string) =>
+      path === manifestPath ? remoteManifestBytes : bytes("remote-main"));
+    const diag = { error: vi.fn(), warn: vi.fn(), log: vi.fn() } as never;
+    const { executor } = makeExecutor({
+      localEntries: [await localEntry(manifestPath, bytes("{ broken")), localMain],
+      remoteEntries: [remoteManifest, remoteMain],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, { downloadFile }),
+      diag,
+    });
+
+    const result = await executor.run("manual");
+
+    expect(result.errors).toBeGreaterThan(0);
+    expect(result.identityBlockedErrors).toBe(result.errors);
+    const logText = (diag.error as unknown as ReturnType<typeof vi.fn>)
+      .mock.calls
+      .map((call) => String(call[1]))
+      .join("\n");
+    expect(logText).toContain("manifest is unreadable: calendar");
+    expect(logText).not.toContain("identity is ambiguous");
+  });
+
+  it("[retirement contract] restores a sealed-generation plugin through ordinary V2 fixed paths with zero lifecycle I/O", async () => {
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const mainContent = bytes("changed-legacy-main");
+    const manifestContent = bytes(PLUGIN_MANIFEST_TEXT);
+    const legacyMain = await remoteEntry(mainPath, mainContent, {
+      driveId: "legacy-main-id",
+    });
+    const legacyManifest = await remoteEntry(manifestPath, manifestContent, {
+      driveId: "legacy-manifest-id",
+    });
+    const contentById = new Map<string, ArrayBuffer>([
+      ["legacy-main-id", mainContent],
+      ["legacy-manifest-id", manifestContent],
+    ]);
+    const readLifecycle = vi.fn().mockResolvedValue(null);
+    const readLifecycleById = vi.fn().mockResolvedValue(null);
+    const downloadFile = vi.fn(async (
+      _vaultName: string,
+      _path: string,
+      _downloadUrl: string | undefined,
+      driveId: string,
+    ) => contentById.get(driveId)?.slice(0) ?? new ArrayBuffer(0));
+    const getDriveItemMetadataById = vi.fn(async (driveId: string) => {
+      const source = [legacyMain, legacyManifest].find((entry) =>
+        entry.driveId === driveId
+      );
+      return source
+        ? {
+            id: source.driveId,
+            name: source.path.slice(source.path.lastIndexOf("/") + 1),
+            size: source.size,
+            file: {},
+            eTag: source.eTag,
+            cTag: source.cTag,
+            parentReference: { id: source.parentId },
+          }
+        : null;
+    });
+    const memory = makeMemoryAdapter({});
+    const state = makeState([legacyMain, legacyManifest], []);
+    const oneDrive = makeOneDrive(null, {
+      readCommunityPluginLifecycleV1: readLifecycle,
+      readCommunityPluginLifecycleV1ById: readLifecycleById,
+      getDelta: vi.fn().mockResolvedValue({
+        value: completeRemoteItems([legacyMain, legacyManifest]),
+        "@odata.deltaLink": "delta-token-next",
+      }),
+      downloadFile,
+      getDriveItemMetadataById,
+      uploadFile: vi.fn(),
+      deleteItem: vi.fn(),
+    });
+    const { executor } = makeExecutor({
+      localEntries: [],
+      remoteEntries: [legacyMain, legacyManifest],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive,
+    });
+
+    const authorization = joinAuthorization([legacyMain, legacyManifest]);
+    const result = await executor.run("manual", {}, false, undefined, {
+      communityPluginJoinAuthorizations: [authorization],
+    });
+
+    expect(result).toMatchObject({
+      success: true,
+      downloaded: 2,
+      deferred: 0,
+      errors: 0,
+    });
+    // 退役合同：云端即使残留封存代 control，恢复也只走普通 V2 固定路径，
+    // 不读 lifecycle control、不碰内容命名空间。
+    expect(readLifecycle).not.toHaveBeenCalled();
+    expect(readLifecycleById).not.toHaveBeenCalled();
+    expect(downloadFile.mock.calls.map((call) => call[3])).toEqual(
+      expect.arrayContaining(["legacy-main-id", "legacy-manifest-id"]),
+    );
+    expect(new Uint8Array(memory.binary.get(mainPath)!)).toEqual(
+      new Uint8Array(mainContent),
+    );
+    expect(new Uint8Array(memory.binary.get(manifestPath)!)).toEqual(
+      new Uint8Array(manifestContent),
+    );
+  });
+
+  it("[retirement guard] keeps ordinary participating plugin sync free of lifecycle I/O", async () => {
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const mainContent = bytes("fixed-main");
+    const manifestContent = bytes(PLUGIN_MANIFEST_TEXT);
+    const remoteMain = await remoteEntry(mainPath, mainContent, {
+      driveId: "fixed-main-id",
+    });
+    const remoteManifest = await remoteEntry(manifestPath, manifestContent, {
+      driveId: "fixed-manifest-id",
+    });
+    const contentById = new Map<string, ArrayBuffer>([
+      ["fixed-main-id", mainContent],
+      ["fixed-manifest-id", manifestContent],
+    ]);
+    const readLifecycle = vi.fn().mockResolvedValue(null);
+    const readLifecycleById = vi.fn().mockResolvedValue(null);
+    const memory = makeMemoryAdapter({});
+    const state = makeState([remoteMain, remoteManifest], [], {
+      getCommunityPluginParticipation: vi.fn().mockReturnValue({
+        schemaVersion: 1,
+        kind: "device-community-plugin-participation",
+        scopeEnabled: true,
+        pluginsById: {
+          calendar: {
+            pluginId: "calendar",
+            phase: "participating",
+          },
+        },
+      }),
+    });
+    const oneDrive = makeOneDrive(null, {
+      readCommunityPluginLifecycleV1: readLifecycle,
+      readCommunityPluginLifecycleV1ById: readLifecycleById,
+      getDelta: vi.fn().mockResolvedValue({
+        value: completeRemoteItems([remoteMain, remoteManifest]),
+        "@odata.deltaLink": "delta-token-next",
+      }),
+      downloadFile: vi.fn(async (
+        _vaultName: string,
+        _path: string,
+        _downloadUrl: string | undefined,
+        driveId: string,
+      ) => contentById.get(driveId)?.slice(0) ?? new ArrayBuffer(0)),
+      getDriveItemMetadataById: vi.fn(async (driveId: string) => {
+        const source = [remoteMain, remoteManifest].find((entry) =>
+          entry.driveId === driveId
+        );
+        return source
+          ? {
+              id: source.driveId,
+              name: source.path.slice(source.path.lastIndexOf("/") + 1),
+              size: source.size,
+              file: {},
+              eTag: source.eTag,
+              cTag: source.cTag,
+              parentReference: { id: source.parentId },
+            }
+          : null;
+      }),
+    });
+    const { executor } = makeExecutor({
+      localEntries: [],
+      remoteEntries: [remoteMain, remoteManifest],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive,
+    });
+
+    const result = await executor.run("manual", {}, false, undefined, {});
+
+    expect(result).toMatchObject({ success: true, downloaded: 2, errors: 0 });
+    expect(readLifecycle).not.toHaveBeenCalled();
+    expect(readLifecycleById).not.toHaveBeenCalled();
+    expect(new Uint8Array(memory.binary.get(mainPath)!)).toEqual(
+      new Uint8Array(mainContent),
+    );
+    expect(new Uint8Array(memory.binary.get(manifestPath)!)).toEqual(
+      new Uint8Array(manifestContent),
+    );
   });
 });

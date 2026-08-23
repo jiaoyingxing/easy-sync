@@ -156,35 +156,6 @@ export interface SyncPlanFolder {
   sourceParentRemoteId?: string;
 }
 
-/**
- * Immutable lifecycle facts that authorize one sealed-generation download.
- * The ordinary `remote` field retains the source object's exact Graph facts;
- * this binding proves which participant, generation and sealed manifest made
- * that source eligible for a local-only restore.
- */
-export interface CommunityPluginGenerationRestoreBindingV1 {
-  schemaVersion: 1;
-  pluginId: string;
-  participant: {
-    participantId: string;
-    incarnation: string;
-  };
-  generation: number;
-  joinNonce: string;
-  controlRecordId: string;
-  fenceEpoch: number;
-  sealRevision: number;
-  manifestObject: {
-    objectPath: string;
-    remoteId: string;
-    parentId: string;
-    size: number;
-    eTag: string;
-    cTag: string;
-    sha256Hash: string;
-  };
-}
-
 export interface SyncPlanItem {
   type: SyncActionType;
   /** Vault-relative file path */
@@ -208,8 +179,6 @@ export interface SyncPlanItem {
   requiresConfirmation?: boolean;
   /** Grouped identity action weight used by the existing bulk-change review gate. */
   reviewImpactCount?: number;
-  /** Present only for a sealed community-plugin generation local restore. */
-  generationRestore?: CommunityPluginGenerationRestoreBindingV1;
   /** Exact versions authorized by a user-facing pending decision. */
   decisionToken?: SyncDecisionToken;
   /**
@@ -795,26 +764,6 @@ export function planDigest(items: readonly SyncPlanItem[]): string {
       i.folder?.parentRemoteETag ?? "",
       i.requiresConfirmation ? "confirm" : "",
       i.reviewImpactCount ?? 1,
-      i.generationRestore
-        ? [
-            i.generationRestore.schemaVersion,
-            i.generationRestore.pluginId,
-            i.generationRestore.participant.participantId,
-            i.generationRestore.participant.incarnation,
-            i.generationRestore.generation,
-            i.generationRestore.joinNonce,
-            i.generationRestore.controlRecordId,
-            i.generationRestore.fenceEpoch,
-            i.generationRestore.sealRevision,
-            i.generationRestore.manifestObject.objectPath,
-            i.generationRestore.manifestObject.remoteId,
-            i.generationRestore.manifestObject.parentId,
-            i.generationRestore.manifestObject.size,
-            i.generationRestore.manifestObject.eTag,
-            i.generationRestore.manifestObject.cTag,
-            i.generationRestore.manifestObject.sha256Hash,
-          ].join(":")
-        : "",
     ].join("|"))
     .sort();
   return normalized.join("\n");

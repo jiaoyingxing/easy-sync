@@ -212,7 +212,7 @@ describe("sync view status copy and scrolling layout", () => {
     expect(zh.t("syncPlan.restoringDetails")).toBe("正在恢复计划明细");
     expect(zh.t("syncPlan.restoreDetails")).toBe("恢复计划明细");
     expect(zh.t("syncPlan.remoteScopeRecreateSummary"))
-      .toBe("原远端同步目录无法继续使用，需要重新创建后核对内容。");
+      .toBe("原云端同步目录无法继续使用，需要重新创建后核对内容。");
     expect(en.t("syncPlan.remoteScopeRecreateSummary"))
       .toContain("previous remote sync folder");
     expect(zh.t("result.sharedControlReadUnavailable"))
@@ -1664,7 +1664,7 @@ describe("buildSyncViewContentKey", () => {
       ],
     }, i18n.t.bind(i18n));
 
-    expect(counts).toBe("冲突 1 · 远端删除待确认 1");
+    expect(counts).toBe("冲突 1 · 云端删除待确认 1");
   });
 
   it("keeps plan confirmation in the fixed primary action and plan details lazy", () => {

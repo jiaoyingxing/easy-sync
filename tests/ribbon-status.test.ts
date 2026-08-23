@@ -83,9 +83,9 @@ describe("resolveRibbonStatus", () => {
     const t = i18n.t.bind(i18n);
 
     expect(resolveRibbonStatusLabel("syncing", progress({ phase: "scanning" }), t))
-      .toBe("扫描本地文件，打开同步状态");
+      .toBe("扫描本机文件，打开同步状态");
     expect(resolveRibbonStatusLabel("syncing", progress({ phase: "preparing" }), t))
-      .toBe("准备远端存储，打开同步状态");
+      .toBe("准备云端存储，打开同步状态");
     expect(RIBBON_STATUS_ICONS.syncing).toBe("refresh-cw");
   });
 
