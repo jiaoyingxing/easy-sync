@@ -4771,4 +4771,192 @@ describe("main sync entry guards", () => {
     expect(saveSyncSettings).toHaveBeenCalledOnce();
     expect(startAutoSync).not.toHaveBeenCalled();
   });
+
+  it("keeps a participating plugin out of the dedicated cloud cleanup", async () => {
+    const plugin = makePlugin();
+    attachParticipationState(plugin, participating());
+    const runCommunityPluginCloudCleanup = vi.fn();
+    plugin.syncExecutor = {
+      isRunning: false,
+      runCommunityPluginCloudCleanup,
+    } as never;
+    plugin.noticeCenter = {
+      show: vi.fn(),
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+
+    await expect(plugin.runCommunityPluginCloudCleanup("calendar"))
+      .resolves.toBe(false);
+    expect(runCommunityPluginCloudCleanup).not.toHaveBeenCalled();
+  });
+
+  it("lets a never-participated device run the dedicated cloud cleanup", async () => {
+    const plugin = makePlugin();
+    attachParticipationState(
+      plugin,
+      reduceDeviceCommunityPluginParticipation(
+        createEmptyDeviceCommunityPluginParticipation(true),
+        { type: "mark-never-participated", pluginId: "calendar" },
+      ),
+    );
+    const runCommunityPluginCloudCleanup = vi.fn().mockResolvedValue({
+      status: "completed",
+      deleted: 3,
+    });
+    plugin.syncExecutor = {
+      isRunning: false,
+      runCommunityPluginCloudCleanup,
+    } as never;
+    const show = vi.fn();
+    plugin.noticeCenter = {
+      show,
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue(null);
+    plugin.app.saveLocalStorage = vi.fn() as never;
+
+    await expect(plugin.runCommunityPluginCloudCleanup("calendar"))
+      .resolves.toBe(true);
+    expect(runCommunityPluginCloudCleanup).toHaveBeenCalledWith("calendar");
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "cloud-cleanup:done:calendar",
+    }));
+  });
+
+  it("exposes persisted cloud-cleanup markers for the settings UI", () => {
+    const plugin = makePlugin();
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue([
+      { pluginId: "calendar", cleanedAt: 123 },
+    ]);
+    plugin.app.saveLocalStorage = vi.fn() as never;
+    expect((plugin as never as {
+      getCommunityPluginCloudCleanupMarkers(): readonly {
+        pluginId: string;
+        cleanedAt: number;
+      }[];
+    }).getCommunityPluginCloudCleanupMarkers()).toEqual([
+      { pluginId: "calendar", cleanedAt: 123 },
+    ]);
+  });
+
+  it("cleans an exited plugin through the dedicated transaction and records a marker", async () => {
+    const plugin = makePlugin();
+    attachParticipationState(
+      plugin,
+      reduceDeviceCommunityPluginParticipation(
+        createEmptyDeviceCommunityPluginParticipation(true),
+        { type: "confirm-excluded", pluginId: "calendar" },
+      ),
+    );
+    const runCommunityPluginCloudCleanup = vi.fn().mockResolvedValue({
+      status: "completed",
+      deleted: 2,
+    });
+    plugin.syncExecutor = {
+      isRunning: false,
+      runCommunityPluginCloudCleanup,
+    } as never;
+    const show = vi.fn();
+    plugin.noticeCenter = {
+      show,
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue(null);
+    const saveLocalStorage = vi.fn();
+    plugin.app.saveLocalStorage = saveLocalStorage as never;
+
+    await expect(plugin.runCommunityPluginCloudCleanup("calendar"))
+      .resolves.toBe(true);
+    expect(runCommunityPluginCloudCleanup).toHaveBeenCalledWith("calendar");
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "cloud-cleanup:done:calendar",
+    }));
+    expect(saveLocalStorage).toHaveBeenCalledWith(
+      "easy-sync-community-plugin-cloud-cleanup-v1",
+      [{ pluginId: "calendar", cleanedAt: expect.any(Number) }],
+    );
+  });
+
+  it("notices once when a cleaned plugin reappears on the cloud", () => {
+    const plugin = makePlugin();
+    const state = {
+      isV2StateActive: true,
+      remoteSnapshot: [{
+        path: ".obsidian/plugins/calendar/main.js",
+        driveId: "main-id",
+        parentId: "parent",
+        size: 10,
+        mtime: 1,
+        eTag: "etag",
+      }],
+      getCommunityPluginParticipation: vi.fn().mockReturnValue(
+        reduceDeviceCommunityPluginParticipation(
+          createEmptyDeviceCommunityPluginParticipation(true),
+          { type: "confirm-excluded", pluginId: "calendar" },
+        ),
+      ),
+    };
+    plugin.state = state as never;
+    const show = vi.fn();
+    plugin.noticeCenter = {
+      show,
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue([
+      { pluginId: "calendar", cleanedAt: 123 },
+    ]);
+    const saveLocalStorage = vi.fn();
+    plugin.app.saveLocalStorage = saveLocalStorage as never;
+
+    (plugin as never as {
+      maybeNoticeCommunityPluginCloudResurrection(): void;
+    }).maybeNoticeCommunityPluginCloudResurrection();
+
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "cloud-cleanup:resurrected:calendar",
+    }));
+    expect(saveLocalStorage).toHaveBeenCalledWith(
+      "easy-sync-community-plugin-cloud-cleanup-v1",
+      [],
+    );
+  });
+
+  it("keeps the marker when the cleaned plugin stays absent", () => {
+    const plugin = makePlugin();
+    const state = {
+      isV2StateActive: true,
+      remoteSnapshot: [],
+      getCommunityPluginParticipation: vi.fn().mockReturnValue(
+        reduceDeviceCommunityPluginParticipation(
+          createEmptyDeviceCommunityPluginParticipation(true),
+          { type: "confirm-excluded", pluginId: "calendar" },
+        ),
+      ),
+    };
+    plugin.state = state as never;
+    const show = vi.fn();
+    plugin.noticeCenter = {
+      show,
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    const marker = { pluginId: "calendar", cleanedAt: 123 };
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue([marker]);
+    const saveLocalStorage = vi.fn();
+    plugin.app.saveLocalStorage = saveLocalStorage as never;
+
+    (plugin as never as {
+      maybeNoticeCommunityPluginCloudResurrection(): void;
+    }).maybeNoticeCommunityPluginCloudResurrection();
+
+    expect(show).not.toHaveBeenCalled();
+    expect(saveLocalStorage).toHaveBeenCalledWith(
+      "easy-sync-community-plugin-cloud-cleanup-v1",
+      [marker],
+    );
+  });
 });

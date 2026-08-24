@@ -1292,3 +1292,8 @@ body.is-mobile .easy-sync-device-actions button {
 .easy-sync-settings-tab .easy-sync-settings-group-host + .easy-sync-settings-group-host {
   margin-top: var(--size-4-6);
 }
+
+/* Dedicated cloud cleanup affordance (route A first slice). */
+.easy-sync-plugin-cloud-cleanup-trigger {
+  color: var(--text-error);
+}

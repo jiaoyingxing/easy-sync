@@ -281,6 +281,11 @@ import {
 } from "./community-plugin-bundle";
 import { presentKnownError } from "../i18n/error-presentation";
 import {
+  executeCommunityPluginCloudCleanupV1,
+  planCommunityPluginCloudCleanupV1,
+  type CommunityPluginCloudCleanupResultV1,
+} from "./community-plugin-cloud-cleanup-v1";
+import {
   validateCommunityPluginJoinAuthorization,
   type CommunityPluginJoinAuthorization,
   type CommunityPluginJoinBlock,
@@ -4233,6 +4238,113 @@ export class SyncExecutor {
     return `${tmpDir}/downloads/${filePath}.part`;
   }
 
+  /**
+   * Download the exact remote bytes and commit them over an already-present
+   * local target (A1 one-shot content alignment for a followed remote move).
+   * The caller has already proven the local side is unchanged and the remote
+   * matches the intent; `expectedLocal` feeds the same local CAS precondition
+   * the Download branch uses, so a user edit during the transfer fails closed
+   * instead of being overwritten. Throws on any failure; the caller keeps the
+   * mutation intent so a later recovery round can retry.
+   */
+  private async alignLocalTargetBytes(
+    path: string,
+    remote: RemoteFileEntry,
+    expectedLocal: LocalFileEntry,
+    onProgress?: (downloaded: number, total: number) => void,
+  ): Promise<{ hash: string; size: number }> {
+    const streamAdapter = this.getStreamDownloadAdapter(remote.size);
+    const tempDownloadPath = streamAdapter ? this.getDownloadTempPath(path) : null;
+    let downloaded: { size: number; hash: string } | null = null;
+    let content: ArrayBuffer | null = null;
+    try {
+      if (streamAdapter && tempDownloadPath) {
+        await this.ensureParentDirs(tempDownloadPath);
+        await this.removePathIfExists(tempDownloadPath);
+        downloaded = await this.onedrive.downloadFileToPath(
+          this.vaultName,
+          path,
+          tempDownloadPath,
+          streamAdapter,
+          remote.downloadUrl,
+          remote.driveId,
+          remote.size,
+          remote.sha256Hash,
+          onProgress,
+        );
+      } else {
+        content = await this.onedrive.downloadFile(
+          this.vaultName,
+          path,
+          remote.downloadUrl,
+          remote.driveId,
+          remote.size,
+          onProgress,
+        );
+        downloaded = {
+          size: content.byteLength,
+          hash: await sha256Hex(content),
+        };
+      }
+      await this.verifyDownloadedPayload(path, remote, downloaded);
+    } catch (error) {
+      if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
+      throw error;
+    }
+    const usesLocalCas = typeof (this.scanner as LocalScanner & { inspectFile?: unknown }).inspectFile === "function";
+    if (streamAdapter && tempDownloadPath && downloaded) {
+      await this.commitDownloadedTempFile(
+        streamAdapter,
+        path,
+        tempDownloadPath,
+        expectedLocal,
+        downloaded,
+      );
+    } else if (!usesLocalCas) {
+      // Compatibility path for isolated/legacy scanner doubles.
+      await this.scanner.vault.adapter.writeBinary(path, content as ArrayBuffer);
+    } else {
+      const readyPath = `${this.getDownloadTempPath(path)}.ready`;
+      try {
+        await this.ensureParentDirs(readyPath);
+        await this.removePathIfExists(readyPath);
+        await this.writeBinaryTempFileWithAndroidZeroByteRetry(
+          path,
+          readyPath,
+          content as ArrayBuffer,
+        );
+        const readyBytes = await this.scanner.vault.adapter.readBinary(readyPath);
+        if (
+          readyBytes.byteLength !== (content as ArrayBuffer).byteLength
+          || await sha256Hex(readyBytes) !== downloaded!.hash
+        ) {
+          throw new Error(`Downloaded temp file verification failed: ${path}`);
+        }
+        await this.commitDownloadedTempFile(
+          this.scanner.vault.adapter as StreamDownloadAdapter,
+          path,
+          readyPath,
+          expectedLocal,
+          downloaded!,
+        );
+      } catch (writeErr) {
+        await this.removePathIfExists(readyPath);
+        throw writeErr;
+      }
+    }
+    const verified = await this.inspectLocalPath(path);
+    if (
+      !verified
+      || verified.status === "uncertain"
+      || verified.status === "missing"
+      || verified.entry!.size !== downloaded!.size
+      || verified.entry!.hash !== downloaded!.hash
+    ) {
+      throw new Error(`Alignment read-back failed: ${path} -> ${path}`);
+    }
+    return { hash: downloaded!.hash, size: downloaded!.size };
+  }
+
   private getRecoveryJournal(): LocalRecoveryJournal {
     return new LocalRecoveryJournal(
       this.scanner.vault.adapter,
@@ -4972,6 +5084,40 @@ export class SyncExecutor {
       this.scanner.vault.adapter,
       getEasySyncPaths(this.scanner.vault).tmpDir,
     );
+  }
+
+  /**
+   * Dedicated cloud cleanup transaction for a community plugin this device
+   * has exited. Enumerates the committed remote index, deletes each managed
+   * bundle object with If-Match and verifies absence by read-back. Re-entrant
+   * by construction; never touches ordinary sync planning or the generic
+   * delete paths (Q3: the dedicated cleanup口子 is the only consumer).
+   */
+  async runCommunityPluginCloudCleanup(
+    pluginId: string,
+  ): Promise<CommunityPluginCloudCleanupResultV1> {
+    const scope = this.activeSyncScope ?? this.state.remoteScope;
+    if (!scope) {
+      return { status: "failed", deleted: 0, error: "no active sync scope" };
+    }
+    const plan = planCommunityPluginCloudCleanupV1({
+      pluginId,
+      configDir: getConfigDir(this.scanner.vault),
+      remoteEntries: this.state.remoteSnapshot,
+    });
+    if (plan.objects.length === 0) {
+      return { status: "completed", deleted: 0 };
+    }
+    return executeCommunityPluginCloudCleanupV1({
+      plan,
+      transport: {
+        vaultName: this.vaultName,
+        getDriveItemMetadataById: (id) =>
+          this.onedrive.getDriveItemMetadataById(id),
+        deleteItem: (vaultName, path, eTag, driveId) =>
+          this.onedrive.deleteItem(vaultName, path, eTag, driveId),
+      },
+    });
   }
 
   private async removePathIfExists(path: string): Promise<void> {
@@ -12863,17 +13009,48 @@ export class SyncExecutor {
         || sourceRemote !== undefined
         || !remoteStillExpected
         || !targetRemote
-        || !await this.remoteMatchesTarget(
-          targetRemote,
-          intent.expectedLocal,
-        )
       ) return null;
+      if (await this.remoteMatchesTarget(
+        targetRemote,
+        intent.expectedLocal,
+      )) {
+        const checkpoint = emptyMutationCheckpoint();
+        checkpoint.baseRemovals.push(intent.sourcePath);
+        checkpoint.baseUpserts.push({
+          path: intent.path,
+          hash: intent.expectedLocal.hash,
+          size: intent.expectedLocal.size,
+          eTag: targetRemote.eTag,
+        });
+        checkpoint.remoteDeletes.push(intent.sourcePath);
+        checkpoint.remoteUpserts.push(targetRemote);
+        return checkpoint;
+      }
+      // A1 one-shot converge: the local file already followed the moved remote
+      // path while the remote content version advanced. Download the exact
+      // remote bytes and settle the receipt against the aligned content, so a
+      // stuck "path followed, bytes pending" record converges automatically.
+      // Observation-only rounds leave the alignment to a real execution round
+      // (same pattern as the automatic merge branch).
+      if (observationOnly) return null;
+      if (local.status !== "present" || !local.entry) return null;
+      const aligned = await this.alignLocalTargetBytes(
+        intent.path,
+        targetRemote,
+        local.entry,
+        undefined,
+      );
+      // The local bytes changed during recovery; the ordinary plan that
+      // follows this round must rescan, otherwise the stale pre-recovery scan
+      // would look like a local edit and upload the old bytes back over the
+      // remote (same mechanism as the automatic merge recovery).
+      this.localVersionRecoveredDuringLedger = true;
       const checkpoint = emptyMutationCheckpoint();
       checkpoint.baseRemovals.push(intent.sourcePath);
       checkpoint.baseUpserts.push({
         path: intent.path,
-        hash: intent.expectedLocal.hash,
-        size: intent.expectedLocal.size,
+        hash: aligned.hash,
+        size: aligned.size,
         eTag: targetRemote.eTag,
       });
       checkpoint.remoteDeletes.push(intent.sourcePath);
@@ -14118,6 +14295,46 @@ export class SyncExecutor {
           || !this.localExpectationMatches(item.local, targetAfter)
         ) {
           throw new Error(`Local file move read-back failed: ${item.renameFrom} -> ${item.path}`);
+        }
+        if (targetAfter.status !== "present" || !targetAfter.entry) {
+          throw new Error(`Local file move read-back failed: ${item.renameFrom} -> ${item.path}`);
+        }
+        const targetEntry = targetAfter.entry;
+        // A1 one-shot converge: the remote identity was moved AND its content
+        // version advanced while the local side stayed unchanged. Align the
+        // moved local file to the exact remote bytes in the same action, so
+        // the mutation receipt proves "local target == remote version" (the
+        // same proof shape conservative reset already requires) instead of
+        // leaving an unreceiptable intermediate state. Without a known remote
+        // hash the plain move receipt stays admissible and the ordinary
+        // same-path decision converges the bytes on the next round (the A1
+        // comment contract), so alignment is limited to a proven difference.
+        const needsAlignment = item.remote.sha256Hash !== undefined
+          && (
+            item.remote.size !== targetEntry.size
+            || targetEntry.hash.toLowerCase() !== item.remote.sha256Hash.toLowerCase()
+          );
+        if (needsAlignment) {
+          const aligned = await this.alignLocalTargetBytes(
+            item.path,
+            item.remote,
+            targetEntry,
+            callbacks.onFileProgress,
+          );
+          remoteDeletes.push(item.renameFrom);
+          remoteUpserts.push({ ...item.remote, path: item.path });
+          result.filesMoved = (result.filesMoved ?? 0) + 1;
+          return {
+            executed: true,
+            mutationApplied: true,
+            baseRemoval: item.renameFrom,
+            baseUpsert: {
+              path: item.path,
+              hash: aligned.hash,
+              size: aligned.size,
+              eTag: item.remote.eTag,
+            },
+          };
         }
         remoteDeletes.push(item.renameFrom);
         remoteUpserts.push({ ...item.remote, path: item.path });

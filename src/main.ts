@@ -200,6 +200,9 @@ import {
 import {
   planCommunityPluginLocalReconciliation,
 } from "./sync/community-plugin-local-reconciliation";
+import {
+  COMMUNITY_PLUGIN_CLOUD_CLEANUP_MARKER_KEY,
+} from "./sync/community-plugin-cloud-cleanup-v1";
 import { StartupPerformanceTracker } from "./startup-performance";
 
 /** Plugin data keys for sync settings */
@@ -1528,6 +1531,7 @@ export default class EasySyncPlugin extends Plugin {
         );
       }
     }
+    this.maybeNoticeCommunityPluginCloudResurrection();
     result.message = formatSyncResultMessage(
       result,
       this.progressStore.state.completedFiles,
@@ -4593,6 +4597,151 @@ export default class EasySyncPlugin extends Plugin {
       ...previous,
       communityPluginSyncPolicy,
     });
+  }
+
+  /**
+   * Dedicated cloud cleanup for a community plugin this device no longer
+   * holds locally. Gated on the device-local participation phase: active
+   * joins/restores/participations, in-flight exits and blocked restores
+   * never enter the transaction. The executor transaction performs the
+   * conditional deletes. Records a one-shot resurrection marker and reports
+   * completion or blockage through the notice center.
+   */
+  async runCommunityPluginCloudCleanup(pluginId: string): Promise<boolean> {
+    await this.ensureStateLoaded();
+    const state = this.state;
+    const executor = this.syncExecutor;
+    if (!state?.isV2StateActive || !executor || executor.isRunning) {
+      this.noticeCenter.show({
+        key: `cloud-cleanup:busy:${pluginId}`,
+        message: this.i18n.t("result.lockBusy"),
+        priority: NOTICE_PRIORITY.attention,
+        className: "easy-sync-notice-action",
+      });
+      return false;
+    }
+    const participation = state.getCommunityPluginParticipation?.();
+    const phase = participation?.pluginsById[pluginId]?.phase;
+    if (
+      phase === "join-requested"
+      || phase === "restoring"
+      || phase === "participating"
+      || phase === "exit-requested"
+      || phase === "blocked"
+    ) {
+      return false;
+    }
+    const result = await executor.runCommunityPluginCloudCleanup(pluginId);
+    if (result.status === "failed") {
+      this.noticeCenter.show({
+        key: `cloud-cleanup:failed:${pluginId}`,
+        message: this.i18n.t("notice.communityPlugins.cloudCleanupFailed", {
+          plugin: pluginId,
+        }),
+        priority: NOTICE_PRIORITY.attention,
+        className: "easy-sync-notice-action",
+      });
+      return false;
+    }
+    if (result.status === "blocked") {
+      this.noticeCenter.show({
+        key: `cloud-cleanup:blocked:${pluginId}`,
+        message: this.i18n.t("notice.communityPlugins.cloudCleanupBlocked", {
+          plugin: pluginId,
+        }),
+        priority: NOTICE_PRIORITY.attention,
+        className: "easy-sync-notice-action",
+      });
+      return false;
+    }
+    const markers = this.readCommunityPluginCloudCleanupMarkers();
+    markers.push({ pluginId, cleanedAt: Date.now() });
+    this.writeCommunityPluginCloudCleanupMarkers(markers);
+    this.noticeCenter.show({
+      key: `cloud-cleanup:done:${pluginId}`,
+      message: this.i18n.t("notice.communityPlugins.cloudCleanupDone", {
+        plugin: pluginId,
+      }),
+      priority: NOTICE_PRIORITY.info,
+      className: "easy-sync-notice-action",
+    });
+    return true;
+  }
+
+  private readCommunityPluginCloudCleanupMarkers():
+    { pluginId: string; cleanedAt: number }[] {
+    if (typeof this.app.loadLocalStorage !== "function") return [];
+    const raw = this.app.loadLocalStorage(
+      COMMUNITY_PLUGIN_CLOUD_CLEANUP_MARKER_KEY,
+    );
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((
+      entry,
+    ): entry is { pluginId: string; cleanedAt: number } =>
+      isRecord(entry)
+      && typeof entry.pluginId === "string"
+      && typeof entry.cleanedAt === "number"
+    );
+  }
+
+  /**
+   * Read-only view of persisted cloud-cleanup markers for the settings UI:
+   * rows of cleaned plugins stay hidden until a resurrection notice drops
+   * the marker (or a later sync proves the cloud entry is gone).
+   */
+  getCommunityPluginCloudCleanupMarkers():
+    readonly { pluginId: string; cleanedAt: number }[] {
+    return this.readCommunityPluginCloudCleanupMarkers();
+  }
+
+  private writeCommunityPluginCloudCleanupMarkers(
+    markers: readonly { pluginId: string; cleanedAt: number }[],
+  ): void {
+    if (typeof this.app.saveLocalStorage !== "function") return;
+    this.app.saveLocalStorage(
+      COMMUNITY_PLUGIN_CLOUD_CLEANUP_MARKER_KEY,
+      [...markers],
+    );
+  }
+
+  /**
+   * One-shot resurrection notice (Q2): if a cleaned plugin's cloud objects
+   * reappear while this device still excludes the plugin, tell the user once
+   * that another device may still be using it, and drop the marker. Never
+   * auto-cleans again.
+   */
+  private maybeNoticeCommunityPluginCloudResurrection(): void {
+    const state = this.state;
+    if (!state?.isV2StateActive) return;
+    const markers = this.readCommunityPluginCloudCleanupMarkers();
+    if (markers.length === 0) return;
+    const participation = state.getCommunityPluginParticipation?.() ?? null;
+    if (!Array.isArray(state.remoteSnapshot)) return;
+    const remoteIds = new Set<string>();
+    for (const entry of state.remoteSnapshot) {
+      const match = /^\.obsidian\/plugins\/([^/]+)\/(main\.js|manifest\.json|styles\.css)$/
+        .exec(entry.path);
+      if (match) remoteIds.add(match[1]!);
+    }
+    const remaining: { pluginId: string; cleanedAt: number }[] = [];
+    for (const marker of markers) {
+      const phase = participation?.pluginsById[marker.pluginId]?.phase;
+      const cameBack = remoteIds.has(marker.pluginId)
+        && (phase === "excluded" || phase === "never-participated");
+      if (cameBack) {
+        this.noticeCenter.show({
+          key: `cloud-cleanup:resurrected:${marker.pluginId}`,
+          message: this.i18n.t("notice.communityPlugins.cloudResurrected", {
+            plugin: marker.pluginId,
+          }),
+          priority: NOTICE_PRIORITY.attention,
+          className: "easy-sync-notice-action",
+        });
+        continue;
+      }
+      remaining.push(marker);
+    }
+    this.writeCommunityPluginCloudCleanupMarkers(remaining);
   }
 
   private async persistCommunityPluginJoinOutcomes(

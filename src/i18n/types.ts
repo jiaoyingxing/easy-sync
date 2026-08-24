@@ -143,6 +143,11 @@ export interface LocaleStrings {
   "settings.communityPlugins.empty": string;
   "settings.communityPlugins.noMatch": string;
   "settings.communityPlugins.toggleAria": string;
+  "settings.communityPlugins.cleanup.tooltip": string;
+  "settings.communityPlugins.cleanup.confirmTitle": string;
+  "settings.communityPlugins.cleanup.confirmMessage": string;
+  "settings.communityPlugins.cleanup.confirmWarning": string;
+  "settings.communityPlugins.cleanup.confirmAction": string;
   "settings.communityPlugins.data.toggleAria": string;
   "settings.communityPlugins.data.restrictedAria": string;
   "settings.communityPlugins.data.experimentalConfirmTitle": string;
@@ -345,6 +350,10 @@ export interface LocaleStrings {
   "reason.remoteScopeRecreate": string;
   "result.communityPluginLocalIgnoreFailed": string;
   "notice.communityPlugins.loadFailed": string;
+  "notice.communityPlugins.cloudCleanupDone": string;
+  "notice.communityPlugins.cloudCleanupFailed": string;
+  "notice.communityPlugins.cloudCleanupBlocked": string;
+  "notice.communityPlugins.cloudResurrected": string;
   "notice.communityPlugins.remoteCatalogFailed": string;
   "notice.communityPlugins.enablementRetired": string;
   "notice.communityPlugins.enableFilesFirst": string;

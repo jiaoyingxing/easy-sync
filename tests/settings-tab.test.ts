@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
-import { ConfigSyncModal } from "../src/ui/config-sync-modal";
+import { ConfigSyncModal, isPluginRowHiddenByCloudCleanup } from "../src/ui/config-sync-modal";
 import { SyncPlanAlertModal } from "../src/ui/confirm-modal";
 import { buildSettingsSyncButtonState } from "../src/ui/settings-tab";
 import en from "../src/i18n/en";
@@ -659,6 +659,66 @@ describe("buildSettingsSyncButtonState", () => {
       .toBe("云端插件或同步位置变化时，将在下次同步时重新核对。");
     expect(zhCN["settings.communityPlugins.guidance.retry"])
       .toBe("恢复受阻时，请稍后重新同步。");
+  });
+
+  it("keeps rows of cloud-cleaned plugins out of the files list", () => {
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    const createDiv = vi.fn(() => ({}));
+    const createEl = vi.fn(() => ({}));
+    Object.assign(modal as object, {
+      plugin: { i18n: { t: (key: string) => key } },
+      inventory: [{
+        id: "calendar",
+        name: "Calendar",
+        local: false,
+        remote: true,
+        dataLocally: false,
+        dataRemotely: false,
+        desktopOnly: false,
+        manifestIssue: false,
+      }],
+      cleanedPluginIds: new Set(["calendar"]),
+      getManagerColumn: () => "files",
+      listScrollEl: {
+        scrollTop: 0,
+        empty: vi.fn(),
+        createEl,
+        createDiv,
+      },
+      searchQuery: "",
+      remoteInventoryAvailable: true,
+      inventoryLoading: false,
+      inventoryLoadFailed: false,
+      remoteCatalogRefreshFailed: false,
+    });
+
+    (modal as unknown as { renderPluginListArea(): void })
+      .renderPluginListArea();
+
+    expect(createDiv).not.toHaveBeenCalled();
+    expect(createEl).toHaveBeenCalledWith(
+      "p",
+      expect.objectContaining({
+        cls: "setting-item-description easy-sync-plugin-list-message",
+      }),
+    );
+  });
+
+  it("seeds the cleaned-plugin set from persisted markers when the modal opens", () => {
+    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    expect(source.indexOf("getCommunityPluginCloudCleanupMarkers()"))
+      .toBeGreaterThan(-1);
+    expect(source.indexOf("getCommunityPluginCloudCleanupMarkers()"))
+      .toBeLessThan(source.indexOf("renderPluginListArea"));
+  });
+
+  it("keeps cleaned rows hidden only while the device holds no local files", () => {
+    expect(isPluginRowHiddenByCloudCleanup("files", false, true)).toBe(true);
+    // Reinstalled locally: the row must come back for management/re-join.
+    expect(isPluginRowHiddenByCloudCleanup("files", true, true)).toBe(false);
+    expect(isPluginRowHiddenByCloudCleanup("files", undefined, true)).toBe(false);
+    expect(isPluginRowHiddenByCloudCleanup("data", false, true)).toBe(false);
+    expect(isPluginRowHiddenByCloudCleanup("files", false, false)).toBe(false);
   });
 
   it("refreshes the range-independent remote catalog only when the plugin manager opens", () => {

@@ -1934,7 +1934,16 @@ export function isProtectedFolderDeletePath(
   path: string,
   configDir: string,
 ): boolean {
-  return isAtOrBelowPath(path, configDir);
+  // Only the config directory root and the community-plugin subtree keep the
+  // folder-delete protection: plugin code/data carries per-device
+  // participation semantics, and the root is the scope boundary. Theme and
+  // snippet directories are user content (DECISIONS 2026-07-16 does not
+  // extend the managed-config protection to them) and follow the ordinary
+  // folder delete chain, whose execution still requires an exact empty
+  // remote subtree, an If-Match delete into the recycle bin and a read-back.
+  if (!isAtOrBelowPath(path, configDir)) return false;
+  return normalizeRemotePathKey(path) === normalizeRemotePathKey(configDir)
+    || isAtOrBelowPath(path, `${configDir}/plugins`);
 }
 
 export function parentFolderPath(path: string): string {

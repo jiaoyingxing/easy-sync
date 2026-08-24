@@ -124,12 +124,39 @@ function conservativeResetReceiptMatchesIntent(
       return true;
     case "renameRemote":
     case "moveLocal":
-      return intent.expectedLocal.exists
-        && intent.expectedRemote.exists
-        && baseMatches(intent.expectedLocal)
+      if (!intent.expectedLocal.exists || !intent.expectedRemote.exists) return false;
+      if (
+        !base
+        || !remote
+        || base.eTag !== remote.eTag
+        || remote.driveId !== intent.expectedRemote.driveId
+      ) return false;
+      // Two admissible receipt shapes, both proving "after the move, the local
+      // target and the remote identity hold the same version":
+      //  1. content-aligned (A1 one-shot converge): the receipt base already
+      //     equals the intended remote bytes when the remote was moved and
+      //     edited while the local side stayed unchanged;
+      //  2. pure rename: both sides still hold the intended local bytes and
+      //     the intent itself declares matching content on both sides.
+      const aligned = (
+        expected: Readonly<{ size: number; sha256Hash?: string }>,
+      ): boolean => Boolean(base
+        && expected.sha256Hash !== undefined
+        && base.hash.toLowerCase() === expected.sha256Hash.toLowerCase()
+        && base.size === expected.size
+        && remote!.size === expected.size
+        && remote!.sha256Hash !== undefined
+        && remote!.sha256Hash.toLowerCase() === expected.sha256Hash.toLowerCase());
+      return aligned(intent.expectedRemote) || (
+        baseMatches(intent.expectedLocal)
         && remoteMatches(intent.expectedLocal)
-        && base?.eTag === remote?.eTag
-        && remote?.driveId === intent.expectedRemote.driveId;
+        && intent.expectedLocal.size === intent.expectedRemote.size
+        && (
+          intent.expectedRemote.sha256Hash === undefined
+          || intent.expectedLocal.hash.toLowerCase()
+            === intent.expectedRemote.sha256Hash.toLowerCase()
+        )
+      );
     case "merge":
       return Boolean(intent.target)
         && intent.expectedRemote.exists
@@ -194,14 +221,10 @@ export function isOrdinaryFileRecoveryRecord(
         && intent.target === undefined;
     case "renameRemote":
     case "moveLocal":
+      // 内容相等性由收据层判定（纯移动或同轮对齐两种形态）；无收据时放行到
+      // 恢复分类器（路径已跟随但内容待对齐的已卡记录也必须能进入结算）。
       return intent.expectedLocal.exists
         && intent.expectedRemote.exists
-        && intent.expectedLocal.size === intent.expectedRemote.size
-        && (
-          intent.expectedRemote.sha256Hash === undefined
-          || intent.expectedLocal.hash.toLowerCase()
-            === intent.expectedRemote.sha256Hash.toLowerCase()
-        )
         && intent.target === undefined;
     case "merge":
       return intent.sourcePath === undefined
@@ -225,8 +248,16 @@ export function isConservativeResetOrdinaryRecord(
   return isOrdinaryFileRecoveryRecord(record, scope)
     && !(
       record.receipt === null
-      && record.intent.action === "upload"
-      && !record.intent.expectedRemote.exists
+      && (
+        (record.intent.action === "upload"
+          && !record.intent.expectedRemote.exists)
+        // Unreceipted moves may have followed the path already while the
+        // content alignment is still pending; reset must not absorb them
+        // before the recovery chain settles them (same fail-closed reason
+        // as the response-unknown create upload).
+        || record.intent.action === "moveLocal"
+        || record.intent.action === "renameRemote"
+      )
     );
 }
 

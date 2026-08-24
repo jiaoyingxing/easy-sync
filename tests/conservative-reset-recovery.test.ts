@@ -182,7 +182,12 @@ describe("conservative reset ordinary-file recovery contract", () => {
     it(`accepts canonical ${action} intent and receipt shapes`, () => {
       const intentOnly = record(action);
       expect(isOrdinaryFileRecoveryRecord(intentOnly, scope)).toBe(true);
-      expect(isConservativeResetOrdinaryRecord(intentOnly, scope)).toBe(true);
+      // Unreceipted moves may have already followed the remote path while
+      // content alignment is still pending; reset keeps them out of the
+      // conservative capsule until the recovery chain settles them.
+      expect(isConservativeResetOrdinaryRecord(intentOnly, scope)).toBe(
+        action !== "renameRemote" && action !== "moveLocal",
+      );
       const receipted = record(action, { receipt: true });
       expect(isOrdinaryFileRecoveryRecord(receipted, scope)).toBe(true);
       expect(isConservativeResetOrdinaryRecord(receipted, scope)).toBe(true);
@@ -199,6 +204,31 @@ describe("conservative reset ordinary-file recovery contract", () => {
     )).toBe(true);
   });
 
+  it("admits a content-diverged moveLocal intent to recovery but rejects its stale pure-rename receipt", () => {
+    // A1 one-shot converge: the intent may legally declare different content
+    // on the two sides (remote moved and edited). The unreceipted intent is
+    // admitted so the recovery chain can align and settle it; a receipt that
+    // still only proves the old pure-rename shape for a diverged intent
+    // remains invalid because it cannot prove "local == remote" anymore.
+    const splitMoveIdentity = record("moveLocal");
+    if (!splitMoveIdentity.intent.expectedRemote.exists) {
+      throw new Error("move fixture requires a remote identity");
+    }
+    splitMoveIdentity.intent.expectedRemote.size += 1;
+    expect(isOrdinaryFileRecoveryRecord(splitMoveIdentity, scope)).toBe(true);
+    expect(isConservativeResetOrdinaryRecord(splitMoveIdentity, scope)).toBe(false);
+    expect(isOrdinaryFileRecoveryRecord(
+      record("moveLocal", { receipt: true }),
+      scope,
+    )).toBe(true);
+    const staleReceipt = record("moveLocal", { receipt: true });
+    if (!staleReceipt.intent.expectedRemote.exists) {
+      throw new Error("move fixture requires a remote identity");
+    }
+    staleReceipt.intent.expectedRemote.size += 1;
+    expect(isOrdinaryFileRecoveryRecord(staleReceipt, scope)).toBe(false);
+  });
+
   it("rejects parser-readable but non-canonical intent and receipt shapes", () => {
     const wrongUpload = record("upload");
     wrongUpload.intent.expectedLocal = { exists: false };
@@ -207,13 +237,6 @@ describe("conservative reset ordinary-file recovery contract", () => {
     const extraSource = record("download");
     extraSource.intent.sourcePath = "old.md";
     expect(isOrdinaryFileRecoveryRecord(extraSource, scope)).toBe(false);
-
-    const splitMoveIdentity = record("moveLocal");
-    if (!splitMoveIdentity.intent.expectedRemote.exists) {
-      throw new Error("move fixture requires a remote identity");
-    }
-    splitMoveIdentity.intent.expectedRemote.size += 1;
-    expect(isOrdinaryFileRecoveryRecord(splitMoveIdentity, scope)).toBe(false);
 
     const malformedReceipt = record("download", { receipt: true });
     malformedReceipt.receipt!.checkpoint.baseUpserts.push({
@@ -260,6 +283,120 @@ describe("conservative reset ordinary-file recovery contract", () => {
     const wrongMerge = record("merge", { receipt: true });
     wrongMerge.receipt!.checkpoint.baseUpserts[0].hash = "d".repeat(64);
     expect(isConservativeResetOrdinaryRecord(wrongMerge, scope)).toBe(false);
+  });
+
+  it("accepts a content-aligned moveLocal receipt (remote move + edit, one-shot converge)", () => {
+    // A1（1.3.8）把「远端移动+改内容、本地未变」从冲突改为 move-local；同轮内容
+    // 对齐后收据的 base 已是远端预期内容，而意图的 expectedLocal 仍是旧内容。
+    // 收据证明目标（本机==远端、identity/eTag 对得上）与原语义一致，应放行。
+    const aligned = record("moveLocal");
+    if (!aligned.intent.expectedRemote.exists || !aligned.intent.sourcePath) {
+      throw new Error("move fixture requires a remote identity and source path");
+    }
+    const remoteExpect = aligned.intent.expectedRemote;
+    remoteExpect.size = 20;
+    remoteExpect.sha256Hash = "b".repeat(64);
+    const receiptBase = {
+      path: aligned.intent.path,
+      hash: "b".repeat(64),
+      size: 20,
+      eTag: remoteExpect.eTag,
+    };
+    aligned.receipt = {
+      version: 1,
+      operationId: aligned.intent.operationId,
+      completedAt: 3,
+      checkpoint: {
+        baseUpserts: [receiptBase],
+        baseRemovals: [aligned.intent.sourcePath],
+        remoteUpserts: [{
+          path: aligned.intent.path,
+          driveId: remoteExpect.driveId,
+          parentId: "files-root",
+          size: 20,
+          mtime: 1,
+          eTag: remoteExpect.eTag,
+          cTag: "ctag-aligned",
+          sha256Hash: "b".repeat(64),
+        }],
+        remoteDeletes: [aligned.intent.sourcePath],
+        pendingConflictRemovals: [],
+        pendingDeleteRemovals: [],
+      },
+    };
+    expect(isOrdinaryFileRecoveryRecord(aligned, scope)).toBe(true);
+    expect(isConservativeResetOrdinaryRecord(aligned, scope)).toBe(true);
+  });
+
+  it("still rejects aligned-shaped moveLocal receipts whose facts do not bind", () => {
+    const aligned = record("moveLocal");
+    if (!aligned.intent.expectedRemote.exists || !aligned.intent.sourcePath) {
+      throw new Error("move fixture requires a remote identity and source path");
+    }
+    const remoteExpect = aligned.intent.expectedRemote;
+    remoteExpect.size = 20;
+    remoteExpect.sha256Hash = "b".repeat(64);
+    const checkpoint = {
+      baseUpserts: [{
+        path: aligned.intent.path,
+        hash: "b".repeat(64),
+        size: 20,
+        eTag: remoteExpect.eTag,
+      }],
+      baseRemovals: [aligned.intent.sourcePath],
+      remoteUpserts: [{
+        path: aligned.intent.path,
+        driveId: remoteExpect.driveId,
+        parentId: "files-root",
+        size: 20,
+        mtime: 1,
+        eTag: remoteExpect.eTag,
+        cTag: "ctag-aligned",
+        sha256Hash: "b".repeat(64),
+      }],
+      remoteDeletes: [aligned.intent.sourcePath],
+      pendingConflictRemovals: [],
+      pendingDeleteRemovals: [],
+    };
+    const wrongIdentity = record("moveLocal");
+    if (!wrongIdentity.intent.expectedRemote.exists || !wrongIdentity.intent.sourcePath) {
+      throw new Error("move fixture requires a remote identity and source path");
+    }
+    wrongIdentity.intent.expectedRemote.size = 20;
+    wrongIdentity.intent.expectedRemote.sha256Hash = "b".repeat(64);
+    wrongIdentity.receipt = {
+      version: 1,
+      operationId: wrongIdentity.intent.operationId,
+      completedAt: 3,
+      checkpoint: {
+        ...structuredClone(checkpoint),
+        remoteUpserts: [{
+          ...checkpoint.remoteUpserts[0],
+          driveId: "replacement-id",
+        }],
+      },
+    };
+    expect(isOrdinaryFileRecoveryRecord(wrongIdentity, scope)).toBe(false);
+
+    const thirdPartyContent = record("moveLocal");
+    if (!thirdPartyContent.intent.expectedRemote.exists || !thirdPartyContent.intent.sourcePath) {
+      throw new Error("move fixture requires a remote identity and source path");
+    }
+    thirdPartyContent.intent.expectedRemote.size = 20;
+    thirdPartyContent.intent.expectedRemote.sha256Hash = "b".repeat(64);
+    thirdPartyContent.receipt = {
+      version: 1,
+      operationId: thirdPartyContent.intent.operationId,
+      completedAt: 3,
+      checkpoint: {
+        ...structuredClone(checkpoint),
+        baseUpserts: [{
+          ...checkpoint.baseUpserts[0],
+          hash: "c".repeat(64),
+        }],
+      },
+    };
+    expect(isOrdinaryFileRecoveryRecord(thirdPartyContent, scope)).toBe(false);
   });
 
   it("owns every exact source, target and checkpoint path", () => {

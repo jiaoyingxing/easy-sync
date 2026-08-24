@@ -1,5 +1,6 @@
 import {
   ButtonComponent,
+  ExtraButtonComponent,
   Modal,
   Notice,
   SearchComponent,
@@ -25,6 +26,9 @@ import {
 } from "../sync/community-plugin-selection-update";
 import { ConfirmModal } from "./confirm-modal";
 import { SequentialSettingsUpdateQueue } from "./sequential-settings-update-queue";
+import {
+  isCommunityPluginCloudCleanupCandidateV1,
+} from "../sync/community-plugin-cloud-cleanup-v1";
 
 export type ConfigSyncView =
   | "scope"
@@ -32,6 +36,21 @@ export type ConfigSyncView =
   | "community-plugin-data";
 
 type PluginColumn = CommunityPluginSelectionColumn;
+
+/**
+ * Rows of cloud-cleaned plugins stay hidden from the files list while this
+ * device holds no local files for them (the persisted marker is only dropped
+ * by a resurrection notice). Reinstalling the plugin locally (`local: true`)
+ * must bring the row back so the user can manage and re-join it — there is
+ * no permanent blocklist.
+ */
+export function isPluginRowHiddenByCloudCleanup(
+  column: PluginColumn | undefined,
+  local: boolean | undefined,
+  cleaned: boolean,
+): boolean {
+  return column === "files" && local === false && cleaned;
+}
 
 interface ScopeToggleConfig {
   key: string;
@@ -70,6 +89,7 @@ export class ConfigSyncModal extends Modal {
   private busyPluginRows = new Set<string>();
   private confirmingDataRows = new Set<string>();
   private pendingPluginValues = new Map<string, boolean>();
+  private cleanedPluginIds = new Set<string>();
   private settingsUpdateQueue = new SequentialSettingsUpdateQueue();
   private unsubscribeCommunityPluginInventoryRevision: (() => void) | null =
     null;
@@ -82,6 +102,12 @@ export class ConfigSyncModal extends Modal {
     private onCloseCallback?: () => void,
   ) {
     super(plugin.app);
+    // Persisted cleanup markers keep cleaned rows hidden across modal
+    // reopenings; a resurrection notice drops the marker, and the row (and
+    // the cleanup affordance for it) comes back only then.
+    for (const marker of plugin.getCommunityPluginCloudCleanupMarkers()) {
+      this.cleanedPluginIds.add(marker.pluginId);
+    }
   }
 
   onOpen(): void {
@@ -594,12 +620,19 @@ export class ConfigSyncModal extends Modal {
     }
     const normalizedQuery = this.searchQuery.trim().toLocaleLowerCase();
     const visibleItems = this.inventory.filter((item) =>
-      normalizedQuery.length === 0
-      || (
-        item.name !== null
-        && item.name.toLocaleLowerCase().includes(normalizedQuery)
+      (
+        normalizedQuery.length === 0
+        || (
+          item.name !== null
+          && item.name.toLocaleLowerCase().includes(normalizedQuery)
+        )
+        || item.id.toLocaleLowerCase().includes(normalizedQuery)
       )
-      || item.id.toLocaleLowerCase().includes(normalizedQuery)
+      && !isPluginRowHiddenByCloudCleanup(
+        column,
+        item.local,
+        this.cleanedPluginIds.has(item.id),
+      )
     );
     if (visibleItems.length === 0) {
       this.listScrollEl.createEl("p", {
@@ -676,6 +709,36 @@ export class ConfigSyncModal extends Modal {
         && !this.getCommunityPluginScopeEnabled("files"));
     const pendingValue = this.pendingPluginValues.get(rowKey);
     const toggleCell = row.createDiv("easy-sync-plugin-toggle-cell");
+    if (
+      column === "files"
+      && isCommunityPluginCloudCleanupCandidateV1({
+        phase: item.participationPhase,
+        local: item.local,
+        remote: item.remote,
+      })
+      && !busy
+      && !this.cleanedPluginIds.has(item.id)
+    ) {
+      const cleanup = new ExtraButtonComponent(toggleCell)
+        .setIcon("trash-2")
+        .setTooltip(this.plugin.i18n.t(
+          "settings.communityPlugins.cleanup.tooltip",
+          { plugin: displayName },
+        ))
+        .onClick(() => {
+          void this.confirmCommunityPluginCloudCleanup(item, displayName);
+        });
+      cleanup.extraSettingsEl.addClass(
+        "easy-sync-plugin-cloud-cleanup-trigger",
+      );
+      cleanup.extraSettingsEl.setAttribute(
+        "aria-label",
+        this.plugin.i18n.t(
+          "settings.communityPlugins.cleanup.tooltip",
+          { plugin: displayName },
+        ),
+      );
+    }
     const toggle = new ToggleComponent(toggleCell)
       .setValue(
         pendingValue
@@ -704,6 +767,34 @@ export class ConfigSyncModal extends Modal {
         { plugin: displayName },
       ),
     );
+  }
+
+  private async confirmCommunityPluginCloudCleanup(
+    item: CommunityPluginInventoryItem,
+    displayName: string,
+  ): Promise<void> {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const confirmed = await new ConfirmModal(
+      this.plugin.app,
+      t("settings.communityPlugins.cleanup.confirmTitle"),
+      null,
+      t("settings.communityPlugins.cleanup.confirmAction"),
+      t("confirm.cancel"),
+      t,
+      {
+        message: t("settings.communityPlugins.cleanup.confirmMessage", {
+          plugin: displayName,
+        }),
+        warning: t("settings.communityPlugins.cleanup.confirmWarning"),
+        danger: true,
+      },
+    ).awaitConfirm();
+    if (!confirmed) return;
+    const ok = await this.plugin.runCommunityPluginCloudCleanup(item.id);
+    if (ok) {
+      this.cleanedPluginIds.add(item.id);
+      this.requestCommunityPluginInventoryRefresh();
+    }
   }
 
   private getCommunityPluginDisplayName(

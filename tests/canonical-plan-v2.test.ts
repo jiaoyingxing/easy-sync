@@ -20,6 +20,25 @@ describe("cross-device path identity", () => {
     expect(isAtOrBelowPath(".obsidian-other", ".obsidian"))
       .toBe(false);
   });
+
+  it("protects only the config root and the community-plugin subtree from folder deletion", () => {
+    expect(isProtectedFolderDeletePath(".obsidian", ".obsidian")).toBe(true);
+    expect(isProtectedFolderDeletePath(".OBSIDIAN", ".obsidian")).toBe(true);
+    expect(isProtectedFolderDeletePath(".obsidian/plugins", ".obsidian"))
+      .toBe(true);
+    expect(isProtectedFolderDeletePath(".obsidian/plugins/dataview", ".obsidian"))
+      .toBe(true);
+    // Theme and snippet directories are user content: they follow the
+    // ordinary folder delete chain instead of the protected-config deferral.
+    expect(isProtectedFolderDeletePath(".obsidian/themes", ".obsidian"))
+      .toBe(false);
+    expect(isProtectedFolderDeletePath(".obsidian/themes/Primary", ".obsidian"))
+      .toBe(false);
+    expect(isProtectedFolderDeletePath(".obsidian/snippets", ".obsidian"))
+      .toBe(false);
+    expect(isProtectedFolderDeletePath(".obsidian-other", ".obsidian"))
+      .toBe(false);
+  });
 });
 import {
   attachBaseAncestorHashesV2,
@@ -975,6 +994,95 @@ describe("canonical V2 plan candidate", () => {
         `.obsidian/plugins/easy-sync/file-${index}.json`)
         .sort((left, right) => left.localeCompare(right))
         .slice(0, 10));
+  });
+
+  it("lets theme folder deletions use the ordinary delete-remote chain", () => {
+    const folders = [
+      { id: "obsidian", name: ".obsidian" },
+      { id: "themes", name: "themes", parentId: "obsidian" },
+      { id: "primary", name: "Primary", parentId: "themes" },
+      { id: "plugins", name: "plugins", parentId: "obsidian" },
+      { id: "dataview", name: "dataview", parentId: "plugins" },
+    ];
+    const state = envelope({
+      folders,
+      folderAnchors: [
+        folderAnchor("obsidian", ".obsidian"),
+        folderAnchor("themes", ".obsidian/themes", "obsidian"),
+        folderAnchor("primary", ".obsidian/themes/Primary", "themes"),
+        folderAnchor("plugins", ".obsidian/plugins", "obsidian"),
+        folderAnchor("dataview", ".obsidian/plugins/dataview", "plugins"),
+      ],
+    });
+    const candidate = build({ state, localFiles: [], localFolders: [] });
+
+    const folderDeletes = candidate.items
+      .filter((item) => item.type === SyncActionType.DeleteRemoteFolder)
+      .map((item) => item.path)
+      .sort();
+    const deferred = candidate.items
+      .filter((item) => item.type === SyncActionType.FolderDeferred)
+      .map((item) => item.path)
+      .sort();
+    expect(folderDeletes).toEqual([
+      ".obsidian/themes",
+      ".obsidian/themes/Primary",
+    ]);
+    expect(deferred).toEqual([
+      ".obsidian",
+      ".obsidian/plugins",
+      ".obsidian/plugins/dataview",
+    ]);
+  });
+
+  it("lets theme folder deletions use the ordinary delete-local chain", () => {
+    const folders = [
+      { id: "obsidian", name: ".obsidian" },
+      { id: "themes", name: "themes", parentId: "obsidian" },
+      { id: "plugins", name: "plugins", parentId: "obsidian" },
+    ];
+    // Both sides of the theme scope were anchored; the remote no longer has
+    // the theme folder (deleted on another device) while the local folder
+    // still exists. Plugin folders must stay protected in the same shape.
+    const state = envelope({
+      folders,
+      folderAnchors: [
+        folderAnchor("obsidian", ".obsidian"),
+        folderAnchor("themes", ".obsidian/themes", "obsidian"),
+        folderAnchor("primary", ".obsidian/themes/Primary", "themes"),
+        folderAnchor("plugins", ".obsidian/plugins", "obsidian"),
+        folderAnchor("dataview", ".obsidian/plugins/dataview", "plugins"),
+      ],
+    });
+    const candidate = build({
+      state,
+      localFiles: [],
+      localFolders: localFolders(
+        ".obsidian",
+        ".obsidian/themes",
+        ".obsidian/themes/Primary",
+        ".obsidian/plugins",
+        ".obsidian/plugins/dataview",
+      ),
+    });
+
+    const localDeletes = candidate.items
+      .filter((item) => item.type === SyncActionType.DeleteLocalFolder)
+      .map((item) => item.path)
+      .sort();
+    const deferred = candidate.items
+      .filter((item) => item.type === SyncActionType.FolderDeferred)
+      .map((item) => item.path)
+      .sort();
+    // The themes root still exists remotely (only the theme itself was
+    // deleted on another device), so only the anchored theme folder is a
+    // delete-local candidate. The plugin folder stays protected.
+    expect(localDeletes).toEqual([
+      ".obsidian/themes/Primary",
+    ]);
+    expect(deferred).toEqual([
+      ".obsidian/plugins/dataview",
+    ]);
   });
 
   it("applies the file scope before both classification and identity planning", () => {

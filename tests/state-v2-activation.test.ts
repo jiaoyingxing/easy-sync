@@ -12758,7 +12758,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.localFolderPaths.has("Empty")).toBe(false);
   });
 
-  it("never deletes a synced config-directory folder shell automatically", async () => {
+  it("deletes a synced theme/snippet directory shell with the ordinary delete-local chain", async () => {
     const harness = makeHarness({
       base: [],
       local: [],
@@ -12797,6 +12797,68 @@ describe("V1 to V2 controlled production activation", () => {
       1,
     );
 
+    const settled = await harness.executor.run("manual");
+
+    expect(settled).toMatchObject({
+      success: true,
+      foldersDeleted: 1,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.localFolderPaths.has(".obsidian/snippets")).toBe(false);
+    expect(harness.fileManager.trashFile).toHaveBeenCalled();
+  });
+
+  it("keeps a synced community-plugin directory shell deferred", async () => {
+    const harness = makeHarness({
+      base: [],
+      local: [],
+      localFolders: [
+        { path: ".obsidian" },
+        { path: ".obsidian/plugins" },
+        { path: ".obsidian/plugins/dataview" },
+      ],
+      remoteItems: [
+        {
+          id: "folder-config",
+          name: ".obsidian",
+          folder: {},
+          parentReference: { id: scope.filesRootId },
+          eTag: "etag-folder-config",
+        },
+        {
+          id: "folder-plugins",
+          name: "plugins",
+          folder: {},
+          parentReference: { id: "folder-config" },
+          eTag: "etag-folder-plugins",
+        },
+        {
+          id: "folder-dataview",
+          name: "dataview",
+          folder: {},
+          parentReference: { id: "folder-plugins" },
+          eTag: "etag-folder-dataview",
+        },
+      ],
+    });
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    harness.executor.setAutomaticHandlingPolicy({
+      autoDeleteLocalFiles: true,
+      mergeNonOverlappingText: true,
+    });
+    harness.remoteItemState.splice(
+      harness.remoteItemState.findIndex((item) => item.id === "folder-dataview"),
+      1,
+    );
+
     const blocked = await harness.executor.run("manual");
 
     expect(blocked).toMatchObject({
@@ -12805,7 +12867,7 @@ describe("V1 to V2 controlled production activation", () => {
       deferred: 1,
       errors: 0,
     });
-    expect(harness.localFolderPaths.has(".obsidian/snippets")).toBe(true);
+    expect(harness.localFolderPaths.has(".obsidian/plugins/dataview")).toBe(true);
     expect(harness.fileManager.trashFile).not.toHaveBeenCalled();
   });
 

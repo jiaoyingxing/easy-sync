@@ -11,7 +11,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeAll } from "vitest";
 import * as obsidian from "obsidian";
 import { Platform, TFile, TFolder, type Plugin } from "obsidian";
 import { sha256Hex } from "../src/crypto";
@@ -52,6 +52,7 @@ import {
 } from "../src/sync/file-state-controller-v2";
 import type { SyncAnchorV2 } from "../src/sync/state-envelope-v2";
 import { createFileStateShadowEnvelopeV2 } from "./helpers/file-state-shadow-v2";
+import { projectRemoteIndexV2 } from "../src/sync/remote-index-v2";
 import {
   makePublic113InterruptedUploadBatch,
   PUBLIC_113_NETWORK_RECOVERY_INCIDENT,
@@ -315,6 +316,7 @@ function makeActiveV2State(
     remoteFolders = folders.map((entry) => ({ ...entry }));
     commitSeq += 1;
     committedAt += 1;
+    const previousEnvelope = envelope;
     envelope = createFileStateShadowEnvelopeV2({
       scope,
       lifecycleEpoch: 1,
@@ -329,6 +331,28 @@ function makeActiveV2State(
       schemaVersion: 2,
       byAnchorId: {},
     };
+    // Keep identity bindings across remote observations: a committed anchor
+    // stays bound to its Graph id even when that id moved to another path
+    // (the shadow seed re-binds anchors by current path, which would fake an
+    // anchor that lost its identity after a remote move). The anchor keeps
+    // its previous lastPath so identity-rename planning can detect the move.
+    const nextPathByRemoteId = projectRemoteIndexV2(envelope.remoteIndex);
+    const retained: Record<string, SyncAnchorV2> = {};
+    for (const anchor of Object.values(previousEnvelope.anchors.byAnchorId)) {
+      if (anchor.remoteId === undefined) continue;
+      if (!nextPathByRemoteId.has(anchor.remoteId)) continue;
+      retained[anchor.anchorId] = { ...anchor };
+    }
+    if (Object.keys(retained).length > 0) {
+      const retainedPaths = new Set(
+        Object.values(retained).map((anchor) => anchor.lastPath),
+      );
+      const rebuilt = { ...envelope.anchors.byAnchorId };
+      for (const [anchorId, anchor] of Object.entries(rebuilt)) {
+        if (retainedPaths.has(anchor.lastPath)) delete rebuilt[anchorId];
+      }
+      envelope.anchors.byAnchorId = { ...rebuilt, ...retained };
+    }
     state.remoteSnapshot = remoteSnapshot;
     state.remoteFolders = remoteFolders;
     state.remoteDeltaLink = deltaLink;
@@ -17336,5 +17360,264 @@ describe("folder confirm-delete batch absence verification", () => {
     expect(harness.getFileMetadata).toHaveBeenCalledTimes(1);
     expect(harness.getFileMetadata.mock.calls).toEqual([["testVault", "FolderA"]]);
     expect(harness.trashFile).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("A1 one-shot content alignment for followed remote moves", () => {
+  const oldBytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]).buffer;
+  const newBytes = new Uint8Array(
+    Array.from({ length: 20 }, (_, index) => index + 1),
+  ).buffer;
+  const remoteNewEntry = (): RemoteFileEntry => ({
+    path: "new.md",
+    driveId: "drv-a",
+    parentId: TEST_SYNC_SCOPE.filesRootId,
+    size: newBytes.byteLength,
+    mtime: 2,
+    eTag: "etag-new",
+    cTag: "ctag-new",
+    sha256Hash: newBytesHash,
+  });
+  let oldBytesHash: string;
+  let newBytesHash: string;
+
+  async function makeAlignmentTestContext(options: {
+    initialFiles: Array<[string, ArrayBuffer]>;
+    initialRemoteEntries: RemoteFileEntry[];
+    initialBaseEntries: BaseFileEntry[];
+  }) {
+    const diagError = vi.fn();
+    const files = new Map(options.initialFiles.map(
+      ([path, value]) => [path, value.slice(0)] as const,
+    ));
+    const uploadFile = vi.fn();
+    const downloadFile = vi.fn().mockResolvedValue(newBytes.slice(0));
+    const adapter = makeMockAdapter({
+      read: vi.fn().mockImplementation(async (target: string) => {
+        const value = files.get(target);
+        return value ? new TextDecoder().decode(value) : "";
+      }),
+      write: vi.fn().mockImplementation(async (target: string, content: string) => {
+        files.set(target, new TextEncoder().encode(content).buffer);
+      }),
+      writeBinary: vi.fn(async (target: string, content: ArrayBuffer) => {
+        files.set(target, content.slice(0));
+      }),
+      exists: vi.fn().mockImplementation(async (target: string) =>
+        files.has(target)),
+      stat: vi.fn().mockImplementation(async (target: string) => {
+        const value = files.get(target);
+        return value ? { size: value.byteLength, mtime: 1 } : null;
+      }),
+      readBinary: vi.fn().mockImplementation(async (target: string) =>
+        files.get(target)?.slice(0) ?? new ArrayBuffer(0)),
+      rename: vi.fn().mockImplementation(async (
+        source: string,
+        target: string,
+      ) => {
+        const value = files.get(source);
+        if (!value) throw new Error(`missing ${source}`);
+        files.set(target, value.slice(0));
+        files.delete(source);
+      }),
+      remove: vi.fn().mockImplementation(async (target: string) => {
+        files.delete(target);
+      }),
+    });
+    const mockOneDrive = makeMockOneDrive({
+      uploadFile,
+      downloadFile,
+      getFileMetadata: vi.fn().mockImplementation(
+        async (_vault: string, path: string) =>
+          path === "new.md" ? remoteNewEntry() : null,
+      ),
+      getDelta: vi.fn().mockResolvedValue({
+        value: [{
+          id: "drv-a",
+          name: "new.md",
+          size: newBytes.byteLength,
+          eTag: "etag-new",
+          cTag: "ctag-new",
+          lastModifiedDateTime: "2026-08-24T00:00:00.000Z",
+          parentReference: { id: TEST_SYNC_SCOPE.filesRootId },
+          file: { hashes: { sha256Hash: newBytesHash } },
+        }],
+        "@odata.deltaLink": "tok",
+      }),
+    });
+    const mockScanner = {
+      vault: {
+        adapter,
+        getFiles: vi.fn().mockReturnValue([]),
+        getName: vi.fn().mockReturnValue("testVault"),
+        getAbstractFileByPath: vi.fn().mockImplementation((path: string) =>
+          files.has(path)
+            ? Object.assign(new TFile({ path: "/" } as unknown as TFolder, path), {
+                path,
+              })
+            : null),
+        rename: vi.fn().mockImplementation(async (source: TFile, target: string) => {
+          const value = files.get(source.path);
+          if (!value) throw new Error(`missing ${source.path}`);
+          files.set(target, value.slice(0));
+          files.delete(source.path);
+        }),
+      },
+      scanAll: vi.fn().mockImplementation(async () => {
+        const entries = [];
+        for (const [path, value] of files.entries()) {
+          entries.push({
+            path,
+            hash: await sha256Hex(value),
+            size: value.byteLength,
+            mtime: 1,
+            binary: false,
+          });
+        }
+        return {
+          entries,
+          folders: [],
+          folderScanComplete: true,
+          folderScanFailures: [],
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        };
+      }),
+      scanFile: vi.fn().mockResolvedValue(null),
+      inspectFile: vi.fn().mockImplementation(async (target: string) => {
+        const value = files.get(target);
+        return value
+          ? {
+              status: "present",
+              entry: {
+                path: target,
+                hash: await sha256Hex(value),
+                size: value.byteLength,
+                mtime: 1,
+                binary: false,
+              },
+            }
+          : { status: "missing" };
+      }),
+      shouldSyncPath: vi.fn().mockReturnValue(true),
+      shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+    } as unknown as LocalScanner;
+    const state = makeActiveV2State(
+      options.initialRemoteEntries,
+      options.initialBaseEntries,
+    );
+    const executor = new SyncExecutor(
+      mockOneDrive,
+      mockScanner,
+      state,
+      "testVault",
+      undefined,
+      undefined,
+      {
+        log: vi.fn(),
+        warn: vi.fn(),
+        error: diagError,
+        setAdapter: vi.fn(),
+      } as unknown as DiagnosticLogger,
+    );
+    return { executor, state, files, downloadFile, uploadFile, diagError };
+  }
+
+  beforeAll(async () => {
+    oldBytesHash = await sha256Hex(oldBytes);
+    newBytesHash = await sha256Hex(newBytes);
+  });
+
+  it("moves the local file and aligns its bytes to the moved+edited remote in one round", async () => {
+    const context = await makeAlignmentTestContext({
+      initialFiles: [["a.md", oldBytes]],
+      initialRemoteEntries: [{
+        path: "a.md",
+        driveId: "drv-a",
+        parentId: TEST_SYNC_SCOPE.filesRootId,
+        size: oldBytes.byteLength,
+        mtime: 1,
+        eTag: "etag-old",
+        cTag: "ctag-old",
+        sha256Hash: oldBytesHash,
+      }],
+      initialBaseEntries: [{
+        path: "a.md",
+        hash: oldBytesHash,
+        size: oldBytes.byteLength,
+        eTag: "etag-old",
+      }],
+    });
+
+    const result = await context.executor.run("manual", {});
+
+    expect(result).toMatchObject({ success: true, conflicts: 0 });
+    expect(result.filesMoved).toBe(1);
+    expect(context.downloadFile).toHaveBeenCalledOnce();
+    expect(context.files.has("a.md")).toBe(false);
+    expect(context.files.has("new.md")).toBe(true);
+    expect(await sha256Hex(context.files.get("new.md")!)).toBe(newBytesHash);
+    expect(context.state.mutationLedger).toHaveLength(0);
+    expect(context.state.baseSnapshot).toEqual([{
+      path: "new.md",
+      hash: newBytesHash,
+      size: newBytes.byteLength,
+      eTag: "etag-new",
+    }]);
+  });
+
+  it("settles a stuck followed-path recovery record by aligning its bytes", async () => {
+    const context = await makeAlignmentTestContext({
+      // The stuck device already followed the remote path but still holds the
+      // old bytes, exactly the receiving-side shape left by the 1.3.8 A1
+      // regression (local move executed, mutation receipt rejected).
+      initialFiles: [["new.md", oldBytes]],
+      initialRemoteEntries: [remoteNewEntry()],
+      initialBaseEntries: [],
+    });
+    context.state.mutationLedger.push({
+      intent: {
+        version: 1,
+        operationId: "op-stuck-move",
+        planRevision: 0,
+        scope: { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+        action: "moveLocal" as const,
+        path: "new.md",
+        sourcePath: "a.md",
+        expectedLocal: {
+          exists: true as const,
+          hash: oldBytesHash,
+          size: oldBytes.byteLength,
+        },
+        expectedRemote: {
+          exists: true as const,
+          driveId: "drv-a",
+          eTag: "etag-new",
+          size: newBytes.byteLength,
+          sha256Hash: newBytesHash,
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    });
+
+    const result = await context.executor.run("manual", {});
+
+    // The recovery chain aligned and settled the stuck record in the same
+    // round: ledger empty, local bytes newest, base bound, and the stale
+    // pre-recovery scan was not allowed to upload old bytes over the remote.
+    expect(context.state.mutationLedger).toHaveLength(0);
+    expect(await sha256Hex(context.files.get("new.md")!)).toBe(newBytesHash);
+    expect(context.state.baseSnapshot).toEqual([{
+      path: "new.md",
+      hash: newBytesHash,
+      size: newBytes.byteLength,
+      eTag: "etag-new",
+    }]);
+    expect(result.uploaded).toBe(0);
+    expect(context.uploadFile).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ success: true });
   });
 });
