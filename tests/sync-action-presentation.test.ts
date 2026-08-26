@@ -93,6 +93,11 @@ const EXPECTED: Record<
     zh: "跳过已忽略路径",
     en: "Skip ignored path",
   },
+  [SyncActionType.SkipOneDriveInvalidName]: {
+    group: "skip",
+    zh: "跳过无法同步的文件名",
+    en: "Skip unsyncable file name",
+  },
   [SyncActionType.RetryLater]: {
     group: "deferred",
     zh: "稍后重试",

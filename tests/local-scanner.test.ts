@@ -827,4 +827,35 @@ describe("Preflight P0 — Included path failures make the scan incomplete", () 
     expect(result.failedPaths).toContain(".obsidian/plugins");
     expect(adapter.write).not.toHaveBeenCalled();
   });
+
+  it("collects orphaned .easy-sync-recovery copies without entering entries", async () => {
+    const adapter = {
+      exists: vi.fn(async () => true),
+      read: vi.fn(async () => { throw new Error("no cache"); }),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      stat: vi.fn(async () => ({ size: content.byteLength, mtime: 1 })),
+      readBinary: vi.fn(async () => content),
+      write: vi.fn(async () => undefined),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => [
+        { path: "assets/photo.png", stat: { size: content.byteLength, mtime: 1 } },
+        { path: "assets/photo.png.easy-sync-recovery", stat: { size: content.byteLength, mtime: 1 } },
+        { path: "notes/note.md", stat: { size: content.byteLength, mtime: 1 } },
+      ]),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      includePaths: [],
+      excludePaths: [],
+    });
+
+    const result = await scanner.scanAll();
+
+    expect(result.recoveryCopies)
+      .toEqual(["assets/photo.png.easy-sync-recovery"]);
+    expect(result.entries.map((entry) => entry.path).sort())
+      .toEqual(["assets/photo.png", "notes/note.md"]);
+    expect(result.complete).toBe(true);
+  });
 });

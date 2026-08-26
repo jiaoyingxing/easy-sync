@@ -25,6 +25,19 @@ import {
   type SyncPlan,
   type SyncPlanItem,
 } from "./types";
+import { findOneDriveInvalidNameIssue } from "../onedrive/types";
+
+/**
+ * True when any path segment has a name OneDrive can never store (Graph
+ * rejects such items with 400 even when the URL is correctly percent-encoded,
+ * so the path can never exist remotely). The remote index can therefore never
+ * contain this path and no remote-targeting action can ever succeed for it.
+ */
+export function hasOneDriveInvalidNamePath(path: string): boolean {
+  return path.split("/").some(
+    (segment) => findOneDriveInvalidNameIssue(segment) !== null,
+  );
+}
 
 export interface FileDecisionFactsV2 {
   localEntries: readonly LocalFileEntry[];
@@ -146,6 +159,22 @@ export function generateFileDecisionPlanV2(
   );
 
   for (const [oldPath, { newPath, localEntry, remoteEntry }] of renames) {
+    if (hasOneDriveInvalidNamePath(newPath)) {
+      // Renaming the remote item to this path would fail forever with 400 and
+      // leave an unreceipted intent that mutation recovery can never settle.
+      // Surface a visible skip with a rename hint instead; the remote old path
+      // stays marked as a rename source so it is never treated as a local
+      // deletion, and renaming the local file to a storable name resumes the
+      // ordinary rename plan next round.
+      plan.push({
+        type: SyncActionType.SkipOneDriveInvalidName,
+        path: newPath,
+        local: localEntry,
+        remote: remoteEntry,
+        reason: "reason.fileNameNotSyncable",
+      });
+      continue;
+    }
     plan.push({
       type: SyncActionType.RenameRemote,
       path: newPath,
@@ -165,6 +194,20 @@ export function generateFileDecisionPlanV2(
     // never be mistaken for a local deletion.
     if (skippedSet.has(path)) continue;
     if (renamedOldPaths.has(path) || renamedNewPaths.has(path)) continue;
+    // A path OneDrive can never store can never exist remotely, so no upload,
+    // conflict or delete decision can ever succeed for it. Skip it visibly
+    // instead of planning an upload that fails with 400 forever and re-blocks
+    // mutation recovery. Renaming the local file to a storable name resumes
+    // ordinary decisions next round.
+    if (hasOneDriveInvalidNamePath(path)) {
+      plan.push({
+        type: SyncActionType.SkipOneDriveInvalidName,
+        path,
+        local: localMap.get(path),
+        reason: "reason.fileNameNotSyncable",
+      });
+      continue;
+    }
 
     const local = localMap.get(path);
     const remote = remoteMap.get(path);
@@ -420,6 +463,7 @@ export function orderSyncPlanItemsV2(
     [SyncActionType.RenameRemote]: 0,
     [SyncActionType.SkipLargeFile]: 1,
     [SyncActionType.SkipIgnoredPath]: 1,
+    [SyncActionType.SkipOneDriveInvalidName]: 1,
     [SyncActionType.RetryLater]: 2,
     [SyncActionType.FolderDeferred]: 2,
     [SyncActionType.Conflict]: 3,

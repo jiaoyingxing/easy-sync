@@ -258,6 +258,17 @@ export function resolveSyncActionPresentation(
         "skip",
         "circle-slash-2",
       );
+    case SyncActionType.SkipOneDriveInvalidName:
+      return action(
+        "skip",
+        "syncAction.group.skip",
+        8,
+        "syncAction.skipOneDriveInvalidName.label",
+        "syncAction.skipOneDriveInvalidName.active",
+        "skipping",
+        "skip",
+        "circle-slash-2",
+      );
     case SyncActionType.AuthExpired:
       return action(
         "authExpired",

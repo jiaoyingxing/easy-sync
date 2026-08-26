@@ -1896,7 +1896,8 @@ describe("buildSyncViewContentKey", () => {
     expect(openMethod).toContain("this.plugin.resolveMutationRecovery(snapshot, choice)");
     expect(modalSource).toContain("extends FileComparisonModal");
     expect(modalSource).toContain("this.renderComparisonTable(");
-    expect(modalSource).toContain('.addClass("easy-sync-comparison-path-table")');
+    expect(modalSource).toContain('"easy-sync-comparison-path-table"');
+    expect(modalSource).toContain('"easy-sync-comparison-bundle-table"');
     expect(modalSource).toContain("this.renderFileComparisonActions([");
     expect(modalSource).not.toContain("easy-sync-detail-actions-mobile-stacked");
     expect(conflictSource).not.toContain("easy-sync-detail-actions-mobile-stacked");
@@ -1927,6 +1928,7 @@ describe("buildSyncViewContentKey", () => {
     expect(styles).toMatch(
       /\.easy-sync-comparison-path-table\s*\{[^}]*table-layout:\s*fixed;/s,
     );
+    expect(styles).toContain("easy-sync-comparison-bundle-table");
     expect(styles).toMatch(
       /\.easy-sync-comparison-path-table th,\s*\.easy-sync-comparison-path-table td\s*\{[^}]*overflow-wrap:\s*anywhere;/s,
     );

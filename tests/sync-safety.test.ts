@@ -22,6 +22,7 @@ import type {
   BaseFileEntry,
   LocalFileEntry,
   ManualMutationResolutionV1,
+  MutationIntentV1,
   MutationLedgerEntryV1,
   MutationReceiptV1,
   RemoteFileEntry,
@@ -4167,6 +4168,27 @@ describe("Persistent remote delta state", () => {
       ],
       keepLocal: { available: true, deletesOtherSide: false },
       keepRemote: { available: true, deletesOtherSide: true },
+    });
+    expect(reviewed?.bundlePresentation).toEqual({
+      version: 1,
+      localVersion: "0.9.13",
+      remoteVersion: "0.9.12",
+      files: [
+        {
+          path: `${root}/main.js`,
+          localMtime: 1,
+          remoteMtime: 1,
+        },
+        {
+          path: `${root}/manifest.json`,
+          localMtime: 1,
+          remoteMtime: 1,
+        },
+        {
+          path: `${root}/styles.css`,
+          localMtime: 1,
+        },
+      ],
     });
     expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-remote"))
       .toBe(true);
@@ -17619,5 +17641,157 @@ describe("A1 one-shot content alignment for followed remote moves", () => {
     expect(result.uploaded).toBe(0);
     expect(context.uploadFile).not.toHaveBeenCalled();
     expect(result).toMatchObject({ success: true });
+  });
+});
+
+describe("OneDrive-invalid-name unreceipted upload recovery", () => {
+  async function makeInvalidNameUploadHarness(localPresent: boolean) {
+    const path = "Learn English/New Concept 2/第25课：Do the English speak english?.md";
+    const localContent = "local content";
+    const encoder = new TextEncoder();
+    const localBytes = encoder.encode(localContent).buffer;
+    const localHash = await sha256Hex(localBytes);
+    const scope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+
+    const localBytesByPath = new Map<string, ArrayBuffer>();
+    if (localPresent) localBytesByPath.set(path, localBytes);
+    const adapter = makeMockAdapter({
+      exists: vi.fn(async (candidate: string) =>
+        localBytesByPath.has(candidate)),
+      stat: vi.fn(async (candidate: string) => {
+        const bytes = localBytesByPath.get(candidate);
+        return bytes
+          ? { type: "file", size: bytes.byteLength, mtime: 1, ctime: 1 }
+          : null;
+      }),
+      readBinary: vi.fn(async (candidate: string) => {
+        const bytes = localBytesByPath.get(candidate);
+        if (!bytes) throw new Error(`missing local: ${candidate}`);
+        return bytes.slice(0);
+      }),
+    });
+
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "invalid-name-upload",
+      planRevision: 1,
+      scope,
+      action: "upload",
+      path,
+      expectedLocal: {
+        exists: true,
+        hash: localHash,
+        size: localBytes.byteLength,
+      },
+      // This name can never exist remotely: Graph rejects it with 400 even
+      // when the URL is correctly encoded.
+      expectedRemote: { exists: false },
+      createdAt: 1,
+    };
+    const ledger: MutationLedgerEntryV1[] = [{
+      intent,
+      receipt: null,
+    }];
+
+    const state = makeActiveV2State([], [], { mutationLedger: ledger });
+    // Real Graph behavior for an invalid name: every request returns 400 and
+    // getFileMetadata only converts 404 into null, so every observation for
+    // this path would throw and block recovery forever.
+    const onedrive = makeMockOneDrive({
+      getFileMetadata: vi.fn(async () => {
+        throw new OneDriveError(
+          OneDriveErrorType.Unknown,
+          "nameContainsInvalidCharacters",
+          400,
+        );
+      }),
+    });
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault: {
+          configDir: ".obsidian",
+          adapter,
+          getAbstractFileByPath: vi.fn((candidate: string) =>
+            localBytesByPath.has(candidate) ? new TFile(candidate) : null),
+          getFileByPath: vi.fn().mockReturnValue(null),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+          rename: vi.fn(),
+        },
+        inspectFile: vi.fn(async (candidate: string) => {
+          const bytes = localBytesByPath.get(candidate);
+          return bytes
+            ? {
+                status: "present" as const,
+                entry: {
+                  path: candidate,
+                  hash: await sha256Hex(bytes),
+                  size: bytes.byteLength,
+                  mtime: 1,
+                  binary: false,
+                },
+              }
+            : { status: "missing" as const };
+        }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    const recover = (observationOnly = false) => {
+      const epoch = (executor as unknown as {
+        lifecycle: { capture(): number };
+      }).lifecycle.capture();
+      return (executor as unknown as {
+        recoverMutationLedger(
+          scope: SyncScope,
+          metrics: undefined,
+          operationEpoch: number,
+          observationOnly: boolean,
+        ): Promise<unknown>;
+      }).recoverMutationLedger(scope, undefined, epoch, observationOnly);
+    };
+    return { executor, onedrive, recover, state, path };
+  }
+
+  it("settles an unreceipted upload targeting an OneDrive-invalid name with zero Graph requests", async () => {
+    const harness = await makeInvalidNameUploadHarness(true);
+    expect(harness.state.mutationLedger).toHaveLength(1);
+
+    const summary = await harness.recover();
+
+    // The intent can never have been applied, so it settles as not-applied
+    // without any local or remote observation — the 400 that used to throw
+    // out of classification and block every round is never issued.
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.onedrive.getFileMetadata).not.toHaveBeenCalled();
+    expect(summary).toEqual(
+      expect.objectContaining({ state: "settled", remaining: 0 }),
+    );
+  });
+
+  it("settles the same intent even after the user deleted the local file", async () => {
+    const harness = await makeInvalidNameUploadHarness(false);
+    expect(harness.state.mutationLedger).toHaveLength(1);
+
+    const summary = await harness.recover();
+
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.onedrive.getFileMetadata).not.toHaveBeenCalled();
+    expect(summary).toEqual(
+      expect.objectContaining({ state: "settled", remaining: 0 }),
+    );
+  });
+
+  it("settles the same intent in observation-only reset preflight rounds", async () => {
+    const harness = await makeInvalidNameUploadHarness(true);
+
+    const summary = await harness.recover(true);
+
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.onedrive.getFileMetadata).not.toHaveBeenCalled();
+    expect(summary).toEqual(
+      expect.objectContaining({ state: "settled", remaining: 0 }),
+    );
   });
 });

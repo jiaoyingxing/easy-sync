@@ -1513,6 +1513,7 @@ export function summarizeCanonicalPlanReviewV2(
     if (
       item.type === SyncActionType.SkipLargeFile
       || item.type === SyncActionType.SkipIgnoredPath
+      || item.type === SyncActionType.SkipOneDriveInvalidName
     ) counts.skipped++;
     if (countsForCanonicalReviewImpact(item.type)) {
       impactCount += Math.max(1, item.reviewImpactCount ?? 1);
@@ -1826,6 +1827,7 @@ function canonicalActionPriority(type: SyncActionType): number {
       return 3;
     case SyncActionType.SkipLargeFile:
     case SyncActionType.SkipIgnoredPath:
+    case SyncActionType.SkipOneDriveInvalidName:
       return 4;
     case SyncActionType.RetryLater:
     case SyncActionType.FolderDeferred:

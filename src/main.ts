@@ -3064,9 +3064,11 @@ export default class EasySyncPlugin extends Plugin {
         deleted: result.deleted,
         conflicts: result.conflicts,
         deferred: result.deferred,
-        skipped: result.skippedLarge + result.skippedIgnored,
+        skipped: result.skippedLarge + result.skippedIgnored
+          + result.skippedInvalidName,
         skippedLarge: result.skippedLarge,
         skippedIgnored: result.skippedIgnored,
+        skippedInvalidName: result.skippedInvalidName,
         errors: result.errors,
         message: result.message,
         files: [...progress.completedFiles],
@@ -3334,6 +3336,7 @@ export default class EasySyncPlugin extends Plugin {
         skipped: 0,
         skippedLarge: 0,
         skippedIgnored: 0,
+        skippedInvalidName: 0,
         errors: recovery.state === "blocked" ? 1 : 0,
         message: this.i18n.t(
           recovery.state === "blocked"

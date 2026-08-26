@@ -393,11 +393,39 @@ body.is-mobile .easy-sync-empty-folder-actions button {
 .easy-sync-comparison-path-table th,
 .easy-sync-comparison-path-table td {
   overflow-wrap: anywhere;
+  /* Bundle rows carry size and modified time as separate lines. */
+  white-space: pre-line;
+}
+
+/* Per-file agreement state (e.g. 一致 / 不同) next to the file name. */
+.easy-sync-meta-status {
+  margin-left: var(--size-4-1);
+  color: var(--text-muted);
+  font-weight: 400;
 }
 
 .easy-sync-comparison-path-table th:first-child,
 .easy-sync-comparison-path-table td:first-child {
   width: 44%;
+}
+
+/*
+ * Bundle reviews use short file names instead of full paths: let the label
+ * column size to its content and give the local/cloud columns the rest.
+ * The generic path table above keeps its fixed 44% label column for the
+ * ordinary long-path review rows.
+ */
+.easy-sync-comparison-path-table.easy-sync-comparison-bundle-table {
+  table-layout: auto;
+}
+
+.easy-sync-comparison-path-table.easy-sync-comparison-bundle-table
+th:first-child,
+.easy-sync-comparison-path-table.easy-sync-comparison-bundle-table
+td:first-child {
+  width: auto;
+  white-space: nowrap;
+  overflow-wrap: normal;
 }
 
 .easy-sync-metadata-table th {

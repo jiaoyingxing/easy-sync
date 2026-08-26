@@ -519,6 +519,7 @@ function resolveFileProgressChipKey(
   if (
     file.actionType === SyncActionType.SkipLargeFile
     || file.actionType === SyncActionType.SkipIgnoredPath
+    || file.actionType === SyncActionType.SkipOneDriveInvalidName
   ) {
     return "syncView.fileStatus.skip";
   }
@@ -590,6 +591,7 @@ export function formatPendingIssueChipLabel(
   if (
     actionType === SyncActionType.SkipLargeFile
     || actionType === SyncActionType.SkipIgnoredPath
+    || actionType === SyncActionType.SkipOneDriveInvalidName
   ) {
     return t("syncView.fileStatus.skip");
   }
@@ -1737,10 +1739,12 @@ export class EasySyncSyncView extends ItemView {
     const groupedIssues = groupPendingIssuesForReview(issues);
     const skipped = groupedIssues.filter(({ issue }) =>
       issue.actionType === SyncActionType.SkipLargeFile
-      || issue.actionType === SyncActionType.SkipIgnoredPath);
+      || issue.actionType === SyncActionType.SkipIgnoredPath
+      || issue.actionType === SyncActionType.SkipOneDriveInvalidName);
     const failures = groupedIssues.filter(({ issue }) =>
       issue.actionType !== SyncActionType.SkipLargeFile
-      && issue.actionType !== SyncActionType.SkipIgnoredPath);
+      && issue.actionType !== SyncActionType.SkipIgnoredPath
+      && issue.actionType !== SyncActionType.SkipOneDriveInvalidName);
 
     for (const { issue, nestedIssues } of failures) {
       this.renderPendingIssue(section, issue, true, nestedIssues);

@@ -303,4 +303,77 @@ describe("S03 — state-neutral local recovery journal", () => {
     expect(brokenRename).toHaveBeenCalled();
     expect(typeof files.get(journal.intentPath)).toBe("string");
   });
+
+  it("cleanupOrphanCopies removes an orphaned copy when its target still exists", async () => {
+    const recoveryPath = "assets/photo.png.easy-sync-recovery";
+    const { adapter, files } = makeMemoryAdapter({
+      "assets/photo.png": bytes(9, 8, 7),
+      [recoveryPath]: bytes(1, 2, 3),
+    });
+    const journal = new LocalRecoveryJournal(
+      adapter,
+      ".obsidian/plugins/easy-sync/tmp",
+    );
+
+    const summary = await journal.cleanupOrphanCopies([recoveryPath]);
+
+    expect(summary).toEqual({
+      removed: 1,
+      retained: 0,
+      removedPaths: [recoveryPath],
+    });
+    expect(files.has(recoveryPath)).toBe(false);
+    expect(files.has("assets/photo.png")).toBe(true);
+  });
+
+  it("cleanupOrphanCopies retains an orphaned copy when its target is missing", async () => {
+    const recoveryPath = "assets/photo.png.easy-sync-recovery";
+    const { adapter, files } = makeMemoryAdapter({ [recoveryPath]: bytes(1, 2) });
+    const journal = new LocalRecoveryJournal(
+      adapter,
+      ".obsidian/plugins/easy-sync/tmp",
+    );
+
+    const summary = await journal.cleanupOrphanCopies([recoveryPath]);
+
+    expect(summary).toEqual({ removed: 0, retained: 1, removedPaths: [] });
+    expect(files.has(recoveryPath)).toBe(true);
+  });
+
+  it("cleanupOrphanCopies never touches copies while a recovery intent is pending", async () => {
+    const path = "note.md";
+    const oldContent = bytes(1, 2, 3);
+    const recoveryPath = `${path}.easy-sync-recovery`;
+    const { adapter, files } = makeMemoryAdapter({ [path]: oldContent });
+    const journal = new LocalRecoveryJournal(
+      adapter,
+      ".obsidian/plugins/easy-sync/tmp",
+    );
+
+    await journal.prepareRenamedOriginal(path, await entry(path, oldContent), recoveryPath, {
+      hash: "aa".repeat(32),
+      size: 3,
+    });
+    await adapter.rename(path, recoveryPath);
+
+    const summary = await journal.cleanupOrphanCopies([recoveryPath]);
+
+    expect(summary).toEqual({ removed: 0, retained: 1, removedPaths: [] });
+    expect(files.has(recoveryPath)).toBe(true);
+    expect(files.has(journal.intentPath)).toBe(true);
+  });
+
+  it("cleanupOrphanCopies is idempotent for empty and already-cleared lists", async () => {
+    const { adapter, files } = makeMemoryAdapter();
+    const journal = new LocalRecoveryJournal(
+      adapter,
+      ".obsidian/plugins/easy-sync/tmp",
+    );
+
+    expect(await journal.cleanupOrphanCopies([]))
+      .toEqual({ removed: 0, retained: 0, removedPaths: [] });
+    expect(await journal.cleanupOrphanCopies(["a.md.easy-sync-recovery"]))
+      .toEqual({ removed: 0, retained: 0, removedPaths: [] });
+    expect(files.size).toBe(0);
+  });
 });

@@ -2153,7 +2153,7 @@ describe("community plugin enablement runtime", () => {
 
       expect(result).toMatchObject({
         downloaded: 0,
-        deferred: 1,
+        deferred: 0,
         errors: 0,
         communityPluginJoinBlocks: [{
           pluginId: "calendar",
@@ -2263,7 +2263,19 @@ describe("community plugin enablement runtime", () => {
       for (const result of [first, second]) {
         expect(result.success).toBe(true);
         expect(result.errors).toBe(0);
-        expect(result.deferred).toBe(1);
+        // A desktop-only join block is deterministic for the current remote
+        // manifest: it must not look like a file deferral — otherwise each
+        // round stays "partially completed" forever and the sync history looks
+        // stuck. The block itself is still recorded and persists the plugin
+        // row status.
+        expect(result.communityPluginJoinBlocks).toEqual([
+          {
+            pluginId: "calendar",
+            operationId: "join-calendar-1",
+            reason: "manifest-incompatible",
+          },
+        ]);
+        expect(result.deferred).toBe(0);
         expect(result.downloaded).toBe(0);
         expect(result.foldersCreated).toBe(0);
         expect(result.communityPluginLocalIgnores).toBeUndefined();

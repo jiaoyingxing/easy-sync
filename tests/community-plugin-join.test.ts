@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
-  createCommunityPluginJoinAuthorization,
   communityPluginJoinBlockRequiresTargetRebind,
+  createCommunityPluginJoinAuthorization,
+  isCommunityPluginJoinBlockDeterministic,
   isCommunityPluginJoinBlockRecheckable,
   planCommunityPluginJoins,
   validateCommunityPluginJoinAuthorization,
@@ -113,6 +114,23 @@ describe("community-plugin join authorization", () => {
     expect(communityPluginJoinBlockRequiresTargetRebind(
       "remote-bundle-incomplete",
     )).toBe(false);
+  });
+
+  it("classifies manifest-incompatible as the only deterministic join block", () => {
+    expect(isCommunityPluginJoinBlockDeterministic("manifest-incompatible"))
+      .toBe(true);
+    for (const reason of [
+      "catalog-unavailable",
+      "catalog-stale",
+      "scope-changed",
+      "remote-bundle-missing",
+      "remote-bundle-incomplete",
+      "remote-bundle-changed",
+      "local-bundle-incomplete",
+    ]) {
+      expect(isCommunityPluginJoinBlockDeterministic(reason)).toBe(false);
+    }
+    expect(isCommunityPluginJoinBlockDeterministic(undefined)).toBe(false);
   });
 
   it("binds a restore only to one fresh complete remote bundle", () => {

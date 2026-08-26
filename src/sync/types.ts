@@ -137,6 +137,11 @@ export enum SyncActionType {
   Conflict = "conflict",
   SkipLargeFile = "skipLargeFile",
   SkipIgnoredPath = "skipIgnoredPath",
+  /** A name OneDrive can never store (e.g. containing `?`); Graph always
+   *  rejects it with 400, so the path can never be uploaded. The planned item
+   *  is shown visibly with a rename hint instead of producing an upload
+   *  intent that would fail forever and re-block mutation recovery. */
+  SkipOneDriveInvalidName = "skipOneDriveInvalidName",
   RetryLater = "retryLater",
   AuthExpired = "authExpired",
 }
@@ -549,6 +554,32 @@ export interface CommunityPluginBundleDirectionReviewV1 {
   reason?: CommunityPluginBundleReviewBlockReasonV1;
 }
 
+/** Per-file display facts for one reviewed community-plugin bundle. */
+export interface CommunityPluginBundleFilePresentationV1 {
+  path: string;
+  /** Local last-modified time (epoch ms) when readable. */
+  localMtime?: number;
+  /** Remote last-modified time (epoch ms) when readable. */
+  remoteMtime?: number;
+}
+
+/**
+ * Read-only presentation extras for the community-plugin bundle review.
+ *
+ * This object is intentionally NOT part of `factsDigest`: it exists only to
+ * carry display-side evidence (manifest versions, modified times) that the
+ * user can inspect before choosing. Keeping it out of the digest means adding
+ * or removing presentation fields can never invalidate an already-reviewed,
+ * persisted settlement across builds.
+ */
+export interface CommunityPluginBundlePresentationV1 {
+  version: 1;
+  /** Parsed manifest version of each side; null when unreadable/missing. */
+  localVersion: string | null;
+  remoteVersion: string | null;
+  files: CommunityPluginBundleFilePresentationV1[];
+}
+
 /**
  * Ephemeral, read-only facts for reviewing one physical community-plugin
  * bundle. This is not a persisted transaction and grants no mutation.
@@ -585,6 +616,11 @@ export interface ManualMutationResolutionSnapshotV1 {
   keepLocal: ManualMutationResolutionOptionV1;
   keepRemote: ManualMutationResolutionOptionV1;
   bundleReview?: CommunityPluginBundleReviewV1;
+  /**
+   * Display-only evidence for the bundle review surface. Never feeds
+   * `factsDigest`; see CommunityPluginBundlePresentationV1.
+   */
+  bundlePresentation?: CommunityPluginBundlePresentationV1;
 }
 
 /**

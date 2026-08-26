@@ -52,6 +52,11 @@ export interface LocalScanResult {
   failedPaths: string[];
   skippedCount: number;
   complete: boolean;
+  /** Orphaned `${target}.easy-sync-recovery` copies encountered during the
+   *  scan (target-side download-replacement backups whose journal intent is
+   *  already gone). They are excluded from sync; the executor clears them in
+   *  the same round after the ordinary journal recovery already ran. */
+  recoveryCopies: string[];
 }
 export type LocalFileInspection =
   | { status: "missing" }
@@ -632,10 +637,12 @@ export class LocalScanner {
         failedPaths: ["/"],
         skippedCount: 0,
         complete: false,
+        recoveryCopies: [],
       };
     }
     let fileCount = 0;
     let skippedCount = 0;
+    const recoveryCopies: string[] = [];
 
     this.collectLoadedFolderPaths(folderPaths, folderScanFailures);
 
@@ -645,6 +652,7 @@ export class LocalScanner {
       observedFilePaths.add(path);
 
       if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
+        if (path.endsWith(".easy-sync-recovery")) recoveryCopies.push(path);
         if (!isPathExcludedByFolders(path, this.config.excludedFolders)) {
           skippedCount++;
         }
@@ -713,6 +721,7 @@ export class LocalScanner {
       observedFilePaths,
       scannedDirs,
       folderPaths,
+      recoveryCopies,
     );
     for (const path of observedFilePaths) {
       if (this.shouldSyncPath(path)) addParentFolderPaths(path, folderPaths);
@@ -749,6 +758,7 @@ export class LocalScanner {
       failedPaths,
       skippedCount,
       complete: failedPaths.length === 0,
+      recoveryCopies,
     };
   }
 
@@ -765,6 +775,7 @@ export class LocalScanner {
     observedFilePaths: Set<string>,
     scannedDirs: Set<string>,
     folderPaths: Set<string>,
+    recoveryCopies: string[],
   ): Promise<void> {
     for (const prefix of this.config.includePaths) {
       if (prefix.endsWith("/")) {
@@ -778,6 +789,7 @@ export class LocalScanner {
           scannedDirs,
           folderPaths,
           true,
+          recoveryCopies,
         );
       } else {
         await this.scanSinglePath(
@@ -876,6 +888,7 @@ export class LocalScanner {
     scannedDirs: Set<string>,
     folderPaths: Set<string>,
     allowMissingRoot = false,
+    recoveryCopies?: string[],
   ): Promise<void> {
     // Normalize: strip trailing slash(es) so path construction is clean
     const base = dirPath.replace(/\/+$/, "");
@@ -918,6 +931,7 @@ export class LocalScanner {
       observedFilePaths.add(path);
 
       if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
+        if (path.endsWith(".easy-sync-recovery")) recoveryCopies?.push(path);
         if (path.endsWith("/data.json")) {
           this.diag?.log("scan", `isExcluded("${path}") → true (/data.json, self-referential protection)`);
         }
@@ -982,6 +996,8 @@ export class LocalScanner {
         observedFilePaths,
         scannedDirs,
         folderPaths,
+        false,
+        recoveryCopies,
       );
     }
   }

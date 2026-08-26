@@ -56,6 +56,7 @@ import type {
 import { isEasySyncInternalPath } from "./local-scanner";
 import type { LocalFileInspection, LocalScanner } from "./local-scanner";
 import {
+  hasOneDriveInvalidNamePath,
   isObsidianManagedConfigPath,
   protectEasySyncSelfSyncPlan,
   remoteContentMatchesBase,
@@ -114,6 +115,7 @@ import type {
   CommunityPluginBundleReviewV1,
   CommunityPluginBundleReviewBlockReasonV1,
   CommunityPluginBundleSettlementV2,
+  CommunityPluginBundlePresentationV1,
 } from "./types";
 import type { DiagnosticLogger } from "./diagnostic-logger";
 import {
@@ -286,6 +288,7 @@ import {
   type CommunityPluginCloudCleanupResultV1,
 } from "./community-plugin-cloud-cleanup-v1";
 import {
+  isCommunityPluginJoinBlockDeterministic,
   validateCommunityPluginJoinAuthorization,
   type CommunityPluginJoinAuthorization,
   type CommunityPluginJoinBlock,
@@ -331,6 +334,10 @@ export interface SyncResult {
   deferred: number;
   skippedLarge: number;
   skippedIgnored: number;
+  /** Files skipped because their name contains characters OneDrive cannot
+   *  store (Graph would reject every upload with 400). Visible skip with a
+   *  rename hint; they rejoin ordinary sync after the user renames them. */
+  skippedInvalidName: number;
   errors: number;
   /** Deterministic community-plugin identity blocks (parse failure,
    *  same-directory drift, cross-directory collision). They stay visible in
@@ -1902,6 +1909,7 @@ export class SyncExecutor {
                 deferred: 0,
                 skippedLarge: 0,
                 skippedIgnored: 0,
+                skippedInvalidName: 0,
                 errors: 0,
                 authExpired: false,
                 message: "",
@@ -2562,6 +2570,8 @@ export class SyncExecutor {
     const localByPath = new Map<string, ManualMutationResolutionLocalFactV1>();
     const remoteByPath = new Map<string, ManualMutationResolutionRemoteFactV1>();
     const remoteEntryByPath = new Map<string, RemoteFileEntry>();
+    const localMtimeByPath = new Map<string, number>();
+    const remoteMtimeByPath = new Map<string, number>();
     let localReason: CommunityPluginBundleReviewBlockReasonV1 | undefined;
     let remoteReason: CommunityPluginBundleReviewBlockReasonV1 | undefined;
 
@@ -2582,10 +2592,19 @@ export class SyncExecutor {
               size: localInspection.entry.size,
             }
           : { path, exists: false });
+        if (
+          localInspection.status === "present"
+          && localInspection.entry?.mtime !== undefined
+        ) {
+          localMtimeByPath.set(path, localInspection.entry.mtime);
+        }
       }
       remoteByPath.set(path, remoteInspection.fact);
       if (remoteInspection.entry) {
         remoteEntryByPath.set(path, remoteInspection.entry);
+        if (remoteInspection.entry.mtime !== undefined) {
+          remoteMtimeByPath.set(path, remoteInspection.entry.mtime);
+        }
       }
     }
 
@@ -2726,6 +2745,20 @@ export class SyncExecutor {
           }
         : {}),
     };
+    const bundlePresentation: CommunityPluginBundlePresentationV1 = {
+      version: 1,
+      localVersion: localManifest?.version ?? null,
+      remoteVersion: remoteManifest?.version ?? null,
+      files: memberPaths.map((path) => ({
+        path,
+        ...(localMtimeByPath.has(path)
+          ? { localMtime: localMtimeByPath.get(path) as number }
+          : {}),
+        ...(remoteMtimeByPath.has(path)
+          ? { remoteMtime: remoteMtimeByPath.get(path) as number }
+          : {}),
+      })),
+    };
     const digestInput = {
       version: 1 as const,
       sourceOperationId: record?.intent.operationId
@@ -2764,6 +2797,7 @@ export class SyncExecutor {
           && localByPath.get(path)?.exists === true),
       },
       bundleReview,
+      bundlePresentation,
     };
   }
 
@@ -5242,7 +5276,7 @@ export class SyncExecutor {
     options: SyncRunOptions = {},
   ): Promise<SyncResult> {
     if (this.running || this.sideActionRunning || this.queuedSideActionPaths.size > 0) {
-      return { success: false, uploaded: 0, downloaded: 0, deleted: 0, conflicts: 0, deferred: 0, skippedLarge: 0, skippedIgnored: 0, errors: 0, authExpired: false, message: this.t("result.alreadyRunning") };
+      return { success: false, uploaded: 0, downloaded: 0, deleted: 0, conflicts: 0, deferred: 0, skippedLarge: 0, skippedIgnored: 0, skippedInvalidName: 0, errors: 0, authExpired: false, message: this.t("result.alreadyRunning") };
     }
 
     if (options.recoveryOnly === true && !this.state.isV2StateActive) {
@@ -5255,6 +5289,7 @@ export class SyncExecutor {
         deferred: 0,
         skippedLarge: 0,
         skippedIgnored: 0,
+        skippedInvalidName: 0,
         errors: 1,
         authExpired: false,
         message: this.t("result.v2RecoveryBlocked"),
@@ -5391,6 +5426,7 @@ export class SyncExecutor {
       deferred: 0,
       skippedLarge: 0,
       skippedIgnored: 0,
+      skippedInvalidName: 0,
       errors: 0,
       authExpired: false,
       message: "",
@@ -5598,6 +5634,23 @@ export class SyncExecutor {
           `scan incomplete — stopping round before remote preparation; ${result.errors} path(s) uncertain: ${failedPaths.slice(0, 5).join(", ")}`,
         );
         return result;
+      }
+
+      // Step 1b: clear orphaned recovery copies collected during the scan.
+      // Step 0 already reconciled every copy with an intent; anything still
+      // present here is an orphan whose transaction completed (the intent was
+      // deleted before its copy cleanup finished). Removing those copies is
+      // safe: the target was verified present at completion, so the copy is
+      // only the replaced old version.
+      if ((scanResult.recoveryCopies?.length ?? 0) > 0) {
+        const orphanSummary = await this.getRecoveryJournal().cleanupOrphanCopies(
+          scanResult.recoveryCopies ?? [],
+        );
+        this.diag?.log(
+          "execute",
+          `orphaned recovery copies cleaned — ${orphanSummary.removed} removed, ${orphanSummary.retained} retained${orphanSummary.removedPaths.length > 0 ? `: ${orphanSummary.removedPaths.join(", ")}` : ""}`,
+          { mutations: 0 },
+        );
       }
 
       // Step 1.5: Resolve and initialize the remote vault directory.
@@ -6526,7 +6579,14 @@ export class SyncExecutor {
         result.communityPluginJoinBlocks = communityPluginJoinBlocks.map(
           (item) => ({ ...item }),
         );
-        result.deferred += added.length;
+        // Deterministic blocks (manifest-incompatible, e.g. a desktop-only
+        // plugin on mobile) never transfer a file — they recheck on the timed
+        // loop and surface on the plugin row with their own status. Counting
+        // them as file deferrals makes every round look "partially completed"
+        // with a misleading "changed again before transfer" message forever.
+        result.deferred += added.filter(
+          (item) => !isCommunityPluginJoinBlockDeterministic(item.reason),
+        ).length;
       };
       const identityBlocks: CommunityPluginJoinBlock[] = [];
       for (const authorization of
@@ -9030,7 +9090,8 @@ export class SyncExecutor {
           : "unknown";
       // Preserve message set by executePlan (e.g. auth expired, cancelled)
       if (!result.message) {
-        const skipped = result.skippedLarge + result.skippedIgnored;
+        const skipped = result.skippedLarge + result.skippedIgnored
+          + result.skippedInvalidName;
         const resultKey = result.errors > 0
           ? "result.partial"
           : result.conflicts > 0
@@ -9686,7 +9747,8 @@ export class SyncExecutor {
           callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize);
           return;
         }
-        if (item.type === SyncActionType.SkipLargeFile) {
+        if (item.type === SyncActionType.SkipLargeFile
+          || item.type === SyncActionType.SkipOneDriveInvalidName) {
           const reason = item.reason
             ? this.t(item.reason)
             : this.t("syncView.fileStatus.skip");
@@ -11734,6 +11796,7 @@ export class SyncExecutor {
       deferred: 0,
       skippedLarge: 0,
       skippedIgnored: 0,
+      skippedInvalidName: 0,
       errors: 0,
       authExpired: false,
       message: "",
@@ -12971,6 +13034,17 @@ export class SyncExecutor {
   ): Promise<"not-applied" | MutationCheckpointV1 | null> {
     if (isFolderMutationIntent(intent)) {
       return this.classifyUnreceiptedFolderMutation(intent);
+    }
+    // A path OneDrive can never store (Graph rejects the item name with 400
+    // even when the URL is correctly percent-encoded; see
+    // findOneDriveInvalidNameIssue) can never exist remotely, so an upload
+    // intent targeting it can never have been applied. That is statically
+    // provable "not applied": no local or remote observation can change it,
+    // while every Graph request for the path throws 400 and would block
+    // mutation recovery forever. Settle the intent with zero requests (SC-15
+    // permits abandoning an intent only when non-application is provable).
+    if (intent.action === "upload" && hasOneDriveInvalidNamePath(intent.path)) {
+      return "not-applied";
     }
     const local = await this.inspectLocalPathForMutation(intent.path, intent);
     if (local === null || local.status === "uncertain") return null;
@@ -15048,6 +15122,10 @@ export class SyncExecutor {
       }
 
       case SyncActionType.SkipLargeFile:
+        return { executed: true };
+
+      case SyncActionType.SkipOneDriveInvalidName:
+        result.skippedInvalidName++;
         return { executed: true };
 
       case SyncActionType.SkipIgnoredPath:

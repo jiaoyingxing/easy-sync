@@ -297,6 +297,12 @@ export interface LocaleStrings {
   "syncView.mutationResolution.action.merge": string;
   "syncView.pluginBundleReview.title": string;
   "syncView.pluginBundleReview.description": string;
+  "syncView.pluginBundleReview.versionLabel": string;
+  "syncView.pluginBundleReview.version": string;
+  "syncView.pluginBundleReview.fileIdentical": string;
+  "syncView.pluginBundleReview.fileDifferent": string;
+  "syncView.pluginBundleReview.fileLocalOnly": string;
+  "syncView.pluginBundleReview.fileRemoteOnly": string;
   "syncView.pluginBundleReview.loading": string;
   "syncView.pluginBundleReview.loadUnavailable": string;
   "syncView.pluginBundleReview.conflictSummary": string;
@@ -416,6 +422,7 @@ export interface LocaleStrings {
 
   // ---- Sync Plan Reasons ----
   "reason.fileExceedsSizeLimit": string;
+  "reason.fileNameNotSyncable": string;
   "reason.newFileBothSides": string;
   "reason.localDeletedRemoteModified": string;
   "reason.fileDeletedLocally": string;
@@ -596,6 +603,8 @@ export interface LocaleStrings {
   "syncAction.skipLargeFile.active": string;
   "syncAction.skipIgnoredPath.label": string;
   "syncAction.skipIgnoredPath.active": string;
+  "syncAction.skipOneDriveInvalidName.label": string;
+  "syncAction.skipOneDriveInvalidName.active": string;
   "syncAction.retryLater.label": string;
   "syncAction.retryLater.active": string;
   "syncAction.authExpired.label": string;

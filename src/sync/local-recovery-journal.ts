@@ -185,6 +185,50 @@ export class LocalRecoveryJournal {
       || await this.adapter.exists(`${this.intentPath}.next`);
   }
 
+  /**
+   * Delete orphaned `${target}.easy-sync-recovery` copies collected by the
+   * local scan. A copy only becomes an orphan after complete() already removed
+   * the intent — at that point the target was verified present, so the copy is
+   * merely the replaced old version and removing it loses nothing. The target
+   * must still exist; when it is missing (abnormal), the copy is retained as
+   * the only remaining content. An active intent owns its copy, so orphan
+   * cleanup never runs while one is pending (the round's Step-0 recover()
+   * reconciles those first). Failures are skipped and retried next round.
+   */
+  async cleanupOrphanCopies(
+    copies: readonly string[],
+  ): Promise<{
+    removed: number;
+    retained: number;
+    removedPaths: string[];
+  }> {
+    if (copies.length === 0) return { removed: 0, retained: 0, removedPaths: [] };
+    if (await this.hasPendingRecovery()) {
+      return { removed: 0, retained: copies.length, removedPaths: [] };
+    }
+    const suffix = ".easy-sync-recovery";
+    let removed = 0;
+    let retained = 0;
+    const removedPaths: string[] = [];
+    for (const copy of copies) {
+      const targetPath = copy.slice(0, -suffix.length);
+      try {
+        if (await this.adapter.exists(copy)) {
+          if (await this.adapter.exists(targetPath)) {
+            await this.adapter.remove(copy);
+            removed++;
+            removedPaths.push(copy);
+          } else {
+            retained++;
+          }
+        }
+      } catch {
+        retained++;
+      }
+    }
+    return { removed, retained, removedPaths };
+  }
+
   async recover(): Promise<RecoveryOutcome> {
     const intent = await this.readIntent();
     if (!intent) return "none";

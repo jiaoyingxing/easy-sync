@@ -522,6 +522,7 @@ export interface SyncHistoryEntry {
   skipped: number;
   skippedLarge?: number;
   skippedIgnored?: number;
+  skippedInvalidName?: number;
   errors: number;
   message: string;
   files: FileProgress[];

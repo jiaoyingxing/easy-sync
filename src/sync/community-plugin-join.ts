@@ -57,6 +57,19 @@ export function communityPluginJoinBlockRequiresTargetRebind(
     && COMMUNITY_PLUGIN_JOIN_BLOCK_REASONS_REQUIRING_TARGET_REBIND.has(reason);
 }
 
+/** A join block that is deterministic for the current remote manifest. For
+ *  these the plugin stays device non-participating until its remote bundle
+ *  changes; the next recheck is driven by the same recheckable loop without
+ *  any file transfer happening. They surface on the plugin row with their own
+ *  status and must not be counted as file-transfer deferrals — otherwise a
+ *  permanently desktop-only plugin keeps every sync round "partially
+ *  completed" with a misleading "changed again before transfer" message. */
+export function isCommunityPluginJoinBlockDeterministic(
+  reason: string | undefined,
+): boolean {
+  return reason === "manifest-incompatible";
+}
+
 export interface CommunityPluginJoinAuthorization {
   pluginId: string;
   operationId: string;

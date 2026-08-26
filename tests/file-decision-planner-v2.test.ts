@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   generateFileDecisionPlanV2,
+  hasOneDriveInvalidNamePath,
   protectEasySyncSelfSyncPlan,
   type FileDecisionFactsV2,
 } from "../src/sync/file-decision-planner-v2";
@@ -225,6 +226,34 @@ describe("V2 pure file decision planner", () => {
         reason: "reason.fileExceedsSizeLimit",
       }],
     },
+    {
+      name: "new local files with names OneDrive can never store are skipped visibly",
+      facts: {
+        localEntries: [local("第25课：Do the English speak english?.md")],
+        remoteEntries: [],
+        baseEntries: [],
+        skippedLarge: [],
+      },
+      expected: [{
+        type: SyncActionType.SkipOneDriveInvalidName,
+        path: "第25课：Do the English speak english?.md",
+        reason: "reason.fileNameNotSyncable",
+      }],
+    },
+    {
+      name: "an existing OneDrive-invalid local path never uploads over a changed base",
+      facts: {
+        localEntries: [local("trailing-dot-name.", "33".repeat(32), 12)],
+        remoteEntries: [],
+        baseEntries: [base("trailing-dot-name.")],
+        skippedLarge: [],
+      },
+      expected: [{
+        type: SyncActionType.SkipOneDriveInvalidName,
+        path: "trailing-dot-name.",
+        reason: "reason.fileNameNotSyncable",
+      }],
+    },
   ];
 
   it.each(classificationCases)("$name", ({ facts, expected }) => {
@@ -283,6 +312,34 @@ describe("V2 pure file decision planner", () => {
         reason: "reason.renameIdentityAmbiguous",
       }),
     ]);
+  });
+
+  it("keeps a rename whose target OneDrive can never store as a visible skip", () => {
+    const plan = generateFileDecisionPlanV2({
+      localEntries: [local("notes/new?.md")],
+      remoteEntries: [remote("notes/old.md")],
+      baseEntries: [base("notes/old.md")],
+      skippedLarge: [],
+    });
+
+    // The remote old path stays a marked rename source, so it is never
+    // planned as a local deletion; only the visible skip is produced.
+    expect(plan.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.SkipOneDriveInvalidName,
+        path: "notes/new?.md",
+        reason: "reason.fileNameNotSyncable",
+      }),
+    ]);
+  });
+
+  it("detects OneDrive-invalid names per path segment", () => {
+    expect(hasOneDriveInvalidNamePath("ok.md")).toBe(false);
+    expect(hasOneDriveInvalidNamePath("dir/ok.md")).toBe(false);
+    expect(hasOneDriveInvalidNamePath("dir?/ok.md")).toBe(true);
+    expect(hasOneDriveInvalidNamePath("ok?.md")).toBe(true);
+    expect(hasOneDriveInvalidNamePath("trailing-dot.")).toBe(true);
+    expect(hasOneDriveInvalidNamePath("trailing-space ")).toBe(true);
   });
 
   it("keeps safe action ordering in the pure planner", () => {

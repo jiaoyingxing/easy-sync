@@ -6,6 +6,8 @@ export interface FileComparisonRow {
   remote: string;
   localHighlighted?: boolean;
   remoteHighlighted?: boolean;
+  /** Short per-row state shown muted next to the label (e.g. 一致 / 不同). */
+  status?: string;
 }
 
 export interface FileComparisonAction {
@@ -71,7 +73,11 @@ export abstract class FileComparisonModal extends Modal {
     const tbody = table.createEl("tbody");
     for (const row of rows) {
       const rowEl = tbody.createEl("tr");
-      rowEl.createEl("td", { text: row.label });
+      const labelCell = rowEl.createEl("td");
+      labelCell.setText(row.label);
+      if (row.status) {
+        labelCell.createSpan("easy-sync-meta-status").setText(row.status);
+      }
       const localCell = rowEl.createEl("td", "easy-sync-meta-col-local");
       localCell.setText(row.local);
       if (row.localHighlighted) localCell.addClass("easy-sync-meta-highlight");
