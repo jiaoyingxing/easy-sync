@@ -5,6 +5,7 @@
  *   - Account and sync action (no heading, always visible)
  *   - Scope (范围)
  *   - Automatic (自动)
+ *   - Display (显示)
  *   - About (关于)
  *   - Maintenance (维护)
  */
@@ -99,6 +100,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
   private accountSectionEl: HTMLElement | null = null;
   private rangeSectionEl: HTMLElement | null = null;
   private automaticSectionEl: HTMLElement | null = null;
+  private displaySectionEl: HTMLElement | null = null;
   private aboutSectionEl: HTMLElement | null = null;
   private maintenanceSectionEl: HTMLElement | null = null;
 
@@ -119,6 +121,9 @@ export class EasySyncSettingTab extends PluginSettingTab {
     this.automaticSectionEl = containerEl.createDiv(
       "easy-sync-settings-group-host easy-sync-settings-automatic",
     );
+    this.displaySectionEl = containerEl.createDiv(
+      "easy-sync-settings-group-host easy-sync-settings-display",
+    );
     this.aboutSectionEl = containerEl.createDiv("easy-sync-settings-group-host easy-sync-settings-about");
     this.maintenanceSectionEl = containerEl.createDiv(
       "easy-sync-settings-group-host easy-sync-settings-maintenance",
@@ -138,6 +143,11 @@ export class EasySyncSettingTab extends PluginSettingTab {
     // Automatic group
     // ========================================================================
     this.renderAutomaticSection(t);
+
+    // ========================================================================
+    // Display group
+    // ========================================================================
+    this.renderDisplaySection(t);
 
     // ========================================================================
     // About group
@@ -161,11 +171,13 @@ export class EasySyncSettingTab extends PluginSettingTab {
       !this.accountSectionEl?.isConnected
       && !this.rangeSectionEl?.isConnected
       && !this.automaticSectionEl?.isConnected
+      && !this.displaySectionEl?.isConnected
     ) return;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     this.renderAccountSection(t);
     this.renderRangeSection(t);
     this.renderAutomaticSection(t);
+    this.renderDisplaySection(t);
   }
 
   hide(): void {
@@ -173,6 +185,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
     this.accountSectionEl = null;
     this.rangeSectionEl = null;
     this.automaticSectionEl = null;
+    this.displaySectionEl = null;
     this.aboutSectionEl = null;
     this.maintenanceSectionEl = null;
   }
@@ -404,6 +417,38 @@ export class EasySyncSettingTab extends PluginSettingTab {
           });
       });
     }
+  }
+
+  private renderDisplaySection(
+    t: (key: string, params?: Record<string, string | number>) => string,
+  ): void {
+    if (!this.displaySectionEl) return;
+    this.displaySectionEl.empty();
+    const displayGroup = new SettingGroup(this.displaySectionEl).setHeading(
+      t("settings.group.display"),
+    );
+
+    displayGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.notificationPopups.name"))
+        .setDesc(t("settings.notificationPopups.desc"))
+        .addDropdown((dropdown) => {
+          dropdown
+            .addOption("all", t("settings.notificationPopups.option.all"))
+            .addOption(
+              "important",
+              t("settings.notificationPopups.option.important"),
+            )
+            .addOption("off", t("settings.notificationPopups.option.off"))
+            .setValue(this.plugin.notificationPopups)
+            .onChange(async (value) => {
+              this.plugin.notificationPopups =
+                value === "important" || value === "off" ? value : "all";
+              await this.plugin.saveSyncSettings();
+              this.plugin.applyNotificationPopups();
+            });
+        });
+    });
   }
 
   private renderAboutSection(

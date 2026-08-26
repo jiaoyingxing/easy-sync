@@ -30,8 +30,13 @@ import { join } from "node:path";
 const SRC_DIR = "src";
 const CSS_FILE = "styles.css";
 
-/** 历史从未定义过样式的结构性钩子（git 溯源见 08024-0415 日志排查）。 */
+/** 历史从未定义过样式的结构性钩子（git 溯源见 08024-0415 日志排查）。
+ *  easy-sync-ribbon 例外：2026-08-26 拍板 ribbon 去色，三条
+ *  `.easy-sync-ribbon[data-easy-sync-status=...]` 颜色规则整体删除
+ *  （styles.css 不再定义该类），图标/tooltip 动态保留 → 该类现为无样式的
+ *  结构性标记钩子，登记在此防止 parity gate 误红。 */
 const STRUCTURAL_HOOKS = new Set([
+  "easy-sync-ribbon",
   "easy-sync-auth-device-code-modal",
   "easy-sync-login-notice",
   "easy-sync-automatic-handling",
@@ -46,6 +51,7 @@ const STRUCTURAL_HOOKS = new Set([
   "easy-sync-notice-result",
   "easy-sync-settings-range",
   "easy-sync-settings-automatic",
+  "easy-sync-settings-display",
   "easy-sync-settings-maintenance",
 ]);
 

@@ -70,6 +70,7 @@ const methodModalState = vi.hoisted(() => ({
   action: "dismiss" as "browser" | "device" | "dismiss",
   deviceRejects: false,
   captured: null as null | {
+    lead: string;
     browser: { title: string; description: string };
     device: { title: string; description: string };
     onBrowserSelect: () => void | Promise<void>;
@@ -81,12 +82,14 @@ vi.mock("../src/ui/auth-method-modal", () => ({
   AuthMethodModal: class {
     constructor(
       _app: unknown,
+      lead: string,
       browser: { title: string; description: string },
       device: { title: string; description: string },
       onBrowserSelect: () => void | Promise<void>,
       onDeviceSelect: () => Promise<unknown>,
     ) {
       methodModalState.captured = {
+        lead,
         browser,
         device,
         onBrowserSelect,
@@ -287,6 +290,9 @@ describe("handleAuthEntryAction", () => {
     await handleAuthEntryAction(host);
 
     expect(methodModalState.captured).not.toBeNull();
+    expect(methodModalState.captured?.lead).toBe(
+      "settings.account.method.lead",
+    );
     expect(methodModalState.captured?.browser.title).toBe(
       "settings.account.method.browser.name",
     );

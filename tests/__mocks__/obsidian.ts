@@ -237,6 +237,17 @@ export class SliderComponent {
   onChange(_callback: (value: number) => void | Promise<void>): this { return this; }
 }
 
+export class DropdownComponent {
+  selectEl = {} as HTMLSelectElement;
+
+  constructor(_containerEl: HTMLElement) {}
+  addOption(_value: string, _display: string): this { return this; }
+  addOptions(_options: Record<string, string>): this { return this; }
+  setValue(_value: string): this { return this; }
+  setDisabled(_disabled: boolean): this { return this; }
+  onChange(_callback: (value: string) => void | Promise<void>): this { return this; }
+}
+
 export class Setting {
   constructor(_containerEl: HTMLElement) {}
   setName(_name: string): this { return this; }
@@ -255,6 +266,10 @@ export class Setting {
   }
   addSlider(callback: (component: SliderComponent) => void): this {
     callback(new SliderComponent({} as HTMLElement));
+    return this;
+  }
+  addDropdown(callback: (component: DropdownComponent) => void): this {
+    callback(new DropdownComponent({} as HTMLElement));
     return this;
   }
 }

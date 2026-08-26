@@ -201,4 +201,167 @@ describe("EasySyncNoticeCenter", () => {
     expect(created).toHaveLength(2);
     expect(center.activeKey).toBeNull();
   });
+
+  it("keeps ambient notices visible by default (all level)", () => {
+    expect(center.show({
+      key: "ambient-info",
+      message: "m",
+      priority: NOTICE_PRIORITY.info,
+      category: "ambient",
+    })).toBe(true);
+    expect(center.activeKey).toBe("ambient-info");
+  });
+
+  it("rejects low-priority ambient requests under the important level", () => {
+    center.setNotificationPopups("important");
+
+    expect(center.show({
+      key: "ambient-low",
+      message: "m",
+      priority: NOTICE_PRIORITY.action,
+      category: "ambient",
+    })).toBe(false);
+    expect(created).toHaveLength(0);
+    expect(center.activeKey).toBeNull();
+
+    expect(center.show({
+      key: "ambient-attention",
+      message: "m",
+      priority: NOTICE_PRIORITY.attention,
+      category: "ambient",
+    })).toBe(true);
+    expect(center.activeKey).toBe("ambient-attention");
+
+    expect(center.show({
+      key: "ambient-failure",
+      message: "m",
+      priority: NOTICE_PRIORITY.failure,
+      category: "ambient",
+    })).toBe(true);
+    expect(created).toHaveLength(2);
+  });
+
+  it("keeps safety and feedback visible under the off level", () => {
+    center.setNotificationPopups("off");
+
+    expect(center.show({
+      key: "feedback",
+      message: "saved",
+      priority: NOTICE_PRIORITY.info,
+    })).toBe(true);
+    expect(center.show({
+      key: "safety",
+      message: "blocked",
+      priority: NOTICE_PRIORITY.info,
+      category: "safety",
+    })).toBe(true);
+
+    // Even a critical ambient request is rejected and cannot preempt.
+    expect(center.show({
+      key: "ambient-critical",
+      message: "m",
+      priority: NOTICE_PRIORITY.critical,
+      category: "ambient",
+    })).toBe(false);
+    expect(created).toHaveLength(2);
+    expect(center.activeKey).toBe("safety");
+  });
+
+  it("rejected ambient requests never occupy the slot or write resumable state", () => {
+    center.setNotificationPopups("off");
+    expect(center.show({
+      key: "sync-progress",
+      message: "progress",
+      priority: NOTICE_PRIORITY.progress,
+      durationMs: 0,
+      resumable: true,
+      category: "ambient",
+    })).toBe(false);
+    expect(created).toHaveLength(0);
+    expect(center.activeKey).toBeNull();
+
+    expect(center.show({
+      key: "action-result",
+      message: "saved",
+      priority: NOTICE_PRIORITY.action,
+      durationMs: 1_000,
+    })).toBe(true);
+    expect(created).toHaveLength(1);
+
+    vi.advanceTimersByTime(1_000);
+    expect(created[0].hidden).toBe(true);
+    expect(center.activeKey).toBeNull();
+    // The rejected ambient progress never resurfaced.
+    expect(created).toHaveLength(1);
+  });
+
+  it("hides a displayed ambient notice immediately when the level tightens", () => {
+    center.show({
+      key: "sync-progress",
+      message: "progress",
+      priority: NOTICE_PRIORITY.progress,
+      durationMs: 0,
+      resumable: true,
+      category: "ambient",
+    });
+    expect(center.activeKey).toBe("sync-progress");
+
+    center.setNotificationPopups("important");
+    expect(center.activeKey).toBeNull();
+    expect(created[0].hidden).toBe(true);
+
+    // A qualifying ambient request still shows at the new level.
+    expect(center.show({
+      key: "sync-result:conflicts",
+      message: "conflicts",
+      priority: NOTICE_PRIORITY.attention,
+      category: "ambient",
+    })).toBe(true);
+    expect(center.activeKey).toBe("sync-result:conflicts");
+
+    center.setNotificationPopups("off");
+    expect(center.activeKey).toBeNull();
+    expect(created[1].hidden).toBe(true);
+  });
+
+  it("drops a stored resumable ambient request when the level tightens", () => {
+    center.show({
+      key: "sync-progress",
+      message: "1/3",
+      priority: NOTICE_PRIORITY.progress,
+      durationMs: 0,
+      resumable: true,
+      category: "ambient",
+    });
+    center.show({
+      key: "action-result",
+      message: "saved",
+      priority: NOTICE_PRIORITY.action,
+      durationMs: 1_000,
+    });
+
+    center.setNotificationPopups("off");
+    vi.advanceTimersByTime(1_000);
+
+    expect(created).toHaveLength(2);
+    expect(created[1].hidden).toBe(true);
+    expect(center.activeKey).toBeNull();
+  });
+
+  it("accepts the initial level through the constructor", () => {
+    const strictCenter = new EasySyncNoticeCenter((message) => {
+      const notice = new FakeNotice(message);
+      created.push(notice);
+      return notice;
+    }, "off");
+
+    expect(strictCenter.show({
+      key: "ambient-critical",
+      message: "m",
+      priority: NOTICE_PRIORITY.critical,
+      category: "ambient",
+    })).toBe(false);
+    expect(created).toHaveLength(0);
+    strictCenter.dispose();
+  });
 });

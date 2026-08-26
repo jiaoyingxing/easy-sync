@@ -99,7 +99,7 @@ import {
 } from "./sync/types";
 import { I18n } from "./i18n/index";
 import { OperationLifecycle } from "./sync/operation-lifecycle";
-import { EasySyncNoticeCenter, NOTICE_PRIORITY } from "./ui/notice-center";
+import { EasySyncNoticeCenter, NOTICE_PRIORITY, type EasySyncNotificationPopupsLevel } from "./ui/notice-center";
 import {
   createSyncProgressNoticeMessage,
   formatSyncProgressNoticeLabel,
@@ -224,6 +224,7 @@ const KEY_SYNC_EXCLUDED_FOLDERS = "sync-excluded-folders";
 const KEY_AUTO_SYNC_PAUSED = "auto-sync-paused";
 const KEY_LEGACY_AUTO_MERGE = "sync-auto-merge";
 const KEY_AUTOMATIC_HANDLING_POLICY = "sync-auto-conflict-policy";
+const KEY_NOTIFICATION_POPUPS = "notification-popups";
 const KEY_PROFILE_CACHE = "easy-sync-profile-cache";
 const RIBBON_SUCCESS_DURATION_MS = 5_000;
 const SYNC_RESULT_NOTICE_DURATION_MS = 2_000;
@@ -441,6 +442,18 @@ type ResetMutationRecoveryDisposition =
   | { kind: "isolated"; entries: ConservativeResetEntries }
   | { kind: "blocked" };
 
+/**
+ * Semantic groups the single status bar item exposes via `.is-*` classes
+ * (is-loggedOut / is-attention / is-syncing / is-ready), mirroring the sidebar
+ * status line class scheme (sync-view.ts). A subset of RibbonStatus: the status
+ * bar never enters the transient "success" state (常驻位不闪烁), and "cancelling"
+ * collapses into the syncing presentation.
+ */
+type StatusBarStatusGroup = Extract<
+  RibbonStatus,
+  "loggedOut" | "attention" | "syncing" | "ready"
+>;
+
 export class SyncPathSettingsUpdateError extends Error {
   constructor(readonly code: "busy" | "recovery") {
     super(code);
@@ -473,6 +486,13 @@ function measurePluginDataWrite(data: Record<string, unknown>): {
     .sort((left, right) => right.bytes - left.bytes)
     .slice(0, 5);
   return { serializedBytes, topLevelKeys: Object.keys(data).length, largestKeys };
+}
+
+/** Notification popups level normalization: unknown/legacy values fall back to "all". */
+function normalizeNotificationPopupsLevel(
+  value: unknown,
+): EasySyncNotificationPopupsLevel {
+  return value === "important" || value === "off" ? value : "all";
 }
 
 /**
@@ -519,6 +539,7 @@ export default class EasySyncPlugin extends Plugin {
   excludedFolders: string[] = [];
   diagLogEnabled = false;
   autoSyncPaused = false;
+  notificationPopups: EasySyncNotificationPopupsLevel = "all";
   private opLock: string | null = null;
   private autoSyncTimer: IntervalHandle | null = null;
   private descendantFileReconstructionTimer: TimeoutHandle | null = null;
@@ -761,6 +782,7 @@ export default class EasySyncPlugin extends Plugin {
     );
     this.ribbonEl.addClass("easy-sync-ribbon");
     this.statusBarEl = this.addStatusBarItem();
+    this.initStatusBar();
     this.updateStatusBar(); // Shows "Connecting…" while auth initializes
     this.addCommand({
       id: "start-sync",
@@ -978,6 +1000,7 @@ export default class EasySyncPlugin extends Plugin {
           message: this.i18n.t("result.v2StateLoadBlocked"),
           priority: NOTICE_PRIORITY.critical,
           className: "easy-sync-notice-action",
+          category: "safety",
         });
         return false;
       }
@@ -987,6 +1010,7 @@ export default class EasySyncPlugin extends Plugin {
           message: this.i18n.t("result.v2ScopeRecoveryPending"),
           priority: NOTICE_PRIORITY.critical,
           className: "easy-sync-notice-action",
+          category: "safety",
         });
         return false;
       }
@@ -996,6 +1020,7 @@ export default class EasySyncPlugin extends Plugin {
           message: this.i18n.t("notice.v2MigrationRequired"),
           priority: NOTICE_PRIORITY.attention,
           className: "easy-sync-notice-action",
+          category: "safety",
         });
         return false;
       }
@@ -1904,6 +1929,7 @@ export default class EasySyncPlugin extends Plugin {
             current: `${currentId.slice(0, 8)}…`,
           }),
           priority: NOTICE_PRIORITY.critical,
+          category: "safety",
         });
       }
       this.diag.warn("lifecycle", `account mismatch — bound=${bound.slice(0, 8)}, current=${currentId.slice(0, 8)}`);
@@ -1936,6 +1962,7 @@ export default class EasySyncPlugin extends Plugin {
           key: "community-plugin-enablement-retired",
           message: this.i18n.t("notice.communityPlugins.enablementRetired"),
           priority: NOTICE_PRIORITY.info,
+          category: "safety",
         });
       }
       try {
@@ -2240,6 +2267,7 @@ export default class EasySyncPlugin extends Plugin {
       durationMs: 0,
       className: "easy-sync-notice-progress",
       resumable: true,
+      category: "ambient",
     });
   }
 
@@ -2283,6 +2311,7 @@ export default class EasySyncPlugin extends Plugin {
       durationMs: 0,
       className: "easy-sync-notice-progress",
       resumable: true,
+      category: "ambient",
     });
   }
 
@@ -2334,6 +2363,7 @@ export default class EasySyncPlugin extends Plugin {
       priority: priorities[outcome.kind],
       durationMs: SYNC_RESULT_NOTICE_DURATION_MS,
       className: "easy-sync-notice-result",
+      category: outcome.kind === "authExpired" ? "safety" : "ambient",
     });
   }
 
@@ -2633,6 +2663,7 @@ export default class EasySyncPlugin extends Plugin {
       message: this.i18n.t("notice.sync.recoveryResetBlocked"),
       priority: NOTICE_PRIORITY.attention,
       durationMs: 10_000,
+      category: "safety",
     });
     this.updateStatusBar();
     this.syncView?.render();
@@ -3349,6 +3380,7 @@ export default class EasySyncPlugin extends Plugin {
       priority: NOTICE_PRIORITY.action,
       durationMs: 5_000,
       className: "easy-sync-notice-result",
+      category: "ambient",
     });
   }
 
@@ -3360,6 +3392,7 @@ export default class EasySyncPlugin extends Plugin {
       priority: NOTICE_PRIORITY.info,
       durationMs: SYNC_RESULT_NOTICE_DURATION_MS,
       className: "easy-sync-notice-result",
+      category: "ambient",
     });
   }
 
@@ -3371,6 +3404,7 @@ export default class EasySyncPlugin extends Plugin {
       priority: NOTICE_PRIORITY.attention,
       durationMs: 8_000,
       className: "easy-sync-notice-result",
+      category: "safety",
     });
   }
 
@@ -4177,6 +4211,9 @@ export default class EasySyncPlugin extends Plugin {
     );
     if (data) {
       if (typeof data[KEY_SYNC_INTERVAL] === "number") this.syncInterval = data[KEY_SYNC_INTERVAL];
+      this.notificationPopups = normalizeNotificationPopupsLevel(
+        data[KEY_NOTIFICATION_POPUPS],
+      );
       if (typeof data[KEY_SYNC_PLUGIN_FILES] === "boolean") this.syncPluginFiles = data[KEY_SYNC_PLUGIN_FILES];
       if (typeof data[KEY_DIAG_LOG] === "boolean") this.diagLogEnabled = data[KEY_DIAG_LOG];
       if (typeof data[KEY_SYNC_EDITOR] === "boolean") this.syncEditorSettings = data[KEY_SYNC_EDITOR];
@@ -4221,6 +4258,7 @@ export default class EasySyncPlugin extends Plugin {
     this.applySyncPathSettings();
     this.applyMaxFileSize();
     this.applyDiagnosticSetting();
+    this.applyNotificationPopups();
   }
 
   /** M14: serialized PluginData write. All callers (StateManager, settings,
@@ -4325,6 +4363,7 @@ export default class EasySyncPlugin extends Plugin {
       data[KEY_AUTO_SYNC_PAUSED] = this.autoSyncPaused;
       data[KEY_MAX_FILE_SIZE_MB] = this.syncMaxFileSizeMb;
       data[KEY_AUTOMATIC_HANDLING_POLICY] = { ...this.automaticHandlingPolicy };
+      data[KEY_NOTIFICATION_POPUPS] = this.notificationPopups;
     });
   }
 
@@ -6015,6 +6054,12 @@ export default class EasySyncPlugin extends Plugin {
     }
   }
 
+  /** Apply the notification popups level to the notice center. Public so
+   *  settings-tab can call it; also applied after loadSyncSettings. */
+  applyNotificationPopups(): void {
+    this.noticeCenter.setNotificationPopups(this.notificationPopups);
+  }
+
   /** Generate a diagnostic report Markdown file in the vault root.
    *  Collects recent anomalies from state and diagnostic buffer. */
   async generateDiagnosticReport(): Promise<void> {
@@ -6570,30 +6615,97 @@ export default class EasySyncPlugin extends Plugin {
 
   // ---- Status bar ----
 
+  /**
+   * One-time status bar item setup: host interaction classes + single click
+   * binding. The click reuses the ribbon's existing semantics through the same
+   * private `handleRibbonClick()` (未登录→打开设置 / ready→startManualSync /
+   * 其余→activateSyncView), so the two entry points can never drift apart.
+   * Never re-run per refresh — updateStatusBar only rebuilds child nodes.
+   */
+  private initStatusBar(): void {
+    if (!this.statusBarEl) return;
+    this.statusBarEl.addClass("easy-sync-status-bar-item");
+    this.statusBarEl.addClass("mod-clickable");
+    this.statusBarEl.onClickEvent(() => {
+      void this.handleRibbonClick();
+    });
+  }
+
+  /**
+   * Rebuild the status bar item: icon-only (slice 3, 2026-08-26 ③ 方案 A,
+   * isomorphic with the official Obsidian Sync item) — host
+   * `status-bar-item-segment` > icon container (`status-bar-item-icon`,
+   * filled via setIcon), **no text span**. The full status text is carried by
+   * setTooltip + `aria-label` (same wording, 无障碍一致), so hover / screen
+   * readers still get the state without any permanent text.
+   * `empty()` only clears child nodes, so the item classes are managed
+   * explicitly here: the full `.is-*` set is cleared first, then the current
+   * group class is added (same first-clear/add-current pattern as the sidebar
+   * status line, sync-view.ts). The connecting branch carries no group and
+   * therefore no `.is-*` class (default grey).
+   */
+  private renderStatusBarItem(
+    el: HTMLElement,
+    iconId: string,
+    group: StatusBarStatusGroup | null,
+    text: string,
+  ): void {
+    el.empty();
+    el.removeClass(
+      "is-loggedOut",
+      "is-cancelling",
+      "is-syncing",
+      "is-attention",
+      "is-success",
+      "is-ready",
+    );
+    if (group) {
+      el.addClass(`is-${group}`);
+    }
+    const segment = el.createDiv({ cls: "status-bar-item-segment" });
+    const iconEl = segment.createDiv({ cls: "status-bar-item-icon" });
+    setIcon(iconEl, iconId);
+    setTooltip(el, text);
+    el.setAttr("aria-label", text);
+  }
+
   updateStatusBar(): void {
     this.updateRibbon();
     this.settingsTab?.refreshSyncState();
     if (!this.statusBarEl) return;
-    this.statusBarEl.empty();
     const t = this.i18n.t.bind(this.i18n);
     const fullSyncRunning = this.syncExecutor?.isRunning ?? false;
     const sideActionRunning = this.syncExecutor?.hasSideActionsInFlight ?? false;
     const isRunning = isAnySyncActivityRunning(this.progressStore.state, fullSyncRunning, sideActionRunning);
 
-    // Auth still initializing in background -> show "Connecting..."
+    // Auth still initializing in background -> show "Connecting…" with a plain
+    // cloud icon (no alarming color while the auth outcome is still unknown).
     if (this.auth?.isInitializing) {
-      this.statusBarEl.setText(t("status.connecting"));
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.ready,
+        null,
+        t("status.connecting"),
+      );
       return;
     }
 
     const authState = this.auth?.authState;
     if (!authState?.isLoggedIn) {
-      this.statusBarEl.setText(t("status.notLoggedIn"));
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.loggedOut,
+        "loggedOut",
+        t("status.notLoggedIn"),
+      );
       return;
     }
 
     if (isRunning) {
-      this.statusBarEl.setText(
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.syncing,
+        "syncing",
         this.progressStore.state.activityKind === "mutationRecovery"
           ? t("status.recovering")
           : t("status.syncing"),
@@ -6603,44 +6715,89 @@ export default class EasySyncPlugin extends Plugin {
 
     // Plan review active (sync paused, user needs to confirm in sidebar)
     if (this.state?.planReviewActive) {
-      this.statusBarEl.setText(t("status.planReview"));
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.attention,
+        "attention",
+        t("status.planReview"),
+      );
       return;
     }
 
     const conflicts = this.state?.pendingConflicts?.length ?? 0;
     const deletes = this.state?.pendingRemoteDeletes?.length ?? 0;
     if (conflicts > 0 && deletes > 0) {
-      this.statusBarEl.setText(t("status.conflictsAndDeletes", { conflicts, deletes }));
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.attention,
+        "attention",
+        t("status.conflictsAndDeletes", { conflicts, deletes }),
+      );
       return;
     }
     if (conflicts > 0) {
-      this.statusBarEl.setText(t("status.conflicts", { count: conflicts }));
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.attention,
+        "attention",
+        t("status.conflicts", { count: conflicts }),
+      );
       return;
     }
     if (deletes > 0) {
-      this.statusBarEl.setText(t("status.pendingDeletes", { count: deletes }));
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.attention,
+        "attention",
+        t("status.pendingDeletes", { count: deletes }),
+      );
       return;
     }
 
     const recovery = this.getMutationRecoveryDisplayState();
     if (recovery?.kind === "waiting-network") {
-      this.statusBarEl.setText(t("status.waitingForNetwork"));
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.attention,
+        "attention",
+        t("status.waitingForNetwork"),
+      );
       return;
     }
     if (recovery?.kind === "blocked") {
-      this.statusBarEl.setText(t("status.recoveryBlocked"));
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.attention,
+        "attention",
+        t("status.recoveryBlocked"),
+      );
       return;
     }
     if (recovery?.kind === "checking") {
-      this.statusBarEl.setText(t("status.recovering"));
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.syncing,
+        "syncing",
+        t("status.recovering"),
+      );
       return;
     }
 
     const lastSync = this.state?.lastSyncTime;
     if (lastSync) {
-      this.statusBarEl.setText(t("status.lastSync", { time: new Date(lastSync).toLocaleTimeString() }));
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.ready,
+        "ready",
+        t("status.lastSync", { time: new Date(lastSync).toLocaleTimeString() }),
+      );
     } else {
-      this.statusBarEl.setText(t("status.ready"));
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.ready,
+        "ready",
+        t("status.ready"),
+      );
     }
   }
 

@@ -34,6 +34,7 @@ export interface LocaleStrings {
   // ---- Settings Groups ----
   "settings.group.scope": string;
   "settings.group.automatic": string;
+  "settings.group.display": string;
   "settings.group.maintenance": string;
   "settings.group.about": string;
 
@@ -59,6 +60,7 @@ export interface LocaleStrings {
   "settings.account.resumeDevice": string;
   "settings.account.browserOpened": string;
   "settings.account.logout": string;
+  "settings.account.method.lead": string;
   "settings.account.method.browser.name": string;
   "settings.account.method.browser.desc": string;
   "settings.account.method.device.name": string;
@@ -183,6 +185,11 @@ export interface LocaleStrings {
   "settings.autoSyncChangeDelay.name": string;
   "settings.autoSyncChangeDelay.desc": string;
   "settings.autoSyncChangeDelay.disabledDesc": string;
+  "settings.notificationPopups.name": string;
+  "settings.notificationPopups.desc": string;
+  "settings.notificationPopups.option.all": string;
+  "settings.notificationPopups.option.important": string;
+  "settings.notificationPopups.option.off": string;
   "settings.maxFileSize.name": string;
   "settings.maxFileSize.desc": string;
   "settings.reset.name": string;

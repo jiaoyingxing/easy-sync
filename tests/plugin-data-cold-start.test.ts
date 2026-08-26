@@ -1341,6 +1341,82 @@ describe("plugin data cold-start cache", () => {
     expect(saveData).not.toHaveBeenCalled();
   });
 
+  it("loads and normalizes the per-device notification popups level without a cold-start write", async () => {
+    const plugin = new EasySyncPlugin();
+    vi.spyOn(plugin, "loadData").mockResolvedValue({
+      "notification-popups": "important",
+    });
+    const saveData = vi.spyOn(plugin, "saveData").mockResolvedValue(undefined);
+
+    await plugin.loadSyncSettings();
+
+    expect(plugin.notificationPopups).toBe("important");
+    expect(saveData).not.toHaveBeenCalled();
+
+    const unknownPlugin = new EasySyncPlugin();
+    vi.spyOn(unknownPlugin, "loadData").mockResolvedValue({
+      "notification-popups": "sometimes",
+    });
+    const unknownSave = vi.spyOn(unknownPlugin, "saveData")
+      .mockResolvedValue(undefined);
+    await unknownPlugin.loadSyncSettings();
+    expect(unknownPlugin.notificationPopups).toBe("all");
+    expect(unknownSave).not.toHaveBeenCalled();
+
+    const defaultPlugin = new EasySyncPlugin();
+    vi.spyOn(defaultPlugin, "loadData").mockResolvedValue({});
+    await defaultPlugin.loadSyncSettings();
+    expect(defaultPlugin.notificationPopups).toBe("all");
+
+    unknownPlugin.notificationPopups = "off";
+    await unknownPlugin.saveSyncSettings();
+    expect(unknownSave).toHaveBeenCalledWith(expect.objectContaining({
+      "notification-popups": "off",
+    }));
+  });
+
+  it("applies the notification popups level to the notice center", async () => {
+    const plugin = new EasySyncPlugin();
+    vi.spyOn(plugin, "loadData").mockResolvedValue({
+      "notification-popups": "off",
+    });
+    vi.spyOn(plugin, "saveData").mockResolvedValue(undefined);
+
+    await plugin.loadSyncSettings();
+
+    // loadSyncSettings applied the level: ambient requests are now rejected
+    // even at critical priority, while feedback stays visible.
+    expect(plugin.noticeCenter.show({
+      key: "ambient",
+      message: "m",
+      priority: 60,
+      category: "ambient",
+    })).toBe(false);
+    expect(plugin.noticeCenter.show({
+      key: "feedback",
+      message: "m",
+      priority: 10,
+    })).toBe(true);
+    expect(plugin.noticeCenter.activeKey).toBe("feedback");
+
+    // A direct apply after a settings change behaves the same.
+    plugin.notificationPopups = "important";
+    plugin.applyNotificationPopups();
+    expect(plugin.noticeCenter.show({
+      key: "ambient-low",
+      message: "m",
+      priority: 10,
+      category: "ambient",
+    })).toBe(false);
+    expect(plugin.noticeCenter.show({
+      key: "ambient-high",
+      message: "m",
+      priority: 40,
+      category: "ambient",
+    })).toBe(true);
+    expect(plugin.noticeCenter.activeKey).toBe("ambient-high");
+  });
+
   it("defaults legacy conflict switches to no deletion authority and saves the canonical policy", async () => {
     const plugin = new EasySyncPlugin();
     vi.spyOn(plugin, "loadData").mockResolvedValue({

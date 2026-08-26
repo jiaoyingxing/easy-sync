@@ -6,17 +6,17 @@ import type { LocaleStrings } from "./types";
 
 const en: LocaleStrings = {
   // ---- Status Bar ----
-  "status.notLoggedIn": "EasySync: Not logged in",
-  "status.connecting": "EasySync: Connecting…",
-  "status.syncing": "EasySync: Syncing…",
-  "status.recovering": "EasySync: Checking an unfinished operation…",
-  "status.waitingForNetwork": "EasySync: Waiting for the network",
-  "status.recoveryBlocked": "EasySync: Previous operation could not be confirmed",
+  "status.notLoggedIn": "Not logged in",
+  "status.connecting": "Connecting…",
+  "status.syncing": "Syncing…",
+  "status.recovering": "Checking…",
+  "status.waitingForNetwork": "Waiting for the network",
+  "status.recoveryBlocked": "Previous operation could not be confirmed",
   "status.conflicts": "{count} conflict(s)",
   "status.pendingDeletes": "{count} pending delete(s)",
-  "status.conflictsAndDeletes": "{conflicts} conflict(s), {deletes} pending delete(s)",
-  "status.lastSync": "EasySync: Last sync {time}",
-  "status.ready": "EasySync: Ready",
+  "status.conflictsAndDeletes": "{conflicts} conflict(s) · {deletes} pending delete(s)",
+  "status.lastSync": "Last sync {time}",
+  "status.ready": "Ready",
 
   // ---- Ribbon ----
   "ribbon.loggedOut": "Not logged in; open EasySync settings",
@@ -32,6 +32,7 @@ const en: LocaleStrings = {
   // ---- Settings Groups ----
   "settings.group.scope": "Scope",
   "settings.group.automatic": "Automatic",
+  "settings.group.display": "Display",
   "settings.group.maintenance": "Maintenance",
   "settings.group.about": "About",
 
@@ -57,10 +58,11 @@ const en: LocaleStrings = {
   "settings.account.authLinkUnavailable": "Couldn’t copy the sign-in link. Reopen the sign-in page.",
   "settings.account.loginSuccess": "Login successful",
   "settings.account.logout": "Log out",
+  "settings.account.method.lead": "Not sure which to pick? Try browser redirect first — if it doesn’t bring you back, come back here and switch.",
   "settings.account.method.browser.name": "Browser redirect",
-  "settings.account.method.browser.desc": "Opens your browser automatically and finishes sign-in when you return to Obsidian",
+  "settings.account.method.browser.desc": "Complete authorization in this device’s browser — Obsidian signs in automatically when you return.",
   "settings.account.method.device.name": "Enter a code",
-  "settings.account.method.device.desc": "Sign in with a 9-character code in your browser — for devices that can’t redirect back to the app",
+  "settings.account.method.device.desc": "Use this if sign-in on this device isn’t possible — you can complete authorization from another device.",
   "settings.account.device.title": "Enter a code",
   "settings.account.device.codeHint": "Enter without spaces",
   "settings.account.device.openVerify": "Open the verification page in your browser",
@@ -181,6 +183,11 @@ const en: LocaleStrings = {
   "settings.autoSyncChangeDelay.name": "Sync after changes",
   "settings.autoSyncChangeDelay.desc": "Start after a {seconds}-second quiet period; new local changes restart the timer.",
   "settings.autoSyncChangeDelay.disabledDesc": "Off. Local changes will not trigger sync automatically.",
+  "settings.notificationPopups.name": "Notification pop-ups",
+  "settings.notificationPopups.desc": "Choose which notification pop-ups appear during sync. “Important only” keeps just results that need attention, such as conflicts and failures. “Off” stops showing sync progress and result pop-ups. Critical reminders (expired sign-in, paused sync) and action result notices always appear. This setting applies per device.",
+  "settings.notificationPopups.option.all": "All",
+  "settings.notificationPopups.option.important": "Important only",
+  "settings.notificationPopups.option.off": "Off",
   "settings.maxFileSize.name": "Max file size",
   "settings.maxFileSize.desc": "Files larger than {size} will not be synced. Large files use more memory and data.",
   "settings.reset.name": "Reset sync state",
@@ -554,7 +561,7 @@ const en: LocaleStrings = {
   "syncPlan.remoteScopeRecreateConfirm": "Create",
 
   // ---- Status Bar ----
-  "status.planReview": "EasySync: Plan needs review",
+  "status.planReview": "Plan needs review",
 
   // ---- Sync Results ----
   "result.pausedForReview": "Sync paused — plan available for review in sidebar",

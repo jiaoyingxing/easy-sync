@@ -1235,14 +1235,15 @@ export class SyncExecutor {
 
   /** Show a translated notice to the user */
   private notice(key: string, params?: Record<string, string | number>): void {
-    const priority = key === "result.legacyStateDisabled"
+    const critical = key === "result.legacyStateDisabled"
       || key === "result.v2StateLoadBlocked"
       || key === "result.v2ScopeRecoveryPending"
       || key === "result.authExpired"
       || key === "notice.localRecoveryFailed"
       || key === "notice.v2MigrationRequired"
       || key === "notice.sideActionScopeChanged"
-      || key === "notice.sideActionMutationRecoveryFailed"
+      || key === "notice.sideActionMutationRecoveryFailed";
+    const priority = critical
       ? NOTICE_PRIORITY.critical
       : key.endsWith(".failed") || key === "notice.conflict.downloadFailed"
         ? NOTICE_PRIORITY.failure
@@ -1251,6 +1252,8 @@ export class SyncExecutor {
       key: `side-action:${key}:${params?.path ?? ""}`,
       message: this.t(key, params),
       priority,
+      // Sync-stopping critical reminders stay visible under every popups level.
+      category: critical ? "safety" : undefined,
       className: "easy-sync-notice-action",
     });
   }

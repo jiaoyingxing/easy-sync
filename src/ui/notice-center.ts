@@ -16,6 +16,16 @@ export const NOTICE_PRIORITY = {
 
 export type EasySyncNoticeMessage = string | DocumentFragment;
 
+/**
+ * Notice category declared by call sites. Only `ambient` requests participate
+ * in the user-configurable notification-popups level filter; `safety` and the
+ * default (feedback) always display.
+ */
+export type EasySyncNoticeCategory = "ambient" | "safety";
+
+/** User-facing notification popups level (per-device, persisted in data.json). */
+export type EasySyncNotificationPopupsLevel = "all" | "important" | "off";
+
 export interface EasySyncNoticeHandle {
   noticeEl?: HTMLElement;
   messageEl?: HTMLElement;
@@ -32,6 +42,12 @@ export interface EasySyncNoticeRequest {
   className?: string;
   /** Keep the latest request so it can return after a short preemption. */
   resumable?: boolean;
+  /**
+   * `"ambient"`: sync-lifecycle notices filtered by the popups level;
+   * `"safety"`: critical reminders that must always show; absent: feedback
+   * (click results) that always shows.
+   */
+  category?: EasySyncNoticeCategory;
 }
 
 export type EasySyncNoticeFactory = (
@@ -57,17 +73,40 @@ export class EasySyncNoticeCenter {
   private active: ActiveNotice | null = null;
   private expiryTimer: TimeoutHandle | null = null;
   private resumable: EasySyncNoticeRequest | null = null;
+  private notificationPopups: EasySyncNotificationPopupsLevel;
 
   constructor(
     private readonly factory: EasySyncNoticeFactory = (message, durationMs) =>
       new Notice(message, durationMs),
-  ) {}
+    initialNotificationPopups: EasySyncNotificationPopupsLevel = "all",
+  ) {
+    this.notificationPopups = initialNotificationPopups;
+  }
 
   get activeKey(): string | null {
     return this.active?.request.key ?? null;
   }
 
+  /**
+   * Change the notification popups level. An active ambient request that no
+   * longer qualifies is hidden immediately; a stored resumable ambient request
+   * that no longer qualifies is dropped so it cannot resurface after the next
+   * preempting notice expires.
+   */
+  setNotificationPopups(level: EasySyncNotificationPopupsLevel): void {
+    this.notificationPopups = level;
+    if (this.active && !this.isAmbientAllowed(this.active.request)) {
+      this.hideActive();
+    }
+    if (this.resumable && !this.isAmbientAllowed(this.resumable)) {
+      this.resumable = null;
+    }
+  }
+
   show(request: EasySyncNoticeRequest): boolean {
+    // Filter ambient requests before any slot or resumable state is touched:
+    // a rejected request never occupies the slot and never restores.
+    if (!this.isAmbientAllowed(request)) return false;
     const normalized = { ...request };
     if (normalized.resumable) this.resumable = normalized;
 
@@ -97,6 +136,18 @@ export class EasySyncNoticeCenter {
   dispose(): void {
     this.resumable = null;
     this.hideActive();
+  }
+
+  private isAmbientAllowed(request: EasySyncNoticeRequest): boolean {
+    if (request.category !== "ambient") return true;
+    switch (this.notificationPopups) {
+      case "off":
+        return false;
+      case "important":
+        return request.priority >= NOTICE_PRIORITY.attention;
+      default:
+        return true;
+    }
   }
 
   private display(request: EasySyncNoticeRequest): void {

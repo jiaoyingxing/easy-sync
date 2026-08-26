@@ -5,17 +5,17 @@ import type { LocaleStrings } from "./types";
 
 const zhCN: LocaleStrings = {
   // ---- 状态栏 ----
-  "status.notLoggedIn": "EasySync: 未登录",
-  "status.connecting": "EasySync: 连接中…",
-  "status.syncing": "EasySync: 同步中…",
-  "status.recovering": "EasySync: 正在核对未完成操作…",
-  "status.waitingForNetwork": "EasySync: 等待网络恢复",
-  "status.recoveryBlocked": "EasySync: 上次操作结果无法确认",
+  "status.notLoggedIn": "未登录",
+  "status.connecting": "连接中…",
+  "status.syncing": "同步中…",
+  "status.recovering": "正在核对…",
+  "status.waitingForNetwork": "等待网络恢复",
+  "status.recoveryBlocked": "上次操作结果无法确认",
   "status.conflicts": "{count} 项冲突",
   "status.pendingDeletes": "{count} 项待确认删除",
-  "status.conflictsAndDeletes": "{conflicts} 项冲突，{deletes} 项待确认删除",
-  "status.lastSync": "EasySync: 上次同步 {time}",
-  "status.ready": "EasySync: 已就绪",
+  "status.conflictsAndDeletes": "{conflicts} 冲突 · {deletes} 待删",
+  "status.lastSync": "上次同步 {time}",
+  "status.ready": "已就绪",
 
   // ---- Ribbon ----
   "ribbon.loggedOut": "未登录，打开 EasySync 设置",
@@ -31,6 +31,7 @@ const zhCN: LocaleStrings = {
   // ---- 设置分组 ----
   "settings.group.scope": "范围",
   "settings.group.automatic": "自动",
+  "settings.group.display": "显示",
   "settings.group.maintenance": "维护",
   "settings.group.about": "关于",
 
@@ -56,10 +57,11 @@ const zhCN: LocaleStrings = {
   "settings.account.authLinkUnavailable": "无法复制登录链接，请重新打开登录页面。",
   "settings.account.loginSuccess": "登录成功",
   "settings.account.logout": "退出登录",
+  "settings.account.method.lead": "不确定？先试跳转登录；没跳回来就返回这里换一个。",
   "settings.account.method.browser.name": "跳转登录",
-  "settings.account.method.browser.desc": "浏览器自动打开，完成后回到 Obsidian 自动登录",
+  "settings.account.method.browser.desc": "在这台设备的浏览器完成授权，回到 Obsidian 自动登录",
   "settings.account.method.device.name": "输入代码登录",
-  "settings.account.method.device.desc": "在浏览器输入 9 位码登录，适合无法跳转回插件的设备",
+  "settings.account.method.device.desc": "当前设备无法登录时，改用此方式，可跨设备授权",
   "settings.account.device.title": "输入代码登录",
   "settings.account.device.codeHint": "输入时不带空格",
   "settings.account.device.openVerify": "在浏览器中打开验证页",
@@ -180,6 +182,11 @@ const zhCN: LocaleStrings = {
   "settings.autoSyncChangeDelay.name": "修改后触发同步",
   "settings.autoSyncChangeDelay.desc": "检测到本机变化后等待 {seconds} 秒；期间有新变化会重新计时。",
   "settings.autoSyncChangeDelay.disabledDesc": "已关闭；本机变化不会自动触发同步。",
+  "settings.notificationPopups.name": "通知弹窗",
+  "settings.notificationPopups.desc": "选择同步过程中显示哪些通知弹窗。「仅重要」只保留冲突、失败等需要关注的结果；「关闭」不再显示同步过程与结果弹窗。登录过期、同步暂停等关键提醒和操作结果提示始终显示。此设置在每台设备上独立生效。",
+  "settings.notificationPopups.option.all": "全部",
+  "settings.notificationPopups.option.important": "仅重要",
+  "settings.notificationPopups.option.off": "关闭",
   "settings.maxFileSize.name": "单个文件限制",
   "settings.maxFileSize.desc": "超过 {size} 的文件不会参与同步。大文件会占用较多内存和流量。",
   "settings.reset.name": "重置同步状态",
@@ -553,7 +560,7 @@ const zhCN: LocaleStrings = {
   "syncPlan.remoteScopeRecreateConfirm": "创建",
 
   // ---- 状态栏 ----
-  "status.planReview": "EasySync: 同步计划待审阅",
+  "status.planReview": "同步计划待审阅",
 
   // ---- 同步结果 ----
   "result.pausedForReview": "同步已暂停：计划可在侧边栏查看",

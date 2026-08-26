@@ -78,7 +78,7 @@ describe("device code i18n keys", () => {
     expect(zh.t("settings.account.method.browser.name")).toBe("跳转登录");
     expect(zh.t("settings.account.method.browser.desc")).toContain("自动登录");
     expect(zh.t("settings.account.method.device.name")).toBe("输入代码登录");
-    expect(zh.t("settings.account.method.device.desc")).toContain("9 位码");
+    expect(zh.t("settings.account.method.device.desc")).toContain("跨设备");
     expect(zh.t("settings.account.device.title")).toBe("输入代码登录");
     expect(zh.t("settings.account.device.openVerify")).toContain("浏览器");
     expect(zh.t("settings.account.device.copyCode")).toBe("复制代码");
@@ -97,7 +97,7 @@ describe("device code i18n keys", () => {
 
     expect(en.t("settings.account.method.browser.name")).toBe("Browser redirect");
     expect(en.t("settings.account.method.device.name")).toBe("Enter a code");
-    expect(en.t("settings.account.method.device.desc")).toContain("9-character");
+    expect(en.t("settings.account.method.device.desc")).toContain("another device");
     expect(en.t("settings.account.device.openVerify")).toContain("browser");
     expect(en.t("settings.account.device.expiresIn", { time: "14:32" }))
       .toBe("expires in 14:32");

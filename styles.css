@@ -1175,6 +1175,11 @@ body.is-mobile .easy-sync-auth-pending-actions button {
   gap: var(--size-4-2);
 }
 
+.easy-sync-auth-method-lead {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+
 .easy-sync-auth-method-option {
   display: flex;
   align-items: center;
@@ -1273,16 +1278,42 @@ body.is-mobile .easy-sync-device-actions button {
   font-size: var(--font-ui-smaller);
 }
 
-.easy-sync-ribbon[data-easy-sync-status="loggedOut"] {
+/* Status bar item: icon-only (slice 3, 2026-08-26 ③ 方案 A) — host
+   `status-bar-item-segment` > icon container (`status-bar-item-icon`),
+   isomorphic with the official Obsidian Sync item; no text span (the full
+   status text lives in tooltip + aria-label). Host carries layout/gap and
+   sizes the 16×16 icon via --icon-s. Slice 2's 定宽+右对齐 rules (min-width
+   128px / segment flex-end) were removed in slice 3, so the item keeps its
+   natural ~24px width — no fixed-width hollow, zero swing across states.
+   EasySync colors the icon by semantic group through the same `.is-*` class
+   scheme as the sidebar status line (2026-08-26 ④): loggedOut red /
+   attention·cancelling orange / ready green / success green (standby) /
+   syncing grey + 1s spin (reuses easy-sync-spin from the sync view). The
+   connecting branch carries no `.is-*` class (default grey). Ribbon 去色
+   (2026-08-26): the old `.easy-sync-ribbon[data-easy-sync-status=...]` color
+   rules were removed; the ribbon keeps icon/tooltip dynamics but no color. */
+.easy-sync-status-bar-item.is-loggedOut .status-bar-item-icon {
   color: var(--color-red);
 }
 
-.easy-sync-ribbon[data-easy-sync-status="attention"] {
+.easy-sync-status-bar-item.is-attention .status-bar-item-icon {
   color: var(--color-orange);
 }
 
-.easy-sync-ribbon[data-easy-sync-status="success"] {
+.easy-sync-status-bar-item.is-cancelling .status-bar-item-icon {
+  color: var(--color-orange);
+}
+
+.easy-sync-status-bar-item.is-ready .status-bar-item-icon {
   color: var(--color-green);
+}
+
+.easy-sync-status-bar-item.is-success .status-bar-item-icon {
+  color: var(--color-green);
+}
+
+.easy-sync-status-bar-item.is-syncing .status-bar-item-icon {
+  animation: easy-sync-spin 1s linear infinite;
 }
 
 /* Settings tab: Obsidian spaces consecutive .setting-group siblings by 1.5em.

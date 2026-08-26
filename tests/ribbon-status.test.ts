@@ -94,11 +94,11 @@ describe("resolveRibbonStatus", () => {
     const en = new I18n("en");
 
     expect(zh.t("status.recoveryBlocked"))
-      .toBe("EasySync: 上次操作结果无法确认");
+      .toBe("上次操作结果无法确认");
     expect(zh.t("ribbon.recoveryBlocked"))
       .toBe("上次操作结果无法确认，打开同步状态");
     expect(en.t("status.recoveryBlocked"))
-      .toBe("EasySync: Previous operation could not be confirmed");
+      .toBe("Previous operation could not be confirmed");
     expect(en.t("ribbon.recoveryBlocked"))
       .toBe("Previous operation could not be confirmed; open sync status");
   });

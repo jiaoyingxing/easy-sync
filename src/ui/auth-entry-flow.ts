@@ -139,6 +139,7 @@ async function chooseAuthMethod(
   let browserPromise: Promise<void> | null = null;
   const result = await new AuthMethodModal(
     host.app,
+    t("settings.account.method.lead"),
     {
       title: t("settings.account.method.browser.name"),
       description: t("settings.account.method.browser.desc"),
