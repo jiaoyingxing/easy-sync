@@ -25,7 +25,7 @@ EasySync keeps your Obsidian vault in sync across computers, phones, and tablets
 
 - Clear throughout: sync status, progress, history, and items needing attention stay visible in a dedicated sidebar.
 
-- Flexible scope: editor settings, appearance, themes, hotkeys, bookmarks, core plugins, and community plugins can be controlled separately, with per-plugin selection for community plugins.
+- Flexible scope: editor settings, appearance, themes, snippets, hotkeys, bookmarks, core plugins, and community plugins can be controlled separately, with per-plugin selection for community plugins.
 
 - Supports Windows, macOS, Linux, iOS, and Android. The first sync establishes a shared baseline; later syncs primarily check incremental changes, and large files use chunked uploads.
 
@@ -65,7 +65,7 @@ Open:
 
 **Obsidian Settings → EasySync → Log in with OneDrive**
 
-Complete Microsoft sign-in in your browser, then return to Obsidian.
+Sign-in opens your system browser for Microsoft authorization; on mobile, return to Obsidian when prompted after authorization.
 
 ### 1.4 Use the same vault name on every device
 
@@ -132,8 +132,9 @@ Enable other options only when you need them:
 | Auto sync | Scheduled sync and sync-after-change can be configured separately; **Sync now** remains available when both are off |
 | Automatic handling | Merging non-overlapping text edits is on by default; applying remote deletions locally is off by default, and uncertain cases remain conflicts or pending decisions |
 | Diagnostic logging | Leave it off for normal use; enable it when investigating a problem and generating a diagnostic report |
+| Notification popups | All by default; can be set to “Important only” or “Off”; critical alerts such as sign-in expiration are always shown |
 
-Settings apply to the current vault only and do not automatically change other vaults.
+Settings are stored in the plugin data of the current device and take effect per device (for example, sync exclusions and notification popup levels); they do not automatically change other devices or vaults.
 
 ## 4. Data and permissions in OneDrive
 
@@ -192,7 +193,40 @@ If a file is deleted from OneDrive, you may be able to recover it from the OneDr
 - **Status and diagnostics:** show the plan, progress, history, conflicts, and pending decisions in the sidebar, handle several decisions in sequence, and generate a diagnostic report when needed.
 - **Large vaults and large files:** establish a shared baseline once, check incremental changes afterward, use chunked uploads for large files, and verify mobile downloads before replacing local files.
 
-## 6. How conflicts are handled
+## 6. Sync scope
+
+### 6.1 Included by default
+
+- Normal files and folders in the vault — notes, images, audio, PDFs, attachments — sync in both directions by default.
+- Everything else in Obsidian is not synced unless you enable the corresponding option under **Sync scope** in settings.
+
+### 6.2 Obsidian configuration included (whitelist)
+
+When the corresponding option is enabled, these objects under `.obsidian` are synced:
+
+- Editor settings (`app.json`)
+- Appearance settings (`appearance.json`)
+- Themes (`themes/`) and snippets (`snippets/`)
+- Hotkeys (`hotkeys.json`)
+- Core plugin enable states (`core-plugins.json`)
+- Bookmarks (`bookmarks.json`)
+- Community plugins: the three plugin files (`main.js`, `manifest.json`, `styles.css`) of plugins participating in sync on this device; plugin data (`data.json`) requires a separate opt-in under **Community plugin data** (experimental)
+- EasySync itself: with **EasySync self-sync** enabled, the plugin files propagate to other devices
+
+Community plugin enable state is not part of the sync scope: each device can enable or disable plugins independently.
+
+Note: even with automatic merging of non-overlapping text edits enabled, files under `.obsidian` are never merged automatically — conflicts there always require you to choose the local or the remote side.
+
+### 6.3 Not included
+
+- Any file under `.obsidian` outside the whitelist: other files a plugin generates inside its plugin folder (configs, caches, session records), and other files in the config directory. For example, some plugins create working files under `.obsidian`; those stay on the device where they were created.
+- Hidden dot-folders (such as `.git` and `.trash`) do not participate in normal sync by default; `.trash/`, `.DS_Store`, and `Thumbs.db` are excluded by default.
+- EasySync's own state, caches, logs, and recovery copies never sync.
+- **Sync exclusions** remove an already-synced folder from this device only: no local or cloud files are deleted, and other devices are unaffected.
+
+> Keep content you want to share across devices in a normal visible folder.
+
+## 7. How conflicts are handled
 
 EasySync records the last successfully synced content and evaluates local and remote changes against that shared baseline.
 
@@ -215,7 +249,7 @@ Cases like these normally require your decision or another review:
 
 EasySync does not overwrite one side merely because a file appears to be newer.
 
-## 7. Usage boundaries
+## 8. Usage boundaries
 
 EasySync is a cross-device file sync tool, not a real-time collaboration service.
 
@@ -230,7 +264,7 @@ Keep these limits in mind:
 - Automatic handling runs only when all safety conditions are satisfied; otherwise, the operation stops or becomes a manual decision.
 - Sync is not a substitute for an independent backup. Back up important data regularly.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 Start by generating a **Diagnostic report** from EasySync settings.
 
@@ -238,6 +272,6 @@ When reporting an issue, include the complete EasySync diagnostic report.
 
 Report issues through [GitHub Issues](https://github.com/jiaoyingxing/easy-sync/issues).
 
-## 9. License
+## 10. License
 
 EasySync is open source under the [MIT License](LICENSE).
