@@ -1006,17 +1006,17 @@ export class LocalScanner {
     folderPaths: Set<string>,
     folderScanFailures: string[],
   ): void {
-    const getAllLoadedFiles = (
-      this.vault as Vault & { getAllLoadedFiles?: Vault["getAllLoadedFiles"] }
-    ).getAllLoadedFiles;
-    if (typeof getAllLoadedFiles !== "function") {
+    const observedVault = this.vault as Vault & {
+      getAllLoadedFiles?: Vault["getAllLoadedFiles"];
+    };
+    if (typeof observedVault.getAllLoadedFiles !== "function") {
       folderScanFailures.push("/");
       this.diag?.warn("scan", "vault folder enumeration is unavailable");
       return;
     }
     let loaded: ReturnType<Vault["getAllLoadedFiles"]>;
     try {
-      loaded = getAllLoadedFiles.call(this.vault);
+      loaded = observedVault.getAllLoadedFiles.call(observedVault);
     } catch (error) {
       folderScanFailures.push("/");
       this.diag?.warn("scan", "vault folder enumeration failed", error);

@@ -4,8 +4,8 @@ export const INDEXED_DB_VAULT_INSTANCE_STORAGE_KEY =
   "easy-sync-indexeddb-vault-instance-v1";
 
 export interface VaultLocalStorage {
-  loadLocalStorage(key: string): unknown | null;
-  saveLocalStorage(key: string, data: unknown | null): void;
+  loadLocalStorage(key: string): unknown;
+  saveLocalStorage(key: string, data: unknown): void;
 }
 
 /**

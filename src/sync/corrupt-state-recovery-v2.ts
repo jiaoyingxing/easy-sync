@@ -107,7 +107,7 @@ export async function buildCorruptStateRecoveryCandidateV2(
   }
   let raw: Record<string, unknown>;
   try {
-    const parsed = JSON.parse(input.source.rawEnvelope);
+    const parsed: unknown = JSON.parse(input.source.rawEnvelope);
     if (!isRecord(parsed)) return abort("source-invalid");
     raw = parsed;
   } catch {

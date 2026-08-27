@@ -647,7 +647,7 @@ export default class EasySyncPlugin extends Plugin {
       registerProtocolHandler: (action, handler) => {
         this.registerObsidianProtocolHandler(action, handler);
       },
-      openUrl: authBrowser.openUrl,
+      openUrl: authBrowser.openUrl.bind(authBrowser),
       // User profile cache: avoid network call on every cold start
       profileCache: {
         get: async () => {
@@ -848,7 +848,7 @@ export default class EasySyncPlugin extends Plugin {
           this.updateStatusBar();
           this.requestMutationRecoveryObservation("state-loaded");
           this.requestDescendantFileReconstructionContinuation("state-loaded");
-          this.scheduleCommunityPluginLocalReconciliation("state-loaded");
+          void this.scheduleCommunityPluginLocalReconciliation("state-loaded");
           this.schedulePersistedCommunityPluginJoinSync("state-loaded");
         })
         .catch((e) => {
@@ -885,7 +885,7 @@ export default class EasySyncPlugin extends Plugin {
       if (document.visibilityState === "visible") {
         this.requestMutationRecoveryObservation("foreground");
         this.requestDescendantFileReconstructionContinuation("foreground");
-        this.scheduleCommunityPluginLocalReconciliation("foreground");
+        void this.scheduleCommunityPluginLocalReconciliation("foreground");
         this.schedulePersistedCommunityPluginJoinSync("foreground");
         // Device-code login: check the token endpoint immediately on return
         // instead of waiting for the next (possibly throttled) poll tick.
@@ -1513,7 +1513,7 @@ export default class EasySyncPlugin extends Plugin {
         continue;
       }
       break;
-    } while (true);
+    } while (true as boolean);
     const localIgnores = result.communityPluginLocalIgnores;
     if (
       this.state?.isV2StateActive === true
@@ -4713,7 +4713,7 @@ export default class EasySyncPlugin extends Plugin {
   private readCommunityPluginCloudCleanupMarkers():
     { pluginId: string; cleanedAt: number }[] {
     if (typeof this.app.loadLocalStorage !== "function") return [];
-    const raw = this.app.loadLocalStorage(
+    const raw: unknown = this.app.loadLocalStorage(
       COMMUNITY_PLUGIN_CLOUD_CLEANUP_MARKER_KEY,
     );
     if (!Array.isArray(raw)) return [];
@@ -6922,6 +6922,7 @@ function formatDiagData(data: unknown): string {
   try {
     return JSON.stringify(data, null, 2);
   } catch {
-    return String(data);
+    // Circular/exotic structures keep a deterministic, readable form.
+    return Object.prototype.toString.call(data);
   }
 }

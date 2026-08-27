@@ -1113,7 +1113,7 @@ function isRemoteIdentityLineage(
     return false;
   }
   for (let index = 0; index < value.length; index++) {
-    const entry = value[index];
+    const entry: unknown = value[index];
     if (
       !isRecord(entry)
       || !nonEmpty(entry.fromRemoteId)
@@ -1129,12 +1129,16 @@ function isRemoteIdentityLineage(
       || !Number.isFinite(entry.confirmedAt)
       || !isAnchorConfirmation(entry.confirmedBy)
     ) return false;
+    const previous: unknown = value[index - 1];
     if (
       index > 0
-      && value[index - 1]?.toRemoteId !== entry.fromRemoteId
+      && (previous as { toRemoteId?: unknown } | undefined)?.toRemoteId
+        !== entry.fromRemoteId
     ) return false;
   }
-  return value[value.length - 1]?.toRemoteId === currentRemoteId;
+  const lastEntry: unknown = value[value.length - 1];
+  return (lastEntry as { toRemoteId?: unknown } | undefined)?.toRemoteId
+    === currentRemoteId;
 }
 
 function isAnchorConfirmation(

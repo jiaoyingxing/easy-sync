@@ -24,7 +24,7 @@ export interface MutationRecoveryDisplayState {
 }
 
 type Translator = (
-  key: keyof LocaleStrings | string,
+  key: string,
   params?: Record<string, string | number>,
 ) => string;
 

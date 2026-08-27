@@ -2948,11 +2948,19 @@ export class OneDriveClient {
       }
     }
     const graphErr = graphBody?.error as Record<string, unknown> | undefined;
+    const graphCodeText = typeof graphErr?.code === "string"
+      ? graphErr.code
+      : typeof graphErr?.code === "number"
+      ? String(graphErr.code)
+      : "none";
+    const graphMsgText = typeof graphErr?.message === "string"
+      ? graphErr.message
+      : "none";
     // 409 is "folder already exists" — handled gracefully, don't alarm the user
     if (errStatus === 409) {
       this.diag?.log("onedrive", `requestUrl 409 — ${sanitizeUrl(url)}`);
     } else if (errStatus > 0 && !(suppressExpectedNotFoundWarning && errStatus === 404)) {
-      this.diag?.warn("onedrive", `requestUrl HTTP error — status=${errStatus}, graphCode=${graphErr?.code || "none"}, graphMsg=${graphErr?.message || "none"}, url=${sanitizeUrl(url)}`);
+      this.diag?.warn("onedrive", `requestUrl HTTP error — status=${errStatus}, graphCode=${graphCodeText}, graphMsg=${graphMsgText}, url=${sanitizeUrl(url)}`);
     } else if (errStatus === 0) {
       this.diag?.warn(
         "onedrive",
@@ -3382,8 +3390,14 @@ function tryParseGraphError(response: RequestUrlResponse): {
     if (json?.error && typeof json.error === "object") {
       const err = json.error as Record<string, unknown>;
       return {
-        code: String(err.code || "unknown"),
-        message: String(err.message || "no message"),
+        code: typeof err.code === "string" && err.code
+          ? err.code
+          : typeof err.code === "number"
+          ? String(err.code)
+          : "unknown",
+        message: typeof err.message === "string" && err.message
+          ? err.message
+          : "no message",
       };
     }
   } catch {

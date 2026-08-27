@@ -9111,7 +9111,7 @@ function isCommunityPluginBundleSettlementEntry(
     || !Array.isArray(conflictDecisions)
     || !Array.isArray(members)
   ) return false;
-  const predecessors = predecessorOperationIds;
+  const predecessors = predecessorOperationIds as string[];
   if (
     new Set(predecessors).size !== predecessors.length
     || predecessors.some((operationId) =>
@@ -9126,9 +9126,12 @@ function isCommunityPluginBundleSettlementEntry(
   ]);
   const memberPaths = new Set<string>();
   const memberOperationIds = new Set<string>([intent.operationId]);
-  for (const member of members) {
+  const memberIntents: MutationIntent[] = [];
+  const memberRecords = members as Array<Record<string, unknown>>;
+  for (const member of memberRecords) {
     if (!isRecord(member) || !isMutationIntent(member.intent, true)) return false;
     const memberIntent = member.intent;
+    memberIntents.push(memberIntent);
     if (
       memberIntent.version !== 1
       || memberIntent.stateEffect !== "bundle-settlement"
@@ -9163,36 +9166,43 @@ function isCommunityPluginBundleSettlementEntry(
     !memberPaths.has(`${settlement.pluginRoot}/main.js`)
     || !memberPaths.has(`${settlement.pluginRoot}/manifest.json`)
     || [...memberPaths].sort((left, right) => left.localeCompare(right))
-      .some((path, index) => path !== members[index]?.intent.path)
+      .some((path, index) => path !== memberIntents[index]?.path)
   ) return false;
   const conflictPaths = new Set<string>();
-  for (const conflict of conflictDecisions) {
+  const conflictRecords = conflictDecisions as Array<Record<string, unknown>>;
+  for (const conflict of conflictRecords) {
+    const decisionToken: unknown = conflict.decisionToken;
     if (
       !isRecord(conflict)
       || typeof conflict.path !== "string"
       || !memberPaths.has(conflict.path)
       || conflictPaths.has(conflict.path)
-      || !isSyncDecisionToken(conflict.decisionToken)
-      || !sameSyncScope(conflict.decisionToken.scope, intent.scope)
+      || !isSyncDecisionToken(decisionToken)
+      || !sameSyncScope(decisionToken.scope, intent.scope)
     ) return false;
-    const member = members.find(
-      (candidate) => candidate.intent.path === conflict.path,
+    const memberIntentMatchesPath = memberIntents.find(
+      (candidateIntent) => candidateIntent.path === conflict.path,
     )!;
-    const localMatches = JSON.stringify(conflict.decisionToken.local)
-      === JSON.stringify(member.intent.expectedLocal);
-    const remoteMatches = member.intent.expectedRemote.exists
-      ? conflict.decisionToken.remote.exists
-        && conflict.decisionToken.remote.driveId
-          === member.intent.expectedRemote.driveId
-        && conflict.decisionToken.remote.eTag
-          === member.intent.expectedRemote.eTag
-      : conflict.decisionToken.remote.exists === false;
+    const localMatches = JSON.stringify(decisionToken.local)
+      === JSON.stringify(memberIntentMatchesPath.expectedLocal);
+    const remoteToken = decisionToken.remote as {
+      exists?: unknown;
+      driveId?: unknown;
+      eTag?: unknown;
+    };
+    const remoteMatches = memberIntentMatchesPath.expectedRemote.exists
+      ? remoteToken.exists === true
+        && remoteToken.driveId
+          === memberIntentMatchesPath.expectedRemote.driveId
+        && remoteToken.eTag
+          === memberIntentMatchesPath.expectedRemote.eTag
+      : remoteToken.exists === false;
     if (!localMatches || !remoteMatches) return false;
     conflictPaths.add(conflict.path);
   }
   return [...conflictPaths].sort((left, right) => left.localeCompare(right))
     .every((path, index) =>
-      path === conflictDecisions[index]?.path);
+      path === conflictRecords[index]?.path);
 }
 
 function isSyncDecisionToken(value: unknown): value is SyncDecisionToken {
@@ -9346,7 +9356,7 @@ function isReceiptedRenameAnchorCollisionEvidence(
   value: unknown,
 ): value is ReceiptedRenameAnchorCollisionEvidenceV1 {
   if (!isRecord(value)) return false;
-  const staleRemoteIds = value.staleRemoteIds;
+  const staleRemoteIds = value.staleRemoteIds as string[];
   return value.kind === "receipted-rename-target-anchor-collision"
     && Number.isSafeInteger(value.lifecycleEpoch)
     && (value.lifecycleEpoch as number) >= 0

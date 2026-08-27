@@ -155,7 +155,7 @@ async function chooseAuthMethod(
   ).awaitAction();
 
   if (result.action === "browser" && browserPromise) {
-    await browserPromise;
+    await (browserPromise as Promise<void>);
     return;
   }
   if (result.action === "device") {
@@ -245,7 +245,7 @@ async function handlePendingAuth(
     return;
   }
   if (result.action === "reopen" && reopenPromise) {
-    await reopenPromise;
+    await (reopenPromise as Promise<void>);
   }
 }
 

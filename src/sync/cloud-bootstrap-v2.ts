@@ -271,7 +271,7 @@ export function readCloudBootstrapPublicationCheckpointV2(
 }
 
 export function verifyCloudBootstrapV2(
-  value: string | unknown,
+  value: unknown,
   expectedScope: SyncScope,
   remoteIndex: RemoteIndexV2,
   localEntries: readonly LocalFileEntry[],

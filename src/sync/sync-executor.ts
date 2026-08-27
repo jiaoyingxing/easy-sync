@@ -386,6 +386,24 @@ export interface SyncResult {
   metrics?: ExecutionMetrics;
 }
 
+/** Stable, human-readable text for values stored in error slots.
+ *  Preserves primitive formatting exactly and JSON-serializes objects. */
+function describeThrownValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (
+    typeof value === "number"
+    || typeof value === "boolean"
+    || typeof value === "bigint"
+  ) return String(value);
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized !== undefined) return serialized;
+  } catch {
+    // circular or otherwise unserializable — fall through
+  }
+  return Object.prototype.toString.call(value);
+}
+
 export function classifyRetryableObservationResult(
   result: SyncResult,
   context: Readonly<{ completedFileCount?: number }> = {},
@@ -3766,12 +3784,12 @@ export class SyncExecutor {
       const type = (stat as { type?: unknown }).type;
       if (type === "folder") return { status: "present" };
       if (type === "file") return { status: "file" };
-      const list = (vault.adapter as DataAdapter & {
+      const observedAdapter = vault.adapter as DataAdapter & {
         list?: (folderPath: string) => Promise<unknown>;
-      }).list;
-      if (typeof list === "function") {
+      };
+      if (typeof observedAdapter.list === "function") {
         try {
-          await list.call(vault.adapter, path);
+          await observedAdapter.list.call(observedAdapter, path);
           return { status: "present" };
         } catch {
           return { status: "file" };
@@ -4915,7 +4933,9 @@ export class SyncExecutor {
           ([, prepared]) => prepared.error !== undefined,
         )?.[1];
         if (failedPreparation?.error !== undefined) {
-          throw failedPreparation.error;
+          throw failedPreparation.error instanceof Error
+            ? failedPreparation.error
+            : new Error(describeThrownValue(failedPreparation.error));
         }
         if (!this.canContinue(operationEpoch, result)) {
           transferMetrics.cancelled += items.length;
@@ -7511,7 +7531,11 @@ export class SyncExecutor {
                   })),
                 resolveRemoteContentHash: async (item) => {
                   const prefetched = prefetchedRemoteHashes.get(item.path);
-                  if (prefetched?.error) throw prefetched.error;
+                  if (prefetched?.error) {
+                    throw prefetched.error instanceof Error
+                      ? prefetched.error
+                      : new Error(describeThrownValue(prefetched.error));
+                  }
                   if (prefetched?.hash) return prefetched.hash;
                   return resolveCanonicalRemoteContentHash(
                     item,
@@ -9583,7 +9607,11 @@ export class SyncExecutor {
 
       try {
         this.diag?.log("execute", `[${position}/${total}] ${item.type} ${item.path}`);
-        if (preparedDownload?.error) throw preparedDownload.error;
+        if (preparedDownload?.error) {
+          throw preparedDownload.error instanceof Error
+            ? preparedDownload.error
+            : new Error(describeThrownValue(preparedDownload.error));
+        }
         mutationIntent = plan.scope
           && isMutationAction(item.type)
           && !item.requiresConfirmation
@@ -10121,7 +10149,9 @@ export class SyncExecutor {
             completion.renameFrom,
           );
         }
-        throw checkpointError;
+        throw checkpointError instanceof Error
+          ? checkpointError
+          : new Error(describeThrownValue(checkpointError));
       }
       for (const completion of completions) {
         callbacks.onFileComplete?.(
@@ -10293,7 +10323,11 @@ export class SyncExecutor {
         );
         try {
           const metadataPreparationError = metadataPreparationErrors.get(item.path);
-          if (metadataPreparationError) throw metadataPreparationError;
+          if (metadataPreparationError) {
+            throw metadataPreparationError instanceof Error
+              ? metadataPreparationError
+              : new Error(describeThrownValue(metadataPreparationError));
+          }
           let content: ArrayBuffer;
           const transferStartedAt = Date.now();
           try {
@@ -11841,7 +11875,11 @@ export class SyncExecutor {
         throw new MutationNotAppliedError(
           preflightError instanceof Error
             ? preflightError
-            : new Error(String(preflightError)),
+            : new Error(
+              typeof preflightError === "string"
+                ? preflightError
+                : Object.prototype.toString.call(preflightError),
+            ),
         );
       }
     }
@@ -16283,7 +16321,11 @@ export class SyncExecutor {
         (error): SharedSyncProtocolObservationSettled => ({ error }),
       );
     const settled = await settledObservation;
-    if (settled.error !== undefined) throw settled.error;
+    if (settled.error !== undefined) {
+      throw settled.error instanceof Error
+        ? settled.error
+        : new Error(describeThrownValue(settled.error));
+    }
     const observation = settled.value!;
     if (observation.status !== "ready") return observation;
     return this.ensureScopeFreeSharedProtocolFromObservation(

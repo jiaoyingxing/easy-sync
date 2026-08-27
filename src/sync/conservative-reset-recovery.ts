@@ -123,7 +123,7 @@ function conservativeResetReceiptMatchesIntent(
     case "deleteLocal":
       return true;
     case "renameRemote":
-    case "moveLocal":
+    case "moveLocal": {
       if (!intent.expectedLocal.exists || !intent.expectedRemote.exists) return false;
       if (
         !base
@@ -157,6 +157,7 @@ function conservativeResetReceiptMatchesIntent(
             === intent.expectedRemote.sha256Hash.toLowerCase()
         )
       );
+    }
     case "merge":
       return Boolean(intent.target)
         && intent.expectedRemote.exists

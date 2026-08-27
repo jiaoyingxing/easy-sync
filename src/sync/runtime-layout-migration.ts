@@ -11,8 +11,8 @@ export const EASY_SYNC_LAYOUT_MIGRATION_STORAGE_KEY =
   "easy-sync-runtime-layout-v2";
 
 export interface EasySyncLayoutMigrationStorage {
-  loadLocalStorage(key: string): unknown | null;
-  saveLocalStorage(key: string, data: unknown | null): void;
+  loadLocalStorage(key: string): unknown;
+  saveLocalStorage(key: string, data: unknown): void;
 }
 
 export interface EasySyncLayoutMigrationResult {

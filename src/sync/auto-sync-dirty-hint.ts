@@ -77,15 +77,14 @@ export class AutoSyncDirtyHint {
       consumed = await this.onReady();
     } catch {
       consumed = false;
-    } finally {
-      // A new event while the shared auto-sync entry was running owns its own
-      // debounce timer. Never clear that newer hint with the older completion.
-      if (this.version !== observedVersion) return;
-      if (consumed) {
-        this.dirty = false;
-      } else {
-        this.schedule();
-      }
+    }
+    // A new event while the shared auto-sync entry was running owns its own
+    // debounce timer. Never clear that newer hint with the older completion.
+    if (this.version !== observedVersion) return;
+    if (consumed) {
+      this.dirty = false;
+    } else {
+      this.schedule();
     }
   }
 }

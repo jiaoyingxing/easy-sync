@@ -119,9 +119,9 @@ export class AncestorStoreV2 {
 
   private async listHashes(): Promise<string[]> {
     if (!await this.adapter.exists(this.paths.directory)) return [];
-    const list = (this.adapter as AncestorAdapter).list;
-    if (typeof list !== "function") throw new Error("Ancestor adapter cannot list objects");
-    const result = await list.call(this.adapter, this.paths.directory);
+    const adapter = this.adapter as AncestorAdapter;
+    if (typeof adapter.list !== "function") throw new Error("Ancestor adapter cannot list objects");
+    const result = await adapter.list.call(adapter, this.paths.directory);
     return result.files
       .map((path) => path.slice(path.lastIndexOf("/") + 1))
       .filter((name) => /^[a-f0-9]{64}\.txt$/i.test(name))
