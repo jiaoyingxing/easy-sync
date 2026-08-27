@@ -7,7 +7,8 @@
     "typecheck": "tsc -noEmit -skipLibCheck",
     "build": "tsc -noEmit -skipLibCheck && esbuild src/main.ts --bundle --external:obsidian --format=cjs --target=es2020 --outfile=main.js && node scripts/check-bundle-compat.cjs",
     "test": "vitest run",
-    "test:performance": "vitest run tests/sync-performance-contract.test.ts tests/sync-safety.test.ts tests/plugin-data-cold-start.test.ts tests/startup-performance-contract.test.ts tests/community-plugin-enablement-runtime.test.ts -t \"A0-P|platform-neutral 500-file|V2 cold-start\" --reporter=verbose"
+    "test:performance": "vitest run tests/sync-performance-contract.test.ts tests/sync-safety.test.ts tests/plugin-data-cold-start.test.ts tests/startup-performance-contract.test.ts tests/community-plugin-enablement-runtime.test.ts -t \"A0-P|platform-neutral 500-file|V2 cold-start\" --reporter=verbose",
+    "lint": "eslint ."
   },
   "keywords": [
     "obsidian",
@@ -29,6 +30,8 @@
     "@types/node": "^26.1.0",
     "core-js-pure": "3.49.0",
     "esbuild": "^0.24.0",
+    "eslint": "9.39.5",
+    "eslint-plugin-obsidianmd": "0.4.2",
     "fake-indexeddb": "^6.2.5",
     "idb": "^8.0.3",
     "obsidian": "latest",
