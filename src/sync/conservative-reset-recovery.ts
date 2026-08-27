@@ -112,11 +112,11 @@ function conservativeResetReceiptMatchesIntent(
     case "download":
       return intent.expectedRemote.exists
         && Boolean(base)
-        && base!.size === intent.expectedRemote.size
-        && base!.eTag === intent.expectedRemote.eTag
+        && base.size === intent.expectedRemote.size
+        && base.eTag === intent.expectedRemote.eTag
         && (
           intent.expectedRemote.sha256Hash === undefined
-          || base!.hash.toLowerCase()
+          || base.hash.toLowerCase()
             === intent.expectedRemote.sha256Hash.toLowerCase()
         );
     case "deleteRemote":
@@ -144,9 +144,9 @@ function conservativeResetReceiptMatchesIntent(
         && expected.sha256Hash !== undefined
         && base.hash.toLowerCase() === expected.sha256Hash.toLowerCase()
         && base.size === expected.size
-        && remote!.size === expected.size
-        && remote!.sha256Hash !== undefined
-        && remote!.sha256Hash.toLowerCase() === expected.sha256Hash.toLowerCase());
+        && remote.size === expected.size
+        && remote.sha256Hash !== undefined
+        && remote.sha256Hash.toLowerCase() === expected.sha256Hash.toLowerCase());
       return aligned(intent.expectedRemote) || (
         baseMatches(intent.expectedLocal)
         && remoteMatches(intent.expectedLocal)

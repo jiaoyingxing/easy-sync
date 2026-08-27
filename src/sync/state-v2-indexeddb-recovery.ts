@@ -408,7 +408,7 @@ export class StateV2IndexedDbRecoveryStore {
       checkpointPaths.map((path) => this.readCheckpoint(path)),
     );
     checkpoints.sort((left, right) => left.commitSeq - right.commitSeq);
-    const checkpoint = checkpoints[checkpoints.length - 1]!;
+    const checkpoint = checkpoints[checkpoints.length - 1];
     let current = structuredClone(checkpoint.envelope);
     let currentDigest = checkpoint.envelopeDigest;
 
@@ -991,7 +991,7 @@ function diffRows<T>(
     .filter((key) =>
       previous[key] !== next[key]
       && JSON.stringify(previous[key]) !== JSON.stringify(next[key]))
-    .map((key) => structuredClone(next[key]!));
+    .map((key) => structuredClone(next[key]));
   const deletes = Object.keys(previous)
     .filter((key) => !(key in next))
     .sort(compareText);

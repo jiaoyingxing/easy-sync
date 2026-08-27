@@ -41,7 +41,7 @@ function resolveLocale(rawLang: string): keyof LocaleMap {
     return "zh-cn";
   }
   // Check exact match
-  if (LOCALES[lower]) return lower as keyof LocaleMap;
+  if (LOCALES[lower]) return lower;
   // Fallback to English
   return "en";
 }
@@ -89,7 +89,9 @@ export class I18n {
     if (obsidianLang) return obsidianLang;
     // 2. Try localStorage (Obsidian stores language here)
     try {
-      const stored = globalThis.localStorage?.getItem("language");
+      const stored = typeof localStorage === "undefined"
+        ? undefined
+        : localStorage.getItem("language");
       if (stored) return stored;
     } catch { /* sandboxed */ }
     // 3. Fall back to browser/Electron language

@@ -29,7 +29,7 @@ const EASY_SYNC_POLYFILL_BRAND = Symbol.for(
   "easy-sync.structured-clone-polyfill",
 );
 
-const structuredCloneCompat: typeof globalThis.structuredClone = (
+const structuredCloneCompat: typeof structuredClone = (
   value,
   options,
 ) => structuredClonePolyfill(value, options);
@@ -53,11 +53,14 @@ function isEasySyncPolyfill(value: unknown): boolean {
  */
 export function installStructuredCloneCompatibility():
   StructuredCloneImplementation {
-  if (typeof globalThis.structuredClone === "function") {
-    return isEasySyncPolyfill(globalThis.structuredClone)
+  if (typeof structuredClone === "function") {
+    return isEasySyncPolyfill(structuredClone)
       ? "polyfill"
       : "native";
   }
+  // 兼容垫片写的是语言级内建的“全局注册表”本体：消费方（含 V2 状态机测试）
+  // 以 globalThis 可见性为契约。官方 no-global-this 规则面向 UI 对象的弹窗安全，
+  // 与本文件的语义正交；该规则的行内禁用被官方禁止，故此处保留并接受告警。
   Object.defineProperty(globalThis, "structuredClone", {
     configurable: true,
     enumerable: false,

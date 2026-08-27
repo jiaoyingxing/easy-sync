@@ -3416,7 +3416,7 @@ export class StateManager {
     ) {
       throw new Error("Plugin bundle settlement evidence is invalid");
     }
-    const settlement = entry.manualResolution as CommunityPluginBundleSettlementV2;
+    const settlement = entry.manualResolution;
     const expectedOperationIds = expectedRecords
       .map((record) => record.intent.operationId)
       .sort((left, right) => left.localeCompare(right));
@@ -4224,7 +4224,7 @@ export class StateManager {
     if (!admitted) return false;
     await this.assertConservativeResetAuthority(
       paths,
-      this.v2Envelope!,
+      this.v2Envelope,
       sourceAuthority,
     );
     const checkpoint = expected.receipt.checkpoint;
@@ -6500,7 +6500,7 @@ export class StateManager {
     const currentHold = this.activeV2MigrationHold;
     return (
       this.matchesPendingV2MigrationAuthorization(input, currentHold)
-      && sourceStateDigest === currentHold!.sourceStateDigest
+      && sourceStateDigest === currentHold.sourceStateDigest
     );
   }
 
@@ -8855,7 +8855,7 @@ function parseRemoteState(value: unknown): RemoteSyncState | null {
   const state = value as Partial<RemoteSyncState>;
   if (state.version !== 1) return null;
   if (typeof state.generation !== "number") (state as Record<string, unknown>).generation = 0;
-  const rawScope = (state as Partial<RemoteSyncState>).scope;
+  const rawScope = (state).scope;
   if (rawScope !== undefined && rawScope !== null && !isSyncScope(rawScope)) return null;
   if (state.deltaLink !== null && typeof state.deltaLink !== "string") return null;
   if (!state.entries || typeof state.entries !== "object" || Array.isArray(state.entries)) {
@@ -8864,18 +8864,18 @@ function parseRemoteState(value: unknown): RemoteSyncState | null {
   for (const [path, entry] of Object.entries(state.entries)) {
     if (!isRemoteEntry(entry) || entry.path !== path) return null;
   }
-  const rawFolders = (state as Partial<RemoteSyncState>).folders;
+  const rawFolders = (state).folders;
   if (rawFolders !== undefined && (
     !rawFolders
     || typeof rawFolders !== "object"
     || Array.isArray(rawFolders)
   )) return null;
-  const folders = (rawFolders ?? {}) as Record<string, RemoteFolderEntry>;
+  const folders = (rawFolders ?? {});
   for (const [driveId, folder] of Object.entries(folders)) {
     if (!isRemoteFolderEntry(folder) || folder.driveId !== driveId) return null;
   }
   const rawFolderIndexComplete = (
-    state as Partial<RemoteSyncState>
+    state
   ).folderIndexComplete;
   if (
     rawFolderIndexComplete !== undefined
@@ -8886,7 +8886,7 @@ function parseRemoteState(value: unknown): RemoteSyncState | null {
     generation: state.generation ?? 0,
     scope: rawScope ?? null,
     deltaLink: state.deltaLink ?? null,
-    entries: state.entries as Record<string, RemoteFileEntry>,
+    entries: state.entries,
     folders,
     folderIndexComplete: rawFolderIndexComplete === true,
   };

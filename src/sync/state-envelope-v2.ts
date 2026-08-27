@@ -1008,7 +1008,7 @@ function isRemoteIndex(value: unknown, filesRootId: string): value is RemoteInde
     || !(value.deltaLink === null || typeof value.deltaLink === "string")
     || !isRecord(value.itemsById)) return false;
 
-  const nodes = value.itemsById as Record<string, unknown>;
+  const nodes = value.itemsById;
   for (const [id, node] of Object.entries(nodes)) {
     if (!isRemoteNode(node, id)) return false;
   }

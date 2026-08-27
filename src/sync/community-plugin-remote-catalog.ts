@@ -398,7 +398,7 @@ function toRemoteFileEntry(
 
 async function digest(value: unknown): Promise<string> {
   const bytes = new TextEncoder().encode(JSON.stringify(value));
-  return sha256Hex(bytes.buffer as ArrayBuffer);
+  return sha256Hex(bytes.buffer);
 }
 
 function compareMember(

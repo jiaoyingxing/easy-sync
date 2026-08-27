@@ -897,8 +897,8 @@ function availableSharedSyncProtocolTransportV2(
     && typeof candidate.readSharedSyncProtocolV2ById === "function"
     ? {
         createOnly: (content) =>
-          candidate.createSharedSyncProtocolV2!(vaultName, content),
-        readById: (id) => candidate.readSharedSyncProtocolV2ById!(id),
+          candidate.createSharedSyncProtocolV2(vaultName, content),
+        readById: (id) => candidate.readSharedSyncProtocolV2ById(id),
       }
     : null;
 }
@@ -916,12 +916,12 @@ function availableSharedSyncProtocolRepairTransportV2(
     && typeof candidate.readSharedSyncProtocolV2ById === "function"
     ? {
         overwriteOnly: (id, eTag, content) =>
-          candidate.overwriteSharedSyncProtocolV2!(
+          candidate.overwriteSharedSyncProtocolV2(
             id,
             eTag,
             content,
           ),
-        readById: (id) => candidate.readSharedSyncProtocolV2ById!(id),
+        readById: (id) => candidate.readSharedSyncProtocolV2ById(id),
       }
     : null;
 }
@@ -939,8 +939,8 @@ function availableSharedSyncProtocolTransportV3(
     && typeof candidate.readSharedSyncProtocolV3ById === "function"
     ? {
         createOnly: (content) =>
-          candidate.createSharedSyncProtocolV3!(vaultName, content),
-        readById: (id) => candidate.readSharedSyncProtocolV3ById!(id),
+          candidate.createSharedSyncProtocolV3(vaultName, content),
+        readById: (id) => candidate.readSharedSyncProtocolV3ById(id),
       }
     : null;
 }
@@ -2752,10 +2752,10 @@ export class SyncExecutor {
       files: memberPaths.map((path) => ({
         path,
         ...(localMtimeByPath.has(path)
-          ? { localMtime: localMtimeByPath.get(path) as number }
+          ? { localMtime: localMtimeByPath.get(path) }
           : {}),
         ...(remoteMtimeByPath.has(path)
-          ? { remoteMtime: remoteMtimeByPath.get(path) as number }
+          ? { remoteMtime: remoteMtimeByPath.get(path) }
           : {}),
       })),
     };
@@ -4353,16 +4353,16 @@ export class SyncExecutor {
         const readyBytes = await this.scanner.vault.adapter.readBinary(readyPath);
         if (
           readyBytes.byteLength !== (content as ArrayBuffer).byteLength
-          || await sha256Hex(readyBytes) !== downloaded!.hash
+          || await sha256Hex(readyBytes) !== downloaded.hash
         ) {
           throw new Error(`Downloaded temp file verification failed: ${path}`);
         }
         await this.commitDownloadedTempFile(
-          this.scanner.vault.adapter as StreamDownloadAdapter,
+          this.scanner.vault.adapter,
           path,
           readyPath,
           expectedLocal,
-          downloaded!,
+          downloaded,
         );
       } catch (writeErr) {
         await this.removePathIfExists(readyPath);
@@ -4374,12 +4374,12 @@ export class SyncExecutor {
       !verified
       || verified.status === "uncertain"
       || verified.status === "missing"
-      || verified.entry!.size !== downloaded!.size
-      || verified.entry!.hash !== downloaded!.hash
+      || verified.entry!.size !== downloaded.size
+      || verified.entry!.hash !== downloaded.hash
     ) {
       throw new Error(`Alignment read-back failed: ${path} -> ${path}`);
     }
-    return { hash: downloaded!.hash, size: downloaded!.size };
+    return { hash: downloaded.hash, size: downloaded.size };
   }
 
   private getRecoveryJournal(): LocalRecoveryJournal {
@@ -4456,7 +4456,7 @@ export class SyncExecutor {
         }
         if (manifests.length === 0) continue;
         assertCommunityPluginManifestIdentityStable(directoryId, manifests);
-        identities.push({ directoryId, manifestId: manifests[0]!.id });
+        identities.push({ directoryId, manifestId: manifests[0].id });
       } catch (error) {
         this.communityPluginIdentityBlockedErrors.set(
           directoryId,
@@ -5667,9 +5667,9 @@ export class SyncExecutor {
         && this.onedrive.restoreVaultScope(
           this.vaultName,
           {
-            driveId: committedScope!.driveId,
-            vaultFolderId: committedScope!.vaultFolderId,
-            filesRootId: committedScope!.filesRootId,
+            driveId: committedScope.driveId,
+            vaultFolderId: committedScope.vaultFolderId,
+            filesRootId: committedScope.filesRootId,
           },
           committedDeltaLink!,
         );
@@ -5683,21 +5683,21 @@ export class SyncExecutor {
           const restored = await this.onedrive.restoreVaultScopeByIdentity(
             this.vaultName,
             {
-              driveId: committedScope!.driveId,
-              vaultFolderId: committedScope!.vaultFolderId,
-              filesRootId: committedScope!.filesRootId,
+              driveId: committedScope.driveId,
+              vaultFolderId: committedScope.vaultFolderId,
+              filesRootId: committedScope.filesRootId,
             },
           );
-          restoredCommittedScope = restored.driveId === committedScope!.driveId
-            && restored.vaultFolderId === committedScope!.vaultFolderId
-            && restored.filesRootId === committedScope!.filesRootId;
+          restoredCommittedScope = restored.driveId === committedScope.driveId
+            && restored.vaultFolderId === committedScope.vaultFolderId
+            && restored.filesRootId === committedScope.filesRootId;
         } catch (error) {
           if (
             !this.state.isV2StateActive
             || this.state.mutationLedger.length > 0
           ) throw error;
           const scopeLoss = await this.resolveV2CommittedScopeLoss(
-            committedScope!,
+            committedScope,
             error,
           );
           await this.stageV2CommittedScopeRecovery(result, scopeLoss);
@@ -8660,7 +8660,7 @@ export class SyncExecutor {
             await this.state.activatePreparedV2MigrationCandidate({
               candidate: migrationCandidateEnvelope!,
               canonicalIdentity: plan.canonicalIdentity!,
-              source: public113MigrationInput!,
+              source: public113MigrationInput,
             });
           this.diag?.log("state", `V2 controlled activation ${migration.status}`, {
             phase: "activation",
@@ -10256,7 +10256,7 @@ export class SyncExecutor {
       const metadataPreparationErrors = new Map<string, unknown>();
       if (canBatchMetadata && missingDownloadUrl.length >= 1) {
         try {
-          const refreshed = await metadataBatchClient.getDriveItemMetadataByIds!(
+          const refreshed = await metadataBatchClient.getDriveItemMetadataByIds(
             missingDownloadUrl.map((item) => item.remote!.driveId),
             "downloadUrlRefresh",
           );
@@ -10348,7 +10348,7 @@ export class SyncExecutor {
       if (shouldBatchVersionVerification && hashlessVerificationIndexes.length > 0) {
         const remoteVerifyStartedAt = Date.now();
         try {
-          const currentById = await metadataBatchClient.getDriveItemMetadataByIds!(
+          const currentById = await metadataBatchClient.getDriveItemMetadataByIds(
             hashlessVerificationIndexes.map((index) => batch[index].remote!.driveId),
             "downloadVersionVerify",
           );
@@ -14859,7 +14859,7 @@ export class SyncExecutor {
                 throw new Error(`Downloaded temp file verification failed: ${item.path}`);
               }
               fileStat = await this.commitDownloadedTempFile(
-                this.scanner.vault.adapter as StreamDownloadAdapter,
+                this.scanner.vault.adapter,
                 item.path,
                 readyPath,
                 item.local,
@@ -16821,7 +16821,7 @@ export class SyncExecutor {
 
       sourceEnvelope =
         await this.state.confirmV2RemoteScopeBootstrapReview(
-          reviewedAuthorization!,
+          reviewedAuthorization,
         );
       recovery = sourceEnvelope.remoteScopeRecovery;
       this.startGeneration = this.state.remoteGeneration;
@@ -19012,7 +19012,7 @@ export class SyncExecutor {
         );
         targetMutationStarted = true;
         await this.commitDownloadedTempFile(
-          this.scanner.vault.adapter as StreamDownloadAdapter,
+          this.scanner.vault.adapter,
           path,
           readyPath,
           expected,
@@ -19261,7 +19261,7 @@ export class SyncExecutor {
               );
               targetMutationStarted = true;
               await this.commitDownloadedTempFile(
-                this.scanner.vault.adapter as StreamDownloadAdapter,
+                this.scanner.vault.adapter,
                 path,
                 readyPath,
                 queuedConflict.local,

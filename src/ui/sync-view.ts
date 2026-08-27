@@ -1139,7 +1139,7 @@ export class EasySyncSyncView extends ItemView {
     };
 
     for (const child of Array.from(scope.children)) {
-      if (!(child instanceof HTMLElement)
+      if (!(child.instanceOf(HTMLElement))
         || !child.classList.contains("easy-sync-path-layout-item")) {
         flush();
         continue;
@@ -2653,7 +2653,7 @@ export class EasySyncSyncView extends ItemView {
 
   private disableActionButtons(actionsEl: HTMLElement): void {
     for (const button of Array.from(actionsEl.querySelectorAll("button"))) {
-      (button as HTMLButtonElement).disabled = true;
+      (button).disabled = true;
     }
   }
 

@@ -12,6 +12,7 @@ export default defineConfig([
       "scripts/**",
       "node_modules/**",
       "**/.codex-tmp*/**",
+      "vitest.config.ts",
     ],
   },
   ...obsidianmd.configs.recommended,
@@ -19,7 +20,7 @@ export default defineConfig([
     languageOptions: {
       parserOptions: {
         projectService: {
-          allowDefaultProject: ["eslint.config.mjs", "vitest.config.ts"],
+          allowDefaultProject: ["eslint.config.mjs"],
         },
       },
     },

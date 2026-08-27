@@ -351,6 +351,16 @@ class FakeNode {
 }
 
 describe("createSyncProgressNoticeMessage", () => {
+  // Emulate Obsidian's renderer-injected global element factories against the
+  // per-test fake document; production code must use the official helpers.
+  function stubObsidianElementFactories(): void {
+    const doc = (globalThis as { document?: Document }).document;
+    vi.stubGlobal(
+      "createFragment",
+      () => doc?.createDocumentFragment() ?? new FakeNode(),
+    );
+    vi.stubGlobal("createDiv", () => doc?.createElement("div") ?? new FakeNode());
+  }
   const ProgressBarMock = ProgressBarComponent as unknown as {
     instances: Array<ProgressBarComponent & { containerEl: HTMLElement }>;
   };
@@ -365,6 +375,7 @@ describe("createSyncProgressNoticeMessage", () => {
       createDocumentFragment: () => new FakeNode(),
       createElement: () => new FakeNode(),
     });
+    stubObsidianElementFactories();
 
     createSyncProgressNoticeMessage("Syncing 3/12", 21, true);
 
@@ -379,6 +390,7 @@ describe("createSyncProgressNoticeMessage", () => {
       createDocumentFragment: () => new FakeNode(),
       createElement: () => new FakeNode(),
     });
+    stubObsidianElementFactories();
 
     createSyncProgressNoticeMessage("Starting sync", 0, false);
 
@@ -393,6 +405,7 @@ describe("createSyncProgressNoticeMessage", () => {
       createDocumentFragment: () => new FakeNode(),
       createElement: () => new FakeNode(),
     });
+    stubObsidianElementFactories();
 
     const message = createSyncProgressNoticeMessage(
       "Checking remote changes",

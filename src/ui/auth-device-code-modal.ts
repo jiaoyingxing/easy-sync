@@ -105,7 +105,7 @@ export class AuthDeviceCodeModal extends Modal {
     codeBlock.addEventListener("click", () => {
       void this.copyCode();
     });
-    contentEl.createEl("div", {
+    contentEl.createDiv({
       text: t("settings.account.device.codeHint"),
       cls: "easy-sync-device-code-hint",
     });
@@ -175,7 +175,7 @@ export class AuthDeviceCodeModal extends Modal {
       status.setText(this.deps.t(devicePhaseMessageKey(attempt.phase)));
     }
 
-    contentEl.createEl("div", {
+    contentEl.createDiv({
       text: t("settings.account.device.security"),
       cls: "easy-sync-device-security",
     });
@@ -235,7 +235,7 @@ export class AuthDeviceCodeModal extends Modal {
     if (!attempt) return;
     const t = this.deps.t;
     try {
-      const clipboard = globalThis.navigator?.clipboard;
+      const clipboard = navigator?.clipboard;
       if (!clipboard?.writeText) {
         throw new Error("Clipboard API is unavailable");
       }
@@ -279,7 +279,7 @@ export class AuthDeviceCodeModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("easy-sync-auth-device-code-modal");
-    contentEl.createEl("div", {
+    contentEl.createDiv({
       text: this.deps.t("settings.account.device.busy"),
       cls: "easy-sync-device-status",
     });

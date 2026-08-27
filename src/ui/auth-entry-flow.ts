@@ -261,7 +261,7 @@ async function copyPendingAuthUrl(
   }
 
   try {
-    const clipboard = globalThis.navigator?.clipboard;
+    const clipboard = navigator?.clipboard;
     if (!clipboard?.writeText) {
       throw new Error("Clipboard API is unavailable");
     }

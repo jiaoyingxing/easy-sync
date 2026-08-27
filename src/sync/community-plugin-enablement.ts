@@ -137,7 +137,7 @@ function isCanonicalPluginIdList(value: readonly unknown[]): value is string[] {
   )) return false;
   return new Set(value).size === value.length
     && value.every((item, index) =>
-      index === 0 || compareText(value[index - 1]!, item) < 0
+      index === 0 || compareText(value[index - 1], item) < 0
     );
 }
 

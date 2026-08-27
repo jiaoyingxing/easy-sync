@@ -56,7 +56,7 @@ export function isIndexedDbVaultInstanceId(
 
 export function createIndexedDbVaultInstanceId(): string {
   const bytes = new Uint8Array(16);
-  globalThis.crypto.getRandomValues(bytes);
+  crypto.getRandomValues(bytes);
   return [...bytes]
     .map((value) => value.toString(16).padStart(2, "0"))
     .join("");

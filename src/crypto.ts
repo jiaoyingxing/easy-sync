@@ -4,7 +4,7 @@ export async function sha256Hex(content: ArrayBuffer): Promise<string> {
   const bytes = new Uint8Array(hashBuffer);
   let hex = "";
   for (let index = 0; index < bytes.length; index++) {
-    hex += bytes[index]!.toString(16).padStart(2, "0");
+    hex += bytes[index].toString(16).padStart(2, "0");
   }
   return hex;
 }
@@ -23,7 +23,7 @@ export function quickXorHashBase64(content: ArrayBuffer): string {
   let shift = 0;
 
   for (let index = 0; index < input.length; index++) {
-    const byte = input[index]!;
+    const byte = input[index];
     const byteOffset = shift >> 3;
     const bitOffset = shift & 7;
     output[byteOffset] ^= (byte << bitOffset) & 0xff;
@@ -41,5 +41,5 @@ export function quickXorHashBase64(content: ArrayBuffer): string {
 
   let binary = "";
   for (const byte of output) binary += String.fromCharCode(byte);
-  return globalThis.btoa(binary);
+  return btoa(binary);
 }

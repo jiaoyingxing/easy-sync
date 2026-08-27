@@ -183,7 +183,7 @@ export class StateV2AuthorityWitnessStore {
       ...(protocolBinding
         ? { protocolBinding: structuredClone(protocolBinding) }
         : {}),
-    }) as Promise<StateV2ActiveAuthorityWitness>;
+    });
   }
 
   /** Advance only the protocol binding for one unchanged active manifest. */
@@ -213,7 +213,7 @@ export class StateV2AuthorityWitnessStore {
       revision: current.revision + 1,
       updatedAt: Math.max(input.now ?? Date.now(), current.updatedAt),
       protocolBinding: structuredClone(input.nextBinding),
-    }) as Promise<StateV2ActiveAuthorityWitness>;
+    });
   }
 
   /**
@@ -268,7 +268,7 @@ export class StateV2AuthorityWitnessStore {
               structuredClone(input.nextProtocolBinding),
           }
         : {}),
-    }) as Promise<StateV2ActiveAuthorityWitness>;
+    });
   }
 
   /**
@@ -311,7 +311,7 @@ export class StateV2AuthorityWitnessStore {
       status: "active",
       updatedAt: Math.max(input.now ?? Date.now(), current.updatedAt),
       manifest: structuredClone(input.nextManifest),
-    }) as Promise<StateV2ActiveAuthorityWitness>;
+    });
   }
 
   /**
@@ -357,7 +357,7 @@ export class StateV2AuthorityWitnessStore {
       revision: current.revision + 1,
       updatedAt: Math.max(input.now ?? Date.now(), current.updatedAt),
       storageAuthority: structuredClone(input.storageAuthority),
-    }) as Promise<StateV2ActiveAuthorityWitness>;
+    });
   }
 
   /**
@@ -413,7 +413,7 @@ export class StateV2AuthorityWitnessStore {
       revision: current.revision + 1,
       updatedAt: Math.max(input.now ?? Date.now(), current.updatedAt),
       storageAuthority: structuredClone(input.nextStorageAuthority),
-    }) as Promise<StateV2ActiveAuthorityWitness>;
+    });
   }
 
   /**
@@ -454,7 +454,7 @@ export class StateV2AuthorityWitnessStore {
       ...next,
       revision: current.revision + 1,
       updatedAt: Math.max(input.now ?? Date.now(), current.updatedAt),
-    }) as Promise<StateV2ActiveAuthorityWitness>;
+    });
   }
 
   private async publish(

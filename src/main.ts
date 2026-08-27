@@ -4763,7 +4763,7 @@ export default class EasySyncPlugin extends Plugin {
     for (const entry of state.remoteSnapshot) {
       const match = /^\.obsidian\/plugins\/([^/]+)\/(main\.js|manifest\.json|styles\.css)$/
         .exec(entry.path);
-      if (match) remoteIds.add(match[1]!);
+      if (match) remoteIds.add(match[1]);
     }
     const remaining: { pluginId: string; cleanedAt: number }[] = [];
     for (const marker of markers) {
@@ -5791,11 +5791,11 @@ export default class EasySyncPlugin extends Plugin {
       ...(participation?.pluginsById[item.id]
         ? {
             participationPhase:
-              participation.pluginsById[item.id]!.phase,
-            ...(participation.pluginsById[item.id]!.blockedReason
+              participation.pluginsById[item.id].phase,
+            ...(participation.pluginsById[item.id].blockedReason
               ? {
                   participationBlockedReason:
-                    participation.pluginsById[item.id]!.blockedReason,
+                    participation.pluginsById[item.id].blockedReason,
                 }
               : {}),
           }

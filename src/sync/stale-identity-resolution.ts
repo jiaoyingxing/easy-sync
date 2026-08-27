@@ -145,7 +145,7 @@ export function buildStaleIdentityResolutionSnapshotV1(
         ),
     );
     if (actions.length !== 1) return null;
-    const action = actions[0]!;
+    const action = actions[0];
     const relatedPaths = uniqueSorted([
       action.relatedPath,
       ...(action.relatedPaths ?? []),
@@ -189,14 +189,14 @@ export function buildStaleIdentityResolutionSnapshotV1(
       && item.reason === "anchored-folder-missing-remote",
   );
   if (deferred.length !== 1 || folderConflicts.length !== 1) return null;
-  const conflict = folderConflicts[0]!;
+  const conflict = folderConflicts[0];
   if (!conflict.remoteId) return null;
   const relatedPaths = uniqueSorted(
     (conflict.affectedPaths ?? []).filter((candidatePath) => candidatePath !== path),
   );
   if (
     relatedPaths.length !== 1
-    || !facts.localFolders.some((folder) => samePath(folder.path, relatedPaths[0]!))
+    || !facts.localFolders.some((folder) => samePath(folder.path, relatedPaths[0]))
   ) return null;
 
   const folderAnchors = Object.values(facts.envelope.folderAnchors.byAnchorId)
@@ -283,9 +283,9 @@ export function retireReviewedStaleIdentityV2(
     if (
       currentFileAnchors.length !== 1
       || currentFolderAnchors.length !== 0
-      || currentFileAnchors[0]!.lastPath !== reviewed.path
-      || !currentFileAnchors[0]!.remoteId
-      || currentFileAnchors[0]!.remoteId !== reviewed.primaryRemote.remoteId
+      || currentFileAnchors[0].lastPath !== reviewed.path
+      || !currentFileAnchors[0].remoteId
+      || currentFileAnchors[0].remoteId !== reviewed.primaryRemote.remoteId
     ) return reject("review-changed");
   } else {
     const selected = currentFolderAnchors.find((anchor) =>

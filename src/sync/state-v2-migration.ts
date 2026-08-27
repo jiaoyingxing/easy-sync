@@ -666,7 +666,7 @@ function migrateBaseAnchor(
         now,
         "migrated",
         itemsById[interruptedDownloadRemoteId]?.kind === "file"
-          ? itemsById[interruptedDownloadRemoteId]!.cTag
+          ? itemsById[interruptedDownloadRemoteId].cTag
           : undefined,
       );
     }
@@ -690,7 +690,7 @@ function migrateBaseAnchor(
         now,
         "migrated",
         itemsById[pendingConflictRemoteId]?.kind === "file"
-          ? itemsById[pendingConflictRemoteId]!.cTag
+          ? itemsById[pendingConflictRemoteId].cTag
           : undefined,
       );
     }
@@ -712,7 +712,7 @@ function migrateBaseAnchor(
         now,
         "migrated",
         itemsById[historicalRelocation.driveId]?.kind === "file"
-          ? itemsById[historicalRelocation.driveId]!.cTag
+          ? itemsById[historicalRelocation.driveId].cTag
           : undefined,
       );
     }
@@ -746,17 +746,17 @@ function migrateBaseAnchor(
     node.kind === "file" && node.contentHash === base.hash && node.size === base.size,
   );
   if (localCandidates.length !== 1 || remoteCandidates.length !== 1) return null;
-  const remotePath = pathById.get(remoteCandidates[0]!.id);
-  if (!remotePath || remotePath !== localCandidates[0]!.path) return null;
+  const remotePath = pathById.get(remoteCandidates[0].id);
+  if (!remotePath || remotePath !== localCandidates[0].path) return null;
   return makeAnchor(
-    remoteCandidates[0]!.id,
+    remoteCandidates[0].id,
     remotePath,
     base.hash,
     base.size,
-    remoteCandidates[0]!.eTag,
+    remoteCandidates[0].eTag,
     now,
     "migrated",
-    remoteCandidates[0]!.cTag,
+    remoteCandidates[0].cTag,
   );
 }
 
@@ -789,7 +789,7 @@ function findExactInterruptedDownloadRemoteId(input: {
       && liveRemote.size === intent.expectedRemote.size;
   });
   if (matches.length !== 1) return null;
-  const expectedRemote = matches[0]!.intent.expectedRemote;
+  const expectedRemote = matches[0].intent.expectedRemote;
   return expectedRemote.exists ? expectedRemote.driveId : null;
 }
 
@@ -829,7 +829,7 @@ function findExactPendingConflictRemoteId(input: {
   ) {
     return null;
   }
-  const conflict = atPath[0]!;
+  const conflict = atPath[0];
   const token = conflict.decisionToken;
   const local = conflict.local;
   const remote = conflict.remote;
@@ -900,7 +900,7 @@ function findExactHistoricalRelocation(input: {
       && entry.size === input.base.size,
   );
   if (candidates.length !== 1) return null;
-  const candidate = candidates[0]!;
+  const candidate = candidates[0];
   const liveRemote = input.itemsById[candidate.driveId];
   const liveLocal = input.localEntries.filter(
     (entry) =>

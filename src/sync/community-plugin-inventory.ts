@@ -249,10 +249,10 @@ function collectRemotePluginIds(
     if (
       parts.length === 2
       && ["main.js", "manifest.json", "styles.css", "data.json"]
-        .includes(parts[1]!)
-      && isSafePluginId(parts[0]!)
+        .includes(parts[1])
+      && isSafePluginId(parts[0])
       && parts[0] !== ownPluginId
-    ) ids.add(parts[0]!);
+    ) ids.add(parts[0]);
   }
   return ids;
 }

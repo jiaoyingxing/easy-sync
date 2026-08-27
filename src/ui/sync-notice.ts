@@ -195,20 +195,20 @@ export function createSyncProgressNoticeMessage(
   showProgressBar = true,
 ): EasySyncNoticeMessage {
   if (typeof document === "undefined") return label;
-  const fragment = document.createDocumentFragment();
-  const content = document.createElement("div");
+  const fragment = createFragment();
+  const content = createDiv();
   content.className = "easy-sync-notice-progress-content";
   if (!showProgressBar) {
     content.classList.add("is-text-only");
   }
 
-  const labelEl = document.createElement("div");
+  const labelEl = createDiv();
   labelEl.className = "easy-sync-notice-progress-label";
   labelEl.textContent = label;
   content.appendChild(labelEl);
 
   if (showProgressBar) {
-    const progressHost = document.createElement("div");
+    const progressHost = createDiv();
     progressHost.className = "easy-sync-notice-progress-native";
     progressHost.setAttribute("aria-hidden", "true");
     new ProgressBarComponent(progressHost)

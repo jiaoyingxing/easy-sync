@@ -150,7 +150,7 @@ export function planIdentityRenamesFromStateV2(
             anchor,
             anchor.lastPath,
             "replacement-with-local-relocation",
-            matchingLocals.length === 1 ? matchingLocals[0]!.path : undefined,
+            matchingLocals.length === 1 ? matchingLocals[0].path : undefined,
             matchingLocals.length > 1
               ? matchingLocals.map((entry) => entry.path)
               : undefined,
@@ -172,7 +172,7 @@ export function planIdentityRenamesFromStateV2(
           anchor,
           anchor.lastPath,
           "remote-identity-missing",
-          matchingLocals.length === 1 ? matchingLocals[0]!.path : undefined,
+          matchingLocals.length === 1 ? matchingLocals[0].path : undefined,
           matchingLocals.length > 1
             ? matchingLocals.map((entry) => entry.path)
             : undefined,
@@ -253,7 +253,7 @@ export function planIdentityRenamesFromStateV2(
     // Both sides already show the same path. Nothing to move.
     if (remotePath !== anchor.lastPath
       && matchingLocals.length === 1
-      && matchingLocals[0]!.path === remotePath) continue;
+      && matchingLocals[0].path === remotePath) continue;
 
     // Local disappeared from the anchor path: only a unique content-identical
     // candidate may authorize a remote identity move.
@@ -271,7 +271,7 @@ export function planIdentityRenamesFromStateV2(
         ));
         continue;
       }
-      const destination = matchingLocals[0]!;
+      const destination = matchingLocals[0];
       if (remotePath !== anchor.lastPath) {
         actions.push(conflict(anchor, destination.path, "both-paths-diverged"));
         continue;

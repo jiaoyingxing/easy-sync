@@ -3172,7 +3172,7 @@ function selectSharedSyncProtocolSlot(
     || !Number.isSafeInteger(item.size)
     || item.size < 0
     || typeof item["@microsoft.graph.downloadUrl"] !== "string"
-    || item["@microsoft.graph.downloadUrl"]!.length === 0
+    || item["@microsoft.graph.downloadUrl"].length === 0
   ) {
     throw new Error(`Shared sync protocol slot ${name} metadata is incomplete`);
   }

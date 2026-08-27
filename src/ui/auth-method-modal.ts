@@ -116,11 +116,11 @@ export class AuthMethodModal extends Modal {
       type: "button",
     });
     const body = button.createDiv({ cls: "easy-sync-auth-method-body" });
-    body.createEl("div", {
+    body.createDiv({
       text: option.title,
       cls: "easy-sync-auth-method-title",
     });
-    body.createEl("div", {
+    body.createDiv({
       text: option.description,
       cls: "easy-sync-auth-method-desc",
     });

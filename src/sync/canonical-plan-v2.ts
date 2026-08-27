@@ -1105,7 +1105,7 @@ export async function finalizeCanonicalPlanCandidateV2(
   const results: ContentVerificationResultV2[] = [];
 
   for (let index = 0; index < selectedCandidates.length; index++) {
-    const item = selectedCandidates[index]!;
+    const item = selectedCandidates[index];
     const local = item.local!;
     const remote = item.remote!;
     let equality = resolveContentEquality({
