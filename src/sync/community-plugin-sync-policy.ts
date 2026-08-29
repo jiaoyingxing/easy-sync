@@ -30,6 +30,34 @@ export const DEFAULT_COMMUNITY_PLUGIN_SYNC_POLICY: CommunityPluginSyncPolicyV1 =
   data: { mode: "all", pluginIds: [] },
 };
 
+/**
+ * Remove one plugin from every list of a scope selection without touching the
+ * mode or any other plugin. Used by the cloud-cleanup thorough removal: the
+ * cleaned plugin stops being tracked on both sides (files and data), its rows
+ * disappear and counts stop including it; cloud data.json and local data
+ * files are untouched, and a local reinstall re-shows the row (no permanent
+ * blocklist).
+ */
+export function stripPluginFromScopeSelection(
+  selection: PluginScopeSelection,
+  pluginId: string,
+): PluginScopeSelection {
+  const without = (ids: readonly string[] | undefined): string[] | undefined =>
+    ids === undefined
+      ? undefined
+      : ids.filter((id) => id !== pluginId);
+  return {
+    mode: selection.mode,
+    pluginIds: selection.pluginIds.filter((id) => id !== pluginId),
+    ...(selection.ignoredPluginIds !== undefined
+      ? { ignoredPluginIds: without(selection.ignoredPluginIds) }
+      : {}),
+    ...(selection.restoringPluginIds !== undefined
+      ? { restoringPluginIds: without(selection.restoringPluginIds) }
+      : {}),
+  };
+}
+
 const PLUGIN_ID_PATTERN = /^[a-z0-9][a-z0-9_-]*$/i;
 
 export function normalizePluginIds(

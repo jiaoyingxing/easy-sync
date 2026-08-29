@@ -140,6 +140,12 @@ function attachResetRecoveryHarness(plugin: EasySyncPlugin) {
   const reset = vi.fn().mockResolvedValue(undefined);
   const resetPreservingIsolatedMutationRecovery = vi.fn()
     .mockResolvedValue(undefined);
+  const forceReset = vi.fn().mockResolvedValue({
+    at: 1,
+    ledgerCount: 1,
+    quarantineCount: 0,
+    corrupt: false,
+  });
   const clearScanCache = vi.fn().mockResolvedValue(undefined);
   const addSyncHistory = vi.fn().mockResolvedValue(undefined);
   const state = {
@@ -158,6 +164,7 @@ function attachResetRecoveryHarness(plugin: EasySyncPlugin) {
     addSyncHistory,
     reset,
     resetPreservingIsolatedMutationRecovery,
+    forceReset,
   };
   plugin.syncExecutor = {
     isRunning: false,
@@ -177,6 +184,7 @@ function attachResetRecoveryHarness(plugin: EasySyncPlugin) {
     invalidateLifecycle,
     reset,
     resetPreservingIsolatedMutationRecovery,
+    forceReset,
     clearScanCache,
     addSyncHistory,
     saveSyncSettings,
@@ -2654,7 +2662,7 @@ describe("main sync entry guards", () => {
     plugin.stopAutoSync();
   });
 
-  it("persists a retryable shared-control observation as one failed run before the next interval succeeds", async () => {
+  it("persists a retryable shared-control observation as one retry-pending run before the next interval succeeds", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-16T12:00:00+08:00"));
     const plugin = new EasySyncPlugin();
@@ -2737,8 +2745,8 @@ describe("main sync entry guards", () => {
     expect(history).toHaveLength(1);
     expect(history[0]).toMatchObject({
       mode: "auto",
-      status: "failed",
-      errors: 1,
+      status: "retry-pending",
+      errors: 0,
       message: "result.sharedControlReadUnavailable",
       files: [],
       runFacts: {
@@ -2775,7 +2783,8 @@ describe("main sync entry guards", () => {
       },
     });
     expect(history[1]).toMatchObject({
-      status: "failed",
+      status: "retry-pending",
+      errors: 0,
       message: "result.sharedControlReadUnavailable",
       files: [],
       runFacts: { userFileChanges: "unknown" },
@@ -3294,7 +3303,7 @@ describe("main sync entry guards", () => {
     }));
     expect(show).toHaveBeenCalledWith(expect.objectContaining({
       key: "sync-result:recovery-blocked",
-      message: "⚠️ Sync paused. Open the EasySync sidebar to handle the unfinished operation.",
+      message: "Some unfinished operations cannot be confirmed automatically. Open the EasySync sidebar for details, or export a diagnostic report.",
     }));
     expect(show.mock.calls[0]?.[0]?.message).not.toContain(
       "The sync location no longer matches",
@@ -3347,7 +3356,7 @@ describe("main sync entry guards", () => {
     expect(plugin.autoSyncPaused).toBe(true);
     const messages = show.mock.calls.map((call) => String(call[0]?.message));
     expect(messages.join("\n")).toContain(
-      "Open the EasySync sidebar to handle the unfinished operation",
+      "Switch back to the original account",
     );
     expect(messages.join("\n")).not.toContain(
       "Reset sync state before switching accounts",
@@ -4422,12 +4431,13 @@ describe("main sync entry guards", () => {
     });
   });
 
-  it("keeps unresolved recovery evidence after one reset-owned recovery attempt", async () => {
+  it("offers informed forced reset confirmation when one reset-owned recovery attempt stays blocked", async () => {
     const plugin = makePlugin();
     const {
       state,
       invalidateLifecycle,
       reset,
+      forceReset,
       saveSyncSettings,
     } =
       attachResetRecoveryHarness(plugin);
@@ -4454,20 +4464,177 @@ describe("main sync entry guards", () => {
         },
       });
     vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+    confirmModalAwaitConfirm.mockResolvedValueOnce(false);
 
     await plugin.resetSyncState();
 
     expect(invalidateLifecycle).toHaveBeenCalledWith("reset");
     expect(dispatch).toHaveBeenCalledOnce();
+    expect(confirmModalAwaitConfirm).toHaveBeenCalledOnce();
     expect(reset).not.toHaveBeenCalled();
+    expect(forceReset).not.toHaveBeenCalled();
     expect(state.mutationLedger).toHaveLength(1);
     expect(saveSyncSettings).not.toHaveBeenCalled();
-    expect(show).toHaveBeenCalledWith(expect.objectContaining({
-      key: "reset-mutation-recovery-blocked",
-      message: "An unfinished operation still cannot be settled safely, so its state was kept. Handle it in the EasySync sidebar, then retry reset.",
-    }));
     expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
   });
+
+  it("force resets after informed confirmation when recovery stays blocked", async () => {
+    const plugin = makePlugin();
+    const {
+      forceReset,
+      clearScanCache,
+      saveSyncSettings,
+      reset,
+    } = attachResetRecoveryHarness(plugin);
+    const show = vi.fn();
+    plugin.noticeCenter = {
+      activeKey: null,
+      show,
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    const dispatch = vi.spyOn(plugin as never, "dispatchSyncRun")
+      .mockResolvedValue({
+        ...okResult(),
+        success: false,
+        errors: 1,
+        mutationRecovery: {
+          state: "blocked",
+          total: 1,
+          settled: 0,
+          remaining: 1,
+          retryAfterSeconds: null,
+          blockReason: "facts-changed",
+          blockedOperationId: "pending",
+        },
+      });
+    vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+    confirmModalAwaitConfirm.mockResolvedValueOnce(true);
+
+    await plugin.resetSyncState();
+
+    expect(forceReset).toHaveBeenCalledOnce();
+    expect(reset).not.toHaveBeenCalled();
+    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    expect(clearScanCache).toHaveBeenCalledOnce();
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "reset-complete",
+    }));
+  });
+
+  it("reports a reset failure and keeps evidence when forced reset throws", async () => {
+    const plugin = makePlugin();
+    const {
+      state,
+      forceReset,
+      reset,
+      saveSyncSettings,
+    } = attachResetRecoveryHarness(plugin);
+    forceReset.mockRejectedValue(new Error("IndexedDB commit failed"));
+    const show = vi.fn();
+    plugin.noticeCenter = {
+      activeKey: null,
+      show,
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    const dispatch = vi.spyOn(plugin as never, "dispatchSyncRun")
+      .mockResolvedValue({
+        ...okResult(),
+        success: false,
+        errors: 1,
+        mutationRecovery: {
+          state: "blocked",
+          total: 1,
+          settled: 0,
+          remaining: 1,
+          retryAfterSeconds: null,
+          blockReason: "facts-changed",
+          blockedOperationId: "pending",
+        },
+      });
+    vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+    confirmModalAwaitConfirm.mockResolvedValueOnce(true);
+
+    await expect(plugin.resetSyncState()).resolves.toBeUndefined();
+
+    expect(forceReset).toHaveBeenCalledOnce();
+    expect(reset).not.toHaveBeenCalled();
+    expect(saveSyncSettings).not.toHaveBeenCalled();
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "reset-failed",
+    }));
+    expect(plugin.diag.error).toHaveBeenCalledWith(
+      "state",
+      "local sync state reset failed",
+      expect.objectContaining({ message: "IndexedDB commit failed" }),
+    );
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
+  it("keeps isolated conservative reset out of the forced-reset path", async () => {
+    const plugin = makePlugin();
+    const {
+      forceReset,
+      resetPreservingIsolatedMutationRecovery,
+    } = attachResetRecoveryHarness(plugin);
+    const retained = {
+      intent: {
+        version: 1 as const,
+        operationId: "pending",
+        planRevision: 1,
+        scope: {
+          accountId: "account",
+          driveId: "drive",
+          vaultFolderId: "vault",
+          filesRootId: "root",
+        },
+        action: "upload" as const,
+        path: "notes/a.md",
+        expectedLocal: {
+          exists: true as const,
+          hash: "aa".repeat(32),
+          size: 3,
+        },
+        expectedRemote: {
+          exists: true as const,
+          driveId: "remote-a",
+          eTag: "etag-a",
+          size: 3,
+          sha256Hash: "aa".repeat(32),
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    plugin.state.mutationLedger.splice(0, 1, retained);
+    const dispatch = vi.spyOn(plugin as never, "dispatchSyncRun")
+      .mockResolvedValue({
+        ...okResult(),
+        success: false,
+        errors: 1,
+        mutationRecovery: {
+          state: "blocked",
+          total: 1,
+          settled: 0,
+          remaining: 1,
+          retryAfterSeconds: null,
+          blockReason: "facts-changed",
+          blockedOperationId: retained.intent.operationId,
+          isolated: true,
+        },
+      });
+    vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+
+    await plugin.resetSyncState();
+
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(confirmModalAwaitConfirm).not.toHaveBeenCalled();
+    expect(forceReset).not.toHaveBeenCalled();
+    expect(resetPreservingIsolatedMutationRecovery).toHaveBeenCalledOnce();
+  });
+
 
   it("conservatively resets unrelated state after one ordinary file is precisely isolated", async () => {
     const plugin = makePlugin();
@@ -4663,14 +4830,13 @@ describe("main sync entry guards", () => {
       }).checkAccountBinding,
     ).mockRejectedValue(new Error("account lookup failed"));
     vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+    confirmModalAwaitConfirm.mockResolvedValueOnce(false);
 
     await expect(plugin.resetSyncState()).resolves.toBeUndefined();
 
     expect(reset).not.toHaveBeenCalled();
     expect(state.mutationLedger).toHaveLength(1);
-    expect(show).toHaveBeenCalledWith(expect.objectContaining({
-      key: "reset-mutation-recovery-blocked",
-    }));
+    expect(confirmModalAwaitConfirm).toHaveBeenCalledOnce();
     expect(plugin.diag.warn).toHaveBeenCalledWith(
       "execute",
       "reset preflight mutation recovery failed",
@@ -4878,6 +5044,51 @@ describe("main sync entry guards", () => {
       "easy-sync-community-plugin-cloud-cleanup-v1",
       [{ pluginId: "calendar", cleanedAt: expect.any(Number) }],
     );
+  });
+
+  it("removes a cleaned plugin from both sides of the local sync policy (thorough removal)", async () => {
+    const plugin = makePlugin();
+    attachParticipationState(
+      plugin,
+      reduceDeviceCommunityPluginParticipation(
+        createEmptyDeviceCommunityPluginParticipation(true),
+        { type: "mark-never-participated", pluginId: "calendar" },
+      ),
+    );
+    plugin.communityPluginSyncPolicy = {
+      version: 1,
+      files: { mode: "selected", pluginIds: ["calendar", "other"] },
+      data: { mode: "selected", pluginIds: ["calendar"] },
+    } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      runCommunityPluginCloudCleanup: vi.fn().mockResolvedValue({
+        status: "completed",
+        deleted: 3,
+      }),
+    } as never;
+    plugin.noticeCenter = {
+      show: vi.fn(),
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue(null);
+    plugin.app.saveLocalStorage = vi.fn() as never;
+    const updateSyncPathSettings = vi.fn().mockResolvedValue(undefined);
+    plugin.updateSyncPathSettings = updateSyncPathSettings as never;
+
+    await expect(plugin.runCommunityPluginCloudCleanup("calendar"))
+      .resolves.toBe(true);
+    expect(updateSyncPathSettings).toHaveBeenCalledTimes(1);
+    const patch = updateSyncPathSettings.mock.calls[0][0] as {
+      communityPluginSyncPolicy: {
+        files: { pluginIds: string[] };
+        data: { pluginIds: string[] };
+      };
+    };
+    expect(patch.communityPluginSyncPolicy.files.pluginIds)
+      .toEqual(["other"]);
+    expect(patch.communityPluginSyncPolicy.data.pluginIds).toEqual([]);
   });
 
   it("notices once when a cleaned plugin reappears on the cloud", () => {

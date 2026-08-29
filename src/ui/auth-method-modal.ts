@@ -28,7 +28,6 @@ export class AuthMethodModal extends Modal {
 
   constructor(
     app: App,
-    private lead: string,
     private browser: AuthMethodOptionView,
     private device: AuthMethodOptionView,
     /** Called synchronously in the browser option's click handler. */
@@ -75,11 +74,6 @@ export class AuthMethodModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("easy-sync-auth-method-modal");
-
-    contentEl.createDiv({
-      text: this.lead,
-      cls: "easy-sync-auth-method-lead",
-    });
 
     const browserEntry = {
       build: () => {

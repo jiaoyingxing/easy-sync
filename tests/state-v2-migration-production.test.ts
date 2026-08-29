@@ -250,6 +250,7 @@ describe("production V1 to V2 migration", () => {
         eTag: anchor.remoteETag ?? "",
       })),
       skippedLarge: [],
+    configDir: ".obsidian",
     });
     expect(laterOldPathPlan.items).toEqual([
       expect.objectContaining({

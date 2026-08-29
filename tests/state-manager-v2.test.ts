@@ -3060,6 +3060,125 @@ describe("StateManager V2 production controller", () => {
     );
   });
 
+  it("force reset terminates every unresolved record with one audit entry and rebuilds default state", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const first = uploadMutationAt(1);
+    const second = uploadMutationAt(2);
+    await state.beginMutationIntent(first.intent);
+    await state.beginMutationIntent(second.intent);
+
+    const audit = await state.forceReset();
+
+    expect(audit).toEqual({
+      at: expect.any(Number),
+      ledgerCount: 2,
+      quarantineCount: 0,
+      corrupt: false,
+    });
+    expect(state.mutationLedger).toEqual([]);
+    expect(state.mutationRecoveryQuarantine).toEqual([]);
+    expect(state.isV2StateActive).toBe(false);
+    expect(state.forceResetAudit).toEqual(audit);
+
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    expect(restarted.mutationLedger).toEqual([]);
+    expect(restarted.forceResetAudit).toEqual(audit);
+  });
+
+  it("restores a corrupt mutation ledger from its checksummed backup", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const mutation = uploadMutationAt(1);
+    await state.beginMutationIntent(mutation.intent);
+
+    const backupPath = `${paths.stateV2File}.ledger-backup`;
+    expect(harness.files.has(backupPath)).toBe(true);
+
+    // Corrupt the primary ledger copy while the backup stays intact.
+    harness.pluginData["easy-sync-v2-mutation-ledger"] =
+      "garbage-not-an-array";
+
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+
+    expect(restarted.hasMutationLedgerCorruption).toBe(false);
+    expect(restarted.mutationLedger).toHaveLength(1);
+    expect(restarted.mutationLedger[0].intent.operationId)
+      .toBe(mutation.intent.operationId);
+  });
+
+  it("stays fail-closed corrupt when no checksummed ledger backup exists", async () => {
+    const harness = makeHarness({
+      pluginData: {
+        "easy-sync-v2-mutation-ledger": "garbage-not-an-array",
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    expect(state.hasMutationLedgerCorruption).toBe(true);
+  });
+
+  it("stays fail-closed corrupt when the checksummed ledger backup is also bad", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const mutation = uploadMutationAt(1);
+    await state.beginMutationIntent(mutation.intent);
+
+    const backupPath = `${paths.stateV2File}.ledger-backup`;
+    expect(harness.files.has(backupPath)).toBe(true);
+    harness.files.set(backupPath, "garbage-backup");
+    harness.pluginData["easy-sync-v2-mutation-ledger"] =
+      "garbage-not-an-array";
+
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    expect(restarted.hasMutationLedgerCorruption).toBe(true);
+  });
+
+  it("refuses a ledger backup whose digest no longer matches its entries", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const mutation = uploadMutationAt(1);
+    await state.beginMutationIntent(mutation.intent);
+
+    const backupPath = `${paths.stateV2File}.ledger-backup`;
+    const backup = JSON.parse(harness.files.get(backupPath)!);
+    // Tamper with the entries while keeping the stored digest intact.
+    backup.entries.push({ intent: "tampered" });
+    harness.files.set(backupPath, JSON.stringify(backup));
+    harness.pluginData["easy-sync-v2-mutation-ledger"] =
+      "garbage-not-an-array";
+
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    expect(restarted.hasMutationLedgerCorruption).toBe(true);
+  });
+
+  it("keeps the primary ledger commit when the backup write fails", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const mutation = uploadMutationAt(1);
+    // Backup write is best-effort: fail it, the commit must still succeed.
+    harness.rawAdapter.write.mockImplementationOnce(
+      async (path: string) => {
+        throw new Error(`injected backup write failure: ${path}`);
+      },
+    );
+
+    await state.beginMutationIntent(mutation.intent);
+
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(state.mutationLedger[0].intent.operationId)
+      .toBe(mutation.intent.operationId);
+  });
+
   it("leaves the active receipt blocking when V2 quarantine persistence fails", async () => {
     const harness = makeHarness();
     const state = new StateManager(harness.plugin);

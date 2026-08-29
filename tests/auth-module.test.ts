@@ -275,6 +275,51 @@ describe("AuthModule account identity", () => {
     vi.restoreAllMocks();
   });
 
+  it("notifies listeners as soon as initialization starts so cold-start surfaces can show the connecting state", async () => {
+    // Hold the token refresh open so the start of initialization is
+    // distinguishable from its completion.
+    const gate = deferred<void>();
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        await gate.promise;
+        return {
+          status: 200,
+          headers: {},
+          json: { access_token: "current-token", expires_in: 3600 },
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "Current User", id: "current-account" },
+      };
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn().mockResolvedValue("stored-refresh-token"),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+    }));
+    const onStateChange = vi.fn();
+    auth.onStateChange(onStateChange);
+
+    const initializePromise = auth.initialize();
+
+    // The listener must be notified while the session restore is still
+    // in flight — that is the transition that lets the sidebar / status
+    // bar flip from a pre-init "logged out" frame to "connecting".
+    expect(onStateChange).toHaveBeenCalledTimes(1);
+    expect(auth.isInitializing).toBe(true);
+    expect(auth.authState.isLoggedIn).toBe(false);
+
+    gate.resolve();
+    await initializePromise;
+    expect(auth.isInitializing).toBe(false);
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(onStateChange).toHaveBeenCalledTimes(2);
+  });
+
   it("uses current-token /me identity instead of the cached account id", async () => {
     vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
       if (options.url.includes("/oauth2/v2.0/token")) {
@@ -1089,6 +1134,292 @@ describe("AuthModule device code flow", () => {
 
     await expect(auth.checkDeviceCodeNow()).resolves.toBe(false);
     expect(tokenCalls).toBe(1);
+  });
+});
+
+describe("AuthModule login persistence (transient refresh failures)", () => {
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function makeDiagnostics(): never {
+    return {
+      log: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    } as never;
+  }
+
+  it("keeps the session and the stored credential when silent refresh fails transiently", async () => {
+    let storedToken: string | null = "stored-refresh-token";
+    const remove = vi.fn(async () => {
+      storedToken = null;
+    });
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        throw new Error("network unreachable");
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "Offline User", id: "offline-account" },
+      };
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn(async () => storedToken),
+        remove,
+      },
+      diag: makeDiagnostics(),
+    }));
+
+    // Cold start while offline: the restore refresh fails transiently, but the
+    // stored session is marked present instead of "logged out".
+    await auth.initialize();
+    expect(auth.authState.isLoggedIn).toBe(true);
+
+    // A sync round refresh fails transiently again: no logout, no credential
+    // deletion, and the session stays present for a later retry.
+    await expect(auth.getAccessToken()).rejects.toMatchObject({
+      type: "NetworkError",
+    });
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(remove).not.toHaveBeenCalled();
+    expect(storedToken).toBe("stored-refresh-token");
+  });
+
+  it("logs out and deletes the credential when refresh is structurally rejected (invalid_grant)", async () => {
+    vi.useFakeTimers();
+    let storedToken: string | null = "stored-refresh-token";
+    let tokenCalls = 0;
+    const remove = vi.fn(async () => {
+      storedToken = null;
+    });
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        tokenCalls++;
+        if (tokenCalls === 1) {
+          return {
+            status: 200,
+            headers: {},
+            json: {
+              access_token: "first-at",
+              refresh_token: "rotated-rt",
+              expires_in: 3600,
+            },
+          };
+        }
+        return {
+          status: 400,
+          headers: {},
+          json: {
+            error: "invalid_grant",
+            error_description: "AADSTS700082: The refresh token has expired due to inactivity.",
+          },
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "Bound User", id: "bound-account" },
+      };
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn(async () => storedToken),
+        remove,
+      },
+      diag: makeDiagnostics(),
+    }));
+
+    await auth.initialize();
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(auth.authState.accountId).toBe("bound-account");
+
+    // Expire the 1h access token (with its 60s buffer).
+    vi.setSystemTime(new Date(Date.now() + 2 * 60 * 60 * 1000));
+
+    await expect(auth.getAccessToken()).rejects.toMatchObject({
+      type: "CredentialsRevoked",
+    });
+    expect(auth.authState.isLoggedIn).toBe(false);
+    expect(auth.authState.accountId).toBe("");
+    expect(remove).toHaveBeenCalled();
+    expect(storedToken).toBeNull();
+  });
+
+  it("backs off after a transient refresh failure instead of hammering the token endpoint", async () => {
+    vi.useFakeTimers();
+    let tokenCalls = 0;
+    let storedToken: string | null = "stored-refresh-token";
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        tokenCalls++;
+        throw new Error("still offline");
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "U", id: "a" },
+      };
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn(async () => storedToken),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      diag: makeDiagnostics(),
+    }));
+
+    await auth.initialize(); // transient restore failure (1 token request)
+    await expect(auth.getAccessToken()).rejects.toMatchObject({
+      type: "NetworkError",
+    });
+    const callsAfterFirstFailure = tokenCalls;
+
+    await expect(auth.getAccessToken()).rejects.toMatchObject({
+      type: "NetworkError",
+    });
+    expect(tokenCalls).toBe(callsAfterFirstFailure); // inside backoff: no HTTP
+  });
+
+  it("recovers automatically after the backoff window and binds the account via /me", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-01T00:00:00Z"));
+    let tokenCalls = 0;
+    let storedToken: string | null = "stored-refresh-token";
+    let meCalls = 0;
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        tokenCalls++;
+        if (tokenCalls <= 2) throw new Error("network down");
+        return {
+          status: 200,
+          headers: {},
+          json: { access_token: "fresh-at", expires_in: 3600 },
+        };
+      }
+      if (options.url.includes("graph.microsoft.com/v1.0/me")) {
+        meCalls++;
+        return {
+          status: 200,
+          headers: {},
+          json: { displayName: "Recovered User", id: "recovered-account" },
+        };
+      }
+      return { status: 200, headers: {}, json: {} };
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn(async () => storedToken),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      diag: makeDiagnostics(),
+    }));
+
+    await auth.initialize(); // cold start offline — session present, no account
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(auth.authState.accountId).toBe("");
+
+    await expect(auth.getAccessToken()).rejects.toMatchObject({
+      type: "NetworkError",
+    });
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(auth.authState.accountId).toBe("");
+
+    vi.advanceTimersByTime(60_000); // past the 15s backoff window
+
+    await expect(auth.getAccessToken()).resolves.toBe("fresh-at");
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(auth.authState.accountId).toBe("recovered-account");
+    expect(meCalls).toBeGreaterThan(0);
+  });
+
+  it("recovers a pending session via refreshNowIfNeeded on connectivity events", async () => {
+    vi.useFakeTimers();
+    let tokenCalls = 0;
+    let storedToken: string | null = "stored-refresh-token";
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        tokenCalls++;
+        if (tokenCalls === 1) throw new Error("network down");
+        return {
+          status: 200,
+          headers: {},
+          json: { access_token: "online-at", expires_in: 3600 },
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "Online User", id: "online-account" },
+      };
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn(async () => storedToken),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      diag: makeDiagnostics(),
+    }));
+
+    await auth.initialize(); // cold start offline — pending session
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(auth.authState.accountId).toBe("");
+
+    await auth.refreshNowIfNeeded(true); // simulated window "online" event
+
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(auth.authState.accountId).toBe("online-account");
+    await expect(auth.getAccessToken()).resolves.toBe("online-at");
+  });
+
+  it("logs out when a connectivity-triggered refresh is structurally rejected", async () => {
+    vi.useFakeTimers();
+    let storedToken: string | null = "stored-refresh-token";
+    const remove = vi.fn(async () => {
+      storedToken = null;
+    });
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        return {
+          status: 400,
+          headers: {},
+          json: {
+            error: "invalid_grant",
+            error_description: "AADSTS700082: The refresh token has expired.",
+          },
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "U", id: "a" },
+      };
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn(async () => storedToken),
+        remove,
+      },
+      diag: makeDiagnostics(),
+    }));
+
+    await auth.initialize(); // restore hits invalid_grant → session ends
+    expect(auth.authState.isLoggedIn).toBe(false);
+    expect(remove).toHaveBeenCalled();
+    expect(storedToken).toBeNull();
+
+    await auth.refreshNowIfNeeded(true); // no credential — stays logged out
+    expect(auth.authState.isLoggedIn).toBe(false);
   });
 });
 

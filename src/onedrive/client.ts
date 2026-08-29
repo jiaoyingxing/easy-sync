@@ -40,6 +40,10 @@ import {
   uploadSessionChunkTimeoutMs,
   type UploadMissingRange,
 } from "./upload-session-policy";
+import {
+  cdnHostOfDownloadUrl,
+  classifyCdnDownloadFailure,
+} from "./cdn-download-failure";
 import type { DiagnosticLogger } from "../sync/diagnostic-logger";
 
 /** Callback to get a fresh access token */
@@ -2265,6 +2269,7 @@ export class OneDriveClient {
     }
     const maxResponseBytes = pluginControlByteBudget(label);
     assertDeclaredRemoteSize(item.size, maxResponseBytes, label);
+    const readStartedAt = Date.now();
     let response: RequestUrlResponse;
     try {
       response = await this.requestSharedSyncProtocolUrl(
@@ -2277,16 +2282,29 @@ export class OneDriveClient {
       );
     } catch (error) {
       if (isResponseByteBudgetError(error)) throw error;
+      const component = requestKey.slice(requestKey.lastIndexOf(":") + 1);
       if (error instanceof SyntheticRequestTimeoutError) {
         this.diag?.warn(
           "onedrive",
           error.source === "deadline"
             ? `request local deadline elapsed — method=GET, endpoint=sharedProtocolContent, timeoutMs=${error.timeoutMs}, HTTP status unavailable`
             : `request not dispatched — method=GET, endpoint=sharedProtocolContent, prior requestUrl remains in flight after timeoutMs=${error.timeoutMs}, HTTP status unavailable`,
+          {
+            source: error.source,
+            timeoutMs: error.timeoutMs,
+            stage: "deadline",
+            component,
+            elapsedMs: Date.now() - readStartedAt,
+          },
         );
         throw error;
       }
-      throw this.toRequestError(error, downloadUrl);
+      throw this.toRequestError(error, downloadUrl, false, {
+        stage: classifyCdnDownloadFailure(error),
+        host: cdnHostOfDownloadUrl(downloadUrl),
+        component,
+        elapsedMs: Date.now() - readStartedAt,
+      });
     }
     return {
       id: item.id,
@@ -2929,6 +2947,7 @@ export class OneDriveClient {
     rawError: unknown,
     url: string,
     suppressExpectedNotFoundWarning = false,
+    detail?: Record<string, unknown>,
   ): OneDriveError {
     if (rawError instanceof OneDriveError) return rawError;
     // Obsidian's requestUrl throws on non-2xx. The error object carries
@@ -2960,11 +2979,16 @@ export class OneDriveClient {
     if (errStatus === 409) {
       this.diag?.log("onedrive", `requestUrl 409 — ${sanitizeUrl(url)}`);
     } else if (errStatus > 0 && !(suppressExpectedNotFoundWarning && errStatus === 404)) {
-      this.diag?.warn("onedrive", `requestUrl HTTP error — status=${errStatus}, graphCode=${graphCodeText}, graphMsg=${graphMsgText}, url=${sanitizeUrl(url)}`);
+      this.diag?.warn(
+        "onedrive",
+        `requestUrl HTTP error — status=${errStatus}, graphCode=${graphCodeText}, graphMsg=${graphMsgText}, url=${sanitizeUrl(url)}`,
+        detail,
+      );
     } else if (errStatus === 0) {
       this.diag?.warn(
         "onedrive",
         `request transport failed — HTTP status unavailable, url=${sanitizeUrl(url)}`,
+        detail,
       );
     }
 

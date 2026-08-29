@@ -11,6 +11,7 @@ export type RibbonStatus =
   | "cancelling"
   | "syncing"
   | "attention"
+  | "offline"
   | "success"
   | "ready";
 
@@ -27,6 +28,7 @@ export const RIBBON_STATUS_ICONS: Record<RibbonStatus, string> = {
   cancelling: "cloud-alert",
   syncing: "refresh-cw",
   attention: "cloud-alert",
+  offline: "wifi-off",
   success: "cloud-check",
   ready: "cloud",
 };

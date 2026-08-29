@@ -7,6 +7,7 @@ import {
   normalizeCommunityPluginSyncSettings,
   normalizePluginScopeSelection,
   readCommunityPluginSyncPolicy,
+  stripPluginFromScopeSelection,
 } from "../src/sync/community-plugin-sync-policy";
 
 describe("community plugin sync policy", () => {
@@ -215,5 +216,25 @@ describe("community plugin sync policy", () => {
       dataEnabled: false,
       policy: bothLegacyNone,
     });
+  });
+
+  it("strips one plugin from every list while keeping the mode and the rest", () => {
+    const selection = {
+      mode: "selected" as const,
+      pluginIds: ["calendar", "other"],
+      ignoredPluginIds: ["calendar", "ignored"],
+      restoringPluginIds: ["calendar"],
+    };
+    expect(stripPluginFromScopeSelection(selection, "calendar")).toEqual({
+      mode: "selected",
+      pluginIds: ["other"],
+      ignoredPluginIds: ["ignored"],
+      restoringPluginIds: [],
+    });
+    // A missing plugin is a no-op.
+    expect(stripPluginFromScopeSelection(
+      { mode: "all", pluginIds: [] },
+      "calendar",
+    )).toEqual({ mode: "all", pluginIds: [] });
   });
 });

@@ -712,12 +712,15 @@ describe("buildSettingsSyncButtonState", () => {
       .toBeLessThan(source.indexOf("renderPluginListArea"));
   });
 
-  it("keeps cleaned rows hidden only while the device holds no local files", () => {
+  it("keeps cleaned rows hidden on both lists only while the device holds no local files", () => {
     expect(isPluginRowHiddenByCloudCleanup("files", false, true)).toBe(true);
     // Reinstalled locally: the row must come back for management/re-join.
     expect(isPluginRowHiddenByCloudCleanup("files", true, true)).toBe(false);
     expect(isPluginRowHiddenByCloudCleanup("files", undefined, true)).toBe(false);
-    expect(isPluginRowHiddenByCloudCleanup("data", false, true)).toBe(false);
+    // Cloud-cleanup thorough removal hides the data list row identically so
+    // the two plugin lists stay consistent after a cleanup.
+    expect(isPluginRowHiddenByCloudCleanup("data", false, true)).toBe(true);
+    expect(isPluginRowHiddenByCloudCleanup("data", true, true)).toBe(false);
     expect(isPluginRowHiddenByCloudCleanup("files", false, false)).toBe(false);
   });
 
@@ -1137,33 +1140,18 @@ describe("buildSettingsSyncButtonState", () => {
     expect(en["settings.syncExclusion.intro"]).toContain("will not be deleted");
   });
 
-  it("moves first-use guidance to the login notice and keeps the plan alert single-purpose", () => {
+  it("keeps the plan alert single-purpose after the login notice is removed", () => {
     const mainSource = readFileSync("src/main.ts", "utf8");
     const entrySource = readFileSync("src/ui/auth-entry-flow.ts", "utf8");
     const alertSource = readFileSync("src/ui/confirm-modal.ts", "utf8");
 
-    expect(zhCN["auth.notice.title"]).toBe("登录前须知");
-    expect(zhCN["auth.notice.line1"]).toBe(
-      "1. 在另一台设备创建同名仓库即可同步；同步无需安装 OneDrive 客户端",
-    );
-    expect(zhCN["auth.notice.line2"]).toBe(
-      "2. 同步的文件保存在你自己的 OneDrive 账号中，可通过网页版或 OneDrive 客户端查看",
-    );
-    expect(zhCN["auth.notice.line3"]).toBe(
-      "3. 让 EasySync 单独管理同步；不要把仓库放进 OneDrive、iCloud、Dropbox 等同步文件夹",
-    );
-    expect(zhCN["auth.notice.continue"]).toBe("继续登录");
-
-    expect(en["auth.notice.line1"]).toContain("same name on another device");
-    expect(en["auth.notice.line1"]).toContain("no OneDrive client required");
-    expect(en["auth.notice.line2"]).toContain("your own OneDrive account");
-    expect(en["auth.notice.line3"]).toContain("sync folders");
-    expect(en["auth.notice.continue"]).toBe("Continue");
-
-    // The education now lives in the login gate; the first plan alert is
-    // single-purpose (plan generated → review in the sidebar).
-    expect(entrySource).toContain('t("auth.notice.title")');
-    expect(entrySource).toContain('t("auth.notice.line3")');
+    // The login-gate notice ("登录前须知") and the method-chooser lead line
+    // were removed entirely in 2026-08-28 (full content archived in the dev
+    // log `20260828-003740`); the first plan alert stays single-purpose
+    // (plan generated → review in the sidebar).
+    expect(entrySource).not.toContain("AuthLoginNoticeModal");
+    expect(entrySource).not.toContain("auth.notice");
+    expect(entrySource).not.toContain("method.lead");
     expect(mainSource).not.toContain("syncPlan.firstUseUsage");
     expect(mainSource).not.toContain("syncPlan.firstUseSafety");
     expect(zhCN["syncPlan.readyMessage"]).toBe(

@@ -21,6 +21,8 @@ export interface MutationRecoveryDisplayState {
   blockedOperationId: string | null;
   /** Synchronous path/intent eligibility only; no remote fact is inferred here. */
   manualResolutionAvailable?: boolean;
+  /** True when the recovery block paused auto-sync (non-isolated block). */
+  paused?: boolean;
 }
 
 type Translator = (
@@ -95,12 +97,22 @@ export interface MutationRecoveryBodyPresentation {
 
 export function mutationRecoveryPrimaryActionKey(
   state: Readonly<MutationRecoveryDisplayState>,
-): keyof LocaleStrings {
-  return state.kind === "blocked"
+): keyof LocaleStrings | null {
+  // Only real user actions survive the existence test: a keep-side review
+  // for facts-changed records, and a scope-recovery retry for scope-changed
+  // (a manual round re-runs scope recovery and can reach plan review).
+  // Every other recovery state is honest status without a choice button.
+  if (
+    state.kind === "blocked"
     && state.blockReason === "facts-changed"
     && state.manualResolutionAvailable === true
-    ? "syncView.recovery.reviewDetails"
-    : "syncView.recovery.checkAgain";
+  ) {
+    return "syncView.recovery.reviewDetails";
+  }
+  if (state.kind === "blocked" && state.blockReason === "scope-changed") {
+    return "syncView.recovery.retryScopeRecovery";
+  }
+  return null;
 }
 
 export function mutationRecoveryBodyPresentation(
@@ -125,21 +137,29 @@ export function mutationRecoveryBodyPresentation(
       reason: null,
       retryAt: state.retryAt === null ? null : formatTime(state.retryAt),
       nextStep: t("syncView.recovery.nextStep.waitingNetwork"),
-      actionKey: "syncView.recovery.checkAgain",
+      actionKey: null,
     };
   }
   const actionKey = mutationRecoveryPrimaryActionKey(state);
   const canReview = actionKey === "syncView.recovery.reviewDetails";
+  const nextStepKey = canReview
+    ? "syncView.recovery.nextStep.review"
+    : state.blockReason === "account-changed"
+      ? "syncView.recovery.nextStep.accountChanged"
+      : "syncView.recovery.nextStep.blocked";
   return {
-    summary: t("syncView.recovery.summary.blocked"),
+    summary: t(
+      state.paused
+        ? "syncView.recovery.summary.blockedPaused"
+        : "syncView.recovery.summary.blocked",
+      {
+        count: state.remaining,
+      },
+    ),
     path: state.firstPath,
     reason: mutationRecoveryBlockReasonText(state.blockReason, t),
     retryAt: null,
-    nextStep: t(
-      canReview
-        ? "syncView.recovery.nextStep.review"
-        : "syncView.recovery.nextStep.recheck",
-    ),
+    nextStep: t(nextStepKey),
     actionKey,
   };
 }

@@ -107,8 +107,8 @@ export class DiagnosticLogger {
       if (e.data !== undefined) console.warn(line, e.data);
       else console.warn(line);
     } else {
-      if (e.data !== undefined) console.log(line, e.data);
-      else console.log(line);
+      if (e.data !== undefined) console.debug(line, e.data);
+      else console.debug(line);
     }
 
     // 2. In-memory ring buffer

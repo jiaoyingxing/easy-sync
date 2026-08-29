@@ -529,7 +529,7 @@ export async function readStateV2Manifest(
   let value: unknown;
   try {
     value = JSON.parse(await adapter.read(path));
-  } catch (_error) {
+  } catch {
     // Some narrow test/compat adapters omit exists(); a failed read is the only
     // missing-file signal available to them. Real Obsidian adapters take the
     // strict exists→read path above, where corrupt content still fails closed.

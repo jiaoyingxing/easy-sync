@@ -111,6 +111,17 @@ export class AuthModule {
     promise: Promise<string>;
   } | null = null;
 
+  /** Transient refresh-failure backoff (login-persistence contract): a
+   *  network flake right after sleep/wake or an offline period must NOT log
+   *  the user out or delete the stored credential, but we also must not
+   *  hammer the token endpoint on every request within a round. Reset by any
+   *  successful refresh and by an explicit connectivity-restored event. */
+  private static readonly REFRESH_RETRY_DELAYS_MS = [
+    15_000, 30_000, 60_000, 120_000, 300_000,
+  ];
+  private refreshFailureCount = 0;
+  private refreshFailureBlockedUntil = 0;
+
   /** Serialize credential/profile persistence so logout cannot be overtaken. */
   private secretStorageTail: Promise<void> = Promise.resolve();
   private profileCacheTail: Promise<void> = Promise.resolve();
@@ -292,13 +303,21 @@ export class AuthModule {
 
     this._initializing = true;
     const generation = this.authGeneration;
+    // Surface the connecting state immediately. Listeners render the
+    // "connecting" presentation while initialization runs; without this
+    // notification, surfaces that rendered before initialization started
+    // (cold-start first frames) keep their pre-init "logged out" presentation
+    // for the whole init window, because the next notification only arrives
+    // when initialization completes.
+    this.notifyChange();
 
+    let storedRefreshToken: string | null = null;
     try {
-      const stored = await this.getStoredRefreshToken();
+      storedRefreshToken = await this.getStoredRefreshToken();
       this.assertGeneration(generation);
-      if (stored) {
+      if (storedRefreshToken) {
         // Refresh token exists — try to get a fresh access token
-        await this.refreshAccessTokenForGeneration(stored, generation);
+        await this.refreshAccessTokenForGeneration(storedRefreshToken, generation);
         this.assertGeneration(generation);
         // Fetch user profile (displayName, accountId) for UI display
         await this.fetchUserProfile(generation, this.accessToken);
@@ -313,8 +332,25 @@ export class AuthModule {
         && e.type === AuthErrorType.SecretStorageUnavailable
       ) {
         this.diag?.warn("auth", "SecretStorage not available, auth disabled");
+      } else if (
+        e instanceof AuthError
+        && e.type === AuthErrorType.CredentialsRevoked
+      ) {
+        // Stored credential was structurally rejected (invalid_grant) — it is
+        // no longer valid, so the session must end: same terminal contract as
+        // the sync path.
+        this.diag?.warn("auth", "stored session rejected (invalid_grant), logging out");
+        await this.logout();
       } else {
         this.diag?.warn("auth", "failed to restore auth session", e);
+        // A stored session may still be valid — this was a transient failure
+        // (e.g. network flake right after wake-up). Present the session as
+        // present so surfaces never show "logged out"; a later refresh (next
+        // sync round or a connectivity event) recovers the token and binds
+        // the account. Only structural rejection ends the session.
+        if (storedRefreshToken) {
+          this.state.isLoggedIn = true;
+        }
       }
     }
     if (generation === this.authGeneration) {
@@ -787,6 +823,7 @@ export class AuthModule {
     this.state.accessTokenExpiry =
       Date.now() + (tokenResponse.expires_in - 60) * 1000; // 60s buffer
     this.state.isLoggedIn = true;
+    this.resetRefreshBackoff();
 
     // Fetch user profile (displayName, accountId) for UI display
     await this.fetchUserProfile(generation, tokenResponse.access_token);
@@ -878,13 +915,33 @@ export class AuthModule {
       this.state.accessTokenExpiry =
         Date.now() + (tokenResponse.expires_in - 60) * 1000;
       this.state.isLoggedIn = true;
+      this.resetRefreshBackoff();
 
       return this.accessToken;
     } catch (error) {
       if (error instanceof AuthOperationInvalidatedError) throw error;
+      if (error instanceof AuthError) {
+        if (error.type === AuthErrorType.CredentialsRevoked) {
+          // Terminal: the stored refresh token is no longer valid. Callers
+          // transition to logged-out.
+          throw error;
+        }
+        // Transient (network flake, 5xx, timeout, unexpected provider
+        // rejection): the stored credential is still valid, so the session
+        // stays logged in and a later attempt retries. Unified as NetworkError
+        // so downstream classification never mistakes this for a logout.
+        throw new AuthError(
+          AuthErrorType.NetworkError,
+          this.tr("auth.error.networkError", "Network error during authentication.", {
+            details: error.message,
+          }),
+        );
+      }
       throw new AuthError(
-        AuthErrorType.RefreshFailed,
-        this.tr("auth.error.refreshFailed", "Token refresh failed."),
+        AuthErrorType.NetworkError,
+        this.tr("auth.error.networkError", "Network error during authentication.", {
+          details: error instanceof Error ? error.message : "unknown",
+        }),
       );
     }
   }
@@ -893,22 +950,63 @@ export class AuthModule {
    * Get a valid access token.
    * Refreshes automatically if expired.
    * This is the only method the sync engine should call.
+   *
+   * Login-persistence contract:
+   * - Structural credential rejection (invalid_grant on refresh) → the stored
+   *   credential is no longer valid: the session logs out (and the credential
+   *   is deleted). This is the ONLY terminal refresh outcome.
+   * - Any transient failure (network flake right after sleep/wake or offline
+   *   periods, 5xx, timeouts) → the session STAYS logged in, the stored
+   *   refresh token is preserved, and a later attempt retries (backoff, next
+   *   sync round, or a connectivity event). Callers receive a NetworkError.
    */
   async getAccessToken(): Promise<string> {
     if (!this.state.isLoggedIn) {
-      throw new AuthError(AuthErrorType.NoRefreshToken, this.tr("auth.error.notLoggedIn", "Not logged in"));
+      const established = await this.establishSessionFromStoredCredential();
+      if (!established) {
+        throw new AuthError(
+          AuthErrorType.NoRefreshToken,
+          this.tr("auth.error.notLoggedIn", "Not logged in"),
+        );
+      }
     }
 
-    // Check if token is still valid (with 60s buffer)
+    const token = await this.ensureFreshAccessToken(this.authGeneration);
+
+    // A session recovered through refresh (e.g. cold start while offline) may
+    // not have bound the account yet — anchor it via /me before returning.
+    // /me failures stay non-fatal: sync authorization remains closed until
+    // the account is bound, and a later round retries.
+    if (!this.state.accountId) {
+      await this.fetchUserProfile(this.authGeneration, token);
+    }
+    return token;
+  }
+
+  /** Get a valid access token, refreshing when expired and respecting the
+   *  transient-failure backoff window. Throws NetworkError while in backoff
+   *  without touching the network; CredentialsRevoked (after logout already
+   *  performed by the caller's path) marks a terminal credential rejection. */
+  private async ensureFreshAccessToken(generation: number): Promise<string> {
     if (this.accessToken && Date.now() < this.state.accessTokenExpiry) {
       return this.accessToken;
     }
 
-    // Token expired — refresh. If refresh fails, transition to logged-out
-    // state so the UI (ribbon, sidebar) reflects reality immediately.
+    if (this.refreshFailureBlockedUntil > Date.now()) {
+      this.diag?.log("auth", "silent refresh in backoff, skipping attempt");
+      throw new AuthError(
+        AuthErrorType.NetworkError,
+        this.tr("auth.error.networkError", "Network error during authentication.", {
+          details: "refresh in backoff",
+        }),
+      );
+    }
+
     this.diag?.log("auth", "access token expired, refreshing silently");
     try {
-      return await this.refreshAccessToken();
+      const token = await this.refreshAccessToken();
+      this.resetRefreshBackoff();
+      return token;
     } catch (e) {
       if (e instanceof AuthOperationInvalidatedError) {
         throw new AuthError(
@@ -916,10 +1014,72 @@ export class AuthModule {
           this.tr("auth.error.notLoggedIn", "Not logged in"),
         );
       }
-      this.diag?.warn("auth", `token refresh failed, transitioning to logged-out: ${e instanceof Error ? e.message : String(e)}`);
-      await this.logout();
+      if (e instanceof AuthError && e.type === AuthErrorType.CredentialsRevoked) {
+        this.diag?.warn("auth", "token refresh rejected (invalid_grant), transitioning to logged-out");
+        await this.logout();
+        throw e;
+      }
+      this.diag?.warn("auth", `token refresh failed transiently, staying logged in: ${e instanceof Error ? e.message : String(e)}`);
+      this.recordRefreshFailure();
       throw e;
     }
+  }
+
+  /** Connectivity-triggered silent refresh (window online / focus / returning
+   *  to a visible document): immediately recovers a session whose token
+   *  expired while offline or sleeping — without waiting for the next sync
+   *  round timer. Never logs out on transient failure; `force` (online
+   *  event) clears the transient backoff for a fresh chance. */
+  async refreshNowIfNeeded(force = false): Promise<void> {
+    if (this._initializing || this.pending) return;
+    if (force) this.resetRefreshBackoff();
+    const generation = this.authGeneration;
+    try {
+      if (!this.state.isLoggedIn) {
+        const established = await this.establishSessionFromStoredCredential();
+        if (!established) return;
+      }
+      const token = await this.ensureFreshAccessToken(generation);
+      if (!this.state.accountId) {
+        await this.fetchUserProfile(generation, token);
+      }
+    } catch (e) {
+      if (e instanceof AuthOperationInvalidatedError) return;
+      // CredentialsRevoked already performed logout and notified; transient
+      // failures already recorded backoff. Either way the session state is
+      // coherent — log and move on.
+      this.diag?.warn("auth", "connectivity-triggered refresh attempt failed", authErrorDiagData(e));
+    }
+  }
+
+  /** When no token has been acquired yet (e.g. cold start while offline), a
+   *  stored refresh token still proves an existing login: mark the session
+   *  present so surfaces never show "logged out" for it. The next refresh
+   *  recovers the token and binds the account. Returns false only when no
+   *  credential exists (true "not logged in"). */
+  private async establishSessionFromStoredCredential(): Promise<boolean> {
+    const rt = await this.getStoredRefreshToken();
+    if (!rt) return false;
+    if (!this.state.isLoggedIn) {
+      this.state.isLoggedIn = true;
+      this.notifyChange();
+    }
+    return true;
+  }
+
+  private recordRefreshFailure(): void {
+    this.refreshFailureCount++;
+    const index = Math.min(
+      this.refreshFailureCount - 1,
+      AuthModule.REFRESH_RETRY_DELAYS_MS.length - 1,
+    );
+    this.refreshFailureBlockedUntil =
+      Date.now() + AuthModule.REFRESH_RETRY_DELAYS_MS[index];
+  }
+
+  private resetRefreshBackoff(): void {
+    this.refreshFailureCount = 0;
+    this.refreshFailureBlockedUntil = 0;
   }
 
   /** Log out only after SecretStorage confirms the refresh token is absent. */
@@ -962,6 +1122,7 @@ export class AuthModule {
       displayName: "",
       isLoggedIn: false,
     };
+    this.resetRefreshBackoff();
     this.notifyChange();
     this.diag?.log("auth", "logged out");
     return true;
@@ -997,9 +1158,24 @@ export class AuthModule {
         status: response.status,
         ...errorData,
       });
+      const provider = { status: response.status, error: errorData.error };
+      if (
+        body.get("grant_type") === "refresh_token"
+        && errorData.error === "invalid_grant"
+      ) {
+        // Structural rejection of the stored refresh token (revoked, expired
+        // by inactivity, superseded): terminal — the session must log out.
+        // Other grant types keep their existing ProviderError semantics.
+        throw new AuthError(
+          AuthErrorType.CredentialsRevoked,
+          this.tr("auth.error.refreshFailed", "Token refresh failed."),
+          provider,
+        );
+      }
       throw new AuthError(
         AuthErrorType.ProviderError,
         this.tr("auth.error.providerError", `Token endpoint returned ${response.status}: ${details}`, { details }),
+        provider,
       );
     }
 

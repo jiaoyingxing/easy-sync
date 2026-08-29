@@ -26,6 +26,7 @@ class MemoryRecoveryAdapter {
   readonly failAfterWrite = new Set<string>();
   readonly failAfterRename = new Set<string>();
   readonly failAfterRemove = new Set<string>();
+  readonly mtimes = new Map<string, number>();
 
   async exists(path: string): Promise<boolean> {
     return this.files.has(path) || this.folders.has(path);
@@ -73,9 +74,92 @@ class MemoryRecoveryAdapter {
   async mkdir(path: string): Promise<void> {
     this.folders.add(path);
   }
+
+  async stat(path: string): Promise<{
+    ctime: number;
+    mtime: number;
+    size: number;
+    type: string;
+  } | null> {
+    if (!this.files.has(path) && !this.folders.has(path)) return null;
+    return {
+      ctime: this.mtimes.get(path) ?? 0,
+      mtime: this.mtimes.get(path) ?? 0,
+      size: 0,
+      type: "file",
+    };
+  }
 }
 
 describe("IndexedDB authority recovery substrate", () => {
+  it("returns a bounded per-identity remote change history across commit deltas", async () => {
+    const adapter = new MemoryRecoveryAdapter() as unknown as DataAdapter;
+    const store = new StateV2IndexedDbRecoveryStore(adapter, "state/recovery");
+    const base = createLargeV2Envelope(1);
+    const nodeX = {
+      id: "node-x",
+      parentId: "folder-bulk",
+      name: "note-x.md",
+      kind: "file" as const,
+      size: 2,
+      mtime: 2,
+      eTag: "etag-x",
+      cTag: "ctag-x",
+      contentHash: "b".repeat(64),
+    };
+    const anchorX = {
+      anchorId: "file:node-x",
+      remoteId: "node-x",
+      lastPath: "Bulk/note-x.md",
+      contentHash: "b".repeat(64),
+      size: 2,
+      remoteETag: "etag-x",
+      confirmedAt: 2,
+      confirmedBy: "equal-read" as const,
+    };
+    const withNode = structuredClone(base);
+    withNode.meta = { ...withNode.meta, commitSeq: base.meta.commitSeq + 1 };
+    withNode.remoteIndex = {
+      ...withNode.remoteIndex,
+      itemsById: { ...withNode.remoteIndex.itemsById, "node-x": nodeX },
+    };
+    withNode.anchors = {
+      schemaVersion: 2,
+      byAnchorId: {
+        ...withNode.anchors.byAnchorId,
+        "file:node-x": anchorX,
+      },
+    };
+    await store.prepareDelta(base, withNode);
+
+    const withoutNode = structuredClone(withNode);
+    withoutNode.meta = {
+      ...withNode.meta,
+      commitSeq: withNode.meta.commitSeq + 1,
+    };
+    const remainingItems = { ...withNode.remoteIndex.itemsById };
+    delete remainingItems["node-x"];
+    const remainingAnchors = { ...withNode.anchors.byAnchorId };
+    delete remainingAnchors["file:node-x"];
+    withoutNode.remoteIndex = {
+      ...withoutNode.remoteIndex,
+      itemsById: remainingItems,
+    };
+    withoutNode.anchors = {
+      schemaVersion: 2,
+      byAnchorId: remainingAnchors,
+    };
+    await store.prepareDelta(withNode, withoutNode);
+
+    const history = await store.remoteNodeHistory("node-x", 10);
+    expect(history.map((event) => [event.commitSeq, event.kind])).toEqual([
+      [5, "delete"],
+      [4, "upsert"],
+    ]);
+    expect(history[1].node).toMatchObject({ id: "node-x", eTag: "etag-x" });
+    expect(history[0].node).toBeNull();
+  });
+
   it("keeps one 50k-state mutation recovery record bounded", async () => {
     const source = createLargeV2Envelope(50_000);
     const next = nextEnvelope(source, "b".repeat(64), "etag-next");

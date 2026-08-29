@@ -172,6 +172,7 @@ export function compareV1WithV2Shadow(input: V2ReadOnlyShadowInput): V2ReadOnlyS
     remoteEntries: v2RemoteEntries,
     baseEntries: input.baseEntries,
     skippedLarge: input.skippedLarge,
+  configDir: ".obsidian",
   });
   report.planCounts.v2 = v2Plan.items.length;
   comparePlans(input.v1Plan.items, v2Plan.items, report.differences);

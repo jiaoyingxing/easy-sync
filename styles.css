@@ -6,8 +6,9 @@
   pointer-events: none;
 }
 
-.easy-sync-notice-hidden {
-  display: none !important;
+.notice .easy-sync-notice-hidden,
+.notice.easy-sync-notice-hidden {
+  display: none;
 }
 
 .easy-sync-notice-progress-content {
@@ -507,7 +508,7 @@ td:first-child {
 .easy-sync-diff-gutter {
   display: grid;
   grid-template-columns: repeat(2, var(--easy-sync-diff-line-number-width, 2ch));
-  column-gap: 0.75ch;
+  gap: 0.75ch;
   flex-shrink: 0;
   color: var(--text-faint);
   user-select: none;
@@ -536,13 +537,6 @@ td:first-child {
 
 .easy-sync-diff-removed .easy-sync-diff-content {
   color: var(--color-red);
-}
-
-/* Login notice gate: large lines so the agreement is readable at a glance */
-.easy-sync-login-notice-line {
-  font-size: var(--font-ui-large);
-  line-height: 1.55;
-  margin: 0.85em 0;
 }
 
 /* Diff gap / ellipsis between non-adjacent hunks */
@@ -764,6 +758,10 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
   color: var(--color-green);
 }
 
+.easy-sync-status-line.is-offline .easy-sync-status-icon {
+  color: var(--color-red);
+}
+
 .easy-sync-status-detail {
   display: flex;
   align-items: center;
@@ -840,10 +838,15 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
 }
 
 .easy-sync-recovery-summary,
-.easy-sync-recovery-next-step {
+.easy-sync-recovery-next-step,
+.easy-sync-recovery-subject {
   color: var(--text-muted);
   font-size: var(--font-ui-small);
   line-height: var(--line-height-normal);
+}
+
+.easy-sync-recovery-subject {
+  overflow-wrap: anywhere;
 }
 
 .easy-sync-recovery-facts {
@@ -866,6 +869,10 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
 
 .easy-sync-recovery-path {
   font-family: var(--font-monospace);
+}
+
+.easy-sync-recovery-actions {
+  margin-top: var(--size-2-3);
 }
 
 .easy-sync-tree-status-icon,
@@ -1203,11 +1210,6 @@ body.is-mobile .easy-sync-auth-pending-actions button {
   gap: var(--size-4-2);
 }
 
-.easy-sync-auth-method-lead {
-  color: var(--text-muted);
-  font-size: var(--font-ui-small);
-}
-
 .easy-sync-auth-method-option {
   display: flex;
   align-items: center;
@@ -1321,6 +1323,10 @@ body.is-mobile .easy-sync-device-actions button {
    (2026-08-26): the old `.easy-sync-ribbon[data-easy-sync-status=...]` color
    rules were removed; the ribbon keeps icon/tooltip dynamics but no color. */
 .easy-sync-status-bar-item.is-loggedOut .status-bar-item-icon {
+  color: var(--color-red);
+}
+
+.easy-sync-status-bar-item.is-offline .status-bar-item-icon {
   color: var(--color-red);
 }
 

@@ -597,6 +597,59 @@ describe("LocalScanner large file boundary", () => {
       first.entries[0]?.quickXorHash,
     );
   });
+
+  it("records a bounded per-path local change history across scan rounds", async () => {
+    let cacheJson = JSON.stringify({ format: 1, entries: {} });
+    const contentB = new TextEncoder().encode("test2").buffer;
+    let fileStat = { size: content.byteLength, mtime: 1 };
+    const adapter = {
+      stat: vi.fn(async () => fileStat),
+      readBinary: vi.fn(async () => content),
+      read: vi.fn(async () => cacheJson),
+      write: vi.fn(async (_path: string, value: string) => {
+        cacheJson = value;
+      }),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+    };
+    const makeVault = () => ({
+      adapter,
+      getFiles: vi.fn(() => [{
+        path: "note.md",
+        stat: fileStat,
+      }]),
+    }) as unknown as Vault;
+    const config = {
+      excludePaths: [],
+      includePaths: [],
+      maxFileSize: 50 * 1024 * 1024,
+      includePluginCode: false,
+      includePluginData: false,
+    };
+    const scanner = new LocalScanner(makeVault(), config);
+    await scanner.scanAll();
+    expect(scanner.pathHistory("note.md")).toHaveLength(0);
+
+    // Next round: different bytes and stat → the previous snapshot becomes
+    // one history entry (self-computed hash/size/mtime + observedAt).
+    fileStat = { size: contentB.byteLength, mtime: 2 };
+    adapter.readBinary = vi.fn(async () => contentB);
+    await scanner.scanAll();
+
+    const history = scanner.pathHistory("note.md");
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({
+      size: content.byteLength,
+      hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+      observedAt: expect.any(Number),
+    });
+
+    // The chain survives a restart through the persisted scan cache.
+    const restarted = new LocalScanner(makeVault(), config);
+    await restarted.scanAll();
+    const restored = restarted.pathHistory("note.md");
+    expect(restored).toHaveLength(1);
+    expect(restored[0]).toEqual(history[0]);
+  });
 });
 
 describe("Preflight P0 — Included path failures make the scan incomplete", () => {

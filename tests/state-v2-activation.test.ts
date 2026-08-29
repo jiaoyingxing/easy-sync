@@ -10038,6 +10038,53 @@ describe("V1 to V2 controlled production activation", () => {
     }
   });
 
+  it("re-applies a reviewed folder location choice on latest facts when the revision advanced during review", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    await (harness.scanner.vault as unknown as {
+      rename: (file: TFolder, target: string) => Promise<void>;
+    }).rename(new TFolder("Notes"), "Archive");
+    expect(await harness.state.recordLocalFolderMoveHint("Notes", "Archive"))
+      .toBe(true);
+    const remoteFolder = findRemoteItemByPath(harness.remoteItemState, "Notes")!;
+    remoteFolder.name = "Cloud";
+    remoteFolder.eTag = "etag-folder-cloud-review-race";
+    await harness.executor.run("manual");
+    const internal = harness.executor as unknown as {
+      getFolderLocationResolutionSnapshot: (path: string) => Promise<{
+        revision: string;
+        localPath: string;
+        remotePath: string;
+      } | null>;
+      resolveReviewedFolderLocation: (
+        reviewed: { revision: string; localPath: string; remotePath: string },
+        choice: "keep-local",
+      ) => Promise<boolean>;
+    };
+    const reviewed = await internal.getFolderLocationResolutionSnapshot("Notes");
+    expect(reviewed).not.toBeNull();
+    // Simulate the dialog-lived state advancing: the reviewed revision now
+    // differs from the freshly built snapshot while the two-sided shape still
+    // holds. The resolver rebuilds on the latest facts instead of answering
+    // with the old "sync again" dead end (one-shot automatic rebuild).
+    reviewed!.revision += "-stale-during-review";
+
+    expect(await internal.resolveReviewedFolderLocation(reviewed!, "keep-local"))
+      .toBe(true);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Archive")?.id)
+      .toBe("folder-notes");
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([]);
+  });
+
   it("does not apply an expired two-sided folder location choice", async () => {
     const harness = makeHarness();
     await harness.state.load();
@@ -16855,6 +16902,60 @@ describe("V1 to V2 controlled production activation", () => {
       await harness.state.close();
     },
   );
+
+  it("counts consecutive retryable observation failures in the diagnostic warning and resets after a healthy round", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    const profile = {
+      v2: await harness.client.readSharedSyncProtocolV2("testVault"),
+      v3: harness.getSharedProtocolV3(),
+    };
+    const readProfile = vi.mocked(
+      harness.client.readSharedSyncProtocolObjects,
+    );
+    const observationUnavailable = () => new SharedSyncProtocolObservationError(
+      "v2",
+      new OneDriveError(
+        OneDriveErrorType.NetworkError,
+        "v2 body unavailable",
+      ),
+    );
+    readProfile.mockReset()
+      .mockRejectedValueOnce(observationUnavailable())
+      .mockRejectedValueOnce(observationUnavailable())
+      .mockResolvedValue(profile);
+
+    const warnCalls = (harness.diag.warn as unknown as {
+      mock: { calls: Array<[unknown, unknown, unknown]> };
+    }).mock.calls;
+    const observationWarnings = () => warnCalls.filter((call) =>
+      call[0] === "state"
+      && call[1] === "shared protocol observation is temporarily unavailable before ordinary planning");
+
+    expect((await harness.executor.run("auto")).success).toBe(false);
+    expect((await harness.executor.run("auto")).success).toBe(false);
+    // The streak grows across consecutive failing rounds and is reported on
+    // the diagnostic warning (session-scoped only — no behavior is gated).
+    expect(observationWarnings().map((call) => (call[2] as { consecutiveFailures: number }).consecutiveFailures))
+      .toEqual([1, 2]);
+    expectNoFileMutations(harness.mutations);
+
+    // A healthy round resets the counter; the next failure restarts at 1.
+    expect((await harness.executor.run("auto")).success).toBe(true);
+    readProfile.mockReset().mockRejectedValueOnce(observationUnavailable());
+    expect((await harness.executor.run("auto")).success).toBe(false);
+    expect(observationWarnings().map((call) => (call[2] as { consecutiveFailures: number }).consecutiveFailures))
+      .toEqual([1, 2, 1]);
+    expectNoFileMutations(harness.mutations);
+    await harness.state.close();
+  });
 
   it.each(["v2", "v3"] as const)(
     "retries a stale %s body snapshot on the next full observation",

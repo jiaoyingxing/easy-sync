@@ -93,7 +93,10 @@ export function resolveSyncHistoryStatus(
   }
   if (result.authExpired) return "authExpired";
   const observation = classifyRetryableObservationResult(result, context);
-  if (observation.kind === "valid") return "failed";
+  // A run that stopped before ordinary planning on a transient remote read is
+  // a neutral retry-pending round, not a failure: auto-sync keeps retrying and
+  // no file action was produced (P0-UX / 08-21 observation contract).
+  if (observation.kind === "valid") return "retry-pending";
   if (result.errors > 0) {
     const completedActions =
       result.uploaded

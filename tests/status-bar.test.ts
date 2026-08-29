@@ -114,6 +114,7 @@ const IS_GROUP_CLASSES = [
   "is-cancelling",
   "is-syncing",
   "is-attention",
+  "is-offline",
   "is-success",
   "is-ready",
 ] as const;
@@ -175,6 +176,22 @@ describe("updateStatusBar item structure", () => {
     expect(el.attrs["aria-label"]).toMatch(/^上次同步 /);
     expect(el.attrs["aria-label"]).not.toContain("EasySync:");
     // Icon-only: the last-sync fact must not reappear as a permanent span.
+    expect(segmentOf(el).children).toHaveLength(1);
+  });
+
+  it("maps a retry-pending latest round to the offline group with a no-network label", () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    (plugin.state as never as { lastSyncTime: number }).lastSyncTime = 1;
+    (plugin.state as never as { syncHistory: unknown[] }).syncHistory = [
+      { id: "1", status: "retry-pending" },
+    ];
+    plugin.updateStatusBar();
+
+    expect(el.classes.has("is-offline")).toBe(true);
+    expect(IS_GROUP_CLASSES.filter((c) => c !== "is-offline" && el.classes.has(c))).toEqual([]);
+    expect(el.attrs["aria-label"]).toBe("无网络连接");
+    expect(RIBBON_STATUS_ICONS.offline).toBe("wifi-off");
     expect(segmentOf(el).children).toHaveLength(1);
   });
 

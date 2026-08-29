@@ -38,7 +38,6 @@ const CSS_FILE = "styles.css";
 const STRUCTURAL_HOOKS = new Set([
   "easy-sync-ribbon",
   "easy-sync-auth-device-code-modal",
-  "easy-sync-login-notice",
   "easy-sync-automatic-handling",
   "easy-sync-detail-format-difference",
   "easy-sync-settings-about",

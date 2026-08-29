@@ -111,12 +111,21 @@ export enum AuthErrorType {
   RefreshFailed = "RefreshFailed",
   /** No refresh token available */
   NoRefreshToken = "NoRefreshToken",
+  /** The stored refresh token was structurally rejected (OAuth invalid_grant
+   *  on the refresh grant): revoked, expired by inactivity or superseded.
+   *  Terminal — unlike NetworkError, this always ends the session and
+   *  requires a fresh login. */
+  CredentialsRevoked = "CredentialsRevoked",
 }
 
 export class AuthError extends Error {
   constructor(
     public readonly type: AuthErrorType,
     message: string,
+    /** Optional token-endpoint HTTP detail for provider-classified failures.
+     *  Read-only diagnostic context (status + OAuth error code); never
+     *  contains tokens, codes or account IDs. */
+    public readonly provider?: { status: number; error?: string },
   ) {
     super(message);
     this.name = "AuthError";

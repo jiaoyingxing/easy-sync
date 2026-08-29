@@ -62,7 +62,7 @@ describe("sync result presentation", () => {
     )).toBe("failed");
   });
 
-  it("shows a pre-plan retryable observation failure as failed without flattening ordinary partial runs", () => {
+  it("shows a pre-plan retryable observation as a neutral retry-pending run without flattening ordinary partial runs", () => {
     const disposition: NonNullable<SyncResult["disposition"]> = {
       kind: "retryable-observation",
       phase: "remotePrepare",
@@ -81,7 +81,7 @@ describe("sync result presentation", () => {
         userFileChanges: "unknown",
       },
       disposition,
-    }))).toBe("failed");
+    }))).toBe("retry-pending");
     expect(resolveSyncHistoryStatus(result({
       success: false,
       errors: 1,
@@ -204,7 +204,7 @@ describe("sync result presentation", () => {
     )).toBe(zh.t("result.pausedForReview"));
   });
 
-  it("shows a pre-plan ordinary remote read failure as a failed run, not a partial flatten", () => {
+  it("shows a pre-plan ordinary remote read failure as a retry-pending run, not a partial flatten", () => {
     const disposition: NonNullable<SyncResult["disposition"]> = {
       kind: "retryable-observation",
       phase: "remotePrepare",
@@ -222,7 +222,7 @@ describe("sync result presentation", () => {
         userFileChanges: "unknown",
       },
       disposition,
-    }))).toBe("failed");
+    }))).toBe("retry-pending");
     // A transient read failure that already produced file work is not a
     // retryable observation; it must remain a partial run.
     expect(resolveSyncHistoryStatus(result({

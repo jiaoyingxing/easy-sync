@@ -278,6 +278,7 @@ describe("canonical V2 plan candidate", () => {
         resolveRemoteContentHash: async () => {
           throw new Error("known SHA-256 must not download");
         },
+      configDir: ".obsidian",
       });
 
       expect(
@@ -330,6 +331,7 @@ describe("canonical V2 plan candidate", () => {
       },
       baselineReconstructionIncomplete: false,
       resolveRemoteContentHash: async () => hashA,
+    configDir: ".obsidian",
     });
     expect(resolved.items).toEqual([
       expect.objectContaining({
@@ -353,6 +355,7 @@ describe("canonical V2 plan candidate", () => {
       resolveRemoteContentHash: async () => {
         throw new Error("offline");
       },
+    configDir: ".obsidian",
     });
     expect(deferred.items).toEqual([
       expect.objectContaining({
@@ -398,6 +401,7 @@ describe("canonical V2 plan candidate", () => {
         downloads++;
         return hashA;
       },
+    configDir: ".obsidian",
     });
 
     expect(downloads).toBe(10);
@@ -583,6 +587,7 @@ describe("canonical V2 plan candidate", () => {
         },
         baselineReconstructionIncomplete: false,
         resolveRemoteContentHash: resolver,
+      configDir: ".obsidian",
       });
 
     const different = await finalize(async () => hashB);
@@ -817,6 +822,7 @@ describe("canonical V2 plan candidate", () => {
         expect(progress.total).toBe(10);
         return hashA;
       },
+    configDir: ".obsidian",
     });
 
     expect(reads).toBe(10);
@@ -1132,6 +1138,7 @@ describe("canonical V2 plan candidate", () => {
       },
       baselineReconstructionIncomplete: false,
       resolveRemoteContentHash: resolver,
+    configDir: ".obsidian",
     });
 
     expect(equalFinal.items).toEqual([]);
@@ -1170,6 +1177,7 @@ describe("canonical V2 plan candidate", () => {
       },
       baselineReconstructionIncomplete: false,
       resolveRemoteContentHash: resolver,
+    configDir: ".obsidian",
     });
 
     expect(deleteFinal.items).toEqual([
@@ -1226,6 +1234,7 @@ describe("canonical V2 plan candidate", () => {
         resolveRemoteContentHash: async () => {
           throw new Error("anchored remote changes must not need a download");
         },
+      configDir: ".obsidian",
       });
 
     const manualDelete = await finalize(false);
@@ -1328,6 +1337,7 @@ describe("canonical V2 plan candidate", () => {
       },
       baselineReconstructionIncomplete: false,
       resolveRemoteContentHash: async () => hashA,
+    configDir: ".obsidian",
     })).rejects.toThrow("no longer matches");
   });
 
@@ -1351,6 +1361,7 @@ describe("canonical V2 plan candidate", () => {
       },
       baselineReconstructionIncomplete: false,
       resolveRemoteContentHash: async () => hashA,
+    configDir: ".obsidian",
     });
     const committed = upsertBaseStateEnvelopeV2(
       state,
@@ -1412,6 +1423,7 @@ describe("canonical V2 plan candidate", () => {
       },
       baselineReconstructionIncomplete: false,
       resolveRemoteContentHash: async () => hashA,
+    configDir: ".obsidian",
     });
     const controllerProjection = upsertBaseStateEnvelopeV2(
       state,
@@ -1464,6 +1476,7 @@ describe("canonical V2 plan candidate", () => {
       },
       baselineReconstructionIncomplete: false,
       resolveRemoteContentHash: async () => hashA,
+    configDir: ".obsidian",
     });
     const baseCommitted = upsertBaseStateEnvelopeV2(
       state,
@@ -1517,6 +1530,7 @@ describe("canonical V2 plan candidate", () => {
       },
       baselineReconstructionIncomplete: false,
       resolveRemoteContentHash: async () => hashA,
+    configDir: ".obsidian",
     });
     const committed = upsertBaseStateEnvelopeV2(
       state,

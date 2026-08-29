@@ -19,6 +19,7 @@ export interface LocaleStrings {
   "status.conflictsAndDeletes": string;
   "status.lastSync": string;
   "status.ready": string;
+  "status.offline": string;
 
   // ---- Ribbon ----
   "ribbon.loggedOut": string;
@@ -60,7 +61,6 @@ export interface LocaleStrings {
   "settings.account.resumeDevice": string;
   "settings.account.browserOpened": string;
   "settings.account.logout": string;
-  "settings.account.method.lead": string;
   "settings.account.method.browser.name": string;
   "settings.account.method.browser.desc": string;
   "settings.account.method.device.name": string;
@@ -199,6 +199,10 @@ export interface LocaleStrings {
   "settings.reset.confirmMessage": string;
   "settings.reset.confirmWarning": string;
   "settings.reset.confirm": string;
+  "settings.reset.forceTitle": string;
+  "settings.reset.forceMessage": string;
+  "settings.reset.forceWarning": string;
+  "settings.reset.forceConfirm": string;
   "settings.reset.done": string;
   "settings.reset.failed": string;
   "settings.about.product.name": string;
@@ -413,6 +417,8 @@ export interface LocaleStrings {
   "notice.sync.recoveryWaiting": string;
   "notice.sync.recoveryRecovered": string;
   "notice.sync.recoveryBlocked": string;
+  "notice.sync.recoveryBlockedReview": string;
+  "notice.sync.recoveryAccountChanged": string;
   "notice.sync.recoveryResetBlocked": string;
   "notice.accountMismatch": string;
   "notice.diagnosticReportGenerated": string;
@@ -470,13 +476,6 @@ export interface LocaleStrings {
   "auth.error.networkError": string;
   "auth.error.secretStorageUnavailable": string;
   "auth.error.refreshFailed": string;
-
-  // ---- Login Notice (shown before every fresh login) ----
-  "auth.notice.title": string;
-  "auth.notice.line1": string;
-  "auth.notice.line2": string;
-  "auth.notice.line3": string;
-  "auth.notice.continue": string;
 
   // ---- General ----
   "general.unknown": string;
@@ -715,6 +714,7 @@ export interface LocaleStrings {
   "error.present.file.protectedConfigDelete": string;
   "error.present.internal": string;
   "syncView.status.synced": string;
+  "syncView.status.offline": string;
   "syncView.status.awaitingLogin": string;
   "syncView.recovery.checking": string;
   "syncView.recovery.checkingTop": string;
@@ -728,14 +728,16 @@ export interface LocaleStrings {
   "syncView.recovery.summary.checking": string;
   "syncView.recovery.summary.waitingNetwork": string;
   "syncView.recovery.summary.blocked": string;
+  "syncView.recovery.summary.blockedPaused": string;
   "syncView.recovery.field.path": string;
   "syncView.recovery.field.reason": string;
   "syncView.recovery.field.retryAt": string;
   "syncView.recovery.nextStep.checking": string;
   "syncView.recovery.nextStep.waitingNetwork": string;
   "syncView.recovery.nextStep.review": string;
-  "syncView.recovery.nextStep.recheck": string;
-  "syncView.recovery.checkAgain": string;
+  "syncView.recovery.nextStep.blocked": string;
+  "syncView.recovery.nextStep.accountChanged": string;
+  "syncView.recovery.retryScopeRecovery": string;
   "syncView.recovery.reviewDetails": string;
   "mutationRecovery.reason.factsChanged": string;
   "mutationRecovery.reason.scopeChanged": string;
@@ -761,6 +763,7 @@ export interface LocaleStrings {
   "syncView.history.status.cancelled": string;
   "syncView.history.status.authExpired": string;
   "syncView.history.status.failed": string;
+  "syncView.history.status.retry-pending": string;
   "syncView.history.recovery.waitingNetwork": string;
   "syncView.history.recovery.recovered": string;
   "syncView.history.recovery.blocked": string;

@@ -38,18 +38,19 @@ export type ConfigSyncView =
 type PluginColumn = CommunityPluginSelectionColumn;
 
 /**
- * Rows of cloud-cleaned plugins stay hidden from the files list while this
- * device holds no local files for them (the persisted marker is only dropped
- * by a resurrection notice). Reinstalling the plugin locally (`local: true`)
- * must bring the row back so the user can manage and re-join it — there is
- * no permanent blocklist.
+ * Rows of cloud-cleaned plugins stay hidden from both the files and the data
+ * list while this device holds no local plugin files for them (the persisted
+ * marker is only dropped by a resurrection notice). Reinstalling the plugin
+ * locally (`local: true`) must bring the row back so the user can manage and
+ * re-join it — there is no permanent blocklist. Counts derive from the same
+ * visible rows, so a cleaned plugin no longer inflates totals.
  */
 export function isPluginRowHiddenByCloudCleanup(
   column: PluginColumn | undefined,
   local: boolean | undefined,
   cleaned: boolean,
 ): boolean {
-  return column === "files" && local === false && cleaned;
+  return column !== undefined && local === false && cleaned;
 }
 
 interface ScopeToggleConfig {
@@ -438,10 +439,19 @@ export class ConfigSyncModal extends Modal {
       return;
     }
     const items = column === "files"
-      ? this.scopeInventory
+      ? this.scopeInventory.filter((item) =>
+          !isPluginRowHiddenByCloudCleanup(
+            column,
+            item.local,
+            this.cleanedPluginIds.has(item.id),
+          ))
       : this.scopeInventory.filter((item) =>
           this.isPluginEffectivelyEnabled(item.id, "files")
-        );
+          && !isPluginRowHiddenByCloudCleanup(
+            column,
+            item.local,
+            this.cleanedPluginIds.has(item.id),
+          ));
     if (items.length === 0) {
       chipEl.setText("");
       chipEl.addClass("is-hidden");

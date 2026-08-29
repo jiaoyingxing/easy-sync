@@ -59,11 +59,11 @@ describe("automatic handling policy", () => {
     expect(applyAutomaticHandlingPolicy(items, {
       autoDeleteLocalFiles: false,
       mergeNonOverlappingText: true,
-    })).toBe(items);
+    }, ".obsidian")).toBe(items);
     expect(applyAutomaticHandlingPolicy(items, {
       autoDeleteLocalFiles: true,
       mergeNonOverlappingText: true,
-    })).toEqual([
+    }, ".obsidian")).toEqual([
       { type: SyncActionType.DeleteLocal, path: "deleted-remotely.md" },
       { type: SyncActionType.ConfirmLocalDelete, path: ".obsidian/app.json" },
       { type: SyncActionType.Conflict, path: "conflict.md" },

@@ -51,7 +51,10 @@ import {
   inspectReceiptedRenameAnchorCollisionV2,
   reduceFileStateEnvelopeV2,
 } from "./file-state-reducer-v2";
-import { projectRemoteIndexV2 } from "./remote-index-v2";
+import {
+  projectRemoteIndexV2,
+  type RemoteNodeV2,
+} from "./remote-index-v2";
 import {
   areIndependentConservativeResetRecords,
   conservativeResetRecordPaths,
@@ -199,6 +202,7 @@ export interface PluginDataStore {
   app: { vault: { adapter: DataAdapter; configDir: string } };
   layoutMigrationStorage?: EasySyncLayoutMigrationStorage;
   manifest: { dir?: string; id: string };
+  diag?: { warn: (category: string, message: string, detail?: unknown) => void };
   indexedDbVaultInstanceId?: string;
   readIndexedDbVaultInstanceId?: () => string | null;
   createPublic113IndexedDbCandidateStore?:
@@ -464,6 +468,15 @@ export interface Public113AncestorPreparation {
   unavailable: number;
 }
 
+/** Audit of a user-authorized forced reset that terminated unresolved
+ * mutation tracking (user resolution; remote data is never touched). */
+export interface MutationForceResetAuditV1 {
+  at: number;
+  ledgerCount: number;
+  quarantineCount: number;
+  corrupt: boolean;
+}
+
 /** Plugin data keys for state persistence */
 const KEY_BASE_SNAPSHOT = "easy-sync-base-snapshot";
 const KEY_PENDING_CONFLICTS = "easy-sync-pending-conflicts";
@@ -485,6 +498,9 @@ const KEY_PUBLIC_MUTATION_LEDGER = "easy-sync-mutation-ledger";
 const KEY_MUTATION_LEDGER = "easy-sync-v2-mutation-ledger";
 const KEY_MANUAL_MUTATION_RESOLUTION_AUDIT =
   "easy-sync-v2-manual-mutation-resolution-audit";
+/** Lightweight audit of a user-authorized forced reset that terminated all
+ * unresolved mutation tracking (user resolution; no vault file is touched). */
+const KEY_FORCE_RESET_AUDIT = "easy-sync-v2-force-reset-audit";
 const KEY_V2_RECOVERY_QUARANTINE = "easy-sync-v2-recovery-quarantine";
 const KEY_LOCAL_FOLDER_MOVE_HINTS = "easy-sync-local-folder-move-hints";
 const KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE = "community-plugin-enablement-state";
@@ -502,7 +518,7 @@ const KEY_SYNC_PATH_SETTINGS_FINGERPRINT =
   "easy-sync-sync-path-settings-fingerprint";
 const KEY_SYNC_SCOPE_EXPANSION =
   "easy-sync-sync-scope-expansion";
-export type SyncHistoryStatus = "success" | "partial" | "cancelled" | "authExpired" | "failed";
+export type SyncHistoryStatus = "success" | "partial" | "cancelled" | "authExpired" | "failed" | "retry-pending";
 
 export interface SyncHistoryEntry {
   id: string;
@@ -579,6 +595,7 @@ interface PluginData {
   [KEY_MUTATION_LEDGER]: MutationLedgerEntryV1[];
   [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]: ManualMutationResolutionAuditV1[];
   [KEY_V2_RECOVERY_QUARANTINE]: MutationRecoveryQuarantineEntryV2[];
+  [KEY_FORCE_RESET_AUDIT]: MutationForceResetAuditV1 | null;
   [KEY_LOCAL_FOLDER_MOVE_HINTS]: LocalFolderMoveHintV1[];
   [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]:
     CommunityPluginManifestObservationV1[];
@@ -614,6 +631,7 @@ const DEFAULT_DATA: PluginData = {
   [KEY_MUTATION_LEDGER]: [],
   [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]: [],
   [KEY_V2_RECOVERY_QUARANTINE]: [],
+  [KEY_FORCE_RESET_AUDIT]: null,
   [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
   [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]: [],
   [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]: null,
@@ -825,7 +843,7 @@ export class StateManager {
         rawPublicMutationLedger,
       );
       const rawMutationLedger = saved[KEY_MUTATION_LEDGER];
-      const mutationLedger = parseMutationLedger(rawMutationLedger);
+      let mutationLedger = parseMutationLedger(rawMutationLedger);
       this.mutationLedgerCorrupt = isMalformedMutationLedger(
         rawPublicMutationLedger,
         publicMutationLedger,
@@ -833,6 +851,30 @@ export class StateManager {
         rawMutationLedger,
         mutationLedger,
       ) || mutationLedgersDisagree(publicMutationLedger, mutationLedger);
+      if (this.mutationLedgerCorrupt) {
+        // Ledger redundancy: one corrupt ledger copy falls back to the
+        // checksummed backup written on every ledger change. Restoration is
+        // best-effort; a still-inconsistent ledger stays fail-closed corrupt.
+        const restored = await this.tryRestoreMutationLedgerFromBackup();
+        if (restored) {
+          saved[KEY_MUTATION_LEDGER] = restored;
+          mutationLedger = parseMutationLedger(restored);
+          this.mutationLedgerCorrupt = isMalformedMutationLedger(
+            restored,
+            mutationLedger,
+          ) || isMalformedMutationLedger(
+            rawPublicMutationLedger,
+            publicMutationLedger,
+          ) || mutationLedgersDisagree(publicMutationLedger, mutationLedger);
+          if (!this.mutationLedgerCorrupt) {
+            this.plugin.diag?.warn(
+              "state",
+              "mutation ledger restored from its checksummed backup",
+              { mutations: 0 },
+            );
+          }
+        }
+      }
       const rawRecoveryQuarantine = saved[KEY_V2_RECOVERY_QUARANTINE];
       const recoveryQuarantine = parseMutationRecoveryQuarantine(
         rawRecoveryQuarantine,
@@ -886,6 +928,9 @@ export class StateManager {
             saved[KEY_MANUAL_MUTATION_RESOLUTION_AUDIT],
           ),
         [KEY_V2_RECOVERY_QUARANTINE]: recoveryQuarantine,
+        [KEY_FORCE_RESET_AUDIT]: readMutationForceResetAudit(
+          saved[KEY_FORCE_RESET_AUDIT],
+        ),
         [KEY_LOCAL_FOLDER_MOVE_HINTS]: parseLocalFolderMoveHints(
           saved[KEY_LOCAL_FOLDER_MOVE_HINTS],
         ),
@@ -1470,11 +1515,80 @@ export class StateManager {
     const task = this.pluginDataCommitQueue.then(async () => {
       const next = buildNext(this.data);
       if (next === this.data) return;
+      const ledgerChanged = next[KEY_MUTATION_LEDGER]
+        !== this.data[KEY_MUTATION_LEDGER];
       await this.persistPluginData(next);
       this.data = next;
+      if (ledgerChanged) {
+        // Ledger redundancy: keep one checksummed backup in lockstep with
+        // every ledger change so a corrupt primary copy can be restored.
+        // Best-effort internally; never fails the data commit.
+        await this.writeMutationLedgerBackup(next[KEY_MUTATION_LEDGER]);
+      }
     });
     this.pluginDataCommitQueue = task.catch(() => undefined);
     return task;
+  }
+
+  private mutationLedgerBackupPath(): string {
+    const paths = getEasySyncPaths(
+      this.plugin.app.vault,
+      this.plugin.manifest.id,
+    );
+    return `${paths.stateV2File}.ledger-backup`;
+  }
+
+  private async writeMutationLedgerBackup(
+    entries: readonly MutationLedgerEntryV1[],
+  ): Promise<void> {
+    try {
+      const payload = {
+        version: 1,
+        updatedAt: Date.now(),
+        digest: await sha256Hex(
+          new TextEncoder().encode(JSON.stringify(entries)).buffer,
+        ),
+        entries,
+      };
+      await this.plugin.app.vault.adapter.write(
+        this.mutationLedgerBackupPath(),
+        JSON.stringify(payload),
+      );
+    } catch (error) {
+      this.plugin.diag?.warn(
+        "state",
+        "mutation ledger backup write failed",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  private async tryRestoreMutationLedgerFromBackup():
+    Promise<MutationLedgerEntryV1[] | null> {
+    try {
+      const raw = await this.plugin.app.vault.adapter.read(
+        this.mutationLedgerBackupPath(),
+      );
+      const parsed: unknown = JSON.parse(raw);
+      if (
+        !isRecord(parsed)
+        || parsed.version !== 1
+        || !Array.isArray(parsed.entries)
+        || typeof parsed.digest !== "string"
+      ) return null;
+      if (
+        await sha256Hex(
+          new TextEncoder().encode(JSON.stringify(parsed.entries)).buffer,
+        ) !== parsed.digest
+      ) {
+        return null;
+      }
+      const entries = parseMutationLedger(parsed.entries);
+      if (isMalformedMutationLedger(parsed.entries, entries)) return null;
+      return entries;
+    } catch {
+      return null;
+    }
   }
 
   private persistPluginData(snapshot: PluginData): Promise<void> {
@@ -3371,6 +3485,78 @@ export class StateManager {
         (candidate) => candidate.operationId === record.intent.operationId,
       ) ?? entry,
     );
+  }
+
+  /**
+   * User-authorized forced reset (the single last-resort escape; the
+   * abandoned-operation exit was retired, DECISIONS 2026-08-29 提示与出口收束).
+   * Terminates tracking of all unresolved mutation evidence, then rebuilds
+   * default local state through the same cleanup as the conservative reset.
+   * No vault file is touched; a lightweight audit records what was terminated.
+   */
+  async forceReset(): Promise<MutationForceResetAuditV1> {
+    const audit: MutationForceResetAuditV1 = {
+      at: Date.now(),
+      ledgerCount: this.mutationLedger.length,
+      quarantineCount: this.mutationRecoveryQuarantine.length,
+      corrupt:
+        this.mutationLedgerCorrupt
+        || this.mutationRecoveryQuarantineCorrupt,
+    };
+    await this.commitPluginData((current) => ({
+      ...current,
+      [KEY_MUTATION_LEDGER]: [],
+      [KEY_V2_RECOVERY_QUARANTINE]: [],
+    }));
+    this.mutationLedgerCorrupt = false;
+    this.mutationRecoveryQuarantineCorrupt = false;
+    await this.reset();
+    await this.commitPluginData((current) => ({
+      ...current,
+      [KEY_FORCE_RESET_AUDIT]: audit,
+    }));
+    return audit;
+  }
+
+  /** Last user-authorized forced-reset audit, if any. */
+  get forceResetAudit(): MutationForceResetAuditV1 | null {
+    const value = this.data[KEY_FORCE_RESET_AUDIT];
+    return value && typeof value === "object"
+      && typeof (value as { at?: unknown }).at === "number"
+      && typeof (value as { ledgerCount?: unknown }).ledgerCount === "number"
+      && typeof (value as { quarantineCount?: unknown }).quarantineCount
+        === "number"
+      && typeof (value as { corrupt?: unknown }).corrupt === "boolean"
+      ? {
+          at: (value as { at: number }).at,
+          ledgerCount: (value as { ledgerCount: number }).ledgerCount,
+          quarantineCount:
+            (value as { quarantineCount: number }).quarantineCount,
+          corrupt: (value as { corrupt: boolean }).corrupt,
+        }
+      : null;
+  }
+
+  /**
+   * Best-effort item-level remote change history from the persisted commit
+   * delta chain (diagnostic/confirmation evidence, never runtime authority).
+   * The chain is append-only today; callers must bound results with `limit`.
+   */
+  async remoteNodeHistory(
+    driveId: string,
+    limit?: number,
+  ): Promise<Array<{
+    commitSeq: number;
+    updatedAt: number;
+    kind: "upsert" | "delete";
+    node: RemoteNodeV2 | null;
+  }>> {
+    const paths = getEasySyncPaths(
+      this.plugin.app.vault,
+      this.plugin.manifest.id,
+    );
+    const store = this.createV2IndexedDbRecoveryStore(paths);
+    return store.remoteNodeHistory(driveId, limit ?? 64);
   }
 
   async beginMutationIntent(intent: MutationIntent): Promise<void> {
@@ -8715,6 +8901,32 @@ function anchorMatchesConservativeResetRecord(
   return intent.action === "download"
     && intent.expectedRemote.exists
     && anchor.remoteId === intent.expectedRemote.driveId;
+}
+
+function readMutationForceResetAudit(
+  value: unknown,
+): MutationForceResetAuditV1 | null {
+  if (!value || typeof value !== "object") return null;
+  const candidate = value as {
+    at?: unknown;
+    ledgerCount?: unknown;
+    quarantineCount?: unknown;
+    corrupt?: unknown;
+  };
+  return typeof candidate.at === "number"
+    && Number.isFinite(candidate.at)
+    && typeof candidate.ledgerCount === "number"
+    && Number.isSafeInteger(candidate.ledgerCount)
+    && typeof candidate.quarantineCount === "number"
+    && Number.isSafeInteger(candidate.quarantineCount)
+    && typeof candidate.corrupt === "boolean"
+    ? {
+        at: candidate.at,
+        ledgerCount: candidate.ledgerCount,
+        quarantineCount: candidate.quarantineCount,
+        corrupt: candidate.corrupt,
+      }
+    : null;
 }
 
 function parseLocalFolderMoveHints(value: unknown): LocalFolderMoveHintV1[] {

@@ -110,12 +110,84 @@ describe("mutation recovery presentation", () => {
 
     expect(mutationRecoveryStatusLabel(state, t)).toBe("未完成操作");
     expect(mutationRecoveryBodyPresentation(state, t, () => "")).toEqual({
-      summary: "为避免覆盖或删除结果不明确的内容，EasySync 已暂停后续同步。",
+      summary: "有 1 笔操作无法自动完成，不影响其他同步。",
       path: ".obsidian/plugins/dataview/data.json",
       reason: "文件或云端状态已经变化",
       retryAt: null,
       nextStep: "核对本机与云端内容并选择保留哪一侧。完成后会自动继续同步。",
       actionKey: "syncView.recovery.reviewDetails",
+    });
+  });
+
+  it("keeps only real recovery actions: review for facts-changed, scope retry for scope-changed", () => {
+    const zh = new I18n("zh-cn");
+    const t = zh.t.bind(zh);
+    const base = {
+      total: 2,
+      settled: 1,
+      remaining: 1,
+      retryAt: null,
+      firstPath: "notes/a.md",
+      blockedOperationId: "op-1",
+    };
+
+    expect(mutationRecoveryBodyPresentation({
+      kind: "blocked",
+      ...base,
+      blockReason: "facts-changed",
+      manualResolutionAvailable: false,
+    }, t, () => "")).toMatchObject({
+      actionKey: null,
+      nextStep: "暂时无法自动确认。可导出诊断报告，或强制重置同步状态。",
+    });
+
+    expect(mutationRecoveryBodyPresentation({
+      kind: "blocked",
+      ...base,
+      blockReason: "scope-changed",
+    }, t, () => "")).toMatchObject({
+      actionKey: "syncView.recovery.retryScopeRecovery",
+    });
+
+    expect(mutationRecoveryBodyPresentation({
+      kind: "blocked",
+      ...base,
+      blockReason: "account-changed",
+    }, t, () => "")).toMatchObject({
+      actionKey: null,
+      nextStep: "请换回原账号，换回后会自动继续；也可以强制重置同步状态。",
+    });
+  });
+
+  it("renders honest status without choice buttons for waiting and paused states", () => {
+    const zh = new I18n("zh-cn");
+    const t = zh.t.bind(zh);
+
+    expect(mutationRecoveryBodyPresentation({
+      kind: "waiting-network",
+      total: 2,
+      settled: 1,
+      remaining: 1,
+      retryAt: 20,
+      firstPath: "notes/a.md",
+      blockReason: null,
+    }, t, () => "20:30:00")).toMatchObject({
+      actionKey: null,
+      nextStep: "无需操作，网络恢复后会自动继续。",
+    });
+
+    expect(mutationRecoveryBodyPresentation({
+      kind: "blocked",
+      total: 2,
+      settled: 1,
+      remaining: 1,
+      retryAt: null,
+      firstPath: "notes/a.md",
+      blockReason: "evidence-corrupt",
+      paused: true,
+    }, t, () => "")).toMatchObject({
+      summary: "同步已暂停：有 1 笔操作无法自动确认。",
+      actionKey: null,
     });
   });
 

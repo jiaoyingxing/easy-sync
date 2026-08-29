@@ -1875,9 +1875,14 @@ describe("buildSyncViewContentKey", () => {
     expect(viewSource).toContain('"syncView.recovery.reviewDetails"');
     expect(viewSource).toContain("mutationRecoveryPrimaryActionKey(");
     expect(viewSource).toContain(
-      'recoveryActionKey === "syncView.recovery.reviewDetails"',
+      'actionKey === "syncView.recovery.reviewDetails"',
     );
     expect(viewSource).toContain("this.renderMutationRecoverySection(");
+    expect(viewSource).not.toContain("abandonAllAction");
+    expect(viewSource).not.toContain("abandonAllAvailable");
+    expect(viewSource).toContain(
+      "state.mutationRecovery && recoveryActionKey",
+    );
     expect(viewSource).not.toContain('"syncView.recovery.reviewAndResolve"');
     expect(openMethod).toContain("if (this.mutationRecoveryResolutionOpening) return");
     expect(openMethod).toContain("shouldAutoSettleIdenticalRecovery(snapshot)");
@@ -2238,6 +2243,49 @@ describe("sync view attention presentation", () => {
       },
       progress: { cancelRequested: false },
     })).toEqual({ status: "success", label: "已同步" });
+  });
+
+  it("shows an offline top status when the latest round is a retry-pending observation", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as {
+      plugin: { i18n: I18n };
+      getStatusPresentation: (state: Record<string, unknown>) => {
+        status: string;
+        label: string;
+      };
+    };
+    view.plugin = { i18n: new I18n("zh-cn") };
+    const baseState = {
+      isLoggedIn: true,
+      isInitializing: false,
+      isPending: false,
+      isRunning: false,
+      lastSyncTime: 1,
+      pendingCount: 0,
+      planReviewActive: false,
+      autoSyncPaused: false,
+      mutationRecovery: null,
+      progress: { cancelRequested: false },
+    };
+    const latestHistory = {
+      status: "retry-pending",
+      conflicts: 0,
+      errors: 0,
+    };
+
+    // The latest round was a network observation miss: the stale "synced"
+    // green from the last healthy round must not imply the vault is in sync.
+    expect(view.getStatusPresentation({
+      ...baseState,
+      latestHistory,
+    })).toEqual({ status: "offline", label: "无网络连接" });
+
+    // A pending item still outranks the offline hint: unresolved conflicts or
+    // deletes must not be hidden behind the network notice.
+    expect(view.getStatusPresentation({
+      ...baseState,
+      pendingCount: 2,
+      latestHistory,
+    })).toEqual({ status: "attention", label: "需要处理 2" });
   });
 
   it("keeps the top status generic when only community plugin decisions remain", () => {

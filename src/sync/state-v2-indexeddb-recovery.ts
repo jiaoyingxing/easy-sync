@@ -163,6 +163,76 @@ export class StateV2IndexedDbRecoveryStore {
     );
   }
 
+  /**
+   * Read-only history of one remote identity across the persisted commit
+   * delta chain (newest first). This is diagnostic/confirmation evidence,
+   * never runtime authority; the chain is append-only and unbounded today,
+   * so callers must bound results with `limit`.
+   */
+  async remoteNodeHistory(
+    driveId: string,
+    limit = 64,
+  ): Promise<Array<{
+    commitSeq: number;
+    updatedAt: number;
+    kind: "upsert" | "delete";
+    node: RemoteNodeV2 | null;
+  }>> {
+    const boundedLimit = Number.isSafeInteger(limit) && limit >= 1
+      ? limit
+      : 64;
+    await this.ensureDirectory();
+    const listed = await this.adapter.list(this.directory);
+    const seqByPath = new Map<string, number>();
+    for (const name of listed.files ?? []) {
+      if (!name.startsWith(`${this.directory}/`)) continue;
+      const base = name.slice(this.directory.length + 1);
+      if (!base.startsWith(COMMIT_PREFIX) || !base.endsWith(FILE_SUFFIX)) {
+        continue;
+      }
+      const seq = Number(
+        base.slice(COMMIT_PREFIX.length, -FILE_SUFFIX.length),
+      );
+      if (!Number.isSafeInteger(seq) || seq < 1) continue;
+      seqByPath.set(name, seq);
+    }
+    const ordered = [...seqByPath.entries()]
+      .sort((left, right) => right[1] - left[1]);
+    const events: Array<{
+      commitSeq: number;
+      updatedAt: number;
+      kind: "upsert" | "delete";
+      node: RemoteNodeV2 | null;
+    }> = [];
+    for (const [path, seq] of ordered) {
+      if (events.length >= boundedLimit) break;
+      let delta: StateV2IndexedDbRecoveryDeltaV1;
+      try {
+        delta = await this.readDelta(path);
+      } catch {
+        continue; // unreadable record: history stays best-effort
+      }
+      const stat = await this.adapter.stat(path);
+      const updatedAt = stat?.mtime ?? 0;
+      if (delta.remoteNodeDeletes.includes(driveId)) {
+        events.push({
+          commitSeq: seq,
+          updatedAt,
+          kind: "delete",
+          node: null,
+        });
+        if (events.length >= boundedLimit) break;
+      }
+      const node = delta.remoteNodeUpserts.find(
+        (entry) => entry.id === driveId,
+      );
+      if (node) {
+        events.push({ commitSeq: seq, updatedAt, kind: "upsert", node });
+      }
+    }
+    return events;
+  }
+
   async prepareDelta(
     previous: SyncStateEnvelopeV2,
     next: SyncStateEnvelopeV2,

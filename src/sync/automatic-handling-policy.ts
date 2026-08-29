@@ -54,10 +54,11 @@ export function readAutomaticHandlingPolicy(
 export function applyAutomaticHandlingPolicy(
   items: SyncPlanItem[],
   policy: Readonly<AutomaticHandlingPolicy>,
+  configDir: string,
 ): SyncPlanItem[] {
   if (!policy.autoDeleteLocalFiles) return items;
   return items.map((item) => item.type === SyncActionType.ConfirmLocalDelete
-    && !isObsidianManagedConfigPath(item.path)
+    && !isObsidianManagedConfigPath(item.path, configDir)
     ? { ...item, type: SyncActionType.DeleteLocal }
     : item);
 }

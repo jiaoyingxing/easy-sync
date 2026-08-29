@@ -7456,8 +7456,425 @@ describe("Persistent remote delta state", () => {
     }]);
   });
 
-  it("does not publish a remote-delete receipt while the exact item still exists", async () => {
-    const state = await makeMemoryState({
+  it("retires a receipted upload moved elsewhere through move-aware reflection", async () => {
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const content = new Uint8Array([1, 2, 3]).buffer;
+    const hash = await sha256Hex(content);
+    const moved: RemoteFileEntry = {
+      path: "moved/moved-note.md",
+      driveId: "uploaded-note",
+      parentId: "moved-folder",
+      size: content.byteLength,
+      mtime: 3,
+      eTag: "etag-uploaded",
+      cTag: "ctag-uploaded",
+      sha256Hash: hash,
+    };
+    const record: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "op-upload-moved-reflected",
+        planRevision: 1,
+        scope: activeScope,
+        action: "upload",
+        path: "note.md",
+        expectedLocal: { exists: true, hash, size: content.byteLength },
+        expectedRemote: { exists: false },
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1,
+        operationId: "op-upload-moved-reflected",
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [{
+            path: "note.md",
+            hash,
+            size: content.byteLength,
+            eTag: "etag-uploaded",
+          }],
+          baseRemovals: [],
+          remoteUpserts: [{
+            path: "note.md",
+            driveId: "uploaded-note",
+            parentId: activeScope.filesRootId,
+            size: content.byteLength,
+            mtime: 3,
+            eTag: "etag-uploaded",
+            cTag: "ctag-uploaded",
+            sha256Hash: hash,
+          }],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      },
+    };
+    const state = makeActiveV2State(
+      [moved],
+      [{
+        path: "moved/moved-note.md",
+        hash,
+        size: content.byteLength,
+        eTag: "etag-uploaded",
+      }],
+      {
+        remoteFolders: [{
+          path: "moved",
+          driveId: "moved-folder",
+          parentId: activeScope.filesRootId,
+          name: "moved",
+        }],
+        mutationLedger: [record],
+      },
+    );
+    let reflectedEnvelope = state.getCommittedV2Envelope()!;
+    const rebuildCommitSeq = reflectedEnvelope.meta.commitSeq;
+    state.getCommittedV2Envelope = vi.fn(() => structuredClone(reflectedEnvelope));
+    const retire = vi.mocked(state.retireMutationCheckpointIfReflected);
+    retire.mockImplementation(async (operationId, expectedCommitSeq) => {
+      if (reflectedEnvelope.meta.commitSeq !== expectedCommitSeq) return false;
+      const index = state.mutationLedger.findIndex(
+        (entry) => entry.intent.operationId === operationId,
+      );
+      if (index < 0) return false;
+      state.mutationLedger.splice(index, 1);
+      reflectedEnvelope = {
+        ...reflectedEnvelope,
+        meta: {
+          ...reflectedEnvelope.meta,
+          commitSeq: reflectedEnvelope.meta.commitSeq + 1,
+        },
+      };
+      return true;
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getFileMetadata: vi.fn().mockResolvedValue(null),
+        getDriveItemMetadataById: vi.fn().mockResolvedValue({
+          id: "uploaded-note",
+          name: "moved-note.md",
+          size: content.byteLength,
+          eTag: "etag-uploaded",
+          file: { hashes: { sha256Hash: hash } },
+          parentReference: { id: "moved-folder" },
+        }),
+      }),
+      Object.assign(emptyScanner(), {
+        inspectFile: vi.fn().mockResolvedValue({ status: "missing" }),
+      }),
+      state,
+      "testVault",
+    );
+
+    const summary = await (executor as unknown as {
+      recoverMutationLedger(
+        scope: SyncScope,
+        metrics: undefined,
+        operationEpoch: undefined,
+        observationOnly: boolean,
+        remoteObservationCommitSeq: number,
+      ): Promise<unknown>;
+    }).recoverMutationLedger(
+      activeScope,
+      undefined,
+      undefined,
+      true,
+      rebuildCommitSeq,
+    );
+
+    expect(summary).toMatchObject({ state: "settled", settled: 1, remaining: 0 });
+    expect(retire).toHaveBeenCalledWith(
+      "op-upload-moved-reflected",
+      rebuildCommitSeq,
+    );
+    expect(state.commitMutationCheckpoint).not.toHaveBeenCalled();
+    expect(state.mutationLedger).toEqual([]);
+  });
+
+  it("keeps a moved receipted upload blocked when the moved object changed", async () => {
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const content = new Uint8Array([1, 2, 3]).buffer;
+    const hash = await sha256Hex(content);
+    const moved: RemoteFileEntry = {
+      path: "moved/moved-note.md",
+      driveId: "uploaded-note",
+      parentId: "moved-folder",
+      size: content.byteLength,
+      mtime: 3,
+      eTag: "etag-uploaded",
+      cTag: "ctag-uploaded",
+      sha256Hash: hash,
+    };
+    const record: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "op-upload-moved-changed",
+        planRevision: 1,
+        scope: activeScope,
+        action: "upload",
+        path: "note.md",
+        expectedLocal: { exists: true, hash, size: content.byteLength },
+        expectedRemote: { exists: false },
+        createdAt: 1,
+      },
+      receipt: {
+        version: 1,
+        operationId: "op-upload-moved-changed",
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [{
+            path: "note.md",
+            hash,
+            size: content.byteLength,
+            eTag: "etag-uploaded",
+          }],
+          baseRemovals: [],
+          remoteUpserts: [{
+            path: "note.md",
+            driveId: "uploaded-note",
+            parentId: activeScope.filesRootId,
+            size: content.byteLength,
+            mtime: 3,
+            eTag: "etag-uploaded",
+            cTag: "ctag-uploaded",
+            sha256Hash: hash,
+          }],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      },
+    };
+    const state = makeActiveV2State(
+      [moved],
+      [{
+        path: "moved/moved-note.md",
+        hash,
+        size: content.byteLength,
+        eTag: "etag-uploaded",
+      }],
+      {
+        remoteFolders: [{
+          path: "moved",
+          driveId: "moved-folder",
+          parentId: activeScope.filesRootId,
+          name: "moved",
+        }],
+        mutationLedger: [record],
+      },
+    );
+    const retire = vi.mocked(state.retireMutationCheckpointIfReflected);
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getFileMetadata: vi.fn().mockResolvedValue(null),
+        getDriveItemMetadataById: vi.fn().mockResolvedValue({
+          id: "uploaded-note",
+          name: "moved-note.md",
+          size: content.byteLength + 1,
+          eTag: "etag-changed",
+          file: { hashes: { sha256Hash: hash } },
+          parentReference: { id: "moved-folder" },
+        }),
+      }),
+      Object.assign(emptyScanner(), {
+        inspectFile: vi.fn().mockResolvedValue({ status: "missing" }),
+      }),
+      state,
+      "testVault",
+    );
+
+    await expect((executor as unknown as {
+      recoverMutationLedger(scope: SyncScope): Promise<void>;
+    }).recoverMutationLedger(activeScope)).rejects.toThrow(
+      "Mutation receipt no longer matches",
+    );
+    expect(retire).not.toHaveBeenCalled();
+    expect(state.mutationLedger).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      caseName: "local file still present at the original path",
+      metadata: {
+        id: "uploaded-note",
+        name: "moved-note.md",
+        size: 3,
+        eTag: "etag-uploaded",
+        file: { hashes: { sha256Hash: "aa".repeat(32) } },
+        parentReference: { id: "moved-folder" },
+      },
+      localStatus: "present" as const,
+      remoteNodeOverrides: {},
+      retireExpectation: "not-called" as const,
+    },
+    {
+      caseName: "moved object is no longer in the observed index",
+      metadata: {
+        id: "uploaded-note",
+        name: "moved-note.md",
+        size: 3,
+        eTag: "etag-uploaded",
+        file: { hashes: { sha256Hash: "aa".repeat(32) } },
+        parentReference: { id: "moved-folder" },
+      },
+      localStatus: "missing" as const,
+      remoteNodeOverrides: { dropFromIndex: true },
+      retireExpectation: "not-called" as const,
+    },
+    {
+      caseName: "reflection retirement refused by state",
+      metadata: {
+        id: "uploaded-note",
+        name: "moved-note.md",
+        size: 3,
+        eTag: "etag-uploaded",
+        file: { hashes: { sha256Hash: "aa".repeat(32) } },
+        parentReference: { id: "moved-folder" },
+      },
+      localStatus: "missing" as const,
+      remoteNodeOverrides: {},
+      retireExpectation: "called" as const,
+    },
+  ])(
+    "keeps a moved receipted upload blocked: $caseName",
+    async ({ caseName, metadata, localStatus, remoteNodeOverrides, retireExpectation }) => {
+      const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+      const content = new Uint8Array([1, 2, 3]).buffer;
+      const hash = await sha256Hex(content);
+      const moved: RemoteFileEntry = {
+        path: "moved/moved-note.md",
+        driveId: "uploaded-note",
+        parentId: "moved-folder",
+        size: content.byteLength,
+        mtime: 3,
+        eTag: "etag-uploaded",
+        cTag: "ctag-uploaded",
+        sha256Hash: hash,
+      };
+      const record: MutationLedgerEntryV1 = {
+        intent: {
+          version: 1,
+          operationId: `op-upload-moved-${caseName}`,
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload",
+          path: "note.md",
+          expectedLocal: { exists: true, hash, size: content.byteLength },
+          expectedRemote: { exists: false },
+          createdAt: 1,
+        },
+        receipt: {
+          version: 1,
+          operationId: `op-upload-moved-${caseName}`,
+          completedAt: 2,
+          checkpoint: {
+            baseUpserts: [{
+              path: "note.md",
+              hash,
+              size: content.byteLength,
+              eTag: "etag-uploaded",
+            }],
+            baseRemovals: [],
+            remoteUpserts: [{
+              path: "note.md",
+              driveId: "uploaded-note",
+              parentId: activeScope.filesRootId,
+              size: content.byteLength,
+              mtime: 3,
+              eTag: "etag-uploaded",
+              cTag: "ctag-uploaded",
+              sha256Hash: hash,
+            }],
+            remoteDeletes: [],
+            pendingConflictRemovals: [],
+            pendingDeleteRemovals: [],
+          },
+        },
+      };
+      const state = makeActiveV2State(
+        remoteNodeOverrides.dropFromIndex ? [] : [moved],
+        remoteNodeOverrides.dropFromIndex
+          ? []
+          : [{
+              path: "moved/moved-note.md",
+              hash,
+              size: content.byteLength,
+              eTag: "etag-uploaded",
+            }],
+        {
+          remoteFolders: remoteNodeOverrides.dropFromIndex
+            ? []
+            : [{
+                path: "moved",
+                driveId: "moved-folder",
+                parentId: activeScope.filesRootId,
+                name: "moved",
+              }],
+          mutationLedger: [record],
+        },
+      );
+      const retire = vi.mocked(state.retireMutationCheckpointIfReflected);
+      retire.mockResolvedValue(false);
+      const executor = new SyncExecutor(
+        makeMockOneDrive({
+          getFileMetadata: vi.fn().mockResolvedValue(null),
+          getDriveItemMetadataById: vi.fn().mockResolvedValue(metadata),
+        }),
+        Object.assign(emptyScanner(), {
+          inspectFile: vi.fn().mockResolvedValue(
+            localStatus === "present"
+              ? {
+                  status: "present",
+                  entry: {
+                    path: "note.md",
+                    hash,
+                    size: content.byteLength,
+                    mtime: 1,
+                    binary: false,
+                  },
+                }
+              : { status: "missing" },
+          ),
+        }),
+        state,
+        "testVault",
+      );
+
+      if (retireExpectation === "called") {
+        const rebuildCommitSeq = state.getCommittedV2Envelope()!.meta.commitSeq;
+        await expect((executor as unknown as {
+          recoverMutationLedger(
+            scope: SyncScope,
+            metrics: undefined,
+            operationEpoch: undefined,
+            observationOnly: boolean,
+            remoteObservationCommitSeq: number,
+          ): Promise<unknown>;
+        }).recoverMutationLedger(
+          activeScope,
+          undefined,
+          undefined,
+          true,
+          rebuildCommitSeq,
+        )).rejects.toThrow("Mutation receipt no longer matches");
+      } else {
+        await expect((executor as unknown as {
+          recoverMutationLedger(scope: SyncScope): Promise<void>;
+        }).recoverMutationLedger(activeScope)).rejects.toThrow(
+          "Mutation receipt no longer matches",
+        );
+      }
+      if (retireExpectation === "called") {
+        expect(retire).toHaveBeenCalled();
+      } else {
+        expect(retire).not.toHaveBeenCalled();
+      }
+      expect(state.mutationLedger).toHaveLength(1);
+    },
+  );
+
+  it("does not publish a remote-delete receipt while the exact item still exists", async () => {    const state = await makeMemoryState({
       "easy-sync-mutation-ledger": [{
         intent: {
           version: 1,
@@ -10828,6 +11245,77 @@ describe("Persistent remote delta state", () => {
     expect(state.mutationLedger).toEqual([]);
     expect(state.remoteSnapshot.map((entry) => entry.path)).toEqual(["upload.md"]);
     expect(state.remoteDeltaLink).toBe("https://graph.example/delta-2");
+  });
+
+  it("allows a conflict action on an unrelated path while one unresolved record is isolated", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "notes/blocked.md",
+      withLedger: true,
+      expectedLocalAtIntent: true,
+      local: {
+        "notes/blocked.md": "blocked local",
+        "notes/other.md": "other local bytes",
+      },
+      remote: {
+        "notes/blocked.md": "blocked remote bytes",
+        "notes/other.md": "other remote bytes",
+      },
+      pendingConflictPaths: ["notes/other.md"],
+    });
+
+    await harness.executor.resolveConflictKeepLocal("notes/other.md");
+
+    // The unrelated keep-local re-upload must proceed even though the
+    // unresolved ordinary record would block a same-path action.
+    expect(harness.uploadFile).toHaveBeenCalled();
+    expect(harness.uploadFile.mock.calls.some(
+      (call) => String(call[1]).endsWith("notes/other.md"),
+    )).toBe(true);
+    expect(harness.state.mutationLedger).toHaveLength(1);
+  });
+
+  it("still refuses an action overlapping an isolated unresolved recovery record", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "notes/other.md",
+      withLedger: true,
+      expectedLocalAtIntent: true,
+      local: {
+        "notes/other.md": "other local bytes",
+      },
+      remote: {
+        "notes/other.md": "other remote bytes",
+      },
+      pendingConflictPaths: ["notes/other.md"],
+    });
+
+    await harness.executor.resolveConflictKeepLocal("notes/other.md");
+
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toHaveLength(1);
+  });
+
+  it("still refuses every action when the unresolved records cannot be isolated", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: ".obsidian/app.json",
+      withLedger: true,
+      expectedLocalAtIntent: true,
+      local: {
+        ".obsidian/app.json": "config bytes",
+        "notes/other.md": "other local bytes",
+      },
+      remote: {
+        ".obsidian/app.json": "config remote bytes",
+        "notes/other.md": "other remote bytes",
+      },
+      pendingConflictPaths: ["notes/other.md"],
+    });
+
+    await harness.executor.resolveConflictKeepLocal("notes/other.md");
+
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.deleteItem).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toHaveLength(1);
   });
 });
 
@@ -14265,6 +14753,7 @@ describe("Download plan preserves the scanned local version", () => {
       remoteEntries: [remote],
       baseEntries: [base],
       skippedLarge: [],
+    configDir: ".obsidian",
     });
 
     expect(plan.items).toEqual([

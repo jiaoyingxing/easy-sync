@@ -1382,20 +1382,29 @@ export class EasySyncSyncView extends ItemView {
         .onClick(() => {
           void this.plugin.executePlanReview(state.planReviewRevision);
         });
-    } else if (state.isLoggedIn) {
+    } else if (state.isLoggedIn && state.mutationRecovery && recoveryActionKey) {
+      // Only real recovery decisions keep a primary action: keep-side review
+      // and scope-recovery retry. Other recovery states render honest status
+      // without a choice button (no fake "check again").
+      const actionKey = recoveryActionKey;
       new ButtonComponent(actions)
-        .setButtonText(t(
-          state.mutationRecovery
-            ? recoveryActionKey ?? "syncView.recovery.checkAgain"
-            : "command.syncNow",
-        ))
+        .setButtonText(t(actionKey))
         .setCta()
         .setDisabled(state.isInitializing)
         .onClick(() => {
-          if (recoveryActionKey === "syncView.recovery.reviewDetails") {
+          if (actionKey === "syncView.recovery.reviewDetails") {
             void this.openMutationRecoveryResolution();
             return;
           }
+          // retryScopeRecovery: a manual round re-runs remote scope recovery.
+          void this.plugin.startManualSync();
+        });
+    } else if (state.isLoggedIn && !state.mutationRecovery) {
+      new ButtonComponent(actions)
+        .setButtonText(t("command.syncNow"))
+        .setCta()
+        .setDisabled(state.isInitializing)
+        .onClick(() => {
           void this.plugin.startManualSync();
         });
     } else {
@@ -1451,7 +1460,7 @@ export class EasySyncSyncView extends ItemView {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
 
     if (this.statusLineEl) {
-      this.statusLineEl.removeClass("is-loggedOut", "is-cancelling", "is-syncing", "is-attention", "is-success", "is-ready");
+      this.statusLineEl.removeClass("is-loggedOut", "is-cancelling", "is-syncing", "is-attention", "is-offline", "is-success", "is-ready");
       this.statusLineEl.addClass(`is-${presentation.status}`);
     }
     if (this.statusIconEl) {
@@ -1591,6 +1600,16 @@ export class EasySyncSyncView extends ItemView {
         || state.mutationRecovery !== null,
       recentSuccess: state.lastSyncTime > 0,
     });
+    // The latest round may be a retry-pending observation (network unavailable
+    // before ordinary planning). That overrides the stale "synced" green from
+    // the last healthy round: show an offline hint instead of implying the
+    // vault is currently in sync. The next healthy round returns to success.
+    if (
+      status === "success"
+      && state.latestHistory?.status === "retry-pending"
+    ) {
+      return { status: "offline", label: t("syncView.status.offline") };
+    }
     switch (status) {
       case "cancelling":
         return { status, label: t("syncView.cancelling") };
@@ -1705,7 +1724,23 @@ export class EasySyncSyncView extends ItemView {
     section.createDiv("easy-sync-recovery-summary").setText(
       presentation.summary,
     );
-    if (presentation.path || presentation.reason || presentation.retryAt) {
+    if (
+      state.kind === "blocked"
+      && presentation.path
+      && presentation.reason
+    ) {
+      // The decision hinges on which operation is stuck and why; keep it to
+      // one compact line instead of a stacked field list.
+      const subject = section.createDiv("easy-sync-recovery-subject");
+      subject.createSpan("easy-sync-recovery-path").setText(
+        presentation.path,
+      );
+      subject.createSpan().setText(` · ${presentation.reason}`);
+    }
+    if (
+      state.kind !== "blocked"
+      && (presentation.path || presentation.reason || presentation.retryAt)
+    ) {
       const facts = section.createEl("dl", "easy-sync-recovery-facts");
       if (presentation.path) {
         facts.createEl("dt").setText(t("syncView.recovery.field.path"));
@@ -1721,6 +1756,10 @@ export class EasySyncSyncView extends ItemView {
         facts.createEl("dd").setText(presentation.retryAt);
       }
     }
+    // Honest next-step line for every state: real-decision pointers where a
+    // decision exists, otherwise status plus the diagnostics / forced-reset
+    // guidance. The abandon escape hatch was removed; the single last-resort
+    // exit lives on the reset flow (informed forced reset).
     section.createDiv("easy-sync-recovery-next-step").setText(
       presentation.nextStep,
     );

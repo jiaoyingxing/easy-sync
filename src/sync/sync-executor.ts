@@ -42,7 +42,7 @@ import type {
   SharedSyncProtocolObservationComponent,
   UploadResult,
 } from "../onedrive/types";
-import { AuthError } from "../auth/types";
+import { AuthError, AuthErrorType } from "../auth/types";
 import {
   SyncActionType,
   planDigest,
@@ -143,6 +143,7 @@ import { OperationLifecycle } from "./operation-lifecycle";
 import { EasySyncNoticeCenter, NOTICE_PRIORITY } from "../ui/notice-center";
 import { LocalRecoveryJournal } from "./local-recovery-journal";
 import { MergeReadyStore } from "./merge-ready-store";
+import { fingerprintIndexedDbError } from "./indexeddb-error-fingerprint";
 import {
   areIndependentConservativeResetRecords,
   buildConservativeResetRecordFootprints,
@@ -1239,6 +1240,10 @@ export class SyncExecutor {
    *  error so the three root causes (parse failure, same-directory drift,
    *  cross-directory collision) surface as distinct messages. */
   private communityPluginIdentityBlockedErrors = new Map<string, Error>();
+  /** Consecutive shared sync protocol observations that ended retryable
+   *  (network / service / timeout) since the last healthy observation.
+   *  Session-scoped diagnostic counter; never gates behavior. */
+  private consecutiveSharedProtocolObservationFailures = 0;
 
   constructor(
     private onedrive: OneDriveClient,
@@ -1852,9 +1857,14 @@ export class SyncExecutor {
         const current = await this.buildCurrentFolderLocationResolutionSnapshot(
           reviewed.path,
         );
+        // Any state commit during the dialog advances the snapshot revision,
+        // so a revision mismatch used to reject with "the location changed,
+        // sync again" — and resyncing only widened the mismatch window. The
+        // freshly built snapshot already re-verified both sides live; treat
+        // it as an automatic one-shot rebuild and continue with the latest
+        // facts instead of showing a guidance dead end.
         if (
           !current
-          || current.revision !== reviewed.revision
           || !this.activeSyncScope
           || !sameSyncScope(current.scope, this.activeSyncScope)
           || !this.canContinue(operationEpoch)
@@ -7152,6 +7162,7 @@ export class SyncExecutor {
             envelope: canonicalSourceEnvelope!,
             vaultName: this.vaultName,
             accountId: this.state.boundAccountId ?? "",
+            configDir: getConfigDir(this.scanner.vault),
             automaticHandlingPolicy,
             baselineReconstructionIncomplete,
             pendingContentComparisons: this.state.pendingConflicts.map(
@@ -7522,6 +7533,7 @@ export class SyncExecutor {
                 envelope: sourceEnvelope,
                 vaultName: this.vaultName,
                 accountId: this.state.boundAccountId ?? "",
+                configDir: getConfigDir(this.scanner.vault),
                 automaticHandlingPolicy,
                 baselineReconstructionIncomplete: false,
                 pendingContentComparisons:
@@ -7868,6 +7880,7 @@ export class SyncExecutor {
           envelope: finalizedEnvelope,
           vaultName: this.vaultName,
           accountId: this.state.boundAccountId ?? "",
+          configDir: getConfigDir(this.scanner.vault),
           automaticHandlingPolicy,
           baselineReconstructionIncomplete,
           pendingContentComparisons: this.state.pendingConflicts.map(
@@ -8928,6 +8941,7 @@ export class SyncExecutor {
                 envelope: continuationSourceEnvelope,
                 vaultName: this.vaultName,
                 accountId: this.state.boundAccountId ?? "",
+                configDir: getConfigDir(this.scanner.vault),
                 automaticHandlingPolicy,
                 baselineReconstructionIncomplete: false,
                 pendingContentComparisons: this.state.pendingConflicts.map(
@@ -9620,6 +9634,17 @@ export class SyncExecutor {
         if (mutationIntent) {
           const intentStartedAt = Date.now();
           await this.state.beginMutationIntent(mutationIntent);
+          this.diag?.log(
+            "state",
+            "mutation intent persisted before execution",
+            {
+              operationId: mutationIntent.operationId,
+              action: mutationIntent.action,
+              path: mutationIntent.path,
+              createdAt: mutationIntent.createdAt,
+              mutations: 0,
+            },
+          );
           metrics.mutationPersistence.intentWrites++;
           metrics.mutationPersistence.stagesMs.intentPersist +=
             Date.now() - intentStartedAt;
@@ -9669,6 +9694,17 @@ export class SyncExecutor {
           };
           const receiptStartedAt = Date.now();
           await this.state.recordMutationReceipt(receipt);
+          this.diag?.log(
+            "state",
+            "mutation receipt persisted after execution",
+            {
+              operationId: mutationIntent.operationId,
+              action: mutationIntent.action,
+              path: mutationIntent.path,
+              completedAt: receipt.completedAt,
+              mutations: 0,
+            },
+          );
           metrics.mutationPersistence.receiptWrites++;
           metrics.mutationPersistence.stagesMs.receiptPersist +=
             Date.now() - receiptStartedAt;
@@ -9909,12 +9945,14 @@ export class SyncExecutor {
             );
             mutationRecovery = "applied";
           } catch (checkpointError) {
+            const checkpointDetail = checkpointError instanceof Error
+              ? checkpointError.message
+              : String(checkpointError);
+            const dbFingerprint = fingerprintIndexedDbError(checkpointError);
             this.diag?.warn(
               "execute",
               `recorded mutation checkpoint retry failed — ${activeIntent.path}`,
-              checkpointError instanceof Error
-                ? checkpointError.message
-                : String(checkpointError),
+              dbFingerprint ?? checkpointDetail,
             );
             mutationRecovery = "unresolved";
           }
@@ -10009,7 +10047,8 @@ export class SyncExecutor {
           return;
         }
         transferOutcome = transferMetrics ? "failed" : null;
-        this.diag?.error("execute", `[${position}/${total}] ${item.type} ${item.path} FAILED: ${e instanceof Error ? e.message : String(e)}`, errorDiagData(e));
+        const dbFingerprint = fingerprintIndexedDbError(e);
+        this.diag?.error("execute", `[${position}/${total}] ${item.type} ${item.path} FAILED: ${e instanceof Error ? e.message : String(e)}`, dbFingerprint ? { ...errorDiagData(e), ...dbFingerprint } : errorDiagData(e));
         // Auth failure at any file stops the entire pool immediately —
         // no point letting other workers continue with a dead token.
         if (isAuthFailure(e)) {
@@ -12409,6 +12448,24 @@ export class SyncExecutor {
             settled++;
             continue;
           }
+          const moveAwareReflection = await this.tryRetireMoveAwareReflectedUpload(
+            record,
+            recoveryEnvelope,
+            reflectedCheckpointRetirementCommitSeq,
+          );
+          if (moveAwareReflection === "retired") {
+            reflectedCheckpointRetirementCommitSeq = undefined;
+            receiptCommitted++;
+            settled++;
+            if (isAutomaticMerge) {
+              if (mergeRecovery) mergeRecovery.receiptCommitted++;
+              await this.getMergeReadyStore().complete(
+                record.intent.operationId,
+              );
+            }
+            continue;
+          }
+          this.logBlockedMutationEvidence(record);
           if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
           blocked.push({
             operationId: record.intent.operationId,
@@ -12473,6 +12530,7 @@ export class SyncExecutor {
       }
       if (!outcome) {
         if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
+        this.logBlockedMutationEvidence(record);
         blocked.push({
           operationId: record.intent.operationId,
           reason: "outcome-unresolved",
@@ -12984,6 +13042,126 @@ export class SyncExecutor {
     if (local.status !== "missing") return false;
     if (observationOnly) return false;
     return this.restoreReceiptedUploadLocal(intent.path, remote, base);
+  }
+
+  /**
+   * Move-aware reflection for one receipted upload whose object was moved
+   * elsewhere after the upload applied. Proves (fail-closed) that the upload
+   * landed and the observation already absorbed the object at its new path,
+   * then retires the record through the existing reflection path without
+   * replaying any remote entry (the reducer pairs base and remote by path, so
+   * a naive rebind would break the committed state model).
+   */
+  private async tryRetireMoveAwareReflectedUpload(
+    record: Readonly<MutationLedgerEntryV1>,
+    envelope: Readonly<SyncStateEnvelopeV2> | null,
+    reflectedCommitSeq: number | undefined,
+  ): Promise<"retired" | "not-applicable"> {
+    const intent = record.intent;
+    const checkpoint = record.receipt?.checkpoint;
+    if (
+      !checkpoint
+      || !envelope
+      || reflectedCommitSeq === undefined
+      || envelope.meta.commitSeq !== reflectedCommitSeq
+      || envelope.remoteIndex.complete !== true
+      || intent.action !== "upload"
+      || intent.stateEffect !== undefined
+      || checkpoint.remoteUpserts.length !== 1
+      || checkpoint.baseUpserts.length !== 1
+      || !sameSyncScope(intent.scope, envelope.scope)
+    ) return "not-applicable";
+    const upsert = checkpoint.remoteUpserts[0];
+    const base = checkpoint.baseUpserts[0];
+    const pathById = projectRemoteIndexV2(envelope.remoteIndex);
+    const currentPath = pathById.get(upsert.driveId);
+    const node = envelope.remoteIndex.itemsById[upsert.driveId];
+    if (
+      !currentPath
+      || !node
+      || node.kind !== "file"
+      || normalizeRemotePathKey(currentPath)
+        === normalizeRemotePathKey(intent.path)
+    ) return "not-applicable";
+    if (
+      node.eTag !== upsert.eTag
+      || node.size !== upsert.size
+      || (
+        upsert.sha256Hash !== undefined
+        && node.contentHash?.toLowerCase()
+          !== upsert.sha256Hash.toLowerCase()
+      )
+    ) return "not-applicable";
+    const anchor = Object.values(envelope.anchors.byAnchorId).find(
+      (candidate) =>
+        candidate.remoteId === upsert.driveId
+        && candidate.contentHash === base.hash
+        && candidate.size === base.size
+        && candidate.remoteETag === base.eTag
+        && normalizeRemotePathKey(candidate.lastPath)
+          === normalizeRemotePathKey(currentPath),
+    );
+    if (!anchor) return "not-applicable";
+    const local = await this.inspectLocalPath(intent.path);
+    if (!local || local.status !== "missing") return "not-applicable";
+    const moved = await this.onedrive.getDriveItemMetadataById(
+      upsert.driveId,
+      "downloadVersionVerify",
+    );
+    if (!moved || moved.eTag !== upsert.eTag) return "not-applicable";
+    const retired = await this.state.retireMutationCheckpointIfReflected(
+      intent.operationId,
+      reflectedCommitSeq,
+    );
+    if (!retired) return "not-applicable";
+    this.diag?.log(
+      "state",
+      `move-aware reflected upload retired — ${intent.path} → ${currentPath}`,
+      { operationId: intent.operationId, mutations: 0 },
+    );
+    return "retired";
+  }
+
+  /**
+   * Auxiliary evidence for a blocked upload: whether the remote object's
+   * lastModifiedDateTime predates the intent creation, and whether the
+   * receipted/expected remote identity now lives at a different path (moved
+   * after the operation). These are weak heuristics (client-settable
+   * timestamps, clock skew) and NEVER decide settlement on their own — they
+   * only enrich the diagnostic surface. The moved-elsewhere case is a known
+   * settlement candidate that still needs a move-aware checkpoint path; the
+   * current reducer pairs base and remote entries by path, so a naive rebind
+   * would break the committed state model (fail-closed keeps it blocked).
+   */
+  private logBlockedMutationEvidence(
+    record: Readonly<MutationLedgerEntryV1>,
+  ): void {
+    const intent = record.intent;
+    if (intent.action !== "upload" || !intent.expectedRemote.exists) return;
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!envelope) return;
+    const node = envelope.remoteIndex.itemsById[intent.expectedRemote.driveId];
+    const pathById = projectRemoteIndexV2(envelope.remoteIndex);
+    const currentPath = pathById.get(intent.expectedRemote.driveId);
+    const movedElsewhere = currentPath !== undefined
+      && normalizeRemotePathKey(currentPath)
+        !== normalizeRemotePathKey(intent.path);
+    if (!node && !movedElsewhere) return;
+    this.diag?.log(
+      "state",
+      "blocked upload evidence: remote mtime and current location",
+      {
+        operationId: intent.operationId,
+        intentCreatedAt: intent.createdAt,
+        remoteMtime: node?.mtime,
+        remoteMtimeOlderByMs:
+          node?.mtime === undefined
+            ? undefined
+            : intent.createdAt - node.mtime,
+        remoteCurrentPath: movedElsewhere ? currentPath : null,
+        mutations: 0,
+      },
+    );
   }
 
   /**
@@ -15910,6 +16088,7 @@ export class SyncExecutor {
       envelope: prepared.envelope,
       vaultName: this.vaultName,
       accountId: source.scope.accountId,
+      configDir: getConfigDir(this.scanner.vault),
       automaticHandlingPolicy,
       baselineReconstructionIncomplete: false,
       pendingContentComparisons: [],
@@ -16023,6 +16202,7 @@ export class SyncExecutor {
         expectedV3Slot,
       );
       this.throwIfSharedSyncProtocolOperationWasCancelled();
+      this.consecutiveSharedProtocolObservationFailures = 0;
       return {
         status: "ready",
         objects,
@@ -16031,18 +16211,20 @@ export class SyncExecutor {
       this.throwIfSharedSyncProtocolOperationWasCancelled();
       const failure = classifySharedSyncProtocolObservationFailure(error);
       throwIfSharedSyncProtocolObservationIsTerminal(failure);
-      return failure.retryable
-        ? {
-            status: "unavailable",
-            reason: failure.reason,
-            component: failure.component,
-          }
-        : {
-            status: "blocked",
-            reason: failure.reason === "control-directory-not-found"
-              ? "control-directory-not-found"
-              : "protocol-read-failed",
-          };
+      if (failure.retryable) {
+        this.consecutiveSharedProtocolObservationFailures += 1;
+        return {
+          status: "unavailable",
+          reason: failure.reason,
+          component: failure.component,
+        };
+      }
+      return {
+        status: "blocked",
+        reason: failure.reason === "control-directory-not-found"
+          ? "control-directory-not-found"
+          : "protocol-read-failed",
+      };
     }
   }
 
@@ -16253,6 +16435,7 @@ export class SyncExecutor {
         component: unavailable.component,
         ordinaryPlanning: result.runFacts?.ordinaryPlanning ?? "unknown",
         retry: "next-sync",
+        consecutiveFailures: this.consecutiveSharedProtocolObservationFailures,
       },
     );
     return result;
@@ -17432,6 +17615,7 @@ export class SyncExecutor {
       envelope: prepared.envelope,
       vaultName: this.vaultName,
       accountId: this.state.boundAccountId,
+      configDir: getConfigDir(this.scanner.vault),
       automaticHandlingPolicy,
       baselineReconstructionIncomplete: false,
       pendingContentComparisons: [],
@@ -18748,8 +18932,72 @@ export class SyncExecutor {
             throw new Error("Reviewed action scope no longer matches the current Graph scope");
           }
           preparationPhase = "mutationRecovery";
+          let isolatedRecoveryRecords: MutationLedgerEntryV1[] | null = null;
+          let recoveryBlockedError: MutationRecoveryBlockedError | null = null;
           if (!options?.skipMutationRecovery) {
-            await this.recoverMutationLedger(this.activeSyncScope);
+            try {
+              await this.recoverMutationLedger(this.activeSyncScope);
+            } catch (error) {
+              if (
+                !(error instanceof MutationRecoveryBlockedError)
+                || !this.activeSyncScope
+              ) throw error;
+              recoveryBlockedError = error;
+              const isolated = this.isolatableOrdinaryFileRecovery(
+                error.summary,
+                this.activeSyncScope,
+              );
+              if (isolated) {
+                isolatedRecoveryRecords = isolated;
+                this.diag?.log(
+                  "execute",
+                  "side action continues past isolated unresolved recovery records",
+                  {
+                    records: isolated.length,
+                    operationIds: isolated.map(
+                      (record) => record.intent.operationId,
+                    ),
+                    mutations: 0,
+                  },
+                );
+              } else if (error.summary.state === "network-unavailable") {
+                // Same semantics as the ordinary sync round: a retryable
+                // network outage must not freeze unrelated user actions; the
+                // recovery still owns its paths.
+                isolatedRecoveryRecords = structuredClone([
+                  ...this.state.mutationLedger,
+                ]);
+                this.diag?.warn(
+                  "execute",
+                  "side action continues during a mutation recovery network outage; protected paths stay frozen",
+                  {
+                    records: isolatedRecoveryRecords.length,
+                    mutations: 0,
+                  },
+                );
+              } else {
+                throw error;
+              }
+            }
+          }
+          // The reviewed action may only proceed when it does not overlap any
+          // unresolved recovery record; the record itself is untouched and
+          // keeps retrying in the background (SC-15: an unverifiable record
+          // blocks only same-path or subtree dependencies, never unrelated
+          // work). Overlapping actions keep the existing blocked notice.
+          if (
+            isolatedRecoveryRecords !== null
+            && this.isPathProtectedByIsolatedRecovery(
+              path,
+              isolatedRecoveryRecords,
+            )
+          ) {
+            this.handleSideActionPreparationFailure(
+              path,
+              preparationPhase,
+              recoveryBlockedError ?? new Error("Mutation recovery is blocked"),
+            );
+            return;
           }
           if (!this.canContinue(operationEpoch)) return;
           preparationPhase = "action";
@@ -19755,11 +20003,13 @@ function isPendingIssueAction(type: SyncActionType): boolean {
     || type === SyncActionType.RetryLater;
 }
 
-/** Unified auth failure check — covers OneDrive token expiry and AuthModule errors. */
-function isAuthFailure(error: unknown): boolean {
+/** Unified auth failure check — covers OneDrive token expiry and AuthModule
+ *  errors, excluding transient refresh NetworkErrors: those keep the session
+ *  logged in and retry later, so they must surface as ordinary failures, not
+ *  as an auth expiry that forces a re-login. */
+export function isAuthFailure(error: unknown): boolean {
   if (error instanceof OneDriveError && error.type === OneDriveErrorType.AuthExpired) return true;
-  if (error instanceof AuthError) return true;
-  return false;
+  return error instanceof AuthError && error.type !== AuthErrorType.NetworkError;
 }
 
 /**

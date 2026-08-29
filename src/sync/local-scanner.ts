@@ -30,7 +30,9 @@ import {
   type PluginScopeSelection,
 } from "./community-plugin-sync-policy";
 import type { DiagnosticLogger } from "./diagnostic-logger";
-const SCAN_CACHE_FORMAT = 1;
+const SCAN_CACHE_FORMAT = 2;
+const SCAN_CACHE_LEGACY_FORMAT = 1;
+const SCAN_CACHE_HISTORY_LIMIT = 16;
 const SCAN_SLEEP_EVERY = 50;
 
 interface ScanCacheEntry {
@@ -40,7 +42,17 @@ interface ScanCacheEntry {
   quickXorHash?: string;
   binary: boolean;
 }
-type ScanCache = { format: number; entries: Record<string, ScanCacheEntry>; };
+
+/** One prior per-path scan observation (the local change history seed). */
+export interface ScanCacheHistoryEntry extends ScanCacheEntry {
+  observedAt: number;
+}
+
+type ScanCache = {
+  format: number;
+  entries: Record<string, ScanCacheEntry>;
+  histories: Record<string, ScanCacheHistoryEntry[]>;
+};
 export interface LocalScanResult {
   entries: LocalFileEntry[];
   /** Read-only folder topology. It does not authorize folder mutations. */
@@ -438,7 +450,11 @@ export class LocalScanner {
   private readonly configDir: string;
   private config: ScanConfig;
   private diag?: DiagnosticLogger;
-  private scanCache: ScanCache = { format: SCAN_CACHE_FORMAT, entries: {} };
+  private scanCache: ScanCache = {
+    format: SCAN_CACHE_FORMAT,
+    entries: {},
+    histories: {},
+  };
   private scanCacheLoaded = false;
   private scanCacheDirty = false;
 
@@ -520,7 +536,10 @@ export class LocalScanner {
       const parsed: unknown = JSON.parse(json);
       if (
         isRecord(parsed)
-        && parsed.format === SCAN_CACHE_FORMAT
+        && (
+          parsed.format === SCAN_CACHE_FORMAT
+          || parsed.format === SCAN_CACHE_LEGACY_FORMAT
+        )
         && isRecord(parsed.entries)
       ) {
         this.scanCache = {
@@ -536,10 +555,17 @@ export class LocalScanner {
                 && typeof value.binary === "boolean";
             }),
           ),
+          histories: parsed.format === SCAN_CACHE_LEGACY_FORMAT
+            ? {}
+            : this.parseScanCacheHistories(parsed),
         };
       }
     } catch {
-      this.scanCache = { format: SCAN_CACHE_FORMAT, entries: {} };
+      this.scanCache = {
+        format: SCAN_CACHE_FORMAT,
+        entries: {},
+        histories: {},
+      };
     }
     this.scanCacheLoaded = true;
     this.scanCacheDirty = false;
@@ -557,11 +583,62 @@ export class LocalScanner {
   }
 
   async clearScanCache(): Promise<void> {
-    this.scanCache = { format: SCAN_CACHE_FORMAT, entries: {} };
+    this.scanCache = {
+      format: SCAN_CACHE_FORMAT,
+      entries: {},
+      histories: {},
+    };
     this.scanCacheLoaded = true;
     this.scanCacheDirty = false;
     const { scanCacheFile } = getEasySyncPaths(this.configDir, this.pluginId);
     try { await this.vault.adapter.remove(scanCacheFile); } catch { /* ok */ }
+  }
+
+  /**
+   * Prior per-path scan observations (newest last). This is the local change
+   * history seed: self-computed hash/size/mtime snapshots across sync rounds.
+   * History entries survive entry pruning so deleted files keep their last
+   * known facts. The chain is bounded per path and append-only across rounds.
+   */
+  pathHistory(path: string): readonly ScanCacheHistoryEntry[] {
+    return this.scanCache.histories[path] ?? [];
+  }
+
+  private parseScanCacheHistories(
+    parsed: Record<string, unknown>,
+  ): Record<string, ScanCacheHistoryEntry[]> {
+    const raw = parsed.histories;
+    if (!isRecord(raw)) return {};
+    const out: Record<string, ScanCacheHistoryEntry[]> = {};
+    for (const [path, list] of Object.entries(raw)) {
+      if (!Array.isArray(list)) continue;
+      const valid: ScanCacheHistoryEntry[] = [];
+      for (const value of list) {
+        if (
+          isRecord(value)
+          && typeof value.mtime === "number"
+          && typeof value.size === "number"
+          && typeof value.hash === "string"
+          && (value.quickXorHash === undefined
+            || typeof value.quickXorHash === "string")
+          && typeof value.binary === "boolean"
+          && typeof value.observedAt === "number"
+        ) {
+          valid.push({
+            mtime: value.mtime,
+            size: value.size,
+            hash: value.hash,
+            quickXorHash: value.quickXorHash,
+            binary: value.binary,
+            observedAt: value.observedAt,
+          });
+        }
+      }
+      if (valid.length > 0) {
+        out[path] = valid.slice(-SCAN_CACHE_HISTORY_LIMIT);
+      }
+    }
+    return out;
   }
 
   private cacheProbe(path: string, mtime: number, size: number): ScanCacheEntry | null {
@@ -588,6 +665,14 @@ export class LocalScanner {
       && current.binary === binary
     ) {
       return;
+    }
+    if (current) {
+      const history = this.scanCache.histories[path] ?? [];
+      history.push({ ...current, observedAt: Date.now() });
+      if (history.length > SCAN_CACHE_HISTORY_LIMIT) {
+        history.splice(0, history.length - SCAN_CACHE_HISTORY_LIMIT);
+      }
+      this.scanCache.histories[path] = history;
     }
     this.scanCache.entries[path] = { mtime, size, hash, quickXorHash, binary };
     this.scanCacheDirty = true;

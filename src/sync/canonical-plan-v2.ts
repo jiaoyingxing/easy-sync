@@ -168,6 +168,7 @@ export interface FinalizeCanonicalPlanInputV2 {
   envelope: SyncStateEnvelopeV2;
   vaultName: string;
   accountId: string;
+  configDir: string;
   automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
   baselineReconstructionIncomplete: boolean;
   pendingContentComparisons?: readonly PendingContentComparisonV2[];
@@ -220,6 +221,7 @@ export function buildCanonicalPlanCandidateFromStateV2(
     remoteEntries: fileFacts.remoteEntries,
     baseEntries: fileFacts.baseEntries,
     skippedLarge: input.skippedLarge.filter(includeFilePath),
+    configDir: input.configDir,
   });
 
   return composeCanonicalActionsV2({
@@ -1030,6 +1032,7 @@ export async function finalizeCanonicalPlanCandidateV2(
     const decision = classifyIdentityReplacementV2(
       replacement,
       remoteHash,
+      input.configDir,
     );
     if ("baseUpsert" in decision) {
       identityBaseUpserts.push(decision.baseUpsert);
@@ -1167,6 +1170,7 @@ export async function finalizeCanonicalPlanCandidateV2(
   items = applyAutomaticHandlingPolicy(
     items,
     input.automaticHandlingPolicy,
+    input.configDir,
   );
   items = bindCanonicalDecisionTokensV2(items, {
     envelope: input.envelope,
@@ -1209,6 +1213,7 @@ export async function finalizeCanonicalPlanCandidateV2(
 function classifyIdentityReplacementV2(
   replacement: CanonicalIdentityReplacementV2,
   remoteHash: string,
+  configDir: string,
 ): { baseUpsert: BaseFileEntry } | { item: SyncPlanItem } {
   const { local, remote, base, path } = replacement;
   const normalizedRemoteHash = remoteHash.toLowerCase();
@@ -1221,7 +1226,7 @@ function classifyIdentityReplacementV2(
   };
 
   if (!local) {
-    if (isObsidianManagedConfigPath(path)) {
+    if (isObsidianManagedConfigPath(path, configDir)) {
       return {
         item: {
           type: SyncActionType.Download,

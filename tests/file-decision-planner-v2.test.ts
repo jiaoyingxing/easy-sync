@@ -69,6 +69,7 @@ describe("V2 pure file decision planner", () => {
       remoteEntries: [],
       baseEntries: [base(path)],
       skippedLarge: [],
+    configDir: ".obsidian",
     });
 
     expect(generated.items).toEqual([
@@ -258,7 +259,10 @@ describe("V2 pure file decision planner", () => {
 
   it.each(classificationCases)("$name", ({ facts, expected }) => {
     const before = structuredClone(facts);
-    const plan = generateFileDecisionPlanV2(facts);
+    const plan = generateFileDecisionPlanV2({
+      ...facts,
+      configDir: ".obsidian",
+    });
 
     expect(plan.items).toHaveLength(expected.length);
     expected.forEach((item, index) => {
@@ -290,14 +294,20 @@ describe("V2 pure file decision planner", () => {
       ],
     };
 
-    expect(generateFileDecisionPlanV2(renameFacts).items).toEqual([
+    expect(generateFileDecisionPlanV2({
+      ...renameFacts,
+      configDir: ".obsidian",
+    }).items).toEqual([
       expect.objectContaining({
         type: SyncActionType.RenameRemote,
         path: "notes/new.md",
         renameFrom: "notes/old.md",
       }),
     ]);
-    expect(generateFileDecisionPlanV2(ambiguousFacts).items).toEqual([
+    expect(generateFileDecisionPlanV2({
+      ...ambiguousFacts,
+      configDir: ".obsidian",
+    }).items).toEqual([
       expect.objectContaining({
         type: SyncActionType.Upload,
         path: "notes/copy-a.md",
@@ -320,6 +330,7 @@ describe("V2 pure file decision planner", () => {
       remoteEntries: [remote("notes/old.md")],
       baseEntries: [base("notes/old.md")],
       skippedLarge: [],
+    configDir: ".obsidian",
     });
 
     // The remote old path stays a marked rename source, so it is never
@@ -359,6 +370,7 @@ describe("V2 pure file decision planner", () => {
         base("conflict.md"),
       ],
       skippedLarge: ["large.bin"],
+    configDir: ".obsidian",
     });
 
     expect(plan.items.map((item) => item.type)).toEqual([

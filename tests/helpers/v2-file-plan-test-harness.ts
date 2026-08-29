@@ -28,6 +28,7 @@ export class V2FilePlanTestHarness {
       remoteEntries,
       baseEntries,
       skippedLarge,
+    configDir: ".obsidian",
     });
   }
 

@@ -44,6 +44,7 @@ export interface FileDecisionFactsV2 {
   remoteEntries: readonly RemoteFileEntry[];
   baseEntries: readonly BaseFileEntry[];
   skippedLarge: readonly string[];
+  configDir: string;
 }
 
 /** Build a lookup map from path to the immutable input entry. */
@@ -76,7 +77,7 @@ const OBSIDIAN_MANAGED_CONFIG_FILES = new Set([
 
 export function isObsidianManagedConfigPath(
   path: string,
-  configDir = ".obsidian",
+  configDir: string,
 ): boolean {
   // These files are live host-owned state. Their absence is not a durable
   // delete signal, so the present side restores the missing side.
@@ -130,6 +131,7 @@ export function generateFileDecisionPlanV2(
     remoteEntries,
     baseEntries,
     skippedLarge,
+    configDir,
   } = facts;
   const localMap = toMap(localEntries);
   const remoteMap = toMap(remoteEntries);
@@ -223,7 +225,7 @@ export function generateFileDecisionPlanV2(
       continue;
     }
 
-    const item = classifyFileDecision(path, local, remote, base);
+    const item = classifyFileDecision(path, local, remote, base, configDir);
     if (item) plan.push(item);
   }
 
@@ -247,6 +249,7 @@ function classifyFileDecision(
   local: LocalFileEntry | undefined,
   remote: RemoteFileEntry | undefined,
   base: BaseFileEntry | undefined,
+  configDir: string,
 ): SyncPlanItem | null {
   if (!base) {
     if (local && remote) {
@@ -278,7 +281,7 @@ function classifyFileDecision(
   );
 
   if (!local && remote) {
-    if (isObsidianManagedConfigPath(path)) {
+    if (isObsidianManagedConfigPath(path, configDir)) {
       return { type: SyncActionType.Download, path, remote };
     }
     if (remoteChanged) {
@@ -298,7 +301,7 @@ function classifyFileDecision(
   }
 
   if (local && !remote) {
-    if (isObsidianManagedConfigPath(path)) {
+    if (isObsidianManagedConfigPath(path, configDir)) {
       return { type: SyncActionType.Upload, path, local };
     }
     if (localChanged) {

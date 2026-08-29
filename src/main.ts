@@ -161,6 +161,7 @@ import {
   normalizeCommunityPluginSyncSettings,
   readCommunityPluginSyncPolicy,
   sameCommunityPluginSyncPolicy,
+  stripPluginFromScopeSelection,
   type CommunityPluginRestoreSet,
   type CommunityPluginSyncPolicyV1,
   type PluginScopeSelection,
@@ -451,7 +452,7 @@ type ResetMutationRecoveryDisposition =
  */
 type StatusBarStatusGroup = Extract<
   RibbonStatus,
-  "loggedOut" | "attention" | "syncing" | "ready"
+  "loggedOut" | "attention" | "syncing" | "ready" | "offline"
 >;
 
 export class SyncPathSettingsUpdateError extends Error {
@@ -890,10 +891,20 @@ export default class EasySyncPlugin extends Plugin {
         // Device-code login: check the token endpoint immediately on return
         // instead of waiting for the next (possibly throttled) poll tick.
         void this.auth?.checkDeviceCodeNow();
+        // Silent token refresh: recover a session whose token expired during
+        // offline/sleep periods without waiting for the next sync round.
+        void this.auth?.refreshNowIfNeeded();
       }
     });
     this.registerDomEvent(window, "focus", () => {
       void this.auth?.checkDeviceCodeNow();
+      void this.auth?.refreshNowIfNeeded();
+    });
+    this.registerDomEvent(window, "online", () => {
+      // Connectivity restored (e.g. laptop wake or network reconnection):
+      // give the silent token refresh a fresh chance immediately, clearing
+      // any transient backoff.
+      void this.auth?.refreshNowIfNeeded(true);
     });
     this.startAutoSync();
 
@@ -1253,6 +1264,28 @@ export default class EasySyncPlugin extends Plugin {
     this.mutationRecoveryBlockReason = null;
     await this.startManualSync();
     return true;
+  }
+
+  /**
+   * User-authorized forced reset: the single last-resort escape for
+   * recoveries that cannot converge on their own (the abandoned-operation
+   * exit was retired; see DECISIONS 2026-08-29 提示与出口收束).
+   */
+  private async confirmForcedReset(): Promise<boolean> {
+    const t = this.i18n.t.bind(this.i18n);
+    return new ConfirmModal(
+      this.app,
+      t("settings.reset.forceTitle"),
+      null,
+      t("settings.reset.forceConfirm"),
+      t("confirm.cancel"),
+      t,
+      {
+        message: t("settings.reset.forceMessage"),
+        warning: t("settings.reset.forceWarning"),
+        danger: true,
+      },
+    ).awaitConfirm();
   }
 
   restoreReviewedEmptyFolder(
@@ -2482,18 +2515,28 @@ export default class EasySyncPlugin extends Plugin {
     try {
       await this.ensureStateLoaded();
       let isolatedRecoveries: ConservativeResetEntries | null = null;
+      let forceReset = false;
       if (this.hasResetBlockingRecovery()) {
         const disposition = await this.settleResetBlockingRecovery();
         if (disposition.kind === "blocked") {
-          this.showMutationRecoveryResetBlockedNotice();
-          return;
+          // Third tier: the conservative preflight cannot settle the
+          // unresolved evidence. Instead of aborting (a reset dead-end in the
+          // exact field where reset is needed most), disclose consequences
+          // and let the user authorize a forced reset. Remote data is never
+          // touched; only local tracking is terminated (audited).
+          if (!await this.confirmForcedReset()) {
+            return;
+          }
+          forceReset = true;
         }
         if (disposition.kind === "isolated") {
           isolatedRecoveries = disposition.entries;
         }
       }
       try {
-        if (isolatedRecoveries) {
+        if (forceReset) {
+          await this.state?.forceReset();
+        } else if (isolatedRecoveries) {
           await this.state?.resetPreservingIsolatedMutationRecovery(
             isolatedRecoveries,
           );
@@ -3069,7 +3112,10 @@ export default class EasySyncPlugin extends Plugin {
         skippedLarge: result.skippedLarge,
         skippedIgnored: result.skippedIgnored,
         skippedInvalidName: result.skippedInvalidName,
-        errors: result.errors,
+        // Retryable-observation rounds are presented as neutral entries without
+        // failure counts; executor result.errors stays untouched (classifier
+        // contract requires errors > 0 on the result itself).
+        errors: status === "retry-pending" ? 0 : result.errors,
         message: result.message,
         files: [...progress.completedFiles],
         uploadBytes: result.metrics?.uploadBytes,
@@ -3208,6 +3254,7 @@ export default class EasySyncPlugin extends Plugin {
         ?? null,
       blockReason,
       blockedOperationId,
+      paused: this.autoSyncPaused,
       manualResolutionAvailable: kind === "blocked"
         && blockReason === "facts-changed"
         && this.syncExecutor?.canResolveMutationRecovery(
@@ -3401,9 +3448,18 @@ export default class EasySyncPlugin extends Plugin {
 
   private showMutationRecoveryBlockedNotice(): void {
     if (this.shouldSuppressSyncNotice()) return;
+    // Honest, action-aware copy: point at the real entry when a keep-side
+    // review exists, at the real account action when the account changed,
+    // and at the honest status otherwise. No generic "please handle" prompt.
+    const display = this.getMutationRecoveryDisplayState();
+    const key = display?.manualResolutionAvailable
+      ? "notice.sync.recoveryBlockedReview"
+      : display?.blockReason === "account-changed"
+        ? "notice.sync.recoveryAccountChanged"
+        : "notice.sync.recoveryBlocked";
     this.noticeCenter.show({
       key: "sync-result:recovery-blocked",
-      message: this.i18n.t("notice.sync.recoveryBlocked"),
+      message: this.i18n.t(key),
       priority: NOTICE_PRIORITY.attention,
       durationMs: 8_000,
       className: "easy-sync-notice-result",
@@ -3417,6 +3473,13 @@ export default class EasySyncPlugin extends Plugin {
     this.mutationRecoveryBlockReason = reason;
     this.autoSyncPaused = true;
     this.stopAutoSync();
+    // Structured, persisted failure evidence: every pause reason lands in the
+    // diagnostic log instead of existing only as a transient UI state.
+    this.diag.warn("execute", "mutation recovery paused (persisted reason)", {
+      reason,
+      remaining: this.state?.mutationLedger?.length ?? 0,
+      mutations: 0,
+    });
     try {
       await this.saveSyncSettings();
     } catch (error) {
@@ -4699,6 +4762,18 @@ export default class EasySyncPlugin extends Plugin {
     const markers = this.readCommunityPluginCloudCleanupMarkers();
     markers.push({ pluginId, cleanedAt: Date.now() });
     this.writeCommunityPluginCloudCleanupMarkers(markers);
+    try {
+      await this.excludeCommunityPluginFromSyncPolicy(pluginId);
+    } catch (error) {
+      // The cloud objects are already deleted; a local policy update failure
+      // must not turn a successful cleanup into a reported failure. The
+      // excluded row and counts catch up on the next inventory refresh.
+      this.diag?.warn(
+        "state",
+        "cloud cleanup succeeded but the local plugin sync policy could not be updated",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
     this.noticeCenter.show({
       key: `cloud-cleanup:done:${pluginId}`,
       message: this.i18n.t("notice.communityPlugins.cloudCleanupDone", {
@@ -4708,6 +4783,27 @@ export default class EasySyncPlugin extends Plugin {
       className: "easy-sync-notice-action",
     });
     return true;
+  }
+
+  /**
+   * Cloud-cleanup thorough removal: drop the plugin from both sides of the
+   * local community-plugin sync policy (files and data) so its rows disappear
+   * and counts stop including it. Cloud data.json and local data files are
+   * untouched; a local reinstall re-shows the row (no permanent blocklist).
+   */
+  private async excludeCommunityPluginFromSyncPolicy(
+    pluginId: string,
+  ): Promise<void> {
+    const policy = cloneCommunityPluginSyncPolicy(
+      this.communityPluginSyncPolicy,
+    );
+    policy.files = stripPluginFromScopeSelection(policy.files, pluginId);
+    policy.data = stripPluginFromScopeSelection(policy.data, pluginId);
+    await this.updateSyncPathSettings({
+      syncCommunityPlugins: this.syncCommunityPlugins,
+      syncPluginData: this.syncPluginData,
+      communityPluginSyncPolicy: policy,
+    });
   }
 
   private readCommunityPluginCloudCleanupMarkers():
@@ -6316,7 +6412,7 @@ export default class EasySyncPlugin extends Plugin {
       lines.push("|------|------|------|----------------|------|------|------|----------|------------|------------|------------|----------|------|------------------|------|-----------|------|");
       for (const h of history) {
         const mode = h.mode === "manual" ? "手动" : h.mode === "auto" ? "自动" : "首次";
-        const statusMap: Record<string, string> = { success: "已完成", partial: "部分完成", cancelled: "已取消", authExpired: "登录过期", failed: "失败" };
+        const statusMap: Record<string, string> = { success: "已完成", partial: "部分完成", cancelled: "已取消", authExpired: "登录过期", failed: "失败", "retry-pending": "稍后重试" };
         const status = statusMap[h.status] ?? h.status;
         const duration = h.endedAt > 0 && h.startedAt > 0 ? `${Math.round((h.endedAt - h.startedAt) / 1000)}s` : "—";
         const skipLarge = h.skippedLarge ?? 0;
@@ -6787,6 +6883,20 @@ export default class EasySyncPlugin extends Plugin {
     }
 
     const lastSync = this.state?.lastSyncTime;
+    const latestRound = this.state?.syncHistory?.[0];
+    if (latestRound?.status === "retry-pending") {
+      // The latest round was a retry-pending observation (network unavailable
+      // before ordinary planning). A green "last sync" here would mislead the
+      // user into believing the vault is currently in sync; show an offline
+      // hint instead. The next healthy round returns to the ready state.
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.offline,
+        "offline",
+        t("status.offline"),
+      );
+      return;
+    }
     if (lastSync) {
       this.renderStatusBarItem(
         this.statusBarEl,

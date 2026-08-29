@@ -1918,6 +1918,74 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     expect(warningText).toContain("HTTP status unavailable");
     expect(warningText).not.toContain("status=0");
   });
+
+  it("records the CDN failure stage, bare host and elapsed time on a slot content read transport failure", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementation(async (options) => {
+        const url = String(options.url);
+        if (url.includes(".easy-sync:/children")) {
+          return {
+            status: 200,
+            headers: {},
+            json: {
+              value: [
+                {
+                  id: "protocol-v2-id",
+                  name: "protocol-v2.json",
+                  size: 21,
+                  eTag: "protocol-v2-etag",
+                  file: {},
+                  "@microsoft.graph.downloadUrl":
+                    "https://download.example/protocol-v2.json",
+                },
+                {
+                  id: "protocol-v3-id",
+                  name: "protocol-v3.json",
+                  size: 21,
+                  eTag: "protocol-v3-etag",
+                  file: {},
+                  "@microsoft.graph.downloadUrl":
+                    "https://download.example/protocol-v3.json",
+                },
+              ],
+            },
+          } as never;
+        }
+        throw Object.assign(
+          new Error("getaddrinfo ENOTFOUND download.example"),
+          { status: 0 },
+        );
+      });
+    const diag = { log: vi.fn(), warn: vi.fn() };
+    const client = new OneDriveClient(async () => "token", diag as never);
+
+    const observed = client.readSharedSyncProtocolObjects("testVault")
+      .then(
+        () => ({ error: null }),
+        (error: unknown) => ({ error }),
+      );
+    const { error } = await observed;
+
+    expect(error).toBeInstanceOf(SharedSyncProtocolObservationError);
+    expect((error as SharedSyncProtocolObservationError).observationCause)
+      .toMatchObject({
+        type: OneDriveErrorType.NetworkError,
+        statusCode: 0,
+      });
+    // Directory listing plus one content request per slot; both slot reads
+    // fail natively and no fallback is dispatched (observation-time binding).
+    expect(requestSpy).toHaveBeenCalledTimes(3);
+    expect(diag.warn).toHaveBeenCalledWith(
+      "onedrive",
+      expect.stringContaining("request transport failed — HTTP status unavailable"),
+      expect.objectContaining({
+        stage: "dns",
+        host: "download.example",
+        component: "v2",
+        elapsedMs: expect.any(Number),
+      }),
+    );
+  });
 });
 
 describe("OneDriveClient.moveItemById", () => {
