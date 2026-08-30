@@ -2216,6 +2216,93 @@ describe("sync view attention presentation", () => {
     })).toEqual({ status: "syncing", label: "验证文件一致性…" });
   });
 
+  it("shows stage-level short statuses in the fixed top for every non-executing phase", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as {
+      plugin: { i18n: I18n };
+      getStatusPresentation: (state: Record<string, unknown>) => {
+        status: string;
+        label: string;
+      };
+    };
+    view.plugin = { i18n: new I18n("zh-cn") };
+
+    const cases: Array<{ phase: string; current?: number; total?: number; label: string }> = [
+      { phase: "scanning", label: "扫描本机文件…" },
+      { phase: "preparing", label: "准备云端存储…" },
+      { phase: "baseline", label: "加载云端基线…" },
+      { phase: "checking", label: "检查云端变更…" },
+      { phase: "planning", label: "生成同步计划…" },
+      { phase: "verifying", current: 3, total: 7, label: "验证文件一致性…" },
+    ];
+
+    for (const entry of cases) {
+      expect(view.getStatusPresentation({
+        isLoggedIn: true,
+        isInitializing: false,
+        isPending: false,
+        isRunning: true,
+        lastSyncTime: 0,
+        pendingCount: 0,
+        planReviewActive: false,
+        autoSyncPaused: false,
+        mutationRecovery: null,
+        progress: {
+          phase: entry.phase,
+          current: entry.current ?? 0,
+          total: entry.total ?? 0,
+          cancelRequested: false,
+        },
+      })).toEqual({ status: "syncing", label: entry.label });
+    }
+  });
+
+  it("keeps executing with an exact action generic in the fixed top status", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as {
+      plugin: { i18n: I18n };
+      getStatusPresentation: (state: Record<string, unknown>) => {
+        status: string;
+        label: string;
+      };
+    };
+    view.plugin = { i18n: new I18n("zh-cn") };
+
+    // Even with an exact action in flight, the fixed top stays generic:
+    // exact action labels belong to Notice / Ribbon / progress body (S4).
+    expect(view.getStatusPresentation({
+      isLoggedIn: true,
+      isInitializing: false,
+      isPending: false,
+      isRunning: true,
+      lastSyncTime: 0,
+      pendingCount: 0,
+      planReviewActive: false,
+      autoSyncPaused: false,
+      mutationRecovery: null,
+      progress: {
+        phase: "executing",
+        currentActionType: SyncActionType.Upload,
+        cancelRequested: false,
+      },
+    })).toEqual({ status: "syncing", label: "同步进行中…" });
+
+    // Executing without an exact action stays generic as well.
+    expect(view.getStatusPresentation({
+      isLoggedIn: true,
+      isInitializing: false,
+      isPending: false,
+      isRunning: true,
+      lastSyncTime: 0,
+      pendingCount: 0,
+      planReviewActive: false,
+      autoSyncPaused: false,
+      mutationRecovery: null,
+      progress: {
+        phase: "executing",
+        cancelRequested: false,
+      },
+    })).toEqual({ status: "syncing", label: "同步进行中…" });
+  });
+
   it("shows the current state as synced after resolved decisions release their pause", () => {
     const view = Object.create(EasySyncSyncView.prototype) as {
       plugin: { i18n: I18n };

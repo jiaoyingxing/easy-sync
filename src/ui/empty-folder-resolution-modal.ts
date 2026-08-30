@@ -1,5 +1,6 @@
 import { ButtonComponent, Modal, Setting, type App } from "obsidian";
 import type { I18nFn } from "./confirm-modal";
+import { applyDestructiveButton } from "./destructive-button";
 import type {
   EmptyFolderResolutionSnapshotV1,
   FolderLocationResolutionSnapshotV1,
@@ -98,9 +99,8 @@ export class EmptyFolderResolutionModal extends Modal {
         ? this.t("syncView.emptyFolder.deleteDescription")
         : this.t("syncView.emptyFolder.deleteUnavailableDescription"));
     if (this.snapshot.remoteCTag) {
-      deleteSetting.addButton((button) => button
+      deleteSetting.addButton((button) => applyDestructiveButton(button)
         .setButtonText(this.t("syncView.emptyFolder.deleteConfirm"))
-        .setWarning()
         .onClick(() => this.finish({ action: "delete" })));
     }
 
@@ -183,9 +183,8 @@ export class EmptyFolderResolutionModal extends Modal {
         ? this.t("syncView.folderSubtree.deleteDescription")
         : this.t("syncView.folderSubtree.deleteUnavailableDescription"));
     if (root?.remoteCTag) {
-      deleteSetting.addButton((button) => button
+      deleteSetting.addButton((button) => applyDestructiveButton(button)
         .setButtonText(this.t("syncView.folderSubtree.delete"))
-        .setWarning()
         .onClick(() => this.finish({ action: "delete-subtree" })));
     }
     const actions = contentEl.createDiv(

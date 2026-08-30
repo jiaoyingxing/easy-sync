@@ -35,6 +35,7 @@ import {
 } from "../sync/sync-progress";
 import type { PendingIssue, SyncHistoryEntry } from "../sync/state-manager";
 import { ConfirmModal } from "./confirm-modal";
+import { applyDestructiveButton } from "./destructive-button";
 import { EmptyFolderResolutionModal } from "./empty-folder-resolution-modal";
 import { ConflictDetailModal } from "./conflict-detail-modal";
 import { MutationRecoveryResolutionModal } from "./mutation-recovery-resolution-modal";
@@ -1614,7 +1615,11 @@ export class EasySyncSyncView extends ItemView {
       case "cancelling":
         return { status, label: t("syncView.cancelling") };
       case "syncing":
-        if (state.progress.phase === "verifying") {
+        if (state.progress.phase !== "executing") {
+          // Stage-level short status (scanning / preparing / baseline /
+          // checking / planning / verifying). Exact per-action labels stay
+          // out of the fixed top (S4 boundary): executing falls through to
+          // the generic running status below.
           return {
             status,
             label: translateSyncActivity(
@@ -1807,9 +1812,11 @@ export class EasySyncSyncView extends ItemView {
       const paths = pendingDeletes.map((item) => item.path);
       const actions = section.createDiv("easy-sync-plan-execute");
       actions.addClass("easy-sync-primary-actions");
-      new ButtonComponent(actions)
+      const confirmAllButton = applyDestructiveButton(
+        new ButtonComponent(actions),
+      );
+      confirmAllButton
         .setButtonText(t("syncView.delete.confirmAll", { count: paths.length }))
-        .setWarning()
         .onClick(() => {
           void this.runItemAction(actions, async () => {
             const confirmed = await new ConfirmModal(
