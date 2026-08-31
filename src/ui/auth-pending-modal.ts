@@ -11,7 +11,8 @@
  * rather than a button that silently does nothing.
  */
 
-import { Modal, type App } from "obsidian";
+import { type App } from "obsidian";
+import { EasySyncModal } from "./easy-sync-modal";
 
 export type PendingModalResult =
   | { action: "recheck" }
@@ -19,7 +20,7 @@ export type PendingModalResult =
   | { action: "cancel" }
   | { action: "dismiss" };
 
-export class AuthPendingModal extends Modal {
+export class AuthPendingModal extends EasySyncModal {
   private resolve: ((value: PendingModalResult) => void) | null = null;
 
   constructor(

@@ -14,7 +14,7 @@
  * "generate a new code" recovery.
  */
 
-import { Modal, type App } from "obsidian";
+import { type App } from "obsidian";
 import {
   compatClearInterval,
   compatSetInterval,
@@ -26,6 +26,7 @@ import {
   NOTICE_PRIORITY,
   type EasySyncNoticeCenter,
 } from "./notice-center";
+import { EasySyncModal } from "./easy-sync-modal";
 
 export interface AuthDeviceCodeModalDeps {
   auth: AuthModule;
@@ -33,7 +34,7 @@ export interface AuthDeviceCodeModalDeps {
   t: (key: string, params?: Record<string, string | number>) => string;
 }
 
-export class AuthDeviceCodeModal extends Modal {
+export class AuthDeviceCodeModal extends EasySyncModal {
   private renderTimer: IntervalHandle | null = null;
   private countdownEl: HTMLElement | null = null;
   private renderedCode = "";

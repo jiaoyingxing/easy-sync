@@ -1,7 +1,6 @@
 import {
   ExtraButtonComponent,
   FuzzySuggestModal,
-  Modal,
   Notice,
   Setting,
   TFolder,
@@ -9,6 +8,7 @@ import {
 import type EasySyncPlugin from "../main";
 import { SyncPathSettingsUpdateError } from "../main";
 import { getConfigDir } from "../obsidian-compat";
+import { EasySyncModal } from "./easy-sync-modal";
 import {
   isPathExcludedByFolders,
   normalizeExcludedFolders,
@@ -155,7 +155,7 @@ export async function updateExcludedFoldersFromUi(
   }
 }
 
-export class SyncExclusionModal extends Modal {
+export class SyncExclusionModal extends EasySyncModal {
   private saving = false;
   private initialized = false;
   private closed = false;
@@ -249,15 +249,34 @@ export class SyncExclusionModal extends Modal {
 
     if (this.plugin.excludedFolders.length === 0) {
       folderSetting.setDesc(t("settings.syncExclusion.empty"));
-      return;
+    } else {
+      const chipsEl = folderSetting.descEl.createDiv();
+      renderExcludedFolderChips(chipsEl, this.plugin.excludedFolders, {
+        disabled: this.saving,
+        removeLabel: (path) => t("settings.syncExclusion.removeFolder", { path }),
+        onRemove: (path) => this.removeFolder(path),
+      });
     }
 
-    const chipsEl = folderSetting.descEl.createDiv();
-    renderExcludedFolderChips(chipsEl, this.plugin.excludedFolders, {
-      disabled: this.saving,
-      removeLabel: (path) => t("settings.syncExclusion.removeFolder", { path }),
-      onRemove: (path) => this.removeFolder(path),
-    });
+    new Setting(this.contentEl)
+      .setName(t("settings.maxFileSize.name"))
+      .setDesc(t("settings.maxFileSize.desc", { size: `${this.plugin.syncMaxFileSizeMb} MB` }))
+      .addSlider((slider) => {
+        slider
+          .setLimits(200, 2000, 100)
+          .setValue(this.plugin.syncMaxFileSizeMb)
+          .onChange(async (value) => {
+            this.plugin.syncMaxFileSizeMb = value;
+            await this.plugin.saveSyncSettings();
+            this.plugin.applyMaxFileSize();
+            const desc = slider.sliderEl
+              .closest(".setting-item")
+              ?.querySelector(".setting-item-description");
+            if (desc) {
+              desc.textContent = t("settings.maxFileSize.desc", { size: `${value} MB` });
+            }
+          });
+      });
   }
 
   private async addFolder(path: string): Promise<void> {

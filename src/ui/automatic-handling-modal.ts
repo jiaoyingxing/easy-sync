@@ -1,7 +1,8 @@
-import { Modal, Setting } from "obsidian";
+import { Setting } from "obsidian";
 import type EasySyncPlugin from "../main";
+import { EasySyncModal } from "./easy-sync-modal";
 
-export class AutomaticHandlingModal extends Modal {
+export class AutomaticHandlingModal extends EasySyncModal {
   constructor(private plugin: EasySyncPlugin) {
     super(plugin.app);
   }

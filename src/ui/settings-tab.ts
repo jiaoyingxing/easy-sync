@@ -22,6 +22,7 @@ import {
   resolveAuthEntryPresentation,
 } from "./auth-entry-flow";
 import { AutomaticHandlingModal } from "./automatic-handling-modal";
+import { AutoSyncModal } from "./auto-sync-modal";
 import { ConfigSyncModal } from "./config-sync-modal";
 import { ConfirmModal, type I18nFn } from "./confirm-modal";
 import {
@@ -334,28 +335,6 @@ export class EasySyncSettingTab extends PluginSettingTab {
         });
       }
     });
-
-    rangeGroup.addSetting((setting) => {
-      setting
-        .setName(t("settings.maxFileSize.name"))
-        .setDesc(t("settings.maxFileSize.desc", { size: `${this.plugin.syncMaxFileSizeMb} MB` }))
-        .addSlider((slider) => {
-          slider
-              .setLimits(200, 2000, 100)
-              .setValue(this.plugin.syncMaxFileSizeMb)
-              .onChange(async (value) => {
-              this.plugin.syncMaxFileSizeMb = value;
-              await this.plugin.saveSyncSettings();
-              this.plugin.applyMaxFileSize();
-              const desc = slider.sliderEl
-                .closest(".setting-item")
-                ?.querySelector(".setting-item-description");
-              if (desc) {
-                desc.textContent = t("settings.maxFileSize.desc", { size: `${value} MB` });
-              }
-            });
-        });
-    });
   }
 
   private renderAutomaticSection(
@@ -363,10 +342,6 @@ export class EasySyncSettingTab extends PluginSettingTab {
   ): void {
     if (!this.automaticSectionEl) return;
     this.automaticSectionEl.empty();
-    const describeAutoSyncChangeDelay = (seconds: number): string =>
-      seconds === 0
-        ? t("settings.autoSyncChangeDelay.disabledDesc")
-        : t("settings.autoSyncChangeDelay.desc", { seconds });
     const automaticGroup = new SettingGroup(this.automaticSectionEl).setHeading(
       t("settings.group.automatic"),
     );
@@ -397,8 +372,21 @@ export class EasySyncSettingTab extends PluginSettingTab {
             ? t("settings.autoSync.desc.disabled")
             : this.plugin.autoSyncPaused
               ? t("settings.autoSync.desc.paused")
-              : t("settings.autoSync.desc.enabled", { minutes: this.plugin.syncInterval }),
+              : t("settings.autoSync.desc.enabled"),
         )
+        .addButton((button) => {
+          button
+            .setIcon("settings")
+            .setTooltip(t("settings.autoSync.open"))
+            .onClick(() => {
+              new AutoSyncModal(this.plugin).open();
+            });
+          button.buttonEl.addClass("clickable-icon");
+          button.buttonEl.setAttribute(
+            "aria-label",
+            t("settings.autoSync.open"),
+          );
+        })
         .addToggle((toggle) => {
           toggle
             .setValue(this.plugin.syncInterval > 0)
@@ -411,53 +399,6 @@ export class EasySyncSettingTab extends PluginSettingTab {
             });
         });
     });
-
-    if (this.plugin.syncInterval > 0) {
-      automaticGroup.addSetting((setting) => {
-        setting
-          .setName(t("settings.syncInterval.name"))
-          .setDesc(t("settings.syncInterval.desc", { minutes: this.plugin.syncInterval }))
-          .addSlider((slider) => {
-            slider
-              .setLimits(3, 10, 1)
-              .setValue(this.plugin.syncInterval)
-              .onChange(async (value) => {
-                this.plugin.syncInterval = value;
-                await this.plugin.saveSyncSettings();
-                this.plugin.restartAutoSync();
-                const desc = slider.sliderEl
-                  .closest(".setting-item")
-                  ?.querySelector(".setting-item-description");
-                if (desc) {
-                  desc.textContent = t("settings.syncInterval.desc", { minutes: value });
-                }
-              });
-          });
-      });
-
-      automaticGroup.addSetting((setting) => {
-        setting
-          .setName(t("settings.autoSyncChangeDelay.name"))
-          .setDesc(describeAutoSyncChangeDelay(
-            this.plugin.autoSyncChangeDelaySeconds,
-          ))
-          .addSlider((slider) => {
-            slider
-              .setLimits(0, 10, 1)
-              .setValue(this.plugin.autoSyncChangeDelaySeconds)
-              .onChange(async (value) => {
-                this.plugin.setAutoSyncChangeDelaySeconds(value);
-                await this.plugin.saveSyncSettings();
-                const desc = slider.sliderEl
-                  .closest(".setting-item")
-                  ?.querySelector(".setting-item-description");
-                if (desc) {
-                  desc.textContent = describeAutoSyncChangeDelay(value);
-                }
-              });
-          });
-      });
-    }
   }
 
   private renderDisplaySection(
@@ -787,27 +728,6 @@ export function buildSettingDefinitions(
             }
           },
         },
-        {
-          name: t("settings.maxFileSize.name"),
-          desc: t("settings.maxFileSize.desc", { size: `${plugin.syncMaxFileSizeMb} MB` }),
-          render: (setting) => {
-            setting.addSlider((slider) => {
-              slider.setLimits(200, 2000, 100)
-                .setValue(plugin.syncMaxFileSizeMb)
-                .onChange(async (value) => {
-                  plugin.syncMaxFileSizeMb = value;
-                  await plugin.saveSyncSettings();
-                  plugin.applyMaxFileSize();
-                  const desc = slider.sliderEl
-                    .closest(".setting-item")
-                    ?.querySelector(".setting-item-description");
-                  if (desc) {
-                    desc.textContent = t("settings.maxFileSize.desc", { size: `${value} MB` });
-                  }
-                });
-            });
-          },
-        },
       ],
     },
     {
@@ -826,7 +746,22 @@ export function buildSettingDefinitions(
         },
         {
           name: t("settings.autoSync.name"),
+          desc: plugin.syncInterval === 0
+            ? t("settings.autoSync.desc.disabled")
+            : plugin.autoSyncPaused
+              ? t("settings.autoSync.desc.paused")
+              : t("settings.autoSync.desc.enabled"),
           render: (setting) => {
+            setting.addButton((button) => {
+              button.setIcon("settings")
+                .setTooltip(t("settings.autoSync.open"))
+                .onClick(() => { new AutoSyncModal(plugin).open(); });
+              button.buttonEl.addClass("clickable-icon");
+              button.buttonEl.setAttribute(
+                "aria-label",
+                t("settings.autoSync.open"),
+              );
+            });
             setting.addToggle((toggle) => {
               toggle.setValue(plugin.syncInterval > 0)
                 .onChange(async (value) => {
@@ -835,55 +770,6 @@ export function buildSettingDefinitions(
                   await plugin.saveSyncSettings();
                   plugin.restartAutoSync();
                   onStateChanged?.();
-                });
-            });
-          },
-        },
-        {
-          // Mirror renderAutomaticSection: the interval sliders only exist
-          // while auto sync is enabled.
-          name: t("settings.syncInterval.name"),
-          desc: t("settings.syncInterval.desc", { minutes: plugin.syncInterval }),
-          visible: () => plugin.syncInterval > 0,
-          render: (setting) => {
-            setting.addSlider((slider) => {
-              slider.setLimits(3, 10, 1)
-                .setValue(plugin.syncInterval)
-                .onChange(async (value) => {
-                  plugin.syncInterval = value;
-                  await plugin.saveSyncSettings();
-                  plugin.restartAutoSync();
-                  const desc = slider.sliderEl
-                    .closest(".setting-item")
-                    ?.querySelector(".setting-item-description");
-                  if (desc) {
-                    desc.textContent = t("settings.syncInterval.desc", { minutes: value });
-                  }
-                });
-            });
-          },
-        },
-        {
-          name: t("settings.autoSyncChangeDelay.name"),
-          desc: plugin.autoSyncChangeDelaySeconds === 0
-            ? t("settings.autoSyncChangeDelay.disabledDesc")
-            : t("settings.autoSyncChangeDelay.desc", { seconds: plugin.autoSyncChangeDelaySeconds }),
-          visible: () => plugin.syncInterval > 0,
-          render: (setting) => {
-            setting.addSlider((slider) => {
-              slider.setLimits(0, 10, 1)
-                .setValue(plugin.autoSyncChangeDelaySeconds)
-                .onChange(async (value) => {
-                  plugin.setAutoSyncChangeDelaySeconds(value);
-                  await plugin.saveSyncSettings();
-                  const desc = slider.sliderEl
-                    .closest(".setting-item")
-                    ?.querySelector(".setting-item-description");
-                  if (desc) {
-                    desc.textContent = value === 0
-                      ? t("settings.autoSyncChangeDelay.disabledDesc")
-                      : t("settings.autoSyncChangeDelay.desc", { seconds: value });
-                  }
                 });
             });
           },

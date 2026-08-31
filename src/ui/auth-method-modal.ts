@@ -9,7 +9,8 @@
  * device login fires its request there) before the modal closes.
  */
 
-import { Modal, Platform, setIcon, type App } from "obsidian";
+import { Platform, setIcon, type App } from "obsidian";
+import { EasySyncModal } from "./easy-sync-modal";
 
 export type AuthMethodResult =
   | { action: "browser" }
@@ -21,7 +22,7 @@ export interface AuthMethodOptionView {
   description: string;
 }
 
-export class AuthMethodModal extends Modal {
+export class AuthMethodModal extends EasySyncModal {
   private resolve: ((value: AuthMethodResult) => void) | null = null;
   private finished = false;
   private busy = false;

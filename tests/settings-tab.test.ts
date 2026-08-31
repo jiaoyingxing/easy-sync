@@ -75,6 +75,7 @@ describe("buildSettingsSyncButtonState", () => {
 
   it("keeps account actions unheaded and separates range from automatic settings", () => {
     const source = readFileSync("src/ui/settings-tab.ts", "utf8");
+    const autoSyncModalSource = readFileSync("src/ui/auto-sync-modal.ts", "utf8");
     const displayStart = source.indexOf("  display(): void {");
     const refreshStart = source.indexOf("  refreshAuthState(): void {", displayStart);
     const displaySource = source.slice(displayStart, refreshStart);
@@ -85,9 +86,6 @@ describe("buildSettingsSyncButtonState", () => {
     const accountSection = source.slice(accountSectionStart, rangeSectionStart);
     const rangeSection = source.slice(rangeSectionStart, automaticSectionStart);
     const automaticSection = source.slice(automaticSectionStart, aboutSectionStart);
-    const enabledTriggerSettings = automaticSection.slice(
-      automaticSection.indexOf("if (this.plugin.syncInterval > 0)"),
-    );
 
     expect(displaySource.indexOf("this.renderAccountSection(t)")).toBeLessThan(
       displaySource.indexOf("this.renderRangeSection(t)"),
@@ -103,7 +101,8 @@ describe("buildSettingsSyncButtonState", () => {
     expect(rangeSection).toContain('t("settings.group.scope")');
     expect(rangeSection).toContain('.setName(t("settings.syncScope.name"))');
     expect(rangeSection).toContain('.setName(t("settings.syncExclusion.name"))');
-    expect(rangeSection).toContain('.setName(t("settings.maxFileSize.name"))');
+    expect(rangeSection).not.toContain('t("settings.maxFileSize.name")');
+    expect(rangeSection).not.toContain(".setLimits(");
     expect(rangeSection).not.toContain('t("settings.firstSync.name")');
     expect(rangeSection).not.toContain('t("settings.automaticHandling.name")');
     expect(rangeSection).not.toContain('t("settings.autoSync.name")');
@@ -112,20 +111,26 @@ describe("buildSettingsSyncButtonState", () => {
     expect(automaticSection).toContain('t("settings.group.automatic")');
     expect(automaticSection).toContain('setName(t("settings.automaticHandling.name"))');
     expect(automaticSection).toContain('setName(t("settings.autoSync.name"))');
-    expect(automaticSection).toContain('setName(t("settings.syncInterval.name"))');
-    expect(automaticSection).toContain(
+    // Auto sync is a single row: toggle + configure (gear) button, sliders live in the modal.
+    expect(automaticSection).toContain('.setIcon("settings")');
+    expect(automaticSection).toContain('t("settings.autoSync.open")');
+    expect(automaticSection).not.toContain('setName(t("settings.syncInterval.name"))');
+    expect(automaticSection).not.toContain(
       'setName(t("settings.autoSyncChangeDelay.name"))',
     );
-    expect(automaticSection).toContain(".setLimits(0, 10, 1)");
-    expect(automaticSection).toContain(
+    expect(automaticSection).not.toContain(".setLimits(");
+    expect(automaticSection).not.toContain("setAutoSyncChangeDelaySeconds");
+    expect(automaticSection).not.toContain("describeAutoSyncChangeDelay");
+    expect(autoSyncModalSource).toContain('setName(t("settings.syncInterval.name"))');
+    expect(autoSyncModalSource).toContain(
+      'setName(t("settings.autoSyncChangeDelay.name"))',
+    );
+    expect(autoSyncModalSource).toContain(".setLimits(3, 10, 1)");
+    expect(autoSyncModalSource).toContain(".setLimits(0, 10, 1)");
+    expect(autoSyncModalSource).toContain(
       "this.plugin.setAutoSyncChangeDelaySeconds(value)",
     );
-    expect(enabledTriggerSettings).toContain(
-      'setName(t("settings.syncInterval.name"))',
-    );
-    expect(enabledTriggerSettings).toContain(
-      'setName(t("settings.autoSyncChangeDelay.name"))',
-    );
+    expect(autoSyncModalSource).toContain("restartAutoSync");
     expect(automaticSection).not.toContain('t("settings.maxFileSize.name")');
     expect(automaticSection).toContain(
       'setButtonText(t("settings.automaticHandling.button"))',
@@ -487,7 +492,8 @@ describe("buildSettingsSyncButtonState", () => {
     const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
     const styles = readFileSync("styles.css", "utf8");
 
-    expect(source.match(/extends Modal/g)).toHaveLength(1);
+    expect(source.match(/extends EasySyncModal/g)).toHaveLength(1);
+    expect(source).not.toContain("extends Modal");
     expect(source).toContain('"community-plugin-files"');
     expect(source).toContain('"community-plugin-data"');
     expect(source).toContain("openCommunityPluginManagerModal");

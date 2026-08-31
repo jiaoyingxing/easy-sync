@@ -1,7 +1,6 @@
 import {
   ButtonComponent,
   ExtraButtonComponent,
-  Modal,
   Notice,
   SearchComponent,
   Setting,
@@ -24,6 +23,7 @@ import {
   type CommunityPluginSelectionColumn,
   type CommunityPluginSelectionSettings,
 } from "../sync/community-plugin-selection-update";
+import { EasySyncModal } from "./easy-sync-modal";
 import { ConfirmModal } from "./confirm-modal";
 import { SequentialSettingsUpdateQueue } from "./sequential-settings-update-queue";
 import {
@@ -65,7 +65,7 @@ interface CommunityPluginScopeControls {
   selectionChipEl: HTMLElement;
 }
 
-export class ConfigSyncModal extends Modal {
+export class ConfigSyncModal extends EasySyncModal {
   private view: ConfigSyncView = "scope";
   private inventory: CommunityPluginInventoryItem[] = [];
   private scopeInventory: CommunityPluginInventoryItem[] = [];

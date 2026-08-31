@@ -39,6 +39,7 @@ const STRUCTURAL_HOOKS = new Set([
   "easy-sync-ribbon",
   "easy-sync-auth-device-code-modal",
   "easy-sync-automatic-handling",
+  "easy-sync-auto-sync",
   "easy-sync-detail-format-difference",
   "easy-sync-settings-about",
   "easy-sync-path-layout",

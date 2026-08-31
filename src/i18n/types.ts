@@ -88,6 +88,8 @@ export interface LocaleStrings {
   "settings.firstSync.start": string;
   "settings.firstSync.sync": string;
   "settings.autoSync.name": string;
+  "settings.autoSync.open": string;
+  "settings.autoSync.title": string;
   "settings.autoSync.desc.disabled": string;
   "settings.autoSync.desc.enabled": string;
   "settings.autoSync.desc.paused": string;

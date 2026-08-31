@@ -292,23 +292,18 @@ describe("declarative completeness vs display()", () => {
     expect((defs[0] as { type?: string }).type).toBe("group");
   });
 
-  it("shows the auto-sync interval sliders only while auto sync is enabled", () => {
+  it("keeps auto sync as a single toggle+configure row; sliders moved to the modal", () => {
     const plugin = createMockPlugin();
     const i18n = new I18n("zh-cn");
     const defs = buildSettingDefinitions(i18n.t.bind(i18n), plugin);
     const items = itemsInGroup(defs, i18n.t("settings.group.automatic"));
-    const interval = items.find((i) => i.name === i18n.t("settings.syncInterval.name"));
-    const delay = items.find((i) => i.name === i18n.t("settings.autoSyncChangeDelay.name"));
-    expect(interval).toBeDefined();
-    expect(delay).toBeDefined();
-    // syncInterval is 3 (>0) in the mock: both sliders are visible.
-    expect(interval?.visible?.()).toBe(true);
-    expect(delay?.visible?.()).toBe(true);
-
-    // Turning auto sync off hides both sliders (syncInterval becomes 0).
-    (plugin as unknown as { syncInterval: number }).syncInterval = 0;
-    expect(interval?.visible?.()).toBe(false);
-    expect(delay?.visible?.()).toBe(false);
+    const autoSync = items.find((i) => i.name === i18n.t("settings.autoSync.name"));
+    expect(autoSync).toBeDefined();
+    // The interval/delay sliders no longer exist as settings-page rows.
+    expect(items.find((i) => i.name === i18n.t("settings.syncInterval.name"))).toBeUndefined();
+    expect(
+      items.find((i) => i.name === i18n.t("settings.autoSyncChangeDelay.name")),
+    ).toBeUndefined();
   });
 
   it("includes the about group with product and author entries", () => {

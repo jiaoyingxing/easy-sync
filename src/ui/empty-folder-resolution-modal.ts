@@ -1,6 +1,7 @@
-import { ButtonComponent, Modal, Setting, type App } from "obsidian";
+import { ButtonComponent, Setting, type App } from "obsidian";
 import type { I18nFn } from "./confirm-modal";
 import { applyDestructiveButton } from "./destructive-button";
+import { EasySyncModal } from "./easy-sync-modal";
 import type {
   EmptyFolderResolutionSnapshotV1,
   FolderLocationResolutionSnapshotV1,
@@ -15,7 +16,7 @@ export type EmptyFolderResolutionChoice =
   | { action: "keep-local-location" }
   | { action: "keep-remote-location" };
 
-export class EmptyFolderResolutionModal extends Modal {
+export class EmptyFolderResolutionModal extends EasySyncModal {
   private resolve:
     ((choice: EmptyFolderResolutionChoice | null) => void) | null = null;
 

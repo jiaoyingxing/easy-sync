@@ -1,4 +1,5 @@
-import { Modal, type App } from "obsidian";
+import { type App } from "obsidian";
+import { EasySyncModal } from "./easy-sync-modal";
 
 export interface FileComparisonRow {
   label: string;
@@ -31,7 +32,7 @@ export function formatFileSize(bytes: number): string {
  * class owns only the single scroll surface, comparison table, and fixed action
  * footer used by both ordinary conflicts and unfinished-operation review.
  */
-export abstract class FileComparisonModal extends Modal {
+export abstract class FileComparisonModal extends EasySyncModal {
   protected comparisonBodyEl!: HTMLElement;
 
   constructor(app: App) {

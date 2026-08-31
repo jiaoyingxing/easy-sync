@@ -6,7 +6,7 @@
  * the sidebar. The plan is already persisted to state — dismissing the
  * alert does not discard it.
  */
-export class SyncPlanAlertModal extends Modal {
+export class SyncPlanAlertModal extends EasySyncModal {
   constructor(
     app: App,
     private title: string,
@@ -58,7 +58,8 @@ export class SyncPlanAlertModal extends Modal {
  * exist from day one.
  */
 
-import { Modal, type App } from "obsidian";
+import { type App } from "obsidian";
+import { EasySyncModal } from "./easy-sync-modal";
 
 export interface ConfirmModalPlan {
   uploads: number;
@@ -70,7 +71,7 @@ export interface ConfirmModalPlan {
 
 export type I18nFn = (key: string, params?: Record<string, string | number>) => string;
 
-export class ConfirmModal extends Modal {
+export class ConfirmModal extends EasySyncModal {
   private resolve: ((value: boolean) => void) | null = null;
 
   constructor(

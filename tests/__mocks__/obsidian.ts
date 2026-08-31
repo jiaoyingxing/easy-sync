@@ -84,8 +84,38 @@ export class ProgressBarComponent {
   }
 }
 
+/** Minimal DOM element stub for UI unit tests (no jsdom installed).
+ *  Supports the handful of DOM operations EasySync modal code uses. */
+export function createMockElement(): HTMLElement {
+  const element: Record<string, unknown> = {
+    classList: { add: () => undefined, remove: () => undefined },
+    children: [] as unknown[],
+    innerHTML: "",
+    textContent: "",
+  };
+  element.empty = () => {
+    element.innerHTML = "";
+    element.children = [];
+    return element;
+  };
+  element.addClass = (..._tokens: string[]) => element;
+  element.removeClass = (..._tokens: string[]) => element;
+  element.toggleClass = (_token: string, _on?: boolean) => element;
+  element.setAttribute = (_name: string, _value: string) => element;
+  element.createDiv = () => createMockElement();
+  element.createSpan = () => createMockElement();
+  element.createEl = () => createMockElement();
+  element.appendChild = (_child: unknown) => element;
+  element.closest = () => null;
+  element.querySelector = () => null;
+  element.isConnected = false;
+  return element as unknown as HTMLElement;
+}
+
 export class Modal {
-  contentEl: HTMLElement = document.createElement("div");
+  contentEl: HTMLElement = createMockElement();
+  containerEl: HTMLElement = createMockElement();
+  modalEl: HTMLElement = createMockElement();
 
   constructor(_app?: App) {}
   setTitle(_title: string): void {}
@@ -204,10 +234,16 @@ export class PluginSettingTab {
 }
 
 export class ButtonComponent {
-  buttonEl = { classList: { add: () => undefined } } as unknown as HTMLButtonElement;
+  buttonEl = {
+    classList: { add: () => undefined },
+    addClass: () => undefined,
+    setAttribute: () => undefined,
+  } as unknown as HTMLButtonElement;
 
   constructor(_containerEl: HTMLElement) {}
   setButtonText(_text: string): this { return this; }
+  setIcon(_icon: string): this { return this; }
+  setTooltip(_tooltip: string): this { return this; }
   setDisabled(_disabled: boolean): this { return this; }
   setWarning(): this { return this; }
   setDestructive(): this { return this; }
@@ -222,6 +258,8 @@ export class ToggleComponent {
 }
 
 export class ExtraButtonComponent {
+  extraSettingsEl: HTMLElement = createMockElement();
+
   constructor(_containerEl: HTMLElement) {}
   setIcon(_icon: string): this { return this; }
   setTooltip(_tooltip: string): this { return this; }
@@ -229,12 +267,32 @@ export class ExtraButtonComponent {
 }
 
 export class SliderComponent {
-  sliderEl = {} as HTMLInputElement;
+  static instances: SliderComponent[] = [];
+  sliderEl = {
+    closest: (_selector: string): HTMLElement | null => null,
+  } as unknown as HTMLInputElement;
+  private onChangeCallback: ((value: number) => void | Promise<void>) | null = null;
+  value = 0;
 
-  constructor(_containerEl: HTMLElement) {}
+  constructor(_containerEl: HTMLElement) {
+    SliderComponent.instances.push(this);
+  }
   setLimits(_min: number, _max: number, _step: number): this { return this; }
-  setValue(_value: number): this { return this; }
-  onChange(_callback: (value: number) => void | Promise<void>): this { return this; }
+  setValue(value: number): this {
+    this.value = value;
+    return this;
+  }
+  onChange(callback: (value: number) => void | Promise<void>): this {
+    this.onChangeCallback = callback;
+    return this;
+  }
+  /** Test helper: invoke the registered onChange callback. */
+  triggerChange(value: number): void | Promise<void> {
+    if (!this.onChangeCallback) {
+      throw new Error("SliderComponent.onChange was never registered");
+    }
+    return this.onChangeCallback(value);
+  }
 }
 
 export class DropdownComponent {
@@ -249,6 +307,8 @@ export class DropdownComponent {
 }
 
 export class Setting {
+  descEl: HTMLElement = createMockElement();
+
   constructor(_containerEl: HTMLElement) {}
   setName(_name: string): this { return this; }
   setDesc(_desc: string): this { return this; }

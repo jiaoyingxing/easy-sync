@@ -78,6 +78,27 @@
   color: var(--text-error);
 }
 
+/* ---- EasySync Modal backdrop ---- */
+
+/* Obsidian dims `.modal-bg` with `--background-modifier-cover` (0.15 light /
+ * 0.35 dark on touch, x0.85 opacity via JS), which is too light on phones for
+ * the vault not to compete with the dialog content. Learn from the "Primary"
+ * theme (vault `焦应行的笔记本`): blur the layer with a gentle blur and keep
+ * the host's own plain cover color — no extra darkening, no saturate /
+ * brightness (a glowing frost). The dialog card is solid, so a light blur on
+ * top of the host's own cover is enough visual separation. Desktop is
+ * untouched (all rules scoped to `body.is-mobile`); only EasySync dialogs
+ * (marked via `easy-sync-modal-container`). Touch users can still scroll the
+ * vault behind the backdrop; we only blur, never block input. */
+body.is-mobile .modal-container.easy-sync-modal-container .modal-bg {
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+
+/* Android WebViews can drop `backdrop-filter`: the host's own cover (0.15 /
+ * 0.35) stays — a plain tint with no blur, same as the pre-change look. No
+ * extra darkening needed, so no overriding rule here. */
+
 /* ---- Settings Modals ---- */
 
 .easy-sync-settings-modal {
