@@ -29,6 +29,11 @@ EasySync 让你在电脑、手机和平板之间轻松同步 Obsidian 仓库。
 
 - 支持 Windows、macOS、Linux、iOS 和 Android；首次建立共同基线，后续主要增量核对新的变化，大文件使用分片上传。
 
+## 👋 联系
+
+- 产品交流：小红书搜索 **焦应行** 🔍
+- 遇到问题：在 EasySync 设置中生成“诊断报告”。提交问题时附上完整的 EasySync 诊断报告。问题反馈：[GitHub Issues](https://github.com/jiaoyingxing/easy-sync/issues)
+
 ## 1. 安装与首次配置
 
 ### 1.1 安装插件
@@ -88,19 +93,19 @@ EasySync 让你在电脑、手机和平板之间轻松同步 Obsidian 仓库。
 
 如果你原本使用其他同步方式，可以按以下步骤迁移到 EasySync。迁移完成前，请保留原仓库和独立备份，不要让两种同步工具同时管理同一个本地仓库；已经放入 EasySync 云端目录、并且与本地路径和内容完全一致的文件，首次同步只会建立共同基线，不会重新上传。如果出现预期之外的大量上传、下载或冲突，请先取消并检查仓库名、目录层级、同步范围和加密状态。
 
-### 2.1 OneDrive 应用
+### 2.1 从 OneDrive 应用迁移
 
 如果仓库直接位于 OneDrive 同步目录，请先确认 OneDrive 已完成同步，并确保所有文件均已完整下载而不是云端占位符；然后关闭 Obsidian、暂停 OneDrive，将整个仓库复制到不受 OneDrive 管理的普通本地目录，并在 Obsidian 中打开这个本地副本。
 
 安装并启用 EasySync，登录原仓库所在的 OneDrive 账号，但暂不开始同步；先通过 OneDrive 网页版，将原仓库根目录下的全部内容复制到 `应用/EasySync/vaults/<你的仓库名>/files/`，直接放入 `files`，不要再多套一层仓库名。随后启动首次同步，完成并确认结果正常后，再处理原 OneDrive 目录中的仓库。
 
-### 2.2 Remotely Save 插件
+### 2.2 从 Remotely Save 插件迁移
 
 请先完成最后一次同步并确认成功，然后停用所有设备上的 Remotely Save。如果没有启用远端加密，可以通过 OneDrive 网页版，将 `应用/remotely-save/<你的仓库名>/` 中的仓库内容复制到 `应用/EasySync/vaults/<你的仓库名>/files/`；直接复制仓库内容，不要多套一层仓库名，也不要复制 Remotely Save 的控制文件。
 
 如果自定义过远端目录，请以实际目录为准；如果启用了远端加密，则需要先使用 Remotely Save 将仓库完整还原到本地，再由 EasySync 执行首次上传。
 
-### 2.3 iOS 的 iCloud
+### 2.3 从 iOS 的 iCloud 迁移
 
 不要先关闭 iCloud。请在“文件”App 中确认 `iCloud 云盘/Obsidian/<你的仓库名>/` 已完整下载；仍保存在云端的内容可长按并选择“保留下载”。然后在 Obsidian 中创建一个名称相同、但不存储到 iCloud 的本地仓库，关闭 Obsidian，将原仓库根目录下的全部内容复制到 `我的 iPhone/Obsidian/<你的仓库名>/` 或 `我的 iPad/Obsidian/<你的仓库名>/` 中的新仓库。
 
@@ -254,14 +259,6 @@ EasySync 是跨设备文件同步工具，不是多人实时协作系统。
 - 自动处理只在安全条件完整时执行，条件不足会停止或转为人工处理；
 - 同步不能代替独立备份，重要资料仍建议定期备份。
 
-## 9. 遇到问题
-
-先在 EasySync 设置中生成“诊断报告”。
-
-提交问题时建议附上完整的 EasySync 诊断报告。
-
-问题反馈：[GitHub Issues](https://github.com/jiaoyingxing/easy-sync/issues)
-
-## 10. 许可
+## 9. 许可
 
 EasySync 采用 [MIT License](LICENSE) 开源。

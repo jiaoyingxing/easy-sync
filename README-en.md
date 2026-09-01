@@ -29,6 +29,11 @@ EasySync keeps your Obsidian vault in sync across computers, phones, and tablets
 
 - Supports Windows, macOS, Linux, iOS, and Android. The first sync establishes a shared baseline; later syncs primarily check incremental changes, and large files use chunked uploads.
 
+## 👋 Contact
+
+- Product discussion: search **Jiao Yingxing** on Xiaohongshu 🔍
+- Having trouble? Generate a **Diagnostic report** from EasySync settings and include the complete report when reporting an issue. Report issues through [GitHub Issues](https://github.com/jiaoyingxing/easy-sync/issues).
+
 ## 1. Install and set up your first sync
 
 ### 1.1 Install the plugin
@@ -92,19 +97,19 @@ The first sync scans the vault, hashes its files, and establishes a shared basel
 
 If you already use another sync method, follow the steps below to move to EasySync. Keep the old vault and an independent backup until the migration is complete, and do not let two sync tools manage the same local vault. Files already placed in EasySync's cloud directory with exactly the same paths and contents as the local copies will only establish a shared baseline during the first sync and will not be uploaded again. If the plan contains an unexpected number of uploads, downloads, or conflicts, cancel it and check the vault name, directory structure, sync scope, and encryption settings.
 
-### 2.1 OneDrive app
+### 2.1 Migrating from the OneDrive app
 
 If the vault is stored directly inside a OneDrive-synced folder, first make sure OneDrive has finished syncing and every file is fully downloaded rather than a cloud-only placeholder. Close Obsidian, pause OneDrive, copy the entire vault to a normal local folder outside OneDrive, and open that local copy in Obsidian.
 
 Install and enable EasySync, sign in to the OneDrive account that contains the old vault, but do not start syncing yet. In OneDrive on the web, copy everything inside the old vault root directly into `Apps/EasySync/vaults/<your-vault-name>/files/`. Do not add another vault-name folder under `files`. Start the first sync, verify the result, and only then decide what to do with the old vault in the OneDrive-synced folder.
 
-### 2.2 Remotely Save plugin
+### 2.2 Migrating from Remotely Save
 
 Finish one last sync, confirm that it succeeded, and disable Remotely Save on every device. If remote encryption is off, use OneDrive on the web to copy the vault contents from `Apps/remotely-save/<your-vault-name>/` into `Apps/EasySync/vaults/<your-vault-name>/files/`. Copy the vault contents directly, without adding another vault-name folder or copying Remotely Save control files.
 
 If you configured a custom remote directory, use that actual directory instead. If remote encryption is enabled, first restore the complete unencrypted vault locally with Remotely Save, then let EasySync perform the initial upload.
 
-### 2.3 iCloud on iOS
+### 2.3 Migrating from iCloud on iOS
 
 Do not turn off iCloud first. In the Files app, make sure `iCloud Drive/Obsidian/<your-vault-name>/` is fully downloaded; use **Keep Downloaded** for items that remain cloud-only. Create a local Obsidian vault with the same name and with iCloud storage disabled. Close Obsidian, then copy everything inside the old vault root into `On My iPhone/Obsidian/<your-vault-name>/` or `On My iPad/Obsidian/<your-vault-name>/`.
 
@@ -258,14 +263,6 @@ Keep these limits in mind:
 - Automatic handling runs only when all safety conditions are satisfied; otherwise, the operation stops or becomes a manual decision.
 - Sync is not a substitute for an independent backup. Back up important data regularly.
 
-## 9. Troubleshooting
-
-Start by generating a **Diagnostic report** from EasySync settings.
-
-When reporting an issue, include the complete EasySync diagnostic report.
-
-Report issues through [GitHub Issues](https://github.com/jiaoyingxing/easy-sync/issues).
-
-## 10. License
+## 9. License
 
 EasySync is open source under the [MIT License](LICENSE).
