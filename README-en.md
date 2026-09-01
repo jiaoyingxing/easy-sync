@@ -49,15 +49,21 @@ Enable EasySync in Obsidian afterward.
 
 ### 1.2 Prepare the local vault
 
-> When using EasySync, do not place the same Obsidian vault inside a folder already managed by OneDrive, iCloud Drive, Dropbox, Syncthing, or another sync tool.
-
-If EasySync and another sync tool both modify the same files, you may get conflict copies, duplicate uploads, restored deletions, or incorrect sync decisions.
+Do not place your Obsidian vault folder directly inside a cloud-sync directory such as OneDrive or iCloud. EasySync itself is a sync tool: if two sync programs modify the same files at the same time, you risk serious conflicts and data chaos. Keep the vault in a normal local folder, managed by EasySync alone.
 
 Recommended setup:
 
 - Keep the Obsidian vault in a normal local folder.
 - Let EasySync be the only tool managing cross-device sync for that vault.
 - Keep an independent backup of important vaults before the first sync.
+
+Use the same vault name on every device: EasySync identifies the cloud sync space by the vault name. For example, if the vault on your computer is named:
+
+```text
+My Notes
+```
+
+Create or open a vault named “My Notes” on your phone as well. A different name is treated as a separate sync space.
 
 ### 1.3 Sign in to OneDrive
 
@@ -67,19 +73,7 @@ Open:
 
 Sign-in opens your system browser for Microsoft authorization; on mobile, return to Obsidian when prompted after authorization.
 
-### 1.4 Use the same vault name on every device
-
-EasySync uses the vault name to identify its cloud sync space.
-
-For example, if the vault on your computer is named:
-
-```text
-My Notes
-```
-
-Create or open a vault named “My Notes” on your phone as well. A different name is treated as a separate sync space.
-
-### 1.5 Run the first sync
+### 1.4 Run the first sync
 
 Start with the device that has the most complete copy of your vault and select **Sync now**. EasySync shows the sync plan first; until you confirm it, notes, attachments, and other pending sync files are not uploaded, overwritten, moved, or deleted. Confirm the plan, wait for the sync to finish, and then sync the other devices.
 
