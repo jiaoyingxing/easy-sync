@@ -19,6 +19,7 @@ import {
   resolvePlanReviewDetailsState,
   resolveRemoteScopeRecoveryFailurePresentation,
   resolveSyncViewBodyMode,
+  resolveSyncViewPrimaryAction,
   resolveSyncViewStatusDetailMode,
   shouldExpandAllVisibleDetails,
   shouldAutoRebuildPlanReview,
@@ -1880,9 +1881,13 @@ describe("buildSyncViewContentKey", () => {
     expect(viewSource).toContain("this.renderMutationRecoverySection(");
     expect(viewSource).not.toContain("abandonAllAction");
     expect(viewSource).not.toContain("abandonAllAvailable");
+    // The facts-changed decision stays in the fixed top action through the
+    // shared pure decision (resolveSyncViewPrimaryAction) and only renders a
+    // button when a real action key exists.
     expect(viewSource).toContain(
-      "state.mutationRecovery && recoveryActionKey",
+      "input.isLoggedIn && input.recoveryActionKey",
     );
+    expect(viewSource).toContain('case "recovery"');
     expect(viewSource).not.toContain('"syncView.recovery.reviewAndResolve"');
     expect(openMethod).toContain("if (this.mutationRecoveryResolutionOpening) return");
     expect(openMethod).toContain("shouldAutoSettleIdenticalRecovery(snapshot)");
@@ -1900,9 +1905,13 @@ describe("buildSyncViewContentKey", () => {
     );
     expect(openMethod).toContain("this.plugin.resolveMutationRecovery(snapshot, choice)");
     expect(modalSource).toContain("extends FileComparisonModal");
+    expect(modalSource).toContain('this.setTitle(this.t(bundle');
+    expect(modalSource).toContain('this.setTitle(this.t("syncView.pluginBundleReview.title"));');
+    expect(modalSource).not.toContain('createEl("h3", {\n        text: this.t("syncView.pluginBundleReview.title")');
+    expect(modalSource).not.toContain('createEl("h3", {\n      text: this.t("syncView.pluginBundleReview.diffTitle"');
     expect(modalSource).toContain("this.renderComparisonTable(");
     expect(modalSource).toContain('"easy-sync-comparison-path-table"');
-    expect(modalSource).toContain('"easy-sync-comparison-bundle-table"');
+    expect(modalSource).toContain("easy-sync-bundle-overview");
     expect(modalSource).toContain("this.renderFileComparisonActions([");
     expect(modalSource).not.toContain("easy-sync-detail-actions-mobile-stacked");
     expect(conflictSource).not.toContain("easy-sync-detail-actions-mobile-stacked");
@@ -1920,7 +1929,9 @@ describe("buildSyncViewContentKey", () => {
     expect(modalSource).not.toContain("syncView.mutationResolution.unavailable");
     expect(modalSource).not.toContain(": !snapshot.keepLocal.available");
     expect(modalSource).not.toContain(": !snapshot.keepRemote.available");
-    expect(modalSource).toContain("bundle && snapshot.identical");
+    // Bundle reviews do not re-show an identical notice: the dialog only opens
+    // when at least one member differs (identical bundles auto-settle).
+    expect(modalSource).not.toContain("bundle && snapshot.identical");
     expect(modalSource).toContain("syncView.mutationResolution.singleActionHint");
     expect(modalSource).toContain("syncView.mutationResolution.noAvailableActions");
     expect(modalSource.indexOf("syncView.mutationResolution.previousAction")).toBeGreaterThan(
@@ -1974,21 +1985,24 @@ describe("buildSyncViewContentKey", () => {
     expect(modalSource).toContain("Promise<MutationResolutionSnapshot | null>");
     expect(modalSource).toContain("await this.refreshComparison()");
     expect(modalSource).toContain('"syncView.pluginBundleReview.loading"');
-    expect(modalSource).toContain('"syncView.pluginBundleReview.keepLocal"');
-    expect(modalSource).toContain('"syncView.pluginBundleReview.keepRemote"');
+    expect(modalSource).toContain('"syncView.conflict.keepLocal"');
+    expect(modalSource).toContain('"syncView.conflict.keepRemote"');
     expect(viewSource).not.toContain("CommunityPluginBundleReviewModal");
 
     const zh = new I18n("zh-cn");
     const en = new I18n("en");
     expect(zh.t("syncView.pluginBundleReview.open")).toBe("核对插件");
-    expect(zh.t("syncView.pluginBundleReview.keepLocal")).toBe("保留本机插件");
-    expect(zh.t("syncView.pluginBundleReview.keepRemote")).toBe("保留云端插件");
+    expect(zh.t("syncView.conflict.keepLocal")).toBe("保留本机");
+    expect(zh.t("syncView.conflict.keepRemote")).toBe("保留云端");
     expect(zh.t("syncView.mutationResolution.present", { size: "2.6 MB" }))
       .toBe("2.6 MB");
     expect(zh.t("syncView.pluginBundleReview.description", { name: "Resojot" }))
       .toContain("选择最终保留的版本");
     expect(en.t("syncView.pluginBundleReview.description", { name: "Resojot" }))
       .toContain("choose which version to keep");
+    expect(zh.t("syncView.pluginBundleReview.viewDiff")).toBe("查看差异");
+    expect(zh.t("syncView.pluginBundleReview.diffTitle", { name: "manifest.json" }))
+      .toBe("manifest.json 差异");
   });
 
   it("requires a native confirmation and reuses the full-width primary action style for batch deletes", () => {
@@ -2012,6 +2026,19 @@ describe("buildSyncViewContentKey", () => {
     expect(section.indexOf("if (!confirmed) return")).toBeLessThan(
       section.indexOf("plugin.confirmRemoteDeletes"),
     );
+    // 确认通过后立即进入官方 mod-loading 加载态（按钮旋转提示，而非卡死）。
+    expect(section.indexOf('confirmAllButton.buttonEl.addClass("mod-loading")'))
+      .toBeGreaterThan(section.indexOf("if (!confirmed) return"));
+    expect(section.indexOf("confirmAllButton.setDisabled(true)")).toBeGreaterThan(
+      section.indexOf('addClass("mod-loading")'),
+    );
+    // 整块重建后按 hasSideActionsInFlight 重新挂加载态，持续到整批结束。
+    expect(section).toContain(
+      "this.plugin.syncExecutor?.hasSideActionsInFlight",
+    );
+    expect(section).toContain("SyncActionType.ConfirmLocalDelete");
+    expect(section.match(/addClass\("mod-loading"\)/g)).toHaveLength(2);
+    expect(section.match(/setDisabled\(true\)/g)?.length).toBeGreaterThanOrEqual(2);
   });
 });
 
@@ -2398,5 +2425,92 @@ describe("sync view attention presentation", () => {
       mutationRecovery: null,
       progress: { cancelRequested: false },
     })).toEqual({ status: "attention", label: "需要处理 1" });
+  });
+});
+
+describe("resolveSyncViewPrimaryAction (finding ⑧, C9 P1)", () => {
+  const baseInput = {
+    isLoggedIn: true,
+    isRunning: false,
+    canCancel: false,
+    planReviewActive: false,
+    planReviewDetailsState: "ready" as const,
+    reviewKind: null,
+    recoveryActionKey: null,
+    isInitializing: false,
+    isPending: false,
+    devicePending: false,
+  };
+
+  it("keeps the sync-now button for a logged-in recovery state without a real action (P1 regression)", () => {
+    // waiting-network/checking/blocked with recoveryActionKey=null: the old
+    // chain tail fell through to the login button, which was dead for an
+    // already-logged-in user. The fixed top primary button must stay a
+    // working sync-now button.
+    expect(resolveSyncViewPrimaryAction({
+      ...baseInput,
+      recoveryActionKey: null,
+    })).toEqual({ kind: "sync-now" });
+  });
+
+  it("shows the login button only when not logged in", () => {
+    expect(resolveSyncViewPrimaryAction({
+      ...baseInput,
+      isLoggedIn: false,
+    })).toEqual({
+      kind: "auth",
+      labelKey: "settings.account.login",
+      cta: true,
+      disabled: false,
+    });
+  });
+
+  it("shows a real recovery action when the recovery state has one", () => {
+    expect(resolveSyncViewPrimaryAction({
+      ...baseInput,
+      recoveryActionKey: "syncView.recovery.retryScopeRecovery",
+    })).toEqual({
+      kind: "recovery",
+      actionKey: "syncView.recovery.retryScopeRecovery",
+    });
+  });
+
+  it("shows the plan-review confirm button while a reviewed plan is ready", () => {
+    expect(resolveSyncViewPrimaryAction({
+      ...baseInput,
+      planReviewActive: true,
+    })).toEqual({
+      kind: "plan-review-confirm",
+      migration: false,
+    });
+    expect(resolveSyncViewPrimaryAction({
+      ...baseInput,
+      planReviewActive: true,
+      reviewKind: "v2-migration",
+    })).toEqual({
+      kind: "plan-review-confirm",
+      migration: true,
+    });
+  });
+
+  it("shows cancel while a cancellable sync is running", () => {
+    expect(resolveSyncViewPrimaryAction({
+      ...baseInput,
+      isRunning: true,
+      canCancel: true,
+    })).toEqual({ kind: "cancel" });
+  });
+
+  it("shows the pending browser-confirm action for a logged-out pending login", () => {
+    expect(resolveSyncViewPrimaryAction({
+      ...baseInput,
+      isLoggedIn: false,
+      isPending: true,
+    })).toEqual({
+      kind: "auth",
+      labelKey: "settings.account.confirmAfterBrowser",
+      cta: true,
+      disabled: false,
+    });
   });
 });

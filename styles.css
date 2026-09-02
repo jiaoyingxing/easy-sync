@@ -274,6 +274,13 @@ body.is-mobile .easy-sync-empty-folder-actions button {
   margin-top: var(--size-2-2);
 }
 
+/* Notification pop-ups level hint: progressive disclosure line shown only
+   after the user picks a level. Rendered as the sole child of the row's
+   native .setting-item-description, so it inherits the muted desc tone. */
+.easy-sync-notification-popups-hint {
+  margin-top: var(--size-2-1);
+}
+
 .easy-sync-exclusion-chip {
   display: flex;
   align-items: center;
@@ -346,10 +353,6 @@ body.is-mobile .easy-sync-empty-folder-actions button {
   overflow-y: auto;
   min-height: 0;
   padding-bottom: 4px;
-}
-
-.easy-sync-conflict-detail h3 {
-  margin-bottom: 8px;
 }
 
 .easy-sync-detail-path {
@@ -464,6 +467,62 @@ td:first-child {
 .easy-sync-meta-highlight {
   color: var(--text-accent);
   font-weight: 600;
+}
+
+/* Bundle overview: compact file/local/remote/action table (no separate
+   "difference" column; version and modified time carry the signal).
+   Desktop keeps content-sized auto layout. On phones the four columns are
+   forced to share the dialog width (fixed layout) so the file-name column
+   wraps instead of pushing the table beyond the screen — no horizontal
+   scroll / blank area when swiping. */
+.easy-sync-bundle-overview {
+  table-layout: auto;
+}
+.easy-sync-bundle-overview th:first-child,
+.easy-sync-bundle-overview td:first-child {
+  text-align: left;
+  white-space: nowrap;
+}
+
+body.is-mobile .easy-sync-bundle-overview {
+  table-layout: fixed;
+  width: 100%;
+}
+body.is-mobile .easy-sync-bundle-overview th:first-child,
+body.is-mobile .easy-sync-bundle-overview td:first-child {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* The action column is ~25% of the phone dialog; a "查看差异" button with
+   the desktop 20px horizontal padding would overflow its fixed-layout cell
+   (button min-width > column width) and push the table past the screen.
+   Tighten the padding so the label fits on one line; on very narrow phones
+   (<360px) the label may wrap instead of overflowing. */
+body.is-mobile .easy-sync-bundle-overview .easy-sync-bundle-diff-link {
+  padding: 2px 4px;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* "View diff" entry on a bundle overview row — small link-style button. */
+.easy-sync-bundle-diff-link {
+  color: var(--text-accent);
+  font-size: 0.85em;
+  background: none;
+  border: none;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.easy-sync-bundle-diff-link:hover {
+  text-decoration: underline;
+}
+
+/* "Identical" marker on a bundle overview row with matching bytes — muted,
+   non-interactive, occupies the same slot as the "view diff" action. */
+.easy-sync-bundle-identical {
+  color: var(--text-muted);
+  font-size: 0.85em;
 }
 
 /* Headers stay neutral; only metadata values carry source colors. */

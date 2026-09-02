@@ -657,6 +657,14 @@ export interface SyncRunFacts {
   termination: "normal" | "cancelled";
   ordinaryPlanning: "not-entered" | "entered";
   userFileChanges: "none" | "performed" | "unknown";
+  /** True when this run paused with a durable plan held for review.
+   * Structured replacement for localised-message sniffing
+   * (review 2026-09-02, C9/C13 cross-cluster finding 6). */
+  planReviewPaused?: boolean;
+  /** True when automatic sync hit the threshold gate but proceeded without
+   * pausing (direction 3, user decision 2026-09-02): the caller shows a
+   * one-line summary notice instead of the durable review flow. */
+  thresholdSkippedInAuto?: boolean;
 }
 
 export interface MutationRecoveryHistory {

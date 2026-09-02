@@ -1068,10 +1068,11 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   /**
-   * A conflict-only round pauses automatic sync until the user has handled its
-   * decisions. Once the last durable decision is gone, that pause no longer
-   * describes current state. Keep the historical partial run intact and only
-   * release the pause when no other blocker or failed result still owns it.
+   * Legacy conflict-owned automatic pause cleanup. New runs never pause on
+   * conflicts (2026-09-01 decision), but a pause persisted by an older build
+   * may still exist when pending decisions settle. Release it only when the
+   * latest conflicted history entry is the sole pause owner — every other
+   * blocker (errors, review, recovery, auth) keeps the pause intact.
    */
   private async maybeResumeAutoSyncAfterResolvedDecisions(
     state: StateManager,
@@ -1109,7 +1110,7 @@ export default class EasySyncPlugin extends Plugin {
       this.autoSyncPaused = true;
       this.diag.warn(
         "state",
-        "failed to release automatic pause after pending decisions settled",
+        "failed to release legacy conflict-owned automatic pause after pending decisions settled",
         error,
       );
       return;
@@ -1117,7 +1118,7 @@ export default class EasySyncPlugin extends Plugin {
     this.startAutoSync();
     this.diag.log(
       "execute",
-      "released conflict-owned automatic pause after pending decisions settled",
+      "released legacy conflict-owned automatic pause after pending decisions settled",
       { historyId: latestHistory.id, mutations: 0 },
     );
   }
@@ -1160,6 +1161,16 @@ export default class EasySyncPlugin extends Plugin {
   confirmRemoteDeletes(paths: readonly string[]): Promise<boolean> {
     const requestedPaths = [...new Set(paths)];
     if (requestedPaths.length === 0) return Promise.resolve(false);
+    // 批量删除确认后先弹一条总入队提示，避免用户误以为系统卡死。提示走
+    // ambient 过滤（遵循「通知弹窗」设置），用户关闭提示时不弹；处理中
+    // 不再重复提示，进度由侧栏顶部进度展示承接。
+    this.noticeCenter.show({
+      key: "side-action:batch-delete:queueing",
+      message: this.i18n.t("notice.delete.queueing"),
+      priority: NOTICE_PRIORITY.action,
+      category: "ambient",
+      className: "easy-sync-notice-action",
+    });
     return this.runSideActionIntent(
       requestedPaths[0],
       "notice.delete.failed",
@@ -1245,6 +1256,28 @@ export default class EasySyncPlugin extends Plugin {
     ) return null;
     if (!await this.checkAccountBinding()) return null;
     return executor.getCommunityPluginBundleReviewSnapshot(pluginId);
+  }
+
+  /**
+   * Read-only single-file diff for one reviewed community-plugin bundle
+   * member (used by the bundle sub-dialog). Never mutates state.
+   */
+  async getCommunityPluginBundleFileDiff(
+    pluginId: string,
+    path: string,
+  ): Promise<Awaited<
+    ReturnType<SyncExecutor["getCommunityPluginBundleFileDiff"]>
+  >> {
+    await this.ensureStateLoaded();
+    const executor = this.syncExecutor;
+    if (
+      !executor
+      || executor.isRunning
+      || executor.hasSideActionsInFlight
+      || !this.state?.isV2StateActive
+    ) return null;
+    if (!await this.checkAccountBinding()) return null;
+    return executor.getCommunityPluginBundleFileDiff(pluginId, path);
   }
 
   async resolveMutationRecovery(
@@ -2013,10 +2046,64 @@ export default class EasySyncPlugin extends Plugin {
         );
       }
       this._stateLoaded = true;
+      // A pause persisted by an older build because of pending conflicts
+      // (conflicts no longer pause automatic sync, 2026-09-01) is stale once
+      // the loaded state proves no real pause owner is present. Release it
+      // only when conflicts are the sole remaining decision; errors, review,
+      // recovery and pending deletes keep the pause intact.
+      await this.releaseLegacyConflictOnlyPauseIfSafe();
     }).finally(() => {
       this.stateLoadPromise = null;
     });
     await this.stateLoadPromise;
+  }
+
+  /**
+   * Release a legacy automatic pause that only owned pending-conflict
+   * decisions. Uses the loaded typed state, never raw plugin-data keys, so
+   * every real pause owner (errors / review / recovery / pending deletes)
+   * keeps the pause. Conflict items alone never pause under the 2026-09-01
+   * decision, so a remaining conflict-only pause is safe to clear.
+   */
+  private async releaseLegacyConflictOnlyPauseIfSafe(): Promise<void> {
+    const state = this.state;
+    if (
+      !this.autoSyncPaused
+      || !state
+      || !state.isV2StateActive
+      || state.planReviewActive
+      || state.hasV2StateLoadRecoveryBlock
+      || state.hasV2RemoteScopeRecovery
+      || (state.mutationLedger?.length ?? 0) > 0
+      || (state.pendingRemoteDeletes?.length ?? 0) > 0
+      || (state.pendingIssues?.length ?? 0) > 0
+      || (state.pendingConflicts?.length ?? 0) === 0
+    ) return;
+    const latestHistory = state.syncHistory[0];
+    const historyIsConflictOnly = !latestHistory
+      || (
+        latestHistory.errors === 0
+        && latestHistory.conflicts > 0
+      );
+    if (!historyIsConflictOnly) return;
+    this.autoSyncPaused = false;
+    try {
+      await this.saveSyncSettings();
+    } catch (error) {
+      this.autoSyncPaused = true;
+      this.diag.warn(
+        "state",
+        "failed to persist release of a legacy conflict-only automatic pause",
+        error,
+      );
+      return;
+    }
+    this.startAutoSync();
+    this.diag.log(
+      "state",
+      "released a legacy conflict-only automatic pause after state load (conflicts no longer pause auto sync)",
+      { mutations: 0 },
+    );
   }
 
   /** Start a first sync (manual trigger from settings) */
@@ -2348,6 +2435,19 @@ export default class EasySyncPlugin extends Plugin {
     });
   }
 
+  /** Structured run-fact checks for sync results. Localised-message
+   *  comparisons remain only as a fallback for results without runFacts
+   *  (review 2026-09-02 finding ⑥: runFacts is the primary signal). */
+  private isCancelled(result: SyncResult): boolean {
+    return result.runFacts?.termination === "cancelled"
+      || result.message === this.i18n.t("result.cancelled");
+  }
+
+  private isPlanReviewPaused(result: SyncResult): boolean {
+    return result.runFacts?.planReviewPaused === true
+      || result.message === this.i18n.t("result.pausedForReview");
+  }
+
   private finishSyncNotice(result: SyncResult): void {
     compatCancelAnimationFrame(this.syncNoticeFrame);
     this.syncNoticeFrame = null;
@@ -2356,8 +2456,8 @@ export default class EasySyncPlugin extends Plugin {
     this.clearSyncLifecycleNotice();
 
     const outcome = resolveSyncNoticeOutcome(result, {
-      pausedForReview: result.message === this.i18n.t("result.pausedForReview"),
-      cancelled: result.message === this.i18n.t("result.cancelled"),
+      pausedForReview: this.isPlanReviewPaused(result),
+      cancelled: this.isCancelled(result),
     }, this.progressStore.state.completedFiles);
     if (
       !outcome
@@ -2398,6 +2498,20 @@ export default class EasySyncPlugin extends Plugin {
       className: "easy-sync-notice-result",
       category: outcome.kind === "authExpired" ? "safety" : "ambient",
     });
+
+    // Direction 3 (user decision 2026-09-02): automatic sync proceeds when
+    // the threshold gate would otherwise pause a large plan; show the
+    // one-line summary instead of the durable review flow.
+    if (result.runFacts?.thresholdSkippedInAuto === true) {
+      this.noticeCenter.show({
+        key: "sync-result:threshold-skipped-auto",
+        message: this.i18n.t("notice.sync.thresholdSkippedInAuto"),
+        priority: NOTICE_PRIORITY.info,
+        durationMs: SYNC_RESULT_NOTICE_DURATION_MS,
+        className: "easy-sync-notice-result",
+        category: "ambient",
+      });
+    }
   }
 
   /** Forward progress from executor to the store for sync-view display.
@@ -2752,21 +2866,21 @@ export default class EasySyncPlugin extends Plugin {
     const retryableMutationRecovery =
       result.mutationRecovery?.state === "network-unavailable"
       && !result.authExpired
-      && result.message !== this.i18n.t("result.cancelled")
+      && !this.isCancelled(result)
       && !(this.state?.planReviewActive ?? false);
     const isolatedMutationRecovery =
       result.mutationRecovery?.state === "blocked"
       && result.mutationRecovery.isolated === true
       && result.errors === 0
       && !result.authExpired
-      && result.message !== this.i18n.t("result.cancelled")
+      && !this.isCancelled(result)
       && (
         recoveryOnly
         || (
           result.success
           && result.conflicts === 0
           && result.deferred === 0
-          && result.message !== this.i18n.t("result.pausedForReview")
+          && !this.isPlanReviewPaused(result)
           && !(this.state?.planReviewActive ?? false)
         )
       );
@@ -2774,7 +2888,7 @@ export default class EasySyncPlugin extends Plugin {
       result.mutationRecovery?.state === "blocked"
       && result.mutationRecovery.isolated !== true
       && !result.authExpired
-      && result.message !== this.i18n.t("result.cancelled");
+      && !this.isCancelled(result);
 
     if (isolatedMutationRecovery) {
       this.clearSyncLifecycleNotice();
@@ -2920,7 +3034,10 @@ export default class EasySyncPlugin extends Plugin {
     // the whole auto-sync round: nothing was written and only an
     // observed-fact change can clear the block. Exemptions apply only to the
     // failure branches those blocks can trigger (non-success / errors);
-    // conflicts, auth, cancellation and review pauses keep pausing.
+    // auth, cancellation and review pauses keep pausing.
+    // Conflicts no longer pause automatic sync: they stay a visible pending
+    // decision (sidebar/ribbon still show them) while the rest of the vault
+    // keeps syncing (user decision 2026-09-01, docs/temp/20260901-221059).
     const identityBlockedOnly = (result.identityBlockedErrors ?? 0) > 0
       && (result.identityBlockedErrors ?? 0) === result.errors;
     const pauseAutoSync =
@@ -2929,10 +3046,9 @@ export default class EasySyncPlugin extends Plugin {
       && (
       ((!result.success && !harmlessRejectedRun) && !identityBlockedOnly)
       || (result.errors > 0 && !identityBlockedOnly)
-      || result.conflicts > 0
       || result.authExpired
-      || result.message === this.i18n.t("result.cancelled")
-      || result.message === this.i18n.t("result.pausedForReview")
+      || this.isCancelled(result)
+      || this.isPlanReviewPaused(result)
       || (this.state?.planReviewActive ?? false)
       );
     this.finishSyncNotice(result);
@@ -2982,7 +3098,7 @@ export default class EasySyncPlugin extends Plugin {
     const progress = this.progressStore.state;
     if (
       progress.startedAt <= 0
-      || result.message === this.i18n.t("result.pausedForReview")
+      || this.isPlanReviewPaused(result)
       || result.message === this.i18n.t("result.alreadyRunning")
     ) {
       return;
@@ -3059,7 +3175,7 @@ export default class EasySyncPlugin extends Plugin {
       && recoveryContext.priorRemaining > 0
       && (
         result.mutationRecovery !== undefined
-        || result.message === this.i18n.t("result.cancelled")
+        || this.isCancelled(result)
       );
     if (recoveryOnly || stoppedInsidePriorRecovery) {
       if (priorRecoveryWithoutEntry) {
@@ -3072,8 +3188,7 @@ export default class EasySyncPlugin extends Plugin {
     }
 
     const status = resolveSyncHistoryStatus(result, {
-      cancelled: result.runFacts?.termination === "cancelled"
-        || result.message === this.i18n.t("result.cancelled"),
+      cancelled: this.isCancelled(result),
       completedFileCount: progress.completedCount,
     });
     const newRecovery = recoveryContext.newRemaining > 0
@@ -7000,9 +7115,18 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   // ---- SecretStorage wrappers ----
+  // Await and propagate the underlying promise (review 2026-09-02 finding ⑦,
+  // C13 P1): the previous wrappers fired setSecret/deleteSecret without
+  // waiting, so logout's remove→read-back check raced the delete and a write
+  // failure stayed silent. Failures now propagate to callers (AuthModule
+  // already logs and reports "removal not confirmed" on error).
 
   private async saveSecret(key: string, value: string): Promise<void> {
-    this.app.secretStorage?.setSecret(key, value);
+    const ss = this.app.secretStorage;
+    if (!ss) return;
+    // Obsidian's runtime returns a real promise; the shipped type signature
+    // still says void. Assert the actual shape so the write still propagates.
+    await (ss.setSecret as (id: string, secret: string) => Promise<void>)(key, value);
   }
 
   private async loadSecret(key: string): Promise<string | null> {
@@ -7015,11 +7139,11 @@ export default class EasySyncPlugin extends Plugin {
     // Feature-detect: deleteSecret exists at runtime (>= 1.11.4) but TS types
     // haven't caught up. Fallback to overwriting with empty string if unavailable.
     if (typeof (ss as unknown as Record<string, unknown>).deleteSecret === "function") {
-      (ss as unknown as { deleteSecret: (k: string) => void }).deleteSecret(key);
+      await (ss as unknown as { deleteSecret: (k: string) => Promise<void> }).deleteSecret(key);
     } else {
       // On older versions without deleteSecret, clear the value.
       // AuthModule treats empty string as "no token".
-      ss.setSecret(key, "");
+      await (ss.setSecret as (id: string, secret: string) => Promise<void>)(key, "");
     }
   }
 }

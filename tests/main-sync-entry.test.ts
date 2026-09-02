@@ -101,6 +101,7 @@ import {
   reduceDeviceCommunityPluginParticipation,
   type DeviceCommunityPluginParticipationV1,
 } from "../src/sync/community-plugin-participation";
+import { NOTICE_PRIORITY } from "../src/ui/notice-center";
 
 function okResult(): SyncResult {
   return {
@@ -2130,6 +2131,55 @@ describe("main sync entry guards", () => {
     expect(show).not.toHaveBeenCalled();
   });
 
+  it("shows the threshold-skipped summary notice after an automatic run proceeded past the gate (direction 3 wiring)", async () => {
+    // The executor records thresholdSkippedInAuto on runFacts; finishSyncNotice
+    // must map it to the one-line summary notice with the completed outcome
+    // (single-slot center replaces the completed notice downstream).
+    const plugin = makePlugin();
+    plugin.app = { workspace: { leftSplit: undefined } } as never;
+    const show = vi.fn();
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+
+    (plugin as never as { finishSyncNotice: (result: SyncResult) => void })
+      .finishSyncNotice({
+        ...okResult(),
+        runFacts: {
+          termination: "normal",
+          ordinaryPlanning: "entered",
+          userFileChanges: "none",
+          thresholdSkippedInAuto: true,
+        },
+      });
+
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "sync-result:threshold-skipped-auto",
+      message: "notice.sync.thresholdSkippedInAuto",
+      priority: NOTICE_PRIORITY.info,
+      category: "ambient",
+    }));
+    // Completed outcome is still emitted first; the single-slot center
+    // replaces it with the summary when priorities are equal.
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "sync-result:completed",
+    }));
+  });
+
+  it("does not show the threshold-skipped summary for a run with no flag", async () => {
+    const plugin = makePlugin();
+    plugin.app = { workspace: { leftSplit: undefined } } as never;
+    const show = vi.fn();
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+
+    (plugin as never as { finishSyncNotice: (result: SyncResult) => void })
+      .finishSyncNotice(okResult());
+
+    expect(show).not.toHaveBeenCalledWith(expect.objectContaining({
+      key: "sync-result:threshold-skipped-auto",
+    }));
+  });
+
   it("re-evaluates an in-flight sync notice when the visible sidebar tab changes", () => {
     const leftSidebar = { collapsed: false };
     const desktopTabs = { parent: leftSidebar };
@@ -2540,6 +2590,72 @@ describe("main sync entry guards", () => {
     expect(stopAutoSync).toHaveBeenCalledOnce();
     expect(saveSyncSettings).toHaveBeenCalledOnce();
     expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("keeps automatic sync paused from structured runFacts even when the message is not the pause text (finding ⑥)", async () => {
+    // Consumers must read runFacts.planReviewPaused instead of sniffing the
+    // localised message: a translated/renamed message must not change the
+    // pause decision (review 2026-09-02 finding ⑥, C9/C13).
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = true;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    if (typeof (plugin as never as { finishSyncNotice?: unknown }).finishSyncNotice === "function") {
+      vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    }
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "first") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      message: "some-custom-message-not-the-pause-text",
+      runFacts: {
+        termination: "normal",
+        ordinaryPlanning: "entered",
+        userFileChanges: "none",
+        planReviewPaused: true,
+      },
+    }, "first");
+
+    expect(plugin.autoSyncPaused).toBe(true);
+    expect(stopAutoSync).toHaveBeenCalledOnce();
+    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("recognises cancellation from structured runFacts termination (finding ⑥)", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      message: "a-custom-cancel-wording",
+      runFacts: {
+        termination: "cancelled",
+        ordinaryPlanning: "entered",
+        userFileChanges: "none",
+      },
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(true);
+    expect(stopAutoSync).toHaveBeenCalledOnce();
+    expect(saveSyncSettings).toHaveBeenCalledOnce();
   });
 
   it("pauses automatic sync after an unexpected incomplete result with no file error count", async () => {
@@ -2984,7 +3100,7 @@ describe("main sync entry guards", () => {
     expect(startAutoSync).toHaveBeenCalledOnce();
   });
 
-  it("keeps the ordinary conflict pause when unrelated recovery is isolated", async () => {
+  it("keeps automatic sync active when conflicts coexist with isolated recovery", async () => {
     const plugin = new EasySyncPlugin();
     plugin.autoSyncPaused = false;
     plugin.state = {
@@ -3029,9 +3145,11 @@ describe("main sync entry guards", () => {
       },
     }, "manual");
 
-    expect(plugin.autoSyncPaused).toBe(true);
-    expect(stopAutoSync).toHaveBeenCalledOnce();
-    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    // Neither conflicts (2026-09-01) nor an isolated ordinary-file recovery
+    // pause the vault; unrelated files keep syncing.
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(stopAutoSync).not.toHaveBeenCalled();
+    expect(saveSyncSettings).not.toHaveBeenCalled();
   });
 
   it("updates one continuing history event across retries and marks it recovered when evidence settles", async () => {
@@ -3438,7 +3556,7 @@ describe("main sync entry guards", () => {
     expect(schedulePersistedJoinSync).toHaveBeenCalledWith("auto-start");
   });
 
-  it("pauses automatic sync after an otherwise successful run leaves pending conflicts", async () => {
+  it("keeps automatic sync active when an otherwise successful run leaves pending conflicts", async () => {
     const plugin = new EasySyncPlugin();
     plugin.autoSyncPaused = false;
     plugin.state = { planReviewActive: false } as never;
@@ -3459,9 +3577,11 @@ describe("main sync entry guards", () => {
       message: "result.conflictsPending",
     }, "auto");
 
-    expect(plugin.autoSyncPaused).toBe(true);
-    expect(stopAutoSync).toHaveBeenCalledOnce();
-    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    // Conflicts are pending decisions, not a sync gate: automatic sync keeps
+    // running and the rest of the vault keeps syncing (2026-09-01 decision).
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(stopAutoSync).not.toHaveBeenCalled();
+    expect(saveSyncSettings).not.toHaveBeenCalled();
     expect(startAutoSync).not.toHaveBeenCalled();
   });
 
@@ -4042,6 +4162,39 @@ describe("main sync entry guards", () => {
 
     expect(confirmRemoteDeletes).toHaveBeenCalledOnce();
     expect(confirmRemoteDeletes).toHaveBeenCalledWith(["a.md", "b.md"]);
+  });
+
+  it("shows one queueing notice for a batch delete before entering the side-action gateway", async () => {
+    const plugin = makePlugin();
+    const show = vi.fn();
+    const confirmRemoteDeletes = vi.fn().mockResolvedValue(undefined);
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    plugin.state = {
+      pendingRemoteDeletes: [
+        { path: "a.md" },
+        { path: "b.md" },
+      ],
+    } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: false,
+      confirmRemoteDeletes,
+    } as never;
+    vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+    vi.spyOn(plugin, "syncView", "get").mockReturnValue(null);
+
+    await expect(plugin.confirmRemoteDeletes(["a.md", "b.md"]))
+      .resolves.toBe(true);
+
+    // 入队提示先于网关执行弹出，且走 ambient 过滤（遵循「通知弹窗」设置）。
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "side-action:batch-delete:queueing",
+      message: "notice.delete.queueing",
+      category: "ambient",
+    }));
+    expect(confirmRemoteDeletes).toHaveBeenCalledOnce();
   });
 
   it("blocks UI side actions when the current token account does not match", async () => {

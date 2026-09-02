@@ -188,10 +188,12 @@ export interface LocaleStrings {
   "settings.autoSyncChangeDelay.desc": string;
   "settings.autoSyncChangeDelay.disabledDesc": string;
   "settings.notificationPopups.name": string;
-  "settings.notificationPopups.desc": string;
   "settings.notificationPopups.option.all": string;
   "settings.notificationPopups.option.important": string;
   "settings.notificationPopups.option.off": string;
+  "settings.notificationPopups.hint.all": string;
+  "settings.notificationPopups.hint.important": string;
+  "settings.notificationPopups.hint.off": string;
   "settings.maxFileSize.name": string;
   "settings.maxFileSize.desc": string;
   "settings.reset.name": string;
@@ -290,6 +292,9 @@ export interface LocaleStrings {
   "syncView.mutationResolution.keepRemote": string;
   "syncView.mutationResolution.singleActionHint": string;
   "syncView.mutationResolution.noAvailableActions": string;
+  "syncView.mutationResolution.noAvailableActionsKeepLocal": string;
+  "syncView.mutationResolution.noAvailableActionsKeepRemote": string;
+  "syncView.mutationResolution.noAvailableActionsFallback": string;
   "syncView.mutationResolution.deleteConfirmTitle": string;
   "syncView.mutationResolution.deleteConfirm": string;
   "syncView.mutationResolution.deleteConfirmMessage": string;
@@ -309,10 +314,13 @@ export interface LocaleStrings {
   "syncView.pluginBundleReview.fileDifferent": string;
   "syncView.pluginBundleReview.fileLocalOnly": string;
   "syncView.pluginBundleReview.fileRemoteOnly": string;
+  "syncView.pluginBundleReview.review": string;
   "syncView.pluginBundleReview.loading": string;
   "syncView.pluginBundleReview.loadUnavailable": string;
   "syncView.pluginBundleReview.conflictSummary": string;
   "syncView.pluginBundleReview.open": string;
+  "syncView.pluginBundleReview.viewDiff": string;
+  "syncView.pluginBundleReview.diffTitle": string;
   "syncView.pluginBundleReview.keepLocal": string;
   "syncView.pluginBundleReview.keepRemote": string;
   "syncView.pluginBundleReview.identical": string;
@@ -416,6 +424,7 @@ export interface LocaleStrings {
   "notice.sync.cancelled": string;
   "notice.sync.failed": string;
   "notice.sync.authExpired": string;
+  "notice.sync.thresholdSkippedInAuto": string;
   "notice.sync.recoveryWaiting": string;
   "notice.sync.recoveryRecovered": string;
   "notice.sync.recoveryBlocked": string;
@@ -501,6 +510,7 @@ export interface LocaleStrings {
   "notice.delete.confirmed": string;
   "notice.delete.rejected": string;
   "notice.delete.failed": string;
+  "notice.delete.queueing": string;
 
   // ---- Conflict Detail Modal ----
   "conflictDetail.title": string;
@@ -509,6 +519,7 @@ export interface LocaleStrings {
   "conflictDetail.fileSize": string;
   "conflictDetail.localLabel": string;
   "conflictDetail.remoteLabel": string;
+  "conflictDetail.file": string;
   "conflictDetail.newer": string;
   "conflictDetail.larger": string;
   "conflictDetail.localPreview": string;
@@ -776,6 +787,7 @@ export interface LocaleStrings {
 
   // ---- Confirm Modal ----
   "confirm.cancel": string;
+  "confirm.confirm": string;
   "syncPlan.migrationSummary": string;
   "syncPlan.cloudJoinSummary": string;
   "syncPlan.confirmMigration": string;
@@ -786,6 +798,11 @@ export interface LocaleStrings {
   "syncPlan.remoteScopeRecreateConfirmMessage": string;
   "syncPlan.remoteScopeRecreateConfirm": string;
   "confirm.deleteWarning": string;
+  "confirm.pluginDowngradeTitle": string;
+  "confirm.pluginDowngradeMessage": string;
+  "confirm.pluginUpgradeTitle": string;
+  "confirm.pluginUpgradeMessage": string;
+  "reason.pluginDowngradeRemote": string;
 
   // ---- Sync Plan Alert & Review ----
   "syncPlan.readyTitle": string;

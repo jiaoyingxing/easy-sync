@@ -73,6 +73,32 @@ describe("buildSettingsSyncButtonState", () => {
     });
   });
 
+  it("keeps notification pop-ups progressive disclosure on both render paths", () => {
+    const source = readFileSync("src/ui/settings-tab.ts", "utf8");
+    const displaySectionStart = source.indexOf("  private renderDisplaySection(");
+    const aboutSectionStart = source.indexOf("  private renderAboutSection(");
+    const displaySection = source.slice(displaySectionStart, aboutSectionStart);
+
+    // Imperative path: the hint element lives in the row desc and follows the
+    // selected level without a full re-render.
+    expect(displaySection).toContain(
+      'const hintEl = setting.descEl.createDiv({',
+    );
+    expect(displaySection).toContain('cls: "easy-sync-notification-popups-hint"');
+    expect(displaySection).toContain(
+      't(`settings.notificationPopups.hint.${this.plugin.notificationPopups}`)',
+    );
+    expect(displaySection).toContain("renderHint();");
+
+    // Declarative path mirrors the same hint wiring for Obsidian 1.13+.
+    const declarativeStart = source.indexOf("export function buildSettingDefinitions(");
+    const declarative = source.slice(declarativeStart);
+    expect(declarative).toContain('cls: "easy-sync-notification-popups-hint"');
+    expect(declarative).toContain(
+      't(`settings.notificationPopups.hint.${plugin.notificationPopups}`)',
+    );
+  });
+
   it("keeps account actions unheaded and separates range from automatic settings", () => {
     const source = readFileSync("src/ui/settings-tab.ts", "utf8");
     const autoSyncModalSource = readFileSync("src/ui/auto-sync-modal.ts", "utf8");

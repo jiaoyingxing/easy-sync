@@ -352,10 +352,27 @@ function makeState(
     applyRemoteMutations: vi.fn().mockResolvedValue(undefined),
     upsertBaseEntries: vi.fn().mockResolvedValue(undefined),
     removeBaseEntries: vi.fn().mockResolvedValue(undefined),
-    prunePendingConflicts: vi.fn().mockResolvedValue(undefined),
+    prunePendingConflicts: vi.fn(async (activePaths: Iterable<string>) => {
+      const active = new Set(activePaths);
+      state.pendingConflicts = state.pendingConflicts.filter((item) =>
+        active.has(item.path));
+    }),
     prunePendingDeletes: vi.fn().mockResolvedValue(undefined),
     prunePendingIssues: vi.fn().mockResolvedValue(undefined),
-    upsertPendingConflicts: vi.fn().mockResolvedValue(undefined),
+    addPendingConflict: vi.fn(async (item: SyncPlanItem) => {
+      state.pendingConflicts = [
+        ...state.pendingConflicts.filter((existing) => existing.path !== item.path),
+        item,
+      ];
+    }),
+    upsertPendingConflicts: vi.fn(async (items: SyncPlanItem[]) => {
+      for (const item of items) {
+        state.pendingConflicts = [
+          ...state.pendingConflicts.filter((existing) => existing.path !== item.path),
+          item,
+        ];
+      }
+    }),
     removePendingConflict: vi.fn().mockResolvedValue(undefined),
     upsertPendingDeletes: vi.fn().mockResolvedValue(undefined),
     removePendingDelete: vi.fn().mockResolvedValue(undefined),
@@ -1960,7 +1977,7 @@ describe("community plugin enablement runtime", () => {
     );
   });
 
-  it("blocks a selected plugin downgrade before writing bundle files", async () => {
+  it("defers a selected plugin downgrade before writing bundle files", async () => {
     const manifestPath = ".obsidian/plugins/calendar/manifest.json";
     const mainPath = ".obsidian/plugins/calendar/main.js";
     const localManifest = JSON.stringify({
@@ -2014,9 +2031,206 @@ describe("community plugin enablement runtime", () => {
 
     const result = await executor.run("manual");
 
-    expect(result.errors).toBeGreaterThan(0);
+    // The plan-level downgrade guard defers the whole bundle to a reviewable
+    // pending conflict; nothing is written and the run does not error.
+    expect(result.errors).toBe(0);
+    expect(state.pendingConflicts.some((item) =>
+      item.path === manifestPath
+      && item.reason === "reason.pluginDowngradeRemote",
+    )).toBe(true);
     expect(memory.text.get(manifestPath)).toBe(localManifest);
     expect(new TextDecoder().decode(memory.binary.get(mainPath))).toBe("current-main");
+  });
+
+
+  it("keeps a downgrade-review pending row alive while the plan still downloads that bundle", async () => {
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const localManifest = JSON.stringify({
+      id: "calendar",
+      version: "2.0.0",
+      minAppVersion: "1.5.0",
+    });
+    const remoteManifestBytes = bytes(JSON.stringify({
+      id: "calendar",
+      version: "1.9.0",
+      minAppVersion: "1.5.0",
+    }));
+    const remoteMainBytes = bytes("older-main");
+    const remoteManifest = await remoteEntry(manifestPath, remoteManifestBytes);
+    const remoteMain = await remoteEntry(mainPath, remoteMainBytes);
+    const memory = makeMemoryAdapter({
+      [manifestPath]: localManifest,
+      [mainPath]: bytes("current-main"),
+    });
+    const localManifestEntry = await localEntry(manifestPath, bytes(localManifest));
+    const localMainEntry = await localEntry(mainPath, bytes("current-main"));
+    const state = makeState(
+      [remoteManifest, remoteMain],
+      [
+        {
+          path: manifestPath,
+          size: localManifestEntry.size,
+          hash: localManifestEntry.hash,
+          eTag: "etag:base:manifest",
+        },
+        {
+          path: mainPath,
+          size: localMainEntry.size,
+          hash: localMainEntry.hash,
+          eTag: "etag:base:main",
+        },
+      ],
+    );
+    const downloadFile = vi.fn(async (
+      _vaultName: string,
+      path: string,
+    ) => path === manifestPath ? remoteManifestBytes : remoteMainBytes);
+    const { executor } = makeExecutor({
+      localEntries: [localManifestEntry, localMainEntry],
+      remoteEntries: [remoteManifest, remoteMain],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, { downloadFile }),
+    });
+
+    const first = await executor.run("manual");
+    // The guard defers the whole bundle; nothing is written, no error, and
+    // the pending downgrade-review row exists (the result message "本轮有 N 项
+    // 冲突待处理" is driven by pendingConflicts, not by result.conflicts).
+    expect(first.errors).toBe(0);
+    const firstPending = state.pendingConflicts.filter((item) =>
+      item.path === manifestPath
+      && item.reason === "reason.pluginDowngradeRemote",
+    );
+    expect(firstPending).toHaveLength(1);
+    const callsAfterFirst = (state.addPendingConflict as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    // Second round with the identical downgrade plan: the guard must not
+    // re-hang the same bundle (the pending row is retained by pruning AND its
+    // decision token must stay stable). A re-upsert with a fresh token would
+    // make an already-open review dialog fail its factsDigest check on every
+    // button press — the "核对卡住" symptom.
+    const second = await executor.run("manual");
+    expect(second.errors).toBe(0);
+    const secondPending = state.pendingConflicts.filter((item) =>
+      item.path === manifestPath
+      && item.reason === "reason.pluginDowngradeRemote",
+    );
+    expect(secondPending).toHaveLength(1);
+    expect(JSON.stringify(secondPending[0].decisionToken))
+      .toBe(JSON.stringify(firstPending[0].decisionToken));
+    expect((state.addPendingConflict as ReturnType<typeof vi.fn>).mock.calls.length)
+      .toBe(callsAfterFirst);
+  });
+
+  it("retires a downgrade-review pending row once the plan stops downloading that bundle", async () => {
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const localManifest = JSON.stringify({
+      id: "calendar",
+      version: "2.0.0",
+      minAppVersion: "1.5.0",
+    });
+    const remoteManifestBytes = bytes(JSON.stringify({
+      id: "calendar",
+      version: "1.9.0",
+      minAppVersion: "1.5.0",
+    }));
+    const remoteMainBytes = bytes("older-main");
+    const remoteManifest = await remoteEntry(manifestPath, remoteManifestBytes);
+    const remoteMain = await remoteEntry(mainPath, remoteMainBytes);
+    const memory = makeMemoryAdapter({
+      [manifestPath]: localManifest,
+      [mainPath]: bytes("current-main"),
+    });
+    const localManifestEntry = await localEntry(manifestPath, bytes(localManifest));
+    const localMainEntry = await localEntry(mainPath, bytes("current-main"));
+    const state = makeState(
+      [remoteManifest, remoteMain],
+      [
+        {
+          path: manifestPath,
+          size: localManifestEntry.size,
+          hash: localManifestEntry.hash,
+          eTag: "etag:base:manifest",
+        },
+        {
+          path: mainPath,
+          size: localMainEntry.size,
+          hash: localMainEntry.hash,
+          eTag: "etag:base:main",
+        },
+      ],
+    );
+    const downloadFile = vi.fn(async (
+      _vaultName: string,
+      path: string,
+    ) => path === manifestPath ? remoteManifestBytes : remoteMainBytes);
+    const { executor } = makeExecutor({
+      localEntries: [localManifestEntry, localMainEntry],
+      remoteEntries: [remoteManifest, remoteMain],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, { downloadFile }),
+    });
+
+    const first = await executor.run("manual");
+    expect(state.pendingConflicts.some((item) =>
+      item.path === manifestPath
+      && item.reason === "reason.pluginDowngradeRemote",
+    )).toBe(true);
+
+    // The remote catches up to the local version on every member; the plan
+    // no longer downloads the bundle and the stale downgrade row is retired.
+    const remoteManifest2 = await remoteEntry(
+      manifestPath,
+      bytes(localManifest),
+    );
+    const remoteMain2 = await remoteEntry(mainPath, bytes("current-main"));
+    const memory2 = makeMemoryAdapter({
+      [manifestPath]: localManifest,
+      [mainPath]: bytes("current-main"),
+    });
+    const state2 = makeState(
+      [remoteManifest2, remoteMain2],
+      [
+        {
+          path: manifestPath,
+          size: localManifestEntry.size,
+          hash: localManifestEntry.hash,
+          eTag: "etag:base:manifest",
+        },
+        {
+          path: mainPath,
+          size: localMainEntry.size,
+          hash: localMainEntry.hash,
+          eTag: "etag:base:main",
+        },
+      ],
+    );
+    await state2.upsertPendingConflicts(state.pendingConflicts);
+    const downloadFile2 = vi.fn(async (
+      _vaultName: string,
+      path: string,
+    ) => path === manifestPath ? bytes(localManifest) : bytes("current-main"));
+    const { executor: executor2 } = makeExecutor({
+      localEntries: [localManifestEntry, localMainEntry],
+      remoteEntries: [remoteManifest2, remoteMain2],
+      remoteContent: null,
+      adapter: memory2.adapter,
+      state: state2,
+      oneDrive: makeOneDrive(null, { downloadFile: downloadFile2 }),
+    });
+
+    const second = await executor2.run("manual");
+    expect(second.errors).toBe(0);
+    expect(state2.pendingConflicts.some((item) =>
+      item.path === manifestPath
+      && item.reason === "reason.pluginDowngradeRemote",
+    )).toBe(false);
   });
 
   it("lets a selected plugin with non-SemVer raw versions upload without an automatic downgrade judgment", async () => {
@@ -2972,8 +3186,93 @@ describe("community plugin enablement runtime", () => {
 
     const result = await executor.run("manual");
 
-    expect(result.errors).toBeGreaterThan(0);
+    // The plan-level upload downgrade guard defers the bundle to a reviewable
+    // pending conflict; nothing is uploaded and the run does not error.
+    expect(result.errors).toBe(0);
+    expect(state.pendingConflicts.some((item) =>
+      item.path === manifestPath
+      && item.reason === "reason.pluginDowngradeRemote",
+    )).toBe(true);
     expect(uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("keeps an upload-downgrade pending row and its decision token stable across rounds", async () => {
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const localManifestText = JSON.stringify({
+      id: "calendar",
+      version: "1.9.0",
+      minAppVersion: "1.5.0",
+    });
+    const remoteManifestBytes = bytes(JSON.stringify({
+      id: "calendar",
+      version: "2.0.0",
+      minAppVersion: "1.5.0",
+    }));
+    const remoteMainBytes = bytes("newer-main");
+    const localManifest = await localEntry(manifestPath, bytes(localManifestText));
+    const localMain = await localEntry(mainPath, bytes("older-main"));
+    const remoteManifest = await remoteEntry(manifestPath, remoteManifestBytes);
+    const remoteMain = await remoteEntry(mainPath, remoteMainBytes);
+    const memory = makeMemoryAdapter({
+      [manifestPath]: localManifestText,
+      [mainPath]: bytes("older-main"),
+    });
+    const state = makeState(
+      [remoteManifest, remoteMain],
+      [
+        {
+          path: manifestPath,
+          size: remoteManifest.size,
+          hash: remoteManifest.sha256Hash!,
+          eTag: remoteManifest.eTag,
+        },
+        {
+          path: mainPath,
+          size: remoteMain.size,
+          hash: remoteMain.sha256Hash!,
+          eTag: remoteMain.eTag,
+        },
+      ],
+    );
+    const downloadFile = vi.fn(async (
+      _vaultName: string,
+      path: string,
+    ) => path === manifestPath ? remoteManifestBytes : remoteMainBytes);
+    const uploadFile = vi.fn();
+    const { executor } = makeExecutor({
+      localEntries: [localManifest, localMain],
+      remoteEntries: [remoteManifest, remoteMain],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, { downloadFile, uploadFile }),
+    });
+
+    const first = await executor.run("manual");
+    expect(first.errors).toBe(0);
+    const firstPending = state.pendingConflicts.filter((item) =>
+      item.path === manifestPath
+      && item.reason === "reason.pluginDowngradeRemote",
+    );
+    expect(firstPending).toHaveLength(1);
+    const callsAfterFirst = (state.addPendingConflict as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    // Second round with the identical upload-downgrade plan: the guard must
+    // not re-hang the same bundle (mirror of the download-direction
+    // idempotency), so the pending row and its decision token stay stable and
+    // an already-open review dialog keeps working.
+    const second = await executor.run("manual");
+    expect(second.errors).toBe(0);
+    const secondPending = state.pendingConflicts.filter((item) =>
+      item.path === manifestPath
+      && item.reason === "reason.pluginDowngradeRemote",
+    );
+    expect(secondPending).toHaveLength(1);
+    expect(JSON.stringify(secondPending[0].decisionToken))
+      .toBe(JSON.stringify(firstPending[0].decisionToken));
+    expect((state.addPendingConflict as ReturnType<typeof vi.fn>).mock.calls.length)
+      .toBe(callsAfterFirst);
   });
 
   it("rebuilds a legacy remote cache before trusting its plugin folder inventory", async () => {

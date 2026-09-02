@@ -387,6 +387,15 @@ export interface SyncResult {
   metrics?: ExecutionMetrics;
 }
 
+/** Strict UTF-8 decode; null when the bytes are not valid text. */
+function decodeUtf8(content: ArrayBuffer): string | null {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(content);
+  } catch {
+    return null;
+  }
+}
+
 /** Stable, human-readable text for values stored in error slots.
  *  Preserves primitive formatting exactly and JSON-serializes objects. */
 function describeThrownValue(value: unknown): string {
@@ -2415,6 +2424,22 @@ export class SyncExecutor {
     if (result.runFacts) result.runFacts.termination = "cancelled";
   }
 
+  /** Record that this run paused with a durable plan held for review.
+   * Structured replacement for the pausedForReview localised-message sniff
+   * (review 2026-09-02, C9/C13 cross-cluster finding 6): consumers read
+   * `runFacts.planReviewPaused` instead of comparing translated text. */
+  private markPlanReviewPaused(result: SyncResult): SyncResult {
+    result.message = this.t("result.pausedForReview");
+    const prior = result.runFacts;
+    result.runFacts = {
+      termination: prior?.termination ?? "normal",
+      ordinaryPlanning: prior?.ordinaryPlanning ?? "not-entered",
+      userFileChanges: prior?.userFileChanges ?? "unknown",
+      planReviewPaused: true,
+    };
+    return result;
+  }
+
   private canContinue(epoch: number, result?: SyncResult): boolean {
     return !this.cancelled
       && this.lifecycle.isCurrent(epoch)
@@ -2465,6 +2490,10 @@ export class SyncExecutor {
 
   private async inspectManualResolutionRemote(
     path: string,
+    options: Readonly<{
+      /** Local SHA-256 (lowercase) to compare against remote hash without downloading. */
+      localHash?: string | undefined;
+    }> = {},
   ): Promise<{
       fact: ManualMutationResolutionRemoteFactV1;
       entry?: RemoteFileEntry;
@@ -2491,6 +2520,21 @@ export class SyncExecutor {
         || verified.eTag !== initial.eTag
         || verified.size !== initial.size
       ) throw new Error(`Remote recovery review changed: ${path}`);
+    } else if (options.localHash && hash === options.localHash) {
+      // Same bytes on both sides: hard equality proof from metadata alone.
+      // Skip the download entirely; the fact still carries the remote hash.
+      const entry = { ...initial, sha256Hash: hash };
+      return {
+        fact: {
+          path,
+          exists: true,
+          driveId: entry.driveId,
+          eTag: entry.eTag,
+          hash,
+          size: entry.size,
+        },
+        entry,
+      };
     }
     const entry = { ...initial, sha256Hash: hash };
     return {
@@ -2568,6 +2612,81 @@ export class SyncExecutor {
     );
   }
 
+  /**
+   * Fetch the current bytes of one reviewed community-plugin bundle member
+   * (local + remote) and compute the bounded display diff. Purely read-only:
+   * no state change, no mutation; the caller (bundle sub-dialog) renders the
+   * result. Returns null when the facts are unavailable or the content is not
+   * text.
+   */
+  async getCommunityPluginBundleFileDiff(
+    pluginId: string,
+    path: string,
+  ): Promise<{
+    localText: string;
+    remoteText: string;
+    localMtime?: number;
+    remoteMtime?: number;
+    localSize: number;
+    remoteSize: number;
+    /** True when either side is not valid UTF-8 text (binary content). */
+    binary: boolean;
+  } | null> {
+    if (
+      this.running
+      || this.hasSideActionsInFlight
+      || !this.state.isV2StateActive
+    ) return null;
+    const configDir = getConfigDir(this.scanner.vault);
+    const parsed = parseCommunityPluginBundlePath(path, configDir);
+    if (!parsed || parsed.pluginId !== pluginId) return null;
+
+    const localInspection = await this.inspectLocalPath(path);
+    if (
+      !localInspection
+      || localInspection.status !== "present"
+      || !localInspection.entry
+    ) return null;
+    const localRaw = await this.scanner.vault.adapter.readBinary(path);
+    const localText = decodeUtf8(localRaw);
+
+    const remote = await this.inspectManualResolutionRemote(path);
+    if (!remote.fact.exists || !remote.entry) return null;
+    const remoteBytes = await this.onedrive.downloadFile(
+      this.vaultName,
+      path,
+      remote.entry.downloadUrl,
+      remote.entry.driveId,
+      remote.entry.size,
+    );
+    if (remoteBytes.byteLength !== remote.entry.size) return null;
+    const remoteText = decodeUtf8(remoteBytes);
+
+    if (localText == null || remoteText == null) {
+      // Binary / non-text side: surface as binary rather than a generic load
+      // failure so the dialog can show the ordinary binary notice.
+      return {
+        localText: localText ?? "",
+        remoteText: remoteText ?? "",
+        localMtime: localInspection.entry.mtime,
+        remoteMtime: remote.entry.mtime,
+        localSize: localInspection.entry.size,
+        remoteSize: remote.entry.size,
+        binary: true,
+      };
+    }
+
+    return {
+      localText,
+      remoteText,
+      localMtime: localInspection.entry.mtime,
+      remoteMtime: remote.entry.mtime,
+      localSize: localInspection.entry.size,
+      remoteSize: remote.entry.size,
+      binary: false,
+    };
+  }
+
   private async buildCurrentPluginBundleReviewSnapshot(
     record: Readonly<MutationLedgerEntryV1> | null,
     requestedPluginId?: string,
@@ -2604,10 +2723,9 @@ export class SyncExecutor {
     let remoteReason: CommunityPluginBundleReviewBlockReasonV1 | undefined;
 
     for (const path of allPaths) {
-      const [localInspection, remoteInspection] = await Promise.all([
-        this.inspectLocalPath(path),
-        this.inspectManualResolutionRemote(path),
-      ]);
+      // Local inspection is cheap (stat + hash from cache); do it first so we
+      // can decide whether the remote needs a download at all.
+      const localInspection = await this.inspectLocalPath(path);
       if (!localInspection || localInspection.status === "uncertain") {
         localReason = "facts-unavailable";
       } else {
@@ -2627,6 +2745,15 @@ export class SyncExecutor {
           localMtimeByPath.set(path, localInspection.entry.mtime);
         }
       }
+
+      const localHash = localInspection?.status === "present"
+        && localInspection.entry
+        ? localInspection.entry.hash
+        : undefined;
+      const remoteInspection = await this.inspectManualResolutionRemote(
+        path,
+        { localHash },
+      );
       remoteByPath.set(path, remoteInspection.fact);
       if (remoteInspection.entry) {
         remoteEntryByPath.set(path, remoteInspection.entry);
@@ -2654,15 +2781,24 @@ export class SyncExecutor {
       }
     }
     if (remoteManifestFact?.exists) {
-      try {
-        remoteManifest = await this.readReviewedPluginRemoteManifest(
-          manifestPath,
-          remoteManifestFact,
-          remoteEntryByPath.get(manifestPath),
-        );
-        if (!remoteManifest) remoteReason = "facts-unavailable";
-      } catch {
-        remoteReason = "manifest-invalid";
+      // Same bytes on both sides (proven from metadata) means the remote
+      // manifest is the same release as the local one: reuse the local parse
+      // result and skip the remote text download entirely.
+      const localHash = localByPath.get(manifestPath)?.hash;
+      const remoteHash = remoteManifestFact.hash;
+      if (localManifest && localHash && remoteHash === localHash) {
+        remoteManifest = localManifest;
+      } else {
+        try {
+          remoteManifest = await this.readReviewedPluginRemoteManifest(
+            manifestPath,
+            remoteManifestFact,
+            remoteEntryByPath.get(manifestPath),
+          );
+          if (!remoteManifest) remoteReason = "facts-unavailable";
+        } catch {
+          remoteReason = "manifest-invalid";
+        }
       }
     }
 
@@ -4997,6 +5133,10 @@ export class SyncExecutor {
           },
         );
         if (incompatibility) {
+          // The plan-level downgrade guard removes the whole bundle from the
+          // download plan before any file (including manifest.json) is
+          // written; this remains a fail-closed backstop for anything that
+          // slips past it.
           throw new Error(
             `Selected plugin bundle is incompatible (${incompatibility}): ${pluginId}`,
           );
@@ -8110,8 +8250,7 @@ export class SyncExecutor {
             if (publishPreview) {
               await waitForReview(() => publishPreview(plan));
             }
-            result.message = this.t("result.pausedForReview");
-            return result;
+            return this.markPlanReviewPaused(result);
           }
         }
       }
@@ -8199,7 +8338,7 @@ export class SyncExecutor {
               reviewKind === "v2-migration"
               && options.acknowledgeMigrationRisk !== true
             ) {
-              result.message = this.t("result.pausedForReview");
+              this.markPlanReviewPaused(result);
               this.diag?.warn(
                 "state",
                 "V2 migration remains paused until this device acknowledges the migration risk",
@@ -8463,8 +8602,7 @@ export class SyncExecutor {
             if (publishPreview) {
               await waitForReview(() => publishPreview(plan));
             }
-            result.message = this.t("result.pausedForReview");
-            return result;
+            return this.markPlanReviewPaused(result);
           }
         } else {
           const hold = await this.state.stageV2MigrationHold({
@@ -8488,8 +8626,7 @@ export class SyncExecutor {
           if (publishPreview) {
             await waitForReview(() => publishPreview(plan));
           }
-          result.message = this.t("result.pausedForReview");
-          return result;
+          return this.markPlanReviewPaused(result);
         }
       }
 
@@ -8517,8 +8654,7 @@ export class SyncExecutor {
             mutations: 0,
           },
         );
-        result.message = this.t("result.pausedForReview");
-        return result;
+        return this.markPlanReviewPaused(result);
       }
 
       // A legacy namespace recovery is never executable in the same round.
@@ -8550,8 +8686,7 @@ export class SyncExecutor {
         );
         const publishPreview = callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
         if (publishPreview) await waitForReview(() => publishPreview(plan));
-        result.message = this.t("result.pausedForReview");
-        return result;
+        return this.markPlanReviewPaused(result);
       }
 
       // Planner-derived issue rows are pure UI state. Retire the rows the
@@ -8596,8 +8731,7 @@ export class SyncExecutor {
           if (callbacks.onConfirmThreshold) {
             await waitForReview(() => callbacks.onConfirmThreshold!(plan));
           }
-          result.message = this.t("result.pausedForReview");
-          return result;
+          return this.markPlanReviewPaused(result);
         }
         const savedDigest = this.state.planReviewDigest;
         const currentDigest = plan.canonicalIdentity
@@ -8622,8 +8756,7 @@ export class SyncExecutor {
             ? await waitForReview(() => callbacks.onConfirmThreshold!(plan))
             : false;
           if (!confirmed) {
-            result.message = this.t("result.pausedForReview");
-            return result;
+            return this.markPlanReviewPaused(result);
           }
           if (this.shouldStop(result, operationEpoch)) return result;
         }
@@ -8631,8 +8764,7 @@ export class SyncExecutor {
         const cleared = await this.state.clearPlanReview(reviewedAuthorization);
         if (!cleared) {
           this.diag?.warn("plan", "plan review changed before authorization commit — stopping before mutation");
-          result.message = this.t("result.pausedForReview");
-          return result;
+          return this.markPlanReviewPaused(result);
         }
       }
 
@@ -8654,11 +8786,22 @@ export class SyncExecutor {
         finalizedCanonicalPlan.requiresThresholdConfirmation
         && !planContainsOnlyExplicitJoinDownloads;
       if (!skipConfirmation && requiresThresholdConfirmation) {
-        if (callbacks.onConfirmThreshold) {
+        if (mode === "auto") {
+          // Direction 3 (user decision 2026-09-02): automatic sync does not
+          // pause for the threshold review — the plan proceeds and the
+          // caller shows a one-line summary notice instead. The structured
+          // flag replaces any localised-message signal.
+          const priorFacts = result.runFacts;
+          result.runFacts = {
+            termination: priorFacts?.termination ?? "normal",
+            ordinaryPlanning: priorFacts?.ordinaryPlanning ?? "not-entered",
+            userFileChanges: priorFacts?.userFileChanges ?? "unknown",
+            thresholdSkippedInAuto: true,
+          };
+        } else if (callbacks.onConfirmThreshold) {
           const confirmed = await waitForReview(() => callbacks.onConfirmThreshold!(plan));
           if (!confirmed) {
-            result.message = this.t("result.pausedForReview");
-            return result;
+            return this.markPlanReviewPaused(result);
           }
           if (this.shouldStop(result, operationEpoch)) return result;
         }
@@ -8670,8 +8813,7 @@ export class SyncExecutor {
         if (callbacks.onFirstSyncPreview) {
           const confirmed = await waitForReview(() => callbacks.onFirstSyncPreview!(plan));
           if (!confirmed) {
-            result.message = this.t("result.pausedForReview");
-            return result;
+            return this.markPlanReviewPaused(result);
           }
           if (this.shouldStop(result, operationEpoch)) return result;
         }
@@ -8732,8 +8874,7 @@ export class SyncExecutor {
             remoteIdentityComplete: migrationRemoteItems !== null,
             mutations: 0,
           });
-          result.message = this.t("result.pausedForReview");
-          return result;
+          return this.markPlanReviewPaused(result);
         }
       }
 
@@ -8742,6 +8883,19 @@ export class SyncExecutor {
       // preview never rewrites legacy state and a zero-plan migration can
       // archive the original public-1.1.3 snapshot before retiring stale UI.
       if (this.shouldStop(result, operationEpoch)) return result;
+      // A downgrade-review row whose bundle still has a download or upload in
+      // this plan must survive pruning: the plan-level guards re-hang the same
+      // bundle on every round, so retiring the row here would recreate the
+      // identical pending conflict on the next round — an endless per-interval
+      // cycle. The row is retired only when the user settles it or the plan
+      // stops touching the bundle (remote no longer lower than local).
+      const pendingDowngradeRetained = new Set(
+        this.state.pendingConflicts
+          .filter((item) => item.reason === "reason.pluginDowngradeRemote")
+          .filter((item) => this.planStillDownloadsPluginBundle(plan, item.path)
+            || this.planStillUploadsPluginBundle(plan, item.path))
+          .map((item) => item.path),
+      );
       await this.state.prunePendingConflicts(
         [
           ...plan.items
@@ -8753,6 +8907,7 @@ export class SyncExecutor {
               protectedMutationRecoveryRecords,
             ))
             .map((item) => item.path),
+          ...pendingDowngradeRetained,
         ],
       );
       if (this.shouldStop(result, operationEpoch)) return result;
@@ -9558,6 +9713,24 @@ export class SyncExecutor {
       }
     }
 
+    // Community-plugin downgrade guard: a remote plugin version lower than the
+    // local one must not be written by an ordinary download (manifest.json
+    // would be overwritten before any bundle-level preflight). Whole affected
+    // bundles are removed from the download pool and surfaced as reviewable
+    // conflicts instead.
+    const communityPluginDowngradeRemoved =
+      await this.guardCommunityPluginBundleDowngrades(
+        downloads,
+        communityPluginSyncPolicy,
+      );
+    if (communityPluginDowngradeRemoved > 0) {
+      total -= communityPluginDowngradeRemoved;
+      this.diag?.log(
+        "execute",
+        `community plugin downgrade guard deferred ${communityPluginDowngradeRemoved} download(s) to user review`,
+      );
+    }
+
     let started = 0;
     this.progressStore?.setProgress(0, total, "");
     callbacks.onProgress?.(0, total, "");
@@ -10132,6 +10305,24 @@ export class SyncExecutor {
     }
 
     const uploadItems = [...smallUploads, ...largeUploads];
+    // Upload-direction downgrade guard: a local plugin version lower than the
+    // remote one must not overwrite the cloud bundle automatically. Whole
+    // affected bundles are removed from the upload pools (smallUploads /
+    // largeUploads directly, since the pools are iterated later) and surfaced
+    // as reviewable conflicts (mirror of guardCommunityPluginBundleDowngrades).
+    const communityPluginUploadDowngradeRemoved =
+      await this.guardCommunityPluginBundleUploadDowngrades(
+        smallUploads,
+        largeUploads,
+        communityPluginSyncPolicy,
+      );
+    if (communityPluginUploadDowngradeRemoved > 0) {
+      total -= communityPluginUploadDowngradeRemoved;
+      this.diag?.log(
+        "execute",
+        `community plugin upload downgrade guard deferred ${communityPluginUploadDowngradeRemoved} upload(s) to user review`,
+      );
+    }
     const communityPluginUploadErrors =
       await this.prepareCommunityPluginBundleUploads(
         uploadItems,
@@ -10281,6 +10472,71 @@ export class SyncExecutor {
     // Step 3b — only the read-only network stage of independent desktop small
     // downloads may overlap. Local CAS, temp verification, intent/receipt and
     // checkpoint publication below remain strictly serial per file.
+    //
+    // P1 — universal downloadUrl refresh batching: every plan download that
+    // lacks a fresh pre-signed URL (any platform, any size) is refreshed once
+    // up front through Graph $batch (20 ids per request) instead of paying one
+    // per-file `downloadUrlRefresh` round trip inside the download waterfall.
+    // This covers mobile (A1), desktop prefetch batches (whose members are now
+    // already filled and therefore skipped), and — the previously uncovered
+    // case — desktop large files (>8 MiB) that never enter the prefetch path.
+    // Any batch failure or malformed sub-response falls back to the existing
+    // per-file waterfall refresh — same fail-closed contract. Version
+    // verification below remains per-file and per-path (unchanged).
+    const universalBatchMetadataClient = this.onedrive as OneDriveClient & {
+      getDriveItemMetadataByIds?: (
+        driveItemIds: readonly string[],
+        metadataReason?: "downloadUrlRefresh" | "downloadVersionVerify" | "other",
+      ) => Promise<Map<string, DriveItem | null>>;
+    };
+    const canBatchDownloadUrlRefresh =
+      typeof universalBatchMetadataClient.getDriveItemMetadataByIds === "function";
+    if (canBatchDownloadUrlRefresh) {
+      const missingDownloadUrl = downloads.filter(
+        (item) => item.type === SyncActionType.Download
+          && !item.remote?.downloadUrl
+          && Boolean(item.remote?.driveId),
+      );
+      if (missingDownloadUrl.length > 0) {
+        const batchStartedAt = Date.now();
+        try {
+          const refreshed = await universalBatchMetadataClient.getDriveItemMetadataByIds(
+            missingDownloadUrl.map((item) => item.remote!.driveId),
+            "downloadUrlRefresh",
+          );
+          for (const item of missingDownloadUrl) {
+            const driveId = item.remote!.driveId;
+            const current = refreshed.get(driveId);
+            if (
+              current
+              && current.id === driveId
+              && current.eTag === item.remote!.eTag
+            ) {
+              const downloadUrl = current["@microsoft.graph.downloadUrl"];
+              if (downloadUrl) item.remote!.downloadUrl = downloadUrl;
+            }
+            // No URL / identity mismatch / missing item: leave downloadUrl
+            // unset so the existing waterfall refresh (or error path) handles
+            // it exactly as before.
+          }
+          this.diag?.log("execute", "batch downloadUrl refresh", {
+            schemaVersion: 1,
+            files: missingDownloadUrl.length,
+            batchRequests: Math.ceil(missingDownloadUrl.length / 20),
+            elapsedMs: Math.max(0, Date.now() - batchStartedAt),
+          });
+        } catch (error) {
+          // Fail-closed: leave every URL unset; the serial loop re-fetches
+          // per file through the existing waterfall, as before batching.
+          this.diag?.warn(
+            "execute",
+            `batch downloadUrl refresh failed, falling back to per-file waterfall`,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+    }
+
     let downloadIndex = 0;
     while (downloadIndex < downloads.length && this.canContinue(operationEpoch, result)) {
       const first = downloads[downloadIndex];
@@ -10537,7 +10793,7 @@ export class SyncExecutor {
 
     if (!this.canContinue(operationEpoch, result)) {
       this.diag?.log("execute", `sync cancelled after starting ${started}/${total} item(s)`);
-      result.message = this.t("result.cancelled");
+      this.markCancelled(result);
       return;
     }
     if (
@@ -11204,6 +11460,31 @@ export class SyncExecutor {
   }
 
   /**
+   * Advance the visible file-processing counter one bundle member at a time.
+   * A reviewed whole-plugin settlement runs inside one side action whose
+   * outer path is the plugin root, so without per-member updates the top
+   * status panel would show 1/1 while every member file is being written.
+   * `position` is the monotonic 1-based ordinal of the member being started
+   * (not its index in the members array: the keep-local commit order sorts
+   * manifest.json last, which would otherwise make the counter jump around).
+   */
+  private advanceBundleSettlementProgress(
+    settlement: Readonly<CommunityPluginBundleSettlementV2>,
+    position: number,
+    memberPath: string,
+    actionType: SyncActionType,
+  ): void {
+    const total = Math.max(1, settlement.members.length);
+    this.progressStore?.setProgress(
+      Math.min(Math.max(1, position), total),
+      total,
+      memberPath,
+      actionType,
+    );
+    this.onProgressUpdate?.();
+  }
+
+  /**
    * Continue one reviewed whole-plugin choice without splitting its members
    * into independent user decisions. Cloud-to-local replacement keeps its
    * local rollback journal; local-to-cloud publication receipts each member
@@ -11295,7 +11576,13 @@ export class SyncExecutor {
         );
       }
       const downloadedByPath = new Map<string, ArrayBuffer>();
-      for (const member of settlement.members) {
+      for (const [memberIndex, member] of settlement.members.entries()) {
+        this.advanceBundleSettlementProgress(
+          settlement,
+          memberIndex + 1,
+          member.intent.path,
+          SyncActionType.Download,
+        );
         const remote = remoteByPath.get(member.intent.path);
         if (!remote) continue;
         const expected = member.intent.expectedRemote;
@@ -11464,7 +11751,7 @@ export class SyncExecutor {
       return leftManifest - rightManifest
         || left.intent.path.localeCompare(right.intent.path);
     });
-    for (const originalMember of membersInCommitOrder) {
+    for (const [ordinal, originalMember] of membersInCommitOrder.entries()) {
       const currentSettlement = record.manualResolution;
       if (!currentSettlement || currentSettlement.version !== 2) {
         throw new Error(
@@ -11481,6 +11768,14 @@ export class SyncExecutor {
         );
       }
       if (member.receipt) continue;
+      this.advanceBundleSettlementProgress(
+        settlement,
+        ordinal + 1,
+        member.intent.path,
+        member.intent.expectedLocal.exists
+          ? SyncActionType.Upload
+          : SyncActionType.DeleteRemote,
+      );
 
       const recovered = await this.recoverCommunityPluginKeepLocalMemberReceipt(
         member.intent,
@@ -11911,6 +12206,45 @@ export class SyncExecutor {
       );
       const preflightError = preflightErrors.get(intent.path);
       if (preflightError !== undefined) {
+        // A plugin-version downgrade in a manual recovery is not a dead end:
+        // surface the whole bundle as a reviewable conflict so the user can
+        // inspect the diff and explicitly confirm (mirror of the plan-level
+        // downgrade guards). Anything else fails closed as before.
+        if (
+          this.failureReason(preflightError)
+            .includes("Selected plugin upload would downgrade remote bundle")
+        ) {
+          // Idempotency: keep an existing downgrade-review row of this bundle
+          // untouched so its decision token (and an already-open review
+          // dialog) survives recovery retries. The recovery still stays
+          // pending either way.
+          const alreadyPending = this.state.pendingConflicts.some((candidate) =>
+            candidate.reason === "reason.pluginDowngradeRemote"
+            && parseCommunityPluginBundlePath(
+              candidate.path,
+              getConfigDir(this.scanner.vault),
+            )?.pluginId === bundle.pluginId);
+          if (!alreadyPending) {
+            const pending: SyncPlanItem = {
+              ...item,
+              type: SyncActionType.Conflict,
+              reason: "reason.pluginDowngradeRemote",
+              decisionToken: this.createDecisionToken(item),
+            };
+            await this.state.addPendingConflict(pending);
+          }
+          result.conflicts++;
+          this.diag?.log(
+            "execute",
+            "manual plugin upload recovery downgrade deferred to user review",
+            { schemaVersion: 1, pluginId: bundle.pluginId },
+          );
+          throw new MutationNotAppliedError(
+            new Error(
+              `Plugin upload recovery downgrade deferred to review: ${intent.path}`,
+            ),
+          );
+        }
         throw new MutationNotAppliedError(
           preflightError instanceof Error
             ? preflightError
@@ -13295,6 +13629,40 @@ export class SyncExecutor {
         && targetStillMissing
         && sourceRemote === undefined
         && remoteStillExpected
+      ) return "not-applied";
+      // The move never happened and no local result survives: local source
+      // and target are both absent and the remote target is absent. The
+      // intent is provably not-applied (SC-15 permits abandoning an intent
+      // only when non-application is provable), the same provable-absence
+      // shape the single-path classifier already settles. Without this the
+      // record blocks mutation recovery forever with no executable
+      // resolution (EasySync issue report 20260901: moveLocalFile stuck in
+      // outcome-unresolved while the recovery modal shows both sides
+      // Missing with no keep-side button; 20260902 Android report: local
+      // source+target gone while the remote source still exists — the
+      // remote move was never applied either, and abandoning keeps the
+      // remote source file untouched as an ordinary re-sync).
+      // Path absence alone is not identity absence (the remote object may
+      // have moved to a third path); require the exact expected remote
+      // identity to be gone as well before abandoning the intent. The
+      // remote source being present does not block this shape: the remote
+      // target absence plus the dead expected remote identity proves the
+      // remote move never happened, and abandoning only stops tracking —
+      // it never deletes the surviving remote source file.
+      // An empty expected driveId never proves identity absence (persisted
+      // intents written by old/corrupt data can carry ""): without a usable
+      // remote identity the four-absence shape is not provable, so the
+      // classifier falls through to the conservative null branch below
+      // (fail-closed, record kept for the next round) instead of "not-applied"
+      // (review 2026-09-02 finding ⑤, C4 vs C5 adjudication: C4 correct).
+      if (
+        sourceLocal.status === "missing"
+        && local.status === "missing"
+        && !targetRemote
+        && !!intent.expectedRemote.driveId
+        && await this.onedrive.getDriveItemMetadataById(
+          intent.expectedRemote.driveId,
+        ) === null
       ) return "not-applied";
       if (
         sourceLocal.status !== "missing"
@@ -15782,8 +16150,7 @@ export class SyncExecutor {
       const publishPreview =
         callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
       if (publishPreview) await publishPreview(plan);
-      result.message = this.t("result.pausedForReview");
-      return result;
+      return this.markPlanReviewPaused(result);
     }
     enterPhase("remotePrepare");
     this.progressStore?.setPhase("preparing");
@@ -15892,6 +16259,62 @@ export class SyncExecutor {
       const local = localByPath.get(normalizeRemotePathKey(path));
       return local?.size === node.size ? [{ node, path }] : [];
     });
+    // N1 — corrupt-state recovery verification: every candidate lacks a
+    // pre-signed URL (delta projections never carry one), so without batching
+    // each verification download pays a per-file `downloadUrlRefresh` round
+    // trip inside the waterfall. Batch the read-only refresh up front (Graph
+    // $batch, 20 ids per request) exactly like the ordinary download path
+    // (P1); candidates without a matching eTag or without an eTag at all fall
+    // back to the existing per-file waterfall, and any batch failure leaves
+    // the map empty (fail-closed, same contract as P1).
+    const n1BatchMetadataClient = this.onedrive as OneDriveClient & {
+      getDriveItemMetadataByIds?: (
+        driveItemIds: readonly string[],
+        metadataReason?: "downloadUrlRefresh" | "downloadVersionVerify" | "other",
+      ) => Promise<Map<string, DriveItem | null>>;
+    };
+    const canBatchVerificationRefresh =
+      typeof n1BatchMetadataClient.getDriveItemMetadataByIds === "function";
+    const verificationDownloadUrlById = new Map<string, string>();
+    if (canBatchVerificationRefresh) {
+      const refreshableCandidates = verificationCandidates.filter(
+        ({ node }) => Boolean(node.eTag),
+      );
+      if (refreshableCandidates.length > 0) {
+        const batchStartedAt = Date.now();
+        try {
+          const refreshed = await n1BatchMetadataClient.getDriveItemMetadataByIds(
+            refreshableCandidates.map(({ node }) => node.id),
+            "downloadUrlRefresh",
+          );
+          for (const { node } of refreshableCandidates) {
+            const current = refreshed.get(node.id);
+            if (
+              current
+              && current.id === node.id
+              && current.eTag === node.eTag
+            ) {
+              const downloadUrl = current["@microsoft.graph.downloadUrl"];
+              if (downloadUrl) verificationDownloadUrlById.set(node.id, downloadUrl);
+            }
+          }
+          this.diag?.log("execute", "batch downloadUrl refresh (verification)", {
+            schemaVersion: 1,
+            files: refreshableCandidates.length,
+            batchRequests: Math.ceil(refreshableCandidates.length / 20),
+            elapsedMs: Math.max(0, Date.now() - batchStartedAt),
+          });
+        } catch (error) {
+          // Fail-closed: leave the map empty; every candidate re-fetches per
+          // file through the existing waterfall, as before batching.
+          this.diag?.warn(
+            "execute",
+            `batch downloadUrl refresh failed for verification, falling back to per-file waterfall`,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+    }
     let verifiedCount = 0;
     for (const { node, path } of verificationCandidates) {
       verifiedCount++;
@@ -15918,7 +16341,7 @@ export class SyncExecutor {
       const content = await this.onedrive.downloadFile(
         this.vaultName,
         path,
-        item["@microsoft.graph.downloadUrl"],
+        verificationDownloadUrlById.get(node.id),
         node.id,
         node.size,
       );
@@ -16189,8 +16612,7 @@ export class SyncExecutor {
     const publishPreview =
       callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
     if (publishPreview) await publishPreview(plan);
-    result.message = this.t("result.pausedForReview");
-    return result;
+    return this.markPlanReviewPaused(result);
   }
 
   private async observeSharedSyncProtocolObjects(
@@ -17032,7 +17454,7 @@ export class SyncExecutor {
         const publishPreview =
           callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
         if (publishPreview) await publishPreview(reviewPlan);
-        result.message = this.t("result.pausedForReview");
+        this.markPlanReviewPaused(result);
         this.diag?.warn(
           "state",
           "missing V2 remote scope requires an explicit create-only infrastructure review",
@@ -17349,6 +17771,59 @@ export class SyncExecutor {
       failureStage: undefined,
       firstFailurePath: undefined,
     });
+    // N2 — scope-recovery verification: same shape as N1. Candidates come from
+    // a delta projection that never carries downloadUrl, so batch the read-only
+    // refresh up front (Graph $batch, 20 ids per request); candidates without a
+    // matching/available eTag and any batch failure fall back to the existing
+    // per-file waterfall (fail-closed, same contract as P1/N1).
+    const n2BatchMetadataClient = this.onedrive as OneDriveClient & {
+      getDriveItemMetadataByIds?: (
+        driveItemIds: readonly string[],
+        metadataReason?: "downloadUrlRefresh" | "downloadVersionVerify" | "other",
+      ) => Promise<Map<string, DriveItem | null>>;
+    };
+    const canBatchScopeRecoveryRefresh =
+      typeof n2BatchMetadataClient.getDriveItemMetadataByIds === "function";
+    const scopeRecoveryDownloadUrlById = new Map<string, string>();
+    if (canBatchScopeRecoveryRefresh) {
+      const refreshableCandidates = pendingVerificationCandidates.filter(
+        ({ node }) => Boolean(node.eTag),
+      );
+      if (refreshableCandidates.length > 0) {
+        const batchStartedAt = Date.now();
+        try {
+          const refreshed = await n2BatchMetadataClient.getDriveItemMetadataByIds(
+            refreshableCandidates.map(({ node }) => node.id),
+            "downloadUrlRefresh",
+          );
+          for (const { node } of refreshableCandidates) {
+            const current = refreshed.get(node.id);
+            if (
+              current
+              && current.id === node.id
+              && current.eTag === node.eTag
+            ) {
+              const downloadUrl = current["@microsoft.graph.downloadUrl"];
+              if (downloadUrl) scopeRecoveryDownloadUrlById.set(node.id, downloadUrl);
+            }
+          }
+          this.diag?.log("execute", "batch downloadUrl refresh (scope recovery)", {
+            schemaVersion: 1,
+            files: refreshableCandidates.length,
+            batchRequests: Math.ceil(refreshableCandidates.length / 20),
+            elapsedMs: Math.max(0, Date.now() - batchStartedAt),
+          });
+        } catch (error) {
+          // Fail-closed: leave the map empty; every candidate re-fetches per
+          // file through the existing waterfall, as before batching.
+          this.diag?.warn(
+            "execute",
+            `batch downloadUrl refresh failed for scope recovery, falling back to per-file waterfall`,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+    }
     let verifiedCount = 0;
     for (const { node, path } of pendingVerificationCandidates) {
       if (this.shouldStop(result, operationEpoch)) return result;
@@ -17377,7 +17852,7 @@ export class SyncExecutor {
         content = await this.onedrive.downloadFile(
           this.vaultName,
           path,
-          item["@microsoft.graph.downloadUrl"],
+          scopeRecoveryDownloadUrlById.get(node.id),
           node.id,
           node.size,
         );
@@ -17711,8 +18186,7 @@ export class SyncExecutor {
       const publishPreview =
         callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
       if (publishPreview) await publishPreview(plan);
-      result.message = this.t("result.pausedForReview");
-      return result;
+      return this.markPlanReviewPaused(result);
     }
 
     await this.state.setLastSyncTime(Date.now());
@@ -18755,8 +19229,7 @@ export class SyncExecutor {
    *  Returns the number of EasySync items to skip (0 = remote >= local, all = downgrade). */
   private async guardEasySyncDowngrade(
     items: SyncPlanItem[],
-  ): Promise<number> {
-    const { manifestFile } = getEasySyncPaths(this.scanner.vault);
+  ): Promise<number> {    const { manifestFile } = getEasySyncPaths(this.scanner.vault);
     const manifestItem = items.find((i) => i.path === manifestFile);
     if (!manifestItem?.remote) return 0; // no remote manifest to check
 
@@ -18785,12 +19258,20 @@ export class SyncExecutor {
       const remoteManifest = JSON.parse(remoteText) as { version?: string };
       const remoteVersion = remoteManifest.version ?? "";
 
-      if (remoteVersion && localVersion && remoteVersion < localVersion) {
-        this.diag?.warn(
-          "execute",
-          `M19 anti-downgrade — remote EasySync ${remoteVersion} < local ${localVersion}, skipping plugin file sync this round`,
-        );
-        return items.length; // skip all EasySync files
+      // SemVer comparison (review 2026-09-02 finding ③): the previous
+      // string comparison misread "1.4.10" < "1.4.9" as a downgrade and
+      // wrongly skipped the round after an upgrade. Unparseable versions
+      // compare as null → allow (guard stays best-effort, same as the
+      // cannot-fetch branch below).
+      if (remoteVersion && localVersion) {
+        const comparison = compareCommunityPluginVersions(remoteVersion, localVersion);
+        if (comparison !== null && comparison < 0) {
+          this.diag?.warn(
+            "execute",
+            `M19 anti-downgrade — remote EasySync ${remoteVersion} < local ${localVersion}, skipping plugin file sync this round`,
+          );
+          return items.length; // skip all EasySync files
+        }
       }
     } catch (err) {
       // Can't fetch remote manifest — allow the sync to proceed
@@ -18799,6 +19280,305 @@ export class SyncExecutor {
     }
 
     return 0;
+  }
+
+  /**
+   * Whether the current plan still downloads any file of the community-plugin
+   * bundle that contains `path`. Used by pending-conflict pruning to keep a
+   * downgrade-review row alive exactly while the plan-level guard would
+   * re-hang it; when the plan stops downloading the bundle the row becomes
+   * stale and is retired by the ordinary prune.
+   */
+  private planStillDownloadsPluginBundle(
+    plan: SyncPlan,
+    path: string,
+  ): boolean {
+    const configDir = getConfigDir(this.scanner.vault);
+    const parsed = parseCommunityPluginBundlePath(path, configDir);
+    if (!parsed || parsed.pluginId === "easy-sync") return false;
+    const root = `${configDir}/plugins/${parsed.pluginId}/`;
+    return plan.items.some((item) =>
+      item.type === SyncActionType.Download
+      && item.path.startsWith(root));
+  }
+
+  /**
+   * Whether the current plan still uploads any file of the community-plugin
+   * bundle that contains `path`. Mirror of planStillDownloadsPluginBundle for
+   * the upload-direction downgrade guard: a pending upload-downgrade row must
+   * survive pruning exactly while the plan-level upload guard would re-hang
+   * it; when the plan stops uploading the bundle the row becomes stale and is
+   * retired by the ordinary prune.
+   */
+  private planStillUploadsPluginBundle(
+    plan: SyncPlan,
+    path: string,
+  ): boolean {
+    const configDir = getConfigDir(this.scanner.vault);
+    const parsed = parseCommunityPluginBundlePath(path, configDir);
+    if (!parsed || parsed.pluginId === "easy-sync") return false;
+    const root = `${configDir}/plugins/${parsed.pluginId}/`;
+    return plan.items.some((item) =>
+      item.type === SyncActionType.Upload
+      && item.path.startsWith(root));
+  }
+
+  /**
+   * Plan-level guard for community-plugin downgrade downloads.
+   *
+   * A remote plugin version lower than the local one must not be written by an
+   * ordinary download: manifest.json would otherwise be overwritten before any
+   * bundle-level preflight could object. This guard removes the whole bundle's
+   * download items from the plan and surfaces them as a reviewable conflict
+   * ("reason.pluginDowngradeRemote") so the user can inspect the diff and
+   * explicitly confirm the downgrade. Mirrors the M19 self-sync guard but
+   * defers to user review instead of silently skipping.
+   *
+   * Returns the number of plan items removed (and deferred to review).
+   */
+  private async guardCommunityPluginBundleDowngrades(
+    downloads: SyncPlanItem[],
+    policy: Readonly<CommunityPluginSyncPolicyV1>,
+  ): Promise<number> {
+    if (policy.files.mode === "none") return 0;
+    const configDir = getConfigDir(this.scanner.vault);
+    const adapter = this.scanner.vault.adapter;
+    const remoteByPath = new Map(
+      this.state.remoteSnapshot.map((entry) => [entry.path, entry]),
+    );
+
+    // Group download items by plugin bundle.
+    const byPlugin = new Map<string, SyncPlanItem[]>();
+    for (const item of downloads) {
+      const parsed = parseCommunityPluginBundlePath(item.path, configDir);
+      if (!parsed || parsed.pluginId === "easy-sync") continue;
+      if (!isPluginSelected(policy.files, parsed.pluginId)) continue;
+      const group = byPlugin.get(parsed.pluginId) ?? [];
+      group.push(item);
+      byPlugin.set(parsed.pluginId, group);
+    }
+
+    let removed = 0;
+    for (const [pluginId, items] of byPlugin) {
+      const root = `${configDir}/plugins/${pluginId}`;
+      const manifestPath = `${root}/manifest.json`;
+      const remoteManifestEntry = remoteByPath.get(manifestPath);
+      const manifestItem = items.find((item) => item.path === manifestPath);
+      const remoteEntry = remoteManifestEntry ?? manifestItem?.remote;
+      if (!remoteEntry) continue;
+
+      // Local version — a missing local manifest means first install, allow.
+      let localVersion: string | null = null;
+      try {
+        if (await adapter.exists(manifestPath)) {
+          const localText = await adapter.read(manifestPath);
+          const localManifest = parseCommunityPluginBundleManifest(
+            localText,
+            pluginId,
+          );
+          localVersion = localManifest.version;
+        }
+      } catch {
+        return removed;
+      }
+      if (localVersion === null) continue;
+
+      // Remote version — manifest.json is small; download inline.
+      let remoteVersion: string | null = null;
+      try {
+        const remoteBytes = await this.onedrive.downloadFile(
+          this.vaultName,
+          manifestPath,
+          remoteEntry.downloadUrl,
+          remoteEntry.driveId,
+          remoteEntry.size,
+        );
+        remoteVersion = parseCommunityPluginBundleManifest(
+          new TextDecoder().decode(remoteBytes),
+          pluginId,
+        ).version;
+      } catch (error) {
+        // Cannot fetch the remote manifest — allow (best-effort guard).
+        this.diag?.log(
+          "execute",
+          "community plugin downgrade guard could not fetch remote manifest, allowing sync",
+          {
+            schemaVersion: 1,
+            pluginId,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        );
+        continue;
+      }
+      if (remoteVersion === null) continue;
+      const comparison = compareCommunityPluginVersions(remoteVersion, localVersion);
+      if (comparison === null || comparison >= 0) continue;
+
+      // Downgrade: remove every download item of this bundle from the plan
+      // and surface the bundle as a reviewable conflict.
+      const removedPaths = new Set(items.map((item) => item.path));
+      // Idempotency: when this bundle already has a downgrade-review row in
+      // pending, keep that row untouched. Re-upserting it every round would
+      // mint a fresh decision token each time, so a review dialog the user
+      // already opened would fail its factsDigest check on every button press
+      // (the very "核对卡住" symptom). The download items are still removed
+      // from this round either way.
+      const alreadyPending = this.state.pendingConflicts.some((candidate) =>
+        candidate.reason === "reason.pluginDowngradeRemote"
+        && parseCommunityPluginBundlePath(candidate.path, configDir)?.pluginId
+          === pluginId);
+      if (!alreadyPending) {
+        const pending: SyncPlanItem[] = items.map((item) => ({
+          ...item,
+          type: SyncActionType.Conflict,
+          reason: "reason.pluginDowngradeRemote",
+          decisionToken: this.createDecisionToken(item),
+        }));
+        for (const entry of pending) {
+          await this.state.addPendingConflict(entry);
+        }
+      }
+      for (let index = downloads.length - 1; index >= 0; index--) {
+        if (removedPaths.has(downloads[index].path)) {
+          downloads.splice(index, 1);
+          removed++;
+        }
+      }
+      this.diag?.log(
+        "execute",
+        "community plugin downgrade download deferred to user review",
+        { schemaVersion: 1, pluginId, files: items.length, localVersion, remoteVersion },
+      );
+    }
+    return removed;
+  }
+
+  /**
+   * Plan-level guard for community-plugin upload downgrades.
+   *
+   * A local plugin version lower than the remote one must not overwrite the
+   * cloud bundle automatically: the upload preflight would otherwise block it
+   * with no user exit. This guard removes the whole bundle's upload items from
+   * the plan and surfaces them as a reviewable conflict
+   * ("reason.pluginDowngradeRemote") so the user can inspect the diff and
+   * explicitly confirm the upload. Mirror of guardCommunityPluginBundleDowngrades.
+   *
+   * Returns the number of plan items removed (and deferred to review).
+   */
+  private async guardCommunityPluginBundleUploadDowngrades(
+    smallUploads: SyncPlanItem[],
+    largeUploads: SyncPlanItem[],
+    policy: Readonly<CommunityPluginSyncPolicyV1>,
+  ): Promise<number> {
+    if (policy.files.mode === "none") return 0;
+    const configDir = getConfigDir(this.scanner.vault);
+    const adapter = this.scanner.vault.adapter;
+    const remoteByPath = new Map(
+      this.state.remoteSnapshot.map((entry) => [entry.path, entry]),
+    );
+
+    // Group upload items by plugin bundle (both pools).
+    const allUploads = [...smallUploads, ...largeUploads];
+    const byPlugin = new Map<string, SyncPlanItem[]>();
+    for (const item of allUploads) {
+      const parsed = parseCommunityPluginBundlePath(item.path, configDir);
+      if (!parsed || parsed.pluginId === "easy-sync") continue;
+      if (!isPluginSelected(policy.files, parsed.pluginId)) continue;
+      const group = byPlugin.get(parsed.pluginId) ?? [];
+      group.push(item);
+      byPlugin.set(parsed.pluginId, group);
+    }
+
+    let removed = 0;
+    for (const [pluginId, items] of byPlugin) {
+      const root = `${configDir}/plugins/${pluginId}`;
+      const manifestPath = `${root}/manifest.json`;
+      const remoteManifestEntry = remoteByPath.get(manifestPath);
+      if (!remoteManifestEntry) continue;
+
+      // Local version — a missing local manifest means no upload to guard.
+      let localVersion: string | null = null;
+      try {
+        if (await adapter.exists(manifestPath)) {
+          const localText = await adapter.read(manifestPath);
+          localVersion = parseCommunityPluginBundleManifest(
+            localText,
+            pluginId,
+          ).version;
+        }
+      } catch {
+        return removed;
+      }
+      if (localVersion === null) continue;
+
+      // Remote version — manifest.json is small; download inline.
+      let remoteVersion: string | null = null;
+      try {
+        const remoteBytes = await this.onedrive.downloadFile(
+          this.vaultName,
+          manifestPath,
+          remoteManifestEntry.downloadUrl,
+          remoteManifestEntry.driveId,
+          remoteManifestEntry.size,
+        );
+        remoteVersion = parseCommunityPluginBundleManifest(
+          new TextDecoder().decode(remoteBytes),
+          pluginId,
+        ).version;
+      } catch (error) {
+        // Cannot fetch the remote manifest — allow (best-effort guard).
+        this.diag?.log(
+          "execute",
+          "community plugin upload downgrade guard could not fetch remote manifest, allowing sync",
+          {
+            schemaVersion: 1,
+            pluginId,
+            error: error instanceof Error ? error.message : String(error),
+          },
+        );
+        continue;
+      }
+      if (remoteVersion === null) continue;
+      const comparison = compareCommunityPluginVersions(localVersion, remoteVersion);
+      if (comparison === null || comparison >= 0) continue;
+
+      // Upload downgrade: remove every upload item of this bundle from both
+      // pools and surface the bundle as a reviewable conflict.
+      const removedPaths = new Set(items.map((item) => item.path));
+      // Idempotency: mirror of guardCommunityPluginBundleDowngrades. When this
+      // bundle already has a downgrade-review row in pending, keep that row
+      // untouched — re-upserting it every round would mint a fresh decision
+      // token and break an already-open review dialog's factsDigest check.
+      const alreadyPending = this.state.pendingConflicts.some((candidate) =>
+        candidate.reason === "reason.pluginDowngradeRemote"
+        && parseCommunityPluginBundlePath(candidate.path, configDir)?.pluginId
+          === pluginId);
+      if (!alreadyPending) {
+        const pending: SyncPlanItem[] = items.map((item) => ({
+          ...item,
+          type: SyncActionType.Conflict,
+          reason: "reason.pluginDowngradeRemote",
+          decisionToken: this.createDecisionToken(item),
+        }));
+        for (const entry of pending) {
+          await this.state.addPendingConflict(entry);
+        }
+      }
+      for (const pool of [smallUploads, largeUploads]) {
+        for (let index = pool.length - 1; index >= 0; index--) {
+          if (removedPaths.has(pool[index].path)) {
+            pool.splice(index, 1);
+            removed++;
+          }
+        }
+      }
+      this.diag?.log(
+        "execute",
+        "community plugin upload downgrade deferred to user review",
+        { schemaVersion: 1, pluginId, files: items.length, localVersion, remoteVersion },
+      );
+    }
+    return removed;
   }
 
   private async ensureParentDirs(filePath: string): Promise<void> {
@@ -20282,3 +21062,7 @@ function errorDiagData(error: unknown): Record<string, unknown> {
   const message = error instanceof Error ? error.message : String(error);
   return { message };
 }
+
+
+
+

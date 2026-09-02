@@ -411,9 +411,14 @@ export class EasySyncSettingTab extends PluginSettingTab {
     );
 
     displayGroup.addSetting((setting) => {
+      const hintEl = setting.descEl.createDiv({
+        cls: "easy-sync-notification-popups-hint",
+      });
+      const renderHint = (): void => {
+        hintEl.setText(t(`settings.notificationPopups.hint.${this.plugin.notificationPopups}`));
+      };
       setting
         .setName(t("settings.notificationPopups.name"))
-        .setDesc(t("settings.notificationPopups.desc"))
         .addDropdown((dropdown) => {
           dropdown
             .addOption("all", t("settings.notificationPopups.option.all"))
@@ -428,8 +433,10 @@ export class EasySyncSettingTab extends PluginSettingTab {
                 value === "important" || value === "off" ? value : "all";
               await this.plugin.saveSyncSettings();
               this.plugin.applyNotificationPopups();
+              renderHint();
             });
         });
+      renderHint();
     });
   }
 
@@ -782,8 +789,13 @@ export function buildSettingDefinitions(
       items: [
         {
           name: t("settings.notificationPopups.name"),
-          desc: t("settings.notificationPopups.desc"),
           render: (setting) => {
+            const hintEl = setting.descEl.createDiv({
+              cls: "easy-sync-notification-popups-hint",
+            });
+            const renderHint = (): void => {
+              hintEl.setText(t(`settings.notificationPopups.hint.${plugin.notificationPopups}`));
+            };
             setting.addDropdown((dropdown) => {
               dropdown.addOption("all", t("settings.notificationPopups.option.all"))
                 .addOption("important", t("settings.notificationPopups.option.important"))
@@ -794,8 +806,10 @@ export function buildSettingDefinitions(
                     value === "important" || value === "off" ? value : "all";
                   await plugin.saveSyncSettings();
                   plugin.applyNotificationPopups();
+                  renderHint();
                 });
             });
+            renderHint();
           },
         },
       ],

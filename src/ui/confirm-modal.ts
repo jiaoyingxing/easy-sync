@@ -85,6 +85,8 @@ export class ConfirmModal extends EasySyncModal {
       message?: string;
       warning?: string;
       danger?: boolean;
+      /** Extra class for the message paragraph; defaults to setting-item-description. */
+      messageClass?: string;
     },
   ) {
     super(app);
@@ -113,7 +115,7 @@ export class ConfirmModal extends EasySyncModal {
     if (this.options?.message) {
       contentEl.createEl("p", {
         text: this.options.message,
-        cls: "setting-item-description",
+        cls: this.options?.messageClass ?? "setting-item-description",
       });
     }
 

@@ -16,44 +16,25 @@ import type EasySyncPlugin from "../main";
 import type { SyncPlanItem } from "../sync/types";
 import { compareContentBuffers } from "../sync/content-equality";
 import { computeDisplayDiff } from "./diff-engine";
-import type {
-  DiffLine,
-  DisplayDiffResult,
-  DisplayDiffSummary,
-} from "./diff-engine";
 import {
-  getDiffSummaryReasonKey,
-  summarizeConflictDetail,
-} from "./conflict-detail-presentation";
+  MAX_FALLBACK_PREVIEW_LINES,
+  MAX_TEXT_DIFF_BYTES_PER_SIDE,
+  decodeUtf8,
+  renderDisplayDiff,
+  sameVisibleText,
+} from "./diff-view-renderer";
+import { summarizeConflictDetail } from "./conflict-detail-presentation";
 import type { ConflictDetailSummaryEvidence } from "./conflict-detail-presentation";
 import {
   FileComparisonModal,
   formatFileSize,
 } from "./file-comparison-modal";
 
-const MAX_TEXT_DIFF_BYTES_PER_SIDE = 8 * 1024 * 1024;
-const MAX_FALLBACK_PREVIEW_LINES = 200;
-
-function decodeUtf8(content: ArrayBuffer): string | null {
-  try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(content);
-  } catch {
-    return null;
-  }
-}
-
-function sameVisibleText(local: string, remote: string): boolean {
-  return local === remote || local.replace(/\r\n?/g, "\n") === remote.replace(/\r\n?/g, "\n");
-}
-
-/** Keep both line-number columns only as wide as the largest number in this diff. */
-export function getDiffLineNumberWidth(
-  localTotalLines: number,
-  remoteTotalLines: number,
-): string {
-  const maxLineNumber = Math.max(1, localTotalLines, remoteTotalLines);
-  return `${Math.max(2, String(maxLineNumber).length)}ch`;
-}
+/**
+ * Keep both line-number columns only as wide as the largest number in this diff.
+ * Re-exported from the shared renderer for callers/tests that import it here.
+ */
+export { getDiffLineNumberWidth } from "./diff-view-renderer";
 
 export class ConflictDetailModal extends FileComparisonModal {
   private onResolved: (() => void) | undefined;
@@ -76,10 +57,8 @@ export class ConflictDetailModal extends FileComparisonModal {
       this.plugin.i18n.t(key, params);
     const body = this.comparisonBodyEl;
 
-    // ---- Title ----
-    body.createEl("h3", {
-      text: t("conflictDetail.title"),
-    });
+    // ---- Title (official modal-title slot, not the scrollable body) ----
+    this.setTitle(t("conflictDetail.title"));
     const pathFact = body.createDiv("easy-sync-detail-path");
     pathFact.createSpan("easy-sync-detail-path-label").setText(
       t("conflictDetail.path"),
@@ -344,88 +323,10 @@ export class ConflictDetailModal extends FileComparisonModal {
   /** Render bounded exact hunks and clearly marked summary regions. */
   private renderDisplayDiff(
     container: HTMLElement,
-    diff: DisplayDiffResult,
+    diff: Parameters<typeof renderDisplayDiff>[1],
     t: (key: string, params?: Record<string, string | number>) => string,
   ): void {
-    const diffContainer = container.createDiv("easy-sync-diff-view");
-    diffContainer.style.setProperty(
-      "--easy-sync-diff-line-number-width",
-      getDiffLineNumberWidth(diff.localTotalLines, diff.remoteTotalLines),
-    );
-    for (let partIndex = 0; partIndex < diff.parts.length; partIndex++) {
-      if (partIndex > 0) {
-        const gap = diffContainer.createDiv(
-          "easy-sync-diff-line easy-sync-diff-gap",
-        );
-        gap.setText("…");
-      }
-
-      const part = diff.parts[partIndex];
-      if (part.kind === "hunk") {
-        for (const line of part.lines) this.renderDiffLine(diffContainer, line);
-      } else {
-        this.renderDiffSummary(diffContainer, part, t);
-      }
-    }
-  }
-
-  private renderDiffLine(container: HTMLElement, line: DiffLine): void {
-    const lineEl = container.createDiv(
-      `easy-sync-diff-line easy-sync-diff-${line.type}`,
-    );
-    const gutter = lineEl.createSpan("easy-sync-diff-gutter");
-    const localNum = line.lineNumber.local ? String(line.lineNumber.local) : "";
-    const remoteNum = line.lineNumber.remote ? String(line.lineNumber.remote) : "";
-    gutter.createSpan("easy-sync-diff-line-number").setText(localNum);
-    gutter.createSpan("easy-sync-diff-line-number").setText(remoteNum);
-
-    const prefix = line.type === "added" ? "+" : line.type === "removed" ? "-" : " ";
-    lineEl.createSpan("easy-sync-diff-content").setText(`${prefix} ${line.text}`);
-  }
-
-  private renderDiffSummary(
-    container: HTMLElement,
-    summary: DisplayDiffSummary,
-    t: (key: string, params?: Record<string, string | number>) => string,
-  ): void {
-    const summaryEl = container.createDiv("easy-sync-diff-summary");
-    summaryEl.createDiv("easy-sync-diff-summary-reason").setText(
-      t(getDiffSummaryReasonKey(summary.reason)),
-    );
-    summaryEl.createDiv("easy-sync-diff-summary-range").setText(
-      t("conflictDetail.diffRegionRange", {
-        localRange: this.formatLineRange(summary.localStartLine, summary.localEndLine),
-        remoteRange: this.formatLineRange(summary.remoteStartLine, summary.remoteEndLine),
-      }),
-    );
-
-    for (const line of summary.localSample) {
-      this.renderDiffLine(summaryEl, {
-        type: "removed",
-        text: line.text,
-        lineNumber: { local: line.lineNumber },
-      });
-    }
-    if (summary.localOmittedLines > 0 || summary.remoteOmittedLines > 0) {
-      summaryEl.createDiv("easy-sync-diff-line easy-sync-diff-gap").setText(
-        t("conflictDetail.diffOmitted", {
-          localCount: summary.localOmittedLines,
-          remoteCount: summary.remoteOmittedLines,
-        }),
-      );
-    }
-    for (const line of summary.remoteSample) {
-      this.renderDiffLine(summaryEl, {
-        type: "added",
-        text: line.text,
-        lineNumber: { remote: line.lineNumber },
-      });
-    }
-  }
-
-  private formatLineRange(start: number, end: number): string {
-    if (end < start) return "—";
-    return start === end ? String(start) : `${start}–${end}`;
+    renderDisplayDiff(container, diff, t);
   }
 
   private renderTextPreview(

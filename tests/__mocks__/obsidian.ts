@@ -102,6 +102,7 @@ export function createMockElement(): HTMLElement {
   element.removeClass = (..._tokens: string[]) => element;
   element.toggleClass = (_token: string, _on?: boolean) => element;
   element.setAttribute = (_name: string, _value: string) => element;
+  element.setText = (_value: string | DocumentFragment) => element;
   element.createDiv = () => createMockElement();
   element.createSpan = () => createMockElement();
   element.createEl = () => createMockElement();
@@ -246,6 +247,12 @@ export class ButtonComponent {
   setTooltip(_tooltip: string): this { return this; }
   setDisabled(_disabled: boolean): this { return this; }
   setWarning(): this { return this; }
+  // NOTE: `setDestructive` exists only on Obsidian 1.13.0+ hosts. This mock
+  // exposes it unconditionally, so any test that calls it directly would pass
+  // here but throw on 1.11.4–1.12.x. Production code must go through
+  // `applyDestructiveButton` (src/ui/destructive-button.ts), which gates on
+  // the runtime capability and falls back to `mod-warning` — never call
+  // `button.setDestructive()` directly.
   setDestructive(): this { return this; }
   setCta(): this { return this; }
   onClick(_callback: () => void | Promise<void>): this { return this; }

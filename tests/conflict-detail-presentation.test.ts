@@ -137,7 +137,7 @@ describe("conflict detail presentation", () => {
     expect(zhCN).toContain("未能下载云端版本，本次未作更改");
   });
 
-  it("keeps the conflict title static and renders the path as an independent wrapping fact", () => {
+  it("keeps the conflict title static and mounts it on the official modal-title slot", () => {
     const source = readFileSync("src/ui/conflict-detail-modal.ts", "utf8");
     const zhCN = readFileSync("src/i18n/zh-cn.ts", "utf8");
     const en = readFileSync("src/i18n/en.ts", "utf8");
@@ -145,7 +145,8 @@ describe("conflict detail presentation", () => {
 
     expect(zhCN).toContain('"conflictDetail.title": "冲突详情"');
     expect(en).toContain('"conflictDetail.title": "Conflict details"');
-    expect(source).toContain('text: t("conflictDetail.title")');
+    expect(source).toContain('this.setTitle(t("conflictDetail.title"))');
+    expect(source).not.toContain('createEl("h3", {\n      text: t("conflictDetail.title")');
     expect(source).toContain('t("conflictDetail.path")');
     expect(source).toContain('"easy-sync-detail-path-value"');
     expect(source).not.toContain('t("conflictDetail.title", { path: this.item.path })');
@@ -155,6 +156,8 @@ describe("conflict detail presentation", () => {
     expect(styles).not.toMatch(
       /\.easy-sync-conflict-detail h3\s*\{[^}]*word-break:\s*break-all;/s,
     );
+    // The modal title lives in the host .modal-title slot, not a body h3.
+    expect(styles).not.toMatch(/\.easy-sync-conflict-detail h3\s*\{/);
   });
 
   it("restores the f3e0bbe metadata hierarchy with neutral headers and colored data columns", () => {
@@ -191,14 +194,17 @@ describe("conflict detail presentation", () => {
   });
 
   it("keeps local and remote line numbers in compact independent columns", () => {
-    const source = readFileSync("src/ui/conflict-detail-modal.ts", "utf8");
+    const renderer = readFileSync("src/ui/diff-view-renderer.ts", "utf8");
+    const modal = readFileSync("src/ui/conflict-detail-modal.ts", "utf8");
     const styles = readFileSync("styles.css", "utf8");
 
-    expect(source).not.toContain("padStart(6)");
-    expect(source.match(/createSpan\("easy-sync-diff-line-number"\)/g)).toHaveLength(2);
-    expect(source).toMatch(
+    expect(renderer).not.toContain("padStart(6)");
+    expect(renderer.match(/createSpan\("easy-sync-diff-line-number"\)/g)).toHaveLength(2);
+    expect(renderer).toMatch(
       /style\.setProperty\(\s*"--easy-sync-diff-line-number-width"/,
     );
+    expect(modal).not.toContain("padStart(6)");
+    expect(modal).toContain('renderDisplayDiff(container, diff, t)');
     expect(styles).toMatch(
       /grid-template-columns:\s*repeat\(2,\s*var\(--easy-sync-diff-line-number-width,\s*2ch\)\);/,
     );

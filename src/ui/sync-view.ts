@@ -115,6 +115,62 @@ export function resolveSyncViewBodyMode(input: {
   return "idle";
 }
 
+export type SyncViewPrimaryActionKind =
+  | { kind: "cancel" }
+  | { kind: "processing" }
+  | { kind: "plan-review-restore"; recovering: boolean }
+  | { kind: "plan-review-confirm"; migration: boolean }
+  | { kind: "recovery"; actionKey: string }
+  | { kind: "sync-now" }
+  | { kind: "auth"; labelKey: string; cta: boolean; disabled: boolean };
+
+/** Decide which primary action the fixed top status panel renders. Kept pure
+ *  so the branch chain has a behaviour-level test gate (review 2026-09-02
+ *  finding ⑧, C9 P1): a logged-in user in a recovery state without a real
+ *  action (waiting-network/checking/blocked with recoveryActionKey=null)
+ *  must keep a working sync-now button — never a dead login button. */
+export function resolveSyncViewPrimaryAction(input: {
+  isLoggedIn: boolean;
+  isRunning: boolean;
+  canCancel: boolean;
+  planReviewActive: boolean;
+  planReviewDetailsState: "ready" | "recovering" | "retry";
+  reviewKind: string | null | undefined;
+  recoveryActionKey: string | null;
+  isInitializing: boolean;
+  isPending: boolean;
+  devicePending: boolean;
+}): SyncViewPrimaryActionKind {
+  if (input.isLoggedIn && input.isRunning && input.canCancel) return { kind: "cancel" };
+  if (input.isLoggedIn && input.isRunning) return { kind: "processing" };
+  if (input.isLoggedIn && input.planReviewActive) {
+    if (input.planReviewDetailsState !== "ready") {
+      return {
+        kind: "plan-review-restore",
+        recovering: input.planReviewDetailsState === "recovering",
+      };
+    }
+    return { kind: "plan-review-confirm", migration: input.reviewKind === "v2-migration" };
+  }
+  if (input.isLoggedIn && input.recoveryActionKey) {
+    return { kind: "recovery", actionKey: input.recoveryActionKey };
+  }
+  if (input.isLoggedIn) {
+    return { kind: "sync-now" };
+  }
+  const authEntry = resolveAuthEntryPresentation({
+    isInitializing: input.isInitializing,
+    isPending: input.isPending,
+    isDevicePending: input.devicePending,
+  });
+  return {
+    kind: "auth",
+    labelKey: authEntry.labelKey,
+    cta: authEntry.cta,
+    disabled: authEntry.disabled,
+  };
+}
+
 export function resolveRemoteScopeRecoveryFailurePresentation(
   state: Pick<RemoteScopeRecoveryVerificationProgress, "failureStage" | "firstFailurePath">,
   t: (key: keyof LocaleStrings) => string,
@@ -1340,20 +1396,36 @@ export class EasySyncSyncView extends ItemView {
     const recoveryActionKey = state.mutationRecovery
       ? mutationRecoveryPrimaryActionKey(state.mutationRecovery)
       : null;
-    if (state.isLoggedIn && state.isRunning && state.canCancel) {
-      const cancelButton = new ButtonComponent(actions)
-        .setButtonText(t("syncView.cancelSync"));
-      cancelButton.buttonEl.classList.add("mod-warning");
-      cancelButton.onClick(() => {
-        void this.plugin.cancelSync();
-      });
-    } else if (state.isLoggedIn && state.isRunning) {
-      new ButtonComponent(actions)
-        .setButtonText(t("syncView.conflict.processing"))
-        .setDisabled(true);
-    } else if (state.isLoggedIn && state.planReviewActive) {
-      if (state.planReviewDetailsState !== "ready") {
-        const recovering = state.planReviewDetailsState === "recovering";
+    const action = resolveSyncViewPrimaryAction({
+      isLoggedIn: state.isLoggedIn,
+      isRunning: state.isRunning,
+      canCancel: state.canCancel,
+      planReviewActive: state.planReviewActive,
+      planReviewDetailsState: state.planReviewDetailsState,
+      reviewKind: this.plugin.state?.planReviewAuthorization?.reviewKind,
+      recoveryActionKey,
+      isInitializing: state.isInitializing,
+      isPending: state.isPending,
+      devicePending: (this.plugin.auth?.deviceAttempt ?? null) !== null,
+    });
+    switch (action.kind) {
+      case "cancel": {
+        const cancelButton = new ButtonComponent(actions)
+          .setButtonText(t("syncView.cancelSync"));
+        cancelButton.buttonEl.classList.add("mod-warning");
+        cancelButton.onClick(() => {
+          void this.plugin.cancelSync();
+        });
+        break;
+      }
+      case "processing": {
+        new ButtonComponent(actions)
+          .setButtonText(t("syncView.conflict.processing"))
+          .setDisabled(true);
+        break;
+      }
+      case "plan-review-restore": {
+        const recovering = action.recovering;
         const detailsButton = new ButtonComponent(actions)
           .setButtonText(t(
             recovering
@@ -1370,60 +1442,73 @@ export class EasySyncSyncView extends ItemView {
             );
           });
         }
-        return;
+        break;
       }
-      const reviewKind = this.plugin.state?.planReviewAuthorization?.reviewKind;
-      new ButtonComponent(actions)
-        .setButtonText(t(
-          reviewKind === "v2-migration"
-            ? "syncPlan.confirmMigration"
-            : "syncPlan.confirmExecute",
-        ))
-        .setCta()
-        .onClick(() => {
-          void this.plugin.executePlanReview(state.planReviewRevision);
-        });
-    } else if (state.isLoggedIn && state.mutationRecovery && recoveryActionKey) {
-      // Only real recovery decisions keep a primary action: keep-side review
-      // and scope-recovery retry. Other recovery states render honest status
-      // without a choice button (no fake "check again").
-      const actionKey = recoveryActionKey;
-      new ButtonComponent(actions)
-        .setButtonText(t(actionKey))
-        .setCta()
-        .setDisabled(state.isInitializing)
-        .onClick(() => {
-          if (actionKey === "syncView.recovery.reviewDetails") {
-            void this.openMutationRecoveryResolution();
-            return;
-          }
-          // retryScopeRecovery: a manual round re-runs remote scope recovery.
-          void this.plugin.startManualSync();
-        });
-    } else if (state.isLoggedIn && !state.mutationRecovery) {
-      new ButtonComponent(actions)
-        .setButtonText(t("command.syncNow"))
-        .setCta()
-        .setDisabled(state.isInitializing)
-        .onClick(() => {
-          void this.plugin.startManualSync();
-        });
-    } else {
-      const authEntry = resolveAuthEntryPresentation({
-        isInitializing: state.isInitializing,
-        isPending: state.isPending,
-        isDevicePending:
-          (this.plugin.auth?.deviceAttempt ?? null) !== null,
-      });
-      const button = new ButtonComponent(actions)
-        .setButtonText(t(authEntry.labelKey));
-      if (authEntry.cta) button.setCta();
-      if (authEntry.disabled) {
-        button.setDisabled(true);
-      } else {
-        button.onClick(() => {
-          void handleAuthEntryAction(this.plugin);
-        });
+      case "plan-review-confirm": {
+        new ButtonComponent(actions)
+          .setButtonText(t(
+            action.migration
+              ? "syncPlan.confirmMigration"
+              : "syncPlan.confirmExecute",
+          ))
+          .setCta()
+          .onClick(() => {
+            void this.plugin.executePlanReview(state.planReviewRevision);
+          });
+        break;
+      }
+      case "recovery": {
+        // Only real recovery decisions keep a primary action: keep-side
+        // review and scope-recovery retry. Other recovery states render
+        // honest status without a choice button (no fake "check again").
+        const actionKey = action.actionKey;
+        new ButtonComponent(actions)
+          .setButtonText(t(actionKey))
+          .setCta()
+          .setDisabled(state.isInitializing)
+          .onClick(() => {
+            if (actionKey === "syncView.recovery.reviewDetails") {
+              void this.openMutationRecoveryResolution();
+              return;
+            }
+            // retryScopeRecovery: a manual round re-runs remote scope recovery.
+            void this.plugin.startManualSync();
+          });
+        break;
+      }
+      case "sync-now": {
+        // Logged in without a durable plan review or a real recovery decision
+        // (e.g. waiting-network/checking recovery with no action): keep the
+        // fixed top primary button a working "sync now" button — never swap it
+        // for a dead "login" button (review 2026-09-02 finding ⑧, C9 P1).
+        new ButtonComponent(actions)
+          .setButtonText(t("command.syncNow"))
+          .setCta()
+          .setDisabled(state.isInitializing)
+          .onClick(() => {
+            void this.plugin.startManualSync();
+          });
+        break;
+      }
+      case "auth": {
+        const button = new ButtonComponent(actions)
+          .setButtonText(t(action.labelKey));
+        if (action.cta) button.setCta();
+        if (action.disabled) {
+          button.setDisabled(true);
+        } else {
+          button.onClick(() => {
+            void handleAuthEntryAction(this.plugin);
+          });
+        }
+        break;
+      }
+      default: {
+        // Exhaustiveness guard: adding a kind to the union without a render
+        // branch here is a compile error instead of a silently missing button.
+        const neverKind: never = action;
+        void neverKind;
+        break;
       }
     }
   }
@@ -1833,9 +1918,26 @@ export class EasySyncSyncView extends ItemView {
               },
             ).awaitConfirm();
             if (!confirmed) return;
+            // 批量删除确认后立即进入官方 mod-loading 加载态：按钮文字被官方
+            // CSS 隐藏并显示旋转圆圈，用户能看出插件正在处理而不是卡死。
+            // 删除期间侧栏整块重建会销毁本按钮，重建后的按钮由下方
+            // batchDeleteInFlight 分支重新挂类，因此加载态可持续到整批结束。
+            confirmAllButton.buttonEl.addClass("mod-loading");
+            confirmAllButton.setDisabled(true);
             await this.plugin.confirmRemoteDeletes(paths);
           });
         });
+      // 重建后恢复加载态：批量删除仍在队列/执行中时，按钮保持官方旋转
+      // 加载态与禁用，直到整批结束（hasSideActionsInFlight 归 false）。
+      if (
+        this.plugin.syncExecutor?.hasSideActionsInFlight
+        && this.plugin.progressStore.state.activityKind === "sideAction"
+        && this.plugin.progressStore.state.currentActionType
+          === SyncActionType.ConfirmLocalDelete
+      ) {
+        confirmAllButton.buttonEl.addClass("mod-loading");
+        confirmAllButton.setDisabled(true);
+      }
     }
     for (const item of pendingDeletes) this.renderDeleteItem(section, item);
     for (const { issue, nestedIssues } of skipped) {
@@ -2142,6 +2244,8 @@ export class EasySyncSyncView extends ItemView {
         this.plugin.app,
         snapshot,
         t,
+        (filePluginId, path) =>
+          this.plugin.getCommunityPluginBundleFileDiff(filePluginId, path),
       ).awaitChoice();
       if (!choice) return;
       if (!await this.confirmMutationResolutionDeletion(snapshot, choice)) return;
@@ -2158,10 +2262,13 @@ export class EasySyncSyncView extends ItemView {
     try {
       const snapshotPromise = this.plugin
         .getCommunityPluginBundleReviewSnapshot(pluginId);
+      const getFileDiff = (filePluginId: string, path: string) =>
+        this.plugin.getCommunityPluginBundleFileDiff(filePluginId, path);
       const choice = await new MutationRecoveryResolutionModal(
         this.plugin.app,
         snapshotPromise,
         t,
+        getFileDiff,
       ).awaitChoice();
       if (!choice) return;
       const snapshot = await snapshotPromise;

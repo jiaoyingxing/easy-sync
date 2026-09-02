@@ -123,6 +123,70 @@ describe("buildSettingDefinitions", () => {
     expect(plugin.syncInterval).toBe(snapshot.syncInterval);
     expect(plugin.notificationPopups).toBe(snapshot.notificationPopups);
   });
+
+  it("progressively discloses the notification pop-ups level hint", async () => {
+    const plugin = createMockPlugin();
+    const i18n = new I18n("zh-cn");
+    const t = i18n.t.bind(i18n);
+    const defs = buildSettingDefinitions(t, plugin);
+
+    const displayGroup = defs.find(
+      (d) => (d as { heading?: string }).heading === t("settings.group.display"),
+    ) as { items: Array<{ name?: string; render?: (setting: never) => void }> };
+    const item = displayGroup.items.find(
+      (i) => i.name === t("settings.notificationPopups.name"),
+    );
+    expect(item).toBeDefined();
+
+    // Track the hint element created inside the row's desc, and drive the
+    // dropdown: the hint must follow the selected level.
+    const hintTexts: string[] = [];
+    const hintEl = {
+      setText: (text: string) => { hintTexts.push(text); return hintEl; },
+    };
+    let dropdownOnChange: ((value: string) => void | Promise<void>) | null = null;
+    const setting = {
+      descEl: { createDiv: () => hintEl },
+      addDropdown: (cb: (dropdown: unknown) => void) => {
+        const dropdown = {
+          addOption: () => dropdown,
+          addOptions: () => dropdown,
+          setValue: () => dropdown,
+          setDisabled: () => dropdown,
+          onChange: (cb2: (value: string) => void | Promise<void>) => {
+            dropdownOnChange = cb2;
+            return dropdown;
+          },
+        };
+        cb(dropdown);
+        return setting;
+      },
+    };
+
+    expect(plugin.notificationPopups).toBe("all");
+    item!.render!(setting as never);
+    // Initial render shows the hint for the current level.
+    expect(hintTexts).toEqual([t("settings.notificationPopups.hint.all")]);
+
+    // Switch to "important only": hint updates in place without a re-render.
+    await dropdownOnChange!("important");
+    expect(plugin.notificationPopups).toBe("important");
+    expect(plugin.saveSyncSettings).toHaveBeenCalledTimes(1);
+    expect(plugin.applyNotificationPopups).toHaveBeenCalledTimes(1);
+    expect(hintTexts).toEqual([
+      t("settings.notificationPopups.hint.all"),
+      t("settings.notificationPopups.hint.important"),
+    ]);
+
+    // Switch to "off".
+    await dropdownOnChange!("off");
+    expect(plugin.notificationPopups).toBe("off");
+    expect(hintTexts).toEqual([
+      t("settings.notificationPopups.hint.all"),
+      t("settings.notificationPopups.hint.important"),
+      t("settings.notificationPopups.hint.off"),
+    ]);
+  });
 });
 
 describe("buildAccountSettingDefinitions", () => {

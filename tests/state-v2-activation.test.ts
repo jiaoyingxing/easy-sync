@@ -1160,6 +1160,14 @@ function makeHarness(input?: {
           : 0,
       };
     }),
+    getDriveItemMetadataByIds: vi.fn(async (ids: readonly string[]) => {
+      const byId = new Map<string, DriveItem | null>();
+      for (const id of ids) {
+        const item = remoteItemState.find((candidate) => candidate.id === id);
+        byId.set(id, item ?? null);
+      }
+      return byId;
+    }),
     getDriveItemMetadata: vi.fn(async (_vaultName: string, path: string) => {
       const item = findRemoteItemByPath(remoteItemState, path);
       if (item && changeNextParentVersion) {
@@ -17853,6 +17861,18 @@ describe("V1 to V2 controlled production activation", () => {
     });
     expect(harness.mutations.downloadFile.mock.calls.map((call) => call[1]))
       .toEqual(["Notes/a.md", "Notes/b.md"]);
+
+    // N2 — scope-recovery verification must batch the downloadUrl refresh up
+    // front (finding C14 root cause: delta projections never carry a
+    // pre-signed URL, so without this every verification download pays a
+    // per-file refresh round trip). The batch wiring is exercised with the
+    // real candidate list instead of being silently skipped.
+    expect((harness.client as unknown as {
+      getDriveItemMetadataByIds: ReturnType<typeof vi.fn>;
+    }).getDriveItemMetadataByIds).toHaveBeenCalledWith(
+      expect.arrayContaining(["file-1", "file-2", "file-3"]),
+      "downloadUrlRefresh",
+    );
 
     await harness.state.close();
     const restartedState = new StateManager(harness.plugin);

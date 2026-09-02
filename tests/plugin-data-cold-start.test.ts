@@ -1448,6 +1448,127 @@ describe("plugin data cold-start cache", () => {
     }));
   });
 
+  it("releases a legacy conflict-only automatic pause after state load", async () => {
+    const plugin = new EasySyncPlugin();
+    vi.spyOn(plugin, "loadData").mockResolvedValue({
+      "auto-sync-paused": true,
+      "easy-sync-pending-conflicts": [{
+        type: "conflict",
+        path: "notes/conflict.md",
+        reason: "reason.bothSidesModified",
+      }],
+      "easy-sync-history": [{
+        id: "conflict-run",
+        mode: "manual",
+        status: "partial",
+        startedAt: 1,
+        endedAt: 2,
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+        conflicts: 1,
+        skipped: 0,
+        errors: 0,
+        message: "result.conflictsPending",
+        files: [],
+      }],
+    });
+    const saveData = vi.spyOn(plugin, "saveData").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings")
+      .mockResolvedValue(undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync")
+      .mockImplementation(() => undefined);
+
+    await plugin.loadSyncSettings();
+    expect(plugin.autoSyncPaused).toBe(true); // raw persisted value still paused
+
+    // State load proves conflicts are the sole pause owner → release.
+    plugin.state = {
+      isV2StateActive: true,
+      planReviewActive: false,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+      mutationLedger: [],
+      pendingRemoteDeletes: [],
+      pendingIssues: [],
+      pendingConflicts: [{
+        type: "conflict",
+        path: "notes/conflict.md",
+        reason: "reason.bothSidesModified",
+      }],
+      syncHistory: [{
+        id: "conflict-run",
+        mode: "manual",
+        status: "partial",
+        startedAt: 1,
+        endedAt: 2,
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+        conflicts: 1,
+        skipped: 0,
+        errors: 0,
+        message: "result.conflictsPending",
+        files: [],
+      }],
+    } as never;
+    plugin._stateLoaded = true;
+
+    await (plugin as never as {
+      releaseLegacyConflictOnlyPauseIfSafe: () => Promise<void>;
+    }).releaseLegacyConflictOnlyPauseIfSafe();
+
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    expect(startAutoSync).toHaveBeenCalledOnce();
+    expect(saveData).not.toHaveBeenCalled();
+  });
+
+  it("keeps an automatic pause after state load when history also owns a failure", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = true;
+    plugin.state = {
+      isV2StateActive: true,
+      planReviewActive: false,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+      mutationLedger: [],
+      pendingRemoteDeletes: [],
+      pendingIssues: [],
+      pendingConflicts: [{
+        type: "conflict",
+        path: "notes/conflict.md",
+        reason: "reason.bothSidesModified",
+      }],
+      syncHistory: [{
+        id: "failed-conflict-run",
+        mode: "manual",
+        status: "partial",
+        startedAt: 1,
+        endedAt: 2,
+        uploaded: 0,
+        downloaded: 0,
+        deleted: 0,
+        conflicts: 1,
+        skipped: 0,
+        errors: 1,
+        message: "result.partial",
+        files: [],
+      }],
+    } as never;
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings")
+      .mockResolvedValue(undefined);
+
+    await (plugin as never as {
+      releaseLegacyConflictOnlyPauseIfSafe: () => Promise<void>;
+    }).releaseLegacyConflictOnlyPauseIfSafe();
+
+    // The error owns the pause; it must not be released by the conflict-only
+    // migration path.
+    expect(plugin.autoSyncPaused).toBe(true);
+    expect(saveSyncSettings).not.toHaveBeenCalled();
+  });
+
   it("applies a policy change to future runs and clears an already reviewed plan", async () => {
     const plugin = new EasySyncPlugin();
     vi.spyOn(plugin, "loadData").mockResolvedValue({});
