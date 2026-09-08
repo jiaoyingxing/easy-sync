@@ -5323,4 +5323,74 @@ describe("main sync entry guards", () => {
       [marker],
     );
   });
+
+  it("notices once per plugin when an upload downgrade is deferred (A1)", () => {
+    const plugin = makePlugin();
+    const show = vi.fn();
+    plugin.noticeCenter = {
+      show,
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue(null);
+    const saveLocalStorage = vi.fn();
+    plugin.app.saveLocalStorage = saveLocalStorage as never;
+
+    (plugin as never as {
+      maybeNoticeCommunityPluginUploadDowngrades(
+        deferred: readonly string[] | undefined,
+      ): void;
+    }).maybeNoticeCommunityPluginUploadDowngrades(["calendar"]);
+
+    expect(show).toHaveBeenCalledTimes(1);
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "plugin-upload-downgrade:calendar",
+    }));
+    expect(saveLocalStorage).toHaveBeenCalledWith(
+      "easy-sync-upload-downgrade-notice-v1",
+      [expect.objectContaining({ pluginId: "calendar" })],
+    );
+
+    // Second identical round: no repeat notice, marker retained.
+    show.mockClear();
+    saveLocalStorage.mockClear();
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue([
+      { pluginId: "calendar", noticedAt: 123 },
+    ]);
+    (plugin as never as {
+      maybeNoticeCommunityPluginUploadDowngrades(
+        deferred: readonly string[] | undefined,
+      ): void;
+    }).maybeNoticeCommunityPluginUploadDowngrades(["calendar"]);
+
+    expect(show).not.toHaveBeenCalled();
+    expect(saveLocalStorage).not.toHaveBeenCalled();
+  });
+
+  it("retires the upload-downgrade marker once the deferral converges (A1)", () => {
+    const plugin = makePlugin();
+    const show = vi.fn();
+    plugin.noticeCenter = {
+      show,
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue([
+      { pluginId: "calendar", noticedAt: 123 },
+    ]);
+    const saveLocalStorage = vi.fn();
+    plugin.app.saveLocalStorage = saveLocalStorage as never;
+
+    (plugin as never as {
+      maybeNoticeCommunityPluginUploadDowngrades(
+        deferred: readonly string[] | undefined,
+      ): void;
+    }).maybeNoticeCommunityPluginUploadDowngrades([]);
+
+    expect(show).not.toHaveBeenCalled();
+    expect(saveLocalStorage).toHaveBeenCalledWith(
+      "easy-sync-upload-downgrade-notice-v1",
+      [],
+    );
+  });
 });

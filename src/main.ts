@@ -227,6 +227,11 @@ const KEY_LEGACY_AUTO_MERGE = "sync-auto-merge";
 const KEY_AUTOMATIC_HANDLING_POLICY = "sync-auto-conflict-policy";
 const KEY_NOTIFICATION_POPUPS = "notification-popups";
 const KEY_PROFILE_CACHE = "easy-sync-profile-cache";
+/** One-shot notice memory: plugin bundles whose upload the downgrade guard
+ *  already told the user about. A marker is dropped once the deferral is gone
+ *  (plan no longer uploads the bundle), so a future real misalignment can
+ *  notify again. Never authorizes any mutation. */
+const KEY_UPLOAD_DOWNGRADE_NOTICE = "easy-sync-upload-downgrade-notice-v1";
 const RIBBON_SUCCESS_DURATION_MS = 5_000;
 const SYNC_RESULT_NOTICE_DURATION_MS = 2_000;
 const SYNC_PROGRESS_NOTICE_KEY = "sync-progress";
@@ -1623,6 +1628,9 @@ export default class EasySyncPlugin extends Plugin {
       }
     }
     this.maybeNoticeCommunityPluginCloudResurrection();
+    this.maybeNoticeCommunityPluginUploadDowngrades(
+      result.communityPluginUploadDowngradesDeferred,
+    );
     result.message = formatSyncResultMessage(
       result,
       this.progressStore.state.completedFiles,
@@ -4995,6 +5003,68 @@ export default class EasySyncPlugin extends Plugin {
       remaining.push(marker);
     }
     this.writeCommunityPluginCloudCleanupMarkers(remaining);
+  }
+
+  private readUploadDowngradeNoticeMarkers(): { pluginId: string; noticedAt: number }[] {
+    if (typeof this.app.loadLocalStorage !== "function") return [];
+    const raw: unknown = this.app.loadLocalStorage(KEY_UPLOAD_DOWNGRADE_NOTICE);
+    if (!Array.isArray(raw)) return [];
+    return raw.filter((
+      entry,
+    ): entry is { pluginId: string; noticedAt: number } =>
+      isRecord(entry)
+      && typeof entry.pluginId === "string"
+      && typeof entry.noticedAt === "number"
+    );
+  }
+
+  private writeUploadDowngradeNoticeMarkers(
+    markers: readonly { pluginId: string; noticedAt: number }[],
+  ): void {
+    if (typeof this.app.saveLocalStorage !== "function") return;
+    this.app.saveLocalStorage(KEY_UPLOAD_DOWNGRADE_NOTICE, [...markers]);
+  }
+
+  /**
+   * One-shot notice for community-plugin upload downgrades deferred to user
+   * review by the plan-level guard. While versions stay misaligned the guard
+   * defers the same bundle on every round; notifying on every round would be
+   * noise, and never notifying leaves the user without any hint that an upload
+   * is intentionally blocked. Each plugin is notified once until the deferral
+   * is gone (the plan stops uploading that bundle), then its marker is dropped
+   * so a future misalignment can notify again. Pure notice; never mutates.
+   */
+  private maybeNoticeCommunityPluginUploadDowngrades(
+    deferredPluginIds: readonly string[] | undefined,
+  ): void {
+    const markers = this.readUploadDowngradeNoticeMarkers();
+    const active = new Set(deferredPluginIds ?? []);
+    // Retire markers whose plugin is no longer deferred this round: the guard
+    // runs every round, so a plugin absent from `deferredPluginIds` has
+    // converged and may notify again if a future misalignment reappears.
+    const retained = markers.filter((marker) => active.has(marker.pluginId));
+    const noticed = new Set(retained.map((marker) => marker.pluginId));
+    const next: { pluginId: string; noticedAt: number }[] = [...retained];
+    for (const pluginId of active) {
+      if (noticed.has(pluginId)) continue;
+      next.push({ pluginId, noticedAt: Date.now() });
+      this.noticeCenter.show({
+        key: `plugin-upload-downgrade:${pluginId}`,
+        message: this.i18n.t(
+          "notice.communityPlugins.uploadDowngradeDeferred",
+          { plugin: pluginId },
+        ),
+        priority: NOTICE_PRIORITY.attention,
+        className: "easy-sync-notice-action",
+      });
+    }
+    const changed = next.length !== markers.length
+      || next.some((marker, index) =>
+        marker.pluginId !== markers[index]?.pluginId
+        || marker.noticedAt !== markers[index]?.noticedAt);
+    if (changed) {
+      this.writeUploadDowngradeNoticeMarkers(next);
+    }
   }
 
   private async persistCommunityPluginJoinOutcomes(

@@ -51,6 +51,7 @@ import {
 } from "./types";
 import type {
   OneDriveClient,
+  OneDriveMetadataReason,
   SharedSyncProtocolBindingProvenObject,
 } from "../onedrive/client";
 import { isEasySyncInternalPath } from "./local-scanner";
@@ -183,7 +184,9 @@ import {
 } from "./canonical-plan-v2";
 import {
   ADAPTIVE_DOWNLOAD_MAX_BYTES,
+  ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY,
   DownloadConcurrencyPolicy,
+  MOBILE_DOWNLOAD_MAX_CONCURRENCY,
 } from "./download-concurrency-policy";
 import {
   ADAPTIVE_UPLOAD_MAX_BYTES,
@@ -346,6 +349,12 @@ export interface SyncResult {
    *  the whole auto-sync round: nothing was written and only an observed-fact
    *  change can clear the block. */
   identityBlockedErrors?: number;
+  /** Community-plugin bundles whose upload the downgrade guard deferred to
+   *  user review this round (local version below the remote one). The caller
+   *  may raise a one-shot notice per plugin id; the list itself is per-round
+   *  and identical deferrals repeat on every round while the versions stay
+   *  misaligned. */
+  communityPluginUploadDowngradesDeferred?: string[];
   authExpired: boolean;
   message: string;
   /** Stable machine semantics for narrow run outcomes that Main must not
@@ -1227,6 +1236,9 @@ export class SyncExecutor {
   private activeSyncScope: SyncScope | null = null;
   private remoteRecoveryPreviewRequired = false;
   private localVersionRecoveredDuringLedger = false;
+  /** Execution-layer mismatches silently converged this round
+   * (candidate ①, 2026-09-06).  Reset at the start of every execute(). */
+  private convergencesThisRound = 0;
   private completeRemoteItems: DriveItem[] | null = null;
   private isolatedMutationRecoveryPathCache: {
     records: readonly Readonly<MutationLedgerEntryV1>[];
@@ -1240,6 +1252,44 @@ export class SyncExecutor {
   private communityPluginSyncPolicy = cloneCommunityPluginSyncPolicy(
     DEFAULT_COMMUNITY_PLUGIN_SYNC_POLICY,
   );
+  /**
+   * Session-scoped bytes fetched while building a community-plugin bundle
+   * review snapshot. Keyed by pluginId → path → bytes + content identity.
+   *
+   * This is a pure display/staging cache: it never feeds `factsDigest`, never
+   * authorizes a mutation, and is discarded when the executor or vault
+   * changes. It lets the bundle sub-dialog ("查看差异") reuse content the
+   * snapshot already downloaded instead of re-downloading it, and lets a
+   * re-opened review re-render without re-fetching unchanged bytes.
+   */
+  private bundleReviewBytesByPlugin = new Map<string, Map<string, {
+    hash: string;
+    bytes: ArrayBuffer;
+    mtime: number;
+    driveId?: string;
+    eTag?: string;
+  }>>();
+  private bundleReviewBytesTotal = 0;
+  /**
+   * Session-scoped snapshot cache: last built community-plugin bundle review
+   * per pluginId, paired with the mutation facts it was built from. A re-open
+   * returns this instantly (秒级) and revalidates in the background; the
+   * user's decision is still re-checked against fresh facts before any write,
+   * so an expired cached snapshot can never authorize a mutation.
+   */
+  private bundleReviewSnapshotCache = new Map<string, {
+    factsIdentity: readonly [unknown, unknown];
+    snapshot: ManualMutationResolutionSnapshotV1;
+  }>();
+  /** Latest mutation facts (ledger + pending conflicts references) used to
+   *  invalidate the bundle-review snapshot cache. Cache-hit comparison must
+   *  compare the two element references, never this tuple: the tuple is
+   *  freshly allocated on every call, so whole-tuple equality would never hit
+   *  and every reopen would rebuild + re-download the whole bundle (host
+   *  finding 2026-09-08: content ready 9–13.5s instead of 秒级). */
+  private bundleReviewCacheFacts(): readonly [unknown, unknown] {
+    return [this.state.mutationLedger, this.state.pendingConflicts];
+  }
   private communityPluginPreparedManifests = new Map<string, {
     sourceKey: string;
     prepared: PreparedDownload;
@@ -1270,6 +1320,48 @@ export class SyncExecutor {
 
   private t(key: string, params?: Record<string, string | number>): string {
     return this.i18n?.t(key, params) ?? key;
+  }
+
+  /**
+   * Result message for a whole-round folder-plan rejection.
+   *
+   * These rejections stop the round before any plan executes (fail-closed,
+   * zero mutations) and are NOT file deferrals: no file "changed again
+   * before transfer", so the historical `result.deferred` sentence was
+   * misleading there. Each reason maps to its own honest, retryable message.
+   */
+  private folderRejectionMessage(
+    reason: string | null | undefined,
+    folderScanFailures: readonly string[],
+  ): string {
+    if (
+      reason === "local-normalized-path-conflict"
+      || reason === "local-folder-scan-incomplete"
+      || reason === "scan-incomplete"
+    ) {
+      // A non-"/" scan failure is a name-clash entry (NFC + toLocaleLowerCase
+      // equivalence: capitalization or Unicode-equivalent spellings), while a
+      // bare "/" failure means the folder list itself was incomplete.
+      const clashPaths = folderScanFailures.filter((path) => path !== "/");
+      if (clashPaths.length > 0) {
+        return this.t("result.folderNameClash", {
+          paths: clashPaths.join(", "),
+        });
+      }
+      return this.t("result.folderListIncomplete");
+    }
+    if (
+      reason === "folder-anchors-uninitialized"
+      || reason === "anchor-incomplete"
+    ) {
+      return this.t("result.syncStateNotReady");
+    }
+    if (reason === "remote-identity-incomplete") {
+      return this.t("result.cloudRecordIncomplete");
+    }
+    // Defensive fallback for unknown or detail-less rejections: keep the
+    // round stopped with an honest, automatically retried message.
+    return this.t("result.folderListIncomplete");
   }
 
   /** Show a translated notice to the user */
@@ -1462,6 +1554,52 @@ export class SyncExecutor {
       || pluginId === "easy-sync"
       || !isPluginSelected(this.communityPluginSyncPolicy.files, pluginId)
     ) return null;
+    // P5 — instant re-open. When this plugin's review was already built this
+    // session and the mutation facts are unchanged, return the cached
+    // snapshot immediately (秒级) and refresh it in the background. The
+    // user's eventual choice still goes through the existing recheck +
+    // factsDigest gate before any write, so a stale cached snapshot can never
+    // authorize a mutation (SC-07/SC-15 preserved).
+    const factsIdentity = this.bundleReviewCacheFacts();
+    const cachedEntry = this.bundleReviewSnapshotCache.get(pluginId);
+    if (
+      cachedEntry
+      && cachedEntry.factsIdentity[0] === factsIdentity[0]
+      && cachedEntry.factsIdentity[1] === factsIdentity[1]
+    ) {
+      this.refreshBundleReviewSnapshotInBackground(pluginId);
+      return cachedEntry.snapshot;
+    }
+    const built = await this.buildAndCacheBundleReviewSnapshot(pluginId);
+    return built?.snapshot ?? null;
+  }
+
+  /** Build a fresh review snapshot and cache it. Single-flight **per plugin**:
+   *  a build already running for plugin A must never be served to a request
+   *  for plugin B (its result would be cached under B's id and open the wrong
+   *  review). */
+  private buildInFlightBundleReviewSnapshots = new Map<string, Promise<{
+    snapshot: ManualMutationResolutionSnapshotV1;
+  } | null>>();
+
+  private buildAndCacheBundleReviewSnapshot(
+    pluginId: string,
+  ): Promise<{ snapshot: ManualMutationResolutionSnapshotV1 } | null> {
+    const inFlight = this.buildInFlightBundleReviewSnapshots.get(pluginId);
+    if (inFlight) return inFlight;
+    const run = this.performBundleReviewSnapshotBuild(pluginId);
+    this.buildInFlightBundleReviewSnapshots.set(pluginId, run);
+    void run.finally(() => {
+      if (this.buildInFlightBundleReviewSnapshots.get(pluginId) === run) {
+        this.buildInFlightBundleReviewSnapshots.delete(pluginId);
+      }
+    });
+    return run;
+  }
+
+  private async performBundleReviewSnapshotBuild(
+    pluginId: string,
+  ): Promise<{ snapshot: ManualMutationResolutionSnapshotV1 } | null> {
     const remoteScope = await this.onedrive.initVaultScope(this.vaultName);
     const scope: SyncScope = {
       accountId: this.state.boundAccountId,
@@ -1475,16 +1613,44 @@ export class SyncExecutor {
       !isFolderMutationIntent(candidate.intent)
       && parseCommunityPluginBundlePath(candidate.intent.path, configDir)
         ?.pluginId === pluginId);
+    let snapshot: ManualMutationResolutionSnapshotV1 | null;
     if (matchingRecords.length > 0) {
       const persisted = matchingRecords[0];
       if (persisted.manualResolution) return null;
       const record = this.state.prepareMutationRecoveryRecord(persisted, scope);
-      return record && !isFolderMutationIntent(record.intent)
-        ? this.buildCurrentPluginBundleReviewSnapshot(record)
+      snapshot = record && !isFolderMutationIntent(record.intent)
+        ? await this.buildCurrentPluginBundleReviewSnapshot(record)
         : null;
+    } else {
+      if (this.state.mutationLedger.length > 0) return null;
+      snapshot = await this.buildCurrentPluginBundleReviewSnapshot(
+        null,
+        pluginId,
+        scope,
+      );
     }
-    if (this.state.mutationLedger.length > 0) return null;
-    return this.buildCurrentPluginBundleReviewSnapshot(null, pluginId, scope);
+    if (!snapshot) return null;
+    this.bundleReviewSnapshotCache.set(pluginId, {
+      factsIdentity: this.bundleReviewCacheFacts(),
+      snapshot,
+    });
+    return { snapshot };
+  }
+
+  /** Refresh the cached snapshot in the background when the same plugin was
+   *  just served from cache. Single-flight (the underlying build is
+   *  single-flight). Skipped entirely while a sync is running or a side
+   *  action is in flight so the refresh can never race remote reads with a
+   *  mutation. Failures leave the previous cache in place (the UI's existing
+   *  "content changed" path still applies on the next open). */
+  private refreshBundleReviewSnapshotInBackground(pluginId: string): void {
+    if (
+      this.running
+      || this.hasSideActionsInFlight
+      || !this.state.isV2StateActive
+    ) return;
+    void this.buildAndCacheBundleReviewSnapshot(pluginId)
+      .catch(() => { /* keep previous cache; next open rebuilds */ });
   }
 
   /**
@@ -2493,6 +2659,10 @@ export class SyncExecutor {
     options: Readonly<{
       /** Local SHA-256 (lowercase) to compare against remote hash without downloading. */
       localHash?: string | undefined;
+      /** When set, the plugin whose bundle this member belongs to. Downloads
+       *  performed to establish the member hash are staged in the session
+       *  bytes cache so the sub-dialog and later re-opens can reuse them. */
+      pluginId?: string | undefined;
     }> = {},
   ): Promise<{
       fact: ManualMutationResolutionRemoteFactV1;
@@ -2502,17 +2672,45 @@ export class SyncExecutor {
     if (!initial) return { fact: { path, exists: false } };
     let hash = initial.sha256Hash?.toLowerCase();
     if (!hash) {
-      const bytes = await this.onedrive.downloadFile(
-        this.vaultName,
-        path,
-        initial.downloadUrl,
-        initial.driveId,
-        initial.size,
-      );
-      if (bytes.byteLength !== initial.size) {
-        throw new Error(`Remote recovery review size changed: ${path}`);
+      // Reuse the session bytes cache when this member's live identity still
+      // matches a previously downloaded copy (1.4.3 review F2): re-opens,
+      // background refreshes and fresh rebuilds used to re-download multi-MB
+      // hashless members (typically main.js) even though the exact bytes were
+      // already cached. Safety is unchanged: cacheGet re-checks identity and
+      // the verified re-inspection below still runs.
+      const cached = options.pluginId
+        ? this.bundleReviewBytesCacheGet(
+          options.pluginId,
+          path,
+          undefined,
+          { driveId: initial.driveId, eTag: initial.eTag },
+        )
+        : null;
+      if (!cached) {
+        const bytes = await this.onedrive.downloadFile(
+          this.vaultName,
+          path,
+          initial.downloadUrl,
+          initial.driveId,
+          initial.size,
+        );
+        if (bytes.byteLength !== initial.size) {
+          throw new Error(`Remote recovery review size changed: ${path}`);
+        }
+        hash = await sha256Hex(bytes);
+        if (options.pluginId) {
+          this.bundleReviewBytesCacheSet(
+            options.pluginId,
+            path,
+            hash,
+            bytes,
+            initial.mtime ?? 0,
+            { driveId: initial.driveId, eTag: initial.eTag },
+          );
+        }
+      } else {
+        hash = cached.hash;
       }
-      hash = await sha256Hex(bytes);
       const verified = await this.inspectRemotePath(path);
       if (
         !verified
@@ -2587,13 +2785,25 @@ export class SyncExecutor {
       || !fact.eTag
       || !entry
     ) return null;
-    const bytes = await this.onedrive.downloadFile(
-      this.vaultName,
+    const pluginId = parseCommunityPluginBundlePath(
       path,
-      entry.downloadUrl,
-      fact.driveId,
-      fact.size,
-    );
+      getConfigDir(this.scanner.vault),
+    )?.pluginId ?? "";
+    // P2/P3: reuse exact bytes previously downloaded for the same bundle
+    // member (hash is the content identity). The parsed manifest only feeds
+    // display (version numbers) and never enters factsDigest.
+    const cached = pluginId
+      ? this.bundleReviewBytesCacheGet(pluginId, path, fact.hash)
+      : null;
+    const bytes = cached
+      ? cached.bytes
+      : await this.onedrive.downloadFile(
+          this.vaultName,
+          path,
+          entry.downloadUrl,
+          fact.driveId,
+          fact.size,
+        );
     if (
       bytes.byteLength !== fact.size
       || await sha256Hex(bytes) !== fact.hash
@@ -2605,11 +2815,103 @@ export class SyncExecutor {
       || current.eTag !== fact.eTag
       || current.size !== fact.size
     ) return null;
+    if (!cached && pluginId) {
+      this.bundleReviewBytesCacheSet(
+        pluginId,
+        path,
+        fact.hash,
+        bytes,
+        entry.mtime ?? 0,
+        { driveId: fact.driveId, eTag: fact.eTag },
+      );
+    }
     return parseCommunityPluginBundleManifest(
       new TextDecoder().decode(bytes),
       parseCommunityPluginBundlePath(path, getConfigDir(this.scanner.vault))!
         .pluginId,
     );
+  }
+
+  /** Global bytes-cache cap across all plugin bundles (LRU evicts whole plugin sets). */
+  private static readonly BUNDLE_REVIEW_BYTES_CACHE_MAX_TOTAL = 16 * 1024 * 1024;
+  /**
+   * Per-member bytes bound for the bundle-review bytes cache. The name says
+   * "per plugin", but the bound is applied per cached file (each plugin bundle
+   * has ≤3 members, so a plugin can hold up to 3 × 3 MiB = 9 MiB; the 16 MiB
+   * global cap is the actual backstop).
+   */
+  private static readonly BUNDLE_REVIEW_BYTES_CACHE_MAX_PER_PLUGIN = 3 * 1024 * 1024;
+
+  private bundleReviewBytesCacheSet(
+    pluginId: string,
+    path: string,
+    hash: string,
+    bytes: ArrayBuffer,
+    mtime: number,
+    identity?: { driveId: string; eTag: string },
+  ): void {
+    if (bytes.byteLength > SyncExecutor.BUNDLE_REVIEW_BYTES_CACHE_MAX_PER_PLUGIN) {
+      return; // never cache an oversized member
+    }
+    let byPath = this.bundleReviewBytesByPlugin.get(pluginId);
+    if (!byPath) {
+      byPath = new Map();
+      this.bundleReviewBytesByPlugin.set(pluginId, byPath);
+    }
+    const previous = byPath.get(path);
+    if (previous) this.bundleReviewBytesTotal -= previous.bytes.byteLength;
+    byPath.set(path, { hash, bytes, mtime, ...identity });
+    this.bundleReviewBytesTotal += bytes.byteLength;
+    // LRU bump before the eviction sweep (1.4.3 review F1): writing to a
+    // plugin set must move it to the MRU position first — otherwise a writer
+    // that is currently the oldest key gets evicted by its own write (the
+    // fresh bytes are dropped while unrelated newer sets survive).
+    this.bundleReviewBytesByPlugin.delete(pluginId);
+    this.bundleReviewBytesByPlugin.set(pluginId, byPath);
+    // LRU over plugins: evict the least recently used plugin's whole set when
+    // over the global cap. (Path-level LRU is unnecessary: ≤3 members each.)
+    while (
+      this.bundleReviewBytesTotal
+        > SyncExecutor.BUNDLE_REVIEW_BYTES_CACHE_MAX_TOTAL
+      && this.bundleReviewBytesByPlugin.size > 0
+    ) {
+      const oldestKey = this.bundleReviewBytesByPlugin.keys().next().value as string;
+      const removed = this.bundleReviewBytesByPlugin.get(oldestKey);
+      if (!removed) break;
+      let removedBytes = 0;
+      for (const cached of removed.values()) removedBytes += cached.bytes.byteLength;
+      this.bundleReviewBytesTotal -= removedBytes;
+      this.bundleReviewBytesByPlugin.delete(oldestKey);
+    }
+  }
+
+  private bundleReviewBytesCacheGet(
+    pluginId: string,
+    path: string,
+    expectedHash?: string,
+    expectedIdentity?: { driveId?: string; eTag?: string },
+  ): { bytes: ArrayBuffer; mtime: number; hash: string } | null {
+    const byPath = this.bundleReviewBytesByPlugin.get(pluginId);
+    if (!byPath) return null;
+    const cached = byPath.get(path);
+    if (!cached) return null;
+    if (expectedHash && cached.hash !== expectedHash) return null;
+    if (
+      expectedIdentity
+      && ((
+        expectedIdentity.driveId
+        && cached.driveId
+        && cached.driveId !== expectedIdentity.driveId
+      ) || (
+        expectedIdentity.eTag
+        && cached.eTag
+        && cached.eTag !== expectedIdentity.eTag
+      ))
+    ) return null;
+    // LRU bump: move the plugin set to MRU position.
+    this.bundleReviewBytesByPlugin.delete(pluginId);
+    this.bundleReviewBytesByPlugin.set(pluginId, byPath);
+    return { bytes: cached.bytes, mtime: cached.mtime, hash: cached.hash };
   }
 
   /**
@@ -2650,39 +2952,114 @@ export class SyncExecutor {
     const localRaw = await this.scanner.vault.adapter.readBinary(path);
     const localText = decodeUtf8(localRaw);
 
-    const remote = await this.inspectManualResolutionRemote(path);
+    // Remote side: prefer the session bytes cache (P3). The snapshot builder
+    // already downloaded this member during review, so the sub-diff reuses
+    // the exact bytes instead of a second remote transfer. A rewritten remote
+    // (driveId/eTag change) rejects the stale hit and falls through to a
+    // fresh download; the read-only diff never feeds factsDigest or
+    // authorizes a mutation.
+    const currentRemote = await this.inspectRemotePath(path);
+    if (currentRemote) {
+      const cached = this.bundleReviewBytesCacheGet(pluginId, path, undefined, {
+        driveId: currentRemote.driveId,
+        eTag: currentRemote.eTag,
+      });
+      if (cached) {
+        return this.buildBundleFileDiffResult(
+          localInspection.entry,
+          localText,
+          cached.bytes,
+          cached.mtime,
+        );
+      }
+    }
+    const remote = await this.inspectManualResolutionRemote(path, { pluginId });
     if (!remote.fact.exists || !remote.entry) return null;
-    const remoteBytes = await this.onedrive.downloadFile(
-      this.vaultName,
-      path,
-      remote.entry.downloadUrl,
-      remote.entry.driveId,
-      remote.entry.size,
+    let remoteBytes: ArrayBuffer;
+    let remoteMtime: number | undefined = remote.entry.mtime;
+    if (remote.fact.hash) {
+      // Hash known (from metadata or the hash-establishing download above).
+      // Reuse cached bytes when the identity still matches, otherwise fetch.
+      const cached = this.bundleReviewBytesCacheGet(
+        pluginId,
+        path,
+        remote.fact.hash,
+        { driveId: remote.entry.driveId, eTag: remote.entry.eTag },
+      );
+      if (cached) {
+        remoteBytes = cached.bytes;
+        remoteMtime = cached.mtime;
+      } else {
+        remoteBytes = await this.onedrive.downloadFile(
+          this.vaultName,
+          path,
+          remote.entry.downloadUrl,
+          remote.entry.driveId,
+          remote.entry.size,
+        );
+        if (remoteBytes.byteLength !== remote.entry.size) return null;
+        this.bundleReviewBytesCacheSet(
+          pluginId,
+          path,
+          remote.fact.hash,
+          remoteBytes,
+          remote.entry.mtime ?? 0,
+          { driveId: remote.entry.driveId, eTag: remote.entry.eTag },
+        );
+      }
+    } else {
+      remoteBytes = await this.onedrive.downloadFile(
+        this.vaultName,
+        path,
+        remote.entry.downloadUrl,
+        remote.entry.driveId,
+        remote.entry.size,
+      );
+      if (remoteBytes.byteLength !== remote.entry.size) return null;
+    }
+    return this.buildBundleFileDiffResult(
+      localInspection.entry,
+      localText,
+      remoteBytes,
+      remoteMtime,
     );
-    if (remoteBytes.byteLength !== remote.entry.size) return null;
-    const remoteText = decodeUtf8(remoteBytes);
+  }
 
+  private buildBundleFileDiffResult(
+    localEntry: LocalFileEntry,
+    localText: string | null,
+    remoteBytes: ArrayBuffer,
+    remoteMtime: number | undefined,
+  ): {
+    localText: string;
+    remoteText: string;
+    localMtime?: number;
+    remoteMtime?: number;
+    localSize: number;
+    remoteSize: number;
+    binary: boolean;
+  } | null {
+    const remoteText = decodeUtf8(remoteBytes);
     if (localText == null || remoteText == null) {
       // Binary / non-text side: surface as binary rather than a generic load
       // failure so the dialog can show the ordinary binary notice.
       return {
         localText: localText ?? "",
         remoteText: remoteText ?? "",
-        localMtime: localInspection.entry.mtime,
-        remoteMtime: remote.entry.mtime,
-        localSize: localInspection.entry.size,
-        remoteSize: remote.entry.size,
+        localMtime: localEntry.mtime,
+        remoteMtime,
+        localSize: localEntry.size,
+        remoteSize: remoteBytes.byteLength,
         binary: true,
       };
     }
-
     return {
       localText,
       remoteText,
-      localMtime: localInspection.entry.mtime,
-      remoteMtime: remote.entry.mtime,
-      localSize: localInspection.entry.size,
-      remoteSize: remote.entry.size,
+      localMtime: localEntry.mtime,
+      remoteMtime,
+      localSize: localEntry.size,
+      remoteSize: remoteBytes.byteLength,
       binary: false,
     };
   }
@@ -2722,10 +3099,27 @@ export class SyncExecutor {
     let localReason: CommunityPluginBundleReviewBlockReasonV1 | undefined;
     let remoteReason: CommunityPluginBundleReviewBlockReasonV1 | undefined;
 
-    for (const path of allPaths) {
+    // Bundle members are independent: run their local+remote inspections in
+    // parallel so one slow network round trip does not serialize the whole
+    // review. Each member keeps the local-first order inside, preserving the
+    // "equal hashes skip the remote download" optimization. Any inspection
+    // failure still propagates exactly as the serial loop did (fail-closed:
+    // the whole build rejects / marks the direction unavailable below).
+    const perPathInspections = await Promise.all(allPaths.map(async (path) => {
       // Local inspection is cheap (stat + hash from cache); do it first so we
       // can decide whether the remote needs a download at all.
       const localInspection = await this.inspectLocalPath(path);
+      const localHash = localInspection?.status === "present"
+        && localInspection.entry
+        ? localInspection.entry.hash
+        : undefined;
+      const remoteInspection = await this.inspectManualResolutionRemote(
+        path,
+        { localHash, pluginId: parsed.pluginId },
+      );
+      return { path, localInspection, remoteInspection };
+    }));
+    for (const { path, localInspection, remoteInspection } of perPathInspections) {
       if (!localInspection || localInspection.status === "uncertain") {
         localReason = "facts-unavailable";
       } else {
@@ -2746,14 +3140,6 @@ export class SyncExecutor {
         }
       }
 
-      const localHash = localInspection?.status === "present"
-        && localInspection.entry
-        ? localInspection.entry.hash
-        : undefined;
-      const remoteInspection = await this.inspectManualResolutionRemote(
-        path,
-        { localHash },
-      );
       remoteByPath.set(path, remoteInspection.fact);
       if (remoteInspection.entry) {
         remoteEntryByPath.set(path, remoteInspection.entry);
@@ -2765,42 +3151,62 @@ export class SyncExecutor {
 
     const manifestPath = `${root}/manifest.json`;
     const mainPath = `${root}/main.js`;
-    let localManifest: CommunityPluginBundleManifest | null = null;
-    let remoteManifest: CommunityPluginBundleManifest | null = null;
     const localManifestFact = localByPath.get(manifestPath);
     const remoteManifestFact = remoteByPath.get(manifestPath);
-    if (localManifestFact?.exists) {
-      try {
-        localManifest = await this.readReviewedPluginLocalManifest(
-          manifestPath,
-          localManifestFact,
-        );
-        if (!localManifest) localReason = "facts-unavailable";
-      } catch {
-        localReason = "manifest-invalid";
-      }
-    }
-    if (remoteManifestFact?.exists) {
-      // Same bytes on both sides (proven from metadata) means the remote
-      // manifest is the same release as the local one: reuse the local parse
-      // result and skip the remote text download entirely.
-      const localHash = localByPath.get(manifestPath)?.hash;
-      const remoteHash = remoteManifestFact.hash;
-      if (localManifest && localHash && remoteHash === localHash) {
-        remoteManifest = localManifest;
-      } else {
-        try {
-          remoteManifest = await this.readReviewedPluginRemoteManifest(
-            manifestPath,
-            remoteManifestFact,
-            remoteEntryByPath.get(manifestPath),
-          );
-          if (!remoteManifest) remoteReason = "facts-unavailable";
-        } catch {
-          remoteReason = "manifest-invalid";
-        }
-      }
-    }
+    const localHash = localByPath.get(manifestPath)?.hash;
+    const remoteHash = remoteManifestFact?.hash;
+    // P2 — the manifest parse (and its possible remote download) joins the
+    // member batch instead of running as a serial tail after it. The
+    // hash-equality skip decision only needs metadata (localHash vs
+    // remoteHash), which the batch already produced, so nothing here forces a
+    // second serial round trip on first open.
+    const needsRemoteManifestDownload = Boolean(
+      remoteManifestFact?.exists
+      && !(localManifestFact?.exists && localHash && remoteHash === localHash),
+    );
+    let localManifest: CommunityPluginBundleManifest | null = null;
+    let remoteManifest: CommunityPluginBundleManifest | null = null;
+    const [localParsed, remoteParsed] = await Promise.all([
+      localManifestFact?.exists
+        ? (async () => {
+            try {
+              const parsed = await this.readReviewedPluginLocalManifest(
+                manifestPath,
+                localManifestFact,
+              );
+              if (!parsed) localReason = "facts-unavailable";
+              return parsed;
+            } catch {
+              localReason = "manifest-invalid";
+              return null;
+            }
+          })()
+        : Promise.resolve(null),
+      needsRemoteManifestDownload
+        ? (async () => {
+            try {
+              const parsed = await this.readReviewedPluginRemoteManifest(
+                manifestPath,
+                remoteManifestFact!,
+                remoteEntryByPath.get(manifestPath),
+              );
+              if (!parsed) remoteReason = "facts-unavailable";
+              return parsed;
+            } catch {
+              remoteReason = "manifest-invalid";
+              return null;
+            }
+          })()
+        : Promise.resolve(null),
+    ]);
+    localManifest = localParsed;
+    // Same bytes on both sides: reuse the local parse (which the batch above
+    // already resolved) — no remote text download happened at all.
+    remoteManifest = needsRemoteManifestDownload
+      ? remoteParsed
+      : remoteManifestFact?.exists && localHash && remoteHash === localHash
+        ? localManifest
+        : null;
 
     const pluginRecords = this.state.mutationLedger.filter((candidate) => {
       if (isFolderMutationIntent(candidate.intent)) return false;
@@ -3723,6 +4129,11 @@ export class SyncExecutor {
         && (
           issue.issueCode === "identity-replacement-ambiguous"
           || issue.issueCode === "anchored-folder-missing-remote"
+          || issue.issueCode === "local-rename-evidence-conflict"
+          || issue.issueCode === "local-subtree-changed"
+          || issue.issueCode === "remote-subtree-changed"
+          || issue.issueCode === "target-occupied"
+          || issue.issueCode === "parent-chain-incomplete"
         ),
     );
     const issueCode = pending?.issueCode as StaleIdentityIssueCodeV1 | undefined;
@@ -4132,11 +4543,15 @@ export class SyncExecutor {
       && current.entry!.size === expected.size;
   }
 
-  /** Read-only eligibility gate used before adaptive network prefetch. */
+  /** Read-only eligibility gate used before adaptive network prefetch.
+   *  A2 (2026-09-08): mobile is no longer excluded — it joins the same
+   *  bounded prefetch machinery with a lower concurrency ceiling
+   *  (MOBILE_DOWNLOAD_MAX_CONCURRENCY = 2). Local CAS, temp verification,
+   *  intent/receipt and checkpoint commits below remain strictly serial
+   *  per file on every platform. */
   private async canPrefetchDownload(item: SyncPlanItem): Promise<boolean> {
     if (
-      Platform.isMobile
-      || item.type !== SyncActionType.Download
+      item.type !== SyncActionType.Download
       || !item.remote
       || item.remote.size > ADAPTIVE_DOWNLOAD_MAX_BYTES
     ) return false;
@@ -5606,6 +6021,7 @@ export class SyncExecutor {
         userFileChanges: "unknown",
       },
     };
+    this.convergencesThisRound = 0;
     const runStartedAt = Date.now();
     const phasesMs: SyncRunPhaseDurations = {
       recovery: 0,
@@ -5721,7 +6137,10 @@ export class SyncExecutor {
           if (recoveryResult) return recoveryResult;
         }
         if (this.state.hasV2RemoteScopeRecovery) {
-          result.deferred = 1;
+          // Whole-round stop, not a file deferral: the history counter must
+          // not read "1 file deferred" (2026-09-08 review P2-1 — same policy
+          // as the folder-rejection sites).
+          result.deferred = 0;
           result.message = this.t("result.v2ScopeRecoveryPending");
           this.diag?.warn(
             "state",
@@ -6301,8 +6720,7 @@ export class SyncExecutor {
           blockedExpansion?.revision === scopeExpansionPreparation.revision
           && blockedExpansion.requiresCompleteRemoteIdentitySnapshot
         ) {
-          result.deferred = 1;
-          result.message = this.t("result.deferred", { deferred: 1 });
+          result.message = this.t("result.cloudRecordIncomplete");
           this.diag?.warn(
             "state",
             "file scope expansion stopped before remote scan and planning until complete remote identity recovery is safe",
@@ -6963,8 +7381,7 @@ export class SyncExecutor {
           : null;
       if (prepareV2MigrationCandidate) {
         if (!migrationRemoteItems) {
-          result.deferred = 1;
-          result.message = this.t("result.deferred", { deferred: 1 });
+          result.message = this.t("result.cloudRecordIncomplete");
           this.diag?.warn(
             "state",
             "V2 migration candidate requires a complete remote identity snapshot",
@@ -7049,10 +7466,11 @@ export class SyncExecutor {
           preparedMigration.status !== "ready"
           || !preparedMigration.envelope
         ) {
-          result.deferred = Math.max(1, preparedMigration.pending.length);
-          result.message = this.t("result.deferred", {
-            deferred: result.deferred,
-          });
+          result.deferred = 0; // whole-round stop: clear any earlier join-block deferral (2026-09-08 review P3-1)
+          result.message = this.folderRejectionMessage(
+            preparedMigration.reason,
+            scanResult.folderScanFailures,
+          );
           this.diag?.warn(
             "state",
             "V2 migration candidate rejected before authority change",
@@ -7242,6 +7660,77 @@ export class SyncExecutor {
               error: error instanceof Error ? error.message : String(error),
               mutations: 0,
             },
+          );
+        }
+      };
+      // Knife-1 (2026-09-08, carrier `docs/temp/20260908-1331`): planner-stage
+      // downloadUrl refresh for the exact budgeted content-verification
+      // download set. The canonical planner hands over the candidates it will
+      // download; we fill a fresh URL on each planner-owned clone through one
+      // Graph $batch (≤20 ids per request, self-chunked in the client) so the
+      // verification content GET below skips the per-file `downloadUrlRefresh`
+      // metadata round trip. Fail-open by contract: a missing batch capability
+      // or a failed batch leaves URLs unset and the per-file waterfall refresh
+      // handles each download exactly as before batching.
+      const refreshVerificationDownloadUrls = async (
+        items: ReadonlyArray<SyncPlanItem>,
+      ): Promise<void> => {
+        const batchMetadataClient = this.onedrive as OneDriveClient & {
+          getDriveItemMetadataByIds?: (
+            driveItemIds: readonly string[],
+            metadataReason?: OneDriveMetadataReason,
+          ) => Promise<Map<string, DriveItem | null>>;
+        };
+        if (
+          typeof batchMetadataClient.getDriveItemMetadataByIds !== "function"
+        ) {
+          // Fail-open: no batch capability — per-file waterfall stays.
+          return;
+        }
+        const missingUrl = items.filter(
+          (item) =>
+            item.remote
+            && !item.remote.downloadUrl
+            && Boolean(item.remote.driveId),
+        );
+        if (missingUrl.length === 0) return;
+        const batchStartedAt = Date.now();
+        try {
+          const refreshed = await batchMetadataClient.getDriveItemMetadataByIds(
+            missingUrl.map((item) => item.remote!.driveId),
+            "contentVerificationRefresh",
+          );
+          let filled = 0;
+          for (const item of missingUrl) {
+            const driveId = item.remote!.driveId;
+            const current = refreshed.get(driveId);
+            if (
+              current
+              && current.id === driveId
+              && current.eTag === item.remote!.eTag
+            ) {
+              const downloadUrl = current["@microsoft.graph.downloadUrl"];
+              if (downloadUrl) {
+                item.remote!.downloadUrl = downloadUrl;
+                filled++;
+              }
+            }
+            // No URL / identity mismatch / missing item: leave downloadUrl
+            // unset so the existing per-file waterfall refresh (or error
+            // path) handles it exactly as before.
+          }
+          this.diag?.log("plan", "batch content-verification downloadUrl refresh", {
+            schemaVersion: 1,
+            candidates: missingUrl.length,
+            filled,
+            batchRequests: Math.ceil(missingUrl.length / 20),
+            elapsedMs: Math.max(0, Date.now() - batchStartedAt),
+          });
+        } catch (error) {
+          this.diag?.warn(
+            "plan",
+            `batch content-verification downloadUrl refresh failed, falling back to per-file waterfall`,
+            error instanceof Error ? error.message : String(error),
           );
         }
       };
@@ -7888,8 +8377,11 @@ export class SyncExecutor {
         );
       }
       if (canonicalPlanCandidate?.status === "rejected") {
-        result.deferred = 1;
-        result.message = this.t("result.deferred", { deferred: 1 });
+        result.deferred = 0; // whole-round stop: clear any earlier join-block deferral (2026-09-08 review P3-1)
+        result.message = this.folderRejectionMessage(
+          canonicalPlanCandidate.rejectionReason,
+          scanResult.folderScanFailures,
+        );
         this.diag?.warn(
           "plan",
           "V2 canonical candidate rejected before mutation",
@@ -8032,6 +8524,21 @@ export class SyncExecutor {
           verifiedRemoteContentHashesById:
             verifiedFirstSyncRemoteHashesById,
           resolveRemoteContentHash: resolveCanonicalRemoteContentHash,
+          refreshVerificationDownloadUrls,
+          // Knife-2 (2026-09-08): bounded read-only overlap for plan-time
+          // content-verification downloads. Window caps reuse the descendant
+          // reconstruction batch caps (desktop 4 files/32 MiB, mobile
+          // 2 files/8 MiB) — the same read-only memory envelope proven on
+          // real devices; absent here means strictly serial verification.
+          verificationDownloadWindow: Platform.isMobile
+            ? {
+                maxFiles: MOBILE_RECONSTRUCTION_BATCH_FILES,
+                maxBytes: MOBILE_RECONSTRUCTION_BATCH_BYTES,
+              }
+            : {
+                maxFiles: DESKTOP_RECONSTRUCTION_BATCH_FILES,
+                maxBytes: DESKTOP_RECONSTRUCTION_BATCH_BYTES,
+              },
         });
         contentEqualityBaseUpserts = finalizedCanonicalPlan.baseUpserts;
         plan.items = finalizedCanonicalPlan.items;
@@ -9281,6 +9788,7 @@ export class SyncExecutor {
           && this.state.mutationLedger.length === 0
           ? "none"
           : "unknown";
+      result.runFacts!.convergences = this.convergencesThisRound || undefined;
       // Preserve message set by executePlan (e.g. auth expired, cancelled)
       if (!result.message) {
         const skipped = result.skippedLarge + result.skippedIgnored
@@ -9691,7 +10199,11 @@ export class SyncExecutor {
         : 0;
 
     const uploadPolicy = new UploadConcurrencyPolicy(Platform.isMobile);
-    const downloadPolicy = new DownloadConcurrencyPolicy();
+    const downloadPolicy = new DownloadConcurrencyPolicy(
+      Platform.isMobile
+        ? MOBILE_DOWNLOAD_MAX_CONCURRENCY
+        : ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY,
+    );
 
     // M19: anti-downgrade guard for EasySync self-sync.
     // Before any plugin files are downloaded, fetch remote manifest.json and
@@ -9736,7 +10248,7 @@ export class SyncExecutor {
     callbacks.onProgress?.(0, total, "");
     this.diag?.log(
       "execute",
-      `pools — folders=${folderCreates.length} small=${smallUploads.length}(adaptive ${uploadPolicy.limit}→${Platform.isMobile ? 2 : 4}) large=${largeUploads.length}(1) download=${downloads.length}(adaptive 1→3 desktop small files) passthrough=${passthroughItems.length} cleanup=${cleanupItems.length}`,
+      `pools — folders=${folderCreates.length} small=${smallUploads.length}(adaptive ${uploadPolicy.limit}→${Platform.isMobile ? 2 : 4}) large=${largeUploads.length}(1) download=${downloads.length}(adaptive 1→${Platform.isMobile ? MOBILE_DOWNLOAD_MAX_CONCURRENCY : ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY} small files) passthrough=${passthroughItems.length} cleanup=${cleanupItems.length}`,
     );
 
     const executePlanItem = async (
@@ -9971,6 +10483,16 @@ export class SyncExecutor {
                 ? { issueCode: "unanchored-shared-folder" as const }
               : item.reason === "reason.folder.both-sides-moved"
                 ? { issueCode: "folder-location-choice" as const }
+              : item.reason === "reason.folder.local-rename-evidence-conflict"
+                ? { issueCode: "local-rename-evidence-conflict" as const }
+              : item.reason === "reason.folder.local-subtree-changed"
+                ? { issueCode: "local-subtree-changed" as const }
+              : item.reason === "reason.folder.remote-subtree-changed"
+                ? { issueCode: "remote-subtree-changed" as const }
+              : item.reason === "reason.folder.target-occupied"
+                ? { issueCode: "target-occupied" as const }
+              : item.reason === "reason.folder.parent-chain-incomplete"
+                ? { issueCode: "parent-chain-incomplete" as const }
               : {}),
             reason,
             updatedAt: Date.now(),
@@ -10310,11 +10832,13 @@ export class SyncExecutor {
     // affected bundles are removed from the upload pools (smallUploads /
     // largeUploads directly, since the pools are iterated later) and surfaced
     // as reviewable conflicts (mirror of guardCommunityPluginBundleDowngrades).
+    const communityPluginUploadDowngradesDeferred: string[] = [];
     const communityPluginUploadDowngradeRemoved =
       await this.guardCommunityPluginBundleUploadDowngrades(
         smallUploads,
         largeUploads,
         communityPluginSyncPolicy,
+        communityPluginUploadDowngradesDeferred,
       );
     if (communityPluginUploadDowngradeRemoved > 0) {
       total -= communityPluginUploadDowngradeRemoved;
@@ -10322,6 +10846,11 @@ export class SyncExecutor {
         "execute",
         `community plugin upload downgrade guard deferred ${communityPluginUploadDowngradeRemoved} upload(s) to user review`,
       );
+    }
+    if (communityPluginUploadDowngradesDeferred.length > 0) {
+      result.communityPluginUploadDowngradesDeferred = [
+        ...new Set(communityPluginUploadDowngradesDeferred),
+      ];
     }
     const communityPluginUploadErrors =
       await this.prepareCommunityPluginBundleUploads(
@@ -10443,36 +10972,6 @@ export class SyncExecutor {
       );
     }
 
-    let visibleBundleRoot = "";
-    const preparedCommunityPluginDownloads =
-      await this.prepareCommunityPluginBundleDownloads(
-        downloads,
-        communityPluginSyncPolicy,
-        metrics,
-        result,
-        operationEpoch,
-        (root, downloaded, totalBytes) => {
-          if (visibleBundleRoot !== root) {
-            visibleBundleRoot = root;
-            const position = total > 0
-              ? Math.min(started + 1, total)
-              : 0;
-            this.progressStore?.setProgress(
-              position,
-              total,
-              root,
-              SyncActionType.Download,
-            );
-            callbacks.onProgress?.(position, total, root);
-          }
-          callbacks.onFileProgress?.(downloaded, totalBytes);
-        },
-      );
-
-    // Step 3b — only the read-only network stage of independent desktop small
-    // downloads may overlap. Local CAS, temp verification, intent/receipt and
-    // checkpoint publication below remain strictly serial per file.
-    //
     // P1 — universal downloadUrl refresh batching: every plan download that
     // lacks a fresh pre-signed URL (any platform, any size) is refreshed once
     // up front through Graph $batch (20 ids per request) instead of paying one
@@ -10480,9 +10979,16 @@ export class SyncExecutor {
     // This covers mobile (A1), desktop prefetch batches (whose members are now
     // already filled and therefore skipped), and — the previously uncovered
     // case — desktop large files (>8 MiB) that never enter the prefetch path.
-    // Any batch failure or malformed sub-response falls back to the existing
-    // per-file waterfall refresh — same fail-closed contract. Version
-    // verification below remains per-file and per-path (unchanged).
+    // Running before the community-plugin bundle pre-download (A2 companion
+    // reorder, 2026-09-08) lets preflight member downloads reuse the same
+    // fresh URLs instead of paying their own per-file waterfall refresh.
+    // Any batch failure or malformed sub-response leaves URLs unset: plan
+    // downloads then refresh per file inside the download waterfall, while
+    // Step-3b prefetch members are handled by the per-batch prep below —
+    // which fails its own refresh closed per member (see 2026-09-08 review
+    // F2: the prep catch marks missing members failed instead of re-falling
+    // to the per-file GET; behaviour predates 1.4.3 and is intentionally
+    // fail-closed, comment kept in sync with the implementation).
     const universalBatchMetadataClient = this.onedrive as OneDriveClient & {
       getDriveItemMetadataByIds?: (
         driveItemIds: readonly string[],
@@ -10536,6 +11042,38 @@ export class SyncExecutor {
         }
       }
     }
+
+    let visibleBundleRoot = "";
+    const preparedCommunityPluginDownloads =
+      await this.prepareCommunityPluginBundleDownloads(
+        downloads,
+        communityPluginSyncPolicy,
+        metrics,
+        result,
+        operationEpoch,
+        (root, downloaded, totalBytes) => {
+          if (visibleBundleRoot !== root) {
+            visibleBundleRoot = root;
+            const position = total > 0
+              ? Math.min(started + 1, total)
+              : 0;
+            this.progressStore?.setProgress(
+              position,
+              total,
+              root,
+              SyncActionType.Download,
+            );
+            callbacks.onProgress?.(position, total, root);
+          }
+          callbacks.onFileProgress?.(downloaded, totalBytes);
+        },
+      );
+
+    // Step 3b — only the read-only network stage of independent small
+    // downloads (≤ 8 MiB, desktop and — since A2 2026-09-08 — mobile with a
+    // lower adaptive ceiling) may overlap. Local CAS, temp verification,
+    // intent/receipt and checkpoint publication below remain strictly serial
+    // per file on every platform.
 
     let downloadIndex = 0;
     while (downloadIndex < downloads.length && this.canContinue(operationEpoch, result)) {
@@ -13807,6 +14345,16 @@ export class SyncExecutor {
       }
       const current = await this.inspectRemotePath(intent.path);
       if (!current) return null;
+      // An empty expected driveId never proves identity absence (persisted
+      // intents written by old/corrupt data can carry ""): the drift check
+      // below needs a usable remote identity to ask "is the expected object
+      // still alive elsewhere?", so without one the upload cannot be
+      // auto-settled and the classifier falls through to the conservative
+      // null branch (fail-closed, record kept for the next round) — mirroring
+      // the moveLocal four-absence adjudication (review 2026-09-02 finding ⑤).
+      if (intent.expectedRemote.exists && !intent.expectedRemote.driveId) {
+        return null;
+      }
       if (
         intent.expectedRemote.exists
         && current.driveId !== intent.expectedRemote.driveId
@@ -13815,8 +14363,14 @@ export class SyncExecutor {
         ) !== null
       ) return null;
       if (!await this.remoteMatchesTarget(current, intent.expectedLocal)) {
+        // 恢复层 upload 不自动收敛（真机验证 + 计划边界：两侧都变 → T3/fail-
+        // closed 亮出）。恢复层 T2（upload/download）已整体回退 fail-closed：
+        // 分类器只有结算权，任何 checkpoint 形状都会与 receipt/reducer 合
+        // 同冲突或覆盖本机唯一副本。T2 的方向判断属于计划层（冲突判定处，
+        // 方案 B 范畴），另行工作线启动。
         return null;
       }
+      this.convergencesThisRound++;
       checkpoint.baseUpserts.push(StateManager.toBaseEntry(local.entry, current));
       checkpoint.remoteUpserts.push(current);
       if (intent.sourcePath) {
@@ -13828,7 +14382,18 @@ export class SyncExecutor {
     if (intent.action === "download") {
       if (!intent.expectedRemote.exists || local.status !== "present" || !local.entry) return null;
       const current = await this.inspectRemotePath(intent.path);
-      if (!this.remoteMatchesExpectation(current, intent.expectedRemote)) return null;
+      if (!this.remoteMatchesExpectation(current, intent.expectedRemote)) {
+        // 恢复层 download 不自动收敛。真机验证（2026-09-07）证明恢复层 T2
+        // checkpoint 无法同时满足两道持久化合同：conservativeResetReceipt
+        // MatchesIntent 要求 base.eTag === intent.expectedRemote.eTag（旧版
+        // 标记），而 applyBaseUpsert 要求 base.eTag === remoteIndex 当前
+        // eTag（新版标记）——恢复轮观察已推进 remoteIndex，两者互斥，任何
+        // 形状都会被其中一道拒绝或产生「内容 R1 + eTag R2」的版本污染。
+        // 计划文档（DECISIONS 2026-09-07 / 20260906-183115）中 T2 的方向判
+        // 断属于计划层（冲突判定处），恢复层恢复原 fail-closed 行为：
+        // download 已应用但回执丢失 + 远程又变 → blocked/隔离（亮出）。
+        return null;
+      }
       const expectedHash = intent.expectedRemote.sha256Hash?.toLowerCase();
       if (local.entry.size !== intent.expectedRemote.size) return null;
       if (expectedHash) {
@@ -13868,7 +14433,16 @@ export class SyncExecutor {
       this.inspectRemotePath(intent.sourcePath),
       this.inspectRemotePath(intent.path),
     ]);
-    if (source || !target || target.driveId !== intent.expectedRemote.driveId) return null;
+    if (source || !target) return null;
+    if (
+      target.driveId !== intent.expectedRemote.driveId
+      && (
+        !intent.expectedRemote.driveId
+        || await this.onedrive.getDriveItemMetadataById(
+          intent.expectedRemote.driveId,
+        ) !== null
+      )
+    ) return null;
     if (!intent.expectedLocal.exists || local.status !== "present" || !local.entry) return null;
     if (!await this.remoteMatchesTarget(target, intent.expectedLocal)) return null;
     checkpoint.baseRemovals.push(intent.sourcePath);
@@ -13878,6 +14452,7 @@ export class SyncExecutor {
       size: local.entry.size,
       eTag: target.eTag,
     });
+    this.convergencesThisRound++;
     checkpoint.remoteDeletes.push(intent.sourcePath);
     checkpoint.remoteUpserts.push(target);
     return checkpoint;
@@ -15113,6 +15688,7 @@ export class SyncExecutor {
               }
               if (sameContent) {
                 remoteUpserts.push(remoteEntry);
+                this.convergencesThisRound++;
                 return {
                   executed: true,
                   baseUpsert: StateManager.toBaseEntry(item.local, remoteEntry),
@@ -16182,7 +16758,8 @@ export class SyncExecutor {
         );
       }
     } catch (error) {
-      result.deferred = 1;
+      // Whole-round stop, not a file deferral (2026-09-08 review P2-1).
+      result.deferred = 0;
       result.message = this.t("result.v2StateLoadBlocked");
       this.diag?.warn(
         "state",
@@ -19358,6 +19935,104 @@ export class SyncExecutor {
       byPlugin.set(parsed.pluginId, group);
     }
 
+    // Knife-① (2026-09-08): this guard runs before the Step-3b universal
+    // downloadUrl refresh, so every remote manifest probe below used to pay
+    // its own per-file `downloadUrlRefresh` metadata round trip inside the
+    // download waterfall. Refresh all probe targets once up front through
+    // Graph $batch (≤20 ids per request, self-chunked in the client) and hand
+    // the fresh URL to each probe download. Fail-open by contract: a missing
+    // batch capability or a failed batch leaves URLs unset and every probe
+    // falls back to the per-file waterfall exactly as before.
+    const refreshedProbeUrls = new Map<string, string>();
+    const probeBatchClient = this.onedrive as OneDriveClient & {
+      getDriveItemMetadataByIds?: (
+        driveItemIds: readonly string[],
+        metadataReason?: OneDriveMetadataReason,
+      ) => Promise<Map<string, DriveItem | null>>;
+    };
+    if (
+      typeof probeBatchClient.getDriveItemMetadataByIds === "function"
+      && byPlugin.size > 0
+    ) {
+      const probeEntries: Array<{
+        driveId: string;
+        eTag: string;
+        /** The plan item whose manifest this probe refreshes, when the
+         *  manifest itself is a plan download. Writing the fresh URL back to
+         *  it lets the later P1 universal refresh skip the same driveId
+         *  (review 2026-09-08 F1). */
+        planItem?: SyncPlanItem;
+      }> = [];
+      const seenProbeDriveIds = new Set<string>();
+      for (const [pluginId, items] of byPlugin) {
+        const root = `${configDir}/plugins/${pluginId}`;
+        const manifestPath = `${root}/manifest.json`;
+        const manifestItem = items.find((item) => item.path === manifestPath);
+        const remoteEntry = remoteByPath.get(manifestPath)
+          ?? manifestItem?.remote;
+        if (
+          remoteEntry?.driveId
+          && !seenProbeDriveIds.has(remoteEntry.driveId)
+        ) {
+          seenProbeDriveIds.add(remoteEntry.driveId);
+          probeEntries.push({
+            driveId: remoteEntry.driveId,
+            eTag: remoteEntry.eTag,
+            planItem: manifestItem?.remote ? manifestItem : undefined,
+          });
+        }
+      }
+      if (probeEntries.length > 0) {
+        const probeStartedAt = Date.now();
+        try {
+          const refreshed = await probeBatchClient.getDriveItemMetadataByIds(
+            probeEntries.map((entry) => entry.driveId),
+            "downloadUrlRefresh",
+          );
+          let filled = 0;
+          for (const entry of probeEntries) {
+            const current = refreshed.get(entry.driveId);
+            if (
+              current
+              && current.id === entry.driveId
+              && current.eTag === entry.eTag
+            ) {
+              const downloadUrl = current["@microsoft.graph.downloadUrl"];
+              if (downloadUrl) {
+                refreshedProbeUrls.set(entry.driveId, downloadUrl);
+                // Write the fresh URL back onto the plan item so the later
+                // universal refresh (P1) skips this driveId (review F1).
+                if (entry.planItem?.remote) {
+                  entry.planItem.remote.downloadUrl = downloadUrl;
+                }
+                filled++;
+              }
+            }
+          }
+          this.diag?.log(
+            "execute",
+            "community plugin downgrade-probe downloadUrl refresh",
+            {
+              schemaVersion: 1,
+              plugins: byPlugin.size,
+              probes: probeEntries.length,
+              filled,
+              batchRequests: Math.ceil(probeEntries.length / 20),
+              elapsedMs: Math.max(0, Date.now() - probeStartedAt),
+            },
+          );
+        } catch (error) {
+          // Fail-open: leave URLs unset; per-file waterfall stays (today's
+          // behavior before batching).
+          this.diag?.warn(
+            "execute",
+            `community plugin downgrade-probe downloadUrl refresh failed, falling back to per-file waterfall`,
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+    }
+
     let removed = 0;
     for (const [pluginId, items] of byPlugin) {
       const root = `${configDir}/plugins/${pluginId}`;
@@ -19383,13 +20058,16 @@ export class SyncExecutor {
       }
       if (localVersion === null) continue;
 
-      // Remote version — manifest.json is small; download inline.
+      // Remote version — manifest.json is small; download inline. The probe
+      // URL, when the batched refresh above succeeded for this drive id, is
+      // reused so the download skips its own per-file metadata round trip.
       let remoteVersion: string | null = null;
       try {
+        const probeUrl = refreshedProbeUrls.get(remoteEntry.driveId);
         const remoteBytes = await this.onedrive.downloadFile(
           this.vaultName,
           manifestPath,
-          remoteEntry.downloadUrl,
+          probeUrl ?? remoteEntry.downloadUrl,
           remoteEntry.driveId,
           remoteEntry.size,
         );
@@ -19464,11 +20142,16 @@ export class SyncExecutor {
    * explicitly confirm the upload. Mirror of guardCommunityPluginBundleDowngrades.
    *
    * Returns the number of plan items removed (and deferred to review).
+   * When `deferredOut` is provided, every plugin bundle deferred this round
+   * is appended to it so the caller can raise a one-shot user notice without
+   * repeating on every identical round (see SyncResult
+   * communityPluginUploadDowngradesDeferred).
    */
   private async guardCommunityPluginBundleUploadDowngrades(
     smallUploads: SyncPlanItem[],
     largeUploads: SyncPlanItem[],
     policy: Readonly<CommunityPluginSyncPolicyV1>,
+    deferredOut?: string[],
   ): Promise<number> {
     if (policy.files.mode === "none") return 0;
     const configDir = getConfigDir(this.scanner.vault);
@@ -19577,6 +20260,7 @@ export class SyncExecutor {
         "community plugin upload downgrade deferred to user review",
         { schemaVersion: 1, pluginId, files: items.length, localVersion, remoteVersion },
       );
+      deferredOut?.push(pluginId);
     }
     return removed;
   }
@@ -20763,6 +21447,11 @@ const PLANNER_DERIVED_PENDING_ISSUE_CODES: ReadonlySet<
   "identity-replacement-ambiguous",
   "unanchored-shared-folder",
   "folder-location-choice",
+  "local-rename-evidence-conflict",
+  "local-subtree-changed",
+  "remote-subtree-changed",
+  "target-occupied",
+  "parent-chain-incomplete",
 ]);
 
 function isPendingIssueAction(type: SyncActionType): boolean {

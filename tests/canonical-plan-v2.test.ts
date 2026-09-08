@@ -1682,4 +1682,431 @@ describe("canonical V2 plan candidate", () => {
     expect(source).toContain("finalizeCanonicalPlanCandidateV2({");
     expect(source).toContain("sealCanonicalPlanV2({");
   });
+
+  describe("knife-1 verification downloadUrl refresh (2026-09-08)", () => {
+    function hashlessConflictState(count: number): SyncStateEnvelopeV2 {
+      const files = Array.from({ length: count }, (_, index) => ({
+        id: `conflict-${index}`,
+        name: `conflict-${index}.md`,
+      }));
+      const state = envelope({
+        files,
+        folderAnchors: [],
+        fileAnchors: files.map((file) =>
+          fileAnchor(file.id, file.name)),
+      });
+      for (const file of files) {
+        delete state.remoteIndex.itemsById[file.id]!.contentHash;
+        state.remoteIndex.itemsById[file.id]!.eTag = `etag-new-${file.id}`;
+      }
+      return state;
+    }
+
+    it("batches a single refresh call over exactly the budgeted verification download set before any download", async () => {
+      const state = hashlessConflictState(3);
+      const candidate = build({
+        state,
+        localFiles: [
+          localFile("conflict-0.md", hashB),
+          localFile("conflict-1.md", hashB),
+          localFile("conflict-2.md", hashB),
+        ],
+      });
+      const refreshedPaths: string[] = [];
+      const resolverSeenUrls: Array<string | undefined> = [];
+      const finalized = await finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles: false,
+          mergeNonOverlappingText: true,
+        },
+        baselineReconstructionIncomplete: false,
+        refreshVerificationDownloadUrls: async (items) => {
+          for (const item of items) {
+            refreshedPaths.push(item.path);
+            if (item.remote) {
+              item.remote.downloadUrl = `https://dl.example/${item.remote.driveId}`;
+            }
+          }
+        },
+        resolveRemoteContentHash: async (item) => {
+          resolverSeenUrls.push(item.remote?.downloadUrl);
+          return "c".repeat(64);
+        },
+      configDir: ".obsidian",
+      });
+
+      expect(refreshedPaths).toEqual([
+        "conflict-0.md",
+        "conflict-1.md",
+        "conflict-2.md",
+      ]);
+      // Every verification download must reuse the planner-stage refresh URL
+      // instead of paying a per-file metadata round trip.
+      expect(resolverSeenUrls).toEqual([
+        "https://dl.example/conflict-0",
+        "https://dl.example/conflict-1",
+        "https://dl.example/conflict-2",
+      ]);
+      expect(finalized.contentVerification).toMatchObject({
+        candidates: 3,
+        cachedEvidence: 0,
+        downloads: 3,
+        skippedDownloads: 0,
+      });
+    });
+
+    it("stays fail-open when the refresh hook throws or fills nothing", async () => {
+      const state = hashlessConflictState(2);
+      const candidate = build({
+        state,
+        localFiles: [
+          localFile("conflict-0.md", hashB),
+          localFile("conflict-1.md", hashB),
+        ],
+      });
+      let downloads = 0;
+      const failed = await finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles: false,
+          mergeNonOverlappingText: true,
+        },
+        baselineReconstructionIncomplete: false,
+        refreshVerificationDownloadUrls: async () => {
+          throw new Error("batch refresh offline");
+        },
+        resolveRemoteContentHash: async () => {
+          downloads++;
+          return "c".repeat(64);
+        },
+      configDir: ".obsidian",
+      });
+      expect(downloads).toBe(2);
+      expect(failed.contentVerification.results.every(
+        (item) => item.outcome === "different",
+      )).toBe(true);
+    });
+
+    it("respects the shared download budget: only budgeted candidates are refreshed", async () => {
+      const state = hashlessConflictState(4);
+      const candidate = build({
+        state,
+        localFiles: Array.from({ length: 4 }, (_, index) =>
+          localFile(`conflict-${index}.md`, hashB)),
+      });
+      let budgetSeen = 0;
+      await finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles: false,
+          mergeNonOverlappingText: true,
+        },
+        baselineReconstructionIncomplete: false,
+        refreshVerificationDownloadUrls: async (items) => {
+          budgetSeen += items.length;
+        },
+        resolveRemoteContentHash: async () => "c".repeat(64),
+      configDir: ".obsidian",
+      });
+      // Four candidates minus zero cached evidence fit inside the ordinary
+      // round budget of 10, so the refresh must see all four exactly once.
+      expect(budgetSeen).toBe(4);
+    });
+  });
+
+  describe("knife-2 verification download window (2026-09-08)", () => {
+    function hashlessConflictState(count: number): SyncStateEnvelopeV2 {
+      const files = Array.from({ length: count }, (_, index) => ({
+        id: `conflict-${index}`,
+        name: `conflict-${index}.md`,
+      }));
+      const state = envelope({
+        files,
+        folderAnchors: [],
+        fileAnchors: files.map((file) =>
+          fileAnchor(file.id, file.name)),
+      });
+      for (const file of files) {
+        delete state.remoteIndex.itemsById[file.id]!.contentHash;
+        state.remoteIndex.itemsById[file.id]!.eTag = `etag-new-${file.id}`;
+      }
+      return state;
+    }
+
+    function buildState(count: number) {
+      const state = hashlessConflictState(count);
+      const candidate = build({
+        state,
+        localFiles: Array.from({ length: count }, (_, index) =>
+          localFile(`conflict-${index}.md`, hashB)),
+      });
+      return { state, candidate };
+    }
+
+    it("overlaps verification content downloads inside a bounded window without changing any outcome", async () => {
+      const { state, candidate } = buildState(3);
+      let inFlight = 0;
+      let peakInFlight = 0;
+      const resolver = async (_item: SyncPlanItem, _progress: {
+        current: number;
+        total: number;
+      }): Promise<string> => {
+        inFlight++;
+        peakInFlight = Math.max(peakInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        inFlight--;
+        return "c".repeat(64);
+      };
+      const serial = await finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles: false,
+          mergeNonOverlappingText: true,
+        },
+        baselineReconstructionIncomplete: false,
+        resolveRemoteContentHash: resolver,
+      configDir: ".obsidian",
+      });
+      expect(peakInFlight).toBe(1);
+
+      peakInFlight = 0;
+      const windowed = await finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles: false,
+          mergeNonOverlappingText: true,
+        },
+        baselineReconstructionIncomplete: false,
+        verificationDownloadWindow: {
+          maxFiles: 2,
+          maxBytes: 1024 * 1024 * 64,
+        },
+        resolveRemoteContentHash: resolver,
+      configDir: ".obsidian",
+      });
+      expect(peakInFlight).toBe(2);
+
+      // Windows must not change any observable outcome: identical items,
+      // base upserts, receipts, and verification results in the same order.
+      expect(windowed.items).toEqual(serial.items);
+      expect(windowed.baseUpserts).toEqual(serial.baseUpserts);
+      expect(windowed.contentVerification).toEqual(
+        serial.contentVerification,
+      );
+    });
+
+    it("keeps per-item failure isolation inside a window", async () => {
+      const { state, candidate } = buildState(3);
+      const resolver = async (item: SyncPlanItem): Promise<string> => {
+        if (item.path === "conflict-1.md") {
+          throw new Error("offline for one candidate");
+        }
+        return "c".repeat(64);
+      };
+      const serial = await finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles: false,
+          mergeNonOverlappingText: true,
+        },
+        baselineReconstructionIncomplete: false,
+        resolveRemoteContentHash: resolver,
+      configDir: ".obsidian",
+      });
+      const windowed = await finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles: false,
+          mergeNonOverlappingText: true,
+        },
+        baselineReconstructionIncomplete: false,
+        verificationDownloadWindow: {
+          maxFiles: 2,
+          maxBytes: 1024 * 1024 * 64,
+        },
+        resolveRemoteContentHash: resolver,
+      configDir: ".obsidian",
+      });
+      expect(windowed.items).toEqual(serial.items);
+      expect(windowed.contentVerification.results).toEqual(
+        serial.contentVerification.results,
+      );
+      expect(windowed.contentVerification.results).toContainEqual(
+        expect.objectContaining({
+          path: "conflict-1.md",
+          outcome: "failed",
+        }),
+      );
+    });
+
+    it("keeps the shared download budget under a window", async () => {
+      const { state, candidate } = buildState(11);
+      let downloads = 0;
+      const finalize = (windowed: boolean) =>
+        finalizeCanonicalPlanCandidateV2({
+          candidate,
+          envelope: state,
+          vaultName: "Vault",
+          accountId: scope.accountId,
+          automaticHandlingPolicy: {
+            autoDeleteLocalFiles: false,
+            mergeNonOverlappingText: true,
+          },
+          baselineReconstructionIncomplete: false,
+          verificationDownloadWindow: windowed
+            ? { maxFiles: 4, maxBytes: 1024 * 1024 * 64 }
+            : undefined,
+          resolveRemoteContentHash: async () => {
+            downloads++;
+            return "c".repeat(64);
+          },
+        configDir: ".obsidian",
+        });
+      const serial = await finalize(false);
+      expect(downloads).toBe(10);
+      downloads = 0;
+      const windowed = await finalize(true);
+      expect(downloads).toBe(10);
+      expect(windowed.items).toEqual(serial.items);
+      expect(windowed.baseUpserts).toEqual(serial.baseUpserts);
+      expect(windowed.contentVerification).toEqual(serial.contentVerification);
+    });
+
+    it("adversarial: the byte budget alone degrades oversized windows to serial", async () => {
+      const { state, candidate } = buildState(3);
+      let inFlight = 0;
+      let peakInFlight = 0;
+      const resolver = async () => {
+        inFlight++;
+        peakInFlight = Math.max(peakInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        inFlight--;
+        return "c".repeat(64);
+      };
+      const windowed = await finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles: false,
+          mergeNonOverlappingText: true,
+        },
+        baselineReconstructionIncomplete: false,
+        // maxFiles allows batching, but every non-first member overflows the
+        // tiny byte budget: the window must degrade per-file (peak 1) and
+        // still produce the exact serial outcome.
+        verificationDownloadWindow: {
+          maxFiles: 100,
+          maxBytes: 1,
+        },
+        resolveRemoteContentHash: resolver,
+        configDir: ".obsidian",
+      });
+      expect(peakInFlight).toBe(1);
+      expect(windowed.contentVerification.results).toHaveLength(3);
+    });
+
+    it("adversarial: prefetch progress stays monotonic across window flushes", async () => {
+      const { state, candidate } = buildState(5);
+      const seen: number[] = [];
+      const resolver = async (
+        _item: SyncPlanItem,
+        progress: { current: number; total: number },
+      ): Promise<string> => {
+        seen.push(progress.current);
+        expect(progress.current).toBeLessThanOrEqual(progress.total);
+        expect(progress.total).toBeGreaterThanOrEqual(1);
+        return "c".repeat(64);
+      };
+      const windowed = await finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles: false,
+          mergeNonOverlappingText: true,
+        },
+        baselineReconstructionIncomplete: false,
+        verificationDownloadWindow: {
+          maxFiles: 2,
+          maxBytes: 1024 * 1024 * 64,
+        },
+        resolveRemoteContentHash: resolver,
+        configDir: ".obsidian",
+      });
+      // Progress must never reset at a flush boundary (a stale per-window
+      // counter would emit e.g. 1,2,1,2 — red side of this adversarial test).
+      let previous = 0;
+      for (const current of seen) {
+        expect(current).toBeGreaterThan(previous);
+        previous = current;
+      }
+      expect(seen.length).toBeGreaterThan(1);
+      expect(windowed.contentVerification.results).toHaveLength(seen.length);
+    });
+
+    it("adversarial: an offline refresh hook stays fail-open under a download window", async () => {
+      const { state, candidate } = buildState(3);
+      let inFlight = 0;
+      let peakInFlight = 0;
+      const windowed = await finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles: false,
+          mergeNonOverlappingText: true,
+        },
+        baselineReconstructionIncomplete: false,
+        refreshVerificationDownloadUrls: async () => {
+          throw new Error("batch refresh offline");
+        },
+        verificationDownloadWindow: {
+          maxFiles: 2,
+          maxBytes: 1024 * 1024 * 64,
+        },
+        resolveRemoteContentHash: async () => {
+          inFlight++;
+          peakInFlight = Math.max(peakInFlight, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          inFlight--;
+          return "c".repeat(64);
+        },
+        configDir: ".obsidian",
+      });
+      // Hook fail-open and window overlap are independent contracts: the
+      // offline hook must not disable the window (still peak 2), and the
+      // verification outcome must stay complete with no failed rows.
+      expect(peakInFlight).toBe(2);
+      expect(windowed.contentVerification.results).toHaveLength(3);
+      expect(windowed.contentVerification.results.every(
+        (item) => item.outcome !== "failed",
+      )).toBe(true);
+    });
+  });
 });

@@ -563,7 +563,12 @@ export interface PendingIssue {
     | "anchored-folder-missing-remote"
     | "identity-replacement-ambiguous"
     | "unanchored-shared-folder"
-    | "folder-location-choice";
+    | "folder-location-choice"
+    | "local-rename-evidence-conflict"
+    | "local-subtree-changed"
+    | "remote-subtree-changed"
+    | "target-occupied"
+    | "parent-chain-incomplete";
   reason?: string;
   updatedAt: number;
   fileSize?: number;

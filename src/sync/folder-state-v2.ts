@@ -374,7 +374,12 @@ export function planFolderStateFromViewV2(
         ));
         continue;
       }
-      if (unclaimedLocalFolders.length > 0) {
+      // Unclaimed local folders are only potential rename candidates when the
+      // remote folder still exists at the anchor's last-known path.  When the
+      // folder has moved on remote (path differs), unclaimed locals are
+      // unrelated and must not block anchor retirement.
+      const remotePathMatchesAnchor = nfcPath(remotePath) === nfcPath(anchor.lastPath);
+      if (unclaimedLocalFolders.length > 0 && remotePathMatchesAnchor) {
         unresolvedLocalIdentity = true;
         candidates.push(conflictCandidate(
           anchor.lastPath,

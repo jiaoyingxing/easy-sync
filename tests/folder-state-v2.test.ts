@@ -1100,6 +1100,38 @@ describe("V2 folder anchors and pure planner", () => {
     })]);
   });
 
+  it("retires an anchored folder deleted on both sides without producing FolderDeferred", () => {
+    // Regression guard (B-group): when the anchored folder is gone both locally
+    // and remotely, folder-state must retire the anchor (delete-local) instead
+    // of producing a conflict/FolderDeferred row that would linger forever.
+    const bothDeleted = planFolderStateV2({
+      envelope: envelope({
+        folders: [], // remote folder "Notes" deleted
+        folderAnchors: [folderAnchor("notes", "Notes")],
+      }),
+      localFiles: [],
+      localFolders: [], // local folder "Notes" deleted too
+      localFolderScanComplete: true,
+    });
+    expect(bothDeleted.status).toBe("planned");
+    expect(bothDeleted.items.some((item) => item.type === "conflict")).toBe(false);
+    expect(bothDeleted.items.map((item) => item.type)).toContain("delete-local");
+
+    // But when an unclaimed local folder still creates rename ambiguity, the
+    // conflict (anchored-folder-missing-local) must be preserved for review.
+    const ambiguous = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Notes" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+      }),
+      localFiles: [],
+      localFolders: [{ path: "NotesRenamed" }],
+      localFolderScanComplete: true,
+    });
+    expect(ambiguous.items.some((item) =>
+      item.type === "conflict" && item.reason === "anchored-folder-missing-local")).toBe(true);
+  });
+
   it("keeps an excluded folder fail-closed unless the caller marks it preserved", () => {
     const report = planFolderStateV2({
       envelope: envelope({

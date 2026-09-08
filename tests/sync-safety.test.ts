@@ -4314,6 +4314,528 @@ describe("Persistent remote delta state", () => {
     expect(reviewed?.bundlePresentation?.remoteVersion).toBe("1.0.1");
   });
 
+  it("reuses snapshot-downloaded bytes for the sub-diff without a second download (P3)", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const paths = [
+      `${root}/main.js`,
+      `${root}/manifest.json`,
+      `${root}/styles.css`,
+    ];
+    const manifest = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "1.0.1",
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: paths[0],
+      expectedLocalAtIntent: true,
+      pendingConflictPaths: [paths[0]],
+      local: {
+        [paths[0]]: "new local code",
+        [paths[1]]: manifest,
+        [paths[2]]: "new local styles",
+      },
+      remote: {
+        [paths[0]]: "old remote code",
+        [paths[1]]: manifest,
+        [paths[2]]: "old remote styles",
+      },
+    });
+    // main.js remote has no SHA-256 hash: the snapshot build downloads it once
+    // to establish equality evidence; those bytes must then be reused by the
+    // sub-diff (查看差异) instead of a second download.
+    const main = harness.remoteFiles.get(paths[0])!;
+    harness.remoteFiles.set(paths[0], {
+      ...main,
+      entry: { ...main.entry, sha256Hash: undefined },
+    });
+
+    const reviewed = await harness.executor
+      .getCommunityPluginBundleReviewSnapshot("resojot");
+    expect(reviewed?.bundleReview?.pluginId).toBe("resojot");
+    const downloadsAfterReview = harness.downloadFile.mock.calls.length;
+    expect(downloadsAfterReview).toBeGreaterThanOrEqual(1);
+
+    const diff = await harness.executor
+      .getCommunityPluginBundleFileDiff("resojot", paths[0]);
+    expect(diff).not.toBeNull();
+    expect(diff?.remoteText).toBe("old remote code");
+    // Zero additional remote transfers: the snapshot bytes cache served the
+    // sub-diff.
+    expect(harness.downloadFile.mock.calls.length).toBe(downloadsAfterReview);
+  });
+
+  it("reopening the review returns the cached snapshot without new downloads (P5)", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const paths = [
+      `${root}/main.js`,
+      `${root}/manifest.json`,
+      `${root}/styles.css`,
+    ];
+    const manifest = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "1.0.1",
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: paths[0],
+      expectedLocalAtIntent: true,
+      pendingConflictPaths: [paths[0]],
+      local: {
+        [paths[0]]: "new local code",
+        [paths[1]]: manifest,
+        [paths[2]]: "new local styles",
+      },
+      remote: {
+        [paths[0]]: "old remote code",
+        [paths[1]]: manifest,
+        [paths[2]]: "old remote styles",
+      },
+    });
+
+    const first = await harness.executor
+      .getCommunityPluginBundleReviewSnapshot("resojot");
+    expect(first).not.toBeNull();
+    const downloadsAfterFirst = harness.downloadFile.mock.calls.length;
+
+    // Reopen: cached snapshot returned (same digest), no new downloads even
+    // after the single-flight background refresh settles (every member here
+    // carries a remote SHA-256, so the background rebuild needs no content
+    // transfer either).
+    const second = await harness.executor
+      .getCommunityPluginBundleReviewSnapshot("resojot");
+    expect(second).not.toBeNull();
+    expect(second?.factsDigest).toBe(first?.factsDigest);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(harness.downloadFile.mock.calls.length).toBe(downloadsAfterFirst);
+  });
+
+  it("regression: reopening takes the P5 cache-hit path (one build, one background refresh) — 2026-09-08", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const paths = [
+      `${root}/main.js`,
+      `${root}/manifest.json`,
+      `${root}/styles.css`,
+    ];
+    const manifest = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "1.0.1",
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: paths[0],
+      expectedLocalAtIntent: true,
+      pendingConflictPaths: [paths[0]],
+      local: {
+        [paths[0]]: "new local code",
+        [paths[1]]: manifest,
+        [paths[2]]: "new local styles",
+      },
+      remote: {
+        [paths[0]]: "old remote code",
+        [paths[1]]: manifest,
+        [paths[2]]: "old remote styles",
+      },
+    });
+    // The factsIdentity wrapper is freshly allocated per call, so the old
+    // whole-tuple equality never hit: every reopen rebuilt the snapshot (and
+    // re-downloaded hashless members) instead of returning the cache. With the
+    // fix (compare the underlying ledger/pending array references) the reopen
+    // must take the hit path: exactly one snapshot build and exactly one
+    // scheduled background refresh, with zero extra synchronous work.
+    const executorProxy = harness.executor as unknown as {
+      refreshBundleReviewSnapshotInBackground: (pluginId: string) => void;
+      buildAndCacheBundleReviewSnapshot: (pluginId: string) => Promise<unknown>;
+    };
+    const refreshSpy = vi.spyOn(
+      executorProxy,
+      "refreshBundleReviewSnapshotInBackground",
+    );
+    const buildSpy = vi.spyOn(executorProxy, "buildAndCacheBundleReviewSnapshot");
+    try {
+      const first = await harness.executor
+        .getCommunityPluginBundleReviewSnapshot("resojot");
+      expect(first).not.toBeNull();
+      expect(buildSpy).toHaveBeenCalledTimes(1);
+
+      const second = await harness.executor
+        .getCommunityPluginBundleReviewSnapshot("resojot");
+      expect(second).not.toBeNull();
+      expect(second?.factsDigest).toBe(first?.factsDigest);
+      // Hit path schedules exactly one background refresh. Under the old
+      // whole-tuple equality the reopen missed and rebuilt inline instead:
+      // refresh would never be scheduled (0 calls) and the rebuild would not
+      // be attributable to a refresh.
+      expect(refreshSpy).toHaveBeenCalledTimes(1);
+      expect(buildSpy).toHaveBeenCalledTimes(2); // 1 inline + 1 background refresh
+      // The refresh is fire-and-forget: the reopened snapshot came from the
+      // cache, not from the second build.
+      expect(second).toBe(first);
+    } finally {
+      refreshSpy.mockRestore();
+      buildSpy.mockRestore();
+    }
+  });
+
+  // ---- Adversarial cache tests (review of the P2/P3/P5 秒级 work, 2026-09-07) ----
+  // Each test attacks one correctness property of the session caches: stale
+  // remote identity, shared single-flight across plugins, LRU bounds, and the
+  // display-only (never facts-authorizing) boundary of the bytes cache.
+
+  it("adversarial: rejects a cached sub-diff whose remote was rewritten (driveId/eTag) and re-downloads", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const paths = [
+      `${root}/main.js`,
+      `${root}/manifest.json`,
+      `${root}/styles.css`,
+    ];
+    const manifest = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "1.0.1",
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: paths[0],
+      expectedLocalAtIntent: true,
+      pendingConflictPaths: [paths[0]],
+      local: {
+        [paths[0]]: "new local code",
+        [paths[1]]: manifest,
+        [paths[2]]: "new local styles",
+      },
+      remote: {
+        [paths[0]]: "old remote code",
+        [paths[1]]: manifest,
+        [paths[2]]: "old remote styles",
+      },
+    });
+    // Hashless remote main.js: the snapshot build downloads it once and stages
+    // the bytes under the current driveId/eTag identity.
+    const main = harness.remoteFiles.get(paths[0])!;
+    harness.remoteFiles.set(paths[0], {
+      ...main,
+      entry: { ...main.entry, sha256Hash: undefined },
+    });
+    const reviewed = await harness.executor
+      .getCommunityPluginBundleReviewSnapshot("resojot");
+    expect(reviewed?.bundleReview?.pluginId).toBe("resojot");
+    expect(harness.downloadFile).toHaveBeenCalledTimes(1);
+
+    // The remote is rewritten in place (same path, new identity + content).
+    harness.remoteFiles.set(paths[0], {
+      entry: {
+        ...main.entry,
+        driveId: "remote-rewritten",
+        eTag: "etag-rewritten",
+        sha256Hash: undefined,
+        size: "newer remote code".length,
+      },
+      bytes: new TextEncoder().encode("newer remote code").buffer,
+    });
+
+    const diff = await harness.executor
+      .getCommunityPluginBundleFileDiff("resojot", paths[0]);
+    expect(diff).not.toBeNull();
+    // The stale cached bytes must NOT be served: the diff re-downloads the
+    // rewritten remote and shows its new content.
+    expect(diff?.remoteText).toBe("newer remote code");
+    expect(harness.downloadFile.mock.calls.length).toBe(2);
+  });
+
+  it("adversarial: a remote deleted after review makes the sub-diff report unavailability instead of stale content", async () => {
+    const root = ".obsidian/plugins/resojot";
+    const paths = [
+      `${root}/main.js`,
+      `${root}/manifest.json`,
+      `${root}/styles.css`,
+    ];
+    const manifest = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "1.0.1",
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: paths[0],
+      expectedLocalAtIntent: true,
+      pendingConflictPaths: [paths[0]],
+      local: {
+        [paths[0]]: "new local code",
+        [paths[1]]: manifest,
+        [paths[2]]: "new local styles",
+      },
+      remote: {
+        [paths[0]]: "old remote code",
+        [paths[1]]: manifest,
+        [paths[2]]: "old remote styles",
+      },
+    });
+    const main = harness.remoteFiles.get(paths[0])!;
+    harness.remoteFiles.set(paths[0], {
+      ...main,
+      entry: { ...main.entry, sha256Hash: undefined },
+    });
+    const reviewed = await harness.executor
+      .getCommunityPluginBundleReviewSnapshot("resojot");
+    expect(reviewed?.bundleReview?.pluginId).toBe("resojot");
+
+    // Remote member disappears entirely after the review.
+    harness.remoteFiles.delete(paths[0]);
+
+    const diff = await harness.executor
+      .getCommunityPluginBundleFileDiff("resojot", paths[0]);
+    // Null → unavailable, never a stale display of reviewed content.
+    expect(diff).toBeNull();
+  });
+
+  it("adversarial: build in flight for one plugin does not serve another plugin's snapshot (single-flight is per-plugin)", async () => {
+    const rootA = ".obsidian/plugins/resojot";
+    const rootB = ".obsidian/plugins/otherplugin";
+    const manifestA = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "1.0.1",
+      minAppVersion: "1.0.0",
+    });
+    const manifestB = JSON.stringify({
+      id: "otherplugin",
+      name: "Other",
+      version: "2.0.0",
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: `${rootA}/main.js`,
+      expectedLocalAtIntent: true,
+      withLedger: false,
+      pendingConflictPaths: [`${rootA}/main.js`, `${rootB}/main.js`],
+      local: {
+        [`${rootA}/main.js`]: "local A",
+        [`${rootA}/manifest.json`]: manifestA,
+        [`${rootA}/styles.css`]: "local styles A",
+        [`${rootB}/main.js`]: "local B",
+        [`${rootB}/manifest.json`]: manifestB,
+        [`${rootB}/styles.css`]: "local styles B",
+      },
+      remote: {
+        [`${rootA}/main.js`]: "remote A",
+        [`${rootA}/manifest.json`]: manifestA,
+        [`${rootA}/styles.css`]: "remote styles A",
+        [`${rootB}/main.js`]: "remote B",
+        [`${rootB}/manifest.json`]: manifestB,
+        [`${rootB}/styles.css`]: "remote styles B",
+      },
+    });
+
+    // Start plugin A's build (a real remote round trip) and, while it is in
+    // flight, open plugin B. B must build its own snapshot — it must never be
+    // served A's in-flight result through the shared single-flight slot.
+    const firstA = harness.executor
+      .getCommunityPluginBundleReviewSnapshot("resojot");
+    const firstB = harness.executor
+      .getCommunityPluginBundleReviewSnapshot("otherplugin");
+
+    const [aSnapshot, bSnapshot] = await Promise.all([firstA, firstB]);
+    expect(aSnapshot?.bundleReview?.pluginId).toBe("resojot");
+    expect(bSnapshot?.bundleReview?.pluginId).toBe("otherplugin");
+
+    // Both plugins were actually opened: their own conflict records are
+    // present in the returned snapshot (a cross-plugin cache mix would leak
+    // A's bundle into B's cache entry).
+    const bLocal = bSnapshot?.local.find(
+      (fact) => fact.path === `${rootB}/main.js`,
+    );
+    expect(bLocal?.exists).toBe(true);
+
+    // Reopen both from the per-plugin caches: identities stay correct.
+    const aAgain = await harness.executor
+      .getCommunityPluginBundleReviewSnapshot("resojot");
+    const bAgain = await harness.executor
+      .getCommunityPluginBundleReviewSnapshot("otherplugin");
+    expect(aAgain?.bundleReview?.pluginId).toBe("resojot");
+    expect(bAgain?.bundleReview?.pluginId).toBe("otherplugin");
+    expect(aAgain?.factsDigest).toBe(aSnapshot?.factsDigest);
+    expect(bAgain?.factsDigest).toBe(bSnapshot?.factsDigest);
+  });
+
+  it("adversarial: bytes cache LRU evicts the least-recently-used plugin and still serves the most-recent", async () => {
+    // White-box: the P3 bytes cache is private, but its eviction contract is
+    // the whole point of the 16 MiB LRU — oversized single members must be
+    // refused and, once the global cap is crossed, whole plugin sets are
+    // evicted in LRU order (least recently used first). The LRU bump on read
+    // must keep the most-recently-used plugin alive.
+    const harness = await makeManualResolutionHarness({
+      path: ".obsidian/plugins/resojot/main.js",
+      withLedger: false,
+      local: { ".obsidian/plugins/resojot/main.js": "x" },
+    });
+    const executor = harness.executor as unknown as {
+      bundleReviewBytesCacheSet(
+        pluginId: string,
+        path: string,
+        hash: string,
+        bytes: ArrayBuffer,
+        mtime: number,
+        identity?: { driveId: string; eTag: string },
+      ): void;
+      bundleReviewBytesCacheGet(
+        pluginId: string,
+        path: string,
+        expectedHash?: string,
+        expectedIdentity?: { driveId?: string; eTag?: string },
+      ): { bytes: ArrayBuffer; mtime: number; hash: string } | null;
+      bundleReviewBytesByPlugin: Map<string, Map<string, unknown>>;
+      bundleReviewBytesTotal: number;
+    };
+    const KiB = 1024;
+    const MiB = KiB * 1024;
+    const member = (pluginId: string, index: number, sizeMiB: number) => ({
+      pluginId,
+      path: `.obsidian/plugins/${pluginId}/member${index}.js`,
+      hash: `${pluginId}-${index}-${"a".repeat(60)}`,
+      bytes: new ArrayBuffer(sizeMiB * MiB),
+    });
+    // Plugin A: 3 members × 2 MiB = 6 MiB; Plugin B: 3 × 2 MiB = 6 MiB.
+    const aMembers = [0, 1, 2].map((i) => member("alpha", i, 2));
+    const bMembers = [0, 1, 2].map((i) => member("bravo", i, 2));
+    for (const m of [...aMembers, ...bMembers]) {
+      executor.bundleReviewBytesCacheSet(m.pluginId, m.path, m.hash, m.bytes, 1);
+    }
+    expect(executor.bundleReviewBytesTotal).toBe(12 * MiB);
+    expect(executor.bundleReviewBytesByPlugin.size).toBe(2);
+
+    // LRU bump alpha by reading one of its members.
+    expect(executor.bundleReviewBytesCacheGet(
+      "alpha",
+      aMembers[0].path,
+      aMembers[0].hash,
+    )).not.toBeNull();
+
+    // Plugin C pushes the global total past 16 MiB → the LRU plugin set
+    // (bravo, untouched since insertion) must be evicted wholesale; alpha
+    // (bumped) survives.
+    const cMembers = [0, 1, 2].map((i) => member("charlie", i, 2));
+    for (const m of cMembers) {
+      executor.bundleReviewBytesCacheSet(m.pluginId, m.path, m.hash, m.bytes, 1);
+    }
+    expect(executor.bundleReviewBytesTotal).toBe(12 * MiB);
+    expect(executor.bundleReviewBytesByPlugin.has("bravo")).toBe(false);
+    expect(executor.bundleReviewBytesByPlugin.has("alpha")).toBe(true);
+    expect(executor.bundleReviewBytesByPlugin.has("charlie")).toBe(true);
+    expect(executor.bundleReviewBytesCacheGet(
+      "alpha",
+      aMembers[0].path,
+      aMembers[0].hash,
+    )).not.toBeNull();
+    expect(executor.bundleReviewBytesCacheGet(
+      "bravo",
+      bMembers[0].path,
+      bMembers[0].hash,
+    )).toBeNull();
+
+    // A single oversized member (over the 3 MiB per-member bound) is never
+    // cached at all.
+    const huge = member("delta", 0, 4);
+    executor.bundleReviewBytesCacheSet(huge.pluginId, huge.path, huge.hash, huge.bytes, 1);
+    expect(executor.bundleReviewBytesByPlugin.has("delta")).toBe(false);
+    expect(executor.bundleReviewBytesTotal).toBe(12 * MiB);
+
+    // Re-adding an existing path replaces its bytes (and re-counts the total)
+    // instead of double counting.
+    const replacement = member("alpha", 0, 1);
+    executor.bundleReviewBytesCacheSet(
+      replacement.pluginId,
+      replacement.path,
+      replacement.hash,
+      replacement.bytes,
+      1,
+    );
+    expect(executor.bundleReviewBytesTotal).toBe(11 * MiB);
+  });
+
+  it("adversarial: a P5 cached snapshot can never authorize a write once the remote changed (SC-07/15)", async () => {
+    // The user opens a review (built + cached), the remote is then rewritten
+    // by another device, and the user re-opens the review: the P5 cache
+    // serves the last-open snapshot for display. Choosing keep-local from
+    // that stale snapshot must NOT authorize an upload — the resolve chain
+    // re-builds current facts and rejects on digest mismatch with zero writes.
+    const root = ".obsidian/plugins/resojot";
+    const paths = [
+      `${root}/main.js`,
+      `${root}/manifest.json`,
+      `${root}/styles.css`,
+    ];
+    const manifest = JSON.stringify({
+      id: "resojot",
+      name: "Resojot",
+      version: "1.0.1",
+      minAppVersion: "1.0.0",
+    });
+    const harness = await makeManualResolutionHarness({
+      path: paths[0],
+      expectedLocalAtIntent: true,
+      pendingConflictPaths: paths,
+      local: {
+        [paths[0]]: "new local code",
+        [paths[1]]: manifest,
+        [paths[2]]: "new local styles",
+      },
+      remote: {
+        [paths[0]]: "old remote code",
+        [paths[1]]: JSON.stringify({
+          id: "resojot",
+          name: "Resojot",
+          version: "1.0.0",
+          minAppVersion: "1.0.0",
+        }),
+        [paths[2]]: "old remote styles",
+      },
+    });
+
+    // First open: snapshot built and cached; keep-remote is available.
+    const first = await harness.executor
+      .getCommunityPluginBundleReviewSnapshot("resojot");
+    expect(first?.bundleReview?.executableChoices)
+      .toContain("keep-remote");
+
+    // Reopen BEFORE the remote changes: the P5 cache serves the cached
+    // snapshot instantly (same digest, no rebuild). The user holds this
+    // (displayed) snapshot open while the remote changes underneath.
+    const reopen = await harness.executor
+      .getCommunityPluginBundleReviewSnapshot("resojot");
+    expect(reopen?.factsDigest).toBe(first?.factsDigest);
+
+    // Another device rewrites the whole remote bundle (new eTag + bytes).
+    for (const path of paths) {
+      const current = harness.remoteFiles.get(path)!;
+      harness.remoteFiles.set(path, {
+        entry: { ...current.entry, eTag: `etag-rewritten-${path}` },
+        bytes: current.bytes,
+      });
+    }
+    const mainJs = harness.remoteFiles.get(paths[0])!;
+    harness.remoteFiles.set(paths[0], {
+      entry: { ...mainJs.entry },
+      bytes: new TextEncoder().encode("cloud rewrote everything").buffer,
+    });
+
+    // The user picks keep-remote from the stale (now outdated) cached
+    // snapshot. The resolve chain re-checks current facts → digest mismatch
+    // → zero writes, and the stale review is not attached.
+    const resolved = await harness.executor.resolveMutationRecovery(
+      reopen!,
+      "keep-remote",
+    );
+    expect(resolved).toBe(false);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).not.toEqual([]);
+    // The pending conflicts were not cleared by the stale choice.
+    expect(harness.state.pendingConflicts.length).toBeGreaterThan(0);
+  });
+
   it("publishes one reviewed local plugin bundle member by member and closes its older evidence", async () => {
     const root = ".obsidian/plugins/resojot";
     const paths = [
@@ -9184,6 +9706,484 @@ describe("Persistent remote delta state", () => {
     expect(result.mutationRecovery).toMatchObject({ state: "blocked" });
   });
 
+  // --- renameRemote auto-close (mirrors moveLocal A2, 2026-09-06) ---
+  // Gap: classifyUnreceiptedMutation renameRemote branch (sync-executor.ts:13871)
+  // unconditionally returns null when target.driveId !== expectedRemote.driveId,
+  // unlike the upload branch (13810–13816) which checks whether the expected ID
+  // is dead (byId 404) before giving up.  When the remote source is gone, the
+  // target exists with a drifted driveId, the expected id is 404, and the target
+  // content matches the local file, the rename is provably complete — converge.
+
+  it("abandons a proven not-applied renameRemote intent when the remote source is gone, target exists with drifted identity, and the expected remote identity is dead", async () => {
+    // renameRemote mirror of moveLocal A2 "three-missing-one": the remote
+    // source is absent (the rename moved the item away), the target exists
+    // with a new driveId, and the old expected driveId is gone (404).  The
+    // target content still matches local, proving the rename completed.
+    const content = new Uint8Array([3, 1, 4]).buffer;
+    const hash = await sha256Hex(content);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "a.md";
+    const targetPath = "b.md";
+    const expectedDriveId = "renameremote-expected-id";
+    const targetRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "renameremote-new-id",
+      parentId: activeScope.filesRootId,
+      eTag: "target-etag",
+      cTag: "target-ctag",
+      size: content.byteLength,
+      sha256Hash: hash,
+    };
+    const targetLocal: LocalFileEntry = {
+      path: targetPath,
+      hash,
+      size: content.byteLength,
+      mtime: 1,
+      binary: false,
+    };
+    const state = makeActiveV2State([targetRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-renameremote-id-dead-converge",
+          planRevision: 1,
+          scope: activeScope,
+          action: "renameRemote",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: { exists: true, hash, size: content.byteLength },
+          expectedRemote: {
+            exists: true,
+            driveId: expectedDriveId,
+            eTag: "old-etag",
+            size: content.byteLength,
+            sha256Hash: hash,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    // Remote source missing; target exists with new driveId; old id dead.
+    const getFileMetadata = vi.fn().mockImplementation(async (_v: string, path: string) =>
+      path === targetPath ? targetRemote : undefined);
+    const getDriveItemMetadataById = vi.fn().mockResolvedValue(null);
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "https://graph.example/delta-renameremote-converge",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getFileMetadata, getDriveItemMetadataById, getDelta }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockImplementation(async (path: string) =>
+          path === targetPath
+            ? { status: "present", entry: targetLocal }
+            : { status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    // The provably completed renameRemote is auto-settled: the ledger is
+    // cleared with a checkpoint that updates the base to the new driveId.
+    expect(getDriveItemMetadataById).toHaveBeenCalledWith(expectedDriveId);
+    expect(result.mutationRecovery).toBeUndefined();
+    expect(state.mutationLedger).toEqual([]);
+  });
+
+  it("does not auto-settle a renameRemote intent when the expected remote identity still lives (byId)", async () => {
+    // The expected driveId still resolves to a live item — the rename may
+    // have moved the object to a third path.  Keep the record blocked;
+    // do not guess.  Mirror of moveLocal safety control L9019.
+    const content = new Uint8Array([3, 1, 4]).buffer;
+    const hash = await sha256Hex(content);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "a.md";
+    const targetPath = "b.md";
+    const expectedDriveId = "renameremote-still-alive-id";
+    const targetRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "renameremote-new-id",
+      parentId: activeScope.filesRootId,
+      eTag: "target-etag",
+      cTag: "target-ctag",
+      size: content.byteLength,
+      sha256Hash: hash,
+    };
+    const targetLocal: LocalFileEntry = {
+      path: targetPath,
+      hash,
+      size: content.byteLength,
+      mtime: 1,
+      binary: false,
+    };
+    const state = makeActiveV2State([targetRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-renameremote-id-alive",
+          planRevision: 1,
+          scope: activeScope,
+          action: "renameRemote",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: { exists: true, hash, size: content.byteLength },
+          expectedRemote: {
+            exists: true,
+            driveId: expectedDriveId,
+            eTag: "old-etag",
+            size: content.byteLength,
+            sha256Hash: hash,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const getFileMetadata = vi.fn().mockImplementation(async (_v: string, path: string) =>
+      path === targetPath ? targetRemote : undefined);
+    // Expected ID is still alive — byId returns a live item.
+    const getDriveItemMetadataById = vi.fn().mockResolvedValue({
+      id: expectedDriveId,
+      eTag: "still-alive-etag",
+      cTag: "still-alive-ctag",
+      size: content.byteLength,
+      file: {},
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "https://graph.example/delta-renameremote-id-alive",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getFileMetadata, getDriveItemMetadataById, getDelta }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockImplementation(async (path: string) =>
+          path === targetPath
+            ? { status: "present", entry: targetLocal }
+            : { status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(getDriveItemMetadataById).toHaveBeenCalledWith(expectedDriveId);
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(result.mutationRecovery).toMatchObject({ state: "blocked" });
+  });
+
+  it("does not auto-settle a renameRemote intent when the expected remote driveId is empty (fail-closed)", async () => {
+    // Empty expected driveId proves nothing about identity absence; the
+    // classifier must keep the record.  Mirror of moveLocal safety control
+    // L9105 (finding ⑤, C4 correct).
+    const content = new Uint8Array([3, 1, 4]).buffer;
+    const hash = await sha256Hex(content);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "a.md";
+    const targetPath = "b.md";
+    const targetRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "renameremote-new-id",
+      parentId: activeScope.filesRootId,
+      eTag: "target-etag",
+      cTag: "target-ctag",
+      size: content.byteLength,
+      sha256Hash: hash,
+    };
+    const targetLocal: LocalFileEntry = {
+      path: targetPath,
+      hash,
+      size: content.byteLength,
+      mtime: 1,
+      binary: false,
+    };
+    const state = makeActiveV2State([targetRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-renameremote-empty-driveid",
+          planRevision: 1,
+          scope: activeScope,
+          action: "renameRemote",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: { exists: true, hash, size: content.byteLength },
+          expectedRemote: {
+            exists: true,
+            driveId: "",
+            eTag: "old-etag",
+            size: content.byteLength,
+            sha256Hash: hash,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const getFileMetadata = vi.fn().mockImplementation(async (_v: string, path: string) =>
+      path === targetPath ? targetRemote : undefined);
+    const getDriveItemMetadataById = vi.fn().mockResolvedValue(null);
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "https://graph.example/delta-renameremote-empty-driveid",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getFileMetadata, getDriveItemMetadataById, getDelta }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockImplementation(async (path: string) =>
+          path === targetPath
+            ? { status: "present", entry: targetLocal }
+            : { status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    // Fail-closed: empty driveId cannot prove identity absence; byId is never
+    // attempted and the record stays blocked.
+    expect(getDriveItemMetadataById).not.toHaveBeenCalled();
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(result.mutationRecovery).toMatchObject({ state: "blocked" });
+  });
+
+  it("does not auto-settle a renameRemote intent when the remote source still exists", async () => {
+    // The remote source path still holds a file — the rename may not have
+    // been applied remotely.  Keep the record blocked.
+    const content = new Uint8Array([3, 1, 4]).buffer;
+    const hash = await sha256Hex(content);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "a.md";
+    const targetPath = "b.md";
+    const expectedDriveId = "renameremote-source-exists-id";
+    const sourceRemote: RemoteFileEntry = {
+      path: sourcePath,
+      driveId: expectedDriveId,
+      parentId: activeScope.filesRootId,
+      eTag: "source-etag",
+      cTag: "source-ctag",
+      size: content.byteLength,
+      sha256Hash: hash,
+    };
+    const state = makeActiveV2State([sourceRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-renameremote-source-exists",
+          planRevision: 1,
+          scope: activeScope,
+          action: "renameRemote",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: { exists: true, hash, size: content.byteLength },
+          expectedRemote: {
+            exists: true,
+            driveId: expectedDriveId,
+            eTag: "old-etag",
+            size: content.byteLength,
+            sha256Hash: hash,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    // Remote source still exists; target is absent.
+    const getFileMetadata = vi.fn().mockImplementation(async (_v: string, path: string) =>
+      path === sourcePath ? sourceRemote : undefined);
+    const getDriveItemMetadataById = vi.fn().mockResolvedValue(null);
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "https://graph.example/delta-renameremote-source-exists",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getFileMetadata, getDriveItemMetadataById, getDelta }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({ status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    // Remote source still holds the file — rename is unconfirmed.
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(result.mutationRecovery).toMatchObject({ state: "blocked" });
+  });
+
+  it("does not auto-settle a renameRemote intent when the target content differs from the expected local", async () => {
+    // The target driveId drifted and the old id is dead, but the remote
+    // content no longer matches local — the rename may have been followed
+    // by a remote content edit.  Keep the record blocked.
+    const content = new Uint8Array([3, 1, 4]).buffer;
+    const otherContent = new Uint8Array([5, 6, 7]).buffer;
+    const hash = await sha256Hex(content);
+    const otherHash = await sha256Hex(otherContent);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "a.md";
+    const targetPath = "b.md";
+    const expectedDriveId = "renameremote-content-mismatch-id";
+    const targetRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "renameremote-new-id",
+      parentId: activeScope.filesRootId,
+      eTag: "target-etag",
+      cTag: "target-ctag",
+      size: otherContent.byteLength,
+      sha256Hash: otherHash,
+    };
+    const targetLocal: LocalFileEntry = {
+      path: targetPath,
+      hash,  // local hash differs from remote
+      size: content.byteLength,
+      mtime: 1,
+      binary: false,
+    };
+    const state = makeActiveV2State([targetRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-renameremote-content-mismatch",
+          planRevision: 1,
+          scope: activeScope,
+          action: "renameRemote",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: { exists: true, hash, size: content.byteLength },
+          expectedRemote: {
+            exists: true,
+            driveId: expectedDriveId,
+            eTag: "old-etag",
+            size: content.byteLength,
+            sha256Hash: hash,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const getFileMetadata = vi.fn().mockImplementation(async (_v: string, path: string) =>
+      path === targetPath ? targetRemote : undefined);
+    const getDriveItemMetadataById = vi.fn().mockResolvedValue(null);
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "https://graph.example/delta-renameremote-content-mismatch",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getFileMetadata, getDriveItemMetadataById, getDelta }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockImplementation(async (path: string) =>
+          path === targetPath
+            ? { status: "present", entry: targetLocal }
+            : { status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    // Identity drifted ok but content mismatch — cannot prove rename
+    // outcome, keep blocked.
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(result.mutationRecovery).toMatchObject({ state: "blocked" });
+  });
+
   it("defers an upload when the file changes after scan without leaving a mutation intent", async () => {
     const scannedContent = new Uint8Array([1, 2, 3]).buffer;
     const currentContent = new Uint8Array([4, 5, 6, 7]).buffer;
@@ -12378,6 +13378,116 @@ describe("Remote sha256 dedup", () => {
     ]);
   });
 
+  it("refreshes verification download URLs through one batch when the conflict candidate needs a byte comparison", async () => {
+    // Knife-1/2 executor wiring (2026-09-08): the canonical planner hands the
+    // budgeted verification download set to an injected batch refresh before
+    // downloading, so a same-size hashless conflict probe downloads through
+    // the refreshed URL instead of paying a per-file waterfall metadata round
+    // trip. This test pins that the main executor finalize call site really
+    // passes the hook through — planner-level behavior is covered separately
+    // in canonical-plan-v2.test.ts.
+    const path = "wired-conflict.bin";
+    const localContent = new TextEncoder().encode("local-wired!").buffer;
+    const remoteContent = new TextEncoder().encode("remote-wired").buffer;
+    expect(localContent.byteLength).toBe(remoteContent.byteLength);
+    const local: LocalFileEntry = {
+      path,
+      size: localContent.byteLength,
+      mtime: 1,
+      hash: await sha256Hex(localContent),
+      binary: true,
+    };
+    const remote: RemoteFileEntry = {
+      path,
+      driveId: "wired-conflict-id",
+      size: remoteContent.byteLength,
+      mtime: 2,
+      eTag: "etag-wired-conflict",
+      cTag: "ctag-wired-conflict",
+    };
+    const base: BaseFileEntry = {
+      path,
+      hash: "cc".repeat(32),
+      size: local.size,
+      eTag: "etag-before-wired",
+    };
+    const pendingStore = makePendingConflictStore([]);
+    const downloadFile = vi.fn().mockResolvedValue(remoteContent);
+    const refreshedUrl = "https://download.example/refreshed-wired";
+    const refreshedReasons: string[] = [];
+    const refreshedIds: string[][] = [];
+    const getDriveItemMetadataByIds = vi.fn(async (
+      ids: readonly string[],
+      reason?: string,
+    ) => {
+      refreshedIds.push([...ids]);
+      if (reason) refreshedReasons.push(reason);
+      return new Map(ids.map((id) => [id, id === remote.driveId
+        ? {
+            id,
+            eTag: remote.eTag,
+            file: {},
+            parentReference: { id: TEST_SYNC_SCOPE.filesRootId },
+            "@microsoft.graph.downloadUrl": refreshedUrl,
+          }
+        : null]));
+    });
+    const state = makeActiveV2State([remote], [base], pendingStore);
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        downloadFile,
+        getDriveItemMetadataByIds,
+        getFileMetadata: vi.fn().mockResolvedValue(remote),
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [local],
+          folders: [],
+          folderScanComplete: true,
+          folderScanFailures: [],
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        scanFile: vi.fn().mockResolvedValue(local),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    // The verification download still happened exactly once and produced the
+    // same conflict + byte-difference receipt as the unbatched path…
+    expect(result.conflicts).toBe(1);
+    expect(result.errors).toBe(0);
+    expect(downloadFile).toHaveBeenCalledTimes(1);
+    // …but the download carried the batched URL (single metadata refresh for
+    // the probe, no per-file waterfall), and the refresh was attributed to
+    // the content-verification bucket.
+    expect(refreshedIds).toEqual([[remote.driveId]]);
+    expect(refreshedReasons).toEqual(["contentVerificationRefresh"]);
+    const wiredCall = downloadFile.mock.calls[0];
+    expect(wiredCall[2]).toBe(refreshedUrl);
+    expect(pendingStore.pendingConflicts).toEqual([
+      expect.objectContaining({
+        path,
+        contentComparison: expect.objectContaining({
+          result: "different",
+          remoteDriveId: remote.driveId,
+          remoteHash: await sha256Hex(remoteContent),
+        }),
+      }),
+    ]);
+  });
+
   it("resolves identical new binary files without downloading remote content", async () => {
     const path = "recording.m4a";
     const hash = "14731cbf60b9c1b219e31ab5a1b71bda45a0a4c3f137c0e0fa7f4ca1ad54a069";
@@ -15247,6 +16357,96 @@ describe("Conservative desktop small-file download concurrency", () => {
     }
   });
 
+  it("A2 — overlaps read-only download prefetch on mobile while local writes stay serial and capped at two", async () => {
+    const previousMobile = Platform.isMobile;
+    Platform.isMobile = true;
+    try {
+      const bytes = new Uint8Array(256 * 1024);
+      bytes.fill(7);
+      const buffer = bytes.buffer;
+      const hash = await sha256Hex(buffer);
+      let activeDownloads = 0;
+      let peakDownloads = 0;
+      let activeWrites = 0;
+      let peakWrites = 0;
+      const downloadFile = vi.fn().mockImplementation(async () => {
+        activeDownloads++;
+        peakDownloads = Math.max(peakDownloads, activeDownloads);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        activeDownloads--;
+        return buffer.slice(0);
+      });
+      const writeBinary = vi.fn().mockImplementation(async () => {
+        activeWrites++;
+        peakWrites = Math.max(peakWrites, activeWrites);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        activeWrites--;
+      });
+      const remoteEntries = Array.from({ length: 9 }, (_, index): RemoteFileEntry => ({
+        path: `mobile-download-${index}.bin`,
+        driveId: `mobile-remote-${index}`,
+        parentId: TEST_SYNC_SCOPE.filesRootId,
+        size: buffer.byteLength,
+        mtime: index,
+        eTag: `mobile-etag-${index}`,
+        cTag: `mobile-ctag-${index}`,
+        sha256Hash: hash,
+      }));
+      const localStore = makeDownloadLocalStore(writeBinary);
+      const state = makeActiveV2State(remoteEntries, []);
+      const executor = new SyncExecutor(
+        makeMockOneDrive({
+          downloadFile,
+          hasDegradedDownloadPathThisRound: vi.fn().mockReturnValue(false),
+        }),
+        {
+          vault: {
+            adapter: localStore.adapter,
+            getFiles: vi.fn().mockReturnValue([]),
+            getName: vi.fn().mockReturnValue("testVault"),
+          },
+          scanAll: vi.fn().mockResolvedValue({
+            entries: [],
+            folders: [],
+            folderScanComplete: true,
+            folderScanFailures: [],
+            skippedLarge: [],
+            failedPaths: [],
+            skippedCount: 0,
+            complete: true,
+          }),
+          scanFile: vi.fn().mockResolvedValue(null),
+          inspectFile: localStore.inspectFile,
+          shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+        } as unknown as LocalScanner,
+        state,
+        "testVault",
+      );
+
+      const result = await executor.run("manual", {});
+
+      expect(result.downloaded).toBe(remoteEntries.length);
+      expect(result.errors).toBe(0);
+      // A2 contract: mobile downloads overlap read-only content GETs up to
+      // the mobile ceiling (2) — never beyond it — while every local write
+      // stays strictly serial.
+      expect(peakDownloads).toBeGreaterThanOrEqual(2);
+      expect(peakDownloads).toBeLessThanOrEqual(2);
+      expect(peakWrites).toBe(1);
+      expect(result.metrics?.fileTransfers.download).toMatchObject({
+        started: remoteEntries.length,
+        succeeded: remoteEntries.length,
+        failed: 0,
+        peakConcurrency: peakDownloads,
+      });
+      expect(state.mutationLedger).toEqual([]);
+      expect(state.baseSnapshot).toHaveLength(remoteEntries.length);
+      expect(localStore.files.size).toBe(remoteEntries.length);
+    } finally {
+      Platform.isMobile = previousMobile;
+    }
+  });
+
   it("batches missing download URLs and hashless version checks without weakening verification", async () => {
     const previousMobile = Platform.isMobile;
     Platform.isMobile = false;
@@ -15422,7 +16622,7 @@ describe("Conservative desktop small-file download concurrency", () => {
 });
 
 describe("P1 — downloadUrl refresh is batched up front for every download (any platform, any size)", () => {
-  it("refreshes missing download URLs through one $batch on mobile and keeps verify per-path", async () => {
+  it("A2 — refreshes missing URLs through one $batch on mobile and version-verifies hashless entries through the batch endpoint", async () => {
     const previousMobile = Platform.isMobile;
     Platform.isMobile = true;
     try {
@@ -15459,28 +16659,9 @@ describe("P1 — downloadUrl refresh is batched up front for every download (any
       const downloadFile = vi.fn().mockResolvedValue(buffer.slice(0));
       const localStore = makeDownloadLocalStore();
       const state = makeActiveV2State(remoteEntries, []);
-      // Per-path version verification (unchanged by A1) reads the remote
-      // metadata through getFileMetadata — model the real remote so the 4
-      // hashless files verify successfully after download.
-      const getFileMetadata = vi.fn(async (_vaultName: string, path: string) => {
-        const entry = remoteEntries.find((item) => item.path === path);
-        if (!entry) return null;
-        return {
-          eTag: entry.eTag,
-          cTag: entry.cTag,
-          size: entry.size,
-          sha256Hash: entry.sha256Hash,
-          quickXorHash: entry.quickXorHash,
-          downloadUrl: `https://download.example/${entry.driveId}`,
-          driveId: entry.driveId,
-          parentId: entry.parentId,
-          mtime: entry.mtime,
-        };
-      });
       const executor = new SyncExecutor(
         makeMockOneDrive({
           downloadFile,
-          getFileMetadata,
           getDriveItemMetadataByIds,
           hasDegradedDownloadPathThisRound: vi.fn().mockReturnValue(false),
         }),
@@ -15520,18 +16701,24 @@ describe("P1 — downloadUrl refresh is batched up front for every download (any
       expect([...refreshCalls[0][0]].sort()).toEqual(
         remoteEntries.map((entry) => entry.driveId).sort(),
       );
-      // Version verification stays per-path on mobile: the batch endpoint is
-      // only ever used for downloadUrlRefresh, never downloadVersionVerify.
+      // A2: hashless mobile downloads are version-verified through the batch
+      // endpoint (one call per adaptive batch) instead of one per-path GET.
+      // Assert coverage, not batch shape.
+      const verifiedIds = getDriveItemMetadataByIds.mock.calls
+        .filter((call) => call[1] === "downloadVersionVerify")
+        .flatMap((call) => call[0]);
+      expect([...verifiedIds].sort()).toEqual(
+        remoteEntries.filter((entry) => !entry.sha256Hash)
+          .map((entry) => entry.driveId).sort(),
+      );
       expect(getDriveItemMetadataByIds.mock.calls.every((call) =>
-        call[1] === "downloadUrlRefresh",
+        call[1] === "downloadUrlRefresh" || call[1] === "downloadVersionVerify",
       )).toBe(true);
       // Every download used the URL the batch refresh filled back into the
       // plan item.
       expect(downloadFile.mock.calls.every((call) =>
         typeof call[2] === "string" && call[2].startsWith("https://download.example/"),
       )).toBe(true);
-      // Content stays fully serial on mobile: peak transfer concurrency 1.
-      expect(result.metrics?.fileTransfers.download.peakConcurrency).toBe(1);
       expect(state.mutationLedger).toEqual([]);
       expect(state.baseSnapshot).toHaveLength(remoteEntries.length);
       expect(localStore.files.size).toBe(remoteEntries.length);
@@ -15540,7 +16727,7 @@ describe("P1 — downloadUrl refresh is batched up front for every download (any
     }
   });
 
-  it("falls back to the per-file waterfall refresh when the batch fails (fail-closed)", async () => {
+  it("A2 — mobile prefetch-eligible downloads fail closed when refresh batching is unavailable", async () => {
     const previousMobile = Platform.isMobile;
     Platform.isMobile = true;
     try {
@@ -15556,10 +16743,10 @@ describe("P1 — downloadUrl refresh is batched up front for every download (any
         cTag: `mobile-fallback-ctag-${index}`,
         ...(index === 0 ? { sha256Hash: hash } : {}),
       }));
-      // Batch endpoint rejects: the batch is absorbed and the existing
-      // per-file waterfall refresh takes over. In this mock the waterfall
-      // refresh cannot produce a URL (no request mock), so every download
-      // fails closed — no file may be written, no mutation recorded.
+      // Batch endpoint rejects: the universal refresh and every per-batch
+      // prep fail. A2 mirrors the desktop prefetch contract — batch members
+      // without a URL fail closed instead of falling back to the per-file
+      // waterfall, so no file may be written and no mutation recorded.
       const getDriveItemMetadataByIds = vi.fn().mockRejectedValue(new Error("batch down"));
       const downloadFile = vi.fn().mockResolvedValue(buffer.slice(0));
       const localStore = makeDownloadLocalStore();
@@ -15596,17 +16783,19 @@ describe("P1 — downloadUrl refresh is batched up front for every download (any
 
       const result = await executor.run("manual", {});
 
-      // Fail-closed: batch failure is absorbed into the existing per-file
-      // path. The file carrying a trusted SHA-256 (index 0) still downloads
-      // and verifies by hash; the two hashless files fail per-path
-      // verification (getFileMetadata is absent in this mock) and are not
-      // written — exactly the pre-A1 fallback behaviour.
-      expect(getDriveItemMetadataByIds).toHaveBeenCalledTimes(1);
-      expect(result.downloaded).toBe(1);
-      expect(result.errors).toBeGreaterThan(0);
-      expect(localStore.files.size).toBe(1);
+      // Fail-closed: universal + per-batch refreshes all fail, every
+      // prefetch-eligible member errors before any content request, and
+      // nothing is written or committed.
+      expect(result.downloaded).toBe(0);
+      expect(result.errors).toBe(remoteEntries.length);
+      expect(getDriveItemMetadataByIds).toHaveBeenCalled();
+      expect(getDriveItemMetadataByIds.mock.calls.every((call) =>
+        call[1] === "downloadUrlRefresh",
+      )).toBe(true);
+      expect(downloadFile).not.toHaveBeenCalled();
+      expect(localStore.files.size).toBe(0);
       expect(state.mutationLedger).toEqual([]);
-      expect(state.baseSnapshot).toHaveLength(1);
+      expect(state.baseSnapshot).toHaveLength(0);
     } finally {
       Platform.isMobile = previousMobile;
     }
@@ -19370,6 +20559,151 @@ describe("OneDrive-invalid-name unreceipted upload recovery", () => {
     expect(summary).toEqual(
       expect.objectContaining({ state: "settled", remaining: 0 }),
     );
+  });
+});
+
+describe("T2 server-authoritative convergence — per-id lastModifiedBy evidence", () => {
+  const hashA = "aa".repeat(32); // remote version at intent creation
+  const hashB = "bb".repeat(32); // local content (upload payload / downloaded content)
+  const hashC = "cc".repeat(32); // current remote version rewritten by EasySync
+
+  async function makeT2Harness(intent: MutationIntentV1, localHash = hashB) {
+    const ledger: MutationLedgerEntryV1[] = [{ intent, receipt: null }];
+    const state = makeActiveV2State(
+      [{
+        path: "note.md",
+        driveId: "remote-id",
+        parentId: TEST_SYNC_SCOPE.filesRootId,
+        size: 3,
+        mtime: 2,
+        eTag: "etag-C",
+        cTag: "ctag-C",
+        sha256Hash: hashC,
+      }],
+      [],
+      { mutationLedger: ledger },
+    );
+    const onedrive = makeMockOneDrive({
+      // Current remote = C (same driveId, eTag/hash moved on)
+      getFileMetadata: vi.fn().mockResolvedValue({
+        driveId: "remote-id",
+        parentId: TEST_SYNC_SCOPE.filesRootId,
+        downloadUrl: "https://download/1",
+        size: 3,
+        mtime: 2,
+        eTag: "etag-C",
+        cTag: "ctag-C",
+        sha256Hash: hashC,
+      }),
+      // T2 per-id evidence: the remote object was written by EasySync
+      getDriveItemMetadataById: vi.fn().mockResolvedValue({
+        id: "remote-id",
+        name: "note.md",
+        size: 3,
+        eTag: "etag-C",
+        lastModifiedBy: { application: { displayName: "EasySync" } },
+      }),
+    });
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault: {
+          configDir: ".obsidian",
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        inspectFile: vi.fn().mockResolvedValue({
+          status: "present" as const,
+          entry: {
+            path: intent.path,
+            hash: localHash,
+            size: 3,
+            mtime: 1,
+            binary: false,
+          },
+        }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    const recover = () => {
+      const epoch = (executor as unknown as {
+        lifecycle: { capture(): number };
+      }).lifecycle.capture();
+      return (executor as unknown as {
+        recoverMutationLedger(
+          scope: SyncScope,
+          metrics: undefined,
+          operationEpoch: number,
+          observationOnly: boolean,
+        ): Promise<unknown>;
+      }).recoverMutationLedger(
+        { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+        undefined,
+        epoch,
+        false,
+      );
+    };
+    return { executor, onedrive, recover, state, intent };
+  }
+
+  it("keeps an unreceipted download fail-closed when the current remote was rewritten by EasySync", async () => {
+    const harness = await makeT2Harness({
+      version: 1,
+      operationId: "op-download-t2",
+      planRevision: 1,
+      scope: { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+      action: "download",
+      path: "note.md",
+      expectedLocal: { exists: true, hash: hashB, size: 3 },
+      expectedRemote: {
+        exists: true,
+        driveId: "remote-id",
+        eTag: "etag-A",
+        size: 3,
+        sha256Hash: hashA,
+      },
+      createdAt: 1,
+    }, hashA);
+
+    // Recovery-layer T2 convergence was removed: its checkpoint cannot
+    // satisfy both the receipt contract (base.eTag === expectedRemote.eTag)
+    // and the reducer contract (base.eTag === current remoteIndex eTag),
+    // and the planned T2 direction evidence belongs to the plan layer.
+    await expect(harness.recover()).rejects.toThrow(
+      "Mutation outcome requires manual review",
+    );
+    expect(harness.onedrive.getDriveItemMetadataById).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toHaveLength(1);
+  });
+
+  it("keeps an unreceipted upload fail-closed even when the current remote was rewritten by EasySync", async () => {
+    const harness = await makeT2Harness({
+      version: 1,
+      operationId: "op-upload-t2",
+      planRevision: 1,
+      scope: { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+      action: "upload",
+      path: "note.md",
+      expectedLocal: { exists: true, hash: hashB, size: 3 },
+      expectedRemote: {
+        exists: true,
+        driveId: "remote-id",
+        eTag: "etag-A",
+        size: 3,
+        sha256Hash: hashA,
+      },
+      createdAt: 1,
+    });
+
+    await expect(harness.recover()).rejects.toThrow(
+      "Mutation outcome requires manual review",
+    );
+    // Upload convergence was removed (planned boundary: both sides changed →
+    // T3). No per-id evidence request may be issued for uploads.
+    expect(harness.onedrive.getDriveItemMetadataById).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toHaveLength(1);
   });
 });
 

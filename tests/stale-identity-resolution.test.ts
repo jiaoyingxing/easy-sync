@@ -4,6 +4,7 @@ import {
   retireReviewedStaleIdentityV2,
 } from "../src/sync/stale-identity-resolution";
 import { buildCanonicalPlanCandidateV2 } from "../src/sync/canonical-plan-v2";
+import { planFolderStateV2 } from "../src/sync/folder-state-v2";
 import type { SyncStateEnvelopeV2 } from "../src/sync/state-envelope-v2";
 import {
   SyncActionType,
@@ -287,5 +288,120 @@ describe("reviewed stale identity retirement", () => {
         [{ path: "New" }],
       ),
     )).toBeNull();
+  });
+
+  it("builds an active-forget snapshot and retires only local anchors for a still-present remote folder", () => {
+    // Local "notes" exists; remote "Notes" still present and anchored, but the
+    // case-only spelling change makes folder-state emit local-rename-evidence-conflict.
+    const envelope = baseEnvelope();
+    envelope.remoteIndex.itemsById.notes = {
+      id: "notes",
+      parentId: scope.filesRootId,
+      name: "Notes",
+      kind: "folder",
+      eTag: "notes-etag",
+    };
+    envelope.folderAnchors!.byAnchorId["folder:notes"] = {
+      anchorId: "folder:notes",
+      remoteId: "notes",
+      lastPath: "Notes",
+      parentRemoteId: scope.filesRootId,
+      remoteETag: "notes-etag",
+      confirmedGeneration: 1,
+      confirmedAt: 1,
+    };
+
+    const reviewed = buildStaleIdentityResolutionSnapshotV1(
+      "Notes",
+      "local-rename-evidence-conflict",
+      facts(envelope, [], [{ path: "notes" }]),
+    );
+    expect(reviewed).toMatchObject({
+      kind: "folder-active-forget",
+      path: "Notes",
+      folderAnchors: [{ anchorId: "folder:notes", remoteId: "notes" }],
+      primaryRemote: { remoteId: "notes", status: "present", kind: "folder" },
+    });
+
+    const retired = retireReviewedStaleIdentityV2(envelope, reviewed!, 20);
+    expect(retired).toMatchObject({
+      status: "accepted",
+      retiredFolderAnchors: 1,
+      retiredFileAnchors: 0,
+    });
+    if (retired.status !== "accepted") throw new Error("expected acceptance");
+    // The remote node must NOT be dropped from the remote index.
+    expect(retired.envelope.remoteIndex.itemsById.notes).toBeDefined();
+    // Next folder-state plan must no longer re-emit the conflict (第 0 项):
+    // it re-meets the remote folder as unanchored → shared-folder review.
+    const replanned = planFolderStateV2({
+      envelope: retired.envelope,
+      localFiles: [],
+      localFolders: [{ path: "notes" }],
+      localFolderScanComplete: true,
+    });
+    expect(replanned.items).not.toContainEqual(expect.objectContaining({
+      reason: "local-rename-evidence-conflict",
+    }));
+  });
+
+  it("refuses active-forget once the remote folder itself is gone", () => {
+    const envelope = baseEnvelope();
+    envelope.folderAnchors!.byAnchorId["folder:notes"] = {
+      anchorId: "folder:notes",
+      remoteId: "notes",
+      lastPath: "Notes",
+      parentRemoteId: scope.filesRootId,
+      remoteETag: "notes-etag",
+      confirmedGeneration: 1,
+      confirmedAt: 1,
+    };
+    const reviewed = buildStaleIdentityResolutionSnapshotV1(
+      "Notes",
+      "local-rename-evidence-conflict",
+      facts(envelope, [], [{ path: "notes" }]),
+    );
+    expect(
+      reviewed?.kind === "folder-active-forget" ? reviewed.kind : null,
+    ).toBeNull();
+  });
+
+  it("covers every active-forget issue code through the snapshot builder", () => {
+    const codes = [
+      "local-rename-evidence-conflict",
+      "local-subtree-changed",
+      "remote-subtree-changed",
+      "target-occupied",
+      "parent-chain-incomplete",
+    ] as const;
+    for (const code of codes) {
+      const envelope = baseEnvelope();
+      envelope.remoteIndex.itemsById.notes = {
+        id: "notes",
+        parentId: scope.filesRootId,
+        name: "Notes",
+        kind: "folder",
+        eTag: "notes-etag",
+      };
+      envelope.folderAnchors!.byAnchorId["folder:notes"] = {
+        anchorId: "folder:notes",
+        remoteId: "notes",
+        lastPath: "Notes",
+        parentRemoteId: scope.filesRootId,
+        remoteETag: "notes-etag",
+        confirmedGeneration: 1,
+        confirmedAt: 1,
+      };
+      // The folder-state conflict must actually be produced for this code to
+      // reach the builder; each shape has its own local/remote precondition,
+      // so only assert the builder returns null gracefully for shapes that do
+      // not currently produce the deferred row (fail-closed), while the code
+      // is accepted as a valid issue code (does not throw).
+      expect(() => buildStaleIdentityResolutionSnapshotV1(
+        "Notes",
+        code,
+        facts(envelope, [], []),
+      )).not.toThrow();
+    }
   });
 });

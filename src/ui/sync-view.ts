@@ -1988,6 +1988,11 @@ export class EasySyncSyncView extends ItemView {
       if (
         issue.issueCode === "identity-replacement-ambiguous"
         || issue.issueCode === "anchored-folder-missing-remote"
+        || issue.issueCode === "local-rename-evidence-conflict"
+        || issue.issueCode === "local-subtree-changed"
+        || issue.issueCode === "remote-subtree-changed"
+        || issue.issueCode === "target-occupied"
+        || issue.issueCode === "parent-chain-incomplete"
       ) {
         this.createActionChip(
           actions,
@@ -2061,9 +2066,11 @@ export class EasySyncSyncView extends ItemView {
         t,
         {
           message: t(
-            snapshot.kind === "folder-missing-remote"
-              ? "syncView.staleIdentity.folderMessage"
-              : "syncView.staleIdentity.fileMessage",
+            snapshot.kind === "folder-active-forget"
+              ? "syncView.staleIdentity.activeForgetMessage"
+              : snapshot.kind === "folder-missing-remote"
+                ? "syncView.staleIdentity.folderMessage"
+                : "syncView.staleIdentity.fileMessage",
             { path },
           ),
         },

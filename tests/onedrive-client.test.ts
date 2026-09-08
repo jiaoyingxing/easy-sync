@@ -3845,8 +3845,9 @@ describe("OneDriveClient delta continuation", () => {
 
     await client.getDelta("testVault");
 
+    const deltaSelect = "id,name,size,file,folder,parentReference,lastModifiedDateTime,createdDateTime,lastModifiedBy,createdBy,eTag,cTag,@microsoft.graph.downloadUrl,deleted,specialFolder";
     expect(requestSpy.mock.calls.map(([request]) => request.url)).toEqual([
-      `https://graph.microsoft.com/v1.0/me/drive/special/approot:/vaults/testVault/files:/delta?$top=1000`,
+      `https://graph.microsoft.com/v1.0/me/drive/special/approot:/vaults/testVault/files:/delta?$top=1000&$select=${deltaSelect}`,
       nextLink,
     ]);
   });
@@ -3881,8 +3882,9 @@ describe("OneDriveClient delta continuation", () => {
 
     await client.getDeltaByFolderId("root/id");
 
+    const deltaSelect = "id,name,size,file,folder,parentReference,lastModifiedDateTime,createdDateTime,lastModifiedBy,createdBy,eTag,cTag,@microsoft.graph.downloadUrl,deleted,specialFolder";
     expect(requestSpy.mock.calls.map(([request]) => request.url)).toEqual([
-      "https://graph.microsoft.com/v1.0/me/drive/items/root%2Fid/delta?$top=1000",
+      `https://graph.microsoft.com/v1.0/me/drive/items/root%2Fid/delta?$top=1000&$select=${deltaSelect}`,
     ]);
   });
 });

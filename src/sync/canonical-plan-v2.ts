@@ -177,6 +177,29 @@ export interface FinalizeCanonicalPlanInputV2 {
     item: Readonly<SyncPlanItem>,
     progress: { current: number; total: number },
   ) => Promise<string>;
+  /** Knife-1 (2026-09-08, carrier `docs/temp/20260908-1331`): optional
+   *  planner-stage downloadUrl refresh for the *exact* budgeted verification
+   *  download set (conflict-candidate downloads below). The planner invokes it
+   *  at most once with those candidates before downloading; implementations
+   *  fill `item.remote.downloadUrl` on the planner-owned clones (safe: the
+   *  planner clones every candidate) only when returned metadata matched the
+   *  planned remote id + eTag (mirror of the Step-3b universal-refresh
+   *  contract). Fail-open: absent, throwing, or unfilled items keep the
+   *  per-file waterfall refresh exactly as before — no behavior weakening. */
+  refreshVerificationDownloadUrls?: (
+    items: ReadonlyArray<SyncPlanItem>,
+  ) => Promise<void>;
+  /** Knife-2 (2026-09-08, carrier `docs/temp/20260908-1331`): optional
+   *  bounded read-only window for plan-time content-verification downloads.
+   *  When provided, the conflict-candidate downloads below run in windows of
+   *  at most `maxFiles` files and `maxBytes` total bytes (a candidate larger
+   *  than the byte budget downloads alone), while per-item decisions, budget
+   *  accounting and receipts stay serial in the original loop order. Absent =
+   *  strictly serial verification downloads (today's behavior). */
+  verificationDownloadWindow?: {
+    maxFiles: number;
+    maxBytes: number;
+  };
 }
 
 export interface SealCanonicalPlanInputV2 {
@@ -1103,6 +1126,72 @@ export async function finalizeCanonicalPlanCandidateV2(
     ...evidenceCandidates,
     ...downloadCandidates,
   ];
+  // Knife-1 (2026-09-08, carrier `docs/temp/20260908-1331`): planner-stage
+  // downloadUrl refresh for exactly the budgeted verification download set.
+  // Called at most once, before any content download below; fail-open — a
+  // missing or throwing hook leaves every URL unset so the per-file waterfall
+  // refresh behaves exactly as before batching.
+  if (downloadCandidates.length > 0 && input.refreshVerificationDownloadUrls) {
+    try {
+      await input.refreshVerificationDownloadUrls(downloadCandidates);
+    } catch {
+      // Fail-open by contract: never let an optimization hook change the
+      // verification outcome; unrefreshed items keep the per-file waterfall.
+    }
+  }
+  const downloadWindow = input.verificationDownloadWindow;
+  // Knife-2 (2026-09-08, carrier `docs/temp/20260908-1331`): bounded
+  // read-only overlap for the conflict-candidate verification downloads.
+  // downloadCandidates is the exact budgeted set the loop below downloads
+  // (every member has unknown equality by construction), so we may prefetch
+  // them in windows of at most maxFiles files / maxBytes bytes while the
+  // per-item decision loop below stays serial and consumes results in its
+  // original order. Fail-open: a missing window keeps strictly serial
+  // verification downloads (today's behavior); a member missing from the
+  // prefetch map falls back to the original serial await.
+  const prefetchedDownloadHashes = new Map<
+    string,
+    { hash: string } | { error: unknown }
+  >();
+  if (
+    downloadWindow
+    && downloadWindow.maxFiles >= 1
+    && downloadWindow.maxBytes >= 1
+    && downloadCandidates.length > 1
+  ) {
+    const windowMembers: SyncPlanItem[] = [];
+    let windowBytes = 0;
+    let prefetchedCount = 0;
+    const flushWindow = async (): Promise<void> => {
+      if (windowMembers.length === 0) return;
+      await Promise.all(windowMembers.map(async (item, inside) => {
+        try {
+          const hash = await input.resolveRemoteContentHash(item, {
+            current: prefetchedCount + inside + 1,
+            total: downloadCandidates.length,
+          });
+          prefetchedDownloadHashes.set(item.path, { hash });
+        } catch (error) {
+          prefetchedDownloadHashes.set(item.path, { error });
+        }
+      }));
+      prefetchedCount += windowMembers.length;
+      windowMembers.length = 0;
+      windowBytes = 0;
+    };
+    for (const item of downloadCandidates) {
+      const bytes = item.remote?.size ?? item.local?.size ?? 0;
+      if (
+        windowMembers.length >= downloadWindow.maxFiles
+        || (windowMembers.length > 0 && windowBytes + bytes > downloadWindow.maxBytes)
+      ) {
+        await flushWindow();
+      }
+      windowMembers.push(item);
+      windowBytes += bytes;
+    }
+    await flushWindow();
+  }
   const falseConflicts = new Set<string>();
   const baseUpserts: BaseFileEntry[] = [...identityBaseUpserts];
   const results: ContentVerificationResultV2[] = [];
@@ -1121,10 +1210,21 @@ export async function finalizeCanonicalPlanCandidateV2(
     let downloadedHash: string | undefined;
     try {
       if (equality.status === "unknown") {
-        downloadedHash = await input.resolveRemoteContentHash(item, {
-          current: index + 1,
-          total: selectedCandidates.length,
-        });
+        const prefetched = prefetchedDownloadHashes.get(item.path);
+        if (prefetched) {
+          if ("error" in prefetched) {
+            const failure = prefetched.error;
+            throw failure instanceof Error
+              ? failure
+              : new Error(String(failure));
+          }
+          downloadedHash = prefetched.hash;
+        } else {
+          downloadedHash = await input.resolveRemoteContentHash(item, {
+            current: index + 1,
+            total: selectedCandidates.length,
+          });
+        }
         equality = resolveContentEquality({
           local,
           remote,

@@ -665,6 +665,13 @@ export interface SyncRunFacts {
    * pausing (direction 3, user decision 2026-09-02): the caller shows a
    * one-line summary notice instead of the durable review flow. */
   thresholdSkippedInAuto?: boolean;
+  /** How many execution-layer mismatches were silently converged this run
+   * (e.g. upload 412 content-match, renameRemote identity-drift auto-close).
+   * Zero / undefined = no silent convergence. (candidate ①, 2026-09-06.)
+   * NOTE: currently no runtime consumer; kept as plan-layer input (recovery-
+   * layer T2 reverted fail-closed, 2026-09-07) — do not "clean up" as dead
+   * code without checking DECISIONS 2026-09-07 first. */
+  convergences?: number;
 }
 
 export interface MutationRecoveryHistory {
@@ -692,9 +699,28 @@ export interface LocalFolderMoveHintV1 {
   observedAt: number;
 }
 
+/**
+ * OneDrive Personal drive IDs are 16-digit hexadecimal strings that Graph may
+ * return in either case. P0-A established the narrow compatibility: two drive
+ * IDs are the same when they are byte-equal, or when both match the 16-hex
+ * Personal shape and differ only by case. Every other identity field stays
+ * strictly compared (see {@link sameSyncScope}). This mirrors
+ * `isSameGraphDriveId` in the OneDrive client without importing the network
+ * layer into the shared scope contract.
+ */
+const ONEDRIVE_PERSONAL_DRIVE_ID_PATTERN = /^[0-9a-f]{16}$/i;
+
+export function isSameDriveId(left: string | undefined, right: string | undefined): boolean {
+  if (left === right) return true;
+  if (typeof left !== "string" || typeof right !== "string") return false;
+  return ONEDRIVE_PERSONAL_DRIVE_ID_PATTERN.test(left)
+    && ONEDRIVE_PERSONAL_DRIVE_ID_PATTERN.test(right)
+    && left.toLowerCase() === right.toLowerCase();
+}
+
 export function sameSyncScope(left: SyncScope | null, right: SyncScope | null): boolean {
   return left?.accountId === right?.accountId
-    && left?.driveId === right?.driveId
+    && isSameDriveId(left?.driveId, right?.driveId)
     && left?.vaultFolderId === right?.vaultFolderId
     && left?.filesRootId === right?.filesRootId;
 }

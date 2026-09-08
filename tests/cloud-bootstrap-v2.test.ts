@@ -249,6 +249,60 @@ describe("CloudBootstrapV2 publication", () => {
     });
     expect(envelope(2).meta.commitSeq).toBe(2);
   });
+
+  it("accepts a cloud bootstrap whose 16-hex drive ID differs only by case (invalid-current regression)", async () => {
+    // Real-world shape from 焦应行的笔记本 (B3 probe 2026-09-08): the cloud
+    // object persisted the Personal drive ID in lowercase while the committed
+    // envelope keeps Graph's uppercase form. sameSyncScope must treat the
+    // 16-hex Personal drive IDs as equal; before the fix every round ended in
+    // "dirty: invalid-current" with no self-healing.
+    const env = envelope(1);
+    const cloudScope = {
+      ...env.scope,
+      driveId: env.scope.driveId.toLowerCase(),
+    };
+    const prior: CloudBootstrapObjectV2 = {
+      id: "bootstrap",
+      eTag: "etag-1",
+      content: JSON.stringify({
+        schemaVersion: 2,
+        scope: cloudScope,
+        revision: 1,
+        sourceCommitSeq: 1,
+        generatedAt: 100,
+        anchors: [{
+          remoteId: "file",
+          lastPath: "a.md",
+          contentHash: hash,
+          size: 4,
+          remoteCTag: "c1",
+          remoteETag: "e1",
+        }],
+      }),
+    };
+    const { transport, spies, current } = makeTransport(prior);
+
+    // The scope now matches (narrow Personal drive-ID compatibility), so the
+    // stale cloud object is rebuilt from the current envelope through the CAS
+    // update path — the natural self-healing that invalid-current previously
+    // blocked before the sameSyncScope fix.
+    await expect(publishCloudBootstrapV2(transport, env, healthy, 200)).resolves.toMatchObject({
+      published: true,
+      dirty: false,
+      revision: 2,
+    });
+    expect(spies.read).toHaveBeenCalledTimes(1);
+    expect(spies.updateCas).toHaveBeenCalledWith(
+      "bootstrap",
+      "etag-1",
+      expect.stringContaining('"revision":2'),
+    );
+    expect(JSON.parse(current()!.content)).toMatchObject({
+      schemaVersion: 2,
+      scope: env.scope,
+      revision: 2,
+    });
+  });
 });
 
 describe("CloudBootstrapV2 verification", () => {

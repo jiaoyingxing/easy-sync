@@ -3,6 +3,13 @@
  * Subset focused on App Folder file operations for MVP.
  */
 
+/** Identity set: user, application, or device that performed an action. */
+export interface IdentitySet {
+  user?: { id?: string; displayName?: string };
+  application?: { id?: string; displayName?: string };
+  device?: { id?: string; displayName?: string };
+}
+
 /** OneDrive driveItem (file or folder metadata) */
 export interface DriveItem {
   id: string;
@@ -24,6 +31,10 @@ export interface DriveItem {
   };
   lastModifiedDateTime?: string;
   createdDateTime?: string;
+  /** Identity that last modified the item (user, app, or device). Server-authoritative. */
+  lastModifiedBy?: IdentitySet;
+  /** Identity that created the item. */
+  createdBy?: IdentitySet;
   eTag?: string;
   cTag?: string;
   /** App Folder special folder marker */

@@ -2042,6 +2042,100 @@ describe("community plugin enablement runtime", () => {
     expect(new TextDecoder().decode(memory.binary.get(mainPath))).toBe("current-main");
   });
 
+  it("batches one URL refresh for the downgrade-probe manifest probes before downloading them", async () => {
+    // Knife-① (2026-09-08): the community-plugin downgrade guard probes the
+    // remote manifest.json of every bundle the plan wants to download. Those
+    // probes used to pay one per-file `downloadUrlRefresh` metadata round trip
+    // each (the guard runs before the Step-3b universal refresh). With the
+    // batch-capable client the probes must share a single $batch refresh and
+    // every probe download must carry the refreshed URL.
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const localManifest = JSON.stringify({
+      id: "calendar",
+      version: "2.0.0",
+      minAppVersion: "1.5.0",
+    });
+    const remoteManifestBytes = bytes(JSON.stringify({
+      id: "calendar",
+      version: "1.9.0",
+      minAppVersion: "1.5.0",
+    }));
+    const remoteMainBytes = bytes("older-main");
+    const remoteManifest = await remoteEntry(manifestPath, remoteManifestBytes);
+    const remoteMain = await remoteEntry(mainPath, remoteMainBytes);
+    const memory = makeMemoryAdapter({
+      [manifestPath]: localManifest,
+      [mainPath]: bytes("current-main"),
+    });
+    const localManifestEntry = await localEntry(manifestPath, bytes(localManifest));
+    const localMainEntry = await localEntry(mainPath, bytes("current-main"));
+    const state = makeState(
+      [remoteManifest, remoteMain],
+      [
+        {
+          path: manifestPath,
+          size: localManifestEntry.size,
+          hash: localManifestEntry.hash,
+          eTag: "etag:base:manifest",
+        },
+        {
+          path: mainPath,
+          size: localMainEntry.size,
+          hash: localMainEntry.hash,
+          eTag: "etag:base:main",
+        },
+      ],
+    );
+    const downloadFile = vi.fn(async (
+      _vaultName: string,
+      path: string,
+    ) => path === manifestPath ? remoteManifestBytes : remoteMainBytes);
+    const refreshedUrl = "https://dl.example/refreshed-manifest";
+    const refreshedIds: string[] = [];
+    const getDriveItemMetadataByIds = vi.fn(async (ids: string[]) => {
+      refreshedIds.push(...ids);
+      return new Map(ids.map((id) => [
+        id,
+        id === remoteManifest.driveId
+          ? {
+              id,
+              eTag: remoteManifest.eTag,
+              "@microsoft.graph.downloadUrl": refreshedUrl,
+            }
+          : null,
+      ]));
+    });
+    const { executor } = makeExecutor({
+      localEntries: [localManifestEntry, localMainEntry],
+      remoteEntries: [remoteManifest, remoteMain],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, {
+        downloadFile,
+        getDriveItemMetadataByIds,
+      }),
+    });
+
+    const result = await executor.run("manual");
+
+    // Still deferred to review (guard behavior unchanged)…
+    expect(result.errors).toBe(0);
+    expect(state.pendingConflicts.some((item) =>
+      item.path === manifestPath
+      && item.reason === "reason.pluginDowngradeRemote",
+    )).toBe(true);
+    // …but the probe manifest was downloaded through the refreshed URL and
+    // the refresh was one batched call, not a per-probe waterfall.
+    expect(refreshedIds).toContain(remoteManifest.driveId);
+    expect(getDriveItemMetadataByIds).toHaveBeenCalledTimes(1);
+    const manifestDownload = downloadFile.mock.calls.find(
+      (call) => call[1] === manifestPath,
+    );
+    expect(manifestDownload?.[2]).toBe(refreshedUrl);
+  });
+
 
   it("keeps a downgrade-review pending row alive while the plan still downloads that bundle", async () => {
     const manifestPath = ".obsidian/plugins/calendar/manifest.json";
@@ -3194,6 +3288,70 @@ describe("community plugin enablement runtime", () => {
       && item.reason === "reason.pluginDowngradeRemote",
     )).toBe(true);
     expect(uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("reports the deferred plugin id on the run result for the one-shot notice", async () => {
+    const manifestPath = ".obsidian/plugins/calendar/manifest.json";
+    const mainPath = ".obsidian/plugins/calendar/main.js";
+    const localManifestText = JSON.stringify({
+      id: "calendar",
+      version: "1.9.0",
+      minAppVersion: "1.5.0",
+    });
+    const remoteManifestBytes = bytes(JSON.stringify({
+      id: "calendar",
+      version: "2.0.0",
+      minAppVersion: "1.5.0",
+    }));
+    const remoteMainBytes = bytes("newer-main");
+    const localManifest = await localEntry(manifestPath, bytes(localManifestText));
+    const localMain = await localEntry(mainPath, bytes("older-main"));
+    const remoteManifest = await remoteEntry(manifestPath, remoteManifestBytes);
+    const remoteMain = await remoteEntry(mainPath, remoteMainBytes);
+    const memory = makeMemoryAdapter({
+      [manifestPath]: localManifestText,
+      [mainPath]: bytes("older-main"),
+    });
+    const state = makeState(
+      [remoteManifest, remoteMain],
+      [
+        {
+          path: manifestPath,
+          size: remoteManifest.size,
+          hash: remoteManifest.sha256Hash!,
+          eTag: remoteManifest.eTag,
+        },
+        {
+          path: mainPath,
+          size: remoteMain.size,
+          hash: remoteMain.sha256Hash!,
+          eTag: remoteMain.eTag,
+        },
+      ],
+    );
+    const downloadFile = vi.fn(async (
+      _vaultName: string,
+      path: string,
+    ) => path === manifestPath ? remoteManifestBytes : remoteMainBytes);
+    const uploadFile = vi.fn();
+    const { executor } = makeExecutor({
+      localEntries: [localManifest, localMain],
+      remoteEntries: [remoteManifest, remoteMain],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      oneDrive: makeOneDrive(null, { downloadFile, uploadFile }),
+    });
+
+    const result = await executor.run("manual");
+
+    // A1: the deferred bundle must surface on the result (deduplicated) so
+    // Main can raise a one-shot notice instead of repeating every round.
+    expect(result.communityPluginUploadDowngradesDeferred).toEqual(["calendar"]);
+    expect(state.pendingConflicts.some((item) =>
+      item.path === manifestPath
+      && item.reason === "reason.pluginDowngradeRemote",
+    )).toBe(true);
   });
 
   it("keeps an upload-downgrade pending row and its decision token stable across rounds", async () => {

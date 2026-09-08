@@ -279,6 +279,7 @@ export interface LocaleStrings {
   "syncView.staleIdentity.fileMessage": string;
   "syncView.staleIdentity.folderMessage": string;
   "syncView.staleIdentity.confirm": string;
+  "syncView.staleIdentity.activeForgetMessage": string;
   "syncView.mutationResolution.title": string;
   "syncView.mutationResolution.description": string;
   "syncView.mutationResolution.previousAction": string;
@@ -354,6 +355,11 @@ export interface LocaleStrings {
   "result.remoteDeletesPending": string;
   "result.conflictsAndRemoteDeletesPending": string;
   "result.deferred": string;
+  /** Whole-round folder-plan rejections: never a file deferral. */
+  "result.folderNameClash": string;
+  "result.folderListIncomplete": string;
+  "result.syncStateNotReady": string;
+  "result.cloudRecordIncomplete": string;
   "result.skipped": string;
   "result.authExpired": string;
   "result.syncFailed": string;
@@ -381,6 +387,7 @@ export interface LocaleStrings {
   "notice.communityPlugins.cloudCleanupFailed": string;
   "notice.communityPlugins.cloudCleanupBlocked": string;
   "notice.communityPlugins.cloudResurrected": string;
+  "notice.communityPlugins.uploadDowngradeDeferred": string;
   "notice.communityPlugins.remoteCatalogFailed": string;
   "notice.communityPlugins.enablementRetired": string;
   "notice.communityPlugins.enableFilesFirst": string;

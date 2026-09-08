@@ -685,6 +685,33 @@ describe("buildSyncViewContentKey", () => {
     expect(actionable).toContain("unanchored-shared-folder");
   });
 
+  it("rebuilds an active-forget folder row for explicit untracking", () => {
+    const legacy = buildSyncViewContentKey(false, {
+      ...baseInput,
+      bodyMode: "pending",
+      pendingIssues: [{
+        path: "Notes",
+        actionType: SyncActionType.FolderDeferred,
+        reason: "rename evidence conflicts",
+        updatedAt: 1,
+      }],
+    });
+    const actionable = buildSyncViewContentKey(false, {
+      ...baseInput,
+      bodyMode: "pending",
+      pendingIssues: [{
+        path: "Notes",
+        actionType: SyncActionType.FolderDeferred,
+        issueCode: "local-rename-evidence-conflict",
+        reason: "rename evidence conflicts",
+        updatedAt: 1,
+      }],
+    });
+
+    expect(actionable).not.toBe(legacy);
+    expect(actionable).toContain("local-rename-evidence-conflict");
+  });
+
   it("changes when auth initialization finishes so the action button can rebuild", () => {
     const initializing = buildSyncViewContentKey(false, {
       ...baseInput,

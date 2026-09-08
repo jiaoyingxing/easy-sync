@@ -21,11 +21,17 @@ import {
 
 export type StaleIdentityIssueCodeV1 =
   | "identity-replacement-ambiguous"
-  | "anchored-folder-missing-remote";
+  | "anchored-folder-missing-remote"
+  | "local-rename-evidence-conflict"
+  | "local-subtree-changed"
+  | "remote-subtree-changed"
+  | "target-occupied"
+  | "parent-chain-incomplete";
 
 export type StaleIdentityResolutionKindV1 =
   | "file-replacement"
-  | "folder-missing-remote";
+  | "folder-missing-remote"
+  | "folder-active-forget";
 
 export type StaleIdentityRemoteFactV1 =
   | {
@@ -178,6 +184,18 @@ export function buildStaleIdentityResolutionSnapshotV1(
     });
   }
 
+  if (isFolderActiveForgetIssueCode(issueCode)) {
+    const snapshot = buildFolderActiveForgetSnapshotV1(
+      path,
+      issueCode,
+      candidate,
+      facts.envelope,
+      statePaths,
+    );
+    if (snapshot) return snapshot;
+    return null;
+  }
+
   const deferred = candidate.items.filter((item) =>
     item.type === SyncActionType.FolderDeferred
       && item.path === path
@@ -243,6 +261,106 @@ export function buildStaleIdentityResolutionSnapshotV1(
 }
 
 /**
+ * Folder-planner conflicts where the anchored remote folder is STILL PRESENT
+ * but the tracking relationship is what the user wants to forget ("无法唯一
+ * 确认改名" and its sibling shapes). Forgetting removes local anchors only;
+ * the remote node stays in the remote index and the next ordinary plan re-meets
+ * the folder as an unanchored remote folder (create-local when no local folder
+ * occupies the name; unanchored-shared-folder review when one does).
+ */
+const FOLDER_ACTIVE_FORGET_ISSUE_CODES: ReadonlySet<StaleIdentityIssueCodeV1> =
+  new Set([
+    "local-rename-evidence-conflict",
+    "local-subtree-changed",
+    "remote-subtree-changed",
+    "target-occupied",
+    "parent-chain-incomplete",
+  ]);
+
+const FOLDER_ACTIVE_FORGET_REASONS: ReadonlySet<string> = new Set([
+  "reason.folder.local-rename-evidence-conflict",
+  "reason.folder.local-subtree-changed",
+  "reason.folder.remote-subtree-changed",
+  "reason.folder.target-occupied",
+  "reason.folder.parent-chain-incomplete",
+]);
+
+function isFolderActiveForgetIssueCode(
+  issueCode: StaleIdentityIssueCodeV1,
+): boolean {
+  return FOLDER_ACTIVE_FORGET_ISSUE_CODES.has(issueCode);
+}
+
+function buildFolderActiveForgetSnapshotV1(
+  path: string,
+  issueCode: StaleIdentityIssueCodeV1,
+  candidate: Exclude<
+    ReturnType<typeof buildCanonicalPlanCandidateV2>,
+    { status: "rejected" }
+  >,
+  envelope: SyncStateEnvelopeV2,
+  statePaths: ReadonlyMap<string, string>,
+): StaleIdentityResolutionSnapshotV1 | null {
+  const reason = [...FOLDER_ACTIVE_FORGET_REASONS].find((r) =>
+    r.endsWith(`.${issueCode}`));
+  if (!reason) return null;
+  const deferred = candidate.items.filter((item) =>
+    item.type === SyncActionType.FolderDeferred
+      && item.path === path
+      && item.reason === reason,
+  );
+  if (deferred.length !== 1) return null;
+
+  const selectedFolderAnchor = Object.values(envelope.folderAnchors!.byAnchorId)
+    .find((anchor) => samePath(anchor.lastPath, path));
+  if (!selectedFolderAnchor?.remoteId) return null;
+  // Active-forget only applies while the remote folder is still present; once
+  // it disappears this becomes the stale-lineage (folder-missing-remote) shape.
+  if (envelope.remoteIndex.itemsById[selectedFolderAnchor.remoteId] === undefined) {
+    return null;
+  }
+
+  const folderAnchors = Object.values(envelope.folderAnchors!.byAnchorId)
+    .filter((anchor) => isAtOrBelow(anchor.lastPath, path))
+    .sort(compareAnchorId)
+    .map((anchor) => structuredClone(anchor));
+  if (!folderAnchors.some((anchor) =>
+    anchor.remoteId === selectedFolderAnchor.remoteId)) return null;
+  const fileAnchors = Object.values(envelope.anchors.byAnchorId)
+    .filter((anchor) => isAtOrBelow(anchor.lastPath, path))
+    .sort(compareAnchorId)
+    .map((anchor) => structuredClone(anchor));
+  if (fileAnchors.some((anchor) => !anchor.remoteId)) return null;
+  const relatedPaths = uniqueSorted(
+    folderAnchors
+      .filter((anchor) => !samePath(anchor.lastPath, path))
+      .map((anchor) => anchor.lastPath)
+      .concat(fileAnchors.map((anchor) => anchor.lastPath)),
+  );
+  return finalizeSnapshot({
+    version: 1,
+    kind: "folder-active-forget",
+    path,
+    relatedPaths,
+    scope: { ...envelope.scope },
+    sourceCommitSeq: envelope.meta.commitSeq,
+    sourceLifecycleEpoch: envelope.meta.lifecycleEpoch,
+    fileAnchors,
+    folderAnchors,
+    primaryRemote: remoteFactForId(
+      envelope,
+      statePaths,
+      selectedFolderAnchor.remoteId,
+    ),
+    pathFacts: pathFactsFor(
+      envelope,
+      statePaths,
+      [path, ...relatedPaths],
+    ),
+  });
+}
+
+/**
  * Pure CAS-style reducer for the state-only retirement. It accepts only the
  * exact reviewed envelope revision, anchors, and remote identity projection.
  */
@@ -286,6 +404,22 @@ export function retireReviewedStaleIdentityV2(
       || currentFileAnchors[0].lastPath !== reviewed.path
       || !currentFileAnchors[0].remoteId
       || currentFileAnchors[0].remoteId !== reviewed.primaryRemote.remoteId
+    ) return reject("review-changed");
+  } else if (reviewed.kind === "folder-active-forget") {
+    // The user explicitly forgets a tracking relationship whose remote object
+    // is still present. The primary remote must still exist (that is what
+    // distinguishes this shape from folder-missing-remote), and the reviewed
+    // anchors must exactly match the current folder subtree.
+    const selected = currentFolderAnchors.find((anchor) =>
+      anchor.remoteId === reviewed.primaryRemote.remoteId
+        && samePath(anchor.lastPath, reviewed.path));
+    if (
+      !selected
+      || envelope.remoteIndex.itemsById[selected.remoteId] === undefined
+      || currentFolderAnchors.some((anchor) =>
+        !isAtOrBelow(anchor.lastPath, reviewed.path))
+      || currentFileAnchors.some((anchor) =>
+        !isAtOrBelow(anchor.lastPath, reviewed.path) || !anchor.remoteId)
     ) return reject("review-changed");
   } else {
     const selected = currentFolderAnchors.find((anchor) =>

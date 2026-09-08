@@ -1,5 +1,6 @@
 export const ADAPTIVE_DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024;
 export const ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY = 3;
+export const MOBILE_DOWNLOAD_MAX_CONCURRENCY = 2;
 
 const MIN_HEALTHY_BATCH_BYTES = 128 * 1024;
 const MIN_HEALTHY_THROUGHPUT_BPS = 512 * 1024;
@@ -24,6 +25,12 @@ export class DownloadConcurrencyPolicy {
   private peakThroughputBps = 0;
   private lockedSerial = false;
   private concurrency = 1;
+
+  /** Platform ceiling: desktop adapts 1 → 2 → 3; mobile is capped at 2
+   *  (A2 mobile read-only prefetch — memory bound 2 × ≤8 MiB in flight). */
+  constructor(
+    private readonly maxConcurrency = ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY,
+  ) {}
 
   get limit(): number {
     return this.concurrency;
@@ -63,9 +70,9 @@ export class DownloadConcurrencyPolicy {
     this.peakThroughputBps = Math.max(this.peakThroughputBps, throughputBps);
     this.stableBatches++;
     if (this.stableBatches >= 4) {
-      this.concurrency = ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY;
+      this.concurrency = this.maxConcurrency;
     } else if (this.stableBatches >= 2) {
-      this.concurrency = 2;
+      this.concurrency = Math.min(2, this.maxConcurrency);
     }
   }
 

@@ -84,6 +84,25 @@ const RETRY_JITTER_MS = 250;
  *  full identity rebuilds). Server-issued @odata.deltaLink/nextLink URLs are
  *  never modified. */
 const DELTA_PAGE_SIZE_TOP = 1000;
+/** Selected fields for delta responses — includes every DriveItem property the
+ *  sync engine consumes plus `lastModifiedBy`/`createdBy`. Note: the recovery-
+ *  layer T2 convergence model that motivated these two fields was reverted to
+ *  fail-closed (2026-09-07, commit b1ec1d85); the fields are retained as
+ *  plan-layer input (see DECISIONS 2026-09-07), not consumed at runtime.
+ *  When `$select` is present the server returns *only* the listed properties,
+ *  so this must stay in sync with the {@link DriveItem} interface and all
+ *  consumer sites. */
+const DELTA_SELECT = [
+  "id","name","size",
+  "file","folder",
+  "parentReference",
+  "lastModifiedDateTime","createdDateTime",
+  "lastModifiedBy","createdBy",
+  "eTag","cTag",
+  "@microsoft.graph.downloadUrl",
+  "deleted",
+  "specialFolder",
+].join(",");
 const DOWNLOAD_BASE_TIMEOUT_MS = 30_000;  // 30s base — covers slow/unstable connections
 const DOWNLOAD_PER_MIB_TIMEOUT_MS = 3_000;  // 3s/MiB — slower connections need more headroom
 const DOWNLOAD_MAX_TIMEOUT_MS = 300_000; // 5min hard cap — slow connections may need minutes, not seconds
@@ -155,6 +174,7 @@ export type OneDriveAttemptStatusCategory =
 export type OneDriveMetadataReason =
   | "downloadUrlRefresh"
   | "downloadVersionVerify"
+  | "contentVerificationRefresh"
   | "other";
 
 export interface OneDriveMetadataReasonRunMetrics {
@@ -2546,7 +2566,7 @@ export class OneDriveClient {
 
   /** Recursively list all files in a directory and its subdirectories. */
   private async listRecursive(dirPath: string): Promise<DriveItem[]> {
-    const apiPath = `${dirPath}:/children`;
+    const apiPath = `${dirPath}:/children?$select=${DELTA_SELECT}`;
     const result: DriveItem[] = [];
     let url: string | null = apiPath;
 
@@ -2608,7 +2628,7 @@ export class OneDriveClient {
   /** First-page URL for a self-constructed delta endpoint. Continuation URLs
    *  returned by the server (nextLink/deltaLink) are never rewritten. */
   private deltaInitialUrl(path: string): string {
-    return `${path}?$top=${DELTA_PAGE_SIZE_TOP}`;
+    return `${path}?$top=${DELTA_PAGE_SIZE_TOP}&$select=${DELTA_SELECT}`;
   }
 
   private async collectDelta(initialUrl: string): Promise<DeltaResponse> {

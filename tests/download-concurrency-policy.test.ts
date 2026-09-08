@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { DownloadConcurrencyPolicy } from "../src/sync/download-concurrency-policy";
+import {
+  ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY,
+  DownloadConcurrencyPolicy,
+  MOBILE_DOWNLOAD_MAX_CONCURRENCY,
+} from "../src/sync/download-concurrency-policy";
 
 function healthyBatch(files = 1, elapsedMs = 100) {
   return {
@@ -24,6 +28,24 @@ describe("DownloadConcurrencyPolicy", () => {
     expect(policy.limit).toBe(2);
     policy.observeBatch(healthyBatch(2));
     expect(policy.limit).toBe(3);
+  });
+
+  it("caps a mobile-bound policy at two (A2) while desktop still reaches three", () => {
+    const mobile = new DownloadConcurrencyPolicy(
+      MOBILE_DOWNLOAD_MAX_CONCURRENCY,
+    );
+    for (let index = 0; index < 6; index++) {
+      mobile.observeBatch(healthyBatch(2));
+    }
+    expect(mobile.limit).toBe(MOBILE_DOWNLOAD_MAX_CONCURRENCY);
+
+    const desktop = new DownloadConcurrencyPolicy(
+      ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY,
+    );
+    for (let index = 0; index < 6; index++) {
+      desktop.observeBatch(healthyBatch(2));
+    }
+    expect(desktop.limit).toBe(ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY);
   });
 
   it.each([

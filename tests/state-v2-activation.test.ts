@@ -469,6 +469,7 @@ function makeHarness(input?: {
   remoteFileContents?: Record<string, string>;
   pluginData?: Record<string, unknown>;
   folderScanComplete?: boolean;
+  folderScanFailures?: string[];
   enableCloudBootstrap?: boolean;
   createPublic113IndexedDbCandidateStore?:
     Public113IndexedDbCandidateStoreFactory;
@@ -887,7 +888,7 @@ function makeHarness(input?: {
         .sort()
         .map((path) => ({ path })),
       folderScanComplete: input?.folderScanComplete ?? true,
-      folderScanFailures: [],
+      folderScanFailures: input?.folderScanFailures ?? [],
       skippedLarge: [],
       failedPaths: [],
       skippedCount: 0,
@@ -7778,7 +7779,8 @@ describe("V1 to V2 controlled production activation", () => {
 
     expect(result).toMatchObject({
       success: false,
-      deferred: 1,
+      deferred: 0,
+      message: "result.syncStateNotReady",
       uploaded: 0,
       downloaded: 0,
       deleted: 0,
@@ -13898,7 +13900,8 @@ describe("V1 to V2 controlled production activation", () => {
     const blocked = await restartedExecutor.run("manual");
     expect(blocked).toMatchObject({
       success: false,
-      deferred: 1,
+      deferred: 0,
+      message: "result.cloudRecordIncomplete",
       uploaded: 0,
       downloaded: 0,
       deleted: 0,
@@ -15655,7 +15658,11 @@ describe("V1 to V2 controlled production activation", () => {
     });
     const stopped = await harness.executor.run("manual");
 
-    expect(stopped.deferred).toBeGreaterThan(0);
+    expect(stopped).toMatchObject({
+      deferred: 0,
+      success: false,
+      message: "result.folderNameClash",
+    });
     expect(harness.state.activeSyncScopeExpansion).not.toBeNull();
     expect(
       Object.values(
@@ -20781,7 +20788,14 @@ describe("V1 to V2 controlled production activation", () => {
   });
 
   it("does not activate from an incomplete local folder topology", async () => {
-    const harness = makeHarness({ folderScanComplete: false });
+    // Real-device shape: two vault folders whose names differ only by case
+    // (e.g. TOOLS and tools on iOS). The scan reports them as normalized
+    // path conflicts, activation stays fail-closed, and the history message
+    // names the clash instead of pretending files were deferred.
+    const harness = makeHarness({
+      folderScanComplete: false,
+      folderScanFailures: ["TOOLS", "tools"],
+    });
     await harness.state.load();
 
     const result = await harness.executor.run(
@@ -20793,8 +20807,8 @@ describe("V1 to V2 controlled production activation", () => {
     );
 
     expect(result.success).toBe(false);
-    expect(result.deferred).toBe(1);
-    expect(result.message).toBe("result.deferred");
+    expect(result.deferred).toBe(0);
+    expect(result.message).toBe("result.folderNameClash");
     expect(harness.state.isV2StateActive).toBe(false);
     expect(harness.files.has(paths.stateV2ManifestFile)).toBe(false);
     expect(harness.files.has(paths.stateV2File)).toBe(false);
