@@ -262,3 +262,33 @@ EasySync 是跨设备文件同步工具，不是多人实时协作系统。
 ## 9. 许可
 
 EasySync 采用 [MIT License](LICENSE) 开源。
+
+---
+
+## EasySync in English
+
+EasySync keeps your Obsidian vault in sync across your computer, phone, and tablet, using your own OneDrive account. One-sided changes, identical content, and non-overlapping text edits are handled automatically; other conflicts are shown for you to compare and decide.
+
+### Installation
+
+In Obsidian, open **Settings → Community plugins → Browse → Search for “EasySync” → Install and enable**.
+
+EasySync requires Obsidian `1.11.4` or later.
+
+For manual installation, download `main.js`, `manifest.json`, and `styles.css` from [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) and place them in:
+
+```text
+<your-vault>/.obsidian/plugins/easy-sync/
+```
+
+Then enable EasySync in Obsidian.
+
+### First sync
+
+1. Keep the vault in a normal local folder — do not put it inside a OneDrive, iCloud, or other cloud-sync directory, since EasySync itself is the sync tool.
+2. Use the same vault name on every device: EasySync identifies the cloud sync space by the vault name.
+3. Open **Obsidian Settings → EasySync → Log in with OneDrive** and complete the Microsoft sign-in (on mobile, return to Obsidian when prompted).
+4. On the device with the most complete content, click **Sync now**, review the sync plan, and confirm it.
+5. After the first device finishes, open the same vault on your other devices, install and sign in to EasySync, and click **Sync now** again.
+
+The first sync scans your files and builds a shared baseline, so it can take noticeably longer than later syncs. For migration guides, recommended settings, sync scope, conflict handling, and data & permissions details, see the [full English README](./README-en.md). Released under the [MIT License](LICENSE).
