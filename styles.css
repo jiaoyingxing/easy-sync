@@ -1442,3 +1442,8 @@ body.is-mobile .easy-sync-device-actions button {
 .easy-sync-plugin-cloud-cleanup-trigger {
   color: var(--text-error);
 }
+
+/* Undo affordance for a queued manager toggle (2026-09-09 反悔拍板). */
+.easy-sync-plugin-queued-cancel {
+  color: var(--text-muted);
+}

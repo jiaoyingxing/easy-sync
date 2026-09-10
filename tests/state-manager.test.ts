@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { StateManager, type PluginDataStore } from "../src/sync/state-manager";
+import {
+  createEmptyCommunityPluginAdoptionMemory,
+  reduceCommunityPluginAdoptionMemory,
+} from "../src/sync/community-plugin-adoption-memory";
 import { SyncActionType } from "../src/sync/types";
 import { createCommunityPluginManifestObservation } from "../src/sync/community-plugin-bundle";
 import { buildRemoteCommunityPluginCatalog } from "../src/sync/community-plugin-remote-catalog";
@@ -249,6 +253,48 @@ describe("StateManager batch persistence", () => {
     expect(saveData).toHaveBeenCalledWith(expect.objectContaining({
       "community-plugin-manifest-observations": [observation],
     }));
+  });
+
+  it("owns the device-local community-plugin adoption memory and degrades corrupt records to empty", async () => {
+    const { state, plugin, saveData } = makeState();
+    await state.load();
+    expect(state.getCommunityPluginAdoptionMemory()).toEqual({
+      schemaVersion: 1,
+      kind: "community-plugin-adoption-memory",
+      ignoredPluginIds: [],
+      pendingPluginIds: [],
+    });
+
+    const next = reduceCommunityPluginAdoptionMemory(
+      createEmptyCommunityPluginAdoptionMemory(),
+      { type: "ignore", pluginId: "plugin-a" },
+    );
+    await state.updateCommunityPluginAdoptionMemory(next);
+    await state.updateCommunityPluginAdoptionMemory(next);
+    expect(saveData).toHaveBeenCalledTimes(1);
+    expect(saveData).toHaveBeenCalledWith(expect.objectContaining({
+      "community-plugin-adoption-memory": next,
+    }));
+    expect(state.getCommunityPluginAdoptionMemory()).toEqual(next);
+
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "community-plugin-adoption-memory": next,
+    });
+    const validReopen = new StateManager(plugin);
+    await validReopen.load();
+    expect(validReopen.getCommunityPluginAdoptionMemory()).toEqual(next);
+
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "community-plugin-adoption-memory": {
+        ...next,
+        ignoredPluginIds: ["plugin-a", "plugin-a"],
+      },
+    });
+    const corruptReopen = new StateManager(plugin);
+    await corruptReopen.load();
+    expect(corruptReopen.getCommunityPluginAdoptionMemory()).toEqual(
+      createEmptyCommunityPluginAdoptionMemory(),
+    );
   });
 
   it("commits sync-path settings with scoped pending state and invalidates the reviewed plan", async () => {

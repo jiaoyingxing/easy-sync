@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   executeCommunityPluginCloudCleanupV1,
   isCommunityPluginCloudCleanupCandidateV1,
+  normalizeCommunityPluginCloudCleanupMarkersV1,
+  planCommunityPluginCloudCleanupMarkerSweepV1,
   planCommunityPluginCloudCleanupV1,
 } from "../src/sync/community-plugin-cloud-cleanup-v1";
 import type { RemoteFileEntry } from "../src/sync/types";
@@ -252,5 +254,56 @@ describe("community plugin cloud cleanup", () => {
       expect(result.reason).toBe("delete-failed");
     }
     expect(result.deleted).toBe(0);
+  });
+});
+
+describe("cloud cleanup markers: normalization and resurrection sweep", () => {
+  it("normalizes duplicate markers to one per plugin, keeping the newest", () => {
+    expect(normalizeCommunityPluginCloudCleanupMarkersV1([
+      { pluginId: "zeta", cleanedAt: 5 },
+      { pluginId: "calendar", cleanedAt: 2 },
+      { pluginId: "calendar", cleanedAt: 1 },
+      { pluginId: "calendar", cleanedAt: 3 },
+      { pluginId: "zeta", cleanedAt: 4 },
+    ])).toEqual([
+      { pluginId: "calendar", cleanedAt: 3 },
+      { pluginId: "zeta", cleanedAt: 5 },
+    ]);
+  });
+
+  it("drops a marker once the plugin's complete bundle reappears, whatever this device remembers", () => {
+    const sweep = planCommunityPluginCloudCleanupMarkerSweepV1({
+      markers: [
+        { pluginId: "calendar", cleanedAt: 1 },
+        { pluginId: "calendar", cleanedAt: 2 },
+        { pluginId: "other", cleanedAt: 3 },
+      ],
+      reappearedPluginIds: ["calendar"],
+    });
+    expect(sweep.resurrectedPluginIds).toEqual(["calendar"]);
+    expect(sweep.remaining).toEqual([{ pluginId: "other", cleanedAt: 3 }]);
+  });
+
+  it("keeps the marker while the bundle is still gone from the cloud", () => {
+    const sweep = planCommunityPluginCloudCleanupMarkerSweepV1({
+      markers: [{ pluginId: "calendar", cleanedAt: 1 }],
+      reappearedPluginIds: [],
+    });
+    expect(sweep.remaining).toEqual([
+      { pluginId: "calendar", cleanedAt: 1 },
+    ]);
+    expect(sweep.resurrectedPluginIds).toEqual([]);
+  });
+
+  it("lists each resurrected plugin once even with duplicate markers", () => {
+    const sweep = planCommunityPluginCloudCleanupMarkerSweepV1({
+      markers: [
+        { pluginId: "calendar", cleanedAt: 1 },
+        { pluginId: "calendar", cleanedAt: 2 },
+      ],
+      reappearedPluginIds: ["calendar"],
+    });
+    expect(sweep.resurrectedPluginIds).toEqual(["calendar"]);
+    expect(sweep.remaining).toEqual([]);
   });
 });

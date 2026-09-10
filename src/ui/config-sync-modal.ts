@@ -8,6 +8,7 @@ import {
 } from "obsidian";
 import {
   SyncPathSettingsUpdateError,
+  type DeferredSettingsMutationHandle,
   type SyncPathSettings,
 } from "../main";
 import type EasySyncPlugin from "../main";
@@ -39,11 +40,12 @@ type PluginColumn = CommunityPluginSelectionColumn;
 
 /**
  * Rows of cloud-cleaned plugins stay hidden from both the files and the data
- * list while this device holds no local plugin files for them (the persisted
- * marker is only dropped by a resurrection notice). Reinstalling the plugin
- * locally (`local: true`) must bring the row back so the user can manage and
- * re-join it — there is no permanent blocklist. Counts derive from the same
- * visible rows, so a cleaned plugin no longer inflates totals.
+ * list while this device holds no local plugin files for them. The persisted
+ * marker is dropped silently by the main side once the plugin's complete
+ * bundle reappears in the cloud (no dedicated notice). Reinstalling the
+ * plugin locally (`local: true`) must bring the row back so the user can
+ * manage and re-join it — there is no permanent blocklist. Counts derive
+ * from the same visible rows, so a cleaned plugin no longer inflates totals.
  */
 export function isPluginRowHiddenByCloudCleanup(
   column: PluginColumn | undefined,
@@ -73,7 +75,6 @@ export class ConfigSyncModal extends EasySyncModal {
   private remoteInventoryAvailable = false;
   private inventoryLoading = false;
   private inventoryLoadFailed = false;
-  private remoteCatalogRefreshFailed = false;
   private searchQuery = "";
   private loadGeneration = 0;
   private destroyed = false;
@@ -90,12 +91,22 @@ export class ConfigSyncModal extends EasySyncModal {
   private busyPluginRows = new Set<string>();
   private confirmingDataRows = new Set<string>();
   private pendingPluginValues = new Map<string, boolean>();
+  private pendingMutationCancels = new Map<
+    string,
+    DeferredSettingsMutationHandle
+  >();
   private cleanedPluginIds = new Set<string>();
   private settingsUpdateQueue = new SequentialSettingsUpdateQueue();
   private unsubscribeCommunityPluginInventoryRevision: (() => void) | null =
     null;
   private inventoryRevisionRefreshRunning = false;
   private inventoryRevisionRefreshPending = false;
+  /**
+   * Set when the remote catalog refresh was skipped because a sync round was
+   * in flight at manager open time. Cleared once a follow-up refresh succeeds
+   * (retried from the next inventory revision, i.e. after that sync ends).
+   */
+  private catalogRefreshSkippedWhileSyncing = false;
 
   constructor(
     private plugin: EasySyncPlugin,
@@ -104,8 +115,8 @@ export class ConfigSyncModal extends EasySyncModal {
   ) {
     super(plugin.app);
     // Persisted cleanup markers keep cleaned rows hidden across modal
-    // reopenings; a resurrection notice drops the marker, and the row (and
-    // the cleanup affordance for it) comes back only then.
+    // reopenings; the main side drops a marker silently when the complete
+    // bundle reappears in the cloud, and the row comes back on its own.
     for (const marker of plugin.getCommunityPluginCloudCleanupMarkers()) {
       this.cleanedPluginIds.add(marker.pluginId);
     }
@@ -113,6 +124,7 @@ export class ConfigSyncModal extends EasySyncModal {
 
   onOpen(): void {
     this.destroyed = false;
+    this.catalogRefreshSkippedWhileSyncing = false;
     this.unsubscribeCommunityPluginInventoryRevision?.();
     this.unsubscribeCommunityPluginInventoryRevision =
       this.plugin.onCommunityPluginInventoryRevision((revision) => {
@@ -137,8 +149,15 @@ export class ConfigSyncModal extends EasySyncModal {
     this.contentEl.empty();
     const onCloseCallback = this.onCloseCallback;
     this.onCloseCallback = undefined;
+    // Batched manager toggles commit through the update queue; one round for
+    // their join requests starts only after the queue has drained.
     if (onCloseCallback) {
-      void this.settingsUpdateQueue.whenIdle().then(onCloseCallback);
+      void this.settingsUpdateQueue.whenIdle().then(() => {
+        this.plugin.flushPendingCommunityPluginJoinSync();
+        onCloseCallback();
+      });
+    } else {
+      this.plugin.flushPendingCommunityPluginJoinSync();
     }
   }
 
@@ -482,17 +501,32 @@ export class ConfigSyncModal extends EasySyncModal {
 
     this.requestCommunityPluginInventoryRefresh();
     if (
-      typeof this.plugin.refreshCommunityPluginRemoteCatalog === "function"
+      this.plugin.syncExecutor?.hasActivityInFlight === true
     ) {
-      void this.plugin.refreshCommunityPluginRemoteCatalog().catch(() => {
-        if (this.destroyed) return;
-        // Inline retry affordance instead of a one-shot blocking Notice: a
-        // transient delta failure must not turn the fine-grained manager into
-        // "reopen to retry the same failing request".
-        this.remoteCatalogRefreshFailed = true;
-        this.renderPluginListArea();
-      });
+      // A sync round is running right now: the catalog refresh would be
+      // skipped silently by the main side. Tell the user once with a Notice
+      // and let the post-sync inventory revision retry automatically.
+      this.catalogRefreshSkippedWhileSyncing = true;
+      new Notice(
+        this.plugin.i18n.t("notice.communityPlugins.catalogWaitingForSync"),
+      );
+      return;
     }
+    this.refreshRemoteCatalogOnce();
+  }
+
+  /**
+   * One best-effort remote catalog refresh on manager open. A failure is
+   * silent here: the main side keeps the last trusted catalog (marking it
+   * stale after repeated failures), and reopening the manager runs this
+   * refresh again.
+   */
+  private refreshRemoteCatalogOnce(): void {
+    if (
+      typeof this.plugin.refreshCommunityPluginRemoteCatalog !== "function"
+    ) return;
+    void this.plugin.refreshCommunityPluginRemoteCatalog()
+      .catch(() => undefined);
   }
 
   private async reloadCommunityPluginManager(
@@ -514,7 +548,6 @@ export class ConfigSyncModal extends EasySyncModal {
       ) return;
       this.inventory = inventory;
       this.remoteInventoryAvailable = remoteInventoryAvailable;
-      this.remoteCatalogRefreshFailed = false;
     } catch {
       if (generation !== this.loadGeneration || this.destroyed) return;
       this.inventoryLoadFailed = true;
@@ -534,6 +567,15 @@ export class ConfigSyncModal extends EasySyncModal {
   private handleCommunityPluginInventoryRevision(_revision: number): void {
     if (this.destroyed) return;
     this.requestCommunityPluginInventoryRefresh();
+    if (
+      this.catalogRefreshSkippedWhileSyncing
+      && this.plugin.syncExecutor?.hasActivityInFlight !== true
+    ) {
+      // The sync round that skipped our refresh has ended (its final inventory
+      // revision just arrived): retry the refresh once and clear the marker.
+      this.catalogRefreshSkippedWhileSyncing = false;
+      this.refreshRemoteCatalogOnce();
+    }
   }
 
   private requestCommunityPluginInventoryRefresh(): void {
@@ -664,25 +706,6 @@ export class ConfigSyncModal extends EasySyncModal {
       });
     }
 
-    if (this.remoteCatalogRefreshFailed) {
-      const row = this.listScrollEl.createDiv(
-        "setting-item-description easy-sync-plugin-list-guidance",
-      );
-      row.setText(t("notice.communityPlugins.remoteCatalogFailed"));
-      new ButtonComponent(row)
-        .setButtonText(t("settings.communityPlugins.retry"))
-        .onClick(() => {
-          if (this.destroyed) return;
-          this.remoteCatalogRefreshFailed = false;
-          this.renderPluginListArea();
-          void this.plugin.refreshCommunityPluginRemoteCatalog().catch(() => {
-            if (this.destroyed) return;
-            this.remoteCatalogRefreshFailed = true;
-            this.renderPluginListArea();
-          });
-        });
-    }
-
     for (const item of visibleItems) {
       this.renderPluginRow(item, column);
     }
@@ -704,21 +727,53 @@ export class ConfigSyncModal extends EasySyncModal {
       cls: "easy-sync-plugin-name",
       text: displayName,
     });
-    const status = this.describeInventoryItem(item, column);
+    const rowKey = this.getRowKey(column, item.id);
+    const busy = this.busyPluginRows.has(rowKey)
+      || this.confirmingDataRows.has(item.id);
+    const queuedHandle = column === "files" && this.busyPluginRows.has(rowKey)
+      ? this.pendingMutationCancels.get(rowKey)
+      : undefined;
+    // Only a mutation actually waiting for sync to go idle renders the queued
+    // affordance — the idle fast path applies immediately and must not flash
+    // it (2026-09-09 用户反馈).
+    const queued = queuedHandle?.isQueued() === true;
+    const scopeDisabled = !this.getCommunityPluginScopeEnabled(column)
+      || (column === "data"
+        && !this.getCommunityPluginScopeEnabled("files"));
+    const pendingValue = this.pendingPluginValues.get(rowKey);
+    const status = queued
+      ? this.plugin.i18n.t("settings.communityPlugins.queuedStatus")
+      : this.describeInventoryItem(item, column);
     if (status) {
       identity.createDiv({
         cls: "easy-sync-plugin-status",
         text: status,
       });
     }
-    const rowKey = this.getRowKey(column, item.id);
-    const busy = this.busyPluginRows.has(rowKey)
-      || this.confirmingDataRows.has(item.id);
-    const scopeDisabled = !this.getCommunityPluginScopeEnabled(column)
-      || (column === "data"
-        && !this.getCommunityPluginScopeEnabled("files"));
-    const pendingValue = this.pendingPluginValues.get(rowKey);
     const toggleCell = row.createDiv("easy-sync-plugin-toggle-cell");
+    if (queued && queuedHandle !== undefined) {
+      const cancelChip = new ExtraButtonComponent(toggleCell)
+        .setIcon("x")
+        .setTooltip(this.plugin.i18n.t(
+          "settings.communityPlugins.queuedCancel.tooltip",
+        ))
+        .onClick(() => {
+          if (!queuedHandle.cancel()) return;
+          this.busyPluginRows.delete(rowKey);
+          this.pendingPluginValues.delete(rowKey);
+          this.pendingMutationCancels.delete(rowKey);
+          if (!this.destroyed) this.renderPluginListArea();
+        });
+      cancelChip.extraSettingsEl.addClass(
+        "easy-sync-plugin-queued-cancel",
+      );
+      cancelChip.extraSettingsEl.setAttribute(
+        "aria-label",
+        this.plugin.i18n.t(
+          "settings.communityPlugins.queuedCancel.tooltip",
+        ),
+      );
+    }
     if (
       column === "files"
       && isCommunityPluginCloudCleanupCandidateV1({
@@ -846,7 +901,11 @@ export class ConfigSyncModal extends EasySyncModal {
         || item.participationPhase === "restoring"
       )
     ) {
-      return t("settings.communityPlugins.status.joinRequested");
+      return t(
+        item.participationPhase === "join-requested"
+          ? "settings.communityPlugins.status.joinRequested"
+          : "settings.communityPlugins.status.restoring",
+      );
     }
     if (column === "files" && item.remoteCatalogStale) {
       return t("settings.communityPlugins.status.remoteCatalogStale");
@@ -866,7 +925,10 @@ export class ConfigSyncModal extends EasySyncModal {
       && item.participationPhase !== "restoring"
       && item.participationPhase !== "blocked"
     ) {
-      return t("settings.communityPlugins.status.unavailable");
+      // A historical hook row without any bundle on either side needs no
+      // status copy — nothing actionable follows from it (2026-09-09 用户
+      // 反馈「无意义」后移除该状态文案)。
+      return null;
     }
     if (
       item.desktopOnly
@@ -946,9 +1008,12 @@ export class ConfigSyncModal extends EasySyncModal {
         this.getRowKey("data", item.id),
         true,
         async () => {
-          await this.plugin.updateCommunityPluginFilesSelection(
-            item.id,
-            true,
+          await this.plugin.runSettingsMutationWhenSyncIdle(() =>
+            this.plugin.updateCommunityPluginFilesSelection(
+              item.id,
+              true,
+              { deferJoinSyncRound: true },
+            ),
           );
           const next = enableCommunityPluginDataWithFiles(
             this.captureSelectionSettings(),
@@ -956,8 +1021,10 @@ export class ConfigSyncModal extends EasySyncModal {
             this.getKnownPluginIds(),
             this.plugin.manifest.id,
           );
-          await this.plugin.updateSyncPathSettings(
-            this.toSyncPathSettingsPatch(next),
+          await this.plugin.runSettingsMutationWhenSyncIdle(() =>
+            this.plugin.updateSyncPathSettings(
+              this.toSyncPathSettingsPatch(next),
+            ),
           );
         },
       );
@@ -1000,14 +1067,30 @@ export class ConfigSyncModal extends EasySyncModal {
   ): void {
     const rowKey = this.getRowKey(column, pluginId);
     if (column === "files") {
-      this.queueSelectionUpdate(
-        rowKey,
-        enabled,
-        () => this.plugin.updateCommunityPluginFilesSelection(
-          pluginId,
-          enabled,
-        ),
+      if (this.busyPluginRows.has(rowKey)) {
+        // A pending row is undone through its cancel chip; the toggle itself
+        // stays disabled until the queued mutation applies or is cancelled.
+        return;
+      }
+      // Create the mutation eagerly so its cancel handle exists at click
+      // time — the settings queue only runs this closure after earlier rows
+      // settle, which must not delay the handle (2026-09-09 反悔拍板).
+      const mutation = this.plugin.runSettingsMutationWhenSyncIdle(
+        () =>
+          this.plugin.updateCommunityPluginFilesSelection(
+            pluginId,
+            enabled,
+            { deferJoinSyncRound: true },
+          ),
       );
+      this.pendingMutationCancels.set(rowKey, mutation);
+      this.queueSelectionUpdate(rowKey, enabled, async () => {
+        try {
+          await mutation;
+        } finally {
+          this.pendingMutationCancels.delete(rowKey);
+        }
+      });
       return;
     }
     this.queueSelectionUpdate(
@@ -1022,8 +1105,10 @@ export class ConfigSyncModal extends EasySyncModal {
           this.getKnownPluginIds(),
           this.plugin.manifest.id,
         );
-        await this.plugin.updateSyncPathSettings(
-          this.toSyncPathSettingsPatch(next),
+        await this.plugin.runSettingsMutationWhenSyncIdle(() =>
+          this.plugin.updateSyncPathSettings(
+            this.toSyncPathSettingsPatch(next),
+          ),
         );
       },
     );

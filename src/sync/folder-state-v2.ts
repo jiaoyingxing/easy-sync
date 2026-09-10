@@ -217,6 +217,9 @@ export function planFolderStateFromViewV2(
   const inferredLocalByRemoteId = new Map<string, string>();
   const localEvidenceConflicts = new Set<string>();
   const localScopeCrossings = new Map<string, string>();
+  /** Anchored folders whose local move evidence lands inside the vault trash:
+   *  the trash move is a deletion gesture, mirrored as delete-remote below. */
+  const localTrashDeletes = new Map<string, string>();
 
   for (const anchor of anchors) {
     const localAtOldPath = localFoldersExact.has(nfcPath(anchor.lastPath))
@@ -247,7 +250,17 @@ export function planFolderStateFromViewV2(
       (path) => !includeFolderPath(path),
     );
     if (scopeCrossingTargets.length > 0) {
-      localScopeCrossings.set(anchor.remoteId, scopeCrossingTargets[0]);
+      if (scopeCrossingTargets.every(isVaultTrashDestinationPath)) {
+        // All observed destinations are inside the vault trash. Deleting into
+        // the Obsidian recycle bin is indistinguishable from a rename at the
+        // event layer, but its semantics are deletion; treat it as such
+        // (delete-remote below) instead of failing closed as a scope crossing.
+        // A non-trash excluded destination (a user archive directory, a scope
+        // that later excluded the old path) stays fail-closed below.
+        localTrashDeletes.set(anchor.remoteId, scopeCrossingTargets[0]);
+      } else {
+        localScopeCrossings.set(anchor.remoteId, scopeCrossingTargets[0]);
+      }
       continue;
     }
     const hintedTargets = new Set(
@@ -288,6 +301,46 @@ export function planFolderStateFromViewV2(
       : undefined;
     const inferredLocalPath = inferredLocalByRemoteId.get(anchor.remoteId);
     if (inferredLocalPath) consumedLocalPaths.add(identityPath(inferredLocalPath));
+
+    const trashDeleteTarget = localTrashDeletes.get(anchor.remoteId);
+    if (trashDeleteTarget !== undefined && remotePath !== undefined) {
+      if (!includeFolderPath(anchor.lastPath)) {
+        // The anchor's old path has since left the sync scope (e.g. a scope
+        // narrowing). Scope narrowing never deletes cloud content, so stay
+        // fail-closed as a scope crossing for the existing review surface.
+        candidates.push(conflictCandidate(
+          anchor.lastPath,
+          "scope-crossing",
+          anchor.remoteId,
+          [
+            { side: "local", root: trashDeleteTarget },
+            { side: "remote", root: remotePath },
+          ],
+          input,
+          remotePathById,
+        ));
+      } else {
+        // Local folder was moved into the vault trash == local deletion.
+        // Mirror it on the remote like the file layer already does; the
+        // deletion chain (If-Match → OneDrive recycle bin → read-back) is the
+        // established safety net. When the remote folder is gone too, fall
+        // through to the ordinary both-sides retirement path below.
+        candidates.push(actionCandidate(
+          "delete-remote",
+          anchor.lastPath,
+          anchor.lastPath,
+          undefined,
+          anchor.remoteId,
+          [
+            { side: "local", root: trashDeleteTarget },
+            { side: "remote", root: remotePath },
+          ],
+          input,
+          remotePathById,
+        ));
+      }
+      continue;
+    }
 
     const localScopeCrossingTarget = localScopeCrossings.get(anchor.remoteId);
     if (localScopeCrossingTarget) {
@@ -1128,6 +1181,15 @@ function comparePlanCandidate(left: FolderPlanItemV2, right: FolderPlanItemV2): 
 function parentPath(path: string): string {
   const index = path.lastIndexOf("/");
   return index < 0 ? "" : path.slice(0, index);
+}
+
+/** Obsidian's fixed vault trash directory (".trash") at any depth.
+ *  The scanner hard-excludes it with the same case-sensitive prefix rule, so a
+ *  path inside it can never be a sync target: moving a folder there is the
+ *  standard delete gesture (the trash move is just a rename at the event
+ *  layer), which the file layer already mirrors as a remote deletion. */
+function isVaultTrashDestinationPath(path: string): boolean {
+  return path === ".trash" || path.startsWith(".trash/");
 }
 
 function relativePath(path: string, root: string): string {

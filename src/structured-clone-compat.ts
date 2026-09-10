@@ -60,7 +60,8 @@ export function installStructuredCloneCompatibility():
   }
   // 兼容垫片写的是语言级内建的“全局注册表”本体：消费方（含 V2 状态机测试）
   // 以 globalThis 可见性为契约。官方 no-global-this 规则面向 UI 对象的弹窗安全，
-  // 与本文件的语义正交；该规则的行内禁用被官方禁止，故此处保留并接受告警。
+  // 与本文件的语义正交；该规则的行内禁用被官方禁止（eslint-comments/no-restricted-disable
+  // 封禁 obsidianmd/* 命名空间，2026-09-08 实测复现），故此处保留并接受告警。
   Object.defineProperty(globalThis, "structuredClone", {
     configurable: true,
     enumerable: false,

@@ -2,12 +2,18 @@ import { describe, expect, it } from "vitest";
 import { createCommunityPluginManifestObservation } from "../src/sync/community-plugin-bundle";
 import {
   buildRemoteCommunityPluginCatalog,
+  buildRemoteCommunityPluginCatalogFromIndex,
   markRemoteCommunityPluginCatalogStale,
+  mergeRemoteCommunityPluginCatalogKeepingSuperset,
   readRemoteCommunityPluginCatalog,
   remoteCommunityPluginCatalogEntries,
   shouldMarkCommunityPluginCatalogStale,
   type RemoteCommunityPluginCatalogV1,
 } from "../src/sync/community-plugin-remote-catalog";
+import {
+  buildRemoteIndexV2,
+  type RemoteIndexV2,
+} from "../src/sync/remote-index-v2";
 import type { DriveItem } from "../src/onedrive/types";
 import type { RemoteFileEntry, SyncScope } from "../src/sync/types";
 
@@ -205,5 +211,250 @@ describe("remote community-plugin catalog", () => {
       ...trusted,
       stale: true,
     }, 1)).toBe(true);
+  });
+
+  describe("committed-index variant", () => {
+    function committedIndex(entries: readonly DriveItem[]): RemoteIndexV2 {
+      return buildRemoteIndexV2(
+        entries as DriveItem[],
+        SCOPE.filesRootId,
+        null,
+      ).index;
+    }
+
+    it("builds the identical catalog from a committed remote index as from its item stream", async () => {
+      const manifestText = JSON.stringify({
+        id: "calendar",
+        name: "Calendar",
+        version: "2.0.0",
+      });
+      const manifestBytes = new TextEncoder().encode(manifestText);
+      const remoteManifest: RemoteFileEntry = {
+        path: ".obsidian/plugins/calendar/manifest.json",
+        driveId: "calendar-manifest",
+        parentId: "calendar-root",
+        size: manifestBytes.byteLength,
+        mtime: Date.parse("2026-08-03T00:00:00.000Z"),
+        eTag: "etag-calendar-manifest",
+        cTag: "ctag-calendar-manifest",
+      };
+      const observation = await createCommunityPluginManifestObservation(
+        SCOPE,
+        "calendar",
+        remoteManifest,
+        manifestBytes.buffer,
+      );
+
+      const streamItems = items(manifestBytes.byteLength);
+      const fromStream = await buildRemoteCommunityPluginCatalog({
+        scope: SCOPE,
+        configDir: ".obsidian",
+        items: streamItems,
+        manifestObservations: [observation],
+        observedAt: 10,
+        previous: null,
+      });
+      // A committed index stores the same facts in a different node order;
+      // the catalog result must stay byte-identical and canonical.
+      const shuffled = [...streamItems].reverse();
+      const fromIndex = await buildRemoteCommunityPluginCatalogFromIndex({
+        scope: SCOPE,
+        configDir: ".obsidian",
+        index: committedIndex(shuffled),
+        manifestObservations: [observation],
+        observedAt: 10,
+        previous: null,
+      });
+
+      expect(fromIndex).toEqual(fromStream);
+      expect(fromIndex.revision).toBe(1);
+      expect(fromIndex.entries[0]).toMatchObject({
+        pluginId: "calendar",
+        bundleState: "complete",
+        manifestName: "Calendar",
+      });
+    });
+
+    it("skips a root node recorded inside the committed index and keeps revision semantics", async () => {
+      const firstItems = items(10);
+      const first = await buildRemoteCommunityPluginCatalogFromIndex({
+        scope: SCOPE,
+        configDir: ".obsidian",
+        index: committedIndex(firstItems),
+        manifestObservations: [],
+        observedAt: 10,
+        previous: null,
+      });
+      const indexWithRoot = committedIndex(firstItems);
+      const withRoot: RemoteIndexV2 = {
+        ...indexWithRoot,
+        itemsById: {
+          ...indexWithRoot.itemsById,
+          [SCOPE.filesRootId]: {
+            id: SCOPE.filesRootId,
+            parentId: "outside-the-scope",
+            name: "files",
+            kind: "folder",
+          },
+        },
+      };
+      const withRootCatalog = await buildRemoteCommunityPluginCatalogFromIndex({
+        scope: SCOPE,
+        configDir: ".obsidian",
+        index: withRoot,
+        manifestObservations: [],
+        observedAt: 20,
+        previous: first,
+      });
+      expect(withRootCatalog.entries).toEqual(first.entries);
+      expect(withRootCatalog.revision).toBe(first.revision);
+    });
+
+    it("rejects an incomplete index or one bound to another files root", async () => {
+      const index = committedIndex(items(10));
+      await expect(buildRemoteCommunityPluginCatalogFromIndex({
+        scope: SCOPE,
+        configDir: ".obsidian",
+        index: { ...index, complete: false } as unknown as RemoteIndexV2,
+        manifestObservations: [],
+        observedAt: 10,
+        previous: null,
+      })).rejects.toThrow("not complete for the scope");
+      await expect(buildRemoteCommunityPluginCatalogFromIndex({
+        scope: SCOPE,
+        configDir: ".obsidian",
+        index: { ...index, filesRootId: "another-root" },
+        manifestObservations: [],
+        observedAt: 10,
+        previous: null,
+      })).rejects.toThrow("not complete for the scope");
+    });
+  });
+
+  describe("round-end superset merge", () => {
+    function catalogFor(
+      ids: readonly string[],
+      previous: RemoteCommunityPluginCatalogV1 | null,
+      observedAt: number,
+    ): Promise<RemoteCommunityPluginCatalogV1> {
+      const stream: DriveItem[] = [
+        folder("config", ".obsidian", SCOPE.filesRootId),
+        folder("plugins", "plugins", "config"),
+      ];
+      for (const id of ids) {
+        const root = `root-${id}`;
+        stream.push(
+          folder(root, id, "plugins"),
+          file(`${id}-main`, "main.js", root),
+          file(`${id}-manifest`, "manifest.json", root),
+        );
+      }
+      return buildRemoteCommunityPluginCatalog({
+        scope: SCOPE,
+        configDir: ".obsidian",
+        items: stream,
+        manifestObservations: [],
+        observedAt,
+        previous,
+        ownPluginId: "easy-sync",
+      });
+    }
+
+    it("keeps delta-fresh entries the committed index no longer sees", async () => {
+      // Delta refresh saw an unanchored cloud bundle (uploaded by another
+      // device): two plugins. The next round-end committed-index build only
+      // sees the anchored one (calendar). The merge must not regress.
+      const deltaFresh = await catalogFor(["calendar", "cloud-only"], null, 10);
+      const indexOnly = await catalogFor(["calendar"], deltaFresh, 20);
+      const merged = await mergeRemoteCommunityPluginCatalogKeepingSuperset(
+        deltaFresh,
+        indexOnly,
+      );
+      expect(merged.entries.map((entry) => entry.pluginId))
+        .toEqual(["calendar", "cloud-only"]);
+      expect(merged.revision).toBeGreaterThan(indexOnly.revision);
+      expect(merged.observedAt).toBe(20);
+      expect(merged.complete).toBe(true);
+      expect(merged.stale).toBe(false);
+      // The merged catalog stays a valid persisted shape.
+      expect(await readRemoteCommunityPluginCatalog(merged)).not.toBeNull();
+    });
+
+    it("returns the fresh build unchanged when it already covers every entry", async () => {
+      const wide = await catalogFor(["calendar", "cloud-only"], null, 10);
+      const fresh = await catalogFor(["calendar", "cloud-only"], wide, 20);
+      const merged = await mergeRemoteCommunityPluginCatalogKeepingSuperset(
+        wide,
+        fresh,
+      );
+      expect(merged).toBe(fresh);
+    });
+
+    it("prefers the fresh build's per-plugin facts over retained entries", async () => {
+      const deltaFresh = await catalogFor(["calendar"], null, 10);
+      const refreshedStream: DriveItem[] = [
+        folder("config", ".obsidian", SCOPE.filesRootId),
+        folder("plugins", "plugins", "config"),
+        folder("calendar-root", "calendar", "plugins"),
+        file("calendar-main", "main.js", "calendar-root"),
+        file("calendar-manifest", "manifest.json", "calendar-root", {
+          size: 999,
+          file: { hashes: {} },
+          eTag: "etag-manifest-v2",
+        }),
+      ];
+      const refreshed = await buildRemoteCommunityPluginCatalog({
+        scope: SCOPE,
+        configDir: ".obsidian",
+        items: refreshedStream,
+        manifestObservations: [],
+        observedAt: 20,
+        previous: deltaFresh,
+        ownPluginId: "easy-sync",
+      });
+      const merged = await mergeRemoteCommunityPluginCatalogKeepingSuperset(
+        deltaFresh,
+        refreshed,
+      );
+      expect(merged.entries[0].members.find((member) =>
+        member.path.endsWith("/manifest.json")
+      )?.eTag).toBe("etag-manifest-v2");
+    });
+
+    it("returns the fresh build when there is no previous catalog or the scope changed", async () => {
+      const fresh = await catalogFor(["calendar"], null, 10);
+      expect(await mergeRemoteCommunityPluginCatalogKeepingSuperset(
+        null,
+        fresh,
+      )).toBe(fresh);
+      const otherScope: SyncScope = {
+        ...SCOPE,
+        vaultFolderId: "other-vault",
+        filesRootId: "other-root",
+      };
+      const foreign = await buildRemoteCommunityPluginCatalog({
+        scope: otherScope,
+        configDir: ".obsidian",
+        items: [
+          folder("other-config", ".obsidian", otherScope.filesRootId),
+          folder("other-plugins", "plugins", "other-config"),
+          folder("other-calendar-root", "calendar", "other-plugins"),
+          file("other-calendar-main", "main.js", "other-calendar-root"),
+          file(
+            "other-calendar-manifest",
+            "manifest.json",
+            "other-calendar-root",
+          ),
+        ],
+        manifestObservations: [],
+        observedAt: 10,
+        previous: fresh,
+        ownPluginId: "easy-sync",
+      });
+      expect(await mergeRemoteCommunityPluginCatalogKeepingSuperset(
+        fresh,
+        foreign,
+      )).toBe(foreign);
+    });
   });
 });

@@ -658,6 +658,39 @@ describe("buildSyncViewContentKey", () => {
     expect(actionable).toContain("anchored-folder-missing-local");
   });
 
+  it("rebuilds a pending body when adoption rows appear, change, or retire", () => {
+    const pendingBase = { ...baseInput, bodyMode: "pending" as const };
+    const empty = buildSyncViewContentKey(false, {
+      ...pendingBase,
+      adoptionRows: [],
+    });
+    const withRow = buildSyncViewContentKey(false, {
+      ...pendingBase,
+      adoptionRows: [{
+        pluginId: "calendar",
+        displayName: "Calendar",
+        desktopOnly: true,
+      }],
+    });
+    const reflagged = buildSyncViewContentKey(false, {
+      ...pendingBase,
+      adoptionRows: [{
+        pluginId: "calendar",
+        displayName: "Calendar",
+        desktopOnly: false,
+      }],
+    });
+
+    expect(withRow).not.toBe(empty);
+    expect(withRow).toContain("calendar");
+    expect(reflagged).not.toBe(withRow);
+    const retired = buildSyncViewContentKey(false, {
+      ...pendingBase,
+      adoptionRows: [],
+    });
+    expect(retired).toBe(empty);
+  });
+
   it("rebuilds an unanchored shared-folder row for explicit identity review", () => {
     const legacy = buildSyncViewContentKey(false, {
       ...baseInput,
@@ -2014,6 +2047,8 @@ describe("buildSyncViewContentKey", () => {
     expect(modalSource).toContain('"syncView.pluginBundleReview.loading"');
     expect(modalSource).toContain('"syncView.conflict.keepLocal"');
     expect(modalSource).toContain('"syncView.conflict.keepRemote"');
+    expect(modalSource).toContain('"syncView.pluginBundleReview.identityMismatchNotice"');
+    expect(modalSource).toContain('reason === "identity-mismatch"');
     expect(viewSource).not.toContain("CommunityPluginBundleReviewModal");
 
     const zh = new I18n("zh-cn");
@@ -2155,6 +2190,36 @@ describe("resolveSyncViewBodyMode", () => {
       mutationRecoveryVisible: true,
       remoteScopeRecoveryFailureVisible: true,
     })).toBe("recovery");
+  });
+
+  it("keeps pending rows visible while a full sync round runs, so other rows stay clickable (continuous click-in)", () => {
+    // Adoption「下载并同步」starts a full sync round; the remaining pending
+    // rows (other plugin proposals / conflicts / deletes) must stay visible
+    // and clickable instead of being replaced by the progress body — the same
+    // contract ordinary file-conflict rows already have via side actions.
+    expect(resolveSyncViewBodyMode({
+      planReviewActive: false,
+      hasSyncState: true,
+      fullSyncRunning: true,
+      pendingCount: 3,
+      sideActionResultsVisible: false,
+    })).toBe("pending");
+
+    expect(resolveSyncViewBodyMode({
+      planReviewActive: false,
+      hasSyncState: true,
+      fullSyncRunning: true,
+      pendingCount: 0,
+      sideActionResultsVisible: false,
+    })).toBe("progress");
+
+    expect(resolveSyncViewBodyMode({
+      planReviewActive: true,
+      hasSyncState: true,
+      fullSyncRunning: true,
+      pendingCount: 2,
+      sideActionResultsVisible: false,
+    })).toBe("plan");
   });
 });
 
@@ -2539,5 +2604,114 @@ describe("resolveSyncViewPrimaryAction (finding ⑧, C9 P1)", () => {
       cta: true,
       disabled: false,
     });
+  });
+});
+
+describe("continuous click-in for resolution rows", () => {
+  it("filters pendingIssues by queued side-action paths like conflicts and deletes", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const renderStart = source.indexOf("const pendingIssues = ");
+    const slice = source.slice(
+      renderStart,
+      renderStart + 400,
+    );
+    expect(slice).toContain(
+      "syncState?.pendingIssues ?? []",
+    );
+    expect(slice).toContain(
+      "isSideActionQueued(item.path)",
+    );
+    // The filter must apply before grouping, so a queued resolution row
+    // disappears from the pending list the moment its side action is queued.
+    expect(source.indexOf("const pendingIssues = ")).toBeLessThan(
+      source.indexOf("const pendingIssueGroups = groupPendingIssuesForReview("),
+    );
+  });
+
+  it("releases each resolution guard before the settlement call, not after the full round", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const cases = [
+      {
+        open: "  private async openStaleIdentityResolution(",
+        guard: "this.staleIdentityResolutionOpening = false;",
+        settle: "this.plugin.retireReviewedStaleIdentity(snapshot)",
+      },
+      {
+        open: "  private async openSharedFolderIdentityResolution(",
+        guard: "this.sharedFolderIdentityResolutionOpening = false;",
+        settle: "this.plugin.confirmReviewedSharedFolderIdentity(snapshot)",
+      },
+      {
+        open: "  private async openScopeCrossingRestore(",
+        guard: "this.scopeCrossingResolutionOpening = false;",
+        settle: "this.plugin.restoreScopeCrossingMove(snapshot)",
+      },
+      {
+        open: "  private async openScopeCrossingConfirm(",
+        guard: "this.scopeCrossingResolutionOpening = false;",
+        settle: "this.plugin.confirmScopeCrossingExit(snapshot)",
+      },
+      {
+        open: "  private async openFolderLocationResolution(",
+        guard: "this.emptyFolderResolutionOpening = false;",
+        settle: "this.plugin.resolveReviewedFolderLocation(",
+      },
+      {
+        open: "  private async openEmptyFolderResolution(",
+        guard: "this.emptyFolderResolutionOpening = false;",
+        settle: "this.plugin.restoreReviewedFolderSubtree(subtree)",
+      },
+    ];
+    for (const { open, guard, settle } of cases) {
+      const start = source.indexOf(open);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const end = source.indexOf("\n  private async ", start + 1);
+      const method = source.slice(start, end < 0 ? undefined : end);
+      expect(method.indexOf(guard)).toBeGreaterThanOrEqual(0);
+      expect(method.indexOf(settle)).toBeGreaterThanOrEqual(0);
+      expect(method.indexOf(guard)).toBeLessThan(
+        method.indexOf(settle),
+      );
+    }
+  });
+});
+
+describe("scope-crossing row exit gating", () => {
+  it("renders exit chips and the folder exit text only when a covering move hint exists", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const renderStart = source.indexOf("  private renderPendingIssue(");
+    const renderEnd = source.indexOf(
+      "\n  private async openStaleIdentityResolution(",
+      renderStart,
+    );
+    const render = source.slice(renderStart, renderEnd);
+    // 出口判定读当前去向记录（与行动侧快照同一规则负责点），在渲染体内计算。
+    expect(render).toContain(
+      "this.plugin.state?.getScopeCrossingExitKind(issue.path)",
+    );
+    // 双 chip 分支以出口存在为前提；无出口（漂移/设置形态）落到通用「重新检查」。
+    expect(render).toContain(
+      'if (issue.issueCode === "scope-crossing" && scopeCrossingExitKind) {',
+    );
+    const branchStart = render.indexOf(
+      'if (issue.issueCode === "scope-crossing" && scopeCrossingExitKind) {',
+    );
+    const fallback = render.slice(branchStart);
+    expect(fallback).toContain("formatPendingIssueActionLabel(");
+    expect(fallback).toContain("startManualSync");
+    // 文件夹出口行的行文替换为出口句；文件行与漂移行保留计划层 reason 文本。
+    expect(render).toContain('"syncView.scopeCrossing.rowReasonFolder"');
+  });
+
+  it("keeps the covering-hint rule owned by the resolution module", () => {
+    const resolution = readFileSync(
+      "src/sync/scope-crossing-resolution.ts",
+      "utf8",
+    );
+    expect(resolution).toContain("export function findScopeCrossingCoveringHintV1(");
+    expect(resolution).toContain("buildScopeCrossingResolutionSnapshotV1");
+    const stateManager = readFileSync("src/sync/state-manager.ts", "utf8");
+    expect(stateManager).toContain("findScopeCrossingCoveringHintV1(path, {");
+    expect(stateManager).toContain("getScopeCrossingExitKind(path: string)");
   });
 });

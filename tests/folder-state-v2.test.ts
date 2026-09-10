@@ -1068,6 +1068,142 @@ describe("V2 folder anchors and pure planner", () => {
     expect(report.items.some((item) => item.type.startsWith("delete-"))).toBe(false);
   });
 
+  it("mirrors a folder moved into the vault trash as a local deletion", () => {
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Notes" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+      }),
+      localFiles: [],
+      localFolders: [],
+      localFolderScanComplete: true,
+      includeFolderPath: (path) => !path.startsWith(".trash"),
+      localMoveHints: [{
+        version: 1,
+        scope,
+        remoteId: "notes",
+        fromPath: "Notes",
+        toPath: ".trash/Notes",
+        observedAt: 10,
+      }],
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "delete-remote",
+      path: "Notes",
+      remoteId: "notes",
+    })]);
+    expect(report.counts).toMatchObject({ deleteRemote: 1, conflicts: 0 });
+  });
+
+  it("mirrors a folder moved into a nested vault-trash archive directory as a local deletion", () => {
+    // 主库真实现场形态：文件夹被移入 .trash 下用户归档子目录（仍是回收站语义）。
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Notes" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+      }),
+      localFiles: [],
+      localFolders: [],
+      localFolderScanComplete: true,
+      includeFolderPath: (path) => !path.startsWith(".trash"),
+      localMoveHints: [{
+        version: 1,
+        scope,
+        remoteId: "notes",
+        fromPath: "Notes",
+        toPath: ".trash/archive-2026-09-08/Notes",
+        observedAt: 10,
+      }],
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "delete-remote",
+      path: "Notes",
+      remoteId: "notes",
+    })]);
+    expect(report.counts).toMatchObject({ deleteRemote: 1, conflicts: 0 });
+  });
+
+  it("mirrors a trashed folder deletion even after the remote folder moved away", () => {
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Archive" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+      }),
+      localFiles: [],
+      localFolders: [],
+      localFolderScanComplete: true,
+      includeFolderPath: (path) => !path.startsWith(".trash"),
+      localMoveHints: [{
+        version: 1,
+        scope,
+        remoteId: "notes",
+        fromPath: "Notes",
+        toPath: ".trash/Notes",
+        observedAt: 10,
+      }],
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "delete-remote",
+      path: "Notes",
+      remoteId: "notes",
+    })]);
+  });
+
+  it("retires an anchor when the trashed folder also disappeared from the remote", () => {
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+      }),
+      localFiles: [],
+      localFolders: [],
+      localFolderScanComplete: true,
+      includeFolderPath: (path) => !path.startsWith(".trash"),
+      localMoveHints: [{
+        version: 1,
+        scope,
+        remoteId: "notes",
+        fromPath: "Notes",
+        toPath: ".trash/Notes",
+        observedAt: 10,
+      }],
+    });
+
+    expect(report.items.map((item) => item.type)).toContain("delete-local");
+    expect(report.items.some((item) => item.type === "conflict")).toBe(false);
+  });
+
+  it("keeps a scope-crossing conflict when a trashed folder's old path left the scope", () => {
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Notes" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+      }),
+      localFiles: [],
+      localFolders: [],
+      localFolderScanComplete: true,
+      localMoveHints: [{
+        version: 1,
+        scope,
+        remoteId: "notes",
+        fromPath: "Notes",
+        toPath: ".trash/Notes",
+        observedAt: 10,
+      }],
+      includeFolderPath: (path) => path !== "Notes" && !path.startsWith(".trash"),
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "conflict",
+      path: "Notes",
+      reason: "scope-crossing",
+    })]);
+    expect(report.counts.deleteRemote).toBe(0);
+  });
+
   it("plans only anchored one-sided folder deletions", () => {
     const localDelete = planFolderStateV2({
       envelope: envelope({

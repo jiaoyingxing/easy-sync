@@ -1,7 +1,7 @@
 import {
   structuredCloneImplementation,
 } from "./structured-clone-compat";
-import { Platform, Plugin, setIcon, setTooltip, TFolder, WorkspaceLeaf } from "obsidian";
+import { Notice, Platform, Plugin, setIcon, setTooltip, TFile, TFolder, WorkspaceLeaf } from "obsidian";
 import { AuthModule, type AuthPluginContext } from "./auth/auth-module";
 import { createAuthBrowserLauncher } from "./auth/auth-browser";
 import {
@@ -63,6 +63,9 @@ import type {
 import type {
   StaleIdentityResolutionSnapshotV1,
 } from "./sync/stale-identity-resolution";
+import type {
+  ScopeCrossingResolutionSnapshotV1,
+} from "./sync/scope-crossing-resolution";
 import {
   isAnySyncActivityRunning,
   SyncProgressStore,
@@ -82,6 +85,7 @@ import {
   type RibbonStatus,
 } from "./ui/ribbon-status";
 import { ConfirmModal, SyncPlanAlertModal } from "./ui/confirm-modal";
+import { ScopeCrossingPromptModal } from "./ui/scope-crossing-prompt-modal";
 import type {
   MutationRecoveryBlockReason,
   MutationRecoveryHistory,
@@ -184,12 +188,30 @@ import {
 } from "./sync/community-plugin-participation";
 import {
   buildRemoteCommunityPluginCatalog,
+  buildRemoteCommunityPluginCatalogFromIndex,
   COMMUNITY_PLUGIN_CATALOG_STALE_FAILURE_THRESHOLD,
   markRemoteCommunityPluginCatalogStale,
+  mergeRemoteCommunityPluginCatalogKeepingSuperset,
   remoteCommunityPluginCatalogEntries,
   shouldMarkCommunityPluginCatalogStale,
   type RemoteCommunityPluginCatalogV1,
 } from "./sync/community-plugin-remote-catalog";
+import {
+  deriveCommunityPluginAdoptionCandidates,
+  resolveCommunityPluginPlatformFacts,
+} from "./sync/community-plugin-adoption-discovery";
+import {
+  reduceCommunityPluginAdoptionMemory,
+  type CommunityPluginAdoptionMemoryCommand,
+} from "./sync/community-plugin-adoption-memory";
+import { tryEnableDownloadedCommunityPlugin } from "./community-plugin-host-enable";
+import {
+  ensureCommunityPluginDisplayFacts,
+} from "./sync/community-plugin-display-facts";
+import {
+  buildCommunityPluginUpdateFacts,
+  type CommunityPluginAutoUpdateCandidate,
+} from "./sync/community-plugin-update-facts";
 import {
   communityPluginJoinBlockRequiresTargetRebind,
   isCommunityPluginJoinBlockRecheckable,
@@ -203,6 +225,8 @@ import {
 } from "./sync/community-plugin-local-reconciliation";
 import {
   COMMUNITY_PLUGIN_CLOUD_CLEANUP_MARKER_KEY,
+  normalizeCommunityPluginCloudCleanupMarkersV1,
+  planCommunityPluginCloudCleanupMarkerSweepV1,
 } from "./sync/community-plugin-cloud-cleanup-v1";
 import { StartupPerformanceTracker } from "./startup-performance";
 
@@ -506,6 +530,29 @@ function normalizeNotificationPopupsLevel(
  * 面向新手用户的极简 Obsidian 云盘同步插件
  * MVP 首发 OneDrive App Folder 双向同步
  */
+/** One pending new-plugin row for the sidebar adoption section (slice 2). */
+export interface CommunityPluginAdoptionRow {
+  pluginId: string;
+  /** Trusted manifest display name; falls back to the plugin id. */
+  displayName: string;
+  /** True only when a source-bound observation says the bundle is desktop-only. */
+  desktopOnly: boolean;
+}
+
+/** Safety recheck interval while deferred settings mutations wait for sync
+ *  to go idle (releaseOpLock is the primary trigger; this covers busy windows
+ *  that end without one, e.g. side actions). */
+const DEFERRED_SETTINGS_MUTATION_RECHECK_MS = 1_000;
+
+/** Handle for a sync-path settings mutation deferred behind an in-flight
+ *  round: `cancel()` reverts a still-queued mutation (false once it started
+ *  applying), `isQueued()` tells the manager row whether the queued
+ *  affordance applies. */
+export type DeferredSettingsMutationHandle = Promise<void> & {
+  cancel: () => boolean;
+  isQueued: () => boolean;
+};
+
 export default class EasySyncPlugin extends Plugin {
   auth: AuthModule | null = null;
   onedrive: OneDriveClient | null = null;
@@ -547,6 +594,14 @@ export default class EasySyncPlugin extends Plugin {
   autoSyncPaused = false;
   notificationPopups: EasySyncNotificationPopupsLevel = "all";
   private opLock: string | null = null;
+  private deferredSettingsMutations: Array<{
+    started: boolean;
+    cancelled: boolean;
+    run: () => Promise<void>;
+    resolve: () => void;
+    reject: (error: unknown) => void;
+  }> = [];
+  private deferredSettingsMutationTimer: TimeoutHandle | null = null;
   private autoSyncTimer: IntervalHandle | null = null;
   private descendantFileReconstructionTimer: TimeoutHandle | null = null;
   private descendantFileReconstructionFailures = 0;
@@ -594,6 +649,16 @@ export default class EasySyncPlugin extends Plugin {
   private communityPluginParticipationInitializationPromise:
     Promise<DeviceCommunityPluginParticipationV1 | null> | null = null;
   private communityPluginParticipationOperationSequence = 0;
+  /**
+   * Platform/name facts cached during the round-end reconcile for pending
+   * adoption rows. Filled from the round's fresh catalog and observations;
+   * entries stay until the next reconcile (missing after a restart resolves
+   * on the first settled round).
+   */
+  private communityPluginAdoptionPlatformFacts = new Map<
+    string,
+    { name: string | null; isDesktopOnly: boolean | null }
+  >();
   private remoteCommunityPluginCatalogRefreshPromise:
     Promise<RemoteCommunityPluginCatalogV1 | null> | null = null;
   /** Consecutive catalog refresh failures since the last success (memory
@@ -618,6 +683,90 @@ export default class EasySyncPlugin extends Plugin {
   private releaseOpLock(): void {
     this.opLock = null;
     this.retryCommunityPluginLocalReconciliationIfIdle();
+    this.drainDeferredSettingsMutations();
+  }
+
+  /** Whether a sync round / side action currently blocks sync-path settings
+   *  commits (the same conditions the commit guards reject with "busy"). */
+  private isSyncPathBusy(): boolean {
+    return this.opLock !== null
+      || this.syncExecutor?.hasActivityInFlight === true;
+  }
+
+  /**
+   * User-initiated sync-path settings mutations (manager toggles, adoption
+   * download) must never bounce off an in-flight round: while the commit
+   * guards would reject with "busy", the mutation waits here and applies in
+   * order once sync is idle again (2026-09-09 卡手反馈). The queue is
+   * in-memory on purpose — the toggled row stays pending until the commit
+   * lands, and a restart simply shows the truthful (unchanged) state.
+   *
+   * Returns a `cancel()` handle (2026-09-09 反悔拍板): cancelling a
+   * still-queued mutation settles its promise without running it, so the
+   * manager row can revert; once the mutation started applying, cancel is a
+   * no-op returning false (the commit then lands normally). The idle fast
+   * path has nothing to cancel and returns false as well. `isQueued()`
+   * distinguishes "waiting for sync to go idle" from "applying now" so the
+   * manager row only renders the queued affordance for the former.
+   */
+  runSettingsMutationWhenSyncIdle(
+    run: () => Promise<void>,
+  ): DeferredSettingsMutationHandle {
+    if (!this.isSyncPathBusy()) {
+      return Object.assign(run(), {
+        cancel: () => false,
+        isQueued: () => false,
+      });
+    }
+    let resolveGate!: () => void;
+    let rejectGate!: (error: unknown) => void;
+    const gate = new Promise<void>((resolve, reject) => {
+      resolveGate = resolve;
+      rejectGate = reject;
+    });
+    const item = {
+      started: false,
+      cancelled: false,
+      run: () => {
+        item.started = true;
+        if (item.cancelled) return Promise.resolve();
+        return run();
+      },
+      resolve: () => resolveGate(),
+      reject: (error: unknown) => rejectGate(error),
+    };
+    this.deferredSettingsMutations.push(item);
+    this.armDeferredSettingsMutationRecheck();
+    const promise = gate as DeferredSettingsMutationHandle;
+    promise.cancel = () => {
+      if (item.started || item.cancelled) return false;
+      item.cancelled = true;
+      resolveGate();
+      return true;
+    };
+    promise.isQueued = () => !item.started;
+    return promise;
+  }
+
+  private armDeferredSettingsMutationRecheck(): void {
+    if (this.deferredSettingsMutationTimer !== null) return;
+    this.deferredSettingsMutationTimer = compatSetTimeout(() => {
+      this.deferredSettingsMutationTimer = null;
+      this.drainDeferredSettingsMutations();
+    }, DEFERRED_SETTINGS_MUTATION_RECHECK_MS);
+  }
+
+  private drainDeferredSettingsMutations(): void {
+    const next = this.deferredSettingsMutations.shift();
+    if (!next) return;
+    if (this.isSyncPathBusy()) {
+      this.deferredSettingsMutations.unshift(next);
+      this.armDeferredSettingsMutationRecheck();
+      return;
+    }
+    void next.run().then(next.resolve, next.reject).finally(() => {
+      this.drainDeferredSettingsMutations();
+    });
   }
 
   // ---- Lifecycle ----
@@ -930,6 +1079,13 @@ export default class EasySyncPlugin extends Plugin {
     this.communityPluginInventoryRevisionListeners.clear();
     this.pendingCommunityPluginReconciliationIds.clear();
     this.communityPluginReconciliationRetryOnLockRelease = false;
+    this.deferredSettingsMutations.splice(0).forEach((mutation) => {
+      mutation.reject(
+        new Error("EasySync unloaded before the queued settings mutation ran"),
+      );
+    });
+    compatClearTimeout(this.deferredSettingsMutationTimer);
+    this.deferredSettingsMutationTimer = null;
     compatClearTimeout(this.communityPluginInventoryRefreshTimer);
     this.communityPluginInventoryRefreshTimer = null;
     compatClearTimeout(this.communityPluginLocalReconciliationTimer);
@@ -981,6 +1137,7 @@ export default class EasySyncPlugin extends Plugin {
       | "notice.folderSubtree.failed"
       | "notice.sharedFolderIdentity.failed"
       | "notice.staleIdentity.failed"
+      | "notice.scopeCrossing.failed"
       | "notice.mutationResolution.failed",
     action: (executor: SyncExecutor, state: StateManager) => Promise<void>,
     requireIdleSideActions = false,
@@ -1229,6 +1386,14 @@ export default class EasySyncPlugin extends Plugin {
     return this.syncExecutor.getStaleIdentityResolutionSnapshot(path);
   }
 
+  async getScopeCrossingResolutionSnapshot(
+    path: string,
+  ): Promise<ScopeCrossingResolutionSnapshotV1 | null> {
+    await this.ensureStateLoaded();
+    if (!this.syncExecutor || !this.state?.isV2StateActive) return null;
+    return this.syncExecutor.getScopeCrossingResolutionSnapshot(path);
+  }
+
   async getMutationRecoveryResolutionSnapshot():
     Promise<ManualMutationResolutionSnapshotV1 | null> {
     await this.ensureStateLoaded();
@@ -1347,9 +1512,7 @@ export default class EasySyncPlugin extends Plugin {
         accepted = await executor.restoreReviewedFolderSubtree(reviewed);
       },
     );
-    if (!admitted || !accepted) return false;
-    await this.startManualSync();
-    return true;
+    return admitted && accepted;
   }
 
   async resolveReviewedFolderLocation(
@@ -1367,9 +1530,7 @@ export default class EasySyncPlugin extends Plugin {
         );
       },
     );
-    if (!admitted || !resolved) return false;
-    await this.startManualSync();
-    return true;
+    return admitted && resolved;
   }
 
   async deleteReviewedFolderSubtree(
@@ -1401,9 +1562,7 @@ export default class EasySyncPlugin extends Plugin {
         );
       },
     );
-    if (!admitted || !bound) return false;
-    await this.startManualSync();
-    return true;
+    return admitted && bound;
   }
 
   async confirmReviewedSharedFolderIdentity(
@@ -1417,9 +1576,7 @@ export default class EasySyncPlugin extends Plugin {
         accepted = await executor.confirmReviewedSharedFolderIdentity(reviewed);
       },
     );
-    if (!admitted || !accepted) return false;
-    await this.startManualSync();
-    return true;
+    return admitted && accepted;
   }
 
   async retireReviewedStaleIdentity(
@@ -1433,9 +1590,35 @@ export default class EasySyncPlugin extends Plugin {
         retired = await executor.retireReviewedStaleIdentity(reviewed);
       },
     );
-    if (!admitted || !retired) return false;
-    await this.startManualSync();
-    return true;
+    return admitted && retired;
+  }
+
+  async restoreScopeCrossingMove(
+    reviewed: Readonly<ScopeCrossingResolutionSnapshotV1>,
+  ): Promise<boolean> {
+    let restored = false;
+    const admitted = await this.runSideActionIntent(
+      reviewed.rowPath,
+      "notice.scopeCrossing.failed",
+      async (executor) => {
+        restored = await executor.restoreScopeCrossingMove(reviewed);
+      },
+    );
+    return admitted && restored;
+  }
+
+  async confirmScopeCrossingExit(
+    reviewed: Readonly<ScopeCrossingResolutionSnapshotV1>,
+  ): Promise<boolean> {
+    let confirmed = false;
+    const admitted = await this.runSideActionIntent(
+      reviewed.rowPath,
+      "notice.scopeCrossing.failed",
+      async (executor) => {
+        confirmed = await executor.confirmScopeCrossingExit(reviewed);
+      },
+    );
+    return admitted && confirmed;
   }
 
   deleteReviewedEmptyRemoteFolder(
@@ -1515,6 +1698,12 @@ export default class EasySyncPlugin extends Plugin {
         allowedLockHolder: "sync",
       });
     }
+    // Community-plugin auto-update baseline: which plugins already
+    // participated before this round. Bundle downloads of plugins outside
+    // this set are explicit accepts (fresh join / restore / new install) and
+    // must not surface as silent auto updates.
+    const autoUpdateBaselinePluginIds =
+      this.collectAutoUpdateBaselinePluginIds();
     const preparedCommunityPluginJoins = request.options?.recoveryOnly === true
       ? { authorizations: [] }
       : await this.prepareCommunityPluginJoinsForSync(
@@ -1627,7 +1816,26 @@ export default class EasySyncPlugin extends Plugin {
         );
       }
     }
-    this.maybeNoticeCommunityPluginCloudResurrection();
+    if (
+      request.resultOwner !== "reset"
+      && request.options?.recoveryOnly !== true
+      && (completedRestores?.files.length ?? 0) > 0
+    ) {
+      // Slice 3: no-restart enablement for the explicit downloads of this
+      // settled round. The set only ever contains user-taken joins/restores
+      // (automatic updates never enter it), so enablement state semantics
+      // stay untouched elsewhere. Every failure falls back to a notice;
+      // the round result is never modified here.
+      try {
+        await this.enableCommunityPluginDownloads(completedRestores!.files);
+      } catch (error) {
+        this.diag.warn(
+          "state",
+          "community plugin auto-enable step failed — manual enablement after restart still applies",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
     this.maybeNoticeCommunityPluginUploadDowngrades(
       result.communityPluginUploadDowngradesDeferred,
     );
@@ -1722,7 +1930,22 @@ export default class EasySyncPlugin extends Plugin {
         recoveryContext,
       );
     }
+    if (
+      request.resultOwner !== "reset"
+      && request.options?.recoveryOnly !== true
+    ) {
+      await this.syncRoundCommunityPluginCatalogUpdate();
+    }
     this.advanceCommunityPluginInventoryRevision();
+    if (
+      request.resultOwner !== "reset"
+      && request.options?.recoveryOnly !== true
+    ) {
+      this.maybeNoticeCommunityPluginAutoUpdates(
+        result,
+        autoUpdateBaselinePluginIds,
+      );
+    }
     if (
       scheduleReconstructionContinuation
       && result.continueAfterConfirmedDescendantFileReconstruction
@@ -1734,6 +1957,116 @@ export default class EasySyncPlugin extends Plugin {
     }
     if (request.renderAfter) this.syncView?.render();
     return result;
+  }
+
+  /**
+   * Snapshot of plugins that participated before this sync round starts.
+   * Read after the local-bundle reconciliation but before joins/restores are
+   * planned, so a plugin that only appears mid-round (fresh accept) is never
+   * counted as an existing participant.
+   */
+  private collectAutoUpdateBaselinePluginIds(): ReadonlySet<string> {
+    const participation = this.communityPluginParticipation;
+    const ids = new Set<string>();
+    if (!participation) return ids;
+    for (const [pluginId, entry] of Object.entries(
+      participation.pluginsById,
+    )) {
+      if (entry.phase === "participating") ids.add(pluginId);
+    }
+    return ids;
+  }
+
+  /**
+   * Surface silent community-plugin auto updates of one finished round: an
+   * already-participating plugin whose bundle files were downloaded over the
+   * local copies. Obsidian keeps running the old in-memory plugin code, so the
+   * new version only takes effect after a restart — the notice says so instead
+   * of leaving the user wondering why nothing changed. Explicit accepts
+   * (fresh join / restore / new install) carry their own semantics and are
+   * excluded by the participating-before baseline.
+   *
+   * Rendered at attention level so the「通知弹窗＝仅重要」setting still shows
+   * it (ambient notices below attention are filtered there); only「关闭」hides
+   * it, and the round history row stays the durable record.
+   */
+  private maybeNoticeCommunityPluginAutoUpdates(
+    result: SyncResult,
+    baseline: ReadonlySet<string>,
+  ): void {
+    const progress = this.progressStore.state;
+    if (progress.startedAt <= 0) return;
+    if (baseline.size === 0) return;
+    const configDir = getConfigDir(this.app.vault);
+    const candidates = buildCommunityPluginUpdateFacts({
+      files: progress.completedFiles,
+      configDir,
+      participatingBeforePluginIds: [...baseline],
+      ownPluginId: this.manifest.id,
+    });
+    if (candidates.length === 0) return;
+    void this.presentCommunityPluginUpdateNotice(candidates, configDir);
+  }
+
+  private async presentCommunityPluginUpdateNotice(
+    candidates: readonly CommunityPluginAutoUpdateCandidate[],
+    configDir: string,
+  ): Promise<void> {
+    const t = this.i18n.t.bind(this.i18n);
+    const labels: string[] = [];
+    let anyVersioned = false;
+    for (const candidate of candidates) {
+      if (candidate.manifestDownloaded) anyVersioned = true;
+      labels.push(await this.describeUpdatedPluginBundle(
+        candidate.pluginId,
+        configDir,
+        candidate.manifestDownloaded,
+      ));
+    }
+    const separator = this.i18n.language === "zh-cn" ? "、" : ", ";
+    this.noticeCenter.show({
+      key: "sync-result:community-plugin-updates",
+      message: t(
+        anyVersioned
+          ? "notice.communityPlugins.updatedRestart"
+          : "notice.communityPlugins.updatedRestartNoVersion",
+        { plugins: labels.join(separator) },
+      ),
+      priority: NOTICE_PRIORITY.attention,
+      category: "ambient",
+    });
+  }
+
+  /** Display label for one updated plugin: "Name v1.2.3" when the freshly
+   *  written manifest is readable, otherwise just the plugin id. */
+  private async describeUpdatedPluginBundle(
+    pluginId: string,
+    configDir: string,
+    readVersion: boolean,
+  ): Promise<string> {
+    try {
+      const manifestPath =
+        `${configDir.replace(/\/+$/, "")}/plugins/${pluginId}/manifest.json`;
+      const parsed: unknown = JSON.parse(
+        await this.app.vault.adapter.read(manifestPath),
+      );
+      if (!parsed || typeof parsed !== "object") return pluginId;
+      const manifest = parsed as { name?: unknown; version?: unknown };
+      const name = typeof manifest.name === "string"
+        && manifest.name.trim().length > 0
+        ? manifest.name.trim()
+        : pluginId;
+      if (
+        readVersion
+        && typeof manifest.version === "string"
+        && manifest.version.trim().length > 0
+      ) {
+        return `${name} v${manifest.version.trim()}`;
+      }
+      return name;
+    } catch {
+      return pluginId;
+    }
   }
 
   /**
@@ -4116,7 +4449,7 @@ export default class EasySyncPlugin extends Plugin {
     if (file instanceof TFolder) {
       // The folder identity hint is the durable evidence used by the next
       // scan. Never let the dirty timer overtake that persistence attempt.
-      await this.captureLocalFolderMoveHint(oldPath, file.path);
+      const recorded = await this.captureLocalFolderMoveHint(oldPath, file.path);
       const previousPluginId = this.parseCommunityPluginRootPath(oldPath);
       const currentPluginId = this.parseCommunityPluginRootPath(file.path);
       if (currentPluginId) {
@@ -4133,8 +4466,18 @@ export default class EasySyncPlugin extends Plugin {
         );
       }
       this.markLocalDirtyFolderHint(file.path, oldPath);
+      if (
+        recorded
+        && this.isScopeCrossingPromptDestination(file.path, "folder")
+      ) {
+        this.enqueueScopeCrossingPrompt("folder", oldPath, file.path);
+      }
       return;
     }
+    // Slice-2: retain the file's out-of-scope destination before scheduling.
+    // A destination inside the sync scope keeps the ordinary content-based
+    // pairing; the dirty timer must never overtake this persistence attempt.
+    const recorded = await this.captureLocalFileMoveHint(oldPath, file.path);
     this.invalidateCommunityPluginLocalReconciliationForPath(file.path);
     this.scheduleCommunityPluginInventoryRevisionForPaths(
       "rename",
@@ -4142,16 +4485,19 @@ export default class EasySyncPlugin extends Plugin {
       { path: file.path, isFolder: false },
     );
     this.markLocalDirtyHint(file.path, oldPath);
+    if (recorded) {
+      this.enqueueScopeCrossingPrompt("file", oldPath, file.path);
+    }
   }
 
   private async captureLocalFolderMoveHint(
     oldPath: string,
     newPath: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await this.ensureStateLoaded();
       const state = this.state;
-      if (!state) return;
+      if (!state) return false;
       const recorded = await state.recordLocalFolderMoveHint(oldPath, newPath);
       if (recorded) {
         this.diag.log("state", "local folder move hint bound to committed V2 identity", {
@@ -4159,12 +4505,220 @@ export default class EasySyncPlugin extends Plugin {
           toPath: newPath,
         });
       }
+      return recorded;
     } catch (error) {
       this.diag.warn(
         "state",
         `local folder move hint was not retained: ${oldPath} -> ${newPath}`,
         error instanceof Error ? error.message : String(error),
       );
+      return false;
+    }
+  }
+
+  /**
+   * Retain a TFile rename whose destination lies outside the sync scope
+   * (slice-2). The file layer treats an in-scope local disappearance as a
+   * remote deletion; a file that merely left the scope would otherwise be
+   * deleted from the cloud without the user being asked whether the move was
+   * intentional. Only destinations that are positively out of scope (and not
+   * the vault trash, whose deletion semantics are unchanged) are retained, so
+   * ordinary in-scope renames never touch persistence. A missing scanner
+   * means the scope cannot be judged — keep the pre-existing semantics.
+   */
+  private async captureLocalFileMoveHint(
+    oldPath: string,
+    newPath: string,
+  ): Promise<boolean> {
+    try {
+      if (
+        newPath === ".trash"
+        || newPath.startsWith(".trash/")
+        || this.scanner == null
+        || this.scanner.shouldSyncPath(newPath) === true
+      ) return false;
+      await this.ensureStateLoaded();
+      const state = this.state;
+      if (!state) return false;
+      const recorded = await state.recordLocalFileMoveHint(oldPath, newPath);
+      if (recorded) {
+        this.diag.log("state", "local file move hint bound to committed V2 identity", {
+          fromPath: oldPath,
+          toPath: newPath,
+        });
+      }
+      return recorded;
+    } catch (error) {
+      this.diag.warn(
+        "state",
+        `local file move hint was not retained: ${oldPath} -> ${newPath}`,
+        error instanceof Error ? error.message : String(error),
+      );
+      return false;
+    }
+  }
+
+  // ---- Slice-2: immediate scope-crossing prompt (debounced queue) ----
+
+  private scopeCrossingPromptQueue: Array<{
+    kind: "folder" | "file";
+    fromPath: string;
+    toPath: string;
+  }> = [];
+  private scopeCrossingPromptTimer: number | null = null;
+  private scopeCrossingPromptShowing = false;
+
+  private isScopeCrossingPromptDestination(
+    path: string,
+    kind: "folder" | "file",
+  ): boolean {
+    if (path === ".trash" || path.startsWith(".trash/")) return false;
+    if (this.scanner == null) return false;
+    return kind === "folder"
+      ? this.scanner.shouldSyncFolderPath(path) === false
+      : this.scanner.shouldSyncPath(path) === false;
+  }
+
+  /** Debounce burst moves into one prompt; never pile modals on top of each
+   *  other — a dismissed prompt falls back to the pending-row surface. */
+  private enqueueScopeCrossingPrompt(
+    kind: "folder" | "file",
+    fromPath: string,
+    toPath: string,
+  ): void {
+    this.scopeCrossingPromptQueue.push({ kind, fromPath, toPath });
+    if (this.scopeCrossingPromptTimer !== null) return;
+    this.scopeCrossingPromptTimer = window.setTimeout(() => {
+      this.scopeCrossingPromptTimer = null;
+      void this.fireScopeCrossingPrompt();
+    }, 700);
+  }
+
+  private async fireScopeCrossingPrompt(): Promise<void> {
+    if (this.scopeCrossingPromptShowing) return;
+    const batch = this.scopeCrossingPromptQueue.splice(0);
+    if (batch.length === 0) return;
+    this.scopeCrossingPromptShowing = true;
+    const t = this.i18n.t.bind(this.i18n);
+    try {
+      const first = batch[0];
+      const choice = await new ScopeCrossingPromptModal(
+        this.app,
+        t("syncView.scopeCrossing.promptTitle"),
+        t(
+          first.kind === "folder"
+            ? "syncView.scopeCrossing.promptMessageFolder"
+            : "syncView.scopeCrossing.promptMessageFile",
+        ),
+        batch.length > 1
+          ? t("syncView.scopeCrossing.promptBatch", {
+            count: String(batch.length - 1),
+          })
+          : null,
+        t("syncView.scopeCrossing.restore"),
+        t("syncView.scopeCrossing.confirm"),
+      ).awaitChoice();
+      if (choice === "restore") {
+        for (const item of batch) {
+          await this.restoreScopeCrossingPromptMove(
+            item.kind,
+            item.fromPath,
+            item.toPath,
+          );
+        }
+      } else if (choice === "confirm") {
+        for (const item of batch) {
+          await this.confirmScopeCrossingPromptMove(
+            item.kind,
+            item.fromPath,
+            item.toPath,
+          );
+        }
+      }
+      // choice === null: dismissed — the pending-row fallback keeps the
+      // decision available without deleting or moving anything.
+    } finally {
+      this.scopeCrossingPromptShowing = false;
+    }
+    if (this.scopeCrossingPromptQueue.length > 0) {
+      this.scopeCrossingPromptTimer = window.setTimeout(() => {
+        this.scopeCrossingPromptTimer = null;
+        void this.fireScopeCrossingPrompt();
+      }, 100);
+    }
+  }
+
+  private findScopeCrossingHintRemoteId(
+    state: StateManager,
+    kind: "folder" | "file",
+    fromPath: string,
+    toPath: string,
+  ): string | null {
+    const hints = kind === "folder"
+      ? state.localFolderMoveHints
+      : state.localFileMoveHints;
+    const hint = hints.find((candidate) =>
+      candidate.fromPath === fromPath && candidate.toPath === toPath);
+    return hint?.remoteId ?? null;
+  }
+
+  private async restoreScopeCrossingPromptMove(
+    kind: "folder" | "file",
+    fromPath: string,
+    toPath: string,
+  ): Promise<void> {
+    const t = this.i18n.t.bind(this.i18n);
+    try {
+      await this.ensureStateLoaded();
+      const state = this.state;
+      if (!state) return;
+      const vault = this.app.vault;
+      const origin = vault.getAbstractFileByPath(fromPath);
+      const originOccupied = origin !== undefined && origin !== null;
+      const source = vault.getAbstractFileByPath(toPath);
+      if (kind === "folder") {
+        if (!(source instanceof TFolder) || originOccupied) {
+          new Notice(t("notice.scopeCrossing.changed"));
+          return;
+        }
+      } else if (!(source instanceof TFile) || originOccupied) {
+        new Notice(t("notice.scopeCrossing.changed"));
+        return;
+      }
+      await vault.rename(source, fromPath);
+      const remoteId = this.findScopeCrossingHintRemoteId(
+        state,
+        kind,
+        fromPath,
+        toPath,
+      );
+      if (remoteId) await state.retireLocalMoveHintsByRemoteIds([remoteId]);
+      new Notice(t("notice.scopeCrossing.restored", { path: fromPath }));
+    } catch {
+      new Notice(t("notice.scopeCrossing.changed"));
+    }
+  }
+
+  private async confirmScopeCrossingPromptMove(
+    kind: "folder" | "file",
+    fromPath: string,
+    toPath: string,
+  ): Promise<void> {
+    const t = this.i18n.t.bind(this.i18n);
+    try {
+      await this.ensureStateLoaded();
+      const state = this.state;
+      if (!state) return;
+      const remoteId = this.findScopeCrossingHintRemoteId(
+        state,
+        kind,
+        fromPath,
+        toPath,
+      );
+      if (remoteId) await state.retireLocalMoveHintsByRemoteIds([remoteId]);
+      new Notice(t("notice.scopeCrossing.confirmed", { path: fromPath }));
+    } catch {
+      new Notice(t("notice.scopeCrossing.changed"));
     }
   }
 
@@ -4832,8 +5386,9 @@ export default class EasySyncPlugin extends Plugin {
    * holds locally. Gated on the device-local participation phase: active
    * joins/restores/participations, in-flight exits and blocked restores
    * never enter the transaction. The executor transaction performs the
-   * conditional deletes. Records a one-shot resurrection marker and reports
-   * completion or blockage through the notice center.
+   * conditional deletes. Records the cleanup marker that keeps the row
+   * hidden until the bundle reappears, and reports completion or blockage
+   * through the notice center.
    */
   async runCommunityPluginCloudCleanup(pluginId: string): Promise<boolean> {
     await this.ensureStateLoaded();
@@ -4936,19 +5491,22 @@ export default class EasySyncPlugin extends Plugin {
       COMMUNITY_PLUGIN_CLOUD_CLEANUP_MARKER_KEY,
     );
     if (!Array.isArray(raw)) return [];
-    return raw.filter((
-      entry,
-    ): entry is { pluginId: string; cleanedAt: number } =>
-      isRecord(entry)
-      && typeof entry.pluginId === "string"
-      && typeof entry.cleanedAt === "number"
+    return normalizeCommunityPluginCloudCleanupMarkersV1(
+      raw.filter((
+        entry,
+      ): entry is { pluginId: string; cleanedAt: number } =>
+        isRecord(entry)
+        && typeof entry.pluginId === "string"
+        && typeof entry.cleanedAt === "number"
+      ),
     );
   }
 
   /**
    * Read-only view of persisted cloud-cleanup markers for the settings UI:
-   * rows of cleaned plugins stay hidden until a resurrection notice drops
-   * the marker (or a later sync proves the cloud entry is gone).
+   * rows of cleaned plugins stay hidden until the sweep drops the marker
+   * once the complete bundle reappears in the cloud, or the user explicitly
+   * re-joins the plugin on this device.
    */
   getCommunityPluginCloudCleanupMarkers():
     readonly { pluginId: string; cleanedAt: number }[] {
@@ -4961,48 +5519,35 @@ export default class EasySyncPlugin extends Plugin {
     if (typeof this.app.saveLocalStorage !== "function") return;
     this.app.saveLocalStorage(
       COMMUNITY_PLUGIN_CLOUD_CLEANUP_MARKER_KEY,
-      [...markers],
+      normalizeCommunityPluginCloudCleanupMarkersV1(markers),
     );
   }
 
   /**
-   * One-shot resurrection notice (Q2): if a cleaned plugin's cloud objects
-   * reappear while this device still excludes the plugin, tell the user once
-   * that another device may still be using it, and drop the marker. Never
-   * auto-cleans again.
+   * Silent reappearance sweep against freshly refreshed catalog evidence
+   * (manager open / any successful remote catalog refresh and the round-end
+   * catalog update). The committed remote index only tracks folders this
+   * device anchors (joined plugins), so a cloud-deleted plugin re-uploaded
+   * by another device — while this device stays excluded — can only be seen
+   * through the catalog. Dropping the cleanup marker here un-hides the row
+   * so the user can re-join; no dedicated notice is shown (2026-09-09 用户
+   * 拍板：重现即展示, 无需为重现专门提示).
    */
-  private maybeNoticeCommunityPluginCloudResurrection(): void {
-    const state = this.state;
-    if (!state?.isV2StateActive) return;
+  private sweepResurrectedCloudCleanupMarkersAgainstCatalog(
+    catalog: Readonly<RemoteCommunityPluginCatalogV1>,
+  ): void {
     const markers = this.readCommunityPluginCloudCleanupMarkers();
     if (markers.length === 0) return;
-    const participation = state.getCommunityPluginParticipation?.() ?? null;
-    if (!Array.isArray(state.remoteSnapshot)) return;
-    const remoteIds = new Set<string>();
-    for (const entry of state.remoteSnapshot) {
-      const match = /^\.obsidian\/plugins\/([^/]+)\/(main\.js|manifest\.json|styles\.css)$/
-        .exec(entry.path);
-      if (match) remoteIds.add(match[1]);
+    const reappearedPluginIds = catalog.entries
+      .filter((entry) => entry.bundleState === "complete")
+      .map((entry) => entry.pluginId);
+    const sweep = planCommunityPluginCloudCleanupMarkerSweepV1({
+      markers,
+      reappearedPluginIds,
+    });
+    if (sweep.resurrectedPluginIds.length > 0) {
+      this.writeCommunityPluginCloudCleanupMarkers(sweep.remaining);
     }
-    const remaining: { pluginId: string; cleanedAt: number }[] = [];
-    for (const marker of markers) {
-      const phase = participation?.pluginsById[marker.pluginId]?.phase;
-      const cameBack = remoteIds.has(marker.pluginId)
-        && (phase === "excluded" || phase === "never-participated");
-      if (cameBack) {
-        this.noticeCenter.show({
-          key: `cloud-cleanup:resurrected:${marker.pluginId}`,
-          message: this.i18n.t("notice.communityPlugins.cloudResurrected", {
-            plugin: marker.pluginId,
-          }),
-          priority: NOTICE_PRIORITY.attention,
-          className: "easy-sync-notice-action",
-        });
-        continue;
-      }
-      remaining.push(marker);
-    }
-    this.writeCommunityPluginCloudCleanupMarkers(remaining);
   }
 
   private readUploadDowngradeNoticeMarkers(): { pluginId: string; noticedAt: number }[] {
@@ -5118,6 +5663,45 @@ export default class EasySyncPlugin extends Plugin {
     ) {
       await this.persistCompletedCommunityPluginRestores(legacyCompleted);
     }
+  }
+
+  /**
+   * No-restart host enablement (slice 3) for the explicit plugin downloads
+   * completed by this settled round. Enabled downloads are silent; every
+   * fallback surfaces one aggregated notice telling the user to enable the
+   * plugin manually after a restart. Never throws per plugin — the caller's
+   * try/catch only covers presentation failures.
+   */
+  private async enableCommunityPluginDownloads(
+    pluginIds: readonly string[],
+  ): Promise<void> {
+    const fallbackIds: string[] = [];
+    for (const pluginId of pluginIds) {
+      const outcome = await tryEnableDownloadedCommunityPlugin(
+        this.app,
+        pluginId,
+      );
+      if (outcome.kind === "fallback") fallbackIds.push(pluginId);
+    }
+    if (fallbackIds.length === 0) return;
+    const t = this.i18n.t.bind(this.i18n);
+    const configDir = getConfigDir(this.app.vault);
+    const labels: string[] = [];
+    for (const pluginId of fallbackIds) {
+      labels.push(await this.describeUpdatedPluginBundle(
+        pluginId,
+        configDir,
+        false,
+      ));
+    }
+    const separator = this.i18n.language === "zh-cn" ? "、" : ", ";
+    this.noticeCenter?.show({
+      key: "sync-result:community-plugin-enable-fallback",
+      message: t("notice.communityPlugins.enableFallbackRestart", {
+        plugins: labels.join(separator),
+      }),
+      priority: NOTICE_PRIORITY.info,
+    });
   }
 
   private async commitSyncPathSettingsCandidate(
@@ -5806,6 +6390,7 @@ export default class EasySyncPlugin extends Plugin {
   async updateCommunityPluginFilesSelection(
     pluginId: string,
     enabled: boolean,
+    options: Readonly<{ deferJoinSyncRound?: boolean }> = {},
   ): Promise<void> {
     await this.ensureStateLoaded();
     const current = await this.ensureCommunityPluginParticipationInitialized();
@@ -5855,7 +6440,225 @@ export default class EasySyncPlugin extends Plugin {
           }
         : {}),
     });
-    this.scheduleCommunityPluginJoinSync();
+    try {
+      await this.clearCommunityPluginAdoptionFor(pluginId);
+    } catch (error) {
+      this.diag.warn(
+        "state",
+        "failed to clear community plugin adoption memory after an explicit join",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    this.clearCommunityPluginCloudCleanupMarker(pluginId);
+    if (options.deferJoinSyncRound === true) {
+      // Manager toggles stay decoupled from the sync engine (2026-09-09
+      // 批量反馈): the join request is already persisted here, and the round
+      // starts once the batch settles (manager close flush) or on the shared
+      // dirty trigger — starting one round per toggle locked later toggles
+      // out with the busy guard until the round finished.
+      this.scheduleCommunityPluginJoinSync("manager-toggle");
+      return;
+    }
+    this.startCommunityPluginJoinNow();
+  }
+
+  /**
+   * User-facing join tail for one-shot explicit actions (adoption
+   * 「下载并同步」): start one manual sync round right away so the download
+   * begins immediately, instead of waiting for the next automatic round
+   * (2026-09-09 用户反馈：点击后处理不立即开始，要等下次甚至重启后的同步).
+   * Manager toggles no longer use this tail per toggle — they defer to the
+   * dirty hint and the manager close flush (2026-09-09 批量反馈).
+   * The manual path is unaffected by `autoSyncPaused` and the sync interval.
+   * Falls back to the ordinary dirty-hint scheduling while the executor is
+   * busy, the operation lock is held, or the very first sync has not settled
+   * yet (join handling there belongs to the in-flight/startup flow).
+   */
+  private startCommunityPluginJoinNow(): void {
+    if (
+      this.opLock !== null
+      || !this.syncExecutor
+      || this.syncExecutor.isRunning
+      || !this.hasCompletedSyncState()
+    ) {
+      this.scheduleCommunityPluginJoinSync();
+      return;
+    }
+    void this.startManualSync().catch((error) => {
+      this.diag?.warn(
+        "state",
+        "community plugin join immediate sync did not start",
+        error instanceof Error ? error.message : String(error),
+      );
+    });
+  }
+
+  /**
+   * Manager-close tail (2026-09-09 批量反馈): one round covering every join
+   * request batched while the manager was open. No-op without pending joins
+   * so plain scope views never start empty rounds; the round itself follows
+   * the same immediate-or-dirty-hint path as the adoption button.
+   */
+  flushPendingCommunityPluginJoinSync(): void {
+    if (!this.hasPendingCommunityPluginJoin()) return;
+    this.startCommunityPluginJoinNow();
+  }
+
+  /**
+   * Pending new-plugin rows for the sidebar. Only returned while the
+   * community-plugin files scope is on; the persisted memory itself stays
+   * untouched, so re-enabling restores the same proposals.
+   */
+  getCommunityPluginAdoptionRows(): CommunityPluginAdoptionRow[] {
+    if (!this.syncCommunityPlugins) return [];
+    const state = this.state;
+    if (
+      !state
+      || typeof state.getCommunityPluginAdoptionMemory !== "function"
+    ) {
+      return [];
+    }
+    let memory: ReturnType<typeof state.getCommunityPluginAdoptionMemory>;
+    try {
+      memory = state.getCommunityPluginAdoptionMemory();
+    } catch {
+      return [];
+    }
+    return memory.pendingPluginIds.map((pluginId) => {
+      const fact = this.communityPluginAdoptionPlatformFacts.get(pluginId);
+      const name = fact?.name?.trim();
+      return {
+        pluginId,
+        displayName: name && name.length > 0 ? name : pluginId,
+        desktopOnly: fact?.isDesktopOnly === true,
+      };
+    });
+  }
+
+  /** Sidebar「跳过」：record the device-local ignore; the row retires. */
+  async skipCommunityPluginAdoption(pluginId: string): Promise<void> {
+    try {
+      await this.persistCommunityPluginAdoptionCommand({
+        type: "ignore",
+        pluginId,
+      });
+    } catch (error) {
+      // A failed memory write keeps the row visible; the next click retries.
+      // Never turn a side-bar action into an unhandled rejection.
+      this.diag.warn(
+        "state",
+        "failed to record the community plugin adoption ignore",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  /**
+   * Sidebar「下载并同步」：retire the pending row, then take the ordinary
+   * explicit join path. Auto-enable without restart is slice 3.
+   */
+  async downloadCommunityPluginAdoption(pluginId: string): Promise<void> {
+    try {
+      await this.persistCommunityPluginAdoptionCommand({
+        type: "remove-pending",
+        pluginId,
+      });
+    } catch (error) {
+      // Row retirement is best-effort: a failed write leaves the row visible
+      // and the join below still runs; a successful join makes the next
+      // round-end reconcile drop the row anyway.
+      this.diag.warn(
+        "state",
+        "failed to retire the community plugin adoption row before download",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    try {
+      // Queued behind an in-flight round instead of surfacing busy — the
+      // sidebar click must never bounce (2026-09-09 卡手反馈).
+      await this.runSettingsMutationWhenSyncIdle(() =>
+        this.updateCommunityPluginFilesSelection(pluginId, true),
+      );
+    } catch (error) {
+      const pathErrorCode =
+        typeof SyncPathSettingsUpdateError === "function"
+          && error instanceof SyncPathSettingsUpdateError
+        ? error.code
+        : null;
+      const key = pathErrorCode === "busy"
+        ? "notice.communityPlugins.downloadBusy"
+        : pathErrorCode === "recovery"
+          ? "notice.communityPlugins.downloadRecovery"
+          : "notice.communityPlugins.downloadFailed";
+      this.noticeCenter?.show({
+        key: "side-action:adoption:download-failed",
+        message: this.i18n.t(key),
+        priority: NOTICE_PRIORITY.info,
+      });
+      this.diag.warn(
+        "state",
+        "community plugin download did not start",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  private async persistCommunityPluginAdoptionCommand(
+    command: Readonly<CommunityPluginAdoptionMemoryCommand>,
+  ): Promise<void> {
+    const state = this.state;
+    if (
+      !state
+      || typeof state.getCommunityPluginAdoptionMemory !== "function"
+      || typeof state.updateCommunityPluginAdoptionMemory !== "function"
+    ) {
+      return;
+    }
+    const memory = state.getCommunityPluginAdoptionMemory();
+    const next = reduceCommunityPluginAdoptionMemory(
+      memory,
+      command,
+      this.manifest.id,
+    );
+    if (JSON.stringify(next) !== JSON.stringify(memory)) {
+      await state.updateCommunityPluginAdoptionMemory(next);
+    }
+  }
+
+  /** Reversal memory: an explicit join re-opens the plugin — forget the
+   *  ignore and drop any pending row for it. */
+  private async clearCommunityPluginAdoptionFor(
+    pluginId: string,
+  ): Promise<void> {
+    await this.persistCommunityPluginAdoptionCommand({
+      type: "clear-ignore",
+      pluginId,
+    });
+    await this.persistCommunityPluginAdoptionCommand({
+      type: "remove-pending",
+      pluginId,
+    });
+  }
+
+  /** Explicit re-join revokes the hidden cloud-cleanup state: drop the
+   *  marker so the row can never stay hidden after the user re-adopts the
+   *  plugin on this device. */
+  private clearCommunityPluginCloudCleanupMarker(pluginId: string): void {
+    try {
+      const markers = this.readCommunityPluginCloudCleanupMarkers();
+      const remaining = markers.filter((marker) =>
+        marker.pluginId !== pluginId
+      );
+      if (remaining.length !== markers.length) {
+        this.writeCommunityPluginCloudCleanupMarkers(remaining);
+      }
+    } catch (error) {
+      this.diag.warn(
+        "state",
+        "failed to clear the cloud cleanup marker after an explicit join",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }
 
   private async commitCommunityPluginParticipationCommand(
@@ -6195,8 +6998,46 @@ export default class EasySyncPlugin extends Plugin {
           ownPluginId: this.manifest.id,
         });
         await state.setRemoteCommunityPluginCatalog(catalog);
+        try {
+          // Display-facts light reads (G6-1): once per unobserved remote-only
+          // bundle, read the manifest body so the inventory can show the real
+          // name and isDesktopOnly flag instead of falling back to the id.
+          // Failure is silent — the refresh result and the trusted catalog
+          // must never be affected by a presentation-evidence miss.
+          await ensureCommunityPluginDisplayFacts({
+            scope,
+            configDir: getConfigDir(this.app.vault),
+            catalog,
+            previousCatalog: previous,
+            storedObservations:
+              state.getCommunityPluginManifestObservations(),
+            fetchManifestText: async (_pluginId, member) => {
+              const content = await onedrive.downloadFile(
+                this.app.vault.getName(),
+                member.path,
+                undefined,
+                member.remoteId,
+                member.size,
+              );
+              return new TextDecoder("utf-8", { fatal: true }).decode(content);
+            },
+            persist: async (observations) => {
+              await state.setCommunityPluginManifestObservations(
+                observations,
+              );
+            },
+            now: Date.now(),
+          });
+        } catch (error) {
+          this.diag?.warn(
+            "state",
+            "community plugin display facts were not ensured; names may fall back to plugin ids",
+            error instanceof Error ? error.message : String(error),
+          );
+        }
         this.communityPluginCatalogRefreshConsecutiveFailures = 0;
         this.communityPluginCatalogLastRefreshFailureAt = 0;
+        this.sweepResurrectedCloudCleanupMarkersAgainstCatalog(catalog);
         this.advanceCommunityPluginInventoryRevision();
         return catalog;
       } catch (error) {
@@ -6249,6 +7090,162 @@ export default class EasySyncPlugin extends Plugin {
     return catalog && sameSyncScope(catalog.scope, state?.remoteScope ?? null)
       ? catalog
       : null;
+  }
+
+  /**
+   * Round-end catalog freshness (slice 2): after an ordinary settled round,
+   * rebuild the remote community-plugin catalog from the round's committed
+   * remote index — zero extra network requests — and then light-read display
+   * facts for previously unseen bundles through the same bounded G6-1 probe
+   * the manager-open refresh uses. Any failure silently keeps the last
+   * trusted catalog and never changes the round outcome or scheduling.
+   */
+  private async syncRoundCommunityPluginCatalogUpdate(): Promise<void> {
+    const state = this.state;
+    const onedrive = this.onedrive;
+    const scope = state?.remoteScope;
+    if (!state?.isV2StateActive || !onedrive || !scope) return;
+    if (!this.syncCommunityPlugins) return;
+    if (this.syncExecutor?.hasActivityInFlight) return;
+    const committedIndex = state.getCommittedRemoteIndex();
+    if (
+      !committedIndex
+      || committedIndex.filesRootId !== scope.filesRootId
+    ) {
+      return;
+    }
+    const previous = this.getCurrentRemoteCommunityPluginCatalog();
+    try {
+      const next = await buildRemoteCommunityPluginCatalogFromIndex({
+        scope,
+        configDir: getConfigDir(this.app.vault),
+        index: committedIndex,
+        manifestObservations: state.getCommunityPluginManifestObservations(),
+        observedAt: Date.now(),
+        previous,
+        ownPluginId: this.manifest.id,
+      });
+      // The committed index only covers anchored folders (joined plugins).
+      // Never overwrite the delta-fresh catalog with that narrower view:
+      // keep the superset so unanchored cloud bundles stay visible and rows
+      // do not flicker away between manager refreshes.
+      const catalog = await mergeRemoteCommunityPluginCatalogKeepingSuperset(
+        previous,
+        next,
+      );
+      await state.setRemoteCommunityPluginCatalog(catalog);
+      try {
+        await ensureCommunityPluginDisplayFacts({
+          scope,
+          configDir: getConfigDir(this.app.vault),
+          catalog,
+          previousCatalog: previous,
+          storedObservations:
+            state.getCommunityPluginManifestObservations(),
+          fetchManifestText: async (_pluginId, member) => {
+            const content = await onedrive.downloadFile(
+              this.app.vault.getName(),
+              member.path,
+              undefined,
+              member.remoteId,
+              member.size,
+            );
+            return new TextDecoder("utf-8", { fatal: true }).decode(content);
+          },
+          persist: async (observations) => {
+            await state.setCommunityPluginManifestObservations(observations);
+          },
+          now: Date.now(),
+        });
+      } catch (error) {
+        this.diag?.warn(
+          "state",
+          "round-end community plugin display facts were not ensured; names may fall back to plugin ids",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      this.communityPluginCatalogRefreshConsecutiveFailures = 0;
+      this.communityPluginCatalogLastRefreshFailureAt = 0;
+      this.sweepResurrectedCloudCleanupMarkersAgainstCatalog(catalog);
+      // Sidebar adoption memory (slice 2): reconcile this device's pending
+      // new-plugin rows with the round's fresh facts. Ignored plugins stay
+      // suppressed; rows whose plugin joined, vanished, or turned partial
+      // disappear without tombstones. Failures degrade silently — the next
+      // settled round reconciles again.
+      try {
+        const participation = this.communityPluginParticipation;
+        if (
+          participation
+          && typeof state.getCommunityPluginAdoptionMemory === "function"
+          && typeof state.updateCommunityPluginAdoptionMemory === "function"
+        ) {
+          const memoryStore = state.getCommunityPluginAdoptionMemory();
+          const manifestObservations =
+            state.getCommunityPluginManifestObservations();
+          const platformFacts = await resolveCommunityPluginPlatformFacts(
+            scope,
+            catalog,
+            manifestObservations,
+            this.manifest.id,
+          );
+          this.communityPluginAdoptionPlatformFacts = platformFacts;
+          // The adoption row promises "not yet downloaded on this device":
+          // a complete local bundle (installed, sync toggle off) fails that
+          // premise and rejoins via the manager toggle instead. Facts
+          // unavailable -> keep the pre-gate phase-only behavior.
+          let localBundleFacts:
+            | ReadonlyMap<string, CommunityPluginLocalBundleFact>
+            | undefined;
+          try {
+            localBundleFacts = await this
+              .observeCommunityPluginLocalBundleFacts(
+                catalog.entries
+                  .filter((entry) => entry.bundleState === "complete")
+                  .map((entry) => entry.pluginId),
+              );
+          } catch (error) {
+            this.diag?.warn(
+              "state",
+              "round-end community plugin local bundle facts were not observed; adoption rows keep phase-only gating",
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+          const candidates = await deriveCommunityPluginAdoptionCandidates({
+            scope,
+            catalog,
+            participation,
+            memory: memoryStore,
+            manifestObservations,
+            platformFacts,
+            localBundleFacts,
+            isMobile: Platform.isMobile,
+            ownPluginId: this.manifest.id,
+          });
+          const next = reduceCommunityPluginAdoptionMemory(
+            memoryStore,
+            { type: "reconcile-pending", pluginIds: candidates },
+            this.manifest.id,
+          );
+          if (JSON.stringify(next) !== JSON.stringify(memoryStore)) {
+            await state.updateCommunityPluginAdoptionMemory(next);
+            this.updateStatusBar();
+            this.syncView?.render();
+          }
+        }
+      } catch (error) {
+        this.diag?.warn(
+          "state",
+          "round-end community plugin adoption reconcile failed — pending rows stay unchanged",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    } catch (error) {
+      this.diag?.warn(
+        "state",
+        "round-end community plugin catalog update failed — keeping the last trusted catalog",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }
 
   onCommunityPluginInventoryRevision(

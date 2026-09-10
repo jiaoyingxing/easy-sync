@@ -223,29 +223,47 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
     }
 
     if (bundle) {
-      if (!bundle.local.available && bundle.local.reason) {
+      // The directory holds two different plugins on the two sides: no
+      // keep-side choice exists at all. A single explanatory notice replaces
+      // the two duplicated "side unavailable" lines plus the generic
+      // read-only sentence, which would otherwise read as a temporary state
+      // the user is expected to resolve by picking a side.
+      const identityMismatchOnBothSides = Boolean(
+        !bundle.local.available
+        && bundle.local.reason === "identity-mismatch"
+        && !bundle.remote.available
+        && bundle.remote.reason === "identity-mismatch",
+      );
+      if (identityMismatchOnBothSides) {
         body.createEl("p", {
-          text: this.t("syncView.pluginBundleReview.directionUnavailable", {
-            side: this.t("syncView.mutationResolution.localTitle"),
-            reason: bundleReasonText(bundle.local.reason, this.t),
-          }),
+          text: this.t("syncView.pluginBundleReview.identityMismatchNotice"),
           cls: "easy-sync-comparison-unavailable",
         });
-      }
-      if (!bundle.remote.available && bundle.remote.reason) {
-        body.createEl("p", {
-          text: this.t("syncView.pluginBundleReview.directionUnavailable", {
-            side: this.t("syncView.mutationResolution.remoteTitle"),
-            reason: bundleReasonText(bundle.remote.reason, this.t),
-          }),
-          cls: "easy-sync-comparison-unavailable",
-        });
-      }
-      if (!bundle.executionReady) {
-        body.createEl("p", {
-          text: this.t("syncView.pluginBundleReview.readOnly"),
-          cls: "easy-sync-comparison-unavailable",
-        });
+      } else {
+        if (!bundle.local.available && bundle.local.reason) {
+          body.createEl("p", {
+            text: this.t("syncView.pluginBundleReview.directionUnavailable", {
+              side: this.t("syncView.mutationResolution.localTitle"),
+              reason: bundleReasonText(bundle.local.reason, this.t),
+            }),
+            cls: "easy-sync-comparison-unavailable",
+          });
+        }
+        if (!bundle.remote.available && bundle.remote.reason) {
+          body.createEl("p", {
+            text: this.t("syncView.pluginBundleReview.directionUnavailable", {
+              side: this.t("syncView.mutationResolution.remoteTitle"),
+              reason: bundleReasonText(bundle.remote.reason, this.t),
+            }),
+            cls: "easy-sync-comparison-unavailable",
+          });
+        }
+        if (!bundle.executionReady) {
+          body.createEl("p", {
+            text: this.t("syncView.pluginBundleReview.readOnly"),
+            cls: "easy-sync-comparison-unavailable",
+          });
+        }
       }
       const executableChoices = bundle.executableChoices ?? [];
       this.renderFileComparisonActions([

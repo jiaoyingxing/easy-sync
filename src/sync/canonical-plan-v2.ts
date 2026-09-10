@@ -68,6 +68,7 @@ export interface CanonicalPlanFactsV2 {
   localFolderScanComplete: boolean;
   skippedLarge: readonly string[];
   localMoveHints?: readonly LocalFolderMoveHintV1[];
+  localFileMoveHints?: readonly LocalFolderMoveHintV1[];
   includeFilePath?: (path: string) => boolean;
   includeFolderPath?: (path: string) => boolean;
   preserveFolderPath?: (path: string) => boolean;
@@ -558,6 +559,36 @@ function composeCanonicalActionsV2(
       .some((path) =>
         [...protectedRoots].some((root) => isAtOrBelowPath(path, root))),
   );
+
+  // Slice-2: a file whose recorded out-of-scope destination is positively
+  // outside the sync scope (and not the vault trash) must not silently fall
+  // into the "local disappearance == deletion" path. Hold its remote deletion
+  // as a reviewable scope-crossing deferral until the user undoes the move or
+  // confirms leaving sync. Trash destinations and destinations that are back
+  // in scope keep their ordinary semantics.
+  const fileScopeCrossingHoldPaths = collectFileScopeCrossingHolds(
+    input.localFileMoveHints ?? [],
+    state,
+    input.includeFilePath ?? (() => true),
+  );
+  if (fileScopeCrossingHoldPaths.size > 0) {
+    const heldFileItems: SyncPlanItem[] = [];
+    for (const candidate of fileItems) {
+      if (
+        candidate.type === SyncActionType.DeleteRemote
+        && fileScopeCrossingHoldPaths.has(normalizeRemotePathKey(candidate.path))
+      ) {
+        deferredItems.push({
+          type: SyncActionType.FolderDeferred,
+          path: candidate.path,
+          reason: "reason.file.scope-crossing",
+        });
+      } else {
+        heldFileItems.push(candidate);
+      }
+    }
+    fileItems = heldFileItems;
+  }
 
   const identityItems: SyncPlanItem[] = [];
   const identityReplacements: CanonicalIdentityReplacementV2[] = [];
@@ -1973,6 +2004,34 @@ function isFolderPlanAction(type: SyncActionType): boolean {
   return isFolderCreateAction(type)
     || isFolderMoveAction(type)
     || isFolderDeleteAction(type);
+}
+
+/**
+ * Collect the old-path hold keys of file out-of-scope destination hints that
+ * are still bound to a committed file identity and point outside the current
+ * sync scope (but not into the vault trash). Mirrors the acceptance rules of
+ * the record layer (state-manager) and revalidates the destination against
+ * the current scope so a hint whose destination re-entered the scope becomes
+ * inert without any state write.
+ */
+function collectFileScopeCrossingHolds(
+  hints: readonly LocalFolderMoveHintV1[],
+  state: CanonicalPlannerStateV2,
+  includeFilePath: (path: string) => boolean,
+): Set<string> {
+  const holds = new Set<string>();
+  for (const hint of hints) {
+    if (!sameSyncScope(hint.scope, state.scope)) continue;
+    if (hint.toPath === ".trash" || hint.toPath.startsWith(".trash/")) continue;
+    const anchored = state.fileAnchors.some((anchor) =>
+      anchor.remoteId === hint.remoteId
+      && normalizeRemotePathKey(anchor.lastPath)
+        === normalizeRemotePathKey(hint.fromPath));
+    if (!anchored) continue;
+    if (includeFilePath(hint.toPath)) continue;
+    holds.add(normalizeRemotePathKey(hint.fromPath));
+  }
+  return holds;
 }
 
 function toDeferredFolderPlanItem(

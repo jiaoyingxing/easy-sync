@@ -2,7 +2,9 @@ import "fake-indexeddb/auto";
 import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { Platform, TFile, TFolder, type DataAdapter } from "obsidian";
-import EasySyncPlugin from "../src/main";
+import EasySyncPlugin, {
+  type DeferredSettingsMutationHandle,
+} from "../src/main";
 import type { OneDriveClient } from "../src/onedrive/client";
 import {
   OneDriveError,
@@ -11994,6 +11996,116 @@ describe("V1 to V2 controlled production activation", () => {
     expect((await harness.executor.run("manual")).foldersDeleted).toBe(0);
   });
 
+  it("mirrors a folder moved into the vault trash as a remote deletion", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    // Obsidian 删除到回收站=一次 rename：移动证据绑定到 committed 身份，
+    // 而 .trash 是扫描硬排除区，本地不再返回该文件夹；云端目录仍在原路径。
+    expect(await harness.state.recordLocalFolderMoveHint("Notes", ".trash/Notes"))
+      .toBe(true);
+    harness.localEntryState.splice(0);
+    harness.localFolderPaths.delete("Notes");
+    vi.mocked(harness.scanner.shouldSyncFolderPath).mockImplementation(
+      (path) => !path.startsWith(".trash"),
+    );
+
+    const deleted = await harness.executor.run("manual");
+
+    expect(harness.diag.error).not.toHaveBeenCalled();
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(deleted).toMatchObject({
+      success: true,
+      deleted: 1,
+      foldersDeleted: 1,
+      errors: 0,
+      deferred: 0,
+    });
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes")).toBeNull();
+    expect(harness.state.localFolderMoveHints).toHaveLength(0);
+    expect(harness.state.mutationLedger).toHaveLength(0);
+    expect((await harness.executor.run("manual")).foldersDeleted).toBe(0);
+  });
+
+  it("retires a legacy scope-crossing pending row once the trash move plan moves on", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    // 修复前现场：folderDeferred 行无 issueCode（reason 路由当时不存在）。
+    await harness.state.reconcilePendingIssues([{
+      path: "Notes",
+      actionType: SyncActionType.FolderDeferred,
+      reason: "这个文件夹被移动、删除，或已不在当前同步设置中。",
+      updatedAt: 1,
+    }], []);
+    expect(await harness.state.recordLocalFolderMoveHint("Notes", ".trash/Notes"))
+      .toBe(true);
+    harness.localEntryState.splice(0);
+    harness.localFolderPaths.delete("Notes");
+    vi.mocked(harness.scanner.shouldSyncFolderPath).mockImplementation(
+      (path) => !path.startsWith(".trash"),
+    );
+
+    const deleted = await harness.executor.run("manual");
+
+    expect(deleted).toMatchObject({
+      success: true,
+      foldersDeleted: 1,
+      deferred: 0,
+      errors: 0,
+    });
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes")).toBeNull();
+    expect((await harness.executor.run("manual")).foldersDeleted).toBe(0);
+  });
+
+  it("deletes an empty remote folder shell when Graph omits the folder cTag", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    // 主库真实现场：OneDrive Personal 对文件夹不返回 cTag，空壳删除的
+    // If-Match 只能使用 exact 核验已通过的 eTag；cTag 缺失不应让空壳删除
+    // 永远延后（每轮重复、用户无出口）。
+    delete (findRemoteItemByPath(harness.remoteItemState, "Notes") as {
+      cTag?: string;
+    }).cTag;
+    harness.localEntryState.splice(0);
+    harness.localFolderPaths.delete("Notes");
+
+    const deleted = await harness.executor.run("manual");
+
+    expect(harness.diag.error).not.toHaveBeenCalled();
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(deleted).toMatchObject({
+      success: true,
+      deleted: 1,
+      foldersDeleted: 1,
+      errors: 0,
+      deferred: 0,
+    });
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes")).toBeNull();
+    expect(harness.state.mutationLedger).toHaveLength(0);
+    expect((await harness.executor.run("manual")).foldersDeleted).toBe(0);
+  });
+
   it("recovers a lost remote file-delete response only after exact item 404", async () => {
     const harness = makeHarness();
     await harness.state.load();
@@ -12473,7 +12585,12 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.mutations.deleteItem).toHaveBeenCalledOnce();
   });
 
-  it("keeps an automatic remote empty-folder delete fail-closed without a folder cTag", async () => {
+  it("deletes an automatic empty remote folder with the verified eTag when Graph omits the folder cTag", async () => {
+    // OneDrive Personal does not return folder cTags; before this fallback the
+    // empty-shell delete deferred forever ("无法安全确认这个空文件夹") with no
+    // user-side remedy on every round. The exact inspection already verified
+    // identity and eTag twice with empty children, so the eTag If-Match plus
+    // the read-back keeps the deletion chain fail-safe.
     const harness = makeHarness({
       base: [],
       local: [],
@@ -12496,18 +12613,24 @@ describe("V1 to V2 controlled production activation", () => {
     )).success).toBe(true);
     harness.localFolderPaths.delete("Empty");
 
-    const deferred = await harness.executor.run("manual");
+    const deleted = await harness.executor.run("manual");
 
-    expect(deferred).toMatchObject({
+    expect(deleted).toMatchObject({
       success: true,
-      foldersDeleted: 0,
-      deferred: 1,
+      foldersDeleted: 1,
+      deferred: 0,
       errors: 0,
     });
-    expect(findRemoteItemByPath(harness.remoteItemState, "Empty")?.folder)
-      .toBeTruthy();
-    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(findRemoteItemByPath(harness.remoteItemState, "Empty")).toBeNull();
+    expect(harness.mutations.deleteItem).toHaveBeenCalledOnce();
+    expect(harness.mutations.deleteItem).toHaveBeenCalledWith(
+      expect.anything(),
+      "Empty",
+      "etag-folder-empty",
+      "folder-empty",
+    );
     expect(harness.state.mutationLedger).toEqual([]);
+    expect((await harness.executor.run("manual")).foldersDeleted).toBe(0);
   });
 
   it("retries a failed folder-delete checkpoint without deleting twice", async () => {
@@ -13367,10 +13490,14 @@ describe("V1 to V2 controlled production activation", () => {
       .mockResolvedValue(undefined);
     vi.spyOn(settingsPlugin as never, "updateStatusBar")
       .mockImplementation(() => undefined);
-    const scheduleCommunityPluginJoinSync = vi.spyOn(
+    const startCommunityPluginJoinNow = vi.spyOn(
+      settingsPlugin as never,
+      "startCommunityPluginJoinNow",
+    ).mockImplementation(() => undefined);
+    const scheduleJoinSync = vi.spyOn(
       settingsPlugin as never,
       "scheduleCommunityPluginJoinSync",
-    );
+    ).mockImplementation(() => undefined);
     const settingsUpdateQueue = new SequentialSettingsUpdateQueue();
     let settingsUpdateError: unknown;
     const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
@@ -13379,6 +13506,7 @@ describe("V1 to V2 controlled production activation", () => {
       inventory: initialInventory,
       busyPluginRows: new Set<string>(),
       pendingPluginValues: new Map<string, boolean>(),
+      pendingMutationCancels: new Map<string, () => boolean>(),
       settingsUpdateQueue,
       destroyed: true,
       renderPluginListArea: vi.fn(),
@@ -13418,8 +13546,12 @@ describe("V1 to V2 controlled production activation", () => {
       (path) => harness.files.has(path),
     )).toBe(false);
     expectNoFileMutations(harness.mutations);
-    const immediateSyncScheduled =
-      scheduleCommunityPluginJoinSync.mock.calls.length > 0;
+    // Manager toggles stay decoupled from the sync engine (2026-09-09 批量
+    // 反馈): the join request persists at toggle time and the round is left
+    // to the shared dirty trigger until the manager modal closes.
+    const joinRoundDeferredToDirtyHint =
+      startCommunityPluginJoinNow.mock.calls.length === 0
+      && scheduleJoinSync.mock.calls.length > 0;
     const automaticResult = await (settingsPlugin as unknown as {
       dispatchSyncRun(request: { mode: "auto" }): Promise<SyncResult | null>;
     }).dispatchSyncRun({ mode: "auto" });
@@ -13503,15 +13635,97 @@ describe("V1 to V2 controlled production activation", () => {
 
     expect({
       remoteOnlyVisibleBeforeJoin,
-      immediateSyncScheduled,
+      joinRoundDeferredToDirtyHint,
       restoredBeforeManualRun,
       enabledMissingHasActionablePhase,
     }).toEqual({
       remoteOnlyVisibleBeforeJoin: true,
-      immediateSyncScheduled: true,
+      joinRoundDeferredToDirtyHint: true,
       restoredBeforeManualRun: true,
       enabledMissingHasActionablePhase: true,
     });
+  });
+
+  it("flushes deferred community plugin joins when the manager modal closes", async () => {
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    const flush = vi.fn();
+    const onCloseCallback = vi.fn();
+    Object.assign(modal as object, {
+      plugin: { flushPendingCommunityPluginJoinSync: flush },
+      destroyed: false,
+      loadGeneration: 0,
+      inventoryRevisionRefreshPending: false,
+      unsubscribeCommunityPluginInventoryRevision: null,
+      contentEl: { empty: vi.fn() },
+      settingsUpdateQueue: new SequentialSettingsUpdateQueue(),
+      onCloseCallback,
+    });
+    modal.onClose();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(flush).toHaveBeenCalledTimes(1);
+    expect(onCloseCallback).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancels a queued manager toggle from its row handle and reverts the row", async () => {
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    let releaseMutation!: () => void;
+    let cancelFn = (): boolean => false;
+    const updateSelection = vi.fn(() => Promise.resolve());
+    const plugin = {
+      runSettingsMutationWhenSyncIdle: () => {
+        const promise = new Promise<void>((resolve) => {
+          releaseMutation = resolve;
+          cancelFn = () => {
+            resolve();
+            return true;
+          };
+        }) as DeferredSettingsMutationHandle;
+        promise.cancel = () => cancelFn();
+        promise.isQueued = () => true;
+        return promise;
+      },
+      updateCommunityPluginFilesSelection: updateSelection,
+    };
+    Object.assign(modal as object, {
+      plugin,
+      busyPluginRows: new Set<string>(),
+      pendingPluginValues: new Map<string, boolean>(),
+      pendingMutationCancels: new Map<string, DeferredSettingsMutationHandle>(),
+      settingsUpdateQueue: new SequentialSettingsUpdateQueue(),
+      destroyed: true,
+      renderPluginListArea: vi.fn(),
+    });
+
+    // The mutation is created eagerly at click time (queued behind a round),
+    // so its cancel handle exists before sync goes idle.
+    (modal as unknown as {
+      queuePluginSelectionUpdate(
+        column: "files" | "data",
+        pluginId: string,
+        enabled: boolean,
+      ): void;
+    }).queuePluginSelectionUpdate("files", "calendar", true);
+    expect(updateSelection).not.toHaveBeenCalled();
+    const handles = (modal as unknown as {
+      pendingMutationCancels: Map<string, DeferredSettingsMutationHandle>;
+    }).pendingMutationCancels;
+    expect(typeof handles.get("files:calendar")?.cancel).toBe("function");
+    expect(handles.get("files:calendar")?.isQueued()).toBe(true);
+
+    // Undo: the queued mutation is dropped, the row reverts and unlocks, and
+    // the commit never runs even after the round releases.
+    expect(handles.get("files:calendar")!.cancel()).toBe(true);
+    await (modal as unknown as {
+      settingsUpdateQueue: SequentialSettingsUpdateQueue;
+    }).settingsUpdateQueue.whenIdle();
+    expect(updateSelection).not.toHaveBeenCalled();
+    expect(
+      (modal as unknown as { busyPluginRows: Set<string> }).busyPluginRows.has(
+        "files:calendar",
+      ),
+    ).toBe(false);
+    expect(handles.has("files:calendar")).toBe(false);
+    releaseMutation();
   });
 
   it.each([
@@ -21345,5 +21559,427 @@ describe("shared protocol V2 slot self-healing", () => {
     // No repair happened: both slots keep their deviant contents.
     const v2After = harness.getSharedProtocolV2();
     expect(JSON.parse(v2After!.content).migrationGeneration).toBe(hashB);
+  });
+});
+
+// ---- 切片 2：文件移出同步范围的去向 hint（记录层，红测先行）----
+describe("slice-2 file out-of-scope move hints (record layer)", () => {
+  async function activatedHarness() {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    return harness;
+  }
+
+  it("binds a move of a synced file to its committed identity and retains the destination", async () => {
+    const harness = await activatedHarness();
+
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Notes/a.md",
+      "Archive/a.md",
+    )).toBe(true);
+
+    expect(harness.state.localFileMoveHints).toEqual([
+      expect.objectContaining({
+        version: 1,
+        scope,
+        remoteId: "file-a",
+        fromPath: "Notes/a.md",
+        toPath: "Archive/a.md",
+      }),
+    ]);
+  });
+
+  it("rejects a move whose source path is not bound to a committed file anchor", async () => {
+    const harness = await activatedHarness();
+
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Notes/never-synced.md",
+      "Archive/never-synced.md",
+    )).toBe(false);
+    expect(harness.state.localFileMoveHints).toEqual([]);
+  });
+
+  it("rejects non-vault-relative or identity-equal moves", async () => {
+    const harness = await activatedHarness();
+
+    expect(await harness.state.recordLocalFileMoveHint(
+      "C:/outside/a.md",
+      "Archive/a.md",
+    )).toBe(false);
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Notes/a.md",
+      "Notes/a.md",
+    )).toBe(false);
+    expect(harness.state.localFileMoveHints).toEqual([]);
+  });
+
+  it("chains a second out-of-scope move back to the original synced path", async () => {
+    const harness = await activatedHarness();
+
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Notes/a.md",
+      "Archive/a.md",
+    )).toBe(true);
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Archive/a.md",
+      "Archive/sub/a.md",
+    )).toBe(true);
+
+    expect(harness.state.localFileMoveHints).toHaveLength(1);
+    expect(harness.state.localFileMoveHints[0]).toMatchObject({
+      remoteId: "file-a",
+      fromPath: "Notes/a.md",
+      toPath: "Archive/sub/a.md",
+    });
+  });
+
+  it("keeps one hint per remote id and replaces it on a newer move", async () => {
+    const harness = await activatedHarness();
+
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Notes/a.md",
+      "Archive/a.md",
+    )).toBe(true);
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Notes/a.md",
+      "Archive-2/a.md",
+    )).toBe(true);
+
+    expect(harness.state.localFileMoveHints).toHaveLength(1);
+    expect(harness.state.localFileMoveHints[0]).toMatchObject({
+      remoteId: "file-a",
+      fromPath: "Notes/a.md",
+      toPath: "Archive-2/a.md",
+    });
+  });
+
+  it("retains nothing when the file moves back to its original synced path", async () => {
+    const harness = await activatedHarness();
+
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Notes/a.md",
+      "Archive/a.md",
+    )).toBe(true);
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Archive/a.md",
+      "Notes/a.md",
+    )).toBe(true);
+
+    expect(harness.state.localFileMoveHints).toEqual([]);
+  });
+
+  it("keeps folder move hints untouched while file hints are recorded", async () => {
+    const harness = await activatedHarness();
+
+    expect(await harness.state.recordLocalFolderMoveHint("Notes", "Archive"))
+      .toBe(true);
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Notes/a.md",
+      "Archive/a.md",
+    )).toBe(true);
+
+    expect(harness.state.localFolderMoveHints).toHaveLength(1);
+    expect(harness.state.localFileMoveHints).toHaveLength(1);
+  });
+});
+
+// ---- 切片 2：文件移出同步范围 → 规划层 hold（红测先行）----
+describe("slice-2 file scope-crossing planner hold", () => {
+  async function activatedHarness() {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    return harness;
+  }
+
+  function excludeArchive(harness: ReturnType<typeof makeHarness>): void {
+    vi.mocked(harness.scanner.shouldSyncPath).mockImplementation(
+      (path: string) => !path.startsWith("Archive"),
+    );
+    vi.mocked(harness.scanner.shouldSyncFolderPath).mockImplementation(
+      (path: string) => !path.startsWith("Archive"),
+    );
+  }
+
+  it("holds the remote deletion of a file moved out of sync scope and raises a scope-crossing row", async () => {
+    const harness = await activatedHarness();
+    excludeArchive(harness);
+
+    // 文件被移进已排除目录：旧路径仍被扫描覆盖（本地缺失、远端未变），
+    // 现役会静默 DeleteRemote。去向 hint 应把该删除 hold 成一行待表态。
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Notes/a.md",
+      "Archive/a.md",
+    )).toBe(true);
+    harness.localEntryState.splice(0);
+
+    const held = await harness.executor.run("manual");
+
+    expect(held).toMatchObject({
+      success: true,
+      deleted: 0,
+      errors: 0,
+      deferred: 1,
+    });
+    expect(harness.state.pendingIssues).toEqual([
+      expect.objectContaining({
+        path: "Notes/a.md",
+        issueCode: "scope-crossing",
+      }),
+    ]);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes/a.md")).not.toBeNull();
+    expect(harness.state.mutationLedger).toHaveLength(0);
+
+    // 表态前每轮稳定挂起，不静默删、不收敛成删除。
+    const again = await harness.executor.run("manual");
+    expect(again).toMatchObject({ success: true, deleted: 0, errors: 0 });
+    expect(harness.state.pendingIssues).toEqual([
+      expect.objectContaining({
+        path: "Notes/a.md",
+        issueCode: "scope-crossing",
+      }),
+    ]);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes/a.md")).not.toBeNull();
+  });
+
+  it("keeps the silent trash deletion semantics even when a file hint points into .trash", async () => {
+    const harness = await activatedHarness();
+
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Notes/a.md",
+      ".trash/a.md",
+    )).toBe(true);
+    harness.localEntryState.splice(0);
+
+    const deleted = await harness.executor.run("manual");
+
+    expect(deleted).toMatchObject({
+      success: true,
+      deleted: 1,
+      errors: 0,
+      deferred: 0,
+    });
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes/a.md")).toBeNull();
+    expect(harness.state.mutationLedger).toHaveLength(0);
+  });
+
+  it("raises only the folder row when a folder move carries the file out of scope", async () => {
+    const harness = await activatedHarness();
+    excludeArchive(harness);
+
+    expect(await harness.state.recordLocalFolderMoveHint("Notes", "Archive"))
+      .toBe(true);
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Notes/a.md",
+      "Archive/a.md",
+    )).toBe(true);
+    harness.localEntryState.splice(0);
+    harness.localFolderPaths.delete("Notes");
+
+    const held = await harness.executor.run("manual");
+
+    expect(held).toMatchObject({
+      success: true,
+      deleted: 0,
+      errors: 0,
+    });
+    expect(harness.state.pendingIssues).toEqual([
+      expect.objectContaining({
+        path: "Notes",
+        issueCode: "scope-crossing",
+      }),
+    ]);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes/a.md")).not.toBeNull();
+    expect(harness.state.mutationLedger).toHaveLength(0);
+  });
+});
+
+// ---- 切片 2：scope-crossing 行出口（撤销移动 / 确认移出同步）----
+describe("slice-2 scope-crossing exit actions", () => {
+  async function activatedHarness() {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    return harness;
+  }
+
+  function excludeArchive(harness: ReturnType<typeof makeHarness>): void {
+    vi.mocked(harness.scanner.shouldSyncPath).mockImplementation(
+      (path: string) => !path.startsWith("Archive"),
+    );
+    vi.mocked(harness.scanner.shouldSyncFolderPath).mockImplementation(
+      (path: string) => !path.startsWith("Archive"),
+    );
+  }
+
+  /** 单个文件移出范围（本地仍在 Archive，扫描不可见），跑出一行后返回快照。 */
+  async function fileExitHarness() {
+    const harness = await activatedHarness();
+    excludeArchive(harness);
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Notes/a.md",
+      "Archive/a.md",
+    )).toBe(true);
+    harness.localEntryState[0]!.path = "Archive/a.md";
+    const held = await harness.executor.run("manual");
+    expect(held).toMatchObject({ success: true, deleted: 0, errors: 0 });
+    return harness;
+  }
+
+  /** 文件夹整树移出范围（本地整树在 Archive，扫描不可见）。 */
+  async function folderExitHarness() {
+    const harness = await activatedHarness();
+    excludeArchive(harness);
+    expect(await harness.state.recordLocalFolderMoveHint("Notes", "Archive"))
+      .toBe(true);
+    harness.localFolderPaths.delete("Notes");
+    harness.localFolderPaths.add("Archive");
+    harness.localEntryState[0]!.path = "Archive/a.md";
+    const held = await harness.executor.run("manual");
+    expect(held).toMatchObject({ success: true, deleted: 0, errors: 0 });
+    return harness;
+  }
+
+  it("restores a held file move to its original synced path", async () => {
+    const harness = await fileExitHarness();
+
+    const snapshot = await harness.executor.getScopeCrossingResolutionSnapshot(
+      "Notes/a.md",
+    );
+    expect(snapshot).toMatchObject({
+      version: 1,
+      kind: "file",
+      rowPath: "Notes/a.md",
+      fromPath: "Notes/a.md",
+      toPath: "Archive/a.md",
+      remoteId: "file-a",
+    });
+
+    expect(await harness.executor.restoreScopeCrossingMove(snapshot!)).toBe(true);
+    expect(harness.localEntryState[0]!.path).toBe("Notes/a.md");
+    expect(harness.state.localFileMoveHints).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(harness.scanner.vault.rename).toHaveBeenCalledOnce();
+
+    const after = await harness.executor.run("manual");
+    expect(after).toMatchObject({ success: true, deleted: 0, errors: 0 });
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes/a.md")).not.toBeNull();
+    expect(harness.state.mutationLedger).toHaveLength(0);
+  });
+
+  it("deletes the cloud copy on the next round after a confirmed file exit", async () => {
+    const harness = await fileExitHarness();
+
+    const snapshot = await harness.executor.getScopeCrossingResolutionSnapshot(
+      "Notes/a.md",
+    );
+    expect(snapshot).not.toBeNull();
+    expect(await harness.executor.confirmScopeCrossingExit(snapshot!)).toBe(true);
+    expect(harness.state.localFileMoveHints).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([]);
+
+    const deleted = await harness.executor.run("manual");
+    expect(deleted).toMatchObject({
+      success: true,
+      deleted: 1,
+      errors: 0,
+    });
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes/a.md")).toBeNull();
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(harness.state.mutationLedger).toHaveLength(0);
+    expect(
+      await harness.executor.getScopeCrossingResolutionSnapshot("Notes/a.md"),
+    ).toBeNull();
+  });
+
+  it("restores a held folder move subtree to its original location", async () => {
+    const harness = await folderExitHarness();
+
+    const snapshot = await harness.executor.getScopeCrossingResolutionSnapshot(
+      "Notes",
+    );
+    expect(snapshot).toMatchObject({
+      version: 1,
+      kind: "folder",
+      rowPath: "Notes",
+      fromPath: "Notes",
+      toPath: "Archive",
+    });
+
+    expect(await harness.executor.restoreScopeCrossingMove(snapshot!)).toBe(true);
+    expect(harness.localFolderPaths.has("Notes")).toBe(true);
+    expect(harness.localFolderPaths.has("Archive")).toBe(false);
+    expect(harness.localEntryState[0]!.path).toBe("Notes/a.md");
+    expect(harness.state.localFolderMoveHints).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([]);
+
+    const after = await harness.executor.run("manual");
+    expect(after).toMatchObject({ success: true, deleted: 0, errors: 0 });
+    expect(harness.state.mutationLedger).toHaveLength(0);
+  });
+
+  it("deletes the remote subtree on the next round after a confirmed folder exit", async () => {
+    const harness = await folderExitHarness();
+
+    const snapshot = await harness.executor.getScopeCrossingResolutionSnapshot(
+      "Notes",
+    );
+    expect(snapshot).not.toBeNull();
+    expect(await harness.executor.confirmScopeCrossingExit(snapshot!)).toBe(true);
+    expect(harness.state.localFolderMoveHints).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([]);
+
+    const deleted = await harness.executor.run("manual");
+    expect(deleted).toMatchObject({
+      success: true,
+      deleted: 1,
+      foldersDeleted: 1,
+      errors: 0,
+    });
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes")).toBeNull();
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes/a.md")).toBeNull();
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(harness.state.mutationLedger).toHaveLength(0);
+  });
+
+  it("rejects a reviewed exit once the move facts drifted", async () => {
+    const harness = await fileExitHarness();
+    const snapshot = await harness.executor.getScopeCrossingResolutionSnapshot(
+      "Notes/a.md",
+    );
+    expect(snapshot).not.toBeNull();
+
+    // 快照期间用户把文件又移走了（hint 链更新），旧快照必须失效。
+    expect(await harness.state.recordLocalFileMoveHint(
+      "Archive/a.md",
+      "Archive/sub/a.md",
+    )).toBe(true);
+
+    expect(await harness.executor.restoreScopeCrossingMove(snapshot!)).toBe(false);
+    expect(harness.state.localFileMoveHints).toHaveLength(1);
+    expect(harness.state.pendingIssues).toEqual([
+      expect.objectContaining({ path: "Notes/a.md", issueCode: "scope-crossing" }),
+    ]);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes/a.md")).not.toBeNull();
   });
 });

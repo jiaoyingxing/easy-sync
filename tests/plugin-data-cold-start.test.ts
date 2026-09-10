@@ -128,9 +128,16 @@ function makeCommunityPluginScopeSwitchHarness(
 }
 
 describe("plugin data cold-start cache", () => {
-  it("refreshes the remote plugin catalog with metadata only and keeps it independent of local selection", async () => {
+  it("refreshes the remote plugin catalog and light-reads manifests for display facts", async () => {
     const plugin = new EasySyncPlugin();
     let catalog: RemoteCommunityPluginCatalogV1 | null = null;
+    const manifestJson = JSON.stringify({
+      id: "calendar",
+      name: "Calendar",
+      version: "1.0.0",
+      minAppVersion: "1.0.0",
+    });
+    const manifestBytes = new TextEncoder().encode(manifestJson);
     const remoteItems = [
       {
         id: "config",
@@ -162,7 +169,7 @@ describe("plugin data cold-start cache", () => {
       {
         id: "calendar-manifest",
         name: "manifest.json",
-        size: 8,
+        size: manifestBytes.byteLength,
         file: { hashes: {} },
         parentReference: { id: "calendar-root", driveId: "drive" },
         eTag: "etag-manifest",
@@ -173,11 +180,17 @@ describe("plugin data cold-start cache", () => {
       value: remoteItems,
       "@odata.deltaLink": "cursor-1",
     });
-    const downloadFile = vi.fn();
+    // Display-facts light read (approved G6-1 exception): the first refresh
+    // that surfaces an unobserved remote-only bundle reads its manifest body
+    // once so the inventory can show the real name instead of the plugin id.
+    const downloadFile = vi.fn().mockResolvedValue(
+      manifestBytes.buffer as ArrayBuffer,
+    );
     Object.defineProperty(plugin, "app", {
       configurable: true,
       value: {
         vault: {
+          getName: () => "Test Vault",
           configDir: ".obsidian",
           adapter: {
             exists: vi.fn().mockResolvedValue(false),
@@ -207,6 +220,9 @@ describe("plugin data cold-start cache", () => {
         catalog = next;
       }),
       getCommunityPluginManifestObservations: vi.fn().mockReturnValue([]),
+      setCommunityPluginManifestObservations: vi.fn().mockResolvedValue(
+        undefined,
+      ),
       getCommunityPluginParticipation: vi.fn().mockReturnValue(null),
       getCommunityPluginEnablementState: vi.fn().mockReturnValue({
         version: 1,
@@ -227,7 +243,14 @@ describe("plugin data cold-start cache", () => {
     const inventory = await plugin.getCommunityPluginInventory();
 
     expect(getDeltaByFolderId).toHaveBeenCalledWith("files");
-    expect(downloadFile).not.toHaveBeenCalled();
+    expect(downloadFile).toHaveBeenCalledTimes(1);
+    expect(downloadFile).toHaveBeenCalledWith(
+      "Test Vault",
+      ".obsidian/plugins/calendar/manifest.json",
+      undefined,
+      "calendar-manifest",
+      manifestBytes.byteLength,
+    );
     expect(inventory).toEqual([
       expect.objectContaining({ id: "calendar", remote: true }),
     ]);
@@ -238,8 +261,9 @@ describe("plugin data cold-start cache", () => {
     await expect(plugin.refreshCommunityPluginRemoteCatalog())
       .rejects.toThrow("offline");
 
-    // A single transient failure keeps the last trusted catalog usable.
-    expect(downloadFile).not.toHaveBeenCalled();
+    // A single transient failure keeps the last trusted catalog usable and
+    // does not trigger further light reads.
+    expect(downloadFile).toHaveBeenCalledTimes(1);
     expect(catalog).toEqual(expect.objectContaining({
       complete: true,
       stale: false,
@@ -259,7 +283,7 @@ describe("plugin data cold-start cache", () => {
     await expect(plugin.refreshCommunityPluginRemoteCatalog())
       .rejects.toThrow("offline");
 
-    expect(downloadFile).not.toHaveBeenCalled();
+    expect(downloadFile).toHaveBeenCalledTimes(1);
     expect(catalog).toEqual(expect.objectContaining({
       complete: true,
       stale: true,
@@ -398,9 +422,9 @@ describe("plugin data cold-start cache", () => {
     } as never;
     plugin.scanner = { setConfig: vi.fn() } as never;
     vi.spyOn(plugin as never, "ensureStateLoaded").mockResolvedValue(undefined);
-    const scheduleJoinSync = vi.spyOn(
+    const startJoinNow = vi.spyOn(
       plugin as never,
-      "scheduleCommunityPluginJoinSync",
+      "startCommunityPluginJoinNow",
     ).mockImplementation(() => undefined);
     const saveData = vi.spyOn(plugin, "saveData").mockResolvedValue(undefined);
 
@@ -415,7 +439,7 @@ describe("plugin data cold-start cache", () => {
         targetBundleDigest: "a".repeat(64),
       }),
     );
-    expect(scheduleJoinSync).toHaveBeenCalledTimes(1);
+    expect(startJoinNow).toHaveBeenCalledTimes(1);
     expect(plugin.syncCommunityPlugins).toBe(true);
     expect(saveData).not.toHaveBeenCalled();
     await expect(plugin.getCommunityPluginInventory()).resolves.toEqual([
@@ -445,6 +469,119 @@ describe("plugin data cold-start cache", () => {
         files: frozenLegacyPolicy.files,
       }),
     }));
+  });
+
+  it("queues a manager toggle behind an in-flight round instead of bouncing it busy", async () => {
+    const plugin = new EasySyncPlugin();
+    let participation = reduceDeviceCommunityPluginParticipation(
+      createEmptyDeviceCommunityPluginParticipation(true),
+      { type: "mark-never-participated", pluginId: "calendar" },
+    );
+    const updateCommunityPluginParticipation = vi.fn(async (command) => {
+      participation = reduceDeviceCommunityPluginParticipation(
+        participation,
+        command,
+      );
+      return true;
+    });
+    const retirePendingStateForPaths = vi.fn().mockResolvedValue(undefined);
+    const adapter = {
+      exists: vi.fn().mockResolvedValue(false),
+      list: vi.fn().mockResolvedValue({ files: [], folders: [] }),
+      read: vi.fn().mockRejectedValue(new Error("missing")),
+    };
+    Object.defineProperty(plugin, "app", {
+      configurable: true,
+      value: {
+        vault: { adapter, configDir: ".obsidian" },
+        workspace: { getLeavesOfType: vi.fn().mockReturnValue([]) },
+      },
+    });
+    Object.defineProperty(plugin, "manifest", {
+      configurable: true,
+      value: { id: "easy-sync" },
+    });
+    const remoteScope = {
+      accountId: "account",
+      driveId: "drive",
+      vaultFolderId: "vault",
+      filesRootId: "files",
+    };
+    plugin.state = {
+      isV2StateActive: true,
+      getCommunityPluginParticipation: () => structuredClone(participation),
+      updateCommunityPluginParticipation,
+      updateCommunityPluginParticipationBatch: vi.fn(async (commands) => {
+        for (const command of commands) {
+          await updateCommunityPluginParticipation(command);
+        }
+        return true;
+      }),
+      retirePendingStateForPaths,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+      hasMutationLedgerCorruption: false,
+      hasMutationRecoveryQuarantineCorruption: false,
+      mutationLedger: [],
+      remoteScope,
+      activeV2MigrationHold: null,
+      hasCompleteRemoteFolderIndex: false,
+      remoteFolders: [],
+      remoteSnapshot: [],
+      baseSnapshot: [],
+      getRemoteCommunityPluginCatalog: vi.fn().mockReturnValue(null),
+      getCommunityPluginEnablementState: vi.fn().mockReturnValue({
+        version: 1,
+        scope: remoteScope,
+        anchors: {},
+        pending: [],
+      }),
+      getCommunityPluginManifestObservations: vi.fn().mockReturnValue([]),
+    } as never;
+    plugin.syncExecutor = {
+      hasActivityInFlight: false,
+      isRunning: false,
+      setCommunityPluginSyncPolicy: vi.fn(),
+      getMobileDesktopOnlyCommunityPluginIds: vi.fn().mockReturnValue([]),
+    } as never;
+    plugin.scanner = { setConfig: vi.fn() } as never;
+    vi.spyOn(plugin as never, "ensureStateLoaded").mockResolvedValue(undefined);
+    const startJoinNow = vi.spyOn(
+      plugin as never,
+      "startCommunityPluginJoinNow",
+    ).mockImplementation(() => undefined);
+    const scheduleJoinSync = vi.spyOn(
+      plugin as never,
+      "scheduleCommunityPluginJoinSync",
+    ).mockImplementation(() => undefined);
+    const saveData = vi.spyOn(plugin, "saveData").mockResolvedValue(undefined);
+
+    // A round holds the operation lock: the manager toggle must queue and
+    // keep its pending row, not bounce with the busy notice (2026-09-09
+    // 卡手反馈). It applies with the deferred dirty-hint contract once the
+    // round releases.
+    const lock = plugin as never as {
+      opLock: string | null;
+      releaseOpLock(): void;
+    };
+    lock.opLock = "sync";
+    const toggle = plugin.runSettingsMutationWhenSyncIdle(() =>
+      plugin.updateCommunityPluginFilesSelection("calendar", true, {
+        deferJoinSyncRound: true,
+      }));
+    await Promise.resolve();
+    expect(updateCommunityPluginParticipation).not.toHaveBeenCalled();
+    expect(participation.pluginsById.calendar?.phase).toBe(
+      "never-participated",
+    );
+
+    lock.opLock = null;
+    lock.releaseOpLock();
+    await toggle;
+    expect(participation.pluginsById.calendar?.phase).toBe("join-requested");
+    expect(scheduleJoinSync).toHaveBeenCalledWith("manager-toggle");
+    expect(startJoinNow).not.toHaveBeenCalled();
+    expect(saveData).not.toHaveBeenCalled();
   });
 
   it("routes the community-plugin outer switch through source-bound folder scope expansion", async () => {

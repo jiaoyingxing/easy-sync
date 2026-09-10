@@ -532,6 +532,9 @@ describe("buildSettingsSyncButtonState", () => {
     expect(source).toContain("this.settingsUpdateQueue.whenIdle()");
     expect(source).toContain("pendingPluginValues");
     expect(source).toContain("updateCommunityPluginFilesSelection(");
+    expect(source).toContain("runSettingsMutationWhenSyncIdle(");
+    expect(source).toContain("pendingMutationCancels");
+    expect(source).toContain("communityPlugins.queuedStatus");
     expect(source).toContain("updateAllCommunityPluginSelections(");
     expect(source).toContain("enableCommunityPluginDataWithFiles(");
     expect(source).toContain("new ConfirmModal(");
@@ -599,11 +602,11 @@ describe("buildSettingsSyncButtonState", () => {
       '"settings.communityPlugins.status.restoreBlocked"',
     );
     expect(zhCN["settings.communityPlugins.status.joinRequested"])
-      .toBe("等待加入同步");
+      .toBe("将在下次同步时生效");
     expect(zhCN["settings.communityPlugins.status.restoreBlocked"])
       .toBe("恢复受阻");
     expect(en["settings.communityPlugins.status.joinRequested"])
-      .toBe("Waiting to join sync");
+      .toBe("Takes effect after the next sync");
     expect(en["settings.communityPlugins.status.restoreBlocked"])
       .toBe("Restore blocked");
     expect(zhCN["settings.communityPlugins.status.restoreIncompatible"])
@@ -626,10 +629,6 @@ describe("buildSettingsSyncButtonState", () => {
       .toBe("云端状态待重新确认");
     expect(en["settings.communityPlugins.status.remoteCatalogStale"])
       .toBe("Remote status needs to be checked again");
-    expect(zhCN["notice.communityPlugins.remoteCatalogFailed"])
-      .toBe("无法确认云端插件列表，请稍后重新打开。");
-    expect(en["notice.communityPlugins.remoteCatalogFailed"])
-      .toBe("Could not verify the remote plugin list. Reopen this page to try again.");
     expect(source).toContain("item.participationBlockedReason");
     expect(describe("manifest-incompatible", true)).toBe(
       "settings.communityPlugins.status.restoreIncompatible",
@@ -684,13 +683,13 @@ describe("buildSettingsSyncButtonState", () => {
       .toBeLessThan(source.indexOf("this.renderPluginRow(item, column)"));
     expect(source).toContain("easy-sync-plugin-list-guidance");
     expect(zhCN["settings.communityPlugins.guidance.reviewIncomplete"])
-      .toBe("插件文件不完整时，将在下次同步中核对本机和云端内容。");
+      .toBe("下次同步会自动比较本机与云端文件，再让你选择保留哪一份。");
     expect(zhCN["settings.communityPlugins.guidance.reinstall"])
-      .toBe("本机插件清单无法读取时，请重新安装对应插件。");
+      .toBe("本机读不到插件清单时，请重新安装该插件。");
     expect(zhCN["settings.communityPlugins.guidance.reconfirm"])
-      .toBe("云端插件或同步位置变化时，将在下次同步时重新核对。");
+      .toBe("云端插件或同步位置变化后，下次同步会重新核对。");
     expect(zhCN["settings.communityPlugins.guidance.retry"])
-      .toBe("恢复受阻时，请稍后重新同步。");
+      .toBe("恢复受阻时，稍后重新同步即可重试。");
   });
 
   it("keeps rows of cloud-cleaned plugins out of the files list", () => {
@@ -721,7 +720,6 @@ describe("buildSettingsSyncButtonState", () => {
       remoteInventoryAvailable: true,
       inventoryLoading: false,
       inventoryLoadFailed: false,
-      remoteCatalogRefreshFailed: false,
     });
 
     (modal as unknown as { renderPluginListArea(): void })
@@ -772,6 +770,7 @@ describe("buildSettingsSyncButtonState", () => {
     Object.assign(modal as object, {
       plugin: {
         i18n: { t: (key: string) => key },
+        flushPendingCommunityPluginJoinSync: vi.fn(),
         onCommunityPluginInventoryRevision: vi.fn(
           (listener: (revision: number) => void) => {
             onRevision = listener;
@@ -1122,9 +1121,6 @@ describe("buildSettingsSyncButtonState", () => {
     expect(zhCN["settings.communityPlugins.status.remoteOnly"]).toBe(
       "插件仅云端有",
     );
-    expect(zhCN["settings.communityPlugins.status.unavailable"]).toBe(
-      "未找到插件本体",
-    );
     expect(zhCN["settings.communityPlugins.status.dataMissing"]).toBe(
       "未发现 data.json",
     );
@@ -1132,16 +1128,13 @@ describe("buildSettingsSyncButtonState", () => {
       "仅桌面可用",
     );
     expect(zhCN["settings.communityPlugins.status.manifestIssue"]).toBe(
-      "插件文件不完整",
+      "本机插件文件缺失或损坏，请重新安装",
     );
     expect(en["settings.communityPlugins.status.localOnly"]).toBe(
       "Plugin files only on this device",
     );
     expect(en["settings.communityPlugins.status.remoteOnly"]).toBe(
       "Plugin files only in the cloud",
-    );
-    expect(en["settings.communityPlugins.status.unavailable"]).toBe(
-      "Plugin files not found",
     );
     expect(en["settings.communityPlugins.status.dataMissing"]).toBe(
       "No data.json found",
@@ -1150,8 +1143,32 @@ describe("buildSettingsSyncButtonState", () => {
       "Only works on desktop",
     );
     expect(en["settings.communityPlugins.status.manifestIssue"]).toBe(
-      "Plugin files are incomplete",
+      "Local plugin files are missing or damaged — reinstall the plugin",
     );
+  });
+
+  it("omits the status line for historical rows with no bundle on either side", () => {
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    Object.assign(modal as object, {
+      plugin: { i18n: { t: (key: string) => key } },
+    });
+    const status = (modal as unknown as {
+      describeInventoryItem(
+        item: Record<string, unknown>,
+        column: "files",
+      ): string | null;
+    }).describeInventoryItem({
+      id: "calendar",
+      name: "Calendar",
+      local: false,
+      remote: false,
+      dataLocally: false,
+      dataRemotely: false,
+      desktopOnly: false,
+      manifestIssue: false,
+      participationPhase: undefined,
+    }, "files");
+    expect(status).toBeNull();
   });
 
   it("keeps sync exclusion copy device-local and non-destructive in both locales", () => {

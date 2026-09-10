@@ -86,6 +86,10 @@ import {
   type StaleIdentityRemoteFactV1,
   type StaleIdentityResolutionSnapshotV1,
 } from "./stale-identity-resolution";
+import {
+  buildScopeCrossingResolutionSnapshotV1,
+  type ScopeCrossingResolutionSnapshotV1,
+} from "./scope-crossing-resolution";
 import type {
   BaseFileEntry,
   CloudBaseline,
@@ -285,6 +289,7 @@ import {
   CommunityPluginIdentityBlockError,
   type CommunityPluginManifestObservationV1,
 } from "./community-plugin-bundle";
+import { mergeCommunityPluginManifestObservations } from "./community-plugin-display-facts";
 import { presentKnownError } from "../i18n/error-presentation";
 import {
   executeCommunityPluginCloudCleanupV1,
@@ -1500,6 +1505,137 @@ export class SyncExecutor {
       ?.snapshot ?? null;
   }
 
+  /** Read-only facts for one scope-crossing exit row (file or folder move). */
+  async getScopeCrossingResolutionSnapshot(
+    path: string,
+  ): Promise<ScopeCrossingResolutionSnapshotV1 | null> {
+    if (
+      this.running
+      || this.hasSideActionsInFlight
+      || !this.state.isV2StateActive
+      || this.state.hasMutationLedgerCorruption
+      || this.state.hasV2StateLoadRecoveryBlock
+      || this.state.hasV2RemoteScopeRecovery
+    ) return null;
+    return this.buildCurrentScopeCrossingReviewSnapshot(path);
+  }
+
+  private async buildCurrentScopeCrossingReviewSnapshot(
+    path: string,
+  ): Promise<ScopeCrossingResolutionSnapshotV1 | null> {
+    const pending = this.state.pendingIssues.some((issue) =>
+      issue.path === path
+        && issue.actionType === SyncActionType.FolderDeferred
+        && issue.issueCode === "scope-crossing",
+    );
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!pending || !envelope) return null;
+    return buildScopeCrossingResolutionSnapshotV1(path, {
+      envelope,
+      folderMoveHints: this.state.localFolderMoveHints,
+      fileMoveHints: this.state.localFileMoveHints,
+    });
+  }
+
+  private async recheckScopeCrossingReview(
+    reviewed: Readonly<ScopeCrossingResolutionSnapshotV1>,
+    operationEpoch: number,
+  ): Promise<ScopeCrossingResolutionSnapshotV1 | null> {
+    const current =
+      await this.buildCurrentScopeCrossingReviewSnapshot(reviewed.rowPath);
+    if (
+      !current
+      || current.revision !== reviewed.revision
+      || !this.activeSyncScope
+      || !sameSyncScope(current.scope, this.activeSyncScope)
+      || !this.canContinue(operationEpoch)
+    ) {
+      this.notice("notice.scopeCrossing.changed", { path: reviewed.rowPath });
+      return null;
+    }
+    return current;
+  }
+
+  /**
+   * Undo one reviewed out-of-scope move: rename the recorded location back to
+   * the original synced path. Rename events would reverse the hint chain on
+   * their own; the explicit retirement below makes the outcome independent of
+   * event timing. No remote mutation happens here — normal sync replans.
+   */
+  async restoreScopeCrossingMove(
+    reviewed: Readonly<ScopeCrossingResolutionSnapshotV1>,
+  ): Promise<boolean> {
+    if (this.stopSideActionForStateRecovery()) return false;
+    let restored = false;
+    await this.enqueueSideAction(
+      reviewed.rowPath,
+      SyncActionType.FolderDeferred,
+      async (operationEpoch) => {
+        const current = await this.recheckScopeCrossingReview(reviewed, operationEpoch);
+        if (!current) return;
+        const vault = this.scanner.vault as LocalScanner["vault"] & {
+          getAbstractFileByPath?: (path: string) => unknown;
+        };
+        const source = vault.getAbstractFileByPath?.(current.toPath);
+        const kindMatches = current.kind === "folder"
+          ? source instanceof TFolder
+          : source instanceof TFile;
+        const origin = vault.getAbstractFileByPath?.(current.fromPath);
+        if (!kindMatches || (origin !== undefined && origin !== null)) {
+          this.notice("notice.scopeCrossing.changed", { path: current.rowPath });
+          return;
+        }
+        try {
+          if (current.kind === "folder") {
+            await this.renameLocalFolder(current.toPath, current.fromPath);
+          } else {
+            await this.renameLocalFile(current.toPath, current.fromPath);
+          }
+        } catch {
+          this.notice("notice.scopeCrossing.changed", { path: current.rowPath });
+          return;
+        }
+        await this.state.retireLocalMoveHintsByRemoteIds([current.remoteId]);
+        await this.state.retirePendingIssues([current.rowPath, current.fromPath]);
+        restored = true;
+        this.notice("notice.scopeCrossing.restored", { path: current.fromPath });
+        return true;
+      },
+      reviewed.kind === "folder" ? { status: "folder" } : undefined,
+      { skipMutationRecovery: true },
+    );
+    return restored;
+  }
+
+  /**
+   * Confirm one reviewed out-of-scope move: retire the move evidence and the
+   * pending row. The next ordinary round then applies the established
+   * deletion contract (folder: slice-1 delete-mirror chain; file:
+   * DeleteRemote). This action itself performs zero external mutations.
+   */
+  async confirmScopeCrossingExit(
+    reviewed: Readonly<ScopeCrossingResolutionSnapshotV1>,
+  ): Promise<boolean> {
+    if (this.stopSideActionForStateRecovery()) return false;
+    let confirmed = false;
+    await this.enqueueSideAction(
+      reviewed.rowPath,
+      SyncActionType.FolderDeferred,
+      async (operationEpoch) => {
+        const current = await this.recheckScopeCrossingReview(reviewed, operationEpoch);
+        if (!current) return;
+        await this.state.retireLocalMoveHintsByRemoteIds([current.remoteId]);
+        await this.state.retirePendingIssues([current.rowPath, current.fromPath]);
+        confirmed = true;
+        this.notice("notice.scopeCrossing.confirmed", { path: current.fromPath });
+        return true;
+      },
+      reviewed.kind === "folder" ? { status: "folder" } : undefined,
+      { skipMutationRecovery: true },
+    );
+    return confirmed;
+  }
+
   /** Read and hash one root recovery item without authorizing a mutation. */
   async getMutationRecoveryResolutionSnapshot(
     preferredOperationId?: string,
@@ -1873,7 +2009,15 @@ export class SyncExecutor {
         return resolved;
       },
       undefined,
-      { skipMutationRecovery: true },
+      {
+        skipMutationRecovery: true,
+        // The sidebar renders one row per plugin, filtered by member paths.
+        // Register them with the settlement so the row disappears as soon as
+        // the side action is queued — the same immediate-removal contract as
+        // ordinary file conflicts.
+        queuedPaths: this.pluginBundleConflicts(bundle.pluginId)
+          .map((conflict) => conflict.path),
+      },
     );
     return resolved;
   }
@@ -5294,7 +5438,20 @@ export class SyncExecutor {
     observations: readonly CommunityPluginManifestObservationV1[],
   ): Promise<void> {
     try {
-      await this.state.setCommunityPluginManifestObservations(observations);
+      // This round's evidence is only the candidates observed this round.
+      // Merge with the persisted store instead of replacing it wholesale:
+      // display-facts light reads (community-plugin-display-facts.ts) persist
+      // observations for remote-only bundles that never become executor
+      // candidates here, and a per-round shrink would erase them on the next
+      // ordinary desktop round. Stale entries are harmless — every consumer
+      // matches source-bound (scope, remote id, eTag) before use, so old
+      // observations naturally stop matching instead of needing deletion.
+      const stored = this.state.getCommunityPluginManifestObservations();
+      const merged = mergeCommunityPluginManifestObservations(
+        stored,
+        observations,
+      );
+      await this.state.setCommunityPluginManifestObservations(merged);
     } catch (error) {
       this.diag?.warn(
         "state",
@@ -7742,6 +7899,7 @@ export class SyncExecutor {
           localFolderScanComplete,
           skippedLarge,
           localMoveHints: this.state.localFolderMoveHints,
+          localFileMoveHints: this.state.localFileMoveHints,
           includeFilePath: includeCanonicalFilePath,
           includeFolderPath: includeCanonicalFolderPath,
           preserveFolderPath: preserveCanonicalFolderPath,
@@ -7757,6 +7915,7 @@ export class SyncExecutor {
           localFolderScanComplete,
           skippedLarge,
           localMoveHints: this.state.localFolderMoveHints,
+          localFileMoveHints: this.state.localFileMoveHints,
           includeFilePath: includeCanonicalFilePath,
           includeFolderPath: includeCanonicalFolderPath,
           preserveFolderPath: preserveCanonicalFolderPath,
@@ -7887,6 +8046,7 @@ export class SyncExecutor {
                   localFolderScanComplete,
                   skippedLarge,
                   localMoveHints: this.state.localFolderMoveHints,
+                  localFileMoveHints: this.state.localFileMoveHints,
                   includeFilePath: includeCanonicalFilePath,
                   includeFolderPath: includeCanonicalFolderPath,
                   preserveFolderPath: preserveCanonicalFolderPath,
@@ -7927,6 +8087,7 @@ export class SyncExecutor {
             localFolderScanComplete,
             skippedLarge,
             localMoveHints: this.state.localFolderMoveHints,
+            localFileMoveHints: this.state.localFileMoveHints,
             includeFilePath: includeCanonicalFilePath,
             includeFolderPath: includeCanonicalFolderPath,
             preserveFolderPath: preserveCanonicalFolderPath,
@@ -8322,6 +8483,7 @@ export class SyncExecutor {
               localFolderScanComplete,
               skippedLarge,
               localMoveHints: this.state.localFolderMoveHints,
+              localFileMoveHints: this.state.localFileMoveHints,
               includeFilePath: includeCanonicalFilePath,
               includeFolderPath: includeCanonicalFolderPath,
               preserveFolderPath: preserveCanonicalFolderPath,
@@ -8340,6 +8502,7 @@ export class SyncExecutor {
             localFolderScanComplete,
             skippedLarge,
             localMoveHints: this.state.localFolderMoveHints,
+            localFileMoveHints: this.state.localFileMoveHints,
             includeFilePath: includeCanonicalFilePath,
             includeFolderPath: includeCanonicalFolderPath,
             preserveFolderPath: preserveCanonicalFolderPath,
@@ -9570,6 +9733,7 @@ export class SyncExecutor {
                 localFolderScanComplete: true,
                 skippedLarge: continuationScan.skippedLarge,
                 localMoveHints: this.state.localFolderMoveHints,
+                localFileMoveHints: this.state.localFileMoveHints,
                 includeFilePath: includeContinuationFilePath,
                 includeFolderPath: includeCanonicalFolderPath,
                 preserveFolderPath: preserveCanonicalFolderPath,
@@ -10493,6 +10657,10 @@ export class SyncExecutor {
                 ? { issueCode: "target-occupied" as const }
               : item.reason === "reason.folder.parent-chain-incomplete"
                 ? { issueCode: "parent-chain-incomplete" as const }
+              : item.reason === "reason.file.scope-crossing"
+                ? { issueCode: "scope-crossing" as const }
+              : item.reason === "reason.folder.scope-crossing"
+                ? { issueCode: "scope-crossing" as const }
               : {}),
             reason,
             updatedAt: Date.now(),
@@ -15400,7 +15568,15 @@ export class SyncExecutor {
               : "reason.folder.remote-version-changed"),
           };
         }
-        if (!exact.contentTag) {
+        // OneDrive Personal does not return folder cTags, so an empty-shell
+        // delete cannot always build an If-Match from the content tag. The
+        // exact inspection above already verified the identity and eTag twice
+        // (by id and by path, children empty, versions stable), so fall back
+        // to that verified eTag; defer only when neither tag is available.
+        // Without this the empty shell delete defers forever on Personal with
+        // no user-side remedy.
+        const deleteMatchTag = exact.contentTag ?? item.folder.remoteETag;
+        if (!deleteMatchTag) {
           result.deferred++;
           return {
             executed: false,
@@ -15424,7 +15600,7 @@ export class SyncExecutor {
           await this.onedrive.deleteItem(
             this.vaultName,
             item.path,
-            exact.contentTag,
+            deleteMatchTag,
             item.folder.remoteId,
           );
         } catch (error) {
@@ -20319,7 +20495,7 @@ export class SyncExecutor {
     actionType: SyncActionType,
     task: (operationEpoch: number) => Promise<boolean | void>,
     completionPresentation?: Pick<FileProgress, "status" | "reason">,
-    options?: { skipMutationRecovery?: boolean },
+    options?: { skipMutationRecovery?: boolean; queuedPaths?: readonly string[] },
   ): Promise<void> {
     if (this.state.isV2StateActive === false) {
       this.notice("notice.v2MigrationRequired");
@@ -20355,6 +20531,9 @@ export class SyncExecutor {
     const operationEpoch = this.lifecycle.capture();
 
     this.queuedSideActionPaths.add(path);
+    for (const queuedPath of options?.queuedPaths ?? []) {
+      this.queuedSideActionPaths.add(queuedPath);
+    }
     this.sideActionBatchTotal++;
     const currentProgress = this.progressStore?.state;
     if (currentProgress?.currentFile) {
@@ -20476,6 +20655,9 @@ export class SyncExecutor {
             completionPresentation,
           );
           this.queuedSideActionPaths.delete(path);
+          for (const queuedPath of options?.queuedPaths ?? []) {
+            this.queuedSideActionPaths.delete(queuedPath);
+          }
           this.activeSyncScope = null;
           this.finishSideAction(this.queuedSideActionPaths.size === 0);
           resolveCompletion();
@@ -21100,6 +21282,12 @@ export class SyncExecutor {
     const preverifiedAbsent = preverifyPaths.length === 0
       ? new Set<string>()
       : await this.verifyRemoteDeleteBatchAbsence(preverifyPaths);
+    // Ordering contract: folder rows must not start before every file row
+    // has settled — a folder shell is only removed after its members are
+    // gone. The shared serial side-action queue preserves enqueue order and
+    // rows are enqueued files-first (sort above), so folder rows below are
+    // guaranteed to run last. If that queue is ever parallelized, split this
+    // call into two awaited phases instead of relying on enqueue order.
     await Promise.all([
       ...filePaths.map((path) =>
         this.confirmRemoteDelete(path, false, {
@@ -21195,6 +21383,20 @@ export class SyncExecutor {
             this.notice("notice.delete.failed", {
               path,
               reason: this.t("notice.decisionExpired"),
+            });
+            return;
+          }
+          // A folder whose shell still contains members cannot be removed
+          // yet: keep the row pending and say what to do instead of surfacing
+          // an empty-check failure. The mutation path below keeps the same
+          // emptiness guard as its race-condition fallback.
+          if (
+            (await this.inspectLocalFolder(path)).status === "present"
+            && !await this.isLocalFolderEmpty(path)
+          ) {
+            this.notice("notice.delete.failed", {
+              path,
+              reason: this.t("reason.delete.folderNotEmpty"),
             });
             return;
           }
@@ -21452,6 +21654,7 @@ const PLANNER_DERIVED_PENDING_ISSUE_CODES: ReadonlySet<
   "remote-subtree-changed",
   "target-occupied",
   "parent-chain-incomplete",
+  "scope-crossing",
 ]);
 
 function isPendingIssueAction(type: SyncActionType): boolean {

@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
-import { TFolder } from "obsidian";
+import { TFile, TFolder } from "obsidian";
 
 const confirmModalAwaitConfirm = vi.hoisted(() => vi.fn());
+const scopeCrossingPromptAwaitChoice = vi.hoisted(() => vi.fn());
+const scopeCrossingPromptMockArgs = vi.hoisted(() => [] as unknown[][]);
 
 vi.mock("../src/auth/auth-module", () => ({
   AuthModule: class {},
@@ -87,6 +89,15 @@ vi.mock("../src/ui/confirm-modal", () => ({
   SyncPlanAlertModal: class {},
 }));
 
+vi.mock("../src/ui/scope-crossing-prompt-modal", () => ({
+  ScopeCrossingPromptModal: class {
+    awaitChoice = scopeCrossingPromptAwaitChoice;
+    constructor(...args: unknown[]) {
+      scopeCrossingPromptMockArgs.push(args);
+    }
+  },
+}));
+
 import EasySyncPlugin from "../src/main";
 import { I18n } from "../src/i18n";
 import type { SyncCallbacks, SyncResult } from "../src/sync/sync-executor";
@@ -101,6 +112,7 @@ import {
   reduceDeviceCommunityPluginParticipation,
   type DeviceCommunityPluginParticipationV1,
 } from "../src/sync/community-plugin-participation";
+import { createEmptyCommunityPluginAdoptionMemory } from "../src/sync/community-plugin-adoption-memory";
 import { NOTICE_PRIORITY } from "../src/ui/notice-center";
 
 function okResult(): SyncResult {
@@ -1238,6 +1250,117 @@ describe("main sync entry guards", () => {
     await vi.advanceTimersByTimeAsync(7_000);
     expect(runAutomaticSync).toHaveBeenCalledOnce();
     plugin.stopAutoSync();
+  });
+
+  it("persists one TFile out-of-scope move hint before scheduling the file dirty run", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    const shouldSyncPath = vi.fn((path: string) => path === "Notes/a.md");
+    plugin.scanner = { shouldSyncPath, shouldSyncFolderPath: vi.fn(() => true) } as never;
+    const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")
+      .mockResolvedValue(true);
+    let releaseMoveHint!: () => void;
+    const captureLocalFileMoveHint = vi.spyOn(
+      plugin as never,
+      "captureLocalFileMoveHint",
+    ).mockImplementation(() => new Promise<void>((resolve) => {
+      releaseMoveHint = resolve;
+    }));
+    const markLocalDirtyHint = vi.spyOn(plugin as never, "markLocalDirtyHint");
+
+    const handled = (plugin as never as {
+      handleLocalVaultRename: (
+        file: TFile,
+        oldPath: string,
+      ) => Promise<void>;
+    }).handleLocalVaultRename(
+      new TFile("archive/a.md"),
+      "Notes/a.md",
+    );
+
+    expect(captureLocalFileMoveHint).toHaveBeenCalledOnce();
+    expect(captureLocalFileMoveHint).toHaveBeenCalledWith(
+      "Notes/a.md",
+      "archive/a.md",
+    );
+    expect(markLocalDirtyHint).not.toHaveBeenCalled();
+    releaseMoveHint();
+    await handled;
+
+    expect(markLocalDirtyHint).toHaveBeenCalledWith(
+      "archive/a.md",
+      "Notes/a.md",
+    );
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(runAutomaticSync).toHaveBeenCalledOnce();
+    plugin.stopAutoSync();
+  });
+
+  it("does not retain a file move hint when the destination stays in the sync scope", async () => {
+    const plugin = makePlugin();
+    const recordLocalFileMoveHint = vi.fn().mockResolvedValue(true);
+    plugin.state = { recordLocalFileMoveHint } as never;
+
+    await (plugin as never as {
+      handleLocalVaultRename: (
+        file: TFile,
+        oldPath: string,
+      ) => Promise<void>;
+    }).handleLocalVaultRename(
+      new TFile("Notes/moved.md"),
+      "Notes/a.md",
+    );
+
+    expect(recordLocalFileMoveHint).not.toHaveBeenCalled();
+  });
+
+  it("does not retain a file move hint when the destination is the vault trash", async () => {
+    const plugin = makePlugin();
+    plugin.scanner = {
+      shouldSyncPath: vi.fn().mockReturnValue(false),
+      shouldSyncFolderPath: vi.fn(() => true),
+    } as never;
+    const recordLocalFileMoveHint = vi.fn().mockResolvedValue(true);
+    plugin.state = { recordLocalFileMoveHint } as never;
+
+    await (plugin as never as {
+      handleLocalVaultRename: (
+        file: TFile,
+        oldPath: string,
+      ) => Promise<void>;
+    }).handleLocalVaultRename(
+      new TFile(".trash/a.md"),
+      "Notes/a.md",
+    );
+
+    expect(recordLocalFileMoveHint).not.toHaveBeenCalled();
+  });
+
+  it("retains a file move hint when the destination is out of scope and not the trash", async () => {
+    const plugin = makePlugin();
+    plugin.scanner = {
+      shouldSyncPath: vi.fn().mockReturnValue(false),
+      shouldSyncFolderPath: vi.fn(() => true),
+    } as never;
+    const recordLocalFileMoveHint = vi.fn().mockResolvedValue(true);
+    plugin.state = { recordLocalFileMoveHint } as never;
+
+    await (plugin as never as {
+      handleLocalVaultRename: (
+        file: TFile,
+        oldPath: string,
+      ) => Promise<void>;
+    }).handleLocalVaultRename(
+      new TFile("Archive/a.md"),
+      "Notes/a.md",
+    );
+
+    expect(recordLocalFileMoveHint).toHaveBeenCalledOnce();
+    expect(recordLocalFileMoveHint).toHaveBeenCalledWith(
+      "Notes/a.md",
+      "Archive/a.md",
+    );
   });
 
   it("immediately opts out a plugin root renamed outside its exact managed path", async () => {
@@ -3556,6 +3679,122 @@ describe("main sync entry guards", () => {
     expect(schedulePersistedJoinSync).toHaveBeenCalledWith("auto-start");
   });
 
+  it("flushes a pending community plugin join round only when joins are pending", async () => {
+    const plugin = new EasySyncPlugin();
+    const startJoinNow = vi.spyOn(
+      plugin as never,
+      "startCommunityPluginJoinNow",
+    ).mockImplementation(() => undefined);
+    const hasPendingJoin = vi.spyOn(
+      plugin as never,
+      "hasPendingCommunityPluginJoin",
+    ).mockReturnValue(true);
+
+    // Manager-close flush: a batch of toggles ends with one round covering
+    // every join request; plain scope views never start empty rounds.
+    plugin.flushPendingCommunityPluginJoinSync();
+    expect(startJoinNow).toHaveBeenCalledTimes(1);
+
+    startJoinNow.mockClear();
+    hasPendingJoin.mockReturnValue(false);
+    plugin.flushPendingCommunityPluginJoinSync();
+    expect(startJoinNow).not.toHaveBeenCalled();
+  });
+
+  it("runs settings mutations when sync is idle and drains queued ones in order after the round releases", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.syncExecutor = {
+      hasActivityInFlight: false,
+      isRunning: false,
+    } as never;
+    const order: string[] = [];
+
+    // Idle fast path: no queue, no added latency.
+    await plugin.runSettingsMutationWhenSyncIdle(async () => {
+      order.push("idle");
+    });
+    expect(order).toEqual(["idle"]);
+
+    // A round holds the operation lock: user-initiated mutations queue and
+    // apply in order once the round releases — they must not bounce busy.
+    const lock = plugin as never as {
+      opLock: string | null;
+      releaseOpLock(): void;
+    };
+    lock.opLock = "sync";
+    const first = plugin.runSettingsMutationWhenSyncIdle(async () => {
+      order.push("queued-1");
+    });
+    const second = plugin.runSettingsMutationWhenSyncIdle(async () => {
+      order.push("queued-2");
+    });
+    expect(order).toEqual(["idle"]);
+
+    lock.opLock = null;
+    lock.releaseOpLock();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["idle", "queued-1", "queued-2"]);
+  });
+
+  it("supports cancelling a queued settings mutation before sync goes idle", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.syncExecutor = {
+      hasActivityInFlight: false,
+      isRunning: false,
+    } as never;
+    let ran = false;
+    const lock = plugin as never as {
+      opLock: string | null;
+      releaseOpLock(): void;
+    };
+
+    // Idle fast path runs immediately and has nothing to cancel.
+    const immediate = plugin.runSettingsMutationWhenSyncIdle(async () => {
+      ran = true;
+    });
+    expect(immediate.isQueued()).toBe(false);
+    await immediate;
+    expect(ran).toBe(true);
+    expect(immediate.cancel()).toBe(false);
+
+    // Queued behind a round: cancel settles the promise without running it,
+    // and the rest of the queue still applies in order.
+    lock.opLock = "sync";
+    ran = false;
+    const cancelled = plugin.runSettingsMutationWhenSyncIdle(async () => {
+      ran = true;
+    });
+    const survivor = plugin.runSettingsMutationWhenSyncIdle(async () => {
+      ran = true;
+    });
+    expect(cancelled.isQueued()).toBe(true);
+    expect(survivor.isQueued()).toBe(true);
+    expect(cancelled.cancel()).toBe(true);
+    await cancelled;
+    expect(ran).toBe(false);
+    lock.opLock = null;
+    lock.releaseOpLock();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(survivor.isQueued()).toBe(false);
+    await survivor;
+    expect(ran).toBe(true);
+
+    // A mutation that already started applying cannot be cancelled.
+    lock.opLock = "sync";
+    let resolveRunning!: () => void;
+    const running = plugin.runSettingsMutationWhenSyncIdle(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveRunning = resolve;
+        }),
+    );
+    lock.opLock = null;
+    lock.releaseOpLock();
+    expect(running.cancel()).toBe(false);
+    resolveRunning();
+    await running;
+  });
+
   it("keeps automatic sync active when an otherwise successful run leaves pending conflicts", async () => {
     const plugin = new EasySyncPlugin();
     plugin.autoSyncPaused = false;
@@ -5160,6 +5399,241 @@ describe("main sync entry guards", () => {
     ]);
   });
 
+  it("drops duplicate cleanup markers silently when the complete bundle reappears", () => {
+    const plugin = makePlugin();
+    plugin.state = {
+      isV2StateActive: true,
+      getCommunityPluginParticipation: vi.fn(() => ({
+        pluginsById: {
+          calendar: { pluginId: "calendar", phase: "excluded" },
+        },
+      })),
+    } as never;
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue([
+      { pluginId: "calendar", cleanedAt: 1 },
+      { pluginId: "calendar", cleanedAt: 2 },
+    ]);
+    const saveLocalStorage = vi.fn();
+    plugin.app.saveLocalStorage = saveLocalStorage as never;
+    const show = vi.fn();
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+    const catalog = {
+      version: 1,
+      complete: true,
+      stale: false,
+      revision: 5,
+      observedAt: 1,
+      sourceDigest: "a".repeat(64),
+      scope: {},
+      entries: [{
+        pluginId: "calendar",
+        bundleState: "complete",
+        bundleDigest: "b".repeat(64),
+        members: [],
+      }],
+    };
+    (plugin as never as {
+      sweepResurrectedCloudCleanupMarkersAgainstCatalog(
+        catalog: unknown,
+      ): void;
+    }).sweepResurrectedCloudCleanupMarkersAgainstCatalog(catalog);
+    // No dedicated reappearance notice (2026-09-09 用户拍板): the row simply
+    // un-hides on the next refresh.
+    expect(show).not.toHaveBeenCalled();
+    expect(saveLocalStorage).toHaveBeenCalledWith(
+      "easy-sync-community-plugin-cloud-cleanup-v1",
+      [],
+    );
+  });
+
+  it("keeps the marker while the bundle stays gone; drops it on reappearance regardless of phase", () => {
+    const completeCalendarCatalog = {
+      version: 1,
+      complete: true,
+      stale: false,
+      revision: 5,
+      observedAt: 1,
+      sourceDigest: "a".repeat(64),
+      scope: {},
+      entries: [{
+        pluginId: "calendar",
+        bundleState: "complete",
+        bundleDigest: "b".repeat(64),
+        members: [],
+      }],
+    };
+    // Gone: excluded phase but no complete bundle in the catalog.
+    const gone = makePlugin();
+    gone.state = {
+      isV2StateActive: true,
+      getCommunityPluginParticipation: vi.fn(() => ({
+        pluginsById: {
+          calendar: { pluginId: "calendar", phase: "excluded" },
+        },
+      })),
+    } as never;
+    gone.app.loadLocalStorage = vi.fn().mockReturnValue([
+      { pluginId: "calendar", cleanedAt: 1 },
+    ]);
+    const saveGone = vi.fn();
+    gone.app.saveLocalStorage = saveGone as never;
+    const showGone = vi.fn();
+    gone.noticeCenter = {
+      show: showGone,
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    const emptyCatalog = {
+      version: 1,
+      complete: true,
+      stale: false,
+      revision: 5,
+      observedAt: 1,
+      sourceDigest: "a".repeat(64),
+      scope: {},
+      entries: [],
+    };
+    (gone as never as {
+      sweepResurrectedCloudCleanupMarkersAgainstCatalog(
+        catalog: unknown,
+      ): void;
+    }).sweepResurrectedCloudCleanupMarkersAgainstCatalog(emptyCatalog);
+    expect(showGone).not.toHaveBeenCalled();
+    expect(saveGone).not.toHaveBeenCalled();
+    // Participating: the bundle is back — the marker is dead weight there
+    // (hiding requires no local files, and an explicit re-join clears the
+    // marker too), so the sweep drops it instead of leaving an orphan.
+    const active = makePlugin();
+    active.state = {
+      isV2StateActive: true,
+      getCommunityPluginParticipation: vi.fn(() => ({
+        pluginsById: {
+          calendar: { pluginId: "calendar", phase: "participating" },
+        },
+      })),
+    } as never;
+    active.app.loadLocalStorage = vi.fn().mockReturnValue([
+      { pluginId: "calendar", cleanedAt: 1 },
+    ]);
+    const saveActive = vi.fn();
+    active.app.saveLocalStorage = saveActive as never;
+    (active as never as {
+      sweepResurrectedCloudCleanupMarkersAgainstCatalog(
+        catalog: unknown,
+      ): void;
+    }).sweepResurrectedCloudCleanupMarkersAgainstCatalog(
+      completeCalendarCatalog,
+    );
+    expect(saveActive).toHaveBeenCalledWith(
+      "easy-sync-community-plugin-cloud-cleanup-v1",
+      [],
+    );
+  });
+
+  it("un-hides a cleaned plugin whose complete bundle reappears in the fresh delta catalog — silently", () => {
+    const plugin = makePlugin();
+    plugin.state = {
+      isV2StateActive: true,
+      getCommunityPluginParticipation: vi.fn(() => ({
+        pluginsById: {
+          calendar: { pluginId: "calendar", phase: "excluded" },
+        },
+      })),
+    } as never;
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue([
+      { pluginId: "calendar", cleanedAt: 1 },
+    ]);
+    const saveLocalStorage = vi.fn();
+    plugin.app.saveLocalStorage = saveLocalStorage as never;
+    const show = vi.fn();
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+    const catalog = {
+      version: 1,
+      complete: true,
+      stale: false,
+      revision: 5,
+      observedAt: 1,
+      sourceDigest: "a".repeat(64),
+      scope: {},
+      entries: [{
+        pluginId: "calendar",
+        bundleState: "complete",
+        bundleDigest: "b".repeat(64),
+        members: [],
+        manifestName: "Calendar",
+      }],
+    };
+    (plugin as never as {
+      sweepResurrectedCloudCleanupMarkersAgainstCatalog(
+        catalog: unknown,
+      ): void;
+    }).sweepResurrectedCloudCleanupMarkersAgainstCatalog(catalog);
+    // The reappearance un-hides the row without any dedicated notice.
+    expect(show).not.toHaveBeenCalled();
+    expect(saveLocalStorage).toHaveBeenCalledWith(
+      "easy-sync-community-plugin-cloud-cleanup-v1",
+      [],
+    );
+  });
+
+  it("keeps the marker when the fresh catalog only lists the plugin as partial", () => {
+    const plugin = makePlugin();
+    plugin.state = {
+      isV2StateActive: true,
+      getCommunityPluginParticipation: vi.fn(() => ({
+        pluginsById: {
+          calendar: { pluginId: "calendar", phase: "excluded" },
+        },
+      })),
+    } as never;
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue([
+      { pluginId: "calendar", cleanedAt: 1 },
+    ]);
+    const saveLocalStorage = vi.fn();
+    plugin.app.saveLocalStorage = saveLocalStorage as never;
+    const show = vi.fn();
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+    const catalog = {
+      version: 1,
+      complete: true,
+      stale: false,
+      revision: 5,
+      observedAt: 1,
+      sourceDigest: "a".repeat(64),
+      scope: {},
+      entries: [{
+        pluginId: "calendar",
+        bundleState: "partial",
+        bundleDigest: "b".repeat(64),
+        members: [],
+      }],
+    };
+    (plugin as never as {
+      sweepResurrectedCloudCleanupMarkersAgainstCatalog(
+        catalog: unknown,
+      ): void;
+    }).sweepResurrectedCloudCleanupMarkersAgainstCatalog(catalog);
+    expect(show).not.toHaveBeenCalled();
+    expect(saveLocalStorage).not.toHaveBeenCalled();
+  });
+
+  it("drops the cleanup marker when the user explicitly re-joins the plugin", () => {
+    const plugin = makePlugin();
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue([
+      { pluginId: "calendar", cleanedAt: 1 },
+      { pluginId: "other", cleanedAt: 2 },
+    ]);
+    const saveLocalStorage = vi.fn();
+    plugin.app.saveLocalStorage = saveLocalStorage as never;
+    (plugin as never as {
+      clearCommunityPluginCloudCleanupMarker(pluginId: string): void;
+    }).clearCommunityPluginCloudCleanupMarker("calendar");
+    expect(saveLocalStorage).toHaveBeenCalledWith(
+      "easy-sync-community-plugin-cloud-cleanup-v1",
+      [{ pluginId: "other", cleanedAt: 2 }],
+    );
+  });
+
   it("cleans an exited plugin through the dedicated transaction and records a marker", async () => {
     const plugin = makePlugin();
     attachParticipationState(
@@ -5244,51 +5718,6 @@ describe("main sync entry guards", () => {
     expect(patch.communityPluginSyncPolicy.data.pluginIds).toEqual([]);
   });
 
-  it("notices once when a cleaned plugin reappears on the cloud", () => {
-    const plugin = makePlugin();
-    const state = {
-      isV2StateActive: true,
-      remoteSnapshot: [{
-        path: ".obsidian/plugins/calendar/main.js",
-        driveId: "main-id",
-        parentId: "parent",
-        size: 10,
-        mtime: 1,
-        eTag: "etag",
-      }],
-      getCommunityPluginParticipation: vi.fn().mockReturnValue(
-        reduceDeviceCommunityPluginParticipation(
-          createEmptyDeviceCommunityPluginParticipation(true),
-          { type: "confirm-excluded", pluginId: "calendar" },
-        ),
-      ),
-    };
-    plugin.state = state as never;
-    const show = vi.fn();
-    plugin.noticeCenter = {
-      show,
-      clear: vi.fn(),
-      dispose: vi.fn(),
-    } as never;
-    plugin.app.loadLocalStorage = vi.fn().mockReturnValue([
-      { pluginId: "calendar", cleanedAt: 123 },
-    ]);
-    const saveLocalStorage = vi.fn();
-    plugin.app.saveLocalStorage = saveLocalStorage as never;
-
-    (plugin as never as {
-      maybeNoticeCommunityPluginCloudResurrection(): void;
-    }).maybeNoticeCommunityPluginCloudResurrection();
-
-    expect(show).toHaveBeenCalledWith(expect.objectContaining({
-      key: "cloud-cleanup:resurrected:calendar",
-    }));
-    expect(saveLocalStorage).toHaveBeenCalledWith(
-      "easy-sync-community-plugin-cloud-cleanup-v1",
-      [],
-    );
-  });
-
   it("keeps the marker when the cleaned plugin stays absent", () => {
     const plugin = makePlugin();
     const state = {
@@ -5314,14 +5743,23 @@ describe("main sync entry guards", () => {
     plugin.app.saveLocalStorage = saveLocalStorage as never;
 
     (plugin as never as {
-      maybeNoticeCommunityPluginCloudResurrection(): void;
-    }).maybeNoticeCommunityPluginCloudResurrection();
+      sweepResurrectedCloudCleanupMarkersAgainstCatalog(
+        catalog: unknown,
+      ): void;
+    }).sweepResurrectedCloudCleanupMarkersAgainstCatalog({
+      version: 1,
+      complete: true,
+      stale: false,
+      revision: 5,
+      observedAt: 1,
+      sourceDigest: "a".repeat(64),
+      scope: {},
+      entries: [],
+    });
 
     expect(show).not.toHaveBeenCalled();
-    expect(saveLocalStorage).toHaveBeenCalledWith(
-      "easy-sync-community-plugin-cloud-cleanup-v1",
-      [marker],
-    );
+    // Nothing changed: the marker stays persisted and no write is issued.
+    expect(saveLocalStorage).not.toHaveBeenCalled();
   });
 
   it("notices once per plugin when an upload downgrade is deferred (A1)", () => {
@@ -5392,5 +5830,735 @@ describe("main sync entry guards", () => {
       "easy-sync-upload-downgrade-notice-v1",
       [],
     );
+  });
+});
+
+describe("round-end community-plugin adoption reconcile", () => {
+  function calendarManifestText(): string {
+    return JSON.stringify({
+      id: "calendar",
+      version: "2.0.0",
+      name: "Calendar",
+      isDesktopOnly: false,
+    });
+  }
+
+  function committedPluginIndex(): {
+    schemaVersion: 2;
+    filesRootId: string;
+    cursorRevision: number;
+    deltaLink: null;
+    complete: true;
+    itemsById: Record<string, unknown>;
+  } {
+    const manifestBytes = new TextEncoder().encode(calendarManifestText());
+    const file = (
+      id: string,
+      name: string,
+      parentId: string,
+      size: number,
+    ) => ({
+      id,
+      parentId,
+      name,
+      kind: "file",
+      size,
+      mtime: 2,
+      eTag: `etag-${id}`,
+      cTag: `ctag-${id}`,
+    });
+    return {
+      schemaVersion: 2,
+      filesRootId: "files",
+      cursorRevision: 0,
+      deltaLink: null,
+      complete: true,
+      itemsById: {
+        "obsidian-folder": {
+          id: "obsidian-folder",
+          parentId: "files",
+          name: ".obsidian",
+          kind: "folder",
+        },
+        "plugins-folder": {
+          id: "plugins-folder",
+          parentId: "obsidian-folder",
+          name: "plugins",
+          kind: "folder",
+        },
+        "calendar-folder": {
+          id: "calendar-folder",
+          parentId: "plugins-folder",
+          name: "calendar",
+          kind: "folder",
+        },
+        "calendar-main": file("calendar-main", "main.js", "calendar-folder", 4),
+        "calendar-manifest": file(
+          "calendar-manifest",
+          "manifest.json",
+          "calendar-folder",
+          manifestBytes.byteLength,
+        ),
+        "calendar-styles": file(
+          "calendar-styles",
+          "styles.css",
+          "calendar-folder",
+          3,
+        ),
+      },
+    };
+  }
+
+  function adoptionStateHarness(
+    initial: ReturnType<typeof createEmptyCommunityPluginAdoptionMemory>,
+  ) {
+    let store = structuredClone(initial);
+    const update = vi.fn(async (
+      next: ReturnType<typeof createEmptyCommunityPluginAdoptionMemory>,
+    ) => {
+      store = structuredClone(next);
+    });
+    return {
+      store: () => structuredClone(store),
+      update,
+    };
+  }
+
+  function makeRoundPlugin(
+    memory: ReturnType<typeof createEmptyCommunityPluginAdoptionMemory>,
+  ) {
+    const plugin = makePlugin();
+    vi.spyOn(plugin as never, "beginSyncNotice")
+      .mockImplementation(() => undefined);
+    const memoryHarness = adoptionStateHarness(memory);
+    const state = {
+      isV2StateActive: true,
+      remoteScope: COMMUNITY_PLUGIN_SCOPE,
+      getCommunityPluginManifestObservations: vi.fn(() => []),
+      setCommunityPluginManifestObservations: vi.fn().mockResolvedValue(
+        undefined,
+      ),
+      getRemoteCommunityPluginCatalog: vi.fn(() => null),
+      setRemoteCommunityPluginCatalog: vi.fn().mockResolvedValue(undefined),
+      getCommittedRemoteIndex: () => committedPluginIndex(),
+      getCommunityPluginAdoptionMemory: memoryHarness.store,
+      updateCommunityPluginAdoptionMemory: memoryHarness.update,
+    };
+    plugin.state = state as never;
+    plugin.onedrive = {
+      downloadFile: vi.fn(async (
+        _vault: string,
+        path: string,
+        _destination: unknown,
+        _itemId: string,
+        size: number,
+      ) => {
+        const bytes = path.endsWith("manifest.json")
+          ? new TextEncoder().encode(calendarManifestText())
+          : new Uint8Array(size);
+        return bytes.buffer;
+      }),
+    } as never;
+    (plugin as never as { syncCommunityPlugins: boolean }).syncCommunityPlugins
+      = true;
+    (plugin as never as { communityPluginParticipation: unknown })
+      .communityPluginParticipation = createEmptyDeviceCommunityPluginParticipation(
+        true,
+      );
+    vi.spyOn(plugin as never, "updateStatusBar")
+      .mockImplementation(() => undefined);
+    plugin.noticeCenter = {
+      show: vi.fn(),
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasActivityInFlight: false,
+      run: vi.fn().mockResolvedValue(okResult()),
+    } as never;
+    return { plugin, state, memoryHarness };
+  }
+
+  it("discovers a new complete bundle into pending rows and stays idempotent across rounds", async () => {
+    const { plugin, memoryHarness } = makeRoundPlugin(
+      createEmptyCommunityPluginAdoptionMemory(),
+    );
+    await (plugin as never as {
+      dispatchSyncRun: (request: { mode: "manual" }) => Promise<unknown>;
+    }).dispatchSyncRun({ mode: "manual" });
+
+    expect(memoryHarness.store()).toEqual({
+      schemaVersion: 1,
+      kind: "community-plugin-adoption-memory",
+      ignoredPluginIds: [],
+      pendingPluginIds: ["calendar"],
+    });
+    expect(memoryHarness.update).toHaveBeenCalledTimes(1);
+
+    await (plugin as never as {
+      dispatchSyncRun: (request: { mode: "manual" }) => Promise<unknown>;
+    }).dispatchSyncRun({ mode: "manual" });
+    // The second settled round reconciles to the same set: no write.
+    expect(memoryHarness.update).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not propose a plugin whose local bundle is already complete", async () => {
+    const { plugin, memoryHarness } = makeRoundPlugin(
+      createEmptyCommunityPluginAdoptionMemory(),
+    );
+    // Calendar is installed on this device with its sync toggle off: the
+    // adoption row's "not yet downloaded" premise is false, so the round-end
+    // reconcile must keep it out of pending.
+    plugin.app.vault.adapter.exists = vi.fn(async (path: string) =>
+      path.endsWith("plugins/calendar/main.js")
+      || path.endsWith("plugins/calendar/manifest.json"),
+    );
+    await (plugin as never as {
+      dispatchSyncRun: (request: { mode: "manual" }) => Promise<unknown>;
+    }).dispatchSyncRun({ mode: "manual" });
+
+    expect(memoryHarness.store()).toEqual({
+      schemaVersion: 1,
+      kind: "community-plugin-adoption-memory",
+      ignoredPluginIds: [],
+      pendingPluginIds: [],
+    });
+    expect(memoryHarness.update).not.toHaveBeenCalled();
+  });
+
+  it("never re-proposes an ignored plugin and reconciles a joined plugin away", async () => {
+    const { plugin, memoryHarness } = makeRoundPlugin({
+      ...createEmptyCommunityPluginAdoptionMemory(),
+      ignoredPluginIds: ["calendar"],
+      pendingPluginIds: ["calendar"],
+    });
+    await (plugin as never as {
+      dispatchSyncRun: (request: { mode: "manual" }) => Promise<unknown>;
+    }).dispatchSyncRun({ mode: "manual" });
+
+    // Ignored plugins are dropped from pending and stay suppressed.
+    expect(memoryHarness.store()).toEqual({
+      schemaVersion: 1,
+      kind: "community-plugin-adoption-memory",
+      ignoredPluginIds: ["calendar"],
+      pendingPluginIds: [],
+    });
+    expect(memoryHarness.update).toHaveBeenCalledTimes(1);
+  });
+
+  it("exposes pending rows and retires them via skip", async () => {
+    const { plugin, memoryHarness } = makeRoundPlugin(
+      createEmptyCommunityPluginAdoptionMemory(),
+    );
+    await (plugin as never as {
+      dispatchSyncRun: (request: { mode: "manual" }) => Promise<unknown>;
+    }).dispatchSyncRun({ mode: "manual" });
+
+    // No stored observation in this harness: the row falls back to the id.
+    expect(plugin.getCommunityPluginAdoptionRows()).toEqual([{
+      pluginId: "calendar",
+      displayName: "calendar",
+      desktopOnly: false,
+    }]);
+
+    await plugin.skipCommunityPluginAdoption("calendar");
+    expect(memoryHarness.store()).toEqual({
+      schemaVersion: 1,
+      kind: "community-plugin-adoption-memory",
+      ignoredPluginIds: ["calendar"],
+      pendingPluginIds: [],
+    });
+    expect(plugin.getCommunityPluginAdoptionRows()).toEqual([]);
+  });
+
+  it("download retires the row and takes the explicit join path once", async () => {
+    const { plugin, memoryHarness } = makeRoundPlugin(
+      createEmptyCommunityPluginAdoptionMemory(),
+    );
+    await (plugin as never as {
+      dispatchSyncRun: (request: { mode: "manual" }) => Promise<unknown>;
+    }).dispatchSyncRun({ mode: "manual" });
+    const join = vi.spyOn(
+      plugin,
+      "updateCommunityPluginFilesSelection",
+    ).mockResolvedValue(undefined);
+
+    await plugin.downloadCommunityPluginAdoption("calendar");
+
+    expect(join).toHaveBeenCalledTimes(1);
+    expect(join).toHaveBeenCalledWith("calendar", true);
+    expect(memoryHarness.store()).toEqual({
+      schemaVersion: 1,
+      kind: "community-plugin-adoption-memory",
+      ignoredPluginIds: [],
+      pendingPluginIds: [],
+    });
+  });
+
+  it("a failed download still retires the row and surfaces feedback", async () => {
+    const { plugin, memoryHarness } = makeRoundPlugin(
+      createEmptyCommunityPluginAdoptionMemory(),
+    );
+    const show = plugin.noticeCenter!.show as ReturnType<typeof vi.fn>;
+    await (plugin as never as {
+      dispatchSyncRun: (request: { mode: "manual" }) => Promise<unknown>;
+    }).dispatchSyncRun({ mode: "manual" });
+    vi.spyOn(
+      plugin,
+      "updateCommunityPluginFilesSelection",
+    ).mockRejectedValue(new Error("network"));
+
+    await plugin.downloadCommunityPluginAdoption("calendar");
+
+    expect(memoryHarness.store().pendingPluginIds).toEqual([]);
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "side-action:adoption:download-failed",
+    }));
+  });
+
+  it("a failed row retirement still runs the join and keeps the row visible", async () => {
+    const { plugin, state, memoryHarness } = makeRoundPlugin(
+      createEmptyCommunityPluginAdoptionMemory(),
+    );
+    await (plugin as never as {
+      dispatchSyncRun: (request: { mode: "manual" }) => Promise<unknown>;
+    }).dispatchSyncRun({ mode: "manual" });
+    vi.spyOn(
+      state,
+      "updateCommunityPluginAdoptionMemory",
+    ).mockRejectedValueOnce(new Error("disk"));
+    const join = vi.spyOn(
+      plugin,
+      "updateCommunityPluginFilesSelection",
+    ).mockResolvedValue(undefined);
+
+    await plugin.downloadCommunityPluginAdoption("calendar");
+
+    expect(join).toHaveBeenCalledTimes(1);
+    expect(join).toHaveBeenCalledWith("calendar", true);
+    expect(memoryHarness.store().pendingPluginIds).toEqual(["calendar"]);
+  });
+
+  it("a failed skip persist is silent and keeps the row", async () => {
+    const { plugin, state, memoryHarness } = makeRoundPlugin(
+      createEmptyCommunityPluginAdoptionMemory(),
+    );
+    await (plugin as never as {
+      dispatchSyncRun: (request: { mode: "manual" }) => Promise<unknown>;
+    }).dispatchSyncRun({ mode: "manual" });
+    vi.spyOn(
+      state,
+      "updateCommunityPluginAdoptionMemory",
+    ).mockRejectedValueOnce(new Error("disk"));
+
+    await expect(
+      plugin.skipCommunityPluginAdoption("calendar"),
+    ).resolves.toBeUndefined();
+
+    expect(memoryHarness.store().pendingPluginIds).toEqual(["calendar"]);
+    expect(memoryHarness.store().ignoredPluginIds).toEqual([]);
+  });
+
+  it("queues the adoption download behind an in-flight round instead of surfacing busy", async () => {
+    const { plugin } = makeRoundPlugin(
+      createEmptyCommunityPluginAdoptionMemory(),
+    );
+    const show = plugin.noticeCenter!.show as ReturnType<typeof vi.fn>;
+    const join = vi.spyOn(
+      plugin,
+      "updateCommunityPluginFilesSelection",
+    ).mockResolvedValue(undefined);
+    const lock = plugin as never as {
+      opLock: string | null;
+      releaseOpLock(): void;
+    };
+
+    // A round holds the operation lock: the click must not bounce with the
+    // busy notice — it waits and applies when the round releases.
+    lock.opLock = "sync";
+    const download = plugin.downloadCommunityPluginAdoption("calendar");
+    await Promise.resolve();
+    expect(join).not.toHaveBeenCalled();
+    expect(show).not.toHaveBeenCalled();
+
+    lock.opLock = null;
+    lock.releaseOpLock();
+    await download;
+    expect(join).toHaveBeenCalledTimes(1);
+    expect(join).toHaveBeenCalledWith("calendar", true);
+  });
+});
+
+function calendarManifestText(): string {
+  return JSON.stringify({
+    id: "calendar",
+    version: "2.0.0",
+    name: "Calendar",
+    isDesktopOnly: false,
+  });
+}
+
+function committedPluginIndex(): {
+  schemaVersion: 2;
+  filesRootId: string;
+  cursorRevision: number;
+  deltaLink: null;
+  complete: true;
+  itemsById: Record<string, unknown>;
+} {
+  const manifestBytes = new TextEncoder().encode(calendarManifestText());
+  const file = (
+    id: string,
+    name: string,
+    parentId: string,
+    size: number,
+  ) => ({
+    id,
+    parentId,
+    name,
+    kind: "file",
+    size,
+    mtime: 2,
+    eTag: `etag-${id}`,
+    cTag: `ctag-${id}`,
+  });
+  return {
+    schemaVersion: 2,
+    filesRootId: "files",
+    cursorRevision: 0,
+    deltaLink: null,
+    complete: true,
+    itemsById: {
+      "obsidian-folder": {
+        id: "obsidian-folder",
+        parentId: "files",
+        name: ".obsidian",
+        kind: "folder",
+      },
+      "plugins-folder": {
+        id: "plugins-folder",
+        parentId: "obsidian-folder",
+        name: "plugins",
+        kind: "folder",
+      },
+      "calendar-folder": {
+        id: "calendar-folder",
+        parentId: "plugins-folder",
+        name: "calendar",
+        kind: "folder",
+      },
+      "calendar-main": file("calendar-main", "main.js", "calendar-folder", 4),
+      "calendar-manifest": file(
+        "calendar-manifest",
+        "manifest.json",
+        "calendar-folder",
+        manifestBytes.byteLength,
+      ),
+      "calendar-styles": file(
+        "calendar-styles",
+        "styles.css",
+        "calendar-folder",
+        3,
+      ),
+    },
+  };
+}
+
+describe("slice-3 no-restart enablement for explicit downloads", () => {
+  function completedRestoreResult(): SyncResult {
+    return {
+      ...okResult(),
+      communityPluginRestoresCompleted: {
+        files: ["calendar"],
+        data: [],
+      },
+    };
+  }
+
+  function makeEnableHarness() {
+    const plugin = makePlugin();
+    vi.spyOn(plugin as never, "beginSyncNotice")
+      .mockImplementation(() => undefined);
+    let participation = reduceDeviceCommunityPluginParticipation(
+      createEmptyDeviceCommunityPluginParticipation(true),
+      { type: "request-join", pluginId: "calendar", operationId: "join-1" },
+    );
+    participation = reduceDeviceCommunityPluginParticipation(
+      participation,
+      { type: "begin-restore", pluginId: "calendar" },
+    );
+    let store = createEmptyCommunityPluginAdoptionMemory();
+    const memoryUpdate = vi.fn(async (next) => {
+      store = structuredClone(next);
+    });
+    const state = {
+      isV2StateActive: true,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+      hasMutationLedgerCorruption: false,
+      hasMutationRecoveryQuarantineCorruption: false,
+      mutationLedger: [],
+      activeV2MigrationHold: null,
+      hasCompleteRemoteFolderIndex: false,
+      remoteFolders: [],
+      remoteScope: COMMUNITY_PLUGIN_SCOPE,
+      getCommunityPluginParticipation: () => structuredClone(participation),
+      updateCommunityPluginParticipation: vi.fn(async (command) => {
+        participation = reduceDeviceCommunityPluginParticipation(
+          participation,
+          command,
+        );
+        return true;
+      }),
+      updateCommunityPluginParticipationBatch: vi.fn(async (commands) => {
+        for (const command of commands) {
+          participation = reduceDeviceCommunityPluginParticipation(
+            participation,
+            command,
+          );
+        }
+        return true;
+      }),
+      retirePendingStateForPaths: vi.fn().mockResolvedValue(undefined),
+      commitSyncPathSettingsChange: vi.fn(async (
+        _isPathInScope: unknown,
+        persistSettings: (data: Record<string, unknown>) => void,
+      ) => persistSettings({})),
+      getCommunityPluginManifestObservations: vi.fn(() => []),
+      setCommunityPluginManifestObservations: vi.fn().mockResolvedValue(
+        undefined,
+      ),
+      getRemoteCommunityPluginCatalog: vi.fn(() => null),
+      setRemoteCommunityPluginCatalog: vi.fn().mockResolvedValue(undefined),
+      getCommittedRemoteIndex: () => committedPluginIndex(),
+      getCommunityPluginAdoptionMemory: () => structuredClone(store),
+      updateCommunityPluginAdoptionMemory: memoryUpdate,
+    };
+    plugin.state = state as never;
+    plugin.i18n = new I18n("zh-cn");
+    plugin.onedrive = {
+      downloadFile: vi.fn(async (
+        _vault: string,
+        path: string,
+        _destination: unknown,
+        _itemId: string,
+        size: number,
+      ) => {
+        const bytes = path.endsWith("manifest.json")
+          ? new TextEncoder().encode(calendarManifestText())
+          : new Uint8Array(size);
+        return bytes.buffer;
+      }),
+    } as never;
+    (plugin as never as { syncCommunityPlugins: boolean }).syncCommunityPlugins
+      = true;
+    plugin.scanner = {
+      setConfig: vi.fn(),
+      shouldSyncPath: vi.fn().mockReturnValue(true),
+      shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+    } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasActivityInFlight: false,
+      setCommunityPluginSyncPolicy: vi.fn(),
+      run: vi.fn().mockResolvedValue(completedRestoreResult()),
+    } as never;
+    (plugin as never as {
+      applyCommunityPluginParticipationProjection: (
+        value: DeviceCommunityPluginParticipationV1,
+      ) => void;
+    }).applyCommunityPluginParticipationProjection(participation);
+    vi.spyOn(plugin as never, "updateStatusBar")
+      .mockImplementation(() => undefined);
+    plugin.noticeCenter = {
+      show: vi.fn(),
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    return {
+      plugin,
+      state,
+      participation: () => structuredClone(participation),
+      memory: () => structuredClone(store),
+      memoryUpdate,
+      show: plugin.noticeCenter!.show as ReturnType<typeof vi.fn>,
+    };
+  }
+
+  it("enables each explicitly downloaded plugin through the host API without notices", async () => {
+    const { plugin, show } = makeEnableHarness();
+    const enablePluginAndSave = vi.fn().mockResolvedValue(undefined);
+    const loadManifests = vi.fn().mockResolvedValue(undefined);
+    plugin.app.plugins = { loadManifests, enablePluginAndSave } as never;
+
+    const result = await (plugin as never as {
+      dispatchSyncRun: (request: { mode: "manual" }) => Promise<SyncResult | null>;
+    }).dispatchSyncRun({ mode: "manual" });
+
+    expect(result?.success).toBe(true);
+    expect(loadManifests).toHaveBeenCalledTimes(1);
+    expect(enablePluginAndSave).toHaveBeenCalledTimes(1);
+    expect(enablePluginAndSave).toHaveBeenCalledWith("calendar");
+    expect(show).not.toHaveBeenCalled();
+  });
+
+  it("falls back with a manual-enable notice and never fails the round", async () => {
+    const { plugin, show } = makeEnableHarness();
+    plugin.app.plugins = {
+      loadManifests: vi.fn().mockResolvedValue(undefined),
+      enablePluginAndSave: vi.fn().mockRejectedValue(new Error("host")),
+    } as never;
+
+    const result = await (plugin as never as {
+      dispatchSyncRun: (request: { mode: "manual" }) => Promise<SyncResult | null>;
+    }).dispatchSyncRun({ mode: "manual" });
+
+    expect(result?.success).toBe(true);
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "sync-result:community-plugin-enable-fallback",
+    }));
+    // The notice text names the plugin (manifest unreadable in this harness
+    // falls back to the plugin id inside the label).
+    const message = (show.mock.calls[0]?.[0] as { message?: string }).message
+      ?? "";
+    expect(message).toContain("calendar");
+  });
+
+  it("keeps automatic updates out of the enablement path", async () => {
+    const { plugin, show } = makeEnableHarness();
+    const enablePluginAndSave = vi.fn();
+    plugin.app.plugins = {
+      loadManifests: vi.fn(),
+      enablePluginAndSave,
+    } as never;
+    // The ordinary update result carries no completed restores: a
+    // participating plugin's version bump must never reach enablement.
+    (plugin.syncExecutor!.run as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({
+        ...okResult(),
+        communityPluginRestoresCompleted: { files: [], data: [] },
+      });
+
+    await (plugin as never as {
+      dispatchSyncRun: (request: { mode: "manual" }) => Promise<SyncResult | null>;
+    }).dispatchSyncRun({ mode: "manual" });
+
+    expect(enablePluginAndSave).not.toHaveBeenCalled();
+    expect(show).not.toHaveBeenCalled();
+  });
+});
+
+// ---- 切片 2：即时弹框（去抖队列/批量合并/动作执行）----
+describe("slice-2 immediate scope-crossing prompt", () => {
+  beforeEach(() => {
+    scopeCrossingPromptAwaitChoice.mockReset();
+    scopeCrossingPromptMockArgs.length = 0;
+  });
+
+  function makePromptPlugin() {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.scanner = {
+      shouldSyncPath: vi.fn((path: string) => path.startsWith("Notes")),
+      shouldSyncFolderPath: vi.fn(() => true),
+    } as never;
+    const recordLocalFileMoveHint = vi.fn().mockResolvedValue(true);
+    const retireLocalMoveHintsByRemoteIds = vi.fn().mockResolvedValue(undefined);
+    let fileHints: Array<{
+      remoteId: string;
+      fromPath: string;
+      toPath: string;
+    }> = [];
+    plugin.state = {
+      recordLocalFileMoveHint,
+      retireLocalMoveHintsByRemoteIds,
+      get localFileMoveHints() {
+        return fileHints;
+      },
+      localFolderMoveHints: [],
+    } as never;
+    return {
+      plugin,
+      recordLocalFileMoveHint,
+      retireLocalMoveHintsByRemoteIds,
+      seedHint: (remoteId: string, fromPath: string, toPath: string) => {
+        fileHints = [...fileHints, { remoteId, fromPath, toPath }];
+      },
+    };
+  }
+
+  function renameFile(
+    plugin: EasySyncPlugin,
+    fromPath: string,
+    toPath: string,
+  ) {
+    return (plugin as never as {
+      handleLocalVaultRename: (
+        file: TFile,
+        oldPath: string,
+      ) => Promise<void>;
+    }).handleLocalVaultRename(new TFile(toPath), fromPath);
+  }
+
+  it("debounces a burst of out-of-scope moves into one batch prompt and applies confirm to every item", async () => {
+    const { plugin, retireLocalMoveHintsByRemoteIds, seedHint } =
+      makePromptPlugin();
+    seedHint("file-a", "Notes/a.md", "Archive/a.md");
+    seedHint("file-b", "Notes/b.md", "Archive/b.md");
+    scopeCrossingPromptAwaitChoice.mockResolvedValue("confirm");
+
+    const first = renameFile(plugin, "Notes/a.md", "Archive/a.md");
+    const second = renameFile(plugin, "Notes/b.md", "Archive/b.md");
+    await Promise.all([first, second]);
+
+    expect(scopeCrossingPromptMockArgs).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(scopeCrossingPromptMockArgs).toHaveLength(1);
+    const args = scopeCrossingPromptMockArgs[0]!;
+    expect(typeof args[1]).toBe("string");
+    expect(typeof args[2]).toBe("string");
+    // 批量合并提示行（第 4 个构造参数）应存在。
+    expect(args[3]).not.toBeNull();
+
+    await vi.waitFor(() => {
+      expect(retireLocalMoveHintsByRemoteIds).toHaveBeenCalledTimes(2);
+    });
+    expect(retireLocalMoveHintsByRemoteIds).toHaveBeenCalledWith(["file-a"]);
+    expect(retireLocalMoveHintsByRemoteIds).toHaveBeenCalledWith(["file-b"]);
+    plugin.stopAutoSync();
+  });
+
+  it("keeps the prompt inside the scope when the user dismisses it", async () => {
+    const { plugin, retireLocalMoveHintsByRemoteIds, seedHint } =
+      makePromptPlugin();
+    seedHint("file-a", "Notes/a.md", "Archive/a.md");
+    scopeCrossingPromptAwaitChoice.mockResolvedValue(null);
+
+    await renameFile(plugin, "Notes/a.md", "Archive/a.md");
+    await vi.advanceTimersByTimeAsync(700);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(scopeCrossingPromptMockArgs).toHaveLength(1);
+    expect(retireLocalMoveHintsByRemoteIds).not.toHaveBeenCalled();
+    plugin.stopAutoSync();
+  });
+
+  it("opens no prompt when the destination stays inside the sync scope", async () => {
+    const { plugin, retireLocalMoveHintsByRemoteIds } = makePromptPlugin();
+    const shouldSyncPath = vi.fn().mockReturnValue(true);
+    plugin.scanner = {
+      shouldSyncPath,
+      shouldSyncFolderPath: vi.fn(() => true),
+    } as never;
+
+    await renameFile(plugin, "Notes/a.md", "Notes/b.md");
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(shouldSyncPath).toHaveBeenCalled();
+    expect(scopeCrossingPromptMockArgs).toHaveLength(0);
+    expect(retireLocalMoveHintsByRemoteIds).not.toHaveBeenCalled();
+    plugin.stopAutoSync();
   });
 });

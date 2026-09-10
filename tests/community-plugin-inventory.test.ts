@@ -59,6 +59,33 @@ async function remoteManifestEvidence(
   return { remote, observation };
 }
 
+async function desktopOnlyEvidence(
+  pluginId: string,
+  isDesktopOnly: boolean,
+): Promise<{
+  remote: RemoteFileEntry;
+  observation: CommunityPluginManifestObservationV1;
+}> {
+  const manifestText = JSON.stringify({
+    id: pluginId,
+    name: `${pluginId} name`,
+    version: "2.0.0",
+    isDesktopOnly,
+  });
+  const content = new TextEncoder().encode(manifestText);
+  const remote = remoteFile(
+    `.obsidian/plugins/${pluginId}/manifest.json`,
+    { size: content.byteLength },
+  );
+  const observation = await createCommunityPluginManifestObservation(
+    SCOPE,
+    pluginId,
+    remote,
+    content.buffer,
+  );
+  return { remote, observation };
+}
+
 describe("community plugin inventory", () => {
   it("combines local and cached remote ids without private Obsidian APIs", async () => {
     const files = new Map<string, string>([
@@ -562,6 +589,73 @@ describe("community plugin inventory", () => {
 
     expect(stale[0]?.name).toBeNull();
     expect(wrongScope[0]?.name).toBeNull();
+  });
+
+  it("marks a remote-only row desktop-only from exact remote manifest evidence", async () => {
+    const { remote, observation } = await desktopOnlyEvidence(
+      "desktop-locked",
+      true,
+    );
+    const adapter = {
+      exists: vi.fn(async () => false),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      read: vi.fn(async () => {
+        throw new Error("missing");
+      }),
+    } as unknown as DataAdapter;
+
+    const result = await buildCommunityPluginInventory(
+      adapter,
+      ".obsidian",
+      "easy-sync",
+      [],
+      [remote],
+      [],
+      [],
+      [],
+      { scope: SCOPE, observations: [observation] },
+    );
+
+    expect(result[0]).toMatchObject({
+      id: "desktop-locked",
+      name: "desktop-locked name",
+      local: false,
+      remote: true,
+      desktopOnly: true,
+    });
+  });
+
+  it("keeps a remote-only row neutral when remote evidence is not desktop-only", async () => {
+    const { remote, observation } = await desktopOnlyEvidence(
+      "anywhere",
+      false,
+    );
+    const adapter = {
+      exists: vi.fn(async () => false),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      read: vi.fn(async () => {
+        throw new Error("missing");
+      }),
+    } as unknown as DataAdapter;
+
+    const result = await buildCommunityPluginInventory(
+      adapter,
+      ".obsidian",
+      "easy-sync",
+      [],
+      [remote],
+      [],
+      [],
+      [],
+      { scope: SCOPE, observations: [observation] },
+    );
+
+    expect(result[0]).toMatchObject({
+      id: "anywhere",
+      local: false,
+      remote: true,
+      desktopOnly: false,
+    });
   });
 
   it("fails closed when the local plugin folder cannot be listed", async () => {

@@ -14,6 +14,7 @@ import {
   type AnimationFrameHandle,
 } from "../obsidian-compat";
 import type EasySyncPlugin from "../main";
+import type { CommunityPluginAdoptionRow } from "../main";
 import { SyncActionType } from "../sync/types";
 import type {
   ManualMutationResolutionChoiceV1,
@@ -38,6 +39,7 @@ import { ConfirmModal } from "./confirm-modal";
 import { applyDestructiveButton } from "./destructive-button";
 import { EmptyFolderResolutionModal } from "./empty-folder-resolution-modal";
 import { ConflictDetailModal } from "./conflict-detail-modal";
+import { ConfigSyncModal } from "./config-sync-modal";
 import { MutationRecoveryResolutionModal } from "./mutation-recovery-resolution-modal";
 import {
   RIBBON_STATUS_ICONS,
@@ -107,8 +109,13 @@ export function resolveSyncViewBodyMode(input: {
   remoteScopeRecoveryFailureVisible?: boolean;
 }): SyncViewBodyMode {
   if (input.planReviewActive && input.hasSyncState) return "plan";
-  if (input.fullSyncRunning) return "progress";
+  // Pending rows stay visible even while a full sync round is running, so
+  // every row type keeps the "click one, it leaves the list, the rest stay
+  // clickable" contract (continuous click-in). The top status panel already
+  // shows the round's progress. A full sync round only takes over the body
+  // when there is nothing left to act on.
   if (input.pendingCount > 0) return "pending";
+  if (input.fullSyncRunning) return "progress";
   if (input.sideActionResultsVisible) return "progress";
   if (input.mutationRecoveryVisible) return "recovery";
   if (input.remoteScopeRecoveryFailureVisible) return "progress";
@@ -197,6 +204,7 @@ export interface SyncViewContentKeyInput {
   pendingIssues: PendingIssue[];
   conflicts: SyncPlanItem[];
   pendingDeletes: SyncPlanItem[];
+  adoptionRows: CommunityPluginAdoptionRow[];
   planReviewCounts: { uploads: number; downloads: number; folders?: number; deletes: number; conflicts: number; skipped: number } | null;
   planReviewRevision: number;
   history: SyncHistoryEntry[];
@@ -762,7 +770,12 @@ export function buildSyncViewContentKey(
     const deletes = input.pendingDeletes
       .map((item) => `${item.type}:${item.path}:${item.reason ?? ""}`)
       .join("|");
-    return `pending:${authKey}:${runKey}:${recoveryKey}:${issues}:${conflicts}:${deletes}:${historyKey}`;
+    const adoption = (input.adoptionRows ?? [])
+      .map((row) =>
+        `${row.pluginId}:${row.displayName}:${row.desktopOnly ? 1 : 0}`
+      )
+      .join("|");
+    return `pending:${authKey}:${runKey}:${recoveryKey}:${issues}:${conflicts}:${deletes}:adoption:${adoption}:${historyKey}`;
   }
   if (input.bodyMode === "recovery") {
     return `recovery:${authKey}:${runKey}:${recoveryKey}:${historyKey}`;
@@ -855,6 +868,7 @@ export class EasySyncSyncView extends ItemView {
   private emptyFolderResolutionOpening = false;
   private sharedFolderIdentityResolutionOpening = false;
   private staleIdentityResolutionOpening = false;
+  private scopeCrossingResolutionOpening = false;
   private mutationRecoveryResolutionOpening = false;
   private closed = false;
 
@@ -983,11 +997,18 @@ export class EasySyncSyncView extends ItemView {
       .filter((item) => !this.plugin.syncExecutor?.isSideActionQueued(item.path));
     const pendingDeletes = (syncState?.pendingRemoteDeletes ?? [])
       .filter((item) => !this.plugin.syncExecutor?.isSideActionQueued(item.path));
-    const pendingIssues = syncState?.pendingIssues ?? [];
+    // Resolution rows (scope-crossing / stale identity / empty folder /
+    // folder subtree / folder location / shared folder identity) settle
+    // through the same side-action queue; hiding them as soon as their path
+    // is queued gives them the same immediate-removal contract as ordinary
+    // conflicts (continuous click-in).
+    const pendingIssues = (syncState?.pendingIssues ?? [])
+      .filter((item) => !this.plugin.syncExecutor?.isSideActionQueued(item.path));
     const pendingIssueGroups = groupPendingIssuesForReview(pendingIssues);
+    const adoptionRows = this.plugin.getCommunityPluginAdoptionRows();
     const planReviewActive = syncState?.planReviewActive ?? false;
     const pendingCount = pendingIssueGroups.length + conflicts.length
-      + pendingDeletes.length;
+      + pendingDeletes.length + adoptionRows.length;
     const sideActionResultsVisible = progress.activityKind === "sideAction"
       && (sideActionRunning || progress.completedFiles.length > 0);
     const mutationRecovery = this.plugin.getMutationRecoveryDisplayState();
@@ -1069,6 +1090,7 @@ export class EasySyncSyncView extends ItemView {
       pendingIssues,
       conflicts,
       pendingDeletes,
+      adoptionRows,
       planReviewCounts,
       planReviewRevision: syncState?.planReviewRevision ?? 0,
       history: syncState?.syncHistory ?? [],
@@ -1120,6 +1142,7 @@ export class EasySyncSyncView extends ItemView {
           pendingIssues,
           conflicts,
           pendingDeletes,
+          adoptionRows,
         );
       } else if (bodyMode === "recovery" && mutationRecovery) {
         this.renderMutationRecoverySection(content, mutationRecovery);
@@ -1292,6 +1315,15 @@ export class EasySyncSyncView extends ItemView {
     this.createIconButton(buttons, "settings", t("syncView.openSettings"), () => {
       this.plugin.openPluginSettings();
     });
+    // 管理入口浅化（切片 4）：范围管理弹框直达，保持设置页现状。
+    this.createIconButton(
+      buttons,
+      "sliders-horizontal",
+      t("syncView.openScopeManage"),
+      () => {
+        new ConfigSyncModal(this.plugin).open();
+      },
+    );
 
     this.renderCollapseToggle(buttons);
   }
@@ -1860,11 +1892,15 @@ export class EasySyncSyncView extends ItemView {
     issues: PendingIssue[],
     conflicts: SyncPlanItem[],
     pendingDeletes: SyncPlanItem[],
+    adoptionRows: readonly CommunityPluginAdoptionRow[],
   ): void {
     const section = container
       .createDiv("easy-sync-section")
       .createDiv("easy-sync-section-body");
     section.addClass("easy-sync-path-layout");
+    for (const row of adoptionRows) {
+      this.renderAdoptionItem(section, row);
+    }
     const groupedIssues = groupPendingIssuesForReview(issues);
     const skipped = groupedIssues.filter(({ issue }) =>
       issue.actionType === SyncActionType.SkipLargeFile
@@ -1962,9 +1998,22 @@ export class EasySyncSyncView extends ItemView {
     configureFilePath(details, pathEl, issue.path, true);
     const chipLabel = formatPendingIssueChipLabel(issue.actionType, t);
     if (chipLabel) summary.createSpan("easy-sync-tree-chip").setText(chipLabel);
+    // scope-crossing 行的出口按当前去向记录分流：有覆盖 hint 的移出行才
+    // 渲染撤销/确认双按钮；漂移与设置形态没有去向证据，恢复通用「重新检
+    // 查」。判定与行动侧快照共用同一规则（StateManager.getScopeCrossing
+    // ExitKind → findScopeCrossingCoveringHintV1），渲染不会许诺不可用的动作。
+    const scopeCrossingExitKind = issue.issueCode === "scope-crossing"
+      ? this.plugin.state?.getScopeCrossingExitKind(issue.path) ?? null
+      : null;
 
     const body = details.createDiv("easy-sync-tree-item-body");
-    if (issue.reason) body.createDiv("easy-sync-item-reason").setText(issue.reason);
+    if (issue.reason) {
+      body.createDiv("easy-sync-item-reason").setText(
+        scopeCrossingExitKind === "folder"
+          ? t("syncView.scopeCrossing.rowReasonFolder")
+          : issue.reason,
+      );
+    }
     if (nestedIssues.length > 0) {
       body.createDiv("easy-sync-item-reason").setText(
         t("syncView.folderSubtree.affectedFolders", {
@@ -2037,6 +2086,25 @@ export class EasySyncSyncView extends ItemView {
         );
         return;
       }
+      if (issue.issueCode === "scope-crossing" && scopeCrossingExitKind) {
+        this.createActionChip(
+          actions,
+          t("syncView.scopeCrossing.restore"),
+          "accent",
+          () => {
+            void this.openScopeCrossingRestore(issue.path);
+          },
+        );
+        this.createActionChip(
+          actions,
+          t("syncView.scopeCrossing.confirm"),
+          "accent",
+          () => {
+            void this.openScopeCrossingConfirm(issue.path);
+          },
+        );
+        return;
+      }
       this.createActionChip(actions, formatPendingIssueActionLabel(
         issue.actionType,
         t,
@@ -2076,6 +2144,10 @@ export class EasySyncSyncView extends ItemView {
         },
       ).awaitConfirm();
       if (!confirmed) return;
+      // The modal interaction is over — release the shared guard before the
+      // settlement so other rows of the same kind stay clickable (same
+      // immediate-response contract as ordinary file conflicts).
+      this.staleIdentityResolutionOpening = false;
       await this.plugin.retireReviewedStaleIdentity(snapshot);
     } finally {
       this.staleIdentityResolutionOpening = false;
@@ -2105,6 +2177,10 @@ export class EasySyncSyncView extends ItemView {
         },
       ).awaitConfirm();
       if (!confirmed) return;
+      // The modal interaction is over — release the shared guard before the
+      // settlement so other rows of the same kind stay clickable (same
+      // immediate-response contract as ordinary file conflicts).
+      this.sharedFolderIdentityResolutionOpening = false;
       await this.plugin.confirmReviewedSharedFolderIdentity(snapshot);
     } finally {
       this.sharedFolderIdentityResolutionOpening = false;
@@ -2125,6 +2201,10 @@ export class EasySyncSyncView extends ItemView {
             subtree,
             t,
           ).awaitChoice();
+          // The modal interaction is over — release the shared guard before
+          // the settlement so other rows stay clickable (same immediate-
+          // response contract as ordinary file conflicts).
+          this.emptyFolderResolutionOpening = false;
           if (choice?.action === "restore") {
             await this.plugin.restoreReviewedFolderSubtree(subtree);
           }
@@ -2165,6 +2245,10 @@ export class EasySyncSyncView extends ItemView {
         t,
       ).awaitChoice();
       if (!choice) return;
+      // The modal interaction is over — release the shared guard before the
+      // settlement so other rows stay clickable (same immediate-response
+      // contract as ordinary file conflicts).
+      this.emptyFolderResolutionOpening = false;
       if (choice.action === "restore") {
         await this.plugin.restoreReviewedEmptyFolder(snapshot);
         return;
@@ -2212,6 +2296,11 @@ export class EasySyncSyncView extends ItemView {
         snapshot,
         t,
       ).awaitChoice();
+      if (!choice) return;
+      // The modal interaction is over — release the shared guard before the
+      // settlement so other rows stay clickable (same immediate-response
+      // contract as ordinary file conflicts).
+      this.emptyFolderResolutionOpening = false;
       if (choice?.action === "keep-local-location") {
         await this.plugin.resolveReviewedFolderLocation(
           snapshot,
@@ -2229,6 +2318,79 @@ export class EasySyncSyncView extends ItemView {
     }
   }
 
+  private async openScopeCrossingRestore(path: string): Promise<void> {
+    if (this.scopeCrossingResolutionOpening) return;
+    this.scopeCrossingResolutionOpening = true;
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    try {
+      const snapshot =
+        await this.plugin.getScopeCrossingResolutionSnapshot(path);
+      if (!snapshot) {
+        new Notice(t("notice.scopeCrossing.changed", { path }));
+        return;
+      }
+      const confirmed = await new ConfirmModal(
+        this.plugin.app,
+        t("syncView.scopeCrossing.restoreTitle"),
+        null,
+        t("syncView.scopeCrossing.restore"),
+        t("confirm.cancel"),
+        t,
+        {
+          message: t("syncView.scopeCrossing.restoreMessage", {
+            path: snapshot.fromPath,
+          }),
+        },
+      ).awaitConfirm();
+      if (!confirmed) return;
+      // The modal interaction is over — release the shared guard before the
+      // settlement so other rows of the same kind stay clickable (same
+      // immediate-response contract as ordinary file conflicts).
+      this.scopeCrossingResolutionOpening = false;
+      await this.plugin.restoreScopeCrossingMove(snapshot);
+    } finally {
+      this.scopeCrossingResolutionOpening = false;
+    }
+  }
+
+  private async openScopeCrossingConfirm(path: string): Promise<void> {
+    if (this.scopeCrossingResolutionOpening) return;
+    this.scopeCrossingResolutionOpening = true;
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    try {
+      const snapshot =
+        await this.plugin.getScopeCrossingResolutionSnapshot(path);
+      if (!snapshot) {
+        new Notice(t("notice.scopeCrossing.changed", { path }));
+        return;
+      }
+      const confirmed = await new ConfirmModal(
+        this.plugin.app,
+        t("syncView.scopeCrossing.confirmTitle"),
+        null,
+        t("syncView.scopeCrossing.confirm"),
+        t("confirm.cancel"),
+        t,
+        {
+          message: t(
+            snapshot.kind === "folder"
+              ? "syncView.scopeCrossing.confirmMessageFolder"
+              : "syncView.scopeCrossing.confirmMessageFile",
+          ),
+          danger: true,
+        },
+      ).awaitConfirm();
+      if (!confirmed) return;
+      // The modal interaction is over — release the shared guard before the
+      // settlement so other rows of the same kind stay clickable (same
+      // immediate-response contract as ordinary file conflicts).
+      this.scopeCrossingResolutionOpening = false;
+      await this.plugin.confirmScopeCrossingExit(snapshot);
+    } finally {
+      this.scopeCrossingResolutionOpening = false;
+    }
+  }
+
   private async openMutationRecoveryResolution(): Promise<void> {
     if (this.mutationRecoveryResolutionOpening) return;
     this.mutationRecoveryResolutionOpening = true;
@@ -2242,6 +2404,7 @@ export class EasySyncSyncView extends ItemView {
       if (shouldAutoSettleIdenticalRecovery(snapshot)) {
         // Identical facts leave no decision for the user: settle through the
         // existing chain, which rechecks facts and digests before any write.
+        this.mutationRecoveryResolutionOpening = false;
         await this.plugin.resolveMutationRecovery(snapshot, "keep-local");
         this.plugin.updateStatusBar();
         this.render();
@@ -2256,6 +2419,10 @@ export class EasySyncSyncView extends ItemView {
       ).awaitChoice();
       if (!choice) return;
       if (!await this.confirmMutationResolutionDeletion(snapshot, choice)) return;
+      // The modal interaction is over — release the shared guard before the
+      // settlement + full sync round so other plugin rows stay clickable
+      // (same immediate-response contract as ordinary file conflicts).
+      this.mutationRecoveryResolutionOpening = false;
       await this.plugin.resolveMutationRecovery(snapshot, choice);
     } finally {
       this.mutationRecoveryResolutionOpening = false;
@@ -2284,6 +2451,10 @@ export class EasySyncSyncView extends ItemView {
         return;
       }
       if (!await this.confirmMutationResolutionDeletion(snapshot, choice)) return;
+      // The modal interaction is over — release the shared guard before the
+      // settlement + full sync round so other plugin rows stay clickable
+      // (same immediate-response contract as ordinary file conflicts).
+      this.mutationRecoveryResolutionOpening = false;
       await this.plugin.resolveMutationRecovery(snapshot, choice);
     } finally {
       this.mutationRecoveryResolutionOpening = false;
@@ -2744,6 +2915,61 @@ export class EasySyncSyncView extends ItemView {
         void this.openCommunityPluginBundleReview(pluginId);
       },
     );
+  }
+
+  /**
+   * One pending new-plugin / reappeared-plugin decision row (slice 2). It uses
+   * the same collapsible tree-item shape as the other pending rows (details +
+   * collapse icon + summary chips + expandable body with action chips), so the
+   * sidebar keeps one consistent format (2026-09-09 用户反馈：原扁平行与其
+   * 它行格式对不上). The two chips execute directly — no expand step, no
+   * confirmation dialog. The desktop-only marker only appears on desktop;
+   * mobile never receives those bundles.
+   */
+  private renderAdoptionItem(
+    container: HTMLElement,
+    row: CommunityPluginAdoptionRow,
+  ): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const details = container.createEl("details", "easy-sync-tree-item");
+    const summary = details.createEl("summary", "easy-sync-tree-row");
+    this.addCollapseIcon(summary);
+    const icon = summary.createSpan("easy-sync-tree-status-icon");
+    setIcon(icon, "blocks");
+    const nameEl = summary.createSpan("easy-sync-tree-path");
+    nameEl.setText(row.displayName);
+    nameEl.setAttribute("aria-label", row.displayName);
+    setTooltip(nameEl, row.displayName);
+    summary.createSpan("easy-sync-tree-chip").setText(
+      t("syncView.adoption.chip"),
+    );
+    if (row.desktopOnly) {
+      summary.createSpan("easy-sync-tree-chip").setText(
+        t("syncView.adoption.desktopOnly"),
+      );
+    }
+    const body = details.createDiv("easy-sync-tree-item-body");
+    body.createDiv("easy-sync-item-reason").setText(
+      t("syncView.adoption.reason"),
+    );
+    const actions = body.createDiv("easy-sync-item-actions");
+    this.createActionChip(
+      actions,
+      t("syncView.adoption.download"),
+      "accent",
+      () => {
+        void this.runItemAction(
+          actions,
+          () => this.plugin.downloadCommunityPluginAdoption(row.pluginId),
+        );
+      },
+    );
+    this.createActionChip(actions, t("syncView.adoption.skip"), "", () => {
+      void this.runItemAction(
+        actions,
+        () => this.plugin.skipCommunityPluginAdoption(row.pluginId),
+      );
+    });
   }
 
   private renderDeleteItem(container: HTMLElement, item: SyncPlanItem): void {

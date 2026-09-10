@@ -7,7 +7,12 @@ import {
   readCommunityPluginManifestObservations,
   type CommunityPluginManifestObservationV1,
 } from "./community-plugin-bundle";
-import { buildRemoteIndexV2 } from "./remote-index-v2";
+import {
+  buildRemoteIndexV2,
+  projectRemoteNodesV2,
+  type RemoteIndexV2,
+  type RemoteNodeV2,
+} from "./remote-index-v2";
 import {
   isSyncScope,
   sameSyncScope,
@@ -63,6 +68,23 @@ export interface BuildRemoteCommunityPluginCatalogInput {
   ownPluginId?: string;
 }
 
+export interface BuildRemoteCommunityPluginCatalogFromIndexInput {
+  scope: Readonly<SyncScope>;
+  configDir: string;
+  /**
+   * The scope's committed V2 remote index. Its nodes are the round's already
+   * fetched and validated remote facts, so building the catalog from them
+   * costs zero extra network requests (per-round catalog freshness).
+   */
+  index: Readonly<RemoteIndexV2>;
+  manifestObservations: readonly Readonly<
+    CommunityPluginManifestObservationV1
+  >[];
+  observedAt: number;
+  previous: Readonly<RemoteCommunityPluginCatalogV1> | null;
+  ownPluginId?: string;
+}
+
 const SAFE_PLUGIN_ID = /^[a-z0-9][a-z0-9_-]*$/i;
 const SHA256_PATTERN = /^[a-f0-9]{64}$/;
 
@@ -90,16 +112,79 @@ export async function buildRemoteCommunityPluginCatalog(
     input.scope.filesRootId,
     null,
   );
+  return buildRemoteCommunityPluginCatalogCore({
+    scope: input.scope,
+    configDir: input.configDir,
+    nodes: Object.values(projection.index.itemsById),
+    pathById: projection.pathById,
+    manifestObservations: input.manifestObservations,
+    observedAt: input.observedAt,
+    previous: input.previous,
+    ownPluginId,
+  });
+}
+
+export async function buildRemoteCommunityPluginCatalogFromIndex(
+  input: Readonly<BuildRemoteCommunityPluginCatalogFromIndexInput>,
+): Promise<RemoteCommunityPluginCatalogV1> {
+  if (!isSyncScope(input.scope)) throw new Error("Remote plugin catalog scope is invalid");
+  if (
+    input.index.complete !== true
+    || input.index.filesRootId !== input.scope.filesRootId
+  ) {
+    throw new Error(
+      "Remote plugin catalog committed index is not complete for the scope",
+    );
+  }
+  assertTimestamp(input.observedAt, "observedAt");
+  const nodes = Object.values(input.index.itemsById)
+    .filter((node) => node.id !== input.index.filesRootId);
+  const pathById = projectRemoteNodesV2(
+    nodes,
+    input.index.filesRootId,
+  ).pathById;
+  return buildRemoteCommunityPluginCatalogCore({
+    scope: input.scope,
+    configDir: input.configDir,
+    nodes,
+    pathById,
+    manifestObservations: input.manifestObservations,
+    observedAt: input.observedAt,
+    previous: input.previous,
+    ownPluginId: input.ownPluginId ?? "easy-sync",
+  });
+}
+
+/**
+ * Shared entry builder over one projected remote node set. `nodes` must
+ * exclude the scope root folder; `pathById` must resolve every node path.
+ * Both public builders (item-stream refresh and committed-index round update)
+ * converge here so their facts and validation semantics stay identical.
+ */
+async function buildRemoteCommunityPluginCatalogCore(
+  input: Readonly<{
+    scope: Readonly<SyncScope>;
+    configDir: string;
+    nodes: readonly Readonly<RemoteNodeV2>[];
+    pathById: ReadonlyMap<string, string>;
+    manifestObservations: readonly Readonly<
+      CommunityPluginManifestObservationV1
+    >[];
+    observedAt: number;
+    previous: Readonly<RemoteCommunityPluginCatalogV1> | null;
+    ownPluginId: string;
+  }>,
+): Promise<RemoteCommunityPluginCatalogV1> {
   const membersByPluginId = new Map<
     string,
     RemoteCommunityPluginCatalogMemberV1[]
   >();
-  for (const node of Object.values(projection.index.itemsById)) {
+  for (const node of input.nodes) {
     if (node.kind !== "file") continue;
-    const path = projection.pathById.get(node.id);
+    const path = input.pathById.get(node.id);
     if (!path) throw new Error(`Remote plugin catalog path is missing: ${node.id}`);
     const managed = parseCommunityPluginBundlePath(path, input.configDir);
-    if (!managed || managed.pluginId === ownPluginId) continue;
+    if (!managed || managed.pluginId === input.ownPluginId) continue;
     const size = node.size ?? 0;
     const mtime = node.mtime ?? 0;
     if (!Number.isSafeInteger(size) || size < 0 || !Number.isFinite(mtime)) {
@@ -260,6 +345,53 @@ export function remoteCommunityPluginCatalogEntries(
   return catalog.entries.flatMap((entry) =>
     entry.members.map(toRemoteFileEntry)
   ).sort((left, right) => compareText(left.path, right.path));
+}
+
+/**
+ * Merge a freshly built catalog over the previously trusted one so entries
+ * never regress. The committed-index build only sees folders this device
+ * anchors (joined plugins), while the delta-fresh catalog also sees
+ * unanchored cloud bundles (plugins other devices uploaded but this device
+ * has not joined). Overwriting the delta-fresh catalog with the narrower
+ * index build every round makes rows flicker away and silently blinds
+ * discovery; keeping the superset makes the round-end update monotonic:
+ * index facts win per plugin (fresh eTags/versions), entries the index no
+ * longer sees survive until the next real delta refresh, and entries only
+ * the index knows (fresh join targets) enter immediately.
+ */
+export async function mergeRemoteCommunityPluginCatalogKeepingSuperset(
+  previous: Readonly<RemoteCommunityPluginCatalogV1> | null,
+  next: Readonly<RemoteCommunityPluginCatalogV1>,
+): Promise<RemoteCommunityPluginCatalogV1> {
+  if (!previous || !sameSyncScope(previous.scope, next.scope)) return next;
+  const previousById = new Map(
+    previous.entries.map((entry) => [entry.pluginId, entry]),
+  );
+  const nextById = new Map(
+    next.entries.map((entry) => [entry.pluginId, entry]),
+  );
+  let changed = false;
+  for (const [pluginId, entry] of previousById) {
+    if (!nextById.has(pluginId)) {
+      nextById.set(pluginId, entry);
+      changed = true;
+    }
+  }
+  if (!changed) return next;
+  const entries = [...nextById.values()].sort((left, right) =>
+    compareText(left.pluginId, right.pluginId)
+  );
+  const sourceDigest = await digest(entries);
+  return {
+    version: 1,
+    scope: { ...next.scope },
+    complete: true,
+    stale: false,
+    revision: Math.max(previous.revision, next.revision) + 1,
+    observedAt: next.observedAt,
+    sourceDigest,
+    entries,
+  };
 }
 
 async function readEntry(

@@ -84,7 +84,7 @@ export async function buildCommunityPluginInventory(
       isSafePluginId(id) && id !== ownPluginId
     ),
   );
-  const remoteManifestNames = await collectRemoteManifestNames(
+  const remoteManifestFacts = await collectRemoteManifestFacts(
     remoteFiles,
     configDir,
     ownPluginId,
@@ -103,10 +103,11 @@ export async function buildCommunityPluginInventory(
         (locallyIgnoredIds.has(id) || mobileDesktopOnlyIds.has(id))
         && manifest === null
       );
+    const remoteFact = remoteManifestFacts.get(id);
     return {
       id,
       name: manifest?.manifest.name.trim()
-        ?? remoteManifestNames.get(id)
+        ?? remoteFact?.name
         ?? null,
       version: manifest?.manifest.version?.trim() || null,
       local,
@@ -116,7 +117,9 @@ export async function buildCommunityPluginInventory(
         && await adapter.exists(`${pluginRoot}/${id}/data.json`),
       dataRemotely: remoteDataIds.has(id),
       desktopOnly: manifest?.manifest.isDesktopOnly === true
-        || mobileDesktopOnlyIds.has(id),
+        || (!local && remoteFact
+          ? remoteFact.isDesktopOnly
+          : mobileDesktopOnlyIds.has(id)),
       manifestIssue: local && manifest === null,
       ...(historicalDataIds.has(id)
         ? { dataHistoricallyPresent: true }
@@ -125,14 +128,27 @@ export async function buildCommunityPluginInventory(
   }));
 }
 
-async function collectRemoteManifestNames(
+interface RemoteManifestFacts {
+  name: string | null;
+  isDesktopOnly: boolean;
+}
+
+/**
+ * Matches current remote manifest members to exact source-bound observations
+ * and derives the presentation facts (display name and desktop-only flag)
+ * from the observed manifest body. The observation must match the current
+ * member by scope, path, remote id, eTag, cTag, size, and hashes; anything
+ * else (stale member version, other scope, other drive) is not evidence for
+ * the current row.
+ */
+async function collectRemoteManifestFacts(
   remoteFiles: readonly RemoteFileEntry[],
   configDir: string,
   ownPluginId: string,
   evidence: Readonly<CommunityPluginRemoteManifestEvidence> | null,
-): Promise<Map<string, string>> {
-  const names = new Map<string, string>();
-  if (!evidence) return names;
+): Promise<Map<string, RemoteManifestFacts>> {
+  const facts = new Map<string, RemoteManifestFacts>();
+  if (!evidence) return facts;
 
   const remoteManifests = new Map<string, RemoteFileEntry>();
   const ambiguousRemoteIds = new Set<string>();
@@ -158,7 +174,7 @@ async function collectRemoteManifestNames(
       readCommunityPluginManifestObservation(observation)
     ),
   );
-  const ambiguousNames = new Set<string>();
+  const ambiguousIds = new Set<string>();
   for (const observation of validated) {
     if (!observation || observation.pluginId === ownPluginId) continue;
     const remote = remoteManifests.get(observation.pluginId);
@@ -170,20 +186,27 @@ async function collectRemoteManifestNames(
         remote,
       )
     ) continue;
-    const name = parseCommunityPluginBundleManifest(
+    const parsed = parseCommunityPluginBundleManifest(
       observation.manifestText,
       observation.pluginId,
-    ).name;
-    if (!name || ambiguousNames.has(observation.pluginId)) continue;
-    const existing = names.get(observation.pluginId);
-    if (existing !== undefined && existing !== name) {
-      names.delete(observation.pluginId);
-      ambiguousNames.add(observation.pluginId);
+    );
+    const next = { name: parsed.name, isDesktopOnly: parsed.isDesktopOnly };
+    if (ambiguousIds.has(observation.pluginId)) continue;
+    const existing = facts.get(observation.pluginId);
+    if (
+      existing !== undefined
+      && (existing.name !== next.name
+        || existing.isDesktopOnly !== next.isDesktopOnly)
+    ) {
+      // Two matching observations describing different manifests make the row
+      // untrustworthy; keep it neutral instead of guessing.
+      facts.delete(observation.pluginId);
+      ambiguousIds.add(observation.pluginId);
       continue;
     }
-    names.set(observation.pluginId, name);
+    facts.set(observation.pluginId, next);
   }
-  return names;
+  return facts;
 }
 
 function collectRemoteDataIds(

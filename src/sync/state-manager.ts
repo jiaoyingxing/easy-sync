@@ -26,6 +26,14 @@ import {
 } from "./runtime-layout-migration";
 import { AncestorStoreV2 } from "./ancestor-store-v2";
 import {
+  findScopeCrossingCoveringHintV1,
+} from "./scope-crossing-resolution";
+import {
+  createEmptyCommunityPluginAdoptionMemory,
+  readCommunityPluginAdoptionMemory,
+  type CommunityPluginAdoptionMemoryV1,
+} from "./community-plugin-adoption-memory";
+import {
   migrateLegacyCommunityPluginParticipation,
   readDeviceCommunityPluginParticipation,
   reduceDeviceCommunityPluginParticipation,
@@ -53,6 +61,7 @@ import {
 } from "./file-state-reducer-v2";
 import {
   projectRemoteIndexV2,
+  type RemoteIndexV2,
   type RemoteNodeV2,
 } from "./remote-index-v2";
 import {
@@ -503,11 +512,14 @@ const KEY_MANUAL_MUTATION_RESOLUTION_AUDIT =
 const KEY_FORCE_RESET_AUDIT = "easy-sync-v2-force-reset-audit";
 const KEY_V2_RECOVERY_QUARANTINE = "easy-sync-v2-recovery-quarantine";
 const KEY_LOCAL_FOLDER_MOVE_HINTS = "easy-sync-local-folder-move-hints";
+const KEY_LOCAL_FILE_MOVE_HINTS = "easy-sync-local-file-move-hints";
 const KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE = "community-plugin-enablement-state";
 const KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS =
   "community-plugin-manifest-observations";
 const KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG =
   "remote-community-plugin-catalog";
+const KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY =
+  "community-plugin-adoption-memory";
 const KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2 =
   "easy-sync-cloud-bootstrap-checkpoint-v2";
 const KEY_CONFIRMED_DESCENDANT_FILE_RECONSTRUCTION =
@@ -568,7 +580,8 @@ export interface PendingIssue {
     | "local-subtree-changed"
     | "remote-subtree-changed"
     | "target-occupied"
-    | "parent-chain-incomplete";
+    | "parent-chain-incomplete"
+    | "scope-crossing";
   reason?: string;
   updatedAt: number;
   fileSize?: number;
@@ -602,10 +615,13 @@ interface PluginData {
   [KEY_V2_RECOVERY_QUARANTINE]: MutationRecoveryQuarantineEntryV2[];
   [KEY_FORCE_RESET_AUDIT]: MutationForceResetAuditV1 | null;
   [KEY_LOCAL_FOLDER_MOVE_HINTS]: LocalFolderMoveHintV1[];
+  [KEY_LOCAL_FILE_MOVE_HINTS]: LocalFolderMoveHintV1[];
   [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]:
     CommunityPluginManifestObservationV1[];
   [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]:
     RemoteCommunityPluginCatalogV1 | null;
+  [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]:
+    CommunityPluginAdoptionMemoryV1 | null;
   [KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2]:
     CloudBootstrapPublicationCheckpointV2 | null;
   [KEY_CONFIRMED_DESCENDANT_FILE_RECONSTRUCTION]:
@@ -638,8 +654,10 @@ const DEFAULT_DATA: PluginData = {
   [KEY_V2_RECOVERY_QUARANTINE]: [],
   [KEY_FORCE_RESET_AUDIT]: null,
   [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
+  [KEY_LOCAL_FILE_MOVE_HINTS]: [],
   [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]: [],
   [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]: null,
+  [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]: null,
   [KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2]: null,
   [KEY_CONFIRMED_DESCENDANT_FILE_RECONSTRUCTION]: null,
   [KEY_SYNC_PATH_SETTINGS_REVISION]: 0,
@@ -668,8 +686,10 @@ function createDefaultData(generation = 0, planRevision = 0): PluginData {
     [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]: [],
     [KEY_V2_RECOVERY_QUARANTINE]: [],
     [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
+    [KEY_LOCAL_FILE_MOVE_HINTS]: [],
     [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]: [],
     [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]: null,
+    [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]: null,
     [KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2]: null,
     [KEY_CONFIRMED_DESCENDANT_FILE_RECONSTRUCTION]: null,
     [KEY_SYNC_PATH_SETTINGS_REVISION]: 0,
@@ -898,6 +918,22 @@ export class StateManager {
         await readRemoteCommunityPluginCatalog(
           saved[KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG],
         );
+      let communityPluginAdoptionMemory:
+        CommunityPluginAdoptionMemoryV1 | null = null;
+      const rawAdoptionMemory = saved[KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY];
+      if (rawAdoptionMemory !== undefined && rawAdoptionMemory !== null) {
+        try {
+          communityPluginAdoptionMemory = readCommunityPluginAdoptionMemory(
+            rawAdoptionMemory,
+            this.plugin.manifest.id,
+          );
+        } catch {
+          // A corrupt adoption-memory record degrades to empty: skipped
+          // plugins may be proposed again and pending rows are re-discovered
+          // on the next round. It must never block state loading.
+          communityPluginAdoptionMemory = null;
+        }
+      }
       this.data = {
         [KEY_BASE_SNAPSHOT]: saved[KEY_BASE_SNAPSHOT] ?? {},
         [KEY_PENDING_CONFLICTS]: saved[KEY_PENDING_CONFLICTS] ?? [],
@@ -939,10 +975,15 @@ export class StateManager {
         [KEY_LOCAL_FOLDER_MOVE_HINTS]: parseLocalFolderMoveHints(
           saved[KEY_LOCAL_FOLDER_MOVE_HINTS],
         ),
+        [KEY_LOCAL_FILE_MOVE_HINTS]: parseLocalFolderMoveHints(
+          saved[KEY_LOCAL_FILE_MOVE_HINTS],
+        ),
         [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]:
           communityPluginManifestObservations,
         [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]:
           remoteCommunityPluginCatalog,
+        [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]:
+          communityPluginAdoptionMemory,
         [KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2]:
           readCloudBootstrapPublicationCheckpointV2(
             saved[KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2],
@@ -2611,6 +2652,7 @@ export class StateManager {
         [KEY_PENDING_DELETES]: [],
         [KEY_PENDING_ISSUES]: [],
         [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
+        [KEY_LOCAL_FILE_MOVE_HINTS]: [],
         [KEY_GENERATION]: pluginData[KEY_GENERATION] + 1,
       }));
     });
@@ -2733,6 +2775,7 @@ export class StateManager {
         [KEY_PENDING_DELETES]: [],
         [KEY_PENDING_ISSUES]: [],
         [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
+        [KEY_LOCAL_FILE_MOVE_HINTS]: [],
         [KEY_GENERATION]: current[KEY_GENERATION] + 1,
       }));
     });
@@ -3287,6 +3330,27 @@ export class StateManager {
     return this.data[KEY_LOCAL_FOLDER_MOVE_HINTS];
   }
 
+  get localFileMoveHints(): readonly LocalFolderMoveHintV1[] {
+    return this.data[KEY_LOCAL_FILE_MOVE_HINTS];
+  }
+
+  /**
+   * Render-time, read-only: which exit kind one scope-crossing pending row
+   * can act on right now, or null when the row carries no covering move hint
+   * (drift and settings forms). Shares the covering-hint rule with the
+   * action-time resolution snapshot so the rendered buttons never promise an
+   * action the row cannot take.
+   */
+  getScopeCrossingExitKind(path: string): "folder" | "file" | null {
+    const envelope = this.getCommittedV2Envelope();
+    if (!envelope) return null;
+    return findScopeCrossingCoveringHintV1(path, {
+      envelope,
+      folderMoveHints: this.data[KEY_LOCAL_FOLDER_MOVE_HINTS],
+      fileMoveHints: this.data[KEY_LOCAL_FILE_MOVE_HINTS],
+    })?.kind ?? null;
+  }
+
   /**
    * Retain a TFolder rename as device-local identity evidence. The event is
    * accepted only when its source path is already bound to one committed V2
@@ -3340,6 +3404,93 @@ export class StateManager {
       };
     });
     return true;
+  }
+
+  /**
+   * Retain a TFile rename as device-local identity evidence, mirroring
+   * {@link recordLocalFolderMoveHint}. Slice-2: a file whose destination lies
+   * out of the sync scope would otherwise be silently deleted from the cloud
+   * (local disappearance == deletion at the scan layer). The hint keeps the
+   * old path's remote copy safe until the user chooses undo or confirm-exit.
+   * The event is accepted only when its source path is already bound to one
+   * committed V2 file identity.
+   */
+  async recordLocalFileMoveHint(
+    fromPath: string,
+    toPath: string,
+    observedAt = Date.now(),
+  ): Promise<boolean> {
+    if (
+      this.v2StateLoadBlock
+      || !this.v2Envelope?.anchors
+      || !isVaultRelativeMutationPath(fromPath)
+      || !isVaultRelativeMutationPath(toPath)
+      || normalizeFolderIdentityPath(fromPath)
+        === normalizeFolderIdentityPath(toPath)
+    ) return false;
+
+    const directAnchor = Object.values(this.v2Envelope.anchors.byAnchorId).find(
+      (anchor) => anchor.lastPath.normalize("NFC") === fromPath.normalize("NFC"),
+    );
+    const chained = this.data[KEY_LOCAL_FILE_MOVE_HINTS].find(
+      (hint) => sameSyncScope(hint.scope, this.v2Envelope!.scope)
+        && hint.toPath.normalize("NFC") === fromPath.normalize("NFC"),
+    );
+    const remoteId = directAnchor?.remoteId ?? chained?.remoteId;
+    if (!remoteId) return false;
+    const originalFrom = chained?.fromPath ?? fromPath;
+
+    await this.commitPluginData((current) => {
+      const retained = current[KEY_LOCAL_FILE_MOVE_HINTS].filter(
+        (hint) => hint.remoteId !== remoteId,
+      );
+      if (normalizeFolderIdentityPath(originalFrom) === normalizeFolderIdentityPath(toPath)) {
+        return retained.length === current[KEY_LOCAL_FILE_MOVE_HINTS].length
+          ? current
+          : { ...current, [KEY_LOCAL_FILE_MOVE_HINTS]: retained };
+      }
+      const next: LocalFolderMoveHintV1 = {
+        version: 1,
+        scope: { ...this.v2Envelope!.scope },
+        remoteId,
+        fromPath: originalFrom,
+        toPath,
+        observedAt,
+      };
+      return {
+        ...current,
+        [KEY_LOCAL_FILE_MOVE_HINTS]: [...retained, next]
+          .sort((left, right) => left.remoteId.localeCompare(right.remoteId)),
+      };
+    });
+    return true;
+  }
+
+  /**
+   * Retire device-local move evidence (folder and file hint lists) by bound
+   * remote ids. Idempotent; used by reviewed scope-crossing exits and by
+   * scope-narrowing consumers that already retire folder hints.
+   */
+  async retireLocalMoveHintsByRemoteIds(remoteIds: Iterable<string>): Promise<void> {
+    const retired = new Set(remoteIds);
+    if (retired.size === 0) return;
+    await this.commitPluginData((current) => {
+      const folderRetained = current[KEY_LOCAL_FOLDER_MOVE_HINTS].filter(
+        (hint) => !retired.has(hint.remoteId),
+      );
+      const fileRetained = current[KEY_LOCAL_FILE_MOVE_HINTS].filter(
+        (hint) => !retired.has(hint.remoteId),
+      );
+      if (
+        folderRetained.length === current[KEY_LOCAL_FOLDER_MOVE_HINTS].length
+        && fileRetained.length === current[KEY_LOCAL_FILE_MOVE_HINTS].length
+      ) return current;
+      return {
+        ...current,
+        [KEY_LOCAL_FOLDER_MOVE_HINTS]: folderRetained,
+        [KEY_LOCAL_FILE_MOVE_HINTS]: fileRetained,
+      };
+    });
   }
 
   get hasMutationLedgerCorruption(): boolean {
@@ -5033,6 +5184,31 @@ export class StateManager {
     );
   }
 
+  getCommunityPluginAdoptionMemory(): CommunityPluginAdoptionMemoryV1 {
+    const stored = this.data[KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY];
+    return stored
+      ? structuredClone(stored)
+      : createEmptyCommunityPluginAdoptionMemory();
+  }
+
+  async updateCommunityPluginAdoptionMemory(
+    memory: Readonly<CommunityPluginAdoptionMemoryV1>,
+  ): Promise<void> {
+    const next = readCommunityPluginAdoptionMemory(
+      memory,
+      this.plugin.manifest.id,
+    );
+    await this.commitPluginData((current) =>
+      JSON.stringify(current[KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY])
+        === JSON.stringify(next)
+        ? current
+        : {
+            ...current,
+            [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]: next,
+          },
+    );
+  }
+
   getCloudBootstrapPublicationCheckpointV2():
     CloudBootstrapPublicationCheckpointV2 | null {
     const current = this.data[KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2];
@@ -5265,6 +5441,13 @@ export class StateManager {
           retiredLocalFolderMoveHintRemoteIds.size === 0
             ? current[KEY_LOCAL_FOLDER_MOVE_HINTS]
             : current[KEY_LOCAL_FOLDER_MOVE_HINTS].filter(
+                (hint) =>
+                  !retiredLocalFolderMoveHintRemoteIds.has(hint.remoteId),
+              ),
+        [KEY_LOCAL_FILE_MOVE_HINTS]:
+          retiredLocalFolderMoveHintRemoteIds.size === 0
+            ? current[KEY_LOCAL_FILE_MOVE_HINTS]
+            : current[KEY_LOCAL_FILE_MOVE_HINTS].filter(
                 (hint) =>
                   !retiredLocalFolderMoveHintRemoteIds.has(hint.remoteId),
               ),
@@ -6414,7 +6597,17 @@ export class StateManager {
     await this.save((current) => {
       const next = current[KEY_PENDING_ISSUES].filter((issue) =>
         active.has(issue.path)
-        || (restrict ? !restrict.has(issue.issueCode ?? "") : false),
+        || (restrict
+          ? !restrict.has(issue.issueCode ?? "")
+            // FolderDeferred rows are planner-derived UI state: they are
+            // upserted only while the fresh plan produces them. Rows created
+            // before issueCode routing existed carry no code, so the code
+            // filter alone would strand them forever after the plan moves on.
+            && !(
+              issue.actionType === SyncActionType.FolderDeferred
+              && issue.issueCode === undefined
+            )
+          : false),
       );
       return next.length === current[KEY_PENDING_ISSUES].length
         ? current
@@ -7544,6 +7737,17 @@ export class StateManager {
   /** Immutable publication input for a cloud recovery hint. */
   getCommittedV2Envelope(): SyncStateEnvelopeV2 | null {
     return this.v2Envelope ? structuredClone(this.v2Envelope) : null;
+  }
+
+  /**
+   * Live read-only view of the committed remote index of the active V2
+   * envelope. The caller must not retain it across awaits that may publish a
+   * successor envelope; the returned objects are never mutated in place by
+   * this manager, so a captured reference stays internally consistent.
+   */
+  getCommittedRemoteIndex(): Readonly<RemoteIndexV2> | null {
+    const index = this.v2Envelope?.remoteIndex;
+    return index && index.complete === true ? index : null;
   }
 
   /**
