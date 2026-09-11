@@ -244,6 +244,18 @@ export class AuthModule {
     return "idle";
   }
 
+  /** A stored session exists, but the account has not been verified yet.
+   *
+   *  A transient restore or refresh failure keeps `isLoggedIn` true (so no
+   *  surface claims "logged out") while `accountId` stays empty until Graph
+   *  /me succeeds. Sync authorization is fail-closed in that window, so
+   *  surfaces must not present it as a healthy ready/synced state. */
+  get isSessionPending(): boolean {
+    return this.state.isLoggedIn
+      && this.state.accountId === ""
+      && !this._initializing;
+  }
+
   /** Manual one-shot check: has the OAuth callback completed?
    *  Returns true if the user is now logged in. */
   checkAuthStatus(): boolean {
@@ -1240,7 +1252,14 @@ export class AuthModule {
           this.state.displayName = data.displayName;
         }
         if (data.id) {
+          const wasUnverified = this.state.accountId === "";
           this.state.accountId = data.id;
+          // Binding the account reopens sync authorization, so a surface still
+          // showing the pending-session state must refresh. During
+          // initialize() the tail notifyChange already covers this window.
+          if (wasUnverified && !this._initializing) {
+            this.notifyChange();
+          }
         }
         if (
           this.state.accountId

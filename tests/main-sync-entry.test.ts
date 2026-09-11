@@ -21,8 +21,12 @@ vi.mock("../src/sync/local-scanner", () => ({
     includedPaths: [],
     excludedFolders: [],
   }),
+  // Faithful to the live rule for the paths this suite exercises: EasySync's
+  // own bookkeeping paths — the tmp dir and the download recovery copies — are
+  // never part of the sync scope, whatever config dir the vault uses.
   isEasySyncInternalPath: (path: string) => path.includes("/.obsidian/plugins/easy-sync/tmp/")
-    || path.startsWith(".obsidian/plugins/easy-sync/tmp/"),
+    || path.startsWith(".obsidian/plugins/easy-sync/tmp/")
+    || path.endsWith(".easy-sync-recovery"),
   normalizeExcludedFolders: (paths: unknown[]) => paths.filter(
     (path): path is string => typeof path === "string" && path.length > 0,
   ),
@@ -3736,6 +3740,37 @@ describe("main sync entry guards", () => {
     expect(order).toEqual(["idle", "queued-1", "queued-2"]);
   });
 
+  it("keeps draining when a queued settings mutation throws synchronously", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.syncExecutor = {
+      hasActivityInFlight: false,
+      isRunning: false,
+    } as never;
+    const order: string[] = [];
+    const lock = plugin as never as {
+      opLock: string | null;
+      releaseOpLock(): void;
+    };
+
+    // A run that throws before its first await must still be observed as a
+    // rejected promise: the drain shifts the item off the queue before running
+    // it, so an escaping throw would abandon that handle (its row stuck
+    // loading) and stop the drain for every mutation behind it.
+    lock.opLock = "sync";
+    const throwing = plugin.runSettingsMutationWhenSyncIdle(() => {
+      throw new Error("boom");
+    });
+    const survivor = plugin.runSettingsMutationWhenSyncIdle(async () => {
+      order.push("survivor");
+    });
+
+    lock.opLock = null;
+    expect(() => lock.releaseOpLock()).not.toThrow();
+    await expect(throwing).rejects.toThrow("boom");
+    await survivor;
+    expect(order).toEqual(["survivor"]);
+  });
+
   it("supports cancelling a queued settings mutation before sync goes idle", async () => {
     const plugin = new EasySyncPlugin();
     plugin.syncExecutor = {
@@ -5097,12 +5132,13 @@ describe("main sync entry guards", () => {
     expect(saveSyncSettings).toHaveBeenCalledOnce();
   });
 
-  it("keeps exact recovery evidence when the conservative reset capsule cannot be proven", async () => {
+  it("keeps exact recovery evidence when the conservative capsule is rejected and forced reset is declined", async () => {
     const plugin = makePlugin();
     const {
       state,
       reset,
       resetPreservingIsolatedMutationRecovery,
+      forceReset,
       clearScanCache,
       saveSyncSettings,
     } = attachResetRecoveryHarness(plugin);
@@ -5133,9 +5169,12 @@ describe("main sync entry guards", () => {
         isolated: true,
       },
     });
+    confirmModalAwaitConfirm.mockResolvedValueOnce(false);
 
     await expect(plugin.resetSyncState()).resolves.toBeUndefined();
 
+    expect(confirmModalAwaitConfirm).toHaveBeenCalledOnce();
+    expect(forceReset).not.toHaveBeenCalled();
     expect(reset).not.toHaveBeenCalled();
     expect(state.mutationLedger).toHaveLength(1);
     expect(clearScanCache).not.toHaveBeenCalled();
@@ -5149,6 +5188,61 @@ describe("main sync entry guards", () => {
       "missing committed identity capsule",
     );
     expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
+  it("force resets after informed confirmation when the conservative capsule is rejected", async () => {
+    const plugin = makePlugin();
+    const {
+      state,
+      reset,
+      resetPreservingIsolatedMutationRecovery,
+      forceReset,
+      clearScanCache,
+      saveSyncSettings,
+    } = attachResetRecoveryHarness(plugin);
+    resetPreservingIsolatedMutationRecovery.mockRejectedValue(
+      new ConservativeResetBlockedError(
+        "missing committed identity capsule",
+      ),
+    );
+    const show = vi.fn();
+    plugin.noticeCenter = {
+      activeKey: null,
+      show,
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    vi.spyOn(plugin as never, "dispatchSyncRun").mockResolvedValue({
+      ...okResult(),
+      success: false,
+      errors: 1,
+      mutationRecovery: {
+        state: "blocked",
+        total: 1,
+        settled: 0,
+        remaining: 1,
+        retryAfterSeconds: null,
+        blockReason: "facts-changed",
+        blockedOperationId: "pending",
+        isolated: true,
+      },
+    });
+    confirmModalAwaitConfirm.mockResolvedValueOnce(true);
+
+    await plugin.resetSyncState();
+
+    expect(confirmModalAwaitConfirm).toHaveBeenCalledOnce();
+    expect(forceReset).toHaveBeenCalledOnce();
+    expect(reset).not.toHaveBeenCalled();
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    expect(clearScanCache).toHaveBeenCalledOnce();
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "reset-complete",
+    }));
+    expect(show).not.toHaveBeenCalledWith(expect.objectContaining({
+      key: "reset-mutation-recovery-blocked",
+    }));
   });
 
   it("reports a reset failure when conservative state maintenance I/O fails", async () => {
@@ -6521,6 +6615,9 @@ describe("slice-2 immediate scope-crossing prompt", () => {
     expect(typeof args[2]).toBe("string");
     // 批量合并提示行（第 4 个构造参数）应存在。
     expect(args[3]).not.toBeNull();
+    // 弹框必须点名被移出的对象：首项进正文，其余项进批量行。
+    expect(String(args[2])).toContain("Notes/a.md");
+    expect(String(args[3])).toContain("Notes/b.md");
 
     await vi.waitFor(() => {
       expect(retireLocalMoveHintsByRemoteIds).toHaveBeenCalledTimes(2);
@@ -6557,6 +6654,31 @@ describe("slice-2 immediate scope-crossing prompt", () => {
     await vi.advanceTimersByTimeAsync(700);
 
     expect(shouldSyncPath).toHaveBeenCalled();
+    expect(scopeCrossingPromptMockArgs).toHaveLength(0);
+    expect(retireLocalMoveHintsByRemoteIds).not.toHaveBeenCalled();
+    plugin.stopAutoSync();
+  });
+
+  it("keeps EasySync's own download recovery rename out of the scope-crossing path", async () => {
+    // 真实链路：下载覆盖一个已同步文件时，插件先把旧文件改名为
+    // `<path>.easy-sync-recovery` 再写回新内容。该改名同样会到达 vault
+    // rename 事件，但它不是用户把文件移出同步范围。
+    const { plugin, recordLocalFileMoveHint, retireLocalMoveHintsByRemoteIds } =
+      makePromptPlugin();
+    plugin.scanner = {
+      shouldSyncPath: vi.fn((path: string) =>
+        path.startsWith("Notes") && !path.endsWith(".easy-sync-recovery")),
+      shouldSyncFolderPath: vi.fn(() => true),
+    } as never;
+
+    await renameFile(
+      plugin,
+      "Notes/a.md",
+      "Notes/a.md.easy-sync-recovery",
+    );
+    await vi.advanceTimersByTimeAsync(700);
+
+    expect(recordLocalFileMoveHint).not.toHaveBeenCalled();
     expect(scopeCrossingPromptMockArgs).toHaveLength(0);
     expect(retireLocalMoveHintsByRemoteIds).not.toHaveBeenCalled();
     plugin.stopAutoSync();

@@ -39,6 +39,7 @@ import {
   validateEnvelope,
   type SyncStateEnvelopeV2,
 } from "./state-envelope-v2";
+import { isEasySyncInternalPath } from "./local-scanner";
 import {
   canonicalPlannerStateFromEnvelopeV2,
   type CanonicalPlannerStateV2,
@@ -570,6 +571,7 @@ function composeCanonicalActionsV2(
     input.localFileMoveHints ?? [],
     state,
     input.includeFilePath ?? (() => true),
+    input.configDir,
   );
   if (fileScopeCrossingHoldPaths.size > 0) {
     const heldFileItems: SyncPlanItem[] = [];
@@ -2010,19 +2012,23 @@ function isFolderPlanAction(type: SyncActionType): boolean {
  * Collect the old-path hold keys of file out-of-scope destination hints that
  * are still bound to a committed file identity and point outside the current
  * sync scope (but not into the vault trash). Mirrors the acceptance rules of
- * the record layer (state-manager) and revalidates the destination against
- * the current scope so a hint whose destination re-entered the scope becomes
- * inert without any state write.
+ * the record layer (state-manager) and revalidates the destination against the
+ * current scope so a hint whose destination re-entered the scope becomes
+ * inert without any state write — including EasySync's own bookkeeping
+ * destinations, which are out of scope by construction and therefore never
+ * evidence that the file left sync.
  */
 function collectFileScopeCrossingHolds(
   hints: readonly LocalFolderMoveHintV1[],
   state: CanonicalPlannerStateV2,
   includeFilePath: (path: string) => boolean,
+  configDir: string,
 ): Set<string> {
   const holds = new Set<string>();
   for (const hint of hints) {
     if (!sameSyncScope(hint.scope, state.scope)) continue;
     if (hint.toPath === ".trash" || hint.toPath.startsWith(".trash/")) continue;
+    if (isEasySyncInternalPath(hint.toPath, configDir)) continue;
     const anchored = state.fileAnchors.some((anchor) =>
       anchor.remoteId === hint.remoteId
       && normalizeRemotePathKey(anchor.lastPath)

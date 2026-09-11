@@ -1008,24 +1008,25 @@ export class ConfigSyncModal extends EasySyncModal {
         this.getRowKey("data", item.id),
         true,
         async () => {
-          await this.plugin.runSettingsMutationWhenSyncIdle(() =>
-            this.plugin.updateCommunityPluginFilesSelection(
+          // One idle window for both writes: the files switch and the data
+          // patch must land together, or a sync round starting between them
+          // leaves the switch saying "included" while the policy does not.
+          await this.plugin.runSettingsMutationWhenSyncIdle(async () => {
+            await this.plugin.updateCommunityPluginFilesSelection(
               item.id,
               true,
               { deferJoinSyncRound: true },
-            ),
-          );
-          const next = enableCommunityPluginDataWithFiles(
-            this.captureSelectionSettings(),
-            item.id,
-            this.getKnownPluginIds(),
-            this.plugin.manifest.id,
-          );
-          await this.plugin.runSettingsMutationWhenSyncIdle(() =>
-            this.plugin.updateSyncPathSettings(
+            );
+            const next = enableCommunityPluginDataWithFiles(
+              this.captureSelectionSettings(),
+              item.id,
+              this.getKnownPluginIds(),
+              this.plugin.manifest.id,
+            );
+            await this.plugin.updateSyncPathSettings(
               this.toSyncPathSettingsPatch(next),
-            ),
-          );
+            );
+          });
         },
       );
       return;

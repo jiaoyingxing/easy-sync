@@ -10,6 +10,7 @@ import {
   EasySyncRuntimeLayoutMigrationConflict,
   ensureEasySyncRuntimeLayoutMigration,
   noteHealthySyncAndCleanupEasySyncRuntimeLayout,
+  toLayoutMigrationConflict,
 } from "../src/sync/runtime-layout-migration";
 
 function makeAdapter(initial: Record<string, string> = {}): {
@@ -181,6 +182,67 @@ describe("EasySync runtime layout migration", () => {
     ).resolves.toMatchObject({ conflicts: [] });
     expect(files.get(current.remoteStateFile)).toBe("current-layout-update");
     expect(files.get(legacy.remoteStateFile)).toBe("initial");
+  });
+
+  it("still migrates a sidecar that appears during the grace period", async () => {
+    const { adapter, files } = makeAdapter({
+      [legacy.remoteStateFile]: "initial",
+    });
+    const { storage } = makeStorage();
+    await ensureEasySyncRuntimeLayoutMigration(adapter, current, legacy, storage);
+    expect(files.has(current.stateV2RollbackFile)).toBe(false);
+
+    // A downgraded or interrupted run writes the old layout again while the
+    // legacy tree is still waiting for cleanup.
+    files.set(legacy.stateV2RollbackFile, "late-arrival");
+
+    const result = await ensureEasySyncRuntimeLayoutMigration(
+      adapter,
+      current,
+      legacy,
+      storage,
+    );
+
+    expect(result.migrated).toEqual([legacy.stateV2RollbackFile]);
+    expect(files.get(current.stateV2RollbackFile)).toBe("late-arrival");
+  });
+
+  it("carries the cleanup count forward when it re-runs during the grace period", async () => {
+    const { adapter, files } = makeAdapter({
+      [legacy.remoteStateFile]: "initial",
+    });
+    const { storage, values } = makeStorage();
+    await ensureEasySyncRuntimeLayoutMigration(adapter, current, legacy, storage);
+    expect(values.get(EASY_SYNC_LAYOUT_MIGRATION_STORAGE_KEY))
+      .toMatchObject({ stableSyncs: 0, completed: false });
+    await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, legacy, storage);
+    await noteHealthySyncAndCleanupEasySyncRuntimeLayout(adapter, legacy, storage);
+
+    files.set(legacy.stateV2RollbackFile, "late-arrival");
+    await ensureEasySyncRuntimeLayoutMigration(adapter, current, legacy, storage);
+
+    expect(values.get(EASY_SYNC_LAYOUT_MIGRATION_STORAGE_KEY))
+      .toMatchObject({ stableSyncs: 2, completed: false });
+  });
+
+  it("skips a diverged discardable sidecar instead of blocking", async () => {
+    const { adapter, files } = makeAdapter({
+      [legacy.scanCacheFile]: "stale-cache",
+      [current.scanCacheFile]: "rebuilt-cache",
+    });
+
+    const result = await ensureEasySyncRuntimeLayoutMigration(adapter, current, legacy);
+
+    expect(result.conflicts).toEqual([legacy.scanCacheFile]);
+    expect(files.get(legacy.scanCacheFile)).toBe("stale-cache");
+    expect(files.get(current.scanCacheFile)).toBe("rebuilt-cache");
+  });
+
+  it("narrows only a layout conflict out of an unknown failure", async () => {
+    const conflict = new EasySyncRuntimeLayoutMigrationConflict("a", "b");
+    expect(toLayoutMigrationConflict(conflict)).toBe(conflict);
+    expect(toLayoutMigrationConflict(new Error("boom"))).toBe(null);
+    expect(toLayoutMigrationConflict("boom")).toBe(null);
   });
 
   it("removes old copies after three healthy rounds, then becomes silent", async () => {

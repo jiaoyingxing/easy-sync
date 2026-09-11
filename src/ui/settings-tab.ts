@@ -553,11 +553,13 @@ export class EasySyncSettingTab extends PluginSettingTab {
       setting
         .setName(t("settings.account.name"))
         .setDesc(
-          auth?.authState.isLoggedIn
-            ? t("settings.account.desc.loggedIn", {
-              name: auth.authState.displayName || t("general.unknown"),
-            })
-            : t(authEntry.descriptionKey),
+          auth?.isSessionPending
+            ? t("settings.account.desc.connecting")
+            : auth?.authState.isLoggedIn
+              ? t("settings.account.desc.loggedIn", {
+                name: auth.authState.displayName || t("general.unknown"),
+              })
+              : t(authEntry.descriptionKey),
         )
         .addButton((btn) => {
           if (auth?.authState.isLoggedIn) {
@@ -605,11 +607,13 @@ export function buildAccountSettingDefinitions(
     items: [
       {
         name: t("settings.account.name"),
-        desc: auth?.authState.isLoggedIn
-          ? t("settings.account.desc.loggedIn", {
-            name: auth.authState.displayName || t("general.unknown"),
-          })
-          : t(authEntry.descriptionKey),
+        desc: auth?.isSessionPending
+          ? t("settings.account.desc.connecting")
+          : auth?.authState.isLoggedIn
+            ? t("settings.account.desc.loggedIn", {
+              name: auth.authState.displayName || t("general.unknown"),
+            })
+            : t(authEntry.descriptionKey),
         render: (setting) => {
           setting.addButton((btn) => {
             if (auth?.authState.isLoggedIn) {

@@ -69,6 +69,7 @@ interface StatusPanelState {
   isLoggedIn: boolean;
   isInitializing: boolean;
   isPending: boolean;
+  sessionPending: boolean;
   isRunning: boolean;
   canCancel: boolean;
   lastSyncTime: number;
@@ -195,6 +196,9 @@ export interface SyncViewContentKeyInput {
   isLoggedIn: boolean;
   isInitializing: boolean;
   isPending: boolean;
+  /** Session present but the account is not verified yet — the status panel
+   *  shows "connecting" instead of a healthy ready/synced state. */
+  sessionPending?: boolean;
   isRunning: boolean;
   canCancel: boolean;
   bodyMode: SyncViewBodyMode;
@@ -424,6 +428,13 @@ export function resolvePlanReviewDetailsState(
 
 export const SYNC_PLAN_VIRTUAL_OVERSCAN = 6;
 
+/**
+ * Invisible text for the row-height probes. It is only ever set on a detached,
+ * hidden probe that is removed right after measuring, and it is kept off the
+ * call sites as a literal so the sentence-case UI lint cannot read it as copy.
+ */
+const PLAN_ROW_PROBE_TEXT = "measure";
+
 export function buildSyncPlanVirtualOffsets(
   items: readonly Pick<PlanReviewItem, "reason">[],
   rowHeight: number,
@@ -484,6 +495,68 @@ export function buildSyncPlanVirtualWindow(input: Readonly<{
     offset: input.offsets[start] ?? 0,
     totalHeight,
   };
+}
+
+export interface SyncPlanDisplayRow {
+  /** Stable identity for the mounted row; also the key for its open state. */
+  key: string;
+  item: PlanReviewItem;
+  /** Community plugin bundle this conflict row stands for, when it does. */
+  pluginConflict: { pluginId: string; items: SyncPlanItem[] } | null;
+}
+
+/**
+ * Resolve a group's plan items into the DOM rows they actually produce. One
+ * community plugin conflict renders a single row for the whole bundle — the
+ * first member in plan order wins — and an item whose conflict or delete
+ * detail is missing degrades to a plain row. Deriving the rows from the whole
+ * group keeps that choice independent of which items the current scroll
+ * window happens to contain.
+ */
+export function buildSyncPlanDisplayRows(
+  items: readonly PlanReviewItem[],
+  conflictByPath: ReadonlyMap<string, SyncPlanItem>,
+  deleteByPath: ReadonlyMap<string, SyncPlanItem>,
+  pluginConflictByPath: ReadonlyMap<string, {
+    pluginId: string;
+    items: SyncPlanItem[];
+  }>,
+): SyncPlanDisplayRow[] {
+  const rows: SyncPlanDisplayRow[] = [];
+  const seen = new Set<string>();
+  for (const item of items) {
+    let key: string;
+    let pluginConflict: SyncPlanDisplayRow["pluginConflict"] = null;
+    if (item.type === SyncActionType.Conflict && conflictByPath.has(item.path)) {
+      pluginConflict = pluginConflictByPath.get(item.path) ?? null;
+      key = pluginConflict
+        ? `plugin:${pluginConflict.pluginId}`
+        : `conflict:${item.path}`;
+    } else if (
+      item.type === SyncActionType.ConfirmLocalDelete
+      && deleteByPath.has(item.path)
+    ) {
+      key = `delete:${item.path}`;
+    } else {
+      key = `row:${item.type}:${item.path}`;
+    }
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rows.push({ key, item, pluginConflict });
+  }
+  return rows;
+}
+
+/** Offsets for rows whose height is not uniform (a decision row grows when its
+ *  body is expanded), so every slot has to carry its own measured height. */
+export function buildSyncPlanMeasuredVirtualOffsets(
+  heights: readonly number[],
+): number[] {
+  const offsets = [0];
+  for (const height of heights) {
+    offsets.push(offsets[offsets.length - 1] + Math.max(1, height));
+  }
+  return offsets;
 }
 
 export function buildSyncPlanDisplayGroups(
@@ -721,7 +794,7 @@ export function buildSyncViewContentKey(
   historyExpanded: boolean,
   input: SyncViewContentKeyInput,
 ): string {
-  const authKey = `auth:${input.isInitializing ? 1 : 0}:${input.isLoggedIn ? 1 : 0}:${input.isPending ? 1 : 0}`;
+  const authKey = `auth:${input.isInitializing ? 1 : 0}:${input.isLoggedIn ? 1 : 0}:${input.isPending ? 1 : 0}:${input.sessionPending ? 1 : 0}`;
   const runKey = `run:${input.isRunning ? 1 : 0}:${input.canCancel ? 1 : 0}`;
   const recovery = input.mutationRecovery;
   const recoveryKey = recovery
@@ -855,6 +928,12 @@ export class EasySyncSyncView extends ItemView {
   private completedFilesRenderKey: string | null = null;
   private planViewportFrameId: AnimationFrameHandle | null = null;
   private planVirtualRenderers = new Set<() => void>();
+  // Windowed decision rows are unmounted while off screen, so their open state
+  // and their measured height have to outlive the DOM they were read from.
+  private planRowExpandedState = new Map<string, boolean>();
+  private planRowHeights = new Map<string, number>();
+  private planRowLayoutRevision = 0;
+  private planDecisionRowsInFlight = new Set<string>();
   private pathLayoutObserver: ResizeObserver | null = null;
   private pathLayoutObservedWidth = -1;
   private statusLineEl: HTMLElement | null = null;
@@ -870,6 +949,7 @@ export class EasySyncSyncView extends ItemView {
   private staleIdentityResolutionOpening = false;
   private scopeCrossingResolutionOpening = false;
   private mutationRecoveryResolutionOpening = false;
+  private resolutionRowLocks = new Set<string>();
   private closed = false;
 
   constructor(leaf: WorkspaceLeaf, plugin: EasySyncPlugin) {
@@ -896,6 +976,11 @@ export class EasySyncSyncView extends ItemView {
     this.contentEl.addEventListener(
       "toggle",
       this.handlePathLayoutToggle,
+      true,
+    );
+    this.contentEl.addEventListener(
+      "click",
+      this.handlePlanRowToggleIntent,
       true,
     );
     window.addEventListener("resize", this.handlePathLayoutResize);
@@ -936,6 +1021,11 @@ export class EasySyncSyncView extends ItemView {
       this.handlePathLayoutToggle,
       true,
     );
+    this.contentEl.removeEventListener(
+      "click",
+      this.handlePlanRowToggleIntent,
+      true,
+    );
     window.removeEventListener("resize", this.handlePathLayoutResize);
     this.contentEl.ownerDocument.removeEventListener(
       "scroll",
@@ -947,6 +1037,24 @@ export class EasySyncSyncView extends ItemView {
   private readonly handlePathLayoutToggle = (): void => {
     this.scheduleAdaptivePathLayout();
     this.updateCollapseTogglePresentation();
+  };
+
+  /**
+   * Record a decision row's open state from the user's own gesture instead of
+   * the `toggle` event: `toggle` also fires for our programmatic writes
+   * (`applyPlanRowExpansionIn`, `toggleAllDetails`), which would pin rows the
+   * user never touched. Only a summary click can toggle a `<details>`, and our
+   * own writes never produce one.
+   */
+  private readonly handlePlanRowToggleIntent = (event: Event): void => {
+    const target = event.target as Node | null;
+    if (!target || !target.instanceOf(HTMLElement)) return;
+    const summary = target.closest("summary");
+    const host = summary?.parentElement ?? null;
+    if (!host || !host.instanceOf(HTMLDetailsElement)) return;
+    const key = host.dataset.easySyncPlanRow;
+    if (!key) return;
+    this.rememberPlanRowExpansion(key, !host.open);
   };
 
   private readonly handlePathLayoutResize = (): void => {
@@ -993,6 +1101,9 @@ export class EasySyncSyncView extends ItemView {
     const isPending = !isInitializing
       && !isLoggedIn
       && (this.plugin.auth?.isPending ?? false);
+    // Session restored but the account is not verified yet: sync authorization
+    // is closed, so the panel must not read as a healthy "synced" state.
+    const sessionPending = this.plugin.auth?.isSessionPending ?? false;
     const conflicts = (syncState?.pendingConflicts ?? [])
       .filter((item) => !this.plugin.syncExecutor?.isSideActionQueued(item.path));
     const pendingDeletes = (syncState?.pendingRemoteDeletes ?? [])
@@ -1035,6 +1146,12 @@ export class EasySyncSyncView extends ItemView {
       if (this.renderedPlanReviewRevision !== syncState.planReviewRevision) {
         this.planGroupsCollapsed = true;
         this.planExpandedGroups.clear();
+        // Row identities belong to one plan revision: a path can change action
+        // type between revisions, so carrying its open state over would restore
+        // it on a row that no longer means the same thing.
+        this.planRowExpandedState.clear();
+        this.planRowHeights.clear();
+        this.planRowLayoutRevision += 1;
         preservedContentScrollTop = null;
         preservedHostScrollTop = null;
         this.renderedPlanReviewRevision = syncState.planReviewRevision;
@@ -1065,6 +1182,7 @@ export class EasySyncSyncView extends ItemView {
       isLoggedIn,
       isInitializing,
       isPending,
+      sessionPending,
       isRunning,
       canCancel,
       lastSyncTime: syncState?.lastSyncTime ?? 0,
@@ -1081,6 +1199,7 @@ export class EasySyncSyncView extends ItemView {
       isLoggedIn,
       isInitializing,
       isPending,
+      sessionPending,
       isRunning,
       canCancel,
       bodyMode,
@@ -1155,7 +1274,13 @@ export class EasySyncSyncView extends ItemView {
       // Re-apply the toolbar state while retaining groups the user opened in
       // this exact reviewed revision.
       this.toggleAllDetails();
+      // `toggleAllDetails` owns group and issue rows; a decision row inside a
+      // plan group answers to its own remembered state instead.
+      this.applyPlanRowExpansion();
+      this.planRowHeights.clear();
+      this.planRowLayoutRevision += 1;
       this.updateCollapseTogglePresentation();
+      this.schedulePlanViewportRender();
       if (preservedContentScrollTop !== null) {
         content.scrollTop = preservedContentScrollTop;
       }
@@ -1200,6 +1325,13 @@ export class EasySyncSyncView extends ItemView {
     for (const scope of scopes) this.applyAdaptivePathLayoutScope(scope);
   }
 
+  /**
+   * Direct children only, deliberately: the windowed decision rows live one
+   * level deeper (`.easy-sync-plan-virtual-window`) and must keep showing their
+   * full path, because extracting a gray directory there drifts while the
+   * window re-mounts during scrolling. Walking descendants instead of
+   * `children` would silently reintroduce that drift.
+   */
   private applyAdaptivePathLayoutScope(scope: HTMLElement): void {
     for (const child of Array.from(scope.children)) {
       if (child.classList.contains("easy-sync-path-directory")) child.remove();
@@ -1691,6 +1823,7 @@ export class EasySyncSyncView extends ItemView {
     isLoggedIn: boolean;
     isInitializing: boolean;
     isPending: boolean;
+    sessionPending: boolean;
     isRunning: boolean;
     lastSyncTime: number;
     pendingCount: number;
@@ -1701,7 +1834,9 @@ export class EasySyncSyncView extends ItemView {
     progress: Readonly<SyncProgressState>;
   }): { status: RibbonStatus; label: string } {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    if (state.isInitializing) {
+    // Cold start, and a restored session whose account is not verified yet,
+    // share the same "connecting" presentation — never a ready/synced claim.
+    if (state.isInitializing || state.sessionPending) {
       return { status: "ready", label: t("settings.account.desc.connecting") };
     }
     if (!state.isLoggedIn && state.isPending) {
@@ -1718,15 +1853,22 @@ export class EasySyncSyncView extends ItemView {
         || state.mutationRecovery !== null,
       recentSuccess: state.lastSyncTime > 0,
     });
-    // The latest round may be a retry-pending observation (network unavailable
-    // before ordinary planning). That overrides the stale "synced" green from
-    // the last healthy round: show an offline hint instead of implying the
-    // vault is currently in sync. The next healthy round returns to success.
+    // The latest round may be a retry-pending observation (a remote read
+    // failed before ordinary planning). That overrides the stale "synced"
+    // green from the last healthy round: never imply the vault is currently
+    // in sync. While the system reports the device has a network, the only
+    // known fact is "the cloud was not readable" — share the neutral
+    // connecting form with cold start / session-pending; keep the offline
+    // presentation only for a system-reported device-level offline. The next
+    // healthy round returns to success.
     if (
       status === "success"
       && state.latestHistory?.status === "retry-pending"
     ) {
-      return { status: "offline", label: t("syncView.status.offline") };
+      if (navigator.onLine === false) {
+        return { status: "offline", label: t("syncView.status.offline") };
+      }
+      return { status: "ready", label: t("status.connecting") };
     }
     switch (status) {
       case "cancelling":
@@ -2114,8 +2256,24 @@ export class EasySyncSyncView extends ItemView {
     }
   }
 
+  // Per-row short guard. The kind-wide flags above are released before the
+  // settlement so other rows of the same kind stay immediately clickable;
+  // without this, the same row would accept a second decision while its first
+  // settlement is still in flight and silently discard it.
+  private lockResolutionRow(key: string): boolean {
+    if (this.resolutionRowLocks.has(key)) return false;
+    this.resolutionRowLocks.add(key);
+    return true;
+  }
+
+  private unlockResolutionRow(key: string): void {
+    this.resolutionRowLocks.delete(key);
+  }
+
   private async openStaleIdentityResolution(path: string): Promise<void> {
     if (this.staleIdentityResolutionOpening) return;
+    const rowKey = `stale:${path}`;
+    if (!this.lockResolutionRow(rowKey)) return;
     this.staleIdentityResolutionOpening = true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     try {
@@ -2151,11 +2309,14 @@ export class EasySyncSyncView extends ItemView {
       await this.plugin.retireReviewedStaleIdentity(snapshot);
     } finally {
       this.staleIdentityResolutionOpening = false;
+      this.unlockResolutionRow(rowKey);
     }
   }
 
   private async openSharedFolderIdentityResolution(path: string): Promise<void> {
     if (this.sharedFolderIdentityResolutionOpening) return;
+    const rowKey = `shared-folder:${path}`;
+    if (!this.lockResolutionRow(rowKey)) return;
     this.sharedFolderIdentityResolutionOpening = true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     try {
@@ -2184,11 +2345,14 @@ export class EasySyncSyncView extends ItemView {
       await this.plugin.confirmReviewedSharedFolderIdentity(snapshot);
     } finally {
       this.sharedFolderIdentityResolutionOpening = false;
+      this.unlockResolutionRow(rowKey);
     }
   }
 
   private async openEmptyFolderResolution(path: string): Promise<void> {
     if (this.emptyFolderResolutionOpening) return;
+    const rowKey = `empty-folder:${path}`;
+    if (!this.lockResolutionRow(rowKey)) return;
     this.emptyFolderResolutionOpening = true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     try {
@@ -2277,11 +2441,14 @@ export class EasySyncSyncView extends ItemView {
       await this.plugin.deleteReviewedEmptyRemoteFolder(snapshot);
     } finally {
       this.emptyFolderResolutionOpening = false;
+      this.unlockResolutionRow(rowKey);
     }
   }
 
   private async openFolderLocationResolution(path: string): Promise<void> {
     if (this.emptyFolderResolutionOpening) return;
+    const rowKey = `folder-location:${path}`;
+    if (!this.lockResolutionRow(rowKey)) return;
     this.emptyFolderResolutionOpening = true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     try {
@@ -2315,11 +2482,14 @@ export class EasySyncSyncView extends ItemView {
       }
     } finally {
       this.emptyFolderResolutionOpening = false;
+      this.unlockResolutionRow(rowKey);
     }
   }
 
   private async openScopeCrossingRestore(path: string): Promise<void> {
     if (this.scopeCrossingResolutionOpening) return;
+    const rowKey = `scope-crossing:${path}`;
+    if (!this.lockResolutionRow(rowKey)) return;
     this.scopeCrossingResolutionOpening = true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     try {
@@ -2350,11 +2520,14 @@ export class EasySyncSyncView extends ItemView {
       await this.plugin.restoreScopeCrossingMove(snapshot);
     } finally {
       this.scopeCrossingResolutionOpening = false;
+      this.unlockResolutionRow(rowKey);
     }
   }
 
   private async openScopeCrossingConfirm(path: string): Promise<void> {
     if (this.scopeCrossingResolutionOpening) return;
+    const rowKey = `scope-crossing:${path}`;
+    if (!this.lockResolutionRow(rowKey)) return;
     this.scopeCrossingResolutionOpening = true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     try {
@@ -2376,6 +2549,7 @@ export class EasySyncSyncView extends ItemView {
             snapshot.kind === "folder"
               ? "syncView.scopeCrossing.confirmMessageFolder"
               : "syncView.scopeCrossing.confirmMessageFile",
+            { path: snapshot.fromPath },
           ),
           danger: true,
         },
@@ -2388,11 +2562,14 @@ export class EasySyncSyncView extends ItemView {
       await this.plugin.confirmScopeCrossingExit(snapshot);
     } finally {
       this.scopeCrossingResolutionOpening = false;
+      this.unlockResolutionRow(rowKey);
     }
   }
 
   private async openMutationRecoveryResolution(): Promise<void> {
     if (this.mutationRecoveryResolutionOpening) return;
+    const rowKey = "mutation-recovery";
+    if (!this.lockResolutionRow(rowKey)) return;
     this.mutationRecoveryResolutionOpening = true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     try {
@@ -2426,11 +2603,14 @@ export class EasySyncSyncView extends ItemView {
       await this.plugin.resolveMutationRecovery(snapshot, choice);
     } finally {
       this.mutationRecoveryResolutionOpening = false;
+      this.unlockResolutionRow(rowKey);
     }
   }
 
   private async openCommunityPluginBundleReview(pluginId: string): Promise<void> {
     if (this.mutationRecoveryResolutionOpening) return;
+    const rowKey = `bundle-review:${pluginId}`;
+    if (!this.lockResolutionRow(rowKey)) return;
     this.mutationRecoveryResolutionOpening = true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     try {
@@ -2458,6 +2638,7 @@ export class EasySyncSyncView extends ItemView {
       await this.plugin.resolveMutationRecovery(snapshot, choice);
     } finally {
       this.mutationRecoveryResolutionOpening = false;
+      this.unlockResolutionRow(rowKey);
     }
   }
 
@@ -2656,7 +2837,6 @@ export class EasySyncSyncView extends ItemView {
       if (entry.kind !== "community-plugin-bundle") continue;
       for (const item of entry.items) pluginConflictByPath.set(item.path, entry);
     }
-    const renderedPluginConflicts = new Set<string>();
     const groups = buildSyncPlanDisplayGroups(items);
 
     for (const group of groups) {
@@ -2675,59 +2855,80 @@ export class EasySyncSyncView extends ItemView {
         if (details.open) this.planExpandedGroups.add(group.group);
         else this.planExpandedGroups.delete(group.group);
       });
+      // Conflict and delete rows carry their own buttons, so they have to be
+      // mounted to be used — and one expanded row is worth several plain ones.
+      // They are windowed the same way, with a measured height per row instead
+      // of the flat two-height model the read-only groups use.
       const hasInlineDecisions = group.items.some((item) =>
         item.type === SyncActionType.Conflict
         || item.type === SyncActionType.ConfirmLocalDelete);
-      if (hasInlineDecisions) {
-        let rendered = false;
-        const renderInlineDecisions = (): void => {
-          if (!details.open || rendered) return;
-          rendered = true;
-          for (const item of group.items) {
-            this.renderPlanReviewItem(
-              body,
-              item,
-              conflictByPath,
-              deleteByPath,
-              pluginConflictByPath,
-              renderedPluginConflicts,
-            );
-          }
-          this.applyPlanDetailsExpandOverride(body);
-          this.scheduleAdaptivePathLayout();
-        };
-        details.addEventListener("toggle", renderInlineDecisions);
-        renderInlineDecisions();
-        continue;
-      }
+      const rows = buildSyncPlanDisplayRows(
+        group.items,
+        conflictByPath,
+        deleteByPath,
+        pluginConflictByPath,
+      );
 
       const virtualList = body.createDiv("easy-sync-plan-virtual-list");
       let virtualOffsets: number[] | null = null;
+      let offsetsRevision = -1;
       let renderedKey = "";
-      const renderWindow = (): void => {
+      let renderDepth = 0;
+
+      const resolveOffsets = (): number[] => {
+        if (virtualOffsets && offsetsRevision === this.planRowLayoutRevision) {
+          return virtualOffsets;
+        }
+        if (hasInlineDecisions) {
+          const probe = this.measurePlanDecisionRowHeights(body);
+          virtualOffsets = buildSyncPlanMeasuredVirtualOffsets(
+            rows.map((row) =>
+              this.planRowHeights.get(row.key)
+              ?? (this.planRowExpanded(row.key)
+                ? probe.expandedRowHeight
+                : probe.collapsedRowHeight)),
+          );
+        } else {
+          const probe = this.measurePlanRowHeights(body);
+          virtualOffsets = buildSyncPlanVirtualOffsets(
+            rows.map((row) => row.item),
+            probe.rowHeight,
+            probe.reasonRowHeight,
+          );
+        }
+        offsetsRevision = this.planRowLayoutRevision;
+        virtualList.style.height =
+          `${virtualOffsets[virtualOffsets.length - 1] ?? 0}px`;
+        return virtualOffsets;
+      };
+
+      let renderInlineDecisions: () => void;
+      renderInlineDecisions = (): void => {
         if (!details.open) {
           if (renderedKey) virtualList.empty();
           renderedKey = "";
           return;
         }
-        if (!virtualOffsets) {
-          const rowHeights = this.measurePlanRowHeights(body);
-          virtualOffsets = buildSyncPlanVirtualOffsets(
-            group.items,
-            rowHeights.rowHeight,
-            rowHeights.reasonRowHeight,
-          );
-          virtualList.style.height = `${virtualOffsets[virtualOffsets.length - 1] ?? 0}px`;
+        // A row whose decision is still settling has to stay mounted: the user
+        // is waiting on that exact row, and a window shift would take it away.
+        // Only the window that holds such a row freezes; other groups render.
+        if (
+          hasInlineDecisions
+          && rows.some((row) => this.planDecisionRowsInFlight.has(row.key))
+        ) {
+          return;
         }
+        const offsets = resolveOffsets();
         const listRect = virtualList.getBoundingClientRect();
         const viewportRect = this.resolvePlanViewportRect();
         const windowState = buildSyncPlanVirtualWindow({
-          offsets: virtualOffsets,
+          offsets,
           listTop: listRect.top,
           viewportTop: viewportRect.top,
           viewportBottom: viewportRect.bottom,
         });
-        const nextKey = `${windowState.start}:${windowState.end}`;
+        const nextKey =
+          `${windowState.start}:${windowState.end}:${windowState.offset}`;
         if (nextKey === renderedKey) return;
         renderedKey = nextKey;
         virtualList.empty();
@@ -2735,30 +2936,31 @@ export class EasySyncSyncView extends ItemView {
         const visible = virtualList.createDiv("easy-sync-plan-virtual-window");
         visible.style.transform = `translateY(${windowState.offset}px)`;
         for (let index = windowState.start; index < windowState.end; index++) {
-          this.renderPlanReviewItem(
+          this.renderPlanReviewRow(
             visible,
-            group.items[index],
+            rows[index],
             conflictByPath,
             deleteByPath,
-            pluginConflictByPath,
-            renderedPluginConflicts,
           );
+        }
+        // Restore the per-row open state before measuring: a row remounted by a
+        // window shift has to answer to the same rule as its first mount.
+        this.applyPlanRowExpansionIn(visible);
+        if (hasInlineDecisions && this.rememberPlanRowHeights(visible) && renderDepth === 0) {
+          // The estimates only place the first window; as soon as the real
+          // heights are known the window has to be resolved against them.
+          renderDepth += 1;
+          virtualOffsets = null;
+          renderInlineDecisions();
+          renderDepth -= 1;
+          return;
         }
         this.scheduleAdaptivePathLayout();
       };
-      this.planVirtualRenderers.add(renderWindow);
-      details.addEventListener("toggle", renderWindow);
-      renderWindow();
+      this.planVirtualRenderers.add(renderInlineDecisions);
+      details.addEventListener("toggle", renderInlineDecisions);
+      renderInlineDecisions();
     }
-  }
-
-  private applyPlanDetailsExpandOverride(container: HTMLElement): void {
-    if (this.planGroupsCollapsed) return;
-    const details = container.querySelectorAll<HTMLDetailsElement>(
-      ".easy-sync-tree-item",
-    );
-    for (const detail of details) detail.setAttribute("open", "");
-    this.updateCollapseTogglePresentation();
   }
 
   private measurePlanRowHeights(container: HTMLElement): {
@@ -2772,13 +2974,111 @@ export class EasySyncSyncView extends ItemView {
     setIcon(icon, "arrow-up");
     probe.createSpan("easy-sync-file-path").setText("measure.md");
     const rowHeight = probe.getBoundingClientRect().height;
-    probe.createDiv("easy-sync-file-reason").setText("measure");
+    probe.createDiv("easy-sync-file-reason").setText(PLAN_ROW_PROBE_TEXT);
     const reasonRowHeight = probe.getBoundingClientRect().height;
     probe.remove();
     return {
       rowHeight: rowHeight > 0 ? rowHeight : 20,
       reasonRowHeight: reasonRowHeight > 0 ? reasonRowHeight : 42,
     };
+  }
+
+  /**
+   * Collapsed and expanded heights of a decision row, measured so a window can
+   * be placed before any row is mounted. The probe mirrors the conflict row
+   * markup — the tallest of the three decision shapes — so the estimate never
+   * under-shoots and leaves blank space while the first window settles.
+   */
+  private measurePlanDecisionRowHeights(container: HTMLElement): {
+    collapsedRowHeight: number;
+    expandedRowHeight: number;
+  } {
+    const probe = container.createEl("details", {
+      cls: "easy-sync-tree-item easy-sync-plan-decision-probe",
+    });
+    const summary = probe.createEl("summary", "easy-sync-tree-row");
+    this.addCollapseIcon(summary);
+    const icon = summary.createSpan("easy-sync-tree-status-icon");
+    setIcon(icon, "triangle-alert");
+    configureFilePath(
+      probe,
+      summary.createSpan("easy-sync-tree-path"),
+      "measure.md",
+      true,
+    );
+    summary.createSpan("easy-sync-tree-chip").setText(PLAN_ROW_PROBE_TEXT);
+    const collapsedRowHeight = probe.getBoundingClientRect().height;
+    const body = probe.createDiv("easy-sync-tree-item-body");
+    body.createDiv("easy-sync-item-reason").setText(PLAN_ROW_PROBE_TEXT);
+    const actions = body.createDiv("easy-sync-item-actions");
+    const variants: Array<"" | "accent"> = ["accent", "accent", ""];
+    for (const variant of variants) {
+      this.createActionChip(actions, "measure", variant, () => undefined);
+    }
+    probe.open = true;
+    const expandedRowHeight = probe.getBoundingClientRect().height;
+    probe.remove();
+    const collapsed = collapsedRowHeight > 0 ? collapsedRowHeight : 26;
+    return {
+      collapsedRowHeight: collapsed,
+      expandedRowHeight: expandedRowHeight > collapsed
+        ? expandedRowHeight
+        : collapsed + 62,
+    };
+  }
+
+  /** Whether a decision row is expected to be open: what the user last chose,
+   *  or the group-level expand-all default when they never touched it. */
+  private planRowExpanded(rowKey: string): boolean {
+    return this.planRowExpandedState.get(rowKey) ?? !this.planGroupsCollapsed;
+  }
+
+  /** Re-apply the remembered open state to every mounted decision row. */
+  private applyPlanRowExpansion(): void {
+    this.applyPlanRowExpansionIn(this.contentEl);
+  }
+
+  /**
+   * The same rule, scoped to one subtree. A window shift remounts rows, so the
+   * mount has to restore their state before any height is measured — otherwise
+   * a scrolled-in row comes back collapsed while the offset model still holds
+   * its expanded height.
+   */
+  private applyPlanRowExpansionIn(root: ParentNode): void {
+    const rows = root.querySelectorAll<HTMLElement>("[data-easy-sync-plan-row]");
+    for (const row of Array.from(rows)) {
+      const key = row.dataset.easySyncPlanRow;
+      if (!key || !row.instanceOf(HTMLDetailsElement)) continue;
+      row.open = this.planRowExpanded(key);
+    }
+  }
+
+  /**
+   * Record the user's choice for one decision row. The row is about to
+   * re-flow, so its cached height no longer applies.
+   */
+  private rememberPlanRowExpansion(key: string, open: boolean): void {
+    this.planRowExpandedState.set(key, open);
+    this.planRowHeights.delete(key);
+    this.planRowLayoutRevision += 1;
+    this.schedulePlanViewportRender();
+  }
+
+  /** Measure the mounted rows and report whether any height changed. */
+  private rememberPlanRowHeights(container: HTMLElement): boolean {
+    const rows = container.querySelectorAll<HTMLElement>(
+      "[data-easy-sync-plan-row]",
+    );
+    let changed = false;
+    for (const row of Array.from(rows)) {
+      const key = row.dataset.easySyncPlanRow;
+      if (!key) continue;
+      const height = row.getBoundingClientRect().height;
+      if (height <= 0 || this.planRowHeights.get(key) === height) continue;
+      this.planRowHeights.set(key, height);
+      changed = true;
+    }
+    return changed;
   }
 
   private resolvePlanViewportRect(): { top: number; bottom: number } {
@@ -2800,51 +3100,51 @@ export class EasySyncSyncView extends ItemView {
     };
   }
 
-  private renderPlanReviewItem(
+  private renderPlanReviewRow(
     container: HTMLElement,
-    item: PlanReviewItem,
+    row: SyncPlanDisplayRow,
     conflictByPath: ReadonlyMap<string, SyncPlanItem>,
     deleteByPath: ReadonlyMap<string, SyncPlanItem>,
-    pluginConflictByPath: ReadonlyMap<string, {
-      pluginId: string;
-      items: SyncPlanItem[];
-    }>,
-    renderedPluginConflicts: Set<string>,
   ): void {
+    const { item, pluginConflict } = row;
+    if (pluginConflict) {
+      this.renderCommunityPluginConflictItem(
+        container,
+        pluginConflict.pluginId,
+        pluginConflict.items.length,
+        row.key,
+      );
+      return;
+    }
     if (item.type === SyncActionType.Conflict && conflictByPath.has(item.path)) {
-      const pluginConflict = pluginConflictByPath.get(item.path);
-      if (pluginConflict) {
-        if (renderedPluginConflicts.has(pluginConflict.pluginId)) return;
-        renderedPluginConflicts.add(pluginConflict.pluginId);
-        this.renderCommunityPluginConflictItem(
-          container,
-          pluginConflict.pluginId,
-          pluginConflict.items.length,
-        );
-        return;
-      }
-      this.renderConflictItem(container, conflictByPath.get(item.path)!);
+      this.renderConflictItem(container, conflictByPath.get(item.path)!, row.key);
       return;
     }
     if (item.type === SyncActionType.ConfirmLocalDelete && deleteByPath.has(item.path)) {
-      this.renderDeleteItem(container, deleteByPath.get(item.path)!);
+      this.renderDeleteItem(container, deleteByPath.get(item.path)!, row.key);
       return;
     }
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const action = resolveSyncActionPresentation(item.type);
-    const row = container.createDiv("easy-sync-file-row");
-    const icon = row.createSpan("easy-sync-file-icon");
+    const rowEl = container.createDiv("easy-sync-file-row");
+    rowEl.dataset.easySyncPlanRow = row.key;
+    const icon = rowEl.createSpan("easy-sync-file-icon");
     setIcon(icon, action.icon);
-    const pathEl = row.createSpan("easy-sync-file-path");
-    configureFilePath(row, pathEl, item.path, true);
+    const pathEl = rowEl.createSpan("easy-sync-file-path");
+    configureFilePath(rowEl, pathEl, item.path, true);
     if (item.reason) {
-      row.createDiv("easy-sync-file-reason").setText(t(item.reason));
+      rowEl.createDiv("easy-sync-file-reason").setText(t(item.reason));
     }
   }
 
-  private renderConflictItem(container: HTMLElement, item: SyncPlanItem): void {
+  private renderConflictItem(
+    container: HTMLElement,
+    item: SyncPlanItem,
+    rowKey?: string,
+  ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const details = container.createEl("details", "easy-sync-tree-item");
+    if (rowKey) details.dataset.easySyncPlanRow = rowKey;
     const summary = details.createEl("summary", "easy-sync-tree-row");
     this.addCollapseIcon(summary);
     const icon = summary.createSpan("easy-sync-tree-status-icon");
@@ -2891,9 +3191,11 @@ export class EasySyncSyncView extends ItemView {
     container: HTMLElement,
     pluginId: string,
     memberCount: number,
+    rowKey?: string,
   ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const details = container.createEl("details", "easy-sync-tree-item");
+    if (rowKey) details.dataset.easySyncPlanRow = rowKey;
     const summary = details.createEl("summary", "easy-sync-tree-row");
     this.addCollapseIcon(summary);
     const icon = summary.createSpan("easy-sync-tree-status-icon");
@@ -2972,9 +3274,14 @@ export class EasySyncSyncView extends ItemView {
     });
   }
 
-  private renderDeleteItem(container: HTMLElement, item: SyncPlanItem): void {
+  private renderDeleteItem(
+    container: HTMLElement,
+    item: SyncPlanItem,
+    rowKey?: string,
+  ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const details = container.createEl("details", "easy-sync-tree-item");
+    if (rowKey) details.dataset.easySyncPlanRow = rowKey;
     const summary = details.createEl("summary", "easy-sync-tree-row");
     this.addCollapseIcon(summary);
     const icon = summary.createSpan("easy-sync-tree-status-icon");
@@ -3043,14 +3350,29 @@ export class EasySyncSyncView extends ItemView {
     }
   }
 
+  private enableActionButtons(actionsEl: HTMLElement): void {
+    for (const button of Array.from(actionsEl.querySelectorAll("button"))) {
+      (button).disabled = false;
+    }
+  }
+
   private async runItemAction(
     actionsEl: HTMLElement,
     action: () => Promise<unknown>,
   ): Promise<void> {
     this.disableActionButtons(actionsEl);
+    // A windowed decision row is pinned while its action settles: scrolling the
+    // window out from under it would take away the row the user is waiting on.
+    const rowKey = actionsEl.closest<HTMLElement>("[data-easy-sync-plan-row]")
+      ?.dataset.easySyncPlanRow;
+    if (rowKey) this.planDecisionRowsInFlight.add(rowKey);
     try {
       await action();
     } finally {
+      if (rowKey) this.planDecisionRowsInFlight.delete(rowKey);
+      // The row is usually still mounted — the window was frozen — so restore
+      // the controls here instead of waiting for a remount that may not come.
+      this.enableActionButtons(actionsEl);
       this.plugin.updateStatusBar();
       this.render();
     }

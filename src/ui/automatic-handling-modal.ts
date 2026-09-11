@@ -1,4 +1,4 @@
-import { Setting } from "obsidian";
+import { Notice, Setting } from "obsidian";
 import type EasySyncPlugin from "../main";
 import { EasySyncModal } from "./easy-sync-modal";
 
@@ -26,10 +26,20 @@ export class AutomaticHandlingModal extends EasySyncModal {
         toggle
           .setValue(this.plugin.automaticHandlingPolicy.autoDeleteLocalFiles)
           .onChange(async (value) => {
-            await this.plugin.updateAutomaticHandlingPolicy({
-              ...this.plugin.automaticHandlingPolicy,
-              autoDeleteLocalFiles: value,
-            });
+            try {
+              await this.plugin.updateAutomaticHandlingPolicy({
+                ...this.plugin.automaticHandlingPolicy,
+                autoDeleteLocalFiles: value,
+              });
+            } catch {
+              // The policy write already rolled the value back in memory, so
+              // read it instead of a captured copy: the control then shows
+              // exactly what was persisted.
+              toggle.setValue(
+                this.plugin.automaticHandlingPolicy.autoDeleteLocalFiles,
+              );
+              new Notice(t("notice.settingsSaveFailed"));
+            }
           });
       });
 
@@ -40,10 +50,17 @@ export class AutomaticHandlingModal extends EasySyncModal {
         toggle
           .setValue(this.plugin.automaticHandlingPolicy.mergeNonOverlappingText)
           .onChange(async (value) => {
-            await this.plugin.updateAutomaticHandlingPolicy({
-              ...this.plugin.automaticHandlingPolicy,
-              mergeNonOverlappingText: value,
-            });
+            try {
+              await this.plugin.updateAutomaticHandlingPolicy({
+                ...this.plugin.automaticHandlingPolicy,
+                mergeNonOverlappingText: value,
+              });
+            } catch {
+              toggle.setValue(
+                this.plugin.automaticHandlingPolicy.mergeNonOverlappingText,
+              );
+              new Notice(t("notice.settingsSaveFailed"));
+            }
           });
       });
   }

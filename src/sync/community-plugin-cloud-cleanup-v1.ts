@@ -228,7 +228,11 @@ export async function executeCommunityPluginCloudCleanupV1(input: Readonly<{
     try {
       verify = await input.transport.getDriveItemMetadataById(object.remoteId);
     } catch {
-      verify = null;
+      // The transport returns null only for a confirmed 404 and rethrows every
+      // other failure. An escaping error therefore means the object's absence
+      // is unproven — reporting the row as a completed deletion would leave an
+      // orphan in the cloud while claiming success.
+      return { status: "blocked", deleted, reason: "read-back-failed" };
     }
     if (verify !== null) {
       return { status: "blocked", deleted, reason: "read-back-failed" };

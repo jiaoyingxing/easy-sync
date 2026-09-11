@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import EasySyncPlugin from "../src/main";
 import {
   buildConflictEvidence,
   findLatestAutomaticHandlingSummary,
@@ -377,5 +378,24 @@ describe("diagnostic report evidence", () => {
     expect(source).toContain("formatV2StorageAuthorityEvidence(");
     expect(source).toContain("buildConflictEvidence(c");
     expect(source).toContain("合并不重叠的文本修改");
+  });
+});
+
+describe("diagnostic report failure notice", () => {
+  it("reports one simple save-failed notice instead of letting the failure escape", async () => {
+    const plugin = new EasySyncPlugin();
+    const show = vi.spyOn(plugin.noticeCenter, "show");
+    const logError = vi.spyOn(plugin.diag, "error");
+    vi.spyOn(plugin as never, "buildDiagnosticReportFile")
+      .mockRejectedValue(new Error("vault write failed"));
+
+    // The command handler fires this without awaiting, so a rejection would be
+    // an unhandled one and the user would see nothing at all.
+    await expect(plugin.generateDiagnosticReport()).resolves.toBeUndefined();
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "diagnostic-report-save-failed",
+      message: "Could not save the diagnostic report.",
+    }));
+    expect(logError).toHaveBeenCalled();
   });
 });

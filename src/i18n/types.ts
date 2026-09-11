@@ -24,7 +24,6 @@ export interface LocaleStrings {
   // ---- Ribbon ----
   "ribbon.loggedOut": string;
   "ribbon.cancelling": string;
-  "ribbon.syncing": string;
   "ribbon.syncingPhase": string;
   "ribbon.attention": string;
   "ribbon.waitingForNetwork": string;
@@ -185,6 +184,7 @@ export interface LocaleStrings {
   "settings.diagReport.generate": string;
   "settings.syncInterval.name": string;
   "settings.syncInterval.desc": string;
+  "settings.syncInterval.disabledDesc": string;
   "settings.autoSyncChangeDelay.name": string;
   "settings.autoSyncChangeDelay.desc": string;
   "settings.autoSyncChangeDelay.disabledDesc": string;
@@ -322,12 +322,8 @@ export interface LocaleStrings {
   "syncView.mutationResolution.action.merge": string;
   "syncView.pluginBundleReview.title": string;
   "syncView.pluginBundleReview.description": string;
-  "syncView.pluginBundleReview.versionLabel": string;
   "syncView.pluginBundleReview.version": string;
   "syncView.pluginBundleReview.fileIdentical": string;
-  "syncView.pluginBundleReview.fileDifferent": string;
-  "syncView.pluginBundleReview.fileLocalOnly": string;
-  "syncView.pluginBundleReview.fileRemoteOnly": string;
   "syncView.pluginBundleReview.review": string;
   "syncView.pluginBundleReview.loading": string;
   "syncView.pluginBundleReview.loadUnavailable": string;
@@ -340,9 +336,6 @@ export interface LocaleStrings {
   "syncView.adoption.reason": string;
   "syncView.pluginBundleReview.viewDiff": string;
   "syncView.pluginBundleReview.diffTitle": string;
-  "syncView.pluginBundleReview.keepLocal": string;
-  "syncView.pluginBundleReview.keepRemote": string;
-  "syncView.pluginBundleReview.identical": string;
   "syncView.pluginBundleReview.readOnly": string;
   "syncView.pluginBundleReview.identityMismatchNotice": string;
   "syncView.pluginBundleReview.directionUnavailable": string;
@@ -468,9 +461,11 @@ export interface LocaleStrings {
   "notice.sync.recoveryResetBlocked": string;
   "notice.accountMismatch": string;
   "notice.diagnosticReportGenerated": string;
+  "notice.diagnosticReportSaveFailed": string;
   "notice.syncPathSettings.busy": string;
   "notice.syncPathSettings.recovery": string;
   "notice.syncPathSettings.failed": string;
+  "notice.settingsSaveFailed": string;
 
   // ---- Sync Plan Reasons ----
   "reason.fileExceedsSizeLimit": string;

@@ -22,7 +22,9 @@ import {
   ensureEasySyncRuntimeLayoutMigration,
   clearEasySyncLegacyRuntimeLayout,
   noteHealthySyncAndCleanupEasySyncRuntimeLayout,
+  toLayoutMigrationConflict,
   type EasySyncLayoutMigrationStorage,
+  type EasySyncRuntimeLayoutMigrationConflict,
 } from "./runtime-layout-migration";
 import { AncestorStoreV2 } from "./ancestor-store-v2";
 import {
@@ -259,6 +261,7 @@ export type V2StateLoadBlockReason =
   | "public-1.1.3-cutover-marker-mismatch"
   | "public-1.1.3-cutover-finalization-failed"
   | "v2-mutation-ledger-migration-failed"
+  | "layout-migration-conflict"
   | "v2-state-load-failed";
 
 export interface V2StateLoadBlock {
@@ -855,12 +858,26 @@ export class StateManager {
       this.plugin.app.vault,
       this.plugin.manifest.id,
     );
-    await ensureEasySyncRuntimeLayoutMigration(
-      this.plugin.app.vault.adapter,
-      layoutPaths,
-      legacyLayoutPaths,
-      this.plugin.layoutMigrationStorage,
-    );
+    let layoutMigrationConflict: EasySyncRuntimeLayoutMigrationConflict | null =
+      null;
+    try {
+      await ensureEasySyncRuntimeLayoutMigration(
+        this.plugin.app.vault.adapter,
+        layoutPaths,
+        legacyLayoutPaths,
+        this.plugin.layoutMigrationStorage,
+      );
+    } catch (error) {
+      const conflict = toLayoutMigrationConflict(error);
+      if (!conflict) throw error;
+      // The migration only moves EasySync's own sidecars, so a conflict must
+      // not abort the load: the envelope read, the block decision and the
+      // mutation-ledger key migration below all still have to run. Recording it
+      // here and blocking at a clean exit is what keeps
+      // `migrateActiveMutationLedgerKeyIfRequired` — which bails out as soon as
+      // a block exists — reachable.
+      layoutMigrationConflict = conflict;
+    }
     const saved = await this.plugin.loadData();
     if (saved) {
       const rawPublicMutationLedger = saved[KEY_PUBLIC_MUTATION_LEDGER];
@@ -1351,6 +1368,7 @@ export class StateManager {
           );
           return;
         }
+        this.applyLayoutMigrationConflictBlock(layoutMigrationConflict);
         return;
       }
 
@@ -1393,6 +1411,7 @@ export class StateManager {
         ).baseContentFile,
       );
       this.remoteState = await this.loadRemoteState();
+      this.applyLayoutMigrationConflictBlock(layoutMigrationConflict);
       return;
     } else {
       this.v2ScopeTransitionStore = null;
@@ -1409,6 +1428,7 @@ export class StateManager {
       ).baseContentFile,
     );
     this.remoteState = await this.loadRemoteState();
+    this.applyLayoutMigrationConflictBlock(layoutMigrationConflict);
   }
 
   /** Record one fully healthy round and retire old layout files after the
@@ -1440,6 +1460,18 @@ export class StateManager {
         ? {}
         : { detail: stateLoadErrorDetail(error) }),
     };
+  }
+
+  /**
+   * Block a load that survived a runtime-layout conflict. Called only from the
+   * loader's clean exits, and never over a reason the loader itself recorded:
+   * that one is more specific and already carries its own diagnostics.
+   */
+  private applyLayoutMigrationConflictBlock(
+    conflict: EasySyncRuntimeLayoutMigrationConflict | null,
+  ): void {
+    if (!conflict || this.v2StateLoadBlock) return;
+    this.setV2StateLoadBlock("layout-migration-conflict", "v2", conflict);
   }
 
   private async finalizePublic113CutoverIfRequired(
@@ -4383,7 +4415,15 @@ export class StateManager {
           )
         )
       ) {
-        throw new Error(`Mutation receipt evidence is invalid: ${receipt.operationId}`);
+        // The refusal reason must be self-describing in diagnostics: a scope
+        // mismatch between the intent and the committed envelope and a
+        // record-shape rejection have different root causes and fixes.
+        const gateReason = !preparedCandidate
+          ? "scope does not match the committed envelope"
+          : "record shape is not an ordinary file recovery record";
+        throw new Error(
+          `Mutation receipt evidence is invalid (${gateReason}): ${receipt.operationId}`,
+        );
       }
       entries[index] = candidate;
       return { ...current, [KEY_MUTATION_LEDGER]: entries };
@@ -8243,7 +8283,9 @@ export class StateManager {
     );
     if (!capsule) {
       throw new ConservativeResetBlockedError(
-        "Cannot conservatively reset without an exact V2 file identity capsule",
+        `Cannot conservatively reset without an exact V2 file identity capsule (${
+          this.describeIsolatedResetCapsuleRejection(retainedEntries)
+        })`,
       );
     }
     const retainedMerges = retainedEntries.filter((record) =>
@@ -8806,6 +8848,24 @@ export class StateManager {
       // a stale or incomplete folder-anchor chain would add no safety.
       folderAnchors: [],
     };
+  }
+
+  /**
+   * Diagnostic-only discrimination for a failed conservative-reset capsule.
+   * It reuses the admission predicate as the single rule source and never
+   * re-decides capsule admissibility.
+   */
+  private describeIsolatedResetCapsuleRejection(
+    entries: readonly Readonly<MutationLedgerEntryV1>[],
+  ): string {
+    const envelope = this.v2Envelope;
+    if (!envelope) return "no committed V2 envelope";
+    const inadmissible = entries.find((record) =>
+      !isConservativeResetOrdinaryRecord(record, envelope.scope));
+    if (inadmissible) {
+      return `record is not admissible for conservative reset (${inadmissible.intent.operationId})`;
+    }
+    return "authority holds or record identity closure failed";
   }
 
   private async removeRegenerableLocalSyncArtifacts(

@@ -289,6 +289,7 @@ export class SliderComponent {
     this.value = value;
     return this;
   }
+  setDisabled(_disabled: boolean): this { return this; }
   onChange(callback: (value: number) => void | Promise<void>): this {
     this.onChangeCallback = callback;
     return this;

@@ -748,7 +748,7 @@ export interface ScanConfig {
   /** Paths that override exclusions. Checked before excludePaths —
    *  a path matching any includePath is never excluded. */
   includePaths: string[];
-  /** Maximum file size in bytes (default 100MB) */
+  /** Maximum file size in bytes (default 500MB) */
   maxFileSize: number;
   /** Include EasySync's own main.js, manifest.json, and styles.css. */
   includeOwnPluginCode?: boolean;

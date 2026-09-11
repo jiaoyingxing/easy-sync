@@ -1423,6 +1423,69 @@ describe("AuthModule login persistence (transient refresh failures)", () => {
   });
 });
 
+describe("AuthModule.isSessionPending", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function makeDiagnostics(): never {
+    return { log: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+  }
+
+  it("flags a restored session until Graph /me binds the account, and refreshes surfaces when it does", async () => {
+    let refreshFails = true;
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        if (refreshFails) throw new Error("network unreachable");
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            access_token: "fresh-at",
+            refresh_token: "rotated-rt",
+            expires_in: 3600,
+          },
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "Offline User", id: "offline-account" },
+      };
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn(async () => "stored-refresh-token"),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      diag: makeDiagnostics(),
+    }));
+    const changes = vi.fn();
+    auth.onStateChange(changes);
+
+    // Logged out: nothing pending.
+    expect(auth.isSessionPending).toBe(false);
+
+    // Transient restore failure: the session stays present so no surface
+    // claims "logged out", but the account is unverified — the window where
+    // sync authorization is fail-closed.
+    await auth.initialize();
+    expect(auth.authState.isLoggedIn).toBe(true);
+    expect(auth.authState.accountId).toBe("");
+    expect(auth.isSessionPending).toBe(true);
+
+    // A later successful refresh binds the account and must notify listeners,
+    // because that is what opens sync authorization again.
+    refreshFails = false;
+    changes.mockClear();
+    await auth.getAccessToken();
+    expect(auth.authState.accountId).toBe("offline-account");
+    expect(auth.isSessionPending).toBe(false);
+    expect(changes).toHaveBeenCalled();
+  });
+});
+
 describe("generateCodeChallengeSync", () => {
   it("produces the same result as the async Web Crypto version", async () => {
     // Import the ACTUAL module (bypass vi.mock) to get the real functions

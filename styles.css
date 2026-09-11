@@ -1249,6 +1249,11 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
   pointer-events: none;
 }
 
+.easy-sync-plan-decision-probe {
+  visibility: hidden;
+  pointer-events: none;
+}
+
 .easy-sync-history-omitted,
 .easy-sync-empty-state {
   padding: 2px 4px;

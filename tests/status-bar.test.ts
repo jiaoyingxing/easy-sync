@@ -179,7 +179,7 @@ describe("updateStatusBar item structure", () => {
     expect(segmentOf(el).children).toHaveLength(1);
   });
 
-  it("maps a retry-pending latest round to the offline group with a no-network label", () => {
+  it("maps a retry-pending latest round to the connecting form while the device reports a network", () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     (plugin.state as never as { lastSyncTime: number }).lastSyncTime = 1;
@@ -187,6 +187,29 @@ describe("updateStatusBar item structure", () => {
       { id: "1", status: "retry-pending" },
     ];
     plugin.updateStatusBar();
+
+    // No network claim while the system flag does not say offline: the only
+    // known fact is "the cloud was not readable" — the neutral connecting
+    // form (no is-* class, same as auth initializing / session-pending).
+    expect(el.classes.has("is-offline")).toBe(false);
+    expect(IS_GROUP_CLASSES.filter((c) => el.classes.has(c))).toEqual([]);
+    expect(el.attrs["aria-label"]).toBe("连接中…");
+    expect(segmentOf(el).children).toHaveLength(1);
+  });
+
+  it("keeps the offline group for a retry-pending round when the system reports the device offline", () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    (plugin.state as never as { lastSyncTime: number }).lastSyncTime = 1;
+    (plugin.state as never as { syncHistory: unknown[] }).syncHistory = [
+      { id: "1", status: "retry-pending" },
+    ];
+    vi.stubGlobal("navigator", { onLine: false });
+    try {
+      plugin.updateStatusBar();
+    } finally {
+      vi.unstubAllGlobals();
+    }
 
     expect(el.classes.has("is-offline")).toBe(true);
     expect(IS_GROUP_CLASSES.filter((c) => c !== "is-offline" && el.classes.has(c))).toEqual([]);

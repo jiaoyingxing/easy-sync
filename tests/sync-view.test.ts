@@ -4,6 +4,8 @@ import {
   buildAdaptivePathLayout,
   buildCompletedFilesRenderState,
   buildSyncPlanDisplayGroups,
+  buildSyncPlanDisplayRows,
+  buildSyncPlanMeasuredVirtualOffsets,
   buildSyncPlanVirtualOffsets,
   buildSyncPlanVirtualWindow,
   buildSyncViewContentKey,
@@ -29,6 +31,7 @@ import {
 } from "../src/ui/sync-view";
 import { I18n } from "../src/i18n";
 import { SyncActionType } from "../src/sync/types";
+import type { SyncPlanItem } from "../src/sync/types";
 import { ConfirmModal } from "../src/ui/confirm-modal";
 import { formatFileSize } from "../src/ui/file-comparison-modal";
 
@@ -171,22 +174,45 @@ describe("shared sidebar detail controls", () => {
     expect(formatFileSize(1024 * 1024)).toBe("1.0 MB");
   });
 
-  it("applies an explicit plan-wide expand action to lazily rendered decisions", () => {
-    const detail = { setAttribute: vi.fn() };
+  it("applies the plan-wide expand default to lazily rendered decisions without forgetting a per-row choice", () => {
     const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
     Object.assign(view as object, {
       planGroupsCollapsed: false,
-      collapseToggleButtonEl: null,
+      planRowExpandedState: new Map<string, boolean>(),
     });
-    const container = {
-      querySelectorAll: vi.fn().mockReturnValue([detail]),
-    } as unknown as HTMLElement;
+    const state = (
+      view as unknown as { planRowExpandedState: Map<string, boolean> }
+    ).planRowExpandedState;
+    const decide = (
+      view as unknown as { planRowExpanded(key: string): boolean }
+    ).planRowExpanded.bind(view);
 
-    (view as unknown as {
-      applyPlanDetailsExpandOverride(container: HTMLElement): void;
-    }).applyPlanDetailsExpandOverride(container);
+    // A row the user never touched follows the group-level expand-all.
+    expect(decide("conflict:a.md")).toBe(true);
+    state.set("conflict:a.md", false);
+    // An explicit per-row choice outranks the group-level default.
+    expect(decide("conflict:a.md")).toBe(false);
 
-    expect(detail.setAttribute).toHaveBeenCalledWith("open", "");
+    Object.assign(view as object, { planGroupsCollapsed: true });
+    expect(decide("conflict:b.md")).toBe(false);
+  });
+
+  it("records a decision row's open state from the user's gesture, not the toggle event", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const toggleStart = source.indexOf("private readonly handlePathLayoutToggle");
+    const intentStart = source.indexOf("private readonly handlePlanRowToggleIntent");
+    const resizeStart = source.indexOf("private readonly handlePathLayoutResize");
+    const toggleHandler = source.slice(toggleStart, intentStart);
+    const intentHandler = source.slice(intentStart, resizeStart);
+
+    // `toggle` also fires for our own programmatic writes
+    // (applyPlanRowExpansionIn, toggleAllDetails), so recording there pins rows
+    // the user never touched.
+    expect(toggleHandler).not.toContain("rememberPlanRowExpansion");
+    expect(toggleHandler).toContain("this.updateCollapseTogglePresentation()");
+    // A summary click is the only user driver of a <details> state change.
+    expect(intentHandler).toContain('target.closest("summary")');
+    expect(intentHandler).toContain("this.rememberPlanRowExpansion(key, !host.open)");
   });
 });
 
@@ -1504,6 +1530,54 @@ describe("buildSyncViewContentKey", () => {
     });
   });
 
+  it("keeps one decision row per community plugin bundle wherever the window starts", () => {
+    const pluginMember = (path: string): SyncPlanItem => ({
+      path,
+      type: SyncActionType.Conflict,
+    });
+    const bundled = [
+      pluginMember("plugins/demo/main.js"),
+      pluginMember("plugins/demo/manifest.json"),
+    ];
+    const pluginConflict = { pluginId: "demo", items: bundled };
+    const rows = buildSyncPlanDisplayRows(
+      [
+        { type: SyncActionType.Conflict, path: "plugins/demo/main.js" },
+        { type: SyncActionType.Conflict, path: "plugins/demo/manifest.json" },
+        { type: SyncActionType.Conflict, path: "notes/a.md" },
+        { type: SyncActionType.ConfirmLocalDelete, path: "gone.md" },
+        { type: SyncActionType.Conflict, path: "detached.md" },
+      ],
+      new Map([
+        ["plugins/demo/main.js", bundled[0]],
+        ["plugins/demo/manifest.json", bundled[1]],
+        ["notes/a.md", pluginMember("notes/a.md")],
+      ]),
+      new Map([["gone.md", { path: "gone.md", type: SyncActionType.ConfirmLocalDelete }]]),
+      new Map([
+        ["plugins/demo/main.js", pluginConflict],
+        ["plugins/demo/manifest.json", pluginConflict],
+      ]),
+    );
+
+    expect(rows.map((row) => row.key)).toEqual([
+      "plugin:demo",
+      "conflict:notes/a.md",
+      "delete:gone.md",
+      "row:conflict:detached.md",
+    ]);
+    expect(rows[0].pluginConflict).toBe(pluginConflict);
+    expect(rows[1].pluginConflict).toBe(null);
+  });
+
+  it("gives every measured decision row its own slot height", () => {
+    expect(buildSyncPlanMeasuredVirtualOffsets([26, 120, 26]))
+      .toEqual([0, 26, 146, 172]);
+    expect(buildSyncPlanMeasuredVirtualOffsets([])).toEqual([0]);
+    // A row that measures as nothing still needs a reachable slot.
+    expect(buildSyncPlanMeasuredVirtualOffsets([0])).toEqual([0, 1]);
+  });
+
   it("uses the existing compact row heights when reasons make individual rows taller", () => {
     expect(buildSyncPlanVirtualOffsets([
       { reason: undefined },
@@ -1737,7 +1811,7 @@ describe("buildSyncViewContentKey", () => {
     const sectionStart = source.indexOf("private renderPlanReviewSection");
     const sectionEnd = source.indexOf("private renderPlanGroups", sectionStart);
     const section = source.slice(sectionStart, sectionEnd);
-    const groupsEnd = source.indexOf("private renderPlanReviewItem", sectionEnd);
+    const groupsEnd = source.indexOf("private renderPlanReviewRow", sectionEnd);
     const groups = source.slice(sectionEnd, groupsEnd);
 
     expect(status).toContain('"syncPlan.confirmMigration"');
@@ -1762,7 +1836,7 @@ describe("buildSyncViewContentKey", () => {
     );
     expect(groups).not.toContain("probe.style.");
     expect(groups).toContain("buildSyncPlanVirtualWindow({");
-    expect(groups).toContain("this.planVirtualRenderers.add(renderWindow)");
+    expect(groups).toContain("this.planVirtualRenderers.add(renderInlineDecisions)");
     expect(groups).toContain("hasInlineDecisions");
     expect(styles).toMatch(/\.easy-sync-plan-virtual-window\s*\{[^}]*position:\s*absolute/s);
     expect(styles).toMatch(
@@ -1775,7 +1849,16 @@ describe("buildSyncViewContentKey", () => {
     const source = readFileSync("src/ui/sync-view.ts", "utf8");
 
     expect(source).toContain("private planExpandedGroups = new Set<SyncActionGroup>()");
-    expect(source).toContain("this.planExpandedGroups.clear();\n        preservedContentScrollTop = null;");
+    const revisionStart = source.indexOf(
+      "this.renderedPlanReviewRevision !== syncState.planReviewRevision",
+    );
+    const revisionEnd = source.indexOf(
+      "this.renderedPlanReviewRevision = syncState.planReviewRevision;",
+      revisionStart,
+    );
+    const revision = source.slice(revisionStart, revisionEnd);
+    expect(revision).toContain("this.planExpandedGroups.clear();");
+    expect(revision).toContain("preservedContentScrollTop = null;");
     expect(source).toContain("details.dataset.easySyncPlanGroup = group.group");
     expect(source).toContain("this.planExpandedGroups.add(group.group)");
     expect(source).toContain("expandedPlanGroups.has(group)");
@@ -2451,7 +2534,7 @@ describe("sync view attention presentation", () => {
     })).toEqual({ status: "success", label: "已同步" });
   });
 
-  it("shows an offline top status when the latest round is a retry-pending observation", () => {
+  it("shows the connecting form when the latest round is a retry-pending observation and the device reports a network", () => {
     const view = Object.create(EasySyncSyncView.prototype) as {
       plugin: { i18n: I18n };
       getStatusPresentation: (state: Record<string, unknown>) => {
@@ -2478,20 +2561,60 @@ describe("sync view attention presentation", () => {
       errors: 0,
     };
 
-    // The latest round was a network observation miss: the stale "synced"
-    // green from the last healthy round must not imply the vault is in sync.
+    // The latest round was a remote-read miss: the stale "synced" green from
+    // the last healthy round must not imply the vault is in sync. The system
+    // flag does not say offline, so there is no network claim either — the
+    // neutral connecting form (same as cold start / session-pending).
     expect(view.getStatusPresentation({
       ...baseState,
       latestHistory,
-    })).toEqual({ status: "offline", label: "无网络连接" });
+    })).toEqual({ status: "ready", label: "连接中…" });
 
-    // A pending item still outranks the offline hint: unresolved conflicts or
-    // deletes must not be hidden behind the network notice.
+    // A pending item still outranks the retry notice: unresolved conflicts or
+    // deletes must not be hidden behind it.
     expect(view.getStatusPresentation({
       ...baseState,
       pendingCount: 2,
       latestHistory,
     })).toEqual({ status: "attention", label: "需要处理 2" });
+  });
+
+  it("keeps the offline top status for a retry-pending round when the system reports the device offline", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as {
+      plugin: { i18n: I18n };
+      getStatusPresentation: (state: Record<string, unknown>) => {
+        status: string;
+        label: string;
+      };
+    };
+    view.plugin = { i18n: new I18n("zh-cn") };
+    const baseState = {
+      isLoggedIn: true,
+      isInitializing: false,
+      isPending: false,
+      isRunning: false,
+      lastSyncTime: 1,
+      pendingCount: 0,
+      planReviewActive: false,
+      autoSyncPaused: false,
+      mutationRecovery: null,
+      progress: { cancelRequested: false },
+    };
+    const latestHistory = {
+      status: "retry-pending",
+      conflicts: 0,
+      errors: 0,
+    };
+
+    vi.stubGlobal("navigator", { onLine: false });
+    try {
+      expect(view.getStatusPresentation({
+        ...baseState,
+        latestHistory,
+      })).toEqual({ status: "offline", label: "无网络连接" });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("keeps the top status generic when only community plugin decisions remain", () => {
@@ -2674,6 +2797,56 @@ describe("continuous click-in for resolution rows", () => {
       );
     }
   });
+
+  it("holds a per-row guard so the same row cannot decide twice while settling", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const cases = [
+      { open: "  private async openStaleIdentityResolution(", key: "stale:" },
+      {
+        open: "  private async openSharedFolderIdentityResolution(",
+        key: "shared-folder:",
+      },
+      { open: "  private async openEmptyFolderResolution(", key: "empty-folder:" },
+      {
+        open: "  private async openFolderLocationResolution(",
+        key: "folder-location:",
+      },
+      {
+        open: "  private async openScopeCrossingRestore(",
+        key: "scope-crossing:",
+      },
+      {
+        open: "  private async openScopeCrossingConfirm(",
+        key: "scope-crossing:",
+      },
+      {
+        open: "  private async openMutationRecoveryResolution(",
+        key: "mutation-recovery",
+      },
+      {
+        open: "  private async openCommunityPluginBundleReview(",
+        key: "bundle-review:",
+      },
+    ];
+    for (const { open, key } of cases) {
+      const start = source.indexOf(open);
+      expect(start).toBeGreaterThanOrEqual(0);
+      const end = source.indexOf("\n  private async ", start + 1);
+      const method = source.slice(start, end < 0 ? undefined : end);
+      expect(method).toContain("const rowKey = ");
+      expect(method).toContain(key);
+      expect(method).toContain("if (!this.lockResolutionRow(rowKey)) return;");
+      expect(method).toContain("this.unlockResolutionRow(rowKey);");
+      // The row guard must be claimed before the settlement and released in
+      // the method's finally, so a cancelled modal never leaves a stuck row.
+      expect(method.indexOf("lockResolutionRow(rowKey)")).toBeLessThan(
+        method.indexOf("await this.plugin."),
+      );
+      expect(method.indexOf("unlockResolutionRow(rowKey)")).toBeGreaterThan(
+        method.indexOf("await this.plugin."),
+      );
+    }
+  });
 });
 
 describe("scope-crossing row exit gating", () => {
@@ -2713,5 +2886,23 @@ describe("scope-crossing row exit gating", () => {
     const stateManager = readFileSync("src/sync/state-manager.ts", "utf8");
     expect(stateManager).toContain("findScopeCrossingCoveringHintV1(path, {");
     expect(stateManager).toContain("getScopeCrossingExitKind(path: string)");
+  });
+
+  it("names the moved object in the confirm exit dialog", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    // 行内确认弹框必须点名被移出的对象，否则用户无法判断这条提示指向哪个
+    // 文件或文件夹（「撤销移动」弹框此前就是这个写法）。
+    const confirmStart = source.indexOf(
+      "  private async openScopeCrossingConfirm(",
+    );
+    expect(confirmStart).toBeGreaterThanOrEqual(0);
+    const openEnd = source.indexOf("\n  private async ", confirmStart + 1);
+    const confirm = source.slice(
+      confirmStart,
+      openEnd < 0 ? undefined : openEnd,
+    );
+    expect(confirm).toContain('"syncView.scopeCrossing.confirmMessageFolder"');
+    expect(confirm).toContain('"syncView.scopeCrossing.confirmMessageFile"');
+    expect(confirm).toContain("path: snapshot.fromPath");
   });
 });

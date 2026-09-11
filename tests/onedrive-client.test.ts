@@ -1665,12 +1665,12 @@ describe("OneDriveClient shared V2 sync protocol", () => {
         () => ({ error: null }),
         (error: unknown) => ({ error }),
       );
-    await vi.advanceTimersByTimeAsync(15_000);
+    await vi.advanceTimersByTimeAsync(30_000);
     const { error } = await first;
 
     expect(error).toBeInstanceOf(SyntheticRequestTimeoutError);
     expect(error).toMatchObject({
-      timeoutMs: 15_000,
+      timeoutMs: 30_000,
     });
     expect(error).not.toHaveProperty("statusCode");
     expect(requestSpy).toHaveBeenCalledTimes(1);
@@ -1733,7 +1733,7 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     const first = client.readSharedSyncProtocolObjects("testVault").catch(
       (error: unknown) => error,
     );
-    await vi.advanceTimersByTimeAsync(15_000);
+    await vi.advanceTimersByTimeAsync(30_000);
     await expect(first).resolves.toBeInstanceOf(SyntheticRequestTimeoutError);
 
     requestSpy.mockResolvedValueOnce({
@@ -1775,12 +1775,12 @@ describe("OneDriveClient shared V2 sync protocol", () => {
         () => ({ error: null }),
         (error: unknown) => ({ error }),
       );
-    await vi.advanceTimersByTimeAsync(15_000);
+    await vi.advanceTimersByTimeAsync(30_000);
     const firstError = (await first).error;
     expect(firstError).toBeInstanceOf(SyntheticRequestTimeoutError);
     expect(firstError).toMatchObject({
       source: "deadline",
-      timeoutMs: 15_000,
+      timeoutMs: 30_000,
     });
     expect(requestSpy).toHaveBeenCalledTimes(1);
 
@@ -1846,7 +1846,7 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     const first = client.readSharedSyncProtocolObjects("testVault").catch(
       (error: unknown) => error,
     );
-    await vi.advanceTimersByTimeAsync(8000);
+    await vi.advanceTimersByTimeAsync(30_000);
     await expect(first).resolves.toMatchObject({
       component: "v2",
       observationCause: expect.any(SyntheticRequestTimeoutError),

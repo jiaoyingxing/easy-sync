@@ -1916,9 +1916,14 @@ describe("StateManager V2 production controller", () => {
       await state.load();
       const before = structuredClone(state.getCommittedV2Envelope()!);
 
+      // The refusal has to stay self-describing: the reset button reaches this
+      // gate, so a message that degrades to a bare "capsule" leaves the user
+      // with nothing to act on. Pin the full shape, one known reason only.
       await expect(
         state.resetPreservingIsolatedMutationRecovery([retained]),
-      ).rejects.toThrow(/isolated|capsule|evidence/i);
+      ).rejects.toThrow(
+        /^Cannot conservatively reset without an exact V2 file identity capsule \((?:no committed V2 envelope|record is not admissible for conservative reset \([^)]+\)|authority holds or record identity closure failed)\)$/,
+      );
 
       expect(state.getCommittedV2Envelope()).toEqual(before);
       expect(state.mutationLedger).toEqual([retained]);
@@ -3058,6 +3063,39 @@ describe("StateManager V2 production controller", () => {
     expect(restarted.mutationRecoveryQuarantine).toEqual(
       state.mutationRecoveryQuarantine,
     );
+  });
+
+  it("pins the receipt-gate scope asymmetry: begin accepts a drifted-scope intent while the receipt stage refuses it", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const mutation = uploadMutation();
+    // Issue #17 conviction: intents carry the per-round observed scope while
+    // the receipt gate compares against the committed envelope scope. An ID
+    // case drift between the two sources strands the record at receipt=null
+    // (begin has no scope gate; recordMutationReceipt does, against a
+    // different scope source). R2 (scope-source unification) must flip this
+    // pin; the control case with the matching scope passes elsewhere.
+    const driftedIntent = {
+      ...mutation.intent,
+      operationId: "upload-scope-drift",
+      scope: { ...scope, vaultFolderId: scope.vaultFolderId.toUpperCase() },
+    };
+    await state.beginMutationIntent(driftedIntent);
+    await expect(
+      state.recordMutationReceipt({
+        ...mutation.receipt,
+        operationId: driftedIntent.operationId,
+      }),
+    // The refusal reason discriminates root causes; a drifted scope must land
+    // on the scope branch, not on the record-shape one.
+    ).rejects.toThrow(
+      /^Mutation receipt evidence is invalid \(scope does not match the committed envelope\): upload-scope-drift$/,
+    );
+    expect(state.mutationLedger).toEqual([{
+      intent: driftedIntent,
+      receipt: null,
+    }]);
   });
 
   it("force reset terminates every unresolved record with one audit entry and rebuilds default state", async () => {

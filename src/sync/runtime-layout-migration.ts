@@ -33,6 +33,18 @@ export class EasySyncRuntimeLayoutMigrationConflict extends Error {
   }
 }
 
+/**
+ * Narrow an unknown failure to a runtime-layout conflict. Only a genuine
+ * authoritative-sidecar disagreement is a conflict: every other error must
+ * keep propagating, so a caller never reports a layout problem for what is
+ * actually an I/O or adapter failure.
+ */
+export function toLayoutMigrationConflict(
+  error: unknown,
+): EasySyncRuntimeLayoutMigrationConflict | null {
+  return error instanceof EasySyncRuntimeLayoutMigrationConflict ? error : null;
+}
+
 interface LayoutMigrationMarker {
   version: 1;
   stableSyncs: number;
@@ -367,12 +379,19 @@ export async function ensureEasySyncRuntimeLayoutMigration(
   // the one-shot legacy copy. A fresh install has no source sidecars, and a
   // previously completed marker must still be able to repair missing folders.
   await ensureCurrentLayoutDirectories(adapter, current);
+  const storedMarker = readStoredMarker(storage);
   // Once the first copy was fully verified, the current tree is the only
   // writer. Legacy files are retained solely for the short cleanup grace
   // period and must never be compared with, or copied back over, newer state.
-  if (readStoredMarker(storage)) {
+  // Only a clean legacy tree ends that phase: while the marker is absent or
+  // still incomplete, each run has to keep looking for newly appeared sidecars,
+  // because an interrupted migration or a downgraded run writes the old layout
+  // again and would otherwise strand them there for good. A `completed` marker
+  // recorded an empty discovery, so this early return skips no such re-look.
+  if (storedMarker?.completed === true) {
     return { migrated: [], legacyFiles: [], conflicts: [] };
   }
+  const gracePeriod = storedMarker !== null;
   const sourceFiles = await discoverLegacyFiles(adapter, legacy);
   const migrated: string[] = [];
   const conflicts: string[] = [];
@@ -384,9 +403,15 @@ export async function ensureEasySyncRuntimeLayoutMigration(
     const targetPath = join(current.pluginDir, targetRelative);
     if (normalizePath(sourcePath) === normalizePath(targetPath)) continue;
     if (await adapter.exists(targetPath)) {
+      // During the grace period the current tree already owns this sidecar and
+      // the legacy copy is stale by contract, so comparing them would report a
+      // conflict for every sidecar the current layout has advanced past.
+      if (gracePeriod) continue;
       if (!await sameBytes(adapter, sourcePath, targetPath)) {
         conflicts.push(sourcePath);
-        throw new EasySyncRuntimeLayoutMigrationConflict(sourcePath, targetPath);
+        if (!isDiscardableLegacySidecar(relative, legacy)) {
+          throw new EasySyncRuntimeLayoutMigrationConflict(sourcePath, targetPath);
+        }
       }
       continue;
     }
@@ -395,16 +420,47 @@ export async function ensureEasySyncRuntimeLayoutMigration(
     await writeBytes(adapter, targetPath, bytes);
     if (!await sameBytes(adapter, sourcePath, targetPath)) {
       conflicts.push(sourcePath);
-      throw new EasySyncRuntimeLayoutMigrationConflict(sourcePath, targetPath);
+      if (!isDiscardableLegacySidecar(relative, legacy)) {
+        throw new EasySyncRuntimeLayoutMigrationConflict(sourcePath, targetPath);
+      }
+      continue;
     }
     migrated.push(sourcePath);
   }
+  // A run during the grace period must carry the cleanup count forward: the
+  // count is advanced once per healthy round and resetting it here (on every
+  // load) would keep the legacy tree from ever reaching the retirement
+  // threshold.
   writeMarker(storage, {
     version: 1,
-    stableSyncs: 0,
+    stableSyncs: gracePeriod ? (storedMarker?.stableSyncs ?? 0) : 0,
     completed: sourceFiles.length === 0,
   });
   return { migrated, legacyFiles: sourceFiles, conflicts };
+}
+
+/**
+ * Sidecars that are rebuilt from other state, or kept only as evidence. Once
+ * the current tree has advanced past them a byte mismatch is expected, so it
+ * must be skipped rather than treated as an ambiguity. Everything else is an
+ * authoritative sidecar and does block.
+ */
+function isDiscardableLegacySidecar(
+  relative: string,
+  legacy: EasySyncPathSet,
+): boolean {
+  const normalized = normalizePath(relative);
+  const discardable = [
+    legacy.scanCacheFile,
+    legacy.stateV1BackupFile,
+    legacy.stateV2CorruptRecoveryFile,
+    legacy.stateV2CorruptRecoveryNextFile,
+    legacy.stateV2CorruptPublicationFile,
+    legacy.stateV2CorruptPublicationNextFile,
+  ];
+  return discardable.some(
+    (path) => relativeToPlugin(path, legacy.pluginDir) === normalized,
+  );
 }
 
 function readStoredMarker(

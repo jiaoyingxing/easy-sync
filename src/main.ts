@@ -21,6 +21,7 @@ import {
 import { OneDriveClient } from "./onedrive/client";
 import {
   createFolderSyncScopeSnapshotV1,
+  isEasySyncInternalPath,
   LocalScanner,
   normalizeExcludedFolders,
 } from "./sync/local-scanner";
@@ -474,10 +475,10 @@ type ResetMutationRecoveryDisposition =
 
 /**
  * Semantic groups the single status bar item exposes via `.is-*` classes
- * (is-loggedOut / is-attention / is-syncing / is-ready), mirroring the sidebar
- * status line class scheme (sync-view.ts). A subset of RibbonStatus: the status
- * bar never enters the transient "success" state (常驻位不闪烁), and "cancelling"
- * collapses into the syncing presentation.
+ * (is-loggedOut / is-attention / is-syncing / is-ready / is-offline), mirroring
+ * the sidebar status line class scheme (sync-view.ts). A subset of RibbonStatus:
+ * the status bar never enters the transient "success" state (常驻位不闪烁), and
+ * "cancelling" collapses into the syncing presentation.
  */
 type StatusBarStatusGroup = Extract<
   RibbonStatus,
@@ -712,8 +713,15 @@ export default class EasySyncPlugin extends Plugin {
   runSettingsMutationWhenSyncIdle(
     run: () => Promise<void>,
   ): DeferredSettingsMutationHandle {
+    // One async hop for both paths. A run that returns a non-promise, or that
+    // throws synchronously, must still reach the drain as a promise: the drain
+    // removes an item from the queue before awaiting it, so an escape here
+    // would drop that settings change for good and leave its row loading.
+    const execute = async (): Promise<void> => {
+      await run();
+    };
     if (!this.isSyncPathBusy()) {
-      return Object.assign(run(), {
+      return Object.assign(execute(), {
         cancel: () => false,
         isQueued: () => false,
       });
@@ -730,7 +738,7 @@ export default class EasySyncPlugin extends Plugin {
       run: () => {
         item.started = true;
         if (item.cancelled) return Promise.resolve();
-        return run();
+        return execute();
       },
       resolve: () => resolveGate(),
       reject: (error: unknown) => rejectGate(error),
@@ -1059,6 +1067,12 @@ export default class EasySyncPlugin extends Plugin {
       // give the silent token refresh a fresh chance immediately, clearing
       // any transient backoff.
       void this.auth?.refreshNowIfNeeded(true);
+    });
+    this.registerDomEvent(window, "offline", () => {
+      // Mirror the online listener: the retry-pending presentation splits on
+      // the system offline flag, so re-render the status bar immediately
+      // instead of waiting for the next sync round.
+      this.updateStatusBar();
     });
     this.startAutoSync();
 
@@ -2949,7 +2963,11 @@ export default class EasySyncPlugin extends Plugin {
 
   /** Reset sync state safely — cancels running sync, acquires lock, clears state. */
   async resetSyncState(): Promise<void> {
-    await this.ensureStateLoaded();
+    // Reset is the exit users are pointed at when a load fails, so this
+    // pre-flight is best effort: letting it reject would seal off the very path
+    // that recovers from a failed load. The load inside the try below still
+    // runs and reports a genuine failure through the normal notice path.
+    await this.ensureStateLoaded().catch(() => undefined);
     if (!await this.invalidateAndDrainSyncActivity("reset")) {
       this.noticeCenter.show({
         key: "reset-lock-busy",
@@ -2992,9 +3010,28 @@ export default class EasySyncPlugin extends Plugin {
         if (forceReset) {
           await this.state?.forceReset();
         } else if (isolatedRecoveries) {
-          await this.state?.resetPreservingIsolatedMutationRecovery(
-            isolatedRecoveries,
-          );
+          try {
+            await this.state?.resetPreservingIsolatedMutationRecovery(
+              isolatedRecoveries,
+            );
+          } catch (error) {
+            if (!(error instanceof ConservativeResetBlockedError)) throw error;
+            // The conservative reset refused to preserve the isolated
+            // evidence (e.g. an unreceipted create upload is not admissible
+            // for a reset capsule). Escalate to the same user-authorized
+            // forced-reset contract as the blocked disposition — without
+            // this the isolated path is a reset dead end (issue #17).
+            this.diag.warn(
+              "state",
+              "conservative local reset kept unresolved recovery evidence",
+              error instanceof Error ? error.message : String(error),
+            );
+            if (!await this.confirmForcedReset()) {
+              this.showMutationRecoveryResetBlockedNotice();
+              return;
+            }
+            await this.state?.forceReset();
+          }
         } else {
           await this.state?.reset();
         }
@@ -4468,7 +4505,7 @@ export default class EasySyncPlugin extends Plugin {
       this.markLocalDirtyFolderHint(file.path, oldPath);
       if (
         recorded
-        && this.isScopeCrossingPromptDestination(file.path, "folder")
+        && this.isOutOfScopeMoveDestination(file.path, "folder")
       ) {
         this.enqueueScopeCrossingPrompt("folder", oldPath, file.path);
       }
@@ -4531,12 +4568,7 @@ export default class EasySyncPlugin extends Plugin {
     newPath: string,
   ): Promise<boolean> {
     try {
-      if (
-        newPath === ".trash"
-        || newPath.startsWith(".trash/")
-        || this.scanner == null
-        || this.scanner.shouldSyncPath(newPath) === true
-      ) return false;
+      if (!this.isOutOfScopeMoveDestination(newPath, "file")) return false;
       await this.ensureStateLoaded();
       const state = this.state;
       if (!state) return false;
@@ -4568,12 +4600,25 @@ export default class EasySyncPlugin extends Plugin {
   private scopeCrossingPromptTimer: number | null = null;
   private scopeCrossingPromptShowing = false;
 
-  private isScopeCrossingPromptDestination(
+  /**
+   * Whether a rename destination is a path the user moved something to, and
+   * that path lies outside the sync scope. This is the single rule behind both
+   * the immediate prompt and the recorded move evidence.
+   *
+   * EasySync's own bookkeeping paths (the download recovery copies, state /
+   * logs / tmp) are out of scope by construction, but the plugin renames into
+   * them itself — a download that replaces an existing file first renames it to
+   * `<path>.easy-sync-recovery`. Those renames reach the same vault events as a
+   * user move, so they must never be read as "the user moved this out of sync".
+   * The vault trash is excluded because its deletion semantics are unchanged.
+   */
+  private isOutOfScopeMoveDestination(
     path: string,
     kind: "folder" | "file",
   ): boolean {
     if (path === ".trash" || path.startsWith(".trash/")) return false;
     if (this.scanner == null) return false;
+    if (isEasySyncInternalPath(path, getConfigDir(this.app.vault))) return false;
     return kind === "folder"
       ? this.scanner.shouldSyncFolderPath(path) === false
       : this.scanner.shouldSyncPath(path) === false;
@@ -4609,10 +4654,12 @@ export default class EasySyncPlugin extends Plugin {
           first.kind === "folder"
             ? "syncView.scopeCrossing.promptMessageFolder"
             : "syncView.scopeCrossing.promptMessageFile",
+          { path: first.fromPath },
         ),
         batch.length > 1
           ? t("syncView.scopeCrossing.promptBatch", {
             count: String(batch.length - 1),
+            paths: batch.slice(1).map((item) => item.fromPath).join(", "),
           })
           : null,
         t("syncView.scopeCrossing.restore"),
@@ -7342,8 +7389,31 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   /** Generate a diagnostic report Markdown file in the vault root.
-   *  Collects recent anomalies from state and diagnostic buffer. */
+   *  Collects recent anomalies from state and diagnostic buffer.
+   *
+   *  Any failure — the vault write, or the evidence gathering that precedes
+   *  it — surfaces as one simple "could not save" notice instead of a
+   *  silently dropped promise. */
   async generateDiagnosticReport(): Promise<void> {
+    try {
+      await this.buildDiagnosticReportFile();
+    } catch (error) {
+      this.diag.error(
+        "state",
+        "diagnostic report failed",
+        error instanceof Error ? error.message : String(error),
+      );
+      this.noticeCenter.show({
+        key: "diagnostic-report-save-failed",
+        message: this.i18n.t("notice.diagnosticReportSaveFailed"),
+        priority: NOTICE_PRIORITY.action,
+      });
+    }
+  }
+
+  /** Build and write the report file. The success notice fires only after the
+   *  write lands; any failure throws so the caller reports it once. */
+  private async buildDiagnosticReportFile(): Promise<void> {
     const now = new Date();
     const reportI18n = new I18n("zh-cn");
     const formatActionLabel = (type?: SyncActionType): string =>
@@ -7932,11 +8002,15 @@ export default class EasySyncPlugin extends Plugin {
     text: string,
   ): void {
     el.empty();
+    // Must list every StatusBarStatusGroup value: the group class is added
+    // below from `group`, so one left behind here keeps tinting the icon after
+    // the status it represents has already cleared.
     el.removeClass(
       "is-loggedOut",
       "is-cancelling",
       "is-syncing",
       "is-attention",
+      "is-offline",
       "is-success",
       "is-ready",
     );
@@ -7978,6 +8052,20 @@ export default class EasySyncPlugin extends Plugin {
         RIBBON_STATUS_ICONS.loggedOut,
         "loggedOut",
         t("status.notLoggedIn"),
+      );
+      return;
+    }
+
+    // Session restored but the account is not verified yet (transient restore
+    // or refresh failure). Sync authorization is fail-closed until Graph /me
+    // binds the account, so do not claim the vault is ready or in sync — reuse
+    // the same "connecting" presentation as the initializing state.
+    if (this.auth?.isSessionPending) {
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.ready,
+        null,
+        t("status.connecting"),
       );
       return;
     }
@@ -8067,16 +8155,29 @@ export default class EasySyncPlugin extends Plugin {
     const lastSync = this.state?.lastSyncTime;
     const latestRound = this.state?.syncHistory?.[0];
     if (latestRound?.status === "retry-pending") {
-      // The latest round was a retry-pending observation (network unavailable
+      // The latest round was a retry-pending observation (a remote read failed
       // before ordinary planning). A green "last sync" here would mislead the
-      // user into believing the vault is currently in sync; show an offline
-      // hint instead. The next healthy round returns to the ready state.
-      this.renderStatusBarItem(
-        this.statusBarEl,
-        RIBBON_STATUS_ICONS.offline,
-        "offline",
-        t("status.offline"),
-      );
+      // user into believing the vault is currently in sync. The system offline
+      // flag is the only honest source for a "no network" claim: while the
+      // device reports having a network, the only known fact is "the cloud was
+      // not readable", which shares the neutral connecting form with auth
+      // initialization / session-pending. The next healthy round returns to
+      // the ready state.
+      if (navigator.onLine === false) {
+        this.renderStatusBarItem(
+          this.statusBarEl,
+          RIBBON_STATUS_ICONS.offline,
+          "offline",
+          t("status.offline"),
+        );
+      } else {
+        this.renderStatusBarItem(
+          this.statusBarEl,
+          RIBBON_STATUS_ICONS.ready,
+          null,
+          t("status.connecting"),
+        );
+      }
       return;
     }
     if (lastSync) {

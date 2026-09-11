@@ -75,6 +75,14 @@ export interface SharedSyncProtocolObjectsObservation {
 }
 
 const REQUEST_TIMEOUT_MS = 15_000;
+/** Metadata-class GETs (directory listings, delta pages) and shared-protocol
+ *  slot reads use a wider cap than the flat 15s/8s lines: real-device logs
+ *  show healthy metadata latency reaching p99 10.8s / max 18.7s and reads
+ *  settling after the old caps with fulfilled results (late-settlement p90
+ *  +9.9s), so the flat lines cut inside the healthy tail and discarded
+ *  late-arriving data as network failures. The cap stays bounded — requestUrl
+ *  promises may never settle (see requestSharedSyncProtocolUrl). */
+const METADATA_READ_TIMEOUT_MS = 30_000;
 const MAX_REQUEST_ATTEMPTS = 3;
 const RETRY_BASE_MS = 500;
 const RETRY_JITTER_MS = 250;
@@ -2294,7 +2302,7 @@ export class OneDriveClient {
     try {
       response = await this.requestSharedSyncProtocolUrl(
         requestKey,
-        8000,
+        METADATA_READ_TIMEOUT_MS,
         () => requestUrl({
           url: downloadUrl,
           method: "GET",
@@ -2844,7 +2852,7 @@ export class OneDriveClient {
       try {
         const timeoutMs = options.perRequestTimeoutMs
           ? requestTimeoutWithCap(options.deadlineMs, options.perRequestTimeoutMs)
-          : requestTimeoutMs(options.deadlineMs);
+          : requestTimeoutWithCap(options.deadlineMs, defaultRequestTimeoutMs(method, endpoint));
         const dispatch = () => requestUrl({
             url,
             method,
@@ -3388,16 +3396,14 @@ function isTransientDownloadUrlError(error: unknown): boolean {
   return status === 408 || status === 429 || status >= 500;
 }
 
-function requestTimeoutMs(deadlineMs?: number): number {
-  if (!deadlineMs) return REQUEST_TIMEOUT_MS;
-  const remaining = deadlineMs - Date.now();
-  if (remaining <= 0) {
-    throw new OneDriveError(
-      OneDriveErrorType.NetworkError,
-      "Request deadline exceeded",
-    );
-  }
-  return Math.min(REQUEST_TIMEOUT_MS, remaining);
+/** Default per-attempt cap for Graph calls that carry no explicit budget.
+ *  Only GETs on metadata/delta endpoints widen to METADATA_READ_TIMEOUT_MS;
+ *  writes and other endpoints keep the flat 15s line (no misjudgment
+ *  evidence there). */
+function defaultRequestTimeoutMs(method: string, endpoint: OneDriveEndpointCategory): number {
+  return method.toUpperCase() === "GET" && (endpoint === "metadata" || endpoint === "delta")
+    ? METADATA_READ_TIMEOUT_MS
+    : REQUEST_TIMEOUT_MS;
 }
 
 /** Like requestTimeoutMs but uses `cap` instead of the global 15 s limit.

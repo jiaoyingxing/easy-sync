@@ -45,6 +45,7 @@ import {
   upsertBaseStateEnvelopeV2,
 } from "../src/sync/file-state-controller-v2";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
+import { isEasySyncInternalPath } from "../src/sync/local-scanner";
 import type {
   FolderAnchorV2,
   SyncAnchorV2,
@@ -210,6 +211,10 @@ function build(input: {
   localMoveHints?: Parameters<
     typeof buildCanonicalPlanCandidateV2
   >[0]["localMoveHints"];
+  localFileMoveHints?: Parameters<
+    typeof buildCanonicalPlanCandidateV2
+  >[0]["localFileMoveHints"];
+  includeFilePath?: (path: string) => boolean;
 }) {
   return buildCanonicalPlanCandidateV2({
     envelope: input.state,
@@ -218,6 +223,8 @@ function build(input: {
     localFolderScanComplete: true,
     skippedLarge: [],
     localMoveHints: input.localMoveHints,
+    localFileMoveHints: input.localFileMoveHints,
+    includeFilePath: input.includeFilePath,
     configDir: ".obsidian",
     automaticDeleteLocalFiles: false,
   });
@@ -778,6 +785,57 @@ describe("canonical V2 plan candidate", () => {
       expect.objectContaining({
         type: SyncActionType.DeleteRemoteFolder,
         path: "Copy",
+      }),
+    ]);
+  });
+
+  it("holds a real out-of-scope move but not EasySync's own recovery copy", () => {
+    const state = envelope({
+      files: [{ id: "note", name: "note.md" }],
+      folderAnchors: [],
+      fileAnchors: [fileAnchor("note", "note.md")],
+    });
+    // Same shape as the live includeCanonicalFilePath: Archive/ and EasySync's
+    // own bookkeeping paths are both outside the sync scope.
+    const includeFilePath = (path: string): boolean =>
+      !path.startsWith("Archive/")
+      && !isEasySyncInternalPath(path, ".obsidian");
+    const hintAt = (toPath: string) => [{
+      version: 1 as const,
+      scope,
+      remoteId: "note",
+      fromPath: "note.md",
+      toPath,
+      observedAt: 1,
+    }];
+
+    // The user really moved the file out of scope: the vanished old path still
+    // has to hold the cloud deletion for review.
+    const crossing = build({
+      state,
+      localFiles: [],
+      localFileMoveHints: hintAt("Archive/note.md"),
+      includeFilePath,
+    });
+    expect(crossing.items).toContainEqual(expect.objectContaining({
+      type: SyncActionType.FolderDeferred,
+      path: "note.md",
+      reason: "reason.file.scope-crossing",
+    }));
+
+    // A `.easy-sync-recovery` copy is EasySync's own download-replacement
+    // rename, not a destination the user chose: the file never left sync, so
+    // the vanished path follows the ordinary local-deletion chain.
+    const selfInflicted = build({
+      state,
+      localFiles: [],
+      localFileMoveHints: hintAt("note.md.easy-sync-recovery"),
+      includeFilePath,
+    });
+    expect(selfInflicted.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.DeleteRemote,
+        path: "note.md",
       }),
     ]);
   });
