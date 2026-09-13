@@ -1443,6 +1443,16 @@ body.is-mobile .easy-sync-device-actions button {
   margin-top: var(--size-4-6);
 }
 
+/* Desktop only: settings action buttons share one minimum width — the natural
+   width of a four-CJK-char label at native button metrics (--font-ui-small,
+   --size-4-3 padding) — so two-char buttons (同步/配置/重置) align with wider
+   ones (退出登录). Element selector: 1.13+ declarative render emits bare
+   <button> without the .button class. Icon-only buttons stay intrinsic;
+   mobile keeps compact. */
+body:not(.is-mobile) .easy-sync-settings-tab .setting-item-control button:not(.clickable-icon) {
+  min-width: calc(4em + var(--size-4-3) * 2);
+}
+
 /* Dedicated cloud cleanup affordance (route A first slice). */
 .easy-sync-plugin-cloud-cleanup-trigger {
   color: var(--text-error);
@@ -1451,4 +1461,89 @@ body.is-mobile .easy-sync-device-actions button {
 /* Undo affordance for a queued manager toggle (2026-09-09 反悔拍板). */
 .easy-sync-plugin-queued-cancel {
   color: var(--text-muted);
+}
+
+/* Passive transfer-rate indicator: signal icon plus the slowest measured
+   direction. Desktop renders it as a panel-footer band at the bottom right;
+   mobile renders a fixed chip just above the host bottom action bar. Both
+   carriers share the same color treatment: normal text color, with orange
+   and red reserved for slow and dead links (用户拍板：不再有绿色档). */
+.easy-sync-transfer-rate {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: var(--text-normal);
+  font-size: var(--font-ui-smaller);
+}
+
+.easy-sync-transfer-rate.is-panel-footer {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  flex: 0 0 auto;
+  justify-content: flex-end;
+  padding: 3px var(--size-4-2);
+  /* Same treatment as the mobile chip (用户拍板：双端同步、纯透明底). */
+  background: transparent;
+}
+
+/* Mobile: a compact fixed chip pinned just above the host bottom action
+   bar (the `bottom` offset is set from JS, measured against the real
+   buttons row; the CSS value is only the pre-measurement fallback). Auto
+   width, single line — a thin pill in the corner, never a full-width mask
+   over the scrolling list. */
+body.is-mobile .easy-sync-transfer-rate.is-mobile-footer.is-hidden {
+  display: none;
+}
+
+/* Before the first successful JS anchor the chip stays invisible but keeps
+   its box (visibility, not display) so the anchor math can still measure
+   its height — otherwise it would flash at the fallback position. */
+body.is-mobile .easy-sync-transfer-rate.is-mobile-footer.is-anchor-pending {
+  visibility: hidden;
+}
+
+body.is-mobile .easy-sync-transfer-rate.is-mobile-footer {
+  position: fixed;
+  right: var(--size-4-2);
+  top: var(--transfer-rate-top, auto);
+  bottom: auto;
+  z-index: 1;
+  display: inline-flex;
+  /* !important: the host gives the view-content's last child a large
+     bottom clearance on phones (Obsidian 1.13.7), which previously turned
+     this chip into a ~120px tall block. Color is deliberately NOT set here:
+     the is-low/zero level rules own it (they would otherwise lose to this
+     higher-specificity rule and the chip would stay gray). */
+  padding: 2px var(--size-4-2) 2px !important;
+  border-radius: var(--radius-s);
+  white-space: nowrap;
+  background: transparent;
+  font-size: var(--font-ui-smaller);
+}
+
+.easy-sync-transfer-rate-icon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+}
+.easy-sync-transfer-rate-icon svg {
+  width: 14px;
+  height: 14px;
+}
+.easy-sync-transfer-rate-value {
+  white-space: nowrap;
+}
+/* Color is warning-only: healthy and usable speeds read as normal text
+   (the signal icon's shape still carries the level), orange = slow,
+   red = nothing came through (用户拍板 2026-09-13). */
+.easy-sync-transfer-rate.is-low {
+  color: var(--color-orange);
+}
+.easy-sync-transfer-rate.is-zero {
+  color: var(--color-red);
 }

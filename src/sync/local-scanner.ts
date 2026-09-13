@@ -215,6 +215,21 @@ function isBinary(content: ArrayBuffer): boolean {
   return false;
 }
 
+/** File-name-level default exclusions that apply anywhere in the vault.
+ *  Office owner/lock files (~$report.docx) exist only while the document is
+ *  open and vanish on close, so syncing them produces upload/delete churn;
+ *  .DS_Store / Thumbs.db / *.tmp are the same class of OS noise. Unlike
+ *  excludePaths (full-path prefixes) these match the basename in every
+ *  directory. Directories are intentionally not affected. */
+const DEFAULT_EXCLUDED_FILE_BASENAMES = new Set([".ds_store", "thumbs.db"]);
+
+export function isDefaultExcludedFileName(fileName: string): boolean {
+  const name = fileName.toLowerCase();
+  if (name.startsWith("~$")) return true;
+  if (name.endsWith(".tmp")) return true;
+  return DEFAULT_EXCLUDED_FILE_BASENAMES.has(name);
+}
+
 /** Check if a path should be excluded based on config.
  *  includePaths override excludePaths — a path matching any includePath is never excluded,
  *  except for plugin data.json files which would cause self-referential sync writes. */
@@ -269,6 +284,7 @@ function isExcluded(path: string, config: ScanConfig, configDir: string, pluginI
   for (const prefix of config.excludePaths) {
     if (path.startsWith(prefix)) return true;
   }
+  if (isDefaultExcludedFileName(path.slice(path.lastIndexOf("/") + 1))) return true;
   return false;
 }
 
@@ -762,8 +778,11 @@ export class LocalScanner {
         continue;
       }
 
-      // P0: reuse cached hash when mtime and size are unchanged
-      const cached = this.cacheProbe(path, stat.mtime ?? 0, stat.size);
+      // A zero stat size is not probe-trusted: a persisted cache entry may
+      // pin size 0 for non-empty bytes (fresh-file quirk), so read fresh.
+      const cached = stat.size === 0
+        ? null
+        : this.cacheProbe(path, stat.mtime ?? 0, stat.size);
       if (cached) {
         entries.push({
           path,
@@ -788,9 +807,14 @@ export class LocalScanner {
 
       const hash = await sha256Hex(content);
       const quickXorHash = quickXorHashBase64(content);
-      const binary = stat.size > 0 ? isBinary(content) : false;
-      entries.push({ path, size: stat.size, mtime: stat.mtime ?? 0, hash, quickXorHash, binary });
-      this.cacheSet(path, stat.mtime ?? 0, stat.size, hash, quickXorHash, binary);
+      const size = resolveScannedFileSize(stat.size, content.byteLength);
+      if (size > this.config.maxFileSize) {
+        skippedLarge.push(path);
+        continue;
+      }
+      const binary = size > 0 ? isBinary(content) : false;
+      entries.push({ path, size, mtime: stat.mtime ?? 0, hash, quickXorHash, binary });
+      this.cacheSet(path, stat.mtime ?? 0, size, hash, quickXorHash, binary);
 
       // P1: yield to UI thread every N files (per Obsidian performance docs)
       if (++fileCount % SCAN_SLEEP_EVERY === 0) await sleep(0);
@@ -923,7 +947,10 @@ export class LocalScanner {
       return;
     }
 
-    const cached = this.cacheProbe(filePath, stat.mtime ?? 0, stat.size);
+    // A zero stat size is not probe-trusted (fresh-file quirk): read fresh.
+    const cached = stat.size === 0
+      ? null
+      : this.cacheProbe(filePath, stat.mtime ?? 0, stat.size);
     if (cached) {
       entries.push({
         path: filePath,
@@ -946,16 +973,21 @@ export class LocalScanner {
 
     const hash = await sha256Hex(content);
     const quickXorHash = quickXorHashBase64(content);
-    const binary = stat.size > 0 ? isBinary(content) : false;
+    const size = resolveScannedFileSize(stat.size, content.byteLength);
+    if (size > this.config.maxFileSize) {
+      skippedLarge.push(filePath);
+      return;
+    }
+    const binary = size > 0 ? isBinary(content) : false;
     entries.push({
       path: filePath,
-      size: stat.size,
+      size,
       mtime: stat.mtime ?? 0,
       hash,
       quickXorHash,
       binary,
     });
-    this.cacheSet(filePath, stat.mtime ?? 0, stat.size, hash, quickXorHash, binary);
+    this.cacheSet(filePath, stat.mtime ?? 0, size, hash, quickXorHash, binary);
   }
 
   /** Recursively list and scan files under `dirPath` via vault.adapter.
@@ -1042,7 +1074,10 @@ export class LocalScanner {
         continue;
       }
 
-      const cached = this.cacheProbe(path, stat.mtime ?? 0, stat.size);
+      // A zero stat size is not probe-trusted (fresh-file quirk): read fresh.
+      const cached = stat.size === 0
+        ? null
+        : this.cacheProbe(path, stat.mtime ?? 0, stat.size);
       if (cached) {
         entries.push({
           path,
@@ -1065,9 +1100,14 @@ export class LocalScanner {
 
       const hash = await sha256Hex(content);
       const quickXorHash = quickXorHashBase64(content);
-      const binary = stat.size > 0 ? isBinary(content) : false;
-      entries.push({ path, size: stat.size, mtime: stat.mtime ?? 0, hash, quickXorHash, binary });
-      this.cacheSet(path, stat.mtime ?? 0, stat.size, hash, quickXorHash, binary);
+      const size = resolveScannedFileSize(stat.size, content.byteLength);
+      if (size > this.config.maxFileSize) {
+        skippedLarge.push(path);
+        continue;
+      }
+      const binary = size > 0 ? isBinary(content) : false;
+      entries.push({ path, size, mtime: stat.mtime ?? 0, hash, quickXorHash, binary });
+      this.cacheSet(path, stat.mtime ?? 0, size, hash, quickXorHash, binary);
     }
 
     for (const sub of listed.folders) {
@@ -1166,12 +1206,16 @@ export class LocalScanner {
 
     const hash = await sha256Hex(content);
     const quickXorHash = quickXorHashBase64(content);
-    const binary = stat.size > 0 ? isBinary(content) : false;
+    const size = resolveScannedFileSize(stat.size, content.byteLength);
+    if (size > this.config.maxFileSize) {
+      return { status: "uncertain", reason: "too-large" };
+    }
+    const binary = size > 0 ? isBinary(content) : false;
     return {
       status: "present",
       entry: {
         path,
-        size: stat.size,
+        size,
         mtime: stat.mtime ?? 0,
         hash,
         quickXorHash,
@@ -1184,6 +1228,21 @@ export class LocalScanner {
 function normalizeListedPath(base: string, entry: string): string {
   const normalized = entry.replace(/\/+$/, "");
   return normalized.startsWith(`${base}/`) ? normalized : `${base}/${normalized}`;
+}
+
+/**
+ * Entry size must describe the same bytes the hash was taken from. Android
+ * can report stat.size 0 for a file written moments ago while readBinary
+ * already returns the full bytes; trusting stat there produces an entry of
+ * {size 0, hash of full content}, which the upload receipt gate later
+ * rejects — the plugin's own successful receipt becomes unrecordable and
+ * the mutation ledger blocks (2026-09-13 mobile incident, diagnostic report
+ * 142823). A genuinely empty file reads back empty, so only the non-empty
+ * divergence is corrected; any stat/content disagreement with stat.size > 0
+ * stays guarded by the transfer-time hash check.
+ */
+function resolveScannedFileSize(statSize: number, contentByteLength: number): number {
+  return statSize === 0 && contentByteLength > 0 ? contentByteLength : statSize;
 }
 
 function addParentFolderPaths(filePath: string, target: Set<string>): void {

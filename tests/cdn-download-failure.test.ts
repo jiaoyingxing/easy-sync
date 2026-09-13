@@ -24,6 +24,8 @@ describe("classifyCdnDownloadFailure", () => {
     "getaddrinfo EAI_AGAIN my.microsoftpersonalcontent.com",
     "queryA ENODATA my.microsoftpersonalcontent.com",
     "name not resolved",
+    "net::ERR_NAME_NOT_RESOLVED",
+    "net::ERR_NAME_RESOLUTION_FAILED",
   ])("classifies DNS-style messages as dns (%s)", (message) => {
     expect(classifyCdnDownloadFailure(new Error(message))).toBe("dns");
     expect(classifyCdnDownloadFailure({ message })).toBe("dns");
@@ -34,6 +36,8 @@ describe("classifyCdnDownloadFailure", () => {
     "unable to verify the first certificate",
     "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
     "self-signed certificate in certificate chain",
+    "net::ERR_SSL_PROTOCOL_ERROR",
+    "net::ERR_CERT_AUTHORITY_INVALID",
   ])("classifies TLS-style messages as tls (%s)", (message) => {
     expect(classifyCdnDownloadFailure(new Error(message))).toBe("tls");
   });
@@ -44,8 +48,17 @@ describe("classifyCdnDownloadFailure", () => {
     "connect ENETUNREACH 1.2.3.4:443",
     "socket hang up with connection reset",
     "connect EHOSTUNREACH",
+    "net::ERR_CONNECTION_RESET",
+    "net::ERR_CONNECTION_REFUSED",
+    "net::ERR_ADDRESS_UNREACHABLE",
+    "net::ERR_QUIC_PROTOCOL_ERROR",
   ])("classifies TCP-style messages as tcp (%s)", (message) => {
     expect(classifyCdnDownloadFailure(new Error(message))).toBe("tcp");
+  });
+
+  it("lands a Chromium connect timeout in the tcp layer, not timeout", () => {
+    expect(classifyCdnDownloadFailure(new Error("net::ERR_CONNECTION_TIMED_OUT")))
+      .toBe("tcp");
   });
 
   it.each([
@@ -53,6 +66,7 @@ describe("classifyCdnDownloadFailure", () => {
     "ESOCKETTIMEDOUT",
     "request timed out",
     "timeout of 8000ms exceeded",
+    "net::ERR_TIMED_OUT",
   ])("classifies timeout-style messages as timeout (%s)", (message) => {
     expect(classifyCdnDownloadFailure(new Error(message))).toBe("timeout");
   });
@@ -62,6 +76,9 @@ describe("classifyCdnDownloadFailure", () => {
       new Error("socket closed before response"),
     )).toBe("unknown");
     expect(classifyCdnDownloadFailure({ status: 0, message: "transport result unknown" }))
+      .toBe("unknown");
+    // Chromium names outside the layer vocabulary stay unknown rather than guessed.
+    expect(classifyCdnDownloadFailure(new Error("net::ERR_BLOCKED_BY_CLIENT")))
       .toBe("unknown");
   });
 });

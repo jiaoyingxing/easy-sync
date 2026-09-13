@@ -149,11 +149,19 @@ function segmentOf(el: FakeStatusBarElement): FakeStatusBarElement {
   return el.children[0];
 }
 
+/** `updateStatusBar()` coalesces per animation frame (2026-09-11, same model
+ *  as the sidebar render and the sync Notice); assertions run one frame later.
+ *  compatRequestAnimationFrame falls back to a ~16ms timer outside a host. */
+function flushStatusBarFrame(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 30));
+}
+
 describe("updateStatusBar item structure", () => {
-  it("renders icon-only segment > icon container (no text span) for the ready state", () => {
+  it("renders icon-only segment > icon container (no text span) for the ready state", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     plugin.updateStatusBar();
+    await flushStatusBarFrame();
 
     expect(el.classes.has("is-ready")).toBe(true);
     expect(IS_GROUP_CLASSES.filter((c) => c !== "is-ready" && el.classes.has(c))).toEqual([]);
@@ -166,11 +174,12 @@ describe("updateStatusBar item structure", () => {
     expect(segment.children[0].tag).toBe("div");
   });
 
-  it("carries the last sync time as the aria-label (status full text, no EasySync: prefix)", () => {
+  it("carries the last sync time as the aria-label (status full text, no EasySync: prefix)", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     (plugin.state as never as { lastSyncTime: number }).lastSyncTime = 1;
     plugin.updateStatusBar();
+    await flushStatusBarFrame();
 
     expect(el.classes.has("is-ready")).toBe(true);
     expect(el.attrs["aria-label"]).toMatch(/^上次同步 /);
@@ -179,7 +188,7 @@ describe("updateStatusBar item structure", () => {
     expect(segmentOf(el).children).toHaveLength(1);
   });
 
-  it("maps a retry-pending latest round to the connecting form while the device reports a network", () => {
+  it("maps a retry-pending latest round to the connecting form while the device reports a network", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     (plugin.state as never as { lastSyncTime: number }).lastSyncTime = 1;
@@ -187,6 +196,7 @@ describe("updateStatusBar item structure", () => {
       { id: "1", status: "retry-pending" },
     ];
     plugin.updateStatusBar();
+    await flushStatusBarFrame();
 
     // No network claim while the system flag does not say offline: the only
     // known fact is "the cloud was not readable" — the neutral connecting
@@ -197,7 +207,7 @@ describe("updateStatusBar item structure", () => {
     expect(segmentOf(el).children).toHaveLength(1);
   });
 
-  it("keeps the offline group for a retry-pending round when the system reports the device offline", () => {
+  it("keeps the offline group for a retry-pending round when the system reports the device offline", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     (plugin.state as never as { lastSyncTime: number }).lastSyncTime = 1;
@@ -207,6 +217,8 @@ describe("updateStatusBar item structure", () => {
     vi.stubGlobal("navigator", { onLine: false });
     try {
       plugin.updateStatusBar();
+      // The frame callback reads the system flag, so the stub must cover it.
+      await flushStatusBarFrame();
     } finally {
       vi.unstubAllGlobals();
     }
@@ -218,11 +230,12 @@ describe("updateStatusBar item structure", () => {
     expect(segmentOf(el).children).toHaveLength(1);
   });
 
-  it("maps the syncing branch to the syncing group with the rotating class", () => {
+  it("maps the syncing branch to the syncing group with the rotating class", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     plugin.syncExecutor = { isRunning: true, hasSideActionsInFlight: false } as never;
     plugin.updateStatusBar();
+    await flushStatusBarFrame();
 
     expect(el.classes.has("is-syncing")).toBe(true);
     expect(IS_GROUP_CLASSES.filter((c) => c !== "is-syncing" && el.classes.has(c))).toEqual([]);
@@ -231,12 +244,13 @@ describe("updateStatusBar item structure", () => {
     expect(RIBBON_STATUS_ICONS.syncing).toBe("refresh-cw");
   });
 
-  it("maps attention branches (conflicts / deletes / plan review) to the attention group", () => {
+  it("maps attention branches (conflicts / deletes / plan review) to the attention group", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     (plugin.state as never as { pendingConflicts: unknown[] }).pendingConflicts =
       [{}, {}];
     plugin.updateStatusBar();
+    await flushStatusBarFrame();
 
     expect(el.classes.has("is-attention")).toBe(true);
     expect(el.classes.has("is-syncing")).toBe(false);
@@ -244,7 +258,7 @@ describe("updateStatusBar item structure", () => {
     expect(segmentOf(el).children).toHaveLength(1);
   });
 
-  it("carries the compound status full text (conflicts · deletes) into the aria-label", () => {
+  it("carries the compound status full text (conflicts · deletes) into the aria-label", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     (plugin.state as never as { pendingConflicts: unknown[] }).pendingConflicts =
@@ -252,13 +266,14 @@ describe("updateStatusBar item structure", () => {
     (plugin.state as never as { pendingRemoteDeletes: unknown[] }).pendingRemoteDeletes =
       [{}, {}];
     plugin.updateStatusBar();
+    await flushStatusBarFrame();
 
     expect(el.classes.has("is-attention")).toBe(true);
     expect(el.attrs["aria-label"]).toBe("3 冲突 · 2 待删");
     expect(segmentOf(el).children).toHaveLength(1);
   });
 
-  it("maps the not-logged-in branch to the loggedOut group", () => {
+  it("maps the not-logged-in branch to the loggedOut group", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     (plugin as never as { auth: unknown }).auth = {
@@ -266,6 +281,7 @@ describe("updateStatusBar item structure", () => {
       authState: { isLoggedIn: false },
     };
     plugin.updateStatusBar();
+    await flushStatusBarFrame();
 
     expect(el.classes.has("is-loggedOut")).toBe(true);
     expect(el.attrs["aria-label"]).toBe("未登录");
@@ -273,7 +289,7 @@ describe("updateStatusBar item structure", () => {
     expect(RIBBON_STATUS_ICONS.loggedOut).toBe("cloud-off");
   });
 
-  it("keeps the connecting branch neutral (plain cloud, no group class, no red)", () => {
+  it("keeps the connecting branch neutral (plain cloud, no group class, no red)", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     (plugin as never as { auth: unknown }).auth = {
@@ -281,6 +297,7 @@ describe("updateStatusBar item structure", () => {
       authState: { isLoggedIn: false },
     };
     plugin.updateStatusBar();
+    await flushStatusBarFrame();
 
     // Contract: 连接中不红 → the fixed CSS rules only color `.is-*` classes,
     // so the branch carries no group class at all.
@@ -289,12 +306,13 @@ describe("updateStatusBar item structure", () => {
     expect(segmentOf(el).children).toHaveLength(1);
   });
 
-  it("resets a stale group class when re-rendering into the connecting branch", () => {
+  it("resets a stale group class when re-rendering into the connecting branch", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     (plugin.state as never as { pendingConflicts: unknown[] }).pendingConflicts =
       [{}, {}];
     plugin.updateStatusBar();
+    await flushStatusBarFrame();
     expect(el.classes.has("is-attention")).toBe(true);
 
     (plugin as never as { auth: unknown }).auth = {
@@ -302,20 +320,23 @@ describe("updateStatusBar item structure", () => {
       authState: { isLoggedIn: false },
     };
     plugin.updateStatusBar();
+    await flushStatusBarFrame();
     expect(IS_GROUP_CLASSES.filter((c) => el.classes.has(c))).toEqual([]);
   });
 
-  it("swaps the group class when re-rendering into another state (remove-all then add)", () => {
+  it("swaps the group class when re-rendering into another state (remove-all then add)", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
     (plugin.state as never as { pendingConflicts: unknown[] }).pendingConflicts =
       [{}, {}];
     plugin.updateStatusBar();
+    await flushStatusBarFrame();
     expect(el.classes.has("is-attention")).toBe(true);
 
     (plugin.state as never as { pendingConflicts: unknown[] }).pendingConflicts =
       [];
     plugin.updateStatusBar();
+    await flushStatusBarFrame();
     expect(el.classes.has("is-ready")).toBe(true);
     expect(el.classes.has("is-attention")).toBe(false);
   });

@@ -36,6 +36,7 @@ import {
   public113IndexedDbDatabaseName,
 } from "./sync/indexeddb-public-1-1-3-state";
 import { StateV2IndexedDbActiveStore } from "./sync/state-v2-indexeddb-active";
+import { detectVaultCloudClientEnvironment } from "./sync/cloud-client-environment";
 import {
   IndexedDbRemoteScopeRecoveryEvidenceStore,
 } from "./sync/remote-scope-recovery-evidence-store";
@@ -151,6 +152,14 @@ import {
   summarizeCommunityPluginSync,
   summarizeMutationRecovery,
 } from "./sync/diagnostic-report-evidence";
+import {
+  deriveTransferRateFacts,
+  formatTransferRate,
+  transferDirectionKBps,
+  TransferRateSampler,
+  type TransferRateFactsV1,
+  type TransferRateReading,
+} from "./sync/transfer-rate";
 import {
   DEFAULT_AUTOMATIC_HANDLING_POLICY,
   readAutomaticHandlingPolicy,
@@ -564,6 +573,11 @@ export default class EasySyncPlugin extends Plugin {
   noticeCenter: EasySyncNoticeCenter = new EasySyncNoticeCenter();
   i18n: I18n = new I18n("en");
   diag: DiagnosticLogger = new DiagnosticLogger();
+  // Connection-speed reading: session-local EWMA over real transferred
+  // bytes, reseeded once from the persisted raw window on first read.
+  private transferRateSampler = new TransferRateSampler();
+  private transferRateSamplerSeeded = false;
+  private transferRateRunWasActive = false;
 
   // M14: single serialized write queue for PluginData — prevents
   // StateManager.save() / saveSyncSettings() / auth profile writes
@@ -595,6 +609,7 @@ export default class EasySyncPlugin extends Plugin {
   autoSyncPaused = false;
   notificationPopups: EasySyncNotificationPopupsLevel = "all";
   private opLock: string | null = null;
+  private vaultCloudClientNoticeShown = false;
   private deferredSettingsMutations: Array<{
     started: boolean;
     cancelled: boolean;
@@ -624,6 +639,7 @@ export default class EasySyncPlugin extends Plugin {
   private v2StateReloadAttempts = 0;
   private v2StateReloadRetryTimer: TimeoutHandle | null = null;
   private statusBarEl: HTMLElement | null = null;
+  private statusBarFrame: AnimationFrameHandle | null = null;
   private ribbonEl: HTMLElement | null = null;
   private ribbonSuccessTimer: TimeoutHandle | null = null;
   private ribbonSuccessVisible = false;
@@ -1110,6 +1126,8 @@ export default class EasySyncPlugin extends Plugin {
     this.cancelDescendantFileReconstructionContinuation();
     compatClearTimeout(this.ribbonSuccessTimer);
     compatCancelAnimationFrame(this.syncNoticeFrame);
+    compatCancelAnimationFrame(this.statusBarFrame);
+    this.statusBarFrame = null;
     this.noticeCenter.dispose();
     void this.state?.close().catch(() => undefined);
     void this.diag.dispose().catch(() => undefined);
@@ -1695,6 +1713,42 @@ export default class EasySyncPlugin extends Plugin {
     };
   }
 
+  /**
+   * Warn once per session when the vault sits inside a desktop cloud client's
+   * sync folder. The client edits, locks and rolls back vault files behind
+   * the plugin's back — the failure shape behind repeated "state cannot be
+   * loaded safely" deadlocks and failed resets. Detection is pure string
+   * classification and must never interfere with the sync it precedes.
+   */
+  private showVaultCloudClientWarningOnce(): void {
+    if (this.vaultCloudClientNoticeShown) return;
+    this.vaultCloudClientNoticeShown = true;
+    try {
+      const detection = detectVaultCloudClientEnvironment(this.app.vault);
+      if (!detection.detected || !detection.service) return;
+      this.diag.log(
+        "state",
+        "vault located inside a cloud client sync folder",
+        { service: detection.service, signature: detection.signature },
+      );
+      this.noticeCenter.show({
+        key: "vault-cloud-client-warning",
+        message: this.i18n.t(
+          `notice.vaultCloudClient.${detection.service}`,
+        ),
+        priority: NOTICE_PRIORITY.attention,
+        durationMs: 10_000,
+        category: "safety",
+      });
+    } catch (error) {
+      this.diag.warn(
+        "state",
+        "vault cloud client detection failed",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
   private async dispatchSyncRun(request: {
     mode: SyncMode;
     skipConfirmation?: boolean;
@@ -1705,6 +1759,7 @@ export default class EasySyncPlugin extends Plugin {
     resultOwner?: "sync" | "reset";
   }): Promise<SyncResult | null> {
     if (!this.syncExecutor) return null;
+    this.showVaultCloudClientWarningOnce();
     await this.preparePublic113MigrationSettings(request.options);
     if (request.options?.recoveryOnly !== true) {
       await this.reconcileCommunityPluginParticipationFromLocalBundles({
@@ -2230,7 +2285,10 @@ export default class EasySyncPlugin extends Plugin {
    *  executor sends the replacement plan back through the normal alert path. */
   async executePlanReview(expectedRevision?: number): Promise<void> {
     if (!this.syncExecutor || !this.state) return;
-    if (this.acquireOpLock("sync")) return;
+    if (this.acquireOpLock("sync")) {
+      this.showSyncBusyHint();
+      return;
+    }
     try {
     await this.ensureStateLoaded();
     if (
@@ -2464,7 +2522,10 @@ export default class EasySyncPlugin extends Plugin {
   /** Start a first sync (manual trigger from settings) */
   async startFirstSync(options: SyncRunOptions = {}): Promise<void> {
     if (!this.syncExecutor) return;
-    if (this.acquireOpLock("sync")) return;
+    if (this.acquireOpLock("sync")) {
+      this.showSyncBusyHint();
+      return;
+    }
     try {
     await this.ensureStateLoaded();
     if (await this.dispatchV2StateLoadBlockIfPresent(
@@ -2495,6 +2556,18 @@ export default class EasySyncPlugin extends Plugin {
     }
   }
 
+  /** One-shot feedback for sync-entry clicks while sync work already holds
+   *  the operation lock; reuses the executor's own "already running" phrase.
+   *  Feedback category (no explicit category) shows at every popups level. */
+  private showSyncBusyHint(): void {
+    this.noticeCenter?.show({
+      key: "sync-busy-hint",
+      message: this.i18n.t("result.alreadyRunning"),
+      priority: NOTICE_PRIORITY.action,
+      durationMs: 2_000,
+    });
+  }
+
   /** Start a manual sync */
   async startManualSync(): Promise<void> {
     if (!this.syncExecutor) return;
@@ -2502,7 +2575,13 @@ export default class EasySyncPlugin extends Plugin {
       await this.startFirstSync();
       return;
     }
-    if (this.acquireOpLock("sync")) return;
+    if (this.acquireOpLock("sync")) {
+      // A run (or other sync work) is already in flight. Ribbon / command
+      // entries give no other signal, so surface one-shot feedback instead of
+      // a silent return; same key updates in place on repeated clicks.
+      this.showSyncBusyHint();
+      return;
+    }
     try {
     await this.ensureStateLoaded();
     if (await this.dispatchV2StateLoadBlockIfPresent(
@@ -2910,6 +2989,11 @@ export default class EasySyncPlugin extends Plugin {
       fileSize,
     });
     this.scheduleSyncNoticeUpdate();
+    // Surface the completed row immediately: the next onProgress only fires
+    // when the following item starts, so without this the completed rows —
+    // and the last one in particular — would wait until round end.
+    // render() coalesces per frame, same as handleFileProgress.
+    this.syncView?.render();
   }
 
   async cancelSync(): Promise<void> {
@@ -3077,6 +3161,27 @@ export default class EasySyncPlugin extends Plugin {
         message: this.i18n.t("settings.reset.done"),
         priority: NOTICE_PRIORITY.action,
       });
+      const leftoverDirectories =
+        this.state?.lastResetLeftoverDirectories ?? [];
+      if (leftoverDirectories.length === 1) {
+        this.noticeCenter.show({
+          key: "reset-leftover-directories",
+          message: this.i18n.t("settings.reset.leftoverDirectoryOne", {
+            directory: leftoverDirectories[0],
+          }),
+          priority: NOTICE_PRIORITY.attention,
+          durationMs: 15_000,
+        });
+      } else if (leftoverDirectories.length > 1) {
+        this.noticeCenter.show({
+          key: "reset-leftover-directories",
+          message: this.i18n.t("settings.reset.leftoverDirectoryMany", {
+            count: leftoverDirectories.length,
+          }),
+          priority: NOTICE_PRIORITY.attention,
+          durationMs: 15_000,
+        });
+      }
       this.updateStatusBar();
       this.syncView?.render();
     } finally {
@@ -3418,12 +3523,19 @@ export default class EasySyncPlugin extends Plugin {
     // keeps syncing (user decision 2026-09-01, docs/temp/20260901-221059).
     const identityBlockedOnly = (result.identityBlockedErrors ?? 0) > 0
       && (result.identityBlockedErrors ?? 0) === result.errors;
+    // M17 breaker deferrals keep auto sync alive: the deferred item is the
+    // breaker protecting the round (its own message promises "自动同步将约每
+    // 15 分钟重试一次"), so a round whose only errors are breaker deferrals
+    // must not pause auto sync — same shape as identityBlockedOnly and the
+    // 2026-09-01 conflicts decision.
+    const breakerDeferredOnly = (result.breakerDeferredErrors ?? 0) > 0
+      && (result.breakerDeferredErrors ?? 0) === result.errors;
     const pauseAutoSync =
       !retryableMutationRecovery
       && !retryingDescendantFileReconstruction
       && (
-      ((!result.success && !harmlessRejectedRun) && !identityBlockedOnly)
-      || (result.errors > 0 && !identityBlockedOnly)
+      ((!result.success && !harmlessRejectedRun) && !identityBlockedOnly && !breakerDeferredOnly)
+      || (result.errors > 0 && !identityBlockedOnly && !breakerDeferredOnly)
       || result.authExpired
       || this.isCancelled(result)
       || this.isPlanReviewPaused(result)
@@ -3584,6 +3696,14 @@ export default class EasySyncPlugin extends Plugin {
           endedAt,
         )
       : undefined;
+    const transferRateFacts = deriveTransferRateFacts({
+      endedAt,
+      fileTransfers: result.metrics?.fileTransfers,
+    });
+    if (transferRateFacts) {
+      await this.state.pushTransferRateFacts(transferRateFacts);
+      this.transferRateSampler.addRoundFacts(transferRateFacts);
+    }
     try {
       await this.state.addSyncHistory({
         id: `${progress.startedAt}-${endedAt}`,
@@ -3615,6 +3735,7 @@ export default class EasySyncPlugin extends Plugin {
         uploadReadMs: result.metrics?.uploadReadMs,
         uploadNetworkMs: result.metrics?.uploadNetworkMs,
         peakUploads: result.metrics?.peakUploads,
+        transferRates: transferRateFacts ?? undefined,
         recovery: newRecovery ?? priorRecoveryWithoutEntry,
         remoteScopeRecovery: result.remoteScopeRecovery,
         runFacts: result.runFacts
@@ -6551,6 +6672,46 @@ export default class EasySyncPlugin extends Plugin {
     this.startCommunityPluginJoinNow();
   }
 
+  /** Reseed the connection-speed sampler once per session from the persisted
+   *  raw window (history entries only backfill devices whose window predates
+   *  this store). Smoothing state itself is session-local by design. */
+  private ensureTransferRateSamplerSeeded(): void {
+    if (this.transferRateSamplerSeeded) return;
+    this.transferRateSamplerSeeded = true;
+    const state = this.state;
+    if (!state) return;
+    const window = state.transferRatesWindow;
+    this.transferRateSampler.seedFromFacts(
+      window.length > 0
+        ? window
+        : state.syncHistory
+          .map((entry) => entry.transferRates)
+          .filter((facts): facts is TransferRateFactsV1 => facts !== undefined),
+    );
+  }
+
+  /** Fixed-cadence sample of the run in flight; the sidebar calls this once
+   *  a second while open. beginRun rides the run's rising edge so tick
+   *  deltas measure the new run's cumulative counters from zero. */
+  pollTransferRateTick(): void {
+    const executor = this.syncExecutor;
+    const running = executor?.isRunning ?? false;
+    if (running && !this.transferRateRunWasActive) {
+      this.transferRateSampler.beginRun();
+    }
+    this.transferRateRunWasActive = running;
+    if (!running || !executor) return;
+    const snapshot = executor.getActiveTransferMetrics();
+    if (snapshot) this.transferRateSampler.sampleRunTick(snapshot, Date.now());
+  }
+
+  /** Passive connection-speed reading (EWMA over real transferred bytes —
+   *  no probe requests). Null until the first transfer sample exists. */
+  getTransferRateReading(): TransferRateReading | null {
+    this.ensureTransferRateSamplerSeeded();
+    return this.transferRateSampler.getReading();
+  }
+
   /**
    * Pending new-plugin rows for the sidebar. Only returned while the
    * community-plugin files scope is on; the persisted memory itself stays
@@ -7634,6 +7795,39 @@ export default class EasySyncPlugin extends Plugin {
     lines.push(`**社区插件策略指纹**: ${communityPluginSummary.policyFingerprint}`);
     lines.push("");
 
+    const diagAll = await this.diag.snapshot(500);
+    lines.push("## 云客户端同步环境");
+    lines.push("");
+    const cloudEnvironment = detectVaultCloudClientEnvironment(this.app.vault);
+    if (!cloudEnvironment.assessable) {
+      lines.push("**仓库位置**: 移动端无法判定（平台不提供仓库本地路径）");
+    } else if (cloudEnvironment.detected && cloudEnvironment.service) {
+      const serviceName =
+        cloudEnvironment.service === "onedrive" ? "OneDrive 客户端" : "iCloud";
+      lines.push(
+        `**仓库位置**: 位于 ${serviceName}同步范围内（命中签名：${cloudEnvironment.signature}）`,
+      );
+      lines.push(`**风险**: ${serviceName}正在同步本仓库，与 EasySync 必然冲突，会导致同步反复失败、状态加载受阻或重置不完整。请移出仓库，确保 EasySync 是本仓库唯一的同步工具。`);
+    } else {
+      lines.push("**仓库位置**: 未命中 OneDrive/iCloud 客户端同步目录签名");
+    }
+    const lockErrorPattern = /\b(?:EPERM|EBUSY|EACCES|ENOTEMPTY)\b/;
+    const journalIntegrityPattern =
+      /already contains different bytes|blocks delta retirement|record digest does not match/;
+    const journalIntegrityCount = diagAll.filter((e) =>
+      (e.lvl === "warn" || e.lvl === "error")
+      && journalIntegrityPattern.test(e.msg)
+    ).length;
+    const lockErrorCount = diagAll.filter((e) =>
+      (e.lvl === "warn" || e.lvl === "error")
+      && (lockErrorPattern.test(e.msg)
+        || (e.data !== undefined
+          && lockErrorPattern.test(JSON.stringify(e.data))))
+    ).length;
+    lines.push(`**账本完整性异常（近期 500 条日志内）**: ${journalIntegrityCount === 0 ? "无" : `${journalIntegrityCount} 条（可能由云客户端改动状态文件引起）`}`);
+    lines.push(`**本机文件锁错误（近期 500 条日志内）**: ${lockErrorCount === 0 ? "无" : `${lockErrorCount} 条`}`);
+    lines.push("");
+
     const remoteScopeRecoverySummary =
       this.progressStore.state.recoveryVerification
       ?? reportState?.syncHistory.find(
@@ -7709,6 +7903,34 @@ export default class EasySyncPlugin extends Plugin {
       lines.push("");
     }
 
+    // ── Passive connection-speed readings from recent runs ──
+    // Derived from bytes real transfers already moved; no probe requests.
+    const rateEntries = history.filter((h) => h.transferRates).slice(0, 10);
+    if (rateEntries.length > 0) {
+      lines.push("## 连接速度（被动实测）");
+      lines.push("");
+      const reading = this.getTransferRateReading();
+      if (reading) {
+        const summaryUpload = this.transferRateSampler.getDirectionKBps("upload");
+        const summaryDownload = this.transferRateSampler.getDirectionKBps("download");
+        lines.push(`**当前读数**：上传 ${summaryUpload !== null ? formatTransferRate(summaryUpload) : "—"} · 下载 ${summaryDownload !== null ? formatTransferRate(summaryDownload) : "—"}`);
+        lines.push("");
+      }
+      lines.push("读数来自同步本身已传输的字节（不含清单与规划耗时），不发起任何额外请求；读数为近期样本的指数平滑（传输中每秒采样、轮末并入轮次读数，近期样本权重更高），持久账本仍保留最近 3 个有传输轮次的原始字节/耗时（供重载恢复与本表）。空轮（本轮没有文件变更）不产生吞吐读数——没有字节就没有速度可测，其网络耗时见「近期同步记录」的耗时列。");
+      lines.push("");
+      lines.push("| 时间 | 上传 | 下载 |");
+      lines.push("|------|------|------|");
+      for (const h of rateEntries) {
+        const rates = h.transferRates!;
+        const uploadKBps = transferDirectionKBps(rates, "upload");
+        const downloadKBps = transferDirectionKBps(rates, "download");
+        lines.push(`| ${fmt(h.startedAt)} | ${uploadKBps !== null ? formatTransferRate(uploadKBps) : "—"} | ${downloadKBps !== null ? formatTransferRate(downloadKBps) : "—"} |`);
+      }
+      lines.push("");
+      lines.push("档位：低 <64 KB/s · 中 64 KB/s–1 MB/s · 高 ≥1 MB/s（阈值按真实慢链样本校准，可调）");
+      lines.push("");
+    }
+
     // ── Pending Issues ──
     const issues = this.state?.pendingIssues ?? [];
     const conflicts = this.state?.pendingConflicts ?? [];
@@ -7779,7 +8001,6 @@ export default class EasySyncPlugin extends Plugin {
     lines.push("");
 
     // ── Recent Diagnostic Anomalies (from disk logs) ──
-    const diagAll = await this.diag.snapshot(500);
     const latestAutomaticHandlingSummary = findLatestAutomaticHandlingSummary(diagAll);
     const currentRecoverySummary = {
       ...summarizeMutationRecovery(reportState?.mutationLedger ?? []),
@@ -8024,7 +8245,20 @@ export default class EasySyncPlugin extends Plugin {
     el.setAttr("aria-label", text);
   }
 
+  /** Public entry point — merges multiple calls within the same animation
+   *  frame. Progress callbacks fire once per plan item, and each uncoalesced
+   *  run rebuilt the status bar item, the ribbon and (when open) the whole
+   *  settings page; the sidebar and Notice updates already coalesce the same
+   *  way (sync-view `render()`, `syncNoticeFrame`). */
   updateStatusBar(): void {
+    if (this.statusBarFrame !== null) return;
+    this.statusBarFrame = compatRequestAnimationFrame(() => {
+      this.statusBarFrame = null;
+      this.doUpdateStatusBar();
+    });
+  }
+
+  private doUpdateStatusBar(): void {
     this.updateRibbon();
     this.settingsTab?.refreshSyncState();
     if (!this.statusBarEl) return;

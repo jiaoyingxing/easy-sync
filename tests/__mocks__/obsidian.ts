@@ -49,7 +49,17 @@ export interface FileStats {
 export const Platform = {
   isMobile: false,
   isDesktop: true,
+  isDesktopApp: true,
+  isMobileApp: false,
 };
+
+// FileSystemAdapter — desktop vault adapter with an inspectable base path
+export class FileSystemAdapter {
+  constructor(private readonly mockBasePath = "") {}
+  getBasePath(): string {
+    return this.mockBasePath;
+  }
+}
 
 export const requireApiVersion = vi.fn((_version: string) => true);
 
@@ -87,8 +97,17 @@ export class ProgressBarComponent {
 /** Minimal DOM element stub for UI unit tests (no jsdom installed).
  *  Supports the handful of DOM operations EasySync modal code uses. */
 export function createMockElement(): HTMLElement {
+  const classTokens = new Set<string>();
   const element: Record<string, unknown> = {
-    classList: { add: () => undefined, remove: () => undefined },
+    classList: {
+      add: (...tokens: string[]) => {
+        for (const token of tokens) classTokens.add(token);
+      },
+      remove: (...tokens: string[]) => {
+        for (const token of tokens) classTokens.delete(token);
+      },
+      contains: (token: string) => classTokens.has(token),
+    },
     children: [] as unknown[],
     innerHTML: "",
     textContent: "",
@@ -98,9 +117,21 @@ export function createMockElement(): HTMLElement {
     element.children = [];
     return element;
   };
-  element.addClass = (..._tokens: string[]) => element;
-  element.removeClass = (..._tokens: string[]) => element;
-  element.toggleClass = (_token: string, _on?: boolean) => element;
+  // Element-level class helpers share the classList token set, mirroring the
+  // real DOM (Obsidian's addClass writes through to classList).
+  element.addClass = (...tokens: string[]) => {
+    for (const token of tokens) classTokens.add(token);
+    return element;
+  };
+  element.removeClass = (...tokens: string[]) => {
+    for (const token of tokens) classTokens.delete(token);
+    return element;
+  };
+  element.toggleClass = (token: string, on?: boolean) => {
+    if (on === undefined ? !classTokens.has(token) : on) classTokens.add(token);
+    else classTokens.delete(token);
+    return element;
+  };
   element.setAttribute = (_name: string, _value: string) => element;
   element.setText = (_value: string | DocumentFragment) => element;
   element.createDiv = () => createMockElement();
@@ -226,7 +257,7 @@ export class Plugin {
 }
 
 export class PluginSettingTab {
-  containerEl: HTMLElement = document.createElement("div");
+  containerEl: HTMLElement = createMockElement();
 
   constructor(public app: App, public plugin: Plugin) {}
 

@@ -754,7 +754,7 @@ describe("community plugin enablement runtime", () => {
       "testVault",
       mainPath,
       changedMain,
-      undefined,
+      expect.anything(),
       expect.anything(),
       expect.anything(),
     );
@@ -1858,7 +1858,7 @@ describe("community plugin enablement runtime", () => {
       "testVault",
       mainPath,
       expect.any(ArrayBuffer),
-      undefined,
+      expect.anything(),
       undefined,
       undefined,
     );
@@ -1866,7 +1866,7 @@ describe("community plugin enablement runtime", () => {
       "testVault",
       manifestPath,
       expect.any(ArrayBuffer),
-      undefined,
+      expect.anything(),
       undefined,
       undefined,
     );

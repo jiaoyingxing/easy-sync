@@ -1412,6 +1412,126 @@ describe("StateManager batch persistence", () => {
     ]);
   });
 
+  it("keeps accumulating network failures across version changes", async () => {
+    const { state } = makeState();
+
+    await state.reconcilePendingIssues([
+      {
+        path: "plugin.main.js",
+        actionType: SyncActionType.Upload,
+        reason: "network",
+        issueCode: "transfer-network",
+        updatedAt: 1,
+        localHash: "aa".repeat(32),
+        remoteETag: "etag-1",
+        consecutiveFailures: 2,
+      },
+    ], []);
+    await state.reconcilePendingIssues([
+      {
+        path: "plugin.main.js",
+        actionType: SyncActionType.Upload,
+        reason: "network",
+        issueCode: "transfer-network",
+        updatedAt: 2,
+        localHash: "bb".repeat(32),
+        remoteETag: "etag-2",
+        consecutiveFailures: 1,
+      },
+    ], []);
+
+    expect(state.pendingIssues).toEqual([
+      {
+        path: "plugin.main.js",
+        actionType: SyncActionType.Upload,
+        reason: "network",
+        issueCode: "transfer-network",
+        updatedAt: 2,
+        localHash: "bb".repeat(32),
+        remoteETag: "etag-2",
+        consecutiveFailures: 3,
+      },
+    ]);
+  });
+
+  it("resets the counter when a content failure arrives with a changed version", async () => {
+    const { state } = makeState();
+
+    await state.reconcilePendingIssues([
+      {
+        path: "broken.md",
+        actionType: SyncActionType.Upload,
+        reason: "bad content",
+        updatedAt: 1,
+        localHash: "aa".repeat(32),
+        consecutiveFailures: 5,
+      },
+    ], []);
+    await state.reconcilePendingIssues([
+      {
+        path: "broken.md",
+        actionType: SyncActionType.Upload,
+        reason: "bad content",
+        updatedAt: 2,
+        localHash: "bb".repeat(32),
+        consecutiveFailures: 1,
+      },
+    ], []);
+
+    expect(state.pendingIssues).toEqual([
+      {
+        path: "broken.md",
+        actionType: SyncActionType.Upload,
+        reason: "bad content",
+        updatedAt: 2,
+        localHash: "bb".repeat(32),
+        consecutiveFailures: 1,
+      },
+    ]);
+  });
+
+  it("keeps the last real failure time across network breaker deferral rounds", async () => {
+    const { state } = makeState();
+
+    await state.reconcilePendingIssues([
+      {
+        path: "plugin.main.js",
+        actionType: SyncActionType.Upload,
+        reason: "network",
+        issueCode: "transfer-network",
+        updatedAt: 1000,
+        localHash: "aa".repeat(32),
+        remoteETag: "etag-1",
+        consecutiveFailures: 3,
+      },
+    ], []);
+    await state.reconcilePendingIssues([
+      {
+        path: "plugin.main.js",
+        actionType: SyncActionType.RetryLater,
+        reason: "deferral round",
+        issueCode: "transfer-network",
+        updatedAt: 2000,
+        localHash: "aa".repeat(32),
+        remoteETag: "etag-1",
+        consecutiveFailures: 1,
+      },
+    ], []);
+
+    expect(state.pendingIssues).toEqual([
+      {
+        path: "plugin.main.js",
+        actionType: SyncActionType.RetryLater,
+        reason: "deferral round",
+        issueCode: "transfer-network",
+        updatedAt: 1000,
+        localHash: "aa".repeat(32),
+        remoteETag: "etag-1",
+        consecutiveFailures: 4,
+      },
+    ]);
+  });
+
   it("does not count stable user-decision deferrals as transfer failures", async () => {
     const { state } = makeState();
     const issue = {

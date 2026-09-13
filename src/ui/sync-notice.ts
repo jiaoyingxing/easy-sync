@@ -47,6 +47,7 @@ export function shouldSuppressSyncNoticeForVisibleSidebar(input: {
 export type SyncProgressNoticeKind =
   | "starting"
   | "stage"
+  | "verify"
   | "recovery"
   | "progress"
   | "cancelling";
@@ -90,6 +91,12 @@ export function resolveSyncProgressNoticePresentation(
     kind = "starting";
   } else if (recoveryDeterminate) {
     kind = "recovery";
+  } else if (determinate && progress.phase === "verifying") {
+    // Verification is long on first sync / rebuild; the notice is the only
+    // surface without the adjacent item counter, so mirror the executing and
+    // recovery kinds and carry the counts. The sidebar phase phrase stays
+    // count-free on purpose (see sync-view "non-duplicative" contract).
+    kind = "verify";
   } else if (determinate && progress.phase === "executing") {
     kind = "progress";
   }
@@ -138,6 +145,11 @@ export function formatSyncProgressNoticeLabel(
         total: recovery.total,
       });
     }
+    case "verify":
+      return t("notice.sync.verifyProgress", {
+        current: presentation.current,
+        total: presentation.total,
+      });
     case "stage":
       return t("notice.sync.stage", {
         stage: translateSyncActivity(presentation.activity, t),

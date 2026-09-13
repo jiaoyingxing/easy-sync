@@ -2353,6 +2353,54 @@ describe("main sync entry guards", () => {
     expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
   });
 
+  it("gives one-shot busy feedback instead of a silent return on manual sync", async () => {
+    const plugin = makePlugin();
+    const run = vi.fn();
+    plugin.syncExecutor = { isRunning: true, run } as never;
+    plugin.state = { planReviewActive: true } as never;
+    const show = vi.fn();
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+    (plugin as never as { acquireOpLock: (name: string) => string | null })
+      .acquireOpLock("recovery");
+
+    await plugin.startManualSync();
+
+    expect(show).toHaveBeenCalledOnce();
+    expect(show.mock.calls[0]?.[0]).toMatchObject({ key: "sync-busy-hint" });
+    expect(run).not.toHaveBeenCalled();
+    expect((plugin as never as { opLock: string | null }).opLock).toBe("recovery");
+  });
+
+  it("renders the sidebar when a file completes so rows do not lag one item behind", () => {
+    const plugin = makePlugin();
+    const render = vi.fn();
+    vi.spyOn(plugin, "syncView", "get").mockReturnValue({ render } as never);
+
+    (plugin as never as {
+      handleFileComplete: (
+        path: string,
+        actionType: SyncActionType,
+        success: boolean,
+      ) => void;
+    }).handleFileComplete("Notes/A.md", SyncActionType.Upload, true);
+
+    expect(render).toHaveBeenCalledOnce();
+    expect(plugin.progressStore.state.completedFiles).toHaveLength(1);
+  });
+
+  it("coalesces status bar refreshes into one frame", async () => {
+    const plugin = makePlugin();
+    const doUpdate = vi.spyOn(plugin as never, "doUpdateStatusBar")
+      .mockImplementation(() => undefined);
+
+    plugin.updateStatusBar();
+    plugin.updateStatusBar();
+    plugin.updateStatusBar();
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(doUpdate).toHaveBeenCalledOnce();
+  });
+
   it("releases the sync lock when first sync is blocked before execution", async () => {
     const plugin = makePlugin();
     plugin.syncExecutor = { isRunning: false } as never;

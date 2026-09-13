@@ -658,6 +658,62 @@ describe("AuthModule device code flow", () => {
     expect(auth.deviceAttempt?.phase).toBe("waiting");
   });
 
+  it("rejects a devicecode response whose expires_in is not a finite positive number", async () => {
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            device_code: "device-secret-1",
+            user_code: "ABCDEFGHI",
+            verification_uri: "https://microsoft.com/devicelogin",
+            expires_in: "soon-ish",
+          },
+        } as unknown as obsidian.RequestUrlResponse;
+      }
+      throw new Error("unexpected request");
+    });
+
+    await expect(auth.beginDeviceCodeLogin()).rejects.toThrow(/incomplete/i);
+    expect(auth.isPending).toBe(false);
+  });
+
+  it("falls back to the documented poll interval when the provider returns a corrupt interval", async () => {
+    vi.useFakeTimers();
+    const tokenCalls: string[] = [];
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            device_code: "device-secret-1",
+            user_code: "ABCDEFGHI",
+            verification_uri: "https://microsoft.com/devicelogin",
+            expires_in: 900,
+            interval: "fast",
+          },
+        } as unknown as obsidian.RequestUrlResponse;
+      }
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        tokenCalls.push(String(options.body));
+        return pendingTokenResponse() as obsidian.RequestUrlResponse;
+      }
+      throw new Error("unexpected request");
+    });
+
+    await auth.beginDeviceCodeLogin();
+
+    // A corrupt interval must not reach the scheduler as NaN
+    // (Math.max(1000, NaN) would fire the poll immediately); the
+    // documented 5s default must be waited out instead.
+    await vi.advanceTimersByTimeAsync(4999);
+    expect(tokenCalls).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(tokenCalls).toHaveLength(1);
+  });
+
   it("keeps the provider's pre-filled verification URI when it is returned", async () => {
     vi.useFakeTimers();
     const auth = makeAuth(async (options) => {
@@ -1516,5 +1572,56 @@ describe("generateCodeChallengeSync", () => {
     // → base64url without padding = "ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0"
     const result = actual.generateCodeChallengeSync("abc");
     expect(result).toBe("ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0");
+  });
+});
+
+describe("AuthModule token response expires_in handling", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("keeps a refresh whose expires_in is malformed and re-refreshes on the next token need", async () => {
+    let tokenRequests = 0;
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        tokenRequests += 1;
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            access_token: `access-token-${tokenRequests}`,
+            refresh_token: `refresh-token-${tokenRequests}`,
+            expires_in: "malformed",
+          },
+        };
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: { displayName: "Current User", id: "current-account" },
+      };
+    });
+    const secretSet = vi.fn().mockResolvedValue(undefined);
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: secretSet,
+        get: vi.fn().mockResolvedValue("stored-refresh-token"),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+    }));
+
+    const token = await auth.refreshAccessToken("stored-refresh-token");
+    expect(token).toBe("access-token-1");
+    // The rotated refresh token must survive the malformed expiry field.
+    expect(secretSet).toHaveBeenCalledWith(
+      "easy-sync-onedrive-refresh-token",
+      "refresh-token-1",
+    );
+    expect(auth.authState.isLoggedIn).toBe(true);
+
+    // The malformed expires_in reads as already due: the next token need
+    // refreshes again instead of trusting an unknown lifetime forever.
+    await auth.getAccessToken();
+    expect(tokenRequests).toBe(2);
   });
 });

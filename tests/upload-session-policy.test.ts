@@ -17,13 +17,30 @@ describe("OneDrive upload-session policy", () => {
     expect(shouldUseUploadSession(UPLOAD_SESSION_THRESHOLD_BYTES + 1)).toBe(true);
   });
 
-  it("uses aligned 10 MiB chunks and downshifts to aligned 5 MiB chunks", () => {
-    expect(uploadSessionChunkSize(null, false)).toBe(UPLOAD_CHUNK_NORMAL_BYTES);
+  it("probes an unknown link with aligned slow chunks, then adapts to the observed rate", () => {
+    // An unknown rate is exactly the slow-link case: the first chunk must be
+    // small enough to land (progress + rate learning) instead of betting the
+    // whole file on the optimistic 128 KiB/s assumption.
+    expect(uploadSessionChunkSize(null, false)).toBe(UPLOAD_CHUNK_SLOW_BYTES);
     expect(uploadSessionChunkSize(20 * 1024 * 1024 / 8, false)).toBe(UPLOAD_CHUNK_NORMAL_BYTES);
     expect(uploadSessionChunkSize(5 * 1024 * 1024 / 8, false)).toBe(UPLOAD_CHUNK_SLOW_BYTES);
     expect(uploadSessionChunkSize(null, true)).toBe(UPLOAD_CHUNK_SLOW_BYTES);
     expect(UPLOAD_CHUNK_NORMAL_BYTES % UPLOAD_CHUNK_ALIGNMENT_BYTES).toBe(0);
     expect(UPLOAD_CHUNK_SLOW_BYTES % UPLOAD_CHUNK_ALIGNMENT_BYTES).toBe(0);
+  });
+
+  it("budgets an unmeasured first chunk at the floor rate, not the optimistic base", () => {
+    // 2026-09-12 real failure: a 9.1 MiB single-chunk PUT budgeted at 128 KiB/s
+    // timed out at 84.8 s on every attempt while the real link sat below
+    // ~108 KiB/s. The floor-rate budget keeps a slow-but-alive chunk landing.
+    expect(
+      uploadSessionChunkTimeoutMs(UPLOAD_CHUNK_SLOW_BYTES, null),
+    ).toBe(15_000 + UPLOAD_CHUNK_SLOW_BYTES / (64 * 1024) * 1000);
+    // A measured link still uses the measured rate (halved, clamped to the
+    // 64–128 KiB/s band): 5 MiB at 2 MiB/s → half rate clamps to 128 KiB/s.
+    expect(
+      uploadSessionChunkTimeoutMs(5 * 1024 * 1024, 2 * 1024 * 1024),
+    ).toBe(55_000);
   });
 
   it.each([
@@ -53,7 +70,7 @@ describe("OneDrive upload-session policy", () => {
 
     expect(range).toEqual({ start: 10 * 1024 * 1024, endExclusive: 20 * 1024 * 1024 });
     expect(uploadRangeEndExclusive(range!, UPLOAD_CHUNK_SLOW_BYTES, total))
-      .toBe(15 * 1024 * 1024);
+      .toBe(10 * 1024 * 1024 + UPLOAD_CHUNK_SLOW_BYTES);
   });
 
   it("rejects malformed or out-of-bounds session ranges", () => {

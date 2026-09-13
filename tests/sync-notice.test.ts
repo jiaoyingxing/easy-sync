@@ -261,15 +261,23 @@ describe("resolveSyncProgressNoticePresentation", () => {
   });
 
   it("uses phase counts directly while verifying files", () => {
-    expect(resolveSyncProgressNoticePresentation(progress({
+    const state = progress({
       phase: "verifying",
       current: 2,
       total: 5,
-    }))).toMatchObject({
-      kind: "stage",
+    });
+    const presentation = resolveSyncProgressNoticePresentation(state);
+
+    expect(presentation).toMatchObject({
+      kind: "verify",
       determinate: true,
       percent: 40,
+      showProgressBar: true,
     });
+    expect(formatSyncProgressNoticeLabel(
+      presentation,
+      new I18n("zh-cn").t.bind(new I18n("zh-cn")),
+    )).toBe("☁️ 验证文件一致性 2/5");
   });
 
   it("uses resumable remote-scope proof counts across recovery phases", () => {
@@ -310,6 +318,7 @@ describe("resolveSyncProgressNoticePresentation", () => {
       [progress({ phase: "preparing" }), "☁️ 准备云端存储…"],
       [progress({ phase: "checking" }), "☁️ 检查云端变更…"],
       [progress({ phase: "planning" }), "☁️ 生成同步计划…"],
+      [progress({ phase: "verifying", current: 2, total: 5 }), "☁️ 验证文件一致性 2/5"],
       [progress({ phase: "executing", current: 3, total: 12 }), "☁️ 正在同步 3/12"],
       [progress({
         phase: "executing",

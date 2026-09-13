@@ -433,7 +433,14 @@ export interface MutationReceiptV1 {
   checkpoint: MutationCheckpointV1;
 }
 
-export type ManualMutationResolutionChoiceV1 = "keep-local" | "keep-remote";
+export type ManualMutationResolutionChoiceV1 =
+  | "keep-local"
+  | "keep-remote"
+  // Folder recovery records only: the user confirms continuing from the
+  // current two-sided facts without executing or undoing the stuck action.
+  // Zero-write settlement; ordinary planning takes over conservatively.
+  | "as-observed";
+
 
 /** Exact V2 state evidence for recovering one receipted remote rename whose
  * checkpoint is blocked by a distinct anchor already owning the target path. */
@@ -514,7 +521,9 @@ export interface ManualMutationResolutionAuditV1 {
   resolutionOperationId: string;
   path: string;
   choice: ManualMutationResolutionChoiceV1;
-  action: MutationAction;
+  // Folder settlements ("as-observed") audit folder actions, which live
+  // outside the file-level MutationAction union.
+  action: MutationAction | FolderMutationActionV2;
   externalMutation: boolean;
   selectedAt: number;
   completedAt: number;

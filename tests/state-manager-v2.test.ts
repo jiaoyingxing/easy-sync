@@ -1585,6 +1585,68 @@ describe("StateManager V2 production controller", () => {
     }
   });
 
+  it("finishes reset when a regenerable directory is locked, cleans the rest, and records the leftover", async () => {
+    const harness = makeHarness({
+      indexedDbActive: true,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "sync-interval": 15,
+        "easy-sync-diagnostic-log": true,
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    let databaseId = "";
+    try {
+      await state.load();
+      databaseId = state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+      harness.folders.add(paths.ancestorsV2Dir);
+      harness.folders.add(paths.stateV2IndexedDbRecoveryDir);
+      harness.files.set(`${paths.ancestorsV2Dir}/${hashA}.txt`, "ancestor");
+      harness.files.set(
+        `${paths.stateV2IndexedDbRecoveryDir}/checkpoint-000000000001.json`,
+        "{}",
+      );
+
+      // OneDrive-style lock: the client holds handles inside its sync root,
+      // so one directory cannot be removed this attempt (EPERM, errno -4048).
+      const lockedDirectory = paths.ancestorsV2Dir;
+      const originalRmdir = harness.rawAdapter.rmdir.getMockImplementation();
+      harness.rawAdapter.rmdir.mockImplementation(
+        async (path: string, recursive: boolean) => {
+          if (path === lockedDirectory) {
+            throw Object.assign(
+              new Error(`EPERM: operation not permitted, rmdir '${path}'`),
+              { code: "EPERM", errno: -4048, syscall: "rmdir", path },
+            );
+          }
+          return originalRmdir!(path, recursive);
+        },
+      );
+
+      // The reset must finish: manifest and database are already gone by the
+      // time directory cleanup runs, so aborting cannot preserve anything.
+      await expect(state.reset()).resolves.toBeUndefined();
+
+      expect(state.isV2StateActive).toBe(false);
+      expect(state.v2StateLoadRecoveryBlock).toBeNull();
+
+      // The recovery journal (the one directory that can permanently block a
+      // fresh activation with stale future records) must be gone even though
+      // the locked directory survived.
+      expect(harness.folders.has(paths.stateV2IndexedDbRecoveryDir))
+        .toBe(false);
+      expect(harness.folders.has(lockedDirectory)).toBe(true);
+
+      // The leftover is disclosed with the exact path for manual removal.
+      expect(state.lastResetLeftoverDirectories).toEqual([lockedDirectory]);
+    } finally {
+      await state.close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
   it.each([
     { authorityKind: "indexeddb" as const, indexedDbActive: true },
     { authorityKind: "json" as const, indexedDbActive: false },
@@ -6481,5 +6543,119 @@ describe("StateManager V2 production controller", () => {
     expect(state.remoteScope).toMatchObject({
       driveId: "stale-drive",
     });
+  });
+});
+
+describe("folder recovery settle-as-observed (zero-write manual exit)", () => {
+  const folderIntent = (): FolderMutationIntentV2 => ({
+    version: 2,
+    operationId: "stuck-folder-op",
+    planRevision: 1,
+    scope,
+    action: "createRemoteFolder",
+    path: "Notes/new-sub",
+    expectedLocal: { exists: true },
+    expectedRemote: {
+      exists: true,
+      driveId: "folder-created",
+      parentId: folder.driveId,
+      eTag: "etag-created",
+    },
+    expectedParent: { driveId: folder.driveId, path: "Notes" },
+    createdAt: 1,
+  });
+
+  const blockedFolderRecord = (): MutationLedgerEntryV1 => ({
+    intent: folderIntent(),
+    receipt: {
+      version: 1,
+      operationId: folderIntent().operationId,
+      completedAt: 2,
+      checkpoint: {
+        baseUpserts: [],
+        baseRemovals: [],
+        remoteUpserts: [],
+        remoteDeletes: [],
+        folderUpserts: [{
+          path: "Notes/new-sub",
+          driveId: "folder-created",
+          parentId: folder.driveId,
+          name: "new-sub",
+          eTag: "etag-created",
+        }],
+        pendingConflictRemovals: [],
+        pendingDeleteRemovals: [],
+      },
+    },
+  });
+
+  it("retires exactly the reviewed folder record, audits as-observed, and never touches the envelope", async () => {
+    const record = blockedFolderRecord();
+    const harness = makeHarness({
+      pluginData: { "easy-sync-v2-mutation-ledger": [record] },
+    });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const beforeEnvelope = state.getCommittedV2Envelope();
+    expect(state.mutationLedger).toHaveLength(1);
+
+    const settled = await state.settleFolderMutationRecoveryAsObserved({
+      expectedRecord: structuredClone(record),
+    });
+
+    expect(settled).toBe(true);
+    expect(state.mutationLedger).toHaveLength(0);
+    expect(state.manualMutationResolutionAudit.at(-1)).toMatchObject({
+      version: 1,
+      sourceOperationId: "stuck-folder-op",
+      resolutionOperationId: "stuck-folder-op-auto-observed-settle",
+      path: "Notes/new-sub",
+      choice: "as-observed",
+      action: "createRemoteFolder",
+      externalMutation: false,
+    });
+    expect(state.getCommittedV2Envelope()).toEqual(beforeEnvelope);
+    expect(harness.pluginData["easy-sync-v2-mutation-ledger"]).toEqual([]);
+
+    // The record CAS: a stale record copy settles nothing.
+    const again = await state.settleFolderMutationRecoveryAsObserved({
+      expectedRecord: structuredClone(record),
+    });
+    expect(again).toBe(false);
+    expect(state.manualMutationResolutionAudit).toHaveLength(1);
+  });
+
+  it("refuses non-folder records (fail-closed on the new exit)", async () => {
+    const fileRecord: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "stuck-file-op",
+        planRevision: 1,
+        scope,
+        action: "upload",
+        path: "Notes/a.md",
+        expectedLocal: { exists: true, hash: hashA, size: remoteA.size },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: remoteA.eTag,
+          size: remoteA.size,
+          sha256Hash: hashA,
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const harness = makeHarness({
+      pluginData: { "easy-sync-v2-mutation-ledger": [fileRecord] },
+    });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+
+    await expect(state.settleFolderMutationRecoveryAsObserved({
+      expectedRecord: fileRecord,
+    })).rejects.toThrow("Only a folder mutation record");
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(state.manualMutationResolutionAudit).toHaveLength(0);
   });
 });

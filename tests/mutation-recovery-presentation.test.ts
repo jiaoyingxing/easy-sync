@@ -7,6 +7,7 @@ import {
   mutationRecoveryStatusDetail,
   mutationRecoveryStatusLabel,
   mutationRecoveryTopStatusLabel,
+  mutationRecoveryPrimaryActionKey,
   shouldAutoSettleIdenticalRecovery,
 } from "../src/ui/mutation-recovery-presentation";
 import type { ManualMutationResolutionSnapshotV1 } from "../src/sync/types";
@@ -249,5 +250,43 @@ describe("shouldAutoSettleIdenticalRecovery", () => {
     expect(shouldAutoSettleIdenticalRecovery(
       snapshot({ identical: false }),
     )).toBe(false);
+  });
+});
+
+describe("folder recovery settle exit presentation", () => {
+  const base = {
+    kind: "blocked" as const,
+    total: 1,
+    settled: 0,
+    remaining: 1,
+    retryAt: null,
+    firstPath: "second-brain/books",
+    blockReason: "facts-changed" as const,
+    blockedOperationId: "stuck-folder-op",
+  };
+
+  it("keeps blocked-folder records honest without an exit button (auto-settled upstream, 2026-09-13 拍板)", () => {
+    const i18n = new I18n("zh-cn");
+    const t = i18n.t.bind(i18n);
+    const state = { ...base };
+
+    // Folder records auto-settle in the recovery batch: no top-slot button,
+    // no settlement pointer — only the honest blocked status remains.
+    expect(mutationRecoveryPrimaryActionKey(state)).toBeNull();
+    const body = mutationRecoveryBodyPresentation(state, t, () => "");
+    expect(body.actionKey).toBeNull();
+    expect(body.nextStep).toBe(t("syncView.recovery.nextStep.blocked"));
+  });
+
+  it("keeps the file review exit for an eligible ordinary-file record", () => {
+    const state = { ...base, manualResolutionAvailable: true };
+
+    expect(mutationRecoveryPrimaryActionKey(state)).toBe(
+      "syncView.recovery.reviewDetails",
+    );
+  });
+
+  it("keeps honest status without an exit when no settlement is available", () => {
+    expect(mutationRecoveryPrimaryActionKey(base)).toBeNull();
   });
 });

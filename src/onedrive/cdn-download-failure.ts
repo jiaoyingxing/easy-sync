@@ -8,6 +8,10 @@
  * observable evidence at the diagnostic boundary so a real-device or
  * real-network report can tell which layer failed and whether the
  * pre-signed host itself was reachable. They never change control flow.
+ *
+ * Both error vocabularies are recognized: Node-style codes (ENOTFOUND,
+ * ECONNRESET) and Chromium network names (net::ERR_*). A message in neither
+ * vocabulary stays "unknown" — the staging is evidence, not a guess.
  */
 
 export type CdnDownloadFailureStage =
@@ -27,16 +31,20 @@ export type CdnDownloadFailureStage =
   | "unknown";
 
 const DNS_MESSAGE_PATTERN =
-  /getaddrinfo|enotfound|eai_again|eai_noname|eai_nodata|eai_fail|eai_service|name or service not known|name not resolved|no address associated|enodata|eservfail/i;
+  /getaddrinfo|enotfound|eai_again|eai_noname|eai_nodata|eai_fail|eai_service|name or service not known|name not resolved|no address associated|enodata|eservfail|net::err_(name_not_resolved|name_resolution_failed|icann_name_collision)/i;
 
+// TLS also covers the Chromium forms via the "ssl" and "cert_" substrings
+// (net::ERR_SSL_PROTOCOL_ERROR, net::ERR_CERT_AUTHORITY_INVALID).
 const TLS_MESSAGE_PATTERN =
   /ssl|tls|certificate|cert_|unable to verify|handshake|self[ _-]?signed|leaf[ _-]?signature|eproto/i;
 
+// Chromium's connection/"address"/"socket"/"quic" families; a connection
+// timeout lands here (tcp layer) rather than under "timeout".
 const TCP_MESSAGE_PATTERN =
-  /econnreset|epipe|econnrefused|enetunreach|ehostunreach|enetdown|ehostdown|enotconn|econnaborted|eaddrinuse|eaddrnotavail|connection reset|connection refused|connection aborted/i;
+  /econnreset|epipe|econnrefused|enetunreach|ehostunreach|enetdown|ehostdown|enotconn|econnaborted|eaddrinuse|eaddrnotavail|connection reset|connection refused|connection aborted|net::err_(connection_[a-z0-9_]*|address_[a-z0-9_]*|socket_[a-z0-9_]*|quic_[a-z0-9_]*)/i;
 
 const TIMEOUT_MESSAGE_PATTERN =
-  /etimedout|esockettimedout|timed? ?out|timeout|deadline/i;
+  /etimedout|esockettimedout|timed? ?out|timeout|deadline|net::err_timed_out/i;
 
 function rawErrorText(error: unknown): { message: string; status: number } {
   if (error instanceof Error) {

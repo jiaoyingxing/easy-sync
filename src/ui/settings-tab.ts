@@ -109,12 +109,14 @@ export class EasySyncSettingTab extends PluginSettingTab {
   constructor(plugin: EasySyncPlugin) {
     super(plugin.app, plugin);
     this.plugin = plugin;
+    // Tab-level class must be applied at construction time: on Obsidian
+    // 1.13.0+ the host renders declaratively and never calls display().
+    this.containerEl.addClass("easy-sync-settings-tab");
   }
 
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.addClass("easy-sync-settings-tab");
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     this.accountSectionEl = containerEl.createDiv("easy-sync-settings-account");
     this.rangeSectionEl = containerEl.createDiv(

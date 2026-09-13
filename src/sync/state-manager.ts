@@ -27,6 +27,7 @@ import {
   type EasySyncRuntimeLayoutMigrationConflict,
 } from "./runtime-layout-migration";
 import { AncestorStoreV2 } from "./ancestor-store-v2";
+import type { TransferRateFactsV1 } from "./transfer-rate";
 import {
   findScopeCrossingCoveringHintV1,
 } from "./scope-crossing-resolution";
@@ -516,6 +517,7 @@ const KEY_FORCE_RESET_AUDIT = "easy-sync-v2-force-reset-audit";
 const KEY_V2_RECOVERY_QUARANTINE = "easy-sync-v2-recovery-quarantine";
 const KEY_LOCAL_FOLDER_MOVE_HINTS = "easy-sync-local-folder-move-hints";
 const KEY_LOCAL_FILE_MOVE_HINTS = "easy-sync-local-file-move-hints";
+const KEY_TRANSFER_RATES_WINDOW = "easy-sync-transfer-rates-window";
 const KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE = "community-plugin-enablement-state";
 const KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS =
   "community-plugin-manifest-observations";
@@ -561,6 +563,8 @@ export interface SyncHistoryEntry {
   uploadReadMs?: number;
   uploadNetworkMs?: number;
   peakUploads?: number;
+  /** Passive connection-speed reading derived from this run's byte transfers. */
+  transferRates?: TransferRateFactsV1;
   /** Aggregated status of one continuing mutation-recovery event. */
   recovery?: MutationRecoveryHistory;
   /** Aggregated GET-only scope proof; not included in file action counts. */
@@ -584,7 +588,8 @@ export interface PendingIssue {
     | "remote-subtree-changed"
     | "target-occupied"
     | "parent-chain-incomplete"
-    | "scope-crossing";
+    | "scope-crossing"
+    | "transfer-network";
   reason?: string;
   updatedAt: number;
   fileSize?: number;
@@ -610,6 +615,10 @@ interface PluginData {
   [KEY_PLAN_REVIEW_SCOPE]: SyncScope | null;
   [KEY_PLAN_REVIEW_CANONICAL_IDENTITY]: CanonicalPlanIdentityV2 | null;
   [KEY_SYNC_HISTORY]: SyncHistoryEntry[];
+  /** Persisted rolling window of per-round transfer-rate facts. Kept
+   *  outside the 10-entry history so the reading survives both reloads and
+   *  quiet stretches of no-transfer rounds. */
+  [KEY_TRANSFER_RATES_WINDOW]: TransferRateFactsV1[];
   [KEY_GENERATION]: number;
   [KEY_BOUND_ACCOUNT]: string;
   [KEY_PUBLIC_MUTATION_LEDGER]: MutationLedgerEntryV1[];
@@ -649,6 +658,7 @@ const DEFAULT_DATA: PluginData = {
   [KEY_PLAN_REVIEW_SCOPE]: null,
   [KEY_PLAN_REVIEW_CANONICAL_IDENTITY]: null,
   [KEY_SYNC_HISTORY]: [],
+  [KEY_TRANSFER_RATES_WINDOW]: [],
   [KEY_GENERATION]: 0,
   [KEY_BOUND_ACCOUNT]: "",
   [KEY_PUBLIC_MUTATION_LEDGER]: [],
@@ -794,6 +804,13 @@ export class StateManager {
   private ancestorStoreV2: AncestorStoreV2 | null = null;
   private pendingV2AncestorContent = new Map<string, string | ArrayBuffer>();
   readonly baseContentCache = new BaseContentCache();
+  /**
+   * Regenerable state directories that the most recent reset could not remove
+   * (e.g. a cloud client holding handles inside its sync root). Populated by
+   * the shared directory cleanup; empty after any reset whose cleanup fully
+   * succeeded. Disclosed to the user so the leftovers stay manually removable.
+   */
+  lastResetLeftoverDirectories: readonly string[] = [];
 
   constructor(private plugin: PluginDataStore) {
     this.data = createDefaultData();
@@ -976,6 +993,11 @@ export class StateManager {
           ),
         [KEY_SYNC_HISTORY]: Array.isArray(saved[KEY_SYNC_HISTORY])
           ? saved[KEY_SYNC_HISTORY]
+          : [],
+        [KEY_TRANSFER_RATES_WINDOW]: Array.isArray(
+          saved[KEY_TRANSFER_RATES_WINDOW],
+        )
+          ? saved[KEY_TRANSFER_RATES_WINDOW]
           : [],
         [KEY_GENERATION]: saved[KEY_GENERATION] ?? 0,
         [KEY_BOUND_ACCOUNT]: saved[KEY_BOUND_ACCOUNT] ?? "",
@@ -4388,6 +4410,75 @@ export class StateManager {
     return retired;
   }
 
+  /**
+   * Zero-write settlement for one blocked folder recovery record (2026-09-13
+   * 用户拍板: auto-settled by the recovery batch — reviewing the record
+   * decided nothing). Folder intents have no keep-side content decision
+   * (files carry the data; folders do not), so the honest exit retires the
+   * record — no mutation, no envelope rewrite — and lets ordinary planning
+   * take over conservatively (deferred/stale-identity flows own the folder
+   * afterwards). State-only, mirroring
+   * `settleReplacedIdentityUploadResolved`: the exact-record CAS settles
+   * only the classified record; everything else stays untouched.
+   */
+  async settleFolderMutationRecoveryAsObserved(input: {
+    expectedRecord: Readonly<MutationLedgerEntryV1>;
+  }): Promise<boolean> {
+    if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
+      throw new Error("Folder recovery settlement requires active V2 authority");
+    }
+    if (this.mutationLedgerCorrupt) {
+      throw new Error("Mutation recovery ledger is corrupt");
+    }
+    const record = input.expectedRecord;
+    if (!isFolderMutationIntent(record.intent)) {
+      throw new Error("Only a folder mutation record may settle as observed");
+    }
+    if (!sameSyncScope(record.intent.scope, this.v2Envelope.scope)) {
+      throw new Error(`Folder recovery settlement scope no longer matches: ${record.intent.operationId}`);
+    }
+    if (this.v2Envelope.remoteIndex.complete !== true) {
+      throw new Error("Folder recovery settlement requires a complete remote observation");
+    }
+    const audit: ManualMutationResolutionAuditV1 = {
+      version: 1,
+      sourceOperationId: record.intent.operationId,
+      resolutionOperationId: `${record.intent.operationId}-auto-observed-settle`,
+      path: record.intent.path,
+      choice: "as-observed",
+      action: record.intent.action,
+      externalMutation: false,
+      selectedAt: Date.now(),
+      completedAt: Date.now(),
+    };
+    let retired = false;
+    await this.commitPluginData((current) => {
+      const index = findUniqueMutationLedgerRecordIndex(
+        current[KEY_MUTATION_LEDGER],
+        record.intent.operationId,
+      );
+      if (index < 0) return current;
+      if (
+        JSON.stringify(current[KEY_MUTATION_LEDGER][index])
+        !== JSON.stringify(record)
+      ) return current;
+      retired = true;
+      return {
+        ...current,
+        [KEY_MUTATION_LEDGER]: current[KEY_MUTATION_LEDGER].filter(
+          (_entry, entryIndex) => entryIndex !== index,
+        ),
+        [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]: [
+          ...current[KEY_MANUAL_MUTATION_RESOLUTION_AUDIT].filter(
+            (entry) => entry.resolutionOperationId !== audit.resolutionOperationId,
+          ),
+          audit,
+        ].slice(-20),
+      };
+    });
+    return retired;
+  }
+
   async recordMutationReceipt(receipt: MutationReceiptV1): Promise<void> {
     if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
       throw new Error("Mutation receipt requires active V2 authority");
@@ -6594,8 +6685,24 @@ export class StateManager {
         ) {
           nextIssue.consecutiveFailures = (existing.consecutiveFailures ?? 1) + 1;
         } else if (existing && (issue.localHash !== existing.localHash || issue.remoteETag !== existing.remoteETag)) {
-          // Version changed — reset counter
-          nextIssue.consecutiveFailures = 1;
+          // Network failures are a property of the link, not of the bytes:
+          // a file whose transfer keeps timing out across rebuilds (e.g. a
+          // plugin re-bundled during a slow-network window) must keep
+          // accumulating so the breaker can back it off. Version change only
+          // resets the counter for content-class failures.
+          nextIssue.consecutiveFailures = issue.issueCode === "transfer-network"
+            ? (existing.consecutiveFailures ?? 1) + 1
+            : 1;
+        }
+        // Breaker deferral rounds (RetryLater) are not fresh evidence about
+        // the link — keep the last real failure time so the backoff window
+        // can expire and grant the next real attempt.
+        if (
+          issue.actionType === SyncActionType.RetryLater
+          && issue.issueCode === "transfer-network"
+          && existing?.issueCode === "transfer-network"
+        ) {
+          nextIssue.updatedAt = existing.updatedAt;
         }
         byPath.set(issue.path, nextIssue);
       }
@@ -8140,6 +8247,20 @@ export class StateManager {
     return this.data[KEY_SYNC_HISTORY];
   }
 
+  get transferRatesWindow(): TransferRateFactsV1[] {
+    return this.data[KEY_TRANSFER_RATES_WINDOW] ?? [];
+  }
+
+  async pushTransferRateFacts(facts: TransferRateFactsV1): Promise<void> {
+    await this.save((current) => ({
+      ...current,
+      [KEY_TRANSFER_RATES_WINDOW]: [
+        facts,
+        ...(current[KEY_TRANSFER_RATES_WINDOW] ?? []),
+      ].slice(0, 3),
+    }));
+  }
+
   async addSyncHistory(entry: SyncHistoryEntry): Promise<void> {
     const normalized = { ...entry, files: retainFileProgress(entry.files) };
     await this.save((current) => ({
@@ -8908,14 +9029,10 @@ export class StateManager {
     } else {
       await this.removeLocalSyncArtifact(paths.ancestorManifestV2File);
     }
-    for (const directory of [
+    await this.removeStateDirectoriesIgnoringLocks([
       ...(retainedAncestorHashes.size === 0 ? [paths.ancestorsV2Dir] : []),
       ...(retainMergeReady ? [] : [paths.tmpDir]),
-    ]) {
-      if (await adapter.exists(directory)) {
-        await adapter.rmdir(directory, true);
-      }
-    }
+    ]);
   }
 
   private async indexedDbStoreForLocalReset(
@@ -8985,14 +9102,45 @@ export class StateManager {
     for (const path of [...new Set(files)]) {
       await this.removeLocalSyncArtifact(path);
     }
-    for (const directory of [
+    await this.removeStateDirectoriesIgnoringLocks([
       paths.ancestorsV2Dir,
       paths.stateV2IndexedDbRecoveryDir,
       paths.tmpDir,
-    ]) {
-      if (await adapter.exists(directory)) {
+    ]);
+  }
+
+  /**
+   * Remove regenerable state directories without letting one locked entry
+   * abort the remaining cleanup. The manifest and the selected database are
+   * already gone by the time directory cleanup runs, so a cloud client
+   * holding handles inside its sync root (Windows EPERM) must not strand the
+   * reset half-done: the recovery journal left behind would permanently block
+   * every fresh activation with stale future records. Surviving directories
+   * are recorded for user-facing disclosure and stay retryable by hand.
+   */
+  private async removeStateDirectoriesIgnoringLocks(
+    directories: readonly string[],
+  ): Promise<void> {
+    const adapter = this.plugin.app.vault.adapter;
+    const leftovers: Array<{ path: string; code?: string }> = [];
+    for (const directory of directories) {
+      if (!await adapter.exists(directory)) continue;
+      try {
         await adapter.rmdir(directory, true);
+      } catch (error) {
+        leftovers.push({
+          path: directory,
+          code: (error as { code?: string })?.code,
+        });
       }
+    }
+    this.lastResetLeftoverDirectories = leftovers.map((entry) => entry.path);
+    if (leftovers.length > 0) {
+      this.plugin.diag?.warn(
+        "state",
+        "local sync state reset left directories behind",
+        leftovers,
+      );
     }
   }
 

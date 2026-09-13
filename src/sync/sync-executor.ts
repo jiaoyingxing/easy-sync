@@ -146,6 +146,7 @@ import {
 } from "./sync-progress";
 import { OperationLifecycle } from "./operation-lifecycle";
 import { EasySyncNoticeCenter, NOTICE_PRIORITY } from "../ui/notice-center";
+import type { TransferRateTickSnapshot } from "./transfer-rate";
 import { LocalRecoveryJournal } from "./local-recovery-journal";
 import { MergeReadyStore } from "./merge-ready-store";
 import { fingerprintIndexedDbError } from "./indexeddb-error-fingerprint";
@@ -354,6 +355,11 @@ export interface SyncResult {
    *  the whole auto-sync round: nothing was written and only an observed-fact
    *  change can clear the block. */
   identityBlockedErrors?: number;
+  /** M17 breaker deferrals this round (auto sync only). They stay visible in
+   *  `errors` (history stays honest) but must not pause the whole auto-sync
+   *  round: the deferral is the breaker protecting the round, not a failure
+   *  of it. The pause gate exempts rounds where these are the only errors. */
+  breakerDeferredErrors?: number;
   /** Community-plugin bundles whose upload the downgrade guard deferred to
    *  user review this round (local version below the remote one). The caller
    *  may raise a one-shot notice per plugin id; the list itself is per-round
@@ -617,6 +623,13 @@ const MOBILE_RECONSTRUCTION_BATCH_BYTES = 8 * 1024 * 1024;
 const ANDROID_TEMP_WRITE_MAX_ATTEMPTS = 3;
 /** Mobile-only bounded settle re-reads after a local folder create. */
 const MOBILE_FOLDER_CREATE_READBACK_SETTLE_ATTEMPTS = 3;
+// M17 network backoff: while the last real transfer failure of a
+// transfer-network issue is younger than this window, auto sync defers the
+// item instead of re-attempting it every round (2026-09-12: a slow-link
+// window re-attempted a 9.1 MiB upload every 3 minutes, each costing 4–5
+// minutes of timeouts). After the window expires the next auto round makes
+// one real attempt; a fresh failure restarts the window.
+const TRANSFER_NETWORK_BACKOFF_WINDOW_MS = 15 * 60 * 1000;
 const FOLDER_CREATE_READBACK_SETTLE_MS = 400;
 /** Bounded re-read attempts for a remote folder create receipt (slow links). */
 const REMOTE_FOLDER_READBACK_ATTEMPTS = 2;
@@ -710,6 +723,16 @@ export interface FileTransferMetrics {
     localVersionGuard: number;
     localCommit: number;
   };
+}
+
+/** Byte-level progress of one transport call still in flight, kept so the
+ *  connection-speed sampler sees movement before the file-level ledger
+ *  accrues. `startedAt` is the first nonzero byte event: session setup and
+ *  first-byte latency are not transfer time. */
+interface InFlightTransfer {
+  direction: "upload" | "download";
+  bytesSoFar: number;
+  startedAt: number;
 }
 
 export type AutomaticMergeManualReason =
@@ -1323,6 +1346,81 @@ export class SyncExecutor {
     private noticeCenter: EasySyncNoticeCenter = new EasySyncNoticeCenter(),
   ) {}
 
+  /** Live accumulator of the run in flight; the connection-speed sampler
+   *  polls it on a fixed cadence. Not cleared at run end — callers gate on
+   *  isRunning, and the next run overwrites the reference. */
+  private activeRunMetrics: ExecutionMetrics | null = null;
+
+  /** Transfers currently moving bytes, one handle per transport call.
+   *  Handles enter at the first nonzero byte event and always leave via the
+   *  trackTransfer finally, so a settled transfer never lingers here. */
+  private inFlightTransfers = new Set<InFlightTransfer>();
+
+  /** Cumulative per-direction byte/time totals of the run in flight,
+   *  composed with the byte-level overlay of transfers still in flight so
+   *  the sampler's Δbytes/Δms is true throughput while a single file is
+   *  still transferring. The ms term only accrues while content actually
+   *  transfers, so planning, queueing and verification time fold into
+   *  neither term. */
+  getActiveTransferMetrics(now: number = Date.now()): TransferRateTickSnapshot | null {
+    const metrics = this.activeRunMetrics;
+    if (!metrics) return null;
+    let uploadInFlightBytes = 0;
+    let uploadInFlightMs = 0;
+    let downloadInFlightBytes = 0;
+    let downloadInFlightMs = 0;
+    for (const transfer of this.inFlightTransfers) {
+      const ms = transfer.startedAt > 0
+        ? Math.max(0, now - transfer.startedAt)
+        : 0;
+      if (transfer.direction === "upload") {
+        uploadInFlightBytes += transfer.bytesSoFar;
+        uploadInFlightMs += ms;
+      } else {
+        downloadInFlightBytes += transfer.bytesSoFar;
+        downloadInFlightMs += ms;
+      }
+    }
+    return {
+      upload: {
+        bytes: metrics.fileTransfers.upload.logicalBytes + uploadInFlightBytes,
+        ms: metrics.fileTransfers.upload.stagesMs.contentTransfer
+          + uploadInFlightMs,
+      },
+      download: {
+        bytes: metrics.fileTransfers.download.logicalBytes + downloadInFlightBytes,
+        ms: metrics.fileTransfers.download.stagesMs.contentTransfer
+          + downloadInFlightMs,
+      },
+    };
+  }
+
+  /** Byte-level overlay for the connection-speed sampler: wrap a transport
+   *  progress callback so bytes moved by the transfer in flight are visible
+   *  to getActiveTransferMetrics before the file-level ledger accrues. The
+   *  handle leaves the set when the transport call settles, and the ledger
+   *  takes the bytes over at completion — the composed total never counts
+   *  them twice. */
+  private async trackTransfer<T>(
+    direction: "upload" | "download",
+    onProgress: ((downloaded: number, total: number) => void) | undefined,
+    transfer: (report: (downloaded: number, total: number) => void) => Promise<T>,
+  ): Promise<T> {
+    const handle: InFlightTransfer = { direction, bytesSoFar: 0, startedAt: 0 };
+    this.inFlightTransfers.add(handle);
+    try {
+      return await transfer((downloaded, total) => {
+        if (downloaded > 0 && handle.startedAt === 0) {
+          handle.startedAt = Date.now();
+        }
+        if (downloaded !== handle.bytesSoFar) handle.bytesSoFar = downloaded;
+        onProgress?.(downloaded, total);
+      });
+    } finally {
+      this.inFlightTransfers.delete(handle);
+    }
+  }
+
   private t(key: string, params?: Record<string, string | number>): string {
     return this.i18n?.t(key, params) ?? key;
   }
@@ -1450,6 +1548,58 @@ export class SyncExecutor {
       return false;
     }
     return this.isManualResolutionIntentEligible(record.intent);
+  }
+
+  /**
+   * Auto-settlement for blocked FOLDER recovery records (2026-09-13 用户拍板,
+   * scoped revision of the issue #17 "no automatic settlement" boundary):
+   * folder intents carry no content, the settlement is a zero-write retire
+   * (evidence kept in the manual-resolution audit), and ordinary planning
+   * takes the folder over conservatively — the real folder decisions stay on
+   * their existing surfaces (folder subtree review / shared-folder identity).
+   * Reviewing the stuck record itself decided nothing, so no user action is
+   * required and no blocked state is raised for it. Any settle failure falls
+   * back to the previous fail-closed blocking. Managed paths (Obsidian,
+   * EasySync self, community plugins) keep the old boundary via the same
+   * eligibility gates as the file review.
+   */
+  private async tryAutoSettleFolderMutationRecovery(
+    record: Readonly<MutationLedgerEntryV1>,
+  ): Promise<boolean> {
+    if (
+      !this.state.isV2StateActive
+      || !isFolderMutationIntent(record.intent)
+      || !this.isManualResolutionIntentEligible(record.intent)
+    ) return false;
+    try {
+      const settledObserved = await this.state
+        .settleFolderMutationRecoveryAsObserved({
+          expectedRecord: record,
+        });
+      if (settledObserved) {
+        this.diag?.warn(
+          "state",
+          `blocked folder record auto-settled from current facts (zero write) — ${record.intent.path}`,
+          {
+            operationId: record.intent.operationId,
+            action: record.intent.action,
+            mutations: 0,
+          },
+        );
+      }
+      return settledObserved;
+    } catch (error) {
+      this.diag?.warn(
+        "state",
+        `folder record auto-settlement unavailable; keeping the record blocked — ${record.intent.path}`,
+        {
+          operationId: record.intent.operationId,
+          reason: error instanceof Error ? error.message : String(error),
+          mutations: 0,
+        },
+      );
+      return false;
+    }
   }
 
   /** Read-only facts for the narrow empty-folder resolution UI. */
@@ -2276,6 +2426,7 @@ export class SyncExecutor {
                   this.automaticHandlingPolicy,
                 ),
               };
+              this.activeRunMetrics = metrics;
               const executed = await this.executeItem(
                 item,
                 result,
@@ -5021,25 +5172,33 @@ export class SyncExecutor {
       if (streamAdapter && tempDownloadPath) {
         await this.ensureParentDirs(tempDownloadPath);
         await this.removePathIfExists(tempDownloadPath);
-        downloaded = await this.onedrive.downloadFileToPath(
-          this.vaultName,
-          path,
-          tempDownloadPath,
-          streamAdapter,
-          remote.downloadUrl,
-          remote.driveId,
-          remote.size,
-          remote.sha256Hash,
+        downloaded = await this.trackTransfer(
+          "download",
           onProgress,
+          (report) => this.onedrive.downloadFileToPath(
+            this.vaultName,
+            path,
+            tempDownloadPath,
+            streamAdapter,
+            remote.downloadUrl,
+            remote.driveId,
+            remote.size,
+            remote.sha256Hash,
+            report,
+          ),
         );
       } else {
-        content = await this.onedrive.downloadFile(
-          this.vaultName,
-          path,
-          remote.downloadUrl,
-          remote.driveId,
-          remote.size,
+        content = await this.trackTransfer(
+          "download",
           onProgress,
+          (report) => this.onedrive.downloadFile(
+            this.vaultName,
+            path,
+            remote.downloadUrl,
+            remote.driveId,
+            remote.size,
+            report,
+          ),
         );
         downloaded = {
           size: content.byteLength,
@@ -6691,6 +6850,11 @@ export class SyncExecutor {
             syncScope,
             localEntries,
             options.mutationRecoveryObservationOnly !== true,
+            this.state.isV2StateActive
+            && skipConfirmation
+            && this.state.planReviewActive
+              ? reviewedAuthorization?.canonicalIdentity?.sourceCommitSeq
+              : undefined,
           );
           if (this.shouldStop(result, operationEpoch)) return result;
           const observedEnvelope = this.state.getCommittedV2Envelope();
@@ -8596,10 +8760,25 @@ export class SyncExecutor {
       // M17: circuit breaker — skip items with 3+ consecutive same-version failures.
       // ponytail: manual/first sync is an explicit user retry, so don't silently
       // keep skipping on stale breaker state; auto sync keeps the guardrail.
+      // transfer-network issues additionally back off across version changes:
+      // a network timeout is a property of the link, not of the bytes, so a
+      // file that keeps failing while its content keeps changing (e.g. a
+      // plugin re-bundled during a slow-network window) still gets deferred —
+      // but only until the backoff window expires, which grants one real
+      // attempt per window instead of the version-matched indefinite skip.
       const breakerMap = new Map<string, PendingIssue>();
       for (const issue of this.state.pendingIssues) {
+        // Terminal skip outcomes (oversized file, unstorable name) never
+        // touch the network and carry no version identity, so their
+        // recurring rows would accumulate "same-version failures" and arm
+        // the breaker against a by-design skip (2026-09-13 大文件演示.bin:
+        // three silent skips converted into a round-failing RetryLater that
+        // paused auto sync). Only real attempt outcomes may arm it, as with
+        // the FolderDeferred exclusion below.
         if (
           issue.actionType !== SyncActionType.FolderDeferred
+          && issue.actionType !== SyncActionType.SkipLargeFile
+          && issue.actionType !== SyncActionType.SkipOneDriveInvalidName
           && (issue.consecutiveFailures ?? 0) >= 3
         ) {
           breakerMap.set(issue.path, issue);
@@ -8607,16 +8786,31 @@ export class SyncExecutor {
       }
       if (breakerMap.size > 0) {
         let breakerCount = 0;
+        let breakerDeferredCount = 0;
         const breakerApplies = mode === "auto";
+        const networkBackoffCutoff = Date.now() - TRANSFER_NETWORK_BACKOFF_WINDOW_MS;
         for (const item of plan.items) {
           const breaker = breakerMap.get(item.path);
-          if (breaker && item.local?.hash === breaker.localHash && item.remote?.eTag === breaker.remoteETag) {
+          if (!breaker) continue;
+          const versionMatched = item.local?.hash === breaker.localHash && item.remote?.eTag === breaker.remoteETag;
+          const networkBackoff = breaker.issueCode === "transfer-network"
+            && breaker.updatedAt >= networkBackoffCutoff;
+          if (versionMatched || networkBackoff) {
             breakerCount++;
             if (breakerApplies) {
               item.type = SyncActionType.RetryLater;
-              item.reason = "reason.circuitBreaker";
+              item.reason = breaker.issueCode === "transfer-network"
+                ? "reason.circuitBreaker.network"
+                : "reason.circuitBreaker";
+              breakerDeferredCount++;
             }
           }
+        }
+        if (breakerDeferredCount > 0) {
+          // The pause gate exempts rounds whose only errors are these
+          // deferrals — otherwise the breaker's own skip would fail the
+          // round and pause the auto sync it exists to protect.
+          result.breakerDeferredErrors = breakerDeferredCount;
         }
         if (breakerCount > 0) {
           this.diag?.log(
@@ -10324,6 +10518,7 @@ export class SyncExecutor {
     // Attach the live accumulator immediately so cancellations and early
     // checkpoint failures retain the file-level outcome evidence.
     result.metrics = metrics;
+    this.activeRunMetrics = metrics;
     const isSmallUpload = (i: SyncPlanItem) =>
       i.type === SyncActionType.Upload && Boolean(i.local)
       && i.local!.size <= ADAPTIVE_UPLOAD_MAX_BYTES;
@@ -10657,6 +10852,8 @@ export class SyncExecutor {
                 ? { issueCode: "target-occupied" as const }
               : item.reason === "reason.folder.parent-chain-incomplete"
                 ? { issueCode: "parent-chain-incomplete" as const }
+              : item.reason === "reason.circuitBreaker.network"
+                ? { issueCode: "transfer-network" as const }
               : item.reason === "reason.file.scope-crossing"
                 ? { issueCode: "scope-crossing" as const }
               : item.reason === "reason.folder.scope-crossing"
@@ -10961,6 +11158,10 @@ export class SyncExecutor {
           localHash,
           remoteETag,
           consecutiveFailures: 1,
+          ...(e instanceof OneDriveError
+            && e.type === OneDriveErrorType.NetworkError
+            ? { issueCode: "transfer-network" as const }
+            : {}),
         });
         callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize);
       } finally {
@@ -11332,14 +11533,18 @@ export class SyncExecutor {
           let content: ArrayBuffer;
           const transferStartedAt = Date.now();
           try {
-            content = await this.onedrive.downloadFile(
-              this.vaultName,
-              item.path,
-              item.remote!.downloadUrl
-                ?? refreshedDownloadUrls.get(item.remote!.driveId),
-              item.remote!.driveId,
-              item.remote!.size,
+            content = await this.trackTransfer(
+              "download",
               undefined,
+              (report) => this.onedrive.downloadFile(
+                this.vaultName,
+                item.path,
+                item.remote!.downloadUrl
+                  ?? refreshedDownloadUrls.get(item.remote!.driveId),
+                item.remote!.driveId,
+                item.remote!.size,
+                report,
+              ),
             );
           } finally {
             metrics.fileTransfers.download.stagesMs.contentTransfer +=
@@ -12888,6 +13093,7 @@ export class SyncExecutor {
       mutationPersistence: createMutationPersistenceMetrics(),
       automaticHandling: createAutomaticHandlingMetrics(this.automaticHandlingPolicy),
     };
+    this.activeRunMetrics = metrics;
     const remoteUpserts: RemoteFileEntry[] = [];
     const remoteDeletes: string[] = [];
     if (this.isPersistedSelectedPluginCodeUploadRecovery(intent)) {
@@ -13505,6 +13711,10 @@ export class SyncExecutor {
             }
             continue;
           }
+          if (await this.tryAutoSettleFolderMutationRecovery(record)) {
+            settled++;
+            continue;
+          }
           this.logBlockedMutationEvidence(record);
           if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
           blocked.push({
@@ -13569,6 +13779,10 @@ export class SyncExecutor {
         continue;
       }
       if (!outcome) {
+        if (await this.tryAutoSettleFolderMutationRecovery(record)) {
+          settled++;
+          continue;
+        }
         if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
         this.logBlockedMutationEvidence(record);
         blocked.push({
@@ -15045,13 +15259,18 @@ export class SyncExecutor {
       return { executed: false };
     }
 
-    const remoteBytes = await this.onedrive.downloadFile(
-      this.vaultName,
-      item.path,
-      item.remote.downloadUrl,
-      item.remote.driveId,
-      item.remote.size,
+    const mergeRemote = item.remote;
+    const remoteBytes = await this.trackTransfer(
+      "download",
       callbacks.onFileProgress,
+      (report) => this.onedrive.downloadFile(
+        this.vaultName,
+        item.path,
+        mergeRemote.downloadUrl,
+        mergeRemote.driveId,
+        mergeRemote.size,
+        report,
+      ),
     );
     const remoteHash = await sha256Hex(remoteBytes);
     await this.verifyDownloadedPayload(item.path, item.remote, {
@@ -15110,13 +15329,17 @@ export class SyncExecutor {
           throw new MutationNotAppliedError(`Local version changed before automatic merge: ${item.path}`);
         }
 
-        await this.onedrive.uploadFile(
-          this.vaultName,
-          item.path,
-          merge.mergedBytes,
+        await this.trackTransfer(
+          "upload",
           callbacks.onFileProgress,
-          item.remote!.eTag,
-          item.remote!.driveId,
+          (report) => this.onedrive.uploadFile(
+            this.vaultName,
+            item.path,
+            merge.mergedBytes,
+            report,
+            item.remote!.eTag,
+            item.remote!.driveId,
+          ),
         );
         const uploadedRemote = await this.inspectRemotePath(item.path);
         if (!uploadedRemote || !await this.remoteMatchesTarget(uploadedRemote, target, true)) {
@@ -15799,13 +16022,17 @@ export class SyncExecutor {
         const uploadStartedAt = Date.now();
         let uploadResult: UploadResult;
         try {
-          uploadResult = await this.onedrive.uploadFile(
-            this.vaultName,
-            item.path,
-            content,
+          uploadResult = await this.trackTransfer(
+            "upload",
             callbacks.onFileProgress,
-            item.baseEtag,
-            item.remote?.driveId,
+            (report) => this.onedrive.uploadFile(
+              this.vaultName,
+              item.path,
+              content,
+              report,
+              item.baseEtag,
+              item.remote?.driveId,
+            ),
           );
           const uploadElapsedMs = Date.now() - uploadStartedAt;
           metrics.uploadNetworkMs += uploadElapsedMs;
@@ -15886,11 +16113,15 @@ export class SyncExecutor {
             }
             const retryStartedAt = Date.now();
             try {
-              uploadResult = await this.onedrive.uploadFile(
-                this.vaultName,
-                item.path,
-                content,
+              uploadResult = await this.trackTransfer(
+                "upload",
                 callbacks.onFileProgress,
+                (report) => this.onedrive.uploadFile(
+                  this.vaultName,
+                  item.path,
+                  content,
+                  report,
+                ),
               );
             } catch (retryError) {
               if (retryError instanceof OneDriveError && isRemoteMutationConflict(retryError)) {
@@ -15962,7 +16193,8 @@ export class SyncExecutor {
         metrics.fileTransfers.download.stagesMs.localVersionGuard +=
           Date.now() - firstLocalGuardStartedAt;
         if (beforeDownload) return beforeDownload;
-        const streamAdapter = this.getStreamDownloadAdapter(item.remote.size);
+        const remote = item.remote;
+        const streamAdapter = this.getStreamDownloadAdapter(remote.size);
         const tempDownloadPath = streamAdapter ? this.getDownloadTempPath(item.path) : null;
         let streamedDownload: { size: number; hash: string } | null = null;
         let content: ArrayBuffer | null = preparedDownload?.content ?? null;
@@ -15987,16 +16219,20 @@ export class SyncExecutor {
           this.diag?.log("execute", `download streaming to temp file — ${item.path}`);
           const transferStartedAt = Date.now();
           try {
-            streamedDownload = await this.onedrive.downloadFileToPath(
-              this.vaultName,
-              item.path,
-              tempDownloadPath,
-              streamAdapter,
-              item.remote.downloadUrl,
-              item.remote.driveId,
-              item.remote.size,
-              item.remote.sha256Hash,
+            streamedDownload = await this.trackTransfer(
+              "download",
               callbacks.onFileProgress,
+              (report) => this.onedrive.downloadFileToPath(
+                this.vaultName,
+                item.path,
+                tempDownloadPath,
+                streamAdapter,
+                remote.downloadUrl,
+                remote.driveId,
+                remote.size,
+                remote.sha256Hash,
+                report,
+              ),
             );
           } finally {
             metrics.fileTransfers.download.stagesMs.contentTransfer +=
@@ -16005,13 +16241,17 @@ export class SyncExecutor {
         } else {
           const transferStartedAt = Date.now();
           try {
-            content = await this.onedrive.downloadFile(
-              this.vaultName,
-              item.remote.path,
-              item.remote.downloadUrl,
-              item.remote.driveId,
-              item.remote.size,
+            content = await this.trackTransfer(
+              "download",
               callbacks.onFileProgress,
+              (report) => this.onedrive.downloadFile(
+                this.vaultName,
+                remote.path,
+                remote.downloadUrl,
+                remote.driveId,
+                remote.size,
+                report,
+              ),
             );
           } finally {
             metrics.fileTransfers.download.stagesMs.contentTransfer +=
@@ -19404,6 +19644,14 @@ export class SyncExecutor {
    * same fail-closed outcome as before. The reset preflight observation
    * (`mutationRecoveryObservationOnly`) keeps the independent token-less
    * rebuild because it must not trust committed state.
+   *
+   * `preserveReviewedSourceCommitSeq` mirrors the planning-delta guard in
+   * `tryDeltaOrFullScan`: while a reviewed plan is sealed at that commit
+   * sequence, a freshly observed projection that is fact-identical to the
+   * committed envelope must not advance `meta.commitSeq`. Graph rotates the
+   * delta cursor on every call, so an unconditional checkpoint here would
+   * invalidate the sealed plan identity every round while any ledger record
+   * stays blocked — the confirm/re-pause loop observed on 2026-09-12.
    */
   private async observeCompleteRemoteStateForMutationRecovery(
     operationEpoch: number,
@@ -19411,6 +19659,7 @@ export class SyncExecutor {
     syncScope: SyncScope,
     localEntries: LocalFileEntry[],
     allowIncremental: boolean,
+    preserveReviewedSourceCommitSeq?: number,
   ): Promise<void> {
     const envelope = this.state.getCommittedV2Envelope();
     const committedDeltaLink = envelope?.remoteIndex.deltaLink ?? null;
@@ -19433,6 +19682,8 @@ export class SyncExecutor {
         operationEpoch,
         result,
         syncScope,
+        true,
+        preserveReviewedSourceCommitSeq,
       );
       return;
     }
@@ -19449,6 +19700,23 @@ export class SyncExecutor {
         syncScope.filesRootId,
       );
       if (!this.canContinue(operationEpoch, result)) return;
+      if (
+        this.deferProjectionIdenticalRemoteCheckpoint(
+          preserveReviewedSourceCommitSeq,
+          {
+            entries: projection.entries,
+            folders: projection.folders,
+            scope: syncScope,
+          },
+        )
+      ) {
+        this.deferProjectionIdenticalRemoteCheckpointLog(
+          preserveReviewedSourceCommitSeq,
+          "recovery-observation",
+          delta.value.length,
+        );
+        return;
+      }
       await this.commitPreparedRemoteState(
         projection.entries,
         delta["@odata.deltaLink"] ?? null,
@@ -19469,6 +19737,8 @@ export class SyncExecutor {
           operationEpoch,
           result,
           syncScope,
+          true,
+          preserveReviewedSourceCommitSeq,
         );
         return;
       }
@@ -19476,21 +19746,84 @@ export class SyncExecutor {
     }
   }
 
+  /** Shared guard behind the reviewed-cursor preservation: the freshly
+   *  observed projection must be fact-identical to the committed envelope
+   *  and the envelope must still sit exactly at the reviewed commit
+   *  sequence. Cursor-only differences (Graph rotates the deltaLink on
+   *  every call) never qualify as a fact change. */
+  private deferProjectionIdenticalRemoteCheckpoint(
+    preserveReviewedSourceCommitSeq: number | undefined,
+    projection: Readonly<{
+      entries: RemoteFileEntry[];
+      folders: RemoteFolderEntry[];
+      scope: SyncScope;
+    }>,
+  ): boolean {
+    if (preserveReviewedSourceCommitSeq === undefined) return false;
+    const currentEnvelope = this.state.getCommittedV2Envelope();
+    return Boolean(
+      currentEnvelope
+      && currentEnvelope.meta.commitSeq === preserveReviewedSourceCommitSeq
+      && remoteStateProjectionMatchesEnvelopeV2(
+        currentEnvelope,
+        {
+          entries: projection.entries,
+          folders: projection.folders,
+          scope: projection.scope,
+        },
+      )
+    );
+  }
+
+  private deferProjectionIdenticalRemoteCheckpointLog(
+    preserveReviewedSourceCommitSeq: number | undefined,
+    source: string,
+    observedItems: number,
+  ): void {
+    this.diag?.log(
+      "state",
+      "deferred a projection-identical remote checkpoint until the sealed reviewed plan is resolved",
+      {
+        sourceCommitSeq: preserveReviewedSourceCommitSeq,
+        source,
+        observedItems,
+        mutations: 0,
+      },
+    );
+  }
+
   /** Rebuild a path-complete V1 snapshot through the validated V2 identity
-   * projector. The existing committed snapshot/cursor stays untouched until
-   * the complete replacement has passed hierarchy validation. */
+   *  projector. The existing committed snapshot/cursor stays untouched until
+   *  the complete replacement has passed hierarchy validation. When
+   *  `preserveReviewedSourceCommitSeq` is provided and the validated
+   *  replacement is fact-identical to the committed envelope, the
+   *  cursor-only checkpoint is deferred so a sealed reviewed plan keeps its
+   *  identity (same guard as `tryDeltaOrFullScan`). */
   private async rebuildRemoteStateFromIdentitySnapshot(
     operationEpoch: number,
     result: SyncResult,
     syncScope: SyncScope,
     persistPreparedState = true,
+    preserveReviewedSourceCommitSeq?: number,
   ): Promise<RemoteFileEntry[]> {
     const { filesRootId } = syncScope;
     const delta = await this.onedrive.getDelta(this.vaultName);
     const projection = this.projectCompleteRemoteSnapshot(delta.value, filesRootId);
     const entries = projection.entries;
     if (!this.canContinue(operationEpoch, result)) return entries;
-    if (persistPreparedState) {
+    if (
+      persistPreparedState
+      && this.deferProjectionIdenticalRemoteCheckpoint(
+        preserveReviewedSourceCommitSeq,
+        { entries, folders: projection.folders, scope: syncScope },
+      )
+    ) {
+      this.deferProjectionIdenticalRemoteCheckpointLog(
+        preserveReviewedSourceCommitSeq,
+        "recovery-observation-rebuild",
+        delta.value.length,
+      );
+    } else if (persistPreparedState) {
       await this.commitPreparedRemoteState(
         entries,
         delta["@odata.deltaLink"] ?? null,

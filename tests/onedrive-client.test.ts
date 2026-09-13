@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import * as obsidian from "obsidian";
 import { getEasySyncPaths } from "../src/obsidian-compat";
 import { OneDriveClient } from "../src/onedrive/client";
+import { UPLOAD_CHUNK_SLOW_BYTES } from "../src/onedrive/upload-session-policy";
 import {
   type DriveItem,
   OneDriveError,
@@ -592,7 +593,9 @@ describe("OneDriveClient.downloadFile", () => {
       message: "Download timed out for: recording.m4a",
     });
 
-    await vi.advanceTimersByTimeAsync(70_000);
+    // 5 MiB download budget under the 12 s/MiB curve: 30 s base + 60 s
+    // primary + 50% reserve = 135 s total before the uncancellable timeout.
+    await vi.advanceTimersByTimeAsync(140_000);
     await rejection;
     expect(requestSpy).toHaveBeenCalledTimes(1);
   });
@@ -1986,6 +1989,192 @@ describe("OneDriveClient shared V2 sync protocol", () => {
       }),
     );
   });
+
+  /** Run `body` with native fetch installed on the global window, restoring
+   *  the previous value afterwards. */
+  async function withNativeFetch<T>(
+    fetchImpl: (input: string, init?: RequestInit) => Promise<Response>,
+    body: () => Promise<T>,
+  ): Promise<T> {
+    const globalScope = globalThis as { window?: unknown };
+    const originalWindow = globalScope.window;
+    globalScope.window = { fetch: fetchImpl };
+    try {
+      return await body();
+    } finally {
+      if (originalWindow === undefined) delete globalScope.window;
+      else globalScope.window = originalWindow;
+    }
+  }
+
+  function slotListing(): unknown {
+    return {
+      status: 200,
+      headers: {},
+      json: {
+        value: [
+          {
+            id: "protocol-v2-id",
+            name: "protocol-v2.json",
+            size: 21,
+            eTag: "protocol-v2-etag",
+            file: {},
+            "@microsoft.graph.downloadUrl":
+              "https://download.example/protocol-v2.json",
+          },
+          {
+            id: "protocol-v3-id",
+            name: "protocol-v3.json",
+            size: 21,
+            eTag: "protocol-v3-etag",
+            file: {},
+            "@microsoft.graph.downloadUrl":
+              "https://download.example/protocol-v3.json",
+          },
+        ],
+      },
+    };
+  }
+
+  const slotProfile = {
+    v2: {
+      id: "protocol-v2-id",
+      eTag: "protocol-v2-etag",
+      content: '{"protocolVersion":2}',
+    },
+    v3: {
+      id: "protocol-v3-id",
+      eTag: "protocol-v3-etag",
+      content: '{"protocolVersion":3}',
+    },
+  };
+
+  it("reads slot content over native fetch and leaves requestUrl to the directory listing", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementation(async (options) => {
+        const url = String(options.url);
+        if (url.includes(".easy-sync:/children")) return slotListing() as never;
+        throw new Error(`requestUrl must not carry slot content: ${url}`);
+      });
+    const fetchSpy = vi.fn(async (url: string) => {
+      if (url.endsWith("/protocol-v2.json")) {
+        return new Response('{"protocolVersion":2}', { status: 200 });
+      }
+      if (url.endsWith("/protocol-v3.json")) {
+        return new Response('{"protocolVersion":3}', { status: 200 });
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await withNativeFetch(fetchSpy, () =>
+      expect(client.readSharedSyncProtocolObjects("testVault"))
+        .resolves.toEqual(slotProfile));
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to requestUrl when the native slot read fails, keeping the fetch error observable", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementation(async (options) => {
+        const url = String(options.url);
+        if (url.includes(".easy-sync:/children")) return slotListing() as never;
+        if (url.endsWith("/protocol-v2.json")) {
+          return { status: 200, headers: {}, text: '{"protocolVersion":2}' } as never;
+        }
+        if (url.endsWith("/protocol-v3.json")) {
+          return { status: 200, headers: {}, text: '{"protocolVersion":3}' } as never;
+        }
+        throw new Error(`Unexpected requestUrl: ${url}`);
+      });
+    const fetchSpy = vi.fn(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+    const diag = { log: vi.fn(), warn: vi.fn() };
+    const client = new OneDriveClient(async () => "token", diag as never);
+
+    await withNativeFetch(fetchSpy, () =>
+      expect(client.readSharedSyncProtocolObjects("testVault"))
+        .resolves.toEqual(slotProfile));
+    expect(requestSpy).toHaveBeenCalledTimes(3);
+    expect(diag.warn).toHaveBeenCalledWith(
+      "onedrive",
+      expect.stringContaining(
+        "shared protocol slot native fetch failed — falling back to requestUrl",
+      ),
+      { message: "Failed to fetch" },
+    );
+  });
+
+  it("does not fall back to requestUrl when the native slot read returns an HTTP error", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementation(async (options) => {
+        const url = String(options.url);
+        if (url.includes(".easy-sync:/children")) return slotListing() as never;
+        throw new Error(`requestUrl must not carry slot content: ${url}`);
+      });
+    const fetchSpy = vi.fn(async () => new Response("gone", { status: 404 }));
+    const client = new OneDriveClient(async () => "token");
+
+    const error = await withNativeFetch(fetchSpy, () =>
+      client.readSharedSyncProtocolObjects("testVault").then(
+        () => null,
+        (cause: unknown) => cause,
+      ));
+    expect(error).toBeInstanceOf(SharedSyncProtocolObservationError);
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fall back to requestUrl when the native slot read exceeds the byte budget", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementation(async (options) => {
+        const url = String(options.url);
+        if (url.includes(".easy-sync:/children")) return slotListing() as never;
+        throw new Error(`requestUrl must not carry slot content: ${url}`);
+      });
+    const oversize = new Uint8Array(1024 * 1024 + 1);
+    const fetchSpy = vi.fn(async () => new Response(oversize, { status: 200 }));
+    const client = new OneDriveClient(async () => "token");
+
+    const error = await withNativeFetch(fetchSpy, () =>
+      client.readSharedSyncProtocolObjects("testVault").then(
+        () => null,
+        (cause: unknown) => cause,
+      )) as SharedSyncProtocolObservationError | null;
+    expect(error?.observationCause).toMatchObject({
+      name: "ResponseByteBudgetError",
+    });
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("carries the redacted raw transport error into the status-0 warning", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      const url = String(options.url);
+      if (url.includes(".easy-sync:/children")) return slotListing() as never;
+      throw Object.assign(
+        new Error(
+          "net::ERR_NAME_NOT_RESOLVED https://download.example/protocol-v2.json?tempauth=secret",
+        ),
+        { status: 0 },
+      );
+    });
+    const diag = { log: vi.fn(), warn: vi.fn() };
+    const client = new OneDriveClient(async () => "token", diag as never);
+
+    await client.readSharedSyncProtocolObjects("testVault").catch(() => undefined);
+
+    const transportWarning = (diag.warn as unknown as {
+      mock: { calls: Array<[string, string, unknown]> };
+    }).mock.calls.find((call) =>
+      call[0] === "onedrive"
+      && call[1].includes("request transport failed — HTTP status unavailable")
+    );
+    expect(transportWarning?.[1]).toContain(
+      "errorMessage=net::ERR_NAME_NOT_RESOLVED [redacted-url]",
+    );
+    expect(transportWarning?.[1]).not.toContain("tempauth=secret");
+    expect(transportWarning?.[2]).toMatchObject({ stage: "dns", component: "v2" });
+  });
 });
 
 describe("OneDriveClient.moveItemById", () => {
@@ -2363,7 +2552,7 @@ describe("OneDriveClient.uploadFile", () => {
         .filter(([options]) => options.method === "PUT" && options.url === "https://upload.example/session")
         .map(([options]) => options.headers?.["Content-Range"]);
       expect(chunkRanges).toEqual([
-        `bytes 0-${10 * 1024 * 1024 - 1}/${total}`,
+        `bytes 0-${UPLOAD_CHUNK_SLOW_BYTES - 1}/${total}`,
         `bytes ${10 * 1024 * 1024}-${total - 1}/${total}`,
       ]);
       expect(summary?.endpoints.uploadSessionChunk?.statusCategories).toMatchObject({

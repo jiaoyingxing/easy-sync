@@ -506,6 +506,8 @@ export class AuthModule {
       || !data.device_code
       || !data.verification_uri
       || !data.expires_in
+      || !Number.isFinite(Number(data.expires_in))
+      || Number(data.expires_in) <= 0
     ) {
       this.diag?.error("auth", "devicecode endpoint returned an incomplete response");
       throw new AuthError(
@@ -522,8 +524,11 @@ export class AuthModule {
       userCode: data.user_code,
       verificationUri: data.verification_uri,
       verificationUriComplete: data.verification_uri_complete ?? null,
-      expiresAt: Date.now() + data.expires_in * 1000,
-      pollIntervalMs: Math.max(1000, (data.interval ?? 5) * 1000),
+      expiresAt: Date.now() + Number(data.expires_in) * 1000,
+      pollIntervalMs: Math.max(
+        1000,
+        finitePositiveNumber(data.interval, 5) * 1000,
+      ),
       createdAt: Date.now(),
     };
     this.pending = pending;
@@ -832,8 +837,10 @@ export class AuthModule {
 
     // Update in-memory state
     this.accessToken = tokenResponse.access_token;
-    this.state.accessTokenExpiry =
-      Date.now() + (tokenResponse.expires_in - 60) * 1000; // 60s buffer
+    this.state.accessTokenExpiry = resolveAccessTokenExpiryAt(
+      tokenResponse.expires_in,
+      Date.now(),
+    );
     this.state.isLoggedIn = true;
     this.resetRefreshBackoff();
 
@@ -924,8 +931,10 @@ export class AuthModule {
       this.assertGeneration(generation);
 
       this.accessToken = tokenResponse.access_token;
-      this.state.accessTokenExpiry =
-        Date.now() + (tokenResponse.expires_in - 60) * 1000;
+      this.state.accessTokenExpiry = resolveAccessTokenExpiryAt(
+        tokenResponse.expires_in,
+        Date.now(),
+      );
       this.state.isLoggedIn = true;
       this.resetRefreshBackoff();
 
@@ -1292,6 +1301,29 @@ export class AuthModule {
       this.onChange();
     }
   }
+}
+
+/** Provider `expires_in` → absolute access-token expiry instant. A missing or
+ *  non-numeric value must degrade to "already due" instead of NaN: freshness
+ *  checks compare `Date.now() < expiry`, and NaN always compares false in a
+ *  way that would make every later check take the refresh path forever. The
+ *  already-due form keeps the tokens just issued and simply refreshes again
+ *  on the next token need (60s buffer included in the healthy branch). */
+function resolveAccessTokenExpiryAt(expiresInSeconds: unknown, now: number): number {
+  const seconds = typeof expiresInSeconds === "number"
+    ? expiresInSeconds
+    : Number(expiresInSeconds);
+  return Number.isFinite(seconds) && seconds > 60
+    ? now + (seconds - 60) * 1000
+    : now;
+}
+
+/** Numeric provider fields arrive as JSON numbers; a corrupted value must
+ *  degrade to the documented default instead of poisoning timeout math
+ *  (e.g. `Math.max(1000, NaN)` scheduling an immediate-fire poll loop). */
+function finitePositiveNumber(value: unknown, fallback: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 /** Keep provider diagnostics useful without ever retaining tokens or codes. */

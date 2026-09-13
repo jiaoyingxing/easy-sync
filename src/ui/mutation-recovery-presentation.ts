@@ -99,9 +99,13 @@ export function mutationRecoveryPrimaryActionKey(
   state: Readonly<MutationRecoveryDisplayState>,
 ): keyof LocaleStrings | null {
   // Only real user actions survive the existence test: a keep-side review
-  // for facts-changed records, and a scope-recovery retry for scope-changed
-  // (a manual round re-runs scope recovery and can reach plan review).
-  // Every other recovery state is honest status without a choice button.
+  // for facts-changed ordinary-file records, and a scope-recovery retry for
+  // scope-changed (a manual round re-runs scope recovery and can reach plan
+  // review). Every other recovery state is honest status without a choice
+  // button. The blocked-folder settlement deliberately has NO top-slot
+  // button: its exit lives on the pending-list row / recovery-section body
+  // next to the record itself (2026-09-13 UI 裁决), and folderSettleAvailable
+  // only switches the next-step pointer below.
   if (
     state.kind === "blocked"
     && state.blockReason === "facts-changed"

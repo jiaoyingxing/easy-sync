@@ -6,7 +6,12 @@ const MIB = 1024 * 1024;
 export const UPLOAD_SESSION_THRESHOLD_BYTES = 4 * MIB;
 export const UPLOAD_CHUNK_ALIGNMENT_BYTES = 320 * 1024;
 export const UPLOAD_CHUNK_NORMAL_BYTES = 10 * MIB;
-export const UPLOAD_CHUNK_SLOW_BYTES = 5 * MIB;
+// OneDrive keeps only fully received, alignment-multiple chunks, so the slow
+// chunk must stay a 320 KiB multiple. 4 alignments (1.25 MiB) is the smallest
+// step that still fits the 15 s overhead budget at the 64 KiB/s floor rate —
+// a real slow link (2026-09-12: ~95–108 KiB/s) completes it and lets the
+// session advance, where a 5 MiB chunk always timed out and restarted at 0.
+export const UPLOAD_CHUNK_SLOW_BYTES = 4 * UPLOAD_CHUNK_ALIGNMENT_BYTES;
 
 const UPLOAD_SLOW_CONNECTION_BYTES_PER_SECOND = 1 * MIB;
 const UPLOAD_TIMEOUT_BASE_BYTES_PER_SECOND = 128 * 1024;
@@ -30,12 +35,10 @@ export function uploadSessionChunkSize(
 ): number {
   if (
     recovering
-    || (
-      observedBytesPerSecond !== null
-      && Number.isFinite(observedBytesPerSecond)
-      && observedBytesPerSecond > 0
-      && observedBytesPerSecond < UPLOAD_SLOW_CONNECTION_BYTES_PER_SECOND
-    )
+    || observedBytesPerSecond === null
+    || !Number.isFinite(observedBytesPerSecond)
+    || observedBytesPerSecond <= 0
+    || observedBytesPerSecond < UPLOAD_SLOW_CONNECTION_BYTES_PER_SECOND
   ) {
     return UPLOAD_CHUNK_SLOW_BYTES;
   }
@@ -46,11 +49,16 @@ export function uploadSessionChunkTimeoutMs(
   chunkBytes: number,
   observedBytesPerSecond: number | null,
 ): number {
+  // An unmeasured link must budget for the floor rate, not the optimistic
+  // base: the first chunk doubles as the link probe, and a chunk that can
+  // never land inside its budget leaves the session stuck at byte 0 forever
+  // (2026-09-12: a 9.1 MiB first chunk budgeted at 128 KiB/s timed out at
+  // 84.8 s on every attempt while the real link sat below ~108 KiB/s).
   const observedBudgetRate = observedBytesPerSecond !== null
     && Number.isFinite(observedBytesPerSecond)
     && observedBytesPerSecond > 0
     ? observedBytesPerSecond / 2
-    : UPLOAD_TIMEOUT_BASE_BYTES_PER_SECOND;
+    : UPLOAD_TIMEOUT_MIN_BYTES_PER_SECOND;
   const budgetRate = Math.max(
     UPLOAD_TIMEOUT_MIN_BYTES_PER_SECOND,
     Math.min(UPLOAD_TIMEOUT_BASE_BYTES_PER_SECOND, observedBudgetRate),

@@ -209,7 +209,11 @@ export interface LocaleStrings {
   "settings.reset.forceWarning": string;
   "settings.reset.forceConfirm": string;
   "settings.reset.done": string;
+  "settings.reset.leftoverDirectoryOne": string;
+  "settings.reset.leftoverDirectoryMany": string;
   "settings.reset.failed": string;
+  "notice.vaultCloudClient.onedrive": string;
+  "notice.vaultCloudClient.icloud": string;
   "settings.about.product.name": string;
   "settings.about.product.desc": string;
   "settings.about.author.name": string;
@@ -442,6 +446,7 @@ export interface LocaleStrings {
   "notice.sync.stage": string;
   "notice.sync.progress": string;
   "notice.sync.remoteScopeRecovery": string;
+  "notice.sync.verifyProgress": string;
   "notice.sync.actionProgress": string;
   "notice.sync.cancelling": string;
   "notice.sync.completed": string;
@@ -496,6 +501,8 @@ export interface LocaleStrings {
   "reason.folder.remote-content-version-unavailable": string;
   "reason.folder.local-create-unconfirmed": string;
   "reason.folder.local-inspection-failed": string;
+  "reason.circuitBreaker": string;
+  "reason.circuitBreaker.network": string;
   "reason.delete.folderNotEmpty": string;
   "reason.identityMove.deferred": string;
   "reason.identityMove.localTargetOccupied": string;
@@ -799,6 +806,7 @@ export interface LocaleStrings {
   "syncView.collapseAll": string;
   "syncView.expandAll": string;
   "syncView.history.title": string;
+  "syncView.transferRate.title": string;
   "syncView.openSettings": string;
   "syncView.openScopeManage": string;
   "syncView.history.empty": string;

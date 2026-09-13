@@ -2,6 +2,7 @@ import {
   ButtonComponent,
   ItemView,
   Notice,
+  Platform,
   TFile,
   WorkspaceLeaf,
   setIcon,
@@ -35,6 +36,10 @@ import {
   type SyncProgressState,
 } from "../sync/sync-progress";
 import type { PendingIssue, SyncHistoryEntry } from "../sync/state-manager";
+import {
+  formatTransferRate,
+  type TransferRateReading,
+} from "../sync/transfer-rate";
 import { ConfirmModal } from "./confirm-modal";
 import { applyDestructiveButton } from "./destructive-button";
 import { EmptyFolderResolutionModal } from "./empty-folder-resolution-modal";
@@ -973,6 +978,28 @@ export class EasySyncSyncView extends ItemView {
     this.closed = false;
     await this.plugin.ensureStateLoaded();
     if (this.closed) return;
+    // The mobile chip pins above the (in-flow) buttons row: re-anchor it as
+    // the list scrolls or the window resizes. Capture scroll on the window —
+    // the drawer's scroller is a nested element, and scroll does not bubble.
+    this.registerDomEvent(
+      window,
+      "scroll",
+      () => this.scheduleTransferRateFooterPosition(),
+      { capture: true, passive: true },
+    );
+    this.registerDomEvent(window, "resize", () =>
+      this.scheduleTransferRateFooterPosition(),
+    );
+    // Live reading cadence: sample the run's cumulative transfer counters
+    // once a second and refresh the indicator in place (a no-op write when
+    // nothing changed). The sidebar drives the sampler — polling lives with
+    // the only consumer, so main stays interval-free.
+    this.registerInterval(
+      window.setInterval(() => {
+        this.plugin.pollTransferRateTick();
+        this.refreshTransferRateValue();
+      }, 1000),
+    );
     this.contentEl.addEventListener(
       "toggle",
       this.handlePathLayoutToggle,
@@ -991,6 +1018,7 @@ export class EasySyncSyncView extends ItemView {
     );
     if (typeof ResizeObserver !== "undefined") {
       this.pathLayoutObserver = new ResizeObserver((entries) => {
+        this.scheduleTransferRateFooterPosition();
         const width = entries[0]?.contentRect.width ?? -1;
         if (Math.abs(width - this.pathLayoutObservedWidth) < 0.5) return;
         this.pathLayoutObservedWidth = width;
@@ -1016,6 +1044,8 @@ export class EasySyncSyncView extends ItemView {
     this.collapseToggleButtonEl = null;
     this.pathLayoutObserver?.disconnect();
     this.pathLayoutObserver = null;
+    for (const id of this.transferRateSettleTimeoutIds) window.clearTimeout(id);
+    this.transferRateSettleTimeoutIds = [];
     this.contentEl.removeEventListener(
       "toggle",
       this.handlePathLayoutToggle,
@@ -1271,6 +1301,8 @@ export class EasySyncSyncView extends ItemView {
         this.renderHistorySection(content, syncState?.syncHistory ?? []);
       }
 
+      this.renderTransferRateFooter(container);
+
       // Re-apply the toolbar state while retaining groups the user opened in
       // this exact reviewed revision.
       this.toggleAllDetails();
@@ -1301,6 +1333,7 @@ export class EasySyncSyncView extends ItemView {
       }
     }
 
+    this.refreshTransferRateValue();
     this.lastContentKey = contentKey;
     this.scheduleAdaptivePathLayout();
   }
@@ -1458,6 +1491,144 @@ export class EasySyncSyncView extends ItemView {
     );
 
     this.renderCollapseToggle(buttons);
+  }
+
+  /** Passive connection-speed reading. Mobile: a compact fixed chip pinned
+   *  (via JS-measured viewport offset) just above the host bottom action
+   *  bar; desktop: a panel-footer band at the bottom right. Both carriers
+   *  share the same rendering, level classes and color treatment — only
+   *  positioning differs. */
+  private renderTransferRateFooter(container: HTMLElement): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const reading = this.plugin.getTransferRateReading();
+    if (!reading) return;
+    const indicator = container.createDiv("easy-sync-transfer-rate");
+    if (Platform.isMobile) {
+      indicator.addClass("is-mobile-footer");
+    } else {
+      indicator.addClass("is-panel-footer");
+    }
+    indicator.addClass(`is-${reading.level}`);
+    this.fillTransferRateIndicator(indicator, reading);
+    setTooltip(indicator, t("syncView.transferRate.title"));
+    if (Platform.isMobile) {
+      // Invisible until the first valid anchor lands (visibility, not
+      // display, so the chip's height stays measurable): without this the
+      // chip flashes at its CSS fallback position — the "drift to the top
+      // right, then snap down" the user saw when opening the drawer
+      // instantly, before the buttons row reached its final place.
+      indicator.addClass("is-anchor-pending");
+      this.positionTransferRateFooter(indicator);
+      this.scheduleTransferRateAnchorSettle();
+    }
+  }
+
+  /** Pin the mobile chip directly above the buttons row, wherever the host
+   *  currently places that row (bottom action bar on narrow phones, top of
+   *  the drawer in wide layouts): measure the row's live position and set
+   *  the chip's leaf-relative `top` from it. Layout-agnostic by
+   *  construction — no per-layout CSS guessing. */
+  private positionTransferRateFooter(indicator: HTMLElement): void {
+    const buttons = this.contentEl.querySelector<HTMLElement>(
+      ".nav-buttons-container",
+    );
+    if (!buttons) return; // nothing to measure yet — stay anchor-pending
+    const buttonsRect = buttons.getBoundingClientRect();
+    const containerRect = this.contentEl.getBoundingClientRect();
+    // The first successful measurement clears the pending-invisible state;
+    // from here on only a genuinely off-screen row hides the chip.
+    indicator.removeClass("is-anchor-pending");
+    const offScreen =
+      buttonsRect.bottom < containerRect.top
+      || buttonsRect.top > containerRect.bottom;
+    indicator.toggleClass("is-hidden", offScreen);
+    if (offScreen) return;
+    indicator.style.setProperty(
+      "--transfer-rate-top",
+      `${Math.max(
+        0,
+        Math.round(buttonsRect.top - containerRect.top - indicator.offsetHeight - 4),
+      )}px`,
+    );
+  }
+
+  private transferRatePositionFrameId: number | null = null;
+
+  private scheduleTransferRateFooterPosition(): void {
+    if (this.transferRatePositionFrameId !== null) return;
+    this.transferRatePositionFrameId = compatRequestAnimationFrame(() => {
+      this.transferRatePositionFrameId = null;
+      const indicator = this.contentEl.querySelector<HTMLElement>(
+        ".easy-sync-transfer-rate",
+      );
+      if (indicator) this.positionTransferRateFooter(indicator);
+    });
+  }
+
+  private transferRateSettleTimeoutIds: number[] = [];
+
+  /** Drawer-open animations (and the host relocating the buttons row between
+   *  narrow/wide layouts) keep moving the anchor after the first
+   *  measurement: re-measure on a short bounded schedule so the chip lands
+   *  together with the drawer instead of trailing it. */
+  private scheduleTransferRateAnchorSettle(): void {
+    for (const delay of [80, 200, 450]) {
+      this.transferRateSettleTimeoutIds.push(
+        window.setTimeout(() => this.scheduleTransferRateFooterPosition(), delay),
+      );
+    }
+  }
+
+  private fillTransferRateIndicator(
+    indicator: HTMLElement,
+    reading: TransferRateReading,
+  ): void {
+    const iconEl = indicator.createSpan("easy-sync-transfer-rate-icon");
+    // Lucide ladder: full bars read as "excellent"; signal-zero means the
+    // link moved no bytes at all during attempted transfers.
+    setIcon(iconEl, reading.level === "high" ? "signal" : `signal-${reading.level}`);
+    if (reading.kbps !== null) {
+      indicator.createSpan("easy-sync-transfer-rate-value")
+        .setText(formatTransferRate(reading.kbps));
+    }
+  }
+
+  /** Per-second cadence and settled-run paths update the existing indicator
+   *  in place — a remove-and-rerender would flash the mobile chip and force
+   *  a pointless re-anchor. Renders only when no indicator exists yet. */
+  private refreshTransferRateValue(): void {
+    const reading = this.plugin.getTransferRateReading();
+    const indicator = this.contentEl.querySelector<HTMLElement>(
+      ".easy-sync-transfer-rate",
+    );
+    if (!reading) {
+      indicator?.remove();
+      return;
+    }
+    if (!indicator) {
+      this.renderTransferRateFooter(this.contentEl);
+      return;
+    }
+    for (const level of ["high", "medium", "low", "zero"] as const) {
+      indicator.toggleClass(`is-${level}`, reading.level === level);
+    }
+    const iconEl = indicator.querySelector<HTMLElement>(
+      ".easy-sync-transfer-rate-icon",
+    );
+    if (iconEl) {
+      setIcon(iconEl, reading.level === "high" ? "signal" : `signal-${reading.level}`);
+    }
+    const text = reading.kbps !== null ? formatTransferRate(reading.kbps) : null;
+    const valueEl = indicator.querySelector<HTMLElement>(
+      ".easy-sync-transfer-rate-value",
+    );
+    if (valueEl && text !== null) {
+      if (valueEl.textContent !== text) valueEl.setText(text);
+    } else if (valueEl) {
+      valueEl.remove();
+    } else if (text !== null) {
+      indicator.createSpan("easy-sync-transfer-rate-value").setText(text);
+    }
   }
 
   private renderCollapseToggle(container: HTMLElement): void {
@@ -2607,6 +2778,11 @@ export class EasySyncSyncView extends ItemView {
     }
   }
 
+  /**
+   * Folder-intent blocked recovery records carry no keep-side content
+   * decision: the exit confirms continuing from the current two-sided
+   * facts. Zero-write settlement; ordinary planning takes over afterwards.
+   */
   private async openCommunityPluginBundleReview(pluginId: string): Promise<void> {
     if (this.mutationRecoveryResolutionOpening) return;
     const rowKey = `bundle-review:${pluginId}`;

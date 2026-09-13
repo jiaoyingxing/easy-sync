@@ -2,9 +2,10 @@ import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { ConfigSyncModal, isPluginRowHiddenByCloudCleanup } from "../src/ui/config-sync-modal";
 import { SyncPlanAlertModal } from "../src/ui/confirm-modal";
-import { buildSettingsSyncButtonState } from "../src/ui/settings-tab";
+import { buildSettingsSyncButtonState, EasySyncSettingTab } from "../src/ui/settings-tab";
 import en from "../src/i18n/en";
 import zhCN from "../src/i18n/zh-cn";
+import type EasySyncPlugin from "../src/main";
 
 describe("buildSettingsSyncButtonState", () => {
   it("uses a warning cancel button while a full sync is running", () => {
@@ -185,6 +186,28 @@ describe("buildSettingsSyncButtonState", () => {
     expect(en["settings.autoSyncChangeDelay.disabledDesc"]).toBe(
       "Off. Local changes will not trigger sync automatically.",
     );
+  });
+
+  it("applies the tab container class at construction time for both render paths", () => {
+    // Obsidian 1.13.0+ renders the tab declaratively and never calls
+    // display(), so the class CSS scopes by must exist before any rendering.
+    const tab = new EasySyncSettingTab({ app: {} } as unknown as EasySyncPlugin);
+    expect(tab.containerEl.classList.contains("easy-sync-settings-tab")).toBe(
+      true,
+    );
+  });
+
+  it("keeps desktop settings action buttons on one shared minimum width", () => {
+    // The min-width equals the natural width of a four-CJK-char label at
+    // native button metrics, so two-char buttons align with wider ones. The
+    // element selector covers both render paths (1.13+ declarative render
+    // emits bare <button> without the .button class); the desktop guard and
+    // the clickable-icon exclusion are part of the contract.
+    const styles = readFileSync("styles.css", "utf8");
+    const rule = styles.match(
+      /body:not\(\.is-mobile\) \.easy-sync-settings-tab \.setting-item-control button:not\(\.clickable-icon\)\s*\{([^}]*)\}/,
+    )?.[1] ?? "";
+    expect(rule).toContain("min-width: calc(4em + var(--size-4-3) * 2)");
   });
 
   it("uses a native folder picker and native settings for device-local exclusions", () => {
@@ -1174,7 +1197,7 @@ describe("buildSettingsSyncButtonState", () => {
   it("keeps sync exclusion copy device-local and non-destructive in both locales", () => {
     expect(zhCN["settings.syncScope.name"]).toBe("同步范围");
     expect(zhCN["settings.syncScope.desc"]).toBe(
-      "选择要与仓库文件一起同步的 Obsidian 配置、主题和插件文件。",
+      "选择要同步的 Obsidian 配置、主题和插件文件。",
     );
     expect(en["settings.syncScope.name"]).toBe("Sync scope");
     expect(zhCN["settings.syncExclusion.name"]).toBe("同步排除");

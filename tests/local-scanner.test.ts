@@ -168,6 +168,30 @@ describe("LocalScanner plugin config paths", () => {
     expect(scanner.shouldSyncPath(".obsidian/app.json")).toBe(true);
   });
 
+  it("excludes Office lock files and OS temp files by basename anywhere in the vault", () => {
+    const vault = {
+      configDir: ".obsidian",
+      adapter: {},
+      getFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault);
+
+    expect(scanner.shouldSyncPath("~$Report.docx")).toBe(false);
+    expect(scanner.shouldSyncPath("Notes/~$Report.docx")).toBe(false);
+    expect(scanner.shouldSyncPath("Notes/scratch.tmp")).toBe(false);
+    expect(scanner.shouldSyncPath("Notes/scratch.TMP")).toBe(false);
+    expect(scanner.shouldSyncPath(".DS_Store")).toBe(false);
+    expect(scanner.shouldSyncPath("Notes/.DS_Store")).toBe(false);
+    expect(scanner.shouldSyncPath("Thumbs.db")).toBe(false);
+    // A subfolder Thumbs.db used to slip past the root-only prefix list.
+    expect(scanner.shouldSyncPath("Notes/Thumbs.db")).toBe(false);
+
+    // Near-miss names must stay in scope.
+    expect(scanner.shouldSyncPath("~salary.csv")).toBe(true);
+    expect(scanner.shouldSyncPath("Notes/template.tmpx")).toBe(true);
+    expect(scanner.shouldSyncPath("Notes/report.docx")).toBe(true);
+  });
+
   it.each([
     { code: false, data: false, expected: [
       ".obsidian/plugins/easy-sync/main.js",
@@ -910,5 +934,152 @@ describe("Preflight P0 — Included path failures make the scan incomplete", () 
     expect(result.entries.map((entry) => entry.path).sort())
       .toEqual(["assets/photo.png", "notes/note.md"]);
     expect(result.complete).toBe(true);
+  });
+});
+
+describe("LocalScanner fresh-file stat quirk (2026-09-13 mobile receipt incident)", () => {
+  // Android can report stat.size 0 for a file written moments ago while
+  // readBinary already returns the full bytes. The entry must describe the
+  // bytes it hashes: an entry carrying {size 0, hash of full content} reaches
+  // the upload receipt gate and gets the plugin's own successful receipt
+  // rejected, which blocked the mutation ledger on device.
+  const reportContent = new TextEncoder().encode("r".repeat(2048)).buffer;
+
+  function makeQuirkVault(options: {
+    maxFileSize?: number;
+    includePaths?: string[];
+    listedFiles?: string[];
+    vaultFilePath?: string;
+    seededCache?: string;
+    readBinaryResult?: ArrayBuffer;
+  } = {}) {
+    const adapter = {
+      exists: vi.fn(async () => true),
+      list: vi.fn(async () => ({ files: options.listedFiles ?? [], folders: [] })),
+      stat: vi.fn(async () => ({ size: 0, mtime: 7 })),
+      readBinary: vi.fn(async () => options.readBinaryResult ?? reportContent),
+      read: vi.fn(async () =>
+        options.seededCache ?? JSON.stringify({ format: 2, entries: {} })),
+      write: vi.fn(async () => undefined),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => options.vaultFilePath
+        ? [{ path: options.vaultFilePath, stat: { size: 0, mtime: 7 } }]
+        : []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      excludePaths: [],
+      includePaths: options.includePaths ?? [],
+      maxFileSize: options.maxFileSize ?? 50 * 1024 * 1024,
+      includePluginCode: false,
+      includePluginData: false,
+    });
+    return { scanner, adapter };
+  }
+
+  it("corrects a vault-file entry whose stat reported zero to the bytes it hashes", async () => {
+    const { scanner } = makeQuirkVault({ vaultFilePath: "报告 142744.md" });
+
+    const result = await scanner.scanAll();
+
+    expect(result.entries.map((entry) => entry.size))
+      .toEqual([reportContent.byteLength]);
+    expect(result.skippedLarge).toEqual([]);
+  });
+
+  it("skips a stat-zero file whose real bytes exceed the size cap after the read", async () => {
+    const { scanner } = makeQuirkVault({
+      vaultFilePath: "huge.mp4",
+      maxFileSize: 1024,
+    });
+
+    const result = await scanner.scanAll();
+
+    expect(result.entries).toEqual([]);
+    expect(result.skippedLarge).toEqual(["huge.mp4"]);
+  });
+
+  it("keeps a genuinely empty file empty instead of inventing a size", async () => {
+    const { scanner } = makeQuirkVault({
+      vaultFilePath: "empty.md",
+      readBinaryResult: new ArrayBuffer(0),
+    });
+
+    const result = await scanner.scanAll();
+
+    expect(result.entries.map((entry) => entry.size)).toEqual([0]);
+    expect(result.skippedLarge).toEqual([]);
+  });
+
+  it("self-heals a persisted pre-fix cache entry that pinned size zero", async () => {
+    const { scanner } = makeQuirkVault({
+      vaultFilePath: "报告 142744.md",
+      seededCache: JSON.stringify({
+        format: 2,
+        entries: {
+          "报告 142744.md": {
+            mtime: 7,
+            size: 0,
+            hash: "stale-full-content-hash",
+            binary: false,
+          },
+        },
+      }),
+    });
+
+    const result = await scanner.scanAll();
+
+    expect(result.entries.map((entry) => entry.size))
+      .toEqual([reportContent.byteLength]);
+  });
+
+  it("corrects included-directory entries scanned through the adapter listing", async () => {
+    const { scanner } = makeQuirkVault({
+      includePaths: ["attachments/"],
+      listedFiles: ["attachments/blob.bin"],
+    });
+
+    const result = await scanner.scanAll();
+
+    expect(result.entries.map((entry) => entry.size))
+      .toEqual([reportContent.byteLength]);
+  });
+
+  it("corrects included single-file entries", async () => {
+    const { scanner } = makeQuirkVault({
+      includePaths: ["config.json"],
+    });
+
+    const result = await scanner.scanAll();
+
+    expect(result.entries.map((entry) => entry.size))
+      .toEqual([reportContent.byteLength]);
+  });
+
+  it("corrects write-time inspections and re-classifies too-large after the read", async () => {
+    const { scanner } = makeQuirkVault();
+
+    const inspection = await scanner.inspectFile("报告 142744.md");
+    expect(inspection.status).toBe("present");
+    expect(inspection.status === "present" && inspection.entry.size)
+      .toBe(reportContent.byteLength);
+
+    const capped = new LocalScanner(({
+      adapter: {
+        stat: vi.fn(async () => ({ size: 0, mtime: 7 })),
+        readBinary: vi.fn(async () => reportContent),
+      },
+    } as unknown as Vault), {
+      excludePaths: [],
+      includePaths: [],
+      maxFileSize: 1024,
+      includePluginCode: false,
+      includePluginData: false,
+    });
+    await expect(capped.inspectFile("报告 142744.md")).resolves.toEqual({
+      status: "uncertain",
+      reason: "too-large",
+    });
   });
 });

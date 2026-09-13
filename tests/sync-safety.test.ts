@@ -32,6 +32,7 @@ import type {
   SyncScope,
 } from "../src/sync/types";
 import { SyncExecutor } from "../src/sync/sync-executor";
+import type { SyncResult } from "../src/sync/sync-executor";
 import { OneDriveClient } from "../src/onedrive/client";
 import { OneDriveError, OneDriveErrorType, type DriveItem } from "../src/onedrive/types";
 import type { LocalScanner } from "../src/sync/local-scanner";
@@ -1861,6 +1862,13 @@ describe("M17 circuit breaker retry semantics", () => {
   function makeBreakerExecutor(
     mode: "manual" | "auto",
     pendingActionType = SyncActionType.Download,
+    issueOverrides: Partial<{
+      issueCode: "transfer-network";
+      updatedAt: number;
+      localHash: string;
+      remoteETag: string;
+    }> = {},
+    scanSkippedLarge: string[] = [],
   ) {
     const downloadFile = vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3]).buffer);
     const remote: RemoteFileEntry = {
@@ -1881,6 +1889,7 @@ describe("M17 circuit breaker retry semantics", () => {
         fileSize: remote.size,
         remoteETag: remote.eTag,
         consecutiveFailures: 3,
+        ...issueOverrides,
       }],
     });
     const executor = new SyncExecutor(
@@ -1904,7 +1913,7 @@ describe("M17 circuit breaker retry semantics", () => {
           entries: [],
           folders: [],
           folderScanComplete: true,
-          skippedLarge: [],
+          skippedLarge: scanSkippedLarge,
           failedPaths: [],
           skippedCount: 0,
         }),
@@ -1949,6 +1958,82 @@ describe("M17 circuit breaker retry semantics", () => {
     expect(result.downloaded).toBe(1);
     expect(result.errors).toBe(0);
     expect(downloadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("auto sync backs off a network-failure file even after its version changed", async () => {
+    // 2026-09-12: a plugin re-bundled during a slow-network window changed
+    // hash every round, which reset the version-pinned counter and kept every
+    // auto round re-attempting a 4–5 minute doomed upload. A fresh network
+    // failure stamps the issue as transfer-network, so the breaker applies
+    // across versions while the backoff window is live.
+    const { executor, downloadFile, mode } = makeBreakerExecutor("auto", SyncActionType.Upload, {
+      issueCode: "transfer-network",
+      updatedAt: Date.now(),
+      localHash: "aa".repeat(32),
+    });
+
+    const result = await executor.run(mode, {});
+
+    expect(result.errors).toBe(1);
+    expect(downloadFile).not.toHaveBeenCalled();
+    expect(mode).toBe("auto");
+  });
+
+  it("auto sync retries a network-failure file once the backoff window expires", async () => {
+    const { executor, downloadFile } = makeBreakerExecutor("auto", SyncActionType.Upload, {
+      issueCode: "transfer-network",
+      updatedAt: Date.now() - 16 * 60 * 1000,
+      localHash: "aa".repeat(32),
+    });
+
+    const result = await executor.run("auto", {});
+
+    expect(result.downloaded).toBe(1);
+    expect(result.errors).toBe(0);
+    expect(downloadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("manual sync never defers a network-failure file through the breaker", async () => {
+    const { executor, downloadFile } = makeBreakerExecutor("manual", SyncActionType.Upload, {
+      issueCode: "transfer-network",
+      updatedAt: Date.now(),
+      localHash: "aa".repeat(32),
+    });
+
+    const result = await executor.run("manual", {});
+
+    expect(result.downloaded).toBe(1);
+    expect(result.errors).toBe(0);
+    expect(downloadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("oversized-file skips never accumulate into breaker failures", async () => {
+    // 2026-09-13 大文件演示.bin: an oversized file is a by-design terminal
+    // skip that never touches the network and carries no version identity,
+    // so its recurring issue row must not arm the breaker — otherwise the
+    // breaker converts the skip into a round-failing RetryLater and pauses
+    // the auto sync it exists to protect.
+    const { executor, downloadFile } = makeBreakerExecutor(
+      "auto",
+      SyncActionType.SkipLargeFile,
+      { remoteETag: undefined },
+      ["stuck.m4a"],
+    );
+
+    const result = await executor.run("auto", {});
+
+    expect(result.errors).toBe(0);
+    expect(result.downloaded).toBe(0);
+    expect(downloadFile).not.toHaveBeenCalled();
+  });
+
+  it("counts breaker-only deferrals so the pause gate can exempt them", async () => {
+    const { executor } = makeBreakerExecutor("auto");
+
+    const result = await executor.run("auto", {});
+
+    expect(result.errors).toBe(1);
+    expect(result.breakerDeferredErrors).toBe(1);
   });
 });
 
@@ -2456,7 +2541,7 @@ describe("Cloud baseline bootstrap safety", () => {
       undefined,
       "item-note",
       12,
-      undefined,
+      expect.anything(),
     );
     expect(writeBinary).toHaveBeenCalledWith(
       `${EASY_SYNC_TMP_DIR}/downloads/note.md.part.ready`,
@@ -2739,7 +2824,7 @@ describe("Cloud baseline bootstrap safety", () => {
         "item-recording",
         size,
         hash,
-        undefined,
+        expect.anything(),
       );
       expect(downloadFile).not.toHaveBeenCalled();
       expect(rename).toHaveBeenCalledWith(
@@ -10571,7 +10656,7 @@ describe("Persistent remote delta state", () => {
       "testVault",
       local.path,
       expect.any(ArrayBuffer),
-      undefined,
+      expect.anything(),
       remoteBeforeUpload.eTag,
       remoteBeforeUpload.driveId,
     );
@@ -15126,7 +15211,7 @@ describe("Execute-time file race safety", () => {
       "testVault",
       local.path,
       expect.any(ArrayBuffer),
-      undefined,
+      expect.anything(),
       "etag-old",
       "remote-id",
     );
@@ -21143,5 +21228,523 @@ describe("M19 anti-downgrade guard version comparison (finding ③)", () => {
     const skipped = await guard(items);
 
     expect(skipped).toBe(items.length);
+  });
+});
+
+// ---- Recovery observation reviewed-cursor preservation (plan re-pause loop) ----
+
+describe("recovery observation reviewed-cursor preservation", () => {
+  const scope: SyncScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+
+  const makeSyncResult = (): SyncResult => ({
+    success: false,
+    uploaded: 0,
+    downloaded: 0,
+    foldersCreated: 0,
+    foldersMoved: 0,
+    foldersDeleted: 0,
+    filesMoved: 0,
+    deleted: 0,
+    conflicts: 0,
+    deferred: 0,
+    skippedLarge: 0,
+    skippedIgnored: 0,
+    errors: 0,
+    authExpired: false,
+    message: "",
+    runFacts: {
+      termination: "normal",
+      ordinaryPlanning: "not-entered",
+      userFileChanges: "unknown",
+    },
+  });
+
+  interface ObservationHarness {
+    executor: SyncExecutor;
+    state: StateManager;
+    setRemoteState: ReturnType<typeof vi.fn>;
+    getDelta: ReturnType<typeof vi.fn>;
+  }
+
+  // One committed file at "note.md", one receipted ledger record, envelope
+  // complete at commitSeq 1 with cursor "delta-token". The delta mock returns
+  // the same single item (or nothing) plus a NEW cursor — Graph rotates the
+  // cursor on every call, so cursor-only differences are the no-change case.
+  const makeObservationHarness = async (
+    input: { changedETag?: string } = {},
+  ): Promise<ObservationHarness> => {
+    const path = "note.md";
+    const localHash = "a".repeat(64);
+    const committedEntry: RemoteFileEntry = {
+      path,
+      driveId: "note-id",
+      parentId: scope.filesRootId,
+      size: 5,
+      mtime: 1,
+      eTag: "etag-1",
+      cTag: "ctag-1",
+      sha256Hash: localHash,
+    };
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "stuck-op",
+      planRevision: 1,
+      scope,
+      action: "upload",
+      path,
+      expectedLocal: { exists: true, hash: localHash, size: 5 },
+      expectedRemote: {
+        exists: true,
+        driveId: "note-id",
+        eTag: "etag-1",
+        size: 5,
+        sha256Hash: localHash,
+      },
+      createdAt: 1,
+    };
+    const ledger: MutationLedgerEntryV1[] = [{
+      intent,
+      receipt: {
+        version: 1,
+        operationId: intent.operationId,
+        completedAt: 2,
+        checkpoint: {
+          baseUpserts: [],
+          baseRemovals: [],
+          remoteUpserts: [],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      },
+    }];
+    const state = makeActiveV2State([committedEntry], [], {
+      mutationLedger: ledger,
+    });
+    const deltaItem = (eTag: string): DriveItem => ({
+      id: "note-id",
+      name: path,
+      size: 5,
+      eTag,
+      cTag: "ctag-1",
+      lastModifiedDateTime: new Date(1).toISOString(),
+      parentReference: { id: scope.filesRootId, driveId: scope.driveId },
+      file: { hashes: { sha256Hash: localHash } },
+    });
+    // Incremental (token) pages carry only changes; the token-less rebuild
+    // feed carries the whole tree. Both rotate the cursor.
+    const getDelta = vi.fn(async (_vault: string, token?: string) => ({
+      value: token
+        ? (input.changedETag ? [deltaItem(input.changedETag)] : [])
+        : [deltaItem(input.changedETag ?? "etag-1")],
+      "@odata.deltaLink": "delta-token-2",
+    }));
+    const onedrive = makeMockOneDrive({ getDelta });
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault: {
+          configDir: ".obsidian",
+          adapter: makeMockAdapter(),
+          getAbstractFileByPath: vi.fn().mockReturnValue(null),
+          getFileByPath: vi.fn().mockReturnValue(null),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    const setRemoteState = state.setRemoteState as unknown as ReturnType<
+      typeof vi.fn
+    >;
+    return { executor, state, setRemoteState, getDelta };
+  };
+
+  const observe = async (
+    harness: ObservationHarness,
+    preserveSeq?: number,
+    allowIncremental = true,
+  ): Promise<void> => {
+    const epoch = (harness.executor as unknown as {
+      lifecycle: { capture(): number };
+    }).lifecycle.capture();
+    await (harness.executor as unknown as {
+      observeCompleteRemoteStateForMutationRecovery(
+        operationEpoch: number,
+        result: SyncResult,
+        syncScope: SyncScope,
+        localEntries: LocalFileEntry[],
+        allowIncremental: boolean,
+        preserveReviewedSourceCommitSeq?: number,
+      ): Promise<void>;
+    }).observeCompleteRemoteStateForMutationRecovery(
+      epoch,
+      makeSyncResult(),
+      scope,
+      [],
+      allowIncremental,
+      preserveSeq,
+    );
+  };
+
+  it("defers a projection-identical incremental observation while a reviewed plan is sealed at the current commit", async () => {
+    // Graph rotates the cursor on every call: an unchanged tree still yields
+    // a new deltaLink. Committing it would advance commitSeq and invalidate
+    // the sealed plan identity every round (the 2026-09-12 confirm/re-pause
+    // loop), so a fact-identical observation must defer the checkpoint.
+    const harness = await makeObservationHarness();
+    const before = harness.state.getCommittedV2Envelope();
+
+    await observe(harness, before.meta.commitSeq);
+
+    expect(harness.setRemoteState).not.toHaveBeenCalled();
+    const after = harness.state.getCommittedV2Envelope();
+    expect(after.meta.commitSeq).toBe(before.meta.commitSeq);
+    expect(after.remoteIndex.deltaLink).toBe(before.remoteIndex.deltaLink);
+  });
+
+  it("still commits the incremental observation when no reviewed plan is sealed", async () => {
+    const harness = await makeObservationHarness();
+
+    await observe(harness, undefined);
+
+    expect(harness.setRemoteState).toHaveBeenCalledTimes(1);
+  });
+
+  it("commits and lets the sealed plan invalidate when the observation sees a fact change", async () => {
+    const harness = await makeObservationHarness({ changedETag: "etag-2" });
+    const before = harness.state.getCommittedV2Envelope();
+
+    await observe(harness, before.meta.commitSeq);
+
+    expect(harness.setRemoteState).toHaveBeenCalledTimes(1);
+  });
+
+  it("defers a projection-identical full rebuild while a reviewed plan is sealed", async () => {
+    const harness = await makeObservationHarness();
+    const before = harness.state.getCommittedV2Envelope();
+
+    await observe(harness, before.meta.commitSeq, false);
+
+    expect(harness.setRemoteState).not.toHaveBeenCalled();
+    const after = harness.state.getCommittedV2Envelope();
+    expect(after.meta.commitSeq).toBe(before.meta.commitSeq);
+  });
+
+  it("commits a full rebuild that sees a fact change even while a reviewed plan is sealed", async () => {
+    const harness = await makeObservationHarness({ changedETag: "etag-2" });
+    const before = harness.state.getCommittedV2Envelope();
+
+    await observe(harness, before.meta.commitSeq, false);
+
+    expect(harness.setRemoteState).toHaveBeenCalledTimes(1);
+  });
+});
+describe("blocked folder records auto-settle from current facts (2026-09-13 拍板)", () => {
+  const scope: SyncScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+
+  const makeFolderRecord = (
+    path = "second-brain/books",
+  ): MutationLedgerEntryV1 => ({
+    intent: {
+      version: 2,
+      operationId: "stuck-folder-op",
+      planRevision: 1,
+      scope,
+      action: "createRemoteFolder",
+      path,
+      expectedLocal: { exists: true },
+      expectedRemote: {
+        exists: true,
+        driveId: "folder-created",
+        parentId: scope.filesRootId,
+        eTag: "etag-created",
+      },
+      expectedParent: { driveId: scope.filesRootId, path: "" },
+      createdAt: 1,
+    },
+    receipt: {
+      version: 1,
+      operationId: "stuck-folder-op",
+      completedAt: 2,
+      checkpoint: {
+        baseUpserts: [],
+        baseRemovals: [],
+        remoteUpserts: [],
+        remoteDeletes: [],
+        folderUpserts: [{
+          path,
+          driveId: "folder-created",
+          parentId: scope.filesRootId,
+          name: "books",
+          eTag: "etag-created",
+        }],
+        pendingConflictRemovals: [],
+        pendingDeleteRemovals: [],
+      },
+    },
+  });
+
+  const makeRecoverHarness = (record: MutationLedgerEntryV1) => {
+    const committedEntry: RemoteFileEntry = {
+      path: "note.md",
+      driveId: "note-id",
+      parentId: scope.filesRootId,
+      size: 5,
+      mtime: 1,
+      eTag: "etag-1",
+      cTag: "ctag-1",
+      sha256Hash: "a".repeat(64),
+    };
+    const state = makeActiveV2State([committedEntry], [], {
+      mutationLedger: [record],
+    });
+    const settleAsObserved = vi.fn(async () => true);
+    (state as unknown as {
+      settleFolderMutationRecoveryAsObserved: unknown;
+    }).settleFolderMutationRecoveryAsObserved = settleAsObserved;
+    const onedrive = makeMockOneDrive({
+      getDriveItemMetadata: vi.fn(async (_vault: string, candidate: string) => ({
+        id: "folder-created",
+        name: candidate.split("/").pop(),
+        folder: {},
+        eTag: "etag-now",
+        cTag: "ctag-now",
+        parentReference: { id: scope.filesRootId, driveId: scope.driveId },
+      })),
+    });
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault: {
+          configDir: ".obsidian",
+          adapter: makeMockAdapter({
+            stat: vi.fn(async () => null),
+          }),
+          getAbstractFileByPath: vi.fn().mockReturnValue(null),
+          getFileByPath: vi.fn().mockReturnValue(null),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    const epoch = (executor as unknown as {
+      lifecycle: { capture(): number };
+    }).lifecycle.capture();
+    const recover = () =>
+      (executor as unknown as {
+        recoverMutationLedger(
+          syncScope: SyncScope,
+          metrics: undefined,
+          operationEpoch: number,
+          observationOnly: boolean,
+        ): Promise<unknown>;
+      }).recoverMutationLedger(scope, undefined, epoch, false);
+    return { state, settleAsObserved, recover };
+  };
+
+  it("auto-retires a drifted receipted folder record with an audit entry and no blocked state", async () => {
+    const record = makeFolderRecord();
+    const { settleAsObserved, recover } = makeRecoverHarness(record);
+
+    await recover();
+
+    expect(settleAsObserved).toHaveBeenCalledTimes(1);
+    expect(settleAsObserved).toHaveBeenCalledWith({
+      expectedRecord: record,
+    });
+  });
+
+  it("keeps the fail-closed block for folder records on managed paths (no auto-settle)", async () => {
+    const record = makeFolderRecord(".obsidian/appearance.json");
+    const { settleAsObserved, recover } = makeRecoverHarness(record);
+
+    await expect(recover()).rejects.toThrow();
+    expect(settleAsObserved).not.toHaveBeenCalled();
+  });
+});
+
+describe("connection-speed in-flight overlay", () => {
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+  async function makeLocalEntry(
+    path: string,
+    content: ArrayBuffer,
+  ): Promise<LocalFileEntry> {
+    return {
+      path,
+      hash: await sha256Hex(content),
+      size: content.byteLength,
+      mtime: 2,
+      binary: false,
+    };
+  }
+
+  function makeUploadExecutor(
+    entries: LocalFileEntry[],
+    contents: Map<string, ArrayBuffer>,
+    uploadFile: ReturnType<typeof vi.fn>,
+  ): SyncExecutor {
+    return new SyncExecutor(
+      makeMockOneDrive({
+        uploadFile,
+        getFileMetadata: vi.fn().mockResolvedValue(undefined),
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter({
+            readBinary: vi.fn(async (path: string) => {
+              const content = contents.get(path);
+              if (content === undefined) throw new Error(`no content for ${path}`);
+              return content;
+            }),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries,
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn(async (target: string) => {
+          const entry = entries.find((candidate) => candidate.path === target);
+          return entry
+            ? { status: "present", entry }
+            : { status: "missing" };
+        }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      makeActiveV2State([], []),
+      "testVault",
+    );
+  }
+
+  it("reports byte-level movement while a single upload is still transferring and reconciles without double counting", async () => {
+    const content = new Uint8Array(1024).fill(7).buffer;
+    const local = await makeLocalEntry("big-note.md", content);
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const uploadFile = vi.fn(
+      async (
+        _vault: string,
+        _path: string,
+        bytes: ArrayBuffer,
+        onProgress?: (downloaded: number, total: number) => void,
+      ) => {
+        for (let part = 1; part <= 4; part++) {
+          await sleep(20);
+          onProgress?.(Math.floor(bytes.byteLength * part / 5), bytes.byteLength);
+        }
+        await released;
+        onProgress?.(bytes.byteLength, bytes.byteLength);
+        return { id: "new-upload-id", eTag: "new-upload-etag", cTag: "new-upload-ctag" };
+      },
+    );
+    const executor = makeUploadExecutor([local], new Map([["big-note.md", content]]), uploadFile);
+
+    const runPromise = executor.run("manual", {});
+    let mid: { bytes: number; ms: number } | null = null;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const snapshot = executor.getActiveTransferMetrics();
+      if (
+        snapshot
+        && snapshot.upload.bytes > 0
+        && snapshot.upload.bytes < content.byteLength
+        && snapshot.upload.ms > 0
+      ) {
+        mid = snapshot.upload;
+        break;
+      }
+      await sleep(5);
+    }
+    expect(mid).not.toBeNull();
+    expect(mid!.bytes).toBeLessThan(content.byteLength);
+    release();
+    const result = await runPromise;
+    expect(result.uploaded).toBe(1);
+    const settled = executor.getActiveTransferMetrics();
+    expect(settled?.upload.bytes).toBe(content.byteLength);
+  });
+
+  it("sums bytes across two uploads transferring in parallel", async () => {
+    const contentA = new Uint8Array(1024).fill(1).buffer;
+    const contentB = new Uint8Array(2048).fill(2).buffer;
+    const localA = await makeLocalEntry("a-note.md", contentA);
+    const localB = await makeLocalEntry("b-note.md", contentB);
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const uploadFile = vi.fn(
+      async (
+        _vault: string,
+        path: string,
+        bytes: ArrayBuffer,
+        onProgress?: (downloaded: number, total: number) => void,
+      ) => {
+        onProgress?.(Math.floor(bytes.byteLength / 2), bytes.byteLength);
+        await released;
+        onProgress?.(bytes.byteLength, bytes.byteLength);
+        return { id: `upload-${path}`, eTag: "new-upload-etag", cTag: "new-upload-ctag" };
+      },
+    );
+    const executor = makeUploadExecutor(
+      [localA, localB],
+      new Map([["a-note.md", contentA], ["b-note.md", contentB]]),
+      uploadFile,
+    );
+
+    const runPromise = executor.run("manual", {});
+    let parallelBytes: number | null = null;
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const snapshot = executor.getActiveTransferMetrics();
+      const combinedHalf = Math.floor(contentA.byteLength / 2)
+        + Math.floor(contentB.byteLength / 2);
+      if (snapshot && snapshot.upload.bytes >= combinedHalf && snapshot.upload.ms > 0) {
+        parallelBytes = snapshot.upload.bytes;
+        break;
+      }
+      await sleep(5);
+    }
+    release();
+    await runPromise;
+    expect(parallelBytes).not.toBeNull();
+    expect(parallelBytes!).toBeGreaterThanOrEqual(
+      Math.floor(contentA.byteLength / 2) + Math.floor(contentB.byteLength / 2),
+    );
+  });
+
+  it("leaves no phantom in-flight bytes after a failed transfer", async () => {
+    const content = new Uint8Array(512).fill(3).buffer;
+    const local = await makeLocalEntry("fail-note.md", content);
+    const uploadFile = vi.fn(
+      async (
+        _vault: string,
+        _path: string,
+        bytes: ArrayBuffer,
+        onProgress?: (downloaded: number, total: number) => void,
+      ) => {
+        onProgress?.(Math.floor(bytes.byteLength / 2), bytes.byteLength);
+        throw new Error("network down");
+      },
+    );
+    const executor = makeUploadExecutor([local], new Map([["fail-note.md", content]]), uploadFile);
+
+    await executor.run("manual", {});
+    const settled = executor.getActiveTransferMetrics();
+    expect(settled?.upload.bytes ?? 0).toBe(0);
   });
 });

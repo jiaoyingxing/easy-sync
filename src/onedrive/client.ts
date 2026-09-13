@@ -112,7 +112,11 @@ const DELTA_SELECT = [
   "specialFolder",
 ].join(",");
 const DOWNLOAD_BASE_TIMEOUT_MS = 30_000;  // 30s base — covers slow/unstable connections
-const DOWNLOAD_PER_MIB_TIMEOUT_MS = 3_000;  // 3s/MiB — slower connections need more headroom
+// 12s/MiB — budgets a 9 MiB file at ~2.4 min so a real slow link (~50 KiB/s,
+// 2026-09-12 mobile: seven consecutive 85.5s timeouts at 3s/MiB) can finish
+// inside one budget; downloads have no resumable retry, so a too-tight budget
+// wastes the whole transfer instead of part of it.
+const DOWNLOAD_PER_MIB_TIMEOUT_MS = 12_000;
 const DOWNLOAD_MAX_TIMEOUT_MS = 300_000; // 5min hard cap — slow connections may need minutes, not seconds
 const DOWNLOAD_FAILURE_RESERVE_RATIO = 0.5;  // 50% reserve for slow/stalled connections
 const UPLOAD_SESSION_CONTROL_TIMEOUT_MS = 15_000;
@@ -2303,10 +2307,7 @@ export class OneDriveClient {
       response = await this.requestSharedSyncProtocolUrl(
         requestKey,
         METADATA_READ_TIMEOUT_MS,
-        () => requestUrl({
-          url: downloadUrl,
-          method: "GET",
-        }),
+        () => this.readSharedSyncProtocolContentUrl(downloadUrl, maxResponseBytes, label),
       );
     } catch (error) {
       if (isResponseByteBudgetError(error)) throw error;
@@ -2339,6 +2340,45 @@ export class OneDriveClient {
       eTag: item.eTag,
       content: responseToText(response, maxResponseBytes, label),
     };
+  }
+
+  /** Read one shared-protocol slot's pre-signed content URL. Native fetch is
+   *  the primary transport because requestUrl carries the documented CDN
+   *  defects on Android (base64 body) and iOS (status 0); requestUrl stays as
+   *  the fallback because on these hosts it is the transport that reports a
+   *  transport-level error text, which the CDN stage grading needs. Only a
+   *  native-fetch transport failure falls back — HTTP and byte-budget errors
+   *  propagate unchanged. */
+  private async readSharedSyncProtocolContentUrl(
+    downloadUrl: string,
+    maxResponseBytes: number,
+    label: "SharedSyncProtocolV2" | "SharedSyncProtocolV3",
+  ): Promise<RequestUrlResponse> {
+    try {
+      return await downloadUrlFetch(downloadUrl, maxResponseBytes, label);
+    } catch (error) {
+      if (isResponseByteBudgetError(error)) throw error;
+      if (isFetchUnavailableError(error)) {
+        this.diag?.log(
+          "onedrive",
+          "native fetch unavailable; reading shared protocol slot content via requestUrl",
+        );
+      } else if (
+        error instanceof TypeError
+        || (error as { status?: number }).status === 0
+      ) {
+        // Keep the failure observable on its own transport, so a later
+        // episode can be compared across transports instead of guessed.
+        this.diag?.warn(
+          "onedrive",
+          `shared protocol slot native fetch failed — falling back to requestUrl, url=${sanitizeUrl(downloadUrl)}`,
+          { message: requestErrorMessage(error) },
+        );
+      } else {
+        throw error;
+      }
+      return await requestUrl({ url: downloadUrl, method: "GET" });
+    }
   }
 
   private requestSharedSyncProtocolUrl(
@@ -3015,7 +3055,7 @@ export class OneDriveClient {
     } else if (errStatus === 0) {
       this.diag?.warn(
         "onedrive",
-        `request transport failed — HTTP status unavailable, url=${sanitizeUrl(url)}`,
+        `request transport failed — HTTP status unavailable, errorMessage=${requestErrorMessage(rawError)}, url=${sanitizeUrl(url)}`,
         detail,
       );
     }
