@@ -9,8 +9,14 @@ const configDir = ".obsidian";
 
 function download(
   path: string,
-): { path: string; actionType: SyncActionType.Download } {
-  return { path, actionType: SyncActionType.Download };
+): { path: string; actionType: SyncActionType.Download; status: "download" } {
+  return { path, actionType: SyncActionType.Download, status: "download" };
+}
+
+function failedDownload(
+  path: string,
+): { path: string; actionType: SyncActionType.Download; status: "error" } {
+  return { path, actionType: SyncActionType.Download, status: "error" };
 }
 
 describe("community plugin update facts", () => {
@@ -131,5 +137,52 @@ describe("community plugin update facts", () => {
     });
     expect(candidates).toEqual([{ pluginId: "calendar", manifestDownloaded: false }]);
     expect<CommunityPluginAutoUpdateCandidate[]>(candidates).toHaveLength(1);
+  });
+
+  it("does not claim an update when every bundle download of the round failed", () => {
+    // A failed download never wrote the new files; announcing "updated,
+    // restart to take effect" would be a false success.
+    const candidates = buildCommunityPluginUpdateFacts({
+      configDir,
+      participatingBeforePluginIds: ["calendar"],
+      files: [
+        failedDownload(`${configDir}/plugins/calendar/main.js`),
+        failedDownload(`${configDir}/plugins/calendar/manifest.json`),
+      ],
+    });
+    expect(candidates).toEqual([]);
+  });
+
+  it("does not claim a plugin whose bundle downloads partially failed this round", () => {
+    const candidates = buildCommunityPluginUpdateFacts({
+      configDir,
+      participatingBeforePluginIds: ["quickadd", "calendar"],
+      files: [
+        // Manifest arrived but the code member failed: the bundle is mixed,
+        // the plugin would still run old code after a restart.
+        download(`${configDir}/plugins/quickadd/manifest.json`),
+        failedDownload(`${configDir}/plugins/quickadd/main.js`),
+        // Code member arrived but the manifest failed: mixed bundle either way.
+        download(`${configDir}/plugins/calendar/main.js`),
+        failedDownload(`${configDir}/plugins/calendar/manifest.json`),
+      ],
+    });
+    expect(candidates).toEqual([]);
+  });
+
+  it("still claims updates from successful bundle downloads alongside unrelated failures", () => {
+    const candidates = buildCommunityPluginUpdateFacts({
+      configDir,
+      participatingBeforePluginIds: ["calendar", "dataview"],
+      files: [
+        failedDownload("notes/meeting.md"),
+        download(`${configDir}/plugins/calendar/main.js`),
+        download(`${configDir}/plugins/dataview/manifest.json`),
+      ],
+    });
+    expect(candidates).toEqual([
+      { pluginId: "calendar", manifestDownloaded: false },
+      { pluginId: "dataview", manifestDownloaded: true },
+    ]);
   });
 });

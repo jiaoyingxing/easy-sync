@@ -478,6 +478,261 @@ describe("OneDriveClient.downloadFile", () => {
     }
   });
 
+  it("kills a stalled CDN fetch at the 60s zero-progress watchdog and retries within budget", async () => {
+    vi.useFakeTimers();
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    // 2026-09-13 real failure: a stalled attempt burned its full 300-450s
+    // budget with zero bytes. The watchdog must abort the dead connection at
+    // 60s so the waterfall retries on a fresh connection while budget
+    // remains — a working second attempt must complete the download.
+    const fetchSpy = vi.fn()
+      .mockImplementationOnce((_url: string, init?: { signal?: AbortSignal }) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        }))
+      .mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3]).buffer, { status: 200 }));
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: {
+        "@microsoft.graph.downloadUrl": "https://download.example/recording.m4a",
+      },
+    });
+    try {
+      const client = new OneDriveClient(async () => "token");
+      const pending = client.downloadFile(
+        "testVault",
+        "recording.m4a",
+        undefined,
+        "file-id",
+        5 * 1024 * 1024,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      // The watchdog fires at 60s, far inside the ~135s total budget; the
+      // retry backoff sleep lands just past the advanced window.
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(pending).resolves.toEqual(expect.any(ArrayBuffer));
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("kills a stalled CDN body read at the 60s zero-progress watchdog", async () => {
+    vi.useFakeTimers();
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    // Body arrives, then the connection stalls mid-stream forever. The
+    // watchdog aborts the dead read, the partial file is cleaned up, and the
+    // retried attempt completes.
+    const fetchSpy = vi.fn()
+      .mockImplementationOnce(() => Promise.resolve(new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+            // Never closes: the connection stalls after the first chunk.
+          },
+        }),
+        { status: 200 },
+      )))
+      .mockResolvedValueOnce(new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1, 2, 3, 4, 5]));
+            controller.close();
+          },
+        }),
+        { status: 200 },
+      ));
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    const localPath = `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`;
+    const adapter = {
+      writeBinary: vi.fn().mockResolvedValue(undefined),
+      appendBinary: vi.fn().mockResolvedValue(undefined),
+      remove: vi.fn().mockResolvedValue(undefined),
+    };
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: {
+        "@microsoft.graph.downloadUrl": "https://download.example/recording.m4a",
+      },
+    });
+    try {
+      const client = new OneDriveClient(async () => "token");
+      const pending = client.downloadFileToPath(
+        "testVault",
+        "recording.m4a",
+        localPath,
+        adapter as never,
+        undefined,
+        "file-id",
+        5 * 1024 * 1024,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(adapter.remove).toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2_000);
+      await expect(pending).resolves.toMatchObject({ size: 5 });
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a too-slow CDN download and retries on a fresh connection", async () => {
+    vi.useFakeTimers();
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    // 2026-09-14 sampling: per-connection rates span 84 KiB/s – 3.2 MiB/s on
+    // the same link (7/10 connections below 512 KiB/s). A slow connection
+    // must be dropped at the user-set gate (512 KiB/s over 15 s) so the
+    // waterfall retries on a fresh connection instead of crawling.
+    const M = 1024 * 1024;
+    const fileBytes = 8 * M;
+    const fetchSpy = vi.fn()
+      .mockImplementationOnce(() => Promise.resolve(new Response(
+        new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            // ~100 KiB/s: 1 KiB every 10 ms of fake time — below the gate.
+            await new Promise<void>((resolve) => setTimeout(resolve, 10));
+            controller.enqueue(new Uint8Array(1024));
+          },
+        }),
+        { status: 200 },
+      )))
+      .mockResolvedValueOnce(new Response(new Uint8Array(fileBytes), { status: 200 }));
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: {
+        "@microsoft.graph.downloadUrl": "https://download.example/recording.m4a",
+      },
+    });
+    try {
+      const client = new OneDriveClient(async () => "token");
+      const pending = client.downloadFile(
+        "testVault",
+        "recording.m4a",
+        undefined,
+        "file-id",
+        fileBytes,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      // The gate fires at ~15 s (far inside the 57 s budget); the retry
+      // backoff sleep lands just past the advanced window.
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(2_000);
+      const result = await pending;
+      expect(result.byteLength).toBe(fileBytes);
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts the fourth connection after three slow-abort reconnects", async () => {
+    vi.useFakeTimers();
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    // Every connection is slow: after three slow-aborts the gate must accept
+    // the fourth connection and let it finish (a genuinely slow link must
+    // complete rather than loop).
+    const M = 1024 * 1024;
+    const fileBytes = 16 * M;
+    const trickleForever = () => Promise.resolve(new Response(
+      new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          // ~455 KiB/s: 4 KiB every 9 ms of fake time — below the 512 gate.
+          await new Promise<void>((resolve) => setTimeout(resolve, 9));
+          controller.enqueue(new Uint8Array(4096));
+        },
+      }),
+      { status: 200 },
+    ));
+    const trickleFinite = () => {
+      let sent = 0;
+      return Promise.resolve(new Response(
+        new ReadableStream<Uint8Array>({
+          async pull(controller) {
+            await new Promise<void>((resolve) => setTimeout(resolve, 9));
+            if (sent >= fileBytes / 4096) { controller.close(); return; }
+            sent++;
+            controller.enqueue(new Uint8Array(4096));
+          },
+        }),
+        { status: 200 },
+      ));
+    };
+    const fetchSpy = vi.fn()
+      .mockImplementationOnce(trickleForever)
+      .mockImplementationOnce(trickleForever)
+      .mockImplementationOnce(trickleForever)
+      .mockImplementationOnce(trickleFinite);
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: {
+        "@microsoft.graph.downloadUrl": "https://download.example/big.bin",
+      },
+    });
+    try {
+      const client = new OneDriveClient(async () => "token");
+      const pending = client.downloadFile(
+        "testVault",
+        "big.bin",
+        "https://download.example/big.bin",
+        "file-id",
+        fileBytes,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      // Three slow-aborts (hint tier ×1, metadata tier ×1, path /content
+      // tier ×1), then the item ID /content tier's connection is accepted
+      // and finishes at ~455 KiB/s.
+      await vi.advanceTimersByTimeAsync(66_000);
+      expect(fetchSpy).toHaveBeenCalledTimes(4);
+      // The accepted connection finishes the remaining ~17 s of trickle at
+      // ~455 KiB/s; keep the fake clock running until it lands.
+      await vi.advanceTimersByTimeAsync(30_000);
+      const result = await pending;
+      expect(result.byteLength).toBe(fileBytes);
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+      vi.useRealTimers();
+    }
+  });
+
   it("cancels a pending streamed CDN retry without opening another transfer", async () => {
     vi.useFakeTimers();
     const originalWindow = (globalThis as { window?: unknown }).window;

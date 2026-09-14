@@ -6,8 +6,8 @@
  * - Per-round RAW accumulations (`TransferRateFactsV1`: bytes plus
  *   content-transfer ms per direction) are persisted in a small window and on
  *   history entries. They are the honest ledger: the diagnostic report's
- *   per-round table reads them, and they reseed the live reading after a
- *   reload.
+ *   per-round table reads them, and they seed the live reading's smoothing
+ *   prior after a reload.
  * - The displayed reading (`TransferRateSampler`) follows standard
  *   connection-speed display practice: sample real byte movement on a fixed
  *   cadence, smooth with an exponential moving average so every transfer
@@ -44,14 +44,26 @@ const TRANSFER_ZERO_MS = 5_000;
  *  Short of it, samples blend; long after it, fresh measurements dominate. */
 const TRANSFER_RATE_SMOOTHING_TAU_MS = 4_000;
 /** Samples with less transfer time than this are noisy speed estimates and
- *  get proportionally less weight in the fold. */
+ *  get proportionally less weight in the fold — relative to the wall window
+ *  the sample sits in, capped here: a per-second tick of a sustained
+ *  transfer covers its whole (short) window and keeps full weight, while a
+ *  brief burst inside a long quiet gap does not. */
 const TRANSFER_RATE_SAMPLE_CONFIDENCE_MS = 2_000;
+/** A direction whose newest sample is within this window is actively
+ *  transferring: while one exists, the reading quotes those directions
+ *  alone — an idle direction's older (but still fresh) rate must not cap
+ *  the live one, and once nothing moves the reading falls back to the most
+ *  recently measured direction. Sync rounds alternate upload/download
+ *  phases, so the previous phase's speed would otherwise be shown for
+ *  minutes into the next one. */
+const TRANSFER_RATE_ACTIVE_MS = 5_000;
 /** A direction's smoothed rate only counts while it is within this window:
- *  past it the direction drops out of the worse-direction combine, and the
- *  reading itself disappears once nothing is fresh — a stale figure
- *  presented as the current speed would be wrong, and the user prefers it
- *  hidden (用户拍板 2026-09-13: 宁愿不要显示，不能显示个错的). */
-const TRANSFER_RATE_READING_FRESH_MS = 600_000;
+ *  past it the direction drops out of the reading entirely, and the reading
+ *  itself disappears once nothing is fresh — a stale figure presented as
+ *  the current speed would be wrong (用户拍板 2026-09-13: 宁愿不要显示，
+ *  不能显示个错的; 同日用户指示窗口自 10 分钟收紧为 10 秒——没有真实
+ *  传输就没有"当前速度"可显示). */
+const TRANSFER_RATE_READING_FRESH_MS = 10_000;
 
 export interface TransferDirectionMetricsInput {
   logicalBytes?: number;
@@ -132,8 +144,10 @@ export function formatTransferRate(kbps: number): string {
  *  - `addRoundFacts`: the settled per-round aggregate, so every round with
  *    bytes moves the reading even when it was too small for a tick to catch.
  *
- *  Smoothing state is session-local and reseeded from the persisted raw
- *  window on load; only the raw ledger is persisted. */
+ *  Smoothing state is session-local; the persisted raw window only seeds
+ *  the smoothing prior on load (display itself needs samples inside the
+ *  10-second freshness window, so a reloaded device stays blank until real
+ *  bytes move again). Only the raw ledger is persisted. */
 
 export interface TransferRateTickSnapshot {
   upload: { bytes: number; ms: number };
@@ -173,11 +187,12 @@ export class TransferRateSampler {
     download: createSamplerDirectionState(),
   };
 
-  /** Reseed from persisted raw round facts (stored newest first): the
-   *  reading survives reloads without persisting smoothing state. Entries
-   *  from the first released shape (derived KB/s, 2026-09-13 012242) are
-   *  converted onto an equivalent nominal 10-second sample so existing
-   *  devices keep a reading instead of going blank. */
+  /** Seed the smoothing prior from persisted raw round facts (stored newest
+   *  first). Display requires samples inside the freshness window, so after
+   *  a reload this shapes only how the first new samples blend — it cannot
+   *  conjure a reading from stale data. Entries from the first released
+   *  shape (derived KB/s, 2026-09-13 012242) are converted onto an
+   *  equivalent nominal 10-second sample. */
   seedFromFacts(factsList: readonly TransferRateFactsV1[]): void {
     for (const raw of [...factsList].reverse()) {
       this.addRoundFacts(normalizeLegacyRateFacts(raw));
@@ -237,12 +252,17 @@ export class TransferRateSampler {
     const instantKbps = bytes / 1024 / (ms / 1000);
     // The first sample seeds the figure outright; afterwards each sample's
     // weight rises with the wall time since the last fold (fresh readings
-    // dominate stale ones) and with the sample's own transfer time (short
-    // bursts are noisy speed estimates).
+    // dominate stale ones) and with how much of that wall window the sample
+    // actually transferred, capped at the confidence span (short bursts are
+    // noisy speed estimates; a sustained transfer's per-second ticks cover
+    // their whole window and keep the designed τ cadence).
+    const confidence = Math.min(
+      1,
+      ms / Math.min(Math.max(wallDelta, 1), TRANSFER_RATE_SAMPLE_CONFIDENCE_MS),
+    );
     const alpha = state.smoothedKbps === null
       ? 1
-      : (1 - Math.exp(-wallDelta / TRANSFER_RATE_SMOOTHING_TAU_MS))
-        * Math.min(1, ms / TRANSFER_RATE_SAMPLE_CONFIDENCE_MS);
+      : (1 - Math.exp(-wallDelta / TRANSFER_RATE_SMOOTHING_TAU_MS)) * confidence;
     state.smoothedKbps = state.smoothedKbps === null
       ? instantKbps
       : state.smoothedKbps + alpha * (instantKbps - state.smoothedKbps);
@@ -262,25 +282,35 @@ export class TransferRateSampler {
       : Math.round(state.smoothedKbps);
   }
 
-  /** The connection level shown is the worse of the measured directions —
-   *  counting only directions with fresh samples. No fresh data means no
-   *  reading at all: a stale figure presented as the current speed would be
-   *  wrong, and the user prefers it hidden (用户拍板 2026-09-13: 宁愿不要
-   *  显示，不能显示个错的). A fresh zero signal (transfer attempted, no
-   *  byte came through) is real current data and reads as zero. */
+  /** The reading quotes the directions that are moving bytes right now
+   *  (sampled within the last few seconds), combined as the worse one when
+   *  both transfer simultaneously — the bottleneck of a genuinely
+   *  concurrent pair. With nothing actively sampling it quotes the most
+   *  recently measured direction within the freshness window, and the
+   *  reading disappears once nothing is fresh: a stale figure presented as
+   *  the current speed would be wrong, and the user prefers it hidden
+   *  (用户拍板 2026-09-13: 宁愿不要显示，不能显示个错的). A fresh zero
+   *  signal (transfer attempted, no byte came through) is real current
+   *  data and reads as zero. */
   getReading(now: number = Date.now()): TransferRateReading | null {
     const states = [this.directions.upload, this.directions.download];
-    const freshRates = states
-      .filter((state) => this.isFresh(state, now))
+    const fresh = states.filter((state) => this.isFresh(state, now));
+    if (fresh.length === 0) return null;
+    const active = fresh.filter(
+      (state) => now - state.lastFoldAt <= TRANSFER_RATE_ACTIVE_MS,
+    );
+    const pool = active.length > 0
+      ? active
+      : [fresh.reduce((a, b) => (b.lastFoldAt > a.lastFoldAt ? b : a))];
+    const rates = pool
       .map((state) => state.smoothedKbps)
       .filter((value): value is number => value !== null);
-    if (freshRates.length > 0) {
-      return this.readRate(Math.min(...freshRates));
+    if (rates.length > 0) {
+      return this.readRate(Math.min(...rates));
     }
-    const zeroFresh = states.some(
-      (state) => state.zeroSignal && this.isFresh(state, now),
-    );
-    return zeroFresh ? { level: "zero", kbps: null } : null;
+    return pool.some((state) => state.zeroSignal)
+      ? { level: "zero", kbps: null }
+      : null;
   }
 
   private readRate(kbps: number): TransferRateReading {

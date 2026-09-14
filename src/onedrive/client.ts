@@ -18,6 +18,7 @@ import {
   getEasySyncPaths,
   isRecord,
   isStringRecord,
+  TimeoutHandle,
 } from "../obsidian-compat";
 import {
   type DriveItem,
@@ -118,6 +119,26 @@ const DOWNLOAD_BASE_TIMEOUT_MS = 30_000;  // 30s base — covers slow/unstable c
 // wastes the whole transfer instead of part of it.
 const DOWNLOAD_PER_MIB_TIMEOUT_MS = 12_000;
 const DOWNLOAD_MAX_TIMEOUT_MS = 300_000; // 5min hard cap — slow connections may need minutes, not seconds
+/** Zero-progress watchdog for streaming downloads (60 s, user-decided
+ *  2026-09-14). 2026-09-13 real failure: four stalled downloads burned their
+ *  full 300–450 s budgets with zero bytes. The watchdog aborts an attempt
+ *  when neither response headers nor body bytes arrive for this long, so the
+ *  waterfall retries on a fresh connection while budget remains. Reopen at a
+ *  larger window if real links show legitimate >60 s stalls being killed. */
+const DOWNLOAD_STALL_WATCHDOG_MS = 60_000;
+/** Slow-connection gate (user-decided 2026-09-14): streaming downloads that
+ *  sustain less than this rate over the window are aborted so the waterfall
+ *  retries on a fresh connection. The 512 KiB/s line is the measured split
+ *  from the 2026-09-14 ten-connection sample (84 KiB/s – 1.3 MiB/s on one
+ *  link, 7/10 below the line; earlier matrix samples ran to 3.2 MiB/s per
+ *  connection); the window and reconnect cap are conservative candidates.
+ *  After DOWNLOAD_SLOW_ABORT_LIMIT aborts the current connection is accepted
+ *  — a genuinely slow link (2026-09-12: 95–108 KiB/s) must complete instead
+ *  of looping. Reopen at a lower line if real links show legit rates being
+ *  killed. */
+const DOWNLOAD_SLOW_RATE_BYTES_PER_SECOND = 512 * 1024;
+const DOWNLOAD_SLOW_RATE_WINDOW_MS = 15_000;
+const DOWNLOAD_SLOW_ABORT_LIMIT = 3;
 const DOWNLOAD_FAILURE_RESERVE_RATIO = 0.5;  // 50% reserve for slow/stalled connections
 const UPLOAD_SESSION_CONTROL_TIMEOUT_MS = 15_000;
 const MAX_UPLOAD_SESSION_RECOVERIES = 3;
@@ -1492,6 +1513,7 @@ export class OneDriveClient {
     loadDownloadUrl: (
       url: string,
       signal: AbortSignal,
+      slowGate?: SlowConnectionGate,
     ) => Promise<{ value: T; bytes: number }>;
     loadRequestUrlResponse: (
       response: RequestUrlResponse,
@@ -1499,11 +1521,13 @@ export class OneDriveClient {
     loadContent: (
       apiPath: string,
       requestOptions: RequestOptions,
+      slowGate?: SlowConnectionGate,
     ) => Promise<T>;
     afterContentShortcut?: (value: T) => void;
     afterHintDownload?: (value: T) => void;
   }): Promise<T> {
     throwIfAborted(this.abortSignal);
+    const slowGate = createSlowConnectionGate(`${input.operationName} "${input.filePath}"`);
     const maxResponseBytes = remoteFileByteBudget(input.fileSize, input.filePath);
     let metadataAuthError: OneDriveError | null = null;
     const primaryTimeoutMs = downloadTimeoutMs(input.fileSize);
@@ -1524,7 +1548,7 @@ export class OneDriveClient {
         const fetchStartedAt = this.beginMetricAttempt("downloadUrl");
         try {
           const result = await withAbortableTimeout(
-            (signal) => input.loadDownloadUrl(url, signal),
+            (signal) => input.loadDownloadUrl(url, signal, slowGate),
             remainingMs(),
             this.abortSignal,
           );
@@ -1628,7 +1652,7 @@ export class OneDriveClient {
           this.getStorageVaultName(input.vaultName),
           input.filePath,
         )}:/content`;
-        const value = await input.loadContent(apiPath, contentRequestOptions);
+        const value = await input.loadContent(apiPath, contentRequestOptions, slowGate);
         input.afterContentShortcut?.(value);
         return value;
       } catch (err) {
@@ -1720,7 +1744,7 @@ export class OneDriveClient {
         this.getStorageVaultName(input.vaultName),
         input.filePath,
       )}:/content`;
-      const value = await input.loadContent(apiPath, contentRequestOptions);
+      const value = await input.loadContent(apiPath, contentRequestOptions, slowGate);
       this.downloadMethod = "content";
       return value;
     } catch (err) {
@@ -1751,6 +1775,7 @@ export class OneDriveClient {
         const value = await input.loadContent(
           `/me/drive/items/${input.driveItemId}/content`,
           contentRequestOptions,
+          slowGate,
         );
         this.downloadMethod = "content";
         return value;
@@ -1804,13 +1829,14 @@ export class OneDriveClient {
       driveItemId,
       fileSize,
       onProgress,
-      loadDownloadUrl: async (url, signal) => {
+      loadDownloadUrl: async (url, signal, slowGate) => {
         const response = await downloadUrlFetch(
           url,
           maxResponseBytes,
           `Remote file "${filePath}"`,
           onProgress,
           signal,
+          slowGate,
         );
         return {
           value: response.arrayBuffer,
@@ -1828,8 +1854,8 @@ export class OneDriveClient {
           bytes: responsePayloadByteLength(response),
         };
       },
-      loadContent: async (apiPath, requestOptions) =>
-        (await this.contentGet(apiPath, requestOptions, onProgress)).arrayBuffer,
+      loadContent: async (apiPath, requestOptions, slowGate) =>
+        (await this.contentGet(apiPath, requestOptions, onProgress, slowGate)).arrayBuffer,
       afterContentShortcut: (buffer) => {
         onProgress?.(0, fileSize || buffer.byteLength);
         onProgress?.(buffer.byteLength, fileSize || buffer.byteLength);
@@ -1864,7 +1890,7 @@ export class OneDriveClient {
       driveItemId,
       fileSize,
       onProgress,
-      loadDownloadUrl: async (url, signal) => {
+      loadDownloadUrl: async (url, signal, slowGate) => {
         const result = await downloadUrlFetchToBinaryFile(
           url,
           adapter,
@@ -1874,6 +1900,7 @@ export class OneDriveClient {
           `Remote file "${filePath}"`,
           onProgress,
           signal,
+          slowGate,
         );
         return { value: result, bytes: result.size };
       },
@@ -1890,7 +1917,7 @@ export class OneDriveClient {
         );
         return { value: result, bytes: result.size };
       },
-      loadContent: (apiPath, requestOptions) =>
+      loadContent: (apiPath, requestOptions, slowGate) =>
         this.contentGetToPath(
           apiPath,
           adapter,
@@ -1898,6 +1925,7 @@ export class OneDriveClient {
           expectedSha256,
           requestOptions,
           onProgress,
+          slowGate,
         ),
     });
   }
@@ -2721,6 +2749,7 @@ export class OneDriveClient {
     apiPath: string,
     options: RequestOptions,
     onProgress?: (downloaded: number, total: number) => void,
+    slowGate?: SlowConnectionGate,
   ): Promise<RequestUrlResponse> {
     throwIfAborted(this.abortSignal);
     const url = resolveAuthenticatedGraphUrl(apiPath);
@@ -2738,6 +2767,7 @@ export class OneDriveClient {
           options.responseLabel,
           onProgress,
           signal,
+          slowGate,
         ),
         timeoutMs,
         this.abortSignal,
@@ -2760,6 +2790,10 @@ export class OneDriveClient {
       );
       if (isAbortError(fetchErr)) throw fetchErr;
       if (isResponseByteBudgetError(fetchErr)) throw fetchErr;
+      // Slow-connection aborts are retryable upstream (fresh connection via
+      // the waterfall); falling back to requestUrl would silently continue
+      // the slow transfer and defeat the gate.
+      if ((fetchErr as { stalled?: unknown })?.stalled === true) throw fetchErr;
       this.diag?.log("onedrive", `content fetch failed, falling back to requestUrl: ${requestErrorMessage(fetchErr)}`);
     }
 
@@ -2781,6 +2815,7 @@ export class OneDriveClient {
     expectedSha256: string | undefined,
     options: RequestOptions,
     onProgress?: (downloaded: number, total: number) => void,
+    slowGate?: SlowConnectionGate,
   ): Promise<DownloadToPathResult> {
     throwIfAborted(this.abortSignal);
     const url = resolveAuthenticatedGraphUrl(apiPath);
@@ -2801,6 +2836,7 @@ export class OneDriveClient {
           options.responseLabel,
           onProgress,
           signal,
+          slowGate,
         ),
         timeoutMs,
         this.abortSignal,
@@ -2823,6 +2859,10 @@ export class OneDriveClient {
       );
       if (isAbortError(fetchErr)) throw fetchErr;
       if (isResponseByteBudgetError(fetchErr)) throw fetchErr;
+      // Slow-connection aborts are retryable upstream (fresh connection via
+      // the waterfall); falling back to requestUrl would silently continue
+      // the slow transfer and defeat the gate.
+      if ((fetchErr as { stalled?: unknown })?.stalled === true) throw fetchErr;
       this.diag?.log("onedrive", `content stream fetch failed, falling back to requestUrl: ${requestErrorMessage(fetchErr)}`);
     }
 
@@ -3429,6 +3469,10 @@ function isUncancellableRequestTimeout(error: unknown): boolean {
 }
 
 function isTransientDownloadUrlError(error: unknown): boolean {
+  // A watchdog stall marks a dead connection, not a dead CDN: retrying the
+  // same URL on a fresh connection is exactly the recovery the watchdog
+  // exists to enable.
+  if ((error as { stalled?: unknown })?.stalled === true) return true;
   const status = (error as { status?: unknown })?.status;
   // status=0 means no HTTP response (DNS/TCP/TLS failure) — retrying the
   // same CDN URL won't help. Fall through to metadata refresh or /content.
@@ -3613,6 +3657,119 @@ function withAbortableTimeout<T>(
       },
     );
   });
+}
+
+/** Linked-signal zero-progress watchdog for streaming downloads: guards both
+ *  the response-header wait and each body read. Firing aborts the linked
+ *  signal (releasing the underlying connection) and rejects the guarded
+ *  promise with a retryable stall error; the total budget and user cancel
+ *  keep working through the outer signal link. */
+interface DownloadStallWatchdog {
+  signal: AbortSignal;
+  readonly slowGate?: SlowConnectionGate;
+  guard<T>(pending: Promise<T>): Promise<T>;
+  dispose(): void;
+}
+
+/** Per-download slow-connection gate: evaluates the achieved rate over
+ *  non-overlapping windows at each body chunk; aborts the attempt (retryable
+ *  via the stalled marker) while the reconnect budget lasts, then accepts
+ *  the current connection for the rest of the download. */
+interface SlowConnectionGate {
+  beginAttempt(): void;
+  evaluate(totalBytes: number): void;
+}
+
+function createSlowConnectionGate(label: string): SlowConnectionGate {
+  let windowStart: number | null = null;
+  let windowBytes = 0;
+  let aborts = 0;
+  let accepted = false;
+  return {
+    beginAttempt(): void {
+      windowStart = null;
+      windowBytes = 0;
+    },
+    evaluate(totalBytes: number): void {
+      if (accepted) return;
+      const now = Date.now();
+      if (windowStart === null) {
+        windowStart = now;
+        windowBytes = totalBytes;
+        return;
+      }
+      const elapsedMs = now - windowStart;
+      if (elapsedMs < DOWNLOAD_SLOW_RATE_WINDOW_MS) return;
+      const rateBytesPerSecond = (totalBytes - windowBytes) / (elapsedMs / 1000);
+      windowStart = now;
+      windowBytes = totalBytes;
+      if (rateBytesPerSecond >= DOWNLOAD_SLOW_RATE_BYTES_PER_SECOND) return;
+      if (aborts >= DOWNLOAD_SLOW_ABORT_LIMIT) {
+        accepted = true;
+        return;
+      }
+      aborts++;
+      throw Object.assign(
+        new OneDriveError(
+          OneDriveErrorType.NetworkError,
+          `Download too slow — ${Math.round(rateBytesPerSecond / 1024)} KiB/s sustained ${Math.round(elapsedMs / 1000)}s (reconnect ${aborts}/${DOWNLOAD_SLOW_ABORT_LIMIT}): ${label}`,
+        ),
+        { stalled: true },
+      );
+    },
+  };
+}
+
+function createDownloadStallWatchdog(
+  outerSignal: AbortSignal | null | undefined,
+  label: string,
+  slowGate?: SlowConnectionGate,
+): DownloadStallWatchdog {
+  const controller = new AbortController();
+  const onOuterAbort = (): void => controller.abort();
+  if (outerSignal) {
+    if (outerSignal.aborted) controller.abort();
+    else outerSignal.addEventListener("abort", onOuterAbort, { once: true });
+  }
+  slowGate?.beginAttempt();
+  let timer: TimeoutHandle | null = null;
+  let rejectCurrent: ((error: Error) => void) | null = null;
+  return {
+    signal: controller.signal,
+    slowGate,
+    guard<T>(pending: Promise<T>): Promise<T> {
+      if (timer !== null) compatClearTimeout(timer);
+      const gate = new Promise<never>((_, reject) => { rejectCurrent = reject; });
+      timer = compatSetTimeout(() => {
+        timer = null;
+        // Reject the gate BEFORE aborting: abort settles the guarded promise
+        // with an AbortError synchronously, and the race must observe the
+        // stall error first or the failure looks like a user cancel.
+        rejectCurrent?.(Object.assign(
+          new OneDriveError(
+            OneDriveErrorType.NetworkError,
+            `Download stalled — no progress for ${DOWNLOAD_STALL_WATCHDOG_MS} ms: ${label}`,
+          ),
+          { stalled: true },
+        ));
+        controller.abort();
+      }, DOWNLOAD_STALL_WATCHDOG_MS);
+      return Promise.race([pending, gate]).finally(() => {
+        if (timer !== null) {
+          compatClearTimeout(timer);
+          timer = null;
+        }
+      });
+    },
+    dispose(): void {
+      if (timer !== null) {
+        compatClearTimeout(timer);
+        timer = null;
+      }
+      rejectCurrent = null;
+      outerSignal?.removeEventListener("abort", onOuterAbort);
+    },
+  };
 }
 
 function browserFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
@@ -3982,8 +4139,8 @@ async function readResponseBuffer(
   res: Response,
   maxBytes: number,
   label: string,
+  watchdog: DownloadStallWatchdog,
   onProgress?: (downloaded: number, total: number) => void,
-  signal?: AbortSignal,
 ): Promise<ArrayBuffer> {
   if (!res.ok) {
     const err = new Error(`HTTP ${res.status}`) as Error & { status: number };
@@ -3993,7 +4150,7 @@ async function readResponseBuffer(
   const contentLength = responseContentLength(res);
   assertDeclaredRemoteSize(contentLength, maxBytes, label);
   if (!res.body) {
-    const data = await res.arrayBuffer();
+    const data = await watchdog.guard(res.arrayBuffer());
     assertByteBudget(data.byteLength, maxBytes, label);
     return data;
   }
@@ -4002,12 +4159,13 @@ async function readResponseBuffer(
   let downloaded = 0;
   try {
     while (true) {
-      throwIfAborted(signal);
-      const { done, value } = await reader.read();
+      throwIfAborted(watchdog.signal);
+      const { done, value } = await watchdog.guard(reader.read());
       if (done) break;
       assertByteBudget(downloaded + value.length, maxBytes, label);
       chunks.push(value);
       downloaded += value.length;
+      watchdog.slowGate?.evaluate(downloaded);
       onProgress?.(downloaded, contentLength || downloaded);
     }
   } catch (error) {
@@ -4054,11 +4212,11 @@ async function streamResponseToBinaryFile(
   res: Response,
   adapter: DataAdapter,
   path: string,
-  expectedSha256?: string,
-  maxBytes = MAX_REMOTE_FILE_BYTES,
-  label = `Remote file "${path}"`,
+  expectedSha256: string | undefined,
+  maxBytes: number,
+  label: string,
+  watchdog: DownloadStallWatchdog,
   onProgress?: (downloaded: number, total: number) => void,
-  signal?: AbortSignal,
 ): Promise<DownloadToPathResult> {
   if (!res.ok) {
     const err = new Error(`HTTP ${res.status}`) as Error & { status: number };
@@ -4071,7 +4229,7 @@ async function streamResponseToBinaryFile(
     return writeArrayBufferToBinaryFile(
       adapter,
       path,
-      await res.arrayBuffer(),
+      await watchdog.guard(res.arrayBuffer()),
       expectedSha256,
       contentLength,
       maxBytes,
@@ -4086,8 +4244,8 @@ async function streamResponseToBinaryFile(
   let wrote = false;
   try {
     while (true) {
-      throwIfAborted(signal);
-      const { done, value } = await reader.read();
+      throwIfAborted(watchdog.signal);
+      const { done, value } = await watchdog.guard(reader.read());
       if (done) break;
       assertByteBudget(downloaded + value.length, maxBytes, label);
       hasher.update(value);
@@ -4099,6 +4257,7 @@ async function streamResponseToBinaryFile(
         await adapter.appendBinary(path, chunk);
       }
       downloaded += value.length;
+      watchdog.slowGate?.evaluate(downloaded);
       onProgress?.(downloaded, contentLength || downloaded);
     }
     if (!wrote) {
@@ -4153,15 +4312,21 @@ async function contentUrlFetch(
   label = "Graph content response",
   onProgress?: (downloaded: number, total: number) => void,
   signal?: AbortSignal,
+  slowGate?: SlowConnectionGate,
 ): Promise<RequestUrlResponse> {
-  const res = await browserFetch(url, {
-    method: "GET",
-    headers: { Authorization: `Bearer ${token}` },
-    cache: "no-store",
-    signal,
-  });
-  const buf = await readResponseBuffer(res, maxBytes, label, onProgress, signal);
-  return { arrayBuffer: buf, status: res.status, headers: {} } as RequestUrlResponse;
+  const watchdog = createDownloadStallWatchdog(signal, label, slowGate);
+  try {
+    const res = await watchdog.guard(browserFetch(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+      signal: watchdog.signal,
+    }));
+    const buf = await readResponseBuffer(res, maxBytes, label, watchdog, onProgress);
+    return { arrayBuffer: buf, status: res.status, headers: {} } as RequestUrlResponse;
+  } finally {
+    watchdog.dispose();
+  }
 }
 
 async function contentUrlFetchToBinaryFile(
@@ -4174,23 +4339,29 @@ async function contentUrlFetchToBinaryFile(
   label = `Remote file "${path}"`,
   onProgress?: (downloaded: number, total: number) => void,
   signal?: AbortSignal,
+  slowGate?: SlowConnectionGate,
 ): Promise<DownloadToPathResult> {
-  const res = await browserFetch(url, {
-    method: "GET",
-    headers: { Authorization: `Bearer ${token}` },
-    cache: "no-store",
-    signal,
-  });
-  return streamResponseToBinaryFile(
-    res,
-    adapter,
-    path,
-    expectedSha256,
-    maxBytes,
-    label,
-    onProgress,
-    signal,
-  );
+  const watchdog = createDownloadStallWatchdog(signal, label, slowGate);
+  try {
+    const res = await watchdog.guard(browserFetch(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}` },
+      cache: "no-store",
+      signal: watchdog.signal,
+    }));
+    return await streamResponseToBinaryFile(
+      res,
+      adapter,
+      path,
+      expectedSha256,
+      maxBytes,
+      label,
+      watchdog,
+      onProgress,
+    );
+  } finally {
+    watchdog.dispose();
+  }
 }
 
 /** Download a CDN pre-signed URL using native fetch (bypasses requestUrl
@@ -4203,10 +4374,16 @@ async function downloadUrlFetch(
   label = "Remote file",
   onProgress?: (downloaded: number, total: number) => void,
   signal?: AbortSignal,
+  slowGate?: SlowConnectionGate,
 ): Promise<RequestUrlResponse> {
-  const res = await browserFetch(url, { cache: "no-store", signal });
-  const buf = await readResponseBuffer(res, maxBytes, label, onProgress, signal);
-  return { arrayBuffer: buf, status: res.status, headers: {} } as RequestUrlResponse;
+  const watchdog = createDownloadStallWatchdog(signal, label, slowGate);
+  try {
+    const res = await watchdog.guard(browserFetch(url, { cache: "no-store", signal: watchdog.signal }));
+    const buf = await readResponseBuffer(res, maxBytes, label, watchdog, onProgress);
+    return { arrayBuffer: buf, status: res.status, headers: {} } as RequestUrlResponse;
+  } finally {
+    watchdog.dispose();
+  }
 }
 
 async function downloadUrlFetchToBinaryFile(
@@ -4218,16 +4395,22 @@ async function downloadUrlFetchToBinaryFile(
   label = `Remote file "${path}"`,
   onProgress?: (downloaded: number, total: number) => void,
   signal?: AbortSignal,
+  slowGate?: SlowConnectionGate,
 ): Promise<DownloadToPathResult> {
-  const res = await browserFetch(url, { cache: "no-store", signal });
-  return streamResponseToBinaryFile(
-    res,
-    adapter,
-    path,
-    expectedSha256,
-    maxBytes,
-    label,
-    onProgress,
-    signal,
-  );
+  const watchdog = createDownloadStallWatchdog(signal, label, slowGate);
+  try {
+    const res = await watchdog.guard(browserFetch(url, { cache: "no-store", signal: watchdog.signal }));
+    return await streamResponseToBinaryFile(
+      res,
+      adapter,
+      path,
+      expectedSha256,
+      maxBytes,
+      label,
+      watchdog,
+      onProgress,
+    );
+  } finally {
+    watchdog.dispose();
+  }
 }

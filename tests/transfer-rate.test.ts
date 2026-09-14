@@ -96,15 +96,33 @@ describe("transfer rate sampler (live reading)", () => {
   it("weights short bursts less than confident samples", () => {
     const noisy = new TransferRateSampler();
     noisy.addRoundFacts({ uploadBytes: 2 * MIB, uploadMs: 4000, measuredAt: 1000 });
-    noisy.addRoundFacts({ uploadBytes: MIB, uploadMs: 1000, measuredAt: 2000 });
-    // 1 s burst at 1024 KB/s: α = 0.221 × 0.5 (confidence) → small pull.
-    expect(noisy.getReading(2000)!.kbps).toBe(569);
+    noisy.addRoundFacts({ uploadBytes: MIB, uploadMs: 1000, measuredAt: 11_000 });
+    // 1 s burst inside a 10 s wall gap: confidence = 1 s / 2 s cap → half
+    // the pull of a sample that transferred the whole capped window.
+    expect(noisy.getReading(11_000)!.kbps).toBe(747);
 
     const confident = new TransferRateSampler();
     confident.addRoundFacts({ uploadBytes: 2 * MIB, uploadMs: 4000, measuredAt: 1000 });
-    confident.addRoundFacts({ uploadBytes: 4 * MIB, uploadMs: 4000, measuredAt: 2000 });
-    // Same wall gap, full 4 s sample: α = 0.221 → stronger pull toward 1024.
-    expect(confident.getReading(2000)!.kbps).toBe(625);
+    confident.addRoundFacts({ uploadBytes: 4 * MIB, uploadMs: 4000, measuredAt: 11_000 });
+    // Same wall gap, full 4 s sample: confidence saturated → strong pull.
+    expect(confident.getReading(11_000)!.kbps).toBe(982);
+  });
+
+  it("tracks a sustained transfer at the designed per-second cadence", () => {
+    const sampler = new TransferRateSampler();
+    sampler.beginRun();
+    sampler.sampleRunTick(snapshot(MIB, 1000), 1000);
+    // Four further seconds at 64 KB/s, sampled once a second: each tick
+    // covers its whole wall window, so confidence must not halve it and the
+    // figure lands near the true rate after τ has passed (the halved
+    // cadence this replaces left it at ~665 — twice the designed lag).
+    for (let i = 2; i <= 5; i++) {
+      sampler.sampleRunTick(
+        snapshot(MIB + (i - 1) * 64 * 1024, 1000 + (i - 1) * 1000),
+        i * 1000,
+      );
+    }
+    expect(sampler.getReading(5000)!.kbps).toBe(417);
   });
 
   it("moves the figure on every round with bytes — even tiny ones", () => {
@@ -115,7 +133,7 @@ describe("transfer rate sampler (live reading)", () => {
     // visibly instead of freezing it (the windowed cumulative average this
     // replaces would have left the number effectively unchanged).
     sampler.addRoundFacts({ uploadBytes: 2048, uploadMs: 300, measuredAt: 2000 });
-    expect(sampler.getReading(2000)).toEqual({ level: "medium", kbps: 990 });
+    expect(sampler.getReading(2000)).toEqual({ level: "medium", kbps: 956 });
   });
 
   it("reads zero when a direction burns time without bytes, and recovers", () => {
@@ -135,7 +153,7 @@ describe("transfer rate sampler (live reading)", () => {
     // read Δ = 512 KiB / 1 s, not a clamped negative delta against the old
     // run's totals (which would fold nothing and freeze the figure).
     sampler.sampleRunTick(snapshot(512 * 1024, 1000), 2000);
-    expect(sampler.getReading(2000)!.kbps).toBe(967);
+    expect(sampler.getReading(2000)!.kbps).toBe(911);
   });
 
   it("reseeds from the persisted window, newest entry dominating", () => {
@@ -145,7 +163,7 @@ describe("transfer rate sampler (live reading)", () => {
       { uploadBytes: MIB, uploadMs: 1000, measuredAt: 5000 },
       { uploadBytes: 2 * MIB, uploadMs: 4000, measuredAt: 4000 },
     ]);
-    expect(sampler.getReading(5000)!.kbps).toBe(569);
+    expect(sampler.getReading(5000)!.kbps).toBe(625);
   });
 
   it("converts legacy derived-KBps entries while seeding", () => {
@@ -158,7 +176,7 @@ describe("transfer rate sampler (live reading)", () => {
     expect(sampler.getReading(100)!.level).toBe("medium");
   });
 
-  it("levels the reading by the worse direction", () => {
+  it("levels the reading by the worse direction while both sample together", () => {
     const round = (upload: number | undefined, download: number | undefined) => ({
       uploadBytes: upload === undefined ? undefined : upload * 16 * 1024,
       uploadMs: upload === undefined ? undefined : 16_000,
@@ -177,6 +195,45 @@ describe("transfer rate sampler (live reading)", () => {
     expect(read(1024, undefined)!.level).toBe("high");
   });
 
+  it("quotes the actively transferring direction, not an idle slower one", () => {
+    const sampler = new TransferRateSampler();
+    // Upload measured 20 s ago at 64 KB/s — still inside the freshness
+    // window, but nothing has uploaded since.
+    sampler.addRoundFacts({
+      uploadBytes: 64 * 16 * 1024,
+      uploadMs: 16_000,
+      measuredAt: 180_000,
+    });
+    // A download now streaming at 1 MiB/s must own the figure: the sync
+    // rounds alternate upload/download phases, and letting the idle
+    // direction's older rate cap the live one displayed the previous
+    // phase's speed for minutes (the perception gap this fixes).
+    sampler.beginRun();
+    sampler.sampleRunTick(
+      { upload: { bytes: 0, ms: 0 }, download: { bytes: MIB, ms: 1000 } },
+      200_000,
+    );
+    expect(sampler.getReading(200_000)).toEqual({ level: "high", kbps: 1024 });
+  });
+
+  it("idle reading quotes the latest measured direction, not the worse one", () => {
+    const sampler = new TransferRateSampler();
+    sampler.addRoundFacts({
+      uploadBytes: 64 * 16 * 1024,
+      uploadMs: 16_000,
+      measuredAt: 180_000,
+    });
+    sampler.addRoundFacts({
+      downloadBytes: 4 * MIB,
+      downloadMs: 4000,
+      measuredAt: 300_000,
+    });
+    // Both directions fresh, neither transferring now: the last speed
+    // actually observed is the download — quoting the worse direction
+    // instead would yank the figure down the moment a transfer ends.
+    expect(sampler.getReading(310_000)).toEqual({ level: "high", kbps: 1024 });
+  });
+
   it("excludes stale directions; hides once nothing is fresh", () => {
     const sampler = new TransferRateSampler();
     // A slow download measured long ago…
@@ -190,10 +247,21 @@ describe("transfer rate sampler (live reading)", () => {
     // frozen stale figure was the defect this redesign removes).
     sampler.addRoundFacts({ uploadBytes: 4 * MIB, uploadMs: 4000, measuredAt: 700_000 });
     expect(sampler.getReading(700_000)).toEqual({ level: "high", kbps: 1024 });
-    // Ten minutes past the last sample there is no current speed to quote —
+    // Past the freshness window there is no current speed to quote —
     // a stale figure presented as current would be wrong, so the reading
-    // disappears (用户拍板: 宁愿不要显示，不能显示个错的).
+    // disappears (用户拍板: 宁愿不要显示，不能显示个错的; 同日指示窗口
+    // 收紧为 10 秒).
     expect(sampler.getReading(1_300_001)).toBeNull();
+  });
+
+  it("hides the reading ten seconds after the last real transfer", () => {
+    const sampler = new TransferRateSampler();
+    sampler.addRoundFacts({ uploadBytes: 2 * MIB, uploadMs: 4000, measuredAt: 1000 });
+    // Exactly 10 s after the last fold the reading is still quotable…
+    expect(sampler.getReading(11_000)).toEqual({ level: "medium", kbps: 512 });
+    // …one tick past it there is nothing current left to show (用户指示
+    // 2026-09-13: 消失窗口 10 分钟 → 10 秒).
+    expect(sampler.getReading(11_001)).toBeNull();
   });
 
   it("lets a stale zero signal expire instead of painting red forever", () => {

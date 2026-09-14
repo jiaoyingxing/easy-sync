@@ -16,7 +16,7 @@
  */
 
 import { parseCommunityPluginBundlePath } from "./community-plugin-bundle";
-import type { FileProgress } from "./sync-progress";
+import { isSuccessfulFileProgress, type FileProgress } from "./sync-progress";
 import { SyncActionType } from "./types";
 
 export interface CommunityPluginAutoUpdateCandidate {
@@ -31,8 +31,12 @@ export interface CommunityPluginAutoUpdateCandidate {
 }
 
 export interface CommunityPluginUpdateFactsInput {
-  /** Per-file completion records of one finished sync round. */
-  files: readonly Pick<FileProgress, "path" | "actionType">[];
+  /**
+   * Per-file completion records of one finished sync round, successful and
+   * failed rows alike. A failed bundle-member download is an update that did
+   * not happen; it must never be announced as a success.
+   */
+  files: readonly Pick<FileProgress, "path" | "actionType" | "status">[];
   /** Vault config dir passed through to parseCommunityPluginBundlePath. */
   configDir: string;
   /**
@@ -53,23 +57,29 @@ export interface CommunityPluginUpdateFactsInput {
  * list and the participation facts that existed before the round.
  *
  * A candidate is a plugin whose plugin-directory bundle member (main.js /
- * manifest.json / styles.css) was completed as a Download this round, that is
- * not EasySync's own plugin, and that already participated before the round.
- * Candidates are deduplicated by plugin id and returned in first-appearance
- * order of the Download entries. Path parsing and normalization follow
- * parseCommunityPluginBundlePath.
+ * manifest.json / styles.css) was successfully completed as a Download this
+ * round and none of whose bundle-member downloads failed this round — a
+ * partially failed bundle still runs old code for the failed members, so it
+ * must not be announced as updated. Candidates are deduplicated by plugin id
+ * and returned in first-appearance order of the Download entries. Path parsing
+ * and normalization follow parseCommunityPluginBundlePath.
  */
 export function buildCommunityPluginUpdateFacts(
   input: CommunityPluginUpdateFactsInput,
 ): CommunityPluginAutoUpdateCandidate[] {
   const participatedBefore = new Set(input.participatingBeforePluginIds ?? []);
   const manifestDownloadedById = new Map<string, boolean>();
+  const failedBundleMemberIds = new Set<string>();
   for (const file of input.files) {
-    if (file.actionType !== SyncActionType.Download) continue;
     const parsed = parseCommunityPluginBundlePath(file.path, input.configDir);
     if (!parsed) continue;
     if (parsed.pluginId === input.ownPluginId) continue;
     if (!participatedBefore.has(parsed.pluginId)) continue;
+    if (file.actionType !== SyncActionType.Download) continue;
+    if (!isSuccessfulFileProgress(file)) {
+      failedBundleMemberIds.add(parsed.pluginId);
+      continue;
+    }
     if (parsed.fileName === "manifest.json") {
       manifestDownloadedById.set(parsed.pluginId, true);
     } else if (!manifestDownloadedById.has(parsed.pluginId)) {
@@ -78,6 +88,7 @@ export function buildCommunityPluginUpdateFacts(
   }
   const candidates: CommunityPluginAutoUpdateCandidate[] = [];
   for (const [pluginId, manifestDownloaded] of manifestDownloadedById) {
+    if (failedBundleMemberIds.has(pluginId)) continue;
     candidates.push({ pluginId, manifestDownloaded });
   }
   return candidates;

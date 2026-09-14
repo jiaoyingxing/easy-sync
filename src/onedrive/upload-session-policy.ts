@@ -5,7 +5,16 @@ const MIB = 1024 * 1024;
 // session above this threshold.
 export const UPLOAD_SESSION_THRESHOLD_BYTES = 4 * MIB;
 export const UPLOAD_CHUNK_ALIGNMENT_BYTES = 320 * 1024;
-export const UPLOAD_CHUNK_NORMAL_BYTES = 10 * MIB;
+// Official hard constraints: 320 KiB multiple, < 60 MiB per request. The
+// normal chunk absorbs the ~0.9 s fixed per-request cost measured on the
+// 2026-09-13 real link (10 MiB chunks carried ~25% overhead at ~3.8 MiB/s;
+// 30 MiB carries ~10%). The size ceiling is our own 300 s timeout cap under
+// the 128 KiB/s floor budget rate — 30 MiB budgets 15 s + 240 s = 255 s with
+// 45 s margin, so a promoted chunk can never be clipped mid-flight by the
+// cap. Failure blast radius grows with the chunk (a failed request's bytes
+// are discarded server-side) but recovery demotes to slow chunks after one
+// miss; reopen at a smaller size if real sessions repeatedly time out.
+export const UPLOAD_CHUNK_NORMAL_BYTES = 30 * MIB;
 // OneDrive keeps only fully received, alignment-multiple chunks, so the slow
 // chunk must stay a 320 KiB multiple. 4 alignments (1.25 MiB) is the smallest
 // step that still fits the 15 s overhead budget at the 64 KiB/s floor rate —
@@ -13,7 +22,15 @@ export const UPLOAD_CHUNK_NORMAL_BYTES = 10 * MIB;
 // session advance, where a 5 MiB chunk always timed out and restarted at 0.
 export const UPLOAD_CHUNK_SLOW_BYTES = 4 * UPLOAD_CHUNK_ALIGNMENT_BYTES;
 
-const UPLOAD_SLOW_CONNECTION_BYTES_PER_SECOND = 1 * MIB;
+// The gate is applied to the rate measured on a 1.25 MiB probe chunk, whose
+// reading is biased low by the fixed per-request cost (~0.9 s on the
+// 2026-09-13 real link: probes read ~1.0 MiB/s while 10 MiB chunks the same
+// minute ran ~2.5–3.1 MiB/s). 256 KiB/s still maps to a true rate that lands
+// a 10 MiB chunk well inside its own transfer budget (~35 s vs 80 s), and
+// real slow-patch probes (92–96 KiB/s) stay in slow mode; the old 1 MiB/s
+// gate sat inside the bias band and pinned healthy links at 1.25 MiB chunks
+// for 3–5× losses.
+const UPLOAD_SLOW_CONNECTION_BYTES_PER_SECOND = 256 * 1024;
 const UPLOAD_TIMEOUT_BASE_BYTES_PER_SECOND = 128 * 1024;
 const UPLOAD_TIMEOUT_MIN_BYTES_PER_SECOND = 64 * 1024;
 const UPLOAD_TIMEOUT_OVERHEAD_MS = 15_000;
