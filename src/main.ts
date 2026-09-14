@@ -1,7 +1,17 @@
 import {
   structuredCloneImplementation,
 } from "./structured-clone-compat";
-import { Notice, Platform, Plugin, setIcon, setTooltip, TFile, TFolder, WorkspaceLeaf } from "obsidian";
+import { Notice, Platform, Plugin, requestUrl, setIcon, setTooltip, TFile, TFolder, WorkspaceLeaf } from "obsidian";
+
+import {
+  fetchLatestStableVersion,
+  isUpdateCheckDue,
+  isNewerVersion,
+  isUpdateReminderSuppressed,
+  SNOOZE_DURATION_MS,
+  UPDATE_CHECK_INTERVAL_MS,
+  type UpdateReminderSnooze,
+} from "./update-check";
 import { AuthModule, type AuthPluginContext } from "./auth/auth-module";
 import { createAuthBrowserLauncher } from "./auth/auth-browser";
 import {
@@ -123,8 +133,10 @@ import {
 import {
   AutoSyncDirtyHint,
   DEFAULT_AUTO_SYNC_CHANGE_DELAY_SECONDS,
+  DEFAULT_AUTO_SYNC_INTERVAL_MINUTES,
   LOCAL_DIRTY_DEBOUNCE_MS,
   normalizeAutoSyncChangeDelaySeconds,
+  normalizeAutoSyncIntervalMinutes,
 } from "./sync/auto-sync-dirty-hint";
 import {
   MutationRecoveryScheduler,
@@ -243,8 +255,14 @@ import { StartupPerformanceTracker } from "./startup-performance";
 /** Plugin data keys for sync settings */
 const KEY_SYNC_INTERVAL = "sync-interval";
 const KEY_AUTO_SYNC_CHANGE_DELAY_SECONDS = "auto-sync-change-delay-seconds";
+const KEY_AUTO_SYNC_RESTORE_INTERVAL = "auto-sync-restore-interval";
+const KEY_AUTO_SYNC_RESTORE_CHANGE_DELAY_SECONDS =
+  "auto-sync-restore-change-delay-seconds";
 const KEY_SYNC_PLUGIN_FILES = "sync-plugin-files";
 const KEY_MAX_FILE_SIZE_MB = "sync-max-file-size-mb";
+const KEY_UPDATE_LAST_CHECK_AT = "update-last-check-at";
+const KEY_UPDATE_LAST_KNOWN_LATEST = "update-last-known-latest";
+const KEY_UPDATE_SNOOZE = "update-reminder-snooze";
 const KEY_DIAG_LOG = "sync-diagnostic-logging";
 const KEY_SYNC_EDITOR = "sync-editor";
 const KEY_SYNC_APPEARANCE = "sync-appearance";
@@ -588,6 +606,10 @@ export default class EasySyncPlugin extends Plugin {
 
   syncInterval = 3;
   autoSyncChangeDelaySeconds = DEFAULT_AUTO_SYNC_CHANGE_DELAY_SECONDS;
+  /** Per-channel settings remembered when the master switch turned everything
+   *  off; the master's on flip restores them instead of imposing defaults. */
+  autoSyncRestoreInterval = DEFAULT_AUTO_SYNC_INTERVAL_MINUTES;
+  autoSyncRestoreChangeDelaySeconds = DEFAULT_AUTO_SYNC_CHANGE_DELAY_SECONDS;
   syncPluginFiles = false; // M19: EasySync self-sync default OFF — explicit opt-in
   syncMaxFileSizeMb = 500;
   automaticHandlingPolicy: AutomaticHandlingPolicy = {
@@ -979,6 +1001,13 @@ export default class EasySyncPlugin extends Plugin {
     });
     this.startupPerformance.markUiReady();
 
+    // Update reminder: prompt-only, silent, 24h-throttled check at the
+    // startup tail (方案单 20260915-0025 §四 检查层). Registered separately
+    // from the auth chain so neither can fail the other.
+    this.app.workspace.onLayoutReady(() => {
+      this.runUpdateCheckFlow();
+    });
+
     // ════ ⑤ Background auth init + state load ════
     // Official load-time guide: heavy startup work belongs in onLayoutReady,
     // which runs only after Obsidian finishes loading. Deferring keeps the
@@ -1095,7 +1124,93 @@ export default class EasySyncPlugin extends Plugin {
     this.diag.log("lifecycle", "onload complete (auth initializing in background)");
   }
 
+  // ════ Update reminder (方案单 20260915-0025) ════
+  // Prompt-only update notice: this plugin never downloads or writes its own
+  // bundle (host policy forbids self-install); it only surfaces a sidebar row
+  // handing the user to Obsidian's own plugin update page. Every check
+  // failure stays silent and touches nothing.
+
+  private updateLastCheckAt: number | null = null;
+  private updateLastKnownLatest: string | null = null;
+  private updateSnooze: UpdateReminderSnooze | null = null;
+  private updateCheckTimer: number | null = null;
+
+  /** Sidebar row model, or null when nothing should be shown. Single source
+   *  of truth for both the body-mode gate and the row render. */
+  getUpdatePromptState(): { latest: string; current: string } | null {
+    const latest = this.updateLastKnownLatest;
+    if (!latest) return null;
+    const current = this.manifest.version;
+    if (!isNewerVersion(latest, current)) return null;
+    if (isUpdateReminderSuppressed(latest, this.updateSnooze, Date.now())) {
+      return null;
+    }
+    return { latest, current };
+  }
+
+  /** 「去更新」：stateless handoff to the host's own plugin detail page.
+   *  The sidebar row must stay until the update actually runs or a snooze is
+   *  confirmed (行不清规则) — this method intentionally mutates nothing. */
+  openUpdatePage(): void {
+    window.open(`obsidian://show-plugin?id=${encodeURIComponent(this.manifest.id)}`);
+  }
+
+  snoozeUpdateReminder(choice: "snooze" | "skipVersion"): void {
+    const latest = this.updateLastKnownLatest;
+    if (!latest) return;
+    this.updateSnooze = {
+      version: latest,
+      until: choice === "snooze" ? Date.now() + SNOOZE_DURATION_MS : null,
+    };
+    void this.updatePluginData((data) => {
+      data[KEY_UPDATE_SNOOZE] = { ...this.updateSnooze };
+    });
+    this.syncView?.render();
+  }
+
+  /** Startup-tail + 24h-cycle check. lastKnownLatest persists the prompt
+   *  across restarts even when the throttle skips the network call; a failed
+   *  check leaves lastCheckAt untouched so the next cycle retries. */
+  private runUpdateCheckFlow(): void {
+    void (async () => {
+      const now = Date.now();
+      if (isUpdateCheckDue(this.updateLastCheckAt, now)) {
+        const latest = await fetchLatestStableVersion((opts) =>
+          requestUrl(opts),
+        );
+        if (latest !== null) {
+          this.updateLastKnownLatest = latest;
+          this.updateLastCheckAt = now;
+          void this.updatePluginData((data) => {
+            data[KEY_UPDATE_LAST_CHECK_AT] = now;
+            data[KEY_UPDATE_LAST_KNOWN_LATEST] = latest;
+          });
+          this.diag.log("lifecycle", "update check found release", {
+            latest,
+            current: this.manifest.version,
+          });
+        } else {
+          this.diag.log("lifecycle", "update check unavailable");
+        }
+      }
+      this.syncView?.render();
+      this.scheduleNextUpdateCheck();
+    })().catch(() => undefined);
+  }
+
+  private scheduleNextUpdateCheck(): void {
+    if (this.updateCheckTimer !== null) window.clearTimeout(this.updateCheckTimer);
+    this.updateCheckTimer = window.setTimeout(() => {
+      this.updateCheckTimer = null;
+      this.runUpdateCheckFlow();
+    }, UPDATE_CHECK_INTERVAL_MS);
+  }
+
   onunload(): void {
+    if (this.updateCheckTimer !== null) {
+      window.clearTimeout(this.updateCheckTimer);
+      this.updateCheckTimer = null;
+    }
     this.startupPerformance.cancel();
     this.diag.log("lifecycle", "unloading");
     if (this.syncExecutor) {
@@ -3405,7 +3520,7 @@ export default class EasySyncPlugin extends Plugin {
       );
       if (
         !recoveryOnly
-        && this.syncInterval > 0
+        && this.isAutoSyncMasterEnabled()
         && !this.autoSyncPaused
       ) {
         this.mutationRecoveryScheduler.continueAfterExternalFailure(
@@ -4130,7 +4245,7 @@ export default class EasySyncPlugin extends Plugin {
    */
   private requestMutationRecoveryObservation(trigger: string): boolean {
     if (
-      this.syncInterval <= 0
+      !this.isAutoSyncMasterEnabled()
       || this.autoSyncPaused
       || !this._stateLoaded
       || !this.auth?.authState.isLoggedIn
@@ -4186,7 +4301,7 @@ export default class EasySyncPlugin extends Plugin {
   private async runScheduledMutationRecovery():
     Promise<MutationRecoveryAttemptOutcome> {
     if (
-      this.syncInterval <= 0
+      !this.isAutoSyncMasterEnabled()
       || this.autoSyncPaused
       || !this.auth?.authState.isLoggedIn
       || !this.syncExecutor
@@ -4284,7 +4399,7 @@ export default class EasySyncPlugin extends Plugin {
       this.releaseOpLock();
       if (
         (settled || continueAfterIsolatedRecovery)
-        && this.syncInterval > 0
+        && this.isAutoSyncMasterEnabled()
         && !this.autoSyncPaused
       ) {
         this.diag.log(
@@ -4897,12 +5012,21 @@ export default class EasySyncPlugin extends Plugin {
       | "dirty"
       | "recovery-continuation",
   ): Promise<boolean> {
-    const persistedJoinPending = trigger === "dirty"
-      && this.hasPendingCommunityPluginJoin();
-    if (
-      (!persistedJoinPending && this.syncInterval <= 0)
-      || this.autoSyncPaused
-    ) return true;
+    if (this.autoSyncPaused) return true;
+    if (trigger === "dirty") {
+      // Persisted join intents ride the dirty hint as their automatic
+      // settlement path; they follow the master switch like every other
+      // automatic surface instead of running with auto sync fully off.
+      if (this.hasPendingCommunityPluginJoin()) {
+        if (!this.isAutoSyncMasterEnabled()) return true;
+      } else if (this.autoSyncChangeDelaySeconds <= 0) {
+        return true;
+      }
+    } else if (trigger === "recovery-continuation") {
+      if (!this.isAutoSyncMasterEnabled()) return true;
+    } else if (this.syncInterval <= 0) {
+      return true;
+    }
     if (!this.auth?.authState.isLoggedIn) return true;
     if (!this.syncExecutor) return false;
     if (this.opLock !== null || this.syncExecutor.isRunning) return false;
@@ -5046,8 +5170,8 @@ export default class EasySyncPlugin extends Plugin {
   startAutoSync(): void {
     this.resetAutoSyncTimer();
     if (this.autoSyncPaused) return;
+    if (!this.isAutoSyncMasterEnabled()) return;
     this.schedulePersistedCommunityPluginJoinSync("auto-start");
-    if (this.syncInterval <= 0) return;
     this.requestMutationRecoveryObservation("auto-start");
   }
 
@@ -5091,10 +5215,70 @@ export default class EasySyncPlugin extends Plugin {
     this.startAutoSync();
   }
 
+  /** Re-render the settings page rows after settings changed outside the tab
+   *  (e.g. the auto-sync modal flipping a channel that owns the master
+   *  switch's derived on/off display). */
+  refreshSettingsTab(): void {
+    this.settingsTab?.refreshSyncState();
+  }
+
+  /** The outer auto-sync master switch: on while either automatic channel
+   *  (scheduled or change-triggered) is enabled. */
+  isAutoSyncMasterEnabled(): boolean {
+    return this.syncInterval > 0 || this.autoSyncChangeDelaySeconds > 0;
+  }
+
+  /**
+   * The master switch controls both channels together: turning it off
+   * remembers the per-channel settings and zeroes them, turning it back on
+   * restores what it turned off (defaults when nothing was remembered), so
+   * a deliberately disabled channel never silently re-enables.
+   */
+  async setAutoSyncMasterEnabled(enabled: boolean): Promise<void> {
+    const previous = {
+      interval: this.syncInterval,
+      delay: this.autoSyncChangeDelaySeconds,
+      restoreInterval: this.autoSyncRestoreInterval,
+      restoreDelay: this.autoSyncRestoreChangeDelaySeconds,
+      paused: this.autoSyncPaused,
+    };
+    if (enabled) {
+      this.syncInterval =
+        normalizeAutoSyncIntervalMinutes(this.autoSyncRestoreInterval);
+      this.setAutoSyncChangeDelaySeconds(
+        normalizeAutoSyncChangeDelaySeconds(
+          this.autoSyncRestoreChangeDelaySeconds,
+        ),
+      );
+    } else {
+      this.autoSyncRestoreInterval = previous.interval;
+      this.autoSyncRestoreChangeDelaySeconds = previous.delay;
+      this.syncInterval = 0;
+      this.setAutoSyncChangeDelaySeconds(0);
+    }
+    this.autoSyncPaused = false;
+    try {
+      await this.saveSyncSettings();
+    } catch (error) {
+      this.syncInterval = previous.interval;
+      this.setAutoSyncChangeDelaySeconds(previous.delay);
+      this.autoSyncRestoreInterval = previous.restoreInterval;
+      this.autoSyncRestoreChangeDelaySeconds = previous.restoreDelay;
+      this.autoSyncPaused = previous.paused;
+      this.diag.warn(
+        "state",
+        "failed to persist the auto sync master switch",
+        error instanceof Error ? error.message : String(error),
+      );
+      new Notice(this.i18n.t("notice.settingsSaveFailed"));
+      return;
+    }
+    this.restartAutoSync();
+  }
+
   private canScheduleLocalChangeAutoSync(): boolean {
-    return this.syncInterval > 0
-      && !this.autoSyncPaused
-      && this.autoSyncChangeDelaySeconds > 0;
+    return this.autoSyncChangeDelaySeconds > 0
+      && !this.autoSyncPaused;
   }
 
   setAutoSyncChangeDelaySeconds(value: unknown): void {
@@ -5121,7 +5305,20 @@ export default class EasySyncPlugin extends Plugin {
       data?.[KEY_AUTO_SYNC_CHANGE_DELAY_SECONDS],
     );
     if (data) {
-      if (typeof data[KEY_SYNC_INTERVAL] === "number") this.syncInterval = data[KEY_SYNC_INTERVAL];
+      if (typeof data[KEY_SYNC_INTERVAL] === "number") {
+        this.syncInterval =
+          normalizeAutoSyncIntervalMinutes(data[KEY_SYNC_INTERVAL]);
+      }
+      if (typeof data[KEY_AUTO_SYNC_RESTORE_INTERVAL] === "number") {
+        this.autoSyncRestoreInterval =
+          normalizeAutoSyncIntervalMinutes(data[KEY_AUTO_SYNC_RESTORE_INTERVAL]);
+      }
+      if (typeof data[KEY_AUTO_SYNC_RESTORE_CHANGE_DELAY_SECONDS] === "number") {
+        this.autoSyncRestoreChangeDelaySeconds =
+          normalizeAutoSyncChangeDelaySeconds(
+            data[KEY_AUTO_SYNC_RESTORE_CHANGE_DELAY_SECONDS],
+          );
+      }
       this.notificationPopups = normalizeNotificationPopupsLevel(
         data[KEY_NOTIFICATION_POPUPS],
       );
@@ -5161,6 +5358,20 @@ export default class EasySyncPlugin extends Plugin {
       );
       if (typeof data[KEY_AUTO_SYNC_PAUSED] === "boolean") this.autoSyncPaused = data[KEY_AUTO_SYNC_PAUSED];
       if (typeof data[KEY_MAX_FILE_SIZE_MB] === "number") this.syncMaxFileSizeMb = data[KEY_MAX_FILE_SIZE_MB];
+      if (typeof data[KEY_UPDATE_LAST_CHECK_AT] === "number") this.updateLastCheckAt = data[KEY_UPDATE_LAST_CHECK_AT];
+      if (typeof data[KEY_UPDATE_LAST_KNOWN_LATEST] === "string") this.updateLastKnownLatest = data[KEY_UPDATE_LAST_KNOWN_LATEST];
+      const storedUpdateSnooze = data[KEY_UPDATE_SNOOZE];
+      if (
+        isRecord(storedUpdateSnooze)
+        && typeof storedUpdateSnooze.version === "string"
+      ) {
+        this.updateSnooze = {
+          version: storedUpdateSnooze.version,
+          until: typeof storedUpdateSnooze.until === "number"
+            ? storedUpdateSnooze.until
+            : null,
+        };
+      }
       this.automaticHandlingPolicy = readAutomaticHandlingPolicy(
         data[KEY_AUTOMATIC_HANDLING_POLICY],
         data[KEY_LEGACY_AUTO_MERGE],
@@ -5269,6 +5480,9 @@ export default class EasySyncPlugin extends Plugin {
       data[KEY_SYNC_INTERVAL] = this.syncInterval;
       data[KEY_AUTO_SYNC_CHANGE_DELAY_SECONDS] =
         this.autoSyncChangeDelaySeconds;
+      data[KEY_AUTO_SYNC_RESTORE_INTERVAL] = this.autoSyncRestoreInterval;
+      data[KEY_AUTO_SYNC_RESTORE_CHANGE_DELAY_SECONDS] =
+        this.autoSyncRestoreChangeDelaySeconds;
       data[KEY_DIAG_LOG] = this.diagLogEnabled;
       this.writeSyncPathSettingsData(data, this.captureSyncPathSettings());
       data[KEY_AUTO_SYNC_PAUSED] = this.autoSyncPaused;

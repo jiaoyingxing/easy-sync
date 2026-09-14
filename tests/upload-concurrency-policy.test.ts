@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { UploadConcurrencyPolicy } from "../src/sync/upload-concurrency-policy";
+import {
+  largeUploadConcurrency,
+  UploadConcurrencyPolicy,
+} from "../src/sync/upload-concurrency-policy";
 
 describe("UploadConcurrencyPolicy", () => {
   it("starts desktop at two and grows only after healthy full waves", () => {
@@ -49,5 +52,15 @@ describe("UploadConcurrencyPolicy", () => {
 
     expect(policy.limit).toBe(1);
     expect(policy.isLockedSerial).toBe(true);
+  });
+});
+
+describe("largeUploadConcurrency (B② cross-file parallelism)", () => {
+  it("keeps two desktop sessions in flight", () => {
+    expect(largeUploadConcurrency(false)).toBe(2);
+  });
+
+  it("keeps mobile serial", () => {
+    expect(largeUploadConcurrency(true)).toBe(1);
   });
 });

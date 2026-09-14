@@ -290,9 +290,28 @@ export class ButtonComponent {
 }
 
 export class ToggleComponent {
-  constructor(_containerEl: HTMLElement) {}
-  setValue(_value: boolean): this { return this; }
-  onChange(_callback: (value: boolean) => void | Promise<void>): this { return this; }
+  static instances: ToggleComponent[] = [];
+  value = false;
+  private onChangeCallback: ((value: boolean) => void | Promise<void>) | null = null;
+
+  constructor(_containerEl: HTMLElement) {
+    ToggleComponent.instances.push(this);
+  }
+  setValue(value: boolean): this {
+    this.value = value;
+    return this;
+  }
+  onChange(callback: (value: boolean) => void | Promise<void>): this {
+    this.onChangeCallback = callback;
+    return this;
+  }
+  /** Test helper: invoke the registered onChange callback. */
+  triggerChange(value: boolean): void | Promise<void> {
+    if (!this.onChangeCallback) {
+      throw new Error("ToggleComponent.onChange was never registered");
+    }
+    return this.onChangeCallback(value);
+  }
 }
 
 export class ExtraButtonComponent {

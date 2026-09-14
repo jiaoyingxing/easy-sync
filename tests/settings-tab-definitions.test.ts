@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { Setting, ButtonComponent } from "./__mocks__/obsidian";
+import { Setting, ButtonComponent, ToggleComponent } from "./__mocks__/obsidian";
 import {
   buildAccountSettingDefinitions,
   buildSettingDefinitions,
@@ -45,6 +45,12 @@ function createMockPlugin(): EasySyncPlugin {
     notificationPopups: "all",
     diagLogEnabled: false,
     autoSyncPaused: false,
+    isAutoSyncMasterEnabled: function (
+      this: { syncInterval: number; autoSyncChangeDelaySeconds: number },
+    ): boolean {
+      return this.syncInterval > 0 || this.autoSyncChangeDelaySeconds > 0;
+    },
+    setAutoSyncMasterEnabled: vi.fn().mockResolvedValue(undefined),
     excludedFolders: [],
     saveSyncSettings: vi.fn().mockResolvedValue(undefined),
     applyMaxFileSize: vi.fn(),
@@ -368,6 +374,34 @@ describe("declarative completeness vs display()", () => {
     expect(
       items.find((i) => i.name === i18n.t("settings.autoSyncChangeDelay.name")),
     ).toBeUndefined();
+  });
+
+  it("derives the auto sync master toggle from the enabled channels", async () => {
+    const i18n = new I18n("zh-cn");
+    ToggleComponent.instances.length = 0;
+
+    const onPlugin = createMockPlugin();
+    onPlugin.syncInterval = 0;
+    onPlugin.autoSyncChangeDelaySeconds = 5;
+    // The master is on because the change trigger alone is enabled; the row's
+    // toggle must read the derived state, not the scheduled interval.
+    expect(onPlugin.isAutoSyncMasterEnabled()).toBe(true);
+
+    const offPlugin = createMockPlugin();
+    offPlugin.syncInterval = 0;
+    offPlugin.autoSyncChangeDelaySeconds = 0;
+    const defs = buildSettingDefinitions(i18n.t.bind(i18n), offPlugin);
+    const autoSync = itemsInGroup(defs, i18n.t("settings.group.automatic"))
+      .find((i) => i.name === i18n.t("settings.autoSync.name"));
+    expect(offPlugin.isAutoSyncMasterEnabled()).toBe(false);
+
+    // Flipping the master toggle routes through the plugin's master switch.
+    const setting = new Setting({} as HTMLElement) as never;
+    (autoSync as unknown as { render: (setting: never) => void }).render(setting);
+    const toggle = ToggleComponent.instances.at(-1);
+    expect(toggle?.value).toBe(false);
+    await toggle?.triggerChange(true);
+    expect(offPlugin.setAutoSyncMasterEnabled).toHaveBeenCalledWith(true);
   });
 
   it("includes the about group with product and author entries", () => {

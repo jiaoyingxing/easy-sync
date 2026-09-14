@@ -370,7 +370,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
       setting
         .setName(t("settings.autoSync.name"))
         .setDesc(
-          this.plugin.syncInterval === 0
+          !this.plugin.isAutoSyncMasterEnabled()
             ? t("settings.autoSync.desc.disabled")
             : this.plugin.autoSyncPaused
               ? t("settings.autoSync.desc.paused")
@@ -391,12 +391,9 @@ export class EasySyncSettingTab extends PluginSettingTab {
         })
         .addToggle((toggle) => {
           toggle
-            .setValue(this.plugin.syncInterval > 0)
+            .setValue(this.plugin.isAutoSyncMasterEnabled())
             .onChange(async (value) => {
-              this.plugin.syncInterval = value ? 3 : 0;
-              this.plugin.autoSyncPaused = false;
-              await this.plugin.saveSyncSettings();
-              this.plugin.restartAutoSync();
+              await this.plugin.setAutoSyncMasterEnabled(value);
               this.renderAutomaticSection(t);
             });
         });
@@ -759,7 +756,7 @@ export function buildSettingDefinitions(
         },
         {
           name: t("settings.autoSync.name"),
-          desc: plugin.syncInterval === 0
+          desc: !plugin.isAutoSyncMasterEnabled()
             ? t("settings.autoSync.desc.disabled")
             : plugin.autoSyncPaused
               ? t("settings.autoSync.desc.paused")
@@ -776,12 +773,9 @@ export function buildSettingDefinitions(
               );
             });
             setting.addToggle((toggle) => {
-              toggle.setValue(plugin.syncInterval > 0)
+              toggle.setValue(plugin.isAutoSyncMasterEnabled())
                 .onChange(async (value) => {
-                  plugin.syncInterval = value ? 3 : 0;
-                  plugin.autoSyncPaused = false;
-                  await plugin.saveSyncSettings();
-                  plugin.restartAutoSync();
+                  await plugin.setAutoSyncMasterEnabled(value);
                   onStateChanged?.();
                 });
             });

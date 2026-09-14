@@ -865,6 +865,18 @@ export interface LocaleStrings {
   // ---- Paused for Review ----
   "result.pausedForReview": string;
   "result.v2ProtocolBlocked": string;
+
+  // ---- Update reminder ----
+  "updateCheck.chip": string;
+  "updateCheck.rowBody": string;
+  "updateCheck.goUpdate": string;
+  "updateCheck.skip": string;
+  "updateCheck.modalTitle": string;
+  "updateCheck.modalBody": string;
+  "updateCheck.optionSnooze": string;
+  "updateCheck.optionSkipVersion": string;
+  "updateCheck.confirm": string;
+  "updateCheck.cancel": string;
 }
 
 /** Language tag to locale mapping */

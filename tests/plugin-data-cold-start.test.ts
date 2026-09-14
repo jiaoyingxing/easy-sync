@@ -1394,6 +1394,73 @@ describe("plugin data cold-start cache", () => {
     }));
   });
 
+  it("loads the remembered auto sync settings for the master switch without a cold-start write", async () => {
+    const rememberedPlugin = new EasySyncPlugin();
+    vi.spyOn(rememberedPlugin, "loadData").mockResolvedValue({
+      "auto-sync-restore-interval": 10,
+      "auto-sync-restore-change-delay-seconds": 4,
+    });
+    const rememberedSave = vi.spyOn(rememberedPlugin, "saveData")
+      .mockResolvedValue(undefined);
+
+    await rememberedPlugin.loadSyncSettings();
+
+    expect(rememberedPlugin.autoSyncRestoreInterval).toBe(10);
+    expect(rememberedPlugin.autoSyncRestoreChangeDelaySeconds).toBe(4);
+    expect(rememberedSave).not.toHaveBeenCalled();
+
+    const clampedPlugin = new EasySyncPlugin();
+    vi.spyOn(clampedPlugin, "loadData").mockResolvedValue({
+      "auto-sync-restore-interval": 1,
+      "auto-sync-restore-change-delay-seconds": 99,
+    });
+
+    await clampedPlugin.loadSyncSettings();
+
+    expect(clampedPlugin.autoSyncRestoreInterval).toBe(1);
+    expect(clampedPlugin.autoSyncRestoreChangeDelaySeconds).toBe(10);
+
+    const defaultPlugin = new EasySyncPlugin();
+    vi.spyOn(defaultPlugin, "loadData").mockResolvedValue({});
+
+    await defaultPlugin.loadSyncSettings();
+
+    expect(defaultPlugin.autoSyncRestoreInterval).toBe(3);
+    expect(defaultPlugin.autoSyncRestoreChangeDelaySeconds).toBe(7);
+  });
+
+  it("clamps a stored scheduled interval into the slider's 0–10 range without a cold-start write", async () => {
+    const clampedPlugin = new EasySyncPlugin();
+    vi.spyOn(clampedPlugin, "loadData").mockResolvedValue({
+      "sync-interval": 99,
+    });
+    const clampedSave = vi.spyOn(clampedPlugin, "saveData")
+      .mockResolvedValue(undefined);
+
+    await clampedPlugin.loadSyncSettings();
+
+    expect(clampedPlugin.syncInterval).toBe(10);
+    expect(clampedSave).not.toHaveBeenCalled();
+
+    const oneMinutePlugin = new EasySyncPlugin();
+    vi.spyOn(oneMinutePlugin, "loadData").mockResolvedValue({
+      "sync-interval": 2,
+    });
+
+    await oneMinutePlugin.loadSyncSettings();
+
+    expect(oneMinutePlugin.syncInterval).toBe(2);
+
+    const offPlugin = new EasySyncPlugin();
+    vi.spyOn(offPlugin, "loadData").mockResolvedValue({
+      "sync-interval": 0,
+    });
+
+    await offPlugin.loadSyncSettings();
+
+    expect(offPlugin.syncInterval).toBe(0);
+  });
+
   it("keeps an explicit community-plugin join working when local-change sync is off", async () => {
     vi.useFakeTimers();
     try {

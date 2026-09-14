@@ -809,6 +809,264 @@ describe("main sync entry guards", () => {
     expect(runAutomaticSync).not.toHaveBeenCalled();
   });
 
+  it("runs local-change sync when only the change trigger is enabled", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 0;
+    plugin.autoSyncPaused = false;
+    const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")
+      .mockResolvedValue(true);
+
+    (plugin as never as { markLocalDirtyHint: (path: string) => void })
+      .markLocalDirtyHint("notes/a.md");
+    await vi.advanceTimersByTimeAsync(7_000);
+
+    expect(runAutomaticSync).toHaveBeenCalledOnce();
+    expect(runAutomaticSync).toHaveBeenCalledWith("dirty");
+    plugin.stopAutoSync();
+  });
+
+  it("keeps the shared auto entry open for a dirty round under a delay-only master", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 0;
+    plugin.autoSyncPaused = false;
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.state = { planReviewActive: false } as never;
+    vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(plugin as never, "beginSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    const consumed = await (plugin as never as {
+      runAutomaticSync: (trigger: "dirty") => Promise<boolean>;
+    }).runAutomaticSync("dirty");
+
+    expect(consumed).toBe(true);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
+  it("drops a persisted join dirty round when the auto sync master is off", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 0;
+    plugin.autoSyncChangeDelaySeconds = 0;
+    plugin.autoSyncPaused = false;
+    vi.spyOn(plugin as never, "hasPendingCommunityPluginJoin")
+      .mockReturnValue(true);
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.state = { planReviewActive: false } as never;
+    vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(plugin as never, "beginSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    const consumed = await (plugin as never as {
+      runAutomaticSync: (trigger: "dirty") => Promise<boolean>;
+    }).runAutomaticSync("dirty");
+
+    expect(consumed).toBe(true);
+    expect(run).not.toHaveBeenCalled();
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
+  it("turning the auto sync master off stops both channels and remembers their settings", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 10;
+    plugin.setAutoSyncChangeDelaySeconds(4);
+    plugin.autoSyncPaused = true;
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings")
+      .mockResolvedValue(undefined);
+    const restartAutoSync = vi.spyOn(plugin as never, "restartAutoSync")
+      .mockImplementation(() => undefined);
+
+    await plugin.setAutoSyncMasterEnabled(false);
+
+    expect(plugin.syncInterval).toBe(0);
+    expect(plugin.autoSyncChangeDelaySeconds).toBe(0);
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(saveSyncSettings).toHaveBeenCalledTimes(1);
+    expect(restartAutoSync).toHaveBeenCalledTimes(1);
+
+    await plugin.setAutoSyncMasterEnabled(true);
+
+    expect(plugin.syncInterval).toBe(10);
+    expect(plugin.autoSyncChangeDelaySeconds).toBe(4);
+  });
+
+  it("turning the master back on keeps a channel the user had disabled", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 10;
+    plugin.setAutoSyncChangeDelaySeconds(0);
+    vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    vi.spyOn(plugin as never, "restartAutoSync")
+      .mockImplementation(() => undefined);
+
+    await plugin.setAutoSyncMasterEnabled(false);
+    await plugin.setAutoSyncMasterEnabled(true);
+
+    expect(plugin.syncInterval).toBe(10);
+    expect(plugin.autoSyncChangeDelaySeconds).toBe(0);
+  });
+
+  it("restores default auto sync settings when the master turns on without a remembered snapshot", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 0;
+    plugin.autoSyncChangeDelaySeconds = 0;
+    vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    vi.spyOn(plugin as never, "restartAutoSync")
+      .mockImplementation(() => undefined);
+
+    await plugin.setAutoSyncMasterEnabled(true);
+
+    expect(plugin.syncInterval).toBe(3);
+    expect(plugin.autoSyncChangeDelaySeconds).toBe(7);
+  });
+
+  it("keeps 1-minute and 1-second triggers to one round at a time", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 1;
+    plugin.setAutoSyncChangeDelaySeconds(1);
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.state = { planReviewActive: false } as never;
+    vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(plugin as never, "beginSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+    let releaseRun!: () => void;
+    const run = vi.fn().mockImplementation(
+      () => new Promise((resolve) => {
+        releaseRun = () => resolve(okResult());
+      }),
+    );
+    plugin.syncExecutor = { isRunning: false, run } as never;
+    plugin.startAutoSync();
+
+    // A 1s-debounce edit starts the round; the round stays in flight.
+    (plugin as never as { markLocalDirtyHint: (path: string) => void })
+      .markLocalDirtyHint("notes/a.md");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(run).toHaveBeenCalledTimes(1);
+
+    // The 1-minute interval tick lands while the dirty round is in flight:
+    // the busy guard refuses it — no second dispatch, no queueing.
+    await vi.advanceTimersByTimeAsync(59_000);
+    expect(run).toHaveBeenCalledTimes(1);
+
+    releaseRun();
+    await vi.advanceTimersByTimeAsync(0);
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+
+    // The next interval tick starts a fresh round; the hint was consumed by
+    // the round it started, not dropped.
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(run).toHaveBeenCalledTimes(2);
+    plugin.stopAutoSync();
+  });
+
+  it("keeps a pending local-change window alive across a delay adjustment that keeps the master on", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.autoSyncPaused = false;
+    const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")
+      .mockResolvedValue(true);
+
+    (plugin as never as { markLocalDirtyHint: (path: string) => void })
+      .markLocalDirtyHint("notes/a.md");
+    await vi.advanceTimersByTimeAsync(3_000);
+
+    // Plain 7s→1s adjustment (master stays on): the pending window
+    // reschedules with the new delay instead of being cancelled.
+    plugin.setAutoSyncChangeDelaySeconds(1);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(runAutomaticSync).toHaveBeenCalledOnce();
+    expect(runAutomaticSync).toHaveBeenCalledWith("dirty");
+    plugin.stopAutoSync();
+  });
+
+  it("releases the delay-only master and its pending window when the delay is set to zero", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 0;
+    plugin.autoSyncPaused = false;
+    const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")
+      .mockResolvedValue(true);
+
+    (plugin as never as { markLocalDirtyHint: (path: string) => void })
+      .markLocalDirtyHint("notes/a.md");
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(runAutomaticSync).not.toHaveBeenCalled();
+
+    plugin.setAutoSyncChangeDelaySeconds(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runAutomaticSync).not.toHaveBeenCalled();
+
+    // With the master off, later edits are not scheduled either.
+    (plugin as never as { markLocalDirtyHint: (path: string) => void })
+      .markLocalDirtyHint("notes/b.md");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(runAutomaticSync).not.toHaveBeenCalled();
+  });
+
+  it("gates mutation recovery observation on the master switch rather than the scheduled interval", () => {
+    const plugin = makePlugin();
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.state = {
+      isV2StateActive: true,
+      hasMutationLedgerCorruption: false,
+      hasMutationRecoveryQuarantineCorruption: false,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+      planReviewActive: false,
+      mutationLedger: [{ intent: { operationId: "pending" }, receipt: null }],
+    } as never;
+    (plugin as never as { _stateLoaded: boolean })._stateLoaded = true;
+    const requestObservation = vi.spyOn(
+      plugin.mutationRecoveryScheduler,
+      "requestObservation",
+    ).mockReturnValue(true);
+    const observe = (trigger: string): boolean =>
+      (plugin as never as {
+        requestMutationRecoveryObservation: (trigger: string) => boolean;
+      }).requestMutationRecoveryObservation(trigger);
+
+    // Delay-only master (scheduled off): observation still armed.
+    plugin.syncInterval = 0;
+    plugin.autoSyncChangeDelaySeconds = 7;
+    expect(observe("foreground")).toBe(true);
+    expect(requestObservation).toHaveBeenCalledTimes(1);
+
+    // Master fully off: nothing armed.
+    plugin.autoSyncChangeDelaySeconds = 0;
+    expect(observe("foreground")).toBe(false);
+    expect(requestObservation).toHaveBeenCalledTimes(1);
+
+    // Scheduled-only master: observation armed again.
+    plugin.syncInterval = 3;
+    expect(observe("interval")).toBe(true);
+    expect(requestObservation).toHaveBeenCalledTimes(2);
+  });
+
+  it("snapshots and restores the dual-1 configuration through the master switch", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 1;
+    plugin.setAutoSyncChangeDelaySeconds(1);
+    vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    vi.spyOn(plugin as never, "restartAutoSync")
+      .mockImplementation(() => undefined);
+
+    await plugin.setAutoSyncMasterEnabled(false);
+    expect(plugin.syncInterval).toBe(0);
+    expect(plugin.autoSyncChangeDelaySeconds).toBe(0);
+
+    await plugin.setAutoSyncMasterEnabled(true);
+    expect(plugin.syncInterval).toBe(1);
+    expect(plugin.autoSyncChangeDelaySeconds).toBe(1);
+  });
+
   it("schedules a rename when either the old or new path is in sync scope", async () => {
     vi.useFakeTimers();
     const plugin = makePlugin();
@@ -3716,9 +3974,10 @@ describe("main sync entry guards", () => {
     expect(scheduleCommunityPluginJoinSync).not.toHaveBeenCalled();
   });
 
-  it("still arms a persisted community plugin join on the lifecycle start entry", async () => {
+  it("still arms a persisted community plugin join on the lifecycle start entry under a delay-only master", async () => {
     const plugin = new EasySyncPlugin();
     plugin.syncInterval = 0;
+    plugin.autoSyncChangeDelaySeconds = 7;
     plugin.autoSyncPaused = false;
     vi.spyOn(plugin as never, "hasPendingCommunityPluginJoin").mockReturnValue(true);
     const schedulePersistedJoinSync = vi.spyOn(
@@ -3729,6 +3988,27 @@ describe("main sync entry guards", () => {
     plugin.startAutoSync();
 
     expect(schedulePersistedJoinSync).toHaveBeenCalledWith("auto-start");
+  });
+
+  it("does not arm persisted join or recovery rounds when auto sync is fully off", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.syncInterval = 0;
+    plugin.autoSyncChangeDelaySeconds = 0;
+    plugin.autoSyncPaused = false;
+    vi.spyOn(plugin as never, "hasPendingCommunityPluginJoin").mockReturnValue(true);
+    const schedulePersistedJoinSync = vi.spyOn(
+      plugin as never,
+      "schedulePersistedCommunityPluginJoinSync",
+    ).mockImplementation(() => undefined);
+    const requestRecovery = vi.spyOn(
+      plugin as never,
+      "requestMutationRecoveryObservation",
+    ).mockReturnValue(false);
+
+    plugin.startAutoSync();
+
+    expect(schedulePersistedJoinSync).not.toHaveBeenCalled();
+    expect(requestRecovery).not.toHaveBeenCalled();
   });
 
   it("flushes a pending community plugin join round only when joins are pending", async () => {

@@ -163,7 +163,7 @@ const en: LocaleStrings = {
   "settings.autoSync.open": "Configure auto sync",
   "settings.autoSync.title": "Auto sync",
   "settings.autoSync.desc.disabled": "Auto sync is disabled. Sync manually only.",
-  "settings.autoSync.desc.enabled": "Auto sync at configured interval.",
+  "settings.autoSync.desc.enabled": "Auto sync is enabled.",
   "settings.autoSync.desc.paused": "Auto sync paused after an incomplete run. Retry manually to resume.",
   "settings.automaticHandling.button": "Configure",
   "settings.automaticHandling.open": "Configure automatic handling",
@@ -181,7 +181,7 @@ const en: LocaleStrings = {
   "settings.diagReport.desc": "Generate a snapshot report of recent anomalies and sync status as a Markdown file in the vault root.",
   "settings.diagReport.generate": "Generate report",
   "settings.syncInterval.name": "Scheduled sync",
-  "settings.syncInterval.desc": "Sync once every {minutes} minutes.",
+  "settings.syncInterval.desc": "Sync once every {minutes} min.",
   "settings.syncInterval.disabledDesc": "Off. Scheduled sync will not run.",
   "settings.autoSyncChangeDelay.name": "Sync after changes",
   "settings.autoSyncChangeDelay.desc": "Start after a {seconds}-second quiet period; new local changes restart the timer.",
@@ -867,6 +867,17 @@ const en: LocaleStrings = {
   "syncView.history.mode.auto": "Auto",
   "syncView.history.mode.first": "First sync",
   "syncView.history.duration": "Duration {seconds}s",
+
+  "updateCheck.chip": "New version",
+  "updateCheck.rowBody": "Version {latest} is now available (current: {current}). Upgrade now?",
+  "updateCheck.goUpdate": "Update",
+  "updateCheck.skip": "Later",
+  "updateCheck.modalTitle": "Not upgrading now?",
+  "updateCheck.modalBody": "You can always check for updates in Settings → Community plugins.",
+  "updateCheck.optionSnooze": "Remind me in 7 days",
+  "updateCheck.optionSkipVersion": "Skip this version",
+  "updateCheck.confirm": "OK",
+  "updateCheck.cancel": "Cancel",
 };
 
 export default en;

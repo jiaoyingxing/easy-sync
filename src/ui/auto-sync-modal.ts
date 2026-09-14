@@ -24,19 +24,16 @@ export class AutoSyncModal extends EasySyncModal {
         ? t("settings.autoSyncChangeDelay.disabledDesc")
         : t("settings.autoSyncChangeDelay.desc", { seconds });
 
-    // Auto sync off is stored as interval 0, which is below the slider's own
-    // range: leaving it enabled would let one drag re-enable auto sync without
-    // the switch ever moving. Park the thumb at the minimum and disable it.
-    const scheduledSyncOff = this.plugin.syncInterval === 0;
-
     new Setting(contentEl)
       .setName(t("settings.syncInterval.name"))
       .setDesc(describeSyncInterval(this.plugin.syncInterval))
       .addSlider((slider) => {
+        // Scheduled sync reads minutes directly: 0 = off (persisted as
+        // syncInterval 0), 1–10 = minutes — same shape as the change-delay
+        // slider, so the off state displays as 0 on both.
         slider
-          .setLimits(3, 10, 1)
-          .setValue(scheduledSyncOff ? 3 : this.plugin.syncInterval)
-          .setDisabled(scheduledSyncOff)
+          .setLimits(0, 10, 1)
+          .setValue(this.plugin.syncInterval)
           .onChange(async (value) => {
             const previous = this.plugin.syncInterval;
             this.plugin.syncInterval = value;
@@ -49,6 +46,7 @@ export class AutoSyncModal extends EasySyncModal {
               return;
             }
             this.plugin.restartAutoSync();
+            this.plugin.refreshSettingsTab();
             const desc = slider.sliderEl
               .closest(".setting-item")
               ?.querySelector(".setting-item-description");
@@ -67,6 +65,7 @@ export class AutoSyncModal extends EasySyncModal {
           .setValue(this.plugin.autoSyncChangeDelaySeconds)
           .onChange(async (value) => {
             const previous = this.plugin.autoSyncChangeDelaySeconds;
+            const masterWasOn = this.plugin.isAutoSyncMasterEnabled();
             this.plugin.setAutoSyncChangeDelaySeconds(value);
             try {
               await this.plugin.saveSyncSettings();
@@ -76,6 +75,13 @@ export class AutoSyncModal extends EasySyncModal {
               new Notice(t("notice.settingsSaveFailed"));
               return;
             }
+            // A delay turn can flip the master switch (last channel on/off);
+            // re-arm or release the join/recovery/timer surfaces with it. A
+            // plain adjustment keeps the pending dirty window — no restart.
+            if (this.plugin.isAutoSyncMasterEnabled() !== masterWasOn) {
+              this.plugin.restartAutoSync();
+            }
+            this.plugin.refreshSettingsTab();
             const desc = slider.sliderEl
               .closest(".setting-item")
               ?.querySelector(".setting-item-description");

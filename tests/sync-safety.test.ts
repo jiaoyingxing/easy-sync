@@ -21748,3 +21748,185 @@ describe("connection-speed in-flight overlay", () => {
     expect(settled?.upload.bytes ?? 0).toBe(0);
   });
 });
+
+describe("B② large upload cross-file concurrency", () => {
+  const sleep = (ms: number) =>
+    new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+  // The pool classifier routes on the entry's size field only; the upload
+  // path itself hashes whatever readBinary returns, so a small body with a
+  // >8 MiB size field models a large file without paying an 8 MiB hash.
+  async function makeLargeLocalEntry(path: string): Promise<LocalFileEntry> {
+    const content = new Uint8Array(1024).fill(9).buffer;
+    return {
+      path,
+      hash: await sha256Hex(content),
+      size: 8 * 1024 * 1024 + 1,
+      mtime: 2,
+      binary: false,
+    };
+  }
+
+  function makeLargeUploadExecutor(
+    entries: LocalFileEntry[],
+    contents: Map<string, ArrayBuffer>,
+    uploadFile: ReturnType<typeof vi.fn>,
+  ): { executor: SyncExecutor; state: StateManager } {
+    const state = makeActiveV2State([], []);
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        uploadFile,
+        getFileMetadata: vi.fn().mockResolvedValue(undefined),
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter({
+            readBinary: vi.fn(async (path: string) => {
+              const content = contents.get(path);
+              if (content === undefined) throw new Error(`no content for ${path}`);
+              return content;
+            }),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries,
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn(async (target: string) => {
+          const entry = entries.find((candidate) => candidate.path === target);
+          return entry
+            ? { status: "present", entry }
+            : { status: "missing" };
+        }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+    return { executor, state };
+  }
+
+  it("starts a second large upload before the first finishes (desktop)", async () => {
+    const previousMobile = Platform.isMobile;
+    Platform.isMobile = false;
+    try {
+      const content = new Uint8Array(1024).fill(9).buffer;
+      const entryA = await makeLargeLocalEntry("large-a.bin");
+      const entryB = await makeLargeLocalEntry("large-b.bin");
+      const started: string[] = [];
+      let activeUploads = 0;
+      let peakConcurrentUploads = 0;
+      const releases: Array<() => void> = [];
+      const uploadFile = vi.fn(async (_vault: string, path: string) => {
+        started.push(path);
+        activeUploads++;
+        peakConcurrentUploads = Math.max(peakConcurrentUploads, activeUploads);
+        await new Promise<void>((resolve) => releases.push(resolve));
+        activeUploads--;
+        return { id: `upload-${path}`, eTag: "new-upload-etag", cTag: "new-upload-ctag" };
+      });
+      const { executor } = makeLargeUploadExecutor(
+        [entryA, entryB],
+        new Map([["large-a.bin", content], ["large-b.bin", content]]),
+        uploadFile,
+      );
+
+      const runPromise = executor.run("manual", {});
+      await vi.waitFor(() => expect(started.length).toBe(2));
+      expect(peakConcurrentUploads).toBe(2);
+      releases.forEach((release) => release());
+      const result = await runPromise;
+
+      expect(result.uploaded).toBe(2);
+      expect(result.errors).toBe(0);
+      expect(result.metrics?.peakUploads).toBe(2);
+    } finally {
+      Platform.isMobile = previousMobile;
+    }
+  });
+
+  it("keeps the sibling upload and per-file checkpoints alive when one large upload fails (desktop)", async () => {
+    const previousMobile = Platform.isMobile;
+    Platform.isMobile = false;
+    try {
+      const content = new Uint8Array(1024).fill(9).buffer;
+      const entryA = await makeLargeLocalEntry("large-fail-a.bin");
+      const entryB = await makeLargeLocalEntry("large-fail-b.bin");
+      const started: string[] = [];
+      const releases: Array<() => void> = [];
+      const uploadFile = vi.fn(async (_vault: string, path: string) => {
+        started.push(path);
+        await new Promise<void>((resolve) => releases.push(resolve));
+        if (path === "large-fail-a.bin") {
+          throw new OneDriveError(
+            "upload session chunk failed",
+            OneDriveErrorType.NetworkError,
+          );
+        }
+        return { id: `upload-${path}`, eTag: "new-upload-etag", cTag: "new-upload-ctag" };
+      });
+      const { executor, state } = makeLargeUploadExecutor(
+        [entryA, entryB],
+        new Map([["large-fail-a.bin", content], ["large-fail-b.bin", content]]),
+        uploadFile,
+      );
+
+      const runPromise = executor.run("manual", {});
+      await vi.waitFor(() => expect(started.length).toBe(2));
+      releases.forEach((release) => release());
+      const result = await runPromise;
+
+      expect(result.uploaded).toBe(1);
+      expect(result.errors).toBe(1);
+      expect(uploadFile).toHaveBeenCalledTimes(2);
+      expect(state.commitMutationCheckpoint).toHaveBeenCalledTimes(1);
+    } finally {
+      Platform.isMobile = previousMobile;
+    }
+  });
+
+  it("keeps mobile large uploads strictly serial", async () => {
+    const previousMobile = Platform.isMobile;
+    Platform.isMobile = true;
+    try {
+      const content = new Uint8Array(1024).fill(9).buffer;
+      const entryA = await makeLargeLocalEntry("large-m-a.bin");
+      const entryB = await makeLargeLocalEntry("large-m-b.bin");
+      const started: string[] = [];
+      let releaseA!: () => void;
+      const releasedA = new Promise<void>((resolve) => {
+        releaseA = resolve;
+      });
+      const uploadFile = vi.fn(async (_vault: string, path: string) => {
+        started.push(path);
+        if (path === "large-m-a.bin") await releasedA;
+        return { id: `upload-${path}`, eTag: "new-upload-etag", cTag: "new-upload-ctag" };
+      });
+      const { executor } = makeLargeUploadExecutor(
+        [entryA, entryB],
+        new Map([["large-m-a.bin", content], ["large-m-b.bin", content]]),
+        uploadFile,
+      );
+
+      const runPromise = executor.run("manual", {});
+      await vi.waitFor(() => expect(started.length).toBe(1));
+      await sleep(50);
+      expect(started).toEqual(["large-m-a.bin"]);
+      releaseA();
+      const result = await runPromise;
+
+      expect(result.uploaded).toBe(2);
+      expect(result.errors).toBe(0);
+      expect(result.metrics?.peakUploads).toBe(1);
+    } finally {
+      Platform.isMobile = previousMobile;
+    }
+  });
+});

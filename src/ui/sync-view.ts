@@ -14,6 +14,7 @@ import {
   getConfigDir,
   type AnimationFrameHandle,
 } from "../obsidian-compat";
+import { UpdateReminderModal } from "./update-reminder-modal";
 import type EasySyncPlugin from "../main";
 import type { CommunityPluginAdoptionRow } from "../main";
 import { SyncActionType } from "../sync/types";
@@ -113,6 +114,7 @@ export function resolveSyncViewBodyMode(input: {
   sideActionResultsVisible: boolean;
   mutationRecoveryVisible?: boolean;
   remoteScopeRecoveryFailureVisible?: boolean;
+  updatePromptVisible?: boolean;
 }): SyncViewBodyMode {
   if (input.planReviewActive && input.hasSyncState) return "plan";
   // Pending rows stay visible even while a full sync round is running, so
@@ -125,6 +127,10 @@ export function resolveSyncViewBodyMode(input: {
   if (input.sideActionResultsVisible) return "progress";
   if (input.mutationRecoveryVisible) return "recovery";
   if (input.remoteScopeRecoveryFailureVisible) return "progress";
+  // Update reminder row renders at the tail of the decision area and never
+  // displaces sync decisions: it only fills the body when nothing more
+  // important is showing (方案单 20260915-0025 §四 提示层).
+  if (input.updatePromptVisible) return "pending";
   return "idle";
 }
 
@@ -1153,6 +1159,7 @@ export class EasySyncSyncView extends ItemView {
     const sideActionResultsVisible = progress.activityKind === "sideAction"
       && (sideActionRunning || progress.completedFiles.length > 0);
     const mutationRecovery = this.plugin.getMutationRecoveryDisplayState();
+    const updatePrompt = this.plugin.getUpdatePromptState();
     const bodyMode = resolveSyncViewBodyMode({
       planReviewActive,
       hasSyncState: Boolean(syncState),
@@ -1163,6 +1170,7 @@ export class EasySyncSyncView extends ItemView {
       remoteScopeRecoveryFailureVisible: Boolean(
         progress.recoveryVerification?.failureStage,
       ),
+      updatePromptVisible: updatePrompt !== null,
     });
     const preservesContentScroll = this.renderedBodyMode === bodyMode
       && (bodyMode === "plan" || bodyMode === "recovery" || bodyMode === "idle");
@@ -1292,6 +1300,7 @@ export class EasySyncSyncView extends ItemView {
           conflicts,
           pendingDeletes,
           adoptionRows,
+          updatePrompt,
         );
       } else if (bodyMode === "recovery" && mutationRecovery) {
         this.renderMutationRecoverySection(content, mutationRecovery);
@@ -2206,6 +2215,7 @@ export class EasySyncSyncView extends ItemView {
     conflicts: SyncPlanItem[],
     pendingDeletes: SyncPlanItem[],
     adoptionRows: readonly CommunityPluginAdoptionRow[],
+    updatePrompt: { latest: string; current: string } | null,
   ): void {
     const section = container
       .createDiv("easy-sync-section")
@@ -2292,6 +2302,56 @@ export class EasySyncSyncView extends ItemView {
     for (const { issue, nestedIssues } of skipped) {
       this.renderPendingIssue(section, issue, false, nestedIssues);
     }
+    // Update reminder row sits at the very tail of the decision area: sync
+    // decisions keep their positions, the row only exists while a newer
+    // version is running late (方案单 20260915-0025 §四 提示层).
+    if (updatePrompt) this.renderUpdateAvailableItem(section, updatePrompt);
+  }
+
+  /** One update-reminder row, same collapsible tree-item shape as the other
+   *  decision rows. 「去更新」 is a stateless handoff to the host's own plugin
+   *  detail page (the row must NOT disappear on click — 行不清规则);
+   *  「跳过」 opens the snooze modal and the row leaves only after a
+   *  confirmed choice. */
+  private renderUpdateAvailableItem(
+    container: HTMLElement,
+    prompt: { latest: string; current: string },
+  ): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const details = container.createEl("details", "easy-sync-tree-item");
+    const summary = details.createEl("summary", "easy-sync-tree-row");
+    this.addCollapseIcon(summary);
+    const icon = summary.createSpan("easy-sync-tree-status-icon");
+    setIcon(icon, "square-arrow-up");
+    // Row title is the plugin's own display name (manifest is the single
+    // source of truth for the product proper noun).
+    summary.createSpan("easy-sync-tree-path").setText(this.plugin.manifest.name);
+    summary.createSpan("easy-sync-tree-chip").setText(t("updateCheck.chip"));
+    const body = details.createDiv("easy-sync-tree-item-body");
+    body.createDiv("easy-sync-item-reason").setText(
+      t("updateCheck.rowBody", {
+        latest: prompt.latest,
+        current: prompt.current,
+      }),
+    );
+    const actions = body.createDiv("easy-sync-item-actions");
+    this.createActionChip(actions, t("updateCheck.goUpdate"), "accent", () => {
+      this.plugin.openUpdatePage();
+    });
+    this.createActionChip(actions, t("updateCheck.skip"), "", () => {
+      void (async () => {
+        const choice = await new UpdateReminderModal(
+          this.plugin.app,
+          t("updateCheck.modalTitle"),
+          t("updateCheck.modalBody"),
+          t("updateCheck.optionSnooze"),
+          t("updateCheck.optionSkipVersion"),
+          t("updateCheck.confirm"),
+          t("updateCheck.cancel"),
+        ).awaitSelection();
+        if (choice) this.plugin.snoozeUpdateReminder(choice);
+      })();
+    });
   }
 
   private renderPendingIssue(

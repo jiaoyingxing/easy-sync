@@ -162,7 +162,7 @@ const zhCN: LocaleStrings = {
   "settings.autoSync.open": "配置自动同步",
   "settings.autoSync.title": "自动同步",
   "settings.autoSync.desc.disabled": "自动同步已关闭，仅可手动同步。",
-  "settings.autoSync.desc.enabled": "按设定间隔自动同步。",
+  "settings.autoSync.desc.enabled": "自动同步已开启。",
   "settings.autoSync.desc.paused": "上次同步未完成，自动同步已暂停，请手动重试。",
   "settings.automaticHandling.button": "配置",
   "settings.automaticHandling.open": "配置自动处理",
@@ -863,6 +863,17 @@ const zhCN: LocaleStrings = {
   "syncView.history.mode.auto": "自动",
   "syncView.history.mode.first": "首次同步",
   "syncView.history.duration": "耗时 {seconds} 秒",
+
+  "updateCheck.chip": "新版本",
+  "updateCheck.rowBody": "本插件已发布 {latest}，当前 {current}，是否升级？",
+  "updateCheck.goUpdate": "去更新",
+  "updateCheck.skip": "跳过",
+  "updateCheck.modalTitle": "暂不升级？",
+  "updateCheck.modalBody": "你随时可以在「设置/第三方插件」页面检查更新。",
+  "updateCheck.optionSnooze": "7 天后再提醒",
+  "updateCheck.optionSkipVersion": "跳过此版本",
+  "updateCheck.confirm": "确定",
+  "updateCheck.cancel": "取消",
 };
 
 export default zhCN;

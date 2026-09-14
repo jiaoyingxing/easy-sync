@@ -704,6 +704,12 @@ describe("OneDriveClient.downloadFile", () => {
     });
     try {
       const client = new OneDriveClient(async () => "token");
+      // This test pins the single-stream waterfall's slow-gate semantics;
+      // pin the no-Node environment so the 16 MiB file does not divert into
+      // the multi-range branch (which would leave the test's fake fetch
+      // untouched and fire real network calls).
+      (client as unknown as { rangeStreamDownloader: unknown })
+        .rangeStreamDownloader = null;
       const pending = client.downloadFile(
         "testVault",
         "big.bin",
@@ -4384,5 +4390,139 @@ describe("OneDriveClient folder identity mutations", () => {
 
     await expect(client.createFolderByParentId("parent-id", "New Folder"))
       .rejects.toThrow("metadata is incomplete or mismatched");
+  });
+});
+
+describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
+  const MIB = 1024 * 1024;
+  const SIXTEEN_MIB = 16 * MIB;
+
+  function makeWindowFetchSpy(body: Uint8Array): ReturnType<typeof vi.fn> {
+    return vi.fn().mockResolvedValue(
+      new Response(body, {
+        status: 200,
+        headers: { "Content-Length": String(body.byteLength) },
+      }),
+    );
+  }
+
+  function withWindowFetch(fetchSpy: ReturnType<typeof vi.fn>): () => void {
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    return () => {
+      (globalThis as { window?: unknown }).window = originalWindow;
+    };
+  }
+
+  it("routes large downloadUrl downloads through the range downloader", async () => {
+    const rangeBuffer = new Uint8Array(SIXTEEN_MIB).fill(7).buffer;
+    const download = vi.fn().mockResolvedValue(rangeBuffer);
+    const fetchSpy = makeWindowFetchSpy(new Uint8Array([1]));
+    const restore = withWindowFetch(fetchSpy);
+    try {
+      const client = new OneDriveClient(async () => "token");
+      (client as unknown as { rangeStreamDownloader: unknown })
+        .rangeStreamDownloader = { download };
+
+      const result = await client.downloadFile(
+        "testVault",
+        "big.bin",
+        "https://download.example/big.bin",
+        undefined,
+        SIXTEEN_MIB,
+      );
+
+      expect(download).toHaveBeenCalledTimes(1);
+      const input = download.mock.calls[0][0] as {
+        windows: Array<{ start: number; end: number }>;
+        fileSize: number;
+        url: string;
+      };
+      expect(input.url).toBe("https://download.example/big.bin");
+      expect(input.fileSize).toBe(SIXTEEN_MIB);
+      expect(input.windows).toEqual([
+        { start: 0, end: 8 * MIB - 1 },
+        { start: 8 * MIB, end: SIXTEEN_MIB - 1 },
+      ]);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(result).toBe(rangeBuffer);
+    } finally {
+      restore();
+    }
+  });
+
+  it("falls back to the single-stream fetch when the range attempt fails", async () => {
+    const fallbackBody = new Uint8Array([1, 2, 3]).buffer;
+    const fetchSpy = makeWindowFetchSpy(new Uint8Array(fallbackBody));
+    const restore = withWindowFetch(fetchSpy);
+    try {
+      const client = new OneDriveClient(async () => "token");
+      (client as unknown as { rangeStreamDownloader: unknown })
+        .rangeStreamDownloader = {
+        download: vi.fn().mockRejectedValue(new Error("range boom")),
+      };
+
+      const result = await client.downloadFile(
+        "testVault",
+        "big.bin",
+        "https://download.example/big.bin",
+        undefined,
+        SIXTEEN_MIB,
+      );
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(result).toEqual(fallbackBody);
+    } finally {
+      restore();
+    }
+  });
+
+  it("keeps the single-stream path when no Node downloader is available", async () => {
+    const body = new Uint8Array([4, 5]).buffer;
+    const fetchSpy = makeWindowFetchSpy(new Uint8Array(body));
+    const restore = withWindowFetch(fetchSpy);
+    try {
+      const client = new OneDriveClient(async () => "token");
+      (client as unknown as { rangeStreamDownloader: unknown })
+        .rangeStreamDownloader = null;
+
+      const result = await client.downloadFile(
+        "testVault",
+        "big.bin",
+        "https://download.example/big.bin",
+        undefined,
+        SIXTEEN_MIB,
+      );
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(result).toEqual(body);
+    } finally {
+      restore();
+    }
+  });
+
+  it("keeps small files on the single-stream path even with a downloader", async () => {
+    const body = new Uint8Array([9]).buffer;
+    const fetchSpy = makeWindowFetchSpy(new Uint8Array(body));
+    const restore = withWindowFetch(fetchSpy);
+    try {
+      const download = vi.fn();
+      const client = new OneDriveClient(async () => "token");
+      (client as unknown as { rangeStreamDownloader: unknown })
+        .rangeStreamDownloader = { download };
+
+      await client.downloadFile(
+        "testVault",
+        "small.bin",
+        "https://download.example/small.bin",
+        undefined,
+        1024,
+      );
+
+      expect(download).not.toHaveBeenCalled();
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
   });
 });

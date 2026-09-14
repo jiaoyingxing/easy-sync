@@ -10,6 +10,10 @@ export const MAX_AUTO_SYNC_CHANGE_DELAY_SECONDS = 10;
 export const LOCAL_DIRTY_DEBOUNCE_MS =
   DEFAULT_AUTO_SYNC_CHANGE_DELAY_SECONDS * 1_000;
 
+export const DEFAULT_AUTO_SYNC_INTERVAL_MINUTES = 3;
+export const MIN_AUTO_SYNC_INTERVAL_MINUTES = 1;
+export const MAX_AUTO_SYNC_INTERVAL_MINUTES = 10;
+
 export function normalizeAutoSyncChangeDelaySeconds(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return DEFAULT_AUTO_SYNC_CHANGE_DELAY_SECONDS;
@@ -17,6 +21,23 @@ export function normalizeAutoSyncChangeDelaySeconds(value: unknown): number {
   return Math.min(
     MAX_AUTO_SYNC_CHANGE_DELAY_SECONDS,
     Math.max(MIN_AUTO_SYNC_CHANGE_DELAY_SECONDS, Math.round(value)),
+  );
+}
+
+/**
+ * Scheduled-sync minutes are stored as 0 (channel off) or 1–10; out-of-range
+ * values clamp so a corrupt restore snapshot or hand-edited data cannot drive
+ * a period the slider never offered.
+ */
+export function normalizeAutoSyncIntervalMinutes(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return 0;
+  }
+  const rounded = Math.round(value);
+  if (rounded <= 0) return 0;
+  return Math.min(
+    MAX_AUTO_SYNC_INTERVAL_MINUTES,
+    Math.max(MIN_AUTO_SYNC_INTERVAL_MINUTES, rounded),
   );
 }
 

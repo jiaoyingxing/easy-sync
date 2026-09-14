@@ -148,12 +148,18 @@ describe("buildSettingsSyncButtonState", () => {
     expect(automaticSection).not.toContain(".setLimits(");
     expect(automaticSection).not.toContain("setAutoSyncChangeDelaySeconds");
     expect(automaticSection).not.toContain("describeAutoSyncChangeDelay");
+    // The settings-page toggle reads the derived master state (either channel
+    // enabled) and routes through the plugin's master switch.
+    expect(automaticSection).toContain("isAutoSyncMasterEnabled()");
+    expect(automaticSection).toContain("setAutoSyncMasterEnabled(value)");
     expect(autoSyncModalSource).toContain('setName(t("settings.syncInterval.name"))');
     expect(autoSyncModalSource).toContain(
       'setName(t("settings.autoSyncChangeDelay.name"))',
     );
-    expect(autoSyncModalSource).toContain(".setLimits(3, 10, 1)");
+    // Both sliders run 0–10 with the leftmost stop = off: scheduled sync
+    // stores 0 or 1–10 minutes, the change-delay slider 0–10 seconds.
     expect(autoSyncModalSource).toContain(".setLimits(0, 10, 1)");
+    expect(autoSyncModalSource).not.toContain("SYNC_INTERVAL_OFF_SLIDER_VALUE");
     expect(autoSyncModalSource).toContain(
       "this.plugin.setAutoSyncChangeDelaySeconds(value)",
     );
@@ -182,6 +188,10 @@ describe("buildSettingsSyncButtonState", () => {
       "已关闭；本机变化不会自动触发同步。",
     );
     expect(en["settings.syncInterval.name"]).toBe("Scheduled sync");
+    // "min" keeps the 1-minute stop grammatical in English ("every 1 min").
+    expect(en["settings.syncInterval.desc"]).toBe(
+      "Sync once every {minutes} min.",
+    );
     expect(en["settings.autoSyncChangeDelay.name"]).toBe("Sync after changes");
     expect(en["settings.autoSyncChangeDelay.disabledDesc"]).toBe(
       "Off. Local changes will not trigger sync automatically.",

@@ -195,6 +195,7 @@ import {
 } from "./download-concurrency-policy";
 import {
   ADAPTIVE_UPLOAD_MAX_BYTES,
+  largeUploadConcurrency,
   UploadConcurrencyPolicy,
 } from "./upload-concurrency-policy";
 import {
@@ -10607,7 +10608,7 @@ export class SyncExecutor {
     callbacks.onProgress?.(0, total, "");
     this.diag?.log(
       "execute",
-      `pools — folders=${folderCreates.length} small=${smallUploads.length}(adaptive ${uploadPolicy.limit}→${Platform.isMobile ? 2 : 4}) large=${largeUploads.length}(1) download=${downloads.length}(adaptive 1→${Platform.isMobile ? MOBILE_DOWNLOAD_MAX_CONCURRENCY : ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY} small files) passthrough=${passthroughItems.length} cleanup=${cleanupItems.length}`,
+      `pools — folders=${folderCreates.length} small=${smallUploads.length}(adaptive ${uploadPolicy.limit}→${Platform.isMobile ? 2 : 4}) large=${largeUploads.length}(x${largeUploadConcurrency(Platform.isMobile)}) download=${downloads.length}(adaptive 1→${Platform.isMobile ? MOBILE_DOWNLOAD_MAX_CONCURRENCY : ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY} small files) passthrough=${passthroughItems.length} cleanup=${cleanupItems.length}`,
     );
 
     const executePlanItem = async (
@@ -11331,15 +11332,35 @@ export class SyncExecutor {
       index += batch.length;
     }
 
-    // Large uploads retain exclusive transfer and per-file checkpointing.
-    for (const item of largeUploads) {
-      if (!this.canContinue(operationEpoch, result)) break;
-      const preflightError = communityPluginUploadErrors.get(item.path);
-      await executePlanItem(
-        item,
-        preflightError === undefined ? undefined : { error: preflightError },
-      );
-    }
+    // Step 3c — large uploads parallelize across files (B②, 2026-09-14):
+    // each file still owns one strictly sequential upload session (session
+    // chunks are order-mandated), but desktop keeps two sessions in flight
+    // so one file's per-chunk request overhead overlaps another file's
+    // transfer. Per-file checkpointing and error isolation are unchanged,
+    // and executePlanItem settles every failure internally (no rethrow),
+    // so this worker pool has the same Promise.all semantics as the small
+    // upload wave above. Mobile stays serial: two concurrent large uploads
+    // would hold two full file reads plus two chunk buffers in memory.
+    const largeConcurrency = Math.min(
+      largeUploads.length,
+      largeUploadConcurrency(Platform.isMobile),
+    );
+    let nextLargeUploadIndex = 0;
+    await Promise.all(
+      Array.from({ length: largeConcurrency }, async () => {
+        while (
+          nextLargeUploadIndex < largeUploads.length
+          && this.canContinue(operationEpoch, result)
+        ) {
+          const item = largeUploads[nextLargeUploadIndex++];
+          const preflightError = communityPluginUploadErrors.get(item.path);
+          await executePlanItem(
+            item,
+            preflightError === undefined ? undefined : { error: preflightError },
+          );
+        }
+      }),
+    );
 
     // P1 — universal downloadUrl refresh batching: every plan download that
     // lacks a fresh pre-signed URL (any platform, any size) is refreshed once
@@ -11748,7 +11769,7 @@ export class SyncExecutor {
     await this.state.reconcilePendingIssues(pendingIssues, resolvedIssuePaths);
     this.diag?.log(
       "execute",
-      `upload summary — files=${result.uploaded}, bytes=${metrics.uploadBytes}, peak=${metrics.peakUploads}/${Platform.isMobile ? 2 : 4}, readMs=${metrics.uploadReadMs}, networkMs=${metrics.uploadNetworkMs}, elapsedMs=${Date.now() - startedAt}`,
+      `upload summary — files=${result.uploaded}, bytes=${metrics.uploadBytes}, peak=${metrics.peakUploads}/${(Platform.isMobile ? 2 : 4) + largeUploadConcurrency(Platform.isMobile)}, readMs=${metrics.uploadReadMs}, networkMs=${metrics.uploadNetworkMs}, elapsedMs=${Date.now() - startedAt}`,
     );
 
   }
