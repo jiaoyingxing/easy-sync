@@ -32,11 +32,20 @@ describe("sync result presentation", () => {
     expect(isSyncResultFullyComplete(result())).toBe(true);
     expect(resolveSyncHistoryStatus(result())).toBe("success");
 
+    // 2026-09-16 拍板延伸：按设置跳过（大型文件/已忽略路径）是预期行为、
+    // 零行动，不把整轮拖成 partial——与跳过项退出待处理账本同层同据。
+    for (const zeroActionSkip of [
+      result({ skippedLarge: 1 }),
+      result({ skippedLarge: 5 }),
+      result({ skippedIgnored: 1 }),
+    ]) {
+      expect(isSyncResultFullyComplete(zeroActionSkip)).toBe(true);
+      expect(resolveSyncHistoryStatus(zeroActionSkip)).toBe("success");
+    }
+
     for (const incomplete of [
       result({ conflicts: 1 }),
       result({ deferred: 1 }),
-      result({ skippedLarge: 1 }),
-      result({ skippedIgnored: 1 }),
     ]) {
       expect(isSyncResultFullyComplete(incomplete)).toBe(false);
       expect(resolveSyncHistoryStatus(incomplete)).toBe("partial");
@@ -74,7 +83,7 @@ describe("sync result presentation", () => {
       success: false,
       errors: 1,
       skippedLarge: 1,
-      message: "result.sharedControlReadUnavailable",
+      message: "result.remoteReadUnavailable",
       runFacts: {
         termination: "normal",
         ordinaryPlanning: "not-entered",
@@ -85,7 +94,7 @@ describe("sync result presentation", () => {
     expect(resolveSyncHistoryStatus(result({
       success: false,
       errors: 1,
-      message: "result.sharedControlReadUnavailable",
+      message: "result.remoteReadUnavailable",
       runFacts: {
         termination: "normal",
         ordinaryPlanning: "entered",
@@ -215,7 +224,7 @@ describe("sync result presentation", () => {
     expect(resolveSyncHistoryStatus(result({
       success: false,
       errors: 1,
-      message: "result.ordinaryRemoteReadUnavailable",
+      message: "result.remoteReadUnavailable",
       runFacts: {
         termination: "normal",
         ordinaryPlanning: "not-entered",

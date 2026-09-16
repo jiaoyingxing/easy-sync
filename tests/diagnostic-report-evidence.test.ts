@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import EasySyncPlugin from "../src/main";
 import {
   buildConflictEvidence,
+  computeChangedPluginDataKeys,
   findLatestAutomaticHandlingSummary,
   findLatestNetworkSummary,
   findLatestPhaseSummary,
@@ -10,8 +11,10 @@ import {
   findLatestTransferSummary,
   fingerprintOpaqueValue,
   formatDiagnosticAutomaticSyncSummary,
+  formatRecentPluginDataWrites,
   formatV2StorageAuthorityEvidence,
   projectSyncHistoryActionCounts,
+  RecentPluginDataWriteLog,
   summarizeCommunityPluginSync,
   summarizeMutationRecovery,
 } from "../src/sync/diagnostic-report-evidence";
@@ -397,5 +400,61 @@ describe("diagnostic report failure notice", () => {
       message: "Could not save the diagnostic report.",
     }));
     expect(logError).toHaveBeenCalled();
+  });
+});
+
+/** Issue #18 round (P3-b4): the report must show which plugin data keys were
+ *  recently written (names + time only, never values) so a mid-activation
+ *  digest drift can be attributed on the device itself. */
+describe("recent plugin data write evidence", () => {
+  it("reports exactly the keys whose values changed, in stable order", () => {
+    const before = {
+      "sync-interval": 3,
+      nested: { a: 1, b: 2 },
+      removed: "gone",
+      untouched: "same",
+    };
+    const after = {
+      "sync-interval": 5,
+      nested: { a: 1, b: 3 },
+      untouched: "same",
+      added: true,
+    };
+    expect(computeChangedPluginDataKeys(before, after)).toEqual([
+      "added",
+      "nested",
+      "removed",
+      "sync-interval",
+    ]);
+  });
+
+  it("treats a clone with identical content as unchanged", () => {
+    const before = { key: { deep: [1, 2, 3] } };
+    const after = JSON.parse(JSON.stringify(before)) as typeof before;
+    expect(computeChangedPluginDataKeys(before, after)).toEqual([]);
+  });
+
+  it("bounds the write log and lists newest entries in write order", () => {
+    const log = new RecentPluginDataWriteLog(2);
+    log.record(1_000, ["a"]);
+    log.record(2_000, ["b"]);
+    log.record(3_000, ["c", "d"]);
+    expect(log.list()).toEqual([
+      { at: 2_000, keys: ["b"] },
+      { at: 3_000, keys: ["c", "d"] },
+    ]);
+  });
+
+  it("formats entries as readable bullet lines without values", () => {
+    const log = new RecentPluginDataWriteLog();
+    log.record(
+      new Date(2026, 8, 15, 12, 20, 18).getTime(),
+      ["update-last-check-at", "update-last-known-latest"],
+    );
+    const lines = formatRecentPluginDataWrites(log.list());
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("09/15 12:20:18");
+    expect(lines[0]).toContain("update-last-check-at, update-last-known-latest");
+    expect(lines[0]).not.toContain("1700000000");
   });
 });

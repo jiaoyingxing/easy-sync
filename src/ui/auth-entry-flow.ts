@@ -190,7 +190,6 @@ async function handlePendingAuth(
     host.app,
     t("settings.account.pendingTitle"),
     t("settings.account.pendingMessage"),
-    t("settings.account.recheck"),
     t("settings.account.copyAuthLink"),
     t("settings.account.reopenAuth"),
     t("settings.account.cancelLogin"),
@@ -200,6 +199,9 @@ async function handlePendingAuth(
     () => {
       reopenPromise = startLogin(host, auth);
     },
+    // Completion closes the modal on its own (device-flow parity): the tick
+    // watches the auth state, so no manual recheck affordance exists.
+    { auth, noticeCenter: host.noticeCenter, t },
   ).awaitAction();
 
   if (result.action === "cancel") {
@@ -207,19 +209,6 @@ async function handlePendingAuth(
     // broken redirect flow to code login) without restarting Obsidian.
     auth.cancelPendingLogin();
     return chooseAuthMethod(host, auth);
-  }
-  if (result.action === "recheck") {
-    const loggedIn = auth.checkAuthStatus();
-    host.noticeCenter.show({
-      key: loggedIn ? "settings-login-success" : "settings-login-pending",
-      message: loggedIn
-        ? t("settings.account.loginSuccess")
-        : t("settings.account.desc.pending"),
-      priority: loggedIn
-        ? NOTICE_PRIORITY.action
-        : NOTICE_PRIORITY.attention,
-    });
-    return;
   }
   if (result.action === "reopen" && reopenPromise) {
     await (reopenPromise as Promise<void>);

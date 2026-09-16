@@ -37,6 +37,9 @@ export interface FileProgress {
   actionType?: SyncActionType;
   reason?: string;
   fileSize?: number;
+  /** Wall-clock moment the action failed, for error entries only; absent on
+   *  success rows and on history entries persisted before this field. */
+  failedAt?: number;
 }
 
 export type RemoteScopeRecoveryFailureStage =

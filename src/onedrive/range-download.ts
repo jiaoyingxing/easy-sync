@@ -26,6 +26,7 @@ import {
   requestErrorMessage,
   sleepWithAbort,
   throwIfAborted,
+  type SlowLinkEvidence,
 } from "./download-stream-guards";
 import type { RangeWindow } from "./download-range-policy";
 
@@ -90,6 +91,9 @@ export interface RangeDownloadInput {
   signal: AbortSignal;
   label: string;
   onProgress?: (downloaded: number, total: number) => void;
+  /** Shared per-round link evidence so every window's rate feeds the same
+   *  slow-gate baseline (2026-09-15 乙路). */
+  slowLinkEvidence?: SlowLinkEvidence;
 }
 
 export interface RangeStreamDownloader {
@@ -162,8 +166,18 @@ async function runRangeWindowStream(
     credit.total += target - credited;
     credited = target;
   };
+  // 甲路续传 (2026-09-16): a stalled retry continues from the credited
+  // offset with a sub-range request instead of re-downloading the window.
+  let creditedInWindow = 0;
   for (let attempt = 1; ; attempt++) {
-    const slowGate = createSlowConnectionGate(windowLabel);
+    const subWin: RangeWindow = {
+      start: win.start + creditedInWindow,
+      end: win.end,
+    };
+    const slowGate = createSlowConnectionGate(windowLabel, {
+      evidence: input.slowLinkEvidence,
+      totalSize: windowBytes - creditedInWindow,
+    });
     const watchdog = createDownloadStallWatchdog(input.signal, windowLabel, slowGate);
     // Holder object: the request is assigned inside the https.request
     // callback, which TypeScript's flow analysis does not track.
@@ -181,33 +195,33 @@ async function runRangeWindowStream(
       const response = await watchdog.guard(waitForRangeResponseHeaders(
         https,
         input.url,
-        win,
+        subWin,
         (request) => { outgoing.request = request; },
       ));
-      assertRangeResponseHonored(response, win, input.fileSize, windowLabel);
+      assertRangeResponseHonored(response, subWin, input.fileSize, windowLabel);
       const iterator = response[Symbol.asyncIterator]();
       for (;;) {
         const step = await watchdog.guard(iterator.next());
         if (step.done) break;
         const chunk = step.value;
         received += chunk.byteLength;
-        if (received > windowBytes) {
+        if (received > windowBytes - creditedInWindow) {
           outgoing.request?.destroy();
           throw new OneDriveError(
             OneDriveErrorType.NetworkError,
-            `${windowLabel} exceeded its range window (${received} > ${windowBytes})`,
+            `${windowLabel} exceeded its range window (${creditedInWindow + received} > ${windowBytes})`,
           );
         }
-        assembly.set(chunk, win.start + received - chunk.byteLength);
-        creditTo(received);
+        assembly.set(chunk, subWin.start + received - chunk.byteLength);
+        creditTo(creditedInWindow + received);
         input.onProgress?.(credit.total, input.fileSize);
         slowGate.evaluate(received);
       }
-      if (received !== windowBytes) {
+      if (received !== windowBytes - creditedInWindow) {
         throw Object.assign(
           new OneDriveError(
             OneDriveErrorType.NetworkError,
-            `${windowLabel} ended early (${received}/${windowBytes})`,
+            `${windowLabel} ended early (${creditedInWindow + received}/${windowBytes})`,
           ),
           { stalled: true },
         );
@@ -218,10 +232,10 @@ async function runRangeWindowStream(
       if (isAbortError(error) || input.signal.aborted) throw error;
       const stalled = (error as { stalled?: boolean })?.stalled === true;
       if (!stalled || attempt > RANGE_STREAM_STALLED_RETRIES) throw error;
-      creditTo(0);
+      creditedInWindow += received;
       diag?.warn(
         "onedrive",
-        `${windowLabel} — range stream retry ${attempt}/${RANGE_STREAM_STALLED_RETRIES}`,
+        `${windowLabel} — range stream retry ${attempt}/${RANGE_STREAM_STALLED_RETRIES} from offset ${creditedInWindow}`,
         requestErrorMessage(error),
       );
       await sleepWithAbort(RANGE_STREAM_RETRY_BACKOFF_MS, input.signal);

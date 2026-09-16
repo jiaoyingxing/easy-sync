@@ -538,10 +538,10 @@ describe("LocalScanner device-local folder exclusions", () => {
 });
 
 describe("LocalScanner large file boundary", () => {
-  it("includes files within the default limit (500 MB) and skips larger files", async () => {
+  it("includes files within the default limit (512 MB) and skips larger files", async () => {
     const adapter = {
       stat: vi.fn(async (path: string) => ({
-        size: path === "large.mp4" ? 57 * 1024 * 1024 : 501 * 1024 * 1024,
+        size: path === "large.mp4" ? 57 * 1024 * 1024 : 513 * 1024 * 1024,
         mtime: 1,
       })),
       readBinary: vi.fn(async () => content),

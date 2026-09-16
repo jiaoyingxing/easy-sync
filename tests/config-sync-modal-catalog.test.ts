@@ -1,6 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import { ConfigSyncModal } from "../src/ui/config-sync-modal";
 
+// The danger confirm dialog is the user's intent gate; the flow under
+// test starts after it resolves affirmative.
+vi.mock("../src/ui/confirm-modal", () => ({
+  ConfirmModal: class {
+    awaitConfirm(): Promise<boolean> {
+      return Promise.resolve(true);
+    }
+  },
+}));
+
 /**
  * Behavior contract for the community-plugin manager's remote catalog refresh:
  * an in-flight sync round defers the refresh once (notice + automatic retry
@@ -100,5 +110,63 @@ describe("community plugin manager catalog refresh visibility", () => {
     // inventory revision still triggers the retry once the round has ended.
     expect(modal.catalogRefreshSkippedWhileSyncing).toBe(true);
     expect(modal.renderPluginListArea).not.toHaveBeenCalled();
+  });
+});
+
+describe("community plugin cleanup confirm row visibility", () => {
+  function createCleanupModal(cleanupResult: Promise<boolean>) {
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    const cleanup = vi.fn().mockReturnValue(cleanupResult);
+    Object.assign(modal as object, {
+      plugin: {
+        app: {},
+        i18n: { t: (key: string) => key },
+        runCommunityPluginCloudCleanup: cleanup,
+      },
+      destroyed: false,
+      cleanedPluginIds: new Set<string>(),
+      renderPluginListArea: vi.fn(),
+      requestCommunityPluginInventoryRefresh: vi.fn(),
+    });
+    return { modal, cleanup };
+  }
+
+  async function confirm(modal: ConfigSyncModal): Promise<void> {
+    await (modal as unknown as {
+      confirmCommunityPluginCloudCleanup(
+        item: { id: string },
+        displayName: string,
+      ): Promise<void>;
+    }).confirmCommunityPluginCloudCleanup({ id: "calendar" }, "Calendar");
+  }
+
+  it("removes the row from the list immediately after confirmation and keeps it hidden on success", async () => {
+    const { modal, cleanup } = createCleanupModal(Promise.resolve(true));
+    let hiddenAtCallTime = false;
+    cleanup.mockImplementation(async () => {
+      hiddenAtCallTime = (modal as unknown as {
+        cleanedPluginIds: Set<string>;
+      }).cleanedPluginIds.has("calendar");
+      return true;
+    });
+    await confirm(modal);
+    // 确认即放行: the row is optimistically hidden BEFORE the transaction
+    // resolves, reusing the existing hiding mechanism.
+    expect(hiddenAtCallTime).toBe(true);
+    expect((modal as unknown as {
+      cleanedPluginIds: Set<string>;
+    }).cleanedPluginIds.has("calendar")).toBe(true);
+    expect(modal.renderPluginListArea).toHaveBeenCalled();
+    expect(modal.requestCommunityPluginInventoryRefresh).toHaveBeenCalled();
+  });
+
+  it("restores the row when the cleanup reports failure or blockage", async () => {
+    const { modal } = createCleanupModal(Promise.resolve(false));
+    await confirm(modal);
+    expect((modal as unknown as {
+      cleanedPluginIds: Set<string>;
+    }).cleanedPluginIds.has("calendar")).toBe(false);
+    expect(modal.renderPluginListArea).toHaveBeenCalled();
+    expect(modal.requestCommunityPluginInventoryRefresh).not.toHaveBeenCalled();
   });
 });

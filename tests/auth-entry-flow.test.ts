@@ -6,7 +6,7 @@ import {
 } from "../src/ui/auth-entry-flow";
 
 const modalState = vi.hoisted(() => ({
-  action: "dismiss" as "recheck" | "reopen" | "cancel" | "dismiss",
+  action: "dismiss" as "reopen" | "cancel" | "dismiss",
   copy: false,
 }));
 
@@ -14,20 +14,22 @@ vi.mock("../src/ui/auth-pending-modal", () => ({
   AuthPendingModal: class {
     private readonly onCopy?: () => void | Promise<void>;
     private readonly onReopen?: () => void;
+    private readonly deps?: unknown;
 
     constructor(
       _app: unknown,
       _title: string,
       _message: string,
-      _recheckLabel: string,
       _copyLabel: string,
       _reopenLabel: string,
       _cancelLabel: string,
       onCopy?: () => void | Promise<void>,
       onReopen?: () => void,
+      deps?: unknown,
     ) {
       this.onCopy = onCopy;
       this.onReopen = onReopen;
+      this.deps = deps;
     }
 
     async awaitAction(): Promise<{ action: typeof modalState.action }> {
@@ -320,21 +322,21 @@ describe("handleAuthEntryAction", () => {
     expect(cancelPendingLogin).toHaveBeenCalledOnce();
   });
 
-  it("rechecks a pending login through the shared modal without opening another browser", async () => {
-    modalState.action = "recheck";
-    const { host, login, checkAuthStatus, showNotice } = makeHost({
+  it("lets a pending login complete without any manual recheck: modal auto-closes and nothing is cancelled", async () => {
+    // 完成链与设备码流对齐：登录由回跳自动完成，等待弹框自动关闭；
+    // 流程层对 dismiss 零动作——不取消尝试、不重复拉起浏览器。
+    modalState.action = "dismiss";
+    const cancelPendingLogin = vi.fn();
+    const { host, login } = makeHost({
       isPending: true,
       checkAuthStatus: false,
+      cancelPendingLogin,
     });
 
     await handleAuthEntryAction(host);
 
-    expect(checkAuthStatus).toHaveBeenCalledTimes(2);
     expect(login).not.toHaveBeenCalled();
-    expect(showNotice).toHaveBeenCalledWith(expect.objectContaining({
-      key: "settings-login-pending",
-      message: "settings.account.desc.pending",
-    }));
+    expect(cancelPendingLogin).not.toHaveBeenCalled();
   });
 
   it("reopens a pending login through the same synchronous login entry", async () => {

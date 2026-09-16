@@ -70,18 +70,20 @@ export function formatSyncResultMessage(
 }
 
 /**
- * A run is visibly complete only when no action remains failed, conflicted,
- * deferred, or skipped. This presentation contract deliberately does not
- * change executor control flow or automatic-sync policy.
+ * A run is visibly complete when no action remains failed, conflicted, or
+ * deferred. Skips produced by the user's own configuration (size exclusion,
+ * ignored paths) are expected zero-action outcomes — 2026-09-16 拍板与跳过项
+ * 退出待处理账本同层同据 — so they do not read as incompleteness here; their
+ * per-file rows and the round message still carry the detail. This
+ * presentation contract deliberately does not change executor control flow
+ * or automatic-sync policy.
  */
 export function isSyncResultFullyComplete(result: SyncResult): boolean {
   return result.success
     && !result.authExpired
     && result.errors === 0
     && result.conflicts === 0
-    && result.deferred === 0
-    && result.skippedLarge === 0
-    && result.skippedIgnored === 0;
+    && result.deferred === 0;
 }
 
 export function resolveSyncHistoryStatus(

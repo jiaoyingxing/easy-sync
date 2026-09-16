@@ -855,9 +855,26 @@ export class ConfigSyncModal extends EasySyncModal {
       },
     ).awaitConfirm();
     if (!confirmed) return;
-    const ok = await this.plugin.runCommunityPluginCloudCleanup(item.id);
+    // 确认即放行（2026-09-16 用户拍板）：确认弹框已承载删除意图，行立即按
+    // 既有隐藏机制移出列表（会话内 cleanedPluginIds；成功后持久标记接手，
+    // 关闭弹框再开即真实状态），不新造"禁用但仍显示"的 busy 状态。事务在
+    // 后台继续；失败/被阻止时行回显，原因由主侧通知说明，可重试。
+    this.cleanedPluginIds.add(item.id);
+    if (!this.destroyed) {
+      this.renderPluginListArea();
+    }
+    let ok = false;
+    try {
+      ok = await this.plugin.runCommunityPluginCloudCleanup(item.id);
+    } finally {
+      if (!ok) {
+        this.cleanedPluginIds.delete(item.id);
+      }
+      if (!this.destroyed) {
+        this.renderPluginListArea();
+      }
+    }
     if (ok) {
-      this.cleanedPluginIds.add(item.id);
       this.requestCommunityPluginInventoryRefresh();
     }
   }

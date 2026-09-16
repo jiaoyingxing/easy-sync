@@ -128,3 +128,159 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
     if (timer !== undefined) window.clearTimeout(timer);
   });
 }
+
+/**
+ * Vault-scoped persistence for the update-reminder state (issue #18 round,
+ * 2026-09-15). These three values are per-vault device bookkeeping: they never
+ * participate in sync, and they must stay out of the plugin data file because
+ * the V2 migration input digest binds that file's whole content — a routine
+ * 24h check writing there could kill an in-flight first-sync activation
+ * round. Callers inject the official App localStorage API; a null storage is
+ * tolerated so non-browser test contexts simply keep state in memory.
+ *
+ * The retired 1.4.8 plugin-data keys are read once as an upgrade seed and
+ * are never written again; the seed retires once 1.4.8 devices are gone.
+ */
+export type UpdateCheckStorage = Pick<Storage, "getItem" | "setItem">;
+
+export interface UpdateCheckPersistedState {
+  lastCheckAt: number | null;
+  lastKnownLatest: string | null;
+  snooze: UpdateReminderSnooze | null;
+}
+
+const UPDATE_CHECK_STORAGE_KEY_LAST_CHECK_AT =
+  "easy-sync-update-last-check-at";
+const UPDATE_CHECK_STORAGE_KEY_LAST_KNOWN_LATEST =
+  "easy-sync-update-last-known-latest";
+const UPDATE_CHECK_STORAGE_KEY_SNOOZE = "easy-sync-update-reminder-snooze";
+
+const LEGACY_PLUGIN_DATA_KEYS = {
+  lastCheckAt: "update-last-check-at",
+  lastKnownLatest: "update-last-known-latest",
+  snooze: "update-reminder-snooze",
+} as const;
+
+export function loadUpdateCheckState(
+  storage: UpdateCheckStorage | null,
+): UpdateCheckPersistedState {
+  if (!storage) {
+    return { lastCheckAt: null, lastKnownLatest: null, snooze: null };
+  }
+  return {
+    lastCheckAt: readStoredNumber(
+      storage,
+      UPDATE_CHECK_STORAGE_KEY_LAST_CHECK_AT,
+    ),
+    lastKnownLatest: readStoredStableVersion(
+      storage,
+      UPDATE_CHECK_STORAGE_KEY_LAST_KNOWN_LATEST,
+    ),
+    snooze: readStoredSnooze(storage),
+  };
+}
+
+/** Only present fields are written; a field's absence simply means "unset". */
+export interface UpdateCheckStatePatch {
+  lastCheckAt?: number;
+  lastKnownLatest?: string;
+  snooze?: UpdateReminderSnooze;
+}
+
+export function saveUpdateCheckState(
+  storage: UpdateCheckStorage | null,
+  state: UpdateCheckStatePatch,
+): void {
+  if (!storage) return;
+  try {
+    if (state.lastCheckAt !== undefined) {
+      storage.setItem(
+        UPDATE_CHECK_STORAGE_KEY_LAST_CHECK_AT,
+        String(state.lastCheckAt),
+      );
+    }
+    if (state.lastKnownLatest !== undefined) {
+      storage.setItem(
+        UPDATE_CHECK_STORAGE_KEY_LAST_KNOWN_LATEST,
+        state.lastKnownLatest,
+      );
+    }
+    if (state.snooze !== undefined) {
+      storage.setItem(
+        UPDATE_CHECK_STORAGE_KEY_SNOOZE,
+        JSON.stringify(state.snooze),
+      );
+    }
+  } catch {
+    // Lost bookkeeping is always safe: an extra check next load, or a
+    // reminder that reopens. Same silence contract as the network check.
+  }
+}
+
+/**
+ * One-time seed from the retired 1.4.8 plugin-data keys so upgrading devices
+ * keep their check throttle and snooze decision. Read-only by design: the
+ * stale keys stay in the plugin data file untouched, so they can never change
+ * a migration input digest again.
+ */
+export function seedUpdateCheckStateFromLegacyPluginData(
+  data: Readonly<Record<string, unknown>> | null,
+): UpdateCheckPersistedState {
+  if (!data) {
+    return { lastCheckAt: null, lastKnownLatest: null, snooze: null };
+  }
+  const legacyLastCheckAt = data[LEGACY_PLUGIN_DATA_KEYS.lastCheckAt];
+  const legacyLastKnownLatest = data[LEGACY_PLUGIN_DATA_KEYS.lastKnownLatest];
+  return {
+    lastCheckAt: typeof legacyLastCheckAt === "number" ? legacyLastCheckAt : null,
+    lastKnownLatest: typeof legacyLastKnownLatest === "string"
+      ? legacyLastKnownLatest
+      : null,
+    snooze: parseSnoozeRecord(data[LEGACY_PLUGIN_DATA_KEYS.snooze]),
+  };
+}
+
+function readStoredNumber(
+  storage: UpdateCheckStorage,
+  key: string,
+): number | null {
+  const raw = storage.getItem(key);
+  if (raw === null) return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
+
+function readStoredStableVersion(
+  storage: UpdateCheckStorage,
+  key: string,
+): string | null {
+  const raw = storage.getItem(key);
+  return raw !== null && isStableVersion(raw) ? raw : null;
+}
+
+function readStoredSnooze(
+  storage: UpdateCheckStorage,
+): UpdateReminderSnooze | null {
+  const raw = storage.getItem(UPDATE_CHECK_STORAGE_KEY_SNOOZE);
+  if (raw === null) return null;
+  try {
+    return parseSnoozeRecord(JSON.parse(raw) as unknown);
+  } catch {
+    return null;
+  }
+}
+
+function parseSnoozeRecord(value: unknown): UpdateReminderSnooze | null {
+  if (
+    !!value
+    && typeof value === "object"
+    && typeof (value as { version?: unknown }).version === "string"
+  ) {
+    const until = (value as { until?: unknown }).until;
+    return {
+      version: (value as { version: string }).version,
+      until: typeof until === "number" ? until : null,
+    };
+  }
+  return null;
+}

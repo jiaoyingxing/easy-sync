@@ -60,8 +60,13 @@ describe("resolveSyncNoticeOutcome", () => {
     });
   });
 
-  it("does not call an incomplete no-change round completed", () => {
-    expect(resolveSyncNoticeOutcome(result({ skippedLarge: 1 }))).toBeNull();
+  it("treats a size-skip-only round as completed like any healthy no-change round", () => {
+    // 2026-09-16 拍板：按设置跳过是预期行为、零行动——与历史状态同层同据，
+    // 不再把「只含按设置跳过」的轮当作未完成（完成通知与侧栏可见抑制不变）。
+    expect(resolveSyncNoticeOutcome(result({ skippedLarge: 1 }))).toEqual({
+      kind: "completed",
+      count: 0,
+    });
   });
 
   it("does not show a success notice while an actively changing file waits for the next round", () => {

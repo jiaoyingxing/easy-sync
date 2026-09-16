@@ -45,6 +45,12 @@ export interface FileDecisionFactsV2 {
   baseEntries: readonly BaseFileEntry[];
   skippedLarge: readonly string[];
   configDir: string;
+  /**
+   * Large-file exclusion threshold in bytes (device setting). Absent or
+   * non-finite disables the download-side gate — the gate may only narrow
+   * the executable set, so missing evidence never widens exclusion.
+   */
+  maxFileSizeBytes?: number;
 }
 
 /** Build a lookup map from path to the immutable input entry. */
@@ -73,6 +79,7 @@ const OBSIDIAN_MANAGED_CONFIG_FILES = new Set([
   "hotkeys.json",
   "core-plugins.json",
   "community-plugins.json",
+  "bookmarks.json",
 ]);
 
 export function isObsidianManagedConfigPath(
@@ -132,6 +139,7 @@ export function generateFileDecisionPlanV2(
     baseEntries,
     skippedLarge,
     configDir,
+    maxFileSizeBytes,
   } = facts;
   const localMap = toMap(localEntries);
   const remoteMap = toMap(remoteEntries);
@@ -225,7 +233,14 @@ export function generateFileDecisionPlanV2(
       continue;
     }
 
-    const item = classifyFileDecision(path, local, remote, base, configDir);
+    const item = classifyFileDecision(
+      path,
+      local,
+      remote,
+      base,
+      configDir,
+      maxFileSizeBytes,
+    );
     if (item) plan.push(item);
   }
 
@@ -250,7 +265,21 @@ function classifyFileDecision(
   remote: RemoteFileEntry | undefined,
   base: BaseFileEntry | undefined,
   configDir: string,
+  maxFileSizeBytes: number | undefined,
 ): SyncPlanItem | null {
+  const gatedDownload = (localEntry?: LocalFileEntry): SyncPlanItem => {
+    if (
+      remote
+      && Number.isFinite(maxFileSizeBytes)
+      && Number.isFinite(remote.size)
+      && remote.size > (maxFileSizeBytes as number)
+    ) {
+      return { type: SyncActionType.SkipLargeFile, path, reason: "reason.fileExceedsSizeLimit" };
+    }
+    return localEntry
+      ? { type: SyncActionType.Download, path, local: localEntry, remote }
+      : { type: SyncActionType.Download, path, remote };
+  };
   if (!base) {
     if (local && remote) {
       return {
@@ -265,7 +294,7 @@ function classifyFileDecision(
       return { type: SyncActionType.Upload, path, local };
     }
     if (remote && !local) {
-      return { type: SyncActionType.Download, path, remote };
+      return gatedDownload();
     }
     return null;
   }
@@ -282,7 +311,7 @@ function classifyFileDecision(
 
   if (!local && remote) {
     if (isObsidianManagedConfigPath(path, configDir)) {
-      return { type: SyncActionType.Download, path, remote };
+      return gatedDownload();
     }
     if (remoteChanged) {
       return {
@@ -342,7 +371,7 @@ function classifyFileDecision(
       };
     }
     if (!localChanged && remoteChanged) {
-      return { type: SyncActionType.Download, path, local, remote };
+      return gatedDownload(local);
     }
   }
 

@@ -174,7 +174,22 @@ describe("mutation recovery presentation", () => {
       blockReason: null,
     }, t, () => "20:30:00")).toMatchObject({
       actionKey: null,
-      nextStep: "无需操作，网络恢复后会自动继续。",
+      // 2026-09-15 文案减负 R-4：summary 已含「网络恢复后自动重试」，
+      // 自动态不再渲染同义复读的 next-step 行。
+      nextStep: null,
+    });
+
+    expect(mutationRecoveryBodyPresentation({
+      kind: "checking",
+      total: 2,
+      settled: 0,
+      remaining: 2,
+      retryAt: null,
+      firstPath: "notes/a.md",
+      blockReason: null,
+    }, t, () => "")).toMatchObject({
+      summary: "EasySync 正在核对上次未完成操作的结果。核对结束前不会继续同步。",
+      nextStep: null,
     });
 
     expect(mutationRecoveryBodyPresentation({

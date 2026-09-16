@@ -5,9 +5,13 @@ import {
   isNewerVersion,
   isUpdateCheckDue,
   isUpdateReminderSuppressed,
+  loadUpdateCheckState,
   pickLatestStableVersion,
+  saveUpdateCheckState,
+  seedUpdateCheckStateFromLegacyPluginData,
   SNOOZE_DURATION_MS,
   UPDATE_CHECK_INTERVAL_MS,
+  type UpdateCheckStorage,
 } from "../src/update-check";
 import en from "../src/i18n/en";
 import zhCN from "../src/i18n/zh-cn";
@@ -141,5 +145,131 @@ describe("fetchLatestStableVersion", () => {
     await expect(
       fetchLatestStableVersion(() => Promise.reject(new Error("offline"))),
     ).resolves.toBeNull();
+  });
+});
+
+/** Issue #18 hardening: update bookkeeping lives in device-local storage,
+ *  never in the synced plugin data file whose whole content is bound into the
+ *  V2 migration input digest — a routine 24h write must not be able to kill
+ *  an in-flight first-sync activation round. */
+describe("update check device-local persistence", () => {
+  function memoryStorage(): UpdateCheckStorage & { dump(): Map<string, string> } {
+    const map = new Map<string, string>();
+    return {
+      getItem: (key: string) => map.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        map.set(key, value);
+      },
+      dump: () => map,
+    };
+  }
+
+  it("round-trips lastCheckAt, lastKnownLatest and snooze", () => {
+    const storage = memoryStorage();
+    saveUpdateCheckState(storage, {
+      lastCheckAt: 1_000,
+      lastKnownLatest: "1.4.9",
+      snooze: { version: "1.4.9", until: 2_000 },
+    });
+    expect(loadUpdateCheckState(storage)).toEqual({
+      lastCheckAt: 1_000,
+      lastKnownLatest: "1.4.9",
+      snooze: { version: "1.4.9", until: 2_000 },
+    });
+  });
+
+  it("returns nulls for an empty storage", () => {
+    expect(loadUpdateCheckState(memoryStorage())).toEqual({
+      lastCheckAt: null,
+      lastKnownLatest: null,
+      snooze: null,
+    });
+  });
+
+  it("degrades corrupted values to nulls instead of throwing", () => {
+    const storage = memoryStorage();
+    storage.setItem("easy-sync-update-last-check-at", "not-a-number");
+    storage.setItem("easy-sync-update-last-known-latest", "");
+    storage.setItem("easy-sync-update-reminder-snooze", "{not-json");
+    expect(loadUpdateCheckState(storage)).toEqual({
+      lastCheckAt: null,
+      lastKnownLatest: null,
+      snooze: null,
+    });
+  });
+
+  it("rejects a snooze record without a version", () => {
+    const storage = memoryStorage();
+    storage.setItem(
+      "easy-sync-update-reminder-snooze",
+      JSON.stringify({ until: 123 }),
+    );
+    expect(loadUpdateCheckState(storage).snooze).toBeNull();
+  });
+
+  it("partial saves leave other fields untouched", () => {
+    const storage = memoryStorage();
+    saveUpdateCheckState(storage, { lastCheckAt: 5_000 });
+    saveUpdateCheckState(storage, { lastKnownLatest: "1.5.0" });
+    saveUpdateCheckState(storage, {
+      snooze: { version: "1.5.0", until: null },
+    });
+    expect(loadUpdateCheckState(storage)).toEqual({
+      lastCheckAt: 5_000,
+      lastKnownLatest: "1.5.0",
+      snooze: { version: "1.5.0", until: null },
+    });
+  });
+
+  it("tolerates a missing storage object on load and save", () => {
+    expect(loadUpdateCheckState(null)).toEqual({
+      lastCheckAt: null,
+      lastKnownLatest: null,
+      snooze: null,
+    });
+    expect(() =>
+      saveUpdateCheckState(null, { lastCheckAt: 1 }),
+    ).not.toThrow();
+  });
+
+  it("seeds once from the retired 1.4.8 plugin-data keys without writing them", () => {
+    expect(
+      seedUpdateCheckStateFromLegacyPluginData({
+        "update-last-check-at": 7_000,
+        "update-last-known-latest": "1.4.8",
+        "update-reminder-snooze": { version: "1.4.8", until: null },
+      }),
+    ).toEqual({
+      lastCheckAt: 7_000,
+      lastKnownLatest: "1.4.8",
+      snooze: { version: "1.4.8", until: null },
+    });
+    expect(
+      seedUpdateCheckStateFromLegacyPluginData({
+        "update-last-check-at": "corrupt",
+        "update-reminder-snooze": "not-a-record",
+      }),
+    ).toEqual({
+      lastCheckAt: null,
+      lastKnownLatest: null,
+      snooze: null,
+    });
+    expect(seedUpdateCheckStateFromLegacyPluginData(null)).toEqual({
+      lastCheckAt: null,
+      lastKnownLatest: null,
+      snooze: null,
+    });
+  });
+
+  it("keeps the plugin data file free of update bookkeeping (structural guard)", async () => {
+    const { readFileSync } = await import("node:fs");
+    const mainSource = readFileSync(
+      new URL("../src/main.ts", import.meta.url),
+      "utf8",
+    );
+    expect(mainSource).not.toContain("update-last-check-at");
+    expect(mainSource).not.toContain("update-last-known-latest");
+    expect(mainSource).not.toContain("update-reminder-snooze");
+    expect(mainSource).not.toContain("KEY_UPDATE_");
   });
 });

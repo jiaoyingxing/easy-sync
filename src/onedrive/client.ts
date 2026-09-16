@@ -47,6 +47,7 @@ import {
 import {
   createDownloadStallWatchdog,
   createSlowConnectionGate,
+  createSlowLinkEvidence,
   isAbortError,
   requestErrorMessage,
   sleepWithAbort,
@@ -267,12 +268,19 @@ export class OneDriveClient {
   /** Remember which download strategy worked last in this sync round so
    *  subsequent files skip the waterfall of known-broken tiers. */
   private downloadMethod: "downloadUrl" | "content" | null = null;
-  /** M13: set when both /content tiers fail for a file in this round.
-   *  Subsequent files skip /content entirely — it's confirmed broken. */
+  /** M13: set when a /content tier fails for a file in this round with a
+   *  real HTTP status (endpoint-level evidence). Transport-level failures
+   *  (statusCode 0 — the link died) never blacklist: they made small files
+   *  fail without a single attempt (2026-09-15 连坐切片). */
   private contentFailedThisRound = false;
-  /** Set when CDN downloadUrl fails for a file this round.
-   *  Subsequent files skip CDN entirely — saves budget for /content. */
+  /** Set when the CDN downloadUrl fails for a file this round with a real
+   *  HTTP status. Subsequent files skip CDN entirely — saves budget for
+   *  /content. Transport-level failures never blacklist (连坐切片). */
   private cdnFailedThisRound = false;
+  /** Per-round slow-link evidence (2026-09-15 乙路): window rates from every
+   *  download feed the slow gate's relative judgment, so only the round's
+   *  first window pays the cold-start tuition against the absolute line. */
+  private slowLinkEvidence = createSlowLinkEvidence();
   private runMetrics: ActiveRunMetrics | null = null;
   /** requestUrl cannot be cancelled after our local deadline. Keep one raw
    * owner per shared-protocol component so later sync rounds cannot pile up
@@ -1003,6 +1011,7 @@ export class OneDriveClient {
     this.downloadMethod = null;
     this.contentFailedThisRound = false;
     this.cdnFailedThisRound = false;
+    this.slowLinkEvidence = createSlowLinkEvidence();
   }
 
   /**
@@ -1535,9 +1544,16 @@ export class OneDriveClient {
     afterHintDownload?: (value: T) => void;
   }): Promise<T> {
     throwIfAborted(this.abortSignal);
-    const slowGate = createSlowConnectionGate(`${input.operationName} "${input.filePath}"`);
+    const slowGate = createSlowConnectionGate(
+      `${input.operationName} "${input.filePath}"`,
+      { evidence: this.slowLinkEvidence, totalSize: input.fileSize },
+    );
     const maxResponseBytes = remoteFileByteBudget(input.fileSize, input.filePath);
     let metadataAuthError: OneDriveError | null = null;
+    // 连坐切片 (2026-09-16): whether a /content tier failed with a real HTTP
+    // status — only that blacklists content for the round when the caller has
+    // no driveItemId and the fallthrough below is reached.
+    let sawEndpointLevelContentFailure = false;
     const primaryTimeoutMs = downloadTimeoutMs(input.fileSize);
     const failureReserveMs = Math.ceil(
       primaryTimeoutMs * DOWNLOAD_FAILURE_RESERVE_RATIO,
@@ -1691,7 +1707,7 @@ export class OneDriveClient {
           `${input.operationName} "${input.filePath}" — downloadUrl failed, trying item metadata`,
           { ...downloadErrorData(err), tierMs: Date.now() - tierStartMs },
         );
-        this.cdnFailedThisRound = true;
+        if (!isTransportLevelDownloadFailure(err)) this.cdnFailedThisRound = true;
         remainingMs();
       }
     }
@@ -1726,7 +1742,7 @@ export class OneDriveClient {
           `${input.operationName} "${input.filePath}" — item metadata downloadUrl failed, trying path /content`,
           { ...downloadErrorData(err), tierMs: Date.now() - tierStartMs },
         );
-        this.cdnFailedThisRound = true;
+        if (!isTransportLevelDownloadFailure(err)) this.cdnFailedThisRound = true;
         remainingMs();
       }
     }
@@ -1769,6 +1785,7 @@ export class OneDriveClient {
         `${input.operationName} "${input.filePath}" — path /content failed, trying item ID /content`,
         { ...downloadErrorData(err), tierMs: Date.now() - pathTierStartMs },
       );
+      if (!isTransportLevelDownloadFailure(err)) sawEndpointLevelContentFailure = true;
       remainingMs();
     }
 
@@ -1798,12 +1815,12 @@ export class OneDriveClient {
           `${input.operationName} "${input.filePath}" — item ID /content failed, no remaining fallback`,
           { ...downloadErrorData(err), tierMs: Date.now() - itemTierStartMs },
         );
-        this.contentFailedThisRound = true;
+        if (!isTransportLevelDownloadFailure(err)) this.contentFailedThisRound = true;
         throw err;
       }
     }
 
-    this.contentFailedThisRound = true;
+    if (sawEndpointLevelContentFailure) this.contentFailedThisRound = true;
     throw new OneDriveError(
       OneDriveErrorType.NotFound,
       `No download method available for: ${input.filePath}`,
@@ -1862,6 +1879,7 @@ export class OneDriveClient {
               signal,
               label: `Remote file "${filePath}"`,
               onProgress,
+              slowLinkEvidence: this.slowLinkEvidence,
             });
             return { value: buffer, bytes: buffer.byteLength };
           } catch (error) {
@@ -1925,7 +1943,14 @@ export class OneDriveClient {
     onProgress?: (downloaded: number, total: number) => void,
   ): Promise<DownloadToPathResult> {
     const maxResponseBytes = remoteFileByteBudget(fileSize, filePath);
-    return this.downloadWithWaterfall({
+    // 甲路续传 (2026-09-16): bytes already received are assets. The streaming
+    // writers keep the on-disk prefix on retryable failures and record its
+    // length here; the next attempt re-requests `Range: bytes=<offset>-` and
+    // re-seeds the hash from the prefix. The offset survives across tiers
+    // (same file) and is reset by any full-buffer (requestUrl) write.
+    const resumeState: DownloadResumeState = { offset: 0 };
+    try {
+      return await this.downloadWithWaterfall({
       operationName: "downloadFileToPath",
       vaultName,
       filePath,
@@ -1944,10 +1969,12 @@ export class OneDriveClient {
           onProgress,
           signal,
           slowGate,
+          resumeState,
         );
         return { value: result, bytes: result.size };
       },
       loadRequestUrlResponse: async (response) => {
+        resumeState.offset = 0;
         const result = await writeArrayBufferToBinaryFile(
           adapter,
           localPath,
@@ -1969,8 +1996,20 @@ export class OneDriveClient {
           requestOptions,
           onProgress,
           slowGate,
+          resumeState,
         ),
-    });
+      });
+    } catch (error) {
+      // 甲路续传: the waterfall gave up on this file for the round — the kept
+      // prefix is unreachable by any further retry, so discard it instead of
+      // leaking it in tmp (the executor's failure path and the next fresh
+      // attempt each also clean up).
+      if (resumeState.offset > 0) {
+        resumeState.offset = 0;
+        await safeRemove(adapter, localPath);
+      }
+      throw error;
+    }
   }
 
   /** Delete a file or folder.
@@ -2104,7 +2143,7 @@ export class OneDriveClient {
               url: baseline["@microsoft.graph.downloadUrl"],
               method: "GET",
             }),
-            8000,
+            METADATA_READ_TIMEOUT_MS,
           );
           this.diag?.log("onedrive", "cloud baseline downloaded via plugin-dir children downloadUrl");
           return responseToText(
@@ -2140,7 +2179,7 @@ export class OneDriveClient {
                 url: meta["@microsoft.graph.downloadUrl"],
                 method: "GET",
               }),
-              8000,
+              METADATA_READ_TIMEOUT_MS,
             );
             this.diag?.log("onedrive", "cloud baseline downloaded via item metadata downloadUrl fallback");
             return responseToText(
@@ -2646,10 +2685,16 @@ export class OneDriveClient {
     if (!item.eTag) throw new Error(`${label} item has no eTag`);
     if (item["@microsoft.graph.downloadUrl"]) {
       try {
-        const response = await withTimeout(requestUrl({
-          url: item["@microsoft.graph.downloadUrl"],
-          method: "GET",
-        }), 8000);
+        // 控制对象内容读取与元数据类读取同预算（27f14c2d 统一的收尾）：
+        // 弱网下 8 秒不够读完引导/协议文档，超时仍按不可取消终局，
+        // 不与 Graph /content 兜底重叠。
+        const response = await withTimeout(
+          requestUrl({
+            url: item["@microsoft.graph.downloadUrl"],
+            method: "GET",
+          }),
+          METADATA_READ_TIMEOUT_MS,
+        );
         return {
           id: item.id,
           eTag: item.eTag,
@@ -2859,6 +2904,7 @@ export class OneDriveClient {
     options: RequestOptions,
     onProgress?: (downloaded: number, total: number) => void,
     slowGate?: SlowConnectionGate,
+    resumeState?: DownloadResumeState,
   ): Promise<DownloadToPathResult> {
     throwIfAborted(this.abortSignal);
     const url = resolveAuthenticatedGraphUrl(apiPath);
@@ -2880,6 +2926,7 @@ export class OneDriveClient {
           onProgress,
           signal,
           slowGate,
+          resumeState,
         ),
         timeoutMs,
         this.abortSignal,
@@ -3941,10 +3988,27 @@ function responseToText(
 /** Extract structured error data for diag logging. */
 function downloadErrorData(err: unknown): Record<string, unknown> {
   const message = err instanceof Error ? err.message : String(err);
-  if (err instanceof OneDriveError) {
-    return { message, errorType: err.type, statusCode: err.statusCode, graphCode: err.graphCode };
-  }
-  return { message };
+  const data: Record<string, unknown> = err instanceof OneDriveError
+    ? { message, errorType: err.type, statusCode: err.statusCode, graphCode: err.graphCode }
+    : { message };
+  // Slow-gate telemetry (2026-09-15 乙路 phase 1): the aborting window rate
+  // and the previous abort's rate on the same gate, for before/after pairing.
+  const slowGateRate = (err as { slowGateRateKiBps?: unknown } | null)?.slowGateRateKiBps;
+  if (typeof slowGateRate === "number") data.slowGateRateKiBps = slowGateRate;
+  const slowGatePrior = (err as { slowGatePriorRateKiBps?: unknown } | null)?.slowGatePriorRateKiBps;
+  if (typeof slowGatePrior === "number") data.slowGatePriorRateKiBps = slowGatePrior;
+  return data;
+}
+
+/** Transport-level download failures (2026-09-16 连坐切片): statusCode 0 means
+ *  no HTTP response at all — stalled connection, DNS, local deadline, slow-gate
+ *  abort. That is evidence the LINK died, not that the endpoint is broken;
+ *  blacklisting an endpoint for the whole round on these failures made small
+ *  files fail without a single attempt (2026-09-15 iPhone: 86.6KB/558KB
+ *  recordings blocked by an earlier large file's stalls). Only failures with a
+ *  real HTTP status confirm "this endpoint is broken" and keep blacklisting. */
+function isTransportLevelDownloadFailure(err: unknown): boolean {
+  return err instanceof OneDriveError && err.statusCode === 0;
 }
 
 /** Upload a chunk to an Azure Blob upload session URL using native fetch
@@ -4102,6 +4166,16 @@ async function writeArrayBufferToBinaryFile(
   return { size, hash };
 }
 
+/** 甲路续传 (2026-09-16): shared per-download resume bookkeeping for the
+ *  streamed (.part) path. `offset` is the number of bytes already on disk;
+ *  the writers keep it current so a retryable failure re-requests
+ *  `Range: bytes=<offset>-` instead of restarting from zero. The offset
+ *  survives across the waterfall's tiers (same remote file) and is reset by
+ *  any full-buffer (requestUrl) write or fresh-stream downgrade. */
+interface DownloadResumeState {
+  offset: number;
+}
+
 async function streamResponseToBinaryFile(
   res: Response,
   adapter: DataAdapter,
@@ -4111,6 +4185,7 @@ async function streamResponseToBinaryFile(
   label: string,
   watchdog: DownloadStallWatchdog,
   onProgress?: (downloaded: number, total: number) => void,
+  resumeState?: DownloadResumeState,
 ): Promise<DownloadToPathResult> {
   if (!res.ok) {
     const err = new Error(`HTTP ${res.status}`) as Error & { status: number };
@@ -4120,6 +4195,7 @@ async function streamResponseToBinaryFile(
   const contentLength = responseContentLength(res);
   assertDeclaredRemoteSize(contentLength, maxBytes, label);
   if (!res.body) {
+    if (resumeState) resumeState.offset = 0;
     return writeArrayBufferToBinaryFile(
       adapter,
       path,
@@ -4131,11 +4207,32 @@ async function streamResponseToBinaryFile(
       onProgress,
     );
   }
-  await safeRemove(adapter, path);
+  // 甲路续传: a 206 against a recorded prefix continues from the on-disk
+  // bytes; anything else (200 — the server ignored Range — or a prefix that
+  // no longer matches) downgrades fail-closed to a full fresh stream. The
+  // terminal sha256 always covers the whole assembled file either way.
+  let resumePrefix: ArrayBuffer | null = null;
+  if (resumeState && resumeState.offset > 0 && res.status === 206) {
+    try {
+      const prefix = await adapter.readBinary(path);
+      if (prefix.byteLength === resumeState.offset) resumePrefix = prefix;
+    } catch {
+      resumePrefix = null;
+    }
+  }
+  if (resumePrefix) {
+    // Continuing after the on-disk prefix: first new chunk appends and the
+    // hash is seeded from the prefix bytes.
+  } else {
+    if (resumeState) resumeState.offset = 0;
+    await safeRemove(adapter, path);
+  }
   const reader = res.body.getReader();
   const hasher = new StreamingSha256();
-  let downloaded = 0;
-  let wrote = false;
+  let downloaded = resumePrefix ? resumeState!.offset : 0;
+  let wrote = Boolean(resumePrefix);
+  if (resumePrefix) hasher.update(new Uint8Array(resumePrefix));
+  const progressTotal = resumePrefix ? resumeState!.offset + (contentLength || 0) : contentLength;
   try {
     while (true) {
       throwIfAborted(watchdog.signal);
@@ -4152,13 +4249,14 @@ async function streamResponseToBinaryFile(
       }
       downloaded += value.length;
       watchdog.slowGate?.evaluate(downloaded);
-      onProgress?.(downloaded, contentLength || downloaded);
+      onProgress?.(downloaded, progressTotal || downloaded);
     }
     if (!wrote) {
       await adapter.writeBinary(path, new ArrayBuffer(0));
     }
     const hash = hasher.digestHex();
     if (expectedSha256 && hash !== expectedSha256.toLowerCase()) {
+      if (resumeState) resumeState.offset = 0;
       await safeRemove(adapter, path);
       throw new OneDriveError(
         OneDriveErrorType.NetworkError,
@@ -4167,7 +4265,9 @@ async function streamResponseToBinaryFile(
     }
     return { size: downloaded, hash };
   } catch (error) {
-    await safeRemove(adapter, path);
+    // 甲路续传: keep the received prefix for the next attempt's Range
+    // resume — only the terminal failures above discard it.
+    if (resumeState) resumeState.offset = downloaded;
     throw withTransferredBytes(error, downloaded);
   } finally {
     try { reader.releaseLock(); } catch { /* noop */ }
@@ -4234,12 +4334,17 @@ async function contentUrlFetchToBinaryFile(
   onProgress?: (downloaded: number, total: number) => void,
   signal?: AbortSignal,
   slowGate?: SlowConnectionGate,
+  resumeState?: DownloadResumeState,
 ): Promise<DownloadToPathResult> {
   const watchdog = createDownloadStallWatchdog(signal, label, slowGate);
   try {
+    const resumeOffset = resumeState?.offset ?? 0;
     const res = await watchdog.guard(browserFetch(url, {
       method: "GET",
-      headers: { Authorization: `Bearer ${token}` },
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(resumeOffset > 0 ? { Range: `bytes=${resumeOffset}-` } : {}),
+      },
       cache: "no-store",
       signal: watchdog.signal,
     }));
@@ -4252,6 +4357,7 @@ async function contentUrlFetchToBinaryFile(
       label,
       watchdog,
       onProgress,
+      resumeState,
     );
   } finally {
     watchdog.dispose();
@@ -4290,10 +4396,18 @@ async function downloadUrlFetchToBinaryFile(
   onProgress?: (downloaded: number, total: number) => void,
   signal?: AbortSignal,
   slowGate?: SlowConnectionGate,
+  resumeState?: DownloadResumeState,
 ): Promise<DownloadToPathResult> {
   const watchdog = createDownloadStallWatchdog(signal, label, slowGate);
   try {
-    const res = await watchdog.guard(browserFetch(url, { cache: "no-store", signal: watchdog.signal }));
+    const resumeOffset = resumeState?.offset ?? 0;
+    const res = await watchdog.guard(browserFetch(url, {
+      cache: "no-store",
+      signal: watchdog.signal,
+      ...(resumeOffset > 0
+        ? { headers: { Range: `bytes=${resumeOffset}-` } }
+        : {}),
+    }));
     return await streamResponseToBinaryFile(
       res,
       adapter,
@@ -4303,6 +4417,7 @@ async function downloadUrlFetchToBinaryFile(
       label,
       watchdog,
       onProgress,
+      resumeState,
     );
   } finally {
     watchdog.dispose();

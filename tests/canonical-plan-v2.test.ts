@@ -2168,3 +2168,15 @@ describe("canonical V2 plan candidate", () => {
     });
   });
 });
+
+describe("canonical plan large-file gate wiring", () => {
+  it("forwards the device size threshold into the file decision facts", () => {
+    const source = readFileSync("src/sync/canonical-plan-v2.ts", "utf8");
+    expect(source).toContain("maxFileSizeBytes: input.maxFileSizeBytes,");
+  });
+
+  it("threads the scanner threshold at every canonical facts build site", () => {
+    const source = readFileSync("src/sync/sync-executor.ts", "utf8");
+    expect(source).toContain("maxFileSizeBytes: this.scanner.getMaxFileSize?.(),");
+  });
+});

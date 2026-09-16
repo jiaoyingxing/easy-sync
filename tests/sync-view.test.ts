@@ -8,11 +8,11 @@ import {
   buildSyncPlanMeasuredVirtualOffsets,
   buildSyncPlanVirtualOffsets,
   buildSyncPlanVirtualWindow,
+  buildSyncPendingDisplayRows,
   buildSyncViewContentKey,
   EasySyncSyncView,
   countOmittedSyncHistorySuccessfulFiles,
   formatFileProgressLabel,
-  formatPendingIssueActionLabel,
   formatPendingIssueChipLabel,
   groupCommunityPluginConflictReviews,
   groupPendingIssuesForReview,
@@ -131,6 +131,79 @@ describe("shared sidebar detail controls", () => {
     });
   });
 
+  it("builds pending display rows in display order with stable keys and retryable flags", () => {
+    const issue = (path: string, actionType: SyncActionType) => ({
+      path,
+      actionType,
+      issueCode: undefined,
+      updatedAt: 1,
+    });
+    const rows = buildSyncPendingDisplayRows({
+      adoptionRows: [{ pluginId: "resp", displayName: "Resojot", desktopOnly: false }],
+      failures: [{ issue: issue("a.md", SyncActionType.Upload), nestedIssues: [] }],
+      conflictEntries: [
+        { kind: "file" as const, item: { type: SyncActionType.Conflict, path: "c.md" } },
+        {
+          kind: "community-plugin-bundle" as const,
+          pluginId: "resp",
+          items: [{ type: SyncActionType.Conflict, path: ".obsidian/plugins/resp/main.js" }],
+        },
+      ],
+      pendingDeletes: [
+        { type: SyncActionType.ConfirmLocalDelete, path: "d1.md" },
+        { type: SyncActionType.ConfirmLocalDelete, path: "d2.md" },
+      ],
+      skipped: [{ issue: issue("big.bin", SyncActionType.SkipLargeFile), nestedIssues: [] }],
+    });
+
+    expect(rows.map((row) => row.kind)).toEqual([
+      "adoption",
+      "issue",
+      "conflict",
+      "pluginConflict",
+      "batchDelete",
+      "delete",
+      "delete",
+      "issue",
+    ]);
+    expect(rows[0].key).toBe("adoption:resp");
+    expect(rows[1].key).toBe(`issue:${SyncActionType.Upload}::a.md`);
+    expect(rows[1].retryable).toBe(true);
+    expect(rows[2].key).toBe("conflict:c.md");
+    expect(rows[3].key).toBe("plugin:resp");
+    expect(rows[4].key).toBe("batch-delete");
+    expect(rows[4].deletes).toHaveLength(2);
+    expect(rows[5].key).toBe("delete:d1.md");
+    expect(rows[6].key).toBe("delete:d2.md");
+    expect(rows[7].key).toBe(`issue:${SyncActionType.SkipLargeFile}::big.bin`);
+    expect(rows[7].retryable).toBe(false);
+  });
+
+  it("omits the batch delete row unless more than one delete is pending", () => {
+    const rows = buildSyncPendingDisplayRows({
+      adoptionRows: [],
+      failures: [],
+      conflictEntries: [],
+      pendingDeletes: [{ type: SyncActionType.ConfirmLocalDelete, path: "only.md" }],
+      skipped: [],
+    });
+    expect(rows.map((row) => row.kind)).toEqual(["delete"]);
+  });
+
+  it("windows the pending section with the shared decision-row machinery", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const sectionStart = source.indexOf("private renderPendingSection");
+    const sectionEnd = source.indexOf("private renderPendingRow(", sectionStart);
+    const section = source.slice(sectionStart, sectionEnd);
+    expect(section).toContain("buildSyncPendingDisplayRows(");
+    expect(section).toContain("easy-sync-plan-virtual-list");
+    expect(section).toContain("buildSyncPlanVirtualWindow(");
+    expect(section).toContain("planDecisionRowsInFlight.has(row.key)");
+    expect(section).toContain("this.planVirtualRenderers.add(renderPendingWindow)");
+    expect(section).toContain("applyPlanRowExpansionIn(visible)");
+    expect(section).not.toContain("for (const item of pendingDeletes) this.renderDeleteItem");
+  });
+
   it("groups one plugin bundle into one review row without absorbing other conflicts", () => {
     const conflict = (path: string) => ({
       type: SyncActionType.Conflict,
@@ -242,10 +315,20 @@ describe("sync view status copy and scrolling layout", () => {
       .toBe("原云端同步目录无法继续使用，需要重新创建后核对内容。");
     expect(en.t("syncPlan.remoteScopeRecreateSummary"))
       .toContain("previous remote sync folder");
+    expect(zh.t("result.remoteReadUnavailable"))
+      .toBe("暂时无法读取云端状态，本轮未进入新的文件同步计划；下次同步时会重新检查。");
+    expect(en.t("result.remoteReadUnavailable"))
+      .toBe("The cloud state is temporarily unavailable, so this run did not enter a new file sync plan. EasySync will check again on the next sync.");
+    // 2026-09-15 文案减负 R-1：云端状态读取失败两键并一，旧键必须已删除。
     expect(zh.t("result.sharedControlReadUnavailable"))
-      .toBe("暂时无法读取云端同步状态，本轮未进入新的文件同步计划；EasySync 会在下次同步时重新检查。");
-    expect(en.t("result.sharedControlReadUnavailable"))
-      .toBe("The cloud sync state is temporarily unavailable, so this run did not enter a new file sync plan. EasySync will check again on the next sync.");
+      .toBe("result.sharedControlReadUnavailable");
+    expect(zh.t("result.ordinaryRemoteReadUnavailable"))
+      .toBe("result.ordinaryRemoteReadUnavailable");
+    // 2026-09-15 文案减负 R-2：冲突下载失败提示去掉通用兜底尾句。
+    expect(zh.t("notice.conflict.downloadFailed"))
+      .toBe("未能下载云端版本，本次未作更改；请稍后重试。");
+    expect(en.t("notice.conflict.downloadFailed"))
+      .toBe("The remote version could not be downloaded, so nothing was changed. Try again later.");
     expect(zh.t("syncView.history.noFileChanges"))
       .toBe("本轮没有文件变更。");
     expect(en.t("syncView.history.noFileChanges"))
@@ -682,6 +765,41 @@ describe("buildSyncViewContentKey", () => {
 
     expect(actionable).not.toBe(legacy);
     expect(actionable).toContain("anchored-folder-missing-local");
+  });
+
+  it("serializes provided pending issue groups instead of collapsing them", () => {
+    const issue = {
+      path: "Notes",
+      actionType: SyncActionType.FolderDeferred,
+      reason: "folder missing",
+      updatedAt: 1,
+    };
+    const withGroups = buildSyncViewContentKey(false, {
+      ...baseInput,
+      bodyMode: "pending",
+      pendingIssues: [],
+      pendingIssueGroups: [{ issue, nestedIssues: [] }],
+    });
+    const withOtherGroups = buildSyncViewContentKey(false, {
+      ...baseInput,
+      bodyMode: "pending",
+      pendingIssues: [],
+      pendingIssueGroups: [{
+        issue: { ...issue, path: "Archive" },
+        nestedIssues: [],
+      }],
+    });
+    const sameGroupsTwice = buildSyncViewContentKey(false, {
+      ...baseInput,
+      bodyMode: "pending",
+      pendingIssues: [],
+      pendingIssueGroups: [{ issue, nestedIssues: [] }],
+    });
+
+    expect(withGroups).not.toBe(withOtherGroups);
+    expect(withGroups).toBe(sameGroupsTwice);
+    expect(withGroups).not.toContain("[object Object]");
+    expect(withGroups).toContain("folderDeferred::Notes:1:folder missing");
   });
 
   it("rebuilds a pending body when adoption rows appear, change, or retire", () => {
@@ -1201,14 +1319,14 @@ describe("buildSyncViewContentKey", () => {
     expect(label(SyncActionType.AuthExpired)).toBeNull();
   });
 
-  it("keeps real retries distinct from safe rechecks", () => {
-    const zh = new I18n("zh-cn");
-    const label = (type: SyncActionType) =>
-      formatPendingIssueActionLabel(type, zh.t.bind(zh));
-
-    expect(label(SyncActionType.FolderDeferred)).toBe("重新检查");
-    expect(label(SyncActionType.RetryLater)).toBe("重新检查");
-    expect(label(SyncActionType.Upload)).toBe("再次同步");
+  it("renders no per-row generic retry affordance for issue rows", () => {
+    // 2026-09-16 按钮清理：行内「重新检查/再次同步」与顶部主动作完全等同
+    // （同一 startManualSync，轮中仅得 busy 提示）——重试统一走顶部；
+    // 延后类行由自动轮次收敛。标签分叉函数随 chip 一并退役。
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    expect(source).not.toContain("formatPendingIssueActionLabel");
+    expect(source).not.toContain('"syncView.issues.retry"');
+    expect(source).not.toContain('"syncView.issues.recheck"');
   });
 
   it("explains a folder scope crossing as a safe user action", () => {
@@ -1337,7 +1455,9 @@ describe("buildSyncViewContentKey", () => {
     expect(source).toContain("new ResizeObserver");
     expect(source).toContain('window.addEventListener("resize"');
     expect(source).toContain("this.scheduleAdaptivePathLayout()");
-    expect(source).toContain("this.renderFileResults(body, entry.files, false)");
+    // 2026-09-16 增量呈现：历史条目先分区再渲染，普通行走 renderFileResults，
+    // SkipLargeFile 行归入折叠组（见 renderHistorySection 的 skip-group）。
+    expect(source).toContain("this.renderFileResults(body, otherRows, false)");
     expect(source).toContain(
       'if (limitHeight) {\n      list.addClass("is-limited");\n      list.addClass("easy-sync-path-layout");',
     );
@@ -1931,6 +2051,11 @@ describe("buildSyncViewContentKey", () => {
     );
   });
 
+  it("drops the no-action last-attempt line from pending rows (2026-09-15 减负 R-5)", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    expect(source).not.toContain("syncView.issues.lastAttempt");
+  });
+
   it("routes a two-sided folder move to one existing folder modal", () => {
     const source = readFileSync("src/ui/sync-view.ts", "utf8");
     const modalSource = readFileSync(
@@ -2155,10 +2280,12 @@ describe("buildSyncViewContentKey", () => {
     const sectionStart = source.indexOf("private renderPendingSection");
     const sectionEnd = source.indexOf("private renderPendingIssue", sectionStart);
     const section = source.slice(sectionStart, sectionEnd);
-
-    expect(section).toContain("pendingDeletes.length > 1");
+    // 批量门槛在显示行 builder（负责点随窗口化迁移）。
+    const builderStart = source.indexOf("export function buildSyncPendingDisplayRows");
+    const builder = source.slice(builderStart);
+    expect(builder).toContain("input.pendingDeletes.length > 1");
     expect(section).toContain('createDiv("easy-sync-plan-execute")');
-    expect(section).toContain('actions.addClass("easy-sync-primary-actions")');
+    expect(section).toContain('addClass("easy-sync-primary-actions")');
     expect(section).toContain('t("syncView.delete.confirmAll"');
     expect(section).toContain("new ConfirmModal(");
     expect(section).toContain('t("syncView.delete.confirmAllTitle"');
@@ -2862,7 +2989,8 @@ describe("scope-crossing row exit gating", () => {
     expect(render).toContain(
       "this.plugin.state?.getScopeCrossingExitKind(issue.path)",
     );
-    // 双 chip 分支以出口存在为前提；无出口（漂移/设置形态）落到通用「重新检查」。
+    // 双 chip 分支以出口存在为前提；无出口（漂移/设置形态）行不再有通用
+    // 兜底重试按钮——重试统一走顶部主动作（2026-09-16 按钮清理）。
     expect(render).toContain(
       'if (issue.issueCode === "scope-crossing" && scopeCrossingExitKind) {',
     );
@@ -2870,8 +2998,8 @@ describe("scope-crossing row exit gating", () => {
       'if (issue.issueCode === "scope-crossing" && scopeCrossingExitKind) {',
     );
     const fallback = render.slice(branchStart);
-    expect(fallback).toContain("formatPendingIssueActionLabel(");
-    expect(fallback).toContain("startManualSync");
+    expect(fallback).not.toContain("formatPendingIssueActionLabel");
+    expect(fallback).not.toContain("startManualSync");
     // 文件夹出口行的行文替换为出口句；文件行与漂移行保留计划层 reason 文本。
     expect(render).toContain('"syncView.scopeCrossing.rowReasonFolder"');
   });

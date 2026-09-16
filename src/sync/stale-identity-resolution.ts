@@ -81,6 +81,8 @@ export interface StaleIdentityResolutionFactsV1 {
   localFolders: readonly LocalFolderEntry[];
   localFolderScanComplete: boolean;
   skippedLarge: readonly string[];
+  /** Device large-file exclusion threshold in bytes; absent disables the download gate. */
+  maxFileSizeBytes?: number;
   localMoveHints?: readonly LocalFolderMoveHintV1[];
   includeFilePath?: (path: string) => boolean;
   includeFolderPath?: (path: string) => boolean;

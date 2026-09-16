@@ -6,6 +6,174 @@ import {
 import {
   simulateV1ToV2Migration,
 } from "./helpers/state-v2-migration-model";
+import {
+  describeStateV2MigrationCandidateDriftV1,
+  sameStateV2MigrationCandidate,
+} from "../src/sync/state-v2-migration";
+import type { SyncStateEnvelopeV2 } from "../src/sync/state-envelope-v2";
+
+const driftEnvelope = (overrides: Record<string, unknown> = {}) => ({
+  meta: { schemaVersion: 2, lifecycleEpoch: 1, commitSeq: 1, committedAt: 1 },
+  scope: {
+    accountId: "acc",
+    driveId: "drive",
+    vaultFolderId: "vault",
+    filesRootId: "root",
+  },
+  remoteIndex: {
+    complete: true,
+    deltaLink: null,
+    cursorRevision: 1,
+    itemsById: {} as Record<string, unknown>,
+  },
+  anchors: { schemaVersion: 2, byAnchorId: {} as Record<string, unknown> },
+  ...overrides,
+}) as unknown as SyncStateEnvelopeV2;
+
+describe("V2 migration candidate drift diagnostics", () => {
+  it("agrees with the commit gate on identical candidates", () => {
+    const committed = driftEnvelope();
+    const candidate = driftEnvelope();
+    expect(sameStateV2MigrationCandidate(committed, candidate)).toBe(true);
+    expect(describeStateV2MigrationCandidateDriftV1(committed, candidate))
+      .toEqual({
+        sameScope: true,
+        sameRemoteIndex: true,
+        sameAnchors: true,
+        sameFolderAnchors: true,
+      });
+  });
+
+  it("normalizes anchor timestamps away exactly like the commit gate", () => {
+    const committed = driftEnvelope();
+    const candidate = driftEnvelope({
+      anchors: {
+        schemaVersion: 2,
+        byAnchorId: {
+          "cloud:r1": {
+            anchorId: "cloud:r1",
+            remoteId: "r1",
+            lastPath: "a.md",
+            contentHash: "aa".repeat(32),
+            size: 1,
+            confirmedAt: 999,
+            confirmedBy: "cloud-verified",
+          },
+        },
+      },
+    });
+    (committed.anchors.byAnchorId as Record<string, unknown>)["cloud:r1"] = {
+      ...(candidate.anchors.byAnchorId["cloud:r1"] as Record<string, unknown>),
+      confirmedAt: 1,
+    };
+    expect(sameStateV2MigrationCandidate(committed, candidate)).toBe(true);
+    expect(
+      describeStateV2MigrationCandidateDriftV1(committed, candidate).sameAnchors,
+    ).toBe(true);
+  });
+
+  it("reports anchor drift without blaming the remote index", () => {
+    const committed = driftEnvelope();
+    const candidate = driftEnvelope({
+      anchors: {
+        schemaVersion: 2,
+        byAnchorId: {
+          "cloud:r1": {
+            anchorId: "cloud:r1",
+            remoteId: "r1",
+            lastPath: "a.md",
+            contentHash: "aa".repeat(32),
+            size: 1,
+            confirmedAt: 1,
+            confirmedBy: "cloud-verified",
+          },
+        },
+      },
+    });
+    expect(sameStateV2MigrationCandidate(committed, candidate)).toBe(false);
+    expect(describeStateV2MigrationCandidateDriftV1(committed, candidate))
+      .toEqual({
+        sameScope: true,
+        sameRemoteIndex: true,
+        sameAnchors: false,
+        sameFolderAnchors: true,
+      });
+  });
+
+  it("reports remote index version drift separately from anchors", () => {
+    const anchor = {
+      anchorId: "cloud:r1",
+      remoteId: "r1",
+      lastPath: "a.md",
+      contentHash: "aa".repeat(32),
+      size: 1,
+      confirmedAt: 1,
+      confirmedBy: "cloud-verified",
+    };
+    const committed = driftEnvelope({
+      remoteIndex: {
+        complete: true,
+        deltaLink: null,
+        cursorRevision: 1,
+        itemsById: {
+          r1: {
+            id: "r1",
+            kind: "file",
+            path: "a.md",
+            eTag: "etag-1",
+            size: 1,
+          },
+        },
+      },
+      anchors: { schemaVersion: 2, byAnchorId: { "cloud:r1": anchor } },
+    });
+    const candidate = driftEnvelope({
+      remoteIndex: {
+        complete: true,
+        deltaLink: null,
+        cursorRevision: 1,
+        itemsById: {
+          r1: {
+            id: "r1",
+            kind: "file",
+            path: "a.md",
+            eTag: "etag-2",
+            size: 1,
+          },
+        },
+      },
+      anchors: { schemaVersion: 2, byAnchorId: { "cloud:r1": anchor } },
+    });
+    expect(sameStateV2MigrationCandidate(committed, candidate)).toBe(false);
+    expect(describeStateV2MigrationCandidateDriftV1(committed, candidate))
+      .toEqual({
+        sameScope: true,
+        sameRemoteIndex: false,
+        sameAnchors: true,
+        sameFolderAnchors: true,
+      });
+  });
+
+  it("reports scope drift", () => {
+    const committed = driftEnvelope();
+    const candidate = driftEnvelope({
+      scope: {
+        accountId: "acc2",
+        driveId: "drive",
+        vaultFolderId: "vault",
+        filesRootId: "root",
+      },
+    });
+    expect(sameStateV2MigrationCandidate(committed, candidate)).toBe(false);
+    expect(describeStateV2MigrationCandidateDriftV1(committed, candidate))
+      .toEqual({
+        sameScope: false,
+        sameRemoteIndex: true,
+        sameAnchors: true,
+        sameFolderAnchors: true,
+      });
+  });
+});
 
 describe("V1 to V2 migration preflight model", () => {
   it("migrates an exact V1 path only when current local and remote versions still match", () => {

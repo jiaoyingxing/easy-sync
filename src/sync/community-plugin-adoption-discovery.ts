@@ -45,6 +45,13 @@ import { sameSyncScope, type RemoteFileEntry, type SyncScope } from "./types";
  * who really want an excluded plugin gone from proposals press「跳过」once
  * (ignore memory).
  *
+ * A cloud-cleanup marker (2026-09-16 用户拍板) suppresses the proposal while
+ * it stands: the marker means this device explicitly cleaned the bundle, and
+ * the merged catalog can still remember the deleted bundle for a round or
+ * two — proposing it then is pure noise. The marker is dropped by the fresh
+ * delta refresh once the bundle genuinely reappears, which resumes proposals
+ * and keeps the 重现即展示 semantics intact.
+ *
  * The output replaces the stored pending set each round (reconcile): rows
  * whose bundle became partial/absent, whose device joined, or that the user
  * ignored disappear automatically; no separate tombstone is needed.
@@ -76,6 +83,14 @@ export interface CommunityPluginAdoptionDiscoveryInput {
    * phase-only behavior stands.
    */
   localBundleFacts?: ReadonlyMap<string, CommunityPluginLocalBundleFact>;
+  /**
+   * Plugin ids carrying a cloud-cleanup marker on this device. While the
+   * marker stands the discovery never proposes the plugin: the merged
+   * catalog can still remember the just-deleted bundle for a round or two,
+   * and the marker is dropped by the fresh refresh once the bundle genuinely
+   * reappears (proposals resume then).
+   */
+  cleanupMarkerPluginIds?: readonly string[];
 }
 
 export interface CommunityPluginPlatformFact {
@@ -141,6 +156,7 @@ export async function deriveCommunityPluginAdoptionCandidates(
   const catalog = input.catalog;
   if (!catalog || !sameSyncScope(catalog.scope, input.scope)) return [];
   const participation = input.participation;
+  const cleanupMarkers = new Set(input.cleanupMarkerPluginIds ?? []);
   const proposable = (pluginId: string): boolean => {
     const phase = participation?.pluginsById[pluginId]?.phase;
     return phase === undefined
@@ -161,6 +177,7 @@ export async function deriveCommunityPluginAdoptionCandidates(
       entry.bundleState !== "complete"
       || pluginId === ownPluginId
       || !proposable(pluginId)
+      || cleanupMarkers.has(pluginId)
       || input.localBundleFacts?.get(pluginId) === "complete"
       || isCommunityPluginIgnored(input.memory, pluginId)
     ) {

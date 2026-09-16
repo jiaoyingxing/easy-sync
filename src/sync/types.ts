@@ -757,7 +757,7 @@ export interface ScanConfig {
   /** Paths that override exclusions. Checked before excludePaths —
    *  a path matching any includePath is never excluded. */
   includePaths: string[];
-  /** Maximum file size in bytes (default 500MB) */
+  /** Maximum file size in bytes (default DEFAULT_MAX_FILE_SIZE_MB, or unlimited) */
   maxFileSize: number;
   /** Include EasySync's own main.js, manifest.json, and styles.css. */
   includeOwnPluginCode?: boolean;
@@ -771,13 +771,33 @@ export interface ScanConfig {
   pluginDataSelection?: PluginScopeSelection;
 }
 
+/** Large-file exclusion UI presets in MiB; the device setting stores this unit. */
+export const MAX_FILE_SIZE_PRESET_OPTIONS_MB: readonly number[] = [8, 16, 64, 256, 512, 1024];
+/** Sentinel for "no size limit" stored in the per-device setting field. */
+export const UNLIMITED_MAX_FILE_SIZE_MB = -1;
+export const DEFAULT_MAX_FILE_SIZE_MB = 512;
+
+/**
+ * Coerce a stored/loaded large-file size value into the domain the plugin
+ * understands: -1 (unlimited) or any finite positive MiB number. Anything
+ * else (0, negative, non-finite, non-number) falls back to the default —
+ * persisted garbage is corrected in memory, never silently widened into
+ * an exclusion change.
+ */
+export function normalizeMaxFileSizeMb(value: unknown): number {
+  if (value === UNLIMITED_MAX_FILE_SIZE_MB) return UNLIMITED_MAX_FILE_SIZE_MB;
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : DEFAULT_MAX_FILE_SIZE_MB;
+}
+
 export const DEFAULT_SCAN_CONFIG: ScanConfig = {
   excludePaths: [".trash/", ".DS_Store", "Thumbs.db"],
   excludedFolders: [],
   // M19: EasySync self-sync default OFF. Explicit opt-in via syncOwnPlugin setting
   // with anti-downgrade protection (manifest.json version comparison).
   includePaths: [],
-  maxFileSize: 500 * 1024 * 1024,
+  maxFileSize: DEFAULT_MAX_FILE_SIZE_MB * 1024 * 1024,
   includeOwnPluginCode: false,
   includePluginCode: false,
   includePluginData: false,

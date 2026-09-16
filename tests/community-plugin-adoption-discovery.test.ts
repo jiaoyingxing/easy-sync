@@ -299,4 +299,35 @@ describe("community-plugin adoption discovery", () => {
     );
     expect(staleFacts.get("alpha")).toEqual({ name: null, isDesktopOnly: null });
   });
+
+  it("does not propose a plugin this device carries a cloud-cleanup marker for", async () => {
+    // 2026-09-16: after a successful cloud cleanup the merged catalog can
+    // still remember the deleted bundle for a round or two; proposing it as
+    // an install suggestion contradicts the marker and produced noise rows.
+    const alpha = await observed("alpha", "Alpha");
+    const candidates = await deriveCommunityPluginAdoptionCandidates({
+      scope: SCOPE,
+      catalog: catalog([alpha.spec]),
+      participation: null,
+      memory: createEmptyCommunityPluginAdoptionMemory(),
+      manifestObservations: [alpha.observation],
+      isMobile: false,
+      cleanupMarkerPluginIds: ["alpha"],
+    });
+    expect(candidates).toEqual([]);
+  });
+
+  it("resumes proposals once the cleanup marker is dropped (bundle reappeared)", async () => {
+    const alpha = await observed("alpha", "Alpha");
+    const candidates = await deriveCommunityPluginAdoptionCandidates({
+      scope: SCOPE,
+      catalog: catalog([alpha.spec]),
+      participation: null,
+      memory: createEmptyCommunityPluginAdoptionMemory(),
+      manifestObservations: [alpha.observation],
+      isMobile: false,
+      cleanupMarkerPluginIds: [],
+    });
+    expect(candidates).toEqual(["alpha"]);
+  });
 });

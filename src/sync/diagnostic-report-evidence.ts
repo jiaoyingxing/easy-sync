@@ -383,3 +383,58 @@ export async function fingerprintOpaqueValue(value?: string): Promise<string> {
   if (!value) return "—";
   return (await sha256Hex(new TextEncoder().encode(value).buffer)).slice(0, 12);
 }
+
+/** Issue #18 round (P3-b4): attribute mid-activation input-digest drift on the
+ *  device itself. The report shows which plugin data keys were recently
+ *  written — key names and time only, never values (插件数据内容不进报告). */
+export function computeChangedPluginDataKeys(
+  before: Readonly<Record<string, unknown>>,
+  after: Readonly<Record<string, unknown>>,
+): string[] {
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  const changed: string[] = [];
+  for (const key of [...keys].sort((left, right) => left.localeCompare(right))) {
+    const left = before[key];
+    const right = after[key];
+    if (left === right) continue;
+    if (JSON.stringify(left ?? null) !== JSON.stringify(right ?? null)) {
+      changed.push(key);
+    }
+  }
+  return changed;
+}
+
+export interface PluginDataWriteRecord {
+  at: number;
+  keys: string[];
+}
+
+export class RecentPluginDataWriteLog {
+  private readonly entries: PluginDataWriteRecord[] = [];
+
+  constructor(private readonly capacity = 20) {}
+
+  record(at: number, keys: string[]): void {
+    this.entries.push({ at, keys: [...keys] });
+    if (this.entries.length > this.capacity) {
+      this.entries.splice(0, this.entries.length - this.capacity);
+    }
+  }
+
+  list(): readonly PluginDataWriteRecord[] {
+    return [...this.entries];
+  }
+}
+
+export function formatRecentPluginDataWrites(
+  entries: readonly PluginDataWriteRecord[],
+): string[] {
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return entries.map(({ at, keys }) => {
+    const date = new Date(at);
+    const stamp = `${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${
+      pad(date.getHours())
+    }:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+    return `- ${stamp} — ${keys.length > 0 ? keys.join(", ") : "(键值无净变化)"}`;
+  });
+}

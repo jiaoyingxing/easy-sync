@@ -237,7 +237,9 @@ describe("buildSettingsSyncButtonState", () => {
     expect(source).toMatch(
       /text: t\("settings\.syncExclusion\.intro"\),\s*cls: "setting-item-description"/,
     );
-    expect(source).not.toContain("TextComponent");
+    // 大型文件排除的自定义值输入（2026-09-16 用户拍板引入，Resojot renderModelField
+    // 同型常驻双控件）是本弹框唯一允许的文本控件，防止自由文本输入蔓延。
+    expect(source.match(/\.addText\(/g)?.length).toBe(1);
     expect(source).not.toContain("textarea");
     expect(source).not.toContain("startManualSync");
     expect(source).toContain("new ExtraButtonComponent(chipEl)");
@@ -1230,14 +1232,15 @@ describe("buildSettingsSyncButtonState", () => {
     // The login-gate notice ("登录前须知") and the method-chooser lead line
     // were removed entirely in 2026-08-28 (full content archived in the dev
     // log `20260828-003740`); the first plan alert stays single-purpose
-    // (plan generated → review in the sidebar).
+    // (plan generated → review in the sidebar). The quiet-period guidance
+    // appended 2026-09-15 (issue #18 round) is part of that single purpose.
     expect(entrySource).not.toContain("AuthLoginNoticeModal");
     expect(entrySource).not.toContain("auth.notice");
     expect(entrySource).not.toContain("method.lead");
     expect(mainSource).not.toContain("syncPlan.firstUseUsage");
     expect(mainSource).not.toContain("syncPlan.firstUseSafety");
     expect(zhCN["syncPlan.readyMessage"]).toBe(
-      "同步计划已生成，请在侧边栏查看详情并确认执行。",
+      "同步计划已生成，请在侧边栏查看详情并确认执行。确认前请尽量避免改动文件；期间如有改动，计划会重新生成，需要重新确认。",
     );
     expect(alertSource).toContain("for (const message of this.messages)");
   });

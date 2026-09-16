@@ -1,38 +1,55 @@
 /**
- * AuthPendingModal — shown when the user clicks "检查登录状态" during an
- * in-progress OAuth flow. Gives them four options:
- *  1. "重新检查" — check if auth completed since last poll tick
- *  2. "复制登录链接" — copy the current attempt without closing the modal
- *  3. "重新打开授权" — re-open the browser for a fresh login attempt
- *  4. "取消登录" — abandon this attempt and re-choose the login method
+ * AuthPendingModal — waiting room for a browser redirect login attempt.
  *
- * This is the fallback mechanism: if auto-polling doesn't detect completion,
- * or the user closed their browser, this gives them a clear recovery path
- * rather than a button that silently does nothing.
+ * Three options: "复制登录链接" copies the current attempt without closing
+ * the modal, "重新打开登录页面" starts a fresh attempt (the old one is
+ * invalidated), "取消登录" abandons it and returns to method choice.
+ *
+ * Completion needs no click: a 1s tick watches the auth state (same pattern
+ * as AuthDeviceCodeModal) and auto-closes with a success notice once the
+ * redirect lands. Closing or dismissing the modal never cancels the attempt
+ * — only the "取消登录" button does.
  */
 
 import { type App } from "obsidian";
+import {
+  compatClearInterval,
+  compatSetInterval,
+  IntervalHandle,
+} from "../obsidian-compat";
+import type { AuthModule } from "../auth/auth-module";
+import {
+  NOTICE_PRIORITY,
+  type EasySyncNoticeCenter,
+} from "./notice-center";
 import { EasySyncModal } from "./easy-sync-modal";
 
 export type PendingModalResult =
-  | { action: "recheck" }
   | { action: "reopen" }
   | { action: "cancel" }
   | { action: "dismiss" };
 
+export interface AuthPendingModalDeps {
+  auth: AuthModule;
+  noticeCenter: Pick<EasySyncNoticeCenter, "show">;
+  t: (key: string) => string;
+}
+
 export class AuthPendingModal extends EasySyncModal {
   private resolve: ((value: PendingModalResult) => void) | null = null;
+  private authTick: IntervalHandle | null = null;
+  private closed = false;
 
   constructor(
     app: App,
     private title: string,
     private message: string,
-    private recheckLabel: string,
     private copyLabel: string,
     private reopenLabel: string,
     private cancelLabel: string,
     private onCopy?: () => void,
     private onReopen?: () => void,
+    private deps?: AuthPendingModalDeps,
   ) {
     super(app);
   }
@@ -66,14 +83,6 @@ export class AuthPendingModal extends EasySyncModal {
       cls: "modal-button-container easy-sync-auth-pending-actions",
     });
 
-    const recheckBtn = btnRow.createEl("button", {
-      text: this.recheckLabel,
-      cls: "mod-cta",
-    });
-    recheckBtn.addEventListener("click", () => {
-      this.finish({ action: "recheck" });
-    });
-
     const copyBtn = btnRow.createEl("button", {
       text: this.copyLabel,
     });
@@ -95,9 +104,31 @@ export class AuthPendingModal extends EasySyncModal {
     cancelBtn.addEventListener("click", () => {
       this.finish({ action: "cancel" });
     });
+
+    if (this.deps) {
+      this.authTick = compatSetInterval(() => this.onAuthTick(), 1000);
+    }
+  }
+
+  /** Success closes the modal on its own — nothing for the user to press. */
+  private onAuthTick(): void {
+    if (this.closed || !this.deps) return;
+    if (!this.deps.auth.authState.isLoggedIn) return;
+    this.closed = true;
+    this.deps.noticeCenter.show({
+      key: "settings-login-success",
+      message: this.deps.t("settings.account.loginSuccess"),
+      priority: NOTICE_PRIORITY.action,
+    });
+    this.finish({ action: "dismiss" });
   }
 
   onClose(): void {
+    if (this.authTick !== null) {
+      compatClearInterval(this.authTick);
+      this.authTick = null;
+    }
+    this.closed = true;
     const resolve = this.resolve;
     this.resolve = null;
     resolve?.({ action: "dismiss" });

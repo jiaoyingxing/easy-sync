@@ -24,6 +24,7 @@ import {
   isFolderPathInSyncScopeSnapshot,
   LocalScanner,
 } from "../src/sync/local-scanner";
+import { projectStatePathViewV2 } from "../src/sync/file-state-controller-v2";
 import { StateManager, type PluginDataStore } from "../src/sync/state-manager";
 import {
   SyncExecutor,
@@ -3004,7 +3005,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(unavailable).toMatchObject({
       success: false,
       errors: 1,
-      message: "result.sharedControlReadUnavailable",
+      message: "result.remoteReadUnavailable",
       runFacts: {
         ordinaryPlanning: "entered",
       },
@@ -3232,7 +3233,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(unavailable).toMatchObject({
       success: false,
       errors: 1,
-      message: "result.sharedControlReadUnavailable",
+      message: "result.remoteReadUnavailable",
     });
     expect(unavailable.disposition).toBeUndefined();
     expect(harness.state.isV2StateActive).toBe(false);
@@ -3342,7 +3343,7 @@ describe("V1 to V2 controlled production activation", () => {
     )).toMatchObject({
       success: false,
       errors: 1,
-      message: "result.sharedControlReadUnavailable",
+      message: "result.remoteReadUnavailable",
     });
     const staleAuthorization = structuredClone(
       harness.state.planReviewAuthorization!,
@@ -4912,6 +4913,220 @@ describe("V1 to V2 controlled production activation", () => {
       await harness.state.close();
       await evidenceStore.delete();
     }
+  }, 30_000);
+
+  it("retries a flaky cloud bootstrap read and keeps the recovered document", async () => {
+    const { fixtureInput, equalPaths } =
+      await public113ReinstalledMixedVersionFixtureInput({
+        baseCount: 1,
+        equalCount: 1,
+        remoteOnlyCount: 0,
+        folderCount: 0,
+      });
+    const seededPath = equalPaths[0]!;
+    const remote = fixtureInput.remoteItems!.find((item) =>
+      item.name === seededPath)!;
+    const content = fixtureInput.remoteFileContents![seededPath]!;
+    const bytes = new TextEncoder().encode(content);
+    const bootstrap = JSON.stringify({
+      schemaVersion: 2,
+      scope,
+      revision: 1,
+      sourceCommitSeq: 7,
+      generatedAt: 1,
+      anchors: [{
+        remoteId: remote.id,
+        lastPath: seededPath,
+        contentHash: await sha256Hex(bytes),
+        size: bytes.byteLength,
+        remoteETag: remote.eTag,
+        remoteCTag: remote.cTag,
+      }],
+    });
+    const harness = makeHarness(fixtureInput);
+    await harness.cloudBootstrap.create("testVault", bootstrap);
+    harness.cloudBootstrap.create.mockClear();
+    harness.cloudBootstrap.read
+      .mockRejectedValueOnce(
+        new OneDriveError(OneDriveErrorType.NetworkError, "slow link"),
+      )
+      .mockRejectedValueOnce(
+        new OneDriveError(OneDriveErrorType.NetworkError, "slow link again"),
+      );
+
+    await harness.state.load();
+    const preview = await harness.executor.run("manual");
+
+    expect(preview).toMatchObject({
+      success: false,
+      message: "result.pausedForReview",
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+    });
+    expect(harness.cloudBootstrap.read).toHaveBeenCalledTimes(3);
+    expect(harness.diag.log.mock.calls.filter(([category, message]) =>
+      category === "state"
+      && String(message).startsWith(
+        "cloud bootstrap v2 read failed (attempt",
+      ),
+    )).toHaveLength(2);
+    expect(harness.diag.warn.mock.calls.filter(([category, message]) =>
+      category === "state"
+      && String(message)
+        === "V2 cloud bootstrap read failed; falling back to public-1.1.3 legacy baseline",
+    )).toHaveLength(0);
+  }, 30_000);
+
+  it("keeps the legacy fallback path after every cloud bootstrap read retry fails", async () => {
+    const { fixtureInput } =
+      await public113ReinstalledMixedVersionFixtureInput({
+        baseCount: 1,
+        equalCount: 1,
+        remoteOnlyCount: 0,
+        folderCount: 0,
+      });
+    const harness = makeHarness(fixtureInput);
+    harness.cloudBootstrap.read.mockRejectedValue(
+      new OneDriveError(OneDriveErrorType.NetworkError, "offline"),
+    );
+
+    await harness.state.load();
+    const preview = await harness.executor.run("manual");
+
+    expect(preview).toMatchObject({
+      success: false,
+      message: "result.pausedForReview",
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+    });
+    expect(harness.cloudBootstrap.read).toHaveBeenCalledTimes(3);
+    expect(harness.diag.log.mock.calls.filter(([category, message]) =>
+      category === "state"
+      && String(message).startsWith(
+        "cloud bootstrap v2 read failed (attempt",
+      ),
+    )).toHaveLength(2);
+    expect(harness.diag.warn.mock.calls.filter(([category, message]) =>
+      category === "state"
+      && String(message)
+        === "V2 cloud bootstrap read failed; continuing with exact public-1.1.3 content verification",
+    )).toHaveLength(1);
+  }, 30_000);
+
+  it("treats a missing cloud bootstrap document as clean absence without retries", async () => {
+    const { fixtureInput } =
+      await public113ReinstalledMixedVersionFixtureInput({
+        baseCount: 1,
+        equalCount: 1,
+        remoteOnlyCount: 0,
+        folderCount: 0,
+      });
+    const harness = makeHarness(fixtureInput);
+    harness.cloudBootstrap.read.mockRejectedValue(
+      new OneDriveError(OneDriveErrorType.NotFound, "gone"),
+    );
+
+    await harness.state.load();
+    const preview = await harness.executor.run("manual");
+
+    expect(preview).toMatchObject({
+      success: false,
+      message: "result.pausedForReview",
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+    });
+    expect(harness.cloudBootstrap.read).toHaveBeenCalledTimes(1);
+    expect(harness.diag.log.mock.calls.filter(([category, message]) =>
+      category === "state"
+      && String(message) === "no cloud bootstrap v2 document",
+    )).toHaveLength(1);
+    expect(harness.diag.warn.mock.calls.filter(([category, message]) =>
+      category === "state"
+      && String(message)
+        === "V2 cloud bootstrap read failed; falling back to public-1.1.3 legacy baseline",
+    )).toHaveLength(0);
+  }, 30_000);
+
+  it("reports candidate drift facts when the migration review source drifts between rounds", async () => {
+    const { fixtureInput, equalPaths } =
+      await public113ReinstalledMixedVersionFixtureInput({
+        baseCount: 1,
+        equalCount: 1,
+        remoteOnlyCount: 0,
+        folderCount: 0,
+      });
+    const seededPath = equalPaths[0]!;
+    const remote = fixtureInput.remoteItems!.find((item) =>
+      item.name === seededPath)!;
+    const content = fixtureInput.remoteFileContents![seededPath]!;
+    const bytes = new TextEncoder().encode(content);
+    const anchor = {
+      remoteId: remote.id,
+      lastPath: seededPath,
+      contentHash: await sha256Hex(bytes),
+      size: bytes.byteLength,
+      remoteETag: remote.eTag,
+      remoteCTag: remote.cTag,
+    };
+    const bootstrapA = JSON.stringify({
+      schemaVersion: 2,
+      scope,
+      revision: 1,
+      sourceCommitSeq: 7,
+      generatedAt: 1,
+      anchors: [anchor],
+    });
+    const bootstrapB = JSON.stringify({
+      schemaVersion: 2,
+      scope,
+      revision: 2,
+      sourceCommitSeq: 8,
+      generatedAt: 2,
+      anchors: [],
+    });
+    const harness = makeHarness(fixtureInput);
+    await harness.cloudBootstrap.create("testVault", bootstrapA);
+    harness.cloudBootstrap.create.mockClear();
+
+    await harness.state.load();
+    const preview = await harness.executor.run("manual");
+    expect(preview.message).toBe("result.pausedForReview");
+    expect(harness.state.activeV2MigrationHold).not.toBeNull();
+
+    await harness.cloudBootstrap.create("testVault", bootstrapB);
+    const drifted = await harness.executor.run(
+      "manual",
+      {},
+      true,
+      structuredClone(harness.state.planReviewAuthorization!),
+      { acknowledgeMigrationRisk: true },
+    );
+
+    expect(drifted).toMatchObject({
+      success: false,
+      message: "result.pausedForReview",
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+    });
+    expect(harness.state.isV2StateActive).toBe(false);
+    const changedWarn = harness.diag.warn.mock.calls.find(([, message]) =>
+      message === "V2 migration review changed before authority commit"
+    );
+    expect(changedWarn).toBeDefined();
+    expect(changedWarn![2]).toMatchObject({
+      phase: "activation",
+      mutations: 0,
+      previousHold: { phase: "pending" },
+      drift: {
+        sameRemoteIndex: true,
+        sameAnchors: false,
+      },
+      planIdentityUnchanged: false,
+    });
   }, 30_000);
 
   it("uses a partial bootstrap per path and reads only stale or locally changed content", async () => {
@@ -15886,6 +16101,139 @@ describe("V1 to V2 controlled production activation", () => {
     expectNoFileMutations(harness.mutations);
   });
 
+  it("keeps the required complete rebuild ready when a previously synced folder re-enters the scope", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    expect(
+      Object.values(
+        harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+      ).map((anchor) => anchor.lastPath),
+    ).toEqual(["Notes"]);
+
+    await harness.state.commitSyncPathSettingsChange(
+      (path) => harness.scanner.shouldSyncPath(path),
+      () => undefined,
+      undefined,
+      {
+        previousSettingsFingerprint: "excluded:notes",
+        targetSettingsFingerprint: "excluded:none",
+        expandedFolderPaths: ["Notes"],
+        folderScopeTransition: {
+          previous: createFolderSyncScopeSnapshotV1({
+            excludedFolders: ["Notes"],
+          }),
+          target: createFolderSyncScopeSnapshotV1({}),
+        },
+        requiresCompleteRemoteIdentitySnapshot: true,
+      },
+    );
+    expect(harness.state.activeSyncScopeExpansion).toMatchObject({
+      revision: 1,
+      requiresCompleteRemoteIdentitySnapshot: true,
+    });
+    expect(await harness.state.prepareSyncScopeExpansion(scope)).toEqual({
+      status: "ready",
+      revision: 1,
+    });
+    expect(harness.state.activeSyncScopeExpansion).not.toBeNull();
+  });
+
+  it("keeps a transition-free re-expansion of a synced folder ready on the plain fingerprint basis", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    await harness.state.commitSyncPathSettingsChange(
+      (path) => harness.scanner.shouldSyncPath(path),
+      () => undefined,
+      undefined,
+      {
+        previousSettingsFingerprint: "excluded:notes",
+        targetSettingsFingerprint: "excluded:none",
+        expandedFolderPaths: ["Notes"],
+        requiresCompleteRemoteIdentitySnapshot: true,
+      },
+    );
+    expect(await harness.state.prepareSyncScopeExpansion(scope)).toEqual({
+      status: "ready",
+      revision: 1,
+    });
+  });
+
+  it("retires a partially anchored re-expansion as stale", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    expect(
+      Object.values(
+        harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+      ).map((anchor) => anchor.lastPath),
+    ).toEqual(["Notes"]);
+
+    // A remote-only folder observed into the index but never locally
+    // confirmed: present in remoteFolders, carrying no folder anchor.
+    const envelope = harness.state.getCommittedV2Envelope()!;
+    const view = projectStatePathViewV2(envelope);
+    await harness.state.setRemoteState(
+      view.remoteEntries,
+      view.deltaLink,
+      { ...envelope.scope },
+      [
+        ...view.remoteFolders,
+        {
+          path: "Archive",
+          driveId: "folder-archive",
+          parentId: scope.filesRootId,
+          name: "Archive",
+        },
+      ],
+    );
+    expect(harness.state.remoteFolders.map((folder) => folder.path)).toEqual(
+      expect.arrayContaining(["Notes", "Archive"]),
+    );
+
+    await harness.state.commitSyncPathSettingsChange(
+      (path) => harness.scanner.shouldSyncPath(path),
+      () => undefined,
+      undefined,
+      {
+        previousSettingsFingerprint: "excluded:notes+archive",
+        targetSettingsFingerprint: "excluded:none",
+        expandedFolderPaths: ["Notes", "Archive"],
+        folderScopeTransition: {
+          previous: createFolderSyncScopeSnapshotV1({
+            excludedFolders: ["Notes", "Archive"],
+          }),
+          target: createFolderSyncScopeSnapshotV1({}),
+        },
+        requiresCompleteRemoteIdentitySnapshot: true,
+      },
+    );
+    expect(await harness.state.prepareSyncScopeExpansion(scope)).toEqual({
+      status: "none",
+    });
+    expect(harness.state.activeSyncScopeExpansion).toBeNull();
+  });
+
   it("blocks scope-expansion identity acceptance while mutation recovery is unresolved", async () => {
     const expandedPaths = [
       ".obsidian",
@@ -16605,7 +16953,7 @@ describe("V1 to V2 controlled production activation", () => {
       deleted: 0,
       conflicts: 0,
       errors: 1,
-      message: "result.sharedControlReadUnavailable",
+      message: "result.remoteReadUnavailable",
       runFacts: {
         termination: "normal",
         ordinaryPlanning: "not-entered",
@@ -16797,7 +17145,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(unavailable).toMatchObject({
       success: false,
       errors: 1,
-      message: "result.ordinaryRemoteReadUnavailable",
+      message: "result.remoteReadUnavailable",
       runFacts: {
         termination: "normal",
         ordinaryPlanning: "not-entered",
@@ -16948,7 +17296,7 @@ describe("V1 to V2 controlled production activation", () => {
       deleted: 0,
       conflicts: 0,
       errors: 1,
-      message: "result.sharedControlReadUnavailable",
+      message: "result.remoteReadUnavailable",
       runFacts: {
         termination: "normal",
         ordinaryPlanning: "not-entered",
@@ -17875,7 +18223,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(unavailable).toMatchObject({
       success: false,
       errors: 1,
-      message: "result.sharedControlReadUnavailable",
+      message: "result.remoteReadUnavailable",
       remoteScopeRecovery: {
         protocolPreflight: "blocked",
         failureStage: "protocol-preflight",

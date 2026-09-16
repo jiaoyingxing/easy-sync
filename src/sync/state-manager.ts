@@ -67,6 +67,7 @@ import {
   type RemoteIndexV2,
   type RemoteNodeV2,
 } from "./remote-index-v2";
+import { normalizeSizeExclusionBaseline } from "./skip-baseline";
 import {
   areIndependentConservativeResetRecords,
   conservativeResetRecordPaths,
@@ -492,6 +493,7 @@ export interface MutationForceResetAuditV1 {
 
 /** Plugin data keys for state persistence */
 const KEY_BASE_SNAPSHOT = "easy-sync-base-snapshot";
+const KEY_SIZE_EXCLUSION_BASELINE = "easy-sync-size-exclusion-baseline";
 const KEY_PENDING_CONFLICTS = "easy-sync-pending-conflicts";
 const KEY_PENDING_DELETES = "easy-sync-pending-remote-deletes";
 const KEY_PENDING_ISSUES = "easy-sync-pending-issues";
@@ -603,6 +605,10 @@ export interface PendingIssue {
 /** Top-level plugin data structure */
 interface PluginData {
   [KEY_BASE_SNAPSHOT]: Record<string, BaseFileEntry>;
+  /** Mirror of the last completed plan's SkipLargeFile settled paths
+   *  (2026-09-16 方案单 §十二). Optional: absent on untouched stores and
+   *  normalizes to an empty baseline. */
+  [KEY_SIZE_EXCLUSION_BASELINE]?: string[];
   [KEY_PENDING_CONFLICTS]: SyncPlanItem[];
   [KEY_PENDING_DELETES]: SyncPlanItem[];
   [KEY_PENDING_ISSUES]: PendingIssue[];
@@ -5445,8 +5451,41 @@ export class StateManager {
     const sourceFolderAnchors = sourceEnvelope?.folderAnchors
       ? Object.values(sourceEnvelope.folderAnchors.byAnchorId)
       : [];
+    const expandedFolderEntries = scopeChange && sourceEnvelope
+      && sourceEnvelope.remoteIndex.complete === true
+      ? [...new Set(scopeChange.expandedFolderPaths)]
+          .map((path) => sourceFoldersByPath.get(path))
+          .filter((folder): folder is RemoteFolderEntry => Boolean(folder))
+      : [];
+    const expandedFolders = expandedFolderEntries
+      .filter((folder) => !sourceFolderAnchors.some(
+        (anchor) =>
+          anchor.remoteId === folder.driveId
+          && anchor.lastPath === folder.path
+          && anchor.parentRemoteId === folder.parentId,
+      ))
+      .sort(compareRemoteFolderPath);
+    // inspectSyncScopeExpansion fingerprints the envelope while omitting the
+    // authorized folders it finds exactly anchored. Mirror that basis here:
+    // with a folder-scope transition those folders materialize back into the
+    // authorized set, so an unsymmetrized fingerprint always reads as stale
+    // and silently kills the required complete remote rebuild.
+    const expansionOmittedAnchorIds = new Set(
+      (scopeChange?.folderScopeTransition
+        ? expandedFolderEntries
+        : []
+      ).filter((folder) => sourceFolderAnchors.some(
+        (anchor) =>
+          anchor.remoteId === folder.driveId
+          && anchor.lastPath === folder.path
+          && anchor.parentRemoteId === folder.parentId,
+      )).map((folder) => folder.driveId),
+    );
     const sourceAnchorFingerprint = sourceEnvelope
-      ? await syncScopeExpansionAnchorFingerprint(sourceEnvelope)
+      ? await syncScopeExpansionAnchorFingerprint(
+          sourceEnvelope,
+          expansionOmittedAnchorIds,
+        )
       : "";
     const scopeExpansionSource = sourceEnvelope
       && sourceEnvelope.remoteIndex.complete === true
@@ -5457,19 +5496,6 @@ export class StateManager {
           anchorFingerprint: sourceAnchorFingerprint,
         }
       : null;
-    const expandedFolders = scopeChange && sourceEnvelope
-      && sourceEnvelope.remoteIndex.complete === true
-      ? [...new Set(scopeChange.expandedFolderPaths)]
-          .map((path) => sourceFoldersByPath.get(path))
-          .filter((folder): folder is RemoteFolderEntry => Boolean(folder))
-          .filter((folder) => !sourceFolderAnchors.some(
-            (anchor) =>
-              anchor.remoteId === folder.driveId
-              && anchor.lastPath === folder.path
-              && anchor.parentRemoteId === folder.parentId,
-          ))
-          .sort(compareRemoteFolderPath)
-      : [];
     const nextRevision = scopeChange
       ? this.data[KEY_SYNC_PATH_SETTINGS_REVISION] + 1
       : this.data[KEY_SYNC_PATH_SETTINGS_REVISION];
@@ -5683,6 +5709,20 @@ export class StateManager {
     if (!marker) return { status: "none" };
     const state = await this.inspectSyncScopeExpansion(marker, scope);
     if (state === "already-applied" || state === "stale") {
+      if (state === "stale") {
+        // A silent retire here previously hid the one defect shape where a
+        // required complete remote rebuild was dropped without any trace.
+        this.plugin.diag?.warn(
+          "state",
+          "device-local sync scope expansion marker retired as stale before its consuming round",
+          {
+            revision: marker.revision,
+            requiresCompleteRemoteIdentitySnapshot:
+              marker.requiresCompleteRemoteIdentitySnapshot === true,
+            mutations: 0,
+          },
+        );
+      }
       await this.clearSyncScopeExpansion(marker.revision);
       return { status: "none" };
     }
@@ -6654,6 +6694,22 @@ export class StateManager {
 
   get pendingIssues(): PendingIssue[] {
     return this.data[KEY_PENDING_ISSUES];
+  }
+
+  /** Mirror of the paths settled as SkipLargeFile in the last completed plan
+   *  (2026-09-16 方案单 §十二: skip rows render incrementally). Pure
+   *  bookkeeping — never a rule owner for the exclusion itself. */
+  getSizeExclusionBaseline(): readonly string[] {
+    return normalizeSizeExclusionBaseline(
+      this.data[KEY_SIZE_EXCLUSION_BASELINE],
+    );
+  }
+
+  async commitSizeExclusionBaseline(paths: readonly string[]): Promise<void> {
+    await this.commitPluginData((pluginData) => ({
+      ...pluginData,
+      [KEY_SIZE_EXCLUSION_BASELINE]: [...paths],
+    }));
   }
 
   async reconcilePendingIssues(

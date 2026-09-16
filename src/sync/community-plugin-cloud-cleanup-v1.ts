@@ -1,4 +1,3 @@
-import type { DriveItem } from "../onedrive/types";
 import type { RemoteFileEntry } from "./types";
 
 /**
@@ -26,9 +25,21 @@ export interface CommunityPluginCloudCleanupPlanV1 {
   objects: CommunityPluginCloudCleanupObjectV1[];
 }
 
+/** Current metadata of the item living AT a path, as seen by the server. */
+export interface CommunityPluginCloudCleanupPathMetadataV1 {
+  remoteId: string;
+  eTag: string;
+}
+
 export interface CommunityPluginCloudCleanupTransportV1 {
   vaultName: string;
-  getDriveItemMetadataById(id: string): Promise<DriveItem | null>;
+  /** Metadata for the item AT THIS PATH right now (null only for a confirmed
+   *  404). The cleanup verifies identities against where the file really
+   *  lives — a remembered id alone cannot prove the path is clean
+   *  (2026-09-15: stale identities produced a silent no-op "success"). */
+  getFileMetadataByPath(
+    path: string,
+  ): Promise<CommunityPluginCloudCleanupPathMetadataV1 | null>;
   deleteItem(
     vaultName: string,
     path: string,
@@ -42,10 +53,16 @@ export type CommunityPluginCloudCleanupResultV1 =
   | {
       status: "blocked";
       deleted: number;
-      reason: "remote-changed" | "delete-failed" | "read-back-failed";
+      reason:
+        | "evidence-stale"
+        | "remote-changed"
+        | "delete-failed"
+        | "read-back-failed";
+      /** Path the transaction stopped at, when one object is responsible. */
+      path?: string;
       error?: string;
     }
-  | { status: "failed"; deleted: number; error: string };
+  | { status: "failed"; deleted: number; path?: string; error: string };
 
 export interface CommunityPluginCloudCleanupMarkerV1 {
   pluginId: string;
@@ -123,6 +140,48 @@ export function planCommunityPluginCloudCleanupMarkerSweepV1(input: Readonly<{
 }
 
 /**
+ * Decide which index-built catalog entries count as reappearance evidence
+ * for one marker-sweep round. The committed index learns about this device's
+ * OWN cloud cleanup one delta later: until then it still lists the just
+ * deleted bundle, and treating that as reappearance would drop the marker
+ * and re-propose the plugin while the deletion decision is still syncing
+ * (2026-09-16 用户拍板). Index evidence therefore counts as reappearance
+ * only when the bundle's own facts (newest member mtime) postdate the
+ * cleanup — a bundle whose facts predate the marker is the pre-cleanup
+ * world, not a fresh one. Authoritative fresh enumerations (manager-open
+ * delta refresh) bypass this rule: their presence IS current server truth.
+ */
+export function planCommunityPluginCloudCleanupIndexReappearanceV1(input: Readonly<{
+  entries: readonly Readonly<{
+    pluginId: string;
+    bundleState: "complete" | "partial";
+    members: readonly Readonly<{ mtime: number }>[];
+  }>[];
+  markers: readonly CommunityPluginCloudCleanupMarkerV1[];
+}>): string[] {
+  const cleanedAtByPluginId = new Map(
+    normalizeCommunityPluginCloudCleanupMarkersV1(input.markers).map((
+      marker,
+    ) => [marker.pluginId, marker.cleanedAt]),
+  );
+  const reappeared: string[] = [];
+  for (const entry of input.entries) {
+    if (entry.bundleState !== "complete") continue;
+    const cleanedAt = cleanedAtByPluginId.get(entry.pluginId);
+    if (cleanedAt === undefined) {
+      reappeared.push(entry.pluginId);
+      continue;
+    }
+    let newestMemberMtime = 0;
+    for (const member of entry.members) {
+      if (member.mtime > newestMemberMtime) newestMemberMtime = member.mtime;
+    }
+    if (newestMemberMtime > cleanedAt) reappeared.push(entry.pluginId);
+  }
+  return reappeared;
+}
+
+/**
  * A row is cleanable once this device holds no managed files for the plugin
  * (`local: false`) AND the cloud index still lists it (`remote: true`) AND
  * the device is not actively joining, restoring, participating, exiting or
@@ -183,11 +242,15 @@ export function planCommunityPluginCloudCleanupV1(input: Readonly<{
 }
 
 /**
- * Delete each planned object with current-identity verification, If-Match and
- * read-back. Already-absent objects are skipped, so an interrupted run is
- * naturally re-entrant: re-planning from the current remote index continues
- * where the previous run stopped. Any mismatch stops the whole cleanup as
- * blocked — this transaction never touches ordinary sync paths.
+ * Delete each planned object with path-verified identity, If-Match and
+ * read-back. Every object's identity is checked against the metadata of the
+ * item living AT ITS PATH right now: a remembered id that no longer matches
+ * the path (stale evidence) stops the transaction as blocked instead of
+ * being treated as "already absent" — the path, not the id, is what the user
+ * asked to clean. Already-absent paths are skipped, so an interrupted run is
+ * naturally re-entrant: re-planning from fresh evidence continues where the
+ * previous run stopped. Any mismatch stops the whole cleanup as blocked —
+ * this transaction never touches ordinary sync paths.
  */
 export async function executeCommunityPluginCloudCleanupV1(input: Readonly<{
   plan: CommunityPluginCloudCleanupPlanV1;
@@ -195,19 +258,33 @@ export async function executeCommunityPluginCloudCleanupV1(input: Readonly<{
 }>): Promise<CommunityPluginCloudCleanupResultV1> {
   let deleted = 0;
   for (const object of input.plan.objects) {
-    let current: DriveItem | null = null;
+    let current: CommunityPluginCloudCleanupPathMetadataV1 | null = null;
     try {
-      current = await input.transport.getDriveItemMetadataById(object.remoteId);
+      current = await input.transport.getFileMetadataByPath(object.path);
     } catch (error) {
       return {
         status: "failed",
         deleted,
+        path: object.path,
         error: error instanceof Error ? error.message : String(error),
       };
     }
-    if (current === null || current.id !== object.remoteId) continue;
+    if (current === null) continue;
+    if (current.remoteId !== object.remoteId) {
+      return {
+        status: "blocked",
+        deleted,
+        path: object.path,
+        reason: "evidence-stale",
+      };
+    }
     if ((current.eTag ?? "") !== object.eTag) {
-      return { status: "blocked", deleted, reason: "remote-changed" };
+      return {
+        status: "blocked",
+        deleted,
+        path: object.path,
+        reason: "remote-changed",
+      };
     }
     try {
       await input.transport.deleteItem(
@@ -220,22 +297,33 @@ export async function executeCommunityPluginCloudCleanupV1(input: Readonly<{
       return {
         status: "blocked",
         deleted,
+        path: object.path,
         reason: "delete-failed",
         error: error instanceof Error ? error.message : String(error),
       };
     }
-    let verify: DriveItem | null = null;
+    let verify: CommunityPluginCloudCleanupPathMetadataV1 | null = null;
     try {
-      verify = await input.transport.getDriveItemMetadataById(object.remoteId);
+      verify = await input.transport.getFileMetadataByPath(object.path);
     } catch {
       // The transport returns null only for a confirmed 404 and rethrows every
-      // other failure. An escaping error therefore means the object's absence
-      // is unproven — reporting the row as a completed deletion would leave an
-      // orphan in the cloud while claiming success.
-      return { status: "blocked", deleted, reason: "read-back-failed" };
+      // other failure. An escaping error therefore means the path's absence
+      // is unproven — reporting the row as a completed deletion would leave
+      // an orphan in the cloud while claiming success.
+      return {
+        status: "blocked",
+        deleted,
+        path: object.path,
+        reason: "read-back-failed",
+      };
     }
     if (verify !== null) {
-      return { status: "blocked", deleted, reason: "read-back-failed" };
+      return {
+        status: "blocked",
+        deleted,
+        path: object.path,
+        reason: "read-back-failed",
+      };
     }
     deleted++;
   }

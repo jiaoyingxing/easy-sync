@@ -214,6 +214,32 @@ describe("V2 pure file decision planner", () => {
       }],
     },
     {
+      name: "a bookmark snapshot missed by the scan restores from the cloud instead of deleting it",
+      facts: {
+        localEntries: [],
+        remoteEntries: [remote(".obsidian/bookmarks.json")],
+        baseEntries: [base(".obsidian/bookmarks.json")],
+        skippedLarge: [],
+      },
+      expected: [{
+        type: SyncActionType.Download,
+        path: ".obsidian/bookmarks.json",
+      }],
+    },
+    {
+      name: "a bookmark file with a missing remote copy re-uploads instead of awaiting deletion",
+      facts: {
+        localEntries: [local(".obsidian/bookmarks.json")],
+        remoteEntries: [],
+        baseEntries: [base(".obsidian/bookmarks.json")],
+        skippedLarge: [],
+      },
+      expected: [{
+        type: SyncActionType.Upload,
+        path: ".obsidian/bookmarks.json",
+      }],
+    },
+    {
       name: "oversized files are skipped instead of deleted",
       facts: {
         localEntries: [],
@@ -406,5 +432,124 @@ describe("V2 pure file decision planner", () => {
       summarizeCanonicalPlanReviewV2(aboveThreshold.items).impactCount,
       aboveThreshold.lastTotalFiles,
     )).toBe(true);
+  });
+});
+
+describe("V2 planner download-side large-file gate", () => {
+  const MB = 1024 * 1024;
+
+  function remoteOnlyFacts(
+    remoteEntry: RemoteFileEntry,
+    maxFileSizeBytes: number | undefined,
+  ): FileDecisionFactsV2 {
+    return {
+      localEntries: [],
+      remoteEntries: [remoteEntry],
+      baseEntries: [],
+      skippedLarge: [],
+      configDir: ".obsidian",
+      ...(maxFileSizeBytes === undefined
+        ? {}
+        : { maxFileSizeBytes }),
+    };
+  }
+
+  it("skips downloading a remote-only file above the size limit instead of planning a download", () => {
+    const plan = generateFileDecisionPlanV2(
+      remoteOnlyFacts(remote("video.mp4", { size: 300 * MB }), 200 * MB),
+    );
+
+    expect(plan.items).toEqual([
+      { type: SyncActionType.SkipLargeFile, path: "video.mp4", reason: "reason.fileExceedsSizeLimit" },
+    ]);
+    expect(plan.items.some((item) => item.type === SyncActionType.Download)).toBe(false);
+  });
+
+  it("still downloads when the remote size is missing or when no limit applies (fail-open)", () => {
+    const missingSize = generateFileDecisionPlanV2(
+      remoteOnlyFacts(
+        remote("video.mp4", { size: undefined as unknown as number }),
+        200 * MB,
+      ),
+    );
+    const unlimited = generateFileDecisionPlanV2(
+      remoteOnlyFacts(remote("video.mp4", { size: 300 * MB }), Number.POSITIVE_INFINITY),
+    );
+    const noFactsField = generateFileDecisionPlanV2(
+      remoteOnlyFacts(remote("video.mp4", { size: 300 * MB }), undefined),
+    );
+
+    for (const plan of [missingSize, unlimited, noFactsField]) {
+      expect(plan.items).toEqual([
+        expect.objectContaining({ type: SyncActionType.Download, path: "video.mp4" }),
+      ]);
+    }
+  });
+
+  it("treats a file exactly at the limit as syncable (strictly-greater threshold)", () => {
+    const plan = generateFileDecisionPlanV2(
+      remoteOnlyFacts(remote("video.mp4", { size: 200 * MB }), 200 * MB),
+    );
+
+    expect(plan.items).toEqual([
+      expect.objectContaining({ type: SyncActionType.Download, path: "video.mp4" }),
+    ]);
+  });
+
+  it("returns a previously skipped file to the download plan when the threshold is raised", () => {
+    // 2026-09-16 用户问询钉测：排除必须可逆——跳过零状态写入（无 base、无
+    // 墓碑），阈值放宽后同一远端文件在下轮规划中自动回到普通下载。
+    const sameRemote = () => remote("video.mp4", { size: 300 * MB });
+
+    expect(generateFileDecisionPlanV2(remoteOnlyFacts(sameRemote(), 200 * MB)).items[0].type)
+      .toBe(SyncActionType.SkipLargeFile);
+    expect(generateFileDecisionPlanV2(remoteOnlyFacts(sameRemote(), 512 * MB)).items[0].type)
+      .toBe(SyncActionType.Download);
+    expect(generateFileDecisionPlanV2(remoteOnlyFacts(sameRemote(), Number.POSITIVE_INFINITY)).items[0].type)
+      .toBe(SyncActionType.Download);
+  });
+
+  it("gates the remote-update download branch but leaves deletion and conflict decisions untouched", () => {
+    const oversizedRemote = { size: 300 * MB, eTag: "etag-new", cTag: "ctag-new" };
+
+    // Remote changed while a smaller local copy exists: previously a download.
+    const updatePlan = generateFileDecisionPlanV2({
+      localEntries: [local("doc.mp4", "11".repeat(32), 100 * MB)],
+      remoteEntries: [remote("doc.mp4", oversizedRemote)],
+      baseEntries: [base("doc.mp4", { size: 100 * MB })],
+      skippedLarge: [],
+      configDir: ".obsidian",
+      maxFileSizeBytes: 200 * MB,
+    });
+    expect(updatePlan.items).toEqual([
+      { type: SyncActionType.SkipLargeFile, path: "doc.mp4", reason: "reason.fileExceedsSizeLimit" },
+    ]);
+
+    // Local deletion of a previously synced oversized file must still propagate
+    // as a remote deletion — the download gate must never freeze deletions.
+    const deletePlan = generateFileDecisionPlanV2({
+      localEntries: [],
+      remoteEntries: [remote("doc.mp4", { size: 300 * MB })],
+      baseEntries: [base("doc.mp4", { size: 300 * MB })],
+      skippedLarge: [],
+      configDir: ".obsidian",
+      maxFileSizeBytes: 200 * MB,
+    });
+    expect(deletePlan.items).toEqual([
+      expect.objectContaining({ type: SyncActionType.DeleteRemote, path: "doc.mp4" }),
+    ]);
+
+    // Remote changed after local deletion stays a conflict (explicit user call).
+    const conflictPlan = generateFileDecisionPlanV2({
+      localEntries: [],
+      remoteEntries: [remote("doc.mp4", oversizedRemote)],
+      baseEntries: [base("doc.mp4", { size: 100 * MB })],
+      skippedLarge: [],
+      configDir: ".obsidian",
+      maxFileSizeBytes: 200 * MB,
+    });
+    expect(conflictPlan.items).toEqual([
+      expect.objectContaining({ type: SyncActionType.Conflict, path: "doc.mp4" }),
+    ]);
   });
 });

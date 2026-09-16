@@ -68,6 +68,8 @@ export interface CanonicalPlanFactsV2 {
   localFolders: readonly LocalFolderEntry[];
   localFolderScanComplete: boolean;
   skippedLarge: readonly string[];
+  /** Device large-file exclusion threshold in bytes; absent disables the download gate. */
+  maxFileSizeBytes?: number;
   localMoveHints?: readonly LocalFolderMoveHintV1[];
   localFileMoveHints?: readonly LocalFolderMoveHintV1[];
   includeFilePath?: (path: string) => boolean;
@@ -247,6 +249,7 @@ export function buildCanonicalPlanCandidateFromStateV2(
     baseEntries: fileFacts.baseEntries,
     skippedLarge: input.skippedLarge.filter(includeFilePath),
     configDir: input.configDir,
+    maxFileSizeBytes: input.maxFileSizeBytes,
   });
 
   return composeCanonicalActionsV2({

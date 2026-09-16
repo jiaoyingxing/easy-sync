@@ -353,15 +353,70 @@ export class SliderComponent {
   }
 }
 
-export class DropdownComponent {
-  selectEl = {} as HTMLSelectElement;
+export class TextComponent {
+  static instances: TextComponent[] = [];
+  inputEl: HTMLInputElement;
+  private onChangeCallback: ((value: string) => void | Promise<void>) | null = null;
+  value = "";
 
-  constructor(_containerEl: HTMLElement) {}
+  constructor(_containerEl: HTMLElement) {
+    const listeners: Record<string, (event?: unknown) => void> = {};
+    this.inputEl = {
+      hidden: false,
+      inputMode: "",
+      focus: () => {},
+      setAttribute: () => {},
+      addEventListener: (type: string, callback: (event?: unknown) => void) => {
+        listeners[type] = callback;
+      },
+      // Test hook: dispatch a recorded DOM listener (e.g. blur).
+      __fire: (type: string) => listeners[type]?.(),
+    } as unknown as HTMLInputElement;
+    (this.inputEl as unknown as Record<string, unknown>).__listeners = listeners;
+    TextComponent.instances.push(this);
+  }
+  setPlaceholder(_placeholder: string): this { return this; }
+  setValue(value: string): this {
+    this.value = value;
+    return this;
+  }
+  getValue(): string { return this.value; }
+  onChange(callback: (value: string) => void | Promise<void>): this {
+    this.onChangeCallback = callback;
+    return this;
+  }
+  async triggerChange(value: string): Promise<void> {
+    this.value = value;
+    await this.onChangeCallback?.(value);
+  }
+}
+
+export class DropdownComponent {
+  static instances: DropdownComponent[] = [];
+  selectEl = {
+    closest: (_selector: string): HTMLElement | null => null,
+  } as unknown as HTMLSelectElement;
+  private onChangeCallback: ((value: string) => void | Promise<void>) | null = null;
+  value = "";
+
+  constructor(_containerEl: HTMLElement) {
+    DropdownComponent.instances.push(this);
+  }
   addOption(_value: string, _display: string): this { return this; }
   addOptions(_options: Record<string, string>): this { return this; }
-  setValue(_value: string): this { return this; }
+  setValue(value: string): this {
+    this.value = value;
+    return this;
+  }
   setDisabled(_disabled: boolean): this { return this; }
-  onChange(_callback: (value: string) => void | Promise<void>): this { return this; }
+  onChange(callback: (value: string) => void | Promise<void>): this {
+    this.onChangeCallback = callback;
+    return this;
+  }
+  async triggerChange(value: string): Promise<void> {
+    this.value = value;
+    await this.onChangeCallback?.(value);
+  }
 }
 
 export class Setting {
@@ -380,6 +435,10 @@ export class Setting {
   }
   addToggle(callback: (component: ToggleComponent) => void): this {
     callback(new ToggleComponent({} as HTMLElement));
+    return this;
+  }
+  addText(callback: (component: TextComponent) => void): this {
+    callback(new TextComponent({} as HTMLElement));
     return this;
   }
   addSlider(callback: (component: SliderComponent) => void): this {

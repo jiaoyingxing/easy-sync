@@ -346,6 +346,45 @@ describe("main sync entry guards", () => {
     vi.useRealTimers();
   });
 
+  it("re-applies the max-file-size threshold after the scanner is created", () => {
+    // 2026-09-16 真机取证：onload 第①步 loadSyncSettings() 里的 applyMaxFileSize()
+    // 跑在 scanner 创建之前，`this.scanner?.setConfig` 被可选链静默吞掉——
+    // 每次重载/重启阈值都悄悄回到默认值，只有当场改设置才生效。
+    // 守卫：scanner 创建点必须像 applySyncPathSettings 一样补调 applyMaxFileSize。
+    const source = readFileSync("src/main.ts", "utf8");
+    const creationAt = source.indexOf("this.scanner = new LocalScanner(");
+    expect(creationAt).toBeGreaterThan(-1);
+    const afterCreation = source.slice(creationAt, creationAt + 700);
+    expect(afterCreation).toContain("this.applyMaxFileSize()");
+  });
+
+  it("keeps the skip-row delta wiring: baseline filter, mirror overwrite, state accessors, history group", () => {
+    // 2026-09-16 拍板（方案单 §十二）：稳定被排除文件不逐行重演——
+    // 结算按基准过滤、轮末镜像覆写、StateManager 两方法、历史折叠组。
+    const executorSource = readFileSync("src/sync/sync-executor.ts", "utf8");
+    const settlementAt = executorSource.indexOf(
+      "if (item.type === SyncActionType.SkipLargeFile) {",
+    );
+    expect(settlementAt).toBeGreaterThan(-1);
+    const settlementWindow = executorSource.slice(
+      settlementAt,
+      settlementAt + 600,
+    );
+    expect(settlementWindow).toContain("settledSkipPaths.add(item.path)");
+    expect(settlementWindow).toContain("skipBaseline.has(item.path)");
+    expect(executorSource).toContain(
+      "commitSizeExclusionBaseline",
+    );
+
+    const stateSource = readFileSync("src/sync/state-manager.ts", "utf8");
+    expect(stateSource).toContain("getSizeExclusionBaseline");
+    expect(stateSource).toContain("commitSizeExclusionBaseline");
+
+    const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
+    expect(viewSource).toContain("easy-sync-history-skip-group");
+    expect(viewSource).toContain("syncView.history.skipGroupTitle");
+  });
+
   it("keeps one executor run call site with explicit mode callback contracts", async () => {
     const source = readFileSync("src/main.ts", "utf8");
     expect(source.match(/syncExecutor\.run\(/g) ?? []).toHaveLength(1);
@@ -686,6 +725,58 @@ describe("main sync entry guards", () => {
     ]);
     expect(executorSource).toContain("completionFileSize,\n            item.renameFrom,");
     expect(executorSource).toContain("fileSize,\n              item.renameFrom,");
+  });
+
+  it("records the wall-clock failure moment on error rows and renders it in the report failure detail", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-15T22:21:09"));
+    const failureMoment = Date.now();
+    const plugin = makePlugin();
+    const executorSource = readFileSync("src/sync/sync-executor.ts", "utf8");
+    const mainSource = readFileSync("src/main.ts", "utf8");
+    const handleFileComplete = (plugin as never as {
+      handleFileComplete: (
+        path: string,
+        actionType: SyncActionType,
+        success: boolean,
+        reason?: string,
+        fileSize?: number,
+        sourcePath?: string,
+      ) => void;
+    }).handleFileComplete.bind(plugin);
+
+    handleFileComplete(
+      "附件/录音/resojot-20260910125415.wav",
+      SyncActionType.Download,
+      false,
+      "网络请求失败",
+      2599824,
+    );
+    handleFileComplete(
+      "Projects/New.md",
+      SyncActionType.Download,
+      true,
+      undefined,
+      12,
+    );
+
+    expect(plugin.progressStore.state.completedFiles).toEqual([
+      expect.objectContaining({
+        path: "附件/录音/resojot-20260910125415.wav",
+        status: "error",
+        failedAt: failureMoment,
+      }),
+      expect.objectContaining({
+        path: "Projects/New.md",
+        status: "download",
+        failedAt: undefined,
+      }),
+    ]);
+    // The report failure detail prefers the per-file failure moment and only
+    // falls back to the round start for legacy history entries.
+    expect(mainSource).toContain("${fmtShort(f.failedAt ?? f.historyStartedAt)}");
+    // Side-action errors (folder/conflict rows) record the same field.
+    expect(executorSource).toContain("failedAt: status === \"error\" ? Date.now() : undefined,");
   });
 
   it("debounces local dirty events into the shared automatic sync entry", async () => {
@@ -2516,10 +2607,10 @@ describe("main sync entry guards", () => {
     expect(show).not.toHaveBeenCalled();
   });
 
-  it("shows the threshold-skipped summary notice after an automatic run proceeded past the gate (direction 3 wiring)", async () => {
+  it("shows only the threshold-skipped summary when an automatic run proceeded past the gate and completed (direction 3 wiring + 2026-09-15 减负 R-7)", async () => {
     // The executor records thresholdSkippedInAuto on runFacts; finishSyncNotice
-    // must map it to the one-line summary notice with the completed outcome
-    // (single-slot center replaces the completed notice downstream).
+    // must show the one-line summary INSTEAD of the completed notice — the
+    // previous double-show made completed flash and get replaced downstream.
     const plugin = makePlugin();
     plugin.app = { workspace: { leftSplit: undefined } } as never;
     const show = vi.fn();
@@ -2537,16 +2628,39 @@ describe("main sync entry guards", () => {
         },
       });
 
+    expect(show).toHaveBeenCalledTimes(1);
     expect(show).toHaveBeenCalledWith(expect.objectContaining({
       key: "sync-result:threshold-skipped-auto",
       message: "notice.sync.thresholdSkippedInAuto",
       priority: NOTICE_PRIORITY.info,
       category: "ambient",
     }));
-    // Completed outcome is still emitted first; the single-slot center
-    // replaces it with the summary when priorities are equal.
+  });
+
+  it("keeps the outcome notice plus the threshold summary for non-completed outcomes (R-7 merges only the completed double-show)", async () => {
+    const plugin = makePlugin();
+    plugin.app = { workspace: { leftSplit: undefined } } as never;
+    const show = vi.fn();
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+
+    (plugin as never as { finishSyncNotice: (result: SyncResult) => void })
+      .finishSyncNotice({
+        ...okResult(),
+        success: false,
+        runFacts: {
+          termination: "normal",
+          ordinaryPlanning: "entered",
+          userFileChanges: "none",
+          thresholdSkippedInAuto: true,
+        },
+      });
+
     expect(show).toHaveBeenCalledWith(expect.objectContaining({
-      key: "sync-result:completed",
+      key: "sync-result:failed",
+    }));
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "sync-result:threshold-skipped-auto",
     }));
   });
 
@@ -3140,7 +3254,7 @@ describe("main sync entry guards", () => {
       success: false,
       errors: 1,
       skippedLarge: 1,
-      message: "result.sharedControlReadUnavailable",
+      message: "result.remoteReadUnavailable",
       runFacts: {
         termination: "normal",
         ordinaryPlanning: "not-entered",
@@ -3187,7 +3301,7 @@ describe("main sync entry guards", () => {
       ...okResult(),
       success: false,
       errors: 1,
-      message: "result.ordinaryRemoteReadUnavailable",
+      message: "result.remoteReadUnavailable",
       runFacts: {
         termination: "normal",
         ordinaryPlanning: "not-entered",
@@ -3246,7 +3360,7 @@ describe("main sync entry guards", () => {
         ...okResult(),
         success: false,
         errors: 1,
-        message: "result.sharedControlReadUnavailable",
+        message: "result.remoteReadUnavailable",
         runFacts: {
           termination: "normal",
           ordinaryPlanning: "not-entered",
@@ -3296,7 +3410,7 @@ describe("main sync entry guards", () => {
       mode: "auto",
       status: "retry-pending",
       errors: 0,
-      message: "result.sharedControlReadUnavailable",
+      message: "result.remoteReadUnavailable",
       files: [],
       runFacts: {
         termination: "normal",
@@ -3334,7 +3448,7 @@ describe("main sync entry guards", () => {
     expect(history[1]).toMatchObject({
       status: "retry-pending",
       errors: 0,
-      message: "result.sharedControlReadUnavailable",
+      message: "result.remoteReadUnavailable",
       files: [],
       runFacts: { userFileChanges: "unknown" },
     });
@@ -3364,7 +3478,7 @@ describe("main sync entry guards", () => {
       ...okResult(),
       success: false,
       errors: 1,
-      message: "result.sharedControlReadUnavailable",
+      message: "result.remoteReadUnavailable",
       runFacts: {
         termination: "normal",
         ordinaryPlanning: "not-entered",
@@ -5771,6 +5885,34 @@ describe("main sync entry guards", () => {
     expect(runCommunityPluginCloudCleanup).not.toHaveBeenCalled();
   });
 
+  function attachFreshCleanupCatalog(plugin: ReturnType<typeof makePlugin>): void {
+    plugin.refreshCommunityPluginRemoteCatalog = vi.fn().mockResolvedValue({
+      version: 1,
+      complete: true,
+      stale: false,
+      revision: 5,
+      observedAt: 1,
+      sourceDigest: "a".repeat(64),
+      scope: {},
+      entries: [{
+        pluginId: "calendar",
+        bundleState: "complete",
+        bundleDigest: "b".repeat(64),
+        members: [{
+          path: ".obsidian/plugins/calendar/main.js",
+          remoteId: "id:main",
+          parentId: "folder",
+          size: 10,
+          mtime: 1,
+          eTag: "etag:main",
+          cTag: "ctag:main",
+          sha256Hash: null,
+          quickXorHash: null,
+        }],
+      }],
+    });
+  }
+
   it("lets a never-participated device run the dedicated cloud cleanup", async () => {
     const plugin = makePlugin();
     attachParticipationState(
@@ -5780,6 +5922,7 @@ describe("main sync entry guards", () => {
         { type: "mark-never-participated", pluginId: "calendar" },
       ),
     );
+    attachFreshCleanupCatalog(plugin);
     const runCommunityPluginCloudCleanup = vi.fn().mockResolvedValue({
       status: "completed",
       deleted: 3,
@@ -5796,12 +5939,60 @@ describe("main sync entry guards", () => {
     } as never;
     plugin.app.loadLocalStorage = vi.fn().mockReturnValue(null);
     plugin.app.saveLocalStorage = vi.fn() as never;
+    const startJoinNow = vi.fn();
+    plugin.startCommunityPluginJoinNow = startJoinNow as never;
 
     await expect(plugin.runCommunityPluginCloudCleanup("calendar"))
       .resolves.toBe(true);
-    expect(runCommunityPluginCloudCleanup).toHaveBeenCalledWith("calendar");
+    expect(runCommunityPluginCloudCleanup).toHaveBeenCalledWith(
+      "calendar",
+      { entries: [expect.objectContaining({
+        path: ".obsidian/plugins/calendar/main.js",
+        driveId: "id:main",
+      })] },
+    );
+    expect(startJoinNow).toHaveBeenCalledTimes(1);
+
     expect(show).toHaveBeenCalledWith(expect.objectContaining({
       key: "cloud-cleanup:done:calendar",
+    }));
+  });
+
+  it("stops before planning when no fresh catalog evidence is available", async () => {
+    const plugin = makePlugin();
+    attachParticipationState(
+      plugin,
+      reduceDeviceCommunityPluginParticipation(
+        createEmptyDeviceCommunityPluginParticipation(true),
+        { type: "mark-never-participated", pluginId: "calendar" },
+      ),
+    );
+    plugin.refreshCommunityPluginRemoteCatalog = vi.fn().mockRejectedValue(
+      new Error("delta unavailable"),
+    );
+    const runCommunityPluginCloudCleanup = vi.fn();
+    plugin.syncExecutor = {
+      isRunning: false,
+      runCommunityPluginCloudCleanup,
+    } as never;
+    const show = vi.fn();
+    plugin.noticeCenter = {
+      show,
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue(null);
+    plugin.app.saveLocalStorage = vi.fn() as never;
+    const startJoinNow = vi.fn();
+    plugin.startCommunityPluginJoinNow = startJoinNow as never;
+
+    await expect(plugin.runCommunityPluginCloudCleanup("calendar"))
+      .resolves.toBe(false);
+    expect(runCommunityPluginCloudCleanup).not.toHaveBeenCalled();
+    expect(startJoinNow).not.toHaveBeenCalled();
+
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "cloud-cleanup:failed:calendar",
     }));
   });
 
@@ -5855,10 +6046,10 @@ describe("main sync entry guards", () => {
       }],
     };
     (plugin as never as {
-      sweepResurrectedCloudCleanupMarkersAgainstCatalog(
-        catalog: unknown,
+      sweepCommunityPluginCloudCleanupMarkers(
+        reappearedPluginIds: readonly string[],
       ): void;
-    }).sweepResurrectedCloudCleanupMarkersAgainstCatalog(catalog);
+    }).sweepCommunityPluginCloudCleanupMarkers(["calendar"]);
     // No dedicated reappearance notice (2026-09-09 用户拍板): the row simply
     // un-hides on the next refresh.
     expect(show).not.toHaveBeenCalled();
@@ -5916,10 +6107,10 @@ describe("main sync entry guards", () => {
       entries: [],
     };
     (gone as never as {
-      sweepResurrectedCloudCleanupMarkersAgainstCatalog(
-        catalog: unknown,
+      sweepCommunityPluginCloudCleanupMarkers(
+        reappearedPluginIds: readonly string[],
       ): void;
-    }).sweepResurrectedCloudCleanupMarkersAgainstCatalog(emptyCatalog);
+    }).sweepCommunityPluginCloudCleanupMarkers([]);
     expect(showGone).not.toHaveBeenCalled();
     expect(saveGone).not.toHaveBeenCalled();
     // Participating: the bundle is back — the marker is dead weight there
@@ -5940,12 +6131,10 @@ describe("main sync entry guards", () => {
     const saveActive = vi.fn();
     active.app.saveLocalStorage = saveActive as never;
     (active as never as {
-      sweepResurrectedCloudCleanupMarkersAgainstCatalog(
-        catalog: unknown,
+      sweepCommunityPluginCloudCleanupMarkers(
+        reappearedPluginIds: readonly string[],
       ): void;
-    }).sweepResurrectedCloudCleanupMarkersAgainstCatalog(
-      completeCalendarCatalog,
-    );
+    }).sweepCommunityPluginCloudCleanupMarkers(["calendar"]);
     expect(saveActive).toHaveBeenCalledWith(
       "easy-sync-community-plugin-cloud-cleanup-v1",
       [],
@@ -5986,10 +6175,10 @@ describe("main sync entry guards", () => {
       }],
     };
     (plugin as never as {
-      sweepResurrectedCloudCleanupMarkersAgainstCatalog(
-        catalog: unknown,
+      sweepCommunityPluginCloudCleanupMarkers(
+        reappearedPluginIds: readonly string[],
       ): void;
-    }).sweepResurrectedCloudCleanupMarkersAgainstCatalog(catalog);
+    }).sweepCommunityPluginCloudCleanupMarkers(["calendar"]);
     // The reappearance un-hides the row without any dedicated notice.
     expect(show).not.toHaveBeenCalled();
     expect(saveLocalStorage).toHaveBeenCalledWith(
@@ -6031,10 +6220,10 @@ describe("main sync entry guards", () => {
       }],
     };
     (plugin as never as {
-      sweepResurrectedCloudCleanupMarkersAgainstCatalog(
-        catalog: unknown,
+      sweepCommunityPluginCloudCleanupMarkers(
+        reappearedPluginIds: readonly string[],
       ): void;
-    }).sweepResurrectedCloudCleanupMarkersAgainstCatalog(catalog);
+    }).sweepCommunityPluginCloudCleanupMarkers([]);
     expect(show).not.toHaveBeenCalled();
     expect(saveLocalStorage).not.toHaveBeenCalled();
   });
@@ -6065,6 +6254,7 @@ describe("main sync entry guards", () => {
         { type: "confirm-excluded", pluginId: "calendar" },
       ),
     );
+    attachFreshCleanupCatalog(plugin);
     const runCommunityPluginCloudCleanup = vi.fn().mockResolvedValue({
       status: "completed",
       deleted: 2,
@@ -6082,13 +6272,81 @@ describe("main sync entry guards", () => {
     plugin.app.loadLocalStorage = vi.fn().mockReturnValue(null);
     const saveLocalStorage = vi.fn();
     plugin.app.saveLocalStorage = saveLocalStorage as never;
+    const startJoinNow = vi.fn();
+    plugin.startCommunityPluginJoinNow = startJoinNow as never;
+    const commitParticipation = vi.fn().mockResolvedValue(undefined);
+    plugin.commitCommunityPluginParticipationCommand =
+      commitParticipation as never;
+    const persistAdoption = vi.fn().mockResolvedValue(undefined);
+    plugin.persistCommunityPluginAdoptionCommand = persistAdoption as never;
 
     await expect(plugin.runCommunityPluginCloudCleanup("calendar"))
       .resolves.toBe(true);
-    expect(runCommunityPluginCloudCleanup).toHaveBeenCalledWith("calendar");
+    expect(runCommunityPluginCloudCleanup).toHaveBeenCalledWith(
+      "calendar",
+      { entries: [expect.objectContaining({ driveId: "id:main" })] },
+    );
+    expect(commitParticipation).toHaveBeenCalledWith({
+      type: "confirm-excluded",
+      pluginId: "calendar",
+    });
+    expect(persistAdoption).toHaveBeenCalledWith({
+      type: "remove-pending",
+      pluginId: "calendar",
+    });
+    expect(startJoinNow).toHaveBeenCalledTimes(1);
+
     expect(show).toHaveBeenCalledWith(expect.objectContaining({
       key: "cloud-cleanup:done:calendar",
     }));
+    expect(saveLocalStorage).toHaveBeenCalledWith(
+      "easy-sync-community-plugin-cloud-cleanup-v1",
+      [{ pluginId: "calendar", cleanedAt: expect.any(Number) }],
+    );
+  });
+
+  it("keeps a successful cleanup when the participation exit fails afterwards", async () => {
+    const plugin = makePlugin();
+    attachParticipationState(
+      plugin,
+      reduceDeviceCommunityPluginParticipation(
+        createEmptyDeviceCommunityPluginParticipation(true),
+        { type: "confirm-excluded", pluginId: "calendar" },
+      ),
+    );
+    attachFreshCleanupCatalog(plugin);
+    const runCommunityPluginCloudCleanup = vi.fn().mockResolvedValue({
+      status: "completed",
+      deleted: 2,
+    });
+    plugin.syncExecutor = {
+      isRunning: false,
+      runCommunityPluginCloudCleanup,
+    } as never;
+    const show = vi.fn();
+    plugin.noticeCenter = {
+      show,
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    plugin.app.loadLocalStorage = vi.fn().mockReturnValue(null);
+    const saveLocalStorage = vi.fn();
+    plugin.app.saveLocalStorage = saveLocalStorage as never;
+    plugin.commitCommunityPluginParticipationCommand = vi.fn()
+      .mockRejectedValue(new Error("busy")) as never;
+    plugin.persistCommunityPluginAdoptionCommand = vi.fn()
+      .mockRejectedValue(new Error("busy")) as never;
+    plugin.diag = { warn: vi.fn() } as never;
+    const startJoinNow = vi.fn();
+    plugin.startCommunityPluginJoinNow = startJoinNow as never;
+
+    await expect(plugin.runCommunityPluginCloudCleanup("calendar"))
+      .resolves.toBe(true);
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "cloud-cleanup:done:calendar",
+    }));
+    expect(startJoinNow).toHaveBeenCalledTimes(1);
+
     expect(saveLocalStorage).toHaveBeenCalledWith(
       "easy-sync-community-plugin-cloud-cleanup-v1",
       [{ pluginId: "calendar", cleanedAt: expect.any(Number) }],
@@ -6109,6 +6367,7 @@ describe("main sync entry guards", () => {
       files: { mode: "selected", pluginIds: ["calendar", "other"] },
       data: { mode: "selected", pluginIds: ["calendar"] },
     } as never;
+    attachFreshCleanupCatalog(plugin);
     plugin.syncExecutor = {
       isRunning: false,
       runCommunityPluginCloudCleanup: vi.fn().mockResolvedValue({
@@ -6125,10 +6384,14 @@ describe("main sync entry guards", () => {
     plugin.app.saveLocalStorage = vi.fn() as never;
     const updateSyncPathSettings = vi.fn().mockResolvedValue(undefined);
     plugin.updateSyncPathSettings = updateSyncPathSettings as never;
+    const startJoinNow = vi.fn();
+    plugin.startCommunityPluginJoinNow = startJoinNow as never;
 
     await expect(plugin.runCommunityPluginCloudCleanup("calendar"))
       .resolves.toBe(true);
     expect(updateSyncPathSettings).toHaveBeenCalledTimes(1);
+    expect(startJoinNow).toHaveBeenCalledTimes(1);
+
     const patch = updateSyncPathSettings.mock.calls[0][0] as {
       communityPluginSyncPolicy: {
         files: { pluginIds: string[] };
@@ -6165,19 +6428,10 @@ describe("main sync entry guards", () => {
     plugin.app.saveLocalStorage = saveLocalStorage as never;
 
     (plugin as never as {
-      sweepResurrectedCloudCleanupMarkersAgainstCatalog(
-        catalog: unknown,
+      sweepCommunityPluginCloudCleanupMarkers(
+        reappearedPluginIds: readonly string[],
       ): void;
-    }).sweepResurrectedCloudCleanupMarkersAgainstCatalog({
-      version: 1,
-      complete: true,
-      stale: false,
-      revision: 5,
-      observedAt: 1,
-      sourceDigest: "a".repeat(64),
-      scope: {},
-      entries: [],
-    });
+    }).sweepCommunityPluginCloudCleanupMarkers([]);
 
     expect(show).not.toHaveBeenCalled();
     // Nothing changed: the marker stays persisted and no write is issued.

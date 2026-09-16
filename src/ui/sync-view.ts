@@ -217,6 +217,9 @@ export interface SyncViewContentKeyInput {
   planReviewActive: boolean;
   planReviewDetailsState: "ready" | "recovering" | "retry";
   pendingIssues: PendingIssue[];
+  /** Pre-grouped pending issues from doRender — the key builder reuses them
+   *  instead of re-running the grouping a second time per render. */
+  pendingIssueGroups?: PendingIssueReviewGroup[];
   conflicts: SyncPlanItem[];
   pendingDeletes: SyncPlanItem[];
   adoptionRows: CommunityPluginAdoptionRow[];
@@ -236,25 +239,116 @@ export interface PendingIssueReviewGroup {
 export function groupPendingIssuesForReview(
   issues: readonly PendingIssue[],
 ): PendingIssueReviewGroup[] {
+  // The nested-tree grouping only ever pairs anchored-folder-missing-local
+  // issues with each other, so the candidate set is collected once instead of
+  // rescanning the whole list per issue (O(n·k) → O(n + k²), k = folder
+  // issues). Semantics identical to the previous per-issue full scans.
+  const folderIssues = issues.filter((issue) =>
+    issue.issueCode === "anchored-folder-missing-local",
+  );
   return issues.map((issue, index) => ({ issue, index }))
-    .filter(({ issue, index }) =>
+    .filter(({ issue }) =>
       issue.issueCode !== "anchored-folder-missing-local"
-        || !issues.some((candidate, candidateIndex) =>
-          candidateIndex !== index
-            && candidate.issueCode === "anchored-folder-missing-local"
-            && isNestedPath(issue.path, candidate.path),
+        || !folderIssues.some((candidate) =>
+          candidate !== issue && isNestedPath(issue.path, candidate.path),
         ),
     )
     .map(({ issue }) => ({
       issue,
       nestedIssues: issue.issueCode === "anchored-folder-missing-local"
-        ? issues.filter((candidate) =>
+        ? folderIssues.filter((candidate) =>
           candidate !== issue
-            && candidate.issueCode === "anchored-folder-missing-local"
             && isNestedPath(candidate.path, issue.path),
         )
         : [],
     }));
+}
+
+/** One mountable row of the pending section, in display order. */
+export interface SyncPendingDisplayRow {
+  key: string;
+  kind: "adoption" | "issue" | "conflict" | "pluginConflict" | "batchDelete" | "delete";
+  adoption?: CommunityPluginAdoptionRow;
+  issue?: PendingIssue;
+  nestedIssues?: PendingIssue[];
+  retryable?: boolean;
+  item?: SyncPlanItem;
+  pluginConflict?: { pluginId: string; items: SyncPlanItem[] };
+  deletes?: SyncPlanItem[];
+}
+
+/**
+ * Resolve the pending section into the DOM rows it actually produces, in
+ * display order (adoptions → failures → conflicts → batch delete → per-item
+ * deletes → skips). Deriving the rows from the whole section keeps every key —
+ * and therefore each row's expansion memory and in-flight pin — independent of
+ * which rows the current scroll window happens to contain.
+ */
+export function buildSyncPendingDisplayRows(input: Readonly<{
+  adoptionRows: readonly CommunityPluginAdoptionRow[];
+  failures: readonly PendingIssueReviewGroup[];
+  conflictEntries: readonly CommunityPluginConflictReviewEntry[];
+  pendingDeletes: readonly SyncPlanItem[];
+  skipped: readonly PendingIssueReviewGroup[];
+}>): SyncPendingDisplayRow[] {
+  const rows: SyncPendingDisplayRow[] = [];
+  const seen = new Set<string>();
+  const push = (row: SyncPendingDisplayRow) => {
+    if (seen.has(row.key)) return;
+    seen.add(row.key);
+    rows.push(row);
+  };
+  for (const adoption of input.adoptionRows) {
+    push({
+      key: `adoption:${adoption.pluginId}`,
+      kind: "adoption",
+      adoption,
+    });
+  }
+  for (const { issue, nestedIssues } of input.failures) {
+    push({
+      key: `issue:${issue.actionType}:${issue.issueCode ?? ""}:${issue.path}`,
+      kind: "issue",
+      issue,
+      nestedIssues,
+      retryable: true,
+    });
+  }
+  for (const entry of input.conflictEntries) {
+    if (entry.kind === "file") {
+      push({
+        key: `conflict:${entry.item.path}`,
+        kind: "conflict",
+        item: entry.item,
+      });
+    } else {
+      push({
+        key: `plugin:${entry.pluginId}`,
+        kind: "pluginConflict",
+        pluginConflict: { pluginId: entry.pluginId, items: entry.items },
+      });
+    }
+  }
+  if (input.pendingDeletes.length > 1) {
+    push({
+      key: "batch-delete",
+      kind: "batchDelete",
+      deletes: [...input.pendingDeletes],
+    });
+  }
+  for (const item of input.pendingDeletes) {
+    push({ key: `delete:${item.path}`, kind: "delete", item });
+  }
+  for (const { issue, nestedIssues } of input.skipped) {
+    push({
+      key: `issue:${issue.actionType}:${issue.issueCode ?? ""}:${issue.path}`,
+      kind: "issue",
+      issue,
+      nestedIssues,
+      retryable: false,
+    });
+  }
+  return rows;
 }
 
 function remoteScopeRecoveryPercent(
@@ -747,18 +841,6 @@ export function formatPendingIssueChipLabel(
   return t("syncView.fileStatus.error");
 }
 
-export function formatPendingIssueActionLabel(
-  actionType: SyncActionType,
-  t: (key: string) => string,
-): string {
-  return t(
-    actionType === SyncActionType.RetryLater
-      || actionType === SyncActionType.FolderDeferred
-      ? "syncView.issues.recheck"
-      : "syncView.issues.retry",
-  );
-}
-
 export type CommunityPluginConflictReviewEntry =
   | { kind: "file"; item: SyncPlanItem }
   | {
@@ -844,7 +926,7 @@ export function buildSyncViewContentKey(
     return `progress:${authKey}:${runKey}:${recoveryKey}:${input.progress.phase}:${progressStructure}:scope-proof:${scopeRecoveryKey}:${historyKey}`;
   }
   if (input.bodyMode === "pending") {
-    const issues = groupPendingIssuesForReview(input.pendingIssues)
+    const issues = (input.pendingIssueGroups ?? groupPendingIssuesForReview(input.pendingIssues))
       .map(({ issue, nestedIssues }) =>
         `${issue.actionType}:${issue.issueCode ?? ""}:${issue.path}:${issue.updatedAt}:${issue.reason ?? ""}:nested:${nestedIssues.map((nested) => nested.path).join(",")}`)
       .join("|");
@@ -1245,6 +1327,7 @@ export class EasySyncSyncView extends ItemView {
       planReviewActive,
       planReviewDetailsState,
       pendingIssues,
+      pendingIssueGroups,
       conflicts,
       pendingDeletes,
       adoptionRows,
@@ -1296,7 +1379,7 @@ export class EasySyncSyncView extends ItemView {
         if (sideActionResultsVisible) this.renderProgressPanel(content, progress);
         this.renderPendingSection(
           content,
-          pendingIssues,
+          pendingIssueGroups,
           conflicts,
           pendingDeletes,
           adoptionRows,
@@ -2200,18 +2283,23 @@ export class EasySyncSyncView extends ItemView {
         facts.createEl("dd").setText(presentation.retryAt);
       }
     }
-    // Honest next-step line for every state: real-decision pointers where a
-    // decision exists, otherwise status plus the diagnostics / forced-reset
-    // guidance. The abandon escape hatch was removed; the single last-resort
-    // exit lives on the reset flow (informed forced reset).
-    section.createDiv("easy-sync-recovery-next-step").setText(
-      presentation.nextStep,
-    );
+    // Honest next-step line for states with a real decision or an active
+    // exit (review / blocked / account-changed). Automatic states
+    // (checking / waiting-network) render none: their summaries already state
+    // the auto-continue outcome, so the line would only repeat it
+    // (2026-09-15 copy-reduction round R-4). The abandon escape hatch was
+    // removed; the single last-resort exit lives on the reset flow (informed
+    // forced reset).
+    if (presentation.nextStep) {
+      section.createDiv("easy-sync-recovery-next-step").setText(
+        presentation.nextStep,
+      );
+    }
   }
 
   private renderPendingSection(
     container: HTMLElement,
-    issues: PendingIssue[],
+    issueGroups: readonly PendingIssueReviewGroup[],
     conflicts: SyncPlanItem[],
     pendingDeletes: SyncPlanItem[],
     adoptionRows: readonly CommunityPluginAdoptionRow[],
@@ -2221,91 +2309,191 @@ export class EasySyncSyncView extends ItemView {
       .createDiv("easy-sync-section")
       .createDiv("easy-sync-section-body");
     section.addClass("easy-sync-path-layout");
-    for (const row of adoptionRows) {
-      this.renderAdoptionItem(section, row);
-    }
-    const groupedIssues = groupPendingIssuesForReview(issues);
-    const skipped = groupedIssues.filter(({ issue }) =>
+    const skipped = issueGroups.filter(({ issue }) =>
       issue.actionType === SyncActionType.SkipLargeFile
       || issue.actionType === SyncActionType.SkipIgnoredPath
       || issue.actionType === SyncActionType.SkipOneDriveInvalidName);
-    const failures = groupedIssues.filter(({ issue }) =>
+    const failures = issueGroups.filter(({ issue }) =>
       issue.actionType !== SyncActionType.SkipLargeFile
       && issue.actionType !== SyncActionType.SkipIgnoredPath
       && issue.actionType !== SyncActionType.SkipOneDriveInvalidName);
+    const rows = buildSyncPendingDisplayRows({
+      adoptionRows,
+      failures,
+      conflictEntries: groupCommunityPluginConflictReviews(
+        conflicts,
+        getConfigDir(this.plugin.app.vault),
+      ),
+      pendingDeletes,
+      skipped,
+    });
+    // 窗口化挂载（2026-09-16，与计划审阅决策行同一机制）：待处理行数大时
+    // 只挂载视口附近的行，滚动按窗口替换。行 key（data-easy-sync-plan-row）
+    // 与计划决策行同族——展开记忆、在飞 pin、换窗回填顺序全部沿用；计数
+    // 与顶部合计仍来自全量事实，窗口化只改变挂载范围。
+    const virtualList = section.createDiv("easy-sync-plan-virtual-list");
+    let virtualOffsets: number[] | null = null;
+    let offsetsRevision = -1;
+    let renderedKey = "";
+    let renderDepth = 0;
 
-    for (const { issue, nestedIssues } of failures) {
-      this.renderPendingIssue(section, issue, true, nestedIssues);
-    }
-    for (const entry of groupCommunityPluginConflictReviews(
-      conflicts,
-      getConfigDir(this.plugin.app.vault),
-    )) {
-      if (entry.kind === "file") {
-        this.renderConflictItem(section, entry.item);
-      } else {
-        this.renderCommunityPluginConflictItem(
-          section,
-          entry.pluginId,
-          entry.items.length,
-        );
+    const resolveOffsets = (): number[] => {
+      if (virtualOffsets && offsetsRevision === this.planRowLayoutRevision) {
+        return virtualOffsets;
       }
-    }
-    if (pendingDeletes.length > 1) {
-      const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-      const paths = pendingDeletes.map((item) => item.path);
-      const actions = section.createDiv("easy-sync-plan-execute");
-      actions.addClass("easy-sync-primary-actions");
-      const confirmAllButton = applyDestructiveButton(
-        new ButtonComponent(actions),
+      const probe = this.measurePlanDecisionRowHeights(section);
+      virtualOffsets = buildSyncPlanMeasuredVirtualOffsets(
+        rows.map((row) =>
+          this.planRowHeights.get(row.key)
+          ?? (this.planRowExpanded(row.key)
+            ? probe.expandedRowHeight
+            : probe.collapsedRowHeight)),
       );
-      confirmAllButton
-        .setButtonText(t("syncView.delete.confirmAll", { count: paths.length }))
-        .onClick(() => {
-          void this.runItemAction(actions, async () => {
-            const confirmed = await new ConfirmModal(
-              this.plugin.app,
-              t("syncView.delete.confirmAllTitle", { count: paths.length }),
-              null,
-              t("syncView.delete.confirmAll", { count: paths.length }),
-              t("confirm.cancel"),
-              t,
-              {
-                message: t("syncView.delete.confirmAllMessage"),
-                warning: t("syncView.delete.confirmAllWarning"),
-                danger: true,
-              },
-            ).awaitConfirm();
-            if (!confirmed) return;
-            // 批量删除确认后立即进入官方 mod-loading 加载态：按钮文字被官方
-            // CSS 隐藏并显示旋转圆圈，用户能看出插件正在处理而不是卡死。
-            // 删除期间侧栏整块重建会销毁本按钮，重建后的按钮由下方
-            // batchDeleteInFlight 分支重新挂类，因此加载态可持续到整批结束。
-            confirmAllButton.buttonEl.addClass("mod-loading");
-            confirmAllButton.setDisabled(true);
-            await this.plugin.confirmRemoteDeletes(paths);
-          });
-        });
-      // 重建后恢复加载态：批量删除仍在队列/执行中时，按钮保持官方旋转
-      // 加载态与禁用，直到整批结束（hasSideActionsInFlight 归 false）。
-      if (
-        this.plugin.syncExecutor?.hasSideActionsInFlight
-        && this.plugin.progressStore.state.activityKind === "sideAction"
-        && this.plugin.progressStore.state.currentActionType
-          === SyncActionType.ConfirmLocalDelete
-      ) {
-        confirmAllButton.buttonEl.addClass("mod-loading");
-        confirmAllButton.setDisabled(true);
+      offsetsRevision = this.planRowLayoutRevision;
+      virtualList.style.height =
+        `${virtualOffsets[virtualOffsets.length - 1] ?? 0}px`;
+      return virtualOffsets;
+    };
+
+    const renderPendingWindow = (): void => {
+      // A row whose decision is still settling has to stay mounted: the user
+      // is waiting on that exact row, and a window shift would take it away.
+      if (rows.some((row) => this.planDecisionRowsInFlight.has(row.key))) {
+        return;
       }
-    }
-    for (const item of pendingDeletes) this.renderDeleteItem(section, item);
-    for (const { issue, nestedIssues } of skipped) {
-      this.renderPendingIssue(section, issue, false, nestedIssues);
-    }
+      const offsets = resolveOffsets();
+      const listRect = virtualList.getBoundingClientRect();
+      const viewportRect = this.resolvePlanViewportRect();
+      const windowState = buildSyncPlanVirtualWindow({
+        offsets,
+        listTop: listRect.top,
+        viewportTop: viewportRect.top,
+        viewportBottom: viewportRect.bottom,
+      });
+      const nextKey =
+        `${windowState.start}:${windowState.end}:${windowState.offset}`;
+      if (nextKey === renderedKey) return;
+      renderedKey = nextKey;
+      virtualList.empty();
+      if (windowState.end <= windowState.start) return;
+      const visible = virtualList.createDiv("easy-sync-plan-virtual-window");
+      visible.style.transform = `translateY(${windowState.offset}px)`;
+      for (let index = windowState.start; index < windowState.end; index++) {
+        this.renderPendingRow(visible, rows[index]);
+      }
+      // Restore the per-row open state before measuring: a row remounted by a
+      // window shift has to answer to the same rule as its first mount.
+      this.applyPlanRowExpansionIn(visible);
+      if (this.rememberPlanRowHeights(visible) && renderDepth === 0) {
+        renderDepth += 1;
+        virtualOffsets = null;
+        renderPendingWindow();
+        renderDepth -= 1;
+        return;
+      }
+      this.scheduleAdaptivePathLayout();
+    };
+    this.planVirtualRenderers.add(renderPendingWindow);
+    renderPendingWindow();
     // Update reminder row sits at the very tail of the decision area: sync
     // decisions keep their positions, the row only exists while a newer
     // version is running late (方案单 20260915-0025 §四 提示层).
     if (updatePrompt) this.renderUpdateAvailableItem(section, updatePrompt);
+  }
+
+  /** One windowed pending row, dispatched by its display kind. */
+  private renderPendingRow(
+    container: HTMLElement,
+    row: SyncPendingDisplayRow,
+  ): void {
+    switch (row.kind) {
+      case "adoption":
+        if (row.adoption) this.renderAdoptionItem(container, row.adoption, row.key);
+        return;
+      case "issue":
+        if (row.issue) {
+          this.renderPendingIssue(
+            container,
+            row.issue,
+            row.retryable === true,
+            row.nestedIssues ?? [],
+            row.key,
+          );
+        }
+        return;
+      case "conflict":
+        if (row.item) this.renderConflictItem(container, row.item, row.key);
+        return;
+      case "pluginConflict":
+        if (row.pluginConflict) {
+          this.renderCommunityPluginConflictItem(
+            container,
+            row.pluginConflict.pluginId,
+            row.pluginConflict.items.length,
+            row.key,
+          );
+        }
+        return;
+      case "batchDelete":
+        this.renderBatchDeleteRow(container, row.deletes ?? []);
+        return;
+      case "delete":
+        if (row.item) this.renderDeleteItem(container, row.item, row.key);
+        return;
+    }
+  }
+
+  /** The batch delete entry: one destructive button for the whole set. */
+  private renderBatchDeleteRow(
+    container: HTMLElement,
+    pendingDeletes: SyncPlanItem[],
+  ): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const actions = container.createDiv("easy-sync-plan-execute");
+    actions.addClass("easy-sync-primary-actions");
+    actions.dataset.easySyncPlanRow = "batch-delete";
+    const paths = pendingDeletes.map((item) => item.path);
+    const confirmAllButton = applyDestructiveButton(
+      new ButtonComponent(actions),
+    );
+    confirmAllButton
+      .setButtonText(t("syncView.delete.confirmAll", { count: paths.length }))
+      .onClick(() => {
+        void this.runItemAction(actions, async () => {
+          const confirmed = await new ConfirmModal(
+            this.plugin.app,
+            t("syncView.delete.confirmAllTitle", { count: paths.length }),
+            null,
+            t("syncView.delete.confirmAll", { count: paths.length }),
+            t("confirm.cancel"),
+            t,
+            {
+              message: t("syncView.delete.confirmAllMessage"),
+              warning: t("syncView.delete.confirmAllWarning"),
+              danger: true,
+            },
+          ).awaitConfirm();
+          if (!confirmed) return;
+          // 批量删除确认后立即进入官方 mod-loading 加载态：按钮文字被官方
+          // CSS 隐藏并显示旋转圆圈，用户能看出插件正在处理而不是卡死。
+          // 窗口重挂后的按钮由下方 batchDeleteInFlight 分支重新挂类，
+          // 加载态可持续到整批结束。
+          confirmAllButton.buttonEl.addClass("mod-loading");
+          confirmAllButton.setDisabled(true);
+          await this.plugin.confirmRemoteDeletes(paths);
+        });
+      });
+    // 重挂后恢复加载态：批量删除仍在队列/执行中时，按钮保持官方旋转
+    // 加载态与禁用，直到整批结束（hasSideActionsInFlight 归 false）。
+    if (
+      this.plugin.syncExecutor?.hasSideActionsInFlight
+      && this.plugin.progressStore.state.activityKind === "sideAction"
+      && this.plugin.progressStore.state.currentActionType
+        === SyncActionType.ConfirmLocalDelete
+    ) {
+      confirmAllButton.buttonEl.addClass("mod-loading");
+      confirmAllButton.setDisabled(true);
+    }
   }
 
   /** One update-reminder row, same collapsible tree-item shape as the other
@@ -2359,9 +2547,11 @@ export class EasySyncSyncView extends ItemView {
     issue: PendingIssue,
     retryable: boolean,
     nestedIssues: readonly PendingIssue[] = [],
+    rowKey?: string,
   ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const details = container.createEl("details", "easy-sync-tree-item");
+    if (rowKey) details.dataset.easySyncPlanRow = rowKey;
     const summary = details.createEl("summary", "easy-sync-tree-row");
     this.addCollapseIcon(summary);
     const action = resolveSyncActionPresentation(issue.actionType);
@@ -2394,11 +2584,6 @@ export class EasySyncSyncView extends ItemView {
         }),
       );
     }
-    body.createDiv("easy-sync-item-time").setText(
-      t("syncView.issues.lastAttempt", {
-        time: new Date(issue.updatedAt).toLocaleString(),
-      }),
-    );
     const actions = body.createDiv("easy-sync-item-actions");
     const localFile = this.plugin.app.vault.getAbstractFileByPath(issue.path);
     if (localFile instanceof TFile) {
@@ -2478,12 +2663,10 @@ export class EasySyncSyncView extends ItemView {
         );
         return;
       }
-      this.createActionChip(actions, formatPendingIssueActionLabel(
-        issue.actionType,
-        t,
-      ), "accent", () => {
-        void this.plugin.startManualSync();
-      });
+      // 通用重试 chip 不再渲染（2026-09-16 按钮清理）：其余可重试问题行
+      // 的行内重试与顶部主动作完全等同（同一完整手动同步入口），轮运行
+      // 中点击也仅得 busy 提示——重试统一经顶部「立即同步」；延后类行
+      // 由自动轮次收敛。行内保留原因文案与可选「打开文件」。
     }
   }
 
@@ -2966,7 +3149,42 @@ export class EasySyncSyncView extends ItemView {
         );
       }
       if (entry.files.length > 0) {
-        this.renderFileResults(body, entry.files, false);
+        // 增量呈现（2026-09-16 方案单 §十二）：SkipLargeFile 行归入折叠组，
+        // 组标题承载性质（设置名「大型文件排除」），组内行=图标+路径，
+        // 徽标与理由句由组收掉；其余行（含上传/下载/invalid-name）照旧。
+        const skipLargeRows = entry.files.filter(
+          (file) => file.actionType === SyncActionType.SkipLargeFile,
+        );
+        const otherRows = entry.files.filter(
+          (file) => file.actionType !== SyncActionType.SkipLargeFile,
+        );
+        if (otherRows.length > 0) {
+          this.renderFileResults(body, otherRows, false);
+        }
+        if (skipLargeRows.length > 0) {
+          const group = body.createEl(
+            "details",
+            "easy-sync-history-skip-group easy-sync-tree-item",
+          );
+          const summary = group.createEl(
+            "summary",
+            "easy-sync-history-skip-summary easy-sync-tree-row",
+          );
+          this.addCollapseIcon(summary);
+          summary.createSpan("easy-sync-history-skip-title").setText(
+            t("syncView.history.skipGroupTitle", {
+              count: skipLargeRows.length,
+            }),
+          );
+          const groupRows = group.createDiv("easy-sync-file-list");
+          for (let i = skipLargeRows.length - 1; i >= 0; i--) {
+            const row = groupRows.createDiv("easy-sync-file-row");
+            const icon = row.createSpan("easy-sync-file-icon");
+            setIcon(icon, resolveFileProgressPresentation(skipLargeRows[i]).icon);
+            const pathEl = row.createSpan("easy-sync-file-path");
+            configureFilePath(row, pathEl, skipLargeRows[i].path, false);
+          }
+        }
       }
       const omitted = countOmittedSyncHistorySuccessfulFiles(entry);
       if (omitted > 0) {
@@ -3467,9 +3685,11 @@ export class EasySyncSyncView extends ItemView {
   private renderAdoptionItem(
     container: HTMLElement,
     row: CommunityPluginAdoptionRow,
+    rowKey?: string,
   ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const details = container.createEl("details", "easy-sync-tree-item");
+    if (rowKey) details.dataset.easySyncPlanRow = rowKey;
     const summary = details.createEl("summary", "easy-sync-tree-row");
     this.addCollapseIcon(summary);
     const icon = summary.createSpan("easy-sync-tree-status-icon");

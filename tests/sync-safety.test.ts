@@ -36,6 +36,7 @@ import type { SyncResult } from "../src/sync/sync-executor";
 import { OneDriveClient } from "../src/onedrive/client";
 import { OneDriveError, OneDriveErrorType, type DriveItem } from "../src/onedrive/types";
 import type { LocalScanner } from "../src/sync/local-scanner";
+import type { PendingIssue } from "../src/sync/types";
 import { generateFileDecisionPlanV2 } from "../src/sync/file-decision-planner-v2";
 import { StateManager } from "../src/sync/state-manager";
 import type { I18n } from "../src/i18n";
@@ -177,6 +178,7 @@ function makeMockOneDrive(overrides: Record<string, unknown> = {}) {
 }
 
 function remoteStateStub() {
+  const sizeExclusionBaseline: string[] = [];
   return {
     hasRemoteState: false,
     remoteSnapshot: [] as RemoteFileEntry[],
@@ -190,6 +192,10 @@ function remoteStateStub() {
     prunePendingIssues: vi.fn().mockResolvedValue(undefined),
     reconcilePendingIssues: vi.fn().mockResolvedValue(undefined),
     pendingIssues: [],
+    getSizeExclusionBaseline: vi.fn((): string[] => [...sizeExclusionBaseline]),
+    commitSizeExclusionBaseline: vi.fn(async (paths: readonly string[]) => {
+      sizeExclusionBaseline.splice(0, sizeExclusionBaseline.length, ...paths);
+    }),
     cacheBaseContent: vi.fn(),
     getBaseContent: vi.fn().mockReturnValue(undefined),
     getBaseEntry: vi.fn((path: string) => undefined),
@@ -2025,6 +2031,143 @@ describe("M17 circuit breaker retry semantics", () => {
     expect(result.errors).toBe(0);
     expect(result.downloaded).toBe(0);
     expect(downloadFile).not.toHaveBeenCalled();
+  });
+
+  it("expected skips never enter the pending-issues ledger and retire stale rows", async () => {
+    // 2026-09-16 拍板：按设置跳过（大型文件）是预期行为、零行动，不属于
+    // 「需要处理」——结算不入待处理账本；轮末对账按已解决路径退役既有跳过行。
+    // 轮内可见性由完成列表/历史承接，细节面在诊断报告。
+    const oversized: RemoteFileEntry = {
+      path: "video.mp4",
+      driveId: "item-video",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      size: 300 * 1024 * 1024,
+      mtime: 1,
+      eTag: "etag-video",
+      cTag: "ctag-video",
+    };
+    const seedPendingIssues: PendingIssue[] = [{
+      path: oversized.path,
+      actionType: SyncActionType.SkipLargeFile,
+      reason: "文件超过大小限制",
+      updatedAt: 1,
+      fileSize: oversized.size,
+      remoteETag: oversized.eTag,
+    }];
+    const mockState = makeActiveV2State([oversized], [], {
+      pendingIssues: seedPendingIssues,
+    });
+    // Mirror the real reconcile semantics (delete resolved paths, upsert the
+    // round's issues) — the shared fixture stub is a no-op.
+    const ledger = [...seedPendingIssues];
+    mockState.reconcilePendingIssues = vi.fn(async (
+      issues: PendingIssue[],
+      resolvedPaths: Iterable<string>,
+    ) => {
+      const resolved = new Set(resolvedPaths);
+      const byPath = new Map(ledger.map((issue) => [issue.path, { ...issue }]));
+      for (const path of resolved) byPath.delete(path);
+      for (const issue of issues) byPath.set(issue.path, { ...issue });
+      ledger.length = 0;
+      ledger.push(...byPath.values());
+      mockState.pendingIssues = [...ledger];
+    });
+
+    const downloadFile = vi.fn().mockResolvedValue(new Uint8Array([1]).buffer);
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ downloadFile }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+        }),
+        scanFile: vi.fn().mockResolvedValue(null),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+        getMaxFileSize: vi.fn().mockReturnValue(200 * 1024 * 1024),
+      } as unknown as LocalScanner,
+      mockState,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.downloaded).toBe(0);
+    expect(downloadFile).not.toHaveBeenCalled();
+    expect(
+      mockState.pendingIssues.filter((issue) => issue.path === "video.mp4"),
+    ).toEqual([]);
+  });
+
+  it("SkipOneDriveInvalidName keeps its pending row (it carries a user action)", async () => {
+    const invalidNamed: RemoteFileEntry = {
+      path: "bad?.md",
+      driveId: "item-aux",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      size: 6,
+      mtime: 1,
+      eTag: "etag-aux",
+      cTag: "ctag-aux",
+    };
+    const seedPendingIssues: PendingIssue[] = [];
+    const mockState = makeActiveV2State([invalidNamed], [], {
+      pendingIssues: seedPendingIssues,
+    });
+    // Mirror the real reconcile semantics (delete resolved paths, upsert the
+    // round's issues) — the shared fixture stub is a no-op.
+    const ledger = [...seedPendingIssues];
+    mockState.reconcilePendingIssues = vi.fn(async (
+      issues: PendingIssue[],
+      resolvedPaths: Iterable<string>,
+    ) => {
+      const resolved = new Set(resolvedPaths);
+      const byPath = new Map(ledger.map((issue) => [issue.path, { ...issue }]));
+      for (const path of resolved) byPath.delete(path);
+      for (const issue of issues) byPath.set(issue.path, { ...issue });
+      ledger.length = 0;
+      ledger.push(...byPath.values());
+      mockState.pendingIssues = [...ledger];
+    });
+
+    const executor = new SyncExecutor(
+      makeMockOneDrive({}),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+        }),
+        scanFile: vi.fn().mockResolvedValue(null),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+        getMaxFileSize: vi.fn().mockReturnValue(500 * 1024 * 1024),
+      } as unknown as LocalScanner,
+      mockState,
+      "testVault",
+    );
+
+    await executor.run("manual", {});
+
+    expect(
+      mockState.pendingIssues.filter(
+        (issue) => issue.actionType === SyncActionType.SkipOneDriveInvalidName,
+      ).map((issue) => issue.path),
+    ).toEqual(["bad?.md"]);
   });
 
   it("counts breaker-only deferrals so the pause gate can exempt them", async () => {
@@ -21928,5 +22071,107 @@ describe("B② large upload cross-file concurrency", () => {
     } finally {
       Platform.isMobile = previousMobile;
     }
+  });
+});
+
+describe("size exclusion baseline — skip rows are incremental", () => {
+  const makeSkippingScannerStub = () =>
+    ({
+      vault: {
+        adapter: makeMockAdapter(),
+        getFiles: vi.fn().mockReturnValue([]),
+        getName: vi.fn().mockReturnValue("testVault"),
+      },
+      scanAll: vi.fn().mockResolvedValue({
+        entries: [],
+        folders: [],
+        folderScanComplete: true,
+        skippedLarge: [],
+        failedPaths: [],
+        skippedCount: 0,
+      }),
+      scanFile: vi.fn().mockResolvedValue(null),
+      shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      getMaxFileSize: vi.fn().mockReturnValue(200 * 1024 * 1024),
+    }) as unknown as LocalScanner;
+
+  it("shows a skip row once, then stays quiet while the file stays excluded", async () => {
+    // 2026-09-16 拍板：稳定被排除文件不再每轮逐行重演——结算时基准成员
+    // 不发行行；轮末把本轮结算全集整体覆写进基准（镜像语义）。
+    const oversized: RemoteFileEntry = {
+      path: "video.mp4",
+      driveId: "item-video",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      size: 300 * 1024 * 1024,
+      mtime: 1,
+      eTag: "etag-video",
+      cTag: "ctag-video",
+    };
+    const mockState = makeActiveV2State([oversized], []);
+    const skipRows: string[] = [];
+    const executor = new SyncExecutor(
+      makeMockOneDrive({}),
+      makeSkippingScannerStub(),
+      mockState,
+      "testVault",
+    );
+
+    const first = await executor.run("manual", {
+      onFileComplete: (path, actionType) => {
+        if (
+          actionType === SyncActionType.SkipLargeFile
+          && path === "video.mp4"
+        ) skipRows.push(path);
+      },
+    });
+
+    expect(skipRows).toEqual(["video.mp4"]);
+    expect(first.skippedLarge).toBe(1);
+    expect(await mockState.getSizeExclusionBaseline()).toEqual(["video.mp4"]);
+
+    const second = await executor.run("manual", {
+      onFileComplete: (path, actionType) => {
+        if (
+          actionType === SyncActionType.SkipLargeFile
+          && path === "video.mp4"
+        ) skipRows.push(path);
+      },
+    });
+
+    expect(skipRows).toEqual(["video.mp4"]);
+    expect(second.skippedLarge).toBe(1);
+    expect(await mockState.getSizeExclusionBaseline()).toEqual(["video.mp4"]);
+  });
+
+  it("falls back to full visibility when one round exceeds the baseline capacity", async () => {
+    // 容量护栏：单轮 SkipLargeFile 项超过上限 → 该轮回退现役全量展示且
+    // 不覆写基准（可见性不丢，基准不截断）。
+    const many: RemoteFileEntry[] = Array.from({ length: 2001 }, (_, i) => ({
+      path: `video-${i}.mp4`,
+      driveId: `item-video-${i}`,
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      size: 300 * 1024 * 1024,
+      mtime: 1,
+      eTag: `etag-${i}`,
+      cTag: `ctag-${i}`,
+    }));
+    const mockState = makeActiveV2State(many, []);
+    const skipRows: string[] = [];
+    const executor = new SyncExecutor(
+      makeMockOneDrive({}),
+      makeSkippingScannerStub(),
+      mockState,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {
+      onFileComplete: (path, actionType) => {
+        if (actionType === SyncActionType.SkipLargeFile) skipRows.push(path);
+      },
+    });
+
+    expect(result.skippedLarge).toBe(2001);
+    expect(skipRows).toHaveLength(2001);
+    expect(await mockState.getSizeExclusionBaseline()).toEqual([]);
   });
 });

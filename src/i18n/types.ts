@@ -47,7 +47,6 @@ export interface LocaleStrings {
   "settings.account.desc.devicePending": string;
   "settings.account.pendingTitle": string;
   "settings.account.pendingMessage": string;
-  "settings.account.recheck": string;
   "settings.account.copyAuthLink": string;
   "settings.account.reopenAuth": string;
   "settings.account.cancelLogin": string;
@@ -197,6 +196,12 @@ export interface LocaleStrings {
   "settings.notificationPopups.hint.off": string;
   "settings.maxFileSize.name": string;
   "settings.maxFileSize.desc": string;
+  "settings.maxFileSize.descUnlimited": string;
+  "settings.maxFileSize.optionMb": string;
+  "settings.maxFileSize.optionUnlimited": string;
+  "settings.maxFileSize.optionCustom": string;
+  "settings.maxFileSize.customPlaceholder": string;
+  "settings.maxFileSize.invalidValue": string;
   "settings.reset.name": string;
   "settings.reset.desc": string;
   "settings.reset.button": string;
@@ -377,6 +382,7 @@ export interface LocaleStrings {
   "result.syncStateNotReady": string;
   "result.cloudRecordIncomplete": string;
   "result.skipped": string;
+  "result.skippedBySettings": string;
   "result.authExpired": string;
   "result.syncFailed": string;
   "result.alreadyRunning": string;
@@ -394,8 +400,7 @@ export interface LocaleStrings {
   "result.v2ScopeRecoveryEvidenceUnavailable": string;
   "result.v2ScopeRecoveryVerificationInterrupted": string;
   "result.v2ScopeRecoveryChanged": string;
-  "result.sharedControlReadUnavailable": string;
-  "result.ordinaryRemoteReadUnavailable": string;
+  "result.remoteReadUnavailable": string;
   "reason.remoteScopeRecreate": string;
   "result.communityPluginLocalIgnoreFailed": string;
   "notice.communityPlugins.loadFailed": string;
@@ -784,8 +789,6 @@ export interface LocaleStrings {
   "syncView.recovery.field.path": string;
   "syncView.recovery.field.reason": string;
   "syncView.recovery.field.retryAt": string;
-  "syncView.recovery.nextStep.checking": string;
-  "syncView.recovery.nextStep.waitingNetwork": string;
   "syncView.recovery.nextStep.review": string;
   "syncView.recovery.nextStep.blocked": string;
   "syncView.recovery.nextStep.accountChanged": string;
@@ -799,10 +802,7 @@ export interface LocaleStrings {
   "mutationRecovery.reason.automaticBudgetExhausted": string;
   "mutationRecovery.reason.unknown": string;
   "syncView.issues.title": string;
-  "syncView.issues.lastAttempt": string;
   "syncView.issues.openFile": string;
-  "syncView.issues.retry": string;
-  "syncView.issues.recheck": string;
   "syncView.collapseAll": string;
   "syncView.expandAll": string;
   "syncView.history.title": string;
@@ -812,6 +812,7 @@ export interface LocaleStrings {
   "syncView.history.empty": string;
   "syncView.history.noFileChanges": string;
   "syncView.history.omitted": string;
+  "syncView.history.skipGroupTitle": string;
   "syncView.history.status.success": string;
   "syncView.history.status.partial": string;
   "syncView.history.status.cancelled": string;

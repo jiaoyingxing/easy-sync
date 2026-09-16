@@ -10,8 +10,9 @@ import type { RangeWindow } from "../src/onedrive/download-range-policy";
  *  a controllable status, Content-Range header, chunk list, optional per-chunk
  *  timer delays, an optional hang after the chunks (stall), and a destroy()
  *  that rejects any pending body read (what a real socket teardown does).
- *  Retries always restart their whole window, so a retry spec must deliver
- *  the full window bytes again. */
+ *  Retries continue from the credited offset with a sub-range request, so a
+ *  retry spec must serve the REMAINING bytes with the sub-window's
+ *  Content-Range. */
 
 interface FakeResponseSpec {
   statusCode?: number;
@@ -206,12 +207,13 @@ describe("range stream downloader (C Node h1 载体)", () => {
 
   it("fails closed after repeated early-ending streams", async () => {
     const { https, requestCount } = makeFakeHttps([
-      // window A attempts 1-3: delivers 1 of 4 bytes then ends
+      // window A attempts 1-3: each delivers 1 byte from its sub-range
+      // (offsets 0/1/2) then ends early
       { chunks: [new Uint8Array([1])], contentRange: "bytes 0-3/8" },
       // window B completes on its single attempt
       { chunks: [new Uint8Array([5, 6, 7, 8])], contentRange: "bytes 4-7/8" },
-      { chunks: [new Uint8Array([1])], contentRange: "bytes 0-3/8" },
-      { chunks: [new Uint8Array([1])], contentRange: "bytes 0-3/8" },
+      { chunks: [new Uint8Array([2])], contentRange: "bytes 1-3/8" },
+      { chunks: [new Uint8Array([3])], contentRange: "bytes 2-3/8" },
     ]);
     const downloader = createRangeStreamDownloader(https as never)!;
 
@@ -226,14 +228,15 @@ describe("range stream downloader (C Node h1 载体)", () => {
     expect(requestCount()).toBe(4);
   });
 
-  it("retries a stalled stream on a fresh connection and completes", async () => {
+  it("retries a stalled stream from the credited offset with a sub-range", async () => {
     const { https, requestCount } = makeFakeHttps([
       // window A attempt 1: one chunk then the connection hangs
       { chunks: [new Uint8Array([1, 2])], contentRange: "bytes 0-3/8", hangNext: true },
       // window B attempt 1: completes normally
       { chunks: [new Uint8Array([5, 6, 7, 8])], contentRange: "bytes 4-7/8" },
-      // window A attempt 2: retries the WHOLE window and completes
-      { chunks: [new Uint8Array([1, 2]), new Uint8Array([3, 4])], contentRange: "bytes 0-3/8" },
+      // window A attempt 2: continues from the credited offset (bytes 2-3),
+      // delivering only the remaining bytes
+      { chunks: [new Uint8Array([3, 4])], contentRange: "bytes 2-3/8" },
     ]);
     const downloader = createRangeStreamDownloader(https as never)!;
 
@@ -243,6 +246,11 @@ describe("range stream downloader (C Node h1 载体)", () => {
 
     expect(new Uint8Array(buffer)).toEqual(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
     expect(requestCount()).toBe(3);
+    // The retry request carries the sub-range, not the whole window again.
+    const retryOptions = https.request.mock.calls[2][1] as {
+      headers: { Range: string };
+    };
+    expect(retryOptions.headers.Range).toBe("bytes=2-3");
   });
 
   it("reconnects when the sustained rate is below the slow-connection line", async () => {
@@ -256,8 +264,9 @@ describe("range stream downloader (C Node h1 载体)", () => {
       },
       // window B completes
       { chunks: [new Uint8Array([5, 6, 7, 8])], contentRange: "bytes 4-7/8" },
-      // window A attempt 2: healthy, full window
-      { chunks: [new Uint8Array([1, 2]), new Uint8Array([3, 4])], contentRange: "bytes 0-3/8" },
+      // window A attempt 2: healthy sub-range continuing from the credited
+      // offset (bytes 2-3)
+      { chunks: [new Uint8Array([3]), new Uint8Array([4])], contentRange: "bytes 2-3/8" },
     ]);
     const downloader = createRangeStreamDownloader(https as never)!;
 

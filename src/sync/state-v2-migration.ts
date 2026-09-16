@@ -1033,6 +1033,39 @@ export function sameStateV2MigrationCandidate(
 }
 
 /**
+ * Diagnostic companion to sameStateV2MigrationCandidate: reports which
+ * normalized section of a previously published hold candidate differs from
+ * the freshly built one. It reuses the commit gate's exact normalization, so
+ * the field report can never disagree with the reuse decision.
+ */
+export function describeStateV2MigrationCandidateDriftV1(
+  committed: SyncStateEnvelopeV2,
+  candidate: SyncStateEnvelopeV2,
+): {
+  sameScope: boolean;
+  sameRemoteIndex: boolean;
+  sameAnchors: boolean;
+  sameFolderAnchors: boolean;
+} {
+  const left = normalizeMigrationEnvelope(committed, false) as Record<
+    string,
+    unknown
+  >;
+  const right = normalizeMigrationEnvelope(candidate, false) as Record<
+    string,
+    unknown
+  >;
+  const sameSection = (section: string): boolean =>
+    JSON.stringify(left[section]) === JSON.stringify(right[section]);
+  return {
+    sameScope: sameSection("scope"),
+    sameRemoteIndex: sameSection("remoteIndex"),
+    sameAnchors: sameSection("anchors"),
+    sameFolderAnchors: sameSection("folderAnchors"),
+  };
+}
+
+/**
  * Proves that a post-cutover V2 envelope differs from the reviewed migration
  * candidate only by the normal remote-index cursor publication.
  *

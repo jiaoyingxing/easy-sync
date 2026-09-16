@@ -876,12 +876,6 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
   text-align: right;
 }
 
-.easy-sync-item-time {
-  margin-top: var(--size-2-1);
-  color: var(--text-muted);
-  font-size: var(--font-ui-smaller);
-}
-
 .easy-sync-primary-actions {
   margin-top: 2px;
 }
@@ -1222,6 +1216,22 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
 
 .easy-sync-history-status {
   flex: 0 0 auto;
+  font-size: var(--font-ui-smaller);
+}
+
+/* 增量跳过折叠组（2026-09-16 方案单 §十二）：与历史条目同族的原生
+   details 折叠；组标题承载性质，组内行只留图标+路径。 */
+.easy-sync-history-skip-group {
+  border: 0;
+  margin-top: 2px;
+}
+
+.easy-sync-history-skip-summary {
+  padding: 2px 4px;
+  color: var(--text-muted);
+}
+
+.easy-sync-history-skip-title {
   font-size: var(--font-ui-smaller);
 }
 

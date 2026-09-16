@@ -48,6 +48,7 @@ import {
   planDigest,
   sameCanonicalPlanIdentityV2,
   sameSyncScope,
+  type CanonicalPlanIdentityV2,
 } from "./types";
 import type {
   OneDriveClient,
@@ -62,6 +63,7 @@ import {
   protectEasySyncSelfSyncPlan,
   remoteContentMatchesBase,
 } from "./file-decision-planner-v2";
+import { MAX_SIZE_EXCLUSION_BASELINE_PATHS } from "./skip-baseline";
 import { StateManager } from "./state-manager";
 import type {
   MutationCheckpointCommitMetrics,
@@ -212,6 +214,7 @@ import {
 import {
   buildStateV2MigrationCandidate,
   sameStateV2MigrationCandidate,
+  describeStateV2MigrationCandidateDriftV1,
   sameStateV2MigrationResumeFacts,
 } from "./state-v2-migration";
 import {
@@ -471,6 +474,69 @@ export function classifyRetryableObservationResult(
 }
 
 /**
+ * Diagnostic facts for a migration review whose freshly built candidate no
+ * longer matches the previously published hold. Section booleans reuse the
+ * commit gate's normalization (describeStateV2MigrationCandidateDriftV1), so
+ * field reports can distinguish "verification still converging" (anchor
+ * counts growing, remote index stable) from observation or local-scan drift.
+ */
+function describeStateV2MigrationReviewDriftFacts(
+  nextCandidate: SyncStateEnvelopeV2,
+  previousHold: MigrationHoldV2 | null,
+  nextPlanIdentity: CanonicalPlanIdentityV2,
+): {
+  previousHold: {
+    phase: string;
+    revision: number;
+    remoteItems: number;
+    anchors: number;
+    folderAnchors: number;
+  } | null;
+  nextCandidate: {
+    remoteItems: number;
+    anchors: number;
+    folderAnchors: number;
+  };
+  drift: {
+    sameScope: boolean;
+    sameRemoteIndex: boolean;
+    sameAnchors: boolean;
+    sameFolderAnchors: boolean;
+  } | null;
+  planIdentityUnchanged: boolean | null;
+} {
+  const sectionCounts = (envelope: SyncStateEnvelopeV2) => ({
+    remoteItems: Object.keys(envelope.remoteIndex.itemsById).length,
+    anchors: Object.keys(envelope.anchors.byAnchorId).length,
+    folderAnchors: envelope.folderAnchors
+      ? Object.keys(envelope.folderAnchors.byAnchorId).length
+      : 0,
+  });
+  return {
+    previousHold: previousHold
+      ? {
+          phase: previousHold.phase,
+          revision: previousHold.revision,
+          ...sectionCounts(previousHold.candidate),
+        }
+      : null,
+    nextCandidate: sectionCounts(nextCandidate),
+    drift: previousHold
+      ? describeStateV2MigrationCandidateDriftV1(
+          previousHold.candidate,
+          nextCandidate,
+        )
+      : null,
+    planIdentityUnchanged: previousHold
+      ? sameCanonicalPlanIdentityV2(
+          nextPlanIdentity,
+          previousHold.canonicalIdentity,
+        )
+      : null,
+  };
+}
+
+/**
  * A retryable-observation disposition must pair its code with a matching
  * component: the shared-control read is owned by a protocol component
  * (directory/v2/v3), while an ordinary remote read has no protocol owner.
@@ -615,7 +681,10 @@ type ExactEmptyRemoteFolderInspection =
   | { status: "not-empty" }
   | { status: "changed" };
 
-const MOBILE_STREAM_DOWNLOAD_MIN_BYTES = 8 * 1024 * 1024;
+/** 甲路续传 (2026-09-16): lowered from 8 MiB so 2–8 MiB files (the slow-link
+ *  evidence class: 2.6–5 MB recordings) stream into the .part carrier, where
+ *  reconnects resume from the received prefix instead of losing every byte. */
+const MOBILE_STREAM_DOWNLOAD_MIN_BYTES = 2 * 1024 * 1024;
 const COMMUNITY_PLUGIN_MANIFEST_PREFLIGHT_CONCURRENCY = 3;
 const DESKTOP_RECONSTRUCTION_BATCH_FILES = 4;
 const MOBILE_RECONSTRUCTION_BATCH_FILES = 2;
@@ -4451,6 +4520,7 @@ export class SyncExecutor {
         localFolders: scan.folders,
         localFolderScanComplete: scan.folderScanComplete,
         skippedLarge: scan.skippedLarge,
+        maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
         localMoveHints: this.state.localFolderMoveHints,
         includeFilePath: scope.includeFilePath,
         includeFolderPath: scope.includeFolderPath,
@@ -6027,13 +6097,16 @@ export class SyncExecutor {
 
   /**
    * Dedicated cloud cleanup transaction for a community plugin this device
-   * has exited. Enumerates the committed remote index, deletes each managed
-   * bundle object with If-Match and verifies absence by read-back. Re-entrant
-   * by construction; never touches ordinary sync planning or the generic
-   * delete paths (Q3: the dedicated cleanup口子 is the only consumer).
+   * has exited. Plans ONLY from the caller's fresh catalog evidence — the
+   * committed snapshot's identities can be stale, and planning from them
+   * once produced a silent no-op "success" (2026-09-15: identities checked
+   * by id alone, deleted=0 reported as completed). Never touches ordinary
+   * sync planning or the generic delete paths (Q3: the dedicated cleanup口子
+   * is the only consumer).
    */
   async runCommunityPluginCloudCleanup(
     pluginId: string,
+    evidence: Readonly<{ entries: readonly RemoteFileEntry[] }>,
   ): Promise<CommunityPluginCloudCleanupResultV1> {
     const scope = this.activeSyncScope ?? this.state.remoteScope;
     if (!scope) {
@@ -6042,21 +6115,59 @@ export class SyncExecutor {
     const plan = planCommunityPluginCloudCleanupV1({
       pluginId,
       configDir: getConfigDir(this.scanner.vault),
-      remoteEntries: this.state.remoteSnapshot,
+      remoteEntries: evidence.entries,
     });
+    this.diag?.log(
+      "execute",
+      "community plugin cloud cleanup planned from fresh catalog evidence",
+      {
+        schemaVersion: 1,
+        pluginId,
+        evidenceEntries: evidence.entries.length,
+        plannedPaths: plan.objects.map((object) => object.path),
+      },
+    );
     if (plan.objects.length === 0) {
       return { status: "completed", deleted: 0 };
     }
-    return executeCommunityPluginCloudCleanupV1({
+    const result = await executeCommunityPluginCloudCleanupV1({
       plan,
       transport: {
         vaultName: this.vaultName,
-        getDriveItemMetadataById: (id) =>
-          this.onedrive.getDriveItemMetadataById(id),
+        getFileMetadataByPath: async (path) => {
+          const metadata = await this.onedrive.getFileMetadata(
+            this.vaultName,
+            path,
+          );
+          return metadata
+            ? { remoteId: metadata.driveId, eTag: metadata.eTag }
+            : null;
+        },
         deleteItem: (vaultName, path, eTag, driveId) =>
           this.onedrive.deleteItem(vaultName, path, eTag, driveId),
       },
     });
+    if (result.status === "completed") {
+      this.diag?.log("execute", "community plugin cloud cleanup completed", {
+        schemaVersion: 1,
+        pluginId,
+        deleted: result.deleted,
+      });
+    } else {
+      this.diag?.warn(
+        "execute",
+        `community plugin cloud cleanup ${result.status}`,
+        {
+          schemaVersion: 1,
+          pluginId,
+          deleted: result.deleted,
+          reason: result.status === "blocked" ? result.reason : undefined,
+          path: result.path,
+          error: result.error,
+        },
+      );
+    }
+    return result;
   }
 
   private async removePathIfExists(path: string): Promise<void> {
@@ -7118,7 +7229,10 @@ export class SyncExecutor {
         if (typeof cloudBootstrapClient.readCloudBootstrapV2 === "function") {
           try {
             cloudBootstrapV2Json = (
-              await cloudBootstrapClient.readCloudBootstrapV2(this.vaultName)
+              await this.readCloudBootstrapV2WithRetry(
+                cloudBootstrapClient,
+                this.vaultName,
+              )
             )?.content ?? null;
           } catch (error) {
             this.diag?.warn(
@@ -7173,7 +7287,7 @@ export class SyncExecutor {
         }
         if (this.isRetryableOrdinaryRemoteReadFailure(error, result)) {
           result.errors = Math.max(1, result.errors);
-          result.message = this.t("result.ordinaryRemoteReadUnavailable");
+          result.message = this.t("result.remoteReadUnavailable");
           result.disposition = {
             kind: "retryable-observation",
             phase: "remotePrepare",
@@ -8063,6 +8177,7 @@ export class SyncExecutor {
           localFolders,
           localFolderScanComplete,
           skippedLarge,
+          maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
           localMoveHints: this.state.localFolderMoveHints,
           localFileMoveHints: this.state.localFileMoveHints,
           includeFilePath: includeCanonicalFilePath,
@@ -8079,6 +8194,7 @@ export class SyncExecutor {
           localFolders,
           localFolderScanComplete,
           skippedLarge,
+          maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
           localMoveHints: this.state.localFolderMoveHints,
           localFileMoveHints: this.state.localFileMoveHints,
           includeFilePath: includeCanonicalFilePath,
@@ -8210,6 +8326,7 @@ export class SyncExecutor {
                   localFolders,
                   localFolderScanComplete,
                   skippedLarge,
+                  maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
                   localMoveHints: this.state.localFolderMoveHints,
                   localFileMoveHints: this.state.localFileMoveHints,
                   includeFilePath: includeCanonicalFilePath,
@@ -8251,6 +8368,7 @@ export class SyncExecutor {
             localFolders,
             localFolderScanComplete,
             skippedLarge,
+            maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
             localMoveHints: this.state.localFolderMoveHints,
             localFileMoveHints: this.state.localFileMoveHints,
             includeFilePath: includeCanonicalFilePath,
@@ -8647,6 +8765,7 @@ export class SyncExecutor {
               localFolders,
               localFolderScanComplete,
               skippedLarge,
+              maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
               localMoveHints: this.state.localFolderMoveHints,
               localFileMoveHints: this.state.localFileMoveHints,
               includeFilePath: includeCanonicalFilePath,
@@ -8666,6 +8785,7 @@ export class SyncExecutor {
             localFolders,
             localFolderScanComplete,
             skippedLarge,
+            maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
             localMoveHints: this.state.localFolderMoveHints,
             localFileMoveHints: this.state.localFileMoveHints,
             includeFilePath: includeCanonicalFilePath,
@@ -9165,7 +9285,7 @@ export class SyncExecutor {
               );
             if (scopeFreeProtocol.status === "unavailable") {
               result.errors = 1;
-              result.message = this.t("result.sharedControlReadUnavailable");
+              result.message = this.t("result.remoteReadUnavailable");
               this.diag?.warn(
                 "state",
                 "reviewed cross-scope cloud join retained its authorization because the shared protocol is temporarily unavailable",
@@ -9228,7 +9348,7 @@ export class SyncExecutor {
               await this.observeSharedSyncProtocolObjects();
             if (protocolObservation.status === "unavailable") {
               result.errors = 1;
-              result.message = this.t("result.sharedControlReadUnavailable");
+              result.message = this.t("result.remoteReadUnavailable");
               this.diag?.warn(
                 "state",
                 "reviewed V2 activation retained its authorization because the shared protocol is temporarily unavailable",
@@ -9291,7 +9411,7 @@ export class SyncExecutor {
             );
             if (protocol.status === "unavailable") {
               result.errors = 1;
-              result.message = this.t("result.sharedControlReadUnavailable");
+              result.message = this.t("result.remoteReadUnavailable");
               this.diag?.warn(
                 "state",
                 "reviewed V2 activation retained its authorization because post-write protocol observation is temporarily unavailable",
@@ -9317,7 +9437,7 @@ export class SyncExecutor {
               );
             if (scopeFreeProtocol.status === "unavailable") {
               result.errors = 1;
-              result.message = this.t("result.sharedControlReadUnavailable");
+              result.message = this.t("result.remoteReadUnavailable");
               this.diag?.warn(
                 "state",
                 "reviewed V2 activation retained its authorization because scope-free protocol observation is temporarily unavailable",
@@ -9460,6 +9580,11 @@ export class SyncExecutor {
                 phase: "activation",
                 planItems: plan.items.length,
                 mutations: 0,
+                ...describeStateV2MigrationReviewDriftFacts(
+                  migrationCandidateEnvelope,
+                  existingConfirmed,
+                  plan.canonicalIdentity,
+                ),
               },
             );
             const publishPreview =
@@ -9470,6 +9595,7 @@ export class SyncExecutor {
             return this.markPlanReviewPaused(result);
           }
         } else {
+          const previousHold = this.state.activeV2MigrationHold;
           const hold = await this.state.stageV2MigrationHold({
             candidate: migrationCandidateEnvelope,
             source: public113MigrationInput!,
@@ -9484,6 +9610,11 @@ export class SyncExecutor {
               holdRevision: hold.revision,
               planItems: plan.items.length,
               mutations: 0,
+              ...describeStateV2MigrationReviewDriftFacts(
+                migrationCandidateEnvelope,
+                previousHold,
+                plan.canonicalIdentity,
+              ),
             },
           );
           const publishPreview =
@@ -10150,8 +10281,8 @@ export class SyncExecutor {
       result.runFacts!.convergences = this.convergencesThisRound || undefined;
       // Preserve message set by executePlan (e.g. auth expired, cancelled)
       if (!result.message) {
-        const skipped = result.skippedLarge + result.skippedIgnored
-          + result.skippedInvalidName;
+        const expectedSkips = result.skippedLarge + result.skippedIgnored;
+        const skipped = expectedSkips + result.skippedInvalidName;
         const resultKey = result.errors > 0
           ? "result.partial"
           : result.conflicts > 0
@@ -10159,7 +10290,9 @@ export class SyncExecutor {
             : result.deferred > 0
               ? "result.deferred"
               : skipped > 0
-                ? "result.skipped"
+                ? result.skippedInvalidName > 0
+                  ? "result.skipped"
+                  : "result.skippedBySettings"
                 : "result.synced";
         result.message = this.t(resultKey, {
           uploaded: result.uploaded,
@@ -10498,6 +10631,16 @@ export class SyncExecutor {
     const pendingDeletes: SyncPlanItem[] = [];
     const pendingIssues: PendingIssue[] = [];
     const resolvedIssuePaths = new Set<string>();
+    // 增量跳过呈现（2026-09-16 方案单 §十二）：基准=上一完成轮的结算全集；
+    // 基准成员不再逐行重演，轮末把本轮结算全集整体覆写回去（镜像语义）。
+    // 单轮超容量的极端库回退现役全量展示（可见性不丢），且不覆写基准。
+    const skipBaseline = new Set(
+      this.state.getSizeExclusionBaseline?.() ?? [],
+    );
+    const settledSkipPaths = new Set<string>();
+    const skipDeltaDisabled = plan.items.filter(
+      (item) => item.type === SyncActionType.SkipLargeFile,
+    ).length > MAX_SIZE_EXCLUSION_BASELINE_PATHS;
     const remoteUpserts: RemoteFileEntry[] = [];
     const remoteDeletes: string[] = [];
     // P1-a: collect base entry updates for batch persistence after pools drain
@@ -10872,8 +11015,29 @@ export class SyncExecutor {
           callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize);
           return;
         }
-        if (item.type === SyncActionType.SkipLargeFile
-          || item.type === SyncActionType.SkipOneDriveInvalidName) {
+        if (item.type === SyncActionType.SkipLargeFile) {
+          // 2026-09-16 拍板：按设置跳过（大型文件）是预期行为、零行动，
+          // 不属于「需要处理」——不入待处理账本；记入已解决路径让轮末对账
+          // 退役既有跳过行。轮内可见性由完成列表/历史承接，细节面在诊断报告。
+          // 增量呈现（方案单 §十二）：基准成员不发行行——计数与对账不受
+          // 影响；新面孔照常发行，轮末结算全集覆写基准。
+          resolvedIssuePaths.add(item.path);
+          settledSkipPaths.add(item.path);
+          const reason = item.reason
+            ? this.t(item.reason)
+            : this.t("syncView.fileStatus.skip");
+          if (skipDeltaDisabled || !skipBaseline.has(item.path)) {
+            callbacks.onFileComplete?.(
+              item.path,
+              item.type,
+              true,
+              reason,
+              fileSize,
+            );
+          }
+          return;
+        }
+        if (item.type === SyncActionType.SkipOneDriveInvalidName) {
           const reason = item.reason
             ? this.t(item.reason)
             : this.t("syncView.fileStatus.skip");
@@ -11767,6 +11931,16 @@ export class SyncExecutor {
     }
     if (!this.canContinue(operationEpoch, result)) return;
     await this.state.reconcilePendingIssues(pendingIssues, resolvedIssuePaths);
+    // 镜像覆写：基准=本轮结算全集（文件改名/回线/删除自动掉出）。失败轮
+    // 走不到这里，基准保留；取消/鉴权过期同样跳过覆写，下轮自愈。
+    if (!skipDeltaDisabled && this.canContinue(operationEpoch, result)) {
+      await this.state.commitSizeExclusionBaseline?.([...settledSkipPaths]);
+    }
+    // 附带修正：skippedLarge 此前只来自扫描层，下载方向 gated 跳过不计入
+    // 总数；结算全集（扫描层+gated 的去重并集）才是真实跳过总量。
+    if (settledSkipPaths.size > result.skippedLarge) {
+      result.skippedLarge = settledSkipPaths.size;
+    }
     this.diag?.log(
       "execute",
       `upload summary — files=${result.uploaded}, bytes=${metrics.uploadBytes}, peak=${metrics.peakUploads}/${(Platform.isMobile ? 2 : 4) + largeUploadConcurrency(Platform.isMobile)}, readMs=${metrics.uploadReadMs}, networkMs=${metrics.uploadNetworkMs}, elapsedMs=${Date.now() - startedAt}`,
@@ -16876,6 +17050,46 @@ export class SyncExecutor {
     });
   }
 
+  /**
+   * Cloud bootstrap read with the same weak-network treatment as the legacy
+   * baseline download (3 attempts, exponential backoff, clean NotFound).
+   * Retry progress logs at info; the final failure is rethrown so the
+   * caller's existing warn keeps its observable receipt before the legacy
+   * fallback decision.
+   */
+  private async readCloudBootstrapV2WithRetry(
+    client: OneDriveClient & {
+      readCloudBootstrapV2: OneDriveClient["readCloudBootstrapV2"];
+    },
+    vaultName: string,
+  ): Promise<{ id: string; eTag: string; content: string } | null> {
+    const maxAttempts = 3;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        return await client.readCloudBootstrapV2(vaultName);
+      } catch (error) {
+        if (
+          error instanceof OneDriveError
+          && error.type === OneDriveErrorType.NotFound
+        ) {
+          this.diag?.log("state", "no cloud bootstrap v2 document");
+          return null;
+        }
+        const isLast = attempt === maxAttempts - 1;
+        if (isLast) throw error;
+        const waitMs = 500 * (2 ** attempt);
+        this.diag?.log(
+          "state",
+          `cloud bootstrap v2 read failed (attempt ${attempt + 1}), retrying in ${waitMs}ms`,
+          error instanceof Error ? error.message : String(error),
+        );
+        await new Promise<void>((resolve) =>
+          compatSetTimeout(() => resolve(), waitMs));
+      }
+    }
+    return null;
+  }
+
   private async downloadLegacyCloudBaseline(): Promise<string | null> {
     const maxAttempts = 3;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -17477,6 +17691,7 @@ export class SyncExecutor {
       localFolders: scan.folders ?? [],
       localFolderScanComplete: true,
       skippedLarge: scan.skippedLarge,
+      maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
       localMoveHints: [],
       includeFilePath: (path) =>
         this.shouldIncludeRemotePath(path)
@@ -17855,7 +18070,7 @@ export class SyncExecutor {
       return result;
     }
     result.errors = Math.max(1, result.errors);
-    result.message = this.t("result.sharedControlReadUnavailable");
+    result.message = this.t("result.remoteReadUnavailable");
     result.disposition = {
       kind: "retryable-observation",
       phase: "remotePrepare",
@@ -18605,7 +18820,7 @@ export class SyncExecutor {
     );
     if (protocol.status === "unavailable") {
       result.errors = 1;
-      result.message = this.t("result.sharedControlReadUnavailable");
+      result.message = this.t("result.remoteReadUnavailable");
       this.diag?.warn(
         "state",
         "remote scope recovery retained its hold because the shared protocol is temporarily unavailable",
@@ -19052,6 +19267,7 @@ export class SyncExecutor {
       localFolders: scan.folders ?? [],
       localFolderScanComplete: true,
       skippedLarge: scan.skippedLarge,
+      maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
       localMoveHints: [],
       includeFilePath: (path) =>
         this.shouldIncludeRemotePath(path)
@@ -21043,18 +21259,20 @@ export class SyncExecutor {
     succeeded: boolean,
     completion?: Pick<FileProgress, "status" | "reason">,
   ): void {
+    const status = succeeded && completion?.status
+      ? completion.status
+      : succeeded
+      ? actionType === SyncActionType.ConfirmLocalDelete
+        ? "delete"
+        : SyncProgressStore.actionToStatus(actionType)
+      : "error";
     this.progressStore?.completeCurrentItem();
     this.progressStore?.addCompletedFile({
       path,
-      status: succeeded && completion?.status
-        ? completion.status
-        : succeeded
-        ? actionType === SyncActionType.ConfirmLocalDelete
-          ? "delete"
-          : SyncProgressStore.actionToStatus(actionType)
-        : "error",
+      status,
       actionType,
       reason: succeeded ? completion?.reason : undefined,
+      failedAt: status === "error" ? Date.now() : undefined,
     });
     this.sideActionBatchSettled++;
     this.onProgressUpdate?.();

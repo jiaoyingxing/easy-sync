@@ -91,7 +91,10 @@ export interface MutationRecoveryBodyPresentation {
   path: string | null;
   reason: string | null;
   retryAt: string | null;
-  nextStep: string;
+  /** Null for automatic states (checking / waiting-network): their summaries
+   *  already state the auto-continue outcome, and a next-step line would only
+   *  repeat it (2026-09-15 copy-reduction round R-4). */
+  nextStep: string | null;
   actionKey: keyof LocaleStrings | null;
 }
 
@@ -130,7 +133,7 @@ export function mutationRecoveryBodyPresentation(
       path: state.firstPath,
       reason: null,
       retryAt: null,
-      nextStep: t("syncView.recovery.nextStep.checking"),
+      nextStep: null,
       actionKey: mutationRecoveryPrimaryActionKey(state),
     };
   }
@@ -140,7 +143,7 @@ export function mutationRecoveryBodyPresentation(
       path: state.firstPath,
       reason: null,
       retryAt: state.retryAt === null ? null : formatTime(state.retryAt),
-      nextStep: t("syncView.recovery.nextStep.waitingNetwork"),
+      nextStep: null,
       actionKey: null,
     };
   }

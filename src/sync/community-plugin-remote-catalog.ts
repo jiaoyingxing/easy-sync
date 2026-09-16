@@ -347,6 +347,16 @@ export function remoteCommunityPluginCatalogEntries(
   ).sort((left, right) => compareText(left.path, right.path));
 }
 
+/** One plugin's managed members as sync evidence entries — the deletion
+ *  authorization input for that plugin's cloud cleanup transaction. */
+export function remoteCommunityPluginCatalogEntryEntries(
+  entry: Readonly<RemoteCommunityPluginCatalogEntryV1>,
+): RemoteFileEntry[] {
+  return entry.members.map(toRemoteFileEntry).sort((left, right) =>
+    compareText(left.path, right.path)
+  );
+}
+
 /**
  * Merge a freshly built catalog over the previously trusted one so entries
  * never regress. The committed-index build only sees folders this device

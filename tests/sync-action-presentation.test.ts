@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { I18n } from "../src/i18n";
 import {
@@ -179,5 +180,24 @@ describe("sync action presentation", () => {
       .toBe("本轮有 3 项未同步，请查看详情");
     expect(en.t("result.skipped", { skipped: 3 }))
       .toBe("3 item(s) were not synced. See details.");
+    // 2026-09-16 拍板：按设置跳过（大型文件/已忽略路径）零行动，
+    // 轮结果消息用中性口径；报警口径仅留给含待处理行的 invalid-name。
+    expect(zh.t("result.skippedBySettings", { skipped: 108 }))
+      .toBe("同步完成（108 项按设置跳过）");
+    expect(en.t("result.skippedBySettings", { skipped: 108 }))
+      .toBe("Sync complete (108 skipped per your settings).");
+    // 折叠组标题：性质词用设置名「大型文件排除」，徽标措辞候选另评。
+    expect(zh.t("syncView.history.skipGroupTitle", { count: 3 }))
+      .toBe("大型文件排除 3 个");
+    expect(en.t("syncView.history.skipGroupTitle", { count: 3 }))
+      .toBe("3 excluded by size limit");
+  });
+
+  it("keeps the executor round-message split between expected skips and pending rows", () => {
+    const source = readFileSync("src/sync/sync-executor.ts", "utf8");
+    const at = source.indexOf('"result.skippedBySettings"');
+    expect(at).toBeGreaterThan(-1);
+    const window = source.slice(at - 200, at + 80);
+    expect(window).toContain("skippedInvalidName > 0");
   });
 });

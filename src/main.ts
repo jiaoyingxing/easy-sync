@@ -8,8 +8,12 @@ import {
   isUpdateCheckDue,
   isNewerVersion,
   isUpdateReminderSuppressed,
+  loadUpdateCheckState,
+  saveUpdateCheckState,
+  seedUpdateCheckStateFromLegacyPluginData,
   SNOOZE_DURATION_MS,
   UPDATE_CHECK_INTERVAL_MS,
+  type UpdateCheckStorage,
   type UpdateReminderSnooze,
 } from "./update-check";
 import { AuthModule, type AuthPluginContext } from "./auth/auth-module";
@@ -105,8 +109,14 @@ import type {
   ManualMutationResolutionChoiceV1,
   ManualMutationResolutionSnapshotV1,
   PlanReviewAuthorization,
+  RemoteFileEntry,
   ScanConfig,
   SyncPlan,
+} from "./sync/types";
+import {
+  DEFAULT_MAX_FILE_SIZE_MB,
+  normalizeMaxFileSizeMb,
+  UNLIMITED_MAX_FILE_SIZE_MB,
 } from "./sync/types";
 import {
   sameCanonicalPlanIdentityV2,
@@ -152,6 +162,7 @@ import {
 import { sha256Hex } from "./crypto";
 import {
   buildConflictEvidence,
+  computeChangedPluginDataKeys,
   findLatestAutomaticHandlingSummary,
   findLatestNetworkSummary,
   findLatestPhaseSummary,
@@ -159,8 +170,10 @@ import {
   findLatestTransferSummary,
   fingerprintOpaqueValue,
   formatDiagnosticAutomaticSyncSummary,
+  formatRecentPluginDataWrites,
   formatV2StorageAuthorityEvidence,
   projectSyncHistoryActionCounts,
+  RecentPluginDataWriteLog,
   summarizeCommunityPluginSync,
   summarizeMutationRecovery,
 } from "./sync/diagnostic-report-evidence";
@@ -215,6 +228,7 @@ import {
   markRemoteCommunityPluginCatalogStale,
   mergeRemoteCommunityPluginCatalogKeepingSuperset,
   remoteCommunityPluginCatalogEntries,
+  remoteCommunityPluginCatalogEntryEntries,
   shouldMarkCommunityPluginCatalogStale,
   type RemoteCommunityPluginCatalogV1,
 } from "./sync/community-plugin-remote-catalog";
@@ -248,6 +262,7 @@ import {
 import {
   COMMUNITY_PLUGIN_CLOUD_CLEANUP_MARKER_KEY,
   normalizeCommunityPluginCloudCleanupMarkersV1,
+  planCommunityPluginCloudCleanupIndexReappearanceV1,
   planCommunityPluginCloudCleanupMarkerSweepV1,
 } from "./sync/community-plugin-cloud-cleanup-v1";
 import { StartupPerformanceTracker } from "./startup-performance";
@@ -260,9 +275,6 @@ const KEY_AUTO_SYNC_RESTORE_CHANGE_DELAY_SECONDS =
   "auto-sync-restore-change-delay-seconds";
 const KEY_SYNC_PLUGIN_FILES = "sync-plugin-files";
 const KEY_MAX_FILE_SIZE_MB = "sync-max-file-size-mb";
-const KEY_UPDATE_LAST_CHECK_AT = "update-last-check-at";
-const KEY_UPDATE_LAST_KNOWN_LATEST = "update-last-known-latest";
-const KEY_UPDATE_SNOOZE = "update-reminder-snooze";
 const KEY_DIAG_LOG = "sync-diagnostic-logging";
 const KEY_SYNC_EDITOR = "sync-editor";
 const KEY_SYNC_APPEARANCE = "sync-appearance";
@@ -601,6 +613,10 @@ export default class EasySyncPlugin extends Plugin {
   // StateManager.save() / saveSyncSettings() / auth profile writes
   // from racing on loadData → modify → saveData cycles.
   private pluginDataQueue: Promise<void> = Promise.resolve();
+  /** Forensic record of recent committed plugin data writes (key names only).
+   *  Surfaced in the diagnostic report so a mid-activation migration-input
+   *  digest drift can be attributed on the device itself (issue #18). */
+  private readonly pluginDataWriteLog = new RecentPluginDataWriteLog();
   private pluginDataCache: Record<string, unknown> | null | undefined;
   private pluginDataLoadPromise: Promise<Record<string, unknown> | null> | null = null;
 
@@ -611,7 +627,7 @@ export default class EasySyncPlugin extends Plugin {
   autoSyncRestoreInterval = DEFAULT_AUTO_SYNC_INTERVAL_MINUTES;
   autoSyncRestoreChangeDelaySeconds = DEFAULT_AUTO_SYNC_CHANGE_DELAY_SECONDS;
   syncPluginFiles = false; // M19: EasySync self-sync default OFF — explicit opt-in
-  syncMaxFileSizeMb = 500;
+  syncMaxFileSizeMb = DEFAULT_MAX_FILE_SIZE_MB;
   automaticHandlingPolicy: AutomaticHandlingPolicy = {
     ...DEFAULT_AUTOMATIC_HANDLING_POLICY,
   };
@@ -932,6 +948,10 @@ export default class EasySyncPlugin extends Plugin {
     this.scanner = new LocalScanner(this.app.vault, undefined, this.manifest.id);
     this.scanner.setDiag(this.diag);
     this.applySyncPathSettings(); // Apply saved path settings after scanner is created
+    // loadSyncSettings() runs before the scanner exists, so its applyMaxFileSize()
+    // call is a silent no-op — this is the only restore point that reaches the
+    // scanner; without it every reload quietly reverts the threshold to default.
+    this.applyMaxFileSize();
     this.onedrive = new OneDriveClient(
       () => this.auth!.getAccessToken(),
       this.diag,
@@ -1162,15 +1182,18 @@ export default class EasySyncPlugin extends Plugin {
       version: latest,
       until: choice === "snooze" ? Date.now() + SNOOZE_DURATION_MS : null,
     };
-    void this.updatePluginData((data) => {
-      data[KEY_UPDATE_SNOOZE] = { ...this.updateSnooze };
+    saveUpdateCheckState(this.updateDeviceStorage(), {
+      snooze: { ...this.updateSnooze },
     });
     this.syncView?.render();
   }
 
   /** Startup-tail + 24h-cycle check. lastKnownLatest persists the prompt
    *  across restarts even when the throttle skips the network call; a failed
-   *  check leaves lastCheckAt untouched so the next cycle retries. */
+   *  check leaves lastCheckAt untouched so the next cycle retries. Bookkeeping
+   *  persists via the official App localStorage API (not the plugin data file)
+   *  so a routine write can never drift a V2 migration input digest
+   *  mid-activation (issue #18). */
   private runUpdateCheckFlow(): void {
     void (async () => {
       const now = Date.now();
@@ -1181,9 +1204,9 @@ export default class EasySyncPlugin extends Plugin {
         if (latest !== null) {
           this.updateLastKnownLatest = latest;
           this.updateLastCheckAt = now;
-          void this.updatePluginData((data) => {
-            data[KEY_UPDATE_LAST_CHECK_AT] = now;
-            data[KEY_UPDATE_LAST_KNOWN_LATEST] = latest;
+          saveUpdateCheckState(this.updateDeviceStorage(), {
+            lastCheckAt: now,
+            lastKnownLatest: latest,
           });
           this.diag.log("lifecycle", "update check found release", {
             latest,
@@ -1196,6 +1219,26 @@ export default class EasySyncPlugin extends Plugin {
       this.syncView?.render();
       this.scheduleNextUpdateCheck();
     })().catch(() => undefined);
+  }
+
+  /** Vault-scoped device storage for the update-reminder bookkeeping via the
+   *  official App localStorage API — never the synced plugin data file, whose
+   *  whole content is bound into the V2 migration input digest. Hosts without
+   *  the API (bare test harnesses) keep the state in memory only. */
+  private updateDeviceStorage(): UpdateCheckStorage | null {
+    if (
+      typeof this.app.loadLocalStorage !== "function"
+      || typeof this.app.saveLocalStorage !== "function"
+    ) {
+      return null;
+    }
+    return {
+      getItem: (key) => {
+        const value = this.app.loadLocalStorage(key) as unknown;
+        return typeof value === "string" ? value : null;
+      },
+      setItem: (key, value) => this.app.saveLocalStorage(key, value),
+    };
   }
 
   private scheduleNextUpdateCheck(): void {
@@ -3033,25 +3076,33 @@ export default class EasySyncPlugin extends Plugin {
       failed: NOTICE_PRIORITY.failure,
       authExpired: NOTICE_PRIORITY.critical,
     };
-    this.noticeCenter.show({
-      key: `sync-result:${outcome.kind}`,
-      message: outcome.message ?? this.i18n.t(
-        messageKeys[outcome.kind],
-        {
-          count: outcome.count,
-          remoteDeletes: outcome.remoteDeletes ?? 0,
-        },
-      ),
-      priority: priorities[outcome.kind],
-      durationMs: SYNC_RESULT_NOTICE_DURATION_MS,
-      className: "easy-sync-notice-result",
-      category: outcome.kind === "authExpired" ? "safety" : "ambient",
-    });
-
     // Direction 3 (user decision 2026-09-02): automatic sync proceeds when
     // the threshold gate would otherwise pause a large plan; show the
     // one-line summary instead of the durable review flow.
-    if (result.runFacts?.thresholdSkippedInAuto === true) {
+    // 2026-09-15 copy-reduction round R-7: when the run completed, the summary
+    // alone replaces the completed notice — the previous double-show made the
+    // completed notice flash and get replaced downstream. Non-completed
+    // outcomes keep both notices (the outcome carries the real news).
+    const thresholdSkippedInAuto =
+      result.runFacts?.thresholdSkippedInAuto === true;
+    if (!thresholdSkippedInAuto || outcome.kind !== "completed") {
+      this.noticeCenter.show({
+        key: `sync-result:${outcome.kind}`,
+        message: outcome.message ?? this.i18n.t(
+          messageKeys[outcome.kind],
+          {
+            count: outcome.count,
+            remoteDeletes: outcome.remoteDeletes ?? 0,
+          },
+        ),
+        priority: priorities[outcome.kind],
+        durationMs: SYNC_RESULT_NOTICE_DURATION_MS,
+        className: "easy-sync-notice-result",
+        category: outcome.kind === "authExpired" ? "safety" : "ambient",
+      });
+    }
+
+    if (thresholdSkippedInAuto) {
       this.noticeCenter.show({
         key: "sync-result:threshold-skipped-auto",
         message: this.i18n.t("notice.sync.thresholdSkippedInAuto"),
@@ -3102,6 +3153,7 @@ export default class EasySyncPlugin extends Plugin {
       actionType,
       reason,
       fileSize,
+      failedAt: status === "error" ? Date.now() : undefined,
     });
     this.scheduleSyncNoticeUpdate();
     // Surface the completed row immediately: the next onProgress only fires
@@ -5357,20 +5409,17 @@ export default class EasySyncPlugin extends Plugin {
         getConfigDir(this.app.vault),
       );
       if (typeof data[KEY_AUTO_SYNC_PAUSED] === "boolean") this.autoSyncPaused = data[KEY_AUTO_SYNC_PAUSED];
-      if (typeof data[KEY_MAX_FILE_SIZE_MB] === "number") this.syncMaxFileSizeMb = data[KEY_MAX_FILE_SIZE_MB];
-      if (typeof data[KEY_UPDATE_LAST_CHECK_AT] === "number") this.updateLastCheckAt = data[KEY_UPDATE_LAST_CHECK_AT];
-      if (typeof data[KEY_UPDATE_LAST_KNOWN_LATEST] === "string") this.updateLastKnownLatest = data[KEY_UPDATE_LAST_KNOWN_LATEST];
-      const storedUpdateSnooze = data[KEY_UPDATE_SNOOZE];
-      if (
-        isRecord(storedUpdateSnooze)
-        && typeof storedUpdateSnooze.version === "string"
-      ) {
-        this.updateSnooze = {
-          version: storedUpdateSnooze.version,
-          until: typeof storedUpdateSnooze.until === "number"
-            ? storedUpdateSnooze.until
-            : null,
-        };
+      this.syncMaxFileSizeMb = normalizeMaxFileSizeMb(data[KEY_MAX_FILE_SIZE_MB]);
+      const deviceUpdateState = loadUpdateCheckState(this.updateDeviceStorage());
+      const legacyUpdateState = seedUpdateCheckStateFromLegacyPluginData(data);
+      this.updateLastCheckAt = deviceUpdateState.lastCheckAt
+        ?? legacyUpdateState.lastCheckAt;
+      this.updateLastKnownLatest = deviceUpdateState.lastKnownLatest
+        ?? legacyUpdateState.lastKnownLatest;
+      const storedUpdateSnooze = deviceUpdateState.snooze
+        ?? legacyUpdateState.snooze;
+      if (storedUpdateSnooze) {
+        this.updateSnooze = storedUpdateSnooze;
       }
       this.automaticHandlingPolicy = readAutomaticHandlingPolicy(
         data[KEY_AUTOMATIC_HANDLING_POLICY],
@@ -5415,6 +5464,10 @@ export default class EasySyncPlugin extends Plugin {
         }
         const publishStartedAt = diagnosticsEnabled ? performance.now() : 0;
         this.pluginDataCache = data;
+        this.pluginDataWriteLog.record(
+          Date.now(),
+          computeChangedPluginDataKeys(committed ?? {}, data),
+        );
         if (diagnosticsEnabled) publishMs = performance.now() - publishStartedAt;
         success = true;
       } finally {
@@ -5767,10 +5820,13 @@ export default class EasySyncPlugin extends Plugin {
    * Dedicated cloud cleanup for a community plugin this device no longer
    * holds locally. Gated on the device-local participation phase: active
    * joins/restores/participations, in-flight exits and blocked restores
-   * never enter the transaction. The executor transaction performs the
-   * conditional deletes. Records the cleanup marker that keeps the row
-   * hidden until the bundle reappears, and reports completion or blockage
-   * through the notice center.
+   * never enter the transaction. Deletion is authorized ONLY by a freshly
+   * refreshed remote catalog — the committed snapshot's identities can be
+   * stale, and planning from them once produced a silent no-op reported as
+   * success (2026-09-15). The executor transaction performs the conditional
+   * deletes. Records the cleanup marker that keeps the row hidden until the
+   * bundle reappears, and reports completion or blockage through the notice
+   * center.
    */
   async runCommunityPluginCloudCleanup(pluginId: string): Promise<boolean> {
     await this.ensureStateLoaded();
@@ -5796,7 +5852,38 @@ export default class EasySyncPlugin extends Plugin {
     ) {
       return false;
     }
-    const result = await executor.runCommunityPluginCloudCleanup(pluginId);
+    let evidenceEntries: RemoteFileEntry[];
+    try {
+      const catalog = await this.refreshCommunityPluginRemoteCatalog();
+      if (!catalog || catalog.stale) {
+        throw new Error("no trusted remote catalog evidence for cloud cleanup");
+      }
+      const entry = catalog.entries.find(
+        (candidate) => candidate.pluginId === pluginId,
+      );
+      evidenceEntries = entry
+        ? remoteCommunityPluginCatalogEntryEntries(entry)
+        : [];
+    } catch (error) {
+      this.diag?.warn(
+        "state",
+        "community plugin cloud cleanup stopped before planning: no fresh catalog evidence",
+        error instanceof Error ? error.message : String(error),
+      );
+      this.noticeCenter.show({
+        key: `cloud-cleanup:failed:${pluginId}`,
+        message: this.i18n.t("notice.communityPlugins.cloudCleanupFailed", {
+          plugin: pluginId,
+        }),
+        priority: NOTICE_PRIORITY.attention,
+        className: "easy-sync-notice-action",
+      });
+      return false;
+    }
+    const result = await executor.runCommunityPluginCloudCleanup(
+      pluginId,
+      { entries: evidenceEntries },
+    );
     if (result.status === "failed") {
       this.noticeCenter.show({
         key: `cloud-cleanup:failed:${pluginId}`,
@@ -5834,6 +5921,39 @@ export default class EasySyncPlugin extends Plugin {
         error instanceof Error ? error.message : String(error),
       );
     }
+    // 清理成功即退出参与并撤侧栏待定行（2026-09-16 用户拍板）：否则参与层
+    // 可能随后把已双侧删除的插件翻成 blocked/remote-bundle-missing 残留，发
+    // 现通道也会借合并目录里的过期条目重新提议安装。Best-effort —— 失败只
+    // 记日志，不回滚已完成的清理。
+    try {
+      await this.commitCommunityPluginParticipationCommand({
+        type: "confirm-excluded",
+        pluginId,
+      });
+    } catch (error) {
+      this.diag?.warn(
+        "state",
+        "community plugin participation exit after cloud cleanup failed",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    try {
+      await this.persistCommunityPluginAdoptionCommand({
+        type: "remove-pending",
+        pluginId,
+      });
+    } catch (error) {
+      this.diag?.warn(
+        "state",
+        "community plugin pending adoption row removal after cloud cleanup failed",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    // 清理成功即触发一轮同步（2026-09-16 用户拍板）：云端删除由清理事务直接
+    // 完成，但本机索引消费删除墓碑、基线收敛不应等下一个间隔轮。走现役一次
+    // 性动作的立即同步尾（忙/锁/首同步未定时回退脏标记调度），与采用行
+    // 「下载并同步」同形。
+    this.startCommunityPluginJoinNow();
     this.noticeCenter.show({
       key: `cloud-cleanup:done:${pluginId}`,
       message: this.i18n.t("notice.communityPlugins.cloudCleanupDone", {
@@ -5906,30 +6026,35 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   /**
-   * Silent reappearance sweep against freshly refreshed catalog evidence
-   * (manager open / any successful remote catalog refresh and the round-end
-   * catalog update). The committed remote index only tracks folders this
-   * device anchors (joined plugins), so a cloud-deleted plugin re-uploaded
-   * by another device — while this device stays excluded — can only be seen
-   * through the catalog. Dropping the cleanup marker here un-hides the row
-   * so the user can re-join; no dedicated notice is shown (2026-09-09 用户
-   * 拍板：重现即展示, 无需为重现专门提示).
+   * Silent reappearance sweep against explicit reappearance evidence. The
+   * evidence contract differs per caller: the manager-open delta-fresh
+   * refresh passes every complete entry (a fresh enumeration IS current
+   * server truth); the round-end path passes only entries whose bundle
+   * facts postdate the cleanup (see
+   * `planCommunityPluginCloudCleanupIndexReappearanceV1`). Dropping the
+   * cleanup marker here un-hides the row so the user can re-join; no
+   * dedicated notice is shown (2026-09-09 用户拍板：重现即展示, 无需为重现
+   * 专门提示).
    */
-  private sweepResurrectedCloudCleanupMarkersAgainstCatalog(
-    catalog: Readonly<RemoteCommunityPluginCatalogV1>,
+  private sweepCommunityPluginCloudCleanupMarkers(
+    reappearedPluginIds: readonly string[],
   ): void {
     const markers = this.readCommunityPluginCloudCleanupMarkers();
     if (markers.length === 0) return;
-    const reappearedPluginIds = catalog.entries
-      .filter((entry) => entry.bundleState === "complete")
-      .map((entry) => entry.pluginId);
     const sweep = planCommunityPluginCloudCleanupMarkerSweepV1({
       markers,
       reappearedPluginIds,
     });
-    if (sweep.resurrectedPluginIds.length > 0) {
-      this.writeCommunityPluginCloudCleanupMarkers(sweep.remaining);
-    }
+    if (sweep.resurrectedPluginIds.length === 0) return;
+    this.writeCommunityPluginCloudCleanupMarkers(sweep.remaining);
+    this.diag?.log(
+      "state",
+      "community plugin cleanup markers dropped on bundle reappearance evidence",
+      {
+        schemaVersion: 1,
+        pluginIds: sweep.resurrectedPluginIds,
+      },
+    );
   }
 
   private readUploadDowngradeNoticeMarkers(): { pluginId: string; noticedAt: number }[] {
@@ -7459,7 +7584,13 @@ export default class EasySyncPlugin extends Plugin {
         }
         this.communityPluginCatalogRefreshConsecutiveFailures = 0;
         this.communityPluginCatalogLastRefreshFailureAt = 0;
-        this.sweepResurrectedCloudCleanupMarkersAgainstCatalog(catalog);
+        // Fresh enumeration: every complete entry is current server truth,
+        // so all of them count as reappearance evidence for the sweep.
+        this.sweepCommunityPluginCloudCleanupMarkers(
+          catalog.entries
+            .filter((entry) => entry.bundleState === "complete")
+            .map((entry) => entry.pluginId),
+        );
         this.advanceCommunityPluginInventoryRevision();
         return catalog;
       } catch (error) {
@@ -7588,7 +7719,21 @@ export default class EasySyncPlugin extends Plugin {
       }
       this.communityPluginCatalogRefreshConsecutiveFailures = 0;
       this.communityPluginCatalogLastRefreshFailureAt = 0;
-      this.sweepResurrectedCloudCleanupMarkersAgainstCatalog(catalog);
+      // Sweep against the freshly built index evidence only, and only when
+      // that evidence postdates the cleanup: the committed index learns
+      // about this device's own cloud deletion one delta later, and a
+      // pre-cleanup bundle still listed there is NOT a reappearance
+      // (2026-09-15: sweeping the merged catalog dropped markers on stale
+      // "complete" bundles; 2026-09-16: the index evidence itself needs the
+      // freshness rule — no reflow while the deletion decision is syncing).
+      // Resurrection for unanchored bundles stays on the manager-open
+      // delta-fresh refresh above.
+      this.sweepCommunityPluginCloudCleanupMarkers(
+        planCommunityPluginCloudCleanupIndexReappearanceV1({
+          entries: next.entries,
+          markers: this.readCommunityPluginCloudCleanupMarkers(),
+        }),
+      );
       // Sidebar adoption memory (slice 2): reconcile this device's pending
       // new-plugin rows with the round's fresh facts. Ignored plugins stay
       // suppressed; rows whose plugin joined, vanished, or turned partial
@@ -7640,6 +7785,10 @@ export default class EasySyncPlugin extends Plugin {
             manifestObservations,
             platformFacts,
             localBundleFacts,
+            cleanupMarkerPluginIds:
+              this.readCommunityPluginCloudCleanupMarkers().map((marker) =>
+                marker.pluginId
+              ),
             isMobile: Platform.isMobile,
             ownPluginId: this.manifest.id,
           });
@@ -8007,6 +8156,17 @@ export default class EasySyncPlugin extends Plugin {
     lines.push(`**增量游标**: ${reportState?.remoteDeltaLink ? "已保存" : "无"}`);
     lines.push(`**最近同步记录 ID**: ${reportState?.syncHistory?.[0]?.id ?? "—"}`);
     lines.push(`**社区插件策略指纹**: ${communityPluginSummary.policyFingerprint}`);
+    const recentPluginDataWrites = formatRecentPluginDataWrites(
+      this.pluginDataWriteLog.list(),
+    );
+    if (recentPluginDataWrites.length > 0) {
+      lines.push("");
+      lines.push("**近期插件数据写入**（仅键名与时间，不含值；最新 20 次）:");
+      lines.push("");
+      for (const writeLine of recentPluginDataWrites) {
+        lines.push(writeLine);
+      }
+    }
     lines.push("");
 
     const diagAll = await this.diag.snapshot(500);
@@ -8112,7 +8272,7 @@ export default class EasySyncPlugin extends Plugin {
       for (const f of failedFiles) {
         const action = formatActionLabel(f.actionType);
         const size = formatSize(f.fileSize);
-        lines.push(`- \`${f.path}\` (${size}) — ${action} (${f.reason ?? "未知错误"}) — ${fmtShort(f.historyStartedAt)}`);
+        lines.push(`- \`${f.path}\` (${size}) — ${action} (${f.reason ?? "未知错误"}) — ${fmtShort(f.failedAt ?? f.historyStartedAt)}`);
       }
       lines.push("");
     }
@@ -8395,7 +8555,9 @@ export default class EasySyncPlugin extends Plugin {
   /** Apply max file size setting to the scanner. Public so settings-tab can call it. */
   applyMaxFileSize(): void {
     this.scanner?.setConfig({
-      maxFileSize: this.syncMaxFileSizeMb * 1024 * 1024,
+      maxFileSize: this.syncMaxFileSizeMb === UNLIMITED_MAX_FILE_SIZE_MB
+        ? Number.POSITIVE_INFINITY
+        : this.syncMaxFileSizeMb * 1024 * 1024,
     });
   }
 

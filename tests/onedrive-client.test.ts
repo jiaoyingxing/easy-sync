@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import * as obsidian from "obsidian";
 import { getEasySyncPaths } from "../src/obsidian-compat";
 import { OneDriveClient } from "../src/onedrive/client";
@@ -13,6 +14,24 @@ import {
 } from "../src/onedrive/types";
 
 const EASY_SYNC_TMP_DIR = getEasySyncPaths(".obsidian").tmpDir;
+
+describe("OneDriveClient slow-link evidence wiring (2026-09-15 乙路)", () => {
+  it("feeds one per-round evidence object into both gate construction sites", () => {
+    const clientSource = readFileSync("src/onedrive/client.ts", "utf8");
+    const rangeSource = readFileSync("src/onedrive/range-download.ts", "utf8");
+    // Round-scoped lifetime: created as an instance field, reset with the
+    // other per-round download strategy hints.
+    expect(clientSource).toContain("private slowLinkEvidence = createSlowLinkEvidence();");
+    expect(clientSource).toContain("this.slowLinkEvidence = createSlowLinkEvidence();");
+    // Both gate construction sites share the evidence; the single-stream gate
+    // also receives the file size for the completion-imminence exemption.
+    expect(clientSource).toContain("{ evidence: this.slowLinkEvidence, totalSize: input.fileSize }");
+    expect(clientSource).toContain("slowLinkEvidence: this.slowLinkEvidence,");
+    expect(rangeSource).toContain("evidence: input.slowLinkEvidence");
+    // Telemetry surfaces through the shared error-data helper.
+    expect(clientSource).toContain("data.slowGateRateKiBps = slowGateRate;");
+  });
+});
 
 describe("OneDriveClient run metrics", () => {
   afterEach(() => {
@@ -226,6 +245,345 @@ describe("OneDriveClient.downloadFile", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it("does not blacklist /content for the round on transport-level failures (2026-09-15 连坐切片)", async () => {
+    vi.useFakeTimers();
+    const __uh = (reason: unknown) => console.log("UNHANDLED:", String((reason as Error)?.message ?? reason));
+    process.on("unhandledRejection", __uh);
+    // 2026-09-15 iPhone evidence: a large file's stalled /content attempts
+    // blacklisted the endpoint for the whole round, so small recordings later
+    // in the round failed with "Content endpoint unavailable" without a
+    // single attempt. Transport-level failures (statusCode 0 — the link
+    // died) must not blacklist; the next file re-attempts every tier.
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockImplementation((request) => {
+      const url = String(request.url);
+      if (url.includes("?select=")) {
+        return Promise.resolve({
+          status: 200,
+          headers: {},
+          json: {
+            "@microsoft.graph.downloadUrl": `https://cdn.example/${url.includes("id-a") ? "a" : "b"}.bin`,
+          },
+        });
+      }
+      // CDN and both /content tiers: dead link, no HTTP response at all.
+      return Promise.reject(new Error("net::ERR_NETWORK_DEAD"));
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    const first = client.downloadFile("testVault", "a.bin", undefined, "id-a", 1024).then(
+      () => ({ k: "resolved" as const }),
+      (error: unknown) => ({ k: "rejected" as const, message: String((error as Error)?.message ?? error) }),
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    const firstOutcome = await first;
+    expect(firstOutcome.k).toBe("rejected");
+    expect(firstOutcome.message).toMatch(/Network error/);
+
+    // The second file re-attempts the full waterfall — no round blacklist.
+    const second = client.downloadFile("testVault", "b.bin", undefined, "id-b", 1024).then(
+      () => ({ k: "resolved" as const }),
+      (error: unknown) => ({ k: "rejected" as const, message: String((error as Error)?.message ?? error) }),
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    const secondOutcome = await second;
+    expect(secondOutcome.k).toBe("rejected");
+    expect(secondOutcome.message).toMatch(/Network error/);
+    expect(secondOutcome.message).not.toMatch(/Content endpoint unavailable/);
+
+    const contentCallsFor = (id: string) => requestSpy.mock.calls.filter(([r]) =>
+      String(r.url).includes("/content") && String(r.url).includes(id)).length;
+    // Both /content tiers attempted for each file (Obsidian requestUrl does
+    // not retry this path — one attempt per tier per file).
+    expect(contentCallsFor("id-a")).toBeGreaterThanOrEqual(2);
+    expect(contentCallsFor("id-b")).toBeGreaterThanOrEqual(2);
+    process.off("unhandledRejection", __uh);
+  });
+
+  it("still blacklists /content for the round on endpoint-level failures", async () => {
+    vi.useFakeTimers();
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockImplementation((request) => {
+      const url = String(request.url);
+      if (url.includes("?select=")) {
+        return Promise.resolve({
+          status: 200,
+          headers: {},
+          json: {
+            "@microsoft.graph.downloadUrl": `https://cdn.example/${url.includes("id-a") ? "a" : "b"}.bin`,
+          },
+        });
+      }
+      if (url.includes("/cdn.example/")) {
+        // Dead link on the CDN tier (transport-level — never blacklists).
+        return Promise.reject(new Error("net::ERR_NETWORK_DEAD"));
+      }
+      // /content tiers answer with a real HTTP status: endpoint broken.
+      // Real Obsidian requestUrl THROWS on non-2xx with the status attached.
+      return Promise.reject(Object.assign(new Error("HTTP 404 Not Found"), { status: 404 }));
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    const first = client.downloadFile("testVault", "a.bin", undefined, "id-a", 1024).then(
+      () => ({ k: "resolved" as const }),
+      (error: unknown) => ({ k: "rejected" as const, message: String((error as Error)?.message ?? error) }),
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    const firstOutcome = await first;
+    expect(firstOutcome.k).toBe("rejected");
+    expect(firstOutcome.message).toMatch(/404/);
+
+    // The endpoint is confirmed broken with HTTP evidence: the next file
+    // fails fast at the round gate instead of re-requesting /content.
+    const second = client.downloadFile("testVault", "b.bin", undefined, "id-b", 1024).then(
+      () => ({ k: "resolved" as const }),
+      (error: unknown) => ({ k: "rejected" as const, message: String((error as Error)?.message ?? error) }),
+    );
+    await vi.advanceTimersByTimeAsync(60_000);
+    const secondOutcome = await second;
+    expect(secondOutcome.k).toBe("rejected");
+    expect(secondOutcome.message).toMatch(/Content endpoint unavailable/);
+    const contentCallsForSecondFile = requestSpy.mock.calls.filter(([r]) =>
+      String(r.url).includes("/content") && String(r.url).includes("id-b")).length;
+    expect(contentCallsForSecondFile).toBe(0);
+  });
+
+  it("resumes a stalled streamed download from the received prefix (甲路: bytes are assets)", async () => {
+    vi.useFakeTimers();
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    const content = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const expectedHashBuffer = await crypto.subtle.digest("SHA-256", content);
+    const expectedHash = Array.from(new Uint8Array(expectedHashBuffer))
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+    let file = new Uint8Array(0);
+    let firstAttempt = true;
+    let emittedFirstChunk = false;
+    const fetchSpy = vi.fn((_url: string, init?: { headers?: Record<string, string> }) => {
+      if (firstAttempt) {
+        firstAttempt = false;
+        return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            // Emit exactly one chunk, then fail: pull() runs ahead of the
+            // writer, so file.length must not gate the emit.
+            if (!emittedFirstChunk) {
+              emittedFirstChunk = true;
+              controller.enqueue(content.subarray(0, 3));
+            } else {
+              controller.error(new Error("stalled"));
+            }
+          },
+        }), { status: 200, headers: { "Content-Length": "8" } }));
+      }
+      // The reconnect must ask for the remainder, not restart from zero.
+      expect(init?.headers?.Range).toBe("bytes=3-");
+      return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(content.subarray(3));
+          controller.close();
+        },
+      }), { status: 206, headers: { "Content-Range": "bytes 3-7/8", "Content-Length": "5" } }));
+    });
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: { "@microsoft.graph.downloadUrl": "https://download.example/recording.m4a" },
+    });
+    const adapter = {
+      writeBinary: vi.fn(async (_path: string, data: ArrayBuffer) => {
+        file = new Uint8Array(data.slice(0));
+      }),
+      appendBinary: vi.fn(async (_path: string, data: ArrayBuffer) => {
+        const merged = new Uint8Array(file.length + data.byteLength);
+        merged.set(file);
+        merged.set(new Uint8Array(data), file.length);
+        file = merged;
+      }),
+      readBinary: vi.fn(async () => file.slice().buffer),
+      remove: vi.fn(async () => {
+        file = new Uint8Array(0);
+      }),
+    };
+    try {
+      const client = new OneDriveClient(async () => "token");
+      const result = await client.downloadFileToPath(
+        "testVault",
+        "recording.m4a",
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
+        adapter as never,
+        "https://download.example/recording.m4a",
+        "file-id",
+        content.byteLength,
+        expectedHash,
+      );
+      expect(result).toEqual({ size: content.byteLength, hash: expectedHash });
+      expect(Array.from(file)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(adapter.appendBinary).toHaveBeenCalled();
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("discards the kept prefix when the waterfall gives up on the file", async () => {
+    vi.useFakeTimers();
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    let file = new Uint8Array(0);
+    let emittedFirstChunk = false;
+    const fetchSpy = vi.fn(() => {
+      if (emittedFirstChunk) {
+        return Promise.reject(new Error("net::ERR_NETWORK_DEAD"));
+      }
+      emittedFirstChunk = true;
+      return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (file.length === 0) {
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+          } else {
+            controller.error(new Error("stalled"));
+          }
+        },
+      }), { status: 200, headers: { "Content-Length": "8" } }));
+    });
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: { "@microsoft.graph.downloadUrl": "https://download.example/recording.m4a" },
+    });
+    const adapter = {
+      writeBinary: vi.fn(async (_path: string, data: ArrayBuffer) => {
+        file = new Uint8Array(data.slice(0));
+      }),
+      appendBinary: vi.fn(async (_path: string, data: ArrayBuffer) => {
+        const merged = new Uint8Array(file.length + data.byteLength);
+        merged.set(file);
+        merged.set(new Uint8Array(data), file.length);
+        file = merged;
+      }),
+      readBinary: vi.fn(async () => file.slice().buffer),
+      remove: vi.fn(async () => {
+        file = new Uint8Array(0);
+      }),
+    };
+    try {
+      const client = new OneDriveClient(async () => "token");
+      const outcome = await client.downloadFileToPath(
+        "testVault",
+        "recording.m4a",
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
+        adapter as never,
+        "https://download.example/recording.m4a",
+        "file-id",
+        8,
+        undefined,
+      ).then(
+        () => ({ k: "resolved" as const }),
+        (error: unknown) => ({ k: "rejected" as const, message: String((error as Error)?.message ?? error) }),
+      );
+      expect(outcome.k).toBe("rejected");
+      // Terminal failure: the kept prefix is unreachable by any further
+      // retry this round — it must be discarded, not leaked in tmp.
+      expect(adapter.remove).toHaveBeenCalled();
+      expect(file.length).toBe(0);
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("downgrades to a fresh stream when the server ignores the Range request", async () => {
+    vi.useFakeTimers();
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    const content = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const expectedHashBuffer = await crypto.subtle.digest("SHA-256", content);
+    const expectedHash = Array.from(new Uint8Array(expectedHashBuffer))
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+    let file = new Uint8Array(0);
+    let firstAttempt = true;
+    let emittedFirstChunk = false;
+    const fetchSpy = vi.fn(() => {
+      if (firstAttempt) {
+        firstAttempt = false;
+        return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (!emittedFirstChunk) {
+              emittedFirstChunk = true;
+              controller.enqueue(content.subarray(0, 3));
+            } else {
+              controller.error(new Error("stalled"));
+            }
+          },
+        }), { status: 200, headers: { "Content-Length": "8" } }));
+      }
+      // Server ignored the Range header: answer 200 with the full body.
+      return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(content);
+          controller.close();
+        },
+      }), { status: 200, headers: { "Content-Length": "8" } }));
+    });
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: { "@microsoft.graph.downloadUrl": "https://download.example/recording.m4a" },
+    });
+    const adapter = {
+      writeBinary: vi.fn(async (_path: string, data: ArrayBuffer) => {
+        file = new Uint8Array(data.slice(0));
+      }),
+      appendBinary: vi.fn(async (_path: string, data: ArrayBuffer) => {
+        const merged = new Uint8Array(file.length + data.byteLength);
+        merged.set(file);
+        merged.set(new Uint8Array(data), file.length);
+        file = merged;
+      }),
+      readBinary: vi.fn(async () => file.slice().buffer),
+      remove: vi.fn(async () => {
+        file = new Uint8Array(0);
+      }),
+    };
+    try {
+      const client = new OneDriveClient(async () => "token");
+      const result = await client.downloadFileToPath(
+        "testVault",
+        "recording.m4a",
+        `${EASY_SYNC_TMP_DIR}/downloads/recording.m4a.part`,
+        adapter as never,
+        "https://download.example/recording.m4a",
+        "file-id",
+        content.byteLength,
+        expectedHash,
+      );
+      // Fail closed: the ignored Range downgrades to a full fresh stream and
+      // the file lands exactly once, with no duplicated prefix.
+      expect(result).toEqual({ size: content.byteLength, hash: expectedHash });
+      expect(Array.from(file)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("streams mobile downloads from 2 MiB so reconnects have bytes to resume (甲路 threshold)", () => {
+    const executorSource = readFileSync("src/sync/sync-executor.ts", "utf8");
+    expect(executorSource).toContain("MOBILE_STREAM_DOWNLOAD_MIN_BYTES = 2 * 1024 * 1024");
   });
 
   it("downloadUrl uses file-size budget instead of 8s cap", async () => {
@@ -657,32 +1015,26 @@ describe("OneDriveClient.downloadFile", () => {
     }
   });
 
-  it("accepts the fourth connection after three slow-abort reconnects", async () => {
+  it("accepts a comparable second connection instead of looping (2026-09-15 iPhone replay)", async () => {
     vi.useFakeTimers();
     const originalWindow = (globalThis as { window?: unknown }).window;
-    // Every connection is slow: after three slow-aborts the gate must accept
-    // the fourth connection and let it finish (a genuinely slow link must
-    // complete rather than loop).
+    // 2026-09-15 rewrite: the slow gate judges windows relative to what the
+    // link recently proved. A cold slow window still aborts (legacy absolute
+    // rule), but the reconnect lands on a comparable connection, so the gate
+    // accepts it instead of burning the remaining reconnect budget — the
+    // uniform-slow-link loop that motivated the 2026-09-14 gate is gone.
     const M = 1024 * 1024;
-    const fileBytes = 16 * M;
-    const trickleForever = () => Promise.resolve(new Response(
-      new ReadableStream<Uint8Array>({
-        async pull(controller) {
-          // ~455 KiB/s: 4 KiB every 9 ms of fake time — below the 512 gate.
-          await new Promise<void>((resolve) => setTimeout(resolve, 9));
-          controller.enqueue(new Uint8Array(4096));
-        },
-      }),
-      { status: 200 },
-    ));
-    const trickleFinite = () => {
+    const fileBytes = 4 * M;
+    // ~60 KiB/s: 4096 bytes every 67 ms — the completion-imminence exemption
+    // must not fire (eta ~53s > reconnect cost ~25s at one window in).
+    const trickle = (finite: boolean) => {
       let sent = 0;
       return Promise.resolve(new Response(
         new ReadableStream<Uint8Array>({
           async pull(controller) {
-            await new Promise<void>((resolve) => setTimeout(resolve, 9));
-            if (sent >= fileBytes / 4096) { controller.close(); return; }
-            sent++;
+            await new Promise<void>((resolve) => setTimeout(resolve, 67));
+            if (finite && sent >= fileBytes / 4096) { controller.close(); return; }
+            if (finite) sent++;
             controller.enqueue(new Uint8Array(4096));
           },
         }),
@@ -690,10 +1042,8 @@ describe("OneDriveClient.downloadFile", () => {
       ));
     };
     const fetchSpy = vi.fn()
-      .mockImplementationOnce(trickleForever)
-      .mockImplementationOnce(trickleForever)
-      .mockImplementationOnce(trickleForever)
-      .mockImplementationOnce(trickleFinite);
+      .mockImplementationOnce(() => trickle(false))
+      .mockImplementationOnce(() => trickle(true));
     (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
     vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
       status: 200,
@@ -704,10 +1054,74 @@ describe("OneDriveClient.downloadFile", () => {
     });
     try {
       const client = new OneDriveClient(async () => "token");
-      // This test pins the single-stream waterfall's slow-gate semantics;
-      // pin the no-Node environment so the 16 MiB file does not divert into
-      // the multi-range branch (which would leave the test's fake fetch
-      // untouched and fire real network calls).
+      // Pin the no-Node environment so the file stays on the single-stream
+      // waterfall this test exercises.
+      (client as unknown as { rangeStreamDownloader: unknown })
+        .rangeStreamDownloader = null;
+      const pending = client.downloadFile(
+        "testVault",
+        "big.bin",
+        "https://download.example/big.bin",
+        "file-id",
+        fileBytes,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      // Cold first window aborts once (absolute rule), then the comparable
+      // reconnect is accepted: exactly two connections, no further looping.
+      await vi.advanceTimersByTimeAsync(16_000);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      const result = await pending;
+      expect(result.byteLength).toBe(fileBytes);
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+      vi.useRealTimers();
+    }
+  });
+
+  it("still abandons collapsing connections and accepts the fourth", async () => {
+    vi.useFakeTimers();
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    // Genuine link collapse (~308 → ~102 → ~31 KiB/s, each window far below
+    // 0.45 × the recent baseline): the relative judgment keeps reconnecting,
+    // the budget still caps at three aborts, and the fourth connection is
+    // accepted and must complete.
+    const M = 1024 * 1024;
+    const fileBytes = 16 * M;
+    const trickleForever = (ms: number) => () => Promise.resolve(new Response(
+      new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          await new Promise<void>((resolve) => setTimeout(resolve, ms));
+          controller.enqueue(new Uint8Array(4096));
+        },
+      }),
+      { status: 200 },
+    ));
+    const fastFinite = () => Promise.resolve(new Response(
+      new Uint8Array(fileBytes),
+      { status: 200 },
+    ));
+    const fetchSpy = vi.fn()
+      .mockImplementationOnce(trickleForever(13))
+      .mockImplementationOnce(trickleForever(40))
+      .mockImplementationOnce(trickleForever(133))
+      .mockImplementationOnce(fastFinite);
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: {
+        "@microsoft.graph.downloadUrl": "https://download.example/big.bin",
+      },
+    });
+    try {
+      const client = new OneDriveClient(async () => "token");
       (client as unknown as { rangeStreamDownloader: unknown })
         .rangeStreamDownloader = null;
       const pending = client.downloadFile(
@@ -721,11 +1135,9 @@ describe("OneDriveClient.downloadFile", () => {
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       // Three slow-aborts (hint tier ×1, metadata tier ×1, path /content
       // tier ×1), then the item ID /content tier's connection is accepted
-      // and finishes at ~455 KiB/s.
+      // and delivers the file.
       await vi.advanceTimersByTimeAsync(66_000);
       expect(fetchSpy).toHaveBeenCalledTimes(4);
-      // The accepted connection finishes the remaining ~17 s of trickle at
-      // ~455 KiB/s; keep the fake clock running until it lands.
       await vi.advanceTimersByTimeAsync(30_000);
       const result = await pending;
       expect(result.byteLength).toBe(fileBytes);
@@ -1262,12 +1674,17 @@ describe("OneDriveClient.downloadBaseline", () => {
     const client = new OneDriveClient(async () => "token");
 
     const result = client.downloadBaseline("testVault");
-    const rejection = expect(result).rejects.toMatchObject<Partial<OneDriveError>>({
+    let settled = false;
+    void result.catch(() => {}).then(() => { settled = true; });
+    // 控制对象内容读取与元数据类读取同预算（METADATA_READ_TIMEOUT_MS）：
+    // 8 秒不再判死，弱网下给满 30 秒才按超时终局。
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(22_000);
+
+    await expect(result).rejects.toMatchObject<Partial<OneDriveError>>({
       type: OneDriveErrorType.NetworkError,
     });
-    await vi.advanceTimersByTimeAsync(8000);
-
-    await rejection;
     expect(requestSpy).toHaveBeenCalledTimes(2);
   });
 });
@@ -1353,12 +1770,17 @@ describe("OneDriveClient CloudBootstrapV2 CAS", () => {
     const client = new OneDriveClient(async () => "token");
 
     const result = client.readCloudBootstrapV2("testVault");
-    const rejection = expect(result).rejects.toMatchObject<Partial<OneDriveError>>({
+    let settled = false;
+    void result.catch(() => {}).then(() => { settled = true; });
+    // 与元数据类读取同预算（METADATA_READ_TIMEOUT_MS）：8 秒不再判死，
+    // 弱网下给满 30 秒才按超时终局，仍不与 Graph /content 兜底重叠。
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(22_000);
+
+    await expect(result).rejects.toMatchObject<Partial<OneDriveError>>({
       type: OneDriveErrorType.NetworkError,
     });
-    await vi.advanceTimersByTimeAsync(8000);
-
-    await rejection;
     expect(requestSpy).toHaveBeenCalledTimes(2);
   });
 });
@@ -1468,12 +1890,17 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     const client = new OneDriveClient(async () => "token");
 
     const result = client.readSharedSyncProtocolV2("testVault");
-    const rejection = expect(result).rejects.toMatchObject<
+    let settled = false;
+    void result.catch(() => {}).then(() => { settled = true; });
+    // 与元数据类读取同预算（METADATA_READ_TIMEOUT_MS）：8 秒不再判死，
+    // 弱网下给满 30 秒才按超时终局，仍不与 Graph content 兜底重叠。
+    await vi.advanceTimersByTimeAsync(8000);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(22_000);
+
+    await expect(result).rejects.toMatchObject<
       Partial<OneDriveError>
     >({ type: OneDriveErrorType.NetworkError });
-    await vi.advanceTimersByTimeAsync(8000);
-
-    await rejection;
     expect(requestSpy).toHaveBeenCalledTimes(2);
   });
 

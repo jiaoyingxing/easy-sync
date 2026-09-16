@@ -5,6 +5,7 @@ import {
   Setting,
   TFolder,
 } from "obsidian";
+import type { DropdownComponent, TextComponent } from "obsidian";
 import type EasySyncPlugin from "../main";
 import { SyncPathSettingsUpdateError } from "../main";
 import { getConfigDir } from "../obsidian-compat";
@@ -13,6 +14,10 @@ import {
   isPathExcludedByFolders,
   normalizeExcludedFolders,
 } from "../sync/local-scanner";
+import {
+  MAX_FILE_SIZE_PRESET_OPTIONS_MB,
+  UNLIMITED_MAX_FILE_SIZE_MB,
+} from "../sync/types";
 
 export interface SyncExclusionFolderCandidate {
   path: string;
@@ -37,6 +42,27 @@ export function buildSyncExclusionFolderCandidates(
   return [...unique.values()].sort(
     (left, right) => left.path.localeCompare(right.path),
   );
+}
+
+export type MaxFileSizeSelection =
+  | { kind: "preset"; value: number }
+  | { kind: "unlimited" }
+  | { kind: "custom" };
+
+export function resolveMaxFileSizeSelection(currentMb: number): MaxFileSizeSelection {
+  if (currentMb === UNLIMITED_MAX_FILE_SIZE_MB) return { kind: "unlimited" };
+  if (MAX_FILE_SIZE_PRESET_OPTIONS_MB.includes(currentMb)) {
+    return { kind: "preset", value: currentMb };
+  }
+  return { kind: "custom" };
+}
+
+/** Accepts only positive whole MiB values; everything else is a visible rejection. */
+export function parseMaxFileSizeInput(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const value = Number.parseInt(trimmed, 10);
+  return value > 0 ? value : null;
 }
 
 export class SyncExclusionEditSession {
@@ -163,6 +189,9 @@ export class SyncExclusionModal extends EasySyncModal {
   private editSession: SyncExclusionEditSession | null = null;
   private initialization: Promise<void> = Promise.resolve();
   private activeSave: Promise<boolean> = Promise.resolve(false);
+  private maxFileSizeDropdown: DropdownComponent | null = null;
+  private maxFileSizeDescEl: HTMLElement | null = null;
+  private maxFileSizeText: TextComponent | null = null;
 
   constructor(private plugin: EasySyncPlugin) {
     super(plugin.app);
@@ -177,6 +206,9 @@ export class SyncExclusionModal extends EasySyncModal {
 
   onClose(): void {
     this.closed = true;
+    this.maxFileSizeDropdown = null;
+    this.maxFileSizeDescEl = null;
+    this.maxFileSizeText = null;
     this.contentEl.empty();
     void this.finalizeClose();
   }
@@ -260,23 +292,104 @@ export class SyncExclusionModal extends EasySyncModal {
 
     new Setting(this.contentEl)
       .setName(t("settings.maxFileSize.name"))
-      .setDesc(t("settings.maxFileSize.desc", { size: `${this.plugin.syncMaxFileSizeMb} MB` }))
-      .addSlider((slider) => {
-        slider
-          .setLimits(200, 2000, 100)
-          .setValue(this.plugin.syncMaxFileSizeMb)
-          .onChange(async (value) => {
-            this.plugin.syncMaxFileSizeMb = value;
-            await this.plugin.saveSyncSettings();
-            this.plugin.applyMaxFileSize();
-            const desc = slider.sliderEl
-              .closest(".setting-item")
-              ?.querySelector(".setting-item-description");
-            if (desc) {
-              desc.textContent = t("settings.maxFileSize.desc", { size: `${value} MB` });
+      .setDesc(this.maxFileSizeDescText())
+      .addText(text => {
+        this.maxFileSizeText = text;
+        const selection = resolveMaxFileSizeSelection(this.plugin.syncMaxFileSizeMb);
+        text.setValue(selection.kind === "custom" ? String(this.plugin.syncMaxFileSizeMb) : "");
+        text.setPlaceholder(t("settings.maxFileSize.customPlaceholder"));
+        text.inputEl.inputMode = "numeric";
+        text.inputEl.hidden = selection.kind !== "custom";
+        text.inputEl.setAttribute("aria-label", t("settings.maxFileSize.customPlaceholder"));
+        text.inputEl.addEventListener("blur", () => {
+          this.revertMaxFileSizeTextIfInvalid();
+          this.syncMaxFileSizeCustomTextVisibility();
+        });
+        text.onChange(raw => {
+          const parsed = parseMaxFileSizeInput(raw);
+          if (parsed !== null) void this.persistMaxFileSizeMb(parsed);
+        });
+      })
+      .addDropdown(dropdown => {
+        for (const preset of MAX_FILE_SIZE_PRESET_OPTIONS_MB) {
+          dropdown.addOption(
+            String(preset),
+            t("settings.maxFileSize.optionMb", { size: preset }),
+          );
+        }
+        dropdown.addOption("unlimited", t("settings.maxFileSize.optionUnlimited"));
+        dropdown.addOption("custom", t("settings.maxFileSize.optionCustom"));
+        this.syncMaxFileSizeDropdownSelection(dropdown);
+        dropdown.onChange(value => {
+          const text = this.maxFileSizeText;
+          if (value === "custom") {
+            // Resojot renderModelField 同型：只翻 hidden＋聚焦，不落写、不重渲染。
+            if (text) {
+              text.inputEl.hidden = false;
+              text.inputEl.focus();
             }
-          });
+            return;
+          }
+          if (text) text.inputEl.hidden = true;
+          const next = value === "unlimited"
+            ? UNLIMITED_MAX_FILE_SIZE_MB
+            : Number.parseInt(value, 10);
+          if (!Number.isFinite(next)) return;
+          void this.persistMaxFileSizeMb(next);
+        });
+        this.maxFileSizeDropdown = dropdown;
       });
+    this.maxFileSizeDescEl = this.resolveMaxFileSizeDescEl();
+  }
+
+  private maxFileSizeDescText(): string {
+    return this.plugin.syncMaxFileSizeMb === UNLIMITED_MAX_FILE_SIZE_MB
+      ? this.plugin.i18n.t("settings.maxFileSize.descUnlimited")
+      : this.plugin.i18n.t("settings.maxFileSize.desc", { size: `${this.plugin.syncMaxFileSizeMb} MB` });
+  }
+
+  private syncMaxFileSizeDropdownSelection(dropdown?: DropdownComponent): void {
+    const target = dropdown ?? this.maxFileSizeDropdown;
+    if (!target) return;
+    const selection = resolveMaxFileSizeSelection(this.plugin.syncMaxFileSizeMb);
+    target.setValue(selection.kind === "preset" ? String(selection.value) : selection.kind);
+  }
+
+  private syncMaxFileSizeCustomTextVisibility(): void {
+    const text = this.maxFileSizeText;
+    if (!text) return;
+    const selection = resolveMaxFileSizeSelection(this.plugin.syncMaxFileSizeMb);
+    text.inputEl.hidden = selection.kind !== "custom";
+    text.setValue(selection.kind === "custom" ? String(this.plugin.syncMaxFileSizeMb) : "");
+    this.syncMaxFileSizeDropdownSelection();
+    this.refreshMaxFileSizeDesc();
+  }
+
+  private revertMaxFileSizeTextIfInvalid(): void {
+    const text = this.maxFileSizeText;
+    if (!text) return;
+    if (parseMaxFileSizeInput(text.getValue()) !== null) return;
+    new Notice(this.plugin.i18n.t("settings.maxFileSize.invalidValue"));
+    text.setValue(this.plugin.syncMaxFileSizeMb > 0 ? String(this.plugin.syncMaxFileSizeMb) : "");
+  }
+
+  private resolveMaxFileSizeDescEl(): HTMLElement | null {
+    return this.maxFileSizeDropdown?.selectEl
+      .closest(".setting-item")
+      ?.querySelector(".setting-item-description") as HTMLElement | null ?? null;
+  }
+
+  private refreshMaxFileSizeDesc(): void {
+    if (this.maxFileSizeDescEl) {
+      this.maxFileSizeDescEl.textContent = this.maxFileSizeDescText();
+    }
+  }
+
+  private async persistMaxFileSizeMb(value: number): Promise<void> {
+    this.plugin.syncMaxFileSizeMb = value;
+    await this.plugin.saveSyncSettings();
+    this.plugin.applyMaxFileSize();
+    this.refreshMaxFileSizeDesc();
   }
 
   private async addFolder(path: string): Promise<void> {
