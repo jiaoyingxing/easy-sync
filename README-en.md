@@ -39,7 +39,7 @@ EasySync is a next-generation two-way sync plugin built on OneDrive — sign in 
 - [7. FAQ](#7-faq)
 - [8. License and support](#8-license-and-support)
 
-## 1. Quick start
+## 1. Installation & first sync
 
 ### 1.1 Install the plugin
 

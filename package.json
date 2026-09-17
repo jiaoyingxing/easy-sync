@@ -1,6 +1,6 @@
 {
   "name": "easy-sync",
-  "version": "1.4.10",
+  "version": "1.4.11",
   "description": "EasySync / 易同步 — Obsidian OneDrive sync with minimal setup, clear status, and controlled conflict handling",
   "main": "main.js",
   "scripts": {
@@ -28,15 +28,17 @@
   },
   "license": "MIT",
   "devDependencies": {
-    "@types/node": "^26.1.0",
-    "core-js-pure": "3.49.0",
     "esbuild": "^0.24.0",
     "eslint": "9.39.5",
     "eslint-plugin-obsidianmd": "0.4.2",
     "fake-indexeddb": "^6.2.5",
-    "idb": "^8.0.3",
-    "obsidian": "1.13.1",
     "typescript": "^5.4.0",
     "vitest": "^4.1.10"
+  },
+  "dependencies": {
+    "@types/node": "^26.1.0",
+    "core-js-pure": "3.49.0",
+    "idb": "^8.0.3",
+    "obsidian": "1.13.1"
   }
 }
