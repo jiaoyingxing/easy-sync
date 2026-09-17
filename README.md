@@ -15,26 +15,31 @@
   </a>
 </p>
 
-<p align="center">
-  <strong>阅读语言：</strong> <strong>简体中文</strong> · <a href="./README-en.md"><strong>English</strong></a>
-</p>
+为了让所有朋友都能轻松解决 Obsidian 同步问题，我做了这个插件：初次部署只要 2 分钟。如果你还在用 Remotely Save + OneDrive，一定要试试 EasySync。
 
-EasySync 让你在电脑、手机和平板之间轻松同步 Obsidian 仓库。
+EasySync 是新一代基于 OneDrive 的双向同步插件——仅需登录 OneDrive 账号，就能在电脑、手机和平板之间同步仓库；冲突可控，移动端也流畅，笔记和设置同步各有独立开关。支持 Windows、macOS、Linux、iOS 和 Android。
 
-- 安全可控：单边变化、内容一致和不重叠的文本修改可以自动处理；其余冲突由你比较后决定。
+| 特点 | 说明 |
+| --- | --- |
+| 🔍 不靠时间判断文件，靠内容 | 给文件内容算 SHA-256 哈希指纹，只比对内容是否真的变了——旧文件拷回来、系统时间跳了，都骗不到它，几乎不会误覆盖你的笔记。 |
+| ⚖️ 冲突不替你乱选 | 两台设备都改过的笔记，不挑一个覆盖另一个：两个版本并排展示、标出差异，由你决定留哪个。 |
+| 👀 同步情况一目了然 | 同步失败的、冲突待处理的、太大被跳过的文件，全部列在侧栏里，不是一条几秒就消失的提示。 |
+| 🎛️ 想同步什么，自己选 | 笔记和附件默认同步；编辑器设置、外观、主题、快捷键、核心插件、社区插件、插件数据，每一项都有独立开关。 |
+| 🛡️ 一直在悄悄保护你的数据 | 上传前重算文件哈希，确认内容没有中途变化；下载的文件覆盖本地前先复核；中断后从已完成的进度继续；云端删除默认不动本地文件，先转给你确认。 |
+| ☁️ 数据只在你自己的 OneDrive 里 | 直连 Microsoft 官方接口，不经过第三方服务器；没有遥测和广告，源码公开在 GitHub。 |
 
-- 全程透明：同步状态、进度、历史和需要处理的项目都在独立侧栏中展示。
+## 目录
 
-- 同步自由：编辑器设置、外观、主题、代码片段、快捷键、书签、核心插件和社区插件等范围可分别控制，社区插件还可以逐项选择。
+- [1. 快速开始](#1-快速开始)
+- [2. 数据与隐私](#2-数据与隐私)
+- [3. 按需配置与同步范围](#3-按需配置与同步范围)
+- [4. 冲突如何处理](#4-冲突如何处理)
+- [5. 从其他方式迁移](#5-从其他方式迁移)
+- [6. 使用边界](#6-使用边界)
+- [7. 常见问题](#7-常见问题)
+- [8. 许可与支持](#8-许可与支持)
 
-- 支持 Windows、macOS、Linux、iOS 和 Android；首次建立共同基线，后续主要增量核对新的变化，大文件使用分片上传。
-
-## 👋 联系
-
-- 产品交流：小红书搜索 **焦应行** 🔍
-- 遇到问题：在 EasySync 设置中生成“诊断报告”。提交问题时附上完整的 EasySync 诊断报告。问题反馈：[GitHub Issues](https://github.com/jiaoyingxing/easy-sync/issues)
-
-## 1. 安装与首次配置
+## 1. 快速开始
 
 ### 1.1 安装插件
 
@@ -45,26 +50,20 @@ EasySync 让你在电脑、手机和平板之间轻松同步 Obsidian 仓库。
 需要 Obsidian `1.11.4` 或更高版本。
 
 也可以从 [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) 手动安装：下载 `main.js`、`manifest.json` 和 `styles.css`，放入：
+
 ```text
 <你的仓库>/.obsidian/plugins/easy-sync/
 ```
+
 然后在 Obsidian 中启用插件。
 
 ### 1.2 准备本地仓库
 
-不要把 Obsidian 仓库文件夹直接放在 OneDrive、iCloud 或其他云盘的同步目录里。EasySync 插件本身就是同步工具，这样做会导致两个同步程序同时修改文件，引发严重的冲突和数据混乱。你的仓库应该放在一个普通的本地文件夹中，只由 EasySync 管理。
+- 首次使用前，为重要仓库保留一份独立备份；
+- 仓库放在普通本地文件夹，只让 EasySync 管理这个仓库的同步；
+- 不要把仓库建在 OneDrive、iCloud 等云盘上，也不要使用其他同步插件/工具，否则会引起冲突。
 
-建议：
-
-- 把 Obsidian 仓库放在普通本地目录；
-- 只让 EasySync 管理这个仓库的跨设备同步；
-- 首次使用前为重要仓库保留一份独立备份。
-
-所有设备必须使用相同的仓库名：EasySync 根据仓库名区分云端同步空间。例如，电脑上的仓库叫：
-```text
-我的笔记
-```
-手机上也应创建或打开名为“我的笔记”的仓库。不同名称会被视为不同的同步空间。
+所有设备使用相同的仓库名：EasySync 按仓库名区分同步空间，名称不同就是两个独立的同步空间。
 
 ### 1.3 登录 OneDrive
 
@@ -76,7 +75,7 @@ EasySync 让你在电脑、手机和平板之间轻松同步 Obsidian 仓库。
 
 ### 1.4 完成第一次同步
 
-建议先在内容最完整的设备上点击“立即同步”。EasySync 会先展示同步计划；确认前不会上传、覆盖、移动或删除笔记、附件和其他待同步文件。确认计划并等待同步完成后，再在其他设备上同步。
+先在内容最完整的设备上点击“立即同步”：EasySync 会先展示同步计划，确认前不会上传、覆盖、移动或删除你的文件。确认并等这轮完成后，再去其他设备同步。
 
 如果新设备还没有内容：
 
@@ -85,55 +84,13 @@ EasySync 让你在电脑、手机和平板之间轻松同步 Obsidian 仓库。
 3. 点击“立即同步”；
 4. 等待云端文件下载完成。
 
-如果云端已经存在同名仓库的 EasySync 同步状态，新设备会提示加入已有同步状态；从旧版升级时，也可能先显示同步方案升级。请先将其他设备更新到当前版本，再按页面提示确认。
+云端已有同名仓库的同步状态时，新设备会提示加入；从旧版升级则可能先显示同步方案升级——请先把其他设备更新到当前版本，再按提示确认。
 
-首次同步需要扫描、计算文件指纹并建立共同基线。文件较多或网络较慢时，耗时会明显长于后续同步。
+首次同步要扫描全部文件、计算指纹、建立共同基线，文件多或网络慢时会明显久于之后的同步。之后的同步主要核对增量变化，大文件分片上传，移动端下载后先验证再替换本地文件。
 
-## 2. 迁移
+## 2. 数据与隐私
 
-如果你原本使用其他同步方式，可以按以下步骤迁移到 EasySync。迁移完成前，请保留原仓库和独立备份，不要让两种同步工具同时管理同一个本地仓库；已经放入 EasySync 云端目录、并且与本地路径和内容完全一致的文件，首次同步只会建立共同基线，不会重新上传。如果出现预期之外的大量上传、下载或冲突，请先取消并检查仓库名、目录层级、同步范围和加密状态。
-
-### 2.1 从 OneDrive 应用迁移
-
-如果仓库直接位于 OneDrive 同步目录，请先确认 OneDrive 已完成同步，并确保所有文件均已完整下载而不是云端占位符；然后关闭 Obsidian、暂停 OneDrive，将整个仓库复制到不受 OneDrive 管理的普通本地目录，并在 Obsidian 中打开这个本地副本。
-
-安装并启用 EasySync，登录原仓库所在的 OneDrive 账号，但暂不开始同步；先通过 OneDrive 网页版，将原仓库根目录下的全部内容复制到 `应用/EasySync/vaults/<你的仓库名>/files/`，直接放入 `files`，不要再多套一层仓库名。随后启动首次同步，完成并确认结果正常后，再处理原 OneDrive 目录中的仓库。
-
-### 2.2 从 Remotely Save 插件迁移
-
-请先完成最后一次同步并确认成功，然后停用所有设备上的 Remotely Save。如果没有启用远端加密，可以通过 OneDrive 网页版，将 `应用/remotely-save/<你的仓库名>/` 中的仓库内容复制到 `应用/EasySync/vaults/<你的仓库名>/files/`；直接复制仓库内容，不要多套一层仓库名，也不要复制 Remotely Save 的控制文件。
-
-如果自定义过远端目录，请以实际目录为准；如果启用了远端加密，则需要先使用 Remotely Save 将仓库完整还原到本地，再由 EasySync 执行首次上传。
-
-### 2.3 从 iOS 的 iCloud 迁移
-
-不要先关闭 iCloud。请在“文件”App 中确认 `iCloud 云盘/Obsidian/<你的仓库名>/` 已完整下载；仍保存在云端的内容可长按并选择“保留下载”。然后在 Obsidian 中创建一个名称相同、但不存储到 iCloud 的本地仓库，关闭 Obsidian，将原仓库根目录下的全部内容复制到 `我的 iPhone/Obsidian/<你的仓库名>/` 或 `我的 iPad/Obsidian/<你的仓库名>/` 中的新仓库。
-
-重新打开 Obsidian，确认笔记、附件和文件夹完整后，再安装 EasySync 并执行首次同步。iCloud 与 EasySync 使用的 OneDrive 是两个独立云端，因此仍需完成一次首次上传；原 iCloud 仓库应保留到 EasySync 上传完成且再次同步结果稳定后，再决定是否删除。
-
-## 3. 推荐配置
-
-EasySync 的基础同步无需额外配置：仓库中的笔记和附件默认参与同步。
-
-其他选项可以按需要开启：
-
-| 设置 | 建议 |
-| --- | --- |
-| 同步排除 | 只影响当前设备；所选文件夹不会上传或下载，现有文件不会仅因排除而被删除 |
-| 同步范围 | 编辑器设置、外观、主题与代码片段、快捷键、书签和核心插件等内容均可独立控制 |
-| 社区插件 | 插件文件可逐项同步；是否启用由每台设备自己的 Obsidian 管理。各插件的 `data.json` 由“社区插件数据”单独控制 |
-| 社区插件数据 | 各插件的 `data.json` 可以逐项控制；该功能仍属实验性，开启前请备份各设备上的插件设置 |
-| EasySync 自同步 | 默认关闭；需要把 EasySync 更新同步到其他设备时再开启 |
-| 自动同步 | “定时同步”和“修改后触发同步”可分别配置；关闭后仍可手动点击“立即同步” |
-| 自动处理 | “合并不重叠的文本修改”默认开启；“将远端删除同步到本地”默认关闭，无法证明安全时仍会转为冲突或待处理 |
-| 诊断日志 | 日常可以关闭；排查同步问题时开启并生成诊断报告 |
-| 通知弹窗 | 默认显示全部；可改为“仅重要”或“关闭”；登录过期等关键提醒始终显示 |
-
-设置保存在当前设备的插件数据中，并按设备独立生效（如同步排除、通知弹窗等级）；不会自动改变其他设备或仓库的配置。
-
-## 4. OneDrive 中的数据与权限
-
-### 4.1 云端文件在哪里
+### 2.1 云端文件在哪里
 
 EasySync 把每个仓库分别存放在 OneDrive 的应用目录中：
 
@@ -147,15 +104,11 @@ EasySync 把每个仓库分别存放在 OneDrive 的应用目录中：
 应用/EasySync/vaults/我的笔记/files/项目/计划.md
 ```
 
-`files` 目录对应仓库中参与同步的文件。你可以通过 OneDrive 网页版或客户端查看这些云端副本。
+`files` 目录就是仓库里参与同步的文件，可在 OneDrive 网页版或客户端查看。同级的 `.easy-sync` 目录保存同步状态，请不要手动修改、移动或删除其中的文件。
 
-同级的 `.easy-sync` 目录保存同步状态，请不要手动修改、移动或删除其中的文件。
+### 2.2 数据如何传输
 
-> OneDrive 中的这些文件是 EasySync 管理的云端副本，不代表应该把本地 Obsidian 仓库直接移动到 OneDrive 同步目录。
-
-### 4.2 数据如何传输
-
-同步文件保存在你自己的 OneDrive 账户中。EasySync 直接连接 Microsoft 登录和 Microsoft Graph，不使用第三方中转服务器。
+同步文件保存在你自己的 OneDrive 账户中。EasySync 直接连接 Microsoft 登录和 Microsoft Graph，不使用第三方中转服务器，同步路径限制在应用目录 `应用/EasySync/` 内。
 
 当前 Microsoft 授权包括：
 
@@ -163,39 +116,34 @@ EasySync 把每个仓库分别存放在 OneDrive 的应用目录中：
 - `Files.Read`：完成文件读取和下载；
 - 基本身份与离线登录权限：确认当前账号并维持登录状态。
 
-EasySync 的同步路径限制在自己的应用目录：
+没有遥测、广告或行为分析；诊断日志保存在本地插件目录，诊断报告只在你主动生成时才写入仓库。源码公开在 GitHub，供用户审查。
 
-```text
-应用/EasySync/
-```
+### 2.3 回收站与备份边界
 
-插件不包含遥测、广告或用户行为分析。诊断日志默认保存在本地插件目录；诊断报告只有在你主动生成时才会写入仓库。
+被删除的云端文件，可按你的 OneDrive 账户策略从回收站恢复。但回收站和同步记录都不能替代独立备份——重要内容请定期备份到同步工具管理不到的位置。
 
-源码公开在 GitHub，供用户审查。
+## 3. 按需配置与同步范围
 
-### 4.3 回收站与备份边界
-
-如果 OneDrive 中的文件被删除，可以根据你的 OneDrive 账户策略检查回收站。回收站和同步记录都不能替代独立备份；重要内容仍建议定期保存到不受 EasySync 或其他同步工具管理的位置。
-
-## 5. EasySync 的核心能力
-
-- **笔记与附件**：双向同步 Markdown、图片、音频、PDF 和其他仓库文件，按内容哈希判断变化，不只依赖修改时间；
-- **文件与文件夹**：同步新建、改名、移动和删除；内容未变化且身份能够确认时，其他设备只调整名称或位置，不会重新传输文件内容；
-- **首次同步与设备接入**：首次执行前预览同步计划；新设备可以加入同名仓库的已有同步状态，已支持的旧版状态通过升级方案接入当前同步方式；
-- **自动处理与冲突**：自动处理单边变化、完全相同的内容和不重叠的文本修改；其余文本提供逐行差异，图片、PDF 等二进制文件展示两端信息并由用户决定；
-- **中断恢复**：上传、下载、删除或状态提交未完成时保留恢复记录，重开 Obsidian、断网、超时或响应丢失后先核对结果，再决定继续或等待处理；
-- **Obsidian 配置与插件**：按需同步编辑器设置、外观、主题、代码片段、快捷键、书签、核心插件和社区插件，社区插件文件、启用状态与数据可以分别管理；
-- **状态与诊断**：在侧栏展示同步计划、进度、历史、冲突和待处理项目，支持连续处理多个决策，并可生成诊断报告；
-- **大仓与大文件**：首次建立共同基线，后续增量检查变化；大文件使用分片上传，移动端下载验证后再替换本地文件。
-
-## 6. 同步范围
-
-### 6.1 默认参与同步
-
-- 仓库中的普通文件与文件夹——笔记、图片、音频、PDF、附件等——默认双向同步；
+- 仓库中的普通文件与文件夹——笔记、图片、音频、PDF、附件等——默认双向同步，无需额外配置；
 - 除此之外的 Obsidian 内容默认不同步，可在设置页“同步范围”中按需开启。
 
-### 6.2 会同步的 Obsidian 配置（白名单）
+其他选项可以按需要开启：
+
+| 设置 | 建议 |
+| --- | --- |
+| 同步排除 | 只影响当前设备；所选文件夹不会上传或下载，现有文件不会仅因排除而被删除 |
+| 同步范围 | 编辑器设置、外观、主题与代码片段、快捷键、书签和核心插件等内容均可独立控制 |
+| 社区插件 | 插件文件可逐项同步；各插件的 `data.json` 由“社区插件数据”单独控制 |
+| 社区插件数据 | 各插件的 `data.json` 可逐项选择；该功能仍属实验性，开启前请备份各设备上的插件设置 |
+| EasySync 自同步 | 默认关闭；需要把 EasySync 更新同步到其他设备时再开启 |
+| 自动同步 | “定时同步”和“修改后触发同步”可分别配置；关闭后仍可手动点击“立即同步” |
+| 自动处理 | “合并不重叠的文本修改”默认开启；“将远端删除同步到本地”默认关闭，无法证明安全时仍会转为冲突或待处理 |
+| 诊断日志 | 日常可以关闭；排查同步问题时开启并生成诊断报告 |
+| 通知弹窗 | 默认显示全部；可改为“仅重要”或“关闭”；登录过期等关键提醒始终显示 |
+
+设置保存在当前设备的插件数据中，并按设备独立生效（如同步排除、通知弹窗等级）；不会自动改变其他设备或仓库的配置。
+
+### 3.1 会同步的 Obsidian 配置（白名单）
 
 开启对应选项后，以下 `.obsidian` 中的对象会同步：
 
@@ -212,18 +160,18 @@ EasySync 的同步路径限制在自己的应用目录：
 
 注意：即使开启了“自动合并不重叠的文本修改”，`.obsidian` 中的文件也不会自动合并——那里的冲突始终由你选择保留本地或云端。
 
-### 6.3 不参与同步的内容
+### 3.2 不参与同步的内容
 
-- `.obsidian` 白名单之外的所有文件：插件在其插件目录中生成的其他文件（配置、缓存、会话记录等）以及配置目录根级的其他文件。例如某些插件会在 `.obsidian` 中产生工作文件，这些文件默认只留在当前设备；
+- `.obsidian` 白名单之外的所有文件——插件在其插件目录中生成的配置、缓存、会话记录等，以及配置目录根级的其他文件——默认只留在当前设备；
 - 点开头的隐藏文件夹（如 `.git`、`.trash`）默认不参与普通同步；`.trash/`、`.DS_Store`、`Thumbs.db` 默认排除；
 - EasySync 自身的状态、缓存、日志与恢复副本永远不参与同步；
 - “同步排除”可以把已参与同步的普通文件夹排除在本设备之外：只影响当前设备，不会删除本机或云端的任何文件。
 
 > 需要跨设备共享的内容，请放在普通可见文件夹中。
 
-## 7. 冲突如何处理
+## 4. 冲突如何处理
 
-EasySync 会记录文件上一次成功同步的内容，并分别判断本地和远端发生了什么变化。
+EasySync 记录每个文件上一次成功同步的内容作为基线，用内容哈希分别比较本地和远端各发生了什么变化。
 
 以下情况可以自动处理：
 
@@ -244,51 +192,63 @@ EasySync 会记录文件上一次成功同步的内容，并分别判断本地�
 
 EasySync 不会因为某个文件“看起来更新”就直接覆盖另一端。
 
-## 8. 使用边界
+## 5. 从其他方式迁移
+
+如果你原本使用其他同步方式，可以按下面的步骤迁移。迁移期间请记住三件事：保留原仓库和独立备份；不要让两种同步工具同时管理同一个本地仓库；启动首次同步后，如果计划里出现预期之外的大量上传、下载或冲突，先取消，检查仓库名、目录层级、同步范围和加密状态再重来。已经放在 EasySync 云端目录里、路径和内容与本地完全一致的文件，首次同步只会建立共同基线，不会重新上传。
+
+### 5.1 从 OneDrive 应用迁移
+
+如果仓库直接位于 OneDrive 同步目录：先确认 OneDrive 已完成同步、所有文件都已完整下载（而不是云端占位符）；关闭 Obsidian，暂停 OneDrive，把整个仓库复制到不受 OneDrive 管理的普通本地目录，并在 Obsidian 中打开这个副本。
+
+安装并启用 EasySync，登录原仓库所在的 OneDrive 账号，但先不要开始同步；通过 OneDrive 网页版，把原仓库根目录下的全部内容复制到 `应用/EasySync/vaults/<你的仓库名>/files/`——直接放入 `files`，不要再多套一层仓库名。最后启动首次同步；确认结果正常后，再处理原 OneDrive 目录中的仓库。
+
+### 5.2 从 Remotely Save 插件迁移
+
+先完成最后一次同步并确认成功，然后停用所有设备上的 Remotely Save。
+
+如果没有启用远端加密，可以通过 OneDrive 网页版，把 `应用/remotely-save/<你的仓库名>/` 中的仓库内容复制到 `应用/EasySync/vaults/<你的仓库名>/files/`；直接复制仓库内容，不要多套一层仓库名，也不要复制 Remotely Save 的控制文件。如果自定义过远端目录，以实际目录为准。
+
+如果启用了远端加密，需要先用 Remotely Save 把仓库完整还原到本地，再由 EasySync 执行首次上传。
+
+### 5.3 从 iOS 的 iCloud 迁移
+
+不要先关闭 iCloud。请在“文件”App 中确认 `iCloud 云盘/Obsidian/<你的仓库名>/` 已完整下载；仍保存在云端的内容可长按并选择“保留下载”。然后在 Obsidian 中创建一个名称相同、但不存储到 iCloud 的本地仓库，关闭 Obsidian，将原仓库根目录下的全部内容复制到 `我的 iPhone/Obsidian/<你的仓库名>/` 或 `我的 iPad/Obsidian/<你的仓库名>/` 中的新仓库。
+
+重新打开 Obsidian，确认笔记、附件和文件夹完整后，再安装 EasySync 并执行首次同步。iCloud 与 EasySync 使用的 OneDrive 是两个独立云端，因此仍需完成一次首次上传；原 iCloud 仓库应保留到 EasySync 上传完成且再次同步结果稳定后，再决定是否删除。
+
+## 6. 使用边界
 
 EasySync 是跨设备文件同步工具，不是多人实时协作系统。
 
-请注意：
-
-- 不要在多个设备上同时编辑同一个文件；
+- 不要在多台设备上同时编辑同一个文件；
 - 不要让 EasySync 与其他同步工具同时管理同一个本地仓库；
-- 单纯的文件或文件夹改名、移动可以按身份同步；如果同时修改内容、目标位置被占用或身份不唯一，可能需要人工处理；
-- 社区插件的同步选择按设备分别生效；在一台设备停用或卸载插件，不会自动删除云端文件或影响其他设备；
-- 社区插件数据仍属实验性，可能替换其他设备上的插件设置，开启前请保留备份；
-- 第一次同步、大量小文件或大文件传输需要更多时间；
-- 自动处理只在安全条件完整时执行，条件不足会停止或转为人工处理；
-- 同步不能代替独立备份，重要资料仍建议定期备份。
+- 同步不能替代独立备份，重要内容请定期备份。
 
-## 9. 许可
+## 7. 常见问题
+
+### 7.1 可以同步多个仓库吗？
+
+可以。数量没有限制，取决于你的 OneDrive 存储空间。同一账号下，仓库名相同的设备同步的是同一个仓库；仓库名不同，就是不同的同步空间，互不影响。
+
+### 7.2 数据安全吗？有端到端加密吗？
+
+EasySync 不提供端到端加密：云端副本是原始文件，保存在你自己的 OneDrive 里，可以随时查看（见第 2 节）。
+
+数据安全来自三方面：文件只保存在你自己的 OneDrive 账号，直连 Microsoft，不经过第三方服务器；删除等敏感操作有确认与保护机制，误删的文件可按账户策略从 OneDrive 回收站恢复；OneDrive 账号自身的登录保护和两步验证同样保护这些文件，建议为 Microsoft 账号开启两步验证。
+
+如果你需要“连云服务商也无法读取内容”的端到端加密，EasySync 目前不提供。
+
+### 7.3 为什么不支持 WebDAV、S3、Google Drive 等其他云端？
+
+EasySync 目前只支持 OneDrive。增量核对、分片上传、变更检测都基于 OneDrive 官方接口的机制实现，不是换个服务器地址就能支持的。如果你正在使用其他同步方案，第 5 节的迁移指南覆盖了从 OneDrive 目录、Remotely Save 和 iCloud 转入的路径。
+
+### 7.4 EasySync 收费吗？
+
+不收费。EasySync 按 [MIT License](LICENSE) 开源，全部功能免费。
+
+## 8. 许可与支持
 
 EasySync 采用 [MIT License](LICENSE) 开源。
 
----
-
-## EasySync in English
-
-EasySync keeps your Obsidian vault in sync across your computer, phone, and tablet, using your own OneDrive account. One-sided changes, identical content, and non-overlapping text edits are handled automatically; other conflicts are shown for you to compare and decide.
-
-### Installation
-
-In Obsidian, open **Settings → Community plugins → Browse → Search for “EasySync” → Install and enable**.
-
-EasySync requires Obsidian `1.11.4` or later.
-
-For manual installation, download `main.js`, `manifest.json`, and `styles.css` from [GitHub Releases](https://github.com/jiaoyingxing/easy-sync/releases) and place them in:
-
-```text
-<your-vault>/.obsidian/plugins/easy-sync/
-```
-
-Then enable EasySync in Obsidian.
-
-### First sync
-
-1. Keep the vault in a normal local folder — do not put it inside a OneDrive, iCloud, or other cloud-sync directory, since EasySync itself is the sync tool.
-2. Use the same vault name on every device: EasySync identifies the cloud sync space by the vault name.
-3. Open **Obsidian Settings → EasySync → Log in with OneDrive** and complete the Microsoft sign-in (on mobile, return to Obsidian when prompted).
-4. On the device with the most complete content, click **Sync now**, review the sync plan, and confirm it.
-5. After the first device finishes, open the same vault on your other devices, install and sign in to EasySync, and click **Sync now** again.
-
-The first sync scans your files and builds a shared baseline, so it can take noticeably longer than later syncs. For migration guides, recommended settings, sync scope, conflict handling, and data & permissions details, see the [full English README](./README-en.md). Released under the [MIT License](LICENSE).
+- 遇到问题：先在 EasySync 设置中生成“诊断报告”，提交问题时附上完整报告；反馈提交到 [GitHub Issues](https://github.com/jiaoyingxing/easy-sync/issues)。
+- 产品交流：小红书搜索 **焦应行** 🔍
