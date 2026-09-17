@@ -7,6 +7,12 @@
   <a href="https://github.com/jiaoyingxing/easy-sync/releases">
     <img alt="Latest release" src="https://img.shields.io/github/v/release/jiaoyingxing/easy-sync?style=flat-square&label=Latest%20release" />
   </a>
+  <a href="https://obsidian.md/plugins?id=easy-sync">
+    <img alt="Obsidian Plugin" src="https://img.shields.io/badge/Obsidian-Plugin-7c3aed?style=flat-square" />
+  </a>
+  <a href="./LICENSE">
+    <img alt="License" src="https://img.shields.io/github/license/jiaoyingxing/easy-sync?style=flat-square" />
+  </a>
   <a href="./README.md">
     <img alt="CN 中文版" src="https://img.shields.io/badge/CN-%E4%B8%AD%E6%96%87%E7%89%88-d32f2f?style=flat-square" />
   </a>
