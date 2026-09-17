@@ -359,7 +359,9 @@ export interface ReviewedFolderSubtreeDeleteBindingV1 {
   version: 1;
   sourceCommitSeq: number;
   sourceLifecycleEpoch: number;
-  rootCTag: string;
+  /** Present only when the platform returned a descendant-sensitive tag
+   *  (OneDrive Personal never returns folder cTags). */
+  rootCTag?: string;
   memberCount: number;
 }
 
@@ -705,6 +707,23 @@ export interface LocalFolderMoveHintV1 {
   remoteId: string;
   fromPath: string;
   toPath: string;
+  observedAt: number;
+}
+
+/**
+ * Device-local deletion-gesture evidence captured from Obsidian's TFolder
+ * delete event. Like the move hint it never authorizes a mutation alone: the
+ * V2 planner consumes it only while the same committed folder ID is still
+ * active, the captured path still equals the anchor's last path, the local
+ * scan confirms the folder is gone and the cloud copy still sits at that
+ * anchor path. Evidence whose anchor retired before consumption is inert and
+ * is cleared by the same remote-id cleanup sweeps as the move hints.
+ */
+export interface LocalFolderDeleteHintV1 {
+  version: 1;
+  scope: SyncScope;
+  remoteId: string;
+  path: string;
   observedAt: number;
 }
 

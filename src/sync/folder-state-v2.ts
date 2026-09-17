@@ -12,6 +12,7 @@ import { planIdentityRenamesFromStateV2 } from "./identity-rename-v2";
 import type {
   LocalFileEntry,
   LocalFolderEntry,
+  LocalFolderDeleteHintV1,
   LocalFolderMoveHintV1,
 } from "./types";
 
@@ -84,6 +85,11 @@ export interface FolderStatePlanInputV2 {
   localFolders: readonly LocalFolderEntry[];
   localFolderScanComplete: boolean;
   localMoveHints?: readonly LocalFolderMoveHintV1[];
+  /** Deletion-gesture evidence from Obsidian's TFolder delete event (P1).
+   *  Valid hints let the planner mirror the deletion instead of failing
+   *  closed into the rename-ambiguity review for an anchored missing
+   *  folder; they never authorize a mutation on their own. */
+  localFolderDeleteHints?: readonly LocalFolderDeleteHintV1[];
   includeFilePath?: (path: string) => boolean;
   includeFolderPath?: (path: string) => boolean;
   /** Remote-only device scope that must not become a folder mutation/conflict. */
@@ -203,6 +209,15 @@ export function planFolderStateFromViewV2(
       && sameScopeIdentity(hint.scope, input.state.scope)
       && nfcPath(hintedAnchor.lastPath) === nfcPath(hint.fromPath);
   });
+  const validLocalDeleteHints = (input.localFolderDeleteHints ?? []).filter((hint) => {
+    const hintedAnchor = anchorByRemoteId.get(hint.remoteId);
+    return hintedAnchor
+      && sameScopeIdentity(hint.scope, input.state.scope)
+      && nfcPath(hintedAnchor.lastPath) === nfcPath(hint.path);
+  });
+  const deleteHintRemoteIds = new Set(
+    validLocalDeleteHints.map((hint) => hint.remoteId),
+  );
   const anchoredRemoteIds = new Set(anchors.map((anchor) => anchor.remoteId));
   const anchoredLastPaths = new Set(anchors.map((anchor) => identityPath(anchor.lastPath)));
   const occupiedAnchoredLocalIdentities = new Set(
@@ -293,6 +308,65 @@ export function planFolderStateFromViewV2(
     (folder) => includeFolderPath(folder.path)
       && !claimedLocalPaths.has(identityPath(folder.path)),
   );
+  // P2: classify the unclaimed local folders once per plan so the anchored
+  // missing-folder decision below can stop treating every unrelated new
+  // folder as rename evidence. A folder is a rename *suspect* when a
+  // descendant file anchor's exact bytes (hash+size) reappear inside its
+  // subtree; a folder holding no descendant bytes at all is *undecidable*
+  // (empty shells have nothing to compare) and stays fail-closed. Folders
+  // with content but zero overlap carry no rename signal at all.
+  const unclaimedIdentityByPath = new Map(
+    unclaimedLocalFolders.map((folder) => [identityPath(folder.path), folder.path]),
+  );
+  const localFilesByContent = new Map<string, LocalFileEntry[]>();
+  for (const file of input.localFiles) {
+    if (!includeFilePath(file.path)) continue;
+    const key = `${file.hash}:${file.size}`;
+    const bucket = localFilesByContent.get(key);
+    if (bucket) bucket.push(file);
+    else localFilesByContent.set(key, [file]);
+  }
+  const unclaimedFileCounts = new Map<string, number>();
+  for (const file of input.localFiles) {
+    if (!includeFilePath(file.path)) continue;
+    let current = identityPath(file.path);
+    for (;;) {
+      const separator = current.lastIndexOf("/");
+      current = separator < 0 ? "" : current.slice(0, separator);
+      if (current === "") break;
+      if (unclaimedIdentityByPath.has(current)) {
+        unclaimedFileCounts.set(current, (unclaimedFileCounts.get(current) ?? 0) + 1);
+      }
+    }
+  }
+  /** Suspect collection is deliberately lazy (per missing anchor) so the
+   *  per-anchor descendant scan is only paid by anchors that actually need
+   *  the ambiguity decision — fully reconciled 50k-folder libraries never
+   *  reach here and keep their linear planning cost. */
+  const unclaimedRenameSuspects = (
+    anchor: FolderAnchorV2,
+  ): string[] => {
+    const suspects = new Set<string>();
+    for (const fileAnchor of input.state.fileAnchors) {
+      if (!isDescendant(fileAnchor.lastPath, anchor.lastPath)
+        || !includeFilePath(fileAnchor.lastPath)) continue;
+      const bucket = fileAnchor.contentHash
+        ? localFilesByContent.get(`${fileAnchor.contentHash}:${fileAnchor.size}`)
+        : undefined;
+      if (!bucket) continue;
+      for (const file of bucket) {
+        let current = identityPath(file.path);
+        for (;;) {
+          const separator = current.lastIndexOf("/");
+          current = separator < 0 ? "" : current.slice(0, separator);
+          if (current === "") break;
+          const original = unclaimedIdentityByPath.get(current);
+          if (original !== undefined) suspects.add(original);
+        }
+      }
+    }
+    return [...suspects].sort();
+  };
 
   for (const anchor of anchors) {
     const remoteNode = input.state.remoteNodeById.get(anchor.remoteId);
@@ -427,12 +501,43 @@ export function planFolderStateFromViewV2(
         ));
         continue;
       }
+      // P1: the user deleted this folder inside the app — the deletion-gesture
+      // evidence binds the same committed folder ID. Mirror the deletion
+      // (delete-remote below) instead of failing closed into the rename
+      // ambiguity review; the executor's empty-shell and CAS guards still
+      // verify every write, and the cloud copy removal goes through the
+      // established If-Match → recycle-bin → read-back chain.
+      if (deleteHintRemoteIds.has(anchor.remoteId)) {
+        candidates.push(actionCandidate(
+          "delete-remote",
+          anchor.lastPath,
+          anchor.lastPath,
+          undefined,
+          anchor.remoteId,
+          [{ side: "remote", root: remotePath }],
+          input,
+          remotePathById,
+        ));
+        continue;
+      }
       // Unclaimed local folders are only potential rename candidates when the
       // remote folder still exists at the anchor's last-known path.  When the
       // folder has moved on remote (path differs), unclaimed locals are
       // unrelated and must not block anchor retirement.
       const remotePathMatchesAnchor = nfcPath(remotePath) === nfcPath(anchor.lastPath);
-      if (unclaimedLocalFolders.length > 0 && remotePathMatchesAnchor) {
+      // P2: a folder counts as rename evidence only when it carries content
+      // overlap with the anchored tree (a descendant file anchor's exact bytes
+      // reappearing inside it); empty shells are undecidable and stay
+      // fail-closed. Unrelated folders with disjoint content no longer block
+      // the mirrored deletion.
+      const renameSuspects = remotePathMatchesAnchor
+        ? unclaimedRenameSuspects(anchor)
+        : [];
+      const undecidableEmpty = remotePathMatchesAnchor
+        ? unclaimedLocalFolders.filter((folder) =>
+            (unclaimedFileCounts.get(identityPath(folder.path)) ?? 0) === 0)
+        : [];
+      if (renameSuspects.length > 0 || undecidableEmpty.length > 0) {
         unresolvedLocalIdentity = true;
         candidates.push(conflictCandidate(
           anchor.lastPath,
@@ -440,7 +545,11 @@ export function planFolderStateFromViewV2(
           anchor.remoteId,
           [
             { side: "remote", root: remotePath },
-            ...unclaimedLocalFolders.map((folder) => ({
+            ...(renameSuspects ?? []).map((folder) => ({
+              side: "local" as const,
+              root: folder,
+            })),
+            ...undecidableEmpty.map((folder) => ({
               side: "local" as const,
               root: folder.path,
             })),

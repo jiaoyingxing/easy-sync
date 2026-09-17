@@ -16,6 +16,7 @@ import {
   type LocalFileEntry,
   type LocalFolderEntry,
   type LocalFolderMoveHintV1,
+  type LocalFolderDeleteHintV1,
   type SyncScope,
 } from "./types";
 
@@ -84,6 +85,7 @@ export interface StaleIdentityResolutionFactsV1 {
   /** Device large-file exclusion threshold in bytes; absent disables the download gate. */
   maxFileSizeBytes?: number;
   localMoveHints?: readonly LocalFolderMoveHintV1[];
+  localFolderDeleteHints?: readonly LocalFolderDeleteHintV1[];
   includeFilePath?: (path: string) => boolean;
   includeFolderPath?: (path: string) => boolean;
   preserveFolderPath?: (path: string) => boolean;

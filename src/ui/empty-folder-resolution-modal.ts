@@ -93,13 +93,13 @@ export class EmptyFolderResolutionModal extends EasySyncModal {
     }
 
     const deleteSetting = new Setting(contentEl)
-      .setName(this.snapshot.remoteCTag
+      .setName(this.snapshot.remoteETag
         ? this.t("syncView.emptyFolder.delete")
         : this.t("syncView.emptyFolder.deleteUnavailable"))
-      .setDesc(this.snapshot.remoteCTag
+      .setDesc(this.snapshot.remoteETag
         ? this.t("syncView.emptyFolder.deleteDescription")
         : this.t("syncView.emptyFolder.deleteUnavailableDescription"));
-    if (this.snapshot.remoteCTag) {
+    if (this.snapshot.remoteETag) {
       deleteSetting.addButton((button) => applyDestructiveButton(button)
         .setButtonText(this.t("syncView.emptyFolder.deleteConfirm"))
         .onClick(() => this.finish({ action: "delete" })));
@@ -177,13 +177,13 @@ export class EmptyFolderResolutionModal extends EasySyncModal {
         .onClick(() => this.finish({ action: "restore" })));
     const root = snapshot.members[0];
     const deleteSetting = new Setting(contentEl)
-      .setName(root?.remoteCTag
+      .setName(root?.remoteETag
         ? this.t("syncView.folderSubtree.deleteTitle")
         : this.t("syncView.folderSubtree.deleteUnavailableTitle"))
-      .setDesc(root?.remoteCTag
+      .setDesc(root?.remoteETag
         ? this.t("syncView.folderSubtree.deleteDescription")
         : this.t("syncView.folderSubtree.deleteUnavailableDescription"));
-    if (root?.remoteCTag) {
+    if (root?.remoteETag) {
       deleteSetting.addButton((button) => applyDestructiveButton(button)
         .setButtonText(this.t("syncView.folderSubtree.delete"))
         .onClick(() => this.finish({ action: "delete-subtree" })));

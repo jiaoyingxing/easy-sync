@@ -3245,6 +3245,17 @@ export class EasySyncSyncView extends ItemView {
       panel.createDiv("setting-item-description").setText(
         t("syncPlan.remoteScopeRecreateSummary"),
       );
+    } else if (
+      // Ordinary plans only: the dedicated review kinds keep their own single
+      // sentence, and a clean plan stays silent. The note states the confirm
+      // button's boundary — decision rows are not executed by it.
+      items.some((item) =>
+        item.type === SyncActionType.Conflict
+        || item.type === SyncActionType.ConfirmLocalDelete)
+    ) {
+      panel.createDiv("setting-item-description").setText(
+        t("syncPlan.confirmBoundarySummary"),
+      );
     }
 
     if (counts && items.length === 0) {

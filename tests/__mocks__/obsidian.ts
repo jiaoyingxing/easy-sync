@@ -53,6 +53,9 @@ export const Platform = {
   isMobileApp: false,
 };
 
+// getLanguage — Obsidian's UI language (tests override per case; "" = unavailable)
+export const getLanguage = vi.fn((): string => "");
+
 // FileSystemAdapter — desktop vault adapter with an inspectable base path
 export class FileSystemAdapter {
   constructor(private readonly mockBasePath = "") {}

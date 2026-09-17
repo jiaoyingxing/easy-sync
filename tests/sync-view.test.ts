@@ -397,7 +397,7 @@ describe("sync view status copy and scrolling layout", () => {
       '.setButtonText(this.t("syncView.emptyFolder.restore"))',
     );
     expect(modalSource).toContain(
-      '.setName(this.snapshot.remoteCTag\n        ? this.t("syncView.emptyFolder.delete")',
+      '.setName(this.snapshot.remoteETag\n        ? this.t("syncView.emptyFolder.delete")',
     );
     expect(modalSource).toContain(
       '.setButtonText(this.t("syncView.emptyFolder.deleteConfirm"))',
@@ -420,7 +420,7 @@ describe("sync view status copy and scrolling layout", () => {
       '.setButtonText(this.t("syncView.folderSubtree.restore"))',
     );
     expect(modalSource).toContain(
-      '.setName(root?.remoteCTag\n        ? this.t("syncView.folderSubtree.deleteTitle")',
+      '.setName(root?.remoteETag\n        ? this.t("syncView.folderSubtree.deleteTitle")',
     );
     expect(modalSource).toContain(
       '.setButtonText(this.t("syncView.folderSubtree.delete"))',
@@ -1963,6 +1963,29 @@ describe("buildSyncViewContentKey", () => {
       /\.easy-sync-plan-measure-probe\s*\{[^}]*visibility:\s*hidden;[^}]*pointer-events:\s*none;/s,
     );
     expect(styles).not.toMatch(/\.easy-sync-plan-virtual-window > \.easy-sync-file-row\s*\{/s);
+  });
+
+  it("renders the confirm boundary note only for ordinary plans with decision rows", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const sectionStart = source.indexOf("private renderPlanReviewSection");
+    const sectionEnd = source.indexOf("private renderPlanGroups", sectionStart);
+    const section = source.slice(sectionStart, sectionEnd);
+
+    // Dedicated review kinds keep their own single sentence; the boundary note
+    // only reaches ordinary plans through the trailing else-if branch, keyed
+    // on the plan's own decision rows (2026-09-17 DECISIONS).
+    const migrationIndex = section.indexOf('"syncPlan.migrationSummary"');
+    const joinIndex = section.indexOf('"syncPlan.cloudJoinSummary"');
+    const recreateIndex = section.indexOf(
+      '"syncPlan.remoteScopeRecreateSummary"',
+    );
+    const boundaryIndex = section.indexOf('"syncPlan.confirmBoundarySummary"');
+    expect(migrationIndex).toBeGreaterThan(-1);
+    expect(joinIndex).toBeGreaterThan(-1);
+    expect(recreateIndex).toBeGreaterThan(-1);
+    expect(boundaryIndex).toBeGreaterThan(recreateIndex);
+    expect(section).toContain("SyncActionType.Conflict");
+    expect(section).toContain("SyncActionType.ConfirmLocalDelete");
   });
 
   it("preserves an opened plan group and scroll position across side-action rerenders", () => {

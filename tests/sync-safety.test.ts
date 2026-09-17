@@ -22175,3 +22175,210 @@ describe("size exclusion baseline — skip rows are incremental", () => {
     expect(await mockState.getSizeExclusionBaseline()).toEqual([]);
   });
 });
+
+describe("reviewed decisions rebuilt from current local facts (P3)", () => {
+  const scope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+  const base: BaseFileEntry = {
+    path: "note.md",
+    size: 4,
+    hash: "bb".repeat(32),
+    eTag: "etag-base",
+  };
+  const local: LocalFileEntry = {
+    path: "note.md",
+    size: 5,
+    mtime: 2,
+    hash: "aa".repeat(32),
+    binary: false,
+  };
+  const remote: RemoteFileEntry = {
+    path: "note.md",
+    driveId: "remote-note",
+    parentId: TEST_SYNC_SCOPE.filesRootId,
+    size: 6,
+    mtime: 3,
+    eTag: "etag-remote",
+    cTag: "ctag-remote",
+    sha256Hash: "cc".repeat(32),
+  };
+  const changedLocal: LocalFileEntry = {
+    path: "note.md",
+    size: 9,
+    mtime: 9,
+    hash: "dd".repeat(32),
+    binary: false,
+  };
+  const conflictToken = {
+    version: 1 as const,
+    vaultName: "testVault",
+    accountId: "account-id",
+    scope,
+    local: { exists: true, hash: local.hash, size: local.size },
+    remote: { exists: true, driveId: remote.driveId, eTag: remote.eTag },
+    ancestorHash: base.hash,
+  };
+  const conflictItem = {
+    type: SyncActionType.Conflict,
+    path: "note.md",
+    local,
+    remote,
+    reason: "reason.bothSidesModified",
+    decisionToken: conflictToken,
+  } as unknown as SyncPlanItem;
+  const deleteToken = {
+    version: 1 as const,
+    vaultName: "testVault",
+    accountId: "account-id",
+    scope,
+    local: { exists: true, hash: local.hash, size: local.size },
+    remote: { exists: false },
+    ancestorHash: base.hash,
+  };
+  const remoteDeleteItem = {
+    type: SyncActionType.ConfirmLocalDelete,
+    path: "note.md",
+    local,
+    remote: undefined,
+    reason: "reason.fileDeletedFromRemote",
+    decisionToken: deleteToken,
+  } as unknown as SyncPlanItem;
+
+  function makeReviewScanner(inspection: unknown): LocalScanner {
+    return {
+      vault: {
+        adapter: makeMockAdapter(),
+        getFiles: vi.fn().mockReturnValue([]),
+        getName: vi.fn().mockReturnValue("testVault"),
+      },
+      shouldSyncPath: vi.fn().mockReturnValue(true),
+      inspectFile: vi.fn().mockResolvedValue(inspection),
+    } as unknown as LocalScanner;
+  }
+
+  it("rebuilds a conflict row as delete/modify when the local file is gone", async () => {
+    const state = makeActiveV2State([remote], [base], {
+      addPendingConflict: vi.fn().mockResolvedValue(undefined),
+      removePendingDelete: vi.fn().mockResolvedValue(undefined),
+      pendingConflicts: [conflictItem],
+    });
+    const uploadFile = vi.fn();
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ uploadFile }),
+      makeReviewScanner({ status: "missing" }),
+      state,
+      "testVault",
+    );
+
+    await executor.resolveConflictKeepLocal("note.md");
+
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(state.addPendingConflict).toHaveBeenCalledTimes(1);
+    expect(state.addPendingConflict.mock.calls[0][0]).toMatchObject({
+      type: SyncActionType.Conflict,
+      path: "note.md",
+      local: undefined,
+      remote: expect.objectContaining({ driveId: remote.driveId }),
+      reason: "reason.localDeletedRemoteModified",
+      decisionToken: expect.objectContaining({
+        local: { exists: false },
+        remote: { exists: true, driveId: remote.driveId, eTag: remote.eTag },
+      }),
+    });
+  });
+
+  it("rebuilds a conflict row with the current local version when it changed", async () => {
+    const state = makeActiveV2State([remote], [base], {
+      addPendingConflict: vi.fn().mockResolvedValue(undefined),
+      removePendingDelete: vi.fn().mockResolvedValue(undefined),
+      pendingConflicts: [conflictItem],
+    });
+    const uploadFile = vi.fn();
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ uploadFile }),
+      makeReviewScanner({ status: "present", entry: changedLocal }),
+      state,
+      "testVault",
+    );
+
+    await executor.resolveConflictKeepLocal("note.md");
+
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(state.addPendingConflict).toHaveBeenCalledTimes(1);
+    expect(state.addPendingConflict.mock.calls[0][0]).toMatchObject({
+      type: SyncActionType.Conflict,
+      path: "note.md",
+      local: expect.objectContaining({ hash: changedLocal.hash }),
+      remote: expect.objectContaining({ driveId: remote.driveId }),
+      reason: "reason.bothSidesModified",
+      decisionToken: expect.objectContaining({
+        local: { exists: true, hash: changedLocal.hash, size: changedLocal.size },
+      }),
+    });
+  });
+
+  it("keeps the plain block on an uncertain local read without rebuilding", async () => {
+    const state = makeActiveV2State([remote], [base], {
+      addPendingConflict: vi.fn().mockResolvedValue(undefined),
+      removePendingDelete: vi.fn().mockResolvedValue(undefined),
+      pendingConflicts: [conflictItem],
+    });
+    const uploadFile = vi.fn();
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ uploadFile }),
+      makeReviewScanner({ status: "uncertain", reason: "stat" }),
+      state,
+      "testVault",
+    );
+
+    await executor.resolveConflictKeepLocal("note.md");
+
+    expect(uploadFile).not.toHaveBeenCalled();
+    expect(state.addPendingConflict).not.toHaveBeenCalled();
+    expect(state.pendingConflicts).toHaveLength(1);
+  });
+
+  it("retires a pending remote delete outright when the local file is gone", async () => {
+    const state = makeActiveV2State([remote], [base], {
+      addPendingConflict: vi.fn().mockResolvedValue(undefined),
+      removePendingDelete: vi.fn().mockResolvedValue(undefined),
+      pendingRemoteDeletes: [remoteDeleteItem],
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({}),
+      makeReviewScanner({ status: "missing" }),
+      state,
+      "testVault",
+    );
+
+    await executor.confirmRemoteDelete("note.md");
+
+    expect(state.removePendingDelete).toHaveBeenCalledWith("note.md");
+    expect(state.addPendingConflict).not.toHaveBeenCalled();
+  });
+
+  it("turns a changed local file into a delete/modify conflict instead of deleting it", async () => {
+    const state = makeActiveV2State([remote], [base], {
+      addPendingConflict: vi.fn().mockResolvedValue(undefined),
+      removePendingDelete: vi.fn().mockResolvedValue(undefined),
+      pendingRemoteDeletes: [remoteDeleteItem],
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({}),
+      makeReviewScanner({ status: "present", entry: changedLocal }),
+      state,
+      "testVault",
+    );
+
+    await executor.confirmRemoteDelete("note.md");
+
+    expect(state.addPendingConflict).toHaveBeenCalledTimes(1);
+    expect(state.addPendingConflict.mock.calls[0][0]).toMatchObject({
+      type: SyncActionType.Conflict,
+      path: "note.md",
+      local: expect.objectContaining({ hash: changedLocal.hash }),
+      remote: undefined,
+      reason: "reason.remoteDeletedLocalModified",
+    });
+    expect(state.removePendingDelete).toHaveBeenCalledWith("note.md");
+  });
+});

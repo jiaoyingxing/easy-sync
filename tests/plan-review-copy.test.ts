@@ -29,3 +29,34 @@ describe("plan review quiet-period guidance", () => {
     );
   });
 });
+
+/** Finalized copy (2026-09-17, DECISIONS): the plan review section states the
+ *  confirm button's boundary in one sentence when the ordinary plan contains
+ *  decision rows (conflicts / deletions awaiting approval), and the cloud-join
+ *  summary drops the internal "sync state" wording for plain user language. */
+describe("plan confirm boundary sentence and cloud join summary", () => {
+  it("boundary sentence is pinned verbatim in both locales", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+
+    expect(zh.t("syncPlan.confirmBoundarySummary")).toBe(
+      "本次只执行上传、下载等常规操作；冲突和云端已删除的文件不碰，完成后由你决定。",
+    );
+    expect(en.t("syncPlan.confirmBoundarySummary")).toBe(
+      "This sync only performs routine operations such as uploads and downloads; conflicts and files already deleted from the cloud are left untouched, and you decide them once it completes.",
+    );
+  });
+
+  it("cloud join summary speaks of joining an existing sync, not sync state", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+
+    expect(zh.t("syncPlan.cloudJoinSummary")).toBe(
+      "本设备正在加入已有同步。确认计划后，EasySync 会先完成本机登记，再按计划同步文件。",
+    );
+    expect(en.t("syncPlan.cloudJoinSummary")).toBe(
+      "This device is joining an existing sync. After you confirm the plan, EasySync will first set up the local record, then sync files according to the plan.",
+    );
+    expect(zh.t("syncPlan.cloudJoinSummary")).not.toContain("同步状态");
+  });
+});

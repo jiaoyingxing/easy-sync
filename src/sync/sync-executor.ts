@@ -803,6 +803,18 @@ interface InFlightTransfer {
   direction: "upload" | "download";
   bytesSoFar: number;
   startedAt: number;
+  callStart: number;
+}
+
+/** One settled transport call's real movement (direction 2, 2026-09-17):
+ *  the connection-speed sampler folds each call at its own bytes/wall, so
+ *  overlapping calls no longer divide the aggregate and sub-second calls no
+ *  longer crawl behind the smoothing prior. */
+export interface TransferCallSample {
+  direction: "upload" | "download";
+  bytes: number;
+  ms: number;
+  at: number;
 }
 
 export type AutomaticMergeManualReason =
@@ -1414,6 +1426,7 @@ export class SyncExecutor {
     private onProgressUpdate?: () => void,
     private lifecycle: OperationLifecycle = new OperationLifecycle(),
     private noticeCenter: EasySyncNoticeCenter = new EasySyncNoticeCenter(),
+    private onTransferCallSample?: (sample: TransferCallSample) => void,
   ) {}
 
   /** Live accumulator of the run in flight; the connection-speed sampler
@@ -1476,7 +1489,12 @@ export class SyncExecutor {
     onProgress: ((downloaded: number, total: number) => void) | undefined,
     transfer: (report: (downloaded: number, total: number) => void) => Promise<T>,
   ): Promise<T> {
-    const handle: InFlightTransfer = { direction, bytesSoFar: 0, startedAt: 0 };
+    const handle: InFlightTransfer = {
+      direction,
+      bytesSoFar: 0,
+      startedAt: 0,
+      callStart: Date.now(),
+    };
     this.inFlightTransfers.add(handle);
     try {
       return await transfer((downloaded, total) => {
@@ -1488,6 +1506,16 @@ export class SyncExecutor {
       });
     } finally {
       this.inFlightTransfers.delete(handle);
+      // A settled call that moved bytes is a real throughput measurement
+      // regardless of how the call ended — fold it at its own bytes/wall.
+      if (handle.bytesSoFar > 0) {
+        this.onTransferCallSample?.({
+          direction,
+          bytes: handle.bytesSoFar,
+          ms: Date.now() - handle.callStart,
+          at: Date.now(),
+        });
+      }
     }
   }
 
@@ -2616,7 +2644,6 @@ export class SyncExecutor {
           || current.revision !== reviewed.revision
           || root?.kind !== "folder"
           || !root.remoteETag
-          || !root.remoteCTag
           || !this.activeSyncScope
           || !sameSyncScope(current.scope, this.activeSyncScope)
           || !this.canContinue(operationEpoch)
@@ -2650,7 +2677,10 @@ export class SyncExecutor {
             version: 1,
             sourceCommitSeq: current.sourceCommitSeq,
             sourceLifecycleEpoch: current.sourceLifecycleEpoch,
-            rootCTag: root.remoteCTag,
+            // OneDrive Personal never returns folder cTags; the credential
+            // here is the per-member live subtree match above, with the root
+            // eTag as the If-Match fallback below.
+            ...(root.remoteCTag ? { rootCTag: root.remoteCTag } : {}),
             memberCount: current.members.length,
           },
           createdAt: Date.now(),
@@ -2681,7 +2711,11 @@ export class SyncExecutor {
                 await this.onedrive.deleteItem(
                   this.vaultName,
                   current.path,
-                  root.remoteCTag,
+                  // Mirror the empty-shell delete fallback: the per-member
+                  // live match above re-verified every identity, so the
+                  // verified root eTag carries the If-Match when the
+                  // platform provides no descendant-sensitive tag.
+                  root.remoteCTag ?? root.remoteETag,
                   root.remoteId,
                 );
               } catch (error) {
@@ -2875,7 +2909,7 @@ export class SyncExecutor {
     reviewed: Readonly<EmptyFolderResolutionSnapshotV1>,
   ): Promise<void> {
     if (this.stopSideActionForStateRecovery()) return;
-    if (!reviewed.remoteCTag) {
+    if (!reviewed.remoteETag) {
       this.notice("notice.emptyFolder.deleteUnavailable", {
         path: reviewed.path,
       });
@@ -2890,7 +2924,7 @@ export class SyncExecutor {
           "deleteRemoteFolder",
           operationEpoch,
           async (latest) => {
-            if (!latest.remoteCTag) {
+            if (!latest.remoteETag) {
               throw new MutationNotAppliedError(
                 this.t("notice.emptyFolder.deleteUnavailable", {
                   path: latest.path,
@@ -2901,7 +2935,11 @@ export class SyncExecutor {
               await this.onedrive.deleteItem(
                 this.vaultName,
                 latest.path,
-                latest.remoteCTag,
+                // The exact-empty inspection re-verified identity and eTag
+                // twice (by id and by path, children empty, versions
+                // stable); Personal returns no folder cTag, so the verified
+                // eTag carries the If-Match.
+                latest.remoteCTag ?? latest.remoteETag,
                 latest.remoteId,
               );
             } catch (error) {
@@ -4259,6 +4297,7 @@ export class SyncExecutor {
       localFolders: scan.folders,
       localFolderScanComplete: scan.folderScanComplete,
       localMoveHints: this.state.localFolderMoveHints,
+      localFolderDeleteHints: this.state.localFolderDeleteHints,
       includeFilePath: scope.includeFilePath,
       includeFolderPath: scope.includeFolderPath,
       preserveFolderPath: scope.preserveFolderPath,
@@ -4304,6 +4343,7 @@ export class SyncExecutor {
       localFolders: scan.folders,
       localFolderScanComplete: scan.folderScanComplete,
       localMoveHints: this.state.localFolderMoveHints,
+      localFolderDeleteHints: this.state.localFolderDeleteHints,
       includeFilePath: scope.includeFilePath,
       includeFolderPath: scope.includeFolderPath,
       preserveFolderPath: scope.preserveFolderPath,
@@ -4334,6 +4374,7 @@ export class SyncExecutor {
       localFolders: scan.folders,
       localFolderScanComplete: scan.folderScanComplete,
       localMoveHints: this.state.localFolderMoveHints,
+      localFolderDeleteHints: this.state.localFolderDeleteHints,
       includeFilePath: scope.includeFilePath,
       includeFolderPath: scope.includeFolderPath,
       preserveFolderPath: scope.preserveFolderPath,
@@ -4454,6 +4495,7 @@ export class SyncExecutor {
       localFolders: scan.folders,
       localFolderScanComplete: scan.folderScanComplete,
       localMoveHints: this.state.localFolderMoveHints,
+      localFolderDeleteHints: this.state.localFolderDeleteHints,
       includeFilePath: scope.includeFilePath,
       includeFolderPath: scope.includeFolderPath,
       preserveFolderPath: scope.preserveFolderPath,
@@ -4522,6 +4564,7 @@ export class SyncExecutor {
         skippedLarge: scan.skippedLarge,
         maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
         localMoveHints: this.state.localFolderMoveHints,
+        localFolderDeleteHints: this.state.localFolderDeleteHints,
         includeFilePath: scope.includeFilePath,
         includeFolderPath: scope.includeFolderPath,
         preserveFolderPath: scope.preserveFolderPath,
@@ -4926,32 +4969,88 @@ export class SyncExecutor {
   }
 
   /** Compare the current local file with the exact version shown to the user.
-   *  Legacy scanner doubles do not expose inspectFile(); production always does. */
-  private async reviewedLocalVersionStillMatches(
-    path: string,
-    expected: LocalFileEntry | undefined,
-  ): Promise<boolean> {
-    const current = await this.inspectLocalPath(path);
-    return current === null || this.localExpectationMatches(expected, current);
-  }
-
+   *  Legacy scanner doubles do not expose inspectFile(); production always does.
+   *  When the decision's local facts have demonstrably changed (present but
+   *  different, or now missing), mirror guardReviewedRemoteVersion: rebuild
+   *  the pending row from current facts with a fresh decision token instead of
+   *  re-blocking the same stale snapshot forever (SC-07: re-show the current
+   *  difference, never silently reuse or execute the old choice). Uncertain
+   *  reads and scanners without inspection keep the plain block — a failed
+   *  read is not a fact change. */
   private async guardReviewedLocalVersion(
     path: string,
     expected: LocalFileEntry | undefined,
     noticeKey: "notice.conflict.failed" | "notice.delete.failed",
+    refresh?: { pendingKind: "conflict" | "delete"; item: SyncPlanItem },
   ): Promise<boolean> {
+    let current: LocalFileInspection | null;
     try {
-      if (await this.reviewedLocalVersionStillMatches(path, expected)) return true;
+      current = await this.inspectLocalPath(path);
+      if (current === null || this.localExpectationMatches(expected, current)) return true;
     } catch (error) {
       this.diag?.warn(
         "execute",
         `local version check failed before reviewed action — ${path}`,
         error instanceof Error ? error.message : String(error),
       );
+      this.diag?.warn("execute", `reviewed action blocked — ${path} changed locally`);
+      this.notice(noticeKey, { path, reason: this.t("notice.localChangedSinceReview") });
+      return false;
     }
-    this.diag?.warn("execute", `reviewed action blocked — ${path} changed locally`);
-    this.notice(noticeKey, { path, reason: this.t("notice.localChangedSinceReview") });
+    if (current.status === "uncertain" || !refresh) {
+      this.diag?.warn("execute", `reviewed action blocked — ${path} changed locally`);
+      this.notice(noticeKey, { path, reason: this.t("notice.localChangedSinceReview") });
+      return false;
+    }
+    await this.refreshPendingDecisionAfterLocalChange(refresh.pendingKind, refresh.item, current);
+    this.diag?.warn(
+      "execute",
+      `reviewed decision rebuilt from current local facts — ${path} (${current.status})`,
+    );
+    this.notice(noticeKey, { path, reason: this.t("notice.decisionExpired") });
     return false;
+  }
+
+  /** Rebuild one pending decision row from current local facts, mirroring the
+   *  remote-side rebuild inside guardReviewedRemoteVersion. Conflict rows are
+   *  upserted with the current local entry and a fresh decision token; the
+   *  remote side keeps the reviewed value because the remote guard re-verifies
+   *  it on the next attempt and rebuilds again if it drifted. A pending
+   *  remote-delete row whose local file is now gone retires outright (both
+   *  sides absent, nothing left to confirm); one whose local file changed
+   *  becomes a delete/modify conflict for the user to re-decide. */
+  private async refreshPendingDecisionAfterLocalChange(
+    pendingKind: "conflict" | "delete",
+    item: SyncPlanItem,
+    current: LocalFileInspection,
+  ): Promise<void> {
+    const local = current.status === "present" ? current.entry ?? undefined : undefined;
+    if (pendingKind === "conflict") {
+      await this.state.addPendingConflict(this.withDecisionToken({
+        type: SyncActionType.Conflict,
+        path: item.path,
+        local,
+        remote: item.remote,
+        reason: local && item.remote
+          ? "reason.bothSidesModified"
+          : local
+            ? "reason.remoteDeletedLocalModified"
+            : "reason.localDeletedRemoteModified",
+      }));
+      return;
+    }
+    if (!local) {
+      await this.state.removePendingDelete(item.path);
+      return;
+    }
+    await this.state.addPendingConflict(this.withDecisionToken({
+      type: SyncActionType.Conflict,
+      path: item.path,
+      local,
+      remote: undefined,
+      reason: "reason.remoteDeletedLocalModified",
+    }));
+    await this.state.removePendingDelete(item.path);
   }
 
   private createDecisionToken(item: SyncPlanItem): SyncDecisionToken {
@@ -8179,6 +8278,7 @@ export class SyncExecutor {
           skippedLarge,
           maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
           localMoveHints: this.state.localFolderMoveHints,
+          localFolderDeleteHints: this.state.localFolderDeleteHints,
           localFileMoveHints: this.state.localFileMoveHints,
           includeFilePath: includeCanonicalFilePath,
           includeFolderPath: includeCanonicalFolderPath,
@@ -8196,6 +8296,7 @@ export class SyncExecutor {
           skippedLarge,
           maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
           localMoveHints: this.state.localFolderMoveHints,
+          localFolderDeleteHints: this.state.localFolderDeleteHints,
           localFileMoveHints: this.state.localFileMoveHints,
           includeFilePath: includeCanonicalFilePath,
           includeFolderPath: includeCanonicalFolderPath,
@@ -8328,6 +8429,7 @@ export class SyncExecutor {
                   skippedLarge,
                   maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
                   localMoveHints: this.state.localFolderMoveHints,
+                  localFolderDeleteHints: this.state.localFolderDeleteHints,
                   localFileMoveHints: this.state.localFileMoveHints,
                   includeFilePath: includeCanonicalFilePath,
                   includeFolderPath: includeCanonicalFolderPath,
@@ -8370,6 +8472,7 @@ export class SyncExecutor {
             skippedLarge,
             maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
             localMoveHints: this.state.localFolderMoveHints,
+            localFolderDeleteHints: this.state.localFolderDeleteHints,
             localFileMoveHints: this.state.localFileMoveHints,
             includeFilePath: includeCanonicalFilePath,
             includeFolderPath: includeCanonicalFolderPath,
@@ -8767,6 +8870,7 @@ export class SyncExecutor {
               skippedLarge,
               maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
               localMoveHints: this.state.localFolderMoveHints,
+              localFolderDeleteHints: this.state.localFolderDeleteHints,
               localFileMoveHints: this.state.localFileMoveHints,
               includeFilePath: includeCanonicalFilePath,
               includeFolderPath: includeCanonicalFolderPath,
@@ -8787,6 +8891,7 @@ export class SyncExecutor {
             skippedLarge,
             maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
             localMoveHints: this.state.localFolderMoveHints,
+            localFolderDeleteHints: this.state.localFolderDeleteHints,
             localFileMoveHints: this.state.localFileMoveHints,
             includeFilePath: includeCanonicalFilePath,
             includeFolderPath: includeCanonicalFolderPath,
@@ -10059,6 +10164,7 @@ export class SyncExecutor {
                 localFolderScanComplete: true,
                 skippedLarge: continuationScan.skippedLarge,
                 localMoveHints: this.state.localFolderMoveHints,
+                localFolderDeleteHints: this.state.localFolderDeleteHints,
                 localFileMoveHints: this.state.localFileMoveHints,
                 includeFilePath: includeContinuationFilePath,
                 includeFolderPath: includeCanonicalFolderPath,
@@ -21310,7 +21416,10 @@ export class SyncExecutor {
           hash: proof.localHash,
           size: proof.localSize,
         };
-        if (!await this.guardReviewedLocalVersion(path, expectedLocal, "notice.conflict.failed")) return;
+        if (!await this.guardReviewedLocalVersion(path, expectedLocal, "notice.conflict.failed", {
+          pendingKind: "conflict",
+          item: queued,
+        })) return;
         if (!await this.guardReviewedRemoteVersion(queued, "notice.conflict.failed", "conflict")) return;
         if (!this.canContinue(operationEpoch)) return;
         await this.stageVerifiedLocalAncestorContent([{
@@ -21571,7 +21680,10 @@ export class SyncExecutor {
       if (queuedConflict?.remote && !queuedConflict.local) {
         try {
           if (!this.guardDecisionToken(queuedConflict, "notice.conflict.failed")) return;
-          if (!await this.guardReviewedLocalVersion(path, undefined, "notice.conflict.failed")) return;
+          if (!await this.guardReviewedLocalVersion(path, undefined, "notice.conflict.failed", {
+            pendingKind: "conflict",
+            item: queuedConflict,
+          })) return;
           if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict")) return;
           if (!this.canContinue(operationEpoch)) return;
           const intent = this.createSideMutationIntent(queuedConflict, "deleteRemote");
@@ -21608,7 +21720,10 @@ export class SyncExecutor {
         const managedConfig = isObsidianManagedConfigPath(path, getConfigDir(this.scanner.vault));
         if (!this.guardDecisionToken(queuedConflict, "notice.conflict.failed")) return;
         if (!managedConfig
-          && !await this.guardReviewedLocalVersion(path, queuedConflict.local, "notice.conflict.failed")) return;
+          && !await this.guardReviewedLocalVersion(path, queuedConflict.local, "notice.conflict.failed", {
+            pendingKind: "conflict",
+            item: queuedConflict,
+          })) return;
         if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict")) return;
         const content = await this.scanner.vault.adapter.readBinary(path);
         const uploadLocal = managedConfig
@@ -21690,7 +21805,10 @@ export class SyncExecutor {
       if (queuedConflict?.local && !queuedConflict.remote) {
         try {
           if (!this.guardDecisionToken(queuedConflict, "notice.conflict.failed")) return;
-          if (!await this.guardReviewedLocalVersion(path, queuedConflict.local, "notice.conflict.failed")) return;
+          if (!await this.guardReviewedLocalVersion(path, queuedConflict.local, "notice.conflict.failed", {
+            pendingKind: "conflict",
+            item: queuedConflict,
+          })) return;
           if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict")) return;
           if (!this.canContinue(operationEpoch)) return;
           const intent = this.createSideMutationIntent(queuedConflict, "deleteLocal");
@@ -21719,7 +21837,10 @@ export class SyncExecutor {
         const managedConfig = isObsidianManagedConfigPath(path, getConfigDir(this.scanner.vault));
         if (!this.guardDecisionToken(queuedConflict, "notice.conflict.failed")) return;
         if (!managedConfig
-          && !await this.guardReviewedLocalVersion(path, queuedConflict.local, "notice.conflict.failed")) return;
+          && !await this.guardReviewedLocalVersion(path, queuedConflict.local, "notice.conflict.failed", {
+            pendingKind: "conflict",
+            item: queuedConflict,
+          })) return;
         if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict")) return;
         if (managedConfig) {
           const content = await this.replaceManagedConfigWithRemote(queuedConflict, operationEpoch);
@@ -21745,7 +21866,10 @@ export class SyncExecutor {
                 new Error("Reviewed download cancelled before local commit"),
               );
             }
-            if (!await this.guardReviewedLocalVersion(path, queuedConflict.local, "notice.conflict.failed")) {
+            if (!await this.guardReviewedLocalVersion(path, queuedConflict.local, "notice.conflict.failed", {
+              pendingKind: "conflict",
+              item: queuedConflict,
+            })) {
               throw new MutationNotAppliedError(undefined, true);
             }
             if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict")) {
@@ -22023,7 +22147,10 @@ export class SyncExecutor {
           return;
         }
         if (!this.guardDecisionToken(pending, "notice.delete.failed")) return;
-        if (!await this.guardReviewedLocalVersion(path, pending.local, "notice.delete.failed")) return;
+        if (!await this.guardReviewedLocalVersion(path, pending.local, "notice.delete.failed", {
+          pendingKind: "delete",
+          item: pending,
+        })) return;
         if (
           options?.preverifiedAbsent !== true
           && !await this.guardReviewedRemoteVersion(
@@ -22142,7 +22269,10 @@ export class SyncExecutor {
       }
       try {
         if (!this.guardDecisionToken(pending, "notice.delete.failed")) return;
-        if (!await this.guardReviewedLocalVersion(path, pending.local, "notice.delete.failed")) return;
+        if (!await this.guardReviewedLocalVersion(path, pending.local, "notice.delete.failed", {
+          pendingKind: "delete",
+          item: pending,
+        })) return;
         if (!await this.guardReviewedRemoteVersion(pending, "notice.delete.failed", "delete")) return;
         const content = await this.scanner.vault.adapter.readBinary(path);
         const contentHash = typeof (this.scanner as LocalScanner & { inspectFile?: unknown }).inspectFile === "function"

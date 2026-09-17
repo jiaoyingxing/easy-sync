@@ -859,6 +859,7 @@ export interface LocaleStrings {
   "syncPlan.restoreDetails": string;
   "syncPlan.noChanges": string;
   "syncPlan.remoteScopeRecreateSummary": string;
+  "syncPlan.confirmBoundarySummary": string;
 
   // ---- Status Bar Plan Review ----
   "status.planReview": string;

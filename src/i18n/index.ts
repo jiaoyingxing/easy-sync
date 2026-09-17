@@ -5,8 +5,9 @@
  * and provides a t() function for user-visible strings.
  *
  * Language Detection:
- *  - Reads Obsidian's configured language from app.vault.getConfig('language')
- *  - Falls back to navigator.language, then 'en'
+ *  - Official API first: getLanguage() (Obsidian's UI language)
+ *  - Builds without that API: app.vault.getConfig('language'),
+ *    then navigator.language, then 'en'
  *  - Map: 'zh' | 'zh-cn' | 'zh-tw' | 'zh-hk' → zh-CN locale
  *
  * Usage:
@@ -21,6 +22,7 @@
  */
 
 import type { LocaleStrings, LocaleMap } from "./types";
+import { getLanguage } from "obsidian";
 import en from "./en";
 import zhCN from "./zh-cn";
 
@@ -84,16 +86,12 @@ export class I18n {
   static detectLanguage(app?: {
     vault?: { getConfig?: (key: string) => string };
   }): string {
-    // 1. Try Obsidian vault config
+    // 1. Official API: the app's UI language (empty on builds without it)
+    const official = typeof getLanguage === "function" ? getLanguage() : "";
+    if (official) return official;
+    // 2. Vault config fallback for builds without the official API
     const obsidianLang = app?.vault?.getConfig?.("language");
     if (obsidianLang) return obsidianLang;
-    // 2. Try localStorage (Obsidian stores language here)
-    try {
-      const stored = typeof localStorage === "undefined"
-        ? undefined
-        : localStorage.getItem("language");
-      if (stored) return stored;
-    } catch { /* sandboxed */ }
     // 3. Fall back to browser/Electron language
     if (typeof navigator !== "undefined" && navigator.language) {
       return navigator.language;

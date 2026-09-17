@@ -5,6 +5,7 @@ import type {
   LocalFileEntry,
   LocalFolderEntry,
   LocalFolderMoveHintV1,
+  LocalFolderDeleteHintV1,
   RemoteFolderEntry,
   SyncScope,
 } from "./types";
@@ -24,6 +25,7 @@ export interface SharedFolderIdentityResolutionFactsV1 {
   localFolders: readonly LocalFolderEntry[];
   localFolderScanComplete: boolean;
   localMoveHints?: readonly LocalFolderMoveHintV1[];
+  localFolderDeleteHints?: readonly LocalFolderDeleteHintV1[];
   includeFilePath?: (path: string) => boolean;
   includeFolderPath?: (path: string) => boolean;
   preserveFolderPath?: (path: string) => boolean;
@@ -48,6 +50,7 @@ export function buildSharedFolderIdentityResolutionSnapshotV1(
     localFolders: facts.localFolders,
     localFolderScanComplete: facts.localFolderScanComplete,
     localMoveHints: facts.localMoveHints,
+    localFolderDeleteHints: facts.localFolderDeleteHints,
     includeFilePath: facts.includeFilePath,
     includeFolderPath: facts.includeFolderPath,
     preserveFolderPath: facts.preserveFolderPath,

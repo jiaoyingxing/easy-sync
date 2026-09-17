@@ -974,6 +974,15 @@ export default class EasySyncPlugin extends Plugin {
       },
       this.operationLifecycle,
       this.noticeCenter,
+      (sample) => {
+        this.ensureTransferRateSamplerSeeded();
+        this.transferRateSampler.addCallSample(
+          sample.direction,
+          sample.bytes,
+          sample.ms,
+          sample.at,
+        );
+      },
     );
     this.syncExecutor.setAutomaticHandlingPolicy(this.automaticHandlingPolicy);
     this.syncExecutor.setCommunityPluginSyncPolicy(
@@ -4555,6 +4564,11 @@ export default class EasySyncPlugin extends Plugin {
       return;
     }
 
+    // P1: retain the deletion-gesture evidence before the dirty timer fires.
+    // The hint binds the committed folder ID; the planner consumes it only
+    // after the scan re-confirms the folder is gone and the cloud copy still
+    // sits at the anchor path. Unanchored folders record nothing.
+    void this.captureLocalFolderDeleteHint(file.path);
     const pluginId = this.parseCommunityPluginRootPath(file.path);
     if (!pluginId) {
       this.markLocalDirtyFolderHint(file.path);
@@ -4568,6 +4582,26 @@ export default class EasySyncPlugin extends Plugin {
     this.markLocalDirtyFolderHint(file.path);
     this.queueCommunityPluginLocalReconciliation(pluginId);
     await this.flushCommunityPluginLocalReconciliation();
+  }
+
+  private async captureLocalFolderDeleteHint(path: string): Promise<void> {
+    try {
+      await this.ensureStateLoaded();
+      const state = this.state;
+      if (!state) return;
+      const recorded = await state.recordLocalFolderDeleteHint(path);
+      if (recorded) {
+        this.diag.log("state", "local folder delete hint bound to committed V2 identity", {
+          path,
+        });
+      }
+    } catch (error) {
+      this.diag.warn(
+        "state",
+        `local folder delete hint was not retained: ${path}`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }
 
   private queueCommunityPluginLocalReconciliation(pluginId: string): void {

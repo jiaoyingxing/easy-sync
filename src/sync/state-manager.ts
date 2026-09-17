@@ -299,6 +299,7 @@ import {
   type MutationRecoveryHistory,
   type SyncRunFacts,
   type LocalFolderMoveHintV1,
+  type LocalFolderDeleteHintV1,
   type V2ActivationReviewKind,
   SyncActionType,
   planDigest,
@@ -519,6 +520,7 @@ const KEY_FORCE_RESET_AUDIT = "easy-sync-v2-force-reset-audit";
 const KEY_V2_RECOVERY_QUARANTINE = "easy-sync-v2-recovery-quarantine";
 const KEY_LOCAL_FOLDER_MOVE_HINTS = "easy-sync-local-folder-move-hints";
 const KEY_LOCAL_FILE_MOVE_HINTS = "easy-sync-local-file-move-hints";
+const KEY_LOCAL_FOLDER_DELETE_HINTS = "easy-sync-local-folder-delete-hints";
 const KEY_TRANSFER_RATES_WINDOW = "easy-sync-transfer-rates-window";
 const KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE = "community-plugin-enablement-state";
 const KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS =
@@ -634,6 +636,7 @@ interface PluginData {
   [KEY_FORCE_RESET_AUDIT]: MutationForceResetAuditV1 | null;
   [KEY_LOCAL_FOLDER_MOVE_HINTS]: LocalFolderMoveHintV1[];
   [KEY_LOCAL_FILE_MOVE_HINTS]: LocalFolderMoveHintV1[];
+  [KEY_LOCAL_FOLDER_DELETE_HINTS]: LocalFolderDeleteHintV1[];
   [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]:
     CommunityPluginManifestObservationV1[];
   [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]:
@@ -669,20 +672,21 @@ const DEFAULT_DATA: PluginData = {
   [KEY_BOUND_ACCOUNT]: "",
   [KEY_PUBLIC_MUTATION_LEDGER]: [],
   [KEY_MUTATION_LEDGER]: [],
-  [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]: [],
-  [KEY_V2_RECOVERY_QUARANTINE]: [],
-  [KEY_FORCE_RESET_AUDIT]: null,
-  [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
-  [KEY_LOCAL_FILE_MOVE_HINTS]: [],
-  [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]: [],
-  [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]: null,
-  [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]: null,
-  [KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2]: null,
-  [KEY_CONFIRMED_DESCENDANT_FILE_RECONSTRUCTION]: null,
-  [KEY_SYNC_PATH_SETTINGS_REVISION]: 0,
-  [KEY_SYNC_PATH_SETTINGS_FINGERPRINT]: "",
-  [KEY_SYNC_SCOPE_EXPANSION]: null,
-  [KEY_PUBLIC_113_CUTOVER]: null,
+    [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]: [],
+    [KEY_V2_RECOVERY_QUARANTINE]: [],
+    [KEY_FORCE_RESET_AUDIT]: null,
+    [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
+    [KEY_LOCAL_FILE_MOVE_HINTS]: [],
+    [KEY_LOCAL_FOLDER_DELETE_HINTS]: [],
+    [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]: [],
+    [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]: null,
+    [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]: null,
+    [KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2]: null,
+    [KEY_CONFIRMED_DESCENDANT_FILE_RECONSTRUCTION]: null,
+    [KEY_SYNC_PATH_SETTINGS_REVISION]: 0,
+    [KEY_SYNC_PATH_SETTINGS_FINGERPRINT]: "",
+    [KEY_SYNC_SCOPE_EXPANSION]: null,
+    [KEY_PUBLIC_113_CUTOVER]: null,
 };
 
 function createDefaultData(generation = 0, planRevision = 0): PluginData {
@@ -706,6 +710,7 @@ function createDefaultData(generation = 0, planRevision = 0): PluginData {
     [KEY_V2_RECOVERY_QUARANTINE]: [],
     [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
     [KEY_LOCAL_FILE_MOVE_HINTS]: [],
+    [KEY_LOCAL_FOLDER_DELETE_HINTS]: [],
     [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]: [],
     [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]: null,
     [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]: null,
@@ -1022,6 +1027,9 @@ export class StateManager {
         ),
         [KEY_LOCAL_FILE_MOVE_HINTS]: parseLocalFolderMoveHints(
           saved[KEY_LOCAL_FILE_MOVE_HINTS],
+        ),
+        [KEY_LOCAL_FOLDER_DELETE_HINTS]: parseLocalFolderDeleteHints(
+          saved[KEY_LOCAL_FOLDER_DELETE_HINTS],
         ),
         [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]:
           communityPluginManifestObservations,
@@ -3394,6 +3402,10 @@ export class StateManager {
     return this.data[KEY_LOCAL_FILE_MOVE_HINTS];
   }
 
+  get localFolderDeleteHints(): readonly LocalFolderDeleteHintV1[] {
+    return this.data[KEY_LOCAL_FOLDER_DELETE_HINTS];
+  }
+
   /**
    * Render-time, read-only: which exit kind one scope-crossing pending row
    * can act on right now, or null when the row carries no covering move hint
@@ -3467,6 +3479,50 @@ export class StateManager {
   }
 
   /**
+   * Retain a TFolder delete as device-local deletion-gesture evidence
+   * (P1). Mirrors {@link recordLocalFolderMoveHint}: the evidence binds the
+   * committed folder ID to the deleted path and never authorizes a mutation
+   * alone — the planner consumes it only while that anchor is still active,
+   * the local scan confirms the folder is gone and the cloud copy still sits
+   * at the anchor path. An unanchored folder delete records nothing and falls
+   * back to the ordinary scan reconciliation.
+   */
+  async recordLocalFolderDeleteHint(
+    path: string,
+    observedAt = Date.now(),
+  ): Promise<boolean> {
+    if (
+      this.v2StateLoadBlock
+      || !this.v2Envelope?.folderAnchors
+      || !isVaultRelativeMutationPath(path)
+    ) return false;
+
+    const anchor = Object.values(this.v2Envelope.folderAnchors.byAnchorId).find(
+      (candidate) => candidate.lastPath.normalize("NFC") === path.normalize("NFC"),
+    );
+    if (!anchor?.remoteId) return false;
+
+    await this.commitPluginData((current) => {
+      const retained = current[KEY_LOCAL_FOLDER_DELETE_HINTS].filter(
+        (hint) => hint.remoteId !== anchor.remoteId,
+      );
+      const next: LocalFolderDeleteHintV1 = {
+        version: 1,
+        scope: { ...this.v2Envelope!.scope },
+        remoteId: anchor.remoteId,
+        path,
+        observedAt,
+      };
+      return {
+        ...current,
+        [KEY_LOCAL_FOLDER_DELETE_HINTS]: [...retained, next]
+          .sort((left, right) => left.remoteId.localeCompare(right.remoteId)),
+      };
+    });
+    return true;
+  }
+
+  /**
    * Retain a TFile rename as device-local identity evidence, mirroring
    * {@link recordLocalFolderMoveHint}. Slice-2: a file whose destination lies
    * out of the sync scope would otherwise be silently deleted from the cloud
@@ -3527,9 +3583,10 @@ export class StateManager {
   }
 
   /**
-   * Retire device-local move evidence (folder and file hint lists) by bound
-   * remote ids. Idempotent; used by reviewed scope-crossing exits and by
-   * scope-narrowing consumers that already retire folder hints.
+   * Retire device-local move evidence (folder and file hint lists) and
+   * deletion-gesture evidence by bound remote ids. Idempotent; used by
+   * reviewed scope-crossing exits and by scope-narrowing consumers that
+   * already retire folder hints.
    */
   async retireLocalMoveHintsByRemoteIds(remoteIds: Iterable<string>): Promise<void> {
     const retired = new Set(remoteIds);
@@ -3541,14 +3598,19 @@ export class StateManager {
       const fileRetained = current[KEY_LOCAL_FILE_MOVE_HINTS].filter(
         (hint) => !retired.has(hint.remoteId),
       );
+      const deleteRetained = current[KEY_LOCAL_FOLDER_DELETE_HINTS].filter(
+        (hint) => !retired.has(hint.remoteId),
+      );
       if (
         folderRetained.length === current[KEY_LOCAL_FOLDER_MOVE_HINTS].length
         && fileRetained.length === current[KEY_LOCAL_FILE_MOVE_HINTS].length
+        && deleteRetained.length === current[KEY_LOCAL_FOLDER_DELETE_HINTS].length
       ) return current;
       return {
         ...current,
         [KEY_LOCAL_FOLDER_MOVE_HINTS]: folderRetained,
         [KEY_LOCAL_FILE_MOVE_HINTS]: fileRetained,
+        [KEY_LOCAL_FOLDER_DELETE_HINTS]: deleteRetained,
       };
     });
   }
@@ -4909,6 +4971,9 @@ export class StateManager {
         [KEY_LOCAL_FOLDER_MOVE_HINTS]: current[KEY_LOCAL_FOLDER_MOVE_HINTS].filter(
           (hint) => !folderMoveHintRemovals.has(hint.remoteId),
         ),
+        [KEY_LOCAL_FOLDER_DELETE_HINTS]: current[KEY_LOCAL_FOLDER_DELETE_HINTS].filter(
+          (hint) => !folderMoveHintRemovals.has(hint.remoteId),
+        ),
       };
     });
     const ledgerClearMs = Date.now() - ledgerClearStartedAt;
@@ -5605,6 +5670,13 @@ export class StateManager {
           retiredLocalFolderMoveHintRemoteIds.size === 0
             ? current[KEY_LOCAL_FILE_MOVE_HINTS]
             : current[KEY_LOCAL_FILE_MOVE_HINTS].filter(
+                (hint) =>
+                  !retiredLocalFolderMoveHintRemoteIds.has(hint.remoteId),
+              ),
+        [KEY_LOCAL_FOLDER_DELETE_HINTS]:
+          retiredLocalFolderMoveHintRemoteIds.size === 0
+            ? current[KEY_LOCAL_FOLDER_DELETE_HINTS]
+            : current[KEY_LOCAL_FOLDER_DELETE_HINTS].filter(
                 (hint) =>
                   !retiredLocalFolderMoveHintRemoteIds.has(hint.remoteId),
               ),
@@ -9440,6 +9512,36 @@ function normalizeFolderIdentityPath(path: string): string {
   return path.normalize("NFC").toLocaleLowerCase();
 }
 
+function parseLocalFolderDeleteHints(value: unknown): LocalFolderDeleteHintV1[] {
+  if (!Array.isArray(value)) return [];
+  const byRemoteId = new Map<string, LocalFolderDeleteHintV1>();
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object") continue;
+    const hint = raw as Partial<LocalFolderDeleteHintV1>;
+    if (
+      hint.version !== 1
+      || !isSyncScope(hint.scope)
+      || typeof hint.remoteId !== "string"
+      || hint.remoteId.length === 0
+      || !isVaultRelativeMutationPath(hint.path)
+      || typeof hint.observedAt !== "number"
+      || !Number.isFinite(hint.observedAt)
+    ) continue;
+    const existing = byRemoteId.get(hint.remoteId);
+    if (!existing || existing.observedAt < hint.observedAt) {
+      byRemoteId.set(hint.remoteId, {
+        version: 1,
+        scope: { ...hint.scope },
+        remoteId: hint.remoteId,
+        path: hint.path,
+        observedAt: hint.observedAt,
+      });
+    }
+  }
+  return [...byRemoteId.values()]
+    .sort((left, right) => left.remoteId.localeCompare(right.remoteId));
+}
+
 function uniqueIdentityPaths(paths: readonly string[]): string[] {
   const byIdentity = new Map<string, string>();
   for (const path of paths) {
@@ -10234,9 +10336,10 @@ function isReviewedFolderSubtreeDeleteBinding(value: unknown): boolean {
     && (binding.sourceCommitSeq as number) >= 0
     && Number.isSafeInteger(binding.sourceLifecycleEpoch)
     && (binding.sourceLifecycleEpoch as number) >= 0
-    && typeof binding.rootCTag === "string"
-    && binding.rootCTag.length > 0
-    && binding.rootCTag.length <= 512
+    && (binding.rootCTag === undefined
+      || (typeof binding.rootCTag === "string"
+        && binding.rootCTag.length > 0
+        && binding.rootCTag.length <= 512))
     && Number.isSafeInteger(binding.memberCount)
     && (binding.memberCount as number) > 1;
 }

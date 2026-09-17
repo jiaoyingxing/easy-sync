@@ -55,6 +55,7 @@ import {
   type LocalFileEntry,
   type LocalFolderEntry,
   type LocalFolderMoveHintV1,
+  type LocalFolderDeleteHintV1,
   type RemoteFileEntry,
   type SyncPlanItem,
   type SyncScope,
@@ -71,6 +72,7 @@ export interface CanonicalPlanFactsV2 {
   /** Device large-file exclusion threshold in bytes; absent disables the download gate. */
   maxFileSizeBytes?: number;
   localMoveHints?: readonly LocalFolderMoveHintV1[];
+  localFolderDeleteHints?: readonly LocalFolderDeleteHintV1[];
   localFileMoveHints?: readonly LocalFolderMoveHintV1[];
   includeFilePath?: (path: string) => boolean;
   includeFolderPath?: (path: string) => boolean;
@@ -276,6 +278,7 @@ function composeCanonicalActionsV2(
     localFolders: input.localFolders,
     localFolderScanComplete: input.localFolderScanComplete,
     localMoveHints: input.localMoveHints,
+    localFolderDeleteHints: input.localFolderDeleteHints,
     includeFilePath: input.includeFilePath,
     includeFolderPath: input.includeFolderPath,
     preserveFolderPath: input.preserveFolderPath,

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   deriveTransferRateFacts,
   formatTransferRate,
@@ -61,6 +62,16 @@ describe("passive transfer-rate facts", () => {
     expect(formatTransferRate(512)).toBe("512 KB/s");
     expect(formatTransferRate(1024)).toBe("1.0 MB/s");
     expect(formatTransferRate(2560)).toBe("2.5 MB/s");
+  });
+
+  it("reads sub-1 KB/s honestly instead of clamping to 1 KB/s", () => {
+    // 用户拍板 2026-09-13: 宁愿不要显示，不能显示个错的 — a measured 0.4 KB/s
+    // must not present itself as "1 KB/s"; 0.5–1.49 stays honest rounding.
+    expect(formatTransferRate(0)).toBe("<1 KB/s");
+    expect(formatTransferRate(0.4)).toBe("<1 KB/s");
+    expect(formatTransferRate(0.5)).toBe("1 KB/s");
+    expect(formatTransferRate(1.4)).toBe("1 KB/s");
+    expect(formatTransferRate(1.5)).toBe("2 KB/s");
   });
 });
 
@@ -269,5 +280,61 @@ describe("transfer rate sampler (live reading)", () => {
     sampler.addRoundFacts({ uploadMs: 6000, measuredAt: 1_000 });
     expect(sampler.getReading(1_000)).toEqual({ level: "zero", kbps: null });
     expect(sampler.getReading(601_001)).toBeNull();
+  });
+});
+
+describe("per-call samples (direction 2: wall-honest aggregation)", () => {
+  it("folds each completed call at its own rate — parallel calls do not divide the reading", () => {
+    const sampler = new TransferRateSampler();
+    // Two 1 MiB calls, each 1 s, settling in the same wall instant. The old
+    // sum-based tick fold read (2 MiB)/(2 s) — the aggregate divided by the
+    // concurrency (「一」23④ candidate); per-call samples keep 1024.
+    sampler.addCallSample("download", MIB, 1000, 1000);
+    sampler.addCallSample("download", MIB, 1000, 1000);
+    expect(sampler.getReading(1000)).toEqual({ level: "high", kbps: 1024 });
+  });
+
+  it("tracks the current network within seconds during small-file sync", () => {
+    const sampler = new TransferRateSampler();
+    // Prior pinned at a slow era's 1 KB/s, folded 1 s before the calls.
+    sampler.addRoundFacts({ uploadBytes: 2048, uploadMs: 2000, measuredAt: 29_000 });
+    // Fast link now: 8 KB calls completing in 100 ms, back to back for 8 s.
+    // The confidence-crawled tick fold took tens of seconds to escape the
+    // prior (short rounds never escaped it at all — the "无论网速如何都是
+    // 1 KB/s" report); per-call folds ride the designed τ cadence.
+    let at = 30_000;
+    for (let i = 0; i < 80; i++) {
+      sampler.addCallSample("upload", 8192, 100, at);
+      at += 100;
+    }
+    const reading = sampler.getReading(at);
+    expect(reading?.level).toBe("medium");
+    expect(reading?.kbps ?? 0).toBeGreaterThan(45);
+  });
+
+  it("clears a fresh zero signal once real bytes come through", () => {
+    const sampler = new TransferRateSampler();
+    sampler.beginRun();
+    sampler.sampleRunTick(
+      { upload: { bytes: 0, ms: 6000 }, download: { bytes: 0, ms: 0 } },
+      1000,
+    );
+    expect(sampler.getReading(1500)).toMatchObject({ level: "zero" });
+    sampler.addCallSample("upload", 4096, 500, 2000);
+    const reading = sampler.getReading(2500);
+    expect(reading?.level).not.toBe("zero");
+    expect(reading?.kbps).toBe(8);
+  });
+
+  it("keeps the per-call sample wired from the executor settle path into the plugin", () => {
+    const executorSource = readFileSync("src/sync/sync-executor.ts", "utf8");
+    // trackTransfer stamps the call start, emits one sample per settled
+    // byte-moving call, and the constructor exposes the hook for main.
+    expect(executorSource).toContain("callStart: Date.now()");
+    expect(executorSource).toContain("handle.bytesSoFar > 0");
+    expect(executorSource).toContain("this.onTransferCallSample?.({");
+    expect(executorSource).toContain("onTransferCallSample?:");
+    const mainSource = readFileSync("src/main.ts", "utf8");
+    expect(mainSource).toContain("transferRateSampler.addCallSample");
   });
 });

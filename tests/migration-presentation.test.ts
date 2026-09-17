@@ -15,10 +15,10 @@ describe("migration presentation", () => {
     const en = new I18n("en");
 
     expect(zh.t("syncPlan.cloudJoinSummary")).toBe(
-      "这台设备正在加入已有同步状态。确认计划后，EasySync 会先建立本机同步状态，再按计划同步文件。",
+      "本设备正在加入已有同步。确认计划后，EasySync 会先完成本机登记，再按计划同步文件。",
     );
     expect(en.t("syncPlan.cloudJoinSummary")).toBe(
-      "This device is joining existing sync state. After you confirm the plan, EasySync will establish local sync state and then sync the listed files.",
+      "This device is joining an existing sync. After you confirm the plan, EasySync will first set up the local record, then sync files according to the plan.",
     );
     expect(zh.t("syncPlan.cloudJoinSummary")).not.toMatch(/\bV2\b|V1/i);
     expect(en.t("syncPlan.cloudJoinSummary")).not.toMatch(/\bV2\b|V1/i);

@@ -30,6 +30,7 @@ const scope = {
   filesRootId: "root",
 };
 const hashA = "a".repeat(64);
+const hashB = "b".repeat(64);
 
 interface FolderSpec {
   id: string;
@@ -1266,6 +1267,166 @@ describe("V2 folder anchors and pure planner", () => {
     });
     expect(ambiguous.items.some((item) =>
       item.type === "conflict" && item.reason === "anchored-folder-missing-local")).toBe(true);
+  });
+
+  it("mirrors an in-app folder deletion when delete-gesture evidence binds the anchor (P1)", () => {
+    const withUnclaimed = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Notes" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+      }),
+      localFiles: [],
+      localFolders: [{ path: "NotesRenamed" }],
+      localFolderScanComplete: true,
+      localFolderDeleteHints: [{
+        version: 1,
+        scope,
+        remoteId: "notes",
+        path: "Notes",
+        observedAt: 10,
+      }],
+    });
+    // The user's unrelated new folder still plans its ordinary cloud creation;
+    // the anchored deletion mirrors without any rename-ambiguity conflict.
+    expect(withUnclaimed.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "delete-remote",
+        path: "Notes",
+        remoteId: "notes",
+      }),
+      expect.objectContaining({ type: "create-remote", path: "NotesRenamed" }),
+    ]));
+    expect(withUnclaimed.items.some((item) => item.type === "conflict")).toBe(false);
+  });
+
+  it("keeps the rename-ambiguity review when the delete hint does not bind the anchor", () => {
+    // Wrong path: the evidence speaks about another folder.
+    const wrongPath = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Notes" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+      }),
+      localFiles: [],
+      localFolders: [{ path: "NotesRenamed" }],
+      localFolderScanComplete: true,
+      localFolderDeleteHints: [{
+        version: 1,
+        scope,
+        remoteId: "notes",
+        path: "Other",
+        observedAt: 10,
+      }],
+    });
+    expect(wrongPath.items.some((item) =>
+      item.type === "conflict" && item.reason === "anchored-folder-missing-local")).toBe(true);
+
+    // Wrong scope: evidence from another sync scope is ignored.
+    const wrongScope = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Notes" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+      }),
+      localFiles: [],
+      localFolders: [{ path: "NotesRenamed" }],
+      localFolderScanComplete: true,
+      localFolderDeleteHints: [{
+        version: 1,
+        scope: { ...scope, driveId: "other-drive" },
+        remoteId: "notes",
+        path: "Notes",
+        observedAt: 10,
+      }],
+    });
+    expect(wrongScope.items.some((item) =>
+      item.type === "conflict" && item.reason === "anchored-folder-missing-local")).toBe(true);
+
+    // Wrong remote id: evidence bound to a retired anchor is inert.
+    const wrongRemoteId = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Notes" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+      }),
+      localFiles: [],
+      localFolders: [{ path: "NotesRenamed" }],
+      localFolderScanComplete: true,
+      localFolderDeleteHints: [{
+        version: 1,
+        scope,
+        remoteId: "retired",
+        path: "Notes",
+        observedAt: 10,
+      }],
+    });
+    expect(wrongRemoteId.items.some((item) =>
+      item.type === "conflict" && item.reason === "anchored-folder-missing-local")).toBe(true);
+  });
+
+  it("mirrors the anchored deletion when unclaimed folders carry disjoint content (P2)", () => {
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Notes" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+        fileAnchors: [fileAnchor("note1", "Notes/note.md")],
+      }),
+      // Content exists elsewhere in the vault but shares no bytes with the
+      // anchored tree: no rename signal, the deletion mirrors.
+      localFiles: [localFile("Unrelated/other.md", hashB, 22)],
+      localFolders: localFolders("Unrelated"),
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "delete-remote", path: "Notes", remoteId: "notes" }),
+      expect.objectContaining({ type: "create-remote", path: "Unrelated" }),
+    ]));
+    expect(report.counts.conflicts).toBe(0);
+  });
+
+  it("keeps the review and names every suspect under partial content overlap", () => {
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Notes" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+        fileAnchors: [
+          fileAnchor("note1", "Notes/note.md", hashA, 10),
+          fileAnchor("note2", "Notes/other.md", hashB, 22),
+        ],
+      }),
+      // Each anchored descendant's exact bytes reappear in a DIFFERENT
+      // unclaimed folder, so the single-root move inference fails; both
+      // folders carry real rename evidence and the review must name them.
+      localFiles: [
+        localFile("First/note.md", hashA, 10),
+        localFile("Second/other.md", hashB, 22),
+      ],
+      localFolders: localFolders("First", "Second"),
+      localFolderScanComplete: true,
+    });
+
+    const conflict = report.items.find((item) =>
+      item.type === "conflict" && item.reason === "anchored-folder-missing-local");
+    expect(conflict).toBeDefined();
+    expect(conflict!.affectedPaths).toContain("First");
+    expect(conflict!.affectedPaths).toContain("Second");
+  });
+
+  it("keeps the review for an empty unclaimed shell but not for the unrelated folder", () => {
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "notes", name: "Notes" }],
+        folderAnchors: [folderAnchor("notes", "Notes")],
+        fileAnchors: [fileAnchor("note1", "Notes/note.md")],
+      }),
+      localFiles: [localFile("Unrelated/other.md", hashB, 22)],
+      localFolders: localFolders("EmptyShell", "Unrelated"),
+      localFolderScanComplete: true,
+    });
+
+    const conflict = report.items.find((item) =>
+      item.type === "conflict" && item.reason === "anchored-folder-missing-local");
+    expect(conflict).toBeDefined();
+    expect(conflict!.affectedPaths).toContain("EmptyShell");
+    expect(conflict!.affectedPaths).not.toContain("Unrelated");
   });
 
   it("keeps an excluded folder fail-closed unless the caller marks it preserved", () => {

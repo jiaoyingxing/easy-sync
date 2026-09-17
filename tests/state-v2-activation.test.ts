@@ -1533,7 +1533,9 @@ async function activateV2WithFolderScopeDisabled(
   };
 }
 
-async function prepareReviewedFolderSubtreeHarness() {
+async function prepareReviewedFolderSubtreeHarness(
+  options: { folderContentTags?: boolean } = {},
+) {
   const content = "reviewed cloud subtree";
   const bytes = new TextEncoder().encode(content);
   const hash = await sha256Hex(bytes);
@@ -1545,8 +1547,11 @@ async function prepareReviewedFolderSubtreeHarness() {
     ...paths,
   ];
   const folders = remoteFolderTree(initialFolderPaths);
-  for (const folder of folders) {
-    folder.cTag = `ctag-${folder.id}`;
+  // OneDrive Personal never returns folder cTags; files keep theirs.
+  if (options.folderContentTags !== false) {
+    for (const folder of folders) {
+      folder.cTag = `ctag-${folder.id}`;
+    }
   }
   const filePath = "Issues/CAD/drawing.md";
   const harness = makeHarness({
@@ -9815,7 +9820,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.state.mutationLedger).toEqual([]);
   });
 
-  it("does not offer direct cloud deletion without a descendant-sensitive tag", async () => {
+  it("deletes one reviewed empty folder by verified identity when no content tag exists", async () => {
     const { harness, reviewed } = await prepareAmbiguousEmptyFolderHarness({
       contentTag: null,
     });
@@ -9823,11 +9828,16 @@ describe("V1 to V2 controlled production activation", () => {
 
     await harness.executor.deleteReviewedEmptyRemoteFolder(reviewed);
 
-    expect(findRemoteItemByPath(harness.remoteItemState, "Notes")?.folder)
-      .toBeTruthy();
-    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes")).toBeNull();
+    expect(harness.state.pendingIssues).toEqual([]);
     expect(harness.state.mutationLedger).toEqual([]);
-    expect(harness.state.pendingIssues).toHaveLength(1);
+    expect(harness.mutations.deleteItem).toHaveBeenCalledOnce();
+    expect(harness.mutations.deleteItem).toHaveBeenCalledWith(
+      "testVault",
+      "Notes",
+      "etag-folder-notes",
+      "folder-notes",
+    );
   });
 
   it("reads one exact subtree snapshot for nested missing-local folder issues", async () => {
@@ -10031,6 +10041,66 @@ describe("V1 to V2 controlled production activation", () => {
     expect(Object.values(reopened.remoteIndex.itemsById).some(
       (item) => item.parentId === reviewed.members[0].remoteId,
     )).toBe(false);
+  });
+
+  it("deletes one reviewed cloud subtree by member identity when folders carry no content tag", async () => {
+    const { harness, reviewed } = await prepareReviewedFolderSubtreeHarness({
+      folderContentTags: false,
+    });
+    const root = reviewed.members[0];
+    expect(root).toMatchObject({
+      path: "Issues",
+      kind: "folder",
+      remoteETag: expect.any(String),
+    });
+    expect(root.remoteCTag).toBeUndefined();
+
+    expect(await harness.executor.deleteReviewedFolderSubtree(reviewed))
+      .toBe(true);
+    expect(harness.mutations.deleteItem).toHaveBeenCalledTimes(1);
+    expect(harness.mutations.deleteItem).toHaveBeenCalledWith(
+      "testVault",
+      "Issues",
+      root.remoteETag,
+      root.remoteId,
+    );
+    expect(findRemoteItemByPath(harness.remoteItemState, "Issues")).toBeNull();
+    expect(findRemoteItemByPath(
+      harness.remoteItemState,
+      "Issues/CAD/drawing.md",
+    )).toBeNull();
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([]);
+  });
+
+  it("keeps a content-tag-free reviewed subtree when a member drifts", async () => {
+    const { harness, reviewed } = await prepareReviewedFolderSubtreeHarness({
+      folderContentTags: false,
+    });
+    const drawing = findRemoteItemByPath(
+      harness.remoteItemState,
+      "Issues/CAD/drawing.md",
+    )!;
+    drawing.size = (drawing.size ?? 0) + 7;
+
+    expect(await harness.executor.deleteReviewedFolderSubtree(reviewed))
+      .toBe(false);
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(harness.state.mutationLedger).toEqual([]);
+  });
+
+  it("settles a content-tag-free reviewed subtree delete after the response is lost", async () => {
+    const { harness, reviewed } = await prepareReviewedFolderSubtreeHarness({
+      folderContentTags: false,
+    });
+    harness.loseFolderDeleteResponseOnce();
+
+    expect(await harness.executor.deleteReviewedFolderSubtree(reviewed))
+      .toBe(true);
+    expect(harness.mutations.deleteItem).toHaveBeenCalledTimes(1);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Issues")).toBeNull();
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingIssues).toEqual([]);
   });
 
   it("continues a reviewed cloud subtree restore after a cold reopen", async () => {

@@ -126,7 +126,12 @@ export function transferDirectionKBps(
 
 export function formatTransferRate(kbps: number): string {
   if (kbps < TRANSFER_RATE_MEDIUM_KBPS) {
-    return `${Math.max(1, Math.round(kbps))} KB/s`;
+    const rounded = Math.round(kbps);
+    // A measured rate below 0.5 KB/s rounds to 0; clamping it up to "1 KB/s"
+    // presents a number that was never measured (用户拍板 2026-09-13: 宁愿
+    // 不要显示，不能显示个错的; 2026-09-17 mobile report: sub-1 readings
+    // pinned at "1 KB/s"). Display the honest "<1" instead.
+    return rounded < 1 ? "<1 KB/s" : `${rounded} KB/s`;
   }
   return `${(kbps / 1024).toFixed(1)} MB/s`;
 }
@@ -228,6 +233,37 @@ export class TransferRateSampler {
         at,
       );
     }
+  }
+
+  /** Fold one completed transport call as its own throughput sample
+   *  (direction 2, 2026-09-17 用户拍板: the reading must track the current
+   *  network during simple-file sync instead of sitting at the floor). The
+   *  sum-based tick fold divides the aggregate by the concurrency when calls
+   *  overlap and its confidence term crawls for sub-second calls, so short
+   *  small-file rounds never escaped the seeded prior ("无论网速如何都是
+   *  1 KB/s"). A settled call is a real measurement: it folds at its own
+   *  bytes/own wall (no divisor), with full confidence and the designed
+   *  wall-time τ cadence. */
+  addCallSample(
+    direction: TransferRateDirection,
+    bytes: number,
+    ms: number,
+    at: number,
+  ): void {
+    if (!(bytes > 0) || !(ms > 0)) return;
+    const state = this.directions[direction];
+    const wallDelta = state.lastFoldAt > 0
+      ? Math.max(0, at - state.lastFoldAt)
+      : 0;
+    state.lastFoldAt = at;
+    state.zeroSignal = false;
+    const instantKbps = bytes / 1024 / (ms / 1000);
+    const alpha = state.smoothedKbps === null
+      ? 1
+      : 1 - Math.exp(-wallDelta / TRANSFER_RATE_SMOOTHING_TAU_MS);
+    state.smoothedKbps = state.smoothedKbps === null
+      ? instantKbps
+      : state.smoothedKbps + alpha * (instantKbps - state.smoothedKbps);
   }
 
   private foldSample(
