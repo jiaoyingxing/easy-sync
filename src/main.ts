@@ -3247,6 +3247,10 @@ export default class EasySyncPlugin extends Plugin {
     }
     try {
       await this.ensureStateLoaded();
+      // The reset is definitely starting: capture a pre-reset report for
+      // every variant (normal / isolated / forced). Best-effort by contract —
+      // a failed report never blocks the exit.
+      await this.generateDiagnosticReport();
       let isolatedRecoveries: ConservativeResetEntries | null = null;
       let forceReset = false;
       if (this.hasResetBlockingRecovery()) {
@@ -8077,6 +8081,9 @@ export default class EasySyncPlugin extends Plugin {
     lines.push(`**仓库名**: ${this.app.vault.getName()}`);
     lines.push(`**登录账号**: ${auth?.isLoggedIn ? auth.displayName || "已登录" : "未登录"}`);
     lines.push(`**平台**: ${platformLabel}`);
+    lines.push("");
+    lines.push(`> ${reportI18n.t("diagnosticReport.feedbackNote")}`);
+    lines.push(`> ${reportI18n.t("diagnosticReport.redactionNote")}`);
     lines.push("");
     lines.push("## 当前同步概况");
     lines.push("");

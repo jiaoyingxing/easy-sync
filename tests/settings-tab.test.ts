@@ -1214,13 +1214,15 @@ describe("buildSettingsSyncButtonState", () => {
     expect(en["settings.syncScope.name"]).toBe("Sync scope");
     expect(zhCN["settings.syncExclusion.name"]).toBe("同步排除");
     expect(zhCN["settings.syncExclusion.desc"]).toBe(
-      "选择此设备不参与同步的文件夹。",
+      "选择此设备不参与同步的文件夹，也可排除超过指定大小的文件。",
     );
     expect(zhCN["settings.syncExclusion.intro"]).toBe(
       "只影响此设备。所选文件夹及其内容不会上传或下载，现有文件不会因此被删除。",
     );
     expect(zhCN["settings.syncExclusion.folders.name"]).toBe("不同步的文件夹");
-    expect(en["settings.syncExclusion.desc"]).toContain("this device");
+    expect(en["settings.syncExclusion.desc"]).toBe(
+      "Choose folders this device will not sync. You can also exclude files above a size limit.",
+    );
     expect(en["settings.syncExclusion.intro"]).toContain("will not be deleted");
   });
 

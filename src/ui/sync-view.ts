@@ -493,14 +493,62 @@ export function buildAdaptivePathLayout(
   return decisions;
 }
 
-export function buildCompletedFilesRenderState(
-  files: readonly Pick<FileProgress, "path" | "sourcePath" | "status" | "actionType" | "reason">[],
-): { key: string } {
-  return {
-    key: files
-      .map((file) => `${file.path}\u0000${file.sourcePath ?? ""}\u0000${file.status}\u0000${file.actionType ?? ""}\u0000${file.reason ?? ""}`)
-      .join("\u0001"),
-  };
+/** Per-row content identity: the same five fields the list renders, so a
+ *  re-completed path (new entry, same path) produces a different key and the
+ *  diff moves the row to the top instead of leaving stale content behind. */
+function completedFileRowKey(
+  file: Pick<FileProgress, "path" | "sourcePath" | "status" | "actionType" | "reason">,
+): string {
+  return `${file.path}\u0000${file.sourcePath ?? ""}\u0000${file.status}\u0000${file.actionType ?? ""}\u0000${file.reason ?? ""}`;
+}
+
+export interface CompletedFileRowsDiff {
+  /** Rows to insert at the top, newest first. */
+  prepend: FileProgress[];
+  /** Rendered paths that must leave the list (re-completed or retired). */
+  removePaths: string[];
+  /** Ledger state after applying this diff. */
+  nextLedger: Map<string, string>;
+}
+
+/** Incremental mount diff for the read-only completed-file list.
+ *
+ *  The visible list is newest first and deduped by path (a later completion
+ *  of the same path supersedes the older row). Comparing the previous
+ *  path→row-key ledger against the desired order yields the minimal DOM
+ *  operations: prepend new rows, remove re-completed or cap-retired rows.
+ *  Completed entries are append-immutable (sync-progress only appends and
+ *  trims), so a row key can never change without a new entry arriving. */
+export function diffCompletedFileRows(
+  ledger: ReadonlyMap<string, string>,
+  files: readonly FileProgress[],
+): CompletedFileRowsDiff {
+  const newestByPath = new Map<string, FileProgress>();
+  const order: string[] = [];
+  for (let i = files.length - 1; i >= 0; i--) {
+    const file = files[i];
+    if (newestByPath.has(file.path)) continue;
+    newestByPath.set(file.path, file);
+    order.push(file.path);
+  }
+
+  const prepend: FileProgress[] = [];
+  const removePaths: string[] = [];
+  const nextLedger = new Map<string, string>();
+  for (const path of order) {
+    const file = newestByPath.get(path);
+    if (!file) continue;
+    const key = completedFileRowKey(file);
+    nextLedger.set(path, key);
+    const previous = ledger.get(path);
+    if (previous === key) continue;
+    if (previous !== undefined) removePaths.push(path);
+    prepend.push(file);
+  }
+  for (const path of ledger.keys()) {
+    if (!nextLedger.has(path)) removePaths.push(path);
+  }
+  return { prepend, removePaths, nextLedger };
 }
 
 export interface SyncPlanDisplayGroup {
@@ -981,8 +1029,9 @@ function renderFileRow(
   list: HTMLElement,
   t: (key: string) => string,
   adaptive: boolean,
-): void {
+): HTMLElement {
   const row = list.createDiv("easy-sync-file-row");
+  row.dataset.easySyncCompletedPath = file.path;
   const icon = row.createSpan("easy-sync-file-icon");
   const presentation = resolveFileProgressPresentation(file);
   setIcon(icon, presentation.icon);
@@ -991,6 +1040,7 @@ function renderFileRow(
   const chipLabel = formatFileProgressLabel(file, t);
   if (chipLabel) row.createSpan("easy-sync-tree-chip").setText(chipLabel);
   if (file.reason) row.createDiv("easy-sync-file-reason").setText(file.reason);
+  return row;
 }
 
 export function shouldExpandAllVisibleDetails(
@@ -1018,7 +1068,7 @@ export class EasySyncSyncView extends ItemView {
   private progressFillEl: HTMLElement | null = null;
   private progressSubtitleEl: HTMLElement | null = null;
   private fileListEl: HTMLElement | null = null;
-  private completedFilesRenderKey: string | null = null;
+  private completedFileRowsLedger: Map<string, string> | null = null;
   private planViewportFrameId: AnimationFrameHandle | null = null;
   private planVirtualRenderers = new Set<() => void>();
   // Windowed decision rows are unmounted while off screen, so their open state
@@ -1348,7 +1398,7 @@ export class EasySyncSyncView extends ItemView {
       this.progressFillEl = null;
       this.progressSubtitleEl = null;
       this.fileListEl = null;
-      this.completedFilesRenderKey = null;
+      this.completedFileRowsLedger = null;
       this.statusLineEl = null;
       this.statusIconEl = null;
       this.statusTextEl = null;
@@ -1537,24 +1587,40 @@ export class EasySyncSyncView extends ItemView {
 
   private appendNewFileRows(files: readonly FileProgress[]): void {
     if (files.length === 0 || !this.progressPanelEl) return;
-    if (!this.fileListEl) {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    if (!this.progressSubtitleEl) {
       this.progressSubtitleEl = this.progressPanelEl.createDiv("easy-sync-progress-subtitle");
       this.progressSubtitleEl.setText(
-        this.plugin.i18n.t("syncView.progress.completed", {
+        t("syncView.progress.completed", {
           count: this.plugin.progressStore.state.completedCount,
         }),
       );
     }
-    const nextState = buildCompletedFilesRenderState(files);
-    if (!this.fileListEl
-      || this.completedFilesRenderKey !== nextState.key) {
-      // ponytail: the visible list is capped, so a small rebuild is simpler than keeping a drifting incremental cache
+    if (!this.fileListEl || !this.completedFileRowsLedger) {
+      // Fallback: no rendered list (or a stale ledger) to diff against.
       this.fileListEl?.remove();
       this.fileListEl = null;
       this.renderFileResults(this.progressPanelEl, [...files], true);
+    } else {
+      const diff = diffCompletedFileRows(this.completedFileRowsLedger, files);
+      this.completedFileRowsLedger = diff.nextLedger;
+      if (diff.removePaths.length > 0) {
+        const removeSet = new Set(diff.removePaths);
+        for (const row of Array.from(this.fileListEl.children)) {
+          if (!row.instanceOf(HTMLElement)) continue;
+          const path = row.dataset.easySyncCompletedPath;
+          if (path && removeSet.has(path)) row.remove();
+        }
+      }
+      // `prepend` is newest first: inserting bottom-up leaves the newest row
+      // on top, matching the full-rebuild order.
+      for (let i = diff.prepend.length - 1; i >= 0; i--) {
+        const row = renderFileRow(diff.prepend[i], this.fileListEl, t, true);
+        this.fileListEl.prepend(row);
+      }
     }
     this.progressSubtitleEl?.setText(
-      this.plugin.i18n.t("syncView.progress.completed", {
+      t("syncView.progress.completed", {
         count: this.plugin.progressStore.state.completedCount,
       }),
     );
@@ -3201,14 +3267,13 @@ export class EasySyncSyncView extends ItemView {
     limitHeight: boolean,
   ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
-    const renderState = buildCompletedFilesRenderState(files);
     const list = container.createDiv("easy-sync-file-list");
     const renderedPaths = new Set<string>();
+    const ledger = new Map<string, string>();
     if (limitHeight) {
       list.addClass("is-limited");
       list.addClass("easy-sync-path-layout");
       this.fileListEl = list;
-      this.completedFilesRenderKey = renderState.key;
     }
 
     // Iterate in reverse (newest first)
@@ -3216,7 +3281,9 @@ export class EasySyncSyncView extends ItemView {
       if (limitHeight && renderedPaths.has(files[i].path)) continue;
       renderedPaths.add(files[i].path);
       renderFileRow(files[i], list, t, limitHeight);
+      if (limitHeight) ledger.set(files[i].path, completedFileRowKey(files[i]));
     }
+    if (limitHeight) this.completedFileRowsLedger = ledger;
   }
 
   private renderPlanReviewSection(

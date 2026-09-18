@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   buildAdaptivePathLayout,
-  buildCompletedFilesRenderState,
+  diffCompletedFileRows,
   buildSyncPlanDisplayGroups,
   buildSyncPlanDisplayRows,
   buildSyncPlanMeasuredVirtualOffsets,
@@ -1160,31 +1160,89 @@ describe("buildSyncViewContentKey", () => {
     expect(trimFilePathPrefix("test/Resojot Todo.md", "test/")).toBe("Resojot Todo.md");
   });
 
-  it("changes completed-file render state when a sibling appears later", () => {
-    const firstOnly = buildCompletedFilesRenderState([
-      { path: "test/333333(4)-副本.md", status: "download" },
-    ]);
-    const withSibling = buildCompletedFilesRenderState([
-      { path: "test/333333(4)-副本.md", status: "download" },
+  it("prepends only the new sibling row when a sibling appears later", () => {
+    const existing = { path: "test/333333(4)-副本.md", status: "download" } as const;
+    const initial = diffCompletedFileRows(new Map(), [existing]);
+    const withSibling = diffCompletedFileRows(initial.nextLedger, [
+      existing,
       { path: "test/444444.md", status: "download" },
     ]);
 
-    expect(firstOnly.key).not.toBe(withSibling.key);
+    expect(initial.prepend.map((file) => file.path)).toEqual([
+      "test/333333(4)-副本.md",
+    ]);
+    expect(withSibling.prepend.map((file) => file.path)).toEqual([
+      "test/444444.md",
+    ]);
+    expect(withSibling.removePaths).toEqual([]);
   });
 
-  it("changes completed-file render state when the same path changes action type", () => {
-    const created = buildCompletedFilesRenderState([{
+  it("removes and re-prepends a path when the same path changes action type", () => {
+    const created = diffCompletedFileRows(new Map(), [{
       path: "Folder",
       status: "folder",
       actionType: SyncActionType.CreateRemoteFolder,
-    }]);
-    const moved = buildCompletedFilesRenderState([{
+    }] as never);
+    const moved = diffCompletedFileRows(created.nextLedger, [{
       path: "Folder",
       status: "folder",
       actionType: SyncActionType.MoveRemoteFolder,
-    }]);
+    }] as never);
 
-    expect(created.key).not.toBe(moved.key);
+    expect(moved.prepend).toHaveLength(1);
+    expect(moved.prepend[0].actionType).toBe(SyncActionType.MoveRemoteFolder);
+    expect(moved.removePaths).toEqual(["Folder"]);
+  });
+
+  it("keeps retained rows untouched when nothing changed", () => {
+    const files = [
+      { path: "a.md", status: "download" },
+      { path: "b.md", status: "upload" },
+    ] as never[];
+    const initial = diffCompletedFileRows(new Map(), files);
+    const again = diffCompletedFileRows(initial.nextLedger, files);
+
+    expect(again.prepend).toEqual([]);
+    expect(again.removePaths).toEqual([]);
+    expect([...again.nextLedger.entries()]).toEqual([
+      ...initial.nextLedger.entries(),
+    ]);
+  });
+
+  it("drops only the row that fell off the retention cap", () => {
+    const initial = diffCompletedFileRows(new Map(), [
+      { path: "old.md", status: "download" },
+      { path: "mid.md", status: "upload" },
+      { path: "new.md", status: "download" },
+    ] as never);
+    const afterCap = diffCompletedFileRows(initial.nextLedger, [
+      { path: "mid.md", status: "upload" },
+      { path: "new.md", status: "download" },
+      { path: "latest.md", status: "upload" },
+    ] as never);
+
+    expect(afterCap.prepend.map((file) => file.path)).toEqual(["latest.md"]);
+    expect(afterCap.removePaths).toEqual(["old.md"]);
+  });
+
+  it("renders the newest occurrence once when a path completes twice", () => {
+    const diff = diffCompletedFileRows(new Map(), [
+      { path: "twice.md", status: "download" },
+      { path: "twice.md", status: "upload" },
+    ] as never);
+
+    expect(diff.prepend).toHaveLength(1);
+    expect(diff.prepend[0].status).toBe("upload");
+  });
+
+  it("keeps failure rows in the diff without cap filtering", () => {
+    const diff = diffCompletedFileRows(new Map(), [
+      { path: "failed.md", status: "error", reason: "timeout" },
+    ] as never);
+
+    expect(diff.prepend).toHaveLength(1);
+    expect(diff.prepend[0].status).toBe("error");
+    expect(diff.removePaths).toEqual([]);
   });
 
   it("maps completed rows to one short result chip without losing exact action facts", () => {
@@ -1438,6 +1496,30 @@ describe("buildSyncViewContentKey", () => {
     );
     expect(append).toContain("state.completedCount");
     expect(append).not.toContain("count: files.length");
+  });
+
+  it("mounts completed rows incrementally and reserves full rebuilds for the fallback", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const append = source.slice(
+      source.indexOf("private appendNewFileRows"),
+      source.indexOf("private renderToolbar"),
+    );
+    // Hot path diffs against the rendered-row ledger; the keyed full rebuild
+    // only remains as the fallback for missing list/ledger state.
+    expect(append).toContain("diffCompletedFileRows(");
+    expect(append.split("renderFileResults(").length - 1).toBe(1);
+    expect(append).toContain("easySyncCompletedPath");
+    // The ledger is dropped with every full rebuild so a stale round's rows
+    // can never be diffed against a fresh list.
+    expect(source).toContain("this.completedFileRowsLedger = null");
+    // Row removal and prepend rely on the row's path dataset and a returned
+    // row element from renderFileRow.
+    const rowRenderer = source.slice(
+      source.indexOf("function renderFileRow"),
+      source.indexOf("export function shouldExpandAllVisibleDetails"),
+    );
+    expect(rowRenderer).toContain("dataset.easySyncCompletedPath");
+    expect(rowRenderer).toContain("return row;");
   });
 
   it("keeps ordinary plan rows chip-free and excludes history from adaptive directories", () => {

@@ -181,6 +181,8 @@ export interface LocaleStrings {
   "settings.diagReport.name": string;
   "settings.diagReport.desc": string;
   "settings.diagReport.generate": string;
+  "diagnosticReport.feedbackNote": string;
+  "diagnosticReport.redactionNote": string;
   "settings.syncInterval.name": string;
   "settings.syncInterval.desc": string;
   "settings.syncInterval.disabledDesc": string;

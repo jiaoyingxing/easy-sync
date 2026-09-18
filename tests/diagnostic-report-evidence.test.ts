@@ -18,6 +18,7 @@ import {
   summarizeCommunityPluginSync,
   summarizeMutationRecovery,
 } from "../src/sync/diagnostic-report-evidence";
+import { I18n } from "../src/i18n";
 import { SyncActionType, type MutationLedgerEntryV1 } from "../src/sync/types";
 
 describe("diagnostic report evidence", () => {
@@ -406,6 +407,73 @@ describe("diagnostic report failure notice", () => {
 /** Issue #18 round (P3-b4): the report must show which plugin data keys were
  *  recently written (names + time only, never values) so a mid-activation
  *  digest drift can be attributed on the device itself. */
+describe("diagnostic report reset capture and reader note", () => {
+  it("pins the reset dialog report copy verbatim in both locales", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+    expect(zh.t("settings.reset.confirmMessage")).toBe(
+      "将清除这台设备记录的同步状态，并在下次同步时重新建立。重置会自动生成一份诊断报告保存在仓库根目录，之后如需反馈问题，可把报告发送给作者。",
+    );
+    expect(zh.t("settings.reset.forceWarning")).toBe(
+      "云端与本机文件不受影响；之后需重新加入同步，未结算的删除或移动结果可能未在另一端落盘。重置会自动生成一份诊断报告，供之后反馈问题使用。",
+    );
+    // The auto-generated report replaces the old "export first" advice.
+    expect(zh.t("settings.reset.forceWarning")).not.toContain("建议先导出诊断报告");
+    expect(en.t("settings.reset.confirmMessage")).toBe(
+      "This clears the sync state recorded on this device and rebuilds it on the next sync. A diagnostic report is saved to the vault root automatically; send it to the author if you need to report a problem later.",
+    );
+    expect(en.t("settings.reset.forceWarning")).toBe(
+      "Cloud and local files are not affected. You will need to rejoin sync afterward; unsettled deletions or moves may not have landed on the other side. A diagnostic report is generated automatically for later feedback.",
+    );
+    expect(en.t("settings.reset.forceWarning")).not.toContain(
+      "Exporting a diagnostic report first is recommended",
+    );
+  });
+
+  it("adds a two-line reader note under the report metadata block", () => {
+    const source = readFileSync("src/main.ts", "utf8");
+    const zh = new I18n("zh-cn");
+    const platform = source.indexOf('lines.push(`**平台**: ${platformLabel}`)');
+    const feedback = source.indexOf('reportI18n.t("diagnosticReport.feedbackNote")');
+    const redaction = source.indexOf('reportI18n.t("diagnosticReport.redactionNote")');
+    const overview = source.indexOf('lines.push("## 当前同步概况")');
+    expect(platform).toBeGreaterThan(-1);
+    expect(feedback).toBeGreaterThan(platform);
+    expect(redaction).toBeGreaterThan(feedback);
+    expect(overview).toBeGreaterThan(redaction);
+    // The email must stay bare: parentheses make Markdown render the
+    // preceding text together with the address as one link.
+    expect(zh.t("diagnosticReport.feedbackNote")).toBe(
+      "EasySync 不设服务器：如需反馈问题，请把本报告发送给作者 yingxingjiao@qq.com",
+    );
+    expect(zh.t("diagnosticReport.feedbackNote")).not.toContain("（yingxingjiao");
+    expect(zh.t("diagnosticReport.redactionNote")).toContain("报告已脱敏");
+    const enFeedback = new I18n("en").t("diagnosticReport.feedbackNote");
+    expect(enFeedback).toBe(
+      "EasySync has no server: to report a problem, send this file to the author at yingxingjiao@qq.com",
+    );
+    expect(enFeedback).not.toContain("(yingxingjiao");
+  });
+
+  it("captures the pre-reset report once the reset is definitely starting", () => {
+    const source = readFileSync("src/main.ts", "utf8");
+    const resetStart = source.indexOf("async resetSyncState()");
+    const lock = source.indexOf('acquireOpLock("reset")', resetStart);
+    const capture = source.indexOf(
+      "await this.generateDiagnosticReport()",
+      resetStart,
+    );
+    const settle = source.indexOf("hasResetBlockingRecovery()", resetStart);
+    expect(resetStart).toBeGreaterThan(-1);
+    expect(lock).toBeGreaterThan(-1);
+    expect(settle).toBeGreaterThan(-1);
+    // After the lock is held (no report for a reset that never starts) and
+    // before any reset variant branches (captures the pre-reset state).
+    expect(capture).toBeGreaterThan(lock);
+    expect(capture).toBeLessThan(settle);
+  });
+});
+
 describe("recent plugin data write evidence", () => {
   it("reports exactly the keys whose values changed, in stable order", () => {
     const before = {

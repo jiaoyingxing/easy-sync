@@ -34,6 +34,6 @@ if (staticBlockMatches && staticBlockMatches.length > 0) {
 }
 
 console.log(
-  `[check-bundle-compat] OK: ${path.basename(bundlePath)} (${code.length} bytes), ` +
-    `no class static initialization block, ES2020 syntax floor enforced.`
+  `[check-bundle-compat] OK: ${path.basename(bundlePath)} (${Buffer.byteLength(code, "utf8")} B on disk / ` +
+    `${code.length} chars), no class static initialization block, ES2020 syntax floor enforced.`
 );
