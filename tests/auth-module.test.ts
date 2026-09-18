@@ -1625,3 +1625,94 @@ describe("AuthModule token response expires_in handling", () => {
     expect(tokenRequests).toBe(2);
   });
 });
+
+describe("AuthModule browser callback failure parity", () => {
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function makeLoginContext(
+    diag: { log: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> },
+    callbackSlot: { current?: (params: Record<string, string>) => void },
+  ) {
+    return makeContext({
+      diag: diag as never,
+      registerProtocolHandler: (_action: string, handler: (params: Record<string, string>) => void) => {
+        callbackSlot.current = handler;
+      },
+    });
+  }
+
+  async function startBrowserLogin(
+    diag: { log: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> },
+    callbackSlot: { current?: (params: Record<string, string>) => void },
+  ): Promise<AuthModule> {
+    const auth = new AuthModule(makeLoginContext(diag, callbackSlot));
+    await auth.initialize();
+    await auth.login();
+    return auth;
+  }
+
+  function readFailedView(auth: AuthModule): boolean {
+    return (auth as unknown as { browserAttemptFailed: boolean }).browserAttemptFailed;
+  }
+
+  it("marks the attempt as failed when the token exchange fails — the waiting modal can surface it", async () => {
+    const diag = { log: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const callbackSlot: { current?: (params: Record<string, string>) => void } = {};
+    vi.spyOn(obsidian, "requestUrl").mockRejectedValue(new Error("offline"));
+    const auth = await startBrowserLogin(diag, callbackSlot);
+
+    callbackSlot.current?.({ code: "auth-code", state: "state-fixed" });
+    await vi.waitFor(() => expect(diag.error).toHaveBeenCalled());
+
+    expect(readFailedView(auth)).toBe(true);
+    expect(auth.isPending).toBe(false);
+    expect(auth.pendingAuthUrl).toBeNull();
+    expect(auth.authState.isLoggedIn).toBe(false);
+  });
+
+  it("marks the attempt as failed on a state-mismatch callback instead of silently dropping the pending", async () => {
+    const diag = { log: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const callbackSlot: { current?: (params: Record<string, string>) => void } = {};
+    const auth = await startBrowserLogin(diag, callbackSlot);
+
+    callbackSlot.current?.({ code: "auth-code", state: "tampered-state" });
+    await vi.waitFor(() => expect(diag.error).toHaveBeenCalled());
+
+    expect(readFailedView(auth)).toBe(true);
+    expect(auth.isPending).toBe(false);
+    expect(auth.authState.isLoggedIn).toBe(false);
+  });
+
+  it("clears the failure view on a successful completion", async () => {
+    const diag = { log: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const callbackSlot: { current?: (params: Record<string, string>) => void } = {};
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (String(options.url).includes("/oauth2/v2.0/token")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { access_token: "fresh-at", refresh_token: "rotated-rt", expires_in: 3600, scope: "x" },
+        };
+      }
+      if (String(options.url).includes("graph.microsoft.com/v1.0/me")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { displayName: "User", id: "account-1" },
+        };
+      }
+      return { status: 200, headers: {}, json: {} };
+    });
+    const auth = await startBrowserLogin(diag, callbackSlot);
+
+    callbackSlot.current?.({ code: "auth-code", state: "state-fixed" });
+    await vi.waitFor(() => expect(auth.authState.isLoggedIn).toBe(true));
+
+    expect(readFailedView(auth)).toBe(false);
+    expect(auth.isPending).toBe(false);
+  });
+});

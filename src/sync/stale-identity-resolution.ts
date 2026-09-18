@@ -574,7 +574,7 @@ function samePath(left: string, right: string): boolean {
 }
 
 function identityPath(path: string): string {
-  return path.normalize("NFC").toLocaleLowerCase();
+  return path.normalize("NFC").toLocaleLowerCase("en-US");
 }
 
 function sortRecord<T>(record: Record<string, T>): Record<string, T> {

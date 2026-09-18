@@ -2497,6 +2497,12 @@ export class OneDriveClient {
     dispatch: () => Promise<RequestUrlResponse>,
   ): Promise<RequestUrlResponse> {
     if (this.sharedSyncProtocolRequestsInFlight.has(requestKey)) {
+      const component = requestKey.slice(requestKey.lastIndexOf(":") + 1);
+      this.diag?.log(
+        "onedrive",
+        "shared protocol request not dispatched — identical request still in flight",
+        { component, source: "prior-request-in-flight", timeoutMs },
+      );
       return Promise.reject(new SyntheticRequestTimeoutError(
         timeoutMs,
         "prior-request-in-flight",

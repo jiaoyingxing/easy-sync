@@ -109,6 +109,17 @@ describe("i18n placeholder parity", () => {
     expect(bad).toEqual([]);
   });
 
+  it("locks every plugin-presence key to exactly the pluginId placeholder", () => {
+    // C11-3(账本 §七):error.present.plugin.* 的插值必须恰为 {pluginId}——
+    // 多余/缺失占位会让 t() 渲染出坏文案而 parity 门无感。
+    const keys = Object.keys(zhCN).filter((k) => k.startsWith("error.present.plugin."));
+    expect(keys.length).toBeGreaterThan(0);
+    for (const key of keys) {
+      expect(tokens(zhCN[key as keyof typeof zhCN])).toEqual(["pluginId"]);
+      expect(tokens(en[key as keyof typeof en])).toEqual(["pluginId"]);
+    }
+  });
+
   it("keys rendered without substitution params carry no tokens", () => {
     const noParamKeys = Object.keys(zhCN).filter(
       (k) => k.startsWith("error.present.file.") || k === "error.present.internal",

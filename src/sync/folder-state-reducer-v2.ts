@@ -956,7 +956,7 @@ function isAtOrBelow(path: string, root: string): boolean {
 }
 
 function identityPath(path: string): string {
-  return path.normalize("NFC").toLocaleLowerCase();
+  return path.normalize("NFC").toLocaleLowerCase("en-US");
 }
 
 function nfcPath(path: string): string {

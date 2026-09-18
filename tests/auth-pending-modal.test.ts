@@ -66,3 +66,65 @@ describe("AuthPendingModal auto-completion", () => {
     expect(source).toContain("compatClearInterval(this.authTick)");
   });
 });
+
+describe("AuthPendingModal browser-attempt failure", () => {
+  function makeFailedModal(show: ReturnType<typeof vi.fn>) {
+    const auth = {
+      authState: { isLoggedIn: false },
+      browserAttemptFailed: true,
+    } as unknown as AuthModule;
+    const modal = new AuthPendingModal(
+      {} as never,
+      "pending-title",
+      "pending-message",
+      "复制登录链接",
+      "重新打开登录页面",
+      "取消登录",
+      undefined,
+      undefined,
+      {
+        auth,
+        noticeCenter: { show },
+        t: ((key: string) => key) as never,
+      },
+    );
+    return modal;
+  }
+
+  it("surfaces the failure once with a notice and the rewritten waiting text — modal stays open for retry", async () => {
+    const show = vi.fn();
+    const modal = makeFailedModal(show);
+    const messageEl = { setText: vi.fn() };
+    (modal as unknown as { messageEl: unknown }).messageEl = messageEl;
+    let settled: { action: string } | null = null;
+    void modal.awaitAction().then((result) => {
+      settled = result;
+    });
+
+    const tick = () => (modal as unknown as { onAuthTick: () => void }).onAuthTick();
+    tick();
+    await Promise.resolve();
+    tick();
+    await Promise.resolve();
+
+    expect(show).toHaveBeenCalledTimes(1);
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "auth-pending-failed",
+      priority: expect.any(Number),
+    }));
+    expect(messageEl.setText).toHaveBeenCalledTimes(1);
+    expect(messageEl.setText).toHaveBeenCalledWith("settings.account.pendingFailed");
+    expect(settled).toBeNull();
+  });
+
+  it("keeps the success path untouched when no failure is flagged", async () => {
+    const show = vi.fn();
+    const modal = makeModal(false, show);
+    (modal as unknown as { messageEl: unknown }).messageEl = { setText: vi.fn() };
+
+    (modal as unknown as { onAuthTick: () => void }).onAuthTick();
+    await Promise.resolve();
+
+    expect(show).not.toHaveBeenCalled();
+  });
+});

@@ -1299,7 +1299,7 @@ function comparePath(left: string, right: string): number {
 }
 
 function normalizeTopologyPath(path: string): string {
-  return path.normalize("NFC").toLocaleLowerCase();
+  return path.normalize("NFC").toLocaleLowerCase("en-US");
 }
 
 function sleep(ms: number): Promise<void> {

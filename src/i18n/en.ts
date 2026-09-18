@@ -55,6 +55,7 @@ const en: LocaleStrings = {
   "settings.account.cancelLogin": "Cancel sign-in",
   "settings.account.authLinkCopied": "Sign-in link copied. Open it in a browser on this device soon, and do not share it.",
   "settings.account.authLinkUnavailable": "Couldn’t copy the sign-in link. Reopen the sign-in page.",
+  "settings.account.pendingFailed": "Sign-in couldn’t complete — reopen the sign-in page to try again, or cancel and pick another method.",
   "settings.account.loginSuccess": "Login successful",
   "settings.account.logout": "Log out",
   "settings.account.method.browser.name": "Browser redirect",

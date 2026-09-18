@@ -63,7 +63,7 @@ export function exactNodeEquality(
 }
 
 export function identityPath(path: string): string {
-  return path.normalize("NFC").toLocaleLowerCase();
+  return path.normalize("NFC").toLocaleLowerCase("en-US");
 }
 
 export function uniqueAnchorId<T>(

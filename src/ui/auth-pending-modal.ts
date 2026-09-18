@@ -39,6 +39,8 @@ export class AuthPendingModal extends EasySyncModal {
   private resolve: ((value: PendingModalResult) => void) | null = null;
   private authTick: IntervalHandle | null = null;
   private closed = false;
+  private failureShown = false;
+  private messageEl: HTMLElement | null = null;
 
   constructor(
     app: App,
@@ -74,7 +76,7 @@ export class AuthPendingModal extends EasySyncModal {
     contentEl.empty();
     this.setTitle(this.title);
 
-    contentEl.createEl("p", {
+    this.messageEl = contentEl.createEl("p", {
       text: this.message,
       cls: "setting-item-description",
     });
@@ -110,9 +112,16 @@ export class AuthPendingModal extends EasySyncModal {
     }
   }
 
-  /** Success closes the modal on its own — nothing for the user to press. */
+  /** Success closes the modal on its own — nothing for the user to press.
+   *  A failed attempt (device-flow parity) surfaces once: failure notice
+   *  plus the waiting text rewritten in place; the modal stays open so the
+   *  existing "重新打开登录页面" button is the retry and "取消登录" the exit. */
   private onAuthTick(): void {
     if (this.closed || !this.deps) return;
+    if (this.deps.auth.browserAttemptFailed) {
+      this.showFailure();
+      return;
+    }
     if (!this.deps.auth.authState.isLoggedIn) return;
     this.closed = true;
     this.deps.noticeCenter.show({
@@ -121,6 +130,17 @@ export class AuthPendingModal extends EasySyncModal {
       priority: NOTICE_PRIORITY.action,
     });
     this.finish({ action: "dismiss" });
+  }
+
+  private showFailure(): void {
+    if (this.failureShown || !this.deps) return;
+    this.failureShown = true;
+    this.deps.noticeCenter.show({
+      key: "auth-pending-failed",
+      message: this.deps.t("settings.account.pendingFailed"),
+      priority: NOTICE_PRIORITY.failure,
+    });
+    this.messageEl?.setText(this.deps.t("settings.account.pendingFailed"));
   }
 
   onClose(): void {

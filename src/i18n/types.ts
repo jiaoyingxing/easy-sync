@@ -52,6 +52,7 @@ export interface LocaleStrings {
   "settings.account.cancelLogin": string;
   "settings.account.authLinkCopied": string;
   "settings.account.authLinkUnavailable": string;
+  "settings.account.pendingFailed": string;
   "settings.account.loginSuccess": string;
   "settings.account.login": string;
   "settings.account.checking": string;

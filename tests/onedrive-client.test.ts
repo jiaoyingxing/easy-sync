@@ -2493,6 +2493,34 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     );
   });
 
+  it("reports a deduplicated request as not dispatched, not as a timeout (C5-2)", async () => {
+    vi.useFakeTimers();
+    const hungRequest = new Promise<never>(() => {});
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementation(() => hungRequest);
+    const diag = { log: vi.fn(), warn: vi.fn() };
+    const client = new OneDriveClient(async () => "token", diag as never);
+
+    void client.readSharedSyncProtocolObjects("testVault").catch(() => {});
+    await vi.advanceTimersByTimeAsync(0);
+    const second = await client.readSharedSyncProtocolObjects("testVault")
+      .then(
+        () => ({ error: null }),
+        (error: unknown) => ({ error }),
+      );
+
+    expect(second.error).toBeInstanceOf(SyntheticRequestTimeoutError);
+    expect(second.error).toMatchObject({ source: "prior-request-in-flight" });
+    // The dedup rejection must be observable in diagnostics as "not
+    // dispatched" — not indistinguishable from a real deadline timeout.
+    const logText = diag.log.mock.calls
+      .map((call) => call.map((part) => JSON.stringify(part) ?? String(part)).join(" "))
+      .join("\n");
+    expect(logText).toContain("not dispatched");
+    expect(logText).toContain("prior-request-in-flight");
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+  });
+
   it("bounds a timed-out protocol-body request by slot and requires a fresh body read", async () => {
     vi.useFakeTimers();
     let resolveLateBody: ((value: never) => void) | undefined;

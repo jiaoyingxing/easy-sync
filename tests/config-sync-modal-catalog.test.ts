@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConfigSyncModal } from "../src/ui/config-sync-modal";
 
 // The danger confirm dialog is the user's intent gate; the flow under
@@ -168,5 +168,96 @@ describe("community plugin cleanup confirm row visibility", () => {
     }).cleanedPluginIds.has("calendar")).toBe(false);
     expect(modal.renderPluginListArea).toHaveBeenCalled();
     expect(modal.requestCommunityPluginInventoryRefresh).not.toHaveBeenCalled();
+  });
+});
+
+describe("community plugin manager render coalescing", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function createCoalescingModal() {
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    Object.assign(modal as object, {
+      plugin: { app: {}, i18n: { t: (key: string) => key } },
+      destroyed: false,
+      searchQuery: "",
+      searchRenderDebounce: null,
+      lastInventoryReloadCompletedAt: 0,
+      inventoryReloadGateTimer: null,
+      inventoryRevisionRefreshRunning: false,
+      inventoryRevisionRefreshPending: false,
+      catalogRefreshSkippedWhileSyncing: false,
+      view: "community-plugin-files" as const,
+      renderPluginListArea: vi.fn(),
+      reloadCommunityPluginManager: vi.fn(async () => {}),
+      getManagerColumn: vi.fn(() => "files" as const),
+    });
+    return modal;
+  }
+
+  function reloadCalls(modal: ConfigSyncModal): ReturnType<typeof vi.fn> {
+    return (modal as unknown as {
+      reloadCommunityPluginManager: ReturnType<typeof vi.fn>;
+    }).reloadCommunityPluginManager;
+  }
+
+  it("coalesces search keystrokes into one list re-render after the quiet gap", async () => {
+    vi.useFakeTimers();
+    const modal = createCoalescingModal();
+    const handle = (modal as unknown as {
+      handleSearchInput(value: string): void;
+    });
+    handle.handleSearchInput("a");
+    handle.handleSearchInput("ap");
+    handle.handleSearchInput("app");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(modal.renderPluginListArea).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(modal.renderPluginListArea).toHaveBeenCalledTimes(1);
+    expect(modal.searchQuery).toBe("app");
+  });
+
+  it("does not re-render the list after the modal is destroyed", async () => {
+    vi.useFakeTimers();
+    const modal = createCoalescingModal();
+    modal.destroyed = true;
+    (modal as unknown as {
+      handleSearchInput(value: string): void;
+    }).handleSearchInput("a");
+    await vi.advanceTimersByTimeAsync(200);
+    expect(modal.renderPluginListArea).not.toHaveBeenCalled();
+  });
+
+  it("gates inventory-event rebuilds to one full remount per quiet interval", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-18T00:00:00Z"));
+    const modal = createCoalescingModal();
+    // The previous reload just completed — directory events streamed inside
+    // the quiet window must coalesce instead of remounting the list each time.
+    modal.lastInventoryReloadCompletedAt = Date.now();
+    const handle = (modal as unknown as {
+      handleCommunityPluginInventoryRevision(_revision: number): void;
+    });
+    handle.handleCommunityPluginInventoryRevision(1);
+    handle.handleCommunityPluginInventoryRevision(2);
+    handle.handleCommunityPluginInventoryRevision(3);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reloadCalls(modal)).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(reloadCalls(modal)).toHaveBeenCalledTimes(1);
+    expect(modal.inventoryRevisionRefreshPending).toBe(false);
+  });
+
+  it("rebuilds immediately when the last reload is outside the quiet window", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-18T00:00:00Z"));
+    const modal = createCoalescingModal();
+    modal.lastInventoryReloadCompletedAt = Date.now() - 1000;
+    (modal as unknown as {
+      handleCommunityPluginInventoryRevision(_revision: number): void;
+    }).handleCommunityPluginInventoryRevision(1);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reloadCalls(modal)).toHaveBeenCalledTimes(1);
   });
 });

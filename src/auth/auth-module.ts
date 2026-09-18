@@ -28,6 +28,7 @@ import {
   type DeviceCodeAttemptView,
   type DeviceCodeResponse,
   type PendingAuth,
+  type PendingBrowserAuth,
   type PendingDeviceAuth,
   type TokenResponse,
   AuthError,
@@ -200,6 +201,8 @@ export class AuthModule {
       // Still waiting unless the poll loop reached a terminal phase.
       return this.pending.phase === undefined;
     }
+    // A failed browser attempt is terminal — no longer "waiting".
+    if (this.pending.phase !== undefined) return false;
     if (Date.now() - this.pending.createdAt > 5 * 60 * 1000) {
       this.diag?.warn("auth", "OAuth pending auth expired after 5 minutes — no callback received");
       this.pending = null;
@@ -229,6 +232,14 @@ export class AuthModule {
       expiresAt: pending.expiresAt,
       phase: pending.phase ?? "waiting",
     };
+  }
+
+  /** Whether the current browser attempt has terminally failed — waiting
+   *  modal parity with deviceAttempt.phase. The attempt stays until the
+   *  user reopens (fresh attempt), cancels, or logs out. */
+  get browserAttemptFailed(): boolean {
+    const pending = this.pending;
+    return pending?.kind === "browser" && pending.phase === "failed";
   }
 
   /** True while initialize() is restoring a session from SecretStorage.
@@ -771,18 +782,12 @@ export class AuthModule {
 
     // Validate state for CSRF protection
     if (state !== pending.state) {
-      if (this.pending === pending) {
-        this.pending = null;
-        this.pendingGeneration = null;
-      }
+      this.markBrowserAttemptFailed(pending);
       throw new AuthError(AuthErrorType.StateMismatch, this.tr("auth.error.stateMismatch", "OAuth state mismatch."));
     }
 
     if (error) {
-      if (this.pending === pending) {
-        this.pending = null;
-        this.pendingGeneration = null;
-      }
+      this.markBrowserAttemptFailed(pending);
       throw new AuthError(
         AuthErrorType.ProviderError,
         this.tr("auth.error.providerError", `Microsoft error: ${error}`, { details: error_description || error }),
@@ -790,10 +795,7 @@ export class AuthModule {
     }
 
     if (!code) {
-      if (this.pending === pending) {
-        this.pending = null;
-        this.pendingGeneration = null;
-      }
+      this.markBrowserAttemptFailed(pending);
       throw new AuthError(AuthErrorType.ProviderError, this.tr("auth.error.noCode", "No authorization code received"));
     }
 
@@ -807,15 +809,28 @@ export class AuthModule {
       this.assertGeneration(generation);
 
       await this.completeFreshLogin(tokenResponse, generation);
-    } finally {
       if (this.pending === pending) {
         this.pending = null;
         this.pendingGeneration = null;
         this.stopPolling();
       }
+    } catch (e) {
+      this.markBrowserAttemptFailed(pending);
+      throw e;
     }
 
     if (generation === this.authGeneration) this.notifyChange();
+  }
+
+  /** Terminal-failure parity with the device flow: keep the attempt so the
+   *  waiting modal can surface the failure; stop polling (isPending reads
+   *  the terminal phase). A newer attempt (generation moved on) is never
+   *  touched by an older attempt's failure. */
+  private markBrowserAttemptFailed(pending: PendingBrowserAuth): void {
+    if (this.pending !== pending || pending.phase !== undefined) return;
+    pending.phase = "failed";
+    this.stopPolling();
+    this.notifyChange();
   }
 
   /** Shared completion tail for every fresh login path (browser callback and

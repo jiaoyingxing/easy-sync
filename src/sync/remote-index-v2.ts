@@ -75,7 +75,7 @@ export function projectRemoteNodesV2(
   const seen = new Map<string, string>();
   for (const id of nodeById.keys()) {
     const path = resolvePath(id);
-    const normalized = path.normalize("NFC").toLocaleLowerCase();
+    const normalized = path.normalize("NFC").toLocaleLowerCase("en-US");
     const existing = seen.get(normalized);
     if (existing && existing !== id) {
       throw new Error(`Remote hierarchy duplicate path: ${path}`);

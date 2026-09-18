@@ -1404,7 +1404,7 @@ export class StateManager {
           );
           return;
         }
-        this.applyLayoutMigrationConflictBlock(layoutMigrationConflict);
+        this.applyLayoutMigrationConflictBlock(layoutMigrationConflict, "v2");
         return;
       }
 
@@ -1447,7 +1447,7 @@ export class StateManager {
         ).baseContentFile,
       );
       this.remoteState = await this.loadRemoteState();
-      this.applyLayoutMigrationConflictBlock(layoutMigrationConflict);
+      this.applyLayoutMigrationConflictBlock(layoutMigrationConflict, "unknown");
       return;
     } else {
       this.v2ScopeTransitionStore = null;
@@ -1464,7 +1464,7 @@ export class StateManager {
       ).baseContentFile,
     );
     this.remoteState = await this.loadRemoteState();
-    this.applyLayoutMigrationConflictBlock(layoutMigrationConflict);
+    this.applyLayoutMigrationConflictBlock(layoutMigrationConflict, "unknown");
   }
 
   /** Record one fully healthy round and retire old layout files after the
@@ -1500,14 +1500,29 @@ export class StateManager {
 
   /**
    * Block a load that survived a runtime-layout conflict. Called only from the
-   * loader's clean exits, and never over a reason the loader itself recorded:
-   * that one is more specific and already carries its own diagnostics.
+   * loader's clean exits. When the loader already recorded a more specific
+   * block, keep that block and surface the conflict evidence through
+   * diagnostics instead of silently dropping it.
    */
   private applyLayoutMigrationConflictBlock(
     conflict: EasySyncRuntimeLayoutMigrationConflict | null,
+    authority: "v2" | "unknown",
   ): void {
-    if (!conflict || this.v2StateLoadBlock) return;
-    this.setV2StateLoadBlock("layout-migration-conflict", "v2", conflict);
+    if (!conflict) return;
+    if (this.v2StateLoadBlock) {
+      this.plugin.diag?.warn(
+        "state",
+        "runtime layout migration conflict blocked behind an existing state load block",
+        {
+          sourcePath: conflict.sourcePath,
+          targetPath: conflict.targetPath,
+          blockedBy: this.v2StateLoadBlock.reason,
+          authority,
+        },
+      );
+      return;
+    }
+    this.setV2StateLoadBlock("layout-migration-conflict", authority, conflict);
   }
 
   private async finalizePublic113CutoverIfRequired(
@@ -9509,7 +9524,7 @@ function parseLocalFolderMoveHints(value: unknown): LocalFolderMoveHintV1[] {
 }
 
 function normalizeFolderIdentityPath(path: string): string {
-  return path.normalize("NFC").toLocaleLowerCase();
+  return path.normalize("NFC").toLocaleLowerCase("en-US");
 }
 
 function parseLocalFolderDeleteHints(value: unknown): LocalFolderDeleteHintV1[] {

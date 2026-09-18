@@ -1322,7 +1322,7 @@ function pathDepth(path: string): number {
 }
 
 function identityPath(path: string): string {
-  return nfcPath(path).toLocaleLowerCase();
+  return nfcPath(path).toLocaleLowerCase("en-US");
 }
 
 function nfcPath(path: string): string {

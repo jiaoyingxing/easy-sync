@@ -24,6 +24,11 @@ import {
   type CommunityPluginSelectionColumn,
   type CommunityPluginSelectionSettings,
 } from "../sync/community-plugin-selection-update";
+import {
+  compatClearTimeout,
+  compatSetTimeout,
+  type TimeoutHandle,
+} from "../obsidian-compat";
 import { EasySyncModal } from "./easy-sync-modal";
 import { ConfirmModal } from "./confirm-modal";
 import { SequentialSettingsUpdateQueue } from "./sequential-settings-update-queue";
@@ -37,6 +42,16 @@ export type ConfigSyncView =
   | "community-plugin-data";
 
 type PluginColumn = CommunityPluginSelectionColumn;
+
+/** Search keystrokes coalesce into one list re-render after this quiet gap —
+ *  each keystroke used to rebuild the whole plugin list (inventory-scale DOM)
+ *  while typing. Conventional input-debounce value, not a measured bound. */
+const SEARCH_RENDER_DEBOUNCE_MS = 200;
+/** Directory events streamed by a sync round gate the full-list remount to
+ *  at most one per this quiet interval; the pending flag keeps the last state
+ *  fresh (the final rebuild always runs). Balance between the event cadence
+ *  and full remount cost, not a measured bound. */
+const INVENTORY_RELOAD_MIN_INTERVAL_MS = 500;
 
 /**
  * Rows of cloud-cleaned plugins stay hidden from both the files and the data
@@ -101,6 +116,9 @@ export class ConfigSyncModal extends EasySyncModal {
     null;
   private inventoryRevisionRefreshRunning = false;
   private inventoryRevisionRefreshPending = false;
+  private searchRenderDebounce: TimeoutHandle | null = null;
+  private inventoryReloadGateTimer: TimeoutHandle | null = null;
+  private lastInventoryReloadCompletedAt = 0;
   /**
    * Set when the remote catalog refresh was skipped because a sync round was
    * in flight at manager open time. Cleared once a follow-up refresh succeeds
@@ -144,6 +162,10 @@ export class ConfigSyncModal extends EasySyncModal {
     this.destroyed = true;
     this.loadGeneration += 1;
     this.inventoryRevisionRefreshPending = false;
+    compatClearTimeout(this.searchRenderDebounce);
+    this.searchRenderDebounce = null;
+    compatClearTimeout(this.inventoryReloadGateTimer);
+    this.inventoryReloadGateTimer = null;
     this.unsubscribeCommunityPluginInventoryRevision?.();
     this.unsubscribeCommunityPluginInventoryRevision = null;
     this.contentEl.empty();
@@ -582,7 +604,23 @@ export class ConfigSyncModal extends EasySyncModal {
     if (this.destroyed) return;
     this.inventoryRevisionRefreshPending = true;
     if (this.inventoryRevisionRefreshRunning) return;
-    void this.drainCommunityPluginInventoryRefresh();
+    // Burst guard: a sync round streams directory events; coalesce them so
+    // the full-list remount runs at most once per quiet interval. The pending
+    // flag guarantees the final state is still rendered after the burst.
+    if (this.inventoryReloadGateTimer) return;
+    const quiet =
+      INVENTORY_RELOAD_MIN_INTERVAL_MS
+      - (Date.now() - (this.lastInventoryReloadCompletedAt ?? 0));
+    if (quiet <= 0) {
+      void this.drainCommunityPluginInventoryRefresh();
+      return;
+    }
+    this.inventoryReloadGateTimer = compatSetTimeout(() => {
+      this.inventoryReloadGateTimer = null;
+      if (this.inventoryRevisionRefreshPending && !this.destroyed) {
+        void this.drainCommunityPluginInventoryRefresh();
+      }
+    }, quiet);
   }
 
   private async drainCommunityPluginInventoryRefresh(): Promise<void> {
@@ -601,6 +639,7 @@ export class ConfigSyncModal extends EasySyncModal {
         const column = this.getManagerColumn();
         if (!column) return;
         await this.reloadCommunityPluginManager(column, generation);
+        this.lastInventoryReloadCompletedAt = Date.now();
       }
     } finally {
       this.inventoryRevisionRefreshRunning = false;
@@ -608,6 +647,17 @@ export class ConfigSyncModal extends EasySyncModal {
         void this.drainCommunityPluginInventoryRefresh();
       }
     }
+  }
+
+  /** Coalesce keystrokes: one full-list remount after the quiet gap instead
+   *  of one per character (inventory-scale rows rebuilt each keystroke). */
+  private handleSearchInput(value: string): void {
+    this.searchQuery = value;
+    compatClearTimeout(this.searchRenderDebounce);
+    this.searchRenderDebounce = compatSetTimeout(() => {
+      this.searchRenderDebounce = null;
+      if (!this.destroyed) this.renderPluginListArea();
+    }, SEARCH_RENDER_DEBOUNCE_MS);
   }
 
   private renderCommunityPluginManager(column: PluginColumn): void {
@@ -631,8 +681,7 @@ export class ConfigSyncModal extends EasySyncModal {
       .setPlaceholder(t("settings.communityPlugins.search"))
       .setValue(this.searchQuery)
       .onChange((value) => {
-        this.searchQuery = value;
-        this.renderPluginListArea();
+        this.handleSearchInput(value);
       });
     search.inputEl.id = "easy-sync-community-plugin-search";
     search.inputEl.setAttribute(

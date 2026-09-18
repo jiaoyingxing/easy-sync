@@ -296,7 +296,7 @@ export function verifyCloudBootstrapV2(
   const anchors: CloudBootstrapAnchorV2[] = [];
   const rejectedPaths: string[] = [];
   for (const hint of bootstrap.anchors) {
-    const normalizedPath = hint.lastPath.normalize("NFC").toLocaleLowerCase();
+    const normalizedPath = hint.lastPath.normalize("NFC").toLocaleLowerCase("en-US");
     const remote = remoteIndex.itemsById[hint.remoteId];
     const local = localByPath.get(hint.lastPath);
     const verified = !seenRemote.has(hint.remoteId)

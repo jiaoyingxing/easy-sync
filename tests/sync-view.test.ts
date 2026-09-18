@@ -45,6 +45,9 @@ interface FakeHistoryElement {
   createSpan(className?: string): FakeHistoryElement;
   createEl(tag: string, className?: string): FakeHistoryElement;
   setText(text: string): FakeHistoryElement;
+  addEventListener(type: string, handler: () => void): void;
+  readonly firstElementChild: FakeHistoryElement | null;
+  listeners: Record<string, Array<() => void>>;
 }
 
 function createFakeHistoryElement(
@@ -75,6 +78,13 @@ function createFakeHistoryElement(
     setText(text) {
       this.text = text;
       return this;
+    },
+    listeners: {},
+    addEventListener(type: string, handler: () => void) {
+      (this.listeners[type] ??= []).push(handler);
+    },
+    get firstElementChild() {
+      return this.children[0] ?? null;
     },
   };
   return element;
@@ -1884,6 +1894,10 @@ describe("buildSyncViewContentKey", () => {
       },
     ]);
 
+    const list = section.children[0];
+    const zeroChangeDetails = list.children[1];
+    zeroChangeDetails.open = true;
+    for (const handler of zeroChangeDetails.listeners.toggle ?? []) handler();
     const text = collectFakeHistoryText(root);
     expect(text).toContain("暂时无法读取云端同步状态。");
     expect(text).toContain("本轮没有文件变更。");
@@ -1923,6 +1937,9 @@ describe("buildSyncViewContentKey", () => {
       message: "同步完成",
       files: [],
     }]);
+    const legacyDetails = section.children[0].children[0];
+    legacyDetails.open = true;
+    for (const handler of legacyDetails.listeners.toggle ?? []) handler();
 
     expect(collectFakeHistoryText(root)).not.toContain("本轮没有文件变更。");
   });
@@ -3137,5 +3154,37 @@ describe("scope-crossing row exit gating", () => {
     expect(confirm).toContain('"syncView.scopeCrossing.confirmMessageFolder"');
     expect(confirm).toContain('"syncView.scopeCrossing.confirmMessageFile"');
     expect(confirm).toContain("path: snapshot.fromPath");
+  });
+});
+
+describe("history section lazy entry bodies", () => {
+  const source = readFileSync("src/ui/sync-view.ts", "utf8");
+
+  it("mounts collapsed history run bodies lazily on first toggle", () => {
+    // 懒建形态:默认展开轮同步建,收起轮首次 toggle 才建详情——
+    // 打开历史区的主要 DOM 成本(10 轮×≤100 文件行)不再一次性挂载。
+    expect(source).toContain("renderHistoryEntryBody(body, entry)");
+    expect(source).toContain('addEventListener("toggle"');
+    expect(source).toContain("firstElementChild === null");
+    expect(source).toMatch(/const initiallyOpen = index === 0 && entry\.status !== "success";/);
+    expect(source).toMatch(/details\.open = initiallyOpen;/);
+  });
+
+  it("keeps the entry body content contract in the lazy builder", () => {
+    // 搬移保真:详情段全部呈现(meta/result/counts/noFileChanges/recovery/
+    // 文件行+跳过折叠组)由 renderHistoryEntryBody 承接,内容零删减。
+    const fn = source.match(
+      /private renderHistoryEntryBody\([\s\S]*?\): void \{[\s\S]*?\n  \}/,
+    );
+    expect(fn).not.toBeNull();
+    const body = fn![0];
+    expect(body).toContain("easy-sync-history-meta");
+    expect(body).toContain("easy-sync-history-result");
+    expect(body).toContain("easy-sync-history-counts");
+    expect(body).toContain("formatMutationRecoveryHistory");
+    expect(body).toContain("renderFileResults");
+    expect(body).toContain("easy-sync-history-skip-group");
+    expect(body).toContain("syncView.history.noFileChanges");
+    expect(body).toContain("formatSyncHistoryCounts");
   });
 });

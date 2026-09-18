@@ -36,7 +36,7 @@ export function buildSyncExclusionFolderCandidates(
       !normalized
       || isPathExcludedByFolders(normalized, excludedFolders)
     ) continue;
-    const key = normalized.toLocaleLowerCase();
+    const key = normalized.toLocaleLowerCase("en-US");
     if (!unique.has(key)) unique.set(key, { path: normalized });
   }
   return [...unique.values()].sort(
@@ -386,8 +386,17 @@ export class SyncExclusionModal extends EasySyncModal {
   }
 
   private async persistMaxFileSizeMb(value: number): Promise<void> {
+    const previous = this.plugin.syncMaxFileSizeMb;
     this.plugin.syncMaxFileSizeMb = value;
-    await this.plugin.saveSyncSettings();
+    try {
+      await this.plugin.saveSyncSettings();
+    } catch {
+      this.plugin.syncMaxFileSizeMb = previous;
+      this.plugin.applyMaxFileSize();
+      this.syncMaxFileSizeDropdownSelection();
+      new Notice(this.plugin.i18n.t("notice.settingsSaveFailed"));
+      return;
+    }
     this.plugin.applyMaxFileSize();
     this.refreshMaxFileSizeDesc();
   }

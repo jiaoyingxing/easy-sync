@@ -1073,6 +1073,43 @@ function availableSharedSyncProtocolRepairTransportV2(
     : null;
 }
 
+/** Capability probe shared by every batched metadata refresh site: returns a
+ *  client-bound refresh function, or null when the OneDrive client lacks the
+ *  Graph $batch metadata API (older build / mock). Callers keep their own
+ *  failure contract (fail-open / fail-closed / per-item error) and their own
+ *  write-back target — only the probe and the identity gate are shared. */
+export function resolveBatchMetadataClient(
+  onedrive: unknown,
+): ((
+  driveItemIds: readonly string[],
+  metadataReason?: OneDriveMetadataReason,
+) => Promise<Map<string, DriveItem | null>>) | null {
+  const candidate = onedrive as OneDriveClient & {
+    getDriveItemMetadataByIds?: (
+      driveItemIds: readonly string[],
+      metadataReason?: OneDriveMetadataReason,
+    ) => Promise<Map<string, DriveItem | null>>;
+  } | null | undefined;
+  return candidate != null
+    && typeof candidate.getDriveItemMetadataByIds === "function"
+    ? candidate.getDriveItemMetadataByIds.bind(candidate)
+    : null;
+}
+
+/** Identity gate shared by every batched metadata refresh site: the refreshed
+ *  item must still exist and match both the key (driveId or remote id) and
+ *  the eTag the caller planned against. Two absent eTags compare as equal —
+ *  the exact semantics every site had inline. */
+export function refreshedMetadataMatchesIdentity(
+  current: DriveItem | null | undefined,
+  identityKey: string,
+  expectedETag: string | null | undefined,
+): current is DriveItem {
+  return current != null
+    && current.id === identityKey
+    && current.eTag === expectedETag;
+}
+
 function availableSharedSyncProtocolTransportV3(
   client: OneDriveClient,
   vaultName: string,
@@ -8210,15 +8247,8 @@ export class SyncExecutor {
       const refreshVerificationDownloadUrls = async (
         items: ReadonlyArray<SyncPlanItem>,
       ): Promise<void> => {
-        const batchMetadataClient = this.onedrive as OneDriveClient & {
-          getDriveItemMetadataByIds?: (
-            driveItemIds: readonly string[],
-            metadataReason?: OneDriveMetadataReason,
-          ) => Promise<Map<string, DriveItem | null>>;
-        };
-        if (
-          typeof batchMetadataClient.getDriveItemMetadataByIds !== "function"
-        ) {
+        const batchMetadataClient = resolveBatchMetadataClient(this.onedrive);
+        if (!batchMetadataClient) {
           // Fail-open: no batch capability — per-file waterfall stays.
           return;
         }
@@ -8231,7 +8261,7 @@ export class SyncExecutor {
         if (missingUrl.length === 0) return;
         const batchStartedAt = Date.now();
         try {
-          const refreshed = await batchMetadataClient.getDriveItemMetadataByIds(
+          const refreshed = await batchMetadataClient(
             missingUrl.map((item) => item.remote!.driveId),
             "contentVerificationRefresh",
           );
@@ -8239,11 +8269,7 @@ export class SyncExecutor {
           for (const item of missingUrl) {
             const driveId = item.remote!.driveId;
             const current = refreshed.get(driveId);
-            if (
-              current
-              && current.id === driveId
-              && current.eTag === item.remote!.eTag
-            ) {
+            if (refreshedMetadataMatchesIdentity(current, driveId, item.remote!.eTag)) {
               const downloadUrl = current["@microsoft.graph.downloadUrl"];
               if (downloadUrl) {
                 item.remote!.downloadUrl = downloadUrl;
@@ -11649,14 +11675,8 @@ export class SyncExecutor {
     // F2: the prep catch marks missing members failed instead of re-falling
     // to the per-file GET; behaviour predates 1.4.3 and is intentionally
     // fail-closed, comment kept in sync with the implementation).
-    const universalBatchMetadataClient = this.onedrive as OneDriveClient & {
-      getDriveItemMetadataByIds?: (
-        driveItemIds: readonly string[],
-        metadataReason?: "downloadUrlRefresh" | "downloadVersionVerify" | "other",
-      ) => Promise<Map<string, DriveItem | null>>;
-    };
-    const canBatchDownloadUrlRefresh =
-      typeof universalBatchMetadataClient.getDriveItemMetadataByIds === "function";
+    const universalBatchMetadataClient = resolveBatchMetadataClient(this.onedrive);
+    const canBatchDownloadUrlRefresh = universalBatchMetadataClient !== null;
     if (canBatchDownloadUrlRefresh) {
       const missingDownloadUrl = downloads.filter(
         (item) => item.type === SyncActionType.Download
@@ -11666,18 +11686,14 @@ export class SyncExecutor {
       if (missingDownloadUrl.length > 0) {
         const batchStartedAt = Date.now();
         try {
-          const refreshed = await universalBatchMetadataClient.getDriveItemMetadataByIds(
+          const refreshed = await universalBatchMetadataClient(
             missingDownloadUrl.map((item) => item.remote!.driveId),
             "downloadUrlRefresh",
           );
           for (const item of missingDownloadUrl) {
             const driveId = item.remote!.driveId;
             const current = refreshed.get(driveId);
-            if (
-              current
-              && current.id === driveId
-              && current.eTag === item.remote!.eTag
-            ) {
+            if (refreshedMetadataMatchesIdentity(current, driveId, item.remote!.eTag)) {
               const downloadUrl = current["@microsoft.graph.downloadUrl"];
               if (downloadUrl) item.remote!.downloadUrl = downloadUrl;
             }
@@ -11762,14 +11778,8 @@ export class SyncExecutor {
       }
 
       const batchStartedAt = Date.now();
-      const metadataBatchClient = this.onedrive as OneDriveClient & {
-        getDriveItemMetadataByIds?: (
-          driveItemIds: readonly string[],
-          metadataReason?: "downloadUrlRefresh" | "downloadVersionVerify" | "other",
-        ) => Promise<Map<string, DriveItem | null>>;
-      };
-      const canBatchMetadata =
-        typeof metadataBatchClient.getDriveItemMetadataByIds === "function";
+      const metadataBatchClient = resolveBatchMetadataClient(this.onedrive);
+      const canBatchMetadata = metadataBatchClient !== null;
       const missingDownloadUrl = batch.filter((item) =>
         !item.remote?.downloadUrl && Boolean(item.remote?.driveId)
       );
@@ -11779,17 +11789,13 @@ export class SyncExecutor {
       const metadataPreparationErrors = new Map<string, unknown>();
       if (canBatchMetadata && missingDownloadUrl.length >= 1) {
         try {
-          const refreshed = await metadataBatchClient.getDriveItemMetadataByIds(
+          const refreshed = await metadataBatchClient(
             missingDownloadUrl.map((item) => item.remote!.driveId),
             "downloadUrlRefresh",
           );
           for (const item of missingDownloadUrl) {
             const current = refreshed.get(item.remote!.driveId);
-            if (
-              !current
-              || current.id !== item.remote!.driveId
-              || current.eTag !== item.remote!.eTag
-            ) {
+            if (!refreshedMetadataMatchesIdentity(current, item.remote!.driveId, item.remote!.eTag)) {
               metadataPreparationErrors.set(
                 item.path,
                 new DownloadRemoteVersionChangedError(item.path),
@@ -11879,7 +11885,7 @@ export class SyncExecutor {
       if (shouldBatchVersionVerification && hashlessVerificationIndexes.length > 0) {
         const remoteVerifyStartedAt = Date.now();
         try {
-          const currentById = await metadataBatchClient.getDriveItemMetadataByIds(
+          const currentById = await metadataBatchClient(
             hashlessVerificationIndexes.map((index) => batch[index].remote!.driveId),
             "downloadVersionVerify",
           );
@@ -11887,11 +11893,7 @@ export class SyncExecutor {
             const item = batch[index];
             const current = currentById.get(item.remote!.driveId);
             try {
-              if (
-                !current
-                || current.id !== item.remote!.driveId
-                || current.eTag !== item.remote!.eTag
-              ) {
+              if (!refreshedMetadataMatchesIdentity(current, item.remote!.driveId, item.remote!.eTag)) {
                 throw new DownloadRemoteVersionChangedError(item.path);
               }
               await this.verifyDownloadedPayload(
@@ -17601,14 +17603,8 @@ export class SyncExecutor {
     // (P1); candidates without a matching eTag or without an eTag at all fall
     // back to the existing per-file waterfall, and any batch failure leaves
     // the map empty (fail-closed, same contract as P1).
-    const n1BatchMetadataClient = this.onedrive as OneDriveClient & {
-      getDriveItemMetadataByIds?: (
-        driveItemIds: readonly string[],
-        metadataReason?: "downloadUrlRefresh" | "downloadVersionVerify" | "other",
-      ) => Promise<Map<string, DriveItem | null>>;
-    };
-    const canBatchVerificationRefresh =
-      typeof n1BatchMetadataClient.getDriveItemMetadataByIds === "function";
+    const n1BatchMetadataClient = resolveBatchMetadataClient(this.onedrive);
+    const canBatchVerificationRefresh = n1BatchMetadataClient !== null;
     const verificationDownloadUrlById = new Map<string, string>();
     if (canBatchVerificationRefresh) {
       const refreshableCandidates = verificationCandidates.filter(
@@ -17617,17 +17613,13 @@ export class SyncExecutor {
       if (refreshableCandidates.length > 0) {
         const batchStartedAt = Date.now();
         try {
-          const refreshed = await n1BatchMetadataClient.getDriveItemMetadataByIds(
+          const refreshed = await n1BatchMetadataClient(
             refreshableCandidates.map(({ node }) => node.id),
             "downloadUrlRefresh",
           );
           for (const { node } of refreshableCandidates) {
             const current = refreshed.get(node.id);
-            if (
-              current
-              && current.id === node.id
-              && current.eTag === node.eTag
-            ) {
+            if (refreshedMetadataMatchesIdentity(current, node.id, node.eTag)) {
               const downloadUrl = current["@microsoft.graph.downloadUrl"];
               if (downloadUrl) verificationDownloadUrlById.set(node.id, downloadUrl);
             }
@@ -17651,6 +17643,7 @@ export class SyncExecutor {
     }
     let verifiedCount = 0;
     for (const { node, path } of verificationCandidates) {
+      if (this.shouldStop(result, operationEpoch)) return result;
       verifiedCount++;
       this.progressStore?.setPhase("verifying");
       this.progressStore?.setProgress(
@@ -19111,14 +19104,8 @@ export class SyncExecutor {
     // refresh up front (Graph $batch, 20 ids per request); candidates without a
     // matching/available eTag and any batch failure fall back to the existing
     // per-file waterfall (fail-closed, same contract as P1/N1).
-    const n2BatchMetadataClient = this.onedrive as OneDriveClient & {
-      getDriveItemMetadataByIds?: (
-        driveItemIds: readonly string[],
-        metadataReason?: "downloadUrlRefresh" | "downloadVersionVerify" | "other",
-      ) => Promise<Map<string, DriveItem | null>>;
-    };
-    const canBatchScopeRecoveryRefresh =
-      typeof n2BatchMetadataClient.getDriveItemMetadataByIds === "function";
+    const n2BatchMetadataClient = resolveBatchMetadataClient(this.onedrive);
+    const canBatchScopeRecoveryRefresh = n2BatchMetadataClient !== null;
     const scopeRecoveryDownloadUrlById = new Map<string, string>();
     if (canBatchScopeRecoveryRefresh) {
       const refreshableCandidates = pendingVerificationCandidates.filter(
@@ -19127,17 +19114,13 @@ export class SyncExecutor {
       if (refreshableCandidates.length > 0) {
         const batchStartedAt = Date.now();
         try {
-          const refreshed = await n2BatchMetadataClient.getDriveItemMetadataByIds(
+          const refreshed = await n2BatchMetadataClient(
             refreshableCandidates.map(({ node }) => node.id),
             "downloadUrlRefresh",
           );
           for (const { node } of refreshableCandidates) {
             const current = refreshed.get(node.id);
-            if (
-              current
-              && current.id === node.id
-              && current.eTag === node.eTag
-            ) {
+            if (refreshedMetadataMatchesIdentity(current, node.id, node.eTag)) {
               const downloadUrl = current["@microsoft.graph.downloadUrl"];
               if (downloadUrl) scopeRecoveryDownloadUrlById.set(node.id, downloadUrl);
             }
@@ -20796,16 +20779,8 @@ export class SyncExecutor {
     // batch capability or a failed batch leaves URLs unset and every probe
     // falls back to the per-file waterfall exactly as before.
     const refreshedProbeUrls = new Map<string, string>();
-    const probeBatchClient = this.onedrive as OneDriveClient & {
-      getDriveItemMetadataByIds?: (
-        driveItemIds: readonly string[],
-        metadataReason?: OneDriveMetadataReason,
-      ) => Promise<Map<string, DriveItem | null>>;
-    };
-    if (
-      typeof probeBatchClient.getDriveItemMetadataByIds === "function"
-      && byPlugin.size > 0
-    ) {
+    const probeBatchClient = resolveBatchMetadataClient(this.onedrive);
+    if (probeBatchClient !== null && byPlugin.size > 0) {
       const probeEntries: Array<{
         driveId: string;
         eTag: string;
@@ -20837,18 +20812,14 @@ export class SyncExecutor {
       if (probeEntries.length > 0) {
         const probeStartedAt = Date.now();
         try {
-          const refreshed = await probeBatchClient.getDriveItemMetadataByIds(
+          const refreshed = await probeBatchClient(
             probeEntries.map((entry) => entry.driveId),
             "downloadUrlRefresh",
           );
           let filled = 0;
           for (const entry of probeEntries) {
             const current = refreshed.get(entry.driveId);
-            if (
-              current
-              && current.id === entry.driveId
-              && current.eTag === entry.eTag
-            ) {
+            if (refreshedMetadataMatchesIdentity(current, entry.driveId, entry.eTag)) {
               const downloadUrl = current["@microsoft.graph.downloadUrl"];
               if (downloadUrl) {
                 refreshedProbeUrls.set(entry.driveId, downloadUrl);

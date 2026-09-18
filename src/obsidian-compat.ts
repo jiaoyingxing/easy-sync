@@ -107,10 +107,12 @@ export function getConfigDir(vault: Pick<Vault, "configDir">): string {
  * Cross-device path identity used by EasySync and OneDrive. Display casing is
  * preserved elsewhere, but identity follows OneDrive's case-insensitive NFC
  * namespace so a path cannot bypass protection on Windows or macOS and then
- * collide when another device syncs it.
+ * collide when another device syncs it. The fold pins en-US: the anchor is
+ * the cloud namespace's casing rule, never the host locale (Turkish I→ı
+ * and friends would drift identity across devices or locale changes).
  */
 export function normalizeVaultPathKey(path: string): string {
-  return path.replace(/\\/g, "/").normalize("NFC").toLocaleLowerCase();
+  return path.replace(/\\/g, "/").normalize("NFC").toLocaleLowerCase("en-US");
 }
 
 export function getPluginDir(

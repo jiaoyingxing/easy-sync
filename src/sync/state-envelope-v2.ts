@@ -858,7 +858,7 @@ export function validateEnvelope(value: unknown): asserts value is SyncStateEnve
   const anchorPaths = new Set<string>();
   for (const [anchorId, raw] of Object.entries(value.anchors.byAnchorId)) {
     if (!isAnchor(raw, anchorId)) throw new Error(`V2 anchor is invalid: ${anchorId}`);
-    const normalizedPath = raw.lastPath.normalize("NFC").toLocaleLowerCase();
+    const normalizedPath = raw.lastPath.normalize("NFC").toLocaleLowerCase("en-US");
     if (anchorPaths.has(normalizedPath)) {
       throw new Error(`V2 path has multiple anchors: ${raw.lastPath}`);
     }
@@ -1078,7 +1078,7 @@ function validateRemoteHierarchy(nodes: Record<string, RemoteNodeV2>, rootId: st
   };
   const seen = new Set<string>();
   for (const id of Object.keys(nodes)) {
-    const path = resolve(id).normalize("NFC").toLocaleLowerCase();
+    const path = resolve(id).normalize("NFC").toLocaleLowerCase("en-US");
     if (seen.has(path)) throw new Error("duplicate path");
     seen.add(path);
   }
@@ -1220,5 +1220,5 @@ function isVaultRelativePath(value: unknown): value is string {
 }
 
 function normalizeIdentityPath(path: string): string {
-  return path.normalize("NFC").toLocaleLowerCase();
+  return path.normalize("NFC").toLocaleLowerCase("en-US");
 }

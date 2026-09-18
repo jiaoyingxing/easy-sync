@@ -3169,7 +3169,8 @@ export class EasySyncSyncView extends ItemView {
     const list = section.createDiv("easy-sync-history-list");
     history.forEach((entry, index) => {
       const details = list.createEl("details", "easy-sync-history-run easy-sync-tree-item");
-      details.open = index === 0 && entry.status !== "success";
+      const initiallyOpen = index === 0 && entry.status !== "success";
+      details.open = initiallyOpen;
       const summary = details.createEl("summary", "easy-sync-history-summary easy-sync-tree-row");
       this.addCollapseIcon(summary);
       const main = summary.createSpan("easy-sync-history-main");
@@ -3186,6 +3187,27 @@ export class EasySyncSyncView extends ItemView {
       );
 
       const body = details.createDiv("easy-sync-history-detail");
+      if (initiallyOpen) {
+        this.renderHistoryEntryBody(body, entry);
+      } else {
+        // 收起轮懒建:首次展开时才挂详情——10 轮×≤100 文件行的全量挂载是
+        // 打开历史区的主要 DOM 成本;折叠态 summary 照常渲染,建后保留
+        // (再收展零重建)。
+        details.addEventListener("toggle", () => {
+          if (details.open && body.firstElementChild === null) {
+            this.renderHistoryEntryBody(body, entry);
+          }
+        });
+      }
+    });
+  }
+
+  private renderHistoryEntryBody(
+    body: HTMLElement,
+    entry: SyncHistoryEntry,
+  ): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    {
       body.createDiv("easy-sync-history-meta").setText(
         `${t(`syncView.history.mode.${entry.mode}`)} · ${t("syncView.history.duration", {
           seconds: Math.max(0, Math.round((entry.endedAt - entry.startedAt)/1000)),
@@ -3258,7 +3280,7 @@ export class EasySyncSyncView extends ItemView {
           t("syncView.history.omitted", { count: omitted }),
         );
       }
-    });
+    }
   }
 
   private renderFileResults(

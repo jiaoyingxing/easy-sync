@@ -38,6 +38,11 @@ export interface PendingBrowserAuth {
   state: string;
   /** Exact authorization URL for the current in-memory login attempt */
   authUrl: string;
+  /** Terminal failure phase once the callback chain fails without success
+   *  (state mismatch, provider error, token exchange or completion failure).
+   *  The attempt is kept so the waiting modal can surface the failure —
+   *  device-flow parity; cleared by cancel / reopen / a new login. */
+  phase?: "failed";
   /** Timestamp when this auth attempt was started */
   createdAt: number;
 }

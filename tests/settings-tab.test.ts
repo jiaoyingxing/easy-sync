@@ -100,6 +100,26 @@ describe("buildSettingsSyncButtonState", () => {
     );
   });
 
+  it("mirrors tooltip and aria-label on the declarative automatic-handling button (C10-2)", () => {
+    const source = readFileSync("src/ui/settings-tab.ts", "utf8");
+    const declarativeStart = source.indexOf("export function buildSettingDefinitions(");
+    const declarative = source.slice(declarativeStart);
+    const automaticGroupStart = declarative.indexOf(
+      'heading: t("settings.group.automatic")',
+    );
+    const automaticGroupEnd = declarative.indexOf('type: "group"', automaticGroupStart);
+    const automaticGroup = declarative.slice(automaticGroupStart, automaticGroupEnd);
+
+    // The command-style block (renderAutomaticSection) already carries both;
+    // the declarative twin must not lose tooltip/aria parity (C10-2).
+    expect(automaticGroup).toContain(
+      'setButtonText(t("settings.automaticHandling.button"))\n                .setTooltip(t("settings.automaticHandling.open"))',
+    );
+    expect(automaticGroup).toContain(
+      '"aria-label",\n                t("settings.automaticHandling.open"),',
+    );
+  });
+
   it("keeps account actions unheaded and separates range from automatic settings", () => {
     const source = readFileSync("src/ui/settings-tab.ts", "utf8");
     const autoSyncModalSource = readFileSync("src/ui/auto-sync-modal.ts", "utf8");
@@ -1328,5 +1348,28 @@ describe("buildSettingsSyncButtonState", () => {
     expect(en["settings.automaticHandling.mergeNonOverlappingText.desc"]).toContain(
       "leave them for manual handling",
     );
+  });
+});
+
+describe("settings save call sites", () => {
+  it("wraps every settings-tab save with rollback and a failure notice (C10-5 同形)", () => {
+    // C10-5 同形缺口(账本 §七):四处 saveSyncSettings 调用(命令式通知弹窗/
+    // 诊断日志+声明式同两处)失败时必须回滚内存与控件并提示,而不是
+    // unhandled rejection 且其后的 apply*/renderHint 被跳过。
+    const source = readFileSync("src/ui/settings-tab.ts", "utf8");
+    const count = (text: string, needle: string) => text.split(needle).length - 1;
+    expect(count(source, "notice.settingsSaveFailed")).toBe(4);
+    expect(count(source, ".setValue(previous)")).toBe(4);
+  });
+
+  it("wraps the exclusion modal max-size persistence with rollback and a failure notice", () => {
+    const source = readFileSync("src/ui/sync-exclusion-modal.ts", "utf8");
+    const start = source.indexOf("private async persistMaxFileSizeMb(");
+    const next = source.indexOf("private async", start + 10);
+    const fn = source.slice(start, next === -1 ? undefined : next);
+    expect(fn).toContain("try {");
+    expect(fn).toContain("notice.settingsSaveFailed");
+    expect(fn).toContain("this.syncMaxFileSizeDropdownSelection()");
+    expect(fn).toContain("this.plugin.applyMaxFileSize()");
   });
 });

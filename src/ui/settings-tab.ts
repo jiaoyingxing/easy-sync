@@ -11,6 +11,7 @@
  */
 
 import {
+  Notice,
   PluginSettingTab,
   SettingGroup,
   type SettingDefinitionItem,
@@ -428,9 +429,17 @@ export class EasySyncSettingTab extends PluginSettingTab {
             .addOption("off", t("settings.notificationPopups.option.off"))
             .setValue(this.plugin.notificationPopups)
             .onChange(async (value) => {
+              const previous = this.plugin.notificationPopups;
               this.plugin.notificationPopups =
                 value === "important" || value === "off" ? value : "all";
-              await this.plugin.saveSyncSettings();
+              try {
+                await this.plugin.saveSyncSettings();
+              } catch {
+                this.plugin.notificationPopups = previous;
+                dropdown.setValue(previous);
+                new Notice(t("notice.settingsSaveFailed"));
+                return;
+              }
               this.plugin.applyNotificationPopups();
               renderHint();
             });
@@ -488,8 +497,16 @@ export class EasySyncSettingTab extends PluginSettingTab {
           toggle
             .setValue(this.plugin.diagLogEnabled)
             .onChange(async (value) => {
+              const previous = this.plugin.diagLogEnabled;
               this.plugin.diagLogEnabled = value;
-              await this.plugin.saveSyncSettings();
+              try {
+                await this.plugin.saveSyncSettings();
+              } catch {
+                this.plugin.diagLogEnabled = previous;
+                toggle.setValue(previous);
+                new Notice(t("notice.settingsSaveFailed"));
+                return;
+              }
               this.plugin.applyDiagnosticSetting();
             });
         });
@@ -750,7 +767,12 @@ export function buildSettingDefinitions(
           render: (setting) => {
             setting.addButton((button) => {
               button.setButtonText(t("settings.automaticHandling.button"))
+                .setTooltip(t("settings.automaticHandling.open"))
                 .onClick(() => { new AutomaticHandlingModal(plugin).open(); });
+              button.buttonEl.setAttribute(
+                "aria-label",
+                t("settings.automaticHandling.open"),
+              );
             });
           },
         },
@@ -802,9 +824,17 @@ export function buildSettingDefinitions(
                 .addOption("off", t("settings.notificationPopups.option.off"))
                 .setValue(plugin.notificationPopups)
                 .onChange(async (value) => {
+                  const previous = plugin.notificationPopups;
                   plugin.notificationPopups =
                     value === "important" || value === "off" ? value : "all";
-                  await plugin.saveSyncSettings();
+                  try {
+                    await plugin.saveSyncSettings();
+                  } catch {
+                    plugin.notificationPopups = previous;
+                    dropdown.setValue(previous);
+                    new Notice(t("notice.settingsSaveFailed"));
+                    return;
+                  }
                   plugin.applyNotificationPopups();
                   renderHint();
                 });
@@ -853,8 +883,16 @@ export function buildSettingDefinitions(
             setting.addToggle((toggle) => {
               toggle.setValue(plugin.diagLogEnabled)
                 .onChange(async (value) => {
+                  const previous = plugin.diagLogEnabled;
                   plugin.diagLogEnabled = value;
-                  await plugin.saveSyncSettings();
+                  try {
+                    await plugin.saveSyncSettings();
+                  } catch {
+                    plugin.diagLogEnabled = previous;
+                    toggle.setValue(previous);
+                    new Notice(t("notice.settingsSaveFailed"));
+                    return;
+                  }
                   plugin.applyDiagnosticSetting();
                 });
             });

@@ -366,7 +366,7 @@ function conflict(
 }
 
 function normalizePath(path: string): string {
-  return path.normalize("NFC").toLocaleLowerCase();
+  return path.normalize("NFC").toLocaleLowerCase("en-US");
 }
 
 function localContentKey(hash: string, size: number): string {

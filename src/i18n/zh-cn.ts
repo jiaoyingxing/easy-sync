@@ -54,6 +54,7 @@ const zhCN: LocaleStrings = {
   "settings.account.cancelLogin": "取消登录",
   "settings.account.authLinkCopied": "登录链接已复制，请尽快在这台设备的浏览器中打开，不要分享。",
   "settings.account.authLinkUnavailable": "无法复制登录链接，请重新打开登录页面。",
+  "settings.account.pendingFailed": "登录未能完成，请点「重新打开登录页面」再试一次，或取消后换用其他登录方式。",
   "settings.account.loginSuccess": "登录成功",
   "settings.account.logout": "退出登录",
   "settings.account.method.browser.name": "跳转登录",
