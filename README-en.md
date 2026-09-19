@@ -254,16 +254,14 @@ Yes. EasySync is open source under the [MIT License](LICENSE), and all features 
 
 ### 7.5 Why are uploads fast but downloads slow?
 
-Two different routes: **uploads** go straight into Microsoft's storage service and usually saturate your bandwidth; **downloads** are fetched from Microsoft's file-delivery endpoint, and the quality of that leg depends on your network — the plugin cannot control it. On weak cellular, during evening peaks, or on a poor carrier route, downloads can drop to tens of KB/s or fail intermittently — that does not mean the plugin is broken. Interrupted downloads resume from their breakpoint and stalled connections are replaced automatically; nothing restarts from zero.
+Different routes: uploads go straight into Microsoft's storage service, while downloads are fetched from Microsoft's file-delivery endpoint — the quality of that leg depends on your network, which the plugin cannot control. On weak cellular, during evening peaks, or on a poor carrier route, downloads can drop to tens of KB/s or fail intermittently; this is not a plugin fault. Interrupted downloads resume from their breakpoint and never restart from zero. If downloads stay slow, try in order:
 
-Walk through these steps:
+1. **Switch DNS**: on phones, in the Wi-Fi settings (iOS: “Configure DNS”; Android: “Private DNS”); on computers, in network settings or on the router. Suggested values: 223.5.5.5 (AliDNS) or 119.29.29.29 (DNSPod) in mainland China; 1.1.1.1 or 8.8.8.8 elsewhere — when the default resolver cannot reach the delivery endpoint, a public one often resolves.
+2. **Check proxies and firewalls**: make sure their rules do not miss or block the Microsoft download domain `my.microsoftpersonalcontent.com`; on some networks, routing it through a proxy is actually faster.
+3. **Switch networks or sync off-peak**: a different Wi-Fi or an off-peak hour often fixes it by itself.
+4. **(Desktop) edit the hosts file**: point `my.microsoftpersonalcontent.com` to a reachable IP. Technical, may stop working when Microsoft changes its infrastructure, and a last resort.
 
-1. **Try a different DNS** (the most common fix). DNS is the “address lookup” service: in real tests, the Microsoft delivery endpoint failed to resolve on the default resolver while a public one resolved fine at the same moment. On phones, change it in the Wi-Fi settings (iOS: “Configure DNS”; Android: “Private DNS”); on computers, in network settings or on the router. Suggested values: 223.5.5.5 (AliDNS) or 119.29.29.29 (DNSPod) in mainland China; 1.1.1.1 or 8.8.8.8 elsewhere.
-2. **Check proxies, accelerators, and firewalls.** Make sure their rules do not miss or block the Microsoft download domain `my.microsoftpersonalcontent.com`; on some networks, routing this domain through the proxy is actually faster.
-3. **Switch networks or sync at another time.** Downloads on weak cellular or during evening peaks can be a fraction of the usual speed; a different Wi-Fi or an off-peak hour often fixes it by itself.
-4. **(Desktop, advanced users) edit the hosts file**: point `my.microsoftpersonalcontent.com` to a reachable IP. This approach is technical, may stop working when Microsoft changes its infrastructure, and is a last resort.
-
-If downloads remain consistently slow after all of this, report it as described in section 8 and include a diagnostic report — it helps tell a network issue from a plugin issue.
+If it stays slow, report as described in section 8 and include a diagnostic report — it helps tell a network issue from a plugin issue.
 
 ## 8. License and support
 
