@@ -244,6 +244,28 @@ describe("updateStatusBar item structure", () => {
     expect(RIBBON_STATUS_ICONS.syncing).toBe("refresh-cw");
   });
 
+  it("renders the held-lock phrase the moment the lock is acquired and restores idle on release", async () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    const lock = plugin as never as {
+      acquireOpLock(operation: string): string | null;
+      releaseOpLock(): void;
+    };
+
+    // 2026-09-20 回填实测：锁持有窗口（重置预检爬网、范围设置提交）没有轮次
+    // 在跑、也没有其他事件会刷新状态栏——占用短语必须在获取锁的那一刻渲染，
+    // 否则整个窗口停留在锁前旧文案（「空闲外观＋正在运行弹窗」错位回归）。
+    expect(lock.acquireOpLock("reset")).toBeNull();
+    await flushStatusBarFrame();
+    expect(el.attrs["aria-label"]).toBe("重置进行中");
+    expect(el.classes.has("is-syncing")).toBe(true);
+
+    lock.releaseOpLock();
+    await flushStatusBarFrame();
+    expect(el.attrs["aria-label"]).toBe("已就绪");
+    expect(el.classes.has("is-syncing")).toBe(false);
+  });
+
   it("maps attention branches (conflicts / deletes / plan review) to the attention group", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);

@@ -55,6 +55,22 @@ export interface DeltaResponse {
   "@odata.nextLink"?: string;
 }
 
+/**
+ * One settled page of a delta enumeration (join 弱网「稍后重试」案C,
+ * 2026-09-19). Delivered to the caller right after the page lands so the
+ * enumeration checkpoint can be persisted before the next page is requested.
+ */
+export interface DeltaPageSnapshot {
+  url: string;
+  values: DriveItem[];
+  deltaLink?: string;
+  nextLink?: string;
+}
+
+export type DeltaPageCallback = (
+  page: DeltaPageSnapshot,
+) => void | Promise<void>;
+
 /** Stable Graph identities that define the remote side of one vault. */
 export interface RemoteVaultScope {
   driveId: string;

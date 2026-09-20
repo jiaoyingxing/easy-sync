@@ -22,6 +22,7 @@ import {
 import {
   type DriveItem,
   type DeltaResponse,
+  type DeltaPageCallback,
   type RemoteVaultScope,
   type UploadResult,
   OneDriveError,
@@ -108,7 +109,9 @@ const RETRY_JITTER_MS = 250;
  *  reduces serial pagination round trips on complete feeds (first sync,
  *  full identity rebuilds). Server-issued @odata.deltaLink/nextLink URLs are
  *  never modified. */
-const DELTA_PAGE_SIZE_TOP = 1000;
+// 500 项/页（2026-09-19 join 弱网案C 配套）：单页响应减半更耐弱网，断点粒度更细；
+// 增量轮的后续页与 deltaLink 页大小由服务端 nextLink 控制，不受此值影响。
+const DELTA_PAGE_SIZE_TOP = 500;
 /** Selected fields for delta responses — includes every DriveItem property the
  *  sync engine consumes plus `lastModifiedBy`/`createdBy`. Note: the recovery-
  *  layer T2 convergence model that motivated these two fields was reverted to
@@ -2768,12 +2771,14 @@ export class OneDriveClient {
   async getDelta(
     vaultName: string,
     deltaToken?: string,
+    onPage?: DeltaPageCallback,
   ): Promise<DeltaResponse> {
     return this.collectDelta(
       deltaToken
         ?? this.deltaInitialUrl(
           APP_FOLDER_PATHS.filesDelta(this.getStorageVaultName(vaultName)),
         ),
+      onPage,
     );
   }
 
@@ -2785,6 +2790,7 @@ export class OneDriveClient {
   async getDeltaByFolderId(
     folderId: string,
     deltaToken?: string,
+    onPage?: DeltaPageCallback,
   ): Promise<DeltaResponse> {
     if (!folderId) throw new Error("Missing folder identity for delta");
     return this.collectDelta(
@@ -2792,6 +2798,7 @@ export class OneDriveClient {
         ?? this.deltaInitialUrl(
           `/me/drive/items/${encodeURIComponent(folderId)}/delta`,
         ),
+      onPage,
     );
   }
 
@@ -2801,7 +2808,10 @@ export class OneDriveClient {
     return `${path}?$top=${DELTA_PAGE_SIZE_TOP}&$select=${DELTA_SELECT}`;
   }
 
-  private async collectDelta(initialUrl: string): Promise<DeltaResponse> {
+  private async collectDelta(
+    initialUrl: string,
+    onPage?: DeltaPageCallback,
+  ): Promise<DeltaResponse> {
     let url = initialUrl;
     const allValues: DriveItem[] = [];
     let deltaLink: string | undefined;
@@ -2815,6 +2825,12 @@ export class OneDriveClient {
       nextLink = data["@odata.nextLink"];
       if (deltaLink) validateGraphContinuationUrl(deltaLink);
       if (nextLink) validateGraphContinuationUrl(nextLink);
+      if (onPage) {
+        // join 弱网「稍后重试」案C: 每个落定页通知一次调用方，调用方持久化
+        // 断点进度后，任何后续页失败都不会丢弃已读页。回调异常向上传播，
+        // 由调用方决定保留或丢弃检查点。
+        await onPage({ url, values: data.value, deltaLink, nextLink });
+      }
       url = nextLink || "";
     }
 
@@ -3095,8 +3111,19 @@ export class OneDriveClient {
           options.metadataReason ?? (endpoint === "metadata" ? "other" : undefined),
           expectedNotFound,
         );
+        // A locally timed-out idempotent read (deadline fired, no HTTP outcome,
+        // GET/HEAD cannot double-apply on resend) joins the ordinary transient
+        // retry path below instead of abandoning the run — join 弱网「稍后重试」
+        // 案二 (2026-09-19): 单页超时曾是整轮枚举作废的最大放大器. Shared
+        // sync-protocol reads keep their own dedup/attempt contract, and every
+        // non-idempotent method keeps the historical outcome-unclear bail-out.
+        const idempotentDeadlineTimeout =
+          syntheticTimeout
+          && rawError.source === "deadline"
+          && !options.sharedSyncProtocolRequestKey
+          && (method === "GET" || method === "HEAD");
         if (
-          isRequestTimeoutError(rawError)
+          isRequestTimeoutError(rawError) && !idempotentDeadlineTimeout
           || (method !== "GET" && method !== "HEAD" && rawStatusCode(rawError) === 0)
         ) {
           this.diag?.warn(
@@ -3106,6 +3133,12 @@ export class OneDriveClient {
           throw syntheticTimeout && options.sharedSyncProtocolRequestKey
             ? rawError
             : error;
+        }
+        if (idempotentDeadlineTimeout) {
+          this.diag?.warn(
+            "onedrive",
+            `idempotent read timed out locally — retrying as transient method=${method}, endpoint=${endpoint}, attempt=${attempt}/${maxAttempts}`,
+          );
         }
         if (error.type === OneDriveErrorType.NotFound) {
           this.initializedVaults.clear();

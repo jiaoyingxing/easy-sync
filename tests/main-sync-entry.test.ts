@@ -4854,6 +4854,91 @@ describe("main sync entry guards", () => {
     }));
   });
 
+  it("names the lock holder when a side action bounces off a held lock", async () => {
+    const plugin = makePlugin();
+    const show = vi.fn();
+    plugin.i18n = {
+      t: (key: string, params?: Record<string, unknown>) =>
+        params === undefined ? key : `${key}:${JSON.stringify(params)}`,
+    } as never;
+    plugin.noticeCenter = { show, dispose: vi.fn() } as never;
+    plugin.state = { isV2StateActive: true } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: false,
+    } as never;
+    (plugin as never as { opLock: string | null }).opLock = "reset";
+
+    await expect(plugin.resolveConflictKeepLocal("a.md"))
+      .resolves.toBe(false);
+
+    expect(show).toHaveBeenCalledOnce();
+    const message = (show.mock.calls[0]?.[0] as { message: string }).message;
+    expect(message).toContain("result.lockBusyWithHolder");
+    expect(message).toContain("opHolder.reset");
+  });
+
+  it("keeps the run-level wording when a sync round causes the rejection", async () => {
+    const plugin = makePlugin();
+    const show = vi.fn();
+    plugin.i18n = {
+      t: (key: string, params?: Record<string, unknown>) =>
+        params === undefined ? key : `${key}:${JSON.stringify(params)}`,
+    } as never;
+    plugin.noticeCenter = { show, dispose: vi.fn() } as never;
+    plugin.state = { isV2StateActive: true } as never;
+    plugin.syncExecutor = {
+      isRunning: true,
+      hasSideActionsInFlight: false,
+    } as never;
+    (plugin as never as { opLock: string | null }).opLock = "sync";
+
+    await expect(plugin.resolveConflictKeepLocal("a.md"))
+      .resolves.toBe(false);
+
+    expect(show).toHaveBeenCalledOnce();
+    const message = (show.mock.calls[0]?.[0] as { message: string }).message;
+    expect(message).toContain("result.alreadyRunning");
+    expect(message).not.toContain("result.lockBusyWithHolder");
+  });
+
+  it("shows the lock holder on the status bar while the lock is held without a run", () => {
+    const plugin = makePlugin();
+    const render = vi.fn();
+    (plugin as never as { renderStatusBarItem: unknown }).renderStatusBarItem =
+      render;
+    (plugin as never as { updateRibbon: unknown }).updateRibbon = vi.fn();
+    vi.spyOn(plugin as never, "getMutationRecoveryDisplayState")
+      .mockReturnValue(null);
+    plugin.auth = {
+      isInitializing: false,
+      isSessionPending: false,
+      authState: { isLoggedIn: true },
+    } as never;
+    plugin.state = {
+      planReviewActive: false,
+      pendingConflicts: [],
+      pendingRemoteDeletes: [],
+      lastSyncTime: 0,
+      syncHistory: [],
+    } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: false,
+    } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    plugin.statusBarEl = { empty: () => undefined } as never;
+    (plugin as never as { opLock: string | null }).opLock = "reset";
+
+    (plugin as never as { doUpdateStatusBar: () => void }).doUpdateStatusBar();
+
+    expect(render).toHaveBeenCalledOnce();
+    const call = render.mock.calls[0];
+    expect(call?.[0]).toBe(plugin.statusBarEl);
+    expect(call?.[2]).toBe("syncing");
+    expect(call?.[3]).toBe("status.occupiedReset");
+  });
+
   it("submits one exact pending-delete snapshot through the existing side-action gateway", async () => {
     const plugin = makePlugin();
     const confirmRemoteDeletes = vi.fn().mockResolvedValue(undefined);

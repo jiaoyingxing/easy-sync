@@ -6625,6 +6625,23 @@ describe("folder recovery settle-as-observed (zero-write manual exit)", () => {
     expect(state.manualMutationResolutionAudit).toHaveLength(1);
   });
 
+  it("throws on a drifted record copy whose id still exists (CAS mismatch must be loud)", async () => {
+    const record = blockedFolderRecord();
+    const harness = makeHarness({
+      pluginData: { "easy-sync-v2-mutation-ledger": [record] },
+    });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const drifted = structuredClone(record);
+    (drifted.intent as { createdAt: number }).createdAt = 999;
+
+    await expect(state.settleFolderMutationRecoveryAsObserved({
+      expectedRecord: drifted,
+    })).rejects.toThrow(/no longer matches/);
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(state.manualMutationResolutionAudit).toHaveLength(0);
+  });
+
   it("refuses non-folder records (fail-closed on the new exit)", async () => {
     const fileRecord: MutationLedgerEntryV1 = {
       intent: {

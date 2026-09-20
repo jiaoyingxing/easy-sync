@@ -14419,7 +14419,7 @@ describe("V1 to V2 controlled production activation", () => {
       deleted: 0,
       errors: 0,
     });
-    expect(harness.getDelta).toHaveBeenCalledWith("testVault");
+    expect(harness.getDelta).toHaveBeenCalledWith("testVault", undefined, expect.anything());
     expect(harness.getDelta).not.toHaveBeenCalledWith(
       "testVault",
       expect.any(String),
@@ -19336,7 +19336,7 @@ describe("V1 to V2 controlled production activation", () => {
     const recovered = await harness.executor.run("manual");
 
     expect(recovered.success).toBe(true);
-    expect(harness.getDelta).toHaveBeenCalledWith("testVault");
+    expect(harness.getDelta).toHaveBeenCalledWith("testVault", undefined, expect.anything());
     expect(harness.getDelta).not.toHaveBeenCalledWith(
       "testVault",
       "https://graph.example/wrong-vault/delta",

@@ -326,9 +326,9 @@ describe("sync view status copy and scrolling layout", () => {
     expect(en.t("syncPlan.remoteScopeRecreateSummary"))
       .toContain("previous remote sync folder");
     expect(zh.t("result.remoteReadUnavailable"))
-      .toBe("暂时无法读取云端状态，本轮未进入新的文件同步计划；下次同步时会重新检查。");
+      .toBe("暂时连不上云端，本轮没有同步任何文件；网络恢复后会自动重试。");
     expect(en.t("result.remoteReadUnavailable"))
-      .toBe("The cloud state is temporarily unavailable, so this run did not enter a new file sync plan. EasySync will check again on the next sync.");
+      .toBe("The cloud is temporarily unreachable, so nothing was synced this round. EasySync will retry automatically once the connection recovers.");
     // 2026-09-15 文案减负 R-1：云端状态读取失败两键并一，旧键必须已删除。
     expect(zh.t("result.sharedControlReadUnavailable"))
       .toBe("result.sharedControlReadUnavailable");

@@ -51,6 +51,7 @@ const EASY_SYNC_STORAGE_LAYOUT = {
     logsDir: "logs",
     tmpDir: "runtime",
     scanCacheFile: "runtime/cache/scan-cache.json",
+    remoteEnumCheckpointFile: "runtime/cache/remote-enum-checkpoint.json",
   },
 } as const;
 
@@ -88,6 +89,7 @@ const EASY_SYNC_LEGACY_STORAGE_LAYOUT = {
     logsDir: "logs",
     tmpDir: "tmp",
     scanCacheFile: "scan-cache.json",
+    remoteEnumCheckpointFile: "remote-enum-checkpoint.json",
   },
 } as const;
 
@@ -162,6 +164,7 @@ export interface EasySyncPathSet {
   logsDir: string;
   tmpDir: string;
   scanCacheFile: string;
+  remoteEnumCheckpointFile: string;
   manifestFile: string;
 }
 
@@ -214,6 +217,7 @@ function buildEasySyncPaths(
     logsDir: path(sidecars.logsDir),
     tmpDir: path(sidecars.tmpDir),
     scanCacheFile: path(sidecars.scanCacheFile),
+    remoteEnumCheckpointFile: path(sidecars.remoteEnumCheckpointFile),
     manifestFile: path(layout.root.manifestFile),
   };
 }

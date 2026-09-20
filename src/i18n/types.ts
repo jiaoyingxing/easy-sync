@@ -14,6 +14,11 @@ export interface LocaleStrings {
   "status.recovering": string;
   "status.waitingForNetwork": string;
   "status.recoveryBlocked": string;
+  "status.occupied": string;
+  "status.occupiedReset": string;
+  "status.occupiedPathSettings": string;
+  "status.occupiedPluginCheck": string;
+  "status.occupiedLogout": string;
   "status.conflicts": string;
   "status.pendingDeletes": string;
   "status.conflictsAndDeletes": string;
@@ -392,6 +397,13 @@ export interface LocaleStrings {
   "result.cancelled": string;
   "result.generationMismatch": string;
   "result.lockBusy": string;
+  "result.lockBusyWithHolder": string;
+  "opHolder.sync": string;
+  "opHolder.reset": string;
+  "opHolder.pathSettings": string;
+  "opHolder.pluginCheck": string;
+  "opHolder.logout": string;
+  "opHolder.other": string;
   "result.scanIncomplete": string;
   "result.localRecoveryFailed": string;
   "result.legacyStateDisabled": string;

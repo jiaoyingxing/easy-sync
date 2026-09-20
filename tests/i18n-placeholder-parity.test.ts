@@ -127,4 +127,26 @@ describe("i18n placeholder parity", () => {
     const offenders = noParamKeys.filter((k) => tokens(zhCN[k as keyof typeof zhCN]).length > 0);
     expect({ offenders }).toEqual({ offenders: [] });
   });
+
+  it("locks the 2026-09-20 occupied-feedback copy (user-approved wording)", () => {
+    expect(zhCN["status.occupied"]).toBe("其他操作进行中");
+    expect(zhCN["status.occupiedReset"]).toBe("重置进行中");
+    expect(zhCN["status.occupiedPathSettings"]).toBe("同步设置处理中");
+    expect(zhCN["status.occupiedPluginCheck"]).toBe("插件核对进行中");
+    expect(zhCN["status.occupiedLogout"]).toBe("退出登录中");
+    expect(zhCN["result.lockBusyWithHolder"]).toBe("「{holder}」正在进行中，请稍候。");
+    expect(zhCN["opHolder.sync"]).toBe("同步");
+    expect(zhCN["opHolder.reset"]).toBe("重置");
+    expect(zhCN["opHolder.pathSettings"]).toBe("同步范围设置");
+    expect(zhCN["opHolder.pluginCheck"]).toBe("插件核对");
+    expect(zhCN["opHolder.logout"]).toBe("退出登录");
+    expect(zhCN["opHolder.other"]).toBe("其他操作");
+    expect(en["status.occupied"]).toBe("Another operation in progress");
+    expect(en["status.occupiedLogout"]).toBe("Logging out");
+    expect(en["result.lockBusyWithHolder"]).toBe(
+      "\"{holder}\" is in progress. Please wait.",
+    );
+    expect(en["opHolder.logout"]).toBe("Log out");
+    expect(en["opHolder.other"]).toBe("Another operation");
+  });
 });

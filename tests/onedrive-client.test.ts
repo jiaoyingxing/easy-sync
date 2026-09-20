@@ -4604,6 +4604,42 @@ describe("OneDriveClient request retry policy", () => {
     expect(requestSpy).toHaveBeenCalledTimes(1);
     expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({ method }));
   });
+
+  it("retries an idempotent GET after an in-call deadline timeout", async () => {
+    // A locally timed-out read never produced an HTTP outcome, and a GET is
+    // idempotent: a resent request cannot double-apply, so the read joins the
+    // ordinary transient retry path (join 弱网「稍后重试」案二, 2026-09-19).
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementationOnce(() => new Promise<never>(() => {}))
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: { id: "app-root", name: "EasySync", folder: {} },
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    const pending = client.getAppFolder();
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toMatchObject({ id: "app-root" });
+    expect(requestSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry a non-idempotent upload whose attempt times out locally", async () => {
+    vi.useFakeTimers();
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementationOnce(() => new Promise<never>(() => {}));
+    const client = new OneDriveClient(async () => "token");
+
+    const pending = client.uploadFile("testVault", "note.md", new ArrayBuffer(4));
+    const rejection = expect(pending).rejects.toMatchObject<Partial<OneDriveError>>({
+      type: OneDriveErrorType.NetworkError,
+    });
+    await vi.runAllTimersAsync();
+    await rejection;
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("OneDriveClient delta continuation", () => {
@@ -4752,7 +4788,7 @@ describe("OneDriveClient delta continuation", () => {
 
     const deltaSelect = "id,name,size,file,folder,parentReference,lastModifiedDateTime,createdDateTime,lastModifiedBy,createdBy,eTag,cTag,@microsoft.graph.downloadUrl,deleted,specialFolder";
     expect(requestSpy.mock.calls.map(([request]) => request.url)).toEqual([
-      `https://graph.microsoft.com/v1.0/me/drive/special/approot:/vaults/testVault/files:/delta?$top=1000&$select=${deltaSelect}`,
+      `https://graph.microsoft.com/v1.0/me/drive/special/approot:/vaults/testVault/files:/delta?$top=500&$select=${deltaSelect}`,
       nextLink,
     ]);
   });
@@ -4789,7 +4825,7 @@ describe("OneDriveClient delta continuation", () => {
 
     const deltaSelect = "id,name,size,file,folder,parentReference,lastModifiedDateTime,createdDateTime,lastModifiedBy,createdBy,eTag,cTag,@microsoft.graph.downloadUrl,deleted,specialFolder";
     expect(requestSpy.mock.calls.map(([request]) => request.url)).toEqual([
-      `https://graph.microsoft.com/v1.0/me/drive/items/root%2Fid/delta?$top=1000&$select=${deltaSelect}`,
+      `https://graph.microsoft.com/v1.0/me/drive/items/root%2Fid/delta?$top=500&$select=${deltaSelect}`,
     ]);
   });
 });

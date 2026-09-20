@@ -732,13 +732,47 @@ export default class EasySyncPlugin extends Plugin {
   private acquireOpLock(operation: string): string | null {
     if (this.opLock !== null) return this.opLock;
     this.opLock = operation;
+    // The held window (reset preflight crawl, settings commit) runs with no
+    // round and no other bar-refresh trigger, so the occupied phrase must be
+    // rendered here — waiting for an unrelated refresh leaves the bar on its
+    // pre-lock copy for the whole window (2026-09-20 回填实测).
+    this.updateStatusBar();
     return null;
   }
 
   private releaseOpLock(): void {
     this.opLock = null;
+    this.updateStatusBar();
     this.retryCommunityPluginLocalReconciliationIfIdle();
     this.drainDeferredSettingsMutations();
+  }
+
+  /** Status-bar phrase for one held-lock moment. The lock holder must be
+   *  visible while every side action bounces off the busy gateway — an idle
+   *  bar next to "another operation" notices is how the 2026-09-20 dead-end
+   *  window looked from the outside. */
+  private opHolderStatusKey(holder: string) {
+    switch (holder) {
+      case "reset": return "status.occupiedReset";
+      case "sync-path-settings": return "status.occupiedPathSettings";
+      case "community-plugin-participation":
+        return "status.occupiedPluginCheck";
+      case "logout": return "status.occupiedLogout";
+      default: return "status.occupied";
+    }
+  }
+
+  /** User-facing holder name shared by the busy notice and the diagnostic
+   *  report (single mapping for both surfaces). */
+  private opHolderNameKey(holder: string) {
+    switch (holder) {
+      case "sync": return "opHolder.sync";
+      case "reset": return "opHolder.reset";
+      case "sync-path-settings": return "opHolder.pathSettings";
+      case "community-plugin-participation": return "opHolder.pluginCheck";
+      case "logout": return "opHolder.logout";
+      default: return "opHolder.other";
+    }
   }
 
   /** Whether a sync round / side action currently blocks sync-path settings
@@ -1351,11 +1385,21 @@ export default class EasySyncPlugin extends Plugin {
         && (!requireIdleSideActions || !executor.hasSideActionsInFlight)) {
         return false;
       }
+      // The reason must name the actual blocker: a running round, the exact
+      // lock holder, or another in-flight side action. One generic sentence
+      // for all three read as a lie while the bar looked idle.
+      const reason = executor.isRunning
+        ? this.i18n.t("result.alreadyRunning")
+        : this.opLock !== null
+          ? this.i18n.t("result.lockBusyWithHolder", {
+              holder: this.i18n.t(this.opHolderNameKey(this.opLock)),
+            })
+          : this.i18n.t("result.lockBusy");
       this.noticeCenter.show({
         key: `side-action-gateway:busy:${path}`,
         message: this.i18n.t(failureKey, {
           path,
-          reason: this.i18n.t("result.lockBusy"),
+          reason,
         }),
         priority: NOTICE_PRIORITY.attention,
         className: "easy-sync-notice-action",
@@ -8070,7 +8114,7 @@ export default class EasySyncPlugin extends Plugin {
     const automaticActivity = this.syncExecutor?.isRunning
       ? "同步中"
       : this.opLock !== null
-        ? "其他操作占用中"
+        ? `其他操作占用中（${reportI18n.t(this.opHolderNameKey(this.opLock))}）`
         : "空闲";
 
     // ── Header ──
@@ -8729,6 +8773,20 @@ export default class EasySyncPlugin extends Plugin {
         this.progressStore.state.activityKind === "mutationRecovery"
           ? t("status.recovering")
           : t("status.syncing"),
+      );
+      return;
+    }
+
+    // The shared operation lock is held without a running round (reset
+    // preflight, settings commit, participation reconciliation). Without
+    // this branch the bar looks idle while every side action bounces off
+    // the busy gateway (2026-09-20 实测「正在运行/空闲」对不上).
+    if (this.opLock !== null) {
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.syncing,
+        "syncing",
+        t(this.opHolderStatusKey(this.opLock)),
       );
       return;
     }

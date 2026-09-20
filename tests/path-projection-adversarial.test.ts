@@ -350,7 +350,7 @@ describe("remote identity projection adversarial contract", () => {
     expect(pendingMigrationRemoteSnapshot(result.state)).toEqual([
       expect.objectContaining({ path: "Notes/note.md", driveId: "note" }),
     ]);
-    expect(result.getDelta).toHaveBeenCalledWith("testVault");
+    expect(result.getDelta).toHaveBeenCalledWith("testVault", undefined, expect.anything());
     expect(result.state.remoteDeltaLink).toBe("https://graph.example/delta-old");
     expectNoMutations(result.mutations);
   });
@@ -397,7 +397,7 @@ describe("remote identity projection adversarial contract", () => {
     });
 
     expect(getDelta).toHaveBeenCalledTimes(1);
-    expect(getDelta).toHaveBeenCalledWith("testVault");
+    expect(getDelta).toHaveBeenCalledWith("testVault", undefined, expect.anything());
     expect(pendingMigrationRemoteSnapshot(state)).toEqual([
       expect.objectContaining({ path: "files/note.md" }),
     ]);
@@ -493,7 +493,7 @@ describe("remote identity projection adversarial contract", () => {
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
     expect(getDelta).toHaveBeenCalledTimes(1);
-    expect(getDelta).toHaveBeenCalledWith("testVault");
+    expect(getDelta).toHaveBeenCalledWith("testVault", undefined, expect.anything());
     expect(pendingMigrationRemoteSnapshot(state)).toEqual([
       expect.objectContaining({
         path: "Safe/new-name.md",
@@ -524,7 +524,7 @@ describe("remote identity projection adversarial contract", () => {
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
     expect(getDelta).toHaveBeenCalledTimes(1);
-    expect(getDelta).toHaveBeenCalledWith("testVault");
+    expect(getDelta).toHaveBeenCalledWith("testVault", undefined, expect.anything());
     expect(pendingMigrationRemoteSnapshot(state)).toEqual([
       expect.objectContaining({
         path: "Safe/note.md",
@@ -558,7 +558,7 @@ describe("remote identity projection adversarial contract", () => {
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
     expect(getDelta).toHaveBeenCalledTimes(1);
-    expect(getDelta).toHaveBeenCalledWith("testVault");
+    expect(getDelta).toHaveBeenCalledWith("testVault", undefined, expect.anything());
     expect(pendingMigrationRemoteSnapshot(state)).toEqual([
       expect.objectContaining({
         path: "Safe/note.md",
@@ -628,8 +628,8 @@ describe("remote identity projection adversarial contract", () => {
     const firstSnapshot = pendingMigrationRemoteSnapshot(state);
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
-    expect(getDelta).toHaveBeenNthCalledWith(1, "testVault");
-    expect(getDelta).toHaveBeenNthCalledWith(2, "testVault");
+    expect(getDelta).toHaveBeenNthCalledWith(1, "testVault", undefined, expect.anything());
+    expect(getDelta).toHaveBeenNthCalledWith(2, "testVault", undefined, expect.anything());
     expect(pendingMigrationRemoteSnapshot(state)).toEqual(firstSnapshot);
     expectNoMutations(mutations);
   });
@@ -656,7 +656,7 @@ describe("remote identity projection adversarial contract", () => {
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
     expect(getDelta).toHaveBeenCalledTimes(1);
-    expect(getDelta).toHaveBeenCalledWith("testVault");
+    expect(getDelta).toHaveBeenCalledWith("testVault", undefined, expect.anything());
     expect(pendingMigrationRemoteSnapshot(state)).toEqual([
       expect.objectContaining({ path: "current-name.md", driveId: "note" }),
     ]);
@@ -696,7 +696,7 @@ describe("remote identity projection adversarial contract", () => {
     await executor.run("first", { onFirstSyncPreview: vi.fn().mockResolvedValue(false) });
 
     expect(getDelta).toHaveBeenCalledTimes(1);
-    expect(getDelta).toHaveBeenCalledWith("testVault");
+    expect(getDelta).toHaveBeenCalledWith("testVault", undefined, expect.anything());
     expect(pendingMigrationRemoteSnapshot(state)).toEqual([
       expect.objectContaining({ path: "current-name.md", driveId: "note" }),
     ]);

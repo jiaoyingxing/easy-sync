@@ -31,6 +31,7 @@ import type { TransferRateFactsV1 } from "./transfer-rate";
 import {
   findScopeCrossingCoveringHintV1,
 } from "./scope-crossing-resolution";
+import type { DriveItem } from "../onedrive/types";
 import {
   createEmptyCommunityPluginAdoptionMemory,
   readCommunityPluginAdoptionMemory,
@@ -540,6 +541,25 @@ const KEY_SYNC_PATH_SETTINGS_FINGERPRINT =
 const KEY_SYNC_SCOPE_EXPANSION =
   "easy-sync-sync-scope-expansion";
 export type SyncHistoryStatus = "success" | "partial" | "cancelled" | "authExpired" | "failed" | "retry-pending";
+
+/**
+ * Persisted progress of one partially-read remote delta enumeration
+ * (join 弱网「稍后重试」案C, 2026-09-19). Mirrors the large-file `.part`
+ * checkpoint philosophy: partial progress is never authoritative — it only
+ * records where the read may resume; the authoritative remote snapshot is
+ * still published exactly once the enumeration completes.
+ */
+export interface RemoteEnumCheckpoint {
+  /** Identity of the sync scope this session belongs to; a mismatch discards. */
+  scopeFingerprint: string;
+  /** URL the next resume must request (Graph nextLink, or the first page). */
+  nextUrl: string;
+  /** DriveItems collected so far; appended page by page, deduplicated by the
+   *  authoritative projection (latestById) at completion. */
+  items: DriveItem[];
+  startedAt: number;
+  updatedAt: number;
+}
 
 export interface SyncHistoryEntry {
   id: string;
@@ -4544,7 +4564,15 @@ export class StateManager {
       if (
         JSON.stringify(current[KEY_MUTATION_LEDGER][index])
         !== JSON.stringify(record)
-      ) return current;
+      ) {
+        // A same-id drift must be loud, not a silent no-op: the caller would
+        // otherwise keep the record blocked forever with no trace of why
+        // (2026-09-20 死路现场）。Fail-closed on the ledger is unchanged —
+        // nothing is written either way.
+        throw new Error(
+          `Folder recovery settlement record no longer matches the stored entry (CAS): ${record.intent.operationId}`,
+        );
+      }
       retired = true;
       return {
         ...current,
@@ -5487,6 +5515,66 @@ export class StateManager {
         scope: current.scope,
       }),
     );
+  }
+
+  /**
+   * Persisted progress of a partially-read remote enumeration (join 弱网
+   * 「稍后重试」案C, 2026-09-19). Pure regenerable cache in runtime/cache: any
+   * absence, corruption or staleness degrades to a full re-read — never to
+   * wrong data — so reads are fail-open and writes are best-effort from the
+   * caller. Scope/TTL validation lives with the executor, which owns the
+   * enumeration session.
+   */
+  async getRemoteEnumCheckpoint(): Promise<RemoteEnumCheckpoint | null> {
+    try {
+      const adapter = this.plugin.app.vault.adapter;
+      const path = getEasySyncPaths(
+        this.plugin.app.vault,
+        this.plugin.manifest.id,
+      ).remoteEnumCheckpointFile;
+      if (!await adapter.exists(path)) return null;
+      const parsed = JSON.parse(await adapter.read(path)) as RemoteEnumCheckpoint;
+      if (
+        typeof parsed !== "object"
+        || parsed === null
+        || typeof parsed.scopeFingerprint !== "string"
+        || !parsed.scopeFingerprint
+        || typeof parsed.nextUrl !== "string"
+        || !parsed.nextUrl
+        || !Array.isArray(parsed.items)
+        || typeof parsed.startedAt !== "number"
+        || typeof parsed.updatedAt !== "number"
+      ) return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  async saveRemoteEnumCheckpoint(checkpoint: RemoteEnumCheckpoint): Promise<void> {
+    const adapter = this.plugin.app.vault.adapter;
+    const paths = getEasySyncPaths(this.plugin.app.vault, this.plugin.manifest.id);
+    try {
+      await adapter.mkdir(paths.tmpDir).catch(() => {});
+      await adapter.mkdir(`${paths.tmpDir}/cache`).catch(() => {});
+    } catch {
+      // Directory creation is best-effort; adapter.write re-reports real errors.
+    }
+    await adapter.write(paths.remoteEnumCheckpointFile, JSON.stringify(checkpoint));
+  }
+
+  async clearRemoteEnumCheckpoint(): Promise<void> {
+    try {
+      const adapter = this.plugin.app.vault.adapter;
+      const path = getEasySyncPaths(
+        this.plugin.app.vault,
+        this.plugin.manifest.id,
+      ).remoteEnumCheckpointFile;
+      if (await adapter.exists(path)) await adapter.remove(path);
+    } catch {
+      // A leftover checkpoint is harmless (fail-open cache); removal is
+      // best-effort so a reset/upgrade path never blocks on it.
+    }
   }
 
   /** Commit a device-local sync-path change through the shared PluginData writer.

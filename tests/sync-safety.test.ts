@@ -67,7 +67,7 @@ import type {
 
 // ---- Shared test helpers ----
 
-const TEST_SYNC_SCOPE = {
+export const TEST_SYNC_SCOPE = {
   accountId: "",
   driveId: "drive-id",
   vaultFolderId: "vault-folder-id",
@@ -75,7 +75,7 @@ const TEST_SYNC_SCOPE = {
 };
 const EASY_SYNC_TMP_DIR = getEasySyncPaths(".obsidian").tmpDir;
 
-function makeMockAdapter(overrides: Record<string, unknown> = {}) {
+export function makeMockAdapter(overrides: Record<string, unknown> = {}) {
   return {
     read: vi.fn().mockResolvedValue(""),
     write: vi.fn().mockResolvedValue(undefined),
@@ -137,7 +137,7 @@ function makeDownloadLocalStore(onWrite?: () => Promise<void>) {
   return { adapter, files, inspectFile };
 }
 
-function makeMockOneDrive(overrides: Record<string, unknown> = {}) {
+export function makeMockOneDrive(overrides: Record<string, unknown> = {}) {
   return {
     downloadBaseline: vi.fn().mockResolvedValue(null),
     downloadFile: vi.fn().mockImplementation(
@@ -209,7 +209,7 @@ function remoteStateStub() {
   };
 }
 
-function makeActiveV2State(
+export function makeActiveV2State(
   remoteEntries: RemoteFileEntry[],
   baseEntries: BaseFileEntry[],
   overrides: Record<string, unknown> = {},
@@ -10550,6 +10550,46 @@ describe("Persistent remote delta state", () => {
     expect(state.setLastSyncTime).not.toHaveBeenCalled();
   });
 
+  it("marks healthy sync when the only skips are the user's own size exclusions", async () => {
+    // 2026-09-19 field report (iOS, 1.4.12): a vault whose large-file setting
+    // excluded 4 files completed every round, yet lastSyncTime stayed zero, so
+    // the header kept reading "尚未同步". Settings-driven skips are expected
+    // zero-action outcomes (2026-09-16 拍板) and must not block the healthy
+    // sync mark.
+    const state = makeActiveV2State([], []);
+    const executor = new SyncExecutor(
+      makeMockOneDrive({}),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: ["🔗Attachments/IMG_0632.mov"],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue(null),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("auto", {});
+
+    expect(result.success).toBe(true);
+    expect(result.errors).toBe(0);
+    expect(result.skippedLarge).toBe(1);
+    expect(state.setLastSyncTime).toHaveBeenCalledTimes(1);
+    expect(state.incrementRemoteGeneration).toHaveBeenCalledTimes(1);
+  });
+
   it("settles a proven not-applied download failure in the same sync round", async () => {
     const previousMobile = Platform.isMobile;
     const remote: RemoteFileEntry = {
@@ -11965,7 +12005,7 @@ describe("Persistent remote delta state", () => {
 
     await executor.run("manual", {});
 
-    expect(getDelta).toHaveBeenCalledWith("testVault");
+    expect(getDelta).toHaveBeenCalledWith("testVault", undefined, expect.anything());
     expect(state.remoteSnapshot).toEqual([]);
     expect(state.remoteDeltaLink).toBe("https://graph.example/legacy-delta");
   });
@@ -21629,7 +21669,10 @@ describe("blocked folder records auto-settle from current facts (2026-09-13 拍�
     },
   });
 
-  const makeRecoverHarness = (record: MutationLedgerEntryV1) => {
+  const makeRecoverHarness = (
+    record: MutationLedgerEntryV1,
+    diag?: DiagnosticLogger,
+  ) => {
     const committedEntry: RemoteFileEntry = {
       path: "note.md",
       driveId: "note-id",
@@ -21673,6 +21716,9 @@ describe("blocked folder records auto-settle from current facts (2026-09-13 拍�
       } as unknown as LocalScanner,
       state,
       "testVault",
+      undefined,
+      undefined,
+      diag,
     );
     const epoch = (executor as unknown as {
       lifecycle: { capture(): number };
@@ -21686,7 +21732,7 @@ describe("blocked folder records auto-settle from current facts (2026-09-13 拍�
           observationOnly: boolean,
         ): Promise<unknown>;
       }).recoverMutationLedger(scope, undefined, epoch, false);
-    return { state, settleAsObserved, recover };
+    return { state, settleAsObserved, recover, executor };
   };
 
   it("auto-retires a drifted receipted folder record with an audit entry and no blocked state", async () => {
@@ -21707,6 +21753,92 @@ describe("blocked folder records auto-settle from current facts (2026-09-13 拍�
 
     await expect(recover()).rejects.toThrow();
     expect(settleAsObserved).not.toHaveBeenCalled();
+  });
+
+  it("says why the eligibility gate refuses a folder record (no silent dead-end)", async () => {
+    const record = makeFolderRecord(".obsidian/appearance.json");
+    const warn = vi.fn();
+    const diag = {
+      log: vi.fn(),
+      warn,
+      error: vi.fn(),
+      isEnabled: vi.fn().mockReturnValue(true),
+    } as unknown as DiagnosticLogger;
+    const { settleAsObserved, recover } = makeRecoverHarness(record, diag);
+
+    await expect(recover()).rejects.toThrow();
+    expect(settleAsObserved).not.toHaveBeenCalled();
+    const gateWarns = warn.mock.calls.filter((call) =>
+      String(call[1]).includes("not eligible for auto-settlement"));
+    expect(gateWarns).toHaveLength(1);
+    expect(gateWarns[0]?.[1]).toEqual(
+      expect.stringContaining("not eligible for auto-settlement"),
+    );
+    expect(gateWarns[0]?.[2]).toEqual(expect.objectContaining({
+      operationId: "stuck-folder-op",
+      reason: expect.stringContaining(".obsidian/appearance.json"),
+      mutations: 0,
+    }));
+  });
+
+  it("records local/remote evidence when a download intent stays blocked", async () => {
+    const downloadRecord: MutationLedgerEntryV1 = {
+      intent: {
+        version: 1,
+        operationId: "stuck-download-op",
+        planRevision: 1,
+        scope,
+        action: "download",
+        path: "附件/录音/resojot-20260918012656-2.m4a",
+        expectedLocal: { exists: false },
+        expectedRemote: {
+          exists: true,
+          driveId: "remote-1",
+          eTag: "etag-1",
+          size: 5,
+          sha256Hash: "a".repeat(64),
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    const log = vi.fn();
+    const diag = {
+      log,
+      warn: vi.fn(),
+      error: vi.fn(),
+      isEnabled: vi.fn().mockReturnValue(true),
+    } as unknown as DiagnosticLogger;
+    const { executor } = makeRecoverHarness(downloadRecord, diag);
+    (executor as unknown as {
+      inspectLocalPath: unknown;
+    }).inspectLocalPath = vi.fn(async () => ({
+      status: "present",
+      entry: { hash: "b".repeat(64), size: 9 },
+    }));
+    (executor as unknown as {
+      inspectRemotePath: unknown;
+    }).inspectRemotePath = vi.fn(async () => ({
+      driveId: "remote-1",
+      eTag: "etag-1",
+    }));
+
+    await (executor as unknown as {
+      logBlockedDownloadEvidence(
+        record: MutationLedgerEntryV1,
+      ): Promise<void>;
+    }).logBlockedDownloadEvidence(downloadRecord);
+
+    expect(log).toHaveBeenCalledWith(
+      "state",
+      "blocked download evidence: local and remote facts",
+      expect.objectContaining({
+        operationId: "stuck-download-op",
+        localStatus: "present",
+        remoteMatchesExpectation: true,
+        mutations: 0,
+      }),
+    );
   });
 });
 

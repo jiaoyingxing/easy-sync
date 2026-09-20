@@ -35,6 +35,7 @@ import {
   SharedSyncProtocolObservationError,
   SyntheticRequestTimeoutError,
   findOneDriveInvalidNameIssue,
+  type DeltaPageSnapshot,
 } from "../onedrive/types";
 import type {
   DriveItem,
@@ -68,6 +69,7 @@ import { StateManager } from "./state-manager";
 import type {
   MutationCheckpointCommitMetrics,
   PendingIssue,
+  RemoteEnumCheckpoint,
 } from "./state-manager";
 import {
   buildEmptyFolderResolutionSnapshotV1,
@@ -436,6 +438,24 @@ function describeThrownValue(value: unknown): string {
     // circular or otherwise unserializable — fall through
   }
   return Object.prototype.toString.call(value);
+}
+
+/**
+ * Enumeration-checkpoint expiry. Conservative against the probe-measured
+ * skipToken lifetime (≥2h on real OneDrive, 2026-09-19 探针终局): a checkpoint
+ * older than this is discarded instead of resumed. Pure cache safety — expiry
+ * only costs a re-read, never correctness.
+ */
+const REMOTE_ENUM_CHECKPOINT_TTL_MS = 60 * 60 * 1000;
+
+/** Identity of the scope an enumeration session belongs to. */
+export function describeRemoteEnumScopeFingerprint(scope: SyncScope): string {
+  return [
+    scope.accountId,
+    scope.driveId,
+    scope.vaultFolderId,
+    scope.filesRootId,
+  ].join("|");
 }
 
 export function classifyRetryableObservationResult(
@@ -1701,11 +1721,27 @@ export class SyncExecutor {
   private async tryAutoSettleFolderMutationRecovery(
     record: Readonly<MutationLedgerEntryV1>,
   ): Promise<boolean> {
-    if (
-      !this.state.isV2StateActive
-      || !isFolderMutationIntent(record.intent)
-      || !this.isManualResolutionIntentEligible(record.intent)
-    ) return false;
+    if (!this.state.isV2StateActive || !isFolderMutationIntent(record.intent)) {
+      return false;
+    }
+    const ineligibility = this.manualResolutionIneligibilityReason(
+      record.intent,
+    );
+    if (ineligibility !== null) {
+      // A refusal here used to be silent: the record then stayed blocked with
+      // no manual exit and no trace of why (2026-09-20 死路现场).
+      this.diag?.warn(
+        "state",
+        `blocked folder record not eligible for auto-settlement — ${record.intent.path}`,
+        {
+          operationId: record.intent.operationId,
+          action: record.intent.action,
+          reason: ineligibility,
+          mutations: 0,
+        },
+      );
+      return false;
+    }
     try {
       const settledObserved = await this.state
         .settleFolderMutationRecoveryAsObserved({
@@ -3996,23 +4032,44 @@ export class SyncExecutor {
   }
 
   private isManualResolutionIntentEligible(intent: MutationIntent): boolean {
+    return this.manualResolutionIneligibilityReason(intent) === null;
+  }
+
+  /** Diagnostics twin of the eligibility gate: the first failing condition,
+   *  or null when eligible. A gate refusal that says nothing is how a folder
+   *  record became a permanent dead-end (2026-09-20 实测：资格门拒绝零日志，
+   *  强制重制成唯一出口）。 */
+  private manualResolutionIneligibilityReason(
+    intent: MutationIntent,
+  ): string | null {
     const configDir = getConfigDir(this.scanner.vault);
     const paths = this.manualResolutionPaths(intent);
     if (this.isPersistedSelectedPluginCodeUploadRecovery(intent)) {
-      return true;
+      return null;
     }
     if (this.isPersistedPluginDataDownloadSettlement(intent)) {
       // This is not new scope authorization. A persisted, exact plugin-data
       // download may be settled even if the user later disables that scope.
       // The surrounding recovery path still binds the original scope and
       // strictly rechecks both current file identities before any mutation.
-      return true;
+      return null;
     }
-    return paths.every((path) =>
-      this.shouldIncludeRemotePath(path)
-      && !isObsidianManagedConfigPath(path, configDir)
-      && !isEasySyncSelfSyncFilePath(path, configDir)
-      && classifyCommunityPluginManagedPath(path, configDir)?.kind === undefined);
+    for (const path of paths) {
+      if (!this.shouldIncludeRemotePath(path)) {
+        return `path outside the current sync scope: ${path}`;
+      }
+      if (isObsidianManagedConfigPath(path, configDir)) {
+        return `obsidian managed config path: ${path}`;
+      }
+      if (isEasySyncSelfSyncFilePath(path, configDir)) {
+        return `easy-sync self sync path: ${path}`;
+      }
+      const managed = classifyCommunityPluginManagedPath(path, configDir);
+      if (managed) {
+        return `community plugin managed path (${managed.kind}): ${path}`;
+      }
+    }
+    return null;
   }
 
   private isPersistedSelectedPluginCodeUploadRecovery(
@@ -10355,15 +10412,19 @@ export class SyncExecutor {
       }
 
       // Step 9: Mark healthy sync — only when no conflicts, pending deletes,
-      // errors, skipped files, or auth issues remain.
+      // errors, deferrals, or auth issues remain. Skips produced by the
+      // user's own configuration (size exclusion, ignored paths) are expected
+      // zero-action outcomes — 2026-09-16 拍板, same contract as
+      // isSyncResultFullyComplete — and must not keep lastSyncTime pinned at
+      // zero for vaults whose settings permanently exclude a few files
+      // (2026-09-19 field report: every round completed, the header still
+      // read "尚未同步").
       const isHealthy = !result.authExpired
         && !this.cancelled
         && this.lifecycle.isCurrent(operationEpoch)
         && result.errors === 0
         && result.conflicts === 0
-        && result.deferred === 0
-        && result.skippedLarge === 0
-        && result.skippedIgnored === 0;
+        && result.deferred === 0;
       if (isHealthy) {
         if (
           seededBaseEntries.length > 0
@@ -14088,6 +14149,7 @@ export class SyncExecutor {
         }
         if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
         this.logBlockedMutationEvidence(record);
+        await this.logBlockedDownloadEvidence(record);
         blocked.push({
           operationId: record.intent.operationId,
           reason: "outcome-unresolved",
@@ -14719,6 +14781,36 @@ export class SyncExecutor {
         mutations: 0,
       },
     );
+  }
+
+  /** Evidence for a blocked download intent: what both sides looked like when
+   *  the classifier refused. Uploads have their own blocked-evidence logger;
+   *  a blocked download used to leave nothing behind, so the cause could not
+   *  be told apart later (2026-09-20 resojot 现场). Best-effort only. */
+  private async logBlockedDownloadEvidence(
+    record: Readonly<MutationLedgerEntryV1>,
+  ): Promise<void> {
+    const intent = record.intent;
+    if (intent.action !== "download") return;
+    try {
+      const local = await this.inspectLocalPath(intent.path);
+      const remote = await this.inspectRemotePath(intent.path);
+      this.diag?.log(
+        "state",
+        "blocked download evidence: local and remote facts",
+        {
+          operationId: intent.operationId,
+          localStatus: local?.status ?? "unavailable",
+          remoteMatchesExpectation: this.remoteMatchesExpectation(
+            remote ?? undefined,
+            intent.expectedRemote,
+          ),
+          mutations: 0,
+        },
+      );
+    } catch {
+      // Evidence must never turn the blocked path itself into a failure.
+    }
   }
 
   /**
@@ -19711,6 +19803,79 @@ export class SyncExecutor {
   }
 
   /** Use persisted remote state for incremental delta, rebuilding on failure. */
+  /**
+   * Enumeration-checkpoint helpers (join 弱网「稍后重试」案C, 2026-09-19).
+   * The checkpoint is pure regenerable cache: restore is fail-open (scope
+   * mismatch, TTL expiry, corruption and test stubs without the new state
+   * methods all degrade to a full read), page recording is best-effort, and
+   * the authoritative snapshot is still published only on completion.
+   * TTL 1h is conservative against the probe-measured ≥2h skipToken lifetime.
+   */
+  private async restoreRemoteEnumCheckpoint(
+    scope: SyncScope,
+  ): Promise<RemoteEnumCheckpoint | null> {
+    if (typeof this.state.getRemoteEnumCheckpoint !== "function") return null;
+    try {
+      const checkpoint = await this.state.getRemoteEnumCheckpoint();
+      if (!checkpoint) return null;
+      if (checkpoint.scopeFingerprint !== describeRemoteEnumScopeFingerprint(scope)) {
+        this.diag?.warn(
+          "onedrive",
+          "enumeration checkpoint belongs to a different sync scope — discarding",
+        );
+        await this.discardRemoteEnumCheckpoint();
+        return null;
+      }
+      if (Date.now() - checkpoint.updatedAt > REMOTE_ENUM_CHECKPOINT_TTL_MS) {
+        this.diag?.warn(
+          "onedrive",
+          "enumeration checkpoint expired — discarding",
+        );
+        await this.discardRemoteEnumCheckpoint();
+        return null;
+      }
+      return checkpoint;
+    } catch (error) {
+      this.diag?.warn(
+        "onedrive",
+        "enumeration checkpoint read failed — continuing without it",
+        error instanceof Error ? error.message : String(error),
+      );
+      return null;
+    }
+  }
+
+  private async recordRemoteEnumPage(
+    session: RemoteEnumCheckpoint,
+    page: DeltaPageSnapshot,
+  ): Promise<void> {
+    if (typeof this.state.saveRemoteEnumCheckpoint !== "function") return;
+    try {
+      // The checkpoint's nextUrl must always point at the first page that is
+      // NOT yet part of items, so a resume re-reads exactly the missing tail.
+      if (!page.nextLink) return;
+      session.items.push(...page.values);
+      session.nextUrl = page.nextLink;
+      session.updatedAt = Date.now();
+      await this.state.saveRemoteEnumCheckpoint(session);
+    } catch (error) {
+      this.diag?.warn(
+        "onedrive",
+        "enumeration checkpoint save failed — continuing (progress loss is safe)",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  private async discardRemoteEnumCheckpoint(): Promise<void> {
+    if (typeof this.state.clearRemoteEnumCheckpoint !== "function") return;
+    try {
+      await this.state.clearRemoteEnumCheckpoint();
+    } catch {
+      // A leftover checkpoint is harmless (fail-open cache).
+    }
+  }
+
   private async tryDeltaOrFullScan(
     operationEpoch: number,
     result: SyncResult,
@@ -19901,22 +20066,87 @@ export class SyncExecutor {
       }
     }
 
+    // join 弱网「稍后重试」案C (2026-09-19): 断点续扫。部分读取进度持久化在
+    // runtime/cache（纯可再生缓存，fail-open）：每页成功即落盘，任何后续页
+    // 失败都不会丢弃已读页；权威快照仍在枚举完整时一次性经
+    // projectCompleteRemoteSnapshot 落库，与一次性读取逐位一致。轮语义不变：
+    // 枚举未完成的轮照旧零动作收场（retryable observation）。
+    const enumSession = await this.restoreRemoteEnumCheckpoint(currentScope);
+    let collectedItems: DriveItem[] = enumSession ? [...enumSession.items] : [];
+    let liveSession: RemoteEnumCheckpoint | null = enumSession;
+    // onPage 恒传：新会话的第 1 页也要建立检查点（第 2 页起失败才有进度可续）。
+    const onPage = (page: DeltaPageSnapshot) => {
+      if (!liveSession) {
+        liveSession = {
+          scopeFingerprint: describeRemoteEnumScopeFingerprint(currentScope),
+          nextUrl: page.url,
+          items: [...collectedItems],
+          startedAt: Date.now(),
+          updatedAt: Date.now(),
+        };
+      }
+      return this.recordRemoteEnumPage(liveSession, page);
+    };
     try {
-      const delta = await this.onedrive.getDelta(this.vaultName);
-      const projection = this.projectCompleteRemoteSnapshot(delta.value, filesRootId);
+      const delta = await this.onedrive.getDelta(
+        this.vaultName,
+        enumSession?.nextUrl,
+        onPage,
+      );
+      if (enumSession) {
+        collectedItems.push(...delta.value);
+      } else {
+        collectedItems = delta.value;
+      }
+      const projection = this.projectCompleteRemoteSnapshot(collectedItems, filesRootId);
       const entries = projection.entries;
       if (!this.canContinue(operationEpoch, result)) return { entries, scope: currentScope };
+      await this.discardRemoteEnumCheckpoint();
       await persistRemoteProjection({
         entries,
         folders: projection.folders,
         deltaLink: delta["@odata.deltaLink"] ?? null,
         scope: currentScope,
         source: "complete-delta",
-        observedItems: delta.value.length,
+        observedItems: collectedItems.length,
       });
-      this.diag?.log("onedrive", `delta returned ${delta.value.length} items → ${entries.length} remote entries`);
+      this.diag?.log("onedrive", `delta returned ${collectedItems.length} items → ${entries.length} remote entries${enumSession ? " (resumed from enumeration checkpoint)" : ""}`);
       return { entries, scope: currentScope };
     } catch (e) {
+      // 凭证/会话级失效（拿到了 HTTP 响应）→ 丢弃检查点，本轮立即从头重读一次
+      // （fail-open 快速自愈）；纯网络失败（statusCode 0）→ 保留检查点，进度
+      // 留给下一轮。重读由下面的 completeRestart 标志控制，只重读一次。
+      if (
+        enumSession
+        && e instanceof OneDriveError
+        && e.statusCode > 0
+        && this.canContinue(operationEpoch, result)
+      ) {
+        this.diag?.warn(
+          "onedrive",
+          `enumeration checkpoint resume failed with HTTP ${e.statusCode} — discarding checkpoint and re-reading from the first page`,
+        );
+        await this.discardRemoteEnumCheckpoint();
+        try {
+          const delta = await this.onedrive.getDelta(this.vaultName);
+          const projection = this.projectCompleteRemoteSnapshot(delta.value, filesRootId);
+          const entries = projection.entries;
+          if (!this.canContinue(operationEpoch, result)) return { entries, scope: currentScope };
+          await persistRemoteProjection({
+            entries,
+            folders: projection.folders,
+            deltaLink: delta["@odata.deltaLink"] ?? null,
+            scope: currentScope,
+            source: "complete-delta",
+            observedItems: delta.value.length,
+          });
+          this.diag?.log("onedrive", `delta returned ${delta.value.length} items → ${entries.length} remote entries (checkpoint discarded, full re-read)`);
+          return { entries, scope: currentScope };
+        } catch {
+          // 重读也失败：不吞错，落入既有的 fullScan fallback 通道继续收口。
+          if (!this.canContinue(operationEpoch, result)) return { entries: [], scope: currentScope };
+        }
+      }
       if (!this.canContinue(operationEpoch, result)) return { entries: [], scope: currentScope };
       // Delta failed — try full scan
       this.diag?.warn("onedrive", `delta failed (${e instanceof Error ? e.message : 'unknown'}), falling back to full scan`);
