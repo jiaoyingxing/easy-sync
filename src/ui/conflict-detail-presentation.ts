@@ -8,7 +8,6 @@
 
 import type {
   DisplayDiffResult,
-  DisplayDiffSummary,
 } from "./diff-engine";
 
 type Translate = (
@@ -75,18 +74,4 @@ export function summarizeConflictDetail(
     });
   }
   return summarizeDifferentContent(reason, t);
-}
-
-/** Map bounded-diff degradation reasons to their sole explanatory copy owner. */
-export function getDiffSummaryReasonKey(
-  reason: DisplayDiffSummary["reason"],
-): string {
-  switch (reason) {
-    case "change-budget":
-      return "conflictDetail.diffChangeBudget";
-    case "display-budget":
-      return "conflictDetail.diffDisplayBudget";
-    case "alignment-limit":
-      return "conflictDetail.diffAlignmentLimit";
-  }
 }

@@ -282,32 +282,30 @@ describe("computeDisplayDiff", () => {
     expect(result.parts).toHaveLength(1);
     expect(result.parts[0]).toMatchObject({
       kind: "summary",
-      reason: "alignment-limit",
       localStartLine: 1,
       localEndLine: 3_000,
       remoteStartLine: 1,
       remoteEndLine: 3_000,
-      localOmittedLines: 2_984,
-      remoteOmittedLines: 2_984,
     });
+    if (result.parts[0]?.kind !== "summary") throw new Error("expected summary");
+    expect(result.parts[0].localSample).toHaveLength(16);
+    expect(result.parts[0].remoteSample).toHaveLength(16);
   });
 
   it("keeps exact counts for a huge pure insertion while bounding rendered samples", () => {
-    const inserted = Array.from({ length: 1_000 }, (_, index) => `inserted-${index}`);
+    const inserted = Array.from({ length: 5_000 }, (_, index) => `inserted-${index}`);
     const local = "head\nend";
     const remote = ["head", ...inserted, "end"].join("\n");
 
     const result = computeDisplayDiff(local, remote);
 
     expect(result.complete).toBe(true);
-    expect(result.addedCount).toBe(1_000);
+    expect(result.addedCount).toBe(5_000);
     expect(result.removedCount).toBe(0);
     expect(result.parts).toHaveLength(1);
-    expect(result.parts[0]).toMatchObject({
-      kind: "summary",
-      reason: "change-budget",
-      remoteOmittedLines: 984,
-    });
+    expect(result.parts[0]).toMatchObject({ kind: "summary" });
+    if (result.parts[0]?.kind !== "summary") throw new Error("expected summary");
+    expect(result.parts[0].remoteSample).toHaveLength(16);
   });
 
   it("keeps a 50k-line unchanged body out of the display result", () => {
@@ -335,9 +333,44 @@ describe("computeDisplayDiff", () => {
 
     expect(result.complete).toBe(false);
     expect(result.parts.length).toBeLessThanOrEqual(201);
-    expect(result.parts.at(-1)).toMatchObject({
-      kind: "summary",
-      reason: "display-budget",
-    });
+    expect(result.parts.at(-1)).toMatchObject({ kind: "summary" });
+  });
+
+  it("renders a note-sized conflict in full instead of sampling it", () => {
+    // Reported case 2026-09-23: a 9-line local file against a 530-line remote
+    // recording log must show every changed line, not head/tail samples.
+    const local = [
+      "## 01:20 录音界面仅闪烁进度条",
+      "",
+      "![[附件/录音/a.m4a]]",
+      "",
+      "> [!note] 润色",
+      "> 本机转写",
+      "",
+      "> [!quote]- 转写",
+      "> 本机转写正文",
+    ];
+    const remote = [
+      "## 08:39",
+      "",
+      "![[附件/录音/b.m4a]]",
+      "",
+      "> [!quote]- 转写",
+      ...Array.from({ length: 525 }, (_, index) => `> 云端转写-${index}`),
+    ];
+
+    const result = computeDisplayDiff(local.join("\n"), remote.join("\n"));
+
+    expect(result.complete).toBe(true);
+    expect(result.addedCount).toBe(527);
+    expect(result.removedCount).toBe(6);
+    expect(result.parts).toHaveLength(1);
+    if (result.parts[0]?.kind !== "hunk") throw new Error("expected exact hunk");
+    const rendered = result.parts[0].lines;
+    expect(rendered).toHaveLength(536);
+    expect(rendered.filter((line) => line.type !== "equal"))
+      .toHaveLength(result.addedCount + result.removedCount);
+    // The tail of the remote log is real content in this window, not a sample.
+    expect(rendered.map((line) => line.text)).toContain("> 云端转写-500");
   });
 });

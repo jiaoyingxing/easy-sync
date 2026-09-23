@@ -53,15 +53,12 @@ export interface DisplayDiffHunk {
 
 export interface DisplayDiffSummary {
   kind: "summary";
-  reason: "change-budget" | "alignment-limit" | "display-budget";
   localStartLine: number;
   localEndLine: number;
   remoteStartLine: number;
   remoteEndLine: number;
   localSample: DisplayDiffSampleLine[];
   remoteSample: DisplayDiffSampleLine[];
-  localOmittedLines: number;
-  remoteOmittedLines: number;
 }
 
 export type DisplayDiffPart = DisplayDiffHunk | DisplayDiffSummary;
@@ -261,7 +258,8 @@ export function computeDiff(
 
 const DISPLAY_CONTEXT_LINES = 3;
 const MAX_EXACT_DISPLAY_REGION_LINES = 4000;
-const MAX_RENDERED_CHANGED_LINES_PER_REGION = 400;
+/** 整份差异合计可逐行渲染的变化行上限；用尽后剩余区域只给首尾样本。 */
+const MAX_RENDERED_CHANGED_LINES = 4000;
 const MAX_DISPLAY_PARTS = 200;
 const MAX_ANCHOR_DEPTH = 6;
 const SUMMARY_SAMPLE_LINES_PER_SIDE = 16;
@@ -277,6 +275,7 @@ interface DisplayDiffState {
   removedCount: number;
   complete: boolean;
   exhausted: boolean;
+  renderedChangedLines: number;
 }
 
 /**
@@ -300,6 +299,7 @@ export function computeDisplayDiff(
     removedCount: 0,
     complete: true,
     exhausted: false,
+    renderedChangedLines: 0,
   };
 
   collectDisplayDiff(
@@ -341,7 +341,6 @@ function collectDisplayDiff(
       initialLocalEnd,
       initialRemoteStart,
       initialRemoteEnd,
-      "display-budget",
       state,
     );
     state.complete = false;
@@ -378,7 +377,7 @@ function collectDisplayDiff(
 
   if (localLength === 0 || remoteLength === 0) {
     const changedLines = localLength + remoteLength;
-    if (changedLines <= MAX_RENDERED_CHANGED_LINES_PER_REGION) {
+    if (hasRenderBudget(state, changedLines)) {
       appendExactRegion(
         localLines,
         remoteLines,
@@ -398,7 +397,6 @@ function collectDisplayDiff(
         localEnd,
         remoteStart,
         remoteEnd,
-        "change-budget",
         state,
       );
     }
@@ -462,6 +460,7 @@ function collectDisplayDiff(
     }
   }
 
+  state.complete = false;
   appendSummary(
     localLines,
     remoteLines,
@@ -469,9 +468,16 @@ function collectDisplayDiff(
     localEnd,
     remoteStart,
     remoteEnd,
-    "alignment-limit",
     state,
   );
+}
+
+/** Rendering budget is cumulative: one region may use it all, later regions then sample. */
+function hasRenderBudget(
+  state: DisplayDiffState,
+  changedLines: number,
+): boolean {
+  return state.renderedChangedLines + changedLines <= MAX_RENDERED_CHANGED_LINES;
 }
 
 function appendExactRegion(
@@ -529,7 +535,7 @@ function appendExactRegion(
   state.addedCount += added;
   state.removedCount += removed;
 
-  if (added + removed > MAX_RENDERED_CHANGED_LINES_PER_REGION) {
+  if (!hasRenderBudget(state, added + removed)) {
     appendSummary(
       localLines,
       remoteLines,
@@ -537,11 +543,11 @@ function appendExactRegion(
       localEnd,
       remoteStart,
       remoteEnd,
-      "change-budget",
       state,
     );
     return true;
   }
+  state.renderedChangedLines += added + removed;
 
   for (const hunk of compactDiffHunks(lines)) {
     state.parts.push({ kind: "hunk", lines: hunk });
@@ -574,21 +580,16 @@ function appendSummary(
   localEnd: number,
   remoteStart: number,
   remoteEnd: number,
-  reason: DisplayDiffSummary["reason"],
   state: DisplayDiffState,
 ): void {
-  if (reason === "alignment-limit") state.complete = false;
   state.parts.push({
     kind: "summary",
-    reason,
     localStartLine: localStart + 1,
     localEndLine: localEnd,
     remoteStartLine: remoteStart + 1,
     remoteEndLine: remoteEnd,
     localSample: sampleLines(localLines, localStart, localEnd),
     remoteSample: sampleLines(remoteLines, remoteStart, remoteEnd),
-    localOmittedLines: Math.max(0, localEnd - localStart - SUMMARY_SAMPLE_LINES_PER_SIDE),
-    remoteOmittedLines: Math.max(0, remoteEnd - remoteStart - SUMMARY_SAMPLE_LINES_PER_SIDE),
   });
 }
 

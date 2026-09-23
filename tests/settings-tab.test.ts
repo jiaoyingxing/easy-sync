@@ -255,7 +255,7 @@ describe("buildSettingsSyncButtonState", () => {
     expect(source).toContain("updateExcludedFolders");
     expect(source).toContain("new Setting(");
     expect(source).toMatch(
-      /text: t\("settings\.syncExclusion\.intro"\),\s*cls: "setting-item-description"/,
+      /text: t\("settings\.syncExclusion\.intro"\),\s*cls: "setting-item-description easy-sync-modal-intro"/,
     );
     // 大型文件排除的自定义值输入（2026-09-16 用户拍板引入，Resojot renderModelField
     // 同型常驻双控件）是本弹框唯一允许的文本控件，防止自由文本输入蔓延。
@@ -1112,7 +1112,11 @@ describe("buildSettingsSyncButtonState", () => {
       "同步 Obsidian 书签列表（bookmarks.json）。",
     );
     const configSource = readFileSync("src/ui/config-sync-modal.ts", "utf8");
-    expect(configSource.indexOf('key: "settings.syncPluginFiles"')).toBeLessThan(
+    // The self-sync switch is retired: EasySync's own bundle is always in
+    // scope, so no toggle may re-introduce a user-controlled opt-in.
+    expect(configSource).not.toContain('"settings.syncPluginFiles"');
+    // The scope guidance must stay above every switch it explains.
+    expect(configSource.indexOf('t("settings.syncScope.intro")')).toBeLessThan(
       configSource.indexOf('key: "settings.syncCorePlugins"'),
     );
     expect(configSource.indexOf('key: "settings.syncCorePlugins"')).toBeLessThan(
@@ -1230,6 +1234,43 @@ describe("buildSettingsSyncButtonState", () => {
     expect(zhCN["settings.syncScope.name"]).toBe("同步范围");
     expect(zhCN["settings.syncScope.desc"]).toBe(
       "选择要同步的 Obsidian 配置、主题和插件文件。",
+    );
+    expect(zhCN["settings.syncScope.intro"]).toBe(
+      "设置仅对本设备生效；两台设备都开启后，才会相互同步。",
+    );
+    expect(en["settings.syncScope.intro"]).toBe(
+      "These settings apply to this device only; sync happens only once both devices have enabled the same item.",
+    );
+    // 自动同步弹框顶部指引（用户 2026-09-23 定稿）：0 值语义 + 被打断后的恢复动作。
+    expect(zhCN["settings.autoSync.intro"]).toBe(
+      "拖到最左侧（归零）即关闭；自动同步若被特殊状态打断，须手动同步一次才继续。",
+    );
+    expect(en["settings.autoSync.intro"]).toBe(
+      "Dragging a slider fully to the left (zero) turns it off. If auto sync is interrupted by a special state, it resumes only after one manual sync.",
+    );
+    // 整包冲突行（用户 2026-09-23 定稿）：标题只用品牌名，原因句问「保留哪一份」。
+    expect(zhCN["syncView.selfBundleReview.title"]).toBe("EasySync");
+    expect(zhCN["syncView.selfBundleReview.conflictSummary"]).toBe(
+      "本插件与云端版本冲突，保留哪一份？",
+    );
+    expect(en["syncView.selfBundleReview.title"]).toBe("EasySync");
+    expect(en["syncView.selfBundleReview.conflictSummary"]).toBe(
+      "This plugin and the cloud hold conflicting versions. Which copy do you want to keep?",
+    );
+    // 弹框顶部说明在手机上会被宿主的内容列向 flex 挤成 0 高（行数最多的同步范围
+    // 弹框首当其冲）：四个弹框都用同一类保住自己的盒子，样式里有对应规则。
+    for (const modalSource of [
+      "src/ui/config-sync-modal.ts",
+      "src/ui/sync-exclusion-modal.ts",
+      "src/ui/automatic-handling-modal.ts",
+      "src/ui/auto-sync-modal.ts",
+    ]) {
+      expect(readFileSync(modalSource, "utf8")).toContain(
+        "setting-item-description easy-sync-modal-intro",
+      );
+    }
+    expect(readFileSync("styles.css", "utf8")).toMatch(
+      /\.easy-sync-modal-intro\s*\{[^}]*flex:\s*0 0 auto/s,
     );
     expect(en["settings.syncScope.name"]).toBe("Sync scope");
     expect(zhCN["settings.syncExclusion.name"]).toBe("同步排除");

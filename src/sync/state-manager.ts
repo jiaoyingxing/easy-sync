@@ -120,6 +120,7 @@ import {
   type StateV2IndexedDbActiveStore,
 } from "./state-v2-indexeddb-active";
 import {
+  isIndexedDbRollbackFormRecoveryError,
   StateV2IndexedDbRecoveryStore,
   stateV2IndexedDbRecoveryEnvelopeDigest,
 } from "./state-v2-indexeddb-recovery";
@@ -213,7 +214,14 @@ import { MergeReadyStore } from "./merge-ready-store";
 export interface PluginDataStore {
   loadData(): Promise<Record<string, unknown> | null>;
   updatePluginData(mutator: (data: Record<string, unknown>) => void): Promise<void>;
-  app: { vault: { adapter: DataAdapter; configDir: string } };
+  app: {
+    vault: { adapter: DataAdapter; configDir: string };
+    /** Official App localStorage API (same surface the update-check keys
+     *  use): vault-scoped, outside the synced plugin data file. Optional —
+     *  bare test harnesses omit it. */
+    loadLocalStorage?(key: string): unknown;
+    saveLocalStorage?(key: string, value: string): void;
+  };
   layoutMigrationStorage?: EasySyncLayoutMigrationStorage;
   manifest: { dir?: string; id: string };
   diag?: { warn: (category: string, message: string, detail?: unknown) => void };
@@ -499,6 +507,9 @@ const KEY_SIZE_EXCLUSION_BASELINE = "easy-sync-size-exclusion-baseline";
 const KEY_PENDING_CONFLICTS = "easy-sync-pending-conflicts";
 const KEY_PENDING_DELETES = "easy-sync-pending-remote-deletes";
 const KEY_PENDING_ISSUES = "easy-sync-pending-issues";
+const INDEXED_DB_JOURNAL_REBUILD_BUDGET_KEY =
+  "easy-sync-indexeddb-journal-rebuild-budget-v1";
+const INDEXED_DB_JOURNAL_REBUILD_BUDGET_WINDOW_MS = 24 * 60 * 60 * 1000;
 const KEY_LAST_SYNC_TIME = "easy-sync-last-sync-time";
 const KEY_PLAN_REVIEW_ACTIVE = "easy-sync-plan-review-active";
 const KEY_PLAN_REVIEW_COUNTS = "easy-sync-plan-review-counts";
@@ -1902,6 +1913,37 @@ export class StateManager {
     }
   }
 
+  /**
+   * One automatic journal rebuild per window per vault (2026-09-21 拍板:
+   * 24h 限 1 次,超出转人工). Stored via the official App localStorage API —
+   * vault-scoped, outside the synced plugin data file, never bound into
+   * migration input digests. Hosts without the API (bare test harnesses)
+   * skip the budget; the rollback form itself is the gate.
+   */
+  private consumeIndexedDbJournalRebuildBudget(): boolean {
+    const app = this.plugin.app;
+    if (
+      typeof app.loadLocalStorage !== "function"
+      || typeof app.saveLocalStorage !== "function"
+    ) {
+      return true;
+    }
+    const raw = app.loadLocalStorage(INDEXED_DB_JOURNAL_REBUILD_BUDGET_KEY);
+    const last = typeof raw === "string" ? Number(raw) : Number.NaN;
+    if (
+      Number.isFinite(last)
+      && last > 0
+      && Date.now() - last < INDEXED_DB_JOURNAL_REBUILD_BUDGET_WINDOW_MS
+    ) {
+      return false;
+    }
+    app.saveLocalStorage(
+      INDEXED_DB_JOURNAL_REBUILD_BUDGET_KEY,
+      String(Date.now()),
+    );
+    return true;
+  }
+
   private async loadSelectedIndexedDbStorage(
     paths: ReturnType<typeof getEasySyncPaths>,
     manifest: StateV2Manifest,
@@ -1971,7 +2013,36 @@ export class StateManager {
         }));
       }
     }
-    await active.reconcileLoadedRecoveryDelta();
+    try {
+      await active.reconcileLoadedRecoveryDelta();
+    } catch (error) {
+      if (
+        !isIndexedDbRollbackFormRecoveryError(error)
+        || !this.consumeIndexedDbJournalRebuildBudget()
+      ) {
+        throw error;
+      }
+      this.plugin.diag?.warn(
+        "state",
+        "IndexedDB active store sits behind the witnessed recovery journal — rebuilding from the journal (auto-heal)",
+        {
+          databaseId: selected.databaseId,
+          form: error instanceof Error ? error.message : String(error),
+        },
+      );
+      await active.close().catch(() => undefined);
+      ({ envelope, store: active, witness: currentWitness } =
+        await this.rebuildSelectedIndexedDbStorage({
+          recovery,
+          manifest,
+          witness: currentWitness,
+          selected,
+          vaultInstanceId,
+          previousStore: active,
+          deletePrevious: true,
+        }));
+      await active.reconcileLoadedRecoveryDelta();
+    }
     const inspection = await active.inspect();
     const binding = currentWitness.storageAuthority;
     if (

@@ -103,6 +103,49 @@ describe("S03 — state-neutral local recovery journal", () => {
     expect(new Uint8Array(files.get(path) as ArrayBuffer)).toEqual(new Uint8Array(newer));
   });
 
+  it("restores the copied original after an interrupted in-place replacement", async () => {
+    const path = "note.md";
+    const oldContent = bytes(7, 7, 7);
+    const downloaded = bytes(8, 8);
+    const { adapter, files } = makeMemoryAdapter({ [path]: oldContent });
+    const journal = new LocalRecoveryJournal(adapter, ".obsidian/plugins/easy-sync/tmp");
+
+    // 现役替换链：旧内容复制留底（目标路径不动），随后原地覆盖下载内容。
+    await journal.prepareCopiedOriginal(path, await entry(path, oldContent), oldContent, {
+      hash: await sha256Hex(downloaded),
+      size: downloaded.byteLength,
+    });
+    await adapter.writeBinary(path, downloaded);
+
+    const outcome = await new LocalRecoveryJournal(adapter, ".obsidian/plugins/easy-sync/tmp").recover();
+
+    expect(outcome).toBe("restored");
+    expect(new Uint8Array(files.get(path) as ArrayBuffer)).toEqual(new Uint8Array(oldContent));
+    expect(files.has(journal.intentPath)).toBe(false);
+    expect(files.has(journal.copiedOriginalPath)).toBe(false);
+  });
+
+  it("leaves an in-place replacement that drifted to a third version untouched", async () => {
+    const path = "note.md";
+    const oldContent = bytes(1, 1);
+    const downloaded = bytes(2, 2);
+    // 宿主把「远端版 + 编辑器未保存行」合并后写回磁盘的内容。
+    const merged = bytes(3, 3, 3, 3);
+    const { adapter, files } = makeMemoryAdapter({ [path]: oldContent });
+    const journal = new LocalRecoveryJournal(adapter, ".obsidian/plugins/easy-sync/tmp");
+
+    await journal.prepareCopiedOriginal(path, await entry(path, oldContent), oldContent, {
+      hash: await sha256Hex(downloaded),
+      size: downloaded.byteLength,
+    });
+    await adapter.writeBinary(path, downloaded);
+    await adapter.writeBinary(path, merged);
+
+    expect(await journal.recover()).toBe("preserved-newer");
+    expect(new Uint8Array(files.get(path) as ArrayBuffer)).toEqual(new Uint8Array(merged));
+    expect(files.has(journal.intentPath)).toBe(false);
+  });
+
   it("rolls back a partially written plugin bundle as one recovery unit", async () => {
     const root = ".obsidian/plugins/resojot";
     const mainPath = `${root}/main.js`;

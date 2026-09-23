@@ -195,23 +195,18 @@ export class ConfigSyncModal extends EasySyncModal {
     this.contentEl.empty();
     this.contentEl.removeClass("easy-sync-community-plugin-page");
     this.setTitle(t("settings.syncScope.title"));
+    this.contentEl.createEl("p", {
+      text: t("settings.syncScope.intro"),
+      cls: "setting-item-description easy-sync-modal-intro",
+    });
 
-    const leadingToggles: ScopeToggleConfig[] = [
-      {
-        key: "settings.syncPluginFiles",
-        get: () => this.plugin.syncPluginFiles,
-        patch: (value) => ({ syncPluginFiles: value }),
-      },
-      {
-        key: "settings.syncCorePlugins",
-        get: () => this.plugin.syncCorePlugins,
-        patch: (value) => ({ syncCorePlugins: value }),
-      },
-    ];
-
-    for (const toggleConfig of leadingToggles) {
-      this.renderScopeToggle(toggleConfig);
-    }
+    // Core plugins leads the list; the remaining scope switches follow the
+    // community-plugin pair (see trailingToggles).
+    this.renderScopeToggle({
+      key: "settings.syncCorePlugins",
+      get: () => this.plugin.syncCorePlugins,
+      patch: (value) => ({ syncCorePlugins: value }),
+    });
 
     this.renderCommunityPluginScopeSetting(
       "files",

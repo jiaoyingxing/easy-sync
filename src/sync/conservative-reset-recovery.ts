@@ -131,13 +131,22 @@ function conservativeResetReceiptMatchesIntent(
         || base.eTag !== remote.eTag
         || remote.driveId !== intent.expectedRemote.driveId
       ) return false;
-      // Two admissible receipt shapes, both proving "after the move, the local
-      // target and the remote identity hold the same version":
+      // Three admissible receipt shapes:
       //  1. content-aligned (A1 one-shot converge): the receipt base already
       //     equals the intended remote bytes when the remote was moved and
       //     edited while the local side stayed unchanged;
       //  2. pure rename: both sides still hold the intended local bytes and
       //     the intent itself declares matching content on both sides.
+      //  3. sha-unknown plain move (field report 2026-09-22, F9 case 3):
+      //     OneDrive personal often provides no sha256Hash, and the execution
+      //     chain legitimately records a followed move whose content diverged
+      //     (facts precheck + rename read-back proved the move; the ordinary
+      //     same-path decision converges the bytes next round). Without this
+      //     shape the receipt is unwritable and the record blocks recovery
+      //     forever as intent-only. It is restricted to intents that carry no
+      //     remote hash, so hash-known moves still require alignment (shape
+      //     1), and it binds both worlds exactly as planned instead of
+      //     proving content identity.
       const aligned = (
         expected: Readonly<{ size: number; sha256Hash?: string }>,
       ): boolean => Boolean(base
@@ -147,6 +156,12 @@ function conservativeResetReceiptMatchesIntent(
         && remote.size === expected.size
         && remote.sha256Hash !== undefined
         && remote.sha256Hash.toLowerCase() === expected.sha256Hash.toLowerCase());
+      if (intent.expectedRemote.sha256Hash === undefined) {
+        return remote.sha256Hash === undefined
+          && remote.eTag === intent.expectedRemote.eTag
+          && remote.size === intent.expectedRemote.size
+          && baseMatches(intent.expectedLocal);
+      }
       return aligned(intent.expectedRemote) || (
         baseMatches(intent.expectedLocal)
         && remoteMatches(intent.expectedLocal)

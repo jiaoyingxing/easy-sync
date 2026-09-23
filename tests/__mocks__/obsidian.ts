@@ -135,10 +135,26 @@ export function createMockElement(): HTMLElement {
     else classTokens.delete(token);
     return element;
   };
-  element.setAttribute = (_name: string, _value: string) => element;
-  element.setText = (_value: string | DocumentFragment) => element;
-  element.createDiv = () => createMockElement();
-  element.createSpan = () => createMockElement();
+    element.setAttribute = (_name: string, _value: string) => element;
+    // Real setText writes through to the text, mirroring the DOM so tests
+    // can assert readout text.
+    element.setText = (value: string | DocumentFragment) => {
+      if (typeof value === "string") element.textContent = value;
+      return element;
+    };
+    element.createDiv = () => createMockElement();
+    // Real createSpan accepts a class string or a DomElementInfo; record
+    // both so tests can assert the created span's class and text.
+    element.createSpan = (fields?: string | { cls?: string; text?: string }) => {
+      const span = createMockElement();
+      const cls = typeof fields === "string" ? fields : fields?.cls;
+      if (cls) {
+        for (const token of cls.split(" ")) span.classList.add(token);
+      }
+      const text = typeof fields === "string" ? undefined : fields?.text;
+      if (text !== undefined) span.setText(text);
+      return span;
+    };
   element.createEl = () => createMockElement();
   element.appendChild = (_child: unknown) => element;
   element.closest = () => null;
@@ -326,20 +342,85 @@ export class ExtraButtonComponent {
   onClick(_callback: () => void | Promise<void>): this { return this; }
 }
 
+/** Element shape behind the mock sliderEl, mirroring a real range input. */
+interface MockSliderElement {
+  closest: (selector: string) => HTMLElement | null;
+  min: string;
+  max: string;
+  valueAsNumber: number;
+  parentElement: HTMLElement;
+  before: (el: HTMLElement) => void;
+  addEventListener: (type: string, callback: (event?: unknown) => void) => void;
+  style: { setProperty: (name: string, value: string) => void };
+  __fire: (type: string) => void;
+  __cssProps: Record<string, string>;
+}
+
 export class SliderComponent {
   static instances: SliderComponent[] = [];
-  sliderEl = {
-    closest: (_selector: string): HTMLElement | null => null,
-  } as unknown as HTMLInputElement;
+  /** Test hook: pre-create a host-style `.slider-value` readout (1.13+). */
+  static simulateHostValueReadout = false;
+  sliderEl: HTMLInputElement;
+  private mockEl: MockSliderElement;
   private onChangeCallback: ((value: number) => void | Promise<void>) | null = null;
   value = 0;
 
   constructor(_containerEl: HTMLElement) {
+    const listeners: Record<string, (event?: unknown) => void> = {};
+    const cssProps: Record<string, string> = {};
+    // The control container starts with the input as its only child — the
+    // old-host shape, where SliderComponent ships no value readout. With
+    // simulateHostValueReadout the container also gets a host-style element
+    // ahead of the input and a querySelector that finds it, mirroring 1.13+.
+    const parent = createMockElement();
+    const mockEl: MockSliderElement = {
+      closest: (_selector: string): HTMLElement | null => null,
+      min: "0",
+      max: "100",
+      valueAsNumber: 0,
+      parentElement: parent as unknown as HTMLElement,
+      before: (el: HTMLElement) => {
+        const children = parent.children as unknown[];
+        const index = children.indexOf(mockEl as unknown as HTMLElement);
+        children.splice(index === -1 ? children.length : index, 0, el);
+      },
+      addEventListener: (type: string, callback: (event?: unknown) => void) => {
+        listeners[type] = callback;
+      },
+      style: {
+        setProperty: (name: string, value: string) => {
+          cssProps[name] = value;
+        },
+      },
+      // Test hook: dispatch a recorded DOM listener (e.g. input).
+      __fire: (type: string) => listeners[type]?.(),
+      __cssProps: cssProps,
+    };
+    (parent.children as unknown[]).push(mockEl as unknown as HTMLElement);
+    if (SliderComponent.simulateHostValueReadout) {
+      const hostEl = createMockElement();
+      hostEl.addClass("slider-value");
+      mockEl.before(hostEl as unknown as HTMLElement);
+      (parent as unknown as {
+        querySelector: (selector: string) => HTMLElement | null;
+      }).querySelector = (selector: string) =>
+        selector.includes("slider-value")
+          ? (parent.children[0] as HTMLElement)
+          : null;
+    }
+    this.mockEl = mockEl;
+    this.sliderEl = this.mockEl as unknown as HTMLInputElement;
     SliderComponent.instances.push(this);
   }
-  setLimits(_min: number, _max: number, _step: number): this { return this; }
+  setLimits(min: number, max: number, _step: number): this {
+    // The slider fill paint reads min/max off the element; keep them in sync.
+    this.mockEl.min = String(min);
+    this.mockEl.max = String(max);
+    return this;
+  }
   setValue(value: number): this {
     this.value = value;
+    this.mockEl.valueAsNumber = value;
     return this;
   }
   setDisabled(_disabled: boolean): this { return this; }
@@ -353,6 +434,17 @@ export class SliderComponent {
       throw new Error("SliderComponent.onChange was never registered");
     }
     return this.onChangeCallback(value);
+  }
+  /** Test helper: read a recorded inline CSS custom property ("" when unset). */
+  getInlineCssProp(name: string): string {
+    return this.mockEl.__cssProps[name] ?? "";
+  }
+  /** Test helper: simulate an input event (drag), optionally moving the value. */
+  fireInput(value?: number): void {
+    if (value !== undefined) {
+      this.mockEl.valueAsNumber = value;
+    }
+    this.mockEl.__fire("input");
   }
 }
 

@@ -11,12 +11,6 @@ import type {
   DisplayDiffResult,
   DisplayDiffSummary,
 } from "./diff-engine";
-import { getDiffSummaryReasonKey } from "./conflict-detail-presentation";
-
-type Translate = (
-  key: string,
-  params?: Record<string, string | number>,
-) => string;
 
 /** Text diff budget per side; beyond this a preview is shown instead. */
 export const MAX_TEXT_DIFF_BYTES_PER_SIDE = 8 * 1024 * 1024;
@@ -50,7 +44,6 @@ export function getDiffLineNumberWidth(
 export function renderDisplayDiff(
   container: HTMLElement,
   diff: DisplayDiffResult,
-  t: Translate,
 ): void {
   const diffContainer = container.createDiv("easy-sync-diff-view");
   diffContainer.style.setProperty(
@@ -69,7 +62,7 @@ export function renderDisplayDiff(
     if (part.kind === "hunk") {
       for (const line of part.lines) renderDiffLine(diffContainer, line);
     } else {
-      renderDiffSummary(diffContainer, part, t);
+      renderDiffSummary(diffContainer, part);
     }
   }
 }
@@ -88,21 +81,12 @@ function renderDiffLine(container: HTMLElement, line: DiffLine): void {
   lineEl.createSpan("easy-sync-diff-content").setText(`${prefix} ${line.text}`);
 }
 
+/** Sample region: head and tail lines of each side, separated by one ellipsis row. */
 function renderDiffSummary(
   container: HTMLElement,
   summary: DisplayDiffSummary,
-  t: Translate,
 ): void {
   const summaryEl = container.createDiv("easy-sync-diff-summary");
-  summaryEl.createDiv("easy-sync-diff-summary-reason").setText(
-    t(getDiffSummaryReasonKey(summary.reason)),
-  );
-  summaryEl.createDiv("easy-sync-diff-summary-range").setText(
-    t("conflictDetail.diffRegionRange", {
-      localRange: formatLineRange(summary.localStartLine, summary.localEndLine),
-      remoteRange: formatLineRange(summary.remoteStartLine, summary.remoteEndLine),
-    }),
-  );
 
   for (const line of summary.localSample) {
     renderDiffLine(summaryEl, {
@@ -111,14 +95,7 @@ function renderDiffSummary(
       lineNumber: { local: line.lineNumber },
     });
   }
-  if (summary.localOmittedLines > 0 || summary.remoteOmittedLines > 0) {
-    summaryEl.createDiv("easy-sync-diff-line easy-sync-diff-gap").setText(
-      t("conflictDetail.diffOmitted", {
-        localCount: summary.localOmittedLines,
-        remoteCount: summary.remoteOmittedLines,
-      }),
-    );
-  }
+  summaryEl.createDiv("easy-sync-diff-line easy-sync-diff-gap").setText("…");
   for (const line of summary.remoteSample) {
     renderDiffLine(summaryEl, {
       type: "added",
@@ -126,9 +103,4 @@ function renderDiffSummary(
       lineNumber: { remote: line.lineNumber },
     });
   }
-}
-
-function formatLineRange(start: number, end: number): string {
-  if (end < start) return "—";
-  return start === end ? String(start) : `${start}–${end}`;
 }

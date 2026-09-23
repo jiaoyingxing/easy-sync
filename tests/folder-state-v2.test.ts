@@ -8,6 +8,7 @@ import {
   buildFolderSubtreeReviewSnapshotV1,
 } from "../src/sync/empty-folder-resolution";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
+import { buildSharedFolderIdentityResolutionSnapshotV1 } from "../src/sync/shared-folder-identity-resolution";
 import {
   shouldPauseCanonicalPlanForReviewV2,
   summarizeCanonicalPlanReviewV2,
@@ -1650,5 +1651,72 @@ describe("V2 folder anchors and pure planner", () => {
       reason: "remote-subtree-changed",
       remoteId: "notes",
     })]);
+  });
+});
+
+describe("shared folder identity review outcome", () => {
+  it("offers the review when the local and cloud names are identical", () => {
+    const current = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      folderAnchors: [],
+    });
+    const outcome = buildSharedFolderIdentityResolutionSnapshotV1("Notes", {
+      envelope: current,
+      localFiles: [],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+    });
+
+    expect(outcome.status).toBe("ready");
+  });
+
+  it("names the case-only difference instead of silently returning no review", () => {
+    // planner 按身份（忽略大小写）匹配，所以同名对会稳定产出待处理行；
+    // 但人工确认要求两侧路径逐字节相等——只差大小写时该出口永远打不开。
+    const current = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      folderAnchors: [],
+    });
+    const outcome = buildSharedFolderIdentityResolutionSnapshotV1("notes", {
+      envelope: current,
+      localFiles: [],
+      localFolders: localFolders("notes"),
+      localFolderScanComplete: true,
+    });
+
+    expect(outcome).toEqual({ status: "name-mismatch", path: "notes" });
+  });
+
+  it("points at the folder that differs when it sits above the reviewed row", () => {
+    const current = envelope({
+      folders: [
+        { id: "notes", name: "Notes" },
+        { id: "notes-sub", name: "Sub", parentId: "notes" },
+      ],
+      folderAnchors: [],
+    });
+    const outcome = buildSharedFolderIdentityResolutionSnapshotV1("notes/Sub", {
+      envelope: current,
+      localFiles: [],
+      localFolders: localFolders("notes", "notes/Sub"),
+      localFolderScanComplete: true,
+    });
+
+    expect(outcome).toEqual({ status: "name-mismatch", path: "notes" });
+  });
+
+  it("keeps the unavailable outcome for facts that are genuinely not ready", () => {
+    const current = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      folderAnchors: [],
+    });
+    const outcome = buildSharedFolderIdentityResolutionSnapshotV1("Notes", {
+      envelope: current,
+      localFiles: [],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: false,
+    });
+
+    expect(outcome).toEqual({ status: "unavailable" });
   });
 });

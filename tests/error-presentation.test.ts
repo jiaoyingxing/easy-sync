@@ -143,6 +143,18 @@ describe("known plugin bundle error presentation", () => {
       zh(),
       "zh-cn",
     )).toBe("恢复核验失败");
+    // 写路径两条可被用户触发的失败（复核轮同族普查）：解析卡住的记录时宿主
+    // 把未保存的行并进对齐写入、以及目标在扫描与写入之间消失。
+    expect(presentKnownFileError(
+      "Alignment read-back failed: note.md -> note.md",
+      zh(),
+      "zh-cn",
+    )).toBe("无法确认本机文件与云端版本一致");
+    expect(presentKnownFileError(
+      "Local file disappeared before replacement: note.md",
+      zh(),
+      "zh-cn",
+    )).toBe("本机文件在写入前已消失");
   });
 
   it("matches the most specific row for overlapping catalog prefixes", () => {

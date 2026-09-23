@@ -29,6 +29,11 @@ import {
   isRecord,
 } from "../obsidian-compat";
 import {
+  LocalReplacementTruncatedError,
+  LocalReplacementVerificationError,
+  writeReplacementInPlace,
+} from "./local-replacement-writer";
+import {
   OneDriveError,
   OneDriveErrorType,
   RemoteVaultScopeIdentityError,
@@ -80,6 +85,11 @@ import {
   type FolderLocationResolutionSnapshotV1,
   type FolderSubtreeReviewSnapshotV1,
 } from "./empty-folder-resolution";
+import {
+  classifyManualResolutionEntry,
+  type ManualResolutionEntryReason,
+  type ManualResolutionEntrySnapshot,
+} from "./manual-resolution-entry";
 import {
   buildSharedFolderIdentityResolutionSnapshotV1,
   type SharedFolderIdentityResolutionSnapshotV1,
@@ -769,6 +779,23 @@ class MutationNotAppliedError extends Error {
 
 /** Local CAS failed before commitDownloadedTempFile touched the target. */
 class LocalCommitPreconditionError extends Error {}
+
+/**
+ * The local write itself did not land: our own truncation, a write that left
+ * the reviewed version in place, or content we cannot attribute. Still a
+ * precondition error for every caller that defers.
+ *
+ * `localStateUncertain` marks the sub-cases where the attempt may have left the
+ * local file modified (rollback failed, or the read-back was unattributable or
+ * missing). Only when it is false may a user-facing message say the file was
+ * not changed (`DECISIONS` 2026-09-23 point 9③④⑤).
+ */
+class LocalWriteNotLandedError extends LocalCommitPreconditionError {
+  constructor(message: string, readonly localStateUncertain = false) {
+    super(message);
+    this.name = "LocalWriteNotLandedError";
+  }
+}
 
 /** Local file changed after DeleteLocal was planned but before deletion began. */
 class LocalVersionChangedBeforeDeleteError extends Error {
@@ -1794,51 +1821,61 @@ export class SyncExecutor {
     return this.buildCurrentFolderLocationResolutionSnapshot(path);
   }
 
+  /**
+   * The single entry-gate classification for every manual resolution chip.
+   * Wording stays with the callers; this only answers why an entry cannot open.
+   */
+  private manualResolutionEntryReason(): ManualResolutionEntryReason {
+    return classifyManualResolutionEntry({
+      running: this.running,
+      sideActionsInFlight: this.hasSideActionsInFlight,
+      v2StateActive: this.state.isV2StateActive,
+      mutationLedgerCorruption: this.state.hasMutationLedgerCorruption,
+      stateLoadRecoveryBlock: this.state.hasV2StateLoadRecoveryBlock,
+      remoteScopeRecovery: this.state.hasV2RemoteScopeRecovery,
+    });
+  }
+
   /** Read-only facts for an explicit shared-folder identity confirmation. */
   async getSharedFolderIdentityResolutionSnapshot(
     path: string,
-  ): Promise<SharedFolderIdentityResolutionSnapshotV1 | null> {
-    if (
-      this.running
-      || this.hasSideActionsInFlight
-      || !this.state.isV2StateActive
-      || this.state.hasMutationLedgerCorruption
-      || this.state.hasV2StateLoadRecoveryBlock
-      || this.state.hasV2RemoteScopeRecovery
-    ) return null;
-    return (await this.buildCurrentSharedFolderIdentityResolutionReview(path))
-      ?.snapshot ?? null;
+  ): Promise<ManualResolutionEntrySnapshot<SharedFolderIdentityResolutionSnapshotV1>> {
+    const entryReason = this.manualResolutionEntryReason();
+    if (entryReason !== "ready") return { snapshot: null, reason: entryReason };
+    const review = await this.buildCurrentSharedFolderIdentityResolutionReview(path);
+    if (review.status === "name-mismatch") {
+      return {
+        snapshot: null,
+        reason: "name-mismatch",
+        nameMismatchPath: review.path,
+      };
+    }
+    if (review.status !== "ready") return { snapshot: null, reason: "facts-changed" };
+    return { snapshot: review.snapshot, reason: "ready" };
   }
 
   /** Read-only facts for explicitly retiring one unreachable old identity. */
   async getStaleIdentityResolutionSnapshot(
     path: string,
-  ): Promise<StaleIdentityResolutionSnapshotV1 | null> {
-    if (
-      this.running
-      || this.hasSideActionsInFlight
-      || !this.state.isV2StateActive
-      || this.state.hasMutationLedgerCorruption
-      || this.state.hasV2StateLoadRecoveryBlock
-      || this.state.hasV2RemoteScopeRecovery
-    ) return null;
-    return (await this.buildCurrentStaleIdentityResolutionReview(path))
-      ?.snapshot ?? null;
+  ): Promise<ManualResolutionEntrySnapshot<StaleIdentityResolutionSnapshotV1>> {
+    const entryReason = this.manualResolutionEntryReason();
+    if (entryReason !== "ready") return { snapshot: null, reason: entryReason };
+    const review = await this.buildCurrentStaleIdentityResolutionReview(path);
+    return review
+      ? { snapshot: review.snapshot, reason: "ready" }
+      : { snapshot: null, reason: "facts-changed" };
   }
 
   /** Read-only facts for one scope-crossing exit row (file or folder move). */
   async getScopeCrossingResolutionSnapshot(
     path: string,
-  ): Promise<ScopeCrossingResolutionSnapshotV1 | null> {
-    if (
-      this.running
-      || this.hasSideActionsInFlight
-      || !this.state.isV2StateActive
-      || this.state.hasMutationLedgerCorruption
-      || this.state.hasV2StateLoadRecoveryBlock
-      || this.state.hasV2RemoteScopeRecovery
-    ) return null;
-    return this.buildCurrentScopeCrossingReviewSnapshot(path);
+  ): Promise<ManualResolutionEntrySnapshot<ScopeCrossingResolutionSnapshotV1>> {
+    const entryReason = this.manualResolutionEntryReason();
+    if (entryReason !== "ready") return { snapshot: null, reason: entryReason };
+    const snapshot = await this.buildCurrentScopeCrossingReviewSnapshot(path);
+    return snapshot
+      ? { snapshot, reason: "ready" }
+      : { snapshot: null, reason: "facts-changed" };
   }
 
   private async buildCurrentScopeCrossingReviewSnapshot(
@@ -1961,14 +1998,7 @@ export class SyncExecutor {
   async getMutationRecoveryResolutionSnapshot(
     preferredOperationId?: string,
   ): Promise<ManualMutationResolutionSnapshotV1 | null> {
-    if (
-      this.running
-      || this.hasSideActionsInFlight
-      || !this.state.isV2StateActive
-      || this.state.hasMutationLedgerCorruption
-      || this.state.hasV2StateLoadRecoveryBlock
-      || this.state.hasV2RemoteScopeRecovery
-    ) return null;
+    if (this.manualResolutionEntryReason() !== "ready") return null;
     const remoteScope = await this.onedrive.initVaultScope(this.vaultName);
     const scope: SyncScope = {
       accountId: this.state.boundAccountId,
@@ -2002,12 +2032,7 @@ export class SyncExecutor {
     pluginId: string,
   ): Promise<ManualMutationResolutionSnapshotV1 | null> {
     if (
-      this.running
-      || this.hasSideActionsInFlight
-      || !this.state.isV2StateActive
-      || this.state.hasMutationLedgerCorruption
-      || this.state.hasV2StateLoadRecoveryBlock
-      || this.state.hasV2RemoteScopeRecovery
+      this.manualResolutionEntryReason() !== "ready"
       || pluginId === "easy-sync"
       || !isPluginSelected(this.communityPluginSyncPolicy.files, pluginId)
     ) return null;
@@ -2669,6 +2694,10 @@ export class SyncExecutor {
         const publication = await this.state.acceptReviewedFolderSubtreeRestore({
           reviewed: current,
         });
+        if (publication.status === "blocked") {
+          this.notice("notice.sideActionPendingWork");
+          return;
+        }
         if (publication.status !== "accepted") {
           this.notice("notice.folderSubtree.changed", { path: reviewed.path });
           return;
@@ -2885,8 +2914,15 @@ export class SyncExecutor {
           await this.buildCurrentSharedFolderIdentityResolutionReview(
             reviewed.path,
           );
+        if (current.status === "name-mismatch") {
+          this.notice("notice.sharedFolderIdentity.nameMismatch", {
+            path: reviewed.path,
+            namePath: current.path,
+          });
+          return;
+        }
         if (
-          !current
+          current.status !== "ready"
           || current.snapshot.revision !== reviewed.revision
           || !this.activeSyncScope
           || !sameSyncScope(current.snapshot.scope, this.activeSyncScope)
@@ -2905,6 +2941,10 @@ export class SyncExecutor {
             localFolderScanComplete: true,
             remoteIdentityComplete: this.state.hasCompleteRemoteFolderIndex,
           });
+        if (publication.status === "blocked") {
+          this.notice("notice.sideActionPendingWork");
+          return;
+        }
         if (publication.status !== "accepted") {
           this.notice("notice.sharedFolderIdentity.changed", {
             path: reviewed.path,
@@ -2953,6 +2993,10 @@ export class SyncExecutor {
         const publication = await this.state.retireReviewedStaleIdentity({
           reviewed: current.snapshot,
         });
+        if (publication.status === "blocked") {
+          this.notice("notice.sideActionPendingWork");
+          return;
+        }
         if (publication.status !== "accepted") {
           this.notice("notice.staleIdentity.changed", { path: reviewed.path });
           return;
@@ -4562,11 +4606,16 @@ export class SyncExecutor {
 
   private async buildCurrentSharedFolderIdentityResolutionReview(
     path: string,
-  ): Promise<{
-    snapshot: SharedFolderIdentityResolutionSnapshotV1;
-    localFiles: LocalFileEntry[];
-    localFolders: LocalFolderEntry[];
-  } | null> {
+  ): Promise<
+    | {
+        status: "ready";
+        snapshot: SharedFolderIdentityResolutionSnapshotV1;
+        localFiles: LocalFileEntry[];
+        localFolders: LocalFolderEntry[];
+      }
+    | { status: "name-mismatch"; path: string }
+    | { status: "unavailable" }
+  > {
     const pending = this.state.pendingIssues.find((issue) =>
       issue.path === path
         && issue.actionType === SyncActionType.FolderDeferred
@@ -4574,16 +4623,18 @@ export class SyncExecutor {
     );
     const envelope = this.state.getCommittedV2Envelope();
     if (!pending || !envelope || !this.state.hasCompleteRemoteFolderIndex) {
-      return null;
+      return { status: "unavailable" };
     }
 
     const scan = await this.scanner.scanAll();
-    if (!scan.complete || !scan.folderScanComplete) return null;
+    if (!scan.complete || !scan.folderScanComplete) {
+      return { status: "unavailable" };
+    }
     const scope = this.currentManualResolutionScanScope();
     const localFiles = scan.entries.filter(
       (entry) => scope.includeFilePath(entry.path),
     );
-    const snapshot = buildSharedFolderIdentityResolutionSnapshotV1(path, {
+    const outcome = buildSharedFolderIdentityResolutionSnapshotV1(path, {
       envelope,
       localFiles,
       localFolders: scan.folders,
@@ -4594,7 +4645,8 @@ export class SyncExecutor {
       includeFolderPath: scope.includeFolderPath,
       preserveFolderPath: scope.preserveFolderPath,
     });
-    if (!snapshot) return null;
+    if (outcome.status !== "ready") return outcome;
+    const snapshot = outcome.snapshot;
 
     for (const folder of snapshot.folders) {
       const [byId, byPath] = await Promise.all([
@@ -4610,9 +4662,10 @@ export class SyncExecutor {
         || byPath.parentReference?.id !== folder.parentId
         || byId.eTag !== folder.eTag
         || byPath.eTag !== folder.eTag
-      ) return null;
+      ) return { status: "unavailable" };
     }
     return {
+      status: "ready",
       snapshot,
       localFiles,
       localFolders: scan.folders,
@@ -6414,13 +6467,14 @@ export class SyncExecutor {
   ): Promise<{ size: number; mtime?: number } | null> {
     const recoveryPath = `${targetPath}.easy-sync-recovery`;
     const existing = await adapter.stat(targetPath);
+    let originalBytes: ArrayBuffer | null = null;
     if (expected) {
       if (!existing) {
         await this.removePathIfExists(tempPath);
         throw new LocalCommitPreconditionError(`Local file disappeared before replacement: ${targetPath}`);
       }
-      const currentBytes = await adapter.readBinary(targetPath);
-      if (currentBytes.byteLength !== expected.size || await sha256Hex(currentBytes) !== expected.hash) {
+      originalBytes = await adapter.readBinary(targetPath);
+      if (originalBytes.byteLength !== expected.size || await sha256Hex(originalBytes) !== expected.hash) {
         await this.removePathIfExists(tempPath);
         throw new LocalCommitPreconditionError(`Local file changed before replacement: ${targetPath}`);
       }
@@ -6444,15 +6498,68 @@ export class SyncExecutor {
     }
 
     const journal = this.getRecoveryJournal();
-    await this.removePathIfExists(recoveryPath);
-    await journal.prepareRenamedOriginal(
-      targetPath,
-      expected,
-      recoveryPath,
-      downloaded,
-    );
+    // 宿主看得见的文件（在库索引里、可能正被打开在某个视图里）走「复制留底 + 原地写」：
+    // 宿主因此把这次变化读作普通内容更新，打开的视图不被挪走或关闭，编辑器里未保存的
+    // 文字由宿主自行合并。索引外的路径（配置目录等）没有可被切走的视图，保持原子替换。
+    const vault = this.scanner.vault as LocalScanner["vault"] & {
+      getFileByPath?: (path: string) => unknown;
+      modify?: (file: TFile, data: string) => Promise<void>;
+    };
+    const hostFile = typeof vault.getFileByPath === "function"
+      ? vault.getFileByPath(targetPath)
+      : null;
+    // 只有「宿主认得这个文件」且「宿主能自己写它」时才改写入形状：打开的视图只可能
+    // 出现在这类文件上，而让宿主执行写入也是这件事唯一被真机验证过的形态。索引外
+    // 的路径（配置目录等）与没有宿主写入面的宿主保持原子替换不变。
+    const hostVisible = hostFile instanceof TFile && typeof vault.modify === "function";
+    if (hostVisible) {
+      await journal.prepareCopiedOriginal(
+        targetPath,
+        expected,
+        originalBytes,
+        downloaded,
+      );
+    } else {
+      await this.removePathIfExists(recoveryPath);
+      await journal.prepareRenamedOriginal(
+        targetPath,
+        expected,
+        recoveryPath,
+        downloaded,
+      );
+    }
     try {
-      if (existing) await adapter.rename(targetPath, recoveryPath);
+      if (hostVisible) {
+        const outcome = await writeReplacementInPlace({
+          file: hostFile,
+          modify: typeof vault.modify === "function"
+            ? vault.modify.bind(vault)
+            : undefined,
+          adapter,
+          targetPath,
+          content: tempBytes,
+          previousBytes: originalBytes,
+          expectedVersion: downloaded,
+          onWarning: (message) => this.diag?.warn("execute", message),
+        });
+        // 原地写不消费暂存文件（旧实现的改名会），成功后必须自己清掉，
+        // 否则每个被覆盖的文件都会在插件 tmp 里留一份远端内容全文副本。
+        await this.removePathIfExists(tempPath);
+        await journal.complete();
+        if (outcome.arm === "merged-tail") {
+          // 宿主把编辑器里未保存的行合并到了我们写入的内容之后。写入本身已经落地，
+          // 所以这一轮记成功、基线记远端版本；合并结果留给下一轮按「本机改动」上传
+          // （`DECISIONS` 2026-09-23 第 9 点②）。
+          this.diag?.warn(
+            "execute",
+            `host merged unsaved editor text into the replaced file: ${targetPath} (+${outcome.appendedBytes}B); base keeps the remote version`,
+          );
+        }
+        // 返回的是**远端版本**的尺寸（调用方按它推进基线）；磁盘实际字节数在
+        // `outcome.size` 里（宿主合并时会更大），目前没有消费者，别把两者混用。
+        return { size: downloaded.size, mtime: outcome.mtime };
+      }
+      if (expected) await adapter.rename(targetPath, recoveryPath);
       await adapter.rename(tempPath, targetPath);
       const stat = await adapter.stat(targetPath);
       if (!stat || stat.size !== downloaded.size) {
@@ -6463,6 +6570,30 @@ export class SyncExecutor {
     } catch (error) {
       await journal.recover();
       await this.removePathIfExists(tempPath);
+      if (error instanceof LocalReplacementTruncatedError) {
+        // 我们自己写坏了（目标只剩我们写入内容的前缀）：写入器已尝试把旧内容放回。
+        // 回放没成功时本机就停在被写坏的状态上，上层不得再说「文件未因此改变」。
+        if (!error.restoredPrevious) {
+          this.diag?.warn(
+            "execute",
+            `truncated local replacement could not be rolled back: ${targetPath}`,
+          );
+        }
+        throw new LocalWriteNotLandedError(error.message, !error.restoredPrevious);
+      }
+      if (error instanceof LocalReplacementVerificationError) {
+        // 写入没落地（磁盘还是旧版本）或落成了无法归属的内容。后者通常来自宿主在
+        // 我们之后又写过一次，但无论哪种都不该声称「本机文件变化」：现场不动，
+        // 交给调用方的延后路径（`DECISIONS` 2026-09-23 第 9 点④⑤）。回读不可归属
+        // 时本机内容同样无法确认，一并标进错误类型。
+        this.diag?.warn(
+          "execute",
+          `local replacement did not land (${error.arm}): ${targetPath}${
+            error.writeFailure ? ` — ${describeThrownValue(error.writeFailure)}` : ""
+          }`,
+        );
+        throw new LocalWriteNotLandedError(error.message, error.arm === "unattributed");
+      }
       throw error;
     }
   }
@@ -14986,10 +15117,22 @@ export class SyncExecutor {
         || !remoteStillExpected
         || !targetRemote
       ) return null;
-      if (await this.remoteMatchesTarget(
-        targetRemote,
-        intent.expectedLocal,
-      )) {
+      // A sha-unknown move settles only as a plain move whose observed world
+      // still binds to the planned one (identity + eTag via remoteStillExpected
+      // above, plus size here), under the same receipt contract as the
+      // execution chain (shape 3 in conservative-reset-recovery): the honest
+      // divergence is recorded and the ordinary same-path decision converges
+      // the bytes next round. Any other sha-unknown shape stays blocked right
+      // here — it must never fall through to the A1 alignment below, which
+      // downloads over the local file and would produce an unreceiptable
+      // checkpoint (field report 2026-09-22, F9 case 3; adversarial review
+      // 2026-09-22). Comparing or aligning bytes is reserved for hash-known
+      // moves.
+      if (
+        intent.expectedRemote.sha256Hash === undefined
+          ? targetRemote.size === intent.expectedRemote.size
+          : await this.remoteMatchesTarget(targetRemote, intent.expectedLocal)
+      ) {
         const checkpoint = emptyMutationCheckpoint();
         checkpoint.baseRemovals.push(intent.sourcePath);
         checkpoint.baseUpserts.push({
@@ -15002,12 +15145,21 @@ export class SyncExecutor {
         checkpoint.remoteUpserts.push(targetRemote);
         return checkpoint;
       }
+      if (intent.expectedRemote.sha256Hash === undefined) {
+        // Contradictory sha-unknown world (identity and eTag matched the plan
+        // but the observed size differs): stay blocked instead of aligning —
+        // A1 would download over the local file and produce an unreceiptable
+        // checkpoint (adversarial review 2026-09-22, F9 case 3 follow-up).
+        return null;
+      }
       // A1 one-shot converge: the local file already followed the moved remote
       // path while the remote content version advanced. Download the exact
       // remote bytes and settle the receipt against the aligned content, so a
       // stuck "path followed, bytes pending" record converges automatically.
-      // Observation-only rounds leave the alignment to a real execution round
-      // (same pattern as the automatic merge branch).
+      // Only reachable for hash-known intents now: sha-unknown moves either
+      // settled as plain moves above (receipt shape 3) or returned null to
+      // stay blocked. Observation-only rounds leave the alignment to a real
+      // execution round (same pattern as the automatic merge branch).
       if (observationOnly) return null;
       if (local.status !== "present" || !local.entry) return null;
       const aligned = await this.alignLocalTargetBytes(
@@ -15548,6 +15700,13 @@ export class SyncExecutor {
         default:
           return this.t("syncView.failure.remote");
       }
+    }
+    if (error instanceof LocalWriteNotLandedError) {
+      // 本机写入的诚实结论：调用方（含手动/恢复链）一律给本地化的一句，绝不落到
+      // 英文内部串上；本机内容无法确认时用如实的那一句（`DECISIONS` 2026-09-23 第 9 点）。
+      return this.t(error.localStateUncertain
+        ? "notice.localWriteStateUncertain"
+        : "notice.localWriteNotLanded");
     }
     if (error instanceof Error) {
       return presentKnownError(
@@ -16336,9 +16495,10 @@ export class SyncExecutor {
         // the mutation receipt proves "local target == remote version" (the
         // same proof shape conservative reset already requires) instead of
         // leaving an unreceiptable intermediate state. Without a known remote
-        // hash the plain move receipt stays admissible and the ordinary
-        // same-path decision converges the bytes on the next round (the A1
-        // comment contract), so alignment is limited to a proven difference.
+        // hash the plain move receipt stays admissible (shape 3 in
+        // conservative-reset-recovery) and the ordinary same-path decision
+        // converges the bytes on the next round (the A1 comment contract), so
+        // alignment is limited to a proven difference.
         const needsAlignment = item.remote.sha256Hash !== undefined
           && (
             item.remote.size !== targetEntry.size
@@ -21359,7 +21519,12 @@ export class SyncExecutor {
       case "mutationRecovery":
         this.notice("notice.sideActionMutationRecoveryFailed", { path });
         return;
-      case "action":
+        case "action":
+          // 已经报过具名原因的失败不再用通用原因覆盖它：事件中心按 key 只留最新一条，
+          // 覆盖会把本地化说明换成内部英文串或「未知错误」。两条冲突链的 catch 眼下
+          // 会先在内部早退（对抗复核 2026-09-23 确认当前不可达），这条是给未来生产者
+          // 留的防线。
+          if (error instanceof MutationNotAppliedError && error.noticeAlreadyShown) return;
         this.notice("notice.conflict.failed", {
           path,
           reason: this.failureReason(error),
@@ -21836,18 +22001,32 @@ export class SyncExecutor {
           expected,
           { size: content.byteLength, hash },
         );
-        const stat = await this.scanner.vault.adapter.stat(path);
         const checkpoint = emptyMutationCheckpoint();
         checkpoint.baseUpserts.push({
           path,
           hash,
-          size: stat?.size ?? content.byteLength,
+          // 基线记云端版本本身：宿主可能把未保存的行合并到我们写入的内容之后，
+          // 那份合并结果属于「本机改动」，下一轮按普通本机改动上传
+          // （`DECISIONS` 2026-09-23 第 9 点②）。
+          size: content.byteLength,
           eTag: queuedConflict.remote!.eTag,
         });
         this.state.cacheBaseContent(path, content);
         checkpoint.pendingConflictRemovals.push(path);
         return checkpoint;
       } catch (error) {
+        if (error instanceof LocalWriteNotLandedError) {
+          // 写入自己没落地（被截断或没写进去）：本机文件没有被这次操作改动，
+          // 不能说成「确认后本机文件又发生了变化」。回放失败/回读不可归属时
+          // 本机内容无法确认，换用如实的那一句。
+          this.notice("notice.conflict.failed", {
+            path,
+            reason: this.t(error.localStateUncertain
+              ? "notice.localWriteStateUncertain"
+              : "notice.localWriteNotLanded"),
+          });
+          throw new MutationNotAppliedError(error, true);
+        }
         if (error instanceof LocalCommitPreconditionError) {
           this.notice("notice.conflict.failed", {
             path,
@@ -22105,18 +22284,39 @@ export class SyncExecutor {
               targetMutationStarted = true;
               await this.scanner.vault.adapter.writeBinary(path, content);
             }
-            const stat = await this.scanner.vault.adapter.stat(path);
             const checkpoint = emptyMutationCheckpoint();
             checkpoint.baseUpserts.push({
               path,
               hash,
-              size: stat?.size ?? content.byteLength,
+              // 基线记云端版本本身（hash 与 size 必须自洽）：宿主可能把未保存的行合并到
+              // 我们写入的内容之后，那份合并结果属于「本机改动」，下一轮按普通本机改动上传
+              // （`DECISIONS` 2026-09-23 第 9 点②）。
+              size: content.byteLength,
               eTag: queuedConflict.remote!.eTag,
             });
             this.state.cacheBaseContent(path, content);
             checkpoint.pendingConflictRemovals.push(path);
             return checkpoint;
           } catch (error) {
+            if (error instanceof LocalWriteNotLandedError) {
+              // 写入自己没落地（被截断或没写进去）：本机文件没有被这次操作改动，
+              // 不能说成「确认后本机文件又发生了变化」。回放失败/回读不可归属时
+              // 本机内容无法确认，换用如实的那一句。
+              this.notice("notice.conflict.failed", {
+                path,
+                reason: this.t(error.localStateUncertain
+                  ? "notice.localWriteStateUncertain"
+                  : "notice.localWriteNotLanded"),
+              });
+              throw new MutationNotAppliedError(error, true);
+            }
+            if (error instanceof LocalCommitPreconditionError) {
+              this.notice("notice.conflict.failed", {
+                path,
+                reason: this.t("notice.localChangedSinceReview"),
+              });
+              throw new MutationNotAppliedError(error, true);
+            }
             if (error instanceof MutationNotAppliedError || targetMutationStarted) throw error;
             throw new MutationNotAppliedError(error);
           }

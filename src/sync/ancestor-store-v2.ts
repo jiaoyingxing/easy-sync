@@ -211,7 +211,8 @@ export class AncestorStoreV2 {
   }
 }
 
-function toStrictUtf8Bytes(content: string | ArrayBuffer): ArrayBuffer | null {
+/** Canonical strict-UTF-8 bytes, or null when the bytes are not canonical UTF-8. */
+export function toStrictUtf8Bytes(content: string | ArrayBuffer): ArrayBuffer | null {
   if (typeof content === "string") return new TextEncoder().encode(content).buffer;
   try {
     const text = new TextDecoder("utf-8", { fatal: true }).decode(content);

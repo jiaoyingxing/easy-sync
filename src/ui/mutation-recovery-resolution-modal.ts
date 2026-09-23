@@ -700,7 +700,7 @@ class BundleFileDiffModal extends EasySyncModal {
         : this.t("conflictDetail.diffTitle") +
           ` (${this.t("conflictDetail.diffRegionsLocated", { count: diff.parts.length })})`,
     });
-    renderDisplayDiff(body, diff, this.t);
+    renderDisplayDiff(body, diff);
     loadingEl.remove();
   }
 

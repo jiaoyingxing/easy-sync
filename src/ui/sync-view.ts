@@ -66,6 +66,8 @@ import {
 } from "./mutation-recovery-presentation";
 import { resolveSyncPendingAttentionCounts } from "./sync-result-presentation";
 import { parseCommunityPluginBundlePath } from "../sync/community-plugin-bundle";
+import type { ManualResolutionEntryReason } from "../sync/manual-resolution-entry";
+import { resolveManualResolutionNotice } from "./manual-resolution-presentation";
 import {
   resolveSyncActivityPresentation,
   translateSyncActivity,
@@ -90,6 +92,10 @@ interface StatusPanelState {
 }
 
 type SyncViewBodyMode = "plan" | "progress" | "pending" | "recovery" | "idle";
+
+/** 工具栏「全部展开／折叠」的会话级覆盖。它只由用户点击改变，跨正文重建与
+ *  计划修订保持；"default" 表示交回各区域自己的类别默认态。 */
+export type SyncViewSessionOverride = "default" | "expanded" | "collapsed";
 type SyncViewStatusDetailMode = "timestamp" | "current-file" | "recovery";
 
 export function resolveSyncViewStatusDetailMode(input: {
@@ -287,7 +293,7 @@ export interface SyncPendingDisplayRow {
 export function buildSyncPendingDisplayRows(input: Readonly<{
   adoptionRows: readonly CommunityPluginAdoptionRow[];
   failures: readonly PendingIssueReviewGroup[];
-  conflictEntries: readonly CommunityPluginConflictReviewEntry[];
+  conflictEntries: readonly BundleConflictReviewEntry[];
   pendingDeletes: readonly SyncPlanItem[];
   skipped: readonly PendingIssueReviewGroup[];
 }>): SyncPendingDisplayRow[] {
@@ -329,7 +335,7 @@ export function buildSyncPendingDisplayRows(input: Readonly<{
       });
     }
   }
-  if (input.pendingDeletes.length > 1) {
+  if (isBatchedDeleteSet(input.pendingDeletes.map((item) => `delete:${item.path}`))) {
     push({
       key: "batch-delete",
       kind: "batchDelete",
@@ -420,6 +426,29 @@ function pathExtractionHelps(
   const fullWidth = item.measureTextWidth(item.path);
   if (fullWidth <= item.availableWidth + 1) return false;
   return item.measureTextWidth(displayPath) + 1 < fullWidth;
+}
+
+/** 灰字目录放不下时的显示串：保尾巴而不是保头。头部省略号截断留住的是
+ *  各库相同的浅层根前缀，路径越深可见部分越无信息，灰字行退化成一条
+ *  「稍宽的空格」却仍占一行（用户 2026-09-24 报告的挤压/行距观感）。这里
+ *  反过来保住最深的层段——最区分位置的部分——以「…/」标记被截的头。
+ *  availableWidth 与 measureTextWidth 处于同一盒模型域（调用方用目录元素
+ *  的 clientWidth／scrollWidth），尾部连最深一段都放不下时原样返回，交给
+ *  CSS 头部省略号兜底。 */
+export function fitDirectoryTail(
+  directory: string,
+  availableWidth: number,
+  measureTextWidth: (text: string) => number,
+): string {
+  if (availableWidth <= 0 || directory.endsWith("…")) return directory;
+  if (measureTextWidth(directory) <= availableWidth) return directory;
+  const parts = directory.split("/").filter(Boolean);
+  if (parts.length === 0) return directory;
+  for (let from = 1; from < parts.length; from++) {
+    const candidate = `…/${parts.slice(from).join("/")}/`;
+    if (measureTextWidth(candidate) <= availableWidth) return candidate;
+  }
+  return directory;
 }
 
 /**
@@ -554,7 +583,6 @@ export function diffCompletedFileRows(
 export interface SyncPlanDisplayGroup {
   group: SyncActionGroup;
   labelKey: keyof LocaleStrings;
-  open: boolean;
   items: PlanReviewItem[];
 }
 
@@ -654,17 +682,18 @@ export interface SyncPlanDisplayRow {
   /** Stable identity for the mounted row; also the key for its open state. */
   key: string;
   item: PlanReviewItem;
-  /** Community plugin bundle this conflict row stands for, when it does. */
+  /** Plugin bundle this conflict row stands for: a community plugin, or
+   *  EasySync's own three files, when it does. */
   pluginConflict: { pluginId: string; items: SyncPlanItem[] } | null;
 }
 
 /**
  * Resolve a group's plan items into the DOM rows they actually produce. One
- * community plugin conflict renders a single row for the whole bundle — the
- * first member in plan order wins — and an item whose conflict or delete
- * detail is missing degrades to a plain row. Deriving the rows from the whole
- * group keeps that choice independent of which items the current scroll
- * window happens to contain.
+ * bundle conflict renders a single row for the whole bundle (a community
+ * plugin, or EasySync's own files) — the first member in plan order wins —
+ * and an item whose conflict or delete detail is missing degrades to a plain
+ * row. Deriving the rows from the whole group keeps that choice independent
+ * of which items the current scroll window happens to contain.
  */
 export function buildSyncPlanDisplayRows(
   items: readonly PlanReviewItem[],
@@ -700,6 +729,39 @@ export function buildSyncPlanDisplayRows(
   return rows;
 }
 
+/** 决策行＝折叠里藏着该条目唯一出口的行（冲突、插件捆绑冲突、插件待决策、
+ *  待确认删除）；只读行（问题、跳过、普通计划行）的出口在顶部主动作或自动
+ *  轮次，不靠行内展开。key 前缀就是行身份族，见两处 build*DisplayRows。 */
+export function isDecisionRowKey(key: string): boolean {
+  return key.startsWith("conflict:")
+    || key.startsWith("delete:")
+    || key.startsWith("plugin:")
+    || key.startsWith("adoption:");
+}
+
+/** 成批的待确认删除：同一区域会出现两条及以上逐条删除行——与界面给出批量
+ *  删除入口的同一条件。成批时该区域的出口是批量入口，逐条行不再默认展开。 */
+export function isBatchedDeleteSet(keys: readonly string[]): boolean {
+  let count = 0;
+  for (const key of keys) {
+    if (!key.startsWith("delete:")) continue;
+    count += 1;
+    if (count > 1) return true;
+  }
+  return false;
+}
+
+/** 决策行的类别默认态：决策行默认展开，出口第一眼可见；成批出现的待确认
+ *  删除默认收起。只读行不在此列（它们没有行身份，也不会被写成展开态）。 */
+export function resolveDecisionRowDefaultOpen(
+  key: string,
+  options: { deleteRowsBatched?: boolean } = {},
+): boolean {
+  if (!isDecisionRowKey(key)) return false;
+  if (key.startsWith("delete:")) return options.deleteRowsBatched !== true;
+  return true;
+}
+
 /** Offsets for rows whose height is not uniform (a decision row grows when its
  *  body is expanded), so every slot has to carry its own measured height. */
 export function buildSyncPlanMeasuredVirtualOffsets(
@@ -727,7 +789,6 @@ export function buildSyncPlanDisplayGroups(
       group: presentation.group,
       labelKey: presentation.groupLabelKey,
       order: presentation.groupOrder,
-      open: false,
       items: [item],
     });
   }
@@ -889,39 +950,41 @@ export function formatPendingIssueChipLabel(
   return t("syncView.fileStatus.error");
 }
 
-export type CommunityPluginConflictReviewEntry =
+export type BundleConflictReviewEntry =
   | { kind: "file"; item: SyncPlanItem }
   | {
-      kind: "community-plugin-bundle";
+      kind: "bundle";
       pluginId: string;
       items: SyncPlanItem[];
     };
 
-/** Preserve first-seen order while presenting one decision per plugin bundle. */
-export function groupCommunityPluginConflictReviews(
+/** Preserve first-seen order while presenting one row per bundle: one for a
+ *  community plugin, and one for EasySync's own three bundle files (which
+ *  would otherwise show up as bare config paths the user cannot place). */
+export function groupBundleConflictReviews(
   conflicts: readonly SyncPlanItem[],
   configDir: string,
-): CommunityPluginConflictReviewEntry[] {
+): BundleConflictReviewEntry[] {
   const pluginItems = new Map<string, SyncPlanItem[]>();
   for (const item of conflicts) {
     const parsed = parseCommunityPluginBundlePath(item.path, configDir);
-    if (!parsed || parsed.pluginId === "easy-sync") continue;
+    if (!parsed) continue;
     const items = pluginItems.get(parsed.pluginId) ?? [];
     items.push(item);
     pluginItems.set(parsed.pluginId, items);
   }
   const emitted = new Set<string>();
-  const result: CommunityPluginConflictReviewEntry[] = [];
+  const result: BundleConflictReviewEntry[] = [];
   for (const item of conflicts) {
     const parsed = parseCommunityPluginBundlePath(item.path, configDir);
-    if (!parsed || parsed.pluginId === "easy-sync") {
+    if (!parsed) {
       result.push({ kind: "file", item });
       continue;
     }
     if (emitted.has(parsed.pluginId)) continue;
     emitted.add(parsed.pluginId);
     result.push({
-      kind: "community-plugin-bundle",
+      kind: "bundle",
       pluginId: parsed.pluginId,
       items: pluginItems.get(parsed.pluginId) ?? [item],
     });
@@ -1052,9 +1115,10 @@ export function shouldExpandAllVisibleDetails(
 export class EasySyncSyncView extends ItemView {
   plugin: EasySyncPlugin;
   private historyExpanded = false;
-  private allCollapsed = false;
-  private planGroupsCollapsed = true;
-  private planExpandedGroups = new Set<SyncActionGroup>();
+  private sessionOverride: SyncViewSessionOverride = "default";
+  // 组级手势与行级同族：记录用户对单个分组的显式开合（默认展开的分组也必须
+  // 记住用户收起过它，否则正文重建会让它弹开）。
+  private planGroupExpandedState = new Map<SyncActionGroup, boolean>();
   private collapseToggleButtonEl: HTMLButtonElement | null = null;
   private renderedBodyMode: SyncViewBodyMode = "idle";
   private renderedPlanReviewRevision = -1;
@@ -1077,6 +1141,10 @@ export class EasySyncSyncView extends ItemView {
   private planRowHeights = new Map<string, number>();
   private planRowLayoutRevision = 0;
   private planDecisionRowsInFlight = new Set<string>();
+  // 当前正文区域是否含成批的待确认删除（决定逐条删除行的类别默认态）。
+  // 区域渲染时写下，正文整体重建后回填展开态时读回；正文没有决策行时该值
+  // 不产生作用。
+  private renderedDeleteRowsBatched = false;
   private pathLayoutObserver: ResizeObserver | null = null;
   private pathLayoutObservedWidth = -1;
   private statusLineEl: HTMLElement | null = null;
@@ -1314,8 +1382,9 @@ export class EasySyncSyncView extends ItemView {
       : null;
     if (bodyMode === "plan" && syncState) {
       if (this.renderedPlanReviewRevision !== syncState.planReviewRevision) {
-        this.planGroupsCollapsed = true;
-        this.planExpandedGroups.clear();
+        // 会话级覆盖有意不在这里重置：用户点过「全部展开／折叠」之后，新计划
+        // 里新出现的条目服从该覆盖（否则每轮新计划都把用户的明确选择抹掉）。
+        this.planGroupExpandedState.clear();
         // Row identities belong to one plan revision: a path can change action
         // type between revisions, so carrying its open state over would restore
         // it on a row that no longer means the same thing.
@@ -1414,6 +1483,21 @@ export class EasySyncSyncView extends ItemView {
       this.renderToolbar(container);
       this.renderStatusPanel(container, statusState);
       const content = container.createDiv("easy-sync-view-content");
+
+      // While a round runs, a borrowed body (plan review / pending rows /
+      // recovery) keeps its rows and their click-in contract, but the round
+      // bar still holds its original body-top spot under the status divider.
+      // The progress body paints the same bar itself (renderProgressPanel).
+      const progressPanelShown = bodyMode === "progress"
+        || (bodyMode === "pending" && sideActionResultsVisible);
+      if (!progressPanelShown && isRunning) {
+        const bar = content.createDiv("easy-sync-progress-bar");
+        this.progressFillEl = bar.createDiv("easy-sync-progress-fill");
+        this.progressFillEl.style.width = `${
+          remoteScopeRecoveryPercent(progress)
+          ?? syncViewProgressPercent(progress)
+        }%`;
+      }
 
       if (bodyMode === "plan" && syncState) {
         this.renderPlanReviewSection(
@@ -1581,6 +1665,14 @@ export class EasySyncSyncView extends ItemView {
           "--easy-sync-path-directory-indent",
           `${indent}px`,
         );
+        directory.setText(fitDirectoryTail(
+          decision.directory,
+          directory.clientWidth,
+          (text) => {
+            directory.setText(text);
+            return directory.scrollWidth;
+          },
+        ));
       }
     }
   }
@@ -1797,21 +1889,17 @@ export class EasySyncSyncView extends ItemView {
 
     this.collapseToggleButtonEl = this.createIconButton(container, icon, label, () => {
       const expand = this.shouldExpandAllDetails();
-      if (this.renderedBodyMode === "plan") {
-        this.planGroupsCollapsed = !expand;
-        this.planExpandedGroups.clear();
-      } else {
-        this.allCollapsed = !expand;
-      }
+      // 一次用户动作同时覆盖计划面与待处理面：两处共用同一份会话级覆盖，
+      // 新出现的可展开项（含下一轮新计划）都服从它。
+      this.sessionOverride = expand ? "expanded" : "collapsed";
+      this.planGroupExpandedState.clear();
       this.toggleAllDetails();
       this.updateCollapseTogglePresentation();
     });
   }
 
-  private isCollapseOverrideActive(): boolean {
-    return this.renderedBodyMode === "plan"
-      ? this.planGroupsCollapsed
-      : this.allCollapsed;
+  private isSessionCollapsed(): boolean {
+    return this.sessionOverride === "collapsed";
   }
 
   private shouldExpandAllDetails(): boolean {
@@ -1820,7 +1908,9 @@ export class EasySyncSyncView extends ItemView {
         ".easy-sync-tree-item",
       ),
     ];
-    if (details.length === 0) return this.isCollapseOverrideActive();
+    // 还没有可展开项可读时按会话覆盖回答：默认态与折叠态下「全部展开」才是
+    // 用户的下一步动作，只有显式展开过才轮到「全部折叠」。
+    if (details.length === 0) return this.sessionOverride !== "expanded";
     return shouldExpandAllVisibleDetails(details.map((detail) => detail.open));
   }
 
@@ -1837,9 +1927,17 @@ export class EasySyncSyncView extends ItemView {
   }
 
   private toggleAllDetails(): void {
+    // 默认态下不在这里铺开或收起任何东西：每个区域按自己的类别默认渲染
+    // （含决策项的分组与决策行展开、只读项折叠）。只有用户显式点过工具栏
+    // 之后，才由这一份会话级覆盖统一压过类别默认。
+    if (this.sessionOverride === "default") return;
     const details = this.contentEl.querySelectorAll<HTMLDetailsElement>(".easy-sync-tree-item");
-    if (this.isCollapseOverrideActive()) {
-      const expandedPlanGroups = new Set(this.planExpandedGroups);
+    if (this.isSessionCollapsed()) {
+      const expandedPlanGroups = new Set(
+        [...this.planGroupExpandedState]
+          .filter(([, open]) => open)
+          .map(([group]) => group),
+      );
       for (const d of details) d.removeAttribute("open");
       if (this.renderedBodyMode === "plan") {
         for (const d of details) {
@@ -1850,6 +1948,14 @@ export class EasySyncSyncView extends ItemView {
     } else {
       for (const d of details) d.setAttribute("open", "");
     }
+    // 程序化批量开合改变了每行的真实高度，但窗口化列表的高度模型不知道：
+    // 行内量高缓存与偏移估算仍按旧的开合态记账，挂载窗口会按旧容器高度
+    // 原地长高溢出，把更新提示行与历史区盖在下面。行级手势走
+    // rememberPlanRowExpansion，正文重建路径结尾也有同一组收尾；这里补齐
+    // 第三个程序化写入口，三个入口对齐同一新鲜度规则。
+    this.planRowHeights.clear();
+    this.planRowLayoutRevision += 1;
+    this.schedulePlanViewportRender();
   }
 
   private createIconButton(
@@ -2363,6 +2469,27 @@ export class EasySyncSyncView extends ItemView {
     }
   }
 
+  /** 流内窗口壳（方案单 20260924-0001）：上占位、流内窗口、下占位。窗口
+   *  参与文档流，行内容只会把下占位连同下方区域一起推开——溢出叠压在构
+   *  造上不可能；估算误差降级为滚动长度短暂不准，由量实高收敛机制自纠。
+   *  空窗口返回 null，但上下占位照常挂载，滚动长度不塌。 */
+  private mountPlanFlowWindow(
+    virtualList: HTMLElement,
+    windowState: { start: number; end: number; offset: number },
+    offsets: readonly number[],
+  ): HTMLElement | null {
+    const totalHeight = offsets[offsets.length - 1] ?? 0;
+    const endOffset = offsets[windowState.end] ?? totalHeight;
+    const topSpacer = virtualList.createDiv("easy-sync-plan-virtual-spacer");
+    topSpacer.style.height = `${Math.max(0, windowState.offset)}px`;
+    const visible = windowState.end <= windowState.start
+      ? null
+      : virtualList.createDiv("easy-sync-plan-virtual-window");
+    const bottomSpacer = virtualList.createDiv("easy-sync-plan-virtual-spacer");
+    bottomSpacer.style.height = `${Math.max(0, totalHeight - endOffset)}px`;
+    return visible;
+  }
+
   private renderPendingSection(
     container: HTMLElement,
     issueGroups: readonly PendingIssueReviewGroup[],
@@ -2386,7 +2513,7 @@ export class EasySyncSyncView extends ItemView {
     const rows = buildSyncPendingDisplayRows({
       adoptionRows,
       failures,
-      conflictEntries: groupCommunityPluginConflictReviews(
+      conflictEntries: groupBundleConflictReviews(
         conflicts,
         getConfigDir(this.plugin.app.vault),
       ),
@@ -2402,6 +2529,9 @@ export class EasySyncSyncView extends ItemView {
     let offsetsRevision = -1;
     let renderedKey = "";
     let renderDepth = 0;
+    // 成批的待确认删除（≥2 条，与批量删除入口同一条件）逐条默认收起。
+    const deleteRowsBatched = isBatchedDeleteSet(rows.map((row) => row.key));
+    this.renderedDeleteRowsBatched = deleteRowsBatched;
 
     const resolveOffsets = (): number[] => {
       if (virtualOffsets && offsetsRevision === this.planRowLayoutRevision) {
@@ -2411,13 +2541,11 @@ export class EasySyncSyncView extends ItemView {
       virtualOffsets = buildSyncPlanMeasuredVirtualOffsets(
         rows.map((row) =>
           this.planRowHeights.get(row.key)
-          ?? (this.planRowExpanded(row.key)
+          ?? (this.resolvePlanRowOpen(row.key, deleteRowsBatched)
             ? probe.expandedRowHeight
             : probe.collapsedRowHeight)),
       );
       offsetsRevision = this.planRowLayoutRevision;
-      virtualList.style.height =
-        `${virtualOffsets[virtualOffsets.length - 1] ?? 0}px`;
       return virtualOffsets;
     };
 
@@ -2438,18 +2566,27 @@ export class EasySyncSyncView extends ItemView {
       });
       const nextKey =
         `${windowState.start}:${windowState.end}:${windowState.offset}`;
-      if (nextKey === renderedKey) return;
+      // 行高缓存被清空后，占位与槽位会退回探针估算；窗口键未变时早退会
+      // 把这套估算冻结住（流内窗口下表现为滚动长度与行位不准）。键未变
+      // 也要重挂量一次实高——本窗口每行都有实测高度后才允许提前返回。
+      const mountedMeasured = rows
+        .slice(windowState.start, windowState.end)
+        .every((row) => this.planRowHeights.has(row.key));
+      if (nextKey === renderedKey && mountedMeasured) return;
       renderedKey = nextKey;
       virtualList.empty();
-      if (windowState.end <= windowState.start) return;
-      const visible = virtualList.createDiv("easy-sync-plan-virtual-window");
-      visible.style.transform = `translateY(${windowState.offset}px)`;
+      const visible = this.mountPlanFlowWindow(
+        virtualList,
+        windowState,
+        offsets,
+      );
+      if (!visible) return;
       for (let index = windowState.start; index < windowState.end; index++) {
         this.renderPendingRow(visible, rows[index]);
       }
       // Restore the per-row open state before measuring: a row remounted by a
       // window shift has to answer to the same rule as its first mount.
-      this.applyPlanRowExpansionIn(visible);
+      this.applyPlanRowExpansionIn(visible, deleteRowsBatched);
       if (this.rememberPlanRowHeights(visible) && renderDepth === 0) {
         renderDepth += 1;
         virtualOffsets = null;
@@ -2492,10 +2629,9 @@ export class EasySyncSyncView extends ItemView {
         return;
       case "pluginConflict":
         if (row.pluginConflict) {
-          this.renderCommunityPluginConflictItem(
+          this.renderBundleConflictItem(
             container,
-            row.pluginConflict.pluginId,
-            row.pluginConflict.items.length,
+            row.pluginConflict,
             row.key,
           );
         }
@@ -2750,6 +2886,37 @@ export class EasySyncSyncView extends ItemView {
     this.resolutionRowLocks.delete(key);
   }
 
+  /**
+   * Report why one manual resolution chip did not open. The entry knows the
+   * cause; this keeps the caller's own facts-level wording for real changes
+   * and stops the entry gates (a running sync, another action, unfinished
+   * state work) from being reported as "the facts changed".
+   */
+  private notifyResolutionEntryUnavailable(
+    entry: {
+      reason: ManualResolutionEntryReason;
+      nameMismatchPath?: string;
+    },
+    path: string,
+    factsChangedKey: string,
+    nameMismatchKey?: string,
+  ): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const notice = resolveManualResolutionNotice(entry.reason);
+    if (notice.kind === "entry") {
+      new Notice(t(notice.key));
+      return;
+    }
+    if (notice.kind === "name-mismatch" && nameMismatchKey) {
+      new Notice(t(nameMismatchKey, {
+        path,
+        namePath: entry.nameMismatchPath ?? path,
+      }));
+      return;
+    }
+    new Notice(t(factsChangedKey, { path }));
+  }
+
   private async openStaleIdentityResolution(path: string): Promise<void> {
     if (this.staleIdentityResolutionOpening) return;
     const rowKey = `stale:${path}`;
@@ -2757,12 +2924,17 @@ export class EasySyncSyncView extends ItemView {
     this.staleIdentityResolutionOpening = true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     try {
-      const snapshot =
+      const entry =
         await this.plugin.getStaleIdentityResolutionSnapshot(path);
-      if (!snapshot) {
-        new Notice(t("notice.staleIdentity.changed", { path }));
+      if (!entry.snapshot) {
+        this.notifyResolutionEntryUnavailable(
+          entry,
+          path,
+          "notice.staleIdentity.changed",
+        );
         return;
       }
+      const snapshot = entry.snapshot;
       const confirmed = await new ConfirmModal(
         this.plugin.app,
         t("syncView.staleIdentity.confirmTitle"),
@@ -2800,12 +2972,18 @@ export class EasySyncSyncView extends ItemView {
     this.sharedFolderIdentityResolutionOpening = true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     try {
-      const snapshot =
+      const entry =
         await this.plugin.getSharedFolderIdentityResolutionSnapshot(path);
-      if (!snapshot) {
-        new Notice(t("notice.sharedFolderIdentity.changed", { path }));
+      if (!entry.snapshot) {
+        this.notifyResolutionEntryUnavailable(
+          entry,
+          path,
+          "notice.sharedFolderIdentity.changed",
+          "notice.sharedFolderIdentity.nameMismatch",
+        );
         return;
       }
+      const snapshot = entry.snapshot;
       const confirmed = await new ConfirmModal(
         this.plugin.app,
         t("syncView.sharedFolderIdentity.confirmTitle"),
@@ -2973,12 +3151,17 @@ export class EasySyncSyncView extends ItemView {
     this.scopeCrossingResolutionOpening = true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     try {
-      const snapshot =
+      const entry =
         await this.plugin.getScopeCrossingResolutionSnapshot(path);
-      if (!snapshot) {
-        new Notice(t("notice.scopeCrossing.changed", { path }));
+      if (!entry.snapshot) {
+        this.notifyResolutionEntryUnavailable(
+          entry,
+          path,
+          "notice.scopeCrossing.changed",
+        );
         return;
       }
+      const snapshot = entry.snapshot;
       const confirmed = await new ConfirmModal(
         this.plugin.app,
         t("syncView.scopeCrossing.restoreTitle"),
@@ -3011,12 +3194,17 @@ export class EasySyncSyncView extends ItemView {
     this.scopeCrossingResolutionOpening = true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     try {
-      const snapshot =
+      const entry =
         await this.plugin.getScopeCrossingResolutionSnapshot(path);
-      if (!snapshot) {
-        new Notice(t("notice.scopeCrossing.changed", { path }));
+      if (!entry.snapshot) {
+        this.notifyResolutionEntryUnavailable(
+          entry,
+          path,
+          "notice.scopeCrossing.changed",
+        );
         return;
       }
+      const snapshot = entry.snapshot;
       const confirmed = await new ConfirmModal(
         this.plugin.app,
         t("syncView.scopeCrossing.confirmTitle"),
@@ -3384,30 +3572,45 @@ export class EasySyncSyncView extends ItemView {
       pluginId: string;
       items: SyncPlanItem[];
     }>();
-    for (const entry of groupCommunityPluginConflictReviews(
+    for (const entry of groupBundleConflictReviews(
       conflicts,
       getConfigDir(this.plugin.app.vault),
     )) {
-      if (entry.kind !== "community-plugin-bundle") continue;
+      if (entry.kind !== "bundle") continue;
       for (const item of entry.items) pluginConflictByPath.set(item.path, entry);
     }
     const groups = buildSyncPlanDisplayGroups(items);
+    // 成批的待确认删除按区域判定（与待处理区批量删除入口同一条件）：它们默认
+    // 收起，出口是那一组行本身或批量入口，不是每行的展开区。
+    const deleteRowsBatched = isBatchedDeleteSet(
+      items
+        .filter((item) => item.type === SyncActionType.ConfirmLocalDelete
+          && deleteByPath.has(item.path))
+        .map((item) => `delete:${item.path}`),
+    );
+    this.renderedDeleteRowsBatched = deleteRowsBatched;
 
     for (const group of groups) {
-      const open = !this.planGroupsCollapsed
-        || this.planExpandedGroups.has(group.group);
+      const rows = buildSyncPlanDisplayRows(
+        group.items,
+        conflictByPath,
+        deleteByPath,
+        pluginConflictByPath,
+      );
       const body = this.createTreeGroup(
         container,
         t(group.labelKey),
         group.items.length,
-        open,
+        this.resolvePlanGroupOpen(
+          group.group,
+          rows.some((row) => isDecisionRowKey(row.key)),
+        ),
       );
       body.addClass("easy-sync-path-layout");
       const details = body.parentElement as HTMLDetailsElement;
       details.dataset.easySyncPlanGroup = group.group;
       details.addEventListener("toggle", () => {
-        if (details.open) this.planExpandedGroups.add(group.group);
-        else this.planExpandedGroups.delete(group.group);
+        this.planGroupExpandedState.set(group.group, details.open);
       });
       // Conflict and delete rows carry their own buttons, so they have to be
       // mounted to be used — and one expanded row is worth several plain ones.
@@ -3416,12 +3619,6 @@ export class EasySyncSyncView extends ItemView {
       const hasInlineDecisions = group.items.some((item) =>
         item.type === SyncActionType.Conflict
         || item.type === SyncActionType.ConfirmLocalDelete);
-      const rows = buildSyncPlanDisplayRows(
-        group.items,
-        conflictByPath,
-        deleteByPath,
-        pluginConflictByPath,
-      );
 
       const virtualList = body.createDiv("easy-sync-plan-virtual-list");
       let virtualOffsets: number[] | null = null;
@@ -3438,7 +3635,7 @@ export class EasySyncSyncView extends ItemView {
           virtualOffsets = buildSyncPlanMeasuredVirtualOffsets(
             rows.map((row) =>
               this.planRowHeights.get(row.key)
-              ?? (this.planRowExpanded(row.key)
+              ?? (this.resolvePlanRowOpen(row.key, deleteRowsBatched)
                 ? probe.expandedRowHeight
                 : probe.collapsedRowHeight)),
           );
@@ -3451,8 +3648,6 @@ export class EasySyncSyncView extends ItemView {
           );
         }
         offsetsRevision = this.planRowLayoutRevision;
-        virtualList.style.height =
-          `${virtualOffsets[virtualOffsets.length - 1] ?? 0}px`;
         return virtualOffsets;
       };
 
@@ -3483,12 +3678,22 @@ export class EasySyncSyncView extends ItemView {
         });
         const nextKey =
           `${windowState.start}:${windowState.end}:${windowState.offset}`;
-        if (nextKey === renderedKey) return;
+        // 与待处理窗口同一规则：行高缓存被清空后窗口键可能不变，早退会把
+        // 占位与槽位冻结在估算值上。键未变也要重挂量一次实高。只读组不用
+        // 行高缓存（两档探针高度即模型本身），保持原早退。
+        const mountedMeasured = !hasInlineDecisions
+          || rows
+            .slice(windowState.start, windowState.end)
+            .every((row) => this.planRowHeights.has(row.key));
+        if (nextKey === renderedKey && mountedMeasured) return;
         renderedKey = nextKey;
         virtualList.empty();
-        if (windowState.end <= windowState.start) return;
-        const visible = virtualList.createDiv("easy-sync-plan-virtual-window");
-        visible.style.transform = `translateY(${windowState.offset}px)`;
+        const visible = this.mountPlanFlowWindow(
+          virtualList,
+          windowState,
+          offsets,
+        );
+        if (!visible) return;
         for (let index = windowState.start; index < windowState.end; index++) {
           this.renderPlanReviewRow(
             visible,
@@ -3499,7 +3704,7 @@ export class EasySyncSyncView extends ItemView {
         }
         // Restore the per-row open state before measuring: a row remounted by a
         // window shift has to answer to the same rule as its first mount.
-        this.applyPlanRowExpansionIn(visible);
+        this.applyPlanRowExpansionIn(visible, deleteRowsBatched);
         if (hasInlineDecisions && this.rememberPlanRowHeights(visible) && renderDepth === 0) {
           // The estimates only place the first window; as soon as the real
           // heights are known the window has to be resolved against them.
@@ -3581,15 +3786,32 @@ export class EasySyncSyncView extends ItemView {
     };
   }
 
-  /** Whether a decision row is expected to be open: what the user last chose,
-   *  or the group-level expand-all default when they never touched it. */
-  private planRowExpanded(rowKey: string): boolean {
-    return this.planRowExpandedState.get(rowKey) ?? !this.planGroupsCollapsed;
+  /** 分组头的默认态：含决策项的分组默认展开（决策出口不该藏在两层折叠后
+   *  面），纯只读分组默认折叠；用户手势与会话级覆盖都在此之上。 */
+  private resolvePlanGroupOpen(
+    group: SyncActionGroup,
+    hasDecisionRows: boolean,
+  ): boolean {
+    const remembered = this.planGroupExpandedState.get(group);
+    if (remembered !== undefined) return remembered;
+    if (this.sessionOverride === "expanded") return true;
+    if (this.sessionOverride === "collapsed") return false;
+    return hasDecisionRows;
+  }
+
+  /** 决策行开合的解析顺序：行级手势 > 会话级覆盖 > 类别默认。key 是行身份；
+   *  类别默认里唯一依赖区域事实的是成批的待确认删除。 */
+  private resolvePlanRowOpen(rowKey: string, deleteRowsBatched: boolean): boolean {
+    const remembered = this.planRowExpandedState.get(rowKey);
+    if (remembered !== undefined) return remembered;
+    if (this.sessionOverride === "expanded") return true;
+    if (this.sessionOverride === "collapsed") return false;
+    return resolveDecisionRowDefaultOpen(rowKey, { deleteRowsBatched });
   }
 
   /** Re-apply the remembered open state to every mounted decision row. */
   private applyPlanRowExpansion(): void {
-    this.applyPlanRowExpansionIn(this.contentEl);
+    this.applyPlanRowExpansionIn(this.contentEl, this.renderedDeleteRowsBatched);
   }
 
   /**
@@ -3598,12 +3820,15 @@ export class EasySyncSyncView extends ItemView {
    * a scrolled-in row comes back collapsed while the offset model still holds
    * its expanded height.
    */
-  private applyPlanRowExpansionIn(root: ParentNode): void {
+  private applyPlanRowExpansionIn(
+    root: ParentNode,
+    deleteRowsBatched: boolean,
+  ): void {
     const rows = root.querySelectorAll<HTMLElement>("[data-easy-sync-plan-row]");
     for (const row of Array.from(rows)) {
       const key = row.dataset.easySyncPlanRow;
       if (!key || !row.instanceOf(HTMLDetailsElement)) continue;
-      row.open = this.planRowExpanded(key);
+      row.open = this.resolvePlanRowOpen(key, deleteRowsBatched);
     }
   }
 
@@ -3662,12 +3887,7 @@ export class EasySyncSyncView extends ItemView {
   ): void {
     const { item, pluginConflict } = row;
     if (pluginConflict) {
-      this.renderCommunityPluginConflictItem(
-        container,
-        pluginConflict.pluginId,
-        pluginConflict.items.length,
-        row.key,
-      );
+      this.renderBundleConflictItem(container, pluginConflict, row.key);
       return;
     }
     if (item.type === SyncActionType.Conflict && conflictByPath.has(item.path)) {
@@ -3741,34 +3961,51 @@ export class EasySyncSyncView extends ItemView {
     });
   }
 
-  private renderCommunityPluginConflictItem(
+  private renderBundleConflictItem(
     container: HTMLElement,
-    pluginId: string,
-    memberCount: number,
+    bundle: { pluginId: string; items: readonly SyncPlanItem[] },
     rowKey?: string,
   ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    // EasySync's own three files reuse this one-row shape so the user sees
+    // what the config paths are, but without the bundle review modal: that
+    // chain is community-plugin owned and refuses this plugin's directory.
+    // The members keep their existing per-file choices underneath.
+    const ownBundle = bundle.pluginId === "easy-sync";
     const details = container.createEl("details", "easy-sync-tree-item");
     if (rowKey) details.dataset.easySyncPlanRow = rowKey;
     const summary = details.createEl("summary", "easy-sync-tree-row");
     this.addCollapseIcon(summary);
     const icon = summary.createSpan("easy-sync-tree-status-icon");
     setIcon(icon, "blocks");
-    summary.createSpan("easy-sync-tree-path").setText(pluginId);
+    summary.createSpan("easy-sync-tree-path").setText(
+      ownBundle ? t("syncView.selfBundleReview.title") : bundle.pluginId,
+    );
     summary.createSpan("easy-sync-tree-chip").setText(
       t("syncView.fileStatus.conflict"),
     );
     const body = details.createDiv("easy-sync-tree-item-body");
     body.createDiv("easy-sync-item-reason").setText(
-      t("syncView.pluginBundleReview.conflictSummary", { count: memberCount }),
+      t(
+        ownBundle
+          ? "syncView.selfBundleReview.conflictSummary"
+          : "syncView.pluginBundleReview.conflictSummary",
+        { count: bundle.items.length },
+      ),
     );
+    if (ownBundle) {
+      for (const item of bundle.items) {
+        this.renderConflictItem(body, item, `conflict:${item.path}`);
+      }
+      return;
+    }
     const actions = body.createDiv("easy-sync-item-actions");
     this.createActionChip(
       actions,
       t("syncView.pluginBundleReview.open"),
       "accent",
       () => {
-        void this.openCommunityPluginBundleReview(pluginId);
+        void this.openCommunityPluginBundleReview(bundle.pluginId);
       },
     );
   }

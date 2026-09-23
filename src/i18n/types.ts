@@ -94,6 +94,7 @@ export interface LocaleStrings {
   "settings.autoSync.name": string;
   "settings.autoSync.open": string;
   "settings.autoSync.title": string;
+  "settings.autoSync.intro": string;
   "settings.autoSync.desc.disabled": string;
   "settings.autoSync.desc.enabled": string;
   "settings.autoSync.desc.paused": string;
@@ -111,6 +112,7 @@ export interface LocaleStrings {
   "settings.syncScope.desc": string;
   "settings.syncScope.button": string;
   "settings.syncScope.title": string;
+  "settings.syncScope.intro": string;
   "settings.syncExclusion.name": string;
   "settings.syncExclusion.desc": string;
   "settings.syncExclusion.button": string;
@@ -121,8 +123,6 @@ export interface LocaleStrings {
   "settings.syncExclusion.empty": string;
   "settings.syncExclusion.removeFolder": string;
   "settings.syncExclusion.pickerPlaceholder": string;
-  "settings.syncPluginFiles.name": string;
-  "settings.syncPluginFiles.desc": string;
   "settings.syncEditor.name": string;
   "settings.syncEditor.desc": string;
   "settings.syncAppearance.name": string;
@@ -346,6 +346,8 @@ export interface LocaleStrings {
   "syncView.pluginBundleReview.loadUnavailable": string;
   "syncView.pluginBundleReview.conflictSummary": string;
   "syncView.pluginBundleReview.open": string;
+  "syncView.selfBundleReview.title": string;
+  "syncView.selfBundleReview.conflictSummary": string;
   "syncView.adoption.download": string;
   "syncView.adoption.skip": string;
   "syncView.adoption.desktopOnly": string;
@@ -443,6 +445,7 @@ export interface LocaleStrings {
   "notice.folderLocation.accepted": string;
   "notice.folderLocation.failed": string;
   "notice.sharedFolderIdentity.changed": string;
+  "notice.sharedFolderIdentity.nameMismatch": string;
   "notice.sharedFolderIdentity.accepted": string;
   "notice.sharedFolderIdentity.failed": string;
   "notice.staleIdentity.changed": string;
@@ -559,10 +562,13 @@ export interface LocaleStrings {
   "notice.conflict.downloadFailed": string;
   "notice.conflict.identical": string;
   "notice.localChangedSinceReview": string;
+  "notice.localWriteNotLanded": string;
+  "notice.localWriteStateUncertain": string;
   "notice.localRecoveryFailed": string;
   "notice.sideActionRemotePrepareFailed": string;
   "notice.sideActionScopeChanged": string;
   "notice.sideActionMutationRecoveryFailed": string;
+  "notice.sideActionPendingWork": string;
   "notice.configSyncDisabled": string;
   "notice.configSnapshotInvalid": string;
   "notice.decisionExpired": string;
@@ -600,11 +606,6 @@ export interface LocaleStrings {
   "conflictDetail.loadUnavailable": string;
   "conflictDetail.binaryFile": string;
   "conflictDetail.diffRegionsLocated": string;
-  "conflictDetail.diffChangeBudget": string;
-  "conflictDetail.diffAlignmentLimit": string;
-  "conflictDetail.diffDisplayBudget": string;
-  "conflictDetail.diffRegionRange": string;
-  "conflictDetail.diffOmitted": string;
   "conflictDetail.textDiffByteLimit": string;
   "conflictDetail.previewTruncated": string;
   "conflictDetail.identical": string;
@@ -772,6 +773,8 @@ export interface LocaleStrings {
   "error.present.file.mutationAlreadyPending": string;
   "error.present.file.recoverySourceMissing": string;
   "error.present.file.recoveryVerifyFailed": string;
+  "error.present.file.alignmentReadback": string;
+  "error.present.file.localFileDisappeared": string;
   "error.present.file.catalogFieldInvalid": string;
   "error.present.file.catalogScopeInvalid": string;
   "error.present.file.catalogItemAnotherDrive": string;

@@ -16,7 +16,7 @@ export class AutomaticHandlingModal extends EasySyncModal {
 
     contentEl.createEl("p", {
       text: t("settings.automaticHandling.intro"),
-      cls: "setting-item-description",
+      cls: "setting-item-description easy-sync-modal-intro",
     });
 
     new Setting(contentEl)

@@ -73,6 +73,7 @@ import type {
   FolderLocationResolutionSnapshotV1,
   FolderSubtreeReviewSnapshotV1,
 } from "./sync/empty-folder-resolution";
+import type { ManualResolutionEntrySnapshot } from "./sync/manual-resolution-entry";
 import type {
   SharedFolderIdentityResolutionSnapshotV1,
 } from "./sync/shared-folder-identity-resolution";
@@ -163,6 +164,8 @@ import { sha256Hex } from "./crypto";
 import {
   buildConflictEvidence,
   computeChangedPluginDataKeys,
+  type DiagnosticResetFacts,
+  extractPreResetReportCore,
   findLatestAutomaticHandlingSummary,
   findLatestNetworkSummary,
   findLatestPhaseSummary,
@@ -172,7 +175,10 @@ import {
   formatDiagnosticAutomaticSyncSummary,
   formatRecentPluginDataWrites,
   formatV2StorageAuthorityEvidence,
+  parseDiagnosticResetFacts,
+  PRE_RESET_REPORT_EMBED_CHAR_LIMIT,
   projectSyncHistoryActionCounts,
+  resetPhasePrefix,
   RecentPluginDataWriteLog,
   summarizeCommunityPluginSync,
   summarizeMutationRecovery,
@@ -287,6 +293,7 @@ const KEY_SYNC_PLUGIN_DATA = "sync-plugin-data";
 const KEY_COMMUNITY_PLUGIN_SYNC_POLICY = "community-plugin-sync-policy";
 const KEY_SYNC_EXCLUDED_FOLDERS = "sync-excluded-folders";
 const KEY_AUTO_SYNC_PAUSED = "auto-sync-paused";
+const KEY_LAST_RESET_FACTS = "last-reset-facts";
 const KEY_LEGACY_AUTO_MERGE = "sync-auto-merge";
 const KEY_AUTOMATIC_HANDLING_POLICY = "sync-auto-conflict-policy";
 const KEY_NOTIFICATION_POPUPS = "notification-popups";
@@ -626,7 +633,12 @@ export default class EasySyncPlugin extends Plugin {
    *  off; the master's on flip restores them instead of imposing defaults. */
   autoSyncRestoreInterval = DEFAULT_AUTO_SYNC_INTERVAL_MINUTES;
   autoSyncRestoreChangeDelaySeconds = DEFAULT_AUTO_SYNC_CHANGE_DELAY_SECONDS;
-  syncPluginFiles = false; // M19: EasySync self-sync default OFF — explicit opt-in
+  /** EasySync self-sync is no longer a user choice: the running build has to
+   *  reach the other devices, so the plugin directory is always part of the
+   *  scope. Devices still carrying the old opt-in `false` are moved through
+   *  the scope transaction on the next state load — see
+   *  `ensureEasySyncSelfSyncScope`. */
+  syncPluginFiles = true;
   syncMaxFileSizeMb = DEFAULT_MAX_FILE_SIZE_MB;
   automaticHandlingPolicy: AutomaticHandlingPolicy = {
     ...DEFAULT_AUTOMATIC_HANDLING_POLICY,
@@ -645,6 +657,7 @@ export default class EasySyncPlugin extends Plugin {
   excludedFolders: string[] = [];
   diagLogEnabled = false;
   autoSyncPaused = false;
+  lastResetFacts: DiagnosticResetFacts | null = null;
   notificationPopups: EasySyncNotificationPopupsLevel = "all";
   private opLock: string | null = null;
   private vaultCloudClientNoticeShown = false;
@@ -683,6 +696,9 @@ export default class EasySyncPlugin extends Plugin {
   private ribbonSuccessVisible = false;
   private settingsTab: EasySyncSettingTab | null = null;
   private stateLoadPromise: Promise<void> | null = null;
+  /** One attempt per reload for the retired self-sync opt-in: see
+   *  `ensureEasySyncSelfSyncScope`. */
+  private selfSyncScopeTransitionAttempted = false;
   private syncNoticeFrame: AnimationFrameHandle | null = null;
   private syncNoticeSignature: string | null = null;
   private readonly operationLifecycle = new OperationLifecycle();
@@ -1615,25 +1631,31 @@ export default class EasySyncPlugin extends Plugin {
 
   async getSharedFolderIdentityResolutionSnapshot(
     path: string,
-  ): Promise<SharedFolderIdentityResolutionSnapshotV1 | null> {
+  ): Promise<ManualResolutionEntrySnapshot<SharedFolderIdentityResolutionSnapshotV1>> {
     await this.ensureStateLoaded();
-    if (!this.syncExecutor || !this.state?.isV2StateActive) return null;
+    if (!this.syncExecutor || !this.state?.isV2StateActive) {
+      return { snapshot: null, reason: "state-unprepared" };
+    }
     return this.syncExecutor.getSharedFolderIdentityResolutionSnapshot(path);
   }
 
   async getStaleIdentityResolutionSnapshot(
     path: string,
-  ): Promise<StaleIdentityResolutionSnapshotV1 | null> {
+  ): Promise<ManualResolutionEntrySnapshot<StaleIdentityResolutionSnapshotV1>> {
     await this.ensureStateLoaded();
-    if (!this.syncExecutor || !this.state?.isV2StateActive) return null;
+    if (!this.syncExecutor || !this.state?.isV2StateActive) {
+      return { snapshot: null, reason: "state-unprepared" };
+    }
     return this.syncExecutor.getStaleIdentityResolutionSnapshot(path);
   }
 
   async getScopeCrossingResolutionSnapshot(
     path: string,
-  ): Promise<ScopeCrossingResolutionSnapshotV1 | null> {
+  ): Promise<ManualResolutionEntrySnapshot<ScopeCrossingResolutionSnapshotV1>> {
     await this.ensureStateLoaded();
-    if (!this.syncExecutor || !this.state?.isV2StateActive) return null;
+    if (!this.syncExecutor || !this.state?.isV2StateActive) {
+      return { snapshot: null, reason: "state-unprepared" };
+    }
     return this.syncExecutor.getScopeCrossingResolutionSnapshot(path);
   }
 
@@ -2680,6 +2702,36 @@ export default class EasySyncPlugin extends Plugin {
       this.stateLoadPromise = null;
     });
     await this.stateLoadPromise;
+    await this.ensureEasySyncSelfSyncScope();
+  }
+
+  /**
+   * Device-local transition for the retired "EasySync self-sync" switch.
+   *
+   * The plugin directory entering the scope is a real scope expansion, so it
+   * runs the same settings transaction a user toggle used to run. Writing the
+   * value in place would not do: the persisted remote index still reads
+   * `complete` while physically missing the newly in-scope folder, and only
+   * the scope-expansion marker makes the next round rebuild it from a
+   * complete remote identity snapshot.
+   *
+   * Devices that already carry `true`, and fresh installs, are a no-op. One
+   * attempt per reload: a failure (sync in flight, recovery block, migration
+   * hold) leaves the plugin directory out of scope — the safe direction — and
+   * the next reload retries.
+   */
+  private async ensureEasySyncSelfSyncScope(): Promise<void> {
+    if (this.selfSyncScopeTransitionAttempted || this.syncPluginFiles) return;
+    this.selfSyncScopeTransitionAttempted = true;
+    try {
+      await this.updateSyncPathSettings({ syncPluginFiles: true });
+    } catch (error) {
+      this.diag.warn(
+        "state",
+        "EasySync self-sync scope transition did not run; the plugin directory stays out of scope until the next reload",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
   }
 
   /**
@@ -3293,8 +3345,9 @@ export default class EasySyncPlugin extends Plugin {
       await this.ensureStateLoaded();
       // The reset is definitely starting: capture a pre-reset report for
       // every variant (normal / isolated / forced). Best-effort by contract —
-      // a failed report never blocks the exit.
-      await this.generateDiagnosticReport();
+      // a failed report never blocks the exit. resetSnapshot=true keeps this
+      // file the raw pre-reset evidence (no prior-reset history embedded).
+      const preResetReportFile = await this.generateDiagnosticReport(true);
       let isolatedRecoveries: ConservativeResetEntries | null = null;
       let forceReset = false;
       if (this.hasResetBlockingRecovery()) {
@@ -3338,6 +3391,9 @@ export default class EasySyncPlugin extends Plugin {
               this.showMutationRecoveryResetBlockedNotice();
               return;
             }
+            // The forced reset is what actually executes here; the marker's
+            // variant must reflect the operation, not the original intent.
+            forceReset = true;
             await this.state?.forceReset();
           }
         } else {
@@ -3367,6 +3423,15 @@ export default class EasySyncPlugin extends Plugin {
       // participation projection from those settings and current file facts.
       this.communityPluginParticipation = null;
       this.communityPluginParticipationInitializationPromise = null;
+      // Reset lineage lives in the settings domain (survives the reset) so
+      // any later report can attribute its logs and embed the pre-reset
+      // snapshot. Recorded only after the reset has actually happened.
+      this.lastResetFacts = {
+        resetAt: Date.now(),
+        variant: forceReset ? "forced" : isolatedRecoveries ? "isolated" : "normal",
+        ...(preResetReportFile !== undefined ? { preResetReportFile } : {}),
+        pluginVersion: this.manifest.version,
+      };
       try {
         await this.saveSyncSettings();
         await this.scanner?.clearScanCache();
@@ -5491,6 +5556,7 @@ export default class EasySyncPlugin extends Plugin {
         getConfigDir(this.app.vault),
       );
       if (typeof data[KEY_AUTO_SYNC_PAUSED] === "boolean") this.autoSyncPaused = data[KEY_AUTO_SYNC_PAUSED];
+      this.lastResetFacts = parseDiagnosticResetFacts(data[KEY_LAST_RESET_FACTS]);
       this.syncMaxFileSizeMb = normalizeMaxFileSizeMb(data[KEY_MAX_FILE_SIZE_MB]);
       const deviceUpdateState = loadUpdateCheckState(this.updateDeviceStorage());
       const legacyUpdateState = seedUpdateCheckStateFromLegacyPluginData(data);
@@ -5624,6 +5690,7 @@ export default class EasySyncPlugin extends Plugin {
       data[KEY_MAX_FILE_SIZE_MB] = this.syncMaxFileSizeMb;
       data[KEY_AUTOMATIC_HANDLING_POLICY] = { ...this.automaticHandlingPolicy };
       data[KEY_NOTIFICATION_POPUPS] = this.notificationPopups;
+      data[KEY_LAST_RESET_FACTS] = this.lastResetFacts;
     });
   }
 
@@ -6453,7 +6520,7 @@ export default class EasySyncPlugin extends Plugin {
     const { configDir, pluginDir } = getEasySyncPaths(this.app.vault, this.manifest.id);
     const pluginDirPrefix = `${pluginDir}/`;
 
-    // EasySync self-sync (default on)
+    // EasySync self-sync (always on — see ensureEasySyncSelfSyncScope)
     if (settings.syncPluginFiles) paths.add(pluginDirPrefix);
 
     // Editor
@@ -8000,9 +8067,15 @@ export default class EasySyncPlugin extends Plugin {
    *  Any failure — the vault write, or the evidence gathering that precedes
    *  it — surfaces as one simple "could not save" notice instead of a
    *  silently dropped promise. */
-  async generateDiagnosticReport(): Promise<void> {
+  /** Generate the report and return its file name, or undefined when the
+   *  generation failed (already noticed). `resetSnapshot` marks the
+   *  reset-flow capture: that report is the raw pre-reset evidence and must
+   *  not embed the previous reset's history inside itself. */
+  async generateDiagnosticReport(
+    resetSnapshot = false,
+  ): Promise<string | undefined> {
     try {
-      await this.buildDiagnosticReportFile();
+      return await this.buildDiagnosticReportFile(resetSnapshot);
     } catch (error) {
       this.diag.error(
         "state",
@@ -8014,12 +8087,13 @@ export default class EasySyncPlugin extends Plugin {
         message: this.i18n.t("notice.diagnosticReportSaveFailed"),
         priority: NOTICE_PRIORITY.action,
       });
+      return undefined;
     }
   }
 
   /** Build and write the report file. The success notice fires only after the
    *  write lands; any failure throws so the caller reports it once. */
-  private async buildDiagnosticReportFile(): Promise<void> {
+  private async buildDiagnosticReportFile(resetSnapshot = false): Promise<string> {
     const now = new Date();
     const reportI18n = new I18n("zh-cn");
     const formatActionLabel = (type?: SyncActionType): string =>
@@ -8054,6 +8128,9 @@ export default class EasySyncPlugin extends Plugin {
     }
     const auth = this.auth?.authState;
     const reportState = this.state;
+    // Reset lineage for this report: suppressed in the reset-flow snapshot so
+    // that file stays the raw "before" evidence (no nested prior-reset data).
+    const resetFacts = resetSnapshot ? null : this.lastResetFacts;
     const reportScope = reportState?.remoteScope;
     const v2StorageAuthority =
       reportState?.activeV2StorageAuthorityEvidence ?? null;
@@ -8129,6 +8206,25 @@ export default class EasySyncPlugin extends Plugin {
     lines.push(`> ${reportI18n.t("diagnosticReport.feedbackNote")}`);
     lines.push(`> ${reportI18n.t("diagnosticReport.redactionNote")}`);
     lines.push("");
+    if (resetFacts) {
+      const resetVariantLabel =
+        resetFacts.variant === "forced"
+          ? "强制重置"
+          : resetFacts.variant === "isolated"
+            ? "隔离保留重置"
+            : "普通重置";
+      lines.push("## 重置历史");
+      lines.push("");
+      lines.push(
+        `**最近一次重置**: ${fmt(resetFacts.resetAt)}（${resetVariantLabel}）· EasySync ${resetFacts.pluginVersion}`,
+      );
+      lines.push(
+        `**重置前报告**: ${resetFacts.preResetReportFile
+          ? `\`${resetFacts.preResetReportFile}\`（核心内容已附于本报告末尾「重置前档案摘录」）`
+          : "未生成（重置时报告生成失败）"}`,
+      );
+      lines.push("");
+    }
     lines.push("## 当前同步概况");
     lines.push("");
     lines.push(...formatDiagnosticAutomaticSyncSummary({
@@ -8604,7 +8700,7 @@ export default class EasySyncPlugin extends Plugin {
         lines.push("");
         lines.push("```");
         for (const e of execFailures) {
-          lines.push(`${fmtShort(e.ts)} ❌ ${e.msg}`);
+          lines.push(`${fmtShort(e.ts)}${resetPhasePrefix(e.ts, resetFacts)} ❌ ${e.msg}`);
           if (e.data !== undefined) {
             lines.push(`  detail: ${formatDiagData(e.data)}`);
           }
@@ -8619,7 +8715,7 @@ export default class EasySyncPlugin extends Plugin {
         lines.push("```");
         for (const e of others) {
           const marker = e.lvl === "error" ? "❌" : "⚠️";
-          lines.push(`${fmtShort(e.ts)} [${e.cat}] ${marker} ${e.msg}`);
+          lines.push(`${fmtShort(e.ts)}${resetPhasePrefix(e.ts, resetFacts)} [${e.cat}] ${marker} ${e.msg}`);
           if (e.data !== undefined) {
             lines.push(`  detail: ${formatDiagData(e.data)}`);
           }
@@ -8629,12 +8725,41 @@ export default class EasySyncPlugin extends Plugin {
     }
     lines.push("");
 
+    if (resetFacts?.preResetReportFile) {
+      lines.push(`## 重置前档案摘录（${resetFacts.preResetReportFile}）`);
+      lines.push("");
+      lines.push("> 以下内容摘自重置前自动生成的报告，反映重置那一刻之前的设备状态。");
+      lines.push("");
+      let excerpt = "";
+      try {
+        const preResetFile = this.app.vault.getAbstractFileByPath(
+          resetFacts.preResetReportFile,
+        );
+        if (preResetFile instanceof TFile) {
+          excerpt = extractPreResetReportCore(
+            await this.app.vault.cachedRead(preResetFile),
+            PRE_RESET_REPORT_EMBED_CHAR_LIMIT,
+          );
+        }
+      } catch {
+        // A missing or unreadable pre-reset report must not fail the current
+        // report; the lineage section above still names the file.
+      }
+      if (excerpt.length > 0) {
+        lines.push(...excerpt.split("\n"));
+      } else {
+        lines.push(`*重置前报告文件不可读（\`${resetFacts.preResetReportFile}\`）*`);
+      }
+      lines.push("");
+    }
+
     await this.app.vault.adapter.write(fileName, lines.join("\n"));
     this.noticeCenter.show({
       key: "diagnostic-report-created",
       message: this.i18n.t("notice.diagnosticReportGenerated", { fileName }),
       priority: NOTICE_PRIORITY.action,
     });
+    return fileName;
   }
 
   /** Apply max file size setting to the scanner. Public so settings-tab can call it. */

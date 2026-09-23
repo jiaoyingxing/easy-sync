@@ -438,3 +438,114 @@ export function formatRecentPluginDataWrites(
     return `- ${stamp} — ${keys.length > 0 ? keys.join(", ") : "(键值无净变化)"}`;
   });
 }
+
+/** Reset lineage recorded by the reset flow (survives the reset itself because
+ *  it lives in the settings domain of plugin data). Lets any later report
+ *  organize the device's surviving evidence: attribute logs to before/after
+ *  the reset and embed the pre-reset report's core sections. */
+export interface DiagnosticResetFacts {
+  resetAt: number;
+  variant: "normal" | "isolated" | "forced";
+  /** File name (vault root) of the pre-reset report captured during that
+   *  reset. Absent when the reset-time report generation failed. */
+  preResetReportFile?: string;
+  pluginVersion: string;
+}
+
+const DIAGNOSTIC_RESET_VARIANTS: ReadonlySet<string> = new Set([
+  "normal",
+  "isolated",
+  "forced",
+]);
+
+export function parseDiagnosticResetFacts(value: unknown): DiagnosticResetFacts | null {
+  if (!isRecord(value)) return null;
+  const resetAt = value.resetAt;
+  const variant = value.variant;
+  const pluginVersion = value.pluginVersion;
+  if (typeof resetAt !== "number" || !Number.isFinite(resetAt)) return null;
+  if (typeof variant !== "string" || !DIAGNOSTIC_RESET_VARIANTS.has(variant)) return null;
+  if (typeof pluginVersion !== "string" || pluginVersion.length === 0) return null;
+  const preResetReportFile = value.preResetReportFile;
+  if (preResetReportFile !== undefined && typeof preResetReportFile !== "string") return null;
+  return {
+    resetAt,
+    variant: variant as DiagnosticResetFacts["variant"],
+    ...(typeof preResetReportFile === "string" && preResetReportFile.length > 0
+      ? { preResetReportFile }
+      : {}),
+    pluginVersion,
+  };
+}
+
+/** Phase label for one log timestamp relative to the latest reset. Empty when
+ *  no reset facts exist (the report keeps its pre-reset-facts shape). */
+export function resetPhasePrefix(
+  ts: number,
+  facts: DiagnosticResetFacts | null,
+): string {
+  if (!facts) return "";
+  return ts < facts.resetAt ? "【重置前】" : "【重置后】";
+}
+
+/** Core sections of a pre-reset report that are worth carrying into any later
+ *  report: the wiped-state evidence. Anomaly logs are deliberately excluded —
+ *  the disk JSONL they come from survives the reset and the current report
+ *  already carries them. */
+const PRE_RESET_REPORT_CORE_SECTIONS = [
+  "## 当前同步概况",
+  "## 技术状态证据",
+  "## 近期同步记录",
+  "## 当前待处理问题",
+  "## 自动处理与恢复摘要",
+] as const;
+
+/** Embed ceiling for the pre-reset report excerpt. Measured basis: 8 real
+ *  reports (2026-09-18~20, three test vaults) had core sections of 2,507–4,751
+ *  chars; 16,000 chars keeps ~3x headroom for much heavier vaults while
+ *  bounding the attachment size. */
+export const PRE_RESET_REPORT_EMBED_CHAR_LIMIT = 16_000;
+
+/** Extract the core sections of a previously generated report. Sections are
+ *  matched by their stable top-level headers and run until the next top-level
+ *  header (subsections ride along). Returns "" when nothing matches. */
+export function extractPreResetReportCore(
+  content: string,
+  maxChars: number,
+): string {
+  const lines = content.split("\n");
+  const kept: string[] = [];
+  let current: string | null = null;
+  let buffer: string[] = [];
+  const flush = () => {
+    if (current === null) return;
+    const section = buffer.join("\n").trimEnd();
+    if (section.length > 0) {
+      if (kept.length > 0) kept.push("");
+      kept.push(section);
+    }
+  };
+  for (const line of lines) {
+    const header = PRE_RESET_REPORT_CORE_SECTIONS.find((h) => line.startsWith(h));
+    if (header) {
+      flush();
+      current = header;
+      buffer = [line];
+      continue;
+    }
+    if (current !== null && /^## /.test(line)) {
+      flush();
+      current = null;
+      buffer = [];
+      continue;
+    }
+    if (current !== null) buffer.push(line);
+  }
+  flush();
+  if (kept.length === 0) return "";
+  let joined = kept.join("\n");
+  if (maxChars > 0 && joined.length > maxChars) {
+    joined = `${joined.slice(0, maxChars).replace(/\n[^\n]*$/, "")}\n\n*（超过嵌入上限，已截断）*`;
+  }
+  return joined;
+}

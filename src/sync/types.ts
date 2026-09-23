@@ -813,10 +813,11 @@ export function normalizeMaxFileSizeMb(value: unknown): number {
 export const DEFAULT_SCAN_CONFIG: ScanConfig = {
   excludePaths: [".trash/", ".DS_Store", "Thumbs.db"],
   excludedFolders: [],
-  // M19: EasySync self-sync default OFF. Explicit opt-in via syncOwnPlugin setting
-  // with anti-downgrade protection (manifest.json version comparison).
   includePaths: [],
   maxFileSize: DEFAULT_MAX_FILE_SIZE_MB * 1024 * 1024,
+  // Pre-config fallback. The plugin applies the effective sync-path settings
+  // right after construction, where EasySync's own bundle is always in scope
+  // (the self-sync opt-in was retired); until then the safe direction is out.
   includeOwnPluginCode: false,
   includePluginCode: false,
   includePluginData: false,

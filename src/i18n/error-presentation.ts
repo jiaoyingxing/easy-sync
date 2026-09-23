@@ -149,6 +149,11 @@ const KNOWN_FILE_ERROR_PATTERNS: readonly KnownErrorPattern[] = [
   { key: "error.present.file.mutationAlreadyPending", prefix: "Mutation already pending for path: " },
   { key: "error.present.file.recoveryVerifyFailed", prefix: "Recovery verification failed: " },
   { key: "error.present.file.recoverySourceMissing", prefix: "Recovery source missing: " },
+  // Write-path failures that a user can actually trigger (resolving a stuck
+  // record while an editor merges unsaved text; the target vanishing between
+  // scan and write). Unmapped they would reach the user as raw English.
+  { key: "error.present.file.alignmentReadback", prefix: "Alignment read-back failed: " },
+  { key: "error.present.file.localFileDisappeared", prefix: "Local file disappeared before replacement: " },
   { key: "error.present.file.protectedConfigDelete", prefix: "Protected config folder cannot be deleted by folder sync: " },
 ];
 

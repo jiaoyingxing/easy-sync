@@ -259,7 +259,7 @@ export class SyncExclusionModal extends EasySyncModal {
     this.setTitle(t("settings.syncExclusion.title"));
     this.contentEl.createEl("p", {
       text: t("settings.syncExclusion.intro"),
-      cls: "setting-item-description",
+      cls: "setting-item-description easy-sync-modal-intro",
     });
 
     const folderSetting = new Setting(this.contentEl)

@@ -169,6 +169,53 @@ function record(
   };
 }
 
+/**
+ * The field-reported settlement shape (2026-09-22 iOS, F9 case 3): a
+ * follow-the-remote-move receipt written by the execution chain when the
+ * moved remote content advanced and Graph provided no sha256Hash. The base
+ * proves the local side, the remote upsert proves the planned remote world
+ * (identity + eTag + size), and the size divergence is recorded honestly.
+ */
+function buildShaUnknownDivergentReceipt(): MutationLedgerEntryV1 {
+  const entry = record("moveLocal");
+  if (
+    !entry.intent.expectedRemote.exists
+    || !entry.intent.sourcePath
+  ) {
+    throw new Error("move fixture requires a remote identity and source path");
+  }
+  const remoteExpect = entry.intent.expectedRemote;
+  remoteExpect.size = 12;
+  delete remoteExpect.sha256Hash;
+  entry.receipt = {
+    version: 1,
+    operationId: entry.intent.operationId,
+    completedAt: 4,
+    checkpoint: {
+      baseUpserts: [{
+        path: entry.intent.path,
+        hash: local.hash,
+        size: local.size,
+        eTag: remoteExpect.eTag,
+      }],
+      baseRemovals: [entry.intent.sourcePath],
+      remoteUpserts: [{
+        path: entry.intent.path,
+        driveId: remoteExpect.driveId,
+        parentId: "files-root",
+        size: remoteExpect.size,
+        mtime: 1,
+        eTag: remoteExpect.eTag,
+        cTag: "ctag-sha-unknown-divergent",
+      }],
+      remoteDeletes: [entry.intent.sourcePath],
+      pendingConflictRemovals: [],
+      pendingDeleteRemovals: [],
+    },
+  };
+  return entry;
+}
+
 describe("conservative reset ordinary-file recovery contract", () => {
   for (const action of [
     "upload",
@@ -326,6 +373,66 @@ describe("conservative reset ordinary-file recovery contract", () => {
     };
     expect(isOrdinaryFileRecoveryRecord(aligned, scope)).toBe(true);
     expect(isConservativeResetOrdinaryRecord(aligned, scope)).toBe(true);
+  });
+
+  it("admits a sha-unknown divergent moveLocal receipt (plain move, bytes pending ordinary convergence)", () => {
+    // 野外判例 2026-09-22（iOS 1.4.13，F9 家族第三例）：OneDrive 个人版
+    // 经常不提供 SHA-256（身份移动专题在案的外部约束）。执行链在远端 hash
+    // 未知时按合同写「纯移动」收据——base 证本地侧（hash+size）、remote
+    // 证云端计划世界（identity+eTag+size），两侧尺寸分歧如实入账，字节收
+    // 敛留给下一轮普通同路径决策。旧两形态（内容对齐/纯改名）都要求内容
+    // 同一性证明，会拒绝该收据并把记录永久卡成 intent-only。第三形态只在
+    // 意图自身无远端 hash 时启用，hash 已知场景仍强制走对齐（形态一）。
+    const divergent = buildShaUnknownDivergentReceipt();
+    expect(isOrdinaryFileRecoveryRecord(divergent, scope)).toBe(true);
+    expect(isConservativeResetOrdinaryRecord(divergent, scope)).toBe(true);
+  });
+
+  it("still rejects sha-unknown plain-move receipts whose facts do not bind to the intent", () => {
+    // 第三形态不放宽事实绑定：收据声称的云端版本与意图计划的世界不一致
+    // （eTag 漂移 / 尺寸不符 / 携带意图没有的 hash / base 不证本地期望）
+    // 时必须维持拒绝，否则收据就能改写计划事实。
+    const driftedEtag = buildShaUnknownDivergentReceipt();
+    driftedEtag.receipt!.checkpoint.remoteUpserts[0].eTag = "drifted-etag";
+    expect(isOrdinaryFileRecoveryRecord(driftedEtag, scope)).toBe(false);
+
+    const wrongRemoteSize = buildShaUnknownDivergentReceipt();
+    wrongRemoteSize.receipt!.checkpoint.remoteUpserts[0].size = 13;
+    expect(isOrdinaryFileRecoveryRecord(wrongRemoteSize, scope)).toBe(false);
+
+    const unexpectedHash = buildShaUnknownDivergentReceipt();
+    unexpectedHash.receipt!.checkpoint.remoteUpserts[0].sha256Hash = "c".repeat(64);
+    expect(isOrdinaryFileRecoveryRecord(unexpectedHash, scope)).toBe(false);
+
+    const wrongBase = buildShaUnknownDivergentReceipt();
+    wrongBase.receipt!.checkpoint.baseUpserts[0].hash = "d".repeat(64);
+    expect(isOrdinaryFileRecoveryRecord(wrongBase, scope)).toBe(false);
+
+    // hash 已知的分歧意图不适用第三形态：执行链必须先对齐（形态一）。
+    const hashKnown = buildShaUnknownDivergentReceipt();
+    const hashKnownRemote = hashKnown.intent.expectedRemote;
+    if (!hashKnownRemote.exists) throw new Error("move fixture requires a remote identity");
+    hashKnownRemote.sha256Hash = "e".repeat(64);
+    expect(isOrdinaryFileRecoveryRecord(hashKnown, scope)).toBe(false);
+  });
+
+  it("rejects a sha-unknown plain-move receipt smuggling extra checkpoint entries", () => {
+    // 走私钉子：回执 checkpoint 的路径表是精确表（形状断言逐 action 核对
+    // 恰一项/恰 source），多带任何条目即整单拒绝——第三形态不提供夹带面。
+    const smuggledDeletes = buildShaUnknownDivergentReceipt();
+    smuggledDeletes.receipt!.checkpoint.remoteDeletes.push(
+      smuggledDeletes.intent.sourcePath!,
+    );
+    expect(isOrdinaryFileRecoveryRecord(smuggledDeletes, scope)).toBe(false);
+
+    const smuggledUpserts = buildShaUnknownDivergentReceipt();
+    smuggledUpserts.receipt!.checkpoint.baseUpserts.push({
+      path: smuggledUpserts.intent.sourcePath!,
+      hash: local.hash,
+      size: local.size,
+      eTag: "sneak-etag",
+    });
+    expect(isOrdinaryFileRecoveryRecord(smuggledUpserts, scope)).toBe(false);
   });
 
   it("still rejects aligned-shaped moveLocal receipts whose facts do not bind", () => {

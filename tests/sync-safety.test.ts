@@ -39,7 +39,7 @@ import type { LocalScanner } from "../src/sync/local-scanner";
 import type { PendingIssue } from "../src/sync/types";
 import { generateFileDecisionPlanV2 } from "../src/sync/file-decision-planner-v2";
 import { StateManager } from "../src/sync/state-manager";
-import type { I18n } from "../src/i18n";
+import { I18n } from "../src/i18n";
 import { SyncProgressStore } from "../src/sync/sync-progress";
 import type { DiagnosticLogger } from "../src/sync/diagnostic-logger";
 import { EasySyncNoticeCenter } from "../src/ui/notice-center";
@@ -9509,6 +9509,401 @@ describe("Persistent remote delta state", () => {
     expect(getFileMetadata).toHaveBeenCalled();
   });
 
+  it("settles a sha-unknown divergent moveLocal record as a plain move without downloading remote bytes", async () => {
+    // Field report 2026-09-22 (iOS 1.4.13, F9 case 3): the local side already
+    // followed the remote move, the remote identity sits at the target path,
+    // but the moved content advanced and Graph provided no sha256Hash (common
+    // on OneDrive personal). The recovery classifier must settle the record
+    // with the same plain-move receipt contract the execution chain uses
+    // (divergence left to the ordinary same-path decision) instead of
+    // downloading over the local bytes (A1 stays hash-gated) — the old path
+    // produced an unreceiptable checkpoint and blocked recovery forever.
+    const localContent = new Uint8Array([3, 1, 4]).buffer;
+    const localHash = await sha256Hex(localContent);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "plan-old.duowei";
+    const targetPath = "plan.duowei";
+    const targetRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "remote-drive-id",
+      parentId: activeScope.filesRootId,
+      eTag: "remote-etag",
+      cTag: "remote-ctag",
+      size: 4606,
+    };
+    const state = makeActiveV2State([targetRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-movelocal-sha-unknown-divergent",
+          planRevision: 1,
+          scope: activeScope,
+          action: "moveLocal",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: {
+            exists: true,
+            hash: localHash,
+            size: localContent.byteLength,
+          },
+          expectedRemote: {
+            exists: true,
+            driveId: "remote-drive-id",
+            eTag: "remote-etag",
+            size: 4606,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const getFileMetadata = vi.fn().mockImplementation(async (_v: string, path: string) =>
+      path === targetPath ? targetRemote : undefined);
+    const downloadFile = vi.fn(async () => {
+      throw new Error("sha-unknown pure-move settlement must not download remote bytes");
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [{
+        id: "remote-drive-id",
+        name: "plan.duowei",
+        size: 4606,
+        eTag: "remote-etag",
+        cTag: "remote-ctag",
+        lastModifiedDateTime: "2026-09-18T22:49:00.000Z",
+        parentReference: { id: activeScope.filesRootId },
+        file: { hashes: {} },
+      }],
+      "@odata.deltaLink": "https://graph.example/delta-movelocal-sha-unknown",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getFileMetadata, downloadFile, getDelta }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [{
+            path: targetPath,
+            size: localContent.byteLength,
+            mtime: 1,
+            hash: localHash,
+            binary: false,
+          }],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn(async (path: string) =>
+          path === targetPath
+            ? {
+                status: "present",
+                entry: {
+                  path,
+                  size: localContent.byteLength,
+                  mtime: 1,
+                  hash: localHash,
+                },
+              }
+            : { status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    // The record settles automatically (no blocked recovery surfaced) with
+    // zero remote downloads: the divergence is recorded honestly in the base
+    // snapshot and the ordinary planner converges the bytes next round.
+    expect(result.mutationRecovery).toBeUndefined();
+    expect(state.mutationLedger).toEqual([]);
+    expect(downloadFile).not.toHaveBeenCalled();
+    expect(
+      state.baseSnapshot.find((entry) => entry.path === targetPath)?.hash,
+    ).toBe(localHash);
+  });
+
+  it("fails the round and keeps the record when a host merge breaks recovery alignment", async () => {
+    // 本线边界（复核轮 `20260923-203102` §六①）：对齐/收据恢复链（`alignLocalTargetBytes`）
+    // 写后要求本机字节与远端**完全一致**。宿主把编辑器里未保存的行并进我们的写入时，
+    // 落盘门按「合并算落地」记成功（`DECISIONS` 2026-09-23 第 9 点②），但这条链自己的
+    // 回读复核不通过 ⇒ 这一轮判失败、记录保留（用户的字仍在文件里，未被回滚）。
+    // 改前（门自己按字节复核）与改后（这条链回读失败）在这一角落结局相同，都不静默推进状态。
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const localContent = encoder.encode("local-version\n").buffer;
+    const localHash = await sha256Hex(localContent);
+    const advancedContent = encoder.encode("remote advanced\n").buffer;
+    const advancedHash = await sha256Hex(advancedContent);
+    const mergedText = "remote advanced\nunsaved\n";
+    const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const sourcePath = "plan-old.duowei";
+    const targetPath = "plan.duowei";
+    const targetRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "remote-drive-id",
+      parentId: activeScope.filesRootId,
+      eTag: "remote-etag",
+      cTag: "remote-ctag",
+      size: advancedContent.byteLength,
+      sha256Hash: advancedHash,
+    };
+    const state = makeActiveV2State([targetRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-movelocal-align-merged",
+          planRevision: 1,
+          scope: activeScope,
+          action: "moveLocal",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: {
+            exists: true,
+            hash: localHash,
+            size: localContent.byteLength,
+          },
+          expectedRemote: {
+            exists: true,
+            driveId: "remote-drive-id",
+            eTag: "remote-etag",
+            size: 4606,
+            // 计划时目标处的远端内容＝被移动的那份（hash 已知是进 A1 对齐的前提）。
+            sha256Hash: localHash,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const files = new Map<string, ArrayBuffer>([[targetPath, localContent]]);
+    const adapter = makeMockAdapter({
+      exists: vi.fn(async (path: string) => files.has(path)),
+      stat: vi.fn(async (path: string) => {
+        const bytes = files.get(path);
+        return bytes ? { size: bytes.byteLength, mtime: 2 } : null;
+      }),
+      readBinary: vi.fn(async (path: string) => {
+        const bytes = files.get(path);
+        if (!bytes) throw new Error(`missing ${path}`);
+        return bytes;
+      }),
+      writeBinary: vi.fn(async (path: string, bytes: ArrayBuffer) => {
+        files.set(path, bytes);
+      }),
+      remove: vi.fn(async (path: string) => {
+        files.delete(path);
+      }),
+      rename: vi.fn(async (from: string, to: string) => {
+        const bytes = files.get(from);
+        if (!bytes) throw new Error(`missing ${from}`);
+        files.delete(from);
+        files.set(to, bytes);
+      }),
+    });
+    const getFileMetadata = vi.fn().mockImplementation(async (_v: string, path: string) =>
+      path === targetPath ? targetRemote : undefined);
+    const downloadFile = vi.fn(async () => advancedContent);
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [{
+        id: "remote-drive-id",
+        name: "plan.duowei",
+        size: advancedContent.byteLength,
+        eTag: "remote-etag",
+        cTag: "remote-ctag",
+        lastModifiedDateTime: "2026-09-23T20:00:00.000Z",
+        parentReference: { id: activeScope.filesRootId },
+        file: { hashes: { quickXorHash: "quick" } },
+      }],
+      "@odata.deltaLink": "https://graph.example/delta-movelocal-align-merged",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getFileMetadata, downloadFile, getDelta }),
+      {
+        vault: {
+          adapter,
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+          getFileByPath: vi.fn((path: string) =>
+            path === targetPath ? new TFile(targetPath) : null),
+          // 宿主写入面：把我们的内容落盘后，又把编辑器里未保存的行合并进去。
+          modify: vi.fn(async (file: TFile, data: string) => {
+            files.set(file.path, encoder.encode(`${data}unsaved\n`).buffer);
+          }),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [{
+            path: targetPath,
+            size: localContent.byteLength,
+            mtime: 1,
+            hash: localHash,
+            binary: false,
+          }],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        // 真机式的本机事实：从磁盘字节算，不写死。
+        inspectFile: vi.fn(async (path: string) => {
+          const bytes = files.get(path);
+          if (!bytes) return { status: "missing" };
+          return {
+            status: "present",
+            entry: {
+              path,
+              size: bytes.byteLength,
+              mtime: 2,
+              hash: await sha256Hex(bytes),
+            },
+          };
+        }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const failure = await executor.run("manual", {}).catch((caught: unknown) => caught);
+
+    // 这一轮判失败，恢复报成 blocked（不是静默推进、也不是静默延后），记录保留，
+    // 用户的未保存行仍在文件里（没有被回滚掉）。
+    expect(failure).toMatchObject({
+      success: false,
+      errors: 1,
+      message: "result.syncFailed",
+      mutationRecovery: {
+        state: "blocked",
+        total: 1,
+        settled: 0,
+        remaining: 1,
+        blockReason: "state-unavailable",
+      },
+    });
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(decoder.decode(files.get(targetPath)!)).toBe(mergedText);
+  });
+
+  it("keeps a sha-unknown moveLocal blocked without downloading when the observed size contradicts the plan", async () => {
+    // Adversarial (review 2026-09-22): a server-side inconsistency (same
+    // eTag, different size than planned) must NOT fall through to the A1
+    // alignment — downloading over the local file and producing an
+    // unreceiptable checkpoint would crash the recovery batch the same way
+    // the field report did. The record stays blocked (reviewable) instead.
+    const localContent = new Uint8Array([3, 1, 4]).buffer;
+    const localHash = await sha256Hex(localContent);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "plan-old.duowei";
+    const targetPath = "plan.duowei";
+    const targetRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "remote-drive-id",
+      parentId: activeScope.filesRootId,
+      eTag: "remote-etag",
+      cTag: "remote-ctag",
+      // Same eTag as planned but a contradictory size (planned: 3).
+      size: 4606,
+    };
+    const state = makeActiveV2State([targetRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-movelocal-sha-unknown-size-contradiction",
+          planRevision: 1,
+          scope: activeScope,
+          action: "moveLocal",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: {
+            exists: true,
+            hash: localHash,
+            size: localContent.byteLength,
+          },
+          expectedRemote: {
+            exists: true,
+            driveId: "remote-drive-id",
+            eTag: "remote-etag",
+            size: localContent.byteLength,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const getFileMetadata = vi.fn().mockImplementation(async (_v: string, path: string) =>
+      path === targetPath ? targetRemote : undefined);
+    const downloadFile = vi.fn(async () => {
+      throw new Error("contradictory sha-unknown move must not download");
+    });
+    const downloadFileToPath = vi.fn(async () => {
+      throw new Error("contradictory sha-unknown move must not download");
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      // Empty delta keeps the ordinary round quiet (nothing anchored on
+      // either side to plan); the recovery classifier observes live facts
+      // through getFileMetadata/inspectFile, not this snapshot.
+      value: [],
+      "@odata.deltaLink": "https://graph.example/delta-movelocal-contradictory",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getFileMetadata, downloadFile, downloadFileToPath, getDelta }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn(async (path: string) =>
+          path === targetPath
+            ? {
+                status: "present",
+                entry: {
+                  path,
+                  size: localContent.byteLength,
+                  mtime: 1,
+                  hash: localHash,
+                },
+              }
+            : { status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    // Blocked and reviewable — with zero downloads and zero local overwrites.
+    expect(result.mutationRecovery).toMatchObject({ state: "blocked" });
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(downloadFile).not.toHaveBeenCalled();
+    expect(downloadFileToPath).not.toHaveBeenCalled();
+    expect(state.baseSnapshot.find((entry) => entry.path === targetPath)).toBeUndefined();
+  });
+
   it("does not auto-settle a moveLocal intent when the remote source still exists and the expected remote identity stays alive", async () => {
     // The remote source still holding the file alone does not block
     // settlement (A2 20260902: local source+target gone + remote
@@ -17707,6 +18102,16 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     diag?: DiagnosticLogger;
     noticeCenter?: EasySyncNoticeCenter;
     shouldSyncPath?: ReturnType<typeof vi.fn>;
+    i18n?: I18n;
+    /** 给了就模拟真实宿主：它认得被替换的文件，并且自己有写入面。
+     *  值模拟打开着的编辑器把这段未保存文本合并回磁盘（宿主在我们写入之后又追加）。 */
+    hostEditorMerge?: string;
+    /** 写入面「静默失败」：接口正常返回但磁盘没变（`DECISIONS` 2026-09-23 第 9 点④的现场）。 */
+    hostWriteSilent?: boolean;
+    /** 宿主写入面的内容变换：模拟「写坏」（只落一部分）等现场。 */
+    hostWriteTransform?: (data: string) => string;
+    /** 宿主写入面的调用记录，用于断言有界重试的次数与内容。 */
+    hostWriteLog?: string[];
   }): SyncExecutor {
     const progressStore = options.progressStore ?? new SyncProgressStore();
     const addToken = (item: SyncPlanItem): SyncPlanItem => {
@@ -17761,6 +18166,10 @@ describe("Conflict resolution actions report standalone transfer progress", () =
       ...options.stateOverrides,
     } as unknown as StateManager;
 
+    const adapter = makeMockAdapter(options.adapterOverrides);
+    const hostWriteSurface = options.hostEditorMerge !== undefined
+      || options.hostWriteSilent === true
+      || options.hostWriteTransform !== undefined;
     return new SyncExecutor(
       makeMockOneDrive({
         downloadFile: options.downloadFile,
@@ -17781,10 +18190,25 @@ describe("Conflict resolution actions report standalone transfer progress", () =
       }),
       {
         vault: {
-          adapter: makeMockAdapter(options.adapterOverrides),
+          adapter,
           getFiles: vi.fn().mockReturnValue([]),
           getName: vi.fn().mockReturnValue("testVault"),
           getFileByPath: vi.fn().mockReturnValue(options.vaultFile ?? null),
+          ...(hostWriteSurface
+            ? {
+                modify: vi.fn(async (file: TFile, data: string) => {
+                  options.hostWriteLog?.push(data);
+                  if (options.hostWriteSilent) return;
+                  const written = options.hostWriteTransform
+                    ? options.hostWriteTransform(data)
+                    : `${data}${options.hostEditorMerge ?? ""}`;
+                  await adapter.writeBinary(
+                    file.path,
+                    new TextEncoder().encode(written).buffer,
+                  );
+                }),
+              }
+            : {}),
         },
         scanAll: vi.fn().mockResolvedValue({
           entries: [],
@@ -17798,7 +18222,7 @@ describe("Conflict resolution actions report standalone transfer progress", () =
       } as unknown as LocalScanner,
       mockState,
       "testVault",
-      undefined,
+      options.i18n,
       progressStore,
       options.diag,
       options.fileManager as never,
@@ -18541,6 +18965,285 @@ describe("Conflict resolution actions report standalone transfer progress", () =
 
     expect(new Uint8Array(files.get(path)!)).toEqual(new Uint8Array(racedBytes));
     expect(abandonMutationIntent).toHaveBeenCalledTimes(1);
+  });
+
+  it("keepRemote counts the host's merge of unsaved text as landed and keeps the cloud version as the base", async () => {
+    const path = "note.md";
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    // 本机版本故意与云端版本长度不同：基线若被误记成「扫描到的本机尺寸」，
+    // 断言要能分辨出来（两者等长时 size 断言形同虚设）。
+    const localBytes = encoder.encode("local v1\n").buffer;
+    const remoteBytes = encoder.encode("cloud\n").buffer;
+    const files = new Map<string, ArrayBuffer>([[path, localBytes]]);
+    const local: LocalFileEntry = {
+      path,
+      hash: await sha256Hex(localBytes),
+      size: localBytes.byteLength,
+      mtime: 1,
+      binary: false,
+    };
+    const remote = {
+      path,
+      driveId: "remote-id",
+      size: remoteBytes.byteLength,
+      mtime: 2,
+      eTag: "etag-cloud",
+      cTag: "ctag-cloud",
+      sha256Hash: await sha256Hex(remoteBytes),
+    } as RemoteFileEntry;
+    const hostWriteLog: string[] = [];
+    const recordMutationReceipt = vi.fn().mockResolvedValue(undefined);
+    const notice = makeNoticeRecorder();
+    const zh = new I18n("zh-cn");
+    const executor = makeProgressAwareExecutor({
+      pendingConflicts: [{ type: SyncActionType.Conflict, path, local, remote }],
+      inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+      downloadFile: vi.fn().mockResolvedValue(remoteBytes),
+      vaultFile: new TFile(path),
+      hostEditorMerge: "unsaved\n",
+      hostWriteLog,
+      adapterOverrides: {
+        stat: vi.fn(async (target: string) => {
+          const bytes = files.get(target);
+          return bytes ? { size: bytes.byteLength, mtime: 2 } : null;
+        }),
+        readBinary: vi.fn(async (target: string) => files.get(target) ?? new ArrayBuffer(0)),
+        writeBinary: vi.fn(async (target: string, bytes: ArrayBuffer) => { files.set(target, bytes); }),
+        remove: vi.fn(async (target: string) => { files.delete(target); }),
+      },
+      stateOverrides: { recordMutationReceipt },
+      noticeCenter: notice.center,
+      i18n: zh,
+    });
+
+    await executor.resolveConflictKeepRemote(path);
+    await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+    // 磁盘上是云端版本后面接宿主合并回来的未保存行：写入本身已落地，这一轮记成功。
+    expect(decoder.decode(files.get(path)!)).toBe("cloud\nunsaved\n");
+    expect(hostWriteLog).toEqual(["cloud\n"]);
+    const checkpoint = recordMutationReceipt.mock.calls[0]?.[0]?.checkpoint as
+      | { baseUpserts: BaseFileEntry[]; pendingConflictRemovals: string[] }
+      | undefined;
+    expect(checkpoint?.pendingConflictRemovals).toEqual([path]);
+    // 基线记云端版本本身，不是磁盘上的合并结果：合并结果属于「本机改动」，
+    // 留给下一轮按普通本机改动上传（`DECISIONS` 2026-09-23 第 9 点②）。
+    expect(checkpoint?.baseUpserts).toEqual([{
+      path,
+      hash: await sha256Hex(remoteBytes),
+      size: remoteBytes.byteLength,
+      eTag: "etag-cloud",
+    }]);
+    // 这一轮记成功：没有任何冲突失败提示（合并结果不是失败，只是留给下一轮上传）。
+    expect(notice.messages.some((line) => line.includes(zh.t("notice.conflict.failed", { reason: "" })))).toBe(false);
+    notice.center.dispose();
+  });
+
+  it("keepRemote reports a write that never landed honestly instead of blaming a local change", async () => {
+    const path = "note.md";
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const localBytes = encoder.encode("local\n").buffer;
+    const remoteBytes = encoder.encode("cloud\n").buffer;
+    const files = new Map<string, ArrayBuffer>([[path, localBytes]]);
+    const local: LocalFileEntry = {
+      path,
+      hash: await sha256Hex(localBytes),
+      size: localBytes.byteLength,
+      mtime: 1,
+      binary: false,
+    };
+    const abandonMutationIntent = vi.fn().mockResolvedValue(undefined);
+    const recordMutationReceipt = vi.fn().mockResolvedValue(undefined);
+    const hostWriteLog: string[] = [];
+    const notice = makeNoticeRecorder();
+    const zh = new I18n("zh-cn");
+    const executor = makeProgressAwareExecutor({
+      pendingConflicts: [{
+        type: SyncActionType.Conflict,
+        path,
+        local,
+        remote: {
+          path,
+          driveId: "remote-id",
+          size: remoteBytes.byteLength,
+          mtime: 2,
+          eTag: "etag-cloud",
+          cTag: "ctag-cloud",
+          sha256Hash: await sha256Hex(remoteBytes),
+        },
+      }],
+      inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+      downloadFile: vi.fn().mockResolvedValue(remoteBytes),
+      vaultFile: new TFile(path),
+      hostWriteSilent: true,
+      hostWriteLog,
+      adapterOverrides: {
+        stat: vi.fn(async (target: string) => {
+          const bytes = files.get(target);
+          return bytes ? { size: bytes.byteLength, mtime: 2 } : null;
+        }),
+        readBinary: vi.fn(async (target: string) => files.get(target) ?? new ArrayBuffer(0)),
+        writeBinary: vi.fn(async (target: string, bytes: ArrayBuffer) => { files.set(target, bytes); }),
+        remove: vi.fn(async (target: string) => { files.delete(target); }),
+      },
+      stateOverrides: { abandonMutationIntent, recordMutationReceipt },
+      noticeCenter: notice.center,
+      i18n: zh,
+    });
+
+    await executor.resolveConflictKeepRemote(path);
+    await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+    // 同轮有界重试一次；本机文件自始至终没被改动，冲突也未销账。
+    expect(hostWriteLog).toEqual(["cloud\n", "cloud\n"]);
+    expect(decoder.decode(files.get(path)!)).toBe("local\n");
+    expect(recordMutationReceipt).not.toHaveBeenCalled();
+    expect(abandonMutationIntent).toHaveBeenCalledTimes(1);
+    // 用户看到的原因是「未能写入本机文件，本次未作更改」，而不是「确认后本机文件又发生了变化」，
+    // 也不是内部英文串（事件中心按 key 只留最新一条，后两条都曾把它覆盖掉）。
+    // 这里逐字钉住定稿文案（`notice.localWriteNotLanded`），防止措辞静默漂移。
+    expect(notice.center.activeKey).toBe(`side-action:notice.conflict.failed:${path}`);
+    expect(notice.messages.some((line) => line.includes("未能写入本机文件，本次未作更改。请查看最新版本后重新选择。"))).toBe(true);
+    expect(notice.messages.some((line) => line.includes(zh.t("notice.localChangedSinceReview")))).toBe(false);
+    expect(notice.messages.some((line) => line.includes("Local replacement did not land"))).toBe(false);
+    expect(notice.messages).toHaveLength(1);
+    notice.center.dispose();
+  });
+
+  it("keepRemote says the local content is unconfirmed when the rollback itself failed", async () => {
+    const path = "note.md";
+    const encoder = new TextEncoder();
+    const localBytes = encoder.encode("local v1\n").buffer;
+    const remoteBytes = encoder.encode("cloud\n").buffer;
+    const files = new Map<string, ArrayBuffer>([[path, localBytes]]);
+    const local: LocalFileEntry = {
+      path,
+      hash: await sha256Hex(localBytes),
+      size: localBytes.byteLength,
+      mtime: 1,
+      binary: false,
+    };
+    const abandonMutationIntent = vi.fn().mockResolvedValue(undefined);
+    const recordMutationReceipt = vi.fn().mockResolvedValue(undefined);
+    const notice = makeNoticeRecorder();
+    const zh = new I18n("zh-cn");
+    const executor = makeProgressAwareExecutor({
+      pendingConflicts: [{
+        type: SyncActionType.Conflict,
+        path,
+        local,
+        remote: {
+          path,
+          driveId: "remote-id",
+          size: remoteBytes.byteLength,
+          mtime: 2,
+          eTag: "etag-cloud",
+          cTag: "ctag-cloud",
+          sha256Hash: await sha256Hex(remoteBytes),
+        },
+      }],
+      inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+      downloadFile: vi.fn().mockResolvedValue(remoteBytes),
+      vaultFile: new TFile(path),
+      // 宿主只写进去两个字节＝我们自己写坏了；回放旧内容那一次写入再失败，
+      // 本机就停在被写坏的状态上（`DECISIONS` 2026-09-23 第 9 点③的坏结局）。
+      hostWriteTransform: (data) => data.slice(0, 2),
+      adapterOverrides: {
+        stat: vi.fn(async (target: string) => {
+          const bytes = files.get(target);
+          return bytes ? { size: bytes.byteLength, mtime: 2 } : null;
+        }),
+        readBinary: vi.fn(async (target: string) => files.get(target) ?? new ArrayBuffer(0)),
+        writeBinary: vi.fn(async (target: string, bytes: ArrayBuffer) => {
+          // 只让「回放旧内容」那一次失败：宿主写坏的那一下要正常落盘。
+          if (target === path && new TextDecoder().decode(bytes) === "local v1\n") {
+            throw new Error("rollback failed on purpose");
+          }
+          files.set(target, bytes);
+        }),
+        remove: vi.fn(async (target: string) => { files.delete(target); }),
+      },
+      stateOverrides: { abandonMutationIntent, recordMutationReceipt },
+      noticeCenter: notice.center,
+      i18n: zh,
+    });
+
+    await executor.resolveConflictKeepRemote(path);
+    await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+    expect(recordMutationReceipt).not.toHaveBeenCalled();
+    expect(abandonMutationIntent).toHaveBeenCalledTimes(1);
+    // 回放失败时不能说「本次未作更改」——那一句只在旧内容确实原样留在磁盘上时成立；
+    // 逐字钉住定稿文案（`notice.localWriteStateUncertain`），防止与另一句混用。
+    expect(notice.messages.some((line) => line.includes("未能写入本机文件，本机文件当前内容无法确认。请查看最新版本后重新选择。"))).toBe(true);
+    expect(notice.messages.some((line) => line.includes("本次未作更改"))).toBe(false);
+    expect(notice.messages).toHaveLength(1);
+    notice.center.dispose();
+  });
+
+  it("keepRemote names the local change when the file moves in the final CAS window", async () => {
+    const path = "note.md";
+    const encoder = new TextEncoder();
+    const reviewedBytes = encoder.encode("reviewed\n").buffer;
+    const racedBytes = encoder.encode("raced\n").buffer;
+    const remoteBytes = encoder.encode("cloud\n").buffer;
+    // 审阅之后、写入之前的窗口里本机被别人改掉：扫描事实仍是审阅版本，磁盘已经变了。
+    const files = new Map<string, ArrayBuffer>([[path, racedBytes]]);
+    const reviewed: LocalFileEntry = {
+      path,
+      hash: await sha256Hex(reviewedBytes),
+      size: reviewedBytes.byteLength,
+      mtime: 1,
+      binary: false,
+    };
+    const abandonMutationIntent = vi.fn().mockResolvedValue(undefined);
+    const recordMutationReceipt = vi.fn().mockResolvedValue(undefined);
+    const notice = makeNoticeRecorder();
+    const zh = new I18n("zh-cn");
+    const executor = makeProgressAwareExecutor({
+      pendingConflicts: [{
+        type: SyncActionType.Conflict,
+        path,
+        local: reviewed,
+        remote: {
+          path,
+          driveId: "remote-id",
+          size: remoteBytes.byteLength,
+          mtime: 2,
+          eTag: "etag-cloud",
+          cTag: "ctag-cloud",
+          sha256Hash: await sha256Hex(remoteBytes),
+        },
+      }],
+      inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: reviewed }),
+      downloadFile: vi.fn().mockResolvedValue(remoteBytes),
+      adapterOverrides: {
+        stat: vi.fn(async (target: string) => {
+          const bytes = files.get(target);
+          return bytes ? { size: bytes.byteLength, mtime: 2 } : null;
+        }),
+        readBinary: vi.fn(async (target: string) => files.get(target) ?? new ArrayBuffer(0)),
+        writeBinary: vi.fn(async (target: string, bytes: ArrayBuffer) => { files.set(target, bytes); }),
+        remove: vi.fn(async (target: string) => { files.delete(target); }),
+      },
+      stateOverrides: { abandonMutationIntent, recordMutationReceipt },
+      noticeCenter: notice.center,
+      i18n: zh,
+    });
+
+    await executor.resolveConflictKeepRemote(path);
+    await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+    expect(new TextDecoder().decode(files.get(path)!)).toBe("raced\n");
+    expect(recordMutationReceipt).not.toHaveBeenCalled();
+    expect(abandonMutationIntent).toHaveBeenCalledTimes(1);
+    // 这一档确实是本机改动，但用户要看本地化说明，不是内部英文串。
+    expect(notice.messages).toHaveLength(1);
+    expect(notice.messages[0]).toContain(zh.t("notice.localChangedSinceReview"));
+    expect(notice.messages[0]).not.toContain("Local file changed before replacement");
+    notice.center.dispose();
   });
 
   it("Preflight P0 — keepLocal rejects a decision after local content changes", async () => {

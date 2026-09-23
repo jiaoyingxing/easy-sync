@@ -99,6 +99,50 @@ body.is-mobile .modal-container.easy-sync-modal-container .modal-bg {
  * 0.35) stays — a plain tint with no blur, same as the pre-change look. No
  * extra darkening needed, so no overriding rule here. */
 
+/* ---- Auto-sync slider fill ---- */
+
+/* The accent fill left of the thumb is a host mechanism from Obsidian 1.13+
+ * only (`input[type=range].slider` paints a gradient driven by the
+ * JS-written `--slider-fill-ratio`); older hosts — several Android builds
+ * included — ship no fill at all, so the track renders as one flat gray
+ * line. Replicate the host rule for EasySync sliders with fallbacks for the
+ * host vars those builds lack; on 1.13+ both write the same paint, so
+ * nothing changes there. The ratio itself is written by paintSliderFill()
+ * in auto-sync-modal.ts. */
+.easy-sync-auto-sync input[type="range"] {
+  --slider-fill-position: calc(
+    var(--slider-thumb-width, 18px) / 2 +
+      (100% - var(--slider-thumb-width, 18px)) * var(--slider-fill-ratio, 0)
+  );
+  background-image: linear-gradient(
+    to var(--inset-end, right),
+    var(--slider-fill-background, var(--interactive-accent))
+      var(--slider-fill-position),
+    transparent var(--slider-fill-position)
+  );
+}
+
+/* ---- Auto-sync slider value ---- */
+
+/* The numeric readout beside the track is a host mechanism from 1.13+ too
+ * (`span.slider-value` created before the input and kept in sync by
+ * SliderComponent); older hosts — several Android builds included — render
+ * nothing at all, since their value tooltip was hover-only and touch
+ * screens never trigger it. ensureSliderValueEl() in auto-sync-modal.ts
+ * creates the same span only on hosts without one; replicate the host rule
+ * with fallbacks for the vars those builds lack. On 1.13+ hosts no plugin
+ * span exists, and for the host's own element this writes the same values
+ * the host rule already applies. */
+.easy-sync-auto-sync .slider-value {
+  font-size: var(--slider-value-font-size, var(--font-ui-small));
+  font-weight: var(
+    --slider-value-font-weight,
+    var(--input-font-weight, var(--font-normal))
+  );
+  color: var(--text-normal);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---- Settings Modals ---- */
 
 .easy-sync-settings-modal {
@@ -112,6 +156,14 @@ body.is-mobile .modal-container.easy-sync-modal-container .modal-bg {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+
+/* One-line intro under a modal title. The host lays modal content out as a
+   column flex on phones, where a long row list squeezes shrinkable children
+   to zero height and the line silently disappears; keep its own box, the same
+   way the community-plugin page protects its search field. */
+.easy-sync-modal-intro {
+  flex: 0 0 auto;
 }
 
 .easy-sync-settings-modal .modal-content.easy-sync-community-plugin-page {
@@ -643,20 +695,6 @@ body.is-mobile .easy-sync-bundle-overview .easy-sync-bundle-diff-link {
   background: var(--background-secondary);
 }
 
-.easy-sync-diff-summary-reason {
-  padding: 8px;
-  color: var(--text-warning);
-  font-family: var(--font-interface);
-  font-size: 0.95em;
-}
-
-.easy-sync-diff-summary-range {
-  padding: 0 8px 8px;
-  color: var(--text-muted);
-  font-family: var(--font-interface);
-  font-size: 0.9em;
-}
-
 /* Remote unavailable fallback */
 .easy-sync-remote-unavailable {
   padding: 12px;
@@ -1141,6 +1179,14 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
   overflow-y: auto;
 }
 
+/* 子项不参与纵向挤压：is-limited 列表装满后应当滚动，而不是把灰字目录
+ * 压成空白窄行——目录带 overflow: hidden（省略号所需），flex 的自动最小
+ * 高度为零，是内容超高时最先被压没的受害者；文件行溢出可见、最小高度
+ * 锁在文字行，挤压几乎全部落在目录行上。 */
+.easy-sync-file-list > * {
+  flex-shrink: 0;
+}
+
 .easy-sync-path-directory {
   box-sizing: border-box;
   min-width: 0;
@@ -1247,11 +1293,15 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
   min-width: 0;
 }
 
+/* 流内窗口（方案单 20260924-0001）：可视行窗口夹在上下占位之间参与文档
+ * 流，行内容只会把下占位与下方区域一起推开——溢出叠压在构造上不可能；
+ * 估算误差降级为滚动长度短暂不准，由量实高收敛自纠。 */
 .easy-sync-plan-virtual-window {
-  position: absolute;
-  top: 0;
-  right: 0;
-  left: 0;
+  min-width: 0;
+}
+
+.easy-sync-plan-virtual-spacer {
+  pointer-events: none;
 }
 
 .easy-sync-plan-measure-probe {

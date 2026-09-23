@@ -11,6 +11,10 @@
  * Check source: jsDelivr data API for the public release repo (same source
  * precedent as OpenPlug / Resojot; reachable from CN networks without a
  * mirror). Single KB-sized anonymous GET, 15s budget, every failure silent.
+ * The singular /v1/package family is officially deprecated (Deprecation
+ * header since 2023-01-01, Link rel="successor-version"); we call the
+ * documented successor /v1/packages, whose versions are {version, links}
+ * objects in the same tag-time-descending order.
  */
 
 /** One cold-start-cycle check budget; failures surface nothing anywhere. */
@@ -23,7 +27,7 @@ export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const SNOOZE_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export const JSDELIVR_PACKAGE_URL =
-  "https://data.jsdelivr.com/v1/package/gh/jiaoyingxing/easy-sync";
+  "https://data.jsdelivr.com/v1/packages/gh/jiaoyingxing/easy-sync";
 
 export function isStableVersion(version: string): boolean {
   return /^\d+(\.\d+)+$/u.test(version);
@@ -108,9 +112,16 @@ export async function fetchLatestStableVersion(
       UPDATE_CHECK_TIMEOUT_MS,
     );
     if (response.status < 200 || response.status >= 300) return null;
-    const data = JSON.parse(response.text) as { versions?: unknown };
+    const data = JSON.parse(response.text) as {
+      versions?: Array<{ version?: unknown }>;
+    };
     if (!Array.isArray(data.versions)) return null;
-    return pickLatestStableVersion(data.versions.map(String));
+    return pickLatestStableVersion(
+      data.versions.flatMap((entry) => {
+        const version = entry?.version;
+        return typeof version === "string" ? [version] : [];
+      }),
+    );
   } catch {
     return null;
   }

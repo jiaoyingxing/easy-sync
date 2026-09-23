@@ -128,9 +128,23 @@ describe("fetchLatestStableVersion", () => {
   const ok = (text: string) =>
     Promise.resolve({ status: 200, text } as const);
 
-  it("returns the newest stable version from jsDelivr payload", async () => {
+  it("returns the newest stable version from the jsDelivr successor payload", async () => {
     const fetcher = vi.fn(() =>
-      ok(JSON.stringify({ versions: ["1.4.8-beta", "1.4.7", "1.4.8"] })),
+      ok(
+        JSON.stringify({
+          versions: [{ version: "1.4.8-beta" }, { version: "1.4.7" }, { version: "1.4.8" }],
+        }),
+      ),
+    );
+    await expect(fetchLatestStableVersion(fetcher)).resolves.toBe("1.4.8");
+    expect(fetcher).toHaveBeenCalledWith(
+      expect.objectContaining({ url: expect.stringContaining("/v1/packages/") }),
+    );
+  });
+
+  it("filters entries without a version field out of the payload", async () => {
+    const fetcher = vi.fn(() =>
+      ok(JSON.stringify({ versions: [null, {}, { version: "1.4.8" }] })),
     );
     await expect(fetchLatestStableVersion(fetcher)).resolves.toBe("1.4.8");
   });

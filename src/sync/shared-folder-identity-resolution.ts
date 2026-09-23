@@ -1,5 +1,6 @@
 import { canonicalPlannerStateFromEnvelopeV2 } from "./canonical-planner-state-v2";
 import { planFolderStateV2 } from "./folder-state-v2";
+import { identityPath } from "./recovery-anchor-v2";
 import type { SyncStateEnvelopeV2 } from "./state-envelope-v2";
 import type {
   LocalFileEntry,
@@ -18,6 +19,18 @@ export interface SharedFolderIdentityResolutionSnapshotV1 {
   sourceCommitSeq: number;
   folders: RemoteFolderEntry[];
 }
+
+/**
+ * Outcome of one review attempt. `name-mismatch` is the one unavailable cause
+ * the user can act on: the planner matched the pair by identity (letter case
+ * and Unicode form do not matter there), so the same-name pair keeps being
+ * reported while this entry can never confirm it — renaming one side to match
+ * the other exactly is the only way out.
+ */
+export type SharedFolderIdentityResolutionOutcomeV1 =
+  | { status: "ready"; snapshot: SharedFolderIdentityResolutionSnapshotV1 }
+  | { status: "name-mismatch"; path: string }
+  | { status: "unavailable" };
 
 export interface SharedFolderIdentityResolutionFactsV1 {
   envelope: SyncStateEnvelopeV2;
@@ -40,8 +53,8 @@ export interface SharedFolderIdentityResolutionFactsV1 {
 export function buildSharedFolderIdentityResolutionSnapshotV1(
   path: string,
   facts: SharedFolderIdentityResolutionFactsV1,
-): SharedFolderIdentityResolutionSnapshotV1 | null {
-  if (!facts.localFolderScanComplete) return null;
+): SharedFolderIdentityResolutionOutcomeV1 {
+  if (!facts.localFolderScanComplete) return { status: "unavailable" };
 
   const state = canonicalPlannerStateFromEnvelopeV2(facts.envelope);
   const plan = planFolderStateV2({
@@ -55,14 +68,14 @@ export function buildSharedFolderIdentityResolutionSnapshotV1(
     includeFolderPath: facts.includeFolderPath,
     preserveFolderPath: facts.preserveFolderPath,
   });
-  if (plan.status !== "planned") return null;
+  if (plan.status !== "planned") return { status: "unavailable" };
 
   const selected = plan.items.find((item) =>
     item.type === "conflict"
       && item.path === path
       && item.reason === "unanchored-shared-folder",
   );
-  if (!selected?.remoteId) return null;
+  if (!selected?.remoteId) return { status: "unavailable" };
 
   const localFolderPaths = new Set(
     facts.localFolders.map((folder) => folder.path),
@@ -78,13 +91,20 @@ export function buildSharedFolderIdentityResolutionSnapshotV1(
       pathDepth(left.path) - pathDepth(right.path)
         || left.path.localeCompare(right.path),
     )) {
-    if (!item.remoteId || !localFolderPaths.has(item.path)) return null;
+    if (!item.remoteId || !localFolderPaths.has(item.path)) {
+      return { status: "unavailable" };
+    }
     const remote = state.remoteNodeById.get(item.remoteId);
-    if (
-      remote?.kind !== "folder"
-      || state.remotePathById.get(item.remoteId) !== item.path
-      || !remote.eTag
-    ) return null;
+    const remotePath = state.remotePathById.get(item.remoteId);
+    if (remote?.kind !== "folder" || remotePath === undefined) {
+      return { status: "unavailable" };
+    }
+    if (remotePath !== item.path) {
+      return identityPath(remotePath) === identityPath(item.path)
+        ? { status: "name-mismatch", path: item.path }
+        : { status: "unavailable" };
+    }
+    if (!remote.eTag) return { status: "unavailable" };
     folders.push({
       path: item.path,
       driveId: remote.id,
@@ -97,7 +117,7 @@ export function buildSharedFolderIdentityResolutionSnapshotV1(
   if (
     folders.length === 0
     || folders[folders.length - 1]?.path !== path
-  ) return null;
+  ) return { status: "unavailable" };
 
   const snapshot = {
     version: 1 as const,
@@ -107,11 +127,14 @@ export function buildSharedFolderIdentityResolutionSnapshotV1(
     folders,
   };
   return {
-    ...snapshot,
-    revision: JSON.stringify({
-      lifecycleEpoch: state.meta.lifecycleEpoch,
+    status: "ready",
+    snapshot: {
       ...snapshot,
-    }),
+      revision: JSON.stringify({
+        lifecycleEpoch: state.meta.lifecycleEpoch,
+        ...snapshot,
+      }),
+    },
   };
 }
 

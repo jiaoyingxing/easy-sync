@@ -25,6 +25,7 @@ import {
   LocalScanner,
 } from "../src/sync/local-scanner";
 import { projectStatePathViewV2 } from "../src/sync/file-state-controller-v2";
+import type { ManualResolutionEntrySnapshot } from "../src/sync/manual-resolution-entry";
 import { StateManager, type PluginDataStore } from "../src/sync/state-manager";
 import {
   SyncExecutor,
@@ -45,7 +46,8 @@ import {
   IndexedDbPublic113StateStore,
   type Public113IndexedDbCandidateStoreFactory,
 } from "../src/sync/indexeddb-public-1-1-3-state";
-import { StateV2IndexedDbActiveStore } from "../src/sync/state-v2-indexeddb-active";
+import { StateV2IndexedDbActiveStore, stateV2ActiveIndexedDbDatabaseName } from "../src/sync/state-v2-indexeddb-active";
+import { openDB } from "idb";
 import {
   IndexedDbRemoteScopeRecoveryEvidenceStore,
 } from "../src/sync/remote-scope-recovery-evidence-store";
@@ -530,6 +532,23 @@ function makeHarness(input?: {
   let changeNextParentVersion = false;
   let moveNextParent = false;
   let onNextDelta: (() => void) | null = null;
+  /** 宿主写入面与适配器写入落同一份事实；分开是为了让 rawAdapter.writeBinary 的
+   *  调用记录只反映生产代码直接对适配器的写入（真实 vault.modify 不走那条路）。 */
+  const hostWrites: string[] = [];
+  const commitLocalBytes = async (path: string, value: ArrayBuffer) => {
+    const content = new Uint8Array(value);
+    files.set(path, new TextDecoder().decode(content));
+    const current = localEntryState.find((entry) => entry.path === path);
+    const next = {
+      path,
+      size: content.byteLength,
+      mtime: (current?.mtime ?? 0) + 1,
+      hash: await sha256Hex(content),
+      binary: false,
+    };
+    if (current) Object.assign(current, next);
+    else localEntryState.push(next);
+  };
   const rawAdapter = {
     exists: vi.fn(async (path: string) => files.has(path) || localFolderPaths.has(path)),
     read: vi.fn(async (path: string) => {
@@ -785,18 +804,7 @@ function makeHarness(input?: {
     readBinary: vi.fn(async (path: string) =>
       new TextEncoder().encode(files.get(path) ?? "").buffer),
     writeBinary: vi.fn(async (path: string, value: ArrayBuffer) => {
-      const content = new Uint8Array(value);
-      files.set(path, new TextDecoder().decode(content));
-      const current = localEntryState.find((entry) => entry.path === path);
-      const next = {
-        path,
-        size: content.byteLength,
-        mtime: (current?.mtime ?? 0) + 1,
-        hash: await sha256Hex(content),
-        binary: false,
-      };
-      if (current) Object.assign(current, next);
-      else localEntryState.push(next);
+      await commitLocalBytes(path, value);
     }),
   };
   const adapter = rawAdapter as unknown as DataAdapter;
@@ -837,9 +845,18 @@ function makeHarness(input?: {
             ? new TFile(path)
             : null),
       getFileByPath: vi.fn((path: string) =>
-        localEntryState.some((entry) => entry.path === path)
+        // 配置目录里的文件在真实宿主里不在库索引中（`getFileByPath` 返回 null），
+        // 永远走原子替换——假体也按这条路由，别让配置路径假装成宿主可见文件。
+        !path.startsWith(".obsidian/")
+        && localEntryState.some((entry) => entry.path === path)
           ? new TFile(path)
           : null),
+      // 真实宿主总是自带的写入面：有它才会走「原地写」而不是改名交换
+      // （`DECISIONS` 2026-09-23 第 9 点）。
+      modify: vi.fn(async (file: TFile, data: string) => {
+        hostWrites.push(data);
+        await commitLocalBytes(file.path, new TextEncoder().encode(data).buffer);
+      }),
       createFolder: vi.fn(async (path: string) => {
         localFolderPaths.add(path);
         if (loseNextLocalFolderCreateResponse) {
@@ -1304,6 +1321,7 @@ function makeHarness(input?: {
   );
   return {
     files,
+    hostWrites,
     localEntryState,
     localFolderPaths,
     remoteItemState,
@@ -1659,6 +1677,13 @@ async function prepareAmbiguousEmptyFolderHarness(
   return { harness, reviewed: reviewed! };
 }
 
+/** Unwrap one manual-resolution entry that is expected to be ready to open. */
+function readySnapshot<T>(entry: ManualResolutionEntrySnapshot<T>): T {
+  expect(entry.reason).toBe("ready");
+  if (!entry.snapshot) throw new Error("expected a ready resolution snapshot");
+  return entry.snapshot;
+}
+
 async function prepareUnanchoredSharedFolderHarness() {
   const folderPaths = [".obsidian", ".obsidian/plugins"];
   const harness = makeHarness();
@@ -1694,10 +1719,11 @@ async function prepareUnanchoredSharedFolderHarness() {
       issueCode: "unanchored-shared-folder",
     }),
   ]);
-  const reviewed =
+  const reviewed = readySnapshot(
     await harness.executor.getSharedFolderIdentityResolutionSnapshot(
       ".obsidian/plugins",
-    );
+    ),
+  );
   expect(reviewed).toMatchObject({
     path: ".obsidian/plugins",
     folders: [
@@ -4299,6 +4325,7 @@ describe("V1 to V2 controlled production activation", () => {
       expect(harness.client.createFolderByParentId).not.toHaveBeenCalled();
       expect(harness.client.moveItemById).not.toHaveBeenCalled();
       expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+      expect(harness.hostWrites).toEqual([]);
       expect(harness.fileManager.trashFile).not.toHaveBeenCalled();
       expect(harness.files.has(paths.stateV2ManifestFile)).toBe(false);
       expect(harness.pluginData[KEY_PUBLIC_113_CUTOVER]).toBeUndefined();
@@ -4516,6 +4543,7 @@ describe("V1 to V2 controlled production activation", () => {
       expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
       expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
       expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+      expect(harness.hostWrites).toEqual([]);
       expect(harness.files.has(paths.stateV2ManifestFile)).toBe(false);
 
       const authorization = structuredClone(
@@ -4670,6 +4698,7 @@ describe("V1 to V2 controlled production activation", () => {
       expect(interruptedHarness.mutations.deleteItem).not.toHaveBeenCalled();
       expect(interruptedHarness.mutations.renameItem).not.toHaveBeenCalled();
       expect(interruptedHarness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+      expect(interruptedHarness.hostWrites).toEqual([]);
       expect(interruptedHarness.fileManager.trashFile).not.toHaveBeenCalled();
       expect(interruptedHarness.files.has(paths.stateV2ManifestFile)).toBe(false);
 
@@ -4722,6 +4751,7 @@ describe("V1 to V2 controlled production activation", () => {
       expect(interruptedHarness.mutations.deleteItem).not.toHaveBeenCalled();
       expect(interruptedHarness.mutations.renameItem).not.toHaveBeenCalled();
       expect(interruptedHarness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+      expect(interruptedHarness.hostWrites).toEqual([]);
       expect(interruptedHarness.fileManager.trashFile).not.toHaveBeenCalled();
       expect(interruptedHarness.files.has(paths.stateV2ManifestFile)).toBe(false);
 
@@ -4753,6 +4783,7 @@ describe("V1 to V2 controlled production activation", () => {
       expect(controlHarness.mutations.deleteItem).not.toHaveBeenCalled();
       expect(controlHarness.mutations.renameItem).not.toHaveBeenCalled();
       expect(controlHarness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+      expect(controlHarness.hostWrites).toEqual([]);
       expect(controlHarness.fileManager.trashFile).not.toHaveBeenCalled();
       expect(controlHarness.files.has(paths.stateV2ManifestFile)).toBe(false);
     } finally {
@@ -5217,6 +5248,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
     expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
     expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+    expect(harness.hostWrites).toEqual([]);
   });
 
   it("keeps an existing public-1.1.3 base authoritative over a newer bootstrap anchor", async () => {
@@ -5281,6 +5313,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
     expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
     expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+    expect(harness.hostWrites).toEqual([]);
   });
 
   it("falls back to content when bootstrap identity and the current remote projection disagree", async () => {
@@ -5345,6 +5378,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
     expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
     expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+    expect(harness.hostWrites).toEqual([]);
   });
 
   it("falls back to every unanchored path when the bootstrap scope is wrong", async () => {
@@ -5395,6 +5429,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
     expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
     expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+    expect(harness.hostWrites).toEqual([]);
   });
 
   it("keeps public 1.1.3 authoritative when its source changes during IndexedDB planner preparation", async () => {
@@ -6512,6 +6547,7 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.state.isV2StateActive).toBe(false);
     expect(harness.files.get(stablePath)).toBe(originalContent);
     expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+    expect(harness.hostWrites).toEqual([]);
     expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
     expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
     expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
@@ -6555,7 +6591,12 @@ describe("V1 to V2 controlled production activation", () => {
         binary: false,
       }),
     );
-    expect(harness.rawAdapter.writeBinary).toHaveBeenCalledOnce();
+    // 宿主看得见的文件由宿主写入面原地替换（F12）；适配器只写暂存文件与留底副本，
+    // 目标路径上不该出现适配器直写——旧的名字交换就是从这里消失的。
+    expect(harness.hostWrites).toEqual([changedContent]);
+    expect(
+      harness.rawAdapter.writeBinary.mock.calls.filter(([path]) => path === stablePath),
+    ).toEqual([]);
     expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
     expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
     expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
@@ -6585,7 +6626,8 @@ describe("V1 to V2 controlled production activation", () => {
     expect(restartedState.isV2StateActive).toBe(true);
     expect(restartedState.mutationLedger).toEqual([]);
     expect(harness.files.get(stablePath)).toBe(changedContent);
-    expect(harness.rawAdapter.writeBinary).toHaveBeenCalledOnce();
+    // 冷启动后的这一轮没有重写任何内容：宿主写入面仍只有切换轮那一次记录。
+    expect(harness.hostWrites).toEqual([changedContent]);
   });
 
   it("preserves an exact public-1.1.3 overlapping edit conflict across V2 cutover and cold restart", async () => {
@@ -8637,6 +8679,7 @@ describe("V1 to V2 controlled production activation", () => {
     ]);
     expect(harness.mutations.uploadFile).not.toHaveBeenCalled();
     expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+    expect(harness.hostWrites).toEqual([]);
   });
 
   it("cuts authority only on a zero plan and the next V2 round stays zero", async () => {
@@ -9533,6 +9576,61 @@ describe("V1 to V2 controlled production activation", () => {
     expectNoFileMutations(harness.mutations);
   });
 
+  it("names a case-only folder-name difference instead of offering the review", async () => {
+    // 规划器按身份（忽略大小写）认定同名对，所以只差大小写的本机/云端文件夹
+    // 会稳定产出 unanchored-shared-folder 待处理行；人工确认却要求两侧路径
+    // 逐字节相等 → 该出口在这种形态下永远打不开。行为契约：入口必须说出真正
+    // 的原因（改名即可解），不再笼统报"状态已变化"。
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    harness.localFolderPaths.add("archive");
+    harness.remoteItemState.push(...remoteFolderTree(["Archive"]));
+
+    const deferred = await harness.executor.run("manual");
+    expect(deferred).toMatchObject({
+      success: true,
+      foldersCreated: 0,
+      foldersMoved: 0,
+      foldersDeleted: 0,
+      deferred: 1,
+      errors: 0,
+    });
+    expect(harness.state.pendingIssues).toEqual([
+      expect.objectContaining({
+        path: "archive",
+        issueCode: "unanchored-shared-folder",
+      }),
+    ]);
+
+    expect(
+      await harness.executor.getSharedFolderIdentityResolutionSnapshot("archive"),
+    ).toEqual({
+      snapshot: null,
+      reason: "name-mismatch",
+      nameMismatchPath: "archive",
+    });
+    expectNoFileMutations(harness.mutations);
+  });
+
+  it("reports the running sync instead of changed facts while a round is in flight", async () => {
+    const { harness } = await prepareUnanchoredSharedFolderHarness();
+
+    const round = harness.executor.run("manual");
+    const entry =
+      await harness.executor.getSharedFolderIdentityResolutionSnapshot(
+        ".obsidian/plugins",
+      );
+    expect(entry).toEqual({ snapshot: null, reason: "round-running" });
+    await round;
+  });
+
   it("retires an explicitly reviewed file replacement lineage without changing either side", async () => {
     const harness = makeHarness();
     await harness.state.load();
@@ -9570,8 +9668,10 @@ describe("V1 to V2 controlled production activation", () => {
         issueCode: "identity-replacement-ambiguous",
       }),
     ]);
-    const reviewed = await harness.executor.getStaleIdentityResolutionSnapshot(
-      "Notes/a.md",
+    const reviewed = readySnapshot(
+      await harness.executor.getStaleIdentityResolutionSnapshot(
+        "Notes/a.md",
+      ),
     );
     expect(reviewed).toMatchObject({
       kind: "file-replacement",
@@ -9615,8 +9715,10 @@ describe("V1 to V2 controlled production activation", () => {
       cTag: "ctag-replacement",
     });
     expect((await harness.executor.run("manual")).deferred).toBe(1);
-    const reviewed = await harness.executor.getStaleIdentityResolutionSnapshot(
-      "Notes/a.md",
+    const reviewed = readySnapshot(
+      await harness.executor.getStaleIdentityResolutionSnapshot(
+        "Notes/a.md",
+      ),
     );
     expect(reviewed).not.toBeNull();
     harness.remoteItemState.find((item) => item.id === "file-replacement")!.eTag =
@@ -9667,8 +9769,10 @@ describe("V1 to V2 controlled production activation", () => {
         issueCode: "identity-replacement-ambiguous",
       }),
     ]);
-    const reviewed = await harness.executor.getStaleIdentityResolutionSnapshot(
-      "Notes",
+    const reviewed = readySnapshot(
+      await harness.executor.getStaleIdentityResolutionSnapshot(
+        "Notes",
+      ),
     );
     expect(reviewed).toMatchObject({
       kind: "folder-missing-remote",
@@ -11643,6 +11747,285 @@ describe("V1 to V2 controlled production activation", () => {
       for (const stores of activeStores.values()) {
         for (const store of stores) await store.close();
         await stores[0]?.delete();
+      }
+    }
+  }, 30_000);
+
+  async function snapshotIndexedDbActiveStore(
+    databaseId: string,
+  ): Promise<{
+    meta: unknown;
+    remoteNodes: unknown[];
+    anchors: unknown[];
+    folderAnchors: unknown[];
+  }> {
+    const db = await openDB(stateV2ActiveIndexedDbDatabaseName(databaseId), 1);
+    const tx = db.transaction(
+      ["meta", "remoteNodes", "anchors", "folderAnchors"],
+      "readonly",
+    );
+    const meta = await tx.objectStore("meta").get("state");
+    const remoteNodes = await tx.objectStore("remoteNodes").getAll();
+    const anchors = await tx.objectStore("anchors").getAll();
+    const folderAnchors = await tx.objectStore("folderAnchors").getAll();
+    await tx.done;
+    db.close();
+    return { meta, remoteNodes, anchors, folderAnchors };
+  }
+
+  async function restoreIndexedDbActiveStore(
+    databaseId: string,
+    snapshot: {
+      meta: unknown;
+      remoteNodes: unknown[];
+      anchors: unknown[];
+      folderAnchors: unknown[];
+    },
+  ): Promise<void> {
+    const db = await openDB(stateV2ActiveIndexedDbDatabaseName(databaseId), 1);
+    const tx = db.transaction(
+      ["meta", "remoteNodes", "anchors", "folderAnchors"],
+      "readwrite",
+    );
+    await Promise.all([
+      tx.objectStore("meta").clear(),
+      tx.objectStore("remoteNodes").clear(),
+      tx.objectStore("anchors").clear(),
+      tx.objectStore("folderAnchors").clear(),
+      tx.objectStore("meta").put(snapshot.meta, "state"),
+      ...snapshot.remoteNodes.map((value) =>
+        tx.objectStore("remoteNodes").put(value as { id: string }, (value as { id: string }).id),
+      ),
+      ...snapshot.anchors.map((value) =>
+        tx.objectStore("anchors").put(value as { anchorId: string }, (value as { anchorId: string }).anchorId),
+      ),
+      ...snapshot.folderAnchors.map((value) =>
+        tx.objectStore("folderAnchors").put(
+          value as { anchorId: string },
+          (value as { anchorId: string }).anchorId,
+        ),
+      ),
+      tx.done,
+    ]);
+    db.close();
+  }
+
+  function makeJournalHarness(): {
+    harness: ReturnType<typeof makeHarness>;
+    activeStores: Map<string, StateV2IndexedDbActiveStore[]>;
+    recoveries: Map<string, StateV2IndexedDbRecoveryStore>;
+  } {
+    const indexedDbVaultInstanceId = crypto.randomUUID().replaceAll("-", "");
+    const activeStores = new Map<string, StateV2IndexedDbActiveStore[]>();
+    const recoveries = new Map<string, StateV2IndexedDbRecoveryStore>();
+    const harness = makeHarness({
+      indexedDbVaultInstanceId,
+      createStateV2IndexedDbActiveStore: (databaseId, recovery) => {
+        const store = new StateV2IndexedDbActiveStore(databaseId, recovery);
+        activeStores.set(databaseId, [
+          ...(activeStores.get(databaseId) ?? []),
+          store,
+        ]);
+        recoveries.set(databaseId, recovery);
+        return store;
+      },
+    });
+    return { harness, activeStores, recoveries };
+  }
+
+  async function commitOneFileRevision(
+    harness: ReturnType<typeof makeHarness>,
+    marker: string,
+    mtime: number,
+    executor: SyncExecutor = harness.executor,
+  ): Promise<void> {
+    const bytes = new TextEncoder().encode(marker);
+    const hash = await sha256Hex(bytes);
+    harness.files.set(localA.path, marker);
+    harness.localEntryState[0] = {
+      ...harness.localEntryState[0],
+      hash,
+      size: bytes.byteLength,
+      mtime,
+    };
+    harness.mutations.uploadFile.mockImplementationOnce(async () => {
+      const remote = harness.remoteItemState.find(
+        (item) => item.id === "file-a",
+      )!;
+      remote.size = bytes.byteLength;
+      remote.file = { hashes: { sha256Hash: hash } };
+      remote.eTag = `etag-${marker}`;
+      remote.cTag = `ctag-${marker}`;
+      return { ...remote, parentReference: { ...remote.parentReference } };
+    });
+    const result = await executor.run("manual");
+    expect(result.success).toBe(true);
+  }
+
+  it("rebuilds a rolled-back IndexedDB store from the witnessed journal on load", async () => {
+    const { harness, recoveries, activeStores } = makeJournalHarness();
+    let restarted: StateManager | null = null;
+    try {
+      await harness.state.load();
+      expect((await harness.executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        { activateV2State: true },
+      )).success).toBe(true);
+      const selectedDatabaseId = harness.state
+        .activeV2StorageAuthorityEvidence!.databaseId!;
+      const recovery = recoveries.get(selectedDatabaseId)!;
+
+      await commitOneFileRevision(harness, "rollback-form revision A", 2);
+      const snapshot = await snapshotIndexedDbActiveStore(selectedDatabaseId);
+      const rollbackSeq = (snapshot.meta as {
+        header: { meta: { commitSeq: number } };
+      }).header.meta.commitSeq;
+      await commitOneFileRevision(harness, "rollback-form revision B", 3);
+      const headSeq = (await recovery.rebuild()).meta.commitSeq;
+      expect(headSeq).toBeGreaterThan(rollbackSeq);
+
+      await restoreIndexedDbActiveStore(selectedDatabaseId, snapshot);
+      restarted = new StateManager(harness.plugin);
+      await restarted.load();
+      expect(restarted.v2StateLoadRecoveryBlock).toBeNull();
+      const healed = restarted.getCommittedV2Envelope()!;
+      expect(healed.meta.commitSeq).toBe(headSeq);
+      const rebuiltDatabaseId = restarted
+        .activeV2StorageAuthorityEvidence!.databaseId!;
+      expect(rebuiltDatabaseId).not.toBe(selectedDatabaseId);
+    } finally {
+      await restarted?.close();
+      await harness.state.close();
+      for (const stores of activeStores.values()) {
+        for (const store of stores) await store.close();
+      }
+    }
+  }, 30_000);
+
+  it("keeps the load blocked when the journal record itself fails digest verification", async () => {
+    const { harness, recoveries, activeStores } = makeJournalHarness();
+    let restarted: StateManager | null = null;
+    try {
+      await harness.state.load();
+      expect((await harness.executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        { activateV2State: true },
+      )).success).toBe(true);
+      const selectedDatabaseId = harness.state
+        .activeV2StorageAuthorityEvidence!.databaseId!;
+      const recovery = recoveries.get(selectedDatabaseId)!;
+
+      await commitOneFileRevision(harness, "tampered-journal revision A", 2);
+      const snapshot = await snapshotIndexedDbActiveStore(selectedDatabaseId);
+      await commitOneFileRevision(harness, "tampered-journal revision B", 3);
+      const headSeq = (await recovery.rebuild()).meta.commitSeq;
+      await restoreIndexedDbActiveStore(selectedDatabaseId, snapshot);
+      await harness.files.set(
+        recovery.deltaPath(headSeq),
+        "{\"tampered\":true}",
+      );
+
+      restarted = new StateManager(harness.plugin);
+      await restarted.load();
+      expect(restarted.v2StateLoadRecoveryBlock).toMatchObject({
+        reason: "indexeddb-authority-recovery-failed",
+      });
+    } finally {
+      await restarted?.close();
+      await harness.state.close();
+      for (const stores of activeStores.values()) {
+        for (const store of stores) await store.close();
+      }
+    }
+  }, 30_000);
+
+  it("keeps the load blocked when the journal rebuild budget is exhausted", async () => {
+    const { harness, recoveries, activeStores } = makeJournalHarness();
+    const deviceStorage = new Map<string, string>();
+    harness.plugin.app.loadLocalStorage = (key: string) =>
+      deviceStorage.get(key) ?? null;
+    harness.plugin.app.saveLocalStorage = (key: string, value: string) => {
+      deviceStorage.set(key, value);
+    };
+    let restarted: StateManager | null = null;
+    let coldState: StateManager | null = null;
+    try {
+      await harness.state.load();
+      expect((await harness.executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        { activateV2State: true },
+      )).success).toBe(true);
+      const selectedDatabaseId = harness.state
+        .activeV2StorageAuthorityEvidence!.databaseId!;
+
+      await commitOneFileRevision(harness, "budget revision A", 2);
+      const snapshot = await snapshotIndexedDbActiveStore(selectedDatabaseId);
+      await commitOneFileRevision(harness, "budget revision B", 3);
+      await restoreIndexedDbActiveStore(selectedDatabaseId, snapshot);
+      restarted = new StateManager(harness.plugin);
+      await restarted.load();
+      expect(restarted.v2StateLoadRecoveryBlock).toBeNull();
+      const rebuiltDatabaseId = restarted
+        .activeV2StorageAuthorityEvidence!.databaseId!;
+      expect(deviceStorage.has("easy-sync-indexeddb-journal-rebuild-budget-v1"))
+        .toBe(true);
+
+      const rebuiltRecovery = recoveries.get(rebuiltDatabaseId)!;
+      const restartedExecutor = new SyncExecutor(
+        harness.client,
+        harness.scanner,
+        restarted,
+        "testVault",
+        undefined,
+        undefined,
+        harness.diag as never,
+        harness.fileManager as never,
+      );
+      await commitOneFileRevision(
+        harness,
+        "budget revision C",
+        4,
+        restartedExecutor,
+      );
+      const secondSnapshot = await snapshotIndexedDbActiveStore(
+        rebuiltDatabaseId,
+      );
+      const secondRollbackSeq = (secondSnapshot.meta as {
+        header: { meta: { commitSeq: number } };
+      }).header.meta.commitSeq;
+      await commitOneFileRevision(
+        harness,
+        "budget revision D",
+        5,
+        restartedExecutor,
+      );
+      await restoreIndexedDbActiveStore(rebuiltDatabaseId, secondSnapshot);
+      expect(
+        (await rebuiltRecovery.rebuild()).meta.commitSeq,
+      ).toBeGreaterThan(secondRollbackSeq);
+
+      await restarted.close();
+      restarted = null;
+      coldState = new StateManager(harness.plugin);
+      await coldState.load();
+      expect(coldState.v2StateLoadRecoveryBlock).toMatchObject({
+        reason: "indexeddb-authority-recovery-failed",
+      });
+    } finally {
+      await restarted?.close();
+      await coldState?.close();
+      await harness.state.close();
+      for (const stores of activeStores.values()) {
+        for (const store of stores) await store.close();
       }
     }
   }, 30_000);
@@ -14204,6 +14587,7 @@ describe("V1 to V2 controlled production activation", () => {
       expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
       expect(harness.rawAdapter.mkdir).not.toHaveBeenCalled();
       expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+      expect(harness.hostWrites).toEqual([]);
       expect(harness.state.pendingIssues).toEqual([]);
       expect(harness.state.getCommunityPluginManifestObservations())
         .toEqual([expect.objectContaining({ pluginId })]);
@@ -14248,6 +14632,7 @@ describe("V1 to V2 controlled production activation", () => {
       expect(harness.mutations.downloadFileToPath).not.toHaveBeenCalled();
       expect(harness.rawAdapter.mkdir).not.toHaveBeenCalled();
       expect(harness.rawAdapter.writeBinary).not.toHaveBeenCalled();
+      expect(harness.hostWrites).toEqual([]);
       expect(restartedState.pendingIssues).toEqual([]);
       await restartedState.close();
     } finally {
@@ -22281,8 +22666,10 @@ describe("slice-2 scope-crossing exit actions", () => {
   it("restores a held file move to its original synced path", async () => {
     const harness = await fileExitHarness();
 
-    const snapshot = await harness.executor.getScopeCrossingResolutionSnapshot(
-      "Notes/a.md",
+    const snapshot = readySnapshot(
+      await harness.executor.getScopeCrossingResolutionSnapshot(
+        "Notes/a.md",
+      ),
     );
     expect(snapshot).toMatchObject({
       version: 1,
@@ -22308,8 +22695,10 @@ describe("slice-2 scope-crossing exit actions", () => {
   it("deletes the cloud copy on the next round after a confirmed file exit", async () => {
     const harness = await fileExitHarness();
 
-    const snapshot = await harness.executor.getScopeCrossingResolutionSnapshot(
-      "Notes/a.md",
+    const snapshot = readySnapshot(
+      await harness.executor.getScopeCrossingResolutionSnapshot(
+        "Notes/a.md",
+      ),
     );
     expect(snapshot).not.toBeNull();
     expect(await harness.executor.confirmScopeCrossingExit(snapshot!)).toBe(true);
@@ -22326,15 +22715,19 @@ describe("slice-2 scope-crossing exit actions", () => {
     expect(harness.state.pendingIssues).toEqual([]);
     expect(harness.state.mutationLedger).toHaveLength(0);
     expect(
-      await harness.executor.getScopeCrossingResolutionSnapshot("Notes/a.md"),
+      (
+        await harness.executor.getScopeCrossingResolutionSnapshot("Notes/a.md")
+      ).snapshot,
     ).toBeNull();
   });
 
   it("restores a held folder move subtree to its original location", async () => {
     const harness = await folderExitHarness();
 
-    const snapshot = await harness.executor.getScopeCrossingResolutionSnapshot(
-      "Notes",
+    const snapshot = readySnapshot(
+      await harness.executor.getScopeCrossingResolutionSnapshot(
+        "Notes",
+      ),
     );
     expect(snapshot).toMatchObject({
       version: 1,
@@ -22359,8 +22752,10 @@ describe("slice-2 scope-crossing exit actions", () => {
   it("deletes the remote subtree on the next round after a confirmed folder exit", async () => {
     const harness = await folderExitHarness();
 
-    const snapshot = await harness.executor.getScopeCrossingResolutionSnapshot(
-      "Notes",
+    const snapshot = readySnapshot(
+      await harness.executor.getScopeCrossingResolutionSnapshot(
+        "Notes",
+      ),
     );
     expect(snapshot).not.toBeNull();
     expect(await harness.executor.confirmScopeCrossingExit(snapshot!)).toBe(true);
@@ -22382,8 +22777,10 @@ describe("slice-2 scope-crossing exit actions", () => {
 
   it("rejects a reviewed exit once the move facts drifted", async () => {
     const harness = await fileExitHarness();
-    const snapshot = await harness.executor.getScopeCrossingResolutionSnapshot(
-      "Notes/a.md",
+    const snapshot = readySnapshot(
+      await harness.executor.getScopeCrossingResolutionSnapshot(
+        "Notes/a.md",
+      ),
     );
     expect(snapshot).not.toBeNull();
 

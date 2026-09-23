@@ -459,8 +459,10 @@ describe("diagnostic report reset capture and reader note", () => {
     const source = readFileSync("src/main.ts", "utf8");
     const resetStart = source.indexOf("async resetSyncState()");
     const lock = source.indexOf('acquireOpLock("reset")', resetStart);
+    // The reset-flow capture pins resetSnapshot=true: that file stays the raw
+    // pre-reset evidence (no prior-reset history embedded inside itself).
     const capture = source.indexOf(
-      "await this.generateDiagnosticReport()",
+      "await this.generateDiagnosticReport(true)",
       resetStart,
     );
     const settle = source.indexOf("hasResetBlockingRecovery()", resetStart);

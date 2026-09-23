@@ -1970,6 +1970,91 @@ describe("plugin data cold-start cache", () => {
     expect(plugin.syncPluginFiles).toBe(true);
   });
 
+  it("moves a stored self-sync opt-out into scope through the scope transaction", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.syncPluginFiles = false;
+    const updateSyncPathSettings = vi
+      .spyOn(plugin, "updateSyncPathSettings")
+      .mockImplementation(async (patch) => {
+        plugin.syncPluginFiles = patch.syncPluginFiles === true;
+      });
+    plugin.state = {
+      load: vi.fn().mockResolvedValue(undefined),
+      consumeCommunityPluginEnablementRetiredThisLoad: () => false,
+      isV2StateActive: false,
+    } as never;
+
+    await plugin.ensureStateLoaded();
+
+    // The plugin directory may only enter the scope through the transaction a
+    // user toggle ran (scope-expansion marker plus complete remote identity
+    // snapshot), never by rewriting the stored value in place.
+    expect(updateSyncPathSettings).toHaveBeenCalledWith({
+      syncPluginFiles: true,
+    });
+    expect(plugin.syncPluginFiles).toBe(true);
+  });
+
+  it("runs the self-sync transition once when the state load is awaited concurrently", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.syncPluginFiles = false;
+    const updateSyncPathSettings = vi
+      .spyOn(plugin, "updateSyncPathSettings")
+      .mockResolvedValue(undefined);
+    let releaseLoad: (() => void) | undefined;
+    plugin.state = {
+      load: () => new Promise<void>((resolve) => {
+        releaseLoad = resolve;
+      }),
+      consumeCommunityPluginEnablementRetiredThisLoad: () => false,
+      isV2StateActive: false,
+    } as never;
+
+    const firstLoad = plugin.ensureStateLoaded();
+    const secondLoad = plugin.ensureStateLoaded();
+    releaseLoad?.();
+    await Promise.all([firstLoad, secondLoad]);
+
+    expect(updateSyncPathSettings).toHaveBeenCalledOnce();
+  });
+
+  it("leaves an already-enabled self-sync scope untouched", async () => {
+    const plugin = new EasySyncPlugin();
+    const updateSyncPathSettings = vi
+      .spyOn(plugin, "updateSyncPathSettings")
+      .mockResolvedValue(undefined);
+    plugin.state = {
+      load: vi.fn().mockResolvedValue(undefined),
+      consumeCommunityPluginEnablementRetiredThisLoad: () => false,
+      isV2StateActive: false,
+    } as never;
+
+    // Fresh installs and devices that already ran the transition: no switch,
+    // no scope change, nothing to reconcile.
+    expect(plugin.syncPluginFiles).toBe(true);
+    await plugin.ensureStateLoaded();
+    expect(updateSyncPathSettings).not.toHaveBeenCalled();
+  });
+
+  it("keeps the plugin directory out of scope when the transition cannot run", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.syncPluginFiles = false;
+    const updateSyncPathSettings = vi
+      .spyOn(plugin, "updateSyncPathSettings")
+      .mockRejectedValue(new SyncPathSettingsUpdateError("busy"));
+    plugin.state = {
+      load: vi.fn().mockResolvedValue(undefined),
+      consumeCommunityPluginEnablementRetiredThisLoad: () => false,
+      isV2StateActive: false,
+    } as never;
+
+    await expect(plugin.ensureStateLoaded()).resolves.toBeUndefined();
+
+    // Fail-closed: the scope stays closed and the next reload retries.
+    expect(plugin.syncPluginFiles).toBe(false);
+    expect(updateSyncPathSettings).toHaveBeenCalledOnce();
+  });
+
   it("publishes independent EasySync and community-plugin scanner ownership", () => {
     const plugin = new EasySyncPlugin();
     const setConfig = vi.fn();
@@ -2013,6 +2098,11 @@ describe("plugin data cold-start cache", () => {
 
   it("marks an effective community-plugin selection expansion for a complete remote identity refresh", async () => {
     const plugin = new EasySyncPlugin();
+    // Pin the self-sync owner out of the way: the check below is that a
+    // community-plugin expansion never takes over EasySync's own directory,
+    // and it stays meaningful while the self-sync scope transition has not
+    // run (fail-closed devices) — not that the directory is out of scope.
+    plugin.syncPluginFiles = false;
     plugin.syncCommunityPlugins = true;
     plugin.communityPluginSyncPolicy = {
       version: 1,

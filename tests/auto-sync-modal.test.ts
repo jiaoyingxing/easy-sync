@@ -140,4 +140,117 @@ describe("AutoSyncModal", () => {
     expect(SliderComponent.instances[0].value).toBe(3);
     expect(SliderComponent.instances[1].value).toBe(5);
   });
+
+  it("leads with the guidance line in the shared intro class", () => {
+    const plugin = createMockPlugin();
+    const modal = new AutoSyncModal(plugin);
+    const created: Array<{ tag: string; text?: string; cls?: string }> = [];
+    const createEl = modal.contentEl.createEl.bind(modal.contentEl);
+    modal.contentEl.createEl = ((
+      tag: string,
+      options?: { text?: string; cls?: string },
+    ) => {
+      created.push({ tag, text: options?.text, cls: options?.cls });
+      return createEl(tag, options);
+    }) as unknown as typeof modal.contentEl.createEl;
+
+    modal.onOpen();
+
+    // One paragraph, created before any Setting: zero is the off stop and a
+    // pause only clears through a manual sync — neither is visible from the
+    // two slider rows alone. The class keeps the line on phones (see
+    // styles.css "easy-sync-modal-intro").
+    expect(created).toEqual([
+      {
+        tag: "p",
+        text: "拖到最左侧（归零）即关闭；自动同步若被特殊状态打断，须手动同步一次才继续。",
+        cls: "setting-item-description easy-sync-modal-intro",
+      },
+    ]);
+  });
+
+  it("paints the slider fill ratio on open, change, and drag input", async () => {
+    const plugin = createMockPlugin();
+    const modal = new AutoSyncModal(plugin);
+    modal.onOpen();
+
+    // Initial value 3 of 0..10 painted immediately: hosts without the
+    // 1.13+ fill mechanism render a flat gray track otherwise.
+    const intervalSlider = SliderComponent.instances[0];
+    expect(intervalSlider.getInlineCssProp("--slider-fill-ratio")).toBe("0.3");
+
+    await intervalSlider.triggerChange(7);
+    expect(intervalSlider.getInlineCssProp("--slider-fill-ratio")).toBe("0.7");
+
+    // Dragging fires input events before release; the fill follows live.
+    intervalSlider.fireInput(1);
+    expect(intervalSlider.getInlineCssProp("--slider-fill-ratio")).toBe("0.1");
+  });
+
+  it("renders a numeric readout beside the slider on hosts without one", async () => {
+    const plugin = createMockPlugin();
+    const modal = new AutoSyncModal(plugin);
+    modal.onOpen();
+
+    // Mock sliders mirror the old-host shape: the control container starts
+    // with just the input, so the plugin supplies the readout that 1.13+
+    // hosts render natively — same class, before the input, initial value.
+    const intervalSlider = SliderComponent.instances[0];
+    const container = intervalSlider.sliderEl
+      .parentElement as unknown as HTMLElement;
+    const children = container.children as unknown as Array<{
+      classList: { contains(token: string): boolean };
+      textContent: string;
+    }>;
+    expect(children).toHaveLength(2);
+    const valueEl = children[0];
+    expect(valueEl.classList.contains("slider-value")).toBe(true);
+    expect(valueEl.textContent).toBe("3");
+
+    await intervalSlider.triggerChange(7);
+    expect(valueEl.textContent).toBe("7");
+
+    // Dragging fires input events before release; the readout follows live.
+    intervalSlider.fireInput(1);
+    expect(valueEl.textContent).toBe("1");
+
+    // The second slider carries its own readout with its own value.
+    const delaySlider = SliderComponent.instances[1];
+    const delayChildren = (delaySlider.sliderEl.parentElement as unknown as {
+      children: Array<{ textContent: string }>;
+    }).children;
+    expect(delayChildren[0].textContent).toBe("5");
+  });
+
+  it("leaves the host readout untouched when the host already renders one", async () => {
+    SliderComponent.simulateHostValueReadout = true;
+    try {
+      const plugin = createMockPlugin();
+      const modal = new AutoSyncModal(plugin);
+      modal.onOpen();
+
+      // 1.13+ shape: the host readout sits ahead of the input and the
+      // plugin must not add a second one or write into the host's element.
+      const intervalSlider = SliderComponent.instances[0];
+      const container = intervalSlider.sliderEl
+        .parentElement as unknown as HTMLElement;
+      const children = container.children as unknown as Array<{
+        classList: { contains(token: string): boolean };
+        textContent: string;
+      }>;
+      expect(children).toHaveLength(2);
+      expect(children[0].classList.contains("slider-value")).toBe(true);
+
+      await intervalSlider.triggerChange(7);
+      intervalSlider.fireInput(1);
+      expect(children[0].textContent).toBe("");
+
+      // The fill keeps painting through the same display sync.
+      expect(intervalSlider.getInlineCssProp("--slider-fill-ratio")).toBe(
+        "0.1",
+      );
+    } finally {
+      SliderComponent.simulateHostValueReadout = false;
+    }
+  });
 });

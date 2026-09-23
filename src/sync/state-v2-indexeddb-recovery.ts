@@ -920,6 +920,22 @@ type VerifiedRecoveryRecord =
   | StateV2IndexedDbRecoveryDeltaV1
   | StateV2IndexedDbRecoveryCommitWitnessV1;
 
+/**
+ * Rollback-form signatures: the active database provably sits behind a fully
+ * witnessed journal — stale bytes, not divergent content. Only these forms
+ * are eligible for automatic journal rebuild; divergence ("does not bind")
+ * forms stay fail-closed. Kept beside the throw sites so the vocabulary
+ * cannot drift.
+ */
+export function isIndexedDbRollbackFormRecoveryError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    message === "IndexedDB recovery future delta contains a gap or branch"
+    || message
+      === "IndexedDB recovery future commit witness blocks delta retirement"
+  );
+}
+
 async function validateRecordRaw(raw: string): Promise<void> {
   await parseAndVerifyRecord(raw);
 }

@@ -10,13 +10,16 @@ import {
   buildSyncPlanVirtualWindow,
   buildSyncPendingDisplayRows,
   buildSyncViewContentKey,
+  fitDirectoryTail,
   EasySyncSyncView,
   countOmittedSyncHistorySuccessfulFiles,
   formatFileProgressLabel,
   formatPendingIssueChipLabel,
-  groupCommunityPluginConflictReviews,
+  groupBundleConflictReviews,
   groupPendingIssuesForReview,
   formatSyncHistoryCounts,
+  isBatchedDeleteSet,
+  isDecisionRowKey,
   resolveFileProgressPresentation,
   resolvePlanReviewDetailsState,
   resolveRemoteScopeRecoveryFailurePresentation,
@@ -154,7 +157,7 @@ describe("shared sidebar detail controls", () => {
       conflictEntries: [
         { kind: "file" as const, item: { type: SyncActionType.Conflict, path: "c.md" } },
         {
-          kind: "community-plugin-bundle" as const,
+          kind: "bundle" as const,
           pluginId: "resp",
           items: [{ type: SyncActionType.Conflict, path: ".obsidian/plugins/resp/main.js" }],
         },
@@ -210,38 +213,59 @@ describe("shared sidebar detail controls", () => {
     expect(section).toContain("buildSyncPlanVirtualWindow(");
     expect(section).toContain("planDecisionRowsInFlight.has(row.key)");
     expect(section).toContain("this.planVirtualRenderers.add(renderPendingWindow)");
-    expect(section).toContain("applyPlanRowExpansionIn(visible)");
+    expect(section).toContain("applyPlanRowExpansionIn(visible, deleteRowsBatched)");
+    expect(section).toContain("isBatchedDeleteSet(rows.map((row) => row.key))");
     expect(section).not.toContain("for (const item of pendingDeletes) this.renderDeleteItem");
   });
 
-  it("groups one plugin bundle into one review row without absorbing other conflicts", () => {
+  it("groups each bundle — community plugin or EasySync's own files — into one review row", () => {
     const conflict = (path: string) => ({
       type: SyncActionType.Conflict,
       path,
     });
-    const grouped = groupCommunityPluginConflictReviews([
+    const grouped = groupBundleConflictReviews([
       conflict(".obsidian/plugins/resojot/main.js"),
       conflict("note.md"),
       conflict(".obsidian/plugins/resojot/manifest.json"),
       conflict(".obsidian/plugins/resojot/styles.css"),
       conflict(".obsidian/plugins/easy-sync/main.js"),
+      conflict(".obsidian/plugins/easy-sync/manifest.json"),
+      conflict(".obsidian/plugins/easy-sync/styles.css"),
       conflict(".obsidian/plugins/resojot/data.json"),
     ], ".obsidian");
 
+    // EasySync 自己的三份插件文件同样按 bundle 合成一行（社区插件与本机自身
+    // 各一行），其余普通冲突与 data.json 仍是逐条 file 行。
     expect(grouped.map((entry) => entry.kind)).toEqual([
-      "community-plugin-bundle",
+      "bundle",
       "file",
-      "file",
+      "bundle",
       "file",
     ]);
     expect(grouped[0]).toMatchObject({
-      kind: "community-plugin-bundle",
+      kind: "bundle",
       pluginId: "resojot",
       items: [
         { path: ".obsidian/plugins/resojot/main.js" },
         { path: ".obsidian/plugins/resojot/manifest.json" },
         { path: ".obsidian/plugins/resojot/styles.css" },
       ],
+    });
+    // EasySync 自身的三件套同样合成一行：用户在待处理区看到的是「EasySync
+    // 自己的文件」，而不是三条看不懂的配置路径。
+    expect(grouped[2]).toMatchObject({
+      kind: "bundle",
+      pluginId: "easy-sync",
+      items: [
+        { path: ".obsidian/plugins/easy-sync/main.js" },
+        { path: ".obsidian/plugins/easy-sync/manifest.json" },
+        { path: ".obsidian/plugins/easy-sync/styles.css" },
+      ],
+    });
+    // 同目录下的非三件套文件（data.json）不受整包吸收。
+    expect(grouped[3]).toMatchObject({
+      kind: "file",
+      item: { path: ".obsidian/plugins/resojot/data.json" },
     });
   });
 
@@ -257,27 +281,114 @@ describe("shared sidebar detail controls", () => {
     expect(formatFileSize(1024 * 1024)).toBe("1.0 MB");
   });
 
-  it("applies the plan-wide expand default to lazily rendered decisions without forgetting a per-row choice", () => {
+  it("resolves decision rows by class default, then session override, then the row's own choice", () => {
     const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
     Object.assign(view as object, {
-      planGroupsCollapsed: false,
+      sessionOverride: "default",
       planRowExpandedState: new Map<string, boolean>(),
     });
     const state = (
       view as unknown as { planRowExpandedState: Map<string, boolean> }
     ).planRowExpandedState;
     const decide = (
-      view as unknown as { planRowExpanded(key: string): boolean }
-    ).planRowExpanded.bind(view);
+      view as unknown as { resolvePlanRowOpen(key: string, deleteRowsBatched: boolean): boolean }
+    ).resolvePlanRowOpen.bind(view);
 
-    // A row the user never touched follows the group-level expand-all.
-    expect(decide("conflict:a.md")).toBe(true);
+    // 类别默认：决策行展开（出口第一眼可见），只读行折叠。
+    expect(decide("conflict:a.md", false)).toBe(true);
+    expect(decide("plugin:resp", false)).toBe(true);
+    expect(decide("adoption:resp", false)).toBe(true);
+    expect(decide("issue:download:timeout:a.md", false)).toBe(false);
+    // 成批的待确认删除默认收起（出口是批量入口），单条时展开。
+    expect(decide("delete:a.md", false)).toBe(true);
+    expect(decide("delete:a.md", true)).toBe(false);
+
+    // 行级手势压过类别默认。
     state.set("conflict:a.md", false);
-    // An explicit per-row choice outranks the group-level default.
-    expect(decide("conflict:a.md")).toBe(false);
+    expect(decide("conflict:a.md", false)).toBe(false);
+    state.set("issue:download:timeout:a.md", true);
+    expect(decide("issue:download:timeout:a.md", false)).toBe(true);
 
-    Object.assign(view as object, { planGroupsCollapsed: true });
-    expect(decide("conflict:b.md")).toBe(false);
+    // 会话级覆盖压过类别默认，但压不过行级手势。
+    Object.assign(view as object, { sessionOverride: "expanded" });
+    expect(decide("issue:download:timeout:b.md", false)).toBe(true);
+    expect(decide("conflict:a.md", false)).toBe(false);
+    Object.assign(view as object, { sessionOverride: "collapsed" });
+    expect(decide("conflict:b.md", false)).toBe(false);
+    expect(decide("delete:a.md", false)).toBe(false);
+  });
+
+  it("keeps the session override and the row-class default as separate facts", () => {
+    // 成批删除的判据与批量删除入口同一条件；只读行不进决策行集合。
+    expect(isBatchedDeleteSet(["delete:a.md"])).toBe(false);
+    expect(isBatchedDeleteSet(["delete:a.md", "delete:b.md"])).toBe(true);
+    expect(isBatchedDeleteSet(["conflict:a.md", "delete:a.md"])).toBe(false);
+    expect(isDecisionRowKey("conflict:a.md")).toBe(true);
+    expect(isDecisionRowKey("delete:a.md")).toBe(true);
+    expect(isDecisionRowKey("plugin:resp")).toBe(true);
+    expect(isDecisionRowKey("adoption:resp")).toBe(true);
+    expect(isDecisionRowKey("issue:upload:timeout:a.md")).toBe(false);
+    expect(isDecisionRowKey("row:Upload:a.md")).toBe(false);
+    expect(isDecisionRowKey("batch-delete")).toBe(false);
+  });
+
+  it("registers every collapsible details site with its fold class", () => {
+    // 折叠体系准入（2026-09-23）：新增可折叠面必须同时登记〔类别／默认态依据／
+    // 记忆粒度／覆盖与重置〕，否则这里会红——站点按「所在函数＋创建时类名」登记，
+    // 类别语义见 docs/topics/侧栏 UI - 文件列表.md「决策行窗口化与展开记忆」节。
+    const registry: Record<string, string> = {
+      "renderConflictItem|easy-sync-tree-item": "decision",
+      "renderDeleteItem|easy-sync-tree-item": "decision",
+      "renderAdoptionItem|easy-sync-tree-item": "decision",
+      "renderBundleConflictItem|easy-sync-tree-item": "decision",
+      "renderPendingIssue|easy-sync-tree-item": "decision",
+      "createTreeGroup|easy-sync-tree-item": "container",
+      "renderHistorySection|easy-sync-history-run easy-sync-tree-item": "readonly",
+      "renderHistoryEntryBody|easy-sync-history-skip-group easy-sync-tree-item": "readonly",
+      "renderUpdateAvailableItem|easy-sync-tree-item": "readonly",
+      "measurePlanDecisionRowHeights|easy-sync-tree-item easy-sync-plan-decision-probe": "probe",
+    };
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const found: string[] = [];
+    for (const match of source.matchAll(/createEl\(\s*"details"/g)) {
+      const at = match.index ?? 0;
+      const window = source.slice(at + match[0].length, at + 240);
+      const cls = /(?:cls:\s*)?"([^"]+)"/.exec(window)?.[1] ?? "?";
+      const declarations = [
+        ...source.slice(0, at).matchAll(/\n  (?:private |public )?(?:readonly )?(?:async )?([A-Za-z0-9_]+)\(/g),
+      ];
+      const fn = declarations[declarations.length - 1]?.[1] ?? "?";
+      found.push(`${fn}|${cls}`);
+    }
+    expect(found.sort()).toEqual(Object.keys(registry).sort());
+    // 决策行站点必须真的带行身份（否则展开记忆与默认态都没有锚点）。
+    for (const site of found.filter((entry) => registry[entry] === "decision")) {
+      const fn = site.split("|")[0];
+      const start = source.indexOf(`private ${fn}(`);
+      expect(source.slice(start, start + 1600)).toContain("details.dataset.easySyncPlanRow = rowKey");
+    }
+  });
+
+  it("does not let a new plan revision wipe the user's explicit global choice", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const revisionStart = source.indexOf(
+      "if (this.renderedPlanReviewRevision !== syncState.planReviewRevision) {",
+    );
+    const revisionBlock = source.slice(revisionStart, revisionStart + 900);
+    // 修订变化只清行级／组级记忆（行身份不再指同一对象），会话级覆盖保持。
+    expect(revisionBlock).toContain("this.planGroupExpandedState.clear()");
+    expect(revisionBlock).toContain("this.planRowExpandedState.clear()");
+    expect(revisionBlock).not.toContain("sessionOverride");
+
+    // 默认态下工具栏不得铺开或收起任何东西：类别默认说了算。
+    const toggleStart = source.indexOf("private toggleAllDetails()");
+    const toggleBody = source.slice(toggleStart, toggleStart + 700);
+    expect(toggleBody).toContain('if (this.sessionOverride === "default") return;');
+
+    // 分组头的类别默认＝含决策项就展开，而不是一律折叠。
+    const groupStart = source.indexOf("private resolvePlanGroupOpen(");
+    const groupBody = source.slice(groupStart, groupStart + 500);
+    expect(groupBody).toContain("return hasDecisionRows;");
   });
 
   it("records a decision row's open state from the user's gesture, not the toggle event", () => {
@@ -1465,6 +1576,52 @@ describe("buildSyncViewContentKey", () => {
     ]);
   });
 
+  it("keeps the deepest directory segments when the gray prefix does not fit", () => {
+    // 用户 2026-09-24 报告：头部省略号留住的只是各库相同的浅层根前缀，
+    // 路径越深灰字行越无信息，退化成「稍宽的空格」却仍占一行。截断必须
+    // 从浅层头切起，保住最区分位置的深层尾。
+    const width = (text: string) => text.length * 10;
+
+    // 放得下 → 原样。
+    expect(fitDirectoryTail("Projects/Alpha/", 200, width)).toBe(
+      "Projects/Alpha/",
+    );
+    // 放不下 → 保深层尾，头部以 …/ 标记被截的浅层段。
+    expect(fitDirectoryTail("Projects/2026/July/", 150, width)).toBe(
+      "…/2026/July/",
+    );
+    // 更窄 → 尾部层段递减到放得下为止。
+    expect(fitDirectoryTail("Projects/2026/July/", 80, width)).toBe("…/July/");
+    // 连最深一段都放不下 → 原样返回，交给 CSS 头部省略号兜底。
+    expect(fitDirectoryTail("Projects/2026/July/", 30, width)).toBe(
+      "Projects/2026/July/",
+    );
+    // 单层目录没有可让出的头 → 原样返回。
+    expect(fitDirectoryTail("Notes/", 50, width)).toBe("Notes/");
+    // 零宽/负宽 → 原样返回。
+    expect(fitDirectoryTail("Projects/", 0, width)).toBe("Projects/");
+
+    // 接线：目录元素渲染必须套用保尾显示串（同一盒模型域量测）。
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const scopeStart = source.indexOf("private applyAdaptivePathLayoutScope(");
+    const scopeEnd = source.indexOf("private appendNewFileRows(", scopeStart);
+    const scope = source.slice(scopeStart, scopeEnd);
+    expect(scope).toContain("directory.setText(fitDirectoryTail(");
+    expect(scope).toContain("directory.clientWidth");
+    expect(scope).toContain("directory.scrollWidth");
+  });
+
+  it("scrolls the limited file list instead of squeezing gray directory lines flat", () => {
+    // 用户 2026-09-24 澄清：纵向挤压——is-limited 列表是纵向 flex 容器，
+    // 内容超高时默认先压子项；灰字目录带 overflow: hidden，自动最小高度
+    // 为零，是唯一被压成空白窄行的受害者。子项必须 flex-shrink: 0，让
+    // 列表装满后走滚动。
+    const styles = readFileSync("styles.css", "utf8");
+    const rule = styles.match(/\.easy-sync-file-list > \* \{[^}]*\}/s);
+    expect(rule).not.toBeNull();
+    expect(rule?.[0]).toContain("flex-shrink: 0");
+  });
+
   it("applies the adaptive path layout in the same task that updated the rows (no two-frame flicker)", () => {
     const prototype = EasySyncSyncView.prototype as unknown as {
       applyAdaptivePathLayout: () => void;
@@ -1506,6 +1663,86 @@ describe("buildSyncViewContentKey", () => {
     );
     expect(append).toContain("state.completedCount");
     expect(append).not.toContain("count: files.length");
+  });
+
+  it("keeps the round bar at the body top in every borrowed body mode while running", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    // While a round runs, a borrowed body (plan review / pending / recovery)
+    // mounts the same round bar at its original body-top spot — the status
+    // panel itself stays untouched (no bar above the divider).
+    const statusPanel = source.slice(
+      source.indexOf("private renderStatusPanel"),
+      source.indexOf("private recoverPlanReviewDetails"),
+    );
+    expect(statusPanel).not.toContain("easy-sync-progress-bar");
+    const dispatch = source.slice(
+      source.indexOf("const content = container.createDiv"),
+      source.indexOf("this.lastContentKey = contentKey;"),
+    );
+    // The cross-mode mount sits before the body dispatch and mirrors the
+    // progress body's bar element-for-element.
+    expect(dispatch).toContain("const progressPanelShown = bodyMode === \"progress\"");
+    expect(dispatch.indexOf("progressPanelShown")).toBeLessThan(
+      dispatch.indexOf('if (bodyMode === "plan"'),
+    );
+    expect(dispatch).toContain("easy-sync-progress-bar");
+    expect(dispatch).toContain("remoteScopeRecoveryPercent(progress)");
+    // The progress body keeps painting its own bar; the patch branch keeps
+    // updating whichever bar the current body mounted.
+    const body = source.slice(
+      source.indexOf("private renderProgressPanel"),
+      source.indexOf("private renderRemoteScopeRecoveryFailure"),
+    );
+    expect(body).toContain("easy-sync-progress-bar");
+    expect(body).toContain("{ count: state.completedCount }");
+    const patch = source.slice(
+      source.indexOf("this.updateStatusPanel(statusState);"),
+      source.indexOf("this.lastContentKey = contentKey;"),
+    );
+    expect(patch).toContain("progressFillEl");
+  });
+
+  it("invalidates the windowed height model when the toolbar expands or collapses everything", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    // The toolbar bulk-writes `open` on every tree item without going through
+    // rememberPlanRowExpansion, so the windowed lists' offset model would
+    // keep the old open-state heights: the mounted absolute window grows in
+    // place, overflows its fixed-height container, and paints over the
+    // update-prompt row and the history section below. The bulk writer has
+    // to end with the same invalidation the rebuild path applies.
+    const toggleAll = source.slice(
+      source.indexOf("private toggleAllDetails(): void"),
+      source.indexOf("private createIconButton("),
+    );
+    expect(toggleAll).toContain("this.planRowHeights.clear()");
+    expect(toggleAll).toContain("this.planRowLayoutRevision += 1");
+    expect(toggleAll).toContain("this.schedulePlanViewportRender()");
+    // A cleared height model can re-derive the container height from probe
+    // estimates while the window key stays identical (full-rebuild tail,
+    // bulk expand) — the old early return then froze the estimate and the
+    // mounted window overflowed onto the update-prompt row and history.
+    // Both windowed renderers must re-measure until every mounted row slot
+    // holds a real measured height.
+    const pendingWindow = source.slice(
+      source.indexOf("private renderPendingSection("),
+      source.indexOf("private renderPendingRow("),
+    );
+    expect(pendingWindow).toContain(
+      ".every((row) => this.planRowHeights.has(row.key));",
+    );
+    expect(pendingWindow).toContain(
+      "if (nextKey === renderedKey && mountedMeasured) return;",
+    );
+    const planWindow = source.slice(
+      source.indexOf("private renderPlanGroups("),
+      source.indexOf("private measurePlanRowHeights("),
+    );
+    // Read-only groups keep the estimate-only two-height probe model; only
+    // decision-row groups (which populate the height cache) re-measure.
+    expect(planWindow).toContain("!hasInlineDecisions");
+    expect(planWindow).toContain(
+      "if (nextKey === renderedKey && mountedMeasured) return;",
+    );
   });
 
   it("mounts completed rows incrementally and reserves full rebuilds for the fallback", () => {
@@ -1596,7 +1833,7 @@ describe("buildSyncViewContentKey", () => {
       .toEqual([SyncActionType.SkipLargeFile, SyncActionType.SkipIgnoredPath]);
     expect(byGroup.get("remotePreparation")?.items.map((item) => item.type))
       .toEqual([SyncActionType.RecreateRemoteScope]);
-    expect(groups.every((group) => group.open === false)).toBe(true);
+    expect(groups.every((group) => !("open" in group))).toBe(true);
   });
 
   it("keeps a 50k plan DOM window bounded to the visible rows plus overscan", () => {
@@ -2057,11 +2294,45 @@ describe("buildSyncViewContentKey", () => {
     expect(groups).toContain("buildSyncPlanVirtualWindow({");
     expect(groups).toContain("this.planVirtualRenderers.add(renderInlineDecisions)");
     expect(groups).toContain("hasInlineDecisions");
-    expect(styles).toMatch(/\.easy-sync-plan-virtual-window\s*\{[^}]*position:\s*absolute/s);
+    expect(styles).not.toMatch(/\.easy-sync-plan-virtual-window\s*\{[^}]*position:\s*absolute/s);
     expect(styles).toMatch(
       /\.easy-sync-plan-measure-probe\s*\{[^}]*visibility:\s*hidden;[^}]*pointer-events:\s*none;/s,
     );
     expect(styles).not.toMatch(/\.easy-sync-plan-virtual-window > \.easy-sync-file-row\s*\{/s);
+  });
+
+  it("mounts windowed rows in flow between spacers so overflow cannot paint over siblings", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    // 方案单 20260924-0001（用户拍板）: the visible-row window is an
+    // ordinary in-flow block between top/bottom spacers — real row content
+    // can only push the bottom spacer (and everything below) down, so
+    // painting over the update-prompt row or history is impossible by
+    // construction. Estimate error degrades to scroll-length drift until
+    // the measure pass corrects it.
+    const helperStart = source.indexOf("private mountPlanFlowWindow(");
+    const helperEnd = source.indexOf("private renderPendingSection(", helperStart);
+    const helper = source.slice(helperStart, helperEnd);
+    expect(helper).toContain('createDiv("easy-sync-plan-virtual-spacer")');
+    expect(helper).toContain("windowState.end <= windowState.start");
+    expect(helper).toContain("totalHeight - endOffset");
+    const pendingWindow = source.slice(
+      source.indexOf("private renderPendingSection("),
+      source.indexOf("private renderPendingRow("),
+    );
+    const planWindow = source.slice(
+      source.indexOf("private renderPlanGroups("),
+      source.indexOf("private measurePlanRowHeights("),
+    );
+    for (const renderer of [pendingWindow, planWindow]) {
+      expect(renderer).toContain("this.mountPlanFlowWindow(");
+      expect(renderer).toContain("virtualList,");
+      // No positioned window and no predicted container height anywhere:
+      // both were the mechanism behind the overlap defects.
+      expect(renderer).not.toContain("translateY(");
+      expect(renderer).not.toContain("virtualList.style.height");
+    }
+    expect(source).not.toContain("virtualList.style.height");
+    expect(source).not.toContain("translateY(${windowState.offset}px)");
   });
 
   it("renders the confirm boundary note only for ordinary plans with decision rows", () => {
@@ -2090,7 +2361,7 @@ describe("buildSyncViewContentKey", () => {
   it("preserves an opened plan group and scroll position across side-action rerenders", () => {
     const source = readFileSync("src/ui/sync-view.ts", "utf8");
 
-    expect(source).toContain("private planExpandedGroups = new Set<SyncActionGroup>()");
+    expect(source).toContain("private planGroupExpandedState = new Map<SyncActionGroup, boolean>()");
     const revisionStart = source.indexOf(
       "this.renderedPlanReviewRevision !== syncState.planReviewRevision",
     );
@@ -2099,12 +2370,12 @@ describe("buildSyncViewContentKey", () => {
       revisionStart,
     );
     const revision = source.slice(revisionStart, revisionEnd);
-    expect(revision).toContain("this.planExpandedGroups.clear();");
+    expect(revision).toContain("this.planGroupExpandedState.clear();");
     expect(revision).toContain("preservedContentScrollTop = null;");
     expect(source).toContain("details.dataset.easySyncPlanGroup = group.group");
-    expect(source).toContain("this.planExpandedGroups.add(group.group)");
+    expect(source).toContain("this.planGroupExpandedState.set(group.group, details.open)");
     expect(source).toContain("expandedPlanGroups.has(group)");
-    expect(source).toContain("this.planExpandedGroups.has(group.group)");
+    expect(source).toContain("this.planGroupExpandedState.get(group)");
     expect(source).toContain("renderInlineDecisions();");
     expect(source).toContain(
       '(bodyMode === "plan" || bodyMode === "recovery" || bodyMode === "idle")',
@@ -2405,7 +2676,9 @@ describe("buildSyncViewContentKey", () => {
     // 批量门槛在显示行 builder（负责点随窗口化迁移）。
     const builderStart = source.indexOf("export function buildSyncPendingDisplayRows");
     const builder = source.slice(builderStart);
-    expect(builder).toContain("input.pendingDeletes.length > 1");
+    expect(builder).toContain(
+      "isBatchedDeleteSet(input.pendingDeletes.map((item) => `delete:${item.path}`))",
+    );
     expect(section).toContain('createDiv("easy-sync-plan-execute")');
     expect(section).toContain('addClass("easy-sync-primary-actions")');
     expect(section).toContain('t("syncView.delete.confirmAll"');
@@ -3094,6 +3367,42 @@ describe("continuous click-in for resolution rows", () => {
       expect(method.indexOf("unlockResolutionRow(rowKey)")).toBeGreaterThan(
         method.indexOf("await this.plugin."),
       );
+    }
+  });
+
+  it("routes every resolution entry's unavailable cause through the shared mapping", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const cases = [
+      {
+        open: "  private async openStaleIdentityResolution(",
+        factsChanged: '"notice.staleIdentity.changed",',
+      },
+      {
+        open: "  private async openSharedFolderIdentityResolution(",
+        factsChanged: '"notice.sharedFolderIdentity.changed",',
+        nameMismatch: '"notice.sharedFolderIdentity.nameMismatch",',
+      },
+      {
+        open: "  private async openScopeCrossingRestore(",
+        factsChanged: '"notice.scopeCrossing.changed",',
+      },
+      {
+        open: "  private async openScopeCrossingConfirm(",
+        factsChanged: '"notice.scopeCrossing.changed",',
+      },
+    ];
+    for (const entry of cases) {
+      const start = source.indexOf(entry.open);
+      expect(start).toBeGreaterThan(-1);
+      const body = source.slice(
+        start,
+        source.indexOf("\n  private async", start + 1),
+      );
+      // 入口只读快照为空时必须说出真正原因，不再一律报"事实已变化"。
+      expect(body).toContain("this.notifyResolutionEntryUnavailable(");
+      expect(body).toContain(entry.factsChanged);
+      if (entry.nameMismatch) expect(body).toContain(entry.nameMismatch);
+      expect(body).not.toMatch(/if \(!snapshot\) \{\s*new Notice\(/);
     }
   });
 });

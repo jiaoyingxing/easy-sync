@@ -1,6 +1,65 @@
-import { Notice, Setting } from "obsidian";
+import { Notice, Setting, SliderComponent } from "obsidian";
 import type EasySyncPlugin from "../main";
 import { EasySyncModal } from "./easy-sync-modal";
+
+/**
+ * Paint the accent fill left of the thumb. Host 1.13+ drives this itself
+ * (SliderComponent writes `--slider-fill-ratio` and its CSS paints the
+ * gradient); older hosts — several Android builds included — ship no fill
+ * and leave a flat gray track. Writing the same inline property on every
+ * host is idempotent, so one code path covers both; the matching gradient
+ * lives in styles.css "Auto-sync slider fill". `value` overrides the DOM
+ * readout when the caller already knows the authoritative value (onChange).
+ */
+function paintSliderFill(slider: SliderComponent, value?: number): void {
+  const el = slider.sliderEl;
+  const min = Number.parseFloat(el.min) || 0;
+  const max = Number.parseFloat(el.max) || 100;
+  const current = value ?? el.valueAsNumber;
+  const ratio = max > min ? (current - min) / (max - min) : 0;
+  el.style.setProperty("--slider-fill-ratio", `${ratio}`);
+}
+
+/**
+ * Numeric readout beside the track. Host 1.13+ renders this itself
+ * (SliderComponent creates a `.slider-value` span before the input and keeps
+ * its text in sync); older hosts — several Android builds included — ship no
+ * readout at all: their value tooltip was hover-only, which touch screens
+ * never trigger. ensureSliderValueEl() creates the same span in the same
+ * position only when the host didn't, and syncSliderValue() mirrors the
+ * value at the same three points paintSliderFill covers; formatting mirrors
+ * the host's getValuePretty(). On 1.13+ hosts both are no-ops, so the native
+ * element is what users see. Matching styles live in styles.css "Auto-sync
+ * slider value".
+ */
+const sliderValueEls = new WeakMap<SliderComponent, HTMLElement>();
+
+function ensureSliderValueEl(slider: SliderComponent): void {
+  const container = slider.sliderEl.parentElement;
+  if (!container || container.querySelector(":scope > .slider-value")) return;
+  const valueEl = container.createSpan("slider-value");
+  slider.sliderEl.before(valueEl);
+  sliderValueEls.set(slider, valueEl);
+  syncSliderValue(slider);
+}
+
+function syncSliderValue(slider: SliderComponent, value?: number): void {
+  const valueEl = sliderValueEls.get(slider);
+  if (!valueEl) return;
+  const el = slider.sliderEl;
+  const current = value ?? el.valueAsNumber;
+  const pretty =
+    el.step === "any" || Number.parseFloat(el.step) < 1
+      ? current.toFixed(2)
+      : String(current);
+  valueEl.setText(pretty);
+}
+
+/** Fill + numeric readout in one call at each sync point. */
+function paintSliderDisplay(slider: SliderComponent, value?: number): void {
+  paintSliderFill(slider, value);
+  syncSliderValue(slider, value);
+}
 
 export class AutoSyncModal extends EasySyncModal {
   constructor(private plugin: EasySyncPlugin) {
@@ -13,6 +72,10 @@ export class AutoSyncModal extends EasySyncModal {
     contentEl.empty();
     contentEl.addClass("easy-sync-auto-sync");
     this.setTitle(t("settings.autoSync.title"));
+    contentEl.createEl("p", {
+      text: t("settings.autoSync.intro"),
+      cls: "setting-item-description easy-sync-modal-intro",
+    });
 
     const describeSyncInterval = (minutes: number): string =>
       minutes === 0
@@ -35,6 +98,7 @@ export class AutoSyncModal extends EasySyncModal {
           .setLimits(0, 10, 1)
           .setValue(this.plugin.syncInterval)
           .onChange(async (value) => {
+            paintSliderDisplay(slider, value);
             const previous = this.plugin.syncInterval;
             this.plugin.syncInterval = value;
             try {
@@ -54,6 +118,11 @@ export class AutoSyncModal extends EasySyncModal {
               desc.textContent = describeSyncInterval(value);
             }
           });
+        ensureSliderValueEl(slider);
+        paintSliderDisplay(slider);
+        slider.sliderEl.addEventListener("input", () =>
+          paintSliderDisplay(slider),
+        );
       });
 
     new Setting(contentEl)
@@ -64,6 +133,7 @@ export class AutoSyncModal extends EasySyncModal {
           .setLimits(0, 10, 1)
           .setValue(this.plugin.autoSyncChangeDelaySeconds)
           .onChange(async (value) => {
+            paintSliderDisplay(slider, value);
             const previous = this.plugin.autoSyncChangeDelaySeconds;
             const masterWasOn = this.plugin.isAutoSyncMasterEnabled();
             this.plugin.setAutoSyncChangeDelaySeconds(value);
@@ -89,6 +159,11 @@ export class AutoSyncModal extends EasySyncModal {
               desc.textContent = describeAutoSyncChangeDelay(value);
             }
           });
+        ensureSliderValueEl(slider);
+        paintSliderDisplay(slider);
+        slider.sliderEl.addEventListener("input", () =>
+          paintSliderDisplay(slider),
+        );
       });
   }
 

@@ -197,7 +197,7 @@ export class ConflictDetailModal extends FileComparisonModal {
                   : t("conflictDetail.diffTitle") +
                     ` (${t("conflictDetail.diffRegionsLocated", { count: diff.parts.length })})`,
               );
-              this.renderDisplayDiff(body, diff, t);
+              this.renderDisplayDiff(body, diff);
             }
           }
           loadingEl.remove();
@@ -324,9 +324,8 @@ export class ConflictDetailModal extends FileComparisonModal {
   private renderDisplayDiff(
     container: HTMLElement,
     diff: Parameters<typeof renderDisplayDiff>[1],
-    t: (key: string, params?: Record<string, string | number>) => string,
   ): void {
-    renderDisplayDiff(container, diff, t);
+    renderDisplayDiff(container, diff);
   }
 
   private renderTextPreview(

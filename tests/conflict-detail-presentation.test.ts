@@ -4,7 +4,6 @@ import {
   getDiffLineNumberWidth,
 } from "../src/ui/conflict-detail-modal";
 import {
-  getDiffSummaryReasonKey,
   summarizeConflictDetail,
 } from "../src/ui/conflict-detail-presentation";
 import type { DisplayDiffResult } from "../src/ui/diff-engine";
@@ -120,10 +119,21 @@ describe("conflict detail presentation", () => {
     expect(source).toContain('setSummary({ kind: "reason" })');
   });
 
-  it("keeps bounded-diff limitation reasons in one exhaustive copy mapping", () => {
-    expect(getDiffSummaryReasonKey("change-budget")).toBe("conflictDetail.diffChangeBudget");
-    expect(getDiffSummaryReasonKey("alignment-limit")).toBe("conflictDetail.diffAlignmentLimit");
-    expect(getDiffSummaryReasonKey("display-budget")).toBe("conflictDetail.diffDisplayBudget");
+  it("keeps sampled regions free of limitation copy", () => {
+    const renderer = readFileSync("src/ui/diff-view-renderer.ts", "utf8");
+    const zhCN = readFileSync("src/i18n/zh-cn.ts", "utf8");
+    const en = readFileSync("src/i18n/en.ts", "utf8");
+
+    // 2026-09-23 user decision: the reason / line-range / omitted-count blocks
+    // added by f3e0bbe1 are removed; a sampled region shows lines only.
+    expect(renderer).not.toContain("diff-summary-reason");
+    expect(renderer).not.toContain("diff-summary-range");
+    expect(zhCN).not.toContain("已省略");
+    expect(zhCN).not.toContain("该差异区域包含大量新增或删除行");
+    expect(zhCN).not.toContain("本机第 {localRange} 行");
+    expect(en).not.toContain("remote line(s) omitted");
+    expect(en).not.toContain("changed region contains many added or removed lines");
+    expect(en).not.toContain("Local lines {localRange}");
   });
 
   it("does not expose raw failures or guess a network cause in conflict detail copy", () => {
@@ -204,7 +214,7 @@ describe("conflict detail presentation", () => {
       /style\.setProperty\(\s*"--easy-sync-diff-line-number-width"/,
     );
     expect(modal).not.toContain("padStart(6)");
-    expect(modal).toContain('renderDisplayDiff(container, diff, t)');
+    expect(modal).toContain('renderDisplayDiff(container, diff)');
     expect(styles).toMatch(
       /grid-template-columns:\s*repeat\(2,\s*var\(--easy-sync-diff-line-number-width,\s*2ch\)\);/,
     );

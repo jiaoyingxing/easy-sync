@@ -86,6 +86,12 @@ export class LocalRecoveryJournal {
     });
   }
 
+  /**
+   * Legacy mode: the replacement chain no longer renames the target aside
+   * (in-place write with a copied original instead), but a crash on an older
+   * build can leave a rename-mode intent behind and `recover()` must still be
+   * able to settle it.
+   */
   async prepareRenamedOriginal(
     targetPath: string,
     expected: LocalFileEntry | undefined,
