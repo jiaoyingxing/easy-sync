@@ -524,6 +524,7 @@ const en: LocaleStrings = {
   "reason.folder.local-inspection-failed": "The local folder state could not be verified",
   "reason.circuitBreaker": "This file failed several syncs in a row, so automatic sync skipped it this round. Manual sync retries it immediately",
   "reason.circuitBreaker.network": "The network kept dropping and this file failed to transfer several times in a row. Automatic sync will retry it about every 15 minutes and continue on its own once the network recovers",
+  "reason.circuitBreaker.remoteMoving": "The cloud file keeps being updated and this file has been deferred for several rounds in a row. Automatic sync will retry it about every 15 minutes and continue on its own once the updates settle",
   "reason.delete.folderNotEmpty": "The folder still has content, so it cannot be deleted. Delete its pending items first, then delete the folder.",
   "reason.identityMove.deferred": "This file move could not be identified uniquely, so nothing was overwritten",
   "reason.identityMove.localTargetOccupied": "A file with the same name already exists at the destination. Rename or move the local file, then sync again.",

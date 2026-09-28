@@ -523,6 +523,7 @@ const zhCN: LocaleStrings = {
   "reason.folder.local-inspection-failed": "无法确认本机文件夹当前状态",
   "reason.circuitBreaker": "这个文件已连续多轮同步失败，本轮自动同步暂时跳过；手动同步会立即重试",
   "reason.circuitBreaker.network": "网络持续不稳定，这个文件已连续多次传输失败；自动同步将约每 15 分钟重试一次，网络恢复后会自动继续",
+  "reason.circuitBreaker.remoteMoving": "云端文件持续更新中，这个文件已连续多轮延后重试；自动同步将约每 15 分钟重试一次，更新结束后会自动继续",
   "reason.delete.folderNotEmpty": "文件夹里还有内容，无法删除。请先删除文件夹里的待确认项目，再删除文件夹。",
   "reason.identityMove.deferred": "无法唯一确认这次文件移动，本轮不会自动覆盖",
   "reason.identityMove.localTargetOccupied": "目标位置已有同名文件，请先重命名或移走本机文件，再重新同步。",

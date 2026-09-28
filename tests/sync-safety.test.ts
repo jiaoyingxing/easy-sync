@@ -246,6 +246,31 @@ export function makeActiveV2State(
     schemaVersion: 2,
     byAnchorId: {},
   };
+  if (Array.isArray(overrides.folderAnchors)) {
+    const seeded = overrides.folderAnchors as Array<{
+      remoteId: string;
+      lastPath: string;
+      parentId?: string;
+      eTag?: string;
+    }>;
+    const next: Record<string, unknown> = {};
+    for (const anchor of seeded) {
+      const anchorId = `folder:${anchor.remoteId}`;
+      next[anchorId] = {
+        anchorId,
+        remoteId: anchor.remoteId,
+        lastPath: anchor.lastPath,
+        parentRemoteId: anchor.parentId,
+        remoteETag: anchor.eTag,
+        confirmedGeneration: 1,
+        confirmedAt: 1,
+      };
+    }
+    envelope.folderAnchors = {
+      schemaVersion: 2,
+      byAnchorId: next,
+    };
+  }
   if (Array.isArray(overrides.staleFileAnchors)) {
     // Test-only device-state modeling: a committed anchor may keep a Graph id
     // that the current remote index no longer maps to the same path (a
@@ -381,7 +406,11 @@ export function makeActiveV2State(
       baseEntries: baseSnapshot,
     });
     envelope.remoteIndex.deltaLink = deltaLink;
-    envelope.folderAnchors = {
+    // Fidelity with replaceRemoteStateEnvelopeV2: the real controller
+    // replaces only the remote index and carries folderAnchors over
+    // unchanged (file-state-controller-v2.ts — withNextCommit spreads the
+    // previous envelope).
+    envelope.folderAnchors = previousEnvelope.folderAnchors ?? {
       schemaVersion: 2,
       byAnchorId: {},
     };
@@ -1869,14 +1898,22 @@ describe("M17 circuit breaker retry semantics", () => {
     mode: "manual" | "auto",
     pendingActionType = SyncActionType.Download,
     issueOverrides: Partial<{
-      issueCode: "transfer-network";
+      issueCode: "transfer-network" | "transfer-remote-moving";
       updatedAt: number;
       localHash: string;
       remoteETag: string;
+      consecutiveFailures: number;
     }> = {},
     scanSkippedLarge: string[] = [],
   ) {
     const downloadFile = vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3]).buffer);
+    const getFileMetadata = vi.fn().mockResolvedValue({
+      driveId: "item-stuck",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      size: 3,
+      mtime: 1,
+      eTag: "etag-stuck",
+    });
     const remote: RemoteFileEntry = {
       path: "stuck.m4a",
       driveId: "item-stuck",
@@ -1901,13 +1938,7 @@ describe("M17 circuit breaker retry semantics", () => {
     const executor = new SyncExecutor(
       makeMockOneDrive({
         downloadFile,
-        getFileMetadata: vi.fn().mockResolvedValue({
-          driveId: remote.driveId,
-          parentId: remote.parentId,
-          size: remote.size,
-          mtime: remote.mtime,
-          eTag: remote.eTag,
-        }),
+        getFileMetadata,
       }),
       {
         vault: {
@@ -1930,7 +1961,7 @@ describe("M17 circuit breaker retry semantics", () => {
       "testVault",
     );
 
-    return { executor, downloadFile, mode };
+    return { executor, downloadFile, mode, mockState, getFileMetadata };
   }
 
   it("manual sync bypasses the stale breaker and retries the file", async () => {
@@ -2177,6 +2208,89 @@ describe("M17 circuit breaker retry semantics", () => {
 
     expect(result.errors).toBe(1);
     expect(result.breakerDeferredErrors).toBe(1);
+  });
+
+  it("auto sync defers a remote-version-changed download instead of failing the round", async () => {
+    // 2026-09-28 热文件现场（resojot 录音分片、传输中的照片）：下载期间云端
+    // 版本前移是瞬态内容竞态，下一轮重排计划即可拿到新版本——不得当作整轮
+    // 失败暂停自动同步，只延后该单项（防覆盖弃写本身不变）。
+    const { executor, downloadFile, mode, mockState, getFileMetadata } =
+      makeBreakerExecutor("auto", SyncActionType.Download, {
+        issueCode: "transfer-remote-moving",
+        consecutiveFailures: 1,
+      });
+    const reconcileCalls: PendingIssue[][] = [];
+    mockState.reconcilePendingIssues = vi.fn(async (issues: PendingIssue[]) => {
+      reconcileCalls.push(issues);
+    });
+    getFileMetadata.mockResolvedValue({
+      driveId: "item-stuck",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      size: 3,
+      mtime: 1,
+      eTag: "etag-newer",
+    });
+
+    const result = await executor.run(mode, {});
+
+    expect(result.errors).toBe(0);
+    expect(result.deferred).toBe(1);
+    expect(result.success).toBe(true);
+    expect(downloadFile).toHaveBeenCalledTimes(1);
+    const deferredRows = reconcileCalls.at(-1)?.filter(
+      (issue) => issue.path === "stuck.m4a",
+    ) ?? [];
+    expect(deferredRows).toHaveLength(1);
+    expect(deferredRows[0].issueCode).toBe("transfer-remote-moving");
+    expect(deferredRows[0].reason).toBe("syncView.failure.remoteChangedDuringDownload");
+    // 执行器推出的原始行固定 consecutiveFailures: 1；跨轮合并由真
+    // reconcile 负责（state-manager.test.ts 覆盖）。
+    expect(deferredRows[0].consecutiveFailures).toBe(1);
+    expect(deferredRows[0].remoteETag).toBe("etag-stuck");
+  });
+
+  it("auto sync backs off a remote-moving file even after its version changed", async () => {
+    // 版本已前移（versionMatched 不成立）但退避窗口仍活着 → 熔断按
+    // transfer-remote-moving 计时臂接管，每窗口一次真实尝试。
+    const { executor, downloadFile } = makeBreakerExecutor("auto", SyncActionType.Download, {
+      issueCode: "transfer-remote-moving",
+      updatedAt: Date.now(),
+      remoteETag: "etag-older",
+    });
+
+    const result = await executor.run("auto", {});
+
+    expect(result.errors).toBe(1);
+    expect(result.breakerDeferredErrors).toBe(1);
+    expect(downloadFile).not.toHaveBeenCalled();
+  });
+
+  it("auto sync retries a remote-moving file once the backoff window expires", async () => {
+    const { executor, downloadFile } = makeBreakerExecutor("auto", SyncActionType.Download, {
+      issueCode: "transfer-remote-moving",
+      updatedAt: Date.now() - 16 * 60 * 1000,
+      remoteETag: "etag-older",
+    });
+
+    const result = await executor.run("auto", {});
+
+    expect(result.downloaded).toBe(1);
+    expect(result.errors).toBe(0);
+    expect(downloadFile).toHaveBeenCalledTimes(1);
+  });
+
+  it("manual sync never defers a remote-moving file through the breaker", async () => {
+    const { executor, downloadFile } = makeBreakerExecutor("manual", SyncActionType.Download, {
+      issueCode: "transfer-remote-moving",
+      updatedAt: Date.now(),
+      remoteETag: "etag-older",
+    });
+
+    const result = await executor.run("manual", {});
+
+    expect(result.downloaded).toBe(1);
+    expect(result.errors).toBe(0);
+    expect(downloadFile).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -3311,13 +3425,16 @@ describe("Download integrity gate", () => {
       "note.bin",
       "downloadVersionVerify",
     );
-    expect(result.result.errors).toBe(1);
+    // 2026-09-28 改判：版本竞态延后为单项，不再记整轮失败。
+    expect(result.result.errors).toBe(0);
+    expect(result.result.deferred).toBe(1);
     expect(result.writeBinary).not.toHaveBeenCalled();
     expect(result.state.reconcilePendingIssues).toHaveBeenCalledWith(
       [expect.objectContaining({
         path: "note.bin",
         actionType: SyncActionType.Download,
         reason: "syncView.failure.remoteChangedDuringDownload",
+        issueCode: "transfer-remote-moving",
       })],
       new Set(),
     );
@@ -8173,7 +8290,7 @@ describe("Persistent remote delta state", () => {
       "execute",
       "mutation recovery batch summary",
       expect.objectContaining({
-        schemaVersion: 1,
+        schemaVersion: 2,
         total: 23,
         settled: 22,
         remaining: 1,
@@ -8182,6 +8299,12 @@ describe("Persistent remote delta state", () => {
         blocked: 1,
         firstBlockedOperationId: "sanitized-network-op-1",
         externalMutations: 0,
+        blockedRecords: [expect.objectContaining({
+          operationId: "sanitized-network-op-1",
+          path: expect.any(String),
+          action: expect.any(String),
+          receipted: expect.any(Boolean),
+        })],
       }),
     );
   });
@@ -9902,6 +10025,392 @@ describe("Persistent remote delta state", () => {
     expect(downloadFile).not.toHaveBeenCalled();
     expect(downloadFileToPath).not.toHaveBeenCalled();
     expect(state.baseSnapshot.find((entry) => entry.path === targetPath)).toBeUndefined();
+  });
+
+  it("settles a sha-unknown renameRemote record whose moved eTag advanced (F17)", async () => {
+    // Field report 2026-09-28 (Desktop 1.5.0, F17): the remote rename itself
+    // succeeded, but its receipt could never be written — the shared
+    // moveLocal shape bound the receipt eTag to the untouched pre-move
+    // remote world, unreachable for an action that changes the eTag by
+    // definition. The record stayed intent-only forever and the recovery
+    // batch blocked every round. The renameRemote own shape settles on the
+    // move anchors (identity + preserved size); the moved eTag/hash are
+    // recorded as read back.
+    const localContent = new Uint8Array([3, 1, 4]).buffer;
+    const localHash = await sha256Hex(localContent);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "plan-old.duowei";
+    const targetPath = "plan.duowei";
+    const sourceRemote: RemoteFileEntry = {
+      path: sourcePath,
+      driveId: "remote-drive-id",
+      parentId: activeScope.filesRootId,
+      eTag: "etag-pre-move",
+      cTag: "ctag-pre-move",
+      size: 3,
+    };
+    const movedRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "remote-drive-id",
+      parentId: activeScope.filesRootId,
+      eTag: "etag-post-move",
+      cTag: "ctag-post-move",
+      size: 3,
+    };
+    const state = makeActiveV2State([sourceRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-rename-remote-sha-unknown",
+          planRevision: 1,
+          scope: activeScope,
+          action: "renameRemote",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: {
+            exists: true,
+            hash: localHash,
+            size: 3,
+          },
+          expectedRemote: {
+            exists: true,
+            driveId: "remote-drive-id",
+            eTag: "etag-pre-move",
+            size: 3,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const getFileMetadata = vi.fn().mockImplementation(
+      async (_v: string, path: string) =>
+        path === targetPath ? movedRemote : undefined,
+    );
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getFileMetadata }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [{
+            path: targetPath,
+            size: 3,
+            mtime: 1,
+            hash: localHash,
+            binary: false,
+          }],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn(async (path: string) =>
+          path === targetPath
+            ? {
+                status: "present",
+                entry: {
+                  path,
+                  size: 3,
+                  mtime: 1,
+                  hash: localHash,
+                },
+              }
+            : { status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.mutationRecovery).toBeUndefined();
+    expect(state.mutationLedger).toEqual([]);
+    expect(state.recordMutationReceipt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        operationId: "op-rename-remote-sha-unknown",
+        checkpoint: expect.objectContaining({
+          remoteUpserts: [expect.objectContaining({
+            path: targetPath,
+            driveId: "remote-drive-id",
+            eTag: "etag-post-move",
+          })],
+        }),
+      }),
+    );
+    expect(state.remoteSnapshot).toContainEqual(expect.objectContaining({
+      path: targetPath,
+      driveId: "remote-drive-id",
+      eTag: "etag-post-move",
+      sha256Hash: undefined,
+    }));
+  });
+
+  it("keeps a sha-unknown renameRemote blocked when the moved object size contradicts the plan (F17 adversarial)", async () => {
+    // Adversarial (F17, mirroring the moveLocal size-contradiction guard):
+    // a same-identity object at the target path whose size differs from the
+    // planned world was replaced, not moved — the plain-move settlement must
+    // not fire and the record stays blocked (reviewable).
+    const localContent = new Uint8Array([3, 1, 4]).buffer;
+    const localHash = await sha256Hex(localContent);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "plan-old.duowei";
+    const targetPath = "plan.duowei";
+    const sourceRemote: RemoteFileEntry = {
+      path: sourcePath,
+      driveId: "remote-drive-id",
+      parentId: activeScope.filesRootId,
+      eTag: "etag-pre-move",
+      cTag: "ctag-pre-move",
+      size: 3,
+    };
+    const movedRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "remote-drive-id",
+      parentId: activeScope.filesRootId,
+      eTag: "etag-post-move",
+      cTag: "ctag-post-move",
+      // Same identity as planned but a contradictory size (planned: 3).
+      size: 4606,
+    };
+    const state = makeActiveV2State([sourceRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-rename-remote-sha-unknown-size-contradiction",
+          planRevision: 1,
+          scope: activeScope,
+          action: "renameRemote",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: {
+            exists: true,
+            hash: localHash,
+            size: 3,
+          },
+          expectedRemote: {
+            exists: true,
+            driveId: "remote-drive-id",
+            eTag: "etag-pre-move",
+            size: 3,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const getFileMetadata = vi.fn().mockImplementation(
+      async (_v: string, path: string) =>
+        path === targetPath ? movedRemote : undefined,
+    );
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getFileMetadata }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [{
+            path: targetPath,
+            size: 3,
+            mtime: 1,
+            hash: localHash,
+            binary: false,
+          }],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn(async (path: string) =>
+          path === targetPath
+            ? {
+                status: "present",
+                entry: {
+                  path,
+                  size: 3,
+                  mtime: 1,
+                  hash: localHash,
+                },
+              }
+            : { status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.mutationRecovery).toMatchObject({ state: "blocked" });
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(state.baseSnapshot.find((entry) => entry.path === targetPath)).toBeUndefined();
+  });
+
+  it("records a renameRemote execution receipt honestly in the sha-unknown world (F17)", async () => {
+    // Field report 2026-09-28 (Desktop 1.5.0, F17): the execution chain used
+    // to stamp the moved remote object with the LOCAL file's hash. In the
+    // sha-unknown world that fabrication made the receipt unwritable (the
+    // shape gate requires an honest sha-less record) and the whole round
+    // crashed into "shared state checkpoint stopped". The receipt must carry
+    // the moved object's own world: the source object's hash as last
+    // observed (absent here) and the post-move eTag.
+    const localContent = new Uint8Array([3, 1, 4]).buffer;
+    const localHash = await sha256Hex(localContent);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "plan-old.duowei";
+    const targetPath = "plan.duowei";
+    const sourceRemote: RemoteFileEntry = {
+      path: sourcePath,
+      driveId: "remote-drive-id",
+      parentId: activeScope.filesRootId,
+      eTag: "etag-pre-move",
+      cTag: "ctag-pre-move",
+      size: 3,
+    };
+    const movedRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "remote-drive-id",
+      parentId: activeScope.filesRootId,
+      eTag: "etag-post-move",
+      cTag: "ctag-post-move",
+      size: 3,
+    };
+    const state = makeActiveV2State(
+      [sourceRemote],
+      [{ path: sourcePath, hash: localHash, size: 3, eTag: "etag-pre-move" }],
+    );
+    // Stateful live world: the rename flips what Graph reports (source gone,
+    // target present), so the planner plans the rename and the execution
+    // chain actually performs it (renameItem called once).
+    let moved = false;
+    const performMove = vi.fn().mockImplementation(async () => {
+      moved = true;
+      return {
+        id: "remote-drive-id",
+        name: "plan.duowei",
+        size: 3,
+        eTag: "etag-post-move",
+        cTag: "ctag-post-move",
+        parentReference: { id: activeScope.filesRootId },
+        file: { hashes: {} },
+      };
+    });
+    const moveItemById = performMove;
+    const renameItem = performMove;
+    const getFileMetadata = vi.fn().mockImplementation(
+      async (_v: string, path: string) => {
+        if (moved) return path === targetPath ? movedRemote : undefined;
+        return path === sourcePath ? sourceRemote : undefined;
+      },
+    );
+    const planLogs: unknown[] = [];
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ renameItem, moveItemById, getFileMetadata }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [{
+            path: targetPath,
+            size: 3,
+            mtime: 1,
+            hash: localHash,
+            binary: false,
+          }],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn(async (path: string) =>
+          path === targetPath
+            ? {
+                status: "present",
+                entry: {
+                  path,
+                  size: 3,
+                  mtime: 1,
+                  hash: localHash,
+                },
+              }
+            : { status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+      undefined,
+      undefined,
+      {
+        isEnabled: vi.fn((category: string) => category !== "onedrive"),
+        log: vi.fn((...args: unknown[]) => planLogs.push(args)),
+        warn: vi.fn((...args: unknown[]) => planLogs.push(args)),
+        error: vi.fn(),
+      } as unknown as DiagnosticLogger,
+    );
+
+    const result = await executor.run("manual", {});
+
+    console.log("F17-EXE-DBG", JSON.stringify({
+      success: result.success,
+      filesMoved: result.filesMoved,
+      message: result.message,
+      renameCalls: renameItem.mock.calls.length,
+      planLogs,
+    }));
+
+    expect(result.success).toBe(true);
+    expect(moveItemById).toHaveBeenCalledOnce();
+    expect(state.mutationLedger).toEqual([]);
+    expect(state.recordMutationReceipt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        checkpoint: expect.objectContaining({
+          remoteUpserts: [expect.objectContaining({
+            path: targetPath,
+            driveId: "remote-drive-id",
+            eTag: "etag-post-move",
+          })],
+        }),
+      }),
+    );
+    const receipt = state.recordMutationReceipt.mock.calls.at(-1)?.[0] as {
+      checkpoint: { remoteUpserts: Array<{ sha256Hash?: string }> };
+    };
+    expect(receipt.checkpoint.remoteUpserts[0].sha256Hash).toBeUndefined();
+    expect(state.remoteSnapshot).toContainEqual(expect.objectContaining({
+      path: targetPath,
+      driveId: "remote-drive-id",
+      eTag: "etag-post-move",
+      sha256Hash: undefined,
+    }));
+    expect(state.baseSnapshot).toContainEqual(expect.objectContaining({
+      path: targetPath,
+      hash: localHash,
+    }));
   });
 
   it("does not auto-settle a moveLocal intent when the remote source still exists and the expected remote identity stays alive", async () => {
@@ -12112,6 +12621,330 @@ describe("Persistent remote delta state", () => {
         })],
       }),
     }));
+  });
+
+  it("recovers a deferred upload batch whose receipt parent drifted from the committed index", async () => {
+    const content = new Uint8Array([1, 2, 3]).buffer;
+    const hash = await sha256Hex(content);
+    const folder: RemoteFolderEntry = {
+      path: "plugins",
+      driveId: "plugins-folder-old",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      name: "plugins",
+    };
+    const local: LocalFileEntry = {
+      path: "plugins/note.md",
+      hash,
+      size: 3,
+      mtime: 1,
+      binary: false,
+    };
+    // Field report 2026-09-28 (case B): the upload response binds the file to
+    // the live parent identity while the committed index still holds the
+    // pre-reorganization folder identity. The hierarchy changes AFTER the
+    // run's initial scan, so the delta phase still reports the old folder and
+    // the drift only surfaces at the batch commit. That commit used to crash
+    // the whole round; the recovery the single-item path owns must settle it.
+    const uploadFile = vi.fn().mockResolvedValue({
+      id: "item-note-current",
+      name: "note.md",
+      size: 3,
+      eTag: "etag-note-current",
+      cTag: "ctag-note-current",
+      parentReference: { id: "plugins-folder-current" },
+    });
+    const getDelta = vi.fn()
+      .mockResolvedValueOnce({
+        value: [
+          graphFolder(
+            "plugins-folder-old",
+            folder.name,
+            TEST_SYNC_SCOPE.filesRootId,
+          ),
+        ],
+        "@odata.deltaLink": "https://graph.example/delta-initial",
+      })
+      .mockResolvedValueOnce({
+        value: [
+          graphFolder(
+            "plugins-folder-current",
+            folder.name,
+            TEST_SYNC_SCOPE.filesRootId,
+          ),
+          driveItem(local.path, hash, {
+            id: "item-note-current",
+            eTag: "etag-note-current",
+            cTag: "ctag-note-current",
+            parentReference: { id: "plugins-folder-current" },
+          }),
+        ],
+        "@odata.deltaLink": "https://graph.example/delta-refreshed",
+      });
+    const getFileMetadata = vi.fn().mockResolvedValue({
+      path: local.path,
+      driveId: "item-note-current",
+      parentId: "plugins-folder-current",
+      size: 3,
+      mtime: 1,
+      eTag: "etag-note-current",
+      cTag: "ctag-note-current",
+      sha256Hash: hash,
+    });
+    const state = makeActiveV2State([], [], {
+      remoteFolders: [folder],
+      folderAnchors: [{
+        remoteId: folder.driveId,
+        lastPath: folder.path,
+        parentId: folder.parentId,
+      }],
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ uploadFile, getDelta, getFileMetadata }),
+      {
+        vault: {
+          adapter: makeMockAdapter({
+            readBinary: vi.fn().mockResolvedValue(content),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [local],
+          folders: [{ path: folder.path }],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(result.uploaded).toBe(1);
+    expect(state.mutationLedger).toEqual([]);
+    expect(getDelta).toHaveBeenCalledTimes(2);
+    expect(state.remoteSnapshot).toContainEqual(expect.objectContaining({
+      path: local.path,
+      driveId: "item-note-current",
+      parentId: "plugins-folder-current",
+      eTag: "etag-note-current",
+    }));
+  });
+
+  it("keeps the round alive when a deferred upload batch still fails after the hierarchy refresh", async () => {
+    const content = new Uint8Array([1, 2, 3]).buffer;
+    const hash = await sha256Hex(content);
+    const folder: RemoteFolderEntry = {
+      path: "plugins",
+      driveId: "plugins-folder-old",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      name: "plugins",
+    };
+    const local: LocalFileEntry = {
+      path: "plugins/note.md",
+      hash,
+      size: 3,
+      mtime: 1,
+      binary: false,
+    };
+    // Receipt and live object agree on a parent identity the refreshed
+    // committed tree still cannot project at the path: nothing provable to
+    // rebind onto. The rebuild+rebase+retry recovery runs (second getDelta)
+    // and the batch then fails closed — the round-end shared checkpoint
+    // refuses to publish net-new unresolved records anyway, so the crash
+    // shape is retained; the stranded receipt settles through the next
+    // round's mutation recovery.
+    const uploadFile = vi.fn().mockResolvedValue({
+      id: "item-note-current",
+      name: "note.md",
+      size: 3,
+      eTag: "etag-note-current",
+      cTag: "ctag-note-current",
+      parentReference: { id: "plugins-folder-orphan" },
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [
+        graphFolder(
+          "plugins-folder-old",
+          folder.name,
+          TEST_SYNC_SCOPE.filesRootId,
+        ),
+      ],
+      "@odata.deltaLink": "https://graph.example/delta-initial",
+    });
+    const getFileMetadata = vi.fn().mockResolvedValue({
+      path: local.path,
+      driveId: "item-note-current",
+      parentId: "plugins-folder-orphan",
+      size: 3,
+      mtime: 1,
+      eTag: "etag-note-current",
+      cTag: "ctag-note-current",
+      sha256Hash: hash,
+    });
+    const state = makeActiveV2State([], [], {
+      remoteFolders: [folder],
+      folderAnchors: [{
+        remoteId: folder.driveId,
+        lastPath: folder.path,
+        parentId: folder.parentId,
+      }],
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ uploadFile, getDelta, getFileMetadata }),
+      {
+        vault: {
+          adapter: makeMockAdapter({
+            readBinary: vi.fn().mockResolvedValue(content),
+          }),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [local],
+          folders: [{ path: folder.path }],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.errors).toBe(1);
+    expect(result.message).toBe("result.syncFailed");
+    expect(result.mutationRecovery).toMatchObject({
+      state: "blocked",
+      blockReason: "state-unavailable",
+    });
+    expect(getDelta).toHaveBeenCalledTimes(2);
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(state.mutationLedger[0].receipt).not.toBeNull();
+  });
+
+  it("settles a receipted upload whose parent identity drifted from the index during recovery", async () => {
+    const hash = "ab".repeat(32);
+    const folder: RemoteFolderEntry = {
+      path: "plugins",
+      driveId: "plugins-folder-old",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      name: "plugins",
+    };
+    const remote: RemoteFileEntry = {
+      path: "plugins/note.md",
+      driveId: "item-note-current",
+      parentId: "plugins-folder-current",
+      size: 3,
+      mtime: 1,
+      eTag: "etag-note-current",
+      cTag: "ctag-note-current",
+      sha256Hash: hash,
+    };
+    const base = {
+      path: remote.path,
+      hash,
+      size: remote.size,
+      eTag: remote.eTag,
+    };
+    const state = makeActiveV2State([], [], {
+      remoteFolders: [folder],
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-drifted-parent",
+          planRevision: 1,
+          scope: { ...TEST_SYNC_SCOPE, accountId: "account-id" },
+          action: "upload",
+          path: remote.path,
+          expectedLocal: { exists: true, hash, size: remote.size },
+          expectedRemote: { exists: false },
+          createdAt: 1,
+        },
+        receipt: {
+          version: 1,
+          operationId: "op-drifted-parent",
+          completedAt: 2,
+          checkpoint: {
+            baseUpserts: [base],
+            baseRemovals: [],
+            remoteUpserts: [remote],
+            remoteDeletes: [],
+            pendingConflictRemovals: [],
+            pendingDeleteRemovals: [],
+          },
+        },
+      }],
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [
+        graphFolder(
+          "plugins-folder-current",
+          folder.name,
+          TEST_SYNC_SCOPE.filesRootId,
+        ),
+        driveItem(remote.path, hash, {
+          id: remote.driveId,
+          eTag: remote.eTag,
+          cTag: remote.cTag,
+          parentReference: { id: "plugins-folder-current" },
+        }),
+      ],
+      "@odata.deltaLink": "https://graph.example/delta-refreshed",
+    });
+    const getFileMetadata = vi.fn().mockResolvedValue(remote);
+    const local: LocalFileEntry = {
+      path: remote.path,
+      hash,
+      size: remote.size,
+      mtime: 1,
+      binary: false,
+    };
+    const executor = new SyncExecutor(
+      makeMockOneDrive({ getDelta, getFileMetadata }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [local],
+          folders: [{ path: folder.path }],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.success).toBe(true);
+    expect(state.mutationLedger).toEqual([]);
+    expect(getDelta).toHaveBeenCalled();
+    expect(state.commitMutationCheckpoint).toHaveBeenCalledWith(
+      "op-drifted-parent",
+    );
   });
 
   it("recovers a cancelled post-upload receipt without uploading the file twice", async () => {

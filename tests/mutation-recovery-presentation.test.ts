@@ -160,6 +160,54 @@ describe("mutation recovery presentation", () => {
     });
   });
 
+  it("offers the review exit under a state-unavailable stamp when the record is eligible", () => {
+    const zh = new I18n("zh-cn");
+    const t = zh.t.bind(zh);
+    const base = {
+      total: 1,
+      settled: 0,
+      remaining: 1,
+      retryAt: null,
+      firstPath: "行医启发/慢性肾病的康复.md",
+      blockedOperationId: "op-1",
+      paused: true,
+    };
+
+    // A state-unavailable stamp describes how a past round ended, not what
+    // the record is. When the record itself is eligible, the crash stamp
+    // must not freeze it behind "export or reset" (field reports 2026-09-28).
+    expect(mutationRecoveryPrimaryActionKey({
+      kind: "blocked",
+      ...base,
+      blockReason: "state-unavailable",
+      manualResolutionAvailable: true,
+    })).toBe("syncView.recovery.reviewDetails");
+    expect(mutationRecoveryBodyPresentation({
+      kind: "blocked",
+      ...base,
+      blockReason: "state-unavailable",
+      manualResolutionAvailable: true,
+    }, t, () => "")).toMatchObject({
+      actionKey: "syncView.recovery.reviewDetails",
+      nextStep: "核对本机与云端内容并选择保留哪一侧。完成后会自动继续同步。",
+    });
+
+    // Eligibility still governs: an ineligible or corrupt-evidence block
+    // keeps the honest no-choice presentation.
+    expect(mutationRecoveryPrimaryActionKey({
+      kind: "blocked",
+      ...base,
+      blockReason: "state-unavailable",
+      manualResolutionAvailable: false,
+    })).toBeNull();
+    expect(mutationRecoveryPrimaryActionKey({
+      kind: "blocked",
+      ...base,
+      blockReason: "evidence-corrupt",
+      manualResolutionAvailable: true,
+    })).toBeNull();
+  });
+
   it("renders honest status without choice buttons for waiting and paused states", () => {
     const zh = new I18n("zh-cn");
     const t = zh.t.bind(zh);

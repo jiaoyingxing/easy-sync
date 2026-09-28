@@ -141,6 +141,7 @@ function makePlugin(): EasySyncPlugin {
   vi.spyOn(plugin as never, "ensureStateLoaded").mockResolvedValue(undefined);
   vi.spyOn(plugin as never, "handleSyncResult").mockResolvedValue(undefined);
   plugin.diag = {
+    isEnabled: vi.fn().mockReturnValue(false),
     log: vi.fn(),
     warn: vi.fn(),
     error: vi.fn(),
@@ -1951,6 +1952,35 @@ describe("main sync entry guards", () => {
     expect((plugin as never as {
       requestMutationRecoveryObservation: (trigger: string) => boolean;
     }).requestMutationRecoveryObservation("paused")).toBe(false);
+
+    // B4 (2026-09-28 用户拍板): a paused block whose record has no manual
+    // exit (self-bundle path class) keeps bounded observations alive —
+    // the automatic settlement is that record's only outlet (field case E).
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: false,
+      canResolveMutationRecovery: vi.fn().mockReturnValue(false),
+    } as never;
+    (
+      plugin as never as { mutationRecoveryBlockReason: string | null }
+    ).mutationRecoveryBlockReason = "state-unavailable";
+    expect((plugin as never as {
+      requestMutationRecoveryObservation: (trigger: string) => boolean;
+    }).requestMutationRecoveryObservation("foreground")).toBe(true);
+
+    // A paused block whose record IS manually resolvable keeps the user in
+    // charge: no scheduler observations behind their back.
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: false,
+      canResolveMutationRecovery: vi.fn().mockReturnValue(true),
+    } as never;
+    (
+      plugin as never as { mutationRecoveryBlockReason: string | null }
+    ).mutationRecoveryBlockReason = "facts-changed";
+    expect((plugin as never as {
+      requestMutationRecoveryObservation: (trigger: string) => boolean;
+    }).requestMutationRecoveryObservation("foreground")).toBe(false);
     plugin.stopAutoSync();
   });
 
@@ -2046,6 +2076,60 @@ describe("main sync entry guards", () => {
     expect(outcome).toEqual({ state: "settled" });
     expect(run).toHaveBeenCalledOnce();
     expect(run.mock.calls[0]?.[0]).toBe("auto");
+    expect(runAutomaticSync).toHaveBeenCalledWith("recovery-continuation");
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
+  it("ends a paused no-exit block when a scheduled observation settles it (B4)", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.autoSyncPaused = true;
+    (
+      plugin as never as { mutationRecoveryBlockReason: string | null }
+    ).mutationRecoveryBlockReason = "state-unavailable";
+    plugin.auth = {
+      authState: {
+        isLoggedIn: true,
+        accountId: "account",
+      },
+    } as never;
+    plugin.state = {
+      isV2StateActive: true,
+      mutationLedger: [{ intent: { operationId: "pending" }, receipt: null }],
+      planReviewActive: false,
+      hasMutationLedgerCorruption: false,
+      hasMutationRecoveryQuarantineCorruption: false,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+    } as never;
+    vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(plugin as never, "beginSyncNotice").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin as never, "startAutoSync")
+      .mockImplementation(() => undefined);
+    const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")
+      .mockResolvedValue(true);
+    const run = vi.fn().mockImplementation(async () => {
+      plugin.state!.mutationLedger.splice(0);
+      return {
+        ...okResult(),
+        mutationRecovery: {
+          state: "settled" as const,
+          total: 1,
+          settled: 1,
+          remaining: 0,
+          retryAfterSeconds: null,
+        },
+      };
+    });
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    const outcome = await (plugin as never as {
+      runScheduledMutationRecovery: () => Promise<{ state: string }>;
+    }).runScheduledMutationRecovery();
+
+    expect(outcome).toEqual({ state: "settled" });
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(startAutoSync).toHaveBeenCalledOnce();
     expect(runAutomaticSync).toHaveBeenCalledWith("recovery-continuation");
     expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
   });
@@ -5331,6 +5415,60 @@ describe("main sync entry guards", () => {
     });
   });
 
+  it("keeps the manual resolution exit reachable under a state-unavailable stamp when the record is eligible", () => {
+    const plugin = makePlugin();
+    plugin.state = {
+      isV2StateActive: true,
+      syncHistory: [],
+      mutationLedger: [{
+        intent: { operationId: "pending", path: "notes/a.md" },
+        receipt: null,
+      }],
+    } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: false,
+      canResolveMutationRecovery: vi.fn().mockReturnValue(true),
+    } as never;
+    // The stamp a crashed round leaves behind must not freeze a resolvable
+    // record behind "export or reset" (field reports 2026-09-28).
+    (plugin as never as {
+      mutationRecoveryBlockReason: string | null;
+    }).mutationRecoveryBlockReason = "state-unavailable";
+
+    expect(plugin.getMutationRecoveryDisplayState()).toMatchObject({
+      kind: "blocked",
+      blockReason: "state-unavailable",
+      manualResolutionAvailable: true,
+    });
+  });
+
+  it("keeps the manual resolution exit hidden under a state-unavailable stamp when the record is ineligible", () => {
+    const plugin = makePlugin();
+    plugin.state = {
+      isV2StateActive: true,
+      syncHistory: [],
+      mutationLedger: [{
+        intent: { operationId: "pending", path: "notes/a.md" },
+        receipt: null,
+      }],
+    } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: false,
+      canResolveMutationRecovery: vi.fn().mockReturnValue(false),
+    } as never;
+    (plugin as never as {
+      mutationRecoveryBlockReason: string | null;
+    }).mutationRecoveryBlockReason = "state-unavailable";
+
+    expect(plugin.getMutationRecoveryDisplayState()).toMatchObject({
+      kind: "blocked",
+      blockReason: "state-unavailable",
+      manualResolutionAvailable: false,
+    });
+  });
+
   it("does not invent a network recovery history when reset receives no recovery summary", async () => {
     const plugin = makePlugin();
     const addSyncHistory = vi.fn().mockResolvedValue(undefined);
@@ -5914,6 +6052,37 @@ describe("main sync entry guards", () => {
       errors: 3,
       identityBlockedErrors: 3,
       message: "syncFailed",
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(stopAutoSync).not.toHaveBeenCalled();
+    expect(saveSyncSettings).not.toHaveBeenCalled();
+    expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("does not pause auto sync when the only outcome is a remote-version-changed deferral", async () => {
+    // 2026-09-28 热文件改判：下载中云端版本变化延后为单项，轮内 errors=0、
+    // success=true——暂停门不得因 deferred>0 把自动同步停掉。
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: true,
+      errors: 0,
+      deferred: 1,
+      message: "result.deferred",
     }, "auto");
 
     expect(plugin.autoSyncPaused).toBe(false);

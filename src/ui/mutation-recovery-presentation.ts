@@ -53,6 +53,24 @@ export function shouldAutoSettleIdenticalRecovery(
   return snapshot.identical && snapshot.bundleReview === undefined;
 }
 
+/**
+ * Block reasons under which the fixed recovery review exit may be offered.
+ * facts-changed is the classified shape. state-unavailable also qualifies:
+ * that stamp describes how the LAST round ended, not what the record is, and
+ * the resolution flow re-inspects both sides and refuses on any uncertainty
+ * at decision time — offering the exit there only stops a transient crash
+ * stamp from freezing a resolvable record behind "export or reset" (field
+ * reports 2026-09-28). Corrupt evidence, account change, and scope recovery
+ * keep their own dedicated exits, and eligibility itself stays gated by
+ * canResolveMutationRecovery.
+ */
+export function manualResolutionExitAllowedFor(
+  blockReason: MutationRecoveryBlockReason | null | undefined,
+): boolean {
+  return blockReason === "facts-changed"
+    || blockReason === "state-unavailable";
+}
+
 export function mutationRecoveryBlockReasonText(
   reason: MutationRecoveryBlockReason | null | undefined,
   t: Translator,
@@ -111,7 +129,7 @@ export function mutationRecoveryPrimaryActionKey(
   // only switches the next-step pointer below.
   if (
     state.kind === "blocked"
-    && state.blockReason === "facts-changed"
+    && manualResolutionExitAllowedFor(state.blockReason)
     && state.manualResolutionAvailable === true
   ) {
     return "syncView.recovery.reviewDetails";

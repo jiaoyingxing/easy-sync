@@ -7306,6 +7306,7 @@ export class SyncExecutor {
             operationEpoch,
             options.mutationRecoveryObservationOnly === true,
             recoveryObservationCommitSeq,
+            result,
           );
         } catch (error) {
           if (!(error instanceof MutationRecoveryBlockedError)) throw error;
@@ -9206,6 +9207,9 @@ export class SyncExecutor {
       // plugin re-bundled during a slow-network window) still gets deferred —
       // but only until the backoff window expires, which grants one real
       // attempt per window instead of the version-matched indefinite skip.
+      // transfer-remote-moving (2026-09-28) shares the timer arm: a hot file
+      // (recording part, in-flight photo) offers a newer remote version every
+      // attempt, so the version-matched arm alone would never engage.
       const breakerMap = new Map<string, PendingIssue>();
       for (const issue of this.state.pendingIssues) {
         // Terminal skip outcomes (oversized file, unstorable name) never
@@ -9233,7 +9237,8 @@ export class SyncExecutor {
           const breaker = breakerMap.get(item.path);
           if (!breaker) continue;
           const versionMatched = item.local?.hash === breaker.localHash && item.remote?.eTag === breaker.remoteETag;
-          const networkBackoff = breaker.issueCode === "transfer-network"
+          const networkBackoff = (breaker.issueCode === "transfer-network"
+            || breaker.issueCode === "transfer-remote-moving")
             && breaker.updatedAt >= networkBackoffCutoff;
           if (versionMatched || networkBackoff) {
             breakerCount++;
@@ -9241,7 +9246,9 @@ export class SyncExecutor {
               item.type = SyncActionType.RetryLater;
               item.reason = breaker.issueCode === "transfer-network"
                 ? "reason.circuitBreaker.network"
-                : "reason.circuitBreaker";
+                : breaker.issueCode === "transfer-remote-moving"
+                  ? "reason.circuitBreaker.remoteMoving"
+                  : "reason.circuitBreaker";
               breakerDeferredCount++;
             }
           }
@@ -11322,6 +11329,8 @@ export class SyncExecutor {
                 ? { issueCode: "parent-chain-incomplete" as const }
               : item.reason === "reason.circuitBreaker.network"
                 ? { issueCode: "transfer-network" as const }
+              : item.reason === "reason.circuitBreaker.remoteMoving"
+                ? { issueCode: "transfer-remote-moving" as const }
               : item.reason === "reason.file.scope-crossing"
                 ? { issueCode: "scope-crossing" as const }
               : item.reason === "reason.folder.scope-crossing"
@@ -11596,6 +11605,34 @@ export class SyncExecutor {
           return;
         }
         transferOutcome = transferMetrics ? "failed" : null;
+        if (e instanceof DownloadRemoteVersionChangedError) {
+          // A stale-version download is a transient content race — the source
+          // device was still writing while we read (hot file: recording part,
+          // in-flight photo). The next round replans from the newer remote
+          // version, so defer the item instead of failing the round; auto sync
+          // keeps running (2026-09-28). The transfer-remote-moving breaker row
+          // grants one real attempt per backoff window so a still-growing file
+          // is not re-downloaded every round.
+          this.diag?.warn(
+            "execute",
+            `[${position}/${total}] download deferred — remote version changed during download: ${item.path}`,
+          );
+          result.deferred++;
+          const reason = this.failureReason(e, item.path);
+          pendingIssues.push({
+            path: item.path,
+            actionType: item.type,
+            reason,
+            updatedAt: Date.now(),
+            fileSize,
+            localHash,
+            remoteETag,
+            consecutiveFailures: 1,
+            issueCode: "transfer-remote-moving" as const,
+          });
+          callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize);
+          return;
+        }
         const dbFingerprint = fingerprintIndexedDbError(e);
         this.diag?.error("execute", `[${position}/${total}] ${item.type} ${item.path} FAILED: ${e instanceof Error ? e.message : String(e)}`, dbFingerprint ? { ...errorDiagData(e), ...dbFingerprint } : errorDiagData(e));
         // Auth failure at any file stops the entire pool immediately —
@@ -11727,6 +11764,7 @@ export class SyncExecutor {
         ? this.commitMutationCheckpoint(operationIds[0])
         : this.commitMutationCheckpoints(operationIds);
       let checkpointError: unknown;
+      let hierarchyRefreshAttempted = false;
       for (let attempt = 0; attempt < 2; attempt++) {
         const checkpointStartedAt = Date.now();
         try {
@@ -11752,6 +11790,28 @@ export class SyncExecutor {
               mutations: 0,
             },
           );
+          if (
+            attempt === 0
+            && !hierarchyRefreshAttempted
+            && isV2RemoteUpsertParentMismatchError(error)
+          ) {
+            // Same recovery the single-item commit path owns: the hierarchy
+            // may have changed after this run's initial scan, so refresh the
+            // committed identity tree once, rebind every receipt the
+            // refreshed tree accepts, and let attempt 2 face that tree. The
+            // reducer's parent assertion itself stays fail-closed.
+            hierarchyRefreshAttempted = true;
+            const rebound = await this.rebaseReceiptsAfterHierarchyRefresh(
+              operationIds,
+              operationEpoch,
+              result,
+            );
+            if (rebound.rebound > 0) {
+              metrics.mutationPersistence.receiptWrites += rebound.rebound;
+              metrics.mutationPersistence.stagesMs.receiptPersist +=
+                rebound.receiptPersistMs;
+            }
+          }
         }
       }
       if (checkpointError !== undefined) {
@@ -11766,6 +11826,13 @@ export class SyncExecutor {
             completion.renameFrom,
           );
         }
+        // Rethrown fail-closed on purpose: the round-end shared checkpoint
+        // refuses to publish while net-new unresolved ledger records exist
+        // (sameRetainedMutationRecovery), so a degraded "keep going" would
+        // crash at round end anyway. The rebuild-rebase-retry above settles
+        // the reachable parent-drift shape; the stranded receipts of a still
+        // failing batch settle through the next round's mutation recovery,
+        // which runs the same refresh (uploadReceiptParentDriftedFromIndex).
         throw checkpointError instanceof Error
           ? checkpointError
           : new Error(describeThrownValue(checkpointError));
@@ -13829,6 +13896,7 @@ export class SyncExecutor {
     operationEpoch?: number,
     observationOnly = false,
     remoteObservationCommitSeq?: number,
+    result?: SyncResult,
   ): Promise<MutationRecoveryRunSummary | null> {
     if (this.state.hasMutationLedgerCorruption) {
       const total = this.state.mutationLedger.length;
@@ -13844,6 +13912,7 @@ export class SyncExecutor {
     const mergeRecovery = automaticHandlingMetrics?.mergeRecovery;
     const persistedRecords = [...(this.state.mutationLedger ?? [])];
     const operationIds = new Set<string>();
+    let hierarchyRefreshedForRecovery = false;
     for (const persistedRecord of persistedRecords) {
       const operationId = persistedRecord.intent.operationId;
       if (operationIds.has(operationId)) {
@@ -14134,9 +14203,34 @@ export class SyncExecutor {
               { operationId: record.intent.operationId, mutations: 0 },
             );
           }
-          const recoveryRecord = rebasedReceipt
+          let recoveryRecord = rebasedReceipt
             ? { ...record, receipt: rebasedReceipt }
             : record;
+          if (
+            !rebasedReceipt
+            && !hierarchyRefreshedForRecovery
+            && operationEpoch !== undefined
+            && result
+            && await this.uploadReceiptParentDriftedFromIndex(record)
+          ) {
+            // The receipt carries the live parent identity while the
+            // committed index still binds the path to an older folder one —
+            // the direction the rebase above cannot repair. Refresh the
+            // committed tree once per recovery run, then re-verify against
+            // it; every other shape stays on its fail-closed path.
+            hierarchyRefreshedForRecovery = true;
+            const rebound = await this.rebaseReceiptsAfterHierarchyRefresh(
+              [record.intent.operationId],
+              operationEpoch,
+              result,
+            );
+            if (rebound.refreshed) {
+              recoveryRecord = this.state.mutationLedger.find(
+                (entry) => entry.intent.operationId
+                  === record.intent.operationId,
+              ) ?? recoveryRecord;
+            }
+          }
           receiptMatches = await this.verifyMutationReceipt(
             recoveryRecord,
             observationOnly,
@@ -14361,8 +14455,14 @@ export class SyncExecutor {
             }
           : {}),
       };
+      const blockedRecordById = new Map(
+        blockedRecords.map((item) => [
+          item.record.intent.operationId,
+          item.record,
+        ]),
+      );
       const diagnosticSummary = {
-        schemaVersion: 1,
+        schemaVersion: 2,
         ...recoverySummary,
         applied,
         notApplied,
@@ -14372,6 +14472,22 @@ export class SyncExecutor {
         blockedByReason,
         firstBlockedOperationId: blocked[0]?.operationId ?? null,
         externalMutations,
+        // Field-report blind spot (2026-09-28): the blocked operationId alone
+        // never says which file is stuck. Paths are within this report's
+        // stated privacy envelope (paths and sync technical facts only).
+        blockedRecords: blocked.map((item) => {
+          const record = blockedRecordById.get(item.operationId);
+          return {
+            operationId: item.operationId,
+            ...(record
+              ? {
+                  path: record.intent.path,
+                  action: record.intent.action,
+                  receipted: record.receipt !== null,
+                }
+              : {}),
+          };
+        }),
       };
       if (blocked.length > 0) {
         this.diag?.warn(
@@ -14497,6 +14613,79 @@ export class SyncExecutor {
       ...record.receipt,
       checkpoint,
     };
+  }
+
+  /**
+   * Shared parent-drift recovery for the single-item commit path and the
+   * deferred upload batch: refresh the committed identity tree once from a
+   * complete remote listing, then rebind every upload receipt the refreshed
+   * tree can accept. Read-only recovery plus durable receipt updates only —
+   * it never rewrites plans and never relaxes the reducer's parent
+   * assertion. Requires a run context (epoch + result); callers without one
+   * stay on their existing fail-closed paths.
+   */
+  private async rebaseReceiptsAfterHierarchyRefresh(
+    operationIds: readonly string[],
+    operationEpoch: number,
+    result: SyncResult,
+  ): Promise<{
+    refreshed: boolean;
+    rebound: number;
+    receiptPersistMs: number;
+  }> {
+    if (!this.activeSyncScope) {
+      return { refreshed: false, rebound: 0, receiptPersistMs: 0 };
+    }
+    await this.rebuildRemoteStateFromIdentitySnapshot(
+      operationEpoch,
+      result,
+      this.activeSyncScope,
+    );
+    let rebound = 0;
+    let receiptPersistMs = 0;
+    for (const operationId of operationIds) {
+      const record = this.state.mutationLedger.find(
+        (entry) => entry.intent.operationId === operationId,
+      );
+      if (!record) continue;
+      const rebased = await this.rebaseReceiptedUploadParent(record);
+      if (!rebased) continue;
+      const receiptStartedAt = Date.now();
+      await this.state.recordMutationReceipt(rebased);
+      receiptPersistMs += Date.now() - receiptStartedAt;
+      rebound++;
+      this.diag?.log(
+        "state",
+        `rebound upload receipt after remote hierarchy refresh — ${record.intent.path}`,
+        { operationId, mutations: 0 },
+      );
+    }
+    return { refreshed: true, rebound, receiptPersistMs };
+  }
+
+  /**
+   * Detect the one parent-drift shape the existing receipt rebase cannot
+   * repair: the receipt carries the live parent identity while the committed
+   * index still binds the path to an older folder identity (field reports
+   * 2026-09-28: uploads into a cloud-reorganized subtree kept failing the
+   * parent assertion because the index never adopted the replacement). Any
+   * missing or conflicting fact returns false and leaves the record on its
+   * existing fail-closed recovery path.
+   */
+  private async uploadReceiptParentDriftedFromIndex(
+    record: Readonly<MutationLedgerEntryV1>,
+  ): Promise<boolean> {
+    if (record.intent.action !== "upload" || !record.receipt) return false;
+    const upserts = record.receipt.checkpoint.remoteUpserts.filter(
+      (entry) => entry.path === record.intent.path,
+    );
+    if (upserts.length !== 1) return false;
+    const expectedParentId = this.committedRemoteParentId(record.intent.path);
+    if (!expectedParentId || upserts[0].parentId === expectedParentId) {
+      return false;
+    }
+    const current = await this.inspectRemotePath(record.intent.path);
+    return Boolean(current && current.parentId === upserts[0].parentId);
   }
 
   /**
@@ -15373,7 +15562,17 @@ export class SyncExecutor {
       )
     ) return null;
     if (!intent.expectedLocal.exists || local.status !== "present" || !local.entry) return null;
-    if (!await this.remoteMatchesTarget(target, intent.expectedLocal)) return null;
+    if (!localStillExpected) return null;
+    if (intent.expectedRemote.sha256Hash === undefined) {
+      // F17: sha-unknown remote rename/move — settle as a plain move on the
+      // move anchors (identity checked above, size preserved); the moved
+      // bytes are recorded as read back and any divergence converges through
+      // the ordinary same-path decision next round (F11 shape-③ mirror).
+      if (target.size !== intent.expectedRemote.size) return null;
+    } else {
+      if (!await this.remoteMatchesTarget(target, intent.expectedLocal)) return null;
+      this.convergencesThisRound++;
+    }
     checkpoint.baseRemovals.push(intent.sourcePath);
     checkpoint.baseUpserts.push({
       path: intent.path,
@@ -15381,7 +15580,6 @@ export class SyncExecutor {
       size: local.entry.size,
       eTag: target.eTag,
     });
-    this.convergencesThisRound++;
     checkpoint.remoteDeletes.push(intent.sourcePath);
     checkpoint.remoteUpserts.push(target);
     return checkpoint;
@@ -17185,14 +17383,23 @@ export class SyncExecutor {
             updated.parentReference?.id,
             item.targetParentRemoteId ?? item.remote.parentId,
           ),
-          size: updated.size ?? item.local.size,
+          size: updated.size ?? item.remote.size,
           mtime: updated.lastModifiedDateTime
             ? new Date(updated.lastModifiedDateTime).getTime()
             : Date.now(),
           eTag: updated.eTag ?? "",
           cTag: updated.cTag ?? "",
-          sha256Hash: item.local.hash,
-          quickXorHash: item.local.quickXorHash,
+          // F17: a rename/move does not change the object's content, so the
+          // hash is the source object's hash as last observed (the response's
+          // fresh value when Graph provides one) — never the local file's
+          // hash, which the remote bytes were never proven to equal. In the
+          // sha-unknown world this keeps the receipt writable and the index
+          // honest; bytes divergence converges through the ordinary
+          // same-path decision next round.
+          sha256Hash: updated.file?.hashes?.sha256Hash?.toLowerCase()
+            ?? item.remote.sha256Hash,
+          quickXorHash: updated.file?.hashes?.quickXorHash
+            ?? item.remote.quickXorHash,
         };
         if (
           updated.id !== item.remote.driveId

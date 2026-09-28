@@ -156,6 +156,7 @@ import {
 } from "./sync/mutation-recovery-scheduler";
 import {
   formatMutationRecoveryHistory,
+  manualResolutionExitAllowedFor,
   mutationRecoveryStatusDetail,
   mutationRecoveryStatusLabel,
   type MutationRecoveryDisplayState,
@@ -1670,7 +1671,7 @@ export default class EasySyncPlugin extends Plugin {
       || executor.hasSideActionsInFlight
       || !this.state?.isV2StateActive
       || display?.kind !== "blocked"
-      || display.blockReason !== "facts-changed"
+      || !manualResolutionExitAllowedFor(display.blockReason)
     ) return null;
     if (!await this.checkAccountBinding()) return null;
     return executor.getMutationRecoveryResolutionSnapshot(
@@ -4159,7 +4160,7 @@ export default class EasySyncPlugin extends Plugin {
       blockedOperationId,
       paused: this.autoSyncPaused,
       manualResolutionAvailable: kind === "blocked"
-        && blockReason === "facts-changed"
+        && manualResolutionExitAllowedFor(blockReason)
         && this.syncExecutor?.canResolveMutationRecovery(
           blockedOperationId ?? undefined,
         ) === true,
@@ -4417,10 +4418,30 @@ export default class EasySyncPlugin extends Plugin {
    * arms the timer-only scheduler; the scheduler cannot inspect or mutate
    * sync state and still re-enters through the shared operation lock.
    */
+  /**
+   * B4 (2026-09-28 用户拍板): while a mutation-recovery pause is active,
+   * bounded scheduler observations may continue ONLY when the blocked record
+   * has no manual exit — the self-bundle path class whose automatic
+   * settlement is the sole outlet (F16, field case E). Records with a
+   * manual exit keep the user in charge; the scheduler budget (bounded
+   * backoff, exhaustion) is unchanged.
+   */
+  private pausedBlockedRecoveryLacksManualExit(): boolean {
+    if (this.mutationRecoveryBlockReason === null) return false;
+    if (typeof this.syncExecutor?.canResolveMutationRecovery !== "function") {
+      // An executor that cannot answer the eligibility gate offers no
+      // manual exit by definition — the bounded retry proceeds.
+      return true;
+    }
+    const display = this.getMutationRecoveryDisplayState();
+    return display?.kind === "blocked"
+      && display.manualResolutionAvailable !== true;
+  }
+
   private requestMutationRecoveryObservation(trigger: string): boolean {
     if (
       !this.isAutoSyncMasterEnabled()
-      || this.autoSyncPaused
+      || (this.autoSyncPaused && !this.pausedBlockedRecoveryLacksManualExit())
       || !this._stateLoaded
       || !this.auth?.authState.isLoggedIn
       || !this.state?.isV2StateActive
@@ -4476,7 +4497,7 @@ export default class EasySyncPlugin extends Plugin {
     Promise<MutationRecoveryAttemptOutcome> {
     if (
       !this.isAutoSyncMasterEnabled()
-      || this.autoSyncPaused
+      || (this.autoSyncPaused && !this.pausedBlockedRecoveryLacksManualExit())
       || !this.auth?.authState.isLoggedIn
       || !this.syncExecutor
     ) return { state: "inactive" };
@@ -4554,6 +4575,14 @@ export default class EasySyncPlugin extends Plugin {
       if (!settled) {
         await this.pauseForMutationRecoveryBlock("state-unavailable");
         return { state: "blocked" };
+      }
+      if (this.autoSyncPaused) {
+        // B4: a scheduled observation that settles a paused no-exit block
+        // ends the pause the same way an isolated recovery does — the
+        // finally below then continues through a fresh canonical round.
+        this.autoSyncPaused = false;
+        await this.saveSyncSettings();
+        this.startAutoSync();
       }
       return { state: "settled" };
     } catch (error) {

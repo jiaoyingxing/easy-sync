@@ -157,6 +157,20 @@ function conservativeResetReceiptMatchesIntent(
         && remote.sha256Hash !== undefined
         && remote.sha256Hash.toLowerCase() === expected.sha256Hash.toLowerCase());
       if (intent.expectedRemote.sha256Hash === undefined) {
+        if (intent.action === "renameRemote") {
+          // F17 (field 2026-09-28): a REMOTE rename/move changes the
+          // object's eTag, so the receipt records the post-move world
+          // instead of the planned pre-move one — the moveLocal shape below
+          // (eTag bound to the untouched remote world) is unreachable by
+          // construction for this action. Anchors: the moved object's
+          // identity (driveId, checked above) and size (a move preserves
+          // size). The content hash is whatever the read-back reported
+          // (usually absent on OneDrive personal) and is never claimed from
+          // the local side; bytes divergence converges through the ordinary
+          // same-path decision next round.
+          return remote.size === intent.expectedRemote.size
+            && baseMatches(intent.expectedLocal);
+        }
         return remote.sha256Hash === undefined
           && remote.eTag === intent.expectedRemote.eTag
           && remote.size === intent.expectedRemote.size

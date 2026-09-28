@@ -624,7 +624,8 @@ export interface PendingIssue {
     | "target-occupied"
     | "parent-chain-incomplete"
     | "scope-crossing"
-    | "transfer-network";
+    | "transfer-network"
+    | "transfer-remote-moving";
   reason?: string;
   updatedAt: number;
   fileSize?: number;
@@ -6990,9 +6991,13 @@ export class StateManager {
           // Network failures are a property of the link, not of the bytes:
           // a file whose transfer keeps timing out across rebuilds (e.g. a
           // plugin re-bundled during a slow-network window) must keep
-          // accumulating so the breaker can back it off. Version change only
-          // resets the counter for content-class failures.
+          // accumulating so the breaker can back it off. The same holds for
+          // transfer-remote-moving (2026-09-28): every attempt of a hot file
+          // (recording part, in-flight photo) sees a newer remote version,
+          // so a version reset would never let the breaker arm. Version
+          // change still resets the counter for content-class failures.
           nextIssue.consecutiveFailures = issue.issueCode === "transfer-network"
+            || issue.issueCode === "transfer-remote-moving"
             ? (existing.consecutiveFailures ?? 1) + 1
             : 1;
         }
@@ -7001,8 +7006,10 @@ export class StateManager {
         // can expire and grant the next real attempt.
         if (
           issue.actionType === SyncActionType.RetryLater
-          && issue.issueCode === "transfer-network"
-          && existing?.issueCode === "transfer-network"
+          && issue.issueCode !== undefined
+          && issue.issueCode === existing?.issueCode
+          && (issue.issueCode === "transfer-network"
+            || issue.issueCode === "transfer-remote-moving")
         ) {
           nextIssue.updatedAt = existing.updatedAt;
         }

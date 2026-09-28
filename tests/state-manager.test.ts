@@ -1313,6 +1313,110 @@ describe("StateManager batch persistence", () => {
     expect(state.pendingIssues).toEqual([]);
   });
 
+  it("keeps accumulating version-changed failures for transfer-remote-moving while content classes reset", async () => {
+    // 2026-09-28 热文件（录音分片／在传照片）：每一次失败尝试的都是更新的
+    // 远端版本，若按内容类策略重置计数，熔断永远武装不起来。云端文件持续
+    // 更新与持续弱网同属「重试值得但每轮都烧预算」的形态，跨版本累计。
+    const { state } = makeState();
+
+    await state.reconcilePendingIssues([{
+      path: "hot.m4a",
+      actionType: SyncActionType.Download,
+      issueCode: "transfer-remote-moving",
+      reason: "下载期间云端文件已更新，将重新核对",
+      remoteETag: "v1",
+      consecutiveFailures: 1,
+      updatedAt: 1,
+    }], []);
+    await state.reconcilePendingIssues([{
+      path: "hot.m4a",
+      actionType: SyncActionType.Download,
+      issueCode: "transfer-remote-moving",
+      reason: "下载期间云端文件已更新，将重新核对",
+      remoteETag: "v2",
+      consecutiveFailures: 1,
+      updatedAt: 2,
+    }], []);
+    await state.reconcilePendingIssues([{
+      path: "hot.m4a",
+      actionType: SyncActionType.Download,
+      issueCode: "transfer-remote-moving",
+      reason: "下载期间云端文件已更新，将重新核对",
+      remoteETag: "v3",
+      consecutiveFailures: 1,
+      updatedAt: 3,
+    }], []);
+
+    expect(state.pendingIssues).toEqual([{
+      path: "hot.m4a",
+      actionType: SyncActionType.Download,
+      issueCode: "transfer-remote-moving",
+      reason: "下载期间云端文件已更新，将重新核对",
+      remoteETag: "v3",
+      consecutiveFailures: 3,
+      updatedAt: 3,
+    }]);
+
+    // 对照边界：无 issueCode 的内容类失败在版本变化时仍重置计数（现役策略）。
+    await state.reconcilePendingIssues([{
+      path: "plain.md",
+      actionType: SyncActionType.Download,
+      reason: "version moved",
+      remoteETag: "v1",
+      consecutiveFailures: 1,
+      updatedAt: 4,
+    }], []);
+    await state.reconcilePendingIssues([{
+      path: "plain.md",
+      actionType: SyncActionType.Download,
+      reason: "version moved",
+      remoteETag: "v2",
+      consecutiveFailures: 1,
+      updatedAt: 5,
+    }], []);
+
+    expect(
+      state.pendingIssues.find((issue) => issue.path === "plain.md")
+        ?.consecutiveFailures,
+    ).toBe(1);
+  });
+
+  it("RetryLater deferral rows keep the last real failure time for remote-moving backoff", async () => {
+    // 延后轮不是关于链路的新证据：updatedAt 必须锚在最后一次真实失败上，
+    // 否则退避窗口被每轮延后永久刷新，文件永远等不到真实尝试
+    // （现役 transfer-network 同款保障）。
+    const { state } = makeState();
+
+    await state.reconcilePendingIssues([{
+      path: "hot.m4a",
+      actionType: SyncActionType.Download,
+      issueCode: "transfer-remote-moving",
+      reason: "下载期间云端文件已更新，将重新核对",
+      remoteETag: "v9",
+      consecutiveFailures: 3,
+      updatedAt: 1000,
+    }], []);
+    await state.reconcilePendingIssues([{
+      path: "hot.m4a",
+      actionType: SyncActionType.RetryLater,
+      issueCode: "transfer-remote-moving",
+      reason: "这个文件已连续多轮同步失败，本轮自动同步暂时跳过；手动同步会立即重试",
+      remoteETag: "v9",
+      consecutiveFailures: 1,
+      updatedAt: 2000,
+    }], []);
+
+    expect(state.pendingIssues).toEqual([{
+      path: "hot.m4a",
+      actionType: SyncActionType.RetryLater,
+      issueCode: "transfer-remote-moving",
+      reason: "这个文件已连续多轮同步失败，本轮自动同步暂时跳过；手动同步会立即重试",
+      remoteETag: "v9",
+      consecutiveFailures: 4,
+      updatedAt: 1000,
+    }]);
+  });
+
   it("prunes only planner-derived issue rows when an issue-code restriction is set", async () => {
     const { state } = makeState();
 

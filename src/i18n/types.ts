@@ -526,6 +526,7 @@ export interface LocaleStrings {
   "reason.folder.local-inspection-failed": string;
   "reason.circuitBreaker": string;
   "reason.circuitBreaker.network": string;
+  "reason.circuitBreaker.remoteMoving": string;
   "reason.delete.folderNotEmpty": string;
   "reason.identityMove.deferred": string;
   "reason.identityMove.localTargetOccupied": string;

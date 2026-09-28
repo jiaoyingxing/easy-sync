@@ -123,9 +123,13 @@ const FILE_SYNC_V1_DEBT: DebtGuard[] = [
     pattern: /\bthis\.state\.(?:beginMutationIntent|recordMutationReceipt|abandonMutationIntent|commitMutationCheckpoints?)\s*\(/g,
     expected: {
       // Two additional V2-only receipt writes rebind a completed upload to a
-      // replacement folder identity. The extra checkpoint owner is the
-      // V2-only independent upload batch gateway, not a V1 runtime path.
-      "src/sync/sync-executor.ts": 15,
+      // replacement folder identity. One more V2-only rebind owner added
+      // 2026-09-28: rebaseReceiptsAfterHierarchyRefresh rebinds upload
+      // receipts after a hierarchy refresh for the deferred upload batch and
+      // the recovery chain (parent-drift field reports) — never a V1 runtime
+      // path. The extra checkpoint owner is the V2-only independent upload
+      // batch gateway, not a V1 runtime path.
+      "src/sync/sync-executor.ts": 16,
     },
   },
 ];
