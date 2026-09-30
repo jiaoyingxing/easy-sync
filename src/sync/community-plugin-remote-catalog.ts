@@ -1,4 +1,5 @@
 import { sha256Hex } from "../crypto";
+import { compareText } from "./compare-text";
 import type { DriveItem } from "../onedrive/types";
 import {
   communityPluginManifestObservationMatchesRemote,
@@ -548,10 +549,6 @@ function compareMember(
   right: Readonly<RemoteCommunityPluginCatalogMemberV1>,
 ): number {
   return compareText(left.path, right.path);
-}
-
-function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

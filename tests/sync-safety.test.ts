@@ -16,6 +16,7 @@ import * as obsidian from "obsidian";
 import { Platform, TFile, TFolder, type Plugin } from "obsidian";
 import { sha256Hex } from "../src/crypto";
 import { getEasySyncPaths } from "../src/obsidian-compat";
+import { BundleReviewBytesCache } from "../src/sync/bundle-review-bytes-cache";
 import { sameSyncScope, SyncActionType } from "../src/sync/types";
 import { planDigest } from "../src/sync/types";
 import type {
@@ -5006,35 +5007,13 @@ describe("Persistent remote delta state", () => {
     expect(bAgain?.factsDigest).toBe(bSnapshot?.factsDigest);
   });
 
-  it("adversarial: bytes cache LRU evicts the least-recently-used plugin and still serves the most-recent", async () => {
-    // White-box: the P3 bytes cache is private, but its eviction contract is
-    // the whole point of the 16 MiB LRU — oversized single members must be
-    // refused and, once the global cap is crossed, whole plugin sets are
-    // evicted in LRU order (least recently used first). The LRU bump on read
-    // must keep the most-recently-used plugin alive.
-    const harness = await makeManualResolutionHarness({
-      path: ".obsidian/plugins/resojot/main.js",
-      withLedger: false,
-      local: { ".obsidian/plugins/resojot/main.js": "x" },
-    });
-    const executor = harness.executor as unknown as {
-      bundleReviewBytesCacheSet(
-        pluginId: string,
-        path: string,
-        hash: string,
-        bytes: ArrayBuffer,
-        mtime: number,
-        identity?: { driveId: string; eTag: string },
-      ): void;
-      bundleReviewBytesCacheGet(
-        pluginId: string,
-        path: string,
-        expectedHash?: string,
-        expectedIdentity?: { driveId?: string; eTag?: string },
-      ): { bytes: ArrayBuffer; mtime: number; hash: string } | null;
-      bundleReviewBytesByPlugin: Map<string, Map<string, unknown>>;
-      bundleReviewBytesTotal: number;
-    };
+  it("adversarial: bytes cache LRU evicts the least-recently-used plugin and still serves the most-recent", () => {
+    // The P3 bytes cache eviction contract is the whole point of the 16 MiB
+    // LRU — oversized single members must be refused and, once the global cap
+    // is crossed, whole plugin sets are evicted in LRU order (least recently
+    // used first). The LRU bump on read must keep the most-recently-used
+    // plugin alive.
+    const cache = new BundleReviewBytesCache();
     const KiB = 1024;
     const MiB = KiB * 1024;
     const member = (pluginId: string, index: number, sizeMiB: number) => ({
@@ -5047,13 +5026,14 @@ describe("Persistent remote delta state", () => {
     const aMembers = [0, 1, 2].map((i) => member("alpha", i, 2));
     const bMembers = [0, 1, 2].map((i) => member("bravo", i, 2));
     for (const m of [...aMembers, ...bMembers]) {
-      executor.bundleReviewBytesCacheSet(m.pluginId, m.path, m.hash, m.bytes, 1);
+      cache.set(m.pluginId, m.path, m.hash, m.bytes, 1);
     }
-    expect(executor.bundleReviewBytesTotal).toBe(12 * MiB);
-    expect(executor.bundleReviewBytesByPlugin.size).toBe(2);
+    expect(cache.totalBytes).toBe(12 * MiB);
+    expect(cache.get("alpha", aMembers[2].path, aMembers[2].hash)).not.toBeNull();
+    expect(cache.get("bravo", bMembers[2].path, bMembers[2].hash)).not.toBeNull();
 
     // LRU bump alpha by reading one of its members.
-    expect(executor.bundleReviewBytesCacheGet(
+    expect(cache.get(
       "alpha",
       aMembers[0].path,
       aMembers[0].hash,
@@ -5064,41 +5044,48 @@ describe("Persistent remote delta state", () => {
     // (bumped) survives.
     const cMembers = [0, 1, 2].map((i) => member("charlie", i, 2));
     for (const m of cMembers) {
-      executor.bundleReviewBytesCacheSet(m.pluginId, m.path, m.hash, m.bytes, 1);
+      cache.set(m.pluginId, m.path, m.hash, m.bytes, 1);
     }
-    expect(executor.bundleReviewBytesTotal).toBe(12 * MiB);
-    expect(executor.bundleReviewBytesByPlugin.has("bravo")).toBe(false);
-    expect(executor.bundleReviewBytesByPlugin.has("alpha")).toBe(true);
-    expect(executor.bundleReviewBytesByPlugin.has("charlie")).toBe(true);
-    expect(executor.bundleReviewBytesCacheGet(
+    expect(cache.totalBytes).toBe(12 * MiB);
+    expect(cache.get(
+      "bravo",
+      bMembers[1].path,
+      bMembers[1].hash,
+    )).toBeNull();
+    expect(cache.get(
+      "alpha",
+      aMembers[1].path,
+      aMembers[1].hash,
+    )).not.toBeNull();
+    expect(cache.get(
+      "charlie",
+      cMembers[0].path,
+      cMembers[0].hash,
+    )).not.toBeNull();
+    expect(cache.get(
       "alpha",
       aMembers[0].path,
       aMembers[0].hash,
     )).not.toBeNull();
-    expect(executor.bundleReviewBytesCacheGet(
-      "bravo",
-      bMembers[0].path,
-      bMembers[0].hash,
-    )).toBeNull();
 
     // A single oversized member (over the 3 MiB per-member bound) is never
     // cached at all.
     const huge = member("delta", 0, 4);
-    executor.bundleReviewBytesCacheSet(huge.pluginId, huge.path, huge.hash, huge.bytes, 1);
-    expect(executor.bundleReviewBytesByPlugin.has("delta")).toBe(false);
-    expect(executor.bundleReviewBytesTotal).toBe(12 * MiB);
+    cache.set(huge.pluginId, huge.path, huge.hash, huge.bytes, 1);
+    expect(cache.get("delta", huge.path, huge.hash)).toBeNull();
+    expect(cache.totalBytes).toBe(12 * MiB);
 
     // Re-adding an existing path replaces its bytes (and re-counts the total)
     // instead of double counting.
     const replacement = member("alpha", 0, 1);
-    executor.bundleReviewBytesCacheSet(
+    cache.set(
       replacement.pluginId,
       replacement.path,
       replacement.hash,
       replacement.bytes,
       1,
     );
-    expect(executor.bundleReviewBytesTotal).toBe(11 * MiB);
+    expect(cache.totalBytes).toBe(11 * MiB);
   });
 
   it("adversarial: a P5 cached snapshot can never authorize a write once the remote changed (SC-07/15)", async () => {

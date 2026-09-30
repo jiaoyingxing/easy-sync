@@ -223,73 +223,7 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
     }
 
     if (bundle) {
-      // The directory holds two different plugins on the two sides: no
-      // keep-side choice exists at all. A single explanatory notice replaces
-      // the two duplicated "side unavailable" lines plus the generic
-      // read-only sentence, which would otherwise read as a temporary state
-      // the user is expected to resolve by picking a side.
-      const identityMismatchOnBothSides = Boolean(
-        !bundle.local.available
-        && bundle.local.reason === "identity-mismatch"
-        && !bundle.remote.available
-        && bundle.remote.reason === "identity-mismatch",
-      );
-      if (identityMismatchOnBothSides) {
-        body.createEl("p", {
-          text: this.t("syncView.pluginBundleReview.identityMismatchNotice"),
-          cls: "easy-sync-comparison-unavailable",
-        });
-      } else {
-        if (!bundle.local.available && bundle.local.reason) {
-          body.createEl("p", {
-            text: this.t("syncView.pluginBundleReview.directionUnavailable", {
-              side: this.t("syncView.mutationResolution.localTitle"),
-              reason: bundleReasonText(bundle.local.reason, this.t),
-            }),
-            cls: "easy-sync-comparison-unavailable",
-          });
-        }
-        if (!bundle.remote.available && bundle.remote.reason) {
-          body.createEl("p", {
-            text: this.t("syncView.pluginBundleReview.directionUnavailable", {
-              side: this.t("syncView.mutationResolution.remoteTitle"),
-              reason: bundleReasonText(bundle.remote.reason, this.t),
-            }),
-            cls: "easy-sync-comparison-unavailable",
-          });
-        }
-        if (!bundle.executionReady) {
-          body.createEl("p", {
-            text: this.t("syncView.pluginBundleReview.readOnly"),
-            cls: "easy-sync-comparison-unavailable",
-          });
-        }
-      }
-      const executableChoices = bundle.executableChoices ?? [];
-      this.renderFileComparisonActions([
-        {
-          label: this.t("syncView.conflict.keepLocal"),
-          className: "easy-sync-detail-action-local",
-          disabled: !executableChoices.includes("keep-local")
-            || !snapshot.keepLocal.available,
-          onClick: () => {
-            void this.confirmDowngradeIfNeeded(snapshot, "keep-local");
-          },
-        },
-        {
-          label: this.t("syncView.conflict.keepRemote"),
-          className: "easy-sync-detail-action-remote",
-          disabled: !executableChoices.includes("keep-remote")
-            || !snapshot.keepRemote.available,
-          onClick: () => {
-            void this.confirmDowngradeIfNeeded(snapshot, "keep-remote");
-          },
-        },
-        {
-          label: this.t("confirm.cancel"),
-          onClick: () => this.finish(null),
-        },
-      ]);
+      this.renderBundleResolutionContent({ body, snapshot, bundle });
       return;
     }
 
@@ -354,6 +288,92 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
     ]);
   }
 
+  /**
+   * Bundle-side comparison body: the identity-mismatch notice (or the two
+   * direction-unavailable lines plus the read-only sentence) and the
+   * keep-side / cancel actions.
+   *
+   * Contract: `body` is the live comparison body element (threaded by
+   * reference, never cloned); `snapshot` and the narrowed `bundle` are
+   * read-only inputs. The caller keeps its `if (bundle)` guard and returns
+   * right after the call, so this phase returns void — nothing is produced
+   * or rebound here, and no field has to flow back.
+   */
+  private renderBundleResolutionContent(args: {
+    body: HTMLElement;
+    snapshot: MutationResolutionSnapshot;
+    bundle: NonNullable<MutationResolutionSnapshot["bundleReview"]>;
+  }): void {
+    const { body, snapshot, bundle } = args;
+    // The directory holds two different plugins on the two sides: no
+    // keep-side choice exists at all. A single explanatory notice replaces
+    // the two duplicated "side unavailable" lines plus the generic
+    // read-only sentence, which would otherwise read as a temporary state
+    // the user is expected to resolve by picking a side.
+    const identityMismatchOnBothSides = Boolean(
+      !bundle.local.available
+      && bundle.local.reason === "identity-mismatch"
+      && !bundle.remote.available
+      && bundle.remote.reason === "identity-mismatch",
+    );
+    if (identityMismatchOnBothSides) {
+      body.createEl("p", {
+        text: this.t("syncView.pluginBundleReview.identityMismatchNotice"),
+        cls: "easy-sync-comparison-unavailable",
+      });
+    } else {
+      if (!bundle.local.available && bundle.local.reason) {
+        body.createEl("p", {
+          text: this.t("syncView.pluginBundleReview.directionUnavailable", {
+            side: this.t("syncView.mutationResolution.localTitle"),
+            reason: bundleReasonText(bundle.local.reason, this.t),
+          }),
+          cls: "easy-sync-comparison-unavailable",
+        });
+      }
+      if (!bundle.remote.available && bundle.remote.reason) {
+        body.createEl("p", {
+          text: this.t("syncView.pluginBundleReview.directionUnavailable", {
+            side: this.t("syncView.mutationResolution.remoteTitle"),
+            reason: bundleReasonText(bundle.remote.reason, this.t),
+          }),
+          cls: "easy-sync-comparison-unavailable",
+        });
+      }
+      if (!bundle.executionReady) {
+        body.createEl("p", {
+          text: this.t("syncView.pluginBundleReview.readOnly"),
+          cls: "easy-sync-comparison-unavailable",
+        });
+      }
+    }
+    const executableChoices = bundle.executableChoices ?? [];
+    this.renderFileComparisonActions([
+      {
+        label: this.t("syncView.conflict.keepLocal"),
+        className: "easy-sync-detail-action-local",
+        disabled: !executableChoices.includes("keep-local")
+          || !snapshot.keepLocal.available,
+        onClick: () => {
+          void this.confirmDowngradeIfNeeded(snapshot, "keep-local");
+        },
+      },
+      {
+        label: this.t("syncView.conflict.keepRemote"),
+        className: "easy-sync-detail-action-remote",
+        disabled: !executableChoices.includes("keep-remote")
+          || !snapshot.keepRemote.available,
+        onClick: () => {
+          void this.confirmDowngradeIfNeeded(snapshot, "keep-remote");
+        },
+      },
+      {
+        label: this.t("confirm.cancel"),
+        onClick: () => this.finish(null),
+      },
+    ]);
+  }
+
   onClose(): void {
     const resolve = this.resolve;
     this.resolve = null;
@@ -393,92 +413,124 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
 
     const tbody = table.createEl("tbody");
     for (const path of orderedPaths) {
-      const row = tbody.createEl("tr");
-      const fileName = path.slice(path.lastIndexOf("/") + 1);
-      const nameCell = row.createEl("td");
-      nameCell.setText(fileName);
+      this.renderBundleOverviewRow({
+        path,
+        tbody,
+        snapshot,
+        presentation,
+        localVersion,
+        remoteVersion,
+      });
+    }
+  }
 
-      const local = snapshot.local.find((fact) => fact.path === path);
-      const remote = snapshot.remote.find((fact) => fact.path === path);
-      const file = presentation?.files.find((entry) => entry.path === path);
+  /**
+   * One bundle-overview row: the name cell, the two value cells (with the
+   * newer/larger accent signal) and the diff action or identical marker.
+   * The container, snapshot and derived versions come from the caller so
+   * the row renders exactly as it did inline.
+   */
+  private renderBundleOverviewRow(args: {
+    path: string;
+    tbody: HTMLElement;
+    snapshot: MutationResolutionSnapshot;
+    presentation: MutationResolutionSnapshot["bundlePresentation"];
+    localVersion: string | null;
+    remoteVersion: string | null;
+  }): void {
+    const {
+      path,
+      tbody,
+      snapshot,
+      presentation,
+      localVersion,
+      remoteVersion,
+    } = args;
+    const row = tbody.createEl("tr");
+    const fileName = path.slice(path.lastIndexOf("/") + 1);
+    const nameCell = row.createEl("td");
+    nameCell.setText(fileName);
 
-      // Version is only shown for the manifest row; other files show the
-      // modified time (matching the "outer = version + mtime" layering).
-      const isManifest = fileName === "manifest.json";
-      const identical = Boolean(
-        local?.exists
-        && remote?.exists
-        && local.hash === remote.hash,
-      );
-      const localValue = identical
-        ? "—"
-        : isManifest && localVersion !== null
-          ? this.t("syncView.pluginBundleReview.version", { version: localVersion })
-          : bundleLocalText(local, file, this.t);
-      const remoteValue = identical
-        ? "—"
-        : isManifest && remoteVersion !== null
-          ? this.t("syncView.pluginBundleReview.version", { version: remoteVersion })
-          : bundleRemoteText(remote, file, this.t);
-      const localCell = row.createEl("td", "easy-sync-meta-col-local");
-      localCell.setText(localValue);
-      const remoteCell = row.createEl("td", "easy-sync-meta-col-remote");
-      remoteCell.setText(remoteValue);
+    const local = snapshot.local.find((fact) => fact.path === path);
+    const remote = snapshot.remote.find((fact) => fact.path === path);
+    const file = presentation?.files.find((entry) => entry.path === path);
 
-      // Identical rows carry no comparison signal — the "两端一致" marker in
-      // the action column already says everything.
-      if (!identical) {
-        // Manifest: the newer version side gets the accent signal (same as
-        // the ordinary conflict-detail metadata table).
-        if (isManifest && localVersion !== null && remoteVersion !== null) {
-          const comparison = compareCommunityPluginVersions(localVersion, remoteVersion);
-          if (comparison !== null && comparison > 0) localCell.addClass("easy-sync-meta-highlight");
-          else if (comparison !== null && comparison < 0) remoteCell.addClass("easy-sync-meta-highlight");
+    // Version is only shown for the manifest row; other files show the
+    // modified time (matching the "outer = version + mtime" layering).
+    const isManifest = fileName === "manifest.json";
+    const identical = Boolean(
+      local?.exists
+      && remote?.exists
+      && local.hash === remote.hash,
+    );
+    const localValue = identical
+      ? "—"
+      : isManifest && localVersion !== null
+        ? this.t("syncView.pluginBundleReview.version", { version: localVersion })
+        : bundleLocalText(local, file, this.t);
+    const remoteValue = identical
+      ? "—"
+      : isManifest && remoteVersion !== null
+        ? this.t("syncView.pluginBundleReview.version", { version: remoteVersion })
+        : bundleRemoteText(remote, file, this.t);
+    const localCell = row.createEl("td", "easy-sync-meta-col-local");
+    localCell.setText(localValue);
+    const remoteCell = row.createEl("td", "easy-sync-meta-col-remote");
+    remoteCell.setText(remoteValue);
+
+    // Identical rows carry no comparison signal — the "两端一致" marker in
+    // the action column already says everything.
+    if (!identical) {
+      // Manifest: the newer version side gets the accent signal (same as
+      // the ordinary conflict-detail metadata table).
+      if (isManifest && localVersion !== null && remoteVersion !== null) {
+        const comparison = compareCommunityPluginVersions(localVersion, remoteVersion);
+        if (comparison !== null && comparison > 0) localCell.addClass("easy-sync-meta-highlight");
+        else if (comparison !== null && comparison < 0) remoteCell.addClass("easy-sync-meta-highlight");
+      } else {
+        const localMtime = file?.localMtime;
+        const remoteMtime = file?.remoteMtime;
+        if (
+          localMtime !== undefined
+          && remoteMtime !== undefined
+          && localMtime !== remoteMtime
+        ) {
+          if (localMtime > remoteMtime) localCell.addClass("easy-sync-meta-highlight");
+          else remoteCell.addClass("easy-sync-meta-highlight");
         } else {
-          const localMtime = file?.localMtime;
-          const remoteMtime = file?.remoteMtime;
+          const localSize = local?.exists ? local.size : undefined;
+          const remoteSize = remote?.exists ? remote.size : undefined;
           if (
-            localMtime !== undefined
-            && remoteMtime !== undefined
-            && localMtime !== remoteMtime
+            localSize !== undefined
+            && remoteSize !== undefined
+            && localSize !== remoteSize
           ) {
-            if (localMtime > remoteMtime) localCell.addClass("easy-sync-meta-highlight");
+            if (localSize > remoteSize) localCell.addClass("easy-sync-meta-highlight");
             else remoteCell.addClass("easy-sync-meta-highlight");
-          } else {
-            const localSize = local?.exists ? local.size : undefined;
-            const remoteSize = remote?.exists ? remote.size : undefined;
-            if (
-              localSize !== undefined
-              && remoteSize !== undefined
-              && localSize !== remoteSize
-            ) {
-              if (localSize > remoteSize) localCell.addClass("easy-sync-meta-highlight");
-              else remoteCell.addClass("easy-sync-meta-highlight");
-            }
           }
         }
       }
+    }
 
-      const actionCell = row.createEl("td");
-      const canDiff = Boolean(
-        local?.exists
-        && remote?.exists
-        && local.hash !== remote.hash,
+    const actionCell = row.createEl("td");
+    const canDiff = Boolean(
+      local?.exists
+      && remote?.exists
+      && local.hash !== remote.hash,
+    );
+    if (canDiff) {
+      const button = actionCell.createEl("button", {
+        cls: "easy-sync-bundle-diff-link",
+        text: this.t("syncView.pluginBundleReview.viewDiff"),
+      });
+      button.addEventListener("click", () => {
+        void this.openBundleFileDiff(snapshot, path);
+      });
+    } else if (local?.exists && remote?.exists) {
+      // Byte-identical on both sides: nothing to review for this member.
+      actionCell.createSpan("easy-sync-bundle-identical").setText(
+        this.t("syncView.pluginBundleReview.fileIdentical"),
       );
-      if (canDiff) {
-        const button = actionCell.createEl("button", {
-          cls: "easy-sync-bundle-diff-link",
-          text: this.t("syncView.pluginBundleReview.viewDiff"),
-        });
-        button.addEventListener("click", () => {
-          void this.openBundleFileDiff(snapshot, path);
-        });
-      } else if (local?.exists && remote?.exists) {
-        // Byte-identical on both sides: nothing to review for this member.
-        actionCell.createSpan("easy-sync-bundle-identical").setText(
-          this.t("syncView.pluginBundleReview.fileIdentical"),
-        );
-      }
     }
   }
 
@@ -567,7 +619,6 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
     const confirmed = await new ConfirmModal(
       this.app,
       this.t(titleKey),
-      null,
       this.t("confirm.confirm"),
       this.t("confirm.cancel"),
       this.t,

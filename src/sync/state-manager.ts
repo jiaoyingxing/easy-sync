@@ -940,159 +940,7 @@ export class StateManager {
     }
     const saved = await this.plugin.loadData();
     if (saved) {
-      const rawPublicMutationLedger = saved[KEY_PUBLIC_MUTATION_LEDGER];
-      const publicMutationLedger = parseMutationLedger(
-        rawPublicMutationLedger,
-      );
-      const rawMutationLedger = saved[KEY_MUTATION_LEDGER];
-      let mutationLedger = parseMutationLedger(rawMutationLedger);
-      this.mutationLedgerCorrupt = isMalformedMutationLedger(
-        rawPublicMutationLedger,
-        publicMutationLedger,
-      ) || isMalformedMutationLedger(
-        rawMutationLedger,
-        mutationLedger,
-      ) || mutationLedgersDisagree(publicMutationLedger, mutationLedger);
-      if (this.mutationLedgerCorrupt) {
-        // Ledger redundancy: one corrupt ledger copy falls back to the
-        // checksummed backup written on every ledger change. Restoration is
-        // best-effort; a still-inconsistent ledger stays fail-closed corrupt.
-        const restored = await this.tryRestoreMutationLedgerFromBackup();
-        if (restored) {
-          saved[KEY_MUTATION_LEDGER] = restored;
-          mutationLedger = parseMutationLedger(restored);
-          this.mutationLedgerCorrupt = isMalformedMutationLedger(
-            restored,
-            mutationLedger,
-          ) || isMalformedMutationLedger(
-            rawPublicMutationLedger,
-            publicMutationLedger,
-          ) || mutationLedgersDisagree(publicMutationLedger, mutationLedger);
-          if (!this.mutationLedgerCorrupt) {
-            this.plugin.diag?.warn(
-              "state",
-              "mutation ledger restored from its checksummed backup",
-              { mutations: 0 },
-            );
-          }
-        }
-      }
-      const rawRecoveryQuarantine = saved[KEY_V2_RECOVERY_QUARANTINE];
-      const recoveryQuarantine = parseMutationRecoveryQuarantine(
-        rawRecoveryQuarantine,
-      );
-      this.mutationRecoveryQuarantineCorrupt =
-        rawRecoveryQuarantine !== undefined
-        && (
-          !Array.isArray(rawRecoveryQuarantine)
-          || recoveryQuarantine.length !== rawRecoveryQuarantine.length
-        );
-      const communityPluginManifestObservations =
-        await readCommunityPluginManifestObservations(
-          saved[KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS],
-        );
-      const remoteCommunityPluginCatalog =
-        await readRemoteCommunityPluginCatalog(
-          saved[KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG],
-        );
-      let communityPluginAdoptionMemory:
-        CommunityPluginAdoptionMemoryV1 | null = null;
-      const rawAdoptionMemory = saved[KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY];
-      if (rawAdoptionMemory !== undefined && rawAdoptionMemory !== null) {
-        try {
-          communityPluginAdoptionMemory = readCommunityPluginAdoptionMemory(
-            rawAdoptionMemory,
-            this.plugin.manifest.id,
-          );
-        } catch {
-          // A corrupt adoption-memory record degrades to empty: skipped
-          // plugins may be proposed again and pending rows are re-discovered
-          // on the next round. It must never block state loading.
-          communityPluginAdoptionMemory = null;
-        }
-      }
-      this.data = {
-        [KEY_BASE_SNAPSHOT]: saved[KEY_BASE_SNAPSHOT] ?? {},
-        [KEY_PENDING_CONFLICTS]: saved[KEY_PENDING_CONFLICTS] ?? [],
-        [KEY_PENDING_DELETES]: saved[KEY_PENDING_DELETES] ?? [],
-        [KEY_PENDING_ISSUES]: Array.isArray(saved[KEY_PENDING_ISSUES])
-          ? saved[KEY_PENDING_ISSUES]
-          : [],
-        [KEY_LAST_SYNC_TIME]: saved[KEY_LAST_SYNC_TIME] ?? 0,
-        [KEY_PLAN_REVIEW_ACTIVE]: saved[KEY_PLAN_REVIEW_ACTIVE] ?? false,
-        [KEY_PLAN_REVIEW_COUNTS]: saved[KEY_PLAN_REVIEW_COUNTS] ?? null,
-        [KEY_PLAN_REVIEW_ITEMS]: saved[KEY_PLAN_REVIEW_ITEMS] ?? [],
-        [KEY_PLAN_REVIEW_DIGEST]: saved[KEY_PLAN_REVIEW_DIGEST] ?? "",
-        [KEY_PLAN_REVIEW_REVISION]: Number.isSafeInteger(saved[KEY_PLAN_REVIEW_REVISION])
-          && Number(saved[KEY_PLAN_REVIEW_REVISION]) >= 0
-          ? Number(saved[KEY_PLAN_REVIEW_REVISION])
-          : 0,
-        [KEY_PLAN_REVIEW_SCOPE]: isSyncScope(saved[KEY_PLAN_REVIEW_SCOPE])
-          ? saved[KEY_PLAN_REVIEW_SCOPE]
-          : null,
-        [KEY_PLAN_REVIEW_CANONICAL_IDENTITY]:
-          parseCanonicalPlanIdentityV2(
-            saved[KEY_PLAN_REVIEW_CANONICAL_IDENTITY],
-          ),
-        [KEY_SYNC_HISTORY]: Array.isArray(saved[KEY_SYNC_HISTORY])
-          ? saved[KEY_SYNC_HISTORY]
-          : [],
-        [KEY_TRANSFER_RATES_WINDOW]: Array.isArray(
-          saved[KEY_TRANSFER_RATES_WINDOW],
-        )
-          ? saved[KEY_TRANSFER_RATES_WINDOW]
-          : [],
-        [KEY_GENERATION]: saved[KEY_GENERATION] ?? 0,
-        [KEY_BOUND_ACCOUNT]: saved[KEY_BOUND_ACCOUNT] ?? "",
-        [KEY_PUBLIC_MUTATION_LEDGER]: publicMutationLedger,
-        [KEY_MUTATION_LEDGER]: mutationLedger,
-        [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]:
-          parseManualMutationResolutionAudit(
-            saved[KEY_MANUAL_MUTATION_RESOLUTION_AUDIT],
-          ),
-        [KEY_V2_RECOVERY_QUARANTINE]: recoveryQuarantine,
-        [KEY_FORCE_RESET_AUDIT]: readMutationForceResetAudit(
-          saved[KEY_FORCE_RESET_AUDIT],
-        ),
-        [KEY_LOCAL_FOLDER_MOVE_HINTS]: parseLocalFolderMoveHints(
-          saved[KEY_LOCAL_FOLDER_MOVE_HINTS],
-        ),
-        [KEY_LOCAL_FILE_MOVE_HINTS]: parseLocalFolderMoveHints(
-          saved[KEY_LOCAL_FILE_MOVE_HINTS],
-        ),
-        [KEY_LOCAL_FOLDER_DELETE_HINTS]: parseLocalFolderDeleteHints(
-          saved[KEY_LOCAL_FOLDER_DELETE_HINTS],
-        ),
-        [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]:
-          communityPluginManifestObservations,
-        [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]:
-          remoteCommunityPluginCatalog,
-        [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]:
-          communityPluginAdoptionMemory,
-        [KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2]:
-          readCloudBootstrapPublicationCheckpointV2(
-            saved[KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2],
-          ),
-        [KEY_CONFIRMED_DESCENDANT_FILE_RECONSTRUCTION]:
-          readConfirmedDescendantFileReconstructionCheckpointV1(
-            saved[KEY_CONFIRMED_DESCENDANT_FILE_RECONSTRUCTION],
-          ),
-        [KEY_SYNC_PATH_SETTINGS_REVISION]:
-          Number.isSafeInteger(saved[KEY_SYNC_PATH_SETTINGS_REVISION])
-          && Number(saved[KEY_SYNC_PATH_SETTINGS_REVISION]) >= 0
-            ? Number(saved[KEY_SYNC_PATH_SETTINGS_REVISION])
-            : 0,
-        [KEY_SYNC_PATH_SETTINGS_FINGERPRINT]:
-          typeof saved[KEY_SYNC_PATH_SETTINGS_FINGERPRINT] === "string"
-            ? saved[KEY_SYNC_PATH_SETTINGS_FINGERPRINT]
-            : "",
-        [KEY_SYNC_SCOPE_EXPANSION]: readSyncScopeExpansionMarkerV1(
-          saved[KEY_SYNC_SCOPE_EXPANSION],
-        ),
-        [KEY_PUBLIC_113_CUTOVER]: readPublic113CutoverMarker(
-          saved[KEY_PUBLIC_113_CUTOVER],
-        ),
-      } as PluginData;
+      await this.applyLoadedPluginData(saved);
     }
     await this.retireCommunityPluginEnablementPluginData(saved ?? {});
     const paths = getEasySyncPaths(this.plugin.app.vault, this.plugin.manifest.id);
@@ -1100,343 +948,41 @@ export class StateManager {
     // Real Obsidian adapters expose exists(). Narrow compatibility/test
     // adapters that do not cannot reliably distinguish this new optional file
     // from another read target, so they remain on the legacy path.
-    if (typeof (adapter as Partial<DataAdapter>).exists === "function") {
-      this.v2AuthorityWitnessStore = this.createV2AuthorityWitnessStore(paths);
-      this.v2ScopeTransitionStore = this.createV2ScopeTransitionStore(paths);
-      this.v2CorruptPublicationStore =
-        this.createV2CorruptPublicationStore(paths);
-      this.migrationHoldStore = new MigrationHoldV2Store(
+    const activateLegacyState = async (): Promise<void> => {
+      this.legacyStateAllowed = true;
+      await this.baseContentCache.load(
         adapter,
-        {
-          committed: paths.stateV2MigrationHoldFile,
-          next: paths.stateV2MigrationHoldNextFile,
-        },
+        paths.baseContentFile,
+        getEasySyncLegacyPaths(
+          this.plugin.app.vault,
+          this.plugin.manifest.id,
+        ).baseContentFile,
       );
-      this.v2CorruptRecoveryHoldStore =
-        new CorruptStateRecoveryHoldV2Store(
-          adapter,
-          {
-            committed: paths.stateV2CorruptRecoveryFile,
-            next: paths.stateV2CorruptRecoveryNextFile,
-          },
-        );
-      let corruptPublicationPresent: boolean;
-      let scopeTransitionPresent: boolean;
-      try {
-        corruptPublicationPresent =
-          await this.v2CorruptPublicationStore.hasControlRecord();
-        scopeTransitionPresent =
-          await adapter.exists(paths.stateV2ScopeTransitionFile)
-          || await adapter.exists(paths.stateV2ScopeTransitionNextFile);
-      } catch (error) {
-        this.legacyStateAllowed = false;
-        this.setV2StateLoadBlock(
-          classifyV2StateLoadError(error),
-          "v2",
-        );
-        return;
-      }
-      if (corruptPublicationPresent && scopeTransitionPresent) {
-        this.legacyStateAllowed = false;
-        this.setV2StateLoadBlock(
-          "corrupt-state-publication-state-ambiguous",
-          "v2",
-        );
-        return;
-      }
-      if (!corruptPublicationPresent) {
-        try {
-          await this.v2ScopeTransitionStore.recover();
-        } catch (error) {
-          this.legacyStateAllowed = false;
-          this.setV2StateLoadBlock(
-            error instanceof StateV2ScopeTransitionError
-              ? error.reason
-              : "scope-transition-state-ambiguous",
-            "v2",
-          );
-          return;
-        }
-      }
-      let manifestPresent: boolean;
-      try {
-        manifestPresent = await adapter.exists(paths.stateV2ManifestFile);
-      } catch {
-        // If manifest presence itself is unreadable, neither V1 nor V2 writes
-        // are safe. Treat the authority as unknown and block before scan.
-        this.legacyStateAllowed = false;
-        this.setV2StateLoadBlock(
-          "manifest-presence-unreadable",
-          "unknown",
-        );
-        return;
-      }
-      let authorityWitness: StateV2AuthorityWitness | null;
-      try {
-        authorityWitness = await this.v2AuthorityWitnessStore.load();
-      } catch (error) {
-        this.legacyStateAllowed = false;
-        this.setV2StateLoadBlock(
-          classifyV2StateLoadError(error),
-          manifestPresent ? "v2" : "unknown",
-        );
-        return;
-      }
-      let recoveredCorruptManifest: StateV2Manifest | null = null;
-      if (corruptPublicationPresent) {
-        // The committed manifest may be momentarily absent after the
-        // transaction has retired the source slot but before promoting the
-        // exact staged target. The source-bound publication journal owns this
-        // gap, so recover it before applying the ordinary manifest-presence
-        // authority gate.
-        try {
-          const recovered =
-            await this.v2CorruptPublicationStore.recover();
-          if (recovered) {
-            this.legacyStateAllowed = false;
-            this.remoteState = null;
-            await this.v2CorruptRecoveryHoldStore.clear();
-            this.v2CorruptRecoveryHold = null;
-            await this.v2CorruptPublicationStore.finalize(recovered.record);
-            recoveredCorruptManifest = recovered.manifest;
-            manifestPresent = true;
-            authorityWitness = await this.v2AuthorityWitnessStore.load();
-          }
-        } catch (error) {
-          this.legacyStateAllowed = false;
-          this.remoteState = null;
-          this.setV2StateLoadBlock(
-            classifyV2StateLoadError(error),
-            "v2",
-          );
-          return;
-        }
-      }
-      let migrationHoldUnreadable = false;
-      try {
-        this.migrationHold = await this.migrationHoldStore.load();
-        if (this.migrationHold?.communityPluginEnablement) {
-          this.communityPluginEnablementRetiredThisLoad = true;
-          this.migrationHold =
-            await this.migrationHoldStore
-              .retireCommunityPluginEnablementCarrier();
-        }
-      } catch {
-        this.legacyStateAllowed = false;
-        this.setV2StateLoadBlock(
-          "migration-hold-unreadable",
-          manifestPresent ? "v2" : "v1-precommit",
-        );
-        if (!manifestPresent) return;
-        migrationHoldUnreadable = true;
-      }
+      this.remoteState = await this.loadRemoteState();
+      this.applyLayoutMigrationConflictBlock(layoutMigrationConflict, "unknown");
+    };
+    if (typeof (adapter as Partial<DataAdapter>).exists === "function") {
+      const loadInputs = await this.prepareV2StateLoadInputs({ paths, adapter });
+      if (loadInputs.blocked) return;
+      const {
+        manifestPresent,
+        authorityWitness,
+        recoveredCorruptManifest,
+        migrationHoldUnreadable,
+        authorityWitnessStore,
+        corruptRecoveryHoldStore,
+      } = loadInputs;
       if (manifestPresent) {
-        // File existence is already durable evidence that the manifest-last
-        // authority transaction selected V2. Never allow a later parse/load
-        // failure to expose the V1 runtime again.
-        this.legacyStateAllowed = false;
-        this.remoteState = null;
-        let manifest = recoveredCorruptManifest;
-        if (!manifest) {
-          try {
-            manifest = await readStateV2Manifest(
-              adapter,
-              paths.stateV2ManifestFile,
-            );
-          } catch (error) {
-            this.setV2StateLoadBlock(
-              classifyV2StateLoadError(error),
-              "v2",
-            );
-            return;
-          }
-        }
-        if (!manifest) {
-          this.setV2StateLoadBlock("manifest-disappeared", "v2");
-          return;
-        }
-        if (
-          authorityWitness
-          && !sameStateV2AuthorityManifest(authorityWitness, manifest)
-        ) {
-          this.setV2StateLoadBlock("authority-witness-mismatch", "v2");
-          return;
-        }
-
-        const store = this.createV2Store(paths);
-        this.v2Store = store;
-        let committed: SyncStateEnvelopeV2 | null;
-        if (authorityWitness?.storageAuthority) {
-          try {
-            const selected = await this.loadSelectedIndexedDbStorage(
-              paths,
-              manifest,
-              authorityWitness,
-            );
-            committed = selected.envelope;
-            authorityWitness = selected.witness;
-            this.v2IndexedDbStore = selected.store;
-          } catch (error) {
-            this.setV2StateLoadBlock(
-              "indexeddb-authority-recovery-failed",
-              "v2",
-              error,
-            );
-            return;
-          }
-        } else {
-          try {
-            committed = await store.load(manifest.scope);
-          } catch (error) {
-            let failure: unknown = error;
-            if (
-              error instanceof StateEnvelopeV2LoadError
-              && error.reason === "envelope-unsupported"
-            ) {
-              try {
-                committed = await store.repairCursorOnly(manifest.scope);
-              } catch (repairError) {
-                failure = repairError;
-                committed = null;
-              }
-            } else {
-              committed = null;
-            }
-            if (!committed) {
-              if (
-                error instanceof StateEnvelopeV2LoadError
-                && error.reason === "envelope-unsupported"
-                && !migrationHoldUnreadable
-                && !isActiveMigrationHoldV2(this.migrationHold)
-                && !this.mutationLedgerCorrupt
-                && !this.mutationRecoveryQuarantineCorrupt
-                && this.mutationLedger.length === 0
-                && this.data[KEY_V2_RECOVERY_QUARANTINE].length === 0
-              ) {
-                try {
-                  this.v2CorruptionEvidence =
-                    await store.inspectCorruptCommitted({
-                      expectedScope: manifest.scope,
-                      minimumCommitSeq: manifest.stateCommitSeq,
-                      minimumLifecycleEpoch: manifest.lifecycleEpoch,
-                    });
-                } catch {
-                  this.v2CorruptionEvidence = null;
-                }
-              }
-              try {
-                this.v2CorruptRecoveryHold =
-                  await this.v2CorruptRecoveryHoldStore.load();
-              } catch {
-                this.setV2StateLoadBlock(
-                  "corrupt-state-recovery-hold-unreadable",
-                  "v2",
-                );
-                return;
-              }
-              if (
-                this.v2CorruptRecoveryHold
-                && (
-                  !this.v2CorruptionEvidence
-                  || this.v2CorruptRecoveryHold.sourceDigest
-                    !== this.v2CorruptionEvidence.sourceDigest
-                  || this.v2CorruptRecoveryHold.sourceCommitSeq
-                    !== this.v2CorruptionEvidence.sourceCommitSeq
-                  || this.v2CorruptRecoveryHold.sourceLifecycleEpoch
-                    !== this.v2CorruptionEvidence.sourceLifecycleEpoch
-                  || this.v2CorruptRecoveryHold.corruption
-                    !== this.v2CorruptionEvidence.corruption
-                  || !sameSyncScope(
-                    this.v2CorruptRecoveryHold.scope,
-                    this.v2CorruptionEvidence.scope,
-                  )
-                )
-              ) {
-                this.setV2StateLoadBlock(
-                  "corrupt-state-recovery-hold-mismatch",
-                  "v2",
-                );
-                return;
-              }
-              this.setV2StateLoadBlock(
-                this.v2CorruptionEvidence
-                  ? corruptionLoadBlockReason(
-                      this.v2CorruptionEvidence.corruption,
-                    )
-                  : classifyV2StateLoadError(failure),
-                "v2",
-              );
-              return;
-            }
-          }
-        }
-        if (!committed) {
-          this.setV2StateLoadBlock("manifest-envelope-missing", "v2");
-          return;
-        }
-        if (
-          committed.meta.commitSeq < manifest.stateCommitSeq
-          || committed.meta.lifecycleEpoch < manifest.lifecycleEpoch
-        ) {
-          this.setV2StateLoadBlock("manifest-envelope-behind", "v2");
-          return;
-        }
-        if (migrationHoldUnreadable) {
-          // The committed envelope remains the selected read-only V2 state,
-          // but a corrupt migration control record cannot be used to recreate
-          // a missing protocol-bound witness or finalize cutover metadata.
-          this.activateV2Envelope(committed);
-          return;
-        }
-        if (!authorityWitness) {
-          try {
-            authorityWitness = await this.v2AuthorityWitnessStore.publishActive(
-              manifest,
-              Date.now(),
-              protocolBindingForManifest(this.migrationHold, manifest),
-            );
-          } catch (error) {
-            this.setV2StateLoadBlock(
-              "authority-witness-save-failed",
-              "v2",
-              error,
-            );
-            return;
-          }
-        }
-        this.activateV2Envelope(committed);
-        const cutoverFailure =
-          await this.finalizePublic113CutoverIfRequired(paths);
-        if (cutoverFailure) {
-          this.setV2StateLoadBlock(cutoverFailure, "v2");
-          return;
-        }
-        try {
-          await this.migrateActiveMutationLedgerKeyIfRequired();
-        } catch (error) {
-          this.setV2StateLoadBlock(
-            "v2-mutation-ledger-migration-failed",
-            "v2",
-            error,
-          );
-          return;
-        }
-        try {
-          authorityWitness = await this.maybeSelectIndexedDbStorage(
-            paths,
-            manifest,
-            authorityWitness,
-            committed,
-          );
-        } catch (error) {
-          this.setV2StateLoadBlock(
-            "indexeddb-authority-load-failed",
-            "v2",
-            error,
-          );
-          return;
-        }
-        this.applyLayoutMigrationConflictBlock(layoutMigrationConflict, "v2");
+        await this.activateCommittedV2Envelope({
+          paths,
+          adapter,
+          authorityWitness,
+          recoveredCorruptManifest,
+          migrationHoldUnreadable,
+          authorityWitnessStore,
+          corruptRecoveryHoldStore,
+          layoutMigrationConflict,
+        });
         return;
       }
 
@@ -1469,34 +1015,618 @@ export class StateManager {
         );
         return;
       }
-      this.legacyStateAllowed = true;
-      await this.baseContentCache.load(
-        adapter,
-        paths.baseContentFile,
-        getEasySyncLegacyPaths(
-          this.plugin.app.vault,
-          this.plugin.manifest.id,
-        ).baseContentFile,
-      );
-      this.remoteState = await this.loadRemoteState();
-      this.applyLayoutMigrationConflictBlock(layoutMigrationConflict, "unknown");
+      await activateLegacyState();
       return;
     } else {
       this.v2ScopeTransitionStore = null;
       this.migrationHoldStore = null;
       this.migrationHold = null;
     }
-    this.legacyStateAllowed = true;
-    await this.baseContentCache.load(
+    await activateLegacyState();
+  }
+
+  /**
+   * Build the V2 stores and read the inputs that decide the state authority.
+   *
+   * Every probe is fail-closed: an unreadable presence, witness or migration
+   * hold records a load block and hands the round back to the caller instead
+   * of letting a later phase guess the authority. A corrupt publication is
+   * recovered before the manifest-presence gate, so the recovered manifest
+   * replaces the committed one that the transaction left momentarily absent.
+   */
+  private async prepareV2StateLoadInputs(args: {
+    paths: ReturnType<typeof getEasySyncPaths>;
+    adapter: DataAdapter;
+  }): Promise<
+    | { blocked: true }
+    | {
+        blocked: false;
+        manifestPresent: boolean;
+        authorityWitness: StateV2AuthorityWitness | null;
+        recoveredCorruptManifest: StateV2Manifest | null;
+        migrationHoldUnreadable: boolean;
+        authorityWitnessStore: StateV2AuthorityWitnessStore;
+        corruptRecoveryHoldStore: CorruptStateRecoveryHoldV2Store;
+      }
+  > {
+    const { paths, adapter } = args;
+    this.v2AuthorityWitnessStore = this.createV2AuthorityWitnessStore(paths);
+    this.v2ScopeTransitionStore = this.createV2ScopeTransitionStore(paths);
+    this.v2CorruptPublicationStore =
+      this.createV2CorruptPublicationStore(paths);
+    this.migrationHoldStore = new MigrationHoldV2Store(
       adapter,
-      paths.baseContentFile,
-      getEasySyncLegacyPaths(
-        this.plugin.app.vault,
-        this.plugin.manifest.id,
-      ).baseContentFile,
+      {
+        committed: paths.stateV2MigrationHoldFile,
+        next: paths.stateV2MigrationHoldNextFile,
+      },
     );
-    this.remoteState = await this.loadRemoteState();
-    this.applyLayoutMigrationConflictBlock(layoutMigrationConflict, "unknown");
+    this.v2CorruptRecoveryHoldStore =
+      new CorruptStateRecoveryHoldV2Store(
+        adapter,
+        {
+          committed: paths.stateV2CorruptRecoveryFile,
+          next: paths.stateV2CorruptRecoveryNextFile,
+        },
+      );
+    let corruptPublicationPresent: boolean;
+    let scopeTransitionPresent: boolean;
+    try {
+      corruptPublicationPresent =
+        await this.v2CorruptPublicationStore.hasControlRecord();
+      scopeTransitionPresent =
+        await adapter.exists(paths.stateV2ScopeTransitionFile)
+        || await adapter.exists(paths.stateV2ScopeTransitionNextFile);
+    } catch (error) {
+      this.legacyStateAllowed = false;
+      this.setV2StateLoadBlock(
+        classifyV2StateLoadError(error),
+        "v2",
+      );
+      return { blocked: true };
+    }
+    if (corruptPublicationPresent && scopeTransitionPresent) {
+      this.legacyStateAllowed = false;
+      this.setV2StateLoadBlock(
+        "corrupt-state-publication-state-ambiguous",
+        "v2",
+      );
+      return { blocked: true };
+    }
+    if (!corruptPublicationPresent) {
+      try {
+        await this.v2ScopeTransitionStore.recover();
+      } catch (error) {
+        this.legacyStateAllowed = false;
+        this.setV2StateLoadBlock(
+          error instanceof StateV2ScopeTransitionError
+            ? error.reason
+            : "scope-transition-state-ambiguous",
+          "v2",
+        );
+        return { blocked: true };
+      }
+    }
+    let manifestPresent: boolean;
+    try {
+      manifestPresent = await adapter.exists(paths.stateV2ManifestFile);
+    } catch {
+      // If manifest presence itself is unreadable, neither V1 nor V2 writes
+      // are safe. Treat the authority as unknown and block before scan.
+      this.legacyStateAllowed = false;
+      this.setV2StateLoadBlock(
+        "manifest-presence-unreadable",
+        "unknown",
+      );
+      return { blocked: true };
+    }
+    let authorityWitness: StateV2AuthorityWitness | null;
+    try {
+      authorityWitness = await this.v2AuthorityWitnessStore.load();
+    } catch (error) {
+      this.legacyStateAllowed = false;
+      this.setV2StateLoadBlock(
+        classifyV2StateLoadError(error),
+        manifestPresent ? "v2" : "unknown",
+      );
+      return { blocked: true };
+    }
+    let recoveredCorruptManifest: StateV2Manifest | null = null;
+    if (corruptPublicationPresent) {
+      // The committed manifest may be momentarily absent after the
+      // transaction has retired the source slot but before promoting the
+      // exact staged target. The source-bound publication journal owns this
+      // gap, so recover it before applying the ordinary manifest-presence
+      // authority gate.
+      try {
+        const recovered =
+          await this.v2CorruptPublicationStore.recover();
+        if (recovered) {
+          this.legacyStateAllowed = false;
+          this.remoteState = null;
+          await this.v2CorruptRecoveryHoldStore.clear();
+          this.v2CorruptRecoveryHold = null;
+          await this.v2CorruptPublicationStore.finalize(recovered.record);
+          recoveredCorruptManifest = recovered.manifest;
+          manifestPresent = true;
+          authorityWitness = await this.v2AuthorityWitnessStore.load();
+        }
+      } catch (error) {
+        this.legacyStateAllowed = false;
+        this.remoteState = null;
+        this.setV2StateLoadBlock(
+          classifyV2StateLoadError(error),
+          "v2",
+        );
+        return { blocked: true };
+      }
+    }
+    let migrationHoldUnreadable = false;
+    try {
+      this.migrationHold = await this.migrationHoldStore.load();
+      if (this.migrationHold?.communityPluginEnablement) {
+        this.communityPluginEnablementRetiredThisLoad = true;
+        this.migrationHold =
+          await this.migrationHoldStore
+            .retireCommunityPluginEnablementCarrier();
+      }
+    } catch {
+      this.legacyStateAllowed = false;
+      this.setV2StateLoadBlock(
+        "migration-hold-unreadable",
+        manifestPresent ? "v2" : "v1-precommit",
+      );
+      if (!manifestPresent) return { blocked: true };
+      migrationHoldUnreadable = true;
+    }
+    return {
+      blocked: false,
+      manifestPresent,
+      authorityWitness,
+      recoveredCorruptManifest,
+      migrationHoldUnreadable,
+      authorityWitnessStore: this.v2AuthorityWitnessStore,
+      corruptRecoveryHoldStore: this.v2CorruptRecoveryHoldStore,
+    };
+  }
+
+  /**
+   * Select the committed V2 envelope and activate it.
+   *
+   * A present manifest is durable evidence that the manifest-last authority
+   * transaction selected V2, so no later parse or load failure may expose the
+   * V1 runtime again: every failure records a block and ends the load. This
+   * method always returns — it never falls through to the legacy path.
+   */
+  private async activateCommittedV2Envelope(args: {
+    paths: ReturnType<typeof getEasySyncPaths>;
+    adapter: DataAdapter;
+    authorityWitness: StateV2AuthorityWitness | null;
+    recoveredCorruptManifest: StateV2Manifest | null;
+    migrationHoldUnreadable: boolean;
+    authorityWitnessStore: StateV2AuthorityWitnessStore;
+    corruptRecoveryHoldStore: CorruptStateRecoveryHoldV2Store;
+    layoutMigrationConflict: EasySyncRuntimeLayoutMigrationConflict | null;
+  }): Promise<void> {
+    const {
+      paths,
+      adapter,
+      recoveredCorruptManifest,
+      migrationHoldUnreadable,
+      authorityWitnessStore,
+      corruptRecoveryHoldStore,
+      layoutMigrationConflict,
+    } = args;
+    let { authorityWitness } = args;
+    // File existence is already durable evidence that the manifest-last
+    // authority transaction selected V2. Never allow a later parse/load
+    // failure to expose the V1 runtime again.
+    this.legacyStateAllowed = false;
+    this.remoteState = null;
+    let manifest = recoveredCorruptManifest;
+    if (!manifest) {
+      try {
+        manifest = await readStateV2Manifest(
+          adapter,
+          paths.stateV2ManifestFile,
+        );
+      } catch (error) {
+        this.setV2StateLoadBlock(
+          classifyV2StateLoadError(error),
+          "v2",
+        );
+        return;
+      }
+    }
+    if (!manifest) {
+      this.setV2StateLoadBlock("manifest-disappeared", "v2");
+      return;
+    }
+    if (
+      authorityWitness
+      && !sameStateV2AuthorityManifest(authorityWitness, manifest)
+    ) {
+      this.setV2StateLoadBlock("authority-witness-mismatch", "v2");
+      return;
+    }
+
+    const store = this.createV2Store(paths);
+    this.v2Store = store;
+    let committed: SyncStateEnvelopeV2 | null;
+    if (authorityWitness?.storageAuthority) {
+      try {
+        const selected = await this.loadSelectedIndexedDbStorage(
+          paths,
+          manifest,
+          authorityWitness,
+        );
+        committed = selected.envelope;
+        authorityWitness = selected.witness;
+        this.v2IndexedDbStore = selected.store;
+      } catch (error) {
+        this.setV2StateLoadBlock(
+          "indexeddb-authority-recovery-failed",
+          "v2",
+          error,
+        );
+        return;
+      }
+    } else {
+      try {
+        committed = await store.load(manifest.scope);
+      } catch (error) {
+        let failure: unknown = error;
+        if (
+          error instanceof StateEnvelopeV2LoadError
+          && error.reason === "envelope-unsupported"
+        ) {
+          try {
+            committed = await store.repairCursorOnly(manifest.scope);
+          } catch (repairError) {
+            failure = repairError;
+            committed = null;
+          }
+        } else {
+          committed = null;
+        }
+        if (!committed) {
+          await this.settleFailedCommittedV2EnvelopeLoad({
+            error,
+            failure,
+            migrationHoldUnreadable,
+            store,
+            manifest,
+            corruptRecoveryHoldStore,
+          });
+          return;
+        }
+      }
+    }
+    if (!committed) {
+      this.setV2StateLoadBlock("manifest-envelope-missing", "v2");
+      return;
+    }
+    if (
+      committed.meta.commitSeq < manifest.stateCommitSeq
+      || committed.meta.lifecycleEpoch < manifest.lifecycleEpoch
+    ) {
+      this.setV2StateLoadBlock("manifest-envelope-behind", "v2");
+      return;
+    }
+    if (migrationHoldUnreadable) {
+      // The committed envelope remains the selected read-only V2 state,
+      // but a corrupt migration control record cannot be used to recreate
+      // a missing protocol-bound witness or finalize cutover metadata.
+      this.activateV2Envelope(committed);
+      return;
+    }
+    if (!authorityWitness) {
+      try {
+        authorityWitness = await authorityWitnessStore.publishActive(
+          manifest,
+          Date.now(),
+          protocolBindingForManifest(this.migrationHold, manifest),
+        );
+      } catch (error) {
+        this.setV2StateLoadBlock(
+          "authority-witness-save-failed",
+          "v2",
+          error,
+        );
+        return;
+      }
+    }
+    this.activateV2Envelope(committed);
+    const cutoverFailure =
+      await this.finalizePublic113CutoverIfRequired(paths);
+    if (cutoverFailure) {
+      this.setV2StateLoadBlock(cutoverFailure, "v2");
+      return;
+    }
+    try {
+      await this.migrateActiveMutationLedgerKeyIfRequired();
+    } catch (error) {
+      this.setV2StateLoadBlock(
+        "v2-mutation-ledger-migration-failed",
+        "v2",
+        error,
+      );
+      return;
+    }
+    try {
+      authorityWitness = await this.maybeSelectIndexedDbStorage(
+        paths,
+        manifest,
+        authorityWitness,
+        committed,
+      );
+    } catch (error) {
+      this.setV2StateLoadBlock(
+        "indexeddb-authority-load-failed",
+        "v2",
+        error,
+      );
+      return;
+    }
+    this.applyLayoutMigrationConflictBlock(layoutMigrationConflict, "v2");
+    return;
+  }
+  /**
+   * Settle a committed-envelope load that produced no usable envelope.
+   *
+   * The primary read and the cursor-only repair both failed, so this decides
+   * the block: corruption evidence is inspected only while no migration hold
+   * or corrupt record already speaks for the failure, and a recovery hold
+   * that cannot be read — or that does not match that evidence — is refused
+   * instead of resumed. Every path records a V2 load block, so the load ends
+   * under V2 authority and never falls back to the legacy runtime.
+   */
+  private async settleFailedCommittedV2EnvelopeLoad(args: {
+    error: unknown;
+    failure: unknown;
+    migrationHoldUnreadable: boolean;
+    store: StateEnvelopeV2Store;
+    manifest: StateV2Manifest;
+    corruptRecoveryHoldStore: CorruptStateRecoveryHoldV2Store;
+  }): Promise<void> {
+    const {
+      error,
+      failure,
+      migrationHoldUnreadable,
+      store,
+      manifest,
+      corruptRecoveryHoldStore,
+    } = args;
+    if (
+      error instanceof StateEnvelopeV2LoadError
+      && error.reason === "envelope-unsupported"
+      && !migrationHoldUnreadable
+      && !isActiveMigrationHoldV2(this.migrationHold)
+      && !this.mutationLedgerCorrupt
+      && !this.mutationRecoveryQuarantineCorrupt
+      && this.mutationLedger.length === 0
+      && this.data[KEY_V2_RECOVERY_QUARANTINE].length === 0
+    ) {
+      try {
+        this.v2CorruptionEvidence =
+          await store.inspectCorruptCommitted({
+            expectedScope: manifest.scope,
+            minimumCommitSeq: manifest.stateCommitSeq,
+            minimumLifecycleEpoch: manifest.lifecycleEpoch,
+          });
+      } catch {
+        this.v2CorruptionEvidence = null;
+      }
+    }
+    try {
+      this.v2CorruptRecoveryHold =
+        await corruptRecoveryHoldStore.load();
+    } catch {
+      this.setV2StateLoadBlock(
+        "corrupt-state-recovery-hold-unreadable",
+        "v2",
+      );
+      return;
+    }
+    if (
+      this.v2CorruptRecoveryHold
+      && (
+        !this.v2CorruptionEvidence
+        || this.v2CorruptRecoveryHold.sourceDigest
+          !== this.v2CorruptionEvidence.sourceDigest
+        || this.v2CorruptRecoveryHold.sourceCommitSeq
+          !== this.v2CorruptionEvidence.sourceCommitSeq
+        || this.v2CorruptRecoveryHold.sourceLifecycleEpoch
+          !== this.v2CorruptionEvidence.sourceLifecycleEpoch
+        || this.v2CorruptRecoveryHold.corruption
+          !== this.v2CorruptionEvidence.corruption
+        || !sameSyncScope(
+          this.v2CorruptRecoveryHold.scope,
+          this.v2CorruptionEvidence.scope,
+        )
+      )
+    ) {
+      this.setV2StateLoadBlock(
+        "corrupt-state-recovery-hold-mismatch",
+        "v2",
+      );
+      return;
+    }
+    this.setV2StateLoadBlock(
+      this.v2CorruptionEvidence
+        ? corruptionLoadBlockReason(
+            this.v2CorruptionEvidence.corruption,
+          )
+        : classifyV2StateLoadError(failure),
+      "v2",
+    );
+    return;
+  }
+
+  /**
+   * Apply one persisted plugin-data record onto the in-memory state.
+   *
+   * Every field degrades to a safe default instead of throwing: a corrupt
+   * ledger falls back to its checksummed backup (still-inconsistent copies
+   * stay fail-closed corrupt), a corrupt adoption memory degrades to empty,
+   * and the quarantine flag records a malformed record for later gating.
+   */
+  private async applyLoadedPluginData(
+    saved: Record<string, unknown>,
+  ): Promise<void> {
+    const rawPublicMutationLedger = saved[KEY_PUBLIC_MUTATION_LEDGER];
+    const publicMutationLedger = parseMutationLedger(
+      rawPublicMutationLedger,
+    );
+    const rawMutationLedger = saved[KEY_MUTATION_LEDGER];
+    let mutationLedger = parseMutationLedger(rawMutationLedger);
+    this.mutationLedgerCorrupt = isMalformedMutationLedger(
+      rawPublicMutationLedger,
+      publicMutationLedger,
+    ) || isMalformedMutationLedger(
+      rawMutationLedger,
+      mutationLedger,
+    ) || mutationLedgersDisagree(publicMutationLedger, mutationLedger);
+    if (this.mutationLedgerCorrupt) {
+      // Ledger redundancy: one corrupt ledger copy falls back to the
+      // checksummed backup written on every ledger change. Restoration is
+      // best-effort; a still-inconsistent ledger stays fail-closed corrupt.
+      const restored = await this.tryRestoreMutationLedgerFromBackup();
+      if (restored) {
+        saved[KEY_MUTATION_LEDGER] = restored;
+        mutationLedger = parseMutationLedger(restored);
+        this.mutationLedgerCorrupt = isMalformedMutationLedger(
+          restored,
+          mutationLedger,
+        ) || isMalformedMutationLedger(
+          rawPublicMutationLedger,
+          publicMutationLedger,
+        ) || mutationLedgersDisagree(publicMutationLedger, mutationLedger);
+        if (!this.mutationLedgerCorrupt) {
+          this.plugin.diag?.warn(
+            "state",
+            "mutation ledger restored from its checksummed backup",
+            { mutations: 0 },
+          );
+        }
+      }
+    }
+    const rawRecoveryQuarantine = saved[KEY_V2_RECOVERY_QUARANTINE];
+    const recoveryQuarantine = parseMutationRecoveryQuarantine(
+      rawRecoveryQuarantine,
+    );
+    this.mutationRecoveryQuarantineCorrupt =
+      rawRecoveryQuarantine !== undefined
+      && (
+        !Array.isArray(rawRecoveryQuarantine)
+        || recoveryQuarantine.length !== rawRecoveryQuarantine.length
+      );
+    const communityPluginManifestObservations =
+      await readCommunityPluginManifestObservations(
+        saved[KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS],
+      );
+    const remoteCommunityPluginCatalog =
+      await readRemoteCommunityPluginCatalog(
+        saved[KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG],
+      );
+    let communityPluginAdoptionMemory:
+      CommunityPluginAdoptionMemoryV1 | null = null;
+    const rawAdoptionMemory = saved[KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY];
+    if (rawAdoptionMemory !== undefined && rawAdoptionMemory !== null) {
+      try {
+        communityPluginAdoptionMemory = readCommunityPluginAdoptionMemory(
+          rawAdoptionMemory,
+          this.plugin.manifest.id,
+        );
+      } catch {
+        // A corrupt adoption-memory record degrades to empty: skipped
+        // plugins may be proposed again and pending rows are re-discovered
+        // on the next round. It must never block state loading.
+        communityPluginAdoptionMemory = null;
+      }
+    }
+    this.data = {
+      [KEY_BASE_SNAPSHOT]: saved[KEY_BASE_SNAPSHOT] ?? {},
+      [KEY_PENDING_CONFLICTS]: saved[KEY_PENDING_CONFLICTS] ?? [],
+      [KEY_PENDING_DELETES]: saved[KEY_PENDING_DELETES] ?? [],
+      [KEY_PENDING_ISSUES]: Array.isArray(saved[KEY_PENDING_ISSUES])
+        ? saved[KEY_PENDING_ISSUES]
+        : [],
+      [KEY_LAST_SYNC_TIME]: saved[KEY_LAST_SYNC_TIME] ?? 0,
+      [KEY_PLAN_REVIEW_ACTIVE]: saved[KEY_PLAN_REVIEW_ACTIVE] ?? false,
+      [KEY_PLAN_REVIEW_COUNTS]: saved[KEY_PLAN_REVIEW_COUNTS] ?? null,
+      [KEY_PLAN_REVIEW_ITEMS]: saved[KEY_PLAN_REVIEW_ITEMS] ?? [],
+      [KEY_PLAN_REVIEW_DIGEST]: saved[KEY_PLAN_REVIEW_DIGEST] ?? "",
+      [KEY_PLAN_REVIEW_REVISION]: Number.isSafeInteger(saved[KEY_PLAN_REVIEW_REVISION])
+        && Number(saved[KEY_PLAN_REVIEW_REVISION]) >= 0
+        ? Number(saved[KEY_PLAN_REVIEW_REVISION])
+        : 0,
+      [KEY_PLAN_REVIEW_SCOPE]: isSyncScope(saved[KEY_PLAN_REVIEW_SCOPE])
+        ? saved[KEY_PLAN_REVIEW_SCOPE]
+        : null,
+      [KEY_PLAN_REVIEW_CANONICAL_IDENTITY]:
+        parseCanonicalPlanIdentityV2(
+          saved[KEY_PLAN_REVIEW_CANONICAL_IDENTITY],
+        ),
+      [KEY_SYNC_HISTORY]: Array.isArray(saved[KEY_SYNC_HISTORY])
+        ? saved[KEY_SYNC_HISTORY]
+        : [],
+      [KEY_TRANSFER_RATES_WINDOW]: Array.isArray(
+        saved[KEY_TRANSFER_RATES_WINDOW],
+      )
+        ? saved[KEY_TRANSFER_RATES_WINDOW]
+        : [],
+      [KEY_GENERATION]: saved[KEY_GENERATION] ?? 0,
+      [KEY_BOUND_ACCOUNT]: saved[KEY_BOUND_ACCOUNT] ?? "",
+      [KEY_PUBLIC_MUTATION_LEDGER]: publicMutationLedger,
+      [KEY_MUTATION_LEDGER]: mutationLedger,
+      [KEY_MANUAL_MUTATION_RESOLUTION_AUDIT]:
+        parseManualMutationResolutionAudit(
+          saved[KEY_MANUAL_MUTATION_RESOLUTION_AUDIT],
+        ),
+      [KEY_V2_RECOVERY_QUARANTINE]: recoveryQuarantine,
+      [KEY_FORCE_RESET_AUDIT]: readMutationForceResetAudit(
+        saved[KEY_FORCE_RESET_AUDIT],
+      ),
+      [KEY_LOCAL_FOLDER_MOVE_HINTS]: parseLocalFolderMoveHints(
+        saved[KEY_LOCAL_FOLDER_MOVE_HINTS],
+      ),
+      [KEY_LOCAL_FILE_MOVE_HINTS]: parseLocalFolderMoveHints(
+        saved[KEY_LOCAL_FILE_MOVE_HINTS],
+      ),
+      [KEY_LOCAL_FOLDER_DELETE_HINTS]: parseLocalFolderDeleteHints(
+        saved[KEY_LOCAL_FOLDER_DELETE_HINTS],
+      ),
+      [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]:
+        communityPluginManifestObservations,
+      [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]:
+        remoteCommunityPluginCatalog,
+      [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]:
+        communityPluginAdoptionMemory,
+      [KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2]:
+        readCloudBootstrapPublicationCheckpointV2(
+          saved[KEY_CLOUD_BOOTSTRAP_CHECKPOINT_V2],
+        ),
+      [KEY_CONFIRMED_DESCENDANT_FILE_RECONSTRUCTION]:
+        readConfirmedDescendantFileReconstructionCheckpointV1(
+          saved[KEY_CONFIRMED_DESCENDANT_FILE_RECONSTRUCTION],
+        ),
+      [KEY_SYNC_PATH_SETTINGS_REVISION]:
+        Number.isSafeInteger(saved[KEY_SYNC_PATH_SETTINGS_REVISION])
+        && Number(saved[KEY_SYNC_PATH_SETTINGS_REVISION]) >= 0
+          ? Number(saved[KEY_SYNC_PATH_SETTINGS_REVISION])
+          : 0,
+      [KEY_SYNC_PATH_SETTINGS_FINGERPRINT]:
+        typeof saved[KEY_SYNC_PATH_SETTINGS_FINGERPRINT] === "string"
+          ? saved[KEY_SYNC_PATH_SETTINGS_FINGERPRINT]
+          : "",
+      [KEY_SYNC_SCOPE_EXPANSION]: readSyncScopeExpansionMarkerV1(
+        saved[KEY_SYNC_SCOPE_EXPANSION],
+      ),
+      [KEY_PUBLIC_113_CUTOVER]: readPublic113CutoverMarker(
+        saved[KEY_PUBLIC_113_CUTOVER],
+      ),
+    } as PluginData;
   }
 
   /** Record one fully healthy round and retire old layout files after the
@@ -7661,80 +7791,10 @@ export class StateManager {
   async clearPlanReview(expected?: PlanReviewAuthorization): Promise<boolean> {
     const hold = this.activeV2MigrationHold;
     if (hold) {
-      if (
-        expected
-        && (
-          expected.reviewKind !== migrationHoldReviewKindV2(hold)
-          || expected.revision !== hold.revision
-          || !sameSyncScope(expected.scope, hold.scope)
-          || !sameCanonicalPlanIdentityV2(
-            expected.canonicalIdentity,
-            hold.canonicalIdentity,
-          )
-        )
-      ) {
-        return false;
-      }
-      if (!this.migrationHoldStore) return false;
-      if (hold.phase === "authority-committed") {
-        await this.clearStoredPlanReview();
-        const completed = await this.migrationHoldStore.transition(
-          hold.revision,
-          hold.canonicalIdentity,
-          "completed",
-        );
-        if (!completed) return false;
-        this.migrationHold = completed;
-        return true;
-      }
-      if (hold.phase === "confirmed" && this.v2Envelope) {
-        const authority = await this.migrationHoldStore.transition(
-          hold.revision,
-          hold.canonicalIdentity,
-          "authority-committed",
-        );
-        if (!authority) return false;
-        await this.clearStoredPlanReview();
-        const completed = await this.migrationHoldStore.transition(
-          authority.revision,
-          authority.canonicalIdentity,
-          "completed",
-        );
-        if (!completed) return false;
-        this.migrationHold = completed;
-        return true;
-      }
-      // An older 1.1.3 review is deliberately left untouched while the V2
-      // migration hold is merely being prepared. Once the user explicitly
-      // cancels that hold, retire the stale review before publishing the
-      // cancellation so a crash cannot expose the old authorization again.
-      const source = await this.readPublic113MigrationInput();
-      await this.reconcilePreManifestMigrationArtifacts({
-        candidate: hold.candidate,
-        source,
-        forceReplace: true,
+      return await this.settleActiveV2MigrationHoldPlanReview({
+        hold,
+        expected,
       });
-      const indexedDbFactory =
-        this.plugin.createPublic113IndexedDbCandidateStore;
-      if (indexedDbFactory) {
-        const indexedDbStore = indexedDbFactory(
-          hold.sourceStateDigest,
-        );
-        try {
-          await indexedDbStore.delete();
-        } finally {
-          await indexedDbStore.close();
-        }
-      }
-      await this.clearStoredPlanReview();
-      const cancelled = await this.migrationHoldStore.transition(
-        hold.revision,
-        hold.canonicalIdentity,
-        "cancelled",
-      );
-      if (!cancelled) return false;
-      this.migrationHold = cancelled;
-      return true;
     }
     const corruptRecoveryHold = this.v2CorruptRecoveryHold;
     if (corruptRecoveryHold) {
@@ -7781,6 +7841,95 @@ export class StateManager {
       return clearPlanReviewData(current);
     });
     return cleared;
+  }
+
+  /**
+   * Settle the plan review against an active V2 migration hold.
+   *
+   * A review that does not match the hold is refused; otherwise the hold is
+   * advanced to completed (or cancelled after its public-1.1.3 source-bound
+   * artifacts are retired), retiring the stored review first. Returns whether
+   * the review was cleared and the hold transition committed.
+   */
+  private async settleActiveV2MigrationHoldPlanReview(args: {
+    hold: MigrationHoldV2;
+    expected?: PlanReviewAuthorization;
+  }): Promise<boolean> {
+    const { hold, expected } = args;
+    if (
+      expected
+      && (
+        expected.reviewKind !== migrationHoldReviewKindV2(hold)
+        || expected.revision !== hold.revision
+        || !sameSyncScope(expected.scope, hold.scope)
+        || !sameCanonicalPlanIdentityV2(
+          expected.canonicalIdentity,
+          hold.canonicalIdentity,
+        )
+      )
+    ) {
+      return false;
+    }
+    if (!this.migrationHoldStore) return false;
+    if (hold.phase === "authority-committed") {
+      await this.clearStoredPlanReview();
+      const completed = await this.migrationHoldStore.transition(
+        hold.revision,
+        hold.canonicalIdentity,
+        "completed",
+      );
+      if (!completed) return false;
+      this.migrationHold = completed;
+      return true;
+    }
+    if (hold.phase === "confirmed" && this.v2Envelope) {
+      const authority = await this.migrationHoldStore.transition(
+        hold.revision,
+        hold.canonicalIdentity,
+        "authority-committed",
+      );
+      if (!authority) return false;
+      await this.clearStoredPlanReview();
+      const completed = await this.migrationHoldStore.transition(
+        authority.revision,
+        authority.canonicalIdentity,
+        "completed",
+      );
+      if (!completed) return false;
+      this.migrationHold = completed;
+      return true;
+    }
+    // An older 1.1.3 review is deliberately left untouched while the V2
+    // migration hold is merely being prepared. Once the user explicitly
+    // cancels that hold, retire the stale review before publishing the
+    // cancellation so a crash cannot expose the old authorization again.
+    const source = await this.readPublic113MigrationInput();
+    await this.reconcilePreManifestMigrationArtifacts({
+      candidate: hold.candidate,
+      source,
+      forceReplace: true,
+    });
+    const indexedDbFactory =
+      this.plugin.createPublic113IndexedDbCandidateStore;
+    if (indexedDbFactory) {
+      const indexedDbStore = indexedDbFactory(
+        hold.sourceStateDigest,
+      );
+      try {
+        await indexedDbStore.delete();
+      } finally {
+        await indexedDbStore.close();
+      }
+    }
+    await this.clearStoredPlanReview();
+    const cancelled = await this.migrationHoldStore.transition(
+      hold.revision,
+      hold.canonicalIdentity,
+      "cancelled",
+    );
+    if (!cancelled) return false;
+    this.migrationHold = cancelled;
+    return true;
   }
 
   // ---- Sync Time ----

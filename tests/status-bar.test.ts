@@ -25,6 +25,7 @@ import { describe, expect, it, vi } from "vitest";
 import EasySyncPlugin from "../src/main";
 import { I18n } from "../src/i18n";
 import { RIBBON_STATUS_ICONS } from "../src/ui/ribbon-status";
+import { EasySyncSyncView } from "../src/ui/sync-view";
 import type { SyncProgressState } from "../src/sync/sync-progress";
 
 interface FakeStatusBarElement {
@@ -361,6 +362,394 @@ describe("updateStatusBar item structure", () => {
     await flushStatusBarFrame();
     expect(el.classes.has("is-ready")).toBe(true);
     expect(el.classes.has("is-attention")).toBe(false);
+  });
+});
+
+describe("the attention members the bar was missing", () => {
+  // 组归属与「不得声称就绪」由三载体一致性门覆盖（每个注意态场景都断言状态栏落到
+  // attention 档）；这里只钉住各自复用的现役文案，避免同一事实两套说法。
+  it("carries the settings wording while an automatic pause is active", async () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    (plugin.state as never as { lastSyncTime: number }).lastSyncTime = 1;
+    (plugin as never as { autoSyncPaused: boolean }).autoSyncPaused = true;
+    plugin.updateStatusBar();
+    await flushStatusBarFrame();
+
+    // 复用设置页现役同一句（同一事实同一措辞）；点击仍是既有「打开同步侧栏」，
+    // 提示不新增信息职责。
+    expect(el.attrs["aria-label"]).toBe(
+      "上次同步未完成，自动同步已暂停，请手动重试。",
+    );
+  });
+
+  it("returns to the ready claim once a healthy round releases the pause", async () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    (plugin as never as { autoSyncPaused: boolean }).autoSyncPaused = true;
+    plugin.updateStatusBar();
+    await flushStatusBarFrame();
+    expect(el.classes.has("is-attention")).toBe(true);
+
+    (plugin as never as { autoSyncPaused: boolean }).autoSyncPaused = false;
+    (plugin.state as never as { lastSyncTime: number }).lastSyncTime = 1;
+    plugin.updateStatusBar();
+    await flushStatusBarFrame();
+    expect(el.classes.has("is-ready")).toBe(true);
+    expect(el.attrs["aria-label"]).toMatch(/^上次同步 /);
+  });
+
+  it("carries the sidebar's count phrase for pending issues", async () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    (plugin.state as never as { pendingIssues: unknown[] }).pendingIssues = [
+      {},
+      {},
+      {},
+    ];
+    plugin.updateStatusBar();
+    await flushStatusBarFrame();
+
+    expect(el.attrs["aria-label"]).toBe("需要处理 3");
+  });
+
+  it("keeps the retry-pending presentation when a pause flag is also set (order guard)", async () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    (plugin as never as { autoSyncPaused: boolean }).autoSyncPaused = true;
+    (plugin.state as never as { syncHistory: unknown[] }).syncHistory = [
+      { id: "1", status: "retry-pending" },
+    ];
+    plugin.updateStatusBar();
+    await flushStatusBarFrame();
+
+    // 观察暂态轮的中性呈现优先于暂停：设备当前读不到云端是更近的事实，既有
+    // 离线／连接中合同零变化。
+    expect(IS_GROUP_CLASSES.filter((c) => el.classes.has(c))).toEqual([]);
+    expect(el.attrs["aria-label"]).toBe("连接中…");
+  });
+});
+
+/**
+ * 三载体一致性门（2026-09-29 用户指令「实测，把对不上的状态都修复掉」）。
+ *
+ * 专题合同（`docs/topics/同步状态提示体系.md` 核心定位＋共同原则 1/2）：同一同步事实、
+ * 共享语义、按载体差异化展示；宽状态判为需要注意时，三个载体不得互相矛盾。本门把
+ * 同一场景同时喂给桌面状态栏、侧栏状态线与 Ribbon，断言三者落到同一语义档——载体的
+ * 文案密度可以不同（侧栏「尚未同步」vs 状态栏「已就绪」），但**档位**必须一致。
+ *
+ * 有意例外（各有已拍板出处，不由本门覆盖）：
+ *  - Ribbon 不表达离线／观察暂态轮（2026-08-29 拍板「ribbon 图标不改」，DECISIONS 在案）；
+ *  - Ribbon 在初始化／会话待续时不动（2026-09-11 拍板，其点击本身是重试路径）；
+ *  - 状态栏的锁占用短语是它独有的载体级补充（2026-09-20 拍板 A2），侧栏无对应档位。
+ */
+type CarrierToken =
+  | "loggedOut"
+  | "connecting"
+  | "running"
+  | "cancelling"
+  | "attention"
+  | "offline"
+  | "ready";
+
+interface CarrierScenario {
+  name: string;
+  token: CarrierToken;
+  /** Ribbon 是否参与本场景（false = 上述已拍板例外）。 */
+  ribbon: boolean;
+  apply: (plugin: EasySyncPlugin) => void;
+}
+
+function sidebarStatusState(plugin: EasySyncPlugin): Record<string, unknown> {
+  const state = plugin.state as never as {
+    lastSyncTime: number;
+    planReviewActive: boolean;
+    pendingConflicts: unknown[];
+    pendingRemoteDeletes: unknown[];
+    pendingIssues: unknown[];
+    syncHistory: Array<{ status: string }>;
+  };
+  return {
+    isLoggedIn: plugin.auth?.authState.isLoggedIn ?? false,
+    isInitializing: plugin.auth?.isInitializing ?? false,
+    isPending: (plugin.auth as never as { isPending?: boolean })?.isPending ?? false,
+    sessionPending:
+      (plugin.auth as never as { isSessionPending?: boolean })?.isSessionPending ?? false,
+    isRunning: plugin.syncExecutor?.isRunning ?? false,
+    lastSyncTime: state.lastSyncTime,
+    pendingCount:
+      state.pendingConflicts.length
+      + state.pendingRemoteDeletes.length
+      + state.pendingIssues.length,
+    planReviewActive: state.planReviewActive,
+    autoSyncPaused: plugin.autoSyncPaused,
+    mutationRecovery: plugin.getMutationRecoveryDisplayState(),
+    latestHistory: state.syncHistory?.[0],
+    progress: plugin.progressStore.state,
+  };
+}
+
+function barToken(el: FakeStatusBarElement, connecting: string): CarrierToken | "other" {
+  if (el.classes.has("is-loggedOut")) return "loggedOut";
+  if (el.classes.has("is-cancelling")) return "cancelling";
+  if (el.classes.has("is-attention")) return "attention";
+  if (el.classes.has("is-offline")) return "offline";
+  if (el.classes.has("is-syncing")) {
+    return el.attrs["aria-label"] === "正在取消…" ? "cancelling" : "running";
+  }
+  if (el.classes.has("is-ready") || el.classes.has("is-success")) return "ready";
+  return el.attrs["aria-label"] === connecting ? "connecting" : "other";
+}
+
+function sidebarToken(presentation: { status: string; label: string }, i18n: I18n): CarrierToken | "other" {
+  switch (presentation.status) {
+    case "loggedOut":
+      return "loggedOut";
+    case "cancelling":
+      return "cancelling";
+    case "attention":
+      return "attention";
+    case "offline":
+      return "offline";
+    case "syncing":
+      return "running";
+    case "success":
+      return "ready";
+    case "ready":
+      return presentation.label === i18n.t("syncView.never") ? "ready" : "connecting";
+    default:
+      return "other";
+  }
+}
+
+function ribbonToken(plugin: EasySyncPlugin): CarrierToken | "other" {
+  switch ((plugin as never as { getRibbonStatus(): string }).getRibbonStatus()) {
+    case "loggedOut":
+      return "loggedOut";
+    case "cancelling":
+      return "cancelling";
+    case "attention":
+      return "attention";
+    case "syncing":
+      return "running";
+    case "success":
+    case "ready":
+      return "ready";
+    default:
+      return "other";
+  }
+}
+
+describe("three-carrier parity — the same scenario must land on the same token", () => {
+  const setState = (plugin: EasySyncPlugin, patch: Record<string, unknown>): void => {
+    Object.assign(
+      plugin.state as never as Record<string, unknown>,
+      {
+        planReviewActive: false,
+        pendingConflicts: [],
+        pendingRemoteDeletes: [],
+        pendingIssues: [],
+        syncHistory: [],
+        lastSyncTime: 0,
+      },
+      patch,
+    );
+  };
+  const setAuth = (
+    plugin: EasySyncPlugin,
+    patch: { isInitializing?: boolean; isLoggedIn?: boolean },
+  ): void => {
+    (plugin as never as { auth: unknown }).auth = {
+      isInitializing: patch.isInitializing ?? false,
+      authState: { isLoggedIn: patch.isLoggedIn ?? true },
+    };
+  };
+  const setRecovery = (plugin: EasySyncPlugin, kind: string | null): void => {
+    vi.spyOn(plugin as never, "getMutationRecoveryDisplayState").mockReturnValue(
+      (kind ? { kind } : null) as never,
+    );
+  };
+
+  const SCENARIOS: CarrierScenario[] = [
+    {
+      name: "未登录",
+      token: "loggedOut",
+      ribbon: true,
+      apply: (p) => {
+        setAuth(p, { isLoggedIn: false });
+      },
+    },
+    {
+      name: "登录初始化中（连接中）",
+      token: "connecting",
+      ribbon: false,
+      apply: (p) => {
+        setAuth(p, { isInitializing: true, isLoggedIn: false });
+      },
+    },
+    {
+      name: "会话待续（连接中）",
+      token: "connecting",
+      ribbon: false,
+      apply: (p) => {
+        (p as never as { auth: unknown }).auth = {
+          isInitializing: false,
+          isSessionPending: true,
+          authState: { isLoggedIn: true },
+        };
+      },
+    },
+    {
+      name: "运行中",
+      token: "running",
+      ribbon: true,
+      apply: (p) => {
+        p.syncExecutor = { isRunning: true, hasSideActionsInFlight: false } as never;
+        setState(p, { lastSyncTime: 1, syncHistory: [{ status: "success" }] });
+      },
+    },
+    {
+      name: "正在取消",
+      token: "cancelling",
+      ribbon: true,
+      apply: (p) => {
+        p.syncExecutor = { isRunning: true, hasSideActionsInFlight: false } as never;
+        setState(p, { lastSyncTime: 1, syncHistory: [{ status: "success" }] });
+        (p.progressStore.state as { cancelRequested: boolean }).cancelRequested = true;
+      },
+    },
+    {
+      name: "计划待审阅",
+      token: "attention",
+      ribbon: true,
+      apply: (p) => {
+        setState(p, { planReviewActive: true, syncHistory: [{ status: "success" }] });
+      },
+    },
+    {
+      name: "冲突",
+      token: "attention",
+      ribbon: true,
+      apply: (p) => {
+        setState(p, {
+          pendingConflicts: [{}, {}],
+          lastSyncTime: 1,
+          syncHistory: [{ status: "success" }],
+        });
+      },
+    },
+    {
+      name: "待确认删除",
+      token: "attention",
+      ribbon: true,
+      apply: (p) => {
+        setState(p, {
+          pendingRemoteDeletes: [{}],
+          lastSyncTime: 1,
+          syncHistory: [{ status: "success" }],
+        });
+      },
+    },
+    {
+      name: "待处理事项",
+      token: "attention",
+      ribbon: true,
+      apply: (p) => {
+        setState(p, {
+          pendingIssues: [{}, {}],
+          lastSyncTime: 1,
+          syncHistory: [{ status: "success" }],
+        });
+      },
+    },
+    {
+      name: "自动同步暂停",
+      token: "attention",
+      ribbon: true,
+      apply: (p) => {
+        p.autoSyncPaused = true;
+        setState(p, { lastSyncTime: 1, syncHistory: [{ status: "cancelled" }] });
+      },
+    },
+    {
+      name: "恢复阻塞",
+      token: "attention",
+      ribbon: true,
+      apply: (p) => {
+        setRecovery(p, "blocked");
+        setState(p, { syncHistory: [{ status: "partial" }] });
+      },
+    },
+    {
+      name: "等待网络恢复",
+      token: "attention",
+      ribbon: true,
+      apply: (p) => {
+        setRecovery(p, "waiting-network");
+        setState(p, { syncHistory: [{ status: "partial" }] });
+      },
+    },
+    {
+      name: "观察暂态轮（设备有网）",
+      token: "connecting",
+      ribbon: false,
+      apply: (p) => {
+        setState(p, { lastSyncTime: 1, syncHistory: [{ status: "retry-pending" }] });
+      },
+    },
+    {
+      name: "观察暂态轮（系统离线）",
+      token: "offline",
+      ribbon: false,
+      apply: (p) => {
+        setState(p, { lastSyncTime: 1, syncHistory: [{ status: "retry-pending" }] });
+        vi.stubGlobal("navigator", { onLine: false });
+      },
+    },
+    {
+      name: "就绪（有成功轮）",
+      token: "ready",
+      ribbon: true,
+      apply: (p) => {
+        setState(p, { lastSyncTime: 1, syncHistory: [{ status: "success" }] });
+      },
+    },
+    {
+      name: "从未同步",
+      token: "ready",
+      ribbon: true,
+      apply: () => {},
+    },
+  ];
+
+  it.each(SCENARIOS)("$name", async (scenario) => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    scenario.apply(plugin);
+    plugin.updateStatusBar();
+    await flushStatusBarFrame();
+
+    const view = Object.create(EasySyncSyncView.prototype) as never as {
+      plugin: { i18n: I18n };
+      getStatusPresentation: (state: unknown) => { status: string; label: string };
+    };
+    view.plugin = { i18n: plugin.i18n };
+
+    try {
+      const tokens = {
+        bar: barToken(el, plugin.i18n.t("status.connecting")),
+        sidebar: sidebarToken(view.getStatusPresentation(sidebarStatusState(plugin)), plugin.i18n),
+        ribbon: scenario.ribbon ? ribbonToken(plugin) : scenario.token,
+      };
+      expect({ scenario: scenario.name, ...tokens }).toEqual({
+        scenario: scenario.name,
+        bar: scenario.token,
+        sidebar: scenario.token,
+        ribbon: scenario.token,
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
 

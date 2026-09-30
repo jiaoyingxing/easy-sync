@@ -1,3 +1,4 @@
+import { compareText } from "./compare-text";
 import {
   isPluginSelected,
   normalizePluginIds,
@@ -143,6 +144,42 @@ export function reduceDeviceCommunityPluginParticipation(
     return { ...committed, scopeEnabled: command.enabled };
   }
   const pluginId = requirePluginId(command.pluginId, ownPluginId);
+  const entry = resolveDeviceCommunityPluginParticipationEntry({
+    command,
+    committed,
+    pluginId,
+  });
+  if (sameJson(committed.pluginsById[pluginId], entry)) return committed;
+  return {
+    ...committed,
+    pluginsById: sortPluginEntries({
+      ...committed.pluginsById,
+      [pluginId]: entry,
+    }),
+  };
+}
+
+/**
+ * Resolve the next participation entry for one device command.
+ *
+ * Contract: `command` is the discriminated command already narrowed past
+ * `set-scope-enabled`; `committed` is the validated participation container,
+ * threaded by reference and never cloned; `pluginId` is already normalized by
+ * the caller. The phase neither rebinds a host binding nor terminates the host
+ * early, so the resolved entry returns through the return value and the only
+ * failure path stays the thrown validation error.
+ */
+function resolveDeviceCommunityPluginParticipationEntry(args: {
+  command: Readonly<
+    Exclude<
+      DeviceCommunityPluginParticipationCommand,
+      { type: "set-scope-enabled" }
+    >
+  >;
+  committed: Readonly<DeviceCommunityPluginParticipationV1>;
+  pluginId: string;
+}): DeviceCommunityPluginParticipationEntryV1 {
+  const { command, committed, pluginId } = args;
   let entry: DeviceCommunityPluginParticipationEntryV1;
   switch (command.type) {
     case "request-join":
@@ -210,14 +247,7 @@ export function reduceDeviceCommunityPluginParticipation(
       break;
     }
   }
-  if (sameJson(committed.pluginsById[pluginId], entry)) return committed;
-  return {
-    ...committed,
-    pluginsById: sortPluginEntries({
-      ...committed.pluginsById,
-      [pluginId]: entry,
-    }),
-  };
+  return entry;
 }
 
 export function isDeviceCommunityPluginEnabled(
@@ -425,8 +455,4 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function sameJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }

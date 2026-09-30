@@ -7,6 +7,7 @@
  * StateManager/manifest wiring remains a separate cutover decision.
  */
 
+import { compareText } from "./compare-text";
 import type { DataAdapter } from "obsidian";
 import { sha256Hex } from "../crypto";
 import type { RemoteNodeV2 } from "./remote-index-v2";
@@ -1191,10 +1192,6 @@ function formatSeq(value: number): string {
     throw new Error("IndexedDB recovery commit sequence is invalid");
   }
   return String(value).padStart(12, "0");
-}
-
-function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -1,3 +1,4 @@
+import { compareText } from "./compare-text";
 import {
   deleteDB,
   openDB,
@@ -697,8 +698,4 @@ function sortJsonValue(value: unknown): unknown {
       .sort(([left], [right]) => compareText(left, right))
       .map(([key, entry]) => [key, sortJsonValue(entry)]),
   );
-}
-
-function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }

@@ -1,3 +1,4 @@
+import { compareText } from "./compare-text";
 import { isRecord } from "../obsidian-compat";
 import {
   isSyncScope,
@@ -121,10 +122,6 @@ export function validateCommunityPluginEnablementMigrationCarrierV2(
       "Community plugin enablement migration carrier is invalid",
     );
   }
-}
-
-function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function isSafePluginId(value: string): boolean {

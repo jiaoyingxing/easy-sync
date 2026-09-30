@@ -175,6 +175,42 @@ async function runRangeWindowStream(
     credit.total += target - credited;
     credited = target;
   };
+  await runRangeWindowAttempts({
+    https,
+    input,
+    win,
+    slotIndex,
+    destroySockets,
+    assembly,
+    credit,
+    windowLabel,
+    windowBytes,
+    creditTo,
+    diag,
+  });
+}
+
+/** Per-window state for the range stream retry loop: the Node-https module,
+ *  the download it belongs to, and the shared assembly/credit/diagnostic
+ *  plumbing each attempt reads or mutates by reference. */
+interface RangeWindowAttemptArgs {
+  https: RangeHttpsModule;
+  input: RangeDownloadInput;
+  win: RangeWindow;
+  slotIndex: number;
+  destroySockets: Array<() => void>;
+  assembly: Uint8Array;
+  credit: { total: number };
+  windowLabel: string;
+  windowBytes: number;
+  creditTo: (target: number) => void;
+  diag: DiagnosticLogger | undefined;
+}
+
+async function runRangeWindowAttempts(args: RangeWindowAttemptArgs): Promise<void> {
+  const {
+    https, input, win, slotIndex, destroySockets, assembly, credit, windowLabel, windowBytes, creditTo, diag,
+  } = args;
   // 甲路续传 (2026-09-16): a stalled retry continues from the credited
   // offset with a sub-range request instead of re-downloading the window.
   let creditedInWindow = 0;

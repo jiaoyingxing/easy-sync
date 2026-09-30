@@ -1,4 +1,5 @@
 import { normalizePluginIds } from "./community-plugin-sync-policy";
+import { compareText } from "./compare-text";
 
 /**
  * Device-local adoption memory for the sidebar new-plugin decision flow
@@ -162,8 +163,4 @@ function hasOnlyKeys(
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-
-function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }

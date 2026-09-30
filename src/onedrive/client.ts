@@ -1221,105 +1221,120 @@ export class OneDriveClient {
       "onedrive",
       `large upload session — path=${displayPath}, bytes=${content.byteLength}`,
     );
-    let range: UploadMissingRange = { start: 0, endExclusive: content.byteLength };
-    let observedBytesPerSecond: number | null = null;
-    let recovering = false;
-    let recoveriesForRange = 0;
-    let reportedProgress = 0;
-
     try {
-      while (range.start < content.byteLength) {
-        throwIfAborted(this.abortSignal);
-        const chunkSize = uploadSessionChunkSize(observedBytesPerSecond, recovering);
-        const endExclusive = uploadRangeEndExclusive(range, chunkSize, content.byteLength);
-        if (endExclusive <= range.start) {
-          throw new OneDriveError(
-            OneDriveErrorType.Unknown,
-            `Upload session returned an invalid missing range: ${displayPath}`,
-          );
-        }
-        const end = endExclusive - 1;
-        const chunk = content.slice(range.start, endExclusive);
-        const timeoutMs = uploadSessionChunkTimeoutMs(chunk.byteLength, observedBytesPerSecond);
-        const startedAt = Date.now();
-        let response: RequestUrlResponse;
-        try {
-          response = await this.uploadChunk(
-            uploadUrl,
-            chunk,
-            range.start,
-            end,
-            content.byteLength,
-            timeoutMs,
-          );
-        } catch (rawError) {
-          if (isAbortError(rawError)) throw rawError;
-          const error = rawError instanceof OneDriveError
-            ? rawError
-            : this.toRequestError(rawError, uploadUrl);
-          if (isUncancellableRequestTimeout(error)) throw error;
-          if (!isRecoverableUploadSessionError(error)) throw error;
-          recoveriesForRange++;
-          if (recoveriesForRange > MAX_UPLOAD_SESSION_RECOVERIES) throw error;
-          range = await this.recoverUploadSessionRange(
-            uploadUrl,
-            content.byteLength,
-            error,
-          );
-          recovering = true;
-          this.diag?.warn(
-            "onedrive",
-            `large upload resumed from session state — next=${range.start}, recovery=${recoveriesForRange}/${MAX_UPLOAD_SESSION_RECOVERIES}`,
-          );
-          continue;
-        }
-
-        if (response.status === 200 || response.status === 201) {
-          onProgress?.(content.byteLength, content.byteLength);
-          return response.json as UploadResult;
-        }
-        if (response.status !== 202) {
-          throw new OneDriveError(
-            OneDriveErrorType.Unknown,
-            `Upload session returned unexpected status ${response.status}: ${displayPath}`,
-            response.status,
-          );
-        }
-
-        const nextRange = firstMissingUploadRange(
-          (response.json as { nextExpectedRanges?: unknown } | undefined)?.nextExpectedRanges,
-          content.byteLength,
-        ) ?? await this.getUploadSessionRange(uploadUrl, content.byteLength);
-        if (nextRange.start <= range.start) {
-          throw new OneDriveError(
-            OneDriveErrorType.Unknown,
-            `Upload session did not advance after an accepted fragment: ${displayPath}`,
-          );
-        }
-
-        const elapsedMs = Math.max(1, Date.now() - startedAt);
-        observedBytesPerSecond = chunk.byteLength / (elapsedMs / 1000);
-        range = nextRange;
-        recovering = false;
-        recoveriesForRange = 0;
-        reportedProgress = Math.max(reportedProgress, Math.min(range.start, content.byteLength));
-        this.diag?.log(
-          "onedrive",
-          `large upload progress — path=${displayPath}, uploaded=${reportedProgress}/${content.byteLength}, chunkBytes=${chunk.byteLength}, timeoutMs=${timeoutMs}`,
-        );
-        onProgress?.(reportedProgress, content.byteLength);
-      }
-
-      throw new OneDriveError(
-        OneDriveErrorType.Unknown,
-        `Upload session ended without a completed driveItem: ${displayPath}`,
-      );
+      return await this.runUploadSessionTransfer({
+        displayPath,
+        uploadUrl,
+        content,
+        onProgress,
+      });
     } catch (error) {
       if (!isUncancellableRequestTimeout(error)) {
         await this.cancelUploadSessionBestEffort(uploadUrl);
       }
       throw error;
     }
+  }
+
+  private async runUploadSessionTransfer(args: {
+    displayPath: string;
+    uploadUrl: string;
+    content: ArrayBuffer;
+    onProgress?: UploadProgressCallback;
+  }): Promise<UploadResult> {
+    const { displayPath, uploadUrl, content, onProgress } = args;
+    let range: UploadMissingRange = { start: 0, endExclusive: content.byteLength };
+    let observedBytesPerSecond: number | null = null;
+    let recovering = false;
+    let recoveriesForRange = 0;
+    let reportedProgress = 0;
+
+    while (range.start < content.byteLength) {
+      throwIfAborted(this.abortSignal);
+      const chunkSize = uploadSessionChunkSize(observedBytesPerSecond, recovering);
+      const endExclusive = uploadRangeEndExclusive(range, chunkSize, content.byteLength);
+      if (endExclusive <= range.start) {
+        throw new OneDriveError(
+          OneDriveErrorType.Unknown,
+          `Upload session returned an invalid missing range: ${displayPath}`,
+        );
+      }
+      const end = endExclusive - 1;
+      const chunk = content.slice(range.start, endExclusive);
+      const timeoutMs = uploadSessionChunkTimeoutMs(chunk.byteLength, observedBytesPerSecond);
+      const startedAt = Date.now();
+      let response: RequestUrlResponse;
+      try {
+        response = await this.uploadChunk(
+          uploadUrl,
+          chunk,
+          range.start,
+          end,
+          content.byteLength,
+          timeoutMs,
+        );
+      } catch (rawError) {
+        if (isAbortError(rawError)) throw rawError;
+        const error = rawError instanceof OneDriveError
+          ? rawError
+          : this.toRequestError(rawError, uploadUrl);
+        if (isUncancellableRequestTimeout(error)) throw error;
+        if (!isRecoverableUploadSessionError(error)) throw error;
+        recoveriesForRange++;
+        if (recoveriesForRange > MAX_UPLOAD_SESSION_RECOVERIES) throw error;
+        range = await this.recoverUploadSessionRange(
+          uploadUrl,
+          content.byteLength,
+          error,
+        );
+        recovering = true;
+        this.diag?.warn(
+          "onedrive",
+          `large upload resumed from session state — next=${range.start}, recovery=${recoveriesForRange}/${MAX_UPLOAD_SESSION_RECOVERIES}`,
+        );
+        continue;
+      }
+
+      if (response.status === 200 || response.status === 201) {
+        onProgress?.(content.byteLength, content.byteLength);
+        return response.json as UploadResult;
+      }
+      if (response.status !== 202) {
+        throw new OneDriveError(
+          OneDriveErrorType.Unknown,
+          `Upload session returned unexpected status ${response.status}: ${displayPath}`,
+          response.status,
+        );
+      }
+
+      const nextRange = firstMissingUploadRange(
+        (response.json as { nextExpectedRanges?: unknown } | undefined)?.nextExpectedRanges,
+        content.byteLength,
+      ) ?? await this.getUploadSessionRange(uploadUrl, content.byteLength);
+      if (nextRange.start <= range.start) {
+        throw new OneDriveError(
+          OneDriveErrorType.Unknown,
+          `Upload session did not advance after an accepted fragment: ${displayPath}`,
+        );
+      }
+
+      const elapsedMs = Math.max(1, Date.now() - startedAt);
+      observedBytesPerSecond = chunk.byteLength / (elapsedMs / 1000);
+      range = nextRange;
+      recovering = false;
+      recoveriesForRange = 0;
+      reportedProgress = Math.max(reportedProgress, Math.min(range.start, content.byteLength));
+      this.diag?.log(
+        "onedrive",
+        `large upload progress — path=${displayPath}, uploaded=${reportedProgress}/${content.byteLength}, chunkBytes=${chunk.byteLength}, timeoutMs=${timeoutMs}`,
+      );
+      onProgress?.(reportedProgress, content.byteLength);
+    }
+
+    throw new OneDriveError(
+      OneDriveErrorType.Unknown,
+      `Upload session ended without a completed driveItem: ${displayPath}`,
+    );
   }
 
   private async uploadChunk(
@@ -3038,6 +3053,42 @@ export class OneDriveClient {
     const requestBytes = endpoint === "simpleUpload"
       ? requestPayloadByteLength(requestBody)
       : 0;
+
+    return this.runRequestAttempts({
+      method,
+      url,
+      headers,
+      requestBody,
+      contentType,
+      options,
+      maxAttempts,
+      endpoint,
+      requestBytes,
+    });
+  }
+
+  private async runRequestAttempts(args: {
+    method: string;
+    url: string;
+    headers: Record<string, string>;
+    requestBody: ArrayBuffer | string | undefined;
+    contentType: string | undefined;
+    options: RequestOptions;
+    maxAttempts: number;
+    endpoint: OneDriveEndpointCategory;
+    requestBytes: number;
+  }): Promise<RequestUrlResponse> {
+    const {
+      method,
+      url,
+      headers,
+      requestBody,
+      contentType,
+      options,
+      maxAttempts,
+      endpoint,
+      requestBytes,
+    } = args;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       throwIfAborted(this.abortSignal);
       const attemptStartedAt = this.beginMetricAttempt(endpoint);
@@ -3176,7 +3227,6 @@ export class OneDriveClient {
         await sleepWithAbort(waitMs, this.abortSignal);
       }
     }
-
     throw new OneDriveError(OneDriveErrorType.Unknown, `Request failed: ${sanitizeUrl(url)}`);
   }
 

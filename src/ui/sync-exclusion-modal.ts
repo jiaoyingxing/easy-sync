@@ -7,7 +7,7 @@ import {
 } from "obsidian";
 import type { DropdownComponent, TextComponent } from "obsidian";
 import type EasySyncPlugin from "../main";
-import { SyncPathSettingsUpdateError } from "../main";
+import { SyncPathSettingsUpdateError } from "../sync/sync-path-settings-error";
 import { getConfigDir } from "../obsidian-compat";
 import { EasySyncModal } from "./easy-sync-modal";
 import {

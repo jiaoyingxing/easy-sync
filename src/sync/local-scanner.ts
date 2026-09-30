@@ -6,6 +6,7 @@
  * and an optional OneDrive-compatible QuickXor fingerprint from the same read.
  */
 
+import { EASY_SYNC_RECOVERY_SUFFIX } from "./local-replacement-writer";
 import { TFolder, type Vault } from "obsidian";
 import { quickXorHashBase64, sha256Hex } from "../crypto";
 import {
@@ -144,7 +145,7 @@ function isEasySyncInternalPathForPaths(
   path: string,
   paths: ReturnType<typeof getEasySyncPaths>,
 ): boolean {
-  return path.endsWith(".easy-sync-recovery")
+  return path.endsWith(EASY_SYNC_RECOVERY_SUFFIX)
     || path === paths.dataFile
     || (
       path.startsWith(`${paths.pluginDirPrefix}data.sync-conflict-`)
@@ -741,19 +742,97 @@ export class LocalScanner {
         recoveryCopies: [],
       };
     }
-    let fileCount = 0;
     let skippedCount = 0;
     const recoveryCopies: string[] = [];
 
     this.collectLoadedFolderPaths(folderPaths, folderScanFailures);
 
+    skippedCount = await this.scanVaultFiles({
+      allFiles,
+      entries,
+      skippedLarge,
+      failedPaths,
+      scannedPaths,
+      observedFilePaths,
+      recoveryCopies,
+      skippedCount,
+    });
+
+    // ── IncludePaths enumeration ──
+    this.diag?.log("scan", `includePaths: [${this.config.includePaths.join(', ')}], excludePaths: [${this.config.excludePaths.join(', ')}]`);
+    await this.scanIncludePaths(
+      entries,
+      skippedLarge,
+      failedPaths,
+      scannedPaths,
+      observedFilePaths,
+      scannedDirs,
+      folderPaths,
+      recoveryCopies,
+    );
+    for (const path of observedFilePaths) {
+      if (this.shouldSyncPath(path)) addParentFolderPaths(path, folderPaths);
+    }
+    const folderSnapshot = buildFolderSnapshot(folderPaths, observedFilePaths, this);
+    if (folderSnapshot.conflicts.length > 0) {
+      folderScanFailures.push(...folderSnapshot.conflicts);
+      this.diag?.warn(
+        "scan",
+        `local folder topology rejected — ${folderSnapshot.conflicts.length} normalized path conflict(s)`,
+        folderSnapshot.conflicts,
+      );
+    }
+    const pluginEntries = entries.filter((e) => e.path.startsWith(`${this.configDir}/`));
+    this.diag?.log(
+      "scan",
+      `scanAll done — ${entries.length} files (${pluginEntries.length} plugin), ${folderSnapshot.entries.length} folders, ${skippedLarge.length} skipped-large, ${failedPaths.length} file failure(s), ${folderScanFailures.length} folder failure(s)`,
+    );
+    // ponytail: only log the count — full path listing is verbose and rarely useful
+
+    // An incomplete scan cannot prove a cached path was deleted. Keep the
+    // previous cache intact and publish nothing until a healthy scan succeeds.
+    if (failedPaths.length === 0) {
+      this.cachePrune(scannedPaths);
+      await this.saveScanCache();
+    }
+
+    return {
+      entries,
+      folders: folderSnapshot.entries,
+      folderScanComplete: failedPaths.length === 0 && folderScanFailures.length === 0,
+      folderScanFailures,
+      skippedLarge,
+      failedPaths,
+      skippedCount,
+      complete: failedPaths.length === 0,
+      recoveryCopies,
+    };
+  }
+
+  /** Scan every file enumerated by the vault index for one scan round.
+   *  Exclusion, cache probe, size ceiling, content read, hashing and the
+   *  cache write keep the exact order and continue semantics of the inline
+   *  loop this method replaces. */
+  private async scanVaultFiles(args: {
+    allFiles: ReturnType<Vault["getFiles"]>;
+    entries: LocalFileEntry[];
+    skippedLarge: string[];
+    failedPaths: string[];
+    scannedPaths: Set<string>;
+    observedFilePaths: Set<string>;
+    recoveryCopies: string[];
+    skippedCount: number;
+  }): Promise<number> {
+    const { allFiles, entries, skippedLarge, failedPaths, scannedPaths, observedFilePaths, recoveryCopies } = args;
+    let { skippedCount } = args;
+    let fileCount = 0;
     for (const file of allFiles) {
       const path = file.path;
       scannedPaths.add(path);
       observedFilePaths.add(path);
 
       if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
-        if (path.endsWith(".easy-sync-recovery")) recoveryCopies.push(path);
+        if (path.endsWith(EASY_SYNC_RECOVERY_SUFFIX)) recoveryCopies.push(path);
         if (!isPathExcludedByFolders(path, this.config.excludedFolders)) {
           skippedCount++;
         }
@@ -819,56 +898,7 @@ export class LocalScanner {
       // P1: yield to UI thread every N files (per Obsidian performance docs)
       if (++fileCount % SCAN_SLEEP_EVERY === 0) await sleep(0);
     }
-
-    // ── IncludePaths enumeration ──
-    this.diag?.log("scan", `includePaths: [${this.config.includePaths.join(', ')}], excludePaths: [${this.config.excludePaths.join(', ')}]`);
-    await this.scanIncludePaths(
-      entries,
-      skippedLarge,
-      failedPaths,
-      scannedPaths,
-      observedFilePaths,
-      scannedDirs,
-      folderPaths,
-      recoveryCopies,
-    );
-    for (const path of observedFilePaths) {
-      if (this.shouldSyncPath(path)) addParentFolderPaths(path, folderPaths);
-    }
-    const folderSnapshot = buildFolderSnapshot(folderPaths, observedFilePaths, this);
-    if (folderSnapshot.conflicts.length > 0) {
-      folderScanFailures.push(...folderSnapshot.conflicts);
-      this.diag?.warn(
-        "scan",
-        `local folder topology rejected — ${folderSnapshot.conflicts.length} normalized path conflict(s)`,
-        folderSnapshot.conflicts,
-      );
-    }
-    const pluginEntries = entries.filter((e) => e.path.startsWith(`${this.configDir}/`));
-    this.diag?.log(
-      "scan",
-      `scanAll done — ${entries.length} files (${pluginEntries.length} plugin), ${folderSnapshot.entries.length} folders, ${skippedLarge.length} skipped-large, ${failedPaths.length} file failure(s), ${folderScanFailures.length} folder failure(s)`,
-    );
-    // ponytail: only log the count — full path listing is verbose and rarely useful
-
-    // An incomplete scan cannot prove a cached path was deleted. Keep the
-    // previous cache intact and publish nothing until a healthy scan succeeds.
-    if (failedPaths.length === 0) {
-      this.cachePrune(scannedPaths);
-      await this.saveScanCache();
-    }
-
-    return {
-      entries,
-      folders: folderSnapshot.entries,
-      folderScanComplete: failedPaths.length === 0 && folderScanFailures.length === 0,
-      folderScanFailures,
-      skippedLarge,
-      failedPaths,
-      skippedCount,
-      complete: failedPaths.length === 0,
-      recoveryCopies,
-    };
+    return skippedCount;
   }
 
   /** Enumerate paths listed in config.includePaths that are NOT
@@ -1041,6 +1071,51 @@ export class LocalScanner {
       return;
     }
 
+    await this.scanListedFiles({
+      base,
+      listed,
+      entries,
+      skippedLarge,
+      failedPaths,
+      scannedPaths,
+      observedFilePaths,
+      recoveryCopies,
+    });
+
+    for (const sub of listed.folders) {
+      const path = normalizeListedPath(base, sub);
+      await this.scanDir(
+        path,
+        entries,
+        skippedLarge,
+        failedPaths,
+        scannedPaths,
+        observedFilePaths,
+        scannedDirs,
+        folderPaths,
+        false,
+        recoveryCopies,
+      );
+    }
+  }
+
+  /** Scan the files listed for one directory `base`.
+   *
+   *  Exclusion, stat, size ceiling, content read, hashing and the cache
+   *  write keep the exact order and continue semantics of the inline loop
+   *  this method replaces; every entry, skip and failure is appended to
+   *  the caller-owned collections passed by reference. */
+  private async scanListedFiles(args: {
+    base: string;
+    listed: { files: string[]; folders: string[] };
+    entries: LocalFileEntry[];
+    skippedLarge: string[];
+    failedPaths: string[];
+    scannedPaths: Set<string>;
+    observedFilePaths: Set<string>;
+    recoveryCopies: string[] | undefined;
+  }): Promise<void> {
+    const { base, listed, entries, skippedLarge, failedPaths, scannedPaths, observedFilePaths, recoveryCopies } = args;
     for (const file of listed.files) {
       const path = normalizeListedPath(base, file);
       if (scannedPaths.has(path)) continue;
@@ -1048,7 +1123,7 @@ export class LocalScanner {
       observedFilePaths.add(path);
 
       if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
-        if (path.endsWith(".easy-sync-recovery")) recoveryCopies?.push(path);
+        if (path.endsWith(EASY_SYNC_RECOVERY_SUFFIX)) recoveryCopies?.push(path);
         if (path.endsWith("/data.json")) {
           this.diag?.log("scan", `isExcluded("${path}") → true (/data.json, self-referential protection)`);
         }
@@ -1108,22 +1183,6 @@ export class LocalScanner {
       const binary = size > 0 ? isBinary(content) : false;
       entries.push({ path, size, mtime: stat.mtime ?? 0, hash, quickXorHash, binary });
       this.cacheSet(path, stat.mtime ?? 0, size, hash, quickXorHash, binary);
-    }
-
-    for (const sub of listed.folders) {
-      const path = normalizeListedPath(base, sub);
-      await this.scanDir(
-        path,
-        entries,
-        skippedLarge,
-        failedPaths,
-        scannedPaths,
-        observedFilePaths,
-        scannedDirs,
-        folderPaths,
-        false,
-        recoveryCopies,
-      );
     }
   }
 

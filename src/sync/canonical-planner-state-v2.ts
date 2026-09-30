@@ -1,3 +1,4 @@
+import { compareText } from "./compare-text";
 import {
   projectRemoteNodesV2,
   type RemoteIndexV2,
@@ -197,8 +198,4 @@ function comparePath(
   right: Readonly<{ path: string }>,
 ): number {
   return compareText(left.path, right.path);
-}
-
-function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }

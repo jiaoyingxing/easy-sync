@@ -28,7 +28,9 @@ import {
   isEasySyncSelfSyncFilePath,
   isRecord,
 } from "../obsidian-compat";
+import { BundleReviewBytesCache } from "./bundle-review-bytes-cache";
 import {
+  EASY_SYNC_RECOVERY_SUFFIX,
   LocalReplacementTruncatedError,
   LocalReplacementVerificationError,
   writeReplacementInPlace,
@@ -1416,6 +1418,346 @@ type ScopeFreeSharedProtocolResult =
     evidence?: SharedSyncProtocolInconsistencyEvidence;
   };
 
+type UploadRemoteConflictRecoveryArgs = {
+  e: unknown;
+  item: SyncPlanItem;
+  result: SyncResult;
+  remoteUpserts: RemoteFileEntry[];
+  metrics: ExecutionMetrics;
+  callbacks: SyncCallbacks;
+  operationEpoch: number;
+  factsChangedPolicy: "defer" | "throw";
+  content: ArrayBuffer;
+};
+
+type UploadRemoteConflictRecoveryOutcome =
+  | { terminated: ItemExecutionResult }
+  | { terminated: null; uploadResult: UploadResult };
+
+type MutationRecoverySummaryArgs = {
+  persistedRecords: MutationLedgerEntryV1[];
+  blocked: Parameters<SyncExecutor["recoverMutationLedgerRecords"]>[0]["blocked"];
+  blockedRecords: Parameters<SyncExecutor["recoverMutationLedgerRecords"]>[0]["blockedRecords"];
+  settled: number;
+  applied: number;
+  notApplied: number;
+  receiptCommitted: number;
+  quarantined: number;
+  externalMutations: number;
+};
+
+type CommunityPluginDowngradeProbeRefreshArgs = {
+  byPlugin: Map<string, SyncPlanItem[]>;
+  configDir: string;
+  remoteByPath: Map<string, RemoteFileEntry>;
+  refreshedProbeUrls: Map<string, string>;
+  probeBatchClient: NonNullable<ReturnType<typeof resolveBatchMetadataClient>>;
+};
+
+type CommunityPluginBundleDownloadDeferralArgs = {
+  byPlugin: Map<string, SyncPlanItem[]>;
+  configDir: string;
+  remoteByPath: Map<string, RemoteFileEntry>;
+  adapter: DataAdapter;
+  refreshedProbeUrls: Map<string, string>;
+  downloads: SyncPlanItem[];
+};
+
+type FreshV2LegacyV2ClassificationArgs = {
+  result: SyncResult;
+  protocolProfile: Extract<SharedSyncProtocolProfile, { status: "legacy-v2" }>;
+  initialProtocolObservation: SharedSyncProtocolObserved;
+  syncScope: SyncScope;
+  pendingFirstSyncProtocolBinding: SharedSyncProtocolBindingV2 | null;
+  operationEpoch: number;
+};
+
+type FreshV2LegacyV2ClassificationOutcome =
+  | { terminated: SyncResult }
+  | {
+    terminated: null;
+    activationReviewKind: V2ActivationReviewKind;
+    firstSyncVerificationProtocolBinding: unknown;
+  };
+
+type EnsurePerRoundSharedProtocolGateReadyArgs = {
+  result: SyncResult;
+  operationEpoch: number;
+  callbacks: SyncCallbacks;
+  enterPhase: (nextPhase: SyncRunPhase) => void;
+  mode: SyncMode;
+  syncScope: SyncScope;
+  perRoundProtocolGate: boolean;
+  perRoundProtocolBinding: SharedSyncProtocolBinding | null;
+  prestartedProtocolObservation:
+    | Promise<SharedSyncProtocolObservationSettled>
+    | null;
+  restoredCommittedScopeFromDeltaCache: boolean;
+  committedScope: StateManager["remoteScope"];
+  automaticHandlingPolicy: AutomaticHandlingPolicy;
+  communityPluginSyncPolicy: ReturnType<typeof cloneCommunityPluginSyncPolicy>;
+};
+
+type EnsurePerRoundSharedProtocolGateReadyOutcome =
+  | { terminated: SyncResult }
+  | { terminated: null };
+
+type AcceptPreparedSyncScopeExpansionArgs = {
+  options: SyncRunOptions;
+  remoteEntries: RemoteFileEntry[];
+  syncScope: SyncScope;
+  localEntries: LocalFileEntry[];
+  localFolders: LocalFolderEntry[];
+  localFolderScanComplete: boolean;
+  scopeExpansionPreparation:
+    | Awaited<ReturnType<StateManager["prepareSyncScopeExpansion"]>>
+    | { status: "none" };
+};
+
+type FinalizeCanonicalContentVerificationArgs = {
+  plan: SyncPlan;
+  canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
+  migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
+  v2PlanState: StateManager & {
+    getCommittedV2Envelope?: StateManager["getCommittedV2Envelope"];
+  };
+  verifiedFirstSyncRemoteHashesById: ReadonlyMap<string, string>;
+  automaticHandlingPolicy: AutomaticHandlingPolicy;
+  baselineReconstructionIncomplete: boolean;
+  resolveCanonicalRemoteContentHash: (
+    item: Readonly<SyncPlanItem>,
+    progress: { current: number; total: number },
+    resetProgressPhase?: boolean,
+  ) => Promise<string>;
+  refreshVerificationDownloadUrls: (
+    items: ReadonlyArray<SyncPlanItem>,
+  ) => Promise<void>;
+};
+
+type FinalizeCanonicalContentVerificationOutcome = {
+  finalizedCanonicalPlan: FinalizedCanonicalPlanV2 | null;
+  canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
+  canonicalFinalizationEnvelope: SyncStateEnvelopeV2 | null;
+  contentEqualityBaseUpserts: BaseFileEntry[];
+};
+
+type CreateFolderMutationIntentArgs = {
+  item: SyncPlanItem;
+  scope: SyncScope;
+};
+
+type CreateFolderMutationIntentOutcome =
+  | { terminated: FolderMutationIntentV2 }
+  | { terminated: null };
+
+type DeferPersistedPluginUploadDowngradeToReviewArgs = {
+  intent: MutationIntentV1;
+  item: SyncPlanItem;
+  result: SyncResult;
+  operationEpoch: number;
+};
+
+type PersistedMutationRecoveryAccumulatorState = {
+  hierarchyRefreshedForRecovery: boolean;
+  reflectedCheckpointRetirementCommitSeq: number | undefined;
+  settled: number;
+  applied: number;
+  notApplied: number;
+  receiptCommitted: number;
+  quarantined: number;
+  externalMutations: number;
+};
+
+type SettlePersistedManualMutationResolutionArgs = {
+  record: MutationLedgerEntryV1;
+  observationOnly: boolean;
+  operationEpoch: number | undefined;
+  currentFootprint: ConservativeResetRecordFootprint;
+  blocked: Parameters<SyncExecutor["settlePersistedMutationRecord"]>[0]["blocked"];
+  blockedRecords: Parameters<SyncExecutor["settlePersistedMutationRecord"]>[0]["blockedRecords"];
+  hierarchyRefreshedForRecovery: boolean;
+  reflectedCheckpointRetirementCommitSeq: number | undefined;
+  settled: number;
+  applied: number;
+  notApplied: number;
+  receiptCommitted: number;
+  quarantined: number;
+  externalMutations: number;
+};
+
+type SettlePersistedManualMutationResolutionOutcome =
+  | { terminated: PersistedMutationRecoveryAccumulatorState }
+  | { terminated: null; settled: number; externalMutations: number };
+
+type SettleExistingV2CorruptStateRecoveryHoldArgs = {
+  result: SyncResult;
+  callbacks: SyncCallbacks;
+  reviewedAuthorization: PlanReviewAuthorization | undefined;
+  existingHold: StateManager["activeV2CorruptStateRecoveryHold"];
+};
+
+type SettleExistingV2CorruptStateRecoveryHoldOutcome =
+  | { terminated: SyncResult }
+  | { terminated: null };
+
+type CommitReviewedFolderLocationResolutionArgs = {
+  intent: FolderMutationIntentV2;
+  operationEpoch: number;
+  current: FolderLocationResolutionSnapshotV1;
+  item: SyncPlanItem;
+  choice: FolderLocationResolutionChoiceV1;
+};
+
+type CommitReviewedFolderLocationResolutionOutcome = {
+  resolved: boolean;
+  value: boolean | undefined;
+};
+
+type CommitReviewedFolderSubtreeDeletionArgs = {
+  intent: FolderMutationIntentV2;
+  operationEpoch: number;
+  current: FolderSubtreeReviewSnapshotV1;
+  root: FolderSubtreeReviewSnapshotV1["members"][number];
+};
+
+type CommitReviewedFolderSubtreeDeletionOutcome = {
+  deleted: boolean;
+  value: boolean | undefined;
+};
+
+type PublishExactDescendantEvidenceForUnanchoredFolderArgs = {
+  result: SyncResult;
+  operationEpoch: number;
+  evidence: Awaited<ReturnType<typeof finalizeUnanchoredFolderEvidenceV2>>;
+  canonicalPlanCandidate: CanonicalPlanCandidateV2;
+  canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+  committedV2Envelope: SyncStateEnvelopeV2 | null;
+  reconstructed: Awaited<ReturnType<StateManager["acceptConfirmedDescendantFolderAnchors"]>>;
+  migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
+  v2PlanState: StateManager & {
+    getCommittedV2Envelope?: StateManager["getCommittedV2Envelope"];
+  };
+  syncScope: SyncScope;
+  acceptConfirmedDescendantFolders: () => ReturnType<StateManager["acceptConfirmedDescendantFolderAnchors"]>;
+  rebuildCanonicalPlanCandidate: (envelope: SyncStateEnvelopeV2) => CanonicalPlanCandidateV2;
+};
+
+type PublishExactDescendantEvidenceForUnanchoredFolderOutcome =
+  | { terminated: SyncResult }
+  | {
+      terminated: null;
+      canonicalPlanCandidate: CanonicalPlanCandidateV2;
+      canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+      committedV2Envelope: SyncStateEnvelopeV2 | null;
+      reconstructed: Awaited<ReturnType<StateManager["acceptConfirmedDescendantFolderAnchors"]>>;
+    };
+
+type CommitReviewedRemoteDownloadTransferArgs = {
+  path: string;
+  queuedConflict: SyncPlanItem;
+  operationEpoch: number;
+  transferState: { targetMutationStarted: boolean };
+};
+
+type CommitReviewedRemoteDownloadTransferOutcome = {
+  content: ArrayBuffer | null;
+  checkpoint: MutationCheckpointV1;
+};
+
+type ConfirmPendingFolderRemoteDeleteArgs = {
+  path: string;
+  pending: SyncPlanItem | undefined;
+  operationEpoch: number;
+  options: { preverifiedAbsent?: boolean } | undefined;
+  showSuccessNotice: boolean;
+};
+
+type ConfirmPendingFolderRemoteDeleteOutcome =
+  | { handled: true; value: boolean | undefined }
+  | { handled: false };
+
+type RecoverReceiptedMutationFailureArgs = {
+  error: unknown;
+  activeIntent: MutationIntent;
+  activeRecord: MutationLedgerEntryV1;
+  operationEpoch: number;
+  result: SyncResult;
+  metrics: ExecutionMetrics;
+};
+
+type SettleAppliedMutationRecoveryArgs = {
+  operationEpoch: number;
+  result: SyncResult;
+  transferMetrics: FileTransferMetrics | null;
+  transferOutcome: "succeeded" | "failed" | "cancelled" | "skipped" | null;
+  item: SyncPlanItem;
+  metrics: ExecutionMetrics;
+  fileSize: number | undefined;
+  completedBefore: number;
+  deletedBefore: number;
+  foldersCreatedBefore: number;
+  foldersMovedBefore: number;
+  foldersDeletedBefore: number;
+  filesMovedBefore: number;
+  automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
+  automaticDeleteCompleted: boolean;
+  isFolderCreate: (candidate: SyncPlanItem) => boolean;
+  isFolderMove: (candidate: SyncPlanItem) => boolean;
+  isFolderDelete: (candidate: SyncPlanItem) => boolean;
+  resolvedIssuePaths: Set<string>;
+};
+
+type SettleAppliedMutationRecoveryOutcome =
+  | { cancelled: true; transferOutcome: "cancelled" | null }
+  | { cancelled: false; transferOutcome: "succeeded" | "failed" | "cancelled" | "skipped" | null };
+
+type SettleMissingV2RemoteScopeArgs = {
+  result: SyncResult;
+  callbacks: SyncCallbacks;
+  observedScope: SyncScope | null;
+  sourceEnvelope: SyncStateEnvelopeV2;
+  recovery: NonNullable<SyncStateEnvelopeV2["remoteScopeRecovery"]>;
+  reviewedAuthorization: PlanReviewAuthorization | undefined;
+};
+
+type SettleMissingV2RemoteScopeOutcome =
+  | { handled: true; value: SyncResult | null }
+  | {
+      handled: false;
+      observedScope: SyncScope;
+      sourceEnvelope: SyncStateEnvelopeV2;
+      recovery: NonNullable<SyncStateEnvelopeV2["remoteScopeRecovery"]>;
+    };
+
+type V2ScopeRecoveryVerificationCandidate = {
+  node: ReturnType<typeof buildRemoteIndexV2>["index"]["itemsById"][string];
+  path: string;
+};
+
+type VerifyPendingV2ScopeRecoveryCandidatesArgs = {
+  result: SyncResult;
+  callbacks: SyncCallbacks;
+  operationEpoch: number;
+  pendingVerificationCandidates: ReadonlyArray<V2ScopeRecoveryVerificationCandidate>;
+  itemById: Map<string, DriveItem>;
+  scopeRecoveryDownloadUrlById: Map<string, string>;
+  verifiedRemoteHashesById: Record<string, string>;
+  evidenceOperationId: string;
+  reusableReceiptCount: number;
+  recoveryVerification: RemoteScopeRecoveryVerificationSummary;
+  publishRecoveryVerification: (patch?: Partial<RemoteScopeRecoveryVerificationSummary>) => void;
+};
+
+type RejectRemoteDeleteFolderArgs = {
+  pending: SyncPlanItem;
+  path: string;
+  operationEpoch: number;
+};
+
+type RejectRemoteDeleteFolderOutcome =
+  | { handled: true; value: boolean | undefined }
+  | { handled: false };
+
 export class SyncExecutor {
   private running = false;
   private sideActionRunning = false;
@@ -1446,24 +1788,7 @@ export class SyncExecutor {
   private communityPluginSyncPolicy = cloneCommunityPluginSyncPolicy(
     DEFAULT_COMMUNITY_PLUGIN_SYNC_POLICY,
   );
-  /**
-   * Session-scoped bytes fetched while building a community-plugin bundle
-   * review snapshot. Keyed by pluginId → path → bytes + content identity.
-   *
-   * This is a pure display/staging cache: it never feeds `factsDigest`, never
-   * authorizes a mutation, and is discarded when the executor or vault
-   * changes. It lets the bundle sub-dialog ("查看差异") reuse content the
-   * snapshot already downloaded instead of re-downloading it, and lets a
-   * re-opened review re-render without re-fetching unchanged bytes.
-   */
-  private bundleReviewBytesByPlugin = new Map<string, Map<string, {
-    hash: string;
-    bytes: ArrayBuffer;
-    mtime: number;
-    driveId?: string;
-    eTag?: string;
-  }>>();
-  private bundleReviewBytesTotal = 0;
+  private readonly bundleReviewBytesCache = new BundleReviewBytesCache();
   /**
    * Session-scoped snapshot cache: last built community-plugin bundle review
    * per pluginId, paired with the mutation facts it was built from. A re-open
@@ -2572,94 +2897,108 @@ export class SyncExecutor {
           sourceLifecycleEpoch: current.sourceLifecycleEpoch,
           sourceAnchorPath: current.path,
         };
-        try {
-          const committed = await this.runDurableSideMutation(
-            intent,
-            operationEpoch,
-            async () => {
-              const latest = await this.buildCurrentFolderLocationResolutionSnapshot(
-                current.path,
-              );
-              if (
-                !latest
-                || latest.revision !== current.revision
-                || !this.canContinue(operationEpoch)
-              ) {
-                throw new MutationNotAppliedError(
-                  this.t("notice.folderLocation.changed", { path: current.path }),
-                );
-              }
-              const result: SyncResult = {
-                success: false,
-                uploaded: 0,
-                downloaded: 0,
-                foldersCreated: 0,
-                foldersMoved: 0,
-                foldersDeleted: 0,
-                filesMoved: 0,
-                deleted: 0,
-                conflicts: 0,
-                deferred: 0,
-                skippedLarge: 0,
-                skippedIgnored: 0,
-                skippedInvalidName: 0,
-                errors: 0,
-                authExpired: false,
-                message: "",
-              };
-              const metrics: ExecutionMetrics = {
-                uploadBytes: 0,
-                uploadReadMs: 0,
-                uploadNetworkMs: 0,
-                activeUploads: 0,
-                peakUploads: 0,
-                fileTransfers: {
-                  upload: createFileTransferMetrics(),
-                  download: createFileTransferMetrics(),
-                },
-                mutationPersistence: createMutationPersistenceMetrics(),
-                automaticHandling: createAutomaticHandlingMetrics(
-                  this.automaticHandlingPolicy,
-                ),
-              };
-              this.activeRunMetrics = metrics;
-              const executed = await this.executeItem(
-                item,
-                result,
-                [],
-                [],
-                metrics,
-                {},
-                operationEpoch,
-                this.automaticHandlingPolicy,
-              );
-              if (!executed.mutationApplied || !executed.folderUpsert) {
-                throw new MutationNotAppliedError(
-                  this.t("notice.folderLocation.changed", { path: current.path }),
-                );
-              }
-              return folderMutationCheckpoint(
-                executed.folderUpsert,
-                current.remoteId,
-              );
-            },
-          );
-          if (!committed) return;
-          await this.state.retirePendingIssues([current.path]);
-          resolved = true;
-          this.notice("notice.folderLocation.accepted", {
-            path: choice === "keep-local" ? current.localPath : current.remotePath,
-          });
-          return true;
-        } catch (error) {
-          if (!(error instanceof MutationNotAppliedError)) throw error;
-          this.notice("notice.folderLocation.changed", { path: current.path });
-          return;
-        }
+        const locationOutcome = await this.commitReviewedFolderLocationResolution({
+          intent,
+          operationEpoch,
+          current,
+          item,
+          choice,
+        });
+        resolved = locationOutcome.resolved;
+        return locationOutcome.value;
       },
       { status: "folder" },
     );
     return resolved;
+  }
+
+  private async commitReviewedFolderLocationResolution(args: CommitReviewedFolderLocationResolutionArgs): Promise<CommitReviewedFolderLocationResolutionOutcome> {
+    const { intent, operationEpoch, current, item, choice } = args;
+    let resolved = false;
+    try {
+      const committed = await this.runDurableSideMutation(
+        intent,
+        operationEpoch,
+        async () => {
+          const latest = await this.buildCurrentFolderLocationResolutionSnapshot(
+            current.path,
+          );
+          if (
+            !latest
+            || latest.revision !== current.revision
+            || !this.canContinue(operationEpoch)
+          ) {
+            throw new MutationNotAppliedError(
+              this.t("notice.folderLocation.changed", { path: current.path }),
+            );
+          }
+          const result: SyncResult = {
+            success: false,
+            uploaded: 0,
+            downloaded: 0,
+            foldersCreated: 0,
+            foldersMoved: 0,
+            foldersDeleted: 0,
+            filesMoved: 0,
+            deleted: 0,
+            conflicts: 0,
+            deferred: 0,
+            skippedLarge: 0,
+            skippedIgnored: 0,
+            skippedInvalidName: 0,
+            errors: 0,
+            authExpired: false,
+            message: "",
+          };
+          const metrics: ExecutionMetrics = {
+            uploadBytes: 0,
+            uploadReadMs: 0,
+            uploadNetworkMs: 0,
+            activeUploads: 0,
+            peakUploads: 0,
+            fileTransfers: {
+              upload: createFileTransferMetrics(),
+              download: createFileTransferMetrics(),
+            },
+            mutationPersistence: createMutationPersistenceMetrics(),
+            automaticHandling: createAutomaticHandlingMetrics(
+              this.automaticHandlingPolicy,
+            ),
+          };
+          this.activeRunMetrics = metrics;
+          const executed = await this.executeItem(
+            item,
+            result,
+            [],
+            [],
+            metrics,
+            {},
+            operationEpoch,
+            this.automaticHandlingPolicy,
+          );
+          if (!executed.mutationApplied || !executed.folderUpsert) {
+            throw new MutationNotAppliedError(
+              this.t("notice.folderLocation.changed", { path: current.path }),
+            );
+          }
+          return folderMutationCheckpoint(
+            executed.folderUpsert,
+            current.remoteId,
+          );
+        },
+      );
+      if (!committed) return { resolved, value: undefined };
+      await this.state.retirePendingIssues([current.path]);
+      resolved = true;
+      this.notice("notice.folderLocation.accepted", {
+        path: choice === "keep-local" ? current.localPath : current.remotePath,
+      });
+      return { resolved, value: true };
+    } catch (error) {
+      if (!(error instanceof MutationNotAppliedError)) throw error;
+      this.notice("notice.folderLocation.changed", { path: current.path });
+      return { resolved, value: undefined };
+    }
   }
 
   /**
@@ -2787,82 +3126,95 @@ export class SyncExecutor {
           },
           createdAt: Date.now(),
         };
-        try {
-          const committed = await this.runDurableSideMutation(
-            intent,
-            operationEpoch,
-            async () => {
-              const latest = await this.buildCurrentFolderSubtreeReviewSnapshot(
-                current.path,
-              );
-              const latestRoot = latest?.members[0];
-              if (
-                !latest
-                || latest.revision !== current.revision
-                || latestRoot?.kind !== "folder"
-                || latestRoot.remoteId !== root.remoteId
-                || latestRoot.remoteCTag !== root.remoteCTag
-                || !this.canContinue(operationEpoch)
-                || !await this.liveFolderSubtreeMatches(latest)
-              ) {
-                throw new MutationNotAppliedError(
-                  this.t("notice.folderSubtree.changed", { path: current.path }),
-                );
-              }
-              try {
-                await this.onedrive.deleteItem(
-                  this.vaultName,
-                  current.path,
-                  // Mirror the empty-shell delete fallback: the per-member
-                  // live match above re-verified every identity, so the
-                  // verified root eTag carries the If-Match when the
-                  // platform provides no descendant-sensitive tag.
-                  root.remoteCTag ?? root.remoteETag,
-                  root.remoteId,
-                );
-              } catch (error) {
-                if (error instanceof OneDriveError && isRemoteMutationConflict(error)) {
-                  throw new MutationNotAppliedError(
-                    this.t("notice.folderSubtree.changed", { path: current.path }),
-                  );
-                }
-                throw error;
-              }
-              if (await this.onedrive.getDriveItemMetadataById(root.remoteId)) {
-                throw new Error(`Reviewed remote subtree delete read-back failed: ${current.path}`);
-              }
-              const checkpoint = folderDeleteCheckpoint(
-                current.path,
-                root.remoteId,
-              );
-              checkpoint.folderMoveHintRemovals = current.members
-                .filter((member) => member.kind === "folder")
-                .map((member) => member.remoteId);
-              return checkpoint;
-            },
-          );
-          if (!committed) return;
-          deleted = true;
-          this.diag?.log(
-            "execute",
-            "reviewed cloud folder subtree deleted by root identity and content tag",
-            {
-              path: current.path,
-              members: current.members.length,
-              mutations: 1,
-            },
-          );
-          this.notice("notice.folderSubtree.deleted", { path: current.path });
-          return true;
-        } catch (error) {
-          if (!(error instanceof MutationNotAppliedError)) throw error;
-          this.notice("notice.folderSubtree.changed", { path: current.path });
-          return;
-        }
+        const deletionOutcome = await this.commitReviewedFolderSubtreeDeletion({
+          intent,
+          operationEpoch,
+          current,
+          root,
+        });
+        deleted = deletionOutcome.deleted;
+        return deletionOutcome.value;
       },
       { status: "folder" },
     );
     return deleted;
+  }
+
+  private async commitReviewedFolderSubtreeDeletion(args: CommitReviewedFolderSubtreeDeletionArgs): Promise<CommitReviewedFolderSubtreeDeletionOutcome> {
+    const { intent, operationEpoch, current, root } = args;
+    let deleted = false;
+    try {
+      const committed = await this.runDurableSideMutation(
+        intent,
+        operationEpoch,
+        async () => {
+          const latest = await this.buildCurrentFolderSubtreeReviewSnapshot(
+            current.path,
+          );
+          const latestRoot = latest?.members[0];
+          if (
+            !latest
+            || latest.revision !== current.revision
+            || latestRoot?.kind !== "folder"
+            || latestRoot.remoteId !== root.remoteId
+            || latestRoot.remoteCTag !== root.remoteCTag
+            || !this.canContinue(operationEpoch)
+            || !await this.liveFolderSubtreeMatches(latest)
+          ) {
+            throw new MutationNotAppliedError(
+              this.t("notice.folderSubtree.changed", { path: current.path }),
+            );
+          }
+          try {
+            await this.onedrive.deleteItem(
+              this.vaultName,
+              current.path,
+              // Mirror the empty-shell delete fallback: the per-member
+              // live match above re-verified every identity, so the
+              // verified root eTag carries the If-Match when the
+              // platform provides no descendant-sensitive tag.
+              root.remoteCTag ?? root.remoteETag,
+              root.remoteId,
+            );
+          } catch (error) {
+            if (error instanceof OneDriveError && isRemoteMutationConflict(error)) {
+              throw new MutationNotAppliedError(
+                this.t("notice.folderSubtree.changed", { path: current.path }),
+              );
+            }
+            throw error;
+          }
+          if (await this.onedrive.getDriveItemMetadataById(root.remoteId)) {
+            throw new Error(`Reviewed remote subtree delete read-back failed: ${current.path}`);
+          }
+          const checkpoint = folderDeleteCheckpoint(
+            current.path,
+            root.remoteId,
+          );
+          checkpoint.folderMoveHintRemovals = current.members
+            .filter((member) => member.kind === "folder")
+            .map((member) => member.remoteId);
+          return checkpoint;
+        },
+      );
+      if (!committed) return { deleted, value: undefined };
+      deleted = true;
+      this.diag?.log(
+        "execute",
+        "reviewed cloud folder subtree deleted by root identity and content tag",
+        {
+          path: current.path,
+          members: current.members.length,
+          mutations: 1,
+        },
+      );
+      this.notice("notice.folderSubtree.deleted", { path: current.path });
+      return { deleted, value: true };
+    } catch (error) {
+      if (!(error instanceof MutationNotAppliedError)) throw error;
+      this.notice("notice.folderSubtree.changed", { path: current.path });
+      return { deleted, value: undefined };
+    }
   }
 
   /** Bind one explicitly selected empty local shell to the reviewed identity. */
@@ -3199,7 +3551,7 @@ export class SyncExecutor {
       // already cached. Safety is unchanged: cacheGet re-checks identity and
       // the verified re-inspection below still runs.
       const cached = options.pluginId
-        ? this.bundleReviewBytesCacheGet(
+        ? this.bundleReviewBytesCache.get(
           options.pluginId,
           path,
           undefined,
@@ -3219,7 +3571,7 @@ export class SyncExecutor {
         }
         hash = await sha256Hex(bytes);
         if (options.pluginId) {
-          this.bundleReviewBytesCacheSet(
+          this.bundleReviewBytesCache.set(
             options.pluginId,
             path,
             hash,
@@ -3313,7 +3665,7 @@ export class SyncExecutor {
     // member (hash is the content identity). The parsed manifest only feeds
     // display (version numbers) and never enters factsDigest.
     const cached = pluginId
-      ? this.bundleReviewBytesCacheGet(pluginId, path, fact.hash)
+      ? this.bundleReviewBytesCache.get(pluginId, path, fact.hash)
       : null;
     const bytes = cached
       ? cached.bytes
@@ -3336,7 +3688,7 @@ export class SyncExecutor {
       || current.size !== fact.size
     ) return null;
     if (!cached && pluginId) {
-      this.bundleReviewBytesCacheSet(
+      this.bundleReviewBytesCache.set(
         pluginId,
         path,
         fact.hash,
@@ -3350,88 +3702,6 @@ export class SyncExecutor {
       parseCommunityPluginBundlePath(path, getConfigDir(this.scanner.vault))!
         .pluginId,
     );
-  }
-
-  /** Global bytes-cache cap across all plugin bundles (LRU evicts whole plugin sets). */
-  private static readonly BUNDLE_REVIEW_BYTES_CACHE_MAX_TOTAL = 16 * 1024 * 1024;
-  /**
-   * Per-member bytes bound for the bundle-review bytes cache. The name says
-   * "per plugin", but the bound is applied per cached file (each plugin bundle
-   * has ≤3 members, so a plugin can hold up to 3 × 3 MiB = 9 MiB; the 16 MiB
-   * global cap is the actual backstop).
-   */
-  private static readonly BUNDLE_REVIEW_BYTES_CACHE_MAX_PER_PLUGIN = 3 * 1024 * 1024;
-
-  private bundleReviewBytesCacheSet(
-    pluginId: string,
-    path: string,
-    hash: string,
-    bytes: ArrayBuffer,
-    mtime: number,
-    identity?: { driveId: string; eTag: string },
-  ): void {
-    if (bytes.byteLength > SyncExecutor.BUNDLE_REVIEW_BYTES_CACHE_MAX_PER_PLUGIN) {
-      return; // never cache an oversized member
-    }
-    let byPath = this.bundleReviewBytesByPlugin.get(pluginId);
-    if (!byPath) {
-      byPath = new Map();
-      this.bundleReviewBytesByPlugin.set(pluginId, byPath);
-    }
-    const previous = byPath.get(path);
-    if (previous) this.bundleReviewBytesTotal -= previous.bytes.byteLength;
-    byPath.set(path, { hash, bytes, mtime, ...identity });
-    this.bundleReviewBytesTotal += bytes.byteLength;
-    // LRU bump before the eviction sweep (1.4.3 review F1): writing to a
-    // plugin set must move it to the MRU position first — otherwise a writer
-    // that is currently the oldest key gets evicted by its own write (the
-    // fresh bytes are dropped while unrelated newer sets survive).
-    this.bundleReviewBytesByPlugin.delete(pluginId);
-    this.bundleReviewBytesByPlugin.set(pluginId, byPath);
-    // LRU over plugins: evict the least recently used plugin's whole set when
-    // over the global cap. (Path-level LRU is unnecessary: ≤3 members each.)
-    while (
-      this.bundleReviewBytesTotal
-        > SyncExecutor.BUNDLE_REVIEW_BYTES_CACHE_MAX_TOTAL
-      && this.bundleReviewBytesByPlugin.size > 0
-    ) {
-      const oldestKey = this.bundleReviewBytesByPlugin.keys().next().value as string;
-      const removed = this.bundleReviewBytesByPlugin.get(oldestKey);
-      if (!removed) break;
-      let removedBytes = 0;
-      for (const cached of removed.values()) removedBytes += cached.bytes.byteLength;
-      this.bundleReviewBytesTotal -= removedBytes;
-      this.bundleReviewBytesByPlugin.delete(oldestKey);
-    }
-  }
-
-  private bundleReviewBytesCacheGet(
-    pluginId: string,
-    path: string,
-    expectedHash?: string,
-    expectedIdentity?: { driveId?: string; eTag?: string },
-  ): { bytes: ArrayBuffer; mtime: number; hash: string } | null {
-    const byPath = this.bundleReviewBytesByPlugin.get(pluginId);
-    if (!byPath) return null;
-    const cached = byPath.get(path);
-    if (!cached) return null;
-    if (expectedHash && cached.hash !== expectedHash) return null;
-    if (
-      expectedIdentity
-      && ((
-        expectedIdentity.driveId
-        && cached.driveId
-        && cached.driveId !== expectedIdentity.driveId
-      ) || (
-        expectedIdentity.eTag
-        && cached.eTag
-        && cached.eTag !== expectedIdentity.eTag
-      ))
-    ) return null;
-    // LRU bump: move the plugin set to MRU position.
-    this.bundleReviewBytesByPlugin.delete(pluginId);
-    this.bundleReviewBytesByPlugin.set(pluginId, byPath);
-    return { bytes: cached.bytes, mtime: cached.mtime, hash: cached.hash };
   }
 
   /**
@@ -3480,7 +3750,7 @@ export class SyncExecutor {
     // authorizes a mutation.
     const currentRemote = await this.inspectRemotePath(path);
     if (currentRemote) {
-      const cached = this.bundleReviewBytesCacheGet(pluginId, path, undefined, {
+      const cached = this.bundleReviewBytesCache.get(pluginId, path, undefined, {
         driveId: currentRemote.driveId,
         eTag: currentRemote.eTag,
       });
@@ -3500,7 +3770,7 @@ export class SyncExecutor {
     if (remote.fact.hash) {
       // Hash known (from metadata or the hash-establishing download above).
       // Reuse cached bytes when the identity still matches, otherwise fetch.
-      const cached = this.bundleReviewBytesCacheGet(
+      const cached = this.bundleReviewBytesCache.get(
         pluginId,
         path,
         remote.fact.hash,
@@ -3518,7 +3788,7 @@ export class SyncExecutor {
           remote.entry.size,
         );
         if (remoteBytes.byteLength !== remote.entry.size) return null;
-        this.bundleReviewBytesCacheSet(
+        this.bundleReviewBytesCache.set(
           pluginId,
           path,
           remote.fact.hash,
@@ -6053,166 +6323,277 @@ export class SyncExecutor {
     };
 
     for (const [pluginId, items] of groups) {
-      const root = `${configDir}/plugins/${pluginId}`;
-      const mainPath = `${root}/main.js`;
-      const manifestPath = `${root}/manifest.json`;
-      const downloadedByPath = new Map<string, number>();
-      const totalByPath = new Map(
-        items.map((item) => [item.path, item.remote?.size ?? 0]),
-      );
-      const reportFileProgress = (
-        path: string,
-        downloaded: number,
-        total: number,
-      ): void => {
-        const reportedDownloaded = Number.isFinite(downloaded)
-          ? Math.max(0, downloaded)
-          : 0;
-        const reportedTotal = Number.isFinite(total)
-          ? Math.max(0, total)
-          : 0;
-        downloadedByPath.set(
-          path,
-          Math.max(downloadedByPath.get(path) ?? 0, reportedDownloaded),
-        );
-        totalByPath.set(
-          path,
-          Math.max(
-            totalByPath.get(path) ?? 0,
-            reportedTotal,
-            reportedDownloaded,
-          ),
-        );
-        onBundleProgress?.(
-          root,
-          [...downloadedByPath.values()].reduce(
-            (sum, value) => sum + value,
-            0,
-          ),
-          [...totalByPath.values()].reduce(
-            (sum, value) => sum + value,
-            0,
-          ),
-        );
-      };
-      let groupPrepared: Array<[SyncPlanItem, PreparedDownload]> = [];
-      transferMetrics.started += items.length;
-      try {
-        const blocked = this.communityPluginIdentityBlockedErrors.get(pluginId);
-        if (blocked) throw blocked;
-        const remoteMain = remoteByPath.get(mainPath);
-        const remoteManifest = remoteByPath.get(manifestPath);
-        if (!remoteMain || !remoteManifest) {
-          throw new Error(`Selected plugin bundle is incomplete remotely: ${pluginId}`);
-        }
-
-        groupPrepared = await Promise.all(items.map(
-          async (item): Promise<[SyncPlanItem, PreparedDownload]> => {
-            try {
-              return [
-                item,
-                await stageRemote(
-                  item,
-                  true,
-                  (downloaded, total) =>
-                    reportFileProgress(item.path, downloaded, total),
-                ),
-              ];
-            } catch (error) {
-              return [item, { error }];
-            }
-          },
-        ));
-        const failedPreparation = groupPrepared.find(
-          ([, prepared]) => prepared.error !== undefined,
-        )?.[1];
-        if (failedPreparation?.error !== undefined) {
-          throw failedPreparation.error instanceof Error
-            ? failedPreparation.error
-            : new Error(describeThrownValue(failedPreparation.error));
-        }
-        if (!this.canContinue(operationEpoch, result)) {
-          transferMetrics.cancelled += items.length;
-          return preparedByPath;
-        }
-
-        const plannedManifest = groupPrepared.find(
-          ([item]) => item.path === manifestPath,
-        )?.[1];
-        const manifestPrepared = plannedManifest
-          ?? await stageRemote(
-            {
-              type: SyncActionType.Download,
-              path: manifestPath,
-              remote: remoteManifest,
-            },
-            false,
-            (downloaded, total) =>
-              reportFileProgress(manifestPath, downloaded, total),
-          );
-        if (!manifestPrepared?.content) {
-          throw new Error(`Selected plugin manifest download failed: ${pluginId}`);
-        }
-        const manifest = parseCommunityPluginBundleManifest(
-          new TextDecoder().decode(manifestPrepared.content),
-          pluginId,
-        );
-
-        let localVersion: string | null = null;
-        if (await adapter.exists(manifestPath)) {
-          const localManifest = parseCommunityPluginBundleManifest(
-            await adapter.read(manifestPath),
-            pluginId,
-          );
-          assertCommunityPluginManifestIdentityStable(pluginId, [
-            manifest,
-            localManifest,
-          ]);
-          localVersion = localManifest.version;
-        }
-        const incompatibility = assessCommunityPluginManifestCompatibility(
-          manifest,
-          {
-            localVersion,
-            isMobile: Platform.isMobile,
-            apiVersionSupported: manifest.minAppVersion
-              ? requireApiVersion(manifest.minAppVersion)
-              : true,
-          },
-        );
-        if (incompatibility) {
-          // The plan-level downgrade guard removes the whole bundle from the
-          // download plan before any file (including manifest.json) is
-          // written; this remains a fail-closed backstop for anything that
-          // slips past it.
-          throw new Error(
-            `Selected plugin bundle is incompatible (${incompatibility}): ${pluginId}`,
-          );
-        }
-        for (const [item, prepared] of groupPrepared) {
-          preparedByPath.set(item.path, prepared);
-        }
-        this.diag?.log("execute", "selected plugin bundle preflight passed", {
-          schemaVersion: 1,
-          files: items.length,
-          hasStyles: remoteByPath.has(`${root}/styles.css`),
-        });
-      } catch (error) {
-        for (const item of items) {
-          preparedByPath.set(item.path, { error });
-        }
-        this.diag?.warn(
-          "execute",
-          "selected plugin bundle preflight blocked local writes",
-          {
-            schemaVersion: 1,
-            files: items.length,
-            reason: this.failureReason(error),
-          },
-        );
-      }
+      const groupOutcome = await this.prepareCommunityPluginBundleGroup({
+        pluginId,
+        items,
+        configDir,
+        remoteByPath,
+        adapter,
+        transferMetrics,
+        preparedByPath,
+        stageRemote,
+        operationEpoch,
+        result,
+        onBundleProgress,
+      });
+      if (groupOutcome.terminated) return groupOutcome.terminated;
     }
     return preparedByPath;
+  }
+
+  /** Stages and preflights one selected community-plugin bundle group:
+   *  downloads every planned file, resolves the bundle manifest, and records
+   *  prepared downloads (or a per-file error) for the whole group. Reports
+   *  cancellation as an explicit termination so remaining groups are skipped. */
+  private async prepareCommunityPluginBundleGroup(args: {
+    pluginId: string;
+    items: readonly SyncPlanItem[];
+    configDir: string;
+    remoteByPath: Map<string, RemoteFileEntry>;
+    adapter: DataAdapter;
+    transferMetrics: ExecutionMetrics["fileTransfers"]["download"];
+    preparedByPath: Map<string, PreparedDownload>;
+    stageRemote: (
+      item: SyncPlanItem,
+      countAsPlanTransfer: boolean,
+      onProgress?: (downloaded: number, total: number) => void,
+    ) => Promise<PreparedDownload>;
+    operationEpoch: number;
+    result: SyncResult;
+    onBundleProgress?: (
+      root: string,
+      downloaded: number,
+      total: number,
+    ) => void;
+  }): Promise<{ terminated: Map<string, PreparedDownload> } | { terminated: null }> {
+    const {
+      pluginId,
+      items,
+      configDir,
+      remoteByPath,
+      adapter,
+      transferMetrics,
+      preparedByPath,
+      stageRemote,
+      operationEpoch,
+      result,
+      onBundleProgress,
+    } = args;
+    const root = `${configDir}/plugins/${pluginId}`;
+    const mainPath = `${root}/main.js`;
+    const manifestPath = `${root}/manifest.json`;
+    const downloadedByPath = new Map<string, number>();
+    const totalByPath = new Map(
+      items.map((item) => [item.path, item.remote?.size ?? 0]),
+    );
+    const reportFileProgress = (
+      path: string,
+      downloaded: number,
+      total: number,
+    ): void => {
+      const reportedDownloaded = Number.isFinite(downloaded)
+        ? Math.max(0, downloaded)
+        : 0;
+      const reportedTotal = Number.isFinite(total)
+        ? Math.max(0, total)
+        : 0;
+      downloadedByPath.set(
+        path,
+        Math.max(downloadedByPath.get(path) ?? 0, reportedDownloaded),
+      );
+      totalByPath.set(
+        path,
+        Math.max(
+          totalByPath.get(path) ?? 0,
+          reportedTotal,
+          reportedDownloaded,
+        ),
+      );
+      onBundleProgress?.(
+        root,
+        [...downloadedByPath.values()].reduce(
+          (sum, value) => sum + value,
+          0,
+        ),
+        [...totalByPath.values()].reduce(
+          (sum, value) => sum + value,
+          0,
+        ),
+      );
+    };
+    transferMetrics.started += items.length;
+    try {
+      const groupOutcome = await this.prepareCommunityPluginBundleGroupPreflight({
+        pluginId,
+        items,
+        root,
+        mainPath,
+        manifestPath,
+        remoteByPath,
+        adapter,
+        transferMetrics,
+        preparedByPath,
+        stageRemote,
+        reportFileProgress,
+        operationEpoch,
+        result,
+      });
+      if (groupOutcome.terminated) return { terminated: groupOutcome.terminated };
+    } catch (error) {
+      for (const item of items) {
+        preparedByPath.set(item.path, { error });
+      }
+      this.diag?.warn(
+        "execute",
+        "selected plugin bundle preflight blocked local writes",
+        {
+          schemaVersion: 1,
+          files: items.length,
+          reason: this.failureReason(error),
+        },
+      );
+    }
+    return { terminated: null };
+  }
+
+  /** Resolves the remote bundle files, manifest and downgrade/host
+   *  compatibility gate for one selected plugin group. Fail-closed errors are
+   *  thrown for the caller to record per file. */
+  private async prepareCommunityPluginBundleGroupPreflight(args: {
+    pluginId: string;
+    items: readonly SyncPlanItem[];
+    root: string;
+    mainPath: string;
+    manifestPath: string;
+    remoteByPath: Map<string, RemoteFileEntry>;
+    adapter: DataAdapter;
+    transferMetrics: ExecutionMetrics["fileTransfers"]["download"];
+    preparedByPath: Map<string, PreparedDownload>;
+    stageRemote: (
+      item: SyncPlanItem,
+      countAsPlanTransfer: boolean,
+      onProgress?: (downloaded: number, total: number) => void,
+    ) => Promise<PreparedDownload>;
+    reportFileProgress: (path: string, downloaded: number, total: number) => void;
+    operationEpoch: number;
+    result: SyncResult;
+  }): Promise<{ terminated: Map<string, PreparedDownload> } | { terminated: null }> {
+    const {
+      pluginId,
+      items,
+      root,
+      mainPath,
+      manifestPath,
+      remoteByPath,
+      adapter,
+      transferMetrics,
+      preparedByPath,
+      stageRemote,
+      reportFileProgress,
+      operationEpoch,
+      result,
+    } = args;
+    let groupPrepared: Array<[SyncPlanItem, PreparedDownload]> = [];
+    const blocked = this.communityPluginIdentityBlockedErrors.get(pluginId);
+    if (blocked) throw blocked;
+    const remoteMain = remoteByPath.get(mainPath);
+    const remoteManifest = remoteByPath.get(manifestPath);
+    if (!remoteMain || !remoteManifest) {
+      throw new Error(`Selected plugin bundle is incomplete remotely: ${pluginId}`);
+    }
+
+    groupPrepared = await Promise.all(items.map(
+      async (item): Promise<[SyncPlanItem, PreparedDownload]> => {
+        try {
+          return [
+            item,
+            await stageRemote(
+              item,
+              true,
+              (downloaded, total) =>
+                reportFileProgress(item.path, downloaded, total),
+            ),
+          ];
+        } catch (error) {
+          return [item, { error }];
+        }
+      },
+    ));
+    const failedPreparation = groupPrepared.find(
+      ([, prepared]) => prepared.error !== undefined,
+    )?.[1];
+    if (failedPreparation?.error !== undefined) {
+      throw failedPreparation.error instanceof Error
+        ? failedPreparation.error
+        : new Error(describeThrownValue(failedPreparation.error));
+    }
+    if (!this.canContinue(operationEpoch, result)) {
+      transferMetrics.cancelled += items.length;
+      return { terminated: preparedByPath };
+    }
+
+    const plannedManifest = groupPrepared.find(
+      ([item]) => item.path === manifestPath,
+    )?.[1];
+    const manifestPrepared = plannedManifest
+      ?? await stageRemote(
+        {
+          type: SyncActionType.Download,
+          path: manifestPath,
+          remote: remoteManifest,
+        },
+        false,
+        (downloaded, total) =>
+          reportFileProgress(manifestPath, downloaded, total),
+      );
+    if (!manifestPrepared?.content) {
+      throw new Error(`Selected plugin manifest download failed: ${pluginId}`);
+    }
+    const manifest = parseCommunityPluginBundleManifest(
+      new TextDecoder().decode(manifestPrepared.content),
+      pluginId,
+    );
+
+    let localVersion: string | null = null;
+    if (await adapter.exists(manifestPath)) {
+      const localManifest = parseCommunityPluginBundleManifest(
+        await adapter.read(manifestPath),
+        pluginId,
+      );
+      assertCommunityPluginManifestIdentityStable(pluginId, [
+        manifest,
+        localManifest,
+      ]);
+      localVersion = localManifest.version;
+    }
+    const incompatibility = assessCommunityPluginManifestCompatibility(
+      manifest,
+      {
+        localVersion,
+        isMobile: Platform.isMobile,
+        apiVersionSupported: manifest.minAppVersion
+          ? requireApiVersion(manifest.minAppVersion)
+          : true,
+      },
+    );
+    if (incompatibility) {
+      // The plan-level downgrade guard removes the whole bundle from the
+      // download plan before any file (including manifest.json) is
+      // written; this remains a fail-closed backstop for anything that
+      // slips past it.
+      throw new Error(
+        `Selected plugin bundle is incompatible (${incompatibility}): ${pluginId}`,
+      );
+    }
+    for (const [item, prepared] of groupPrepared) {
+      preparedByPath.set(item.path, prepared);
+    }
+    this.diag?.log("execute", "selected plugin bundle preflight passed", {
+      schemaVersion: 1,
+      files: items.length,
+      hasStyles: remoteByPath.has(`${root}/styles.css`),
+    });
+    return { terminated: null };
   }
 
   /** Validate selected plugin upload sources and prevent remote downgrades. */
@@ -6465,7 +6846,7 @@ export class SyncExecutor {
     expected: LocalFileEntry | undefined,
     downloaded: { size: number; hash: string },
   ): Promise<{ size: number; mtime?: number } | null> {
-    const recoveryPath = `${targetPath}.easy-sync-recovery`;
+    const recoveryPath = `${targetPath}${EASY_SYNC_RECOVERY_SUFFIX}`;
     const existing = await adapter.stat(targetPath);
     let originalBytes: ArrayBuffer | null = null;
     if (expected) {
@@ -6605,6 +6986,5587 @@ export class SyncExecutor {
    * @param callbacks  UI callbacks for progress and confirmations
    * @param skipConfirmation  skip threshold/first-sync checks (user confirmed from sidebar)
    */
+  /** Step 1: scan local files, then clear orphaned recovery copies the scan
+   *  collected (Step 0 already reconciled every copy with an intent).
+   *  Returns the terminated result when the round must stop, otherwise the
+   *  scan outputs consumed by later steps. */
+  private async runStep1ScanLocalFiles(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    callbacks: SyncCallbacks;
+    enterPhase: (nextPhase: SyncRunPhase) => void;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        localEntries: LocalFileEntry[];
+        localFolders: LocalFolderEntry[];
+        localFolderScanComplete: boolean;
+        skippedLarge: string[];
+        folderScanFailures: string[];
+      }
+  > {
+    const { result, operationEpoch, callbacks, enterPhase } = args;
+    enterPhase("scan");
+    this.progressStore?.setPhase("scanning");
+    callbacks.onProgress?.(0, 1, this.t("progress.scanningLocal"));
+    const scanResult = await this.scanner.scanAll();
+    const { skippedLarge, failedPaths } = scanResult;
+    const localEntries = scanResult.entries;
+    const localFolders = scanResult.folders ?? [];
+    const localFolderScanComplete = scanResult.folderScanComplete === true;
+    result.skippedLarge = skippedLarge.length;
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    if (scanResult.complete === false || failedPaths.length > 0) {
+      result.errors = Math.max(1, new Set(failedPaths).size);
+      result.message = this.t("result.scanIncomplete");
+      this.diag?.warn(
+        "scan",
+        `scan incomplete — stopping round before remote preparation; ${result.errors} path(s) uncertain: ${failedPaths.slice(0, 5).join(", ")}`,
+      );
+      return { terminated: result };
+    }
+    // Step 1b: clear orphaned recovery copies collected during the scan.
+    // Step 0 already reconciled every copy with an intent; anything still
+    // present here is an orphan whose transaction completed (the intent was
+    // deleted before its copy cleanup finished). Removing those copies is
+    // safe: the target was verified present at completion, so the copy is
+    // only the replaced old version.
+    if ((scanResult.recoveryCopies?.length ?? 0) > 0) {
+      const orphanSummary = await this.getRecoveryJournal().cleanupOrphanCopies(
+        scanResult.recoveryCopies ?? [],
+      );
+      this.diag?.log(
+        "execute",
+        `orphaned recovery copies cleaned — ${orphanSummary.removed} removed, ${orphanSummary.retained} retained${orphanSummary.removedPaths.length > 0 ? `: ${orphanSummary.removedPaths.join(", ")}` : ""}`,
+        { mutations: 0 },
+      );
+    }
+    return {
+      terminated: null,
+      localEntries,
+      localFolders,
+      localFolderScanComplete,
+      skippedLarge,
+      folderScanFailures: scanResult.folderScanFailures,
+    };
+  }
+
+  /** Step 2: load a non-authoritative cloud recovery hint when the local
+   *  base still needs reconstruction. Returns the terminated result when the
+   *  round must stop, otherwise the baseline-hint outputs consumed by later
+   *  steps. */
+  private async runStep2LoadCloudRecoveryHint(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    callbacks: SyncCallbacks;
+    enterPhase: (nextPhase: SyncRunPhase) => void;
+    prepareV2MigrationCandidate: boolean;
+    public113MigrationInput: Awaited<
+      ReturnType<StateManager["readPublic113MigrationInput"]>
+    > | null;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        cloudBootstrapV2Json: string | null;
+        cloudBaselineJson: string | null;
+        baselineReconstructionIncomplete: boolean;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      callbacks,
+      enterPhase,
+      prepareV2MigrationCandidate,
+      public113MigrationInput,
+    } = args;
+    // The legacy baseline is a read-only public-1.1.3 migration input only;
+    // once V2 is authoritative it must never re-enter runtime planning as a
+    // fallback.
+    enterPhase("baseline");
+    this.progressStore?.setPhase("baseline");
+    callbacks.onProgress?.(0, 1, this.t("progress.loadingBaseline"));
+    // Capture this before cloud-baseline hints are projected into the
+    // planning base. A reset may seed only some paths; those hints must not
+    // make the remaining paths look like an established vault.
+    const startedWithoutCommittedBase = (
+      public113MigrationInput?.baseEntries
+      ?? this.state.baseSnapshot
+    ).length === 0;
+    // A prior interrupted/partial reset run may already have persisted some
+    // exact-content bases. lastSyncTime stays zero until the reconstruction
+    // reaches a fully healthy round, so keep lifting the verification cap.
+    const baselineReconstructionIncomplete = startedWithoutCommittedBase
+      || this.state.lastSyncTime === 0;
+    // A public-1.1.3 device can join after another device has already
+    // committed V2 authority. Its local V1 base may be only partially
+    // reconstructed even though the shared V2 bootstrap now carries exact,
+    // version-bound content evidence for the remaining paths. Read that
+    // non-authoritative hint during migration preparation as well; the
+    // existing verifier still accepts each path only when the current
+    // remote identity/version and the freshly scanned local SHA-256 agree.
+    const shouldReadCloudBootstrapV2 = startedWithoutCommittedBase
+      || (
+        prepareV2MigrationCandidate
+        && baselineReconstructionIncomplete
+      );
+    let cloudBootstrapV2Json: string | null = null;
+    let cloudBaselineJson: string | null = null;
+    if (shouldReadCloudBootstrapV2) {
+      const cloudBootstrapClient = this.onedrive as OneDriveClient & {
+        readCloudBootstrapV2?: OneDriveClient["readCloudBootstrapV2"];
+      };
+      if (typeof cloudBootstrapClient.readCloudBootstrapV2 === "function") {
+        try {
+          cloudBootstrapV2Json = (
+            await this.readCloudBootstrapV2WithRetry(
+              cloudBootstrapClient,
+              this.vaultName,
+            )
+          )?.content ?? null;
+        } catch (error) {
+          this.diag?.warn(
+            "state",
+            this.state.isV2StateActive
+              ? "V2 cloud bootstrap read failed; legacy baseline fallback is disabled after V2 authority"
+              : startedWithoutCommittedBase
+                ? "V2 cloud bootstrap read failed; falling back to public-1.1.3 legacy baseline"
+                : "V2 cloud bootstrap read failed; continuing with exact public-1.1.3 content verification",
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+      }
+      if (
+        startedWithoutCommittedBase
+        && !cloudBootstrapV2Json
+        && !this.state.isV2StateActive
+      ) {
+        cloudBaselineJson = await this.downloadLegacyCloudBaseline();
+      }
+    }
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    return {
+      terminated: null,
+      cloudBootstrapV2Json,
+      cloudBaselineJson,
+      baselineReconstructionIncomplete,
+    };
+  }
+
+  /** Step 3: get the remote file list (delta or full scan), run the
+   *  per-round shared-protocol gate, and accept prepared scope expansions.
+   *  Returns the terminated result when the round must stop, otherwise the
+   *  remote-side outputs consumed by later steps. */
+  private async runStep3GetRemoteFileList(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    callbacks: SyncCallbacks;
+    enterPhase: (nextPhase: SyncRunPhase) => void;
+    mode: SyncMode;
+    options: SyncRunOptions;
+    syncScope: SyncScope;
+    localEntries: LocalFileEntry[];
+    localFolders: LocalFolderEntry[];
+    localFolderScanComplete: boolean;
+    skipConfirmation: boolean;
+    reviewedAuthorization: PlanReviewAuthorization | undefined;
+    prepareV2MigrationCandidate: boolean;
+    public113MigrationInput: Awaited<
+      ReturnType<StateManager["readPublic113MigrationInput"]>
+    > | null;
+    forceCompleteRemoteIdentitySnapshot: boolean;
+    perRoundProtocolGate: boolean;
+    perRoundProtocolBinding: SharedSyncProtocolBinding | null;
+    prestartedProtocolObservation:
+      | Promise<SharedSyncProtocolObservationSettled>
+      | null;
+    restoredCommittedScopeFromDeltaCache: boolean;
+    committedScope: StateManager["remoteScope"];
+    scopeExpansionPreparation:
+      | Awaited<ReturnType<StateManager["prepareSyncScopeExpansion"]>>
+      | { status: "none" };
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    communityPluginSyncPolicy: ReturnType<typeof cloneCommunityPluginSyncPolicy>;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        remoteEntries: RemoteFileEntry[];
+        syncScope: SyncScope;
+        migrationSourceRemoteEntries: RemoteFileEntry[];
+        migrationRemoteItems: DriveItem[] | null;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      callbacks,
+      enterPhase,
+      mode,
+      options,
+      localEntries,
+      localFolders,
+      localFolderScanComplete,
+      skipConfirmation,
+      reviewedAuthorization,
+      prepareV2MigrationCandidate,
+      public113MigrationInput,
+      forceCompleteRemoteIdentitySnapshot,
+      perRoundProtocolGate,
+      perRoundProtocolBinding,
+      prestartedProtocolObservation,
+      restoredCommittedScopeFromDeltaCache,
+      committedScope,
+      scopeExpansionPreparation,
+      automaticHandlingPolicy,
+      communityPluginSyncPolicy,
+    } = args;
+    let { syncScope } = args;
+    enterPhase("remoteChanges");
+    this.progressStore?.setPhase("checking");
+    callbacks.onProgress?.(0, 1, this.t("progress.checkingRemote"));
+    const migrationSourceRemoteEntries = prepareV2MigrationCandidate
+      ? public113MigrationInput!.remoteEntries.map((entry) => ({ ...entry }))
+      : [];
+    let remotePreparation: { entries: RemoteFileEntry[]; scope: SyncScope };
+    try {
+      remotePreparation = await this.tryDeltaOrFullScan(
+        operationEpoch,
+        result,
+        syncScope,
+        localEntries,
+        forceCompleteRemoteIdentitySnapshot,
+        !prepareV2MigrationCandidate,
+        (
+          this.state.isV2StateActive
+          && skipConfirmation
+          && this.state.planReviewActive
+        )
+          ? reviewedAuthorization?.canonicalIdentity?.sourceCommitSeq
+          : undefined,
+      );
+    } catch (error) {
+      if (error instanceof V2CommittedScopeUnreachableError) {
+        await this.stageV2CommittedScopeRecovery(result, error);
+        return { terminated: result };
+      }
+      if (this.isRetryableOrdinaryRemoteReadFailure(error, result)) {
+        result.errors = Math.max(1, result.errors);
+        result.message = this.t("result.remoteReadUnavailable");
+        result.disposition = {
+          kind: "retryable-observation",
+          phase: "remotePrepare",
+          code: "ordinary-remote-read-unavailable",
+          retry: "next-sync",
+          component: "ordinary-remote",
+        };
+        this.diag?.warn(
+          "execute",
+          "ordinary remote read unavailable before ordinary planning; the next normal sync will observe again",
+          {
+            ordinaryPlanning: result.runFacts?.ordinaryPlanning ?? "unknown",
+            retry: "next-sync",
+          },
+        );
+        return { terminated: result };
+      }
+      throw error;
+    }
+    const remoteEntries = remotePreparation.entries;
+    syncScope = remotePreparation.scope;
+    this.activeSyncScope = syncScope;
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    const migrationRemoteItems = this.completeRemoteItems;
+
+    if (this.state.remoteGeneration !== this.startGeneration) {
+      result.message = this.t("result.generationMismatch");
+      this.diag?.warn("execute", `generation mismatch after delta scan (${this.startGeneration} → ${this.state.remoteGeneration}), aborting`);
+      return { terminated: result };
+    }
+    const protocolGate = await this.ensurePerRoundSharedProtocolGateReady({
+      result,
+      operationEpoch,
+      callbacks,
+      enterPhase,
+      mode,
+      syncScope,
+      perRoundProtocolGate,
+      perRoundProtocolBinding,
+      prestartedProtocolObservation,
+      restoredCommittedScopeFromDeltaCache,
+      committedScope,
+      automaticHandlingPolicy,
+      communityPluginSyncPolicy,
+    });
+    if (protocolGate.terminated) return protocolGate;
+    await this.acceptPreparedSyncScopeExpansion({
+      options,
+      remoteEntries,
+      syncScope,
+      localEntries,
+      localFolders,
+      localFolderScanComplete,
+      scopeExpansionPreparation,
+    });
+    return {
+      terminated: null,
+      remoteEntries,
+      syncScope,
+      migrationSourceRemoteEntries,
+      migrationRemoteItems,
+    };
+  }
+
+  /** Per-round shared-protocol gate of runStep3GetRemoteFileList — moved
+   *  verbatim; an exit that leaves the gate returns the terminated round. */
+  private async ensurePerRoundSharedProtocolGateReady(args: EnsurePerRoundSharedProtocolGateReadyArgs): Promise<EnsurePerRoundSharedProtocolGateReadyOutcome> {
+    const {
+      result, operationEpoch, callbacks, enterPhase,
+      mode, syncScope, perRoundProtocolGate, perRoundProtocolBinding,
+      prestartedProtocolObservation, restoredCommittedScopeFromDeltaCache,
+      committedScope, automaticHandlingPolicy, communityPluginSyncPolicy,
+    } = args;
+    if (perRoundProtocolGate) {
+      const expectedBinding = perRoundProtocolBinding;
+      let protocol = expectedBinding
+        ? await this.ensureScopeFreeSharedProtocol(
+            expectedBinding,
+            syncScope,
+            prestartedProtocolObservation ?? undefined,
+          )
+        : { status: "blocked" as const, reason: "binding-missing" };
+      if (
+        protocol.status === "blocked"
+        && protocol.reason === "control-directory-not-found"
+        && restoredCommittedScopeFromDeltaCache
+        && committedScope
+        && typeof this.onedrive.restoreVaultScopeByIdentity === "function"
+      ) {
+        try {
+          const restored = await this.onedrive.restoreVaultScopeByIdentity(
+            this.vaultName,
+            {
+              driveId: committedScope.driveId,
+              vaultFolderId: committedScope.vaultFolderId,
+              filesRootId: committedScope.filesRootId,
+            },
+          );
+          if (
+            restored.driveId !== committedScope.driveId
+            || restored.vaultFolderId !== committedScope.vaultFolderId
+            || restored.filesRootId !== committedScope.filesRootId
+          ) {
+            throw new RemoteVaultScopeIdentityError("scope-incomplete");
+          }
+        } catch (error) {
+          const scopeLoss = await this.resolveV2CommittedScopeLoss(
+            committedScope,
+            error,
+          );
+          await this.stageV2CommittedScopeRecovery(result, scopeLoss);
+          if (mode === "auto") return { terminated: result };
+          const recoveryResult = await this.runV2RemoteScopeRecovery({
+            result,
+            callbacks,
+            operationEpoch,
+            automaticHandlingPolicy,
+            communityPluginSyncPolicy,
+            enterPhase,
+          });
+          if (recoveryResult) return { terminated: recoveryResult };
+          result.deferred = 0;
+          result.message = "";
+          // The retry must start a fresh observation (the prestarted one
+          // already settled as control-directory-not-found).
+          protocol = expectedBinding
+            ? await this.ensureScopeFreeSharedProtocol(
+                expectedBinding,
+                syncScope,
+              )
+            : { status: "blocked" as const, reason: "binding-missing" };
+        }
+      }
+      if (protocol.status !== "ready") {
+        if (protocol.status === "unavailable") {
+          return {
+            terminated: this.finishRetryableSharedControlObservation(
+              result,
+              protocol,
+              operationEpoch,
+            ),
+          };
+        }
+        result.errors = 1;
+        result.message = this.t("result.v2ProtocolBlocked");
+        if (protocol.evidence) {
+          this.diag?.error(
+            "state",
+            SHARED_SYNC_PROTOCOL_PROFILE_DIAGNOSTIC_EVENT,
+            protocol.evidence,
+          );
+        }
+        this.diag?.error(
+          "state",
+          "active V2 shared protocol profile could not converge safely",
+          { reason: protocol.reason, mutations: 0 },
+        );
+        return { terminated: result };
+      }
+      if (expectedBinding && protocol.binding !== expectedBinding) {
+        if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+        try {
+          await this.state.upgradeActiveV2ProtocolBinding({
+            expectedBinding,
+            nextBinding: protocol.binding,
+          });
+        } catch (error) {
+          result.errors = 1;
+          result.message = this.t("result.v2ProtocolBlocked");
+          this.diag?.error(
+            "state",
+            "active V2 shared protocol binding changed before adjacent migration committed",
+            error instanceof Error ? error.message : String(error),
+          );
+          return { terminated: result };
+        }
+      }
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    }
+    return { terminated: null };
+  }
+
+  /** Source-bound acceptance of a prepared sync-scope expansion from
+   *  runStep3GetRemoteFileList — moved verbatim; the pass produces no
+   *  output of its own. */
+  private async acceptPreparedSyncScopeExpansion(args: AcceptPreparedSyncScopeExpansionArgs): Promise<void> {
+    const {
+      options, remoteEntries, syncScope, localEntries,
+      localFolders, localFolderScanComplete, scopeExpansionPreparation,
+    } = args;
+    if (scopeExpansionPreparation.status === "ready") {
+      const sourceBoundCommunityPluginJoinRoots = [
+        ...(options.communityPluginJoinAuthorizations ?? []),
+      ].flatMap((authorization) => {
+        if (
+          validateCommunityPluginJoinAuthorization(
+            authorization,
+            remoteEntries,
+            syncScope,
+          ).status !== "valid"
+        ) return [];
+        const firstMemberPath = authorization.members[0]?.path ?? "";
+        const pluginRoot = firstMemberPath.slice(
+          0,
+          firstMemberPath.lastIndexOf("/"),
+        );
+        const remoteRoot = this.state.remoteFolders.find(
+          (folder) => folder.path === pluginRoot,
+        );
+        if (
+          !pluginRoot
+          || !remoteRoot
+          || authorization.members.some((member) =>
+            member.path.slice(0, member.path.lastIndexOf("/")) !== pluginRoot
+          )
+          || authorization.members.some((member) =>
+            member.parentId !== remoteRoot.driveId
+          )
+          || localFolders.some((folder) => folder.path === pluginRoot)
+        ) return [];
+        return [{ path: pluginRoot, remoteId: remoteRoot.driveId }];
+      });
+      const accepted = await this.state.acceptSyncScopeExpansionFolders({
+        expectedRevision: scopeExpansionPreparation.revision,
+        scope: syncScope,
+        localFiles: localEntries,
+        localFolders,
+        localFolderScanComplete,
+        remoteIdentityComplete:
+          this.completeRemoteItems !== null
+          && this.state.hasCompleteRemoteFolderIndex,
+        sourceBoundCommunityPluginJoinRoots,
+      });
+      if (accepted.status === "accepted") {
+        this.diag?.log(
+          "state",
+          "device-local sync scope expansion completed source-bound remote identity preparation",
+          {
+            revision: scopeExpansionPreparation.revision,
+            accepted: accepted.accepted,
+            mutations: 0,
+          },
+        );
+      } else {
+        this.diag?.warn(
+          "state",
+          accepted.status === "stale"
+            ? "device-local sync scope expansion authorization became stale; ordinary folder safety remains active"
+            : "device-local sync scope expansion could not be accepted from complete current facts",
+          {
+            revision: scopeExpansionPreparation.revision,
+            status: accepted.status,
+            mutations: 0,
+          },
+        );
+      }
+    }
+  }
+
+  /** Step 4: load the base snapshot and project non-authoritative cloud
+   *  baseline hints (V2 bootstrap seeds, legacy cloud baseline) into it.
+   *  Returns the terminated result when the round must stop, otherwise the
+   *  base entries consumed by planning. */
+  private async runStep4LoadBaseSnapshot(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    syncScope: SyncScope;
+    localEntries: LocalFileEntry[];
+    remoteEntries: RemoteFileEntry[];
+    cloudBootstrapV2Json: string | null;
+    cloudBaselineJson: string | null;
+    public113MigrationInput: Awaited<
+      ReturnType<StateManager["readPublic113MigrationInput"]>
+    > | null;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        baseEntries: BaseFileEntry[];
+        seededBaseEntries: BaseFileEntry[];
+        seededBaseEntriesPersisted: boolean;
+        cloudBaselineJson: string | null;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      syncScope,
+      localEntries,
+      remoteEntries,
+      cloudBootstrapV2Json,
+      public113MigrationInput,
+    } = args;
+    let cloudBaselineJson = args.cloudBaselineJson;
+    let baseEntries = (
+      public113MigrationInput?.baseEntries
+      ?? this.state.baseSnapshot
+    ).filter(
+      (entry) => this.shouldIncludeRemotePath(entry.path),
+    );
+    let seededBaseEntries: BaseFileEntry[] = [];
+    let seededBaseEntriesPersisted = false;
+    if (cloudBootstrapV2Json) {
+      const bootstrapSeeds = this.seedBaseEntriesFromCloudBootstrapV2(
+        cloudBootstrapV2Json,
+        syncScope,
+        localEntries,
+        remoteEntries,
+      );
+      if (bootstrapSeeds.length > 0) {
+        // CloudBootstrapV2 is a non-authoritative hint. It may fill only
+        // paths that public 1.1.3 has not anchored yet; an existing V1 base
+        // remains the migration source even when the cloud hint describes a
+        // newer exact common version.
+        const existingPathKeys = new Set(
+          baseEntries.map((entry) => normalizeRemotePathKey(entry.path)),
+        );
+        seededBaseEntries = bootstrapSeeds.filter((entry) =>
+          !existingPathKeys.has(normalizeRemotePathKey(entry.path)),
+        );
+        if (seededBaseEntries.length > 0) {
+          baseEntries = [...baseEntries, ...seededBaseEntries];
+          this.diag?.log(
+            "state",
+            `V2 cloud bootstrap seeded ${seededBaseEntries.length} previously unanchored version-bound path(s)`,
+          );
+        }
+      } else if (baseEntries.length === 0) {
+        this.diag?.warn(
+          "state",
+          "V2 cloud bootstrap had no currently verifiable shared paths",
+        );
+        if (!this.state.isV2StateActive) {
+          cloudBaselineJson = await this.downloadLegacyCloudBaseline();
+        }
+      }
+    }
+    if (baseEntries.length === 0 && cloudBaselineJson) {
+      seededBaseEntries = this.seedBaseEntriesFromCloudBaseline(
+        cloudBaselineJson,
+        localEntries,
+        remoteEntries,
+      );
+      if (seededBaseEntries.length > 0) {
+        baseEntries = seededBaseEntries;
+        this.diag?.log("state", `cloud baseline seeded ${seededBaseEntries.length} shared path(s)`);
+      } else {
+        this.diag?.log("state", "cloud baseline loaded, but no shared paths eligible");
+      }
+    }
+    if (
+      this.state.isV2StateActive
+      && seededBaseEntries.length > 0
+    ) {
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      await this.persistSeededBaseEntries(seededBaseEntries);
+      seededBaseEntriesPersisted = true;
+    }
+    return {
+      terminated: null,
+      baseEntries,
+      seededBaseEntries,
+      seededBaseEntriesPersisted,
+      cloudBaselineJson,
+    };
+  }
+
+  /** Step 4 (cont.): reconcile unchanged remote eTags into the local base —
+   *  a read-only hint projection for the migration candidate, a persisted
+   *  base update otherwise. */
+  private async runStep4ReconcileBaseETags(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    remoteEntries: RemoteFileEntry[];
+    prepareV2MigrationCandidate: boolean;
+    baseEntries: BaseFileEntry[];
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        baseEntries: BaseFileEntry[];
+        eTagUpdates: BaseFileEntry[];
+      }
+  > {
+    const { result, operationEpoch, remoteEntries, prepareV2MigrationCandidate } = args;
+    let baseEntries = args.baseEntries;
+    const remoteByPath = new Map(remoteEntries.map((entry) => [entry.path, entry]));
+    const eTagUpdates = baseEntries.flatMap((base) => {
+      const remote = remoteByPath.get(base.path);
+      if (!remote || remote.eTag === base.eTag || !remoteContentMatchesBase(remote, base)) {
+        return [];
+      }
+      return [{ ...base, eTag: remote.eTag }];
+    });
+    if (eTagUpdates.length > 0) {
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      if (!prepareV2MigrationCandidate) {
+        await this.state.upsertBaseEntries(eTagUpdates);
+      }
+      const updatedByPath = new Map(eTagUpdates.map((entry) => [entry.path, entry]));
+      baseEntries = baseEntries.map((entry) => updatedByPath.get(entry.path) ?? entry);
+      this.diag?.log(
+        "state",
+        prepareV2MigrationCandidate
+          ? `projected ${eTagUpdates.length} unchanged remote eTag(s) into the read-only migration candidate`
+          : `reconciled ${eTagUpdates.length} unchanged remote eTag(s)`,
+      );
+    }
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    return { terminated: null, baseEntries, eTagUpdates };
+  }
+
+  /** Step 4 (cont.): prepare community-plugin join/identity evidence, detect
+   *  device-local ignores, and project the resulting policy onto the scanned
+   *  entry sets. Returns the terminated result when the round must stop,
+   *  otherwise the policy-filtered entries plus the post-authority publisher
+   *  consumed by later steps. */
+  private async runStep4PrepareCommunityPluginPlanInputs(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    options: SyncRunOptions;
+    prepareV2MigrationCandidate: boolean;
+    communityPluginSyncPolicy: ReturnType<typeof cloneCommunityPluginSyncPolicy>;
+    localEntries: LocalFileEntry[];
+    remoteEntries: RemoteFileEntry[];
+    baseEntries: BaseFileEntry[];
+    syncScope: SyncScope;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        communityPluginSyncPolicy: ReturnType<typeof cloneCommunityPluginSyncPolicy>;
+        localEntries: LocalFileEntry[];
+        remoteEntries: RemoteFileEntry[];
+        baseEntries: BaseFileEntry[];
+        joinAuthorizationsByPluginId: Map<
+          string,
+          Readonly<CommunityPluginJoinAuthorization>
+        >;
+        publishCommunityPluginPostAuthorityState: () => Promise<void>;
+        configDir: string;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      options,
+      prepareV2MigrationCandidate,
+      localEntries: scannedLocalEntries,
+      remoteEntries: scannedRemoteEntries,
+      baseEntries: scannedBaseEntries,
+      syncScope,
+    } = args;
+    let communityPluginSyncPolicy = args.communityPluginSyncPolicy;
+    let localEntries = scannedLocalEntries;
+    let remoteEntries = scannedRemoteEntries;
+    let baseEntries = scannedBaseEntries;
+    const configDir = getConfigDir(this.scanner.vault);
+    const communityPluginJoinBlocks: CommunityPluginJoinBlock[] = [];
+    const joinAuthorizationsByPluginId = new Map(
+      (options.communityPluginJoinAuthorizations ?? []).map(
+        (authorization) => [authorization.pluginId, authorization],
+      ),
+    );
+    const recordCommunityPluginJoinBlocks = (
+      blocks: readonly Readonly<CommunityPluginJoinBlock>[],
+    ): void => {
+      const known = new Set(
+        communityPluginJoinBlocks.map((item) => item.pluginId),
+      );
+      const added = blocks.filter((item) => !known.has(item.pluginId));
+      if (added.length === 0) return;
+      communityPluginJoinBlocks.push(...added.map((item) => ({ ...item })));
+      communityPluginSyncPolicy = excludeSelectedCommunityPluginFiles(
+        communityPluginSyncPolicy,
+        added.map((item) => item.pluginId),
+      );
+      result.communityPluginJoinBlocks = communityPluginJoinBlocks.map(
+        (item) => ({ ...item }),
+      );
+      // Deterministic blocks (manifest-incompatible, e.g. a desktop-only
+      // plugin on mobile) never transfer a file — they recheck on the timed
+      // loop and surface on the plugin row with their own status. Counting
+      // them as file deferrals makes every round look "partially completed"
+      // with a misleading "changed again before transfer" message forever.
+      result.deferred += added.filter(
+        (item) => !isCommunityPluginJoinBlockDeterministic(item.reason),
+      ).length;
+    };
+    const identityBlocks: CommunityPluginJoinBlock[] = [];
+    for (const authorization of
+      options.communityPluginJoinAuthorizations ?? []) {
+      const validation = validateCommunityPluginJoinAuthorization(
+        authorization,
+        remoteEntries,
+        syncScope,
+      );
+      if (validation.status === "valid") continue;
+      identityBlocks.push({
+        pluginId: authorization.pluginId,
+        operationId: authorization.operationId,
+        reason: validation.reason,
+      });
+    }
+    recordCommunityPluginJoinBlocks(identityBlocks);
+    for (const block of identityBlocks) {
+      joinAuthorizationsByPluginId.delete(block.pluginId);
+    }
+    if (identityBlocks.length > 0) {
+      this.diag?.warn(
+        "plan",
+        "community plugin join target changed; affected bundles stopped before mutation",
+        {
+          count: identityBlocks.length,
+          reasons: identityBlocks.map((item) => item.reason),
+          mutations: 0,
+        },
+      );
+    }
+    const detectedCommunityPluginLocalIgnores: CommunityPluginLocalIgnores =
+      prepareV2MigrationCandidate
+        ? detectCommunityPluginLocalIgnores({
+            policy: communityPluginSyncPolicy,
+            configDir,
+            localEntries,
+            remoteEntries,
+            baseEntries,
+          })
+        : {
+            files: [],
+            data: detectCommunityPluginDataLocalIgnores({
+              policy: communityPluginSyncPolicy,
+              configDir,
+              localEntries,
+              remoteEntries,
+              baseEntries,
+            }),
+          };
+    const hasDetectedCommunityPluginLocalIgnores =
+      detectedCommunityPluginLocalIgnores.files.length > 0
+      || detectedCommunityPluginLocalIgnores.data.length > 0;
+    if (hasDetectedCommunityPluginLocalIgnores) {
+      communityPluginSyncPolicy = applyCommunityPluginLocalIgnores(
+        communityPluginSyncPolicy,
+        detectedCommunityPluginLocalIgnores,
+      );
+      if (!prepareV2MigrationCandidate) {
+        result.communityPluginLocalIgnores =
+          detectedCommunityPluginLocalIgnores;
+      }
+      this.diag?.log(
+        "plan",
+        prepareV2MigrationCandidate
+          ? "public community plugin absence projected into migration candidate"
+          : "community plugin data absence converted to device-local ignore",
+        {
+          schemaVersion: 1,
+          files: detectedCommunityPluginLocalIgnores.files.length,
+          data: detectedCommunityPluginLocalIgnores.data.length,
+          mutations: 0,
+        },
+      );
+    }
+    const communityPluginManifestEvidence =
+      await this.prepareCommunityPluginManifestEvidence({
+        policy: communityPluginSyncPolicy,
+        configDir,
+        localEntries,
+        remoteEntries,
+        scope: syncScope,
+        result,
+        operationEpoch,
+        joiningPluginIds: [...joinAuthorizationsByPluginId.keys()],
+      });
+    await this.prepareCommunityPluginBundleIdentities({
+      policy: communityPluginSyncPolicy,
+      configDir,
+      localEntries,
+      remoteEntries,
+      manifestObservations: communityPluginManifestEvidence.observations,
+    });
+    const manifestCompatibilityBlocks =
+      communityPluginManifestEvidence.incompatiblePluginIds.flatMap(
+        (pluginId): CommunityPluginJoinBlock[] => {
+          const authorization = joinAuthorizationsByPluginId.get(pluginId);
+          return authorization
+            ? [{
+                pluginId,
+                operationId: authorization.operationId,
+                reason: "manifest-incompatible",
+              }]
+            : [];
+        },
+      );
+    recordCommunityPluginJoinBlocks(manifestCompatibilityBlocks);
+    for (const block of manifestCompatibilityBlocks) {
+      joinAuthorizationsByPluginId.delete(block.pluginId);
+    }
+    if (manifestCompatibilityBlocks.length > 0) {
+      this.diag?.warn(
+        "plan",
+        "community plugin join manifest is incompatible; affected bundles stopped before mutation",
+        {
+          count: manifestCompatibilityBlocks.length,
+          mutations: 0,
+        },
+      );
+    }
+    let communityPluginManifestObservationsPersisted = false;
+    const publishCommunityPluginPostAuthorityState = async (): Promise<void> => {
+      if (!communityPluginManifestObservationsPersisted) {
+        await this.persistCommunityPluginManifestObservations(
+          communityPluginManifestEvidence.observations,
+        );
+        communityPluginManifestObservationsPersisted = true;
+      }
+      if (hasDetectedCommunityPluginLocalIgnores) {
+        result.communityPluginLocalIgnores =
+          detectedCommunityPluginLocalIgnores;
+      }
+    };
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    if (
+      this.state.isV2StateActive
+      && !prepareV2MigrationCandidate
+    ) {
+      await publishCommunityPluginPostAuthorityState();
+    }
+    const mobileDesktopOnlyPluginIds =
+      communityPluginManifestEvidence.desktopOnlyPluginIds;
+    if (mobileDesktopOnlyPluginIds.length > 0) {
+      communityPluginSyncPolicy = prepareV2MigrationCandidate
+        ? applyCommunityPluginLocalIgnores(
+            communityPluginSyncPolicy,
+            {
+              files: mobileDesktopOnlyPluginIds,
+              data: [],
+            },
+          )
+        : excludeSelectedCommunityPluginFiles(
+            communityPluginSyncPolicy,
+            mobileDesktopOnlyPluginIds,
+          );
+      this.diag?.log(
+        "plan",
+        "desktop-only community plugin bundles excluded from mobile participation",
+        {
+          schemaVersion: 1,
+          count: mobileDesktopOnlyPluginIds.length,
+          mutations: 0,
+        },
+      );
+    }
+
+    localEntries = localEntries.filter((entry) =>
+      isCommunityPluginPathSelectedByPolicy(
+        entry.path,
+        communityPluginSyncPolicy,
+        configDir,
+      )
+    );
+    remoteEntries = remoteEntries.filter((entry) =>
+      isCommunityPluginPathSelectedByPolicy(
+        entry.path,
+        communityPluginSyncPolicy,
+        configDir,
+      )
+    );
+    baseEntries = baseEntries.filter((entry) =>
+      isCommunityPluginPathSelectedByPolicy(
+        entry.path,
+        communityPluginSyncPolicy,
+        configDir,
+      )
+    );
+    return {
+      terminated: null,
+      communityPluginSyncPolicy,
+      localEntries,
+      remoteEntries,
+      baseEntries,
+      joinAuthorizationsByPluginId,
+      publishCommunityPluginPostAuthorityState,
+      configDir,
+    };
+  }
+
+  /** Step 5 (migration path): build the V2 migration candidate envelope from
+   *  the public-1.1.3 migration input plus the seeded/eTag-projected base,
+   *  and prepare the source-bound IndexedDB planner state. Returns the
+   *  terminated result when the round must stop, otherwise the candidate
+   *  outputs consumed by the canonical planning branches. */
+  private async runStep5PrepareMigrationCandidate(args: {
+    result: SyncResult;
+    prepareV2MigrationCandidate: boolean;
+    migrationRemoteItems: DriveItem[] | null;
+    public113MigrationInput: Awaited<
+      ReturnType<StateManager["readPublic113MigrationInput"]>
+    > | null;
+    communityPluginSyncPolicy: ReturnType<typeof cloneCommunityPluginSyncPolicy>;
+    configDir: string;
+    seededBaseEntries: BaseFileEntry[];
+    eTagUpdates: BaseFileEntry[];
+    attemptV2Activation: boolean;
+    syncScope: SyncScope;
+    localFolderScanComplete: boolean;
+    planningLocalEntries: LocalFileEntry[];
+    localFolders: LocalFolderEntry[];
+    migrationSourceRemoteEntries: RemoteFileEntry[];
+    folderScanFailures: string[];
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
+        migrationPlannerState: CanonicalPlannerStateV2 | null;
+      }
+  > {
+    const {
+      result,
+      prepareV2MigrationCandidate,
+      migrationRemoteItems,
+      public113MigrationInput,
+      communityPluginSyncPolicy,
+      configDir,
+      seededBaseEntries,
+      eTagUpdates,
+      attemptV2Activation,
+      syncScope,
+      localFolderScanComplete,
+      planningLocalEntries,
+      localFolders,
+      migrationSourceRemoteEntries,
+      folderScanFailures,
+    } = args;
+    if (!prepareV2MigrationCandidate) {
+      return {
+        terminated: null,
+        migrationCandidateEnvelope: null,
+        migrationPlannerState: null,
+      };
+    }
+    let migrationPlannerState: CanonicalPlannerStateV2 | null = null;
+    if (!migrationRemoteItems) {
+      result.message = this.t("result.cloudRecordIncomplete");
+      this.diag?.warn(
+        "state",
+        "V2 migration candidate requires a complete remote identity snapshot",
+        { mutations: 0 },
+      );
+      return { terminated: result };
+    }
+    const migrationBaseByPath = new Map(
+      public113MigrationInput!.baseEntries
+        .filter((entry) => isCommunityPluginPathSelectedByPolicy(
+          entry.path,
+          communityPluginSyncPolicy,
+          configDir,
+        ))
+        .map((entry) => [entry.path, { ...entry }]),
+    );
+    for (const entry of seededBaseEntries) {
+      if (isCommunityPluginPathSelectedByPolicy(
+        entry.path,
+        communityPluginSyncPolicy,
+        configDir,
+      )) {
+        migrationBaseByPath.set(entry.path, { ...entry });
+      }
+    }
+    for (const entry of eTagUpdates) {
+      if (isCommunityPluginPathSelectedByPolicy(
+        entry.path,
+        communityPluginSyncPolicy,
+        configDir,
+      )) {
+        migrationBaseByPath.set(entry.path, { ...entry });
+      }
+    }
+    const ancestorPreparation = attemptV2Activation
+      ? await this.state.preparePublic113MigrationAncestors(
+          public113MigrationInput!,
+        )
+      : null;
+    if (ancestorPreparation) {
+      this.diag?.log(
+        "state",
+        "public 1.1.3 base-content prepared for V2 ancestors",
+        {
+          sourceEntries: ancestorPreparation.sourceEntries,
+          published: ancestorPreparation.published,
+          rejected: ancestorPreparation.rejected,
+          unavailable: ancestorPreparation.unavailable,
+          mutations: 0,
+        },
+      );
+    }
+    const preparedMigration = buildStateV2MigrationCandidate({
+      scope: syncScope,
+      lifecycleEpoch: this.state.remoteGeneration,
+      localScanComplete: true,
+      remoteScanComplete: true,
+      folderScanComplete: localFolderScanComplete,
+      localEntries: planningLocalEntries,
+      localFolders,
+      remoteItems: migrationRemoteItems,
+      v1Base: [...migrationBaseByPath.values()],
+      v1RemoteEntries: migrationSourceRemoteEntries.filter(
+        (entry) =>
+          isCommunityPluginPathSelectedByPolicy(
+            entry.path,
+            communityPluginSyncPolicy,
+            configDir,
+          ),
+      ),
+      preservedBasePaths: public113MigrationInput!.baseEntries
+        .filter((entry) => !this.shouldIncludeRemotePath(entry.path))
+        .map((entry) => entry.path),
+      requireCompleteAnchors: true,
+      allowChangedAnchors: true,
+      v1MutationLedger: this.state.mutationLedger,
+      v1PendingConflicts: this.state.pendingConflicts,
+      v1VaultName: this.vaultName,
+      ancestorHashesByPath: ancestorPreparation?.hashesByPath,
+    });
+    if (
+      preparedMigration.status !== "ready"
+      || !preparedMigration.envelope
+    ) {
+      result.deferred = 0; // whole-round stop: clear any earlier join-block deferral (2026-09-08 review P3-1)
+      result.message = this.folderRejectionMessage(
+        preparedMigration.reason,
+        folderScanFailures,
+      );
+      this.diag?.warn(
+        "state",
+        "V2 migration candidate rejected before authority change",
+        {
+          reason: preparedMigration.reason,
+          pending: preparedMigration.pending.length,
+          mutations: 0,
+        },
+      );
+      return { terminated: result };
+    }
+    const migrationCandidateEnvelope = preparedMigration.envelope;
+    if (attemptV2Activation) {
+      migrationPlannerState =
+        await this.state.preparePublic113IndexedDbPlannerState(
+          migrationCandidateEnvelope,
+          public113MigrationInput!,
+        );
+      if (migrationPlannerState) {
+        this.diag?.log(
+          "state",
+          "public 1.1.3 canonical planner is using the source-bound inactive IndexedDB view",
+          {
+            sourceCommitSeq: migrationPlannerState.meta.commitSeq,
+            remoteNodes: migrationPlannerState.remoteNodes.length,
+            fileAnchors: migrationPlannerState.fileAnchors.length,
+            folderAnchors:
+              migrationPlannerState.folderAnchors?.length ?? 0,
+            mutations: 0,
+          },
+        );
+      }
+    }
+    return { terminated: null, migrationCandidateEnvelope, migrationPlannerState };
+  }
+
+  /** Step 5: open the version-bound first-sync verification evidence session
+   *  and reuse any valid cached receipts. Falls back to empty evidence on
+   *  failure (the canonical verification closures handle the null operation
+   *  id as "verify everything"). */
+  private async runStep5PrepareFirstSyncVerificationEvidence(args: {
+    syncScope: SyncScope;
+    public113MigrationEvidence: boolean;
+    public113MigrationInput: Awaited<
+      ReturnType<StateManager["readPublic113MigrationInput"]>
+    > | null;
+    firstSyncVerificationProtocolBinding: unknown;
+    remoteEntries: RemoteFileEntry[];
+    prepareV2MigrationCandidate: boolean;
+  }): Promise<{
+    firstSyncVerificationOperationId: string | null;
+    verifiedFirstSyncRemoteHashesById: ReadonlyMap<string, string>;
+  }> {
+    const {
+      syncScope,
+      public113MigrationEvidence,
+      public113MigrationInput,
+      firstSyncVerificationProtocolBinding,
+      remoteEntries,
+      prepareV2MigrationCandidate,
+    } = args;
+    let firstSyncVerificationOperationId: string | null = null;
+    let verifiedFirstSyncRemoteHashesById: ReadonlyMap<string, string> =
+      new Map();
+    if (prepareV2MigrationCandidate) {
+      try {
+        const operation = await this.state.beginFirstSyncVerificationEvidence(
+          syncScope,
+          public113MigrationEvidence ? public113MigrationInput : null,
+          firstSyncVerificationProtocolBinding,
+        );
+        firstSyncVerificationOperationId = operation.operationId;
+        const versionsByRemoteId = new Map(remoteEntries.map((entry) => [
+          entry.driveId,
+          {
+            remoteId: entry.driveId,
+            size: entry.size,
+            eTag: entry.eTag,
+            ...(entry.cTag ? { cTag: entry.cTag } : {}),
+          },
+        ]));
+        const cached = await this.state.readValidFirstSyncVerificationEvidence(
+          operation.operationId,
+          [...versionsByRemoteId.values()],
+        );
+        verifiedFirstSyncRemoteHashesById = new Map(
+          [...cached.receiptsByRemoteId].map(([remoteId, receipt]) => [
+            remoteId,
+            receipt.sha256,
+          ]),
+        );
+        if (cached.receiptsByRemoteId.size > 0 || cached.invalidated > 0) {
+          this.diag?.log(
+            "plan",
+            "loaded version-bound first-sync content evidence",
+            {
+              operationKind: "first-sync-verification",
+              total: versionsByRemoteId.size,
+              reusable: cached.receiptsByRemoteId.size,
+              invalidated: cached.invalidated,
+              unverified:
+                versionsByRemoteId.size - cached.receiptsByRemoteId.size,
+              mutations: 0,
+            },
+          );
+        }
+      } catch (error) {
+        firstSyncVerificationOperationId = null;
+        verifiedFirstSyncRemoteHashesById = new Map();
+        this.diag?.warn(
+          "plan",
+          "first-sync content evidence is unavailable; falling back to full verification",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+    return {
+      firstSyncVerificationOperationId,
+      verifiedFirstSyncRemoteHashesById,
+    };
+  }
+
+  /** Step 5: build the canonical plan candidate (from the migration planner
+   *  state or the authoritative envelope) and run the two confirmed
+   *  descendant reconstruction passes, which may rebuild the candidate and
+   *  re-read committed authority. The verification/include closures stay in
+   *  run() and are passed here by reference. */
+  private async runStep5PrepareCanonicalPlanCandidate(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    callbacks: SyncCallbacks;
+    migrationPlannerState: CanonicalPlannerStateV2 | null;
+    migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
+    canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+    committedV2Envelope: SyncStateEnvelopeV2 | null;
+    v2PlanState: StateManager & {
+      getCommittedV2Envelope?: StateManager["getCommittedV2Envelope"];
+    };
+    syncScope: SyncScope;
+    localFolders: LocalFolderEntry[];
+    localFolderScanComplete: boolean;
+    skippedLarge: string[];
+    planningLocalEntries: LocalFileEntry[];
+    configDir: string;
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    baselineReconstructionIncomplete: boolean;
+    prepareV2MigrationCandidate: boolean;
+    includeCanonicalFilePath: (path: string) => boolean;
+    includeCanonicalFolderPath: (path: string) => boolean;
+    preserveCanonicalFolderPath: (path: string) => boolean;
+    resolveCanonicalRemoteContentHash: (
+      item: Readonly<SyncPlanItem>,
+      progress: { current: number; total: number },
+      resetProgressPhase?: boolean,
+    ) => Promise<string>;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
+        canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+        committedV2Envelope: SyncStateEnvelopeV2 | null;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      callbacks,
+      migrationPlannerState,
+      migrationCandidateEnvelope,
+      v2PlanState,
+      syncScope,
+      localFolders,
+      localFolderScanComplete,
+      skippedLarge,
+      planningLocalEntries,
+      configDir,
+      automaticHandlingPolicy,
+      baselineReconstructionIncomplete,
+      prepareV2MigrationCandidate,
+      includeCanonicalFilePath,
+      includeCanonicalFolderPath,
+      preserveCanonicalFolderPath,
+      resolveCanonicalRemoteContentHash,
+    } = args;
+    const rebuildCanonicalPlanCandidate = (
+      envelope: SyncStateEnvelopeV2,
+    ): CanonicalPlanCandidateV2 =>
+      buildCanonicalPlanCandidateV2({
+        envelope,
+        localFiles: planningLocalEntries,
+        localFolders,
+        localFolderScanComplete,
+        skippedLarge,
+        maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
+        localMoveHints: this.state.localFolderMoveHints,
+        localFolderDeleteHints: this.state.localFolderDeleteHints,
+        localFileMoveHints: this.state.localFileMoveHints,
+        includeFilePath: includeCanonicalFilePath,
+        includeFolderPath: includeCanonicalFolderPath,
+        preserveFolderPath: preserveCanonicalFolderPath,
+        configDir,
+        automaticDeleteLocalFiles:
+          automaticHandlingPolicy.autoDeleteLocalFiles,
+      });
+    let canonicalSourceEnvelope = args.canonicalSourceEnvelope;
+    let committedV2Envelope = args.committedV2Envelope;
+    let canonicalPlanCandidate: CanonicalPlanCandidateV2 | null = null;
+    if (migrationPlannerState) {
+      canonicalPlanCandidate = buildCanonicalPlanCandidateFromStateV2({
+        state: migrationPlannerState,
+        localFiles: planningLocalEntries,
+        localFolders,
+        localFolderScanComplete,
+        skippedLarge,
+        maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
+        localMoveHints: this.state.localFolderMoveHints,
+        localFolderDeleteHints: this.state.localFolderDeleteHints,
+        localFileMoveHints: this.state.localFileMoveHints,
+        includeFilePath: includeCanonicalFilePath,
+        includeFolderPath: includeCanonicalFolderPath,
+        preserveFolderPath: preserveCanonicalFolderPath,
+        configDir,
+        automaticDeleteLocalFiles:
+          automaticHandlingPolicy.autoDeleteLocalFiles,
+      });
+    } else if (canonicalSourceEnvelope) {
+      canonicalPlanCandidate = rebuildCanonicalPlanCandidate(canonicalSourceEnvelope);
+    }
+    const folderReconstruction =
+      await this.reconstructConfirmedDescendantFolderAnchors({
+        result,
+        operationEpoch,
+        canonicalPlanCandidate,
+        canonicalSourceEnvelope,
+        committedV2Envelope,
+        migrationCandidateEnvelope,
+        v2PlanState,
+        syncScope,
+        planningLocalEntries,
+        localFolders,
+        localFolderScanComplete,
+        includeCanonicalFilePath,
+        includeCanonicalFolderPath,
+        preserveCanonicalFolderPath,
+        automaticHandlingPolicy,
+        baselineReconstructionIncomplete,
+        prepareV2MigrationCandidate,
+        resolveCanonicalRemoteContentHash,
+        rebuildCanonicalPlanCandidate,
+      });
+    if (folderReconstruction.terminated) {
+      return { terminated: folderReconstruction.terminated };
+    }
+    canonicalPlanCandidate = folderReconstruction.canonicalPlanCandidate;
+    canonicalSourceEnvelope = folderReconstruction.canonicalSourceEnvelope;
+    committedV2Envelope = folderReconstruction.committedV2Envelope;
+    const fileReconstruction =
+      await this.reconstructConfirmedDescendantFileBaseline({
+        result,
+        operationEpoch,
+        callbacks,
+        canonicalPlanCandidate,
+        canonicalSourceEnvelope,
+        committedV2Envelope,
+        migrationCandidateEnvelope,
+        v2PlanState,
+        syncScope,
+        localFolders,
+        automaticHandlingPolicy,
+        prepareV2MigrationCandidate,
+        resolveCanonicalRemoteContentHash,
+        rebuildCanonicalPlanCandidate,
+      });
+    if (fileReconstruction.terminated) {
+      return { terminated: fileReconstruction.terminated };
+    }
+    canonicalPlanCandidate = fileReconstruction.canonicalPlanCandidate;
+    canonicalSourceEnvelope = fileReconstruction.canonicalSourceEnvelope;
+    committedV2Envelope = fileReconstruction.committedV2Envelope;
+    return {
+      terminated: null,
+      canonicalPlanCandidate,
+      canonicalSourceEnvelope,
+      committedV2Envelope,
+    };
+  }
+
+  /**
+   * Recover source-bound folder anchors from confirmed descendant files.
+   *
+   * Runs before the file baseline reconstruction: an unanchored shared folder
+   * can only be settled once its descendants carry exact, still-current local
+   * and remote versions, so this phase publishes that evidence first and
+   * rebuilds the candidate from the envelope it produced.
+   */
+  private async reconstructConfirmedDescendantFolderAnchors(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
+    canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+    committedV2Envelope: SyncStateEnvelopeV2 | null;
+    migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
+    v2PlanState: StateManager & {
+      getCommittedV2Envelope?: StateManager["getCommittedV2Envelope"];
+    };
+    syncScope: SyncScope;
+    planningLocalEntries: LocalFileEntry[];
+    localFolders: LocalFolderEntry[];
+    localFolderScanComplete: boolean;
+    includeCanonicalFilePath: (path: string) => boolean;
+    includeCanonicalFolderPath: (path: string) => boolean;
+    preserveCanonicalFolderPath: (path: string) => boolean;
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    baselineReconstructionIncomplete: boolean;
+    prepareV2MigrationCandidate: boolean;
+    resolveCanonicalRemoteContentHash: (
+      item: Readonly<SyncPlanItem>,
+      progress: { current: number; total: number },
+      resetProgressPhase?: boolean,
+    ) => Promise<string>;
+    rebuildCanonicalPlanCandidate: (
+      envelope: SyncStateEnvelopeV2,
+    ) => CanonicalPlanCandidateV2;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
+        canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+        committedV2Envelope: SyncStateEnvelopeV2 | null;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      migrationCandidateEnvelope,
+      v2PlanState,
+      syncScope,
+      planningLocalEntries,
+      localFolders,
+      localFolderScanComplete,
+      includeCanonicalFilePath,
+      includeCanonicalFolderPath,
+      preserveCanonicalFolderPath,
+      automaticHandlingPolicy,
+      baselineReconstructionIncomplete,
+      prepareV2MigrationCandidate,
+      resolveCanonicalRemoteContentHash,
+      rebuildCanonicalPlanCandidate,
+    } = args;
+    let { canonicalPlanCandidate, canonicalSourceEnvelope, committedV2Envelope } = args;
+    if (
+      !this.state.isV2StateActive
+      || prepareV2MigrationCandidate
+      || !canonicalPlanCandidate?.folderPlan.items.some(
+        (item) => item.reason === "unanchored-shared-folder",
+      )
+    ) {
+      return {
+        terminated: null,
+        canonicalPlanCandidate,
+        canonicalSourceEnvelope,
+        committedV2Envelope,
+      };
+    }
+    const acceptConfirmedDescendantFolders = () =>
+      this.state.acceptConfirmedDescendantFolderAnchors({
+        scope: syncScope,
+        localFiles: planningLocalEntries,
+        localFolders,
+        localFolderScanComplete,
+        remoteIdentityComplete: this.state.hasCompleteRemoteFolderIndex,
+        includeFilePath: includeCanonicalFilePath,
+        includeFolderPath: (path) =>
+          includeCanonicalFolderPath(path)
+          && !preserveCanonicalFolderPath(path),
+      });
+    let reconstructed = await acceptConfirmedDescendantFolders();
+    if (reconstructed.status === "none") {
+      const evidence = await finalizeUnanchoredFolderEvidenceV2({
+        candidate: canonicalPlanCandidate,
+        envelope: canonicalSourceEnvelope!,
+        vaultName: this.vaultName,
+        accountId: this.state.boundAccountId ?? "",
+        configDir: getConfigDir(this.scanner.vault),
+        automaticHandlingPolicy,
+        baselineReconstructionIncomplete,
+        pendingContentComparisons: this.state.pendingConflicts.map(
+          (item) => ({
+            path: item.path,
+            contentComparison: item.contentComparison,
+          }),
+        ),
+        resolveRemoteContentHash: resolveCanonicalRemoteContentHash,
+      });
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      const evidenceOutcome = await this.publishExactDescendantEvidenceForUnanchoredFolder({
+        result,
+        operationEpoch,
+        evidence,
+        canonicalPlanCandidate,
+        canonicalSourceEnvelope,
+        committedV2Envelope,
+        reconstructed,
+        migrationCandidateEnvelope,
+        v2PlanState,
+        syncScope,
+        acceptConfirmedDescendantFolders,
+        rebuildCanonicalPlanCandidate,
+      });
+      if (evidenceOutcome.terminated) return evidenceOutcome;
+      canonicalPlanCandidate = evidenceOutcome.canonicalPlanCandidate;
+      canonicalSourceEnvelope = evidenceOutcome.canonicalSourceEnvelope;
+      committedV2Envelope = evidenceOutcome.committedV2Envelope;
+      reconstructed = evidenceOutcome.reconstructed;
+    }
+    if (reconstructed.status === "accepted") {
+      this.diag?.log(
+        "state",
+        "reconstructed source-bound folder identities from confirmed descendant files",
+        {
+          accepted: reconstructed.accepted,
+          evidenceFiles: reconstructed.evidenceFiles,
+          mutations: 0,
+        },
+      );
+      committedV2Envelope =
+        typeof v2PlanState.getCommittedV2Envelope === "function"
+          ? v2PlanState.getCommittedV2Envelope()
+          : null;
+      canonicalSourceEnvelope =
+        committedV2Envelope ?? migrationCandidateEnvelope;
+      if (!canonicalSourceEnvelope) {
+        throw new Error(
+          "Confirmed descendant folder reconstruction lost V2 authority",
+        );
+      }
+      canonicalPlanCandidate = rebuildCanonicalPlanCandidate(canonicalSourceEnvelope);
+    } else if (reconstructed.status === "rejected") {
+      this.diag?.warn(
+        "state",
+        "confirmed descendant folder identity reconstruction remained fail-closed",
+        {
+          reason: reconstructed.reason,
+          mutations: 0,
+        },
+      );
+    }
+    return {
+      terminated: null,
+      canonicalPlanCandidate,
+      canonicalSourceEnvelope,
+      committedV2Envelope,
+    };
+  }
+
+  private async publishExactDescendantEvidenceForUnanchoredFolder(args: PublishExactDescendantEvidenceForUnanchoredFolderArgs): Promise<PublishExactDescendantEvidenceForUnanchoredFolderOutcome> {
+    const {
+      result, operationEpoch, evidence, migrationCandidateEnvelope,
+      v2PlanState, syncScope, acceptConfirmedDescendantFolders,
+      rebuildCanonicalPlanCandidate,
+    } = args;
+    let { canonicalPlanCandidate, canonicalSourceEnvelope, committedV2Envelope, reconstructed } = args;
+    if (evidence.baseUpserts.length > 0) {
+      const evidenceItemsByPath = new Map(
+        canonicalPlanCandidate.unanchoredDescendantEvidence.map(
+          (item) => [item.path, item],
+        ),
+      );
+      const currentEvidence: BaseFileEntry[] = [];
+      for (const entry of evidence.baseUpserts) {
+        const sourceItem = evidenceItemsByPath.get(entry.path);
+        const expectedLocal = sourceItem?.local;
+        const expectedRemote = sourceItem?.remote;
+        if (!expectedLocal || !expectedRemote) continue;
+        const [currentLocal, currentRemote] = await Promise.all([
+          this.inspectLocalPath(entry.path),
+          this.inspectRemotePath(entry.path),
+        ]);
+        if (
+          currentLocal?.status !== "present"
+          || !this.inspectionMatchesVersion(
+            currentLocal,
+            expectedLocal,
+          )
+          || !currentRemote
+          || currentRemote.driveId !== expectedRemote.driveId
+          || currentRemote.eTag !== expectedRemote.eTag
+          || currentRemote.size !== expectedRemote.size
+        ) {
+          this.diag?.warn(
+            "state",
+            `unanchored folder evidence changed before publication — ${entry.path}`,
+            { mutations: 0 },
+          );
+          continue;
+        }
+        currentEvidence.push(entry);
+      }
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      if (currentEvidence.length > 0) {
+        await this.stageVerifiedLocalAncestorContent(currentEvidence);
+        const publication =
+          await this.state.acceptConfirmedDescendantFileEvidence({
+            scope: syncScope,
+            sourceCommitSeq: canonicalSourceEnvelope!.meta.commitSeq,
+            entries: currentEvidence,
+          });
+        if (publication.status !== "accepted") {
+          this.diag?.warn(
+            "state",
+            "exact descendant file evidence publication remained fail-closed",
+            {
+              reason: publication.status,
+              candidates: evidence.contentVerification.candidates,
+              mutations: 0,
+            },
+          );
+        } else {
+          this.diag?.log(
+            "state",
+            "published exact descendant file evidence for unanchored folder recovery",
+            {
+              accepted: publication.accepted,
+              candidates: evidence.contentVerification.candidates,
+              downloads: evidence.contentVerification.downloads,
+              mutations: 0,
+            },
+          );
+          committedV2Envelope =
+            typeof v2PlanState.getCommittedV2Envelope === "function"
+              ? v2PlanState.getCommittedV2Envelope()
+              : null;
+          canonicalSourceEnvelope =
+            committedV2Envelope ?? migrationCandidateEnvelope;
+          if (!canonicalSourceEnvelope) {
+            throw new Error(
+              "Exact descendant evidence publication lost V2 authority",
+            );
+          }
+          canonicalPlanCandidate = rebuildCanonicalPlanCandidate(canonicalSourceEnvelope);
+          reconstructed = await acceptConfirmedDescendantFolders();
+        }
+      }
+    }
+    return {
+      terminated: null,
+      canonicalPlanCandidate,
+      canonicalSourceEnvelope,
+      committedV2Envelope,
+      reconstructed,
+    };
+  }
+
+  /**
+   * Rebuild the source-bound file baseline in bounded verification batches.
+   *
+   * Every batch settles each source version exactly once — as published
+   * evidence or as a pending content comparison — before the next batch is
+   * verified, and any version that moved mid-verification pauses the round
+   * for retry instead of being recorded against a stale version.
+   */
+  private async reconstructConfirmedDescendantFileBaseline(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    callbacks: SyncCallbacks;
+    canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
+    canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+    committedV2Envelope: SyncStateEnvelopeV2 | null;
+    migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
+    v2PlanState: StateManager & {
+      getCommittedV2Envelope?: StateManager["getCommittedV2Envelope"];
+    };
+    syncScope: SyncScope;
+    localFolders: LocalFolderEntry[];
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    prepareV2MigrationCandidate: boolean;
+    resolveCanonicalRemoteContentHash: (
+      item: Readonly<SyncPlanItem>,
+      progress: { current: number; total: number },
+      resetProgressPhase?: boolean,
+    ) => Promise<string>;
+    rebuildCanonicalPlanCandidate: (
+      envelope: SyncStateEnvelopeV2,
+    ) => CanonicalPlanCandidateV2;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
+        canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+        committedV2Envelope: SyncStateEnvelopeV2 | null;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      callbacks,
+      migrationCandidateEnvelope,
+      v2PlanState,
+      syncScope,
+      localFolders,
+      automaticHandlingPolicy,
+      prepareV2MigrationCandidate,
+      resolveCanonicalRemoteContentHash,
+      rebuildCanonicalPlanCandidate,
+    } = args;
+    let { canonicalPlanCandidate, canonicalSourceEnvelope, committedV2Envelope } = args;
+    if (
+      !this.state.isV2StateActive
+      || prepareV2MigrationCandidate
+      || canonicalPlanCandidate?.status !== "planned"
+    ) {
+      return {
+        terminated: null,
+        canonicalPlanCandidate,
+        canonicalSourceEnvelope,
+        committedV2Envelope,
+      };
+    }
+    const reconstruction =
+      await this.state.prepareConfirmedDescendantFileReconstruction?.({
+        scope: syncScope,
+        localFolders,
+        candidateItems: canonicalPlanCandidate.items,
+      }) ?? { status: "none" as const, roots: [] };
+    if (reconstruction.status === "ready") {
+      const reconstructionOutcome =
+        await this.runConfirmedDescendantFileReconstruction({
+          result,
+          operationEpoch,
+          callbacks,
+          reconstruction,
+          canonicalPlanCandidate,
+          canonicalSourceEnvelope,
+          committedV2Envelope,
+          syncScope,
+          automaticHandlingPolicy,
+          v2PlanState,
+          migrationCandidateEnvelope,
+          resolveCanonicalRemoteContentHash,
+          rebuildCanonicalPlanCandidate,
+        });
+      if (reconstructionOutcome.terminated) {
+        return { terminated: reconstructionOutcome.terminated };
+      }
+      canonicalPlanCandidate = reconstructionOutcome.canonicalPlanCandidate;
+      canonicalSourceEnvelope = reconstructionOutcome.canonicalSourceEnvelope;
+      committedV2Envelope = reconstructionOutcome.committedV2Envelope;
+    }
+    return {
+      terminated: null,
+      canonicalPlanCandidate,
+      canonicalSourceEnvelope,
+      committedV2Envelope,
+    };
+  }
+
+  /** Rebuild the source-bound file baseline once the reconstruction gate is
+   *  ready: settle every source version in bounded verification batches and
+   *  re-plan the candidate before the round continues. */
+  private async runConfirmedDescendantFileReconstruction(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    callbacks: SyncCallbacks;
+    reconstruction: Extract<
+      Awaited<
+        ReturnType<StateManager["prepareConfirmedDescendantFileReconstruction"]>
+      >,
+      { status: "ready" }
+    >;
+    canonicalPlanCandidate: CanonicalPlanCandidateV2;
+    canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+    committedV2Envelope: SyncStateEnvelopeV2 | null;
+    syncScope: SyncScope;
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    v2PlanState: StateManager & {
+      getCommittedV2Envelope?: StateManager["getCommittedV2Envelope"];
+    };
+    migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
+    resolveCanonicalRemoteContentHash: (
+      item: Readonly<SyncPlanItem>,
+      progress: { current: number; total: number },
+      resetProgressPhase?: boolean,
+    ) => Promise<string>;
+    rebuildCanonicalPlanCandidate: (
+      envelope: SyncStateEnvelopeV2,
+    ) => CanonicalPlanCandidateV2;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        canonicalPlanCandidate: CanonicalPlanCandidateV2;
+        canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+        committedV2Envelope: SyncStateEnvelopeV2 | null;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      callbacks,
+      reconstruction,
+      syncScope,
+      automaticHandlingPolicy,
+      v2PlanState,
+      migrationCandidateEnvelope,
+      resolveCanonicalRemoteContentHash,
+      rebuildCanonicalPlanCandidate,
+    } = args;
+    let {
+      canonicalPlanCandidate,
+      canonicalSourceEnvelope,
+      committedV2Envelope,
+    } = args;
+    const reconstructionStartedAt = Date.now();
+    const reconstructionRoots =
+      reconstruction.roots.map((root) => root.path);
+    const reconstructionComparisons = new Map(
+      this.state.pendingConflicts.map((item) => [item.path, item]),
+    );
+    const isReconstructionCandidate = (
+      item: Readonly<SyncPlanItem>,
+    ): boolean =>
+      item.type === SyncActionType.Conflict
+      && item.reason === "reason.newFileBothSides"
+      && Boolean(item.local)
+      && Boolean(item.remote)
+      && item.local!.size === item.remote!.size
+      && resolveContentEquality({
+        local: item.local!,
+        remote: item.remote!,
+      }).status !== "different"
+      && reconstructionRoots.some((root) =>
+        isAtOrBelowPath(item.path, root));
+    const reconstructionEvidenceStatus = (
+      item: Readonly<SyncPlanItem>,
+    ) => resolveContentEquality({
+      local: item.local!,
+      remote: item.remote!,
+    }).status;
+    const pendingComparisonFor = (
+      item: Readonly<SyncPlanItem>,
+    ): SyncPlanItem | undefined => {
+      const pending = reconstructionComparisons.get(item.path);
+      return pending
+        && item.local
+        && item.remote
+        && contentDifferenceReceiptMatches(
+          pending.contentComparison,
+          item.local,
+          item.remote,
+        )
+        ? pending
+        : undefined;
+    };
+    const initialCandidates = canonicalPlanCandidate.items.filter(
+      (item) =>
+        isReconstructionCandidate(item)
+        && !pendingComparisonFor(item),
+    ).sort((left, right) => {
+      const leftNeedsDownload =
+        reconstructionEvidenceStatus(left) === "unknown";
+      const rightNeedsDownload =
+        reconstructionEvidenceStatus(right) === "unknown";
+      if (leftNeedsDownload !== rightNeedsDownload) {
+        return leftNeedsDownload ? 1 : -1;
+      }
+      return left.path.localeCompare(right.path);
+    });
+    let batches = 0;
+    let verified = 0;
+    let downloads = 0;
+    let verifiedBytes = 0;
+    let downloadBytes = 0;
+    const pauseReconstructionForRetry = (
+      message: string,
+    ): SyncResult => {
+      result.success = false;
+      result.deferred++;
+      result.continueAfterConfirmedDescendantFileReconstruction = true;
+      result.descendantFileReconstructionRetryableFailure = true;
+      result.errors = Math.max(1, result.errors);
+      result.message = this.t("result.syncFailed", { message });
+      return result;
+    };
+    this.diag?.log(
+      "state",
+      "starting source-bound descendant file baseline reconstruction",
+      {
+        roots: reconstructionRoots.length,
+        candidates: initialCandidates.length,
+        zeroDownloadCandidates: initialCandidates.filter(
+          (item) =>
+            reconstructionEvidenceStatus(item) !== "unknown",
+        ).length,
+        bytes: initialCandidates.reduce(
+          (total, item) => total + (item.remote?.size ?? 0),
+          0,
+        ),
+        visibleSession: "single",
+        mutations: 0,
+      },
+    );
+    if (initialCandidates.length > 0) {
+      this.progressStore?.setPhase("verifying");
+      this.progressStore?.setProgress(
+        0,
+        initialCandidates.length,
+        "",
+      );
+      callbacks.onProgress?.(
+        0,
+        initialCandidates.length,
+        this.t("progress.verifyingFiles", {
+          current: 0,
+          total: initialCandidates.length,
+        }),
+      );
+    }
+    while (true) {
+      const batchOutcome =
+        await this.settleConfirmedDescendantFileReconstructionBatch({
+          result,
+          operationEpoch,
+          callbacks,
+          canonicalPlanCandidate,
+          canonicalSourceEnvelope,
+          committedV2Envelope,
+          automaticHandlingPolicy,
+          v2PlanState,
+          migrationCandidateEnvelope,
+          rebuildCanonicalPlanCandidate,
+          resolveCanonicalRemoteContentHash,
+          reconstructionComparisons,
+          initialCandidates,
+          reconstructionEvidenceStatus,
+          isReconstructionCandidate,
+          pendingComparisonFor,
+          pauseReconstructionForRetry,
+          syncScope,
+          batches,
+          verified,
+          downloads,
+          verifiedBytes,
+          downloadBytes,
+        });
+      if (batchOutcome.terminated) {
+        return { terminated: batchOutcome.terminated };
+      }
+      batches = batchOutcome.batches;
+      verified = batchOutcome.verified;
+      downloads = batchOutcome.downloads;
+      verifiedBytes = batchOutcome.verifiedBytes;
+      downloadBytes = batchOutcome.downloadBytes;
+      canonicalPlanCandidate = batchOutcome.canonicalPlanCandidate;
+      canonicalSourceEnvelope = batchOutcome.canonicalSourceEnvelope;
+      committedV2Envelope = batchOutcome.committedV2Envelope;
+      if (batchOutcome.done) break;
+    }
+    await this.state.completeConfirmedDescendantFileReconstruction?.(
+      syncScope,
+    );
+    canonicalPlanCandidate = rebuildCanonicalPlanCandidate(canonicalSourceEnvelope!);
+    this.diag?.log(
+      "state",
+      "completed source-bound descendant file baseline reconstruction",
+      {
+        roots: reconstructionRoots.length,
+        batches,
+        verified,
+        downloads,
+        bytes: verifiedBytes,
+        downloadBytes,
+        elapsedMs: Date.now() - reconstructionStartedAt,
+        mutations: 0,
+      },
+    );
+    return {
+      terminated: null,
+      canonicalPlanCandidate,
+      canonicalSourceEnvelope,
+      committedV2Envelope,
+    };
+  }
+
+  /** Settle one reconstruction batch: resolve the next unresolved cohort,
+   *  verify its evidence, publish it and re-plan the candidate. Returns the
+   *  accumulators for the next batch with a done signal for the loop exit. */
+  private async settleConfirmedDescendantFileReconstructionBatch(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    callbacks: SyncCallbacks;
+    canonicalPlanCandidate: CanonicalPlanCandidateV2;
+    canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+    committedV2Envelope: SyncStateEnvelopeV2 | null;
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    v2PlanState: StateManager & {
+      getCommittedV2Envelope?: StateManager["getCommittedV2Envelope"];
+    };
+    migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
+    rebuildCanonicalPlanCandidate: (
+      envelope: SyncStateEnvelopeV2,
+    ) => CanonicalPlanCandidateV2;
+    resolveCanonicalRemoteContentHash: (
+      item: Readonly<SyncPlanItem>,
+      progress: { current: number; total: number },
+      resetProgressPhase?: boolean,
+    ) => Promise<string>;
+    reconstructionComparisons: Map<string, SyncPlanItem>;
+    initialCandidates: SyncPlanItem[];
+    isReconstructionCandidate: (item: Readonly<SyncPlanItem>) => boolean;
+    reconstructionEvidenceStatus: (
+      item: Readonly<SyncPlanItem>,
+    ) => ReturnType<typeof resolveContentEquality>["status"];
+    pendingComparisonFor: (
+      item: Readonly<SyncPlanItem>,
+    ) => SyncPlanItem | undefined;
+    pauseReconstructionForRetry: (message: string) => SyncResult;
+    syncScope: SyncScope;
+    batches: number;
+    verified: number;
+    downloads: number;
+    verifiedBytes: number;
+    downloadBytes: number;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        done: boolean;
+        batches: number;
+        verified: number;
+        downloads: number;
+        verifiedBytes: number;
+        downloadBytes: number;
+        canonicalPlanCandidate: CanonicalPlanCandidateV2;
+        canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+        committedV2Envelope: SyncStateEnvelopeV2 | null;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      callbacks,
+      automaticHandlingPolicy,
+      v2PlanState,
+      migrationCandidateEnvelope,
+      rebuildCanonicalPlanCandidate,
+      resolveCanonicalRemoteContentHash,
+      reconstructionComparisons,
+      initialCandidates,
+      isReconstructionCandidate,
+      reconstructionEvidenceStatus,
+      pendingComparisonFor,
+      pauseReconstructionForRetry,
+      syncScope,
+    } = args;
+    let {
+      canonicalPlanCandidate,
+      canonicalSourceEnvelope,
+      committedV2Envelope,
+      batches,
+      verified,
+      downloads,
+      verifiedBytes,
+      downloadBytes,
+    } = args;
+    // Every batch exit hands the caller the accumulators for the next batch.
+    const accumulators = (done: boolean) => ({
+      terminated: null,
+      done,
+      batches,
+      verified,
+      downloads,
+      verifiedBytes,
+      downloadBytes,
+      canonicalPlanCandidate,
+      canonicalSourceEnvelope,
+      committedV2Envelope,
+    });
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    const unresolved = canonicalPlanCandidate.items.filter(
+      (item) =>
+        isReconstructionCandidate(item)
+        && !pendingComparisonFor(item),
+    ).sort((left, right) => {
+      const leftNeedsDownload =
+        reconstructionEvidenceStatus(left) === "unknown";
+      const rightNeedsDownload =
+        reconstructionEvidenceStatus(right) === "unknown";
+      if (leftNeedsDownload !== rightNeedsDownload) {
+        return leftNeedsDownload ? 1 : -1;
+      }
+      return left.path.localeCompare(right.path);
+    });
+    if (unresolved.length === 0) return accumulators(true);
+    const next = unresolved[0];
+    if (!next) return accumulators(true);
+    const batchFileLimit = Platform.isMobile
+      ? MOBILE_RECONSTRUCTION_BATCH_FILES
+      : DESKTOP_RECONSTRUCTION_BATCH_FILES;
+    const batchByteLimit = Platform.isMobile
+      ? MOBILE_RECONSTRUCTION_BATCH_BYTES
+      : DESKTOP_RECONSTRUCTION_BATCH_BYTES;
+    const batch: SyncPlanItem[] = [];
+    let batchBytes = 0;
+    for (const candidate of unresolved) {
+      if (batch.length >= batchFileLimit) break;
+      const candidateBytes = candidate.remote?.size ?? 0;
+      if (
+        batch.length > 0
+        && batchBytes + candidateBytes > batchByteLimit
+      ) break;
+      batch.push(candidate);
+      batchBytes += candidateBytes;
+    }
+    batches++;
+    const reconstructionProgress = {
+      current: verified + batch.length,
+      total: initialCandidates.length,
+    };
+    this.progressStore?.setProgress(
+      reconstructionProgress.current,
+      reconstructionProgress.total,
+      next.path,
+    );
+    callbacks.onProgress?.(
+      reconstructionProgress.current,
+      reconstructionProgress.total,
+      this.t("progress.verifyingFiles", reconstructionProgress),
+    );
+    const downloadCandidates = batch.filter((item) =>
+      reconstructionEvidenceStatus(item) === "unknown"
+    );
+    downloadBytes += downloadCandidates.reduce(
+      (total, item) => total + (item.remote?.size ?? 0),
+      0,
+    );
+    verifiedBytes += batch.reduce(
+      (total, item) => total + (item.remote?.size ?? 0),
+      0,
+    );
+    const sourceEnvelope =
+      this.state.getCommittedV2Envelope();
+    if (!sourceEnvelope) {
+      throw new Error(
+        "Descendant file reconstruction lost V2 authority",
+      );
+    }
+    const prefetchedRemoteHashes = new Map<
+      string,
+      { hash?: string; error?: unknown }
+    >();
+    await Promise.all(downloadCandidates.map(async (item, index) => {
+      try {
+        const hash = await resolveCanonicalRemoteContentHash(
+          item,
+          {
+            current: verified + index + 1,
+            total: initialCandidates.length,
+          },
+          false,
+        );
+        prefetchedRemoteHashes.set(item.path, { hash });
+      } catch (error) {
+        prefetchedRemoteHashes.set(item.path, { error });
+      }
+    }));
+    const finalizedBatch =
+      await finalizeCanonicalPlanCandidateV2({
+        candidate: {
+          ...canonicalPlanCandidate,
+          items: batch.map((item) => ({ ...item })),
+          identityReplacements: [],
+          identityMoveVerifications: [],
+        },
+        envelope: sourceEnvelope,
+        vaultName: this.vaultName,
+        accountId: this.state.boundAccountId ?? "",
+        configDir: getConfigDir(this.scanner.vault),
+        automaticHandlingPolicy,
+        baselineReconstructionIncomplete: false,
+        pendingContentComparisons:
+          [...reconstructionComparisons.values()].map((item) => ({
+            path: item.path,
+            contentComparison: item.contentComparison,
+          })),
+        resolveRemoteContentHash: async (item) => {
+          const prefetched = prefetchedRemoteHashes.get(item.path);
+          if (prefetched?.error) {
+            throw prefetched.error instanceof Error
+              ? prefetched.error
+              : new Error(describeThrownValue(prefetched.error));
+          }
+          if (prefetched?.hash) return prefetched.hash;
+          return resolveCanonicalRemoteContentHash(
+            item,
+            reconstructionProgress,
+            false,
+          );
+        },
+      });
+    downloads += finalizedBatch.contentVerification.downloads;
+    const failures =
+      finalizedBatch.contentVerification.results.filter(
+        (item) => item.outcome === "failed",
+      );
+    if (failures.length > 0) {
+      this.diag?.warn(
+        "state",
+        "descendant file baseline reconstruction interrupted during verification",
+        {
+          batch: batches,
+          failed: failures.length,
+          completed: verified,
+          mutations: 0,
+        },
+      );
+      return {
+        terminated: pauseReconstructionForRetry(
+          "descendant file baseline verification failed",
+        ),
+      };
+    }
+    const differences = finalizedBatch.items.filter((item) =>
+      item.type === SyncActionType.Conflict
+      && Boolean(item.contentComparison),
+    );
+    if (differences.length > 0) {
+      await this.state.upsertPendingConflicts(differences);
+      for (const item of differences) {
+        reconstructionComparisons.set(item.path, item);
+      }
+    }
+    const currentEvidence: BaseFileEntry[] = [];
+    if (finalizedBatch.baseUpserts.length > 0) {
+      const evidenceOutcome =
+        await this.publishConfirmedDescendantFileBatchEvidence({
+          finalizedBatch,
+          batch,
+          currentEvidence,
+          batches,
+          syncScope,
+          sourceEnvelope,
+          pauseReconstructionForRetry,
+        });
+      if (evidenceOutcome.terminated) {
+        return { terminated: evidenceOutcome.terminated };
+      }
+    }
+    const settled =
+      currentEvidence.length + differences.length;
+    if (settled !== batch.length) {
+      this.diag?.warn(
+        "state",
+        "descendant file baseline batch did not settle every source version",
+        {
+          batch: batches,
+          candidates: batch.length,
+          settled,
+          mutations: 0,
+        },
+      );
+      return {
+        terminated: pauseReconstructionForRetry(
+          "descendant file baseline batch did not settle",
+        ),
+      };
+    }
+    verified += settled;
+    committedV2Envelope =
+      typeof v2PlanState.getCommittedV2Envelope === "function"
+        ? v2PlanState.getCommittedV2Envelope()
+        : null;
+    canonicalSourceEnvelope =
+      committedV2Envelope ?? migrationCandidateEnvelope;
+    if (!canonicalSourceEnvelope) {
+      throw new Error(
+        "Descendant file baseline publication lost V2 authority",
+      );
+    }
+    canonicalPlanCandidate = rebuildCanonicalPlanCandidate(canonicalSourceEnvelope);
+    return accumulators(false);
+  }
+
+  /** Verify and publish the batch's confirmed descendant baseline evidence,
+   *  pausing the round when the evidence moved mid-verification or the
+   *  publication was blocked. */
+  private async publishConfirmedDescendantFileBatchEvidence(args: {
+    finalizedBatch: Awaited<
+      ReturnType<typeof finalizeCanonicalPlanCandidateV2>
+    >;
+    batch: SyncPlanItem[];
+    currentEvidence: BaseFileEntry[];
+    batches: number;
+    syncScope: SyncScope;
+    sourceEnvelope: SyncStateEnvelopeV2;
+    pauseReconstructionForRetry: (message: string) => SyncResult;
+  }): Promise<{ terminated: SyncResult } | { terminated: null }> {
+    const {
+      finalizedBatch,
+      batch,
+      currentEvidence,
+      batches,
+      syncScope,
+      sourceEnvelope,
+      pauseReconstructionForRetry,
+    } = args;
+    const batchByPath = new Map(
+      batch.map((item) => [item.path, item]),
+    );
+    for (const entry of finalizedBatch.baseUpserts) {
+      const sourceItem = batchByPath.get(entry.path);
+      const expectedLocal = sourceItem?.local;
+      const expectedRemote = sourceItem?.remote;
+      if (!expectedLocal || !expectedRemote) continue;
+      const [currentLocal, currentRemote] = await Promise.all([
+        this.inspectLocalPath(entry.path),
+        this.inspectRemotePath(entry.path),
+      ]);
+      if (
+        currentLocal?.status !== "present"
+        || !this.inspectionMatchesVersion(
+          currentLocal,
+          expectedLocal,
+        )
+        || !currentRemote
+        || currentRemote.driveId !== expectedRemote.driveId
+        || currentRemote.eTag !== expectedRemote.eTag
+        || currentRemote.size !== expectedRemote.size
+      ) continue;
+      currentEvidence.push(entry);
+    }
+    if (
+      currentEvidence.length
+      !== finalizedBatch.baseUpserts.length
+    ) {
+      this.diag?.warn(
+        "state",
+        "descendant file baseline evidence changed before publication",
+        {
+          batch: batches,
+          candidates: finalizedBatch.baseUpserts.length,
+          current: currentEvidence.length,
+          mutations: 0,
+        },
+      );
+      return {
+        terminated: pauseReconstructionForRetry(
+          "descendant file baseline evidence changed",
+        ),
+      };
+    }
+    await this.stageVerifiedLocalAncestorContent(currentEvidence);
+    const publication =
+      await this.state.acceptConfirmedDescendantFileEvidence({
+        scope: syncScope,
+        sourceCommitSeq: sourceEnvelope.meta.commitSeq,
+        entries: currentEvidence,
+      });
+    if (
+      publication.status !== "accepted"
+      || publication.accepted !== currentEvidence.length
+    ) {
+      this.diag?.warn(
+        "state",
+        "descendant file baseline publication remained fail-closed",
+        {
+          batch: batches,
+          status: publication.status,
+          candidates: currentEvidence.length,
+          mutations: 0,
+        },
+      );
+      return {
+        terminated: pauseReconstructionForRetry(
+          "descendant file baseline publication was blocked",
+        ),
+      };
+    }
+    return { terminated: null };
+  }
+
+  /** Step 5: shape the executable plan — build the plan from the canonical
+   *  candidate, reject a fail-closed candidate before any mutation, apply
+   *  self/community plugin protection and recovery-intersecting deferrals,
+   *  then arm the M17 circuit breaker and log the config-prefix uploads. */
+  private runStep5PrepareExecutablePlan(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    mode: SyncMode;
+    canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
+    migrationPlannerState: CanonicalPlannerStateV2 | null;
+    canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
+    communityPluginSyncPolicy: ReturnType<typeof cloneCommunityPluginSyncPolicy>;
+    configDir: string;
+    planningLocalEntries: LocalFileEntry[];
+    remoteEntries: RemoteFileEntry[];
+    joinAuthorizationsByPluginId: Map<
+      string,
+      Readonly<CommunityPluginJoinAuthorization>
+    >;
+    protectedMutationRecoveryRecords: readonly Readonly<MutationLedgerEntryV1>[];
+    folderScanFailures: string[];
+    syncScope: SyncScope;
+  }): {
+    terminated: SyncResult;
+  } | {
+    terminated: null;
+    plan: SyncPlan & { scope: SyncScope };
+  } {
+    const {
+      result,
+      operationEpoch,
+      mode,
+      canonicalPlanCandidate,
+      migrationPlannerState,
+      canonicalSourceEnvelope,
+      communityPluginSyncPolicy,
+      configDir,
+      planningLocalEntries,
+      remoteEntries,
+      joinAuthorizationsByPluginId,
+      protectedMutationRecoveryRecords,
+      folderScanFailures,
+      syncScope,
+    } = args;
+    let plan: SyncPlan;
+    if (canonicalPlanCandidate) {
+      plan = {
+        items: canonicalPlanCandidate.items,
+        lastTotalFiles: canonicalPlanCandidate.lastTotalFiles,
+        confirmed: false,
+        scope: { ...canonicalPlanCandidate.scope },
+      };
+    } else {
+      throw new Error(
+        "V2 canonical planning requires an active envelope or a complete migration candidate",
+      );
+    }
+    if (canonicalPlanCandidate?.status === "rejected") {
+      result.deferred = 0; // whole-round stop: clear any earlier join-block deferral (2026-09-08 review P3-1)
+      result.message = this.folderRejectionMessage(
+        canonicalPlanCandidate.rejectionReason,
+        folderScanFailures,
+      );
+      this.diag?.warn(
+        "plan",
+        "V2 canonical candidate rejected before mutation",
+        {
+          reason: canonicalPlanCandidate.rejectionReason,
+          sourceCommitSeq: canonicalPlanCandidate.sourceCommitSeq,
+          mutations: 0,
+        },
+      );
+      return { terminated: result };
+    }
+    const anchoredRemoteIdByPath = new Map(
+      (
+        migrationPlannerState?.fileAnchors
+        ?? (canonicalSourceEnvelope
+          ? Object.values(canonicalSourceEnvelope.anchors.byAnchorId)
+          : [])
+      ).flatMap((anchor) =>
+        anchor.remoteId
+          ? [[anchor.lastPath, anchor.remoteId] as const]
+          : []
+      ),
+    );
+    plan.items = protectEasySyncSelfSyncPlan(
+      protectCommunityPluginPlan(
+        plan.items,
+        communityPluginSyncPolicy,
+        configDir,
+        planningLocalEntries,
+        "easy-sync",
+        {
+          remoteEntries,
+          anchoredRemoteIdByPath,
+          restoringFilePluginIds: [
+            ...joinAuthorizationsByPluginId.keys(),
+          ],
+        },
+      ),
+      configDir,
+    );
+    this.deferPlanItemsIntersectingRecovery(
+      plan,
+      result,
+      protectedMutationRecoveryRecords,
+    );
+    plan.scope = syncScope;
+    this.diag?.log("plan", `plan generated — ${plan.items.length} actions (up/down/del/conflict: ${plan.items.filter(i=>i.type===SyncActionType.Upload).length}/${plan.items.filter(i=>i.type===SyncActionType.Download).length}/${plan.items.filter(i=>i.type===SyncActionType.Conflict).length})`);
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    // M17: circuit breaker — skip items with 3+ consecutive same-version failures.
+    // ponytail: manual/first sync is an explicit user retry, so don't silently
+    // keep skipping on stale breaker state; auto sync keeps the guardrail.
+    // transfer-network issues additionally back off across version changes:
+    // a network timeout is a property of the link, not of the bytes, so a
+    // file that keeps failing while its content keeps changing (e.g. a
+    // plugin re-bundled during a slow-network window) still gets deferred —
+    // but only until the backoff window expires, which grants one real
+    // attempt per window instead of the version-matched indefinite skip.
+    // transfer-remote-moving (2026-09-28) shares the timer arm: a hot file
+    // (recording part, in-flight photo) offers a newer remote version every
+    // attempt, so the version-matched arm alone would never engage.
+    const breakerMap = new Map<string, PendingIssue>();
+    for (const issue of this.state.pendingIssues) {
+      // Terminal skip outcomes (oversized file, unstorable name) never
+      // touch the network and carry no version identity, so their
+      // recurring rows would accumulate "same-version failures" and arm
+      // the breaker against a by-design skip (2026-09-13 大文件演示.bin:
+      // three silent skips converted into a round-failing RetryLater that
+      // paused auto sync). Only real attempt outcomes may arm it, as with
+      // the FolderDeferred exclusion below.
+      if (
+        issue.actionType !== SyncActionType.FolderDeferred
+        && issue.actionType !== SyncActionType.SkipLargeFile
+        && issue.actionType !== SyncActionType.SkipOneDriveInvalidName
+        && (issue.consecutiveFailures ?? 0) >= 3
+      ) {
+        breakerMap.set(issue.path, issue);
+      }
+    }
+    if (breakerMap.size > 0) {
+      let breakerCount = 0;
+      let breakerDeferredCount = 0;
+      const breakerApplies = mode === "auto";
+      const networkBackoffCutoff = Date.now() - TRANSFER_NETWORK_BACKOFF_WINDOW_MS;
+      for (const item of plan.items) {
+        const breaker = breakerMap.get(item.path);
+        if (!breaker) continue;
+        const versionMatched = item.local?.hash === breaker.localHash && item.remote?.eTag === breaker.remoteETag;
+        const networkBackoff = (breaker.issueCode === "transfer-network"
+          || breaker.issueCode === "transfer-remote-moving")
+          && breaker.updatedAt >= networkBackoffCutoff;
+        if (versionMatched || networkBackoff) {
+          breakerCount++;
+          if (breakerApplies) {
+            item.type = SyncActionType.RetryLater;
+            item.reason = breaker.issueCode === "transfer-network"
+              ? "reason.circuitBreaker.network"
+              : breaker.issueCode === "transfer-remote-moving"
+                ? "reason.circuitBreaker.remoteMoving"
+                : "reason.circuitBreaker";
+            breakerDeferredCount++;
+          }
+        }
+      }
+      if (breakerDeferredCount > 0) {
+        // The pause gate exempts rounds whose only errors are these
+        // deferrals — otherwise the breaker's own skip would fail the
+        // round and pause the auto sync it exists to protect.
+        result.breakerDeferredErrors = breakerDeferredCount;
+      }
+      if (breakerCount > 0) {
+        this.diag?.log(
+          "plan",
+          breakerApplies
+            ? `M17 circuit breaker — ${breakerCount} item(s) skipped (3+ consecutive failures)`
+            : `M17 circuit breaker bypassed for ${mode} sync — ${breakerCount} item(s) will retry despite 3+ consecutive failures`,
+        );
+      }
+    }
+
+    const configPrefix = `${getConfigDir(this.scanner.vault)}/`;
+    const obsidianUploads = plan.items.filter((i) =>
+      i.type === SyncActionType.Upload && i.path.startsWith(configPrefix));
+    if (obsidianUploads.length > 0) {
+      this.diag?.log("plan", `plan includes ${configPrefix} uploads: ${obsidianUploads.map((i) => i.path).join(', ')}`);
+    } else {
+      const obsidianLocal = planningLocalEntries.filter((e) => e.path.startsWith(configPrefix));
+      this.diag?.log("plan", `NO ${configPrefix} uploads in plan. localEntries with ${configPrefix}: ${obsidianLocal.map((e) => e.path).join(', ') || '(none)'}`);
+    }
+    return {
+      terminated: null,
+      plan: plan as SyncPlan & { scope: SyncScope },
+    };
+  }
+
+  /** Step 5.5: finalize the canonical plan with content-hash dedup — the
+   *  bounded download cap and the fresh-install cap lift are documented in
+   *  the in-body step comment. The verification closures stay in run() and
+   *  arrive here by reference. */
+  private async runStep5_5FinalizeCanonicalContent(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    plan: SyncPlan;
+    canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
+    migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
+    v2PlanState: StateManager & {
+      getCommittedV2Envelope?: StateManager["getCommittedV2Envelope"];
+    };
+    verifiedFirstSyncRemoteHashesById: ReadonlyMap<string, string>;
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    baselineReconstructionIncomplete: boolean;
+    prepareV2MigrationCandidate: boolean;
+    resolveCanonicalRemoteContentHash: (
+      item: Readonly<SyncPlanItem>,
+      progress: { current: number; total: number },
+      resetProgressPhase?: boolean,
+    ) => Promise<string>;
+    refreshVerificationDownloadUrls: (
+      items: ReadonlyArray<SyncPlanItem>,
+    ) => Promise<void>;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        finalizedCanonicalPlan: FinalizedCanonicalPlanV2 | null;
+        canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
+        migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      plan,
+      v2PlanState,
+      verifiedFirstSyncRemoteHashesById,
+      automaticHandlingPolicy,
+      baselineReconstructionIncomplete,
+      prepareV2MigrationCandidate,
+      resolveCanonicalRemoteContentHash,
+      refreshVerificationDownloadUrls,
+    } = args;
+    let { canonicalPlanCandidate, migrationCandidateEnvelope } = args;
+    // Step 5.5: Content hash dedup — for files that appear on both sides
+    // without a base entry, compare actual content hashes to avoid false
+    // conflicts when the same file exists on two devices (cloud baseline
+    // covers most cases; this is the fallback for remaining edge cases).
+    //
+    // SAFETY LIMIT: during normal sync, download-based hash dedup is
+    // capped at 10 files to avoid stalling on slow networks. When the run
+    // started without any committed base (fresh install or explicit reset),
+    // lift the cap even if cloud-baseline hints seed only some paths.
+    // Uncompared pending items remain eligible on later rounds; only a
+    // version-bound byte-difference receipt may suppress another download.
+    let finalizedCanonicalPlan: FinalizedCanonicalPlanV2 | null = null;
+    let canonicalFinalizationEnvelope: SyncStateEnvelopeV2 | null = null;
+    let contentEqualityBaseUpserts: BaseFileEntry[] = [];
+    let contentEqualityAncestorHashes:
+      Readonly<Record<string, string>> | undefined;
+    const canonicalContentVerification = await this.finalizeCanonicalContentVerification({
+      plan,
+      canonicalPlanCandidate,
+      migrationCandidateEnvelope,
+      v2PlanState,
+      verifiedFirstSyncRemoteHashesById,
+      automaticHandlingPolicy,
+      baselineReconstructionIncomplete,
+      resolveCanonicalRemoteContentHash,
+      refreshVerificationDownloadUrls,
+    });
+    finalizedCanonicalPlan = canonicalContentVerification.finalizedCanonicalPlan;
+    canonicalPlanCandidate = canonicalContentVerification.canonicalPlanCandidate;
+    canonicalFinalizationEnvelope = canonicalContentVerification.canonicalFinalizationEnvelope;
+    contentEqualityBaseUpserts = canonicalContentVerification.contentEqualityBaseUpserts;
+    if (contentEqualityBaseUpserts.length > 0) {
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      if (!prepareV2MigrationCandidate) {
+        await this.stageVerifiedLocalAncestorContent(
+          contentEqualityBaseUpserts,
+        );
+        contentEqualityAncestorHashes =
+          await this.state.upsertBaseEntries(contentEqualityBaseUpserts);
+      }
+      if (migrationCandidateEnvelope) {
+        const unpublishedCandidateMeta = migrationCandidateEnvelope.meta;
+        const contentFinalizedCandidate = upsertBaseStateEnvelopeV2(
+          migrationCandidateEnvelope,
+          contentEqualityBaseUpserts,
+          unpublishedCandidateMeta.committedAt,
+        );
+        // Content verification is still part of constructing the first
+        // unpublished migration candidate. The general V2 controller
+        // increments commitSeq for an already authoritative envelope; do
+        // not turn this in-memory preparation into a fictitious prior
+        // publication.
+        migrationCandidateEnvelope = {
+          ...contentFinalizedCandidate,
+          meta: { ...unpublishedCandidateMeta },
+        };
+      }
+    }
+    if (finalizedCanonicalPlan) {
+      const committedEnvelope = migrationCandidateEnvelope
+        ?? (
+          typeof v2PlanState.getCommittedV2Envelope === "function"
+            ? v2PlanState.getCommittedV2Envelope()
+            : null
+        );
+      if (!canonicalFinalizationEnvelope || !committedEnvelope) {
+        throw new Error(
+          "V2 canonical sealing requires both source and committed envelopes",
+        );
+      }
+      const sealed = sealCanonicalPlanV2({
+        finalized: finalizedCanonicalPlan,
+        sourceEnvelope: canonicalFinalizationEnvelope,
+        committedEnvelope,
+        ancestorHashesByPath: contentEqualityAncestorHashes,
+        unpublishedMigrationCandidate: prepareV2MigrationCandidate,
+      });
+      finalizedCanonicalPlan = sealed;
+      canonicalPlanCandidate = sealed;
+      plan.items = sealed.items;
+      plan.scope = { ...sealed.scope };
+      plan.canonicalIdentity = sealed.canonicalIdentity;
+      plan.canonicalReview = sealed.canonicalReview;
+      this.diag?.log(
+        "plan",
+        `V2 canonical plan sealed at commit ${sealed.sourceCommitSeq}`,
+        {
+          sourceCommitSeq: sealed.sourceCommitSeq,
+          actions: sealed.items.length,
+          reviewImpact: sealed.canonicalReview.impactCount,
+          digestBytes: sealed.canonicalIdentity.digest.length,
+          mutations: 0,
+        },
+      );
+    }
+    return {
+      terminated: null,
+      finalizedCanonicalPlan,
+      canonicalPlanCandidate,
+      migrationCandidateEnvelope,
+    };
+  }
+
+  /** Canonical content verification and candidate rebinding of
+   *  runStep5_5FinalizeCanonicalContent — moved verbatim; the rebound
+   *  canonical state returns to the caller in the outcome. */
+  private async finalizeCanonicalContentVerification(args: FinalizeCanonicalContentVerificationArgs): Promise<FinalizeCanonicalContentVerificationOutcome> {
+    const {
+      plan, migrationCandidateEnvelope, v2PlanState,
+      verifiedFirstSyncRemoteHashesById, automaticHandlingPolicy,
+      baselineReconstructionIncomplete, resolveCanonicalRemoteContentHash,
+      refreshVerificationDownloadUrls,
+    } = args;
+    let { canonicalPlanCandidate } = args;
+    let finalizedCanonicalPlan: FinalizedCanonicalPlanV2 | null = null;
+    let canonicalFinalizationEnvelope: SyncStateEnvelopeV2 | null = null;
+    let contentEqualityBaseUpserts: BaseFileEntry[] = [];
+    if (canonicalPlanCandidate) {
+      const finalizedEnvelope = migrationCandidateEnvelope
+        ?? (
+          typeof v2PlanState.getCommittedV2Envelope === "function"
+            ? v2PlanState.getCommittedV2Envelope()
+            : null
+        );
+      if (!finalizedEnvelope) {
+        throw new Error(
+          "V2 canonical finalization requires a committed envelope",
+        );
+      }
+      canonicalFinalizationEnvelope = finalizedEnvelope;
+      finalizedCanonicalPlan = await finalizeCanonicalPlanCandidateV2({
+        candidate: {
+          ...canonicalPlanCandidate,
+          items: plan.items,
+        },
+        envelope: finalizedEnvelope,
+        vaultName: this.vaultName,
+        accountId: this.state.boundAccountId ?? "",
+        configDir: getConfigDir(this.scanner.vault),
+        automaticHandlingPolicy,
+        baselineReconstructionIncomplete,
+        pendingContentComparisons: this.state.pendingConflicts.map(
+          (item) => ({
+            path: item.path,
+            contentComparison: item.contentComparison,
+          }),
+        ),
+        verifiedRemoteContentHashesById:
+          verifiedFirstSyncRemoteHashesById,
+        resolveRemoteContentHash: resolveCanonicalRemoteContentHash,
+        refreshVerificationDownloadUrls,
+        // Knife-2 (2026-09-08): bounded read-only overlap for plan-time
+        // content-verification downloads. Window caps reuse the descendant
+        // reconstruction batch caps (desktop 4 files/32 MiB, mobile
+        // 2 files/8 MiB) — the same read-only memory envelope proven on
+        // real devices; absent here means strictly serial verification.
+        verificationDownloadWindow: Platform.isMobile
+          ? {
+              maxFiles: MOBILE_RECONSTRUCTION_BATCH_FILES,
+              maxBytes: MOBILE_RECONSTRUCTION_BATCH_BYTES,
+            }
+          : {
+              maxFiles: DESKTOP_RECONSTRUCTION_BATCH_FILES,
+              maxBytes: DESKTOP_RECONSTRUCTION_BATCH_BYTES,
+            },
+      });
+      contentEqualityBaseUpserts = finalizedCanonicalPlan.baseUpserts;
+      plan.items = finalizedCanonicalPlan.items;
+      canonicalPlanCandidate = finalizedCanonicalPlan;
+      const verification = finalizedCanonicalPlan.contentVerification;
+      if (verification.candidates > 0) {
+        this.diag?.log(
+          "plan",
+          `V2 canonical content verification — ${verification.cachedEvidence} cached evidence candidate(s), ${verification.downloads} download candidate(s), ${verification.skippedDownloads} deferred`,
+        );
+        for (const item of verification.results) {
+          if (item.outcome === "failed") {
+            this.diag?.warn(
+              "plan",
+              `canonical content verification kept ${item.path} — ${item.error ?? "unknown failure"}`,
+            );
+          } else {
+            this.diag?.log(
+              "plan",
+              `canonical content verification ${item.outcome.toUpperCase()} — ${item.path} via ${item.proof}`,
+            );
+          }
+        }
+      }
+    }
+    return { finalizedCanonicalPlan, canonicalPlanCandidate, canonicalFinalizationEnvelope, contentEqualityBaseUpserts };
+  }
+
+  /** Step 6: Threshold check — automatic runs record a structured run-fact
+   *  instead of pausing; interactive runs confirm through the callback. The
+   *  review closure stays in run() and arrives here by reference. */
+  private async runStep6CheckThreshold(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    plan: SyncPlan;
+    skipConfirmation: boolean;
+    mode: SyncMode;
+    callbacks: SyncCallbacks;
+    finalizedCanonicalPlan: FinalizedCanonicalPlanV2 | null;
+    joinAuthorizationsByPluginId: Map<
+      string,
+      Readonly<CommunityPluginJoinAuthorization>
+    >;
+    waitForReview: (review: () => Promise<boolean>) => Promise<boolean>;
+  }): Promise<{ terminated: SyncResult } | { terminated: null }> {
+    const {
+      result,
+      operationEpoch,
+      plan,
+      skipConfirmation,
+      mode,
+      callbacks,
+      finalizedCanonicalPlan,
+      joinAuthorizationsByPluginId,
+      waitForReview,
+    } = args;
+    // Step 6: Threshold check (skip if user is confirming a reviewed plan)
+    if (!finalizedCanonicalPlan) {
+      throw new Error("V2 canonical plan was not finalized");
+    }
+    const authorizedJoinPaths = new Set(
+      [...joinAuthorizationsByPluginId.values()].flatMap((authorization) =>
+        authorization.members.map((member) => member.path)
+      ),
+    );
+    const planContainsOnlyExplicitJoinDownloads = plan.items.length > 0
+      && plan.items.every((item) =>
+        item.type === SyncActionType.Download
+        && authorizedJoinPaths.has(item.path)
+      );
+    const requiresThresholdConfirmation =
+      finalizedCanonicalPlan.requiresThresholdConfirmation
+      && !planContainsOnlyExplicitJoinDownloads;
+    if (!skipConfirmation && requiresThresholdConfirmation) {
+      if (mode === "auto") {
+        // Direction 3 (user decision 2026-09-02): automatic sync does not
+        // pause for the threshold review — the plan proceeds and the
+        // caller shows a one-line summary notice instead. The structured
+        // flag replaces any localised-message signal.
+        const priorFacts = result.runFacts;
+        result.runFacts = {
+          termination: priorFacts?.termination ?? "normal",
+          ordinaryPlanning: priorFacts?.ordinaryPlanning ?? "not-entered",
+          userFileChanges: priorFacts?.userFileChanges ?? "unknown",
+          thresholdSkippedInAuto: true,
+        };
+      } else if (callbacks.onConfirmThreshold) {
+        const confirmed = await waitForReview(() => callbacks.onConfirmThreshold!(plan));
+        if (!confirmed) {
+          return { terminated: this.markPlanReviewPaused(result) };
+        }
+        if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      }
+      plan.confirmed = true;
+    }
+    return { terminated: null };
+  }
+
+  /** Step 7: First sync preview gate — interactive first runs confirm the
+   *  previewed plan before any mutation. The review closure stays in run()
+   *  and arrives here by reference. */
+  private async runStep7FirstSyncPreview(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    plan: SyncPlan;
+    skipConfirmation: boolean;
+    mode: SyncMode;
+    callbacks: SyncCallbacks;
+    waitForReview: (review: () => Promise<boolean>) => Promise<boolean>;
+  }): Promise<{ terminated: SyncResult } | { terminated: null }> {
+    const {
+      result,
+      operationEpoch,
+      plan,
+      skipConfirmation,
+      mode,
+      callbacks,
+      waitForReview,
+    } = args;
+    // Step 7: First sync preview (skip if user is confirming a reviewed plan)
+    if (!skipConfirmation && mode === "first") {
+      if (callbacks.onFirstSyncPreview) {
+        const confirmed = await waitForReview(() => callbacks.onFirstSyncPreview!(plan));
+        if (!confirmed) {
+          return { terminated: this.markPlanReviewPaused(result) };
+        }
+        if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      }
+      plan.confirmed = true;
+    }
+    return { terminated: null };
+  }
+
+  /** Between Steps 7 and 8: V2 authority may change only after every
+   *  mandatory review gate has authorized this exact zero-plan round. The
+   *  retire/publish closures stay in run() and arrive here by reference. */
+  private async runStep7_5ActivateV2Authority(args: {
+    result: SyncResult;
+    plan: SyncPlan;
+    attemptV2Activation: boolean;
+    migrationAuthorityCommittedThisRun: boolean;
+    localFolderScanComplete: boolean;
+    migrationRemoteItems: DriveItem[] | null;
+    migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
+    public113MigrationInput: Awaited<
+      ReturnType<StateManager["readPublic113MigrationInput"]>
+    > | null;
+    retireFirstSyncVerificationEvidence: () => Promise<void>;
+    publishCommunityPluginPostAuthorityState: () => Promise<void>;
+  }): Promise<{ terminated: SyncResult } | { terminated: null }> {
+    const {
+      result,
+      plan,
+      attemptV2Activation,
+      migrationAuthorityCommittedThisRun,
+      localFolderScanComplete,
+      migrationRemoteItems,
+      migrationCandidateEnvelope,
+      public113MigrationInput,
+      retireFirstSyncVerificationEvidence,
+      publishCommunityPluginPostAuthorityState,
+    } = args;
+    // Authority may change only after every mandatory review gate has
+    // authorized this exact zero-plan round. A declined first-sync preview
+    // or a forced recovery preview must leave V1 authoritative.
+    if (attemptV2Activation && !migrationAuthorityCommittedThisRun) {
+      const activationReady = plan.items.length === 0
+        && result.skippedLarge === 0
+        && result.skippedIgnored === 0
+        && localFolderScanComplete
+        && this.state.mutationLedger.length === 0
+        && !this.state.hasMutationLedgerCorruption
+        && migrationRemoteItems !== null
+        && migrationCandidateEnvelope !== null
+        && plan.canonicalIdentity !== undefined
+        && public113MigrationInput !== null;
+      if (activationReady) {
+        const migration =
+          await this.state.activatePreparedV2MigrationCandidate({
+            candidate: migrationCandidateEnvelope,
+            canonicalIdentity: plan.canonicalIdentity!,
+            source: public113MigrationInput,
+          });
+        this.diag?.log("state", `V2 controlled activation ${migration.status}`, {
+          phase: "activation",
+          status: migration.status,
+          reason: migration.reason,
+          pending: migration.pending.length,
+          mutations: migration.mutations.length,
+        });
+        if (migration.status !== "committed" && migration.status !== "already-committed") {
+          throw new Error(`V2 state activation aborted: ${migration.reason ?? "unknown"}`);
+        }
+        await retireFirstSyncVerificationEvidence();
+        await publishCommunityPluginPostAuthorityState();
+        if (
+          this.state.planReviewActive
+          && !this.state.activeV2MigrationHold
+        ) {
+          await this.state.clearPlanReview();
+        }
+      } else {
+        this.diag?.warn("state", "V2 controlled activation held before mutation", {
+          phase: "activation",
+          planItems: plan.items.length,
+          skippedLarge: result.skippedLarge,
+          skippedIgnored: result.skippedIgnored,
+          localFolderScanComplete,
+          planReviewActive: this.state.planReviewActive,
+          pendingConflicts: this.state.pendingConflicts.length,
+          pendingDeletes: this.state.pendingRemoteDeletes.length,
+          pendingIssues: this.state.pendingIssues.length,
+          mutationLedger: this.state.mutationLedger.length,
+          remoteIdentityComplete: migrationRemoteItems !== null,
+          mutations: 0,
+        });
+        return { terminated: this.markPlanReviewPaused(result) };
+      }
+    }
+    return { terminated: null };
+  }
+
+  /** Between Steps 7 and 8: pending decisions are ancillary UI state, not
+   *  planning authority — pruned only after every review/activation gate
+   *  has passed. */
+  private async runStep7_6PrunePendingDecisions(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    plan: SyncPlan;
+    protectedMutationRecoveryRecords: readonly Readonly<MutationLedgerEntryV1>[];
+  }): Promise<{ terminated: SyncResult } | { terminated: null }> {
+    const {
+      result,
+      operationEpoch,
+      plan,
+      protectedMutationRecoveryRecords,
+    } = args;
+    // Pending decisions are ancillary UI state, not planning authority.
+    // Prune them only after every review/activation gate has passed so a
+    // preview never rewrites legacy state and a zero-plan migration can
+    // archive the original public-1.1.3 snapshot before retiring stale UI.
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    // A downgrade-review row whose bundle still has a download or upload in
+    // this plan must survive pruning: the plan-level guards re-hang the same
+    // bundle on every round, so retiring the row here would recreate the
+    // identical pending conflict on the next round — an endless per-interval
+    // cycle. The row is retired only when the user settles it or the plan
+    // stops touching the bundle (remote no longer lower than local).
+    const pendingDowngradeRetained = new Set(
+      this.state.pendingConflicts
+        .filter((item) => item.reason === "reason.pluginDowngradeRemote")
+        .filter((item) => this.planStillDownloadsPluginBundle(plan, item.path)
+          || this.planStillUploadsPluginBundle(plan, item.path))
+        .map((item) => item.path),
+    );
+    await this.state.prunePendingConflicts(
+      [
+        ...plan.items
+          .filter((item) => item.type === SyncActionType.Conflict)
+          .map((item) => item.path),
+        ...this.state.pendingConflicts
+          .filter((item) => this.isPathProtectedByIsolatedRecovery(
+            item.path,
+            protectedMutationRecoveryRecords,
+          ))
+          .map((item) => item.path),
+        ...pendingDowngradeRetained,
+      ],
+    );
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    await this.state.prunePendingDeletes(
+      [
+        ...plan.items
+          .filter((item) => item.type === SyncActionType.ConfirmLocalDelete
+          || item.type === SyncActionType.DeleteLocal
+          || (
+            item.type === SyncActionType.DeleteLocalFolder
+            && item.requiresConfirmation
+          ))
+          .map((item) => item.path),
+        ...this.state.pendingRemoteDeletes
+          .filter((item) => this.isPathProtectedByIsolatedRecovery(
+            item.path,
+            protectedMutationRecoveryRecords,
+          ))
+          .map((item) => item.path),
+      ],
+    );
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    await this.state.prunePendingIssues(
+      [
+        ...plan.items
+          .filter((item) => isPendingIssueAction(item.type))
+          .map((item) => item.path),
+        ...this.state.pendingIssues
+          .filter((item) => this.isPathProtectedByIsolatedRecovery(
+            item.path,
+            protectedMutationRecoveryRecords,
+          ))
+          .map((item) => item.path),
+      ],
+    );
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    return { terminated: null };
+  }
+
+  /** Step 8: Execute plan items — including the reviewed folder-move
+   *  continuation transaction, the migration-hold completion, the commit
+   *  phase gate and the community-plugin restore checkpoint. The canonical
+   *  include/resolve closures stay in run() and arrive here by reference. */
+  private async runStep8ExecutePlanItems(args: {
+    result: SyncResult;
+    plan: SyncPlan & { scope: SyncScope };
+    callbacks: SyncCallbacks;
+    operationEpoch: number;
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    automaticHandlingMetrics: ReturnType<typeof createAutomaticHandlingMetrics>;
+    communityPluginSyncPolicy: ReturnType<typeof cloneCommunityPluginSyncPolicy>;
+    protectedMutationRecoveryRecords: MutationLedgerEntryV1[];
+    canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
+    remoteEntries: RemoteFileEntry[];
+    configDir: string;
+    joinAuthorizationsByPluginId: Map<
+      string,
+      Readonly<CommunityPluginJoinAuthorization>
+    >;
+    syncScope: SyncScope;
+    localFolderScanComplete: boolean;
+    enterPhase: (nextPhase: SyncRunPhase) => void;
+    includeCanonicalFilePath: (path: string) => boolean;
+    includeCanonicalFolderPath: (path: string) => boolean;
+    preserveCanonicalFolderPath: (path: string) => boolean;
+    resolveCanonicalRemoteContentHash: (
+      item: Readonly<SyncPlanItem>,
+      progress: { current: number; total: number },
+      resetProgressPhase?: boolean,
+    ) => Promise<string>;
+    migrationExecutionHold: MigrationHoldV2 | null;
+  }): Promise<
+    | { terminated: SyncResult }
+    | { terminated: null; migrationExecutionHold: MigrationHoldV2 | null }
+  > {
+    const {
+      result,
+      plan,
+      callbacks,
+      operationEpoch,
+      automaticHandlingPolicy,
+      automaticHandlingMetrics,
+      communityPluginSyncPolicy,
+      protectedMutationRecoveryRecords,
+      canonicalPlanCandidate,
+      remoteEntries,
+      configDir,
+      joinAuthorizationsByPluginId,
+      syncScope,
+      localFolderScanComplete,
+      enterPhase,
+      includeCanonicalFilePath,
+      includeCanonicalFolderPath,
+      preserveCanonicalFolderPath,
+      resolveCanonicalRemoteContentHash,
+    } = args;
+    let { migrationExecutionHold } = args;
+    // Step 8: Execute plan items
+    enterPhase("transfer");
+    this.progressStore?.setPhase("executing");
+    const stagedFolderMoves = plan.items.filter(
+      (item) => item.type === SyncActionType.MoveRemoteFolder
+        || item.type === SyncActionType.MoveLocalFolder,
+    );
+    const stagedFolderMove =
+      stagedFolderMoves.length === 1
+      && canonicalPlanCandidate?.folderPlan.items.length === 1
+      && (
+        canonicalPlanCandidate.folderPlan.items[0]?.type === "move-remote"
+        || canonicalPlanCandidate.folderPlan.items[0]?.type === "move-local"
+      )
+      && plan.canonicalIdentity
+        ? stagedFolderMoves[0]
+        : null;
+    const foldersMovedBeforeExecution = result.foldersMoved ?? 0;
+    await this.executePlan(
+      plan,
+      result,
+      callbacks,
+      operationEpoch,
+      automaticHandlingPolicy,
+      automaticHandlingMetrics,
+      communityPluginSyncPolicy,
+      protectedMutationRecoveryRecords,
+    );
+    // A folder move is a topology transaction in either direction. Only
+    // after its receipt/checkpoint has advanced the authority may one fresh
+    // scan produce a single bounded descendant plan; never recurse into run().
+    await this.continueStagedFolderMoveDescendantPlan({
+      stagedFolderMove,
+      foldersMovedBeforeExecution,
+      plan,
+      result,
+      operationEpoch,
+      callbacks,
+      automaticHandlingPolicy,
+      automaticHandlingMetrics,
+      communityPluginSyncPolicy,
+      configDir,
+      includeCanonicalFilePath,
+      includeCanonicalFolderPath,
+      preserveCanonicalFolderPath,
+      resolveCanonicalRemoteContentHash,
+    });
+    if (
+      migrationExecutionHold
+      && result.errors === 0
+      && result.deferred === 0
+      && this.state.mutationLedger.length === 0
+    ) {
+      const completed = await this.state.transitionV2MigrationHold(
+        migrationExecutionHold,
+        "completed",
+      );
+      if (!completed) {
+        throw new Error(
+          "V2 migration plan finished but its hold did not complete",
+        );
+      }
+      migrationExecutionHold = completed;
+    }
+    enterPhase("commit");
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+
+    if (this.state.remoteGeneration !== this.startGeneration) {
+      result.message = this.t("result.generationMismatch");
+      this.diag?.warn("execute", `generation mismatch after executePlan (${this.startGeneration} → ${this.state.remoteGeneration}), aborting`);
+      return { terminated: result };
+    }
+
+    const detectedCommunityPluginRestores =
+      await this.detectCompletedCommunityPluginRestores(
+        communityPluginSyncPolicy,
+        remoteEntries,
+        configDir,
+        [...joinAuthorizationsByPluginId.keys()],
+      );
+    const completedCommunityPluginFiles =
+      await this.checkpointCompletedCommunityPluginJoinRoots({
+        pluginIds: detectedCommunityPluginRestores.files,
+        authorizationsByPluginId: joinAuthorizationsByPluginId,
+        remoteEntries,
+        scope: syncScope,
+        localFolderScanComplete,
+      });
+    if (
+      completedCommunityPluginFiles.length
+      !== detectedCommunityPluginRestores.files.length
+    ) {
+      result.deferred += detectedCommunityPluginRestores.files.length
+        - completedCommunityPluginFiles.length;
+    }
+    const completedCommunityPluginRestores = {
+      files: completedCommunityPluginFiles,
+      data: detectedCommunityPluginRestores.data,
+    };
+    if (
+      completedCommunityPluginRestores.files.length > 0
+      || completedCommunityPluginRestores.data.length > 0
+    ) {
+      result.communityPluginRestoresCompleted =
+        completedCommunityPluginRestores;
+    }
+    return {
+      terminated: null,
+      migrationExecutionHold,
+    };
+  }
+
+  /**
+   * Continue one staged folder move with a single bounded descendant plan.
+   *
+   * A folder move is a topology transaction in either direction. Only after
+   * its receipt and checkpoint have advanced the authority may one fresh
+   * scan produce a bounded descendant plan, and only when the committed
+   * anchor, the ledger and the stop signal all agree; otherwise the round is
+   * deferred and reported instead of recursing into run().
+   */
+  private async continueStagedFolderMoveDescendantPlan(args: {
+    stagedFolderMove: SyncPlanItem | null;
+    foldersMovedBeforeExecution: number;
+    plan: SyncPlan & { scope: SyncScope };
+    result: SyncResult;
+    operationEpoch: number;
+    callbacks: SyncCallbacks;
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    automaticHandlingMetrics: ReturnType<typeof createAutomaticHandlingMetrics>;
+    communityPluginSyncPolicy: ReturnType<typeof cloneCommunityPluginSyncPolicy>;
+    configDir: string;
+    includeCanonicalFilePath: (path: string) => boolean;
+    includeCanonicalFolderPath: (path: string) => boolean;
+    preserveCanonicalFolderPath: (path: string) => boolean;
+    resolveCanonicalRemoteContentHash: (
+      item: Readonly<SyncPlanItem>,
+      progress: { current: number; total: number },
+      resetProgressPhase?: boolean,
+    ) => Promise<string>;
+  }): Promise<void> {
+    const {
+      stagedFolderMove,
+      foldersMovedBeforeExecution,
+      plan,
+      result,
+      operationEpoch,
+      callbacks,
+      automaticHandlingPolicy,
+      automaticHandlingMetrics,
+      communityPluginSyncPolicy,
+      configDir,
+      includeCanonicalFilePath,
+      includeCanonicalFolderPath,
+      preserveCanonicalFolderPath,
+      resolveCanonicalRemoteContentHash,
+    } = args;
+    if (
+      !stagedFolderMove
+      || (result.foldersMoved ?? 0) !== foldersMovedBeforeExecution + 1
+      || result.errors !== 0
+      || result.conflicts !== 0
+      || result.deferred !== 0
+      || this.state.mutationLedger.length !== 0
+      || this.shouldStop(result, operationEpoch)
+    ) {
+      return;
+    }
+    const targetRoot = stagedFolderMove.path;
+    const sourceRoot = stagedFolderMove.renameFrom;
+    const remoteId = stagedFolderMove.folder?.remoteId;
+    const sourceCommitSeq = plan.canonicalIdentity!.sourceCommitSeq;
+    const checkpointEnvelope = this.state.getCommittedV2Envelope();
+    const committedFolderAnchor = remoteId && checkpointEnvelope
+      ? Object.values(
+          checkpointEnvelope.folderAnchors?.byAnchorId ?? {},
+        ).find((anchor) => anchor.remoteId === remoteId)
+      : null;
+    const moveAuthorizationSettled = stagedFolderMove.type
+      === SyncActionType.MoveLocalFolder
+      || (remoteId
+        ? !this.state.localFolderMoveHints.some((hint) =>
+            hint.remoteId === remoteId
+            || (
+              sourceRoot !== undefined
+              && hint.fromPath === sourceRoot
+              && hint.toPath === targetRoot
+            ))
+        : false);
+    const continuationSettled =
+      await this.settleStagedFolderMoveContinuation({
+        checkpointEnvelope,
+        remoteId,
+        targetRoot,
+        sourceCommitSeq,
+        moveAuthorizationSettled,
+        committedFolderAnchor,
+        plan,
+        result,
+        operationEpoch,
+        callbacks,
+        automaticHandlingPolicy,
+        automaticHandlingMetrics,
+        communityPluginSyncPolicy,
+        includeCanonicalFilePath,
+        includeCanonicalFolderPath,
+        preserveCanonicalFolderPath,
+        resolveCanonicalRemoteContentHash,
+        configDir,
+      });
+    if (!continuationSettled) {
+      result.deferred = Math.max(1, result.deferred);
+      this.diag?.warn(
+        "plan",
+        "V2 folder checkpoint committed but descendant continuation was not fully proven",
+        { root: targetRoot, mutations: 0 },
+      );
+    }
+  }
+
+  /**
+   * Prove and run the one bounded descendant plan a staged folder move allows.
+   *
+   * The committed anchor, the ledger and the stop signal must all agree after
+   * a fresh scan; only then may the sealed continuation plan be executed under
+   * the authorization the reviewed folder move already carried. Returns
+   * whether the continuation settled.
+   */
+  private async settleStagedFolderMoveContinuation(args: {
+    checkpointEnvelope: ReturnType<StateManager["getCommittedV2Envelope"]>;
+    remoteId: string | undefined;
+    targetRoot: string;
+    sourceCommitSeq: number;
+    moveAuthorizationSettled: boolean;
+    committedFolderAnchor: { lastPath: string } | null | undefined;
+    plan: SyncPlan & { scope: SyncScope };
+    result: SyncResult;
+    operationEpoch: number;
+    callbacks: SyncCallbacks;
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    automaticHandlingMetrics: ReturnType<typeof createAutomaticHandlingMetrics>;
+    communityPluginSyncPolicy: ReturnType<typeof cloneCommunityPluginSyncPolicy>;
+    includeCanonicalFilePath: (path: string) => boolean;
+    includeCanonicalFolderPath: (path: string) => boolean;
+    preserveCanonicalFolderPath: (path: string) => boolean;
+    resolveCanonicalRemoteContentHash: (item: Readonly<SyncPlanItem>, progress: { current: number; total: number }, resetProgressPhase?: boolean) => Promise<string>;
+    configDir: string;
+  }): Promise<boolean> {
+    const {
+      checkpointEnvelope,
+      remoteId,
+      targetRoot,
+      sourceCommitSeq,
+      moveAuthorizationSettled,
+      committedFolderAnchor,
+      plan,
+      result,
+      operationEpoch,
+      callbacks,
+      automaticHandlingPolicy,
+      automaticHandlingMetrics,
+      communityPluginSyncPolicy,
+      includeCanonicalFilePath,
+      includeCanonicalFolderPath,
+      preserveCanonicalFolderPath,
+      resolveCanonicalRemoteContentHash,
+      configDir,
+    } = args;
+    if (
+      !checkpointEnvelope
+      || !remoteId
+      || committedFolderAnchor?.lastPath !== targetRoot
+      || checkpointEnvelope.meta.commitSeq <= sourceCommitSeq
+      || !moveAuthorizationSettled
+    ) {
+      return false;
+    }
+    const continuationScan = await this.scanner.scanAll();
+    const continuationScanComplete = continuationScan.complete !== false
+      && continuationScan.failedPaths.length === 0
+      && continuationScan.folderScanComplete === true;
+    let continuationEnvelope: SyncStateEnvelopeV2 | null =
+      checkpointEnvelope;
+    if (
+      continuationScanComplete
+      && this.state.mutationLedger.length === 0
+      && !this.shouldStop(result, operationEpoch)
+    ) {
+      const continuationRemote = await this.tryDeltaOrFullScan(
+        operationEpoch,
+        result,
+        plan.scope,
+        continuationScan.entries,
+      );
+      continuationEnvelope = this.state.getCommittedV2Envelope();
+      const refreshedFolderAnchor = remoteId && continuationEnvelope
+        ? Object.values(
+            continuationEnvelope.folderAnchors?.byAnchorId ?? {},
+          ).find((anchor) => anchor.remoteId === remoteId)
+        : null;
+      if (
+        !continuationEnvelope
+        || !sameSyncScope(continuationRemote.scope, plan.scope)
+        || refreshedFolderAnchor?.lastPath !== targetRoot
+        || this.state.mutationLedger.length > 0
+        || this.shouldStop(result, operationEpoch)
+      ) {
+        continuationEnvelope = null;
+      }
+    } else {
+      continuationEnvelope = null;
+    }
+    const includeContinuationFilePath = (path: string): boolean =>
+      includeCanonicalFilePath(path)
+      && isAtOrBelowPath(
+        normalizeRemotePathKey(path),
+        normalizeRemotePathKey(targetRoot),
+      );
+    let continuationCandidate = continuationEnvelope
+      ? buildCanonicalPlanCandidateV2({
+          envelope: continuationEnvelope,
+          localFiles: continuationScan.entries,
+          localFolders: continuationScan.folders ?? [],
+          localFolderScanComplete: true,
+          skippedLarge: continuationScan.skippedLarge,
+          localMoveHints: this.state.localFolderMoveHints,
+          localFolderDeleteHints: this.state.localFolderDeleteHints,
+          localFileMoveHints: this.state.localFileMoveHints,
+          includeFilePath: includeContinuationFilePath,
+          includeFolderPath: includeCanonicalFolderPath,
+          preserveFolderPath: preserveCanonicalFolderPath,
+          configDir,
+          automaticDeleteLocalFiles:
+            automaticHandlingPolicy.autoDeleteLocalFiles,
+        })
+      : null;
+    const continuationSourceEnvelope = continuationEnvelope;
+    return this.sealAndRunStagedFolderMoveContinuation({
+      continuationSourceEnvelope,
+      continuationCandidate,
+      continuationScanEntries: continuationScan.entries,
+      communityPluginSyncPolicy,
+      configDir,
+      automaticHandlingPolicy,
+      resolveCanonicalRemoteContentHash,
+      targetRoot,
+      sourceCommitSeq,
+      result,
+      callbacks,
+      operationEpoch,
+      automaticHandlingMetrics,
+    });
+  }
+
+  /**
+   * Seal the bounded descendant plan a staged folder move proved and run it.
+   *
+   * The reviewed folder move already counted the complete affected subtree, so
+   * the sealed continuation reuses that authorization instead of showing a
+   * second threshold prompt for the same operation. Returns whether the
+   * continuation settled.
+   */
+  private async sealAndRunStagedFolderMoveContinuation(args: {
+    continuationSourceEnvelope: SyncStateEnvelopeV2 | null;
+    continuationCandidate: CanonicalPlanCandidateV2 | null;
+    continuationScanEntries: LocalFileEntry[];
+    communityPluginSyncPolicy: ReturnType<typeof cloneCommunityPluginSyncPolicy>;
+    configDir: string;
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    resolveCanonicalRemoteContentHash: (item: Readonly<SyncPlanItem>, progress: { current: number; total: number }, resetProgressPhase?: boolean) => Promise<string>;
+    targetRoot: string;
+    sourceCommitSeq: number;
+    result: SyncResult;
+    callbacks: SyncCallbacks;
+    operationEpoch: number;
+    automaticHandlingMetrics: ReturnType<typeof createAutomaticHandlingMetrics>;
+  }): Promise<boolean> {
+    const {
+      continuationSourceEnvelope,
+      continuationScanEntries,
+      communityPluginSyncPolicy,
+      configDir,
+      automaticHandlingPolicy,
+      resolveCanonicalRemoteContentHash,
+      targetRoot,
+      sourceCommitSeq,
+      result,
+      callbacks,
+      operationEpoch,
+      automaticHandlingMetrics,
+    } = args;
+    let { continuationCandidate } = args;
+    if (
+      !continuationSourceEnvelope
+      || continuationCandidate?.status !== "planned"
+      || continuationCandidate.folderPlan.items.length !== 0
+    ) {
+      return false;
+    }
+    const continuationItems = protectEasySyncSelfSyncPlan(
+      protectCommunityPluginPlan(
+        continuationCandidate.items,
+        communityPluginSyncPolicy,
+        configDir,
+        continuationScanEntries,
+      ),
+      configDir,
+    );
+    continuationCandidate = {
+      ...continuationCandidate,
+      items: continuationItems,
+    };
+    const finalizedContinuation =
+      await finalizeCanonicalPlanCandidateV2({
+        candidate: continuationCandidate,
+        envelope: continuationSourceEnvelope,
+        vaultName: this.vaultName,
+        accountId: this.state.boundAccountId ?? "",
+        configDir: getConfigDir(this.scanner.vault),
+        automaticHandlingPolicy,
+        baselineReconstructionIncomplete: false,
+        pendingContentComparisons: this.state.pendingConflicts.map(
+          (item) => ({
+            path: item.path,
+            contentComparison: item.contentComparison,
+          }),
+        ),
+        resolveRemoteContentHash: resolveCanonicalRemoteContentHash,
+      });
+    const latestEnvelope = this.state.getCommittedV2Envelope();
+    if (
+      finalizedContinuation.baseUpserts.length === 0
+      && latestEnvelope?.meta.commitSeq
+        === continuationSourceEnvelope.meta.commitSeq
+    ) {
+      const sealedContinuation = sealCanonicalPlanV2({
+        finalized: finalizedContinuation,
+        sourceEnvelope: continuationSourceEnvelope,
+        committedEnvelope: latestEnvelope,
+      });
+      if (sealedContinuation.items.length === 0) {
+        return true;
+      } else {
+        // The reviewed folder move already counted the complete
+        // affected subtree. Reuse that authorization instead of
+        // showing a second threshold prompt for the same operation.
+        this.diag?.log(
+          "plan",
+          "V2 folder checkpoint continued with one bounded descendant plan",
+          {
+            root: targetRoot,
+            actions: sealedContinuation.items.length,
+            sourceCommitSeq,
+            continuationCommitSeq: latestEnvelope.meta.commitSeq,
+            mutations: 0,
+          },
+        );
+        await this.executePlan(
+          {
+            items: sealedContinuation.items,
+            lastTotalFiles: sealedContinuation.lastTotalFiles,
+            confirmed: true,
+            scope: { ...sealedContinuation.scope },
+            canonicalIdentity: sealedContinuation.canonicalIdentity,
+            canonicalReview: sealedContinuation.canonicalReview,
+          },
+          result,
+          callbacks,
+          operationEpoch,
+          automaticHandlingPolicy,
+          automaticHandlingMetrics,
+          communityPluginSyncPolicy,
+        );
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Step 9: Mark a healthy sync — persist seeded base entries, advance the
+   *  last-sync time and remote generation, and publish the healthy cloud
+   *  bootstrap, only when no conflicts, deletes, errors or deferrals remain. */
+  private async runStep9MarkHealthySync(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    seededBaseEntries: BaseFileEntry[];
+    seededBaseEntriesPersisted: boolean;
+  }): Promise<{ terminated: SyncResult } | { terminated: null }> {
+    const {
+      result,
+      operationEpoch,
+      seededBaseEntries,
+      seededBaseEntriesPersisted,
+    } = args;
+    // Step 9: Mark healthy sync — only when no conflicts, pending deletes,
+    // errors, deferrals, or auth issues remain. Skips produced by the
+    // user's own configuration (size exclusion, ignored paths) are expected
+    // zero-action outcomes — 2026-09-16 拍板, same contract as
+    // isSyncResultFullyComplete — and must not keep lastSyncTime pinned at
+    // zero for vaults whose settings permanently exclude a few files
+    // (2026-09-19 field report: every round completed, the header still
+    // read "尚未同步").
+    const isHealthy = !result.authExpired
+      && !this.cancelled
+      && this.lifecycle.isCurrent(operationEpoch)
+      && result.errors === 0
+      && result.conflicts === 0
+      && result.deferred === 0;
+    if (isHealthy) {
+      if (
+        seededBaseEntries.length > 0
+        && !seededBaseEntriesPersisted
+      ) {
+        if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+        await this.persistSeededBaseEntries(seededBaseEntries);
+      }
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      await this.state.setLastSyncTime(Date.now());
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      await this.state.incrementRemoteGeneration();
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      await this.publishHealthyCloudBootstrapV2(
+        operationEpoch,
+      );
+      // Older test doubles and pre-migration state holders do not expose
+      // the optional local layout cleanup hook; sync correctness must not
+      // depend on this housekeeping step.
+      if (typeof (this.state as StateManager & {
+        noteHealthySync?: () => Promise<void>;
+      }).noteHealthySync === "function") {
+        await (this.state as StateManager & {
+          noteHealthySync: () => Promise<void>;
+        }).noteHealthySync();
+      }
+    }
+    return { terminated: null };
+  }
+
+  /** Step 9 tail: finalize the run result — success flag, user-change facts
+   *  and the localised summary message (executePlan-set messages win). */
+  private runStep9FinalizeResultSummary(args: {
+    result: SyncResult;
+    mutationRecordsAtRunStart: number;
+  }): void {
+    const { result, mutationRecordsAtRunStart } = args;
+    result.success = !result.authExpired
+      && !this.cancelled
+      && result.errors === 0;
+    const completedUserFileActions =
+      result.uploaded
+      + result.downloaded
+      + result.deleted
+      + (result.foldersCreated ?? 0)
+      + (result.foldersMoved ?? 0)
+      + (result.foldersDeleted ?? 0)
+      + (result.filesMoved ?? 0);
+    result.runFacts!.userFileChanges = completedUserFileActions > 0
+      ? "performed"
+      : result.success
+        && mutationRecordsAtRunStart === 0
+        && this.state.mutationLedger.length === 0
+        ? "none"
+        : "unknown";
+    result.runFacts!.convergences = this.convergencesThisRound || undefined;
+    // Preserve message set by executePlan (e.g. auth expired, cancelled)
+    if (!result.message) {
+      const expectedSkips = result.skippedLarge + result.skippedIgnored;
+      const skipped = expectedSkips + result.skippedInvalidName;
+      const resultKey = result.errors > 0
+        ? "result.partial"
+        : result.conflicts > 0
+          ? "result.conflictsPending"
+          : result.deferred > 0
+            ? "result.deferred"
+            : skipped > 0
+              ? result.skippedInvalidName > 0
+                ? "result.skipped"
+                : "result.skippedBySettings"
+              : "result.synced";
+      result.message = this.t(resultKey, {
+        uploaded: result.uploaded,
+        downloaded: result.downloaded,
+        foldersCreated: result.foldersCreated ?? 0,
+        foldersMoved: result.foldersMoved ?? 0,
+        foldersDeleted: result.foldersDeleted ?? 0,
+        filesMoved: result.filesMoved ?? 0,
+        deleted: result.deleted,
+        conflicts: result.conflicts,
+        deferred: result.deferred,
+        skipped,
+        errors: result.errors,
+      });
+    }
+  }
+
+  /** Step 1.5: resolve and initialize the remote vault directory — restore a
+   *  committed scope (delta cache, then identity read-back), recover a lost
+   *  committed scope, or initialize a fresh one. The phase closure stays in
+   *  run() and arrives here by reference. */
+  private async runStep1_5PrepareRemoteVaultScope(args: {
+    result: SyncResult;
+    callbacks: SyncCallbacks;
+    operationEpoch: number;
+    mode: SyncMode;
+    options: SyncRunOptions;
+    automaticHandlingPolicy: AutomaticHandlingPolicy;
+    communityPluginSyncPolicy: ReturnType<typeof cloneCommunityPluginSyncPolicy>;
+    recoveryOnly: boolean;
+    enterPhase: (nextPhase: SyncRunPhase) => void;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        committedScope: StateManager["remoteScope"];
+        restoredCommittedScopeFromDeltaCache: boolean;
+        syncScope: SyncScope;
+      }
+  > {
+    const {
+      result,
+      callbacks,
+      operationEpoch,
+      mode,
+      options,
+      automaticHandlingPolicy,
+      communityPluginSyncPolicy,
+      recoveryOnly,
+      enterPhase,
+    } = args;
+    // Step 1.5: Resolve and initialize the remote vault directory.
+    enterPhase("remotePrepare");
+    this.progressStore?.setPhase("preparing");
+    callbacks.onProgress?.(0, 1, this.t("progress.preparingRemote"));
+    const committedScope = this.state.remoteScope;
+    const committedDeltaLink = this.state.remoteDeltaLink;
+    const canRestoreCommittedScope = Boolean(this.state.boundAccountId)
+      && committedScope?.accountId === this.state.boundAccountId
+      && Boolean(committedScope);
+    const restoredCommittedScopeFromDeltaCache = canRestoreCommittedScope
+      && Boolean(committedDeltaLink)
+      && this.onedrive.restoreVaultScope(
+        this.vaultName,
+        {
+          driveId: committedScope.driveId,
+          vaultFolderId: committedScope.vaultFolderId,
+          filesRootId: committedScope.filesRootId,
+        },
+        committedDeltaLink!,
+      );
+    let restoredCommittedScope = restoredCommittedScopeFromDeltaCache;
+    if (
+      canRestoreCommittedScope
+      && !restoredCommittedScope
+      && typeof this.onedrive.restoreVaultScopeByIdentity === "function"
+    ) {
+      try {
+        const restored = await this.onedrive.restoreVaultScopeByIdentity(
+          this.vaultName,
+          {
+            driveId: committedScope.driveId,
+            vaultFolderId: committedScope.vaultFolderId,
+            filesRootId: committedScope.filesRootId,
+          },
+        );
+        restoredCommittedScope = restored.driveId === committedScope.driveId
+          && restored.vaultFolderId === committedScope.vaultFolderId
+          && restored.filesRootId === committedScope.filesRootId;
+      } catch (error) {
+        if (
+          !this.state.isV2StateActive
+          || this.state.mutationLedger.length > 0
+        ) throw error;
+        const scopeLoss = await this.resolveV2CommittedScopeLoss(
+          committedScope,
+          error,
+        );
+        await this.stageV2CommittedScopeRecovery(result, scopeLoss);
+        if (
+          mode !== "auto"
+          && options.readOnlyPreview !== true
+        ) {
+          const recoveryResult = await this.runV2RemoteScopeRecovery({
+            result,
+            callbacks,
+            operationEpoch,
+            automaticHandlingPolicy,
+            communityPluginSyncPolicy,
+            enterPhase,
+          });
+          if (recoveryResult) return { terminated: recoveryResult };
+          restoredCommittedScope = true;
+          result.deferred = 0;
+          result.message = "";
+        } else {
+          return { terminated: result };
+        }
+      }
+    }
+    const remoteVaultScope = restoredCommittedScope
+      ? {
+          driveId: committedScope!.driveId,
+          vaultFolderId: committedScope!.vaultFolderId,
+          filesRootId: committedScope!.filesRootId,
+        }
+      : options.readOnlyPreview || recoveryOnly
+        ? await this.onedrive.initVaultScope(this.vaultName, { createMissing: false })
+        : await this.onedrive.initVaultScope(this.vaultName);
+    let syncScope: SyncScope = {
+      accountId: this.state.boundAccountId,
+      ...remoteVaultScope,
+    };
+    this.activeSyncScope = syncScope;
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    return {
+      terminated: null,
+      committedScope,
+      restoredCommittedScopeFromDeltaCache,
+      syncScope,
+    };
+  }
+
+  /** Between Steps 1.5 and 2: classify a fresh V2 activation by observing the
+   *  shared sync protocol profile — first device, legacy V2 join, healthy
+   *  join, or blocked. Non-migration rounds fall through unchanged. */
+  private async runStep1_6ClassifyFreshV2Activation(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    prepareV2MigrationCandidate: boolean;
+    activationReviewKind: V2ActivationReviewKind | null;
+    syncScope: SyncScope;
+    pendingFirstSyncProtocolBinding: SharedSyncProtocolBindingV2 | null;
+    firstSyncVerificationProtocolBinding: unknown;
+    freshSharedProtocolBinding: SharedSyncProtocolBindingV3 | null;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        activationReviewKind: V2ActivationReviewKind | null;
+        firstSyncVerificationProtocolBinding: unknown;
+        freshSharedProtocolBinding: SharedSyncProtocolBindingV3 | null;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      prepareV2MigrationCandidate,
+      syncScope,
+      pendingFirstSyncProtocolBinding,
+    } = args;
+    let {
+      activationReviewKind,
+      firstSyncVerificationProtocolBinding,
+      freshSharedProtocolBinding,
+    } = args;
+    if (!prepareV2MigrationCandidate || activationReviewKind !== null) {
+      return {
+        terminated: null,
+        activationReviewKind,
+        firstSyncVerificationProtocolBinding,
+        freshSharedProtocolBinding,
+      };
+    }
+    const protocolObservation =
+      await this.readFreshSharedProtocolProfile(syncScope);
+    if (protocolObservation.status === "unavailable") {
+        return {
+          terminated: this.finishRetryableSharedControlObservation(
+          result,
+          protocolObservation,
+          operationEpoch,
+          ),
+        };
+    }
+    if (protocolObservation.status === "blocked") {
+      result.errors = 1;
+      result.message = this.t("result.v2ProtocolBlocked");
+      return { terminated: result };
+    }
+    const protocolProfile = protocolObservation.profile;
+    const initialProtocolObservation: SharedSyncProtocolObserved = {
+      status: "ready",
+      objects: protocolObservation.objects,
+    };
+    if (protocolProfile.status === "empty") {
+      if (pendingFirstSyncProtocolBinding) {
+        result.errors = 1;
+        result.message = this.t("result.v2ProtocolBlocked");
+        this.diag?.error(
+          "state",
+          "reviewed first-sync protocol checkpoint is missing from the fresh control-directory observation",
+          { mutations: 0 },
+        );
+        return { terminated: result };
+      }
+      activationReviewKind = "v2-first-sync";
+      this.diag?.log(
+        "state",
+        "fresh V2 device classified as the first device for this sync state",
+        { mutations: 0 },
+      );
+    } else if (protocolProfile.status === "legacy-v2") {
+      const legacyV2Outcome = await this.classifyLegacyV2FreshActivation({
+        result,
+        protocolProfile,
+        initialProtocolObservation,
+        syncScope,
+        pendingFirstSyncProtocolBinding,
+        operationEpoch,
+      });
+      if (legacyV2Outcome.terminated) return { terminated: legacyV2Outcome.terminated };
+      activationReviewKind = legacyV2Outcome.activationReviewKind;
+      firstSyncVerificationProtocolBinding =
+        legacyV2Outcome.firstSyncVerificationProtocolBinding;
+    } else if (protocolProfile.status === "healthy") {
+      const scopeFreeProtocol =
+        await this.inspectExistingScopeFreeSharedProtocolForFreshActivation(
+          initialProtocolObservation,
+        );
+      if (
+        scopeFreeProtocol.status !== "ready"
+        || scopeFreeProtocol.binding.migrationGeneration
+          !== protocolProfile.migrationGeneration
+        || scopeFreeProtocol.binding.recordId
+          !== protocolProfile.protocolV3Object.id
+        || scopeFreeProtocol.binding.recordETag
+          !== protocolProfile.protocolV3Object.eTag
+      ) {
+        result.errors = 1;
+        result.message = this.t("result.v2ProtocolBlocked");
+        this.diag?.error(
+          "state",
+          "healthy shared protocol profile changed during activation classification",
+          {
+            reason: scopeFreeProtocol.status === "ready"
+              ? "generation-mismatch"
+              : scopeFreeProtocol.reason,
+            mutations: 0,
+          },
+        );
+        return { terminated: result };
+      }
+      const resumesReviewedFirstSync = Boolean(
+        pendingFirstSyncProtocolBinding
+        && sharedSyncProtocolV2MatchesBinding(
+          protocolProfile.protocolV2Object,
+          protocolProfile.protocolV2,
+          pendingFirstSyncProtocolBinding,
+          syncScope,
+        )
+      );
+      activationReviewKind = resumesReviewedFirstSync
+        ? "v2-first-sync"
+        : "v2-cloud-join";
+      freshSharedProtocolBinding = scopeFreeProtocol.binding;
+      firstSyncVerificationProtocolBinding = scopeFreeProtocol.binding;
+      this.diag?.log(
+        "state",
+        resumesReviewedFirstSync
+          ? "reviewed first-sync resumed from its exact healthy protocol lineage"
+          : "fresh device classified as joining an existing healthy shared protocol profile",
+        {
+          protocolVersion: scopeFreeProtocol.binding.protocolVersion,
+          migrationGeneration:
+            scopeFreeProtocol.binding.migrationGeneration.slice(0, 12),
+          predecessorContentSha256:
+            scopeFreeProtocol.binding.predecessorContentSha256.slice(0, 12),
+          contentSha256:
+            scopeFreeProtocol.binding.contentSha256.slice(0, 12),
+          mutations: 0,
+        },
+      );
+    } else {
+      result.errors = 1;
+      result.message = this.t("result.v2ProtocolBlocked");
+      if (protocolProfile.status === "inconsistent") {
+        this.diag?.error(
+          "state",
+          SHARED_SYNC_PROTOCOL_PROFILE_DIAGNOSTIC_EVENT,
+          protocolProfile.evidence,
+        );
+      }
+      this.diag?.error(
+        "state",
+        "fresh activation could not classify the shared protocol profile safely",
+        {
+          reason: protocolProfile.status === "inconsistent"
+            ? protocolProfile.reason
+            : "recovery-proof-required",
+          mutations: 0,
+        },
+      );
+      return { terminated: result };
+    }
+    return {
+      terminated: null,
+      activationReviewKind,
+      firstSyncVerificationProtocolBinding,
+      freshSharedProtocolBinding,
+    };
+  }
+
+  /** Legacy-V2 fresh-activation classification branch of
+   *  runStep1_6ClassifyFreshV2Activation — moved verbatim. */
+  private async classifyLegacyV2FreshActivation(
+    args: FreshV2LegacyV2ClassificationArgs,
+  ): Promise<FreshV2LegacyV2ClassificationOutcome> {
+    const {
+      result,
+      protocolProfile,
+      initialProtocolObservation,
+      syncScope,
+      pendingFirstSyncProtocolBinding,
+      operationEpoch,
+    } = args;
+    let activationReviewKind: V2ActivationReviewKind;
+    let firstSyncVerificationProtocolBinding: unknown;
+    const protocolTransportV2 = availableSharedSyncProtocolTransportV2(
+      this.onedrive,
+      this.vaultName,
+    );
+    if (!protocolTransportV2) {
+      result.errors = 1;
+      result.message = this.t("result.v2ProtocolBlocked");
+      return { terminated: result };
+    }
+    const protocol = await this.ensureSharedSyncProtocolV2FromObservation(
+      protocolTransportV2,
+      initialProtocolObservation,
+      {
+        scope: syncScope,
+        acknowledgeMigrationRisk: false,
+        ...(pendingFirstSyncProtocolBinding
+          ? {
+              expectedBinding: pendingFirstSyncProtocolBinding,
+              requireExactBinding: true,
+            }
+          : {}),
+      },
+    );
+    if (protocol.status === "unavailable") {
+        return {
+          terminated: this.finishRetryableSharedControlObservation(
+          result,
+          protocol,
+          operationEpoch,
+          ),
+        };
+    }
+    if (
+      protocol.status !== "ready"
+      || protocol.value.binding.migrationGeneration
+        !== protocolProfile.migrationGeneration
+      || protocol.value.binding.recordId
+        !== protocolProfile.protocolV2Object.id
+      || protocol.value.binding.recordETag
+        !== protocolProfile.protocolV2Object.eTag
+    ) {
+      result.errors = 1;
+      result.message = this.t("result.v2ProtocolBlocked");
+      this.diag?.error(
+        "state",
+        "legacy V2 protocol changed during activation classification",
+        {
+          reason: protocol.status === "ready"
+              ? "identity-mismatch"
+              : protocol.reason,
+          mutations: 0,
+        },
+      );
+      return { terminated: result };
+    }
+    const resumesReviewedFirstSync = Boolean(
+      pendingFirstSyncProtocolBinding
+      && sharedSyncProtocolV2MatchesBinding(
+        protocolProfile.protocolV2Object,
+        protocolProfile.protocolV2,
+        pendingFirstSyncProtocolBinding,
+        syncScope,
+      )
+    );
+    activationReviewKind = resumesReviewedFirstSync
+      ? "v2-first-sync"
+      : "v2-cloud-join";
+    firstSyncVerificationProtocolBinding = protocol.value.binding;
+    this.diag?.log(
+      "state",
+      resumesReviewedFirstSync
+        ? "reviewed first-sync resumed from its exact pending V2 protocol checkpoint"
+        : "fresh device classified as joining a legacy V2 shared sync state",
+      {
+        migrationGeneration:
+          protocol.value.binding.migrationGeneration.slice(0, 12),
+        mutations: 0,
+      },
+    );
+    return {
+      terminated: null,
+      activationReviewKind,
+      firstSyncVerificationProtocolBinding,
+    };
+  }
+
+  /** Between Steps 1.6 and 2: recover the mutation ledger before planning —
+   *  observe complete remote state, replay or isolate blocked mutation
+   *  records, refresh the local scan after an interrupted merge, and stop
+   *  before baseline/planning in recovery-only rounds. Skipped when the
+   *  public-1.1.3 ledger takeover already owns the round. */
+  private async runStep1_7RecoverMutationLedger(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    syncScope: SyncScope;
+    localEntries: LocalFileEntry[];
+    localFolders: LocalFolderEntry[];
+    localFolderScanComplete: boolean;
+    protectedMutationRecoveryRecords: MutationLedgerEntryV1[];
+    takeOverPublic113MutationLedger: boolean;
+    options: SyncRunOptions;
+    skipConfirmation: boolean;
+    reviewedAuthorization: PlanReviewAuthorization | undefined;
+    automaticHandlingMetrics: ReturnType<typeof createAutomaticHandlingMetrics>;
+    recoveryOnly: boolean;
+    recoveryRecordsAtStart: number;
+    mutationRecordsAtRunStart: number;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        protectedMutationRecoveryRecords: MutationLedgerEntryV1[];
+        localEntries: LocalFileEntry[];
+        localFolders: LocalFolderEntry[];
+        localFolderScanComplete: boolean;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      syncScope,
+      takeOverPublic113MutationLedger,
+      options,
+      skipConfirmation,
+      reviewedAuthorization,
+      automaticHandlingMetrics,
+      recoveryOnly,
+      recoveryRecordsAtStart,
+      mutationRecordsAtRunStart,
+    } = args;
+    let {
+      protectedMutationRecoveryRecords,
+      localEntries,
+      localFolders,
+      localFolderScanComplete,
+    } = args;
+    if (takeOverPublic113MutationLedger) {
+      return {
+        terminated: null,
+        protectedMutationRecoveryRecords,
+        localEntries,
+        localFolders,
+        localFolderScanComplete,
+      };
+    }
+    let recoveryObservationCommitSeq: number | undefined;
+    if (
+      this.state.isV2StateActive
+      && this.state.mutationLedger.length > 0
+    ) {
+      await this.observeCompleteRemoteStateForMutationRecovery(
+        operationEpoch,
+        result,
+        syncScope,
+        localEntries,
+        options.mutationRecoveryObservationOnly !== true,
+        this.state.isV2StateActive
+        && skipConfirmation
+        && this.state.planReviewActive
+          ? reviewedAuthorization?.canonicalIdentity?.sourceCommitSeq
+          : undefined,
+      );
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      const observedEnvelope = this.state.getCommittedV2Envelope();
+      if (observedEnvelope?.remoteIndex.complete === true) {
+        recoveryObservationCommitSeq = observedEnvelope.meta.commitSeq;
+      }
+    }
+    let mutationRecovery: MutationRecoveryRunSummary | null = null;
+    try {
+      mutationRecovery = await this.recoverMutationLedger(
+        syncScope,
+        automaticHandlingMetrics,
+        operationEpoch,
+        options.mutationRecoveryObservationOnly === true,
+        recoveryObservationCommitSeq,
+        result,
+      );
+    } catch (error) {
+      if (!(error instanceof MutationRecoveryBlockedError)) throw error;
+      const isolated = this.isolatableOrdinaryFileRecovery(
+        error.summary,
+        syncScope,
+      );
+      if (!isolated) {
+        if (error.summary.state !== "network-unavailable") throw error;
+        // Every remaining record still owns its paths, but a retryable
+        // network outage must not freeze the rest of the Vault. Keep the
+        // remaining records protected from ordinary planning and let the
+        // run sync everything else; the recovery keeps owning those paths.
+        mutationRecovery = error.summary;
+        result.mutationRecovery = error.summary;
+        protectedMutationRecoveryRecords = structuredClone([
+          ...this.state.mutationLedger,
+        ]);
+        this.diag?.warn(
+          "execute",
+          "mutation recovery is network-unavailable; protected paths stay frozen while the rest of the vault continues",
+          {
+            records: protectedMutationRecoveryRecords.length,
+            operationIds: protectedMutationRecoveryRecords.map(
+              (record) => record.intent.operationId,
+            ),
+            mutations: 0,
+          },
+        );
+      } else {
+        protectedMutationRecoveryRecords = isolated;
+        const isolatedSummary: MutationRecoveryRunSummary = {
+          ...error.summary,
+          isolated: true,
+        };
+        mutationRecovery = isolatedSummary;
+        result.mutationRecovery = isolatedSummary;
+        this.diag?.warn(
+          "execute",
+          "unresolved ordinary files were isolated from unrelated planning",
+          {
+            records: isolated.length,
+            operationIds: isolated.map((record) => record.intent.operationId),
+            mutations: 0,
+          },
+        );
+      }
+    }
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    if (this.localVersionRecoveredDuringLedger) {
+      const recoveredScan = await this.scanner.scanAll();
+      if (
+        recoveredScan.complete === false
+        || recoveredScan.failedPaths.length > 0
+      ) {
+        result.errors = Math.max(
+          1,
+          new Set(recoveredScan.failedPaths).size,
+        );
+        result.message = this.t("result.scanIncomplete");
+        return { terminated: result };
+      }
+      localEntries = recoveredScan.entries;
+      localFolders = recoveredScan.folders ?? [];
+      localFolderScanComplete =
+        recoveredScan.folderScanComplete === true;
+      this.localVersionRecoveredDuringLedger = false;
+      this.diag?.warn(
+        "execute",
+        "local scan refreshed after interrupted merge recovery",
+      );
+    }
+    if (recoveryOnly) {
+      result.mutationRecovery = mutationRecovery ?? {
+        state: "settled",
+        total: recoveryRecordsAtStart,
+        settled: Math.max(
+          0,
+          recoveryRecordsAtStart - this.state.mutationLedger.length,
+        ),
+        remaining: this.state.mutationLedger.length,
+        retryAfterSeconds: null,
+      };
+      result.success = this.state.mutationLedger.length === 0;
+      result.runFacts!.userFileChanges = mutationRecordsAtRunStart === 0
+        ? "none"
+        : "unknown";
+      result.message = this.t(
+        result.success ? "result.synced" : "result.syncFailed",
+        result.success
+          ? {
+              uploaded: 0,
+              downloaded: 0,
+              foldersCreated: 0,
+              foldersMoved: 0,
+              foldersDeleted: 0,
+              filesMoved: 0,
+              deleted: 0,
+              conflicts: 0,
+              deferred: 0,
+              errors: 0,
+            }
+          : { message: "Mutation recovery remains pending" },
+      );
+      this.diag?.log(
+        "execute",
+        "recovery-only V2 round stopped before baseline and planning",
+        {
+          ...result.mutationRecovery,
+        },
+      );
+      return { terminated: result };
+    }
+    return {
+      terminated: null,
+      protectedMutationRecoveryRecords,
+      localEntries,
+      localFolders,
+      localFolderScanComplete,
+    };
+  }
+
+  /** Between Steps 1.7 and 2: start the per-round shared protocol
+   *  observation (its network round trips overlap the delta), prepare the
+   *  device-local scope expansion, and validate the remote delta cache
+   *  against this vault identity before the remote scan. */
+  private async runStep1_8PreparePerRoundProtocolAndScope(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    syncScope: SyncScope;
+    options: SyncRunOptions;
+    prepareV2MigrationCandidate: boolean;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        perRoundProtocolGate: boolean;
+        perRoundProtocolBinding: SharedSyncProtocolBinding | null;
+        prestartedProtocolObservation:
+          | Promise<SharedSyncProtocolObservationSettled>
+          | null;
+        forceCompleteRemoteIdentitySnapshot: boolean;
+        scopeExpansionPreparation:
+          | Awaited<ReturnType<StateManager["prepareSyncScopeExpansion"]>>
+          | { status: "none" };
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      syncScope,
+      options,
+      prepareV2MigrationCandidate,
+    } = args;
+    // Per-round shared protocol convergence: start its (read-only)
+    // observation before the remote scan so its network round trips overlap
+    // the delta, and consume the settled observation after the scan. If the
+    // protocol cannot converge afterwards, the remote scan's projection may
+    // already have been committed — a deliberate, observation-only outcome
+    // (same lifecycle family as review-wait and recovery-observation
+    // rounds), see docs/dev-logs/2026-08/20260823-2200 …
+    let perRoundProtocolGate = false;
+    let perRoundProtocolBinding: SharedSyncProtocolBinding | null = null;
+    let prestartedProtocolObservation:
+      | Promise<SharedSyncProtocolObservationSettled>
+      | null = null;
+    if (
+      this.state.isV2StateActive
+      && !this.state.activeSyncScopeExpansion
+      && this.state.activeV2MigrationHold === null
+      && options.readOnlyPreview !== true
+    ) {
+      perRoundProtocolGate = true;
+      perRoundProtocolBinding = await this.state.getActiveV2ProtocolBinding();
+      if (perRoundProtocolBinding) {
+        const expectedV3Slot =
+          isSharedSyncProtocolBindingV3(perRoundProtocolBinding)
+            ? {
+                id: perRoundProtocolBinding.recordId,
+                eTag: perRoundProtocolBinding.recordETag,
+              }
+            : undefined;
+        prestartedProtocolObservation =
+          this.observeSharedSyncProtocolObjects(expectedV3Slot).then(
+            (value): SharedSyncProtocolObservationSettled => ({ value }),
+            (error): SharedSyncProtocolObservationSettled => ({ error }),
+          );
+      }
+    }
+    const scopeExpansionState = this.state as StateManager & Partial<
+      Pick<StateManager, "prepareSyncScopeExpansion">
+    >;
+    const scopeExpansionPreparation =
+      this.state.isV2StateActive
+      && typeof scopeExpansionState.prepareSyncScopeExpansion === "function"
+      ? await scopeExpansionState.prepareSyncScopeExpansion(syncScope)
+      : { status: "none" as const };
+    if (scopeExpansionPreparation.status === "blocked") {
+      this.diag?.warn(
+        "state",
+        "device-local sync scope expansion remains blocked by unsettled recovery or review state",
+        {
+          revision: scopeExpansionPreparation.revision,
+          mutations: 0,
+        },
+      );
+      const blockedExpansion = this.state.activeSyncScopeExpansion;
+      if (
+        blockedExpansion?.revision === scopeExpansionPreparation.revision
+        && blockedExpansion.requiresCompleteRemoteIdentitySnapshot
+      ) {
+        result.message = this.t("result.cloudRecordIncomplete");
+        this.diag?.warn(
+          "state",
+          "file scope expansion stopped before remote scan and planning until complete remote identity recovery is safe",
+          {
+            revision: scopeExpansionPreparation.revision,
+            mutations: 0,
+          },
+        );
+        return { terminated: result };
+      }
+    }
+    let forceCompleteRemoteIdentitySnapshot =
+      prepareV2MigrationCandidate
+      || scopeExpansionPreparation.status === "ready"
+      || (options.communityPluginJoinAuthorizations?.length ?? 0) > 0;
+    if (
+      this.state.remoteDeltaLink
+      && !this.onedrive.isDeltaLinkForVault(
+        this.vaultName,
+        this.state.remoteDeltaLink,
+      )
+    ) {
+      this.diag?.warn("onedrive", "remote delta cache belongs to a different vault directory, rebuilding");
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      if (this.state.isV2StateActive) {
+        forceCompleteRemoteIdentitySnapshot = true;
+        this.diag?.warn(
+          "onedrive",
+          "committed V2 delta route does not match its vault identity; rebuilding from the verified committed scope",
+        );
+      } else if (!prepareV2MigrationCandidate) {
+        await this.state.clearRemoteState();
+      }
+    }
+    return {
+      terminated: null,
+      perRoundProtocolGate,
+      perRoundProtocolBinding,
+      prestartedProtocolObservation,
+      forceCompleteRemoteIdentitySnapshot,
+      scopeExpansionPreparation,
+    };
+  }
+
+  /** Step 5.6: log the executable folder plan joined into the main plan. */
+  private runStep5_6LogExecutableFolderPlan(args: {
+    canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
+  }): void {
+    const { canonicalPlanCandidate } = args;
+    const executableFolderPlan = canonicalPlanCandidate?.folderPlan ?? null;
+    if (executableFolderPlan) {
+      this.diag?.log(
+        "plan",
+        `V2 folder actions joined main plan — create-local=${executableFolderPlan.counts.createLocal}, create-remote=${executableFolderPlan.counts.createRemote}, move-local=${executableFolderPlan.counts.moveLocal}, move-remote=${executableFolderPlan.counts.moveRemote}, delete-local=${executableFolderPlan.counts.deleteLocal}, delete-remote=${executableFolderPlan.counts.deleteRemote}, conflicts=${executableFolderPlan.counts.conflicts}`,
+        {
+          phase: "plan",
+          counts: executableFolderPlan.counts,
+          reviewImpact: executableFolderPlan.reviewImpact,
+          mutations: 0,
+        },
+      );
+    }
+  }
+
+  /** Step 5.7: resume a reviewed V2 migration from its committed hold —
+   *  confirm the authority handoff, or settle/convert the hold when the
+   *  reviewed facts no longer match. The review/publish closures stay in
+   *  run() and arrive here by reference. */
+  private async runStep5_7ResumeCommittedV2Migration(args: {
+    result: SyncResult;
+    plan: SyncPlan;
+    callbacks: SyncCallbacks;
+    reviewedAuthorization: PlanReviewAuthorization | undefined;
+    resumeCommittedV2Migration: boolean;
+    migrationAuthorityCommittedThisRun: boolean;
+    migrationExecutionHold: MigrationHoldV2 | null;
+    waitForReview: (review: () => Promise<boolean>) => Promise<boolean>;
+    publishCommunityPluginPostAuthorityState: () => Promise<void>;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        migrationAuthorityCommittedThisRun: boolean;
+        migrationExecutionHold: MigrationHoldV2 | null;
+      }
+  > {
+    const {
+      result,
+      plan,
+      callbacks,
+      reviewedAuthorization,
+      resumeCommittedV2Migration,
+      waitForReview,
+      publishCommunityPluginPostAuthorityState,
+    } = args;
+    let {
+      migrationAuthorityCommittedThisRun,
+      migrationExecutionHold,
+    } = args;
+    if (!resumeCommittedV2Migration) {
+      return {
+        terminated: null,
+        migrationAuthorityCommittedThisRun,
+        migrationExecutionHold,
+      };
+    }
+      let hold = this.state.activeV2MigrationHold;
+      const authorizationMatchesHold = Boolean(
+        hold
+        && reviewedAuthorization
+        && reviewedAuthorization.revision === hold.revision
+        && sameSyncScope(reviewedAuthorization.scope, hold.scope)
+        && sameCanonicalPlanIdentityV2(
+          reviewedAuthorization.canonicalIdentity,
+          hold.canonicalIdentity,
+        )
+      );
+      const exactPlanIdentity = Boolean(
+        hold
+        && plan.canonicalIdentity
+        && sameCanonicalPlanIdentityV2(
+          plan.canonicalIdentity,
+          hold.canonicalIdentity,
+        )
+      );
+      const currentEnvelope = this.state.getCommittedV2Envelope();
+      const cursorPublicationRebind = Boolean(
+        hold
+        && plan.canonicalIdentity
+        && currentEnvelope
+        && sameStateV2MigrationResumeFacts(
+          hold.candidate,
+          currentEnvelope,
+        )
+        && migrationPlanFactsDigestV2({
+          items: plan.items,
+          lastTotalFiles: plan.lastTotalFiles,
+          scope: plan.canonicalIdentity.scope,
+        }) === hold.planFactsDigest
+      );
+      const authorizationMatches = authorizationMatchesHold
+        && (exactPlanIdentity || cursorPublicationRebind);
+      if (hold?.phase === "confirmed") {
+        hold = await this.state.transitionV2MigrationHold(
+          hold,
+          "authority-committed",
+        );
+      }
+      if (
+        authorizationMatches
+        && hold?.phase === "authority-committed"
+      ) {
+        plan.reviewKind = migrationHoldReviewKindV2(hold);
+        plan.confirmed = true;
+        migrationAuthorityCommittedThisRun = true;
+        await publishCommunityPluginPostAuthorityState();
+        migrationExecutionHold = hold;
+        if (!exactPlanIdentity) {
+          this.diag?.log(
+            "state",
+            "V2 migration resume rebound across a cursor-only state publication",
+            {
+              phase: "activation",
+              reviewedCommitSeq:
+                hold.canonicalIdentity.sourceCommitSeq,
+              currentCommitSeq:
+                plan.canonicalIdentity?.sourceCommitSeq,
+              mutations: 0,
+            },
+          );
+        }
+      } else {
+        const convergedAfterCommittedMigration = Boolean(
+          hold?.phase === "authority-committed"
+          && plan.items.length === 0
+          && this.state.mutationLedger.length === 0
+          && result.errors === 0
+          && result.deferred === 0
+          && result.conflicts === 0
+        );
+        if (convergedAfterCommittedMigration) {
+          const completed = await this.state.transitionV2MigrationHold(
+            hold!,
+            "completed",
+          );
+          if (!completed) {
+            throw new Error(
+              "Converged V2 migration hold could not complete",
+            );
+          }
+          plan.reviewKind = undefined;
+          this.diag?.log(
+            "state",
+            "V2 migration transaction recovered as already converged",
+            {
+              phase: "activation",
+              mutations: 0,
+            },
+          );
+        } else {
+          if (hold?.phase === "authority-committed") {
+            await this.state.transitionV2MigrationHold(hold, "completed");
+          } else if (hold?.phase === "pending" && reviewedAuthorization) {
+            await this.state.clearPlanReview(reviewedAuthorization);
+          }
+          plan.reviewKind = undefined;
+          this.diag?.warn(
+            "state",
+            "V2 migration resume facts changed; converted to a normal V2 review",
+            {
+              phase: "activation",
+              mutations: 0,
+            },
+          );
+          const publishPreview =
+            callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
+          if (publishPreview) {
+            await waitForReview(() => publishPreview(plan));
+          }
+          return { terminated: this.markPlanReviewPaused(result) };
+        }
+      }
+    return {
+      terminated: null,
+      migrationAuthorityCommittedThisRun,
+      migrationExecutionHold,
+    };
+  }
+
+  /** Step 5.8: run the durable V2 review transaction for a fresh
+   *  activation — adopt or revalidate the reviewed authorization, commit
+   *  the authority handoff, or stage/refresh the migration hold. The
+   *  retire/publish/review closures stay in run() and arrive here by
+   *  reference. */
+  private async runStep5_8RunV2ReviewTransaction(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    plan: SyncPlan;
+    callbacks: SyncCallbacks;
+    reviewedAuthorization: PlanReviewAuthorization | undefined;
+    skipConfirmation: boolean;
+    options: SyncRunOptions;
+    attemptV2Activation: boolean;
+    activationReviewKind: V2ActivationReviewKind | null;
+    freshSharedProtocolBinding: SharedSyncProtocolBindingV3 | null;
+    migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
+    public113MigrationInput: Awaited<
+      ReturnType<StateManager["readPublic113MigrationInput"]>
+    > | null;
+    takeOverPublic113MutationLedger: boolean;
+    syncScope: SyncScope;
+    automaticHandlingMetrics: ReturnType<typeof createAutomaticHandlingMetrics>;
+    retireFirstSyncVerificationEvidence: () => Promise<void>;
+    publishCommunityPluginPostAuthorityState: () => Promise<void>;
+    waitForReview: (review: () => Promise<boolean>) => Promise<boolean>;
+    migrationAuthorityCommittedThisRun: boolean;
+    migrationExecutionHold: MigrationHoldV2 | null;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        migrationAuthorityCommittedThisRun: boolean;
+        migrationExecutionHold: MigrationHoldV2 | null;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      plan,
+      callbacks,
+      reviewedAuthorization,
+      skipConfirmation,
+      options,
+      attemptV2Activation,
+      activationReviewKind,
+      freshSharedProtocolBinding,
+      migrationCandidateEnvelope,
+      public113MigrationInput,
+      takeOverPublic113MutationLedger,
+      syncScope,
+      automaticHandlingMetrics,
+      retireFirstSyncVerificationEvidence,
+      publishCommunityPluginPostAuthorityState,
+      waitForReview,
+    } = args;
+    let {
+      migrationAuthorityCommittedThisRun,
+      migrationExecutionHold,
+    } = args;
+    if (!attemptV2Activation) {
+      return {
+        terminated: null,
+        migrationAuthorityCommittedThisRun,
+        migrationExecutionHold,
+      };
+    }
+    // Every pre-authority V2 entry path enters the same durable review
+    // transaction. The review kind preserves whether this is a public
+    // 1.1.3 migration, a join to existing cloud V2, or the first V2 device.
+    if (
+      !migrationCandidateEnvelope
+      || !plan.canonicalIdentity
+      || !plan.canonicalReview
+      || activationReviewKind === null
+    ) {
+      throw new Error(
+        "V2 activation requires a classified sealed candidate",
+      );
+    }
+    const reviewKind = activationReviewKind;
+    let activeReviewedAuthorization = reviewedAuthorization;
+    plan.reviewKind = reviewKind;
+    if (
+      skipConfirmation
+      && activeReviewedAuthorization?.reviewKind === reviewKind
+    ) {
+      const adoption =
+        await this.runReviewedV2ActivationAdoption({
+          result,
+          operationEpoch,
+          plan,
+          callbacks,
+          reviewKind,
+          activeReviewedAuthorization,
+          options,
+          freshSharedProtocolBinding,
+          migrationCandidateEnvelope,
+          canonicalIdentity: plan.canonicalIdentity,
+          public113MigrationInput,
+          takeOverPublic113MutationLedger,
+          syncScope,
+          automaticHandlingMetrics,
+          retireFirstSyncVerificationEvidence,
+          publishCommunityPluginPostAuthorityState,
+          waitForReview,
+          migrationAuthorityCommittedThisRun,
+          migrationExecutionHold,
+        });
+      if (adoption.terminated) {
+        return { terminated: adoption.terminated };
+      }
+      migrationAuthorityCommittedThisRun =
+        adoption.migrationAuthorityCommittedThisRun;
+      migrationExecutionHold = adoption.migrationExecutionHold;
+    } else {
+      const previousHold = this.state.activeV2MigrationHold;
+      const hold = await this.state.stageV2MigrationHold({
+        candidate: migrationCandidateEnvelope,
+        source: public113MigrationInput!,
+        reviewKind,
+        plan,
+      });
+      this.diag?.warn(
+        "state",
+        "V2 controlled activation held on a canonical migration plan",
+        {
+          phase: "activation",
+          holdRevision: hold.revision,
+          planItems: plan.items.length,
+          mutations: 0,
+          ...describeStateV2MigrationReviewDriftFacts(
+            migrationCandidateEnvelope,
+            previousHold,
+            plan.canonicalIdentity,
+          ),
+        },
+      );
+      const publishPreview =
+        callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
+      if (publishPreview) {
+        await waitForReview(() => publishPreview(plan));
+      }
+      return { terminated: this.markPlanReviewPaused(result) };
+    }
+    return {
+      terminated: null,
+      migrationAuthorityCommittedThisRun,
+      migrationExecutionHold,
+    };
+  }
+
+  /** Adopt the reviewed authorization for a fresh V2 activation: revalidate
+   *  the exact protocol bindings, commit the confirmed authority handoff, or
+   *  stage a refreshed review hold and pause for the next review. */
+  private async runReviewedV2ActivationAdoption(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    plan: SyncPlan;
+    callbacks: SyncCallbacks;
+    reviewKind: V2ActivationReviewKind;
+    activeReviewedAuthorization: PlanReviewAuthorization;
+    options: SyncRunOptions;
+    freshSharedProtocolBinding: SharedSyncProtocolBindingV3 | null;
+    migrationCandidateEnvelope: SyncStateEnvelopeV2;
+    canonicalIdentity: CanonicalPlanIdentityV2;
+    public113MigrationInput: Awaited<
+      ReturnType<StateManager["readPublic113MigrationInput"]>
+    > | null;
+    takeOverPublic113MutationLedger: boolean;
+    syncScope: SyncScope;
+    automaticHandlingMetrics: ReturnType<typeof createAutomaticHandlingMetrics>;
+    retireFirstSyncVerificationEvidence: () => Promise<void>;
+    publishCommunityPluginPostAuthorityState: () => Promise<void>;
+    waitForReview: (review: () => Promise<boolean>) => Promise<boolean>;
+    migrationAuthorityCommittedThisRun: boolean;
+    migrationExecutionHold: MigrationHoldV2 | null;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        migrationAuthorityCommittedThisRun: boolean;
+        migrationExecutionHold: MigrationHoldV2 | null;
+      }
+  > {
+    const {
+      result,
+      operationEpoch,
+      plan,
+      callbacks,
+      reviewKind,
+      options,
+      freshSharedProtocolBinding,
+      migrationCandidateEnvelope,
+      canonicalIdentity,
+      public113MigrationInput,
+      takeOverPublic113MutationLedger,
+      syncScope,
+      automaticHandlingMetrics,
+      retireFirstSyncVerificationEvidence,
+      publishCommunityPluginPostAuthorityState,
+      waitForReview,
+    } = args;
+    let {
+      activeReviewedAuthorization,
+      migrationAuthorityCommittedThisRun,
+      migrationExecutionHold,
+    } = args;
+    const existingConfirmed = this.state.activeV2MigrationHold;
+    const reviewedMigrationStillCurrent =
+      existingConfirmed?.phase === "confirmed"
+      || await this.state.isCurrentV2MigrationAuthorization({
+        authorization: activeReviewedAuthorization,
+        candidate: migrationCandidateEnvelope,
+        canonicalIdentity,
+      });
+    let protocolBinding =
+      existingConfirmed?.phase === "confirmed"
+        ? existingConfirmed.protocolBinding
+        : undefined;
+    if (
+      reviewedMigrationStillCurrent
+      && reviewKind === "v2-cloud-join"
+      && freshSharedProtocolBinding
+      && !protocolBinding
+    ) {
+      const scopeFreeProtocol =
+        await this.adoptExistingScopeFreeSharedProtocolForFreshActivation(
+          freshSharedProtocolBinding,
+        );
+      if (scopeFreeProtocol.status === "unavailable") {
+        result.errors = 1;
+        result.message = this.t("result.remoteReadUnavailable");
+        this.diag?.warn(
+          "state",
+          "reviewed cross-scope cloud join retained its authorization because the shared protocol is temporarily unavailable",
+          { reason: scopeFreeProtocol.reason, mutations: 0 },
+        );
+        return { terminated: result };
+      }
+      if (scopeFreeProtocol.status !== "ready") {
+        result.errors = 1;
+        result.message = this.t("result.v2ProtocolBlocked");
+        this.diag?.error(
+          "state",
+          "reviewed cross-scope cloud join could not revalidate the exact scope-free protocol before authority commit",
+          { reason: scopeFreeProtocol.reason, mutations: 0 },
+        );
+        return { terminated: result };
+      }
+      protocolBinding = scopeFreeProtocol.binding;
+      this.diag?.log(
+        "state",
+        "reviewed cross-scope cloud join revalidated the exact scope-free protocol before authority commit",
+        {
+          protocolVersion: scopeFreeProtocol.binding.protocolVersion,
+          migrationGeneration:
+            scopeFreeProtocol.binding.migrationGeneration.slice(0, 12),
+          mutations: 0,
+        },
+      );
+    }
+    if (reviewedMigrationStillCurrent && !protocolBinding) {
+      const protocolRevalidation =
+        await this.revalidateReviewedV2ProtocolBinding({
+          result,
+          reviewKind,
+          options,
+          syncScope,
+          existingConfirmed,
+          activeReviewedAuthorization,
+          protocolBinding,
+          migrationCandidateEnvelope,
+          canonicalIdentity,
+        });
+      if (protocolRevalidation.terminated) {
+        return { terminated: protocolRevalidation.terminated };
+      }
+      protocolBinding = protocolRevalidation.protocolBinding;
+      activeReviewedAuthorization =
+        protocolRevalidation.activeReviewedAuthorization;
+    }
+    let confirmed: MigrationHoldV2 | null = null;
+    if (reviewedMigrationStillCurrent) {
+      confirmed = (
+        existingConfirmed?.phase === "confirmed"
+        && activeReviewedAuthorization.revision
+          === existingConfirmed.revision
+        && sameSyncScope(
+          activeReviewedAuthorization.scope,
+          existingConfirmed.scope,
+        )
+        && sameCanonicalPlanIdentityV2(
+          activeReviewedAuthorization.canonicalIdentity,
+          existingConfirmed.canonicalIdentity,
+        )
+        && sameCanonicalPlanIdentityV2(
+          canonicalIdentity,
+          existingConfirmed.canonicalIdentity,
+        )
+        && sameStateV2MigrationCandidate(
+          migrationCandidateEnvelope,
+          existingConfirmed.candidate,
+        )
+      )
+        ? existingConfirmed
+        : await this.state.confirmV2MigrationHold({
+            authorization: activeReviewedAuthorization,
+            candidate: migrationCandidateEnvelope,
+            canonicalIdentity,
+            protocolBinding: protocolBinding!,
+          });
+    }
+    // Revalidating the pending hold may await storage/source evidence.
+    // Cancellation remains authoritative until authority commit begins;
+    // a confirmed hold is durable and can resume on the next run.
+    this.throwIfSharedSyncProtocolOperationWasCancelled();
+    if (confirmed) {
+      const authorityCommit =
+        await this.commitReviewedV2MigrationAuthority({
+          result,
+          plan,
+          syncScope,
+          operationEpoch,
+          automaticHandlingMetrics,
+          takeOverPublic113MutationLedger,
+          confirmed,
+          retireFirstSyncVerificationEvidence,
+          publishCommunityPluginPostAuthorityState,
+          migrationAuthorityCommittedThisRun,
+          migrationExecutionHold,
+        });
+      if (authorityCommit.terminated) {
+        return { terminated: authorityCommit.terminated };
+      }
+      migrationAuthorityCommittedThisRun =
+        authorityCommit.migrationAuthorityCommittedThisRun;
+      migrationExecutionHold = authorityCommit.migrationExecutionHold;
+    } else {
+      await this.state.stageV2MigrationHold({
+        candidate: migrationCandidateEnvelope,
+        source: public113MigrationInput!,
+        reviewKind,
+        plan,
+      });
+      this.diag?.warn(
+        "state",
+        "V2 migration review changed before authority commit",
+        {
+          phase: "activation",
+          planItems: plan.items.length,
+          mutations: 0,
+          ...describeStateV2MigrationReviewDriftFacts(
+            migrationCandidateEnvelope,
+            existingConfirmed,
+            canonicalIdentity,
+          ),
+        },
+      );
+      const publishPreview =
+        callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
+      if (publishPreview) {
+        await waitForReview(() => publishPreview(plan));
+      }
+      return { terminated: this.markPlanReviewPaused(result) };
+    }
+    return {
+      terminated: null,
+      migrationAuthorityCommittedThisRun,
+      migrationExecutionHold,
+    };
+  }
+
+  /** Revalidate the exact shared and scope-free V2 protocol bindings for a
+   *  reviewed activation before the authority commit, and hand back the
+   *  possibly refreshed reviewed authorization. */
+  private async revalidateReviewedV2ProtocolBinding(args: {
+    result: SyncResult;
+    reviewKind: V2ActivationReviewKind;
+    options: SyncRunOptions;
+    syncScope: SyncScope;
+    existingConfirmed: StateManager["activeV2MigrationHold"];
+    activeReviewedAuthorization: PlanReviewAuthorization;
+    protocolBinding: SharedSyncProtocolBinding | undefined;
+    migrationCandidateEnvelope: SyncStateEnvelopeV2;
+    canonicalIdentity: CanonicalPlanIdentityV2;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        protocolBinding: SharedSyncProtocolBinding;
+        activeReviewedAuthorization: PlanReviewAuthorization;
+      }
+  > {
+    const {
+      result,
+      reviewKind,
+      options,
+      syncScope,
+      existingConfirmed,
+      migrationCandidateEnvelope,
+      canonicalIdentity,
+    } = args;
+    let {
+      activeReviewedAuthorization,
+      protocolBinding,
+    } = args;
+    // Public 1.1.3 migration alone needs the dedicated upgrade-risk
+    // acknowledgement. A reviewed first-sync plan may create the
+    // initial record; cloud join must only adopt an existing record.
+    if (
+      reviewKind === "v2-migration"
+      && options.acknowledgeMigrationRisk !== true
+    ) {
+      this.markPlanReviewPaused(result);
+      this.diag?.warn(
+        "state",
+        "V2 migration remains paused until this device acknowledges the migration risk",
+        { mutations: 0 },
+      );
+      return { terminated: result };
+    }
+    const protocolTransport = availableSharedSyncProtocolTransportV2(
+      this.onedrive,
+      this.vaultName,
+    );
+    if (!protocolTransport) {
+      result.errors = 1;
+      result.message = this.t("result.v2ProtocolBlocked");
+      this.diag?.error(
+        "state",
+        "shared V2 sync protocol transport is unavailable",
+      );
+      return { terminated: result };
+    }
+    const protocolObservation =
+      await this.observeSharedSyncProtocolObjects();
+    if (protocolObservation.status === "unavailable") {
+      result.errors = 1;
+      result.message = this.t("result.remoteReadUnavailable");
+      this.diag?.warn(
+        "state",
+        "reviewed V2 activation retained its authorization because the shared protocol is temporarily unavailable",
+        { reason: protocolObservation.reason, mutations: 0 },
+      );
+      return { terminated: result };
+    }
+    if (protocolObservation.status !== "ready") {
+      result.errors = 1;
+      result.message = this.t("result.v2ProtocolBlocked");
+      this.diag?.error(
+        "state",
+        "shared V2 sync protocol could not be observed before authority commit",
+        { reason: protocolObservation.reason, mutations: 0 },
+      );
+      return { terminated: result };
+    }
+    const protocol = await this.ensureSharedSyncProtocolV2FromObservation(
+      protocolTransport,
+      protocolObservation,
+      {
+        scope: syncScope,
+        acknowledgeMigrationRisk:
+          reviewKind !== "v2-cloud-join",
+        ...(reviewKind === "v2-first-sync"
+            && existingConfirmed?.phase === "pending"
+            && existingConfirmed.protocolBinding?.protocolVersion === 2
+          ? {
+              expectedBinding: existingConfirmed.protocolBinding,
+              requireExactBinding: true,
+            }
+          : {}),
+      },
+      async (settled) => {
+        if (
+          reviewKind !== "v2-first-sync"
+          || settled.source !== "created"
+          || !activeReviewedAuthorization
+        ) return;
+        const checkpointed =
+          await this.state.checkpointPendingFirstSyncProtocolBinding({
+            authorization: activeReviewedAuthorization,
+            candidate: migrationCandidateEnvelope,
+            canonicalIdentity,
+            protocolBinding: settled.binding,
+          });
+        if (!checkpointed) return;
+        const refreshedAuthorization =
+          this.state.planReviewAuthorization;
+        if (
+          !refreshedAuthorization
+          || refreshedAuthorization.reviewKind !== "v2-first-sync"
+        ) {
+          throw new Error(
+            "First-sync protocol checkpoint lost its reviewed authorization",
+          );
+        }
+        activeReviewedAuthorization = refreshedAuthorization;
+      },
+    );
+    if (protocol.status === "unavailable") {
+      result.errors = 1;
+      result.message = this.t("result.remoteReadUnavailable");
+      this.diag?.warn(
+        "state",
+        "reviewed V2 activation retained its authorization because post-write protocol observation is temporarily unavailable",
+        { reason: protocol.reason, mutations: 0 },
+      );
+      return { terminated: result };
+    }
+    if (protocol.status !== "ready") {
+      result.errors = 1;
+      result.message = this.t("result.v2ProtocolBlocked");
+      this.diag?.error(
+        "state",
+        "shared V2 sync protocol could not be joined safely",
+        { reason: protocol.reason, mutations: 0 },
+      );
+      return { terminated: result };
+    }
+    const scopeFreeProtocol =
+      await this.ensureScopeFreeSharedProtocolFromObservation(
+        protocol.value.binding,
+        syncScope,
+        protocol.observation,
+      );
+    if (scopeFreeProtocol.status === "unavailable") {
+      result.errors = 1;
+      result.message = this.t("result.remoteReadUnavailable");
+      this.diag?.warn(
+        "state",
+        "reviewed V2 activation retained its authorization because scope-free protocol observation is temporarily unavailable",
+        { reason: scopeFreeProtocol.reason, mutations: 0 },
+      );
+      return { terminated: result };
+    }
+    if (scopeFreeProtocol.status !== "ready") {
+      result.errors = 1;
+      result.message = this.t("result.v2ProtocolBlocked");
+      this.diag?.error(
+        "state",
+        "scope-free shared protocol could not be established before authority commit",
+        {
+          reason: scopeFreeProtocol.reason,
+          mutations: 0,
+        },
+      );
+      return { terminated: result };
+    }
+    protocolBinding = scopeFreeProtocol.binding;
+    this.diag?.log(
+      "state",
+      `scope-free shared protocol joined from ${scopeFreeProtocol.source}`,
+      {
+        protocolVersion: scopeFreeProtocol.binding.protocolVersion,
+        migrationGeneration:
+          scopeFreeProtocol.binding.migrationGeneration.slice(0, 12),
+        mutations: 0,
+      },
+    );
+    return {
+      terminated: null,
+      protocolBinding,
+      activeReviewedAuthorization,
+    };
+  }
+
+  /** Commit the confirmed V2 migration hold as this run's authority, retire
+   *  the first-sync evidence, publish the post-authority state, and settle
+   *  the legacy mutation-ledger takeover. */
+  private async commitReviewedV2MigrationAuthority(args: {
+    result: SyncResult;
+    plan: SyncPlan;
+    syncScope: SyncScope;
+    operationEpoch: number;
+    automaticHandlingMetrics: ReturnType<typeof createAutomaticHandlingMetrics>;
+    takeOverPublic113MutationLedger: boolean;
+    confirmed: MigrationHoldV2;
+    retireFirstSyncVerificationEvidence: () => Promise<void>;
+    publishCommunityPluginPostAuthorityState: () => Promise<void>;
+    migrationAuthorityCommittedThisRun: boolean;
+    migrationExecutionHold: MigrationHoldV2 | null;
+  }): Promise<
+    | { terminated: SyncResult }
+    | {
+        terminated: null;
+        migrationAuthorityCommittedThisRun: boolean;
+        migrationExecutionHold: MigrationHoldV2 | null;
+      }
+  > {
+    const {
+      result,
+      plan,
+      syncScope,
+      operationEpoch,
+      automaticHandlingMetrics,
+      takeOverPublic113MutationLedger,
+      confirmed,
+      retireFirstSyncVerificationEvidence,
+      publishCommunityPluginPostAuthorityState,
+    } = args;
+    let {
+      migrationAuthorityCommittedThisRun,
+      migrationExecutionHold,
+    } = args;
+    const committed =
+      await this.state.commitConfirmedV2MigrationHold(
+        confirmed,
+        Date.now(),
+        takeOverPublic113MutationLedger
+          ? "legacy-mutation-recovery"
+          : "ordinary",
+    );
+    migrationAuthorityCommittedThisRun = true;
+    await retireFirstSyncVerificationEvidence();
+    await publishCommunityPluginPostAuthorityState();
+    migrationExecutionHold = committed.hold;
+    plan.confirmed = true;
+    this.diag?.warn(
+      "state",
+      "V2 migration authority committed from the reviewed hold",
+      {
+        phase: "activation",
+        holdRevision: committed.hold.revision,
+        planItems: plan.items.length,
+        mutations: 0,
+      },
+    );
+    if (takeOverPublic113MutationLedger) {
+      await this.recoverMutationLedger(
+        syncScope,
+        automaticHandlingMetrics,
+        operationEpoch,
+      );
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+      if (this.state.mutationLedger.length > 0) {
+        throw new Error(
+          "Public 1.1.3 mutation recovery remains unresolved under V2 authority",
+        );
+      }
+      const completed = await this.state.transitionV2MigrationHold(
+        committed.hold,
+        "completed",
+      );
+      if (!completed) {
+        throw new Error(
+          "V2 migration hold did not complete after legacy mutation recovery",
+        );
+      }
+      result.success = true;
+      result.message = this.t("result.synced", {
+        uploaded: 0,
+        downloaded: 0,
+        foldersCreated: 0,
+        foldersMoved: 0,
+        foldersDeleted: 0,
+        filesMoved: 0,
+        deleted: 0,
+        conflicts: 0,
+        deferred: 0,
+        errors: 0,
+      });
+      result.continueAfterStateOnlyMigrationRecovery = true;
+      return { terminated: result };
+    }
+    return {
+      terminated: null,
+      migrationAuthorityCommittedThisRun,
+      migrationExecutionHold,
+    };
+  }
+
+  /** Step 5.9: bind the exact reviewed versions onto every user-visible
+   *  pending decision before a first-sync or threshold callback can persist
+   *  it. */
+  private runStep5_9BindPendingDecisionTokens(args: {
+    plan: SyncPlan;
+    finalizedCanonicalPlan: FinalizedCanonicalPlanV2 | null;
+  }): void {
+    const { plan, finalizedCanonicalPlan } = args;
+    // Every user-visible pending item must carry the exact reviewed
+    // versions before a first-sync or threshold callback can persist it.
+    if (!finalizedCanonicalPlan) {
+      this.bindPendingDecisionTokens(plan);
+    }
+  }
+
+  /** Step 5.10: enforce an explicit read-only preview — publish the plan
+   *  to the review callback and stop before any mutation. The review closure
+   *  stays in run() and arrives here by reference. */
+  private async runStep5_10PublishReadOnlyPreview(args: {
+    result: SyncResult;
+    plan: SyncPlan;
+    callbacks: SyncCallbacks;
+    options: SyncRunOptions;
+    syncScope: SyncScope;
+    waitForReview: (review: () => Promise<boolean>) => Promise<boolean>;
+  }): Promise<{ terminated: SyncResult } | { terminated: null }> {
+    const { result, plan, callbacks, options, syncScope, waitForReview } = args;
+    if (!options.readOnlyPreview) {
+      return { terminated: null };
+    }
+    const publishPreview = callbacks.onFirstSyncPreview ?? callbacks.onConfirmThreshold;
+    if (publishPreview) await waitForReview(() => publishPreview(plan));
+    this.diag?.warn(
+      "plan",
+      "explicit read-only preview enforced; Graph creates=0, file mutations=0",
+      {
+        scope: syncScope,
+        counts: this.summarizePlanActions(plan),
+        total: plan.items.length,
+        sample: plan.items.slice(0, 10).map((item) => ({
+          type: item.type,
+          path: item.path,
+          reason: item.reason,
+        })),
+        mutations: 0,
+      },
+    );
+    return { terminated: this.markPlanReviewPaused(result) };
+  }
+
+  /** Step 5.11: a legacy namespace recovery is never executable in the same
+   *  round — publish the corrected plan once and stop. The review closure
+   *  stays in run() and arrives here by reference. */
+  private async runStep5_11PublishRecoveryPreview(args: {
+    result: SyncResult;
+    plan: SyncPlan;
+    callbacks: SyncCallbacks;
+    syncScope: SyncScope;
+    baseEntries: BaseFileEntry[];
+    waitForReview: (review: () => Promise<boolean>) => Promise<boolean>;
+  }): Promise<{ terminated: SyncResult } | { terminated: null }> {
+    const { result, plan, callbacks, syncScope, baseEntries, waitForReview } = args;
+    if (!this.remoteRecoveryPreviewRequired) {
+      return { terminated: null };
+    }
+    // A legacy namespace recovery is never executable in the same round.
+    // Persist/show the corrected plan once, but ignore a callback that would
+    // otherwise authorize immediate execution. The following round starts
+    // from the clean committed snapshot and must pass normal revision gates.
+    const counts = this.summarizePlanActions(plan);
+    const anomalies = plan.items
+      .filter((item) => item.path.startsWith("files/") || item.path.startsWith(".easy-sync/"))
+      .slice(0, 10)
+      .map((item) => `${item.type}:${item.path}`);
+    this.diag?.warn(
+      "plan",
+      "remote namespace recovery forced a read-only preview; file mutations=0",
+      {
+        scope: syncScope,
+        counts,
+        total: plan.items.length,
+        priorBaseCount: baseEntries.length,
+        anomalies,
+        sample: plan.items.slice(0, 10).map((item) => ({
+          type: item.type,
+          path: item.path,
+          reason: item.reason,
+        })),
+        mutations: 0,
+      },
+    );
+    const publishPreview = callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
+    if (publishPreview) await waitForReview(() => publishPreview(plan));
+    return { terminated: this.markPlanReviewPaused(result) };
+  }
+
+  /** Step 5.12: retire planner-derived issue rows the fresh plan no longer
+   *  produces — pure UI state, pruned after the review gates. */
+  private async runStep5_12PrunePlannerDerivedIssues(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    plan: SyncPlan;
+    protectedMutationRecoveryRecords: MutationLedgerEntryV1[];
+  }): Promise<{ terminated: SyncResult } | { terminated: null }> {
+    const { result, operationEpoch, plan, protectedMutationRecoveryRecords } = args;
+    // Planner-derived issue rows are pure UI state. Retire the rows the
+    // fresh plan no longer produces even when a review gate is about to
+    // hold this round, so stale "核对文件夹"-style rows cannot outlive the
+    // plan that created them. Conflict/delete rows stay behind the gates:
+    // they carry confirmation semantics and planning authority.
+    await this.prunePlannerDerivedStaleIssues(
+      plan,
+      protectedMutationRecoveryRecords,
+    );
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    return { terminated: null };
+  }
+
+  /** Step 5.13: verify the reviewed plan digest after every pre-execution
+   *  rewrite; a changed plan re-pauses for confirmation. The review closure
+   *  stays in run() and arrives here by reference. */
+  private async runStep5_13VerifyReviewedPlanDigest(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    plan: SyncPlan;
+    callbacks: SyncCallbacks;
+    reviewedAuthorization: PlanReviewAuthorization | undefined;
+    skipConfirmation: boolean;
+    syncScope: SyncScope;
+    attemptV2Activation: boolean;
+    migrationAuthorityCommittedThisRun: boolean;
+    waitForReview: (review: () => Promise<boolean>) => Promise<boolean>;
+  }): Promise<{ terminated: SyncResult } | { terminated: null }> {
+    const {
+      result,
+      operationEpoch,
+      plan,
+      callbacks,
+      reviewedAuthorization,
+      skipConfirmation,
+      syncScope,
+      attemptV2Activation,
+      migrationAuthorityCommittedThisRun,
+      waitForReview,
+    } = args;
+    if (
+      !skipConfirmation
+      || !this.state.planReviewActive
+      || migrationAuthorityCommittedThisRun
+      || attemptV2Activation
+    ) {
+      return { terminated: null };
+    }
+    // If the user is executing a reviewed plan, verify the digest after all
+    // pre-execution rewrites (scan health and dedup). The
+    // reviewed bundle stays in state until this point so stale plans re-pause.
+    const authorizationIsCurrent = Boolean(
+      reviewedAuthorization
+      && reviewedAuthorization.revision === this.state.planReviewRevision
+      && sameSyncScope(reviewedAuthorization.scope, this.state.planReviewScope)
+      && sameSyncScope(reviewedAuthorization.scope, syncScope)
+      && sameCanonicalPlanIdentityV2(
+        reviewedAuthorization.canonicalIdentity,
+        plan.canonicalIdentity,
+      )
+      && sameCanonicalPlanIdentityV2(
+        this.state.planReviewCanonicalIdentity,
+        plan.canonicalIdentity,
+      )
+    );
+    if (!authorizationIsCurrent) {
+      this.diag?.warn(
+        "plan",
+        "plan revision, scope, or canonical identity changed since review — re-pausing for confirmation",
+      );
+      if (callbacks.onConfirmThreshold) {
+        await waitForReview(() => callbacks.onConfirmThreshold!(plan));
+      }
+      return { terminated: this.markPlanReviewPaused(result) };
+    }
+    const savedDigest = this.state.planReviewDigest;
+    const currentDigest = plan.canonicalIdentity
+      ? canonicalPlanDigestV2({
+          items: plan.items,
+          lastTotalFiles: plan.lastTotalFiles,
+          scope: plan.canonicalIdentity.scope,
+          sourceCommitSeq:
+            plan.canonicalIdentity.sourceCommitSeq,
+        })
+      : planDigest(plan.items);
+    const sealedIdentityChanged = Boolean(
+      plan.canonicalIdentity
+      && currentDigest !== plan.canonicalIdentity.digest
+    );
+    if (
+      sealedIdentityChanged
+      || (savedDigest && currentDigest !== savedDigest)
+    ) {
+      this.diag?.warn("plan", "plan changed since review — re-pausing for confirmation");
+      const confirmed = callbacks.onConfirmThreshold
+        ? await waitForReview(() => callbacks.onConfirmThreshold!(plan))
+        : false;
+      if (!confirmed) {
+        return { terminated: this.markPlanReviewPaused(result) };
+      }
+      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    }
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    const cleared = await this.state.clearPlanReview(reviewedAuthorization);
+    if (!cleared) {
+      this.diag?.warn("plan", "plan review changed before authorization commit — stopping before mutation");
+      return { terminated: this.markPlanReviewPaused(result) };
+    }
+    return { terminated: null };
+  }
+
   async run(
     mode: SyncMode,
     callbacks: SyncCallbacks = {},
@@ -6956,1173 +12918,192 @@ export class SyncExecutor {
         return result;
       }
 
-      // Step 1: Scan local files
-      enterPhase("scan");
-      this.progressStore?.setPhase("scanning");
-      callbacks.onProgress?.(0, 1, this.t("progress.scanningLocal"));
-      const scanResult = await this.scanner.scanAll();
-      let localEntries = scanResult.entries;
-      let localFolders = scanResult.folders ?? [];
-      let localFolderScanComplete = scanResult.folderScanComplete === true;
-      const { skippedLarge, failedPaths } = scanResult;
-      result.skippedLarge = skippedLarge.length;
-      if (this.shouldStop(result, operationEpoch)) return result;
-      if (scanResult.complete === false || failedPaths.length > 0) {
-        result.errors = Math.max(1, new Set(failedPaths).size);
-        result.message = this.t("result.scanIncomplete");
-        this.diag?.warn(
-          "scan",
-          `scan incomplete — stopping round before remote preparation; ${result.errors} path(s) uncertain: ${failedPaths.slice(0, 5).join(", ")}`,
-        );
-        return result;
-      }
+      // Step 1: Scan local files (+ Step 1b: clear orphaned recovery copies
+      // collected during the scan — safety rationale in runStep1ScanLocalFiles).
+      const step1 = await this.runStep1ScanLocalFiles({
+        result,
+        operationEpoch,
+        callbacks,
+        enterPhase,
+      });
+      if (step1.terminated) return step1.terminated;
+      let localEntries = step1.localEntries;
+      let localFolders = step1.localFolders;
+      let localFolderScanComplete = step1.localFolderScanComplete;
+      const { skippedLarge, folderScanFailures } = step1;
 
-      // Step 1b: clear orphaned recovery copies collected during the scan.
-      // Step 0 already reconciled every copy with an intent; anything still
-      // present here is an orphan whose transaction completed (the intent was
-      // deleted before its copy cleanup finished). Removing those copies is
-      // safe: the target was verified present at completion, so the copy is
-      // only the replaced old version.
-      if ((scanResult.recoveryCopies?.length ?? 0) > 0) {
-        const orphanSummary = await this.getRecoveryJournal().cleanupOrphanCopies(
-          scanResult.recoveryCopies ?? [],
-        );
-        this.diag?.log(
-          "execute",
-          `orphaned recovery copies cleaned — ${orphanSummary.removed} removed, ${orphanSummary.retained} retained${orphanSummary.removedPaths.length > 0 ? `: ${orphanSummary.removedPaths.join(", ")}` : ""}`,
-          { mutations: 0 },
-        );
-      }
-
-      // Step 1.5: Resolve and initialize the remote vault directory.
-      enterPhase("remotePrepare");
-      this.progressStore?.setPhase("preparing");
-      callbacks.onProgress?.(0, 1, this.t("progress.preparingRemote"));
-      const committedScope = this.state.remoteScope;
-      const committedDeltaLink = this.state.remoteDeltaLink;
-      const canRestoreCommittedScope = Boolean(this.state.boundAccountId)
-        && committedScope?.accountId === this.state.boundAccountId
-        && Boolean(committedScope);
-      const restoredCommittedScopeFromDeltaCache = canRestoreCommittedScope
-        && Boolean(committedDeltaLink)
-        && this.onedrive.restoreVaultScope(
-          this.vaultName,
-          {
-            driveId: committedScope.driveId,
-            vaultFolderId: committedScope.vaultFolderId,
-            filesRootId: committedScope.filesRootId,
-          },
-          committedDeltaLink!,
-        );
-      let restoredCommittedScope = restoredCommittedScopeFromDeltaCache;
-      if (
-        canRestoreCommittedScope
-        && !restoredCommittedScope
-        && typeof this.onedrive.restoreVaultScopeByIdentity === "function"
-      ) {
-        try {
-          const restored = await this.onedrive.restoreVaultScopeByIdentity(
-            this.vaultName,
-            {
-              driveId: committedScope.driveId,
-              vaultFolderId: committedScope.vaultFolderId,
-              filesRootId: committedScope.filesRootId,
-            },
-          );
-          restoredCommittedScope = restored.driveId === committedScope.driveId
-            && restored.vaultFolderId === committedScope.vaultFolderId
-            && restored.filesRootId === committedScope.filesRootId;
-        } catch (error) {
-          if (
-            !this.state.isV2StateActive
-            || this.state.mutationLedger.length > 0
-          ) throw error;
-          const scopeLoss = await this.resolveV2CommittedScopeLoss(
-            committedScope,
-            error,
-          );
-          await this.stageV2CommittedScopeRecovery(result, scopeLoss);
-          if (
-            mode !== "auto"
-            && options.readOnlyPreview !== true
-          ) {
-            const recoveryResult = await this.runV2RemoteScopeRecovery({
-              result,
-              callbacks,
-              operationEpoch,
-              automaticHandlingPolicy,
-              communityPluginSyncPolicy,
-              enterPhase,
-            });
-            if (recoveryResult) return recoveryResult;
-            restoredCommittedScope = true;
-            result.deferred = 0;
-            result.message = "";
-          } else {
-            return result;
-          }
-        }
-      }
-      const remoteVaultScope = restoredCommittedScope
-        ? {
-            driveId: committedScope!.driveId,
-            vaultFolderId: committedScope!.vaultFolderId,
-            filesRootId: committedScope!.filesRootId,
-          }
-        : options.readOnlyPreview || recoveryOnly
-          ? await this.onedrive.initVaultScope(this.vaultName, { createMissing: false })
-          : await this.onedrive.initVaultScope(this.vaultName);
-      let syncScope: SyncScope = {
-        accountId: this.state.boundAccountId,
-        ...remoteVaultScope,
-      };
-      this.activeSyncScope = syncScope;
-      if (this.shouldStop(result, operationEpoch)) return result;
-      if (prepareV2MigrationCandidate && activationReviewKind === null) {
-        const protocolObservation =
-          await this.readFreshSharedProtocolProfile(syncScope);
-        if (protocolObservation.status === "unavailable") {
-          return this.finishRetryableSharedControlObservation(
-            result,
-            protocolObservation,
-            operationEpoch,
-          );
-        }
-        if (protocolObservation.status === "blocked") {
-          result.errors = 1;
-          result.message = this.t("result.v2ProtocolBlocked");
-          return result;
-        }
-        const protocolProfile = protocolObservation.profile;
-        const initialProtocolObservation: SharedSyncProtocolObserved = {
-          status: "ready",
-          objects: protocolObservation.objects,
-        };
-        if (protocolProfile.status === "empty") {
-          if (pendingFirstSyncProtocolBinding) {
-            result.errors = 1;
-            result.message = this.t("result.v2ProtocolBlocked");
-            this.diag?.error(
-              "state",
-              "reviewed first-sync protocol checkpoint is missing from the fresh control-directory observation",
-              { mutations: 0 },
-            );
-            return result;
-          }
-          activationReviewKind = "v2-first-sync";
-          this.diag?.log(
-            "state",
-            "fresh V2 device classified as the first device for this sync state",
-            { mutations: 0 },
-          );
-        } else if (protocolProfile.status === "legacy-v2") {
-          const protocolTransportV2 = availableSharedSyncProtocolTransportV2(
-            this.onedrive,
-            this.vaultName,
-          );
-          if (!protocolTransportV2) {
-            result.errors = 1;
-            result.message = this.t("result.v2ProtocolBlocked");
-            return result;
-          }
-          const protocol = await this.ensureSharedSyncProtocolV2FromObservation(
-            protocolTransportV2,
-            initialProtocolObservation,
-            {
-              scope: syncScope,
-              acknowledgeMigrationRisk: false,
-              ...(pendingFirstSyncProtocolBinding
-                ? {
-                    expectedBinding: pendingFirstSyncProtocolBinding,
-                    requireExactBinding: true,
-                  }
-                : {}),
-            },
-          );
-          if (protocol.status === "unavailable") {
-            return this.finishRetryableSharedControlObservation(
-              result,
-              protocol,
-              operationEpoch,
-            );
-          }
-          if (
-            protocol.status !== "ready"
-            || protocol.value.binding.migrationGeneration
-              !== protocolProfile.migrationGeneration
-            || protocol.value.binding.recordId
-              !== protocolProfile.protocolV2Object.id
-            || protocol.value.binding.recordETag
-              !== protocolProfile.protocolV2Object.eTag
-          ) {
-            result.errors = 1;
-            result.message = this.t("result.v2ProtocolBlocked");
-            this.diag?.error(
-              "state",
-              "legacy V2 protocol changed during activation classification",
-              {
-                reason: protocol.status === "ready"
-                    ? "identity-mismatch"
-                    : protocol.reason,
-                mutations: 0,
-              },
-            );
-            return result;
-          }
-          const resumesReviewedFirstSync = Boolean(
-            pendingFirstSyncProtocolBinding
-            && sharedSyncProtocolV2MatchesBinding(
-              protocolProfile.protocolV2Object,
-              protocolProfile.protocolV2,
-              pendingFirstSyncProtocolBinding,
-              syncScope,
-            )
-          );
-          activationReviewKind = resumesReviewedFirstSync
-            ? "v2-first-sync"
-            : "v2-cloud-join";
-          firstSyncVerificationProtocolBinding = protocol.value.binding;
-          this.diag?.log(
-            "state",
-            resumesReviewedFirstSync
-              ? "reviewed first-sync resumed from its exact pending V2 protocol checkpoint"
-              : "fresh device classified as joining a legacy V2 shared sync state",
-            {
-              migrationGeneration:
-                protocol.value.binding.migrationGeneration.slice(0, 12),
-              mutations: 0,
-            },
-          );
-        } else if (protocolProfile.status === "healthy") {
-          const scopeFreeProtocol =
-            await this.inspectExistingScopeFreeSharedProtocolForFreshActivation(
-              initialProtocolObservation,
-            );
-          if (
-            scopeFreeProtocol.status !== "ready"
-            || scopeFreeProtocol.binding.migrationGeneration
-              !== protocolProfile.migrationGeneration
-            || scopeFreeProtocol.binding.recordId
-              !== protocolProfile.protocolV3Object.id
-            || scopeFreeProtocol.binding.recordETag
-              !== protocolProfile.protocolV3Object.eTag
-          ) {
-            result.errors = 1;
-            result.message = this.t("result.v2ProtocolBlocked");
-            this.diag?.error(
-              "state",
-              "healthy shared protocol profile changed during activation classification",
-              {
-                reason: scopeFreeProtocol.status === "ready"
-                  ? "generation-mismatch"
-                  : scopeFreeProtocol.reason,
-                mutations: 0,
-              },
-            );
-            return result;
-          }
-          const resumesReviewedFirstSync = Boolean(
-            pendingFirstSyncProtocolBinding
-            && sharedSyncProtocolV2MatchesBinding(
-              protocolProfile.protocolV2Object,
-              protocolProfile.protocolV2,
-              pendingFirstSyncProtocolBinding,
-              syncScope,
-            )
-          );
-          activationReviewKind = resumesReviewedFirstSync
-            ? "v2-first-sync"
-            : "v2-cloud-join";
-          freshSharedProtocolBinding = scopeFreeProtocol.binding;
-          firstSyncVerificationProtocolBinding = scopeFreeProtocol.binding;
-          this.diag?.log(
-            "state",
-            resumesReviewedFirstSync
-              ? "reviewed first-sync resumed from its exact healthy protocol lineage"
-              : "fresh device classified as joining an existing healthy shared protocol profile",
-            {
-              protocolVersion: scopeFreeProtocol.binding.protocolVersion,
-              migrationGeneration:
-                scopeFreeProtocol.binding.migrationGeneration.slice(0, 12),
-              predecessorContentSha256:
-                scopeFreeProtocol.binding.predecessorContentSha256.slice(0, 12),
-              contentSha256:
-                scopeFreeProtocol.binding.contentSha256.slice(0, 12),
-              mutations: 0,
-            },
-          );
-        } else {
-          result.errors = 1;
-          result.message = this.t("result.v2ProtocolBlocked");
-          if (protocolProfile.status === "inconsistent") {
-            this.diag?.error(
-              "state",
-              SHARED_SYNC_PROTOCOL_PROFILE_DIAGNOSTIC_EVENT,
-              protocolProfile.evidence,
-            );
-          }
-          this.diag?.error(
-            "state",
-            "fresh activation could not classify the shared protocol profile safely",
-            {
-              reason: protocolProfile.status === "inconsistent"
-                ? protocolProfile.reason
-                : "recovery-proof-required",
-              mutations: 0,
-            },
-          );
-          return result;
-        }
-      }
-      if (!takeOverPublic113MutationLedger) {
-        let recoveryObservationCommitSeq: number | undefined;
-        if (
-          this.state.isV2StateActive
-          && this.state.mutationLedger.length > 0
-        ) {
-          await this.observeCompleteRemoteStateForMutationRecovery(
-            operationEpoch,
-            result,
-            syncScope,
-            localEntries,
-            options.mutationRecoveryObservationOnly !== true,
-            this.state.isV2StateActive
-            && skipConfirmation
-            && this.state.planReviewActive
-              ? reviewedAuthorization?.canonicalIdentity?.sourceCommitSeq
-              : undefined,
-          );
-          if (this.shouldStop(result, operationEpoch)) return result;
-          const observedEnvelope = this.state.getCommittedV2Envelope();
-          if (observedEnvelope?.remoteIndex.complete === true) {
-            recoveryObservationCommitSeq = observedEnvelope.meta.commitSeq;
-          }
-        }
-        let mutationRecovery: MutationRecoveryRunSummary | null = null;
-        try {
-          mutationRecovery = await this.recoverMutationLedger(
-            syncScope,
-            automaticHandlingMetrics,
-            operationEpoch,
-            options.mutationRecoveryObservationOnly === true,
-            recoveryObservationCommitSeq,
-            result,
-          );
-        } catch (error) {
-          if (!(error instanceof MutationRecoveryBlockedError)) throw error;
-          const isolated = this.isolatableOrdinaryFileRecovery(
-            error.summary,
-            syncScope,
-          );
-          if (!isolated) {
-            if (error.summary.state !== "network-unavailable") throw error;
-            // Every remaining record still owns its paths, but a retryable
-            // network outage must not freeze the rest of the Vault. Keep the
-            // remaining records protected from ordinary planning and let the
-            // run sync everything else; the recovery keeps owning those paths.
-            mutationRecovery = error.summary;
-            result.mutationRecovery = error.summary;
-            protectedMutationRecoveryRecords = structuredClone([
-              ...this.state.mutationLedger,
-            ]);
-            this.diag?.warn(
-              "execute",
-              "mutation recovery is network-unavailable; protected paths stay frozen while the rest of the vault continues",
-              {
-                records: protectedMutationRecoveryRecords.length,
-                operationIds: protectedMutationRecoveryRecords.map(
-                  (record) => record.intent.operationId,
-                ),
-                mutations: 0,
-              },
-            );
-          } else {
-            protectedMutationRecoveryRecords = isolated;
-            const isolatedSummary: MutationRecoveryRunSummary = {
-              ...error.summary,
-              isolated: true,
-            };
-            mutationRecovery = isolatedSummary;
-            result.mutationRecovery = isolatedSummary;
-            this.diag?.warn(
-              "execute",
-              "unresolved ordinary files were isolated from unrelated planning",
-              {
-                records: isolated.length,
-                operationIds: isolated.map((record) => record.intent.operationId),
-                mutations: 0,
-              },
-            );
-          }
-        }
-        if (this.shouldStop(result, operationEpoch)) return result;
-        if (this.localVersionRecoveredDuringLedger) {
-          const recoveredScan = await this.scanner.scanAll();
-          if (
-            recoveredScan.complete === false
-            || recoveredScan.failedPaths.length > 0
-          ) {
-            result.errors = Math.max(
-              1,
-              new Set(recoveredScan.failedPaths).size,
-            );
-            result.message = this.t("result.scanIncomplete");
-            return result;
-          }
-          localEntries = recoveredScan.entries;
-          localFolders = recoveredScan.folders ?? [];
-          localFolderScanComplete =
-            recoveredScan.folderScanComplete === true;
-          this.localVersionRecoveredDuringLedger = false;
-          this.diag?.warn(
-            "execute",
-            "local scan refreshed after interrupted merge recovery",
-          );
-        }
-        if (recoveryOnly) {
-          result.mutationRecovery = mutationRecovery ?? {
-            state: "settled",
-            total: recoveryRecordsAtStart,
-            settled: Math.max(
-              0,
-              recoveryRecordsAtStart - this.state.mutationLedger.length,
-            ),
-            remaining: this.state.mutationLedger.length,
-            retryAfterSeconds: null,
-          };
-          result.success = this.state.mutationLedger.length === 0;
-          result.runFacts!.userFileChanges = mutationRecordsAtRunStart === 0
-            ? "none"
-            : "unknown";
-          result.message = this.t(
-            result.success ? "result.synced" : "result.syncFailed",
-            result.success
-              ? {
-                  uploaded: 0,
-                  downloaded: 0,
-                  foldersCreated: 0,
-                  foldersMoved: 0,
-                  foldersDeleted: 0,
-                  filesMoved: 0,
-                  deleted: 0,
-                  conflicts: 0,
-                  deferred: 0,
-                  errors: 0,
-                }
-              : { message: "Mutation recovery remains pending" },
-          );
-          this.diag?.log(
-            "execute",
-            "recovery-only V2 round stopped before baseline and planning",
-            {
-              ...result.mutationRecovery,
-            },
-          );
-          return result;
-        }
-      }
-      // Per-round shared protocol convergence: start its (read-only)
-      // observation before the remote scan so its network round trips overlap
-      // the delta, and consume the settled observation after the scan. If the
-      // protocol cannot converge afterwards, the remote scan's projection may
-      // already have been committed — a deliberate, observation-only outcome
-      // (same lifecycle family as review-wait and recovery-observation
-      // rounds), see docs/dev-logs/2026-08/20260823-2200 …
-      let perRoundProtocolGate = false;
-      let perRoundProtocolBinding: SharedSyncProtocolBinding | null = null;
-      let prestartedProtocolObservation:
-        | Promise<SharedSyncProtocolObservationSettled>
-        | null = null;
-      if (
-        this.state.isV2StateActive
-        && !this.state.activeSyncScopeExpansion
-        && this.state.activeV2MigrationHold === null
-        && options.readOnlyPreview !== true
-      ) {
-        perRoundProtocolGate = true;
-        perRoundProtocolBinding = await this.state.getActiveV2ProtocolBinding();
-        if (perRoundProtocolBinding) {
-          const expectedV3Slot =
-            isSharedSyncProtocolBindingV3(perRoundProtocolBinding)
-              ? {
-                  id: perRoundProtocolBinding.recordId,
-                  eTag: perRoundProtocolBinding.recordETag,
-                }
-              : undefined;
-          prestartedProtocolObservation =
-            this.observeSharedSyncProtocolObjects(expectedV3Slot).then(
-              (value): SharedSyncProtocolObservationSettled => ({ value }),
-              (error): SharedSyncProtocolObservationSettled => ({ error }),
-            );
-        }
-      }
-      const scopeExpansionState = this.state as StateManager & Partial<
-        Pick<StateManager, "prepareSyncScopeExpansion">
-      >;
-      const scopeExpansionPreparation =
-        this.state.isV2StateActive
-        && typeof scopeExpansionState.prepareSyncScopeExpansion === "function"
-        ? await scopeExpansionState.prepareSyncScopeExpansion(syncScope)
-        : { status: "none" as const };
-      if (scopeExpansionPreparation.status === "blocked") {
-        this.diag?.warn(
-          "state",
-          "device-local sync scope expansion remains blocked by unsettled recovery or review state",
-          {
-            revision: scopeExpansionPreparation.revision,
-            mutations: 0,
-          },
-        );
-        const blockedExpansion = this.state.activeSyncScopeExpansion;
-        if (
-          blockedExpansion?.revision === scopeExpansionPreparation.revision
-          && blockedExpansion.requiresCompleteRemoteIdentitySnapshot
-        ) {
-          result.message = this.t("result.cloudRecordIncomplete");
-          this.diag?.warn(
-            "state",
-            "file scope expansion stopped before remote scan and planning until complete remote identity recovery is safe",
-            {
-              revision: scopeExpansionPreparation.revision,
-              mutations: 0,
-            },
-          );
-          return result;
-        }
-      }
-      let forceCompleteRemoteIdentitySnapshot =
-        prepareV2MigrationCandidate
-        || scopeExpansionPreparation.status === "ready"
-        || (options.communityPluginJoinAuthorizations?.length ?? 0) > 0;
-      if (
-        this.state.remoteDeltaLink
-        && !this.onedrive.isDeltaLinkForVault(
-          this.vaultName,
-          this.state.remoteDeltaLink,
-        )
-      ) {
-        this.diag?.warn("onedrive", "remote delta cache belongs to a different vault directory, rebuilding");
-        if (this.shouldStop(result, operationEpoch)) return result;
-        if (this.state.isV2StateActive) {
-          forceCompleteRemoteIdentitySnapshot = true;
-          this.diag?.warn(
-            "onedrive",
-            "committed V2 delta route does not match its vault identity; rebuilding from the verified committed scope",
-          );
-        } else if (!prepareV2MigrationCandidate) {
-          await this.state.clearRemoteState();
-        }
-      }
+      const step1_5 = await this.runStep1_5PrepareRemoteVaultScope({
+        result,
+        callbacks,
+        operationEpoch,
+        mode,
+        options,
+        automaticHandlingPolicy,
+        communityPluginSyncPolicy,
+        recoveryOnly,
+        enterPhase,
+      });
+      if (step1_5.terminated) return step1_5.terminated;
+      const committedScope = step1_5.committedScope;
+      const restoredCommittedScopeFromDeltaCache =
+        step1_5.restoredCommittedScopeFromDeltaCache;
+      let syncScope: SyncScope = step1_5.syncScope;
+      const step1_6 = await this.runStep1_6ClassifyFreshV2Activation({
+        result,
+        operationEpoch,
+        prepareV2MigrationCandidate,
+        activationReviewKind,
+        syncScope,
+        pendingFirstSyncProtocolBinding,
+        firstSyncVerificationProtocolBinding,
+        freshSharedProtocolBinding,
+      });
+      if (step1_6.terminated) return step1_6.terminated;
+      activationReviewKind = step1_6.activationReviewKind;
+      firstSyncVerificationProtocolBinding =
+        step1_6.firstSyncVerificationProtocolBinding;
+      freshSharedProtocolBinding = step1_6.freshSharedProtocolBinding;
+      const step1_7 = await this.runStep1_7RecoverMutationLedger({
+        result,
+        operationEpoch,
+        syncScope,
+        localEntries,
+        localFolders,
+        localFolderScanComplete,
+        protectedMutationRecoveryRecords,
+        takeOverPublic113MutationLedger,
+        options,
+        skipConfirmation,
+        reviewedAuthorization,
+        automaticHandlingMetrics,
+        recoveryOnly,
+        recoveryRecordsAtStart,
+        mutationRecordsAtRunStart,
+      });
+      if (step1_7.terminated) return step1_7.terminated;
+      protectedMutationRecoveryRecords =
+        step1_7.protectedMutationRecoveryRecords;
+      localEntries = step1_7.localEntries;
+      localFolders = step1_7.localFolders;
+      localFolderScanComplete = step1_7.localFolderScanComplete;
+      const step1_8 = await this.runStep1_8PreparePerRoundProtocolAndScope({
+        result,
+        operationEpoch,
+        syncScope,
+        options,
+        prepareV2MigrationCandidate,
+      });
+      if (step1_8.terminated) return step1_8.terminated;
+      const perRoundProtocolGate = step1_8.perRoundProtocolGate;
+      const perRoundProtocolBinding = step1_8.perRoundProtocolBinding;
+      const prestartedProtocolObservation =
+        step1_8.prestartedProtocolObservation;
+      const forceCompleteRemoteIdentitySnapshot =
+        step1_8.forceCompleteRemoteIdentitySnapshot;
+      const scopeExpansionPreparation = step1_8.scopeExpansionPreparation;
 
       // Step 2: Load a non-authoritative cloud recovery hint when the local
-      // base still needs reconstruction. The legacy
-      // baseline is a read-only public-1.1.3 migration input only; once V2 is
-      // authoritative it must never re-enter runtime planning as a fallback.
-      enterPhase("baseline");
-      this.progressStore?.setPhase("baseline");
-      callbacks.onProgress?.(0, 1, this.t("progress.loadingBaseline"));
-      // Capture this before cloud-baseline hints are projected into the
-      // planning base. A reset may seed only some paths; those hints must not
-      // make the remaining paths look like an established vault.
-      const startedWithoutCommittedBase = (
-        public113MigrationInput?.baseEntries
-        ?? this.state.baseSnapshot
-      ).length === 0;
-      // A prior interrupted/partial reset run may already have persisted some
-      // exact-content bases. lastSyncTime stays zero until the reconstruction
-      // reaches a fully healthy round, so keep lifting the verification cap.
-      const baselineReconstructionIncomplete = startedWithoutCommittedBase
-        || this.state.lastSyncTime === 0;
-      // A public-1.1.3 device can join after another device has already
-      // committed V2 authority. Its local V1 base may be only partially
-      // reconstructed even though the shared V2 bootstrap now carries exact,
-      // version-bound content evidence for the remaining paths. Read that
-      // non-authoritative hint during migration preparation as well; the
-      // existing verifier still accepts each path only when the current
-      // remote identity/version and the freshly scanned local SHA-256 agree.
-      const shouldReadCloudBootstrapV2 = startedWithoutCommittedBase
-        || (
-          prepareV2MigrationCandidate
-          && baselineReconstructionIncomplete
-        );
-      let cloudBootstrapV2Json: string | null = null;
-      let cloudBaselineJson: string | null = null;
-      if (shouldReadCloudBootstrapV2) {
-        const cloudBootstrapClient = this.onedrive as OneDriveClient & {
-          readCloudBootstrapV2?: OneDriveClient["readCloudBootstrapV2"];
-        };
-        if (typeof cloudBootstrapClient.readCloudBootstrapV2 === "function") {
-          try {
-            cloudBootstrapV2Json = (
-              await this.readCloudBootstrapV2WithRetry(
-                cloudBootstrapClient,
-                this.vaultName,
-              )
-            )?.content ?? null;
-          } catch (error) {
-            this.diag?.warn(
-              "state",
-              this.state.isV2StateActive
-                ? "V2 cloud bootstrap read failed; legacy baseline fallback is disabled after V2 authority"
-                : startedWithoutCommittedBase
-                  ? "V2 cloud bootstrap read failed; falling back to public-1.1.3 legacy baseline"
-                  : "V2 cloud bootstrap read failed; continuing with exact public-1.1.3 content verification",
-              error instanceof Error ? error.message : String(error),
-            );
-          }
-        }
-        if (
-          startedWithoutCommittedBase
-          && !cloudBootstrapV2Json
-          && !this.state.isV2StateActive
-        ) {
-          cloudBaselineJson = await this.downloadLegacyCloudBaseline();
-        }
-      }
-      if (this.shouldStop(result, operationEpoch)) return result;
-
-      // Step 3: Get remote file list (delta or full scan)
-      enterPhase("remoteChanges");
-      this.progressStore?.setPhase("checking");
-      callbacks.onProgress?.(0, 1, this.t("progress.checkingRemote"));
-      const migrationSourceRemoteEntries = prepareV2MigrationCandidate
-        ? public113MigrationInput!.remoteEntries.map((entry) => ({ ...entry }))
-        : [];
-      let remotePreparation: { entries: RemoteFileEntry[]; scope: SyncScope };
-      try {
-        remotePreparation = await this.tryDeltaOrFullScan(
-          operationEpoch,
-          result,
-          syncScope,
-          localEntries,
-          forceCompleteRemoteIdentitySnapshot,
-          !prepareV2MigrationCandidate,
-          (
-            this.state.isV2StateActive
-            && skipConfirmation
-            && this.state.planReviewActive
-          )
-            ? reviewedAuthorization?.canonicalIdentity?.sourceCommitSeq
-            : undefined,
-        );
-      } catch (error) {
-        if (error instanceof V2CommittedScopeUnreachableError) {
-          await this.stageV2CommittedScopeRecovery(result, error);
-          return result;
-        }
-        if (this.isRetryableOrdinaryRemoteReadFailure(error, result)) {
-          result.errors = Math.max(1, result.errors);
-          result.message = this.t("result.remoteReadUnavailable");
-          result.disposition = {
-            kind: "retryable-observation",
-            phase: "remotePrepare",
-            code: "ordinary-remote-read-unavailable",
-            retry: "next-sync",
-            component: "ordinary-remote",
-          };
-          this.diag?.warn(
-            "execute",
-            "ordinary remote read unavailable before ordinary planning; the next normal sync will observe again",
-            {
-              ordinaryPlanning: result.runFacts?.ordinaryPlanning ?? "unknown",
-              retry: "next-sync",
-            },
-          );
-          return result;
-        }
-        throw error;
-      }
-      let remoteEntries = remotePreparation.entries;
-      syncScope = remotePreparation.scope;
-      this.activeSyncScope = syncScope;
-      if (this.shouldStop(result, operationEpoch)) return result;
-      const migrationRemoteItems = this.completeRemoteItems;
-
-      if (this.state.remoteGeneration !== this.startGeneration) {
-        result.message = this.t("result.generationMismatch");
-        this.diag?.warn("execute", `generation mismatch after delta scan (${this.startGeneration} → ${this.state.remoteGeneration}), aborting`);
-        return result;
-      }
-      if (perRoundProtocolGate) {
-        const expectedBinding = perRoundProtocolBinding;
-        let protocol = expectedBinding
-          ? await this.ensureScopeFreeSharedProtocol(
-              expectedBinding,
-              syncScope,
-              prestartedProtocolObservation ?? undefined,
-            )
-          : { status: "blocked" as const, reason: "binding-missing" };
-        if (
-          protocol.status === "blocked"
-          && protocol.reason === "control-directory-not-found"
-          && restoredCommittedScopeFromDeltaCache
-          && committedScope
-          && typeof this.onedrive.restoreVaultScopeByIdentity === "function"
-        ) {
-          try {
-            const restored = await this.onedrive.restoreVaultScopeByIdentity(
-              this.vaultName,
-              {
-                driveId: committedScope.driveId,
-                vaultFolderId: committedScope.vaultFolderId,
-                filesRootId: committedScope.filesRootId,
-              },
-            );
-            if (
-              restored.driveId !== committedScope.driveId
-              || restored.vaultFolderId !== committedScope.vaultFolderId
-              || restored.filesRootId !== committedScope.filesRootId
-            ) {
-              throw new RemoteVaultScopeIdentityError("scope-incomplete");
-            }
-          } catch (error) {
-            const scopeLoss = await this.resolveV2CommittedScopeLoss(
-              committedScope,
-              error,
-            );
-            await this.stageV2CommittedScopeRecovery(result, scopeLoss);
-            if (mode === "auto") return result;
-            const recoveryResult = await this.runV2RemoteScopeRecovery({
-              result,
-              callbacks,
-              operationEpoch,
-              automaticHandlingPolicy,
-              communityPluginSyncPolicy,
-              enterPhase,
-            });
-            if (recoveryResult) return recoveryResult;
-            result.deferred = 0;
-            result.message = "";
-            // The retry must start a fresh observation (the prestarted one
-            // already settled as control-directory-not-found).
-            protocol = expectedBinding
-              ? await this.ensureScopeFreeSharedProtocol(
-                  expectedBinding,
-                  syncScope,
-                )
-              : { status: "blocked" as const, reason: "binding-missing" };
-          }
-        }
-        if (protocol.status !== "ready") {
-          if (protocol.status === "unavailable") {
-            return this.finishRetryableSharedControlObservation(
-              result,
-              protocol,
-              operationEpoch,
-            );
-          }
-          result.errors = 1;
-          result.message = this.t("result.v2ProtocolBlocked");
-          if (protocol.evidence) {
-            this.diag?.error(
-              "state",
-              SHARED_SYNC_PROTOCOL_PROFILE_DIAGNOSTIC_EVENT,
-              protocol.evidence,
-            );
-          }
-          this.diag?.error(
-            "state",
-            "active V2 shared protocol profile could not converge safely",
-            { reason: protocol.reason, mutations: 0 },
-          );
-          return result;
-        }
-        if (expectedBinding && protocol.binding !== expectedBinding) {
-          if (this.shouldStop(result, operationEpoch)) return result;
-          try {
-            await this.state.upgradeActiveV2ProtocolBinding({
-              expectedBinding,
-              nextBinding: protocol.binding,
-            });
-          } catch (error) {
-            result.errors = 1;
-            result.message = this.t("result.v2ProtocolBlocked");
-            this.diag?.error(
-              "state",
-              "active V2 shared protocol binding changed before adjacent migration committed",
-              error instanceof Error ? error.message : String(error),
-            );
-            return result;
-          }
-        }
-        if (this.shouldStop(result, operationEpoch)) return result;
-      }
-      if (scopeExpansionPreparation.status === "ready") {
-        const sourceBoundCommunityPluginJoinRoots = [
-          ...(options.communityPluginJoinAuthorizations ?? []),
-        ].flatMap((authorization) => {
-          if (
-            validateCommunityPluginJoinAuthorization(
-              authorization,
-              remoteEntries,
-              syncScope,
-            ).status !== "valid"
-          ) return [];
-          const firstMemberPath = authorization.members[0]?.path ?? "";
-          const pluginRoot = firstMemberPath.slice(
-            0,
-            firstMemberPath.lastIndexOf("/"),
-          );
-          const remoteRoot = this.state.remoteFolders.find(
-            (folder) => folder.path === pluginRoot,
-          );
-          if (
-            !pluginRoot
-            || !remoteRoot
-            || authorization.members.some((member) =>
-              member.path.slice(0, member.path.lastIndexOf("/")) !== pluginRoot
-            )
-            || authorization.members.some((member) =>
-              member.parentId !== remoteRoot.driveId
-            )
-            || localFolders.some((folder) => folder.path === pluginRoot)
-          ) return [];
-          return [{ path: pluginRoot, remoteId: remoteRoot.driveId }];
-        });
-        const accepted = await this.state.acceptSyncScopeExpansionFolders({
-          expectedRevision: scopeExpansionPreparation.revision,
-          scope: syncScope,
-          localFiles: localEntries,
-          localFolders,
-          localFolderScanComplete,
-          remoteIdentityComplete:
-            this.completeRemoteItems !== null
-            && this.state.hasCompleteRemoteFolderIndex,
-          sourceBoundCommunityPluginJoinRoots,
-        });
-        if (accepted.status === "accepted") {
-          this.diag?.log(
-            "state",
-            "device-local sync scope expansion completed source-bound remote identity preparation",
-            {
-              revision: scopeExpansionPreparation.revision,
-              accepted: accepted.accepted,
-              mutations: 0,
-            },
-          );
-        } else {
-          this.diag?.warn(
-            "state",
-            accepted.status === "stale"
-              ? "device-local sync scope expansion authorization became stale; ordinary folder safety remains active"
-              : "device-local sync scope expansion could not be accepted from complete current facts",
-            {
-              revision: scopeExpansionPreparation.revision,
-              status: accepted.status,
-              mutations: 0,
-            },
-          );
-        }
-      }
-
-      // Step 4: Load base snapshot
-      let baseEntries = (
-        public113MigrationInput?.baseEntries
-        ?? this.state.baseSnapshot
-      ).filter(
-        (entry) => this.shouldIncludeRemotePath(entry.path),
-      );
-      let seededBaseEntries: BaseFileEntry[] = [];
-      let seededBaseEntriesPersisted = false;
-      if (cloudBootstrapV2Json) {
-        const bootstrapSeeds = this.seedBaseEntriesFromCloudBootstrapV2(
-          cloudBootstrapV2Json,
-          syncScope,
-          localEntries,
-          remoteEntries,
-        );
-        if (bootstrapSeeds.length > 0) {
-          // CloudBootstrapV2 is a non-authoritative hint. It may fill only
-          // paths that public 1.1.3 has not anchored yet; an existing V1 base
-          // remains the migration source even when the cloud hint describes a
-          // newer exact common version.
-          const existingPathKeys = new Set(
-            baseEntries.map((entry) => normalizeRemotePathKey(entry.path)),
-          );
-          seededBaseEntries = bootstrapSeeds.filter((entry) =>
-            !existingPathKeys.has(normalizeRemotePathKey(entry.path)),
-          );
-          if (seededBaseEntries.length > 0) {
-            baseEntries = [...baseEntries, ...seededBaseEntries];
-            this.diag?.log(
-              "state",
-              `V2 cloud bootstrap seeded ${seededBaseEntries.length} previously unanchored version-bound path(s)`,
-            );
-          }
-        } else if (baseEntries.length === 0) {
-          this.diag?.warn(
-            "state",
-            "V2 cloud bootstrap had no currently verifiable shared paths",
-          );
-          if (!this.state.isV2StateActive) {
-            cloudBaselineJson = await this.downloadLegacyCloudBaseline();
-          }
-        }
-      }
-      if (baseEntries.length === 0 && cloudBaselineJson) {
-        seededBaseEntries = this.seedBaseEntriesFromCloudBaseline(
-          cloudBaselineJson,
-          localEntries,
-          remoteEntries,
-        );
-        if (seededBaseEntries.length > 0) {
-          baseEntries = seededBaseEntries;
-          this.diag?.log("state", `cloud baseline seeded ${seededBaseEntries.length} shared path(s)`);
-        } else {
-          this.diag?.log("state", "cloud baseline loaded, but no shared paths eligible");
-        }
-      }
-      if (
-        this.state.isV2StateActive
-        && seededBaseEntries.length > 0
-      ) {
-        if (this.shouldStop(result, operationEpoch)) return result;
-        await this.persistSeededBaseEntries(seededBaseEntries);
-        seededBaseEntriesPersisted = true;
-      }
-
-      const remoteByPath = new Map(remoteEntries.map((entry) => [entry.path, entry]));
-      const eTagUpdates = baseEntries.flatMap((base) => {
-        const remote = remoteByPath.get(base.path);
-        if (!remote || remote.eTag === base.eTag || !remoteContentMatchesBase(remote, base)) {
-          return [];
-        }
-        return [{ ...base, eTag: remote.eTag }];
+      // base still needs reconstruction (boundary notes in
+      // runStep2LoadCloudRecoveryHint).
+      const step2 = await this.runStep2LoadCloudRecoveryHint({
+        result,
+        operationEpoch,
+        callbacks,
+        enterPhase,
+        prepareV2MigrationCandidate,
+        public113MigrationInput,
       });
-      if (eTagUpdates.length > 0) {
-        if (this.shouldStop(result, operationEpoch)) return result;
-        if (!prepareV2MigrationCandidate) {
-          await this.state.upsertBaseEntries(eTagUpdates);
-        }
-        const updatedByPath = new Map(eTagUpdates.map((entry) => [entry.path, entry]));
-        baseEntries = baseEntries.map((entry) => updatedByPath.get(entry.path) ?? entry);
-        this.diag?.log(
-          "state",
-          prepareV2MigrationCandidate
-            ? `projected ${eTagUpdates.length} unchanged remote eTag(s) into the read-only migration candidate`
-            : `reconciled ${eTagUpdates.length} unchanged remote eTag(s)`,
-        );
-      }
-      if (this.shouldStop(result, operationEpoch)) return result;
+      if (step2.terminated) return step2.terminated;
+      const cloudBootstrapV2Json = step2.cloudBootstrapV2Json;
+      let cloudBaselineJson = step2.cloudBaselineJson;
+      const baselineReconstructionIncomplete =
+        step2.baselineReconstructionIncomplete;
 
-      const configDir = getConfigDir(this.scanner.vault);
-      const communityPluginJoinBlocks: CommunityPluginJoinBlock[] = [];
-      const joinAuthorizationsByPluginId = new Map(
-        (options.communityPluginJoinAuthorizations ?? []).map(
-          (authorization) => [authorization.pluginId, authorization],
-        ),
-      );
-      const recordCommunityPluginJoinBlocks = (
-        blocks: readonly Readonly<CommunityPluginJoinBlock>[],
-      ): void => {
-        const known = new Set(
-          communityPluginJoinBlocks.map((item) => item.pluginId),
-        );
-        const added = blocks.filter((item) => !known.has(item.pluginId));
-        if (added.length === 0) return;
-        communityPluginJoinBlocks.push(...added.map((item) => ({ ...item })));
-        communityPluginSyncPolicy = excludeSelectedCommunityPluginFiles(
-          communityPluginSyncPolicy,
-          added.map((item) => item.pluginId),
-        );
-        result.communityPluginJoinBlocks = communityPluginJoinBlocks.map(
-          (item) => ({ ...item }),
-        );
-        // Deterministic blocks (manifest-incompatible, e.g. a desktop-only
-        // plugin on mobile) never transfer a file — they recheck on the timed
-        // loop and surface on the plugin row with their own status. Counting
-        // them as file deferrals makes every round look "partially completed"
-        // with a misleading "changed again before transfer" message forever.
-        result.deferred += added.filter(
-          (item) => !isCommunityPluginJoinBlockDeterministic(item.reason),
-        ).length;
-      };
-      const identityBlocks: CommunityPluginJoinBlock[] = [];
-      for (const authorization of
-        options.communityPluginJoinAuthorizations ?? []) {
-        const validation = validateCommunityPluginJoinAuthorization(
-          authorization,
-          remoteEntries,
-          syncScope,
-        );
-        if (validation.status === "valid") continue;
-        identityBlocks.push({
-          pluginId: authorization.pluginId,
-          operationId: authorization.operationId,
-          reason: validation.reason,
-        });
-      }
-      recordCommunityPluginJoinBlocks(identityBlocks);
-      for (const block of identityBlocks) {
-        joinAuthorizationsByPluginId.delete(block.pluginId);
-      }
-      if (identityBlocks.length > 0) {
-        this.diag?.warn(
-          "plan",
-          "community plugin join target changed; affected bundles stopped before mutation",
-          {
-            count: identityBlocks.length,
-            reasons: identityBlocks.map((item) => item.reason),
-            mutations: 0,
-          },
-        );
-      }
-      const detectedCommunityPluginLocalIgnores: CommunityPluginLocalIgnores =
-        prepareV2MigrationCandidate
-          ? detectCommunityPluginLocalIgnores({
-              policy: communityPluginSyncPolicy,
-              configDir,
-              localEntries,
-              remoteEntries,
-              baseEntries,
-            })
-          : {
-              files: [],
-              data: detectCommunityPluginDataLocalIgnores({
-                policy: communityPluginSyncPolicy,
-                configDir,
-                localEntries,
-                remoteEntries,
-                baseEntries,
-              }),
-            };
-      const hasDetectedCommunityPluginLocalIgnores =
-        detectedCommunityPluginLocalIgnores.files.length > 0
-        || detectedCommunityPluginLocalIgnores.data.length > 0;
-      if (hasDetectedCommunityPluginLocalIgnores) {
-        communityPluginSyncPolicy = applyCommunityPluginLocalIgnores(
-          communityPluginSyncPolicy,
-          detectedCommunityPluginLocalIgnores,
-        );
-        if (!prepareV2MigrationCandidate) {
-          result.communityPluginLocalIgnores =
-            detectedCommunityPluginLocalIgnores;
-        }
-        this.diag?.log(
-          "plan",
-          prepareV2MigrationCandidate
-            ? "public community plugin absence projected into migration candidate"
-            : "community plugin data absence converted to device-local ignore",
-          {
-            schemaVersion: 1,
-            files: detectedCommunityPluginLocalIgnores.files.length,
-            data: detectedCommunityPluginLocalIgnores.data.length,
-            mutations: 0,
-          },
-        );
-      }
-      const communityPluginManifestEvidence =
-        await this.prepareCommunityPluginManifestEvidence({
-          policy: communityPluginSyncPolicy,
-          configDir,
-          localEntries,
-          remoteEntries,
-          scope: syncScope,
-          result,
-          operationEpoch,
-          joiningPluginIds: [...joinAuthorizationsByPluginId.keys()],
-        });
-      await this.prepareCommunityPluginBundleIdentities({
-        policy: communityPluginSyncPolicy,
-        configDir,
+      // Step 3: Get remote file list (delta or full scan) — per-round protocol
+      // gate and scope-expansion acceptance live in runStep3GetRemoteFileList.
+      const step3 = await this.runStep3GetRemoteFileList({
+        result,
+        operationEpoch,
+        callbacks,
+        enterPhase,
+        mode,
+        options,
+        syncScope,
+        localEntries,
+        localFolders,
+        localFolderScanComplete,
+        skipConfirmation,
+        reviewedAuthorization,
+        prepareV2MigrationCandidate,
+        public113MigrationInput,
+        forceCompleteRemoteIdentitySnapshot,
+        perRoundProtocolGate,
+        perRoundProtocolBinding,
+        prestartedProtocolObservation,
+        restoredCommittedScopeFromDeltaCache,
+        committedScope,
+        scopeExpansionPreparation,
+        automaticHandlingPolicy,
+        communityPluginSyncPolicy,
+      });
+      if (step3.terminated) return step3.terminated;
+      let remoteEntries = step3.remoteEntries;
+      syncScope = step3.syncScope;
+      const migrationSourceRemoteEntries = step3.migrationSourceRemoteEntries;
+      const migrationRemoteItems = step3.migrationRemoteItems;
+
+      // Step 4: Load base snapshot (+ non-authoritative cloud baseline hint
+      // projection — see runStep4LoadBaseSnapshot).
+      const step4 = await this.runStep4LoadBaseSnapshot({
+        result,
+        operationEpoch,
+        syncScope,
         localEntries,
         remoteEntries,
-        manifestObservations: communityPluginManifestEvidence.observations,
+        cloudBootstrapV2Json,
+        cloudBaselineJson,
+        public113MigrationInput,
       });
-      const manifestCompatibilityBlocks =
-        communityPluginManifestEvidence.incompatiblePluginIds.flatMap(
-          (pluginId): CommunityPluginJoinBlock[] => {
-            const authorization = joinAuthorizationsByPluginId.get(pluginId);
-            return authorization
-              ? [{
-                  pluginId,
-                  operationId: authorization.operationId,
-                  reason: "manifest-incompatible",
-                }]
-              : [];
-          },
-        );
-      recordCommunityPluginJoinBlocks(manifestCompatibilityBlocks);
-      for (const block of manifestCompatibilityBlocks) {
-        joinAuthorizationsByPluginId.delete(block.pluginId);
-      }
-      if (manifestCompatibilityBlocks.length > 0) {
-        this.diag?.warn(
-          "plan",
-          "community plugin join manifest is incompatible; affected bundles stopped before mutation",
-          {
-            count: manifestCompatibilityBlocks.length,
-            mutations: 0,
-          },
-        );
-      }
-      let communityPluginManifestObservationsPersisted = false;
-      const publishCommunityPluginPostAuthorityState = async (): Promise<void> => {
-        if (!communityPluginManifestObservationsPersisted) {
-          await this.persistCommunityPluginManifestObservations(
-            communityPluginManifestEvidence.observations,
-          );
-          communityPluginManifestObservationsPersisted = true;
-        }
-        if (hasDetectedCommunityPluginLocalIgnores) {
-          result.communityPluginLocalIgnores =
-            detectedCommunityPluginLocalIgnores;
-        }
-      };
-      if (this.shouldStop(result, operationEpoch)) return result;
-      if (
-        this.state.isV2StateActive
-        && !prepareV2MigrationCandidate
-      ) {
-        await publishCommunityPluginPostAuthorityState();
-      }
-      const mobileDesktopOnlyPluginIds =
-        communityPluginManifestEvidence.desktopOnlyPluginIds;
-      if (mobileDesktopOnlyPluginIds.length > 0) {
-        communityPluginSyncPolicy = prepareV2MigrationCandidate
-          ? applyCommunityPluginLocalIgnores(
-              communityPluginSyncPolicy,
-              {
-                files: mobileDesktopOnlyPluginIds,
-                data: [],
-              },
-            )
-          : excludeSelectedCommunityPluginFiles(
-              communityPluginSyncPolicy,
-              mobileDesktopOnlyPluginIds,
-            );
-        this.diag?.log(
-          "plan",
-          "desktop-only community plugin bundles excluded from mobile participation",
-          {
-            schemaVersion: 1,
-            count: mobileDesktopOnlyPluginIds.length,
-            mutations: 0,
-          },
-        );
-      }
+      if (step4.terminated) return step4.terminated;
+      let baseEntries = step4.baseEntries;
+      const seededBaseEntries = step4.seededBaseEntries;
+      const seededBaseEntriesPersisted = step4.seededBaseEntriesPersisted;
+      cloudBaselineJson = step4.cloudBaselineJson;
 
-      localEntries = localEntries.filter((entry) =>
-        isCommunityPluginPathSelectedByPolicy(
-          entry.path,
-          communityPluginSyncPolicy,
-          configDir,
-        )
-      );
-      remoteEntries = remoteEntries.filter((entry) =>
-        isCommunityPluginPathSelectedByPolicy(
-          entry.path,
-          communityPluginSyncPolicy,
-          configDir,
-        )
-      );
-      baseEntries = baseEntries.filter((entry) =>
-        isCommunityPluginPathSelectedByPolicy(
-          entry.path,
-          communityPluginSyncPolicy,
-          configDir,
-        )
-      );
+      // Step 4 (cont.): reconcile unchanged remote eTags into the base, then
+      // prepare community-plugin join/identity evidence and project the
+      // resulting policy onto the entry sets (see
+      // runStep4ReconcileBaseETags / runStep4PrepareCommunityPluginPlanInputs).
+      const step4b = await this.runStep4ReconcileBaseETags({
+        result,
+        operationEpoch,
+        remoteEntries,
+        prepareV2MigrationCandidate,
+        baseEntries,
+      });
+      if (step4b.terminated) return step4b.terminated;
+      baseEntries = step4b.baseEntries;
+      const eTagUpdates = step4b.eTagUpdates;
+      const step4c = await this.runStep4PrepareCommunityPluginPlanInputs({
+        result,
+        operationEpoch,
+        options,
+        prepareV2MigrationCandidate,
+        communityPluginSyncPolicy,
+        localEntries,
+        remoteEntries,
+        baseEntries,
+        syncScope,
+      });
+      if (step4c.terminated) return step4c.terminated;
+      communityPluginSyncPolicy = step4c.communityPluginSyncPolicy;
+      localEntries = step4c.localEntries;
+      remoteEntries = step4c.remoteEntries;
+      baseEntries = step4c.baseEntries;
+      const joinAuthorizationsByPluginId = step4c.joinAuthorizationsByPluginId;
+      const publishCommunityPluginPostAuthorityState =
+        step4c.publishCommunityPluginPostAuthorityState;
+      const configDir = step4c.configDir;
 
       const planningLocalEntries = localEntries;
       // Step 5: Generate sync plan
@@ -8140,132 +13121,26 @@ export class SyncExecutor {
         typeof v2PlanState.getCommittedV2Envelope === "function"
           ? v2PlanState.getCommittedV2Envelope()
           : null;
-      if (prepareV2MigrationCandidate) {
-        if (!migrationRemoteItems) {
-          result.message = this.t("result.cloudRecordIncomplete");
-          this.diag?.warn(
-            "state",
-            "V2 migration candidate requires a complete remote identity snapshot",
-            { mutations: 0 },
-          );
-          return result;
-        }
-        const migrationBaseByPath = new Map(
-          public113MigrationInput!.baseEntries
-            .filter((entry) => isCommunityPluginPathSelectedByPolicy(
-              entry.path,
-              communityPluginSyncPolicy,
-              configDir,
-            ))
-            .map((entry) => [entry.path, { ...entry }]),
-        );
-        for (const entry of seededBaseEntries) {
-          if (isCommunityPluginPathSelectedByPolicy(
-            entry.path,
-            communityPluginSyncPolicy,
-            configDir,
-          )) {
-            migrationBaseByPath.set(entry.path, { ...entry });
-          }
-        }
-        for (const entry of eTagUpdates) {
-          if (isCommunityPluginPathSelectedByPolicy(
-            entry.path,
-            communityPluginSyncPolicy,
-            configDir,
-          )) {
-            migrationBaseByPath.set(entry.path, { ...entry });
-          }
-        }
-        const ancestorPreparation = attemptV2Activation
-          ? await this.state.preparePublic113MigrationAncestors(
-              public113MigrationInput!,
-            )
-          : null;
-        if (ancestorPreparation) {
-          this.diag?.log(
-            "state",
-            "public 1.1.3 base-content prepared for V2 ancestors",
-            {
-              sourceEntries: ancestorPreparation.sourceEntries,
-              published: ancestorPreparation.published,
-              rejected: ancestorPreparation.rejected,
-              unavailable: ancestorPreparation.unavailable,
-              mutations: 0,
-            },
-          );
-        }
-        const preparedMigration = buildStateV2MigrationCandidate({
-          scope: syncScope,
-          lifecycleEpoch: this.state.remoteGeneration,
-          localScanComplete: true,
-          remoteScanComplete: true,
-          folderScanComplete: localFolderScanComplete,
-          localEntries: planningLocalEntries,
-          localFolders,
-          remoteItems: migrationRemoteItems,
-          v1Base: [...migrationBaseByPath.values()],
-          v1RemoteEntries: migrationSourceRemoteEntries.filter(
-            (entry) =>
-              isCommunityPluginPathSelectedByPolicy(
-                entry.path,
-                communityPluginSyncPolicy,
-                configDir,
-              ),
-          ),
-          preservedBasePaths: public113MigrationInput!.baseEntries
-            .filter((entry) => !this.shouldIncludeRemotePath(entry.path))
-            .map((entry) => entry.path),
-          requireCompleteAnchors: true,
-          allowChangedAnchors: true,
-          v1MutationLedger: this.state.mutationLedger,
-          v1PendingConflicts: this.state.pendingConflicts,
-          v1VaultName: this.vaultName,
-          ancestorHashesByPath: ancestorPreparation?.hashesByPath,
-        });
-        if (
-          preparedMigration.status !== "ready"
-          || !preparedMigration.envelope
-        ) {
-          result.deferred = 0; // whole-round stop: clear any earlier join-block deferral (2026-09-08 review P3-1)
-          result.message = this.folderRejectionMessage(
-            preparedMigration.reason,
-            scanResult.folderScanFailures,
-          );
-          this.diag?.warn(
-            "state",
-            "V2 migration candidate rejected before authority change",
-            {
-              reason: preparedMigration.reason,
-              pending: preparedMigration.pending.length,
-              mutations: 0,
-            },
-          );
-          return result;
-        }
-        migrationCandidateEnvelope = preparedMigration.envelope;
-        if (attemptV2Activation) {
-          migrationPlannerState =
-            await this.state.preparePublic113IndexedDbPlannerState(
-              migrationCandidateEnvelope,
-              public113MigrationInput!,
-            );
-          if (migrationPlannerState) {
-            this.diag?.log(
-              "state",
-              "public 1.1.3 canonical planner is using the source-bound inactive IndexedDB view",
-              {
-                sourceCommitSeq: migrationPlannerState.meta.commitSeq,
-                remoteNodes: migrationPlannerState.remoteNodes.length,
-                fileAnchors: migrationPlannerState.fileAnchors.length,
-                folderAnchors:
-                  migrationPlannerState.folderAnchors?.length ?? 0,
-                mutations: 0,
-              },
-            );
-          }
-        }
-      }
+      const step5a = await this.runStep5PrepareMigrationCandidate({
+        result,
+        prepareV2MigrationCandidate,
+        migrationRemoteItems,
+        public113MigrationInput,
+        communityPluginSyncPolicy,
+        configDir,
+        seededBaseEntries,
+        eTagUpdates,
+        attemptV2Activation,
+        syncScope,
+        localFolderScanComplete,
+        planningLocalEntries,
+        localFolders,
+        migrationSourceRemoteEntries,
+        folderScanFailures,
+      });
+      if (step5a.terminated) return step5a.terminated;
+      migrationCandidateEnvelope = step5a.migrationCandidateEnvelope;
+      migrationPlannerState = step5a.migrationPlannerState;
       let canonicalSourceEnvelope =
         committedV2Envelope ?? migrationCandidateEnvelope;
       const includeCanonicalFilePath = (path: string): boolean =>
@@ -8294,61 +13169,23 @@ export class SyncExecutor {
           "easy-sync",
           [...joinAuthorizationsByPluginId.keys()],
         );
-      let firstSyncVerificationOperationId: string | null = null;
-      let verifiedFirstSyncRemoteHashesById: ReadonlyMap<string, string> =
-        new Map();
-      if (prepareV2MigrationCandidate) {
-        try {
-          const operation = await this.state.beginFirstSyncVerificationEvidence(
-            syncScope,
-            public113MigrationEvidence ? public113MigrationInput : null,
-            firstSyncVerificationProtocolBinding,
-          );
-          firstSyncVerificationOperationId = operation.operationId;
-          const versionsByRemoteId = new Map(remoteEntries.map((entry) => [
-            entry.driveId,
-            {
-              remoteId: entry.driveId,
-              size: entry.size,
-              eTag: entry.eTag,
-              ...(entry.cTag ? { cTag: entry.cTag } : {}),
-            },
-          ]));
-          const cached = await this.state.readValidFirstSyncVerificationEvidence(
-            operation.operationId,
-            [...versionsByRemoteId.values()],
-          );
-          verifiedFirstSyncRemoteHashesById = new Map(
-            [...cached.receiptsByRemoteId].map(([remoteId, receipt]) => [
-              remoteId,
-              receipt.sha256,
-            ]),
-          );
-          if (cached.receiptsByRemoteId.size > 0 || cached.invalidated > 0) {
-            this.diag?.log(
-              "plan",
-              "loaded version-bound first-sync content evidence",
-              {
-                operationKind: "first-sync-verification",
-                total: versionsByRemoteId.size,
-                reusable: cached.receiptsByRemoteId.size,
-                invalidated: cached.invalidated,
-                unverified:
-                  versionsByRemoteId.size - cached.receiptsByRemoteId.size,
-                mutations: 0,
-              },
-            );
-          }
-        } catch (error) {
-          firstSyncVerificationOperationId = null;
-          verifiedFirstSyncRemoteHashesById = new Map();
-          this.diag?.warn(
-            "plan",
-            "first-sync content evidence is unavailable; falling back to full verification",
-            error instanceof Error ? error.message : String(error),
-          );
-        }
-      }
+      // Step 5: first-sync verification evidence session (see
+      // runStep5PrepareFirstSyncVerificationEvidence; the canonical
+      // verification closures below capture these bindings and may null the
+      // operation id after a persist failure).
+      const firstSyncVerification =
+        await this.runStep5PrepareFirstSyncVerificationEvidence({
+          syncScope,
+          public113MigrationEvidence,
+          public113MigrationInput,
+          firstSyncVerificationProtocolBinding,
+          remoteEntries,
+          prepareV2MigrationCandidate,
+        });
+      let firstSyncVerificationOperationId =
+        firstSyncVerification.firstSyncVerificationOperationId;
+      let verifiedFirstSyncRemoteHashesById =
+        firstSyncVerification.verifiedFirstSyncRemoteHashesById;
       const resolveCanonicalRemoteContentHash = async (
         item: Readonly<SyncPlanItem>,
         progress: { current: number; total: number },
@@ -8484,2161 +13321,248 @@ export class SyncExecutor {
           );
         }
       };
-      if (migrationPlannerState) {
-        canonicalPlanCandidate = buildCanonicalPlanCandidateFromStateV2({
-          state: migrationPlannerState,
-          localFiles: planningLocalEntries,
-          localFolders,
-          localFolderScanComplete,
-          skippedLarge,
-          maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
-          localMoveHints: this.state.localFolderMoveHints,
-          localFolderDeleteHints: this.state.localFolderDeleteHints,
-          localFileMoveHints: this.state.localFileMoveHints,
-          includeFilePath: includeCanonicalFilePath,
-          includeFolderPath: includeCanonicalFolderPath,
-          preserveFolderPath: preserveCanonicalFolderPath,
-          configDir,
-          automaticDeleteLocalFiles:
-            automaticHandlingPolicy.autoDeleteLocalFiles,
-        });
-      } else if (canonicalSourceEnvelope) {
-        canonicalPlanCandidate = buildCanonicalPlanCandidateV2({
-          envelope: canonicalSourceEnvelope,
-          localFiles: planningLocalEntries,
-          localFolders,
-          localFolderScanComplete,
-          skippedLarge,
-          maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
-          localMoveHints: this.state.localFolderMoveHints,
-          localFolderDeleteHints: this.state.localFolderDeleteHints,
-          localFileMoveHints: this.state.localFileMoveHints,
-          includeFilePath: includeCanonicalFilePath,
-          includeFolderPath: includeCanonicalFolderPath,
-          preserveFolderPath: preserveCanonicalFolderPath,
-          configDir,
-          automaticDeleteLocalFiles:
-            automaticHandlingPolicy.autoDeleteLocalFiles,
-        });
-      }
-      if (
-        this.state.isV2StateActive
-        && !prepareV2MigrationCandidate
-        && canonicalPlanCandidate?.folderPlan.items.some(
-          (item) => item.reason === "unanchored-shared-folder",
-        )
-      ) {
-        const acceptConfirmedDescendantFolders = () =>
-          this.state.acceptConfirmedDescendantFolderAnchors({
-            scope: syncScope,
-            localFiles: planningLocalEntries,
-            localFolders,
-            localFolderScanComplete,
-            remoteIdentityComplete: this.state.hasCompleteRemoteFolderIndex,
-            includeFilePath: includeCanonicalFilePath,
-            includeFolderPath: (path) =>
-              includeCanonicalFolderPath(path)
-              && !preserveCanonicalFolderPath(path),
-          });
-        let reconstructed = await acceptConfirmedDescendantFolders();
-        if (reconstructed.status === "none") {
-          const evidence = await finalizeUnanchoredFolderEvidenceV2({
-            candidate: canonicalPlanCandidate,
-            envelope: canonicalSourceEnvelope!,
-            vaultName: this.vaultName,
-            accountId: this.state.boundAccountId ?? "",
-            configDir: getConfigDir(this.scanner.vault),
-            automaticHandlingPolicy,
-            baselineReconstructionIncomplete,
-            pendingContentComparisons: this.state.pendingConflicts.map(
-              (item) => ({
-                path: item.path,
-                contentComparison: item.contentComparison,
-              }),
-            ),
-            resolveRemoteContentHash: resolveCanonicalRemoteContentHash,
-          });
-          if (this.shouldStop(result, operationEpoch)) return result;
-          if (evidence.baseUpserts.length > 0) {
-            const evidenceItemsByPath = new Map(
-              canonicalPlanCandidate.unanchoredDescendantEvidence.map(
-                (item) => [item.path, item],
-              ),
-            );
-            const currentEvidence: BaseFileEntry[] = [];
-            for (const entry of evidence.baseUpserts) {
-              const sourceItem = evidenceItemsByPath.get(entry.path);
-              const expectedLocal = sourceItem?.local;
-              const expectedRemote = sourceItem?.remote;
-              if (!expectedLocal || !expectedRemote) continue;
-              const [currentLocal, currentRemote] = await Promise.all([
-                this.inspectLocalPath(entry.path),
-                this.inspectRemotePath(entry.path),
-              ]);
-              if (
-                currentLocal?.status !== "present"
-                || !this.inspectionMatchesVersion(
-                  currentLocal,
-                  expectedLocal,
-                )
-                || !currentRemote
-                || currentRemote.driveId !== expectedRemote.driveId
-                || currentRemote.eTag !== expectedRemote.eTag
-                || currentRemote.size !== expectedRemote.size
-              ) {
-                this.diag?.warn(
-                  "state",
-                  `unanchored folder evidence changed before publication — ${entry.path}`,
-                  { mutations: 0 },
-                );
-                continue;
-              }
-              currentEvidence.push(entry);
-            }
-            if (this.shouldStop(result, operationEpoch)) return result;
-            if (currentEvidence.length > 0) {
-              await this.stageVerifiedLocalAncestorContent(currentEvidence);
-              const publication =
-                await this.state.acceptConfirmedDescendantFileEvidence({
-                  scope: syncScope,
-                  sourceCommitSeq: canonicalSourceEnvelope!.meta.commitSeq,
-                  entries: currentEvidence,
-                });
-              if (publication.status !== "accepted") {
-                this.diag?.warn(
-                  "state",
-                  "exact descendant file evidence publication remained fail-closed",
-                  {
-                    reason: publication.status,
-                    candidates: evidence.contentVerification.candidates,
-                    mutations: 0,
-                  },
-                );
-              } else {
-                this.diag?.log(
-                  "state",
-                  "published exact descendant file evidence for unanchored folder recovery",
-                  {
-                    accepted: publication.accepted,
-                    candidates: evidence.contentVerification.candidates,
-                    downloads: evidence.contentVerification.downloads,
-                    mutations: 0,
-                  },
-                );
-                committedV2Envelope =
-                  typeof v2PlanState.getCommittedV2Envelope === "function"
-                    ? v2PlanState.getCommittedV2Envelope()
-                    : null;
-                canonicalSourceEnvelope =
-                  committedV2Envelope ?? migrationCandidateEnvelope;
-                if (!canonicalSourceEnvelope) {
-                  throw new Error(
-                    "Exact descendant evidence publication lost V2 authority",
-                  );
-                }
-                canonicalPlanCandidate = buildCanonicalPlanCandidateV2({
-                  envelope: canonicalSourceEnvelope,
-                  localFiles: planningLocalEntries,
-                  localFolders,
-                  localFolderScanComplete,
-                  skippedLarge,
-                  maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
-                  localMoveHints: this.state.localFolderMoveHints,
-                  localFolderDeleteHints: this.state.localFolderDeleteHints,
-                  localFileMoveHints: this.state.localFileMoveHints,
-                  includeFilePath: includeCanonicalFilePath,
-                  includeFolderPath: includeCanonicalFolderPath,
-                  preserveFolderPath: preserveCanonicalFolderPath,
-                  configDir,
-                  automaticDeleteLocalFiles:
-                    automaticHandlingPolicy.autoDeleteLocalFiles,
-                });
-                reconstructed = await acceptConfirmedDescendantFolders();
-              }
-            }
-          }
-        }
-        if (reconstructed.status === "accepted") {
-          this.diag?.log(
-            "state",
-            "reconstructed source-bound folder identities from confirmed descendant files",
-            {
-              accepted: reconstructed.accepted,
-              evidenceFiles: reconstructed.evidenceFiles,
-              mutations: 0,
-            },
-          );
-          committedV2Envelope =
-            typeof v2PlanState.getCommittedV2Envelope === "function"
-              ? v2PlanState.getCommittedV2Envelope()
-              : null;
-          canonicalSourceEnvelope =
-            committedV2Envelope ?? migrationCandidateEnvelope;
-          if (!canonicalSourceEnvelope) {
-            throw new Error(
-              "Confirmed descendant folder reconstruction lost V2 authority",
-            );
-          }
-          canonicalPlanCandidate = buildCanonicalPlanCandidateV2({
-            envelope: canonicalSourceEnvelope,
-            localFiles: planningLocalEntries,
-            localFolders,
-            localFolderScanComplete,
-            skippedLarge,
-            maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
-            localMoveHints: this.state.localFolderMoveHints,
-            localFolderDeleteHints: this.state.localFolderDeleteHints,
-            localFileMoveHints: this.state.localFileMoveHints,
-            includeFilePath: includeCanonicalFilePath,
-            includeFolderPath: includeCanonicalFolderPath,
-            preserveFolderPath: preserveCanonicalFolderPath,
-            configDir,
-            automaticDeleteLocalFiles:
-              automaticHandlingPolicy.autoDeleteLocalFiles,
-          });
-        } else if (reconstructed.status === "rejected") {
-          this.diag?.warn(
-            "state",
-            "confirmed descendant folder identity reconstruction remained fail-closed",
-            {
-              reason: reconstructed.reason,
-              mutations: 0,
-            },
-          );
-        }
-      }
-      if (
-        this.state.isV2StateActive
-        && !prepareV2MigrationCandidate
-        && canonicalPlanCandidate?.status === "planned"
-      ) {
-        const reconstruction =
-          await this.state.prepareConfirmedDescendantFileReconstruction?.({
-            scope: syncScope,
-            localFolders,
-            candidateItems: canonicalPlanCandidate.items,
-          }) ?? { status: "none" as const, roots: [] };
-        if (reconstruction.status === "ready") {
-          const reconstructionStartedAt = Date.now();
-          const reconstructionRoots =
-            reconstruction.roots.map((root) => root.path);
-          const reconstructionComparisons = new Map(
-            this.state.pendingConflicts.map((item) => [item.path, item]),
-          );
-          const isReconstructionCandidate = (
-            item: Readonly<SyncPlanItem>,
-          ): boolean =>
-            item.type === SyncActionType.Conflict
-            && item.reason === "reason.newFileBothSides"
-            && Boolean(item.local)
-            && Boolean(item.remote)
-            && item.local!.size === item.remote!.size
-            && resolveContentEquality({
-              local: item.local!,
-              remote: item.remote!,
-            }).status !== "different"
-            && reconstructionRoots.some((root) =>
-              isAtOrBelowPath(item.path, root));
-          const reconstructionEvidenceStatus = (
-            item: Readonly<SyncPlanItem>,
-          ) => resolveContentEquality({
-            local: item.local!,
-            remote: item.remote!,
-          }).status;
-          const pendingComparisonFor = (
-            item: Readonly<SyncPlanItem>,
-          ): SyncPlanItem | undefined => {
-            const pending = reconstructionComparisons.get(item.path);
-            return pending
-              && item.local
-              && item.remote
-              && contentDifferenceReceiptMatches(
-                pending.contentComparison,
-                item.local,
-                item.remote,
-              )
-              ? pending
-              : undefined;
-          };
-          const initialCandidates = canonicalPlanCandidate.items.filter(
-            (item) =>
-              isReconstructionCandidate(item)
-              && !pendingComparisonFor(item),
-          ).sort((left, right) => {
-            const leftNeedsDownload =
-              reconstructionEvidenceStatus(left) === "unknown";
-            const rightNeedsDownload =
-              reconstructionEvidenceStatus(right) === "unknown";
-            if (leftNeedsDownload !== rightNeedsDownload) {
-              return leftNeedsDownload ? 1 : -1;
-            }
-            return left.path.localeCompare(right.path);
-          });
-          let batches = 0;
-          let verified = 0;
-          let downloads = 0;
-          let verifiedBytes = 0;
-          let downloadBytes = 0;
-          const pauseReconstructionForRetry = (
-            message: string,
-          ): SyncResult => {
-            result.success = false;
-            result.deferred++;
-            result.continueAfterConfirmedDescendantFileReconstruction = true;
-            result.descendantFileReconstructionRetryableFailure = true;
-            result.errors = Math.max(1, result.errors);
-            result.message = this.t("result.syncFailed", { message });
-            return result;
-          };
-          this.diag?.log(
-            "state",
-            "starting source-bound descendant file baseline reconstruction",
-            {
-              roots: reconstructionRoots.length,
-              candidates: initialCandidates.length,
-              zeroDownloadCandidates: initialCandidates.filter(
-                (item) =>
-                  reconstructionEvidenceStatus(item) !== "unknown",
-              ).length,
-              bytes: initialCandidates.reduce(
-                (total, item) => total + (item.remote?.size ?? 0),
-                0,
-              ),
-              visibleSession: "single",
-              mutations: 0,
-            },
-          );
-          if (initialCandidates.length > 0) {
-            this.progressStore?.setPhase("verifying");
-            this.progressStore?.setProgress(
-              0,
-              initialCandidates.length,
-              "",
-            );
-            callbacks.onProgress?.(
-              0,
-              initialCandidates.length,
-              this.t("progress.verifyingFiles", {
-                current: 0,
-                total: initialCandidates.length,
-              }),
-            );
-          }
-          while (true) {
-            if (this.shouldStop(result, operationEpoch)) return result;
-            const unresolved = canonicalPlanCandidate.items.filter(
-              (item) =>
-                isReconstructionCandidate(item)
-                && !pendingComparisonFor(item),
-            ).sort((left, right) => {
-              const leftNeedsDownload =
-                reconstructionEvidenceStatus(left) === "unknown";
-              const rightNeedsDownload =
-                reconstructionEvidenceStatus(right) === "unknown";
-              if (leftNeedsDownload !== rightNeedsDownload) {
-                return leftNeedsDownload ? 1 : -1;
-              }
-              return left.path.localeCompare(right.path);
-            });
-            if (unresolved.length === 0) break;
-            const next = unresolved[0];
-            if (!next) break;
-            const batchFileLimit = Platform.isMobile
-              ? MOBILE_RECONSTRUCTION_BATCH_FILES
-              : DESKTOP_RECONSTRUCTION_BATCH_FILES;
-            const batchByteLimit = Platform.isMobile
-              ? MOBILE_RECONSTRUCTION_BATCH_BYTES
-              : DESKTOP_RECONSTRUCTION_BATCH_BYTES;
-            const batch: SyncPlanItem[] = [];
-            let batchBytes = 0;
-            for (const candidate of unresolved) {
-              if (batch.length >= batchFileLimit) break;
-              const candidateBytes = candidate.remote?.size ?? 0;
-              if (
-                batch.length > 0
-                && batchBytes + candidateBytes > batchByteLimit
-              ) break;
-              batch.push(candidate);
-              batchBytes += candidateBytes;
-            }
-            batches++;
-            const reconstructionProgress = {
-              current: verified + batch.length,
-              total: initialCandidates.length,
-            };
-            this.progressStore?.setProgress(
-              reconstructionProgress.current,
-              reconstructionProgress.total,
-              next.path,
-            );
-            callbacks.onProgress?.(
-              reconstructionProgress.current,
-              reconstructionProgress.total,
-              this.t("progress.verifyingFiles", reconstructionProgress),
-            );
-            const downloadCandidates = batch.filter((item) =>
-              reconstructionEvidenceStatus(item) === "unknown"
-            );
-            downloadBytes += downloadCandidates.reduce(
-              (total, item) => total + (item.remote?.size ?? 0),
-              0,
-            );
-            verifiedBytes += batch.reduce(
-              (total, item) => total + (item.remote?.size ?? 0),
-              0,
-            );
-            const sourceEnvelope =
-              this.state.getCommittedV2Envelope();
-            if (!sourceEnvelope) {
-              throw new Error(
-                "Descendant file reconstruction lost V2 authority",
-              );
-            }
-            const prefetchedRemoteHashes = new Map<
-              string,
-              { hash?: string; error?: unknown }
-            >();
-            await Promise.all(downloadCandidates.map(async (item, index) => {
-              try {
-                const hash = await resolveCanonicalRemoteContentHash(
-                  item,
-                  {
-                    current: verified + index + 1,
-                    total: initialCandidates.length,
-                  },
-                  false,
-                );
-                prefetchedRemoteHashes.set(item.path, { hash });
-              } catch (error) {
-                prefetchedRemoteHashes.set(item.path, { error });
-              }
-            }));
-            const finalizedBatch =
-              await finalizeCanonicalPlanCandidateV2({
-                candidate: {
-                  ...canonicalPlanCandidate,
-                  items: batch.map((item) => ({ ...item })),
-                  identityReplacements: [],
-                  identityMoveVerifications: [],
-                },
-                envelope: sourceEnvelope,
-                vaultName: this.vaultName,
-                accountId: this.state.boundAccountId ?? "",
-                configDir: getConfigDir(this.scanner.vault),
-                automaticHandlingPolicy,
-                baselineReconstructionIncomplete: false,
-                pendingContentComparisons:
-                  [...reconstructionComparisons.values()].map((item) => ({
-                    path: item.path,
-                    contentComparison: item.contentComparison,
-                  })),
-                resolveRemoteContentHash: async (item) => {
-                  const prefetched = prefetchedRemoteHashes.get(item.path);
-                  if (prefetched?.error) {
-                    throw prefetched.error instanceof Error
-                      ? prefetched.error
-                      : new Error(describeThrownValue(prefetched.error));
-                  }
-                  if (prefetched?.hash) return prefetched.hash;
-                  return resolveCanonicalRemoteContentHash(
-                    item,
-                    reconstructionProgress,
-                    false,
-                  );
-                },
-              });
-            downloads += finalizedBatch.contentVerification.downloads;
-            const failures =
-              finalizedBatch.contentVerification.results.filter(
-                (item) => item.outcome === "failed",
-              );
-            if (failures.length > 0) {
-              this.diag?.warn(
-                "state",
-                "descendant file baseline reconstruction interrupted during verification",
-                {
-                  batch: batches,
-                  failed: failures.length,
-                  completed: verified,
-                  mutations: 0,
-                },
-              );
-              return pauseReconstructionForRetry(
-                "descendant file baseline verification failed",
-              );
-            }
-            const differences = finalizedBatch.items.filter((item) =>
-              item.type === SyncActionType.Conflict
-              && Boolean(item.contentComparison),
-            );
-            if (differences.length > 0) {
-              await this.state.upsertPendingConflicts(differences);
-              for (const item of differences) {
-                reconstructionComparisons.set(item.path, item);
-              }
-            }
-            const currentEvidence: BaseFileEntry[] = [];
-            if (finalizedBatch.baseUpserts.length > 0) {
-              const batchByPath = new Map(
-                batch.map((item) => [item.path, item]),
-              );
-              for (const entry of finalizedBatch.baseUpserts) {
-                const sourceItem = batchByPath.get(entry.path);
-                const expectedLocal = sourceItem?.local;
-                const expectedRemote = sourceItem?.remote;
-                if (!expectedLocal || !expectedRemote) continue;
-                const [currentLocal, currentRemote] = await Promise.all([
-                  this.inspectLocalPath(entry.path),
-                  this.inspectRemotePath(entry.path),
-                ]);
-                if (
-                  currentLocal?.status !== "present"
-                  || !this.inspectionMatchesVersion(
-                    currentLocal,
-                    expectedLocal,
-                  )
-                  || !currentRemote
-                  || currentRemote.driveId !== expectedRemote.driveId
-                  || currentRemote.eTag !== expectedRemote.eTag
-                  || currentRemote.size !== expectedRemote.size
-                ) continue;
-                currentEvidence.push(entry);
-              }
-              if (
-                currentEvidence.length
-                !== finalizedBatch.baseUpserts.length
-              ) {
-                this.diag?.warn(
-                  "state",
-                  "descendant file baseline evidence changed before publication",
-                  {
-                    batch: batches,
-                    candidates: finalizedBatch.baseUpserts.length,
-                    current: currentEvidence.length,
-                    mutations: 0,
-                  },
-                );
-                return pauseReconstructionForRetry(
-                  "descendant file baseline evidence changed",
-                );
-              }
-              await this.stageVerifiedLocalAncestorContent(currentEvidence);
-              const publication =
-                await this.state.acceptConfirmedDescendantFileEvidence({
-                  scope: syncScope,
-                  sourceCommitSeq: sourceEnvelope.meta.commitSeq,
-                  entries: currentEvidence,
-                });
-              if (
-                publication.status !== "accepted"
-                || publication.accepted !== currentEvidence.length
-              ) {
-                this.diag?.warn(
-                  "state",
-                  "descendant file baseline publication remained fail-closed",
-                  {
-                    batch: batches,
-                    status: publication.status,
-                    candidates: currentEvidence.length,
-                    mutations: 0,
-                  },
-                );
-                return pauseReconstructionForRetry(
-                  "descendant file baseline publication was blocked",
-                );
-              }
-            }
-            const settled =
-              currentEvidence.length + differences.length;
-            if (settled !== batch.length) {
-              this.diag?.warn(
-                "state",
-                "descendant file baseline batch did not settle every source version",
-                {
-                  batch: batches,
-                  candidates: batch.length,
-                  settled,
-                  mutations: 0,
-                },
-              );
-              return pauseReconstructionForRetry(
-                "descendant file baseline batch did not settle",
-              );
-            }
-            verified += settled;
-            committedV2Envelope =
-              typeof v2PlanState.getCommittedV2Envelope === "function"
-                ? v2PlanState.getCommittedV2Envelope()
-                : null;
-            canonicalSourceEnvelope =
-              committedV2Envelope ?? migrationCandidateEnvelope;
-            if (!canonicalSourceEnvelope) {
-              throw new Error(
-                "Descendant file baseline publication lost V2 authority",
-              );
-            }
-            canonicalPlanCandidate = buildCanonicalPlanCandidateV2({
-              envelope: canonicalSourceEnvelope,
-              localFiles: planningLocalEntries,
-              localFolders,
-              localFolderScanComplete,
-              skippedLarge,
-              maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
-              localMoveHints: this.state.localFolderMoveHints,
-              localFolderDeleteHints: this.state.localFolderDeleteHints,
-              localFileMoveHints: this.state.localFileMoveHints,
-              includeFilePath: includeCanonicalFilePath,
-              includeFolderPath: includeCanonicalFolderPath,
-              preserveFolderPath: preserveCanonicalFolderPath,
-              configDir,
-              automaticDeleteLocalFiles:
-                automaticHandlingPolicy.autoDeleteLocalFiles,
-            });
-          }
-          await this.state.completeConfirmedDescendantFileReconstruction?.(
-            syncScope,
-          );
-          canonicalPlanCandidate = buildCanonicalPlanCandidateV2({
-            envelope: canonicalSourceEnvelope!,
-            localFiles: planningLocalEntries,
-            localFolders,
-            localFolderScanComplete,
-            skippedLarge,
-            maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
-            localMoveHints: this.state.localFolderMoveHints,
-            localFolderDeleteHints: this.state.localFolderDeleteHints,
-            localFileMoveHints: this.state.localFileMoveHints,
-            includeFilePath: includeCanonicalFilePath,
-            includeFolderPath: includeCanonicalFolderPath,
-            preserveFolderPath: preserveCanonicalFolderPath,
-            configDir,
-            automaticDeleteLocalFiles:
-              automaticHandlingPolicy.autoDeleteLocalFiles,
-          });
-          this.diag?.log(
-            "state",
-            "completed source-bound descendant file baseline reconstruction",
-            {
-              roots: reconstructionRoots.length,
-              batches,
-              verified,
-              downloads,
-              bytes: verifiedBytes,
-              downloadBytes,
-              elapsedMs: Date.now() - reconstructionStartedAt,
-              mutations: 0,
-            },
-          );
-        }
-      }
-      let plan: SyncPlan;
-      if (canonicalPlanCandidate) {
-        plan = {
-          items: canonicalPlanCandidate.items,
-          lastTotalFiles: canonicalPlanCandidate.lastTotalFiles,
-          confirmed: false,
-          scope: { ...canonicalPlanCandidate.scope },
-        };
-      } else {
-        throw new Error(
-          "V2 canonical planning requires an active envelope or a complete migration candidate",
-        );
-      }
-      if (canonicalPlanCandidate?.status === "rejected") {
-        result.deferred = 0; // whole-round stop: clear any earlier join-block deferral (2026-09-08 review P3-1)
-        result.message = this.folderRejectionMessage(
-          canonicalPlanCandidate.rejectionReason,
-          scanResult.folderScanFailures,
-        );
-        this.diag?.warn(
-          "plan",
-          "V2 canonical candidate rejected before mutation",
-          {
-            reason: canonicalPlanCandidate.rejectionReason,
-            sourceCommitSeq: canonicalPlanCandidate.sourceCommitSeq,
-            mutations: 0,
-          },
-        );
-        return result;
-      }
-      const anchoredRemoteIdByPath = new Map(
-        (
-          migrationPlannerState?.fileAnchors
-          ?? (canonicalSourceEnvelope
-            ? Object.values(canonicalSourceEnvelope.anchors.byAnchorId)
-            : [])
-        ).flatMap((anchor) =>
-          anchor.remoteId
-            ? [[anchor.lastPath, anchor.remoteId] as const]
-            : []
-        ),
-      );
-      plan.items = protectEasySyncSelfSyncPlan(
-        protectCommunityPluginPlan(
-          plan.items,
-          communityPluginSyncPolicy,
-          configDir,
-          planningLocalEntries,
-          "easy-sync",
-          {
-            remoteEntries,
-            anchoredRemoteIdByPath,
-            restoringFilePluginIds: [
-              ...joinAuthorizationsByPluginId.keys(),
-            ],
-          },
-        ),
+      const step5c = await this.runStep5PrepareCanonicalPlanCandidate({
+        result,
+        operationEpoch,
+        callbacks,
+        migrationPlannerState,
+        migrationCandidateEnvelope,
+        canonicalSourceEnvelope,
+        committedV2Envelope,
+        v2PlanState,
+        syncScope,
+        localFolders,
+        localFolderScanComplete,
+        skippedLarge,
+        planningLocalEntries,
         configDir,
-      );
-      this.deferPlanItemsIntersectingRecovery(
-        plan,
+        automaticHandlingPolicy,
+        baselineReconstructionIncomplete,
+        prepareV2MigrationCandidate,
+        includeCanonicalFilePath,
+        includeCanonicalFolderPath,
+        preserveCanonicalFolderPath,
+        resolveCanonicalRemoteContentHash,
+      });
+      if (step5c.terminated) return step5c.terminated;
+      canonicalPlanCandidate = step5c.canonicalPlanCandidate;
+      canonicalSourceEnvelope = step5c.canonicalSourceEnvelope;
+      committedV2Envelope = step5c.committedV2Envelope;
+      const step5d = this.runStep5PrepareExecutablePlan({
         result,
+        operationEpoch,
+        mode,
+        canonicalPlanCandidate,
+        migrationPlannerState,
+        canonicalSourceEnvelope,
+        communityPluginSyncPolicy,
+        configDir,
+        planningLocalEntries,
+        remoteEntries,
+        joinAuthorizationsByPluginId,
         protectedMutationRecoveryRecords,
-      );
-      plan.scope = syncScope;
-      this.diag?.log("plan", `plan generated — ${plan.items.length} actions (up/down/del/conflict: ${plan.items.filter(i=>i.type===SyncActionType.Upload).length}/${plan.items.filter(i=>i.type===SyncActionType.Download).length}/${plan.items.filter(i=>i.type===SyncActionType.Conflict).length})`);
-      if (this.shouldStop(result, operationEpoch)) return result;
-      // M17: circuit breaker — skip items with 3+ consecutive same-version failures.
-      // ponytail: manual/first sync is an explicit user retry, so don't silently
-      // keep skipping on stale breaker state; auto sync keeps the guardrail.
-      // transfer-network issues additionally back off across version changes:
-      // a network timeout is a property of the link, not of the bytes, so a
-      // file that keeps failing while its content keeps changing (e.g. a
-      // plugin re-bundled during a slow-network window) still gets deferred —
-      // but only until the backoff window expires, which grants one real
-      // attempt per window instead of the version-matched indefinite skip.
-      // transfer-remote-moving (2026-09-28) shares the timer arm: a hot file
-      // (recording part, in-flight photo) offers a newer remote version every
-      // attempt, so the version-matched arm alone would never engage.
-      const breakerMap = new Map<string, PendingIssue>();
-      for (const issue of this.state.pendingIssues) {
-        // Terminal skip outcomes (oversized file, unstorable name) never
-        // touch the network and carry no version identity, so their
-        // recurring rows would accumulate "same-version failures" and arm
-        // the breaker against a by-design skip (2026-09-13 大文件演示.bin:
-        // three silent skips converted into a round-failing RetryLater that
-        // paused auto sync). Only real attempt outcomes may arm it, as with
-        // the FolderDeferred exclusion below.
-        if (
-          issue.actionType !== SyncActionType.FolderDeferred
-          && issue.actionType !== SyncActionType.SkipLargeFile
-          && issue.actionType !== SyncActionType.SkipOneDriveInvalidName
-          && (issue.consecutiveFailures ?? 0) >= 3
-        ) {
-          breakerMap.set(issue.path, issue);
-        }
-      }
-      if (breakerMap.size > 0) {
-        let breakerCount = 0;
-        let breakerDeferredCount = 0;
-        const breakerApplies = mode === "auto";
-        const networkBackoffCutoff = Date.now() - TRANSFER_NETWORK_BACKOFF_WINDOW_MS;
-        for (const item of plan.items) {
-          const breaker = breakerMap.get(item.path);
-          if (!breaker) continue;
-          const versionMatched = item.local?.hash === breaker.localHash && item.remote?.eTag === breaker.remoteETag;
-          const networkBackoff = (breaker.issueCode === "transfer-network"
-            || breaker.issueCode === "transfer-remote-moving")
-            && breaker.updatedAt >= networkBackoffCutoff;
-          if (versionMatched || networkBackoff) {
-            breakerCount++;
-            if (breakerApplies) {
-              item.type = SyncActionType.RetryLater;
-              item.reason = breaker.issueCode === "transfer-network"
-                ? "reason.circuitBreaker.network"
-                : breaker.issueCode === "transfer-remote-moving"
-                  ? "reason.circuitBreaker.remoteMoving"
-                  : "reason.circuitBreaker";
-              breakerDeferredCount++;
-            }
-          }
-        }
-        if (breakerDeferredCount > 0) {
-          // The pause gate exempts rounds whose only errors are these
-          // deferrals — otherwise the breaker's own skip would fail the
-          // round and pause the auto sync it exists to protect.
-          result.breakerDeferredErrors = breakerDeferredCount;
-        }
-        if (breakerCount > 0) {
-          this.diag?.log(
-            "plan",
-            breakerApplies
-              ? `M17 circuit breaker — ${breakerCount} item(s) skipped (3+ consecutive failures)`
-              : `M17 circuit breaker bypassed for ${mode} sync — ${breakerCount} item(s) will retry despite 3+ consecutive failures`,
-          );
-        }
-      }
+        folderScanFailures,
+        syncScope,
+      });
+      if (step5d.terminated) return step5d.terminated;
+      const plan = step5d.plan;
 
-      const configPrefix = `${getConfigDir(this.scanner.vault)}/`;
-      const obsidianUploads = plan.items.filter((i) =>
-        i.type === SyncActionType.Upload && i.path.startsWith(configPrefix));
-      if (obsidianUploads.length > 0) {
-        this.diag?.log("plan", `plan includes ${configPrefix} uploads: ${obsidianUploads.map((i) => i.path).join(', ')}`);
-      } else {
-        const obsidianLocal = planningLocalEntries.filter((e) => e.path.startsWith(configPrefix));
-        this.diag?.log("plan", `NO ${configPrefix} uploads in plan. localEntries with ${configPrefix}: ${obsidianLocal.map((e) => e.path).join(', ') || '(none)'}`);
-      }
+      const step5_5 = await this.runStep5_5FinalizeCanonicalContent({
+        result,
+        operationEpoch,
+        plan,
+        canonicalPlanCandidate,
+        migrationCandidateEnvelope,
+        v2PlanState,
+        verifiedFirstSyncRemoteHashesById,
+        automaticHandlingPolicy,
+        baselineReconstructionIncomplete,
+        prepareV2MigrationCandidate,
+        resolveCanonicalRemoteContentHash,
+        refreshVerificationDownloadUrls,
+      });
+      if (step5_5.terminated) return step5_5.terminated;
+      canonicalPlanCandidate = step5_5.canonicalPlanCandidate;
+      migrationCandidateEnvelope = step5_5.migrationCandidateEnvelope;
+      let finalizedCanonicalPlan = step5_5.finalizedCanonicalPlan;
 
-      // Step 5.5: Content hash dedup — for files that appear on both sides
-      // without a base entry, compare actual content hashes to avoid false
-      // conflicts when the same file exists on two devices (cloud baseline
-      // covers most cases; this is the fallback for remaining edge cases).
-      //
-      // SAFETY LIMIT: during normal sync, download-based hash dedup is
-      // capped at 10 files to avoid stalling on slow networks. When the run
-      // started without any committed base (fresh install or explicit reset),
-      // lift the cap even if cloud-baseline hints seed only some paths.
-      // Uncompared pending items remain eligible on later rounds; only a
-      // version-bound byte-difference receipt may suppress another download.
-      let finalizedCanonicalPlan: FinalizedCanonicalPlanV2 | null = null;
-      let canonicalFinalizationEnvelope: SyncStateEnvelopeV2 | null = null;
-      let contentEqualityBaseUpserts: BaseFileEntry[] = [];
-      let contentEqualityAncestorHashes:
-        Readonly<Record<string, string>> | undefined;
-      if (canonicalPlanCandidate) {
-        const finalizedEnvelope = migrationCandidateEnvelope
-          ?? (
-            typeof v2PlanState.getCommittedV2Envelope === "function"
-              ? v2PlanState.getCommittedV2Envelope()
-              : null
-          );
-        if (!finalizedEnvelope) {
-          throw new Error(
-            "V2 canonical finalization requires a committed envelope",
-          );
-        }
-        canonicalFinalizationEnvelope = finalizedEnvelope;
-        finalizedCanonicalPlan = await finalizeCanonicalPlanCandidateV2({
-          candidate: {
-            ...canonicalPlanCandidate,
-            items: plan.items,
-          },
-          envelope: finalizedEnvelope,
-          vaultName: this.vaultName,
-          accountId: this.state.boundAccountId ?? "",
-          configDir: getConfigDir(this.scanner.vault),
-          automaticHandlingPolicy,
-          baselineReconstructionIncomplete,
-          pendingContentComparisons: this.state.pendingConflicts.map(
-            (item) => ({
-              path: item.path,
-              contentComparison: item.contentComparison,
-            }),
-          ),
-          verifiedRemoteContentHashesById:
-            verifiedFirstSyncRemoteHashesById,
-          resolveRemoteContentHash: resolveCanonicalRemoteContentHash,
-          refreshVerificationDownloadUrls,
-          // Knife-2 (2026-09-08): bounded read-only overlap for plan-time
-          // content-verification downloads. Window caps reuse the descendant
-          // reconstruction batch caps (desktop 4 files/32 MiB, mobile
-          // 2 files/8 MiB) — the same read-only memory envelope proven on
-          // real devices; absent here means strictly serial verification.
-          verificationDownloadWindow: Platform.isMobile
-            ? {
-                maxFiles: MOBILE_RECONSTRUCTION_BATCH_FILES,
-                maxBytes: MOBILE_RECONSTRUCTION_BATCH_BYTES,
-              }
-            : {
-                maxFiles: DESKTOP_RECONSTRUCTION_BATCH_FILES,
-                maxBytes: DESKTOP_RECONSTRUCTION_BATCH_BYTES,
-              },
-        });
-        contentEqualityBaseUpserts = finalizedCanonicalPlan.baseUpserts;
-        plan.items = finalizedCanonicalPlan.items;
-        canonicalPlanCandidate = finalizedCanonicalPlan;
-        const verification = finalizedCanonicalPlan.contentVerification;
-        if (verification.candidates > 0) {
-          this.diag?.log(
-            "plan",
-            `V2 canonical content verification — ${verification.cachedEvidence} cached evidence candidate(s), ${verification.downloads} download candidate(s), ${verification.skippedDownloads} deferred`,
-          );
-          for (const item of verification.results) {
-            if (item.outcome === "failed") {
-              this.diag?.warn(
-                "plan",
-                `canonical content verification kept ${item.path} — ${item.error ?? "unknown failure"}`,
-              );
-            } else {
-              this.diag?.log(
-                "plan",
-                `canonical content verification ${item.outcome.toUpperCase()} — ${item.path} via ${item.proof}`,
-              );
-            }
-          }
-        }
-      }
-      if (contentEqualityBaseUpserts.length > 0) {
-        if (this.shouldStop(result, operationEpoch)) return result;
-        if (!prepareV2MigrationCandidate) {
-          await this.stageVerifiedLocalAncestorContent(
-            contentEqualityBaseUpserts,
-          );
-          contentEqualityAncestorHashes =
-            await this.state.upsertBaseEntries(contentEqualityBaseUpserts);
-        }
-        if (migrationCandidateEnvelope) {
-          const unpublishedCandidateMeta = migrationCandidateEnvelope.meta;
-          const contentFinalizedCandidate = upsertBaseStateEnvelopeV2(
-            migrationCandidateEnvelope,
-            contentEqualityBaseUpserts,
-            unpublishedCandidateMeta.committedAt,
-          );
-          // Content verification is still part of constructing the first
-          // unpublished migration candidate. The general V2 controller
-          // increments commitSeq for an already authoritative envelope; do
-          // not turn this in-memory preparation into a fictitious prior
-          // publication.
-          migrationCandidateEnvelope = {
-            ...contentFinalizedCandidate,
-            meta: { ...unpublishedCandidateMeta },
-          };
-        }
-      }
-      if (finalizedCanonicalPlan) {
-        const committedEnvelope = migrationCandidateEnvelope
-          ?? (
-            typeof v2PlanState.getCommittedV2Envelope === "function"
-              ? v2PlanState.getCommittedV2Envelope()
-              : null
-          );
-        if (!canonicalFinalizationEnvelope || !committedEnvelope) {
-          throw new Error(
-            "V2 canonical sealing requires both source and committed envelopes",
-          );
-        }
-        const sealed = sealCanonicalPlanV2({
-          finalized: finalizedCanonicalPlan,
-          sourceEnvelope: canonicalFinalizationEnvelope,
-          committedEnvelope,
-          ancestorHashesByPath: contentEqualityAncestorHashes,
-          unpublishedMigrationCandidate: prepareV2MigrationCandidate,
-        });
-        finalizedCanonicalPlan = sealed;
-        canonicalPlanCandidate = sealed;
-        plan.items = sealed.items;
-        plan.scope = { ...sealed.scope };
-        plan.canonicalIdentity = sealed.canonicalIdentity;
-        plan.canonicalReview = sealed.canonicalReview;
-        this.diag?.log(
-          "plan",
-          `V2 canonical plan sealed at commit ${sealed.sourceCommitSeq}`,
-          {
-            sourceCommitSeq: sealed.sourceCommitSeq,
-            actions: sealed.items.length,
-            reviewImpact: sealed.canonicalReview.impactCount,
-            digestBytes: sealed.canonicalIdentity.digest.length,
-            mutations: 0,
-          },
-        );
-      }
+      this.runStep5_6LogExecutableFolderPlan({
+        canonicalPlanCandidate,
+      });
 
-      const executableFolderPlan = canonicalPlanCandidate?.folderPlan ?? null;
-      if (executableFolderPlan) {
-        this.diag?.log(
-          "plan",
-          `V2 folder actions joined main plan — create-local=${executableFolderPlan.counts.createLocal}, create-remote=${executableFolderPlan.counts.createRemote}, move-local=${executableFolderPlan.counts.moveLocal}, move-remote=${executableFolderPlan.counts.moveRemote}, delete-local=${executableFolderPlan.counts.deleteLocal}, delete-remote=${executableFolderPlan.counts.deleteRemote}, conflicts=${executableFolderPlan.counts.conflicts}`,
-          {
-            phase: "plan",
-            counts: executableFolderPlan.counts,
-            reviewImpact: executableFolderPlan.reviewImpact,
-            mutations: 0,
-          },
-        );
-      }
+      const step5_7 = await this.runStep5_7ResumeCommittedV2Migration({
+        result,
+        plan,
+        callbacks,
+        reviewedAuthorization,
+        resumeCommittedV2Migration,
+        migrationAuthorityCommittedThisRun,
+        migrationExecutionHold,
+        waitForReview,
+        publishCommunityPluginPostAuthorityState,
+      });
+      if (step5_7.terminated) return step5_7.terminated;
+      migrationAuthorityCommittedThisRun =
+        step5_7.migrationAuthorityCommittedThisRun;
+      migrationExecutionHold = step5_7.migrationExecutionHold;
 
-      if (resumeCommittedV2Migration) {
-        let hold = this.state.activeV2MigrationHold;
-        const authorizationMatchesHold = Boolean(
-          hold
-          && reviewedAuthorization
-          && reviewedAuthorization.revision === hold.revision
-          && sameSyncScope(reviewedAuthorization.scope, hold.scope)
-          && sameCanonicalPlanIdentityV2(
-            reviewedAuthorization.canonicalIdentity,
-            hold.canonicalIdentity,
-          )
-        );
-        const exactPlanIdentity = Boolean(
-          hold
-          && plan.canonicalIdentity
-          && sameCanonicalPlanIdentityV2(
-            plan.canonicalIdentity,
-            hold.canonicalIdentity,
-          )
-        );
-        const currentEnvelope = this.state.getCommittedV2Envelope();
-        const cursorPublicationRebind = Boolean(
-          hold
-          && plan.canonicalIdentity
-          && currentEnvelope
-          && sameStateV2MigrationResumeFacts(
-            hold.candidate,
-            currentEnvelope,
-          )
-          && migrationPlanFactsDigestV2({
-            items: plan.items,
-            lastTotalFiles: plan.lastTotalFiles,
-            scope: plan.canonicalIdentity.scope,
-          }) === hold.planFactsDigest
-        );
-        const authorizationMatches = authorizationMatchesHold
-          && (exactPlanIdentity || cursorPublicationRebind);
-        if (hold?.phase === "confirmed") {
-          hold = await this.state.transitionV2MigrationHold(
-            hold,
-            "authority-committed",
-          );
-        }
-        if (
-          authorizationMatches
-          && hold?.phase === "authority-committed"
-        ) {
-          plan.reviewKind = migrationHoldReviewKindV2(hold);
-          plan.confirmed = true;
-          migrationAuthorityCommittedThisRun = true;
-          await publishCommunityPluginPostAuthorityState();
-          migrationExecutionHold = hold;
-          if (!exactPlanIdentity) {
-            this.diag?.log(
-              "state",
-              "V2 migration resume rebound across a cursor-only state publication",
-              {
-                phase: "activation",
-                reviewedCommitSeq:
-                  hold.canonicalIdentity.sourceCommitSeq,
-                currentCommitSeq:
-                  plan.canonicalIdentity?.sourceCommitSeq,
-                mutations: 0,
-              },
-            );
-          }
-        } else {
-          const convergedAfterCommittedMigration = Boolean(
-            hold?.phase === "authority-committed"
-            && plan.items.length === 0
-            && this.state.mutationLedger.length === 0
-            && result.errors === 0
-            && result.deferred === 0
-            && result.conflicts === 0
-          );
-          if (convergedAfterCommittedMigration) {
-            const completed = await this.state.transitionV2MigrationHold(
-              hold!,
-              "completed",
-            );
-            if (!completed) {
-              throw new Error(
-                "Converged V2 migration hold could not complete",
-              );
-            }
-            plan.reviewKind = undefined;
-            this.diag?.log(
-              "state",
-              "V2 migration transaction recovered as already converged",
-              {
-                phase: "activation",
-                mutations: 0,
-              },
-            );
-          } else {
-            if (hold?.phase === "authority-committed") {
-              await this.state.transitionV2MigrationHold(hold, "completed");
-            } else if (hold?.phase === "pending" && reviewedAuthorization) {
-              await this.state.clearPlanReview(reviewedAuthorization);
-            }
-            plan.reviewKind = undefined;
-            this.diag?.warn(
-              "state",
-              "V2 migration resume facts changed; converted to a normal V2 review",
-              {
-                phase: "activation",
-                mutations: 0,
-              },
-            );
-            const publishPreview =
-              callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
-            if (publishPreview) {
-              await waitForReview(() => publishPreview(plan));
-            }
-            return this.markPlanReviewPaused(result);
-          }
-        }
-      }
+      const step5_8 = await this.runStep5_8RunV2ReviewTransaction({
+        result,
+        operationEpoch,
+        plan,
+        callbacks,
+        reviewedAuthorization,
+        skipConfirmation,
+        options,
+        attemptV2Activation,
+        activationReviewKind,
+        freshSharedProtocolBinding,
+        migrationCandidateEnvelope,
+        public113MigrationInput,
+        takeOverPublic113MutationLedger,
+        syncScope,
+        automaticHandlingMetrics,
+        retireFirstSyncVerificationEvidence,
+        publishCommunityPluginPostAuthorityState,
+        waitForReview,
+        migrationAuthorityCommittedThisRun,
+        migrationExecutionHold,
+      });
+      if (step5_8.terminated) return step5_8.terminated;
+      migrationAuthorityCommittedThisRun =
+        step5_8.migrationAuthorityCommittedThisRun;
+      migrationExecutionHold = step5_8.migrationExecutionHold;
 
-      // Every pre-authority V2 entry path enters the same durable review
-      // transaction. The review kind preserves whether this is a public
-      // 1.1.3 migration, a join to existing cloud V2, or the first V2 device.
-      if (attemptV2Activation) {
-        if (
-          !migrationCandidateEnvelope
-          || !plan.canonicalIdentity
-          || !plan.canonicalReview
-          || activationReviewKind === null
-        ) {
-          throw new Error(
-            "V2 activation requires a classified sealed candidate",
-          );
-        }
-        const reviewKind = activationReviewKind;
-        let activeReviewedAuthorization = reviewedAuthorization;
-        plan.reviewKind = reviewKind;
-        if (
-          skipConfirmation
-          && activeReviewedAuthorization?.reviewKind === reviewKind
-        ) {
-          const existingConfirmed = this.state.activeV2MigrationHold;
-          const reviewedMigrationStillCurrent =
-            existingConfirmed?.phase === "confirmed"
-            || await this.state.isCurrentV2MigrationAuthorization({
-              authorization: activeReviewedAuthorization,
-              candidate: migrationCandidateEnvelope,
-              canonicalIdentity: plan.canonicalIdentity,
-            });
-          let protocolBinding =
-            existingConfirmed?.phase === "confirmed"
-              ? existingConfirmed.protocolBinding
-              : undefined;
-          if (
-            reviewedMigrationStillCurrent
-            && reviewKind === "v2-cloud-join"
-            && freshSharedProtocolBinding
-            && !protocolBinding
-          ) {
-            const scopeFreeProtocol =
-              await this.adoptExistingScopeFreeSharedProtocolForFreshActivation(
-                freshSharedProtocolBinding,
-              );
-            if (scopeFreeProtocol.status === "unavailable") {
-              result.errors = 1;
-              result.message = this.t("result.remoteReadUnavailable");
-              this.diag?.warn(
-                "state",
-                "reviewed cross-scope cloud join retained its authorization because the shared protocol is temporarily unavailable",
-                { reason: scopeFreeProtocol.reason, mutations: 0 },
-              );
-              return result;
-            }
-            if (scopeFreeProtocol.status !== "ready") {
-              result.errors = 1;
-              result.message = this.t("result.v2ProtocolBlocked");
-              this.diag?.error(
-                "state",
-                "reviewed cross-scope cloud join could not revalidate the exact scope-free protocol before authority commit",
-                { reason: scopeFreeProtocol.reason, mutations: 0 },
-              );
-              return result;
-            }
-            protocolBinding = scopeFreeProtocol.binding;
-            this.diag?.log(
-              "state",
-              "reviewed cross-scope cloud join revalidated the exact scope-free protocol before authority commit",
-              {
-                protocolVersion: scopeFreeProtocol.binding.protocolVersion,
-                migrationGeneration:
-                  scopeFreeProtocol.binding.migrationGeneration.slice(0, 12),
-                mutations: 0,
-              },
-            );
-          }
-          if (reviewedMigrationStillCurrent && !protocolBinding) {
-            // Public 1.1.3 migration alone needs the dedicated upgrade-risk
-            // acknowledgement. A reviewed first-sync plan may create the
-            // initial record; cloud join must only adopt an existing record.
-            if (
-              reviewKind === "v2-migration"
-              && options.acknowledgeMigrationRisk !== true
-            ) {
-              this.markPlanReviewPaused(result);
-              this.diag?.warn(
-                "state",
-                "V2 migration remains paused until this device acknowledges the migration risk",
-                { mutations: 0 },
-              );
-              return result;
-            }
-            const protocolTransport = availableSharedSyncProtocolTransportV2(
-              this.onedrive,
-              this.vaultName,
-            );
-            if (!protocolTransport) {
-              result.errors = 1;
-              result.message = this.t("result.v2ProtocolBlocked");
-              this.diag?.error(
-                "state",
-                "shared V2 sync protocol transport is unavailable",
-              );
-              return result;
-            }
-            const protocolObservation =
-              await this.observeSharedSyncProtocolObjects();
-            if (protocolObservation.status === "unavailable") {
-              result.errors = 1;
-              result.message = this.t("result.remoteReadUnavailable");
-              this.diag?.warn(
-                "state",
-                "reviewed V2 activation retained its authorization because the shared protocol is temporarily unavailable",
-                { reason: protocolObservation.reason, mutations: 0 },
-              );
-              return result;
-            }
-            if (protocolObservation.status !== "ready") {
-              result.errors = 1;
-              result.message = this.t("result.v2ProtocolBlocked");
-              this.diag?.error(
-                "state",
-                "shared V2 sync protocol could not be observed before authority commit",
-                { reason: protocolObservation.reason, mutations: 0 },
-              );
-              return result;
-            }
-            const protocol = await this.ensureSharedSyncProtocolV2FromObservation(
-              protocolTransport,
-              protocolObservation,
-              {
-                scope: syncScope,
-                acknowledgeMigrationRisk:
-                  reviewKind !== "v2-cloud-join",
-                ...(reviewKind === "v2-first-sync"
-                    && existingConfirmed?.phase === "pending"
-                    && existingConfirmed.protocolBinding?.protocolVersion === 2
-                  ? {
-                      expectedBinding: existingConfirmed.protocolBinding,
-                      requireExactBinding: true,
-                    }
-                  : {}),
-              },
-              async (settled) => {
-                if (
-                  reviewKind !== "v2-first-sync"
-                  || settled.source !== "created"
-                  || !activeReviewedAuthorization
-                ) return;
-                const checkpointed =
-                  await this.state.checkpointPendingFirstSyncProtocolBinding({
-                    authorization: activeReviewedAuthorization,
-                    candidate: migrationCandidateEnvelope,
-                    canonicalIdentity: plan.canonicalIdentity!,
-                    protocolBinding: settled.binding,
-                  });
-                if (!checkpointed) return;
-                const refreshedAuthorization =
-                  this.state.planReviewAuthorization;
-                if (
-                  !refreshedAuthorization
-                  || refreshedAuthorization.reviewKind !== "v2-first-sync"
-                ) {
-                  throw new Error(
-                    "First-sync protocol checkpoint lost its reviewed authorization",
-                  );
-                }
-                activeReviewedAuthorization = refreshedAuthorization;
-              },
-            );
-            if (protocol.status === "unavailable") {
-              result.errors = 1;
-              result.message = this.t("result.remoteReadUnavailable");
-              this.diag?.warn(
-                "state",
-                "reviewed V2 activation retained its authorization because post-write protocol observation is temporarily unavailable",
-                { reason: protocol.reason, mutations: 0 },
-              );
-              return result;
-            }
-            if (protocol.status !== "ready") {
-              result.errors = 1;
-              result.message = this.t("result.v2ProtocolBlocked");
-              this.diag?.error(
-                "state",
-                "shared V2 sync protocol could not be joined safely",
-                { reason: protocol.reason, mutations: 0 },
-              );
-              return result;
-            }
-            const scopeFreeProtocol =
-              await this.ensureScopeFreeSharedProtocolFromObservation(
-                protocol.value.binding,
-                syncScope,
-                protocol.observation,
-              );
-            if (scopeFreeProtocol.status === "unavailable") {
-              result.errors = 1;
-              result.message = this.t("result.remoteReadUnavailable");
-              this.diag?.warn(
-                "state",
-                "reviewed V2 activation retained its authorization because scope-free protocol observation is temporarily unavailable",
-                { reason: scopeFreeProtocol.reason, mutations: 0 },
-              );
-              return result;
-            }
-            if (scopeFreeProtocol.status !== "ready") {
-              result.errors = 1;
-              result.message = this.t("result.v2ProtocolBlocked");
-              this.diag?.error(
-                "state",
-                "scope-free shared protocol could not be established before authority commit",
-                {
-                  reason: scopeFreeProtocol.reason,
-                  mutations: 0,
-                },
-              );
-              return result;
-            }
-            protocolBinding = scopeFreeProtocol.binding;
-            this.diag?.log(
-              "state",
-              `scope-free shared protocol joined from ${scopeFreeProtocol.source}`,
-              {
-                protocolVersion: scopeFreeProtocol.binding.protocolVersion,
-                migrationGeneration:
-                  scopeFreeProtocol.binding.migrationGeneration.slice(0, 12),
-                mutations: 0,
-              },
-            );
-          }
-          let confirmed: MigrationHoldV2 | null = null;
-          if (reviewedMigrationStillCurrent) {
-            confirmed = (
-              existingConfirmed?.phase === "confirmed"
-              && activeReviewedAuthorization.revision
-                === existingConfirmed.revision
-              && sameSyncScope(
-                activeReviewedAuthorization.scope,
-                existingConfirmed.scope,
-              )
-              && sameCanonicalPlanIdentityV2(
-                activeReviewedAuthorization.canonicalIdentity,
-                existingConfirmed.canonicalIdentity,
-              )
-              && sameCanonicalPlanIdentityV2(
-                plan.canonicalIdentity,
-                existingConfirmed.canonicalIdentity,
-              )
-              && sameStateV2MigrationCandidate(
-                migrationCandidateEnvelope,
-                existingConfirmed.candidate,
-              )
-            )
-              ? existingConfirmed
-              : await this.state.confirmV2MigrationHold({
-                  authorization: activeReviewedAuthorization,
-                  candidate: migrationCandidateEnvelope,
-                  canonicalIdentity: plan.canonicalIdentity,
-                  protocolBinding: protocolBinding!,
-                });
-          }
-          // Revalidating the pending hold may await storage/source evidence.
-          // Cancellation remains authoritative until authority commit begins;
-          // a confirmed hold is durable and can resume on the next run.
-          this.throwIfSharedSyncProtocolOperationWasCancelled();
-          if (confirmed) {
-            const committed =
-              await this.state.commitConfirmedV2MigrationHold(
-                confirmed,
-                Date.now(),
-                takeOverPublic113MutationLedger
-                  ? "legacy-mutation-recovery"
-                  : "ordinary",
-            );
-            migrationAuthorityCommittedThisRun = true;
-            await retireFirstSyncVerificationEvidence();
-            await publishCommunityPluginPostAuthorityState();
-            migrationExecutionHold = committed.hold;
-            plan.confirmed = true;
-            this.diag?.warn(
-              "state",
-              "V2 migration authority committed from the reviewed hold",
-              {
-                phase: "activation",
-                holdRevision: committed.hold.revision,
-                planItems: plan.items.length,
-                mutations: 0,
-              },
-            );
-            if (takeOverPublic113MutationLedger) {
-              await this.recoverMutationLedger(
-                syncScope,
-                automaticHandlingMetrics,
-                operationEpoch,
-              );
-              if (this.shouldStop(result, operationEpoch)) return result;
-              if (this.state.mutationLedger.length > 0) {
-                throw new Error(
-                  "Public 1.1.3 mutation recovery remains unresolved under V2 authority",
-                );
-              }
-              const completed = await this.state.transitionV2MigrationHold(
-                committed.hold,
-                "completed",
-              );
-              if (!completed) {
-                throw new Error(
-                  "V2 migration hold did not complete after legacy mutation recovery",
-                );
-              }
-              result.success = true;
-              result.message = this.t("result.synced", {
-                uploaded: 0,
-                downloaded: 0,
-                foldersCreated: 0,
-                foldersMoved: 0,
-                foldersDeleted: 0,
-                filesMoved: 0,
-                deleted: 0,
-                conflicts: 0,
-                deferred: 0,
-                errors: 0,
-              });
-              result.continueAfterStateOnlyMigrationRecovery = true;
-              return result;
-            }
-          } else {
-            await this.state.stageV2MigrationHold({
-              candidate: migrationCandidateEnvelope,
-              source: public113MigrationInput!,
-              reviewKind,
-              plan,
-            });
-            this.diag?.warn(
-              "state",
-              "V2 migration review changed before authority commit",
-              {
-                phase: "activation",
-                planItems: plan.items.length,
-                mutations: 0,
-                ...describeStateV2MigrationReviewDriftFacts(
-                  migrationCandidateEnvelope,
-                  existingConfirmed,
-                  plan.canonicalIdentity,
-                ),
-              },
-            );
-            const publishPreview =
-              callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
-            if (publishPreview) {
-              await waitForReview(() => publishPreview(plan));
-            }
-            return this.markPlanReviewPaused(result);
-          }
-        } else {
-          const previousHold = this.state.activeV2MigrationHold;
-          const hold = await this.state.stageV2MigrationHold({
-            candidate: migrationCandidateEnvelope,
-            source: public113MigrationInput!,
-            reviewKind,
-            plan,
-          });
-          this.diag?.warn(
-            "state",
-            "V2 controlled activation held on a canonical migration plan",
-            {
-              phase: "activation",
-              holdRevision: hold.revision,
-              planItems: plan.items.length,
-              mutations: 0,
-              ...describeStateV2MigrationReviewDriftFacts(
-                migrationCandidateEnvelope,
-                previousHold,
-                plan.canonicalIdentity,
-              ),
-            },
-          );
-          const publishPreview =
-            callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
-          if (publishPreview) {
-            await waitForReview(() => publishPreview(plan));
-          }
-          return this.markPlanReviewPaused(result);
-        }
-      }
+      this.runStep5_9BindPendingDecisionTokens({
+        plan,
+        finalizedCanonicalPlan,
+      });
 
-      // Every user-visible pending item must carry the exact reviewed
-      // versions before a first-sync or threshold callback can persist it.
-      if (!finalizedCanonicalPlan) {
-        this.bindPendingDecisionTokens(plan);
-      }
+      const step5_10 = await this.runStep5_10PublishReadOnlyPreview({
+        result,
+        plan,
+        callbacks,
+        options,
+        syncScope,
+        waitForReview,
+      });
+      if (step5_10.terminated) return step5_10.terminated;
 
-      if (options.readOnlyPreview) {
-        const publishPreview = callbacks.onFirstSyncPreview ?? callbacks.onConfirmThreshold;
-        if (publishPreview) await waitForReview(() => publishPreview(plan));
-        this.diag?.warn(
-          "plan",
-          "explicit read-only preview enforced; Graph creates=0, file mutations=0",
-          {
-            scope: syncScope,
-            counts: this.summarizePlanActions(plan),
-            total: plan.items.length,
-            sample: plan.items.slice(0, 10).map((item) => ({
-              type: item.type,
-              path: item.path,
-              reason: item.reason,
-            })),
-            mutations: 0,
-          },
-        );
-        return this.markPlanReviewPaused(result);
-      }
+      const step5_11 = await this.runStep5_11PublishRecoveryPreview({
+        result,
+        plan,
+        callbacks,
+        syncScope,
+        baseEntries,
+        waitForReview,
+      });
+      if (step5_11.terminated) return step5_11.terminated;
 
-      // A legacy namespace recovery is never executable in the same round.
-      // Persist/show the corrected plan once, but ignore a callback that would
-      // otherwise authorize immediate execution. The following round starts
-      // from the clean committed snapshot and must pass normal revision gates.
-      if (this.remoteRecoveryPreviewRequired) {
-        const counts = this.summarizePlanActions(plan);
-        const anomalies = plan.items
-          .filter((item) => item.path.startsWith("files/") || item.path.startsWith(".easy-sync/"))
-          .slice(0, 10)
-          .map((item) => `${item.type}:${item.path}`);
-        this.diag?.warn(
-          "plan",
-          "remote namespace recovery forced a read-only preview; file mutations=0",
-          {
-            scope: syncScope,
-            counts,
-            total: plan.items.length,
-            priorBaseCount: baseEntries.length,
-            anomalies,
-            sample: plan.items.slice(0, 10).map((item) => ({
-              type: item.type,
-              path: item.path,
-              reason: item.reason,
-            })),
-            mutations: 0,
-          },
-        );
-        const publishPreview = callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
-        if (publishPreview) await waitForReview(() => publishPreview(plan));
-        return this.markPlanReviewPaused(result);
-      }
-
-      // Planner-derived issue rows are pure UI state. Retire the rows the
-      // fresh plan no longer produces even when a review gate is about to
-      // hold this round, so stale "核对文件夹"-style rows cannot outlive the
-      // plan that created them. Conflict/delete rows stay behind the gates:
-      // they carry confirmation semantics and planning authority.
-      await this.prunePlannerDerivedStaleIssues(
+      const step5_12 = await this.runStep5_12PrunePlannerDerivedIssues({
+        result,
+        operationEpoch,
         plan,
         protectedMutationRecoveryRecords,
-      );
-      if (this.shouldStop(result, operationEpoch)) return result;
+      });
+      if (step5_12.terminated) return step5_12.terminated;
 
-      // If the user is executing a reviewed plan, verify the digest after all
-      // pre-execution rewrites (scan health and dedup). The
-      // reviewed bundle stays in state until this point so stale plans re-pause.
-      if (
-        skipConfirmation
-        && this.state.planReviewActive
-        && !migrationAuthorityCommittedThisRun
-        && !attemptV2Activation
-      ) {
-        const authorizationIsCurrent = Boolean(
-          reviewedAuthorization
-          && reviewedAuthorization.revision === this.state.planReviewRevision
-          && sameSyncScope(reviewedAuthorization.scope, this.state.planReviewScope)
-          && sameSyncScope(reviewedAuthorization.scope, syncScope)
-          && sameCanonicalPlanIdentityV2(
-            reviewedAuthorization.canonicalIdentity,
-            plan.canonicalIdentity,
-          )
-          && sameCanonicalPlanIdentityV2(
-            this.state.planReviewCanonicalIdentity,
-            plan.canonicalIdentity,
-          )
-        );
-        if (!authorizationIsCurrent) {
-          this.diag?.warn(
-            "plan",
-            "plan revision, scope, or canonical identity changed since review — re-pausing for confirmation",
-          );
-          if (callbacks.onConfirmThreshold) {
-            await waitForReview(() => callbacks.onConfirmThreshold!(plan));
-          }
-          return this.markPlanReviewPaused(result);
-        }
-        const savedDigest = this.state.planReviewDigest;
-        const currentDigest = plan.canonicalIdentity
-          ? canonicalPlanDigestV2({
-              items: plan.items,
-              lastTotalFiles: plan.lastTotalFiles,
-              scope: plan.canonicalIdentity.scope,
-              sourceCommitSeq:
-                plan.canonicalIdentity.sourceCommitSeq,
-            })
-          : planDigest(plan.items);
-        const sealedIdentityChanged = Boolean(
-          plan.canonicalIdentity
-          && currentDigest !== plan.canonicalIdentity.digest
-        );
-        if (
-          sealedIdentityChanged
-          || (savedDigest && currentDigest !== savedDigest)
-        ) {
-          this.diag?.warn("plan", "plan changed since review — re-pausing for confirmation");
-          const confirmed = callbacks.onConfirmThreshold
-            ? await waitForReview(() => callbacks.onConfirmThreshold!(plan))
-            : false;
-          if (!confirmed) {
-            return this.markPlanReviewPaused(result);
-          }
-          if (this.shouldStop(result, operationEpoch)) return result;
-        }
-        if (this.shouldStop(result, operationEpoch)) return result;
-        const cleared = await this.state.clearPlanReview(reviewedAuthorization);
-        if (!cleared) {
-          this.diag?.warn("plan", "plan review changed before authorization commit — stopping before mutation");
-          return this.markPlanReviewPaused(result);
-        }
-      }
-
-      // Step 6: Threshold check (skip if user is confirming a reviewed plan)
-      if (!finalizedCanonicalPlan) {
-        throw new Error("V2 canonical plan was not finalized");
-      }
-      const authorizedJoinPaths = new Set(
-        [...joinAuthorizationsByPluginId.values()].flatMap((authorization) =>
-          authorization.members.map((member) => member.path)
-        ),
-      );
-      const planContainsOnlyExplicitJoinDownloads = plan.items.length > 0
-        && plan.items.every((item) =>
-          item.type === SyncActionType.Download
-          && authorizedJoinPaths.has(item.path)
-        );
-      const requiresThresholdConfirmation =
-        finalizedCanonicalPlan.requiresThresholdConfirmation
-        && !planContainsOnlyExplicitJoinDownloads;
-      if (!skipConfirmation && requiresThresholdConfirmation) {
-        if (mode === "auto") {
-          // Direction 3 (user decision 2026-09-02): automatic sync does not
-          // pause for the threshold review — the plan proceeds and the
-          // caller shows a one-line summary notice instead. The structured
-          // flag replaces any localised-message signal.
-          const priorFacts = result.runFacts;
-          result.runFacts = {
-            termination: priorFacts?.termination ?? "normal",
-            ordinaryPlanning: priorFacts?.ordinaryPlanning ?? "not-entered",
-            userFileChanges: priorFacts?.userFileChanges ?? "unknown",
-            thresholdSkippedInAuto: true,
-          };
-        } else if (callbacks.onConfirmThreshold) {
-          const confirmed = await waitForReview(() => callbacks.onConfirmThreshold!(plan));
-          if (!confirmed) {
-            return this.markPlanReviewPaused(result);
-          }
-          if (this.shouldStop(result, operationEpoch)) return result;
-        }
-        plan.confirmed = true;
-      }
-
-      // Step 7: First sync preview (skip if user is confirming a reviewed plan)
-      if (!skipConfirmation && mode === "first") {
-        if (callbacks.onFirstSyncPreview) {
-          const confirmed = await waitForReview(() => callbacks.onFirstSyncPreview!(plan));
-          if (!confirmed) {
-            return this.markPlanReviewPaused(result);
-          }
-          if (this.shouldStop(result, operationEpoch)) return result;
-        }
-        plan.confirmed = true;
-      }
-
-      // Authority may change only after every mandatory review gate has
-      // authorized this exact zero-plan round. A declined first-sync preview
-      // or a forced recovery preview must leave V1 authoritative.
-      if (attemptV2Activation && !migrationAuthorityCommittedThisRun) {
-        const activationReady = plan.items.length === 0
-          && result.skippedLarge === 0
-          && result.skippedIgnored === 0
-          && localFolderScanComplete
-          && this.state.mutationLedger.length === 0
-          && !this.state.hasMutationLedgerCorruption
-          && migrationRemoteItems !== null
-          && migrationCandidateEnvelope !== null
-          && plan.canonicalIdentity !== undefined
-          && public113MigrationInput !== null;
-        if (activationReady) {
-          const migration =
-            await this.state.activatePreparedV2MigrationCandidate({
-              candidate: migrationCandidateEnvelope!,
-              canonicalIdentity: plan.canonicalIdentity!,
-              source: public113MigrationInput,
-            });
-          this.diag?.log("state", `V2 controlled activation ${migration.status}`, {
-            phase: "activation",
-            status: migration.status,
-            reason: migration.reason,
-            pending: migration.pending.length,
-            mutations: migration.mutations.length,
-          });
-          if (migration.status !== "committed" && migration.status !== "already-committed") {
-            throw new Error(`V2 state activation aborted: ${migration.reason ?? "unknown"}`);
-          }
-          await retireFirstSyncVerificationEvidence();
-          await publishCommunityPluginPostAuthorityState();
-          if (
-            this.state.planReviewActive
-            && !this.state.activeV2MigrationHold
-          ) {
-            await this.state.clearPlanReview();
-          }
-        } else {
-          this.diag?.warn("state", "V2 controlled activation held before mutation", {
-            phase: "activation",
-            planItems: plan.items.length,
-            skippedLarge: result.skippedLarge,
-            skippedIgnored: result.skippedIgnored,
-            localFolderScanComplete,
-            planReviewActive: this.state.planReviewActive,
-            pendingConflicts: this.state.pendingConflicts.length,
-            pendingDeletes: this.state.pendingRemoteDeletes.length,
-            pendingIssues: this.state.pendingIssues.length,
-            mutationLedger: this.state.mutationLedger.length,
-            remoteIdentityComplete: migrationRemoteItems !== null,
-            mutations: 0,
-          });
-          return this.markPlanReviewPaused(result);
-        }
-      }
-
-      // Pending decisions are ancillary UI state, not planning authority.
-      // Prune them only after every review/activation gate has passed so a
-      // preview never rewrites legacy state and a zero-plan migration can
-      // archive the original public-1.1.3 snapshot before retiring stale UI.
-      if (this.shouldStop(result, operationEpoch)) return result;
-      // A downgrade-review row whose bundle still has a download or upload in
-      // this plan must survive pruning: the plan-level guards re-hang the same
-      // bundle on every round, so retiring the row here would recreate the
-      // identical pending conflict on the next round — an endless per-interval
-      // cycle. The row is retired only when the user settles it or the plan
-      // stops touching the bundle (remote no longer lower than local).
-      const pendingDowngradeRetained = new Set(
-        this.state.pendingConflicts
-          .filter((item) => item.reason === "reason.pluginDowngradeRemote")
-          .filter((item) => this.planStillDownloadsPluginBundle(plan, item.path)
-            || this.planStillUploadsPluginBundle(plan, item.path))
-          .map((item) => item.path),
-      );
-      await this.state.prunePendingConflicts(
-        [
-          ...plan.items
-            .filter((item) => item.type === SyncActionType.Conflict)
-            .map((item) => item.path),
-          ...this.state.pendingConflicts
-            .filter((item) => this.isPathProtectedByIsolatedRecovery(
-              item.path,
-              protectedMutationRecoveryRecords,
-            ))
-            .map((item) => item.path),
-          ...pendingDowngradeRetained,
-        ],
-      );
-      if (this.shouldStop(result, operationEpoch)) return result;
-      await this.state.prunePendingDeletes(
-        [
-          ...plan.items
-            .filter((item) => item.type === SyncActionType.ConfirmLocalDelete
-            || item.type === SyncActionType.DeleteLocal
-            || (
-              item.type === SyncActionType.DeleteLocalFolder
-              && item.requiresConfirmation
-            ))
-            .map((item) => item.path),
-          ...this.state.pendingRemoteDeletes
-            .filter((item) => this.isPathProtectedByIsolatedRecovery(
-              item.path,
-              protectedMutationRecoveryRecords,
-            ))
-            .map((item) => item.path),
-        ],
-      );
-      if (this.shouldStop(result, operationEpoch)) return result;
-      await this.state.prunePendingIssues(
-        [
-          ...plan.items
-            .filter((item) => isPendingIssueAction(item.type))
-            .map((item) => item.path),
-          ...this.state.pendingIssues
-            .filter((item) => this.isPathProtectedByIsolatedRecovery(
-              item.path,
-              protectedMutationRecoveryRecords,
-            ))
-            .map((item) => item.path),
-        ],
-      );
-      if (this.shouldStop(result, operationEpoch)) return result;
-
-      // Step 8: Execute plan items
-      enterPhase("transfer");
-      this.progressStore?.setPhase("executing");
-      const stagedFolderMoves = plan.items.filter(
-        (item) => item.type === SyncActionType.MoveRemoteFolder
-          || item.type === SyncActionType.MoveLocalFolder,
-      );
-      const stagedFolderMove =
-        stagedFolderMoves.length === 1
-        && canonicalPlanCandidate?.folderPlan.items.length === 1
-        && (
-          canonicalPlanCandidate.folderPlan.items[0]?.type === "move-remote"
-          || canonicalPlanCandidate.folderPlan.items[0]?.type === "move-local"
-        )
-        && plan.canonicalIdentity
-          ? stagedFolderMoves[0]
-          : null;
-      const foldersMovedBeforeExecution = result.foldersMoved ?? 0;
-      await this.executePlan(
-        plan,
+      const step5_13 = await this.runStep5_13VerifyReviewedPlanDigest({
         result,
+        operationEpoch,
+        plan,
+        callbacks,
+        reviewedAuthorization,
+        skipConfirmation,
+        syncScope,
+        attemptV2Activation,
+        migrationAuthorityCommittedThisRun,
+        waitForReview,
+      });
+      if (step5_13.terminated) return step5_13.terminated;
+
+      const step6 = await this.runStep6CheckThreshold({
+        result,
+        operationEpoch,
+        plan,
+        skipConfirmation,
+        mode,
+        callbacks,
+        finalizedCanonicalPlan,
+        joinAuthorizationsByPluginId,
+        waitForReview,
+      });
+      if (step6.terminated) return step6.terminated;
+
+      const step7 = await this.runStep7FirstSyncPreview({
+        result,
+        operationEpoch,
+        plan,
+        skipConfirmation,
+        mode,
+        callbacks,
+        waitForReview,
+      });
+      if (step7.terminated) return step7.terminated;
+
+      const step7_5 = await this.runStep7_5ActivateV2Authority({
+        result,
+        plan,
+        attemptV2Activation,
+        migrationAuthorityCommittedThisRun,
+        localFolderScanComplete,
+        migrationRemoteItems,
+        migrationCandidateEnvelope,
+        public113MigrationInput,
+        retireFirstSyncVerificationEvidence,
+        publishCommunityPluginPostAuthorityState,
+      });
+      if (step7_5.terminated) return step7_5.terminated;
+
+      const step7_6 = await this.runStep7_6PrunePendingDecisions({
+        result,
+        operationEpoch,
+        plan,
+        protectedMutationRecoveryRecords,
+      });
+      if (step7_6.terminated) return step7_6.terminated;
+
+      const step8 = await this.runStep8ExecutePlanItems({
+        result,
+        plan,
         callbacks,
         operationEpoch,
         automaticHandlingPolicy,
         automaticHandlingMetrics,
         communityPluginSyncPolicy,
         protectedMutationRecoveryRecords,
-      );
-      // A folder move is a topology transaction in either direction. Only
-      // after its receipt/checkpoint has advanced the authority may one fresh
-      // scan produce a single bounded descendant plan; never recurse into run().
-      if (
-        stagedFolderMove
-        && (result.foldersMoved ?? 0) === foldersMovedBeforeExecution + 1
-        && result.errors === 0
-        && result.conflicts === 0
-        && result.deferred === 0
-        && this.state.mutationLedger.length === 0
-        && !this.shouldStop(result, operationEpoch)
-      ) {
-        let continuationSettled = false;
-        const targetRoot = stagedFolderMove.path;
-        const sourceRoot = stagedFolderMove.renameFrom;
-        const remoteId = stagedFolderMove.folder?.remoteId;
-        const sourceCommitSeq = plan.canonicalIdentity!.sourceCommitSeq;
-        const checkpointEnvelope = this.state.getCommittedV2Envelope();
-        const committedFolderAnchor = remoteId && checkpointEnvelope
-          ? Object.values(
-              checkpointEnvelope.folderAnchors?.byAnchorId ?? {},
-            ).find((anchor) => anchor.remoteId === remoteId)
-          : null;
-        const moveAuthorizationSettled = stagedFolderMove.type
-          === SyncActionType.MoveLocalFolder
-          || (remoteId
-            ? !this.state.localFolderMoveHints.some((hint) =>
-                hint.remoteId === remoteId
-                || (
-                  sourceRoot !== undefined
-                  && hint.fromPath === sourceRoot
-                  && hint.toPath === targetRoot
-                ))
-            : false);
-        if (
-          checkpointEnvelope
-          && remoteId
-          && committedFolderAnchor?.lastPath === targetRoot
-          && checkpointEnvelope.meta.commitSeq > sourceCommitSeq
-          && moveAuthorizationSettled
-        ) {
-          const continuationScan = await this.scanner.scanAll();
-          const continuationScanComplete = continuationScan.complete !== false
-            && continuationScan.failedPaths.length === 0
-            && continuationScan.folderScanComplete === true;
-          let continuationEnvelope: SyncStateEnvelopeV2 | null =
-            checkpointEnvelope;
-          if (
-            continuationScanComplete
-            && this.state.mutationLedger.length === 0
-            && !this.shouldStop(result, operationEpoch)
-          ) {
-            const continuationRemote = await this.tryDeltaOrFullScan(
-              operationEpoch,
-              result,
-              plan.scope,
-              continuationScan.entries,
-            );
-            continuationEnvelope = this.state.getCommittedV2Envelope();
-            const refreshedFolderAnchor = remoteId && continuationEnvelope
-              ? Object.values(
-                  continuationEnvelope.folderAnchors?.byAnchorId ?? {},
-                ).find((anchor) => anchor.remoteId === remoteId)
-              : null;
-            if (
-              !continuationEnvelope
-              || !sameSyncScope(continuationRemote.scope, plan.scope)
-              || refreshedFolderAnchor?.lastPath !== targetRoot
-              || this.state.mutationLedger.length > 0
-              || this.shouldStop(result, operationEpoch)
-            ) {
-              continuationEnvelope = null;
-            }
-          } else {
-            continuationEnvelope = null;
-          }
-          const includeContinuationFilePath = (path: string): boolean =>
-            includeCanonicalFilePath(path)
-            && isAtOrBelowPath(
-              normalizeRemotePathKey(path),
-              normalizeRemotePathKey(targetRoot),
-            );
-          let continuationCandidate = continuationEnvelope
-            ? buildCanonicalPlanCandidateV2({
-                envelope: continuationEnvelope,
-                localFiles: continuationScan.entries,
-                localFolders: continuationScan.folders ?? [],
-                localFolderScanComplete: true,
-                skippedLarge: continuationScan.skippedLarge,
-                localMoveHints: this.state.localFolderMoveHints,
-                localFolderDeleteHints: this.state.localFolderDeleteHints,
-                localFileMoveHints: this.state.localFileMoveHints,
-                includeFilePath: includeContinuationFilePath,
-                includeFolderPath: includeCanonicalFolderPath,
-                preserveFolderPath: preserveCanonicalFolderPath,
-                configDir,
-                automaticDeleteLocalFiles:
-                  automaticHandlingPolicy.autoDeleteLocalFiles,
-              })
-            : null;
-          const continuationSourceEnvelope = continuationEnvelope;
-          if (
-            continuationSourceEnvelope
-            && continuationCandidate?.status === "planned"
-            && continuationCandidate.folderPlan.items.length === 0
-          ) {
-            const continuationItems = protectEasySyncSelfSyncPlan(
-              protectCommunityPluginPlan(
-                continuationCandidate.items,
-                communityPluginSyncPolicy,
-                configDir,
-                continuationScan.entries,
-              ),
-              configDir,
-            );
-            continuationCandidate = {
-              ...continuationCandidate,
-              items: continuationItems,
-            };
-            const finalizedContinuation =
-              await finalizeCanonicalPlanCandidateV2({
-                candidate: continuationCandidate,
-                envelope: continuationSourceEnvelope,
-                vaultName: this.vaultName,
-                accountId: this.state.boundAccountId ?? "",
-                configDir: getConfigDir(this.scanner.vault),
-                automaticHandlingPolicy,
-                baselineReconstructionIncomplete: false,
-                pendingContentComparisons: this.state.pendingConflicts.map(
-                  (item) => ({
-                    path: item.path,
-                    contentComparison: item.contentComparison,
-                  }),
-                ),
-                resolveRemoteContentHash: resolveCanonicalRemoteContentHash,
-              });
-            const latestEnvelope = this.state.getCommittedV2Envelope();
-            if (
-              finalizedContinuation.baseUpserts.length === 0
-              && latestEnvelope?.meta.commitSeq
-                === continuationSourceEnvelope.meta.commitSeq
-            ) {
-              const sealedContinuation = sealCanonicalPlanV2({
-                finalized: finalizedContinuation,
-                sourceEnvelope: continuationSourceEnvelope,
-                committedEnvelope: latestEnvelope,
-              });
-              if (sealedContinuation.items.length === 0) {
-                continuationSettled = true;
-              } else {
-                // The reviewed folder move already counted the complete
-                // affected subtree. Reuse that authorization instead of
-                // showing a second threshold prompt for the same operation.
-                this.diag?.log(
-                  "plan",
-                  "V2 folder checkpoint continued with one bounded descendant plan",
-                  {
-                    root: targetRoot,
-                    actions: sealedContinuation.items.length,
-                    sourceCommitSeq,
-                    continuationCommitSeq: latestEnvelope.meta.commitSeq,
-                    mutations: 0,
-                  },
-                );
-                await this.executePlan(
-                  {
-                    items: sealedContinuation.items,
-                    lastTotalFiles: sealedContinuation.lastTotalFiles,
-                    confirmed: true,
-                    scope: { ...sealedContinuation.scope },
-                    canonicalIdentity: sealedContinuation.canonicalIdentity,
-                    canonicalReview: sealedContinuation.canonicalReview,
-                  },
-                  result,
-                  callbacks,
-                  operationEpoch,
-                  automaticHandlingPolicy,
-                  automaticHandlingMetrics,
-                  communityPluginSyncPolicy,
-                );
-                continuationSettled = true;
-              }
-            }
-          }
-        }
-        if (!continuationSettled) {
-          result.deferred = Math.max(1, result.deferred);
-          this.diag?.warn(
-            "plan",
-            "V2 folder checkpoint committed but descendant continuation was not fully proven",
-            { root: targetRoot, mutations: 0 },
-          );
-        }
-      }
-      if (
-        migrationExecutionHold
-        && result.errors === 0
-        && result.deferred === 0
-        && this.state.mutationLedger.length === 0
-      ) {
-        const completed = await this.state.transitionV2MigrationHold(
-          migrationExecutionHold,
-          "completed",
-        );
-        if (!completed) {
-          throw new Error(
-            "V2 migration plan finished but its hold did not complete",
-          );
-        }
-        migrationExecutionHold = completed;
-      }
-      enterPhase("commit");
-      if (this.shouldStop(result, operationEpoch)) return result;
+        canonicalPlanCandidate,
+        remoteEntries,
+        configDir,
+        joinAuthorizationsByPluginId,
+        syncScope,
+        localFolderScanComplete,
+        enterPhase,
+        includeCanonicalFilePath,
+        includeCanonicalFolderPath,
+        preserveCanonicalFolderPath,
+        resolveCanonicalRemoteContentHash,
+        migrationExecutionHold,
+      });
+      if (step8.terminated) return step8.terminated;
+      migrationExecutionHold = step8.migrationExecutionHold;
 
-      if (this.state.remoteGeneration !== this.startGeneration) {
-        result.message = this.t("result.generationMismatch");
-        this.diag?.warn("execute", `generation mismatch after executePlan (${this.startGeneration} → ${this.state.remoteGeneration}), aborting`);
-        return result;
-      }
+      const step9 = await this.runStep9MarkHealthySync({
+        result,
+        operationEpoch,
+        seededBaseEntries,
+        seededBaseEntriesPersisted,
+      });
+      if (step9.terminated) return step9.terminated;
 
-      const detectedCommunityPluginRestores =
-        await this.detectCompletedCommunityPluginRestores(
-          communityPluginSyncPolicy,
-          remoteEntries,
-          configDir,
-          [...joinAuthorizationsByPluginId.keys()],
-        );
-      const completedCommunityPluginFiles =
-        await this.checkpointCompletedCommunityPluginJoinRoots({
-          pluginIds: detectedCommunityPluginRestores.files,
-          authorizationsByPluginId: joinAuthorizationsByPluginId,
-          remoteEntries,
-          scope: syncScope,
-          localFolderScanComplete,
-        });
-      if (
-        completedCommunityPluginFiles.length
-        !== detectedCommunityPluginRestores.files.length
-      ) {
-        result.deferred += detectedCommunityPluginRestores.files.length
-          - completedCommunityPluginFiles.length;
-      }
-      const completedCommunityPluginRestores = {
-        files: completedCommunityPluginFiles,
-        data: detectedCommunityPluginRestores.data,
-      };
-      if (
-        completedCommunityPluginRestores.files.length > 0
-        || completedCommunityPluginRestores.data.length > 0
-      ) {
-        result.communityPluginRestoresCompleted =
-          completedCommunityPluginRestores;
-      }
-
-      // Step 9: Mark healthy sync — only when no conflicts, pending deletes,
-      // errors, deferrals, or auth issues remain. Skips produced by the
-      // user's own configuration (size exclusion, ignored paths) are expected
-      // zero-action outcomes — 2026-09-16 拍板, same contract as
-      // isSyncResultFullyComplete — and must not keep lastSyncTime pinned at
-      // zero for vaults whose settings permanently exclude a few files
-      // (2026-09-19 field report: every round completed, the header still
-      // read "尚未同步").
-      const isHealthy = !result.authExpired
-        && !this.cancelled
-        && this.lifecycle.isCurrent(operationEpoch)
-        && result.errors === 0
-        && result.conflicts === 0
-        && result.deferred === 0;
-      if (isHealthy) {
-        if (
-          seededBaseEntries.length > 0
-          && !seededBaseEntriesPersisted
-        ) {
-          if (this.shouldStop(result, operationEpoch)) return result;
-          await this.persistSeededBaseEntries(seededBaseEntries);
-        }
-        if (this.shouldStop(result, operationEpoch)) return result;
-        await this.state.setLastSyncTime(Date.now());
-        if (this.shouldStop(result, operationEpoch)) return result;
-        await this.state.incrementRemoteGeneration();
-        if (this.shouldStop(result, operationEpoch)) return result;
-        await this.publishHealthyCloudBootstrapV2(
-          operationEpoch,
-        );
-        // Older test doubles and pre-migration state holders do not expose
-        // the optional local layout cleanup hook; sync correctness must not
-        // depend on this housekeeping step.
-        if (typeof (this.state as StateManager & {
-          noteHealthySync?: () => Promise<void>;
-        }).noteHealthySync === "function") {
-          await (this.state as StateManager & {
-            noteHealthySync: () => Promise<void>;
-          }).noteHealthySync();
-        }
-      }
-
-      result.success = !result.authExpired
-        && !this.cancelled
-        && result.errors === 0;
-      const completedUserFileActions =
-        result.uploaded
-        + result.downloaded
-        + result.deleted
-        + (result.foldersCreated ?? 0)
-        + (result.foldersMoved ?? 0)
-        + (result.foldersDeleted ?? 0)
-        + (result.filesMoved ?? 0);
-      result.runFacts!.userFileChanges = completedUserFileActions > 0
-        ? "performed"
-        : result.success
-          && mutationRecordsAtRunStart === 0
-          && this.state.mutationLedger.length === 0
-          ? "none"
-          : "unknown";
-      result.runFacts!.convergences = this.convergencesThisRound || undefined;
-      // Preserve message set by executePlan (e.g. auth expired, cancelled)
-      if (!result.message) {
-        const expectedSkips = result.skippedLarge + result.skippedIgnored;
-        const skipped = expectedSkips + result.skippedInvalidName;
-        const resultKey = result.errors > 0
-          ? "result.partial"
-          : result.conflicts > 0
-            ? "result.conflictsPending"
-            : result.deferred > 0
-              ? "result.deferred"
-              : skipped > 0
-                ? result.skippedInvalidName > 0
-                  ? "result.skipped"
-                  : "result.skippedBySettings"
-                : "result.synced";
-        result.message = this.t(resultKey, {
-          uploaded: result.uploaded,
-          downloaded: result.downloaded,
-          foldersCreated: result.foldersCreated ?? 0,
-          foldersMoved: result.foldersMoved ?? 0,
-          foldersDeleted: result.foldersDeleted ?? 0,
-          filesMoved: result.filesMoved ?? 0,
-          deleted: result.deleted,
-          conflicts: result.conflicts,
-          deferred: result.deferred,
-          skipped,
-          errors: result.errors,
-        });
-      }
+      this.runStep9FinalizeResultSummary({
+        result,
+        mutationRecordsAtRunStart,
+      });
 
     } catch (e) {
       if (isAuthFailure(e)) {
@@ -11138,18 +14062,81 @@ export class SyncExecutor {
         );
       }
 
-      try {
-        this.diag?.log("execute", `[${position}/${total}] ${item.type} ${item.path}`);
-        if (preparedDownload?.error) {
-          throw preparedDownload.error instanceof Error
-            ? preparedDownload.error
-            : new Error(describeThrownValue(preparedDownload.error));
-        }
-        mutationIntent = plan.scope
-          && isMutationAction(item.type)
-          && !item.requiresConfirmation
-          ? this.createMutationIntent(item, plan.scope)
-          : null;
+      /** Run one plan item's execution attempt: persist the mutation intent,
+       *  execute the item, settle its receipt and checkpoint, and record the
+       *  item's completion. The caller's containers are threaded by reference;
+       *  the caller's own phase bindings (mutationIntent, the deferred
+       *  operation id, the delete-completed flag and the transfer outcome) are
+       *  mutated in place for the caller's catch/finally, and a terminal item
+       *  reports its completion back through the returned union. */
+      const runPlanItemExecutionAttempt = async (args: {
+        item: SyncPlanItem;
+        result: SyncResult;
+        itemRemoteUpserts: RemoteFileEntry[];
+        itemRemoteDeletes: string[];
+        remoteUpserts: RemoteFileEntry[];
+        remoteDeletes: string[];
+        metrics: ExecutionMetrics;
+        callbacks: SyncCallbacks;
+        operationEpoch: number;
+        automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
+        isFolderMove: (candidate: SyncPlanItem) => boolean;
+        isFolderDelete: (candidate: SyncPlanItem) => boolean;
+        transferMetrics: FileTransferMetrics | null;
+        transferDirection: "upload" | "download" | null;
+        completedBefore: number;
+        deferUploadCheckpoint: boolean;
+        mutationIntent: MutationIntent | null;
+        preparedDownload: PreparedDownload | undefined;
+        fileSize: number | undefined;
+        localHash: string | undefined;
+        remoteETag: string | undefined;
+        baseUpserts: BaseFileEntry[];
+        baseRemovals: string[];
+        pendingConflicts: SyncPlanItem[];
+        pendingDeletes: SyncPlanItem[];
+        pendingIssues: PendingIssue[];
+        resolvedIssuePaths: Set<string>;
+        settledSkipPaths: Set<string>;
+        skipDeltaDisabled: boolean;
+        skipBaseline: Set<string>;
+      }): Promise<
+        | { terminated: DeferredMutationCompletion | undefined }
+        | { terminated: null }
+      > => {
+        const {
+          item,
+          result,
+          itemRemoteUpserts,
+          itemRemoteDeletes,
+          remoteUpserts,
+          remoteDeletes,
+          metrics,
+          callbacks,
+          operationEpoch,
+          automaticHandlingPolicy,
+          isFolderMove,
+          isFolderDelete,
+          transferMetrics,
+          transferDirection,
+          completedBefore,
+          deferUploadCheckpoint,
+          mutationIntent,
+          preparedDownload,
+          fileSize,
+          localHash,
+          remoteETag,
+          baseUpserts,
+          baseRemovals,
+          pendingConflicts,
+          pendingDeletes,
+          pendingIssues,
+          resolvedIssuePaths,
+          settledSkipPaths,
+          skipDeltaDisabled,
+          skipBaseline,
+        } = args;
+
         if (mutationIntent) {
           const intentStartedAt = Date.now();
           await this.state.beginMutationIntent(mutationIntent);
@@ -11183,51 +14170,18 @@ export class SyncExecutor {
           await this.state.abandonMutationIntent(mutationIntent.operationId);
         }
         if (mutationIntent && itemResult.mutationApplied) {
-          const checkpoint = emptyMutationCheckpoint();
-          checkpoint.remoteUpserts.push(...itemRemoteUpserts.splice(0));
-          checkpoint.remoteDeletes.push(...itemRemoteDeletes.splice(0));
-          if (itemResult.baseUpsert) checkpoint.baseUpserts.push(itemResult.baseUpsert);
-          if (itemResult.baseRemoval) checkpoint.baseRemovals.push(itemResult.baseRemoval);
-          if (itemResult.folderUpsert) checkpoint.folderUpserts = [itemResult.folderUpsert];
-          if (itemResult.folderDelete) checkpoint.folderDeletes = [itemResult.folderDelete];
-          if (
-            isFolderMove(item)
-            || isFolderDelete(item)
-          ) {
-            const remoteId = item.folder?.remoteId;
-            if (remoteId) {
-              checkpoint.folderMoveHintRemovals = isFolderMove(item) && item.renameFrom
-                ? this.folderIdentityIdsAtOrBelow(item.renameFrom)
-                : [remoteId];
-            }
-          }
-          if (automaticHandlingPolicy.autoDeleteLocalFiles
-            && item.type === SyncActionType.DeleteLocal) {
-            checkpoint.pendingDeleteRemovals.push(item.path);
-          }
-          const receipt: MutationReceiptV1 = {
-            version: 1,
-            operationId: mutationIntent.operationId,
-            completedAt: Date.now(),
-            checkpoint,
-          };
-          const receiptStartedAt = Date.now();
-          await this.state.recordMutationReceipt(receipt);
-          this.diag?.log(
-            "state",
-            "mutation receipt persisted after execution",
-            {
-              operationId: mutationIntent.operationId,
-              action: mutationIntent.action,
-              path: mutationIntent.path,
-              completedAt: receipt.completedAt,
-              mutations: 0,
-            },
-          );
-          metrics.mutationPersistence.receiptWrites++;
-          metrics.mutationPersistence.stagesMs.receiptPersist +=
-            Date.now() - receiptStartedAt;
-          if (!this.canContinue(operationEpoch, result)) return;
+          await this.persistPlanItemMutationReceipt({
+            item,
+            itemResult,
+            itemRemoteUpserts,
+            itemRemoteDeletes,
+            mutationIntent,
+            automaticHandlingPolicy,
+            metrics,
+            isFolderMove,
+            isFolderDelete,
+          });
+          if (!this.canContinue(operationEpoch, result)) return { terminated: undefined };
           if (deferUploadCheckpoint && item.type === SyncActionType.Upload) {
             deferredMutationOperationId = mutationIntent.operationId;
           } else {
@@ -11257,7 +14211,7 @@ export class SyncExecutor {
         }
         remoteUpserts.push(...itemRemoteUpserts);
         remoteDeletes.push(...itemRemoteDeletes);
-        if (!this.canContinue(operationEpoch, result)) return;
+        if (!this.canContinue(operationEpoch, result)) return { terminated: undefined };
         if (!itemResult.executed) {
           transferOutcome = transferMetrics ? "skipped" : null;
           if (itemResult.completionReason) {
@@ -11271,7 +14225,7 @@ export class SyncExecutor {
               fileSizeForAction(item, completionActionType),
             );
           }
-          return;
+          return { terminated: undefined };
         }
         if (transferMetrics && transferDirection) {
           const completedAfter = transferDirection === "upload"
@@ -11346,7 +14300,7 @@ export class SyncExecutor {
               : {}),
           });
           callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize);
-          return;
+          return { terminated: undefined };
         }
         if (item.type === SyncActionType.SkipLargeFile) {
           // 2026-09-16 拍板：按设置跳过（大型文件）是预期行为、零行动，
@@ -11368,7 +14322,7 @@ export class SyncExecutor {
               fileSize,
             );
           }
-          return;
+          return { terminated: undefined };
         }
         if (item.type === SyncActionType.SkipOneDriveInvalidName) {
           const reason = item.reason
@@ -11384,7 +14338,7 @@ export class SyncExecutor {
             remoteETag,
           });
           callbacks.onFileComplete?.(item.path, item.type, true, reason, fileSize);
-          return;
+          return { terminated: undefined };
         }
         if (isResolvedIssueAction(item.type)) {
           resolvedIssuePaths.add(item.path);
@@ -11398,12 +14352,14 @@ export class SyncExecutor {
         );
         if (deferredMutationOperationId) {
           return {
-            operationId: deferredMutationOperationId,
-            path: item.path,
-            actionType: completionActionType,
-            reason: itemResult.completionReason,
-            fileSize: completionFileSize,
-            renameFrom: item.renameFrom,
+            terminated: {
+              operationId: deferredMutationOperationId,
+              path: item.path,
+              actionType: completionActionType,
+              reason: itemResult.completionReason,
+              fileSize: completionFileSize,
+              renameFrom: item.renameFrom,
+            },
           };
         }
         if (item.renameFrom) {
@@ -11424,6 +14380,55 @@ export class SyncExecutor {
             completionFileSize,
           );
         }
+
+        return { terminated: null };
+      };
+
+      try {
+        this.diag?.log("execute", `[${position}/${total}] ${item.type} ${item.path}`);
+        if (preparedDownload?.error) {
+          throw preparedDownload.error instanceof Error
+            ? preparedDownload.error
+            : new Error(describeThrownValue(preparedDownload.error));
+        }
+        mutationIntent = plan.scope
+          && isMutationAction(item.type)
+          && !item.requiresConfirmation
+          ? this.createMutationIntent(item, plan.scope)
+          : null;
+        const attempt = await runPlanItemExecutionAttempt({
+          item,
+          result,
+          itemRemoteUpserts,
+          itemRemoteDeletes,
+          remoteUpserts,
+          remoteDeletes,
+          metrics,
+          callbacks,
+          operationEpoch,
+          automaticHandlingPolicy,
+          isFolderMove,
+          isFolderDelete,
+          transferMetrics,
+          transferDirection,
+          completedBefore,
+          deferUploadCheckpoint,
+          mutationIntent,
+          preparedDownload,
+          fileSize,
+          localHash,
+          remoteETag,
+          baseUpserts,
+          baseRemovals,
+          pendingConflicts,
+          pendingDeletes,
+          pendingIssues,
+          resolvedIssuePaths,
+          settledSkipPaths,
+          skipDeltaDisabled,
+          skipBaseline,
+        });
+        if (attempt.terminated !== null) return attempt.terminated;
       } catch (e) {
         let mutationRecovery: SideMutationRecoveryOutcome | null = null;
         let retryableRecoveryObservationError: OneDriveError | null = null;
@@ -11451,69 +14456,14 @@ export class SyncExecutor {
             mutationRecovery = "unresolved";
           }
         } else if (activeIntent && activeRecord?.receipt) {
-          try {
-            if (isV2RemoteUpsertParentMismatchError(e)) {
-              // The hierarchy may have changed after this run's initial
-              // scan. Refresh the committed identity tree once, then retry
-              // the exact receipt against that new tree. This is read-only
-              // recovery; it never rewrites the plan or relaxes the reducer.
-              if (this.activeSyncScope) {
-                await this.rebuildRemoteStateFromIdentitySnapshot(
-                  operationEpoch,
-                  result,
-                  this.activeSyncScope,
-                );
-              }
-              const refreshedRecord = this.state.mutationLedger.find(
-                (entry) => entry.intent.operationId === activeIntent.operationId,
-              ) ?? activeRecord;
-              const rebasedReceipt = await this.rebaseReceiptedUploadParent(refreshedRecord);
-              if (rebasedReceipt) {
-                const receiptStartedAt = Date.now();
-                await this.state.recordMutationReceipt(rebasedReceipt);
-                metrics.mutationPersistence.receiptWrites++;
-                metrics.mutationPersistence.stagesMs.receiptPersist +=
-                  Date.now() - receiptStartedAt;
-                this.diag?.log(
-                  "state",
-                  `rebound same-action upload receipt after remote hierarchy refresh — ${activeIntent.path}`,
-                  { operationId: activeIntent.operationId, mutations: 0 },
-                );
-              }
-            }
-            const checkpointStartedAt = Date.now();
-            try {
-              const checkpointMetrics = await this.commitMutationCheckpoint(
-                activeIntent.operationId,
-              );
-              recordCheckpointMetrics(
-                metrics.mutationPersistence,
-                checkpointMetrics,
-                Date.now() - checkpointStartedAt,
-              );
-            } catch (checkpointError) {
-              metrics.mutationPersistence.checkpointFailures++;
-              metrics.mutationPersistence.stagesMs.checkpointTotal +=
-                Date.now() - checkpointStartedAt;
-              throw checkpointError;
-            }
-            this.diag?.warn(
-              "execute",
-              `recorded mutation checkpoint retried in the same action — ${activeIntent.path}`,
-            );
-            mutationRecovery = "applied";
-          } catch (checkpointError) {
-            const checkpointDetail = checkpointError instanceof Error
-              ? checkpointError.message
-              : String(checkpointError);
-            const dbFingerprint = fingerprintIndexedDbError(checkpointError);
-            this.diag?.warn(
-              "execute",
-              `recorded mutation checkpoint retry failed — ${activeIntent.path}`,
-              dbFingerprint ?? checkpointDetail,
-            );
-            mutationRecovery = "unresolved";
-          }
+          mutationRecovery = await this.recoverReceiptedMutationFailure({
+            error: e,
+            activeIntent,
+            activeRecord,
+            operationEpoch,
+            result,
+            metrics,
+          });
         } else if (activeIntent && activeRecord) {
           const recovery = await this.reconcileFailedMutation(activeIntent);
           mutationRecovery = recovery.outcome;
@@ -11521,50 +14471,29 @@ export class SyncExecutor {
             recovery.retryableObservationError;
         }
         if (mutationRecovery === "applied") {
-          if (!this.canContinue(operationEpoch, result)) {
-            transferOutcome = transferMetrics ? "cancelled" : null;
-            return;
-          }
-          if (item.type === SyncActionType.Upload && result.uploaded === completedBefore) {
-            result.uploaded++;
-            metrics.uploadBytes += Math.max(0, fileSize ?? 0);
-          } else if (item.type === SyncActionType.Download && result.downloaded === completedBefore) {
-            result.downloaded++;
-          } else if (
-            (item.type === SyncActionType.DeleteLocal || item.type === SyncActionType.DeleteRemote)
-            && result.deleted === deletedBefore
-          ) {
-            result.deleted++;
-          } else if (isFolderCreate(item)
-            && (result.foldersCreated ?? 0) === foldersCreatedBefore) {
-            result.foldersCreated = foldersCreatedBefore + 1;
-          } else if (isFolderMove(item)
-            && (result.foldersMoved ?? 0) === foldersMovedBefore) {
-            result.foldersMoved = foldersMovedBefore + 1;
-          } else if (isFolderDelete(item)
-            && (result.foldersDeleted ?? 0) === foldersDeletedBefore) {
-            result.foldersDeleted = foldersDeletedBefore + 1;
-          } else if (
-            (item.type === SyncActionType.MoveLocalFile
-              || (item.type === SyncActionType.RenameRemote
-                && Boolean(item.targetParentRemoteId)))
-            && (result.filesMoved ?? 0) === filesMovedBefore) {
-            result.filesMoved = filesMovedBefore + 1;
-          }
-          if (automaticHandlingPolicy.autoDeleteLocalFiles
-            && item.type === SyncActionType.DeleteLocal
-            && !automaticDeleteCompleted) {
-            metrics.automaticHandling.deleteLocal.completed++;
-            automaticDeleteCompleted = true;
-          }
-          if (transferMetrics) {
-            transferOutcome = "succeeded";
-            transferMetrics.logicalBytes += Math.max(0, fileSize ?? 0);
-          }
-          if (isResolvedIssueAction(item.type)) {
-            resolvedIssuePaths.add(item.path);
-            if (item.renameFrom) resolvedIssuePaths.add(item.renameFrom);
-          }
+          const appliedSettlement = await this.settleAppliedMutationRecovery({
+            operationEpoch,
+            result,
+            transferMetrics,
+            transferOutcome,
+            item,
+            metrics,
+            fileSize,
+            completedBefore,
+            deletedBefore,
+            foldersCreatedBefore,
+            foldersMovedBefore,
+            foldersDeletedBefore,
+            filesMovedBefore,
+            automaticHandlingPolicy,
+            automaticDeleteCompleted,
+            isFolderCreate,
+            isFolderMove,
+            isFolderDelete,
+            resolvedIssuePaths,
+          });
+          transferOutcome = appliedSettlement.transferOutcome;
+          if (appliedSettlement.cancelled) return;
           if (item.renameFrom) {
             callbacks.onFileComplete?.(
               item.path,
@@ -12010,6 +14939,354 @@ export class SyncExecutor {
     // intent/receipt and checkpoint publication below remain strictly serial
     // per file on every platform.
 
+    await this.runDownloadWindow({
+      result,
+      operationEpoch,
+      downloads,
+      downloadPolicy,
+      executePlanItem,
+      preparedCommunityPluginDownloads,
+      metrics,
+    });
+
+    // Step 4 — cleanup (file deletes) after all uploads/downloads. Each
+    // delete is an independent identity/eTag-guarded round trip, so run a
+    // bounded batch to overlap the latency — the previous strict serial loop
+    // made bulk local-delete rounds cost one remote RTT per file. Per-item
+    // fail-closed semantics are unchanged (remote-version changes route to
+    // conflict/defer) and shared state commits stay serialized by the state
+    // queues; folder shells keep their child-first serial order in Step 5.
+    for (
+      let index = 0;
+      index < cleanupItems.length;
+      index += DELETE_CLEANUP_BATCH
+    ) {
+      if (!this.canContinue(operationEpoch, result)) break;
+      const batch = cleanupItems.slice(index, index + DELETE_CLEANUP_BATCH);
+      await Promise.all(batch.map((item) => executePlanItem(item)));
+    }
+
+    // Step 5 — directory shells are removed child-first only after every file
+    // action settled. Deletes at the same path depth are independent, so
+    // each depth layer runs as a bounded batch and a folder is only
+    // attempted after every deeper layer in the plan settled — the previous
+    // strict serial loop serialized sibling folders that share nothing and
+    // paid several round trips per folder on slower links. Each executor
+    // branch still re-lists the target immediately (fail-closed semantics
+    // unchanged; non-empty or drifted folders defer as before).
+    const folderDeleteDepth = (path: string): number => path.split("/").length;
+    const maxFolderDeleteDepth = folderDeletes.reduce(
+      (max, item) => Math.max(max, folderDeleteDepth(item.path)),
+      0,
+    );
+    for (let depth = maxFolderDeleteDepth; depth >= 1; depth--) {
+      if (!this.canContinue(operationEpoch, result)) break;
+      const layer = folderDeletes.filter(
+        (item) => folderDeleteDepth(item.path) === depth,
+      );
+      for (
+        let index = 0;
+        index < layer.length;
+        index += DELETE_CLEANUP_BATCH
+      ) {
+        if (!this.canContinue(operationEpoch, result)) break;
+        const batch = layer.slice(index, index + DELETE_CLEANUP_BATCH);
+        await Promise.all(batch.map((item) => executePlanItem(item)));
+      }
+    }
+
+    if (!this.canContinue(operationEpoch, result)) {
+      this.diag?.log("execute", `sync cancelled after starting ${started}/${total} item(s)`);
+      this.markCancelled(result);
+      return;
+    }
+    if (
+      (this.state.mutationLedger?.length ?? 0) > 0
+      && !this.sameRetainedMutationRecovery(
+        this.state.mutationLedger,
+        retainedMutationRecovery,
+      )
+    ) {
+      throw new Error("Mutation recovery is unresolved; shared state checkpoint stopped");
+    }
+
+    // State-only convergence can observe a newer remote version without
+    // performing a mutation (for example, an If-Match upload race whose
+    // winner already has the local bytes). Publish that remote identity
+    // before a base anchor is allowed to reference its eTag.
+    if (remoteUpserts.length > 0 || remoteDeletes.length > 0) {
+      if (!this.canContinue(operationEpoch, result)) return;
+      await this.state.applyRemoteMutations(remoteUpserts, remoteDeletes);
+    }
+
+    // P1-a: batch persist base entry updates (deferred from per-file calls)
+    if (baseUpserts.length > 0) {
+      if (!this.canContinue(operationEpoch, result)) return;
+      await this.state.upsertBaseEntries(baseUpserts);
+    }
+    if (baseRemovals.length > 0) {
+      if (!this.canContinue(operationEpoch, result)) return;
+      await this.state.removeBaseEntries(baseRemovals);
+    }
+
+    if (pendingConflicts.length > 0) {
+      if (!this.canContinue(operationEpoch, result)) return;
+      await this.state.upsertPendingConflicts(pendingConflicts);
+    }
+    if (pendingDeletes.length > 0) {
+      if (!this.canContinue(operationEpoch, result)) return;
+      await this.state.upsertPendingDeletes(pendingDeletes);
+    }
+    if (!this.canContinue(operationEpoch, result)) return;
+    await this.state.reconcilePendingIssues(pendingIssues, resolvedIssuePaths);
+    // 镜像覆写：基准=本轮结算全集（文件改名/回线/删除自动掉出）。失败轮
+    // 走不到这里，基准保留；取消/鉴权过期同样跳过覆写，下轮自愈。
+    if (!skipDeltaDisabled && this.canContinue(operationEpoch, result)) {
+      await this.state.commitSizeExclusionBaseline?.([...settledSkipPaths]);
+    }
+    // 附带修正：skippedLarge 此前只来自扫描层，下载方向 gated 跳过不计入
+    // 总数；结算全集（扫描层+gated 的去重并集）才是真实跳过总量。
+    if (settledSkipPaths.size > result.skippedLarge) {
+      result.skippedLarge = settledSkipPaths.size;
+    }
+    this.diag?.log(
+      "execute",
+      `upload summary — files=${result.uploaded}, bytes=${metrics.uploadBytes}, peak=${metrics.peakUploads}/${(Platform.isMobile ? 2 : 4) + largeUploadConcurrency(Platform.isMobile)}, readMs=${metrics.uploadReadMs}, networkMs=${metrics.uploadNetworkMs}, elapsedMs=${Date.now() - startedAt}`,
+    );
+
+  }
+
+  /** Retry the recorded mutation checkpoint in the same action when the
+   *  failed intent already has a receipt: the receipt proves the target
+   *  change landed, so only the checkpoint commit is replayed, with one
+   *  read-only remote-hierarchy rebase for the upload-parent mismatch. */
+  private async recoverReceiptedMutationFailure(args: RecoverReceiptedMutationFailureArgs): Promise<SideMutationRecoveryOutcome> {
+    const { error, activeIntent, activeRecord, operationEpoch, result, metrics } = args;
+    try {
+      if (isV2RemoteUpsertParentMismatchError(error)) {
+        // The hierarchy may have changed after this run's initial
+        // scan. Refresh the committed identity tree once, then retry
+        // the exact receipt against that new tree. This is read-only
+        // recovery; it never rewrites the plan or relaxes the reducer.
+        if (this.activeSyncScope) {
+          await this.rebuildRemoteStateFromIdentitySnapshot(
+            operationEpoch,
+            result,
+            this.activeSyncScope,
+          );
+        }
+        const refreshedRecord = this.state.mutationLedger.find(
+          (entry) => entry.intent.operationId === activeIntent.operationId,
+        ) ?? activeRecord;
+        const rebasedReceipt = await this.rebaseReceiptedUploadParent(refreshedRecord);
+        if (rebasedReceipt) {
+          const receiptStartedAt = Date.now();
+          await this.state.recordMutationReceipt(rebasedReceipt);
+          metrics.mutationPersistence.receiptWrites++;
+          metrics.mutationPersistence.stagesMs.receiptPersist +=
+            Date.now() - receiptStartedAt;
+          this.diag?.log(
+            "state",
+            `rebound same-action upload receipt after remote hierarchy refresh — ${activeIntent.path}`,
+            { operationId: activeIntent.operationId, mutations: 0 },
+          );
+        }
+      }
+      const checkpointStartedAt = Date.now();
+      try {
+        const checkpointMetrics = await this.commitMutationCheckpoint(
+          activeIntent.operationId,
+        );
+        recordCheckpointMetrics(
+          metrics.mutationPersistence,
+          checkpointMetrics,
+          Date.now() - checkpointStartedAt,
+        );
+      } catch (checkpointError) {
+        metrics.mutationPersistence.checkpointFailures++;
+        metrics.mutationPersistence.stagesMs.checkpointTotal +=
+          Date.now() - checkpointStartedAt;
+        throw checkpointError;
+      }
+      this.diag?.warn(
+        "execute",
+        `recorded mutation checkpoint retried in the same action — ${activeIntent.path}`,
+      );
+      return "applied";
+    } catch (checkpointError) {
+      const checkpointDetail = checkpointError instanceof Error
+        ? checkpointError.message
+        : String(checkpointError);
+      const dbFingerprint = fingerprintIndexedDbError(checkpointError);
+      this.diag?.warn(
+        "execute",
+        `recorded mutation checkpoint retry failed — ${activeIntent.path}`,
+        dbFingerprint ?? checkpointDetail,
+      );
+      return "unresolved";
+    }
+  }
+
+  /** Settle the recovery-shape side effects of an applied mutation whose
+   *  checkpoint was replayed: count the item, keep the automatic-delete and
+   *  resolved-issue ledgers in step, and return the transfer outcome the
+   *  caller's finally has to publish. The success callbacks stay with the
+   *  caller, which owns the item's completion row. */
+  private async settleAppliedMutationRecovery(args: SettleAppliedMutationRecoveryArgs): Promise<SettleAppliedMutationRecoveryOutcome> {
+    const {
+      operationEpoch, result, transferMetrics, item,
+      metrics, fileSize, completedBefore, deletedBefore,
+      foldersCreatedBefore, foldersMovedBefore, foldersDeletedBefore, filesMovedBefore,
+      automaticHandlingPolicy, isFolderCreate, isFolderMove,
+      isFolderDelete, resolvedIssuePaths,
+    } = args;
+    let transferOutcome = args.transferOutcome;
+    let automaticDeleteCompleted = args.automaticDeleteCompleted;
+    if (!this.canContinue(operationEpoch, result)) {
+      transferOutcome = transferMetrics ? "cancelled" : null;
+      return { cancelled: true, transferOutcome };
+    }
+    if (item.type === SyncActionType.Upload && result.uploaded === completedBefore) {
+      result.uploaded++;
+      metrics.uploadBytes += Math.max(0, fileSize ?? 0);
+    } else if (item.type === SyncActionType.Download && result.downloaded === completedBefore) {
+      result.downloaded++;
+    } else if (
+      (item.type === SyncActionType.DeleteLocal || item.type === SyncActionType.DeleteRemote)
+      && result.deleted === deletedBefore
+    ) {
+      result.deleted++;
+    } else if (isFolderCreate(item)
+      && (result.foldersCreated ?? 0) === foldersCreatedBefore) {
+      result.foldersCreated = foldersCreatedBefore + 1;
+    } else if (isFolderMove(item)
+      && (result.foldersMoved ?? 0) === foldersMovedBefore) {
+      result.foldersMoved = foldersMovedBefore + 1;
+    } else if (isFolderDelete(item)
+      && (result.foldersDeleted ?? 0) === foldersDeletedBefore) {
+      result.foldersDeleted = foldersDeletedBefore + 1;
+    } else if (
+      (item.type === SyncActionType.MoveLocalFile
+        || (item.type === SyncActionType.RenameRemote
+          && Boolean(item.targetParentRemoteId)))
+      && (result.filesMoved ?? 0) === filesMovedBefore) {
+      result.filesMoved = filesMovedBefore + 1;
+    }
+    if (automaticHandlingPolicy.autoDeleteLocalFiles
+      && item.type === SyncActionType.DeleteLocal
+      && !automaticDeleteCompleted) {
+      metrics.automaticHandling.deleteLocal.completed++;
+      automaticDeleteCompleted = true;
+    }
+    if (transferMetrics) {
+      transferOutcome = "succeeded";
+      transferMetrics.logicalBytes += Math.max(0, fileSize ?? 0);
+    }
+    if (isResolvedIssueAction(item.type)) {
+      resolvedIssuePaths.add(item.path);
+      if (item.renameFrom) resolvedIssuePaths.add(item.renameFrom);
+    }
+    return { cancelled: false, transferOutcome };
+  }
+
+  /** Build the mutation checkpoint from the item's committed effects and
+   *  persist the applied mutation's receipt before the checkpoint commit is
+   *  decided; every input is read-only. */
+  private async persistPlanItemMutationReceipt(args: {
+    item: SyncPlanItem;
+    itemResult: ItemExecutionResult;
+    itemRemoteUpserts: RemoteFileEntry[];
+    itemRemoteDeletes: string[];
+    mutationIntent: MutationIntent;
+    automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
+    metrics: ExecutionMetrics;
+    isFolderMove: (candidate: SyncPlanItem) => boolean;
+    isFolderDelete: (candidate: SyncPlanItem) => boolean;
+  }): Promise<void> {
+    const {
+      item,
+      itemResult,
+      itemRemoteUpserts,
+      itemRemoteDeletes,
+      mutationIntent,
+      automaticHandlingPolicy,
+      metrics,
+      isFolderMove,
+      isFolderDelete,
+    } = args;
+    const checkpoint = emptyMutationCheckpoint();
+    checkpoint.remoteUpserts.push(...itemRemoteUpserts.splice(0));
+    checkpoint.remoteDeletes.push(...itemRemoteDeletes.splice(0));
+    if (itemResult.baseUpsert) checkpoint.baseUpserts.push(itemResult.baseUpsert);
+    if (itemResult.baseRemoval) checkpoint.baseRemovals.push(itemResult.baseRemoval);
+    if (itemResult.folderUpsert) checkpoint.folderUpserts = [itemResult.folderUpsert];
+    if (itemResult.folderDelete) checkpoint.folderDeletes = [itemResult.folderDelete];
+    if (
+      isFolderMove(item)
+      || isFolderDelete(item)
+    ) {
+      const remoteId = item.folder?.remoteId;
+      if (remoteId) {
+        checkpoint.folderMoveHintRemovals = isFolderMove(item) && item.renameFrom
+          ? this.folderIdentityIdsAtOrBelow(item.renameFrom)
+          : [remoteId];
+      }
+    }
+    if (automaticHandlingPolicy.autoDeleteLocalFiles
+      && item.type === SyncActionType.DeleteLocal) {
+      checkpoint.pendingDeleteRemovals.push(item.path);
+    }
+    const receipt: MutationReceiptV1 = {
+      version: 1,
+      operationId: mutationIntent.operationId,
+      completedAt: Date.now(),
+      checkpoint,
+    };
+    const receiptStartedAt = Date.now();
+    await this.state.recordMutationReceipt(receipt);
+    this.diag?.log(
+      "state",
+      "mutation receipt persisted after execution",
+      {
+        operationId: mutationIntent.operationId,
+        action: mutationIntent.action,
+        path: mutationIntent.path,
+        completedAt: receipt.completedAt,
+        mutations: 0,
+      },
+    );
+    metrics.mutationPersistence.receiptWrites++;
+    metrics.mutationPersistence.stagesMs.receiptPersist +=
+      Date.now() - receiptStartedAt;
+  }
+
+  /** Step 3b download window: overlap only the read-only network stage of
+   *  independent small downloads; local CAS, temp verification, intent/
+   *  receipt and checkpoint publication stay strictly serial per file. */
+  private async runDownloadWindow(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    downloads: SyncPlanItem[];
+    downloadPolicy: DownloadConcurrencyPolicy;
+    executePlanItem: (
+      item: SyncPlanItem,
+      preparedDownload?: PreparedDownload,
+      deferUploadCheckpoint?: boolean,
+    ) => Promise<DeferredMutationCompletion | undefined>;
+    preparedCommunityPluginDownloads: Awaited<
+      ReturnType<SyncExecutor["prepareCommunityPluginBundleDownloads"]>
+    >;
+    metrics: ExecutionMetrics;
+  }): Promise<void> {
+    const {
+      result,
+      operationEpoch,
+      downloads,
+      downloadPolicy,
+      executePlanItem,
+      preparedCommunityPluginDownloads,
+      metrics,
+    } = args;
     let downloadIndex = 0;
     while (downloadIndex < downloads.length && this.canContinue(operationEpoch, result)) {
       const first = downloads[downloadIndex];
@@ -12207,113 +15484,8 @@ export class SyncExecutor {
         await executePlanItem(batch[index], prepared[index]);
       }
     }
-
-    // Step 4 — cleanup (file deletes) after all uploads/downloads. Each
-    // delete is an independent identity/eTag-guarded round trip, so run a
-    // bounded batch to overlap the latency — the previous strict serial loop
-    // made bulk local-delete rounds cost one remote RTT per file. Per-item
-    // fail-closed semantics are unchanged (remote-version changes route to
-    // conflict/defer) and shared state commits stay serialized by the state
-    // queues; folder shells keep their child-first serial order in Step 5.
-    for (
-      let index = 0;
-      index < cleanupItems.length;
-      index += DELETE_CLEANUP_BATCH
-    ) {
-      if (!this.canContinue(operationEpoch, result)) break;
-      const batch = cleanupItems.slice(index, index + DELETE_CLEANUP_BATCH);
-      await Promise.all(batch.map((item) => executePlanItem(item)));
-    }
-
-    // Step 5 — directory shells are removed child-first only after every file
-    // action settled. Deletes at the same path depth are independent, so
-    // each depth layer runs as a bounded batch and a folder is only
-    // attempted after every deeper layer in the plan settled — the previous
-    // strict serial loop serialized sibling folders that share nothing and
-    // paid several round trips per folder on slower links. Each executor
-    // branch still re-lists the target immediately (fail-closed semantics
-    // unchanged; non-empty or drifted folders defer as before).
-    const folderDeleteDepth = (path: string): number => path.split("/").length;
-    const maxFolderDeleteDepth = folderDeletes.reduce(
-      (max, item) => Math.max(max, folderDeleteDepth(item.path)),
-      0,
-    );
-    for (let depth = maxFolderDeleteDepth; depth >= 1; depth--) {
-      if (!this.canContinue(operationEpoch, result)) break;
-      const layer = folderDeletes.filter(
-        (item) => folderDeleteDepth(item.path) === depth,
-      );
-      for (
-        let index = 0;
-        index < layer.length;
-        index += DELETE_CLEANUP_BATCH
-      ) {
-        if (!this.canContinue(operationEpoch, result)) break;
-        const batch = layer.slice(index, index + DELETE_CLEANUP_BATCH);
-        await Promise.all(batch.map((item) => executePlanItem(item)));
-      }
-    }
-
-    if (!this.canContinue(operationEpoch, result)) {
-      this.diag?.log("execute", `sync cancelled after starting ${started}/${total} item(s)`);
-      this.markCancelled(result);
-      return;
-    }
-    if (
-      (this.state.mutationLedger?.length ?? 0) > 0
-      && !this.sameRetainedMutationRecovery(
-        this.state.mutationLedger,
-        retainedMutationRecovery,
-      )
-    ) {
-      throw new Error("Mutation recovery is unresolved; shared state checkpoint stopped");
-    }
-
-    // State-only convergence can observe a newer remote version without
-    // performing a mutation (for example, an If-Match upload race whose
-    // winner already has the local bytes). Publish that remote identity
-    // before a base anchor is allowed to reference its eTag.
-    if (remoteUpserts.length > 0 || remoteDeletes.length > 0) {
-      if (!this.canContinue(operationEpoch, result)) return;
-      await this.state.applyRemoteMutations(remoteUpserts, remoteDeletes);
-    }
-
-    // P1-a: batch persist base entry updates (deferred from per-file calls)
-    if (baseUpserts.length > 0) {
-      if (!this.canContinue(operationEpoch, result)) return;
-      await this.state.upsertBaseEntries(baseUpserts);
-    }
-    if (baseRemovals.length > 0) {
-      if (!this.canContinue(operationEpoch, result)) return;
-      await this.state.removeBaseEntries(baseRemovals);
-    }
-
-    if (pendingConflicts.length > 0) {
-      if (!this.canContinue(operationEpoch, result)) return;
-      await this.state.upsertPendingConflicts(pendingConflicts);
-    }
-    if (pendingDeletes.length > 0) {
-      if (!this.canContinue(operationEpoch, result)) return;
-      await this.state.upsertPendingDeletes(pendingDeletes);
-    }
-    if (!this.canContinue(operationEpoch, result)) return;
-    await this.state.reconcilePendingIssues(pendingIssues, resolvedIssuePaths);
-    // 镜像覆写：基准=本轮结算全集（文件改名/回线/删除自动掉出）。失败轮
-    // 走不到这里，基准保留；取消/鉴权过期同样跳过覆写，下轮自愈。
-    if (!skipDeltaDisabled && this.canContinue(operationEpoch, result)) {
-      await this.state.commitSizeExclusionBaseline?.([...settledSkipPaths]);
-    }
-    // 附带修正：skippedLarge 此前只来自扫描层，下载方向 gated 跳过不计入
-    // 总数；结算全集（扫描层+gated 的去重并集）才是真实跳过总量。
-    if (settledSkipPaths.size > result.skippedLarge) {
-      result.skippedLarge = settledSkipPaths.size;
-    }
-    this.diag?.log(
-      "execute",
-      `upload summary — files=${result.uploaded}, bytes=${metrics.uploadBytes}, peak=${metrics.peakUploads}/${(Platform.isMobile ? 2 : 4) + largeUploadConcurrency(Platform.isMobile)}, readMs=${metrics.uploadReadMs}, networkMs=${metrics.uploadNetworkMs}, elapsedMs=${Date.now() - startedAt}`,
-    );
-
   }
+
 
   /** Reconcile every durable mutation record before reading a cursor or planning. */
   private resolveCurrentFolderParent(
@@ -12429,6 +15601,46 @@ export class SyncExecutor {
   }
 
   private createMutationIntent(item: SyncPlanItem, scope: SyncScope): MutationIntent {
+    const folderIntent = this.createFolderMutationIntent({ item, scope });
+    if (folderIntent.terminated) return folderIntent.terminated;
+    return {
+      version: 1,
+      operationId: `${Date.now()}-${++this.mutationSequence}-${item.type}`,
+      planRevision: this.state.planReviewRevision,
+      scope: { ...scope },
+      action: item.type === SyncActionType.DeleteRemote
+        ? "deleteRemote"
+        : item.type === SyncActionType.DeleteLocal
+          ? "deleteLocal"
+        : item.type === SyncActionType.RenameRemote
+          ? "renameRemote"
+          : item.type === SyncActionType.MoveLocalFile
+            ? "moveLocal"
+          : item.type === SyncActionType.Download
+            ? "download"
+            : "upload",
+      path: item.path,
+      sourcePath: item.renameFrom,
+      expectedLocal: item.local
+        ? { exists: true, hash: item.local.hash, size: item.local.size }
+        : { exists: false },
+      expectedRemote: item.remote
+        ? {
+            exists: true,
+            driveId: item.remote.driveId,
+            eTag: item.remote.eTag,
+            size: item.remote.size,
+            sha256Hash: item.remote.sha256Hash,
+          }
+        : { exists: false },
+      createdAt: Date.now(),
+    };
+  }
+
+  /** V2 folder-mutation intent branch of createMutationIntent — moved
+   *  verbatim; the folder intent terminates the caller's builder. */
+  private createFolderMutationIntent(args: CreateFolderMutationIntentArgs): CreateFolderMutationIntentOutcome {
+    const { item, scope } = args;
     if (isFolderMutationAction(item.type)) {
       if (!item.folder) {
         throw new Error(`Folder mutation has no identity metadata: ${item.path}`);
@@ -12459,7 +15671,7 @@ export class SyncExecutor {
       if ((moveLocal || moveRemote || deleteLocal || deleteRemote) && !item.folder.remoteId) {
         throw new Error(`Folder mutation has no committed identity: ${item.path}`);
       }
-      return {
+      return { terminated: {
         version: 2,
         operationId: `${Date.now()}-${++this.mutationSequence}-${item.type}`,
         planRevision: this.state.planReviewRevision,
@@ -12498,40 +15710,9 @@ export class SyncExecutor {
           eTag: parent.eTag,
         },
         createdAt: Date.now(),
-      };
+      } };
     }
-    return {
-      version: 1,
-      operationId: `${Date.now()}-${++this.mutationSequence}-${item.type}`,
-      planRevision: this.state.planReviewRevision,
-      scope: { ...scope },
-      action: item.type === SyncActionType.DeleteRemote
-        ? "deleteRemote"
-        : item.type === SyncActionType.DeleteLocal
-          ? "deleteLocal"
-        : item.type === SyncActionType.RenameRemote
-          ? "renameRemote"
-          : item.type === SyncActionType.MoveLocalFile
-            ? "moveLocal"
-          : item.type === SyncActionType.Download
-            ? "download"
-            : "upload",
-      path: item.path,
-      sourcePath: item.renameFrom,
-      expectedLocal: item.local
-        ? { exists: true, hash: item.local.hash, size: item.local.size }
-        : { exists: false },
-      expectedRemote: item.remote
-        ? {
-            exists: true,
-            driveId: item.remote.driveId,
-            eTag: item.remote.eTag,
-            size: item.remote.size,
-            sha256Hash: item.remote.sha256Hash,
-          }
-        : { exists: false },
-      createdAt: Date.now(),
-    };
+    return { terminated: null };
   }
 
   private createSideMutationIntent(
@@ -13038,150 +16219,16 @@ export class SyncExecutor {
     }
 
     if (!allTarget) {
-      if (
-        !allOriginal
-        || !allowExternalMutation
-        || operationEpoch === undefined
-        || !this.canContinue(operationEpoch)
-      ) {
-        throw new Error(
-          `Community plugin bundle waits for its authorized continuation: ${record.intent.operationId}`,
-        );
-      }
-      const downloadedByPath = new Map<string, ArrayBuffer>();
-      for (const [memberIndex, member] of settlement.members.entries()) {
-        this.advanceBundleSettlementProgress(
-          settlement,
-          memberIndex + 1,
-          member.intent.path,
-          SyncActionType.Download,
-        );
-        const remote = remoteByPath.get(member.intent.path);
-        if (!remote) continue;
-        const expected = member.intent.expectedRemote;
-        if (!expected.exists || !expected.sha256Hash) {
-          throw new Error(
-            `Community plugin bundle remote proof is incomplete: ${member.intent.path}`,
-          );
-        }
-        const bytes = await this.onedrive.downloadFile(
-          this.vaultName,
-          member.intent.path,
-          remote.downloadUrl,
-          remote.driveId,
-          remote.size,
-        );
-        const hash = await sha256Hex(bytes);
-        if (bytes.byteLength !== expected.size || hash !== expected.sha256Hash) {
-          throw new Error(
-            `Community plugin bundle download verification failed: ${member.intent.path}`,
-          );
-        }
-        downloadedByPath.set(member.intent.path, bytes);
-      }
-
-      // The reviewed remote identities and every local source must still be
-      // exact after all network reads and immediately before the first write.
-      for (const member of settlement.members) {
-        await this.inspectCommunityPluginBundleRemote(member.intent);
-        const local = await this.inspectLocalPath(member.intent.path, {
-          allowExcludedForRecovery: true,
-        });
-        if (
-          !local
-          || local.status === "uncertain"
-          || !this.inspectionMatchesExpectation(local, member.intent.expectedLocal)
-        ) {
-          throw new Error(
-            `Community plugin bundle changed before replacement: ${member.intent.path}`,
-          );
-        }
-        localByPath.set(member.intent.path, local);
-      }
-      if (!this.canContinue(operationEpoch)) {
-        throw new Error(
-          `Community plugin bundle replacement was cancelled: ${record.intent.operationId}`,
-        );
-      }
-
-      const originalByPath = new Map<string, ArrayBuffer | null>();
-      for (const member of settlement.members) {
-        const local = localByPath.get(member.intent.path)!;
-        if (local.status !== "present") {
-          originalByPath.set(member.intent.path, null);
-          continue;
-        }
-        if (!local.entry) {
-          throw new Error(
-            `Community plugin bundle local proof is incomplete: ${member.intent.path}`,
-          );
-        }
-        const bytes = await this.scanner.vault.adapter.readBinary(member.intent.path);
-        if (
-          bytes.byteLength !== local.entry.size
-          || await sha256Hex(bytes) !== local.entry.hash
-        ) {
-          throw new Error(
-            `Community plugin bundle local source changed: ${member.intent.path}`,
-          );
-        }
-        originalByPath.set(member.intent.path, bytes);
-      }
-
-      const journal = this.getRecoveryJournal();
-      await journal.prepareCopiedBundleOriginals(settlement.members.map((member) => {
-        const local = localByPath.get(member.intent.path)!;
-        const expected = local.status === "present" ? local.entry : undefined;
-        const remote = member.intent.expectedRemote;
-        return {
-          targetPath: member.intent.path,
-          expected,
-          original: originalByPath.get(member.intent.path) ?? null,
-          downloaded: remote.exists
-            ? { hash: remote.sha256Hash!, size: remote.size }
-            : null,
-        };
-      }));
-      onExternalMutation?.();
-      try {
-        const membersInCommitOrder = [...settlement.members].sort((left, right) => {
-          const leftManifest = left.intent.path.endsWith("/manifest.json") ? 1 : 0;
-          const rightManifest = right.intent.path.endsWith("/manifest.json") ? 1 : 0;
-          return leftManifest - rightManifest
-            || left.intent.path.localeCompare(right.intent.path);
-        });
-        for (const member of membersInCommitOrder) {
-          const content = downloadedByPath.get(member.intent.path);
-          if (content) {
-            await this.ensureParentDirs(member.intent.path);
-            await this.writeBinaryTempFileWithAndroidZeroByteRetry(
-              member.intent.path,
-              member.intent.path,
-              content,
-            );
-          } else if (await this.scanner.vault.adapter.exists(member.intent.path)) {
-            await this.scanner.vault.adapter.remove(member.intent.path);
-          }
-        }
-        for (const member of settlement.members) {
-          const local = await this.inspectLocalPath(member.intent.path, {
-            allowExcludedForRecovery: true,
-          });
-          if (
-            !local
-            || local.status === "uncertain"
-            || !this.communityPluginBundleLocalMatchesTarget(local, member.intent)
-          ) {
-            throw new Error(
-              `Community plugin bundle local read-back failed: ${member.intent.path}`,
-            );
-          }
-        }
-        await journal.complete();
-      } catch (error) {
-        await journal.recover();
-        throw error;
-      }
+      await this.applyCommunityPluginBundleSettlementReplacement({
+        record,
+        settlement,
+        operationEpoch,
+        allowExternalMutation,
+        onExternalMutation,
+        localByPath,
+        remoteByPath,
+        allOriginal,
+      });
     }
 
     const nextReceipts = await this.buildCommunityPluginBundleSettlementReceipts(
@@ -13208,6 +16255,178 @@ export class SyncExecutor {
     }
     await this.verifyCommunityPluginBundleSettlementTarget(updated);
     await this.state.commitCommunityPluginBundleSettlementCheckpoint(updated);
+  }
+
+  /** Replace every member of a reviewed whole-plugin settlement from the
+   *  cloud: download and verify each member's remote bytes, snapshot the
+   *  local originals into the recovery journal, write the members in commit
+   *  order (manifest last), read the result back, then complete the journal
+   *  (rolling it back on any failure). The caller keeps the reviewed
+   *  direction; every collection is the caller's own object. */
+  private async applyCommunityPluginBundleSettlementReplacement(args: {
+    record: Readonly<MutationLedgerEntryV1>;
+    settlement: Readonly<CommunityPluginBundleSettlementV2>;
+    operationEpoch: number | undefined;
+    allowExternalMutation: boolean;
+    onExternalMutation?: () => void;
+    localByPath: Map<string, LocalFileInspection>;
+    remoteByPath: Map<string, RemoteFileEntry | undefined>;
+    allOriginal: boolean;
+  }): Promise<void> {
+    const {
+      record,
+      settlement,
+      operationEpoch,
+      allowExternalMutation,
+      onExternalMutation,
+      localByPath,
+      remoteByPath,
+      allOriginal,
+    } = args;
+    if (
+      !allOriginal
+      || !allowExternalMutation
+      || operationEpoch === undefined
+      || !this.canContinue(operationEpoch)
+    ) {
+      throw new Error(
+        `Community plugin bundle waits for its authorized continuation: ${record.intent.operationId}`,
+      );
+    }
+    const downloadedByPath = new Map<string, ArrayBuffer>();
+    for (const [memberIndex, member] of settlement.members.entries()) {
+      this.advanceBundleSettlementProgress(
+        settlement,
+        memberIndex + 1,
+        member.intent.path,
+        SyncActionType.Download,
+      );
+      const remote = remoteByPath.get(member.intent.path);
+      if (!remote) continue;
+      const expected = member.intent.expectedRemote;
+      if (!expected.exists || !expected.sha256Hash) {
+        throw new Error(
+          `Community plugin bundle remote proof is incomplete: ${member.intent.path}`,
+        );
+      }
+      const bytes = await this.onedrive.downloadFile(
+        this.vaultName,
+        member.intent.path,
+        remote.downloadUrl,
+        remote.driveId,
+        remote.size,
+      );
+      const hash = await sha256Hex(bytes);
+      if (bytes.byteLength !== expected.size || hash !== expected.sha256Hash) {
+        throw new Error(
+          `Community plugin bundle download verification failed: ${member.intent.path}`,
+        );
+      }
+      downloadedByPath.set(member.intent.path, bytes);
+    }
+
+    // The reviewed remote identities and every local source must still be
+    // exact after all network reads and immediately before the first write.
+    for (const member of settlement.members) {
+      await this.inspectCommunityPluginBundleRemote(member.intent);
+      const local = await this.inspectLocalPath(member.intent.path, {
+        allowExcludedForRecovery: true,
+      });
+      if (
+        !local
+        || local.status === "uncertain"
+        || !this.inspectionMatchesExpectation(local, member.intent.expectedLocal)
+      ) {
+        throw new Error(
+          `Community plugin bundle changed before replacement: ${member.intent.path}`,
+        );
+      }
+      localByPath.set(member.intent.path, local);
+    }
+    if (!this.canContinue(operationEpoch)) {
+      throw new Error(
+        `Community plugin bundle replacement was cancelled: ${record.intent.operationId}`,
+      );
+    }
+
+    const originalByPath = new Map<string, ArrayBuffer | null>();
+    for (const member of settlement.members) {
+      const local = localByPath.get(member.intent.path)!;
+      if (local.status !== "present") {
+        originalByPath.set(member.intent.path, null);
+        continue;
+      }
+      if (!local.entry) {
+        throw new Error(
+          `Community plugin bundle local proof is incomplete: ${member.intent.path}`,
+        );
+      }
+      const bytes = await this.scanner.vault.adapter.readBinary(member.intent.path);
+      if (
+        bytes.byteLength !== local.entry.size
+        || await sha256Hex(bytes) !== local.entry.hash
+      ) {
+        throw new Error(
+          `Community plugin bundle local source changed: ${member.intent.path}`,
+        );
+      }
+      originalByPath.set(member.intent.path, bytes);
+    }
+
+    const journal = this.getRecoveryJournal();
+    await journal.prepareCopiedBundleOriginals(settlement.members.map((member) => {
+      const local = localByPath.get(member.intent.path)!;
+      const expected = local.status === "present" ? local.entry : undefined;
+      const remote = member.intent.expectedRemote;
+      return {
+        targetPath: member.intent.path,
+        expected,
+        original: originalByPath.get(member.intent.path) ?? null,
+        downloaded: remote.exists
+          ? { hash: remote.sha256Hash!, size: remote.size }
+          : null,
+      };
+    }));
+    onExternalMutation?.();
+    try {
+      const membersInCommitOrder = [...settlement.members].sort((left, right) => {
+        const leftManifest = left.intent.path.endsWith("/manifest.json") ? 1 : 0;
+        const rightManifest = right.intent.path.endsWith("/manifest.json") ? 1 : 0;
+        return leftManifest - rightManifest
+          || left.intent.path.localeCompare(right.intent.path);
+      });
+      for (const member of membersInCommitOrder) {
+        const content = downloadedByPath.get(member.intent.path);
+        if (content) {
+          await this.ensureParentDirs(member.intent.path);
+          await this.writeBinaryTempFileWithAndroidZeroByteRetry(
+            member.intent.path,
+            member.intent.path,
+            content,
+          );
+        } else if (await this.scanner.vault.adapter.exists(member.intent.path)) {
+          await this.scanner.vault.adapter.remove(member.intent.path);
+        }
+      }
+      for (const member of settlement.members) {
+        const local = await this.inspectLocalPath(member.intent.path, {
+          allowExcludedForRecovery: true,
+        });
+        if (
+          !local
+          || local.status === "uncertain"
+          || !this.communityPluginBundleLocalMatchesTarget(local, member.intent)
+        ) {
+          throw new Error(
+            `Community plugin bundle local read-back failed: ${member.intent.path}`,
+          );
+        }
+      }
+      await journal.complete();
+    } catch (error) {
+      await journal.recover();
+      throw error;
+    }
   }
 
   private async resumeCommunityPluginKeepLocalSettlement(
@@ -13658,6 +16877,48 @@ export class SyncExecutor {
     this.activeRunMetrics = metrics;
     const remoteUpserts: RemoteFileEntry[] = [];
     const remoteDeletes: string[] = [];
+    await this.deferPersistedPluginUploadDowngradeToReview({
+      intent,
+      item,
+      result,
+      operationEpoch,
+    });
+    const executed = await this.executeItem(
+      item,
+      result,
+      remoteUpserts,
+      remoteDeletes,
+      metrics,
+      { onFileProgress: (bytes, total) => this.updateSideActionProgress(bytes, total) },
+      operationEpoch,
+      this.automaticHandlingPolicy,
+      undefined,
+      "throw",
+      this.isPersistedPluginDataDownloadSettlement(intent),
+    );
+    if (!executed.executed || !executed.mutationApplied) {
+      throw new MutationNotAppliedError(new Error("Manual mutation was not applied"));
+    }
+    if (intent.stateEffect === "settlement-only") {
+      return emptyMutationCheckpoint();
+    }
+    const checkpoint = emptyMutationCheckpoint();
+    checkpoint.remoteUpserts.push(...remoteUpserts);
+    checkpoint.remoteDeletes.push(...remoteDeletes);
+    if (executed.baseUpsert) checkpoint.baseUpserts.push(executed.baseUpsert);
+    if (executed.baseRemoval) checkpoint.baseRemovals.push(executed.baseRemoval);
+    if (intent.action === "upload" && intent.sourcePath) {
+      checkpoint.baseRemovals.push(intent.sourcePath);
+      checkpoint.remoteDeletes.push(intent.sourcePath);
+    }
+    return checkpoint;
+  }
+
+  /** Persisted plugin-bundle upload recovery downgrade pass of
+   *  executeManualMutationIntentWithCanonicalExecutor — moved verbatim;
+   *  the pass only leaves a reviewable conflict row or throws. */
+  private async deferPersistedPluginUploadDowngradeToReview(args: DeferPersistedPluginUploadDowngradeToReviewArgs): Promise<void> {
+    const { intent, item, result, operationEpoch } = args;
     if (this.isPersistedSelectedPluginCodeUploadRecovery(intent)) {
       const bundle = parseCommunityPluginBundlePath(
         intent.path,
@@ -13730,35 +16991,6 @@ export class SyncExecutor {
         );
       }
     }
-    const executed = await this.executeItem(
-      item,
-      result,
-      remoteUpserts,
-      remoteDeletes,
-      metrics,
-      { onFileProgress: (bytes, total) => this.updateSideActionProgress(bytes, total) },
-      operationEpoch,
-      this.automaticHandlingPolicy,
-      undefined,
-      "throw",
-      this.isPersistedPluginDataDownloadSettlement(intent),
-    );
-    if (!executed.executed || !executed.mutationApplied) {
-      throw new MutationNotAppliedError(new Error("Manual mutation was not applied"));
-    }
-    if (intent.stateEffect === "settlement-only") {
-      return emptyMutationCheckpoint();
-    }
-    const checkpoint = emptyMutationCheckpoint();
-    checkpoint.remoteUpserts.push(...remoteUpserts);
-    checkpoint.remoteDeletes.push(...remoteDeletes);
-    if (executed.baseUpsert) checkpoint.baseUpserts.push(executed.baseUpsert);
-    if (executed.baseRemoval) checkpoint.baseRemovals.push(executed.baseRemoval);
-    if (intent.action === "upload" && intent.sourcePath) {
-      checkpoint.baseRemovals.push(intent.sourcePath);
-      checkpoint.remoteDeletes.push(intent.sourcePath);
-    }
-    return checkpoint;
   }
 
   private async runDurableSideMutation(
@@ -14001,417 +17233,71 @@ export class SyncExecutor {
     let receiptCommitted = 0;
     let quarantined = 0;
     let externalMutations = 0;
-    for (const [recordIndex, persistedRecord] of persistedRecords.entries()) {
-      const currentFootprint = recoveryFootprints[recordIndex];
-      // A bundle coordinator owns these exact older records until its single
-      // checkpoint retires them. Processing them independently would recreate
-      // the very per-file deadlock the reviewed whole-bundle choice replaces.
-      if (bundlePredecessorIds.has(persistedRecord.intent.operationId)) {
-        continue;
-      }
-      const record = this.state.prepareMutationRecoveryRecord(
-        persistedRecord,
-        syncScope,
+    const recoveryPass = await this.recoverMutationLedgerRecords({
+      result,
+      syncScope,
+      operationEpoch,
+      observationOnly,
+      mergeRecovery,
+      persistedRecords,
+      recoveryEnvelope,
+      recoveryFootprints,
+      bundlePredecessorIds,
+      blocked,
+      blockedRecords,
+      hierarchyRefreshedForRecovery,
+      reflectedCheckpointRetirementCommitSeq,
+      settled,
+      applied,
+      notApplied,
+      receiptCommitted,
+      quarantined,
+      externalMutations,
+    });
+    hierarchyRefreshedForRecovery = recoveryPass.hierarchyRefreshedForRecovery;
+    reflectedCheckpointRetirementCommitSeq = recoveryPass.reflectedCheckpointRetirementCommitSeq;
+    settled = recoveryPass.settled;
+    applied = recoveryPass.applied;
+    notApplied = recoveryPass.notApplied;
+    receiptCommitted = recoveryPass.receiptCommitted;
+    quarantined = recoveryPass.quarantined;
+    externalMutations = recoveryPass.externalMutations;
+    const recoverySummary = this.buildMutationRecoverySummary({
+      persistedRecords,
+      blocked,
+      blockedRecords,
+      settled,
+      applied,
+      notApplied,
+      receiptCommitted,
+      quarantined,
+      externalMutations,
+    });
+    if (blocked.length > 0) {
+      throw new MutationRecoveryBlockedError(
+        recoverySummary!,
+        blocked[0].error,
       );
-      if (!record) {
-        throw new MutationRecoveryBlockedError({
-          state: "blocked",
-          total: persistedRecords.length,
-          settled,
-          remaining: this.state.mutationLedger.length,
-          retryAfterSeconds: null,
-          blockReason: "scope-changed",
-        }, new Error(
-          `Mutation scope no longer matches: ${persistedRecord.intent.operationId}`,
-        ));
-      }
-      const blockingDependency = blockedRecords.find((blockedRecord) =>
-        mutationRecoveryIntentsOverlap(
-          blockedRecord.record.intent,
-          record.intent,
-        )
-        || conservativeResetFootprintsOverlap(
-          blockedRecord.footprint,
-          currentFootprint,
-        ));
-      if (blockingDependency) {
-        blocked.push({
-          operationId: record.intent.operationId,
-          reason: "dependent-on-unresolved",
-          error: new Error(
-            `Mutation recovery waits for an earlier dependent operation: ${record.intent.operationId}`,
-          ),
-          retryable: blockingDependency.retryable,
-        });
-        blockedRecords.push({
-          record,
-          footprint: currentFootprint,
-          retryable: blockingDependency.retryable,
-        });
-        continue;
-      }
-      // A same-path delete-recreate can replace the remote object with an
-      // identical one under a new Graph identity. With complete evidence this
-      // settles as a state-only anchor rebind before any other recovery rule
-      // replays or blocks the record. It performs no Vault or Graph mutation,
-      // so it also runs during reset observation-only rounds.
-      try {
-        if (await this.trySettleReplacedIdentityUpload(
-          persistedRecord,
-          record,
-          operationEpoch,
-        )) {
-          settled++;
-          continue;
-        }
-      } catch (error) {
-        if (this.cancelled) throw error;
-        const retryable = isRetryableMutationRecoveryObservationError(error);
-        blocked.push({
-          operationId: record.intent.operationId,
-          reason: retryable
-            ? "observation-unavailable"
-            : "outcome-unresolved",
-          error: error instanceof Error ? error : new Error(String(error)),
-          retryable,
-        });
-        blockedRecords.push({
-          record,
-          footprint: currentFootprint,
-          retryable,
-        });
-        continue;
-      }
-      const isAutomaticMerge = record.intent.action === "merge";
-      if (isAutomaticMerge && mergeRecovery) mergeRecovery.records++;
-      if (record.manualResolution) {
-        if (observationOnly) {
-          blocked.push({
-            operationId: record.intent.operationId,
-            reason: "outcome-unresolved",
-            error: new Error(
-              `Manual mutation continuation is not executed during reset: ${record.intent.operationId}`,
-            ),
-            retryable: false,
-          });
-          blockedRecords.push({
-            record,
-            footprint: currentFootprint,
-            retryable: false,
-          });
-          continue;
-        }
-        if (record.manualResolution.version === 2) {
-          try {
-            const predecessorCount = record.manualResolution
-              .predecessorOperationIds.length;
-            await this.resumeCommunityPluginBundleSettlement(
-              record,
-              operationEpoch,
-              operationEpoch !== undefined,
-              () => { externalMutations++; },
-            );
-            settled += 1 + predecessorCount;
-          } catch (error) {
-            if (this.cancelled) throw error;
-            const retryable = isRetryableMutationRecoveryObservationError(error);
-            blocked.push({
-              operationId: record.intent.operationId,
-              reason: retryable
-                ? "observation-unavailable"
-                : "outcome-unresolved",
-              error: error instanceof Error ? error : new Error(String(error)),
-              retryable,
-            });
-            blockedRecords.push({
-              record,
-              footprint: currentFootprint,
-              retryable,
-            });
-          }
-          continue;
-        }
-        try {
-          await this.resumeManualMutationResolution(
-            record,
-            operationEpoch,
-            operationEpoch !== undefined,
-            () => { externalMutations++; },
-          );
-          settled++;
-          continue;
-        } catch (error) {
-          if (this.cancelled) throw error;
-          const retryable = isRetryableMutationRecoveryObservationError(error);
-          blocked.push({
-            operationId: record.intent.operationId,
-            reason: retryable
-              ? "observation-unavailable"
-              : "outcome-unresolved",
-            error: error instanceof Error ? error : new Error(String(error)),
-            retryable,
-          });
-          blockedRecords.push({
-            record,
-            footprint: currentFootprint,
-            retryable,
-          });
-          continue;
-        }
-      }
-      if (record.receipt) {
-        const reflectedCommitSeq = reflectedCheckpointRetirementCommitSeq;
-        const currentEnvelope = reflectedCommitSeq !== undefined
-          ? this.state.getCommittedV2Envelope()
-          : null;
-        if (
-          currentEnvelope?.remoteIndex.complete === true
-          && currentEnvelope.meta.commitSeq === reflectedCommitSeq
-          && await this.state.retireMutationCheckpointIfReflected(
-            record.intent.operationId,
-            reflectedCommitSeq,
-          )
-        ) {
-          const successor = this.state.getCommittedV2Envelope();
-          reflectedCheckpointRetirementCommitSeq =
-            successor?.remoteIndex.complete === true
-            && successor.meta.commitSeq === reflectedCommitSeq + 1
-              ? successor.meta.commitSeq
-              : undefined;
-          receiptCommitted++;
-          settled++;
-          if (isAutomaticMerge) {
-            if (mergeRecovery) mergeRecovery.receiptCommitted++;
-            await this.getMergeReadyStore().complete(record.intent.operationId);
-          }
-          continue;
-        }
-        let receiptMatches: boolean;
-        try {
-          // A remote hierarchy rebuild can legitimately replace a folder
-          // identity while the upload's durable receipt still carries the
-          // response's older parentReference. Rebind only that parent after
-          // the current path, version, content, and committed folder tree
-          // agree. The reducer remains strict and still rejects every other
-          // identity mismatch.
-          const rebasedReceipt = await this.rebaseReceiptedUploadParent(record);
-          if (rebasedReceipt) {
-            await this.state.recordMutationReceipt(rebasedReceipt);
-            this.diag?.log(
-              "state",
-              `rebound upload receipt to the current remote parent — ${record.intent.path}`,
-              { operationId: record.intent.operationId, mutations: 0 },
-            );
-          }
-          let recoveryRecord = rebasedReceipt
-            ? { ...record, receipt: rebasedReceipt }
-            : record;
-          if (
-            !rebasedReceipt
-            && !hierarchyRefreshedForRecovery
-            && operationEpoch !== undefined
-            && result
-            && await this.uploadReceiptParentDriftedFromIndex(record)
-          ) {
-            // The receipt carries the live parent identity while the
-            // committed index still binds the path to an older folder one —
-            // the direction the rebase above cannot repair. Refresh the
-            // committed tree once per recovery run, then re-verify against
-            // it; every other shape stays on its fail-closed path.
-            hierarchyRefreshedForRecovery = true;
-            const rebound = await this.rebaseReceiptsAfterHierarchyRefresh(
-              [record.intent.operationId],
-              operationEpoch,
-              result,
-            );
-            if (rebound.refreshed) {
-              recoveryRecord = this.state.mutationLedger.find(
-                (entry) => entry.intent.operationId
-                  === record.intent.operationId,
-              ) ?? recoveryRecord;
-            }
-          }
-          receiptMatches = await this.verifyMutationReceipt(
-            recoveryRecord,
-            observationOnly,
-          );
-        } catch (error) {
-          if (
-            this.cancelled
-            || !isRetryableMutationRecoveryObservationError(error)
-          ) throw error;
-          blocked.push({
-            operationId: record.intent.operationId,
-            reason: "observation-unavailable",
-            error,
-            retryable: true,
-          });
-          blockedRecords.push({
-            record,
-            footprint: currentFootprint,
-            retryable: true,
-          });
-          if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
-          continue;
-        }
-        if (!receiptMatches) {
-          const unreachableUpload = this.state.isV2StateActive
-            ? await this.proveUnreachableReceiptedUpload(record)
-            : null;
-          if (unreachableUpload) {
-            const quarantine =
-              await this.state.quarantineUnreachableUploadReceipt({
-                record,
-                remoteId: unreachableUpload.remoteId,
-                localMissing: true,
-                graphItemMissing: true,
-              });
-            this.diag?.warn(
-              "state",
-              `unreachable upload receipt quarantined under V2 authority — ${record.intent.path}`,
-              {
-                operationId: record.intent.operationId,
-                sourceCommitSeq: quarantine.sourceCommitSeq,
-                reason: quarantine.reason,
-                activeLedgerRecords: this.state.mutationLedger.length,
-                quarantinedRecords:
-                  this.state.mutationRecoveryQuarantine.length,
-                mutations: 0,
-              },
-            );
-            quarantined++;
-            settled++;
-            continue;
-          }
-          const moveAwareReflection = await this.tryRetireMoveAwareReflectedUpload(
-            record,
-            recoveryEnvelope,
-            reflectedCheckpointRetirementCommitSeq,
-          );
-          if (moveAwareReflection === "retired") {
-            reflectedCheckpointRetirementCommitSeq = undefined;
-            receiptCommitted++;
-            settled++;
-            if (isAutomaticMerge) {
-              if (mergeRecovery) mergeRecovery.receiptCommitted++;
-              await this.getMergeReadyStore().complete(
-                record.intent.operationId,
-              );
-            }
-            continue;
-          }
-          if (await this.tryAutoSettleFolderMutationRecovery(record)) {
-            settled++;
-            continue;
-          }
-          this.logBlockedMutationEvidence(record);
-          if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
-          blocked.push({
-            operationId: record.intent.operationId,
-            reason: "outcome-unresolved",
-            error: new Error(
-              `Mutation receipt no longer matches local/remote facts: ${record.intent.operationId}`,
-            ),
-            retryable: false,
-          });
-          blockedRecords.push({
-            record,
-            footprint: currentFootprint,
-            retryable: false,
-          });
-          continue;
-        }
-        await this.commitMutationCheckpoint(record.intent.operationId);
-        reflectedCheckpointRetirementCommitSeq = undefined;
-        receiptCommitted++;
-        settled++;
-        if (isAutomaticMerge) {
-          if (mergeRecovery) mergeRecovery.receiptCommitted++;
-          await this.getMergeReadyStore().complete(record.intent.operationId);
-        }
-        continue;
-      }
-
-      let outcome: "not-applied" | MutationCheckpointV1 | null;
-      try {
-        outcome = await this.classifyUnreceiptedMutation(
-          record.intent,
-          observationOnly,
-        );
-      } catch (error) {
-        if (
-          this.cancelled
-          || !isRetryableMutationRecoveryObservationError(error)
-        ) throw error;
-        blocked.push({
-          operationId: record.intent.operationId,
-          reason: "observation-unavailable",
-          error,
-          retryable: true,
-        });
-        blockedRecords.push({
-          record,
-          footprint: currentFootprint,
-          retryable: true,
-        });
-        if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
-        continue;
-      }
-      if (outcome === "not-applied") {
-        await this.state.abandonMutationIntent(record.intent.operationId);
-        notApplied++;
-        settled++;
-        if (isAutomaticMerge) {
-          if (mergeRecovery) mergeRecovery.notApplied++;
-          await this.getMergeReadyStore().complete(record.intent.operationId);
-        }
-        continue;
-      }
-      if (!outcome) {
-        if (await this.tryAutoSettleFolderMutationRecovery(record)) {
-          settled++;
-          continue;
-        }
-        if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
-        this.logBlockedMutationEvidence(record);
-        await this.logBlockedDownloadEvidence(record);
-        blocked.push({
-          operationId: record.intent.operationId,
-          reason: "outcome-unresolved",
-          error: new Error(
-            `Mutation outcome requires manual review: ${record.intent.operationId}`,
-          ),
-          retryable: false,
-        });
-        blockedRecords.push({
-          record,
-          footprint: currentFootprint,
-          retryable: false,
-        });
-        continue;
-      }
-      if (isAutomaticMerge) {
-        if (outcome.baseUpserts.some((entry) => entry.path === record.intent.path)) {
-          if (mergeRecovery) mergeRecovery.remoteCommittedLocalRecovered++;
-        } else {
-          if (mergeRecovery) mergeRecovery.remoteCommittedLocalPending++;
-        }
-      }
-      const receipt: MutationReceiptV1 = {
-        version: 1,
-        operationId: record.intent.operationId,
-        completedAt: Date.now(),
-        checkpoint: outcome,
-      };
-      await this.state.recordMutationReceipt(receipt);
-      await this.commitMutationCheckpoint(record.intent.operationId);
-      reflectedCheckpointRetirementCommitSeq = undefined;
-      applied++;
-      settled++;
-      if (isAutomaticMerge) {
-        await this.getMergeReadyStore().complete(record.intent.operationId);
-      }
     }
+    return recoverySummary;
+  }
+
+  /** Mutation-recovery batch summary and diagnostics for one recovery pass —
+   *  moved verbatim from recoverMutationLedger; null when nothing was persisted. */
+  private buildMutationRecoverySummary(
+    args: MutationRecoverySummaryArgs,
+  ): MutationRecoveryRunSummary | null {
+    const {
+      persistedRecords,
+      blocked,
+      blockedRecords,
+      settled,
+      applied,
+      notApplied,
+      receiptCommitted,
+      quarantined,
+      externalMutations,
+    } = args;
     let recoverySummary: MutationRecoveryRunSummary | null = null;
     if (persistedRecords.length > 0) {
       const blockedByReason = blocked.reduce<Record<string, number>>(
@@ -14503,14 +17389,825 @@ export class SyncExecutor {
         );
       }
     }
-    if (blocked.length > 0) {
-      throw new MutationRecoveryBlockedError(
-        recoverySummary!,
-        blocked[0].error,
-      );
-    }
     return recoverySummary;
   }
+
+  /** Mutation-ledger recovery pass over every persisted record — per-record
+   *  outcome classification, receipt/checkpoint reconciliation and blocked/
+   *  quarantine accounting. Accumulators return to the caller. */
+  private async recoverMutationLedgerRecords(args: {
+    result: SyncResult | undefined;
+    syncScope: SyncScope;
+    operationEpoch: number | undefined;
+    observationOnly: boolean;
+    mergeRecovery: AutomaticHandlingMetrics["mergeRecovery"] | undefined;
+    persistedRecords: MutationLedgerEntryV1[];
+    recoveryEnvelope: ReturnType<StateManager["getCommittedV2Envelope"]>;
+    recoveryFootprints: ReturnType<typeof buildConservativeResetRecordFootprints>;
+    bundlePredecessorIds: Set<string>;
+    blocked: Array<{
+      operationId: string;
+      reason:
+        | "outcome-unresolved"
+        | "observation-unavailable"
+        | "dependent-on-unresolved";
+      error: Error;
+      retryable: boolean;
+    }>;
+    blockedRecords: Array<{
+      record: MutationLedgerEntryV1;
+      footprint: ConservativeResetRecordFootprint;
+      retryable: boolean;
+    }>;
+    hierarchyRefreshedForRecovery: boolean;
+    reflectedCheckpointRetirementCommitSeq: number | undefined;
+    settled: number;
+    applied: number;
+    notApplied: number;
+    receiptCommitted: number;
+    quarantined: number;
+    externalMutations: number;
+  }): Promise<{
+    hierarchyRefreshedForRecovery: boolean;
+    reflectedCheckpointRetirementCommitSeq: number | undefined;
+    settled: number;
+    applied: number;
+    notApplied: number;
+    receiptCommitted: number;
+    quarantined: number;
+    externalMutations: number;
+  }> {
+    const {
+      result,
+      syncScope,
+      operationEpoch,
+      observationOnly,
+      mergeRecovery,
+      persistedRecords,
+      recoveryEnvelope,
+      recoveryFootprints,
+      bundlePredecessorIds,
+      blocked,
+      blockedRecords,
+    } = args;
+    let {
+      hierarchyRefreshedForRecovery,
+      reflectedCheckpointRetirementCommitSeq,
+      settled,
+      applied,
+      notApplied,
+      receiptCommitted,
+      quarantined,
+      externalMutations,
+    } = args;
+    for (const [recordIndex, persistedRecord] of persistedRecords.entries()) {
+      const recovery = await this.settlePersistedMutationRecord({
+        result,
+        syncScope,
+        operationEpoch,
+        observationOnly,
+        mergeRecovery,
+        persistedRecords,
+        persistedRecord,
+        recordIndex,
+        recoveryEnvelope,
+        recoveryFootprints,
+        bundlePredecessorIds,
+        blocked,
+        blockedRecords,
+        hierarchyRefreshedForRecovery,
+        reflectedCheckpointRetirementCommitSeq,
+        settled,
+        applied,
+        notApplied,
+        receiptCommitted,
+        quarantined,
+        externalMutations,
+      });
+      hierarchyRefreshedForRecovery = recovery.hierarchyRefreshedForRecovery;
+      reflectedCheckpointRetirementCommitSeq =
+        recovery.reflectedCheckpointRetirementCommitSeq;
+      settled = recovery.settled;
+      applied = recovery.applied;
+      notApplied = recovery.notApplied;
+      receiptCommitted = recovery.receiptCommitted;
+      quarantined = recovery.quarantined;
+      externalMutations = recovery.externalMutations;
+    }
+    return {
+      hierarchyRefreshedForRecovery,
+      reflectedCheckpointRetirementCommitSeq,
+      settled,
+      applied,
+      notApplied,
+      receiptCommitted,
+      quarantined,
+      externalMutations,
+    };
+  }
+
+  /** Settle one persisted mutation-ledger record's recovery outcome.
+   *
+   *  Applies the single rule the record's current evidence supports — identity
+   *  rebind, receipt reconciliation, quarantine, manual continuation, checkpoint
+   *  commit or blocking — and returns the accumulator state the caller threads
+   *  into the next record. */
+  private async settlePersistedMutationRecord(args: {
+    result: SyncResult | undefined;
+    syncScope: SyncScope;
+    operationEpoch: number | undefined;
+    observationOnly: boolean;
+    mergeRecovery: AutomaticHandlingMetrics["mergeRecovery"] | undefined;
+    persistedRecords: MutationLedgerEntryV1[];
+    persistedRecord: MutationLedgerEntryV1;
+    recordIndex: number;
+    recoveryEnvelope: ReturnType<StateManager["getCommittedV2Envelope"]>;
+    recoveryFootprints: ReturnType<typeof buildConservativeResetRecordFootprints>;
+    bundlePredecessorIds: Set<string>;
+    blocked: Array<{
+      operationId: string;
+      reason:
+        | "outcome-unresolved"
+        | "observation-unavailable"
+        | "dependent-on-unresolved";
+      error: Error;
+      retryable: boolean;
+    }>;
+    blockedRecords: Array<{
+      record: MutationLedgerEntryV1;
+      footprint: ConservativeResetRecordFootprint;
+      retryable: boolean;
+    }>;
+    hierarchyRefreshedForRecovery: boolean;
+    reflectedCheckpointRetirementCommitSeq: number | undefined;
+    settled: number;
+    applied: number;
+    notApplied: number;
+    receiptCommitted: number;
+    quarantined: number;
+    externalMutations: number;
+  }): Promise<{
+    hierarchyRefreshedForRecovery: boolean;
+    reflectedCheckpointRetirementCommitSeq: number | undefined;
+    settled: number;
+    applied: number;
+    notApplied: number;
+    receiptCommitted: number;
+    quarantined: number;
+    externalMutations: number;
+  }> {
+    const {
+      result,
+      syncScope,
+      operationEpoch,
+      observationOnly,
+      mergeRecovery,
+      persistedRecords,
+      persistedRecord,
+      recordIndex,
+      recoveryEnvelope,
+      recoveryFootprints,
+      bundlePredecessorIds,
+      blocked,
+      blockedRecords,
+    } = args;
+    let {
+      hierarchyRefreshedForRecovery,
+      reflectedCheckpointRetirementCommitSeq,
+      settled,
+      applied,
+      notApplied,
+      receiptCommitted,
+      quarantined,
+      externalMutations,
+    } = args;
+    // Every record exit hands the caller the accumulators for the next record.
+    const accumulators = () => ({
+      hierarchyRefreshedForRecovery,
+      reflectedCheckpointRetirementCommitSeq,
+      settled,
+      applied,
+      notApplied,
+      receiptCommitted,
+      quarantined,
+      externalMutations,
+    });
+    const currentFootprint = recoveryFootprints[recordIndex];
+    // A bundle coordinator owns these exact older records until its single
+    // checkpoint retires them. Processing them independently would recreate
+    // the very per-file deadlock the reviewed whole-bundle choice replaces.
+    if (bundlePredecessorIds.has(persistedRecord.intent.operationId)) {
+      return accumulators();
+    }
+    const record = this.state.prepareMutationRecoveryRecord(
+      persistedRecord,
+      syncScope,
+    );
+    if (!record) {
+      throw new MutationRecoveryBlockedError({
+        state: "blocked",
+        total: persistedRecords.length,
+        settled,
+        remaining: this.state.mutationLedger.length,
+        retryAfterSeconds: null,
+        blockReason: "scope-changed",
+      }, new Error(
+        `Mutation scope no longer matches: ${persistedRecord.intent.operationId}`,
+      ));
+    }
+    const blockingDependency = blockedRecords.find((blockedRecord) =>
+      mutationRecoveryIntentsOverlap(
+        blockedRecord.record.intent,
+        record.intent,
+      )
+      || conservativeResetFootprintsOverlap(
+        blockedRecord.footprint,
+        currentFootprint,
+      ));
+    if (blockingDependency) {
+      blocked.push({
+        operationId: record.intent.operationId,
+        reason: "dependent-on-unresolved",
+        error: new Error(
+          `Mutation recovery waits for an earlier dependent operation: ${record.intent.operationId}`,
+        ),
+        retryable: blockingDependency.retryable,
+      });
+      blockedRecords.push({
+        record,
+        footprint: currentFootprint,
+        retryable: blockingDependency.retryable,
+      });
+      return accumulators();
+    }
+    // A same-path delete-recreate can replace the remote object with an
+    // identical one under a new Graph identity. With complete evidence this
+    // settles as a state-only anchor rebind before any other recovery rule
+    // replays or blocks the record. It performs no Vault or Graph mutation,
+    // so it also runs during reset observation-only rounds.
+    try {
+      if (await this.trySettleReplacedIdentityUpload(
+        persistedRecord,
+        record,
+        operationEpoch,
+      )) {
+        settled++;
+        return accumulators();
+      }
+    } catch (error) {
+      if (this.cancelled) throw error;
+      const retryable = isRetryableMutationRecoveryObservationError(error);
+      blocked.push({
+        operationId: record.intent.operationId,
+        reason: retryable
+          ? "observation-unavailable"
+          : "outcome-unresolved",
+        error: error instanceof Error ? error : new Error(String(error)),
+        retryable,
+      });
+      blockedRecords.push({
+        record,
+        footprint: currentFootprint,
+        retryable,
+      });
+      return accumulators();
+    }
+    const isAutomaticMerge = record.intent.action === "merge";
+    if (isAutomaticMerge && mergeRecovery) mergeRecovery.records++;
+    const manualResolution = await this.settlePersistedManualMutationResolution({
+      record,
+      observationOnly,
+      operationEpoch,
+      currentFootprint,
+      blocked,
+      blockedRecords,
+      hierarchyRefreshedForRecovery,
+      reflectedCheckpointRetirementCommitSeq,
+      settled,
+      applied,
+      notApplied,
+      receiptCommitted,
+      quarantined,
+      externalMutations,
+    });
+    if (manualResolution.terminated) return manualResolution.terminated;
+    settled = manualResolution.settled;
+    externalMutations = manualResolution.externalMutations;
+    if (record.receipt) {
+      return this.settlePersistedMutationReceipt({
+        record,
+        observationOnly,
+        operationEpoch,
+        result,
+        recoveryEnvelope,
+        currentFootprint,
+        isAutomaticMerge,
+        mergeRecovery,
+        blocked,
+        blockedRecords,
+        hierarchyRefreshedForRecovery,
+        reflectedCheckpointRetirementCommitSeq,
+        settled,
+        applied,
+        notApplied,
+        receiptCommitted,
+        quarantined,
+        externalMutations,
+      });
+    }
+
+    let outcome: "not-applied" | MutationCheckpointV1 | null;
+    try {
+      outcome = await this.classifyUnreceiptedMutation(
+        record.intent,
+        observationOnly,
+      );
+    } catch (error) {
+      if (
+        this.cancelled
+        || !isRetryableMutationRecoveryObservationError(error)
+      ) throw error;
+      blocked.push({
+        operationId: record.intent.operationId,
+        reason: "observation-unavailable",
+        error,
+        retryable: true,
+      });
+      blockedRecords.push({
+        record,
+        footprint: currentFootprint,
+        retryable: true,
+      });
+      if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
+      return accumulators();
+    }
+    if (outcome === "not-applied") {
+      await this.state.abandonMutationIntent(record.intent.operationId);
+      notApplied++;
+      settled++;
+      if (isAutomaticMerge) {
+        if (mergeRecovery) mergeRecovery.notApplied++;
+        await this.getMergeReadyStore().complete(record.intent.operationId);
+      }
+      return accumulators();
+    }
+    if (!outcome) {
+      if (await this.tryAutoSettleFolderMutationRecovery(record)) {
+        settled++;
+        return accumulators();
+      }
+      if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
+      this.logBlockedMutationEvidence(record);
+      await this.logBlockedDownloadEvidence(record);
+      blocked.push({
+        operationId: record.intent.operationId,
+        reason: "outcome-unresolved",
+        error: new Error(
+          `Mutation outcome requires manual review: ${record.intent.operationId}`,
+        ),
+        retryable: false,
+      });
+      blockedRecords.push({
+        record,
+        footprint: currentFootprint,
+        retryable: false,
+      });
+      return accumulators();
+    }
+    if (isAutomaticMerge) {
+      if (outcome.baseUpserts.some((entry) => entry.path === record.intent.path)) {
+        if (mergeRecovery) mergeRecovery.remoteCommittedLocalRecovered++;
+      } else {
+        if (mergeRecovery) mergeRecovery.remoteCommittedLocalPending++;
+      }
+    }
+    const receipt: MutationReceiptV1 = {
+      version: 1,
+      operationId: record.intent.operationId,
+      completedAt: Date.now(),
+      checkpoint: outcome,
+    };
+    await this.state.recordMutationReceipt(receipt);
+    await this.commitMutationCheckpoint(record.intent.operationId);
+    reflectedCheckpointRetirementCommitSeq = undefined;
+    applied++;
+    settled++;
+    if (isAutomaticMerge) {
+      await this.getMergeReadyStore().complete(record.intent.operationId);
+    }
+    return accumulators();
+  }
+
+  /** Manual-resolution continuation of settlePersistedMutationRecord —
+   *  moved verbatim; every exit hands the caller the accumulator state. */
+  private async settlePersistedManualMutationResolution(args: SettlePersistedManualMutationResolutionArgs): Promise<SettlePersistedManualMutationResolutionOutcome> {
+    const {
+      record, observationOnly, operationEpoch, currentFootprint, blocked,
+      blockedRecords, hierarchyRefreshedForRecovery,
+      reflectedCheckpointRetirementCommitSeq, applied, notApplied,
+      receiptCommitted, quarantined,
+    } = args;
+    let { settled, externalMutations } = args;
+    const accumulators = (): PersistedMutationRecoveryAccumulatorState => ({
+      hierarchyRefreshedForRecovery, reflectedCheckpointRetirementCommitSeq,
+      settled, applied, notApplied, receiptCommitted, quarantined,
+      externalMutations,
+    });
+    if (record.manualResolution) {
+      if (observationOnly) {
+        blocked.push({
+          operationId: record.intent.operationId,
+          reason: "outcome-unresolved",
+          error: new Error(
+            `Manual mutation continuation is not executed during reset: ${record.intent.operationId}`,
+          ),
+          retryable: false,
+        });
+        blockedRecords.push({
+          record,
+          footprint: currentFootprint,
+          retryable: false,
+        });
+        return { terminated: accumulators() };
+      }
+      if (record.manualResolution.version === 2) {
+        try {
+          const predecessorCount = record.manualResolution
+            .predecessorOperationIds.length;
+          await this.resumeCommunityPluginBundleSettlement(
+            record,
+            operationEpoch,
+            operationEpoch !== undefined,
+            () => { externalMutations++; },
+          );
+          settled += 1 + predecessorCount;
+        } catch (error) {
+          if (this.cancelled) throw error;
+          const retryable = isRetryableMutationRecoveryObservationError(error);
+          blocked.push({
+            operationId: record.intent.operationId,
+            reason: retryable
+              ? "observation-unavailable"
+              : "outcome-unresolved",
+            error: error instanceof Error ? error : new Error(String(error)),
+            retryable,
+          });
+          blockedRecords.push({
+            record,
+            footprint: currentFootprint,
+            retryable,
+          });
+        }
+        return { terminated: accumulators() };
+      }
+      try {
+        await this.resumeManualMutationResolution(
+          record,
+          operationEpoch,
+          operationEpoch !== undefined,
+          () => { externalMutations++; },
+        );
+        settled++;
+        return { terminated: accumulators() };
+      } catch (error) {
+        if (this.cancelled) throw error;
+        const retryable = isRetryableMutationRecoveryObservationError(error);
+        blocked.push({
+          operationId: record.intent.operationId,
+          reason: retryable
+            ? "observation-unavailable"
+            : "outcome-unresolved",
+          error: error instanceof Error ? error : new Error(String(error)),
+          retryable,
+        });
+        blockedRecords.push({
+          record,
+          footprint: currentFootprint,
+          retryable,
+        });
+        return { terminated: accumulators() };
+      }
+    }
+    return { terminated: null, settled, externalMutations };
+  }
+
+  /** Reconciles the durable receipt of one persisted mutation record: reflected
+   *  checkpoint retirement, parent-identity rebase, hierarchy refresh, quarantine
+   *  and checkpoint commit. Every exit returns the accumulator state for the
+   *  caller's next record. */
+  private async settlePersistedMutationReceipt(args: {
+    record: MutationLedgerEntryV1;
+    observationOnly: boolean;
+    operationEpoch: number | undefined;
+    result: SyncResult | undefined;
+    recoveryEnvelope: ReturnType<StateManager["getCommittedV2Envelope"]>;
+    currentFootprint: ConservativeResetRecordFootprint;
+    isAutomaticMerge: boolean;
+    mergeRecovery: AutomaticHandlingMetrics["mergeRecovery"] | undefined;
+    blocked: Parameters<SyncExecutor["settlePersistedMutationRecord"]>[0]["blocked"];
+    blockedRecords: Parameters<SyncExecutor["settlePersistedMutationRecord"]>[0]["blockedRecords"];
+    hierarchyRefreshedForRecovery: boolean;
+    reflectedCheckpointRetirementCommitSeq: number | undefined;
+    settled: number;
+    applied: number;
+    notApplied: number;
+    receiptCommitted: number;
+    quarantined: number;
+    externalMutations: number;
+  }): Promise<{
+    hierarchyRefreshedForRecovery: boolean;
+    reflectedCheckpointRetirementCommitSeq: number | undefined;
+    settled: number;
+    applied: number;
+    notApplied: number;
+    receiptCommitted: number;
+    quarantined: number;
+    externalMutations: number;
+  }> {
+    const {
+      record,
+      observationOnly,
+      operationEpoch,
+      result,
+      recoveryEnvelope,
+      currentFootprint,
+      isAutomaticMerge,
+      mergeRecovery,
+      blocked,
+      blockedRecords,
+      applied,
+      notApplied,
+      externalMutations,
+    } = args;
+    let {
+      hierarchyRefreshedForRecovery,
+      reflectedCheckpointRetirementCommitSeq,
+      settled,
+      receiptCommitted,
+      quarantined,
+    } = args;
+    // Every receipt exit hands the caller the accumulators for the next record.
+    const accumulators = () => ({
+      hierarchyRefreshedForRecovery,
+      reflectedCheckpointRetirementCommitSeq,
+      settled,
+      applied,
+      notApplied,
+      receiptCommitted,
+      quarantined,
+      externalMutations,
+    });
+    const reflectedCommitSeq = reflectedCheckpointRetirementCommitSeq;
+    const currentEnvelope = reflectedCommitSeq !== undefined
+      ? this.state.getCommittedV2Envelope()
+      : null;
+    if (
+      currentEnvelope?.remoteIndex.complete === true
+      && currentEnvelope.meta.commitSeq === reflectedCommitSeq
+      && await this.state.retireMutationCheckpointIfReflected(
+        record.intent.operationId,
+        reflectedCommitSeq,
+      )
+    ) {
+      const successor = this.state.getCommittedV2Envelope();
+      reflectedCheckpointRetirementCommitSeq =
+        successor?.remoteIndex.complete === true
+        && successor.meta.commitSeq === reflectedCommitSeq + 1
+          ? successor.meta.commitSeq
+          : undefined;
+      receiptCommitted++;
+      settled++;
+      if (isAutomaticMerge) {
+        if (mergeRecovery) mergeRecovery.receiptCommitted++;
+        await this.getMergeReadyStore().complete(record.intent.operationId);
+      }
+      return accumulators();
+    }
+    let receiptMatches: boolean;
+    try {
+      // A remote hierarchy rebuild can legitimately replace a folder
+      // identity while the upload's durable receipt still carries the
+      // response's older parentReference. Rebind only that parent after
+      // the current path, version, content, and committed folder tree
+      // agree. The reducer remains strict and still rejects every other
+      // identity mismatch.
+      const rebasedReceipt = await this.rebaseReceiptedUploadParent(record);
+      if (rebasedReceipt) {
+        await this.state.recordMutationReceipt(rebasedReceipt);
+        this.diag?.log(
+          "state",
+          `rebound upload receipt to the current remote parent — ${record.intent.path}`,
+          { operationId: record.intent.operationId, mutations: 0 },
+        );
+      }
+      let recoveryRecord = rebasedReceipt
+        ? { ...record, receipt: rebasedReceipt }
+        : record;
+      if (
+        !rebasedReceipt
+        && !hierarchyRefreshedForRecovery
+        && operationEpoch !== undefined
+        && result
+        && await this.uploadReceiptParentDriftedFromIndex(record)
+      ) {
+        // The receipt carries the live parent identity while the
+        // committed index still binds the path to an older folder one —
+        // the direction the rebase above cannot repair. Refresh the
+        // committed tree once per recovery run, then re-verify against
+        // it; every other shape stays on its fail-closed path.
+        hierarchyRefreshedForRecovery = true;
+        const rebound = await this.rebaseReceiptsAfterHierarchyRefresh(
+          [record.intent.operationId],
+          operationEpoch,
+          result,
+        );
+        if (rebound.refreshed) {
+          recoveryRecord = this.state.mutationLedger.find(
+            (entry) => entry.intent.operationId
+              === record.intent.operationId,
+          ) ?? recoveryRecord;
+        }
+      }
+      receiptMatches = await this.verifyMutationReceipt(
+        recoveryRecord,
+        observationOnly,
+      );
+    } catch (error) {
+      if (
+        this.cancelled
+        || !isRetryableMutationRecoveryObservationError(error)
+      ) throw error;
+      blocked.push({
+        operationId: record.intent.operationId,
+        reason: "observation-unavailable",
+        error,
+        retryable: true,
+      });
+      blockedRecords.push({
+        record,
+        footprint: currentFootprint,
+        retryable: true,
+      });
+      if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
+      return accumulators();
+    }
+    if (!receiptMatches) {
+      return this.settleUnmatchedMutationReceipt({
+        record,
+        recoveryEnvelope,
+        currentFootprint,
+        isAutomaticMerge,
+        mergeRecovery,
+        blocked,
+        blockedRecords,
+        hierarchyRefreshedForRecovery,
+        reflectedCheckpointRetirementCommitSeq,
+        settled,
+        applied,
+        notApplied,
+        receiptCommitted,
+        quarantined,
+        externalMutations,
+      });
+    }
+    await this.commitMutationCheckpoint(record.intent.operationId);
+    reflectedCheckpointRetirementCommitSeq = undefined;
+    receiptCommitted++;
+    settled++;
+    if (isAutomaticMerge) {
+      if (mergeRecovery) mergeRecovery.receiptCommitted++;
+      await this.getMergeReadyStore().complete(record.intent.operationId);
+    }
+    return accumulators();
+  }
+
+  /** Settles one persisted record whose durable receipt no longer matches the
+   *  current local/remote facts: unreachable-upload quarantine, move-aware
+   *  reflection retirement, folder-mutation auto-settlement, or an explicit
+   *  blocked outcome. Every exit returns the accumulator state. */
+  private async settleUnmatchedMutationReceipt(args: {
+    record: MutationLedgerEntryV1;
+    recoveryEnvelope: ReturnType<StateManager["getCommittedV2Envelope"]>;
+    currentFootprint: ConservativeResetRecordFootprint;
+    isAutomaticMerge: boolean;
+    mergeRecovery: AutomaticHandlingMetrics["mergeRecovery"] | undefined;
+    blocked: Parameters<SyncExecutor["settlePersistedMutationRecord"]>[0]["blocked"];
+    blockedRecords: Parameters<SyncExecutor["settlePersistedMutationRecord"]>[0]["blockedRecords"];
+    hierarchyRefreshedForRecovery: boolean;
+    reflectedCheckpointRetirementCommitSeq: number | undefined;
+    settled: number;
+    applied: number;
+    notApplied: number;
+    receiptCommitted: number;
+    quarantined: number;
+    externalMutations: number;
+  }): Promise<{
+    hierarchyRefreshedForRecovery: boolean;
+    reflectedCheckpointRetirementCommitSeq: number | undefined;
+    settled: number;
+    applied: number;
+    notApplied: number;
+    receiptCommitted: number;
+    quarantined: number;
+    externalMutations: number;
+  }> {
+    const {
+      record,
+      recoveryEnvelope,
+      currentFootprint,
+      isAutomaticMerge,
+      mergeRecovery,
+      blocked,
+      blockedRecords,
+      hierarchyRefreshedForRecovery,
+      applied,
+      notApplied,
+      externalMutations,
+    } = args;
+    let {
+      reflectedCheckpointRetirementCommitSeq,
+      settled,
+      receiptCommitted,
+      quarantined,
+    } = args;
+    // Every exit hands the caller the accumulators for the next record.
+    const accumulators = () => ({
+      hierarchyRefreshedForRecovery,
+      reflectedCheckpointRetirementCommitSeq,
+      settled,
+      applied,
+      notApplied,
+      receiptCommitted,
+      quarantined,
+      externalMutations,
+    });
+    const unreachableUpload = this.state.isV2StateActive
+      ? await this.proveUnreachableReceiptedUpload(record)
+      : null;
+    if (unreachableUpload) {
+      const quarantine =
+        await this.state.quarantineUnreachableUploadReceipt({
+          record,
+          remoteId: unreachableUpload.remoteId,
+          localMissing: true,
+          graphItemMissing: true,
+        });
+      this.diag?.warn(
+        "state",
+        `unreachable upload receipt quarantined under V2 authority — ${record.intent.path}`,
+        {
+          operationId: record.intent.operationId,
+          sourceCommitSeq: quarantine.sourceCommitSeq,
+          reason: quarantine.reason,
+          activeLedgerRecords: this.state.mutationLedger.length,
+          quarantinedRecords:
+            this.state.mutationRecoveryQuarantine.length,
+          mutations: 0,
+        },
+      );
+      quarantined++;
+      settled++;
+      return accumulators();
+    }
+    const moveAwareReflection = await this.tryRetireMoveAwareReflectedUpload(
+      record,
+      recoveryEnvelope,
+      reflectedCheckpointRetirementCommitSeq,
+    );
+    if (moveAwareReflection === "retired") {
+      reflectedCheckpointRetirementCommitSeq = undefined;
+      receiptCommitted++;
+      settled++;
+      if (isAutomaticMerge) {
+        if (mergeRecovery) mergeRecovery.receiptCommitted++;
+        await this.getMergeReadyStore().complete(
+          record.intent.operationId,
+        );
+      }
+      return accumulators();
+    }
+    if (await this.tryAutoSettleFolderMutationRecovery(record)) {
+      settled++;
+      return accumulators();
+    }
+    this.logBlockedMutationEvidence(record);
+    if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
+    blocked.push({
+      operationId: record.intent.operationId,
+      reason: "outcome-unresolved",
+      error: new Error(
+        `Mutation receipt no longer matches local/remote facts: ${record.intent.operationId}`,
+      ),
+      retryable: false,
+    });
+    blockedRecords.push({
+      record,
+      footprint: currentFootprint,
+      retryable: false,
+    });
+    return accumulators();
+  }
+
 
   /**
    * A receipted upload can leave the active V2 ledger only after independent
@@ -15241,138 +18938,11 @@ export class SyncExecutor {
       return this.classifySettlementOnlyMutation(intent, local);
     }
     if (intent.action === "moveLocal") {
-      if (!intent.sourcePath || !intent.expectedLocal.exists || !intent.expectedRemote.exists) {
-        return null;
-      }
-      const [sourceLocal, sourceRemote, targetRemote] = await Promise.all([
-        this.inspectLocalPath(intent.sourcePath),
-        this.inspectRemotePath(intent.sourcePath),
-        this.inspectRemotePath(intent.path),
-      ]);
-      if (!sourceLocal || sourceLocal.status === "uncertain") return null;
-      const sourceStillExpected = this.inspectionMatchesExpectation(
-        sourceLocal,
-        intent.expectedLocal,
-      );
-      const targetStillMissing = local.status === "missing";
-      const remoteStillExpected = this.remoteMatchesExpectation(
-        targetRemote,
-        intent.expectedRemote,
-      );
-      if (
-        sourceStillExpected
-        && targetStillMissing
-        && sourceRemote === undefined
-        && remoteStillExpected
-      ) return "not-applied";
-      // The move never happened and no local result survives: local source
-      // and target are both absent and the remote target is absent. The
-      // intent is provably not-applied (SC-15 permits abandoning an intent
-      // only when non-application is provable), the same provable-absence
-      // shape the single-path classifier already settles. Without this the
-      // record blocks mutation recovery forever with no executable
-      // resolution (EasySync issue report 20260901: moveLocalFile stuck in
-      // outcome-unresolved while the recovery modal shows both sides
-      // Missing with no keep-side button; 20260902 Android report: local
-      // source+target gone while the remote source still exists — the
-      // remote move was never applied either, and abandoning keeps the
-      // remote source file untouched as an ordinary re-sync).
-      // Path absence alone is not identity absence (the remote object may
-      // have moved to a third path); require the exact expected remote
-      // identity to be gone as well before abandoning the intent. The
-      // remote source being present does not block this shape: the remote
-      // target absence plus the dead expected remote identity proves the
-      // remote move never happened, and abandoning only stops tracking —
-      // it never deletes the surviving remote source file.
-      // An empty expected driveId never proves identity absence (persisted
-      // intents written by old/corrupt data can carry ""): without a usable
-      // remote identity the four-absence shape is not provable, so the
-      // classifier falls through to the conservative null branch below
-      // (fail-closed, record kept for the next round) instead of "not-applied"
-      // (review 2026-09-02 finding ⑤, C4 vs C5 adjudication: C4 correct).
-      if (
-        sourceLocal.status === "missing"
-        && local.status === "missing"
-        && !targetRemote
-        && !!intent.expectedRemote.driveId
-        && await this.onedrive.getDriveItemMetadataById(
-          intent.expectedRemote.driveId,
-        ) === null
-      ) return "not-applied";
-      if (
-        sourceLocal.status !== "missing"
-        || !this.inspectionMatchesExpectation(local, intent.expectedLocal)
-        || sourceRemote !== undefined
-        || !remoteStillExpected
-        || !targetRemote
-      ) return null;
-      // A sha-unknown move settles only as a plain move whose observed world
-      // still binds to the planned one (identity + eTag via remoteStillExpected
-      // above, plus size here), under the same receipt contract as the
-      // execution chain (shape 3 in conservative-reset-recovery): the honest
-      // divergence is recorded and the ordinary same-path decision converges
-      // the bytes next round. Any other sha-unknown shape stays blocked right
-      // here — it must never fall through to the A1 alignment below, which
-      // downloads over the local file and would produce an unreceiptable
-      // checkpoint (field report 2026-09-22, F9 case 3; adversarial review
-      // 2026-09-22). Comparing or aligning bytes is reserved for hash-known
-      // moves.
-      if (
-        intent.expectedRemote.sha256Hash === undefined
-          ? targetRemote.size === intent.expectedRemote.size
-          : await this.remoteMatchesTarget(targetRemote, intent.expectedLocal)
-      ) {
-        const checkpoint = emptyMutationCheckpoint();
-        checkpoint.baseRemovals.push(intent.sourcePath);
-        checkpoint.baseUpserts.push({
-          path: intent.path,
-          hash: intent.expectedLocal.hash,
-          size: intent.expectedLocal.size,
-          eTag: targetRemote.eTag,
-        });
-        checkpoint.remoteDeletes.push(intent.sourcePath);
-        checkpoint.remoteUpserts.push(targetRemote);
-        return checkpoint;
-      }
-      if (intent.expectedRemote.sha256Hash === undefined) {
-        // Contradictory sha-unknown world (identity and eTag matched the plan
-        // but the observed size differs): stay blocked instead of aligning —
-        // A1 would download over the local file and produce an unreceiptable
-        // checkpoint (adversarial review 2026-09-22, F9 case 3 follow-up).
-        return null;
-      }
-      // A1 one-shot converge: the local file already followed the moved remote
-      // path while the remote content version advanced. Download the exact
-      // remote bytes and settle the receipt against the aligned content, so a
-      // stuck "path followed, bytes pending" record converges automatically.
-      // Only reachable for hash-known intents now: sha-unknown moves either
-      // settled as plain moves above (receipt shape 3) or returned null to
-      // stay blocked. Observation-only rounds leave the alignment to a real
-      // execution round (same pattern as the automatic merge branch).
-      if (observationOnly) return null;
-      if (local.status !== "present" || !local.entry) return null;
-      const aligned = await this.alignLocalTargetBytes(
-        intent.path,
-        targetRemote,
-        local.entry,
-        undefined,
-      );
-      // The local bytes changed during recovery; the ordinary plan that
-      // follows this round must rescan, otherwise the stale pre-recovery scan
-      // would look like a local edit and upload the old bytes back over the
-      // remote (same mechanism as the automatic merge recovery).
-      this.localVersionRecoveredDuringLedger = true;
-      const checkpoint = emptyMutationCheckpoint();
-      checkpoint.baseRemovals.push(intent.sourcePath);
-      checkpoint.baseUpserts.push({
-        path: intent.path,
-        hash: aligned.hash,
-        size: aligned.size,
-        eTag: targetRemote.eTag,
+      return await this.classifyUnreceiptedMoveLocalMutation({
+        intent,
+        local,
+        observationOnly,
       });
-      checkpoint.remoteDeletes.push(intent.sourcePath);
-      checkpoint.remoteUpserts.push(targetRemote);
-      return checkpoint;
     }
     const remotePath = intent.action === "renameRemote"
       ? intent.sourcePath ?? intent.path
@@ -15583,6 +19153,149 @@ export class SyncExecutor {
     checkpoint.remoteDeletes.push(intent.sourcePath);
     checkpoint.remoteUpserts.push(target);
     return checkpoint;
+  }
+
+  private async classifyUnreceiptedMoveLocalMutation(args: {
+    intent: MutationIntent;
+    local: LocalFileInspection;
+    observationOnly: boolean;
+  }): Promise<"not-applied" | MutationCheckpointV1 | null> {
+    const { intent, local, observationOnly } = args;
+    if (intent.action === "moveLocal") {
+      if (!intent.sourcePath || !intent.expectedLocal.exists || !intent.expectedRemote.exists) {
+        return null;
+      }
+      const [sourceLocal, sourceRemote, targetRemote] = await Promise.all([
+        this.inspectLocalPath(intent.sourcePath),
+        this.inspectRemotePath(intent.sourcePath),
+        this.inspectRemotePath(intent.path),
+      ]);
+      if (!sourceLocal || sourceLocal.status === "uncertain") return null;
+      const sourceStillExpected = this.inspectionMatchesExpectation(
+        sourceLocal,
+        intent.expectedLocal,
+      );
+      const targetStillMissing = local.status === "missing";
+      const remoteStillExpected = this.remoteMatchesExpectation(
+        targetRemote,
+        intent.expectedRemote,
+      );
+      if (
+        sourceStillExpected
+        && targetStillMissing
+        && sourceRemote === undefined
+        && remoteStillExpected
+      ) return "not-applied";
+      // The move never happened and no local result survives: local source
+      // and target are both absent and the remote target is absent. The
+      // intent is provably not-applied (SC-15 permits abandoning an intent
+      // only when non-application is provable), the same provable-absence
+      // shape the single-path classifier already settles. Without this the
+      // record blocks mutation recovery forever with no executable
+      // resolution (EasySync issue report 20260901: moveLocalFile stuck in
+      // outcome-unresolved while the recovery modal shows both sides
+      // Missing with no keep-side button; 20260902 Android report: local
+      // source+target gone while the remote source still exists — the
+      // remote move was never applied either, and abandoning keeps the
+      // remote source file untouched as an ordinary re-sync).
+      // Path absence alone is not identity absence (the remote object may
+      // have moved to a third path); require the exact expected remote
+      // identity to be gone as well before abandoning the intent. The
+      // remote source being present does not block this shape: the remote
+      // target absence plus the dead expected remote identity proves the
+      // remote move never happened, and abandoning only stops tracking —
+      // it never deletes the surviving remote source file.
+      // An empty expected driveId never proves identity absence (persisted
+      // intents written by old/corrupt data can carry ""): without a usable
+      // remote identity the four-absence shape is not provable, so the
+      // classifier falls through to the conservative null branch below
+      // (fail-closed, record kept for the next round) instead of "not-applied"
+      // (review 2026-09-02 finding ⑤, C4 vs C5 adjudication: C4 correct).
+      if (
+        sourceLocal.status === "missing"
+        && local.status === "missing"
+        && !targetRemote
+        && !!intent.expectedRemote.driveId
+        && await this.onedrive.getDriveItemMetadataById(
+          intent.expectedRemote.driveId,
+        ) === null
+      ) return "not-applied";
+      if (
+        sourceLocal.status !== "missing"
+        || !this.inspectionMatchesExpectation(local, intent.expectedLocal)
+        || sourceRemote !== undefined
+        || !remoteStillExpected
+        || !targetRemote
+      ) return null;
+      // A sha-unknown move settles only as a plain move whose observed world
+      // still binds to the planned one (identity + eTag via remoteStillExpected
+      // above, plus size here), under the same receipt contract as the
+      // execution chain (shape 3 in conservative-reset-recovery): the honest
+      // divergence is recorded and the ordinary same-path decision converges
+      // the bytes next round. Any other sha-unknown shape stays blocked right
+      // here — it must never fall through to the A1 alignment below, which
+      // downloads over the local file and would produce an unreceiptable
+      // checkpoint (field report 2026-09-22, F9 case 3; adversarial review
+      // 2026-09-22). Comparing or aligning bytes is reserved for hash-known
+      // moves.
+      if (
+        intent.expectedRemote.sha256Hash === undefined
+          ? targetRemote.size === intent.expectedRemote.size
+          : await this.remoteMatchesTarget(targetRemote, intent.expectedLocal)
+      ) {
+        const checkpoint = emptyMutationCheckpoint();
+        checkpoint.baseRemovals.push(intent.sourcePath);
+        checkpoint.baseUpserts.push({
+          path: intent.path,
+          hash: intent.expectedLocal.hash,
+          size: intent.expectedLocal.size,
+          eTag: targetRemote.eTag,
+        });
+        checkpoint.remoteDeletes.push(intent.sourcePath);
+        checkpoint.remoteUpserts.push(targetRemote);
+        return checkpoint;
+      }
+      if (intent.expectedRemote.sha256Hash === undefined) {
+        // Contradictory sha-unknown world (identity and eTag matched the plan
+        // but the observed size differs): stay blocked instead of aligning —
+        // A1 would download over the local file and produce an unreceiptable
+        // checkpoint (adversarial review 2026-09-22, F9 case 3 follow-up).
+        return null;
+      }
+      // A1 one-shot converge: the local file already followed the moved remote
+      // path while the remote content version advanced. Download the exact
+      // remote bytes and settle the receipt against the aligned content, so a
+      // stuck "path followed, bytes pending" record converges automatically.
+      // Only reachable for hash-known intents now: sha-unknown moves either
+      // settled as plain moves above (receipt shape 3) or returned null to
+      // stay blocked. Observation-only rounds leave the alignment to a real
+      // execution round (same pattern as the automatic merge branch).
+      if (observationOnly) return null;
+      if (local.status !== "present" || !local.entry) return null;
+      const aligned = await this.alignLocalTargetBytes(
+        intent.path,
+        targetRemote,
+        local.entry,
+        undefined,
+      );
+      // The local bytes changed during recovery; the ordinary plan that
+      // follows this round must rescan, otherwise the stale pre-recovery scan
+      // would look like a local edit and upload the old bytes back over the
+      // remote (same mechanism as the automatic merge recovery).
+      this.localVersionRecoveredDuringLedger = true;
+      const checkpoint = emptyMutationCheckpoint();
+      checkpoint.baseRemovals.push(intent.sourcePath);
+      checkpoint.baseUpserts.push({
+        path: intent.path,
+        hash: aligned.hash,
+        size: aligned.size,
+        eTag: targetRemote.eTag,
+      });
+      checkpoint.remoteDeletes.push(intent.sourcePath);
+      checkpoint.remoteUpserts.push(targetRemote);
+      return checkpoint;
+    }
+    return null;
   }
 
   private async classifySettlementOnlyMutation(
@@ -16073,111 +19786,17 @@ export class SyncExecutor {
     const readyStore = this.getMergeReadyStore();
     await readyStore.prepare(intent.operationId, merge.mergedBytes, target);
     try {
-      const committed = await this.runDurableSideMutation(intent, operationEpoch, async () => {
-        const localBeforeRemote = await this.inspectLocalPath(item.path);
-        if (!localBeforeRemote
-          || localBeforeRemote.status === "uncertain"
-          || !this.inspectionMatchesExpectation(localBeforeRemote, intent.expectedLocal)) {
-          throw new MutationNotAppliedError(`Local version changed before automatic merge: ${item.path}`);
-        }
-
-        await this.trackTransfer(
-          "upload",
-          callbacks.onFileProgress,
-          (report) => this.onedrive.uploadFile(
-            this.vaultName,
-            item.path,
-            merge.mergedBytes,
-            report,
-            item.remote!.eTag,
-            item.remote!.driveId,
-          ),
-        );
-        const uploadedRemote = await this.inspectRemotePath(item.path);
-        if (!uploadedRemote || !await this.remoteMatchesTarget(uploadedRemote, target, true)) {
-          throw new Error(`Automatic merge remote read-back failed: ${item.path}`);
-        }
-        const remoteEntry: RemoteFileEntry = {
-          ...uploadedRemote,
-          parentId: this.requireKnownRemoteParentId(
-            item.path,
-            uploadedRemote.parentId,
-            item.remote?.parentId,
-          ),
-          sha256Hash: target.hash,
-        };
-
-        let localAfterRemote = await this.inspectLocalPath(item.path);
-        if (!localAfterRemote || localAfterRemote.status === "uncertain") {
-          throw new Error(`Local version could not be verified after automatic merge: ${item.path}`);
-        }
-        if (this.inspectionMatchesExpectation(localAfterRemote, intent.expectedLocal)) {
-          await this.commitMergeLocally(
-            item.path,
-            intent.expectedLocal as Extract<MutationIntentV1["expectedLocal"], { exists: true }>,
-            target,
-            merge.mergedBytes,
-          );
-          localAfterRemote = await this.inspectLocalPath(item.path);
-          if (!localAfterRemote || localAfterRemote.status === "uncertain") {
-            throw new Error(`Merged local version could not be verified: ${item.path}`);
-          }
-        }
-
-        const checkpoint = emptyMutationCheckpoint();
-        checkpoint.remoteUpserts.push(remoteEntry);
-        if (this.inspectionMatchesVersion(localAfterRemote, target)) {
-          checkpoint.baseUpserts.push({
-            path: item.path,
-            hash: target.hash,
-            size: target.size,
-            eTag: remoteEntry.eTag,
-          });
-          this.state.cacheBaseContent(item.path, merge.mergedBytes);
-          checkpoint.pendingConflictRemovals.push(item.path);
-        }
-        return checkpoint;
-      });
-      if (!committed) {
-        automaticMetrics.textMerge.cancelled++;
-        return { executed: false };
-      }
-
-      const [localAfterCommit, remoteAfterCommit] = await Promise.all([
-        this.inspectLocalPath(item.path),
-        this.inspectRemotePath(item.path),
-      ]);
-      const fullyMerged = Boolean(localAfterCommit
-        && this.inspectionMatchesVersion(localAfterCommit, target));
-      if (localAfterCommit?.status === "present" && localAfterCommit.entry) {
-        item.local = localAfterCommit.entry;
-      } else if (localAfterCommit?.status === "missing") {
-        item.local = undefined;
-      }
-      if (remoteAfterCommit) item.remote = remoteAfterCommit;
-      result.uploaded++;
-      metrics.uploadBytes += target.size;
-      if (fullyMerged) {
-        automaticMetrics.textMerge.completed++;
-        return {
-          executed: true,
-          resolvedConflict: true,
-          completionActionType: SyncActionType.Upload,
-          completionReason: this.t("syncView.merge.autoMerged", { path: item.path }),
-        };
-      }
-      this.diag?.warn(
-        "execute",
-        `automatic merge preserved a newer local version after remote commit — ${item.path}`,
-      );
-      item.reason = item.local
-        ? "reason.bothSidesModified"
-        : "reason.localDeletedRemoteModified";
-      recordAutomaticMergeManual(
+      return await this.commitAutomaticTextMergeAttempt({
+        item,
+        metrics,
+        result,
+        callbacks,
         automaticMetrics,
-        "remote-committed-local-pending",
-      );
-      return { executed: true };
+        operationEpoch,
+        intent,
+        merge,
+        target,
+      });
     } catch (error) {
       const unresolved = this.state.mutationLedger.some(
         (entry) => entry.intent.operationId === intent.operationId,
@@ -16197,6 +19816,137 @@ export class SyncExecutor {
         await readyStore.complete(intent.operationId);
       }
     }
+  }
+
+  /** Durable automatic text-merge commit and post-commit reconciliation,
+   *  moved verbatim from tryAutomaticTextMerge's try body. */
+  private async commitAutomaticTextMergeAttempt(args: {
+    item: SyncPlanItem;
+    metrics: ExecutionMetrics;
+    result: SyncResult;
+    callbacks: SyncCallbacks;
+    automaticMetrics: ExecutionMetrics["automaticHandling"];
+    operationEpoch: number;
+    intent: MutationIntentV1;
+    merge: Extract<Awaited<ReturnType<typeof evaluateConservativeMergeV2>>, { status: "ready" }>;
+    target: NonNullable<MutationIntentV1["target"]>;
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      metrics,
+      result,
+      callbacks,
+      automaticMetrics,
+      operationEpoch,
+      intent,
+      merge,
+      target,
+    } = args;
+    const committed = await this.runDurableSideMutation(intent, operationEpoch, async () => {
+      const localBeforeRemote = await this.inspectLocalPath(item.path);
+      if (!localBeforeRemote
+        || localBeforeRemote.status === "uncertain"
+        || !this.inspectionMatchesExpectation(localBeforeRemote, intent.expectedLocal)) {
+        throw new MutationNotAppliedError(`Local version changed before automatic merge: ${item.path}`);
+      }
+
+      await this.trackTransfer(
+        "upload",
+        callbacks.onFileProgress,
+        (report) => this.onedrive.uploadFile(
+          this.vaultName,
+          item.path,
+          merge.mergedBytes,
+          report,
+          item.remote!.eTag,
+          item.remote!.driveId,
+        ),
+      );
+      const uploadedRemote = await this.inspectRemotePath(item.path);
+      if (!uploadedRemote || !await this.remoteMatchesTarget(uploadedRemote, target, true)) {
+        throw new Error(`Automatic merge remote read-back failed: ${item.path}`);
+      }
+      const remoteEntry: RemoteFileEntry = {
+        ...uploadedRemote,
+        parentId: this.requireKnownRemoteParentId(
+          item.path,
+          uploadedRemote.parentId,
+          item.remote?.parentId,
+        ),
+        sha256Hash: target.hash,
+      };
+
+      let localAfterRemote = await this.inspectLocalPath(item.path);
+      if (!localAfterRemote || localAfterRemote.status === "uncertain") {
+        throw new Error(`Local version could not be verified after automatic merge: ${item.path}`);
+      }
+      if (this.inspectionMatchesExpectation(localAfterRemote, intent.expectedLocal)) {
+        await this.commitMergeLocally(
+          item.path,
+          intent.expectedLocal as Extract<MutationIntentV1["expectedLocal"], { exists: true }>,
+          target,
+          merge.mergedBytes,
+        );
+        localAfterRemote = await this.inspectLocalPath(item.path);
+        if (!localAfterRemote || localAfterRemote.status === "uncertain") {
+          throw new Error(`Merged local version could not be verified: ${item.path}`);
+        }
+      }
+
+      const checkpoint = emptyMutationCheckpoint();
+      checkpoint.remoteUpserts.push(remoteEntry);
+      if (this.inspectionMatchesVersion(localAfterRemote, target)) {
+        checkpoint.baseUpserts.push({
+          path: item.path,
+          hash: target.hash,
+          size: target.size,
+          eTag: remoteEntry.eTag,
+        });
+        this.state.cacheBaseContent(item.path, merge.mergedBytes);
+        checkpoint.pendingConflictRemovals.push(item.path);
+      }
+      return checkpoint;
+    });
+    if (!committed) {
+      automaticMetrics.textMerge.cancelled++;
+      return { executed: false };
+    }
+
+    const [localAfterCommit, remoteAfterCommit] = await Promise.all([
+      this.inspectLocalPath(item.path),
+      this.inspectRemotePath(item.path),
+    ]);
+    const fullyMerged = Boolean(localAfterCommit
+      && this.inspectionMatchesVersion(localAfterCommit, target));
+    if (localAfterCommit?.status === "present" && localAfterCommit.entry) {
+      item.local = localAfterCommit.entry;
+    } else if (localAfterCommit?.status === "missing") {
+      item.local = undefined;
+    }
+    if (remoteAfterCommit) item.remote = remoteAfterCommit;
+    result.uploaded++;
+    metrics.uploadBytes += target.size;
+    if (fullyMerged) {
+      automaticMetrics.textMerge.completed++;
+      return {
+        executed: true,
+        resolvedConflict: true,
+        completionActionType: SyncActionType.Upload,
+        completionReason: this.t("syncView.merge.autoMerged", { path: item.path }),
+      };
+    }
+    this.diag?.warn(
+      "execute",
+      `automatic merge preserved a newer local version after remote commit — ${item.path}`,
+    );
+    item.reason = item.local
+      ? "reason.bothSidesModified"
+      : "reason.localDeletedRemoteModified";
+    recordAutomaticMergeManual(
+      automaticMetrics,
+      "remote-committed-local-pending",
+    );
+    return { executed: true };
   }
 
   private async queuePendingConflict(
@@ -16225,1262 +19975,118 @@ export class SyncExecutor {
     allowExcludedForRecovery = false,
   ): Promise<ItemExecutionResult> {
     switch (item.type) {
-      case SyncActionType.CreateRemoteFolder: {
-        if (!item.folder) return { executed: false };
-        const parentRemoteId = item.folder.parentRemoteId;
-        if (!parentRemoteId) return { executed: false };
-        const local = await this.inspectLocalFolder(item.path);
-        if (local.status !== "present") {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.local-source-changed"),
-          };
-        }
-
-        const target = await this.inspectRemoteFolder(item.path);
-        if (target.status === "file") {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.type-conflict"),
-          };
-        }
-        if (target.status === "folder") {
-          if (target.entry.parentId !== parentRemoteId) {
-            result.deferred++;
-            return {
-              executed: false,
-              completionActionType: SyncActionType.FolderDeferred,
-              completionReason: this.t("reason.folder.parent-chain-incomplete"),
-            };
-          }
-          result.foldersCreated = (result.foldersCreated ?? 0) + 1;
-          return {
-            executed: true,
-            mutationApplied: true,
-            folderUpsert: target.entry,
-          };
-        }
-
-        const envelope = this.state.getCommittedV2Envelope();
-        if (!envelope) {
-          throw new Error("Folder mutation requires the active V2 envelope");
-        }
-        const parentStillOwnsPath = item.folder.parentPath === ""
-          ? await this.onedrive.getDriveItemMetadataById(parentRemoteId)
-              .then((parent) => Boolean(parent?.folder && parent.id === parentRemoteId))
-          : await this.inspectRemoteFolder(item.folder.parentPath)
-              .then((parent) => {
-                const committedParent =
-                  envelope.remoteIndex.itemsById[parentRemoteId];
-                return parent.status === "folder"
-                  && parent.entry.driveId === parentRemoteId
-                  && committedParent?.kind === "folder"
-                  && parent.entry.parentId === committedParent.parentId;
-              });
-        if (!parentStillOwnsPath) {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.parent-version-changed"),
-          };
-        }
-        const folderUpsert = await this.createRemoteFolderWithReadback(
-          item.path,
-          parentRemoteId,
-        );
-        result.foldersCreated = (result.foldersCreated ?? 0) + 1;
-        return {
-          executed: true,
-          mutationApplied: true,
-          folderUpsert,
-        };
-      }
-
-      case SyncActionType.CreateLocalFolder: {
-        if (!item.folder?.remoteId || !item.folder.parentRemoteId) {
-          return { executed: false };
-        }
-        const remote = await this.inspectRemoteFolder(item.path);
-        if (
-          remote.status !== "folder"
-          || remote.entry.driveId !== item.folder.remoteId
-          || remote.entry.parentId !== item.folder.parentRemoteId
-          || (
-            item.folder.remoteETag !== undefined
-            && remote.entry.eTag !== item.folder.remoteETag
-          )
-        ) {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.remote-version-changed"),
-          };
-        }
-
-        const local = await this.inspectLocalFolder(item.path);
-        if (local.status === "file" || local.status === "uncertain") {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t(
-              local.status === "file"
-                ? "reason.folder.type-conflict"
-                : "reason.folder.local-inspection-failed",
-            ),
-          };
-        }
-        if (local.status === "missing") {
-          await this.createLocalFolder(item.path);
-          const readback = await this.inspectLocalFolderAfterFolderCreate(
-            item.path,
-          );
-          if (readback.status !== "present") {
-            throw new LocalFolderCreateUnconfirmedError(item.path);
-          }
-        }
-        result.foldersCreated = (result.foldersCreated ?? 0) + 1;
-        return {
-          executed: true,
-          mutationApplied: true,
-          folderUpsert: remote.entry,
-        };
-      }
-
-      case SyncActionType.MoveRemoteFolder: {
-        if (
-          !item.renameFrom
-          || !item.folder?.remoteId
-          || !item.folder.parentRemoteId
-          || !item.folder.sourceParentRemoteId
-          || !item.folder.remoteETag
-        ) return { executed: false };
-        const [localSource, localTarget, remoteSource, remoteTarget] = await Promise.all([
-          this.inspectLocalFolder(item.renameFrom),
-          this.inspectLocalFolder(item.path),
-          this.inspectRemoteFolder(item.renameFrom),
-          this.inspectRemoteFolder(item.path),
-        ]);
-        if (
-          localSource.status !== "missing"
-          || localTarget.status !== "present"
-          || remoteTarget.status !== "missing"
-          || remoteSource.status !== "folder"
-          || remoteSource.entry.driveId !== item.folder.remoteId
-          || remoteSource.entry.parentId !== item.folder.sourceParentRemoteId
-          || remoteSource.entry.eTag !== item.folder.remoteETag
-        ) {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.remote-version-changed"),
-          };
-        }
-        const [targetParent, targetParentByPath] = await Promise.all([
-          this.onedrive.getDriveItemMetadataById(item.folder.parentRemoteId),
-          item.folder.parentPath === ""
-            ? Promise.resolve(null)
-            : this.inspectRemoteFolder(item.folder.parentPath),
-        ]);
-        if (
-          !targetParent?.folder
-          || targetParent.id !== item.folder.parentRemoteId
-          || (
-            item.folder.parentPath !== ""
-            && (
-              targetParentByPath?.status !== "folder"
-              || targetParentByPath.entry.driveId !== item.folder.parentRemoteId
-            )
-          )
-        ) {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.parent-version-changed"),
-          };
-        }
-        if (!this.canContinue(operationEpoch, result)) return { executed: false };
-
-        let moved: DriveItem;
-        try {
-          moved = await this.onedrive.moveItemById(
-            item.folder.remoteId,
-            item.folder.remoteETag,
-            folderName(item.path),
-            item.folder.parentRemoteId,
-          );
-        } catch (error) {
-          if (!(error instanceof OneDriveError) || !isRemoteMutationConflict(error)) throw error;
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.remote-version-changed"),
-          };
-        }
-        const folderUpsert = toRemoteFolderEntry(item.path, moved);
-        const [sourceAfter, targetAfter, idAfter] = await Promise.all([
-          this.inspectRemoteFolder(item.renameFrom),
-          this.inspectRemoteFolder(item.path),
-          this.onedrive.getDriveItemMetadataById(item.folder.remoteId),
-        ]);
-        if (
-          sourceAfter.status !== "missing"
-          || targetAfter.status !== "folder"
-          || targetAfter.entry.driveId !== item.folder.remoteId
-          || targetAfter.entry.parentId !== item.folder.parentRemoteId
-          || !idAfter?.folder
-          || idAfter.id !== item.folder.remoteId
-          || idAfter.parentReference?.id !== item.folder.parentRemoteId
-          || folderUpsert.driveId !== targetAfter.entry.driveId
-          || folderUpsert.eTag !== targetAfter.entry.eTag
-        ) {
-          throw new Error(`Remote folder move read-back failed: ${item.renameFrom} -> ${item.path}`);
-        }
-        result.foldersMoved = (result.foldersMoved ?? 0) + 1;
-        return {
-          executed: true,
-          mutationApplied: true,
-          folderUpsert: targetAfter.entry,
-        };
-      }
-
-      case SyncActionType.MoveLocalFolder: {
-        if (
-          !item.renameFrom
-          || !item.folder?.remoteId
-          || !item.folder.parentRemoteId
-          || !item.folder.remoteETag
-        ) return { executed: false };
-        const [localSource, localTarget, remoteSource, remoteTarget] = await Promise.all([
-          this.inspectLocalFolder(item.renameFrom),
-          this.inspectLocalFolder(item.path),
-          this.inspectRemoteFolder(item.renameFrom),
-          this.inspectRemoteFolder(item.path),
-        ]);
-        if (
-          localSource.status !== "present"
-          || localTarget.status !== "missing"
-          || remoteSource.status !== "missing"
-          || remoteTarget.status !== "folder"
-          || remoteTarget.entry.driveId !== item.folder.remoteId
-          || remoteTarget.entry.parentId !== item.folder.parentRemoteId
-          || remoteTarget.entry.eTag !== item.folder.remoteETag
-        ) {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.local-source-changed"),
-          };
-        }
-        if (!this.canContinue(operationEpoch, result)) return { executed: false };
-        await this.renameLocalFolder(item.renameFrom, item.path);
-        result.foldersMoved = (result.foldersMoved ?? 0) + 1;
-        return {
-          executed: true,
-          mutationApplied: true,
-          folderUpsert: remoteTarget.entry,
-        };
-      }
-
-      case SyncActionType.DeleteRemoteFolder: {
-        if (
-          !item.folder?.remoteId
-          || !item.folder.sourceParentRemoteId
-          || !item.folder.remoteETag
-        ) return { executed: false };
-        const local = await this.inspectLocalFolder(item.path);
-        if (local.status !== "missing") {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.local-source-changed"),
-          };
-        }
-        const [byId, byPath] = await Promise.all([
-          this.onedrive.getDriveItemMetadataById(item.folder.remoteId),
-          this.onedrive.getDriveItemMetadata(this.vaultName, item.path),
-        ]);
-        if (!byId) {
-          if (byPath !== null) {
-            result.deferred++;
-            return {
-              executed: false,
-              completionActionType: SyncActionType.FolderDeferred,
-              completionReason: this.t("reason.folder.remote-version-changed"),
-            };
-          }
-          result.foldersDeleted = (result.foldersDeleted ?? 0) + 1;
-          return {
-            executed: true,
-            mutationApplied: true,
-            folderDelete: { path: item.path, driveId: item.folder.remoteId },
-          };
-        }
-        const exact = await this.inspectExactEmptyRemoteFolder({
-          path: item.path,
-          remoteId: item.folder.remoteId,
-          remoteETag: item.folder.remoteETag,
-          parentRemoteId: item.folder.sourceParentRemoteId,
+      case SyncActionType.CreateRemoteFolder:
+        return this.executeCreateRemoteFolderItem({
+          item,
+          result,
         });
-        if (exact.status !== "exact") {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t(exact.status === "not-empty"
-              ? "reason.folder.remote-subtree-changed"
-              : "reason.folder.remote-version-changed"),
-          };
-        }
-        // OneDrive Personal does not return folder cTags, so an empty-shell
-        // delete cannot always build an If-Match from the content tag. The
-        // exact inspection above already verified the identity and eTag twice
-        // (by id and by path, children empty, versions stable), so fall back
-        // to that verified eTag; defer only when neither tag is available.
-        // Without this the empty shell delete defers forever on Personal with
-        // no user-side remedy.
-        const deleteMatchTag = exact.contentTag ?? item.folder.remoteETag;
-        if (!deleteMatchTag) {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t(
-              "reason.folder.remote-content-version-unavailable",
-            ),
-          };
-        }
-        const localBeforeDelete = await this.inspectLocalFolder(item.path);
-        if (localBeforeDelete.status !== "missing") {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.local-source-changed"),
-          };
-        }
-        if (!this.canContinue(operationEpoch, result)) return { executed: false };
-        try {
-          await this.onedrive.deleteItem(
-            this.vaultName,
-            item.path,
-            deleteMatchTag,
-            item.folder.remoteId,
-          );
-        } catch (error) {
-          if (!(error instanceof OneDriveError) || !isRemoteMutationConflict(error)) throw error;
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.remote-version-changed"),
-          };
-        }
-        if (await this.onedrive.getDriveItemMetadataById(item.folder.remoteId)) {
-          throw new Error(`Remote folder delete read-back failed: ${item.path}`);
-        }
-        result.foldersDeleted = (result.foldersDeleted ?? 0) + 1;
-        return {
-          executed: true,
-          mutationApplied: true,
-          folderDelete: { path: item.path, driveId: item.folder.remoteId },
-        };
-      }
-
-      case SyncActionType.DeleteLocalFolder: {
-        if (!item.folder?.remoteId) return { executed: false };
-        if (item.requiresConfirmation) {
-          return { executed: true };
-        }
-        const [remoteById, remoteByPath, local] = await Promise.all([
-          this.onedrive.getDriveItemMetadataById(item.folder.remoteId),
-          this.inspectRemoteFolder(item.path),
-          this.inspectLocalFolder(item.path),
-        ]);
-        if (
-          remoteById
-          || remoteByPath.status !== "missing"
-          || local.status === "file"
-          || local.status === "uncertain"
-        ) {
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.FolderDeferred,
-            completionReason: this.t("reason.folder.local-inspection-failed"),
-          };
-        }
-        if (local.status === "present") {
-          if (!this.canContinue(operationEpoch, result)) return { executed: false };
-          await this.deleteEmptyLocalFolder(item.path);
-        }
-        result.foldersDeleted = (result.foldersDeleted ?? 0) + 1;
-        return {
-          executed: true,
-          mutationApplied: true,
-          folderDelete: { path: item.path, driveId: item.folder.remoteId },
-        };
-      }
-
-      case SyncActionType.MoveLocalFile: {
-        if (!item.renameFrom || !item.local || !item.remote) return { executed: false };
-        const [sourceLocal, targetLocal, remoteSource, remoteTarget] = await Promise.all([
-          this.inspectLocalPath(item.renameFrom),
-          this.inspectLocalPath(item.path),
-          this.inspectRemotePath(item.renameFrom),
-          this.inspectRemotePath(item.path),
-        ]);
-        if (
-          !sourceLocal
-          || !targetLocal
-          || sourceLocal.status === "uncertain"
-          || targetLocal.status === "uncertain"
-          || !this.localExpectationMatches(item.local, sourceLocal)
-          || targetLocal.status !== "missing"
-          || remoteSource !== undefined
-          || !this.remoteMatchesExpectation(remoteTarget, {
-            exists: true,
-            driveId: item.remote.driveId,
-            eTag: item.remote.eTag,
-            size: item.remote.size,
-            sha256Hash: item.remote.sha256Hash,
-          })
-        ) {
-          if (factsChangedPolicy === "throw") {
-            throw new MutationNotAppliedError(
-              new Error(`Manual local move facts changed: ${item.path}`),
-            );
-          }
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.RetryLater,
-            completionReason: this.t("syncView.fileStatus.deferred"),
-          };
-        }
-        if (!this.canContinue(operationEpoch, result)) return { executed: false };
-        await this.renameLocalFile(item.renameFrom, item.path);
-        const [sourceAfter, targetAfter] = await Promise.all([
-          this.inspectLocalPath(item.renameFrom),
-          this.inspectLocalPath(item.path),
-        ]);
-        if (
-          !sourceAfter
-          || !targetAfter
-          || sourceAfter.status !== "missing"
-          || !this.localExpectationMatches(item.local, targetAfter)
-        ) {
-          throw new Error(`Local file move read-back failed: ${item.renameFrom} -> ${item.path}`);
-        }
-        if (targetAfter.status !== "present" || !targetAfter.entry) {
-          throw new Error(`Local file move read-back failed: ${item.renameFrom} -> ${item.path}`);
-        }
-        const targetEntry = targetAfter.entry;
-        // A1 one-shot converge: the remote identity was moved AND its content
-        // version advanced while the local side stayed unchanged. Align the
-        // moved local file to the exact remote bytes in the same action, so
-        // the mutation receipt proves "local target == remote version" (the
-        // same proof shape conservative reset already requires) instead of
-        // leaving an unreceiptable intermediate state. Without a known remote
-        // hash the plain move receipt stays admissible (shape 3 in
-        // conservative-reset-recovery) and the ordinary same-path decision
-        // converges the bytes on the next round (the A1 comment contract), so
-        // alignment is limited to a proven difference.
-        const needsAlignment = item.remote.sha256Hash !== undefined
-          && (
-            item.remote.size !== targetEntry.size
-            || targetEntry.hash.toLowerCase() !== item.remote.sha256Hash.toLowerCase()
-          );
-        if (needsAlignment) {
-          const aligned = await this.alignLocalTargetBytes(
-            item.path,
-            item.remote,
-            targetEntry,
-            callbacks.onFileProgress,
-          );
-          remoteDeletes.push(item.renameFrom);
-          remoteUpserts.push({ ...item.remote, path: item.path });
-          result.filesMoved = (result.filesMoved ?? 0) + 1;
-          return {
-            executed: true,
-            mutationApplied: true,
-            baseRemoval: item.renameFrom,
-            baseUpsert: {
-              path: item.path,
-              hash: aligned.hash,
-              size: aligned.size,
-              eTag: item.remote.eTag,
-            },
-          };
-        }
-        remoteDeletes.push(item.renameFrom);
-        remoteUpserts.push({ ...item.remote, path: item.path });
-        result.filesMoved = (result.filesMoved ?? 0) + 1;
-        return {
-          executed: true,
-          mutationApplied: true,
-          baseRemoval: item.renameFrom,
-          baseUpsert: {
-            path: item.path,
-            hash: item.local.hash,
-            size: item.local.size,
-            eTag: item.remote.eTag,
-          },
-        };
-      }
-
-      case SyncActionType.Upload: {
-        if (!item.local) break;
-        const readStartedAt = Date.now();
-        const content = await this.scanner.vault.adapter.readBinary(item.path);
-        const readElapsedMs = Date.now() - readStartedAt;
-        metrics.uploadReadMs += readElapsedMs;
-        metrics.fileTransfers.upload.stagesMs.sourceRead += readElapsedMs;
-        if (!this.canContinue(operationEpoch, result)) return { executed: false };
-
-        // Re-check hash — file may have changed since scan.
-        // If hash differs, skip this round; the change will be picked up next sync.
-        const hashStartedAt = Date.now();
-        const actualHash = await sha256Hex(content);
-        metrics.fileTransfers.upload.stagesMs.contentHash += Date.now() - hashStartedAt;
-        if (actualHash !== item.local.hash) {
-          this.diag?.warn("execute", `upload skipped — ${item.path} hash changed since scan (${item.local.hash.slice(0, 8)}… → ${actualHash.slice(0, 8)}…)`);
-          if (factsChangedPolicy === "throw") {
-            throw new MutationNotAppliedError(
-              new Error(`Manual upload source changed: ${item.path}`),
-            );
-          }
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.RetryLater,
-            completionReason: this.t("syncView.fileStatus.deferred"),
-          };
-        }
-        if (!this.canContinue(operationEpoch, result)) return { executed: false };
-
-        metrics.activeUploads++;
-        metrics.peakUploads = Math.max(metrics.peakUploads, metrics.activeUploads);
-        const uploadStartedAt = Date.now();
-        let uploadResult: UploadResult;
-        try {
-          uploadResult = await this.trackTransfer(
-            "upload",
-            callbacks.onFileProgress,
-            (report) => this.onedrive.uploadFile(
-              this.vaultName,
-              item.path,
-              content,
-              report,
-              item.baseEtag,
-              item.remote?.driveId,
-            ),
-          );
-          const uploadElapsedMs = Date.now() - uploadStartedAt;
-          metrics.uploadNetworkMs += uploadElapsedMs;
-          metrics.fileTransfers.upload.stagesMs.contentTransfer += uploadElapsedMs;
-        } catch (e) {
-          const uploadElapsedMs = Date.now() - uploadStartedAt;
-          metrics.uploadNetworkMs += uploadElapsedMs;
-          metrics.fileTransfers.upload.stagesMs.contentTransfer += uploadElapsedMs;
-          if (
-            e instanceof OneDriveError
-            && isRemoteMutationConflict(e)
-          ) {
-            if (factsChangedPolicy === "throw") {
-              metrics.activeUploads--;
-              throw new MutationNotAppliedError(e);
-            }
-            // Another device changed this file since we scanned remote.
-            // Fetch current remote state and route to conflict.
-            const fresh = await this.onedrive.getFileMetadata(
-              this.vaultName,
-              item.path,
-            );
-            if (!this.canContinue(operationEpoch, result)) {
-              metrics.activeUploads--;
-              return { executed: false };
-            }
-            if (fresh) {
-              metrics.activeUploads--;
-              const remoteEntry = this.toMetadataRemoteEntry(
-                item.path,
-                fresh,
-                item.remote?.parentId,
-              );
-              const metadataEquality = resolveContentEquality({
-                local: item.local,
-                remote: { ...fresh, eTag: fresh.eTag },
-              });
-              let sameContent = metadataEquality.status === "equal";
-              if (metadataEquality.status === "unknown") {
-                try {
-                  sameContent = await this.remoteMatchesTarget(
-                    remoteEntry,
-                    item.local,
-                    true,
-                  );
-                } catch (comparisonError) {
-                  this.diag?.warn(
-                    "execute",
-                    `upload race content read-back failed — ${item.path}`,
-                    comparisonError,
-                  );
-                }
-              }
-              if (!this.canContinue(operationEpoch, result)) {
-                return { executed: false };
-              }
-              if (sameContent) {
-                remoteUpserts.push(remoteEntry);
-                this.convergencesThisRound++;
-                return {
-                  executed: true,
-                  baseUpsert: StateManager.toBaseEntry(item.local, remoteEntry),
-                };
-              }
-              remoteUpserts.push(remoteEntry);
-              return this.queuePendingConflict({
-                type: SyncActionType.Conflict,
-                path: item.path,
-                local: item.local,
-                remote: remoteEntry,
-                reason: "reason.bothSidesModified",
-              }, result, operationEpoch);
-            }
-            // File was deleted remotely — re-upload without If-Match
-            if (!this.canContinue(operationEpoch, result)) {
-              metrics.activeUploads--;
-              return { executed: false };
-            }
-            const retryStartedAt = Date.now();
-            try {
-              uploadResult = await this.trackTransfer(
-                "upload",
-                callbacks.onFileProgress,
-                (report) => this.onedrive.uploadFile(
-                  this.vaultName,
-                  item.path,
-                  content,
-                  report,
-                ),
-              );
-            } catch (retryError) {
-              if (retryError instanceof OneDriveError && isRemoteMutationConflict(retryError)) {
-                const raced = await this.onedrive.getFileMetadata(this.vaultName, item.path);
-                if (!this.canContinue(operationEpoch, result)) {
-                  metrics.activeUploads--;
-                  return { executed: false };
-                }
-                if (raced) {
-                  const racedEntry = this.toMetadataRemoteEntry(
-                    item.path,
-                    raced,
-                    item.remote?.parentId,
-                  );
-                  metrics.activeUploads--;
-                  remoteUpserts.push(racedEntry);
-                  return this.queuePendingConflict({
-                    type: SyncActionType.Conflict,
-                    path: item.path,
-                    local: item.local,
-                    remote: racedEntry,
-                    reason: "reason.newFileBothSides",
-                  }, result, operationEpoch);
-                }
-              }
-              metrics.activeUploads--;
-              throw retryError;
-            }
-            const retryElapsedMs = Date.now() - retryStartedAt;
-            metrics.uploadNetworkMs += retryElapsedMs;
-            metrics.fileTransfers.upload.stagesMs.contentTransfer += retryElapsedMs;
-            // fall through to post-upload logic
-          } else {
-            metrics.activeUploads--;
-            throw e;
-          }
-        }
-        metrics.activeUploads--;
-
-        const baseUpsert: BaseFileEntry = {
-          path: item.path,
-          hash: item.local.hash,
-          size: item.local.size,
-          eTag: uploadResult.eTag ?? "",
-        };
-        metrics.uploadBytes += item.local.size;
-        remoteUpserts.push(this.toUploadedRemoteEntry(
-          item.path,
-          item.local,
-          uploadResult,
-          item.remote?.parentId,
-        ));
-        result.uploaded++;
-        this.state.cacheBaseContent(item.path, content);
-        return { executed: true, mutationApplied: true, baseUpsert };
-      }
-
-      case SyncActionType.Download: {
-        if (!item.remote) break;
-        const usesLocalCas = typeof (this.scanner as LocalScanner & { inspectFile?: unknown }).inspectFile === "function";
-        const firstLocalGuardStartedAt = Date.now();
-        const beforeDownload = await this.guardDownloadLocalVersion(
+      case SyncActionType.CreateLocalFolder:
+        return this.executeCreateLocalFolderItem({
+          item,
+          result,
+        });
+      case SyncActionType.MoveRemoteFolder:
+        return this.executeMoveRemoteFolderItem({
           item,
           result,
           operationEpoch,
-          factsChangedPolicy,
-          allowExcludedForRecovery,
-        );
-        metrics.fileTransfers.download.stagesMs.localVersionGuard +=
-          Date.now() - firstLocalGuardStartedAt;
-        if (beforeDownload) return beforeDownload;
-        const remote = item.remote;
-        const streamAdapter = this.getStreamDownloadAdapter(remote.size);
-        const tempDownloadPath = streamAdapter ? this.getDownloadTempPath(item.path) : null;
-        let streamedDownload: { size: number; hash: string } | null = null;
-        let content: ArrayBuffer | null = preparedDownload?.content ?? null;
-        if (preparedDownload?.downloaded) {
-          streamedDownload = preparedDownload.downloaded;
-          // 社区插件整包预下载把内容保存在内存里，从未写过流式临时文件；而
-          // 提交门 commitDownloadedTempFile 会按临时文件字节校验。移动端
-          // ≥8MiB 的被选插件下载若直接进入该门，临时文件不存在将稳定判定
-          // “Downloaded temp file verification failed”。这里用一次有界写入
-          // 把预下载内容落到临时路径，再交给既有的提交门做完整字节核对。
-          if (streamAdapter && tempDownloadPath && content) {
-            await this.ensureParentDirs(tempDownloadPath);
-            await this.removePathIfExists(tempDownloadPath);
-            await this.writeBinaryTempFileWithAndroidZeroByteRetry(
-              item.path,
-              tempDownloadPath,
-              content,
-            );
-          }
-        } else if (streamAdapter && tempDownloadPath) {
-          await this.ensureParentDirs(tempDownloadPath);
-          this.diag?.log("execute", `download streaming to temp file — ${item.path}`);
-          const transferStartedAt = Date.now();
-          try {
-            streamedDownload = await this.trackTransfer(
-              "download",
-              callbacks.onFileProgress,
-              (report) => this.onedrive.downloadFileToPath(
-                this.vaultName,
-                item.path,
-                tempDownloadPath,
-                streamAdapter,
-                remote.downloadUrl,
-                remote.driveId,
-                remote.size,
-                remote.sha256Hash,
-                report,
-              ),
-            );
-          } finally {
-            metrics.fileTransfers.download.stagesMs.contentTransfer +=
-              Date.now() - transferStartedAt;
-          }
-        } else {
-          const transferStartedAt = Date.now();
-          try {
-            content = await this.trackTransfer(
-              "download",
-              callbacks.onFileProgress,
-              (report) => this.onedrive.downloadFile(
-                this.vaultName,
-                remote.path,
-                remote.downloadUrl,
-                remote.driveId,
-                remote.size,
-                report,
-              ),
-            );
-          } finally {
-            metrics.fileTransfers.download.stagesMs.contentTransfer +=
-              Date.now() - transferStartedAt;
-          }
-        }
-        let downloaded = streamedDownload;
-        if (!downloaded) {
-          const hashStartedAt = Date.now();
-          downloaded = {
-            size: (content as ArrayBuffer).byteLength,
-            hash: await sha256Hex(content as ArrayBuffer),
-          };
-          metrics.fileTransfers.download.stagesMs.contentHash += Date.now() - hashStartedAt;
-        }
-        if (!preparedDownload?.downloaded) {
-          const remoteVerifyStartedAt = Date.now();
-          try {
-            await this.verifyDownloadedPayload(
-              item.remote.path,
-              item.remote,
-              downloaded,
-            );
-          } catch (error) {
-            if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
-            throw error;
-          } finally {
-            metrics.fileTransfers.download.stagesMs.remoteVersionVerify +=
-              Date.now() - remoteVerifyStartedAt;
-          }
-        }
-        if (!this.canContinue(operationEpoch, result)) {
-          if (tempDownloadPath) {
-            await this.removePathIfExists(tempDownloadPath);
-          }
-          return { executed: false };
-        }
-        if (factsChangedPolicy === "throw") {
-          const currentRemote = await this.inspectRemotePath(item.path);
-          if (!this.remoteMatchesExpectation(currentRemote, {
-            exists: true,
-            driveId: item.remote.driveId,
-            eTag: item.remote.eTag,
-            size: item.remote.size,
-            sha256Hash: item.remote.sha256Hash,
-          })) {
-            if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
-            throw new MutationNotAppliedError(
-              new Error(`Manual download remote facts changed: ${item.path}`),
-            );
-          }
-          if (!this.canContinue(operationEpoch, result)) {
-            if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
-            throw new MutationNotAppliedError(new Error("Manual mutation was cancelled"));
-          }
-        }
-        const secondLocalGuardStartedAt = Date.now();
-        const beforeWrite = await this.guardDownloadLocalVersion(
+        });
+      case SyncActionType.MoveLocalFolder:
+        return this.executeMoveLocalFolderItem({
           item,
           result,
           operationEpoch,
+        });
+      case SyncActionType.DeleteRemoteFolder:
+        return this.executeDeleteRemoteFolderItem({
+          item,
+          result,
+          operationEpoch,
+        });
+      case SyncActionType.DeleteLocalFolder:
+        return this.executeDeleteLocalFolderItem({
+          item,
+          result,
+          operationEpoch,
+        });
+      case SyncActionType.MoveLocalFile:
+        return this.executeMoveLocalFileItem({
+          item,
+          result,
+          remoteUpserts,
+          remoteDeletes,
+          callbacks,
+          operationEpoch,
+          factsChangedPolicy,
+        });
+      case SyncActionType.Upload:
+        return this.executeUploadItem({
+          item,
+          result,
+          remoteUpserts,
+          metrics,
+          callbacks,
+          operationEpoch,
+          factsChangedPolicy,
+        });
+      case SyncActionType.Download:
+        return this.executeDownloadItem({
+          item,
+          result,
+          metrics,
+          callbacks,
+          operationEpoch,
+          preparedDownload,
           factsChangedPolicy,
           allowExcludedForRecovery,
-        );
-        metrics.fileTransfers.download.stagesMs.localVersionGuard +=
-          Date.now() - secondLocalGuardStartedAt;
-        if (beforeWrite) {
-          if (tempDownloadPath) {
-            await this.removePathIfExists(tempDownloadPath);
-          }
-          return beforeWrite;
-        }
-        const localCommitStartedAt = Date.now();
-        // Ensure all parent directories exist (recursive)
-        if (!this.canContinue(operationEpoch, result)) return { executed: false };
-        await this.ensureParentDirs(item.path);
-        // Verify local file hasn't changed since scan before overwriting.
-        // If the local file was modified after the scan, route to conflict
-        // instead of silently overwriting the user's changes.
-        if (!usesLocalCas && item.local) {
-          let currentContent: ArrayBuffer | null = null;
-          try { currentContent = await this.scanner.vault.adapter.readBinary(item.path); } catch { /* file doesn't exist yet */ }
-          if (currentContent) {
-            const currentHash = await sha256Hex(currentContent);
-            if (currentHash !== item.local.hash) {
-              this.diag?.warn("execute", `download blocked — ${item.path} was modified locally since scan (${item.local.hash.slice(0, 8)}… → ${currentHash.slice(0, 8)}…)`);
-              if (factsChangedPolicy === "throw") {
-                if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
-                throw new MutationNotAppliedError(
-                  new Error(`Manual download local facts changed: ${item.path}`),
-                );
-              }
-              if (this.localMatchesRemoteHash({ hash: currentHash, size: currentContent.byteLength }, item.remote)) {
-                if (tempDownloadPath) {
-                  await this.removePathIfExists(tempDownloadPath);
-                }
-                return {
-                  executed: true,
-                  baseUpsert: StateManager.toBaseEntry(
-                    { ...item.local, hash: currentHash, size: currentContent.byteLength },
-                    item.remote,
-                  ),
-                };
-              }
-              const stat = await this.scanner.vault.adapter.stat(item.path);
-              if (tempDownloadPath) {
-                await this.removePathIfExists(tempDownloadPath);
-              }
-              return this.queuePendingConflict({
-                ...item,
-                type: SyncActionType.Conflict,
-                local: {
-                  ...item.local,
-                  hash: currentHash,
-                  size: currentContent.byteLength,
-                  mtime: stat?.mtime ?? item.local.mtime,
-                },
-                reason: "reason.bothSidesModified",
-              }, result, operationEpoch);
-            }
-          }
-        }
-        let fileStat: { size: number; mtime?: number } | null = null;
-        if (!this.canContinue(operationEpoch, result)) return { executed: false };
-        if (streamAdapter && tempDownloadPath && streamedDownload) {
-          try {
-            if (usesLocalCas) {
-              fileStat = await this.commitDownloadedTempFile(
-                streamAdapter,
-                item.path,
-                tempDownloadPath,
-                item.local,
-                streamedDownload,
-              );
-            } else {
-              // Compatibility path for isolated/legacy scanner doubles. The
-              // production LocalScanner always exposes inspectFile().
-              await streamAdapter.rename(tempDownloadPath, item.path);
-              const stat = await streamAdapter.stat(item.path);
-              fileStat = stat ? { size: stat.size, mtime: stat.mtime } : null;
-            }
-          } catch (writeErr) {
-            this.diag?.warn("execute", `streamed download commit failed for ${item.path}, recovery attempted`, writeErr instanceof Error ? writeErr.message : String(writeErr));
-            if (writeErr instanceof LocalCommitPreconditionError) {
-              if (factsChangedPolicy === "throw") {
-                throw new MutationNotAppliedError(writeErr);
-              }
-              const guarded = await this.guardDownloadLocalVersion(item, result, operationEpoch);
-              if (guarded) return guarded;
-              result.deferred++;
-              return {
-                executed: false,
-                completionActionType: SyncActionType.RetryLater,
-                completionReason: this.t("syncView.fileStatus.deferred"),
-              };
-            }
-            throw writeErr;
-          }
-        } else {
-          // Write and verify away from the target, then journal the short
-          // replacement window so a restart can roll it back safely.
-          if (!usesLocalCas) {
-            await this.scanner.vault.adapter.writeBinary(item.path, content as ArrayBuffer);
-            const stat = await this.scanner.vault.adapter.stat(item.path);
-            fileStat = stat ? { size: stat.size, mtime: stat.mtime } : null;
-          } else {
-            const readyPath = `${this.getDownloadTempPath(item.path)}.ready`;
-            try {
-              await this.ensureParentDirs(readyPath);
-              await this.removePathIfExists(readyPath);
-              await this.writeBinaryTempFileWithAndroidZeroByteRetry(
-                item.path,
-                readyPath,
-                content as ArrayBuffer,
-              );
-              const readyBytes = await this.scanner.vault.adapter.readBinary(readyPath);
-              if (
-                readyBytes.byteLength !== (content as ArrayBuffer).byteLength
-                || await sha256Hex(readyBytes) !== downloaded.hash
-              ) {
-                throw new Error(`Downloaded temp file verification failed: ${item.path}`);
-              }
-              fileStat = await this.commitDownloadedTempFile(
-                this.scanner.vault.adapter,
-                item.path,
-                readyPath,
-                item.local,
-                downloaded,
-              );
-            } catch (writeErr) {
-              await this.removePathIfExists(readyPath);
-              this.diag?.warn("execute", `download write failed for ${item.path}, recovery attempted`, writeErr instanceof Error ? writeErr.message : String(writeErr));
-              if (writeErr instanceof LocalCommitPreconditionError) {
-                if (factsChangedPolicy === "throw") {
-                  throw new MutationNotAppliedError(writeErr);
-                }
-                const guarded = await this.guardDownloadLocalVersion(item, result, operationEpoch);
-                if (guarded) return guarded;
-                result.deferred++;
-                return {
-                  executed: false,
-                  completionActionType: SyncActionType.RetryLater,
-                  completionReason: this.t("syncView.fileStatus.deferred"),
-                };
-              }
-              throw writeErr;
-            }
-          }
-        }
-        metrics.fileTransfers.download.stagesMs.localCommit +=
-          Date.now() - localCommitStartedAt;
-
-        const hash = downloaded.hash;
-        result.downloaded++;
-        if (content) {
-          this.state.cacheBaseContent(item.path, content);
-        }
-        return {
-          executed: true,
-          mutationApplied: true,
-          baseUpsert: {
-            path: item.path,
-            hash,
-            size: fileStat?.size ?? downloaded.size,
-            eTag: item.remote.eTag,
-          },
-        };
-      }
-
-      case SyncActionType.DeleteRemote: {
-        try {
-          if (!this.canContinue(operationEpoch, result)) return { executed: false };
-          await this.onedrive.deleteItem(
-            this.vaultName,
-            item.path,
-            item.remote?.eTag,
-            item.remote?.driveId,
-          );
-        } catch (e) {
-          if (e instanceof OneDriveError && isRemoteMutationConflict(e)) {
-            if (factsChangedPolicy === "throw") {
-              throw new MutationNotAppliedError(e);
-            }
-            // File was modified remotely since plan — route to conflict
-            this.diag?.warn("execute", `delete blocked — ${item.path} eTag changed since plan`);
-            const fresh = await this.onedrive.getFileMetadata(
-              this.vaultName,
-              item.path,
-            );
-            if (!this.canContinue(operationEpoch, result)) return { executed: false };
-            if (!fresh) {
-              remoteDeletes.push(item.path);
-              result.deleted++;
-              return { executed: true, baseRemoval: item.path };
-            }
-            const remoteEntry = this.toMetadataRemoteEntry(
-              item.path,
-              fresh,
-              item.remote?.parentId,
-            );
-            remoteUpserts.push(remoteEntry);
-            return this.queuePendingConflict({
-              type: SyncActionType.Conflict,
-              path: item.path,
-              remote: remoteEntry,
-              reason: "reason.localDeletedRemoteModified",
-            }, result, operationEpoch);
-          }
-          throw e;
-        }
-        remoteDeletes.push(item.path);
-        result.deleted++;
-        return { executed: true, mutationApplied: true, baseRemoval: item.path };
-      }
-
-      case SyncActionType.DeleteLocal: {
-        if (!item.local) return { executed: false };
-        if (isObsidianManagedConfigPath(item.path, getConfigDir(this.scanner.vault))) {
-          throw new MutationNotAppliedError(
-            new Error(this.t("notice.decisionExpired")),
-          );
-        }
-        let current: LocalFileInspection;
-        try {
-          if (!this.canContinue(operationEpoch, result)) return { executed: false };
-          const remote = await this.onedrive.getFileMetadata(this.vaultName, item.path);
-          if (!this.canContinue(operationEpoch, result)) return { executed: false };
-          if (remote) throw new Error(this.t("notice.decisionExpired"));
-
-          const inspected = await this.inspectLocalPath(item.path);
-          if (!inspected || inspected.status === "uncertain") {
-            throw new Error(this.t("notice.localChangedSinceReview"));
-          }
-          if (
-            inspected.status === "present"
-            && !this.localExpectationMatches(item.local, inspected)
-          ) {
-            throw new LocalVersionChangedBeforeDeleteError(item.path);
-          }
-          current = inspected;
-        } catch (error) {
-          throw new MutationNotAppliedError(error);
-        }
-        if (!this.canContinue(operationEpoch, result)) return { executed: false };
-        if (current.status === "present") await this.deleteLocalPath(item.path);
-        result.deleted++;
-        return { executed: true, mutationApplied: true, baseRemoval: item.path };
-      }
-
-      case SyncActionType.RenameRemote: {
-        if (!item.renameFrom || !item.local || !item.remote) return { executed: false };
-        if (!this.canContinue(operationEpoch, result)) return { executed: false };
-        const envelope = this.state.getCommittedV2Envelope();
-        if (envelope && inspectRenameTargetAnchorCollisionV2(envelope, {
-          sourcePath: item.renameFrom,
-          path: item.path,
-          movedRemoteId: item.remote.driveId,
-          scope: envelope.scope,
-        })) {
-          throw new MutationNotAppliedError(
-            new Error(`Remote file move target is owned by another V2 anchor: ${item.path}`),
-          );
-        }
-        let updated: DriveItem;
-        try {
-          updated = item.targetParentRemoteId
-            ? await this.onedrive.moveItemById(
-                item.remote.driveId,
-                item.remote.eTag,
-                folderName(item.path),
-                item.targetParentRemoteId,
-              )
-            : await this.onedrive.renameItem(
-                this.vaultName,
-                item.renameFrom,
-                item.path,
-                item.remote.driveId,
-                item.remote.eTag,
-              );
-        } catch (error) {
-          if (!(error instanceof OneDriveError) || !isRemoteMutationConflict(error)) throw error;
-          if (factsChangedPolicy === "throw") {
-            throw new MutationNotAppliedError(error);
-          }
-          const fresh = await this.onedrive.getFileMetadata(this.vaultName, item.renameFrom);
-          if (!this.canContinue(operationEpoch, result)) return { executed: false };
-          if (!fresh) {
-            result.deferred++;
-            return {
-              executed: false,
-              completionActionType: SyncActionType.RetryLater,
-              completionReason: this.t("syncView.fileStatus.deferred"),
-            };
-          }
-          const remoteEntry = this.toMetadataRemoteEntry(
-            item.renameFrom,
-            fresh,
-            item.remote.parentId,
-          );
-          remoteUpserts.push(remoteEntry);
-          result.deferred++;
-          return {
-            executed: false,
-            completionActionType: SyncActionType.RetryLater,
-            completionReason: this.t("syncView.fileStatus.deferred"),
-          };
-        }
-        // Defer persistent base removal and upsert to batch flush in caller.
-        // Caller will see baseRemoval + baseUpsert and do both after pool drain.
-        // Update remote state: old path removed, new path added
-        const movedRemote: RemoteFileEntry = {
-          path: item.path,
-          driveId: updated.id,
-          parentId: this.requireKnownRemoteParentId(
-            item.path,
-            updated.parentReference?.id,
-            item.targetParentRemoteId ?? item.remote.parentId,
-          ),
-          size: updated.size ?? item.remote.size,
-          mtime: updated.lastModifiedDateTime
-            ? new Date(updated.lastModifiedDateTime).getTime()
-            : Date.now(),
-          eTag: updated.eTag ?? "",
-          cTag: updated.cTag ?? "",
-          // F17: a rename/move does not change the object's content, so the
-          // hash is the source object's hash as last observed (the response's
-          // fresh value when Graph provides one) — never the local file's
-          // hash, which the remote bytes were never proven to equal. In the
-          // sha-unknown world this keeps the receipt writable and the index
-          // honest; bytes divergence converges through the ordinary
-          // same-path decision next round.
-          sha256Hash: updated.file?.hashes?.sha256Hash?.toLowerCase()
-            ?? item.remote.sha256Hash,
-          quickXorHash: updated.file?.hashes?.quickXorHash
-            ?? item.remote.quickXorHash,
-        };
-        if (
-          updated.id !== item.remote.driveId
-          || (
-            item.targetParentRemoteId
-            && movedRemote.parentId !== item.targetParentRemoteId
-          )
-        ) {
-          throw new Error(`Remote file move lost its identity: ${item.renameFrom} -> ${item.path}`);
-        }
-        const [sourceAfter, targetAfter] = await Promise.all([
-          this.inspectRemotePath(item.renameFrom),
-          this.inspectRemotePath(item.path),
-        ]);
-        if (
-          sourceAfter
-          || !targetAfter
-          || targetAfter.driveId !== item.remote.driveId
-          || targetAfter.eTag !== movedRemote.eTag
-          || (
-            item.targetParentRemoteId
-            && targetAfter.parentId !== item.targetParentRemoteId
-          )
-        ) {
-          throw new Error(`Remote file move read-back failed: ${item.renameFrom} -> ${item.path}`);
-        }
-        remoteDeletes.push(item.renameFrom);
-        remoteUpserts.push(movedRemote);
-        if (item.targetParentRemoteId) {
-          result.filesMoved = (result.filesMoved ?? 0) + 1;
-        }
-        return {
-          executed: true,
-          mutationApplied: true,
-          baseUpsert: { path: item.path, hash: item.local.hash, size: item.local.size, eTag: updated.eTag ?? "" },
-          baseRemoval: item.renameFrom,
-        };
-      }
-
-      case SyncActionType.ConfirmLocalDelete: {
-        // Route to pending — user must confirm
-        result.conflicts++;
-        return { executed: true };
-      }
-
-      case SyncActionType.Conflict: {
-        const automatic = await this.tryAutomaticTextMerge(
+        });
+      case SyncActionType.DeleteRemote:
+        return this.executeDeleteRemoteItem({
+          item,
+          result,
+          remoteUpserts,
+          remoteDeletes,
+          operationEpoch,
+          factsChangedPolicy,
+        });
+      case SyncActionType.DeleteLocal:
+        return this.executeDeleteLocalItem({
+          item,
+          result,
+          operationEpoch,
+        });
+      case SyncActionType.RenameRemote:
+        return this.executeRenameRemoteItem({
+          item,
+          result,
+          remoteUpserts,
+          remoteDeletes,
+          operationEpoch,
+          factsChangedPolicy,
+        });
+      case SyncActionType.ConfirmLocalDelete:
+        return this.executeConfirmLocalDeleteItem({ result });
+      case SyncActionType.Conflict:
+        return this.executeConflictItem({
           item,
           result,
           metrics,
           callbacks,
           operationEpoch,
           automaticHandlingPolicy,
-        );
-        if (automatic?.resolvedConflict || automatic?.executed === false) return automatic;
-        result.conflicts++;
-        return automatic ?? { executed: true };
-      }
-
+        });
       case SyncActionType.SkipLargeFile:
-        return { executed: true };
-
+        return this.executeSkipLargeFileItem();
       case SyncActionType.SkipOneDriveInvalidName:
-        result.skippedInvalidName++;
-        return { executed: true };
-
+        return this.executeSkipOneDriveInvalidNameItem({ result });
       case SyncActionType.SkipIgnoredPath:
-        result.skippedIgnored++;
-        return { executed: true };
-
+        return this.executeSkipIgnoredPathItem({ result });
       case SyncActionType.RetryLater:
-        result.errors++;
-        return { executed: true };
-
+        return this.executeRetryLaterItem({ result });
       case SyncActionType.FolderDeferred:
-        result.deferred++;
-        return { executed: true };
-
+        return this.executeFolderDeferredItem({ result });
       case SyncActionType.AuthExpired:
-        result.authExpired = true;
-        return { executed: true };
+        return this.executeAuthExpiredItem({ result });
     }
     return { executed: true };
   }
@@ -17688,6 +20294,357 @@ export class SyncExecutor {
     return null;
   }
 
+  /** Extracted verbatim from the executeItem switch (case CreateLocalFolder). */
+  private async executeCreateLocalFolderItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+    } = args;
+    if (!item.folder?.remoteId || !item.folder.parentRemoteId) {
+      return { executed: false };
+    }
+    const remote = await this.inspectRemoteFolder(item.path);
+    if (
+      remote.status !== "folder"
+      || remote.entry.driveId !== item.folder.remoteId
+      || remote.entry.parentId !== item.folder.parentRemoteId
+      || (
+        item.folder.remoteETag !== undefined
+        && remote.entry.eTag !== item.folder.remoteETag
+      )
+    ) {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.remote-version-changed"),
+      };
+    }
+
+    const local = await this.inspectLocalFolder(item.path);
+    if (local.status === "file" || local.status === "uncertain") {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t(
+          local.status === "file"
+            ? "reason.folder.type-conflict"
+            : "reason.folder.local-inspection-failed",
+        ),
+      };
+    }
+    if (local.status === "missing") {
+      await this.createLocalFolder(item.path);
+      const readback = await this.inspectLocalFolderAfterFolderCreate(
+        item.path,
+      );
+      if (readback.status !== "present") {
+        throw new LocalFolderCreateUnconfirmedError(item.path);
+      }
+    }
+    result.foldersCreated = (result.foldersCreated ?? 0) + 1;
+    return {
+      executed: true,
+      mutationApplied: true,
+      folderUpsert: remote.entry,
+    };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case MoveLocalFolder). */
+  private async executeMoveLocalFolderItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+    operationEpoch: number;
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+      operationEpoch,
+    } = args;
+    if (
+      !item.renameFrom
+      || !item.folder?.remoteId
+      || !item.folder.parentRemoteId
+      || !item.folder.remoteETag
+    ) return { executed: false };
+    const [localSource, localTarget, remoteSource, remoteTarget] = await Promise.all([
+      this.inspectLocalFolder(item.renameFrom),
+      this.inspectLocalFolder(item.path),
+      this.inspectRemoteFolder(item.renameFrom),
+      this.inspectRemoteFolder(item.path),
+    ]);
+    if (
+      localSource.status !== "present"
+      || localTarget.status !== "missing"
+      || remoteSource.status !== "missing"
+      || remoteTarget.status !== "folder"
+      || remoteTarget.entry.driveId !== item.folder.remoteId
+      || remoteTarget.entry.parentId !== item.folder.parentRemoteId
+      || remoteTarget.entry.eTag !== item.folder.remoteETag
+    ) {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.local-source-changed"),
+      };
+    }
+    if (!this.canContinue(operationEpoch, result)) return { executed: false };
+    await this.renameLocalFolder(item.renameFrom, item.path);
+    result.foldersMoved = (result.foldersMoved ?? 0) + 1;
+    return {
+      executed: true,
+      mutationApplied: true,
+      folderUpsert: remoteTarget.entry,
+    };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case DeleteLocalFolder). */
+  private async executeDeleteLocalFolderItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+    operationEpoch: number;
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+      operationEpoch,
+    } = args;
+    if (!item.folder?.remoteId) return { executed: false };
+    if (item.requiresConfirmation) {
+      return { executed: true };
+    }
+    const [remoteById, remoteByPath, local] = await Promise.all([
+      this.onedrive.getDriveItemMetadataById(item.folder.remoteId),
+      this.inspectRemoteFolder(item.path),
+      this.inspectLocalFolder(item.path),
+    ]);
+    if (
+      remoteById
+      || remoteByPath.status !== "missing"
+      || local.status === "file"
+      || local.status === "uncertain"
+    ) {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.local-inspection-failed"),
+      };
+    }
+    if (local.status === "present") {
+      if (!this.canContinue(operationEpoch, result)) return { executed: false };
+      await this.deleteEmptyLocalFolder(item.path);
+    }
+    result.foldersDeleted = (result.foldersDeleted ?? 0) + 1;
+    return {
+      executed: true,
+      mutationApplied: true,
+      folderDelete: { path: item.path, driveId: item.folder.remoteId },
+    };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case DeleteRemote). */
+  private async executeDeleteRemoteItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+    remoteUpserts: RemoteFileEntry[];
+    remoteDeletes: string[];
+    operationEpoch: number;
+    factsChangedPolicy: "defer" | "throw";
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+      remoteUpserts,
+      remoteDeletes,
+      operationEpoch,
+      factsChangedPolicy,
+    } = args;
+    try {
+      if (!this.canContinue(operationEpoch, result)) return { executed: false };
+      await this.onedrive.deleteItem(
+        this.vaultName,
+        item.path,
+        item.remote?.eTag,
+        item.remote?.driveId,
+      );
+    } catch (e) {
+      if (e instanceof OneDriveError && isRemoteMutationConflict(e)) {
+        if (factsChangedPolicy === "throw") {
+          throw new MutationNotAppliedError(e);
+        }
+        // File was modified remotely since plan — route to conflict
+        this.diag?.warn("execute", `delete blocked — ${item.path} eTag changed since plan`);
+        const fresh = await this.onedrive.getFileMetadata(
+          this.vaultName,
+          item.path,
+        );
+        if (!this.canContinue(operationEpoch, result)) return { executed: false };
+        if (!fresh) {
+          remoteDeletes.push(item.path);
+          result.deleted++;
+          return { executed: true, baseRemoval: item.path };
+        }
+        const remoteEntry = this.toMetadataRemoteEntry(
+          item.path,
+          fresh,
+          item.remote?.parentId,
+        );
+        remoteUpserts.push(remoteEntry);
+        return this.queuePendingConflict({
+          type: SyncActionType.Conflict,
+          path: item.path,
+          remote: remoteEntry,
+          reason: "reason.localDeletedRemoteModified",
+        }, result, operationEpoch);
+      }
+      throw e;
+    }
+    remoteDeletes.push(item.path);
+    result.deleted++;
+    return { executed: true, mutationApplied: true, baseRemoval: item.path };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case DeleteLocal). */
+  private async executeDeleteLocalItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+    operationEpoch: number;
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+      operationEpoch,
+    } = args;
+    if (!item.local) return { executed: false };
+    if (isObsidianManagedConfigPath(item.path, getConfigDir(this.scanner.vault))) {
+      throw new MutationNotAppliedError(
+        new Error(this.t("notice.decisionExpired")),
+      );
+    }
+    let current: LocalFileInspection;
+    try {
+      if (!this.canContinue(operationEpoch, result)) return { executed: false };
+      const remote = await this.onedrive.getFileMetadata(this.vaultName, item.path);
+      if (!this.canContinue(operationEpoch, result)) return { executed: false };
+      if (remote) throw new Error(this.t("notice.decisionExpired"));
+
+      const inspected = await this.inspectLocalPath(item.path);
+      if (!inspected || inspected.status === "uncertain") {
+        throw new Error(this.t("notice.localChangedSinceReview"));
+      }
+      if (
+        inspected.status === "present"
+        && !this.localExpectationMatches(item.local, inspected)
+      ) {
+        throw new LocalVersionChangedBeforeDeleteError(item.path);
+      }
+      current = inspected;
+    } catch (error) {
+      throw new MutationNotAppliedError(error);
+    }
+    if (!this.canContinue(operationEpoch, result)) return { executed: false };
+    if (current.status === "present") await this.deleteLocalPath(item.path);
+    result.deleted++;
+    return { executed: true, mutationApplied: true, baseRemoval: item.path };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case ConfirmLocalDelete). */
+  private executeConfirmLocalDeleteItem(args: {
+    result: SyncResult;
+  }): ItemExecutionResult {
+    const { result } = args;
+    // Route to pending — user must confirm
+    result.conflicts++;
+    return { executed: true };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case Conflict). */
+  private async executeConflictItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+    metrics: ExecutionMetrics;
+    callbacks: SyncCallbacks;
+    operationEpoch: number;
+    automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+      metrics,
+      callbacks,
+      operationEpoch,
+      automaticHandlingPolicy,
+    } = args;
+    const automatic = await this.tryAutomaticTextMerge(
+      item,
+      result,
+      metrics,
+      callbacks,
+      operationEpoch,
+      automaticHandlingPolicy,
+    );
+    if (automatic?.resolvedConflict || automatic?.executed === false) return automatic;
+    result.conflicts++;
+    return automatic ?? { executed: true };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case SkipLargeFile). */
+  private executeSkipLargeFileItem(): ItemExecutionResult {
+    return { executed: true };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case SkipOneDriveInvalidName). */
+  private executeSkipOneDriveInvalidNameItem(args: {
+    result: SyncResult;
+  }): ItemExecutionResult {
+    const { result } = args;
+    result.skippedInvalidName++;
+    return { executed: true };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case SkipIgnoredPath). */
+  private executeSkipIgnoredPathItem(args: {
+    result: SyncResult;
+  }): ItemExecutionResult {
+    const { result } = args;
+    result.skippedIgnored++;
+    return { executed: true };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case RetryLater). */
+  private executeRetryLaterItem(args: {
+    result: SyncResult;
+  }): ItemExecutionResult {
+    const { result } = args;
+    result.errors++;
+    return { executed: true };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case FolderDeferred). */
+  private executeFolderDeferredItem(args: {
+    result: SyncResult;
+  }): ItemExecutionResult {
+    const { result } = args;
+    result.deferred++;
+    return { executed: true };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case AuthExpired). */
+  private executeAuthExpiredItem(args: {
+    result: SyncResult;
+  }): ItemExecutionResult {
+    const { result } = args;
+    result.authExpired = true;
+    return { executed: true };
+  }
+
+
   private async publishHealthyCloudBootstrapV2(
     operationEpoch: number,
   ): Promise<void> {
@@ -17876,76 +20833,13 @@ export class SyncExecutor {
     }
     const existingHold =
       this.state.activeV2CorruptStateRecoveryHold;
-    if (existingHold) {
-      const plan: SyncPlan = {
-        items: structuredClone(existingHold.items),
-        lastTotalFiles: existingHold.lastTotalFiles,
-        confirmed: existingHold.phase === "confirmed",
-        scope: { ...existingHold.scope },
-        canonicalIdentity:
-          structuredClone(existingHold.canonicalIdentity),
-        canonicalReview: structuredClone(existingHold.canonicalReview),
-      };
-      if (
-        reviewedAuthorization?.canonicalIdentity
-        && sameCanonicalPlanIdentityV2(
-          reviewedAuthorization.canonicalIdentity,
-          existingHold.canonicalIdentity,
-        )
-      ) {
-        const confirmed =
-          await this.state.confirmV2CorruptStateRecoveryHold(
-            reviewedAuthorization,
-          );
-        if (confirmed) {
-          try {
-            const published =
-              await this.state.publishConfirmedV2CorruptStateRecovery(
-                reviewedAuthorization,
-              );
-            result.success = true;
-            result.message = this.t("result.synced", {
-              uploaded: 0,
-              downloaded: 0,
-              foldersCreated: 0,
-              foldersMoved: 0,
-              foldersDeleted: 0,
-              filesMoved: 0,
-              deleted: 0,
-              conflicts: 0,
-              deferred: 0,
-              errors: 0,
-            });
-            result.continueAfterV2CorruptStateRecovery = true;
-            this.diag?.warn(
-              "state",
-              "V2 corrupt-state recovery authority published; handing the reviewed plan to the ordinary V2 chain",
-              {
-                holdRevision: confirmed.revision,
-                sourceDigest: confirmed.sourceDigest,
-                sourceCommitSeq: confirmed.sourceCommitSeq,
-                targetCommitSeq: published.meta.commitSeq,
-                planItems: confirmed.items.length,
-                mutations: 0,
-              },
-            );
-          } catch (error) {
-            result.errors = 1;
-            result.message = this.t("result.v2StateLoadBlocked");
-            this.diag?.error(
-              "state",
-              "V2 corrupt-state recovery authority publication failed closed",
-              error instanceof Error ? error.message : String(error),
-            );
-          }
-          return result;
-        }
-      }
-      const publishPreview =
-        callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
-      if (publishPreview) await publishPreview(plan);
-      return this.markPlanReviewPaused(result);
-    }
+    const corruptStateHold = await this.settleExistingV2CorruptStateRecoveryHold({
+      result,
+      callbacks,
+      reviewedAuthorization,
+      existingHold,
+    });
+    if (corruptStateHold.terminated) return corruptStateHold.terminated;
     enterPhase("remotePrepare");
     this.progressStore?.setPhase("preparing");
     callbacks.onProgress?.(0, 1, this.t("progress.preparingRemote"));
@@ -18401,6 +21295,1227 @@ export class SyncExecutor {
     if (publishPreview) await publishPreview(plan);
     return this.markPlanReviewPaused(result);
   }
+
+  /** Existing corrupt-state recovery hold settlement of
+   *  runV2CorruptStateEvidenceCollection — moved verbatim; both exits
+   *  terminate the evidence-collection round. */
+  private async settleExistingV2CorruptStateRecoveryHold(args: SettleExistingV2CorruptStateRecoveryHoldArgs): Promise<SettleExistingV2CorruptStateRecoveryHoldOutcome> {
+    const { result, callbacks, reviewedAuthorization, existingHold } = args;
+    if (existingHold) {
+      const plan: SyncPlan = {
+        items: structuredClone(existingHold.items),
+        lastTotalFiles: existingHold.lastTotalFiles,
+        confirmed: existingHold.phase === "confirmed",
+        scope: { ...existingHold.scope },
+        canonicalIdentity:
+          structuredClone(existingHold.canonicalIdentity),
+        canonicalReview: structuredClone(existingHold.canonicalReview),
+      };
+      if (
+        reviewedAuthorization?.canonicalIdentity
+        && sameCanonicalPlanIdentityV2(
+          reviewedAuthorization.canonicalIdentity,
+          existingHold.canonicalIdentity,
+        )
+      ) {
+        const confirmed =
+          await this.state.confirmV2CorruptStateRecoveryHold(
+            reviewedAuthorization,
+          );
+        if (confirmed) {
+          try {
+            const published =
+              await this.state.publishConfirmedV2CorruptStateRecovery(
+                reviewedAuthorization,
+              );
+            result.success = true;
+            result.message = this.t("result.synced", {
+              uploaded: 0,
+              downloaded: 0,
+              foldersCreated: 0,
+              foldersMoved: 0,
+              foldersDeleted: 0,
+              filesMoved: 0,
+              deleted: 0,
+              conflicts: 0,
+              deferred: 0,
+              errors: 0,
+            });
+            result.continueAfterV2CorruptStateRecovery = true;
+            this.diag?.warn(
+              "state",
+              "V2 corrupt-state recovery authority published; handing the reviewed plan to the ordinary V2 chain",
+              {
+                holdRevision: confirmed.revision,
+                sourceDigest: confirmed.sourceDigest,
+                sourceCommitSeq: confirmed.sourceCommitSeq,
+                targetCommitSeq: published.meta.commitSeq,
+                planItems: confirmed.items.length,
+                mutations: 0,
+              },
+            );
+          } catch (error) {
+            result.errors = 1;
+            result.message = this.t("result.v2StateLoadBlocked");
+            this.diag?.error(
+              "state",
+              "V2 corrupt-state recovery authority publication failed closed",
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+          return { terminated: result };
+        }
+      }
+      const publishPreview =
+        callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
+      if (publishPreview) await publishPreview(plan);
+      return { terminated: this.markPlanReviewPaused(result) };
+    }
+    return { terminated: null };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case CreateRemoteFolder). */
+  private async executeCreateRemoteFolderItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+    } = args;
+    if (!item.folder) return { executed: false };
+    const parentRemoteId = item.folder.parentRemoteId;
+    if (!parentRemoteId) return { executed: false };
+    const local = await this.inspectLocalFolder(item.path);
+    if (local.status !== "present") {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.local-source-changed"),
+      };
+    }
+
+    const target = await this.inspectRemoteFolder(item.path);
+    if (target.status === "file") {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.type-conflict"),
+      };
+    }
+    if (target.status === "folder") {
+      if (target.entry.parentId !== parentRemoteId) {
+        result.deferred++;
+        return {
+          executed: false,
+          completionActionType: SyncActionType.FolderDeferred,
+          completionReason: this.t("reason.folder.parent-chain-incomplete"),
+        };
+      }
+      result.foldersCreated = (result.foldersCreated ?? 0) + 1;
+      return {
+        executed: true,
+        mutationApplied: true,
+        folderUpsert: target.entry,
+      };
+    }
+
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!envelope) {
+      throw new Error("Folder mutation requires the active V2 envelope");
+    }
+    const parentStillOwnsPath = item.folder.parentPath === ""
+      ? await this.onedrive.getDriveItemMetadataById(parentRemoteId)
+          .then((parent) => Boolean(parent?.folder && parent.id === parentRemoteId))
+      : await this.inspectRemoteFolder(item.folder.parentPath)
+          .then((parent) => {
+            const committedParent =
+              envelope.remoteIndex.itemsById[parentRemoteId];
+            return parent.status === "folder"
+              && parent.entry.driveId === parentRemoteId
+              && committedParent?.kind === "folder"
+              && parent.entry.parentId === committedParent.parentId;
+          });
+    if (!parentStillOwnsPath) {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.parent-version-changed"),
+      };
+    }
+    const folderUpsert = await this.createRemoteFolderWithReadback(
+      item.path,
+      parentRemoteId,
+    );
+    result.foldersCreated = (result.foldersCreated ?? 0) + 1;
+    return {
+      executed: true,
+      mutationApplied: true,
+      folderUpsert,
+    };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case MoveRemoteFolder). */
+  private async executeMoveRemoteFolderItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+    operationEpoch: number;
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+      operationEpoch,
+    } = args;
+    if (
+      !item.renameFrom
+      || !item.folder?.remoteId
+      || !item.folder.parentRemoteId
+      || !item.folder.sourceParentRemoteId
+      || !item.folder.remoteETag
+    ) return { executed: false };
+    const [localSource, localTarget, remoteSource, remoteTarget] = await Promise.all([
+      this.inspectLocalFolder(item.renameFrom),
+      this.inspectLocalFolder(item.path),
+      this.inspectRemoteFolder(item.renameFrom),
+      this.inspectRemoteFolder(item.path),
+    ]);
+    if (
+      localSource.status !== "missing"
+      || localTarget.status !== "present"
+      || remoteTarget.status !== "missing"
+      || remoteSource.status !== "folder"
+      || remoteSource.entry.driveId !== item.folder.remoteId
+      || remoteSource.entry.parentId !== item.folder.sourceParentRemoteId
+      || remoteSource.entry.eTag !== item.folder.remoteETag
+    ) {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.remote-version-changed"),
+      };
+    }
+    const [targetParent, targetParentByPath] = await Promise.all([
+      this.onedrive.getDriveItemMetadataById(item.folder.parentRemoteId),
+      item.folder.parentPath === ""
+        ? Promise.resolve(null)
+        : this.inspectRemoteFolder(item.folder.parentPath),
+    ]);
+    if (
+      !targetParent?.folder
+      || targetParent.id !== item.folder.parentRemoteId
+      || (
+        item.folder.parentPath !== ""
+        && (
+          targetParentByPath?.status !== "folder"
+          || targetParentByPath.entry.driveId !== item.folder.parentRemoteId
+        )
+      )
+    ) {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.parent-version-changed"),
+      };
+    }
+    if (!this.canContinue(operationEpoch, result)) return { executed: false };
+
+    let moved: DriveItem;
+    try {
+      moved = await this.onedrive.moveItemById(
+        item.folder.remoteId,
+        item.folder.remoteETag,
+        folderName(item.path),
+        item.folder.parentRemoteId,
+      );
+    } catch (error) {
+      if (!(error instanceof OneDriveError) || !isRemoteMutationConflict(error)) throw error;
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.remote-version-changed"),
+      };
+    }
+    const folderUpsert = toRemoteFolderEntry(item.path, moved);
+    const [sourceAfter, targetAfter, idAfter] = await Promise.all([
+      this.inspectRemoteFolder(item.renameFrom),
+      this.inspectRemoteFolder(item.path),
+      this.onedrive.getDriveItemMetadataById(item.folder.remoteId),
+    ]);
+    if (
+      sourceAfter.status !== "missing"
+      || targetAfter.status !== "folder"
+      || targetAfter.entry.driveId !== item.folder.remoteId
+      || targetAfter.entry.parentId !== item.folder.parentRemoteId
+      || !idAfter?.folder
+      || idAfter.id !== item.folder.remoteId
+      || idAfter.parentReference?.id !== item.folder.parentRemoteId
+      || folderUpsert.driveId !== targetAfter.entry.driveId
+      || folderUpsert.eTag !== targetAfter.entry.eTag
+    ) {
+      throw new Error(`Remote folder move read-back failed: ${item.renameFrom} -> ${item.path}`);
+    }
+    result.foldersMoved = (result.foldersMoved ?? 0) + 1;
+    return {
+      executed: true,
+      mutationApplied: true,
+      folderUpsert: targetAfter.entry,
+    };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case DeleteRemoteFolder). */
+  private async executeDeleteRemoteFolderItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+    operationEpoch: number;
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+      operationEpoch,
+    } = args;
+    if (
+      !item.folder?.remoteId
+      || !item.folder.sourceParentRemoteId
+      || !item.folder.remoteETag
+    ) return { executed: false };
+    const local = await this.inspectLocalFolder(item.path);
+    if (local.status !== "missing") {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.local-source-changed"),
+      };
+    }
+    const [byId, byPath] = await Promise.all([
+      this.onedrive.getDriveItemMetadataById(item.folder.remoteId),
+      this.onedrive.getDriveItemMetadata(this.vaultName, item.path),
+    ]);
+    if (!byId) {
+      if (byPath !== null) {
+        result.deferred++;
+        return {
+          executed: false,
+          completionActionType: SyncActionType.FolderDeferred,
+          completionReason: this.t("reason.folder.remote-version-changed"),
+        };
+      }
+      result.foldersDeleted = (result.foldersDeleted ?? 0) + 1;
+      return {
+        executed: true,
+        mutationApplied: true,
+        folderDelete: { path: item.path, driveId: item.folder.remoteId },
+      };
+    }
+    const exact = await this.inspectExactEmptyRemoteFolder({
+      path: item.path,
+      remoteId: item.folder.remoteId,
+      remoteETag: item.folder.remoteETag,
+      parentRemoteId: item.folder.sourceParentRemoteId,
+    });
+    if (exact.status !== "exact") {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t(exact.status === "not-empty"
+          ? "reason.folder.remote-subtree-changed"
+          : "reason.folder.remote-version-changed"),
+      };
+    }
+    // OneDrive Personal does not return folder cTags, so an empty-shell
+    // delete cannot always build an If-Match from the content tag. The
+    // exact inspection above already verified the identity and eTag twice
+    // (by id and by path, children empty, versions stable), so fall back
+    // to that verified eTag; defer only when neither tag is available.
+    // Without this the empty shell delete defers forever on Personal with
+    // no user-side remedy.
+    const deleteMatchTag = exact.contentTag ?? item.folder.remoteETag;
+    if (!deleteMatchTag) {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t(
+          "reason.folder.remote-content-version-unavailable",
+        ),
+      };
+    }
+    const localBeforeDelete = await this.inspectLocalFolder(item.path);
+    if (localBeforeDelete.status !== "missing") {
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.local-source-changed"),
+      };
+    }
+    if (!this.canContinue(operationEpoch, result)) return { executed: false };
+    try {
+      await this.onedrive.deleteItem(
+        this.vaultName,
+        item.path,
+        deleteMatchTag,
+        item.folder.remoteId,
+      );
+    } catch (error) {
+      if (!(error instanceof OneDriveError) || !isRemoteMutationConflict(error)) throw error;
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.remote-version-changed"),
+      };
+    }
+    if (await this.onedrive.getDriveItemMetadataById(item.folder.remoteId)) {
+      throw new Error(`Remote folder delete read-back failed: ${item.path}`);
+    }
+    result.foldersDeleted = (result.foldersDeleted ?? 0) + 1;
+    return {
+      executed: true,
+      mutationApplied: true,
+      folderDelete: { path: item.path, driveId: item.folder.remoteId },
+    };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case MoveLocalFile). */
+  private async executeMoveLocalFileItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+    remoteUpserts: RemoteFileEntry[];
+    remoteDeletes: string[];
+    callbacks: SyncCallbacks;
+    operationEpoch: number;
+    factsChangedPolicy: "defer" | "throw";
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+      remoteUpserts,
+      remoteDeletes,
+      callbacks,
+      operationEpoch,
+      factsChangedPolicy,
+    } = args;
+    if (!item.renameFrom || !item.local || !item.remote) return { executed: false };
+    const [sourceLocal, targetLocal, remoteSource, remoteTarget] = await Promise.all([
+      this.inspectLocalPath(item.renameFrom),
+      this.inspectLocalPath(item.path),
+      this.inspectRemotePath(item.renameFrom),
+      this.inspectRemotePath(item.path),
+    ]);
+    if (
+      !sourceLocal
+      || !targetLocal
+      || sourceLocal.status === "uncertain"
+      || targetLocal.status === "uncertain"
+      || !this.localExpectationMatches(item.local, sourceLocal)
+      || targetLocal.status !== "missing"
+      || remoteSource !== undefined
+      || !this.remoteMatchesExpectation(remoteTarget, {
+        exists: true,
+        driveId: item.remote.driveId,
+        eTag: item.remote.eTag,
+        size: item.remote.size,
+        sha256Hash: item.remote.sha256Hash,
+      })
+    ) {
+      if (factsChangedPolicy === "throw") {
+        throw new MutationNotAppliedError(
+          new Error(`Manual local move facts changed: ${item.path}`),
+        );
+      }
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.RetryLater,
+        completionReason: this.t("syncView.fileStatus.deferred"),
+      };
+    }
+    if (!this.canContinue(operationEpoch, result)) return { executed: false };
+    await this.renameLocalFile(item.renameFrom, item.path);
+    const [sourceAfter, targetAfter] = await Promise.all([
+      this.inspectLocalPath(item.renameFrom),
+      this.inspectLocalPath(item.path),
+    ]);
+    if (
+      !sourceAfter
+      || !targetAfter
+      || sourceAfter.status !== "missing"
+      || !this.localExpectationMatches(item.local, targetAfter)
+    ) {
+      throw new Error(`Local file move read-back failed: ${item.renameFrom} -> ${item.path}`);
+    }
+    if (targetAfter.status !== "present" || !targetAfter.entry) {
+      throw new Error(`Local file move read-back failed: ${item.renameFrom} -> ${item.path}`);
+    }
+    const targetEntry = targetAfter.entry;
+    // A1 one-shot converge: the remote identity was moved AND its content
+    // version advanced while the local side stayed unchanged. Align the
+    // moved local file to the exact remote bytes in the same action, so
+    // the mutation receipt proves "local target == remote version" (the
+    // same proof shape conservative reset already requires) instead of
+    // leaving an unreceiptable intermediate state. Without a known remote
+    // hash the plain move receipt stays admissible (shape 3 in
+    // conservative-reset-recovery) and the ordinary same-path decision
+    // converges the bytes on the next round (the A1 comment contract), so
+    // alignment is limited to a proven difference.
+    const needsAlignment = item.remote.sha256Hash !== undefined
+      && (
+        item.remote.size !== targetEntry.size
+        || targetEntry.hash.toLowerCase() !== item.remote.sha256Hash.toLowerCase()
+      );
+    if (needsAlignment) {
+      const aligned = await this.alignLocalTargetBytes(
+        item.path,
+        item.remote,
+        targetEntry,
+        callbacks.onFileProgress,
+      );
+      remoteDeletes.push(item.renameFrom);
+      remoteUpserts.push({ ...item.remote, path: item.path });
+      result.filesMoved = (result.filesMoved ?? 0) + 1;
+      return {
+        executed: true,
+        mutationApplied: true,
+        baseRemoval: item.renameFrom,
+        baseUpsert: {
+          path: item.path,
+          hash: aligned.hash,
+          size: aligned.size,
+          eTag: item.remote.eTag,
+        },
+      };
+    }
+    remoteDeletes.push(item.renameFrom);
+    remoteUpserts.push({ ...item.remote, path: item.path });
+    result.filesMoved = (result.filesMoved ?? 0) + 1;
+    return {
+      executed: true,
+      mutationApplied: true,
+      baseRemoval: item.renameFrom,
+      baseUpsert: {
+        path: item.path,
+        hash: item.local.hash,
+        size: item.local.size,
+        eTag: item.remote.eTag,
+      },
+    };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case Upload). */
+  private async executeUploadItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+    remoteUpserts: RemoteFileEntry[];
+    metrics: ExecutionMetrics;
+    callbacks: SyncCallbacks;
+    operationEpoch: number;
+    factsChangedPolicy: "defer" | "throw";
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+      remoteUpserts,
+      metrics,
+      callbacks,
+      operationEpoch,
+      factsChangedPolicy,
+    } = args;
+    if (!item.local) return { executed: true };
+    const readStartedAt = Date.now();
+    const content = await this.scanner.vault.adapter.readBinary(item.path);
+    const readElapsedMs = Date.now() - readStartedAt;
+    metrics.uploadReadMs += readElapsedMs;
+    metrics.fileTransfers.upload.stagesMs.sourceRead += readElapsedMs;
+    if (!this.canContinue(operationEpoch, result)) return { executed: false };
+
+    // Re-check hash — file may have changed since scan.
+    // If hash differs, skip this round; the change will be picked up next sync.
+    const hashStartedAt = Date.now();
+    const actualHash = await sha256Hex(content);
+    metrics.fileTransfers.upload.stagesMs.contentHash += Date.now() - hashStartedAt;
+    if (actualHash !== item.local.hash) {
+      this.diag?.warn("execute", `upload skipped — ${item.path} hash changed since scan (${item.local.hash.slice(0, 8)}… → ${actualHash.slice(0, 8)}…)`);
+      if (factsChangedPolicy === "throw") {
+        throw new MutationNotAppliedError(
+          new Error(`Manual upload source changed: ${item.path}`),
+        );
+      }
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.RetryLater,
+        completionReason: this.t("syncView.fileStatus.deferred"),
+      };
+    }
+    if (!this.canContinue(operationEpoch, result)) return { executed: false };
+
+    metrics.activeUploads++;
+    metrics.peakUploads = Math.max(metrics.peakUploads, metrics.activeUploads);
+    const uploadStartedAt = Date.now();
+    let uploadResult: UploadResult;
+    try {
+      uploadResult = await this.trackTransfer(
+        "upload",
+        callbacks.onFileProgress,
+        (report) => this.onedrive.uploadFile(
+          this.vaultName,
+          item.path,
+          content,
+          report,
+          item.baseEtag,
+          item.remote?.driveId,
+        ),
+      );
+      const uploadElapsedMs = Date.now() - uploadStartedAt;
+      metrics.uploadNetworkMs += uploadElapsedMs;
+      metrics.fileTransfers.upload.stagesMs.contentTransfer += uploadElapsedMs;
+    } catch (e) {
+      const uploadElapsedMs = Date.now() - uploadStartedAt;
+      metrics.uploadNetworkMs += uploadElapsedMs;
+      metrics.fileTransfers.upload.stagesMs.contentTransfer += uploadElapsedMs;
+      const conflictOutcome = await this.runUploadRemoteConflictRecovery({
+        e,
+        item,
+        result,
+        remoteUpserts,
+        metrics,
+        callbacks,
+        operationEpoch,
+        factsChangedPolicy,
+        content,
+      });
+      if (conflictOutcome.terminated) return conflictOutcome.terminated;
+      uploadResult = conflictOutcome.uploadResult;
+    }
+    metrics.activeUploads--;
+
+    const baseUpsert: BaseFileEntry = {
+      path: item.path,
+      hash: item.local.hash,
+      size: item.local.size,
+      eTag: uploadResult.eTag ?? "",
+    };
+    metrics.uploadBytes += item.local.size;
+    remoteUpserts.push(this.toUploadedRemoteEntry(
+      item.path,
+      item.local,
+      uploadResult,
+      item.remote?.parentId,
+    ));
+    result.uploaded++;
+    this.state.cacheBaseContent(item.path, content);
+    return { executed: true, mutationApplied: true, baseUpsert };
+  }
+
+  /** Upload race/conflict recovery branch of executeUploadItem — moved verbatim. */
+  private async runUploadRemoteConflictRecovery(
+    args: UploadRemoteConflictRecoveryArgs,
+  ): Promise<UploadRemoteConflictRecoveryOutcome> {
+    const {
+      e,
+      item,
+      result,
+      remoteUpserts,
+      metrics,
+      callbacks,
+      operationEpoch,
+      factsChangedPolicy,
+      content,
+    } = args;
+    // Narrowed by the caller's own guard; kept for the type system.
+    if (!item.local) return { terminated: { executed: true } };
+    let uploadResult: UploadResult;
+    if (
+      e instanceof OneDriveError
+      && isRemoteMutationConflict(e)
+    ) {
+      if (factsChangedPolicy === "throw") {
+        metrics.activeUploads--;
+        throw new MutationNotAppliedError(e);
+      }
+      // Another device changed this file since we scanned remote.
+      // Fetch current remote state and route to conflict.
+      const fresh = await this.onedrive.getFileMetadata(
+        this.vaultName,
+        item.path,
+      );
+      if (!this.canContinue(operationEpoch, result)) {
+        metrics.activeUploads--;
+        return { terminated: { executed: false } };
+      }
+      if (fresh) {
+        metrics.activeUploads--;
+        const remoteEntry = this.toMetadataRemoteEntry(
+          item.path,
+          fresh,
+          item.remote?.parentId,
+        );
+        const metadataEquality = resolveContentEquality({
+          local: item.local,
+          remote: { ...fresh, eTag: fresh.eTag },
+        });
+        let sameContent = metadataEquality.status === "equal";
+        if (metadataEquality.status === "unknown") {
+          try {
+            sameContent = await this.remoteMatchesTarget(
+              remoteEntry,
+              item.local,
+              true,
+            );
+          } catch (comparisonError) {
+            this.diag?.warn(
+              "execute",
+              `upload race content read-back failed — ${item.path}`,
+              comparisonError,
+            );
+          }
+        }
+        if (!this.canContinue(operationEpoch, result)) {
+          return { terminated: { executed: false } };
+        }
+        if (sameContent) {
+          remoteUpserts.push(remoteEntry);
+          this.convergencesThisRound++;
+          return { terminated: {
+            executed: true,
+            baseUpsert: StateManager.toBaseEntry(item.local, remoteEntry),
+          } };
+        }
+        remoteUpserts.push(remoteEntry);
+        return { terminated: await this.queuePendingConflict({
+          type: SyncActionType.Conflict,
+          path: item.path,
+          local: item.local,
+          remote: remoteEntry,
+          reason: "reason.bothSidesModified",
+        }, result, operationEpoch) };
+      }
+      // File was deleted remotely — re-upload without If-Match
+      if (!this.canContinue(operationEpoch, result)) {
+        metrics.activeUploads--;
+        return { terminated: { executed: false } };
+      }
+      const retryStartedAt = Date.now();
+      try {
+        uploadResult = await this.trackTransfer(
+          "upload",
+          callbacks.onFileProgress,
+          (report) => this.onedrive.uploadFile(
+            this.vaultName,
+            item.path,
+            content,
+            report,
+          ),
+        );
+      } catch (retryError) {
+        if (retryError instanceof OneDriveError && isRemoteMutationConflict(retryError)) {
+          const raced = await this.onedrive.getFileMetadata(this.vaultName, item.path);
+          if (!this.canContinue(operationEpoch, result)) {
+            metrics.activeUploads--;
+            return { terminated: { executed: false } };
+          }
+          if (raced) {
+            const racedEntry = this.toMetadataRemoteEntry(
+              item.path,
+              raced,
+              item.remote?.parentId,
+            );
+            metrics.activeUploads--;
+            remoteUpserts.push(racedEntry);
+            return { terminated: await this.queuePendingConflict({
+              type: SyncActionType.Conflict,
+              path: item.path,
+              local: item.local,
+              remote: racedEntry,
+              reason: "reason.newFileBothSides",
+            }, result, operationEpoch) };
+          }
+        }
+        metrics.activeUploads--;
+        throw retryError;
+      }
+      const retryElapsedMs = Date.now() - retryStartedAt;
+      metrics.uploadNetworkMs += retryElapsedMs;
+      metrics.fileTransfers.upload.stagesMs.contentTransfer += retryElapsedMs;
+      // fall through to post-upload logic
+    } else {
+      metrics.activeUploads--;
+      throw e;
+    }
+    return { terminated: null, uploadResult };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case Download). */
+  private async executeDownloadItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+    metrics: ExecutionMetrics;
+    callbacks: SyncCallbacks;
+    operationEpoch: number;
+    preparedDownload: PreparedDownload | undefined;
+    factsChangedPolicy: "defer" | "throw";
+    allowExcludedForRecovery: boolean;
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+      metrics,
+      callbacks,
+      operationEpoch,
+      preparedDownload,
+      factsChangedPolicy,
+      allowExcludedForRecovery,
+    } = args;
+    if (!item.remote) return { executed: true };
+    const usesLocalCas = typeof (this.scanner as LocalScanner & { inspectFile?: unknown }).inspectFile === "function";
+    const firstLocalGuardStartedAt = Date.now();
+    const beforeDownload = await this.guardDownloadLocalVersion(
+      item,
+      result,
+      operationEpoch,
+      factsChangedPolicy,
+      allowExcludedForRecovery,
+    );
+    metrics.fileTransfers.download.stagesMs.localVersionGuard +=
+      Date.now() - firstLocalGuardStartedAt;
+    if (beforeDownload) return beforeDownload;
+    const remote = item.remote;
+    const streamAdapter = this.getStreamDownloadAdapter(remote.size);
+    const tempDownloadPath = streamAdapter ? this.getDownloadTempPath(item.path) : null;
+    let streamedDownload: { size: number; hash: string } | null = null;
+    let content: ArrayBuffer | null = preparedDownload?.content ?? null;
+    if (preparedDownload?.downloaded) {
+      streamedDownload = preparedDownload.downloaded;
+      // 社区插件整包预下载把内容保存在内存里，从未写过流式临时文件；而
+      // 提交门 commitDownloadedTempFile 会按临时文件字节校验。移动端
+      // ≥8MiB 的被选插件下载若直接进入该门，临时文件不存在将稳定判定
+      // “Downloaded temp file verification failed”。这里用一次有界写入
+      // 把预下载内容落到临时路径，再交给既有的提交门做完整字节核对。
+      if (streamAdapter && tempDownloadPath && content) {
+        await this.ensureParentDirs(tempDownloadPath);
+        await this.removePathIfExists(tempDownloadPath);
+        await this.writeBinaryTempFileWithAndroidZeroByteRetry(
+          item.path,
+          tempDownloadPath,
+          content,
+        );
+      }
+    } else if (streamAdapter && tempDownloadPath) {
+      await this.ensureParentDirs(tempDownloadPath);
+      this.diag?.log("execute", `download streaming to temp file — ${item.path}`);
+      const transferStartedAt = Date.now();
+      try {
+        streamedDownload = await this.trackTransfer(
+          "download",
+          callbacks.onFileProgress,
+          (report) => this.onedrive.downloadFileToPath(
+            this.vaultName,
+            item.path,
+            tempDownloadPath,
+            streamAdapter,
+            remote.downloadUrl,
+            remote.driveId,
+            remote.size,
+            remote.sha256Hash,
+            report,
+          ),
+        );
+      } finally {
+        metrics.fileTransfers.download.stagesMs.contentTransfer +=
+          Date.now() - transferStartedAt;
+      }
+    } else {
+      const transferStartedAt = Date.now();
+      try {
+        content = await this.trackTransfer(
+          "download",
+          callbacks.onFileProgress,
+          (report) => this.onedrive.downloadFile(
+            this.vaultName,
+            remote.path,
+            remote.downloadUrl,
+            remote.driveId,
+            remote.size,
+            report,
+          ),
+        );
+      } finally {
+        metrics.fileTransfers.download.stagesMs.contentTransfer +=
+          Date.now() - transferStartedAt;
+      }
+    }
+    let downloaded = streamedDownload;
+    if (!downloaded) {
+      const hashStartedAt = Date.now();
+      downloaded = {
+        size: (content as ArrayBuffer).byteLength,
+        hash: await sha256Hex(content as ArrayBuffer),
+      };
+      metrics.fileTransfers.download.stagesMs.contentHash += Date.now() - hashStartedAt;
+    }
+    if (!preparedDownload?.downloaded) {
+      const remoteVerifyStartedAt = Date.now();
+      try {
+        await this.verifyDownloadedPayload(
+          item.remote.path,
+          item.remote,
+          downloaded,
+        );
+      } catch (error) {
+        if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
+        throw error;
+      } finally {
+        metrics.fileTransfers.download.stagesMs.remoteVersionVerify +=
+          Date.now() - remoteVerifyStartedAt;
+      }
+    }
+    if (!this.canContinue(operationEpoch, result)) {
+      if (tempDownloadPath) {
+        await this.removePathIfExists(tempDownloadPath);
+      }
+      return { executed: false };
+    }
+    if (factsChangedPolicy === "throw") {
+      const currentRemote = await this.inspectRemotePath(item.path);
+      if (!this.remoteMatchesExpectation(currentRemote, {
+        exists: true,
+        driveId: item.remote.driveId,
+        eTag: item.remote.eTag,
+        size: item.remote.size,
+        sha256Hash: item.remote.sha256Hash,
+      })) {
+        if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
+        throw new MutationNotAppliedError(
+          new Error(`Manual download remote facts changed: ${item.path}`),
+        );
+      }
+      if (!this.canContinue(operationEpoch, result)) {
+        if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
+        throw new MutationNotAppliedError(new Error("Manual mutation was cancelled"));
+      }
+    }
+    const secondLocalGuardStartedAt = Date.now();
+    const beforeWrite = await this.guardDownloadLocalVersion(
+      item,
+      result,
+      operationEpoch,
+      factsChangedPolicy,
+      allowExcludedForRecovery,
+    );
+    metrics.fileTransfers.download.stagesMs.localVersionGuard +=
+      Date.now() - secondLocalGuardStartedAt;
+    if (beforeWrite) {
+      if (tempDownloadPath) {
+        await this.removePathIfExists(tempDownloadPath);
+      }
+      return beforeWrite;
+    }
+    const localCommitStartedAt = Date.now();
+    // Ensure all parent directories exist (recursive)
+    if (!this.canContinue(operationEpoch, result)) return { executed: false };
+    await this.ensureParentDirs(item.path);
+    // Verify local file hasn't changed since scan before overwriting.
+    // If the local file was modified after the scan, route to conflict
+    // instead of silently overwriting the user's changes.
+    if (!usesLocalCas && item.local) {
+      let currentContent: ArrayBuffer | null = null;
+      try { currentContent = await this.scanner.vault.adapter.readBinary(item.path); } catch { /* file doesn't exist yet */ }
+      if (currentContent) {
+        const currentHash = await sha256Hex(currentContent);
+        if (currentHash !== item.local.hash) {
+          this.diag?.warn("execute", `download blocked — ${item.path} was modified locally since scan (${item.local.hash.slice(0, 8)}… → ${currentHash.slice(0, 8)}…)`);
+          if (factsChangedPolicy === "throw") {
+            if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
+            throw new MutationNotAppliedError(
+              new Error(`Manual download local facts changed: ${item.path}`),
+            );
+          }
+          if (this.localMatchesRemoteHash({ hash: currentHash, size: currentContent.byteLength }, item.remote)) {
+            if (tempDownloadPath) {
+              await this.removePathIfExists(tempDownloadPath);
+            }
+            return {
+              executed: true,
+              baseUpsert: StateManager.toBaseEntry(
+                { ...item.local, hash: currentHash, size: currentContent.byteLength },
+                item.remote,
+              ),
+            };
+          }
+          const stat = await this.scanner.vault.adapter.stat(item.path);
+          if (tempDownloadPath) {
+            await this.removePathIfExists(tempDownloadPath);
+          }
+          return this.queuePendingConflict({
+            ...item,
+            type: SyncActionType.Conflict,
+            local: {
+              ...item.local,
+              hash: currentHash,
+              size: currentContent.byteLength,
+              mtime: stat?.mtime ?? item.local.mtime,
+            },
+            reason: "reason.bothSidesModified",
+          }, result, operationEpoch);
+        }
+      }
+    }
+    let fileStat: { size: number; mtime?: number } | null = null;
+    if (!this.canContinue(operationEpoch, result)) return { executed: false };
+    if (streamAdapter && tempDownloadPath && streamedDownload) {
+      try {
+        if (usesLocalCas) {
+          fileStat = await this.commitDownloadedTempFile(
+            streamAdapter,
+            item.path,
+            tempDownloadPath,
+            item.local,
+            streamedDownload,
+          );
+        } else {
+          // Compatibility path for isolated/legacy scanner doubles. The
+          // production LocalScanner always exposes inspectFile().
+          await streamAdapter.rename(tempDownloadPath, item.path);
+          const stat = await streamAdapter.stat(item.path);
+          fileStat = stat ? { size: stat.size, mtime: stat.mtime } : null;
+        }
+      } catch (writeErr) {
+        this.diag?.warn("execute", `streamed download commit failed for ${item.path}, recovery attempted`, writeErr instanceof Error ? writeErr.message : String(writeErr));
+        if (writeErr instanceof LocalCommitPreconditionError) {
+          if (factsChangedPolicy === "throw") {
+            throw new MutationNotAppliedError(writeErr);
+          }
+          const guarded = await this.guardDownloadLocalVersion(item, result, operationEpoch);
+          if (guarded) return guarded;
+          result.deferred++;
+          return {
+            executed: false,
+            completionActionType: SyncActionType.RetryLater,
+            completionReason: this.t("syncView.fileStatus.deferred"),
+          };
+        }
+        throw writeErr;
+      }
+    } else {
+      // Write and verify away from the target, then journal the short
+      // replacement window so a restart can roll it back safely.
+      if (!usesLocalCas) {
+        await this.scanner.vault.adapter.writeBinary(item.path, content as ArrayBuffer);
+        const stat = await this.scanner.vault.adapter.stat(item.path);
+        fileStat = stat ? { size: stat.size, mtime: stat.mtime } : null;
+      } else {
+        const readyPath = `${this.getDownloadTempPath(item.path)}.ready`;
+        try {
+          await this.ensureParentDirs(readyPath);
+          await this.removePathIfExists(readyPath);
+          await this.writeBinaryTempFileWithAndroidZeroByteRetry(
+            item.path,
+            readyPath,
+            content as ArrayBuffer,
+          );
+          const readyBytes = await this.scanner.vault.adapter.readBinary(readyPath);
+          if (
+            readyBytes.byteLength !== (content as ArrayBuffer).byteLength
+            || await sha256Hex(readyBytes) !== downloaded.hash
+          ) {
+            throw new Error(`Downloaded temp file verification failed: ${item.path}`);
+          }
+          fileStat = await this.commitDownloadedTempFile(
+            this.scanner.vault.adapter,
+            item.path,
+            readyPath,
+            item.local,
+            downloaded,
+          );
+        } catch (writeErr) {
+          await this.removePathIfExists(readyPath);
+          this.diag?.warn("execute", `download write failed for ${item.path}, recovery attempted`, writeErr instanceof Error ? writeErr.message : String(writeErr));
+          if (writeErr instanceof LocalCommitPreconditionError) {
+            if (factsChangedPolicy === "throw") {
+              throw new MutationNotAppliedError(writeErr);
+            }
+            const guarded = await this.guardDownloadLocalVersion(item, result, operationEpoch);
+            if (guarded) return guarded;
+            result.deferred++;
+            return {
+              executed: false,
+              completionActionType: SyncActionType.RetryLater,
+              completionReason: this.t("syncView.fileStatus.deferred"),
+            };
+          }
+          throw writeErr;
+        }
+      }
+    }
+    metrics.fileTransfers.download.stagesMs.localCommit +=
+      Date.now() - localCommitStartedAt;
+
+    const hash = downloaded.hash;
+    result.downloaded++;
+    if (content) {
+      this.state.cacheBaseContent(item.path, content);
+    }
+    return {
+      executed: true,
+      mutationApplied: true,
+      baseUpsert: {
+        path: item.path,
+        hash,
+        size: fileStat?.size ?? downloaded.size,
+        eTag: item.remote.eTag,
+      },
+    };
+  }
+
+  /** Extracted verbatim from the executeItem switch (case RenameRemote). */
+  private async executeRenameRemoteItem(args: {
+    item: SyncPlanItem;
+    result: SyncResult;
+    remoteUpserts: RemoteFileEntry[];
+    remoteDeletes: string[];
+    operationEpoch: number;
+    factsChangedPolicy: "defer" | "throw";
+  }): Promise<ItemExecutionResult> {
+    const {
+      item,
+      result,
+      remoteUpserts,
+      remoteDeletes,
+      operationEpoch,
+      factsChangedPolicy,
+    } = args;
+    if (!item.renameFrom || !item.local || !item.remote) return { executed: false };
+    if (!this.canContinue(operationEpoch, result)) return { executed: false };
+    const envelope = this.state.getCommittedV2Envelope();
+    if (envelope && inspectRenameTargetAnchorCollisionV2(envelope, {
+      sourcePath: item.renameFrom,
+      path: item.path,
+      movedRemoteId: item.remote.driveId,
+      scope: envelope.scope,
+    })) {
+      throw new MutationNotAppliedError(
+        new Error(`Remote file move target is owned by another V2 anchor: ${item.path}`),
+      );
+    }
+    let updated: DriveItem;
+    try {
+      updated = item.targetParentRemoteId
+        ? await this.onedrive.moveItemById(
+            item.remote.driveId,
+            item.remote.eTag,
+            folderName(item.path),
+            item.targetParentRemoteId,
+          )
+        : await this.onedrive.renameItem(
+            this.vaultName,
+            item.renameFrom,
+            item.path,
+            item.remote.driveId,
+            item.remote.eTag,
+          );
+    } catch (error) {
+      if (!(error instanceof OneDriveError) || !isRemoteMutationConflict(error)) throw error;
+      if (factsChangedPolicy === "throw") {
+        throw new MutationNotAppliedError(error);
+      }
+      const fresh = await this.onedrive.getFileMetadata(this.vaultName, item.renameFrom);
+      if (!this.canContinue(operationEpoch, result)) return { executed: false };
+      if (!fresh) {
+        result.deferred++;
+        return {
+          executed: false,
+          completionActionType: SyncActionType.RetryLater,
+          completionReason: this.t("syncView.fileStatus.deferred"),
+        };
+      }
+      const remoteEntry = this.toMetadataRemoteEntry(
+        item.renameFrom,
+        fresh,
+        item.remote.parentId,
+      );
+      remoteUpserts.push(remoteEntry);
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.RetryLater,
+        completionReason: this.t("syncView.fileStatus.deferred"),
+      };
+    }
+    // Defer persistent base removal and upsert to batch flush in caller.
+    // Caller will see baseRemoval + baseUpsert and do both after pool drain.
+    // Update remote state: old path removed, new path added
+    const movedRemote: RemoteFileEntry = {
+      path: item.path,
+      driveId: updated.id,
+      parentId: this.requireKnownRemoteParentId(
+        item.path,
+        updated.parentReference?.id,
+        item.targetParentRemoteId ?? item.remote.parentId,
+      ),
+      size: updated.size ?? item.remote.size,
+      mtime: updated.lastModifiedDateTime
+        ? new Date(updated.lastModifiedDateTime).getTime()
+        : Date.now(),
+      eTag: updated.eTag ?? "",
+      cTag: updated.cTag ?? "",
+      // F17: a rename/move does not change the object's content, so the
+      // hash is the source object's hash as last observed (the response's
+      // fresh value when Graph provides one) — never the local file's
+      // hash, which the remote bytes were never proven to equal. In the
+      // sha-unknown world this keeps the receipt writable and the index
+      // honest; bytes divergence converges through the ordinary
+      // same-path decision next round.
+      sha256Hash: updated.file?.hashes?.sha256Hash?.toLowerCase()
+        ?? item.remote.sha256Hash,
+      quickXorHash: updated.file?.hashes?.quickXorHash
+        ?? item.remote.quickXorHash,
+    };
+    if (
+      updated.id !== item.remote.driveId
+      || (
+        item.targetParentRemoteId
+        && movedRemote.parentId !== item.targetParentRemoteId
+      )
+    ) {
+      throw new Error(`Remote file move lost its identity: ${item.renameFrom} -> ${item.path}`);
+    }
+    const [sourceAfter, targetAfter] = await Promise.all([
+      this.inspectRemotePath(item.renameFrom),
+      this.inspectRemotePath(item.path),
+    ]);
+    if (
+      sourceAfter
+      || !targetAfter
+      || targetAfter.driveId !== item.remote.driveId
+      || targetAfter.eTag !== movedRemote.eTag
+      || (
+        item.targetParentRemoteId
+        && targetAfter.parentId !== item.targetParentRemoteId
+      )
+    ) {
+      throw new Error(`Remote file move read-back failed: ${item.renameFrom} -> ${item.path}`);
+    }
+    remoteDeletes.push(item.renameFrom);
+    remoteUpserts.push(movedRemote);
+    if (item.targetParentRemoteId) {
+      result.filesMoved = (result.filesMoved ?? 0) + 1;
+    }
+    return {
+      executed: true,
+      mutationApplied: true,
+      baseUpsert: { path: item.path, hash: item.local.hash, size: item.local.size, eTag: updated.eTag ?? "" },
+      baseRemoval: item.renameFrom,
+    };
+  }
+
 
   private async observeSharedSyncProtocolObjects(
     expectedV3Slot?: { id: string; eTag: string },
@@ -19214,79 +23329,18 @@ export class SyncExecutor {
         },
       );
     }
-    if (!observedScope) {
-      if (!recovery.scopeBootstrap) {
-        sourceEnvelope =
-          await this.state.stageV2RemoteScopeBootstrapReview();
-        recovery = sourceEnvelope.remoteScopeRecovery;
-        this.startGeneration = this.state.remoteGeneration;
-      }
-      const reviewPlan = this.buildV2RemoteScopeBootstrapReview(
-        sourceEnvelope,
-      );
-      const reviewedBootstrap =
-        recovery?.scopeBootstrap?.phase === "pending"
-        && reviewedAuthorization?.canonicalIdentity !== undefined
-        && sameCanonicalPlanIdentityV2(
-          reviewedAuthorization.canonicalIdentity,
-          reviewPlan.canonicalIdentity,
-        )
-        && reviewedAuthorization.revision
-          === this.state.planReviewRevision
-        && sameSyncScope(
-          reviewedAuthorization.scope,
-          sourceEnvelope.scope,
-        );
-      if (!reviewedBootstrap) {
-        const publishPreview =
-          callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
-        if (publishPreview) await publishPreview(reviewPlan);
-        this.markPlanReviewPaused(result);
-        this.diag?.warn(
-          "state",
-          "missing V2 remote scope requires an explicit create-only infrastructure review",
-          {
-            phase: recovery?.scopeBootstrap?.phase ?? null,
-            mutations: 0,
-          },
-        );
-        return result;
-      }
-
-      sourceEnvelope =
-        await this.state.confirmV2RemoteScopeBootstrapReview(
-          reviewedAuthorization,
-        );
-      recovery = sourceEnvelope.remoteScopeRecovery;
-      this.startGeneration = this.state.remoteGeneration;
-      observedScope = await this.createV2RemoteScopeInfrastructure(
-        sourceEnvelope.scope.accountId,
-      );
-      if (sameSyncScope(observedScope, sourceEnvelope.scope)) {
-        await this.state.resolveV2RemoteScopeRecoveryToCommittedScope(
-          observedScope,
-        );
-        this.activeSyncScope = observedScope;
-        this.startGeneration = this.state.remoteGeneration;
-        return null;
-      }
-      await this.state.refreshV2RemoteScopeRecoveryObservation({
-        observedScope,
-      });
-      sourceEnvelope = this.state.getCommittedV2Envelope();
-      recovery = sourceEnvelope?.remoteScopeRecovery;
-      if (!sourceEnvelope || !recovery) {
-        result.errors = 1;
-        result.message = this.t("result.v2StateLoadBlocked");
-        return result;
-      }
-      this.startGeneration = this.state.remoteGeneration;
-      this.diag?.warn(
-        "state",
-        "confirmed V2 remote scope infrastructure was created and rebound to its exact identities",
-        { mutations: 1 },
-      );
-    }
+    const missingScopeSettlement = await this.settleMissingV2RemoteScope({
+      result,
+      callbacks,
+      observedScope,
+      sourceEnvelope,
+      recovery,
+      reviewedAuthorization,
+    });
+    if (missingScopeSettlement.handled) return missingScopeSettlement.value;
+    sourceEnvelope = missingScopeSettlement.sourceEnvelope;
+    recovery = missingScopeSettlement.recovery;
+    observedScope = missingScopeSettlement.observedScope;
     if (
       !recovery.observedScope
       || !sameSyncScope(observedScope, recovery.observedScope)
@@ -19601,115 +23655,19 @@ export class SyncExecutor {
         }
       }
     }
-    let verifiedCount = 0;
-    for (const { node, path } of pendingVerificationCandidates) {
-      if (this.shouldStop(result, operationEpoch)) return result;
-      verifiedCount++;
-      this.progressStore?.setPhase("verifying");
-      this.progressStore?.setProgress(
-        verifiedCount,
-        pendingVerificationCandidates.length,
-        path,
-      );
-      callbacks.onProgress?.(
-        verifiedCount,
-        pendingVerificationCandidates.length,
-        this.t("progress.verifyingFiles", {
-          current: verifiedCount,
-          total: pendingVerificationCandidates.length,
-        }),
-      );
-      const item = itemById.get(node.id);
-      if (!item) {
-        throw new Error(`V2 scope recovery remote item disappeared: ${node.id}`);
-      }
-      let content: ArrayBuffer;
-      let hash: string;
-      try {
-        content = await this.onedrive.downloadFile(
-          this.vaultName,
-          path,
-          scopeRecoveryDownloadUrlById.get(node.id),
-          node.id,
-          node.size,
-        );
-        hash = await sha256Hex(content);
-        await this.verifyDownloadedPayload(
-          path,
-          this.toRemoteEntry(item, path, node.parentId),
-          { size: content.byteLength, hash },
-        );
-      } catch (error) {
-        result.errors = 1;
-        const completed = recoveryVerification.reused
-          + recoveryVerification.verifiedThisRun;
-        result.message = this.t(
-          "result.v2ScopeRecoveryVerificationInterrupted",
-          { path },
-        );
-        publishRecoveryVerification({
-          remaining: Math.max(0, recoveryVerification.total - completed),
-          failureStage: "body-verification",
-          firstFailurePath: path,
-        });
-        this.diag?.error(
-          "state",
-          "remote scope recovery body verification stopped",
-          {
-            path,
-            verifiedThisRun: recoveryVerification.verifiedThisRun,
-            reused: recoveryVerification.reused,
-            error: error instanceof Error ? error.message : String(error),
-            mutations: 0,
-          },
-        );
-        return result;
-      }
-      verifiedRemoteHashesById[node.id] = hash;
-      try {
-        await this.state.putVerifiedRemoteScopeRecoveryEvidence({
-          schemaVersion: 1,
-          operationId: evidenceOperation.operationId,
-          remoteId: node.id,
-          size: node.size!,
-          eTag: item.eTag!,
-          ...(item.cTag ? { cTag: item.cTag } : {}),
-          sha256: hash,
-          verifiedAt: Date.now(),
-        });
-      } catch (error) {
-        result.errors = 1;
-        const completed = recoveryVerification.reused
-          + recoveryVerification.verifiedThisRun;
-        result.message = this.t(
-          "result.v2ScopeRecoveryVerificationInterrupted",
-          { path },
-        );
-        publishRecoveryVerification({
-          remaining: Math.max(0, recoveryVerification.total - completed),
-          failureStage: "body-verification",
-          firstFailurePath: path,
-        });
-        this.diag?.error(
-          "state",
-          "remote scope recovery receipt could not be persisted",
-          {
-            remoteId: node.id,
-            path,
-            verifiedThisRun: verifiedCount,
-            reused: reusableEvidence.receiptsByRemoteId.size,
-            error: error instanceof Error ? error.message : String(error),
-            mutations: 0,
-          },
-        );
-        return result;
-      }
-      publishRecoveryVerification({
-        verifiedThisRun: recoveryVerification.verifiedThisRun + 1,
-        remaining: Math.max(0, recoveryVerification.remaining - 1),
-      });
-      if (this.shouldStop(result, operationEpoch)) return result;
-    }
+    if (await this.verifyPendingV2ScopeRecoveryCandidates({
+      result,
+      callbacks,
+      operationEpoch,
+      pendingVerificationCandidates,
+      itemById,
+      scopeRecoveryDownloadUrlById,
+      verifiedRemoteHashesById,
+      evidenceOperationId: evidenceOperation.operationId,
+      reusableReceiptCount: reusableEvidence.receiptsByRemoteId.size,
+      recoveryVerification,
+      publishRecoveryVerification,
+    })) return result;
 
     // Bind downloaded content evidence to the complete identity snapshot.
     // Any change after the first delta makes this attempt stale; the user can
@@ -19976,6 +23934,217 @@ export class SyncExecutor {
       conflicts: 0,
     });
     return result;
+  }
+
+  /** A missing observed scope means the committed identity is unreachable:
+   *  publish the create-only infrastructure review for the user, or, once
+   *  that review is authorized, create the missing infrastructure and bind
+   *  it back to the exact identities. When the round continues instead of
+   *  ending here, the rebound identities travel back to the caller. */
+  private async settleMissingV2RemoteScope(args: SettleMissingV2RemoteScopeArgs): Promise<SettleMissingV2RemoteScopeOutcome> {
+    const { result, callbacks, reviewedAuthorization } = args;
+    let sourceEnvelope: SyncStateEnvelopeV2 | null = args.sourceEnvelope;
+    let recovery: SyncStateEnvelopeV2["remoteScopeRecovery"] = args.recovery;
+    let observedScope: SyncScope | null = args.observedScope;
+    if (!observedScope) {
+      if (!recovery.scopeBootstrap) {
+        sourceEnvelope =
+          await this.state.stageV2RemoteScopeBootstrapReview();
+        recovery = sourceEnvelope.remoteScopeRecovery;
+        this.startGeneration = this.state.remoteGeneration;
+      }
+      const reviewPlan = this.buildV2RemoteScopeBootstrapReview(
+        sourceEnvelope,
+      );
+      const reviewedBootstrap =
+        recovery?.scopeBootstrap?.phase === "pending"
+        && reviewedAuthorization?.canonicalIdentity !== undefined
+        && sameCanonicalPlanIdentityV2(
+          reviewedAuthorization.canonicalIdentity,
+          reviewPlan.canonicalIdentity,
+        )
+        && reviewedAuthorization.revision
+          === this.state.planReviewRevision
+        && sameSyncScope(
+          reviewedAuthorization.scope,
+          sourceEnvelope.scope,
+        );
+      if (!reviewedBootstrap) {
+        const publishPreview =
+          callbacks.onConfirmThreshold ?? callbacks.onFirstSyncPreview;
+        if (publishPreview) await publishPreview(reviewPlan);
+        this.markPlanReviewPaused(result);
+        this.diag?.warn(
+          "state",
+          "missing V2 remote scope requires an explicit create-only infrastructure review",
+          {
+            phase: recovery?.scopeBootstrap?.phase ?? null,
+            mutations: 0,
+          },
+        );
+        return { handled: true, value: result };
+      }
+
+      sourceEnvelope =
+        await this.state.confirmV2RemoteScopeBootstrapReview(
+          reviewedAuthorization,
+        );
+      recovery = sourceEnvelope.remoteScopeRecovery;
+      this.startGeneration = this.state.remoteGeneration;
+      observedScope = await this.createV2RemoteScopeInfrastructure(
+        sourceEnvelope.scope.accountId,
+      );
+      if (sameSyncScope(observedScope, sourceEnvelope.scope)) {
+        await this.state.resolveV2RemoteScopeRecoveryToCommittedScope(
+          observedScope,
+        );
+        this.activeSyncScope = observedScope;
+        this.startGeneration = this.state.remoteGeneration;
+        return { handled: true, value: null };
+      }
+      await this.state.refreshV2RemoteScopeRecoveryObservation({
+        observedScope,
+      });
+      sourceEnvelope = this.state.getCommittedV2Envelope();
+      recovery = sourceEnvelope?.remoteScopeRecovery;
+      if (!sourceEnvelope || !recovery) {
+        result.errors = 1;
+        result.message = this.t("result.v2StateLoadBlocked");
+        return { handled: true, value: result };
+      }
+      this.startGeneration = this.state.remoteGeneration;
+      this.diag?.warn(
+        "state",
+        "confirmed V2 remote scope infrastructure was created and rebound to its exact identities",
+        { mutations: 1 },
+      );
+    }
+    return {
+      handled: false, observedScope, sourceEnvelope, recovery,
+    };
+  }
+
+  /** Body-verify every pending scope-recovery candidate and persist one
+   *  evidence receipt per verified file. A stop request or an interrupted
+   *  download/receipt write ends the round with the shared result; the
+   *  candidate list is only ever read here. */
+  private async verifyPendingV2ScopeRecoveryCandidates(args: VerifyPendingV2ScopeRecoveryCandidatesArgs): Promise<boolean> {
+    const {
+      result, callbacks, operationEpoch, pendingVerificationCandidates,
+      itemById, scopeRecoveryDownloadUrlById, verifiedRemoteHashesById,
+      evidenceOperationId, reusableReceiptCount, recoveryVerification,
+      publishRecoveryVerification,
+    } = args;
+    let verifiedCount = 0;
+    for (const { node, path } of pendingVerificationCandidates) {
+      if (this.shouldStop(result, operationEpoch)) return true;
+      verifiedCount++;
+      this.progressStore?.setPhase("verifying");
+      this.progressStore?.setProgress(
+        verifiedCount,
+        pendingVerificationCandidates.length,
+        path,
+      );
+      callbacks.onProgress?.(
+        verifiedCount,
+        pendingVerificationCandidates.length,
+        this.t("progress.verifyingFiles", {
+          current: verifiedCount,
+          total: pendingVerificationCandidates.length,
+        }),
+      );
+      const item = itemById.get(node.id);
+      if (!item) {
+        throw new Error(`V2 scope recovery remote item disappeared: ${node.id}`);
+      }
+      let content: ArrayBuffer;
+      let hash: string;
+      try {
+        content = await this.onedrive.downloadFile(
+          this.vaultName,
+          path,
+          scopeRecoveryDownloadUrlById.get(node.id),
+          node.id,
+          node.size,
+        );
+        hash = await sha256Hex(content);
+        await this.verifyDownloadedPayload(
+          path,
+          this.toRemoteEntry(item, path, node.parentId),
+          { size: content.byteLength, hash },
+        );
+      } catch (error) {
+        result.errors = 1;
+        const completed = recoveryVerification.reused
+          + recoveryVerification.verifiedThisRun;
+        result.message = this.t(
+          "result.v2ScopeRecoveryVerificationInterrupted",
+          { path },
+        );
+        publishRecoveryVerification({
+          remaining: Math.max(0, recoveryVerification.total - completed),
+          failureStage: "body-verification",
+          firstFailurePath: path,
+        });
+        this.diag?.error(
+          "state",
+          "remote scope recovery body verification stopped",
+          {
+            path,
+            verifiedThisRun: recoveryVerification.verifiedThisRun,
+            reused: recoveryVerification.reused,
+            error: error instanceof Error ? error.message : String(error),
+            mutations: 0,
+          },
+        );
+        return true;
+      }
+      verifiedRemoteHashesById[node.id] = hash;
+      try {
+        await this.state.putVerifiedRemoteScopeRecoveryEvidence({
+          schemaVersion: 1,
+          operationId: evidenceOperationId,
+          remoteId: node.id,
+          size: node.size!,
+          eTag: item.eTag!,
+          ...(item.cTag ? { cTag: item.cTag } : {}),
+          sha256: hash,
+          verifiedAt: Date.now(),
+        });
+      } catch (error) {
+        result.errors = 1;
+        const completed = recoveryVerification.reused
+          + recoveryVerification.verifiedThisRun;
+        result.message = this.t(
+          "result.v2ScopeRecoveryVerificationInterrupted",
+          { path },
+        );
+        publishRecoveryVerification({
+          remaining: Math.max(0, recoveryVerification.total - completed),
+          failureStage: "body-verification",
+          firstFailurePath: path,
+        });
+        this.diag?.error(
+          "state",
+          "remote scope recovery receipt could not be persisted",
+          {
+            remoteId: node.id,
+            path,
+            verifiedThisRun: verifiedCount,
+            reused: reusableReceiptCount,
+            error: error instanceof Error ? error.message : String(error),
+            mutations: 0,
+          },
+        );
+        return true;
+      }
+      publishRecoveryVerification({
+        verifiedThisRun: recoveryVerification.verifiedThisRun + 1,
+        remaining: Math.max(0, recoveryVerification.remaining - 1),
+      });
+      if (this.shouldStop(result, operationEpoch)) return true;
+    }
+    return false;
   }
 
   private buildV2RemoteScopeBootstrapReview(
@@ -20299,138 +24468,20 @@ export class SyncExecutor {
     if (!forceCompleteIdentitySnapshot
       && this.state.hasRemoteState
       && this.state.remoteDeltaLink) {
-      if (!sameSyncScope(this.state.remoteScope, syncScope)) {
-        this.diag?.warn(
-          "onedrive",
-          "remote cache belongs to a different or incomplete sync scope; rebuilding from known Graph identities",
-        );
-        const entries = await this.rebuildRemoteStateFromIdentitySnapshot(
-          operationEpoch,
-          result,
-          currentScope,
-          persistPreparedState,
-        );
-        return { entries, scope: currentScope };
-      }
-      if (this.state.hasCompleteRemoteFolderIndex === false) {
-        this.diag?.warn(
-          "onedrive",
-          "remote cache predates the complete folder identity index; rebuilding from known Graph identities",
-        );
-        const entries = await this.rebuildRemoteStateFromIdentitySnapshot(
-          operationEpoch,
-          result,
-          currentScope,
-          persistPreparedState,
-        );
-        return { entries, scope: currentScope };
-      }
-      if (this.hasLegacyFilesRootPollution(this.state.remoteSnapshot, localEntries)) {
-        this.remoteRecoveryPreviewRequired = true;
-        this.diag?.warn(
-          "onedrive",
-          "remote cache contains the legacy files/ namespace prefix; rebuilding from the known files root",
-        );
-        const entries = await this.rebuildRemoteStateFromIdentitySnapshot(
-          operationEpoch,
-          result,
-          currentScope,
-          persistPreparedState,
-        );
-        return { entries, scope: currentScope };
-      }
-      try {
-        const delta = await this.onedrive.getDelta(
-          this.vaultName,
-          this.state.remoteDeltaLink,
-        );
-        const projection = this.applyRemoteDelta(
-          this.state.remoteSnapshot,
-          this.state.remoteFolders,
-          delta.value,
-          filesRootId,
-        );
-        const entries = projection.entries;
-        if (!this.canContinue(operationEpoch, result)) return { entries, scope: currentScope };
-        await persistRemoteProjection({
-          entries,
-          folders: projection.folders,
-          deltaLink: delta["@odata.deltaLink"] ?? null,
-          scope: currentScope,
-          source: "incremental",
-          observedItems: delta.value.length,
-        });
-        this.diag?.log("onedrive", `incremental delta returned ${delta.value.length} change(s) → ${entries.length} cached remote entries`);
-        return { entries, scope: currentScope };
-      } catch (e) {
-        if (!this.canContinue(operationEpoch, result)) return { entries: [], scope: currentScope };
-        if (e instanceof IncrementalRemoteHierarchyError) {
-          this.diag?.warn(
-            "onedrive",
-            `${e.message}; rebuilding a complete remote identity snapshot`,
-          );
-          const entries = await this.rebuildRemoteStateFromIdentitySnapshot(
-            operationEpoch,
-            result,
-            currentScope,
-            persistPreparedState,
-          );
-          return { entries, scope: currentScope };
-        }
-        if (!isDeltaStateInvalid(e)) {
-          throw e;
-        }
-        this.diag?.warn("onedrive", `incremental delta failed (${e instanceof Error ? e.message : "unknown"}), rebuilding remote cache`);
-        if (!this.canContinue(operationEpoch, result)) return { entries: [], scope: currentScope };
-        this.onedrive.invalidateVaultScope(this.vaultName);
-        let refreshedRemoteScope: {
-          driveId: string;
-          vaultFolderId: string;
-          filesRootId: string;
-        } | null = null;
-        if (typeof this.onedrive.restoreVaultScopeByIdentity === "function") {
-          try {
-            refreshedRemoteScope = await this.onedrive.restoreVaultScopeByIdentity(
-              this.vaultName,
-              {
-                driveId: currentScope.driveId,
-                vaultFolderId: currentScope.vaultFolderId,
-                filesRootId: currentScope.filesRootId,
-              },
-            );
-          } catch (identityError) {
-            if (this.state.isV2StateActive) {
-              if (this.state.mutationLedger.length > 0) throw identityError;
-              throw await this.resolveV2CommittedScopeLoss(
-                currentScope,
-                identityError,
-              );
-            }
-            this.diag?.warn(
-              "onedrive",
-              "committed remote identities are no longer restorable; resolving the live V1 scope",
-              identityError instanceof Error ? identityError.message : String(identityError),
-            );
-          }
-        }
-        refreshedRemoteScope ??= await this.onedrive.initVaultScope(this.vaultName);
-        const refreshedSyncScope: SyncScope = {
-          accountId: currentScope.accountId,
-          ...refreshedRemoteScope,
-        };
-        if (
-          !sameSyncScope(refreshedSyncScope, currentScope)
-          && (
-            this.state.mutationLedger.length > 0
-            || this.state.isV2StateActive
-          )
-        ) {
-          throw new Error("Committed remote scope changed during protected state recovery");
-        }
-        currentScope = refreshedSyncScope;
-        this.activeSyncScope = currentScope;
-        filesRootId = refreshedSyncScope.filesRootId;
-      }
+      const cacheOutcome = await this.refreshIncrementalRemoteCache({
+        operationEpoch,
+        result,
+        syncScope,
+        localEntries,
+        persistPreparedState,
+        persistRemoteProjection,
+        currentScope,
+        filesRootId,
+        deltaLink: this.state.remoteDeltaLink,
+      });
+      if (cacheOutcome.terminated) return cacheOutcome.terminated;
+      currentScope = cacheOutcome.scope;
+      filesRootId = cacheOutcome.filesRootId;
     }
 
     // join 弱网「稍后重试」案C (2026-09-19): 断点续扫。部分读取进度持久化在
@@ -20550,6 +24601,174 @@ export class SyncExecutor {
         throw e2;
       }
     }
+  }
+
+  private async refreshIncrementalRemoteCache(args: {
+    operationEpoch: number;
+    result: SyncResult;
+    syncScope: SyncScope;
+    localEntries: LocalFileEntry[];
+    persistPreparedState: boolean;
+    persistRemoteProjection: (
+      input: Readonly<{
+        entries: RemoteFileEntry[];
+        folders: RemoteFolderEntry[];
+        deltaLink: string | null;
+        scope: SyncScope;
+        source: "incremental" | "complete-delta" | "full-scan" | "not-found";
+        observedItems: number;
+      }>,
+    ) => Promise<void>;
+    currentScope: SyncScope;
+    filesRootId: string;
+    deltaLink: string;
+  }): Promise<
+    | { terminated: { entries: RemoteFileEntry[]; scope: SyncScope } }
+    | { terminated: null; scope: SyncScope; filesRootId: string }
+  > {
+    const {
+      operationEpoch,
+      result,
+      syncScope,
+      localEntries,
+      persistPreparedState,
+      persistRemoteProjection,
+      deltaLink,
+    } = args;
+    let { currentScope, filesRootId } = args;
+    if (!sameSyncScope(this.state.remoteScope, syncScope)) {
+      this.diag?.warn(
+        "onedrive",
+        "remote cache belongs to a different or incomplete sync scope; rebuilding from known Graph identities",
+      );
+      const entries = await this.rebuildRemoteStateFromIdentitySnapshot(
+        operationEpoch,
+        result,
+        currentScope,
+        persistPreparedState,
+      );
+      return { terminated: { entries, scope: currentScope } };
+    }
+    if (this.state.hasCompleteRemoteFolderIndex === false) {
+      this.diag?.warn(
+        "onedrive",
+        "remote cache predates the complete folder identity index; rebuilding from known Graph identities",
+      );
+      const entries = await this.rebuildRemoteStateFromIdentitySnapshot(
+        operationEpoch,
+        result,
+        currentScope,
+        persistPreparedState,
+      );
+      return { terminated: { entries, scope: currentScope } };
+    }
+    if (this.hasLegacyFilesRootPollution(this.state.remoteSnapshot, localEntries)) {
+      this.remoteRecoveryPreviewRequired = true;
+      this.diag?.warn(
+        "onedrive",
+        "remote cache contains the legacy files/ namespace prefix; rebuilding from the known files root",
+      );
+      const entries = await this.rebuildRemoteStateFromIdentitySnapshot(
+        operationEpoch,
+        result,
+        currentScope,
+        persistPreparedState,
+      );
+      return { terminated: { entries, scope: currentScope } };
+    }
+    try {
+      const delta = await this.onedrive.getDelta(
+        this.vaultName,
+        deltaLink,
+      );
+      const projection = this.applyRemoteDelta(
+        this.state.remoteSnapshot,
+        this.state.remoteFolders,
+        delta.value,
+        filesRootId,
+      );
+      const entries = projection.entries;
+      if (!this.canContinue(operationEpoch, result)) return { terminated: { entries, scope: currentScope } };
+      await persistRemoteProjection({
+        entries,
+        folders: projection.folders,
+        deltaLink: delta["@odata.deltaLink"] ?? null,
+        scope: currentScope,
+        source: "incremental",
+        observedItems: delta.value.length,
+      });
+      this.diag?.log("onedrive", `incremental delta returned ${delta.value.length} change(s) → ${entries.length} cached remote entries`);
+      return { terminated: { entries, scope: currentScope } };
+    } catch (e) {
+      if (!this.canContinue(operationEpoch, result)) return { terminated: { entries: [], scope: currentScope } };
+      if (e instanceof IncrementalRemoteHierarchyError) {
+        this.diag?.warn(
+          "onedrive",
+          `${e.message}; rebuilding a complete remote identity snapshot`,
+        );
+        const entries = await this.rebuildRemoteStateFromIdentitySnapshot(
+          operationEpoch,
+          result,
+          currentScope,
+          persistPreparedState,
+        );
+        return { terminated: { entries, scope: currentScope } };
+      }
+      if (!isDeltaStateInvalid(e)) {
+        throw e;
+      }
+      this.diag?.warn("onedrive", `incremental delta failed (${e instanceof Error ? e.message : "unknown"}), rebuilding remote cache`);
+      if (!this.canContinue(operationEpoch, result)) return { terminated: { entries: [], scope: currentScope } };
+      this.onedrive.invalidateVaultScope(this.vaultName);
+      let refreshedRemoteScope: {
+        driveId: string;
+        vaultFolderId: string;
+        filesRootId: string;
+      } | null = null;
+      if (typeof this.onedrive.restoreVaultScopeByIdentity === "function") {
+        try {
+          refreshedRemoteScope = await this.onedrive.restoreVaultScopeByIdentity(
+            this.vaultName,
+            {
+              driveId: currentScope.driveId,
+              vaultFolderId: currentScope.vaultFolderId,
+              filesRootId: currentScope.filesRootId,
+            },
+          );
+        } catch (identityError) {
+          if (this.state.isV2StateActive) {
+            if (this.state.mutationLedger.length > 0) throw identityError;
+            throw await this.resolveV2CommittedScopeLoss(
+              currentScope,
+              identityError,
+            );
+          }
+          this.diag?.warn(
+            "onedrive",
+            "committed remote identities are no longer restorable; resolving the live V1 scope",
+            identityError instanceof Error ? identityError.message : String(identityError),
+          );
+        }
+      }
+      refreshedRemoteScope ??= await this.onedrive.initVaultScope(this.vaultName);
+      const refreshedSyncScope: SyncScope = {
+        accountId: currentScope.accountId,
+        ...refreshedRemoteScope,
+      };
+      if (
+        !sameSyncScope(refreshedSyncScope, currentScope)
+        && (
+          this.state.mutationLedger.length > 0
+          || this.state.isV2StateActive
+        )
+      ) {
+        throw new Error("Committed remote scope changed during protected state recovery");
+      }
+      currentScope = refreshedSyncScope;
+      this.activeSyncScope = currentScope;
+      filesRootId = refreshedSyncScope.filesRootId;
+    }
+    return { terminated: null, scope: currentScope, filesRootId };
   }
 
   /**
@@ -20978,163 +25197,242 @@ export class SyncExecutor {
     for (const change of changes) latestById.set(change.id, change);
 
     for (const change of latestById.values()) {
-      let previous = byDriveId.get(change.id);
-      if (change.id === filesRootId) {
-        if (change.deleted || !change.folder) {
-          throw new IncrementalRemoteHierarchyError("Remote hierarchy changed the known files root");
-        }
-        // OneDrive emits a folder delta for the scoped root when its direct
-        // children change. The root identity anchors every cached path, so a
-        // live mutation of that exact known ID carries no path change to apply.
-        continue;
-      }
-      if (change.deleted) {
-        if (previous) {
-          byPath.delete(previous.path);
-          driveIdByPathKey.delete(normalizeRemotePathKey(previous.path));
-          byDriveId.delete(change.id);
-          continue;
-        }
-        if (!foldersById.has(change.id)) continue;
-        const deletedFolderPath = folderPathById.get(change.id);
-        if (deletedFolderPath === undefined) {
-          throw new IncrementalRemoteHierarchyError(`Remote hierarchy deleted known folder ${change.id}`);
-        }
-        // A deleted known folder removes its whole remote subtree. The delta
-        // feed since the last cursor is the complete change record, so the
-        // cached subtree can be dropped incrementally as long as no live entry
-        // in the same batch contradicts a subtree member (an edited, moved or
-        // restored descendant, or a new item created inside it). The cached
-        // folder and file indexes are path-consistent (validated above), so a
-        // path-prefix scan selects exactly the descendants the cache holds.
-        const subtreeIds = new Set<string>([change.id]);
-        for (const entry of byDriveId.values()) {
-          if (entry.path === deletedFolderPath
-            || entry.path.startsWith(`${deletedFolderPath}/`)) {
-            subtreeIds.add(entry.driveId);
-          }
-        }
-        for (const folder of foldersById.values()) {
-          if (folder.driveId !== change.id
-            && (folder.path === deletedFolderPath
-              || folder.path.startsWith(`${deletedFolderPath}/`))) {
-            subtreeIds.add(folder.driveId);
-          }
-        }
-        for (const other of latestById.values()) {
-          if (other.deleted) continue;
-          if (subtreeIds.has(other.id)) {
-            throw new IncrementalRemoteHierarchyError(`Remote hierarchy deleted known folder ${change.id}`);
-          }
-          const otherParentId = other.parentReference?.id;
-          if (otherParentId && subtreeIds.has(otherParentId)) {
-            throw new IncrementalRemoteHierarchyError(`Remote hierarchy deleted known folder ${change.id}`);
-          }
-        }
-        for (const entry of [...byDriveId.values()]) {
-          if (entry.path === deletedFolderPath
-            || entry.path.startsWith(`${deletedFolderPath}/`)) {
-            byPath.delete(entry.path);
-            driveIdByPathKey.delete(normalizeRemotePathKey(entry.path));
-            byDriveId.delete(entry.driveId);
-          }
-        }
-        for (const folder of [...foldersById.values()]) {
-          if (folder.driveId === change.id
-            || folder.path === deletedFolderPath
-            || folder.path.startsWith(`${deletedFolderPath}/`)) {
-            foldersById.delete(folder.driveId);
-            folderPathById.delete(folder.driveId);
-            folderIdByPathKey.delete(normalizeRemotePathKey(folder.path));
-          }
-        }
-        continue;
-      }
-      if (change.folder) {
-        const previousFolder = foldersById.get(change.id);
-        const parentId = change.parentReference?.id;
-        if (!previousFolder || !parentId) {
-          throw new IncrementalRemoteHierarchyError(`Remote hierarchy incomplete: folder mutation ${change.id}`);
-        }
-        if (
-          change.name !== previousFolder.name
-          || parentId !== previousFolder.parentId
-        ) {
-          throw new IncrementalRemoteHierarchyError(`Remote hierarchy changed known folder ${change.id}`);
-        }
-        // Graph reports both direct folder writes and parent metadata changes
-        // with the same stable identity/path. Preserve the newer version even
-        // when there is no hierarchy change: later folder CAS must not retry a
-        // stale eTag forever after a real 412.
-        if (
-          (change.eTag !== undefined && change.eTag !== previousFolder.eTag)
-          || (change.cTag !== undefined && change.cTag !== previousFolder.cTag)
-        ) {
-          foldersById.set(change.id, {
-            ...previousFolder,
-            ...(change.eTag !== undefined ? { eTag: change.eTag } : {}),
-            ...(change.cTag !== undefined ? { cTag: change.cTag } : {}),
-          });
-        }
-        continue;
-      }
-      if (!change.file) {
-        continue;
-      }
-      const parentId = change.parentReference?.id;
-      if (!parentId) {
-        throw new IncrementalRemoteHierarchyError(`Remote hierarchy incomplete: missing parent identity for ${change.id}`);
-      }
-
-      let projectedPath: string;
-      if (previous) {
-        if (!previous.parentId) {
-          const separator = previous.path.lastIndexOf("/");
-          const expectedParentPath = separator >= 0 ? previous.path.slice(0, separator) : "";
-          const provenParentPath = folderPathById.get(parentId);
-          if (provenParentPath !== expectedParentPath) {
-            throw new IncrementalRemoteHierarchyError(`Remote hierarchy incomplete: legacy cached parent for ${change.id}`);
-          }
-          previous = { ...previous, parentId };
-          byPath.set(previous.path, previous);
-          byDriveId.set(previous.driveId, previous);
-        }
-        if (previous.parentId !== parentId) {
-          throw new IncrementalRemoteHierarchyError(`Remote hierarchy changed parent for ${change.id}`);
-        }
-        const separator = previous.path.lastIndexOf("/");
-        projectedPath = separator >= 0
-          ? `${previous.path.slice(0, separator)}/${change.name}`
-          : change.name;
-        byPath.delete(previous.path);
-        driveIdByPathKey.delete(normalizeRemotePathKey(previous.path));
-      } else {
-        const parentPath = folderPathById.get(parentId);
-        if (parentPath === undefined) {
-          throw new IncrementalRemoteHierarchyError(`Remote hierarchy missing known parent for ${change.id}`);
-        }
-        projectedPath = parentPath ? `${parentPath}/${change.name}` : change.name;
-      }
-
-      const collisionKey = normalizeRemotePathKey(projectedPath);
-      const collisionOwner = driveIdByPathKey.get(collisionKey);
-      if (collisionOwner && collisionOwner !== change.id) {
-        throw new IncrementalRemoteHierarchyError(`Remote hierarchy duplicate path: ${projectedPath}`);
-      }
-      const entry = this.toRemoteEntry(change, projectedPath, parentId);
-      if (!this.shouldIncludeRemotePath(entry.path)) {
-        byDriveId.delete(change.id);
-        continue;
-      }
-      byPath.set(entry.path, entry);
-      byDriveId.set(entry.driveId, entry);
-      driveIdByPathKey.set(collisionKey, entry.driveId);
+      this.applyRemoteDeltaChange({
+        change,
+        byPath,
+        byDriveId,
+        driveIdByPathKey,
+        folderPathById,
+        folderIdByPathKey,
+        foldersById,
+        latestById,
+        filesRootId,
+      });
     }
 
     return {
       entries: [...byPath.values()],
       folders: [...foldersById.values()],
     };
+  }
+
+  /** Project one remote delta change onto the cached hierarchy. */
+  private applyRemoteDeltaChange(args: {
+    change: DriveItem;
+    byPath: Map<string, RemoteFileEntry>;
+    byDriveId: Map<string, RemoteFileEntry>;
+    driveIdByPathKey: Map<string, string>;
+    folderPathById: Map<string, string>;
+    folderIdByPathKey: Map<string, string>;
+    foldersById: Map<string, RemoteFolderEntry>;
+    latestById: Map<string, DriveItem>;
+    filesRootId: string;
+  }): void {
+    const {
+      change,
+      byPath,
+      byDriveId,
+      driveIdByPathKey,
+      folderPathById,
+      folderIdByPathKey,
+      foldersById,
+      latestById,
+      filesRootId,
+    } = args;
+    let previous = byDriveId.get(change.id);
+    if (change.id === filesRootId) {
+      if (change.deleted || !change.folder) {
+        throw new IncrementalRemoteHierarchyError("Remote hierarchy changed the known files root");
+      }
+      // OneDrive emits a folder delta for the scoped root when its direct
+      // children change. The root identity anchors every cached path, so a
+      // live mutation of that exact known ID carries no path change to apply.
+      return;
+    }
+    if (change.deleted) {
+      this.applyRemoteDeltaDeletion({
+        change,
+        previous,
+        byPath,
+        byDriveId,
+        driveIdByPathKey,
+        folderPathById,
+        folderIdByPathKey,
+        foldersById,
+        latestById,
+      });
+      return;
+    }
+    if (change.folder) {
+      const previousFolder = foldersById.get(change.id);
+      const parentId = change.parentReference?.id;
+      if (!previousFolder || !parentId) {
+        throw new IncrementalRemoteHierarchyError(`Remote hierarchy incomplete: folder mutation ${change.id}`);
+      }
+      if (
+        change.name !== previousFolder.name
+        || parentId !== previousFolder.parentId
+      ) {
+        throw new IncrementalRemoteHierarchyError(`Remote hierarchy changed known folder ${change.id}`);
+      }
+      // Graph reports both direct folder writes and parent metadata changes
+      // with the same stable identity/path. Preserve the newer version even
+      // when there is no hierarchy change: later folder CAS must not retry a
+      // stale eTag forever after a real 412.
+      if (
+        (change.eTag !== undefined && change.eTag !== previousFolder.eTag)
+        || (change.cTag !== undefined && change.cTag !== previousFolder.cTag)
+      ) {
+        foldersById.set(change.id, {
+          ...previousFolder,
+          ...(change.eTag !== undefined ? { eTag: change.eTag } : {}),
+          ...(change.cTag !== undefined ? { cTag: change.cTag } : {}),
+        });
+      }
+      return;
+    }
+    if (!change.file) {
+      return;
+    }
+    const parentId = change.parentReference?.id;
+    if (!parentId) {
+      throw new IncrementalRemoteHierarchyError(`Remote hierarchy incomplete: missing parent identity for ${change.id}`);
+    }
+
+    let projectedPath: string;
+    if (previous) {
+      if (!previous.parentId) {
+        const separator = previous.path.lastIndexOf("/");
+        const expectedParentPath = separator >= 0 ? previous.path.slice(0, separator) : "";
+        const provenParentPath = folderPathById.get(parentId);
+        if (provenParentPath !== expectedParentPath) {
+          throw new IncrementalRemoteHierarchyError(`Remote hierarchy incomplete: legacy cached parent for ${change.id}`);
+        }
+        previous = { ...previous, parentId };
+        byPath.set(previous.path, previous);
+        byDriveId.set(previous.driveId, previous);
+      }
+      if (previous.parentId !== parentId) {
+        throw new IncrementalRemoteHierarchyError(`Remote hierarchy changed parent for ${change.id}`);
+      }
+      const separator = previous.path.lastIndexOf("/");
+      projectedPath = separator >= 0
+        ? `${previous.path.slice(0, separator)}/${change.name}`
+        : change.name;
+      byPath.delete(previous.path);
+      driveIdByPathKey.delete(normalizeRemotePathKey(previous.path));
+    } else {
+      const parentPath = folderPathById.get(parentId);
+      if (parentPath === undefined) {
+        throw new IncrementalRemoteHierarchyError(`Remote hierarchy missing known parent for ${change.id}`);
+      }
+      projectedPath = parentPath ? `${parentPath}/${change.name}` : change.name;
+    }
+
+    const collisionKey = normalizeRemotePathKey(projectedPath);
+    const collisionOwner = driveIdByPathKey.get(collisionKey);
+    if (collisionOwner && collisionOwner !== change.id) {
+      throw new IncrementalRemoteHierarchyError(`Remote hierarchy duplicate path: ${projectedPath}`);
+    }
+    const entry = this.toRemoteEntry(change, projectedPath, parentId);
+    if (!this.shouldIncludeRemotePath(entry.path)) {
+      byDriveId.delete(change.id);
+      return;
+    }
+    byPath.set(entry.path, entry);
+    byDriveId.set(entry.driveId, entry);
+    driveIdByPathKey.set(collisionKey, entry.driveId);
+  }
+
+  /**
+   * Drop a deleted known folder and its whole cached subtree.
+   *
+   * The delta feed since the last cursor is the complete change record, so the
+   * cached subtree can be dropped incrementally as long as no live entry in the
+   * same batch contradicts a subtree member.
+   */
+  private applyRemoteDeltaDeletion(args: {
+    change: DriveItem;
+    previous: RemoteFileEntry | undefined;
+    byPath: Map<string, RemoteFileEntry>;
+    byDriveId: Map<string, RemoteFileEntry>;
+    driveIdByPathKey: Map<string, string>;
+    folderPathById: Map<string, string>;
+    folderIdByPathKey: Map<string, string>;
+    foldersById: Map<string, RemoteFolderEntry>;
+    latestById: Map<string, DriveItem>;
+  }): void {
+    const {
+      change,
+      previous,
+      byPath,
+      byDriveId,
+      driveIdByPathKey,
+      folderPathById,
+      folderIdByPathKey,
+      foldersById,
+      latestById,
+    } = args;
+    if (previous) {
+      byPath.delete(previous.path);
+      driveIdByPathKey.delete(normalizeRemotePathKey(previous.path));
+      byDriveId.delete(change.id);
+      return;
+    }
+    if (!foldersById.has(change.id)) return;
+    const deletedFolderPath = folderPathById.get(change.id);
+    if (deletedFolderPath === undefined) {
+      throw new IncrementalRemoteHierarchyError(`Remote hierarchy deleted known folder ${change.id}`);
+    }
+    // A deleted known folder removes its whole remote subtree. The delta
+    // feed since the last cursor is the complete change record, so the
+    // cached subtree can be dropped incrementally as long as no live entry
+    // in the same batch contradicts a subtree member (an edited, moved or
+    // restored descendant, or a new item created inside it). The cached
+    // folder and file indexes are path-consistent (validated above), so a
+    // path-prefix scan selects exactly the descendants the cache holds.
+    const subtreeIds = new Set<string>([change.id]);
+    for (const entry of byDriveId.values()) {
+      if (entry.path === deletedFolderPath
+        || entry.path.startsWith(`${deletedFolderPath}/`)) {
+        subtreeIds.add(entry.driveId);
+      }
+    }
+    for (const folder of foldersById.values()) {
+      if (folder.driveId !== change.id
+        && (folder.path === deletedFolderPath
+          || folder.path.startsWith(`${deletedFolderPath}/`))) {
+        subtreeIds.add(folder.driveId);
+      }
+    }
+    for (const other of latestById.values()) {
+      if (other.deleted) continue;
+      if (subtreeIds.has(other.id)) {
+        throw new IncrementalRemoteHierarchyError(`Remote hierarchy deleted known folder ${change.id}`);
+      }
+      const otherParentId = other.parentReference?.id;
+      if (otherParentId && subtreeIds.has(otherParentId)) {
+        throw new IncrementalRemoteHierarchyError(`Remote hierarchy deleted known folder ${change.id}`);
+      }
+    }
+    for (const entry of [...byDriveId.values()]) {
+      if (entry.path === deletedFolderPath
+        || entry.path.startsWith(`${deletedFolderPath}/`)) {
+        byPath.delete(entry.path);
+        driveIdByPathKey.delete(normalizeRemotePathKey(entry.path));
+        byDriveId.delete(entry.driveId);
+      }
+    }
+    for (const folder of [...foldersById.values()]) {
+      if (folder.driveId === change.id
+        || folder.path === deletedFolderPath
+        || folder.path.startsWith(`${deletedFolderPath}/`)) {
+        foldersById.delete(folder.driveId);
+        folderPathById.delete(folder.driveId);
+        folderIdByPathKey.delete(normalizeRemotePathKey(folder.path));
+      }
+    }
+    return;
   }
 
   private shouldIncludeRemotePath(path: string): boolean {
@@ -21378,81 +25676,127 @@ export class SyncExecutor {
     const refreshedProbeUrls = new Map<string, string>();
     const probeBatchClient = resolveBatchMetadataClient(this.onedrive);
     if (probeBatchClient !== null && byPlugin.size > 0) {
-      const probeEntries: Array<{
-        driveId: string;
-        eTag: string;
-        /** The plan item whose manifest this probe refreshes, when the
-         *  manifest itself is a plan download. Writing the fresh URL back to
-         *  it lets the later P1 universal refresh skip the same driveId
-         *  (review 2026-09-08 F1). */
-        planItem?: SyncPlanItem;
-      }> = [];
-      const seenProbeDriveIds = new Set<string>();
-      for (const [pluginId, items] of byPlugin) {
-        const root = `${configDir}/plugins/${pluginId}`;
-        const manifestPath = `${root}/manifest.json`;
-        const manifestItem = items.find((item) => item.path === manifestPath);
-        const remoteEntry = remoteByPath.get(manifestPath)
-          ?? manifestItem?.remote;
-        if (
-          remoteEntry?.driveId
-          && !seenProbeDriveIds.has(remoteEntry.driveId)
-        ) {
-          seenProbeDriveIds.add(remoteEntry.driveId);
-          probeEntries.push({
-            driveId: remoteEntry.driveId,
-            eTag: remoteEntry.eTag,
-            planItem: manifestItem?.remote ? manifestItem : undefined,
-          });
-        }
-      }
-      if (probeEntries.length > 0) {
-        const probeStartedAt = Date.now();
-        try {
-          const refreshed = await probeBatchClient(
-            probeEntries.map((entry) => entry.driveId),
-            "downloadUrlRefresh",
-          );
-          let filled = 0;
-          for (const entry of probeEntries) {
-            const current = refreshed.get(entry.driveId);
-            if (refreshedMetadataMatchesIdentity(current, entry.driveId, entry.eTag)) {
-              const downloadUrl = current["@microsoft.graph.downloadUrl"];
-              if (downloadUrl) {
-                refreshedProbeUrls.set(entry.driveId, downloadUrl);
-                // Write the fresh URL back onto the plan item so the later
-                // universal refresh (P1) skips this driveId (review F1).
-                if (entry.planItem?.remote) {
-                  entry.planItem.remote.downloadUrl = downloadUrl;
-                }
-                filled++;
-              }
-            }
-          }
-          this.diag?.log(
-            "execute",
-            "community plugin downgrade-probe downloadUrl refresh",
-            {
-              schemaVersion: 1,
-              plugins: byPlugin.size,
-              probes: probeEntries.length,
-              filled,
-              batchRequests: Math.ceil(probeEntries.length / 20),
-              elapsedMs: Math.max(0, Date.now() - probeStartedAt),
-            },
-          );
-        } catch (error) {
-          // Fail-open: leave URLs unset; per-file waterfall stays (today's
-          // behavior before batching).
-          this.diag?.warn(
-            "execute",
-            `community plugin downgrade-probe downloadUrl refresh failed, falling back to per-file waterfall`,
-            error instanceof Error ? error.message : String(error),
-          );
-        }
-      }
+      await this.refreshCommunityPluginDowngradeProbeUrls({
+        byPlugin,
+        configDir,
+        remoteByPath,
+        refreshedProbeUrls,
+        probeBatchClient,
+      });
     }
 
+    return await this.deferCommunityPluginBundleDownloadDowngrades({
+      byPlugin,
+      configDir,
+      remoteByPath,
+      adapter,
+      refreshedProbeUrls,
+      downloads,
+    });
+  }
+
+  /** Batched manifest-probe downloadUrl refresh for the community-plugin
+   *  bundle download-downgrade guard — moved verbatim from
+   *  guardCommunityPluginBundleDowngrades. */
+  private async refreshCommunityPluginDowngradeProbeUrls(
+    args: CommunityPluginDowngradeProbeRefreshArgs,
+  ): Promise<void> {
+    const {
+      byPlugin,
+      configDir,
+      remoteByPath,
+      refreshedProbeUrls,
+      probeBatchClient,
+    } = args;
+    const probeEntries: Array<{
+      driveId: string;
+      eTag: string;
+      /** The plan item whose manifest this probe refreshes, when the
+       *  manifest itself is a plan download. Writing the fresh URL back to
+       *  it lets the later P1 universal refresh skip the same driveId
+       *  (review 2026-09-08 F1). */
+      planItem?: SyncPlanItem;
+    }> = [];
+    const seenProbeDriveIds = new Set<string>();
+    for (const [pluginId, items] of byPlugin) {
+      const root = `${configDir}/plugins/${pluginId}`;
+      const manifestPath = `${root}/manifest.json`;
+      const manifestItem = items.find((item) => item.path === manifestPath);
+      const remoteEntry = remoteByPath.get(manifestPath)
+        ?? manifestItem?.remote;
+      if (
+        remoteEntry?.driveId
+        && !seenProbeDriveIds.has(remoteEntry.driveId)
+      ) {
+        seenProbeDriveIds.add(remoteEntry.driveId);
+        probeEntries.push({
+          driveId: remoteEntry.driveId,
+          eTag: remoteEntry.eTag,
+          planItem: manifestItem?.remote ? manifestItem : undefined,
+        });
+      }
+    }
+    if (probeEntries.length > 0) {
+      const probeStartedAt = Date.now();
+      try {
+        const refreshed = await probeBatchClient(
+          probeEntries.map((entry) => entry.driveId),
+          "downloadUrlRefresh",
+        );
+        let filled = 0;
+        for (const entry of probeEntries) {
+          const current = refreshed.get(entry.driveId);
+          if (refreshedMetadataMatchesIdentity(current, entry.driveId, entry.eTag)) {
+            const downloadUrl = current["@microsoft.graph.downloadUrl"];
+            if (downloadUrl) {
+              refreshedProbeUrls.set(entry.driveId, downloadUrl);
+              // Write the fresh URL back onto the plan item so the later
+              // universal refresh (P1) skips this driveId (review F1).
+              if (entry.planItem?.remote) {
+                entry.planItem.remote.downloadUrl = downloadUrl;
+              }
+              filled++;
+            }
+          }
+        }
+        this.diag?.log(
+          "execute",
+          "community plugin downgrade-probe downloadUrl refresh",
+          {
+            schemaVersion: 1,
+            plugins: byPlugin.size,
+            probes: probeEntries.length,
+            filled,
+            batchRequests: Math.ceil(probeEntries.length / 20),
+            elapsedMs: Math.max(0, Date.now() - probeStartedAt),
+          },
+        );
+      } catch (error) {
+        // Fail-open: leave URLs unset; per-file waterfall stays (today's
+        // behavior before batching).
+        this.diag?.warn(
+          "execute",
+          `community plugin downgrade-probe downloadUrl refresh failed, falling back to per-file waterfall`,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+  }
+
+  /** Per-bundle download-downgrade guard pass for community-plugin
+   *  bundles — moved verbatim from guardCommunityPluginBundleDowngrades.
+   *  The accumulator returns to the caller; the in-loop early exit ends the pass. */
+  private async deferCommunityPluginBundleDownloadDowngrades(
+    args: CommunityPluginBundleDownloadDeferralArgs,
+  ): Promise<number> {
+    const {
+      byPlugin,
+      configDir,
+      remoteByPath,
+      adapter,
+      refreshedProbeUrls,
+      downloads,
+    } = args;
     let removed = 0;
     for (const [pluginId, items] of byPlugin) {
       const root = `${configDir}/plugins/${pluginId}`;
@@ -21592,6 +25936,40 @@ export class SyncExecutor {
       byPlugin.set(parsed.pluginId, group);
     }
 
+    const uploadDowngradeOutcome = await this.deferCommunityPluginBundleUploadDowngrades({
+      byPlugin,
+      configDir,
+      remoteByPath,
+      adapter,
+      smallUploads,
+      largeUploads,
+      deferredOut,
+    });
+    if (uploadDowngradeOutcome.terminated !== null) return uploadDowngradeOutcome.terminated;
+    return uploadDowngradeOutcome.removed;
+  }
+
+  /** Per-bundle community-plugin upload-downgrade guard pass — moved verbatim
+   *  from guardCommunityPluginBundleUploadDowngrades. The accumulator returns to
+   *  the caller; the in-loop early exit terminates the host scan for that round. */
+  private async deferCommunityPluginBundleUploadDowngrades(args: {
+    byPlugin: Map<string, SyncPlanItem[]>;
+    configDir: string;
+    remoteByPath: Map<string, RemoteFileEntry>;
+    adapter: DataAdapter;
+    smallUploads: SyncPlanItem[];
+    largeUploads: SyncPlanItem[];
+    deferredOut?: string[];
+  }): Promise<{ terminated: number } | { terminated: null; removed: number }> {
+    const {
+      byPlugin,
+      configDir,
+      remoteByPath,
+      adapter,
+      smallUploads,
+      largeUploads,
+      deferredOut,
+    } = args;
     let removed = 0;
     for (const [pluginId, items] of byPlugin) {
       const root = `${configDir}/plugins/${pluginId}`;
@@ -21610,7 +25988,7 @@ export class SyncExecutor {
           ).version;
         }
       } catch {
-        return removed;
+        return { terminated: removed };
       }
       if (localVersion === null) continue;
 
@@ -21682,7 +26060,7 @@ export class SyncExecutor {
       );
       deferredOut?.push(pluginId);
     }
-    return removed;
+    return { terminated: null, removed };
   }
 
   private async ensureParentDirs(filePath: string): Promise<void> {
@@ -22438,72 +26816,16 @@ export class SyncExecutor {
         const intent = this.createSideMutationIntent(queuedConflict, "download");
         let content: ArrayBuffer | null = null;
         const committed = await this.runDurableSideMutation(intent, operationEpoch, async () => {
-          let targetMutationStarted = false;
+          const transferState = { targetMutationStarted: false };
           try {
-            content = await this.onedrive.downloadFile(
-              this.vaultName,
+            const transfer = await this.commitReviewedRemoteDownloadTransfer({
               path,
-              queuedConflict.remote!.downloadUrl,
-              queuedConflict.remote!.driveId,
-              queuedConflict.remote!.size,
-              (downloaded, total) => this.updateSideActionProgress(downloaded, total),
-            );
-            if (!this.canContinue(operationEpoch)) {
-              throw new MutationNotAppliedError(
-                new Error("Reviewed download cancelled before local commit"),
-              );
-            }
-            if (!await this.guardReviewedLocalVersion(path, queuedConflict.local, "notice.conflict.failed", {
-              pendingKind: "conflict",
-              item: queuedConflict,
-            })) {
-              throw new MutationNotAppliedError(undefined, true);
-            }
-            if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict")) {
-              throw new MutationNotAppliedError(undefined, true);
-            }
-            const hash = await sha256Hex(content);
-            await this.verifyDownloadedPayload(
-              path,
-              queuedConflict.remote!,
-              { size: content.byteLength, hash },
-              true,
-            );
-            if (typeof (this.scanner as LocalScanner & { inspectFile?: unknown }).inspectFile === "function") {
-              const readyPath = `${this.getDownloadTempPath(path)}.ready`;
-              await this.ensureParentDirs(readyPath);
-              await this.removePathIfExists(readyPath);
-              await this.writeBinaryTempFileWithAndroidZeroByteRetry(
-                path,
-                readyPath,
-                content,
-              );
-              targetMutationStarted = true;
-              await this.commitDownloadedTempFile(
-                this.scanner.vault.adapter,
-                path,
-                readyPath,
-                queuedConflict.local,
-                { size: content.byteLength, hash },
-              );
-            } else {
-              await this.ensureParentDirs(path);
-              targetMutationStarted = true;
-              await this.scanner.vault.adapter.writeBinary(path, content);
-            }
-            const checkpoint = emptyMutationCheckpoint();
-            checkpoint.baseUpserts.push({
-              path,
-              hash,
-              // 基线记云端版本本身（hash 与 size 必须自洽）：宿主可能把未保存的行合并到
-              // 我们写入的内容之后，那份合并结果属于「本机改动」，下一轮按普通本机改动上传
-              // （`DECISIONS` 2026-09-23 第 9 点②）。
-              size: content.byteLength,
-              eTag: queuedConflict.remote!.eTag,
+              queuedConflict,
+              operationEpoch,
+              transferState,
             });
-            this.state.cacheBaseContent(path, content);
-            checkpoint.pendingConflictRemovals.push(path);
-            return checkpoint;
+            content = transfer.content;
+            return transfer.checkpoint;
           } catch (error) {
             if (error instanceof LocalWriteNotLandedError) {
               // 写入自己没落地（被截断或没写进去）：本机文件没有被这次操作改动，
@@ -22524,7 +26846,7 @@ export class SyncExecutor {
               });
               throw new MutationNotAppliedError(error, true);
             }
-            if (error instanceof MutationNotAppliedError || targetMutationStarted) throw error;
+            if (error instanceof MutationNotAppliedError || transferState.targetMutationStarted) throw error;
             throw new MutationNotAppliedError(error);
           }
         });
@@ -22556,6 +26878,75 @@ export class SyncExecutor {
         });
       }
     });
+  }
+
+  private async commitReviewedRemoteDownloadTransfer(args: CommitReviewedRemoteDownloadTransferArgs): Promise<CommitReviewedRemoteDownloadTransferOutcome> {
+    const { path, queuedConflict, operationEpoch, transferState } = args;
+    let content: ArrayBuffer | null = null;
+    content = await this.onedrive.downloadFile(
+      this.vaultName,
+      path,
+      queuedConflict.remote!.downloadUrl,
+      queuedConflict.remote!.driveId,
+      queuedConflict.remote!.size,
+      (downloaded, total) => this.updateSideActionProgress(downloaded, total),
+    );
+    if (!this.canContinue(operationEpoch)) {
+      throw new MutationNotAppliedError(
+        new Error("Reviewed download cancelled before local commit"),
+      );
+    }
+    if (!await this.guardReviewedLocalVersion(path, queuedConflict.local, "notice.conflict.failed", {
+      pendingKind: "conflict",
+      item: queuedConflict,
+    })) {
+      throw new MutationNotAppliedError(undefined, true);
+    }
+    if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict")) {
+      throw new MutationNotAppliedError(undefined, true);
+    }
+    const hash = await sha256Hex(content);
+    await this.verifyDownloadedPayload(
+      path,
+      queuedConflict.remote!,
+      { size: content.byteLength, hash },
+      true,
+    );
+    if (typeof (this.scanner as LocalScanner & { inspectFile?: unknown }).inspectFile === "function") {
+      const readyPath = `${this.getDownloadTempPath(path)}.ready`;
+      await this.ensureParentDirs(readyPath);
+      await this.removePathIfExists(readyPath);
+      await this.writeBinaryTempFileWithAndroidZeroByteRetry(
+        path,
+        readyPath,
+        content,
+      );
+      transferState.targetMutationStarted = true;
+      await this.commitDownloadedTempFile(
+        this.scanner.vault.adapter,
+        path,
+        readyPath,
+        queuedConflict.local,
+        { size: content.byteLength, hash },
+      );
+    } else {
+      await this.ensureParentDirs(path);
+      transferState.targetMutationStarted = true;
+      await this.scanner.vault.adapter.writeBinary(path, content);
+    }
+    const checkpoint = emptyMutationCheckpoint();
+    checkpoint.baseUpserts.push({
+      path,
+      hash,
+      // 基线记云端版本本身（hash 与 size 必须自洽）：宿主可能把未保存的行合并到
+      // 我们写入的内容之后，那份合并结果属于「本机改动」，下一轮按普通本机改动上传
+      // （`DECISIONS` 2026-09-23 第 9 点②）。
+      size: content.byteLength,
+      eTag: queuedConflict.remote!.eTag,
+    });
+    this.state.cacheBaseContent(path, content);
+    checkpoint.pendingConflictRemovals.push(path);
+    return { content, checkpoint };
   }
 
   /** Confirm the exact pending delete paths from one user action. */
@@ -22676,80 +27067,14 @@ export class SyncExecutor {
         Boolean(pending?.folder),
       )) return;
       try {
-        if (pending?.folder?.remoteId) {
-          const envelope = this.state.getCommittedV2Envelope();
-          const syncScope = this.activeSyncScope ?? this.state.remoteScope;
-          const anchor = Object.values(envelope?.folderAnchors?.byAnchorId ?? {}).find(
-            (candidate) => candidate.remoteId === pending.folder!.remoteId
-              && candidate.lastPath === path,
-          );
-          if (!envelope || !syncScope || !anchor || !sameSyncScope(envelope.scope, syncScope)) {
-            this.notice("notice.delete.failed", {
-              path,
-              reason: this.t("notice.decisionExpired"),
-            });
-            return;
-          }
-          // A folder whose shell still contains members cannot be removed
-          // yet: keep the row pending and say what to do instead of surfacing
-          // an empty-check failure. The mutation path below keeps the same
-          // emptiness guard as its race-condition fallback.
-          if (
-            (await this.inspectLocalFolder(path)).status === "present"
-            && !await this.isLocalFolderEmpty(path)
-          ) {
-            this.notice("notice.delete.failed", {
-              path,
-              reason: this.t("reason.delete.folderNotEmpty"),
-            });
-            return;
-          }
-          const intent: FolderMutationIntentV2 = {
-            version: 2,
-            operationId: `${Date.now()}-${++this.mutationSequence}-deleteLocalFolder`,
-            planRevision: this.state.planReviewRevision,
-            scope: { ...syncScope },
-            action: "deleteLocalFolder",
-            path,
-            folderId: anchor.remoteId,
-            expectedLocal: { exists: true },
-            expectedRemote: { exists: false },
-            expectedParent: {
-              driveId: anchor.parentRemoteId,
-              path: parentFolderPath(path),
-            },
-            createdAt: Date.now(),
-          };
-          const committed = await this.runDurableSideMutation(
-            intent,
-            operationEpoch,
-            async () => {
-              const [remoteById, remoteByPath, local] = await Promise.all([
-                this.onedrive.getDriveItemMetadataById(anchor.remoteId),
-                // A batch-proven path absence skips the redundant per-item
-                // by-path re-check; the by-ID guard and local guard still run.
-                options?.preverifiedAbsent === true
-                  ? Promise.resolve<RemoteFolderInspection>({ status: "missing" })
-                  : this.inspectRemoteFolder(path),
-                this.inspectLocalFolder(path),
-              ]);
-              if (
-                remoteById
-                || remoteByPath.status !== "missing"
-                || local.status !== "present"
-              ) {
-                throw new MutationNotAppliedError(this.t("notice.decisionExpired"));
-              }
-              await this.deleteEmptyLocalFolder(path);
-              const checkpoint = folderDeleteCheckpoint(path, anchor.remoteId);
-              checkpoint.pendingDeleteRemovals.push(path);
-              return checkpoint;
-            },
-          );
-          if (!committed) return;
-          if (showSuccessNotice) this.notice("notice.delete.confirmed", { path });
-          return true;
-        }
+        const folderHandled = await this.confirmPendingFolderRemoteDelete({
+          path,
+          pending,
+          operationEpoch,
+          options,
+          showSuccessNotice,
+        });
+        if (folderHandled.handled) return folderHandled.value;
         if (!pending?.local) {
           this.notice("notice.delete.failed", { path, reason: this.t("general.unknown") });
           return;
@@ -22790,6 +27115,163 @@ export class SyncExecutor {
     });
   }
 
+  private async confirmPendingFolderRemoteDelete(args: ConfirmPendingFolderRemoteDeleteArgs): Promise<ConfirmPendingFolderRemoteDeleteOutcome> {
+    const { path, pending, operationEpoch, options, showSuccessNotice } = args;
+    if (pending?.folder?.remoteId) {
+      const envelope = this.state.getCommittedV2Envelope();
+      const syncScope = this.activeSyncScope ?? this.state.remoteScope;
+      const anchor = Object.values(envelope?.folderAnchors?.byAnchorId ?? {}).find(
+        (candidate) => candidate.remoteId === pending.folder!.remoteId
+          && candidate.lastPath === path,
+      );
+      if (!envelope || !syncScope || !anchor || !sameSyncScope(envelope.scope, syncScope)) {
+        this.notice("notice.delete.failed", {
+          path,
+          reason: this.t("notice.decisionExpired"),
+        });
+        return { handled: true, value: undefined };
+      }
+      // A folder whose shell still contains members cannot be removed
+      // yet: keep the row pending and say what to do instead of surfacing
+      // an empty-check failure. The mutation path below keeps the same
+      // emptiness guard as its race-condition fallback.
+      if (
+        (await this.inspectLocalFolder(path)).status === "present"
+        && !await this.isLocalFolderEmpty(path)
+      ) {
+        this.notice("notice.delete.failed", {
+          path,
+          reason: this.t("reason.delete.folderNotEmpty"),
+        });
+        return { handled: true, value: undefined };
+      }
+      const intent: FolderMutationIntentV2 = {
+        version: 2,
+        operationId: `${Date.now()}-${++this.mutationSequence}-deleteLocalFolder`,
+        planRevision: this.state.planReviewRevision,
+        scope: { ...syncScope },
+        action: "deleteLocalFolder",
+        path,
+        folderId: anchor.remoteId,
+        expectedLocal: { exists: true },
+        expectedRemote: { exists: false },
+        expectedParent: {
+          driveId: anchor.parentRemoteId,
+          path: parentFolderPath(path),
+        },
+        createdAt: Date.now(),
+      };
+      const committed = await this.runDurableSideMutation(
+        intent,
+        operationEpoch,
+        async () => {
+          const [remoteById, remoteByPath, local] = await Promise.all([
+            this.onedrive.getDriveItemMetadataById(anchor.remoteId),
+            // A batch-proven path absence skips the redundant per-item
+            // by-path re-check; the by-ID guard and local guard still run.
+            options?.preverifiedAbsent === true
+              ? Promise.resolve<RemoteFolderInspection>({ status: "missing" })
+              : this.inspectRemoteFolder(path),
+            this.inspectLocalFolder(path),
+          ]);
+          if (
+            remoteById
+            || remoteByPath.status !== "missing"
+            || local.status !== "present"
+          ) {
+            throw new MutationNotAppliedError(this.t("notice.decisionExpired"));
+          }
+          await this.deleteEmptyLocalFolder(path);
+          const checkpoint = folderDeleteCheckpoint(path, anchor.remoteId);
+          checkpoint.pendingDeleteRemovals.push(path);
+          return checkpoint;
+        },
+      );
+      if (!committed) return { handled: true, value: undefined };
+      if (showSuccessNotice) this.notice("notice.delete.confirmed", { path });
+      return { handled: true, value: true };
+    }
+    return { handled: false };
+  }
+
+  /** Recreate the remote folder for a pending folder delete whose reviewed
+   *  decision was rejected: preflight the anchor against the committed
+   *  identity, run one durable create, and report whether the side action is
+   *  already finished — the caller keeps its own trailing return for the
+   *  paths that fall through without a decision. */
+  private async rejectRemoteDeleteFolder(args: RejectRemoteDeleteFolderArgs): Promise<RejectRemoteDeleteFolderOutcome> {
+    const { pending, path, operationEpoch } = args;
+    try {
+      const envelope = this.state.getCommittedV2Envelope();
+      const syncScope = this.activeSyncScope ?? this.state.remoteScope;
+      const anchor = Object.values(envelope?.folderAnchors?.byAnchorId ?? {}).find(
+        (candidate) => candidate.remoteId === pending.folder!.remoteId
+          && candidate.lastPath === path,
+      );
+      if (!envelope || !syncScope || !anchor || !sameSyncScope(envelope.scope, syncScope)) {
+        this.notice("notice.delete.failed", {
+          path,
+          reason: this.t("notice.decisionExpired"),
+        });
+        return { handled: true, value: undefined };
+      }
+      const parent = this.resolveCurrentFolderParent({
+        ...pending.folder,
+        parentRemoteId: anchor.parentRemoteId,
+        parentPath: parentFolderPath(path),
+      });
+      const intent: FolderMutationIntentV2 = {
+        version: 2,
+        operationId: `${Date.now()}-${++this.mutationSequence}-createRemoteFolder`,
+        planRevision: this.state.planReviewRevision,
+        scope: { ...syncScope },
+        action: "createRemoteFolder",
+        path,
+        expectedLocal: { exists: true },
+        expectedRemote: { exists: false },
+        expectedParent: {
+          driveId: parent.driveId,
+          path: parentFolderPath(path),
+          eTag: parent.eTag,
+        },
+        createdAt: Date.now(),
+      };
+      const committed = await this.runDurableSideMutation(
+        intent,
+        operationEpoch,
+        async () => {
+          const [local, remote] = await Promise.all([
+            this.inspectLocalFolder(path),
+            this.inspectRemoteFolder(path),
+          ]);
+          if (local.status !== "present" || remote.status !== "missing") {
+            throw new MutationNotAppliedError(this.t("notice.decisionExpired"));
+          }
+          const folder = await this.createRemoteFolderWithReadback(
+            path,
+            parent.driveId,
+          );
+          if (folder.parentId !== parent.driveId) {
+            throw new Error(`Remote folder recreate parent changed: ${path}`);
+          }
+          const checkpoint = folderMutationCheckpoint(folder);
+          checkpoint.pendingDeleteRemovals.push(path);
+          return checkpoint;
+        },
+      );
+      if (!committed) return { handled: true, value: undefined };
+      this.notice("notice.delete.rejected", { path });
+      return { handled: true, value: true };
+    } catch (e) {
+      if (this.stopSideActionForAuthFailure(path, e)) return { handled: true, value: undefined };
+      this.notice("notice.delete.failed", {
+        path,
+        reason: this.failureReason(e),
+      });
+    }
+    return { handled: false };
+  }
+
   /** Reject a remote delete: re-upload local file */
   async rejectRemoteDelete(path: string): Promise<void> {
     if (this.stopSideActionForStateRecovery()) return;
@@ -22801,74 +27283,12 @@ export class SyncExecutor {
       if (!this.canContinue(operationEpoch)) return;
       const pending = this.state.pendingRemoteDeletes.find((d) => d.path === path);
       if (pending?.folder?.remoteId) {
-        try {
-          const envelope = this.state.getCommittedV2Envelope();
-          const syncScope = this.activeSyncScope ?? this.state.remoteScope;
-          const anchor = Object.values(envelope?.folderAnchors?.byAnchorId ?? {}).find(
-            (candidate) => candidate.remoteId === pending.folder!.remoteId
-              && candidate.lastPath === path,
-          );
-          if (!envelope || !syncScope || !anchor || !sameSyncScope(envelope.scope, syncScope)) {
-            this.notice("notice.delete.failed", {
-              path,
-              reason: this.t("notice.decisionExpired"),
-            });
-            return;
-          }
-          const parent = this.resolveCurrentFolderParent({
-            ...pending.folder,
-            parentRemoteId: anchor.parentRemoteId,
-            parentPath: parentFolderPath(path),
-          });
-          const intent: FolderMutationIntentV2 = {
-            version: 2,
-            operationId: `${Date.now()}-${++this.mutationSequence}-createRemoteFolder`,
-            planRevision: this.state.planReviewRevision,
-            scope: { ...syncScope },
-            action: "createRemoteFolder",
-            path,
-            expectedLocal: { exists: true },
-            expectedRemote: { exists: false },
-            expectedParent: {
-              driveId: parent.driveId,
-              path: parentFolderPath(path),
-              eTag: parent.eTag,
-            },
-            createdAt: Date.now(),
-          };
-          const committed = await this.runDurableSideMutation(
-            intent,
-            operationEpoch,
-            async () => {
-              const [local, remote] = await Promise.all([
-                this.inspectLocalFolder(path),
-                this.inspectRemoteFolder(path),
-              ]);
-              if (local.status !== "present" || remote.status !== "missing") {
-                throw new MutationNotAppliedError(this.t("notice.decisionExpired"));
-              }
-              const folder = await this.createRemoteFolderWithReadback(
-                path,
-                parent.driveId,
-              );
-              if (folder.parentId !== parent.driveId) {
-                throw new Error(`Remote folder recreate parent changed: ${path}`);
-              }
-              const checkpoint = folderMutationCheckpoint(folder);
-              checkpoint.pendingDeleteRemovals.push(path);
-              return checkpoint;
-            },
-          );
-          if (!committed) return;
-          this.notice("notice.delete.rejected", { path });
-          return true;
-        } catch (e) {
-          if (this.stopSideActionForAuthFailure(path, e)) return;
-          this.notice("notice.delete.failed", {
-            path,
-            reason: this.failureReason(e),
-          });
-        }
+        const folderRejection = await this.rejectRemoteDeleteFolder({
+          pending,
+          path,
+          operationEpoch,
+        });
+        if (folderRejection.handled) return folderRejection.value;
         return;
       }
       if (!pending?.local) {

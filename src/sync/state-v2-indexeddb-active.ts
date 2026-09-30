@@ -1,3 +1,4 @@
+import { compareText } from "./compare-text";
 import {
   deleteDB,
   openDB,
@@ -883,10 +884,6 @@ function sameCounts(
   return left.remoteNodes === right.remoteNodes
     && left.anchors === right.anchors
     && left.folderAnchors === right.folderAnchors;
-}
-
-function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function abortTransaction(transaction: { abort(): void }): void {

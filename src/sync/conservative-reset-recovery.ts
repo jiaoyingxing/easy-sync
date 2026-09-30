@@ -123,70 +123,14 @@ function conservativeResetReceiptMatchesIntent(
     case "deleteLocal":
       return true;
     case "renameRemote":
-    case "moveLocal": {
-      if (!intent.expectedLocal.exists || !intent.expectedRemote.exists) return false;
-      if (
-        !base
-        || !remote
-        || base.eTag !== remote.eTag
-        || remote.driveId !== intent.expectedRemote.driveId
-      ) return false;
-      // Three admissible receipt shapes:
-      //  1. content-aligned (A1 one-shot converge): the receipt base already
-      //     equals the intended remote bytes when the remote was moved and
-      //     edited while the local side stayed unchanged;
-      //  2. pure rename: both sides still hold the intended local bytes and
-      //     the intent itself declares matching content on both sides.
-      //  3. sha-unknown plain move (field report 2026-09-22, F9 case 3):
-      //     OneDrive personal often provides no sha256Hash, and the execution
-      //     chain legitimately records a followed move whose content diverged
-      //     (facts precheck + rename read-back proved the move; the ordinary
-      //     same-path decision converges the bytes next round). Without this
-      //     shape the receipt is unwritable and the record blocks recovery
-      //     forever as intent-only. It is restricted to intents that carry no
-      //     remote hash, so hash-known moves still require alignment (shape
-      //     1), and it binds both worlds exactly as planned instead of
-      //     proving content identity.
-      const aligned = (
-        expected: Readonly<{ size: number; sha256Hash?: string }>,
-      ): boolean => Boolean(base
-        && expected.sha256Hash !== undefined
-        && base.hash.toLowerCase() === expected.sha256Hash.toLowerCase()
-        && base.size === expected.size
-        && remote.size === expected.size
-        && remote.sha256Hash !== undefined
-        && remote.sha256Hash.toLowerCase() === expected.sha256Hash.toLowerCase());
-      if (intent.expectedRemote.sha256Hash === undefined) {
-        if (intent.action === "renameRemote") {
-          // F17 (field 2026-09-28): a REMOTE rename/move changes the
-          // object's eTag, so the receipt records the post-move world
-          // instead of the planned pre-move one — the moveLocal shape below
-          // (eTag bound to the untouched remote world) is unreachable by
-          // construction for this action. Anchors: the moved object's
-          // identity (driveId, checked above) and size (a move preserves
-          // size). The content hash is whatever the read-back reported
-          // (usually absent on OneDrive personal) and is never claimed from
-          // the local side; bytes divergence converges through the ordinary
-          // same-path decision next round.
-          return remote.size === intent.expectedRemote.size
-            && baseMatches(intent.expectedLocal);
-        }
-        return remote.sha256Hash === undefined
-          && remote.eTag === intent.expectedRemote.eTag
-          && remote.size === intent.expectedRemote.size
-          && baseMatches(intent.expectedLocal);
-      }
-      return aligned(intent.expectedRemote) || (
-        baseMatches(intent.expectedLocal)
-        && remoteMatches(intent.expectedLocal)
-        && intent.expectedLocal.size === intent.expectedRemote.size
-        && (
-          intent.expectedRemote.sha256Hash === undefined
-          || intent.expectedLocal.hash.toLowerCase()
-            === intent.expectedRemote.sha256Hash.toLowerCase()
-        )
-      );
-    }
+    case "moveLocal":
+      return conservativeResetRenameOrMoveReceiptMatchesIntent({
+        intent,
+        base,
+        remote,
+        baseMatches,
+        remoteMatches,
+      });
     case "merge":
       return Boolean(intent.target)
         && intent.expectedRemote.exists
@@ -197,6 +141,90 @@ function conservativeResetReceiptMatchesIntent(
           && base.eTag === remote?.eTag
         ));
   }
+}
+
+/**
+ * Decide whether one rename/move receipt is an admissible settlement of its
+ * intent: both sides must exist, the checkpoint must bind the moved identity
+ * with a matching eTag, and the content must match one of the three
+ * admissible receipt shapes documented below. The caller's predicates are
+ * threaded by reference and no binding is reassigned, so the decision is
+ * returned directly.
+ */
+function conservativeResetRenameOrMoveReceiptMatchesIntent(args: {
+  intent: Extract<Readonly<MutationLedgerEntryV1>["intent"], { version: 1 }>;
+  base: NonNullable<
+    Readonly<MutationLedgerEntryV1>["receipt"]
+  >["checkpoint"]["baseUpserts"][number];
+  remote: NonNullable<
+    Readonly<MutationLedgerEntryV1>["receipt"]
+  >["checkpoint"]["remoteUpserts"][number];
+  baseMatches: (expected: Readonly<{ hash: string; size: number }>) => boolean;
+  remoteMatches: (expected: Readonly<{ hash: string; size: number }>) => boolean;
+}): boolean {
+  const { intent, base, remote, baseMatches, remoteMatches } = args;
+  if (!intent.expectedLocal.exists || !intent.expectedRemote.exists) return false;
+  if (
+    !base
+    || !remote
+    || base.eTag !== remote.eTag
+    || remote.driveId !== intent.expectedRemote.driveId
+  ) return false;
+  // Three admissible receipt shapes:
+  //  1. content-aligned (A1 one-shot converge): the receipt base already
+  //     equals the intended remote bytes when the remote was moved and
+  //     edited while the local side stayed unchanged;
+  //  2. pure rename: both sides still hold the intended local bytes and
+  //     the intent itself declares matching content on both sides.
+  //  3. sha-unknown plain move (field report 2026-09-22, F9 case 3):
+  //     OneDrive personal often provides no sha256Hash, and the execution
+  //     chain legitimately records a followed move whose content diverged
+  //     (facts precheck + rename read-back proved the move; the ordinary
+  //     same-path decision converges the bytes next round). Without this
+  //     shape the receipt is unwritable and the record blocks recovery
+  //     forever as intent-only. It is restricted to intents that carry no
+  //     remote hash, so hash-known moves still require alignment (shape
+  //     1), and it binds both worlds exactly as planned instead of
+  //     proving content identity.
+  const aligned = (
+    expected: Readonly<{ size: number; sha256Hash?: string }>,
+  ): boolean => Boolean(base
+    && expected.sha256Hash !== undefined
+    && base.hash.toLowerCase() === expected.sha256Hash.toLowerCase()
+    && base.size === expected.size
+    && remote.size === expected.size
+    && remote.sha256Hash !== undefined
+    && remote.sha256Hash.toLowerCase() === expected.sha256Hash.toLowerCase());
+  if (intent.expectedRemote.sha256Hash === undefined) {
+    if (intent.action === "renameRemote") {
+      // F17 (field 2026-09-28): a REMOTE rename/move changes the
+      // object's eTag, so the receipt records the post-move world
+      // instead of the planned pre-move one — the moveLocal shape below
+      // (eTag bound to the untouched remote world) is unreachable by
+      // construction for this action. Anchors: the moved object's
+      // identity (driveId, checked above) and size (a move preserves
+      // size). The content hash is whatever the read-back reported
+      // (usually absent on OneDrive personal) and is never claimed from
+      // the local side; bytes divergence converges through the ordinary
+      // same-path decision next round.
+      return remote.size === intent.expectedRemote.size
+        && baseMatches(intent.expectedLocal);
+    }
+    return remote.sha256Hash === undefined
+      && remote.eTag === intent.expectedRemote.eTag
+      && remote.size === intent.expectedRemote.size
+      && baseMatches(intent.expectedLocal);
+  }
+  return aligned(intent.expectedRemote) || (
+    baseMatches(intent.expectedLocal)
+    && remoteMatches(intent.expectedLocal)
+    && intent.expectedLocal.size === intent.expectedRemote.size
+    && (
+      intent.expectedRemote.sha256Hash === undefined
+      || intent.expectedLocal.hash.toLowerCase()
+        === intent.expectedRemote.sha256Hash.toLowerCase()
+    )
+  );
 }
 
 /**

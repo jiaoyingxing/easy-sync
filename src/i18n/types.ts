@@ -262,9 +262,6 @@ export interface LocaleStrings {
   "syncView.folderSubtree.delete": string;
   "syncView.folderSubtree.deleteUnavailableTitle": string;
   "syncView.folderSubtree.deleteUnavailableDescription": string;
-  "syncView.folderSubtree.deleteConfirmTitle": string;
-  "syncView.folderSubtree.deleteConfirmMessage": string;
-  "syncView.folderSubtree.deleteConfirmWarning": string;
   "syncView.folderLocation.resolve": string;
   "syncView.folderLocation.title": string;
   "syncView.folderLocation.description": string;
@@ -284,10 +281,7 @@ export interface LocaleStrings {
   "syncView.emptyFolder.deleteDescription": string;
   "syncView.emptyFolder.deleteUnavailable": string;
   "syncView.emptyFolder.deleteUnavailableDescription": string;
-  "syncView.emptyFolder.deleteConfirmTitle": string;
   "syncView.emptyFolder.deleteConfirm": string;
-  "syncView.emptyFolder.deleteConfirmMessage": string;
-  "syncView.emptyFolder.deleteConfirmWarning": string;
   "syncView.sharedFolderIdentity.resolve": string;
   "syncView.sharedFolderIdentity.confirmTitle": string;
   "syncView.sharedFolderIdentity.confirmMessage": string;
@@ -696,7 +690,6 @@ export interface LocaleStrings {
   "syncView.progress.completed": string;
   "syncView.progress.remoteScopeRecoveryFailureTitle": string;
   "syncView.progress.remoteScopeRecoveryFailureSummary": string;
-  "syncView.progress.remoteScopeRecoveryFailureNextStep": string;
   "syncView.cancelSync": string;
   "syncView.cancelling": string;
   "syncView.failure.contentUnavailable": string;
@@ -851,6 +844,8 @@ export interface LocaleStrings {
   "confirm.confirm": string;
   "syncPlan.migrationSummary": string;
   "syncPlan.cloudJoinSummary": string;
+  "syncPlan.firstSyncSummary": string;
+  "syncPlan.activationDecisionSummary": string;
   "syncPlan.confirmMigration": string;
   "syncPlan.migrationConfirmTitle": string;
   "syncPlan.migrationConfirmMessage": string;
@@ -858,7 +853,6 @@ export interface LocaleStrings {
   "syncPlan.remoteScopeRecreateConfirmTitle": string;
   "syncPlan.remoteScopeRecreateConfirmMessage": string;
   "syncPlan.remoteScopeRecreateConfirm": string;
-  "confirm.deleteWarning": string;
   "confirm.pluginDowngradeTitle": string;
   "confirm.pluginDowngradeMessage": string;
   "confirm.pluginUpgradeTitle": string;

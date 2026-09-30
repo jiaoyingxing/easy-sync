@@ -126,7 +126,49 @@ export function planIdentityRenamesFromStateV2(
 
   const actions: IdentityRenameActionV2[] = [];
   for (const anchor of state.fileAnchors) {
-    if (!anchor.remoteId) continue;
+    planIdentityRenameForAnchorV2({
+      anchor,
+      state,
+      pathByRemoteId,
+      remoteIdByPath,
+      localByPath,
+      unanchoredLocalByContent,
+      folderIdByPath,
+      actions,
+    });
+  }
+  return actions;
+}
+
+/**
+ * Plan the identity-rename actions for one anchor of the planner state.
+ *
+ * Every early exit in this phase means "no further action for this anchor" and
+ * is expressed as a plain return: the caller's loop simply moves on to the next
+ * anchor. All produced actions are pushed into the shared `actions` array passed
+ * by reference, so the phase owns no products of its own.
+ */
+function planIdentityRenameForAnchorV2(args: {
+  anchor: SyncAnchorV2;
+  state: CanonicalPlannerStateV2;
+  pathByRemoteId: CanonicalPlannerStateV2["remotePathById"];
+  remoteIdByPath: Map<string, string>;
+  localByPath: Map<string, LocalFileEntry>;
+  unanchoredLocalByContent: Map<string, LocalFileEntry[]>;
+  folderIdByPath: Map<string, string>;
+  actions: IdentityRenameActionV2[];
+}): void {
+  const {
+    anchor,
+    state,
+    pathByRemoteId,
+    remoteIdByPath,
+    localByPath,
+    unanchoredLocalByContent,
+    folderIdByPath,
+    actions,
+  } = args;
+    if (!anchor.remoteId) return;
     const remote = state.remoteNodeById.get(anchor.remoteId);
     const remotePath = pathByRemoteId.get(anchor.remoteId);
     const anchorPathKey = normalizePath(anchor.lastPath);
@@ -165,7 +207,7 @@ export function planIdentityRenamesFromStateV2(
             expectedRemoteETag: occupant.eTag ?? "",
           });
         }
-        continue;
+        return;
       }
       if (!oldLocal && matchingLocals.length > 0) {
         actions.push(conflict(
@@ -178,7 +220,7 @@ export function planIdentityRenamesFromStateV2(
             : undefined,
         ));
       }
-      continue;
+      return;
     }
 
     if (
@@ -192,7 +234,7 @@ export function planIdentityRenamesFromStateV2(
         "same-path-identity-occupied",
         remotePath,
       ));
-      continue;
+      return;
     }
 
     // Remote identity moved while local stayed at the anchored path.
@@ -247,81 +289,124 @@ export function planIdentityRenamesFromStateV2(
           expectedLocalSize: oldLocal.size,
         });
       }
-      continue;
+      return;
     }
 
     // Both sides already show the same path. Nothing to move.
     if (remotePath !== anchor.lastPath
       && matchingLocals.length === 1
-      && matchingLocals[0].path === remotePath) continue;
+      && matchingLocals[0].path === remotePath) return;
 
     // Local disappeared from the anchor path: only a unique content-identical
     // candidate may authorize a remote identity move.
     if (!oldLocal) {
-      if (matchingLocals.length === 0) {
-        continue;
-      }
-      if (matchingLocals.length > 1) {
-        actions.push(conflict(
-          anchor,
-          anchor.lastPath,
-          "local-identity-ambiguous",
-          undefined,
-          matchingLocals.map((entry) => entry.path),
-        ));
-        continue;
-      }
-      const destination = matchingLocals[0];
-      if (remotePath !== anchor.lastPath) {
-        actions.push(conflict(anchor, destination.path, "both-paths-diverged"));
-        continue;
-      }
-      if (!remoteMatchesAnchor(remote, anchor)) {
-        actions.push(conflict(
-          anchor,
-          anchor.lastPath,
-          "remote-content-changed",
-          destination.path,
-        ));
-        continue;
-      }
-      const occupiedId = remoteIdByPath.get(normalizePath(destination.path));
-      if (occupiedId && occupiedId !== remote.id) {
-        actions.push(conflict(
-          anchor,
-          destination.path,
-          "remote-destination-occupied",
-          anchor.lastPath,
-        ));
-        continue;
-      }
-      const slash = destination.path.lastIndexOf("/");
-      const parentPath = slash === -1 ? "" : destination.path.slice(0, slash);
-      const parentId = parentPath === ""
-        ? state.remoteIndex.filesRootId
-        : folderIdByPath.get(normalizePath(parentPath));
-      if (!parentId) {
-        actions.push(conflict(
-          anchor,
-          destination.path,
-          "destination-parent-missing",
-          anchor.lastPath,
-        ));
-        continue;
-      }
-      actions.push({
-        type: "move-remote",
-        anchorId: anchor.anchorId,
-        remoteId: remote.id,
-        fromPath: anchor.lastPath,
-        toPath: destination.path,
-        expectedRemoteETag: remote.eTag!,
-        newName: destination.path.slice(slash + 1),
-        newParentId: parentId,
+      planIdentityRenameForRelocatedLocalV2({
+        anchor,
+        state,
+        remote,
+        remotePath,
+        matchingLocals,
+        remoteIdByPath,
+        folderIdByPath,
+        actions,
       });
     }
+}
+
+/**
+ * Plan the identity-rename actions for an anchor whose local file left the
+ * anchored path (the caller enters this phase only when no local entry
+ * occupies `anchor.lastPath`).
+ *
+ * Only a unique content-identical local candidate may authorize relocating
+ * the remote identity onto it; every other shape becomes a fail-closed
+ * conflict. Every early exit is a plain return meaning "no further action for
+ * this anchor": this phase is the caller's tail statement, so returning here
+ * is the same as returning from `planIdentityRenameForAnchorV2`. All produced
+ * actions are pushed into the shared `actions` array passed by reference, so
+ * the phase owns no products of its own.
+ */
+function planIdentityRenameForRelocatedLocalV2(args: {
+  anchor: SyncAnchorV2;
+  state: CanonicalPlannerStateV2;
+  remote: RemoteNodeV2;
+  remotePath: string;
+  matchingLocals: readonly LocalFileEntry[];
+  remoteIdByPath: Map<string, string>;
+  folderIdByPath: Map<string, string>;
+  actions: IdentityRenameActionV2[];
+}): void {
+  const {
+    anchor,
+    state,
+    remote,
+    remotePath,
+    matchingLocals,
+    remoteIdByPath,
+    folderIdByPath,
+    actions,
+  } = args;
+  if (matchingLocals.length === 0) {
+    return;
   }
-  return actions;
+  if (matchingLocals.length > 1) {
+    actions.push(conflict(
+      anchor,
+      anchor.lastPath,
+      "local-identity-ambiguous",
+      undefined,
+      matchingLocals.map((entry) => entry.path),
+    ));
+    return;
+  }
+  const destination = matchingLocals[0];
+  if (remotePath !== anchor.lastPath) {
+    actions.push(conflict(anchor, destination.path, "both-paths-diverged"));
+    return;
+  }
+  if (!remoteMatchesAnchor(remote, anchor)) {
+    actions.push(conflict(
+      anchor,
+      anchor.lastPath,
+      "remote-content-changed",
+      destination.path,
+    ));
+    return;
+  }
+  const occupiedId = remoteIdByPath.get(normalizePath(destination.path));
+  if (occupiedId && occupiedId !== remote.id) {
+    actions.push(conflict(
+      anchor,
+      destination.path,
+      "remote-destination-occupied",
+      anchor.lastPath,
+    ));
+    return;
+  }
+  const slash = destination.path.lastIndexOf("/");
+  const parentPath = slash === -1 ? "" : destination.path.slice(0, slash);
+  const parentId = parentPath === ""
+    ? state.remoteIndex.filesRootId
+    : folderIdByPath.get(normalizePath(parentPath));
+  if (!parentId) {
+    actions.push(conflict(
+      anchor,
+      destination.path,
+      "destination-parent-missing",
+      anchor.lastPath,
+    ));
+    return;
+  }
+  actions.push({
+    type: "move-remote",
+    anchorId: anchor.anchorId,
+    remoteId: remote.id,
+    fromPath: anchor.lastPath,
+    toPath: destination.path,
+    expectedRemoteETag: remote.eTag!,
+    newName: destination.path.slice(slash + 1),
+    newParentId: parentId,
+  });
 }
 
 function remoteMatchesAnchor(

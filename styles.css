@@ -716,7 +716,10 @@ body.is-mobile .easy-sync-bundle-overview .easy-sync-bundle-diff-link {
   margin: 8px 0;
 }
 
-/* Modal action buttons — fixed footer below scrollable body */
+/* Modal action buttons — fixed footer below scrollable body.
+   Must track the dialog card via --modal-background: the shell repaints with
+   --background-secondary on dark mobile (.is-mobile.theme-dark), so pinning
+   --background-primary here leaves a visibly lighter band there. */
 .easy-sync-detail-actions {
   display: flex;
   gap: 8px;
@@ -724,7 +727,7 @@ body.is-mobile .easy-sync-bundle-overview .easy-sync-bundle-diff-link {
   padding: 8px 0 2px;
   flex-shrink: 0;
   border-top: 1px solid var(--background-modifier-border);
-  background: var(--background-primary);
+  background: var(--modal-background);
 }
 
 .easy-sync-detail-actions button {

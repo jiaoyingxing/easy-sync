@@ -67,6 +67,7 @@ import {
   type SyncRunOptions,
   type ReviewedContentEqualityProof,
 } from "./sync/sync-executor";
+import { SyncPathSettingsUpdateError } from "./sync/sync-path-settings-error";
 import type {
   EmptyFolderResolutionSnapshotV1,
   FolderLocationResolutionChoiceV1,
@@ -99,6 +100,7 @@ import {
   RIBBON_STATUS_ICONS,
   resolveRibbonStatus,
   resolveRibbonStatusLabel,
+  type RibbonOwnStatus,
   type RibbonStatus,
 } from "./ui/ribbon-status";
 import { ConfirmModal, SyncPlanAlertModal } from "./ui/confirm-modal";
@@ -524,20 +526,16 @@ type ResetMutationRecoveryDisposition =
  * Semantic groups the single status bar item exposes via `.is-*` classes
  * (is-loggedOut / is-attention / is-syncing / is-ready / is-offline), mirroring
  * the sidebar status line class scheme (sync-view.ts). A subset of RibbonStatus:
- * the status bar never enters the transient "success" state (常驻位不闪烁), and
- * "cancelling" collapses into the syncing presentation.
+ * the status bar never enters the transient "success" state (常驻位不闪烁).
+ * "cancelling" has its own group here since 2026-09-29: the three carriers are
+ * gated to agree on the same token (tests/status-bar.test.ts), and collapsing
+ * it into "syncing" made the bar keep spinning through the drain window while
+ * the sidebar and ribbon had already switched to the cancelling form.
  */
 type StatusBarStatusGroup = Extract<
   RibbonStatus,
-  "loggedOut" | "attention" | "syncing" | "ready" | "offline"
+  "loggedOut" | "attention" | "syncing" | "cancelling" | "ready" | "offline"
 >;
-
-export class SyncPathSettingsUpdateError extends Error {
-  constructor(readonly code: "busy" | "recovery") {
-    super(code);
-    this.name = "SyncPathSettingsUpdateError";
-  }
-}
 
 interface MutationRecoveryRunContext {
   priorTotal: number;
@@ -599,6 +597,48 @@ const DEFERRED_SETTINGS_MUTATION_RECHECK_MS = 1_000;
 export type DeferredSettingsMutationHandle = Promise<void> & {
   cancel: () => boolean;
   isQueued: () => boolean;
+};
+
+type DiagnosticReportRenderContext = {
+  lines: string[];
+  reportI18n: I18n;
+  fmt: (ts: number) => string;
+  fmtShort: (ts: number) => string;
+  formatActionLabel: (type?: SyncActionType) => string;
+  now: Date;
+  auth: AuthModule["authState"] | undefined;
+  reportState: EasySyncPlugin["state"];
+  resetFacts: DiagnosticResetFacts | null;
+  platformLabel: string;
+  automaticActivity: string;
+  buildFingerprint: string;
+  communityPluginInventory: CommunityPluginInventoryItem[];
+  communityPluginSummary: Awaited<ReturnType<typeof summarizeCommunityPluginSync>>;
+  mutationRecoveryDisplay: ReturnType<EasySyncPlugin["getMutationRecoveryDisplayState"]>;
+  mutationRecoveryScheduler: MutationRecoveryScheduler["snapshot"];
+  storageLayoutVersion: ReturnType<typeof getEasySyncPaths>["storageLayoutVersion"];
+  v2RemoteScopeRecovery:
+    | NonNullable<EasySyncPlugin["state"]>["activeV2RemoteScopeRecovery"]
+    | undefined;
+  v2StateLoadBlock:
+    | NonNullable<EasySyncPlugin["state"]>["v2StateLoadRecoveryBlock"]
+    | undefined;
+  v2StorageAuthority: NonNullable<EasySyncPlugin["state"]>["activeV2StorageAuthorityEvidence"];
+  accountFingerprint: Awaited<ReturnType<typeof fingerprintOpaqueValue>>;
+  driveFingerprint: Awaited<ReturnType<typeof fingerprintOpaqueValue>>;
+  vaultFingerprint: Awaited<ReturnType<typeof fingerprintOpaqueValue>>;
+  filesRootFingerprint: Awaited<ReturnType<typeof fingerprintOpaqueValue>>;
+  v2DatabaseFingerprint: Awaited<ReturnType<typeof fingerprintOpaqueValue>>;
+};
+
+/** Values declared inside a report section and consumed by a later section. */
+type DiagnosticReportProvidedValues = {
+  diagAll: Awaited<ReturnType<DiagnosticLogger["snapshot"]>>;
+  remoteScopeRecoverySummary:
+    | StateManager["syncHistory"][number]["remoteScopeRecovery"]
+    | NonNullable<EasySyncPlugin["progressStore"]>["state"]["recoveryVerification"];
+  history: StateManager["syncHistory"];
+  formatSize: (bytes?: number) => string;
 };
 
 export default class EasySyncPlugin extends Plugin {
@@ -1354,19 +1394,37 @@ export default class EasySyncPlugin extends Plugin {
 
   // ---- Public API for UI callbacks ----
 
-  get syncView(): EasySyncSyncView | null {
+  /**
+   * The EasySync leaf every plugin-driven refresh targets. A second EasySync
+   * leaf can exist (the user splits the view, or a dev opens it directly):
+   * picking "the first one" blindly let a hidden, never-opened duplicate
+   * swallow every render while the visible panel froze at the moment the
+   * duplicate appeared (2026-09-29 实测). Prefer a leaf the host actually
+   * shows; fall back to the first when none is shown.
+   *
+   * 当前适用上限：多个面板同时可见时只驱动其中一个（先发现即用），其余面板
+   * 停在上一次渲染。重开触发＝真机反馈「拆分出第二个 EasySync 面板后其中一侧
+   * 不再更新」，届时改为对全部叶渲染。
+   */
+  private primarySyncViewLeaf(): WorkspaceLeaf | null {
     const leaves = this.app.workspace.getLeavesOfType(SYNC_VIEW_TYPE);
     if (leaves.length === 0) return null;
-    const view = leaves[0].view as unknown as Partial<EasySyncSyncView>;
+    return leaves.find((leaf) => leaf.view.containerEl?.isShown()) ?? leaves[0];
+  }
+
+  get syncView(): EasySyncSyncView | null {
+    const leaf = this.primarySyncViewLeaf();
+    if (!leaf) return null;
+    const view = leaf.view as unknown as Partial<EasySyncSyncView>;
     // Hot reload can leave an old ItemView instance without the new prototype.
     return typeof view.render === "function" ? view as EasySyncSyncView : null;
   }
 
   /** Open the sync detail view in the left sidebar */
   async activateSyncView(): Promise<void> {
-    const existing = this.app.workspace.getLeavesOfType(SYNC_VIEW_TYPE);
-    if (existing.length > 0) {
-      await this.app.workspace.revealLeaf(existing[0]);
+    const existing = this.primarySyncViewLeaf();
+    if (existing) {
+      await this.app.workspace.revealLeaf(existing);
       this.refreshSyncNoticeVisibility();
       return;
     }
@@ -1745,7 +1803,6 @@ export default class EasySyncPlugin extends Plugin {
     return new ConfirmModal(
       this.app,
       t("settings.reset.forceTitle"),
-      null,
       t("settings.reset.forceConfirm"),
       t("confirm.cancel"),
       t,
@@ -2900,7 +2957,6 @@ export default class EasySyncPlugin extends Plugin {
     return new ConfirmModal(
       this.app,
       t("syncPlan.migrationConfirmTitle"),
-      null,
       t("syncPlan.migrationConfirm"),
       t("confirm.cancel"),
       t,
@@ -2915,7 +2971,6 @@ export default class EasySyncPlugin extends Plugin {
     return new ConfirmModal(
       this.app,
       t("syncPlan.remoteScopeRecreateConfirmTitle"),
-      null,
       t("syncPlan.remoteScopeRecreateConfirm"),
       t("confirm.cancel"),
       t,
@@ -4505,86 +4560,14 @@ export default class EasySyncPlugin extends Plugin {
       return { state: "busy" };
     }
     if (this.acquireOpLock("mutation-recovery")) return { state: "busy" };
-    let settled = false;
-    let continueAfterIsolatedRecovery = false;
+    const recoveryContinuation = {
+      settled: false,
+      continueAfterIsolatedRecovery: false,
+    };
     try {
-      await this.ensureStateLoaded();
-      if (
-        !this.state?.isV2StateActive
-        || this.state.mutationLedger.length === 0
-      ) return { state: "inactive" };
-      if (this.state.planReviewActive) return { state: "inactive" };
-      if (
-        this.state.hasMutationLedgerCorruption
-        || this.state.hasMutationRecoveryQuarantineCorruption
-      ) {
-        await this.pauseForMutationRecoveryBlock("evidence-corrupt");
-        return { state: "blocked" };
-      }
-      if (this.state.hasV2StateLoadRecoveryBlock) {
-        if (this.v2StateReloadInFlight || this.v2StateReloadRetryTimer) {
-          return { state: "inactive" };
-        }
-        await this.attemptV2StateReloadSelfHeal();
-        if (this.state.hasV2StateLoadRecoveryBlock) {
-          await this.pauseForMutationRecoveryBlock("state-unavailable");
-          return { state: "blocked" };
-        }
-        // Block cleared by the reload; fall through to the ordinary flow.
-      }
-      if (this.state.hasV2RemoteScopeRecovery) {
-        await this.pauseForMutationRecoveryBlock("scope-changed");
-        return { state: "blocked" };
-      }
-      if (!await this.checkAccountBinding({
-        suppressNotice: true,
-        allowInitialBind: false,
-      })) {
-        await this.pauseForMutationRecoveryBlock("account-changed");
-        return { state: "blocked" };
-      }
-
-      this.diag.log("execute", "scheduled mutation recovery observation started", {
-        remaining: this.state.mutationLedger.length,
-        mutations: 0,
+      return await this.runScheduledMutationRecoveryObservation({
+        continuation: recoveryContinuation,
       });
-      const result = await this.dispatchSyncRun({
-        mode: "auto",
-        options: { recoveryOnly: true },
-        logLabel: "scheduled mutation recovery result",
-      });
-      const recovery = result?.mutationRecovery;
-      if (!recovery) {
-        if (this.state.mutationLedger.length > 0) {
-          await this.pauseForMutationRecoveryBlock("state-unavailable");
-        }
-        return { state: "blocked" };
-      }
-      if (recovery.state === "network-unavailable") {
-        return {
-          state: "retry",
-          retryAfterSeconds: recovery.retryAfterSeconds,
-        };
-      }
-      if (recovery.state === "blocked" && recovery.isolated === true) {
-        continueAfterIsolatedRecovery = true;
-        return { state: "inactive" };
-      }
-      if (recovery.state === "blocked") return { state: "blocked" };
-      settled = recovery.remaining === 0;
-      if (!settled) {
-        await this.pauseForMutationRecoveryBlock("state-unavailable");
-        return { state: "blocked" };
-      }
-      if (this.autoSyncPaused) {
-        // B4: a scheduled observation that settles a paused no-exit block
-        // ends the pause the same way an isolated recovery does — the
-        // finally below then continues through a fresh canonical round.
-        this.autoSyncPaused = false;
-        await this.saveSyncSettings();
-        this.startAutoSync();
-      }
-      return { state: "settled" };
     } catch (error) {
       this.diag.warn(
         "execute",
@@ -4601,13 +4584,13 @@ export default class EasySyncPlugin extends Plugin {
     } finally {
       this.releaseOpLock();
       if (
-        (settled || continueAfterIsolatedRecovery)
+        (recoveryContinuation.settled || recoveryContinuation.continueAfterIsolatedRecovery)
         && this.isAutoSyncMasterEnabled()
         && !this.autoSyncPaused
       ) {
         this.diag.log(
           "execute",
-          settled
+          recoveryContinuation.settled
             ? "mutation recovery settled; continuing through a new canonical V2 round"
             : "isolated mutation recovery retained; continuing unrelated canonical work",
           { mutations: 0 },
@@ -4615,6 +4598,89 @@ export default class EasySyncPlugin extends Plugin {
         void this.runAutomaticSync("recovery-continuation");
       }
     }
+  }
+
+  private async runScheduledMutationRecoveryObservation(args: {
+    continuation: { settled: boolean; continueAfterIsolatedRecovery: boolean };
+  }): Promise<MutationRecoveryAttemptOutcome> {
+    const { continuation } = args;
+    await this.ensureStateLoaded();
+    if (
+      !this.state?.isV2StateActive
+      || this.state.mutationLedger.length === 0
+    ) return { state: "inactive" };
+    if (this.state.planReviewActive) return { state: "inactive" };
+    if (
+      this.state.hasMutationLedgerCorruption
+      || this.state.hasMutationRecoveryQuarantineCorruption
+    ) {
+      await this.pauseForMutationRecoveryBlock("evidence-corrupt");
+      return { state: "blocked" };
+    }
+    if (this.state.hasV2StateLoadRecoveryBlock) {
+      if (this.v2StateReloadInFlight || this.v2StateReloadRetryTimer) {
+        return { state: "inactive" };
+      }
+      await this.attemptV2StateReloadSelfHeal();
+      if (this.state.hasV2StateLoadRecoveryBlock) {
+        await this.pauseForMutationRecoveryBlock("state-unavailable");
+        return { state: "blocked" };
+      }
+      // Block cleared by the reload; fall through to the ordinary flow.
+    }
+    if (this.state.hasV2RemoteScopeRecovery) {
+      await this.pauseForMutationRecoveryBlock("scope-changed");
+      return { state: "blocked" };
+    }
+    if (!await this.checkAccountBinding({
+      suppressNotice: true,
+      allowInitialBind: false,
+    })) {
+      await this.pauseForMutationRecoveryBlock("account-changed");
+      return { state: "blocked" };
+    }
+
+    this.diag.log("execute", "scheduled mutation recovery observation started", {
+      remaining: this.state.mutationLedger.length,
+      mutations: 0,
+    });
+    const result = await this.dispatchSyncRun({
+      mode: "auto",
+      options: { recoveryOnly: true },
+      logLabel: "scheduled mutation recovery result",
+    });
+    const recovery = result?.mutationRecovery;
+    if (!recovery) {
+      if (this.state.mutationLedger.length > 0) {
+        await this.pauseForMutationRecoveryBlock("state-unavailable");
+      }
+      return { state: "blocked" };
+    }
+    if (recovery.state === "network-unavailable") {
+      return {
+        state: "retry",
+        retryAfterSeconds: recovery.retryAfterSeconds,
+      };
+    }
+    if (recovery.state === "blocked" && recovery.isolated === true) {
+      continuation.continueAfterIsolatedRecovery = true;
+      return { state: "inactive" };
+    }
+    if (recovery.state === "blocked") return { state: "blocked" };
+    continuation.settled = recovery.remaining === 0;
+    if (!continuation.settled) {
+      await this.pauseForMutationRecoveryBlock("state-unavailable");
+      return { state: "blocked" };
+    }
+    if (this.autoSyncPaused) {
+      // B4: a scheduled observation that settles a paused no-exit block
+      // ends the pause the same way an isolated recovery does — the
+      // finally below then continues through a fresh canonical round.
+      this.autoSyncPaused = false;
+      await this.saveSyncSettings();
+      this.startAutoSync();
+    }
+    return { state: "settled" };
   }
 
   private async handleMutationRecoveryBudgetExhausted(): Promise<void> {
@@ -6409,100 +6475,13 @@ export default class EasySyncPlugin extends Plugin {
       }
     };
     try {
-      const migrationHold = this.state.activeV2MigrationHold;
-      if (migrationHold) {
-        const migrationAuthorization = this.state.planReviewAuthorization;
-        if (!migrationAuthorization) {
-          throw new Error(
-            "Cannot change sync paths without a valid migration review",
-          );
-        }
-        assertOperationCurrent();
-        const retired = await this.state.clearPlanReview(
-          migrationAuthorization,
-        );
-        assertOperationCurrent();
-        if (!retired || this.state.activeV2MigrationHold) {
-          throw new Error(
-            "Cannot change sync paths while the migration review remains active",
-          );
-        }
-      }
-      const previousSettingsFingerprint =
-        syncPathSettingsFingerprint(previous);
-      const targetSettingsFingerprint =
-        syncPathSettingsFingerprint(candidate);
-      const requiresCompleteRemoteIdentitySnapshot =
-        syncPathSettingsExpandFileScope(previous, candidate);
-      const { configDir } = getEasySyncPaths(
-        this.app.vault,
-        this.manifest.id,
-      );
-      const previousFolderScope = createFolderSyncScopeSnapshotV1(
-        this.buildSyncPathScanConfig(previous),
-        configDir,
-        this.manifest.id,
-      );
-      const targetFolderScope = createFolderSyncScopeSnapshotV1(
-        this.buildSyncPathScanConfig(candidate),
-        configDir,
-        this.manifest.id,
-      );
-      const v2RemoteFolderPaths =
-        this.state.isV2StateActive
-        && this.state.hasCompleteRemoteFolderIndex
-          ? this.state.remoteFolders.map((folder) => folder.path)
-          : [];
-      const previousIncludedFolderPaths = new Set(
-        v2RemoteFolderPaths.filter(
-          (path) => this.scanner!.shouldSyncFolderPath(path),
-        ),
-      );
-      assertOperationCurrent();
-      this.publishSyncPathSettings(candidate);
-      const expandedFolderPaths = v2RemoteFolderPaths.filter(
-        (path) =>
-          !previousIncludedFolderPaths.has(path)
-          && this.scanner!.shouldSyncFolderPath(path),
-      );
-      const includedFolderPaths = v2RemoteFolderPaths.filter(
-        (path) => this.scanner!.shouldSyncFolderPath(path),
-      );
-      const filesPolicy =
-        this.getEffectiveCommunityPluginSyncPolicy(candidate).files;
-      assertOperationCurrent();
-      await this.state.commitSyncPathSettingsChange(
-        (path) => this.scanner!.shouldSyncPath(path),
-        (data) => {
-          assertOperationCurrent();
-          this.writeSyncPathSettingsData(data, candidate);
-        },
-        filesPolicy.mode === "all"
-          ? undefined
-          : filesPolicy.mode === "selected"
-            ? filesPolicy.pluginIds.filter(
-                (pluginId) => isPluginSelected(filesPolicy, pluginId),
-              )
-            : [],
-        {
-          previousSettingsFingerprint,
-          targetSettingsFingerprint,
-          expandedFolderPaths,
-          includedFolderPaths,
-          folderScopeTransition: {
-            previous: previousFolderScope,
-            target: targetFolderScope,
-          },
-          requiresCompleteRemoteIdentitySnapshot,
-          retireLocalFolderMoveHintRemoteIds:
-            options.retireLocalFolderMoveHintRemoteIds,
-        },
-      );
-      assertOperationCurrent();
-      this.advanceCommunityPluginInventoryRevision();
-      this.updateStatusBar();
-      this.syncView?.render();
-      this.settingsTab?.refreshSyncState();
+      await this.runSyncPathSettingsCandidateCommit({
+        previous,
+        candidate,
+        state: this.state,
+        assertOperationCurrent,
+        options,
+      });
     } catch (error) {
       if (
         options.operationEpoch === undefined
@@ -6512,6 +6491,112 @@ export default class EasySyncPlugin extends Plugin {
       }
       throw error;
     }
+  }
+
+  private async runSyncPathSettingsCandidateCommit(args: {
+    previous: Readonly<SyncPathSettings>;
+    candidate: Readonly<SyncPathSettings>;
+    state: StateManager;
+    assertOperationCurrent: () => void;
+    options: Readonly<{
+      retireLocalFolderMoveHintRemoteIds?: readonly string[];
+    }>;
+  }): Promise<void> {
+    const { previous, candidate, state, assertOperationCurrent, options } = args;
+    const migrationHold = state.activeV2MigrationHold;
+    if (migrationHold) {
+      const migrationAuthorization = state.planReviewAuthorization;
+      if (!migrationAuthorization) {
+        throw new Error(
+          "Cannot change sync paths without a valid migration review",
+        );
+      }
+      assertOperationCurrent();
+      const retired = await state.clearPlanReview(
+        migrationAuthorization,
+      );
+      assertOperationCurrent();
+      if (!retired || state.activeV2MigrationHold) {
+        throw new Error(
+          "Cannot change sync paths while the migration review remains active",
+        );
+      }
+    }
+    const previousSettingsFingerprint =
+      syncPathSettingsFingerprint(previous);
+    const targetSettingsFingerprint =
+      syncPathSettingsFingerprint(candidate);
+    const requiresCompleteRemoteIdentitySnapshot =
+      syncPathSettingsExpandFileScope(previous, candidate);
+    const { configDir } = getEasySyncPaths(
+      this.app.vault,
+      this.manifest.id,
+    );
+    const previousFolderScope = createFolderSyncScopeSnapshotV1(
+      this.buildSyncPathScanConfig(previous),
+      configDir,
+      this.manifest.id,
+    );
+    const targetFolderScope = createFolderSyncScopeSnapshotV1(
+      this.buildSyncPathScanConfig(candidate),
+      configDir,
+      this.manifest.id,
+    );
+    const v2RemoteFolderPaths =
+      state.isV2StateActive
+      && state.hasCompleteRemoteFolderIndex
+        ? state.remoteFolders.map((folder) => folder.path)
+        : [];
+    const previousIncludedFolderPaths = new Set(
+      v2RemoteFolderPaths.filter(
+        (path) => this.scanner!.shouldSyncFolderPath(path),
+      ),
+    );
+    assertOperationCurrent();
+    this.publishSyncPathSettings(candidate);
+    const expandedFolderPaths = v2RemoteFolderPaths.filter(
+      (path) =>
+        !previousIncludedFolderPaths.has(path)
+        && this.scanner!.shouldSyncFolderPath(path),
+    );
+    const includedFolderPaths = v2RemoteFolderPaths.filter(
+      (path) => this.scanner!.shouldSyncFolderPath(path),
+    );
+    const filesPolicy =
+      this.getEffectiveCommunityPluginSyncPolicy(candidate).files;
+    assertOperationCurrent();
+    await state.commitSyncPathSettingsChange(
+      (path) => this.scanner!.shouldSyncPath(path),
+      (data) => {
+        assertOperationCurrent();
+        this.writeSyncPathSettingsData(data, candidate);
+      },
+      filesPolicy.mode === "all"
+        ? undefined
+        : filesPolicy.mode === "selected"
+          ? filesPolicy.pluginIds.filter(
+              (pluginId) => isPluginSelected(filesPolicy, pluginId),
+            )
+          : [],
+      {
+        previousSettingsFingerprint,
+        targetSettingsFingerprint,
+        expandedFolderPaths,
+        includedFolderPaths,
+        folderScopeTransition: {
+          previous: previousFolderScope,
+          target: targetFolderScope,
+        },
+        requiresCompleteRemoteIdentitySnapshot,
+        retireLocalFolderMoveHintRemoteIds:
+          options.retireLocalFolderMoveHintRemoteIds,
+      },
+    );
+    assertOperationCurrent();
+    this.advanceCommunityPluginInventoryRevision();
+    this.updateStatusBar();
+    this.syncView?.render();
+    this.settingsTab?.refreshSyncState();
   }
 
   async updateExcludedFolders(excludedFolders: readonly string[]): Promise<void> {
@@ -7426,110 +7511,11 @@ export default class EasySyncPlugin extends Plugin {
       throw new SyncPathSettingsUpdateError("busy");
     }
     try {
-      if (
-        options.expectedParticipation
-        && JSON.stringify(state.getCommunityPluginParticipation())
-          !== JSON.stringify(options.expectedParticipation)
-      ) {
-        throw new SyncPathSettingsUpdateError("busy");
-      }
-      const previousParticipation = state.getCommunityPluginParticipation();
-      if (!previousParticipation) {
-        throw new Error("Community-plugin participation commit disappeared");
-      }
-      let targetParticipation = previousParticipation;
-      for (const command of commands) {
-        targetParticipation = reduceDeviceCommunityPluginParticipation(
-          targetParticipation,
-          command,
-          this.manifest.id,
-        );
-      }
-      const isPluginExcludedByTarget = (pluginId: string): boolean =>
-        !targetParticipation.scopeEnabled
-        || !isDeviceCommunityPluginEnabled(
-          targetParticipation,
-          pluginId,
-        );
-      const recoveryScopeExitRecords = (state.mutationLedger?.length ?? 0) > 0
-        && options.allowPluginCodeRecoveryScopeExit === true
-        && this.syncExecutor
-          ? this.syncExecutor
-              .inspectSelectedPluginCodeUploadRecoveriesForScopeExit(
-                isPluginExcludedByTarget,
-              )
-          : (state.mutationLedger?.length ?? 0) === 0 ? [] : null;
-      if (!recoveryScopeExitRecords) {
-        throw new SyncPathSettingsUpdateError("recovery");
-      }
-      if (recoveryScopeExitRecords.length > 0) {
-        await state.updateCommunityPluginParticipationBatch(commands);
-        const committed = state.getCommunityPluginParticipation();
-        if (
-          !committed
-          || JSON.stringify(committed) !== JSON.stringify(targetParticipation)
-        ) {
-          throw new Error("Community-plugin scope exit commit disappeared");
-        }
-        this.applyCommunityPluginParticipationProjection(committed);
-        if (!await this.resumeExcludedCommunityPluginCodeRecoveryScopeExit(
-          committed,
-        )) {
-          throw new SyncPathSettingsUpdateError("recovery");
-        }
-        await this.retireExcludedCommunityPluginPendingState(committed, true);
-        this.advanceCommunityPluginInventoryRevision();
-        this.updateStatusBar();
-        this.syncView?.render();
-        this.settingsTab?.refreshSyncState();
-        return;
-      }
-      const previousSyncPathSettings =
-        options.commitSyncPathSettingsTransition
-          ? this.captureSyncPathSettings()
-          : null;
-      let candidateSyncPathSettings: SyncPathSettings | null = null;
-      if (previousSyncPathSettings) {
-        this.applyCommunityPluginParticipationProjection(targetParticipation);
-        candidateSyncPathSettings = this.captureSyncPathSettings();
-        this.applyCommunityPluginParticipationProjection(previousParticipation);
-      }
-      const requiresSyncPathSettingsCommit = Boolean(
-        previousSyncPathSettings
-        && candidateSyncPathSettings
-        && syncPathSettingsFingerprint(previousSyncPathSettings)
-          !== syncPathSettingsFingerprint(candidateSyncPathSettings),
-      );
-      const participationStateChanged =
-        JSON.stringify(previousParticipation)
-          !== JSON.stringify(targetParticipation);
-      if (
-        requiresSyncPathSettingsCommit
-        && previousSyncPathSettings
-        && candidateSyncPathSettings
-      ) {
-        await this.commitSyncPathSettingsCandidate(
-          previousSyncPathSettings,
-          candidateSyncPathSettings,
-        );
-      } else {
-        await this.retireExcludedCommunityPluginPendingState(
-          targetParticipation,
-          participationStateChanged,
-        );
-      }
-      await state.updateCommunityPluginParticipationBatch(commands);
-      const committed = state.getCommunityPluginParticipation();
-      if (!committed) {
-        throw new Error("Community-plugin participation commit disappeared");
-      }
-      this.applyCommunityPluginParticipationProjection(committed);
-      if (!requiresSyncPathSettingsCommit) {
-        this.advanceCommunityPluginInventoryRevision();
-        this.updateStatusBar();
-        this.syncView?.render();
-        this.settingsTab?.refreshSyncState();
-      }
+      await this.runCommunityPluginParticipationCommit({
+        commands,
+        state,
+        options,
+      });
     } catch (error) {
       const durableParticipation =
         state.getCommunityPluginParticipation();
@@ -7545,6 +7531,122 @@ export default class EasySyncPlugin extends Plugin {
       throw error;
     } finally {
       if (ownsLock) this.releaseOpLock();
+    }
+  }
+
+  private async runCommunityPluginParticipationCommit(args: {
+    commands: readonly Readonly<DeviceCommunityPluginParticipationCommand>[];
+    state: StateManager;
+    options: Readonly<{
+      expectedParticipation?: Readonly<DeviceCommunityPluginParticipationV1>;
+      commitSyncPathSettingsTransition?: boolean;
+      allowPluginCodeRecoveryScopeExit?: boolean;
+    }>;
+  }): Promise<void> {
+    const { commands, state, options } = args;
+    if (
+      options.expectedParticipation
+      && JSON.stringify(state.getCommunityPluginParticipation())
+        !== JSON.stringify(options.expectedParticipation)
+    ) {
+      throw new SyncPathSettingsUpdateError("busy");
+    }
+    const previousParticipation = state.getCommunityPluginParticipation();
+    if (!previousParticipation) {
+      throw new Error("Community-plugin participation commit disappeared");
+    }
+    let targetParticipation = previousParticipation;
+    for (const command of commands) {
+      targetParticipation = reduceDeviceCommunityPluginParticipation(
+        targetParticipation,
+        command,
+        this.manifest.id,
+      );
+    }
+    const isPluginExcludedByTarget = (pluginId: string): boolean =>
+      !targetParticipation.scopeEnabled
+      || !isDeviceCommunityPluginEnabled(
+        targetParticipation,
+        pluginId,
+      );
+    const recoveryScopeExitRecords = (state.mutationLedger?.length ?? 0) > 0
+      && options.allowPluginCodeRecoveryScopeExit === true
+      && this.syncExecutor
+        ? this.syncExecutor
+            .inspectSelectedPluginCodeUploadRecoveriesForScopeExit(
+              isPluginExcludedByTarget,
+            )
+        : (state.mutationLedger?.length ?? 0) === 0 ? [] : null;
+    if (!recoveryScopeExitRecords) {
+      throw new SyncPathSettingsUpdateError("recovery");
+    }
+    if (recoveryScopeExitRecords.length > 0) {
+      await state.updateCommunityPluginParticipationBatch(commands);
+      const committed = state.getCommunityPluginParticipation();
+      if (
+        !committed
+        || JSON.stringify(committed) !== JSON.stringify(targetParticipation)
+      ) {
+        throw new Error("Community-plugin scope exit commit disappeared");
+      }
+      this.applyCommunityPluginParticipationProjection(committed);
+      if (!await this.resumeExcludedCommunityPluginCodeRecoveryScopeExit(
+        committed,
+      )) {
+        throw new SyncPathSettingsUpdateError("recovery");
+      }
+      await this.retireExcludedCommunityPluginPendingState(committed, true);
+      this.advanceCommunityPluginInventoryRevision();
+      this.updateStatusBar();
+      this.syncView?.render();
+      this.settingsTab?.refreshSyncState();
+      return;
+    }
+    const previousSyncPathSettings =
+      options.commitSyncPathSettingsTransition
+        ? this.captureSyncPathSettings()
+        : null;
+    let candidateSyncPathSettings: SyncPathSettings | null = null;
+    if (previousSyncPathSettings) {
+      this.applyCommunityPluginParticipationProjection(targetParticipation);
+      candidateSyncPathSettings = this.captureSyncPathSettings();
+      this.applyCommunityPluginParticipationProjection(previousParticipation);
+    }
+    const requiresSyncPathSettingsCommit = Boolean(
+      previousSyncPathSettings
+      && candidateSyncPathSettings
+      && syncPathSettingsFingerprint(previousSyncPathSettings)
+        !== syncPathSettingsFingerprint(candidateSyncPathSettings),
+    );
+    const participationStateChanged =
+      JSON.stringify(previousParticipation)
+        !== JSON.stringify(targetParticipation);
+    if (
+      requiresSyncPathSettingsCommit
+      && previousSyncPathSettings
+      && candidateSyncPathSettings
+    ) {
+      await this.commitSyncPathSettingsCandidate(
+        previousSyncPathSettings,
+        candidateSyncPathSettings,
+      );
+    } else {
+      await this.retireExcludedCommunityPluginPendingState(
+        targetParticipation,
+        participationStateChanged,
+      );
+    }
+    await state.updateCommunityPluginParticipationBatch(commands);
+    const committed = state.getCommunityPluginParticipation();
+    if (!committed) {
+      throw new Error("Community-plugin participation commit disappeared");
+    }
+    this.applyCommunityPluginParticipationProjection(committed);
+    if (!requiresSyncPathSettingsCommit) {
+      this.advanceCommunityPluginInventoryRevision();
+      this.updateStatusBar();
+      this.syncView?.render();
+      this.settingsTab?.refreshSyncState();
     }
   }
 
@@ -7708,69 +7810,12 @@ export default class EasySyncPlugin extends Plugin {
     this.remoteCommunityPluginCatalogRefreshPromise = (async () => {
       const previous = this.getCurrentRemoteCommunityPluginCatalog();
       try {
-        const delta = await onedrive.getDeltaByFolderId(scope.filesRootId);
-        if (!sameSyncScope(state.remoteScope, scope)) {
-          throw new Error("Remote plugin catalog scope changed during refresh");
-        }
-        const catalog = await buildRemoteCommunityPluginCatalog({
+        return await this.runDeltaFreshRemoteCommunityPluginCatalogRefresh({
+          state,
+          onedrive,
           scope,
-          configDir: getConfigDir(this.app.vault),
-          items: delta.value,
-          manifestObservations:
-            state.getCommunityPluginManifestObservations(),
-          observedAt: Date.now(),
           previous,
-          ownPluginId: this.manifest.id,
         });
-        await state.setRemoteCommunityPluginCatalog(catalog);
-        try {
-          // Display-facts light reads (G6-1): once per unobserved remote-only
-          // bundle, read the manifest body so the inventory can show the real
-          // name and isDesktopOnly flag instead of falling back to the id.
-          // Failure is silent — the refresh result and the trusted catalog
-          // must never be affected by a presentation-evidence miss.
-          await ensureCommunityPluginDisplayFacts({
-            scope,
-            configDir: getConfigDir(this.app.vault),
-            catalog,
-            previousCatalog: previous,
-            storedObservations:
-              state.getCommunityPluginManifestObservations(),
-            fetchManifestText: async (_pluginId, member) => {
-              const content = await onedrive.downloadFile(
-                this.app.vault.getName(),
-                member.path,
-                undefined,
-                member.remoteId,
-                member.size,
-              );
-              return new TextDecoder("utf-8", { fatal: true }).decode(content);
-            },
-            persist: async (observations) => {
-              await state.setCommunityPluginManifestObservations(
-                observations,
-              );
-            },
-            now: Date.now(),
-          });
-        } catch (error) {
-          this.diag?.warn(
-            "state",
-            "community plugin display facts were not ensured; names may fall back to plugin ids",
-            error instanceof Error ? error.message : String(error),
-          );
-        }
-        this.communityPluginCatalogRefreshConsecutiveFailures = 0;
-        this.communityPluginCatalogLastRefreshFailureAt = 0;
-        // Fresh enumeration: every complete entry is current server truth,
-        // so all of them count as reappearance evidence for the sweep.
-        this.sweepCommunityPluginCloudCleanupMarkers(
-          catalog.entries
-            .filter((entry) => entry.bundleState === "complete")
-            .map((entry) => entry.pluginId),
-        );
-        this.advanceCommunityPluginInventoryRevision();
-        return catalog;
       } catch (error) {
         const now = Date.now();
         if (
@@ -7811,6 +7856,83 @@ export default class EasySyncPlugin extends Plugin {
     return this.remoteCommunityPluginCatalogRefreshPromise;
   }
 
+  private async runDeltaFreshRemoteCommunityPluginCatalogRefresh(args: {
+    state: StateManager;
+    onedrive: OneDriveClient;
+    scope: NonNullable<StateManager["remoteScope"]>;
+    previous: RemoteCommunityPluginCatalogV1 | null;
+  }): Promise<RemoteCommunityPluginCatalogV1> {
+    const {
+      state,
+      onedrive,
+      scope,
+      previous,
+    } = args;
+    const delta = await onedrive.getDeltaByFolderId(scope.filesRootId);
+    if (!sameSyncScope(state.remoteScope, scope)) {
+      throw new Error("Remote plugin catalog scope changed during refresh");
+    }
+    const catalog = await buildRemoteCommunityPluginCatalog({
+      scope,
+      configDir: getConfigDir(this.app.vault),
+      items: delta.value,
+      manifestObservations:
+        state.getCommunityPluginManifestObservations(),
+      observedAt: Date.now(),
+      previous,
+      ownPluginId: this.manifest.id,
+    });
+    await state.setRemoteCommunityPluginCatalog(catalog);
+    try {
+      // Display-facts light reads (G6-1): once per unobserved remote-only
+      // bundle, read the manifest body so the inventory can show the real
+      // name and isDesktopOnly flag instead of falling back to the id.
+      // Failure is silent — the refresh result and the trusted catalog
+      // must never be affected by a presentation-evidence miss.
+      await ensureCommunityPluginDisplayFacts({
+        scope,
+        configDir: getConfigDir(this.app.vault),
+        catalog,
+        previousCatalog: previous,
+        storedObservations:
+          state.getCommunityPluginManifestObservations(),
+        fetchManifestText: async (_pluginId, member) => {
+          const content = await onedrive.downloadFile(
+            this.app.vault.getName(),
+            member.path,
+            undefined,
+            member.remoteId,
+            member.size,
+          );
+          return new TextDecoder("utf-8", { fatal: true }).decode(content);
+        },
+        persist: async (observations) => {
+          await state.setCommunityPluginManifestObservations(
+            observations,
+          );
+        },
+        now: Date.now(),
+      });
+    } catch (error) {
+      this.diag?.warn(
+        "state",
+        "community plugin display facts were not ensured; names may fall back to plugin ids",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    this.communityPluginCatalogRefreshConsecutiveFailures = 0;
+    this.communityPluginCatalogLastRefreshFailureAt = 0;
+    // Fresh enumeration: every complete entry is current server truth,
+    // so all of them count as reappearance evidence for the sweep.
+    this.sweepCommunityPluginCloudCleanupMarkers(
+      catalog.entries
+        .filter((entry) => entry.bundleState === "complete")
+        .map((entry) => entry.pluginId),
+    );
+    this.advanceCommunityPluginInventoryRevision();
+    return catalog;
+  }
+
   private getCurrentRemoteCommunityPluginCatalog():
     RemoteCommunityPluginCatalogV1 | null {
     const state = this.state;
@@ -7847,153 +7969,191 @@ export default class EasySyncPlugin extends Plugin {
     }
     const previous = this.getCurrentRemoteCommunityPluginCatalog();
     try {
-      const next = await buildRemoteCommunityPluginCatalogFromIndex({
+      await this.runRoundCommunityPluginCatalogRefresh({
+        state,
+        onedrive,
         scope,
-        configDir: getConfigDir(this.app.vault),
-        index: committedIndex,
-        manifestObservations: state.getCommunityPluginManifestObservations(),
-        observedAt: Date.now(),
+        committedIndex,
         previous,
-        ownPluginId: this.manifest.id,
       });
-      // The committed index only covers anchored folders (joined plugins).
-      // Never overwrite the delta-fresh catalog with that narrower view:
-      // keep the superset so unanchored cloud bundles stay visible and rows
-      // do not flicker away between manager refreshes.
-      const catalog = await mergeRemoteCommunityPluginCatalogKeepingSuperset(
-        previous,
-        next,
-      );
-      await state.setRemoteCommunityPluginCatalog(catalog);
-      try {
-        await ensureCommunityPluginDisplayFacts({
-          scope,
-          configDir: getConfigDir(this.app.vault),
-          catalog,
-          previousCatalog: previous,
-          storedObservations:
-            state.getCommunityPluginManifestObservations(),
-          fetchManifestText: async (_pluginId, member) => {
-            const content = await onedrive.downloadFile(
-              this.app.vault.getName(),
-              member.path,
-              undefined,
-              member.remoteId,
-              member.size,
-            );
-            return new TextDecoder("utf-8", { fatal: true }).decode(content);
-          },
-          persist: async (observations) => {
-            await state.setCommunityPluginManifestObservations(observations);
-          },
-          now: Date.now(),
-        });
-      } catch (error) {
-        this.diag?.warn(
-          "state",
-          "round-end community plugin display facts were not ensured; names may fall back to plugin ids",
-          error instanceof Error ? error.message : String(error),
-        );
-      }
-      this.communityPluginCatalogRefreshConsecutiveFailures = 0;
-      this.communityPluginCatalogLastRefreshFailureAt = 0;
-      // Sweep against the freshly built index evidence only, and only when
-      // that evidence postdates the cleanup: the committed index learns
-      // about this device's own cloud deletion one delta later, and a
-      // pre-cleanup bundle still listed there is NOT a reappearance
-      // (2026-09-15: sweeping the merged catalog dropped markers on stale
-      // "complete" bundles; 2026-09-16: the index evidence itself needs the
-      // freshness rule — no reflow while the deletion decision is syncing).
-      // Resurrection for unanchored bundles stays on the manager-open
-      // delta-fresh refresh above.
-      this.sweepCommunityPluginCloudCleanupMarkers(
-        planCommunityPluginCloudCleanupIndexReappearanceV1({
-          entries: next.entries,
-          markers: this.readCommunityPluginCloudCleanupMarkers(),
-        }),
-      );
-      // Sidebar adoption memory (slice 2): reconcile this device's pending
-      // new-plugin rows with the round's fresh facts. Ignored plugins stay
-      // suppressed; rows whose plugin joined, vanished, or turned partial
-      // disappear without tombstones. Failures degrade silently — the next
-      // settled round reconciles again.
-      try {
-        const participation = this.communityPluginParticipation;
-        if (
-          participation
-          && typeof state.getCommunityPluginAdoptionMemory === "function"
-          && typeof state.updateCommunityPluginAdoptionMemory === "function"
-        ) {
-          const memoryStore = state.getCommunityPluginAdoptionMemory();
-          const manifestObservations =
-            state.getCommunityPluginManifestObservations();
-          const platformFacts = await resolveCommunityPluginPlatformFacts(
-            scope,
-            catalog,
-            manifestObservations,
-            this.manifest.id,
-          );
-          this.communityPluginAdoptionPlatformFacts = platformFacts;
-          // The adoption row promises "not yet downloaded on this device":
-          // a complete local bundle (installed, sync toggle off) fails that
-          // premise and rejoins via the manager toggle instead. Facts
-          // unavailable -> keep the pre-gate phase-only behavior.
-          let localBundleFacts:
-            | ReadonlyMap<string, CommunityPluginLocalBundleFact>
-            | undefined;
-          try {
-            localBundleFacts = await this
-              .observeCommunityPluginLocalBundleFacts(
-                catalog.entries
-                  .filter((entry) => entry.bundleState === "complete")
-                  .map((entry) => entry.pluginId),
-              );
-          } catch (error) {
-            this.diag?.warn(
-              "state",
-              "round-end community plugin local bundle facts were not observed; adoption rows keep phase-only gating",
-              error instanceof Error ? error.message : String(error),
-            );
-          }
-          const candidates = await deriveCommunityPluginAdoptionCandidates({
-            scope,
-            catalog,
-            participation,
-            memory: memoryStore,
-            manifestObservations,
-            platformFacts,
-            localBundleFacts,
-            cleanupMarkerPluginIds:
-              this.readCommunityPluginCloudCleanupMarkers().map((marker) =>
-                marker.pluginId
-              ),
-            isMobile: Platform.isMobile,
-            ownPluginId: this.manifest.id,
-          });
-          const next = reduceCommunityPluginAdoptionMemory(
-            memoryStore,
-            { type: "reconcile-pending", pluginIds: candidates },
-            this.manifest.id,
-          );
-          if (JSON.stringify(next) !== JSON.stringify(memoryStore)) {
-            await state.updateCommunityPluginAdoptionMemory(next);
-            this.updateStatusBar();
-            this.syncView?.render();
-          }
-        }
-      } catch (error) {
-        this.diag?.warn(
-          "state",
-          "round-end community plugin adoption reconcile failed — pending rows stay unchanged",
-          error instanceof Error ? error.message : String(error),
-        );
-      }
     } catch (error) {
       this.diag?.warn(
         "state",
         "round-end community plugin catalog update failed — keeping the last trusted catalog",
         error instanceof Error ? error.message : String(error),
       );
+    }
+  }
+
+  private async runRoundCommunityPluginCatalogRefresh(args: {
+    state: StateManager;
+    onedrive: OneDriveClient;
+    scope: NonNullable<StateManager["remoteScope"]>;
+    committedIndex: NonNullable<
+      ReturnType<StateManager["getCommittedRemoteIndex"]>
+    >;
+    previous: RemoteCommunityPluginCatalogV1 | null;
+  }): Promise<void> {
+    const {
+      state,
+      onedrive,
+      scope,
+      committedIndex,
+      previous,
+    } = args;
+    const next = await buildRemoteCommunityPluginCatalogFromIndex({
+      scope,
+      configDir: getConfigDir(this.app.vault),
+      index: committedIndex,
+      manifestObservations: state.getCommunityPluginManifestObservations(),
+      observedAt: Date.now(),
+      previous,
+      ownPluginId: this.manifest.id,
+    });
+    // The committed index only covers anchored folders (joined plugins).
+    // Never overwrite the delta-fresh catalog with that narrower view:
+    // keep the superset so unanchored cloud bundles stay visible and rows
+    // do not flicker away between manager refreshes.
+    const catalog = await mergeRemoteCommunityPluginCatalogKeepingSuperset(
+      previous,
+      next,
+    );
+    await state.setRemoteCommunityPluginCatalog(catalog);
+    try {
+      await ensureCommunityPluginDisplayFacts({
+        scope,
+        configDir: getConfigDir(this.app.vault),
+        catalog,
+        previousCatalog: previous,
+        storedObservations:
+          state.getCommunityPluginManifestObservations(),
+        fetchManifestText: async (_pluginId, member) => {
+          const content = await onedrive.downloadFile(
+            this.app.vault.getName(),
+            member.path,
+            undefined,
+            member.remoteId,
+            member.size,
+          );
+          return new TextDecoder("utf-8", { fatal: true }).decode(content);
+        },
+        persist: async (observations) => {
+          await state.setCommunityPluginManifestObservations(observations);
+        },
+        now: Date.now(),
+      });
+    } catch (error) {
+      this.diag?.warn(
+        "state",
+        "round-end community plugin display facts were not ensured; names may fall back to plugin ids",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    this.communityPluginCatalogRefreshConsecutiveFailures = 0;
+    this.communityPluginCatalogLastRefreshFailureAt = 0;
+    // Sweep against the freshly built index evidence only, and only when
+    // that evidence postdates the cleanup: the committed index learns
+    // about this device's own cloud deletion one delta later, and a
+    // pre-cleanup bundle still listed there is NOT a reappearance
+    // (2026-09-15: sweeping the merged catalog dropped markers on stale
+    // "complete" bundles; 2026-09-16: the index evidence itself needs the
+    // freshness rule — no reflow while the deletion decision is syncing).
+    // Resurrection for unanchored bundles stays on the manager-open
+    // delta-fresh refresh above.
+    this.sweepCommunityPluginCloudCleanupMarkers(
+      planCommunityPluginCloudCleanupIndexReappearanceV1({
+        entries: next.entries,
+        markers: this.readCommunityPluginCloudCleanupMarkers(),
+      }),
+    );
+    // Sidebar adoption memory (slice 2): reconcile this device's pending
+    // new-plugin rows with the round's fresh facts. Ignored plugins stay
+    // suppressed; rows whose plugin joined, vanished, or turned partial
+    // disappear without tombstones. Failures degrade silently — the next
+    // settled round reconciles again.
+    try {
+      await this.runRoundCommunityPluginAdoptionReconcile({
+        state,
+        scope,
+        catalog,
+      });
+    } catch (error) {
+      this.diag?.warn(
+        "state",
+        "round-end community plugin adoption reconcile failed — pending rows stay unchanged",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  private async runRoundCommunityPluginAdoptionReconcile(args: {
+    state: StateManager;
+    scope: NonNullable<StateManager["remoteScope"]>;
+    catalog: RemoteCommunityPluginCatalogV1;
+  }): Promise<void> {
+    const { state, scope, catalog } = args;
+    const participation = this.communityPluginParticipation;
+    if (
+      participation
+      && typeof state.getCommunityPluginAdoptionMemory === "function"
+      && typeof state.updateCommunityPluginAdoptionMemory === "function"
+    ) {
+      const memoryStore = state.getCommunityPluginAdoptionMemory();
+      const manifestObservations =
+        state.getCommunityPluginManifestObservations();
+      const platformFacts = await resolveCommunityPluginPlatformFacts(
+        scope,
+        catalog,
+        manifestObservations,
+        this.manifest.id,
+      );
+      this.communityPluginAdoptionPlatformFacts = platformFacts;
+      // The adoption row promises "not yet downloaded on this device":
+      // a complete local bundle (installed, sync toggle off) fails that
+      // premise and rejoins via the manager toggle instead. Facts
+      // unavailable -> keep the pre-gate phase-only behavior.
+      let localBundleFacts:
+        | ReadonlyMap<string, CommunityPluginLocalBundleFact>
+        | undefined;
+      try {
+        localBundleFacts = await this
+          .observeCommunityPluginLocalBundleFacts(
+            catalog.entries
+              .filter((entry) => entry.bundleState === "complete")
+              .map((entry) => entry.pluginId),
+          );
+      } catch (error) {
+        this.diag?.warn(
+          "state",
+          "round-end community plugin local bundle facts were not observed; adoption rows keep phase-only gating",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+      const candidates = await deriveCommunityPluginAdoptionCandidates({
+        scope,
+        catalog,
+        participation,
+        memory: memoryStore,
+        manifestObservations,
+        platformFacts,
+        localBundleFacts,
+        cleanupMarkerPluginIds:
+          this.readCommunityPluginCloudCleanupMarkers().map((marker) =>
+            marker.pluginId
+          ),
+        isMobile: Platform.isMobile,
+        ownPluginId: this.manifest.id,
+      });
+      const next = reduceCommunityPluginAdoptionMemory(
+        memoryStore,
+        { type: "reconcile-pending", pluginIds: candidates },
+        this.manifest.id,
+      );
+      if (JSON.stringify(next) !== JSON.stringify(memoryStore)) {
+        await state.updateCommunityPluginAdoptionMemory(next);
+        this.updateStatusBar();
+        this.syncView?.render();
+      }
     }
   }
 
@@ -8223,6 +8383,77 @@ export default class EasySyncPlugin extends Plugin {
         ? `其他操作占用中（${reportI18n.t(this.opHolderNameKey(this.opLock))}）`
         : "空闲";
 
+    const renderCtx: DiagnosticReportRenderContext = {
+      lines,
+      reportI18n,
+      fmt,
+      fmtShort,
+      formatActionLabel,
+      now,
+      auth,
+      reportState,
+      resetFacts,
+      platformLabel,
+      automaticActivity,
+      buildFingerprint,
+      communityPluginInventory,
+      communityPluginSummary,
+      mutationRecoveryDisplay,
+      mutationRecoveryScheduler,
+      storageLayoutVersion,
+      v2RemoteScopeRecovery,
+      v2StateLoadBlock,
+      v2StorageAuthority,
+      accountFingerprint,
+      driveFingerprint,
+      vaultFingerprint,
+      filesRootFingerprint,
+      v2DatabaseFingerprint,
+    };
+
+    const headerValues = await this.renderDiagnosticHeaderSection(renderCtx);
+    const historyValues = this.renderDiagnosticSyncHistorySection(renderCtx);
+    this.renderDiagnosticFailedFileDetailsSection(renderCtx, historyValues);
+    this.renderDiagnosticConnectionSpeedSection(renderCtx, historyValues);
+    await this.renderDiagnosticPendingIssuesSection(renderCtx, historyValues);
+    await this.renderDiagnosticAnomaliesSection(renderCtx, headerValues);
+
+    await this.app.vault.adapter.write(fileName, lines.join("\n"));
+    this.noticeCenter.show({
+      key: "diagnostic-report-created",
+      message: this.i18n.t("notice.diagnosticReportGenerated", { fileName }),
+      priority: NOTICE_PRIORITY.action,
+    });
+    return fileName;
+  }
+
+  /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
+  private async renderDiagnosticHeaderSection(ctx: DiagnosticReportRenderContext): Promise<Pick<DiagnosticReportProvidedValues, "diagAll" | "remoteScopeRecoverySummary">> {
+    const {
+      accountFingerprint,
+      auth,
+      automaticActivity,
+      buildFingerprint,
+      communityPluginInventory,
+      communityPluginSummary,
+      driveFingerprint,
+      filesRootFingerprint,
+      fmt,
+      fmtShort,
+      lines,
+      mutationRecoveryDisplay,
+      now,
+      platformLabel,
+      reportI18n,
+      reportState,
+      resetFacts,
+      storageLayoutVersion,
+      v2DatabaseFingerprint,
+      v2RemoteScopeRecovery,
+      v2StateLoadBlock,
+      v2StorageAuthority,
+      vaultFingerprint,
+    } = ctx;
     // ── Header ──
     lines.push("# EasySync 诊断报告");
     lines.push("");
@@ -8431,6 +8662,16 @@ export default class EasySyncPlugin extends Plugin {
     }
     lines.push("");
 
+    return { diagAll, remoteScopeRecoverySummary };
+  }
+
+  /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
+  private renderDiagnosticSyncHistorySection(ctx: DiagnosticReportRenderContext): Pick<DiagnosticReportProvidedValues, "history" | "formatSize"> {
+    const {
+      fmt,
+      lines,
+      reportI18n,
+    } = ctx;
     // ── Sync History ──
     const history = this.state?.syncHistory ?? [];
     lines.push("## 近期同步记录");
@@ -8470,6 +8711,20 @@ export default class EasySyncPlugin extends Plugin {
       return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
     };
 
+    return { history, formatSize };
+  }
+
+  /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
+  private renderDiagnosticFailedFileDetailsSection(ctx: DiagnosticReportRenderContext, prior: Pick<DiagnosticReportProvidedValues, "formatSize" | "history">): void {
+    const {
+      fmtShort,
+      formatActionLabel,
+      lines,
+    } = ctx;
+    const {
+      formatSize,
+      history,
+    } = prior;
     // ── Failed file details from sync history ──
     const failedFiles = history
       .filter((h) => h.status === "partial" || h.status === "failed")
@@ -8487,6 +8742,17 @@ export default class EasySyncPlugin extends Plugin {
       lines.push("");
     }
 
+  }
+
+  /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
+  private renderDiagnosticConnectionSpeedSection(ctx: DiagnosticReportRenderContext, prior: Pick<DiagnosticReportProvidedValues, "history">): void {
+    const {
+      fmt,
+      lines,
+    } = ctx;
+    const {
+      history,
+    } = prior;
     // ── Passive connection-speed readings from recent runs ──
     // Derived from bytes real transfers already moved; no probe requests.
     const rateEntries = history.filter((h) => h.transferRates).slice(0, 10);
@@ -8515,6 +8781,20 @@ export default class EasySyncPlugin extends Plugin {
       lines.push("");
     }
 
+  }
+
+  /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
+  private async renderDiagnosticPendingIssuesSection(ctx: DiagnosticReportRenderContext, prior: Pick<DiagnosticReportProvidedValues, "formatSize">): Promise<void> {
+    const {
+      fmt,
+      fmtShort,
+      formatActionLabel,
+      lines,
+      reportState,
+    } = ctx;
+    const {
+      formatSize,
+    } = prior;
     // ── Pending Issues ──
     const issues = this.state?.pendingIssues ?? [];
     const conflicts = this.state?.pendingConflicts ?? [];
@@ -8584,6 +8864,25 @@ export default class EasySyncPlugin extends Plugin {
     }
     lines.push("");
 
+  }
+
+  /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
+  private async renderDiagnosticAnomaliesSection(ctx: DiagnosticReportRenderContext, prior: Pick<DiagnosticReportProvidedValues, "diagAll" | "remoteScopeRecoverySummary">): Promise<void> {
+    const {
+      fmt,
+      fmtShort,
+      lines,
+      mutationRecoveryDisplay,
+      mutationRecoveryScheduler,
+      reportState,
+      resetFacts,
+      v2RemoteScopeRecovery,
+      v2StateLoadBlock,
+    } = ctx;
+    const {
+      diagAll,
+      remoteScopeRecoverySummary,
+    } = prior;
     // ── Recent Diagnostic Anomalies (from disk logs) ──
     const latestAutomaticHandlingSummary = findLatestAutomaticHandlingSummary(diagAll);
     const currentRecoverySummary = {
@@ -8781,15 +9080,8 @@ export default class EasySyncPlugin extends Plugin {
       }
       lines.push("");
     }
-
-    await this.app.vault.adapter.write(fileName, lines.join("\n"));
-    this.noticeCenter.show({
-      key: "diagnostic-report-created",
-      message: this.i18n.t("notice.diagnosticReportGenerated", { fileName }),
-      priority: NOTICE_PRIORITY.action,
-    });
-    return fileName;
   }
+
 
   /** Apply max file size setting to the scanner. Public so settings-tab can call it. */
   applyMaxFileSize(): void {
@@ -8919,6 +9211,22 @@ export default class EasySyncPlugin extends Plugin {
       return;
     }
 
+    // Cancelling is its own wide-status presentation and both other carriers
+    // switch to it the moment the request lands (`resolveRibbonStatus` ranks
+    // cancelling ahead of syncing). Keeping the bar on the rotating "syncing…"
+    // form through the drain window made it the only carrier still claiming
+    // work is moving (2026-09-29 三载体一致性门实测；is-cancelling 着色规则自
+    // 2026-08-26 起就是备位，本轮启用，文案复用侧栏现役短句).
+    if (this.progressStore.state.cancelRequested) {
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.cancelling,
+        "cancelling",
+        t("syncView.cancelling"),
+      );
+      return;
+    }
+
     if (isRunning) {
       this.renderStatusBarItem(
         this.statusBarEl,
@@ -8986,6 +9294,23 @@ export default class EasySyncPlugin extends Plugin {
       return;
     }
 
+    // The wide status has four attention members (plan review, pending items,
+    // a blocking recovery and an active automatic pause); the bar must cover
+    // each one it can render specifically or it silently falls through to the
+    // green ready claim below. Pending items are counted here with the
+    // sidebar's own phrase, so the two carriers read the same fact the same
+    // way — the bar itself stays a reminder, not a second information surface.
+    const issues = this.state?.pendingIssues?.length ?? 0;
+    if (issues > 0) {
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.attention,
+        "attention",
+        t("syncView.issues.title", { count: issues }),
+      );
+      return;
+    }
+
     const recovery = this.getMutationRecoveryDisplayState();
     if (recovery?.kind === "waiting-network") {
       this.renderStatusBarItem(
@@ -9043,6 +9368,23 @@ export default class EasySyncPlugin extends Plugin {
       }
       return;
     }
+    // The wide status reads an active automatic pause as "attention" (ribbon
+    // and sidebar both use `autoSyncPaused`). While it is set every automatic
+    // entry stays silent and only a user-initiated round resumes it, so the bar
+    // is the one signal left and must not claim the vault is healthy
+    // (2026-09-29: cancelled round → orange sidebar, green bar). Recovery and
+    // retry-pending keep their more specific forms above; the sentence is the
+    // settings page's own wording for this flag, so no new copy is introduced.
+    if (this.autoSyncPaused) {
+      this.renderStatusBarItem(
+        this.statusBarEl,
+        RIBBON_STATUS_ICONS.attention,
+        "attention",
+        t("settings.autoSync.desc.paused"),
+      );
+      return;
+    }
+
     if (lastSync) {
       this.renderStatusBarItem(
         this.statusBarEl,
@@ -9090,7 +9432,7 @@ export default class EasySyncPlugin extends Plugin {
     this.ribbonEl.dataset.easySyncStatus = status;
   }
 
-  private getRibbonStatus(): RibbonStatus {
+  private getRibbonStatus(): RibbonOwnStatus {
     const fullSyncRunning = this.syncExecutor?.isRunning ?? false;
     const sideActionRunning = this.syncExecutor?.hasSideActionsInFlight ?? false;
     return resolveRibbonStatus({

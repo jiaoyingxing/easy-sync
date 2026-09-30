@@ -433,7 +433,7 @@ describe("sync view status copy and scrolling layout", () => {
     expect(zh.t("syncPlan.restoringDetails")).toBe("正在恢复计划明细");
     expect(zh.t("syncPlan.restoreDetails")).toBe("恢复计划明细");
     expect(zh.t("syncPlan.remoteScopeRecreateSummary"))
-      .toBe("原云端同步目录无法继续使用，需要重新创建后核对内容。");
+      .toBe("原云端同步目录无法继续使用。确认后重新创建目录并核对内容。");
     expect(en.t("syncPlan.remoteScopeRecreateSummary"))
       .toContain("previous remote sync folder");
     expect(zh.t("result.remoteReadUnavailable"))
@@ -505,12 +505,23 @@ describe("sync view status copy and scrolling layout", () => {
 
     expect([
       zh.t("syncView.emptyFolder.deleteUnavailableDescription"),
-      zh.t("syncView.emptyFolder.deleteConfirmWarning"),
+      zh.t("syncView.emptyFolder.deleteDescription"),
     ].join("\n")).not.toMatch(/版本凭据|身份和版本/);
     expect([
       en.t("syncView.emptyFolder.deleteUnavailableDescription"),
-      en.t("syncView.emptyFolder.deleteConfirmWarning"),
+      en.t("syncView.emptyFolder.deleteDescription"),
     ].join("\n")).not.toMatch(/folder version|identity and version/i);
+    // The delete option is the single destructive confirmation (2026-09-29 拍板)：
+    // the consequence sentence that used to live in the second gate must stay
+    // visible on the option itself.
+    expect(zh.t("syncView.emptyFolder.deleteDescription"))
+      .toContain("影响其他设备看到的云端内容");
+    expect(zh.t("syncView.emptyFolder.deleteDescription"))
+      .toContain("仍为空且没有变化");
+    expect(en.t("syncView.emptyFolder.deleteDescription"))
+      .toContain("other devices");
+    expect(en.t("syncView.emptyFolder.deleteDescription"))
+      .toContain("still empty and unchanged");
     expect(modalSource).toContain(
       '.setName(this.t("syncView.emptyFolder.restoreTitle"))',
     );
@@ -565,6 +576,23 @@ describe("sync view status copy and scrolling layout", () => {
       en.t("syncView.folderLocation.title"),
       en.t("syncView.folderLocation.description", { path: "Original" }),
     ].join("\n")).not.toMatch(/锚点|身份|eTag|anchor|identity/i);
+  });
+
+  it("keeps empty-folder and subtree deletion at a single confirmation gate", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const start = source.indexOf("  private async openEmptyFolderResolution(");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = source.indexOf("\n  private ", start + 1);
+    const method = source.slice(start, end < 0 ? undefined : end);
+    // 2026-09-29 拍板：第一层弹框的红键即最终授权，不再叠第二道 ConfirmModal；
+    // 删前核对与版本门由执行链独立承担（评审后远端变化即不删、零 mutation）。
+    expect(method).not.toContain("ConfirmModal");
+    expect(method).toContain(
+      "this.plugin.deleteReviewedEmptyRemoteFolder(snapshot)",
+    );
+    expect(method).toContain(
+      "this.plugin.deleteReviewedFolderSubtree(subtree)",
+    );
   });
 
   it("explains same-content copies through the existing cloud-location decision", () => {
@@ -2335,25 +2363,38 @@ describe("buildSyncViewContentKey", () => {
     expect(source).not.toContain("translateY(${windowState.offset}px)");
   });
 
-  it("renders the confirm boundary note only for ordinary plans with decision rows", () => {
+  it("renders the summary slot as flow lines plus a timing-matched decision note", () => {
     const source = readFileSync("src/ui/sync-view.ts", "utf8");
     const sectionStart = source.indexOf("private renderPlanReviewSection");
     const sectionEnd = source.indexOf("private renderPlanGroups", sectionStart);
     const section = source.slice(sectionStart, sectionEnd);
 
-    // Dedicated review kinds keep their own single sentence; the boundary note
-    // only reaches ordinary plans through the trailing else-if branch, keyed
-    // on the plan's own decision rows (2026-09-17 DECISIONS).
+    // Activation reviews render a flow line (with the deferred decision note
+    // appended only when decision rows exist); the inline-decision boundary
+    // note only reaches ordinary plans through the trailing else-if branch
+    // (2026-09-29 DECISIONS, amending the 2026-09-17 single-sentence rule).
+    // The decision note lives inside the renderSummaryLine helper, which sits
+    // above the branch chain — so it must appear before every branch, while
+    // the ordinary boundary branch stays last.
+    const decisionNoteIndex = section.indexOf(
+      '"syncPlan.activationDecisionSummary"',
+    );
     const migrationIndex = section.indexOf('"syncPlan.migrationSummary"');
     const joinIndex = section.indexOf('"syncPlan.cloudJoinSummary"');
+    const firstSyncIndex = section.indexOf('"syncPlan.firstSyncSummary"');
     const recreateIndex = section.indexOf(
       '"syncPlan.remoteScopeRecreateSummary"',
     );
     const boundaryIndex = section.indexOf('"syncPlan.confirmBoundarySummary"');
-    expect(migrationIndex).toBeGreaterThan(-1);
-    expect(joinIndex).toBeGreaterThan(-1);
-    expect(recreateIndex).toBeGreaterThan(-1);
+    expect(decisionNoteIndex).toBeGreaterThan(-1);
+    expect(migrationIndex).toBeGreaterThan(decisionNoteIndex);
+    expect(joinIndex).toBeGreaterThan(migrationIndex);
+    expect(firstSyncIndex).toBeGreaterThan(joinIndex);
+    expect(recreateIndex).toBeGreaterThan(firstSyncIndex);
     expect(boundaryIndex).toBeGreaterThan(recreateIndex);
+    // The deferred note must flow through the same slot, not a second block.
+    expect(section).toContain("renderSummaryLine");
+    expect(section).toContain("hasDecisionRows");
     expect(section).toContain("SyncActionType.Conflict");
     expect(section).toContain("SyncActionType.ConfirmLocalDelete");
   });
@@ -2829,7 +2870,7 @@ describe("resolveSyncViewBodyMode", () => {
 });
 
 describe("remote scope recovery failure presentation", () => {
-  it("moves the failure path and next step into persistent body content", () => {
+  it("keeps the failure path in persistent body content", () => {
     const i18n = new I18n("zh-cn");
 
     expect(resolveRemoteScopeRecoveryFailurePresentation({
@@ -2846,8 +2887,19 @@ describe("remote scope recovery failure presentation", () => {
       title: "云端核验",
       summary: "云端文件核验未完成，本轮同步已停止。",
       path: "Resources/long/path/file.md",
-      nextStep: "请重新同步。已安全记录的核验进度会继续保留。",
     });
+  });
+
+  it("carries no per-section next-step line (retry lives in the top primary action)", () => {
+    const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
+    const start = viewSource.indexOf(
+      "  private renderRemoteScopeRecoveryFailure(",
+    );
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = viewSource.indexOf("\n  private ", start + 1);
+    const method = viewSource.slice(start, end < 0 ? undefined : end);
+    expect(method).not.toContain("next-step");
+    expect(method).not.toContain("nextStep");
   });
 });
 

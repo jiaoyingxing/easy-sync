@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import EasySyncPlugin, { SyncPathSettingsUpdateError } from "../src/main";
+import EasySyncPlugin from "../src/main";
+import { SyncPathSettingsUpdateError } from "../src/sync/sync-path-settings-error";
 import { sha256Hex } from "../src/crypto";
 import {
   StateManager,

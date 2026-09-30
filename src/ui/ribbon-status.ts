@@ -15,6 +15,15 @@ export type RibbonStatus =
   | "success"
   | "ready";
 
+/**
+ * The statuses the ribbon itself can take. "offline" is deliberately absent:
+ * the offline presentation belongs to the desktop status bar and the sidebar
+ * status line (2026-08-29 拍板), which each pass their own label key. Keeping
+ * it out of this type means the ribbon label lookup can never ask for the
+ * `ribbon.offline` key, which is not part of the locale files.
+ */
+export type RibbonOwnStatus = Exclude<RibbonStatus, "offline">;
+
 export interface RibbonStatusInput {
   loggedIn: boolean;
   cancelling: boolean;
@@ -33,7 +42,7 @@ export const RIBBON_STATUS_ICONS: Record<RibbonStatus, string> = {
   ready: "cloud",
 };
 
-export function resolveRibbonStatus(input: RibbonStatusInput): RibbonStatus {
+export function resolveRibbonStatus(input: RibbonStatusInput): RibbonOwnStatus {
   if (!input.loggedIn) return "loggedOut";
   if (input.cancelling) return "cancelling";
   if (input.syncing) return "syncing";
@@ -43,7 +52,7 @@ export function resolveRibbonStatus(input: RibbonStatusInput): RibbonStatus {
 }
 
 export function resolveRibbonStatusLabel(
-  status: RibbonStatus,
+  status: RibbonOwnStatus,
   progress: Readonly<SyncProgressState>,
   t: SyncStatusTranslator,
 ): string {

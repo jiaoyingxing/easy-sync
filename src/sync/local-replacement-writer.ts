@@ -1,6 +1,8 @@
 import { Platform, TFile, type DataAdapter } from "obsidian";
 import { toStrictUtf8Bytes } from "./ancestor-store-v2";
 
+export const EASY_SYNC_RECOVERY_SUFFIX = ".easy-sync-recovery";
+
 /**
  * In-place replacement of an existing local file through the host's own write
  * surface.

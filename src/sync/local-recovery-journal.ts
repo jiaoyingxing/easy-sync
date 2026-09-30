@@ -1,3 +1,4 @@
+import { EASY_SYNC_RECOVERY_SUFFIX } from "./local-replacement-writer";
 import type { DataAdapter } from "obsidian";
 import { sha256Hex } from "../crypto";
 import type { LocalFileEntry } from "./types";
@@ -212,7 +213,7 @@ export class LocalRecoveryJournal {
     if (await this.hasPendingRecovery()) {
       return { removed: 0, retained: copies.length, removedPaths: [] };
     }
-    const suffix = ".easy-sync-recovery";
+    const suffix = EASY_SYNC_RECOVERY_SUFFIX;
     let removed = 0;
     let retained = 0;
     const removedPaths: string[] = [];

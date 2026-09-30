@@ -61,14 +61,6 @@ export class SyncPlanAlertModal extends EasySyncModal {
 import { type App } from "obsidian";
 import { EasySyncModal } from "./easy-sync-modal";
 
-export interface ConfirmModalPlan {
-  uploads: number;
-  downloads: number;
-  deletes: number;
-  conflicts: number;
-  skipped: number;
-}
-
 export type I18nFn = (key: string, params?: Record<string, string | number>) => string;
 
 export class ConfirmModal extends EasySyncModal {
@@ -77,7 +69,6 @@ export class ConfirmModal extends EasySyncModal {
   constructor(
     app: App,
     private title: string,
-    private plan: ConfirmModalPlan | null,
     private confirmLabel: string,
     private cancelLabel: string,
     private t: I18nFn,
@@ -119,30 +110,6 @@ export class ConfirmModal extends EasySyncModal {
       });
     }
 
-    // Counts table
-    if (this.plan) {
-      const rows: [string, number][] = [
-        [this.t("syncView.fileStatus.upload"), this.plan.uploads],
-        [this.t("syncView.fileStatus.download"), this.plan.downloads],
-        [this.t("syncView.fileStatus.delete"), this.plan.deletes],
-        [this.t("syncView.fileStatus.conflict"), this.plan.conflicts],
-        [this.t("syncView.fileStatus.skip"), this.plan.skipped],
-      ];
-      const visibleRows = rows.filter(([, count]) => count > 0);
-      if (visibleRows.length > 0) {
-        const table = contentEl.createEl("table");
-        for (const [label, count] of visibleRows) {
-          const tr = table.createEl("tr");
-          tr.createEl("td", { text: label });
-          tr.createEl("td", { text: String(count) });
-        }
-      }
-      if (this.plan.deletes > 0) {
-        contentEl.createDiv().setText(
-          this.t("confirm.deleteWarning", { count: this.plan.deletes }),
-        );
-      }
-    }
     if (this.options?.warning) {
       contentEl.createDiv().setText(this.options.warning);
     }

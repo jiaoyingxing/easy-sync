@@ -648,74 +648,20 @@ function migrateBaseAnchor(
   }
 
   if (allowChangedAnchors) {
-    const interruptedDownloadRemoteId =
-      findExactInterruptedDownloadRemoteId({
-        base,
-        scope,
-        ledger: v1MutationLedger,
-        pathById,
-        itemsById,
-      });
-    if (interruptedDownloadRemoteId) {
-      return makeAnchor(
-        interruptedDownloadRemoteId,
-        base.path,
-        base.hash,
-        base.size,
-        base.eTag,
-        now,
-        "migrated",
-        itemsById[interruptedDownloadRemoteId]?.kind === "file"
-          ? itemsById[interruptedDownloadRemoteId].cTag
-          : undefined,
-      );
-    }
-    const pendingConflictRemoteId =
-      findExactPendingConflictRemoteId({
-        base,
-        scope,
-        pendingConflicts: v1PendingConflicts,
-        vaultName: v1VaultName,
-        v1RemoteEntries,
-        pathById,
-        itemsById,
-      });
-    if (pendingConflictRemoteId) {
-      return makeAnchor(
-        pendingConflictRemoteId,
-        base.path,
-        base.hash,
-        base.size,
-        base.eTag,
-        now,
-        "migrated",
-        itemsById[pendingConflictRemoteId]?.kind === "file"
-          ? itemsById[pendingConflictRemoteId].cTag
-          : undefined,
-      );
-    }
-    const historicalRelocation = findExactHistoricalRelocation({
+    const changedBaseAnchor = migrateChangedBaseAnchor({
       base,
       localEntries,
-      v1RemoteEntries,
-      v1BasePaths,
       pathById,
       itemsById,
+      v1RemoteEntries,
+      scope,
+      v1MutationLedger,
+      v1PendingConflicts,
+      v1VaultName,
+      v1BasePaths,
+      now,
     });
-    if (historicalRelocation) {
-      return makeAnchor(
-        historicalRelocation.driveId,
-        historicalRelocation.path,
-        base.hash,
-        base.size,
-        base.eTag,
-        now,
-        "migrated",
-        itemsById[historicalRelocation.driveId]?.kind === "file"
-          ? itemsById[historicalRelocation.driveId].cTag
-          : undefined,
-      );
-    }
+    if (changedBaseAnchor.terminated) return changedBaseAnchor.terminated;
   }
 
   const remoteAtPath = Object.values(itemsById).find((node) =>
@@ -758,6 +704,119 @@ function migrateBaseAnchor(
     "migrated",
     remoteCandidates[0].cTag,
   );
+}
+
+/**
+ * Changed-common-ancestor phase of migrateBaseAnchor: probe the interrupted
+ * download ledger, the pending conflicts, and the historical relocations for
+ * an exact V1 remote identity, and report the anchor as the host's
+ * termination value. A null termination means no exact evidence exists, so
+ * the host continues with its live-observation phases. Every container is
+ * passed by reference and is only read here.
+ */
+function migrateChangedBaseAnchor(args: {
+  base: BaseFileEntry;
+  localEntries: LocalFileEntry[];
+  pathById: Map<string, string>;
+  itemsById: SyncStateEnvelopeV2["remoteIndex"]["itemsById"];
+  v1RemoteEntries: RemoteFileEntry[];
+  scope: SyncScope;
+  v1MutationLedger: readonly MutationLedgerEntryV1[];
+  v1PendingConflicts: readonly SyncPlanItem[];
+  v1VaultName: string | undefined;
+  v1BasePaths: ReadonlySet<string>;
+  now: number;
+}):
+  | { terminated: SyncAnchorV2 }
+  | { terminated: null } {
+  const {
+    base,
+    localEntries,
+    pathById,
+    itemsById,
+    v1RemoteEntries,
+    scope,
+    v1MutationLedger,
+    v1PendingConflicts,
+    v1VaultName,
+    v1BasePaths,
+    now,
+  } = args;
+  const interruptedDownloadRemoteId =
+    findExactInterruptedDownloadRemoteId({
+      base,
+      scope,
+      ledger: v1MutationLedger,
+      pathById,
+      itemsById,
+    });
+  if (interruptedDownloadRemoteId) {
+    return {
+      terminated: makeAnchor(
+        interruptedDownloadRemoteId,
+        base.path,
+        base.hash,
+        base.size,
+        base.eTag,
+        now,
+        "migrated",
+        itemsById[interruptedDownloadRemoteId]?.kind === "file"
+          ? itemsById[interruptedDownloadRemoteId].cTag
+          : undefined,
+      ),
+    };
+  }
+  const pendingConflictRemoteId =
+    findExactPendingConflictRemoteId({
+      base,
+      scope,
+      pendingConflicts: v1PendingConflicts,
+      vaultName: v1VaultName,
+      v1RemoteEntries,
+      pathById,
+      itemsById,
+    });
+  if (pendingConflictRemoteId) {
+    return {
+      terminated: makeAnchor(
+        pendingConflictRemoteId,
+        base.path,
+        base.hash,
+        base.size,
+        base.eTag,
+        now,
+        "migrated",
+        itemsById[pendingConflictRemoteId]?.kind === "file"
+          ? itemsById[pendingConflictRemoteId].cTag
+          : undefined,
+      ),
+    };
+  }
+  const historicalRelocation = findExactHistoricalRelocation({
+    base,
+    localEntries,
+    v1RemoteEntries,
+    v1BasePaths,
+    pathById,
+    itemsById,
+  });
+  if (historicalRelocation) {
+    return {
+      terminated: makeAnchor(
+        historicalRelocation.driveId,
+        historicalRelocation.path,
+        base.hash,
+        base.size,
+        base.eTag,
+        now,
+        "migrated",
+        itemsById[historicalRelocation.driveId]?.kind === "file"
+          ? itemsById[historicalRelocation.driveId].cTag
+          : undefined,
+      ),
+    };
+  }
+  return { terminated: null };
 }
 
 function findExactInterruptedDownloadRemoteId(input: {

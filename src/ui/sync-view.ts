@@ -199,13 +199,12 @@ export function resolveSyncViewPrimaryAction(input: {
 export function resolveRemoteScopeRecoveryFailurePresentation(
   state: Pick<RemoteScopeRecoveryVerificationProgress, "failureStage" | "firstFailurePath">,
   t: (key: keyof LocaleStrings) => string,
-): { title: string; summary: string; path: string | null; nextStep: string } | null {
+): { title: string; summary: string; path: string | null } | null {
   if (!state.failureStage) return null;
   return {
     title: t("syncView.progress.remoteScopeRecoveryFailureTitle"),
     summary: t("syncView.progress.remoteScopeRecoveryFailureSummary"),
     path: state.firstFailurePath ?? null,
-    nextStep: t("syncView.progress.remoteScopeRecoveryFailureNextStep"),
   };
 }
 
@@ -1319,6 +1318,143 @@ export class EasySyncSyncView extends ItemView {
     });
   }
 
+  /**
+   * Rebuild the view content from scratch for the current body mode.
+   *
+   * Contract: `container` is the live content element (`this.contentEl`)
+   * threaded by reference, never cloned; every other field is a read-only
+   * input sampled by the caller before the rebuild. The phase neither
+   * reassigns a host binding nor terminates the host, so it returns void.
+   * `this.lastContentKey` is deliberately not written here — the caller
+   * records the new content key once both branches have rendered.
+   */
+  private renderSyncViewFullRebuild(args: {
+    container: HTMLElement;
+    statusState: StatusPanelState;
+    bodyMode: SyncViewBodyMode;
+    sideActionResultsVisible: boolean;
+    isRunning: boolean;
+    progress: SyncProgressState;
+    syncState: EasySyncPlugin["state"];
+    planReviewCounts: NonNullable<EasySyncPlugin["state"]>["planReviewCounts"];
+    planReviewItems: PlanReviewItem[];
+    conflicts: SyncPlanItem[];
+    pendingDeletes: SyncPlanItem[];
+    pendingIssueGroups: PendingIssueReviewGroup[];
+    adoptionRows: CommunityPluginAdoptionRow[];
+    updatePrompt: ReturnType<EasySyncPlugin["getUpdatePromptState"]>;
+    mutationRecovery: MutationRecoveryDisplayState | null;
+    preservedContentScrollTop: number | null;
+    preservedHostScrollTop: number | null;
+  }): void {
+    const {
+      container,
+      statusState,
+      bodyMode,
+      sideActionResultsVisible,
+      isRunning,
+      progress,
+      syncState,
+      planReviewCounts,
+      planReviewItems,
+      conflicts,
+      pendingDeletes,
+      pendingIssueGroups,
+      adoptionRows,
+      updatePrompt,
+      mutationRecovery,
+      preservedContentScrollTop,
+      preservedHostScrollTop,
+    } = args;
+    this.planVirtualRenderers.clear();
+    if (this.planViewportFrameId !== null) {
+      compatCancelAnimationFrame(this.planViewportFrameId);
+      this.planViewportFrameId = null;
+    }
+    this.progressPanelEl = null;
+    this.progressFillEl = null;
+    this.progressSubtitleEl = null;
+    this.fileListEl = null;
+    this.completedFileRowsLedger = null;
+    this.statusLineEl = null;
+    this.statusIconEl = null;
+    this.statusTextEl = null;
+    this.statusCounterEl = null;
+    this.statusDetailEl = null;
+    this.currentFileTextEl = null;
+    this.currentByteProgressEl = null;
+    this.statusDetailMode = null;
+    this.collapseToggleButtonEl = null;
+    container.empty();
+    container.addClass("easy-sync-view");
+
+    this.renderToolbar(container);
+    this.renderStatusPanel(container, statusState);
+    const content = container.createDiv("easy-sync-view-content");
+
+    // While a round runs, a borrowed body (plan review / pending rows /
+    // recovery) keeps its rows and their click-in contract, but the round
+    // bar still holds its original body-top spot under the status divider.
+    // The progress body paints the same bar itself (renderProgressPanel).
+    const progressPanelShown = bodyMode === "progress"
+      || (bodyMode === "pending" && sideActionResultsVisible);
+    if (!progressPanelShown && isRunning) {
+      const bar = content.createDiv("easy-sync-progress-bar");
+      this.progressFillEl = bar.createDiv("easy-sync-progress-fill");
+      this.progressFillEl.style.width = `${
+        remoteScopeRecoveryPercent(progress)
+        ?? syncViewProgressPercent(progress)
+      }%`;
+    }
+
+    if (bodyMode === "plan" && syncState) {
+      this.renderPlanReviewSection(
+        content,
+        planReviewCounts,
+        planReviewItems,
+        conflicts,
+        pendingDeletes,
+      );
+    } else if (bodyMode === "progress") {
+      this.renderProgressPanel(content, progress);
+    } else if (bodyMode === "pending") {
+      if (sideActionResultsVisible) this.renderProgressPanel(content, progress);
+      this.renderPendingSection(
+        content,
+        pendingIssueGroups,
+        conflicts,
+        pendingDeletes,
+        adoptionRows,
+        updatePrompt,
+      );
+    } else if (bodyMode === "recovery" && mutationRecovery) {
+      this.renderMutationRecoverySection(content, mutationRecovery);
+    }
+
+    if (this.historyExpanded) {
+      this.renderHistorySection(content, syncState?.syncHistory ?? []);
+    }
+
+    this.renderTransferRateFooter(container);
+
+    // Re-apply the toolbar state while retaining groups the user opened in
+    // this exact reviewed revision.
+    this.toggleAllDetails();
+    // `toggleAllDetails` owns group and issue rows; a decision row inside a
+    // plan group answers to its own remembered state instead.
+    this.applyPlanRowExpansion();
+    this.planRowHeights.clear();
+    this.planRowLayoutRevision += 1;
+    this.updateCollapseTogglePresentation();
+    this.schedulePlanViewportRender();
+    if (preservedContentScrollTop !== null) {
+      content.scrollTop = preservedContentScrollTop;
+    }
+    if (preservedHostScrollTop !== null) {
+      container.scrollTop = preservedHostScrollTop;
+    }
+  }
+
   private doRender(): void {
     const container = this.contentEl;
     const progress = this.plugin.progressStore.state;
@@ -1458,93 +1594,25 @@ export class EasySyncSyncView extends ItemView {
     });
 
     if (this.lastContentKey !== contentKey) {
-      this.planVirtualRenderers.clear();
-      if (this.planViewportFrameId !== null) {
-        compatCancelAnimationFrame(this.planViewportFrameId);
-        this.planViewportFrameId = null;
-      }
-      this.progressPanelEl = null;
-      this.progressFillEl = null;
-      this.progressSubtitleEl = null;
-      this.fileListEl = null;
-      this.completedFileRowsLedger = null;
-      this.statusLineEl = null;
-      this.statusIconEl = null;
-      this.statusTextEl = null;
-      this.statusCounterEl = null;
-      this.statusDetailEl = null;
-      this.currentFileTextEl = null;
-      this.currentByteProgressEl = null;
-      this.statusDetailMode = null;
-      this.collapseToggleButtonEl = null;
-      container.empty();
-      container.addClass("easy-sync-view");
-
-      this.renderToolbar(container);
-      this.renderStatusPanel(container, statusState);
-      const content = container.createDiv("easy-sync-view-content");
-
-      // While a round runs, a borrowed body (plan review / pending rows /
-      // recovery) keeps its rows and their click-in contract, but the round
-      // bar still holds its original body-top spot under the status divider.
-      // The progress body paints the same bar itself (renderProgressPanel).
-      const progressPanelShown = bodyMode === "progress"
-        || (bodyMode === "pending" && sideActionResultsVisible);
-      if (!progressPanelShown && isRunning) {
-        const bar = content.createDiv("easy-sync-progress-bar");
-        this.progressFillEl = bar.createDiv("easy-sync-progress-fill");
-        this.progressFillEl.style.width = `${
-          remoteScopeRecoveryPercent(progress)
-          ?? syncViewProgressPercent(progress)
-        }%`;
-      }
-
-      if (bodyMode === "plan" && syncState) {
-        this.renderPlanReviewSection(
-          content,
-          planReviewCounts,
-          planReviewItems,
-          conflicts,
-          pendingDeletes,
-        );
-      } else if (bodyMode === "progress") {
-        this.renderProgressPanel(content, progress);
-      } else if (bodyMode === "pending") {
-        if (sideActionResultsVisible) this.renderProgressPanel(content, progress);
-        this.renderPendingSection(
-          content,
-          pendingIssueGroups,
-          conflicts,
-          pendingDeletes,
-          adoptionRows,
-          updatePrompt,
-        );
-      } else if (bodyMode === "recovery" && mutationRecovery) {
-        this.renderMutationRecoverySection(content, mutationRecovery);
-      }
-
-      if (this.historyExpanded) {
-        this.renderHistorySection(content, syncState?.syncHistory ?? []);
-      }
-
-      this.renderTransferRateFooter(container);
-
-      // Re-apply the toolbar state while retaining groups the user opened in
-      // this exact reviewed revision.
-      this.toggleAllDetails();
-      // `toggleAllDetails` owns group and issue rows; a decision row inside a
-      // plan group answers to its own remembered state instead.
-      this.applyPlanRowExpansion();
-      this.planRowHeights.clear();
-      this.planRowLayoutRevision += 1;
-      this.updateCollapseTogglePresentation();
-      this.schedulePlanViewportRender();
-      if (preservedContentScrollTop !== null) {
-        content.scrollTop = preservedContentScrollTop;
-      }
-      if (preservedHostScrollTop !== null) {
-        container.scrollTop = preservedHostScrollTop;
-      }
+      this.renderSyncViewFullRebuild({
+        container,
+        statusState,
+        bodyMode,
+        sideActionResultsVisible,
+        isRunning,
+        progress,
+        syncState,
+        planReviewCounts,
+        planReviewItems,
+        conflicts,
+        pendingDeletes,
+        pendingIssueGroups,
+        adoptionRows,
+        updatePrompt,
+        mutationRecovery,
+        preservedContentScrollTop,
+        preservedHostScrollTop,
+      });
     } else {
       // Same visible content — keep DOM, only patch the bits that changed.
       this.updateStatusPanel(statusState);
@@ -2007,6 +2075,30 @@ export class EasySyncSyncView extends ItemView {
       isPending: state.isPending,
       devicePending: (this.plugin.auth?.deviceAttempt ?? null) !== null,
     });
+    this.renderStatusPanelPrimaryAction({
+      action,
+      actions,
+      state,
+      t,
+    });
+  }
+
+  /**
+   * Render the status panel's fixed primary action button for the resolved
+   * action kind.
+   *
+   * Contract: `actions` is the live container element the button is appended
+   * into (threaded by reference, never cloned); `t` is the plugin-bound
+   * translator; `action` and `state` are read-only inputs. The phase neither
+   * reassigns a host binding nor terminates the host, so it returns void.
+   */
+  private renderStatusPanelPrimaryAction(args: {
+    action: SyncViewPrimaryActionKind;
+    actions: ReturnType<HTMLElement["createDiv"]>;
+    state: StatusPanelState;
+    t: EasySyncPlugin["i18n"]["t"];
+  }): void {
+    const { action, actions, state, t } = args;
     switch (action.kind) {
       case "cancel": {
         const cancelButton = new ButtonComponent(actions)
@@ -2398,9 +2490,6 @@ export class EasySyncSyncView extends ItemView {
       const path = facts.createEl("dd", "easy-sync-recovery-path");
       configureFilePath(facts, path, presentation.path, false);
     }
-    section.createDiv("easy-sync-recovery-next-step").setText(
-      presentation.nextStep,
-    );
   }
 
   private renderMutationRecoverySection(
@@ -2665,7 +2754,6 @@ export class EasySyncSyncView extends ItemView {
           const confirmed = await new ConfirmModal(
             this.plugin.app,
             t("syncView.delete.confirmAllTitle", { count: paths.length }),
-            null,
             t("syncView.delete.confirmAll", { count: paths.length }),
             t("confirm.cancel"),
             t,
@@ -2794,82 +2882,109 @@ export class EasySyncSyncView extends ItemView {
       });
     }
     if (retryable) {
-      if (
-        issue.issueCode === "identity-replacement-ambiguous"
-        || issue.issueCode === "anchored-folder-missing-remote"
-        || issue.issueCode === "local-rename-evidence-conflict"
-        || issue.issueCode === "local-subtree-changed"
-        || issue.issueCode === "remote-subtree-changed"
-        || issue.issueCode === "target-occupied"
-        || issue.issueCode === "parent-chain-incomplete"
-      ) {
-        this.createActionChip(
-          actions,
-          t("syncView.staleIdentity.resolve"),
-          "accent",
-          () => {
-            void this.openStaleIdentityResolution(issue.path);
-          },
-        );
-        return;
-      }
-      if (issue.issueCode === "unanchored-shared-folder") {
-        this.createActionChip(
-          actions,
-          t("syncView.sharedFolderIdentity.resolve"),
-          "accent",
-          () => {
-            void this.openSharedFolderIdentityResolution(issue.path);
-          },
-        );
-        return;
-      }
-      if (issue.issueCode === "anchored-folder-missing-local") {
-        this.createActionChip(
-          actions,
-          t("syncView.folderSubtree.review"),
-          "accent",
-          () => {
-            void this.openEmptyFolderResolution(issue.path);
-          },
-        );
-        return;
-      }
-      if (issue.issueCode === "folder-location-choice") {
-        this.createActionChip(
-          actions,
-          t("syncView.folderLocation.resolve"),
-          "accent",
-          () => {
-            void this.openFolderLocationResolution(issue.path);
-          },
-        );
-        return;
-      }
-      if (issue.issueCode === "scope-crossing" && scopeCrossingExitKind) {
-        this.createActionChip(
-          actions,
-          t("syncView.scopeCrossing.restore"),
-          "accent",
-          () => {
-            void this.openScopeCrossingRestore(issue.path);
-          },
-        );
-        this.createActionChip(
-          actions,
-          t("syncView.scopeCrossing.confirm"),
-          "accent",
-          () => {
-            void this.openScopeCrossingConfirm(issue.path);
-          },
-        );
-        return;
-      }
-      // 通用重试 chip 不再渲染（2026-09-16 按钮清理）：其余可重试问题行
-      // 的行内重试与顶部主动作完全等同（同一完整手动同步入口），轮运行
-      // 中点击也仅得 busy 提示——重试统一经顶部「立即同步」；延后类行
-      // 由自动轮次收敛。行内保留原因文案与可选「打开文件」。
+      this.renderPendingIssueRetryableActions({
+        actions,
+        issue,
+        scopeCrossingExitKind,
+        t,
+      });
     }
+  }
+
+  /**
+   * Render the retryable action chips for one pending issue row.
+   *
+   * Contract: `actions` is the live action container the chips are appended
+   * into (threaded by reference, never cloned); `t` is the plugin-bound
+   * translator; `issue` and `scopeCrossingExitKind` are read-only inputs. Every
+   * branch appends its chip and returns; the caller has no statements after the
+   * call, so an early return here ends the row render exactly as the inline
+   * block did, and the phase returns void.
+   */
+  private renderPendingIssueRetryableActions(args: {
+    actions: ReturnType<HTMLElement["createDiv"]>;
+    issue: PendingIssue;
+    scopeCrossingExitKind: ReturnType<
+      NonNullable<EasySyncPlugin["state"]>["getScopeCrossingExitKind"]
+    >;
+    t: EasySyncPlugin["i18n"]["t"];
+  }): void {
+    const { actions, issue, scopeCrossingExitKind, t } = args;
+    if (
+      issue.issueCode === "identity-replacement-ambiguous"
+      || issue.issueCode === "anchored-folder-missing-remote"
+      || issue.issueCode === "local-rename-evidence-conflict"
+      || issue.issueCode === "local-subtree-changed"
+      || issue.issueCode === "remote-subtree-changed"
+      || issue.issueCode === "target-occupied"
+      || issue.issueCode === "parent-chain-incomplete"
+    ) {
+      this.createActionChip(
+        actions,
+        t("syncView.staleIdentity.resolve"),
+        "accent",
+        () => {
+          void this.openStaleIdentityResolution(issue.path);
+        },
+      );
+      return;
+    }
+    if (issue.issueCode === "unanchored-shared-folder") {
+      this.createActionChip(
+        actions,
+        t("syncView.sharedFolderIdentity.resolve"),
+        "accent",
+        () => {
+          void this.openSharedFolderIdentityResolution(issue.path);
+        },
+      );
+      return;
+    }
+    if (issue.issueCode === "anchored-folder-missing-local") {
+      this.createActionChip(
+        actions,
+        t("syncView.folderSubtree.review"),
+        "accent",
+        () => {
+          void this.openEmptyFolderResolution(issue.path);
+        },
+      );
+      return;
+    }
+    if (issue.issueCode === "folder-location-choice") {
+      this.createActionChip(
+        actions,
+        t("syncView.folderLocation.resolve"),
+        "accent",
+        () => {
+          void this.openFolderLocationResolution(issue.path);
+        },
+      );
+      return;
+    }
+    if (issue.issueCode === "scope-crossing" && scopeCrossingExitKind) {
+      this.createActionChip(
+        actions,
+        t("syncView.scopeCrossing.restore"),
+        "accent",
+        () => {
+          void this.openScopeCrossingRestore(issue.path);
+        },
+      );
+      this.createActionChip(
+        actions,
+        t("syncView.scopeCrossing.confirm"),
+        "accent",
+        () => {
+          void this.openScopeCrossingConfirm(issue.path);
+        },
+      );
+      return;
+    }
+    // 通用重试 chip 不再渲染（2026-09-16 按钮清理）：其余可重试问题行
+    // 的行内重试与顶部主动作完全等同（同一完整手动同步入口），轮运行
+    // 中点击也仅得 busy 提示——重试统一经顶部「立即同步」；延后类行
+    // 由自动轮次收敛。行内保留原因文案与可选「打开文件」。
   }
 
   // Per-row short guard. The kind-wide flags above are released before the
@@ -2938,7 +3053,6 @@ export class EasySyncSyncView extends ItemView {
       const confirmed = await new ConfirmModal(
         this.plugin.app,
         t("syncView.staleIdentity.confirmTitle"),
-        null,
         t("syncView.staleIdentity.confirm"),
         t("confirm.cancel"),
         t,
@@ -2987,7 +3101,6 @@ export class EasySyncSyncView extends ItemView {
       const confirmed = await new ConfirmModal(
         this.plugin.app,
         t("syncView.sharedFolderIdentity.confirmTitle"),
-        null,
         t("syncView.sharedFolderIdentity.confirm"),
         t("confirm.cancel"),
         t,
@@ -3031,30 +3144,7 @@ export class EasySyncSyncView extends ItemView {
             await this.plugin.restoreReviewedFolderSubtree(subtree);
           }
           if (choice?.action === "delete-subtree") {
-            const folders = subtree.members.filter(
-              (member) => member.kind === "folder",
-            ).length;
-            const files = subtree.members.length - folders;
-            const confirmed = await new ConfirmModal(
-              this.plugin.app,
-              t("syncView.folderSubtree.deleteConfirmTitle"),
-              null,
-              t("syncView.folderSubtree.delete"),
-              t("confirm.cancel"),
-              t,
-              {
-                message: t("syncView.folderSubtree.deleteConfirmMessage", {
-                  path: subtree.path,
-                  folders,
-                  files,
-                }),
-                warning: t("syncView.folderSubtree.deleteConfirmWarning"),
-                danger: true,
-              },
-            ).awaitConfirm();
-            if (confirmed) {
-              await this.plugin.deleteReviewedFolderSubtree(subtree);
-            }
+            await this.plugin.deleteReviewedFolderSubtree(subtree);
           }
           return;
         }
@@ -3082,20 +3172,8 @@ export class EasySyncSyncView extends ItemView {
         );
         return;
       }
-      const confirmed = await new ConfirmModal(
-        this.plugin.app,
-        t("syncView.emptyFolder.deleteConfirmTitle", { path }),
-        null,
-        t("syncView.emptyFolder.deleteConfirm"),
-        t("confirm.cancel"),
-        t,
-        {
-          message: t("syncView.emptyFolder.deleteConfirmMessage", { path }),
-          warning: t("syncView.emptyFolder.deleteConfirmWarning"),
-          danger: true,
-        },
-      ).awaitConfirm();
-      if (!confirmed) return;
+      // 删除是单一破坏性确认：第一层弹框的红键即最终授权，删前核对与版本门
+      // 由执行链独立承担（2026-09-29 用户拍板撤第二道确认）。
       await this.plugin.deleteReviewedEmptyRemoteFolder(snapshot);
     } finally {
       this.emptyFolderResolutionOpening = false;
@@ -3165,7 +3243,6 @@ export class EasySyncSyncView extends ItemView {
       const confirmed = await new ConfirmModal(
         this.plugin.app,
         t("syncView.scopeCrossing.restoreTitle"),
-        null,
         t("syncView.scopeCrossing.restore"),
         t("confirm.cancel"),
         t,
@@ -3208,7 +3285,6 @@ export class EasySyncSyncView extends ItemView {
       const confirmed = await new ConfirmModal(
         this.plugin.app,
         t("syncView.scopeCrossing.confirmTitle"),
-        null,
         t("syncView.scopeCrossing.confirm"),
         t("confirm.cancel"),
         t,
@@ -3327,7 +3403,6 @@ export class EasySyncSyncView extends ItemView {
     return new ConfirmModal(
       this.plugin.app,
       t("syncView.mutationResolution.deleteConfirmTitle"),
-      null,
       t("syncView.mutationResolution.deleteConfirm"),
       t("confirm.cancel"),
       t,
@@ -3507,28 +3582,37 @@ export class EasySyncSyncView extends ItemView {
     const panel = this.createSection(container, t("syncPlan.sectionTitle"));
     const activationReviewKind =
       this.plugin.state?.planReviewAuthorization?.reviewKind;
+    const hasDecisionRows = items.some((item) =>
+      item.type === SyncActionType.Conflict
+      || item.type === SyncActionType.ConfirmLocalDelete);
+    const renderSummaryLine = (base: string): void => {
+      // One slot, two roles: the flow line states what confirming does; the
+      // decision note is appended only when the plan actually carries decision
+      // rows. Activation reviews defer those rows to after the run (they are
+      // read-only here); ordinary plans decide them inline right now — each
+      // sentence must say the timing its rows really have.
+      const decisionNote = hasDecisionRows
+        ? ` ${t("syncPlan.activationDecisionSummary")}`
+        : "";
+      panel.createDiv("setting-item-description").setText(
+        `${base}${decisionNote}`,
+      );
+    };
 
     if (activationReviewKind === "v2-migration") {
-      panel.createDiv("setting-item-description").setText(
-        t("syncPlan.migrationSummary"),
-      );
+      renderSummaryLine(t("syncPlan.migrationSummary"));
     } else if (activationReviewKind === "v2-cloud-join") {
-      panel.createDiv("setting-item-description").setText(
-        t("syncPlan.cloudJoinSummary"),
-      );
+      renderSummaryLine(t("syncPlan.cloudJoinSummary"));
+    } else if (activationReviewKind === "v2-first-sync") {
+      renderSummaryLine(t("syncPlan.firstSyncSummary"));
     } else if (items.some(
       (item) => item.type === SyncActionType.RecreateRemoteScope,
     )) {
-      panel.createDiv("setting-item-description").setText(
-        t("syncPlan.remoteScopeRecreateSummary"),
-      );
+      renderSummaryLine(t("syncPlan.remoteScopeRecreateSummary"));
     } else if (
-      // Ordinary plans only: the dedicated review kinds keep their own single
-      // sentence, and a clean plan stays silent. The note states the confirm
-      // button's boundary — decision rows are not executed by it.
-      items.some((item) =>
-        item.type === SyncActionType.Conflict
-        || item.type === SyncActionType.ConfirmLocalDelete)
+      // Ordinary plans only: the note states the confirm button's boundary
+      // and the decision rows' own timing — they are decidable inline now.
+      hasDecisionRows
     ) {
       panel.createDiv("setting-item-description").setText(
         t("syncPlan.confirmBoundarySummary"),

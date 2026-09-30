@@ -268,92 +268,22 @@ export function acceptConfirmedDescendantFolderAnchorsV2(input: {
 
   for (const anchor of Object.values(input.envelope.anchors.byAnchorId)
     .sort((left, right) => left.lastPath.localeCompare(right.lastPath))) {
-    if (!anchor.remoteId || !includeFilePath(anchor.lastPath)) continue;
-    const local = localFiles.get(identityPath(anchor.lastPath));
-    if (
-      !local
-      || nfcPath(local.path) !== nfcPath(anchor.lastPath)
-      || local.hash !== anchor.contentHash
-      || local.size !== anchor.size
-    ) continue;
-    const remote = input.envelope.remoteIndex.itemsById[anchor.remoteId];
-    if (
-      !remote
-      || remote.kind !== "file"
-      || remotePaths.get(remote.id) !== anchor.lastPath
-      || remote.size !== anchor.size
-      || !currentRemoteVersionMatchesAnchor(remote, anchor)
-    ) continue;
-
-    const candidateChain: RemoteFolderEntry[] = [];
-    let expectedParentPath = parentPath(anchor.lastPath);
-    let parentRemoteId = remote.parentId;
-    let chainMatches = true;
-    while (expectedParentPath !== "") {
-      const parent = input.envelope.remoteIndex.itemsById[parentRemoteId];
-      const localFolder = localFolders.get(identityPath(expectedParentPath));
-      if (
-        !parent
-        || parent.kind !== "folder"
-        || remotePaths.get(parent.id) !== expectedParentPath
-        || !localFolder
-        || nfcPath(localFolder.path) !== nfcPath(expectedParentPath)
-        || !includeFolderPath(expectedParentPath)
-      ) {
-        chainMatches = false;
-        break;
-      }
-
-      const exact = currentAnchors.find((folderAnchor) =>
-        folderAnchor.remoteId === parent.id
-        && folderAnchor.lastPath === expectedParentPath
-        && folderAnchor.parentRemoteId === parent.parentId
-      );
-      if (!exact) {
-        if (currentAnchors.some((folderAnchor) =>
-          folderAnchor.remoteId === parent.id
-          || identityPath(folderAnchor.lastPath)
-            === identityPath(expectedParentPath)
-        )) {
-          return reject("folder-anchor-collision");
-        }
-        candidateChain.push({
-          path: expectedParentPath,
-          driveId: parent.id,
-          parentId: parent.parentId,
-          name: parent.name,
-          ...(parent.eTag !== undefined ? { eTag: parent.eTag } : {}),
-          ...(parent.cTag !== undefined ? { cTag: parent.cTag } : {}),
-        });
-      }
-      expectedParentPath = parentPath(expectedParentPath);
-      parentRemoteId = parent.parentId;
-    }
-    if (
-      !chainMatches
-      || parentRemoteId !== input.envelope.remoteIndex.filesRootId
-    ) continue;
-
-    for (const folder of candidateChain) {
-      const pathKey = identityPath(folder.path);
-      const existingById = additionsByRemoteId.get(folder.driveId);
-      const existingIdAtPath = additionRemoteIdByPath.get(pathKey);
-      if (
-        (
-          existingById
-          && (
-            existingById.path !== folder.path
-            || existingById.parentId !== folder.parentId
-          )
-        )
-        || (existingIdAtPath && existingIdAtPath !== folder.driveId)
-      ) {
-        return reject("folder-anchor-collision");
-      }
-      additionsByRemoteId.set(folder.driveId, folder);
-      additionRemoteIdByPath.set(pathKey, folder.driveId);
-    }
-    if (candidateChain.length > 0) evidenceFiles++;
+    const settled = settleConfirmedDescendantFolderAnchorV2({
+      anchor,
+      envelope: input.envelope,
+      localFiles,
+      localFolders,
+      remotePaths,
+      currentAnchors,
+      includeFilePath,
+      includeFolderPath,
+      additionsByRemoteId,
+      additionRemoteIdByPath,
+      evidenceFiles,
+      reject,
+    });
+    if (settled.terminated) return settled.terminated;
+    evidenceFiles = settled.evidenceFiles;
   }
 
   if (additionsByRemoteId.size === 0) {
@@ -403,6 +333,136 @@ export function acceptConfirmedDescendantFolderAnchorsV2(input: {
     evidenceFiles,
     envelope,
   };
+}
+
+/**
+ * Settle the descendant folder evidence of one committed file anchor: walk
+ * the anchor's remote parent chain, require every step to match a local
+ * folder, the current remote projection and the include predicates, and
+ * record the still unanchored ancestors as pending additions. Any anchor
+ * collision fails the whole acceptance closed. The caller's maps are
+ * mutated by reference and the returned union carries the evidence counter
+ * or the early rejection.
+ */
+function settleConfirmedDescendantFolderAnchorV2(args: {
+  anchor: SyncStateEnvelopeV2["anchors"]["byAnchorId"][string];
+  envelope: SyncStateEnvelopeV2;
+  localFiles: Map<string, LocalFileEntry>;
+  localFolders: Map<string, LocalFolderEntry>;
+  remotePaths: ReturnType<typeof projectRemoteIndexV2>;
+  currentAnchors: FolderAnchorV2[];
+  includeFilePath: (path: string) => boolean;
+  includeFolderPath: (path: string) => boolean;
+  additionsByRemoteId: Map<string, RemoteFolderEntry>;
+  additionRemoteIdByPath: Map<string, string>;
+  evidenceFiles: number;
+  reject: (
+    reason: ConfirmedDescendantFolderRejectionReasonV2,
+  ) => ConfirmedDescendantFolderAcceptanceV2;
+}):
+  | { terminated: ConfirmedDescendantFolderAcceptanceV2 }
+  | { terminated: null; evidenceFiles: number } {
+  const {
+    anchor,
+    envelope,
+    localFiles,
+    localFolders,
+    remotePaths,
+    currentAnchors,
+    includeFilePath,
+    includeFolderPath,
+    additionsByRemoteId,
+    additionRemoteIdByPath,
+    reject,
+  } = args;
+  let { evidenceFiles } = args;
+  if (!anchor.remoteId || !includeFilePath(anchor.lastPath)) return { terminated: null, evidenceFiles };
+  const local = localFiles.get(identityPath(anchor.lastPath));
+  if (
+    !local
+    || nfcPath(local.path) !== nfcPath(anchor.lastPath)
+    || local.hash !== anchor.contentHash
+    || local.size !== anchor.size
+  ) return { terminated: null, evidenceFiles };
+  const remote = envelope.remoteIndex.itemsById[anchor.remoteId];
+  if (
+    !remote
+    || remote.kind !== "file"
+    || remotePaths.get(remote.id) !== anchor.lastPath
+    || remote.size !== anchor.size
+    || !currentRemoteVersionMatchesAnchor(remote, anchor)
+  ) return { terminated: null, evidenceFiles };
+
+  const candidateChain: RemoteFolderEntry[] = [];
+  let expectedParentPath = parentPath(anchor.lastPath);
+  let parentRemoteId = remote.parentId;
+  let chainMatches = true;
+  while (expectedParentPath !== "") {
+    const parent = envelope.remoteIndex.itemsById[parentRemoteId];
+    const localFolder = localFolders.get(identityPath(expectedParentPath));
+    if (
+      !parent
+      || parent.kind !== "folder"
+      || remotePaths.get(parent.id) !== expectedParentPath
+      || !localFolder
+      || nfcPath(localFolder.path) !== nfcPath(expectedParentPath)
+      || !includeFolderPath(expectedParentPath)
+    ) {
+      chainMatches = false;
+      break;
+    }
+
+    const exact = currentAnchors.find((folderAnchor) =>
+      folderAnchor.remoteId === parent.id
+      && folderAnchor.lastPath === expectedParentPath
+      && folderAnchor.parentRemoteId === parent.parentId
+    );
+    if (!exact) {
+      if (currentAnchors.some((folderAnchor) =>
+        folderAnchor.remoteId === parent.id
+        || identityPath(folderAnchor.lastPath)
+          === identityPath(expectedParentPath)
+      )) {
+        return { terminated: reject("folder-anchor-collision") };
+      }
+      candidateChain.push({
+        path: expectedParentPath,
+        driveId: parent.id,
+        parentId: parent.parentId,
+        name: parent.name,
+        ...(parent.eTag !== undefined ? { eTag: parent.eTag } : {}),
+        ...(parent.cTag !== undefined ? { cTag: parent.cTag } : {}),
+      });
+    }
+    expectedParentPath = parentPath(expectedParentPath);
+    parentRemoteId = parent.parentId;
+  }
+  if (
+    !chainMatches
+    || parentRemoteId !== envelope.remoteIndex.filesRootId
+  ) return { terminated: null, evidenceFiles };
+
+  for (const folder of candidateChain) {
+    const pathKey = identityPath(folder.path);
+    const existingById = additionsByRemoteId.get(folder.driveId);
+    const existingIdAtPath = additionRemoteIdByPath.get(pathKey);
+    if (
+      (
+        existingById
+        && (
+          existingById.path !== folder.path
+          || existingById.parentId !== folder.parentId
+        )
+      )
+      || (existingIdAtPath && existingIdAtPath !== folder.driveId)
+    ) {
+      return { terminated: reject("folder-anchor-collision") };
+    }
+    additionsByRemoteId.set(folder.driveId, folder);
+    additionRemoteIdByPath.set(pathKey, folder.driveId);
+  }
+  if (candidateChain.length > 0) evidenceFiles++;
+  return { terminated: null, evidenceFiles };
 }
 
 /**

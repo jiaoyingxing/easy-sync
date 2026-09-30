@@ -7,10 +7,10 @@ import {
   ToggleComponent,
 } from "obsidian";
 import {
-  SyncPathSettingsUpdateError,
   type DeferredSettingsMutationHandle,
   type SyncPathSettings,
 } from "../main";
+import { SyncPathSettingsUpdateError } from "../sync/sync-path-settings-error";
 import type EasySyncPlugin from "../main";
 import type { CommunityPluginInventoryItem } from "../sync/community-plugin-inventory";
 import {
@@ -886,7 +886,6 @@ export class ConfigSyncModal extends EasySyncModal {
     const confirmed = await new ConfirmModal(
       this.plugin.app,
       t("settings.communityPlugins.cleanup.confirmTitle"),
-      null,
       t("settings.communityPlugins.cleanup.confirmAction"),
       t("confirm.cancel"),
       t,
@@ -1103,7 +1102,6 @@ export class ConfigSyncModal extends EasySyncModal {
     return new ConfirmModal(
       this.plugin.app,
       t("settings.communityPlugins.data.experimentalConfirmTitle"),
-      null,
       t("settings.communityPlugins.data.experimentalConfirm"),
       t("confirm.cancel"),
       t,

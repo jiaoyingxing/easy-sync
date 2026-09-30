@@ -360,175 +360,21 @@ function composeCanonicalActionsV2(
   const otherProtectedRoots = new Set<string>();
 
   for (const item of folderPlan.items) {
-    if (item.type === "create-remote") {
-      const parent = parentFolderPath(item.path);
-      const parentRemoteId = parent === ""
-        ? state.scope.filesRootId
-        : remoteIdByPath.get(normalizeRemotePathKey(parent));
-      const parentNode = parentRemoteId
-        ? state.remoteNodeById.get(parentRemoteId)
-        : undefined;
-      if (
-        (!parentRemoteId
-          && !plannedRemoteCreates.has(normalizeRemotePathKey(parent)))
-        || (parentRemoteId && parent !== "" && parentNode?.kind !== "folder")
-      ) {
-        deferredItems.push(toDeferredFolderPlanItem(
-          item.path,
-          "parent-chain-incomplete",
-        ));
-        continue;
-      }
-      createItems.push({
-        type: SyncActionType.CreateRemoteFolder,
-        path: item.path,
-        folder: {
-          parentRemoteId,
-          parentPath: parent,
-          parentRemoteETag: parentNode?.eTag,
-        },
-      });
-      continue;
-    }
-
-    if (item.type === "create-local" && item.remoteId) {
-      const remoteNode = state.remoteNodeById.get(item.remoteId);
-      if (!remoteNode || remoteNode.kind !== "folder") {
-        deferredItems.push(toDeferredFolderPlanItem(
-          item.path,
-          "parent-chain-incomplete",
-        ));
-        continue;
-      }
-      const parentNode = state.remoteNodeById.get(remoteNode.parentId);
-      createItems.push({
-        type: SyncActionType.CreateLocalFolder,
-        path: item.path,
-        folder: {
-          remoteId: remoteNode.id,
-          remoteETag: remoteNode.eTag,
-          parentRemoteId: remoteNode.parentId,
-          parentPath: parentFolderPath(item.path),
-          parentRemoteETag: parentNode?.eTag,
-        },
-      });
-      continue;
-    }
-
-    if (
-      (item.type === "move-remote" || item.type === "move-local")
-      && item.remoteId
-      && item.sourcePath
-      && item.targetPath
-    ) {
-      const remoteNode = state.remoteNodeById.get(item.remoteId);
-      const anchor = state.folderAnchorByRemoteId.get(item.remoteId);
-      if (!remoteNode || remoteNode.kind !== "folder" || !anchor) {
-        deferredItems.push(toDeferredFolderPlanItem(
-          item.path,
-          "parent-chain-incomplete",
-        ));
-        continue;
-      }
-      const parent = parentFolderPath(item.targetPath);
-      const parentRemoteId = parent === ""
-        ? state.scope.filesRootId
-        : remoteIdByPath.get(normalizeRemotePathKey(parent));
-      const parentNode = parentRemoteId
-        ? state.remoteNodeById.get(parentRemoteId)
-        : undefined;
-      if (
-        (!parentRemoteId
-          && !plannedRemoteCreates.has(normalizeRemotePathKey(parent)))
-        || (parentRemoteId && parent !== "" && parentNode?.kind !== "folder")
-      ) {
-        deferredItems.push(toDeferredFolderPlanItem(
-          item.path,
-          "parent-chain-incomplete",
-        ));
-        continue;
-      }
-      moveItems.push({
-        type: item.type === "move-remote"
-          ? SyncActionType.MoveRemoteFolder
-          : SyncActionType.MoveLocalFolder,
-        path: item.targetPath,
-        renameFrom: item.sourcePath,
-        reviewImpactCount: Math.max(
-          1,
-          item.impact.files + item.impact.folders,
-        ),
-        folder: {
-          remoteId: item.remoteId,
-          remoteETag: remoteNode.eTag ?? anchor.remoteETag,
-          parentRemoteId,
-          parentPath: parent,
-          parentRemoteETag: parentNode?.eTag,
-          sourceParentRemoteId: item.type === "move-remote"
-            ? remoteNode.parentId
-            : anchor.parentRemoteId,
-        },
-      });
-      for (const root of [
-        item.sourcePath,
-        item.targetPath,
-        ...(item.affectedPaths ?? []),
-      ]) {
-        protectedRoots.add(root);
-        otherProtectedRoots.add(root);
-      }
-      continue;
-    }
-
-    if (
-      (item.type === "delete-remote" || item.type === "delete-local")
-      && item.remoteId
-    ) {
-      const anchor = state.folderAnchorByRemoteId.get(item.remoteId);
-      if (
-        !anchor
-        || isProtectedFolderDeletePath(item.path, input.configDir)
-      ) {
-        deferredItems.push(toDeferredFolderPlanItem(
-          item.path,
-          anchor ? "scope-crossing" : "parent-chain-incomplete",
-        ));
-        continue;
-      }
-      const remoteNode = state.remoteNodeById.get(item.remoteId);
-      deleteItems.push({
-        type: item.type === "delete-remote"
-          ? SyncActionType.DeleteRemoteFolder
-          : SyncActionType.DeleteLocalFolder,
-        path: item.path,
-        // A remote-deleted folder only needs user approval while a local
-        // folder still exists to be removed. When both sides are already
-        // absent, execute the identity retirement directly so the old anchor
-        // cannot strand an empty, permanently pending delete.
-        requiresConfirmation: item.type === "delete-local"
-          && !input.automaticDeleteLocalFiles
-          && item.impact.folders > 0,
-        folder: {
-          remoteId: item.remoteId,
-          remoteETag: remoteNode?.eTag ?? anchor.remoteETag,
-          parentRemoteId: remoteNode?.parentId ?? anchor.parentRemoteId,
-          parentPath: parentFolderPath(item.path),
-          sourceParentRemoteId: remoteNode?.parentId
-            ?? anchor.parentRemoteId,
-        },
-      });
-      continue;
-    }
-
-    for (const root of item.affectedPaths ?? [item.path]) {
-      protectedRoots.add(root);
-      if (item.reason === "unanchored-shared-folder") {
-        unanchoredProtectedRoots.add(root);
-      } else {
-        otherProtectedRoots.add(root);
-      }
-    }
-    deferredItems.push(toDeferredFolderPlanItem(item.path, item.reason));
+    applyFolderPlanItemV2({
+      item,
+      state,
+      remoteIdByPath,
+      plannedRemoteCreates,
+      configDir: input.configDir,
+      automaticDeleteLocalFiles: input.automaticDeleteLocalFiles,
+      createItems,
+      moveItems,
+      deleteItems,
+      deferredItems,
+      protectedRoots,
+      unanchoredProtectedRoots,
+      otherProtectedRoots,
+    });
   }
 
   const leafUnanchoredRoots = [...unanchoredProtectedRoots].filter(
@@ -598,13 +444,309 @@ function composeCanonicalActionsV2(
     fileItems = heldFileItems;
   }
 
+  const includeFilePath = input.includeFilePath ?? (() => true);
+  const identityResult = applyIdentityRenameActionsV2({
+    state,
+    localFiles: input.localFiles,
+    projectedFolderIdentities,
+    includeFilePath,
+    carriedFolderMoves,
+    remoteFilesById,
+    protectedRoots,
+    fileItems,
+    deferredItems,
+  });
+  fileItems = identityResult.fileItems;
+  const {
+    identityItems,
+    identityReplacements,
+    identityMoveVerifications,
+  } = identityResult;
+
+  createItems.sort((left, right) =>
+    folderPathDepth(left.path) - folderPathDepth(right.path)
+    || left.path.localeCompare(right.path)
+    || left.type.localeCompare(right.type));
+  moveItems.sort((left, right) =>
+    folderPathDepth(left.renameFrom ?? left.path)
+      - folderPathDepth(right.renameFrom ?? right.path)
+    || left.path.localeCompare(right.path));
+  deleteItems.sort((left, right) =>
+    folderPathDepth(right.path) - folderPathDepth(left.path)
+    || left.path.localeCompare(right.path));
+  deferredItems.sort((left, right) => left.path.localeCompare(right.path));
+
+  return {
+    ...base,
+    status: "planned",
+    identityReplacements,
+    identityMoveVerifications,
+    unanchoredDescendantEvidence,
+    items: [
+      ...createItems,
+      ...moveItems,
+      ...identityItems,
+      ...fileItems,
+      ...deleteItems,
+      ...deferredItems,
+    ],
+  };
+}
+
+/**
+ * Apply one planned folder action to the composed folder decision arrays.
+ *
+ * A create, move or delete either joins its action array or becomes a
+ * per-action deferral; every decomposed item path additionally joins the
+ * protected-root sets the later file filtering and descendant-evidence
+ * steps consult. The caller's containers are threaded by reference and no
+ * binding is reassigned, so a terminal per-item outcome is a plain return.
+ */
+function applyFolderPlanItemV2(args: {
+  item: FolderStatePlanV2["items"][number];
+  state: CanonicalPlannerStateV2;
+  remoteIdByPath: Map<string, string>;
+  plannedRemoteCreates: Set<string>;
+  configDir: string;
+  automaticDeleteLocalFiles: boolean;
+  createItems: SyncPlanItem[];
+  moveItems: SyncPlanItem[];
+  deleteItems: SyncPlanItem[];
+  deferredItems: SyncPlanItem[];
+  protectedRoots: Set<string>;
+  unanchoredProtectedRoots: Set<string>;
+  otherProtectedRoots: Set<string>;
+}): void {
+  const {
+    item,
+    state,
+    remoteIdByPath,
+    plannedRemoteCreates,
+    configDir,
+    automaticDeleteLocalFiles,
+    createItems,
+    moveItems,
+    deleteItems,
+    deferredItems,
+    protectedRoots,
+    unanchoredProtectedRoots,
+    otherProtectedRoots,
+  } = args;
+
+  if (item.type === "create-remote") {
+    const parent = parentFolderPath(item.path);
+    const parentRemoteId = parent === ""
+      ? state.scope.filesRootId
+      : remoteIdByPath.get(normalizeRemotePathKey(parent));
+    const parentNode = parentRemoteId
+      ? state.remoteNodeById.get(parentRemoteId)
+      : undefined;
+    if (
+      (!parentRemoteId
+        && !plannedRemoteCreates.has(normalizeRemotePathKey(parent)))
+      || (parentRemoteId && parent !== "" && parentNode?.kind !== "folder")
+    ) {
+      deferredItems.push(toDeferredFolderPlanItem(
+        item.path,
+        "parent-chain-incomplete",
+      ));
+      return;
+    }
+    createItems.push({
+      type: SyncActionType.CreateRemoteFolder,
+      path: item.path,
+      folder: {
+        parentRemoteId,
+        parentPath: parent,
+        parentRemoteETag: parentNode?.eTag,
+      },
+    });
+    return;
+  }
+
+  if (item.type === "create-local" && item.remoteId) {
+    const remoteNode = state.remoteNodeById.get(item.remoteId);
+    if (!remoteNode || remoteNode.kind !== "folder") {
+      deferredItems.push(toDeferredFolderPlanItem(
+        item.path,
+        "parent-chain-incomplete",
+      ));
+      return;
+    }
+    const parentNode = state.remoteNodeById.get(remoteNode.parentId);
+    createItems.push({
+      type: SyncActionType.CreateLocalFolder,
+      path: item.path,
+      folder: {
+        remoteId: remoteNode.id,
+        remoteETag: remoteNode.eTag,
+        parentRemoteId: remoteNode.parentId,
+        parentPath: parentFolderPath(item.path),
+        parentRemoteETag: parentNode?.eTag,
+      },
+    });
+    return;
+  }
+
+  if (
+    (item.type === "move-remote" || item.type === "move-local")
+    && item.remoteId
+    && item.sourcePath
+    && item.targetPath
+  ) {
+    const remoteNode = state.remoteNodeById.get(item.remoteId);
+    const anchor = state.folderAnchorByRemoteId.get(item.remoteId);
+    if (!remoteNode || remoteNode.kind !== "folder" || !anchor) {
+      deferredItems.push(toDeferredFolderPlanItem(
+        item.path,
+        "parent-chain-incomplete",
+      ));
+      return;
+    }
+    const parent = parentFolderPath(item.targetPath);
+    const parentRemoteId = parent === ""
+      ? state.scope.filesRootId
+      : remoteIdByPath.get(normalizeRemotePathKey(parent));
+    const parentNode = parentRemoteId
+      ? state.remoteNodeById.get(parentRemoteId)
+      : undefined;
+    if (
+      (!parentRemoteId
+        && !plannedRemoteCreates.has(normalizeRemotePathKey(parent)))
+      || (parentRemoteId && parent !== "" && parentNode?.kind !== "folder")
+    ) {
+      deferredItems.push(toDeferredFolderPlanItem(
+        item.path,
+        "parent-chain-incomplete",
+      ));
+      return;
+    }
+    moveItems.push({
+      type: item.type === "move-remote"
+        ? SyncActionType.MoveRemoteFolder
+        : SyncActionType.MoveLocalFolder,
+      path: item.targetPath,
+      renameFrom: item.sourcePath,
+      reviewImpactCount: Math.max(
+        1,
+        item.impact.files + item.impact.folders,
+      ),
+      folder: {
+        remoteId: item.remoteId,
+        remoteETag: remoteNode.eTag ?? anchor.remoteETag,
+        parentRemoteId,
+        parentPath: parent,
+        parentRemoteETag: parentNode?.eTag,
+        sourceParentRemoteId: item.type === "move-remote"
+          ? remoteNode.parentId
+          : anchor.parentRemoteId,
+      },
+    });
+    for (const root of [
+      item.sourcePath,
+      item.targetPath,
+      ...(item.affectedPaths ?? []),
+    ]) {
+      protectedRoots.add(root);
+      otherProtectedRoots.add(root);
+    }
+    return;
+  }
+
+  if (
+    (item.type === "delete-remote" || item.type === "delete-local")
+    && item.remoteId
+  ) {
+    const anchor = state.folderAnchorByRemoteId.get(item.remoteId);
+    if (
+      !anchor
+      || isProtectedFolderDeletePath(item.path, configDir)
+    ) {
+      deferredItems.push(toDeferredFolderPlanItem(
+        item.path,
+        anchor ? "scope-crossing" : "parent-chain-incomplete",
+      ));
+      return;
+    }
+    const remoteNode = state.remoteNodeById.get(item.remoteId);
+    deleteItems.push({
+      type: item.type === "delete-remote"
+        ? SyncActionType.DeleteRemoteFolder
+        : SyncActionType.DeleteLocalFolder,
+      path: item.path,
+      // A remote-deleted folder only needs user approval while a local
+      // folder still exists to be removed. When both sides are already
+      // absent, execute the identity retirement directly so the old anchor
+      // cannot strand an empty, permanently pending delete.
+      requiresConfirmation: item.type === "delete-local"
+        && !automaticDeleteLocalFiles
+        && item.impact.folders > 0,
+      folder: {
+        remoteId: item.remoteId,
+        remoteETag: remoteNode?.eTag ?? anchor.remoteETag,
+        parentRemoteId: remoteNode?.parentId ?? anchor.parentRemoteId,
+        parentPath: parentFolderPath(item.path),
+        sourceParentRemoteId: remoteNode?.parentId
+          ?? anchor.parentRemoteId,
+      },
+    });
+    return;
+  }
+
+  for (const root of item.affectedPaths ?? [item.path]) {
+    protectedRoots.add(root);
+    if (item.reason === "unanchored-shared-folder") {
+      unanchoredProtectedRoots.add(root);
+    } else {
+      otherProtectedRoots.add(root);
+    }
+  }
+  deferredItems.push(toDeferredFolderPlanItem(item.path, item.reason));
+}
+
+/**
+ * Apply the identity-rename decisions planned from the same state revision to
+ * the composed file and folder decision arrays.
+ *
+ * Each planned action either joins the plan (rename / move items, same-path
+ * identity replacements, move verifications) or becomes a per-action deferral;
+ * file items an identity decision owns are dropped from the ordinary file
+ * decisions in the same iteration order as before. Returns the updated file
+ * items plus the identity products the candidate is composed from.
+ */
+function applyIdentityRenameActionsV2(args: {
+  state: CanonicalPlannerStateV2;
+  localFiles: readonly LocalFileEntry[];
+  projectedFolderIdentities: readonly { path: string; remoteId: string }[];
+  includeFilePath: (path: string) => boolean;
+  carriedFolderMoves: readonly { sourcePath: string; targetPath: string }[];
+  remoteFilesById: Map<string, RemoteFileEntry>;
+  protectedRoots: Set<string>;
+  fileItems: SyncPlanItem[];
+  deferredItems: SyncPlanItem[];
+}): {
+  fileItems: SyncPlanItem[];
+  identityItems: SyncPlanItem[];
+  identityReplacements: CanonicalIdentityReplacementV2[];
+  identityMoveVerifications: CanonicalIdentityMoveVerificationV2[];
+} {
+  const {
+    state,
+    localFiles,
+    projectedFolderIdentities,
+    includeFilePath,
+    carriedFolderMoves,
+    remoteFilesById,
+    protectedRoots,
+    deferredItems,
+  } = args;
+  let { fileItems } = args;
   const identityItems: SyncPlanItem[] = [];
   const identityReplacements: CanonicalIdentityReplacementV2[] = [];
   const identityMoveVerifications: CanonicalIdentityMoveVerificationV2[] = [];
-  const includeFilePath = input.includeFilePath ?? (() => true);
   for (const action of planIdentityRenamesFromStateV2(
     state,
-    input.localFiles,
+    localFiles,
     { projectedFolderIdentities },
   )) {
     if (action.type === "conflict" && !includeFilePath(action.path)) continue;
@@ -690,7 +832,7 @@ function composeCanonicalActionsV2(
 
     if (action.type === "verify-move-local") {
       const anchor = state.fileAnchorById.get(action.anchorId);
-      const local = input.localFiles.find(
+      const local = localFiles.find(
         (entry) =>
           normalizeRemotePathKey(entry.path)
           === normalizeRemotePathKey(action.fromPath),
@@ -740,7 +882,7 @@ function composeCanonicalActionsV2(
     if (action.type === "reconcile-remote-identity") {
       const anchor = state.fileAnchorById.get(action.anchorId);
       const remote = remoteFilesById.get(action.remoteId);
-      const local = input.localFiles.find(
+      const local = localFiles.find(
         (entry) =>
           normalizeRemotePathKey(entry.path)
           === normalizeRemotePathKey(action.path),
@@ -786,7 +928,7 @@ function composeCanonicalActionsV2(
     const localPath = action.type === "move-remote"
       ? action.toPath
       : action.fromPath;
-    const local = input.localFiles.find(
+    const local = localFiles.find(
       (entry) =>
         normalizeRemotePathKey(entry.path)
         === normalizeRemotePathKey(localPath),
@@ -828,34 +970,11 @@ function composeCanonicalActionsV2(
           remote,
         });
   }
-
-  createItems.sort((left, right) =>
-    folderPathDepth(left.path) - folderPathDepth(right.path)
-    || left.path.localeCompare(right.path)
-    || left.type.localeCompare(right.type));
-  moveItems.sort((left, right) =>
-    folderPathDepth(left.renameFrom ?? left.path)
-      - folderPathDepth(right.renameFrom ?? right.path)
-    || left.path.localeCompare(right.path));
-  deleteItems.sort((left, right) =>
-    folderPathDepth(right.path) - folderPathDepth(left.path)
-    || left.path.localeCompare(right.path));
-  deferredItems.sort((left, right) => left.path.localeCompare(right.path));
-
   return {
-    ...base,
-    status: "planned",
+    fileItems,
+    identityItems,
     identityReplacements,
     identityMoveVerifications,
-    unanchoredDescendantEvidence,
-    items: [
-      ...createItems,
-      ...moveItems,
-      ...identityItems,
-      ...fileItems,
-      ...deleteItems,
-      ...deferredItems,
-    ],
   };
 }
 
@@ -952,164 +1071,40 @@ export async function finalizeCanonicalPlanCandidateV2(
   );
 
   for (const verification of identityMoveVerifications) {
-    let remoteHash = verification.remote.sha256Hash?.toLowerCase();
-    let proof: ContentEqualityProof = remoteHash
-      ? "remoteSha256"
-      : "insufficientEvidence";
-    if (!remoteHash) {
-      remoteHash = input.verifiedRemoteContentHashesById
-        ?.get(verification.remote.driveId)
-        ?.toLowerCase();
-      if (remoteHash) proof = "verifiedRemoteReceipt";
-    }
-    let downloadedThisRound = false;
-    if (remoteHash) {
-      identityCachedEvidence++;
-    } else if (remainingDownloadBudget > 0) {
-      remainingDownloadBudget--;
-      identityDownloads++;
-      downloadedThisRound = true;
-      try {
-        remoteHash = (
-          await input.resolveRemoteContentHash({
-            type: SyncActionType.Conflict,
-            path: verification.toPath,
-            local: verification.local,
-            remote: verification.remote,
-            reason: "reason.identityMove.verificationFailed",
-          }, {
-            current: identityDownloads,
-            total: identityProgressTotal,
-          })
-        ).toLowerCase();
-        proof = "downloadedSha256";
-      } catch (error) {
-        identityItems.push(identityMovePendingItem(
-          verification.toPath,
-          "reason.identityMove.verificationFailed",
-        ));
-        identityResults.push({
-          path: verification.toPath,
-          outcome: "failed",
-          downloaded: true,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        continue;
-      }
-    } else {
-      identityItems.push(identityMovePendingItem(
-        verification.toPath,
-        "reason.identityMove.verificationFailed",
-      ));
-      continue;
-    }
-
-    const equal =
-      verification.local.hash === verification.base.hash
-      && verification.local.size === verification.base.size
-      && verification.remote.size === verification.base.size
-      && remoteHash === verification.base.hash;
-    if (equal) {
-      identityItems.push({
-        type: SyncActionType.MoveLocalFile,
-        path: verification.toPath,
-        renameFrom: verification.fromPath,
-        local: { ...verification.local },
-        remote: { ...verification.remote },
-      });
-    } else {
-      identityItems.push(identityMovePendingItem(
-        verification.toPath,
-        "reason.identityMove.contentChanged",
-      ));
-    }
-    identityResults.push({
-      path: verification.toPath,
-      outcome: equal ? "equal" : "different",
-      proof,
-      downloaded: downloadedThisRound,
+    const counters = await settleIdentityMoveVerificationV2({
+      verification,
+      verifiedRemoteContentHashesById: input.verifiedRemoteContentHashesById,
+      resolveRemoteContentHash: input.resolveRemoteContentHash,
+      identityItems,
+      identityResults,
+      identityProgressTotal,
+      identityCachedEvidence,
+      identityDownloads,
+      remainingDownloadBudget,
     });
+    identityCachedEvidence = counters.identityCachedEvidence;
+    identityDownloads = counters.identityDownloads;
+    remainingDownloadBudget = counters.remainingDownloadBudget;
   }
 
   for (const replacement of identityReplacements) {
-    const pendingReceipt = pendingByPath.get(replacement.path);
-    let remoteHash = replacement.remote.sha256Hash?.toLowerCase();
-    let proof: ContentEqualityProof = remoteHash
-      ? "remoteSha256"
-      : "insufficientEvidence";
-    if (!remoteHash) {
-      remoteHash = input.verifiedRemoteContentHashesById
-        ?.get(replacement.remote.driveId)
-        ?.toLowerCase();
-      if (remoteHash) proof = "verifiedRemoteReceipt";
-    }
-    let downloadedThisRound = false;
-    if (
-      !remoteHash
-      && replacement.local
-      && contentDifferenceReceiptMatches(
-        pendingReceipt,
-        replacement.local,
-        replacement.remote,
-      )
-    ) {
-      remoteHash = pendingReceipt!.remoteHash.toLowerCase();
-      proof = "downloadedSha256";
-    }
-    if (remoteHash) {
-      identityCachedEvidence++;
-    } else if (remainingDownloadBudget > 0) {
-      remainingDownloadBudget--;
-      identityDownloads++;
-      downloadedThisRound = true;
-      try {
-        remoteHash = (
-          await input.resolveRemoteContentHash({
-            type: SyncActionType.Conflict,
-            path: replacement.path,
-            local: replacement.local,
-            remote: replacement.remote,
-            reason: "reason.identityReplacement.verificationPending",
-          }, {
-            current: identityDownloads,
-            total: identityProgressTotal,
-          })
-        ).toLowerCase();
-        proof = "downloadedSha256";
-      } catch (error) {
-        identityItems.push(identityReplacementPendingItem(replacement.path));
-        identityResults.push({
-          path: replacement.path,
-          outcome: "failed",
-          downloaded: true,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        continue;
-      }
-    } else {
-      identityItems.push(identityReplacementPendingItem(replacement.path));
-      continue;
-    }
-
-    const decision = classifyIdentityReplacementV2(
+    const counters = await settleIdentityReplacementVerificationV2({
       replacement,
-      remoteHash,
-      input.configDir,
-    );
-    if ("baseUpsert" in decision) {
-      identityBaseUpserts.push(decision.baseUpsert);
-    } else {
-      identityItems.push(decision.item);
-    }
-    identityResults.push({
-      path: replacement.path,
-      outcome: remoteHash === replacement.base.hash
-        && replacement.remote.size === replacement.base.size
-        ? "equal"
-        : "different",
-      proof,
-      downloaded: downloadedThisRound,
+      pendingByPath,
+      verifiedRemoteContentHashesById: input.verifiedRemoteContentHashesById,
+      resolveRemoteContentHash: input.resolveRemoteContentHash,
+      configDir: input.configDir,
+      identityItems,
+      identityBaseUpserts,
+      identityResults,
+      identityProgressTotal,
+      identityCachedEvidence,
+      identityDownloads,
+      remainingDownloadBudget,
     });
+    identityCachedEvidence = counters.identityCachedEvidence;
+    identityDownloads = counters.identityDownloads;
+    remainingDownloadBudget = counters.remainingDownloadBudget;
   }
 
   const candidates = items.filter((item) => {
@@ -1236,70 +1231,17 @@ export async function finalizeCanonicalPlanCandidateV2(
   const results: ContentVerificationResultV2[] = [];
 
   for (let index = 0; index < selectedCandidates.length; index++) {
-    const item = selectedCandidates[index];
-    const local = item.local!;
-    const remote = item.remote!;
-    let equality = resolveContentEquality({
-      local,
-      remote,
-      base: baseByPath.get(item.path),
-      verifiedRemoteHash: input.verifiedRemoteContentHashesById
-        ?.get(remote.driveId),
+    await settleSelectedCandidateVerificationV2({
+      index,
+      selectedCandidates,
+      baseByPath,
+      verifiedRemoteContentHashesById: input.verifiedRemoteContentHashesById,
+      prefetchedDownloadHashes,
+      resolveRemoteContentHash: input.resolveRemoteContentHash,
+      falseConflicts,
+      baseUpserts,
+      results,
     });
-    let downloadedHash: string | undefined;
-    try {
-      if (equality.status === "unknown") {
-        const prefetched = prefetchedDownloadHashes.get(item.path);
-        if (prefetched) {
-          if ("error" in prefetched) {
-            const failure = prefetched.error;
-            throw failure instanceof Error
-              ? failure
-              : new Error(String(failure));
-          }
-          downloadedHash = prefetched.hash;
-        } else {
-          downloadedHash = await input.resolveRemoteContentHash(item, {
-            current: index + 1,
-            total: selectedCandidates.length,
-          });
-        }
-        equality = resolveContentEquality({
-          local,
-          remote,
-          base: baseByPath.get(item.path),
-          downloadedHash,
-        });
-      }
-      if (equality.status === "equal") {
-        falseConflicts.add(item.path);
-        baseUpserts.push({
-          path: item.path,
-          hash: local.hash,
-          size: local.size,
-          eTag: remote.eTag,
-        });
-      } else if (downloadedHash) {
-        item.contentComparison = createContentDifferenceReceipt(
-          local,
-          remote,
-          downloadedHash,
-        );
-      }
-      results.push({
-        path: item.path,
-        outcome: equality.status === "equal" ? "equal" : "different",
-        proof: equality.proof,
-        downloaded: downloadedHash !== undefined,
-      });
-    } catch (error) {
-      results.push({
-        path: item.path,
-        outcome: "failed",
-        downloaded: downloadedHash !== undefined,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
   }
 
   if (falseConflicts.size > 0) {
@@ -1347,6 +1289,362 @@ export async function finalizeCanonicalPlanCandidateV2(
     },
     requiresThresholdConfirmation,
   };
+}
+
+/** Download-counter snapshot returned by one identity verification pass. */
+interface IdentityVerificationCountersV2 {
+  identityCachedEvidence: number;
+  identityDownloads: number;
+  remainingDownloadBudget: number;
+}
+
+/** Cached remote content hashes by drive id, as supplied by the caller. */
+type VerifiedRemoteContentHashesByIdV2 =
+  FinalizeCanonicalPlanInputV2["verifiedRemoteContentHashesById"];
+/** Budgeted content-hash download adapter, as supplied by the caller. */
+type ResolveRemoteContentHashV2 =
+  FinalizeCanonicalPlanInputV2["resolveRemoteContentHash"];
+
+/**
+ * Settle one identity move verification against the current content
+ * evidence: the recorded hash, the verified-hash lookup or one budgeted
+ * download decide equality, then the verification contributes either the
+ * public local-move action or a pending deferral plus one result entry. The
+ * caller's containers are threaded by reference; the returned counter
+ * snapshot replaces the caller's bindings.
+ */
+async function settleIdentityMoveVerificationV2(args: {
+  verification: CanonicalIdentityMoveVerificationV2;
+  verifiedRemoteContentHashesById: VerifiedRemoteContentHashesByIdV2;
+  resolveRemoteContentHash: ResolveRemoteContentHashV2;
+  identityItems: SyncPlanItem[];
+  identityResults: ContentVerificationResultV2[];
+  identityProgressTotal: number;
+  identityCachedEvidence: number;
+  identityDownloads: number;
+  remainingDownloadBudget: number;
+}): Promise<IdentityVerificationCountersV2> {
+  const {
+    verification,
+    verifiedRemoteContentHashesById,
+    resolveRemoteContentHash,
+    identityItems,
+    identityResults,
+    identityProgressTotal,
+  } = args;
+  let {
+    identityCachedEvidence,
+    identityDownloads,
+    remainingDownloadBudget,
+  } = args;
+  const counters = (): IdentityVerificationCountersV2 => ({
+    identityCachedEvidence,
+    identityDownloads,
+    remainingDownloadBudget,
+  });
+
+  let remoteHash = verification.remote.sha256Hash?.toLowerCase();
+  let proof: ContentEqualityProof = remoteHash
+    ? "remoteSha256"
+    : "insufficientEvidence";
+  if (!remoteHash) {
+    remoteHash = verifiedRemoteContentHashesById
+      ?.get(verification.remote.driveId)
+      ?.toLowerCase();
+    if (remoteHash) proof = "verifiedRemoteReceipt";
+  }
+  let downloadedThisRound = false;
+  if (remoteHash) {
+    identityCachedEvidence++;
+  } else if (remainingDownloadBudget > 0) {
+    remainingDownloadBudget--;
+    identityDownloads++;
+    downloadedThisRound = true;
+    try {
+      remoteHash = (
+        await resolveRemoteContentHash({
+          type: SyncActionType.Conflict,
+          path: verification.toPath,
+          local: verification.local,
+          remote: verification.remote,
+          reason: "reason.identityMove.verificationFailed",
+        }, {
+          current: identityDownloads,
+          total: identityProgressTotal,
+        })
+      ).toLowerCase();
+      proof = "downloadedSha256";
+    } catch (error) {
+      identityItems.push(identityMovePendingItem(
+        verification.toPath,
+        "reason.identityMove.verificationFailed",
+      ));
+      identityResults.push({
+        path: verification.toPath,
+        outcome: "failed",
+        downloaded: true,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return counters();
+    }
+  } else {
+    identityItems.push(identityMovePendingItem(
+      verification.toPath,
+      "reason.identityMove.verificationFailed",
+    ));
+    return counters();
+  }
+
+  const equal =
+    verification.local.hash === verification.base.hash
+    && verification.local.size === verification.base.size
+    && verification.remote.size === verification.base.size
+    && remoteHash === verification.base.hash;
+  if (equal) {
+    identityItems.push({
+      type: SyncActionType.MoveLocalFile,
+      path: verification.toPath,
+      renameFrom: verification.fromPath,
+      local: { ...verification.local },
+      remote: { ...verification.remote },
+    });
+  } else {
+    identityItems.push(identityMovePendingItem(
+      verification.toPath,
+      "reason.identityMove.contentChanged",
+    ));
+  }
+  identityResults.push({
+    path: verification.toPath,
+    outcome: equal ? "equal" : "different",
+    proof,
+    downloaded: downloadedThisRound,
+  });
+  return counters();
+}
+
+/**
+ * Settle one identity replacement against the current content evidence: a
+ * persisted difference receipt, the recorded hash, the verified-hash lookup
+ * or one budgeted download decide equality, then the replacement becomes a
+ * base upsert or a download/delete/conflict action. The caller's containers
+ * are threaded by reference; the returned counter snapshot replaces the
+ * caller's bindings.
+ */
+async function settleIdentityReplacementVerificationV2(args: {
+  replacement: CanonicalIdentityReplacementV2;
+  pendingByPath: ReadonlyMap<string, ContentComparisonReceiptV1 | undefined>;
+  verifiedRemoteContentHashesById: VerifiedRemoteContentHashesByIdV2;
+  resolveRemoteContentHash: ResolveRemoteContentHashV2;
+  configDir: string;
+  identityItems: SyncPlanItem[];
+  identityBaseUpserts: BaseFileEntry[];
+  identityResults: ContentVerificationResultV2[];
+  identityProgressTotal: number;
+  identityCachedEvidence: number;
+  identityDownloads: number;
+  remainingDownloadBudget: number;
+}): Promise<IdentityVerificationCountersV2> {
+  const {
+    replacement,
+    pendingByPath,
+    verifiedRemoteContentHashesById,
+    resolveRemoteContentHash,
+    configDir,
+    identityItems,
+    identityBaseUpserts,
+    identityResults,
+    identityProgressTotal,
+  } = args;
+  let {
+    identityCachedEvidence,
+    identityDownloads,
+    remainingDownloadBudget,
+  } = args;
+  const counters = (): IdentityVerificationCountersV2 => ({
+    identityCachedEvidence,
+    identityDownloads,
+    remainingDownloadBudget,
+  });
+
+  const pendingReceipt = pendingByPath.get(replacement.path);
+  let remoteHash = replacement.remote.sha256Hash?.toLowerCase();
+  let proof: ContentEqualityProof = remoteHash
+    ? "remoteSha256"
+    : "insufficientEvidence";
+  if (!remoteHash) {
+    remoteHash = verifiedRemoteContentHashesById
+      ?.get(replacement.remote.driveId)
+      ?.toLowerCase();
+    if (remoteHash) proof = "verifiedRemoteReceipt";
+  }
+  let downloadedThisRound = false;
+  if (
+    !remoteHash
+    && replacement.local
+    && contentDifferenceReceiptMatches(
+      pendingReceipt,
+      replacement.local,
+      replacement.remote,
+    )
+  ) {
+    remoteHash = pendingReceipt!.remoteHash.toLowerCase();
+    proof = "downloadedSha256";
+  }
+  if (remoteHash) {
+    identityCachedEvidence++;
+  } else if (remainingDownloadBudget > 0) {
+    remainingDownloadBudget--;
+    identityDownloads++;
+    downloadedThisRound = true;
+    try {
+      remoteHash = (
+        await resolveRemoteContentHash({
+          type: SyncActionType.Conflict,
+          path: replacement.path,
+          local: replacement.local,
+          remote: replacement.remote,
+          reason: "reason.identityReplacement.verificationPending",
+        }, {
+          current: identityDownloads,
+          total: identityProgressTotal,
+        })
+      ).toLowerCase();
+      proof = "downloadedSha256";
+    } catch (error) {
+      identityItems.push(identityReplacementPendingItem(replacement.path));
+      identityResults.push({
+        path: replacement.path,
+        outcome: "failed",
+        downloaded: true,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return counters();
+    }
+  } else {
+    identityItems.push(identityReplacementPendingItem(replacement.path));
+    return counters();
+  }
+
+  const decision = classifyIdentityReplacementV2(
+    replacement,
+    remoteHash,
+    configDir,
+  );
+  if ("baseUpsert" in decision) {
+    identityBaseUpserts.push(decision.baseUpsert);
+  } else {
+    identityItems.push(decision.item);
+  }
+  identityResults.push({
+    path: replacement.path,
+    outcome: remoteHash === replacement.base.hash
+      && replacement.remote.size === replacement.base.size
+      ? "equal"
+      : "different",
+    proof,
+    downloaded: downloadedThisRound,
+  });
+  return counters();
+}
+
+/**
+ * Settle one selected conflict candidate: reuse a prefetched hash or run the
+ * one budgeted download, then record a false-conflict base upsert, a
+ * difference receipt on the planner-owned clone, or a failed result. The
+ * caller's containers are threaded by reference and no binding is
+ * reassigned, so this phase has no value to return.
+ */
+async function settleSelectedCandidateVerificationV2(args: {
+  index: number;
+  selectedCandidates: readonly SyncPlanItem[];
+  baseByPath: ReadonlyMap<string, BaseFileEntry>;
+  verifiedRemoteContentHashesById: VerifiedRemoteContentHashesByIdV2;
+  prefetchedDownloadHashes: ReadonlyMap<
+    string,
+    { hash: string } | { error: unknown }
+  >;
+  resolveRemoteContentHash: ResolveRemoteContentHashV2;
+  falseConflicts: Set<string>;
+  baseUpserts: BaseFileEntry[];
+  results: ContentVerificationResultV2[];
+}): Promise<void> {
+  const {
+    index,
+    selectedCandidates,
+    baseByPath,
+    verifiedRemoteContentHashesById,
+    prefetchedDownloadHashes,
+    resolveRemoteContentHash,
+    falseConflicts,
+    baseUpserts,
+    results,
+  } = args;
+
+  const item = selectedCandidates[index];
+  const local = item.local!;
+  const remote = item.remote!;
+  let equality = resolveContentEquality({
+    local,
+    remote,
+    base: baseByPath.get(item.path),
+    verifiedRemoteHash: verifiedRemoteContentHashesById
+      ?.get(remote.driveId),
+  });
+  let downloadedHash: string | undefined;
+  try {
+    if (equality.status === "unknown") {
+      const prefetched = prefetchedDownloadHashes.get(item.path);
+      if (prefetched) {
+        if ("error" in prefetched) {
+          const failure = prefetched.error;
+          throw failure instanceof Error
+            ? failure
+            : new Error(String(failure));
+        }
+        downloadedHash = prefetched.hash;
+      } else {
+        downloadedHash = await resolveRemoteContentHash(item, {
+          current: index + 1,
+          total: selectedCandidates.length,
+        });
+      }
+      equality = resolveContentEquality({
+        local,
+        remote,
+        base: baseByPath.get(item.path),
+        downloadedHash,
+      });
+    }
+    if (equality.status === "equal") {
+      falseConflicts.add(item.path);
+      baseUpserts.push({
+        path: item.path,
+        hash: local.hash,
+        size: local.size,
+        eTag: remote.eTag,
+      });
+    } else if (downloadedHash) {
+      item.contentComparison = createContentDifferenceReceipt(
+        local,
+        remote,
+        downloadedHash,
+      );
+    }
+    results.push({
+      path: item.path,
+      outcome: equality.status === "equal" ? "equal" : "different",
+      proof: equality.proof,
+      downloaded: downloadedHash !== undefined,
+    });
+  } catch (error) {
+    results.push({
+      path: item.path,
+      outcome: "failed",
+      downloaded: downloadedHash !== undefined,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 function classifyIdentityReplacementV2(

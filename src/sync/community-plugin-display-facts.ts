@@ -1,3 +1,4 @@
+import { compareText } from "./compare-text";
 import {
   communityPluginManifestObservationMatchesRemote,
   createCommunityPluginManifestObservation,
@@ -138,7 +139,7 @@ export async function ensureCommunityPluginDisplayFacts(
     if (left.freshlyAppeared !== right.freshlyAppeared) {
       return left.freshlyAppeared ? -1 : 1;
     }
-    return comparePluginIds(left.entry.pluginId, right.entry.pluginId);
+    return compareText(left.entry.pluginId, right.entry.pluginId);
   });
 
   let probed = 0;
@@ -198,7 +199,7 @@ export async function ensureCommunityPluginDisplayFacts(
 
   if (added.length > 0) {
     const merged = [...input.storedObservations, ...added].sort((left, right) =>
-      comparePluginIds(left.pluginId, right.pluginId)
+      compareText(left.pluginId, right.pluginId)
     );
     await input.persist(merged);
   }
@@ -222,12 +223,8 @@ export function mergeCommunityPluginManifestObservations(
   const merged = [
     ...stored.filter((item) => !incomingIds.has(item.pluginId)),
     ...incoming,
-  ].sort((left, right) => comparePluginIds(left.pluginId, right.pluginId));
+  ].sort((left, right) => compareText(left.pluginId, right.pluginId));
   return merged;
-}
-
-function comparePluginIds(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function toRemoteFileEntry(

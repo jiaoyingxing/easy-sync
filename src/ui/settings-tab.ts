@@ -535,7 +535,6 @@ export class EasySyncSettingTab extends PluginSettingTab {
               const confirmed = await new ConfirmModal(
                 this.plugin.app,
                 t("settings.reset.confirmTitle"),
-                null,
                 t("settings.reset.confirm"),
                 t("confirm.cancel"),
                 t,
@@ -921,7 +920,6 @@ export function buildSettingDefinitions(
                   const confirmed = await new ConfirmModal(
                     plugin.app,
                     t("settings.reset.confirmTitle"),
-                    null,
                     t("settings.reset.confirm"),
                     t("confirm.cancel"),
                     t,
