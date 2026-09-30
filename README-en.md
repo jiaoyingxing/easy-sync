@@ -21,21 +21,19 @@
   </a>
 </p>
 
-I built EasySync so that anyone can solve their Obsidian sync problem with ease: initial setup takes only 2 minutes. If you're still using Remotely Save with OneDrive, give EasySync a try.
+EasySync keeps your Obsidian vault in sync across computers, phones, and tablets.
 
-EasySync is a next-generation two-way sync plugin built on OneDrive — sign in with your OneDrive account, and your vault stays in sync across computers, phones, and tablets. Conflicts stay under your control, mobile runs smoothly, and notes and settings each have their own sync switches. Supports Windows, macOS, Linux, iOS, and Android.
+## ⚠️ Read this first
 
-| Feature | Details |
-| --- | --- |
-| 🔍 Judges by content, not by time | Every file gets a SHA-256 content fingerprint, and only real content changes count — old files copied back, edits made on another device, or system clock jumps can't fool it, so your notes are almost never overwritten by mistake. |
-| ⚖️ Conflicts are yours to decide | When the same note was edited on two devices, EasySync never picks one and overwrites the other: both versions are shown side by side with the differences highlighted, and you decide which to keep. |
-| 👀 The whole picture at a glance | Failed items, conflicts waiting for you, and files skipped for being too large are all listed in the sidebar — not just a notice that disappears in a few seconds. |
-| 🎛️ You choose what syncs | Notes and attachments sync by default; editor settings, appearance, themes, hotkeys, core plugins, community plugins, and plugin data each have their own switch. |
-| 🛡️ Quietly protecting your data | Hashes are recomputed before upload to confirm nothing changed along the way; downloads are verified before replacing local files; after an interruption, syncing resumes from completed progress; remote deletions never touch your local files by default — they are handed to you for confirmation first. |
-| ☁️ Your data stays in your own OneDrive | Connects directly to Microsoft's official APIs with no third-party relay server; no telemetry, no ads, and the source code is published on GitHub. |
+1. **Don't mix it with other sync methods.** Don't put your vault inside a cloud-synced folder such as iCloud or the OneDrive client, and don't let other sync tools such as Obsidian Sync or Remotely Save manage the same vault. When two sync programs change the same files, they conflict with each other — files can even end up deleted, re-uploaded, and deleted again in a loop. Keep your vault in a plain local folder and let EasySync be the only tool managing it.
+2. **Set up every device separately.** Setting it up on one device doesn't make sync work everywhere: on each device you need to install EasySync, sign in to the same OneDrive account, configure its own settings, and run the sync.
+3. **You don't need the OneDrive app.** The plugin connects to your OneDrive account directly — installing EasySync and signing in is all it takes; it doesn't rely on the OneDrive client.
+4. **Use the same vault name on every device.** EasySync identifies the sync scope by vault name; vaults with different names are treated as two unrelated vaults and never sync with each other.
+5. **Run the first sync on the device with the most complete content, review the sync plan the plugin shows, and confirm it before continuing; your other devices can then sync and pull down everything.** The first sync builds the baseline and is slower than everyday syncs — that's normal.
 
 ## Table of contents
 
+- [⚠️ Read this first](#-read-this-first)
 - [1. Quick start](#1-quick-start)
 - [2. Data and privacy](#2-data-and-privacy)
 - [3. Configuration and sync scope](#3-configuration-and-sync-scope)
@@ -114,7 +112,7 @@ The `files` directory contains the vault files included in sync, and you can bro
 
 ### 2.2 How data is transferred
 
-Synced files stay in your own OneDrive account. EasySync connects directly to Microsoft sign-in and Microsoft Graph with no third-party relay, and its sync paths are limited to the app folder `Apps/EasySync/`.
+Synced files stay in your own OneDrive account. EasySync connects directly to Microsoft sign-in and Microsoft Graph with no third-party relay, and its sync paths are limited to the app folder `Apps/EasySync/`. Every upload recomputes each file's content hash to confirm nothing changed in transit, and downloads are verified before overwriting local files.
 
 The current Microsoft permissions are:
 
