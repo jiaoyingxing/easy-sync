@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import * as obsidian from "obsidian";
 import { getEasySyncPaths } from "../src/obsidian-compat";
-import { OneDriveClient } from "../src/onedrive/client";
+import { OneDriveClient, classifyRemotelySaveVaultChildren } from "../src/onedrive/client";
 import { UPLOAD_CHUNK_SLOW_BYTES } from "../src/onedrive/upload-session-policy";
 import {
   type DriveItem,
@@ -2914,6 +2914,247 @@ describe("OneDriveClient.moveItemById", () => {
   });
 });
 
+describe("OneDriveClient.detectRemotelySaveRepository", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  function mockDetectionPages(
+    vaultDirName: string,
+    vaultDirChildren: DriveItem[] = [],
+  ): void {
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (input) => {
+      const options = input as { url: string; method?: string };
+      const url = options.url;
+      if (url.includes("/me/drive/root/children")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { value: [{ id: "apps-id", name: "应用", folder: {} }] },
+        };
+      }
+      if (url.includes("/drive/items/apps-id/children")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            value: [
+              { id: "es-id", name: "EasySync", folder: {}, parentReference: { id: "apps-id" } },
+              { id: "rs-id", name: "remotely-save", folder: {}, parentReference: { id: "apps-id" } },
+            ],
+          },
+        };
+      }
+      if (url.includes("/drive/items/rs-id/children")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            value: [
+              {
+                id: "vault-dir-id",
+                name: vaultDirName,
+                folder: {},
+                parentReference: { driveId: "drive-1", id: "rs-id" },
+              },
+            ],
+          },
+        };
+      }
+      if (url.includes("/drive/items/vault-dir-id/children")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { value: vaultDirChildren },
+        };
+      }
+      throw new Error(`unexpected request: ${url}`);
+    });
+  }
+
+  it("finds a paired repository through a localized Apps container", async () => {
+    mockDetectionPages("我的笔记");
+    const client = new OneDriveClient(async () => "token");
+    await expect(client.detectRemotelySaveRepository("我的笔记"))
+      .resolves.toEqual({
+        driveId: "drive-1",
+        appsContainerId: "apps-id",
+        remotelySaveDirId: "rs-id",
+        vaultDirId: "vault-dir-id",
+      });
+  });
+
+  it("still finds a repository whose vault directory holds ordinary plaintext files", async () => {
+    mockDetectionPages("我的笔记", [
+      {
+        id: "meta-id",
+        name: "_remotely-save-metadata-on-remote.json",
+        parentReference: { id: "vault-dir-id" },
+      },
+      { id: "note-id", name: "欢迎.md", parentReference: { id: "vault-dir-id" } },
+      { id: "dir-id", name: "日记", folder: {}, parentReference: { id: "vault-dir-id" } },
+    ]);
+    const client = new OneDriveClient(async () => "token");
+    await expect(client.detectRemotelySaveRepository("我的笔记"))
+      .resolves.toEqual({
+        driveId: "drive-1",
+        appsContainerId: "apps-id",
+        remotelySaveDirId: "rs-id",
+        vaultDirId: "vault-dir-id",
+      });
+  });
+
+  it("treats an end-to-end encrypted remote as absent so the adoption offer stays hidden", async () => {
+    mockDetectionPages("我的笔记", [
+      {
+        id: "meta-id",
+        name: "_remotely-save-metadata-on-remote.bin",
+        parentReference: { id: "vault-dir-id" },
+      },
+      {
+        id: "cipher-1",
+        name: "KuR2xWfZbQhPn9sTaVcLmD8gY0jE1oHrAiNpT3uXw5zB7dC4fG6hJ8kM0nP2qR4s",
+        parentReference: { id: "vault-dir-id" },
+      },
+      {
+        id: "cipher-2",
+        name: "pZ3vN7xDk1sLq9WbHcT2yFgJ5mR0uE8oAi4SdXw6zBnC3fV7hJ9kL1mN3pQ5rTt",
+        parentReference: { id: "vault-dir-id" },
+      },
+    ]);
+    const client = new OneDriveClient(async () => "token");
+    await expect(client.detectRemotelySaveRepository("我的笔记")).resolves.toBeNull();
+  });
+
+  it("returns null when no known Apps container exists at the drive root", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: { value: [{ id: "docs-id", name: "文档", folder: {} }] },
+    });
+    const client = new OneDriveClient(async () => "token");
+    await expect(client.detectRemotelySaveRepository("我的笔记")).resolves.toBeNull();
+  });
+
+  it("returns null when the vault directory name does not exactly match", async () => {
+    mockDetectionPages("我的笔记-old");
+    const client = new OneDriveClient(async () => "token");
+    await expect(client.detectRemotelySaveRepository("我的笔记")).resolves.toBeNull();
+  });
+
+  it("gives up with null when the root listing exceeds the page budget", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: {
+        value: [{ id: "x-id", name: "n", folder: {} }],
+        "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/drive/root/children?$top=200&$select=id,name,folder&$skiptoken=abc",
+      },
+    });
+    const client = new OneDriveClient(async () => "token");
+    await expect(client.detectRemotelySaveRepository("我的笔记")).resolves.toBeNull();
+  });
+});
+
+describe("classifyRemotelySaveVaultChildren", () => {
+  const file = (name: string): DriveItem => ({ id: name, name });
+  const folder = (name: string): DriveItem => ({ id: name, name, folder: {} });
+
+  it("keeps a directory with ordinary extensions plain", () => {
+    expect(classifyRemotelySaveVaultChildren([
+      file("_remotely-save-metadata-on-remote.json"),
+      file("欢迎.md"),
+      folder("日记"),
+    ])).toBe("plain");
+  });
+
+  it("marks extensionless cipher tokens as encrypted", () => {
+    expect(classifyRemotelySaveVaultChildren([
+      file("_remotely-save-metadata-on-remote.bin"),
+      file("KuR2xWfZbQhPn9sTaVcLmD8gY0jE1oHrAiNpT3uXw5zB7dC4fG6hJ8kM0nP2qR4s"),
+      file("pZ3vN7xDk1sLq9WbHcT2yFgJ5mR0uE8oAi4SdXw6zBnC3fV7hJ9kL1mN3pQ5rTt"),
+    ])).toBe("encrypted");
+  });
+
+  it("ignores Remotely Save metadata files when classifying", () => {
+    expect(classifyRemotelySaveVaultChildren([
+      file("_remotely-save-metadata-on-remote.json"),
+      file("_remotely-save-metadata-on-remote.bin"),
+    ])).toBe("plain");
+  });
+
+  it("keeps a file-less listing plain because it cannot be classified", () => {
+    expect(classifyRemotelySaveVaultChildren([folder("日记")])).toBe("plain");
+    expect(classifyRemotelySaveVaultChildren([])).toBe("plain");
+  });
+
+  it("stays plain when any file still carries a meaningful extension", () => {
+    expect(classifyRemotelySaveVaultChildren([
+      file("KuR2xWfZbQhPn9sTaVcLmD8gY0jE1oHrAiNp"),
+      file("唯一笔记.md"),
+    ])).toBe("plain");
+  });
+
+  it("stays plain when no file matches the cipher name shape", () => {
+    expect(classifyRemotelySaveVaultChildren([
+      file("LICENSE"),
+      file("Makefile"),
+    ])).toBe("plain");
+  });
+});
+
+describe("OneDriveClient.copyItemById", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("waits for the copied item to appear in the destination", async () => {
+    let childrenCalls = 0;
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (input) => {
+      const options = input as { url: string; method?: string };
+      if (options.method === "POST" && options.url.includes("/copy")) {
+        return { status: 202, headers: { location: "https://contoso.sharepoint.com/_api/v2.0/monitor/1" }, json: null };
+      }
+      if (options.method === "GET" && options.url.includes("/drive/items/dest-id/children")) {
+        childrenCalls++;
+        return childrenCalls === 1
+          ? { status: 200, headers: {}, json: { value: [] } }
+          : {
+              status: 200,
+              headers: {},
+              json: {
+                value: [
+                  { id: "copied-id", name: "new.md", parentReference: { id: "dest-id" } },
+                ],
+              },
+            };
+      }
+      throw new Error(`unexpected request: ${options.method} ${options.url}`);
+    });
+    const client = new OneDriveClient(async () => "token");
+    const item = await client.copyItemById("src-id", "dest-id", "new.md", {
+      timeoutMs: 5_000,
+      pollIntervalMs: 1,
+    });
+    expect(item.id).toBe("copied-id");
+    expect(childrenCalls).toBe(2);
+  });
+
+  it("fails closed when the copy never lands in the destination", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (input) => {
+      const options = input as { url: string; method?: string };
+      if (options.method === "POST" && options.url.includes("/copy")) {
+        return { status: 202, headers: {}, json: null };
+      }
+      if (options.method === "GET" && options.url.includes("/drive/items/dest-id/children")) {
+        return { status: 200, headers: {}, json: { value: [] } };
+      }
+      throw new Error(`unexpected request: ${options.method} ${options.url}`);
+    });
+    const client = new OneDriveClient(async () => "token");
+    await expect(client.copyItemById("src-id", "dest-id", "new.md", {
+      timeoutMs: 40,
+      pollIntervalMs: 5,
+    })).rejects.toMatchObject({ type: OneDriveErrorType.ServerError });
+  });
+});
+
 describe("OneDriveClient.listFolderChildrenById", () => {
   afterEach(() => vi.restoreAllMocks());
 
@@ -4881,6 +5122,51 @@ describe("OneDriveClient folder identity mutations", () => {
 
     await expect(client.createFolderByParentId("parent-id", "New Folder"))
       .rejects.toThrow("metadata is incomplete or mismatched");
+  });
+
+  it("records the request method when a folder create hits a 409 conflict", async () => {
+    const diag = { log: vi.fn(), warn: vi.fn() };
+    // Host error path shape (verified against the app bundle): status and
+    // headers only — the response body is discarded by the host.
+    vi.spyOn(obsidian, "requestUrl").mockRejectedValueOnce({
+      status: 409,
+      headers: {},
+    });
+    const client = new OneDriveClient(async () => "token", diag as never);
+
+    await expect(client.createFolderByParentId("parent-id", "Jack Knowledge"))
+      .rejects.toMatchObject({
+        type: OneDriveErrorType.Conflict,
+        statusCode: 409,
+      });
+
+    expect(diag.log).toHaveBeenCalledWith(
+      "onedrive",
+      expect.stringContaining("requestUrl 409 — method=POST, "),
+    );
+  });
+
+  it("records the method and the host body-visibility contract on an HTTP error without a body", async () => {
+    const diag = { log: vi.fn(), warn: vi.fn() };
+    vi.spyOn(obsidian, "requestUrl").mockRejectedValueOnce({
+      status: 400,
+      headers: {},
+    });
+    const client = new OneDriveClient(async () => "token", diag as never);
+
+    await expect(client.createFolderByParentId("parent-id", "New Folder"))
+      .rejects.toMatchObject({
+        type: OneDriveErrorType.Unknown,
+        statusCode: 400,
+      });
+
+    expect(diag.warn).toHaveBeenCalledWith(
+      "onedrive",
+      expect.stringContaining(
+        "requestUrl HTTP error — method=POST, status=400, graphCode=none, graphMsg=none, responseBody=not exposed on requestUrl error path",
+      ),
+      undefined,
+    );
   });
 });
 

@@ -23,6 +23,9 @@ import type {
 } from "../src/sync/types";
 import { SyncActionType } from "../src/sync/types";
 import {
+  IndexedDbRemoteScopeRecoveryEvidenceStore,
+} from "../src/sync/remote-scope-recovery-evidence-store";
+import {
   StateV2IndexedDbActiveStore,
   stateV2ActiveIndexedDbDatabaseName,
 } from "../src/sync/state-v2-indexeddb-active";
@@ -143,6 +146,11 @@ function makeHarness(input?: {
   indexedDbActive?: boolean;
   indexedDbVaultInstanceId?: string;
   readIndexedDbVaultInstanceId?: () => string | null;
+  rotateIndexedDbVaultInstanceId?: () => string | null;
+  diag?: PluginDataStore["diag"];
+  createRemoteScopeRecoveryEvidenceStore?: NonNullable<
+    PluginDataStore["createRemoteScopeRecoveryEvidenceStore"]
+  >;
   indexedDbFactory?: NonNullable<
     PluginDataStore["createStateV2IndexedDbActiveStore"]
   >;
@@ -255,24 +263,44 @@ function makeHarness(input?: {
     })),
   };
   const adapter = rawAdapter as unknown as DataAdapter;
+  // The captured Vault instance identity lives in one mutable holder so a
+  // reset-time rotation can move storage, the captured property and the live
+  // reader together, mirroring the plugin onload capture.
+  const vaultInstanceId = {
+    id: input?.indexedDbVaultInstanceId ?? "1".repeat(32),
+  };
   const plugin: PluginDataStore = {
     loadData: vi.fn(async () => pluginData),
     updatePluginData: vi.fn(async (mutator) => mutator(pluginData)),
     app: { vault: { adapter, configDir: ".obsidian" } },
     manifest: { id: "easy-sync", dir: paths.pluginDir },
+    ...(input?.diag ? { diag: input.diag } : {}),
     ...(input?.indexedDbFactory || input?.indexedDbActive
       ? {
-          indexedDbVaultInstanceId:
-            input.indexedDbVaultInstanceId ?? "1".repeat(32),
+          indexedDbVaultInstanceId: vaultInstanceId.id,
           readIndexedDbVaultInstanceId:
-            input.readIndexedDbVaultInstanceId
-            ?? (() => input.indexedDbVaultInstanceId ?? "1".repeat(32)),
+            input.readIndexedDbVaultInstanceId ?? (() => vaultInstanceId.id),
           createStateV2IndexedDbActiveStore:
             input.indexedDbFactory ?? ((databaseId, recovery) =>
               new StateV2IndexedDbActiveStore(databaseId, recovery)),
         }
       : {}),
   };
+  if (input?.createRemoteScopeRecoveryEvidenceStore) {
+    plugin.createRemoteScopeRecoveryEvidenceStore =
+      input.createRemoteScopeRecoveryEvidenceStore;
+  }
+  if (input?.rotateIndexedDbVaultInstanceId) {
+    const generateRotatedId = input.rotateIndexedDbVaultInstanceId;
+    plugin.rotateIndexedDbVaultInstanceId = () => {
+      const rotated = generateRotatedId();
+      if (rotated) {
+        vaultInstanceId.id = rotated;
+        plugin.indexedDbVaultInstanceId = rotated;
+      }
+      return rotated;
+    };
+  }
   return {
     files,
     folders,
@@ -1643,6 +1671,245 @@ describe("StateManager V2 production controller", () => {
       await state.close();
       if (databaseId) {
         await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
+  it("orphans an engine-unreadable IndexedDB database by rotating the Vault instance identity and still completes reset", async () => {
+    const deleteAttempts: string[] = [];
+    let corruptedDatabaseId: string | null = null;
+    const harness = makeHarness({
+      indexedDbActive: true,
+      pluginData: {
+        "easy-sync-bound-account": scope.accountId,
+        "sync-interval": 15,
+      },
+      diag: { warn: vi.fn() },
+      rotateIndexedDbVaultInstanceId: () => "2".repeat(32),
+      indexedDbFactory: (databaseId, recovery) => {
+        const store = new StateV2IndexedDbActiveStore(databaseId, recovery);
+        const originalDelete = store.delete.bind(store);
+        return Object.assign(store, {
+          delete: async (): Promise<void> => {
+            deleteAttempts.push(databaseId);
+            if (databaseId === corruptedDatabaseId) {
+              throw new Error("UnknownError: Internal error.");
+            }
+            await originalDelete();
+          },
+        });
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    try {
+      await state.load();
+      corruptedDatabaseId =
+        state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+      expect(corruptedDatabaseId).not.toBe("");
+
+      await expect(state.reset()).resolves.toBeUndefined();
+
+      // The Vault instance identity rotated in storage and in the plugin's
+      // captured binding, so the identity stays usable after the reset.
+      expect(harness.plugin.indexedDbVaultInstanceId).toBe("2".repeat(32));
+      expect(harness.plugin.readIndexedDbVaultInstanceId?.())
+        .toBe("2".repeat(32));
+
+      // The unreadable database was attempted exactly once and then orphaned
+      // in place: never deleted again, never selected again.
+      expect(deleteAttempts).toEqual([corruptedDatabaseId]);
+      expect((await indexedDB.databases()).map((entry) => entry.name))
+        .toContain(stateV2ActiveIndexedDbDatabaseName(corruptedDatabaseId));
+
+      // The remaining cleanup still finished: witness and manifest artifacts
+      // are gone, the reload after reset lands fresh and the plugin data is
+      // zeroed.
+      expect(harness.files.has(paths.stateV2ManifestFile)).toBe(false);
+      expect(harness.files.has(paths.stateV2AuthorityWitnessFile)).toBe(false);
+      expect(state.isV2StateActive).toBe(false);
+      expect(state.v2StateLoadRecoveryBlock).toBeNull();
+      expect(state.boundAccountId).toBe("");
+      expect(state.remoteGeneration).toBe(0);
+
+      // The rotation left a diagnostic account with old and new ids.
+      expect(harness.plugin.diag?.warn).toHaveBeenCalledWith(
+        "state",
+        expect.stringContaining("rotating the Vault instance identity"),
+        expect.objectContaining({
+          trigger: "v2-active-state-delete",
+          previousInstanceId: "1".repeat(32),
+          newInstanceInstanceId: "2".repeat(32),
+        }),
+      );
+    } finally {
+      await state.close();
+      for (const id of [corruptedDatabaseId, "2".repeat(32)]) {
+        if (id) {
+          await deleteDB(stateV2ActiveIndexedDbDatabaseName(id)).catch(
+            () => undefined,
+          );
+        }
+      }
+    }
+  });
+
+  it("does not rotate the Vault instance identity when reset succeeds on a healthy IndexedDB store", async () => {
+    const deleteAttempts: string[] = [];
+    const harness = makeHarness({
+      indexedDbActive: true,
+      diag: { warn: vi.fn() },
+      rotateIndexedDbVaultInstanceId: () => "2".repeat(32),
+      indexedDbFactory: (databaseId, recovery) => {
+        const store = new StateV2IndexedDbActiveStore(databaseId, recovery);
+        const originalDelete = store.delete.bind(store);
+        return Object.assign(store, {
+          delete: async (): Promise<void> => {
+            deleteAttempts.push(databaseId);
+            await originalDelete();
+          },
+        });
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    let databaseId = "";
+    try {
+      await state.load();
+      databaseId = state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+      expect(databaseId).not.toBe("");
+
+      await expect(state.reset()).resolves.toBeUndefined();
+
+      // A healthy database is deleted normally: no rotation, no orphan, no
+      // rotation diagnostic.
+      expect(harness.plugin.indexedDbVaultInstanceId).toBe("1".repeat(32));
+      expect(harness.plugin.readIndexedDbVaultInstanceId?.())
+        .toBe("1".repeat(32));
+      expect(deleteAttempts).toEqual([databaseId]);
+      expect((await indexedDB.databases()).map((entry) => entry.name))
+        .not.toContain(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      expect(harness.plugin.diag?.warn).not.toHaveBeenCalled();
+    } finally {
+      await state.close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId)).catch(
+          () => undefined,
+        );
+      }
+    }
+  });
+
+  it("keeps reset usable on the rotated identity after an orphaning rescue", async () => {
+    const deleteAttempts: string[] = [];
+    let corruptedDatabaseId: string | null = null;
+    const harness = makeHarness({
+      indexedDbActive: true,
+      diag: { warn: vi.fn() },
+      rotateIndexedDbVaultInstanceId: () => "2".repeat(32),
+      indexedDbFactory: (databaseId, recovery) => {
+        const store = new StateV2IndexedDbActiveStore(databaseId, recovery);
+        const originalDelete = store.delete.bind(store);
+        return Object.assign(store, {
+          delete: async (): Promise<void> => {
+            deleteAttempts.push(databaseId);
+            if (databaseId === corruptedDatabaseId) {
+              throw new Error("UnknownError: Internal error.");
+            }
+            await originalDelete();
+          },
+        });
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    try {
+      await state.load();
+      corruptedDatabaseId =
+        state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+      await state.reset();
+      expect(harness.plugin.indexedDbVaultInstanceId).toBe("2".repeat(32));
+
+      // Re-establish a fresh V2 authority under the rotated identity: the
+      // normal load selects a brand-new database, not the orphaned one.
+      harness.files.set(paths.stateV2ManifestFile, JSON.stringify(manifest()));
+      harness.files.set(paths.stateV2File, JSON.stringify(envelope()));
+      await state.load();
+
+      const secondDatabaseId =
+        state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+      expect(secondDatabaseId).not.toBe("");
+      expect(secondDatabaseId).not.toBe(corruptedDatabaseId);
+      expect(state.v2StateLoadRecoveryBlock).toBeNull();
+
+      await expect(state.reset()).resolves.toBeUndefined();
+
+      expect(harness.plugin.indexedDbVaultInstanceId).toBe("2".repeat(32));
+      expect(deleteAttempts).toEqual([
+        corruptedDatabaseId,
+        secondDatabaseId,
+      ]);
+      expect(state.isV2StateActive).toBe(false);
+      expect(state.v2StateLoadRecoveryBlock).toBeNull();
+    } finally {
+      await state.close();
+      for (const id of [corruptedDatabaseId, "2".repeat(32)]) {
+        if (id) {
+          await deleteDB(stateV2ActiveIndexedDbDatabaseName(id)).catch(
+            () => undefined,
+          );
+        }
+      }
+    }
+  });
+
+  it("orphans the remote-scope evidence store and rotates when its delete fails during reset", async () => {
+    const evidenceDeleteAttempts: string[] = [];
+    const harness = makeHarness({
+      indexedDbActive: true,
+      diag: { warn: vi.fn() },
+      rotateIndexedDbVaultInstanceId: () => "2".repeat(32),
+      createRemoteScopeRecoveryEvidenceStore: (vaultInstanceId) => {
+        const store = new IndexedDbRemoteScopeRecoveryEvidenceStore(
+          vaultInstanceId,
+        );
+        return Object.assign(store, {
+          delete: async (): Promise<void> => {
+            evidenceDeleteAttempts.push(vaultInstanceId);
+            throw new Error("UnknownError: Internal error.");
+          },
+        });
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    try {
+      await state.load();
+      expect(state.activeV2StorageAuthorityEvidence.databaseId ?? "").not.toBe(
+        "",
+      );
+
+      await expect(state.reset()).resolves.toBeUndefined();
+
+      // The evidence delete failed once, the rescue rotated once, and the
+      // remaining file-level cleanup still finished.
+      expect(evidenceDeleteAttempts).toEqual(["1".repeat(32)]);
+      expect(harness.plugin.indexedDbVaultInstanceId).toBe("2".repeat(32));
+      expect(state.isV2StateActive).toBe(false);
+      expect(state.v2StateLoadRecoveryBlock).toBeNull();
+      expect(harness.files.has(paths.stateV2AuthorityWitnessFile)).toBe(false);
+      expect(harness.plugin.diag?.warn).toHaveBeenCalledWith(
+        "state",
+        expect.stringContaining("rotating the Vault instance identity"),
+        expect.objectContaining({
+          trigger: "remote-scope-evidence-delete",
+        }),
+      );
+    } finally {
+      await state.close();
+      for (const id of ["1".repeat(32), "2".repeat(32)]) {
+        await deleteDB(
+          `easy-sync:scope-recovery:${id}`,
+        ).catch(() => undefined);
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(id)).catch(
+          () => undefined,
+        );
       }
     }
   });

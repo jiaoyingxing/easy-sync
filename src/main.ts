@@ -57,6 +57,7 @@ import {
 import {
   loadOrCreateIndexedDbVaultInstanceId,
   readIndexedDbVaultInstanceId,
+  rotateIndexedDbVaultInstanceId,
 } from "./sync/indexeddb-vault-namespace";
 import {
   classifyRetryableObservationResult,
@@ -104,6 +105,9 @@ import {
   type RibbonStatus,
 } from "./ui/ribbon-status";
 import { ConfirmModal, SyncPlanAlertModal } from "./ui/confirm-modal";
+import { RsMigrationOfferModal } from "./ui/rs-migration-offer-modal";
+import { RsMigrationFailureModal } from "./ui/rs-migration-failure-modal";
+import { runRsMigrationTransaction } from "./sync/rs-migration-transaction";
 import { ScopeCrossingPromptModal } from "./ui/scope-crossing-prompt-modal";
 import type {
   MutationRecoveryBlockReason,
@@ -297,6 +301,38 @@ const KEY_COMMUNITY_PLUGIN_SYNC_POLICY = "community-plugin-sync-policy";
 const KEY_SYNC_EXCLUDED_FOLDERS = "sync-excluded-folders";
 const KEY_AUTO_SYNC_PAUSED = "auto-sync-paused";
 const KEY_LAST_RESET_FACTS = "last-reset-facts";
+const KEY_RS_ADOPTION_MARKER = "rs-adoption-marker";
+
+/** Device-local memory that the confirmed adoption transaction has already
+ *  placed the foreign vault content into this vault's files/ root, so fresh
+ *  activations keep seeding identical-content baselines until the V2
+ *  authority commits. Never a sync authority; survives reset on purpose
+ *  (the adopted content stays in the cloud folder). */
+export interface RsAdoptionMarker {
+  vaultName: string;
+  sourceVaultDirId: string;
+  strategy: "moved" | "copied";
+  completedAt: number;
+}
+
+function parseRsAdoptionMarker(value: unknown): RsAdoptionMarker | null {
+  if (typeof value !== "object" || value === null) return null;
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.vaultName !== "string"
+    || candidate.vaultName.length === 0
+    || typeof candidate.sourceVaultDirId !== "string"
+    || candidate.sourceVaultDirId.length === 0
+    || (candidate.strategy !== "moved" && candidate.strategy !== "copied")
+    || typeof candidate.completedAt !== "number"
+  ) return null;
+  return {
+    vaultName: candidate.vaultName,
+    sourceVaultDirId: candidate.sourceVaultDirId,
+    strategy: candidate.strategy,
+    completedAt: candidate.completedAt,
+  };
+}
 const KEY_LEGACY_AUTO_MERGE = "sync-auto-merge";
 const KEY_AUTOMATIC_HANDLING_POLICY = "sync-auto-conflict-policy";
 const KEY_NOTIFICATION_POPUPS = "notification-popups";
@@ -699,6 +735,7 @@ export default class EasySyncPlugin extends Plugin {
   diagLogEnabled = false;
   autoSyncPaused = false;
   lastResetFacts: DiagnosticResetFacts | null = null;
+  rsAdoptionMarker: RsAdoptionMarker | null = null;
   notificationPopups: EasySyncNotificationPopupsLevel = "all";
   private opLock: string | null = null;
   private vaultCloudClientNoticeShown = false;
@@ -993,7 +1030,7 @@ export default class EasySyncPlugin extends Plugin {
 
     // ════ ③ Scanner + state (no state load yet) ════
 
-    const indexedDbVaultInstanceId =
+    let indexedDbVaultInstanceId =
       loadOrCreateIndexedDbVaultInstanceId(this.app);
     if (!indexedDbVaultInstanceId) {
       this.diag.warn(
@@ -1008,18 +1045,36 @@ export default class EasySyncPlugin extends Plugin {
       app: this.app,
       layoutMigrationStorage: this.app,
       manifest: this.manifest,
+      // Read live instead of a construction-time snapshot: a reset-time
+      // rotation (orphaned unreadable IndexedDB storage) must keep the
+      // captured identity and the live read in agreement.
+      get indexedDbVaultInstanceId() {
+        return indexedDbVaultInstanceId ?? undefined;
+      },
       ...(indexedDbVaultInstanceId
         ? {
-            indexedDbVaultInstanceId,
             readIndexedDbVaultInstanceId: () =>
               readIndexedDbVaultInstanceId(this.app),
-            createPublic113IndexedDbCandidateStore: (sourceStateDigest) =>
-              new IndexedDbPublic113StateStore(
+            rotateIndexedDbVaultInstanceId: () => {
+              const rotated = rotateIndexedDbVaultInstanceId(this.app);
+              if (rotated) indexedDbVaultInstanceId = rotated;
+              return rotated;
+            },
+            createPublic113IndexedDbCandidateStore: (sourceStateDigest) => {
+              // The identity is non-null inside this branch; the guard keeps
+              // the fail-closed contract for any future reordering.
+              if (!indexedDbVaultInstanceId) {
+                throw new Error(
+                  "IndexedDB Vault instance identity is unavailable",
+                );
+              }
+              return new IndexedDbPublic113StateStore(
                 public113IndexedDbDatabaseName(
                   indexedDbVaultInstanceId,
                   sourceStateDigest,
                 ),
-              ),
+              );
+            },
             createStateV2IndexedDbActiveStore: (databaseId, recovery) =>
               new StateV2IndexedDbActiveStore(databaseId, recovery),
             createRemoteScopeRecoveryEvidenceStore: (vaultInstanceId) =>
@@ -1031,8 +1086,16 @@ export default class EasySyncPlugin extends Plugin {
     // be due to stale auth scope and are no longer predictive.
     authCtx.onFreshLogin = () => {
       void this.state!.resetCircuitBreakers().catch((error) => {
-        this.diag.warn("state", "failed to reset circuit breakers after fresh login", error);
+        // The diagnostic report serializes a raw Error as `{}` (F14).
+        this.diag.warn(
+          "state",
+          "failed to reset circuit breakers after fresh login",
+          error instanceof Error
+            ? `${error.name}: ${error.message}`
+            : String(error),
+        );
       });
+      void this.offerRsMigrationNoticeAfterFreshLogin();
     };
     // Loaded in the background after UI registration so Ribbon state is accurate.
 
@@ -2071,6 +2134,12 @@ export default class EasySyncPlugin extends Plugin {
         );
     const runOptions: SyncRunOptions = {
       ...(request.options ?? {}),
+      // The durable adoption marker (not just the offer-round option) drives
+      // seeding on EVERY round until authority commits — review confirm and
+      // resume rounds must re-derive the exact reviewed plan (anchors
+      // included) or the drift guard would correctly re-stage instead of
+      // executing.
+      ...(this.rsAdoptionMarker ? { rsAdoptionPending: true } : {}),
       ...(preparedCommunityPluginJoins.authorizations.length > 0
         ? {
             communityPluginJoinAuthorizations:
@@ -2134,6 +2203,34 @@ export default class EasySyncPlugin extends Plugin {
       }
       break;
     } while (true as boolean);
+    if (
+      this.rsAdoptionMarker
+      && this.state?.isV2StateActive === true
+    ) {
+      // The adoption choice is baked into the committed V2 authority; the
+      // device-local marker has served its purpose.
+      this.rsAdoptionMarker = null;
+      await this.updatePluginData((data) => {
+        delete data[KEY_RS_ADOPTION_MARKER];
+      });
+      this.diag.log(
+        "state",
+        "Remotely Save adoption marker cleared after authority commit",
+        { mutations: 0 },
+      );
+      // Journey 幕4: the adoption has been digested by the authority — this
+      // is the one correct moment for the completion reminder. Sent on an
+      // 8s delay because the round-result notice (shown by handleSyncResult
+      // right after this funnel returns) always preempts an immediate show.
+      compatSetTimeout(() => {
+        this.noticeCenter?.show({
+          key: "rs-migration-completed",
+          message: this.i18n.t("rsMigration.completedNotice"),
+          priority: NOTICE_PRIORITY.info,
+          durationMs: 8_000,
+        });
+      }, 8_000);
+    }
     const localIgnores = result.communityPluginLocalIgnores;
     if (
       this.state?.isV2StateActive === true
@@ -2624,7 +2721,8 @@ export default class EasySyncPlugin extends Plugin {
     const acknowledgeMigrationRisk =
       reviewedAuthorization?.reviewKind === "v2-migration";
     const createFirstV2Protocol =
-      reviewedAuthorization?.reviewKind === "v2-first-sync";
+      reviewedAuthorization?.reviewKind === "v2-first-sync"
+      || reviewedAuthorization?.reviewKind === "v2-rs-adoption";
     if (
       acknowledgeMigrationRisk
       && !await this.acknowledgeV2MigrationRisk()
@@ -2840,6 +2938,139 @@ export default class EasySyncPlugin extends Plugin {
     );
   }
 
+  /** One-shot login-time hint (carrier plan §11.1 幕1): a fresh login that
+   *  has never synced may be told a Remotely Save repository exists. Silent
+   *  and side-effect free — detection errors never surface here. */
+  private async offerRsMigrationNoticeAfterFreshLogin(): Promise<void> {
+    try {
+      if (!this.onedrive || !this.state) return;
+      if (
+        this.rsAdoptionMarker
+        || this.hasCompletedSyncState()
+        || this.state.planReviewActive
+      ) return;
+      const detected = await this.onedrive.detectRemotelySaveRepository(
+        this.app.vault.getName(),
+      );
+      if (!detected) return;
+      this.noticeCenter?.show({
+        key: "rs-migration-detect",
+        message: this.i18n.t("rsMigration.detectNotice"),
+        priority: NOTICE_PRIORITY.info,
+      });
+    } catch (error) {
+      this.diag.warn(
+        "state",
+        "Remotely Save detection after login failed",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  /** Remotely Save adoption decision point (carrier plan §11.3). Runs at
+   *  first-sync triggers when this vault has never synced and a foreign
+   *  repository pairs by exact vault name. Returns how the caller proceeds:
+   *  "migrated" (transaction done — dispatch with the adoption option),
+   *  "fresh" (plain first sync), or "abort" (this round ends here; the
+   *  adoption choice stays available for the next trigger). */
+  private async maybeRunRsMigrationOffer(): Promise<
+    "migrated" | "fresh" | "abort"
+  > {
+    if (!this.onedrive || !this.syncExecutor || !this.state) return "fresh";
+    if (this.rsAdoptionMarker) return "migrated";
+    if (
+      this.hasCompletedSyncState()
+      || this.state.planReviewActive
+      || !this.auth?.authState.isLoggedIn
+    ) return "fresh";
+    const vaultName = this.app.vault.getName();
+    let detected: Awaited<
+      ReturnType<OneDriveClient["detectRemotelySaveRepository"]>
+    >;
+    try {
+      detected = await this.onedrive.detectRemotelySaveRepository(vaultName);
+    } catch (error) {
+      // A detection error is not an absence: keep the choice alive instead
+      // of silently closing the adoption window.
+      this.diag.warn(
+        "state",
+        "Remotely Save detection failed; first sync deferred",
+        error instanceof Error ? error.message : String(error),
+      );
+      return "abort";
+    }
+    if (!detected) return "fresh";
+
+    const offer = await new RsMigrationOfferModal(this.app, {
+      title: this.i18n.t("rsMigration.offerTitle"),
+      body: this.i18n.t("rsMigration.offerBody", { vault: vaultName }),
+      migrate: {
+        title: this.i18n.t("rsMigration.offerMigrateTitle"),
+        description: this.i18n.t("rsMigration.offerMigrateDesc"),
+      },
+      fresh: {
+        title: this.i18n.t("rsMigration.offerFreshTitle"),
+        description: this.i18n.t("rsMigration.offerFreshDesc"),
+      },
+      crossDeviceNote: this.i18n.t("rsMigration.offerCrossDeviceNote"),
+    }).awaitAction();
+    if (offer.action === "dismiss") return "abort";
+    if (offer.action === "fresh-sync") return "fresh";
+
+    // Adoption confirmed: create the App Folder layout first (files/ is the
+    // move destination), then run the transaction.
+    try {
+      const scope = await this.onedrive.initVaultScope(vaultName);
+      const outcome = await runRsMigrationTransaction({
+        onedrive: this.onedrive,
+        vaultName,
+        filesRootId: scope.filesRootId,
+      });
+      if (outcome.status === "moved" || outcome.status === "copied") {
+        this.rsAdoptionMarker = outcome.marker;
+        await this.updatePluginData((data) => {
+          data[KEY_RS_ADOPTION_MARKER] = outcome.marker;
+        });
+        this.diag.log("state", "Remotely Save adoption transaction completed", {
+          strategy: outcome.status,
+          adoptedCount: outcome.adoptedCount,
+          mutations: 0,
+        });
+        return "migrated";
+      }
+      if (outcome.status === "empty-source" || outcome.status === "not-found") {
+        return "fresh";
+      }
+      this.diag.warn("state", "Remotely Save adoption transaction failed", {
+        status: outcome.status,
+        reason: outcome.reason,
+        mutations: 0,
+      });
+      const failure = await new RsMigrationFailureModal(this.app, {
+        title: this.i18n.t("rsMigration.failureTitle"),
+        // destination-not-empty is persistent, not transient — say so instead
+        // of blaming OneDrive and offering a retry that can never succeed.
+        body: outcome.status === "destination-not-empty"
+          ? this.i18n.t("rsMigration.failureBodyDestination")
+          : this.i18n.t("rsMigration.failureBody"),
+        retryLabel: this.i18n.t("rsMigration.failureRetry"),
+        freshLabel: this.i18n.t("rsMigration.failureFreshSync"),
+        guideLabel: this.i18n.t("rsMigration.failureGuide"),
+        guideTitle: this.i18n.t("rsMigration.guideTitle"),
+        guideBody: this.i18n.t("rsMigration.guideBody"),
+        guideOk: this.i18n.t("rsMigration.guideOk"),
+      }).awaitAction();
+      return failure.action === "fresh-sync" ? "fresh" : "abort";
+    } catch (error) {
+      this.diag.warn(
+        "state",
+        "Remotely Save adoption transaction threw; the choice is preserved",
+        error instanceof Error ? error.message : String(error),
+      );
+      return "abort";
+    }
+  }
+
   /** Start a first sync (manual trigger from settings) */
   async startFirstSync(options: SyncRunOptions = {}): Promise<void> {
     if (!this.syncExecutor) return;
@@ -2861,11 +3092,14 @@ export default class EasySyncPlugin extends Plugin {
       this.syncView?.render();
       return;
     }
+    const rsMigration = await this.maybeRunRsMigrationOffer();
+    if (rsMigration === "abort") return;
     await this.activateSyncView();
     await this.dispatchSyncRun({
       mode: "first",
       options: {
         ...options,
+        ...(rsMigration === "migrated" ? { rsAdoptionPending: true } : {}),
         ...(recoverV2RemoteScope
           ? { recoverV2RemoteScope: true }
           : {}),
@@ -2922,7 +3156,8 @@ export default class EasySyncPlugin extends Plugin {
     const acknowledgeMigrationRisk =
       reviewedAuthorization?.reviewKind === "v2-migration";
     const createFirstV2Protocol =
-      reviewedAuthorization?.reviewKind === "v2-first-sync";
+      reviewedAuthorization?.reviewKind === "v2-first-sync"
+      || reviewedAuthorization?.reviewKind === "v2-rs-adoption";
     const createsRemoteScope = skipConfirmation
       && (this.state?.planReviewItems ?? []).some(
         (item) => item.type === SyncActionType.RecreateRemoteScope,
@@ -3465,7 +3700,16 @@ export default class EasySyncPlugin extends Plugin {
           this.showMutationRecoveryResetBlockedNotice();
           return;
         }
-        this.diag.error("state", "local sync state reset failed", error);
+        // The diagnostic report serializes details as JSON, which turns a raw
+        // Error into `{}` (F14). Extract the name and message so the real
+        // error text reaches the report.
+        this.diag.error(
+          "state",
+          "local sync state reset failed",
+          error instanceof Error
+            ? `${error.name}: ${error.message}`
+            : String(error),
+        );
         this.noticeCenter.show({
           key: "reset-failed",
           message: this.i18n.t("settings.reset.failed"),
@@ -3492,7 +3736,14 @@ export default class EasySyncPlugin extends Plugin {
         await this.saveSyncSettings();
         await this.scanner?.clearScanCache();
       } catch (error) {
-        this.diag.error("state", "local reset maintenance failed", error);
+        // The diagnostic report serializes a raw Error as `{}` (F14).
+        this.diag.error(
+          "state",
+          "local reset maintenance failed",
+          error instanceof Error
+            ? `${error.name}: ${error.message}`
+            : String(error),
+        );
         this.noticeCenter.show({
           key: "reset-failed",
           message: this.i18n.t("settings.reset.failed"),
@@ -5348,6 +5599,22 @@ export default class EasySyncPlugin extends Plugin {
         this.diag.log("execute", `auto sync skipped — plan review pending (${trigger})`);
         return true;
       }
+      if (!this.hasCompletedSyncState()) {
+        // A first sync triggered automatically still deserves the adoption
+        // decision (plan §1): the modal shows while the app is foregrounded,
+        // which is the only state in which timers run.
+        const rsMigration = await this.maybeRunRsMigrationOffer();
+        if (rsMigration === "abort") return true;
+        this.diag.log("execute", `auto sync started — trigger=${trigger}`);
+        dispatched = true;
+        await this.dispatchSyncRun({
+          mode: "auto",
+          ...(rsMigration === "migrated"
+            ? { options: { rsAdoptionPending: true } }
+            : {}),
+        });
+        return true;
+      }
       this.diag.log("execute", `auto sync started — trigger=${trigger}`);
       dispatched = true;
       await this.dispatchSyncRun({ mode: "auto" });
@@ -5626,8 +5893,13 @@ export default class EasySyncPlugin extends Plugin {
       if (typeof data[KEY_SYNC_BOOKMARKS] === "boolean") this.syncBookmarks = data[KEY_SYNC_BOOKMARKS];
       this.syncCommunityPlugins =
         data[KEY_SYNC_COMMUNITY_PLUGINS] === true;
-      this.syncPluginData = this.syncCommunityPlugins
-        && data[KEY_SYNC_PLUGIN_DATA] === true;
+      // The data switch's own key is its single stored source. The
+      // files-precondition is owned by the participation projection clamp
+      // and the effective policy (scanner and executor both require the
+      // files selection to hit); gating here against the legacy files key
+      // would clamp on a value participation-era persistence no longer
+      // maintains and reset the switch on every restart.
+      this.syncPluginData = data[KEY_SYNC_PLUGIN_DATA] === true;
       const communityPluginSyncSettings =
         normalizeCommunityPluginSyncSettings(
           readCommunityPluginSyncPolicy(
@@ -5640,9 +5912,6 @@ export default class EasySyncPlugin extends Plugin {
           this.syncPluginData,
           this.manifest.id,
         );
-      this.syncCommunityPlugins =
-        communityPluginSyncSettings.filesEnabled;
-      this.syncPluginData = communityPluginSyncSettings.dataEnabled;
       this.communityPluginSyncPolicy = communityPluginSyncSettings.policy;
       this.excludedFolders = normalizeExcludedFolders(
         Array.isArray(data[KEY_SYNC_EXCLUDED_FOLDERS])
@@ -5652,6 +5921,7 @@ export default class EasySyncPlugin extends Plugin {
       );
       if (typeof data[KEY_AUTO_SYNC_PAUSED] === "boolean") this.autoSyncPaused = data[KEY_AUTO_SYNC_PAUSED];
       this.lastResetFacts = parseDiagnosticResetFacts(data[KEY_LAST_RESET_FACTS]);
+      this.rsAdoptionMarker = parseRsAdoptionMarker(data[KEY_RS_ADOPTION_MARKER]);
       this.syncMaxFileSizeMb = normalizeMaxFileSizeMb(data[KEY_MAX_FILE_SIZE_MB]);
       const deviceUpdateState = loadUpdateCheckState(this.updateDeviceStorage());
       const legacyUpdateState = seedUpdateCheckStateFromLegacyPluginData(data);

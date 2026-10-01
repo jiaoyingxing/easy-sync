@@ -5237,7 +5237,7 @@ describe("main sync entry guards", () => {
     expect(plugin.diag.error).toHaveBeenCalledWith(
       "state",
       "local sync state reset failed",
-      expect.any(Error),
+      "Error: state cleanup failed",
     );
   });
 
@@ -5276,7 +5276,7 @@ describe("main sync entry guards", () => {
     expect(plugin.diag.error).toHaveBeenCalledWith(
       "state",
       "local reset maintenance failed",
-      expect.any(Error),
+      "Error: settings write failed",
     );
   });
 
@@ -5660,7 +5660,7 @@ describe("main sync entry guards", () => {
     expect(plugin.diag.error).toHaveBeenCalledWith(
       "state",
       "local sync state reset failed",
-      expect.objectContaining({ message: "IndexedDB commit failed" }),
+      "Error: IndexedDB commit failed",
     );
     expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
   });
@@ -5960,7 +5960,7 @@ describe("main sync entry guards", () => {
     expect(plugin.diag.error).toHaveBeenCalledWith(
       "state",
       "local sync state reset failed",
-      expect.objectContaining({ message: "IndexedDB commit failed" }),
+      "Error: IndexedDB commit failed",
     );
     expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
   });

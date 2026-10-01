@@ -467,6 +467,11 @@ export class LocalScanner {
   private readonly configDir: string;
   private config: ScanConfig;
   private diag?: DiagnosticLogger;
+  /** Included single paths whose stat-null warning already fired this session
+   *  (F14: a configured-but-absent bookmarks.json warned every scan cycle).
+   *  First warning per path is kept; the entry re-arms when the file is
+   *  observed again so a later absence warns fresh. */
+  private statNullSinglePathWarned = new Set<string>();
   private scanCache: ScanCache = {
     format: SCAN_CACHE_FORMAT,
     entries: {},
@@ -967,10 +972,21 @@ export class LocalScanner {
       return;
     }
     if (!stat) {
-      this.diag?.warn("scan", `stat returned null for "${filePath}", skipping`);
+      // An include path can legitimately point at a config file that does not
+      // exist locally (bookmarks.json with bookmark sync enabled). Keep the
+      // first warning, suppress the per-cycle repeats, and re-arm once the
+      // file is observed again (below).
+      if (!this.statNullSinglePathWarned.has(filePath)) {
+        this.statNullSinglePathWarned.add(filePath);
+        this.diag?.warn(
+          "scan",
+          `stat returned null for "${filePath}", skipping`,
+        );
+      }
       return;
     }
     observedFilePaths.add(filePath);
+    this.statNullSinglePathWarned.delete(filePath);
 
     if (stat.size > this.config.maxFileSize) {
       skippedLarge.push(filePath);

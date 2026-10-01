@@ -756,6 +756,51 @@ describe("Preflight P0 — Included path failures make the scan incomplete", () 
     expect(adapter.list).not.toHaveBeenCalled();
   });
 
+  it("warns once per session for an included single file that is absent locally, and re-arms after it reappears", async () => {
+    const missingPath = ".obsidian/bookmarks.json";
+    const statEntry = { size: content.byteLength, mtime: 1 };
+    let fileExists = false;
+    const adapter = {
+      exists: vi.fn(async () => true),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      stat: vi.fn(async (path: string) =>
+        path === missingPath && !fileExists ? null : statEntry),
+      readBinary: vi.fn(async () => content),
+    };
+    const vault = {
+      adapter,
+      getFiles: vi.fn(() => []),
+      getAllLoadedFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const diag = { log: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const scanner = new LocalScanner(vault, {
+      ...config,
+      includePaths: [missingPath],
+    });
+    scanner.setDiag(diag as never);
+
+    // First absence keeps the ordinary first warning.
+    await scanner.scanAll();
+    expect(diag.warn).toHaveBeenCalledTimes(1);
+    expect(diag.warn).toHaveBeenCalledWith(
+      "scan",
+      `stat returned null for "${missingPath}", skipping`,
+    );
+
+    // A stable absence then repeats every cycle without a new warning, so a
+    // configured-but-absent file cannot flood the anomaly log.
+    await scanner.scanAll();
+    await scanner.scanAll();
+    expect(diag.warn).toHaveBeenCalledTimes(1);
+
+    // Once the file is observed again, a later absence warns afresh.
+    fileExists = true;
+    await scanner.scanAll();
+    fileExists = false;
+    await scanner.scanAll();
+    expect(diag.warn).toHaveBeenCalledTimes(2);
+  });
+
   it("records a stat failure for a file found during included traversal", async () => {
     const path = ".obsidian/plugins/example-plugin/main.js";
     const adapter = {

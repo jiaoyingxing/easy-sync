@@ -1521,12 +1521,74 @@ describe("plugin data cold-start cache", () => {
     });
     await pausedPlugin.loadSyncSettings();
     expect(pausedPlugin.syncCommunityPlugins).toBe(false);
-    expect(pausedPlugin.syncPluginData).toBe(false);
+    // The data switch keeps its own stored flag at load. The
+    // files-precondition is enforced where the files scope's owner decides
+    // (participation projection clamp, effective policy), not by pairing
+    // against the legacy files key here.
+    expect(pausedPlugin.syncPluginData).toBe(true);
     expect(pausedPlugin.communityPluginSyncPolicy).toEqual({
       version: 1,
       files: { mode: "selected", pluginIds: ["calendar"] },
       data: { mode: "selected", pluginIds: ["calendar"] },
     });
+  });
+
+  it("keeps the community-plugin data switch on across restart when participation owns the files scope", async () => {
+    // Participation-era device: settings persistence no longer rewrites the
+    // legacy files key, so it stays absent while the files scope is enabled
+    // through device participation. The data switch must survive restart on
+    // its own stored key instead of being clamped by the stale pair.
+    const plugin = new EasySyncPlugin();
+    vi.spyOn(plugin, "loadData").mockResolvedValue({
+      "sync-plugin-data": true,
+      "community-plugin-sync-policy": {
+        version: 1,
+        files: { mode: "selected", pluginIds: ["calendar"] },
+        data: { mode: "selected", pluginIds: ["calendar"] },
+      },
+    });
+    const participation = reduceDeviceCommunityPluginParticipation(
+      createEmptyDeviceCommunityPluginParticipation(true),
+      { type: "confirm-participating", pluginId: "calendar" },
+    );
+    plugin.state = {
+      isV2StateActive: true,
+      getCommunityPluginParticipation: () => structuredClone(participation),
+    } as never;
+    plugin.scanner = { setConfig: vi.fn() } as never;
+    vi.spyOn(plugin as never, "ensureStateLoaded").mockResolvedValue(undefined);
+
+    await plugin.loadSyncSettings();
+    await plugin.ensureCommunityPluginParticipationInitialized();
+
+    expect(plugin.syncCommunityPlugins).toBe(true);
+    expect(plugin.syncPluginData).toBe(true);
+  });
+
+  it("clamps the community-plugin data switch off when the participation scope is disabled", async () => {
+    const plugin = new EasySyncPlugin();
+    vi.spyOn(plugin, "loadData").mockResolvedValue({
+      "sync-plugin-data": true,
+      "community-plugin-sync-policy": {
+        version: 1,
+        files: { mode: "selected", pluginIds: ["calendar"] },
+        data: { mode: "selected", pluginIds: ["calendar"] },
+      },
+    });
+    const participation = createEmptyDeviceCommunityPluginParticipation(false);
+    plugin.state = {
+      isV2StateActive: true,
+      getCommunityPluginParticipation: () => structuredClone(participation),
+      retirePendingStateForPaths: vi.fn(async () => undefined),
+    } as never;
+    plugin.scanner = { setConfig: vi.fn() } as never;
+    vi.spyOn(plugin as never, "ensureStateLoaded").mockResolvedValue(undefined);
+
+    await plugin.loadSyncSettings();
+    await plugin.ensureCommunityPluginParticipationInitialized();
+
+    expect(plugin.syncCommunityPlugins).toBe(false);
+    expect(plugin.syncPluginData).toBe(false);
   });
 
   it("loads and normalizes device-local folder exclusions without a cold-start write", async () => {

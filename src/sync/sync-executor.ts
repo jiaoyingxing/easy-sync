@@ -218,6 +218,7 @@ import {
   contentDifferenceReceiptMatches,
   resolveContentEquality,
 } from "./content-equality";
+import { seedBaseEntriesFromRsAdoption } from "./rs-migration-transaction";
 import {
   cloudBootstrapAnchorDigestV2,
   cloudBootstrapCheckpointMatchesEnvelopeV2,
@@ -623,6 +624,12 @@ export interface SyncRunOptions {
    *  migration also requires the dedicated risk confirmation; ordinary first
    *  sync receives permission from confirmation of its canonical plan. */
   acknowledgeMigrationRisk?: boolean;
+  /** One-shot Remotely Save adoption: this fresh-activation round may seed
+   *  identical-content baselines from the adopted foreign vault directory and
+   *  classifies its review as a migration confirmation. Set only when the
+   *  migration transaction has already moved (or copied) the foreign content
+   *  into files/ and the device-local marker is durable. */
+  rsAdoptionPending?: boolean;
   /** Observe and settle only the active V2 mutation ledger. Even when all
    *  records settle, return before baseline loading, planning, or mutation. */
   recoveryOnly?: boolean;
@@ -7529,6 +7536,7 @@ export class SyncExecutor {
     public113MigrationInput: Awaited<
       ReturnType<StateManager["readPublic113MigrationInput"]>
     > | null;
+    rsAdoptionPending: boolean;
   }): Promise<
     | { terminated: SyncResult }
     | {
@@ -7557,6 +7565,33 @@ export class SyncExecutor {
     );
     let seededBaseEntries: BaseFileEntry[] = [];
     let seededBaseEntriesPersisted = false;
+    if (
+      args.rsAdoptionPending
+      && baseEntries.length === 0
+      && !this.state.isV2StateActive
+    ) {
+      // Remotely Save adoption: the confirmed transaction already moved the
+      // foreign vault content into files/. Identical-content paths become
+      // baseline anchors directly (same evidence class as the cloud-join
+      // equal-read seed) so the adoption plan carries only real differences.
+      const adoptionSeeds = seedBaseEntriesFromRsAdoption(
+        localEntries,
+        remoteEntries,
+      );
+      if (adoptionSeeds.length > 0) {
+        seededBaseEntries = adoptionSeeds;
+        baseEntries = adoptionSeeds;
+        this.diag?.log(
+          "state",
+          `Remotely Save adoption seeded ${adoptionSeeds.length} identical-content baseline path(s)`,
+        );
+      } else {
+        this.diag?.warn(
+          "state",
+          "Remotely Save adoption found no safely adoptable shared paths",
+        );
+      }
+    }
     if (cloudBootstrapV2Json) {
       const bootstrapSeeds = this.seedBaseEntriesFromCloudBootstrapV2(
         cloudBootstrapV2Json,
@@ -10878,6 +10913,7 @@ export class SyncExecutor {
     pendingFirstSyncProtocolBinding: SharedSyncProtocolBindingV2 | null;
     firstSyncVerificationProtocolBinding: unknown;
     freshSharedProtocolBinding: SharedSyncProtocolBindingV3 | null;
+    rsAdoptionPending: boolean;
   }): Promise<
     | { terminated: SyncResult }
     | {
@@ -10939,10 +10975,14 @@ export class SyncExecutor {
         );
         return { terminated: result };
       }
-      activationReviewKind = "v2-first-sync";
+      activationReviewKind = args.rsAdoptionPending
+        ? "v2-rs-adoption"
+        : "v2-first-sync";
       this.diag?.log(
         "state",
-        "fresh V2 device classified as the first device for this sync state",
+        args.rsAdoptionPending
+          ? "fresh V2 device classified as a Remotely Save adoption of the adopted foreign vault content"
+          : "fresh V2 device classified as the first device for this sync state",
         { mutations: 0 },
       );
     } else if (protocolProfile.status === "legacy-v2") {
@@ -12143,7 +12183,10 @@ export class SyncExecutor {
         scope: syncScope,
         acknowledgeMigrationRisk:
           reviewKind !== "v2-cloud-join",
-        ...(reviewKind === "v2-first-sync"
+        ...((
+          reviewKind === "v2-first-sync"
+          || reviewKind === "v2-rs-adoption"
+        )
             && existingConfirmed?.phase === "pending"
             && existingConfirmed.protocolBinding?.protocolVersion === 2
           ? {
@@ -12154,7 +12197,10 @@ export class SyncExecutor {
       },
       async (settled) => {
         if (
-          reviewKind !== "v2-first-sync"
+          (
+            reviewKind !== "v2-first-sync"
+            && reviewKind !== "v2-rs-adoption"
+          )
           || settled.source !== "created"
           || !activeReviewedAuthorization
         ) return;
@@ -12170,7 +12216,10 @@ export class SyncExecutor {
           this.state.planReviewAuthorization;
         if (
           !refreshedAuthorization
-          || refreshedAuthorization.reviewKind !== "v2-first-sync"
+          || (
+            refreshedAuthorization.reviewKind !== "v2-first-sync"
+            && refreshedAuthorization.reviewKind !== "v2-rs-adoption"
+          )
         ) {
           throw new Error(
             "First-sync protocol checkpoint lost its reviewed authorization",
@@ -12668,9 +12717,15 @@ export class SyncExecutor {
         : null;
     const pendingActivationHold = this.state.activeV2MigrationHold;
     const pendingFirstSyncProtocolBinding: SharedSyncProtocolBindingV2 | null =
-      reviewedAuthorization?.reviewKind === "v2-first-sync"
+      (
+        reviewedAuthorization?.reviewKind === "v2-first-sync"
+        || reviewedAuthorization?.reviewKind === "v2-rs-adoption"
+      )
       && pendingActivationHold?.phase === "pending"
-      && migrationHoldReviewKindV2(pendingActivationHold) === "v2-first-sync"
+      && (
+        migrationHoldReviewKindV2(pendingActivationHold) === "v2-first-sync"
+        || migrationHoldReviewKindV2(pendingActivationHold) === "v2-rs-adoption"
+      )
       && pendingActivationHold.protocolBinding?.protocolVersion === 2
       && reviewedAuthorization.revision === pendingActivationHold.revision
       && sameSyncScope(reviewedAuthorization.scope, pendingActivationHold.scope)
@@ -12957,6 +13012,7 @@ export class SyncExecutor {
         pendingFirstSyncProtocolBinding,
         firstSyncVerificationProtocolBinding,
         freshSharedProtocolBinding,
+        rsAdoptionPending: options.rsAdoptionPending === true,
       });
       if (step1_6.terminated) return step1_6.terminated;
       activationReviewKind = step1_6.activationReviewKind;
@@ -13063,6 +13119,7 @@ export class SyncExecutor {
         cloudBootstrapV2Json,
         cloudBaselineJson,
         public113MigrationInput,
+        rsAdoptionPending: options.rsAdoptionPending === true,
       });
       if (step4.terminated) return step4.terminated;
       let baseEntries = step4.baseEntries;

@@ -263,7 +263,11 @@ export interface SyncPlan {
 export type V2ActivationReviewKind =
   | "v2-migration"
   | "v2-cloud-join"
-  | "v2-first-sync";
+  | "v2-first-sync"
+  /** Remotely Save adoption: a fresh activation that seeds identical-content
+   *  baselines from an adopted foreign vault directory (plan-confirmed
+   *  transaction moved that content into files/ before this review). */
+  | "v2-rs-adoption";
 
 export interface CanonicalPlanIdentityV2 {
   version: 2;

@@ -227,6 +227,10 @@ export interface PluginDataStore {
   diag?: { warn: (category: string, message: string, detail?: unknown) => void };
   indexedDbVaultInstanceId?: string;
   readIndexedDbVaultInstanceId?: () => string | null;
+  /** Reset rescue only (F14): rotate the Vault instance identity to orphan
+   *  engine-unreadable IndexedDB storage. Supplied by the plugin onload
+   *  capture; must keep the captured binding and the live read in agreement. */
+  rotateIndexedDbVaultInstanceId?: () => string | null;
   createPublic113IndexedDbCandidateStore?:
     Public113IndexedDbCandidateStoreFactory;
   createStateV2IndexedDbActiveStore?: (
@@ -7427,6 +7431,7 @@ export class StateManager {
   }): Promise<MigrationHoldV2 | null> {
     if (
       input.authorization.reviewKind !== "v2-first-sync"
+      && input.authorization.reviewKind !== "v2-rs-adoption"
       || !isSharedSyncProtocolBindingV2(input.protocolBinding)
       || !await this.isCurrentV2MigrationAuthorization(input)
     ) {
@@ -7436,7 +7441,10 @@ export class StateManager {
     if (
       !hold
       || hold.phase !== "pending"
-      || migrationHoldReviewKindV2(hold) !== "v2-first-sync"
+      || (
+        migrationHoldReviewKindV2(hold) !== "v2-first-sync"
+        && migrationHoldReviewKindV2(hold) !== "v2-rs-adoption"
+      )
       || !this.migrationHoldStore
     ) {
       return null;
@@ -8777,6 +8785,40 @@ export class StateManager {
     const nextPlanReviewRevision = this.data[KEY_PLAN_REVIEW_REVISION] + 1;
     await this.save(() => createDefaultData(0, nextPlanReviewRevision));
 
+    // F14 "reset must win": an engine-level unreadable IndexedDB database
+    // fails every operation including deleteDatabase, so a failing delete
+    // would leave this user-authorized reset permanently half-done. When an
+    // IndexedDB-level cleanup fails, rotate the Vault instance identity once
+    // and orphan the unreadable storage in place — never deleted, never
+    // selected again — instead of failing the reset. Healthy databases never
+    // rotate: their normal delete is the contract that clears local records.
+    let orphaningRescueUsed = false;
+    const rescueByOrphaningUnreadableDatabases = async (
+      trigger: string,
+    ): Promise<boolean> => {
+      if (orphaningRescueUsed) return false;
+      const rotate = this.plugin.rotateIndexedDbVaultInstanceId;
+      if (!rotate) return false;
+      const previousInstanceId = this.currentIndexedDbVaultInstanceId();
+      const newInstanceInstanceId = rotate();
+      if (!newInstanceInstanceId) return false;
+      orphaningRescueUsed = true;
+      // Abandon every live handle bound to the orphaned namespace so no later
+      // step reads or writes through the corrupted storage again.
+      await this.v2IndexedDbStore?.close().catch(() => undefined);
+      this.v2IndexedDbStore = null;
+      await this.remoteScopeRecoveryEvidenceStore?.close().catch(
+        () => undefined,
+      );
+      this.remoteScopeRecoveryEvidenceStore = null;
+      this.plugin.diag?.warn(
+        "state",
+        "local reset orphaned unreadable IndexedDB storage by rotating the Vault instance identity",
+        { trigger, previousInstanceId, newInstanceInstanceId },
+      );
+      return true;
+    };
+
     try {
       // The committed manifest is the local V2 cutover point. Remove it before
       // deleting the selected database so an interruption cannot silently
@@ -8785,6 +8827,15 @@ export class StateManager {
       if (indexedDbStore) {
         try {
           await indexedDbStore.delete();
+        } catch (error) {
+          if (
+            !orphaningRescueUsed
+            && !(await rescueByOrphaningUnreadableDatabases(
+              "v2-active-state-delete",
+            ))
+          ) {
+            throw error;
+          }
         } finally {
           if (indexedDbStore === this.v2IndexedDbStore) {
             this.v2IndexedDbStore = null;
@@ -8794,12 +8845,32 @@ export class StateManager {
       if (publicCandidate) {
         try {
           await publicCandidate.delete();
+        } catch (error) {
+          if (
+            !orphaningRescueUsed
+            && !(await rescueByOrphaningUnreadableDatabases(
+              "public-1-1-3-candidate-delete",
+            ))
+          ) {
+            throw error;
+          }
         } finally {
           await publicCandidate.close();
         }
       }
       if (evidenceStore) {
-        await evidenceStore.delete();
+        try {
+          await evidenceStore.delete();
+        } catch (error) {
+          if (
+            !orphaningRescueUsed
+            && !(await rescueByOrphaningUnreadableDatabases(
+              "remote-scope-evidence-delete",
+            ))
+          ) {
+            throw error;
+          }
+        }
         if (evidenceStore === this.remoteScopeRecoveryEvidenceStore) {
           this.remoteScopeRecoveryEvidenceStore = null;
         }

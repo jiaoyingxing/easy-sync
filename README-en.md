@@ -23,7 +23,7 @@
 
 EasySync keeps your Obsidian vault in sync across computers, phones, and tablets.
 
-## ⚠️ Read this first
+### ⚠️ Read this first
 
 1. **Don't mix it with other sync methods.** Don't put your vault inside a cloud-synced folder such as iCloud or the OneDrive client, and don't let other sync tools such as Obsidian Sync or Remotely Save manage the same vault. When two sync programs change the same files, they conflict with each other — files can even end up deleted, re-uploaded, and deleted again in a loop. Keep your vault in a plain local folder and let EasySync be the only tool managing it.
 2. **Set up every device separately.** Setting it up on one device doesn't make sync work everywhere: on each device you need to install EasySync, sign in to the same OneDrive account, configure its own settings, and run the sync.
@@ -34,7 +34,7 @@ EasySync keeps your Obsidian vault in sync across computers, phones, and tablets
 ## Table of contents
 
 - [⚠️ Read this first](#-read-this-first)
-- [1. Quick start](#1-quick-start)
+- [1. Installation & first sync](#1-installation--first-sync)
 - [2. Data and privacy](#2-data-and-privacy)
 - [3. Configuration and sync scope](#3-configuration-and-sync-scope)
 - [4. How conflicts are handled](#4-how-conflicts-are-handled)
@@ -80,6 +80,8 @@ Sign-in opens your system browser for Microsoft authorization; on mobile, return
 ### 1.4 Run the first sync
 
 Start on the device with the most complete copy and select **Sync now**: EasySync shows the sync plan first, and nothing is uploaded, overwritten, moved, or deleted until you confirm it. Confirm the plan, wait for this round to finish, and then sync your other devices.
+
+If this vault previously synced with Remotely Save, the first sync will ask whether to adopt the old repository automatically — no re-upload needed (see [5.2](#52-from-remotely-save)).
 
 If a new device has no content yet:
 
@@ -208,11 +210,17 @@ Install and enable EasySync, sign in to the OneDrive account that holds the old 
 
 ### 5.2 From Remotely Save
 
-Finish one last sync, confirm that it succeeded, and disable Remotely Save on every device.
+**Automatic migration (recommended)**: after you sign in to OneDrive, EasySync checks the OneDrive app folder for a Remotely Save repository with the same vault name — if one is found, you get a brief notice, and in a vault that has never synced, the **first sync** opens a choice:
 
-If remote encryption is off, use OneDrive on the web to copy the vault contents from `Apps/remotely-save/<your-vault-name>/` into `Apps/EasySync/vaults/<your-vault-name>/files/` — copy the vault contents directly, without adding another vault-name folder, and without Remotely Save's control files. If you used a custom remote directory, use that actual directory instead.
+- **Migrate**: the old repository is adopted wholesale into EasySync's cloud folder — no re-upload needed. Files identical to the cloud are registered as-is without uploading; differing files are listed in the sync plan and only processed after your confirmation — once confirmed, those decisions cannot be undone (except via the OneDrive recycle bin). Disable Remotely Save on your other devices before migrating; EasySync will remind you again afterwards.
+- **Direct sync**: ignore the old repository and start from the local content; you will not be asked again.
+- Not ready to decide: just close the dialog — nothing syncs this round, and you will be asked again at the next first-sync attempt.
 
-If remote encryption is on, first restore the complete unencrypted vault locally with Remotely Save, then let EasySync perform the initial upload.
+If OneDrive rejects the automatic migration (for example, EasySync's cloud folder already has content), your content is not changed at all: you can retry later, switch to a direct sync, or follow the in-dialog guide to migrate manually.
+
+> Note: if remote encryption is enabled in Remotely Save, the cloud content is ciphertext and automatic migration does not apply — EasySync will not show the migration prompt for an encrypted repository. Use the manual steps below.
+
+**Manual migration (fallback)**: finish one last sync, confirm that it succeeded, and disable Remotely Save on every device. Use OneDrive on the web to copy the vault contents from `Apps/remotely-save/<your-vault-name>/` into `Apps/EasySync/vaults/<your-vault-name>/files/` — copy the vault contents directly, without adding another vault-name folder, and without Remotely Save's control files. If you used a custom remote directory, use that actual directory instead. If remote encryption is on, first restore the complete unencrypted vault locally with Remotely Save, then let EasySync perform the initial upload.
 
 ### 5.3 From iCloud on iOS
 

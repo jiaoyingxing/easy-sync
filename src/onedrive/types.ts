@@ -78,6 +78,16 @@ export interface RemoteVaultScope {
   filesRootId: string;
 }
 
+/** Read-only scan result for a Remotely Save repository that pairs with one
+ *  vault by exact directory name (layout probe-verified 2026-09/10: the RS
+ *  app folder holds one directory per vault, named after the vault). */
+export interface RemotelySaveRepositoryLocation {
+  driveId: string;
+  appsContainerId: string;
+  remotelySaveDirId: string;
+  vaultDirId: string;
+}
+
 /** Upload response for small file PUT */
 export interface UploadResult {
   id: string;

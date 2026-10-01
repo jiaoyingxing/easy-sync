@@ -233,6 +233,39 @@ describe("MigrationHoldV2Store", () => {
     expect((await store.load())?.reviewKind).toBe("v2-cloud-join");
   });
 
+  it("persists rs-adoption classification and allows the first-sync protocol checkpoint", async () => {
+    const { adapter, spies } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    const pending = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      reviewKind: "v2-rs-adoption",
+      now: 2000,
+    });
+
+    expect(pending.reviewKind).toBe("v2-rs-adoption");
+    expect((await store.load())?.reviewKind).toBe("v2-rs-adoption");
+
+    const checkpoint = await store.checkpointPendingProtocolBinding(
+      pending.revision,
+      pending.canonicalIdentity,
+      protocolBinding,
+      2100,
+    );
+    expect(checkpoint).toMatchObject({
+      phase: "pending",
+      reviewKind: "v2-rs-adoption",
+      revision: pending.revision + 1,
+      protocolBinding,
+    });
+    expect(await store.load()).toEqual(checkpoint);
+    expect(spies.write.mock.calls.length).toBeGreaterThan(0);
+  });
+
   it("checkpoints the exact V2 binding on a pending first-sync hold and keeps an exact repeat idempotent", async () => {
     const { adapter, spies } = makeAdapter();
     const store = new MigrationHoldV2Store(adapter, paths);

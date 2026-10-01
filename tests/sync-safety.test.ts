@@ -3738,6 +3738,16 @@ describe("Persistent remote delta state", () => {
     pendingConflictPaths?: string[];
     withLedger?: boolean;
     progressStore?: SyncProgressStore;
+    /** 给了任一项就模拟真实宿主：它认得库里的文件，并且自己有写入面
+     *  （F12 修复的「复制留底 + 宿主写入面原地写」分支；`commitDownloadedTempFile`
+     *  的 hostVisible 判据＝宿主认得目标且 `vault.modify` 存在）。 */
+    hostEditorMerge?: string;
+    /** 宿主写入面「静默失败」：接口正常返回但磁盘没变（`DECISIONS` 2026-09-23 第 9 点④的现场）。 */
+    hostWriteSilent?: boolean;
+    /** 宿主写入面的调用记录，用于断言原地写入的内容与有界重试次数。 */
+    hostWriteLog?: string[];
+    i18n?: I18n;
+    noticeCenter?: EasySyncNoticeCenter;
   }) {
     const encoder = new TextEncoder();
     const localBytes = new Map<string, ArrayBuffer>();
@@ -4103,6 +4113,9 @@ describe("Persistent remote delta state", () => {
       getDriveItemMetadataById,
       downloadFile,
     });
+    const hostWriteSurface = input.hostEditorMerge !== undefined
+      || input.hostWriteSilent === true
+      || input.hostWriteLog !== undefined;
     const executor = new SyncExecutor(
       onedrive,
       {
@@ -4111,7 +4124,23 @@ describe("Persistent remote delta state", () => {
           adapter,
           getAbstractFileByPath: vi.fn((path: string) =>
             localBytes.has(path) ? new TFile(path) : null),
-          getFileByPath: vi.fn().mockReturnValue(null),
+          // 宿主写入面在场时宿主认得库索引里的文件；缺席＝没有可被切走的视图，
+          // 下载保持原子替换（与 `commitDownloadedTempFile` 的路由判据一致）。
+          getFileByPath: hostWriteSurface
+            ? vi.fn((path: string) => (localBytes.has(path) ? new TFile(path) : null))
+            : vi.fn().mockReturnValue(null),
+          ...(hostWriteSurface
+            ? {
+                modify: vi.fn(async (file: TFile, data: string) => {
+                  input.hostWriteLog?.push(data);
+                  if (input.hostWriteSilent) return;
+                  await adapter.writeBinary(
+                    file.path,
+                    new TextEncoder().encode(`${data}${input.hostEditorMerge ?? ""}`).buffer,
+                  );
+                }),
+              }
+            : {}),
           getFiles: vi.fn().mockReturnValue([]),
           getName: vi.fn().mockReturnValue("testVault"),
           rename: vi.fn(async (file: TFile, target: string) => {
@@ -4122,8 +4151,13 @@ describe("Persistent remote delta state", () => {
       } as unknown as LocalScanner,
       state,
       "testVault",
-      undefined,
+      input.i18n,
       input.progressStore,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      input.noticeCenter,
     );
     return {
       adapter,
@@ -4138,6 +4172,23 @@ describe("Persistent remote delta state", () => {
       state,
       uploadFile,
     };
+  }
+
+  function makeNoticeRecorder(): {
+    center: EasySyncNoticeCenter;
+    messages: string[];
+  } {
+    const messages: string[] = [];
+    const center = new EasySyncNoticeCenter((message) => {
+      messages.push(String(message));
+      return {
+        setMessage(next) {
+          messages.push(String(next));
+        },
+        hide: vi.fn(),
+      };
+    });
+    return { center, messages };
   }
 
   it("reopens review for a stale manual resolution and replaces it with a fresh choice", async () => {
@@ -4306,6 +4357,127 @@ describe("Persistent remote delta state", () => {
     expect(harness.state.mutationLedger).toEqual([]);
     expect(harness.uploadFile).not.toHaveBeenCalled();
     expect(new TextDecoder().decode(harness.localBytes.get("note.md")!)).toBe("cloud");
+  });
+
+  it("localizes the cloud version through the host write surface and settles the record", async () => {
+    // F12 余项②：手动恢复下载链把云端内容「本地化」进库时必须走「复制留底 + 宿主写入面
+    // 原地写」，而不是原子改名交换——从真实入口 `resolveMutationRecovery` 打到结局。
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const remoteBytes = encoder.encode("cloud\n");
+    const hostWriteLog: string[] = [];
+    const notice = makeNoticeRecorder();
+    const harness = await makeManualResolutionHarness({
+      path: "note.md",
+      local: { "note.md": "local\n" },
+      remote: { "note.md": "cloud\n" },
+      hostWriteLog,
+      noticeCenter: notice.center,
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-remote"))
+      .toBe(true);
+
+    // 落地走宿主写入面（一次、内容正确）。假体的宿主写入面经 adapter.writeBinary 落盘，
+    // 与生产通道不可在此接缝区分；可分辨的合同＝hostWriteLog 一次正确＋无改名交换。
+    expect(hostWriteLog).toEqual(["cloud\n"]);
+    expect(decoder.decode(harness.localBytes.get("note.md")!)).toBe("cloud\n");
+    // 原地写：除留底日志自身的簿记动作外没有任何改名，也没有 `.easy-sync-recovery` 副本。
+    const vaultRenames = vi.mocked(harness.adapter.rename).mock.calls
+      .map(([from, to]) => `${from} -> ${to}`)
+      .filter((entry) => !entry.split(" -> ")[1].startsWith(EASY_SYNC_TMP_DIR));
+    expect(vaultRenames).toEqual([]);
+    expect([...harness.localBytes.keys()].filter((path) =>
+      path.endsWith(".easy-sync-recovery"))).toEqual([]);
+    // 暂存文件与留底全部退休：插件 tmp 不留远端内容副本，也不留未完成事务。
+    expect([...harness.localBytes.keys()].filter((path) =>
+      path.startsWith(EASY_SYNC_TMP_DIR))).toEqual([]);
+    // 记账＝写入落地即成功：记录销账，基线记云端版本本身（hash/size/eTag 自洽）。
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.baseSnapshot).toEqual([expect.objectContaining({
+      path: "note.md",
+      hash: await sha256Hex(remoteBytes.buffer),
+      size: remoteBytes.byteLength,
+      eTag: "etag-1",
+    })]);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+    expect(notice.center.activeKey)
+      .toBe(`side-action:notice.mutationResolution.completed:note.md`);
+    notice.center.dispose();
+  });
+
+  it("counts a host merge of unsaved text as landed and keeps the remote version as the base", async () => {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    const remoteBytes = encoder.encode("cloud\n");
+    const hostWriteLog: string[] = [];
+    const harness = await makeManualResolutionHarness({
+      path: "note.md",
+      local: { "note.md": "local\n" },
+      remote: { "note.md": "cloud\n" },
+      hostEditorMerge: "unsaved\n",
+      hostWriteLog,
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-remote"))
+      .toBe(true);
+
+    // 宿主把未保存的行合并到我们写入的内容之后：写入已落地，这一轮记成功、记录销账，
+    // 用户的字留在磁盘上。
+    expect(hostWriteLog).toEqual(["cloud\n"]);
+    expect(decoder.decode(harness.localBytes.get("note.md")!)).toBe("cloud\nunsaved\n");
+    expect(harness.state.mutationLedger).toEqual([]);
+    // 基线记云端版本本身，不是磁盘上的合并结果；合并结果属于「本机改动」，
+    // 留给下一轮按普通本机改动上传（`DECISIONS` 2026-09-23 第 9 点②）。
+    expect(harness.state.baseSnapshot).toEqual([expect.objectContaining({
+      path: "note.md",
+      hash: await sha256Hex(remoteBytes.buffer),
+      size: remoteBytes.byteLength,
+    })]);
+    expect(harness.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it("keeps the record and reports an honest reason when the host write never lands", async () => {
+    const decoder = new TextDecoder();
+    const hostWriteLog: string[] = [];
+    const notice = makeNoticeRecorder();
+    const zh = new I18n("zh-cn");
+    const harness = await makeManualResolutionHarness({
+      path: "note.md",
+      local: { "note.md": "local\n" },
+      remote: { "note.md": "cloud\n" },
+      hostWriteSilent: true,
+      hostWriteLog,
+      i18n: zh,
+      noticeCenter: notice.center,
+    });
+    const reviewed = await harness.executor.getMutationRecoveryResolutionSnapshot();
+
+    expect(await harness.executor.resolveMutationRecovery(reviewed!, "keep-remote"))
+      .toBe(false);
+
+    // 同轮有界重试（桌面预算 2 次）后如实放弃：本机一字未动，留底与暂存全部退休。
+    expect(hostWriteLog).toEqual(["cloud\n", "cloud\n"]);
+    expect(decoder.decode(harness.localBytes.get("note.md")!)).toBe("local\n");
+    expect([...harness.localBytes.keys()].filter((path) =>
+      path.startsWith(EASY_SYNC_TMP_DIR))).toEqual([]);
+    // 记录保留待重审：未落收据、未销账。
+    expect(harness.state.mutationLedger).toHaveLength(1);
+    expect((harness.state.mutationLedger[0] as MutationLedgerEntryV1).manualResolution)
+      .toMatchObject({ choice: "keep-remote", receipt: null });
+    // 用户看到的原因是本地化的「未能写入本机文件，本次未作更改」（逐字钉住定稿文案），
+    // 不是英文内部串，也不是「状态已变化」——那两句都会把没落地误说成用户的锅。
+    expect(notice.center.activeKey).toBe(`side-action:notice.conflict.failed:note.md`);
+    expect(notice.messages.some((line) =>
+      line.includes("未能写入本机文件，本次未作更改。请查看最新版本后重新选择。"))).toBe(true);
+    expect(notice.messages.some((line) => line.includes("Local replacement did not land")))
+      .toBe(false);
+    expect(notice.messages.some((line) =>
+      line.includes(zh.t("notice.mutationResolution.changed")))).toBe(false);
+    expect(notice.messages).toHaveLength(1);
+    notice.center.dispose();
   });
 
   it("supports both explicit deletion directions without guessing from absence", async () => {

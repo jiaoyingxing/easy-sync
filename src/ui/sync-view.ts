@@ -3605,6 +3605,8 @@ export class EasySyncSyncView extends ItemView {
       renderSummaryLine(t("syncPlan.cloudJoinSummary"));
     } else if (activationReviewKind === "v2-first-sync") {
       renderSummaryLine(t("syncPlan.firstSyncSummary"));
+    } else if (activationReviewKind === "v2-rs-adoption") {
+      renderSummaryLine(t("syncPlan.rsAdoptionSummary"));
     } else if (items.some(
       (item) => item.type === SyncActionType.RecreateRemoteScope,
     )) {

@@ -12,6 +12,9 @@ export default defineConfig([
       "scripts/**",
       "node_modules/**",
       "**/.codex-tmp*/**",
+      // 登记保留的临时探针／夹具目录（各保留理由见对应开发日志），非产品代码：
+      // 独立 .mjs 不在 tsconfig project service 内，纳入会产生解析错误类假告警。
+      "outputs/**",
       "vitest.config.ts",
     ],
   },

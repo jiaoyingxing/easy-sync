@@ -23,6 +23,7 @@ import {
   type DriveItem,
   type DeltaResponse,
   type DeltaPageCallback,
+  type RemotelySaveRepositoryLocation,
   type RemoteVaultScope,
   type UploadResult,
   OneDriveError,
@@ -1277,7 +1278,7 @@ export class OneDriveClient {
         if (isAbortError(rawError)) throw rawError;
         const error = rawError instanceof OneDriveError
           ? rawError
-          : this.toRequestError(rawError, uploadUrl);
+          : this.toRequestError(rawError, uploadUrl, false, undefined, "PUT");
         if (isUncancellableRequestTimeout(error)) throw error;
         if (!isRecoverableUploadSessionError(error)) throw error;
         recoveriesForRange++;
@@ -1371,7 +1372,7 @@ export class OneDriveClient {
       );
       if (isAbortError(fetchError)) throw fetchError;
       if (!isFetchUnavailableError(fetchError)) {
-        const classified = classifyUploadSessionUrlError(this.toRequestError(fetchError, uploadUrl));
+        const classified = classifyUploadSessionUrlError(this.toRequestError(fetchError, uploadUrl, false, undefined, "PUT"));
         if (isRequestTimeoutError(fetchError)) {
           throw new OneDriveError(
             OneDriveErrorType.NetworkError,
@@ -1422,7 +1423,7 @@ export class OneDriveClient {
         "onedrive",
         `large upload chunk failed — range=${start}-${end}, bytes=${chunk.byteLength}, hostError=${requestErrorMessage(rawError)}`,
       );
-      throw classifyUploadSessionUrlError(this.toRequestError(rawError, uploadUrl));
+      throw classifyUploadSessionUrlError(this.toRequestError(rawError, uploadUrl, false, undefined, "PUT"));
     }
   }
 
@@ -1442,7 +1443,7 @@ export class OneDriveClient {
         if (isAbortError(rawError)) throw rawError;
         const error = rawError instanceof OneDriveError
           ? rawError
-          : this.toRequestError(rawError, uploadUrl);
+          : this.toRequestError(rawError, uploadUrl, false, undefined, "PUT");
         if (
           isUncancellableRequestTimeout(error)
           || !isTransientRequestError(error)
@@ -1497,7 +1498,7 @@ export class OneDriveClient {
       );
       if (isAbortError(fetchError)) throw fetchError;
       if (!isFetchUnavailableError(fetchError)) {
-        throw classifyUploadSessionUrlError(this.toRequestError(fetchError, uploadUrl));
+        throw classifyUploadSessionUrlError(this.toRequestError(fetchError, uploadUrl, false, undefined, "PUT"));
       }
     }
 
@@ -1515,7 +1516,7 @@ export class OneDriveClient {
         rawAttemptStatus(rawError, method === "GET" ? this.abortSignal : null),
         fallbackStartedAt,
       );
-      throw classifyUploadSessionUrlError(this.toRequestError(rawError, uploadUrl));
+      throw classifyUploadSessionUrlError(this.toRequestError(rawError, uploadUrl, false, undefined, "PUT"));
     }
   }
 
@@ -1526,7 +1527,7 @@ export class OneDriveClient {
     } catch (error) {
       const classified = error instanceof OneDriveError
         ? error
-        : this.toRequestError(error, uploadUrl);
+          : this.toRequestError(error, uploadUrl, false, undefined, "PUT");
       if (classified.type !== OneDriveErrorType.NotFound) {
         this.diag?.warn(
           "onedrive",
@@ -2083,6 +2084,134 @@ export class OneDriveClient {
     return response.json as DriveItem;
   }
 
+  // ---- Foreign App Folder (Remotely Save adoption) ----
+
+  /** Read-only scan for a Remotely Save repository that pairs with one vault.
+   *  GET only and never touches special/approot, so it cannot create any
+   *  folder as an observable side effect. Pairing is strict: the vault
+   *  directory must exactly equal the vault name (a renamed vault must not
+   *  adopt a stale directory). An end-to-end encrypted remote (every synced
+   *  file carries an unrecognisable cipher name) cannot be adopted either,
+   *  so it classifies as null too and the caller silently walks the normal
+   *  first sync. Returns null when any level of the expected layout is
+   *  absent — absence is a normal outcome, not an error. */
+  async detectRemotelySaveRepository(
+    vaultName: string,
+  ): Promise<RemotelySaveRepositoryLocation | null> {
+    const rootFolders: DriveItem[] = [];
+    let rootUrl: string | null = "/me/drive/root/children?$top=200&$select=id,name,folder";
+    let rootPages = 0;
+    while (rootUrl) {
+      if (rootPages >= REMOTELY_SAVE_MAX_ROOT_PAGES) {
+        this.diag?.warn(
+          "onedrive",
+          "Remotely Save detection gave up: root listing exceeded the page budget",
+          { pages: rootPages, mutations: 0 },
+        );
+        return null;
+      }
+      const response = await this.request("GET", rootUrl);
+      const data = response.json as {
+        value?: DriveItem[];
+        "@odata.nextLink"?: string;
+      };
+      rootFolders.push(...(data.value ?? []));
+      rootUrl = data["@odata.nextLink"] ?? null;
+      rootPages++;
+    }
+    const container = rootFolders.find(
+      (item) => item.folder
+        && REMOTELY_SAVE_APPS_CONTAINER_NAMES.has(item.name.toLowerCase()),
+    );
+    if (!container?.id) return null;
+    const containerChildren = await this.listFolderChildrenById(container.id);
+    const remotelySaveDir = containerChildren.find(
+      (item) => item.folder
+        && item.name.toLowerCase() === REMOTELY_SAVE_DIR_NAME,
+    );
+    if (!remotelySaveDir?.id) return null;
+    const remotelySaveChildren = await this.listFolderChildrenById(
+      remotelySaveDir.id,
+    );
+    const vaultDir = remotelySaveChildren.find(
+      (item) => item.folder && item.name === vaultName,
+    );
+    if (!vaultDir?.id) return null;
+    const vaultDirChildren = await this.listFolderChildrenById(vaultDir.id);
+    if (classifyRemotelySaveVaultChildren(vaultDirChildren) === "encrypted") {
+      this.diag?.log(
+        "onedrive",
+        "Remotely Save repository looks end-to-end encrypted; the adoption offer stays hidden",
+        { vault: vaultName, mutations: 0 },
+      );
+      return null;
+    }
+    const driveId = vaultDir.parentReference?.driveId
+      ?? remotelySaveDir.parentReference?.driveId
+      ?? container.parentReference?.driveId;
+    if (!driveId) {
+      throw new Error("Remotely Save detection could not resolve a drive identity");
+    }
+    return {
+      driveId,
+      appsContainerId: container.id,
+      remotelySaveDirId: remotelySaveDir.id,
+      vaultDirId: vaultDir.id,
+    };
+  }
+
+  /** Copy one driveItem subtree into a same-drive destination folder.
+   *  Graph copy is asynchronous and its monitor URL lives on a SharePoint
+   *  host that must not receive the Graph token, so completion is observed by
+   *  polling the destination children for the expected name. The caller must
+   *  guarantee the destination does not already hold that name (personal
+   *  OneDrive copies fail server-side on name conflicts, and conflictBehavior
+   *  is unsupported there). */
+  async copyItemById(
+    driveItemId: string,
+    targetParentId: string,
+    expectedName: string,
+    options?: { timeoutMs?: number; pollIntervalMs?: number },
+  ): Promise<DriveItem> {
+    await this.request(
+      "POST",
+      `/me/drive/items/${encodeURIComponent(driveItemId)}/copy`,
+      { parentReference: { id: targetParentId } },
+    );
+    const arrived = await this.pollChildArrivedInParent(
+      targetParentId,
+      expectedName,
+      options?.timeoutMs ?? REMOTELY_SAVE_COPY_TIMEOUT_MS,
+      options?.pollIntervalMs ?? REMOTELY_SAVE_COPY_POLL_INTERVAL_MS,
+    );
+    if (!arrived) {
+      throw new OneDriveError(
+        OneDriveErrorType.ServerError,
+        `Copy of drive item did not appear in the destination within its deadline: ${expectedName}`,
+      );
+    }
+    return arrived;
+  }
+
+  /** Poll a destination folder until one child with the expected name shows
+   *  up, or the deadline elapses (null). Used for asynchronous Graph copy and
+   *  as the arrival check after folder moves that Graph answers 202. */
+  async pollChildArrivedInParent(
+    parentId: string,
+    expectedName: string,
+    timeoutMs: number,
+    pollIntervalMs: number,
+  ): Promise<DriveItem | null> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await sleepWithAbort(pollIntervalMs, this.abortSignal);
+      const children = await this.listFolderChildrenById(parentId);
+      const found = children.find((item) => item.name === expectedName);
+      if (found?.id) return found;
+    }
+    return null;
+  }
+
   /** Fetch current metadata for a single file — used when an If-Match upload
    *  fails with 412 to get fresh remote info for conflict creation. */
   async getFileMetadata(
@@ -2461,7 +2590,7 @@ export class OneDriveClient {
         host: cdnHostOfDownloadUrl(downloadUrl),
         component,
         elapsedMs: Date.now() - readStartedAt,
-      });
+      }, "GET");
     }
     return {
       id: item.id,
@@ -3140,7 +3269,7 @@ export class OneDriveClient {
               OneDriveErrorType.NetworkError,
               rawError.message,
             )
-          : this.toRequestError(rawError, url, options.expectedNotFound === true);
+          : this.toRequestError(rawError, url, options.expectedNotFound === true, undefined, method);
         if (syntheticTimeout) {
           this.diag?.warn(
             "onedrive",
@@ -3210,7 +3339,7 @@ export class OneDriveClient {
           if (!(method === "PUT" && error.type === OneDriveErrorType.Conflict)) {
             this.diag?.warn(
               "onedrive",
-              `request failed — attempt=${attempt}/${maxAttempts}, type=${error.type}, url=${sanitizeUrl(url)}`,
+              `request failed — attempt=${attempt}/${maxAttempts}, type=${error.type}, method=${method}, url=${sanitizeUrl(url)}`,
             );
           }
           throw error;
@@ -3219,7 +3348,7 @@ export class OneDriveClient {
         const waitMs = retryDelayMs(error, attempt);
         this.diag?.warn(
           "onedrive",
-          `request retry — attempt=${attempt}/${maxAttempts}, type=${error.type}, waitMs=${waitMs}, url=${sanitizeUrl(url)}`,
+          `request retry — attempt=${attempt}/${maxAttempts}, type=${error.type}, method=${method}, waitMs=${waitMs}, url=${sanitizeUrl(url)}`,
         );
         if (options.deadlineMs && Date.now() + waitMs >= options.deadlineMs) {
           throw error;
@@ -3235,10 +3364,14 @@ export class OneDriveClient {
     url: string,
     suppressExpectedNotFoundWarning = false,
     detail?: Record<string, unknown>,
+    method?: string,
   ): OneDriveError {
     if (rawError instanceof OneDriveError) return rawError;
-    // Obsidian's requestUrl throws on non-2xx. The error object carries
-    // status, headers, and sometimes json/text from the response.
+    // Obsidian's requestUrl throws on non-2xx. The thrown error carries only
+    // message/status/headers — the host discards the response body on the
+    // error path (verified against the app bundle, 2026-10-01), so the body
+    // can never be recovered from it and graphCode stays "none" unless a
+    // future host change starts exposing it.
     const errAny = isRecord(rawError) ? rawError : {};
     const errStatus = typeof errAny.status === "number" ? errAny.status : 0;
     const errHeaders = isStringRecord(errAny.headers) ? errAny.headers : {};
@@ -3262,19 +3395,25 @@ export class OneDriveClient {
     const graphMsgText = typeof graphErr?.message === "string"
       ? graphErr.message
       : "none";
+    const methodPrefix = method ? `method=${method}, ` : "";
+    // The host never exposes the body on the error path today; keep the note
+    // tied to the "none" case so it self-corrects if that ever changes.
+    const bodyVisibilityNote = graphCodeText === "none"
+      ? ", responseBody=not exposed on requestUrl error path"
+      : "";
     // 409 is "folder already exists" — handled gracefully, don't alarm the user
     if (errStatus === 409) {
-      this.diag?.log("onedrive", `requestUrl 409 — ${sanitizeUrl(url)}`);
+      this.diag?.log("onedrive", `requestUrl 409 — ${methodPrefix}${sanitizeUrl(url)}`);
     } else if (errStatus > 0 && !(suppressExpectedNotFoundWarning && errStatus === 404)) {
       this.diag?.warn(
         "onedrive",
-        `requestUrl HTTP error — status=${errStatus}, graphCode=${graphCodeText}, graphMsg=${graphMsgText}, url=${sanitizeUrl(url)}`,
+        `requestUrl HTTP error — ${methodPrefix}status=${errStatus}, graphCode=${graphCodeText}, graphMsg=${graphMsgText}${bodyVisibilityNote}, url=${sanitizeUrl(url)}`,
         detail,
       );
     } else if (errStatus === 0) {
       this.diag?.warn(
         "onedrive",
-        `request transport failed — HTTP status unavailable, errorMessage=${requestErrorMessage(rawError)}, url=${sanitizeUrl(url)}`,
+        `request transport failed — HTTP status unavailable${method ? `, method=${method}` : ""}, errorMessage=${requestErrorMessage(rawError)}, url=${sanitizeUrl(url)}`,
         detail,
       );
     }
@@ -3727,6 +3866,45 @@ function tryParseGraphError(response: RequestUrlResponse): {
 
 const GRAPH_ORIGIN = new URL(GRAPH_BASE_URL).origin;
 const GRAPH_API_PATH_PREFIX = new URL(GRAPH_BASE_URL).pathname;
+
+// Foreign App Folder (Remotely Save adoption) constants. The observed layout
+// and the localized "Apps" container names come from the 2026-09/10 real
+// account probes recorded in the migration feasibility carrier.
+const REMOTELY_SAVE_APPS_CONTAINER_NAMES = new Set(["apps", "应用", "applications"]);
+const REMOTELY_SAVE_DIR_NAME = "remotely-save";
+const REMOTELY_SAVE_METADATA_BASE_NAME = "_remotely-save-metadata-on-remote";
+const REMOTELY_SAVE_MAX_ROOT_PAGES = 25;
+/** Filename shapes produced by rclone-crypt-style name encryption (research
+ *  doc §124): a long unrecognisable token with no extension. */
+const REMOTELY_SAVE_CIPHER_NAME_PATTERN = /^[A-Za-z0-9_-]{16,}$/;
+
+/** Decide whether a Remotely Save vault directory holds plaintext content or
+ *  end-to-end encrypted ciphertext. Encrypted remotes encrypt every file
+ *  name, so their synced files carry no meaningful extension at all, while a
+ *  plaintext vault always exposes at least one ordinary one (.md notes,
+ *  attachments). Encrypted content cannot be adopted: detection must keep
+ *  the adoption offer hidden and let normal first sync run (design contract
+ *  "encrypted users never see the modal"). A listing without files cannot be
+ *  classified and stays "plain" — an empty source is handled by the
+ *  transaction on its own. */
+export function classifyRemotelySaveVaultChildren(
+  children: readonly DriveItem[],
+): "plain" | "encrypted" {
+  const files = children.filter(
+    (item) => !item.folder
+      && !item.name.startsWith(`${REMOTELY_SAVE_METADATA_BASE_NAME}.`),
+  );
+  if (files.length === 0) return "plain";
+  if (files.some((item) => /\.[A-Za-z0-9]{1,8}$/.test(item.name))) {
+    return "plain";
+  }
+  return files.some((item) => REMOTELY_SAVE_CIPHER_NAME_PATTERN.test(item.name))
+    ? "encrypted"
+    : "plain";
+}
+
+const REMOTELY_SAVE_COPY_TIMEOUT_MS = 180_000;
+const REMOTELY_SAVE_COPY_POLL_INTERVAL_MS = 3_000;
 
 /** Resolve the only routes that may receive a Microsoft Graph bearer token. */
 function resolveAuthenticatedGraphUrl(apiPath: string): string {

@@ -266,7 +266,10 @@ export class MigrationHoldV2Store {
     if (
       !current
       || current.phase !== "pending"
-      || migrationHoldReviewKindV2(current) !== "v2-first-sync"
+      || (
+        migrationHoldReviewKindV2(current) !== "v2-first-sync"
+        && migrationHoldReviewKindV2(current) !== "v2-rs-adoption"
+      )
       || current.revision !== expectedRevision
       || !sameCanonicalPlanIdentityV2(
         current.canonicalIdentity,
@@ -385,6 +388,7 @@ export function validateMigrationHoldV2(
       && value.reviewKind !== "v2-migration"
       && value.reviewKind !== "v2-cloud-join"
       && value.reviewKind !== "v2-first-sync"
+      && value.reviewKind !== "v2-rs-adoption"
     )
   ) {
     throw new Error("V2 migration hold has an unsupported format");
@@ -428,7 +432,10 @@ export function validateMigrationHoldV2(
     value.phase === "pending"
     && value.protocolBinding !== undefined
     && (
-      value.reviewKind !== "v2-first-sync"
+      (
+        value.reviewKind !== "v2-first-sync"
+        && value.reviewKind !== "v2-rs-adoption"
+      )
       || !isSharedSyncProtocolBindingV2(value.protocolBinding)
     )
   ) {

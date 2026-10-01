@@ -9,7 +9,7 @@
  * device login fires its request there) before the modal closes.
  */
 
-import { Platform, setIcon, type App } from "obsidian";
+import { Platform, type App } from "obsidian";
 import { EasySyncModal } from "./easy-sync-modal";
 
 export type AuthMethodResult =
@@ -105,26 +105,8 @@ export class AuthMethodModal extends EasySyncModal {
     }
   }
 
-  private buildOptionButton(option: AuthMethodOptionView): HTMLButtonElement {
-    const button = this.contentEl.createEl("button", {
-      cls: "easy-sync-auth-method-option",
-      type: "button",
-    });
-    const body = button.createDiv({ cls: "easy-sync-auth-method-body" });
-    body.createDiv({
-      text: option.title,
-      cls: "easy-sync-auth-method-title",
-    });
-    body.createDiv({
-      text: option.description,
-      cls: "easy-sync-auth-method-desc",
-    });
-    const chevron = button.createSpan({
-      cls: "easy-sync-auth-method-chevron",
-    });
-    setIcon(chevron, "chevron-right");
-    return button;
-  }
+  // Option-row construction is inherited from EasySyncModal (shared with the
+  // Remotely Save migration offer; extraction 2026-10-01).
 
   onClose(): void {
     const resolve = this.resolve;

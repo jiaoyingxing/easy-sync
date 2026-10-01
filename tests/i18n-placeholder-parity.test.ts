@@ -149,4 +149,38 @@ describe("i18n placeholder parity", () => {
     expect(en["opHolder.logout"]).toBe("Log out");
     expect(en["opHolder.other"]).toBe("Another operation");
   });
+
+  it("locks the 2026-10-01 RS migration copy (user-annotated wording)", () => {
+    expect(zhCN["syncPlan.rsAdoptionSummary"]).toBe(
+      "旧仓库已并入 EasySync 的云端目录。与云端一致的文件按现状登记、不再上传；下方差异经你确认后执行，不可撤回（OneDrive 回收站除外）。",
+    );
+    expect(zhCN["rsMigration.offerTitle"]).toBe("检测到 Remotely Save 云端仓库");
+    expect(zhCN["rsMigration.offerBody"]).toBe(
+      "「{vault}」之前用 Remotely Save 同步。可以接管，不用重新上传。",
+    );
+    expect(zhCN["rsMigration.offerMigrateTitle"]).toBe("迁移");
+    expect(zhCN["rsMigration.offerMigrateDesc"]).toBe(
+      "把旧仓库整体移入 EasySync 的云端目录。确认执行后不可撤回。",
+    );
+    expect(zhCN["rsMigration.offerFreshTitle"]).toBe("直接同步");
+    expect(zhCN["rsMigration.offerFreshDesc"]).toBe(
+      "忽略旧仓库，从当前本机内容开始同步。",
+    );
+    expect(zhCN["rsMigration.detectNotice"]).toBe(
+      "检测到 Remotely Save 的云端仓库，首次同步时可接管迁移，无需重新上传。",
+    );
+    expect(zhCN["rsMigration.completedNotice"]).toBe(
+      "迁移完成：旧仓库已并入 EasySync 云端目录。请在所有设备上停用 Remotely Save。",
+    );
+    expect(zhCN["rsMigration.failureBodyDestination"]).toBe(
+      "EasySync 的云端目录里已有内容，无法自动搬入。你的内容没有任何改动。",
+    );
+    expect(zhCN["rsMigration.failureFreshSync"]).toBe("改为直接同步");
+    expect(zhCN["rsMigration.guideOk"]).toBe("知道了");
+    expect(en["rsMigration.offerFreshTitle"]).toBe("Direct sync");
+    expect(en["rsMigration.failureFreshSync"]).toBe(
+      "Switch to a direct sync instead",
+    );
+    expect(en["rsMigration.guideOk"]).toBe("Got it");
+  });
 });
