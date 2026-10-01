@@ -229,8 +229,11 @@ export interface LocaleStrings {
   "notice.vaultCloudClient.icloud": string;
   "settings.about.product.name": string;
   "settings.about.product.desc": string;
+  "settings.about.updateNow": string;
   "settings.about.author.name": string;
   "settings.about.author.desc": string;
+  "settings.about.feedback.name": string;
+  "settings.about.feedback.desc": string;
   "settings.about.contact.github": string;
   "settings.about.contact.xiaohongshu": string;
 

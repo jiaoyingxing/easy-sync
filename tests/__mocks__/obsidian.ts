@@ -289,10 +289,13 @@ export class ButtonComponent {
     classList: { add: () => undefined },
     addClass: () => undefined,
     setAttribute: () => undefined,
+    empty: () => undefined,
+    createSpan: (_fields?: { cls?: string; text?: string }) => createMockElement(),
   } as unknown as HTMLButtonElement;
 
   constructor(_containerEl: HTMLElement) {}
   setButtonText(_text: string): this { return this; }
+  setClass(_cls: string): this { return this; }
   setIcon(_icon: string): this { return this; }
   setTooltip(_tooltip: string): this { return this; }
   setDisabled(_disabled: boolean): this { return this; }
@@ -516,10 +519,12 @@ export class DropdownComponent {
 
 export class Setting {
   descEl: HTMLElement = createMockElement();
+  nameEl: HTMLElement = createMockElement();
 
   constructor(_containerEl: HTMLElement) {}
   setName(_name: string): this { return this; }
   setDesc(_desc: string): this { return this; }
+  setClass(_cls: string): this { return this; }
   addButton(callback: (component: ButtonComponent) => void): this {
     callback(new ButtonComponent({} as HTMLElement));
     return this;

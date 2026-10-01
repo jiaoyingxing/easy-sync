@@ -75,6 +75,8 @@ function createMockPlugin(): EasySyncPlugin {
     executePlanReview: vi.fn(),
     cancelSync: vi.fn(),
     logoutUser: vi.fn().mockResolvedValue(undefined),
+    getUpdatePromptState: vi.fn(() => null),
+    openUpdatePage: vi.fn(),
   } as unknown as EasySyncPlugin;
 }
 
@@ -404,12 +406,88 @@ describe("declarative completeness vs display()", () => {
     expect(offPlugin.setAutoSyncMasterEnabled).toHaveBeenCalledWith(true);
   });
 
-  it("includes the about group with product and author entries", () => {
+  it("includes the about group with product, author and feedback entries", () => {
     const plugin = createMockPlugin();
     const i18n = new I18n("zh-cn");
     const defs = buildSettingDefinitions(i18n.t.bind(i18n), plugin);
     const items = itemsInGroup(defs, i18n.t("settings.group.about"));
     expect(items.some((i) => i.name === i18n.t("settings.about.product.name"))).toBe(true);
     expect(items.some((i) => i.name === i18n.t("settings.about.author.name"))).toBe(true);
+    expect(items.some((i) => i.name === i18n.t("settings.about.feedback.name"))).toBe(true);
+    // Author row carries the name only; usage/contact guidance lives in the
+    // feedback row below it.
+    const author = items.find((i) => i.name === i18n.t("settings.about.author.name"));
+    expect(author?.desc).not.toContain("使用中遇到问题");
+    const feedback = items.find((i) => i.name === i18n.t("settings.about.feedback.name"));
+    expect(feedback?.desc).toContain("使用中遇到问题");
+  });
+
+  it("shows the update chip and button on the product row only when an update is available", () => {
+    const plugin = createMockPlugin();
+    const i18n = new I18n("zh-cn");
+    const defs = buildSettingDefinitions(i18n.t.bind(i18n), plugin);
+    const items = itemsInGroup(defs, i18n.t("settings.group.about"));
+    const product = items.find((i) => i.name === i18n.t("settings.about.product.name"));
+
+    // No update -> the row stays plain: no chip span, no button.
+    const plain = new Setting({} as HTMLElement) as never;
+    const plainSpans: string[] = [];
+    const plainNameEl = (plain as unknown as { nameEl: HTMLElement }).nameEl;
+    (plainNameEl as unknown as { createSpan: (cls?: string) => unknown }).createSpan =
+      (cls?: string) => {
+        plainSpans.push(cls ?? "");
+        return {} as unknown;
+      };
+    const plainAddButton = vi.spyOn(plain as never, "addButton").mockReturnValue(plain as never);
+    product!.render!(plain);
+    expect(plainSpans).toHaveLength(0);
+    expect(plainAddButton).not.toHaveBeenCalled();
+
+    // Update available -> 「新版本」 chip on the name; the button hands off to
+    // the host plugin page via openUpdatePage().
+    (plugin as unknown as { getUpdatePromptState: () => unknown }).getUpdatePromptState =
+      () => ({ latest: "1.5.5", current: "1.5.4" });
+    const withUpdate = new Setting({} as HTMLElement) as never;
+    const chip: {
+      classList: { contains: (t: string) => boolean };
+      textContent?: string;
+      setText: (v: string) => void;
+    } = {
+      classList: { contains: () => false },
+      setText(v: string) {
+        this.textContent = v;
+      },
+    };
+    const withNameEl = (withUpdate as unknown as { nameEl: HTMLElement }).nameEl;
+    (withNameEl as unknown as { createSpan: (cls?: string) => unknown }).createSpan =
+      (cls?: string) => {
+        chip.classList.contains = (token: string) => token === cls;
+        return chip as unknown;
+      };
+    let clickHandler: (() => void) | null = null;
+    let buttonText = "";
+    vi.spyOn(withUpdate as never, "addButton").mockImplementation(
+      (cb: (b: unknown) => void) => {
+        const btn = {
+          setButtonText: (label: string) => {
+            buttonText = label;
+            return btn;
+          },
+          onClick: (h: () => void) => {
+            clickHandler = h;
+          },
+        };
+        cb(btn);
+        return withUpdate;
+      },
+    );
+    product!.render!(withUpdate);
+    expect(chip.classList.contains("easy-sync-plugin-selection-chip")).toBe(true);
+    // 定稿文案（2026-10-02 用户拍板）：存在句，不与版本标签混淆。
+    expect(chip.textContent).toBe("有新版本");
+    expect(chip.textContent).toBe(i18n.t("updateCheck.chip"));
+    expect(buttonText).toBe(i18n.t("settings.about.updateNow"));
+    clickHandler!();
+    expect(plugin.openUpdatePage).toHaveBeenCalledTimes(1);
   });
 });

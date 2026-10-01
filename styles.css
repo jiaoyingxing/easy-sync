@@ -1516,6 +1516,47 @@ body:not(.is-mobile) .easy-sync-settings-tab .setting-item-control button:not(.c
   min-width: calc(4em + var(--size-4-3) * 2);
 }
 
+/* About card contact buttons (author row): icon and label on one line; the
+   Xiaohongshu icon keeps its brand red. */
+.easy-sync-settings-about-contact-setting .setting-item-control {
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.easy-sync-settings-about-contact-setting .setting-item-control > .easy-sync-settings-about-contact-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  line-height: 1;
+}
+
+.easy-sync-settings-about-contact-setting .setting-item-control > .easy-sync-settings-about-contact-button .easy-sync-settings-about-contact-button-icon,
+.easy-sync-settings-about-contact-setting .setting-item-control > .easy-sync-settings-about-contact-button .easy-sync-settings-about-contact-button-label {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.easy-sync-settings-about-contact-setting .setting-item-control > .easy-sync-settings-about-contact-button .easy-sync-settings-about-contact-button-icon {
+  flex: 0 0 auto;
+}
+
+.easy-sync-settings-about-contact-setting .setting-item-control > .easy-sync-settings-about-contact-button .easy-sync-settings-about-contact-button-label {
+  line-height: 1;
+}
+
+.easy-sync-settings-about-contact-setting .setting-item-control > .easy-sync-settings-about-contact-button svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+
+.easy-sync-settings-about-contact-setting .setting-item-control > .easy-sync-settings-about-contact-button--xiaohongshu svg {
+  color: #e62e43;
+}
+
 /* Dedicated cloud cleanup affordance (route A first slice). */
 .easy-sync-plugin-cloud-cleanup-trigger {
   color: var(--text-error);

@@ -23,13 +23,6 @@
 
 EasySync keeps your Obsidian vault in sync across computers, phones, and tablets.
 
-> [!WARNING] Read this first
-> 1. **Don't mix it with other sync methods.** Don't put your vault inside a cloud-synced folder such as iCloud or the OneDrive client, and don't let other sync tools such as Obsidian Sync or Remotely Save manage the same vault. When two sync programs change the same files, they conflict with each other — files can even end up deleted, re-uploaded, and deleted again in a loop. Keep your vault in a plain local folder and let EasySync be the only tool managing it.
-> 2. **Set up every device separately.** Setting it up on one device doesn't make sync work everywhere: on each device you need to install EasySync, sign in to the same OneDrive account, configure its own settings, and run the sync.
-> 3. **You don't need the OneDrive app.** The plugin connects to your OneDrive account directly — installing EasySync and signing in is all it takes; it doesn't rely on the OneDrive client.
-> 4. **Use the same vault name on every device.** EasySync identifies the sync scope by vault name; vaults with different names are treated as two unrelated vaults and never sync with each other.
-> 5. **Run the first sync on the device with the most complete content, review the sync plan the plugin shows, and confirm it before continuing; your other devices can then sync and pull down everything.** The first sync builds the baseline and is slower than everyday syncs — that's normal.
-
 ## Table of contents
 
 - [1. Installation & first sync](#1-installation--first-sync)
@@ -42,6 +35,13 @@ EasySync keeps your Obsidian vault in sync across computers, phones, and tablets
 - [8. License and support](#8-license-and-support)
 
 ## 1. Installation & first sync
+
+> [!WARNING] Read this before installing and using
+> 1. **Don't mix it with other sync methods.** Don't put your vault inside a cloud-synced folder such as iCloud or the OneDrive client, and don't let other sync tools such as Obsidian Sync or Remotely Save manage the same vault. When two sync programs change the same files, they conflict with each other — files can even end up deleted, re-uploaded, and deleted again in a loop. Keep your vault in a plain local folder and let EasySync be the only tool managing it.
+> 2. **Set up every device separately.** Setting it up on one device doesn't make sync work everywhere: on each device you need to install EasySync, sign in to the same OneDrive account, configure its own settings, and run the sync.
+> 3. **You don't need the OneDrive app.** The plugin connects to your OneDrive account directly — installing EasySync and signing in is all it takes; it doesn't rely on the OneDrive client.
+> 4. **Use the same vault name on every device.** EasySync identifies the sync scope by vault name; vaults with different names are treated as two unrelated vaults and never sync with each other.
+> 5. **Run the first sync on the device with the most complete content, review the sync plan the plugin shows, and confirm it before continuing; your other devices can then sync and pull down everything.** The first sync builds the baseline and is slower than everyday syncs — that's normal.
 
 ### 1.1 Install the plugin
 

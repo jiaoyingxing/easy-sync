@@ -11,9 +11,12 @@
  */
 
 import {
+  ButtonComponent,
   Notice,
   PluginSettingTab,
   SettingGroup,
+  setIcon,
+  type Setting,
   type SettingDefinitionItem,
 } from "obsidian";
 import type EasySyncPlugin from "../main";
@@ -34,6 +37,61 @@ import {
 
 const GITHUB_URL = "https://github.com/jiaoyingxing/easy-sync";
 const XHS_URL = "https://xhslink.com/m/57v8xzlVMKp";
+
+/**
+ * Contact button for the About card: rebuilds the default text-only button
+ * content as icon + label spans on one line. Label doubles as tooltip and
+ * aria-label.
+ */
+function configureAboutContactButton(
+  button: ButtonComponent,
+  options: {
+    label: string;
+    icon: string;
+    url: string;
+    extraClassName?: string;
+  },
+): void {
+  button.setClass("easy-sync-settings-about-contact-button");
+  button.setTooltip(options.label);
+  button.buttonEl.setAttribute("aria-label", options.label);
+  button.onClick(() => {
+    window.open(options.url, "_blank", "noopener,noreferrer");
+  });
+  button.buttonEl.empty();
+  if (options.extraClassName) {
+    button.buttonEl.addClass(options.extraClassName);
+  }
+  const iconEl = button.buttonEl.createSpan({
+    cls: "easy-sync-settings-about-contact-button-icon",
+  });
+  setIcon(iconEl, options.icon);
+  button.buttonEl.createSpan({
+    cls: "easy-sync-settings-about-contact-button-label",
+    text: options.label,
+  });
+}
+
+/**
+ * 「新版本」chip + update button on the About product row. Visibility follows
+ * the shared update-prompt state (single source of truth, snooze-aware); the
+ * action hands off to the host plugin page — the plugin never self-installs.
+ */
+function renderAboutUpdateAffordance(
+  setting: Setting,
+  t: I18nFn,
+  plugin: EasySyncPlugin,
+): void {
+  if (!plugin.getUpdatePromptState()) return;
+  setting.nameEl
+    .createSpan("easy-sync-plugin-selection-chip")
+    .setText(t("updateCheck.chip"));
+  setting.addButton((btn) => {
+    btn.setButtonText(t("settings.about.updateNow")).onClick(() => {
+      plugin.openUpdatePage();
+    });
+  });
+}
 
 export interface SettingsSyncButtonStateInput {
   hasCompletedSync: boolean;
@@ -459,24 +517,35 @@ export class EasySyncSettingTab extends PluginSettingTab {
       setting
         .setName(t("settings.about.product.name"))
         .setDesc(t("settings.about.product.desc", { version: this.plugin.manifest.version }));
+      renderAboutUpdateAffordance(setting, t, this.plugin);
     });
 
     aboutGroup.addSetting((setting) => {
       setting
+        .setClass("easy-sync-settings-about-contact-setting")
         .setName(t("settings.about.author.name"))
         .setDesc(t("settings.about.author.desc"))
         .addButton((btn) => {
-          btn.setButtonText(t("settings.about.contact.github"))
-            .onClick(() => {
-              window.open(GITHUB_URL, "_blank", "noopener,noreferrer");
-            });
+          configureAboutContactButton(btn, {
+            label: t("settings.about.contact.github"),
+            icon: "github",
+            url: GITHUB_URL,
+          });
         })
         .addButton((btn) => {
-          btn.setButtonText(t("settings.about.contact.xiaohongshu"))
-            .onClick(() => {
-              window.open(XHS_URL, "_blank", "noopener,noreferrer");
-            });
+          configureAboutContactButton(btn, {
+            label: t("settings.about.contact.xiaohongshu"),
+            icon: "book-open",
+            url: XHS_URL,
+            extraClassName: "easy-sync-settings-about-contact-button--xiaohongshu",
+          });
         });
+    });
+
+    aboutGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.about.feedback.name"))
+        .setDesc(t("settings.about.feedback.desc"));
     });
   }
 
@@ -850,24 +919,35 @@ export function buildSettingDefinitions(
         {
           name: t("settings.about.product.name"),
           desc: t("settings.about.product.desc", { version: plugin.manifest.version }),
+          render: (setting) => {
+            renderAboutUpdateAffordance(setting, t, plugin);
+          },
         },
         {
           name: t("settings.about.author.name"),
           desc: t("settings.about.author.desc"),
           render: (setting) => {
+            setting.setClass("easy-sync-settings-about-contact-setting");
             setting.addButton((btn) => {
-              btn.setButtonText(t("settings.about.contact.github"))
-                .onClick(() => {
-                  window.open(GITHUB_URL, "_blank", "noopener,noreferrer");
-                });
+              configureAboutContactButton(btn, {
+                label: t("settings.about.contact.github"),
+                icon: "github",
+                url: GITHUB_URL,
+              });
             });
             setting.addButton((btn) => {
-              btn.setButtonText(t("settings.about.contact.xiaohongshu"))
-                .onClick(() => {
-                  window.open(XHS_URL, "_blank", "noopener,noreferrer");
-                });
+              configureAboutContactButton(btn, {
+                label: t("settings.about.contact.xiaohongshu"),
+                icon: "book-open",
+                url: XHS_URL,
+                extraClassName: "easy-sync-settings-about-contact-button--xiaohongshu",
+              });
             });
           },
+        },
+        {
+          name: t("settings.about.feedback.name"),
+          desc: t("settings.about.feedback.desc"),
         },
       ],
     },
