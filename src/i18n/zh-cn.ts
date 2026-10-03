@@ -380,7 +380,7 @@ const zhCN: LocaleStrings = {
   "result.conflictsPending": "本轮有 {conflicts} 项冲突待处理",
   "result.remoteDeletesPending": "本轮有 {deletes} 项云端删除待确认",
   "result.conflictsAndRemoteDeletesPending": "本轮有 {conflicts} 项冲突待处理，{deletes} 项云端删除待确认",
-  "result.deferred": "本轮有 {deferred} 个文件在同步前再次变化，已延后到下一轮",
+  "result.deferred": "本轮有 {deferred} 项未同步，将在下一轮自动处理",
   "result.folderNameClash": "部分文件夹名无法区分——仅大小写或 Unicode 等价写法不同（{paths}）。请保留想要的，将其余改名或移走。",
   "result.folderListIncomplete": "本机文件夹列表不完整，同步已暂停。请重新同步；若持续失败，请导出诊断报告。",
   "result.syncStateNotReady": "同步状态尚未完成准备，同步已暂停。请重新同步；若持续失败，请导出诊断报告。",

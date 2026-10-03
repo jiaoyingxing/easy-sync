@@ -381,7 +381,7 @@ const en: LocaleStrings = {
   "result.conflictsPending": "{conflicts} conflict(s) still need attention",
   "result.remoteDeletesPending": "{deletes} remote deletion(s) need confirmation",
   "result.conflictsAndRemoteDeletesPending": "{conflicts} conflict(s) need attention; {deletes} remote deletion(s) need confirmation",
-  "result.deferred": "{deferred} file(s) changed again before transfer and were deferred to the next run",
+  "result.deferred": "{deferred} item(s) were not synced and will be handled in the next run.",
   "result.folderNameClash": "Some folder names cannot be told apart — they differ only in capitalization or Unicode-equivalent spelling ({paths}). Keep the one you want, and rename or move the rest.",
   "result.folderListIncomplete": "The local folder list is incomplete and sync has paused. Please sync again; if this persists, export a diagnostic report.",
   "result.syncStateNotReady": "The sync state has not finished preparing and sync has paused. Please sync again; if this persists, export a diagnostic report.",

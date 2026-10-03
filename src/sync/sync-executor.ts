@@ -19188,7 +19188,38 @@ export class SyncExecutor {
         ) !== null
       )
     ) return null;
-    if (!intent.expectedLocal.exists || local.status !== "present" || !local.entry) return null;
+    if (!intent.expectedLocal.exists) return null;
+    if (local.status !== "present" || !local.entry) {
+      // F20 (field report 2026-10-03): the cloud rename landed and the user
+      // then deleted the local copy. The move anchors above already prove the
+      // rename; the local presence the plain branch demands was only ever
+      // corroboration, and the content proof is `intent.expectedLocal.hash`,
+      // which the intent has carried since it was created — so this settles
+      // without the remote reporting a sha256Hash at all. Reading the bytes
+      // back keeps the same fail-closed standard when the remote has no hash
+      // (OneDrive personal). The settlement writes nothing: the next ordinary
+      // round applies the normal local-deletion decision, or protects the
+      // path with a rename-identity conflict when the file merely moved on.
+      // A copy still sitting at the source path means the user moved it back
+      // rather than deleting it — that stays blocked for a human.
+      const sourceLocal = await this.inspectLocalPath(intent.sourcePath);
+      if (
+        !sourceLocal
+        || sourceLocal.status !== "missing"
+        || !await this.remoteMatchesTarget(target, intent.expectedLocal)
+      ) return null;
+      this.convergencesThisRound++;
+      checkpoint.baseRemovals.push(intent.sourcePath);
+      checkpoint.baseUpserts.push({
+        path: intent.path,
+        hash: intent.expectedLocal.hash,
+        size: intent.expectedLocal.size,
+        eTag: target.eTag,
+      });
+      checkpoint.remoteDeletes.push(intent.sourcePath);
+      checkpoint.remoteUpserts.push(target);
+      return checkpoint;
+    }
     if (!localStillExpected) return null;
     if (intent.expectedRemote.sha256Hash === undefined) {
       // F17: sha-unknown remote rename/move — settle as a plain move on the
@@ -21887,7 +21918,35 @@ export class SyncExecutor {
     } = args;
     if (!item.local) return { executed: true };
     const readStartedAt = Date.now();
-    const content = await this.scanner.vault.adapter.readBinary(item.path);
+    let content: ArrayBuffer;
+    try {
+      content = await this.scanner.vault.adapter.readBinary(item.path);
+    } catch (readError) {
+      // The local source can be renamed or deleted between scan and execution
+      // (default-named new notes are renamed within seconds). A read failure
+      // alone proves nothing — only a fresh inspection that confirms the path
+      // is missing may be treated as scan-window drift, then the item defers
+      // like content drift so the next round replans from the current local
+      // tree. Any other outcome keeps the honest hard failure (2026-10-02,
+      // F19; same shape as the download-side LocalCommitPreconditionError).
+      const inspected = await this.inspectLocalPath(item.path);
+      if (inspected?.status !== "missing") throw readError;
+      this.diag?.warn(
+        "execute",
+        `upload skipped — ${item.path} disappeared since scan (${readError instanceof Error ? readError.message : String(readError)})`,
+      );
+      if (factsChangedPolicy === "throw") {
+        throw new MutationNotAppliedError(
+          new Error(`Manual upload source disappeared: ${item.path}`),
+        );
+      }
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.RetryLater,
+        completionReason: this.t("syncView.fileStatus.deferred"),
+      };
+    }
     const readElapsedMs = Date.now() - readStartedAt;
     metrics.uploadReadMs += readElapsedMs;
     metrics.fileTransfers.upload.stagesMs.sourceRead += readElapsedMs;
