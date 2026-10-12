@@ -114,6 +114,7 @@ export function createMockElement(): HTMLElement {
     children: [] as unknown[],
     innerHTML: "",
     textContent: "",
+    style: {} as Record<string, string>,
   };
   element.empty = () => {
     element.innerHTML = "";
@@ -159,6 +160,11 @@ export function createMockElement(): HTMLElement {
   element.appendChild = (_child: unknown) => element;
   element.closest = () => null;
   element.querySelector = () => null;
+  element.querySelectorAll = () => [] as unknown[];
+  // 官方动态样式口子（obsidianmd/no-static-styles-assignment 指向它）。
+  element.setCssProps = (props: Record<string, string>) => {
+    Object.assign(element.style as Record<string, string>, props);
+  };
   element.isConnected = false;
   return element as unknown as HTMLElement;
 }
@@ -520,6 +526,8 @@ export class DropdownComponent {
 export class Setting {
   descEl: HTMLElement = createMockElement();
   nameEl: HTMLElement = createMockElement();
+  controlEl: HTMLElement = createMockElement();
+  settingEl: HTMLElement = createMockElement();
 
   constructor(_containerEl: HTMLElement) {}
   setName(_name: string): this { return this; }

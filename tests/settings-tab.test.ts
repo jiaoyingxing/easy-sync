@@ -2,8 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { ConfigSyncModal, isPluginRowHiddenByCloudCleanup } from "../src/ui/config-sync-modal";
 import { SyncPlanAlertModal } from "../src/ui/confirm-modal";
-import { ButtonComponent, createMockElement } from "./__mocks__/obsidian";
+import { ButtonComponent, Setting, createMockElement } from "./__mocks__/obsidian";
 import { EasySyncSettingTab } from "../src/ui/settings-tab";
+import { I18n } from "../src/i18n";
 import en from "../src/i18n/en";
 import zhCN from "../src/i18n/zh-cn";
 import type EasySyncPlugin from "../src/main";
@@ -92,33 +93,32 @@ describe("settings tab", () => {
     );
     expect(displaySection).toContain("renderHint();");
 
-    // Declarative path mirrors the same hint wiring for Obsidian 1.13+.
-    const declarativeStart = source.indexOf("export function buildSettingDefinitions(");
-    const declarative = source.slice(declarativeStart);
-    expect(declarative).toContain('cls: "easy-sync-notification-popups-hint"');
+    // Declarative path mirrors the same hint wiring for Obsidian 1.13+；1.13+ 起
+    // 通知行实现住在设置页行模块（2026-10-12 重构）。
+    const declarative = readFileSync("src/ui/settings-page-rows.ts", "utf8");
+    expect(declarative).toContain('"easy-sync-notification-popups-hint"');
     expect(declarative).toContain(
       't(`settings.notificationPopups.hint.${plugin.notificationPopups}`)',
     );
   });
 
-  it("mirrors tooltip and aria-label on the declarative automatic-handling button (C10-2)", () => {
+  it("keeps tooltip and aria-label on the automatic-handling entry of the legacy path (C10-2)", () => {
     const source = readFileSync("src/ui/settings-tab.ts", "utf8");
+    const sectionStart = source.indexOf("  private renderAutomaticSection(");
+    const sectionEnd = source.indexOf("  private renderDisplaySection(");
+    const section = source.slice(sectionStart, sectionEnd);
+
+    // <1.13 旧路径的弹框入口按钮保留 tooltip + aria-label（C10-2 不丢）。
+    expect(section).toContain('setTooltip(t("settings.automaticHandling.open"))');
+    expect(section).toContain('"aria-label"');
+    expect(section).toContain('t("settings.automaticHandling.open"),');
+
+    // 1.13+ 声明式路径不再有弹框入口（页内直接是两条开关）：parity＝不存在，
+    // 因此本轮不再要求声明式侧镜像 tooltip/aria-label（2026-10-12 重构）。
     const declarativeStart = source.indexOf("export function buildSettingDefinitions(");
     const declarative = source.slice(declarativeStart);
-    const automaticGroupStart = declarative.indexOf(
-      'heading: t("settings.group.automatic")',
-    );
-    const automaticGroupEnd = declarative.indexOf('type: "group"', automaticGroupStart);
-    const automaticGroup = declarative.slice(automaticGroupStart, automaticGroupEnd);
-
-    // The command-style block (renderAutomaticSection) already carries both;
-    // the declarative twin must not lose tooltip/aria parity (C10-2).
-    expect(automaticGroup).toContain(
-      'setButtonText(t("settings.automaticHandling.button"))\n                .setTooltip(t("settings.automaticHandling.open"))',
-    );
-    expect(automaticGroup).toContain(
-      '"aria-label",\n                t("settings.automaticHandling.open"),',
-    );
+    expect(declarative).not.toContain("settings.automaticHandling.open");
+    expect(declarative).toContain('applyAutomaticHandlingRow(setting, host, "autoDeleteLocalFiles")');
   });
 
   it("keeps account actions unheaded and separates range from automatic settings", () => {
@@ -389,6 +389,35 @@ describe("settings tab", () => {
     expect(en["notice.communityPlugins.enableFilesFirst"]).toBe(
       "Turn on Community plugins first.",
     );
+  });
+
+  it("mounts the settings-page community scope rows with the modal chip layout", () => {
+    // 1.13+ 页面行与弹框同口径（settings-page-rows 模块头 S1 双轨）：
+    // ① 行类触发 nameEl 的 flex+gap（styles.css），缺了 chip 会紧贴行名；
+    // ② chip 挂点必须在最后一次 setName 之后——setName 会重写 nameEl 内容，
+    //    先挂上去的 chip 会被冲掉（真机 1.13：同步 chip 消失、实验性 chip
+    //    因创建在后而幸存）。
+    const source = readFileSync("src/ui/settings-page-rows.ts", "utf8");
+    const fnStart = source.indexOf("export function applyCommunityPluginScopeRow(");
+    const fnEnd = source.indexOf("/** 不同步的文件夹行", fnStart);
+    const fn = source.slice(fnStart, fnEnd === -1 ? undefined : fnEnd);
+    expect(fn).toContain(
+      'setting.setClass("easy-sync-community-plugin-scope-setting")',
+    );
+    const setNameIdx = fn.indexOf(".setName(");
+    const experimentalIdx = fn.indexOf(
+      '"easy-sync-plugin-selection-chip is-experimental"',
+    );
+    const chipIdx = fn.indexOf(
+      'setting.nameEl.createSpan("easy-sync-plugin-selection-chip")',
+    );
+    expect(setNameIdx).toBeGreaterThan(-1);
+    expect(experimentalIdx).toBeGreaterThan(setNameIdx);
+    expect(chipIdx).toBeGreaterThan(experimentalIdx);
+    // ③ 计数 chip 的插值参数名与模板占位符对齐（模板＝{enabled}/{total}；
+    //    曾误传 selected，真机 1.14 直显「同步：{enabled}/30」）。
+    expect(fn).toContain("enabled: enabledCount");
+    expect(fn).not.toContain("selected:");
   });
 
   it("uses historical data evidence when the outer plugin-data switch rejoins scope", async () => {
@@ -1236,11 +1265,13 @@ describe("settings tab", () => {
     expect(zhCN["settings.syncScope.desc"]).toBe(
       "选择要同步的 Obsidian 配置、主题和插件文件。",
     );
+    // 规则句（用户 2026-10-12 定稿）：两设备语义＋⚙ 引导；同一句也作同步视图
+    // 「范围管理」弹框（scope 视图）的 intro，弹框 intro 下方同样有带 ⚙ 的行。
     expect(zhCN["settings.syncScope.intro"]).toBe(
-      "设置仅对本设备生效；两台设备都开启后，才会相互同步。",
+      "设置仅对本设备生效，当其他设备也开启后，才会相互同步。点击下方 ⚙，可单独控制每个插件是否参与同步。",
     );
     expect(en["settings.syncScope.intro"]).toBe(
-      "These settings apply to this device only; sync happens only once both devices have enabled the same item.",
+      "These settings apply to this device only; sync starts only once your other devices enable them too. Click the gear below to control whether each plugin takes part in sync.",
     );
     // 自动同步弹框顶部指引（用户 2026-09-23 定稿）：0 值语义 + 被打断后的恢复动作。
     expect(zhCN["settings.autoSync.intro"]).toBe(
@@ -1345,6 +1376,46 @@ describe("settings tab", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  it("hides the automatic handling row in one-way mode on the imperative path", () => {
+    const names: string[] = [];
+    const setNameSpy = vi.spyOn(Setting.prototype, "setName")
+      .mockImplementation(function (this: Setting, name: string) {
+        names.push(name);
+        return this;
+      });
+    try {
+      const renderNames = (direction: "two-way" | "one-way") => {
+        names.length = 0;
+        const tab = new EasySyncSettingTab({
+          app: {},
+          syncDirection: direction,
+          i18n: { t: (key: string) => key },
+          autoSyncPaused: false,
+          isAutoSyncMasterEnabled: () => true,
+          setAutoSyncMasterEnabled: vi.fn().mockResolvedValue(undefined),
+        } as unknown as EasySyncPlugin);
+        (tab as unknown as { automaticSectionEl: unknown })
+          .automaticSectionEl = createMockElement();
+        (tab as unknown as {
+          renderAutomaticSection(t: (key: string) => string): void;
+        }).renderAutomaticSection((key) => key);
+        return [...names];
+      };
+
+      // 双向：两行都在（「自动处理」行只隐藏、不删除）。
+      const twoWay = renderNames("two-way");
+      expect(twoWay).toContain("settings.automaticHandling.name");
+      expect(twoWay).toContain("settings.autoSync.name");
+
+      // 单向：入口行不渲染；「自动同步」行照常。
+      const oneWay = renderNames("one-way");
+      expect(oneWay).not.toContain("settings.automaticHandling.name");
+      expect(oneWay).toContain("settings.autoSync.name");
+    } finally {
+      setNameSpy.mockRestore();
+    }
+  });
+
   it("renders both automatic handling choices as native toggles without triggering sync", () => {
     const source = readFileSync("src/ui/automatic-handling-modal.ts", "utf8");
 
@@ -1354,6 +1425,35 @@ describe("settings tab", () => {
     expect(source).toContain("updateAutomaticHandlingPolicy");
     expect(source).not.toContain("startManualSync");
     expect(source).not.toContain("confirmRemoteDelete");
+  });
+
+  it("keeps the sync mode hints and the local-only row copy directional", () => {
+    // 模式行两条说明句（2026-10-12 末轮定稿）：单向＝云端的修改与删除会同步到
+    // 本机、本机不再主动上传（"不再主动向云端上传"是用户点名的核心点）；
+    // 双向句不变。
+    expect(zhCN["settings.syncMode.hint.oneway"]).toBe(
+      "云端的修改与删除会同步到本机；本机不再主动向云端上传笔记与附件。",
+    );
+    expect(en["settings.syncMode.hint.oneway"]).toBe(
+      "Cloud changes and deletions are synced down to this device; this device no longer uploads notes or attachments to the cloud automatically.",
+    );
+    expect(zhCN["settings.syncMode.hint.twoway"]).toBe(
+      "本机和云端的改动会互相同步。",
+    );
+    expect(en["settings.syncMode.hint.twoway"]).toBe(
+      "Changes here and in the cloud sync to each other.",
+    );
+    // 副本文件名标签（copyLabel＝设备中立）与新建 chip 不变；改动 chip 随末轮
+    // 改「本机修改」，与开启弹框的"本机修改／本机新建"成对。
+    expect(zhCN["syncView.localOnly.copyLabel"]).toBe("副本");
+    expect(en["syncView.localOnly.copyLabel"]).toBe("Copy");
+    expect(zhCN["syncView.localOnly.chip.edited"]).toBe("本机修改");
+    expect(zhCN["syncView.localOnly.chip.created"]).toBe("本机新建");
+    // 逐条行说明句（2026-10-12 末轮定稿）：只有改动类有一句"这份副本里是什么"；
+    // 新建类不写说明句（键已退场，渲染侧按类条件挂载）。
+    expect(zhCN["syncView.localOnly.reason.edited"]).toBe(
+      "本机修改已存入此副本。",
+    );
   });
 
   it("keeps automatic handling copy directional and condition-accurate", () => {
@@ -1395,13 +1495,32 @@ describe("settings tab", () => {
 
 describe("settings save call sites", () => {
   it("wraps every settings-tab save with rollback and a failure notice (C10-5 同形)", () => {
-    // C10-5 同形缺口(账本 §七):四处 saveSyncSettings 调用(命令式通知弹窗/
-    // 诊断日志+声明式同两处)失败时必须回滚内存与控件并提示,而不是
-    // unhandled rejection 且其后的 apply*/renderHint 被跳过。
-    const source = readFileSync("src/ui/settings-tab.ts", "utf8");
+    // C10-5 同形缺口(账本 §七):saveSyncSettings 调用失败时必须回滚内存与控件并
+    // 提示，而不是 unhandled rejection 且其后的 apply*/渲染被跳过。
+    // 2026-10-12 重构后拆两处承接：命令式路径与模式行留在 settings-tab.ts，
+    // 1.13+ 页面行（通知／滑条×2／自动处理×2／大文件排除／移动端状态图标）在
+    // settings-page-rows.ts。
+    const tabSource = readFileSync("src/ui/settings-tab.ts", "utf8");
+    const rowsSource = readFileSync("src/ui/settings-page-rows.ts", "utf8");
     const count = (text: string, needle: string) => text.split(needle).length - 1;
-    expect(count(source, "notice.settingsSaveFailed")).toBe(4);
-    expect(count(source, ".setValue(previous)")).toBe(4);
+    expect(count(tabSource, "notice.settingsSaveFailed")).toBe(5);
+    expect(count(rowsSource, "notice.settingsSaveFailed")).toBe(6);
+    // 回滚语义：控件拨回上一值；自动处理开关按内存现值拨回（同义）。
+    expect(count(tabSource, ".setValue(previous)")).toBe(4);
+    expect(count(rowsSource, ".setValue(previous)")).toBe(5);
+    expect(rowsSource).toContain(
+      "toggle.setValue(plugin.automaticHandlingPolicy[policyKey]);",
+    );
+  });
+
+  it("restores the acknowledged rules through reset, not through a new row (2026-10-12 用户裁决)", () => {
+    // 恢复出口＝「重置同步状态」本身：重置时清空「已读」记忆，规则随之全部重现；
+    // 不新增行、不新增文案（源码守卫；行为随重置链由真机/回归覆盖）。
+    const mainSource = readFileSync("src/main.ts", "utf8");
+    const tabSource = readFileSync("src/ui/settings-tab.ts", "utf8");
+    expect(mainSource).toContain("this.acknowledgedRules = [];");
+    expect(mainSource).not.toContain("restoreAcknowledgedSettingRules");
+    expect(tabSource).not.toContain("buildSettingRulesRestoreRow");
   });
 
   it("wraps the exclusion modal max-size persistence with rollback and a failure notice", () => {
@@ -1413,5 +1532,81 @@ describe("settings save call sites", () => {
     expect(fn).toContain("notice.settingsSaveFailed");
     expect(fn).toContain("this.syncMaxFileSizeDropdownSelection()");
     expect(fn).toContain("this.plugin.applyMaxFileSize()");
+  });
+});
+
+describe("imperative maintenance group · local-only reversal row (件③)", () => {
+  function renderRowNames(
+    plugin: EasySyncPlugin,
+    t: (key: string, params?: Record<string, string | number>) => string,
+  ): Array<{ name: string; desc?: string }> {
+    const tab = new EasySyncSettingTab(plugin);
+    (tab as unknown as { maintenanceSectionEl: unknown }).maintenanceSectionEl =
+      createMockElement();
+    const rows: Array<{ name: string; desc?: string }> = [];
+    let current: { name: string; desc?: string } | null = null;
+    const nameSpy = vi.spyOn(Setting.prototype, "setName").mockImplementation(
+      function (this: Setting, name: string) {
+        current = { name };
+        rows.push(current);
+        return this;
+      },
+    );
+    const descSpy = vi.spyOn(Setting.prototype, "setDesc").mockImplementation(
+      function (this: Setting, desc: string) {
+        if (current) current.desc = desc;
+        return this;
+      },
+    );
+    try {
+      (tab as unknown as {
+        renderMaintenanceSection(t: unknown): void;
+      }).renderMaintenanceSection(t);
+    } finally {
+      nameSpy.mockRestore();
+      descSpy.mockRestore();
+    }
+    return rows;
+  }
+
+  function makeMaintenancePlugin(options: {
+    direction: string;
+    ignoredCount: number;
+  }): EasySyncPlugin {
+    return {
+      app: {},
+      syncDirection: options.direction,
+      getIgnoredLocalOnlyCount: () => options.ignoredCount,
+      clearLocalOnlyIgnores: vi.fn().mockResolvedValue(undefined),
+      diagLogEnabled: false,
+      generateDiagnosticReport: vi.fn().mockResolvedValue(undefined),
+      resetSyncState: vi.fn().mockResolvedValue(undefined),
+    } as unknown as EasySyncPlugin;
+  }
+
+  const t = new I18n("zh-cn").t.bind(new I18n("zh-cn"));
+
+  it("keeps the row out of the group unless one-way mode still has ignored entries", () => {
+    const namesIn = (plugin: EasySyncPlugin) =>
+      renderRowNames(plugin, t).map((row) => row.name);
+
+    // 双向：不出现（忽略记忆在双向不生效）。
+    expect(namesIn(makeMaintenancePlugin({ direction: "two-way", ignoredCount: 4 })))
+      .not.toContain(t("settings.localOnlyIgnored.name"));
+    // 单向但没有可收回的内容：保持零动作干净态。
+    expect(namesIn(makeMaintenancePlugin({ direction: "one-way", ignoredCount: 0 })))
+      .not.toContain(t("settings.localOnlyIgnored.name"));
+    // 单向且有被忽略的条目：出现在「生成报告」与「重置」之间，说明带计数。
+    const rows = renderRowNames(
+      makeMaintenancePlugin({ direction: "one-way", ignoredCount: 4 }),
+      t,
+    );
+    expect(rows.map((row) => row.name)).toEqual([
+      t("settings.diagLog.name"),
+      t("settings.diagReport.name"),
+      t("settings.localOnlyIgnored.name"),
+      t("settings.reset.name"),
+    ]);
+    expect(rows[2].desc).toBe(t("settings.localOnlyIgnored.desc", { count: 4 }));
   });
 });

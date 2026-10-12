@@ -3455,6 +3455,67 @@ describe("StateManager V2 production controller", () => {
     expect(restarted.forceResetAudit).toEqual(audit);
   });
 
+  it("force reset terminates the public 1.1.3 ledger so a legacy device can leave the reset dead end", async () => {
+    // F23 field shape: a device that never selected V2 authority keeps its
+    // unreceipted intents in the public key, and every reset is refused by the
+    // guard that reads that key. The user-authorized forced reset is the only
+    // exit, so it must clear the slot the guard actually reads.
+    const harness = makeHarness();
+    harness.files.delete(paths.stateV2ManifestFile);
+    harness.files.delete(paths.stateV2File);
+    const legacyRecord = (index: number): MutationLedgerEntryV1 => ({
+      intent: {
+        version: 1,
+        operationId: `download-legacy-${index}`,
+        planRevision: 3,
+        scope,
+        action: "download",
+        path: `Notes/legacy-${index}.md`,
+        expectedLocal: { exists: true, hash: hashA, size: 10 },
+        expectedRemote: {
+          exists: true,
+          driveId: `file-legacy-${index}`,
+          eTag: `etag-legacy-${index}`,
+          size: 11,
+          sha256Hash: hashB,
+        },
+        createdAt: 10,
+      },
+      receipt: null,
+    });
+    harness.pluginData["easy-sync-mutation-ledger"] = [
+      legacyRecord(1),
+      legacyRecord(2),
+    ];
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    expect(state.legacyAutoSyncAllowed).toBe(true);
+    expect(state.isV2StateActive).toBe(false);
+    expect(state.mutationLedger).toHaveLength(2);
+    // Field evidence: an unauthorized reset must still refuse, and the refusal
+    // is what the forced reset is authorized to terminate.
+    await expect(state.reset()).rejects.toThrow(
+      "Cannot reset while mutation recovery is unresolved",
+    );
+
+    const audit = await state.forceReset();
+
+    expect(audit).toEqual({
+      at: expect.any(Number),
+      ledgerCount: 2,
+      quarantineCount: 0,
+      corrupt: false,
+    });
+    expect(state.mutationLedger).toEqual([]);
+    expect(harness.pluginData["easy-sync-mutation-ledger"]).toEqual([]);
+    expect(harness.pluginData["easy-sync-v2-mutation-ledger"]).toEqual([]);
+
+    const restarted = new StateManager(harness.plugin);
+    await restarted.load();
+    expect(restarted.mutationLedger).toEqual([]);
+    expect(restarted.isV2StateActive).toBe(false);
+  });
+
   it("restores a corrupt mutation ledger from its checksummed backup", async () => {
     const harness = makeHarness();
     const state = new StateManager(harness.plugin);

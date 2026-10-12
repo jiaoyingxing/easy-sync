@@ -117,6 +117,18 @@ class SyncExclusionFolderPicker
   }
 }
 
+/**
+ * 按需打开文件夹排除选择器（设置页与弹框共用入口；候选由调用方先取好，
+ * 因为选择器的候选读取是同步的）。
+ */
+export function openSyncExclusionFolderPicker(
+  plugin: EasySyncPlugin,
+  remoteFolderPaths: readonly string[],
+  onChoose: (folder: SyncExclusionFolderCandidate) => void,
+): void {
+  new SyncExclusionFolderPicker(plugin, remoteFolderPaths, onChoose).open();
+}
+
 interface ExclusionChipOptions {
   disabled?: boolean;
   removeLabel: (path: string) => string;

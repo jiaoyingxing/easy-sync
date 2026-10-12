@@ -22,6 +22,15 @@ import {
   type AutomaticHandlingPolicy,
 } from "./automatic-handling-policy";
 import {
+  applyOneWayLocalDeletedPullBackPlan,
+  applyOneWayLocalOnlyCopyPlan,
+  DEFAULT_SYNC_DIRECTION,
+  forceRemoteFolderDeleteFollow,
+  isExcludedFromOneWaySyncPath,
+  suppressOutboundUserContentActions,
+  type SyncDirection,
+} from "./sync-direction";
+import {
   contentDifferenceReceiptMatches,
   createContentDifferenceReceipt,
   resolveContentEquality,
@@ -176,6 +185,13 @@ export interface FinalizeCanonicalPlanInputV2 {
   accountId: string;
   configDir: string;
   automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
+  /**
+   * Committed sync direction. Absent means two-way, which keeps every existing
+   * caller and fixture on today's exact output. In one-way mode cloud-bound
+   * user-content actions are dropped here (before decision tokens and the
+   * review impact count) and the remote delete follow is forced on.
+   */
+  syncDirection?: SyncDirection;
   baselineReconstructionIncomplete: boolean;
   pendingContentComparisons?: readonly PendingContentComparisonV2[];
   verifiedRemoteContentHashesById?: ReadonlyMap<string, string>;
@@ -1248,10 +1264,32 @@ export async function finalizeCanonicalPlanCandidateV2(
     items = items.filter((item) => !falseConflicts.has(item.path));
   }
   items = [...identityItems, ...items];
+  // 片①／片② 单向同步的单一挂点：改写与抑制都必须发生在决策令牌绑定
+  // （bindCanonicalDecisionTokensV2）与审阅影响计数
+  // （shouldPauseCanonicalPlanForReviewV2）之前，被拦掉的动作既不产生令牌也不
+  // 抬高审阅门槛。顺序＝先把本机改动/无基线同名改写成"留副本＋云端接管"的下载
+  // （片②），再丢弃其余出站动作（片①）。单向模式下删除跟随强制恒开——文件级
+  // 口径即 `autoDeleteLocalFiles = true` 的等效行为（applyAutomaticHandlingPolicy
+  // 是它唯一的功能性应用点）；目录级标记在建计划期就已由该开关决定，只能在这里
+  // 清掉（SkipLargeFile 等其余标记一律不动）。
+  const oneWay = (input.syncDirection ?? DEFAULT_SYNC_DIRECTION) === "one-way";
+  if (oneWay) {
+    items = applyOneWayLocalOnlyCopyPlan(items, input.configDir);
+    items = applyOneWayLocalDeletedPullBackPlan(items, input.configDir);
+    items = suppressOutboundUserContentActions(items, input.configDir);
+    items = forceRemoteFolderDeleteFollow(items, input.configDir);
+  }
   items = applyAutomaticHandlingPolicy(
     items,
-    input.automaticHandlingPolicy,
+    oneWay
+      ? { ...input.automaticHandlingPolicy, autoDeleteLocalFiles: true }
+      : input.automaticHandlingPolicy,
     input.configDir,
+    // 排除块的"本机跟随云端删除"仍按双向裁决（配置白名单目录 owner 也在内）：
+    // 强制跟随只落在模式自己的范围上，与上面的目录标记同一判定。
+    oneWay
+      ? (path) => isExcludedFromOneWaySyncPath(path, input.configDir)
+      : undefined,
   );
   items = bindCanonicalDecisionTokensV2(items, {
     envelope: input.envelope,
@@ -1932,10 +1970,14 @@ export function summarizeCanonicalPlanReviewV2(
     conflicts: 0,
     skipped: 0,
   };
+  let localOnlyCopies = 0;
   let impactCount = 0;
   for (const item of items) {
     if (item.type === SyncActionType.Upload) counts.uploads++;
     if (item.type === SyncActionType.Download) counts.downloads++;
+    // 片② 单向模式的留副本改写项：只有计划生产链会写这个标记，双向计划里恒为
+    // 0——为 0 时不落字段，计数对象对所有非单向调用方保持原形状。
+    if (item.localOnlyCopyKind !== undefined) localOnlyCopies++;
     if (
       item.type === SyncActionType.RecreateRemoteScope
       ||
@@ -1961,7 +2003,10 @@ export function summarizeCanonicalPlanReviewV2(
       impactCount += Math.max(1, item.reviewImpactCount ?? 1);
     }
   }
-  return { counts, impactCount };
+  return {
+    counts: localOnlyCopies > 0 ? { ...counts, localOnlyCopies } : counts,
+    impactCount,
+  };
 }
 
 export function orderCanonicalPlanItemsV2(
@@ -2202,6 +2247,8 @@ function canonicalPlanItemFactsV2(item: SyncPlanItem): unknown[] {
           comparison.remoteHash,
         ]
       : null,
+    // Appended last on purpose: the nested-name map below indexes by position.
+    item.localOnlyCopyKind ?? null,
   ];
 }
 
@@ -2220,6 +2267,7 @@ const CANONICAL_PLAN_ITEM_FACT_NAMES_V2 = [
   "reviewImpactCount",
   "decisionToken",
   "contentComparison",
+  "localOnlyCopyKind",
 ] as const;
 
 /** Nested fact names per top-level position of canonicalPlanItemFactsV2. */

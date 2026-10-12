@@ -2,7 +2,8 @@
  * EasySync repository join offer (carrier 20261003-2128, R1) — main-layer
  * behavior: gate conditions, name comparison, count-only offer, the
  * offer→list→offer loop, RS priority at the first-sync wiring points, and
- * the fresh-login notice.
+ * the fresh-login notice. 2026-10-10 追加：首同步前两次询问的并发预取（R4）、
+ * 只读准备期可取消（R1）与 RS 检测失败可见化（R2）。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -122,15 +123,23 @@ function makePlugin(): {
   return { plugin, t };
 }
 
+/** 检测层的注入：数组＝「有活仓但都不同名」（名单完整），`"same-name"`＝同名
+ *  快通道命中（名单未列举，2026-10-10 R3），Error＝检测失败。 */
+type DetectionInput = string[] | Error | "same-name";
+
 function attachDetection(
   plugin: EasySyncPlugin,
-  repositories: string[] | Error,
+  detection: DetectionInput,
 ): { detect: ReturnType<typeof vi.fn> } {
   const detect = vi.fn();
-  if (repositories instanceof Error) {
-    detect.mockRejectedValue(repositories);
+  if (detection instanceof Error) {
+    detect.mockRejectedValue(detection);
+  } else if (detection === "same-name") {
+    detect.mockResolvedValue({ kind: "same-name" });
+  } else if (detection.length === 0) {
+    detect.mockResolvedValue({ kind: "none" });
   } else {
-    detect.mockResolvedValue(repositories);
+    detect.mockResolvedValue({ kind: "others", repositories: detection });
   }
   plugin.onedrive = { detectExistingEasySyncRepositories: detect } as never;
   plugin.syncExecutor = { isRunning: false } as never;
@@ -238,6 +247,15 @@ describe("maybeOfferExistingVaultJoin", () => {
     expect(vaultJoinListAwaitAction).not.toHaveBeenCalled();
   });
 
+  it("stays silent when the same-name fast path answered without listing", async () => {
+    // 快通道命中（名单未列举）：这条路上既不弹框也不能弹登录提示（零打扰不变）。
+    const { plugin } = makePlugin();
+    attachDetection(plugin, "same-name");
+
+    await expect(callOffer(plugin)).resolves.toBe("continue");
+    expect(vaultJoinArgs).toHaveLength(0);
+  });
+
   it("continues the plain first sync when detection fails, with a diagnostic note", async () => {
     const { plugin } = makePlugin();
     attachDetection(plugin, new Error("network down"));
@@ -335,12 +353,12 @@ function attachFirstSyncHarness(plugin: EasySyncPlugin) {
   vi.spyOn(plugin as never, "dispatchV2StateLoadBlockIfPresent")
     .mockResolvedValue(false);
   vi.spyOn(plugin as never, "checkAccountBindingForSync").mockResolvedValue(true);
-  vi.spyOn(plugin, "activateSyncView").mockResolvedValue(undefined);
+  const panel = vi.spyOn(plugin, "activateSyncView").mockResolvedValue(undefined);
   const dispatch = vi.spyOn(plugin as never, "dispatchSyncRun")
     .mockResolvedValue(undefined);
   const migrate = vi.spyOn(plugin as never, "maybeRunRsMigrationOffer");
   const join = vi.spyOn(plugin as never, "maybeOfferExistingVaultJoin");
-  return { dispatch, migrate, join };
+  return { dispatch, migrate, join, panel };
 }
 
 describe("startFirstSync join-offer wiring", () => {
@@ -381,5 +399,191 @@ describe("startFirstSync join-offer wiring", () => {
     await plugin.startFirstSync();
 
     expect(harness.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("opens the sync panel before the repository detections", async () => {
+    // 2026-10-10 拍板：面板先开——用户点完同步马上能在侧栏看到「同步进行中…」，
+    // 而不是等云端仓库检测（首同步实测 6.5s+）跑完才把面板弹出来。
+    const { plugin } = makePlugin();
+    const harness = attachFirstSyncHarness(plugin);
+    const order: string[] = [];
+    harness.panel.mockImplementation(async () => { order.push("panel"); });
+    harness.migrate.mockImplementation(async () => {
+      order.push("rs");
+      return "fresh";
+    });
+    harness.join.mockImplementation(async () => {
+      order.push("join");
+      return "continue";
+    });
+
+    await plugin.startFirstSync();
+
+    expect(order).toEqual(["panel", "rs", "join"]);
+  });
+});
+
+describe("sync entry preparation (2026-10-10: R4 并发预取 / R1 只读准备期可取消)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function attachInquiryDeps(
+    plugin: EasySyncPlugin,
+  ): { detect: ReturnType<typeof vi.fn>; setAbortSignal: ReturnType<typeof vi.fn> } {
+    const detect = vi.fn().mockResolvedValue({ kind: "none" });
+    const setAbortSignal = vi.fn();
+    plugin.onedrive = {
+      detectExistingEasySyncRepositories: detect,
+      setAbortSignal,
+    } as never;
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    return { detect, setAbortSignal };
+  }
+
+  it("prefetches the join detection while the Remotely Save inquiry is still running", async () => {
+    // R4：两个只读检测互不依赖，加入检测必须在 RS 询问还没回来时就已经发出。
+    const { plugin } = makePlugin();
+    const harness = attachFirstSyncHarness(plugin);
+    const { detect } = attachInquiryDeps(plugin);
+    let releaseRs = (): void => {};
+    const rsGate = new Promise<void>((resolve) => {
+      releaseRs = resolve;
+    });
+    harness.migrate.mockImplementation(async () => {
+      await rsGate;
+      return "fresh";
+    });
+    harness.join.mockResolvedValue("continue");
+
+    const pending = plugin.startFirstSync();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(harness.migrate).toHaveBeenCalledOnce();
+    expect(detect).toHaveBeenCalled(); // RS 尚未返回，加入检测已发出＝并发
+
+    releaseRs();
+    await pending;
+    expect(harness.dispatch).toHaveBeenCalledOnce();
+  });
+
+  it("arms the entry cancel for the read-only wait and clears it after dispatch", async () => {
+    // R1：等待段可取消（armed）；结束时必须收回并清空中止信号——否则留下一枚
+    // 已中止的信号会让后续所有云端请求立刻失败。
+    const { plugin } = makePlugin();
+    const harness = attachFirstSyncHarness(plugin);
+    const { setAbortSignal } = attachInquiryDeps(plugin);
+    let releaseRs = (): void => {};
+    const rsGate = new Promise<void>((resolve) => {
+      releaseRs = resolve;
+    });
+    harness.migrate.mockImplementation(async () => {
+      await rsGate;
+      return "fresh";
+    });
+    harness.join.mockResolvedValue("continue");
+
+    const pending = plugin.startFirstSync();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(plugin.isSyncEntryCancellable).toBe(true);
+
+    releaseRs();
+    await pending;
+
+    expect(plugin.isSyncEntryCancellable).toBe(false);
+    expect(setAbortSignal).toHaveBeenCalledTimes(2);
+    expect(setAbortSignal.mock.calls[0]?.[0]).toBeInstanceOf(AbortSignal);
+    expect(setAbortSignal.mock.calls[1]?.[0]).toBeNull();
+  });
+
+  it("ends the round without dispatching when the user cancels the preparation", async () => {
+    const { plugin } = makePlugin();
+    const harness = attachFirstSyncHarness(plugin);
+    attachInquiryDeps(plugin);
+    let releaseRs = (): void => {};
+    const rsGate = new Promise<void>((resolve) => {
+      releaseRs = resolve;
+    });
+    harness.migrate.mockImplementation(async () => {
+      await rsGate;
+      return "fresh";
+    });
+    harness.join.mockResolvedValue("continue");
+    const noticeShow = (plugin.noticeCenter as never as {
+      show: ReturnType<typeof vi.fn>;
+    }).show;
+
+    const pending = plugin.startFirstSync();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(plugin.isSyncEntryCancellable).toBe(true);
+
+    await plugin.cancelSync();
+    expect(noticeShow).toHaveBeenCalledWith(
+      expect.objectContaining({ key: "sync-entry-cancelled" }),
+    );
+
+    releaseRs();
+    await pending;
+
+    expect(harness.dispatch).not.toHaveBeenCalled();
+    expect(plugin.isSyncEntryCancellable).toBe(false);
+  });
+});
+
+describe("Remotely Save detection failure visibility (2026-10-10 R2)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function attachRsDeps(
+    plugin: EasySyncPlugin,
+    failure: Error,
+  ): { show: ReturnType<typeof vi.fn> } {
+    plugin.onedrive = {
+      detectRemotelySaveRepository: vi.fn().mockRejectedValue(failure),
+      setAbortSignal: vi.fn(),
+    } as never;
+    plugin.syncExecutor = { isRunning: false } as never;
+    plugin.state = {
+      lastSyncTime: 0,
+      baseSnapshot: [],
+      planReviewActive: false,
+    } as never;
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    return (plugin.noticeCenter as never as { show: ReturnType<typeof vi.fn> });
+  }
+
+  function callRsOffer(plugin: EasySyncPlugin): Promise<string> {
+    return (plugin as never as {
+      maybeRunRsMigrationOffer(): Promise<string>;
+    }).maybeRunRsMigrationOffer();
+  }
+
+  it("tells the user why nothing happened instead of ending the round silently", async () => {
+    const { plugin } = makePlugin();
+    const notice = attachRsDeps(plugin, new Error("network down"));
+
+    await expect(callRsOffer(plugin)).resolves.toBe("abort");
+
+    expect(notice.show).toHaveBeenCalledWith(
+      expect.objectContaining({
+        key: "rs-migration-detect-failed",
+        message: "rsMigration.detectFailedNotice",
+      }),
+    );
+  });
+
+  it("keeps a user cancel silent (cancel is not a detection failure)", async () => {
+    const { plugin } = makePlugin();
+    const notice = attachRsDeps(plugin, new Error("aborted"));
+    (plugin as never as { entryCancelController: unknown }).entryCancelController = {
+      signal: AbortSignal.abort(),
+    };
+    const warn = (plugin.diag as never as { warn: ReturnType<typeof vi.fn> }).warn;
+
+    await expect(callRsOffer(plugin)).resolves.toBe("abort");
+
+    expect(notice.show).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
   });
 });

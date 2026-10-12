@@ -126,6 +126,24 @@ import {
 } from "./state-v2-indexeddb-recovery";
 import { isIndexedDbVaultInstanceId } from "./indexeddb-vault-namespace";
 import {
+  createEmptyLocalOnlyIgnoreMemory,
+  readLocalOnlyIgnoreMemory,
+  reduceLocalOnlyIgnoreMemory,
+  sameLocalOnlyIgnoreMemory,
+  type LocalOnlyIgnoreMemoryV1,
+} from "./local-only-ignore-memory";
+import {
+  emptyLocalOnlyCopiesV1,
+  readLocalOnlyCopiesV1,
+  reconcileLocalOnlyEntriesV1,
+  retireLocalOnlyEntriesV1,
+  sameLocalOnlyFamilyV1,
+  upsertLocalOnlyCopyEntryV1,
+  type LocalOnlyCopiesV1,
+  type LocalOnlyCopyEntryV1,
+  type LocalOnlyCreatedEntryV1,
+} from "./local-only-copies";
+import {
   StateV2ScopeTransitionError,
   StateV2ScopeTransitionStore,
   type StateV2ScopeTransitionFailureReason,
@@ -434,7 +452,10 @@ export type ConfirmedDescendantFolderAcceptance =
       accepted: 0;
       evidenceFiles: 0;
     }
-  | { status: "accepted"; accepted: number; evidenceFiles: number };
+  | { status: "accepted"; accepted: number; evidenceFiles: number;
+      /** F24: remote ids whose provably retired same-path anchor was
+       *  superseded in the same state commit (audit trail). */
+      supersededFolderRemoteIds?: string[] };
 
 export type ConfirmedDescendantFileEvidenceAcceptance =
   | { status: "none" | "blocked"; accepted: 0 }
@@ -537,6 +558,10 @@ const KEY_V2_RECOVERY_QUARANTINE = "easy-sync-v2-recovery-quarantine";
 const KEY_LOCAL_FOLDER_MOVE_HINTS = "easy-sync-local-folder-move-hints";
 const KEY_LOCAL_FILE_MOVE_HINTS = "easy-sync-local-file-move-hints";
 const KEY_LOCAL_FOLDER_DELETE_HINTS = "easy-sync-local-folder-delete-hints";
+/** 片② 本机独有条目记录：原路径 ↔ 本机改动副本（片④ 消费、片⑤ 联动）。 */
+const KEY_LOCAL_ONLY_COPIES = "easy-sync-local-only-copies";
+/** 片⑤ 忽略记忆：「留在本机，不再提醒」的本机清单（只影响提醒）。 */
+const KEY_LOCAL_ONLY_IGNORE_MEMORY = "easy-sync-local-only-ignore-memory";
 const KEY_TRANSFER_RATES_WINDOW = "easy-sync-transfer-rates-window";
 const KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE = "community-plugin-enablement-state";
 const KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS =
@@ -673,6 +698,8 @@ interface PluginData {
   [KEY_LOCAL_FOLDER_MOVE_HINTS]: LocalFolderMoveHintV1[];
   [KEY_LOCAL_FILE_MOVE_HINTS]: LocalFolderMoveHintV1[];
   [KEY_LOCAL_FOLDER_DELETE_HINTS]: LocalFolderDeleteHintV1[];
+  [KEY_LOCAL_ONLY_COPIES]: LocalOnlyCopiesV1;
+  [KEY_LOCAL_ONLY_IGNORE_MEMORY]: LocalOnlyIgnoreMemoryV1;
   [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]:
     CommunityPluginManifestObservationV1[];
   [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]:
@@ -714,6 +741,8 @@ const DEFAULT_DATA: PluginData = {
     [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
     [KEY_LOCAL_FILE_MOVE_HINTS]: [],
     [KEY_LOCAL_FOLDER_DELETE_HINTS]: [],
+    [KEY_LOCAL_ONLY_COPIES]: emptyLocalOnlyCopiesV1(),
+    [KEY_LOCAL_ONLY_IGNORE_MEMORY]: createEmptyLocalOnlyIgnoreMemory(),
     [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]: [],
     [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]: null,
     [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]: null,
@@ -747,6 +776,8 @@ function createDefaultData(generation = 0, planRevision = 0): PluginData {
     [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
     [KEY_LOCAL_FILE_MOVE_HINTS]: [],
     [KEY_LOCAL_FOLDER_DELETE_HINTS]: [],
+    [KEY_LOCAL_ONLY_COPIES]: emptyLocalOnlyCopiesV1(),
+    [KEY_LOCAL_ONLY_IGNORE_MEMORY]: createEmptyLocalOnlyIgnoreMemory(),
     [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]: [],
     [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]: null,
     [KEY_COMMUNITY_PLUGIN_ADOPTION_MEMORY]: null,
@@ -1601,6 +1632,12 @@ export class StateManager {
       [KEY_LOCAL_FOLDER_DELETE_HINTS]: parseLocalFolderDeleteHints(
         saved[KEY_LOCAL_FOLDER_DELETE_HINTS],
       ),
+      [KEY_LOCAL_ONLY_COPIES]:
+        readLocalOnlyCopiesV1(saved[KEY_LOCAL_ONLY_COPIES])
+        ?? emptyLocalOnlyCopiesV1(),
+      [KEY_LOCAL_ONLY_IGNORE_MEMORY]:
+        readLocalOnlyIgnoreMemory(saved[KEY_LOCAL_ONLY_IGNORE_MEMORY])
+        ?? createEmptyLocalOnlyIgnoreMemory(),
       [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]:
         communityPluginManifestObservations,
       [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]:
@@ -3648,6 +3685,147 @@ export class StateManager {
   }
 
   /**
+   * 片② 本机独有条目记录：哪一份本机改动留在了哪个副本里。片④ 据此出侧栏
+   * 条目、片⑤ 联动忽略；本片只负责写入与损坏降级（损坏＝空清单，重新提醒）。
+   */
+  get localOnlyCopyEntries(): readonly LocalOnlyCopyEntryV1[] {
+    return this.data[KEY_LOCAL_ONLY_COPIES].entries;
+  }
+
+  /**
+   * Append/replace the copy records written by one one-way round. Idempotent on
+   * (原路径, 副本路径), so a replay after a crash cannot duplicate a record.
+   */
+  async upsertLocalOnlyCopies(
+    entries: readonly LocalOnlyCopyEntryV1[],
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    await this.commitPluginData((current) => ({
+      ...current,
+      [KEY_LOCAL_ONLY_COPIES]: entries.reduce(
+        (family, entry) => upsertLocalOnlyCopyEntryV1(family, entry),
+        current[KEY_LOCAL_ONLY_COPIES] ?? emptyLocalOnlyCopiesV1(),
+      ),
+    }));
+  }
+
+  /**
+   * 片⑤ 忽略记忆：「留在本机，不再提醒」的本机清单。只影响侧栏条目与计数
+   * （单一真源在插件侧的行投影里过滤），不参与任何同步判定。
+   */
+  get localOnlyIgnoreMemory(): LocalOnlyIgnoreMemoryV1 {
+    return this.data[KEY_LOCAL_ONLY_IGNORE_MEMORY];
+  }
+
+  /** 记住"不再提醒"这一条（键＝行代表的上传目标路径）。 */
+  async ignoreLocalOnlyPath(path: string): Promise<void> {
+    await this.commitPluginData((current) => {
+      const family = current[KEY_LOCAL_ONLY_IGNORE_MEMORY]
+        ?? createEmptyLocalOnlyIgnoreMemory();
+      const next = reduceLocalOnlyIgnoreMemory(family, {
+        type: "ignore",
+        path,
+      });
+      if (sameLocalOnlyIgnoreMemory(next, family)) return current;
+      return { ...current, [KEY_LOCAL_ONLY_IGNORE_MEMORY]: next };
+    });
+  }
+
+  /**
+   * 件② 批量行「全部留在本机」：同一把键（行代表的上传目标路径）一次写入整批
+   * 忽略，只落一次盘。语义与逐条完全相同——只影响提醒。
+   */
+  async ignoreLocalOnlyPaths(paths: readonly string[]): Promise<void> {
+    if (paths.length === 0) return;
+    await this.commitPluginData((current) => {
+      const family = current[KEY_LOCAL_ONLY_IGNORE_MEMORY]
+        ?? createEmptyLocalOnlyIgnoreMemory();
+      const next = paths.reduce(
+        (memory, path) =>
+          reduceLocalOnlyIgnoreMemory(memory, { type: "ignore", path }),
+        family,
+      );
+      if (sameLocalOnlyIgnoreMemory(next, family)) return current;
+      return { ...current, [KEY_LOCAL_ONLY_IGNORE_MEMORY]: next };
+    });
+  }
+
+  /**
+   * 件③ 设置页反转入口「放回同步面板」：一次清空整份忽略记忆（现役 clear-ignore
+   * 命令按当前清单批量施加）。只影响提醒：文件仍在原处、片② 记录照常维护。
+   */
+  async clearAllLocalOnlyIgnorePaths(): Promise<void> {
+    await this.commitPluginData((current) => {
+      const family = current[KEY_LOCAL_ONLY_IGNORE_MEMORY]
+        ?? createEmptyLocalOnlyIgnoreMemory();
+      const next = family.ignoredPaths.reduce(
+        (memory, path) =>
+          reduceLocalOnlyIgnoreMemory(memory, { type: "clear-ignore", path }),
+        family,
+      );
+      if (sameLocalOnlyIgnoreMemory(next, family)) return current;
+      return { ...current, [KEY_LOCAL_ONLY_IGNORE_MEMORY]: next };
+    });
+  }
+
+  /**
+   * 移除一条忽略（store 的移除 API）。本片不接任何反转界面——它供后续
+   * 用户拍板后的界面、以及关闭模式时的点名告知（片⑥）使用。
+   */
+  async clearLocalOnlyIgnorePath(path: string): Promise<void> {
+    await this.commitPluginData((current) => {
+      const family = current[KEY_LOCAL_ONLY_IGNORE_MEMORY]
+        ?? createEmptyLocalOnlyIgnoreMemory();
+      const next = reduceLocalOnlyIgnoreMemory(family, {
+        type: "clear-ignore",
+        path,
+      });
+      if (sameLocalOnlyIgnoreMemory(next, family)) return current;
+      return { ...current, [KEY_LOCAL_ONLY_IGNORE_MEMORY]: next };
+    });
+  }
+
+  /** 片④ 新建类条目：本机独有、云端没有的文件。 */
+  get localOnlyCreatedEntries(): readonly LocalOnlyCreatedEntryV1[] {
+    return this.data[KEY_LOCAL_ONLY_COPIES].created;
+  }
+
+  /**
+   * 片④ 每轮核对（单向模式）：把"哪些路径还是本机独有"这一事实写回同一个记录
+   * 族——改动类只在副本仍本机独有时保留，新建类＝本机独有路径里不属于任何副本
+   * 的那些。读侧（侧栏与桌面状态栏）因此只需读这一份记录，不重新扫描。
+   */
+  async reconcileLocalOnlyEntries(
+    localOnlyPaths: ReadonlySet<string>,
+    now = Date.now(),
+  ): Promise<void> {
+    await this.commitPluginData((current) => {
+      const family = current[KEY_LOCAL_ONLY_COPIES] ?? emptyLocalOnlyCopiesV1();
+      const next = reconcileLocalOnlyEntriesV1(family, {
+        localOnlyPaths,
+        now,
+      });
+      if (
+        sameLocalOnlyFamilyV1(next, family)
+      ) return current;
+      return { ...current, [KEY_LOCAL_ONLY_COPIES]: next };
+    });
+  }
+
+  /** 上传成功或路径作废：把对应条目退场（记录随条目一起消失）。 */
+  async retireLocalOnlyEntries(input: {
+    paths?: readonly string[];
+    copyPaths?: readonly string[];
+  }): Promise<void> {
+    await this.commitPluginData((current) => {
+      const family = current[KEY_LOCAL_ONLY_COPIES] ?? emptyLocalOnlyCopiesV1();
+      const next = retireLocalOnlyEntriesV1(family, input);
+      if (sameLocalOnlyFamilyV1(next, family)) return current;
+      return { ...current, [KEY_LOCAL_ONLY_COPIES]: next };
+    });
+  }
+
+  /**
    * Render-time, read-only: which exit kind one scope-crossing pending row
    * can act on right now, or null when the row carries no covering move hint
    * (drift and settings forms). Shares the covering-hint rule with the
@@ -4024,6 +4202,11 @@ export class StateManager {
     };
     await this.commitPluginData((current) => ({
       ...current,
+      // Both ledger slots are terminated: a device that never selected V2
+      // authority keeps its evidence in the public key, and the reset guard
+      // reads whichever slot the `mutationLedger` getter selects (F23:
+      // clearing only the V2 key left a legacy device with no reset exit).
+      [KEY_PUBLIC_MUTATION_LEDGER]: [],
       [KEY_MUTATION_LEDGER]: [],
       [KEY_V2_RECOVERY_QUARANTINE]: [],
     }));
@@ -6236,6 +6419,7 @@ export class StateManager {
       localFolderScanComplete: input.localFolderScanComplete,
       remoteIdentityComplete: input.remoteIdentityComplete,
       authorizedFolders: input.reviewed.folders,
+      allowRetiredAnchorSupersede: true,
       confirmedAt,
     });
     if (reduced.status !== "accepted") {
@@ -6261,6 +6445,7 @@ export class StateManager {
           localFolderScanComplete: input.localFolderScanComplete,
           remoteIdentityComplete: input.remoteIdentityComplete,
           authorizedFolders: input.reviewed.folders,
+          allowRetiredAnchorSupersede: true,
           confirmedAt,
         });
         if (
@@ -6651,6 +6836,8 @@ export class StateManager {
         currentReduction.status !== "accepted"
         || currentReduction.accepted !== reduced.accepted
         || currentReduction.evidenceFiles !== reduced.evidenceFiles
+        || JSON.stringify(currentReduction.supersededFolderRemoteIds ?? [])
+          !== JSON.stringify(reduced.supersededFolderRemoteIds ?? [])
       ) {
         throw new Error(
           "Confirmed descendant folder evidence changed before state commit",
@@ -6673,6 +6860,9 @@ export class StateManager {
       status: "accepted",
       accepted: reduced.accepted,
       evidenceFiles: reduced.evidenceFiles,
+      ...(reduced.supersededFolderRemoteIds
+        ? { supersededFolderRemoteIds: reduced.supersededFolderRemoteIds }
+        : {}),
     };
   }
 

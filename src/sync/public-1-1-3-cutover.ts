@@ -1,4 +1,6 @@
 import { isRecord } from "../obsidian-compat";
+import { emptyLocalOnlyCopiesV1 } from "./local-only-copies";
+import { createEmptyLocalOnlyIgnoreMemory } from "./local-only-ignore-memory";
 
 export const KEY_PUBLIC_113_CUTOVER =
   "easy-sync-public-1.1.3-cutover-v2";
@@ -18,6 +20,8 @@ const KEY_PLAN_REVIEW_CANONICAL_IDENTITY =
 const KEY_PUBLIC_MUTATION_LEDGER = "easy-sync-mutation-ledger";
 const KEY_V2_MUTATION_LEDGER = "easy-sync-v2-mutation-ledger";
 const KEY_LOCAL_FOLDER_MOVE_HINTS = "easy-sync-local-folder-move-hints";
+const KEY_LOCAL_ONLY_COPIES = "easy-sync-local-only-copies";
+const KEY_LOCAL_ONLY_IGNORE_MEMORY = "easy-sync-local-only-ignore-memory";
 const KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE =
   "community-plugin-enablement-state";
 
@@ -108,6 +112,8 @@ export function finalizePublic113PluginDataCutover(input: {
   pluginData[KEY_PLAN_REVIEW_SCOPE] = null;
   pluginData[KEY_PLAN_REVIEW_CANONICAL_IDENTITY] = null;
   pluginData[KEY_LOCAL_FOLDER_MOVE_HINTS] = [];
+  pluginData[KEY_LOCAL_ONLY_COPIES] = emptyLocalOnlyCopiesV1();
+  pluginData[KEY_LOCAL_ONLY_IGNORE_MEMORY] = createEmptyLocalOnlyIgnoreMemory();
   delete pluginData[KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE];
   migrateMutationLedgerKey(pluginData);
   pluginData[KEY_PUBLIC_113_CUTOVER] = marker;

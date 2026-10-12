@@ -98,6 +98,42 @@ export function isObsidianManagedConfigPath(
 }
 
 /**
+ * The config-whitelist owner surface that is a *directory subtree* rather than
+ * a single managed file: the 「主题与代码片段」row of the sync-scope settings
+ * (`docs/topics/同步范围边界.md` 功能矩阵, `<configDir>/themes/` +
+ * `<configDir>/snippets/`). It travels with the managed config files because
+ * both are one row each on the same settings screen, so a mode rule that keeps
+ * 「配置」 untouched has to cover them together (2026-10-12 review: leaving
+ * these two out made one-way mode revert local CSS edits and hide new snippets
+ * from uploads).
+ */
+const CONFIG_WHITELIST_DIRECTORIES: ReadonlySet<string> = new Set([
+  "themes",
+  "snippets",
+]);
+
+/**
+ * True for a path inside a whitelisted config *directory* subtree, including
+ * the directory itself (folder plan items target the directory path exactly).
+ * Matches on the normalized relative remainder, so `<configDir>/themes/x.css`
+ * counts while a vault-level `themes/x.css` does not.
+ */
+export function isObsidianConfigWhitelistDirectoryPath(
+  path: string,
+  configDir: string,
+): boolean {
+  const normalizedDir = normalizeVaultPathKey(configDir)
+    .replace(/^\/+|\/+$/g, "");
+  const normalizedPath = normalizeVaultPathKey(path);
+  if (!normalizedDir || !normalizedPath.startsWith(`${normalizedDir}/`)) {
+    return false;
+  }
+  const remainder = normalizedPath.slice(normalizedDir.length + 1);
+  const firstSegment = remainder.split("/")[0];
+  return CONFIG_WHITELIST_DIRECTORIES.has(firstSegment);
+}
+
+/**
  * EasySync self-sync never treats a missing remote bundle file as authority
  * to delete the running local plugin. The next canonical action restores the
  * cloud copy from the locally present bundle.

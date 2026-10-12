@@ -21,7 +21,7 @@
   </a>
 </p>
 
-EasySync keeps your Obsidian vault in sync across computers, phones, and tablets.
+EasySync keeps your Obsidian vault in sync across computers, phones, and tablets, with two sync modes: two-way and one-way.
 
 ## Table of contents
 
@@ -37,7 +37,7 @@ EasySync keeps your Obsidian vault in sync across computers, phones, and tablets
 ## 1. Installation & first sync
 
 > [!WARNING]
-> **Read this before installing and using**
+> **Read this first**
 > 1. **Don't mix it with other sync methods.** Don't put your vault inside a cloud-synced folder such as iCloud or the OneDrive client, and don't let other sync tools such as Obsidian Sync or Remotely Save manage the same vault. When two sync programs change the same files, they conflict with each other — files can even end up deleted, re-uploaded, and deleted again in a loop. Keep your vault in a plain local folder and let EasySync be the only tool managing it.
 > 2. **Set up every device separately.** Setting it up on one device doesn't make sync work everywhere: on each device you need to install EasySync, sign in to the same OneDrive account, configure its own settings, and run the sync.
 > 3. **You don't need the OneDrive app.** The plugin connects to your OneDrive account directly — installing EasySync and signing in is all it takes; it doesn't rely on the OneDrive client.
@@ -136,6 +136,7 @@ Other options can be enabled as needed:
 
 | Setting | Recommendation |
 | --- | --- |
+| Sync mode | Two-way by default; can be set to one-way sync (receive only) — see [3.3](#33-sync-modes-two-way-and-one-way) |
 | Sync exclusions | Apply only to the current device; excluded folders are neither uploaded nor downloaded, and existing files are not deleted merely because of the exclusion |
 | Sync scope | Editor settings, appearance, themes and snippets, hotkeys, bookmarks, and core plugins can be controlled separately |
 | Community plugins | Plugin files can be selected individually; each plugin's `data.json` is controlled separately by **Community plugin data** |
@@ -173,6 +174,16 @@ Note: even with automatic merging of non-overlapping text edits enabled, files u
 - **Sync exclusions** remove an already-synced folder from this device only: nothing is deleted locally or in the cloud, and other devices are unaffected.
 
 > Keep content you want to share across devices in a normal visible folder.
+
+### 3.3 Sync modes: two-way and one-way
+
+Two-way sync is the default: changes on this device and in the cloud sync to each other. Under **Sync mode** in settings you can switch to one-way sync:
+
+- This device no longer uploads notes or attachments to the cloud automatically; files changed or deleted in the cloud are updated or deleted here too;
+- New and edited files stay on this device: an edited file reverts to the cloud version and your changes are saved as a separate copy; a new file stays as it is. Both are listed in the sync panel, where you can upload them to the cloud or keep them on this device;
+- This mode only applies to notes and attachments; plugins and other configuration keep syncing as usual.
+
+It suits setups where one device maintains the content and the others only read from it. Switching requires manual confirmation; when you switch back to two-way sync, everything not yet uploaded from this device is synced to the cloud.
 
 ## 4. How conflicts are handled
 

@@ -278,6 +278,16 @@ import {
   isAutomaticTextMergeCandidatePath,
   type AutomaticHandlingPolicy,
 } from "./automatic-handling-policy";
+import { localOnlyCopyPathV1 } from "./local-only-copies";
+import {
+  collectOneWayLocalOnlyPaths,
+  isExcludedFromOneWaySyncPath,
+} from "./sync-direction";
+import {
+  DEFAULT_SYNC_DIRECTION,
+  readSyncDirection,
+  type SyncDirection,
+} from "./sync-direction";
 import {
   cloneCommunityPluginSyncPolicy,
   DEFAULT_COMMUNITY_PLUGIN_SYNC_POLICY,
@@ -736,6 +746,8 @@ type ExactEmptyRemoteFolderInspection =
  *  evidence class: 2.6–5 MB recordings) stream into the .part carrier, where
  *  reconnects resume from the received prefix instead of losing every byte. */
 const MOBILE_STREAM_DOWNLOAD_MIN_BYTES = 2 * 1024 * 1024;
+/** 片② 留副本换名落位的最大尝试次数（同分钟重名/既有文件同名）。 */
+const LOCAL_ONLY_COPY_MAX_ATTEMPTS = 50;
 const COMMUNITY_PLUGIN_MANIFEST_PREFLIGHT_CONCURRENCY = 3;
 const DESKTOP_RECONSTRUCTION_BATCH_FILES = 4;
 const MOBILE_RECONSTRUCTION_BATCH_FILES = 2;
@@ -752,6 +764,9 @@ const MOBILE_FOLDER_CREATE_READBACK_SETTLE_ATTEMPTS = 3;
 // one real attempt; a fresh failure restarts the window.
 const TRANSFER_NETWORK_BACKOFF_WINDOW_MS = 15 * 60 * 1000;
 const FOLDER_CREATE_READBACK_SETTLE_MS = 400;
+/** A rejected migration candidate names at most this many blocked base paths
+ *  in the diagnostic event; the total count always stays complete (F23). */
+const MIGRATION_PENDING_DIAGNOSTIC_LIMIT = 20;
 /** Bounded re-read attempts for a remote folder create receipt (slow links). */
 const REMOTE_FOLDER_READBACK_ATTEMPTS = 2;
 const REMOTE_FOLDER_READBACK_RETRY_MS = 500;
@@ -1804,6 +1819,9 @@ export class SyncExecutor {
   private automaticHandlingPolicy: AutomaticHandlingPolicy = {
     ...DEFAULT_AUTOMATIC_HANDLING_POLICY,
   };
+  /** Committed sync direction; one-way drops cloud-bound user-content actions
+   *  in the canonical plan and forces the remote delete follow. */
+  private syncDirection: SyncDirection = DEFAULT_SYNC_DIRECTION;
   private communityPluginSyncPolicy = cloneCommunityPluginSyncPolicy(
     DEFAULT_COMMUNITY_PLUGIN_SYNC_POLICY,
   );
@@ -2036,6 +2054,24 @@ export class SyncExecutor {
 
   setAutomaticHandlingPolicy(policy: Readonly<AutomaticHandlingPolicy>): void {
     this.automaticHandlingPolicy = { ...policy };
+  }
+
+  setSyncDirection(direction: SyncDirection): void {
+    this.syncDirection = readSyncDirection(direction);
+  }
+
+  /**
+   * 建计划时喂给 `buildCanonicalPlanCandidateV2` 的目录级确认标记输入＝**设备设置
+   * 本身**，不是本轮的模式生效策略。
+   *
+   * 单向模式把文件级删除跟随强制恒开（见 run() 里的模式生效策略与 finalize 挂点），
+   * 但排除块（配置白名单含 `themes/`／`snippets/`、社区插件、自身构筑物）保留双向
+   * 裁决：标记必须按设置值先建出来，再由 finalize 对模式自己的范围清掉。若这里直接
+   * 喂强制值，排除块的非空目录会被静默跟随删除，用户拿不到双向该有的确认行
+   * （2026-10-12 review）。
+   */
+  private planBuildAutomaticDeleteLocalFiles(): boolean {
+    return this.automaticHandlingPolicy.autoDeleteLocalFiles;
   }
 
   setCommunityPluginSyncPolicy(
@@ -5756,6 +5792,119 @@ export class SyncExecutor {
   }
 
   /**
+   * 片② 单向模式：把当前本机字节先留成笔记库内独立副本，成功后才允许云端版本
+   * 接管原路径（调用方在拿到返回值之前不得覆盖目标）。命名模板＝
+   * `{原名}（{标签} {yyyy-MM-dd HHmm}）{扩展名}`（时分不加任何标点），标签走
+   * i18n；同分钟重名与既有文件重名都会换名落位，绝不覆盖已有内容。
+   *
+   * 幂等：同一份本机字节已经留过副本（含"副本已落盘、记录未写"的崩溃形态）时
+   * 直接复用，记录按 (原路径, 副本路径) 去重，因此重放不会产生第二份副本，也
+   * 不会丢掉副本↔原路径的对应。任何失败都抛出，调用方本轮不还原。
+   */
+  private async ensureLocalOnlyCopyBeforeOverwrite(
+    item: SyncPlanItem,
+    operationEpoch: number,
+  ): Promise<void> {
+    const kind = item.localOnlyCopyKind;
+    const expected = item.local;
+    if (!kind || !expected) return;
+    const adapter = this.scanner.vault.adapter;
+    const originalBytes = await adapter.readBinary(item.path);
+    if (!await this.bytesMatchLocalVersion(originalBytes, expected)) {
+      throw new Error(
+        `Local file changed before its copy could be kept: ${item.path}`,
+      );
+    }
+    const label = this.t("syncView.localOnly.copyLabel");
+    const changedAt = Number.isFinite(expected.mtime) && expected.mtime > 0
+      ? expected.mtime
+      : Date.now();
+    for (let attempt = 0; attempt <= LOCAL_ONLY_COPY_MAX_ATTEMPTS; attempt++) {
+      if (!this.canContinue(operationEpoch)) return;
+      const candidate = localOnlyCopyPathV1({
+        path: item.path,
+        label,
+        changedAt,
+        attempt,
+      });
+      const existing = await this.readVaultFileBytes(candidate);
+      if (existing) {
+        // 已留过的同一份本机字节（重放、或副本落盘后崩溃）：复用，不写第二份。
+        if (await this.bytesMatchLocalVersion(existing, expected)) {
+          await this.recordLocalOnlyCopy({ item, kind, copyPath: candidate });
+          return;
+        }
+        // 撞名：换名落位，绝不覆盖既有文件。
+        continue;
+      }
+      const tempPath = this.getDownloadTempPath(candidate);
+      await this.ensureParentDirs(tempPath);
+      await this.removePathIfExists(tempPath);
+      await this.writeBinaryTempFileWithAndroidZeroByteRetry(
+        item.path,
+        tempPath,
+        originalBytes,
+      );
+      const staged = await this.readVaultFileBytes(tempPath);
+      if (!staged || !await this.bytesMatchLocalVersion(staged, expected)) {
+        await this.removePathIfExists(tempPath);
+        throw new Error(`Local-only copy verification failed: ${candidate}`);
+      }
+      await this.ensureParentDirs(candidate);
+      try {
+        await adapter.rename(tempPath, candidate);
+      } catch (renameError) {
+        // 只清我们自己的暂存文件；目标位置里的任何东西都不动。
+        await this.removePathIfExists(tempPath);
+        throw renameError;
+      }
+      const written = await this.readVaultFileBytes(candidate);
+      if (!written || !await this.bytesMatchLocalVersion(written, expected)) {
+        // 不删目标：回读不符只可能是别人在这个窗口里先落位，删掉会毁数据。
+        // 下一轮按内容判定（相同＝复用，不同＝换名），自愈且不丢东西。
+        throw new Error(`Local-only copy verification failed: ${candidate}`);
+      }
+      await this.recordLocalOnlyCopy({ item, kind, copyPath: candidate });
+      return;
+    }
+    throw new Error(`No free local-only copy name for: ${item.path}`);
+  }
+
+  /** Durable copy record for 片④; identity is (原路径, 副本路径). */
+  private async recordLocalOnlyCopy(input: {
+    item: SyncPlanItem;
+    kind: NonNullable<SyncPlanItem["localOnlyCopyKind"]>;
+    copyPath: string;
+  }): Promise<void> {
+    const alreadyRecorded = this.state.localOnlyCopyEntries.some((entry) =>
+      entry.path === input.item.path && entry.copyPath === input.copyPath);
+    if (alreadyRecorded) return;
+    await this.state.upsertLocalOnlyCopies([{
+      version: 1,
+      path: input.item.path,
+      copyPath: input.copyPath,
+      kind: input.kind,
+      recordedAt: Date.now(),
+    }]);
+  }
+
+  private async readVaultFileBytes(path: string): Promise<ArrayBuffer | null> {
+    try {
+      return await this.scanner.vault.adapter.readBinary(path);
+    } catch {
+      return null;
+    }
+  }
+
+  private async bytesMatchLocalVersion(
+    bytes: ArrayBuffer,
+    expected: LocalFileEntry,
+  ): Promise<boolean> {
+    return bytes.byteLength === expected.size
+      && await sha256Hex(bytes) === expected.hash;
+  }
+
+  /**
    * Download the exact remote bytes and commit them over an already-present
    * local target (A1 one-shot content alignment for a followed remote move).
    * The caller has already proven the local side is unchanged and the remote
@@ -8136,12 +8285,20 @@ export class SyncExecutor {
         preparedMigration.reason,
         folderScanFailures,
       );
+      const pendingPathFacts = preparedMigration.pending
+        .slice(0, MIGRATION_PENDING_DIAGNOSTIC_LIMIT)
+        .map((item) => ({ path: item.sourcePath, reason: item.reason }));
       this.diag?.warn(
         "state",
         "V2 migration candidate rejected before authority change",
         {
           reason: preparedMigration.reason,
           pending: preparedMigration.pending.length,
+          // The count alone cannot name the blocked base entries, so a field
+          // report cannot point at the files that keep the device stuck (F23).
+          pendingPaths: pendingPathFacts,
+          pendingTruncated:
+            preparedMigration.pending.length - pendingPathFacts.length,
           mutations: 0,
         },
       );
@@ -8339,7 +8496,7 @@ export class SyncExecutor {
         preserveFolderPath: preserveCanonicalFolderPath,
         configDir,
         automaticDeleteLocalFiles:
-          automaticHandlingPolicy.autoDeleteLocalFiles,
+          this.planBuildAutomaticDeleteLocalFiles(),
       });
     let canonicalSourceEnvelope = args.canonicalSourceEnvelope;
     let committedV2Envelope = args.committedV2Envelope;
@@ -8360,7 +8517,7 @@ export class SyncExecutor {
         preserveFolderPath: preserveCanonicalFolderPath,
         configDir,
         automaticDeleteLocalFiles:
-          automaticHandlingPolicy.autoDeleteLocalFiles,
+          this.planBuildAutomaticDeleteLocalFiles(),
       });
     } else if (canonicalSourceEnvelope) {
       canonicalPlanCandidate = rebuildCanonicalPlanCandidate(canonicalSourceEnvelope);
@@ -8523,6 +8680,7 @@ export class SyncExecutor {
         accountId: this.state.boundAccountId ?? "",
         configDir: getConfigDir(this.scanner.vault),
         automaticHandlingPolicy,
+        syncDirection: this.syncDirection,
         baselineReconstructionIncomplete,
         pendingContentComparisons: this.state.pendingConflicts.map(
           (item) => ({
@@ -8560,6 +8718,9 @@ export class SyncExecutor {
         {
           accepted: reconstructed.accepted,
           evidenceFiles: reconstructed.evidenceFiles,
+          ...(reconstructed.supersededFolderRemoteIds
+            ? { supersededFolderRemoteIds: reconstructed.supersededFolderRemoteIds }
+            : {}),
           mutations: 0,
         },
       );
@@ -9217,6 +9378,7 @@ export class SyncExecutor {
         accountId: this.state.boundAccountId ?? "",
         configDir: getConfigDir(this.scanner.vault),
         automaticHandlingPolicy,
+        syncDirection: this.syncDirection,
         baselineReconstructionIncomplete: false,
         pendingContentComparisons:
           [...reconstructionComparisons.values()].map((item) => ({
@@ -9679,6 +9841,12 @@ export class SyncExecutor {
     let contentEqualityBaseUpserts: BaseFileEntry[] = [];
     let contentEqualityAncestorHashes:
       Readonly<Record<string, string>> | undefined;
+    // 片④ 单向模式：本轮的"本机独有内容"必须在这里取快照——finalize 的改写与
+    // 抑制会把它们从计划里去掉，之后就没有这个事实了。核对写回记录族一次，
+    // 侧栏与桌面状态栏都读这一份记录（不重新扫描、不建第二套列表）。
+    const localOnlyPathsForReview = this.syncDirection === "one-way"
+      ? collectOneWayLocalOnlyPaths(plan.items, getConfigDir(this.scanner.vault))
+      : null;
     const canonicalContentVerification = await this.finalizeCanonicalContentVerification({
       plan,
       canonicalPlanCandidate,
@@ -9746,6 +9914,9 @@ export class SyncExecutor {
       plan.scope = { ...sealed.scope };
       plan.canonicalIdentity = sealed.canonicalIdentity;
       plan.canonicalReview = sealed.canonicalReview;
+      if (localOnlyPathsForReview) {
+        await this.state.reconcileLocalOnlyEntries(localOnlyPathsForReview);
+      }
       this.diag?.log(
         "plan",
         `V2 canonical plan sealed at commit ${sealed.sourceCommitSeq}`,
@@ -9803,6 +9974,7 @@ export class SyncExecutor {
         accountId: this.state.boundAccountId ?? "",
         configDir: getConfigDir(this.scanner.vault),
         automaticHandlingPolicy,
+        syncDirection: this.syncDirection,
         baselineReconstructionIncomplete,
         pendingContentComparisons: this.state.pendingConflicts.map(
           (item) => ({
@@ -10525,7 +10697,7 @@ export class SyncExecutor {
           preserveFolderPath: preserveCanonicalFolderPath,
           configDir,
           automaticDeleteLocalFiles:
-            automaticHandlingPolicy.autoDeleteLocalFiles,
+            this.planBuildAutomaticDeleteLocalFiles(),
         })
       : null;
     const continuationSourceEnvelope = continuationEnvelope;
@@ -10612,6 +10784,7 @@ export class SyncExecutor {
         accountId: this.state.boundAccountId ?? "",
         configDir: getConfigDir(this.scanner.vault),
         automaticHandlingPolicy,
+        syncDirection: this.syncDirection,
         baselineReconstructionIncomplete: false,
         pendingContentComparisons: this.state.pendingConflicts.map(
           (item) => ({
@@ -12676,7 +12849,14 @@ export class SyncExecutor {
     this.communityPluginIdentityBlockedErrors.clear();
     this.cancelController = new AbortController();
     const operationEpoch = this.lifecycle.capture();
-    const automaticHandlingPolicy = { ...this.automaticHandlingPolicy };
+    // 片⑥ 收口：本轮的生效策略。单向模式下"将云端删除同步到本机"强制恒开
+    // （与 finalize 挂点的强制跟随同义）——执行计数（candidates/failed/
+    // completed）、`pendingDeleteRemovals`、以及建计划期的事实（目录删除的
+    // requiresConfirmation）都按这一份生效策略走，不再读设置值。
+    const automaticHandlingPolicy: AutomaticHandlingPolicy =
+      this.syncDirection === "one-way"
+        ? { ...this.automaticHandlingPolicy, autoDeleteLocalFiles: true }
+        : { ...this.automaticHandlingPolicy };
     let communityPluginSyncPolicy = cloneCommunityPluginSyncPolicy(
       this.communityPluginSyncPolicy,
     );
@@ -21266,7 +21446,7 @@ export class SyncExecutor {
         ),
       configDir,
       automaticDeleteLocalFiles:
-        automaticHandlingPolicy.autoDeleteLocalFiles,
+        this.planBuildAutomaticDeleteLocalFiles(),
     });
     if (canonical.status === "rejected") {
       result.deferred = 1;
@@ -21297,6 +21477,7 @@ export class SyncExecutor {
       accountId: source.scope.accountId,
       configDir: getConfigDir(this.scanner.vault),
       automaticHandlingPolicy,
+      syncDirection: this.syncDirection,
       baselineReconstructionIncomplete: false,
       pendingContentComparisons: [],
       resolveRemoteContentHash: async (item, progress) => {
@@ -22348,6 +22529,32 @@ export class SyncExecutor {
         await this.removePathIfExists(tempDownloadPath);
       }
       return beforeWrite;
+    }
+    // 片② 单向模式：先把当前本机字节留成笔记库内独立副本（"本机改动"），副本
+    // 成功落盘后才允许云端版本接管本路径。副本与还原同处这一个下载意图的窗口
+    // 内：副本失败→本轮不还原、下一轮重试；崩溃/重放→复用已留副本，不重复生成。
+    if (item.localOnlyCopyKind) {
+      try {
+        await this.ensureLocalOnlyCopyBeforeOverwrite(item, operationEpoch);
+      } catch (copyError) {
+        if (tempDownloadPath) await this.removePathIfExists(tempDownloadPath);
+        this.diag?.warn(
+          "execute",
+          `local-only copy not kept; the cloud version will not take ${item.path} over this round`,
+          copyError instanceof Error ? copyError.message : String(copyError),
+        );
+        if (factsChangedPolicy === "throw") {
+          throw new MutationNotAppliedError(
+            copyError instanceof Error ? copyError : new Error(String(copyError)),
+          );
+        }
+        result.deferred++;
+        return {
+          executed: false,
+          completionActionType: SyncActionType.RetryLater,
+          completionReason: this.t("syncView.fileStatus.deferred"),
+        };
+      }
     }
     const localCommitStartedAt = Date.now();
     // Ensure all parent directories exist (recursive)
@@ -23924,7 +24131,7 @@ export class SyncExecutor {
         ),
       configDir,
       automaticDeleteLocalFiles:
-        automaticHandlingPolicy.autoDeleteLocalFiles,
+        this.planBuildAutomaticDeleteLocalFiles(),
     });
     if (canonical.status === "rejected") {
       result.deferred = 1;
@@ -23959,6 +24166,7 @@ export class SyncExecutor {
       accountId: this.state.boundAccountId,
       configDir: getConfigDir(this.scanner.vault),
       automaticHandlingPolicy,
+      syncDirection: this.syncDirection,
       baselineReconstructionIncomplete: false,
       pendingContentComparisons: [],
       resolveRemoteContentHash: async (item, progress) => {
@@ -26564,6 +26772,30 @@ export class SyncExecutor {
     return false;
   }
 
+  /**
+   * 单向模式没有"保留本机＝云端删除/改名"的出口：带 remote 事实、缺 local 事实的
+   * 冲突行（本机删除／本机重命名留下的行）一律退场，交给下一次同步按"本机删除
+   * 不算数"把云端版本拉回（片② 的拉回改写）。先例＝
+   * {@link expireManagedConfigDecision}：退役旧的单向决策，让计划层用当前策略。
+   * 排除三块不在此列——它们继续按双向运行。
+   */
+  private async expireOneWayOutboundConflictDecision(
+    path: string,
+    conflict: SyncPlanItem | undefined,
+  ): Promise<boolean> {
+    if (this.syncDirection !== "one-way") return false;
+    if (isExcludedFromOneWaySyncPath(path, getConfigDir(this.scanner.vault))) {
+      return false;
+    }
+    if (!conflict?.remote || conflict.local) return false;
+    await this.state.removePendingConflict(path);
+    this.notice("notice.conflict.failed", {
+      path,
+      reason: this.t("notice.decisionExpired"),
+    });
+    return true;
+  }
+
   private async expireOutOfScopeConflictDecision(
     path: string,
   ): Promise<boolean> {
@@ -26757,6 +26989,271 @@ export class SyncExecutor {
     return committed ? content : null;
   }
 
+  /**
+   * 片④：上传前确保 targetPath 的远端父目录链存在（浅→深）。
+   *
+   * 为什么每一级都走一次现役目录 mutation：文件的基线与远端收据在提交时要求
+   * 父目录**已在 V2 远端索引里**（`assertParentMatchesPath`），而路径式 PUT 建完
+   * 目录不会进索引，文件收据会被拒。所以这里逐级复用与计划里
+   * `CreateRemoteFolder` 完全相同的形状（intent → create/read-back →
+   * `folderUpserts` 收据 → 提交），并落在文件自己的持久窗口**之前**：中断只会
+   * 留下已提交的目录（下一次按"已存在"放行），文件意图尚未存在、无需恢复；文件
+   * 收据形状保持不变。已在索引里的目录直接跳过；远端已存在但未提交的目录按现有
+   * 身份提交（幂等）。两道保险＝目录仍在同步范围内且不属于排除三块。
+   * 返回 false＝本轮被取消，调用方不得继续上传。
+   */
+  private async ensureRemoteParentChainForLocalOnlyUpload(
+    targetPath: string,
+    operationEpoch: number,
+  ): Promise<boolean> {
+    const configDir = getConfigDir(this.scanner.vault);
+    const scope = this.activeSyncScope;
+    if (!scope) {
+      throw new Error("Local-only upload has no current authorization scope");
+    }
+    const segments = targetPath.split("/");
+    segments.pop();
+    // 先整链校验（范围 + 排除三块），任何一级不合法就不做任何远端写入。
+    let checkedPath = "";
+    for (const segment of segments) {
+      checkedPath = checkedPath === "" ? segment : `${checkedPath}/${segment}`;
+      if (isExcludedFromOneWaySyncPath(checkedPath, configDir)) {
+        throw new Error(
+          `Local-only upload parent belongs to an excluded block: ${checkedPath}`,
+        );
+      }
+      if (!this.scanner.shouldSyncFolderPath(checkedPath)) {
+        throw new Error(
+          `Local-only upload parent is outside the sync scope: ${checkedPath}`,
+        );
+      }
+    }
+    let parentPath = "";
+    for (const segment of segments) {
+      const parentDir = parentPath;
+      parentPath = parentPath === "" ? segment : `${parentPath}/${segment}`;
+      if (!this.canContinue(operationEpoch)) return false;
+      // 已提交到 V2 远端索引的目录：文件收据的父校验已经满足。
+      if (this.committedRemoteFolderId(parentPath)) continue;
+      const existing = await this.inspectRemoteFolder(parentPath);
+      if (existing.status === "file") {
+        throw new Error(
+          `Local-only upload parent is a file in the cloud: ${parentPath}`,
+        );
+      }
+      const folderIntent = this.createFolderMutationIntent({
+        item: {
+          type: SyncActionType.CreateRemoteFolder,
+          path: parentPath,
+          folder: { parentPath: parentDir },
+        },
+        scope,
+      });
+      if (!folderIntent.terminated) {
+        throw new Error(
+          `Local-only upload parent is not a folder create: ${parentPath}`,
+        );
+      }
+      const intent = folderIntent.terminated;
+      const parentRemoteId = intent.expectedParent.driveId;
+      const committed = await this.runDurableSideMutation(
+        intent,
+        operationEpoch,
+        async () => folderMutationCheckpoint(
+          existing.status === "folder"
+            ? existing.entry
+            : await this.createRemoteFolderByPathWithReadback(
+                parentPath,
+                parentRemoteId,
+              ),
+        ),
+      );
+      if (!committed) return false;
+    }
+    return true;
+  }
+
+  /**
+   * 路径式建目录 + 精确身份回读（片④ 的父目录链专用；与上传用的路径形态
+   * 一致：`PUT ...:/<path>`）。`createFolderPath` 把 409（已存在）映射成
+   * null，这里按"再查一次现有身份"放行，因此重入安全。
+   */
+  private async createRemoteFolderByPathWithReadback(
+    path: string,
+    parentRemoteId: string,
+  ): Promise<RemoteFolderEntry> {
+    const created = await this.onedrive.createFolderPath(this.vaultName, path);
+    if (created) {
+      const readBack = await this.readRemoteFolderCreatedIdentity(
+        path,
+        created.id,
+        parentRemoteId,
+        created.eTag,
+      );
+      return toRemoteFolderEntry(path, readBack);
+    }
+    // 409＝目录已在云端（例如上一次尝试已建好）：取现有身份放行。
+    const existing = await this.inspectRemoteFolder(path);
+    if (existing.status !== "folder" || existing.entry.parentId !== parentRemoteId) {
+      throw new Error(`Remote folder appeared but its identity drifted: ${path}`);
+    }
+    return existing.entry;
+  }
+
+  /** 已提交 V2 远端索引里该路径的目录 id（null＝未提交/不存在）。 */
+  private committedRemoteFolderId(path: string): string | null {
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!envelope) return null;
+    const pathById = projectRemoteIndexV2(envelope.remoteIndex);
+    const node = Object.values(envelope.remoteIndex.itemsById).find(
+      (candidate) => candidate.kind === "folder"
+        && normalizeRemotePathKey(pathById.get(candidate.id) ?? "")
+          === normalizeRemotePathKey(path),
+    );
+    return node?.id ?? null;
+  }
+
+  /**
+   * 片④ 单向模式：把一条"本机独有"条目上传到云端（侧栏「上传到云端」）。
+   *
+   * 语义＝把这份本机文件**作为独立新文件**同步到云端：路径式上传（不带
+   * `eTag`／`driveItemId`），云端已有同名文件时由 `conflictBehavior=fail`
+   * 直接失败（409），绝不覆盖。成功＝该文件进入正常同步（基线与远端索引随
+   * 检查点一起提交），条目与记录一起退场。
+   */
+  async uploadLocalOnlyEntry(
+    targetPath: string,
+    showSuccessNotice = true,
+  ): Promise<void> {
+    if (this.syncDirection !== "one-way") return;
+    if (this.stopSideActionForStateRecovery()) return;
+    return this.enqueueSideAction(
+      targetPath,
+      SyncActionType.Upload,
+      async (operationEpoch) => {
+        if (!this.canContinue(operationEpoch)) return;
+        const inspection = await this.inspectLocalPath(targetPath);
+        if (!inspection || inspection.status !== "present" || !inspection.entry) {
+          await this.state.retireLocalOnlyEntries({ paths: [targetPath] });
+          this.notice("notice.delete.failed", {
+            path: targetPath,
+            reason: this.t("notice.localChangedSinceReview"),
+          });
+          return;
+        }
+        // 本机独有校验：一旦有基线或云端已有同名，这条动作就不再适用。
+        const tracked = this.state.baseSnapshot.some(
+          (entry) => entry.path === targetPath,
+        ) || this.state.remoteSnapshot.some(
+          (entry) => entry.path === targetPath,
+        );
+        if (tracked) {
+          await this.state.retireLocalOnlyEntries({ paths: [targetPath] });
+          this.notice("notice.delete.failed", {
+            path: targetPath,
+            reason: this.t("notice.decisionExpired"),
+          });
+          return;
+        }
+        try {
+          const content = await this.scanner.vault.adapter.readBinary(targetPath);
+          const entry = inspection.entry;
+          if (
+            content.byteLength !== entry.size
+            || await sha256Hex(content) !== entry.hash
+          ) {
+            this.notice("notice.delete.failed", {
+              path: targetPath,
+              reason: this.t("notice.localChangedSinceReview"),
+            });
+            return;
+          }
+          if (!this.canContinue(operationEpoch)) return;
+          const scope = this.activeSyncScope;
+          if (!scope) {
+            throw new Error(
+              "Local-only upload has no current authorization scope",
+            );
+          }
+          // 父目录链先落地（各自持久、可重入），文件自己的持久窗口随后开。
+          const parentsReady = await this.ensureRemoteParentChainForLocalOnlyUpload(
+            targetPath,
+            operationEpoch,
+          );
+          if (!parentsReady) return;
+          const intent: MutationIntentV1 = {
+            version: 1,
+            operationId: `${Date.now()}-${++this.mutationSequence}-localOnlyUpload`,
+            planRevision: this.state.planReviewRevision,
+            scope: { ...scope },
+            action: "upload",
+            path: targetPath,
+            expectedLocal: { exists: true, hash: entry.hash, size: entry.size },
+            expectedRemote: { exists: false },
+            createdAt: Date.now(),
+          };
+          const committed = await this.runDurableSideMutation(
+            intent,
+            operationEpoch,
+            async () => {
+              const uploadResult = await this.onedrive.uploadFile(
+                this.vaultName,
+                targetPath,
+                content,
+                (uploaded, total) =>
+                  this.updateSideActionProgress(uploaded, total),
+              );
+              const checkpoint = emptyMutationCheckpoint();
+              checkpoint.baseUpserts.push({
+                path: targetPath,
+                hash: entry.hash,
+                size: entry.size,
+                eTag: uploadResult.eTag ?? "",
+              });
+              this.state.cacheBaseContent(targetPath, content);
+              checkpoint.remoteUpserts.push(this.toUploadedRemoteEntry(
+                targetPath,
+                entry,
+                uploadResult,
+              ));
+              return checkpoint;
+            },
+          );
+          if (!committed) return;
+          await this.state.retireLocalOnlyEntries({
+            paths: [targetPath],
+            copyPaths: [targetPath],
+          });
+          if (showSuccessNotice) {
+            this.notice("notice.localOnly.uploaded", { path: targetPath });
+          }
+          return true;
+        } catch (error) {
+          if (this.stopSideActionForAuthFailure(targetPath, error)) return;
+          this.notice("notice.delete.failed", {
+            path: targetPath,
+            reason: this.failureReason(error),
+          });
+        }
+      },
+    );
+  }
+
+  /**
+   * 件② 批量行「全部上传」：逐条走现役 `uploadLocalOnlyEntry` 的上行链（本机
+   * 独有校验、父目录链、持久窗口、退场记录一项不少），只关掉逐条成功提示——
+   * 照 `confirmRemoteDeletes`（批量删除入口）先例；失败仍照逐条出口报错并保留
+   * 条目，批量不另设状态。顺序按路径排序，重挂/重放稳定。
+   */
+  async uploadLocalOnlyEntries(paths: readonly string[]): Promise<void> {
+    if (this.syncDirection !== "one-way") return;
+    const unique = [...new Set(paths)].sort((left, right) =>
+      left.localeCompare(right));
+    await Promise.all(
+      unique.map((path) => this.uploadLocalOnlyEntry(path, false)),
+    );
+  }
+
   /** Resolve a conflict: keep local version (re-upload) */
   async resolveConflictKeepLocal(path: string): Promise<void> {
     if (this.stopSideActionForStateRecovery()) return;
@@ -26766,6 +27263,7 @@ export class SyncExecutor {
       return;
     }
     if (await this.expireManagedConfigDecision(path, conflict)) return;
+    if (await this.expireOneWayOutboundConflictDecision(path, conflict)) return;
     const actionType = conflict?.remote && !conflict.local
       ? SyncActionType.DeleteRemote
       : SyncActionType.Upload;

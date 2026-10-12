@@ -8062,7 +8062,7 @@ describe("V1 to V2 controlled production activation", () => {
   });
 
   it("keeps an anchored public download in V1 when the remote version changed after its intent", async () => {
-    const { fixtureInput, ledger } =
+    const { fixtureInput, ledger, base } =
       await public113InterruptedAnchoredDownloadFixtureInput();
     const remoteFile = fixtureInput.remoteItems!.find((item) => item.file)!;
     remoteFile.eTag = "etag-after-public-download-intent";
@@ -8078,6 +8078,22 @@ describe("V1 to V2 controlled production activation", () => {
       uploaded: 0,
       downloaded: 0,
       deleted: 0,
+    });
+    // F23: the field report must be able to name the base entries whose remote
+    // identity cannot be proven, not just count them.
+    const rejection = harness.diag.warn.mock.calls.find(
+      ([category, message]) =>
+        category === "state"
+        && message === "V2 migration candidate rejected before authority change",
+    );
+    expect(rejection?.[2]).toMatchObject({
+      reason: "anchor-incomplete",
+      pending: 1,
+      pendingPaths: [{
+        path: base.path,
+        reason: "identity-not-unique-or-unverified",
+      }],
+      pendingTruncated: 0,
     });
     expect(harness.state.isV2StateActive).toBe(false);
     expect(harness.state.mutationLedger).toEqual(ledger);

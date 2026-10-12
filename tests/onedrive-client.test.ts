@@ -3073,10 +3073,13 @@ describe("OneDriveClient.detectExistingEasySyncRepositories", () => {
 
   function mockVaults(
     vaults: Array<{ name: string; slots: string[] | null }>,
-  ): void {
+    options: { sameNameProbeFailure?: boolean } = {},
+  ): { requests: string[] } {
+    const requests: string[] = [];
     vi.spyOn(obsidian, "requestUrl").mockImplementation(async (input) => {
-      const options = input as { url: string; method?: string };
-      const url = options.url;
+      const requestOptions = input as { url: string; method?: string };
+      const url = requestOptions.url;
+      requests.push(url);
       if (url.includes("/me/drive/special/approot:/vaults:/children")) {
         return {
           status: 200,
@@ -3096,9 +3099,11 @@ describe("OneDriveClient.detectExistingEasySyncRepositories", () => {
         const target = vaults.find(
           (vault) => storageNameOf(vault.name) === storage,
         );
-        if (!target) throw new Error(`unexpected request: ${url}`);
-        if (target.slots === null) {
-          // No .easy-sync directory at all — a plain 404, same as the cloud.
+        // 云端缺席与非活仓目录都是 404，与同名快通道探针看到的形态一致。
+        if (!target || target.slots === null) {
+          if (options.sameNameProbeFailure && !target) {
+            throw httpError(500, "Server Error");
+          }
           throw httpError(404, "Not Found");
         }
         return {
@@ -3114,14 +3119,20 @@ describe("OneDriveClient.detectExistingEasySyncRepositories", () => {
       }
       throw new Error(`unexpected request: ${url}`);
     });
+    return { requests };
   }
 
-  it("returns an empty list when the vaults directory does not exist", async () => {
+  function controlProbes(requests: string[]): string[] {
+    return requests.filter((url) => url.includes("/.easy-sync:/children"));
+  }
+
+  it("reports absence when the vaults directory does not exist", async () => {
     vi.spyOn(obsidian, "requestUrl").mockImplementation(async () => {
       throw httpError(404, "Not Found");
     });
     const client = new OneDriveClient(async () => "token");
-    await expect(client.detectExistingEasySyncRepositories()).resolves.toEqual([]);
+    await expect(client.detectExistingEasySyncRepositories("任意库"))
+      .resolves.toEqual({ kind: "none" });
   });
 
   it("keeps only directories that carry a protocol slot, across probe batches", async () => {
@@ -3133,16 +3144,47 @@ describe("OneDriveClient.detectExistingEasySyncRepositories", () => {
       { name: "第二批活跃库", slots: ["protocol-v3.json"] },
     ]);
     const client = new OneDriveClient(async () => "token");
-    await expect(client.detectExistingEasySyncRepositories())
-      .resolves.toEqual(["活跃库", "死链库", "第二批活跃库"]);
+    await expect(client.detectExistingEasySyncRepositories("本机库"))
+      .resolves.toEqual({
+        kind: "others",
+        repositories: ["活跃库", "死链库", "第二批活跃库"],
+      });
   });
 
   it("decodes legacy percent-encoded directory names and probes them verbatim", async () => {
     const legacyName = encodeURIComponent("我的笔记");
     mockVaults([{ name: legacyName, slots: ["protocol-v3.json"] }]);
     const client = new OneDriveClient(async () => "token");
-    await expect(client.detectExistingEasySyncRepositories())
-      .resolves.toEqual(["我的笔记"]);
+    await expect(client.detectExistingEasySyncRepositories("别的库"))
+      .resolves.toEqual({ kind: "others", repositories: ["我的笔记"] });
+  });
+
+  it("short-circuits the probe batches when the cloud already holds this vault's name", async () => {
+    // 同名快通道（2026-10-10 R3）：命中时只保留一次控制目录直探，不再逐仓探测
+    // ——这段就是「改前后 7.1 秒 → 约 1 秒」的机制本身。
+    const transport = mockVaults([
+      { name: "活跃库", slots: ["protocol-v3.json"] },
+      { name: "别家库", slots: ["protocol-v3.json"] },
+      { name: "第三家", slots: ["protocol-v3.json"] },
+      { name: "第四家", slots: ["protocol-v3.json"] },
+      { name: "第五家", slots: ["protocol-v3.json"] },
+    ]);
+    const client = new OneDriveClient(async () => "token");
+    await expect(client.detectExistingEasySyncRepositories("活跃库"))
+      .resolves.toEqual({ kind: "same-name" });
+    expect(controlProbes(transport.requests)).toHaveLength(1);
+  });
+
+  it("treats a failed same-name probe as a miss and enumerates as before", async () => {
+    // 快通道只做加速：探针失败（非 404）不得变成整次检测失败，也不得漏掉弹框。
+    const transport = mockVaults(
+      [{ name: "别家库", slots: ["protocol-v3.json"] }],
+      { sameNameProbeFailure: true },
+    );
+    const client = new OneDriveClient(async () => "token");
+    await expect(client.detectExistingEasySyncRepositories("本机库"))
+      .resolves.toEqual({ kind: "others", repositories: ["别家库"] });
+    expect(controlProbes(transport.requests).length).toBeGreaterThanOrEqual(2);
   });
 
   it("propagates listing failures instead of reporting an empty cloud", async () => {
@@ -3150,7 +3192,8 @@ describe("OneDriveClient.detectExistingEasySyncRepositories", () => {
       throw httpError(400, "Bad Request");
     });
     const client = new OneDriveClient(async () => "token");
-    await expect(client.detectExistingEasySyncRepositories()).rejects.toBeTruthy();
+    await expect(client.detectExistingEasySyncRepositories("任意库"))
+      .rejects.toBeTruthy();
   });
 });
 
@@ -5205,6 +5248,49 @@ describe("OneDriveClient folder identity mutations", () => {
         "@microsoft.graph.conflictBehavior": "fail",
       }),
     }));
+  });
+
+  it("creates a vault folder by path with the same path shape uploadFile uses", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 201,
+      headers: {},
+      json: {
+        id: "folder-id",
+        name: "sub",
+        folder: {},
+        parentReference: { id: "parent-id" },
+        eTag: "folder-etag",
+      },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.createFolderPath("My Vault", "notes/sub"))
+      .resolves.toMatchObject({ id: "folder-id" });
+
+    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({
+      method: "PUT",
+      url: expect.stringContaining(
+        "/me/drive/special/approot:/vaults/My%20Vault/files/notes/sub",
+      ),
+      body: JSON.stringify({
+        name: "sub",
+        folder: {},
+        "@microsoft.graph.conflictBehavior": "fail",
+      }),
+    }));
+  });
+
+  it("treats an existing vault folder (409) as already present", async () => {
+    // Host error path shape (verified against the app bundle): status and
+    // headers only — the response body is discarded by the host.
+    vi.spyOn(obsidian, "requestUrl").mockRejectedValueOnce({
+      status: 409,
+      headers: {},
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.createFolderPath("My Vault", "notes/sub"))
+      .resolves.toBeNull();
   });
 
   it("rejects a create response that does not preserve the requested parent identity", async () => {

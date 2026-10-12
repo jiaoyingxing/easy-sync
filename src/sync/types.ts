@@ -161,6 +161,13 @@ export interface SyncPlanFolder {
   sourceParentRemoteId?: string;
 }
 
+/**
+ * 片② 单向模式：本机改动被云端版本接管之前，先留成笔记库内独立副本的类别。
+ * `edited` ＝有基线的本机改动（含两端都改）；`new-file-both-sides` ＝无基线但
+ * 两端同名。本机独有条目记录与侧栏条目（片④）都按这两个类别归属。
+ */
+export type LocalOnlyCopyKindV1 = "edited" | "new-file-both-sides";
+
 export interface SyncPlanItem {
   type: SyncActionType;
   /** Vault-relative file path */
@@ -198,6 +205,12 @@ export interface SyncPlanItem {
    * It never authorizes a mutation and is ignored on any source mismatch.
    */
   textMergeEvidence?: TextMergeManualEvidenceV1;
+  /**
+   * 片② 单向模式：带着这个标记的 Download 在写入云端版本之前，必须先把当前
+   * 本机字节留成笔记库内独立副本（"本机改动"）；副本成功落盘才允许覆盖原路径。
+   * 只由计划生产链在方向＝单向时写入，双向计划里绝不出现。
+   */
+  localOnlyCopyKind?: LocalOnlyCopyKindV1;
 }
 
 export interface ContentComparisonReceiptV1 {
@@ -853,6 +866,13 @@ export interface PlanReviewCounts {
   deletes: number;
   conflicts: number;
   skipped: number;
+  /**
+   * 片② 单向模式：本轮"本机改动留副本、云端版本接管原路径"的文件数（只有单向
+   * 计划里才可能大于 0，双向计数对象形状保持不变）。它由 {@link
+   * summarizeCanonicalPlanReviewV2} 从封存后的计划项推出，所以冻结进审阅事实的
+   * 也是这一份——侧栏的事前告知句读它，不再自己数一遍计划。
+   */
+  localOnlyCopies?: number;
 }
 
 export interface PlanReviewItem {

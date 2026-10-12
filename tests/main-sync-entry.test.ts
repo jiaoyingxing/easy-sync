@@ -4522,7 +4522,9 @@ describe("main sync entry guards", () => {
     await plugin.executePlanReview(8);
 
     expect(run).not.toHaveBeenCalled();
-    expect(render).toHaveBeenCalledOnce();
+    // 面板必须被重画（失效的旧控件不能静默返回）；次数不再恰好为一——
+    // 2026-10-10 起同步入口占用在取得/释放锁时也各重画一次。
+    expect(render).toHaveBeenCalled();
   });
 
   it("does not execute a plan whose persisted counts have no review details", async () => {
@@ -4550,7 +4552,8 @@ describe("main sync entry guards", () => {
     await plugin.executePlanReview(9);
 
     expect(run).not.toHaveBeenCalled();
-    expect(render).toHaveBeenCalledOnce();
+    // 同前：重画即达（次数不再恰好为一，见 2026-10-10 锁时机重画）。
+    expect(render).toHaveBeenCalled();
   });
 
   it("requires migration-risk acknowledgement before executing a V2 migration review", async () => {
@@ -7518,5 +7521,400 @@ describe("slice-2 immediate scope-crossing prompt", () => {
     expect(scopeCrossingPromptMockArgs).toHaveLength(0);
     expect(retireLocalMoveHintsByRemoteIds).not.toHaveBeenCalled();
     plugin.stopAutoSync();
+  });
+});
+
+describe("sync mode switch transaction (片⑥)", () => {
+  function attachSyncModeHarness(plugin: EasySyncPlugin) {
+    const retireLocalOnlyEntries = vi.fn().mockResolvedValue(undefined);
+    const state = {
+      planReviewActive: false,
+      baseSnapshot: [],
+      remoteSnapshot: [],
+      pendingRemoteDeletes: [],
+      // 未结算 mutation 台账：默认空（既有用例走"无未结算记录→正常提交"）。
+      mutationLedger: [] as unknown[],
+      localOnlyCopyEntries: [{
+        version: 1,
+        path: "note.md",
+        copyPath: "note（副本）.md",
+        kind: "edited",
+        recordedAt: 1,
+      }],
+      localOnlyCreatedEntries: [
+        { version: 1, path: "new-note.md", recordedAt: 1 },
+      ],
+      localOnlyIgnoreMemory: {
+        schemaVersion: 1,
+        kind: "local-only-ignore-memory",
+        ignoredPaths: ["new-note.md"],
+      },
+      clearPlanReview: vi.fn().mockResolvedValue(true),
+      retireLocalOnlyEntries,
+    };
+    const setSyncDirection = vi.fn();
+    const syncViewRender = vi.fn();
+    const refreshSyncState = vi.fn();
+    plugin.state = state as never;
+    // syncView 是 getter（main.ts:1515），settingsTab 是私有字段：分别用 getter
+    // spy 与直接赋值替换，观察切换后的两处刷新。
+    vi.spyOn(plugin, "syncView", "get").mockReturnValue({
+      render: syncViewRender,
+    } as never);
+    plugin.settingsTab = { refreshSyncState } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasActivityInFlight: false,
+      setSyncDirection,
+    } as never;
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings")
+      .mockResolvedValue(undefined);
+    const noticeShow = vi.spyOn(plugin.noticeCenter, "show");
+    return {
+      state,
+      setSyncDirection,
+      saveSyncSettings,
+      noticeShow,
+      retireLocalOnlyEntries,
+      syncViewRender,
+      refreshSyncState,
+    };
+  }
+
+  it("commits the direction through the settings write and pushes it to the executor", async () => {
+    const plugin = makePlugin();
+    const harness = attachSyncModeHarness(plugin);
+    expect(plugin.syncDirection).toBe("two-way");
+
+    await expect(plugin.updateSyncDirection("one-way")).resolves.toBe(true);
+
+    expect(plugin.syncDirection).toBe("one-way");
+    expect(harness.saveSyncSettings).toHaveBeenCalledTimes(1);
+    expect(harness.setSyncDirection).toHaveBeenCalledWith("one-way");
+    // 片⑦：两处按方向渲染的面（「自动处理」行隐藏＋E1 常驻标识）靠这次刷新
+    // 立即生效（设置页组重渲染＋侧栏面板重渲染）。
+    expect(harness.refreshSyncState).toHaveBeenCalled();
+    expect(harness.syncViewRender).toHaveBeenCalled();
+    // 不动账本：开启方向不碰任何记录/条目（关闭方向才按 per-class 作废）。
+    expect(harness.retireLocalOnlyEntries).not.toHaveBeenCalled();
+    expect(harness.state.localOnlyCopyEntries).toHaveLength(1);
+  });
+
+  it("retires the local-only entries when switching back to two-way, keeping files and ignore memory", async () => {
+    const plugin = makePlugin();
+    plugin.syncDirection = "one-way";
+    const harness = attachSyncModeHarness(plugin);
+
+    await expect(plugin.updateSyncDirection("two-way")).resolves.toBe(true);
+
+    expect(plugin.syncDirection).toBe("two-way");
+    expect(harness.setSyncDirection).toHaveBeenCalledWith("two-way");
+    // per-class 作废：条目（记录）退场；忽略记忆保留（效力随模式结束）。
+    expect(harness.retireLocalOnlyEntries).toHaveBeenCalledWith({
+      paths: ["note.md", "new-note.md"],
+      copyPaths: ["note（副本）.md"],
+    });
+    expect(plugin.state?.localOnlyIgnoreMemory.ignoredPaths)
+      .toEqual(["new-note.md"]);
+  });
+
+  it("rejects the switch while a round or side action is in flight, without any write", async () => {
+    const plugin = makePlugin();
+    const harness = attachSyncModeHarness(plugin);
+    (plugin.syncExecutor as never as { hasActivityInFlight: boolean })
+      .hasActivityInFlight = true;
+
+    await expect(plugin.updateSyncDirection("one-way")).resolves.toBe(false);
+
+    expect(plugin.syncDirection).toBe("two-way");
+    expect(harness.saveSyncSettings).not.toHaveBeenCalled();
+    expect(harness.setSyncDirection).not.toHaveBeenCalled();
+    // 不静默失败：按现役忙碌形状给出占用原因。
+    expect(harness.noticeShow).toHaveBeenCalled();
+  });
+
+  it("aborts a stale operation and rolls the field back when the write fails", async () => {
+    const plugin = makePlugin();
+    const harness = attachSyncModeHarness(plugin);
+
+    // 中断注入：弹框期间操作生命周期被作废 → 提交拒绝，不写任何东西。
+    const epoch = plugin.captureOperationEpoch();
+    (plugin as never as { operationLifecycle: { invalidate(r: string): number } })
+      .operationLifecycle.invalidate("test");
+    await expect(plugin.updateSyncDirection("one-way", epoch)).rejects.toThrow(
+      "Operation lifecycle was invalidated",
+    );
+    expect(plugin.syncDirection).toBe("two-way");
+    expect(harness.saveSyncSettings).not.toHaveBeenCalled();
+
+    // 写入失败：字段回退（可重试），抛出给调用方（复用 settingsSaveFailed）。
+    harness.saveSyncSettings.mockRejectedValueOnce(new Error("disk full"));
+    await expect(plugin.updateSyncDirection("one-way")).rejects.toThrow(
+      "disk full",
+    );
+    expect(plugin.syncDirection).toBe("two-way");
+    expect(harness.setSyncDirection).not.toHaveBeenCalled();
+  });
+
+  it("rejects the switch while an unsettled mutation record exists, without any write", async () => {
+    const plugin = makePlugin();
+    const harness = attachSyncModeHarness(plugin);
+    // 未结算的出站 intent 会在下一轮被 recoverMutationLedger 结算/补完——那会在
+    // 单向模式下产生一笔云端写入，所以有未结算记录时必须先拒绝。
+    (plugin.state as never as { mutationLedger: unknown[] }).mutationLedger = [
+      {
+        intent: {
+          version: 1,
+          operationId: "pending-upload",
+          planRevision: 0,
+          scope: {},
+          action: "upload",
+          path: "note.md",
+          expectedLocal: { exists: true, hash: "h", size: 1 },
+          expectedRemote: { exists: false },
+          createdAt: 1,
+        },
+        receipt: null,
+      },
+    ];
+
+    await expect(plugin.updateSyncDirection("one-way")).resolves.toBe(false);
+
+    expect(plugin.syncDirection).toBe("two-way");
+    expect(harness.saveSyncSettings).not.toHaveBeenCalled();
+    expect(harness.setSyncDirection).not.toHaveBeenCalled();
+    // 复用现成文案，不新增键；呈现照忙碌门形状（不静默失败）。
+    expect(harness.noticeShow).toHaveBeenCalledWith(expect.objectContaining({
+      message: plugin.i18n.t("notice.sideActionPendingWork"),
+    }));
+  });
+
+  it("applies the unsettled-mutation gate in both directions", async () => {
+    const plugin = makePlugin();
+    plugin.syncDirection = "one-way";
+    const harness = attachSyncModeHarness(plugin);
+    (plugin.state as never as { mutationLedger: unknown[] }).mutationLedger = [
+      { intent: { operationId: "pending" }, receipt: null },
+    ];
+
+    // 单向→双向同样过门（方向无关）。
+    await expect(plugin.updateSyncDirection("two-way")).resolves.toBe(false);
+
+    expect(plugin.syncDirection).toBe("one-way");
+    expect(harness.saveSyncSettings).not.toHaveBeenCalled();
+    expect(harness.setSyncDirection).not.toHaveBeenCalled();
+    expect(harness.noticeShow).toHaveBeenCalledWith(expect.objectContaining({
+      message: plugin.i18n.t("notice.sideActionPendingWork"),
+    }));
+  });
+
+  it("rejects the switch on a corrupt mutation ledger, same criterion as the settings commit", async () => {
+    const plugin = makePlugin();
+    const harness = attachSyncModeHarness(plugin);
+    // 同口径来源 state-manager.ts:5954-5963：损坏/隔离/载入阻塞与"台账非空"
+    // 同属"恢复未完成"，同样拒绝（台账本身为空）。
+    (plugin.state as never as { hasMutationLedgerCorruption: boolean })
+      .hasMutationLedgerCorruption = true;
+
+    await expect(plugin.updateSyncDirection("one-way")).resolves.toBe(false);
+
+    expect(plugin.syncDirection).toBe("two-way");
+    expect(harness.saveSyncSettings).not.toHaveBeenCalled();
+    expect(harness.noticeShow).toHaveBeenCalled();
+  });
+
+  it("keeps the ledger untouched across both directions", async () => {
+    const plugin = makePlugin();
+    plugin.syncDirection = "one-way";
+    const harness = attachSyncModeHarness(plugin);
+    const state = plugin.state as never as Record<string, unknown>;
+    // 账本事实（基线与远端快照）：切换只写 `sync-direction` 这一个键，两份
+    // 指纹（以及它们的形状）一字不动；状态对象上也不新增任何记录面。
+    state.baseSnapshot = [
+      { path: "note.md", hash: "base-hash", size: 4, eTag: "etag-base" },
+    ];
+    state.remoteSnapshot = [{ path: "note.md", driveId: "d", eTag: "e" }];
+    const before = JSON.stringify({
+      base: state.baseSnapshot,
+      remote: state.remoteSnapshot,
+      keys: Object.keys(state).sort(),
+    });
+
+    await expect(plugin.updateSyncDirection("two-way")).resolves.toBe(true);
+    await expect(plugin.updateSyncDirection("one-way")).resolves.toBe(true);
+
+    expect(JSON.stringify({
+      base: state.baseSnapshot,
+      remote: state.remoteSnapshot,
+      keys: Object.keys(state).sort(),
+    })).toBe(before);
+    // 唯一被动的状态面＝关闭方向时本机独有条目的 per-class 作废（记录退场）。
+    expect(harness.retireLocalOnlyEntries).toHaveBeenCalledTimes(1);
+    expect(harness.saveSyncSettings).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports the gate counts from live facts and the disable counts from the row family", async () => {
+    const plugin = makePlugin();
+    attachSyncModeHarness(plugin);
+    // 开启侧：一次本机扫描（只读、无网络）＋状态里的待确认删除。
+    const state = plugin.state as never as Record<string, unknown>;
+    state.baseSnapshot = [
+      { path: "note.md", hash: "base-hash", size: 4, eTag: "etag-base" },
+    ];
+    state.remoteSnapshot = [
+      { path: "remote-only.md", driveId: "d", size: 1, mtime: 1, eTag: "e", sha256Hash: "s" },
+    ];
+    state.pendingRemoteDeletes = [{ path: "gone.md" }];
+    plugin.scanner = {
+      scanAll: vi.fn().mockResolvedValue({
+        entries: [
+          // 有基线且本机改过 → 计 1。
+          { path: "note.md", hash: "edited-hash", size: 9, mtime: 1, binary: false },
+          // 无基线但云端已有同名 → 计 1（同样会留副本）。
+          { path: "remote-only.md", hash: "same", size: 1, mtime: 1, binary: false },
+          // 无基线、云端也没有 → 不计（片③ 的新建保留，不产生副本）。
+          { path: "local-only.md", hash: "x", size: 1, mtime: 1, binary: false },
+        ],
+        folders: [],
+        folderScanComplete: true,
+        skippedLarge: [],
+        failedPaths: [],
+        skippedCount: 0,
+        complete: true,
+      }),
+    } as never;
+
+    await expect(plugin.getSyncModeGateCounts()).resolves.toEqual({
+      edited: 2,
+      blockedDeletes: 1,
+    });
+
+    // 关闭侧：本机独有条目总数含被"不再提醒"的项，另一数是其中仍被忽略的。
+    expect(plugin.getSyncModeDisableCounts()).toEqual({
+      pendingUploads: 2,
+      dismissed: 1,
+    });
+  });
+});
+
+describe("one-way local-only batch row and reversal entry (三件优化 件②/件③)", () => {
+  function attachLocalOnlyHarness(
+    plugin: EasySyncPlugin,
+    options: { ignoredPaths?: string[] } = {},
+  ) {
+    const ignoreLocalOnlyPaths = vi.fn().mockResolvedValue(undefined);
+    const clearAllLocalOnlyIgnorePaths = vi.fn().mockResolvedValue(undefined);
+    const state = {
+      localOnlyCopyEntries: [{
+        version: 1,
+        path: "note.md",
+        copyPath: "note（副本）.md",
+        kind: "edited",
+        recordedAt: 1,
+      }],
+      localOnlyCreatedEntries: [
+        { version: 1, path: "new-note.md", recordedAt: 1 },
+        { version: 1, path: "gone.md", recordedAt: 1 },
+      ],
+      localOnlyIgnoreMemory: {
+        schemaVersion: 1,
+        kind: "local-only-ignore-memory",
+        // 记忆里刻意留一条"已退场"的旧路径：面板不会列出它，计数也不该算进去。
+        ignoredPaths: options.ignoredPaths ?? ["new-note.md", "已退场的旧记录.md"],
+      },
+      ignoreLocalOnlyPaths,
+      clearAllLocalOnlyIgnorePaths,
+    };
+    plugin.state = state as never;
+    const syncViewRender = vi.fn();
+    const refreshSyncState = vi.fn();
+    vi.spyOn(plugin, "syncView", "get").mockReturnValue({
+      render: syncViewRender,
+    } as never);
+    plugin.settingsTab = { refreshSyncState } as never;
+    const noticeShow = vi.spyOn(plugin.noticeCenter, "show");
+    return {
+      state,
+      ignoreLocalOnlyPaths,
+      clearAllLocalOnlyIgnorePaths,
+      noticeShow,
+      syncViewRender,
+      refreshSyncState,
+    };
+  }
+
+  it("writes the whole batch of ignores in one call and refreshes both panes (件②)", async () => {
+    const plugin = makePlugin();
+    plugin.syncDirection = "one-way";
+    const harness = attachLocalOnlyHarness(plugin);
+
+    await plugin.ignoreLocalOnlyEntries([
+      "note（副本）.md",
+      "new-note.md",
+    ]);
+
+    // 一次写入整批（键＝行代表的上传目标路径，与逐条行同一把键）。
+    expect(harness.ignoreLocalOnlyPaths).toHaveBeenCalledTimes(1);
+    expect(harness.ignoreLocalOnlyPaths).toHaveBeenCalledWith([
+      "note（副本）.md",
+      "new-note.md",
+    ]);
+    // 行消失即反馈：侧栏与设置页两组都刷新（设置页那一行按计数重估）。
+    expect(harness.syncViewRender).toHaveBeenCalled();
+    expect(harness.refreshSyncState).toHaveBeenCalled();
+  });
+
+  it("counts only the ignored entries still in the record family, and returns zero in two-way (件③)", async () => {
+    const plugin = makePlugin();
+    plugin.syncDirection = "one-way";
+    const harness = attachLocalOnlyHarness(plugin);
+
+    // 记录族里当前存在的三条：edited(note.md)／created(new-note.md)／created(gone.md)；
+    // 记忆命中两条，其中"已退场的旧记录.md"不在族里 ⇒ 只数 1。
+    expect(plugin.getIgnoredLocalOnlyCount()).toBe(1);
+
+    const twoWay = makePlugin();
+    const twoWayHarness = attachLocalOnlyHarness(twoWay);
+    expect(twoWay.getIgnoredLocalOnlyCount()).toBe(0);
+    await twoWay.ignoreLocalOnlyEntries(["a.md"]);
+    await twoWay.clearLocalOnlyIgnores();
+    expect(twoWayHarness.ignoreLocalOnlyPaths).not.toHaveBeenCalled();
+    expect(twoWayHarness.clearAllLocalOnlyIgnorePaths).not.toHaveBeenCalled();
+    void harness;
+  });
+
+  it("reversal clears the memory once and reports one line, without touching files (件③)", async () => {
+    const plugin = makePlugin();
+    plugin.syncDirection = "one-way";
+    // 反馈句逐字（中文侧；英文同键见语言用例）。
+    plugin.i18n = new I18n("zh-cn");
+    const harness = attachLocalOnlyHarness(plugin);
+
+    await plugin.clearLocalOnlyIgnores();
+
+    expect(harness.clearAllLocalOnlyIgnorePaths).toHaveBeenCalledTimes(1);
+    const messages = harness.noticeShow.mock.calls
+      .map((entry) => (entry[0] as { message: string }).message);
+    // 反馈带数量（2026-10-12 文案重设计定稿）：harness 里记录族有 1 条命中忽略记忆。
+    expect(messages).toContain("已重置，1 个文件可在同步面板重新选择。");
+    // 条目回归：两处按方向/计数渲染的面都刷新。
+    expect(harness.syncViewRender).toHaveBeenCalled();
+    expect(harness.refreshSyncState).toHaveBeenCalled();
+  });
+
+  it("reversal is a zero-action no-op when nothing is currently ignored (件③)", async () => {
+    const plugin = makePlugin();
+    plugin.syncDirection = "one-way";
+    const harness = attachLocalOnlyHarness(plugin, {
+      ignoredPaths: ["已退场的旧记录.md"],
+    });
+
+    expect(plugin.getIgnoredLocalOnlyCount()).toBe(0);
+    await plugin.clearLocalOnlyIgnores();
+
+    // 没有可收回的内容：不写记忆、不弹反馈（设置页那一行也不出现）。
+    expect(harness.clearAllLocalOnlyIgnorePaths).not.toHaveBeenCalled();
+    expect(harness.noticeShow).not.toHaveBeenCalled();
+    expect(harness.syncViewRender).not.toHaveBeenCalled();
   });
 });

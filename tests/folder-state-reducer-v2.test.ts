@@ -1,10 +1,20 @@
 import { describe, expect, it } from "vitest";
 import type { DriveItem } from "../src/onedrive/types";
-import { reduceFolderStateEnvelopeV2 } from "../src/sync/folder-state-reducer-v2";
+import {
+  acceptConfirmedDescendantFolderAnchorsV2,
+  acceptScopeExpansionFolderAnchorsV2,
+  reduceFolderStateEnvelopeV2,
+} from "../src/sync/folder-state-reducer-v2";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
-import type { SyncStateEnvelopeV2 } from "../src/sync/state-envelope-v2";
+import type {
+  FolderAnchorV2,
+  SyncAnchorV2,
+  SyncStateEnvelopeV2,
+} from "../src/sync/state-envelope-v2";
 import type {
   FolderMutationIntentV2,
+  LocalFileEntry,
+  LocalFolderEntry,
   MutationLedgerEntryV1,
   RemoteFolderEntry,
 } from "../src/sync/types";
@@ -560,5 +570,242 @@ describe("V2 folder-create reducer", () => {
 
     expect(() => reduceFolderStateEnvelopeV2(current, record))
       .toThrow("still has committed descendants");
+  });
+});
+
+const hashA = "a".repeat(64);
+
+function identityEnvelope(input: {
+  folders?: Array<{ id: string; name: string; parentId?: string }>;
+  files?: Array<{ id: string; name: string; parentId: string; hash?: string; size?: number }>;
+  folderAnchors?: FolderAnchorV2[];
+  fileAnchors?: SyncAnchorV2[];
+}): SyncStateEnvelopeV2 {
+  const remoteItems: DriveItem[] = [
+    ...(input.folders ?? []).map((folder): DriveItem => ({
+      id: folder.id,
+      name: folder.name,
+      parentReference: { id: folder.parentId ?? scope.filesRootId },
+      folder: {},
+      eTag: `etag-${folder.id}`,
+      cTag: `ctag-${folder.id}`,
+    })),
+    ...(input.files ?? []).map((file): DriveItem => ({
+      id: file.id,
+      name: file.name,
+      parentReference: { id: file.parentId },
+      file: { hashes: { sha256Hash: file.hash ?? hashA } },
+      size: file.size ?? 10,
+      eTag: `etag-${file.id}`,
+      cTag: `ctag-${file.id}`,
+    })),
+  ];
+  return {
+    meta: {
+      schemaVersion: 2,
+      lifecycleEpoch: 1,
+      commitSeq: 3,
+      committedAt: 1,
+    },
+    scope,
+    remoteIndex: buildRemoteIndexV2(remoteItems, scope.filesRootId, "delta", 2).index,
+    anchors: {
+      schemaVersion: 2,
+      byAnchorId: Object.fromEntries(
+        (input.fileAnchors ?? []).map((anchor) => [anchor.anchorId, anchor]),
+      ),
+    },
+    folderAnchors: {
+      schemaVersion: 2,
+      byAnchorId: Object.fromEntries(
+        (input.folderAnchors ?? []).map((anchor) => [anchor.anchorId, anchor]),
+      ),
+    },
+  };
+}
+
+function retiredFolderAnchor(remoteId: string, lastPath: string): FolderAnchorV2 {
+  return {
+    anchorId: `folder:${remoteId}`,
+    remoteId,
+    lastPath,
+    parentRemoteId: scope.filesRootId,
+    remoteETag: `etag-${remoteId}`,
+    confirmedGeneration: 1,
+    confirmedAt: 1,
+  };
+}
+
+function equalReadFileAnchor(remoteId: string, lastPath: string): SyncAnchorV2 {
+  return {
+    anchorId: `file:${remoteId}`,
+    remoteId,
+    lastPath,
+    contentHash: hashA,
+    size: 10,
+    remoteETag: `etag-${remoteId}`,
+    confirmedAt: 1,
+    confirmedBy: "equal-read",
+  };
+}
+
+const inboxLocalFiles: LocalFileEntry[] = [
+  { path: "Inbox/note.md", hash: hashA, size: 10, mtime: 1, binary: false },
+];
+const inboxLocalFolders: LocalFolderEntry[] = [{ path: "Inbox" }];
+
+describe("F24 same-path folder identity replacement (provably retired anchor)", () => {
+  it("supersedes a retired same-path anchor from confirmed descendant evidence", () => {
+    const current = identityEnvelope({
+      folders: [{ id: "inbox-new", name: "Inbox" }],
+      files: [{ id: "note-new", name: "note.md", parentId: "inbox-new" }],
+      folderAnchors: [retiredFolderAnchor("inbox-old", "Inbox")],
+      fileAnchors: [equalReadFileAnchor("note-new", "Inbox/note.md")],
+    });
+
+    const reduced = acceptConfirmedDescendantFolderAnchorsV2({
+      envelope: current,
+      localFiles: inboxLocalFiles,
+      localFolders: inboxLocalFolders,
+      localFolderScanComplete: true,
+      remoteIdentityComplete: true,
+      confirmedAt: 5,
+    });
+
+    expect(reduced.status).toBe("accepted");
+    expect(reduced.accepted).toBe(1);
+    expect(reduced.evidenceFiles).toBe(1);
+    expect(reduced.supersededFolderRemoteIds).toEqual(["inbox-old"]);
+    const anchors = reduced.envelope.folderAnchors!.byAnchorId;
+    expect(Object.keys(anchors)).toEqual(["folder:inbox-new"]);
+    expect(anchors["folder:inbox-new"]).toMatchObject({
+      remoteId: "inbox-new",
+      lastPath: "Inbox",
+      parentRemoteId: scope.filesRootId,
+    });
+    expect(reduced.envelope.meta.commitSeq).toBe(current.meta.commitSeq + 1);
+  });
+
+  it("keeps fail-closed while a live anchor still occupies the same path", () => {
+    const current = identityEnvelope({
+      folders: [
+        { id: "inbox-new", name: "Inbox" },
+        { id: "inbox-moved", name: "Inbox 2" },
+      ],
+      files: [{ id: "note-new", name: "note.md", parentId: "inbox-new" }],
+      folderAnchors: [retiredFolderAnchor("inbox-moved", "Inbox")],
+      fileAnchors: [equalReadFileAnchor("note-new", "Inbox/note.md")],
+    });
+
+    const reduced = acceptConfirmedDescendantFolderAnchorsV2({
+      envelope: current,
+      localFiles: inboxLocalFiles,
+      localFolders: inboxLocalFolders,
+      localFolderScanComplete: true,
+      remoteIdentityComplete: true,
+      confirmedAt: 5,
+    });
+
+    expect(reduced).toMatchObject({
+      status: "rejected",
+      reason: "folder-anchor-collision",
+      accepted: 0,
+    });
+    expect(reduced.supersededFolderRemoteIds).toBeUndefined();
+  });
+
+  it("supersedes a retired same-path anchor when the user confirms the shared identity", () => {
+    const current = identityEnvelope({
+      folders: [{ id: "inbox-new", name: "Inbox" }],
+      folderAnchors: [retiredFolderAnchor("inbox-old", "Inbox")],
+    });
+
+    const reduced = acceptScopeExpansionFolderAnchorsV2({
+      envelope: current,
+      localFiles: [],
+      localFolders: inboxLocalFolders,
+      localFolderScanComplete: true,
+      remoteIdentityComplete: true,
+      authorizedFolders: [{
+        path: "Inbox",
+        driveId: "inbox-new",
+        parentId: scope.filesRootId,
+        name: "Inbox",
+        eTag: "etag-inbox-new",
+      }],
+      allowRetiredAnchorSupersede: true,
+      confirmedAt: 5,
+    });
+
+    expect(reduced.status).toBe("accepted");
+    expect(reduced.accepted).toBe(1);
+    expect(reduced.supersededFolderRemoteIds).toEqual(["inbox-old"]);
+    expect(Object.keys(reduced.envelope.folderAnchors!.byAnchorId)).toEqual([
+      "folder:inbox-new",
+    ]);
+  });
+
+  it("keeps the scope-expansion adoption fail-closed without an identity decision", () => {
+    // The scope-expansion path must never rebind a remote id that was replaced
+    // while the path was out of scope: only the explicit shared-folder
+    // identity confirmation may supersede a retired anchor.
+    const current = identityEnvelope({
+      folders: [{ id: "inbox-new", name: "Inbox" }],
+      folderAnchors: [retiredFolderAnchor("inbox-old", "Inbox")],
+    });
+
+    const reduced = acceptScopeExpansionFolderAnchorsV2({
+      envelope: current,
+      localFiles: [],
+      localFolders: inboxLocalFolders,
+      localFolderScanComplete: true,
+      remoteIdentityComplete: true,
+      authorizedFolders: [{
+        path: "Inbox",
+        driveId: "inbox-new",
+        parentId: scope.filesRootId,
+        name: "Inbox",
+        eTag: "etag-inbox-new",
+      }],
+      confirmedAt: 5,
+    });
+
+    expect(reduced).toMatchObject({
+      status: "rejected",
+      reason: "folder-anchor-collision",
+      accepted: 0,
+    });
+  });
+
+  it("keeps the shared-identity write fail-closed for a live same-path anchor", () => {
+    const current = identityEnvelope({
+      folders: [
+        { id: "inbox-new", name: "Inbox" },
+        { id: "inbox-moved", name: "Inbox 2" },
+      ],
+      folderAnchors: [retiredFolderAnchor("inbox-moved", "Inbox")],
+    });
+
+    const reduced = acceptScopeExpansionFolderAnchorsV2({
+      envelope: current,
+      localFiles: [],
+      localFolders: inboxLocalFolders,
+      localFolderScanComplete: true,
+      remoteIdentityComplete: true,
+      authorizedFolders: [{
+        path: "Inbox",
+        driveId: "inbox-new",
+        parentId: scope.filesRootId,
+        name: "Inbox",
+        eTag: "etag-inbox-new",
+      }],
+      confirmedAt: 5,
+    });
+
+    expect(reduced).toMatchObject({
+      status: "rejected",
+      reason: "folder-anchor-collision",
+      accepted: 0,
+    });
   });
 });

@@ -38,6 +38,17 @@ export interface LocaleStrings {
 
   // ---- Settings Groups ----
   "settings.group.scope": string;
+  "settings.rules.name": string;
+  "settings.rules.acknowledge": string;
+  "settings.syncContent.heading": string;
+  "settings.rootNav.scope.desc": string;
+  "settings.rootNav.autoSync.desc": string;
+  "settings.rootNav.display.desc": string;
+  "settings.rootNav.about.desc": string;
+  "settings.rootNav.maintenance.desc": string;
+  "settings.rootNav.value.autoSyncOn": string;
+  "settings.rootNav.value.autoSyncOff": string;
+  "settings.rootNav.value.excluded": string;
   "settings.group.automatic": string;
   "settings.group.display": string;
   "settings.group.maintenance": string;
@@ -89,6 +100,26 @@ export interface LocaleStrings {
   "settings.account.device.cancel": string;
   "settings.account.device.busy": string;
   "settings.syncPanel.name": string;
+  "settings.syncMode.name": string;
+  "settings.syncMode.option.twoway": string;
+  "settings.syncMode.option.oneway": string;
+  "settings.syncMode.hint.twoway": string;
+  "settings.syncMode.hint.oneway": string;
+  "settings.syncMode.gate.title": string;
+  "settings.syncMode.gate.message": string;
+  "settings.syncMode.gate.point1": string;
+  "settings.syncMode.gate.point2": string;
+  "settings.syncMode.gate.point3": string;
+  "settings.syncMode.gate.tail": string;
+  "settings.syncMode.gate.editedCount": string;
+  "settings.syncMode.gate.blockedDeletes": string;
+  "settings.syncMode.gate.inputLabel": string;
+  "settings.syncMode.gate.confirm": string;
+  "settings.syncMode.disable.title": string;
+  "settings.syncMode.disable.message": string;
+  "settings.syncMode.disable.count": string;
+  "settings.syncMode.disable.dismissedCount": string;
+  "settings.syncMode.disable.confirm": string;
   "settings.syncPanel.button": string;
   "settings.autoSync.name": string;
   "settings.autoSync.open": string;
@@ -201,6 +232,8 @@ export interface LocaleStrings {
   "settings.notificationPopups.hint.all": string;
   "settings.notificationPopups.hint.important": string;
   "settings.notificationPopups.hint.off": string;
+  "settings.mobileStatusBar.name": string;
+  "settings.mobileStatusBar.desc": string;
   "settings.maxFileSize.name": string;
   "settings.maxFileSize.desc": string;
   "settings.maxFileSize.descUnlimited": string;
@@ -209,6 +242,9 @@ export interface LocaleStrings {
   "settings.maxFileSize.optionCustom": string;
   "settings.maxFileSize.customPlaceholder": string;
   "settings.maxFileSize.invalidValue": string;
+  "settings.localOnlyIgnored.name": string;
+  "settings.localOnlyIgnored.desc": string;
+  "settings.localOnlyIgnored.button": string;
   "settings.reset.name": string;
   "settings.reset.desc": string;
   "settings.reset.button": string;
@@ -244,6 +280,22 @@ export interface LocaleStrings {
   "syncView.conflict.keepRemote": string;
   "syncView.conflict.skip": string;
   "syncView.conflict.defaultReason": string;
+  /** 片② 副本的文件名标签（用户可见；副本命名模板的一部分；设备中立用词）。 */
+  "syncView.localOnly.copyLabel": string;
+  "syncView.localOnly.chip.edited": string;
+  "syncView.localOnly.chip.created": string;
+  /** 逐条行说明句只有改动类有（新建类的身份由 chip 承担，2026-10-12 定稿）。 */
+  "syncView.localOnly.reason.edited": string;
+  "syncView.localOnly.upload": string;
+  "syncView.localOnly.keep": string;
+  "syncView.localOnly.batchNote": string;
+  "syncView.localOnly.batchUploadAll": string;
+  "syncView.localOnly.batchKeepAll": string;
+  "syncView.localOnly.batchConfirmTitle": string;
+  "syncView.localOnly.batchConfirmMessage": string;
+  "syncView.localOnly.batchConfirmUpload": string;
+  "notice.localOnly.uploaded": string;
+  "notice.localOnly.reminded": string;
   "syncView.delete.confirm": string;
   "syncView.delete.confirmAll": string;
   "syncView.delete.confirmAllTitle": string;
@@ -787,6 +839,7 @@ export interface LocaleStrings {
   "syncView.status.synced": string;
   "syncView.status.offline": string;
   "syncView.status.awaitingLogin": string;
+  "syncView.status.mode.oneway": string;
   "syncView.recovery.checking": string;
   "syncView.recovery.checkingTop": string;
   "syncView.recovery.waitingNetwork": string;
@@ -856,6 +909,9 @@ export interface LocaleStrings {
   "rsMigration.offerFreshDesc": string;
   "rsMigration.offerCrossDeviceNote": string;
   "rsMigration.detectNotice": string;
+  /** 首同步前的 RS 旧仓检测失败：本轮已中止（选择保留），必须让用户知道
+   *  为什么什么都没发生（2026-10-10 R2）。 */
+  "rsMigration.detectFailedNotice": string;
   "rsMigration.completedNotice": string;
   "rsMigration.failureTitle": string;
   "rsMigration.failureBody": string;
@@ -906,6 +962,9 @@ export interface LocaleStrings {
   "syncPlan.noChanges": string;
   "syncPlan.remoteScopeRecreateSummary": string;
   "syncPlan.confirmBoundarySummary": string;
+  "syncPlan.oneWayNote.both": string;
+  "syncPlan.oneWayNote.localOnly": string;
+  "syncPlan.oneWayNote.copies": string;
 
   // ---- Status Bar Plan Review ----
   "status.planReview": string;

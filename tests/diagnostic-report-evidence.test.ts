@@ -383,6 +383,20 @@ describe("diagnostic report evidence", () => {
     expect(source).toContain("buildConflictEvidence(c");
     expect(source).toContain("合并不重叠的文本修改");
   });
+
+  it("reports the sync mode and the effective delete-follow wording (片⑥ 收口)", () => {
+    const source = readFileSync("src/main.ts", "utf8");
+    // 模式行：单向/双向如实写明（此前报告完全没有模式事实）。
+    expect(source).toContain("**同步模式**");
+    expect(source).toContain(
+      '**同步模式**: ${this.syncDirection === "one-way" ? "单向同步（本机不上传笔记与附件）" : "双向同步"}',
+    );
+    // 自动处理行：单向模式下删除跟随恒开，必须写"生效"口径而不是设置值，
+    // 否则报告与真实行为不符（此前读设置值会写成"关闭"）。
+    expect(source).toContain(
+      '将云端删除同步到本机 ${this.syncDirection === "one-way" ? "强制跟随（单向同步）"',
+    );
+  });
 });
 
 describe("diagnostic report failure notice", () => {

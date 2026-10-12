@@ -1872,6 +1872,68 @@ describe("community plugin enablement runtime", () => {
     );
   });
 
+  it("keeps the one-way outbound-conflict guard off the excluded config surface", async () => {
+    // 单向模式：「保留本机」对"本机已删、云端改过"的行＝删云端，属模式不提供的
+    // 反向出口，因此陈旧行退役；但配置白名单成员（这里＝themes/ 目录 owner）在模式
+    // 内照常双向，出口保持可用（2026-10-12 review 修正）。
+    const notePath = "note.md";
+    const themePath = ".obsidian/themes/MyTheme/theme.css";
+    const themeFolders: RemoteFolderEntry[] = [
+      ...REMOTE_FOLDERS,
+      {
+        path: ".obsidian/themes",
+        driveId: "themes-folder-id",
+        parentId: "obsidian-folder-id",
+        name: "themes",
+      },
+      {
+        path: ".obsidian/themes/MyTheme",
+        driveId: "mytheme-folder-id",
+        parentId: "themes-folder-id",
+        name: "MyTheme",
+      },
+    ];
+    const remoteNote = await remoteEntry(notePath, bytes("note"), {
+      parentId: SCOPE.filesRootId,
+    });
+    const remoteTheme = await remoteEntry(themePath, bytes("css"), {
+      parentId: "mytheme-folder-id",
+    });
+    const memory = makeMemoryAdapter({});
+    const state = makeState([remoteNote, remoteTheme], [], {
+      pendingConflicts: [
+        {
+          type: "conflict",
+          path: notePath,
+          remote: remoteNote,
+          reason: "reason.localDeletedRemoteModified",
+        },
+        {
+          type: "conflict",
+          path: themePath,
+          remote: remoteTheme,
+          reason: "reason.localDeletedRemoteModified",
+        },
+      ],
+    }, themeFolders);
+    const { executor } = makeExecutor({
+      localEntries: [],
+      remoteEntries: [remoteNote, remoteTheme],
+      remoteContent: null,
+      adapter: memory.adapter,
+      state,
+      remoteFolders: themeFolders,
+      oneDrive: makeOneDrive(null),
+    });
+    executor.setSyncDirection("one-way");
+
+    await executor.resolveConflictKeepLocal(notePath);
+    await executor.resolveConflictKeepLocal(themePath);
+
+    expect(state.removePendingConflict).toHaveBeenCalledWith(notePath);
+    expect(state.removePendingConflict).not.toHaveBeenCalledWith(themePath);
+  });
+
   it("expires stale one-sided plugin conflicts instead of accepting a destructive choice", async () => {
     const remoteOnlyPath = ".obsidian/plugins/calendar/main.js";
     const localOnlyPath = ".obsidian/plugins/calendar/manifest.json";

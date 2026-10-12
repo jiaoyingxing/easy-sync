@@ -21,6 +21,9 @@ export type ScopeExpansionFolderAcceptanceV2 =
   | {
       status: "accepted";
       accepted: number;
+      /** F24: remote ids whose stale same-path anchor was superseded in this
+       *  commit (audit trail; absent when nothing was superseded). */
+      supersededFolderRemoteIds?: string[];
       envelope: SyncStateEnvelopeV2;
     }
   | {
@@ -48,6 +51,9 @@ export type ConfirmedDescendantFolderAcceptanceV2 =
       status: "accepted";
       accepted: number;
       evidenceFiles: number;
+      /** F24: remote ids whose stale same-path anchor was superseded in this
+       *  commit (audit trail; absent when nothing was superseded). */
+      supersededFolderRemoteIds?: string[];
       envelope: SyncStateEnvelopeV2;
     }
   | {
@@ -70,6 +76,11 @@ export function acceptScopeExpansionFolderAnchorsV2(input: {
   localFolderScanComplete: boolean;
   remoteIdentityComplete: boolean;
   authorizedFolders: readonly RemoteFolderEntry[];
+  /** F24: only the explicit shared-folder identity confirmation may supersede
+   *  a provably retired same-path anchor. The scope-expansion adoption path
+   *  keeps its fail-closed collision rule: a remote id replaced while the
+   *  path was out of scope is never rebound without an identity decision. */
+  allowRetiredAnchorSupersede?: boolean;
   confirmedAt: number;
 }): ScopeExpansionFolderAcceptanceV2 {
   validateEnvelope(input.envelope);
@@ -110,6 +121,7 @@ export function acceptScopeExpansionFolderAnchorsV2(input: {
   const additions: RemoteFolderEntry[] = [];
   const seenPaths = new Set<string>();
   const seenRemoteIds = new Set<string>();
+  const supersededAnchorIds = new Set<string>();
 
   for (const authorized of [...input.authorizedFolders].sort(
     (left, right) =>
@@ -145,8 +157,23 @@ export function acceptScopeExpansionFolderAnchorsV2(input: {
     if (exact) continue;
     if (currentAnchors.some((anchor) =>
       anchor.remoteId === authorized.driveId
-      || identityPath(anchor.lastPath) === pathKey
     )) return reject("folder-anchor-collision");
+    // F24 (GitHub #21): an anchor whose remote identity is provably retired
+    // (absent from the complete remote index) may be superseded at its path:
+    // the stale anchor is deleted in the same state commit and reported for
+    // audit. A live anchor at the path keeps the collision gate closed, and
+    // the supersede requires the explicit identity decision of the caller.
+    const samePathAnchor = currentAnchors.find((anchor) =>
+      identityPath(anchor.lastPath) === pathKey);
+    if (samePathAnchor) {
+      if (
+        !input.allowRetiredAnchorSupersede
+        || !isRetiredRemoteId(input.envelope, samePathAnchor.remoteId)
+      ) {
+        return reject("folder-anchor-collision");
+      }
+      supersededAnchorIds.add(samePathAnchor.anchorId);
+    }
     additions.push({
       ...authorized,
       ...(node.eTag !== undefined ? { eTag: node.eTag } : {}),
@@ -165,6 +192,11 @@ export function acceptScopeExpansionFolderAnchorsV2(input: {
   const nextAnchors = {
     ...input.envelope.folderAnchors.byAnchorId,
   };
+  const supersededFolderRemoteIds = [...supersededAnchorIds]
+    .map((anchorId) => nextAnchors[anchorId]?.remoteId)
+    .filter((remoteId): remoteId is string => Boolean(remoteId))
+    .sort();
+  for (const anchorId of supersededAnchorIds) delete nextAnchors[anchorId];
   for (const folder of additions) {
     const anchorId = `folder:${folder.driveId}`;
     nextAnchors[anchorId] = {
@@ -193,8 +225,23 @@ export function acceptScopeExpansionFolderAnchorsV2(input: {
   return {
     status: "accepted",
     accepted: additions.length,
+    ...(supersededFolderRemoteIds.length > 0
+      ? { supersededFolderRemoteIds }
+      : {}),
     envelope,
   };
+}
+
+/**
+ * F24: a folder remote identity is provably retired once it is absent from a
+ * complete remote index. Both acceptance reducers refuse to run on partial
+ * enumerations, so absence is proof here — never apply this to a partial scan.
+ */
+function isRetiredRemoteId(
+  envelope: SyncStateEnvelopeV2,
+  remoteId: string,
+): boolean {
+  return envelope.remoteIndex.itemsById[remoteId] === undefined;
 }
 
 /**
@@ -264,6 +311,7 @@ export function acceptConfirmedDescendantFolderAnchorsV2(input: {
   );
   const additionsByRemoteId = new Map<string, RemoteFolderEntry>();
   const additionRemoteIdByPath = new Map<string, string>();
+  const supersededAnchorIds = new Set<string>();
   let evidenceFiles = 0;
 
   for (const anchor of Object.values(input.envelope.anchors.byAnchorId)
@@ -279,6 +327,7 @@ export function acceptConfirmedDescendantFolderAnchorsV2(input: {
       includeFolderPath,
       additionsByRemoteId,
       additionRemoteIdByPath,
+      supersededAnchorIds,
       evidenceFiles,
       reject,
     });
@@ -298,6 +347,11 @@ export function acceptConfirmedDescendantFolderAnchorsV2(input: {
   const nextAnchors = {
     ...input.envelope.folderAnchors.byAnchorId,
   };
+  const supersededFolderRemoteIds = [...supersededAnchorIds]
+    .map((anchorId) => nextAnchors[anchorId]?.remoteId)
+    .filter((remoteId): remoteId is string => Boolean(remoteId))
+    .sort();
+  for (const anchorId of supersededAnchorIds) delete nextAnchors[anchorId];
   for (const folder of [...additionsByRemoteId.values()].sort(
     (left, right) =>
       pathDepth(left.path) - pathDepth(right.path)
@@ -331,6 +385,9 @@ export function acceptConfirmedDescendantFolderAnchorsV2(input: {
     status: "accepted",
     accepted: additionsByRemoteId.size,
     evidenceFiles,
+    ...(supersededFolderRemoteIds.length > 0
+      ? { supersededFolderRemoteIds }
+      : {}),
     envelope,
   };
 }
@@ -355,6 +412,7 @@ function settleConfirmedDescendantFolderAnchorV2(args: {
   includeFolderPath: (path: string) => boolean;
   additionsByRemoteId: Map<string, RemoteFolderEntry>;
   additionRemoteIdByPath: Map<string, string>;
+  supersededAnchorIds: Set<string>;
   evidenceFiles: number;
   reject: (
     reason: ConfirmedDescendantFolderRejectionReasonV2,
@@ -373,6 +431,7 @@ function settleConfirmedDescendantFolderAnchorV2(args: {
     includeFolderPath,
     additionsByRemoteId,
     additionRemoteIdByPath,
+    supersededAnchorIds,
     reject,
   } = args;
   let { evidenceFiles } = args;
@@ -420,10 +479,21 @@ function settleConfirmedDescendantFolderAnchorV2(args: {
     if (!exact) {
       if (currentAnchors.some((folderAnchor) =>
         folderAnchor.remoteId === parent.id
-        || identityPath(folderAnchor.lastPath)
-          === identityPath(expectedParentPath)
       )) {
         return { terminated: reject("folder-anchor-collision") };
+      }
+      // F24 (GitHub #21): an anchor whose remote identity is provably retired
+      // (absent from the complete remote index) may be superseded at its path;
+      // the stale anchor is deleted in the same state commit. A live anchor at
+      // the path keeps the collision gate closed.
+      const samePathAnchor = currentAnchors.find((folderAnchor) =>
+        identityPath(folderAnchor.lastPath)
+          === identityPath(expectedParentPath));
+      if (samePathAnchor) {
+        if (!isRetiredRemoteId(envelope, samePathAnchor.remoteId)) {
+          return { terminated: reject("folder-anchor-collision") };
+        }
+        supersededAnchorIds.add(samePathAnchor.anchorId);
       }
       candidateChain.push({
         path: expectedParentPath,

@@ -267,6 +267,28 @@ describe("updateStatusBar item structure", () => {
     expect(el.classes.has("is-syncing")).toBe(false);
   });
 
+  it("says 同步中… for the sync holder's entry window, not the generic occupied phrase", async () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    const lock = plugin as never as {
+      acquireOpLock(operation: string): string | null;
+      releaseOpLock(): void;
+    };
+
+    // 同步入口占用（检测/准备期，执行器尚未开跑）：默认句「其他操作进行中」会被
+    // 读成"别的操作占着"，而这正是用户自己点的同步——复用现役 status.syncing
+    // （2026-10-10 拍板，零新增文案）。
+    expect(lock.acquireOpLock("sync")).toBeNull();
+    await flushStatusBarFrame();
+    expect(el.attrs["aria-label"]).toBe("同步中…");
+    expect(el.classes.has("is-syncing")).toBe(true);
+
+    lock.releaseOpLock();
+    await flushStatusBarFrame();
+    expect(el.attrs["aria-label"]).toBe("已就绪");
+    expect(el.classes.has("is-syncing")).toBe(false);
+  });
+
   it("maps attention branches (conflicts / deletes / plan review) to the attention group", async () => {
     const el = createFakeStatusBarElement();
     const plugin = makePlugin(el);
@@ -441,7 +463,10 @@ describe("the attention members the bar was missing", () => {
  * 有意例外（各有已拍板出处，不由本门覆盖）：
  *  - Ribbon 不表达离线／观察暂态轮（2026-08-29 拍板「ribbon 图标不改」，DECISIONS 在案）；
  *  - Ribbon 在初始化／会话待续时不动（2026-09-11 拍板，其点击本身是重试路径）；
- *  - 状态栏的锁占用短语是它独有的载体级补充（2026-09-20 拍板 A2），侧栏无对应档位。
+ *  - **非同步持有者**的锁占用短语（重置／同步设置／插件核对／退出登录）仍是状态栏
+ *    独有的载体级补充（2026-09-20 拍板 A2）；**同步持有者有对应档位**，由场景
+ *    「同步入口准备期（锁被握、无轮）」覆盖——该窗口实测 6.5s+，侧栏与 Ribbon
+ *    必须同落运行档（2026-10-10 拍板）。
  */
 type CarrierToken =
   | "loggedOut"
@@ -476,11 +501,14 @@ function sidebarStatusState(plugin: EasySyncPlugin): Record<string, unknown> {
     sessionPending:
       (plugin.auth as never as { isSessionPending?: boolean })?.isSessionPending ?? false,
     isRunning: plugin.syncExecutor?.isRunning ?? false,
+    syncEntryInProgress: plugin.isSyncEntryInProgress,
     lastSyncTime: state.lastSyncTime,
     pendingCount:
       state.pendingConflicts.length
       + state.pendingRemoteDeletes.length
-      + state.pendingIssues.length,
+      + state.pendingIssues.length
+      // 片④ 本机独有条目与前三类同属"需要处理"，侧栏计数包含它们。
+      + plugin.getLocalOnlyEntryCount(),
     planReviewActive: state.planReviewActive,
     autoSyncPaused: plugin.autoSyncPaused,
     mutationRecovery: plugin.getMutationRecoveryDisplayState(),
@@ -609,6 +637,16 @@ describe("three-carrier parity — the same scenario must land on the same token
       },
     },
     {
+      name: "同步入口准备期（锁被握、无轮）",
+      token: "running",
+      ribbon: true,
+      apply: (p) => {
+        // 点同步后、执行器开跑前：云端仓库检测与运行前准备（首同步实测 6.5s+）。
+        // 三个载体都必须落运行档，而不是"空闲外观＋正在运行弹窗"错位（2026-10-10 拍板）。
+        (p as never as { opLock: string | null }).opLock = "sync";
+      },
+    },
+    {
       name: "正在取消",
       token: "cancelling",
       ribbon: true,
@@ -657,6 +695,30 @@ describe("three-carrier parity — the same scenario must land on the same token
       apply: (p) => {
         setState(p, {
           pendingIssues: [{}, {}],
+          lastSyncTime: 1,
+          syncHistory: [{ status: "success" }],
+        });
+      },
+    },
+    {
+      name: "本机独有条目（单向）",
+      token: "attention",
+      ribbon: true,
+      apply: (p) => {
+        p.syncDirection = "one-way";
+        setState(p, {
+          localOnlyCopyEntries: [{
+            version: 1,
+            path: "note.md",
+            copyPath: "note（副本 2026-10-11 2345）.md",
+            kind: "edited",
+            recordedAt: 1,
+          }],
+          localOnlyCreatedEntries: [{
+            version: 1,
+            path: "new-note.md",
+            recordedAt: 1,
+          }],
           lastSyncTime: 1,
           syncHistory: [{ status: "success" }],
         });
@@ -779,5 +841,134 @@ describe("initStatusBar one-time binding", () => {
     expect(() =>
       (plugin as never as { initStatusBar: () => void }).initStatusBar.call(plugin),
     ).not.toThrow();
+  });
+});
+
+describe("one-way local-only entries in the desktop bar (片④)", () => {
+  it("lights the same attention member as the sidebar and gates on the direction", async () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    const records = {
+      localOnlyCopyEntries: [{
+        version: 1,
+        path: "note.md",
+        copyPath: "note（副本 2026-10-11 2345）.md",
+        kind: "edited",
+        recordedAt: 1,
+      }],
+      localOnlyCreatedEntries: [{ version: 1, path: "new-note.md", recordedAt: 1 }],
+      lastSyncTime: 1,
+      syncHistory: [{ status: "success" }],
+    };
+    Object.assign(plugin.state as never as Record<string, unknown>, records);
+
+    // 双向模式：这类记录不产生任何条目，也不点亮状态栏。
+    plugin.syncDirection = "two-way";
+    expect(plugin.getLocalOnlyRows()).toEqual([]);
+    expect(plugin.getLocalOnlyEntryCount()).toBe(0);
+    plugin.updateStatusBar();
+    await flushStatusBarFrame();
+    expect(el.classes.has("is-ready")).toBe(true);
+    expect(el.classes.has("is-attention")).toBe(false);
+
+    // 单向模式：条目与计数出现，状态栏与侧栏用同一句「需要处理 N」。
+    plugin.syncDirection = "one-way";
+    expect(plugin.getLocalOnlyRows()).toEqual([
+      {
+        kind: "edited",
+        path: "note.md",
+        targetPath: "note（副本 2026-10-11 2345）.md",
+      },
+      { kind: "created", path: "new-note.md", targetPath: "new-note.md" },
+    ]);
+    expect(plugin.getLocalOnlyEntryCount()).toBe(2);
+    plugin.updateStatusBar();
+    await flushStatusBarFrame();
+    expect(el.classes.has("is-attention")).toBe(true);
+    expect(el.attrs["aria-label"]).toBe(plugin.i18n.t("syncView.issues.title", {
+      count: 2,
+    }));
+  });
+});
+
+describe("local-only ignore memory in the carriers (片⑤)", () => {
+  const copyPath = "note（副本 2026-10-11 2345）.md";
+
+  function seedLocalOnly(
+    plugin: EasySyncPlugin,
+    ignoredPaths: readonly string[],
+  ): void {
+    plugin.syncDirection = "one-way";
+    Object.assign(plugin.state as never as Record<string, unknown>, {
+      localOnlyCopyEntries: [{
+        version: 1,
+        path: "note.md",
+        copyPath,
+        kind: "edited",
+        recordedAt: 1,
+      }],
+      localOnlyCreatedEntries: [
+        { version: 1, path: "new-note.md", recordedAt: 1 },
+        { version: 1, path: "other-new.md", recordedAt: 1 },
+      ],
+      localOnlyIgnoreMemory: {
+        schemaVersion: 1,
+        kind: "local-only-ignore-memory",
+        ignoredPaths: [...ignoredPaths],
+      },
+      lastSyncTime: 1,
+      syncHistory: [{ status: "success" }],
+    });
+  }
+
+  it("drops ignored entries from rows, counts and the desktop bar alike", async () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    seedLocalOnly(plugin, ["new-note.md"]);
+
+    // 单一真源：侧栏行与桌面计数都读同一份投影，忽略只滤显示。
+    expect(plugin.getLocalOnlyRows().map((row) => row.targetPath)).toEqual([
+      copyPath,
+      "other-new.md",
+    ]);
+    expect(plugin.getLocalOnlyEntryCount()).toBe(2);
+    plugin.updateStatusBar();
+    await flushStatusBarFrame();
+    expect(el.classes.has("is-attention")).toBe(true);
+    expect(el.attrs["aria-label"]).toBe(
+      plugin.i18n.t("syncView.issues.title", { count: 2 }),
+    );
+
+    // 全部忽略：条目与计数归零，状态栏回落就绪。
+    seedLocalOnly(plugin, [copyPath, "new-note.md", "other-new.md"]);
+    expect(plugin.getLocalOnlyRows()).toEqual([]);
+    expect(plugin.getLocalOnlyEntryCount()).toBe(0);
+    plugin.updateStatusBar();
+    await flushStatusBarFrame();
+    expect(el.classes.has("is-ready")).toBe(true);
+    expect(el.classes.has("is-attention")).toBe(false);
+
+    // 未忽略的条目不受影响。
+    seedLocalOnly(plugin, []);
+    expect(plugin.getLocalOnlyEntryCount()).toBe(3);
+  });
+
+  it("writes the ignore memory on the row action without any notice", async () => {
+    const el = createFakeStatusBarElement();
+    const plugin = makePlugin(el);
+    seedLocalOnly(plugin, []);
+    const ignoreLocalOnlyPath = vi.fn().mockResolvedValue(undefined);
+    Object.assign(plugin.state as never as Record<string, unknown>, {
+      ignoreLocalOnlyPath,
+    });
+    const statusBar = vi.spyOn(plugin, "updateStatusBar");
+    const noticeShow = vi.spyOn(plugin.noticeCenter, "show");
+
+    await plugin.ignoreLocalOnlyEntry(copyPath);
+
+    expect(ignoreLocalOnlyPath).toHaveBeenCalledWith(copyPath);
+    expect(statusBar).toHaveBeenCalled();
+    // 行消失即反馈：不加 Notice（文案稿没有该键）。
+    expect(noticeShow).not.toHaveBeenCalled();
   });
 });

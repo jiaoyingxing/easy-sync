@@ -50,15 +50,25 @@ export function readAutomaticHandlingPolicy(
   };
 }
 
-/** Project manual delete confirmations into executable actions for this run. */
+/**
+ * Project manual delete confirmations into executable actions for this run.
+ *
+ * `preserveDeleteConfirmation` lets a caller keep the confirmation row for
+ * specific paths even when the policy would auto-delete them: one-way mode
+ * passes its excluded-block predicate (config / plugins / own bundle) so those
+ * paths keep their two-way delete裁决 instead of being followed silently
+ * (2026-10-12 review). Two-way callers pass nothing and keep today's output.
+ */
 export function applyAutomaticHandlingPolicy(
   items: SyncPlanItem[],
   policy: Readonly<AutomaticHandlingPolicy>,
   configDir: string,
+  preserveDeleteConfirmation?: (path: string) => boolean,
 ): SyncPlanItem[] {
   if (!policy.autoDeleteLocalFiles) return items;
   return items.map((item) => item.type === SyncActionType.ConfirmLocalDelete
     && !isObsidianManagedConfigPath(item.path, configDir)
+    && !preserveDeleteConfirmation?.(item.path)
     ? { ...item, type: SyncActionType.DeleteLocal }
     : item);
 }

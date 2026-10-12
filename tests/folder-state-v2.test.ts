@@ -188,6 +188,92 @@ describe("V2 folder anchors and pure planner", () => {
     expect(report.mutations).toEqual([]);
   });
 
+  it("hands a vanished folder identity with a live same-path folder to the shared-folder review", () => {
+    // F24 / GitHub #21: the tracked cloud folder was deleted and re-created
+    // under a new id while the local folder is still in place. Mirroring the
+    // remote deletion is no longer the only reading: the same-path pair must go
+    // to the existing unanchored shared-folder chain (descendant-evidence
+    // reconstruction first, explicit confirmation as the fallback) instead of
+    // proposing to delete the local folder that is plainly still there.
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "inbox-new", name: "Inbox" }],
+        files: [{ id: "note-new", name: "note.md", parentId: "inbox-new" }],
+        folderAnchors: [folderAnchor("inbox-old", "Inbox")],
+        fileAnchors: [fileAnchor("note-new", "Inbox/note.md")],
+      }),
+      localFiles: [localFile("Inbox/note.md")],
+      localFolders: localFolders("Inbox"),
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "conflict",
+      path: "Inbox",
+      reason: "unanchored-shared-folder",
+      remoteId: "inbox-new",
+    })]);
+  });
+
+  it("keeps the ordinary remote-deletion reading when the shadowed folder carries no descendant anchors", () => {
+    // Empty tracked folder + a live same-path replacement: the existing delete
+    // row stays actionable there (an empty shell can still be confirmed) and
+    // the scope-expansion family owns that shape — do not re-route it here.
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "inbox-new", name: "Inbox" }],
+        folderAnchors: [folderAnchor("inbox-old", "Inbox")],
+      }),
+      localFiles: [],
+      localFolders: localFolders("Inbox"),
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "delete-local",
+      path: "Inbox",
+      remoteId: "inbox-old",
+    })]);
+  });
+
+  it("still mirrors a remote folder deletion when the same path stays empty", () => {
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folderAnchors: [folderAnchor("inbox-old", "Inbox")],
+      }),
+      localFiles: [],
+      localFolders: localFolders("Inbox"),
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "delete-local",
+      path: "Inbox",
+      remoteId: "inbox-old",
+    })]);
+  });
+
+  it("keeps the both-sides-gone retirement when the local folder is absent", () => {
+    // Local folder missing + a live same-path remote folder: intentionally
+    // outside this change (registered as a sibling shape for later review).
+    const report = planFolderStateV2({
+      envelope: envelope({
+        folders: [{ id: "inbox-new", name: "Inbox" }],
+        folderAnchors: [folderAnchor("inbox-old", "Inbox")],
+      }),
+      localFiles: [],
+      localFolders: [],
+      localFolderScanComplete: true,
+    });
+
+    expect(report.items).toContainEqual(expect.objectContaining({
+      type: "delete-local",
+      path: "Inbox",
+      remoteId: "inbox-old",
+    }));
+    expect(report.items.some((item) => item.type === "conflict")).toBe(false);
+  });
+
   it("plans one local move when a stable remote folder id changes path", () => {
     const report = planFolderStateV2({
       envelope: envelope({

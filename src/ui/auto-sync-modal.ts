@@ -34,7 +34,7 @@ function paintSliderFill(slider: SliderComponent, value?: number): void {
  */
 const sliderValueEls = new WeakMap<SliderComponent, HTMLElement>();
 
-function ensureSliderValueEl(slider: SliderComponent): void {
+export function ensureSliderValueEl(slider: SliderComponent): void {
   const container = slider.sliderEl.parentElement;
   if (!container || container.querySelector(":scope > .slider-value")) return;
   const valueEl = container.createSpan("slider-value");
@@ -56,7 +56,7 @@ function syncSliderValue(slider: SliderComponent, value?: number): void {
 }
 
 /** Fill + numeric readout in one call at each sync point. */
-function paintSliderDisplay(slider: SliderComponent, value?: number): void {
+export function paintSliderDisplay(slider: SliderComponent, value?: number): void {
   paintSliderFill(slider, value);
   syncSliderValue(slider, value);
 }

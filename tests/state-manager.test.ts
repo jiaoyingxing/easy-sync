@@ -1722,3 +1722,275 @@ describe("StateManager reset generation contract", () => {
     expect(state.remoteGeneration).toBe(0);
   });
 });
+
+describe("local-only copy records (仅接收片②)", () => {
+  const entry = {
+    version: 1 as const,
+    path: "note.md",
+    copyPath: "note（副本 2026-10-11 2345）.md",
+    kind: "edited" as const,
+    recordedAt: 1,
+  };
+
+  it("round-trips the new record family through plugin data", async () => {
+    const { state, plugin, saveData } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-local-only-copies": {
+        schemaVersion: 1,
+        kind: "local-only-copies",
+        entries: [entry],
+      },
+    });
+    await state.load();
+    expect(state.localOnlyCopyEntries).toEqual([entry]);
+
+    saveData.mockClear();
+    await state.upsertLocalOnlyCopies([
+      {
+        ...entry,
+        copyPath: "note（副本 2026-10-12 0830）.md",
+        recordedAt: 2,
+      },
+    ]);
+    expect(state.localOnlyCopyEntries.map((item) => item.copyPath)).toEqual([
+      "note（副本 2026-10-11 2345）.md",
+      "note（副本 2026-10-12 0830）.md",
+    ]);
+    expect(saveData).toHaveBeenCalledWith(expect.objectContaining({
+      "easy-sync-local-only-copies": {
+        schemaVersion: 1,
+        kind: "local-only-copies",
+        entries: [
+          entry,
+          {
+            ...entry,
+            copyPath: "note（副本 2026-10-12 0830）.md",
+            recordedAt: 2,
+          },
+        ],
+        // 片④ 起同一个键还承载"本机新建"类条目。
+        created: [],
+      },
+    }));
+  });
+
+  it("degrades corrupt records to an empty list instead of failing the load", async () => {
+    for (const corrupt of [
+      "nope",
+      { schemaVersion: 7, kind: "local-only-copies", entries: [entry] },
+      { schemaVersion: 1, kind: "something-else", entries: [entry] },
+      { schemaVersion: 1, kind: "local-only-copies", entries: [{ path: "x" }] },
+      { schemaVersion: 1, kind: "local-only-copies", entries: "nope" },
+      [entry],
+      null,
+    ]) {
+      const { plugin, state } = makeState();
+      vi.mocked(plugin.loadData).mockResolvedValue({
+        "easy-sync-local-only-copies": corrupt,
+      });
+      await state.load();
+      expect(state.localOnlyCopyEntries).toEqual([]);
+    }
+  });
+});
+
+describe("local-only created entries (仅接收片④)", () => {
+  const copy = {
+    version: 1 as const,
+    path: "note.md",
+    copyPath: "note（副本 2026-10-11 2345）.md",
+    kind: "edited" as const,
+    recordedAt: 1,
+  };
+
+  it("reconciles and retires the family through plugin data", async () => {
+    const { state, plugin, saveData } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-local-only-copies": {
+        schemaVersion: 1,
+        kind: "local-only-copies",
+        entries: [copy],
+        created: [{ version: 1, path: "stale.md", recordedAt: 1 }],
+      },
+    });
+    await state.load();
+    expect(state.localOnlyCopyEntries).toEqual([copy]);
+    expect(state.localOnlyCreatedEntries).toEqual([
+      { version: 1, path: "stale.md", recordedAt: 1 },
+    ]);
+
+    saveData.mockClear();
+    await state.reconcileLocalOnlyEntries(
+      new Set([copy.copyPath, "new-note.md"]),
+      42,
+    );
+    expect(state.localOnlyCopyEntries).toEqual([copy]);
+    expect(state.localOnlyCreatedEntries).toEqual([
+      { version: 1, path: "new-note.md", recordedAt: 42 },
+    ]);
+    expect(saveData).toHaveBeenCalledWith(expect.objectContaining({
+      "easy-sync-local-only-copies": {
+        schemaVersion: 1,
+        kind: "local-only-copies",
+        entries: [copy],
+        created: [{ version: 1, path: "new-note.md", recordedAt: 42 }],
+      },
+    }));
+
+    // 同一事实再核一次不重写（时间戳保留、无多余写入）。
+    saveData.mockClear();
+    await state.reconcileLocalOnlyEntries(
+      new Set([copy.copyPath, "new-note.md"]),
+      99,
+    );
+    expect(state.localOnlyCreatedEntries).toEqual([
+      { version: 1, path: "new-note.md", recordedAt: 42 },
+    ]);
+    expect(saveData).not.toHaveBeenCalled();
+
+    // 上传成功：条目与记录一起退场。
+    await state.retireLocalOnlyEntries({
+      paths: ["new-note.md"],
+      copyPaths: [copy.copyPath],
+    });
+    expect(state.localOnlyCopyEntries).toEqual([]);
+    expect(state.localOnlyCreatedEntries).toEqual([]);
+  });
+
+  it("degrades a corrupt created array instead of failing the load", async () => {
+    for (const created of [
+      "nope",
+      [{ path: "x" }],
+      [null, { version: 2, path: "x", recordedAt: 1 }],
+    ]) {
+      const { plugin, state } = makeState();
+      vi.mocked(plugin.loadData).mockResolvedValue({
+        "easy-sync-local-only-copies": {
+          schemaVersion: 1,
+          kind: "local-only-copies",
+          entries: [],
+          created,
+        },
+      });
+      await state.load();
+      expect(state.localOnlyCreatedEntries).toEqual([]);
+    }
+  });
+});
+
+describe("local-only ignore memory (仅接收片⑤)", () => {
+  const copyPath = "notes/note（副本 2026-10-11 2345）.md";
+
+  it("round-trips the ignore memory and survives a reload", async () => {
+    const { state, plugin, saveData } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue({});
+    await state.load();
+    expect(state.localOnlyIgnoreMemory).toEqual({
+      schemaVersion: 1,
+      kind: "local-only-ignore-memory",
+      ignoredPaths: [],
+    });
+
+    saveData.mockClear();
+    await state.ignoreLocalOnlyPath(copyPath);
+    expect(state.localOnlyIgnoreMemory.ignoredPaths).toEqual([copyPath]);
+    expect(saveData).toHaveBeenCalledWith(expect.objectContaining({
+      "easy-sync-local-only-ignore-memory": {
+        schemaVersion: 1,
+        kind: "local-only-ignore-memory",
+        ignoredPaths: [copyPath],
+      },
+    }));
+
+    // 跨重启：同一份 plugin data 再载入仍然忽略（持久化路径断言）。
+    const persisted = vi.mocked(saveData).mock.calls.at(-1)?.[0] as
+      Record<string, unknown>;
+    const restarted = makeState();
+    vi.mocked(restarted.plugin.loadData).mockResolvedValue(persisted);
+    await restarted.state.load();
+    expect(restarted.state.localOnlyIgnoreMemory.ignoredPaths)
+      .toEqual([copyPath]);
+
+    // 移除 API（本片不接界面）。
+    await restarted.state.clearLocalOnlyIgnorePath(copyPath);
+    expect(restarted.state.localOnlyIgnoreMemory.ignoredPaths).toEqual([]);
+  });
+
+  it("ignores a whole batch in one write, canonically (件② 批量行)", async () => {
+    const { state, plugin, saveData } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue({});
+    await state.load();
+
+    // 空清单＝零写入（不产生无变化提交）。
+    saveData.mockClear();
+    await state.ignoreLocalOnlyPaths([]);
+    expect(saveData).not.toHaveBeenCalled();
+
+    await state.ignoreLocalOnlyPaths([
+      " notes/b.md ",
+      "notes/a.md",
+      "notes/a.md",
+    ]);
+    // 一批只落一次盘；键＝行代表的上传目标路径（与逐条同一把键，规范化去重）。
+    expect(saveData).toHaveBeenCalledTimes(1);
+    expect(state.localOnlyIgnoreMemory.ignoredPaths).toEqual([
+      "notes/a.md",
+      "notes/b.md",
+    ]);
+
+    // 重复整批：没有任何新忽略项时不产生第二次写入。
+    saveData.mockClear();
+    await state.ignoreLocalOnlyPaths(["notes/a.md", "notes/b.md"]);
+    expect(saveData).not.toHaveBeenCalled();
+  });
+
+  it("clears the whole ignore memory in one write (件③ 反转入口)", async () => {
+    const { state, plugin, saveData } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue({});
+    await state.load();
+    await state.ignoreLocalOnlyPaths(["notes/a.md", "notes/b.md"]);
+    expect(state.localOnlyIgnoreMemory.ignoredPaths).toHaveLength(2);
+
+    saveData.mockClear();
+    await state.clearAllLocalOnlyIgnorePaths();
+    expect(saveData).toHaveBeenCalledTimes(1);
+    expect(state.localOnlyIgnoreMemory.ignoredPaths).toEqual([]);
+
+    // 已经空的记忆：不产生无变化写入（重复点按钮不会反复落盘）。
+    saveData.mockClear();
+    await state.clearAllLocalOnlyIgnorePaths();
+    expect(saveData).not.toHaveBeenCalled();
+  });
+
+  it("degrades a corrupt ignore memory to reminding about everything again", async () => {
+    for (const corrupt of [
+      "nope",
+      {
+        schemaVersion: 1,
+        kind: "local-only-ignore-memory",
+        ignoredPaths: ["b.md", "a.md"],
+      },
+      {
+        schemaVersion: 9,
+        kind: "local-only-ignore-memory",
+        ignoredPaths: [],
+      },
+      {
+        schemaVersion: 1,
+        kind: "local-only-ignore-memory",
+        ignoredPaths: "nope",
+      },
+    ]) {
+      const { state, plugin } = makeState();
+      vi.mocked(plugin.loadData).mockResolvedValue({
+        "easy-sync-local-only-ignore-memory": corrupt,
+      });
+      await state.load();
+      expect(state.localOnlyIgnoreMemory).toEqual({
+        schemaVersion: 1,
+        kind: "local-only-ignore-memory",
+        ignoredPaths: [],
+      });
+    }
+  });
+});

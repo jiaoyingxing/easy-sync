@@ -68,7 +68,8 @@ describe("plan confirm boundary sentence and cloud join summary", () => {
     );
     expect(zh.t("syncPlan.cloudJoinSummary")).not.toContain("同步状态");
     expect(zh.t("syncPlan.firstSyncSummary")).toBe(
-      "这是这台设备的首次同步。确认后按下方计划建立同步。",
+      // 2026-10-12 用户过目的修订（唯一改动＝"这台"→"本设备"，去掉双「这」）。
+      "这是本设备的首次同步。确认后按下方计划建立同步。",
     );
     expect(en.t("syncPlan.firstSyncSummary")).toBe(
       "This is the first sync for this device. After you confirm, EasySync will set up sync according to the plan below.",

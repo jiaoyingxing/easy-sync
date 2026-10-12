@@ -578,6 +578,7 @@ function planAnchoredFolderCandidatesV2(args: {
   } = args;
   let unresolvedLocalIdentity = false;
   let unresolvedRemoteIdentity = false;
+  const anchoredRemoteIds = new Set(anchors.map((anchor) => anchor.remoteId));
 
   for (const anchor of anchors) {
     const remoteNode = input.state.remoteNodeById.get(anchor.remoteId);
@@ -674,6 +675,22 @@ function planAnchoredFolderCandidatesV2(args: {
         ));
         continue;
       }
+      // F24 (GitHub #21): the tracked cloud folder is gone, but a *different*
+      // live folder may now sit at the same path while the local folder never
+      // moved. When that folder still carries descendant file anchors, the
+      // dead end is real (the kept members make the shell non-empty, so the
+      // existing delete row can neither be confirmed nor rejected) and the
+      // same-path pair belongs to the established unanchored shared-folder
+      // chain: descendant-evidence reconstruction first, explicit
+      // confirmation as the fallback. Without descendant anchors there is no
+      // evidence machinery to hand it to, so the ordinary remote-deletion
+      // reading (and its scope-expansion family behaviours) stays untouched.
+      // The remote index is complete here (planner-state precondition), so
+      // absence by exact id is proof of retirement; a live anchor at the path
+      // keeps this closed.
+      const shadowFolder = remoteFoldersByIdentity.get(
+        identityPath(anchor.lastPath),
+      );
       if (inferredLocalPath && nfcPath(inferredLocalPath) !== nfcPath(anchor.lastPath)) {
         unresolvedRemoteIdentity = true;
         candidates.push(conflictCandidate(
@@ -681,6 +698,24 @@ function planAnchoredFolderCandidatesV2(args: {
           "anchored-folder-missing-remote",
           anchor.remoteId,
           [{ side: "local", root: inferredLocalPath }],
+          input,
+          remotePathById,
+        ));
+      } else if (
+        inferredLocalPath
+        && shadowFolder
+        && !anchoredRemoteIds.has(shadowFolder.id)
+        && input.state.fileAnchors.some((fileAnchor) =>
+          isDescendant(fileAnchor.lastPath, anchor.lastPath))
+      ) {
+        candidates.push(conflictCandidate(
+          anchor.lastPath,
+          "unanchored-shared-folder",
+          shadowFolder.id,
+          [
+            { side: "local", root: inferredLocalPath },
+            { side: "remote", root: shadowFolder.path },
+          ],
           input,
           remotePathById,
         ));

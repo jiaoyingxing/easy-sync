@@ -42,6 +42,12 @@ describe("public 1.1.3 PluginData cutover", () => {
       "easy-sync-plan-review-scope": { accountId: "account" },
       "easy-sync-plan-review-canonical-identity-v2": { digest: "old" },
       "easy-sync-local-folder-move-hints": [{ remoteId: "folder" }],
+      // 片⑤ 忽略记忆：旧库里的这份清单随清表一起作废（全部重新提醒）。
+      "easy-sync-local-only-ignore-memory": {
+        schemaVersion: 1,
+        kind: "local-only-ignore-memory",
+        ignoredPaths: ["notes/old.md"],
+      },
       "release-1.1.3-unknown-key": { mustSurvive: true },
     };
 
@@ -73,6 +79,11 @@ describe("public 1.1.3 PluginData cutover", () => {
       "easy-sync-plan-review-scope": null,
       "easy-sync-plan-review-canonical-identity-v2": null,
       "easy-sync-local-folder-move-hints": [],
+      "easy-sync-local-only-ignore-memory": {
+        schemaVersion: 1,
+        kind: "local-only-ignore-memory",
+        ignoredPaths: [],
+      },
     }));
     expect(result.marker).toEqual({
       version: 2,

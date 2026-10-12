@@ -65,6 +65,7 @@ import {
   type MutationRecoveryDisplayState,
 } from "./mutation-recovery-presentation";
 import { resolveSyncPendingAttentionCounts } from "./sync-result-presentation";
+import type { LocalOnlyEntryRowV1 } from "../sync/local-only-copies";
 import { parseCommunityPluginBundlePath } from "../sync/community-plugin-bundle";
 import type { ManualResolutionEntryReason } from "../sync/manual-resolution-entry";
 import { resolveManualResolutionNotice } from "./manual-resolution-presentation";
@@ -79,6 +80,10 @@ interface StatusPanelState {
   isPending: boolean;
   sessionPending: boolean;
   isRunning: boolean;
+  /** 同步入口已持有共享占用（云端检测、运行前准备；执行器尚未开跑）。
+   *  与「运行中」同档呈现（同一句现役短语与同一个禁用主动作），但补充事实行
+   *  仍按真实运行事实决定——准备期还没有当前文件可显示（2026-10-10 拍板）。 */
+  syncEntryInProgress: boolean;
   canCancel: boolean;
   lastSyncTime: number;
   pendingCount: number;
@@ -111,6 +116,21 @@ export function resolveSyncViewStatusDetailMode(input: {
     return "recovery";
   }
   return "timestamp";
+}
+
+/**
+ * 片⑦ E1：静止（时间戳态）detail 槽的文本——时间戳之后拼单向模式常驻标识
+ * （已过目文案 `syncView.status.mode.oneway`）。纯文本：不新增控件、不按钮化、
+ * 不承担切换入口；无时间戳时标识单独显示；双向不加任何字。
+ */
+export function resolveSyncViewStatusDetailText(input: {
+  timestampText: string;
+  oneWay: boolean;
+  oneWayIndicator: string;
+}): string {
+  return input.oneWay
+    ? `${input.timestampText}${input.oneWayIndicator}`
+    : input.timestampText;
 }
 
 export function resolveSyncViewBodyMode(input: {
@@ -218,6 +238,9 @@ export interface SyncViewContentKeyInput {
   sessionPending?: boolean;
   isRunning: boolean;
   canCancel: boolean;
+  /** Sync entry holds the shared operation lock (detection / run preparation);
+   *  part of the run key so the panel rebuilds when the window opens or closes. */
+  syncEntryInProgress: boolean;
   bodyMode: SyncViewBodyMode;
   progress: Readonly<SyncProgressState>;
   planReviewActive: boolean;
@@ -229,7 +252,11 @@ export interface SyncViewContentKeyInput {
   conflicts: SyncPlanItem[];
   pendingDeletes: SyncPlanItem[];
   adoptionRows: CommunityPluginAdoptionRow[];
-  planReviewCounts: { uploads: number; downloads: number; folders?: number; deletes: number; conflicts: number; skipped: number } | null;
+  /** 片⑦ 修复：本机独有条目（与待处理区行同源 `plugin.getLocalOnlyRows()`）。
+   *  忽略写入与上传成功都只改这份集合——不进指纹时，重建会被跳过，行要等
+   *  下一轮同步（historyKey 变化）才消失。 */
+  localOnlyRows?: readonly LocalOnlyEntryRowV1[];
+  planReviewCounts: { uploads: number; downloads: number; folders?: number; deletes: number; conflicts: number; skipped: number; localOnlyCopies?: number } | null;
   planReviewRevision: number;
   history: SyncHistoryEntry[];
   lastSyncTime: number;
@@ -273,7 +300,15 @@ export function groupPendingIssuesForReview(
 /** One mountable row of the pending section, in display order. */
 export interface SyncPendingDisplayRow {
   key: string;
-  kind: "adoption" | "issue" | "conflict" | "pluginConflict" | "batchDelete" | "delete";
+  kind:
+    | "adoption"
+    | "issue"
+    | "conflict"
+    | "pluginConflict"
+    | "batchDelete"
+    | "delete"
+    | "batchLocalOnly"
+    | "localOnly";
   adoption?: CommunityPluginAdoptionRow;
   issue?: PendingIssue;
   nestedIssues?: PendingIssue[];
@@ -281,6 +316,10 @@ export interface SyncPendingDisplayRow {
   item?: SyncPlanItem;
   pluginConflict?: { pluginId: string; items: SyncPlanItem[] };
   deletes?: SyncPlanItem[];
+  /** 片④ 单向模式的本机独有条目（改动副本／本机新建）。 */
+  localOnly?: LocalOnlyEntryRowV1;
+  /** 成批的本机独有条目：批量行的动作作用在这整份清单上。 */
+  localOnlyBatch?: readonly LocalOnlyEntryRowV1[];
 }
 
 /**
@@ -296,6 +335,8 @@ export function buildSyncPendingDisplayRows(input: Readonly<{
   conflictEntries: readonly BundleConflictReviewEntry[];
   pendingDeletes: readonly SyncPlanItem[];
   skipped: readonly PendingIssueReviewGroup[];
+  /** 片④ 本机独有条目；排在逐条删除之后、只读跳过项之前（仍是要处理的动作）。 */
+  localOnlyRows?: readonly LocalOnlyEntryRowV1[];
 }>): SyncPendingDisplayRow[] {
   const rows: SyncPendingDisplayRow[] = [];
   const seen = new Set<string>();
@@ -344,6 +385,21 @@ export function buildSyncPendingDisplayRows(input: Readonly<{
   }
   for (const item of input.pendingDeletes) {
     push({ key: `delete:${item.path}`, kind: "delete", item });
+  }
+  const localOnlyRows = input.localOnlyRows ?? [];
+  if (isBatchedLocalOnlySet(localOnlyRows.map((entry) => `localOnly:${entry.targetPath}`))) {
+    push({
+      key: "batch-localOnly",
+      kind: "batchLocalOnly",
+      localOnlyBatch: [...localOnlyRows],
+    });
+  }
+  for (const entry of localOnlyRows) {
+    push({
+      key: `localOnly:${entry.targetPath}`,
+      kind: "localOnly",
+      localOnly: entry,
+    });
   }
   for (const { issue, nestedIssues } of input.skipped) {
     push({
@@ -755,7 +811,9 @@ export function isDecisionRowKey(key: string): boolean {
   return key.startsWith("conflict:")
     || key.startsWith("delete:")
     || key.startsWith("plugin:")
-    || key.startsWith("adoption:");
+    || key.startsWith("adoption:")
+    // 片④ 本机独有条目：唯一出口（「上传到云端」）只在展开区。
+    || key.startsWith("localOnly:");
 }
 
 /** 成批的待确认删除：同一区域会出现两条及以上逐条删除行——与界面给出批量
@@ -770,14 +828,31 @@ export function isBatchedDeleteSet(keys: readonly string[]): boolean {
   return false;
 }
 
+/** 成批的本机独有条目：与批量删除同一判据（≥2 条才给批量入口），批量入口
+ *  出现时逐条行不再默认展开——同一屏里一个出口就够了。 */
+export function isBatchedLocalOnlySet(keys: readonly string[]): boolean {
+  let count = 0;
+  for (const key of keys) {
+    if (!key.startsWith("localOnly:")) continue;
+    count += 1;
+    if (count > 1) return true;
+  }
+  return false;
+}
+
 /** 决策行的类别默认态：决策行默认展开，出口第一眼可见；成批出现的待确认
- *  删除默认收起。只读行不在此列（它们没有行身份，也不会被写成展开态）。 */
+ *  删除与成批出现的本机独有条目默认收起（这两类各有自己的批量入口）。
+ *  只读行不在此列（它们没有行身份，也不会被写成展开态）。 */
 export function resolveDecisionRowDefaultOpen(
   key: string,
-  options: { deleteRowsBatched?: boolean } = {},
+  options: {
+    deleteRowsBatched?: boolean;
+    localOnlyRowsBatched?: boolean;
+  } = {},
 ): boolean {
   if (!isDecisionRowKey(key)) return false;
   if (key.startsWith("delete:")) return options.deleteRowsBatched !== true;
+  if (key.startsWith("localOnly:")) return options.localOnlyRowsBatched !== true;
   return true;
 }
 
@@ -1018,7 +1093,7 @@ export function buildSyncViewContentKey(
   input: SyncViewContentKeyInput,
 ): string {
   const authKey = `auth:${input.isInitializing ? 1 : 0}:${input.isLoggedIn ? 1 : 0}:${input.isPending ? 1 : 0}:${input.sessionPending ? 1 : 0}`;
-  const runKey = `run:${input.isRunning ? 1 : 0}:${input.canCancel ? 1 : 0}`;
+  const runKey = `run:${input.isRunning ? 1 : 0}:${input.canCancel ? 1 : 0}:${input.syncEntryInProgress ? 1 : 0}`;
   const recovery = input.mutationRecovery;
   const recoveryKey = recovery
     ? `recovery:${recovery.kind}:${recovery.total}:${recovery.settled}:${recovery.remaining}:${recovery.retryAt ?? ""}:${recovery.blockReason ?? ""}:${recovery.blockedOperationId ?? ""}:${recovery.manualResolutionAvailable ? 1 : 0}:${recovery.firstPath ?? ""}`
@@ -1040,7 +1115,7 @@ export function buildSyncViewContentKey(
   const historyKey = historyExpanded ? `history:open:${historyIds}` : "history:closed";
   if (input.bodyMode === "plan") {
     const counts = input.planReviewCounts
-      ? `${input.planReviewCounts.uploads},${input.planReviewCounts.downloads},${input.planReviewCounts.folders ?? 0},${input.planReviewCounts.deletes},${input.planReviewCounts.conflicts},${input.planReviewCounts.skipped}`
+      ? `${input.planReviewCounts.uploads},${input.planReviewCounts.downloads},${input.planReviewCounts.folders ?? 0},${input.planReviewCounts.deletes},${input.planReviewCounts.conflicts},${input.planReviewCounts.skipped},${input.planReviewCounts.localOnlyCopies ?? 0}`
       : "";
     return `plan:${authKey}:${runKey}:${recoveryKey}:${counts}:details:${input.planReviewDetailsState}:revision:${input.planReviewRevision}:${historyKey}`;
   }
@@ -1071,7 +1146,14 @@ export function buildSyncViewContentKey(
         `${row.pluginId}:${row.displayName}:${row.desktopOnly ? 1 : 0}`
       )
       .join("|");
-    return `pending:${authKey}:${runKey}:${recoveryKey}:${issues}:${conflicts}:${deletes}:adoption:${adoption}:${historyKey}`;
+    // 本机独有条目：行事实全进指纹——显示路径（`path`）、行 key／忽略键
+    // （`targetPath`）与类别。待处理区行会再按 `isSideActionQueued` 过滤，但那份
+    // 过滤只会与 runKey（isRunning）同时变化——有排队项时
+    // `hasSideActionsInFlight` 必为真——所以未过滤集合足够。
+    const localOnly = (input.localOnlyRows ?? [])
+      .map((row) => `${row.path}:${row.targetPath}:${row.kind}`)
+      .join("|");
+    return `pending:${authKey}:${runKey}:${recoveryKey}:${issues}:${conflicts}:${deletes}:adoption:${adoption}:localOnly:${localOnly}:${historyKey}`;
   }
   if (input.bodyMode === "recovery") {
     return `recovery:${authKey}:${runKey}:${recoveryKey}:${historyKey}`;
@@ -1164,10 +1246,13 @@ export class EasySyncSyncView extends ItemView {
   private planRowHeights = new Map<string, number>();
   private planRowLayoutRevision = 0;
   private planDecisionRowsInFlight = new Set<string>();
-  // 当前正文区域是否含成批的待确认删除（决定逐条删除行的类别默认态）。
-  // 区域渲染时写下，正文整体重建后回填展开态时读回；正文没有决策行时该值
-  // 不产生作用。
-  private renderedDeleteRowsBatched = false;
+  // 当前正文区域里两类"成批"事实（决定逐条行的类别默认态）：成批的待确认删除、
+  // 成批的本机独有条目。区域渲染时写下，正文整体重建后回填展开态时读回；正文没有
+  // 对应行时该值不产生作用。
+  private renderedBatchedRows: {
+    deleteRowsBatched: boolean;
+    localOnlyRowsBatched: boolean;
+  } = { deleteRowsBatched: false, localOnlyRowsBatched: false };
   private pathLayoutObserver: ResizeObserver | null = null;
   private pathLayoutObservedWidth = -1;
   private statusLineEl: HTMLElement | null = null;
@@ -1486,13 +1571,19 @@ export class EasySyncSyncView extends ItemView {
     const container = this.contentEl;
     const progress = this.plugin.progressStore.state;
     const fullSyncRunning = this.plugin.syncExecutor?.isRunning ?? false;
-    const canCancel = fullSyncRunning;
+    // 可取消＝轮在跑，或入口只读准备期已 armed（2026-10-10 R1：那段等待此前
+    // 没有任何出口，现在复用现役「取消同步」；弹框/写事务期间不 armed）。
+    const canCancel = fullSyncRunning || this.plugin.isSyncEntryCancellable;
     const sideActionRunning = this.plugin.syncExecutor?.hasSideActionsInFlight ?? false;
     const isRunning = isAnySyncActivityRunning(
       progress,
       fullSyncRunning,
       sideActionRunning,
     );
+    // 同步入口占用（云端检测/运行前准备，执行器尚未开跑）：与运行中同档呈现，
+    // 让「点同步→运行开始」这段空窗不再读成空闲（2026-10-10 拍板；同族事实
+    // 与状态栏、Ribbon 同源）。
+    const syncEntryInProgress = this.plugin.isSyncEntryInProgress;
     const syncState = this.plugin.state;
     const isInitializing = this.plugin.auth?.isInitializing ?? false;
     const authState = this.plugin.auth?.authState;
@@ -1518,7 +1609,9 @@ export class EasySyncSyncView extends ItemView {
     const adoptionRows = this.plugin.getCommunityPluginAdoptionRows();
     const planReviewActive = syncState?.planReviewActive ?? false;
     const pendingCount = pendingIssueGroups.length + conflicts.length
-      + pendingDeletes.length + adoptionRows.length;
+      + pendingDeletes.length + adoptionRows.length
+      + this.plugin.getLocalOnlyRows().filter((entry) =>
+        !this.plugin.syncExecutor?.isSideActionQueued(entry.targetPath)).length;
     const sideActionResultsVisible = progress.activityKind === "sideAction"
       && (sideActionRunning || progress.completedFiles.length > 0);
     const mutationRecovery = this.plugin.getMutationRecoveryDisplayState();
@@ -1598,6 +1691,7 @@ export class EasySyncSyncView extends ItemView {
       isPending,
       sessionPending,
       isRunning,
+      syncEntryInProgress,
       canCancel,
       lastSyncTime: syncState?.lastSyncTime ?? 0,
       pendingCount,
@@ -1617,6 +1711,7 @@ export class EasySyncSyncView extends ItemView {
       sessionPending,
       isRunning,
       canCancel,
+      syncEntryInProgress,
       bodyMode,
       progress,
       planReviewActive,
@@ -1626,6 +1721,8 @@ export class EasySyncSyncView extends ItemView {
       conflicts,
       pendingDeletes,
       adoptionRows,
+      // 片⑦ 修复：与待处理区行同一真源（`renderPendingSection` 也读这里）。
+      localOnlyRows: this.plugin.getLocalOnlyRows(),
       planReviewCounts,
       planReviewRevision: syncState?.planReviewRevision ?? 0,
       history: syncState?.syncHistory ?? [],
@@ -2106,7 +2203,9 @@ export class EasySyncSyncView extends ItemView {
       : null;
     const action = resolveSyncViewPrimaryAction({
       isLoggedIn: state.isLoggedIn,
-      isRunning: state.isRunning,
+      // 同步入口占用同样落到运行档：canCancel 仍为假（检测/准备不可取消），
+      // 于是拿到现役的禁用「处理中…」，而不是一颗点了只弹 busy 的「立即同步」。
+      isRunning: state.isRunning || state.syncEntryInProgress,
       canCancel: state.canCancel,
       planReviewActive: state.planReviewActive,
       planReviewDetailsState: state.planReviewDetailsState,
@@ -2358,7 +2457,7 @@ export class EasySyncSyncView extends ItemView {
     const timestamp = state.autoSyncPaused && state.latestHistory
       ? state.latestHistory.endedAt
       : state.lastSyncTime;
-    const detailText = timestamp > 0
+    const timestampText = timestamp > 0
       ? new Date(timestamp).toLocaleString(undefined, {
         month: "numeric",
         day: "numeric",
@@ -2366,6 +2465,13 @@ export class EasySyncSyncView extends ItemView {
         minute: "2-digit",
       })
       : "";
+    // 片⑦ E1：常驻标识只属静止的时间戳态（current-file／recovery 两个分支已
+    // 提前返回）；纯文本，不新增槽位与控件。
+    const detailText = resolveSyncViewStatusDetailText({
+      timestampText,
+      oneWay: this.plugin.syncDirection === "one-way",
+      oneWayIndicator: t("syncView.status.mode.oneway"),
+    });
     if (this.statusDetailEl.textContent !== detailText) {
       this.statusDetailEl.setText(detailText);
     }
@@ -2393,6 +2499,7 @@ export class EasySyncSyncView extends ItemView {
     isPending: boolean;
     sessionPending: boolean;
     isRunning: boolean;
+    syncEntryInProgress: boolean;
     lastSyncTime: number;
     pendingCount: number;
     planReviewActive: boolean;
@@ -2415,7 +2522,7 @@ export class EasySyncSyncView extends ItemView {
     const status = resolveRibbonStatus({
       loggedIn: state.isLoggedIn,
       cancelling: state.progress.cancelRequested,
-      syncing: state.isRunning,
+      syncing: state.isRunning || state.syncEntryInProgress,
       needsAttention: state.pendingCount > 0
         || state.planReviewActive
         || state.autoSyncPaused
@@ -2657,6 +2764,8 @@ export class EasySyncSyncView extends ItemView {
       ),
       pendingDeletes,
       skipped,
+      localOnlyRows: this.plugin.getLocalOnlyRows().filter((entry) =>
+        !this.plugin.syncExecutor?.isSideActionQueued(entry.targetPath)),
     });
     // 窗口化挂载（2026-09-16，与计划审阅决策行同一机制）：待处理行数大时
     // 只挂载视口附近的行，滚动按窗口替换。行 key（data-easy-sync-plan-row）
@@ -2667,9 +2776,13 @@ export class EasySyncSyncView extends ItemView {
     let offsetsRevision = -1;
     let renderedKey = "";
     let renderDepth = 0;
-    // 成批的待确认删除（≥2 条，与批量删除入口同一条件）逐条默认收起。
+    // 成批的待确认删除与成批的本机独有条目（各≥2 条，与各自的批量入口同一
+    // 条件）逐条默认收起：批量入口就是这一屏的出口。
     const deleteRowsBatched = isBatchedDeleteSet(rows.map((row) => row.key));
-    this.renderedDeleteRowsBatched = deleteRowsBatched;
+    const localOnlyRowsBatched = isBatchedLocalOnlySet(
+      rows.map((row) => row.key),
+    );
+    this.renderedBatchedRows = { deleteRowsBatched, localOnlyRowsBatched };
 
     const resolveOffsets = (): number[] => {
       if (virtualOffsets && offsetsRevision === this.planRowLayoutRevision) {
@@ -2679,7 +2792,7 @@ export class EasySyncSyncView extends ItemView {
       virtualOffsets = buildSyncPlanMeasuredVirtualOffsets(
         rows.map((row) =>
           this.planRowHeights.get(row.key)
-          ?? (this.resolvePlanRowOpen(row.key, deleteRowsBatched)
+          ?? (this.resolvePlanRowOpen(row.key, this.renderedBatchedRows)
             ? probe.expandedRowHeight
             : probe.collapsedRowHeight)),
       );
@@ -2724,7 +2837,7 @@ export class EasySyncSyncView extends ItemView {
       }
       // Restore the per-row open state before measuring: a row remounted by a
       // window shift has to answer to the same rule as its first mount.
-      this.applyPlanRowExpansionIn(visible, deleteRowsBatched);
+      this.applyPlanRowExpansionIn(visible, this.renderedBatchedRows);
       if (this.rememberPlanRowHeights(visible) && renderDepth === 0) {
         renderDepth += 1;
         virtualOffsets = null;
@@ -2780,7 +2893,141 @@ export class EasySyncSyncView extends ItemView {
       case "delete":
         if (row.item) this.renderDeleteItem(container, row.item, row.key);
         return;
+      case "batchLocalOnly":
+        if (row.localOnlyBatch) {
+          this.renderBatchLocalOnlyRow(container, row.localOnlyBatch);
+        }
+        return;
+      case "localOnly":
+        if (row.localOnly) {
+          this.renderLocalOnlyItem(container, row.localOnly, row.key);
+        }
+        return;
     }
+  }
+
+  /**
+   * 片④ 单向模式的本机独有条目：行主体只承担识别与展开（不是按钮），来源
+   * chip 只做识别，唯一出口「上传到云端」在展开区。上传成功由执行器退场条目，
+   * 侧栏随之少一行。
+   */
+  private renderLocalOnlyItem(
+    container: HTMLElement,
+    entry: LocalOnlyEntryRowV1,
+    rowKey?: string,
+  ): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const details = container.createEl("details", "easy-sync-tree-item");
+    if (rowKey) details.dataset.easySyncPlanRow = rowKey;
+    const summary = details.createEl("summary", "easy-sync-tree-row");
+    this.addCollapseIcon(summary);
+    const icon = summary.createSpan("easy-sync-tree-status-icon");
+    setIcon(icon, "arrow-up");
+    const pathEl = summary.createSpan("easy-sync-tree-path");
+    // 行主体显示要操作的那份文件：改动类＝副本路径（上传目标同一路径），
+    // 新建类＝文件自身。chip／两个动作／行 key／忽略键一律不变。
+    configureFilePath(details, pathEl, entry.targetPath, true);
+    summary.createSpan("easy-sync-tree-chip").setText(
+      entry.kind === "edited"
+        ? t("syncView.localOnly.chip.edited")
+        : t("syncView.localOnly.chip.created"),
+    );
+
+    const body = details.createDiv("easy-sync-tree-item-body");
+    // 说明句只有改动类有（2026-10-12 文案定稿）：新建类的身份由 chip 承担，
+    // 处境由列表级（批量行／审阅句）说一次，行内不重复。
+    if (entry.kind === "edited") {
+      body.createDiv("easy-sync-item-reason").setText(
+        t("syncView.localOnly.reason.edited"),
+      );
+    }
+    const actions = body.createDiv("easy-sync-item-actions");
+    // 主次判据（同族先例：采纳行「下载并同步」＝accent／「跳过」＝""，删除行
+    // 「确认删除」＝warning／「拒绝」＝""）：上传是这一行的主动作，上强调色；
+    // 「留在本机，不再提醒」是次动作，保持中性。
+    this.createActionChip(
+      actions,
+      t("syncView.localOnly.upload"),
+      "accent",
+      () => {
+        void this.runItemAction(
+          actions,
+          () => this.plugin.uploadLocalOnlyEntry(entry.targetPath),
+        );
+      },
+    );
+    // 片⑤：留在本机、不再提醒。点击即写入忽略记忆并刷新（行消失即反馈，
+    // 不加 Notice）；本片不建反转界面，移除 API 留给后续拍板后的界面。
+    this.createActionChip(
+      actions,
+      t("syncView.localOnly.keep"),
+      "",
+      () => {
+        void this.runItemAction(
+          actions,
+          () => this.plugin.ignoreLocalOnlyEntry(entry.targetPath),
+        );
+      },
+    );
+
+  }
+
+  /**
+   * 批量处置行（三件优化·件②）：≥2 条本机独有条目时出现在这一族的顶部，两个
+   * 动作＝逐条行两个动作的并集（两类可用动作完全相同）：上传全部走现役上行链
+   * （确认后逐条成功不弹提示，照批量删除先例），全部留在本机＝一次写忽略记忆
+   * （零云端写入、零文件改动、不加确认，行消失即反馈）。逐条行的 chip／原因句／
+   * 动作／忽略键都不变——这一行只是同一屏多出来的出口。
+   */
+  private renderBatchLocalOnlyRow(
+    container: HTMLElement,
+    entries: readonly LocalOnlyEntryRowV1[],
+  ): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const rowEl = container.createDiv();
+    rowEl.dataset.easySyncPlanRow = "batch-localOnly";
+    rowEl.createDiv("easy-sync-item-reason").setText(
+      t("syncView.localOnly.batchNote", { count: entries.length }),
+    );
+    const actions = rowEl.createDiv(
+      "easy-sync-plan-execute easy-sync-local-only-batch-actions",
+    );
+    // 忽略键＝行代表的上传目标路径（与逐条行、side action 同一把键）。
+    const targetPaths = entries.map((entry) => entry.targetPath);
+    // 主次照逐条行：上传＝强调色，留在本机＝中性。
+    const uploadAllButton = new ButtonComponent(actions);
+    uploadAllButton
+      .setButtonText(t("syncView.localOnly.batchUploadAll"))
+      .setCta()
+      .onClick(() => {
+        void this.runItemAction(actions, async () => {
+          const confirmed = await new ConfirmModal(
+            this.plugin.app,
+            t("syncView.localOnly.batchConfirmTitle", {
+              count: targetPaths.length,
+            }),
+            t("syncView.localOnly.batchConfirmUpload"),
+            t("confirm.cancel"),
+            t,
+            {
+              message: t("syncView.localOnly.batchConfirmMessage"),
+            },
+          ).awaitConfirm();
+          if (!confirmed) return;
+          // 照批量删除：确认后立刻进官方加载态，整批执行期间保持旋转与禁用。
+          uploadAllButton.buttonEl.addClass("mod-loading");
+          uploadAllButton.setDisabled(true);
+          await this.plugin.uploadLocalOnlyEntries(targetPaths);
+        });
+      });
+    new ButtonComponent(actions)
+      .setButtonText(t("syncView.localOnly.batchKeepAll"))
+      .onClick(() => {
+        void this.runItemAction(
+          actions,
+          () => this.plugin.ignoreLocalOnlyEntries(targetPaths),
+        );
+      });
   }
 
   /** The batch delete entry: one destructive button for the whole set. */
@@ -3620,9 +3867,29 @@ export class EasySyncSyncView extends ItemView {
     if (limitHeight) this.completedFileRowsLedger = ledger;
   }
 
+  /**
+   * 件① 单向模式的审阅告知句（三种组合：只一类命中时报一类，两类都命中时报
+   * 并集句）。计数来源见 `renderPlanReviewSection` 的注释；没有本机独有内容时
+   * 返回 null（双向模式恒 null）。
+   */
+  private buildOneWayReviewNote(
+    counts: { localOnlyCopies?: number } | null,
+  ): string | null {
+    if (this.plugin.syncDirection !== "one-way") return null;
+    const copies = counts?.localOnlyCopies ?? 0;
+    const localOnly = this.plugin
+      .getLocalOnlyRows()
+      .filter((row) => row.kind === "created").length;
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    if (copies <= 0 && localOnly <= 0) return null;
+    if (copies <= 0) return t("syncPlan.oneWayNote.localOnly", { localOnly });
+    if (localOnly <= 0) return t("syncPlan.oneWayNote.copies", { copies });
+    return t("syncPlan.oneWayNote.both", { localOnly, copies });
+  }
+
   private renderPlanReviewSection(
     container: HTMLElement,
-    counts: { uploads: number; downloads: number; folders?: number; deletes: number; conflicts: number; skipped: number } | null,
+    counts: { uploads: number; downloads: number; folders?: number; deletes: number; conflicts: number; skipped: number; localOnlyCopies?: number } | null,
     items: PlanReviewItem[],
     conflicts: SyncPlanItem[],
     pendingDeletes: SyncPlanItem[],
@@ -3635,6 +3902,12 @@ export class EasySyncSyncView extends ItemView {
     const hasDecisionRows = items.some((item) =>
       item.type === SyncActionType.Conflict
       || item.type === SyncActionType.ConfirmLocalDelete);
+    // 件① 事前告知：单向模式下的本机独有内容数量。两个计数都是冻结事实——
+    // 「会另存为副本」数取自随计划封存的审阅计数（localOnlyCopies），「只在本机」
+    // 数取自面板同源的那份记录族（忽略记忆已过滤，所以报的就是接下来会列出的行
+    // 数）。两类都为 0 时不出现这句话（双向模式恒不出现）。
+    const oneWayNote = this.buildOneWayReviewNote(counts);
+    const oneWaySuffix = oneWayNote ? ` ${oneWayNote}` : "";
     const renderSummaryLine = (base: string): void => {
       // One slot, two roles: the flow line states what confirming does; the
       // decision note is appended only when the plan actually carries decision
@@ -3645,7 +3918,7 @@ export class EasySyncSyncView extends ItemView {
         ? ` ${t("syncPlan.activationDecisionSummary")}`
         : "";
       panel.createDiv("setting-item-description").setText(
-        `${base}${decisionNote}`,
+        `${base}${oneWaySuffix}${decisionNote}`,
       );
     };
 
@@ -3653,7 +3926,7 @@ export class EasySyncSyncView extends ItemView {
       // 计划在展示期间被重新生成：同一个说明槽位改说既有的「已更新」句
       // （弹框正文逐字复用，不新增文案）。与下方流程句分支互斥，仍是单块。
       panel.createDiv("setting-item-description").setText(
-        t("syncPlan.reviewUpdatedMessage"),
+        `${t("syncPlan.reviewUpdatedMessage")}${oneWaySuffix}`,
       );
     } else if (activationReviewKind === "v2-migration") {
       renderSummaryLine(t("syncPlan.migrationSummary"));
@@ -3673,8 +3946,12 @@ export class EasySyncSyncView extends ItemView {
       hasDecisionRows
     ) {
       panel.createDiv("setting-item-description").setText(
-        t("syncPlan.confirmBoundarySummary"),
+        `${t("syncPlan.confirmBoundarySummary")}${oneWaySuffix}`,
       );
+    } else if (oneWayNote) {
+      // 上面各分支都没占这个槽位（普通审阅里既没有决策行、也没有激活类流程句）：
+      // 告知句自己占它——否则这一屏对"有多少本机内容不会被上传"一个字都不说。
+      panel.createDiv("setting-item-description").setText(oneWayNote);
     }
 
     if (counts && items.length === 0) {
@@ -3686,9 +3963,14 @@ export class EasySyncSyncView extends ItemView {
         [t("syncAction.group.conflict"), counts.conflicts],
         [t("syncAction.group.skip"), counts.skipped],
       ];
-      panel.createDiv("easy-sync-plan-counts").setText(
-        rows.filter(([, count]) => count > 0).map(([label, count]) => `${label} ${count}`).join(" · "),
-      );
+      // 全 0 时不渲染（零文案、零结构变化）：单向模式下"只有本机独有内容"
+      // 会走到这里，否则会留下一个空的计数行。
+      const present = rows.filter(([, count]) => count > 0);
+      if (present.length > 0) {
+        panel.createDiv("easy-sync-plan-counts").setText(
+          present.map(([label, count]) => `${label} ${count}`).join(" · "),
+        );
+      }
     }
 
     if (items.length > 0) {
@@ -3723,14 +4005,18 @@ export class EasySyncSyncView extends ItemView {
     }
     const groups = buildSyncPlanDisplayGroups(items);
     // 成批的待确认删除按区域判定（与待处理区批量删除入口同一条件）：它们默认
-    // 收起，出口是那一组行本身或批量入口，不是每行的展开区。
+    // 收起，出口是那一组行本身或批量入口，不是每行的展开区。本机独有行不在这份
+    // 分组里（它们在待处理区），这一屏按"未成批"记账。
     const deleteRowsBatched = isBatchedDeleteSet(
       items
         .filter((item) => item.type === SyncActionType.ConfirmLocalDelete
           && deleteByPath.has(item.path))
         .map((item) => `delete:${item.path}`),
     );
-    this.renderedDeleteRowsBatched = deleteRowsBatched;
+    this.renderedBatchedRows = {
+      deleteRowsBatched,
+      localOnlyRowsBatched: false,
+    };
 
     for (const group of groups) {
       const rows = buildSyncPlanDisplayRows(
@@ -3777,7 +4063,7 @@ export class EasySyncSyncView extends ItemView {
           virtualOffsets = buildSyncPlanMeasuredVirtualOffsets(
             rows.map((row) =>
               this.planRowHeights.get(row.key)
-              ?? (this.resolvePlanRowOpen(row.key, deleteRowsBatched)
+              ?? (this.resolvePlanRowOpen(row.key, this.renderedBatchedRows)
                 ? probe.expandedRowHeight
                 : probe.collapsedRowHeight)),
           );
@@ -3846,7 +4132,7 @@ export class EasySyncSyncView extends ItemView {
         }
         // Restore the per-row open state before measuring: a row remounted by a
         // window shift has to answer to the same rule as its first mount.
-        this.applyPlanRowExpansionIn(visible, deleteRowsBatched);
+        this.applyPlanRowExpansionIn(visible, this.renderedBatchedRows);
         if (hasInlineDecisions && this.rememberPlanRowHeights(visible) && renderDepth === 0) {
           // The estimates only place the first window; as soon as the real
           // heights are known the window has to be resolved against them.
@@ -3942,18 +4228,25 @@ export class EasySyncSyncView extends ItemView {
   }
 
   /** 决策行开合的解析顺序：行级手势 > 会话级覆盖 > 类别默认。key 是行身份；
-   *  类别默认里唯一依赖区域事实的是成批的待确认删除。 */
-  private resolvePlanRowOpen(rowKey: string, deleteRowsBatched: boolean): boolean {
+   *  类别默认里依赖区域事实的两类（成批的待确认删除、成批的本机独有条目）
+   *  由 `batchedRows` 带进来。 */
+  private resolvePlanRowOpen(
+    rowKey: string,
+    batchedRows: {
+      deleteRowsBatched: boolean;
+      localOnlyRowsBatched: boolean;
+    },
+  ): boolean {
     const remembered = this.planRowExpandedState.get(rowKey);
     if (remembered !== undefined) return remembered;
     if (this.sessionOverride === "expanded") return true;
     if (this.sessionOverride === "collapsed") return false;
-    return resolveDecisionRowDefaultOpen(rowKey, { deleteRowsBatched });
+    return resolveDecisionRowDefaultOpen(rowKey, batchedRows);
   }
 
   /** Re-apply the remembered open state to every mounted decision row. */
   private applyPlanRowExpansion(): void {
-    this.applyPlanRowExpansionIn(this.contentEl, this.renderedDeleteRowsBatched);
+    this.applyPlanRowExpansionIn(this.contentEl, this.renderedBatchedRows);
   }
 
   /**
@@ -3964,13 +4257,16 @@ export class EasySyncSyncView extends ItemView {
    */
   private applyPlanRowExpansionIn(
     root: ParentNode,
-    deleteRowsBatched: boolean,
+    batchedRows: {
+      deleteRowsBatched: boolean;
+      localOnlyRowsBatched: boolean;
+    },
   ): void {
     const rows = root.querySelectorAll<HTMLElement>("[data-easy-sync-plan-row]");
     for (const row of Array.from(rows)) {
       const key = row.dataset.easySyncPlanRow;
       if (!key || !row.instanceOf(HTMLDetailsElement)) continue;
-      row.open = this.resolvePlanRowOpen(key, deleteRowsBatched);
+      row.open = this.resolvePlanRowOpen(key, batchedRows);
     }
   }
 

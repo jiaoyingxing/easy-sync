@@ -20,6 +20,7 @@ import {
   formatSyncHistoryCounts,
   isBatchedDeleteSet,
   isDecisionRowKey,
+  resolveDecisionRowDefaultOpen,
   isPlanReviewRefreshedSinceShown,
   resolveFileProgressPresentation,
   resolvePlanReviewDetailsState,
@@ -27,6 +28,7 @@ import {
   resolveSyncViewBodyMode,
   resolveSyncViewPrimaryAction,
   resolveSyncViewStatusDetailMode,
+  resolveSyncViewStatusDetailText,
   shouldExpandAllVisibleDetails,
   shouldAutoRebuildPlanReview,
   SYNC_PLAN_VIRTUAL_OVERSCAN,
@@ -214,8 +216,10 @@ describe("shared sidebar detail controls", () => {
     expect(section).toContain("buildSyncPlanVirtualWindow(");
     expect(section).toContain("planDecisionRowsInFlight.has(row.key)");
     expect(section).toContain("this.planVirtualRenderers.add(renderPendingWindow)");
-    expect(section).toContain("applyPlanRowExpansionIn(visible, deleteRowsBatched)");
+    expect(section).toContain("applyPlanRowExpansionIn(visible, this.renderedBatchedRows)");
     expect(section).toContain("isBatchedDeleteSet(rows.map((row) => row.key))");
+    // 件②：本机独有条目族走同一判据（成批时逐条行默认收起，出口是批量行）。
+    expect(section).toContain("isBatchedLocalOnlySet(");
     expect(section).not.toContain("for (const item of pendingDeletes) this.renderDeleteItem");
   });
 
@@ -292,31 +296,46 @@ describe("shared sidebar detail controls", () => {
       view as unknown as { planRowExpandedState: Map<string, boolean> }
     ).planRowExpandedState;
     const decide = (
-      view as unknown as { resolvePlanRowOpen(key: string, deleteRowsBatched: boolean): boolean }
+      view as unknown as {
+        resolvePlanRowOpen(
+          key: string,
+          batchedRows: {
+            deleteRowsBatched: boolean;
+            localOnlyRowsBatched: boolean;
+          },
+        ): boolean;
+      }
     ).resolvePlanRowOpen.bind(view);
+    const batched = (
+      deleteRowsBatched: boolean,
+      localOnlyRowsBatched = false,
+    ) => ({ deleteRowsBatched, localOnlyRowsBatched });
 
     // 类别默认：决策行展开（出口第一眼可见），只读行折叠。
-    expect(decide("conflict:a.md", false)).toBe(true);
-    expect(decide("plugin:resp", false)).toBe(true);
-    expect(decide("adoption:resp", false)).toBe(true);
-    expect(decide("issue:download:timeout:a.md", false)).toBe(false);
+    expect(decide("conflict:a.md", batched(false))).toBe(true);
+    expect(decide("plugin:resp", batched(false))).toBe(true);
+    expect(decide("adoption:resp", batched(false))).toBe(true);
+    expect(decide("issue:download:timeout:a.md", batched(false))).toBe(false);
     // 成批的待确认删除默认收起（出口是批量入口），单条时展开。
-    expect(decide("delete:a.md", false)).toBe(true);
-    expect(decide("delete:a.md", true)).toBe(false);
+    expect(decide("delete:a.md", batched(false))).toBe(true);
+    expect(decide("delete:a.md", batched(true))).toBe(false);
+    // 件② 同一规则搬到本机独有条目族：成批（≥2 条）时逐条默认收起。
+    expect(decide("localOnly:a.md", batched(false))).toBe(true);
+    expect(decide("localOnly:a.md", batched(false, true))).toBe(false);
 
     // 行级手势压过类别默认。
     state.set("conflict:a.md", false);
-    expect(decide("conflict:a.md", false)).toBe(false);
+    expect(decide("conflict:a.md", batched(false))).toBe(false);
     state.set("issue:download:timeout:a.md", true);
-    expect(decide("issue:download:timeout:a.md", false)).toBe(true);
+    expect(decide("issue:download:timeout:a.md", batched(false))).toBe(true);
 
     // 会话级覆盖压过类别默认，但压不过行级手势。
     Object.assign(view as object, { sessionOverride: "expanded" });
-    expect(decide("issue:download:timeout:b.md", false)).toBe(true);
-    expect(decide("conflict:a.md", false)).toBe(false);
+    expect(decide("issue:download:timeout:b.md", batched(false))).toBe(true);
+    expect(decide("conflict:a.md", batched(false))).toBe(false);
     Object.assign(view as object, { sessionOverride: "collapsed" });
-    expect(decide("conflict:b.md", false)).toBe(false);
-    expect(decide("delete:a.md", false)).toBe(false);
+    expect(decide("conflict:b.md", batched(false))).toBe(false);
+    expect(decide("delete:a.md", batched(false))).toBe(false);
   });
 
   it("keeps the session override and the row-class default as separate facts", () => {
@@ -343,6 +362,7 @@ describe("shared sidebar detail controls", () => {
       "renderAdoptionItem|easy-sync-tree-item": "decision",
       "renderBundleConflictItem|easy-sync-tree-item": "decision",
       "renderPendingIssue|easy-sync-tree-item": "decision",
+      "renderLocalOnlyItem|easy-sync-tree-item": "decision",
       "createTreeGroup|easy-sync-tree-item": "container",
       "renderHistorySection|easy-sync-history-run easy-sync-tree-item": "readonly",
       "renderHistoryEntryBody|easy-sync-history-skip-group easy-sync-tree-item": "readonly",
@@ -745,6 +765,7 @@ describe("buildSyncViewContentKey", () => {
     isPending: false,
     isRunning: true,
     canCancel: false,
+    syncEntryInProgress: false,
     bodyMode: "progress" as const,
     progress: {
       phase: "executing" as const,
@@ -2830,8 +2851,120 @@ describe("buildSyncViewContentKey", () => {
       "this.plugin.syncExecutor?.hasSideActionsInFlight",
     );
     expect(section).toContain("SyncActionType.ConfirmLocalDelete");
-    expect(section.match(/addClass\("mod-loading"\)/g)).toHaveLength(2);
-    expect(section.match(/setDisabled\(true\)/g)?.length).toBeGreaterThanOrEqual(2);
+    // 加载态只数批量删除自己的那一块（本机独有批量行也有加载态，同族但另一件）。
+    const batchSlice = source.slice(
+      source.indexOf("private renderBatchDeleteRow("),
+      source.indexOf("private renderUpdateAvailableItem("),
+    );
+    expect(batchSlice.match(/addClass\("mod-loading"\)/g)).toHaveLength(2);
+    expect(batchSlice.match(/setDisabled\(true\)/g)?.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("buildSyncViewContentKey · local-only rows (片⑦ 修复)", () => {
+  const pendingBase = {
+    isLoggedIn: true,
+    isInitializing: false,
+    isPending: false,
+    isRunning: false,
+    canCancel: false,
+    syncEntryInProgress: false,
+    bodyMode: "pending" as const,
+    progress: {
+      phase: "idle" as const,
+      current: 0,
+      total: 0,
+      currentFile: "",
+      completedFiles: [],
+      completedCount: 0,
+      currentItemBytes: 0,
+      currentItemTotalBytes: 0,
+      cancelRequested: false,
+    },
+    planReviewActive: false,
+    planReviewDetailsState: "ready" as const,
+    pendingIssues: [],
+    conflicts: [],
+    pendingDeletes: [],
+    planReviewCounts: null,
+    planReviewRevision: 0,
+    history: [],
+    lastSyncTime: 0,
+    mutationRecovery: null,
+  };
+
+  it("rebuilds when a local-only row is dismissed so it disappears immediately", () => {
+    const row = {
+      kind: "created" as const,
+      path: "new-note.md",
+      targetPath: "new-note.md",
+    };
+    const before = buildSyncViewContentKey(false, {
+      ...pendingBase,
+      localOnlyRows: [row],
+    });
+    // 忽略写入（「留在本机，不再提醒」）后行集合少一条，其它分量一字不变：
+    // 指纹必须变化，否则重建被跳过、行要等下一轮同步才消失（移动端实测缺陷）。
+    const after = buildSyncViewContentKey(false, {
+      ...pendingBase,
+      localOnlyRows: [],
+    });
+    expect(before).not.toBe(after);
+    expect(before).toContain("localOnly:new-note.md:new-note.md:created");
+    // 行集合不变 ⇒ 指纹不变（不为无关重渲染埋单）。
+    expect(buildSyncViewContentKey(false, {
+      ...pendingBase,
+      localOnlyRows: [row],
+    })).toBe(before);
+  });
+
+  it("rebuilds when an uploaded local-only entry retires, with the kind in the key", () => {
+    const edited = {
+      kind: "edited" as const,
+      path: "note.md",
+      targetPath: "note（副本）.md",
+    };
+    const withEntry = buildSyncViewContentKey(false, {
+      ...pendingBase,
+      localOnlyRows: [edited],
+    });
+    // 上传成功退场：条目退场 ⇒ 行集合变化 ⇒ 立即重建（不靠 side-action 进度分量）。
+    expect(withEntry).not.toBe(buildSyncViewContentKey(false, {
+      ...pendingBase,
+      localOnlyRows: [],
+    }));
+    // 类别进指纹：同一路径换类别（改动副本 ↔ 新建）同样触发重建。
+    expect(withEntry).not.toBe(buildSyncViewContentKey(false, {
+      ...pendingBase,
+      localOnlyRows: [{
+        kind: "created",
+        path: edited.targetPath,
+        targetPath: edited.targetPath,
+      }],
+    }));
+    // 无本机独有条目（双向／无记录）：带空数组与省略该字段同形，行为不变。
+    expect(buildSyncViewContentKey(false, {
+      ...pendingBase,
+      localOnlyRows: [],
+    })).toBe(buildSyncViewContentKey(false, pendingBase));
+  });
+
+  it("feeds the key and the pending section from the same single source", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const doRenderSlice = source.slice(
+      source.indexOf("const contentKey = buildSyncViewContentKey("),
+      source.indexOf("this.lastContentKey = contentKey"),
+    );
+    // 指纹与待处理区行读同一处（忽略记忆的过滤在 getLocalOnlyRows 内）。
+    expect(doRenderSlice).toContain("localOnlyRows: this.plugin.getLocalOnlyRows()");
+    expect(source).toContain("localOnlyRows: this.plugin.getLocalOnlyRows().filter(");
+    // 指纹分量＝行 key（targetPath）＋类别，与行构建同键。
+    const keyFn = source.slice(
+      source.indexOf("export function buildSyncViewContentKey("),
+      source.indexOf("if (input.bodyMode === \"recovery\")"),
+    );
+    expect(keyFn).toContain("localOnly:${localOnly}");
+    expect(keyFn).toContain("${row.path}:${row.targetPath}:${row.kind}");
   });
 });
 
@@ -2850,6 +2983,80 @@ describe("resolveSyncViewStatusDetailMode", () => {
       activityKind: "mutationRecovery",
       mutationRecoveryVisible: true,
     })).toBe("recovery");
+  });
+});
+
+describe("resolveSyncViewStatusDetailText (片⑦ E1)", () => {
+  const indicator = "（单向同步）";
+  const oneWay = true;
+  const twoWay = false;
+
+  it("appends the one-way indicator after the timestamp in the idle state", () => {
+    expect(resolveSyncViewStatusDetailText({
+      timestampText: "10月12日 03:30",
+      oneWay,
+      oneWayIndicator: indicator,
+    })).toBe("10月12日 03:30（单向同步）");
+  });
+
+  it("shows the indicator alone when there is no timestamp", () => {
+    expect(resolveSyncViewStatusDetailText({
+      timestampText: "",
+      oneWay,
+      oneWayIndicator: indicator,
+    })).toBe("（单向同步）");
+  });
+
+  it("adds nothing in two-way mode", () => {
+    expect(resolveSyncViewStatusDetailText({
+      timestampText: "10月12日 03:30",
+      oneWay: twoWay,
+      oneWayIndicator: indicator,
+    })).toBe("10月12日 03:30");
+    expect(resolveSyncViewStatusDetailText({
+      timestampText: "",
+      oneWay: twoWay,
+      oneWayIndicator: indicator,
+    })).toBe("");
+  });
+
+  it("keeps the timestamp branch plain text: no control, no tooltip, no click", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const timestampBranch = source.slice(
+      source.indexOf('if (this.statusDetailMode !== "timestamp")'),
+      source.indexOf("private updateByteProgress("),
+    );
+    expect(timestampBranch).toContain("resolveSyncViewStatusDetailText(");
+    expect(timestampBranch).toContain("this.statusDetailEl.setText(detailText)");
+    // 纯文本、非按钮、不承担切换入口：不新增控件／事件／tooltip。
+    expect(timestampBranch).not.toContain("createEl(");
+    expect(timestampBranch).not.toContain("createSpan(");
+    expect(timestampBranch).not.toContain("addEventListener");
+    expect(timestampBranch).not.toContain("setTooltip");
+    expect(timestampBranch).not.toContain("onClick");
+  });
+
+  it("leaves the three-state mechanism untouched and only wires the indicator into the idle state", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const modeStart = source.indexOf(
+      "export function resolveSyncViewStatusDetailMode(",
+    );
+    // 只取三态判定函数本体（到它自己的收尾大括号），不含随后新增的拼接函数。
+    const modeFn = source.slice(
+      modeStart,
+      source.indexOf("\n}\n", modeStart) + 2,
+    );
+    // 三态判定本体不含方向/标识事实（不得改动）。
+    expect(modeFn).toContain('return "timestamp";');
+    expect(modeFn).not.toContain("syncDirection");
+    expect(modeFn).not.toContain("oneWay");
+    expect(modeFn).not.toContain("status.mode.oneway");
+    // 拼接只有一处调用（定义 1＋调用 1），且在 current-file／recovery 两个
+    // 提前返回之后——同步中与恢复态看不到标识。
+    expect(source.split("resolveSyncViewStatusDetailText(").length - 1).toBe(2);
+    const call = source.indexOf("const detailText = resolveSyncViewStatusDetailText(");
+    expect(call).toBeGreaterThan(source.indexOf('if (detailMode === "current-file")'));
+    expect(call).toBeGreaterThan(source.indexOf('if (detailMode === "recovery")'));
   });
 });
 
@@ -3632,5 +3839,413 @@ describe("history section lazy entry bodies", () => {
     expect(body).toContain("easy-sync-history-skip-group");
     expect(body).toContain("syncView.history.noFileChanges");
     expect(body).toContain("formatSyncHistoryCounts");
+  });
+});
+
+describe("sync entry window presentation (2026-10-10 拍板)", () => {
+  const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
+  const mainSource = readFileSync("src/main.ts", "utf8");
+
+  const baseState = () => ({
+    isLoggedIn: true,
+    isInitializing: false,
+    isPending: false,
+    sessionPending: false,
+    isRunning: false,
+    syncEntryInProgress: false,
+    lastSyncTime: 0,
+    pendingCount: 0,
+    planReviewActive: false,
+    planReviewRefreshed: false,
+    autoSyncPaused: false,
+    mutationRecovery: null,
+    latestHistory: undefined,
+    progress: {
+      phase: "idle" as const,
+      current: 0,
+      total: 0,
+      currentFile: "",
+      currentItemBytes: 0,
+      currentItemTotalBytes: 0,
+      currentItemComplete: false,
+      cancelRequested: false,
+      completedFiles: [],
+      completedCount: 0,
+      startedAt: 0,
+    },
+  });
+
+  const presentationFor = (state: Record<string, unknown>) => {
+    // 与三载体一致性门同一手法：原型对象上调用真方法，只喂状态。
+    const view = Object.create(EasySyncSyncView.prototype) as never as {
+      plugin: { i18n: I18n };
+      getStatusPresentation: (s: unknown) => { status: string; label: string };
+    };
+    const i18n = new I18n("zh-cn");
+    view.plugin = { i18n };
+    return { presentation: view.getStatusPresentation(state), i18n };
+  };
+
+  it("reads 同步进行中… for the entry window instead of 尚未同步", () => {
+    // 从未同步的库在检测/准备期（点同步后、执行器开跑前）：主状态行落运行档并
+    // 复用现役 syncView.progress——这就是报障里的「尚未同步」空窗期。
+    const { presentation, i18n } = presentationFor({
+      ...baseState(),
+      syncEntryInProgress: true,
+    });
+    expect(presentation).toEqual({
+      status: "syncing",
+      label: i18n.t("syncView.progress"),
+    });
+  });
+
+  it("falls back to 尚未同步 / 已同步 once the window closes", () => {
+    const never = presentationFor(baseState());
+    expect(never.presentation).toEqual({
+      status: "ready",
+      label: never.i18n.t("syncView.never"),
+    });
+
+    const synced = presentationFor({ ...baseState(), lastSyncTime: 1 });
+    expect(synced.presentation).toEqual({
+      status: "success",
+      label: synced.i18n.t("syncView.status.synced"),
+    });
+  });
+
+  it("splits the content key so the panel rebuilds when the window opens or closes", () => {
+    const key = (syncEntryInProgress: boolean) => buildSyncViewContentKey(false, {
+      ...baseState(),
+      bodyMode: "idle",
+      pendingIssues: [],
+      conflicts: [],
+      pendingDeletes: [],
+      adoptionRows: [],
+      planReviewDetailsState: "ready",
+      planReviewCounts: null,
+      planReviewRevision: 0,
+      history: [],
+      syncEntryInProgress,
+    } as never);
+
+    expect(key(true)).toContain("run:0:0:1");
+    expect(key(false)).toContain("run:0:0:0");
+    expect(key(true)).not.toBe(key(false));
+  });
+
+  it("keeps the composing order literal (entry window is not cancellable)", () => {
+    // 入口占用并进运行档时 canCancel 仍为假 ⇒ 落现役的禁用「处理中…」，
+    // 而不是一颗点了只弹 busy 的「立即同步」。
+    expect(resolveSyncViewPrimaryAction({
+      isLoggedIn: true,
+      isRunning: true,
+      canCancel: false,
+      planReviewActive: false,
+      planReviewDetailsState: "ready",
+      reviewKind: null,
+      recoveryActionKey: null,
+      isInitializing: false,
+      isPending: false,
+      devicePending: false,
+    })).toEqual({ kind: "processing" });
+  });
+
+  it("wires the same fact into the status line, the action and the other carriers", () => {
+    // 源码守卫（按钮渲染是 DOM 重路径，正向行为由三载体一致性门覆盖）。
+    expect(viewSource).toContain("syncing: state.isRunning || state.syncEntryInProgress,");
+    expect(viewSource).toContain("isRunning: state.isRunning || state.syncEntryInProgress,");
+    // 入口只读准备期 armed 时主动作必须变可取消（R1）——落点在 canCancel 组合。
+    expect(viewSource).toContain(
+      "const canCancel = fullSyncRunning || this.plugin.isSyncEntryCancellable;",
+    );
+    expect(mainSource).toContain('case "sync": return "status.syncing";');
+    expect(mainSource).toContain("|| this.isSyncEntryInProgress,");
+
+    // 锁取得/释放时侧栏必须跟着重绘：只刷状态栏会让面板停在点同步前的样子。
+    const acquireStart = mainSource.indexOf("private acquireOpLock");
+    const releaseStart = mainSource.indexOf("\n  private releaseOpLock", acquireStart);
+    const opHolderStart = mainSource.indexOf(
+      "\n  /** Status-bar phrase for one held-lock moment",
+      releaseStart,
+    );
+    expect(acquireStart).toBeGreaterThan(-1);
+    expect(releaseStart).toBeGreaterThan(acquireStart);
+    expect(mainSource.slice(acquireStart, releaseStart)).toContain("this.syncView?.render();");
+    expect(mainSource.slice(releaseStart, opHolderStart)).toContain("this.syncView?.render();");
+  });
+});
+
+describe("one-way local-only rows (片④)", () => {
+  it("builds one actionable row per record, after deletes and before read-only skips", () => {
+    const rows = buildSyncPendingDisplayRows({
+      adoptionRows: [],
+      failures: [{
+        issue: {
+          path: "retry.md",
+          actionType: SyncActionType.RetryLater,
+          updatedAt: 1,
+        },
+        nestedIssues: [],
+      }],
+      conflictEntries: [],
+      pendingDeletes: [{ type: SyncActionType.ConfirmLocalDelete, path: "d.md" }],
+      skipped: [{
+        issue: {
+          path: "big.bin",
+          actionType: SyncActionType.SkipLargeFile,
+          updatedAt: 1,
+        },
+        nestedIssues: [],
+      }],
+      localOnlyRows: [
+        {
+          kind: "edited",
+          path: "note.md",
+          targetPath: "note（副本 2026-10-11 2345）.md",
+        },
+        { kind: "created", path: "new-note.md", targetPath: "new-note.md" },
+      ],
+    });
+    expect(rows.map((row) => row.kind)).toEqual([
+      "issue",
+      "delete",
+      // 件②：缺省 ≥2 条本机独有条目 ⇒ 这一族顶部多一条批量处置行。
+      "batchLocalOnly",
+      "localOnly",
+      "localOnly",
+      "issue",
+    ]);
+    expect(rows[3].key).toBe("localOnly:note（副本 2026-10-11 2345）.md");
+    expect(rows[3].localOnly).toEqual({
+      kind: "edited",
+      path: "note.md",
+      targetPath: "note（副本 2026-10-11 2345）.md",
+    });
+    expect(rows[4].key).toBe("localOnly:new-note.md");
+    // 「需要处理 N」是全量真值：计数来自行集，不看窗口；批量行不改逐条行数。
+    expect(rows.filter((row) => row.kind === "localOnly")).toHaveLength(2);
+    // 批量行动作作用在整份清单上（顺序＝逐条行顺序）。
+    expect(rows[2].key).toBe("batch-localOnly");
+    expect(rows[2].localOnlyBatch?.map((entry) => entry.targetPath)).toEqual([
+      "note（副本 2026-10-11 2345）.md",
+      "new-note.md",
+    ]);
+
+    // 只有一条本机独有条目时没有批量入口：单行仍默认展开、出口第一眼可见。
+    const single = buildSyncPendingDisplayRows({
+      adoptionRows: [],
+      failures: [],
+      conflictEntries: [],
+      pendingDeletes: [],
+      skipped: [],
+      localOnlyRows: [
+        { kind: "created", path: "only.md", targetPath: "only.md" },
+      ],
+    });
+    expect(single.map((row) => row.kind)).toEqual(["localOnly"]);
+    expect(resolveDecisionRowDefaultOpen("localOnly:only.md", {})).toBe(true);
+  });
+
+  it("pins the note into every review flow line and into the otherwise-empty slot (件①)", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const sectionStart = source.indexOf("private renderPlanReviewSection");
+    const section = source.slice(
+      sectionStart,
+      source.indexOf("private renderPlanGroups", sectionStart),
+    );
+    // 流程句各分支都在同一块里追加告知句（含决策行时机句的场景）。
+    expect(section).toContain("`${base}${oneWaySuffix}${decisionNote}`");
+    expect(section).toContain(
+      "`${t(\"syncPlan.confirmBoundarySummary\")}${oneWaySuffix}`",
+    );
+    expect(section).toContain(
+      "`${t(\"syncPlan.reviewUpdatedMessage\")}${oneWaySuffix}`",
+    );
+    // 没有流程句占位的普通审阅（有动作行、无决策行）也要说这句话——槽位判据
+    // 与 items 是否为空无关。
+    expect(section).toContain("} else if (oneWayNote) {");
+    expect(section).not.toContain("} else if (oneWayNote && items.length === 0) {");
+  });
+
+  it("counts the class as a decision-row family with its only exit expanded", () => {
+    expect(isDecisionRowKey("localOnly:new-note.md")).toBe(true);
+    expect(resolveDecisionRowDefaultOpen("localOnly:new-note.md", {})).toBe(true);
+    expect(isDecisionRowKey("issue:retryLater::x.md")).toBe(false);
+  });
+
+  it("builds the one-way review note from the frozen copy count and the row family (件①)", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    const note = (
+      counts: { localOnlyCopies?: number } | null,
+      options: {
+        direction?: string;
+        rows?: ReadonlyArray<{ kind: "edited" | "created" }>;
+      } = {},
+    ): string | null => {
+      Object.assign(view as object, {
+        plugin: {
+          syncDirection: options.direction ?? "one-way",
+          getLocalOnlyRows: () => options.rows ?? [],
+          i18n: new I18n("zh-cn"),
+        },
+      });
+      return (
+        view as unknown as {
+          buildOneWayReviewNote(
+            counts: { localOnlyCopies?: number } | null,
+          ): string | null;
+        }
+      ).buildOneWayReviewNote(counts);
+    };
+    const created = (): { kind: "created" } => ({ kind: "created" });
+
+    // 两类都是 0（或双向模式）时不出现这句话：老流程句不因单向改造而变长。
+    expect(note(null)).toBeNull();
+    expect(note({ localOnlyCopies: 0 })).toBeNull();
+    expect(note({ localOnlyCopies: 3 }, { direction: "two-way" })).toBeNull();
+    expect(note(null, { direction: "two-way", rows: [created()] })).toBeNull();
+
+    // 只有"尚未上传到云端"类：计数取自面板同源的行集（忽略记忆已过滤）。
+    expect(note(null, { rows: [created(), created(), created()] })).toBe(
+      "有 3 个文件尚未上传到云端。",
+    );
+    // 只有"与云端内容不同"类：计数取自随计划封存的审阅计数。
+    expect(note({ localOnlyCopies: 2 })).toBe(
+      "有 2 个文件与云端内容不同。",
+    );
+    // 两类都命中：并集句（每类各报一个数；只报数量，不复述后果）。
+    expect(note({ localOnlyCopies: 8 }, { rows: [created(), created()] })).toBe(
+      "有 2 个文件尚未上传到云端，另有 8 个文件与云端内容不同。",
+    );
+    // 改动类行（副本）不进前一个数：它们只在"与云端内容不同"那一半里报。
+    expect(note({ localOnlyCopies: 1 }, {
+      rows: [{ kind: "edited" }, created()],
+    })).toBe(
+      "有 1 个文件尚未上传到云端，另有 1 个文件与云端内容不同。",
+    );
+  });
+
+  it("dispatches the new kind and registers its fold site", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const dispatch = source.slice(
+      source.indexOf("private renderPendingRow("),
+      source.indexOf("private renderLocalOnlyItem("),
+    );
+    expect(dispatch).toContain('case "localOnly":');
+    // 件②：批量处置行是同族的新 kind，也必须显式派发。
+    expect(dispatch).toContain('case "batchLocalOnly":');
+    // switch 无 default：没有 case 的 kind 会被静默跳过，因此新 kind 必须显式派发。
+    expect(dispatch).not.toContain("default:");
+    const renderer = source.slice(
+      source.indexOf("private renderLocalOnlyItem("),
+      source.indexOf("private renderBatchLocalOnlyRow("),
+    );
+    // 行主体只承担识别与展开（不是按钮），来源 chip 只做识别（span）。
+    expect(renderer).toContain('createEl("summary", "easy-sync-tree-row")');
+    // 行主体显示要操作的那份文件：改动类＝副本路径、新建类＝文件自身
+    // （targetPath 对新建类就是 path）；与上传动作同一路径。
+    expect(renderer).toContain(
+      "configureFilePath(details, pathEl, entry.targetPath, true)",
+    );
+    expect(renderer).toContain(
+      "this.plugin.uploadLocalOnlyEntry(entry.targetPath)",
+    );
+    expect(renderer).toContain('summary.createSpan("easy-sync-tree-chip")');
+    expect(renderer).not.toContain('createEl("button"');
+    // 唯一出口在展开区：动作 chip + 现役执行反馈形状 + 上传目标是副本路径。
+    expect(renderer).toContain("this.createActionChip(");
+    expect(renderer).toContain("this.runItemAction(");
+    expect(renderer).toContain(
+      "this.plugin.uploadLocalOnlyEntry(entry.targetPath)",
+    );
+    expect(renderer).toContain('t("syncView.localOnly.upload")');
+    expect(renderer).toContain('t("syncView.localOnly.chip.edited")');
+    expect(renderer).toContain('t("syncView.localOnly.chip.created")');
+    // 说明句只有改动类有；新建类按类条件跳过（2026-10-12 文案定稿）。
+    expect(renderer).toContain('t("syncView.localOnly.reason.edited")');
+    expect(renderer).toContain('if (entry.kind === "edited") {');
+    expect(renderer).not.toContain("reason.created");
+    // 片⑤ 起第二个动作「留在本机，不再提醒」也在展开区（见下一条用例）。
+  });
+
+  it("feeds the section count and the queued-path filter from the same records", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    expect(source).toContain("localOnlyRows: this.plugin.getLocalOnlyRows()");
+    expect(source).toContain("isSideActionQueued(entry.targetPath)");
+    const countStart = source.indexOf("const pendingCount = ");
+    expect(countStart).toBeGreaterThanOrEqual(0);
+    expect(source.slice(countStart, countStart + 500))
+      .toContain("this.plugin.getLocalOnlyRows()");
+  });
+
+  it("renders the keep chip beside upload and never reads the ignore store", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const renderer = source.slice(
+      source.indexOf("private renderLocalOnlyItem("),
+      source.indexOf("private renderBatchLocalOnlyRow("),
+    );
+    // 两个动作 chip 都在展开区、都用现役动作形状与现役执行反馈。
+    expect(renderer).toContain('t("syncView.localOnly.upload")');
+    expect(renderer).toContain('t("syncView.localOnly.keep")');
+    expect(renderer).toContain(
+      "this.plugin.ignoreLocalOnlyEntry(entry.targetPath)",
+    );
+    expect(renderer.match(/this\.createActionChip\(/g) ?? []).toHaveLength(2);
+    expect(renderer.match(/this\.runItemAction\(/g) ?? []).toHaveLength(2);
+    // 忽略只走单一真源（getLocalOnlyRows）：侧栏不直接读写忽略记忆，
+    // 也不建反转界面（本片只留 store 的移除 API）。
+    expect(source).not.toContain("localOnlyIgnoreMemory");
+    expect(source).not.toContain("clearLocalOnlyIgnore");
+    expect(source).not.toContain("localOnly.unignore");
+  });
+
+  it("colors the upload chip as the primary action and keeps the keep chip neutral", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const renderer = source.slice(
+      source.indexOf("private renderLocalOnlyItem("),
+      source.indexOf("private renderBatchLocalOnlyRow("),
+    );
+    const chips = renderer.split("this.createActionChip(").slice(1);
+    expect(chips).toHaveLength(2);
+    const variantBeforeCallback = (chip: string): string | null =>
+      chip.match(/("accent"|"warning"|""),\s*\n\s*\(\) => \{/)?.[1] ?? null;
+
+    // 主次判据（与「新插件待决策」行同形）：主动作 accent、次动作中性。
+    // 顺序不变：第一个＝上传到云端（强调色），第二个＝留在本机（中性）。
+    expect(chips[0]).toContain('t("syncView.localOnly.upload")');
+    expect(chips[0]).toContain(
+      "this.plugin.uploadLocalOnlyEntry(entry.targetPath)",
+    );
+    expect(variantBeforeCallback(chips[0])).toBe('"accent"');
+    expect(chips[1]).toContain('t("syncView.localOnly.keep")');
+    expect(chips[1]).toContain(
+      "this.plugin.ignoreLocalOnlyEntry(entry.targetPath)",
+    );
+    expect(variantBeforeCallback(chips[1])).toBe('""');
+
+    // 同族先例对拍：采纳行主动作 accent／跳过中性；删除行 warning／拒绝中性。
+    const adoption = source.slice(
+      source.indexOf("private renderAdoptionItem("),
+      source.indexOf("private renderDeleteItem("),
+    );
+    expect(adoption).toContain('t("syncView.adoption.download"),\n      "accent",');
+    expect(adoption).toContain('t("syncView.adoption.skip"), "", () => {');
+    const deletion = source.slice(
+      source.indexOf("private renderDeleteItem("),
+      source.indexOf("private createSection("),
+    );
+    expect(deletion).toContain('t("syncView.delete.confirm"), "warning",');
+    expect(deletion).toContain('t("syncView.delete.reject"), "", () => {');
+  });
+
+  it("skips the plan-review count row when every count is zero", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const start = source.indexOf(
+      "const present = rows.filter(([, count]) => count > 0);",
+    );
+    expect(start).toBeGreaterThanOrEqual(0);
+    const slice = source.slice(start, start + 400);
+    expect(slice).toContain("if (present.length > 0)");
+    expect(slice).toContain("easy-sync-plan-counts");
   });
 });

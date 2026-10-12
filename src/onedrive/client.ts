@@ -490,6 +490,24 @@ export class OneDriveClient {
     }
   }
 
+  /**
+   * Ensure one vault-relative folder exists, addressed by path — the same path
+   * shape `uploadFile` uses. `createFolder` treats 409 as "already there", so
+   * this is re-entrant; a *missing parent* of this folder is a NotFound error
+   * the caller must resolve by creating shallower levels first.
+   */
+  async createFolderPath(
+    vaultName: string,
+    folderPath: string,
+  ): Promise<DriveItem | null> {
+    return this.createFolder(
+      APP_FOLDER_PATHS.filePath(
+        this.getStorageVaultName(vaultName),
+        folderPath,
+      ),
+    );
+  }
+
   /** Create one child folder under an already committed parent identity.
    *  Unlike the bootstrap path helper, a name collision remains an error so
    *  the mutation ledger can reconcile the exact outcome before retrying. */
@@ -2160,13 +2178,16 @@ export class OneDriveClient {
     };
   }
 
-  /** List cloud repositories that already carry an EasySync sync line (the
-   *  protocol control directory is present). Read-only: one listing of vaults/
-   *  plus one path probe per candidate, four probes in flight at a time. An
-   *  empty list means the cloud holds no EasySync line; a thrown error means
-   *  detection failed and must not be read as absence. Legacy percent-encoded
-   *  directory names are probed verbatim and decoded for display. */
-  async detectExistingEasySyncRepositories(): Promise<string[]> {
+  /** 加入询问用的仓库检测结果。`same-name` 来自同名快通道：命中时不再列举其余仓
+   *  ——调用方在该分支本来就不弹框、不提示（同名防打扰门），不需要数量或名单，
+   *  所以用显式形态说明「名单未列举」，而不是返回一份不完整的列表。 */
+  async detectExistingEasySyncRepositories(
+    vaultName: string,
+  ): Promise<EasySyncRepositoryDetection> {
+    // 同名快通道与列举并发发出：命中时省掉全部探测批次（慢在串行来回次数），
+    // 未命中时这次并发不增加墙钟（它的往返被列举覆盖）。任何探测失败都算未命中
+    // ——这条路径只做加速，不新增失败面（失败仍由下方现役路径如实抛出）。
+    const sameNameProbe = this.probeLiveRepositoryForVaultName(vaultName);
     const candidates: DriveItem[] = [];
     let url: string | null =
       "/me/drive/special/approot:/vaults:/children?$top=200&$select=id,name,folder";
@@ -2184,7 +2205,7 @@ export class OneDriveClient {
           && error.type === OneDriveErrorType.NotFound
         ) {
           // No vaults/ directory at all — confirmed absence, not a failure.
-          return [];
+          return { kind: "none" };
         }
         throw error;
       }
@@ -2205,6 +2226,7 @@ export class OneDriveClient {
       }
       pages++;
     }
+    if (await sameNameProbe) return { kind: "same-name" };
 
     const repositories: string[] = [];
     for (
@@ -2236,20 +2258,34 @@ export class OneDriveClient {
             }
             throw error;
           }
-          return children.some(
-            (item) =>
-              item.name === "protocol-v2.json"
-              || item.name === "protocol-v3.json",
-          )
-            ? naming.display
-            : null;
+          return hasEasySyncControlSlot(children) ? naming.display : null;
         }),
       );
       for (const name of probed) {
         if (name !== null) repositories.push(name);
       }
     }
-    return repositories;
+    if (repositories.length === 0) return { kind: "none" };
+    return { kind: "others", repositories };
+  }
+
+  /** 同名快通道探针（只读）：按本条库名做一次控制目录直探，命名约定与全量枚举
+   *  共用 `resolveVaultDirectoryNaming`。**只做加速**——任何失败（含非 404 的真实
+   *  故障）都算未命中并回落全量路径，不新增失败面；legacy 编码目录名不在快通道
+   *  覆盖内（回落全量后由现役解码逻辑识别，语义不变）。 */
+  private async probeLiveRepositoryForVaultName(vaultName: string): Promise<boolean> {
+    const naming = resolveVaultDirectoryNaming(vaultName);
+    try {
+      const response = await this.request(
+        "GET",
+        `/me/drive/special/approot:/vaults/${naming.storage}/.easy-sync:/children?$select=id,name`,
+      );
+      return hasEasySyncControlSlot(
+        (response.json as { value?: DriveItem[] }).value ?? [],
+      );
+    } catch {
+      return false;
+    }
   }
 
   /** Copy one driveItem subtree into a same-drive destination folder.
@@ -3972,6 +4008,21 @@ const REMOTELY_SAVE_MAX_ROOT_PAGES = 25;
 const EASYSYNC_VAULTS_MAX_PAGES = 5;
 /** Path probes in flight at a time during EasySync repository detection. */
 const EASYSYNC_VAULTS_PROBE_CONCURRENCY = 4;
+/** Control-directory slots that mark a live EasySync repository (协议 v2/v3 任一
+ *  存在即活仓）；全量枚举与同名快通道共用同一判据。 */
+const EASYSYNC_CONTROL_SLOT_NAMES = ["protocol-v2.json", "protocol-v3.json"] as const;
+
+function hasEasySyncControlSlot(children: readonly DriveItem[]): boolean {
+  return children.some((item) =>
+    (EASYSYNC_CONTROL_SLOT_NAMES as readonly string[]).includes(item.name));
+}
+
+/** 加入仓库检测的结果。`same-name` 由同名快通道给出（名单未列举，调用方在该
+ *  分支不弹框、不提示，不需要数量）；`others` 的名单完整，用于弹框与计数。 */
+export type EasySyncRepositoryDetection =
+  | { kind: "none" }
+  | { kind: "same-name" }
+  | { kind: "others"; repositories: string[] };
 /** Filename shapes produced by rclone-crypt-style name encryption (research
  *  doc §124): a long unrecognisable token with no extension. */
 const REMOTELY_SAVE_CIPHER_NAME_PATTERN = /^[A-Za-z0-9_-]{16,}$/;

@@ -1,7 +1,7 @@
 import {
   structuredCloneImplementation,
 } from "./structured-clone-compat";
-import { Notice, Platform, Plugin, requestUrl, setIcon, setTooltip, TFile, TFolder, WorkspaceLeaf } from "obsidian";
+import { EventRef, Notice, Platform, Plugin, requestUrl, setIcon, setTooltip, TFile, TFolder, WorkspaceLeaf } from "obsidian";
 
 import {
   fetchLatestStableVersion,
@@ -33,6 +33,7 @@ import {
   TimeoutHandle,
 } from "./obsidian-compat";
 import { OneDriveClient } from "./onedrive/client";
+import type { EasySyncRepositoryDetection } from "./onedrive/client";
 import {
   createFolderSyncScopeSnapshotV1,
   isEasySyncInternalPath,
@@ -206,6 +207,21 @@ import {
   type AutomaticHandlingPolicy,
 } from "./sync/automatic-handling-policy";
 import {
+  DEFAULT_SYNC_DIRECTION,
+  readSyncDirection,
+  type SyncDirection,
+} from "./sync/sync-direction";
+import {
+  projectLocalOnlyEntryRowsV1,
+  type LocalOnlyEntryRowV1,
+} from "./sync/local-only-copies";
+import { isLocalOnlyPathIgnored } from "./sync/local-only-ignore-memory";
+import type { LocalFileEntry } from "./sync/types";
+import {
+  countLocalOnlyEditedFacts,
+  countLocalOnlyRowFacts,
+} from "./sync/sync-mode-transition";
+import {
   clearCompletedCommunityPluginRestores,
   cloneCommunityPluginSyncPolicy,
   createEffectiveCommunityPluginSyncPolicy,
@@ -337,7 +353,12 @@ function parseRsAdoptionMarker(value: unknown): RsAdoptionMarker | null {
 }
 const KEY_LEGACY_AUTO_MERGE = "sync-auto-merge";
 const KEY_AUTOMATIC_HANDLING_POLICY = "sync-auto-conflict-policy";
+/** Committed sync direction (双向同步／单向同步). Absent means two-way. */
+const KEY_SYNC_DIRECTION = "sync-direction";
 const KEY_NOTIFICATION_POPUPS = "notification-popups";
+/** 移动端常驻状态图标开关（方案单 20261012-225046）：仅移动端生效，桌面状态栏不受影响。 */
+const KEY_MOBILE_STATUS_BAR = "mobile-status-bar";
+const KEY_ACKNOWLEDGED_RULES = "acknowledged-rules";
 const KEY_PROFILE_CACHE = "easy-sync-profile-cache";
 /** One-shot notice memory: plugin bundles whose upload the downgrade guard
  *  already told the user about. A marker is dropped once the deferral is gone
@@ -722,6 +743,13 @@ export default class EasySyncPlugin extends Plugin {
   automaticHandlingPolicy: AutomaticHandlingPolicy = {
     ...DEFAULT_AUTOMATIC_HANDLING_POLICY,
   };
+  /**
+   * Committed sync direction (双向上限的设备级二选一)：设置页「同步模式」行读写它，
+   * 计划层与执行器按它切换抑制／改写与强制跟随语义；缺省与未知值都按双向处理
+   * （`readSyncDirection`）。单向模式的入口、门槛与切换事务见
+   * `src/ui/settings-tab.ts` 与 `updateSyncDirection`。
+   */
+  syncDirection: SyncDirection = DEFAULT_SYNC_DIRECTION;
   syncEditorSettings = false;
   syncAppearance = false;
   syncThemes = false;
@@ -739,7 +767,14 @@ export default class EasySyncPlugin extends Plugin {
   lastResetFacts: DiagnosticResetFacts | null = null;
   rsAdoptionMarker: RsAdoptionMarker | null = null;
   notificationPopups: EasySyncNotificationPopupsLevel = "all";
+  /** 移动端常驻状态图标开关（仅移动端渲染与生效；桌面状态栏体系不受影响）。 */
+  mobileStatusBar = true;
+  /** 设置页「规则」行的已读记忆（本设备；清空该字段即恢复显示）。 */
+  acknowledgedRules: string[] = [];
   private opLock: string | null = null;
+  /** 入口只读准备期的取消范围（2026-10-10 R1）：非空＝armed，期间两个云端仓库
+   *  检测可被「取消同步」中止；进入弹框/写事务前清空（见 endEntryCancellation）。 */
+  private entryCancelController: AbortController | null = null;
   private vaultCloudClientNoticeShown = false;
   private deferredSettingsMutations: Array<{
     started: boolean;
@@ -771,6 +806,11 @@ export default class EasySyncPlugin extends Plugin {
   private v2StateReloadRetryTimer: TimeoutHandle | null = null;
   private statusBarEl: HTMLElement | null = null;
   private statusBarFrame: AnimationFrameHandle | null = null;
+  private mobileStatusBarObserver: MutationObserver | null = null;
+  private mobileStatusBarResizeHandler: (() => void) | null = null;
+  private mobileStatusBarRecomputeTimer: TimeoutHandle | null = null;
+  private mobileStatusBarLayoutRef: EventRef | null = null;
+  private mobileStatusBarLayoutRetryArmed = false;
   private ribbonEl: HTMLElement | null = null;
   private ribbonSuccessTimer: TimeoutHandle | null = null;
   private ribbonSuccessVisible = false;
@@ -833,12 +873,16 @@ export default class EasySyncPlugin extends Plugin {
     // rendered here — waiting for an unrelated refresh leaves the bar on its
     // pre-lock copy for the whole window (2026-09-20 回填实测).
     this.updateStatusBar();
+    // 侧栏同样从这一份事实读「同步入口占用」（检测/准备期），所以它的重绘
+    // 时机也挂在这里——只刷状态栏会让面板停在点同步前的样子（2026-10-10）。
+    this.syncView?.render();
     return null;
   }
 
   private releaseOpLock(): void {
     this.opLock = null;
     this.updateStatusBar();
+    this.syncView?.render();
     this.retryCommunityPluginLocalReconciliationIfIdle();
     this.drainDeferredSettingsMutations();
   }
@@ -849,6 +893,9 @@ export default class EasySyncPlugin extends Plugin {
    *  window looked from the outside. */
   private opHolderStatusKey(holder: string) {
     switch (holder) {
+      // 同步持有者说现役「同步中…」：默认句「其他操作进行中」会被读成"别的
+      // 操作占着"，而这正是用户自己点的同步（2026-10-10）。
+      case "sync": return "status.syncing";
       case "reset": return "status.occupiedReset";
       case "sync-path-settings": return "status.occupiedPathSettings";
       case "community-plugin-participation":
@@ -1141,6 +1188,7 @@ export default class EasySyncPlugin extends Plugin {
       },
     );
     this.syncExecutor.setAutomaticHandlingPolicy(this.automaticHandlingPolicy);
+    this.syncExecutor.setSyncDirection(this.syncDirection);
     this.syncExecutor.setCommunityPluginSyncPolicy(
       this.getEffectiveCommunityPluginSyncPolicy(),
     );
@@ -1170,6 +1218,7 @@ export default class EasySyncPlugin extends Plugin {
     this.statusBarEl = this.addStatusBarItem();
     this.initStatusBar();
     this.updateStatusBar(); // Shows "Connecting…" while auth initializes
+    this.applyMobileStatusBar();
     this.addCommand({
       id: "start-sync",
       name: this.i18n.t("command.syncNow"),
@@ -1447,6 +1496,7 @@ export default class EasySyncPlugin extends Plugin {
     this.v2StateReloadRetryTimer = null;
     this.stopAutoSync();
     this.cancelDescendantFileReconstructionContinuation();
+    this.disableMobileStatusBar();
     compatClearTimeout(this.ribbonSuccessTimer);
     compatCancelAnimationFrame(this.syncNoticeFrame);
     compatCancelAnimationFrame(this.statusBarFrame);
@@ -1722,6 +1772,73 @@ export default class EasySyncPlugin extends Plugin {
       "notice.delete.failed",
       (executor) => executor.confirmRemoteDelete(path),
     );
+  }
+
+  /** 片④ 单向模式：把一条本机独有条目上传到云端（侧栏「上传到云端」）。 */
+  uploadLocalOnlyEntry(targetPath: string): Promise<boolean> {
+    return this.runSideActionIntent(
+      targetPath,
+      "notice.delete.failed",
+      (executor) => executor.uploadLocalOnlyEntry(targetPath),
+    );
+  }
+
+  /**
+   * 件② 批量行「全部上传」：逐条走现役上行链，逐条成功提示关掉（同
+   * `confirmRemoteDeletes` 先例）。确认弹框已经在侧栏问过，这里不另弹总入队
+   * 提示——行上的加载态与逐条失败提示已经说明系统在处理。
+   */
+  uploadLocalOnlyEntries(targetPaths: readonly string[]): Promise<boolean> {
+    const requestedPaths = [...new Set(targetPaths)];
+    if (requestedPaths.length === 0) return Promise.resolve(false);
+    return this.runSideActionIntent(
+      requestedPaths[0],
+      "notice.delete.failed",
+      (executor) => executor.uploadLocalOnlyEntries(requestedPaths),
+    );
+  }
+
+  /** 件② 批量行「全部留在本机」：一次写入整批忽略记忆（只影响提醒）。 */
+  async ignoreLocalOnlyEntries(targetPaths: readonly string[]): Promise<void> {
+    const state = this.state;
+    if (!state || this.syncDirection !== "one-way") return;
+    await state.ignoreLocalOnlyPaths(targetPaths);
+    this.updateStatusBar();
+    this.syncView?.render();
+    this.settingsTab?.refreshSyncState();
+  }
+
+  /**
+   * 件③ 反转入口的两个事实：面板看不见、但仍在记录族里的被忽略条目数
+   * （记录已退场的旧忽略项不计——它们本来就不会回来）。
+   */
+  getIgnoredLocalOnlyCount(): number {
+    const state = this.state;
+    if (!state || this.syncDirection !== "one-way") return 0;
+    return countLocalOnlyRowFacts({
+      rows: projectLocalOnlyEntryRowsV1({
+        copies: state.localOnlyCopyEntries,
+        created: state.localOnlyCreatedEntries,
+      }),
+      memory: state.localOnlyIgnoreMemory,
+    }).dismissed;
+  }
+
+  /** 件③ 反转入口「放回同步面板」：清空忽略记忆，条目回到同步面板。 */
+  async clearLocalOnlyIgnores(): Promise<void> {
+    const state = this.state;
+    if (!state || this.syncDirection !== "one-way") return;
+    const returning = this.getIgnoredLocalOnlyCount();
+    if (returning === 0) return;
+    await state.clearAllLocalOnlyIgnorePaths();
+    this.noticeCenter.show({
+      key: "local-only-ignored:reminded",
+      message: this.i18n.t("notice.localOnly.reminded", { count: returning }),
+      priority: NOTICE_PRIORITY.action,
+    });
+    this.updateStatusBar();
+    this.syncView?.render();
+    this.settingsTab?.refreshSyncState();
   }
 
   confirmRemoteDeletes(paths: readonly string[]): Promise<boolean> {
@@ -2793,6 +2910,20 @@ export default class EasySyncPlugin extends Plugin {
       || baseCount > 0;
   }
 
+  /** 同步入口占用：一次同步（手动／首同步／审阅确认／自动／后台恢复）已拿到
+   *  共享操作锁，但执行器可能还没开跑——这段要先做云端仓库检测、账号核对与
+   *  运行前准备，首同步实测 6.5 秒以上。三个载体（侧栏状态行、桌面状态栏、
+   *  Ribbon）必须读同一份事实，否则这段会被呈现成空闲（2026-10-10 拍板）。 */
+  get isSyncEntryInProgress(): boolean {
+    return this.opLock === "sync";
+  }
+
+  /** 入口只读准备期是否可取消（2026-10-10 R1）：armed 期间侧栏主动作显示现役
+   *  「取消同步」；弹框询问与写事务期间为假（那时各自的出口在弹框本身）。 */
+  get isSyncEntryCancellable(): boolean {
+    return this.entryCancelController !== null;
+  }
+
   /** Verify the current account matches the vault's bound identity.
    *  First sync ever silently binds. Account mismatch → Notice + block.
    *  Returns true if sync may proceed. */
@@ -3016,14 +3147,14 @@ export default class EasySyncPlugin extends Plugin {
         || this.state.planReviewActive
       ) return;
       const vaultName = this.app.vault.getName();
-      const repositories = await this.onedrive
-        .detectExistingEasySyncRepositories();
-      if (repositories.length === 0) return;
-      if (repositories.some((name) => name === vaultName)) return;
+      const detection = await this.onedrive
+        .detectExistingEasySyncRepositories(vaultName);
+      if (detection.kind !== "others") return;
+      if (detection.repositories.some((name) => name === vaultName)) return;
       this.noticeCenter?.show({
         key: "vault-join-detect",
         message: this.i18n.t("vaultJoin.detectNotice", {
-          count: repositories.length,
+          count: detection.repositories.length,
         }),
         priority: NOTICE_PRIORITY.info,
       });
@@ -3036,6 +3167,54 @@ export default class EasySyncPlugin extends Plugin {
     }
   }
 
+  /** 首同步前两次云端询问的资格门与依赖（依赖就绪＋从未同步＋已登录＋无待审计划）：
+   *  RS 检测、加入检测与其预取共用同一份判据，避免各处复制后漂移。返回 null＝本轮
+   *  不做询问；非 null 时给出已验证非空的客户端（TS 收窄不跨方法，这里显式交接）。 */
+  private firstSyncCloudInquiryDeps(): { onedrive: OneDriveClient } | null {
+    if (!this.onedrive || !this.syncExecutor || !this.state) return null;
+    if (this.hasCompletedSyncState()) return null;
+    if (this.state.planReviewActive) return null;
+    if (this.auth?.authState.isLoggedIn !== true) return null;
+    return { onedrive: this.onedrive };
+  }
+
+  /** 加入询问检测的只读预取：与 RS 旧仓检测并发发出（两者互不依赖，各走自己的
+   *  云端路径），消费点仍是 `maybeOfferExistingVaultJoin`——同一个 catch、同一姿态。
+   *  资格门在这里多判一次只影响「是否预取」，不会改变行为（未预取时消费者自己发起）。
+   *  放弃消费（迁移/中止）时不留未处理拒绝。 */
+  private prefetchVaultJoinDetection():
+    Promise<EasySyncRepositoryDetection> | null {
+    const deps = this.firstSyncCloudInquiryDeps();
+    if (!deps) return null;
+    if (this.rsAdoptionMarker) return null;
+    const detection = deps.onedrive.detectExistingEasySyncRepositories(
+      this.app.vault.getName(),
+    );
+    detection.catch(() => {});
+    return detection;
+  }
+
+  /** 入口只读准备期的取消范围（2026-10-10 R1）：armed 期间两个云端仓库检测可被
+   *  「取消同步」中止；弹框询问、搬迁写事务与轮内取消各归各自现役负责点。 */
+  private beginEntryCancellation(): AbortController {
+    const controller = new AbortController();
+    this.entryCancelController = controller;
+    this.onedrive?.setAbortSignal(controller.signal);
+    this.updateStatusBar();
+    this.syncView?.render();
+    return controller;
+  }
+
+  private endEntryCancellation(): void {
+    if (this.entryCancelController === null) return;
+    this.entryCancelController = null;
+    // 轮内取消由 executor 每轮自持一份信号；这里必须清空，避免留下一枚已中止的
+    // 信号让后续所有云端请求立刻失败。
+    this.onedrive?.setAbortSignal(null);
+    this.updateStatusBar();
+    this.syncView?.render();
+  }
+
   /** Remotely Save adoption decision point (carrier plan §11.3). Runs at
    *  first-sync triggers when this vault has never synced and a foreign
    *  repository pairs by exact vault name. Returns how the caller proceeds:
@@ -3045,29 +3224,44 @@ export default class EasySyncPlugin extends Plugin {
   private async maybeRunRsMigrationOffer(): Promise<
     "migrated" | "fresh" | "abort"
   > {
-    if (!this.onedrive || !this.syncExecutor || !this.state) return "fresh";
     if (this.rsAdoptionMarker) return "migrated";
-    if (
-      this.hasCompletedSyncState()
-      || this.state.planReviewActive
-      || !this.auth?.authState.isLoggedIn
-    ) return "fresh";
+    const deps = this.firstSyncCloudInquiryDeps();
+    if (!deps) return "fresh";
     const vaultName = this.app.vault.getName();
     let detected: Awaited<
       ReturnType<OneDriveClient["detectRemotelySaveRepository"]>
     >;
     try {
-      detected = await this.onedrive.detectRemotelySaveRepository(vaultName);
+      detected = await deps.onedrive.detectRemotelySaveRepository(vaultName);
     } catch (error) {
+      // 入口取消是用户自己按的，不是检测失败：不出失败提示，只留诊断。
+      if (this.entryCancelController?.signal.aborted) {
+        this.diag.log(
+          "state",
+          "Remotely Save detection aborted by the sync-entry cancel",
+          { mutations: 0 },
+        );
+        return "abort";
+      }
       // A detection error is not an absence: keep the choice alive instead
-      // of silently closing the adoption window.
+      // of silently closing the adoption window. 静默中止曾让用户只看到面板
+      // 闪一下又回原样（2026-10-10 R2）：补一条告知，行为语义不变。
       this.diag.warn(
         "state",
         "Remotely Save detection failed; first sync deferred",
         error instanceof Error ? error.message : String(error),
       );
+      this.noticeCenter?.show({
+        key: "rs-migration-detect-failed",
+        message: this.i18n.t("rsMigration.detectFailedNotice"),
+        priority: NOTICE_PRIORITY.attention,
+        durationMs: 8_000,
+      });
       return "abort";
     }
+    // 只读检测段到此结束：后面的弹框与搬迁写事务一律不可取消（写一半停下比
+    // 等一会更危险，2026-10-10 R1 边界）。
+    this.endEntryCancellation();
     if (!detected) return "fresh";
 
     const offer = await new RsMigrationOfferModal(this.app, {
@@ -3089,9 +3283,9 @@ export default class EasySyncPlugin extends Plugin {
     // Adoption confirmed: create the App Folder layout first (files/ is the
     // move destination), then run the transaction.
     try {
-      const scope = await this.onedrive.initVaultScope(vaultName);
+      const scope = await deps.onedrive.initVaultScope(vaultName);
       const outcome = await runRsMigrationTransaction({
-        onedrive: this.onedrive,
+        onedrive: deps.onedrive,
         vaultName,
         filesRootId: scope.filesRootId,
       });
@@ -3148,19 +3342,30 @@ export default class EasySyncPlugin extends Plugin {
    *  (pre-loaded from the same scan); closing the list returns to the offer.
    *  Detection is a gain, not a safety gate: failures log and fall through to
    *  the plain first sync. "abort" ends this round with the choice preserved
-   *  (the next first-sync trigger re-detects, no extra state involved). */
-  private async maybeOfferExistingVaultJoin(): Promise<"continue" | "abort"> {
-    if (!this.onedrive || !this.syncExecutor || !this.state) return "continue";
-    if (
-      this.hasCompletedSyncState()
-      || this.state.planReviewActive
-      || !this.auth?.authState.isLoggedIn
-    ) return "continue";
+   *  (the next first-sync trigger re-detects, no extra state involved).
+   *  `prefetched` lets the first-sync entry run this read-only scan in parallel
+   *  with the Remotely Save detection（2026-10-10 R4：两段串行等待实测合计约
+   *  10 秒，并发后取两者最大值）。 */
+  private async maybeOfferExistingVaultJoin(
+    prefetched?: Promise<EasySyncRepositoryDetection> | null,
+  ): Promise<"continue" | "abort"> {
+    const deps = this.firstSyncCloudInquiryDeps();
+    if (!deps) return "continue";
     const vaultName = this.app.vault.getName();
-    let repositories: string[];
+    let detection: EasySyncRepositoryDetection;
     try {
-      repositories = await this.onedrive.detectExistingEasySyncRepositories();
+      detection = await (prefetched
+        ?? deps.onedrive.detectExistingEasySyncRepositories(vaultName));
     } catch (error) {
+      if (this.entryCancelController?.signal.aborted) {
+        // 入口取消：中止是自己发起的，别按检测失败归因（本轮由调用方收尾）。
+        this.diag.log(
+          "state",
+          "EasySync repository detection aborted by the sync-entry cancel",
+          { mutations: 0 },
+        );
+        return "continue";
+      }
       this.diag.warn(
         "state",
         "EasySync repository detection failed; the plain first sync proceeds",
@@ -3168,7 +3373,8 @@ export default class EasySyncPlugin extends Plugin {
       );
       return "continue";
     }
-    if (repositories.length === 0) return "continue";
+    if (detection.kind !== "others") return "continue";
+    const repositories = detection.repositories;
     if (repositories.some((name) => name === vaultName)) return "continue";
     this.diag.log(
       "state",
@@ -3224,13 +3430,26 @@ export default class EasySyncPlugin extends Plugin {
       this.syncView?.render();
       return;
     }
-    const rsMigration = await this.maybeRunRsMigrationOffer();
-    if (rsMigration === "abort") return;
-    if (rsMigration !== "migrated") {
-      const vaultJoin = await this.maybeOfferExistingVaultJoin();
-      if (vaultJoin === "abort") return;
-    }
+    // 面板先开：用户点完同步马上能在侧栏看到「同步进行中…」，而不是等云端
+    // 仓库检测（实测 6.5 秒以上）跑完才把面板弹出来（2026-10-10 拍板）。
     await this.activateSyncView();
+    // 只读准备期＝可取消窗口（2026-10-10 R1）：两个云端仓库检测并发（R4），
+    // 期间侧栏主动作显示现役「取消同步」；进入弹框/写事务前由各自负责点收回。
+    const entryCancel = this.beginEntryCancellation();
+    let rsMigration: "migrated" | "fresh" | "abort" = "fresh";
+    try {
+      const joinDetection = this.prefetchVaultJoinDetection();
+      rsMigration = await this.maybeRunRsMigrationOffer();
+      if (rsMigration === "abort") return;
+      if (rsMigration !== "migrated") {
+        const vaultJoin = await this.maybeOfferExistingVaultJoin(joinDetection);
+        if (vaultJoin === "abort") return;
+      }
+      // 取消落在最后一段（检测已结束、还没派发）：本轮作废，不进入同步。
+      if (entryCancel.signal.aborted) return;
+    } finally {
+      this.endEntryCancellation();
+    }
     await this.dispatchSyncRun({
       mode: "first",
       options: {
@@ -3697,6 +3916,25 @@ export default class EasySyncPlugin extends Plugin {
 
   async cancelSync(): Promise<void> {
     this.cancelDescendantFileReconstructionContinuation();
+    const entryCancel = this.entryCancelController;
+    if (entryCancel) {
+      // 入口只读准备期（2026-10-10 R1）：中止两个云端仓库检测，本轮直接作废
+      // ——等价于用户在询问弹框里按 ✕，复用现役取消回执句。写事务不在此列
+      // （arm 在进入弹框/事务前已收回）。
+      this.diag.log(
+        "execute",
+        "sync entry cancelled during repository preparation",
+        { mutations: 0 },
+      );
+      entryCancel.abort();
+      this.noticeCenter?.show({
+        key: "sync-entry-cancelled",
+        message: this.i18n.t("notice.sync.cancelled"),
+        priority: NOTICE_PRIORITY.attention,
+        durationMs: 6_000,
+      });
+      return;
+    }
     if (!this.syncExecutor?.isRunning) return;
     this.progressStore.requestCancel();
     this.scheduleSyncNoticeUpdate();
@@ -3868,6 +4106,9 @@ export default class EasySyncPlugin extends Plugin {
         ...(preResetReportFile !== undefined ? { preResetReportFile } : {}),
         pluginVersion: this.manifest.version,
       };
+      // 规则行的「已读」记忆随重置一并清空（2026-10-12 用户裁决）：重置是用户的
+      // 大扫除出口，设置页的规则随之重新显示——不再单设恢复入口、零新增文案。
+      this.acknowledgedRules = [];
       try {
         await this.saveSyncSettings();
         await this.scanner?.clearScanCache();
@@ -5739,11 +5980,21 @@ export default class EasySyncPlugin extends Plugin {
         // A first sync triggered automatically still deserves the adoption
         // decision (plan §1): the modal shows while the app is foregrounded,
         // which is the only state in which timers run.
-        const rsMigration = await this.maybeRunRsMigrationOffer();
-        if (rsMigration === "abort") return true;
-        if (rsMigration !== "migrated") {
-          const vaultJoin = await this.maybeOfferExistingVaultJoin();
-          if (vaultJoin === "abort") return true;
+        // 与手动首同步同一套只读准备期（R4 并发 + R1 可取消）：自动触发同样让
+        // 用户可以从侧栏取消这段等待。
+        const entryCancel = this.beginEntryCancellation();
+        let rsMigration: "migrated" | "fresh" | "abort" = "fresh";
+        try {
+          const joinDetection = this.prefetchVaultJoinDetection();
+          rsMigration = await this.maybeRunRsMigrationOffer();
+          if (rsMigration === "abort") return true;
+          if (rsMigration !== "migrated") {
+            const vaultJoin = await this.maybeOfferExistingVaultJoin(joinDetection);
+            if (vaultJoin === "abort") return true;
+          }
+          if (entryCancel.signal.aborted) return true;
+        } finally {
+          this.endEntryCancellation();
         }
         this.diag.log("execute", `auto sync started — trigger=${trigger}`);
         dispatched = true;
@@ -5923,6 +6174,24 @@ export default class EasySyncPlugin extends Plugin {
     this.settingsTab?.refreshSyncState();
   }
 
+  /** 设置页「规则」行是否已被「我知道了」收起（本设备记忆；重置同步状态会一并清空）。 */
+  isSettingRuleAcknowledged(ruleId: string): boolean {
+    return this.acknowledgedRules.includes(ruleId);
+  }
+
+  /** 收起一条「规则」行：先改内存再落盘，失败回滚（调用方补提示）。 */
+  async acknowledgeSettingRule(ruleId: string): Promise<void> {
+    if (this.acknowledgedRules.includes(ruleId)) return;
+    const previous = this.acknowledgedRules;
+    this.acknowledgedRules = [...previous, ruleId];
+    try {
+      await this.saveSyncSettings();
+    } catch (error) {
+      this.acknowledgedRules = previous;
+      throw error;
+    }
+  }
+
   /** The outer auto-sync master switch: on while either automatic channel
    *  (scheduled or change-triggered) is enabled. */
   isAutoSyncMasterEnabled(): boolean {
@@ -6023,6 +6292,13 @@ export default class EasySyncPlugin extends Plugin {
       this.notificationPopups = normalizeNotificationPopupsLevel(
         data[KEY_NOTIFICATION_POPUPS],
       );
+      if (typeof data[KEY_MOBILE_STATUS_BAR] === "boolean") {
+        this.mobileStatusBar = data[KEY_MOBILE_STATUS_BAR];
+      }
+      if (Array.isArray(data[KEY_ACKNOWLEDGED_RULES])) {
+        this.acknowledgedRules = data[KEY_ACKNOWLEDGED_RULES]
+          .filter((ruleId): ruleId is string => typeof ruleId === "string");
+      }
       if (typeof data[KEY_SYNC_PLUGIN_FILES] === "boolean") this.syncPluginFiles = data[KEY_SYNC_PLUGIN_FILES];
       if (typeof data[KEY_DIAG_LOG] === "boolean") this.diagLogEnabled = data[KEY_DIAG_LOG];
       if (typeof data[KEY_SYNC_EDITOR] === "boolean") this.syncEditorSettings = data[KEY_SYNC_EDITOR];
@@ -6078,6 +6354,7 @@ export default class EasySyncPlugin extends Plugin {
         data[KEY_AUTOMATIC_HANDLING_POLICY],
         data[KEY_LEGACY_AUTO_MERGE],
       );
+      this.syncDirection = readSyncDirection(data[KEY_SYNC_DIRECTION]);
     }
     this.applySyncPathSettings();
     this.applyMaxFileSize();
@@ -6194,7 +6471,10 @@ export default class EasySyncPlugin extends Plugin {
       data[KEY_AUTO_SYNC_PAUSED] = this.autoSyncPaused;
       data[KEY_MAX_FILE_SIZE_MB] = this.syncMaxFileSizeMb;
       data[KEY_AUTOMATIC_HANDLING_POLICY] = { ...this.automaticHandlingPolicy };
+      data[KEY_SYNC_DIRECTION] = this.syncDirection;
       data[KEY_NOTIFICATION_POPUPS] = this.notificationPopups;
+      data[KEY_MOBILE_STATUS_BAR] = this.mobileStatusBar;
+      data[KEY_ACKNOWLEDGED_RULES] = this.acknowledgedRules;
       data[KEY_LAST_RESET_FACTS] = this.lastResetFacts;
     });
   }
@@ -8837,6 +9117,226 @@ export default class EasySyncPlugin extends Plugin {
     return fileName;
   }
 
+  /**
+   * 片④ 单向模式的本机独有条目（侧栏「需要处理」区）。侧栏与桌面状态栏都读
+   * 这一份记录族（单一真源）；双向模式不出现这类条目。
+   */
+  getLocalOnlyRows(): LocalOnlyEntryRowV1[] {
+    if (this.syncDirection !== "one-way") return [];
+    const state = this.state;
+    if (!state) return [];
+    const memory = state.localOnlyIgnoreMemory;
+    return projectLocalOnlyEntryRowsV1({
+      copies: state.localOnlyCopyEntries,
+      created: state.localOnlyCreatedEntries,
+    }).filter((entry) => !isLocalOnlyPathIgnored(memory, entry.targetPath));
+  }
+
+  /**
+   * 片⑤「留在本机，不再提醒」：记住这一条、刷新侧栏（行消失即反馈，不加
+   * Notice——文案稿没有该键）。忽略只影响提醒：文件仍在原处、不会被自动上传，
+   * 片② 记录也照常维护。
+   */
+  async ignoreLocalOnlyEntry(targetPath: string): Promise<void> {
+    const state = this.state;
+    if (!state || this.syncDirection !== "one-way") return;
+    await state.ignoreLocalOnlyPath(targetPath);
+    this.updateStatusBar();
+    this.syncView?.render();
+    this.settingsTab?.refreshSyncState();
+  }
+
+  /** 片④ 单向模式的本机独有条目数（桌面状态栏「需要注意」与侧栏同源）。 */
+  getLocalOnlyEntryCount(): number {
+    return this.getLocalOnlyRows().length;
+  }
+
+  /**
+   * 片⑥ 开启门槛的两个数量。取一份本机扫描事实（只读、无网络）数"改过、
+   * 还没上传"的文件——它们会在切换后一次性变成副本；待确认的云端删除数
+   * 直接来自状态。扫描失败按 0 呈现，不阻断门槛（用户仍可切换）。
+   */
+  async getSyncModeGateCounts(): Promise<{
+    edited: number;
+    blockedDeletes: number;
+  }> {
+    const state = this.state;
+    const scanner = this.scanner;
+    if (!state || !scanner) return { edited: 0, blockedDeletes: 0 };
+    let localEntries: readonly LocalFileEntry[] = [];
+    try {
+      const scan = await scanner.scanAll();
+      localEntries = scan.entries;
+    } catch (error) {
+      this.diag.warn(
+        "state",
+        "sync-mode gate count fell back to zero: local scan failed",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    return {
+      edited: countLocalOnlyEditedFacts({
+        localEntries,
+        baseEntries: state.baseSnapshot,
+        remoteEntries: state.remoteSnapshot,
+        configDir: getConfigDir(this.app.vault),
+      }),
+      blockedDeletes: state.pendingRemoteDeletes.length,
+    };
+  }
+
+  /** 片⑥ 关闭告知的两个数量（本机独有条目总数／其中被"不再提醒"的）。 */
+  getSyncModeDisableCounts(): { pendingUploads: number; dismissed: number } {
+    const state = this.state;
+    if (!state) return { pendingUploads: 0, dismissed: 0 };
+    const facts = countLocalOnlyRowFacts({
+      rows: projectLocalOnlyEntryRowsV1({
+        copies: state.localOnlyCopyEntries,
+        created: state.localOnlyCreatedEntries,
+      }),
+      memory: state.localOnlyIgnoreMemory,
+    });
+    return { pendingUploads: facts.total, dismissed: facts.dismissed };
+  }
+
+  /**
+   * 片⑥ 模式切换（一次可恢复的设置事务）。
+   *
+   * 前置门＝现役 `isSyncPathBusy()`（`opLock !== null || executor.hasActivityInFlight`，
+   * 后者＝`running || hasSideActionsInFlight`）——它覆盖"同步进行中""side action
+   * 在途"与"其它操作占用（重置／登出／范围设置等）"。忙碌时按现役 `rejectBusy`
+   * 形状指名占用者并返回 false（不静默失败），由调用方把下拉拨回。
+   *
+   * 第二道前置门＝未结算 mutation（台账非空，以及损坏／隔离／V2 载入阻塞——同口径
+   * 来源 `state-manager.ts:5954-5963` 的判定）。未结算的出站 intent 会在下一轮
+   * `recoverMutationLedger` 里被结算／补完，那会在单向模式下产生一笔云端写入，
+   * 与模式承诺冲突，故命中即拒绝且零写入。呈现复用现成文案
+   * `notice.sideActionPendingWork`（语义正合：还有未完成的恢复处理），不新增键。
+   *
+   * 写入＝单键设置（原子）：失败回退字段并抛出（调用方复用
+   * `notice.settingsSaveFailed`）；成功后推给执行器，并作废在审计划（方向改变会
+   * 改变计划语义，照自动处理策略的现役处理）。`assertOperationCurrent` 用调用方
+   * 给的 operation epoch（与范围设置变更同形）。
+   *
+   * **不动账本**：只写 `sync-direction`，基线／V2 权威与索引／远端协议对象一律
+   * 不碰；关闭方向把本机独有条目按 per-class 作废退场（记录退场，文件与忽略
+   * 记忆都保留）。
+   */
+  /** 设置页动作在弹框前捕获的操作 epoch（与范围设置变更同形）。 */
+  captureOperationEpoch(): number {
+    return this.operationLifecycle.capture();
+  }
+
+  async updateSyncDirection(
+    direction: SyncDirection,
+    operationEpoch?: number,
+  ): Promise<boolean> {
+    const assertOperationCurrent = (): void => {
+      if (
+        operationEpoch !== undefined
+        && !this.operationLifecycle.isCurrent(operationEpoch)
+      ) {
+        throw new Error("Operation lifecycle was invalidated");
+      }
+    };
+    assertOperationCurrent();
+    if (direction === this.syncDirection) return true;
+    if (this.isSyncPathBusy()) {
+      this.showSyncModeBusyNotice();
+      return false;
+    }
+    if (this.hasUnsettledMutationRecovery()) {
+      this.showSyncModePendingWorkNotice();
+      return false;
+    }
+    const previous = this.syncDirection;
+    this.syncDirection = direction;
+    try {
+      await this.saveSyncSettings();
+    } catch (error) {
+      this.syncDirection = previous;
+      throw error;
+    }
+    assertOperationCurrent();
+    this.syncExecutor?.setSyncDirection(direction);
+    if (direction === "two-way") {
+      await this.retireLocalOnlyEntriesForDisabledMode();
+    }
+    if (this.state?.planReviewActive) {
+      await this.state.clearPlanReview();
+    }
+    this.diag.log("state", "sync direction committed", {
+      direction,
+      mutations: 0,
+    });
+    this.updateStatusBar();
+    this.syncView?.render();
+    this.settingsTab?.refreshSyncState();
+    return true;
+  }
+
+  /**
+   * 片⑥ 关闭方向：未处置的本机独有条目按现役 per-class 作废形状退场
+   * （照 `expire*Decision`：条目失去意义即退场）。只退记录——文件仍在原处、
+   * 忽略记忆保留、账本一字不动。
+   */
+  private async retireLocalOnlyEntriesForDisabledMode(): Promise<void> {
+    const state = this.state;
+    if (!state) return;
+    const rows = projectLocalOnlyEntryRowsV1({
+      copies: state.localOnlyCopyEntries,
+      created: state.localOnlyCreatedEntries,
+    });
+    if (rows.length === 0) return;
+    await state.retireLocalOnlyEntries({
+      paths: rows.map((row) => row.path),
+      copyPaths: rows
+        .filter((row) => row.kind === "edited")
+        .map((row) => row.targetPath),
+    });
+  }
+
+  /** 忙碌时的现役形状：指名占用者，不静默失败。 */
+  private showSyncModeBusyNotice(): void {
+    const reason = this.syncExecutor?.isRunning
+      ? this.i18n.t("result.alreadyRunning")
+      : this.opLock !== null
+        ? this.i18n.t("result.lockBusyWithHolder", {
+            holder: this.i18n.t(this.opHolderNameKey(this.opLock)),
+          })
+        : this.i18n.t("result.lockBusy");
+    this.noticeCenter?.show({
+      key: "settings:sync-mode-busy",
+      message: reason,
+      priority: NOTICE_PRIORITY.attention,
+      className: "easy-sync-notice-action",
+    });
+  }
+
+  /**
+   * 未结算 mutation 的第二道门（同口径来源 `state-manager.ts:5954-5963`）：
+   * 台账非空，或账本／隔离区损坏、V2 载入阻塞——都属"恢复未完成"，此时切换
+   * 方向会让下一轮的恢复结算在单向模式下补完一笔云端写入。
+   */
+  private hasUnsettledMutationRecovery(): boolean {
+    const state = this.state;
+    if (!state) return false;
+    return state.mutationLedger.length > 0
+      || state.hasMutationLedgerCorruption
+      || state.hasMutationRecoveryQuarantineCorruption
+      || state.hasV2StateLoadRecoveryBlock;
+  }
+
+  /** 未结算恢复的现役呈现形状（复用 `notice.sideActionPendingWork`，不新增键）。 */
+  private showSyncModePendingWorkNotice(): void {
+    this.noticeCenter?.show({
+      key: "settings:sync-mode-pending-work",
+      message: this.i18n.t("notice.sideActionPendingWork"),
+      priority: NOTICE_PRIORITY.attention,
+      className: "easy-sync-notice-action",
+    });
+  }
+
   /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
   private async renderDiagnosticHeaderSection(ctx: DiagnosticReportRenderContext): Promise<Pick<DiagnosticReportProvidedValues, "diagAll" | "remoteScopeRecoverySummary">> {
     const {
@@ -8872,6 +9372,7 @@ export default class EasySyncPlugin extends Plugin {
     lines.push(`**仓库名**: ${this.app.vault.getName()}`);
     lines.push(`**登录账号**: ${auth?.isLoggedIn ? auth.displayName || "已登录" : "未登录"}`);
     lines.push(`**平台**: ${platformLabel}`);
+    lines.push(`**同步模式**: ${this.syncDirection === "one-way" ? "单向同步（本机不上传笔记与附件）" : "双向同步"}`);
     lines.push("");
     lines.push(`> ${reportI18n.t("diagnosticReport.feedbackNote")}`);
     lines.push(`> ${reportI18n.t("diagnosticReport.redactionNote")}`);
@@ -8924,7 +9425,12 @@ export default class EasySyncPlugin extends Plugin {
       lines.push("**未完成操作核对**: 无");
     }
     lines.push(`**计划审阅**: ${reportState?.planReviewActive ? `等待确认（revision ${reportState.planReviewRevision}）` : "无"}`);
-    lines.push(`**自动处理配置**: 将云端删除同步到本机 ${this.automaticHandlingPolicy.autoDeleteLocalFiles ? "开启" : "关闭"} / 合并不重叠的文本修改 ${this.automaticHandlingPolicy.mergeNonOverlappingText ? "开启" : "关闭"}`);
+    // 片⑥ 收口：单向模式下删除跟随强制恒开，这里必须写"生效"而不是设置值，
+    // 否则报告与真实行为不符（技术工件，照现役行样式）。
+    const autoDeleteLocalFilesEffective =
+      this.syncDirection === "one-way"
+      || this.automaticHandlingPolicy.autoDeleteLocalFiles;
+    lines.push(`**自动处理配置**: 将云端删除同步到本机 ${this.syncDirection === "one-way" ? "强制跟随（单向同步）" : autoDeleteLocalFilesEffective ? "开启" : "关闭"} / 合并不重叠的文本修改 ${this.automaticHandlingPolicy.mergeNonOverlappingText ? "开启" : "关闭"}`);
     const describePluginScope = (
       scope: typeof communityPluginSummary.files,
     ): string => `${scope.mode === "selected"
@@ -9521,6 +10027,137 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   /**
+   * 移动端常驻状态图标开关的应用入口（方案单 20261012-225046）：移动端宿主
+   * DOM 里存在一个官方隐藏的 `.status-bar` 元素，桌面状态项就在其中
+   * （20261012-215203 实测强显可行）。本方法只决定「现役状态项在移动端是否
+   * 可见」，不新建任何 UI；桌面端不进本路径（显示隔离，桌面状态栏体系与
+   * 设置项不受影响）。
+   */
+  applyMobileStatusBar(): void {
+    if (!Platform.isMobile) return;
+    if (this.mobileStatusBar) {
+      this.enableMobileStatusBar();
+    } else {
+      this.disableMobileStatusBar();
+    }
+  }
+
+  /**
+   * 强显宿主隐藏状态栏（Remotely Save 同款注入点）：`display:flex` + 按导航
+   * 栏布局高度让位。定位基于布局高度，导航栏滚动隐藏走 transform、改不了
+   * 布局，藏不住该图标（20261012-224210 实测）；键盘弹出/收起等底部占位变化
+   * 由 Observer 重算承接（真机待验）。
+   */
+  private enableMobileStatusBar(): void {
+    const statusBar = document.querySelector<HTMLElement>(
+      ".is-mobile .app-container .status-bar",
+    );
+    if (!statusBar) {
+      // 宿主元素未就绪（罕见）：布局就绪后重试一次，仍失败则放弃，不死循环。
+      if (this.mobileStatusBarLayoutRetryArmed) return;
+      this.mobileStatusBarLayoutRetryArmed = true;
+      this.app.workspace.onLayoutReady(() => {
+        this.mobileStatusBarLayoutRetryArmed = false;
+        if (this.mobileStatusBar) this.enableMobileStatusBar();
+      });
+      return;
+    }
+    statusBar.setCssProps({ display: "flex" });
+    // 标记类配合 styles.css 抑制规则：强显时只保留 EasySync 现役状态项，
+    // 隐藏宿主随笔记打开塞入的原生项（反向链接／字数统计／视图切换等，
+    // 真机反馈 2026-10-12）。
+    statusBar.addClass("easy-sync-mobile-status-bar-shown");
+    this.refreshMobileStatusBarOffset();
+    if (!this.mobileStatusBarObserver) {
+      // 导航栏/工具栏挂载、卸载会改变底部占位高度：childList 变化后延迟重算
+      // （与 Remotely Save 同款 300ms 等待，取稳定后的计算高度）。
+      const appContainer = document.querySelector(".app-container");
+      if (appContainer) {
+        this.mobileStatusBarObserver = new MutationObserver(() => {
+          this.scheduleMobileStatusBarOffsetRefresh();
+        });
+        this.mobileStatusBarObserver.observe(appContainer, {
+          attributes: false,
+          childList: true,
+          characterData: false,
+          subtree: false,
+        });
+      }
+    }
+    if (!this.mobileStatusBarResizeHandler) {
+      this.mobileStatusBarResizeHandler = () =>
+        this.scheduleMobileStatusBarOffsetRefresh();
+      window.addEventListener("resize", this.mobileStatusBarResizeHandler);
+    }
+    if (this.mobileStatusBarLayoutRef === null) {
+      // 形态切换（含平板↔手机壳体重建）会整体替换 app-container，使上面挂在
+      // 旧容器上的 Observer 失联：layout-change 与其并行兜底重算（模拟实测
+      // 20261012-225046 实施轮：壳体重建后 margin-bottom 失效即此因）。
+      const layoutRef = this.app.workspace.on("layout-change", () => {
+        this.scheduleMobileStatusBarOffsetRefresh();
+      });
+      this.registerEvent(layoutRef);
+      this.mobileStatusBarLayoutRef = layoutRef;
+    }
+  }
+
+  private disableMobileStatusBar(): void {
+    // 无 DOM 环境（Node 侧卸载测试、异常生命周期）：无可还原的样式，直接返回。
+    if (typeof document === "undefined") return;
+    this.mobileStatusBarObserver?.disconnect();
+    this.mobileStatusBarObserver = null;
+    if (this.mobileStatusBarLayoutRef !== null) {
+      this.app.workspace.offref(this.mobileStatusBarLayoutRef);
+      this.mobileStatusBarLayoutRef = null;
+    }
+    if (this.mobileStatusBarResizeHandler) {
+      window.removeEventListener("resize", this.mobileStatusBarResizeHandler);
+      this.mobileStatusBarResizeHandler = null;
+    }
+    if (this.mobileStatusBarRecomputeTimer !== null) {
+      compatClearTimeout(this.mobileStatusBarRecomputeTimer);
+      this.mobileStatusBarRecomputeTimer = null;
+    }
+    const statusBar = document.querySelector<HTMLElement>(
+      ".is-mobile .app-container .status-bar",
+    );
+    statusBar?.removeClass("easy-sync-mobile-status-bar-shown");
+    statusBar?.setCssProps({ display: "" });
+    // `margin-bottom` 是多词属性，键必须带引号；带引号的具体属性名会被官方 lint
+    // 规则（`no-static-styles-assignment`）拦下，故走 DOM 原生的 removeProperty。
+    statusBar?.style.removeProperty("margin-bottom");
+  }
+
+  private scheduleMobileStatusBarOffsetRefresh(): void {
+    if (this.mobileStatusBarRecomputeTimer !== null) {
+      compatClearTimeout(this.mobileStatusBarRecomputeTimer);
+    }
+    this.mobileStatusBarRecomputeTimer = compatSetTimeout(() => {
+      this.mobileStatusBarRecomputeTimer = null;
+      this.refreshMobileStatusBarOffset();
+    }, 300);
+  }
+
+  private refreshMobileStatusBarOffset(): void {
+    const statusBar = document.querySelector<HTMLElement>(
+      ".is-mobile .app-container .status-bar",
+    );
+    if (!statusBar) return;
+    const navbar = document.querySelector<HTMLElement>(".mobile-navbar");
+    if (!navbar) {
+      // 平板等无导航栏形态：不预留底部占位（导航栏出现时由 Observer 重算）。
+      statusBar.style.removeProperty("margin-bottom");
+      return;
+    }
+    // 多词属性名不能走 setCssProps（带引号的键会被官方 lint 规则拦下），改用
+    // style.setProperty 写行内值：写出的声明与原实现逐字相同。
+    statusBar.style.setProperty(
+      "margin-bottom",
+      window.getComputedStyle(navbar).getPropertyValue("height"),
+    );
+  }
+
+  /**
    * Rebuild the status bar item: icon-only (slice 3, 2026-08-26 ③ 方案 A,
    * isomorphic with the official Obsidian Sync item) — host
    * `status-bar-item-segment` > icon container (`status-bar-item-icon`,
@@ -9710,7 +10347,10 @@ export default class EasySyncPlugin extends Plugin {
     // green ready claim below. Pending items are counted here with the
     // sidebar's own phrase, so the two carriers read the same fact the same
     // way — the bar itself stays a reminder, not a second information surface.
-    const issues = this.state?.pendingIssues?.length ?? 0;
+    // 本机独有条目（片④）与待处理问题同属"需要注意"这一档：两者都用侧栏那句
+    // 合计文案，两个载体的读法一致（不新增文案、不另立一档）。
+    const issues = (this.state?.pendingIssues?.length ?? 0)
+      + this.getLocalOnlyEntryCount();
     if (issues > 0) {
       this.renderStatusBarItem(
         this.statusBarEl,
@@ -9821,7 +10461,8 @@ export default class EasySyncPlugin extends Plugin {
       (this.state?.planReviewActive ?? false)
       || (this.state?.pendingIssues.length ?? 0) > 0
       || (this.state?.pendingConflicts.length ?? 0) > 0
-      || (this.state?.pendingRemoteDeletes.length ?? 0) > 0;
+      || (this.state?.pendingRemoteDeletes.length ?? 0) > 0
+      || this.getLocalOnlyEntryCount() > 0;
     const label =
       status === "attention"
       && recovery
@@ -9848,12 +10489,18 @@ export default class EasySyncPlugin extends Plugin {
     return resolveRibbonStatus({
       loggedIn: this.auth?.authState.isLoggedIn ?? false,
       cancelling: this.progressStore.state.cancelRequested,
-      syncing: isAnySyncActivityRunning(this.progressStore.state, fullSyncRunning, sideActionRunning),
+      // 同步入口占用（检测/准备期）并入运行档：Ribbon 是「点同步」的入口本身，
+      // 整段窗口保持「立即同步」会让用户以为没点上（2026-10-10 拍板）。
+      syncing: isAnySyncActivityRunning(this.progressStore.state, fullSyncRunning, sideActionRunning)
+        || this.isSyncEntryInProgress,
       needsAttention: this.autoSyncPaused
         || (this.state?.planReviewActive ?? false)
         || (this.state?.pendingIssues.length ?? 0) > 0
         || (this.state?.pendingConflicts.length ?? 0) > 0
         || (this.state?.pendingRemoteDeletes.length ?? 0) > 0
+        // 片④ 本机独有条目与其它"需要处理"同档：三个载体（侧栏／状态栏／
+        // Ribbon）读同一份记录，图标档位一致。
+        || this.getLocalOnlyEntryCount() > 0
         || this.getMutationRecoveryDisplayState() !== null,
       recentSuccess: this.ribbonSuccessVisible,
     });

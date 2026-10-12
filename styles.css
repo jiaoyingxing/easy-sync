@@ -333,6 +333,12 @@ body.is-mobile .easy-sync-empty-folder-actions button {
   margin-top: var(--size-2-1);
 }
 
+/* Sync mode hint: the per-option explanation line under the mode dropdown,
+   same progressive-disclosure shape as the pop-ups hint above. */
+.easy-sync-sync-mode-hint {
+  margin-top: var(--size-2-1);
+}
+
 .easy-sync-exclusion-chip {
   display: flex;
   align-items: center;
@@ -1333,6 +1339,14 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
   padding-top: var(--size-4-2);
 }
 
+/* 单向下本机独有内容的批量处置行（2026-10-12 用户过目）：两个总动作各占一半、
+   两端顶着，读起来才是"这一族的总按钮"（与面板顶部「立即同步」同宽）。窄到放不
+   下时逐个整宽换行。 */
+.easy-sync-local-only-batch-actions button {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
 body.is-mobile .easy-sync-plan-execute {
   flex-direction: column;
   align-items: stretch;
@@ -1340,6 +1354,11 @@ body.is-mobile .easy-sync-plan-execute {
 
 body.is-mobile .easy-sync-plan-execute button {
   width: 100%;
+}
+
+/* 移动端＝逐条整宽堆叠（与其余计划动作行一致）：等分只属于并排形态。 */
+body.is-mobile .easy-sync-local-only-batch-actions button {
+  flex: 0 0 auto;
 }
 
 body.is-mobile .easy-sync-auth-pending-actions {
@@ -1565,6 +1584,16 @@ body:not(.is-mobile) .easy-sync-settings-tab .setting-item-control button:not(.c
   min-width: calc(4em + var(--size-4-3) * 2);
 }
 
+/* 1.13+ 设置页「规则」行被「我知道了」收起后：宿主把组内行间分割线画在每行的
+   ::before 上，只对 DOM :first-child 豁免；收起的行以 display:none 隐藏但仍
+   占住 first-child，紧随其后那行的分割线会浮在组顶（2026-10-12 真机复测）。
+   规则行恒为组内首行，收起标记类挂在自己的 settingEl 上，用后继选择器同步
+   关掉后继行的分割线；「content: none」与宿主对 first-child 的豁免写法同款，
+   前缀 .setting-group 使 specificity（0,3,1）压过宿主分割线规则（0,3,0）。 */
+.setting-group .easy-sync-setting-rule-acknowledged + .setting-item::before {
+  content: none;
+}
+
 /* About card contact buttons (author row): icon and label on one line; the
    Xiaohongshu icon keeps its brand red. */
 .easy-sync-settings-about-contact-setting .setting-item-control {
@@ -1699,4 +1728,16 @@ body.is-mobile .easy-sync-transfer-rate.is-mobile-footer {
 }
 .easy-sync-transfer-rate.is-zero {
   color: var(--color-red);
+}
+
+/* ═══ 移动端常驻状态图标（方案单 20261012-225046） ═══
+   强显宿主隐藏状态栏时，只保留 EasySync 现役状态项：原生移动端该栏永不
+   可见，笔记打开时宿主会往里塞原生项（反向链接／字数统计／视图切换等），
+   随强显露出会挤占右下角——真机反馈 2026-10-12。标记类仅在 EasySync 强显
+   激活时挂上，不影响宿主默认与其他插件自己的强显行为。 */
+.is-mobile
+  .app-container
+  .status-bar.easy-sync-mobile-status-bar-shown
+  .status-bar-item:not(.plugin-easy-sync) {
+  display: none;
 }
