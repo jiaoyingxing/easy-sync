@@ -56,6 +56,22 @@ export interface DeltaResponse {
 }
 
 /**
+ * One retained version of a driveItem (Graph driveItemVersion).
+ *
+ * Read-only forensic surface: OneDrive does not preserve complete metadata for
+ * previous versions, version creation is service/configuration dependent (it
+ * may happen per edit, per save, manually, or never), and retention is bounded
+ * by service/admin settings — so an empty list is a legitimate answer and
+ * `lastModifiedBy` only reaches account/application level, never the device.
+ */
+export interface DriveItemVersion {
+  id: string;
+  size?: number;
+  lastModifiedDateTime?: string;
+  lastModifiedBy?: IdentitySet;
+}
+
+/**
  * One settled page of a delta enumeration (join 弱网「稍后重试」案C,
  * 2026-09-19). Delivered to the caller right after the page lands so the
  * enumeration checkpoint can be persisted before the next page is requested.

@@ -165,6 +165,34 @@ export class AutoSyncModal extends EasySyncModal {
           paintSliderDisplay(slider),
         );
       });
+
+    new Setting(contentEl)
+      .setName(t("settings.autoSyncOnStartup.name"))
+      .setDesc(t("settings.autoSyncOnStartup.desc"))
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.autoSyncOnStartup).onChange(
+          async (value) => {
+            const previous = this.plugin.autoSyncOnStartup;
+            const masterWasOn = this.plugin.isAutoSyncMasterEnabled();
+            this.plugin.setAutoSyncOnStartup(value);
+            try {
+              await this.plugin.saveSyncSettings();
+            } catch {
+              this.plugin.setAutoSyncOnStartup(previous);
+              toggle.setValue(previous);
+              new Notice(t("notice.settingsSaveFailed"));
+              return;
+            }
+            // This channel can own the master switch on its own (when it is
+            // the only one on, or the last one turned off), so a flip re-arms
+            // or releases the auto-sync surfaces exactly like the sliders do.
+            if (this.plugin.isAutoSyncMasterEnabled() !== masterWasOn) {
+              this.plugin.restartAutoSync();
+            }
+            this.plugin.refreshSettingsTab();
+          },
+        );
+      });
   }
 
   onClose(): void {

@@ -63,6 +63,7 @@ import type {
   OneDriveMetadataReason,
   SharedSyncProtocolBindingProvenObject,
 } from "../onedrive/client";
+import { isResponseByteBudgetError } from "../onedrive/client";
 import { isEasySyncInternalPath } from "./local-scanner";
 import type { LocalFileInspection, LocalScanner } from "./local-scanner";
 import {
@@ -139,6 +140,10 @@ import type {
   CommunityPluginBundlePresentationV1,
 } from "./types";
 import type { DiagnosticLogger } from "./diagnostic-logger";
+import {
+  BlockedUploadVersionHistoryProbe,
+  buildBlockedUploadRemoteFacts,
+} from "./blocked-upload-version-history";
 import {
   remoteStateProjectionMatchesEnvelopeV2,
   upsertBaseStateEnvelopeV2,
@@ -846,6 +851,19 @@ class DownloadRemoteVersionChangedError extends Error {
   constructor(path: string) {
     super(`Remote version changed during download: ${path}`);
     this.name = "DownloadRemoteVersionChangedError";
+  }
+}
+
+/** The body we received no longer matches the remote item's declared size —
+ *  the same content race as DownloadRemoteVersionChangedError caught at the
+ *  other guard (the declared size was read before the rewrite). Deferred like
+ *  the version-changed case; the next round replans from the newer remote. */
+class DownloadedPayloadSizeMismatchError extends Error {
+  constructor(path: string, downloadedSize: number, declaredSize: number) {
+    super(
+      `Downloaded size mismatch: ${path} (${downloadedSize} != ${declaredSize})`,
+    );
+    this.name = "DownloadedPayloadSizeMismatchError";
   }
 }
 
@@ -1816,6 +1834,19 @@ export class SyncExecutor {
     folderShellKeys: ReadonlySet<string>;
   } | null = null;
   private staleFirstSyncEvidenceChecked = false;
+  /** Blocked-upload read-only evidence (2026-10-13 field case): the retained
+   *  version history is fetched at most once per operation per session, only
+   *  to enrich the diag surface — never to settle the record. */
+  private readonly blockedUploadVersionHistory =
+    new BlockedUploadVersionHistoryProbe({
+      listVersions: (driveItemId) =>
+        this.onedrive.listDriveItemVersionsById(
+          driveItemId,
+          "blockedRecoveryVersionHistory",
+        ),
+      isLoggingEnabled: () => this.diag?.isEnabled("state") === true,
+      log: (message, data) => this.diag?.log("state", message, data),
+    });
   private automaticHandlingPolicy: AutomaticHandlingPolicy = {
     ...DEFAULT_AUTOMATIC_HANDLING_POLICY,
   };
@@ -4492,6 +4523,7 @@ export class SyncExecutor {
   private isolatableOrdinaryFileRecovery(
     summary: Readonly<MutationRecoveryRunSummary>,
     syncScope: Readonly<SyncScope>,
+    options: { allowManagedConfigPaths: boolean },
   ): MutationLedgerEntryV1[] | null {
     const records = this.state.mutationLedger;
     if (
@@ -4509,9 +4541,16 @@ export class SyncExecutor {
         !isOrdinaryFileRecoveryRecord(record, syncScope)
         || paths.some((path) =>
           !this.shouldIncludeRemotePath(path)
-          || isObsidianManagedConfigPath(path, configDir)
-          || isEasySyncSelfSyncFilePath(path, configDir)
-          || classifyCommunityPluginManagedPath(path, configDir) !== null)
+          || classifyCommunityPluginManagedPath(path, configDir) !== null
+          // 2026-10-13 (B1): a record on the plugin's own artifacts or on a
+          // managed config path used to freeze every file decision in the
+          // vault (2026-10-13 field case). Ordinary rounds isolate it like any
+          // other ordinary-file record — paths stay frozen, the record stays
+          // visible — while the reset-preflight observation keeps the strict
+          // set so the reset gate is not loosened as a side effect.
+          || (!options.allowManagedConfigPaths
+            && (isObsidianManagedConfigPath(path, configDir)
+              || isEasySyncSelfSyncFilePath(path, configDir))))
       ) return null;
     }
     const envelope = this.state.getCommittedV2Envelope();
@@ -5755,7 +5794,7 @@ export class SyncExecutor {
     remoteVersionAlreadyVerified = false,
   ): Promise<void> {
     if (downloaded.size !== remote.size) {
-      throw new Error(`Downloaded size mismatch: ${path} (${downloaded.size} != ${remote.size})`);
+      throw new DownloadedPayloadSizeMismatchError(path, downloaded.size, remote.size);
     }
     if (remote.sha256Hash) {
       if (downloaded.hash !== remote.sha256Hash.toLowerCase()) {
@@ -11469,6 +11508,7 @@ export class SyncExecutor {
       const isolated = this.isolatableOrdinaryFileRecovery(
         error.summary,
         syncScope,
+        { allowManagedConfigPaths: options.mutationRecoveryObservationOnly !== true },
       );
       if (!isolated) {
         if (error.summary.state !== "network-unavailable") throw error;
@@ -13878,7 +13918,7 @@ export class SyncExecutor {
         ? this.onedrive.finishRunMetrics()
         : null;
       if (networkMetrics) {
-        this.diag?.log("onedrive", "sync network summary", networkMetrics);
+        this.diag?.log("onedrive", "sync network summary", networkMetrics, { urgent: true });
       }
       if (result.metrics) {
         this.diag?.log("execute", "sync file transfer summary", {
@@ -13887,7 +13927,7 @@ export class SyncExecutor {
           upload: result.metrics.fileTransfers.upload,
           download: result.metrics.fileTransfers.download,
           mutationPersistence: result.metrics.mutationPersistence,
-        });
+        }, { urgent: true });
       }
       automaticHandlingMetrics.recoveryPendingAtEnd = {
         deleteLocal: this.state.mutationLedger.filter(
@@ -13904,6 +13944,7 @@ export class SyncExecutor {
           schemaVersion: 1,
           ...automaticHandlingMetrics,
         },
+        { urgent: true },
       );
       this.diag?.log("lifecycle", "sync run phase summary", {
         schemaVersion: 2,
@@ -13931,7 +13972,7 @@ export class SyncExecutor {
         },
         phasesMs,
         totalMs: Math.max(0, Date.now() - runStartedAt),
-      });
+      }, { urgent: true });
       this.onedrive.setAbortSignal(null);
       this.cancelController = null;
       this.activeSyncScope = null;
@@ -14786,17 +14827,27 @@ export class SyncExecutor {
           return;
         }
         transferOutcome = transferMetrics ? "failed" : null;
-        if (e instanceof DownloadRemoteVersionChangedError) {
+        if (e instanceof DownloadRemoteVersionChangedError
+          || e instanceof DownloadedPayloadSizeMismatchError
+          || (isResponseByteBudgetError(e) && e.kind === "observed")) {
           // A stale-version download is a transient content race — the source
           // device was still writing while we read (hot file: recording part,
           // in-flight photo). The next round replans from the newer remote
           // version, so defer the item instead of failing the round; auto sync
           // keeps running (2026-09-28). The transfer-remote-moving breaker row
           // grants one real attempt per backoff window so a still-growing file
-          // is not re-downloaded every round.
+          // is not re-downloaded every round. 2026-10-13: the same race is also
+          // caught by the size guards (body over the declared budget, or a
+          // completed body whose size no longer matches) — those defer too; a
+          // declared size over the hard cap stays the hard failure above.
+          const deferCause = e instanceof DownloadRemoteVersionChangedError
+            ? "remote version changed during download"
+            : e instanceof DownloadedPayloadSizeMismatchError
+              ? "downloaded size no longer matches the declared size"
+              : "response body exceeded the declared size budget";
           this.diag?.warn(
             "execute",
-            `[${position}/${total}] download deferred — remote version changed during download: ${item.path}`,
+            `[${position}/${total}] download deferred — ${deferCause}: ${item.path}`,
           );
           result.deferred++;
           const reason = this.failureReason(e, item.path);
@@ -17638,6 +17689,7 @@ export class SyncExecutor {
           "execute",
           "mutation recovery batch summary",
           diagnosticSummary,
+          { urgent: true },
         );
       }
     }
@@ -18011,6 +18063,7 @@ export class SyncExecutor {
       if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
       this.logBlockedMutationEvidence(record);
       await this.logBlockedDownloadEvidence(record);
+      await this.blockedUploadVersionHistory.probe(record.intent);
       blocked.push({
         operationId: record.intent.operationId,
         reason: "outcome-unresolved",
@@ -18040,7 +18093,11 @@ export class SyncExecutor {
       checkpoint: outcome,
     };
     await this.state.recordMutationReceipt(receipt);
-    await this.commitMutationCheckpoint(record.intent.operationId);
+    await this.commitRecoveryCheckpointsWithRepair({
+      operationIds: [record.intent.operationId],
+      operationEpoch,
+      result,
+    });
     reflectedCheckpointRetirementCommitSeq = undefined;
     applied++;
     settled++;
@@ -18322,7 +18379,11 @@ export class SyncExecutor {
         externalMutations,
       });
     }
-    await this.commitMutationCheckpoint(record.intent.operationId);
+    await this.commitRecoveryCheckpointsWithRepair({
+      operationIds: [record.intent.operationId],
+      operationEpoch,
+      result,
+    });
     reflectedCheckpointRetirementCommitSeq = undefined;
     receiptCommitted++;
     settled++;
@@ -18443,6 +18504,7 @@ export class SyncExecutor {
       return accumulators();
     }
     this.logBlockedMutationEvidence(record);
+    await this.blockedUploadVersionHistory.probe(record.intent);
     if (isAutomaticMerge && mergeRecovery) mergeRecovery.unresolved++;
     blocked.push({
       operationId: record.intent.operationId,
@@ -18926,10 +18988,39 @@ export class SyncExecutor {
       || remote.eTag !== upsert.eTag
       || !committedParentId
       || remote.parentId !== committedParentId) return false;
+    // The receipt's own response identity still sitting at the intent path
+    // under the committed parent is what proves the upload applied. Size and
+    // (when both sides publish one) content hash must agree with the receipt
+    // as well: a different version under a recycled identity stays
+    // fail-closed.
+    if (remote.size !== upsert.size) return false;
+    if (
+      upsert.sha256Hash
+      && remote.sha256Hash
+      && upsert.sha256Hash.toLowerCase() !== remote.sha256Hash.toLowerCase()
+    ) return false;
     if (this.inspectionMatchesVersion(local, base)) return true;
-    if (local.status !== "missing") return false;
-    if (observationOnly) return false;
-    return this.restoreReceiptedUploadLocal(intent.path, remote, base);
+    if (local.status === "missing") {
+      if (observationOnly) return false;
+      return this.restoreReceiptedUploadLocal(intent.path, remote, base);
+    }
+    // A present inspection without content facts cannot re-confirm anything;
+    // keep the old fail-closed shape for it (2026-10-13 review finding).
+    if (!local.entry) return false;
+    // The local file was rewritten after the upload landed — the ordinary state
+    // of a client data file that gets rewritten every few seconds. That is a
+    // plain local change, not an undecidable outcome: settle the receipt
+    // against the receipt's own version and let the next round plan the
+    // current local content from the freshly observed tree. Requiring the
+    // local copy to still hold the uploaded version left every such record
+    // without any exit (blocked, non-retryable, whole-vault pause) — 2026-10-13
+    // field case.
+    this.diag?.log(
+      "execute",
+      `receipted upload settled after the local file was rewritten — ${intent.path}`,
+      { operationId: intent.operationId, mutations: 0 },
+    );
+    return true;
   }
 
   /**
@@ -19047,8 +19138,15 @@ export class SyncExecutor {
             ? undefined
             : intent.createdAt - node.mtime,
         remoteCurrentPath: movedElsewhere ? currentPath : null,
+        // 2026-10-13 field case: telling "our write landed, then someone
+        // replaced it" apart from "our write never landed" needed these
+        // dimensions, gathered by hand from three sources that round.
+        // remoteVersionDelta counts writes (retained version numbers) after
+        // the recorded base — our own write included.
+        ...buildBlockedUploadRemoteFacts(node, intent),
         mutations: 0,
       },
+      { urgent: true },
     );
   }
 
@@ -19076,6 +19174,7 @@ export class SyncExecutor {
           ),
           mutations: 0,
         },
+        { urgent: true },
       );
     } catch {
       // Evidence must never turn the blocked path itself into a failure.
@@ -19269,13 +19368,28 @@ export class SyncExecutor {
 
     const checkpoint = emptyMutationCheckpoint();
     if (intent.action === "upload") {
-      if (
-        local.status !== "present"
-        || !local.entry
-        || !intent.expectedLocal.exists
-        || local.entry.hash !== intent.expectedLocal.hash
-        || local.entry.size !== intent.expectedLocal.size
-      ) return null;
+      const localPresent = local.status === "present" && local.entry !== undefined;
+      // Capture the exists-variant once: the gates below need a narrowed
+      // expectation, and an upload whose recorded local side never existed
+      // cannot be adjudicated here (same as before).
+      const localExpectation = intent.expectedLocal.exists ? intent.expectedLocal : null;
+      if (!localExpectation) return null;
+      const localStillIntended = localPresent
+        && local.entry?.hash === localExpectation.hash
+        && local.entry?.size === localExpectation.size;
+      // C1 (2026-10-13, user-approved): the upload landed but its receipt was
+      // lost, and the local source moved on afterwards. When the remote still
+      // holds exactly the intended version — forced readback, and the item is
+      // still the object the intent targeted — the effect we wanted exists, so
+      // settle zero-write with the intended version as the baseline; the local
+      // edit is then handled by the next three-way comparison. Anything weaker
+      // (the remote moved too, the identity was replaced, the readback cannot
+      // prove the bytes) stays fail-closed — that is the C1b shape we
+      // deliberately do not open.
+      const adoptRemoteIntendedVersion = !localStillIntended
+        && localPresent
+        && !intent.sourcePath;
+      if (!localStillIntended && !adoptRemoteIntendedVersion) return null;
       if (intent.sourcePath) {
         const [sourceLocal, sourceRemote] = await Promise.all([
           this.inspectLocalPath(intent.sourcePath),
@@ -19302,9 +19416,35 @@ export class SyncExecutor {
           intent.expectedRemote.driveId,
         ) !== null
       ) return null;
-      if (!await this.remoteMatchesTarget(current, intent.expectedLocal)) {
-        // 恢复层 upload 不自动收敛（真机验证 + 计划边界：两侧都变 → T3/fail-
-        // closed 亮出）。恢复层 T2（upload/download）已整体回退 fail-closed：
+      if (adoptRemoteIntendedVersion) {
+        // Identity continuity: a delete-and-recreate under the same path is
+        // not evidence that our write landed.
+        if (
+          intent.expectedRemote.exists
+          && current.driveId !== intent.expectedRemote.driveId
+        ) return null;
+        if (!await this.remoteMatchesTarget(current, localExpectation, true)) {
+          return null;
+        }
+        this.convergencesThisRound++;
+        this.diag?.warn(
+          "execute",
+          `unreceipted upload settled from remote readback after the local file was rewritten — ${intent.path}`,
+        );
+        checkpoint.baseUpserts.push({
+          path: intent.path,
+          hash: localExpectation.hash,
+          size: localExpectation.size,
+          eTag: current.eTag,
+        });
+        checkpoint.remoteUpserts.push(current);
+        return checkpoint;
+      }
+      if (!local.entry) return null;
+      if (!await this.remoteMatchesTarget(current, localExpectation)) {
+        // 远端已变时的恢复层 upload 不自动收敛（真机验证 + 计划边界：两侧都
+        // 变 → T3/fail-closed 亮出）；远端仍驻留所传版本的情形见上面的 C1
+        // 采纳分支。恢复层 T2（upload/download）已整体回退 fail-closed：
         // 分类器只有结算权，任何 checkpoint 形状都会与 receipt/reducer 合
         // 同冲突或覆盖本机唯一副本。T2 的方向判断属于计划层（冲突判定处，
         // 方案 B 范畴），另行工作线启动。
@@ -19415,7 +19555,35 @@ export class SyncExecutor {
       checkpoint.remoteUpserts.push(target);
       return checkpoint;
     }
-    if (!localStillExpected) return null;
+    if (!localStillExpected) {
+      // 2026-10-14 (field report 2026-10-13, the second F20-family shape): the
+      // cloud rename landed and the local file was then edited or replaced, so
+      // the plain branch's "local unchanged" precondition can never hold again
+      // and every round stayed blocked. The move anchors above already prove
+      // the rename; the local side is a separate, ordinary decision. Settle the
+      // record against the remote's *actual* content version — read back,
+      // because a moved object without a remote sha has no other honest source
+      // for that hash — and let the next ordinary round compare the local edit
+      // against this baseline (upload, or a conflict when the remote moved
+      // too). A copy still sitting at the source path means the user moved it
+      // back rather than on; an unprovable readback stays blocked.
+      const sourceLocal = await this.inspectLocalPath(intent.sourcePath);
+      if (!sourceLocal || sourceLocal.status !== "missing") return null;
+      const bytes = await this.downloadRemoteContent(target);
+      if (!bytes || !await this.remoteStillSameObject(target)) return null;
+      const readbackHash = await sha256Hex(bytes);
+      this.convergencesThisRound++;
+      checkpoint.baseRemovals.push(intent.sourcePath);
+      checkpoint.baseUpserts.push({
+        path: intent.path,
+        hash: readbackHash,
+        size: bytes.byteLength,
+        eTag: target.eTag,
+      });
+      checkpoint.remoteDeletes.push(intent.sourcePath);
+      checkpoint.remoteUpserts.push(target);
+      return checkpoint;
+    }
     if (intent.expectedRemote.sha256Hash === undefined) {
       // F17: sha-unknown remote rename/move — settle as a plain move on the
       // move anchors (identity checked above, size preserved); the moved
@@ -19790,13 +19958,13 @@ export class SyncExecutor {
       && current.eTag === expected.eTag);
   }
 
-  private async remoteMatchesTarget(
+  /**
+   * Downloads a remote file's bytes, enforcing the size the caller observed.
+   * Null means the readback cannot be trusted as this version's content.
+   */
+  private async downloadRemoteContent(
     remote: RemoteFileEntry,
-    target: { hash: string; size: number },
-    requireReadback = false,
-  ): Promise<boolean> {
-    if (remote.size !== target.size) return false;
-    if (!requireReadback && remote.sha256Hash?.toLowerCase() === target.hash) return true;
+  ): Promise<ArrayBuffer | null> {
     const bytes = await this.onedrive.downloadFile(
       this.vaultName,
       remote.path,
@@ -19804,11 +19972,33 @@ export class SyncExecutor {
       remote.driveId,
       remote.size,
     );
-    if (bytes.byteLength !== target.size || await sha256Hex(bytes) !== target.hash) return false;
+    return bytes.byteLength === remote.size ? bytes : null;
+  }
+
+  /**
+   * Re-inspects the path after a readback and answers whether it is still the
+   * same object (same driveId and eTag). Callers use it to refuse settling on
+   * bytes that may already belong to a newer version.
+   */
+  private async remoteStillSameObject(
+    remote: RemoteFileEntry,
+  ): Promise<boolean> {
     const current = await this.inspectRemotePath(remote.path);
     return Boolean(current
       && current.driveId === remote.driveId
       && current.eTag === remote.eTag);
+  }
+
+  private async remoteMatchesTarget(
+    remote: RemoteFileEntry,
+    target: { hash: string; size: number },
+    requireReadback = false,
+  ): Promise<boolean> {
+    if (remote.size !== target.size) return false;
+    if (!requireReadback && remote.sha256Hash?.toLowerCase() === target.hash) return true;
+    const bytes = await this.downloadRemoteContent(remote);
+    if (!bytes || await sha256Hex(bytes) !== target.hash) return false;
+    return this.remoteStillSameObject(remote);
   }
 
   private async commitMergeLocally(
@@ -19854,7 +20044,13 @@ export class SyncExecutor {
     if (error instanceof LocalVersionChangedBeforeDeleteError) {
       return this.t("syncView.failure.localChangedBeforeDelete");
     }
-    if (error instanceof DownloadRemoteVersionChangedError) {
+    if (
+      error instanceof DownloadRemoteVersionChangedError
+      || error instanceof DownloadedPayloadSizeMismatchError
+      || (isResponseByteBudgetError(error) && error.kind === "observed")
+    ) {
+      // The same physical race ("the remote moved while we were reading it")
+      // has three detection points; they share one user-facing reason.
       return this.t("syncView.failure.remoteChangedDuringDownload");
     }
     if (error instanceof OneDriveError) {
@@ -25373,6 +25569,54 @@ export class SyncExecutor {
     return this.state.commitMutationCheckpoints(operationIds);
   }
 
+  /**
+   * Commit recovery checkpoints with one stale-tree repair attempt.
+   *
+   * A base-upsert rejection means the committed identity tree disagrees with
+   * the facts this recovery just verified against the live service — which a
+   * single full rebuild of the committed tree can legitimately repair when the
+   * tree was merely behind (the committed index advances through incremental
+   * observations and can lag the live facts the verification used). The
+   * reducer's own assertions stay fail-closed: the rebuilt tree is re-checked
+   * by the same commission, and a second rejection is rethrown unchanged so
+   * the record keeps its blocking (2026-10-13, F26 residual §3 — same
+   * read-only repair shape as the upload parent-drift retry).
+   */
+  private async commitRecoveryCheckpointsWithRepair(args: {
+    operationIds: readonly string[];
+    operationEpoch: number | undefined;
+    result: SyncResult | undefined;
+  }): Promise<MutationCheckpointCommitMetrics | undefined> {
+    const commit = () => args.operationIds.length === 1
+      ? this.commitMutationCheckpoint(args.operationIds[0])
+      : this.commitMutationCheckpoints(args.operationIds);
+    try {
+      return await commit();
+    } catch (error) {
+      if (
+        !isV2BaseUpsertRejectionError(error)
+        || args.operationEpoch === undefined
+        || !args.result
+        || !this.activeSyncScope
+      ) throw error;
+      this.diag?.warn(
+        "state",
+        `recovery checkpoint rejected against the committed tree; rebuilding once — ${args.operationIds.join(", ")}`,
+        {
+          operations: args.operationIds.length,
+          error: error instanceof Error ? error.message : String(error),
+          mutations: 0,
+        },
+      );
+      await this.rebuildRemoteStateFromIdentitySnapshot(
+        args.operationEpoch,
+        args.result,
+        this.activeSyncScope,
+      );
+      return await commit();
+    }
+  }
+
   private selectFilesRootDescendants(
     liveItems: DriveItem[],
     filesRootId: string,
@@ -26555,6 +26799,7 @@ export class SyncExecutor {
               const isolated = this.isolatableOrdinaryFileRecovery(
                 error.summary,
                 this.activeSyncScope,
+                { allowManagedConfigPaths: true },
               );
               if (isolated) {
                 isolatedRecoveryRecords = isolated;
@@ -28064,6 +28309,23 @@ function isRetryableMutationRecoveryObservationError(
 function isV2RemoteUpsertParentMismatchError(error: unknown): boolean {
   return error instanceof Error
     && error.message.includes("V2 remote upsert parent does not match path");
+}
+
+/**
+ * The three reducer rejections a committed identity tree can raise against a
+ * recovery checkpoint's base upsert (`file-state-reducer-v2.ts`): the tree has
+ * no node at the path, its node carries a different version, or the path is
+ * held by another anchor. Every one of them is a statement about the committed
+ * tree, so a single full rebuild of that tree is the read-only repair to try
+ * before keeping the record blocked.
+ */
+function isV2BaseUpsertRejectionError(error: unknown): boolean {
+  return error instanceof Error
+    && (
+      error.message.includes("V2 base upsert has no remote file identity")
+      || error.message.includes("V2 base upsert remote version mismatch")
+      || error.message.includes("V2 base upsert would replace another anchor")
+    );
 }
 
 function mutationRecoveryIntentsOverlap(

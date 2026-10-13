@@ -33,6 +33,7 @@ import {
   SyntheticRequestTimeoutError,
   GRAPH_BASE_URL,
   APP_FOLDER_PATHS,
+  type DriveItemVersion,
 } from "./types";
 import {
   firstMissingUploadRange,
@@ -155,13 +156,29 @@ function isSameGraphDriveId(actual: string, expected: string): boolean {
     && actual.toLowerCase() === expected.toLowerCase();
 }
 
-class ResponseByteBudgetError extends OneDriveError {
-  constructor(label: string, maxBytes: number, observedBytes: number) {
+/** Which side of the byte budget was exceeded. "declared" is a standing fact
+ *  (the metadata itself is already over the hard cap — the item can never be
+ *  transferred, so it must stay a hard failure). "observed" means the response
+ *  body came back larger than the declared size: the remote was rewritten
+ *  between the metadata read and the body read (content race), which the
+ *  download layer defers instead of failing the round. */
+export type ResponseByteBudgetKind = "declared" | "observed";
+
+export class ResponseByteBudgetError extends OneDriveError {
+  readonly kind: ResponseByteBudgetKind;
+
+  constructor(
+    label: string,
+    maxBytes: number,
+    observedBytes: number,
+    kind: ResponseByteBudgetKind,
+  ) {
     super(
       OneDriveErrorType.Unknown,
       `${label} exceeds safe download size (${observedBytes} > ${maxBytes})`,
     );
     this.name = "ResponseByteBudgetError";
+    this.kind = kind;
   }
 }
 
@@ -208,6 +225,7 @@ export type OneDriveMetadataReason =
   | "downloadUrlRefresh"
   | "downloadVersionVerify"
   | "contentVerificationRefresh"
+  | "blockedRecoveryVersionHistory"
   | "other";
 
 export interface OneDriveMetadataReasonRunMetrics {
@@ -642,9 +660,36 @@ export class OneDriveClient {
     }
   }
 
+  /** Read the retained version history of one driveItem — read-only forensic
+   *  surface used only to enrich blocked-recovery evidence. Version creation
+   *  and retention are service/configuration dependent (a write may create no
+   *  version at all), so an empty list is a valid answer, never an error;
+   *  `lastModifiedBy` reaches account/application level only, not the device. */
+  async listDriveItemVersionsById(
+    driveItemId: string,
+    metadataReason: OneDriveMetadataReason = "other",
+  ): Promise<DriveItemVersion[]> {
+    try {
+      const response = await this.request(
+        "GET",
+        `/me/drive/items/${encodeURIComponent(driveItemId)}/versions`,
+        undefined,
+        undefined,
+        { metadataReason, expectedNotFound: true },
+      );
+      const body: unknown = response.json;
+      if (!isRecord(body) || !Array.isArray(body.value)) return [];
+      return body.value as DriveItemVersion[];
+    } catch (error) {
+      if (error instanceof OneDriveError && error.type === OneDriveErrorType.NotFound) {
+        return [];
+      }
+      throw error;
+    }
+  }
+
   /** Read up to 20 independent driveItem identities per Graph JSON batch.
-   *  Every sub-response is checked independently; retryable or malformed
-   *  sub-responses fall back through the ordinary single-item GET contract. */
+   *  Every sub-response is checked independently; retryable or malformed   *  sub-responses fall back through the ordinary single-item GET contract. */
   async getDriveItemMetadataByIds(
     driveItemIds: readonly string[],
     metadataReason: OneDriveMetadataReason = "other",
@@ -3779,7 +3824,7 @@ function assertDeclaredRemoteSize(
   label: string,
 ): void {
   if (typeof size === "number" && Number.isFinite(size) && size > maxBytes) {
-    throw new ResponseByteBudgetError(label, maxBytes, size);
+    throw new ResponseByteBudgetError(label, maxBytes, size, "declared");
   }
 }
 
@@ -3789,11 +3834,11 @@ function assertByteBudget(
   label: string,
 ): void {
   if (observedBytes > maxBytes) {
-    throw new ResponseByteBudgetError(label, maxBytes, observedBytes);
+    throw new ResponseByteBudgetError(label, maxBytes, observedBytes, "observed");
   }
 }
 
-function isResponseByteBudgetError(error: unknown): error is ResponseByteBudgetError {
+export function isResponseByteBudgetError(error: unknown): error is ResponseByteBudgetError {
   return error instanceof ResponseByteBudgetError;
 }
 

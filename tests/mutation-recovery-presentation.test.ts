@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { I18n } from "../src/i18n";
 import {
@@ -6,6 +8,7 @@ import {
   mutationRecoveryBodyPresentation,
   mutationRecoveryStatusDetail,
   mutationRecoveryStatusLabel,
+  resolveMoveNoActionHints,
   mutationRecoveryTopStatusLabel,
   mutationRecoveryPrimaryActionKey,
   shouldAutoSettleIdenticalRecovery,
@@ -351,5 +354,42 @@ describe("folder recovery settle exit presentation", () => {
 
   it("keeps honest status without an exit when no settlement is available", () => {
     expect(mutationRecoveryPrimaryActionKey(base)).toBeNull();
+  });
+});
+
+describe("resolveMoveNoActionHints (2026-10-13 field report)", () => {
+  it("states both directions while the cloud still holds the old path", () => {
+    expect(resolveMoveNoActionHints({
+      sourcePath: "无标题 2.md",
+      remoteSourceExists: true,
+    })).toEqual(["keep-local", "keep-remote"]);
+  });
+
+  it("drops the keep-cloud sentence once the cloud already holds the moved name", () => {
+    // The sentence promises the file at the old cloud path and its return to
+    // the old local path; after the rename landed that path is gone, so the
+    // modal must not promise it (the field report read exactly this line).
+    expect(resolveMoveNoActionHints({
+      sourcePath: "无标题 2.md",
+      remoteSourceExists: false,
+    })).toEqual(["keep-local"]);
+  });
+
+  it("renders no move hint without a source path", () => {
+    expect(resolveMoveNoActionHints({
+      sourcePath: null,
+      remoteSourceExists: true,
+    })).toEqual([]);
+  });
+
+  it("keeps the modal wired to the resolver", () => {
+    // No DOM harness exists in this repo, so the render wiring is pinned by
+    // source shape: the modal must ask the resolver instead of rendering both
+    // sentences unconditionally.
+    const modal = readFileSync(
+      path.resolve(__dirname, "../src/ui/mutation-recovery-resolution-modal.ts"),
+      "utf8",
+    );
+    expect(modal).toContain("resolveMoveNoActionHints(");
   });
 });

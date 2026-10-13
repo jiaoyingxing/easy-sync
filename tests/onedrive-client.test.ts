@@ -633,6 +633,9 @@ describe("OneDriveClient.downloadFile", () => {
       3,
     )).rejects.toMatchObject({
       name: "ResponseByteBudgetError",
+      // Body larger than the declared size = the content race the download
+      // layer defers (2026-10-13), not the declared-over-cap hard failure.
+      kind: "observed",
       message: expect.stringContaining("4 > 3"),
     });
     expect(requestSpy).toHaveBeenCalledTimes(1);
@@ -1609,6 +1612,8 @@ describe("OneDriveClient.downloadBaseline", () => {
 
     await expect(client.downloadBaseline("testVault")).rejects.toMatchObject({
       name: "ResponseByteBudgetError",
+      // Declared size over the hard cap is a standing condition, never deferred.
+      kind: "declared",
       message: expect.stringContaining("Cloud baseline"),
     });
     expect(requestSpy).toHaveBeenCalledTimes(1);

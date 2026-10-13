@@ -76,6 +76,23 @@ export function formatV2StorageAuthorityEvidence(
     : `json（${revision}）`;
 }
 
+/**
+ * The generation of the running code, printed next to the manifest version the
+ * header carries. The two come from different files (`main.js` vs
+ * `manifest.json`), so a plugin folder assembled from two installs shows the
+ * split here instead of silently running the older build (2026-10-13 field
+ * report: store-installed 1.5.0 under a 1.5.7 version label).
+ */
+export function formatBuildVersionEvidence(
+  bakedVersion: string | null,
+  manifestVersion: string,
+): string {
+  if (!bakedVersion) return "**代码内版本**: 不可用（本构筑物未注入版本）";
+  return bakedVersion === manifestVersion
+    ? `**代码内版本**: ${bakedVersion}`
+    : `**代码内版本**: ${bakedVersion}（与上方版本号 ${manifestVersion} 不一致——插件文件与版本号可能来自不同安装）`;
+}
+
 export function formatDiagnosticAutomaticSyncSummary(input: {
   intervalMinutes: number;
   paused: boolean;

@@ -208,6 +208,10 @@ describe("settings tab", () => {
     expect(zhCN["settings.autoSyncChangeDelay.disabledDesc"]).toBe(
       "已关闭；本机变化不会自动触发同步。",
     );
+    expect(zhCN["settings.autoSyncOnStartup.name"]).toBe("启动后立即同步");
+    expect(zhCN["settings.autoSyncOnStartup.desc"]).toBe(
+      "打开 Obsidian 后立即触发一次同步。",
+    );
     expect(en["settings.syncInterval.name"]).toBe("Scheduled sync");
     // "min" keeps the 1-minute stop grammatical in English ("every 1 min").
     expect(en["settings.syncInterval.desc"]).toBe(
@@ -1498,16 +1502,16 @@ describe("settings save call sites", () => {
     // C10-5 同形缺口(账本 §七):saveSyncSettings 调用失败时必须回滚内存与控件并
     // 提示，而不是 unhandled rejection 且其后的 apply*/渲染被跳过。
     // 2026-10-12 重构后拆两处承接：命令式路径与模式行留在 settings-tab.ts，
-    // 1.13+ 页面行（通知／滑条×2／自动处理×2／大文件排除／移动端状态图标）在
-    // settings-page-rows.ts。
+    // 1.13+ 页面行（通知／滑条×2／启动后立即同步／自动处理×2／大文件排除／
+    // 移动端状态图标）在 settings-page-rows.ts。
     const tabSource = readFileSync("src/ui/settings-tab.ts", "utf8");
     const rowsSource = readFileSync("src/ui/settings-page-rows.ts", "utf8");
     const count = (text: string, needle: string) => text.split(needle).length - 1;
     expect(count(tabSource, "notice.settingsSaveFailed")).toBe(5);
-    expect(count(rowsSource, "notice.settingsSaveFailed")).toBe(6);
+    expect(count(rowsSource, "notice.settingsSaveFailed")).toBe(7);
     // 回滚语义：控件拨回上一值；自动处理开关按内存现值拨回（同义）。
     expect(count(tabSource, ".setValue(previous)")).toBe(4);
-    expect(count(rowsSource, ".setValue(previous)")).toBe(5);
+    expect(count(rowsSource, ".setValue(previous)")).toBe(6);
     expect(rowsSource).toContain(
       "toggle.setValue(plugin.automaticHandlingPolicy[policyKey]);",
     );

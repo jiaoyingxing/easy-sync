@@ -225,6 +225,8 @@ export interface LocaleStrings {
   "settings.autoSyncChangeDelay.name": string;
   "settings.autoSyncChangeDelay.desc": string;
   "settings.autoSyncChangeDelay.disabledDesc": string;
+  "settings.autoSyncOnStartup.name": string;
+  "settings.autoSyncOnStartup.desc": string;
   "settings.notificationPopups.name": string;
   "settings.notificationPopups.option.all": string;
   "settings.notificationPopups.option.important": string;

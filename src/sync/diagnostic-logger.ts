@@ -48,14 +48,27 @@ const MAX_LOG_DAYS = 7;
 const MAX_LOG_BYTES = 30 * 1024 * 1024;
 const MAX_LOG_FILE_BYTES = 5 * 1024 * 1024;
 const FLUSH_INTERVAL_MS = 5000;
+/**
+ * Backlog cap for entries waiting to reach disk (same order as the memory
+ * ring). Background throttling can stall the flush timer for hours; without
+ * a cap the queue grows without bound and a hard kill loses every pending
+ * line. Oldest entries are dropped first and the drop is reported to disk.
+ */
+export const MAX_PENDING = 5000;
 export class DiagnosticLogger {
   private enabled = new Set<DiagCategory>();
   private buffer: DiagEntry[] = [];
   private pending: DiagEntry[] = [];
+  private pendingDropped = 0;
   private timer: TimeoutHandle | null = null;
+  private flushChain: Promise<void> = Promise.resolve();
   private adapter: DataAdapter | null = null;
   private logDir = getEasySyncPaths(DEFAULT_CONFIG_DIR).logsDir;
   private lastPruneDate: string | null = null;
+  /** Expected on-disk byte size per log path, for the external-rewrite probe. */
+  private expectedBytes = new Map<string, number>();
+  /** Paths already reported by the external-rewrite probe (once per session). */
+  private externalRewriteReported = new Set<string>();
 
   /** Must be called after the Obsidian vault adapter is available. */
   setAdapter(adapter: DataAdapter, configDir: string): void {
@@ -80,23 +93,41 @@ export class DiagnosticLogger {
 
   // ---- Public logging API ----
 
-  log(cat: DiagCategory, msg: string, data?: unknown): void {
+  log(cat: DiagCategory, msg: string, data?: unknown, opts?: { urgent?: boolean }): void {
     if (!this.enabled.has(cat)) return;
-    this.emit({ ts: Date.now(), cat, lvl: "log", msg, data });
+    this.emit({ ts: Date.now(), cat, lvl: "log", msg, data }, opts?.urgent === true);
   }
 
   warn(cat: DiagCategory, msg: string, data?: unknown): void {
-    this.emit({ ts: Date.now(), cat, lvl: "warn", msg, data });
+    this.emit({ ts: Date.now(), cat, lvl: "warn", msg, data }, true);
   }
 
   error(cat: DiagCategory, msg: string, data?: unknown): void {
-    this.emit({ ts: Date.now(), cat, lvl: "error", msg, data });
+    this.emit({ ts: Date.now(), cat, lvl: "error", msg, data }, true);
   }
 
   // ---- Internal ----
 
-  private emit(e: DiagEntry): void {
-    // 1. Console output
+  /** warn/error and explicitly urgent lines reach disk immediately instead of
+   *  waiting for the batch window: a hard kill or a background freeze used to
+   *  swallow the last ≤5s batch whole, including receipt/failure/summary rows
+   *  (F26 2026-10-13). */
+  private emit(e: DiagEntry, urgent = false): void {
+    this.writeToConsole(e);
+    this.pushRing(e);
+    this.pushPending(e);
+    if (urgent) {
+      void this.flush();
+      return;
+    }
+    if (!this.timer) {
+      this.timer = compatSetTimeout(() => {
+        void this.flush();
+      }, FLUSH_INTERVAL_MS);
+    }
+  }
+
+  private writeToConsole(e: DiagEntry): void {
     const ts = new Date(e.ts).toLocaleTimeString();
     const prefix = `[EasySync|${e.cat}]`;
     const line = `${ts} ${prefix} ${e.msg}`;
@@ -110,28 +141,56 @@ export class DiagnosticLogger {
       if (e.data !== undefined) console.debug(line, e.data);
       else console.debug(line);
     }
+  }
 
-    // 2. In-memory ring buffer
+  private pushRing(e: DiagEntry): void {
     this.buffer.push(e);
     if (this.buffer.length > MAX_BUFFER) {
       this.buffer = this.buffer.slice(-MAX_BUFFER);
     }
+  }
 
-    // 3. Queue for batched disk flush
+  /** Queue for the next batch; beyond the cap the oldest entries are dropped
+   *  and the next flush reports the dropped count. */
+  private pushPending(e: DiagEntry): void {
     this.pending.push(e);
-    if (!this.timer) {
-      this.timer = compatSetTimeout(() => {
-        void this.flush();
-      }, FLUSH_INTERVAL_MS);
+    if (this.pending.length > MAX_PENDING) {
+      const overflow = this.pending.length - MAX_PENDING;
+      this.pending.splice(0, overflow);
+      this.pendingDropped += overflow;
     }
   }
 
-  private async flush(): Promise<void> {
+  /** Serialize flushes: an urgent flush must not interleave its append with a
+   *  batch flush writing the same JSONL segment. */
+  private flush(): Promise<void> {
+    this.flushChain = this.flushChain
+      .then(() => this.flushOnce())
+      .catch(() => undefined);
+    return this.flushChain;
+  }
+
+  private async flushOnce(): Promise<void> {
     this.timer = null;
-    if (!this.adapter || this.pending.length === 0) return;
+    if (!this.adapter) return;
 
     const batch = this.pending;
     this.pending = [];
+    if (this.pendingDropped > 0) {
+      const dropped = this.pendingDropped;
+      this.pendingDropped = 0;
+      const notice: DiagEntry = {
+        ts: Date.now(),
+        cat: "lifecycle",
+        lvl: "warn",
+        msg: `diagnostic log backlog overflow — dropped ${dropped} oldest pending ${dropped === 1 ? "entry" : "entries"}`,
+        data: { dropped, limit: MAX_PENDING },
+      };
+      this.writeToConsole(notice);
+      this.pushRing(notice);
+      batch.unshift(notice);
+    }
+    if (batch.length === 0) return;
 
     const today = localDate();
     const text = batch.map((e) => JSON.stringify(e)).join("\n") + "\n";
@@ -142,19 +201,34 @@ export class DiagnosticLogger {
       // Pick the current segment, rolling if the file exceeds the single-file cap
       let seg = 0;
       let path = `${this.logDir}/${today}.jsonl`;
+      let observedSize: number | null = null;
       while (seg < 99) {
         try {
           const st = await this.adapter.stat(path);
-          if (!st || st.size + text.length <= MAX_LOG_FILE_BYTES) break;
-        } catch { break; }
+          if (!st) {
+            observedSize = null;
+            break;
+          }
+          observedSize = st.size;
+          if (st.size + text.length <= MAX_LOG_FILE_BYTES) break;
+        } catch {
+          observedSize = null;
+          break;
+        }
         seg++;
         path = `${this.logDir}/${today}.${seg}.jsonl`;
       }
 
       if (await this.adapter.exists(path)) {
+        const expected = this.expectedBytes.get(path);
+        if (expected !== undefined && observedSize !== null && observedSize !== expected) {
+          this.reportExternalRewrite(path, expected, observedSize);
+        }
         await this.adapter.append(path, text);
+        this.expectedBytes.set(path, (observedSize ?? 0) + text.length);
       } else {
         await this.adapter.write(path, text);
+        this.expectedBytes.set(path, text.length);
       }
       // Prune daily; always run after write to enforce byte limits
       if (this.lastPruneDate !== today) {
@@ -164,6 +238,20 @@ export class DiagnosticLogger {
     } catch {
       // Disk write failed — silently degrade (console + buffer still work)
     }
+  }
+
+  /** This logger only ever grows its own file, so a size that differs from the
+   *  expected one means something outside the plugin rewrote it (external
+   *  vault-level copy/sync — the only way to tell that apart from a lost batch
+   *  at the time it happens). Reported once per path per session because the
+   *  wrong size persists across flushes. */
+  private reportExternalRewrite(path: string, expected: number, observed: number): void {
+    if (this.externalRewriteReported.has(path)) return;
+    this.externalRewriteReported.add(path);
+    this.warn("lifecycle", `diagnostic log file changed outside this plugin — ${path}`, {
+      expectedBytes: expected,
+      observedBytes: observed,
+    });
   }
 
   /** Force flush pending entries to disk. Call on plugin unload. */

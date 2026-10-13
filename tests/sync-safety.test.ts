@@ -34,7 +34,7 @@ import type {
 } from "../src/sync/types";
 import { SyncExecutor } from "../src/sync/sync-executor";
 import type { SyncResult } from "../src/sync/sync-executor";
-import { OneDriveClient } from "../src/onedrive/client";
+import { OneDriveClient, ResponseByteBudgetError } from "../src/onedrive/client";
 import { OneDriveError, OneDriveErrorType, type DriveItem } from "../src/onedrive/types";
 import type { LocalScanner } from "../src/sync/local-scanner";
 import type { PendingIssue } from "../src/sync/types";
@@ -2262,6 +2262,85 @@ describe("M17 circuit breaker retry semantics", () => {
     expect(deferredRows[0].remoteETag).toBe("etag-stuck");
   });
 
+  it("auto sync defers a download whose response body outgrew the declared size", async () => {
+    // 2026-10-13（双轨候选，用户拍板立项）：同一物理竞态「远端在读取期间
+    // 被改写」被尺寸守卫先捕获时，与版本校验一路同规——延后该单项、不暂停
+    // 自动同步；守卫本身（拒绝写入不完整正文）不放宽。
+    const { executor, downloadFile, mockState } = makeBreakerExecutor(
+      "auto",
+      SyncActionType.Download,
+      { issueCode: "transfer-remote-moving", consecutiveFailures: 1 },
+    );
+    downloadFile.mockRejectedValue(
+      new ResponseByteBudgetError('Remote file "stuck.m4a"', 22, 27, "observed"),
+    );
+    const reconcileCalls: PendingIssue[][] = [];
+    mockState.reconcilePendingIssues = vi.fn(async (issues: PendingIssue[]) => {
+      reconcileCalls.push(issues);
+    });
+
+    const result = await executor.run("auto", {});
+
+    expect(result.errors).toBe(0);
+    expect(result.deferred).toBe(1);
+    expect(result.success).toBe(true);
+    const deferredRows = reconcileCalls.at(-1)?.filter(
+      (issue) => issue.path === "stuck.m4a",
+    ) ?? [];
+    expect(deferredRows).toHaveLength(1);
+    expect(deferredRows[0].issueCode).toBe("transfer-remote-moving");
+    expect(deferredRows[0].reason).toBe("syncView.failure.remoteChangedDuringDownload");
+  });
+
+  it("auto sync defers a completed download whose size no longer matches the declaration", async () => {
+    const { executor, downloadFile, mockState } = makeBreakerExecutor(
+      "auto",
+      SyncActionType.Download,
+      { issueCode: "transfer-remote-moving", consecutiveFailures: 1 },
+    );
+    // The remote declared 3 bytes; the body that arrived has 5 (rewritten
+    // between the metadata read and the body read).
+    downloadFile.mockResolvedValue(new Uint8Array([1, 2, 3, 4, 5]).buffer);
+    const reconcileCalls: PendingIssue[][] = [];
+    mockState.reconcilePendingIssues = vi.fn(async (issues: PendingIssue[]) => {
+      reconcileCalls.push(issues);
+    });
+
+    const result = await executor.run("auto", {});
+
+    expect(result.errors).toBe(0);
+    expect(result.deferred).toBe(1);
+    expect(result.success).toBe(true);
+    const deferredRows = reconcileCalls.at(-1)?.filter(
+      (issue) => issue.path === "stuck.m4a",
+    ) ?? [];
+    expect(deferredRows[0]?.issueCode).toBe("transfer-remote-moving");
+  });
+
+  it("keeps a declared size over the hard cap a hard failure", async () => {
+    // 反例护栏：声明尺寸本身超硬上限是恒久条件（这个文件永远传不了），
+    // 不得被并进「瞬时延后」通道藏成永久延后。
+    const { executor, downloadFile } = makeBreakerExecutor(
+      "auto",
+      SyncActionType.Download,
+      { issueCode: "transfer-remote-moving", consecutiveFailures: 1 },
+    );
+    downloadFile.mockRejectedValue(
+      new ResponseByteBudgetError(
+        'Remote file "stuck.m4a"',
+        2 * 1024 * 1024 * 1024,
+        2 * 1024 * 1024 * 1024 + 1,
+        "declared",
+      ),
+    );
+
+    const result = await executor.run("auto", {});
+
+    expect(result.errors).toBe(1);
+    expect(result.deferred).toBe(0);
+    expect(result.success).toBe(false);
+  });
+
   it("auto sync backs off a remote-moving file even after its version changed", async () => {
     // 版本已前移（versionMatched 不成立）但退避窗口仍活着 → 熔断按
     // transfer-remote-moving 计时臂接管，每窗口一次真实尝试。
@@ -3344,7 +3423,7 @@ describe("Download integrity gate", () => {
     }
   }
 
-  it("rejects a truncated in-memory response before replacing the local file", async () => {
+  it("defers a truncated in-memory response instead of replacing the local file", async () => {
     const result = await runIntegrityCase({
       remote: {
         path: "note.bin",
@@ -3357,12 +3436,24 @@ describe("Download integrity gate", () => {
       content: new Uint8Array([1, 2, 3]).buffer,
     });
 
-    expect(result.result.errors).toBe(1);
+    // 2026-10-13（双轨候选，用户拍板立项）：正文尺寸与声明不符＝同一物理
+    // 竞态的尺寸检测点，按瞬时延后处理（不写入、不落回执），不再是整轮失败。
+    expect(result.result.errors).toBe(0);
+    expect(result.result.deferred).toBe(1);
     expect(result.writeBinary).not.toHaveBeenCalled();
     expect(result.state.recordMutationReceipt).not.toHaveBeenCalled();
+    expect(result.state.reconcilePendingIssues).toHaveBeenCalledWith(
+      [expect.objectContaining({
+        path: "note.bin",
+        actionType: SyncActionType.Download,
+        reason: "syncView.failure.remoteChangedDuringDownload",
+        issueCode: "transfer-remote-moving",
+      })],
+      new Set(),
+    );
   });
 
-  it("rejects a 200 requestUrl fallback error body before replacing the local file", async () => {
+  it("defers a 200 requestUrl fallback error body instead of replacing the local file", async () => {
     const errorBody = new TextEncoder().encode('{"error":"quota exceeded"}').buffer;
     const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
       status: 200,
@@ -3387,7 +3478,8 @@ describe("Download integrity gate", () => {
       });
 
       expect(requestSpy).toHaveBeenCalled();
-      expect(result.result.errors).toBe(1);
+      expect(result.result.errors).toBe(0);
+      expect(result.result.deferred).toBe(1);
       expect(result.writeBinary).not.toHaveBeenCalled();
     } finally {
       requestSpy.mockRestore();
@@ -3453,7 +3545,7 @@ describe("Download integrity gate", () => {
     );
   });
 
-  it("rejects a truncated streamed response and removes its temp file", async () => {
+  it("defers a truncated streamed response and removes its temp file", async () => {
     const size = 9 * 1024 * 1024;
     const result = await runStreamIntegrityCase({
       remote: {
@@ -3469,7 +3561,9 @@ describe("Download integrity gate", () => {
       tempContent: new ArrayBuffer(0),
     });
 
-    expect(result.result.errors).toBe(1);
+    // 尺寸类竞态并入延后通道；"不落半个文件"不变：临时件照删、不重命名。
+    expect(result.result.errors).toBe(0);
+    expect(result.result.deferred).toBe(1);
     expect(result.rename).not.toHaveBeenCalled();
     expect(result.remove).toHaveBeenCalledWith(
       `${EASY_SYNC_TMP_DIR}/downloads/large.bin.part`,
@@ -6901,6 +6995,673 @@ describe("Persistent remote delta state", () => {
     });
   });
 
+  describe("unreceipted upload settled from remote readback (C1, 2026-10-13)", () => {
+    async function runC1Recovery(options: {
+      intendedBytes: ArrayBuffer;
+      localBytes: ArrayBuffer;
+      expectedRemoteDriveId?: string;
+      liveDriveId?: string;
+      downloadedBytes?: ArrayBuffer | null;
+      oldIdAlive?: boolean;
+      sourcePath?: string;
+      observationOnly?: boolean;
+      localEntryOmitted?: boolean;
+      readbackETagDrift?: boolean;
+    }) {
+      const activeScope: SyncScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+      const intendedHash = await sha256Hex(options.intendedBytes);
+      const localHash = await sha256Hex(options.localBytes);
+      const liveDriveId = options.liveDriveId
+        ?? options.expectedRemoteDriveId
+        ?? "uploaded-note";
+      const remoteBytes = options.downloadedBytes ?? options.intendedBytes;
+      const remote: RemoteFileEntry = {
+        path: "note.md",
+        driveId: liveDriveId,
+        parentId: activeScope.filesRootId,
+        size: remoteBytes?.byteLength ?? 0,
+        mtime: 3,
+        eTag: "etag-uploaded",
+        cTag: "ctag-uploaded",
+        sha256Hash: intendedHash,
+      };
+      const local: LocalFileEntry = {
+        path: remote.path,
+        hash: localHash,
+        size: options.localBytes.byteLength,
+        mtime: 9,
+        binary: false,
+      };
+      const state = makeActiveV2State([remote], [], {
+        mutationLedger: [{
+          intent: {
+            version: 1 as const,
+            operationId: "op-c1-upload",
+            planRevision: 1,
+            scope: activeScope,
+            action: "upload" as const,
+            path: remote.path,
+            expectedLocal: {
+              exists: true as const,
+              hash: intendedHash,
+              size: options.intendedBytes.byteLength,
+            },
+            expectedRemote: options.expectedRemoteDriveId
+              ? {
+                exists: true as const,
+                driveId: options.expectedRemoteDriveId,
+                eTag: "etag-old",
+                size: options.intendedBytes.byteLength,
+                sha256Hash: intendedHash,
+              }
+              : { exists: false as const },
+            ...(options.sourcePath ? { sourcePath: options.sourcePath } : {}),
+            createdAt: 1,
+          },
+          receipt: null,
+        }],
+      });
+      vi.mocked(state.retireMutationCheckpointIfReflected).mockResolvedValue(false);
+      let readbackDone = false;
+      const downloadFile = vi.fn().mockImplementation(async () => {
+        readbackDone = true;
+        return options.downloadedBytes === null
+          ? new ArrayBuffer(0)
+          : options.downloadedBytes ?? options.intendedBytes;
+      });
+      const executor = new SyncExecutor(
+        makeMockOneDrive({
+          downloadFile,
+          // 回读复检的漂移装置：下载真的发生之后，再读到的 eTag 已不同源。
+          getFileMetadata: vi.fn().mockImplementation(async () =>
+            options.readbackETagDrift && readbackDone
+              ? { ...remote, eTag: "etag-uploaded-again" }
+              : remote),
+          getDriveItemMetadataById: vi.fn().mockResolvedValue(
+            options.oldIdAlive
+              ? { id: options.expectedRemoteDriveId }
+              : null,
+          ),
+        }),
+        Object.assign(emptyScanner(), {
+          // localEntryOmitted＝「文件在、但读不出内容」的检查面。
+          inspectFile: vi.fn().mockResolvedValue(
+            options.localEntryOmitted
+              ? { status: "present" }
+              : { status: "present", entry: local },
+          ),
+        }),
+        state,
+        "testVault",
+      );
+      let summary: MutationRecoveryRunSummary;
+      try {
+        summary = await (executor as unknown as {
+          recoverMutationLedger(
+            scope: SyncScope,
+            metrics?: unknown,
+            epoch?: unknown,
+            observationOnly?: boolean,
+          ): Promise<MutationRecoveryRunSummary>;
+        }).recoverMutationLedger(
+          activeScope,
+          undefined,
+          undefined,
+          options.observationOnly === true,
+        );
+      } catch (error) {
+        // A record that stays blocked makes the recovery pass throw; the
+        // summary it carries is what the caller adjudicates on.
+        if (!(error instanceof Error) || error.name !== "MutationRecoveryBlockedError") {
+          throw error;
+        }
+        summary = (error as unknown as { summary: MutationRecoveryRunSummary }).summary;
+      }
+      return { summary, state, downloadFile };
+    }
+
+    async function runC1MixedRecovery() {
+      // 两记录同账本：note.md＝C1 可结算形态，other.md＝远端已变（C1b 形态）。
+      const activeScope: SyncScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+      const intendedBytes = new Uint8Array([1, 2, 3]).buffer;
+      const intendedHash = await sha256Hex(intendedBytes);
+      const localBytes = new Uint8Array([4, 5, 6, 7]).buffer;
+      const localHash = await sha256Hex(localBytes);
+      const driftedBytes = new Uint8Array([7, 7, 7, 7]).buffer;
+      const remoteFor = (
+        path: string,
+        driveId: string,
+        size: number,
+      ): RemoteFileEntry => ({
+        path,
+        driveId,
+        parentId: activeScope.filesRootId,
+        size,
+        mtime: 3,
+        eTag: `${driveId}-etag`,
+        cTag: `${driveId}-ctag`,
+        sha256Hash: intendedHash,
+      });
+      const settleRemote = remoteFor("note.md", "uploaded-note", intendedBytes.byteLength);
+      const movedOnRemote = remoteFor("other.md", "uploaded-other", driftedBytes.byteLength);
+      const recordFor = (operationId: string, path: string, driveId: string | null) => ({
+        intent: {
+          version: 1 as const,
+          operationId,
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload" as const,
+          path,
+          expectedLocal: {
+            exists: true as const,
+            hash: intendedHash,
+            size: intendedBytes.byteLength,
+          },
+          expectedRemote: driveId
+            ? {
+              exists: true as const,
+              driveId,
+              eTag: "etag-old",
+              size: intendedBytes.byteLength,
+              sha256Hash: intendedHash,
+            }
+            : { exists: false as const },
+          createdAt: 1,
+        },
+        receipt: null,
+      });
+      const state = makeActiveV2State([settleRemote, movedOnRemote], [], {
+        mutationLedger: [
+          recordFor("op-c1-settles", "note.md", null),
+          recordFor("op-c1b-stays", "other.md", "uploaded-other"),
+        ],
+      });
+      vi.mocked(state.retireMutationCheckpointIfReflected).mockResolvedValue(false);
+      const executor = new SyncExecutor(
+        makeMockOneDrive({
+          downloadFile: vi.fn().mockImplementation(async (_v: string, path: string) =>
+            path === "note.md" ? intendedBytes : driftedBytes),
+          getFileMetadata: vi.fn().mockImplementation(async (_v: string, path: string) =>
+            path === "note.md" ? settleRemote : movedOnRemote),
+          getDriveItemMetadataById: vi.fn().mockResolvedValue(null),
+        }),
+        Object.assign(emptyScanner(), {
+          inspectFile: vi.fn().mockImplementation(async (path: string) => ({
+            status: "present",
+            entry: {
+              path,
+              hash: localHash,
+              size: localBytes.byteLength,
+              mtime: 9,
+              binary: false,
+            } as LocalFileEntry,
+          })),
+        }),
+        state,
+        "testVault",
+      );
+      let summary: MutationRecoveryRunSummary;
+      try {
+        summary = await (executor as unknown as {
+          recoverMutationLedger(scope: SyncScope): Promise<MutationRecoveryRunSummary>;
+        }).recoverMutationLedger(activeScope);
+      } catch (error) {
+        if (!(error instanceof Error) || error.name !== "MutationRecoveryBlockedError") {
+          throw error;
+        }
+        summary = (error as unknown as { summary: MutationRecoveryRunSummary }).summary;
+      }
+      return { summary, state, intendedHash };
+    }
+
+    it("settles the record when the remote still holds exactly the intended version", async () => {
+      // 同形标本（C1）：上传已落地但回执丢失，本机随后又被改写；远端仍原样
+      // 驻留所传版本 ⇒ 零写入结算，基线取所传版本（不是更新后的本机字节）。
+      const intendedBytes = new Uint8Array([1, 2, 3]).buffer;
+      const intendedHash = await sha256Hex(intendedBytes);
+      const { summary, state, downloadFile } = await runC1Recovery({
+        intendedBytes,
+        localBytes: new Uint8Array([4, 5, 6, 7]).buffer,
+      });
+
+      expect(summary).toMatchObject({ state: "settled", settled: 1, remaining: 0 });
+      expect(state.mutationLedger).toEqual([]);
+      expect(state.baseSnapshot).toEqual([
+        expect.objectContaining({
+          path: "note.md",
+          hash: intendedHash,
+          size: intendedBytes.byteLength,
+          eTag: "etag-uploaded",
+        }),
+      ]);
+      // 强制回读确实发生（比对的是下载到的字节，不是索引里的陈旧哈希）。
+      expect(downloadFile).toHaveBeenCalledTimes(1);
+    });
+
+    it("settles the overwrite shape too when the identity is still the same item", async () => {
+      const intendedBytes = new Uint8Array([1, 2, 3]).buffer;
+      const { summary, state } = await runC1Recovery({
+        intendedBytes,
+        localBytes: new Uint8Array([4, 5, 6, 7]).buffer,
+        expectedRemoteDriveId: "uploaded-note",
+      });
+
+      expect(summary).toMatchObject({ state: "settled", settled: 1 });
+      expect(state.mutationLedger).toEqual([]);
+    });
+
+    it("keeps the record fail-closed when the remote moved on as well", async () => {
+      // C1b 形态（两侧都已变）：明确不做——记录保留、不结算。
+      const { summary, state } = await runC1Recovery({
+        intendedBytes: new Uint8Array([1, 2, 3]).buffer,
+        localBytes: new Uint8Array([4, 5, 6, 7]).buffer,
+        downloadedBytes: new Uint8Array([7, 7, 7]).buffer,
+      });
+
+      expect(summary.state).not.toBe("settled");
+      expect(state.mutationLedger.map((record) => record.intent.operationId))
+        .toEqual(["op-c1-upload"]);
+    });
+
+    it("keeps the record fail-closed when the remote identity was replaced", async () => {
+      // 路径下的对象被删后重建（driveId 变了）：内容相等也不构成"我们那次
+      // 写成功"的证据——不结算，且连强制回读都不发生（先校验身份）。
+      const { summary, state, downloadFile } = await runC1Recovery({
+        intendedBytes: new Uint8Array([1, 2, 3]).buffer,
+        localBytes: new Uint8Array([4, 5, 6, 7]).buffer,
+        expectedRemoteDriveId: "old-uploaded-note",
+        liveDriveId: "recreated-note",
+        oldIdAlive: false,
+      });
+
+      expect(summary.state).not.toBe("settled");
+      expect(state.mutationLedger.map((record) => record.intent.operationId))
+        .toEqual(["op-c1-upload"]);
+      expect(downloadFile).not.toHaveBeenCalled();
+    });
+
+    it("keeps a sourcePath upload fail-closed when the local file moved on", async () => {
+      // sourcePath 变体（复制式上传）有额外源侧交付面，本次证据门不覆盖它：
+      // 本机已改写 ⇒ 不采纳、不结算、记录保留（形状门前提）。
+      const { summary, state } = await runC1Recovery({
+        intendedBytes: new Uint8Array([1, 2, 3]).buffer,
+        localBytes: new Uint8Array([4, 5, 6, 7]).buffer,
+        sourcePath: "copy-source.md",
+      });
+
+      expect(summary.state).not.toBe("settled");
+      expect(state.mutationLedger.map((record) => record.intent.operationId))
+        .toEqual(["op-c1-upload"]);
+    });
+
+    it("settles during a reset-preflight observation round (zero-write)", async () => {
+      // 观察轮（重置预检／B4 复探）照常可结算：C1 是零写入收敛、不依赖任何
+      // 本机恢复写入；若在这里被拦下，重置会被无谓推入强制档。
+      const intendedBytes = new Uint8Array([1, 2, 3]).buffer;
+      const { summary, state } = await runC1Recovery({
+        intendedBytes,
+        localBytes: new Uint8Array([4, 5, 6, 7]).buffer,
+        observationOnly: true,
+      });
+
+      expect(summary).toMatchObject({ state: "settled", settled: 1, remaining: 0 });
+      expect(state.mutationLedger).toEqual([]);
+    });
+
+    it("keeps the record fail-closed when the recorded object moved elsewhere and is still alive (drift)", async () => {
+      // 记录指向的对象被挪走（路径下换了别的对象），而原对象仍在别处存活：
+      // 这是一次漂移，不是"我们那次写成功"——内容相同也不采纳、不结算。
+      const intendedBytes = new Uint8Array([1, 2, 3]).buffer;
+      const { summary, state } = await runC1Recovery({
+        intendedBytes,
+        localBytes: intendedBytes,
+        expectedRemoteDriveId: "old-uploaded-note",
+        liveDriveId: "recreated-note",
+        oldIdAlive: true,
+      });
+
+      expect(summary.state).not.toBe("settled");
+      expect(state.mutationLedger.map((record) => record.intent.operationId))
+        .toEqual(["op-c1-upload"]);
+    });
+
+    it("keeps a present inspection without content facts fail-closed", async () => {
+      // 「文件在、但读不出内容」没有可比较的事实面，不能按"本机已改写"来
+      // 采纳——保持 fail-closed，记录保留。
+      const intendedBytes = new Uint8Array([1, 2, 3]).buffer;
+      const { summary, state, downloadFile } = await runC1Recovery({
+        intendedBytes,
+        localBytes: new Uint8Array([4, 5, 6, 7]).buffer,
+        localEntryOmitted: true,
+      });
+
+      expect(summary.state).not.toBe("settled");
+      expect(state.mutationLedger.map((record) => record.intent.operationId))
+        .toEqual(["op-c1-upload"]);
+      expect(downloadFile).not.toHaveBeenCalled();
+    });
+
+    it("keeps the record fail-closed when the remote changes again after the readback (eTag drift)", async () => {
+      // 回读到的字节虽然相符，但回读之后那个对象又变了一次（eTag 已不同源）：
+      // "刚读到的字节"不能当结算依据。
+      const intendedBytes = new Uint8Array([1, 2, 3]).buffer;
+      const { summary, state } = await runC1Recovery({
+        intendedBytes,
+        localBytes: new Uint8Array([4, 5, 6, 7]).buffer,
+        readbackETagDrift: true,
+      });
+
+      expect(summary.state).not.toBe("settled");
+      expect(state.mutationLedger.map((record) => record.intent.operationId))
+        .toEqual(["op-c1-upload"]);
+    });
+
+    it("settles one C1 record independently in a multi-record ledger", async () => {
+      // 多记录账本：能证落地的那条先行零写入结算，另一条（远端也变过）原样
+      // 保留——结算不因同账本还有其他阻塞记录而整体回退，也不连带它。
+      const { summary, state, intendedHash } = await runC1MixedRecovery();
+
+      expect(summary).toMatchObject({ state: "blocked", settled: 1, remaining: 1 });
+      expect(state.mutationLedger.map((record) => record.intent.operationId))
+        .toEqual(["op-c1b-stays"]);
+      expect(state.baseSnapshot).toEqual([
+        expect.objectContaining({
+          path: "note.md",
+          hash: intendedHash,
+          size: 3,
+          eTag: "uploaded-note-etag",
+        }),
+      ]);
+    });
+  });
+
+  describe("receipted upload verification keeps content-less local inspections fail-closed (F26 item ③, 2026-10-13)", () => {
+    async function runReceiptCheck(options: { localEntry: LocalFileEntry | null }) {
+      const activeScope: SyncScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+      const uploadedBytes = new Uint8Array([1, 2, 3]).buffer;
+      const uploadedHash = await sha256Hex(uploadedBytes);
+      const remote: RemoteFileEntry = {
+        path: "note.md",
+        driveId: "uploaded-note",
+        parentId: activeScope.filesRootId,
+        size: uploadedBytes.byteLength,
+        mtime: 3,
+        eTag: "etag-uploaded",
+        cTag: "ctag-uploaded",
+        sha256Hash: uploadedHash,
+      };
+      const base: BaseFileEntry = {
+        path: "note.md",
+        hash: uploadedHash,
+        size: uploadedBytes.byteLength,
+        eTag: "etag-uploaded",
+      };
+      const record = {
+        intent: {
+          version: 1 as const,
+          operationId: "op-receipted-upload",
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload" as const,
+          path: "note.md",
+          expectedLocal: {
+            exists: true as const,
+            hash: uploadedHash,
+            size: uploadedBytes.byteLength,
+          },
+          expectedRemote: {
+            exists: true as const,
+            driveId: "uploaded-note",
+            eTag: "etag-uploaded",
+            size: uploadedBytes.byteLength,
+            sha256Hash: uploadedHash,
+          },
+          createdAt: 1,
+        },
+        receipt: {
+          version: 1 as const,
+          operationId: "op-receipted-upload",
+          completedAt: 1,
+          checkpoint: {
+            baseUpserts: [base],
+            remoteUpserts: [remote],
+            baseRemovals: [],
+            remoteDeletes: [],
+            pendingDeleteRemovals: [],
+          },
+        },
+      };
+      const state = makeActiveV2State([remote], [base], {
+        mutationLedger: [record],
+      });
+      const executor = new SyncExecutor(
+        makeMockOneDrive({
+          getFileMetadata: vi.fn().mockResolvedValue(remote),
+        }),
+        Object.assign(emptyScanner(), {
+          inspectFile: vi.fn().mockResolvedValue(
+            options.localEntry
+              ? { status: "present", entry: options.localEntry }
+              : { status: "present" },
+          ),
+        }),
+        state,
+        "testVault",
+      );
+      const matches = await (executor as unknown as {
+        verifyMutationReceipt(record: MutationLedgerEntryV1): Promise<boolean>;
+      }).verifyMutationReceipt(record as unknown as MutationLedgerEntryV1);
+      return { matches };
+    }
+
+    it("settles a receipted upload after the local file was rewritten (contrast)", async () => {
+      // 回执自带的那一版已在云端落地、本机随后被改写：按回执版本结算，本机
+      // 新内容交下一轮。与下一条同装置，证明本装置确实走到该结算出口。
+      const rewritten: LocalFileEntry = {
+        path: "note.md",
+        hash: await sha256Hex(new Uint8Array([4, 5, 6, 7]).buffer),
+        size: 4,
+        mtime: 9,
+        binary: false,
+      };
+      const { matches } = await runReceiptCheck({ localEntry: rewritten });
+
+      expect(matches).toBe(true);
+    });
+
+    it("keeps a present local inspection without content facts fail-closed", async () => {
+      // 「文件在、但读不出内容」没有可比较的事实面，不能按"本机已改写"
+      // 结算——保持 fail-closed（2026-10-13 复核⑥）。
+      const { matches } = await runReceiptCheck({ localEntry: null });
+
+      expect(matches).toBe(false);
+    });
+  });
+
+  describe("managed-config and self-sync recoveries isolate instead of freezing the vault (2026-10-13 B1)", () => {
+    async function runBlockedUploadRound(options: {
+      path: string;
+      runOptions?: Record<string, unknown>;
+      extraRecordPath?: string;
+      action?: "upload" | "deleteLocal";
+    }) {
+      const activeScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+      const expectedHash = "aa".repeat(32);
+      const remoteEntry: RemoteFileEntry = {
+        path: options.path,
+        driveId: "remote-old-id",
+        parentId: activeScope.filesRootId,
+        size: 3,
+        mtime: 1,
+        eTag: "etag-old",
+        cTag: "ctag-old",
+        sha256Hash: expectedHash,
+      };
+      const recordFor = (path: string, operationId: string) => ({
+        intent: {
+          version: 1 as const,
+          operationId,
+          planRevision: 1,
+          scope: activeScope,
+          action: (options.action ?? "upload") as "upload" | "deleteLocal",
+          path,
+          expectedLocal: { exists: true as const, hash: expectedHash, size: 3 },
+          expectedRemote: {
+            exists: true as const,
+            driveId: "remote-old-id",
+            eTag: "etag-old",
+            size: 3,
+            sha256Hash: expectedHash,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      });
+      const state = makeActiveV2State([], [], {
+        mutationLedger: [
+          recordFor(options.path, "op-config-stuck"),
+          ...(options.extraRecordPath
+            ? [recordFor(options.extraRecordPath, "op-config-stuck-2")]
+            : []),
+        ],
+      });
+      const local: LocalFileEntry = {
+        path: options.path,
+        hash: "bb".repeat(32),
+        size: 3,
+        mtime: 2,
+        binary: false,
+      };
+      const executor = new SyncExecutor(
+        makeMockOneDrive({
+          // The live remote moved on after the intent, so neither the local
+          // gate nor the remote gate can settle the record (F26 shape).
+          getFileMetadata: vi.fn().mockResolvedValue({
+            driveId: "remote-old-id",
+            parentId: activeScope.filesRootId,
+            size: 3,
+            mtime: 5,
+            eTag: "etag-new",
+          }),
+        }),
+        {
+          vault: {
+            adapter: makeMockAdapter({
+              readBinary: vi.fn().mockResolvedValue(new Uint8Array([1, 2, 3]).buffer),
+            }),
+            getFiles: vi.fn().mockReturnValue([]),
+            getName: vi.fn().mockReturnValue("testVault"),
+          },
+          scanAll: vi.fn().mockResolvedValue({
+            entries: [local],
+            folders: [],
+            folderScanComplete: true,
+            skippedLarge: [],
+            failedPaths: [],
+            skippedCount: 0,
+            complete: true,
+          }),
+          inspectFile: vi.fn().mockImplementation(async (path: string) => ({
+            status: "present",
+            entry: { ...local, path },
+          })),
+          shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+          shouldSyncPath: vi.fn().mockReturnValue(true),
+        } as unknown as LocalScanner,
+        state,
+        "testVault",
+        { t: (key: string) => key } as I18n,
+      );
+      const result = await executor.run(
+        "manual",
+        {},
+        false,
+        undefined,
+        options.runOptions ?? {},
+      );
+      return { result, state };
+    }
+
+    it("isolates a blocked record on the plugin's own artifact instead of freezing the vault", async () => {
+      const { result, state } = await runBlockedUploadRound({
+        path: ".obsidian/plugins/easy-sync/main.js",
+      });
+
+      expect(result.mutationRecovery).toMatchObject({
+        state: "blocked",
+        blockReason: "facts-changed",
+        isolated: true,
+      });
+      // 记录原样保留（隔离不删不猜），整库其余决策不再被它挡下。
+      expect(state.mutationLedger.map((record) => record.intent.operationId))
+        .toEqual(["op-config-stuck"]);
+      expect(result.errors).toBe(0);
+    });
+
+    it("isolates a blocked record on a managed config path", async () => {
+      const { result } = await runBlockedUploadRound({ path: ".obsidian/app.json" });
+
+      expect(result.mutationRecovery).toMatchObject({
+        state: "blocked",
+        isolated: true,
+      });
+    });
+
+    it("keeps the strict set for the reset-preflight observation", async () => {
+      // 重置预检用同一分类器判「能否按隔离胶囊保全证据」；本刀明确不放宽
+      // 该链（重置闸门保持不变），否则重置会从 forced 档静默变普通档。
+      const { result } = await runBlockedUploadRound({
+        path: ".obsidian/plugins/easy-sync/main.js",
+        runOptions: { recoveryOnly: true, mutationRecoveryObservationOnly: true },
+      });
+
+      expect(result.mutationRecovery?.isolated).not.toBe(true);
+      // 端到端判定的输入面：main.ts 只有拿到「blocked＋isolated === true＋
+      // facts-changed＋blockedOperationId 命中在册记录」才走隔离胶囊档；这里
+      // 没有 isolated，该记录必然落强制重置确认档——重置闸门不因 B1 静默放宽。
+      expect(result.mutationRecovery).toMatchObject({
+        state: "blocked",
+        blockReason: "facts-changed",
+        blockedOperationId: "op-config-stuck",
+        remaining: 1,
+      });
+    });
+
+    it("still refuses to isolate a record on another plugin's managed path", async () => {
+      const { result } = await runBlockedUploadRound({
+        path: ".obsidian/plugins/other-plugin/main.js",
+      });
+
+      expect(result.mutationRecovery?.isolated).not.toBe(true);
+    });
+
+    it("keeps a mixed ledger non-isolated when any record stays outside the widened set", async () => {
+      // 放宽是逐记录合取：账本里只要有一条范围外路径的记录，整体仍按原
+      // 行为（整库暂停），不出现"半数隔离"的中间态。
+      const { result } = await runBlockedUploadRound({
+        path: ".obsidian/plugins/easy-sync/main.js",
+        extraRecordPath: ".obsidian/plugins/other-plugin/main.js",
+      });
+
+      expect(result.mutationRecovery?.isolated).not.toBe(true);
+    });
+
+    it("keeps a delete-type record non-isolated when its block reason is outside the isolation gate", async () => {
+      // 放宽只作用于事实门（facts-changed）这一种阻塞——既有隔离门的要求；
+      // 删除类记录走别的阻塞原因时维持原行为（整库暂停、零删除、记录保留）。
+      const { result, state } = await runBlockedUploadRound({
+        path: ".obsidian/plugins/easy-sync/main.js",
+        action: "deleteLocal",
+      });
+
+      expect(result.mutationRecovery?.state).toBe("blocked");
+      expect(result.mutationRecovery?.isolated).not.toBe(true);
+      expect(state.mutationLedger.map((record) => record.intent.operationId))
+        .toEqual(["op-config-stuck"]);
+      expect(result.deleted).toBe(0);
+    });
+  });
+
   it("rebuilds a capsule-shaped state without leaking either path of the retained remote identity", async () => {
     const baseHash = "aa".repeat(32);
     const localHash = "bb".repeat(32);
@@ -9191,6 +9952,451 @@ describe("Persistent remote delta state", () => {
         expect(retire).not.toHaveBeenCalled();
       }
       expect(state.mutationLedger).toHaveLength(1);
+    },
+  );
+
+  it("settles a receipted upload after the local file moved on, keeping the receipt's version as the base", async () => {
+    const uploadedContent = new Uint8Array([1, 2, 3]).buffer;
+    const uploadedHash = await sha256Hex(uploadedContent);
+    const currentContent = new Uint8Array([4, 5, 6, 7]).buffer;
+    const currentHash = await sha256Hex(currentContent);
+    const activeScope: SyncScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const remote: RemoteFileEntry = {
+      path: "note.md",
+      driveId: "uploaded-note",
+      parentId: activeScope.filesRootId,
+      size: uploadedContent.byteLength,
+      mtime: 3,
+      eTag: "etag-uploaded",
+      cTag: "ctag-uploaded",
+      sha256Hash: uploadedHash,
+    };
+    // A client data file rewritten right after the upload landed: the local
+    // content is no longer the uploaded version.
+    const local: LocalFileEntry = {
+      path: remote.path,
+      hash: currentHash,
+      size: currentContent.byteLength,
+      mtime: 9,
+      binary: false,
+    };
+    const state = makeActiveV2State([remote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-hot-upload",
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload",
+          path: remote.path,
+          expectedLocal: {
+            exists: true,
+            hash: uploadedHash,
+            size: uploadedContent.byteLength,
+          },
+          expectedRemote: { exists: false },
+          createdAt: 1,
+        },
+        receipt: {
+          version: 1,
+          operationId: "op-hot-upload",
+          completedAt: 2,
+          checkpoint: {
+            baseUpserts: [{
+              path: remote.path,
+              hash: uploadedHash,
+              size: uploadedContent.byteLength,
+              eTag: remote.eTag,
+            }],
+            baseRemovals: [],
+            remoteUpserts: [remote],
+            remoteDeletes: [],
+            pendingConflictRemovals: [],
+            pendingDeleteRemovals: [],
+          },
+        },
+      }],
+    });
+    vi.mocked(state.retireMutationCheckpointIfReflected).mockResolvedValue(false);
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getFileMetadata: vi.fn().mockResolvedValue(remote),
+      }),
+      Object.assign(emptyScanner(), {
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+      }),
+      state,
+      "testVault",
+    );
+
+    await expect((executor as unknown as {
+      recoverMutationLedger(scope: SyncScope): Promise<MutationRecoveryRunSummary>;
+    }).recoverMutationLedger(activeScope)).resolves.toMatchObject({
+      state: "settled",
+      settled: 1,
+      remaining: 0,
+    });
+
+    expect(state.mutationLedger).toEqual([]);
+    expect(state.commitMutationCheckpoint).toHaveBeenCalledWith("op-hot-upload");
+    // The settled base is the version the upload actually wrote — never the
+    // newer local bytes: pairing the base with the current local content would
+    // corrupt every later three-way comparison.
+    expect(state.baseSnapshot).toEqual([
+      expect.objectContaining({
+        path: remote.path,
+        hash: uploadedHash,
+        size: uploadedContent.byteLength,
+        eTag: remote.eTag,
+      }),
+    ]);
+  });
+
+  it("settles the same rewritten receipted upload during the reset preflight (observation-only)", async () => {
+    const uploadedContent = new Uint8Array([1, 2, 3]).buffer;
+    const uploadedHash = await sha256Hex(uploadedContent);
+    const activeScope: SyncScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const remote: RemoteFileEntry = {
+      path: "note.md",
+      driveId: "uploaded-note",
+      parentId: activeScope.filesRootId,
+      size: uploadedContent.byteLength,
+      mtime: 3,
+      eTag: "etag-uploaded",
+      cTag: "ctag-uploaded",
+      sha256Hash: uploadedHash,
+    };
+    const local: LocalFileEntry = {
+      path: remote.path,
+      hash: "cd".repeat(32),
+      size: 4,
+      mtime: 9,
+      binary: false,
+    };
+    const state = makeActiveV2State([remote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-hot-upload-preflight",
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload",
+          path: remote.path,
+          expectedLocal: {
+            exists: true,
+            hash: uploadedHash,
+            size: uploadedContent.byteLength,
+          },
+          expectedRemote: { exists: false },
+          createdAt: 1,
+        },
+        receipt: {
+          version: 1,
+          operationId: "op-hot-upload-preflight",
+          completedAt: 2,
+          checkpoint: {
+            baseUpserts: [{
+              path: remote.path,
+              hash: uploadedHash,
+              size: uploadedContent.byteLength,
+              eTag: remote.eTag,
+            }],
+            baseRemovals: [],
+            remoteUpserts: [remote],
+            remoteDeletes: [],
+            pendingConflictRemovals: [],
+            pendingDeleteRemovals: [],
+          },
+        },
+      }],
+    });
+    vi.mocked(state.retireMutationCheckpointIfReflected).mockResolvedValue(false);
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getFileMetadata: vi.fn().mockResolvedValue(remote),
+      }),
+      Object.assign(emptyScanner(), {
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+      }),
+      state,
+      "testVault",
+    );
+
+    // The reset preflight runs the same verification with observationOnly=true;
+    // this shape must settle there too, otherwise a reset keeps offering the
+    // forced-reset path for a record that is provably settled
+    // (2026-10-13 review finding).
+    await expect((executor as unknown as {
+      recoverMutationLedger(
+        scope: SyncScope,
+        metrics: undefined,
+        operationEpoch: undefined,
+        observationOnly: boolean,
+      ): Promise<MutationRecoveryRunSummary>;
+    }).recoverMutationLedger(
+      activeScope,
+      undefined,
+      undefined,
+      true,
+    )).resolves.toMatchObject({
+      state: "settled",
+      settled: 1,
+      remaining: 0,
+    });
+
+    expect(state.mutationLedger).toEqual([]);
+    expect(state.commitMutationCheckpoint).toHaveBeenCalledWith(
+      "op-hot-upload-preflight",
+    );
+  });
+
+  const BASE_UPSERT_GATES = [
+    "V2 base upsert has no remote file identity: note.md",
+    "V2 base upsert remote version mismatch: note.md",
+    "V2 base upsert would replace another anchor: note.md",
+  ];
+
+  const makeStaleTreeCommitProbe = async (decide: (
+    attempt: number,
+  ) => "reject" | "succeed") => {
+    const uploadedContent = new Uint8Array([1, 2, 3]).buffer;
+    const uploadedHash = await sha256Hex(uploadedContent);
+    const activeScope: SyncScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+    const remote: RemoteFileEntry = {
+      path: "note.md",
+      driveId: "uploaded-note",
+      parentId: activeScope.filesRootId,
+      size: uploadedContent.byteLength,
+      mtime: 3,
+      eTag: "etag-uploaded",
+      cTag: "ctag-uploaded",
+      sha256Hash: uploadedHash,
+    };
+    const state = makeActiveV2State([remote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-stale-tree",
+          planRevision: 1,
+          scope: activeScope,
+          action: "upload",
+          path: remote.path,
+          expectedLocal: {
+            exists: true,
+            hash: uploadedHash,
+            size: uploadedContent.byteLength,
+          },
+          expectedRemote: { exists: false },
+          createdAt: 1,
+        },
+        receipt: {
+          version: 1,
+          operationId: "op-stale-tree",
+          completedAt: 2,
+          checkpoint: {
+            baseUpserts: [{
+              path: remote.path,
+              hash: uploadedHash,
+              size: uploadedContent.byteLength,
+              eTag: remote.eTag,
+            }],
+            baseRemovals: [],
+            remoteUpserts: [remote],
+            remoteDeletes: [],
+            pendingConflictRemovals: [],
+            pendingDeleteRemovals: [],
+          },
+        },
+      }],
+    });
+    vi.mocked(state.retireMutationCheckpointIfReflected).mockResolvedValue(false);
+    const realCommit = state.commitMutationCheckpoint;
+    let attempts = 0;
+    state.commitMutationCheckpoint = vi.fn(async (operationId: string) => {
+      attempts++;
+      if (decide(attempts) === "reject") {
+        throw new Error(BASE_UPSERT_GATES[0]);
+      }
+      return realCommit(operationId);
+    }) as never;
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getFileMetadata: vi.fn().mockResolvedValue(remote),
+      }),
+      Object.assign(emptyScanner(), {
+        inspectFile: vi.fn().mockResolvedValue({
+          status: "present",
+          entry: {
+            path: remote.path,
+            hash: "cd".repeat(32),
+            size: 4,
+            mtime: 9,
+            binary: false,
+          },
+        }),
+      }),
+      state,
+      "testVault",
+    );
+    const rebuild = vi.fn().mockResolvedValue([]);
+    (executor as unknown as { rebuildRemoteStateFromIdentitySnapshot: unknown })
+      .rebuildRemoteStateFromIdentitySnapshot = rebuild;
+    // A round sets the active scope before the recovery runs; a direct call
+    // must do the same or the repair has no scope to rebuild (fail-closed).
+    (executor as unknown as { activeSyncScope: SyncScope })
+      .activeSyncScope = activeScope;
+    return { executor, state, activeScope, rebuild, attempts: () => attempts };
+  };
+
+  it.each(BASE_UPSERT_GATES.map((message) => ({ message })))(
+    "gives a stale committed tree one rebuild before keeping the record blocked ($message)",
+    async () => {
+      // The recovery verified the receipt against live facts while the
+      // committed index lagged; one full rebuild of that index is the
+      // read-only repair the commit path may take (2026-10-13, residual §3).
+      const probe = await makeStaleTreeCommitProbe(
+        (attempt) => attempt === 1 ? "reject" : "succeed",
+      );
+      await expect((probe.executor as unknown as {
+        recoverMutationLedger(scope: SyncScope): Promise<MutationRecoveryRunSummary>;
+      }).recoverMutationLedger(
+        probe.activeScope,
+        undefined,
+        1,
+        false,
+        undefined,
+        {} as never,
+      )).resolves.toMatchObject({
+        state: "settled",
+        settled: 1,
+        remaining: 0,
+      });
+      expect(probe.rebuild).toHaveBeenCalledTimes(1);
+      expect(probe.attempts()).toBe(2);
+      expect(probe.state.mutationLedger).toEqual([]);
+    },
+  );
+
+  it("keeps the record blocked when the rebuilt tree rejects the checkpoint again", async () => {
+    const probe = await makeStaleTreeCommitProbe(() => "reject");
+    await expect((probe.executor as unknown as {
+      recoverMutationLedger(scope: SyncScope): Promise<MutationRecoveryRunSummary>;
+    }).recoverMutationLedger(
+      probe.activeScope,
+      undefined,
+      1,
+      false,
+      undefined,
+      {} as never,
+    )).rejects.toThrow("V2 base upsert");
+    expect(probe.rebuild).toHaveBeenCalledTimes(1);
+    expect(probe.attempts()).toBe(2);
+    expect(probe.state.mutationLedger).toHaveLength(1);
+  });
+
+  it("does not rebuild the tree for a rejection outside the three base-upsert gates", async () => {
+    const probe = await makeStaleTreeCommitProbe(() => "reject");
+    (probe.state.commitMutationCheckpoint as unknown as {
+      mockImplementation(fn: (operationId: string) => Promise<unknown>): void;
+    }).mockImplementation(async () => {
+      throw new Error("unexpected commit failure");
+    });
+    await expect((probe.executor as unknown as {
+      recoverMutationLedger(scope: SyncScope): Promise<MutationRecoveryRunSummary>;
+    }).recoverMutationLedger(
+      probe.activeScope,
+      undefined,
+      1,
+      false,
+      undefined,
+      {} as never,
+    )).rejects.toThrow("unexpected commit failure");
+    expect(probe.rebuild).not.toHaveBeenCalled();
+    expect(probe.state.mutationLedger).toHaveLength(1);
+  });
+
+  it.each([
+    { caseName: "remote eTag no longer matches the receipt", divergent: { eTag: "etag-rewritten" } },
+    { caseName: "remote size no longer matches the receipt", divergent: { size: 99 } },
+  ])(
+    "keeps a receipted upload blocked when the remote version moved on ($caseName)",
+    async ({ divergent }) => {
+      const uploadedContent = new Uint8Array([1, 2, 3]).buffer;
+      const uploadedHash = await sha256Hex(uploadedContent);
+      const currentHash = "cd".repeat(32);
+      const activeScope: SyncScope = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
+      const remote: RemoteFileEntry = {
+        path: "note.md",
+        driveId: "uploaded-note",
+        parentId: activeScope.filesRootId,
+        size: uploadedContent.byteLength,
+        mtime: 3,
+        eTag: "etag-uploaded",
+        cTag: "ctag-uploaded",
+        sha256Hash: uploadedHash,
+      };
+      const local: LocalFileEntry = {
+        path: remote.path,
+        hash: currentHash,
+        size: 4,
+        mtime: 9,
+        binary: false,
+      };
+      const state = makeActiveV2State([remote], [], {
+        mutationLedger: [{
+          intent: {
+            version: 1,
+            operationId: "op-hot-upload-divergent",
+            planRevision: 1,
+            scope: activeScope,
+            action: "upload",
+            path: remote.path,
+            expectedLocal: {
+              exists: true,
+              hash: uploadedHash,
+              size: uploadedContent.byteLength,
+            },
+            expectedRemote: { exists: false },
+            createdAt: 1,
+          },
+          receipt: {
+            version: 1,
+            operationId: "op-hot-upload-divergent",
+            completedAt: 2,
+            checkpoint: {
+              baseUpserts: [{
+                path: remote.path,
+                hash: uploadedHash,
+                size: uploadedContent.byteLength,
+                eTag: remote.eTag,
+              }],
+              baseRemovals: [],
+              remoteUpserts: [remote],
+              remoteDeletes: [],
+              pendingConflictRemovals: [],
+              pendingDeleteRemovals: [],
+            },
+          },
+        }],
+      });
+      const executor = new SyncExecutor(
+        makeMockOneDrive({
+          getFileMetadata: vi.fn().mockResolvedValue({ ...remote, ...divergent }),
+        }),
+        Object.assign(emptyScanner(), {
+          inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+        }),
+        state,
+        "testVault",
+      );
+
+      await expect((executor as unknown as {
+        recoverMutationLedger(scope: SyncScope): Promise<void>;
+      }).recoverMutationLedger(activeScope)).rejects.toThrow(
+        "Mutation receipt no longer matches",
+      );
+      expect(state.mutationLedger).toHaveLength(1);
+      expect(state.commitMutationCheckpoint).not.toHaveBeenCalled();
     },
   );
 
@@ -11875,6 +13081,340 @@ describe("Persistent remote delta state", () => {
           path === sourcePath
             ? { status: "present", entry: sourceLocal }
             : { status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(result.mutationRecovery).toMatchObject({ state: "blocked" });
+  });
+
+  // --- renameRemote whose local copy was edited after the move landed (2026-10-14) ---
+  // Second shape of the F20 family (field report 2026-10-13): the cloud rename
+  // landed and the local file was then edited or replaced, so the plain
+  // branch's "local unchanged" precondition can never hold again — every round
+  // blocked the record and the review modal offered no keep-side button. The
+  // move anchors prove the rename; the baseline must describe what the remote
+  // actually holds, so the bytes are read back and the local edit is left to
+  // the next ordinary round.
+
+  it("settles a renameRemote whose moved remote survived while the local file was edited", async () => {
+    const movedContent = new Uint8Array([3, 1, 4]).buffer;
+    const editedContent = new Uint8Array([2, 7, 1, 8, 5]).buffer;
+    const movedHash = await sha256Hex(movedContent);
+    const editedHash = await sha256Hex(editedContent);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "无标题 2.md";
+    const targetPath = "弟弟推荐的短剧.md";
+    const editedLocal: LocalFileEntry = {
+      path: targetPath,
+      hash: editedHash,
+      size: editedContent.byteLength,
+      mtime: 2,
+      binary: false,
+    };
+    // OneDrive personal reports no sha256Hash for this item — the world that
+    // blocked F11/F17's remote-side receipt shapes.
+    const targetRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "renameremote-edited-id",
+      parentId: activeScope.filesRootId,
+      downloadUrl: "https://graph.example/target",
+      eTag: "target-etag",
+      cTag: "target-ctag",
+      size: movedContent.byteLength,
+    };
+    const state = makeActiveV2State([targetRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-renameremote-local-edited",
+          planRevision: 1,
+          scope: activeScope,
+          action: "renameRemote",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: { exists: true, hash: movedHash, size: movedContent.byteLength },
+          expectedRemote: {
+            exists: true,
+            driveId: "renameremote-old-id",
+            eTag: "old-etag",
+            size: movedContent.byteLength,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const getFileMetadata = vi.fn().mockImplementation(async (_v: string, path: string) =>
+      path === targetPath ? targetRemote : undefined);
+    const getDriveItemMetadataById = vi.fn().mockResolvedValue(null);
+    const downloadFile = vi.fn().mockResolvedValue(movedContent);
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "https://graph.example/delta-renameremote-local-edited",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getFileMetadata,
+        getDriveItemMetadataById,
+        downloadFile,
+        getDelta,
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [editedLocal],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockImplementation(async (path: string) =>
+          path === targetPath
+            ? { status: "present", entry: editedLocal }
+            : { status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(getDriveItemMetadataById).toHaveBeenCalledWith("renameremote-old-id");
+    // The remote reports no sha, so the baseline hash must come from the
+    // readback — never from the local file the user has since edited.
+    expect(downloadFile).toHaveBeenCalled();
+    expect(state.mutationLedger).toEqual([]);
+    expect(result.mutationRecovery).toBeUndefined();
+    expect(state.recordMutationReceipt).toHaveBeenCalledWith(
+      expect.objectContaining({
+        operationId: "op-renameremote-local-edited",
+        checkpoint: expect.objectContaining({
+          baseRemovals: [sourcePath],
+          baseUpserts: [{
+            path: targetPath,
+            hash: movedHash,
+            size: movedContent.byteLength,
+            eTag: "target-etag",
+          }],
+          remoteDeletes: [sourcePath],
+        }),
+      }),
+    );
+  });
+
+  it("keeps an edited-copy renameRemote blocked when the readback cannot prove a stable version", async () => {
+    // The moved object changed again while its bytes were being read back, so
+    // the content version at the target cannot be stated honestly — stay
+    // blocked rather than write a baseline that may be wrong.
+    const movedContent = new Uint8Array([3, 1, 4]).buffer;
+    const editedContent = new Uint8Array([2, 7, 1, 8, 5]).buffer;
+    const movedHash = await sha256Hex(movedContent);
+    const editedHash = await sha256Hex(editedContent);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "无标题 2.md";
+    const targetPath = "弟弟推荐的短剧.md";
+    const editedLocal: LocalFileEntry = {
+      path: targetPath,
+      hash: editedHash,
+      size: editedContent.byteLength,
+      mtime: 2,
+      binary: false,
+    };
+    const targetRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "renameremote-unstable-id",
+      parentId: activeScope.filesRootId,
+      downloadUrl: "https://graph.example/target",
+      eTag: "target-etag",
+      cTag: "target-ctag",
+      size: movedContent.byteLength,
+    };
+    const state = makeActiveV2State([targetRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-renameremote-unstable-readback",
+          planRevision: 1,
+          scope: activeScope,
+          action: "renameRemote",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: { exists: true, hash: movedHash, size: movedContent.byteLength },
+          expectedRemote: {
+            exists: true,
+            driveId: "renameremote-old-id",
+            eTag: "old-etag",
+            size: movedContent.byteLength,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    let downloaded = false;
+    const downloadFile = vi.fn().mockImplementation(async () => {
+      downloaded = true;
+      return movedContent;
+    });
+    const getFileMetadata = vi.fn().mockImplementation(async (_v: string, path: string) => {
+      if (path !== targetPath) return undefined;
+      // Same object while it is inspected before the read, a new eTag after it.
+      return downloaded ? { ...targetRemote, eTag: "target-etag-2" } : targetRemote;
+    });
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "https://graph.example/delta-renameremote-unstable",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getFileMetadata,
+        getDriveItemMetadataById: vi.fn().mockResolvedValue(null),
+        downloadFile,
+        getDelta,
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [editedLocal],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockImplementation(async (path: string) =>
+          path === targetPath
+            ? { status: "present", entry: editedLocal }
+            : { status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(result.mutationRecovery).toMatchObject({ state: "blocked" });
+  });
+
+  it("keeps an edited-copy renameRemote blocked while a local copy still sits at the source path", async () => {
+    // "Edited at the new path, present at the old path" is a move back, not a
+    // rename that landed — settling would rebind the base while the user's own
+    // copy is still tracked.
+    const movedContent = new Uint8Array([3, 1, 4]).buffer;
+    const editedContent = new Uint8Array([2, 7, 1, 8, 5]).buffer;
+    const movedHash = await sha256Hex(movedContent);
+    const editedHash = await sha256Hex(editedContent);
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "无标题 2.md";
+    const targetPath = "弟弟推荐的短剧.md";
+    const sourceLocal: LocalFileEntry = {
+      path: sourcePath,
+      hash: movedHash,
+      size: movedContent.byteLength,
+      mtime: 1,
+      binary: false,
+    };
+    const editedLocal: LocalFileEntry = {
+      path: targetPath,
+      hash: editedHash,
+      size: editedContent.byteLength,
+      mtime: 2,
+      binary: false,
+    };
+    const targetRemote: RemoteFileEntry = {
+      path: targetPath,
+      driveId: "renameremote-moved-back-edited-id",
+      parentId: activeScope.filesRootId,
+      downloadUrl: "https://graph.example/target",
+      eTag: "target-etag",
+      cTag: "target-ctag",
+      size: movedContent.byteLength,
+    };
+    const state = makeActiveV2State([targetRemote], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-renameremote-moved-back-edited",
+          planRevision: 1,
+          scope: activeScope,
+          action: "renameRemote",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: { exists: true, hash: movedHash, size: movedContent.byteLength },
+          expectedRemote: {
+            exists: true,
+            driveId: "renameremote-old-id",
+            eTag: "old-etag",
+            size: movedContent.byteLength,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const getFileMetadata = vi.fn().mockImplementation(async (_v: string, path: string) =>
+      path === targetPath ? targetRemote : undefined);
+    const downloadFile = vi.fn().mockResolvedValue(movedContent);
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "https://graph.example/delta-renameremote-moved-back-edited",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getFileMetadata,
+        getDriveItemMetadataById: vi.fn().mockResolvedValue(null),
+        downloadFile,
+        getDelta,
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [sourceLocal, editedLocal],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockImplementation(async (path: string) => {
+          if (path === sourcePath) return { status: "present", entry: sourceLocal };
+          if (path === targetPath) return { status: "present", entry: editedLocal };
+          return { status: "missing" };
+        }),
         shouldSyncFolderPath: vi.fn().mockReturnValue(true),
       } as unknown as LocalScanner,
       state,
@@ -15140,7 +16680,7 @@ describe("Persistent remote delta state", () => {
     expect(harness.state.mutationLedger).toHaveLength(1);
   });
 
-  it("still refuses every action when the unresolved records cannot be isolated", async () => {
+  it("allows an unrelated action when the only unresolved record sits on a managed config path (2026-10-13 B1)", async () => {
     const harness = await makeManualResolutionHarness({
       path: ".obsidian/app.json",
       withLedger: true,
@@ -15158,8 +16698,12 @@ describe("Persistent remote delta state", () => {
 
     await harness.executor.resolveConflictKeepLocal("notes/other.md");
 
-    expect(harness.uploadFile).not.toHaveBeenCalled();
-    expect(harness.deleteItem).not.toHaveBeenCalled();
+    // B1：受管配置路径上的未结算记录不再冻结整库——无关路径的动作照常执行，
+    // 记录原样保留（隔离不删不猜、该路径族仍被保护）。
+    expect(harness.uploadFile).toHaveBeenCalled();
+    expect(harness.uploadFile.mock.calls.some(
+      (call) => String(call[1]).endsWith("notes/other.md"),
+    )).toBe(true);
     expect(harness.state.mutationLedger).toHaveLength(1);
   });
 });
@@ -21442,6 +22986,7 @@ describe("S1a — sync run phase observability", () => {
         schemaVersion: 1,
         totals: expect.objectContaining({ attempts: 1, peakConcurrency: 1 }),
       }),
+      { urgent: true },
     );
     expect(diagLog).toHaveBeenCalledWith(
       "execute",
@@ -21480,6 +23025,7 @@ describe("S1a — sync run phase observability", () => {
           }),
         }),
       }),
+      { urgent: true },
     );
     const summaryCall = diagLog.mock.calls.find(
       ([category, message]) => category === "lifecycle" && message === "sync run phase summary",
@@ -23998,6 +25544,7 @@ describe("blocked folder records auto-settle from current facts (2026-09-13 拍�
         remoteMatchesExpectation: true,
         mutations: 0,
       }),
+      { urgent: true },
     );
   });
 });

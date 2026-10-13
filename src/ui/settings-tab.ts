@@ -43,6 +43,7 @@ import {
 } from "./sync-exclusion-modal";
 import {
   applyAutoSyncChangeDelayRow,
+  applyAutoSyncOnStartupRow,
   applyAutomaticHandlingRow,
   applyCommunityPluginScopeRow,
   applyExcludedFoldersRow,
@@ -1098,6 +1099,10 @@ export function buildAutoSyncPage(
       {
         name: t("settings.autoSyncChangeDelay.name"),
         render: (setting) => applyAutoSyncChangeDelayRow(setting, host),
+      },
+      {
+        name: t("settings.autoSyncOnStartup.name"),
+        render: (setting) => applyAutoSyncOnStartupRow(setting, host),
       },
       {
         type: "group",

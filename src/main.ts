@@ -154,9 +154,11 @@ import {
   AutoSyncDirtyHint,
   DEFAULT_AUTO_SYNC_CHANGE_DELAY_SECONDS,
   DEFAULT_AUTO_SYNC_INTERVAL_MINUTES,
+  DEFAULT_AUTO_SYNC_ON_STARTUP,
   LOCAL_DIRTY_DEBOUNCE_MS,
   normalizeAutoSyncChangeDelaySeconds,
   normalizeAutoSyncIntervalMinutes,
+  normalizeAutoSyncOnStartup,
 } from "./sync/auto-sync-dirty-hint";
 import {
   MutationRecoveryScheduler,
@@ -170,6 +172,7 @@ import {
   mutationRecoveryStatusLabel,
   type MutationRecoveryDisplayState,
 } from "./ui/mutation-recovery-presentation";
+import { readBakedBuildVersion } from "./build-version";
 import { sha256Hex } from "./crypto";
 import {
   buildConflictEvidence,
@@ -182,6 +185,7 @@ import {
   findLatestSharedProtocolProfileSummary,
   findLatestTransferSummary,
   fingerprintOpaqueValue,
+  formatBuildVersionEvidence,
   formatDiagnosticAutomaticSyncSummary,
   formatRecentPluginDataWrites,
   formatV2StorageAuthorityEvidence,
@@ -304,6 +308,8 @@ const KEY_AUTO_SYNC_CHANGE_DELAY_SECONDS = "auto-sync-change-delay-seconds";
 const KEY_AUTO_SYNC_RESTORE_INTERVAL = "auto-sync-restore-interval";
 const KEY_AUTO_SYNC_RESTORE_CHANGE_DELAY_SECONDS =
   "auto-sync-restore-change-delay-seconds";
+const KEY_AUTO_SYNC_ON_STARTUP = "auto-sync-on-startup";
+const KEY_AUTO_SYNC_RESTORE_ON_STARTUP = "auto-sync-restore-on-startup";
 const KEY_SYNC_PLUGIN_FILES = "sync-plugin-files";
 const KEY_MAX_FILE_SIZE_MB = "sync-max-file-size-mb";
 const KEY_DIAG_LOG = "sync-diagnostic-logging";
@@ -729,10 +735,15 @@ export default class EasySyncPlugin extends Plugin {
 
   syncInterval = 3;
   autoSyncChangeDelaySeconds = DEFAULT_AUTO_SYNC_CHANGE_DELAY_SECONDS;
+  /** 启动后立即同步通道（默认开）：每次插件加载后补一轮，见
+   *  `noteStartupReadinessSettled`；缺失键的默认值由 `loadSyncSettings`
+   *  按当时总开关状态派生，不直接取默认常量。 */
+  autoSyncOnStartup = DEFAULT_AUTO_SYNC_ON_STARTUP;
   /** Per-channel settings remembered when the master switch turned everything
    *  off; the master's on flip restores them instead of imposing defaults. */
   autoSyncRestoreInterval = DEFAULT_AUTO_SYNC_INTERVAL_MINUTES;
   autoSyncRestoreChangeDelaySeconds = DEFAULT_AUTO_SYNC_CHANGE_DELAY_SECONDS;
+  autoSyncRestoreOnStartup = DEFAULT_AUTO_SYNC_ON_STARTUP;
   /** EasySync self-sync is no longer a user choice: the running build has to
    *  reach the other devices, so the plugin directory is always part of the
    *  scope. Devices still carrying the old opt-in `false` are moved through
@@ -776,6 +787,8 @@ export default class EasySyncPlugin extends Plugin {
    *  检测可被「取消同步」中止；进入弹框/写事务前清空（见 endEntryCancellation）。 */
   private entryCancelController: AbortController | null = null;
   private vaultCloudClientNoticeShown = false;
+  /** 卸载即置位：晚到的 onLayoutReady 回调（vault 监听挂载）据此退场。 */
+  private unloaded = false;
   private deferredSettingsMutations: Array<{
     started: boolean;
     cancelled: boolean;
@@ -790,6 +803,16 @@ export default class EasySyncPlugin extends Plugin {
   private readonly autoSyncDirtyHint = new AutoSyncDirtyHint(
     () => this.runAutomaticSync("dirty"),
   );
+  /** Busy-retry wheel for this session's single startup round: the first
+   *  attempt fires as soon as auth and state are both ready, and hands further
+   *  attempts here when the sync surface is busy (same semantics as the local
+   *  change hint, but with its own one-shot intent). */
+  private readonly startupSyncRetryHint = new AutoSyncDirtyHint(
+    () => this.runAutomaticSync("startup"),
+  );
+  private startupSyncAuthSettled = false;
+  private startupSyncStateSettled = false;
+  private startupSyncDispatched = false;
   private readonly mutationRecoveryScheduler = new MutationRecoveryScheduler(
     () => this.runScheduledMutationRecovery(),
     () => {
@@ -1261,6 +1284,7 @@ export default class EasySyncPlugin extends Plugin {
           });
           this.emitColdStartSummaryIfReady();
           this.schedulePersistedCommunityPluginJoinSync("auth-ready");
+          this.noteStartupReadinessSettled("auth");
         })
         .catch((e) => {
           this.startupPerformance.markAuthReady({
@@ -1270,6 +1294,10 @@ export default class EasySyncPlugin extends Plugin {
           });
           this.emitColdStartSummaryIfReady();
           this.diag.warn("lifecycle", "background auth init failed", e);
+          // A failed auth init still settles the readiness pair: the startup
+          // round then runs and is consumed as "not logged in" (runAutomaticSync),
+          // which is the honest outcome — there is nothing to sync yet.
+          this.noteStartupReadinessSettled("auth");
         });
       // onStateChange callback fires when complete → UI auto-refreshes
       void this.ensureStateLoaded()
@@ -1292,6 +1320,7 @@ export default class EasySyncPlugin extends Plugin {
           this.requestDescendantFileReconstructionContinuation("state-loaded");
           void this.scheduleCommunityPluginLocalReconciliation("state-loaded");
           this.schedulePersistedCommunityPluginJoinSync("state-loaded");
+          this.noteStartupReadinessSettled("state");
         })
         .catch((e) => {
           this.startupPerformance.markStateReady({
@@ -1306,24 +1335,28 @@ export default class EasySyncPlugin extends Plugin {
           });
           this.emitColdStartSummaryIfReady();
           this.diag.warn("state", "background state load failed", e);
+          // Deliberately NOT reporting state readiness here: with the state
+          // load rejected there is nothing to plan against, and
+          // `ensureStateLoaded` (awaited by the round) would keep re-throwing
+          // the cached rejection, turning the busy-retry wheel into a 7s
+          // failure loop. A failed load is owned by the self-heal path and by
+          // the interval/manual rounds instead.
         });
     });
 
     // ════ ⑥ Auto-sync timer (skips until auth is ready) ════
 
-    this.registerEvent(this.app.vault.on("create", (file) => {
-      this.handleLocalVaultChange(file, "create");
-    }));
-    this.registerEvent(this.app.vault.on("modify", (file) => {
-      this.handleLocalVaultChange(file, "modify");
-    }));
-    this.registerEvent(this.app.vault.on("delete", (file) => {
-      void this.handleLocalVaultDelete(file);
-    }));
-    this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
-      void this.handleLocalVaultRename(file, oldPath);
-    }));
+    // Vault listeners attach in onLayoutReady (see the method comment): the
+    // host's initialization calls `create` for every existing file, which must
+    // not read as a local change.
+    this.registerVaultLifecycleListeners();
     this.registerDomEvent(document, "visibilitychange", () => {
+      if (document.visibilityState === "hidden") {
+        // Backgrounding can end in a hard kill before the batch window fires;
+        // push the pending diagnostic lines to disk now (2026-10-13 F26).
+        void this.diag.forceFlush();
+        return;
+      }
       if (document.visibilityState === "visible") {
         this.requestMutationRecoveryObservation("foreground");
         this.requestDescendantFileReconstructionContinuation("foreground");
@@ -1464,6 +1497,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   onunload(): void {
+    this.unloaded = true;
     if (this.updateCheckTimer !== null) {
       window.clearTimeout(this.updateCheckTimer);
       this.updateCheckTimer = null;
@@ -1505,6 +1539,37 @@ export default class EasySyncPlugin extends Plugin {
     void this.state?.close().catch(() => undefined);
     void this.diag.dispose().catch(() => undefined);
     // Auth token stays in SecretStorage across sessions
+  }
+
+  /**
+   * Vault lifecycle listeners attach only once the workspace is ready.
+   *
+   * Obsidian's vault initialization calls `create` for every existing file
+   * (official load-time guide, "Listening to `vault.on('create')`"). Attached
+   * in `onload`, that host init flood read as local modifications and scheduled
+   * an auto-sync round on every cold start (archived design 20260802-103406
+   * §4.5/§6.1「Vault 初始化 create 洪峰不形成 dirty hint」；宿主实测 2026-10-14：
+   * 静态库冷启动 onload 后 43ms 即打出 dirty hint）。`onLayoutReady` runs
+   * immediately when the layout is already ready, so plugin reload / late
+   * enable keep the previous timing. The unload gate keeps the "unload cleans
+   * every resource" invariant for a callback that runs after teardown.
+   */
+  private registerVaultLifecycleListeners(): void {
+    this.app.workspace.onLayoutReady(() => {
+      if (this.unloaded) return;
+      this.registerEvent(this.app.vault.on("create", (file) => {
+        this.handleLocalVaultChange(file, "create");
+      }));
+      this.registerEvent(this.app.vault.on("modify", (file) => {
+        this.handleLocalVaultChange(file, "modify");
+      }));
+      this.registerEvent(this.app.vault.on("delete", (file) => {
+        void this.handleLocalVaultDelete(file);
+      }));
+      this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+        void this.handleLocalVaultRename(file, oldPath);
+      }));
+    });
   }
 
   // ---- Public API for UI callbacks ----
@@ -2442,7 +2507,7 @@ export default class EasySyncPlugin extends Plugin {
       this.i18n.t.bind(this.i18n),
     );
     if (request.logLabel) {
-      this.diag.log("execute", `${request.logLabel}: ${result.message}`);
+      this.diag.log("execute", `${request.logLabel}: ${result.message}`, undefined, { urgent: true });
     }
     const remainingRecoveryIds = new Set(
       this.state?.isV2StateActive
@@ -4379,7 +4444,7 @@ export default class EasySyncPlugin extends Plugin {
       if (
         !recoveryOnly
         && this.isAutoSyncMasterEnabled()
-        && !this.autoSyncPaused
+        && (!this.autoSyncPaused || this.pausedBlockedRecoveryLacksManualExit())
       ) {
         this.mutationRecoveryScheduler.continueAfterExternalFailure(
           result.mutationRecovery?.retryAfterSeconds ?? null,
@@ -4751,6 +4816,34 @@ export default class EasySyncPlugin extends Plugin {
           : {}),
       };
     }
+    // Per-round history is persisted text, so it follows the same rule as the
+    // live carriers: while automatic sync is paused nothing retries, and a
+    // "waiting for the network" line would contradict the paused body above
+    // it (2026-10-13 fix round).
+    if (this.autoSyncPaused) {
+      // The real reason must survive: the in-memory block reason is cleared by
+      // retryable rounds and after a restart, and falling straight through to
+      // "unknown" would both misreport the cause and (through the reason-keyed
+      // review gate) hide the record's review exit for good
+      // (2026-10-13 review finding).
+      const priorReason = (this.state?.syncHistory ?? []).find(
+        (entry) => entry.recovery?.state !== undefined
+          && entry.recovery.state !== "recovered",
+      )?.recovery?.blockReason;
+      return {
+        state: "blocked",
+        ...counts,
+        updatedAt,
+        blockReason:
+          summary?.blockReason
+          ?? this.mutationRecoveryBlockReason
+          ?? priorReason
+          ?? "unknown",
+        ...(summary?.blockedOperationId
+          ? { blockedOperationId: summary.blockedOperationId }
+          : {}),
+      };
+    }
     const retryAt =
       this.mutationRecoveryScheduler.snapshot.nextObservationAt ?? undefined;
     return {
@@ -4801,15 +4894,22 @@ export default class EasySyncPlugin extends Plugin {
       (retryAt !== null && retryAt > Date.now())
       || scheduler.state === "exhausted"
       || historyRecovery?.state === "waiting-network";
+    // An active automatic pause silences every automatic entry, so the
+    // waiting-for-network copy ("it will try again once the network is back")
+    // is a promise nothing can keep; report the pause first and keep the retry
+    // wording for the states that really retry (2026-10-13 field case: a
+    // paused stuck record read as a network wait for ten days).
+    const pausedOrBlocked =
+      this.autoSyncPaused
+      || this.mutationRecoveryBlockReason !== null
+      || corruptEvidence
+      || historyRecovery?.state === "blocked";
     const kind = checking
       ? "checking"
-      : waitingForNetwork
-        ? "waiting-network"
-        : this.autoSyncPaused
-            || this.mutationRecoveryBlockReason !== null
-            || corruptEvidence
-            || historyRecovery?.state === "blocked"
-          ? "blocked"
+      : pausedOrBlocked
+        ? "blocked"
+        : waitingForNetwork
+          ? "waiting-network"
           : "checking";
     const blockReason = kind === "blocked"
       ? this.mutationRecoveryBlockReason
@@ -4857,13 +4957,31 @@ export default class EasySyncPlugin extends Plugin {
       snapshot.state === "scheduled"
       && snapshot.nextObservationAt !== null
     ) {
-      await this.updateActiveMutationRecoveryHistory((recovery) => ({
-        ...recovery,
-        state: "waiting-network",
-        retryAt: snapshot.nextObservationAt ?? undefined,
-        updatedAt: Date.now(),
-      }));
-      this.showMutationRecoveryWaitingNotice();
+      if (this.autoSyncPaused) {
+        // A paused vault keeps the paused/blocked shape: "retry once the
+        // network is back" is a promise no automatic entry can keep while the
+        // pause silences them all (2026-10-13 review finding — this write path
+        // was reaching past the pause and putting the network row back).
+        await this.updateActiveMutationRecoveryHistory((recovery) => ({
+          ...recovery,
+          state: "blocked",
+          retryAt: undefined,
+          blockReason:
+            recovery.blockReason
+            ?? this.mutationRecoveryBlockReason
+            ?? "unknown",
+          updatedAt: Date.now(),
+        }));
+        this.noticeCenter.clear("sync-result:recovery-waiting");
+      } else {
+        await this.updateActiveMutationRecoveryHistory((recovery) => ({
+          ...recovery,
+          state: "waiting-network",
+          retryAt: snapshot.nextObservationAt ?? undefined,
+          updatedAt: Date.now(),
+        }));
+        this.showMutationRecoveryWaitingNotice();
+      }
     } else {
       this.noticeCenter.clear("sync-result:recovery-waiting");
     }
@@ -5103,22 +5221,58 @@ export default class EasySyncPlugin extends Plugin {
    */
   /**
    * B4 (2026-09-28 用户拍板): while a mutation-recovery pause is active,
-   * bounded scheduler observations may continue ONLY when the blocked record
-   * has no manual exit — the self-bundle path class whose automatic
-   * settlement is the sole outlet (F16, field case E). Records with a
-   * manual exit keep the user in charge; the scheduler budget (bounded
-   * backoff, exhaustion) is unchanged.
+   * bounded scheduler observations may continue ONLY when the stuck record
+   * has no manual exit — the configuration-path class whose automatic
+   * settlement is the sole outlet (F16, field case E). Records with a manual
+   * exit keep the user in charge; the scheduler budget (bounded backoff,
+   * exhaustion) is unchanged.
+   *
+   * Facts only, never the presentation ladder (2026-10-13 fix round): the
+   * display kind used to close this gate on itself — once the fast-retry
+   * budget ran out, the kind flipped to the waiting-for-network form, the
+   * gate read "not blocked", and the record's only automatic channel was
+   * gone for good. The pause must also not be a precondition: after a
+   * restart the pause is persisted while a memory-only block reason is not,
+   * and the record would start every session with no channel at all.
    */
   private pausedBlockedRecoveryLacksManualExit(): boolean {
-    if (this.mutationRecoveryBlockReason === null) return false;
-    if (typeof this.syncExecutor?.canResolveMutationRecovery !== "function") {
-      // An executor that cannot answer the eligibility gate offers no
-      // manual exit by definition — the bounded retry proceeds.
-      return true;
-    }
-    const display = this.getMutationRecoveryDisplayState();
-    return display?.kind === "blocked"
-      && display.manualResolutionAvailable !== true;
+    if (!this.state?.isV2StateActive) return false;
+    if (this.state.mutationLedger.length === 0) return false;
+    // "No manual exit" is a fact about the record, never about the pause or
+    // its recorded reason: the reason is memory-only (lost across restarts) and
+    // is cleared by retryable rounds, so keying this channel on it would
+    // silently strand exactly the records the gate exists for. An executor
+    // that cannot answer the eligibility gate offers no manual exit by
+    // definition, so the bounded observation proceeds.
+    //
+    // Asked per record on purpose (2026-10-13 review finding): the first ledger
+    // row and the row the carriers report as blocked can differ, and either
+    // mistake is bad — keying on the wrong row would leave a no-exit record
+    // without a channel, or keep auto-resolving behind a resolvable record.
+    // One record without a manual exit is enough to keep the channel alive.
+    return this.state.mutationLedger.some(
+      (record) => this.syncExecutor?.canResolveMutationRecovery?.(
+        record.intent.operationId,
+      ) !== true,
+    );
+  }
+
+  /**
+   * The pause a mutation-recovery block set, as opposed to a pause another
+   * cause owns (an incomplete round, a cancelled round, a legacy
+   * conflict-only pause). Only the former may be ended by a settling
+   * observation: the documented rule is that every other pause is released by
+   * a user-initiated round, and the in-memory block reason is not durable
+   * across restarts, so the persisted recovery row is the marker
+   * (2026-10-13 review finding).
+   */
+  private pauseIsRecoveryBlockOwned(): boolean {
+    if (this.mutationRecoveryBlockReason !== null) return true;
+    const active = (this.state?.syncHistory ?? []).find(
+      (entry) => entry.recovery?.state !== undefined
+        && entry.recovery.state !== "recovered",
+    );
+    return active?.recovery?.state === "blocked";
   }
 
   private requestMutationRecoveryObservation(trigger: string): boolean {
@@ -5272,6 +5426,11 @@ export default class EasySyncPlugin extends Plugin {
       remaining: this.state.mutationLedger.length,
       mutations: 0,
     });
+    // Captured before the round: the observation itself rewrites the recovery
+    // history row, so ownership of the active pause must be read while the
+    // pre-round evidence is still intact (2026-10-13 review finding).
+    const recoveryOwnedPause = this.autoSyncPaused
+      && this.pauseIsRecoveryBlockOwned();
     const result = await this.dispatchSyncRun({
       mode: "auto",
       options: { recoveryOnly: true },
@@ -5300,13 +5459,21 @@ export default class EasySyncPlugin extends Plugin {
       await this.pauseForMutationRecoveryBlock("state-unavailable");
       return { state: "blocked" };
     }
-    if (this.autoSyncPaused) {
+    if (this.autoSyncPaused && recoveryOwnedPause) {
       // B4: a scheduled observation that settles a paused no-exit block
       // ends the pause the same way an isolated recovery does — the
       // finally below then continues through a fresh canonical round.
+      // A pause another cause owns keeps its own release rule: settling a
+      // record is not evidence about that cause (2026-10-13 review finding).
       this.autoSyncPaused = false;
       await this.saveSyncSettings();
       this.startAutoSync();
+    } else if (this.autoSyncPaused) {
+      this.diag.log(
+        "execute",
+        "mutation recovery settled but the active pause belongs to another cause; pause retained",
+        { remaining: this.state.mutationLedger.length, mutations: 0 },
+      );
     }
     return { state: "settled" };
   }
@@ -5927,12 +6094,14 @@ export default class EasySyncPlugin extends Plugin {
     }
   }
 
-  /** Shared activity-gated entry for periodic reconciliation and dirty hints. */
+  /** Shared activity-gated entry for periodic reconciliation, dirty hints,
+   *  recovery continuations and the once-per-session startup round. */
   private async runAutomaticSync(
     trigger:
       | "interval"
       | "dirty"
-      | "recovery-continuation",
+      | "recovery-continuation"
+      | "startup",
   ): Promise<boolean> {
     if (this.autoSyncPaused) return true;
     if (trigger === "dirty") {
@@ -5944,7 +6113,10 @@ export default class EasySyncPlugin extends Plugin {
       } else if (this.autoSyncChangeDelaySeconds <= 0) {
         return true;
       }
-    } else if (trigger === "recovery-continuation") {
+    } else if (trigger === "recovery-continuation" || trigger === "startup") {
+      // Both ride the master switch rather than one channel: a recovery
+      // continuation inherits the round that started it, and the startup
+      // round is its own (third) channel of the same master.
       if (!this.isAutoSyncMasterEnabled()) return true;
     } else if (this.syncInterval <= 0) {
       return true;
@@ -5974,6 +6146,16 @@ export default class EasySyncPlugin extends Plugin {
       }
       if (this.state?.planReviewActive) {
         this.diag.log("execute", `auto sync skipped — plan review pending (${trigger})`);
+        return true;
+      }
+      if (trigger === "startup" && !this.hasCompletedSyncState()) {
+        // 2026-10-13 拍板：启动轮只替已加入的库把第一轮提前，绝不放行首同步
+        // 分支（迁移询问与加入选择弹框不在启动时出现；定时轮与修改后触发仍按
+        // 现役行为承接首同步）。
+        this.diag.log(
+          "execute",
+          "auto sync skipped — startup round never runs the first-sync flow",
+        );
         return true;
       }
       if (!this.hasCompletedSyncState()) {
@@ -6133,7 +6315,37 @@ export default class EasySyncPlugin extends Plugin {
       this.autoSyncTimer = null;
     }
     this.autoSyncDirtyHint.cancel();
+    this.startupSyncRetryHint.cancel();
     this.mutationRecoveryScheduler.cancel();
+  }
+
+  /**
+   * 启动后立即同步（2026-10-13）：每次插件加载只补一轮，解决冷启动后到第一个
+   * 定时周期之间的覆盖空白。发轮点＝登录与状态双双就绪（取较晚者）——状态先就绪
+   * 时登录还在后台恢复，提前发轮会被「未登录静默跳过」消费掉且不重来。轮次本身
+   * 只对已加入的库生效（见 `runAutomaticSync` 的 startup 分支）；暂停、待确认计划、
+   * 账本非空等让路规则与其它自动轮同源。
+   *
+   * 状态加载失败分支**不**报到（见该分支注释）：无状态可规划，且 `ensureStateLoaded`
+   * 的失败缓存会让重试轮变成 7 秒一次的失败循环；登录失败分支仍报到（如实按"未登录"
+   * 消费掉这一轮，不重试）。
+   */
+  private noteStartupReadinessSettled(signal: "auth" | "state"): void {
+    if (signal === "auth") this.startupSyncAuthSettled = true;
+    else this.startupSyncStateSettled = true;
+    if (!this.startupSyncAuthSettled || !this.startupSyncStateSettled) return;
+    if (this.startupSyncDispatched) return;
+    this.startupSyncDispatched = true;
+    void this.runAutomaticSync("startup").then(
+      (consumed) => {
+        // 忙时（返回 false）不丢这一轮：交给重试轮在静默窗口后再试，直到某一轮
+        // 真正被消费（起跑、或按规则让路）为止。
+        if (!consumed) this.startupSyncRetryHint.mark();
+      },
+      () => {
+        this.startupSyncRetryHint.mark();
+      },
+    );
   }
 
   private schedulePersistedCommunityPluginJoinSync(trigger: string): void {
@@ -6192,14 +6404,16 @@ export default class EasySyncPlugin extends Plugin {
     }
   }
 
-  /** The outer auto-sync master switch: on while either automatic channel
-   *  (scheduled or change-triggered) is enabled. */
+  /** The outer auto-sync master switch: on while any automatic channel
+   *  (scheduled, change-triggered, startup) is enabled. */
   isAutoSyncMasterEnabled(): boolean {
-    return this.syncInterval > 0 || this.autoSyncChangeDelaySeconds > 0;
+    return this.syncInterval > 0
+      || this.autoSyncChangeDelaySeconds > 0
+      || this.autoSyncOnStartup;
   }
 
   /**
-   * The master switch controls both channels together: turning it off
+   * The master switch controls every channel together: turning it off
    * remembers the per-channel settings and zeroes them, turning it back on
    * restores what it turned off (defaults when nothing was remembered), so
    * a deliberately disabled channel never silently re-enables.
@@ -6208,8 +6422,10 @@ export default class EasySyncPlugin extends Plugin {
     const previous = {
       interval: this.syncInterval,
       delay: this.autoSyncChangeDelaySeconds,
+      onStartup: this.autoSyncOnStartup,
       restoreInterval: this.autoSyncRestoreInterval,
       restoreDelay: this.autoSyncRestoreChangeDelaySeconds,
+      restoreOnStartup: this.autoSyncRestoreOnStartup,
       paused: this.autoSyncPaused,
     };
     if (enabled) {
@@ -6220,11 +6436,14 @@ export default class EasySyncPlugin extends Plugin {
           this.autoSyncRestoreChangeDelaySeconds,
         ),
       );
+      this.setAutoSyncOnStartup(this.autoSyncRestoreOnStartup);
     } else {
       this.autoSyncRestoreInterval = previous.interval;
       this.autoSyncRestoreChangeDelaySeconds = previous.delay;
+      this.autoSyncRestoreOnStartup = previous.onStartup;
       this.syncInterval = 0;
       this.setAutoSyncChangeDelaySeconds(0);
+      this.setAutoSyncOnStartup(false);
     }
     this.autoSyncPaused = false;
     try {
@@ -6232,8 +6451,10 @@ export default class EasySyncPlugin extends Plugin {
     } catch (error) {
       this.syncInterval = previous.interval;
       this.setAutoSyncChangeDelaySeconds(previous.delay);
+      this.setAutoSyncOnStartup(previous.onStartup);
       this.autoSyncRestoreInterval = previous.restoreInterval;
       this.autoSyncRestoreChangeDelaySeconds = previous.restoreDelay;
+      this.autoSyncRestoreOnStartup = previous.restoreOnStartup;
       this.autoSyncPaused = previous.paused;
       this.diag.warn(
         "state",
@@ -6249,6 +6470,10 @@ export default class EasySyncPlugin extends Plugin {
   private canScheduleLocalChangeAutoSync(): boolean {
     return this.autoSyncChangeDelaySeconds > 0
       && !this.autoSyncPaused;
+  }
+
+  setAutoSyncOnStartup(value: unknown): void {
+    this.autoSyncOnStartup = normalizeAutoSyncOnStartup(value);
   }
 
   setAutoSyncChangeDelaySeconds(value: unknown): void {
@@ -6288,6 +6513,18 @@ export default class EasySyncPlugin extends Plugin {
           normalizeAutoSyncChangeDelaySeconds(
             data[KEY_AUTO_SYNC_RESTORE_CHANGE_DELAY_SECONDS],
           );
+      }
+      // 启动通道缺失时按当时的总开关状态派生（2026-10-13 拍板）：无条件取默认
+      // 开启会把曾经主动关掉自动同步的设备重新打开；显式布尔值（含用户关过之后
+      // 随保存落盘的 false）优先。
+      if (typeof data[KEY_AUTO_SYNC_ON_STARTUP] === "boolean") {
+        this.autoSyncOnStartup = data[KEY_AUTO_SYNC_ON_STARTUP];
+      } else {
+        this.autoSyncOnStartup =
+          this.syncInterval > 0 || this.autoSyncChangeDelaySeconds > 0;
+      }
+      if (typeof data[KEY_AUTO_SYNC_RESTORE_ON_STARTUP] === "boolean") {
+        this.autoSyncRestoreOnStartup = data[KEY_AUTO_SYNC_RESTORE_ON_STARTUP];
       }
       this.notificationPopups = normalizeNotificationPopupsLevel(
         data[KEY_NOTIFICATION_POPUPS],
@@ -6466,6 +6703,8 @@ export default class EasySyncPlugin extends Plugin {
       data[KEY_AUTO_SYNC_RESTORE_INTERVAL] = this.autoSyncRestoreInterval;
       data[KEY_AUTO_SYNC_RESTORE_CHANGE_DELAY_SECONDS] =
         this.autoSyncRestoreChangeDelaySeconds;
+      data[KEY_AUTO_SYNC_ON_STARTUP] = this.autoSyncOnStartup;
+      data[KEY_AUTO_SYNC_RESTORE_ON_STARTUP] = this.autoSyncRestoreOnStartup;
       data[KEY_DIAG_LOG] = this.diagLogEnabled;
       this.writeSyncPathSettingsData(data, this.captureSyncPathSettings());
       data[KEY_AUTO_SYNC_PAUSED] = this.autoSyncPaused;
@@ -9489,6 +9728,7 @@ export default class EasySyncPlugin extends Plugin {
     lines.push("## 技术状态证据");
     lines.push("");
     lines.push(`**构筑物指纹**: ${buildFingerprint}`);
+    lines.push(formatBuildVersionEvidence(readBakedBuildVersion(), this.manifest.version));
     lines.push(`**本机存储布局**: v${storageLayoutVersion}`);
     lines.push(
       `**同步状态权威**: ${v2StateLoadBlock

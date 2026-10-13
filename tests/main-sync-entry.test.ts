@@ -870,6 +870,99 @@ describe("main sync entry guards", () => {
     expect(runAutomaticSync).not.toHaveBeenCalled();
   });
 
+  it("attaches vault lifecycle listeners only after layout ready (host init create flood)", () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.autoSyncPaused = false;
+    const vaultListeners = new Map<string, (file: unknown) => void>();
+    const layoutReadyCallbacks: Array<() => void> = [];
+    plugin.app = {
+      workspace: {
+        onLayoutReady: (callback: () => void) => {
+          layoutReadyCallbacks.push(callback);
+        },
+        getLeavesOfType: () => [],
+      },
+      vault: {
+        adapter: { exists: vi.fn().mockResolvedValue(false) },
+        on: (event: string, callback: (file: unknown) => void) => {
+          vaultListeners.set(event, callback);
+          return { event };
+        },
+        getFiles: () => [],
+        getName: () => "testVault",
+      },
+      fileManager: {},
+    } as never;
+
+    (plugin as never as { registerVaultLifecycleListeners: () => void })
+      .registerVaultLifecycleListeners();
+
+    // Obsidian's vault initialization calls `create` for every existing file
+    // (official load-time guide). Before layout ready nothing may listen, or
+    // the host's own init flood reads as local modifications and schedules an
+    // auto-sync round on the next start (2026-08-02 archived design §4.5/§6.1;
+    // measured on the host 2026-10-14: hint marked 43ms after onload).
+    expect(vaultListeners.size).toBe(0);
+    expect(plugin.autoSyncDirtyHint.pending).toBe(false);
+    expect(plugin.diag.log).not.toHaveBeenCalledWith(
+      "execute",
+      "local dirty hint scheduled normal auto sync",
+      expect.anything(),
+    );
+
+    // Once the workspace is ready the same event is a real local change.
+    layoutReadyCallbacks.forEach((callback) => callback());
+    expect([...vaultListeners.keys()].sort()).toEqual([
+      "create",
+      "delete",
+      "modify",
+      "rename",
+    ]);
+    vaultListeners.get("create")?.({ path: "notes/a.md" });
+
+    expect(plugin.autoSyncDirtyHint.pending).toBe(true);
+    expect(plugin.diag.log).toHaveBeenCalledWith(
+      "execute",
+      "local dirty hint scheduled normal auto sync",
+      expect.objectContaining({ debounceMs: 7_000 }),
+    );
+    plugin.stopAutoSync();
+  });
+
+  it("does not attach vault listeners when the plugin unloaded before layout ready", () => {
+    const plugin = makePlugin();
+    const vaultListeners = new Map<string, unknown>();
+    const layoutReadyCallbacks: Array<() => void> = [];
+    plugin.app = {
+      workspace: {
+        onLayoutReady: (callback: () => void) => {
+          layoutReadyCallbacks.push(callback);
+        },
+        getLeavesOfType: () => [],
+      },
+      vault: {
+        adapter: { exists: vi.fn().mockResolvedValue(false) },
+        on: (event: string, callback: unknown) => {
+          vaultListeners.set(event, callback);
+          return { event };
+        },
+        getFiles: () => [],
+        getName: () => "testVault",
+      },
+      fileManager: {},
+    } as never;
+    // The unload signal onunload sets before late onLayoutReady callbacks run.
+    (plugin as never as { unloaded: boolean }).unloaded = true;
+
+    (plugin as never as { registerVaultLifecycleListeners: () => void })
+      .registerVaultLifecycleListeners();
+    layoutReadyCallbacks.forEach((callback) => callback());
+
+    expect(vaultListeners.size).toBe(0);
+  });
+
   it("does not schedule a dirty run for EasySync internal state", async () => {
     vi.useFakeTimers();
     const plugin = makePlugin();
@@ -943,6 +1036,9 @@ describe("main sync entry guards", () => {
     const plugin = makePlugin();
     plugin.syncInterval = 0;
     plugin.autoSyncChangeDelaySeconds = 0;
+    // Every channel off — the startup channel defaults on, so leaving it true
+    // would keep the master on by itself.
+    plugin.autoSyncOnStartup = false;
     plugin.autoSyncPaused = false;
     vi.spyOn(plugin as never, "hasPendingCommunityPluginJoin")
       .mockReturnValue(true);
@@ -963,10 +1059,11 @@ describe("main sync entry guards", () => {
     expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
   });
 
-  it("turning the auto sync master off stops both channels and remembers their settings", async () => {
+  it("turning the auto sync master off stops every channel and remembers their settings", async () => {
     const plugin = makePlugin();
     plugin.syncInterval = 10;
     plugin.setAutoSyncChangeDelaySeconds(4);
+    plugin.autoSyncOnStartup = true;
     plugin.autoSyncPaused = true;
     const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings")
       .mockResolvedValue(undefined);
@@ -977,6 +1074,7 @@ describe("main sync entry guards", () => {
 
     expect(plugin.syncInterval).toBe(0);
     expect(plugin.autoSyncChangeDelaySeconds).toBe(0);
+    expect(plugin.autoSyncOnStartup).toBe(false);
     expect(plugin.autoSyncPaused).toBe(false);
     expect(saveSyncSettings).toHaveBeenCalledTimes(1);
     expect(restartAutoSync).toHaveBeenCalledTimes(1);
@@ -985,6 +1083,7 @@ describe("main sync entry guards", () => {
 
     expect(plugin.syncInterval).toBe(10);
     expect(plugin.autoSyncChangeDelaySeconds).toBe(4);
+    expect(plugin.autoSyncOnStartup).toBe(true);
   });
 
   it("turning the master back on keeps a channel the user had disabled", async () => {
@@ -1014,6 +1113,130 @@ describe("main sync entry guards", () => {
 
     expect(plugin.syncInterval).toBe(3);
     expect(plugin.autoSyncChangeDelaySeconds).toBe(7);
+    // 启动通道一并回默认（2026-10-13 新增第三通道）。
+    expect(plugin.autoSyncOnStartup).toBe(true);
+  });
+
+  it("keeps the master on with only the startup channel enabled", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 0;
+    plugin.setAutoSyncChangeDelaySeconds(0);
+    plugin.autoSyncOnStartup = true;
+    vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    vi.spyOn(plugin as never, "restartAutoSync")
+      .mockImplementation(() => undefined);
+
+    expect(plugin.isAutoSyncMasterEnabled()).toBe(true);
+
+    // 关掉唯一开着的通道：总开关落回关闭并记住它，再开时恢复。
+    await plugin.setAutoSyncMasterEnabled(false);
+    expect(plugin.isAutoSyncMasterEnabled()).toBe(false);
+
+    await plugin.setAutoSyncMasterEnabled(true);
+    expect(plugin.autoSyncOnStartup).toBe(true);
+    expect(plugin.isAutoSyncMasterEnabled()).toBe(true);
+  });
+
+  it("runs one startup round for a joined vault and never the first-sync flow", async () => {
+    const unjoined = makePlugin();
+    unjoined.auth = { authState: { isLoggedIn: true } } as never;
+    unjoined.state = { planReviewActive: false } as never;
+    vi.spyOn(unjoined as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(unjoined as never, "beginSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(unjoined as never, "updateStatusBar").mockImplementation(() => undefined);
+    // 首同步流程的代表性入口：命中即证明启动轮进了不该进的分支。
+    const unjoinedFirstSyncFlow = vi.spyOn(unjoined as never, "maybeRunRsMigrationOffer")
+      .mockResolvedValue("fresh");
+    const unjoinedRun = vi.fn().mockResolvedValue(okResult());
+    unjoined.syncExecutor = { isRunning: false, run: unjoinedRun } as never;
+
+    const unjoinedConsumed = await (unjoined as never as {
+      runAutomaticSync: (trigger: "startup") => Promise<boolean>;
+    }).runAutomaticSync("startup");
+
+    // 未加入云端仓库：启动轮原地让路，绝不进入首同步（迁移询问／加入选择）分支。
+    expect(unjoinedConsumed).toBe(true);
+    expect(unjoinedRun).not.toHaveBeenCalled();
+    expect(unjoinedFirstSyncFlow).not.toHaveBeenCalled();
+
+    const joined = makePlugin();
+    joined.auth = { authState: { isLoggedIn: true } } as never;
+    joined.state = { planReviewActive: false, lastSyncTime: 1 } as never;
+    vi.spyOn(joined as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(joined as never, "beginSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(joined as never, "updateStatusBar").mockImplementation(() => undefined);
+    const joinedRun = vi.fn().mockResolvedValue(okResult());
+    joined.syncExecutor = { isRunning: false, run: joinedRun } as never;
+
+    const joinedConsumed = await (joined as never as {
+      runAutomaticSync: (trigger: "startup") => Promise<boolean>;
+    }).runAutomaticSync("startup");
+
+    expect(joinedConsumed).toBe(true);
+    expect(joinedRun).toHaveBeenCalledTimes(1);
+    expect(joinedRun.mock.calls[0]?.[0]).toBe("auto");
+  });
+
+  it("fires the once-per-session startup round only after auth and state are both ready", async () => {
+    const plugin = makePlugin();
+    const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")
+      .mockResolvedValue(true);
+    const note = (signal: "auth" | "state"): void =>
+      (plugin as never as {
+        noteStartupReadinessSettled: (signal: "auth" | "state") => void;
+      }).noteStartupReadinessSettled(signal);
+
+    // 状态先就绪时不能抢跑：登录还在后台恢复，提前发轮会被「未登录静默跳过」
+    // 消费掉且不重来。
+    note("state");
+    expect(runAutomaticSync).not.toHaveBeenCalled();
+
+    note("auth");
+    expect(runAutomaticSync).toHaveBeenCalledOnce();
+    expect(runAutomaticSync).toHaveBeenCalledWith("startup");
+
+    // 之后的就绪回报（重载等）不补发第二轮。
+    note("auth");
+    note("state");
+    expect(runAutomaticSync).toHaveBeenCalledOnce();
+  });
+
+  it("hands a busy startup round to the retry wheel instead of losing it", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")
+      .mockResolvedValue(false); // 忙：本轮未被消费
+    const note = (signal: "auth" | "state"): void =>
+      (plugin as never as {
+        noteStartupReadinessSettled: (signal: "auth" | "state") => void;
+      }).noteStartupReadinessSettled(signal);
+
+    note("auth");
+    note("state");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runAutomaticSync).toHaveBeenCalledTimes(1);
+
+    // 静默窗口后自动再试，直到某一轮被真正消费。
+    await vi.advanceTimersByTimeAsync(7_000);
+    expect(runAutomaticSync).toHaveBeenCalledTimes(2);
+    plugin.stopAutoSync();
+  });
+
+  it("arms the startup round from the state success path but not from a failed state load", () => {
+    // 失败分支报到会把重试轮挂在 ensureStateLoaded 的失败缓存上（7 秒一次的失败
+    // 循环），且此时没有可规划的状态。源码守卫：成功分支保留报到调用，失败分支不得有
+    // ——两侧都删时前半句会先红（守卫不空转）。
+    // prettier-ignore
+    const source = readFileSync("src/main.ts", "utf8");
+    expect(source).toContain(
+      'this.schedulePersistedCommunityPluginJoinSync("state-loaded");\n'
+      + "          this.noteStartupReadinessSettled(\"state\");",
+    );
+    const warnIndex = source.indexOf('"background state load failed"');
+    expect(warnIndex).toBeGreaterThan(-1);
+    const branchEnd = source.indexOf("});", warnIndex);
+    const failureBranch = source.slice(warnIndex, branchEnd);
+    expect(failureBranch).not.toContain("noteStartupReadinessSettled");
   });
 
   it("keeps 1-minute and 1-second triggers to one round at a time", async () => {
@@ -1133,6 +1356,7 @@ describe("main sync entry guards", () => {
 
     // Master fully off: nothing armed.
     plugin.autoSyncChangeDelaySeconds = 0;
+    plugin.autoSyncOnStartup = false;
     expect(observe("foreground")).toBe(false);
     expect(requestObservation).toHaveBeenCalledTimes(1);
 
@@ -1913,7 +2137,7 @@ describe("main sync entry guards", () => {
     expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
   });
 
-  it("uses a persisted active V2 intent as a cold-start trigger without accepting public precommit or paused state", async () => {
+  it("uses a persisted active V2 intent as a cold-start trigger without accepting public precommit or a resolvable paused record", async () => {
     vi.useFakeTimers();
     const plugin = makePlugin();
     plugin.syncInterval = 3;
@@ -1949,9 +2173,16 @@ describe("main sync entry guards", () => {
 
     plugin.state.isV2StateActive = true;
     plugin.autoSyncPaused = true;
+    // A pause alone no longer suppresses the channel (2026-10-13): whether the
+    // stuck record has a manual exit decides, because the pause's recorded
+    // reason is memory-only and would strand records across restarts. At this
+    // point no executor can answer the eligibility gate, so no manual exit is
+    // available and the bounded observation proceeds.
     expect((plugin as never as {
       requestMutationRecoveryObservation: (trigger: string) => boolean;
-    }).requestMutationRecoveryObservation("paused")).toBe(false);
+    }).requestMutationRecoveryObservation("paused")).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(runScheduled).toHaveBeenCalledTimes(2);
 
     // B4 (2026-09-28 用户拍板): a paused block whose record has no manual
     // exit (self-bundle path class) keeps bounded observations alive —
@@ -3783,6 +4014,321 @@ describe("main sync entry guards", () => {
     expect(saveSyncSettings).not.toHaveBeenCalled();
   });
 
+  it("falls back to ordinary handling when an isolated recovery coexists with deferred items", async () => {
+    // 隔离"安静支路"要求 deferred === 0（无待办遗留才由它收尾）：有延后项时
+    // 走普通轮收尾——不接管暂停、也不解除既有暂停，且不吞掉轮次提示。
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = true;
+    plugin.state = {
+      planReviewActive: false,
+      syncHistory: [],
+      mutationLedger: [{
+        intent: { operationId: "pending", path: "notes/a.md" },
+        receipt: null,
+      }],
+    } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    const finishSyncNotice = vi.spyOn(plugin as never, "finishSyncNotice")
+      .mockImplementation(() => undefined);
+    const clearSyncLifecycleNotice = vi.spyOn(plugin as never, "clearSyncLifecycleNotice")
+      .mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings")
+      .mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync")
+      .mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync")
+      .mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess")
+      .mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar")
+      .mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (
+        result: SyncResult,
+        mode: "manual",
+      ) => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      deferred: 1,
+      message: "result.deferred",
+      mutationRecovery: {
+        state: "blocked",
+        total: 1,
+        settled: 0,
+        remaining: 1,
+        retryAfterSeconds: null,
+        blockReason: "facts-changed",
+        blockedOperationId: "pending",
+        isolated: true,
+      },
+    }, "manual");
+
+    expect(finishSyncNotice).toHaveBeenCalledOnce();
+    expect(clearSyncLifecycleNotice).not.toHaveBeenCalled();
+    expect((plugin as never as {
+      mutationRecoveryBlockReason: string | null;
+    }).mutationRecoveryBlockReason).toBeNull();
+    expect(plugin.autoSyncPaused).toBe(true);
+    expect(stopAutoSync).not.toHaveBeenCalled();
+    expect(saveSyncSettings).not.toHaveBeenCalled();
+    expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("reports an active automatic pause instead of a network wait, and keeps the network form when nothing is paused", () => {
+    const plugin = new EasySyncPlugin();
+    plugin.state = {
+      isV2StateActive: true,
+      mutationLedger: [{
+        intent: { operationId: "pending", path: "notes/a.md" },
+        receipt: null,
+      }],
+      mutationRecoveryQuarantine: [],
+      hasMutationLedgerCorruption: false,
+      hasMutationRecoveryQuarantineCorruption: false,
+      syncHistory: [],
+    } as never;
+    const stub = {
+      snapshot: {
+        state: "exhausted" as const,
+        automaticObservations: 5,
+        nextObservationAt: null,
+      },
+    };
+    (plugin as never as { mutationRecoveryScheduler: typeof stub })
+      .mutationRecoveryScheduler = stub;
+
+    // A pause silences every automatic entry, so even an exhausted scheduler
+    // must not be presented as "it will try again once the network is back"
+    // (2026-10-13 field case: ten days of a paused record reading as a
+    // network wait).
+    plugin.autoSyncPaused = true;
+    const paused = plugin.getMutationRecoveryDisplayState();
+    expect(paused?.kind).toBe("blocked");
+    // The reason chain decides whether the user gets an exit at all, so the
+    // paused-without-recorded-reason shape must stay honest and closed rather
+    // than claim a review that does not exist (2026-10-13 review finding).
+    expect(paused?.blockReason).toBe("unknown");
+    expect(paused?.manualResolutionAvailable).toBe(false);
+
+    stub.snapshot = {
+      state: "scheduled",
+      automaticObservations: 1,
+      nextObservationAt: Date.now() + 60_000,
+    };
+    expect(plugin.getMutationRecoveryDisplayState()?.kind).toBe("blocked");
+
+    // A paused record whose persisted recovery row keeps a review-eligible
+    // reason exposes the real exit — this is the state the field case could
+    // never reach (2026-10-13 review finding).
+    plugin.state.syncHistory = [{
+      id: "mutation-recovery-1",
+      mode: "auto",
+      status: "partial",
+      startedAt: 1,
+      endedAt: 2,
+      recovery: {
+        state: "blocked",
+        total: 1,
+        settled: 0,
+        remaining: 1,
+        updatedAt: 2,
+        blockReason: "facts-changed",
+      },
+    }] as never;
+    plugin.syncExecutor = {
+      canResolveMutationRecovery: (operationId?: string) => operationId === "pending",
+    } as never;
+    expect(plugin.getMutationRecoveryDisplayState()).toMatchObject({
+      kind: "blocked",
+      blockReason: "facts-changed",
+      manualResolutionAvailable: true,
+    });
+
+    // Without a pause the scheduled retry keeps its network wording.
+    plugin.autoSyncPaused = false;
+    plugin.state.syncHistory = [] as never;
+    plugin.syncExecutor = undefined as never;
+    expect(plugin.getMutationRecoveryDisplayState()?.kind).toBe("waiting-network");
+  });
+
+  it("keeps the paused shape in the persisted recovery row when a retry is scheduled", async () => {
+    const plugin = new EasySyncPlugin();
+    const history: SyncHistoryEntry[] = [{
+      id: "mutation-recovery-1",
+      mode: "auto",
+      status: "partial",
+      startedAt: 1,
+      endedAt: 2,
+      recovery: {
+        state: "blocked",
+        total: 1,
+        settled: 0,
+        remaining: 1,
+        updatedAt: 2,
+        blockReason: "facts-changed",
+      },
+    }];
+    const addSyncHistory = vi.fn().mockImplementation(async (
+      entry: SyncHistoryEntry,
+    ) => {
+      history.splice(0, history.length, entry);
+    });
+    plugin.state = { syncHistory: history, addSyncHistory } as never;
+    plugin.autoSyncPaused = true;
+    (plugin as never as { updateStatusBar: unknown }).updateStatusBar = vi.fn();
+
+    await (plugin as never as {
+      handleMutationRecoverySchedulerState: (snapshot: {
+        state: "scheduled";
+        automaticObservations: number;
+        nextObservationAt: number;
+      }) => Promise<void>;
+    }).handleMutationRecoverySchedulerState({
+      state: "scheduled",
+      automaticObservations: 1,
+      nextObservationAt: Date.now() + 60_000,
+    });
+
+    // Scheduling a retry must not put the network wording back into the
+    // persisted row while the pause silences that very retry.
+    expect(history[0].recovery).toMatchObject({
+      state: "blocked",
+      blockReason: "facts-changed",
+    });
+    expect(history[0].recovery?.retryAt).toBeUndefined();
+  });
+
+  it("ends only a recovery-owned pause when a scheduled observation settles", async () => {
+    const runOnce = async (recoveryRow: boolean) => {
+      const plugin = makePlugin();
+      plugin.syncInterval = 3;
+      plugin.auth = { authState: { isLoggedIn: true } } as never;
+      plugin._stateLoaded = true;
+      plugin.autoSyncPaused = true;
+      (plugin as never as { mutationRecoveryBlockReason: string | null })
+        .mutationRecoveryBlockReason = recoveryRow ? "facts-changed" : null;
+      plugin.state = {
+        isV2StateActive: true,
+        mutationLedger: [{
+          intent: { operationId: "stuck", path: "notes/a.md" },
+          receipt: null,
+        }],
+        planReviewActive: false,
+        hasMutationLedgerCorruption: false,
+        hasMutationRecoveryQuarantineCorruption: false,
+        hasV2StateLoadRecoveryBlock: false,
+        hasV2RemoteScopeRecovery: false,
+        syncHistory: recoveryRow
+          ? [{
+              id: "mutation-recovery-1",
+              mode: "auto",
+              status: "partial",
+              startedAt: 1,
+              endedAt: 2,
+              recovery: {
+                state: "blocked",
+                total: 1,
+                settled: 0,
+                remaining: 1,
+                updatedAt: 2,
+                blockReason: "facts-changed",
+              },
+            }]
+          : [],
+      } as never;
+      plugin.syncExecutor = {
+        canResolveMutationRecovery: () => false,
+      } as never;
+      const checkAccountBinding = vi.spyOn(plugin as never, "checkAccountBinding")
+        .mockResolvedValue(true);
+      (plugin as never as { dispatchSyncRun: unknown }).dispatchSyncRun =
+        vi.fn().mockResolvedValue({
+          success: true,
+          errors: 0,
+          mutationRecovery: {
+            state: "settled",
+            total: 1,
+            settled: 1,
+            remaining: 0,
+            retryAfterSeconds: null,
+          },
+        });
+      const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings")
+        .mockResolvedValue(undefined);
+      const startAutoSync = vi.spyOn(plugin, "startAutoSync")
+        .mockImplementation(() => undefined);
+      plugin.diag = { log: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+
+      await (plugin as never as {
+        runScheduledMutationRecoveryObservation: (args: {
+          continuation: { settled: boolean; continueAfterIsolatedRecovery: boolean };
+        }) => Promise<{ state: string }>;
+      }).runScheduledMutationRecoveryObservation({
+        continuation: { settled: false, continueAfterIsolatedRecovery: false },
+      });
+
+      return { plugin, checkAccountBinding, saveSyncSettings, startAutoSync };
+    };
+
+    // A pause a recovery block set is ended by the settling observation.
+    const owned = await runOnce(true);
+    expect(owned.checkAccountBinding).toHaveBeenCalled();
+    expect(owned.plugin.autoSyncPaused).toBe(false);
+    expect(owned.startAutoSync).toHaveBeenCalled();
+
+    // A pause another cause owns (an incomplete or cancelled round) keeps its
+    // own release rule: settling a record says nothing about that cause
+    // (2026-10-13 review finding).
+    const foreign = await runOnce(false);
+    expect(foreign.plugin.autoSyncPaused).toBe(true);
+    expect(foreign.saveSyncSettings).not.toHaveBeenCalled();
+    expect(foreign.startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("keeps the observation channel while any stuck record lacks a manual exit", () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin._stateLoaded = true;
+    plugin.autoSyncPaused = true;
+    plugin.state = {
+      isV2StateActive: true,
+      mutationLedger: [
+        { intent: { operationId: "resolvable", path: "notes/a.md" }, receipt: null },
+        { intent: { operationId: "stuck", path: ".obsidian/plugins/x/data.json" }, receipt: null },
+      ],
+      planReviewActive: false,
+      syncHistory: [],
+    } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: false,
+      canResolveMutationRecovery: (operationId?: string) =>
+        operationId === "resolvable",
+    } as never;
+    (plugin as never as { updateStatusBar: unknown }).updateStatusBar = vi.fn();
+    vi.spyOn(plugin as never, "runScheduledMutationRecovery")
+      .mockResolvedValue({ state: "inactive" });
+    const request = (plugin as never as {
+      requestMutationRecoveryObservation: (trigger: string) => boolean;
+    }).requestMutationRecoveryObservation.bind(plugin);
+
+    // The first ledger row is manually resolvable, but the stuck one is not:
+    // keying the gate on the wrong row would strand it without any channel
+    // (2026-10-13 review finding).
+    expect(request("mixed-ledger")).toBe(true);
+    plugin.mutationRecoveryScheduler.cancel();
+
+    // Every record resolvable: the user stays in charge, no observations.
+    plugin.state.mutationLedger = [
+      { intent: { operationId: "resolvable", path: "notes/a.md" }, receipt: null },
+    ];
+    expect(request("all-resolvable")).toBe(false);
+    plugin.mutationRecoveryScheduler.cancel();
+  });
+
   it("updates one continuing history event across retries and marks it recovered when evidence settles", async () => {
     const plugin = new EasySyncPlugin();
     const history: SyncHistoryEntry[] = [{
@@ -4192,6 +4738,7 @@ describe("main sync entry guards", () => {
     const plugin = new EasySyncPlugin();
     plugin.syncInterval = 0;
     plugin.autoSyncChangeDelaySeconds = 0;
+    plugin.autoSyncOnStartup = false;
     plugin.autoSyncPaused = false;
     vi.spyOn(plugin as never, "hasPendingCommunityPluginJoin").mockReturnValue(true);
     const schedulePersistedJoinSync = vi.spyOn(
@@ -5728,6 +6275,74 @@ describe("main sync entry guards", () => {
     expect(confirmModalAwaitConfirm).not.toHaveBeenCalled();
     expect(forceReset).not.toHaveBeenCalled();
     expect(resetPreservingIsolatedMutationRecovery).toHaveBeenCalledOnce();
+  });
+
+  it("routes a non-isolatable managed config record to the forced-reset tier after B1 (2026-10-13)", async () => {
+    // B1 只放宽普通同步轮的隔离集合；重置预检观察轮保持严格 ⇒ 配置路径记录
+    // 在预检里必为 blocked（绝不 isolated）⇒ 仍走强制确认档。与上一条
+    // （isolated 走保全档）互为反面，钉住这条分档不被静默放宽。
+    const plugin = makePlugin();
+    const {
+      reset,
+      forceReset,
+      resetPreservingIsolatedMutationRecovery,
+    } = attachResetRecoveryHarness(plugin);
+    const retained = {
+      intent: {
+        version: 1 as const,
+        operationId: "op-config-stuck",
+        planRevision: 1,
+        scope: {
+          accountId: "account",
+          driveId: "drive",
+          vaultFolderId: "vault",
+          filesRootId: "root",
+        },
+        action: "upload" as const,
+        path: ".obsidian/plugins/easy-sync/main.js",
+        expectedLocal: {
+          exists: true as const,
+          hash: "aa".repeat(32),
+          size: 3,
+        },
+        expectedRemote: {
+          exists: true as const,
+          driveId: "remote-main",
+          eTag: "etag-main",
+          size: 3,
+          sha256Hash: "aa".repeat(32),
+        },
+        createdAt: 1,
+      },
+      receipt: null,
+    };
+    plugin.state.mutationLedger.splice(0, 1, retained);
+    const dispatch = vi.spyOn(plugin as never, "dispatchSyncRun")
+      .mockResolvedValue({
+        ...okResult(),
+        success: false,
+        errors: 1,
+        // 严格观察轮对这条记录的产物：blocked 且不带 isolated。
+        mutationRecovery: {
+          state: "blocked",
+          total: 1,
+          settled: 0,
+          remaining: 1,
+          retryAfterSeconds: null,
+          blockReason: "facts-changed",
+          blockedOperationId: retained.intent.operationId,
+        },
+      });
+    vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+    confirmModalAwaitConfirm.mockResolvedValueOnce(true);
+
+    await plugin.resetSyncState();
+
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(confirmModalAwaitConfirm).toHaveBeenCalledOnce();
+    expect(forceReset).toHaveBeenCalledOnce();
+    expect(resetPreservingIsolatedMutationRecovery).not.toHaveBeenCalled();
+    expect(reset).not.toHaveBeenCalled();
   });
 
 

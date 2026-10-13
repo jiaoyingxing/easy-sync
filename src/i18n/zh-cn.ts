@@ -222,6 +222,8 @@ const zhCN: LocaleStrings = {
   "settings.autoSyncChangeDelay.name": "修改后触发同步",
   "settings.autoSyncChangeDelay.desc": "检测到本机变化后等待 {seconds} 秒；期间有新变化会重新计时。",
   "settings.autoSyncChangeDelay.disabledDesc": "已关闭；本机变化不会自动触发同步。",
+  "settings.autoSyncOnStartup.name": "启动后立即同步",
+  "settings.autoSyncOnStartup.desc": "打开 Obsidian 后立即触发一次同步。",
   "settings.notificationPopups.name": "通知弹窗",
   "settings.notificationPopups.option.all": "全部",
   "settings.notificationPopups.option.important": "仅重要",

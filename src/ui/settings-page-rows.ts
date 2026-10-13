@@ -639,6 +639,41 @@ export function applyAutoSyncChangeDelayRow(
   renderDesc();
 }
 
+/** 启动后立即同步开关（默认开启；翻总开关时与两条滑条同规重挂自动同步面）。 */
+export function applyAutoSyncOnStartupRow(
+  setting: Setting,
+  host: SettingsPageRowHost,
+): void {
+  const { plugin, t } = host;
+  setting.controlEl.empty();
+  setting
+    .setName(t("settings.autoSyncOnStartup.name"))
+    .setDesc(t("settings.autoSyncOnStartup.desc"))
+    .addToggle((toggle) => {
+      toggle
+        .setValue(plugin.autoSyncOnStartup)
+        .onChange(async (value) => {
+          const previous = plugin.autoSyncOnStartup;
+          const masterWasOn = plugin.isAutoSyncMasterEnabled();
+          plugin.setAutoSyncOnStartup(value);
+          try {
+            await plugin.saveSyncSettings();
+          } catch {
+            plugin.setAutoSyncOnStartup(previous);
+            toggle.setValue(previous);
+            new Notice(t("notice.settingsSaveFailed"));
+            return;
+          }
+          // 本通道可以独自决定总开关（它是唯一开着、或最后关掉的通道时）：
+          // 翻转总开关时与两条滑条同规重挂自动同步面，普通微调不动。
+          if (plugin.isAutoSyncMasterEnabled() !== masterWasOn) {
+            plugin.restartAutoSync();
+          }
+          host.refresh();
+        });
+    });
+}
+
 /** 自动处理开关行（policy 键直接落盘，失败回滚）。 */
 export function applyAutomaticHandlingRow(
   setting: Setting,

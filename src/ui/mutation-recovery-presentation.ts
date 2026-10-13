@@ -246,3 +246,21 @@ export function formatMutationRecoveryHistory(
       });
   }
 }
+
+/**
+ * Which of the two "no available action" hints a move-style record can still
+ * state honestly. The keep-cloud sentence promises the file at the *old* cloud
+ * path and its return to the old local path; once the cloud already holds the
+ * moved name that path is gone (2026-10-13 field report), so the sentence is
+ * dropped rather than promising a file that is not there. The keep-local
+ * sentence carries its own "（若存在）" qualifier and stays.
+ */
+export function resolveMoveNoActionHints(input: {
+  sourcePath: string | null;
+  remoteSourceExists: boolean;
+}): Array<"keep-local" | "keep-remote"> {
+  if (!input.sourcePath) return [];
+  return input.remoteSourceExists
+    ? ["keep-local", "keep-remote"]
+    : ["keep-local"];
+}

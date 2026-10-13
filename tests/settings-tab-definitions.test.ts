@@ -44,17 +44,25 @@ function createMockPlugin(): EasySyncPlugin {
     syncMaxFileSizeMb: 500,
     syncInterval: 3,
     autoSyncChangeDelaySeconds: 5,
+    autoSyncOnStartup: true,
     notificationPopups: "all",
     mobileStatusBar: true,
     diagLogEnabled: false,
     syncDirection: "two-way",
     autoSyncPaused: false,
     isAutoSyncMasterEnabled: function (
-      this: { syncInterval: number; autoSyncChangeDelaySeconds: number },
+      this: {
+        syncInterval: number;
+        autoSyncChangeDelaySeconds: number;
+        autoSyncOnStartup: boolean;
+      },
     ): boolean {
-      return this.syncInterval > 0 || this.autoSyncChangeDelaySeconds > 0;
+      return this.syncInterval > 0
+        || this.autoSyncChangeDelaySeconds > 0
+        || this.autoSyncOnStartup;
     },
     setAutoSyncMasterEnabled: vi.fn().mockResolvedValue(undefined),
+    setAutoSyncOnStartup: vi.fn(),
     excludedFolders: [],
     automaticHandlingPolicy: {
       autoDeleteLocalFiles: false,
@@ -155,6 +163,7 @@ describe("buildSettingDefinitions", () => {
       t("settings.autoSync.name"),
       t("settings.syncInterval.name"),
       t("settings.autoSyncChangeDelay.name"),
+      t("settings.autoSyncOnStartup.name"),
       t("settings.automaticHandling.name"),
       t("settings.rules.name"),
       t("settings.automaticHandling.autoDeleteLocalFiles.name"),
@@ -413,6 +422,7 @@ describe("buildSettingDefinitions", () => {
     const off = createMockPlugin();
     off.syncInterval = 0;
     off.autoSyncChangeDelaySeconds = 0;
+    off.autoSyncOnStartup = false;
     expect(rowsOf(off)[1].displayValue).toBe(t("settings.rootNav.value.autoSyncOff"));
 
     // 显示：档位词（复用现役选项词）；维护：留空。
@@ -766,6 +776,7 @@ describe("declarative completeness vs display()", () => {
     const offPlugin = createMockPlugin();
     offPlugin.syncInterval = 0;
     offPlugin.autoSyncChangeDelaySeconds = 0;
+    offPlugin.autoSyncOnStartup = false;
     const defs = buildSettingDefinitions(i18n.t.bind(i18n), offPlugin);
     const autoSync = pageItems(defs, i18n.t("settings.autoSync.name"))
       .find((i) => i.name === i18n.t("settings.autoSync.name"));

@@ -11,6 +11,7 @@ import type {
 import { ConfirmModal, type I18nFn } from "./confirm-modal";
 import { EasySyncModal } from "./easy-sync-modal";
 import { computeDisplayDiff } from "./diff-engine";
+import { resolveMoveNoActionHints } from "./mutation-recovery-presentation";
 import {
   MAX_FALLBACK_PREVIEW_LINES,
   MAX_TEXT_DIFF_BYTES_PER_SIDE,
@@ -254,20 +255,23 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
       // what they can actually do to change the outcome, and be honest that
       // one direction cannot yet converge automatically (the two sides
       // differ, and the current classifier has no automatic branch for it).
-      if (snapshot.sourcePath) {
-        body.createEl("p", {
-          text: this.t("syncView.mutationResolution.noAvailableActionsKeepLocal", {
-            sourcePath: snapshot.sourcePath,
-          }),
-          cls: "easy-sync-detail-reason",
-        });
-        body.createEl("p", {
-          text: this.t("syncView.mutationResolution.noAvailableActionsKeepRemote", {
-            sourcePath: snapshot.sourcePath,
-            path: snapshot.path,
-          }),
-          cls: "easy-sync-detail-reason",
-        });
+      const sourcePath = snapshot.sourcePath ?? null;
+      if (sourcePath) {
+        const remoteSourceExists = snapshot.remote.some((fact) =>
+          fact.path === sourcePath && fact.exists);
+        for (const hint of resolveMoveNoActionHints({ sourcePath, remoteSourceExists })) {
+          body.createEl("p", {
+            text: hint === "keep-local"
+              ? this.t("syncView.mutationResolution.noAvailableActionsKeepLocal", {
+                  sourcePath,
+                })
+              : this.t("syncView.mutationResolution.noAvailableActionsKeepRemote", {
+                  sourcePath,
+                  path: snapshot.path,
+                }),
+            cls: "easy-sync-detail-reason",
+          });
+        }
       }
       body.createEl("p", {
         text: this.t("syncView.mutationResolution.noAvailableActionsFallback"),

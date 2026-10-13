@@ -223,6 +223,8 @@ const en: LocaleStrings = {
   "settings.autoSyncChangeDelay.name": "Sync after changes",
   "settings.autoSyncChangeDelay.desc": "Start after a {seconds}-second quiet period; new local changes restart the timer.",
   "settings.autoSyncChangeDelay.disabledDesc": "Off. Local changes will not trigger sync automatically.",
+  "settings.autoSyncOnStartup.name": "Sync on startup",
+  "settings.autoSyncOnStartup.desc": "Start a sync immediately after Obsidian opens.",
   "settings.notificationPopups.name": "Notification pop-ups",
   "settings.notificationPopups.option.all": "All",
   "settings.notificationPopups.option.important": "Important only",

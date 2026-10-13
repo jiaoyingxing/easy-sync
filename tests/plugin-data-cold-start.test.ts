@@ -1430,6 +1430,49 @@ describe("plugin data cold-start cache", () => {
     expect(defaultPlugin.autoSyncRestoreChangeDelaySeconds).toBe(7);
   });
 
+  it("derives the startup channel default from the master state and persists it with the settings", async () => {
+    // 2026-10-13 拍板：缺失键时按当时总开关状态派生——无条件默认开启会把曾经
+    // 主动关掉自动同步的设备重新打开。
+    const optedOutPlugin = new EasySyncPlugin();
+    vi.spyOn(optedOutPlugin, "loadData").mockResolvedValue({
+      "sync-interval": 0,
+      "auto-sync-change-delay-seconds": 0,
+    });
+    const optedOutSave = vi.spyOn(optedOutPlugin, "saveData")
+      .mockResolvedValue(undefined);
+
+    await optedOutPlugin.loadSyncSettings();
+
+    expect(optedOutPlugin.autoSyncOnStartup).toBe(false);
+    expect(optedOutPlugin.isAutoSyncMasterEnabled()).toBe(false);
+    expect(optedOutSave).not.toHaveBeenCalled();
+
+    const freshPlugin = new EasySyncPlugin();
+    vi.spyOn(freshPlugin, "loadData").mockResolvedValue({});
+
+    await freshPlugin.loadSyncSettings();
+
+    expect(freshPlugin.autoSyncOnStartup).toBe(true);
+    expect(freshPlugin.isAutoSyncMasterEnabled()).toBe(true);
+
+    const explicitOffPlugin = new EasySyncPlugin();
+    vi.spyOn(explicitOffPlugin, "loadData").mockResolvedValue({
+      "auto-sync-on-startup": false,
+    });
+    const explicitOffSave = vi.spyOn(explicitOffPlugin, "saveData")
+      .mockResolvedValue(undefined);
+
+    await explicitOffPlugin.loadSyncSettings();
+    expect(explicitOffPlugin.autoSyncOnStartup).toBe(false);
+
+    await explicitOffPlugin.saveSyncSettings();
+
+    expect(explicitOffSave).toHaveBeenCalledWith(expect.objectContaining({
+      "auto-sync-on-startup": false,
+      "auto-sync-restore-on-startup": true,
+    }));
+  });
+
   it("clamps a stored scheduled interval into the slider's 0–10 range without a cold-start write", async () => {
     const clampedPlugin = new EasySyncPlugin();
     vi.spyOn(clampedPlugin, "loadData").mockResolvedValue({

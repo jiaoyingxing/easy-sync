@@ -13,6 +13,18 @@ export const LOCAL_DIRTY_DEBOUNCE_MS =
 export const DEFAULT_AUTO_SYNC_INTERVAL_MINUTES = 3;
 export const MIN_AUTO_SYNC_INTERVAL_MINUTES = 1;
 export const MAX_AUTO_SYNC_INTERVAL_MINUTES = 10;
+export const DEFAULT_AUTO_SYNC_ON_STARTUP = true;
+
+/**
+ * The startup channel is a plain boolean; anything that is not an explicit
+ * boolean (missing key, hand-edited data) falls back to the default. A missing
+ * key at load time does not use this fallback — `loadSyncSettings` derives it
+ * from the current master state instead, so a device that deliberately turned
+ * auto sync off is not silently re-enabled by the new channel (2026-10-13).
+ */
+export function normalizeAutoSyncOnStartup(value: unknown): boolean {
+  return typeof value === "boolean" ? value : DEFAULT_AUTO_SYNC_ON_STARTUP;
+}
 
 export function normalizeAutoSyncChangeDelaySeconds(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {

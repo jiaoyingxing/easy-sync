@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { SliderComponent } from "./__mocks__/obsidian";
+import { SliderComponent, ToggleComponent } from "./__mocks__/obsidian";
 import { I18n } from "../src/i18n";
 import type EasySyncPlugin from "../src/main";
 import { AutoSyncModal } from "../src/ui/auto-sync-modal";
@@ -14,6 +14,7 @@ function createMockPlugin(): EasySyncPlugin {
     i18n,
     syncInterval: 3,
     autoSyncChangeDelaySeconds: 5,
+    autoSyncOnStartup: true,
     saveSyncSettings: vi.fn().mockResolvedValue(undefined),
     restartAutoSync: vi.fn(),
     setAutoSyncChangeDelaySeconds: vi.fn(function (
@@ -22,10 +23,22 @@ function createMockPlugin(): EasySyncPlugin {
     ): void {
       this.autoSyncChangeDelaySeconds = value;
     }),
+    setAutoSyncOnStartup: vi.fn(function (
+      this: { autoSyncOnStartup: boolean },
+      value: boolean,
+    ): void {
+      this.autoSyncOnStartup = value;
+    }),
     isAutoSyncMasterEnabled: function (
-      this: { syncInterval: number; autoSyncChangeDelaySeconds: number },
+      this: {
+        syncInterval: number;
+        autoSyncChangeDelaySeconds: number;
+        autoSyncOnStartup: boolean;
+      },
     ): boolean {
-      return this.syncInterval > 0 || this.autoSyncChangeDelaySeconds > 0;
+      return this.syncInterval > 0
+        || this.autoSyncChangeDelaySeconds > 0
+        || this.autoSyncOnStartup;
     },
     refreshSettingsTab: vi.fn(),
   } as unknown as EasySyncPlugin;
@@ -106,6 +119,7 @@ describe("AutoSyncModal", () => {
     const plugin = createMockPlugin();
     plugin.syncInterval = 0;
     plugin.autoSyncChangeDelaySeconds = 0;
+    plugin.autoSyncOnStartup = false;
     const modal = new AutoSyncModal(plugin);
     modal.onOpen();
 
@@ -113,6 +127,28 @@ describe("AutoSyncModal", () => {
 
     // Master flipped off→on with the scheduled channel off: the join and
     // recovery surfaces must be armed through the shared restart entry.
+    expect(plugin.restartAutoSync).toHaveBeenCalledTimes(1);
+    expect(plugin.refreshSettingsTab).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the startup toggle and re-arms auto sync when it flips the master off", async () => {
+    ToggleComponent.instances.length = 0;
+    const plugin = createMockPlugin();
+    // The startup channel is the only one on: its flip owns the master switch.
+    plugin.syncInterval = 0;
+    plugin.autoSyncChangeDelaySeconds = 0;
+    const modal = new AutoSyncModal(plugin);
+    modal.onOpen();
+
+    // One toggle (the startup channel), after the two sliders.
+    expect(ToggleComponent.instances).toHaveLength(1);
+    const toggle = ToggleComponent.instances[0];
+    expect(toggle.value).toBe(true);
+
+    await toggle.triggerChange(false);
+
+    expect(plugin.setAutoSyncOnStartup).toHaveBeenCalledWith(false);
+    expect(plugin.saveSyncSettings).toHaveBeenCalledTimes(1);
     expect(plugin.restartAutoSync).toHaveBeenCalledTimes(1);
     expect(plugin.refreshSettingsTab).toHaveBeenCalledTimes(1);
   });
