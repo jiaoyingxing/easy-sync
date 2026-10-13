@@ -261,6 +261,11 @@ export interface SyncViewContentKeyInput {
   history: SyncHistoryEntry[];
   lastSyncTime: number;
   mutationRecovery: MutationRecoveryDisplayState | null;
+  /** 更新提示行（方案单 20260915-0025 §四 提示层）：行只在整屏重建时挂载，
+   *  而计划审阅／核对（recovery）体态下模式不随提示出现而翻转——不进指纹时
+   *  这两类体态下的出现与消失会被重建跳过（与 localOnlyRows 同族；
+   *  2026-10-13 实机坐实：状态层已有新版、侧栏整行不可见）。 */
+  updatePrompt?: { latest: string; current: string } | null;
 }
 
 export interface PendingIssueReviewGroup {
@@ -1113,11 +1118,17 @@ export function buildSyncViewContentKey(
       : `${entry.id}:${entry.status}:${messageKey}:${runFactsKey}:${scopeRecoveryKey}`;
   }).join("|");
   const historyKey = historyExpanded ? `history:open:${historyIds}` : "history:closed";
+  // 更新提示行（pending 区尾部、计划审阅与核对体态的内容尾部）都只在整屏
+  // 重建时挂载：提示的出现、消失与版本文案变化必须进指纹，否则重建会被跳过
+  // （pending 体态已由 localOnlyRows 同族修复，2026-10-13 补齐本行）。
+  const updateKey = input.updatePrompt
+    ? `update:${input.updatePrompt.latest}:${input.updatePrompt.current}`
+    : "update:none";
   if (input.bodyMode === "plan") {
     const counts = input.planReviewCounts
       ? `${input.planReviewCounts.uploads},${input.planReviewCounts.downloads},${input.planReviewCounts.folders ?? 0},${input.planReviewCounts.deletes},${input.planReviewCounts.conflicts},${input.planReviewCounts.skipped},${input.planReviewCounts.localOnlyCopies ?? 0}`
       : "";
-    return `plan:${authKey}:${runKey}:${recoveryKey}:${counts}:details:${input.planReviewDetailsState}:revision:${input.planReviewRevision}:${historyKey}`;
+    return `plan:${authKey}:${runKey}:${recoveryKey}:${counts}:details:${input.planReviewDetailsState}:revision:${input.planReviewRevision}:${updateKey}:${historyKey}`;
   }
   if (input.bodyMode === "progress") {
     const scopeRecovery = input.progress.recoveryVerification;
@@ -1153,10 +1164,10 @@ export function buildSyncViewContentKey(
     const localOnly = (input.localOnlyRows ?? [])
       .map((row) => `${row.path}:${row.targetPath}:${row.kind}`)
       .join("|");
-    return `pending:${authKey}:${runKey}:${recoveryKey}:${issues}:${conflicts}:${deletes}:adoption:${adoption}:localOnly:${localOnly}:${historyKey}`;
+    return `pending:${authKey}:${runKey}:${recoveryKey}:${issues}:${conflicts}:${deletes}:adoption:${adoption}:localOnly:${localOnly}:${updateKey}:${historyKey}`;
   }
   if (input.bodyMode === "recovery") {
-    return `recovery:${authKey}:${runKey}:${recoveryKey}:${historyKey}`;
+    return `recovery:${authKey}:${runKey}:${recoveryKey}:${updateKey}:${historyKey}`;
   }
   return `idle:${authKey}:${runKey}:${recoveryKey}:${input.lastSyncTime}:${historyKey}`;
 }
@@ -1543,6 +1554,17 @@ export class EasySyncSyncView extends ItemView {
       this.renderMutationRecoverySection(content, mutationRecovery);
     }
 
+    // 更新提示行：待处理区自带（`renderPendingSection` 尾部）；计划审阅与核对
+    // （recovery）体态此前把它整行吞掉——方案单 §四 要求行位于「冲突/核对/
+    // 待审计划行」之后，故这两类体态也在内容末尾补挂（追加在下方，不推挤
+    // 上方任何行；2026-10-13 实机坐实 iphone/rs-migration 两库整行不可见）。
+    if (updatePrompt && (bodyMode === "plan" || bodyMode === "recovery")) {
+      const updateSection = content
+        .createDiv("easy-sync-section")
+        .createDiv("easy-sync-section-body");
+      this.renderUpdateAvailableItem(updateSection, updatePrompt);
+    }
+
     if (this.historyExpanded) {
       this.renderHistorySection(content, syncState?.syncHistory ?? []);
     }
@@ -1728,6 +1750,8 @@ export class EasySyncSyncView extends ItemView {
       history: syncState?.syncHistory ?? [],
       lastSyncTime: syncState?.lastSyncTime ?? 0,
       mutationRecovery,
+      // 与行渲染同一取值源：提示的出现/消失/版本文案变化都进指纹。
+      updatePrompt,
     });
 
     if (this.lastContentKey !== contentKey) {

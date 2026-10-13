@@ -2968,6 +2968,95 @@ describe("buildSyncViewContentKey · local-only rows (片⑦ 修复)", () => {
   });
 });
 
+describe("buildSyncViewContentKey · update reminder row (2026-10-13 修复)", () => {
+  const base = {
+    isLoggedIn: true,
+    isInitializing: false,
+    isPending: false,
+    isRunning: false,
+    canCancel: false,
+    syncEntryInProgress: false,
+    bodyMode: "pending" as const,
+    progress: {
+      phase: "idle" as const,
+      current: 0,
+      total: 0,
+      currentFile: "",
+      completedFiles: [],
+      completedCount: 0,
+      currentItemBytes: 0,
+      currentItemTotalBytes: 0,
+      cancelRequested: false,
+    },
+    planReviewActive: false,
+    planReviewDetailsState: "ready" as const,
+    pendingIssues: [],
+    conflicts: [],
+    pendingDeletes: [],
+    planReviewCounts: null,
+    planReviewRevision: 0,
+    history: [],
+    lastSyncTime: 0,
+    mutationRecovery: null,
+  };
+  const prompt = { latest: "1.5.8", current: "1.5.7" };
+
+  it("rebuilds when the update row appears, disappears or changes version", () => {
+    const withPrompt = buildSyncViewContentKey(false, {
+      ...base,
+      updatePrompt: prompt,
+    });
+    // 出现 ⇒ 指纹必须变化；否则整屏重建被跳过、行不挂载（2026-10-13 实机：
+    // 状态层已有新版、侧栏整行不可见）。
+    expect(withPrompt).not.toBe(buildSyncViewContentKey(false, base));
+    expect(withPrompt).toContain("update:1.5.8:1.5.7");
+    // 确认跳过（提示消失）⇒ 指纹变化、行立即消失。
+    expect(buildSyncViewContentKey(false, { ...base, updatePrompt: null }))
+      .not.toBe(withPrompt);
+    // 会话内出现更新版本 ⇒ 行文案变化同样触发重建。
+    expect(buildSyncViewContentKey(false, {
+      ...base,
+      updatePrompt: { latest: "1.5.9", current: "1.5.7" },
+    })).not.toBe(withPrompt);
+    // 省略字段与显式 null 同形：无提示设备行为不变。
+    expect(buildSyncViewContentKey(false, { ...base, updatePrompt: null }))
+      .toBe(buildSyncViewContentKey(false, base));
+  });
+
+  it("carries the prompt in the plan and recovery fingerprints as well", () => {
+    // 计划审阅与核对（recovery）体态不因提示出现而翻转模式：指纹不带提示时
+    // 这两类体态下出现/消失都会被重建跳过（方案单 §四 要求行位于待审计划/
+    // 核对行之后；2026-10-13 修复）。
+    for (const bodyMode of ["pending", "plan", "recovery"] as const) {
+      const scoped = { ...base, bodyMode };
+      expect(buildSyncViewContentKey(false, { ...scoped, updatePrompt: prompt }))
+        .not.toBe(buildSyncViewContentKey(false, scoped));
+    }
+  });
+
+  it("renders the row at the tail of the plan and recovery bodies from the same source", () => {
+    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const dispatchSlice = source.slice(
+      source.indexOf('if (bodyMode === "plan" && syncState)'),
+      source.indexOf("if (this.historyExpanded)"),
+    );
+    expect(dispatchSlice).toContain('bodyMode === "plan" || bodyMode === "recovery"');
+    expect(dispatchSlice).toContain(
+      "this.renderUpdateAvailableItem(updateSection, updatePrompt)",
+    );
+    // 待处理区尾部保持原挂点（提示行在两处体态各自只挂一次）。
+    expect(source).toContain(
+      "if (updatePrompt) this.renderUpdateAvailableItem(section, updatePrompt)",
+    );
+    // 指纹与行渲染读同一取值源。
+    const keyCall = source.slice(
+      source.indexOf("const contentKey = buildSyncViewContentKey("),
+      source.indexOf("this.lastContentKey = contentKey"),
+    );
+    expect(keyCall).toContain("updatePrompt,");
+  });
+});
+
 describe("resolveSyncViewStatusDetailMode", () => {
   it("keeps the current full-sync file visible while its mutation receipt is in flight", () => {
     expect(resolveSyncViewStatusDetailMode({
