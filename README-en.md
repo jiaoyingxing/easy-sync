@@ -7,7 +7,7 @@
   <a href="https://github.com/jiaoyingxing/easy-sync/releases">
     <img alt="Latest release" src="https://img.shields.io/github/v/release/jiaoyingxing/easy-sync?style=flat-square&label=Latest%20release" />
   </a>
-  <a href="https://obsidian.md/plugins?id=easy-sync">
+  <a href="https://community.obsidian.md/plugins/easy-sync">
     <img alt="Obsidian Plugin" src="https://img.shields.io/badge/Obsidian-Plugin-7c3aed?style=flat-square" />
   </a>
   <a href="./LICENSE">
@@ -136,12 +136,11 @@ Other options can be enabled as needed:
 
 | Setting | Recommendation |
 | --- | --- |
-| Sync mode | Two-way by default; can be set to one-way sync (receive only) — see [3.3](#33-sync-modes-two-way-and-one-way) |
+| Sync mode | Two-way by default; can be set to one-way sync — see [3.3](#33-sync-modes-two-way-and-one-way) |
 | Sync exclusions | Apply only to the current device; excluded folders are neither uploaded nor downloaded, and existing files are not deleted merely because of the exclusion |
 | Sync scope | Editor settings, appearance, themes and snippets, hotkeys, bookmarks, and core plugins can be controlled separately |
 | Community plugins | Plugin files can be selected individually; each plugin's `data.json` is controlled separately by **Community plugin data** |
 | Community plugin data | Each plugin's `data.json` can be selected separately; this feature is still experimental, so back up plugin settings on every device before enabling it |
-| EasySync self-sync | Off by default; enable it only if EasySync updates should propagate to other devices |
 | Auto sync | Scheduled sync and sync-after-change can be configured separately; **Sync now** remains available when both are off |
 | Automatic handling | Merging non-overlapping text edits is on by default; applying remote deletions locally is off by default, and uncertain cases become conflicts or pending decisions |
 | Diagnostic logging | Leave it off for normal use; enable it when investigating a problem and generating a diagnostic report |
@@ -160,7 +159,7 @@ When the corresponding option is enabled, these objects under `.obsidian` are sy
 - Core plugin enable states (`core-plugins.json`)
 - Bookmarks (`bookmarks.json`)
 - Community plugins: the three plugin files (`main.js`, `manifest.json`, `styles.css`) of plugins participating in sync on this device; plugin data (`data.json`) requires a separate opt-in under **Community plugin data** (experimental)
-- EasySync itself: with **EasySync self-sync** enabled, the plugin files propagate to other devices
+- EasySync itself: the plugin files always propagate to other devices, with no setting needed
 
 Community plugin **enable state is not part of the sync scope**: each device can enable or disable plugins independently.
 
@@ -272,7 +271,7 @@ Yes. EasySync is open source under the [MIT License](LICENSE), and all features 
 
 Different routes: uploads go straight into Microsoft's storage service, while downloads are fetched from Microsoft's file-delivery endpoint — the quality of that leg depends on your network, which the plugin cannot control. On weak cellular, during evening peaks, or on a poor carrier route, downloads can drop to tens of KB/s or fail intermittently; this is not a plugin fault. Interrupted downloads resume from their breakpoint and never restart from zero. If downloads stay slow, try in order:
 
-1. **Switch DNS**: on phones, in the Wi-Fi settings (iOS: “Configure DNS”; Android: “Private DNS”); on computers, in network settings or on the router. Suggested values: 223.5.5.5 (AliDNS) or 119.29.29.29 (DNSPod) in mainland China; 1.1.1.1 or 8.8.8.8 elsewhere — when the default resolver cannot reach the delivery endpoint, a public one often resolves.
+1. **Switch DNS**: on phones, in the Wi-Fi settings (iOS: "Configure DNS"; Android: "Private DNS"); on computers, in network settings or on the router. Suggested values: 223.5.5.5 (AliDNS) or 119.29.29.29 (DNSPod) in mainland China; 1.1.1.1 or 8.8.8.8 elsewhere — when the default resolver cannot reach the delivery endpoint, a public one often resolves.
 2. **Check proxies and firewalls**: make sure their rules do not miss or block the Microsoft download domain `my.microsoftpersonalcontent.com`; on some networks, routing it through a proxy is actually faster.
 3. **Switch networks or sync off-peak**: a different Wi-Fi or an off-peak hour often fixes it by itself.
 4. **(Desktop) edit the hosts file**: point `my.microsoftpersonalcontent.com` to a reachable IP. Technical, may stop working when Microsoft changes its infrastructure, and a last resort.
