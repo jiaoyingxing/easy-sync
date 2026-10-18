@@ -163,6 +163,8 @@ When the corresponding option is enabled, these objects under `.obsidian` are sy
 
 Community plugin **enable state is not part of the sync scope**: each device can enable or disable plugins independently.
 
+Community plugins don't delete across devices either: uninstalling affects only that device, and a deleted cloud copy comes back as long as some other device still syncs the plugin. To delete one everywhere: uninstall it on every device, then use the delete icon on its row in Settings → Sync scope → Manage community plugins to clear the cloud copy.
+
 Note: even with automatic merging of non-overlapping text edits enabled, files under `.obsidian` are never merged automatically — conflicts there always require you to choose the local or the remote side.
 
 ### 3.2 What is not synced
