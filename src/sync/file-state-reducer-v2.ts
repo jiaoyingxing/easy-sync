@@ -16,7 +16,7 @@ import {
   type RemoteFileEntry,
 } from "./types";
 
-export interface FileStatePathViewV2 {
+interface FileStatePathViewV2 {
   baseEntries: BaseFileEntry[];
   remoteEntries: RemoteFileEntry[];
 }
@@ -28,13 +28,13 @@ export interface ReceiptedRenameAnchorCollisionV2 {
   targetAnchor: SyncAnchorV2;
 }
 
-export interface RenameTargetAnchorCollisionV2 {
+interface RenameTargetAnchorCollisionV2 {
   movedRemoteId: string;
   sourceAnchor: SyncAnchorV2;
   targetAnchor: SyncAnchorV2;
 }
 
-export interface RenameTargetAnchorInspectionInputV2 {
+interface RenameTargetAnchorInspectionInputV2 {
   sourcePath: string;
   path: string;
   movedRemoteId: string;

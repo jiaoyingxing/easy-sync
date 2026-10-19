@@ -12,12 +12,12 @@
 import { type App } from "obsidian";
 import { EasySyncModal } from "./easy-sync-modal";
 
-export type VaultJoinOfferResult =
+type VaultJoinOfferResult =
   | { action: "join" }
   | { action: "fresh-sync" }
   | { action: "dismiss" };
 
-export interface VaultJoinOfferViews {
+interface VaultJoinOfferViews {
   title: string;
   body: string;
   join: { title: string; description: string };

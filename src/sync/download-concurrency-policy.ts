@@ -6,7 +6,7 @@ const MIN_HEALTHY_BATCH_BYTES = 128 * 1024;
 const MIN_HEALTHY_THROUGHPUT_BPS = 512 * 1024;
 const SIGNIFICANT_THROUGHPUT_DROP_RATIO = 0.5;
 
-export interface DownloadBatchObservation {
+interface DownloadBatchObservation {
   files: number;
   bytes: number;
   elapsedMs: number;

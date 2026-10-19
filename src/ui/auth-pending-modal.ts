@@ -24,12 +24,12 @@ import {
 } from "./notice-center";
 import { EasySyncModal } from "./easy-sync-modal";
 
-export type PendingModalResult =
+type PendingModalResult =
   | { action: "reopen" }
   | { action: "cancel" }
   | { action: "dismiss" };
 
-export interface AuthPendingModalDeps {
+interface AuthPendingModalDeps {
   auth: AuthModule;
   noticeCenter: Pick<EasySyncNoticeCenter, "show">;
   t: (key: string) => string;

@@ -503,16 +503,125 @@ describe("StateEnvelopeV2Store", () => {
       throw new Error("rename response lost");
     });
 
+    // F31 第九层：对已实际落地的改名，响应丢失不再要求中止本轮——现场
+    // 已证实删除/改名被拒与响应丢失都常态出现，恢复日志本来就按「已生效」
+    // 收敛，改名之后的行为与其一致（观察到目标在位即收口，尽力清除源）。
     await expect(store.recoverInterruptedPublish(envelope().scope))
-      .rejects.toThrow("rename response lost");
+      .resolves.toBe("published");
     expect(JSON.parse(files.get(paths.committed)!)).toEqual(envelope(2));
-    expect(files.has(paths.recovery)).toBe(true);
+    expect(files.has(paths.previous)).toBe(false);
+    expect(files.has(paths.recovery)).toBe(false);
+
+    // 二次调用＝干净态（响应丢失那轮已顺带收口清理）。
+    await expect(store.recoverInterruptedPublish(envelope().scope))
+      .resolves.toBe("none");
+  });
+
+  it("keeps load convergent when cleanup deletion is refused outright", async () => {
+    const { adapter, files, spies } = makeAdapter();
+    const store = new StateEnvelopeV2Store(adapter, paths);
+    files.set(paths.previous, JSON.stringify(envelope(1)));
+    files.set(paths.committed, JSON.stringify(envelope(2)));
+    files.set(paths.recovery, JSON.stringify({
+      version: 1,
+      status: "publishing",
+      scope: envelope().scope,
+      previousCommitSeq: 1,
+      nextCommitSeq: 2,
+      startedAt: 5,
+    }));
+    spies.remove.mockRejectedValue(new Error("Unable to delete file"));
 
     await expect(store.recoverInterruptedPublish(envelope().scope))
       .resolves.toBe("published");
     expect(await store.load(envelope().scope)).toEqual(envelope(2));
+    // 删除被拒＝残档留职；状态照旧由可读槽裁决，下一轮清屋照旧进行。
+    expect(files.has(paths.previous)).toBe(true);
+    expect(files.has(paths.recovery)).toBe(true);
+  });
+
+  it("restores previous through the write channel when rename is refused", async () => {
+    const { adapter, files, spies } = makeAdapter();
+    const store = new StateEnvelopeV2Store(adapter, paths);
+    files.set(paths.previous, JSON.stringify(envelope(1)));
+    files.set(paths.recovery, JSON.stringify({
+      version: 1,
+      status: "publishing",
+      scope: envelope().scope,
+      previousCommitSeq: 1,
+      nextCommitSeq: 2,
+      startedAt: 5,
+    }));
+    spies.rename.mockRejectedValue(new Error("Unable to rename, unknown reason"));
+
+    await expect(store.recoverInterruptedPublish(envelope().scope))
+      .resolves.toBe("rolled-back");
+    expect(JSON.parse(files.get(paths.committed)!)).toEqual(envelope(1));
+    expect(await store.load(envelope().scope)).toEqual(envelope(1));
     expect(files.has(paths.previous)).toBe(false);
-    expect(files.has(paths.recovery)).toBe(false);
+  });
+
+  it("never trusts the write channel substitution readback", async () => {
+    const { adapter, files, spies } = makeAdapter();
+    const store = new StateEnvelopeV2Store(adapter, paths);
+    files.set(paths.previous, JSON.stringify(envelope(1)));
+    files.set(paths.recovery, JSON.stringify({
+      version: 1,
+      status: "publishing",
+      scope: envelope().scope,
+      previousCommitSeq: 1,
+      nextCommitSeq: 2,
+      startedAt: 5,
+    }));
+    spies.rename.mockRejectedValue(new Error("Unable to rename, unknown reason"));
+    // 写通道被挂载层篡改（读回与写入源不一致）：必须拒绝，宁可本轮失败、
+    // 下一轮恢复，也不能让不可信内容占住已提交槽。
+    spies.write.mockImplementation(async (path: string, value: string) => {
+      if (path === paths.committed) {
+        const tampered = JSON.parse(value);
+        tampered.remoteIndex.cursorRevision = 999;
+        files.set(path, JSON.stringify(tampered));
+        return;
+      }
+      files.set(path, value);
+    });
+
+    await expect(store.recoverInterruptedPublish(envelope().scope))
+      .rejects.toThrow("Unable to rename, unknown reason");
+    expect(files.has(paths.committed)).toBe(true);
+    expect(JSON.parse(files.get(paths.committed)!).remoteIndex.cursorRevision)
+      .toBe(999);
+  });
+
+  it("publishes over a converged leftover journal when its cleanup was refused", async () => {
+    const { adapter, files, spies } = makeAdapter();
+    const store = new StateEnvelopeV2Store(adapter, paths);
+    files.set(paths.previous, JSON.stringify(envelope(1)));
+    files.set(paths.committed, JSON.stringify(envelope(2)));
+    files.set(paths.recovery, JSON.stringify({
+      version: 1,
+      status: "publishing",
+      scope: envelope().scope,
+      previousCommitSeq: 1,
+      nextCommitSeq: 2,
+      startedAt: 5,
+    }));
+    spies.remove.mockRejectedValue(new Error("Unable to delete file"));
+
+    // 恢复读场先收敛 journal；清理被拒后残留。load 已裁决、publish 不应
+    // 再被残账本拦下（F31：celebrated 尽力而为语义下删不掉＝留职）。
+    await expect(store.recoverInterruptedPublish(envelope().scope))
+      .resolves.toBe("published");
+
+    const next = envelope(3);
+    next.remoteIndex.deltaLink = "delta-3";
+    next.remoteIndex.cursorRevision = 3;
+    next.meta.commitSeq = 3;
+    next.meta.committedAt = 3000;
+    next.anchors.byAnchorId.anchor!.remoteETag = "e3";
+    await expect(store.publish(next)).resolves.toBeUndefined();
+    expect(JSON.parse(files.get(paths.committed)!)).toEqual(next);
+    expect(files.has(paths.previous)).toBe(true);
   });
 
   it("repairs only invalid cursor metadata in an otherwise valid committed envelope", async () => {
@@ -799,7 +908,7 @@ describe("StateEnvelopeV2Store", () => {
   it.each([
     { name: "previous cleanup", failAtRemoveCall: 1 },
     { name: "journal cleanup", failAtRemoveCall: 2 },
-  ])("converges after $name response loss", async ({ failAtRemoveCall }) => {
+  ])("converges when $name cleanup reports lost response", async ({ failAtRemoveCall }) => {
     const { adapter, files, spies } = makeAdapter();
     const corrupt = envelope();
     corrupt.remoteIndex.cursorRevision = -1;
@@ -813,22 +922,26 @@ describe("StateEnvelopeV2Store", () => {
       }
     });
 
-    await expect(
-      new StateEnvelopeV2Store(adapter, paths)
-        .repairCursorOnly(envelope().scope, 2000),
-    ).rejects.toThrow("cleanup response lost");
+    // F31 第九层：清理删除尽力而为——响应丢失（实际已删）不再中止本轮，
+    // 直接返回修复结果；终态与下一轮收敛后的状态一致。
+    const repaired = await new StateEnvelopeV2Store(adapter, paths)
+      .repairCursorOnly(envelope().scope, 2000);
+    expect(repaired).toMatchObject({
+      meta: { commitSeq: 2 },
+      remoteIndex: { cursorRevision: 0, deltaLink: null },
+    });
     expect(JSON.parse(files.get(paths.committed)!)).toMatchObject({
       meta: { commitSeq: 2 },
     });
+    expect(files.has(paths.previous)).toBe(false);
+    expect(files.has(paths.next)).toBe(false);
+    expect(files.has(paths.recovery)).toBe(false);
 
     const restarted = new StateEnvelopeV2Store(adapter, paths);
     await expect(restarted.load(envelope().scope)).resolves.toMatchObject({
       meta: { commitSeq: 2 },
       remoteIndex: { cursorRevision: 0, deltaLink: null },
     });
-    expect(files.has(paths.previous)).toBe(false);
-    expect(files.has(paths.next)).toBe(false);
-    expect(files.has(paths.recovery)).toBe(false);
   });
 
   it("preserves unknown envelope fields while repairing only cursor metadata", async () => {

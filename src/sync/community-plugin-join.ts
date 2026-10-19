@@ -12,7 +12,7 @@ import {
   type SyncScope,
 } from "./types";
 
-export type CommunityPluginJoinBlockReason =
+type CommunityPluginJoinBlockReason =
   | "catalog-unavailable"
   | "catalog-stale"
   | "scope-changed"

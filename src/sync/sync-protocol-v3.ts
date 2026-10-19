@@ -61,7 +61,7 @@ export type SharedSyncProtocolBinding =
   | SharedSyncProtocolBindingV2
   | SharedSyncProtocolBindingV3;
 
-export type EnsureSharedSyncProtocolResultV3 =
+type EnsureSharedSyncProtocolResultV3 =
   | {
     status: "ready";
     source: "existing" | "created" | "create-race";

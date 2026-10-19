@@ -77,20 +77,20 @@ interface Public113StateDb extends DBSchema {
   };
 }
 
-export interface IndexedDbPublic113StateCounts {
+interface IndexedDbPublic113StateCounts {
   remoteNodes: number;
   anchors: number;
   folderAnchors: number;
 }
 
-export interface IndexedDbPublic113StageResult {
+interface IndexedDbPublic113StageResult {
   reused: boolean;
   candidateDigest: string;
   counts: IndexedDbPublic113StateCounts;
   batches: number;
 }
 
-export interface IndexedDbPublic113StateInspection {
+interface IndexedDbPublic113StateInspection {
   phase: ImportPhase | "missing";
   authority: "inactive" | null;
   sourceStateDigest: string | null;
@@ -99,14 +99,14 @@ export interface IndexedDbPublic113StateInspection {
   counts: IndexedDbPublic113StateCounts;
 }
 
-export interface IndexedDbPublic113PlannerView {
+interface IndexedDbPublic113PlannerView {
   sourceStateDigest: string;
   candidateDigest: string;
   counts: IndexedDbPublic113StateCounts;
   state: CanonicalPlannerStateV2;
 }
 
-export interface Public113IndexedDbCandidateStore {
+interface Public113IndexedDbCandidateStore {
   stageCandidate(
     candidate: SyncStateEnvelopeV2,
     options: {

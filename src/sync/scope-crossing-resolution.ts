@@ -42,7 +42,7 @@ export interface ScopeCrossingResolutionFactsV1 {
 }
 
 /** The move hint that owns one scope-crossing row, with its bound anchor. */
-export interface ScopeCrossingCoveringHintV1 {
+interface ScopeCrossingCoveringHintV1 {
   kind: "folder" | "file";
   hint: LocalFolderMoveHintV1;
   anchorLastPath: string;

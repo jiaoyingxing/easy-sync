@@ -4,7 +4,7 @@
  */
 
 /** Identity set: user, application, or device that performed an action. */
-export interface IdentitySet {
+interface IdentitySet {
   user?: { id?: string; displayName?: string };
   application?: { id?: string; displayName?: string };
   device?: { id?: string; displayName?: string };
@@ -113,17 +113,6 @@ export interface UploadResult {
   cTag?: string;
   lastModifiedDateTime?: string;
   parentReference?: DriveItem["parentReference"];
-}
-
-/** Strict byte read-back for one immutable object below the plugin-control root. */
-export interface CommunityPluginGenerationCloudObjectV1 {
-  id: string;
-  name: string;
-  parentId: string;
-  size: number;
-  eTag: string;
-  cTag: string;
-  content: ArrayBuffer;
 }
 
 /** OneDrive-specific error types for classification */
@@ -242,7 +231,7 @@ const ONE_DRIVE_INVALID_NAME_CHARACTERS = new Set([
 ]);
 
 /** What exactly makes a OneDrive item name unacceptable. */
-export type OneDriveInvalidNameIssue =
+type OneDriveInvalidNameIssue =
   /** A visible reserved character, e.g. `?`, `:`, `"`. The offending char is returned for display. */
   | { kind: "char"; char: string }
   /** The name ends with a dot (`.`), which OneDrive treats as an extension-signature. */

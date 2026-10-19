@@ -27,12 +27,12 @@ export interface SharedFolderIdentityResolutionSnapshotV1 {
  * reported while this entry can never confirm it — renaming one side to match
  * the other exactly is the only way out.
  */
-export type SharedFolderIdentityResolutionOutcomeV1 =
+type SharedFolderIdentityResolutionOutcomeV1 =
   | { status: "ready"; snapshot: SharedFolderIdentityResolutionSnapshotV1 }
   | { status: "name-mismatch"; path: string }
   | { status: "unavailable" };
 
-export interface SharedFolderIdentityResolutionFactsV1 {
+interface SharedFolderIdentityResolutionFactsV1 {
   envelope: SyncStateEnvelopeV2;
   localFiles: readonly LocalFileEntry[];
   localFolders: readonly LocalFolderEntry[];

@@ -7,6 +7,7 @@ import {
   resetPhasePrefix,
   type DiagnosticResetFacts,
 } from "../src/sync/diagnostic-report-evidence";
+import { functionBody } from "./helpers/source-scope";
 
 const SAMPLE_REPORT = [
   "# EasySync 诊断报告",
@@ -202,16 +203,21 @@ describe("重置血统源码守卫", () => {
   });
 
   it("报告装配携带重置历史节、日志归因与摘录附录，且快照生成不嵌历史", () => {
+    // 收窄：这三条句子在 main.ts 里都出现多次（导入、另一处列表分支），
+    // 全部绑到真正装配它们的那个函数体上。
+    const anomaliesSection = functionBody(
+      source,
+      "private async renderDiagnosticAnomaliesSection(",
+    );
     expect(source).toContain("## 重置历史");
     expect(source).toContain("## 重置前档案摘录（${resetFacts.preResetReportFile}）");
-    expect(source).toContain("resetPhasePrefix(e.ts, resetFacts)");
+    expect(anomaliesSection).toContain("resetPhasePrefix(e.ts, resetFacts)");
     expect(source).toContain("resetSnapshot ? null : this.lastResetFacts");
     expect(source).toContain(
       "extractPreResetReportCore(\n            await this.app.vault.cachedRead(preResetFile),",
     );
-    expect(source).toContain("PRE_RESET_REPORT_EMBED_CHAR_LIMIT");
+    expect(anomaliesSection).toContain("PRE_RESET_REPORT_EMBED_CHAR_LIMIT");
   });
-
   it("设置域持久化重置标记键", () => {
     expect(source).toContain('const KEY_LAST_RESET_FACTS = "last-reset-facts";');
     expect(source).toContain("data[KEY_LAST_RESET_FACTS] = this.lastResetFacts;");

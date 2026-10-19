@@ -40,6 +40,7 @@ import { SyncActionType } from "../src/sync/types";
 import type { SyncPlanItem } from "../src/sync/types";
 import { ConfirmModal } from "../src/ui/confirm-modal";
 import { formatFileSize } from "../src/ui/file-comparison-modal";
+import { functionBody } from "./helpers/source-scope";
 
 interface FakeHistoryElement {
   tag: string;
@@ -2573,7 +2574,11 @@ describe("buildSyncViewContentKey", () => {
     const row = source.slice(rowStart, openStart);
     const openMethod = source.slice(openStart, openEnd);
 
-    expect(row).toContain('issue.issueCode === "unanchored-shared-folder"');
+    // 出口种类现由 `pendingIssueExitKind`（src/sync/sync-item-termination）
+    // 单点判定：S4 终止判据的「有没有真实人工出口」与本行的 chip 分支必须来
+    // 自同一判断，否则会出现「判定说没有出口、界面却在画出口」。逐字改写下
+    // 该码点（用例全名与项数不变，2026-10-17 S4）。
+    expect(row).toContain('case "shared-folder-identity":');
     expect(row).toContain('t("syncView.sharedFolderIdentity.resolve")');
     expect(openMethod).toContain(
       "if (this.sharedFolderIdentityResolutionOpening) return",
@@ -2613,7 +2618,9 @@ describe("buildSyncViewContentKey", () => {
     ));
     const openMethod = source.slice(openStart, source.indexOf("\n  private ", openStart + 5));
 
-    expect(row).toContain('issue.issueCode === "folder-location-choice"');
+    // 同族改写（2026-10-17 S4 终止判据）：出口种类单点判定在
+    // `pendingIssueExitKind`，本行的 chip 分支按它分发（用例名与项数不变）。
+    expect(row).toContain('case "folder-location":');
     expect(row).toContain('t("syncView.folderLocation.resolve")');
     expect(openMethod).toContain("new EmptyFolderResolutionModal(");
     expect(openMethod).toContain('choice?.action === "keep-local-location"');
@@ -2636,8 +2643,10 @@ describe("buildSyncViewContentKey", () => {
     const row = source.slice(rowStart, openStart);
     const openMethod = source.slice(openStart, openEnd);
 
-    expect(row).toContain('issue.issueCode === "identity-replacement-ambiguous"');
-    expect(row).toContain('issue.issueCode === "anchored-folder-missing-remote"');
+    // 同族改写（2026-10-17 S4 终止判据）：这批码点归入
+    // `pendingIssueExitKind` 的 stale-identity 类，本行只按类分发 chip；
+    // 判定侧的「有真实出口」读同一函数（用例名与项数不变）。
+    expect(row).toContain('case "stale-identity":');
     expect(row).toContain('t("syncView.staleIdentity.resolve")');
     expect(openMethod).toContain(
       "if (this.staleIdentityResolutionOpening) return",
@@ -2752,7 +2761,6 @@ describe("buildSyncViewContentKey", () => {
     expect(styles).toMatch(
       /\.easy-sync-comparison-path-table\s*\{[^}]*table-layout:\s*fixed;/s,
     );
-    expect(styles).toContain("easy-sync-comparison-bundle-table");
     expect(styles).toMatch(
       /\.easy-sync-comparison-path-table th,\s*\.easy-sync-comparison-path-table td\s*\{[^}]*overflow-wrap:\s*anywhere;/s,
     );
@@ -3853,14 +3861,12 @@ describe("scope-crossing row exit gating", () => {
     expect(render).toContain(
       "this.plugin.state?.getScopeCrossingExitKind(issue.path)",
     );
-    // 双 chip 分支以出口存在为前提；无出口（漂移/设置形态）行不再有通用
-    // 兜底重试按钮——重试统一走顶部主动作（2026-09-16 按钮清理）。
-    expect(render).toContain(
-      'if (issue.issueCode === "scope-crossing" && scopeCrossingExitKind) {',
-    );
-    const branchStart = render.indexOf(
-      'if (issue.issueCode === "scope-crossing" && scopeCrossingExitKind) {',
-    );
+    // 双 chip 分支以出口存在为前提（出口种类由 `pendingIssueExitKind` 单点
+    // 判定，2026-10-17 S4 逐字改写：原来这里直接比对 issueCode 条件，现在
+    // 渲染按种类分发，判定侧读同一函数）；无出口（漂移/设置形态）行不再有
+    // 通用兜底重试按钮——重试统一走顶部主动作（2026-09-16 按钮清理）。
+    expect(render).toContain('case "scope-crossing":');
+    const branchStart = render.indexOf('case "scope-crossing":');
     const fallback = render.slice(branchStart);
     expect(fallback).not.toContain("formatPendingIssueActionLabel");
     expect(fallback).not.toContain("startManualSync");
@@ -4259,8 +4265,14 @@ describe("one-way local-only rows (片④)", () => {
 
   it("feeds the section count and the queued-path filter from the same records", () => {
     const source = readFileSync("src/ui/sync-view.ts", "utf8");
-    expect(source).toContain("localOnlyRows: this.plugin.getLocalOnlyRows()");
-    expect(source).toContain("isSideActionQueued(entry.targetPath)");
+    // 收窄：这两句在文件里各有两处（渲染主流程与待处理区），且都承重——
+    // 只留文件级断言时，删掉其中一处仍然全绿。
+    const renderBody = functionBody(source, "private doRender(): void");
+    const pendingBody = functionBody(source, "private renderPendingSection(");
+    expect(renderBody).toContain("localOnlyRows: this.plugin.getLocalOnlyRows()");
+    expect(pendingBody).toContain("localOnlyRows: this.plugin.getLocalOnlyRows()");
+    expect(renderBody).toContain("isSideActionQueued(entry.targetPath)");
+    expect(pendingBody).toContain("isSideActionQueued(entry.targetPath)");
     const countStart = source.indexOf("const pendingCount = ");
     expect(countStart).toBeGreaterThanOrEqual(0);
     expect(source.slice(countStart, countStart + 500))

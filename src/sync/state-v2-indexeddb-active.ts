@@ -63,13 +63,13 @@ interface StateV2ActiveDb extends DBSchema {
   };
 }
 
-export interface StateV2IndexedDbActiveCounts {
+interface StateV2IndexedDbActiveCounts {
   remoteNodes: number;
   anchors: number;
   folderAnchors: number;
 }
 
-export interface StateV2IndexedDbActiveInspection {
+interface StateV2IndexedDbActiveInspection {
   phase: ActiveStatePhase | "missing";
   databaseId: string | null;
   commitSeq: number | null;
@@ -78,7 +78,7 @@ export interface StateV2IndexedDbActiveInspection {
   counts: StateV2IndexedDbActiveCounts;
 }
 
-export interface StateV2IndexedDbActiveInitializeResult {
+interface StateV2IndexedDbActiveInitializeResult {
   reused: boolean;
   stateDigest: string;
   counts: StateV2IndexedDbActiveCounts;
@@ -86,19 +86,19 @@ export interface StateV2IndexedDbActiveInitializeResult {
   logicalWrites: number;
 }
 
-export interface StateV2IndexedDbActiveCommitResult {
+interface StateV2IndexedDbActiveCommitResult {
   alreadyCommitted: boolean;
   commitSeq: number;
   stateDigest: string;
   logicalWrites: number;
 }
 
-export type StateV2IndexedDbRecoveryReconciliation =
+type StateV2IndexedDbRecoveryReconciliation =
   | "clean"
   | "witness-confirmed"
   | "orphan-retired";
 
-export type StateV2IndexedDbActiveStateErrorReason =
+type StateV2IndexedDbActiveStateErrorReason =
   | "missing"
   | "not-ready"
   | "binding-mismatch"

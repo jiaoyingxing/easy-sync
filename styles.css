@@ -492,25 +492,6 @@ body.is-mobile .easy-sync-empty-folder-actions button {
   width: 44%;
 }
 
-/*
- * Bundle reviews use short file names instead of full paths: let the label
- * column size to its content and give the local/cloud columns the rest.
- * The generic path table above keeps its fixed 44% label column for the
- * ordinary long-path review rows.
- */
-.easy-sync-comparison-path-table.easy-sync-comparison-bundle-table {
-  table-layout: auto;
-}
-
-.easy-sync-comparison-path-table.easy-sync-comparison-bundle-table
-th:first-child,
-.easy-sync-comparison-path-table.easy-sync-comparison-bundle-table
-td:first-child {
-  width: auto;
-  white-space: nowrap;
-  overflow-wrap: normal;
-}
-
 .easy-sync-metadata-table th {
   background: var(--background-secondary);
   font-weight: 600;
@@ -992,10 +973,6 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
   font-family: var(--font-monospace);
 }
 
-.easy-sync-recovery-actions {
-  margin-top: var(--size-2-3);
-}
-
 .easy-sync-tree-status-icon,
 .easy-sync-file-icon {
   display: inline-flex;
@@ -1445,6 +1422,11 @@ body.is-mobile .easy-sync-auth-pending-actions button {
   min-height: 44px;
   padding: var(--size-4-2) var(--size-4-3);
   text-align: left;
+  /* The host global `button` rule sets `white-space: nowrap`, which inherits
+     into this row and defeats `overflow-wrap: anywhere` below — a long
+     repository name then overflows as one line and paints over the copy
+     icon (long-name mobile report, 2026-10). Restore wrapping here. */
+  white-space: normal;
   background: transparent;
   border: none;
   border-radius: 0;
@@ -1572,6 +1554,44 @@ body.is-mobile .easy-sync-device-actions button {
 .easy-sync-settings-tab .easy-sync-settings-account + .easy-sync-settings-group-host,
 .easy-sync-settings-tab .easy-sync-settings-group-host + .easy-sync-settings-group-host {
   margin-top: var(--size-4-6);
+}
+
+/* 设置窗左栏：宿主对第三方插件整栏隐藏页签图标（1.14 asar 规则原文
+   `.vertical-tab-header-group-items[data-section="community-plugins"]
+   .vertical-tab-nav-item-icon{display:none}`）。这里只放开本插件自己那一行（按
+   页签 id），其余插件行保持宿主给的纯文字形态；本规则 specificity 高于宿主隐藏
+   规则，不需要 !important。宿主改版 ⇒ 规则失效 ⇒ 回到纯文字，功能不受影响。 */
+.vertical-tab-header-group-items[data-section="community-plugins"] .vertical-tab-nav-item[data-setting-id="easy-sync"] .vertical-tab-nav-item-icon {
+  display: flex;
+}
+
+/* 1.13+ 根级导航行行首图标（声明式 schema 无 icon 字段，由
+   src/ui/settings-root-icons.ts 按「行名＝页名」补挂）：尺寸/颜色对齐宿主图标
+   习惯（--icon-s ＋ --text-muted）。间距写法与 Resojot 逐字同形（2026-10-17
+   用户要求对齐）：基础 8px ＋ 手机端 4px——两者的实际生效条件见下条。 */
+body.is-phone .easy-sync-settings-root-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  margin-inline-end: var(--size-4-1);
+}
+
+/* 手机端收一档到 4px。**`body.is-phone` 前缀是承重的**：宿主有一条
+   `.setting-item > *:first-child { margin-inline-end: var(--size-4-4) }`
+   （asar 原文；specificity (0,2,0)，16px）会给每个设置行的首个子元素统一派边距，
+   任何**单类**间距规则都被它压掉——本插件在桌面如此，Resojot 在桌面同样如此
+   （2026-10-17 真机读它的构筑物：桌面 computed 也是 16px）；带上 body.is-phone
+   后本规则为 (0,2,1)，刚好压过它，于是手机端能收到 4px——这正是「它手机行、我们
+   手机不行」的全部原因（真机对照实测：加该前缀后同一行间距 16px→4px）。 */
+.easy-sync-settings-root-icon {
+  margin-inline-end: var(--size-4-2);
+}
+
+.easy-sync-settings-root-icon svg {
+  width: var(--icon-s);
+  height: var(--icon-s);
 }
 
 /* Desktop only: settings action buttons share one minimum width — the natural

@@ -332,7 +332,7 @@ const KEY_RS_ADOPTION_MARKER = "rs-adoption-marker";
  *  activations keep seeding identical-content baselines until the V2
  *  authority commits. Never a sync authority; survives reset on purpose
  *  (the adopted content stays in the cloud folder). */
-export interface RsAdoptionMarker {
+interface RsAdoptionMarker {
   vaultName: string;
   sourceVaultDirId: string;
   strategy: "moved" | "copied";
@@ -4550,30 +4550,49 @@ export default class EasySyncPlugin extends Plugin {
     const retryingDescendantFileReconstruction =
       result.continueAfterConfirmedDescendantFileReconstruction === true
       && result.descendantFileReconstructionRetryableFailure === true;
-    // Deterministic community-plugin identity blocks stay visible in
-    // `errors` (history and failure details stay honest) but must not pause
-    // the whole auto-sync round: nothing was written and only an
-    // observed-fact change can clear the block. Exemptions apply only to the
-    // failure branches those blocks can trigger (non-success / errors);
-    // auth, cancellation and review pauses keep pausing.
-    // Conflicts no longer pause automatic sync: they stay a visible pending
-    // decision (sidebar/ribbon still show them) while the rest of the vault
-    // keeps syncing (user decision 2026-09-01, docs/temp/20260901-221059).
-    const identityBlockedOnly = (result.identityBlockedErrors ?? 0) > 0
-      && (result.identityBlockedErrors ?? 0) === result.errors;
-    // M17 breaker deferrals keep auto sync alive: the deferred item is the
-    // breaker protecting the round (its own message promises "自动同步将约每
-    // 15 分钟重试一次"), so a round whose only errors are breaker deferrals
-    // must not pause auto sync — same shape as identityBlockedOnly and the
-    // 2026-09-01 conflicts decision.
-    const breakerDeferredOnly = (result.breakerDeferredErrors ?? 0) > 0
-      && (result.breakerDeferredErrors ?? 0) === result.errors;
+    // Errors that must not pause the whole auto-sync round stay visible in
+    // `errors` (history and failure details stay honest); each exempt family
+    // has its own decision:
+    // - deterministic community-plugin identity blocks: nothing was written,
+    //   and only an observed-fact change can clear the block;
+    // - M17 breaker deferrals: the breaker protecting the round must not fail
+    //   it (its own message promises "自动同步将约每 15 分钟重试一次");
+    // - network-class transfer failures (2026-10-16 user decision): a dropped
+    //   link is an environmental transient — the item rows and the failure
+    //   notice stay, and the next round retries under the M17 network backoff
+    //   arm. Pausing would silence that very arm and leave the vault stopped
+    //   until a manual sync, which is what a long-lived machine hit after its
+    //   network came back.
+    // - plan-layer deferrals (2026-10-18 user decision): a `RetryLater` item
+    //   the plan itself produced for an identity-replacement verification
+    //   ("nothing was changed this round") is by design settled by *the next
+    //   round's* verification — pausing for a manual sync would contradict
+    //   the deferral's own semantics and the F30 rule that only unknown
+    //   outcomes stop the vault. The failure row and the notice stay.
+    // Conflicts no longer pause automatic sync either: they stay a visible
+    // pending decision (sidebar/ribbon still show them) while the rest of the
+    // vault keeps syncing (user decision 2026-09-01, docs/temp/20260901-221059).
+    // The gate asks whether *every* counted error belongs to an exempt family,
+    // not whether one family accounts for all of them: a round mixing exempt
+    // families (a breaker-deferred item plus a fresh dropped link, or a
+    // blocked identity item plus either, or a plan deferral plus any of them)
+    // is still all-exempt, while any error outside the families keeps the
+    // round pausing. The sum is compared for equality, so an over-count (a
+    // deferred item that never reached execution) pauses instead of slipping
+    // through.
+    const exemptErrorFamilies =
+      (result.identityBlockedErrors ?? 0)
+      + (result.breakerDeferredErrors ?? 0)
+      + (result.networkFailureErrors ?? 0)
+      + (result.planningDeferredErrors ?? 0);
+    const exemptFailuresOnly = exemptErrorFamilies > 0
+      && exemptErrorFamilies === result.errors;
     const pauseAutoSync =
       !retryableMutationRecovery
       && !retryingDescendantFileReconstruction
       && (
-      ((!result.success && !harmlessRejectedRun) && !identityBlockedOnly && !breakerDeferredOnly)
-      || (result.errors > 0 && !identityBlockedOnly && !breakerDeferredOnly)
+      ((!result.success && !harmlessRejectedRun) && !exemptFailuresOnly)
+      || (result.errors > 0 && !exemptFailuresOnly)
       || result.authExpired
       || this.isCancelled(result)
       || this.isPlanReviewPaused(result)
@@ -10237,7 +10256,6 @@ export default class EasySyncPlugin extends Plugin {
       lines.push("");
     }
   }
-
 
   /** Apply max file size setting to the scanner. Public so settings-tab can call it. */
   applyMaxFileSize(): void {

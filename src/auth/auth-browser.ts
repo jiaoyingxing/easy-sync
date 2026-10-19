@@ -9,7 +9,7 @@ interface AuthBrowserLauncherOptions {
   openWindow?: AuthWindowOpener;
 }
 
-export interface AuthBrowserLauncher {
+interface AuthBrowserLauncher {
   openUrl(url: string): void;
 }
 

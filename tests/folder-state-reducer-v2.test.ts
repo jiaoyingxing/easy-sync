@@ -381,6 +381,70 @@ describe("V2 folder-create reducer", () => {
       .toThrow("Reviewed folder location source changed");
   });
 
+  // A1（2026-10-16 复核）：这是**现役行为**的钉子，必须绿——它记录归约层的逐字节
+  // 父路径断言本身（folder-state-reducer-v2.ts:1065-1066），也是文件夹层
+  // 「目的父目录拼写别名」缺闸的停机条件：执行器把回执路径写成本机拼写
+  // （sync-executor.ts:22024），而索引里父身份仍按规范拼写投影 ⇒ 结构上无法提交。
+  // 全仓此前对该错误串零测试引用；A1-甲 修复（乙）落地后本条**保持不动**。
+  it("rejects a folder move receipt whose parent spelling differs from the committed index", () => {
+    const current = envelope([
+      {
+        id: "parent",
+        name: "videos",
+        folder: {},
+        parentReference: { id: scope.filesRootId },
+        eTag: "etag-parent",
+      },
+      {
+        id: "sub",
+        name: "Notes",
+        folder: {},
+        parentReference: { id: "parent" },
+        eTag: "etag-sub",
+      },
+    ]);
+    current.folderAnchors!.byAnchorId = {
+      "folder:parent": {
+        anchorId: "folder:parent",
+        remoteId: "parent",
+        lastPath: "videos",
+        parentRemoteId: scope.filesRootId,
+        remoteETag: "etag-parent",
+        confirmedGeneration: 3,
+        confirmedAt: 1,
+      },
+    };
+    const moved: RemoteFolderEntry = {
+      path: "Videos/Notes2",
+      driveId: "sub",
+      parentId: "parent",
+      name: "Notes2",
+      eTag: "etag-sub-2",
+    };
+    const moveIntent: FolderMutationIntentV2 = {
+      ...intent("moveRemoteFolder", moved.path, {
+        ...moved,
+        path: "videos/Notes",
+        name: "Notes",
+        eTag: "etag-sub",
+      }),
+      sourcePath: "videos/Notes",
+      folderId: "sub",
+      expectedLocal: { exists: true },
+      expectedRemote: {
+        exists: true,
+        driveId: "sub",
+        parentId: "parent",
+        eTag: "etag-sub",
+      },
+    };
+    const record = receipt(moveIntent, moved);
+
+    // 回执父路径（本机拼写 Videos/Notes2 ⇒ 父 Videos）与索引父路径（videos）逐字节不等。
+    expect(() => reduceFolderStateEnvelopeV2(current, record))
+      .toThrow("V2 folder parent path changed: Videos/Notes2");
+  });
+
   it("retires only an empty folder identity and replays safely", () => {
     const current = envelope([{
       id: "empty",

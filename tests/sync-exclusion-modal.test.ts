@@ -5,6 +5,7 @@ import { DropdownComponent, TextComponent } from "./__mocks__/obsidian";
 import { I18n } from "../src/i18n";
 import { DEFAULT_MAX_FILE_SIZE_MB, normalizeMaxFileSizeMb } from "../src/sync/types";
 import type EasySyncPlugin from "../src/main";
+import { functionBody } from "./helpers/source-scope";
 import {
   buildSyncExclusionFolderCandidates,
   parseMaxFileSizeInput,
@@ -93,16 +94,28 @@ describe("large-file exclusion select control in the modal", () => {
   it("lives inside SyncExclusionModal as a select with presets, unlimited and custom", () => {
     const source = readFileSync("src/ui/sync-exclusion-modal.ts", "utf8");
     const settingsSource = readFileSync("src/ui/settings-tab.ts", "utf8");
+    // 收窄：这三处在同一文件里都出现两次（另一处是同名的另一条路径），
+    // 绑到各自真正负责的函数体上。
+    const renderBody = functionBody(source, "private render(): void");
+    const visibilityBody = functionBody(
+      source,
+      "private syncMaxFileSizeCustomTextVisibility(): void",
+    );
+    const persistBody = functionBody(
+      source,
+      "private async persistMaxFileSizeMb(value: number): Promise<void>",
+    );
 
     expect(source).toContain('t("settings.maxFileSize.name")');
     expect(source).toContain(".addDropdown(");
     expect(source).toContain(".addText(");
-    expect(source).toContain("inputEl.hidden = selection.kind !== \"custom\"");
+    expect(renderBody).toContain("inputEl.hidden = selection.kind !== \"custom\"");
+    expect(visibilityBody).toContain("inputEl.hidden = selection.kind !== \"custom\"");
     expect(source).not.toContain(".addSlider(");
     expect(source).toContain('t("settings.maxFileSize.optionUnlimited")');
     expect(source).toContain('t("settings.maxFileSize.optionCustom")');
     expect(source).toContain('inputEl.inputMode = "numeric"');
-    expect(source).toContain("plugin.applyMaxFileSize");
+    expect(persistBody).toContain("plugin.applyMaxFileSize");
     expect(settingsSource).not.toContain(
       '.setName(t("settings.maxFileSize.name"))',
     );

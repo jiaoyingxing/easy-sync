@@ -46,7 +46,7 @@ export function conservativeResetRecordRemoteIds(
  * effects or unrelated paths need their original full authority and cannot be
  * reduced to an ordinary-file reset capsule.
  */
-export function conservativeResetReceiptIsBounded(
+function conservativeResetReceiptIsBounded(
   record: Readonly<MutationLedgerEntryV1>,
 ): boolean {
   const checkpoint = record.receipt?.checkpoint;

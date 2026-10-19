@@ -11,7 +11,7 @@
  * apart; they never change control flow.
  */
 
-export type IndexedDbErrorKind =
+type IndexedDbErrorKind =
   /** iOS WebKit: an IndexedDB transaction auto-committed before a queued operation ran. */
   | "webkit-transaction"
   /** IndexedDB-family error without the WebKit transaction quirk. */
@@ -61,7 +61,7 @@ export function classifyIndexedDbError(error: unknown): IndexedDbErrorKind {
   return "other";
 }
 
-export interface IndexedDbErrorFingerprint {
+interface IndexedDbErrorFingerprint {
   message: string;
   dbErrorKind: IndexedDbErrorKind;
   name?: string;

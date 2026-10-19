@@ -38,6 +38,13 @@ import {
 } from "../sync/sync-progress";
 import type { PendingIssue, SyncHistoryEntry } from "../sync/state-manager";
 import {
+  mutationRecoveryItemKey,
+  pendingIssueExitKind,
+  pendingIssueTerminationKey,
+  syncItemTerminationSignature,
+  type PendingIssueExitKind,
+} from "../sync/sync-item-termination";
+import {
   formatTransferRate,
   type TransferRateReading,
 } from "../sync/transfer-rate";
@@ -101,7 +108,7 @@ type SyncViewBodyMode = "plan" | "progress" | "pending" | "recovery" | "idle";
 
 /** 工具栏「全部展开／折叠」的会话级覆盖。它只由用户点击改变，跨正文重建与
  *  计划修订保持；"default" 表示交回各区域自己的类别默认态。 */
-export type SyncViewSessionOverride = "default" | "expanded" | "collapsed";
+type SyncViewSessionOverride = "default" | "expanded" | "collapsed";
 type SyncViewStatusDetailMode = "timestamp" | "current-file" | "recovery";
 
 export function resolveSyncViewStatusDetailMode(input: {
@@ -161,7 +168,7 @@ export function resolveSyncViewBodyMode(input: {
   return "idle";
 }
 
-export type SyncViewPrimaryActionKind =
+type SyncViewPrimaryActionKind =
   | { kind: "cancel" }
   | { kind: "processing" }
   | { kind: "plan-review-restore"; recovering: boolean }
@@ -229,7 +236,7 @@ export function resolveRemoteScopeRecoveryFailurePresentation(
   };
 }
 
-export interface SyncViewContentKeyInput {
+interface SyncViewContentKeyInput {
   isLoggedIn: boolean;
   isInitializing: boolean;
   isPending: boolean;
@@ -266,9 +273,13 @@ export interface SyncViewContentKeyInput {
    *  这两类体态下的出现与消失会被重建跳过（与 localOnlyRows 同族；
    *  2026-10-13 实机坐实：状态层已有新版、侧栏整行不可见）。 */
   updatePrompt?: { latest: string; current: string } | null;
+  /** S4 逐项终局判定签名（`syncItemTerminationSignature`）：结论到达的那一轮
+   *  可能没有任何其他可见事实变化（记录与待办行都没动），不进指纹时待处理行
+   *  的终局句与核对区的终局句会被重建跳过（与 localOnlyRows／updatePrompt 同族）。 */
+  itemTerminationKey?: string;
 }
 
-export interface PendingIssueReviewGroup {
+interface PendingIssueReviewGroup {
   issue: PendingIssue;
   nestedIssues: PendingIssue[];
 }
@@ -303,7 +314,7 @@ export function groupPendingIssuesForReview(
 }
 
 /** One mountable row of the pending section, in display order. */
-export interface SyncPendingDisplayRow {
+interface SyncPendingDisplayRow {
   key: string;
   kind:
     | "adoption"
@@ -359,7 +370,7 @@ export function buildSyncPendingDisplayRows(input: Readonly<{
   }
   for (const { issue, nestedIssues } of input.failures) {
     push({
-      key: `issue:${issue.actionType}:${issue.issueCode ?? ""}:${issue.path}`,
+      key: pendingIssueTerminationKey(issue),
       kind: "issue",
       issue,
       nestedIssues,
@@ -408,7 +419,7 @@ export function buildSyncPendingDisplayRows(input: Readonly<{
   }
   for (const { issue, nestedIssues } of input.skipped) {
     push({
-      key: `issue:${issue.actionType}:${issue.issueCode ?? ""}:${issue.path}`,
+      key: pendingIssueTerminationKey(issue),
       kind: "issue",
       issue,
       nestedIssues,
@@ -454,13 +465,13 @@ export function trimFilePathPrefix(path: string, prefix: string): string {
   return prefix && path.startsWith(prefix) ? path.slice(prefix.length) : path;
 }
 
-export interface AdaptivePathLayoutInput {
+interface AdaptivePathLayoutInput {
   path: string;
   availableWidth: number;
   measureTextWidth: (text: string) => number;
 }
 
-export interface AdaptivePathLayoutDecision {
+interface AdaptivePathLayoutDecision {
   displayPath: string;
   directory: string | null;
   directoryKind: "shared" | "isolated" | null;
@@ -592,7 +603,7 @@ function completedFileRowKey(
   return `${file.path}\u0000${file.sourcePath ?? ""}\u0000${file.status}\u0000${file.actionType ?? ""}\u0000${file.reason ?? ""}`;
 }
 
-export interface CompletedFileRowsDiff {
+interface CompletedFileRowsDiff {
   /** Rows to insert at the top, newest first. */
   prepend: FileProgress[];
   /** Rendered paths that must leave the list (re-completed or retired). */
@@ -641,7 +652,7 @@ export function diffCompletedFileRows(
   return { prepend, removePaths, nextLedger };
 }
 
-export interface SyncPlanDisplayGroup {
+interface SyncPlanDisplayGroup {
   group: SyncActionGroup;
   labelKey: keyof LocaleStrings;
   items: PlanReviewItem[];
@@ -758,7 +769,7 @@ export function buildSyncPlanVirtualWindow(input: Readonly<{
   };
 }
 
-export interface SyncPlanDisplayRow {
+interface SyncPlanDisplayRow {
   /** Stable identity for the mounted row; also the key for its open state. */
   key: string;
   item: PlanReviewItem;
@@ -1049,7 +1060,7 @@ export function formatPendingIssueChipLabel(
   return t("syncView.fileStatus.error");
 }
 
-export type BundleConflictReviewEntry =
+type BundleConflictReviewEntry =
   | { kind: "file"; item: SyncPlanItem }
   | {
       kind: "bundle";
@@ -1124,6 +1135,9 @@ export function buildSyncViewContentKey(
   const updateKey = input.updatePrompt
     ? `update:${input.updatePrompt.latest}:${input.updatePrompt.current}`
     : "update:none";
+  // S4 逐项终局判定：结论本身可能就是这一轮唯一的可见变化（记录与待办行
+  // 都没动），所以与 updatePrompt 同族进指纹。
+  const terminationKey = `termination:${input.itemTerminationKey ?? ""}`;
   if (input.bodyMode === "plan") {
     const counts = input.planReviewCounts
       ? `${input.planReviewCounts.uploads},${input.planReviewCounts.downloads},${input.planReviewCounts.folders ?? 0},${input.planReviewCounts.deletes},${input.planReviewCounts.conflicts},${input.planReviewCounts.skipped},${input.planReviewCounts.localOnlyCopies ?? 0}`
@@ -1164,10 +1178,10 @@ export function buildSyncViewContentKey(
     const localOnly = (input.localOnlyRows ?? [])
       .map((row) => `${row.path}:${row.targetPath}:${row.kind}`)
       .join("|");
-    return `pending:${authKey}:${runKey}:${recoveryKey}:${issues}:${conflicts}:${deletes}:adoption:${adoption}:localOnly:${localOnly}:${updateKey}:${historyKey}`;
+    return `pending:${authKey}:${runKey}:${recoveryKey}:${issues}:${conflicts}:${deletes}:adoption:${adoption}:localOnly:${localOnly}:${updateKey}:${terminationKey}:${historyKey}`;
   }
   if (input.bodyMode === "recovery") {
-    return `recovery:${authKey}:${runKey}:${recoveryKey}:${updateKey}:${historyKey}`;
+    return `recovery:${authKey}:${runKey}:${recoveryKey}:${updateKey}:${terminationKey}:${historyKey}`;
   }
   return `idle:${authKey}:${runKey}:${recoveryKey}:${input.lastSyncTime}:${historyKey}`;
 }
@@ -1243,6 +1257,10 @@ export class EasySyncSyncView extends ItemView {
   // P0: incremental render — frame merging + diffed file list
   private renderFrameId: AnimationFrameHandle | null = null;
   private lastContentKey: string | null = null;
+  /** S4 终止判据的呈现缓存：本渲染 tick 内「不可重试诊断」已结论的项 key。
+   *  判定状态只在轮末变化，同一 tick 内重扫快照纯属浪费（大列表下逐行
+   *  扫＝O(行数×结论数)）。doRender 开头置空。 */
+  private nonRetryableTerminationKeys: ReadonlySet<string> | null = null;
   // Cached DOM refs for direct progress-bar updates
   private progressPanelEl: HTMLElement | null = null;
   private progressFillEl: HTMLElement | null = null;
@@ -1591,6 +1609,9 @@ export class EasySyncSyncView extends ItemView {
 
   private doRender(): void {
     const container = this.contentEl;
+    // S4 逐项终局判定按渲染轮次重新取样一次：判定只在轮末变化，同一 tick 内
+    // 多行查询不必各自重扫快照（见 nonRetryableItemKeys）。
+    this.nonRetryableTerminationKeys = null;
     const progress = this.plugin.progressStore.state;
     const fullSyncRunning = this.plugin.syncExecutor?.isRunning ?? false;
     // 可取消＝轮在跑，或入口只读准备期已 armed（2026-10-10 R1：那段等待此前
@@ -1752,6 +1773,10 @@ export class EasySyncSyncView extends ItemView {
       mutationRecovery,
       // 与行渲染同一取值源：提示的出现/消失/版本文案变化都进指纹。
       updatePrompt,
+      // S4：逐项终局判定的出现/消失/结局变化都进指纹（同族理由见上）。
+      itemTerminationKey: syncItemTerminationSignature(
+        this.plugin.syncExecutor?.getSyncItemTerminationSnapshot() ?? [],
+      ),
     });
 
     if (this.lastContentKey !== contentKey) {
@@ -2684,6 +2709,15 @@ export class EasySyncSyncView extends ItemView {
         hour: "2-digit",
         minute: "2-digit",
       }),
+      // S4 终止判据（2026-10-16 §六 S4）：这条记录连续两轮事实完全相同、且
+      // 没有现役人工出口时，正文的「暂时无法自动确认」不再成立，换成一句终局
+      // 诊断（同一事实指纹下结论不变，不会每轮换说法）。判定只读 executor 的
+      // 逐项台账，本处不重推任何资格规则。
+      {
+        nonRetryable: typeof state.blockedOperationId === "string"
+          && this.nonRetryableItemKeys()
+            .has(mutationRecoveryItemKey(state.blockedOperationId)),
+      },
     );
     const section = this.createSection(
       container,
@@ -2736,6 +2770,23 @@ export class EasySyncSyncView extends ItemView {
         presentation.nextStep,
       );
     }
+  }
+
+  /**
+   * S4: keys of the items whose terminal outcome is an explicit non-retryable
+   * diagnosis (the executor's per-item fact ledger), sampled once per render
+   * tick. Presentation-only read: it decides which single terminal line a row
+   * or the recovery section shows, and never a sync decision.
+   */
+  private nonRetryableItemKeys(): ReadonlySet<string> {
+    if (this.nonRetryableTerminationKeys === null) {
+      this.nonRetryableTerminationKeys = new Set(
+        (this.plugin.syncExecutor?.getSyncItemTerminationSnapshot() ?? [])
+          .filter((verdict) => verdict.outcome === "non-retryable")
+          .map((verdict) => verdict.key),
+      );
+    }
+    return this.nonRetryableTerminationKeys;
   }
 
   /** 流内窗口壳（方案单 20260924-0001）：上占位、流内窗口、下占位。窗口
@@ -3194,6 +3245,15 @@ export class EasySyncSyncView extends ItemView {
         }),
       );
     }
+    // S4 终止判据（2026-10-16 §六 S4）：这一项连续两轮事实完全相同、且没有
+    // 现役人工出口时，行内只补一句终局诊断——同一事实指纹下结论不变，不会
+    // 每轮换一个说法；判定来自 executor 的逐项指纹台账（本处只读）。有真实
+    // 出口的项不会走到这里（它们由下面的 chip 承接「一次裁决」）。
+    if (this.nonRetryableItemKeys().has(pendingIssueTerminationKey(issue))) {
+      body.createDiv("easy-sync-item-reason").setText(
+        t("syncView.itemTermination.nonRetryable"),
+      );
+    }
     const actions = body.createDiv("easy-sync-item-actions");
     const localFile = this.plugin.app.vault.getAbstractFileByPath(issue.path);
     if (localFile instanceof TFile) {
@@ -3220,6 +3280,11 @@ export class EasySyncSyncView extends ItemView {
    * branch appends its chip and returns; the caller has no statements after the
    * call, so an early return here ends the row render exactly as the inline
    * block did, and the phase returns void.
+   *
+   * The handled code lists live in `pendingIssueExitKind` (single source of
+   * truth): the S4 termination verdict derives "this row has a live manual
+   * exit" from the same call, so a row can never be diagnosed as having no
+   * disposition while a chip for it is on screen.
    */
   private renderPendingIssueRetryableActions(args: {
     actions: ReturnType<HTMLElement["createDiv"]>;
@@ -3230,81 +3295,76 @@ export class EasySyncSyncView extends ItemView {
     t: EasySyncPlugin["i18n"]["t"];
   }): void {
     const { actions, issue, scopeCrossingExitKind, t } = args;
-    if (
-      issue.issueCode === "identity-replacement-ambiguous"
-      || issue.issueCode === "anchored-folder-missing-remote"
-      || issue.issueCode === "local-rename-evidence-conflict"
-      || issue.issueCode === "local-subtree-changed"
-      || issue.issueCode === "remote-subtree-changed"
-      || issue.issueCode === "target-occupied"
-      || issue.issueCode === "parent-chain-incomplete"
-    ) {
-      this.createActionChip(
-        actions,
-        t("syncView.staleIdentity.resolve"),
-        "accent",
-        () => {
-          void this.openStaleIdentityResolution(issue.path);
-        },
-      );
-      return;
+    const exitKind: PendingIssueExitKind | null = pendingIssueExitKind(
+      issue.issueCode,
+      scopeCrossingExitKind,
+    );
+    switch (exitKind) {
+      case "stale-identity":
+        this.createActionChip(
+          actions,
+          t("syncView.staleIdentity.resolve"),
+          "accent",
+          () => {
+            void this.openStaleIdentityResolution(issue.path);
+          },
+        );
+        return;
+      case "shared-folder-identity":
+        this.createActionChip(
+          actions,
+          t("syncView.sharedFolderIdentity.resolve"),
+          "accent",
+          () => {
+            void this.openSharedFolderIdentityResolution(issue.path);
+          },
+        );
+        return;
+      case "empty-folder-review":
+        this.createActionChip(
+          actions,
+          t("syncView.folderSubtree.review"),
+          "accent",
+          () => {
+            void this.openEmptyFolderResolution(issue.path);
+          },
+        );
+        return;
+      case "folder-location":
+        this.createActionChip(
+          actions,
+          t("syncView.folderLocation.resolve"),
+          "accent",
+          () => {
+            void this.openFolderLocationResolution(issue.path);
+          },
+        );
+        return;
+      case "scope-crossing":
+        this.createActionChip(
+          actions,
+          t("syncView.scopeCrossing.restore"),
+          "accent",
+          () => {
+            void this.openScopeCrossingRestore(issue.path);
+          },
+        );
+        this.createActionChip(
+          actions,
+          t("syncView.scopeCrossing.confirm"),
+          "accent",
+          () => {
+            void this.openScopeCrossingConfirm(issue.path);
+          },
+        );
+        return;
+      case null:
+        // 通用重试 chip 不再渲染（2026-09-16 按钮清理）：其余可重试问题行
+        // 的行内重试与顶部主动作完全等同（同一完整手动同步入口），轮运行
+        // 中点击也仅得 busy 提示——重试统一经顶部「立即同步」；延后类行
+        // 由自动轮次收敛。行内保留原因文案与可选「打开文件」。
+        return;
     }
-    if (issue.issueCode === "unanchored-shared-folder") {
-      this.createActionChip(
-        actions,
-        t("syncView.sharedFolderIdentity.resolve"),
-        "accent",
-        () => {
-          void this.openSharedFolderIdentityResolution(issue.path);
-        },
-      );
-      return;
-    }
-    if (issue.issueCode === "anchored-folder-missing-local") {
-      this.createActionChip(
-        actions,
-        t("syncView.folderSubtree.review"),
-        "accent",
-        () => {
-          void this.openEmptyFolderResolution(issue.path);
-        },
-      );
-      return;
-    }
-    if (issue.issueCode === "folder-location-choice") {
-      this.createActionChip(
-        actions,
-        t("syncView.folderLocation.resolve"),
-        "accent",
-        () => {
-          void this.openFolderLocationResolution(issue.path);
-        },
-      );
-      return;
-    }
-    if (issue.issueCode === "scope-crossing" && scopeCrossingExitKind) {
-      this.createActionChip(
-        actions,
-        t("syncView.scopeCrossing.restore"),
-        "accent",
-        () => {
-          void this.openScopeCrossingRestore(issue.path);
-        },
-      );
-      this.createActionChip(
-        actions,
-        t("syncView.scopeCrossing.confirm"),
-        "accent",
-        () => {
-          void this.openScopeCrossingConfirm(issue.path);
-        },
-      );
-      return;
-    }
-    // 通用重试 chip 不再渲染（2026-09-16 按钮清理）：其余可重试问题行
-    // 的行内重试与顶部主动作完全等同（同一完整手动同步入口），轮运行
-    // 中点击也仅得 busy 提示——重试统一经顶部「立即同步」；延后类行
-    // 由自动轮次收敛。行内保留原因文案与可选「打开文件」。
   }
 
   // Per-row short guard. The kind-wide flags above are released before the

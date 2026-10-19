@@ -35,7 +35,7 @@ const DEFAULT_TARGET_WRITE_MAX_ATTEMPTS = 2;
  * - `truncated`：③ 只剩我们写入内容的前缀＝我们自己写坏了；
  * - `unattributed`：⑤ 别的内容或读不回来，无法归属。
  */
-export type PostWriteArm =
+type PostWriteArm =
   | "exact"
   | "merged-tail"
   | "empty"
@@ -73,7 +73,7 @@ export class LocalReplacementTruncatedError extends Error {
   }
 }
 
-export interface InPlaceReplacementRequest {
+interface InPlaceReplacementRequest {
   /** Host-visible identity of the target. Callers only route files the vault
    *  can name here: without it there is no open view to preserve, and the
    *  atomic swap stays the safer replacement. */
@@ -94,7 +94,7 @@ export interface InPlaceReplacementRequest {
   onWarning?: (message: string) => void;
 }
 
-export interface InPlaceReplacementOutcome {
+interface InPlaceReplacementOutcome {
   via: "host-modify" | "adapter-write";
   attempts: number;
   /** 磁盘上的实际字节数（宿主可能在我们的写入之后又合并了一次）。 */

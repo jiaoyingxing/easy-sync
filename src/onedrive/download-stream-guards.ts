@@ -25,7 +25,7 @@ import { OneDriveError, OneDriveErrorType } from "./types";
  *  when neither response headers nor body bytes arrive for this long, so the
  *  waterfall retries on a fresh connection while budget remains. Reopen at a
  *  larger window if real links show legitimate >60 s stalls being killed. */
-export const DOWNLOAD_STALL_WATCHDOG_MS = 60_000;
+const DOWNLOAD_STALL_WATCHDOG_MS = 60_000;
 /** Slow-connection gate (user-decided 2026-09-14; decision function replaced
  *  2026-09-15 by the evidence-driven design — 2026-09-15 research, docs/temp/
  *  20260915-2310). The 2026-09-15 iPhone evidence showed the absolute 512 KiB/s
@@ -41,22 +41,22 @@ export const DOWNLOAD_STALL_WATCHDOG_MS = 60_000;
  *  stay far below 0.45 × p75 and are abandoned; mid-rate ones are accepted
  *  earlier than before. Reopen at a different factor if real links show legit
  *  rates being killed (or stalls being kept). */
-export const DOWNLOAD_SLOW_RATE_BYTES_PER_SECOND = 512 * 1024;
+const DOWNLOAD_SLOW_RATE_BYTES_PER_SECOND = 512 * 1024;
 export const DOWNLOAD_SLOW_RATE_WINDOW_MS = 15_000;
 export const DOWNLOAD_SLOW_ABORT_LIMIT = 3;
 /** Relative-judgment factor: a window is slow when rate < factor × baseline.
  *  2026-09-15 reconnect outcomes (105→90→106, ratios ~0.86 must NOT abort)
  *  and genuine collapses (148→44→5, ratios ~0.3 must abort) sit an order of
  *  magnitude apart; 0.45 separates them with margin either way. */
-export const DOWNLOAD_SLOW_RELATIVE_FACTOR = 0.45;
+const DOWNLOAD_SLOW_RELATIVE_FACTOR = 0.45;
 /** Reconnect cost estimate for the completion-imminence exemption: the next
  *  tier's metadata round trip observed at 2–20s on real slow links, taken at
  *  the conservative (high) end so the exemption prefers keeping connections. */
-export const DOWNLOAD_SLOW_RECONNECT_COST_MS = 10_000;
+const DOWNLOAD_SLOW_RECONNECT_COST_MS = 10_000;
 /** Baseline ring size: the last completed window rates this link produced.
  *  p75 tolerates up to 2 of 8 outlier bursts; per-round lifetime keeps a
  *  stale baseline from outliving the network it described. */
-export const DOWNLOAD_SLOW_BASELINE_SAMPLES = 8;
+const DOWNLOAD_SLOW_BASELINE_SAMPLES = 8;
 
 export interface SlowLinkEvidence {
   record(rateBytesPerSecond: number): void;
@@ -81,7 +81,7 @@ export function createSlowLinkEvidence(): SlowLinkEvidence {
   };
 }
 
-export interface SlowConnectionGateOptions {
+interface SlowConnectionGateOptions {
   /** Shared per-round link evidence; without it the gate falls back to the
    *  legacy absolute-threshold rule (first window of every round pays the
    *  cold-start tuition against the absolute line, later windows judge

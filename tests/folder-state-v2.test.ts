@@ -606,6 +606,57 @@ describe("V2 folder anchors and pure planner", () => {
     });
   });
 
+  // A1 拼写别名接缝（甲 2026-10-16 发现，乙 2026-10-16 落守卫）：文件夹层在这里
+  // 允许发出"候选"，SC-19 的禁令管的是**可执行计划**与 mutation 回执，而 canonical
+  // plan 是所有计划项的单一咽喉 ⇒ 该形状的合同钉子按结果锚在
+  // tests/canonical-plan-v2.test.ts「A1 拼写别名」一组（含反向镜像与新建接缝），
+  // 本层不再断言候选计数（否则同一规则会有两个负责点，且钉子会永久红着）。
+  // 判例 F27 与回执逐字节断言见 docs/topics/同步写入安全不变量.md SC-19。
+
+  // 控制项（必须绿）：父目录拼写与索引逐字节一致时，正常改名仍产 move-remote。
+  it("still plans a folder move when the destination parent spelling is byte-identical", () => {
+    const current = envelope({
+      folders: [
+        { id: "parent", name: "videos" },
+        { id: "sub", name: "Notes", parentId: "parent" },
+      ],
+      files: [{ id: "file-a", name: "a.md", parentId: "sub" }],
+      folderAnchors: [
+        folderAnchor("parent", "videos"),
+        folderAnchor("sub", "videos/Notes", "parent"),
+      ],
+      fileAnchors: [fileAnchor("file-a", "videos/Notes/a.md")],
+    });
+    const report = planFolderStateV2({
+      envelope: current,
+      localFiles: [localFile("videos/Notes2/a.md")],
+      localFolders: localFolders("videos", "videos/Notes2"),
+      localFolderScanComplete: true,
+      localMoveHints: [{
+        version: 1,
+        scope,
+        remoteId: "sub",
+        fromPath: "videos/Notes",
+        toPath: "videos/Notes2",
+        observedAt: 11,
+      }],
+    });
+
+    expect(report.items).toEqual([expect.objectContaining({
+      type: "move-remote",
+      path: "videos/Notes2",
+      sourcePath: "videos/Notes",
+      targetPath: "videos/Notes2",
+      remoteId: "sub",
+    })]);
+    expect(report.counts).toMatchObject({ moveRemote: 1, conflicts: 0 });
+  });
+
+  // A1 新建接缝（create-remote 同型）：分歧父未锚定时文件夹层仍会发出 create-remote
+  // 候选（上游条件闸 folder-state-v2.ts:378 只在同轮有锚点落进
+  // local-rename-evidence-conflict 时为真）。该形状的合同钉子同样锚在计划层
+  // （tests/canonical-plan-v2.test.ts「A1 拼写别名」的零 CreateRemoteFolder 一条）。
+
   it("keeps an exact folder move independent from a changed incoming file", () => {
     const current = envelope({
       folders: [{ id: "text", name: "text" }],

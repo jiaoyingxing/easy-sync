@@ -58,12 +58,13 @@ export type IdentityRenameActionV2 =
         | "local-destination-occupied"
         | "remote-destination-occupied"
         | "destination-parent-missing"
+        | "destination-parent-spelling-diverged"
         | "both-paths-diverged"
         | "replacement-with-local-relocation"
         | "same-path-identity-occupied";
     };
 
-export interface IdentityRenamePlanOptionsV2 {
+interface IdentityRenamePlanOptionsV2 {
   /**
    * Folder identities whose paths will be established by an earlier folder
    * move in the same SyncPlan. This does not mutate the committed envelope.
@@ -110,9 +111,11 @@ export function planIdentityRenamesFromStateV2(
     unanchoredLocalByContent.set(key, matches);
   }
   const folderIdByPath = new Map<string, string>();
+  const pathByFolderId = new Map<string, string>();
   for (const [id, path] of pathByRemoteId) {
     if (state.remoteNodeById.get(id)?.kind === "folder") {
       folderIdByPath.set(normalizePath(path), id);
+      pathByFolderId.set(id, path);
     }
   }
   for (const projected of options.projectedFolderIdentities ?? []) {
@@ -121,6 +124,7 @@ export function planIdentityRenamesFromStateV2(
     const occupiedId = folderIdByPath.get(key);
     if (node?.kind === "folder" && (!occupiedId || occupiedId === projected.remoteId)) {
       folderIdByPath.set(key, projected.remoteId);
+      pathByFolderId.set(projected.remoteId, projected.path);
     }
   }
 
@@ -134,6 +138,7 @@ export function planIdentityRenamesFromStateV2(
       localByPath,
       unanchoredLocalByContent,
       folderIdByPath,
+      pathByFolderId,
       actions,
     });
   }
@@ -156,6 +161,7 @@ function planIdentityRenameForAnchorV2(args: {
   localByPath: Map<string, LocalFileEntry>;
   unanchoredLocalByContent: Map<string, LocalFileEntry[]>;
   folderIdByPath: Map<string, string>;
+  pathByFolderId: Map<string, string>;
   actions: IdentityRenameActionV2[];
 }): void {
   const {
@@ -166,6 +172,7 @@ function planIdentityRenameForAnchorV2(args: {
     localByPath,
     unanchoredLocalByContent,
     folderIdByPath,
+    pathByFolderId,
     actions,
   } = args;
     if (!anchor.remoteId) return;
@@ -308,6 +315,7 @@ function planIdentityRenameForAnchorV2(args: {
         matchingLocals,
         remoteIdByPath,
         folderIdByPath,
+        pathByFolderId,
         actions,
       });
     }
@@ -334,6 +342,7 @@ function planIdentityRenameForRelocatedLocalV2(args: {
   matchingLocals: readonly LocalFileEntry[];
   remoteIdByPath: Map<string, string>;
   folderIdByPath: Map<string, string>;
+  pathByFolderId: Map<string, string>;
   actions: IdentityRenameActionV2[];
 }): void {
   const {
@@ -344,6 +353,7 @@ function planIdentityRenameForRelocatedLocalV2(args: {
     matchingLocals,
     remoteIdByPath,
     folderIdByPath,
+    pathByFolderId,
     actions,
   } = args;
   if (matchingLocals.length === 0) {
@@ -393,6 +403,23 @@ function planIdentityRenameForRelocatedLocalV2(args: {
       anchor,
       destination.path,
       "destination-parent-missing",
+      anchor.lastPath,
+    ));
+    return;
+  }
+  // The parent resolved by identity alias (NFC + case fold), but this move
+  // would be recorded under the local spelling while the committed tree keeps
+  // the canonical one: the byte-exact parent receipt can then never commit
+  // (field case 2026-10-14 — `Videos/` against index `videos/`). Withhold the
+  // remote move and let the folder layer's deferral carry the divergence.
+  const canonicalParentPath = parentPath === ""
+    ? ""
+    : pathByFolderId.get(parentId);
+  if (canonicalParentPath !== parentPath) {
+    actions.push(conflict(
+      anchor,
+      destination.path,
+      "destination-parent-spelling-diverged",
       anchor.lastPath,
     ));
     return;

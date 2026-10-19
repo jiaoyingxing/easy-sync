@@ -36,7 +36,7 @@ import {
   isCommunityPluginCloudCleanupCandidateV1,
 } from "../sync/community-plugin-cloud-cleanup-v1";
 
-export type ConfigSyncView =
+type ConfigSyncView =
   | "scope"
   | "community-plugin-files"
   | "community-plugin-data";

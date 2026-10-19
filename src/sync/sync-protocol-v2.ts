@@ -69,7 +69,7 @@ export interface SharedSyncProtocolBindingV2 {
   recordETag: string;
 }
 
-export type EnsureSharedSyncProtocolResultV2 =
+type EnsureSharedSyncProtocolResultV2 =
   | {
     status: "ready";
     source: "existing" | "created" | "create-race";
@@ -89,7 +89,7 @@ export type EnsureSharedSyncProtocolResultV2 =
       | "readback-mismatch";
   };
 
-export type EnsureCanonicalSharedSyncProtocolResultV2 =
+type EnsureCanonicalSharedSyncProtocolResultV2 =
   | {
     status: "ready";
     source: "existing" | "created" | "create-race";

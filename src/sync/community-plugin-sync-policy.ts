@@ -1,4 +1,4 @@
-export type PluginSelectionMode = "none" | "all" | "selected";
+type PluginSelectionMode = "none" | "all" | "selected";
 
 export interface PluginScopeSelection {
   mode: PluginSelectionMode;
@@ -253,7 +253,7 @@ export function normalizeCommunityPluginSyncSettings(
   };
 }
 
-export function getIgnoredPluginIds(
+function getIgnoredPluginIds(
   selection: Readonly<PluginScopeSelection>,
 ): readonly string[] {
   return selection.ignoredPluginIds ?? [];

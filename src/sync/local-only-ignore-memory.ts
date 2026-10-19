@@ -22,8 +22,8 @@
 
 import { compareText } from "./compare-text";
 
-export const LOCAL_ONLY_IGNORE_MEMORY_KIND = "local-only-ignore-memory";
-export const LOCAL_ONLY_IGNORE_MEMORY_SCHEMA_VERSION = 1;
+const LOCAL_ONLY_IGNORE_MEMORY_KIND = "local-only-ignore-memory";
+const LOCAL_ONLY_IGNORE_MEMORY_SCHEMA_VERSION = 1;
 
 export interface LocalOnlyIgnoreMemoryV1 {
   schemaVersion: 1;
@@ -32,7 +32,7 @@ export interface LocalOnlyIgnoreMemoryV1 {
   ignoredPaths: string[];
 }
 
-export type LocalOnlyIgnoreMemoryCommand =
+type LocalOnlyIgnoreMemoryCommand =
   | { type: "ignore"; path: string }
   | { type: "clear-ignore"; path: string };
 
@@ -133,7 +133,7 @@ export function normalizeLocalOnlyIgnorePaths(
   return [...new Set(normalized)].sort(compareText);
 }
 
-export function normalizeLocalOnlyIgnorePath(value: string): string {
+function normalizeLocalOnlyIgnorePath(value: string): string {
   return value.trim().replace(/^\/+|\/+$/g, "");
 }
 

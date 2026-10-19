@@ -16,8 +16,8 @@
 
 import type { LocalOnlyCopyKindV1 } from "./types";
 
-export const LOCAL_ONLY_COPIES_KIND = "local-only-copies";
-export const LOCAL_ONLY_COPIES_SCHEMA_VERSION = 1;
+const LOCAL_ONLY_COPIES_KIND = "local-only-copies";
+const LOCAL_ONLY_COPIES_SCHEMA_VERSION = 1;
 
 export interface LocalOnlyCopyEntryV1 {
   version: 1;
@@ -204,18 +204,6 @@ export function sameLocalOnlyFamilyV1(
   right: LocalOnlyCopiesV1,
 ): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
-}
-
-/** 片④ 新建类：按路径 upsert（同一路径只有一条）。 */
-export function upsertLocalOnlyCreatedEntryV1(
-  current: LocalOnlyCopiesV1 | null,
-  entry: LocalOnlyCreatedEntryV1,
-): LocalOnlyCopiesV1 {
-  const base = current ?? emptyLocalOnlyCopiesV1();
-  const next = base.created
-    .filter((candidate) => candidate.path !== entry.path)
-    .concat([{ ...entry }]);
-  return { ...base, created: next };
 }
 
 /**

@@ -52,6 +52,7 @@ import {
   type SyncPlanItem,
 } from "../src/sync/types";
 import type { SyncDirection } from "../src/sync/sync-direction";
+import { functionBody } from "./helpers/source-scope";
 
 const scope = {
   accountId: "account",
@@ -1593,7 +1594,11 @@ describe("one-way local-only pipeline wiring", () => {
       "utf8",
     );
     // 侧栏不自己读记录、不扫盘、不建第二份列表：只消费插件暴露的那一份投影。
-    expect(view).toContain("localOnlyRows: this.plugin.getLocalOnlyRows()");
+    // 收窄：该句在视图文件里两处出现（渲染主流程与待处理区）——两处都要钉住。
+    const renderBody = functionBody(view, "private doRender(): void");
+    const pendingBody = functionBody(view, "private renderPendingSection(");
+    expect(renderBody).toContain("localOnlyRows: this.plugin.getLocalOnlyRows()");
+    expect(pendingBody).toContain("localOnlyRows: this.plugin.getLocalOnlyRows()");
     expect(view).not.toContain("localOnlyCopyEntries");
   });
 });

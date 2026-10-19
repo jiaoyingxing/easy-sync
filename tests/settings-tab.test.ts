@@ -8,12 +8,14 @@ import { I18n } from "../src/i18n";
 import en from "../src/i18n/en";
 import zhCN from "../src/i18n/zh-cn";
 import type EasySyncPlugin from "../src/main";
+import { functionBody } from "./helpers/source-scope";
 
 describe("settings tab", () => {
   it("opens the sync panel from the imperative account row", async () => {
     const openSyncPanelFromSettings = vi.fn().mockResolvedValue(undefined);
     const tab = new EasySyncSettingTab({
       app: {},
+      register: vi.fn(),
       auth: {
         authState: { isLoggedIn: true, displayName: "tester" },
         isInitializing: false,
@@ -127,13 +129,9 @@ describe("settings tab", () => {
     const displayStart = source.indexOf("  display(): void {");
     const refreshStart = source.indexOf("  refreshAuthState(): void {", displayStart);
     const displaySource = source.slice(displayStart, refreshStart);
-    const accountSectionStart = source.indexOf("  private renderAccountSection(");
-    const rangeSectionStart = source.indexOf("  private renderRangeSection(");
-    const automaticSectionStart = source.indexOf("  private renderAutomaticSection(");
-    const aboutSectionStart = source.indexOf("  private renderAboutSection(");
-    const accountSection = source.slice(accountSectionStart, rangeSectionStart);
-    const rangeSection = source.slice(rangeSectionStart, automaticSectionStart);
-    const automaticSection = source.slice(automaticSectionStart, aboutSectionStart);
+    const accountSection = functionBody(source, "private renderAccountSection(");
+    const rangeSection = functionBody(source, "private renderRangeSection(");
+    const automaticSection = functionBody(source, "private renderAutomaticSection(");
 
     expect(displaySource.indexOf("this.renderAccountSection(t)")).toBeLessThan(
       displaySource.indexOf("this.renderRangeSection(t)"),
@@ -179,12 +177,15 @@ describe("settings tab", () => {
     );
     // Both sliders run 0–10 with the leftmost stop = off: scheduled sync
     // stores 0 or 1–10 minutes, the change-delay slider 0–10 seconds.
-    expect(autoSyncModalSource).toContain(".setLimits(0, 10, 1)");
+    // 收窄到弹框的 onOpen：这两个滑杆与重启都只在那里接线，文件级断言会被
+    // 同文件别处的同名调用蒙过（同规则见《测试与检查规范》§3）。
+    const autoSyncOnOpen = functionBody(autoSyncModalSource, "onOpen(): void");
+    expect(autoSyncOnOpen).toContain(".setLimits(0, 10, 1)");
     expect(autoSyncModalSource).not.toContain("SYNC_INTERVAL_OFF_SLIDER_VALUE");
     expect(autoSyncModalSource).toContain(
       "this.plugin.setAutoSyncChangeDelaySeconds(value)",
     );
-    expect(autoSyncModalSource).toContain("restartAutoSync");
+    expect(autoSyncOnOpen).toContain("restartAutoSync");
     expect(automaticSection).not.toContain('t("settings.maxFileSize.name")');
     expect(automaticSection).toContain(
       'setButtonText(t("settings.automaticHandling.button"))',
@@ -226,7 +227,10 @@ describe("settings tab", () => {
   it("applies the tab container class at construction time for both render paths", () => {
     // Obsidian 1.13.0+ renders the tab declaratively and never calls
     // display(), so the class CSS scopes by must exist before any rendering.
-    const tab = new EasySyncSettingTab({ app: {} } as unknown as EasySyncPlugin);
+    const tab = new EasySyncSettingTab({
+      app: {},
+      register: vi.fn(),
+    } as unknown as EasySyncPlugin);
     expect(tab.containerEl.classList.contains("easy-sync-settings-tab")).toBe(
       true,
     );
@@ -248,17 +252,22 @@ describe("settings tab", () => {
   it("uses a native folder picker and native settings for device-local exclusions", () => {
     const source = readFileSync("src/ui/sync-exclusion-modal.ts", "utf8");
     const settingsSource = readFileSync("src/ui/settings-tab.ts", "utf8");
+    // 收窄：这两条句子在各自目标文件里都出现多次（定义处／导入处／别的方法），
+    // 文件级断言删掉真正那一处也照样绿。
+    const pickerItems = functionBody(source, "getItems(): SyncExclusionFolderCandidate[]");
+    const nativeSettings = functionBody(source, "private render(): void");
+    const rangeSection = functionBody(settingsSource, "private renderRangeSection(");
 
     expect(source).toContain(
       "extends FuzzySuggestModal<SyncExclusionFolderCandidate>",
     );
     expect(source).toContain("getAllLoadedFiles");
     expect(source).toContain("instanceof TFolder");
-    expect(source).toContain("buildSyncExclusionFolderCandidates");
+    expect(pickerItems).toContain("buildSyncExclusionFolderCandidates");
     expect(source).toContain("createSyncExclusionFolderSnapshot");
     expect(source).toContain("rebuildPlanReview");
     expect(source).toContain("updateExcludedFolders");
-    expect(source).toContain("new Setting(");
+    expect(nativeSettings).toContain("new Setting(");
     expect(source).toMatch(
       /text: t\("settings\.syncExclusion\.intro"\),\s*cls: "setting-item-description easy-sync-modal-intro"/,
     );
@@ -269,11 +278,10 @@ describe("settings tab", () => {
     expect(source).not.toContain("startManualSync");
     expect(source).toContain("new ExtraButtonComponent(chipEl)");
     expect(source).toContain('.setIcon("x")');
-    expect(settingsSource).toContain("renderExcludedFolderChips");
-    expect(settingsSource).toContain("setting.descEl.createDiv()");
-    expect(settingsSource).toContain("updateExcludedFoldersFromUi");
+    expect(rangeSection).toContain("renderExcludedFolderChips");
+    expect(rangeSection).toContain("setting.descEl.createDiv()");
+    expect(rangeSection).toContain("updateExcludedFoldersFromUi");
   });
-
   it("mirrors the official hotkey chip geometry without depending on internal host classes", () => {
     const source = readFileSync("src/ui/sync-exclusion-modal.ts", "utf8");
     const styles = readFileSync("styles.css", "utf8");
@@ -338,18 +346,29 @@ describe("settings tab", () => {
   it("renders community plugin scope as native outer switches with always-available management", () => {
     const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
     const styles = readFileSync("styles.css", "utf8");
+    // 收窄：下面这些句子在同一文件里多处出现（导入、接口成员、别的方法），
+    // 各自绑到真正负责它的那个函数体上。
+    const renderScope = functionBody(source, "private renderScope(): void");
+    const scopeSetting = functionBody(
+      source,
+      "private renderCommunityPluginScopeSetting(",
+    );
+    const manager = functionBody(
+      source,
+      "private renderCommunityPluginManager(column: PluginColumn): void",
+    );
 
-    expect(source).toContain("renderCommunityPluginScopeSetting(");
+    expect(renderScope).toContain("renderCommunityPluginScopeSetting(");
     expect(source).toContain("updateAllCommunityPluginSelections(");
-    expect(source).toContain("selectionChipEl");
+    expect(scopeSetting).toContain("selectionChipEl");
     expect(source).toContain(
       'setting.settingEl.addClass("easy-sync-community-plugin-scope-setting")',
     );
     expect(source).toMatch(
       /setting\.nameEl\.createSpan\(\s*"easy-sync-plugin-selection-chip"/,
     );
-    expect(source).toContain("appendExperimentalPluginDataChip(");
-    expect(source).toContain("this.titleEl");
+    expect(scopeSetting).toContain("appendExperimentalPluginDataChip(");
+    expect(manager).toContain("this.titleEl");
     expect(source).toContain("settings.communityPlugins.experimental");
     expect(source).toContain("busyCommunityPluginScopeRows");
     expect(source).toContain("pendingCommunityPluginScopeValues");
@@ -654,6 +673,13 @@ describe("settings tab", () => {
 
   it("renders actionable participation phases from the unified files read model", () => {
     const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    // 收窄：这两个字段名在同一文件里各有 5–7 处，且分属两个读取函数
+    // （逐行描述 / 整段指引）——两处都钉住，文件级断言才不会漏掉其中一处。
+    const itemBody = functionBody(source, "private describeInventoryItem(");
+    const guidanceBody = functionBody(
+      source,
+      "private describeInventoryGuidance(",
+    );
     const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
     Object.assign(modal as object, {
       plugin: { i18n: { t: (key: string) => key } },
@@ -683,11 +709,10 @@ describe("settings tab", () => {
         ...overrides,
       }, "files");
 
-    expect(source).toContain("item.participationPhase");
+    expect(itemBody).toContain("item.participationPhase");
     expect(source).toContain(
       '"settings.communityPlugins.status.joinRequested"',
-    );
-    expect(source).toContain(
+    );    expect(source).toContain(
       '"settings.communityPlugins.status.restoreBlocked"',
     );
     expect(zhCN["settings.communityPlugins.status.joinRequested"])
@@ -718,7 +743,8 @@ describe("settings tab", () => {
       .toBe("云端状态待重新确认");
     expect(en["settings.communityPlugins.status.remoteCatalogStale"])
       .toBe("Remote status needs to be checked again");
-    expect(source).toContain("item.participationBlockedReason");
+    expect(itemBody).toContain("item.participationBlockedReason");
+    expect(guidanceBody).toContain("item.participationBlockedReason");
     expect(describe("manifest-incompatible", true)).toBe(
       "settings.communityPlugins.status.restoreIncompatible",
     );
@@ -845,8 +871,11 @@ describe("settings tab", () => {
 
   it("refreshes the range-independent remote catalog only when the plugin manager opens", () => {
     const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    // 收窄：刷新调用只该出现在那个"只跑一次"的刷新函数体里；先后关系是
+    // 位置事实（定义顺序），按整文件判读。
+    const refreshOnce = functionBody(source, "private refreshRemoteCatalogOnce(): void");
 
-    expect(source).toContain("refreshCommunityPluginRemoteCatalog");
+    expect(refreshOnce).toContain("refreshCommunityPluginRemoteCatalog");
     expect(source.indexOf("refreshCommunityPluginRemoteCatalog"))
       .toBeGreaterThan(source.indexOf("openCommunityPluginManager("));
   });
@@ -1392,6 +1421,7 @@ describe("settings tab", () => {
         names.length = 0;
         const tab = new EasySyncSettingTab({
           app: {},
+          register: vi.fn(),
           syncDirection: direction,
           i18n: { t: (key: string) => key },
           autoSyncPaused: false,
@@ -1422,11 +1452,14 @@ describe("settings tab", () => {
 
   it("renders both automatic handling choices as native toggles without triggering sync", () => {
     const source = readFileSync("src/ui/automatic-handling-modal.ts", "utf8");
+    // 收窄：两个开关与它们的提交都接在 onOpen 里；文件级断言会被同文件别处
+    // （类型声明、别的分支）的同名字段蒙过。
+    const onOpen = functionBody(source, "onOpen(): void");
 
     expect(source.match(/new Setting\(/g)).toHaveLength(2);
-    expect(source).toContain("autoDeleteLocalFiles");
-    expect(source).toContain("mergeNonOverlappingText");
-    expect(source).toContain("updateAutomaticHandlingPolicy");
+    expect(onOpen).toContain("autoDeleteLocalFiles");
+    expect(onOpen).toContain("mergeNonOverlappingText");
+    expect(onOpen).toContain("updateAutomaticHandlingPolicy");
     expect(source).not.toContain("startManualSync");
     expect(source).not.toContain("confirmRemoteDelete");
   });
@@ -1532,7 +1565,6 @@ describe("settings save call sites", () => {
     const start = source.indexOf("private async persistMaxFileSizeMb(");
     const next = source.indexOf("private async", start + 10);
     const fn = source.slice(start, next === -1 ? undefined : next);
-    expect(fn).toContain("try {");
     expect(fn).toContain("notice.settingsSaveFailed");
     expect(fn).toContain("this.syncMaxFileSizeDropdownSelection()");
     expect(fn).toContain("this.plugin.applyMaxFileSize()");
@@ -1579,6 +1611,7 @@ describe("imperative maintenance group · local-only reversal row (件③)", () 
   }): EasySyncPlugin {
     return {
       app: {},
+      register: vi.fn(),
       syncDirection: options.direction,
       getIgnoredLocalOnlyCount: () => options.ignoredCount,
       clearLocalOnlyIgnores: vi.fn().mockResolvedValue(undefined),

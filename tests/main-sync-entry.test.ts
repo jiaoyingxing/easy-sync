@@ -14,23 +14,25 @@ vi.mock("../src/onedrive/client", () => ({
   OneDriveClient: class {},
 }));
 
-vi.mock("../src/sync/local-scanner", () => ({
-  LocalScanner: class {},
-  createFolderSyncScopeSnapshotV1: () => ({
-    version: 1,
-    includedPaths: [],
-    excludedFolders: [],
-  }),
-  // Faithful to the live rule for the paths this suite exercises: EasySync's
-  // own bookkeeping paths — the tmp dir and the download recovery copies — are
-  // never part of the sync scope, whatever config dir the vault uses.
-  isEasySyncInternalPath: (path: string) => path.includes("/.obsidian/plugins/easy-sync/tmp/")
-    || path.startsWith(".obsidian/plugins/easy-sync/tmp/")
-    || path.endsWith(".easy-sync-recovery"),
-  normalizeExcludedFolders: (paths: unknown[]) => paths.filter(
-    (path): path is string => typeof path === "string" && path.length > 0,
-  ),
-}));
+vi.mock("../src/sync/local-scanner", async () => {
+  const actual = await vi.importActual<typeof import("../src/sync/local-scanner")>(
+    "../src/sync/local-scanner",
+  );
+  return {
+    LocalScanner: class {},
+    createFolderSyncScopeSnapshotV1: () => ({
+      version: 1,
+      includedPaths: [],
+      excludedFolders: [],
+    }),
+    // 内部路径判定取真实现：这条规则带配置目录与插件 ID 参数、覆盖
+    // tmp / 状态文件 / 恢复副本整族，替身抄一份必然随规则漂移。
+    isEasySyncInternalPath: actual.isEasySyncInternalPath,
+    normalizeExcludedFolders: (paths: unknown[]) => paths.filter(
+      (path): path is string => typeof path === "string" && path.length > 0,
+    ),
+  };
+});
 
 vi.mock("../src/sync/state-manager", () => ({
   StateManager: class {},
@@ -51,28 +53,20 @@ vi.mock("../src/ui/settings-tab", () => ({
   EasySyncSettingTab: class {},
 }));
 
-vi.mock("../src/ui/sync-view", () => ({
-  SYNC_VIEW_TYPE: "easy-sync-detail",
-  shouldAutoRebuildPlanReview: (
-    counts: {
-      uploads: number;
-      downloads: number;
-      folders?: number;
-      deletes: number;
-      conflicts: number;
-      skipped: number;
-    } | null,
-    items: unknown[],
-  ) => Boolean(
-    counts
-    && items.length === 0
-    && counts.uploads + counts.downloads + (counts.folders ?? 0)
-      + counts.deletes + counts.conflicts + counts.skipped > 0
-  ),
-  EasySyncSyncView: class {
-    render = vi.fn();
-  },
-}));
+vi.mock("../src/ui/sync-view", async () => {
+  const actual = await vi.importActual<typeof import("../src/ui/sync-view")>(
+    "../src/ui/sync-view",
+  );
+  return {
+    SYNC_VIEW_TYPE: actual.SYNC_VIEW_TYPE,
+    // 「计划已变、需要重建审阅」这条判定取真实现：替身抄的是同一算式，
+    // 但它属于视图层不变量，抄一份就多一处会漂移的副本。
+    shouldAutoRebuildPlanReview: actual.shouldAutoRebuildPlanReview,
+    EasySyncSyncView: class {
+      render = vi.fn();
+    },
+  };
+});
 
 vi.mock("../src/ui/ribbon-status", () => ({
   RIBBON_STATUS_ICONS: {},
@@ -118,6 +112,8 @@ import {
 } from "../src/sync/community-plugin-participation";
 import { createEmptyCommunityPluginAdoptionMemory } from "../src/sync/community-plugin-adoption-memory";
 import { NOTICE_PRIORITY } from "../src/ui/notice-center";
+import { isEasySyncInternalPath } from "../src/sync/local-scanner";
+import { SYNC_VIEW_TYPE, shouldAutoRebuildPlanReview } from "../src/ui/sync-view";
 
 function okResult(): SyncResult {
   return {
@@ -335,6 +331,40 @@ function remoteCalendarCatalog(revision = 8, digest = "b".repeat(64)) {
     }],
   };
 }
+
+// 本套件用替身替掉扫描器与侧栏视图，但其中两条规则不属于「外部依赖」，
+// 而是产品自己的判定。替身必须直接引用真实现：验收「替身没有变成第二份
+// 实现」，否则规则一改，替身会继续按旧规则放行，本套件全绿却已经失真。
+describe("test harness delegates product rules", () => {
+  it("两条规则与视图类型都取自真实现", async () => {
+    const actualScanner = await vi.importActual<
+      typeof import("../src/sync/local-scanner")
+    >("../src/sync/local-scanner");
+    const actualSyncView = await vi.importActual<
+      typeof import("../src/ui/sync-view")
+    >("../src/ui/sync-view");
+    expect(isEasySyncInternalPath, "内部路径判定必须复用真规则而非另抄一份")
+      .toBe(actualScanner.isEasySyncInternalPath);
+    expect(shouldAutoRebuildPlanReview, "审阅重建判定必须复用真规则而非另抄一份")
+      .toBe(actualSyncView.shouldAutoRebuildPlanReview);
+    expect(SYNC_VIEW_TYPE).toBe(actualSyncView.SYNC_VIEW_TYPE);
+  });
+
+  it("内部路径判定按真规则工作：状态文件与配置目录都在判据内", () => {
+    expect(isEasySyncInternalPath(".obsidian/plugins/easy-sync/tmp/scratch.md"))
+      .toBe(true);
+    // 插件自己的状态文件同样不是同步范围——早期替身只认临时目录，漏了这一族。
+    expect(isEasySyncInternalPath(".obsidian/plugins/easy-sync/data.json"))
+      .toBe(true);
+    // 配置目录是入参而非写死的 .obsidian：换目录后判据跟着换。
+    expect(isEasySyncInternalPath(
+      ".vault2/plugins/easy-sync/tmp/scratch.md",
+      ".vault2",
+    )).toBe(true);
+    expect(isEasySyncInternalPath(".vault2/plugins/easy-sync/tmp/scratch.md"))
+      .toBe(false);
+  });
+});
 
 describe("main sync entry guards", () => {
   beforeEach(() => {
@@ -4076,6 +4106,72 @@ describe("main sync entry guards", () => {
     expect(startAutoSync).not.toHaveBeenCalled();
   });
 
+  it("keeps a mixed failing round on the ordinary path even when recovery isolated a record", async () => {
+    // S2 反向控制项②：新通道只决定「哪些记录可被记录级冻结」，不许把一个
+    // 仍然失败的轮次洗成隔离安静支路。隔离支路的条件是 errors === 0；本轮
+    // 带着 errors: 1 与隔离记录 ⇒ 落回普通轮的暂停门（错误的非豁免族仍然
+    // 暂停自动同步），而不是隔离支路的「不暂停并继续」。
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = {
+      planReviewActive: false,
+      syncHistory: [],
+      mutationLedger: [{
+        intent: { operationId: "pending", path: "notes/a.md" },
+        receipt: null,
+      }],
+    } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    const finishSyncNotice = vi.spyOn(plugin as never, "finishSyncNotice")
+      .mockImplementation(() => undefined);
+    const clearSyncLifecycleNotice = vi.spyOn(plugin as never, "clearSyncLifecycleNotice")
+      .mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings")
+      .mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync")
+      .mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync")
+      .mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess")
+      .mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar")
+      .mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (
+        result: SyncResult,
+        mode: "manual",
+      ) => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: false,
+      errors: 1,
+      mutationRecovery: {
+        state: "blocked",
+        total: 1,
+        settled: 0,
+        remaining: 1,
+        retryAfterSeconds: null,
+        blockReason: "facts-changed",
+        blockedOperationId: "pending",
+        isolated: true,
+      },
+    }, "manual");
+
+    // The isolated quiet branch did not claim the round …
+    expect(clearSyncLifecycleNotice).not.toHaveBeenCalled();
+    expect((plugin as never as {
+      mutationRecoveryBlockReason: string | null;
+    }).mutationRecoveryBlockReason).toBeNull();
+    // … the ordinary pause gate did, exactly as for any failing round.
+    expect(plugin.autoSyncPaused).toBe(true);
+    expect(stopAutoSync).toHaveBeenCalledOnce();
+    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    expect(startAutoSync).not.toHaveBeenCalled();
+    expect(finishSyncNotice).toHaveBeenCalledOnce();
+  });
+
   it("reports an active automatic pause instead of a network wait, and keeps the network form when nothing is paused", () => {
     const plugin = new EasySyncPlugin();
     plugin.state = {
@@ -6729,6 +6825,270 @@ describe("main sync entry guards", () => {
       success: false,
       errors: 3,
       identityBlockedErrors: 1,
+      message: "syncFailed",
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(true);
+    expect(stopAutoSync).toHaveBeenCalledOnce();
+    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("does not pause auto sync when every failure is a network-class transfer failure", async () => {
+    // 2026-10-16 用户拍板：断网造成的失败是环境瞬态，不是未知结果。整库暂停会
+    // 把 M17 网络退避臂（每 15 分钟一次真实重试）一起关掉，落成"必须手动同步
+    // 才继续"——长时间不关机的机器恢复联网后正是这样停摆的。
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: false,
+      errors: 2,
+      networkFailureErrors: 2,
+      message: "syncFailed",
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(stopAutoSync).not.toHaveBeenCalled();
+    expect(saveSyncSettings).not.toHaveBeenCalled();
+    expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("does not pause auto sync when a round mixes exempt failure families", async () => {
+    // 组合现场（2026-10-16 review）：网络长时间不稳时，同一轮里既可能有被 M17
+    // 熔断延后的项（同版本已连续失败 3 次），也可能有刚断链的项。两者各自都不该
+    // 让整库停摆，混在一起同样不该——判据是"每个错误都属于既有豁免族"，不是
+    // "某一族恰好等于全部错误"。
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: false,
+      errors: 2,
+      breakerDeferredErrors: 1,
+      networkFailureErrors: 1,
+      message: "syncFailed",
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(stopAutoSync).not.toHaveBeenCalled();
+    expect(saveSyncSettings).not.toHaveBeenCalled();
+    expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("keeps pausing when exempt counters over-count the round's errors", async () => {
+    // 反假绿控制项：豁免族的和必须与 errors 严格相等。这里延后项在轮内没走到
+    // 执行（错误没被计入），网络族单独看又恰好等于 errors——旧判据会把它当成
+    // "只剩网络族"而放过整轮，新判据按和比对，和（4）大于 errors（1），仍暂停。
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: false,
+      errors: 1,
+      breakerDeferredErrors: 2,
+      networkFailureErrors: 1,
+      message: "syncFailed",
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(true);
+    expect(stopAutoSync).toHaveBeenCalledOnce();
+    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("keeps pausing auto sync when network failures are mixed with other failures", async () => {
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: false,
+      errors: 3,
+      networkFailureErrors: 1,
+      message: "syncFailed",
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(true);
+    expect(stopAutoSync).toHaveBeenCalledOnce();
+    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("does not pause auto sync when the only failure is a plan-layer identity deferral", async () => {
+    // 2026-10-18 用户拍板：计划层 RetryLater（`reason.identityReplacement.
+    // verificationPending`，文案自陈「本轮未作更改」、设计语义＝下一轮再验证）
+    // 不再触发整库暂停——把它停下来等手动同步，正好否掉它自己「下一轮再验证」
+    // 的语义。失败仍如实进历史与失败提示（本项同时钉住这两处照常收到这一轮）。
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    const finishSyncNotice = vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    const recordSyncHistory = vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: false,
+      errors: 1,
+      planningDeferredErrors: 1,
+      message: "syncFailed",
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(stopAutoSync).not.toHaveBeenCalled();
+    expect(saveSyncSettings).not.toHaveBeenCalled();
+    expect(startAutoSync).not.toHaveBeenCalled();
+    expect(recordSyncHistory).toHaveBeenCalledTimes(1);
+    expect(recordSyncHistory.mock.calls[0][0]).toMatchObject({
+      success: false,
+      errors: 1,
+      planningDeferredErrors: 1,
+      message: "syncFailed",
+    });
+    expect(finishSyncNotice).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps pausing auto sync when a plan-layer deferral is mixed with a family-outside failure", async () => {
+    // 反假绿控制项：豁免的是「整轮每个错误都属于豁免族」，不是「有这一类延后
+    // 就不暂停」。混入族外失败（这一轮 errors=2、其中延后只占 1）照旧暂停。
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: false,
+      errors: 2,
+      planningDeferredErrors: 1,
+      message: "syncFailed",
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(true);
+    expect(stopAutoSync).toHaveBeenCalledOnce();
+    expect(saveSyncSettings).toHaveBeenCalledOnce();
+    expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("does not pause auto sync when a plan-layer deferral mixes with other exempt families", async () => {
+    // 组合现场：计划层延后与熔断延后、网络类失败同轮出现时，每个错误仍在豁免
+    // 族内——求和等式判据保持不变（F30 三处边界之一：豁免族相混不停摆）。
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: false,
+      errors: 3,
+      planningDeferredErrors: 1,
+      breakerDeferredErrors: 1,
+      networkFailureErrors: 1,
+      message: "syncFailed",
+    }, "auto");
+
+    expect(plugin.autoSyncPaused).toBe(false);
+    expect(stopAutoSync).not.toHaveBeenCalled();
+    expect(saveSyncSettings).not.toHaveBeenCalled();
+    expect(startAutoSync).not.toHaveBeenCalled();
+  });
+
+  it("keeps pausing when the plan-layer deferral counter over-counts the round's errors", async () => {
+    // 反假绿控制项：求和等式语义不变——四族之和必须严格等于 errors。这里延后
+    // 计数（2）大于 errors（1，延后项在轮内没走到执行），和大于 errors ⇒ 仍暂停。
+    const plugin = new EasySyncPlugin();
+    plugin.autoSyncPaused = false;
+    plugin.state = { planReviewActive: false } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    vi.spyOn(plugin as never, "finishSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "recordSyncHistory").mockResolvedValue(undefined);
+    const saveSyncSettings = vi.spyOn(plugin, "saveSyncSettings").mockResolvedValue(undefined);
+    const stopAutoSync = vi.spyOn(plugin, "stopAutoSync").mockImplementation(() => undefined);
+    const startAutoSync = vi.spyOn(plugin, "startAutoSync").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "clearRibbonSuccess").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+
+    await (plugin as never as {
+      handleSyncResult: (result: SyncResult, mode: "auto") => Promise<void>;
+    }).handleSyncResult({
+      ...okResult(),
+      success: false,
+      errors: 1,
+      planningDeferredErrors: 2,
       message: "syncFailed",
     }, "auto");
 

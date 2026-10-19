@@ -427,6 +427,33 @@ describe("canonical V2 plan candidate", () => {
     });
   });
 
+  it("defers a reconcile action whose expected remote facts no longer match the projection", () => {
+    // 计划层延后（`RetryLater` + `reason.identityReplacement.verificationPending`，
+    // 文案自陈「本轮未作更改」、设计语义＝下一轮再验证）——执行器暂停门第四豁免族
+    // （`planningDeferredErrors`）唯一的计划生产点，本项钉住「计划的产出 reason」与
+    // 「执行器按同一 reason 计入豁免族」两处字面量的同一性。
+    // 构造条件：reconcile 动作按锚点拼写（"Note.md"）通过范围谓词，占用者节点的
+    // 投影拼写（"note.md"）没通过 ⇒ `remoteFilesById` 找不到动作预期的远端事实，
+    // 守卫把该路径交回普通规划而不是按失效预期改写身份。
+    const state = envelope({
+      files: [{ id: "rebuilt-id", name: "note.md" }],
+      folderAnchors: [],
+      fileAnchors: [fileAnchor("gone-id", "Note.md")],
+    });
+    const candidate = build({
+      state,
+      localFiles: [localFile("Note.md")],
+      includeFilePath: (path) => path !== "note.md",
+    });
+    expect(candidate.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: SyncActionType.RetryLater,
+        path: "Note.md",
+        reason: "reason.identityReplacement.verificationPending",
+      }),
+    ]));
+  });
+
   it("uses an explicit unknown state for replacement plus local relocation", () => {
     const state = envelope({
       files: [{ id: "new-id", name: "old.md" }],
@@ -688,6 +715,247 @@ describe("canonical V2 plan candidate", () => {
         SyncActionType.ConfirmLocalDelete,
       ].includes(item.type))).toBe(false);
     }
+  });
+
+  it("owns a spelling-alias relocation target instead of a doomed remote move", () => {
+    const state = envelope({
+      folders: [{ id: "folder", name: "videos" }],
+      files: [{ id: "file", name: "old.md" }],
+      folderAnchors: [],
+      fileAnchors: [fileAnchor("file", "old.md")],
+    });
+    const candidate = build({
+      state,
+      localFiles: [localFile("Videos/old.md")],
+      localFolders: localFolders("Videos"),
+    });
+
+    // The identity layer withholds the move (the destination parent is only a
+    // spelling alias), and no file action may take over those paths: the plan
+    // stays at the two actionable rows — the ordinary same-content decision on
+    // the old cloud path plus the folder-level deferral.
+    expect(candidate.items.map((item) => `${item.type}|${item.path}|${item.reason ?? ""}`)).toEqual([
+      `conflict|old.md|reason.renameIdentityAmbiguous`,
+      `folderDeferred|Videos|reason.folder.unanchored-shared-folder`,
+    ]);
+    expect(candidate.items.some((item) => [
+      SyncActionType.Upload,
+      SyncActionType.Download,
+      SyncActionType.DeleteRemote,
+      SyncActionType.DeleteLocal,
+      SyncActionType.ConfirmLocalDelete,
+      SyncActionType.RenameRemote,
+    ].includes(item.type))).toBe(false);
+  });
+
+  // A1 拼写别名（甲 2026-10-16 发现；乙口径 2026-10-16 落守卫并复锚）。
+  // SC-19 的禁令管的是**可执行计划**与 mutation 回执，而 canonical plan 是所有文件夹
+  // 计划项的单一咽喉 ⇒ 合同钉子按结果锚在这一层：文件夹层允许发出候选（它只延后或
+  // 交候选），但分歧形状过 canonical plan 后不得留下任何可执行的文件夹路径 mutation。
+  // 三条形状：①改名正向（索引 `videos`／本机 `Videos`）；②改名反向镜像（索引 `Videos`
+  // ／本机 `videos`）；③未锚定分歧父下的新建（上游条件闸放行的那条接缝）。
+  // 每条都同时断言"该项确实存在且被扣下"（folderDeferred 行），否则零动作可能只是
+  // 因为上游压根没发候选而假绿。
+  const spellingAliasFolderRows = (
+    candidate: ReturnType<typeof build>,
+  ) => candidate.items
+    .filter((item) => item.type === SyncActionType.MoveRemoteFolder
+      || item.type === SyncActionType.CreateRemoteFolder);
+
+  it("A1-① leaves no remote folder move under a spelling-alias destination parent", () => {
+    const state = envelope({
+      folders: [
+        { id: "parent", name: "videos" },
+        { id: "sub", name: "Notes", parentId: "parent" },
+      ],
+      files: [{ id: "file-a", name: "a.md", parentId: "sub" }],
+      folderAnchors: [
+        folderAnchor("parent", "videos"),
+        folderAnchor("sub", "videos/Notes", "parent"),
+      ],
+      fileAnchors: [fileAnchor("file-a", "videos/Notes/a.md")],
+    });
+
+    const candidate = build({
+      state,
+      localFiles: [localFile("Videos/Notes2/a.md")],
+      localFolders: localFolders("Videos", "Videos/Notes2"),
+      localMoveHints: [
+        { version: 1, scope, remoteId: "parent", fromPath: "videos", toPath: "Videos", observedAt: 10 },
+        { version: 1, scope, remoteId: "sub", fromPath: "videos/Notes", toPath: "Videos/Notes2", observedAt: 11 },
+      ],
+    });
+
+    expect(candidate.status).toBe("planned");
+    expect(spellingAliasFolderRows(candidate)).toEqual([]);
+    // 反假绿：该项存在过，是本层把它扣下的。
+    expect(candidate.items).toContainEqual(expect.objectContaining({
+      type: "folderDeferred",
+      path: "Videos/Notes2",
+    }));
+  });
+
+  it("A1-② leaves no remote folder move in the mirrored spelling direction", () => {
+    const state = envelope({
+      folders: [
+        { id: "parent", name: "Videos" },
+        { id: "sub", name: "Notes", parentId: "parent" },
+      ],
+      files: [{ id: "file-a", name: "a.md", parentId: "sub" }],
+      folderAnchors: [
+        folderAnchor("parent", "Videos"),
+        folderAnchor("sub", "Videos/Notes", "parent"),
+      ],
+      fileAnchors: [fileAnchor("file-a", "Videos/Notes/a.md")],
+    });
+
+    const candidate = build({
+      state,
+      localFiles: [localFile("videos/Notes2/a.md")],
+      localFolders: localFolders("videos", "videos/Notes2"),
+      localMoveHints: [
+        { version: 1, scope, remoteId: "parent", fromPath: "Videos", toPath: "videos", observedAt: 10 },
+        { version: 1, scope, remoteId: "sub", fromPath: "Videos/Notes", toPath: "videos/Notes2", observedAt: 11 },
+      ],
+    });
+
+    expect(candidate.status).toBe("planned");
+    expect(spellingAliasFolderRows(candidate)).toEqual([]);
+    expect(candidate.items).toContainEqual(expect.objectContaining({
+      type: "folderDeferred",
+      path: "videos/Notes2",
+    }));
+  });
+
+  it("A1-④ leaves no remote folder create under an unanchored spelling-alias parent", () => {
+    const state = envelope({
+      folders: [{ id: "parent", name: "videos" }],
+      folderAnchors: [],
+    });
+
+    const candidate = build({
+      state,
+      localFiles: [],
+      localFolders: localFolders("Videos", "Videos/New"),
+    });
+
+    expect(candidate.status).toBe("planned");
+    expect(spellingAliasFolderRows(candidate)).toEqual([]);
+    expect(candidate.items).toContainEqual(expect.objectContaining({
+      type: "folderDeferred",
+      path: "Videos/New",
+    }));
+  });
+
+  // 控制项（必须绿）：分歧父的拼写与索引逐字节一致时，同一新建形状照旧发射 ⇒
+  // 上一条的零动作来自本层的逐字节闸，而不是上游压根没发候选（反假绿）。
+  it("A1-④ control: still creates that folder when the parent spelling is byte-identical", () => {
+    const state = envelope({
+      folders: [{ id: "parent", name: "Videos" }],
+      folderAnchors: [],
+    });
+
+    const candidate = build({
+      state,
+      localFiles: [],
+      localFolders: localFolders("Videos", "Videos/New"),
+    });
+
+    expect(candidate.status).toBe("planned");
+    expect(candidate.items).toContainEqual(expect.objectContaining({
+      type: SyncActionType.CreateRemoteFolder,
+      path: "Videos/New",
+    }));
+  });
+
+  // F29 切片 1（2026-10-16）：文件夹移动的**后代投影闸**。归约层在提交文件夹移动
+  // 回执时要求该文件夹之下每个 file anchor 在**已提交索引**里的投影 == 机械翻译
+  // （`folder-state-reducer-v2.ts:810-823`）；云端把这棵子树改成非整体形状（后代被
+  // 重新挂到别处／身份被替换／锚点成墓碑）时该断言结构性不可满足、回执永不提交
+  // （野外案 2026-10-16：Android 1.5.9 整库停机、无出口）。本层做同构预检：不等即
+  // 扣下、改产延后行（复用现成 reason，行内出口可用），后代先由文件层按现状对账、
+  // 下一轮再把这次移动发出去 ⇒ 一轮延后自动收敛，而不是停机。
+  // 每条都同时断言"确实没有可执行的文件夹移动"＋"该项到过本层且被扣下"，
+  // 否则零动作可能只是因为上游压根没发候选而假绿（同 A1 钉子口径）。
+  const folderMoveRows = (candidate: ReturnType<typeof build>) => candidate.items
+    .filter((item) => item.type === SyncActionType.MoveLocalFolder
+      || item.type === SyncActionType.MoveRemoteFolder);
+
+  // 三个变体共享同一份现场：云端已把 `05秋招` 改名为 `05秋招记录`，本机还没动，
+  // 该文件夹与其子文件夹都已锚定、后代文件也已锚定。
+  //   diverged ＝ 云端把这个子文件夹搬到了别处（后代投影 ≠ 机械翻译）→ 闸门应扣下；
+  //   tombstone＝ 后代锚点的远端身份已消失（墓碑）→ 闸门应扣下；
+  //   converged＝ 后代跟着文件夹一起改名（投影 == 机械翻译）→ 照旧发射（控制项）。
+  const f29Candidate = (variant: "diverged" | "converged" | "tombstone") => build({
+    state: envelope({
+      folders: variant === "diverged"
+        ? [
+          { id: "renamed", name: "05秋招记录" },
+          { id: "misc", name: "其他" },
+          { id: "child", name: "投递与面试记录", parentId: "misc" },
+        ]
+        : [
+          { id: "renamed", name: "05秋招记录" },
+          { id: "child", name: "投递与面试记录", parentId: "renamed" },
+        ],
+      files: [{ id: "file-y", name: "东风汽车.md", parentId: "child" }],
+      folderAnchors: [
+        folderAnchor("renamed", "05秋招"),
+        folderAnchor("child", "05秋招/投递与面试记录", "renamed"),
+      ],
+      fileAnchors: [
+        variant === "tombstone"
+          ? { ...fileAnchor("file-y", "05秋招/投递与面试记录/东风汽车.md"), remoteId: undefined }
+          : fileAnchor("file-y", "05秋招/投递与面试记录/东风汽车.md"),
+      ],
+    }),
+    localFiles: [localFile("05秋招/投递与面试记录/东风汽车.md")],
+    localFolders: localFolders("05秋招", "05秋招/投递与面试记录"),
+  });
+
+  it("F29-① withholds the move when a descendant projects somewhere else (field shape)", () => {
+    // 云端已把 05秋招 改名为 05秋招记录，同时把它的子文件夹搬到了别处；本机还没动。
+    const candidate = f29Candidate("diverged");
+
+    expect(candidate.status).toBe("planned");
+    expect(folderMoveRows(candidate)).toEqual([]);
+    // 反假绿：这项确实到过本层，是被后代投影闸扣下的。
+    expect(candidate.items).toContainEqual(expect.objectContaining({
+      type: "folderDeferred",
+      path: "05秋招记录",
+      reason: "reason.folder.remote-subtree-changed",
+    }));
+    // 扣下文件夹移动不连坐后代对账：文件层照旧按现状把它搬到云端现位置。
+    expect(candidate.items).toContainEqual(expect.objectContaining({
+      type: SyncActionType.MoveLocalFile,
+      path: "其他/投递与面试记录/东风汽车.md",
+    }));
+  });
+
+  it("F29-② withholds the move when a descendant anchor lost its remote identity", () => {
+    // 同一形状的另一子情形（实跑判定为野外最可能的一种）：后代锚点成墓碑。
+    const candidate = f29Candidate("tombstone");
+
+    expect(candidate.status).toBe("planned");
+    expect(folderMoveRows(candidate)).toEqual([]);
+    expect(candidate.items).toContainEqual(expect.objectContaining({
+      type: "folderDeferred",
+      path: "05秋招记录",
+      reason: "reason.folder.remote-subtree-changed",
+    }));
+  });
+
+  // 控制项（必须绿）：后代随文件夹一起改名（投影 == 机械翻译）时照旧发射 ⇒ 上两条的
+  // 零动作来自本层的投影闸，而不是上游没发候选或闸门过宽（反假绿）。
+  it("F29-③ control: still moves that folder when every descendant projects to the translation", () => {
+    const candidate = f29Candidate("converged");
+
+    expect(candidate.status).toBe("planned");
+    expect(folderMoveRows(candidate)).toContainEqual(expect.objectContaining({
+      type: SyncActionType.MoveLocalFolder,
+      path: "05秋招记录",
+      renameFrom: "05秋招",
+    }));
   });
 
   it("uploads same-content copies while keeping the old cloud path as a normal decision", () => {

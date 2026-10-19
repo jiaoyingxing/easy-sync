@@ -1,9 +1,9 @@
 import { FileSystemAdapter, Platform, type Vault } from "obsidian";
 import { normalizeVaultPathKey } from "../obsidian-compat";
 
-export type VaultCloudClientService = "onedrive" | "icloud";
+type VaultCloudClientService = "onedrive" | "icloud";
 
-export interface VaultCloudClientDetection {
+interface VaultCloudClientDetection {
   /**
    * Whether the vault base path could be inspected at all. Mobile adapters
    * expose no vault base path, so the environment stays undecidable there.

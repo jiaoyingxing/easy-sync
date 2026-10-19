@@ -63,7 +63,7 @@ interface StateV2IndexedDbRecoveryCommitWitnessV1 {
   recordDigest: string;
 }
 
-export interface StateV2IndexedDbPreparedRecoveryDelta {
+interface StateV2IndexedDbPreparedRecoveryDelta {
   previousCommitSeq: number;
   nextCommitSeq: number;
   previousEnvelopeDigest: string;
@@ -74,7 +74,7 @@ export interface StateV2IndexedDbPreparedRecoveryDelta {
   folderAnchors: StateV2IndexedDbRecoveryRowChanges<FolderAnchorV2>;
 }
 
-export interface StateV2IndexedDbRecoveryRowChanges<T> {
+interface StateV2IndexedDbRecoveryRowChanges<T> {
   upserts: T[];
   deletes: string[];
 }

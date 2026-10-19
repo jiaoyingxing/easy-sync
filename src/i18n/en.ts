@@ -949,6 +949,7 @@ const en: LocaleStrings = {
   "mutationRecovery.reason.unknown": "The available evidence is not enough to confirm the result",
   "syncView.issues.title": "Needs attention {count}",
   "syncView.issues.openFile": "Open file",
+  "syncView.itemTermination.nonRetryable": "EasySync has seen this item unchanged for two syncs in a row, and this version cannot finish it safely. Until it changes, syncing again will not produce a different result. To report this, export a diagnostic report and send it to the author.",
   "syncView.collapseAll": "Collapse all",
   "syncView.expandAll": "Expand all",
   "syncView.history.title": "Sync history",

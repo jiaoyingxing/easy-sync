@@ -33,7 +33,7 @@ export interface StateV2ScopeTransitionPaths {
   transitionNext: string;
 }
 
-export interface StateV2ScopeTransitionRecord {
+interface StateV2ScopeTransitionRecord {
   schemaVersion: 1;
   kind: "state-v2-scope-transition";
   createdAt: number;
@@ -406,7 +406,7 @@ export class StateV2ScopeTransitionStore {
   }
 }
 
-export function validateTransitionRecord(
+function validateTransitionRecord(
   value: unknown,
 ): asserts value is StateV2ScopeTransitionRecord {
   if (

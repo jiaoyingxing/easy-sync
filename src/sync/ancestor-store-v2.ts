@@ -18,7 +18,7 @@ export interface AncestorStoreV2Paths {
   manifestNext: string;
 }
 
-export interface AncestorManifestV2 {
+interface AncestorManifestV2 {
   schemaVersion: 2;
   textHashes: string[];
 }

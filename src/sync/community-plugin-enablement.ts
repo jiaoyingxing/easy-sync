@@ -5,23 +5,23 @@ import {
   type SyncScope,
 } from "./types";
 
-export type PluginEnablementAnchorsV1 = Record<string, boolean>;
+type PluginEnablementAnchorsV1 = Record<string, boolean>;
 
-export interface ObservedPluginEnablementDecision {
+interface ObservedPluginEnablementDecision {
   pluginId: string;
   localEnabled: boolean;
   remoteEnabled: boolean;
   resolvedEnabled?: boolean;
 }
 
-export interface CommunityPluginEnablementObservedVersionV2 {
+interface CommunityPluginEnablementObservedVersionV2 {
   exists: boolean;
   contentHash?: string;
   remoteId?: string;
   eTag?: string;
 }
 
-export interface CommunityPluginEnablementSourceV2 {
+interface CommunityPluginEnablementSourceV2 {
   path: string;
   selectedPluginIds: string[];
   local: CommunityPluginEnablementObservedVersionV2;

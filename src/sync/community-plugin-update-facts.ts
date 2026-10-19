@@ -30,7 +30,7 @@ export interface CommunityPluginAutoUpdateCandidate {
   manifestDownloaded: boolean;
 }
 
-export interface CommunityPluginUpdateFactsInput {
+interface CommunityPluginUpdateFactsInput {
   /**
    * Per-file completion records of one finished sync round, successful and
    * failed rows alike. A failed bundle-member download is an update that did

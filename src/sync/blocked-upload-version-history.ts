@@ -32,14 +32,14 @@ const EVIDENCE_VERSION_LIMIT = 8;
  *  delay the blocked round by the transport's own metadata budget. */
 const DEFAULT_PROBE_TIMEOUT_MS = 5000;
 
-export interface DriveItemVersionFacts {
+interface DriveItemVersionFacts {
   versionId: string;
   size: number | null;
   mtimeMs: number | null;
   lastModifiedBy: string | null;
 }
 
-export interface BlockedUploadVersionHistoryEvidence {
+interface BlockedUploadVersionHistoryEvidence {
   retainedCount: number;
   /** Newest first, capped at EVIDENCE_VERSION_LIMIT. */
   newest: DriveItemVersionFacts[];
@@ -51,7 +51,7 @@ export interface BlockedUploadVersionHistoryEvidence {
   versionsAtOrAfterIntent: number;
 }
 
-export interface BlockedUploadVersionHistoryProbeDeps {
+interface BlockedUploadVersionHistoryProbeDeps {
   listVersions(driveItemId: string): Promise<DriveItemVersion[]>;
   isLoggingEnabled(): boolean;
   log(message: string, data: Record<string, unknown>): void;
@@ -82,7 +82,7 @@ export function computeETagVersionDelta(
   return current !== null && base !== null ? current - base : undefined;
 }
 
-export interface BlockedUploadRemoteFacts {
+interface BlockedUploadRemoteFacts {
   intentExpectedLocalSize: number | null;
   remoteSize: number | undefined;
   remoteSha256: string | undefined;

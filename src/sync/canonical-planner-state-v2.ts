@@ -17,7 +17,7 @@ import type {
   SyncScope,
 } from "./types";
 
-export interface CanonicalPlannerStateRecordsV2 {
+interface CanonicalPlannerStateRecordsV2 {
   meta: CommitMetaV2;
   scope: SyncScope;
   remoteIndex: Omit<RemoteIndexV2, "itemsById">;

@@ -15,7 +15,7 @@ export interface EasySyncLayoutMigrationStorage {
   saveLocalStorage(key: string, data: unknown): void;
 }
 
-export interface EasySyncLayoutMigrationResult {
+interface EasySyncLayoutMigrationResult {
   migrated: string[];
   legacyFiles: string[];
   conflicts: string[];
@@ -65,6 +65,96 @@ function join(pluginDir: string, relative: string): string {
   return `${normalizePath(pluginDir)}/${relative}`;
 }
 
+/** A path-valued key of the registry (excludes the version/counter fields). */
+type EasySyncSidecarKey = {
+  [K in keyof EasySyncPathSet]: EasySyncPathSet[K] extends string ? K : never;
+}[keyof EasySyncPathSet];
+
+/**
+ * Sidecar keys the layout migration moves one-to-one, keyed by the shared path
+ * registry so a key can never be spelled twice. Exported together with the two
+ * prefix groups: the completeness gate (tests/easy-sync-storage-layout.test.ts)
+ * proves every registered sidecar is either listed here or spells the same path
+ * in both layouts, so a newly added sidecar cannot be forgotten silently.
+ */
+/** Direct sidecars the migration probes for explicitly (a superset probe of the
+ *  tree walk below, which is only entered when the legacy plugin existed). */
+export const EASY_SYNC_LAYOUT_DIRECT_MIGRATION_KEYS = [
+  "remoteStateFile",
+  "stateV2File",
+  "stateV2NextFile",
+  "stateV2PreviousFile",
+  "stateV2RecoveryFile",
+  "stateV2ManifestFile",
+  "stateV2ManifestNextFile",
+  "stateV2AuthorityWitnessFile",
+  "stateV2AuthorityWitnessNextFile",
+  "stateV2RetiredManifestFile",
+  "stateV2RollbackFile",
+  "stateV2MigrationHoldFile",
+  "stateV2MigrationHoldNextFile",
+  "stateV2ScopeTransitionFile",
+  "stateV2ScopeTransitionNextFile",
+  "stateV2CorruptRecoveryFile",
+  "stateV2CorruptRecoveryNextFile",
+  "stateV2CorruptPublicationFile",
+  "stateV2CorruptPublicationNextFile",
+  "stateV1BackupFile",
+  "baseContentFile",
+  "ancestorManifestV2File",
+  "ancestorManifestV2NextFile",
+  "scanCacheFile",
+  "remoteEnumCheckpointFile",
+] as const satisfies ReadonlyArray<EasySyncSidecarKey>;
+
+/** Prefix entries that moved from the plugin root into the state tree. */
+export const EASY_SYNC_LAYOUT_ROOT_PREFIX_MIGRATION_KEYS = [
+  "stateV2CorruptSourcePrefix",
+  "stateV2ReactivationArchivePrefix",
+] as const satisfies ReadonlyArray<EasySyncSidecarKey>;
+
+/** Directory prefixes that kept their shape but moved under another parent. */
+export const EASY_SYNC_LAYOUT_NESTED_PREFIX_MIGRATION_KEYS = [
+  "stateV2IndexedDbRecoveryDir",
+  "ancestorsV2Dir",
+  "tmpDir",
+] as const satisfies ReadonlyArray<EasySyncSidecarKey>;
+
+/**
+ * Sidecars that are rebuilt from other state (or kept only as evidence). Once
+ * the current tree has advanced past them a byte mismatch between the two
+ * copies is expected, so the migration skips them instead of blocking the whole
+ * layout change on a stale cache. Everything else is an authoritative sidecar
+ * and does block.
+ */
+export const EASY_SYNC_LAYOUT_DISCARDABLE_SIDECAR_KEYS = [
+  "scanCacheFile",
+  "remoteEnumCheckpointFile",
+  "stateV1BackupFile",
+  "stateV2CorruptRecoveryFile",
+  "stateV2CorruptRecoveryNextFile",
+  "stateV2CorruptPublicationFile",
+  "stateV2CorruptPublicationNextFile",
+] as const satisfies ReadonlyArray<EasySyncSidecarKey>;
+
+/**
+ * Cheapest probe for "a legacy install existed here": a handful of primary
+ * sidecars rather than the whole table. The enumeration checkpoint is in the
+ * list because a downgraded run can leave it as the *only* legacy artefact —
+ * and an undiscovered legacy file is never copied away, which would keep the
+ * old tree (and its directory shells) alive forever.
+ */
+export const EASY_SYNC_LAYOUT_PROBE_SENTINEL_KEYS = [
+  "remoteStateFile",
+  "stateV2File",
+  "stateV2ManifestFile",
+  "stateV1BackupFile",
+  "baseContentFile",
+  "ancestorManifestV2File",
+  "scanCacheFile",
+  "remoteEnumCheckpointFile",
+] as const satisfies ReadonlyArray<EasySyncSidecarKey>;
+
 function mapLegacyRelativePath(
   relative: string,
   legacy: EasySyncPathSet,
@@ -73,53 +163,40 @@ function mapLegacyRelativePath(
   const normalized = normalizePath(relative);
   const legacyRoot = legacy.pluginDir;
   const currentRoot = current.pluginDir;
-  const directPairs: Array<[string, string]> = [
-    [legacy.remoteStateFile, current.remoteStateFile],
-    [legacy.stateV2File, current.stateV2File],
-    [legacy.stateV2NextFile, current.stateV2NextFile],
-    [legacy.stateV2PreviousFile, current.stateV2PreviousFile],
-    [legacy.stateV2RecoveryFile, current.stateV2RecoveryFile],
-    [legacy.stateV2ManifestFile, current.stateV2ManifestFile],
-    [legacy.stateV2ManifestNextFile, current.stateV2ManifestNextFile],
-    [legacy.stateV2AuthorityWitnessFile, current.stateV2AuthorityWitnessFile],
-    [legacy.stateV2AuthorityWitnessNextFile, current.stateV2AuthorityWitnessNextFile],
-    [legacy.stateV2RetiredManifestFile, current.stateV2RetiredManifestFile],
-    [legacy.stateV2RollbackFile, current.stateV2RollbackFile],
-    [legacy.stateV2MigrationHoldFile, current.stateV2MigrationHoldFile],
-    [legacy.stateV2MigrationHoldNextFile, current.stateV2MigrationHoldNextFile],
-    [legacy.stateV2ScopeTransitionFile, current.stateV2ScopeTransitionFile],
-    [legacy.stateV2ScopeTransitionNextFile, current.stateV2ScopeTransitionNextFile],
-    [legacy.stateV2CorruptRecoveryFile, current.stateV2CorruptRecoveryFile],
-    [legacy.stateV2CorruptRecoveryNextFile, current.stateV2CorruptRecoveryNextFile],
-    [legacy.stateV2CorruptPublicationFile, current.stateV2CorruptPublicationFile],
-    [legacy.stateV2CorruptPublicationNextFile, current.stateV2CorruptPublicationNextFile],
-    [legacy.stateV1BackupFile, current.stateV1BackupFile],
-    [legacy.baseContentFile, current.baseContentFile],
-    [legacy.ancestorManifestV2File, current.ancestorManifestV2File],
-    [legacy.ancestorManifestV2NextFile, current.ancestorManifestV2NextFile],
-    [legacy.scanCacheFile, current.scanCacheFile],
-  ];
+  const directPairs: Array<[string, string]> =
+    EASY_SYNC_LAYOUT_DIRECT_MIGRATION_KEYS.map((key) => [
+      legacy[key],
+      current[key],
+    ]);
   for (const [source, target] of directPairs) {
     if (normalized === relativeToPlugin(source, legacyRoot)) {
       return relativeToPlugin(target, currentRoot);
     }
   }
 
+  // The caller hands in a path relative to the legacy plugin directory, so the
+  // key-derived prefixes must be reduced the same way as the direct pairs.
+  const legacyRelative = (key: EasySyncSidecarKey): string =>
+    relativeToPlugin(legacy[key], legacyRoot) ?? legacy[key];
   const currentRelative = (target: string) => target.slice(`${currentRoot}/`.length);
-  const rootPrefixPairs: Array<[string, string]> = [
-    ["state-v2.corrupt-source-", "state/v2/state-v2.corrupt-source-"],
-    ["state-v2.reactivation-archive-", "state/v2/state-v2.reactivation-archive-"],
-  ];
+  const rootPrefixPairs: Array<[string, string]> =
+    EASY_SYNC_LAYOUT_ROOT_PREFIX_MIGRATION_KEYS.map((key) => [
+      legacyRelative(key),
+      currentRelative(current[key]),
+    ]);
   for (const [sourcePrefix, targetPrefix] of rootPrefixPairs) {
     if (normalized.startsWith(sourcePrefix)) {
-      return currentRelative(targetPrefix + normalized.slice(sourcePrefix.length));
+      // Both sides are plugin-relative here: the target prefix is the new
+      // spelling of the same relative shape (the old code stripped the plugin
+      // directory a second time, which turned the target into a fragment).
+      return targetPrefix + normalized.slice(sourcePrefix.length);
     }
   }
-  const nestedPrefixPairs: Array<[string, string]> = [
-    ["state-v2-indexeddb-recovery/", "state/v2/indexeddb-recovery/"],
-    ["ancestors-v2/", "objects/ancestors-v2/"],
-    ["tmp/", "runtime/"],
-  ];
+  const nestedPrefixPairs: Array<[string, string]> =
+    EASY_SYNC_LAYOUT_NESTED_PREFIX_MIGRATION_KEYS.map((key) => [
+      `${legacyRelative(key)}/`,
+      `${currentRelative(current[key])}/`,
+    ]);
   for (const [sourcePrefix, targetPrefix] of nestedPrefixPairs) {
     if (normalized.startsWith(sourcePrefix)) {
       return targetPrefix + normalized.slice(sourcePrefix.length);
@@ -290,42 +367,11 @@ async function discoverLegacyFiles(
   adapter: DataAdapter,
   legacy: EasySyncPathSet,
 ): Promise<string[]> {
-  const directCandidates = [
-    legacy.remoteStateFile,
-    legacy.stateV2File,
-    legacy.stateV2NextFile,
-    legacy.stateV2PreviousFile,
-    legacy.stateV2RecoveryFile,
-    legacy.stateV2ManifestFile,
-    legacy.stateV2ManifestNextFile,
-    legacy.stateV2AuthorityWitnessFile,
-    legacy.stateV2AuthorityWitnessNextFile,
-    legacy.stateV2RetiredManifestFile,
-    legacy.stateV2RollbackFile,
-    legacy.stateV2MigrationHoldFile,
-    legacy.stateV2MigrationHoldNextFile,
-    legacy.stateV2ScopeTransitionFile,
-    legacy.stateV2ScopeTransitionNextFile,
-    legacy.stateV2CorruptRecoveryFile,
-    legacy.stateV2CorruptRecoveryNextFile,
-    legacy.stateV2CorruptPublicationFile,
-    legacy.stateV2CorruptPublicationNextFile,
-    legacy.stateV1BackupFile,
-    legacy.baseContentFile,
-    legacy.ancestorManifestV2File,
-    legacy.ancestorManifestV2NextFile,
-    legacy.scanCacheFile,
-  ];
+  const directCandidates = EASY_SYNC_LAYOUT_DIRECT_MIGRATION_KEYS
+    .map((key) => legacy[key]);
   const files: string[] = [];
-  const sentinels = [
-    legacy.remoteStateFile,
-    legacy.stateV2File,
-    legacy.stateV2ManifestFile,
-    legacy.stateV1BackupFile,
-    legacy.baseContentFile,
-    legacy.ancestorManifestV2File,
-    legacy.scanCacheFile,
-  ];
+  const sentinels = EASY_SYNC_LAYOUT_PROBE_SENTINEL_KEYS
+    .map((key) => legacy[key]);
   let legacyFileExists = false;
   for (const path of sentinels) {
     try {
@@ -440,24 +486,17 @@ export async function ensureEasySyncRuntimeLayoutMigration(
 }
 
 /**
- * Sidecars that are rebuilt from other state, or kept only as evidence. Once
- * the current tree has advanced past them a byte mismatch is expected, so it
- * must be skipped rather than treated as an ambiguity. Everything else is an
- * authoritative sidecar and does block.
+ * Whether a byte mismatch on this sidecar may be skipped instead of blocking.
+ * The key list is the single source of truth (see
+ * `EASY_SYNC_LAYOUT_DISCARDABLE_SIDECAR_KEYS`).
  */
 function isDiscardableLegacySidecar(
   relative: string,
   legacy: EasySyncPathSet,
 ): boolean {
   const normalized = normalizePath(relative);
-  const discardable = [
-    legacy.scanCacheFile,
-    legacy.stateV1BackupFile,
-    legacy.stateV2CorruptRecoveryFile,
-    legacy.stateV2CorruptRecoveryNextFile,
-    legacy.stateV2CorruptPublicationFile,
-    legacy.stateV2CorruptPublicationNextFile,
-  ];
+  const discardable = EASY_SYNC_LAYOUT_DISCARDABLE_SIDECAR_KEYS
+    .map((key) => legacy[key]);
   return discardable.some(
     (path) => relativeToPlugin(path, legacy.pluginDir) === normalized,
   );

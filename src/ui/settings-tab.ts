@@ -42,6 +42,10 @@ import {
   updateExcludedFoldersFromUi,
 } from "./sync-exclusion-modal";
 import {
+  SETTINGS_TAB_ICON,
+  decorateSettingsRootRowIcons,
+} from "./settings-root-icons";
+import {
   applyAutoSyncChangeDelayRow,
   applyAutoSyncOnStartupRow,
   applyAutomaticHandlingRow,
@@ -128,6 +132,8 @@ export class EasySyncSettingTab extends PluginSettingTab {
   private displaySectionEl: HTMLElement | null = null;
   private aboutSectionEl: HTMLElement | null = null;
   private maintenanceSectionEl: HTMLElement | null = null;
+  /** 1.13+ 根级导航行图标的补挂观察器（宿主重建根行后自动补）。 */
+  private rootRowIconObserver: MutationObserver | null = null;
 
   constructor(plugin: EasySyncPlugin) {
     super(plugin.app, plugin);
@@ -135,6 +141,10 @@ export class EasySyncSettingTab extends PluginSettingTab {
     // Tab-level class must be applied at construction time: on Obsidian
     // 1.13.0+ the host renders declaratively and never calls display().
     this.containerEl.addClass("easy-sync-settings-tab");
+    // 设置窗左栏本插件那一行的图标（宿主只在页签 icon 非空时建该元素；第三方
+    // 插件整栏被宿主隐藏，由 styles.css 只放开我们自己那一行）。
+    this.icon = SETTINGS_TAB_ICON;
+    this.observeRootRowIcons();
   }
 
   display(): void {
@@ -303,6 +313,48 @@ export class EasySyncSettingTab extends PluginSettingTab {
     this.aboutSectionEl = null;
     this.maintenanceSectionEl = null;
     this.flushExclusionChanges();
+  }
+
+  /**
+   * 1.13+ 根级导航行的行首图标补挂。
+   *
+   * 宿主进子页再返回会重建根行、`update()` 不重建（1.14.4 实测），所以盯
+   * `containerEl` 的 DOM 变化同步补挂；**不用 rAF 合帧**——设置窗在前台时主窗
+   * `document.hidden === true`，rAF 实测不触发。装饰只遍历容器内的
+   * `.setting-item`（根级 ≤8 行）且幂等，成本可忽略。
+   */
+  private observeRootRowIcons(): void {
+    this.rootRowIconObserver = new MutationObserver(() => {
+      this.decorateRootRowIcons();
+    });
+    this.rootRowIconObserver.observe(this.containerEl, {
+      attributes: false,
+      childList: true,
+      characterData: false,
+      subtree: true,
+    });
+    this.plugin.register(() => {
+      this.rootRowIconObserver?.disconnect();
+      this.rootRowIconObserver = null;
+    });
+  }
+
+  /**
+   * `<1.13` 的 `display()` 弹框形态没有根级导航行（行名与页名同名的行在那里是
+   * 普通设置行），只在声明式渲染（1.13+）才装饰。
+   */
+  private decorateRootRowIcons(): void {
+    const declarative = this as unknown as { settingItems?: unknown[] };
+    if (
+      declarative.settingItems === undefined
+      || declarative.settingItems.length === 0
+    ) {
+      return;
+    }
+    decorateSettingsRootRowIcons(
+      this.containerEl,
+      this.plugin.i18n.t.bind(this.plugin.i18n),
+    );
   }
 
   private renderAccountSection(
@@ -902,7 +954,7 @@ export function buildSettingDefinitions(
 }
 
 /** 设置页「规则」行：一条规则只解释它所在板块，可由「我知道了」收起（2026-10-12 拍板）。 */
-export type SettingsRuleId =
+type SettingsRuleId =
   | "scopeExclusion"
   | "scopeContent"
   | "autoSync"
@@ -915,7 +967,7 @@ const SETTING_RULE_CONTENT_KEYS: Record<SettingsRuleId, string> = {
   autoHandling: "settings.automaticHandling.intro",
 };
 
-export function buildSettingRuleRow(
+function buildSettingRuleRow(
   t: I18nFn,
   plugin: EasySyncPlugin,
   host: SettingsPageRowHost,
@@ -977,7 +1029,7 @@ export function buildSettingRuleRow(
  * 同步范围页（2026-10-11 拍板）：同步排除两项置顶＋「同步内容」分组；
  * 规则按板块拆分（2026-10-12 拍板）——排除板块一条、内容板块一条。
  */
-export function buildScopePage(
+function buildScopePage(
   t: I18nFn,
   plugin: EasySyncPlugin,
   host: SettingsPageRowHost,
@@ -1059,7 +1111,7 @@ export function buildScopePage(
 }
 
 /** 自动同步页（2026-10-11 拍板）：总开关＋两条滑条＋「自动处理」分组（片⑦ 条件隐藏随迁）。 */
-export function buildAutoSyncPage(
+function buildAutoSyncPage(
   t: I18nFn,
   plugin: EasySyncPlugin,
   host: SettingsPageRowHost,
@@ -1131,7 +1183,7 @@ export function buildAutoSyncPage(
 }
 
 /** 显示页（2026-10-11 拍板为入口页；后续新设置进本页）。 */
-export function buildDisplayPage(
+function buildDisplayPage(
   t: I18nFn,
   plugin: EasySyncPlugin,
   host: SettingsPageRowHost,
@@ -1155,7 +1207,7 @@ export function buildDisplayPage(
 }
 
 /** 关于页（原「关于」组逐行平移）。 */
-export function buildAboutPage(
+function buildAboutPage(
   t: I18nFn,
   plugin: EasySyncPlugin,
   onStateChanged?: () => void,
@@ -1204,7 +1256,7 @@ export function buildAboutPage(
 }
 
 /** 维护页（原「维护」组逐行平移；件③ 反转入口按条件出现）。 */
-export function buildMaintenancePage(
+function buildMaintenancePage(
   t: I18nFn,
   plugin: EasySyncPlugin,
   host: SettingsPageRowHost,

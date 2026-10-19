@@ -71,7 +71,7 @@ function descTextEl(setting: Setting): HTMLElement {
 }
 
 /** 同步范围族写入失败的统一提示（与弹框 `showSyncPathSettingsError` 同口径）。 */
-export function noticeForSyncPathSettingsError(
+function noticeForSyncPathSettingsError(
   plugin: EasySyncPlugin,
   error: unknown,
 ): void {

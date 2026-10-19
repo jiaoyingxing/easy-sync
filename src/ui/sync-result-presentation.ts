@@ -7,7 +7,7 @@ import type { SyncHistoryStatus } from "../sync/state-manager";
 import { SyncActionType } from "../sync/types";
 import type { LocaleStrings } from "../i18n/types";
 
-export interface SyncPendingAttentionCounts {
+interface SyncPendingAttentionCounts {
   conflicts: number;
   remoteDeletes: number;
 }

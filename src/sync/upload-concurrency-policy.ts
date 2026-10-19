@@ -24,7 +24,7 @@ export function largeUploadConcurrency(isMobile: boolean): number {
     : LARGE_UPLOAD_CONCURRENCY_DESKTOP;
 }
 
-export interface UploadBatchObservation {
+interface UploadBatchObservation {
   files: number;
   elapsedMs: number;
   failed: boolean;

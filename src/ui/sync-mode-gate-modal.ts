@@ -9,7 +9,7 @@ import type { I18nFn } from "./confirm-modal";
  * 两个状态：正常可切换／有待确认的云端删除时拦下（提示先去同步面板处理，
  * 确认按钮保持不可用）。门槛不降：手输与提示句逐字一致前确认不可用。
  */
-export interface SyncModeGateViewV1 {
+interface SyncModeGateViewV1 {
   title: string;
   /** 首句（正常字号）。 */
   message: string;

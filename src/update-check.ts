@@ -18,7 +18,7 @@
  */
 
 /** One cold-start-cycle check budget; failures surface nothing anywhere. */
-export const UPDATE_CHECK_TIMEOUT_MS = 15_000;
+const UPDATE_CHECK_TIMEOUT_MS = 15_000;
 
 /** Throttle between real network checks (per device, persisted by main). */
 export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -26,7 +26,7 @@ export const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 /** "Remind me in 7 days" window (方案单 §四 跳过层 选项 A). */
 export const SNOOZE_DURATION_MS = 7 * 24 * 60 * 60 * 1000;
 
-export const JSDELIVR_PACKAGE_URL =
+const JSDELIVR_PACKAGE_URL =
   "https://data.jsdelivr.com/v1/packages/gh/jiaoyingxing/easy-sync";
 
 export function isStableVersion(version: string): boolean {
@@ -88,12 +88,12 @@ export function isUpdateReminderSuppressed(
   return now < snooze.until;
 }
 
-export interface UpdateCheckResponse {
+interface UpdateCheckResponse {
   status: number;
   text: string;
 }
 
-export type UpdateCheckFetcher = (
+type UpdateCheckFetcher = (
   opts: { url: string; method?: string },
 ) => Promise<UpdateCheckResponse>;
 
@@ -154,7 +154,7 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
  */
 export type UpdateCheckStorage = Pick<Storage, "getItem" | "setItem">;
 
-export interface UpdateCheckPersistedState {
+interface UpdateCheckPersistedState {
   lastCheckAt: number | null;
   lastKnownLatest: string | null;
   snooze: UpdateReminderSnooze | null;
@@ -192,7 +192,7 @@ export function loadUpdateCheckState(
 }
 
 /** Only present fields are written; a field's absence simply means "unset". */
-export interface UpdateCheckStatePatch {
+interface UpdateCheckStatePatch {
   lastCheckAt?: number;
   lastKnownLatest?: string;
   snooze?: UpdateReminderSnooze;

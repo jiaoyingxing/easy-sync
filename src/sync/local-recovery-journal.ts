@@ -34,14 +34,14 @@ interface LocalRecoveryBundleIntentV2 {
 
 type LocalRecoveryIntent = LocalRecoveryIntentV1 | LocalRecoveryBundleIntentV2;
 
-export interface LocalRecoveryBundleMemberInput {
+interface LocalRecoveryBundleMemberInput {
   targetPath: string;
   expected: LocalFileEntry | undefined;
   original: ArrayBuffer | null;
   downloaded: RecoveryVersion | null;
 }
 
-export type RecoveryOutcome = "none" | "restored" | "preserved-newer";
+type RecoveryOutcome = "none" | "restored" | "preserved-newer";
 
 /**
  * A state-neutral, single-writer journal for local download replacement.

@@ -6,7 +6,7 @@ import type { ManualResolutionEntryReason } from "../sync/manual-resolution-entr
  * `facts-changed` and `name-mismatch` stay with the calling family, which owns
  * the row path and the folder name that differs.
  */
-export type ManualResolutionNotice =
+type ManualResolutionNotice =
   | { kind: "entry"; key: string }
   | { kind: "facts-changed" }
   | { kind: "name-mismatch" };

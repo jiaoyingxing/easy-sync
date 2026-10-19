@@ -24,7 +24,7 @@ export type RibbonStatus =
  */
 export type RibbonOwnStatus = Exclude<RibbonStatus, "offline">;
 
-export interface RibbonStatusInput {
+interface RibbonStatusInput {
   loggedIn: boolean;
   cancelling: boolean;
   syncing: boolean;

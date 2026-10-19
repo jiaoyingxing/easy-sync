@@ -21,7 +21,7 @@ const CACHEABLE_MANUAL_REASONS = new Set<TextMergeManualEvidenceReasonV1>([
   "overlap",
 ]);
 
-export interface MergeVersionV2 {
+interface MergeVersionV2 {
   bytes: ArrayBuffer;
   hash: string;
   size: number;
@@ -40,7 +40,7 @@ export interface ConservativeMergeInputV2 {
   recoveryPending: boolean;
 }
 
-export type ConservativeMergeResultV2 =
+type ConservativeMergeResultV2 =
   | {
       status: "ready";
       mergedText: string;

@@ -35,7 +35,7 @@ export type RemoteScopeRecoveryEvidenceOperationIdentityV1 = Omit<
   "schemaVersion" | "operationId" | "startedAt" | "updatedAt"
 >;
 
-export type FirstSyncVerificationSourceCohortV2 =
+type FirstSyncVerificationSourceCohortV2 =
   | { kind: "fresh" }
   | { kind: "public-1.1.3"; sourceStateDigest: string };
 
@@ -507,7 +507,7 @@ implements RemoteScopeRecoveryEvidenceStore {
   }
 }
 
-export async function remoteScopeRecoveryEvidenceOperationId(
+async function remoteScopeRecoveryEvidenceOperationId(
   identity: RemoteScopeRecoveryEvidenceOperationIdentityV1,
 ): Promise<string> {
   validateOperationIdentity(identity);

@@ -11,11 +11,15 @@
  */
 
 /**
- * Generate a PKCE code verifier: 128 bytes of random data,
- * base64url-encoded without padding.
+ * Generate a PKCE code verifier: 96 bytes of random data (768 bits of entropy),
+ * base64url-encoded without padding ⇒ 128 characters.
+ *
+ * 长度必须落在 RFC 7636 §4.1 的 43–128 **字符**区间内；此前实现用 128 **字节**
+ * （base64url 后 171 字符）超出上限（2026-10-16 批次⑤ 由 `tests/auth-pkce.test.ts`
+ * 对 RFC 形状取证时发现）。96 字节恰好编成 128 字符、无填充，熵仍远高于要求。
  */
 export function generateCodeVerifier(): string {
-  const bytes = new Uint8Array(128);
+  const bytes = new Uint8Array(96);
   crypto.getRandomValues(bytes);
   return base64UrlEncode(bytes);
 }

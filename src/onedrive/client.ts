@@ -67,10 +67,10 @@ import { planRangeDownloadWindows } from "./download-range-policy";
 import type { DiagnosticLogger } from "../sync/diagnostic-logger";
 
 /** Callback to get a fresh access token */
-export type TokenProvider = () => Promise<string>;
+type TokenProvider = () => Promise<string>;
 type UploadProgressCallback = (uploadedBytes: number, totalBytes: number) => void;
 
-export interface SharedSyncProtocolControlObject {
+interface SharedSyncProtocolControlObject {
   id: string;
   eTag: string;
   content: string;
@@ -86,7 +86,7 @@ export interface SharedSyncProtocolBindingProvenObject {
   content: null;
 }
 
-export interface SharedSyncProtocolObjectsObservation {
+interface SharedSyncProtocolObjectsObservation {
   v2: SharedSyncProtocolControlObject | null;
   v3:
     | SharedSyncProtocolControlObject
@@ -161,8 +161,16 @@ function isSameGraphDriveId(actual: string, expected: string): boolean {
  *  transferred, so it must stay a hard failure). "observed" means the response
  *  body came back larger than the declared size: the remote was rewritten
  *  between the metadata read and the body read (content race), which the
- *  download layer defers instead of failing the round. */
-export type ResponseByteBudgetKind = "declared" | "observed";
+ *  download layer defers instead of failing the round.
+ *  "declared-over-expected" (2026-10-16) is the same physical race caught one
+ *  step earlier: the response header declares more than the size the metadata
+ *  promised for this very item. It only applies where the budget came from that
+ *  item's own metadata size; a budget that fell back to the class hard cap, the
+ *  plugin control-plane budgets and the legacy baseline keep "declared". */
+type ResponseByteBudgetKind =
+  | "declared"
+  | "declared-over-expected"
+  | "observed";
 
 export class ResponseByteBudgetError extends OneDriveError {
   readonly kind: ResponseByteBudgetKind;
@@ -191,11 +199,16 @@ interface RequestOptions {
   metadataReason?: OneDriveMetadataReason;
   expectedNotFound?: boolean;
   maxResponseBytes?: number;
+  /** Kind to report when a response *declares* more than `maxResponseBytes`.
+   *  Download requests sized from one item's own metadata pass
+   *  "declared-over-expected" (the response grew after the metadata read);
+   *  everything else keeps the standing-fact default. */
+  maxResponseBytesDeclaredKind?: ResponseByteBudgetKind;
   responseLabel?: string;
   sharedSyncProtocolRequestKey?: string;
 }
 
-export type OneDriveEndpointCategory =
+type OneDriveEndpointCategory =
   | "metadata"
   | "delta"
   | "simpleUpload"
@@ -206,7 +219,7 @@ export type OneDriveEndpointCategory =
   | "downloadUrl"
   | "contentFallback";
 
-export type OneDriveAttemptStatusCategory =
+type OneDriveAttemptStatusCategory =
   | "success"
   | "cancelled"
   | "auth"
@@ -228,7 +241,7 @@ export type OneDriveMetadataReason =
   | "blockedRecoveryVersionHistory"
   | "other";
 
-export interface OneDriveMetadataReasonRunMetrics {
+interface OneDriveMetadataReasonRunMetrics {
   attempts: number;
   succeeded: number;
   failed: number;
@@ -236,7 +249,7 @@ export interface OneDriveMetadataReasonRunMetrics {
   elapsedMs: number;
 }
 
-export interface OneDriveEndpointRunMetrics {
+interface OneDriveEndpointRunMetrics {
   attempts: number;
   succeeded: number;
   failed: number;
@@ -249,7 +262,7 @@ export interface OneDriveEndpointRunMetrics {
   statusCategories: Partial<Record<OneDriveAttemptStatusCategory, number>>;
 }
 
-export interface OneDriveRunMetricsSummary {
+interface OneDriveRunMetricsSummary {
   schemaVersion: 2;
   tokenAcquisition: {
     attempts: number;
@@ -994,7 +1007,7 @@ export class OneDriveClient {
     const legacyName = encodeURIComponent(vaultName);
     if (legacyName !== vaultName) candidates.push(legacyName);
     const storageVaultName = candidates.find((candidate) =>
-      deltaLink.includes(APP_FOLDER_PATHS.filesDelta(candidate))
+      routeMatchesContinuationUrl(deltaLink, APP_FOLDER_PATHS.filesDelta(candidate))
     );
     if (!storageVaultName) return false;
 
@@ -1067,7 +1080,8 @@ export class OneDriveClient {
   }
 
   isDeltaLinkForVault(vaultName: string, deltaLink: string): boolean {
-    return deltaLink.includes(
+    return routeMatchesContinuationUrl(
+      deltaLink,
       APP_FOLDER_PATHS.filesDelta(this.getStorageVaultName(vaultName)),
     );
   }
@@ -1630,7 +1644,10 @@ export class OneDriveClient {
       `${input.operationName} "${input.filePath}"`,
       { evidence: this.slowLinkEvidence, totalSize: input.fileSize },
     );
-    const maxResponseBytes = remoteFileByteBudget(input.fileSize, input.filePath);
+    const {
+      maxBytes: maxResponseBytes,
+      declaredKind: declaredOverflowKind,
+    } = remoteFileByteBudget(input.fileSize, input.filePath);
     let metadataAuthError: OneDriveError | null = null;
     // 连坐切片 (2026-09-16): whether a /content tier failed with a real HTTP
     // status — only that blacklists content for the round when the caller has
@@ -1738,6 +1755,7 @@ export class OneDriveClient {
       maxAttempts: 2,
       perRequestTimeoutMs: DOWNLOAD_MAX_TIMEOUT_MS,
       maxResponseBytes,
+      maxResponseBytesDeclaredKind: declaredOverflowKind,
       responseLabel: `Remote file "${input.filePath}"`,
     };
     const metaRequestOptions: RequestOptions = {
@@ -1927,7 +1945,10 @@ export class OneDriveClient {
     fileSize = 0,
     onProgress?: (downloaded: number, total: number) => void,
   ): Promise<ArrayBuffer> {
-    const maxResponseBytes = remoteFileByteBudget(fileSize, filePath);
+    const {
+      maxBytes: maxResponseBytes,
+      declaredKind: declaredOverflowKind,
+    } = remoteFileByteBudget(fileSize, filePath);
     return this.downloadWithWaterfall({
       operationName: "downloadFile",
       vaultName,
@@ -1980,6 +2001,7 @@ export class OneDriveClient {
           onProgress,
           signal,
           slowGate,
+          declaredOverflowKind,
         );
         return {
           value: response.arrayBuffer,
@@ -2024,7 +2046,10 @@ export class OneDriveClient {
     expectedSha256?: string,
     onProgress?: (downloaded: number, total: number) => void,
   ): Promise<DownloadToPathResult> {
-    const maxResponseBytes = remoteFileByteBudget(fileSize, filePath);
+    const {
+      maxBytes: maxResponseBytes,
+      declaredKind: declaredOverflowKind,
+    } = remoteFileByteBudget(fileSize, filePath);
     // 甲路续传 (2026-09-16): bytes already received are assets. The streaming
     // writers keep the on-disk prefix on retryable failures and record its
     // length here; the next attempt re-requests `Range: bytes=<offset>-` and
@@ -2052,6 +2077,7 @@ export class OneDriveClient {
           signal,
           slowGate,
           resumeState,
+          declaredOverflowKind,
         );
         return { value: result, bytes: result.size };
       },
@@ -2988,7 +3014,6 @@ export class OneDriveClient {
     );
   }
 
-
   private async readPluginControlItemV2(
     initial: DriveItem,
     label:
@@ -3195,6 +3220,7 @@ export class OneDriveClient {
           onProgress,
           signal,
           slowGate,
+          options.maxResponseBytesDeclaredKind,
         ),
         timeoutMs,
         this.abortSignal,
@@ -3266,6 +3292,7 @@ export class OneDriveClient {
           signal,
           slowGate,
           resumeState,
+          options.maxResponseBytesDeclaredKind,
         ),
         timeoutMs,
         this.abortSignal,
@@ -3762,15 +3789,26 @@ function responsePayloadByteLength(response: RequestUrlResponse): number {
   return 0;
 }
 
-function remoteFileByteBudget(fileSize: number, filePath: string): number {
+/** Per-item response budget for a remote file download.
+ *
+ *  The budget is the size the metadata promised for this item. A response that
+ *  declares more than that is the content race (the remote grew between the
+ *  metadata read and the body read) — never a standing fact about the item —
+ *  so the caller receives the matching kind alongside the number. When the
+ *  metadata size is unusable the budget falls back to the class hard cap, and
+ *  then a declared length over it *is* the standing fact ("declared"). */
+function remoteFileByteBudget(
+  fileSize: number,
+  filePath: string,
+): { maxBytes: number; declaredKind: ResponseByteBudgetKind } {
   assertDeclaredRemoteSize(
     fileSize,
     MAX_REMOTE_FILE_BYTES,
     `Remote file "${filePath}"`,
   );
   return Number.isFinite(fileSize) && fileSize > 0
-    ? fileSize
-    : MAX_REMOTE_FILE_BYTES;
+    ? { maxBytes: fileSize, declaredKind: "declared-over-expected" }
+    : { maxBytes: MAX_REMOTE_FILE_BYTES, declaredKind: "declared" };
 }
 
 function pluginControlByteBudget(
@@ -3822,9 +3860,10 @@ function assertDeclaredRemoteSize(
   size: number | undefined,
   maxBytes: number,
   label: string,
+  declaredKind: ResponseByteBudgetKind = "declared",
 ): void {
   if (typeof size === "number" && Number.isFinite(size) && size > maxBytes) {
-    throw new ResponseByteBudgetError(label, maxBytes, size, "declared");
+    throw new ResponseByteBudgetError(label, maxBytes, size, declaredKind);
   }
 }
 
@@ -4156,6 +4195,38 @@ function resolveAuthenticatedGraphUrl(apiPath: string): string {
 
 function validateGraphContinuationUrl(url: string): void {
   resolveAuthenticatedGraphUrl(url);
+}
+
+/**
+ * Match a Graph continuation URL against one exact vault route.
+ *
+ * Byte equality first; otherwise both sides are decoded, NFC-normalized and
+ * case-folded before the containment check. The service re-serializes the
+ * cursor URL it hands back — a field sample (2026-10-14) shows a request path
+ * carrying `%40` for "@" returning with a literal "@", and query separators
+ * returning as `%2c` — so byte equality alone can misjudge the same directory
+ * as a foreign one, forcing a full re-enumeration on every round. A different
+ * directory still fails the check; undecodable input stays fail-closed on the
+ * raw comparison.
+ */
+function routeMatchesContinuationUrl(url: string, route: string): boolean {
+  if (url.includes(route)) return true;
+  const queryStart = url.search(/[?#]/);
+  const decodedUrl = decodeRouteForComparison(
+    queryStart === -1 ? url : url.slice(0, queryStart),
+  );
+  const decodedRoute = decodeRouteForComparison(route);
+  return decodedUrl !== null
+    && decodedRoute !== null
+    && decodedUrl.includes(decodedRoute);
+}
+
+function decodeRouteForComparison(value: string): string | null {
+  try {
+    return decodeURIComponent(value).normalize("NFC").toLocaleLowerCase("en-US");
+  } catch {
+    return null;
+  }
 }
 
 /** Strip credentials, query parameters, and fragments from a URL for log safety. */
@@ -4579,6 +4650,7 @@ async function readResponseBuffer(
   label: string,
   watchdog: DownloadStallWatchdog,
   onProgress?: (downloaded: number, total: number) => void,
+  declaredKind: ResponseByteBudgetKind = "declared",
 ): Promise<ArrayBuffer> {
   if (!res.ok) {
     const err = new Error(`HTTP ${res.status}`) as Error & { status: number };
@@ -4586,7 +4658,7 @@ async function readResponseBuffer(
     throw err;
   }
   const contentLength = responseContentLength(res);
-  assertDeclaredRemoteSize(contentLength, maxBytes, label);
+  assertDeclaredRemoteSize(contentLength, maxBytes, label, declaredKind);
   if (!res.body) {
     const data = await watchdog.guard(res.arrayBuffer());
     assertByteBudget(data.byteLength, maxBytes, label);
@@ -4666,6 +4738,7 @@ async function streamResponseToBinaryFile(
   watchdog: DownloadStallWatchdog,
   onProgress?: (downloaded: number, total: number) => void,
   resumeState?: DownloadResumeState,
+  declaredKind: ResponseByteBudgetKind = "declared",
 ): Promise<DownloadToPathResult> {
   if (!res.ok) {
     const err = new Error(`HTTP ${res.status}`) as Error & { status: number };
@@ -4673,7 +4746,7 @@ async function streamResponseToBinaryFile(
     throw err;
   }
   const contentLength = responseContentLength(res);
-  assertDeclaredRemoteSize(contentLength, maxBytes, label);
+  assertDeclaredRemoteSize(contentLength, maxBytes, label, declaredKind);
   if (!res.body) {
     if (resumeState) resumeState.offset = 0;
     return writeArrayBufferToBinaryFile(
@@ -4787,6 +4860,7 @@ async function contentUrlFetch(
   onProgress?: (downloaded: number, total: number) => void,
   signal?: AbortSignal,
   slowGate?: SlowConnectionGate,
+  declaredKind: ResponseByteBudgetKind = "declared",
 ): Promise<RequestUrlResponse> {
   const watchdog = createDownloadStallWatchdog(signal, label, slowGate);
   try {
@@ -4796,7 +4870,14 @@ async function contentUrlFetch(
       cache: "no-store",
       signal: watchdog.signal,
     }));
-    const buf = await readResponseBuffer(res, maxBytes, label, watchdog, onProgress);
+    const buf = await readResponseBuffer(
+      res,
+      maxBytes,
+      label,
+      watchdog,
+      onProgress,
+      declaredKind,
+    );
     return { arrayBuffer: buf, status: res.status, headers: {} } as RequestUrlResponse;
   } finally {
     watchdog.dispose();
@@ -4815,6 +4896,7 @@ async function contentUrlFetchToBinaryFile(
   signal?: AbortSignal,
   slowGate?: SlowConnectionGate,
   resumeState?: DownloadResumeState,
+  declaredKind: ResponseByteBudgetKind = "declared",
 ): Promise<DownloadToPathResult> {
   const watchdog = createDownloadStallWatchdog(signal, label, slowGate);
   try {
@@ -4838,6 +4920,7 @@ async function contentUrlFetchToBinaryFile(
       watchdog,
       onProgress,
       resumeState,
+      declaredKind,
     );
   } finally {
     watchdog.dispose();
@@ -4855,11 +4938,19 @@ async function downloadUrlFetch(
   onProgress?: (downloaded: number, total: number) => void,
   signal?: AbortSignal,
   slowGate?: SlowConnectionGate,
+  declaredKind: ResponseByteBudgetKind = "declared",
 ): Promise<RequestUrlResponse> {
   const watchdog = createDownloadStallWatchdog(signal, label, slowGate);
   try {
     const res = await watchdog.guard(browserFetch(url, { cache: "no-store", signal: watchdog.signal }));
-    const buf = await readResponseBuffer(res, maxBytes, label, watchdog, onProgress);
+    const buf = await readResponseBuffer(
+      res,
+      maxBytes,
+      label,
+      watchdog,
+      onProgress,
+      declaredKind,
+    );
     return { arrayBuffer: buf, status: res.status, headers: {} } as RequestUrlResponse;
   } finally {
     watchdog.dispose();
@@ -4877,6 +4968,7 @@ async function downloadUrlFetchToBinaryFile(
   signal?: AbortSignal,
   slowGate?: SlowConnectionGate,
   resumeState?: DownloadResumeState,
+  declaredKind: ResponseByteBudgetKind = "declared",
 ): Promise<DownloadToPathResult> {
   const watchdog = createDownloadStallWatchdog(signal, label, slowGate);
   try {
@@ -4898,6 +4990,7 @@ async function downloadUrlFetchToBinaryFile(
       watchdog,
       onProgress,
       resumeState,
+      declaredKind,
     );
   } finally {
     watchdog.dispose();

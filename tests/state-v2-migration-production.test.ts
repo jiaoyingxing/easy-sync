@@ -121,6 +121,14 @@ describe("production V1 to V2 migration", () => {
       .toBe(false);
   });
 
+  // 反假绿（2026-10-16 检查体检轮）：下面那条 it.each 里只有
+  // `id === "missing-drive-id"` 的分支断言"中止且零写入"这一形态；夹具里少掉
+  // 这一条，整组用例会静默地少断言一个形态、而报告依旧全绿。
+  it("keeps the fixture that exercises the aborted migration branch", () => {
+    expect(STATE_V1_MIGRATION_CASES.map((fixture) => fixture.id))
+      .toContain("missing-drive-id");
+  });
+
   it.each(STATE_V1_MIGRATION_CASES.map((fixture) => [fixture.id, fixture] as const))(
     "runs %s through real V2 serialization with no user-file mutation",
     async (id, fixture) => {
@@ -189,11 +197,15 @@ describe("production V1 to V2 migration", () => {
     });
     expect(files.has(paths.committed)).toBe(true);
     expect(files.has(paths.v1Backup)).toBe(true);
-    expect(files.has(paths.manifest)).toBe(false);
+    // F31 第十处（交互层）：改名被确定拒绝的挂载上，写通道把同一份档案
+    // 落到 manifest 位（读回验证）；本轮仍按不可逆合同保守失败——恢复轮
+    // 直接从在位 manifest 激活，不再依赖改名这一原语。
+    expect(files.has(paths.manifest)).toBe(true);
 
     spies.rename.mockImplementation(originalRename);
     input.now = 5678;
-    await expect(migrateV1ToV2(adapter, paths, input)).resolves.toMatchObject({ status: "committed" });
+    // manifest 已在位＝本轮恢复语义直接已提交态（激活完成），不再是重发布。
+    await expect(migrateV1ToV2(adapter, paths, input)).resolves.toMatchObject({ status: "already-committed" });
     expect(files.has(paths.manifest)).toBe(true);
   });
 
@@ -881,7 +893,8 @@ describe("production V1 to V2 migration", () => {
       reason: "committed-envelope-mismatch",
       mutations: [],
     });
-    expect(files.has(paths.manifest)).toBe(false);
+    // 第一轮写通道已把 manifest 落位；本轮对 stale 候选保守失败、绝不激活。
+    expect(files.has(paths.manifest)).toBe(true);
     expect(files.has(paths.v1Backup)).toBe(true);
     expect(files.has(paths.committed)).toBe(true);
   });

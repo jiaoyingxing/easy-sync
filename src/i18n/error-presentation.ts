@@ -15,12 +15,12 @@
 
 import type { LocaleStrings } from "./types";
 
-export type PresentT = (
+type PresentT = (
   key: string,
   params?: Record<string, string | number>,
 ) => string;
 
-export type PresentLocale = "en" | "zh-cn";
+type PresentLocale = "en" | "zh-cn";
 
 interface KnownErrorPattern {
   key: keyof LocaleStrings;

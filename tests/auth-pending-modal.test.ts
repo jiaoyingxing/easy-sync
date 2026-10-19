@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { AuthPendingModal } from "../src/ui/auth-pending-modal";
 import type { AuthModule } from "../src/auth/auth-module";
+import { functionBody } from "./helpers/source-scope";
 
 function makeModal(loggedIn: boolean, show: ReturnType<typeof vi.fn>) {
   const auth = {
@@ -60,9 +61,11 @@ describe("AuthPendingModal auto-completion", () => {
 
   it("removes the manual recheck affordance and wires the state tick", () => {
     const source = readFileSync("src/ui/auth-pending-modal.ts", "utf8");
+    // 收窄：同名标记在文件里还出现在导入行，绑到真正建立计时的函数体上。
+    const onOpenBody = functionBody(source, "onOpen(): void");
     expect(source).not.toContain("recheck");
     expect(source).not.toContain("settings.account.recheck");
-    expect(source).toContain("compatSetInterval");
+    expect(onOpenBody).toContain("compatSetInterval");
     expect(source).toContain("compatClearInterval(this.authTick)");
   });
 });

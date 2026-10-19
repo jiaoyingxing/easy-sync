@@ -25,7 +25,7 @@ export interface TransferRateFactsV1 {
   measuredAt: number;
 }
 
-export type TransferSignalLevel = "zero" | "low" | "medium" | "high";
+type TransferSignalLevel = "zero" | "low" | "medium" | "high";
 
 type TransferRateDirection = "upload" | "download";
 
@@ -65,12 +65,12 @@ const TRANSFER_RATE_ACTIVE_MS = 5_000;
  *  传输就没有"当前速度"可显示). */
 const TRANSFER_RATE_READING_FRESH_MS = 10_000;
 
-export interface TransferDirectionMetricsInput {
+interface TransferDirectionMetricsInput {
   logicalBytes?: number;
   stagesMs?: { contentTransfer?: number };
 }
 
-export interface TransferRateMetricsInput {
+interface TransferRateMetricsInput {
   upload?: TransferDirectionMetricsInput;
   download?: TransferDirectionMetricsInput;
 }

@@ -8,7 +8,7 @@ import type {
   FolderSubtreeReviewSnapshotV1,
 } from "../sync/empty-folder-resolution";
 
-export type EmptyFolderResolutionChoice =
+type EmptyFolderResolutionChoice =
   | { action: "restore" }
   | { action: "bind"; candidatePath: string }
   | { action: "delete" }

@@ -57,7 +57,7 @@ export interface RemoteCommunityPluginCatalogV1 {
   lastRefreshFailedAt?: number;
 }
 
-export interface BuildRemoteCommunityPluginCatalogInput {
+interface BuildRemoteCommunityPluginCatalogInput {
   scope: Readonly<SyncScope>;
   configDir: string;
   items: readonly Readonly<DriveItem>[];
@@ -69,7 +69,7 @@ export interface BuildRemoteCommunityPluginCatalogInput {
   ownPluginId?: string;
 }
 
-export interface BuildRemoteCommunityPluginCatalogFromIndexInput {
+interface BuildRemoteCommunityPluginCatalogFromIndexInput {
   scope: Readonly<SyncScope>;
   configDir: string;
   /**

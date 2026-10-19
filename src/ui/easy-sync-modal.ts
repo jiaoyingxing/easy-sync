@@ -17,7 +17,7 @@
 import { Modal, setIcon, type App } from "obsidian";
 
 /** One selectable row for chooser modals (login methods, migration offer). */
-export interface EasySyncModalOptionView {
+interface EasySyncModalOptionView {
   title: string;
   description: string;
 }

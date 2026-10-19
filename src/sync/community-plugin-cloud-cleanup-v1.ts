@@ -12,7 +12,7 @@ export const COMMUNITY_PLUGIN_CLOUD_CLEANUP_MARKER_KEY =
 
 const CLEANUP_FILE_NAMES = new Set(["main.js", "manifest.json", "styles.css"]);
 
-export interface CommunityPluginCloudCleanupObjectV1 {
+interface CommunityPluginCloudCleanupObjectV1 {
   fileName: "main.js" | "manifest.json" | "styles.css";
   path: string;
   remoteId: string;
@@ -20,18 +20,18 @@ export interface CommunityPluginCloudCleanupObjectV1 {
   size: number;
 }
 
-export interface CommunityPluginCloudCleanupPlanV1 {
+interface CommunityPluginCloudCleanupPlanV1 {
   pluginId: string;
   objects: CommunityPluginCloudCleanupObjectV1[];
 }
 
 /** Current metadata of the item living AT a path, as seen by the server. */
-export interface CommunityPluginCloudCleanupPathMetadataV1 {
+interface CommunityPluginCloudCleanupPathMetadataV1 {
   remoteId: string;
   eTag: string;
 }
 
-export interface CommunityPluginCloudCleanupTransportV1 {
+interface CommunityPluginCloudCleanupTransportV1 {
   vaultName: string;
   /** Metadata for the item AT THIS PATH right now (null only for a confirmed
    *  404). The cleanup verifies identities against where the file really
@@ -64,7 +64,7 @@ export type CommunityPluginCloudCleanupResultV1 =
     }
   | { status: "failed"; deleted: number; path?: string; error: string };
 
-export interface CommunityPluginCloudCleanupMarkerV1 {
+interface CommunityPluginCloudCleanupMarkerV1 {
   pluginId: string;
   cleanedAt: number;
 }
@@ -90,7 +90,7 @@ export function normalizeCommunityPluginCloudCleanupMarkersV1(
     .map(([pluginId, cleanedAt]) => ({ pluginId, cleanedAt }));
 }
 
-export interface CommunityPluginCloudCleanupMarkerSweepV1 {
+interface CommunityPluginCloudCleanupMarkerSweepV1 {
   remaining: CommunityPluginCloudCleanupMarkerV1[];
   /** Plugins whose marker is dropped because their complete bundle reappeared
    *  in the cloud. */

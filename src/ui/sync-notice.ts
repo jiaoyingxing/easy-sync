@@ -29,7 +29,7 @@ export type SyncNoticeOutcomeKind =
   | "failed"
   | "authExpired";
 
-export interface SyncNoticeOutcome {
+interface SyncNoticeOutcome {
   kind: SyncNoticeOutcomeKind;
   count: number;
   remoteDeletes?: number;
@@ -44,7 +44,7 @@ export function shouldSuppressSyncNoticeForVisibleSidebar(input: {
     && input.easySyncViewVisibleInLeftSidebar;
 }
 
-export type SyncProgressNoticeKind =
+type SyncProgressNoticeKind =
   | "starting"
   | "stage"
   | "verify"
@@ -52,7 +52,7 @@ export type SyncProgressNoticeKind =
   | "progress"
   | "cancelling";
 
-export interface SyncProgressNoticePresentation {
+interface SyncProgressNoticePresentation {
   kind: SyncProgressNoticeKind;
   activity: SyncActivityPresentation;
   showProgressBar: boolean;

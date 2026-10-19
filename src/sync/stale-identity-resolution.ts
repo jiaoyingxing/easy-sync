@@ -29,7 +29,7 @@ export type StaleIdentityIssueCodeV1 =
   | "target-occupied"
   | "parent-chain-incomplete";
 
-export type StaleIdentityResolutionKindV1 =
+type StaleIdentityResolutionKindV1 =
   | "file-replacement"
   | "folder-missing-remote"
   | "folder-active-forget";
@@ -51,7 +51,7 @@ export type StaleIdentityRemoteFactV1 =
       size?: number;
     };
 
-export interface StaleIdentityPathFactV1 {
+interface StaleIdentityPathFactV1 {
   path: string;
   remote: Extract<StaleIdentityRemoteFactV1, { status: "present" }> | null;
 }
@@ -76,7 +76,7 @@ export interface StaleIdentityResolutionSnapshotV1 {
   pathFacts: StaleIdentityPathFactV1[];
 }
 
-export interface StaleIdentityResolutionFactsV1 {
+interface StaleIdentityResolutionFactsV1 {
   envelope: SyncStateEnvelopeV2;
   localFiles: readonly LocalFileEntry[];
   localFolders: readonly LocalFolderEntry[];
@@ -93,7 +93,7 @@ export interface StaleIdentityResolutionFactsV1 {
   automaticDeleteLocalFiles: boolean;
 }
 
-export type StaleIdentityRetirementV2 =
+type StaleIdentityRetirementV2 =
   | {
       status: "accepted";
       retiredFileAnchors: number;

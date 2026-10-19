@@ -1,4 +1,5 @@
 import type { DataAdapter } from "obsidian";
+import { public113BackupSnapshotSemanticallyMatches } from "./public-1-1-3-state-import";
 import type { DriveItem } from "../onedrive/types";
 import { isRecord } from "../obsidian-compat";
 import { buildRemoteIndexV2 } from "./remote-index-v2";
@@ -34,7 +35,7 @@ export interface StateV2MigrationPaths extends StateEnvelopeV2Paths {
   v1Backup: string;
 }
 
-export interface CloudBootstrapAnchorHintV2
+interface CloudBootstrapAnchorHintV2
   extends Omit<CloudBootstrapAnchorV2, "remoteId"> {
   remoteId?: string;
 }
@@ -69,7 +70,7 @@ export interface StateV2MigrationInput {
   now?: number;
 }
 
-export interface StateV2MigrationCandidateInput
+interface StateV2MigrationCandidateInput
   extends Omit<StateV2MigrationInput, "v1Snapshot"> {
   /** Retain a proven V1 remote identity even when one or both live sides
    *  changed from the common base. This is valid only for an unpublished
@@ -88,7 +89,7 @@ export interface StateV2MigrationCandidateInput
   v1VaultName?: string;
 }
 
-export interface StateV2MigrationPending {
+interface StateV2MigrationPending {
   sourcePath: string;
   reason: "identity-not-unique-or-unverified" | "cloud-hint-not-verified";
 }
@@ -132,7 +133,7 @@ export interface StateV2MigrationResult {
   v1BackupRetained: true;
 }
 
-export interface StateV2MigrationCandidateResult {
+interface StateV2MigrationCandidateResult {
   status: "ready" | "aborted";
   reason?:
     | "scan-incomplete"
@@ -143,7 +144,7 @@ export interface StateV2MigrationCandidateResult {
   envelope: SyncStateEnvelopeV2 | null;
 }
 
-export interface ReviewedStateV2MigrationInput {
+interface ReviewedStateV2MigrationInput {
   candidate: SyncStateEnvelopeV2;
   canonicalIdentity: CanonicalPlanIdentityV2;
   v1Snapshot: unknown;
@@ -167,14 +168,6 @@ export async function migrateV1ToV2(
     v1BackupRetained: true as const,
   };
 
-  const existing = await readExistingMigration(
-    adapter,
-    paths,
-    input.scope,
-    baseResult,
-  );
-  if (existing) return existing;
-
   const prepared = buildStateV2MigrationCandidate({
     ...input,
     // Publication is permitted only after an external exact zero-plan gate.
@@ -191,6 +184,23 @@ export async function migrateV1ToV2(
       manifest: null,
     };
   }
+  // The in-place manifest now selects V2 even when a rename was refused
+  // (F31 write-channel substitution), so this caller only accepts a
+  // committed manifest whose envelope equals the candidate built from the
+  // current input — a stale committed envelope must never activate.
+  let existing: StateV2MigrationResult | null = null;
+  try {
+    existing = await readExistingMigration(
+      adapter,
+      paths,
+      input.scope,
+      baseResult,
+      prepared.envelope,
+    );
+  } catch {
+    existing = null;
+  }
+  if (existing) return existing;
   baseResult.pending.push(...prepared.pending);
   return publishMigrationCandidate(
     adapter,
@@ -317,7 +327,11 @@ async function publishMigrationCandidate(
   );
   try {
     await writeV1BackupOnce(adapter, paths.v1Backup, v1Snapshot, now);
-  } catch {
+  } catch (error) {
+    console.error(
+      "esdiag state-save-failure at v1-backup:",
+      error instanceof Error ? error.stack ?? error.message : error,
+    );
     return {
       ...baseResult,
       status: "aborted",
@@ -329,7 +343,11 @@ async function publishMigrationCandidate(
   let committed: SyncStateEnvelopeV2 | null;
   try {
     committed = await envelopeStore.load(candidate.scope);
-  } catch {
+  } catch (error) {
+    console.error(
+      "esdiag committed-envelope-mismatch at envelope-load:",
+      error instanceof Error ? error.stack ?? error.message : error,
+    );
     return {
       ...baseResult,
       status: "aborted",
@@ -352,7 +370,11 @@ async function publishMigrationCandidate(
       };
     }
     if (!committed) throw new Error("V2 envelope was not published");
-  } catch {
+  } catch (error) {
+    console.error(
+      "esdiag state-save-failure at envelope-publish:",
+      error instanceof Error ? error.stack ?? error.message : error,
+    );
     return { ...baseResult, status: "aborted", reason: "state-save-failure", envelope: null, manifest: null };
   }
 
@@ -367,7 +389,11 @@ async function publishMigrationCandidate(
   };
   try {
     await publishManifest(adapter, paths, manifest);
-  } catch {
+  } catch (error) {
+    console.error(
+      "esdiag state-save-failure at manifest-publish:",
+      error instanceof Error ? error.stack ?? error.message : error,
+    );
     return { ...baseResult, status: "aborted", reason: "state-save-failure", envelope: null, manifest: null };
   }
   return { ...baseResult, status: "committed", envelope: committed, manifest };
@@ -548,12 +574,25 @@ export async function readStateV2Manifest(
   return value;
 }
 
+async function discardManifestStagingNext(
+  adapter: DataAdapter,
+  paths: Pick<StateV2MigrationPaths, "manifestNext">,
+): Promise<void> {
+  try {
+    await removeIfExists(adapter, paths.manifestNext);
+  } catch {
+    // A stale staged manifest is inert: the next publish overwrites it and
+    // its presence never selects authority, so a suspended Android mount's
+    // intermittent delete refusal (F31) must not fail the round here.
+  }
+}
+
 async function publishManifest(
   adapter: DataAdapter,
   paths: Pick<StateV2MigrationPaths, "manifest" | "manifestNext">,
   manifest: StateV2Manifest,
 ): Promise<void> {
-  await removeIfExists(adapter, paths.manifestNext);
+  await discardManifestStagingNext(adapter, paths);
   await adapter.write(paths.manifestNext, JSON.stringify(manifest));
   const staged = await readStateV2Manifest(adapter, paths.manifestNext);
   if (!staged || JSON.stringify(staged) !== JSON.stringify(manifest)) {
@@ -564,10 +603,32 @@ async function publishManifest(
     if (JSON.stringify(current) !== JSON.stringify(manifest)) {
       throw new Error("A different V2 manifest is already committed");
     }
-    await removeIfExists(adapter, paths.manifestNext);
+    await discardManifestStagingNext(adapter, paths);
     return;
   }
-  await adapter.rename(paths.manifestNext, paths.manifest);
+  try {
+    await adapter.rename(paths.manifestNext, paths.manifest);
+  } catch (error) {
+    // F31 live evidence: the MuMu shared-storage mount refuses this rename
+    // deterministically ("Unable to rename, unknown reason" on every
+    // round), so plain refusal would pin activation forever. The
+    // irreversible contract is about ordering (nothing user-visible may
+    // run before an explicitly written manifest), not about the storage
+    // primitive: land the same staged manifest through the write channel
+    // (read-back verified), retire the staging next best-effort, and still
+    // fail this round conservatively — the recovery round then activates
+    // straight from the committed manifest, exactly as before.
+    const landed = await readStateV2Manifest(adapter, paths.manifestNext);
+    await adapter.write(paths.manifest, JSON.stringify(manifest));
+    const committed = await readStateV2Manifest(adapter, paths.manifest);
+    if (
+      !committed
+      || JSON.stringify(committed) !== JSON.stringify(manifest)
+      || JSON.stringify(landed) !== JSON.stringify(manifest)
+    ) throw error;
+    await discardManifestStagingNext(adapter, paths);
+    throw error;
+  }
   const committed = await readStateV2Manifest(adapter, paths.manifest);
   if (!committed || JSON.stringify(committed) !== JSON.stringify(manifest)) {
     throw new Error("V2 manifest failed committed read-back verification");
@@ -587,7 +648,10 @@ async function writeV1BackupOnce(
       || existing.schemaVersion !== 1
       || !Number.isFinite(existing.createdAt)
       || !("snapshot" in existing)
-      || JSON.stringify(existing.snapshot) !== JSON.stringify(snapshot)
+      || !public113BackupSnapshotSemanticallyMatches(
+        existing.snapshot,
+        snapshot,
+      )
     ) {
       throw new Error("Existing V1 backup does not match this migration input");
     }

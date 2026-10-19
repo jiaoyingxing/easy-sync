@@ -15,7 +15,7 @@ import {
   makeMockAdapter,
   makeMockOneDrive,
   TEST_SYNC_SCOPE,
-} from "./sync-safety.test";
+} from "./helpers/sync-safety-harness";
 
 const PAGE2_URL = "https://graph.microsoft.com/v1.0/me/drive/next-page";
 const SCAN_SCOPE = { ...TEST_SYNC_SCOPE, accountId: "account-id" };
@@ -38,7 +38,7 @@ function makeDriveItem(id: string, name: string) {
 }
 
 /** Standard empty-vault harness (mirrors the healthy-sync case in
- *  sync-safety.test.ts) with an in-memory enumeration-checkpoint store. */
+ *  helpers/sync-safety-harness.ts) with an in-memory enumeration-checkpoint store. */
 function makeHarness(getDeltaImpl: (...args: never[]) => unknown) {
   const checkpointStore: { current: unknown } = { current: null };
   const state = makeActiveV2State([], []) as StateManager & {

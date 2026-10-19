@@ -56,7 +56,7 @@ import { sameSyncScope, type RemoteFileEntry, type SyncScope } from "./types";
  * whose bundle became partial/absent, whose device joined, or that the user
  * ignored disappear automatically; no separate tombstone is needed.
  */
-export interface CommunityPluginAdoptionDiscoveryInput {
+interface CommunityPluginAdoptionDiscoveryInput {
   scope: Readonly<SyncScope>;
   catalog: Readonly<RemoteCommunityPluginCatalogV1> | null;
   participation: Readonly<DeviceCommunityPluginParticipationV1> | null;
@@ -93,7 +93,7 @@ export interface CommunityPluginAdoptionDiscoveryInput {
   cleanupMarkerPluginIds?: readonly string[];
 }
 
-export interface CommunityPluginPlatformFact {
+interface CommunityPluginPlatformFact {
   /** Trusted manifest display name, null until the light read succeeded. */
   name: string | null;
   /** `isDesktopOnly` from the observed manifest; null when unobserved. */

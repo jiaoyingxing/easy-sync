@@ -648,7 +648,7 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
 }
 
 /** Read-only single-file diff data returned by the plugin (executor). */
-export interface BundleFileDiffData {
+interface BundleFileDiffData {
   localText: string;
   remoteText: string;
   localMtime?: number;

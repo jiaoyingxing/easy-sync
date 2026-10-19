@@ -37,9 +37,22 @@ function envelope(): SyncStateEnvelopeV2 {
   };
 }
 
+/** Envelope whose single folder identity is spelled `folderName`, with the
+ *  anchor file living at the root (`old.md`) so a local match inside that
+ *  folder is a relocation into a possibly alias-spelled parent. */
+function aliasFolderEnvelope(folderName: string): SyncStateEnvelopeV2 {
+  const state = envelope();
+  state.remoteIndex.itemsById.folder = {
+    id: "folder",
+    parentId: "root",
+    name: folderName,
+    kind: "folder",
+  };
+  return state;
+}
+
 describe("identity-safe V2 rename planning", () => {
-  it("moves the same remote ID for a unique local rename", () => {
-    expect(planIdentityRenamesV2(envelope(), [local("new.md")])).toEqual([{
+  it("moves the same remote ID for a unique local rename", () => {    expect(planIdentityRenamesV2(envelope(), [local("new.md")])).toEqual([{
       type: "move-remote",
       anchorId: "anchor",
       remoteId: "file",
@@ -312,6 +325,42 @@ describe("identity-safe V2 rename planning", () => {
       path: "old.md",
       relatedPath: "moved.md",
       reason: "same-path-identity-occupied",
+    }]);
+  });
+
+  it("defers a relocated local file whose destination parent is only a spelling alias", () => {
+    const state = aliasFolderEnvelope("videos");
+    expect(planIdentityRenamesV2(state, [local("Videos/old.md")])).toEqual([{
+      type: "conflict",
+      anchorId: "anchor",
+      path: "Videos/old.md",
+      relatedPath: "old.md",
+      reason: "destination-parent-spelling-diverged",
+    }]);
+  });
+
+  it("defers the mirrored spelling direction the same way", () => {
+    const state = aliasFolderEnvelope("Videos");
+    expect(planIdentityRenamesV2(state, [local("videos/old.md")])).toEqual([{
+      type: "conflict",
+      anchorId: "anchor",
+      path: "videos/old.md",
+      relatedPath: "old.md",
+      reason: "destination-parent-spelling-diverged",
+    }]);
+  });
+
+  it("still mirrors a relocation into a same-spelling destination folder", () => {
+    const state = aliasFolderEnvelope("videos");
+    expect(planIdentityRenamesV2(state, [local("videos/old.md")])).toEqual([{
+      type: "move-remote",
+      anchorId: "anchor",
+      remoteId: "file",
+      fromPath: "old.md",
+      toPath: "videos/old.md",
+      expectedRemoteETag: "e1",
+      newName: "old.md",
+      newParentId: "folder",
     }]);
   });
 });

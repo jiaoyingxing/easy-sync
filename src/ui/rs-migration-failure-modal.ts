@@ -8,12 +8,12 @@
 import { type App } from "obsidian";
 import { EasySyncModal } from "./easy-sync-modal";
 
-export type RsMigrationFailureResult =
+type RsMigrationFailureResult =
   | { action: "retry" }
   | { action: "fresh-sync" }
   | { action: "dismiss" };
 
-export interface RsMigrationFailureViews {
+interface RsMigrationFailureViews {
   title: string;
   body: string;
   retryLabel: string;

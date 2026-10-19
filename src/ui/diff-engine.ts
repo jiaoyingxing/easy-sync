@@ -26,7 +26,7 @@ export interface DiffLine {
 }
 
 /** Complete diff result with summary stats */
-export interface DiffResult {
+interface DiffResult {
   lines: DiffLine[];
   addedCount: number;
   removedCount: number;
@@ -41,12 +41,12 @@ export interface DiffResult {
   remoteTotalLines?: number;
 }
 
-export interface DisplayDiffSampleLine {
+interface DisplayDiffSampleLine {
   lineNumber: number;
   text: string;
 }
 
-export interface DisplayDiffHunk {
+interface DisplayDiffHunk {
   kind: "hunk";
   lines: DiffLine[];
 }
@@ -61,7 +61,7 @@ export interface DisplayDiffSummary {
   remoteSample: DisplayDiffSampleLine[];
 }
 
-export type DisplayDiffPart = DisplayDiffHunk | DisplayDiffSummary;
+type DisplayDiffPart = DisplayDiffHunk | DisplayDiffSummary;
 
 export interface DisplayDiffResult {
   parts: DisplayDiffPart[];

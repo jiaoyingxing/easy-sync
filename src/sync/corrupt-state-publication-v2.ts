@@ -38,7 +38,7 @@ export interface CorruptStatePublicationV2Paths {
   publicationNext: string;
 }
 
-export interface CorruptStatePublicationV2Record {
+interface CorruptStatePublicationV2Record {
   schemaVersion: 1;
   kind: "v2-corrupt-state-publication";
   createdAt: number;
@@ -47,7 +47,7 @@ export interface CorruptStatePublicationV2Record {
   sourceWitness: StateV2ActiveAuthorityWitness;
 }
 
-export interface CorruptStatePublicationV2Recovery {
+interface CorruptStatePublicationV2Recovery {
   record: CorruptStatePublicationV2Record;
   envelope: SyncStateEnvelopeV2;
   manifest: StateV2Manifest;
@@ -730,7 +730,7 @@ export class CorruptStatePublicationV2Store {
   }
 }
 
-export function validateCorruptStatePublicationV2Record(
+function validateCorruptStatePublicationV2Record(
   value: unknown,
 ): asserts value is CorruptStatePublicationV2Record {
   if (

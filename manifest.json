@@ -1,9 +1,9 @@
 {
   "id": "easy-sync",
   "name": "EasySync",
-  "version": "1.5.9",
+  "version": "1.6.0",
   "minAppVersion": "1.11.4",
-  "description": "Two-way and one-way sync for your vault across computers, phones, and tablets, with a simple OneDrive setup.",
+  "description": "在电脑、手机和平板之间轻松同步你的仓库。Easily keep your vault in sync across your computer, phone, and tablet.",
   "author": "Jiao Yingxing",
   "authorUrl": "https://github.com/jiaoyingxing",
   "isDesktopOnly": false

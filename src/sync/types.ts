@@ -146,7 +146,7 @@ export enum SyncActionType {
   AuthExpired = "authExpired",
 }
 
-export interface SyncPlanFolder {
+interface SyncPlanFolder {
   /** Stable remote identity when the folder already exists remotely. */
   remoteId?: string;
   /** Parent identity used for create-only Graph writes and read-back checks. */
@@ -324,7 +324,7 @@ export type FolderMutationActionV2 =
   | "deleteLocalFolder"
   | "deleteRemoteFolder";
 
-export type MutationLocalExpectation =
+type MutationLocalExpectation =
   | { exists: false }
   | { exists: true; hash: string; size: number };
 
@@ -372,7 +372,7 @@ export interface MutationIntentV1 {
  * committed source facts let recovery retire exactly the reviewed identities
  * after an unknown DELETE response without storing a second subtree state.
  */
-export interface ReviewedFolderSubtreeDeleteBindingV1 {
+interface ReviewedFolderSubtreeDeleteBindingV1 {
   version: 1;
   sourceCommitSeq: number;
   sourceLifecycleEpoch: number;
@@ -388,7 +388,7 @@ export interface ReviewedFolderSubtreeDeleteBindingV1 {
  * remains `sourcePath`; this binding exists only so the receipt can translate
  * the older committed anchors after that exact move succeeds.
  */
-export interface ReviewedFolderLocationMoveBindingV1 {
+interface ReviewedFolderLocationMoveBindingV1 {
   version: 1;
   sourceCommitSeq: number;
   sourceLifecycleEpoch: number;
@@ -460,7 +460,6 @@ export type ManualMutationResolutionChoiceV1 =
   // Zero-write settlement; ordinary planning takes over conservatively.
   | "as-observed";
 
-
 /** Exact V2 state evidence for recovering one receipted remote rename whose
  * checkpoint is blocked by a distinct anchor already owning the target path. */
 export interface ReceiptedRenameAnchorCollisionEvidenceV1 {
@@ -492,12 +491,12 @@ export interface ManualMutationResolutionV1 {
   receipt: MutationReceiptV1 | null;
 }
 
-export interface CommunityPluginBundleSettlementMemberV2 {
+interface CommunityPluginBundleSettlementMemberV2 {
   intent: MutationIntentV1;
   receipt: MutationReceiptV1 | null;
 }
 
-export interface CommunityPluginBundleConflictDecisionV2 {
+interface CommunityPluginBundleConflictDecisionV2 {
   path: string;
   decisionToken: SyncDecisionToken;
 }
@@ -524,7 +523,7 @@ export interface CommunityPluginBundleSettlementV2 {
   members: CommunityPluginBundleSettlementMemberV2[];
 }
 
-export type ManualMutationResolution =
+type ManualMutationResolution =
   | ManualMutationResolutionV1
   | CommunityPluginBundleSettlementV2;
 
@@ -564,7 +563,7 @@ export interface ManualMutationResolutionRemoteFactV1 {
   size?: number;
 }
 
-export interface ManualMutationResolutionOptionV1 {
+interface ManualMutationResolutionOptionV1 {
   available: boolean;
   deletesOtherSide: boolean;
 }
@@ -577,7 +576,7 @@ export type CommunityPluginBundleReviewBlockReasonV1 =
   | "platform-incompatible"
   | "predecessor-mismatch";
 
-export interface CommunityPluginBundleDirectionReviewV1 {
+interface CommunityPluginBundleDirectionReviewV1 {
   available: boolean;
   reason?: CommunityPluginBundleReviewBlockReasonV1;
 }
@@ -848,7 +847,7 @@ export const CHANGE_THRESHOLD_RATIO = 0.5;
 // ---- Cloud Baseline ----
 
 /** A single file entry in the cloud baseline snapshot */
-export interface BaselineFileEntry {
+interface BaselineFileEntry {
   hash: string;
   size: number;
   eTag: string;

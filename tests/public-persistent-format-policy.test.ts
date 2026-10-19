@@ -80,6 +80,22 @@ const supportedReleases = [
   "1.2.7",
 ];
 
+// True when candidate is not older than floor (numeric x.y.z compare).
+function isVersionAtLeast(candidate: string, floor: string): boolean {
+  const parts = (version: string) => version.split(".").map(
+    (part) => Number.parseInt(part, 10),
+  );
+  const candidateParts = parts(candidate);
+  const floorParts = parts(floor);
+  const total = Math.max(candidateParts.length, floorParts.length);
+  for (let index = 0; index < total; index++) {
+    const left = candidateParts[index] ?? 0;
+    const right = floorParts[index] ?? 0;
+    if (left !== right) return left > right;
+  }
+  return true;
+}
+
 describe("public persistent-format compatibility policy", () => {
   it("freezes every supported public release without promoting rolling builds", () => {
     const fixture = readFixture();
@@ -87,8 +103,8 @@ describe("public persistent-format compatibility policy", () => {
     expect(fixture.schemaVersion).toBe(1);
     expect(fixture.releases.map((entry) => entry.version)).toEqual(supportedReleases);
     expect(fixture.policy).toMatchObject({
-      currentPublicRelease: "1.2.7",
-      directUpgradeBaseline: "1.2.7",
+      currentPublicRelease: "1.5.9",
+      directUpgradeBaseline: "1.5.9",
       historicalMigrationFloor: "1.1.3",
       unpublishedBuildsArePermanentInputs: false,
       breakingChangesRequireAdjacentMigration: true,
@@ -161,13 +177,21 @@ describe("public persistent-format compatibility policy", () => {
 
   it("matches the current public release and current runtime version vector", () => {
     const fixture = readFixture();
-    const currentRelease = fixture.releases.at(-1)!;
-    const currentProfile = fixture.profiles[currentRelease.profile]!;
+    const newestFrozenRelease = fixture.releases.at(-1)!;
+    const newestFrozenProfile = fixture.profiles[newestFrozenRelease.profile]!;
 
     expect(packageJson.version).toBe(manifestJson.version);
-    expect(currentRelease.version).toBe(fixture.policy.currentPublicRelease);
-    expect(currentRelease.profile).toBe(fixture.policy.currentRuntimeProfile);
-    expect(currentProfile).toMatchObject({
+    // Since 2026-10-17 the published-baseline pointer (1.5.9) is aligned to the
+    // actual last public release while the frozen source-blob evidence ends at
+    // 1.2.7: releases after 1.2.7 kept the same persistent version vector, so
+    // the pointer may run ahead of the evidence list but must never regress
+    // behind it.
+    expect(isVersionAtLeast(
+      fixture.policy.currentPublicRelease,
+      newestFrozenRelease.version,
+    )).toBe(true);
+    expect(newestFrozenRelease.profile).toBe(fixture.policy.currentRuntimeProfile);
+    expect(newestFrozenProfile).toMatchObject({
       fileStateModel: 2,
       activeDatabaseSchema: 1,
       authorityWitnessSchema: 1,

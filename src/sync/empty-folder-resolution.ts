@@ -27,7 +27,7 @@ export interface EmptyFolderResolutionSnapshotV1 {
   candidatePaths: string[];
 }
 
-export interface EmptyFolderResolutionFactsV1 {
+interface EmptyFolderResolutionFactsV1 {
   envelope: SyncStateEnvelopeV2;
   localFiles: readonly LocalFileEntry[];
   localFolders: readonly LocalFolderEntry[];
@@ -39,7 +39,7 @@ export interface EmptyFolderResolutionFactsV1 {
   preserveFolderPath?: (path: string) => boolean;
 }
 
-export interface FolderSubtreeReviewMemberV1 {
+interface FolderSubtreeReviewMemberV1 {
   path: string;
   kind: "file" | "folder";
   remoteId: string;
@@ -91,7 +91,7 @@ export interface FolderLocationResolutionSnapshotV1 {
 
 export type FolderLocationResolutionChoiceV1 = "keep-local" | "keep-remote";
 
-export type ReviewedFolderSubtreeRestoreV2 =
+type ReviewedFolderSubtreeRestoreV2 =
   | {
       status: "accepted";
       retiredFileAnchors: number;

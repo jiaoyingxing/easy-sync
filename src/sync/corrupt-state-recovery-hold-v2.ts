@@ -20,7 +20,7 @@ import {
   type SyncScope,
 } from "./types";
 
-export interface CorruptStateRecoveryHoldV2Paths {
+interface CorruptStateRecoveryHoldV2Paths {
   committed: string;
   next: string;
 }
@@ -44,7 +44,7 @@ export interface CorruptStateRecoveryHoldV2 {
   items: SyncPlanItem[];
 }
 
-export interface PendingCorruptStateRecoveryHoldInputV2 {
+interface PendingCorruptStateRecoveryHoldInputV2 {
   sourceDigest: string;
   sourceCommitSeq: number;
   sourceLifecycleEpoch: number;

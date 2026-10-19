@@ -145,6 +145,21 @@ import {
   buildBlockedUploadRemoteFacts,
 } from "./blocked-upload-version-history";
 import {
+  observeSyncRoundEnd,
+  type SyncIdleObservationInput,
+  type SyncIdleObservationState,
+} from "./sync-idle-observation";
+import {
+  SyncItemTerminationTracker,
+  mutationRecoveryItemKey,
+  pendingIssueExitKind,
+  pendingIssueTerminationKey,
+  resolveMutationRecoveryDisposition,
+  resolvePendingIssueDisposition,
+  type SyncBlockedItemRoundFact,
+  type SyncItemTerminationVerdict,
+} from "./sync-item-termination";
+import {
   remoteStateProjectionMatchesEnvelopeV2,
   upsertBaseStateEnvelopeV2,
 } from "./file-state-controller-v2";
@@ -167,9 +182,18 @@ import {
 } from "./sync-progress";
 import { OperationLifecycle } from "./operation-lifecycle";
 import { EasySyncNoticeCenter, NOTICE_PRIORITY } from "../ui/notice-center";
+// The S4 blade resolves a recovery record's live review exit with the very
+// rule the sidebar renders from (`manualResolutionExitAllowedFor`), so the
+// verdict and the visible button can never disagree. Presentation-only
+// import: it carries no runtime dependency beyond locale key names.
+import { manualResolutionExitAllowedFor } from "../ui/mutation-recovery-presentation";
 import type { TransferRateTickSnapshot } from "./transfer-rate";
 import { LocalRecoveryJournal } from "./local-recovery-journal";
 import { MergeReadyStore } from "./merge-ready-store";
+import {
+  isolationCapsuleAdmits,
+  type IsolationCapsuleId,
+} from "./isolation-capsules";
 import { fingerprintIndexedDbError } from "./indexeddb-error-fingerprint";
 import {
   areIndependentConservativeResetRecords,
@@ -340,7 +364,7 @@ import {
   type CommunityPluginJoinBlock,
 } from "./community-plugin-join";
 
-export interface RetryableObservationDisposition {
+interface RetryableObservationDisposition {
   kind: "retryable-observation";
   phase: "remotePrepare";
   code:
@@ -352,11 +376,11 @@ export interface RetryableObservationDisposition {
     | "ordinary-remote";
 }
 
-export type SyncRunDisposition = RetryableObservationDisposition;
+type SyncRunDisposition = RetryableObservationDisposition;
 
 /** Monotonic execution facts owned by the executor. Presentation and
  * scheduling must not reconstruct these facts from aggregate counters. */
-export type RetryableObservationResultClassification =
+type RetryableObservationResultClassification =
   | { kind: "absent" }
   | { kind: "valid"; disposition: RetryableObservationDisposition }
   | { kind: "contradictory"; disposition: RetryableObservationDisposition };
@@ -396,6 +420,26 @@ export interface SyncResult {
    *  round: the deferral is the breaker protecting the round, not a failure
    *  of it. The pause gate exempts rounds where these are the only errors. */
   breakerDeferredErrors?: number;
+  /** Transfer failures this round whose only cause was the network itself
+   *  (dropped link, request deadline, HTTP 408). They stay visible in
+   *  `errors` (history, sidebar rows and the failure notice stay honest) but
+   *  must not pause the whole auto-sync round: a dropped link is an
+   *  environmental transient, not an unknown mutation, and pausing silences
+   *  the M17 network backoff arm that exists to retry it. The pause gate
+   *  exempts rounds where these are the only errors (2026-10-16 user
+   *  decision: a long-lived machine lost its link, the round paused auto sync
+   *  and only a manual sync resumed it). */
+  networkFailureErrors?: number;
+  /** Plan-layer deferrals this round = `RetryLater` items the plan itself
+   *  produced with `reason.identityReplacement.verificationPending` ("nothing
+   *  was changed this round", the design semantics is "verify again next
+   *  round"). They stay visible in `errors` (history, sidebar rows and the
+   *  failure notice stay honest) but must not pause the whole auto-sync
+   *  round: the deferral *is* the next-round verification, so pausing to be
+   *  resumed by a manual sync would contradict its own recorded semantics
+   *  and the F30 rule that only unknown outcomes stop the vault (2026-10-18
+   *  user decision, boundary identical to the other exempt families). */
+  planningDeferredErrors?: number;
   /** Community-plugin bundles whose upload the downgrade guard deferred to
    *  user review this round (local version below the remote one). The caller
    *  may raise a one-shot notice per plugin id; the list itself is per-round
@@ -617,7 +661,7 @@ function isValidRetryableObservationCodeComponent(
 }
 
 /** Result of executing a single plan item — caller collects baseUpsert/baseRemoval for batch persistence. */
-export interface ItemExecutionResult {
+interface ItemExecutionResult {
   executed: boolean;
   /** True only after a local/remote file mutation returned successfully. */
   mutationApplied?: boolean;
@@ -877,7 +921,7 @@ class LocalFolderCreateUnconfirmedError extends Error {
   }
 }
 
-export interface FileTransferMetrics {
+interface FileTransferMetrics {
   started: number;
   succeeded: number;
   failed: number;
@@ -911,14 +955,14 @@ interface InFlightTransfer {
  *  the connection-speed sampler folds each call at its own bytes/wall, so
  *  overlapping calls no longer divide the aggregate and sub-second calls no
  *  longer crawl behind the smoothing prior. */
-export interface TransferCallSample {
+interface TransferCallSample {
   direction: "upload" | "download";
   bytes: number;
   ms: number;
   at: number;
 }
 
-export type AutomaticMergeManualReason =
+type AutomaticMergeManualReason =
   | "missing-version"
   | "binary-file"
   | "unsupported-text-path"
@@ -966,7 +1010,7 @@ export interface AutomaticHandlingMetrics {
   };
 }
 
-export interface ExecutionMetrics {
+interface ExecutionMetrics {
   uploadBytes: number;
   uploadReadMs: number;
   uploadNetworkMs: number;
@@ -980,7 +1024,7 @@ export interface ExecutionMetrics {
   automaticHandling: AutomaticHandlingMetrics;
 }
 
-export interface MutationPersistenceMetrics {
+interface MutationPersistenceMetrics {
   intentWrites: number;
   receiptWrites: number;
   /** Logical mutation receipts covered by successful checkpoint commits. */
@@ -1489,6 +1533,7 @@ type UploadRemoteConflictRecoveryOutcome =
 type MutationRecoverySummaryArgs = {
   persistedRecords: MutationLedgerEntryV1[];
   blocked: Parameters<SyncExecutor["recoverMutationLedgerRecords"]>[0]["blocked"];
+  deferred: Parameters<SyncExecutor["recoverMutationLedgerRecords"]>[0]["deferred"];
   blockedRecords: Parameters<SyncExecutor["recoverMutationLedgerRecords"]>[0]["blockedRecords"];
   settled: number;
   applied: number;
@@ -1833,6 +1878,13 @@ export class SyncExecutor {
     exactPathKeys: ReadonlySet<string>;
     folderShellKeys: ReadonlySet<string>;
   } | null = null;
+  /** S2 round fact for the third blocking point: operation ids whose durable
+   *  receipt this recovery pass verified against the live two-sided facts and
+   *  whose checkpoint commit the committed common state then refused to
+   *  absorb. Consumed by the isolation channel's third capsule
+   *  (`isolation-capsules.ts`); cleared at the start of every recovery pass
+   *  and never persisted — it is evidence about *this* pass only. */
+  private verifiedReceiptRefusedAbsorption = new Set<string>();
   private staleFirstSyncEvidenceChecked = false;
   /** Blocked-upload read-only evidence (2026-10-13 field case): the retained
    *  version history is fetched at most once per operation per session, only
@@ -1890,6 +1942,24 @@ export class SyncExecutor {
    *  (network / service / timeout) since the last healthy observation.
    *  Session-scoped diagnostic counter; never gates behavior. */
   private consecutiveSharedProtocolObservationFailures = 0;
+  /** S1 observation blade comparison state (2026-10-16 §六 S1, user decision
+   *  2026-10-17): previous round's fact fingerprint + idle streak, held in
+   *  memory for the instance lifetime and deliberately not persisted — a
+   *  reload restarts the streak, so a verdict always takes two freshly
+   *  observed consecutive rounds. Diagnostic-only; never read by any sync
+   *  decision. */
+  private syncIdleObservation: SyncIdleObservationState = {
+    previousFingerprint: null,
+    streak: 0,
+  };
+  /** S4 termination-criterion blade (2026-10-16 §五 D3／§六 S4, user decision
+   *  2026-10-17): per-blocked-item fact fingerprints + consecutive-identical
+   *  streak, held in memory and never persisted (a reload restarts the
+   *  streak). Presentation state only: it classifies and remembers, performs
+   *  no data action and no sync decision reads it back — the sidebar consumes
+   *  {@link getSyncItemTerminationSnapshot} to replace a doomed re-check with
+   *  one terminal ending. */
+  private syncItemTermination = new SyncItemTerminationTracker();
 
   constructor(
     private onedrive: OneDriveClient,
@@ -4515,16 +4585,30 @@ export class SyncExecutor {
   }
 
   /**
-   * Independent ordinary-file records may keep their exact unknown results
-   * without owning the rest of the Vault. Managed configuration, folders,
-   * reviewed settlements, unbounded receipts and overlapping file records
-   * remain global until their dedicated owner resolves them.
+   * The S2 isolation channel's admission half (docs 2026-10-16 §五 D4／§六 S2):
+   * the channel is shape-blind, and each admitted record is vouched for by a
+   * capsule in `isolation-capsules.ts` that proves its own narrowest bounded
+   * evidence. Ordinary file records and — since the 2026-10-17 folder cut —
+   * folder records with a bounded receipt are admitted by the two standard
+   * capsules; the third capsule admits the third blocking point
+   * (receipt verified against live facts, absorption refused) for the shapes
+   * the standard folder capsule deliberately refuses. Anything no capsule
+   * admits keeps the existing whole-vault behaviour.
+   *
+   * Managed configuration, reviewed settlements, unbounded receipts and
+   * overlapping records remain global until their dedicated owner resolves
+   * them: the per-path eligibility below is the same gate the folder
+   * settlement path uses, so the channel cannot hand a record a freeze its
+   * own exit gate would refuse.
    */
-  private isolatableOrdinaryFileRecovery(
+  private isolatableMutationRecoveryRecords(
     summary: Readonly<MutationRecoveryRunSummary>,
     syncScope: Readonly<SyncScope>,
     options: { allowManagedConfigPaths: boolean },
-  ): MutationLedgerEntryV1[] | null {
+  ): {
+    records: MutationLedgerEntryV1[];
+    capsuleCounts: Partial<Record<IsolationCapsuleId, number>>;
+  } | null {
     const records = this.state.mutationLedger;
     if (
       summary.state !== "blocked"
@@ -4535,11 +4619,23 @@ export class SyncExecutor {
         === summary.blockedOperationId)
     ) return null;
     const configDir = getConfigDir(this.scanner.vault);
+    const envelope = this.state.getCommittedV2Envelope();
+    const capsuleCounts: Partial<Record<IsolationCapsuleId, number>> = {};
     for (const record of records) {
       const paths = conservativeResetRecordPaths(record);
+      const capsule = isolationCapsuleAdmits({
+        record,
+        syncScope,
+        envelope,
+        verifiedReceiptRefusedAbsorption:
+          this.verifiedReceiptRefusedAbsorption.has(
+            record.intent.operationId,
+          ),
+      });
+      if (capsule === null) return null;
+      capsuleCounts[capsule] = (capsuleCounts[capsule] ?? 0) + 1;
       if (
-        !isOrdinaryFileRecoveryRecord(record, syncScope)
-        || paths.some((path) =>
+        paths.some((path) =>
           !this.shouldIncludeRemotePath(path)
           || classifyCommunityPluginManagedPath(path, configDir) !== null
           // 2026-10-13 (B1): a record on the plugin's own artifacts or on a
@@ -4553,7 +4649,6 @@ export class SyncExecutor {
               || isEasySyncSelfSyncFilePath(path, configDir))))
       ) return null;
     }
-    const envelope = this.state.getCommittedV2Envelope();
     const currentPathByRemoteId = envelope
       ? projectRemoteIndexV2(envelope.remoteIndex)
       : new Map<string, string>();
@@ -4562,7 +4657,10 @@ export class SyncExecutor {
       currentPathByRemoteId,
       Object.values(envelope?.anchors.byAnchorId ?? {}),
     )) return null;
-    return structuredClone([...records]);
+    return {
+      records: structuredClone([...records]),
+      capsuleCounts,
+    };
   }
 
   private isPathProtectedByIsolatedRecovery(
@@ -4589,34 +4687,93 @@ export class SyncExecutor {
     plan: SyncPlan,
     protectedMutationRecoveryRecords: readonly Readonly<MutationLedgerEntryV1>[],
   ): Promise<void> {
+    const protectedPaths = this.state.pendingIssues
+      .filter((item) => this.isPathProtectedByIsolatedRecovery(
+        item.path,
+        protectedMutationRecoveryRecords,
+      ))
+      .map((item) => item.path);
     await this.state.prunePendingIssues(
       [
         ...plan.items
           .filter((item) => isPendingIssueAction(item.type))
           .map((item) => item.path),
-        ...this.state.pendingIssues
-          .filter((item) => this.isPathProtectedByIsolatedRecovery(
-            item.path,
-            protectedMutationRecoveryRecords,
-          ))
-          .map((item) => item.path),
+        ...protectedPaths,
       ],
       { onlyIssueCodes: PLANNER_DERIVED_PENDING_ISSUE_CODES },
     );
+    // Persist the rows this plan produces right now, not only at the end of a
+    // round that reaches execution. Planner-derived rows are pure UI state and
+    // they are scoped to the plan that produced them (the prune above already
+    // retires the stale ones even while a review gate holds the round) — but
+    // until now they were written only after every plan item ran, so any round
+    // that stopped earlier (a review gate, a blocked recovery record, an
+    // auth/cancel stop) left the user with no row describing what the plan had
+    // just found. A second unsettled ledger record was enough to hide the whole
+    // outcome: `executePlan`'s end-of-round shared-state checkpoint is skipped
+    // while the ledger is non-empty (2026-10-16 field findings).
+    //
+    // Only the codes this device already prunes are written here, so the
+    // execution-phase transients (`transfer-network` /
+    // `transfer-remote-moving`) keep their existing semantics untouched, and
+    // the end-of-round reconcile stays the single owner of execution-phase
+    // state (it removes resolved paths and merges consecutive failures).
+    //
+    // `SkipOneDriveInvalidName` also produces a pending row, but it carries no
+    // `issueCode` (it is a rename hint, not a resolvable route) so the code
+    // filter below leaves it to the end-of-round reconcile exactly as before.
+    const plannerDerived = plan.items
+      .filter((item) => (
+        item.type === SyncActionType.FolderDeferred
+        || item.type === SyncActionType.RetryLater
+      ))
+      .map((item) => buildPendingIssueFromPlanItem(item, (key) => this.t(key), Date.now()))
+      .filter((issue) => (
+        issue.issueCode !== undefined
+        && PLANNER_DERIVED_PENDING_ISSUE_CODES.has(issue.issueCode)
+        && !this.isPathProtectedByIsolatedRecovery(
+          issue.path,
+          protectedMutationRecoveryRecords,
+        )
+      ));
+    if (plannerDerived.length > 0) {
+      await this.state.reconcilePendingIssues(plannerDerived, []);
+    }
   }
 
+  /**
+   * Two orthogonal directions, each with its own set:
+   *
+   *  - **downward** (`exactPathKeys`): the record's own paths plus — criterion ①
+   *    of the 2026-10-17 folder-isolation cut — *every path below them*. An
+   *    isolated folder owns its whole subtree: `Videos/F/Child/x.md` must
+   *    execute nothing while `Videos/F` is frozen, although only the folder
+   *    path appears in the ledger record.
+   *  - **upward** (`folderShellKeys`, now strict ancestors only): a folder item
+   *    that *contains* an isolated path is frozen too — moving or deleting the
+   *    shell above a frozen descendant is work on that descendant's location.
+   *
+   * Equality lives in the downward direction alone, so each direction can be
+   * removed on its own and the loss shows up (the mutations the criterion-① pins
+   * pin down). Before this cut the downward direction was an incidental side
+   * effect of the upward walk reusing `exactPathKeys` — the walk stripped one
+   * segment at a time and re-tested membership, so descendants already matched
+   * — and no pin covered it.
+   */
   private isNamespaceProtectedByIsolatedRecovery(
     path: string,
     records: readonly Readonly<MutationLedgerEntryV1>[],
   ): boolean {
     const boundary = this.isolatedMutationRecoveryBoundary(records);
     let key = normalizeRemotePathKey(path);
-    if (boundary.folderShellKeys.has(key)) return true;
-    while (key.includes("/")) {
-      key = key.slice(0, key.lastIndexOf("/"));
+    while (true) {
       if (boundary.exactPathKeys.has(key)) return true;
+      if (!key.includes("/")) break;
+      key = key.slice(0, key.lastIndexOf("/"));
     }
-    return false;
+    return boundary.folderShellKeys.has(
+      normalizeRemotePathKey(path),
+    );
   }
 
   /**
@@ -4625,6 +4782,14 @@ export class SyncExecutor {
    * conservative reset: a complete remote identity rebuild may observe that
    * the response-unknown object moved, but that new path must not re-enter the
    * ordinary planner under a different spelling.
+   *
+   * `exactPathKeys` are the record's own paths (and those current identity
+   * paths); `folderShellKeys` holds only their strict ancestors. The downward
+   * half of the contract — the whole subtree below an isolated path is frozen,
+   * which is what lets one isolated *folder* record own everything under it
+   * (criterion ① of the 2026-10-17 cut) — is applied by
+   * {@link isNamespaceProtectedByIsolatedRecovery}, not enumerated here: a
+   * path has no finite descendant list.
    */
   private isolatedMutationRecoveryBoundary(
     records: readonly Readonly<MutationLedgerEntryV1>[],
@@ -4684,7 +4849,10 @@ export class SyncExecutor {
     const exactPathKeys = new Set(protectedPaths.keys());
     const folderShellKeys = new Set<string>();
     for (const path of protectedPaths.values()) {
-      let folder = path;
+      // Strict ancestors only (the path itself is owned by the downward test):
+      // a folder item above an isolated path must not move or delete the shell
+      // that holds it.
+      let folder = parentFolderPath(path);
       while (true) {
         folderShellKeys.add(normalizeRemotePathKey(folder));
         const parent = parentFolderPath(folder);
@@ -5585,6 +5753,33 @@ export class SyncExecutor {
 
   private withDecisionToken(item: SyncPlanItem): SyncPlanItem {
     return { ...item, decisionToken: this.createDecisionToken(item) };
+  }
+
+  /**
+   * The user-visible pending decision a plan item contributes, or null. Both
+   * writers of that row — the plan-step delivery in
+   * `runStep7_6PrunePendingDecisions` and the execution loop's collection —
+   * build it through this single mapping, so the row that lands with the plan
+   * and the row the end-of-round upsert owns can never drift apart. The
+   * `decisionToken` is derived deterministically from the plan item
+   * (`createDecisionToken`), so the two writes are byte-identical.
+   */
+  private decisionRowForPlanItem(item: SyncPlanItem): SyncPlanItem | null {
+    if (
+      item.type === SyncActionType.Conflict
+      || item.type === SyncActionType.ConfirmLocalDelete
+    ) {
+      return this.withDecisionToken(item);
+    }
+    if (
+      item.type === SyncActionType.DeleteLocalFolder
+      && item.requiresConfirmation
+    ) {
+      // Unchanged from the execution loop: the folder delete confirmation row
+      // carries no token (the user's confirmation is the plan item itself).
+      return item;
+    }
+    return null;
   }
 
   private bindPendingDecisionTokens(plan: SyncPlan): void {
@@ -9770,10 +9965,19 @@ export class SyncExecutor {
         const breaker = breakerMap.get(item.path);
         if (!breaker) continue;
         const versionMatched = item.local?.hash === breaker.localHash && item.remote?.eTag === breaker.remoteETag;
-        const networkBackoff = (breaker.issueCode === "transfer-network"
-          || breaker.issueCode === "transfer-remote-moving")
-          && breaker.updatedAt >= networkBackoffCutoff;
-        if (versionMatched || networkBackoff) {
+        const timerArm = breaker.issueCode === "transfer-network"
+          || breaker.issueCode === "transfer-remote-moving";
+        const networkBackoff = timerArm && breaker.updatedAt >= networkBackoffCutoff;
+        // Network-shaped rows are governed by the *window*, not by the version
+        // match: a dropped link is a property of the link, so an unchanged file
+        // must still get its one real attempt per window. Before the 2026-10-16
+        // review the version-matched arm held such a row forever — an upload
+        // stranded by three network failures kept its pending row (and its
+        // "自动同步将约每 15 分钟重试一次" copy) while never being retried, which
+        // is the same promise-versus-behaviour gap this fix exists to close.
+        // Content-class rows keep the version-matched guardrail (same version =
+        // the same doomed attempt); their copy promises only "手动同步会立即重试".
+        if (timerArm ? networkBackoff : versionMatched) {
           breakerCount++;
           if (breakerApplies) {
             item.type = SyncActionType.RetryLater;
@@ -10341,6 +10545,56 @@ export class SyncExecutor {
           .map((item) => item.path),
       ],
     );
+    if (this.shouldStop(result, operationEpoch)) return { terminated: result };
+    // The visible decision rows go with the plan, not with the shared-state
+    // commit: retire the stale ones above (the retire direction already ran
+    // behind the review gates), then land this plan's rows right here — after
+    // every review/activation gate let the round through, before execution.
+    // Until this cut the rows existed only in `executePlan`'s end-of-round
+    // batch (`upsertPendingConflicts` / `upsertPendingDeletes`), so a round
+    // that ended with any mutation still unabsorbed by the common state (a
+    // rethrown refused checkpoint, the end-of-round shared-state gate, an
+    // auth/cancel stop) dropped the whole batch and the user saw nothing of
+    // what the plan had just found (2026-10-16 F29 family; the third cut
+    // `20261016-213000` moved only the planner-derived issue rows).
+    //
+    // Boundaries kept: a preview round returns above these gates and persists
+    // no decision; rows owned by the execution phase (transients, skip rows,
+    // issue rows) are not claimed here; isolated-recovery-protected paths
+    // never reach this plan (their items are deferred before planning); the
+    // end-of-round upserts stay the single owner of the row set (they refresh
+    // the row and merge consecutive failures) and this delivery never
+    // rewrites an existing row — an existing row carries state other owners
+    // put there, e.g. the cached `textMergeEvidence` the automatic merge reads
+    // back through `state.pendingConflicts`, so the plan step only fills the
+    // gaps: one row per decision path the plan produces, written when it is
+    // produced.
+    const planConflictRows: SyncPlanItem[] = [];
+    const planDeleteRows: SyncPlanItem[] = [];
+    for (const item of plan.items) {
+      const row = this.decisionRowForPlanItem(item);
+      if (row === null) continue;
+      if (item.type === SyncActionType.Conflict) planConflictRows.push(row);
+      else planDeleteRows.push(row);
+    }
+    const existingConflictPaths = new Set(
+      this.state.pendingConflicts.map((item) => item.path),
+    );
+    const missingConflictRows = planConflictRows.filter(
+      (row) => !existingConflictPaths.has(row.path),
+    );
+    const existingDeletePaths = new Set(
+      this.state.pendingRemoteDeletes.map((item) => item.path),
+    );
+    const missingDeleteRows = planDeleteRows.filter(
+      (row) => !existingDeletePaths.has(row.path),
+    );
+    if (missingConflictRows.length > 0) {
+      await this.state.upsertPendingConflicts(missingConflictRows);
+    }
+    if (missingDeleteRows.length > 0) {
+      await this.state.upsertPendingDeletes(missingDeleteRows);
+    }
     if (this.shouldStop(result, operationEpoch)) return { terminated: result };
     return { terminated: null };
   }
@@ -11505,7 +11759,7 @@ export class SyncExecutor {
       );
     } catch (error) {
       if (!(error instanceof MutationRecoveryBlockedError)) throw error;
-      const isolated = this.isolatableOrdinaryFileRecovery(
+      const isolated = this.isolatableMutationRecoveryRecords(
         error.summary,
         syncScope,
         { allowManagedConfigPaths: options.mutationRecoveryObservationOnly !== true },
@@ -11533,7 +11787,7 @@ export class SyncExecutor {
           },
         );
       } else {
-        protectedMutationRecoveryRecords = isolated;
+        protectedMutationRecoveryRecords = isolated.records;
         const isolatedSummary: MutationRecoveryRunSummary = {
           ...error.summary,
           isolated: true,
@@ -11544,8 +11798,22 @@ export class SyncExecutor {
           "execute",
           "unresolved ordinary files were isolated from unrelated planning",
           {
-            records: isolated.length,
-            operationIds: isolated.map((record) => record.intent.operationId),
+            records: isolated.records.length,
+            operationIds: isolated.records.map(
+              (record) => record.intent.operationId,
+            ),
+            mutations: 0,
+          },
+        );
+        // S2: which bounded-evidence capsule admitted each record. One extra
+        // diag line (zero UI): the shape breakdown is what a field report
+        // needs to tell the standard capsules from the third blocking point.
+        this.diag?.log(
+          "execute",
+          "mutation recovery isolation capsules",
+          {
+            records: isolated.records.length,
+            capsules: isolated.capsuleCounts,
             mutations: 0,
           },
         );
@@ -13905,6 +14173,18 @@ export class SyncExecutor {
         }
         unexpectedFailure = true;
         result.errors = Math.max(1, result.errors);
+        // A run-level unexpected failure belongs to no exempt family, and the
+        // bump above can be a no-op when an item already failed this round —
+        // without this the pause gate could read the round as "network-class
+        // only" (or "breaker deferrals only", or "plan deferrals only") and
+        // keep retrying an unknown failure forever instead of stopping for
+        // diagnostics (2026-10-16 review; the plan-deferral family joined
+        // 2026-10-18). The families are dropped, never the error: `errors`
+        // keeps the round honest in history and diagnostics.
+        delete result.identityBlockedErrors;
+        delete result.breakerDeferredErrors;
+        delete result.networkFailureErrors;
+        delete result.planningDeferredErrors;
         result.message = this.t("result.syncFailed", { message: e instanceof Error ? e.message : "unknown error" });
         this.diag?.error(
           "execute",
@@ -13973,6 +14253,8 @@ export class SyncExecutor {
         phasesMs,
         totalMs: Math.max(0, Date.now() - runStartedAt),
       }, { urgent: true });
+      this.recordSyncIdleObservation(result);
+      this.recordSyncItemTermination(result);
       this.onedrive.setAbortSignal(null);
       this.cancelController = null;
       this.activeSyncScope = null;
@@ -13982,6 +14264,163 @@ export class SyncExecutor {
     }
 
     return result;
+  }
+
+  /**
+   * S1 observation blade (docs 2026-10-16 §六 S1; user decision 2026-10-17):
+   * after every completed round, emit a fact fingerprint + blocked-item
+   * classification counts and a consecutive-identical-round "idle spin"
+   * verdict — diagnostic-logger only, computed once at round end over
+   * round-existing facts (never inside a per-file loop), strictly read-only,
+   * zero control-flow influence and no new user-visible surface.
+   *
+   * Guarded by the `execute` category so diagnostics-off vaults pay nothing;
+   * a disabled round also clears the comparison state so a resumed streak
+   * can never span an unobserved round. Failures are swallowed: the
+   * observation must never propagate into the round result.
+   */
+  private recordSyncIdleObservation(result: SyncResult): void {
+    if (this.diag?.isEnabled?.("execute") !== true) {
+      this.syncIdleObservation = { previousFingerprint: null, streak: 0 };
+      return;
+    }
+    try {
+      observeSyncRoundEnd(
+        this.syncIdleObservation,
+        this.buildSyncRoundObservationInput(result),
+        (message, data) =>
+          this.diag!.log("execute", message, data, { urgent: true }),
+      );
+    } catch {
+      // Observation output is not allowed to alter anything else.
+    }
+  }
+
+  /** The round-end facts both observation blades read (S1 fingerprint and the
+   *  S4 per-item fingerprints), assembled once per round from existing
+   *  read-only state getters. Must never run inside a per-file loop. */
+  private buildSyncRoundObservationInput(
+    result: SyncResult,
+  ): SyncIdleObservationInput {
+    return {
+      scope: this.activeSyncScope,
+      stateCommitSeq:
+        this.state.activeV2StorageAuthorityEvidence?.stateCommitSeq ?? null,
+      pendingConflicts: this.state.pendingConflicts,
+      pendingRemoteDeletes: this.state.pendingRemoteDeletes,
+      pendingIssues: this.state.pendingIssues,
+      planReview: {
+        active: this.state.planReviewActive,
+        revision: this.state.planReviewRevision,
+        digest: this.state.planReviewDigest || null,
+      },
+      mutationLedger: this.state.mutationLedger,
+      runFacts: result.runFacts ?? null,
+      authExpired: result.authExpired === true,
+      success: result.success === true,
+      disposition: result.disposition ?? null,
+      mutationRecovery: result.mutationRecovery ?? null,
+      counts: {
+        uploaded: result.uploaded,
+        downloaded: result.downloaded,
+        foldersCreated: result.foldersCreated ?? 0,
+        foldersMoved: result.foldersMoved ?? 0,
+        foldersDeleted: result.foldersDeleted ?? 0,
+        filesMoved: result.filesMoved ?? 0,
+        deleted: result.deleted,
+        conflicts: result.conflicts,
+        deferred: result.deferred,
+        errors: result.errors,
+        identityBlockedErrors: result.identityBlockedErrors ?? null,
+        breakerDeferredErrors: result.breakerDeferredErrors ?? null,
+        networkFailureErrors: result.networkFailureErrors ?? null,
+        skippedLarge: result.skippedLarge,
+        skippedIgnored: result.skippedIgnored,
+        skippedInvalidName: result.skippedInvalidName,
+      },
+    };
+  }
+
+  /**
+   * S4 termination-criterion blade (docs 2026-10-16 §五 D3／§六 S4, user
+   * decision 2026-10-17): after every completed round, answer per blocked
+   * item whether it is spinning (identical facts across two consecutive
+   * observed rounds and no explicit external dependency) and remember the
+   * ending it reached — one user decision when a real manual exit exists, an
+   * explicit non-retryable diagnosis when none does.
+   *
+   * Presentation state only: zero data actions, zero control-flow influence
+   * (the round result is not read back by anything here beyond the facts it
+   * already carries), no new persistence (instance memory), and failures are
+   * swallowed so the blade can never alter a round. Unlike the S1 diagnostic
+   * blade this runs with diagnostics disabled too — the sidebar consumes it.
+   */
+  private recordSyncItemTermination(result: SyncResult): void {
+    try {
+      this.syncItemTermination.observe(
+        {
+          ...this.buildSyncRoundObservationInput(result),
+          items: this.collectBlockedItemRoundFacts(result),
+        },
+        (message, data) =>
+          this.diag?.log("execute", message, data, { urgent: true }),
+      );
+    } catch {
+      // Presentation state is not allowed to alter anything else.
+    }
+  }
+
+  /** Every blocked item of the round with the ending it can reach right now.
+   *  The dispositions only read live eligibility (the renderer's own exit
+   *  rule and the executor's recovery eligibility), never a new gate. */
+  private collectBlockedItemRoundFacts(
+    result: SyncResult,
+  ): SyncBlockedItemRoundFact[] {
+    const items: SyncBlockedItemRoundFact[] = [];
+    for (const issue of this.state.pendingIssues) {
+      const exitKind = issue.issueCode === "scope-crossing"
+        ? this.state.getScopeCrossingExitKind(issue.path)
+        : null;
+      items.push({
+        key: pendingIssueTerminationKey(issue),
+        path: issue.path,
+        disposition: resolvePendingIssueDisposition({
+          issueCode: issue.issueCode,
+          actionType: issue.actionType,
+          reason: issue.reason,
+          hasRenderableExit:
+            pendingIssueExitKind(issue.issueCode, exitKind) !== null,
+        }),
+      });
+    }
+    const recovery = result.mutationRecovery ?? null;
+    const blockReason = recovery?.blockReason ?? null;
+    const roundExternalDependency = result.authExpired === true
+      || recovery?.state === "network-unavailable";
+    for (const entry of this.state.mutationLedger) {
+      const operationId = entry.intent.operationId;
+      items.push({
+        key: mutationRecoveryItemKey(operationId),
+        path: entry.intent.path,
+        disposition: resolveMutationRecoveryDisposition({
+          roundExternalDependency,
+          blockReason,
+          manualResolutionAvailable:
+            manualResolutionExitAllowedFor(blockReason)
+            && this.canResolveMutationRecovery(operationId),
+        }),
+      });
+    }
+    return items;
+  }
+
+  /**
+   * S4 verdicts for the presentation layer (read-only snapshot). The sidebar
+   * reads this to replace a doomed re-check entry with the single ending an
+   * item actually has; nothing in the sync engine consumes it.
+   */
+  getSyncItemTerminationSnapshot(): readonly SyncItemTerminationVerdict[] {
+    return this.syncItemTermination.snapshot();
   }
 
   private async detectCompletedCommunityPluginRestores(
@@ -14534,64 +14973,22 @@ export class SyncExecutor {
         // P1-a: collect deferred base entry updates for batch persistence
         if (itemResult.baseUpsert) baseUpserts.push(itemResult.baseUpsert);
         if (itemResult.baseRemoval) baseRemovals.push(itemResult.baseRemoval);
-        if (item.type === SyncActionType.Conflict && !itemResult.resolvedConflict) {
-          pendingConflicts.push(this.withDecisionToken(item));
-        } else if (item.type === SyncActionType.ConfirmLocalDelete) {
-          pendingDeletes.push(this.withDecisionToken(item));
-        } else if (
-          item.type === SyncActionType.DeleteLocalFolder
-          && item.requiresConfirmation
-        ) {
-          pendingDeletes.push(item);
+        if (item.type === SyncActionType.Conflict) {
+          if (!itemResult.resolvedConflict) {
+            const row = this.decisionRowForPlanItem(item);
+            if (row !== null) pendingConflicts.push(row);
+          }
+        } else {
+          const row = this.decisionRowForPlanItem(item);
+          if (row !== null) pendingDeletes.push(row);
         }
         if (
           item.type === SyncActionType.RetryLater
           || item.type === SyncActionType.FolderDeferred
         ) {
-          const reason = item.reason
-            ? this.t(item.reason)
-            : this.t("syncView.failure.local");
-          pendingIssues.push({
-            path: item.path,
-            actionType: item.type,
-            ...(item.reason === "reason.folder.anchored-folder-missing-local"
-              ? { issueCode: "anchored-folder-missing-local" as const }
-              : item.reason === "reason.folder.anchored-folder-missing-remote"
-                ? { issueCode: "anchored-folder-missing-remote" as const }
-              : item.reason === "reason.identityReplacement.ambiguous"
-                ? { issueCode: "identity-replacement-ambiguous" as const }
-              : item.reason === "reason.folder.unanchored-shared-folder"
-                ? { issueCode: "unanchored-shared-folder" as const }
-              : item.reason === "reason.folder.both-sides-moved"
-                ? { issueCode: "folder-location-choice" as const }
-              : item.reason === "reason.folder.local-rename-evidence-conflict"
-                ? { issueCode: "local-rename-evidence-conflict" as const }
-              : item.reason === "reason.folder.local-subtree-changed"
-                ? { issueCode: "local-subtree-changed" as const }
-              : item.reason === "reason.folder.remote-subtree-changed"
-                ? { issueCode: "remote-subtree-changed" as const }
-              : item.reason === "reason.folder.target-occupied"
-                ? { issueCode: "target-occupied" as const }
-              : item.reason === "reason.folder.parent-chain-incomplete"
-                ? { issueCode: "parent-chain-incomplete" as const }
-              : item.reason === "reason.circuitBreaker.network"
-                ? { issueCode: "transfer-network" as const }
-              : item.reason === "reason.circuitBreaker.remoteMoving"
-                ? { issueCode: "transfer-remote-moving" as const }
-              : item.reason === "reason.file.scope-crossing"
-                ? { issueCode: "scope-crossing" as const }
-              : item.reason === "reason.folder.scope-crossing"
-                ? { issueCode: "scope-crossing" as const }
-              : {}),
-            reason,
-            updatedAt: Date.now(),
-            fileSize,
-            localHash,
-            remoteETag,
-            ...(item.type === SyncActionType.RetryLater
-              ? { consecutiveFailures: 1 }
-              : {}),
-          });
+          const issue = buildPendingIssueFromPlanItem(item, (key) => this.t(key), Date.now());
+          const reason = issue.reason ?? this.t("syncView.failure.local");
+          pendingIssues.push(issue);
           callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize);
           return { terminated: undefined };
         }
@@ -14829,7 +15226,8 @@ export class SyncExecutor {
         transferOutcome = transferMetrics ? "failed" : null;
         if (e instanceof DownloadRemoteVersionChangedError
           || e instanceof DownloadedPayloadSizeMismatchError
-          || (isResponseByteBudgetError(e) && e.kind === "observed")) {
+          || (isResponseByteBudgetError(e)
+            && (e.kind === "observed" || e.kind === "declared-over-expected"))) {
           // A stale-version download is a transient content race — the source
           // device was still writing while we read (hot file: recording part,
           // in-flight photo). The next round replans from the newer remote
@@ -14877,6 +15275,10 @@ export class SyncExecutor {
           return;
         }
         result.errors++;
+        if (isNetworkClassTransferFailure(e)) {
+          result.networkFailureErrors =
+            (result.networkFailureErrors ?? 0) + 1;
+        }
         if (e instanceof CommunityPluginIdentityBlockError) {
           result.identityBlockedErrors =
             (result.identityBlockedErrors ?? 0) + 1;
@@ -14916,8 +15318,7 @@ export class SyncExecutor {
           localHash,
           remoteETag,
           consecutiveFailures: 1,
-          ...(e instanceof OneDriveError
-            && e.type === OneDriveErrorType.NetworkError
+          ...(isNetworkClassTransferFailure(e)
             ? { issueCode: "transfer-network" as const }
             : {}),
         });
@@ -15362,11 +15763,15 @@ export class SyncExecutor {
   /** Retry the recorded mutation checkpoint in the same action when the
    *  failed intent already has a receipt: the receipt proves the target
    *  change landed, so only the checkpoint commit is replayed, with one
-   *  read-only remote-hierarchy rebase for the upload-parent mismatch. */
+   *  read-only remote-hierarchy rebase for the upload-parent mismatch or the
+   *  rename destination-spelling alias (the reducer's two path refusals). */
   private async recoverReceiptedMutationFailure(args: RecoverReceiptedMutationFailureArgs): Promise<SideMutationRecoveryOutcome> {
     const { error, activeIntent, activeRecord, operationEpoch, result, metrics } = args;
     try {
-      if (isV2RemoteUpsertParentMismatchError(error)) {
+      if (
+        isV2RemoteUpsertParentMismatchError(error)
+        || isV2RemoteMoveMissingSourceDeletionError(error)
+      ) {
         // The hierarchy may have changed after this run's initial
         // scan. Refresh the committed identity tree once, then retry
         // the exact receipt against that new tree. This is read-only
@@ -15393,6 +15798,12 @@ export class SyncExecutor {
             `rebound same-action upload receipt after remote hierarchy refresh — ${activeIntent.path}`,
             { operationId: activeIntent.operationId, mutations: 0 },
           );
+        } else {
+          // renameRemote sibling: re-spell the receipt's destination paths to
+          // the refreshed index spelling when the read-back proves the move
+          // effect already exists there. Zero remote writes; every missing
+          // fact leaves the receipt fail-closed.
+          await this.rebaseReceiptedRenameSpelling(refreshedRecord);
         }
       }
       const checkpointStartedAt = Date.now();
@@ -15788,7 +16199,6 @@ export class SyncExecutor {
       }
     }
   }
-
 
   /** Reconcile every durable mutation record before reading a cursor or planning. */
   private resolveCurrentFolderParent(
@@ -17433,6 +17843,9 @@ export class SyncExecutor {
     remoteObservationCommitSeq?: number,
     result?: SyncResult,
   ): Promise<MutationRecoveryRunSummary | null> {
+    // The third-blocking-point round fact belongs to one recovery pass; the
+    // isolation channel may only consume what this pass actually verified.
+    this.verifiedReceiptRefusedAbsorption = new Set();
     if (this.state.hasMutationLedgerCorruption) {
       const total = this.state.mutationLedger.length;
       throw new MutationRecoveryBlockedError({
@@ -17520,10 +17933,18 @@ export class SyncExecutor {
       operationId: string;
       reason:
         | "outcome-unresolved"
-        | "observation-unavailable"
-        | "dependent-on-unresolved";
+        | "observation-unavailable";
       error: Error;
       retryable: boolean;
+    }> = [];
+    // Records that merely wait for an earlier unresolved record (criterion ② of
+    // the 2026-10-17 cut). They stay in the ledger, stay protected and keep
+    // blocking later records — they just do not count as blocked outcomes, do
+    // not pick the batch's `blockedOperationId` and never make the round look
+    // worse than its root does.
+    const deferred: Array<{
+      operationId: string;
+      error: Error;
     }> = [];
     const blockedRecords: Array<{
       record: MutationLedgerEntryV1;
@@ -17547,6 +17968,7 @@ export class SyncExecutor {
       recoveryFootprints,
       bundlePredecessorIds,
       blocked,
+      deferred,
       blockedRecords,
       hierarchyRefreshedForRecovery,
       reflectedCheckpointRetirementCommitSeq,
@@ -17568,6 +17990,7 @@ export class SyncExecutor {
     const recoverySummary = this.buildMutationRecoverySummary({
       persistedRecords,
       blocked,
+      deferred,
       blockedRecords,
       settled,
       applied,
@@ -17593,6 +18016,7 @@ export class SyncExecutor {
     const {
       persistedRecords,
       blocked,
+      deferred,
       blockedRecords,
       settled,
       applied,
@@ -17659,6 +18083,12 @@ export class SyncExecutor {
         quarantined,
         blocked: blocked.length,
         blockedByReason,
+        // Waiting is not being stuck: these records were skipped because an
+        // earlier unresolved record owns an overlapping path (2026-10-17
+        // criterion ②). Counting them as blocked made the batch look worse
+        // than its root and diluted `blockedOperationId` (whose contract is
+        // "first non-retryable root record").
+        deferred: deferred.length,
         firstBlockedOperationId: blocked[0]?.operationId ?? null,
         externalMutations,
         // Field-report blind spot (2026-09-28): the blocked operationId alone
@@ -17713,10 +18143,13 @@ export class SyncExecutor {
       operationId: string;
       reason:
         | "outcome-unresolved"
-        | "observation-unavailable"
-        | "dependent-on-unresolved";
+        | "observation-unavailable";
       error: Error;
       retryable: boolean;
+    }>;
+    deferred: Array<{
+      operationId: string;
+      error: Error;
     }>;
     blockedRecords: Array<{
       record: MutationLedgerEntryV1;
@@ -17752,6 +18185,7 @@ export class SyncExecutor {
       recoveryFootprints,
       bundlePredecessorIds,
       blocked,
+      deferred,
       blockedRecords,
     } = args;
     let {
@@ -17778,6 +18212,7 @@ export class SyncExecutor {
         recoveryFootprints,
         bundlePredecessorIds,
         blocked,
+        deferred,
         blockedRecords,
         hierarchyRefreshedForRecovery,
         reflectedCheckpointRetirementCommitSeq,
@@ -17832,10 +18267,13 @@ export class SyncExecutor {
       operationId: string;
       reason:
         | "outcome-unresolved"
-        | "observation-unavailable"
-        | "dependent-on-unresolved";
+        | "observation-unavailable";
       error: Error;
       retryable: boolean;
+    }>;
+    deferred: Array<{
+      operationId: string;
+      error: Error;
     }>;
     blockedRecords: Array<{
       record: MutationLedgerEntryV1;
@@ -17873,6 +18311,7 @@ export class SyncExecutor {
       recoveryFootprints,
       bundlePredecessorIds,
       blocked,
+      deferred,
       blockedRecords,
     } = args;
     let {
@@ -17929,13 +18368,17 @@ export class SyncExecutor {
         currentFootprint,
       ));
     if (blockingDependency) {
-      blocked.push({
+      // Waiting is not a blocked outcome (criterion ②, 2026-10-17): the record
+      // stays in the ledger and stays protected, and it keeps blocking later
+      // records through `blockedRecords` below, but it does not enlarge the
+      // batch's blocked set, does not decide `state`/`blockedOperationId` and
+      // does not pretend `retryable` describes this record (it described its
+      // blocker — `mutationRecoveryIntentsOverlap` is unchanged).
+      deferred.push({
         operationId: record.intent.operationId,
-        reason: "dependent-on-unresolved",
         error: new Error(
           `Mutation recovery waits for an earlier dependent operation: ${record.intent.operationId}`,
         ),
-        retryable: blockingDependency.retryable,
       });
       blockedRecords.push({
         record,
@@ -18312,29 +18755,44 @@ export class SyncExecutor {
       let recoveryRecord = rebasedReceipt
         ? { ...record, receipt: rebasedReceipt }
         : record;
-      if (
-        !rebasedReceipt
+      const rereadRecord = (): MutationLedgerEntryV1 =>
+        this.state.mutationLedger.find(
+          (entry) => entry.intent.operationId === record.intent.operationId,
+        ) ?? recoveryRecord;
+      const renameSpellingDiverged = !rebasedReceipt
+        && this.renameRemoteReceiptSpellingDivergedFromIndex(record);
+      const uploadParentDrifted = !rebasedReceipt
+        && !renameSpellingDiverged
         && !hierarchyRefreshedForRecovery
         && operationEpoch !== undefined
         && result
-        && await this.uploadReceiptParentDriftedFromIndex(record)
-      ) {
-        // The receipt carries the live parent identity while the
-        // committed index still binds the path to an older folder one —
-        // the direction the rebase above cannot repair. Refresh the
-        // committed tree once per recovery run, then re-verify against
-        // it; every other shape stays on its fail-closed path.
-        hierarchyRefreshedForRecovery = true;
-        const rebound = await this.rebaseReceiptsAfterHierarchyRefresh(
-          [record.intent.operationId],
-          operationEpoch,
-          result,
-        );
-        if (rebound.refreshed) {
-          recoveryRecord = this.state.mutationLedger.find(
-            (entry) => entry.intent.operationId
-              === record.intent.operationId,
-          ) ?? recoveryRecord;
+        && await this.uploadReceiptParentDriftedFromIndex(record);
+      if (renameSpellingDiverged || uploadParentDrifted) {
+        // The receipt carries the live parent identity while the committed
+        // index still binds the path to an older folder one — the direction
+        // the rebase above cannot repair — or a rename receipt records its
+        // destination in a spelling alias of the committed index path.
+        // Refresh the committed tree once per recovery run, then re-verify
+        // against it; every other shape stays on its fail-closed path.
+        if (
+          !hierarchyRefreshedForRecovery
+          && operationEpoch !== undefined
+          && result
+        ) {
+          hierarchyRefreshedForRecovery = true;
+          const rebound = await this.rebaseReceiptsAfterHierarchyRefresh(
+            [record.intent.operationId],
+            operationEpoch,
+            result,
+          );
+          if (rebound.refreshed) recoveryRecord = rereadRecord();
+        } else if (renameSpellingDiverged) {
+          // The bounded refresh already ran this recovery pass, so later
+          // rename records face the refreshed tree directly — the read-back
+          // gate still decides every one of them on its own.
+          if (await this.rebaseReceiptedRenameSpelling(recoveryRecord)) {
+            recoveryRecord = rereadRecord();
+          }
         }
       }
       receiptMatches = await this.verifyMutationReceipt(
@@ -18379,11 +18837,41 @@ export class SyncExecutor {
         externalMutations,
       });
     }
-    await this.commitRecoveryCheckpointsWithRepair({
-      operationIds: [record.intent.operationId],
-      operationEpoch,
-      result,
-    });
+    try {
+      await this.commitRecoveryCheckpointsWithRepair({
+        operationIds: [record.intent.operationId],
+        operationEpoch,
+        result,
+      });
+    } catch (error) {
+      if (!(error instanceof MutationRecoveryBlockedError)) throw error;
+      // The receipt was verified against live facts (this branch is only
+      // reached when it still matches both sides) yet the committed common
+      // state refuses to absorb it — the cloud re-organized the same objects
+      // underneath the move, so the mechanical projection can never hold.
+      // Retrying cannot change that, and a bare error here froze every file
+      // decision in the vault with no in-app exit (2026-10-16 field case F29,
+      // Android 1.5.9, reset only; see SC-20's zero-write degradation target).
+      //
+      // The reviewed zero-write settlement already exists for exactly this
+      // reading — "continue from the current two-sided facts, execute or undo
+      // nothing" — and it keeps every gate it had: folder-intent only, scope
+      // match, a complete remote observation, and an exact-record CAS that
+      // fails closed on any drift. It removes the ledger record and writes one
+      // audit entry; it never touches the envelope, the Vault or Graph.
+      //
+      // The round fact is recorded first: if the settlement refuses, this is
+      // the strongest evidence any blocked record can hold (the receipt was
+      // just verified true against the world) and the S2 isolation channel's
+      // third capsule consumes it — the record stays, its path family freezes,
+      // and the rest of the vault keeps syncing.
+      this.verifiedReceiptRefusedAbsorption.add(record.intent.operationId);
+      if (await this.tryAutoSettleFolderMutationRecovery(record)) {
+        settled++;
+        return accumulators();
+      }
+      throw error;
+    }
     reflectedCheckpointRetirementCommitSeq = undefined;
     receiptCommitted++;
     settled++;
@@ -18522,7 +19010,6 @@ export class SyncExecutor {
     return accumulators();
   }
 
-
   /**
    * A receipted upload can leave the active V2 ledger only after independent
    * local, complete-index, and exact Graph identity facts prove that the
@@ -18660,18 +19147,132 @@ export class SyncExecutor {
       );
       if (!record) continue;
       const rebased = await this.rebaseReceiptedUploadParent(record);
-      if (!rebased) continue;
-      const receiptStartedAt = Date.now();
-      await this.state.recordMutationReceipt(rebased);
-      receiptPersistMs += Date.now() - receiptStartedAt;
-      rebound++;
-      this.diag?.log(
-        "state",
-        `rebound upload receipt after remote hierarchy refresh — ${record.intent.path}`,
-        { operationId, mutations: 0 },
-      );
+      if (rebased) {
+        const receiptStartedAt = Date.now();
+        await this.state.recordMutationReceipt(rebased);
+        receiptPersistMs += Date.now() - receiptStartedAt;
+        rebound++;
+        this.diag?.log(
+          "state",
+          `rebound upload receipt after remote hierarchy refresh — ${record.intent.path}`,
+          { operationId, mutations: 0 },
+        );
+        continue;
+      }
+      if (await this.rebaseReceiptedRenameSpelling(record)) rebound++;
     }
     return { refreshed: true, rebound, receiptPersistMs };
+  }
+
+  /**
+   * Re-spell the destination paths of one completed rename remote receipt
+   * (intent.path plus the receipt's base/upsert path) to the committed index
+   * spelling, so the reducer absorbs the record as an ordinary same-path
+   * metadata refresh instead of refusing the move forever. This is the
+   * renameRemote sibling of the upload parent rebase: read-back proof, a
+   * single durable record rewrite, one audit line — and zero remote writes
+   * (the move itself already happened when the receipt was written).
+   *
+   * The evidence gate is deliberately the strictest set the durable facts can
+   * offer, and every missing item returns false with the record untouched:
+   * - the committed index projects the moved identity at a path that is a
+   *   case/Unicode alias of the receipt path under the same parent identity;
+   * - the live service resolves BOTH spellings to the receipt's driveId, with
+   *   the receipt's parent, eTag and size (bytes were never rewritten by a
+   *   move, so both spellings must still carry the recorded version);
+   * - the record is a receipted renameRemote whose source spelling is NOT an
+   *   alias of the destination (a self-rename has no divergent source
+   *   spelling to rebase and stays on the ordinary fail-closed path).
+   * The reducer's own source-deletion and parent assertions stay untouched;
+   * after the rewrite they hold naturally because the receipt path is
+   * byte-identical to the index path.
+   */
+  private async rebaseReceiptedRenameSpelling(
+    record: Readonly<MutationLedgerEntryV1>,
+  ): Promise<boolean> {
+    const intent = record.intent;
+    if (
+      intent.action !== "renameRemote"
+      || intent.version !== 1
+      || !intent.sourcePath
+      || !intent.expectedRemote.exists
+      || !record.receipt
+    ) return false;
+    const checkpoint = record.receipt.checkpoint;
+    const previousPath = intent.path;
+    const bases = checkpoint.baseUpserts.filter(
+      (entry) => entry.path === intent.path,
+    );
+    const upserts = checkpoint.remoteUpserts.filter(
+      (entry) => entry.path === intent.path,
+    );
+    if (bases.length !== 1 || upserts.length !== 1) return false;
+    const [base] = bases;
+    const [upsert] = upserts;
+    if (upsert.driveId !== intent.expectedRemote.driveId) return false;
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!envelope || envelope.remoteIndex.complete !== true) return false;
+    const indexPath = projectRemoteIndexV2(envelope.remoteIndex)
+      .get(upsert.driveId);
+    if (
+      !indexPath
+      || indexPath === upsert.path
+      || normalizeRemotePathKey(indexPath) !== normalizeRemotePathKey(upsert.path)
+      || normalizeRemotePathKey(intent.sourcePath)
+        === normalizeRemotePathKey(indexPath)
+    ) return false;
+    const node = envelope.remoteIndex.itemsById[upsert.driveId];
+    if (
+      !node
+      || node.kind !== "file"
+      || node.parentId !== upsert.parentId
+      || node.eTag !== base.eTag
+      || node.size !== base.size
+      || (
+        upsert.sha256Hash !== undefined
+        && node.contentHash?.toLowerCase() !== upsert.sha256Hash.toLowerCase()
+      )
+    ) return false;
+    const [indexRead, receiptRead] = await Promise.all([
+      this.inspectRemotePath(indexPath),
+      this.inspectRemotePath(upsert.path),
+    ]);
+    for (const read of [indexRead, receiptRead]) {
+      if (
+        !read
+        || read.driveId !== upsert.driveId
+        || read.parentId !== upsert.parentId
+        || read.eTag !== upsert.eTag
+        || read.size !== upsert.size
+        || (
+          upsert.sha256Hash !== undefined
+          && read.sha256Hash?.toLowerCase() !== upsert.sha256Hash.toLowerCase()
+        )
+      ) return false;
+    }
+    const nextReceipt: MutationReceiptV1 = {
+      ...record.receipt,
+      checkpoint: {
+        ...checkpoint,
+        baseUpserts: checkpoint.baseUpserts.map((entry) =>
+          entry.path === intent.path ? { ...entry, path: indexPath } : entry),
+        remoteUpserts: checkpoint.remoteUpserts.map((entry) =>
+          entry.path === intent.path ? { ...entry, path: indexPath } : entry),
+      },
+    };
+    await this.state.rebaseReceiptedRenameSpelling({
+      expected: record,
+      path: indexPath,
+      receipt: nextReceipt,
+    });
+    // The write may replace the record object; the audit line must always name
+    // the spelling that was actually rebased, never the rewritten one twice.
+    this.diag?.log(
+      "state",
+      `rebased rename receipt spelling to the committed index path — ${previousPath} -> ${indexPath}`,
+      { operationId: intent.operationId, mutations: 0 },
+    );
+    return true;
   }
 
   /**
@@ -18697,6 +19298,51 @@ export class SyncExecutor {
     }
     const current = await this.inspectRemotePath(record.intent.path);
     return Boolean(current && current.parentId === upserts[0].parentId);
+  }
+
+  /**
+   * Detect the rename-destination spelling divergence the alias rebase can
+   * repair: the receipt records the destination in the local spelling while
+   * the committed index already projects the moved identity at its cloud
+   * spelling under the same parent identity (2026-10-14 field case F27:
+   * `x.md` at the vault root moved into the cloud folder `videos` while the
+   * local folder is spelled `Videos`). Index-only — no live reads; the
+   * sibling rebase still has to prove the live facts before anything is
+   * rewritten. Any missing or non-alias fact returns false and leaves the
+   * record on its existing fail-closed recovery path.
+   */
+  private renameRemoteReceiptSpellingDivergedFromIndex(
+    record: Readonly<MutationLedgerEntryV1>,
+  ): boolean {
+    const intent = record.intent;
+    if (
+      intent.action !== "renameRemote"
+      || intent.version !== 1
+      || !intent.sourcePath
+      || !record.receipt
+    ) return false;
+    const upserts = record.receipt.checkpoint.remoteUpserts.filter(
+      (entry) => entry.path === intent.path,
+    );
+    if (upserts.length !== 1) return false;
+    const [upsert] = upserts;
+    const envelope = this.state.getCommittedV2Envelope();
+    if (!envelope || envelope.remoteIndex.complete !== true) return false;
+    const indexPath = projectRemoteIndexV2(envelope.remoteIndex)
+      .get(upsert.driveId);
+    if (
+      !indexPath
+      || indexPath === upsert.path
+      || normalizeRemotePathKey(indexPath) !== normalizeRemotePathKey(upsert.path)
+      || normalizeRemotePathKey(intent.sourcePath)
+        === normalizeRemotePathKey(indexPath)
+    ) return false;
+    const node = envelope.remoteIndex.itemsById[upsert.driveId];
+    return Boolean(
+      node
+      && node.kind === "file"
+      && node.parentId === upsert.parentId,
+    );
   }
 
   /**
@@ -20047,10 +20693,15 @@ export class SyncExecutor {
     if (
       error instanceof DownloadRemoteVersionChangedError
       || error instanceof DownloadedPayloadSizeMismatchError
-      || (isResponseByteBudgetError(error) && error.kind === "observed")
+      || (isResponseByteBudgetError(error)
+        && (error.kind === "observed"
+          || error.kind === "declared-over-expected"))
     ) {
       // The same physical race ("the remote moved while we were reading it")
-      // has three detection points; they share one user-facing reason.
+      // has three detection points; they share one user-facing reason. The
+      // third one (2026-10-16) is the response header declaring more than the
+      // file's own metadata size — it used to share kind="declared" with the
+      // standing "this item can never transfer" fact and so failed the round.
       return this.t("syncView.failure.remoteChangedDuringDownload");
     }
     if (error instanceof OneDriveError) {
@@ -20561,7 +21212,7 @@ export class SyncExecutor {
       case SyncActionType.SkipIgnoredPath:
         return this.executeSkipIgnoredPathItem({ result });
       case SyncActionType.RetryLater:
-        return this.executeRetryLaterItem({ result });
+        return this.executeRetryLaterItem({ item, result });
       case SyncActionType.FolderDeferred:
         return this.executeFolderDeferredItem({ result });
       case SyncActionType.AuthExpired:
@@ -21096,12 +21747,23 @@ export class SyncExecutor {
     return { executed: true };
   }
 
-  /** Extracted verbatim from the executeItem switch (case RetryLater). */
+  /** Extracted from the executeItem switch (case RetryLater).
+   *  2026-10-18: plan-layer deferrals (the `verificationPending` reason) also
+   *  mark their own exempt family — the counter is bumped next to the
+   *  `errors++` it exempts, so the pause gate's sum can never drift from the
+   *  count of executed deferrals. Breaker deferrals keep their own bulk
+   *  counter (set where the breaker converts the item), hence the reason
+   *  test instead of an unconditional bump. */
   private executeRetryLaterItem(args: {
+    item: SyncPlanItem;
     result: SyncResult;
   }): ItemExecutionResult {
-    const { result } = args;
+    const { item, result } = args;
     result.errors++;
+    if (item.reason === "reason.identityReplacement.verificationPending") {
+      result.planningDeferredErrors =
+        (result.planningDeferredErrors ?? 0) + 1;
+    }
     return { executed: true };
   }
 
@@ -21122,7 +21784,6 @@ export class SyncExecutor {
     result.authExpired = true;
     return { executed: true };
   }
-
 
   private async publishHealthyCloudBootstrapV2(
     operationEpoch: number,
@@ -23049,7 +23710,6 @@ export class SyncExecutor {
       baseRemoval: item.renameFrom,
     };
   }
-
 
   private async observeSharedSyncProtocolObjects(
     expectedV3Slot?: { id: string; eTag: string },
@@ -25581,6 +26241,25 @@ export class SyncExecutor {
    * by the same commission, and a second rejection is rethrown unchanged so
    * the record keeps its blocking (2026-10-13, F26 residual §3 — same
    * read-only repair shape as the upload parent-drift retry).
+   *
+   * A rejection that is *not* about a stale tree — the receipt itself asserts a
+   * projection the committed common state contradicts, or the cloud
+   * re-organized the same objects underneath it — cannot be repaired by
+   * rebuilding, so it is reported as one record-level `blocked` outcome
+   * instead of a bare error. Two reasons, both from the field:
+   *
+   * - the recovery loop has no per-record guard, so a bare error aborts the
+   *   whole round and every record queued behind this one stays unprocessed
+   *   (2026-10-16 field case F29: whole-vault stall, auto-sync paused, no
+   *   in-app exit, reset only);
+   * - a bare error is reported to the user as "state unavailable", which is not
+   *   what happened — the state loaded fine, it just cannot absorb this record.
+   *
+   * The record itself is untouched by this change: its receipt and ledger entry
+   * keep blocking exactly as before, and the existing record-level exit
+   * (`facts-changed`) becomes reachable instead of being masked by a
+   * round-level failure (SC-20: an unabsorbable record needs a zero-write
+   * degradation target and must not block the whole vault).
    */
   private async commitRecoveryCheckpointsWithRepair(args: {
     operationIds: readonly string[];
@@ -25594,26 +26273,62 @@ export class SyncExecutor {
       return await commit();
     } catch (error) {
       if (
-        !isV2BaseUpsertRejectionError(error)
-        || args.operationEpoch === undefined
-        || !args.result
-        || !this.activeSyncScope
-      ) throw error;
-      this.diag?.warn(
-        "state",
-        `recovery checkpoint rejected against the committed tree; rebuilding once — ${args.operationIds.join(", ")}`,
-        {
-          operations: args.operationIds.length,
-          error: error instanceof Error ? error.message : String(error),
-          mutations: 0,
-        },
-      );
-      await this.rebuildRemoteStateFromIdentitySnapshot(
-        args.operationEpoch,
-        args.result,
-        this.activeSyncScope,
-      );
-      return await commit();
+        isV2BaseUpsertRejectionError(error)
+        && args.operationEpoch !== undefined
+        && args.result
+        && this.activeSyncScope
+      ) {
+        this.diag?.warn(
+          "state",
+          `recovery checkpoint rejected against the committed tree; rebuilding once — ${args.operationIds.join(", ")}`,
+          {
+            operations: args.operationIds.length,
+            error: error instanceof Error ? error.message : String(error),
+            mutations: 0,
+          },
+        );
+        await this.rebuildRemoteStateFromIdentitySnapshot(
+          args.operationEpoch,
+          args.result,
+          this.activeSyncScope,
+        );
+        return await commit();
+      }
+      // The record's receipt is already durable and the mutation already
+      // reached the world; only the committed common state refuses to absorb
+      // it. Rebuilding cannot change that (the divergence is in the world, not
+      // in a stale tree), so stop retrying and report one record-level blocked
+      // outcome. A bare error here would abort the whole recovery loop and
+      // leave every record behind this one unprocessed for the round
+      // (2026-10-16 field case F29; SC-20 zero-write degradation target).
+      if (isV2StateAbsorptionRefusalError(error)) {
+        // Nothing settled this record (the reduction aborted), so the honest
+        // reading is "everything still outstanding stays outstanding".
+        const remaining = this.state.mutationLedger.length;
+        this.diag?.warn(
+          "state",
+          `recovery checkpoint cannot be absorbed by the committed state; keeping one record blocked — ${args.operationIds.join(", ")}`,
+          {
+            operations: args.operationIds.length,
+            error: error instanceof Error ? error.message : String(error),
+            activeLedgerRecords: remaining,
+            mutations: 0,
+          },
+        );
+        throw new MutationRecoveryBlockedError(
+          {
+            state: "blocked",
+            total: remaining,
+            settled: 0,
+            remaining,
+            retryAfterSeconds: null,
+            blockReason: "facts-changed",
+            blockedOperationId: args.operationIds[0],
+          },
+          error instanceof Error ? error : new Error(String(error)),
+        );
+      }
+      throw error;
     }
   }
 
@@ -26796,21 +27511,22 @@ export class SyncExecutor {
                 || !this.activeSyncScope
               ) throw error;
               recoveryBlockedError = error;
-              const isolated = this.isolatableOrdinaryFileRecovery(
+              const isolated = this.isolatableMutationRecoveryRecords(
                 error.summary,
                 this.activeSyncScope,
                 { allowManagedConfigPaths: true },
               );
               if (isolated) {
-                isolatedRecoveryRecords = isolated;
+                isolatedRecoveryRecords = isolated.records;
                 this.diag?.log(
                   "execute",
                   "side action continues past isolated unresolved recovery records",
                   {
-                    records: isolated.length,
-                    operationIds: isolated.map(
+                    records: isolated.records.length,
+                    operationIds: isolated.records.map(
                       (record) => record.intent.operationId,
                     ),
+                    capsules: isolated.capsuleCounts,
                     mutations: 0,
                   },
                 );
@@ -28261,8 +28977,71 @@ const PLANNER_DERIVED_PENDING_ISSUE_CODES: ReadonlySet<
   "scope-crossing",
 ]);
 
-function isPendingIssueAction(type: SyncActionType): boolean {
-  return type === SyncActionType.Upload
+/**
+ * Stable, localization-independent route from a plan item's reason to the
+ * resolution entry the sidebar offers. Kept as one table so the planner-derived
+ * row written right after planning and the row written at the end of a round
+ * can never drift apart.
+ */
+function plannerIssueCodeForReason(
+  reason: string | undefined,
+): PendingIssue["issueCode"] {
+  switch (reason) {
+    case "reason.folder.anchored-folder-missing-local":
+      return "anchored-folder-missing-local";
+    case "reason.folder.anchored-folder-missing-remote":
+      return "anchored-folder-missing-remote";
+    case "reason.identityReplacement.ambiguous":
+      return "identity-replacement-ambiguous";
+    case "reason.folder.unanchored-shared-folder":
+      return "unanchored-shared-folder";
+    case "reason.folder.both-sides-moved":
+      return "folder-location-choice";
+    case "reason.folder.local-rename-evidence-conflict":
+      return "local-rename-evidence-conflict";
+    case "reason.folder.local-subtree-changed":
+      return "local-subtree-changed";
+    case "reason.folder.remote-subtree-changed":
+      return "remote-subtree-changed";
+    case "reason.folder.target-occupied":
+      return "target-occupied";
+    case "reason.folder.parent-chain-incomplete":
+      return "parent-chain-incomplete";
+    case "reason.circuitBreaker.network":
+      return "transfer-network";
+    case "reason.circuitBreaker.remoteMoving":
+      return "transfer-remote-moving";
+    case "reason.file.scope-crossing":
+    case "reason.folder.scope-crossing":
+      return "scope-crossing";
+    default:
+      return undefined;
+  }
+}
+
+/** One pending-issue row for a plan item that is not an executable action. */
+function buildPendingIssueFromPlanItem(
+  item: SyncPlanItem,
+  translate: (key: string) => string,
+  now: number,
+): PendingIssue {
+  const issueCode = plannerIssueCodeForReason(item.reason);
+  return {
+    path: item.path,
+    actionType: item.type,
+    ...(issueCode ? { issueCode } : {}),
+    reason: item.reason ? translate(item.reason) : translate("syncView.failure.local"),
+    updatedAt: now,
+    fileSize: item.local?.size ?? item.remote?.size,
+    localHash: item.local?.hash,
+    remoteETag: item.remote?.eTag,
+    ...(item.type === SyncActionType.RetryLater
+      ? { consecutiveFailures: 1 }
+      : {}),
+  };
+}
+
+function isPendingIssueAction(type: SyncActionType): boolean {  return type === SyncActionType.Upload
     || type === SyncActionType.Download
     || type === SyncActionType.CreateRemoteFolder
     || type === SyncActionType.CreateLocalFolder
@@ -28289,6 +29068,22 @@ export function isAuthFailure(error: unknown): boolean {
 }
 
 /**
+ * A transfer failure whose only cause is the network itself: the link dropped
+ * mid-request (DNS/TCP/TLS reset), the plugin's own request deadline elapsed
+ * (the client already rethrows those as NetworkError), or Graph answered 408.
+ * HTTP 408 joins NetworkError because the existing cross-round classifier
+ * (`classifySharedSyncProtocolObservationFailure`) already treats both as
+ * "network-unavailable" — same class, same handling.
+ *
+ * Only classifies the thrown failure; whether the round may skip the
+ * automatic pause is decided by the caller through `networkFailureErrors`.
+ */
+function isNetworkClassTransferFailure(error: unknown): boolean {
+  return error instanceof OneDriveError
+    && (error.type === OneDriveErrorType.NetworkError || error.statusCode === 408);
+}
+
+/**
  * A transient Graph read failure proves nothing about the mutation outcome,
  * but it also does not invalidate the independent evidence available for
  * later ledger records. Keep the failed intent pending and continue read-only
@@ -28312,6 +29107,20 @@ function isV2RemoteUpsertParentMismatchError(error: unknown): boolean {
 }
 
 /**
+ * The second reducer refusal a receipted rename can hit: the receipt records
+ * the destination in the local spelling while the refreshed index already
+ * projects the moved identity at the cloud spelling, so the reducer asks for a
+ * source deletion of the index path the receipt never had to record
+ * (`V2 remote move is missing its source deletion`, 2026-10-14 field case).
+ * Same read-only recovery lane as the parent mismatch — refresh the committed
+ * tree once, then run the alias-spelling rebase.
+ */
+function isV2RemoteMoveMissingSourceDeletionError(error: unknown): boolean {
+  return error instanceof Error
+    && error.message.includes("V2 remote move is missing its source deletion");
+}
+
+/**
  * The three reducer rejections a committed identity tree can raise against a
  * recovery checkpoint's base upsert (`file-state-reducer-v2.ts`): the tree has
  * no node at the path, its node carries a different version, or the path is
@@ -28327,6 +29136,78 @@ function isV2BaseUpsertRejectionError(error: unknown): boolean {
       || error.message.includes("V2 base upsert would replace another anchor")
     );
 }
+
+/**
+ * The reducer refusals one **already receipted** record can still be rejected by
+ * after its mutation reached the world: the committed common state cannot
+ * mechanically absorb this record's checkpoint any more, because either the
+ * receipt claims a projection the committed tree contradicts or the cloud
+ * re-organized the same objects underneath it (2026-10-16 field case F29:
+ * `V2 folder move file projection changed`).
+ *
+ * These are not environment faults and not batch-level failures: the record's
+ * own receipt is what cannot be absorbed. Reporting them as a record-level
+ * `blocked` outcome (instead of a bare `Error`) is what keeps one unabsorbable
+ * record from aborting the whole recovery loop — the loop in
+ * `recoverMutationLedgerRecords` has no per-record guard, so a bare throw ends
+ * the round for every record queued behind it (see SC-20: a record that cannot
+ * be mechanically absorbed must have a zero-write degradation target and must
+ * not block the whole vault).
+ *
+ * Fail-closed by construction: the message is matched against the exact V2
+ * assertion vocabulary, so a *new* assertion keeps today's loud round-level
+ * failure until it is classified here on purpose. Silence is never assumed.
+ */
+function isV2StateAbsorptionRefusalError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const message = error.message;
+  // Every assertion in either reducer names its own subject after "V2 ", before
+  // the first variable part (path / operation id). Matching that prefix keeps a
+  // path containing a colon from faking a kind.
+  const colon = message.indexOf(":");
+  const kind = colon < 0 ? message : message.slice(0, colon);
+  return V2_STATE_ABSORPTION_REFUSAL_KINDS.has(kind);
+}
+
+/**
+ * The exact set of reducer assertions that mean "this receipt cannot be
+ * absorbed", as opposed to a malformed receipt (the batch never should have
+ * produced it) or an environment fault (IndexedDB / adapter / host).
+ *
+ * Kept deliberately explicit and closed so the classification is auditable;
+ * {@link isV2StateAbsorptionRefusalError} stays fail-closed for anything absent.
+ */
+const V2_STATE_ABSORPTION_REFUSAL_KINDS: ReadonlySet<string> = new Set([
+  // file-state-reducer-v2.ts — committed-tree / world divergence
+  "V2 remote upsert is missing a drive id",
+  "V2 remote upsert is missing a parent id",
+  "V2 remote upsert would replace another identity",
+  "V2 remote move is missing its source deletion",
+  "V2 remote upsert parent does not match path",
+  "V2 base upsert has no remote file identity",
+  "V2 base upsert remote version mismatch",
+  "V2 base upsert would replace another anchor",
+  "V2 root file upsert has a non-root parent identity",
+  "V2 file path is invalid",
+  // folder-state-reducer-v2.ts — committed-tree / world divergence
+  "V2 folder move file projection changed",
+  "V2 folder move descendant projection changed",
+  "V2 folder move descendant identity is missing",
+  "V2 folder move has no committed source anchor",
+  "V2 folder move source identity is missing",
+  "V2 folder move projection differs from receipt",
+  "V2 folder move would replace another identity",
+  "V2 folder upsert projection differs from receipt",
+  "V2 folder upsert would replace another identity",
+  "V2 folder parent identity is missing",
+  "V2 folder parent path changed",
+  "V2 folder delete still has committed descendants",
+  "V2 folder delete still has remote children",
+  "V2 folder delete identity changed type",
+  "V2 local folder create lost its remote identity",
+  "V2 remote folder create expected an existing target",
+  "V2 root folder has a non-root parent identity",
+]);
 
 function mutationRecoveryIntentsOverlap(
   left: MutationIntent,
@@ -28575,7 +29456,4 @@ function errorDiagData(error: unknown): Record<string, unknown> {
   const message = error instanceof Error ? error.message : String(error);
   return { message };
 }
-
-
-
 

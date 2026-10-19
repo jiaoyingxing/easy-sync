@@ -1,5 +1,7 @@
 import {
+  isAnchoredDescendantV2,
   projectRemoteIndexV2,
+  translateAnchoredPathV2,
   type RemoteNodeV2,
 } from "./remote-index-v2";
 import {
@@ -17,7 +19,7 @@ import {
   type RemoteFolderEntry,
 } from "./types";
 
-export type ScopeExpansionFolderAcceptanceV2 =
+type ScopeExpansionFolderAcceptanceV2 =
   | {
       status: "accepted";
       accepted: number;
@@ -46,7 +48,7 @@ export type ConfirmedDescendantFolderRejectionReasonV2 =
   | "local-topology-conflict"
   | "folder-anchor-collision";
 
-export type ConfirmedDescendantFolderAcceptanceV2 =
+type ConfirmedDescendantFolderAcceptanceV2 =
   | {
       status: "accepted";
       accepted: number;
@@ -778,7 +780,7 @@ function reduceFolderMove(
   for (const anchor of Object.values(nextFolderAnchors)) {
     if (!isAtOrBelow(anchor.lastPath, sourcePath)) continue;
     const projectedPath = nextPathById.get(anchor.remoteId);
-    const translated = translatePath(anchor.lastPath, sourcePath, intent.path);
+    const translated = translateAnchoredPathV2(anchor.lastPath, sourcePath, intent.path);
     if (projectedPath !== translated) {
       throw new Error(`V2 folder move descendant projection changed: ${anchor.lastPath}`);
     }
@@ -809,8 +811,8 @@ function reduceFolderMove(
 
   const nextFileAnchors = { ...envelope.anchors.byAnchorId };
   for (const anchor of Object.values(nextFileAnchors)) {
-    if (!isDescendant(anchor.lastPath, sourcePath)) continue;
-    const translated = translatePath(anchor.lastPath, sourcePath, intent.path);
+    if (!isAnchoredDescendantV2(anchor.lastPath, sourcePath)) continue;
+    const translated = translateAnchoredPathV2(anchor.lastPath, sourcePath, intent.path);
     if (!anchor.remoteId || nextPathById.get(anchor.remoteId) !== translated) {
       throw new Error(`V2 folder move file projection changed: ${anchor.lastPath}`);
     }
@@ -863,13 +865,13 @@ function reduceFolderDelete(
   }
   const nextItemsById = { ...envelope.remoteIndex.itemsById };
   const descendantFileAnchors = Object.values(envelope.anchors.byAnchorId).filter(
-    (anchor) => isDescendant(anchor.lastPath, intent.path),
+    (anchor) => isAnchoredDescendantV2(anchor.lastPath, intent.path),
   );
   const descendantFolderAnchors = Object.values(
     envelope.folderAnchors!.byAnchorId,
   ).filter(
     (anchor) => anchor.remoteId !== intent.folderId
-      && isDescendant(anchor.lastPath, intent.path),
+      && isAnchoredDescendantV2(anchor.lastPath, intent.path),
   );
   if (
     descendantFileAnchors.some(
@@ -1072,17 +1074,9 @@ function parentPath(path: string): string {
   return separator < 0 ? "" : path.slice(0, separator);
 }
 
-function translatePath(path: string, fromRoot: string, toRoot: string): string {
-  if (path === fromRoot) return toRoot;
-  return `${toRoot}${path.slice(fromRoot.length)}`;
-}
-
-function isDescendant(path: string, root: string): boolean {
-  return path.normalize("NFC").startsWith(`${root.normalize("NFC")}/`);
-}
-
 function isAtOrBelow(path: string, root: string): boolean {
-  return path.normalize("NFC") === root.normalize("NFC") || isDescendant(path, root);
+  return path.normalize("NFC") === root.normalize("NFC")
+    || isAnchoredDescendantV2(path, root);
 }
 
 function identityPath(path: string): string {

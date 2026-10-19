@@ -54,7 +54,7 @@ interface RangeHttpResponse extends AsyncIterable<Uint8Array> {
   destroy(error?: Error): void;
 }
 
-export interface RangeHttpsModule {
+interface RangeHttpsModule {
   request(
     url: string,
     options: { method: string; headers: Record<string, string> },

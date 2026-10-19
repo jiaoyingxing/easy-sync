@@ -16,7 +16,7 @@ import type {
   LocalFolderMoveHintV1,
 } from "./types";
 
-export type FolderPlanActionV2 =
+type FolderPlanActionV2 =
   | "create-local"
   | "create-remote"
   | "move-local"
@@ -39,13 +39,13 @@ export type FolderPlanConflictReasonV2 =
   | "unanchored-shared-folder"
   | "local-rename-evidence-conflict";
 
-export interface FolderPlanImpactV2 {
+interface FolderPlanImpactV2 {
   files: number;
   folders: number;
   bytes: number;
 }
 
-export interface FolderPlanItemV2 {
+interface FolderPlanItemV2 {
   type: FolderPlanActionV2;
   path: string;
   sourcePath?: string;
@@ -57,7 +57,7 @@ export interface FolderPlanItemV2 {
   impact: FolderPlanImpactV2;
 }
 
-export interface FolderPlanCountsV2 {
+interface FolderPlanCountsV2 {
   createLocal: number;
   createRemote: number;
   moveLocal: number;
@@ -79,7 +79,7 @@ export interface FolderStatePlanV2 {
   mutations: [];
 }
 
-export interface FolderStatePlanInputV2 {
+interface FolderStatePlanInputV2 {
   envelope: SyncStateEnvelopeV2;
   localFiles: readonly LocalFileEntry[];
   localFolders: readonly LocalFolderEntry[];
@@ -96,7 +96,7 @@ export interface FolderStatePlanInputV2 {
   preserveFolderPath?: (path: string) => boolean;
 }
 
-export interface FolderStatePlanViewInputV2
+interface FolderStatePlanViewInputV2
   extends Omit<FolderStatePlanInputV2, "envelope"> {
   state: CanonicalPlannerStateV2;
 }
@@ -251,6 +251,105 @@ export function planFolderStateFromViewV2(
     inferredLocalByRemoteId,
   });
 
+  const {
+    unclaimedLocalFolders,
+    unclaimedFileCounts,
+    unclaimedRenameSuspects,
+  } = buildUnclaimedFolderEvidence({
+    input,
+    anchoredLastPaths,
+    inferredLocalByRemoteId,
+    includeFilePath,
+    includeFolderPath,
+  });
+
+  const anchoredFolderPlanning = planAnchoredFolderCandidatesV2({
+    anchors,
+    input,
+    remotePathById,
+    localFoldersByIdentity,
+    localFilesByIdentity,
+    remoteFoldersByIdentity,
+    remoteFilesByIdentity,
+    validLocalMoveHints,
+    deleteHintRemoteIds,
+    includeFilePath,
+    includeFolderPath,
+    inferredLocalByRemoteId,
+    localEvidenceConflicts,
+    localScopeCrossings,
+    localTrashDeletes,
+    unclaimedLocalFolders,
+    unclaimedFileCounts,
+    unclaimedRenameSuspects,
+    candidates,
+    consumedLocalPaths,
+  });
+  unresolvedLocalIdentity = anchoredFolderPlanning.unresolvedLocalIdentity;
+  unresolvedRemoteIdentity = anchoredFolderPlanning.unresolvedRemoteIdentity;
+
+  planUnanchoredLocalFolderCandidatesV2({
+    input,
+    preserveFolderPath,
+    includeFolderPath,
+    consumedLocalPaths,
+    anchoredLastPaths,
+    remoteFoldersByIdentity,
+    remoteFilesByIdentity,
+    anchoredRemoteIds,
+    unresolvedLocalIdentity,
+    remotePathById,
+    candidates,
+  });
+
+  planUnanchoredRemoteFolderCandidatesV2({
+    input,
+    preserveFolderPath,
+    includeFolderPath,
+    anchoredRemoteIds,
+    remoteFoldersByIdentity,
+    localFoldersByIdentity,
+    localFilesByIdentity,
+    unresolvedRemoteIdentity,
+    remotePathById,
+    candidates,
+  });
+
+  const collapsed = collapseCoveredMoves(candidates)
+    .sort(comparePlanCandidate);
+  return {
+    version: 1,
+    status: "planned",
+    items: collapsed.map(({ coverage: _coverage, ...item }) => item),
+    counts: countActions(collapsed),
+    reviewImpact: calculateReviewImpact(collapsed, input, remotePathById),
+    mutations: [],
+  };
+}
+
+interface UnclaimedFolderEvidenceInputV2 {
+  input: FolderStatePlanViewInputV2;
+  anchoredLastPaths: ReadonlySet<string>;
+  inferredLocalByRemoteId: ReadonlyMap<string, string>;
+  includeFilePath: (path: string) => boolean;
+  includeFolderPath: (path: string) => boolean;
+}
+
+interface UnclaimedFolderEvidenceV2 {
+  unclaimedLocalFolders: LocalFolderEntry[];
+  unclaimedFileCounts: Map<string, number>;
+  unclaimedRenameSuspects: (anchor: FolderAnchorV2) => string[];
+}
+
+/**
+ * Classify the unclaimed local folders once per plan: which ones nobody claimed
+ * yet, how many descendant files each holds, and a lazy per-anchor rename-suspect
+ * collector. Extracted verbatim from `planFolderStateFromViewV2`（2026-10-16 第二期
+ * 类内分解，逐 token 等价）。
+ */
+function buildUnclaimedFolderEvidence({
+  input, anchoredLastPaths, inferredLocalByRemoteId, includeFilePath, includeFolderPath,
+}: UnclaimedFolderEvidenceInputV2): UnclaimedFolderEvidenceV2 {
   const claimedLocalPaths = new Set([
     ...anchoredLastPaths,
     ...[...inferredLocalByRemoteId.values()].map(identityPath),
@@ -319,31 +418,35 @@ export function planFolderStateFromViewV2(
     return [...suspects].sort();
   };
 
-  const anchoredFolderPlanning = planAnchoredFolderCandidatesV2({
-    anchors,
-    input,
-    remotePathById,
-    localFoldersByIdentity,
-    localFilesByIdentity,
-    remoteFoldersByIdentity,
-    remoteFilesByIdentity,
-    validLocalMoveHints,
-    deleteHintRemoteIds,
-    includeFilePath,
-    includeFolderPath,
-    inferredLocalByRemoteId,
-    localEvidenceConflicts,
-    localScopeCrossings,
-    localTrashDeletes,
-    unclaimedLocalFolders,
-    unclaimedFileCounts,
-    unclaimedRenameSuspects,
-    candidates,
-    consumedLocalPaths,
-  });
-  unresolvedLocalIdentity = anchoredFolderPlanning.unresolvedLocalIdentity;
-  unresolvedRemoteIdentity = anchoredFolderPlanning.unresolvedRemoteIdentity;
+  return { unclaimedLocalFolders, unclaimedFileCounts, unclaimedRenameSuspects };
+}
 
+interface UnanchoredLocalFolderPlanInputV2 {
+  input: FolderStatePlanViewInputV2;
+  preserveFolderPath: (path: string) => boolean;
+  includeFolderPath: (path: string) => boolean;
+  consumedLocalPaths: ReadonlySet<string>;
+  anchoredLastPaths: ReadonlySet<string>;
+  remoteFoldersByIdentity: ReadonlyMap<string, { id: string; path: string }>;
+  remoteFilesByIdentity: ReadonlyMap<string, { id: string; path: string }>;
+  anchoredRemoteIds: ReadonlySet<string>;
+  unresolvedLocalIdentity: boolean;
+  remotePathById: FolderStatePlanViewInputV2["state"]["remotePathById"];
+  candidates: PlannedCandidate[];
+}
+
+/**
+ * Local folders nobody claimed: a remote file at the same identity is a type
+ * conflict, an unanchored remote folder is a shared-folder conflict, and an
+ * empty remote side becomes `create-remote` (unless the local identity is still
+ * unresolved). Extracted verbatim from `planFolderStateFromViewV2`（2026-10-16
+ * 第二期类内分解，逐 token 等价）。
+ */
+function planUnanchoredLocalFolderCandidatesV2({
+  input, preserveFolderPath, includeFolderPath, consumedLocalPaths, anchoredLastPaths,
+  remoteFoldersByIdentity, remoteFilesByIdentity, anchoredRemoteIds,
+  unresolvedLocalIdentity, remotePathById, candidates,
+}: UnanchoredLocalFolderPlanInputV2): void {
   for (const folder of input.localFolders) {
     if (preserveFolderPath(folder.path)) continue;
     if (!includeFolderPath(folder.path)) continue;
@@ -388,7 +491,32 @@ export function planFolderStateFromViewV2(
       ));
     }
   }
+}
 
+interface UnanchoredRemoteFolderPlanInputV2 {
+  input: FolderStatePlanViewInputV2;
+  preserveFolderPath: (path: string) => boolean;
+  includeFolderPath: (path: string) => boolean;
+  anchoredRemoteIds: ReadonlySet<string>;
+  remoteFoldersByIdentity: ReadonlyMap<string, { id: string; path: string }>;
+  localFoldersByIdentity: ReadonlyMap<string, string>;
+  localFilesByIdentity: ReadonlyMap<string, LocalFileEntry>;
+  unresolvedRemoteIdentity: boolean;
+  remotePathById: FolderStatePlanViewInputV2["state"]["remotePathById"];
+  candidates: PlannedCandidate[];
+}
+
+/**
+ * Remote folders nobody claimed: a local file at the same identity is a type
+ * conflict, otherwise the folder becomes `create-local` unless the remote
+ * identity is still unresolved. Extracted verbatim from
+ * `planFolderStateFromViewV2`（2026-10-16 第二期类内分解，逐 token 等价）。
+ */
+function planUnanchoredRemoteFolderCandidatesV2({
+  input, preserveFolderPath, includeFolderPath, anchoredRemoteIds, remoteFoldersByIdentity,
+  localFoldersByIdentity, localFilesByIdentity, unresolvedRemoteIdentity, remotePathById,
+  candidates,
+}: UnanchoredRemoteFolderPlanInputV2): void {
   for (const [key, remoteFolder] of remoteFoldersByIdentity) {
     if (preserveFolderPath(remoteFolder.path)) continue;
     if (!includeFolderPath(remoteFolder.path)) continue;
@@ -417,17 +545,6 @@ export function planFolderStateFromViewV2(
       ));
     }
   }
-
-  const collapsed = collapseCoveredMoves(candidates)
-    .sort(comparePlanCandidate);
-  return {
-    version: 1,
-    status: "planned",
-    items: collapsed.map(({ coverage: _coverage, ...item }) => item),
-    counts: countActions(collapsed),
-    reviewImpact: calculateReviewImpact(collapsed, input, remotePathById),
-    mutations: [],
-  };
 }
 
 interface AnchorLocalEvidenceInputV2 {
@@ -590,41 +707,15 @@ function planAnchoredFolderCandidatesV2(args: {
 
     const trashDeleteTarget = localTrashDeletes.get(anchor.remoteId);
     if (trashDeleteTarget !== undefined && remotePath !== undefined) {
-      if (!includeFolderPath(anchor.lastPath)) {
-        // The anchor's old path has since left the sync scope (e.g. a scope
-        // narrowing). Scope narrowing never deletes cloud content, so stay
-        // fail-closed as a scope crossing for the existing review surface.
-        candidates.push(conflictCandidate(
-          anchor.lastPath,
-          "scope-crossing",
-          anchor.remoteId,
-          [
-            { side: "local", root: trashDeleteTarget },
-            { side: "remote", root: remotePath },
-          ],
-          input,
-          remotePathById,
-        ));
-      } else {
-        // Local folder was moved into the vault trash == local deletion.
-        // Mirror it on the remote like the file layer already does; the
-        // deletion chain (If-Match → OneDrive recycle bin → read-back) is the
-        // established safety net. When the remote folder is gone too, fall
-        // through to the ordinary both-sides retirement path below.
-        candidates.push(actionCandidate(
-          "delete-remote",
-          anchor.lastPath,
-          anchor.lastPath,
-          undefined,
-          anchor.remoteId,
-          [
-            { side: "local", root: trashDeleteTarget },
-            { side: "remote", root: remotePath },
-          ],
-          input,
-          remotePathById,
-        ));
-      }
+      planAnchoredFolderTrashDeleteV2({
+        anchor,
+        trashDeleteTarget,
+        remotePath,
+        includeFolderPath,
+        input,
+        remotePathById,
+        candidates,
+      });
       continue;
     }
 
@@ -661,78 +752,17 @@ function planAnchoredFolderCandidatesV2(args: {
     }
 
     if (!remotePath) {
-      if (
-        !includeFolderPath(anchor.lastPath)
-        || (inferredLocalPath !== undefined && !includeFolderPath(inferredLocalPath))
-      ) {
-        candidates.push(conflictCandidate(
-          anchor.lastPath,
-          "scope-crossing",
-          anchor.remoteId,
-          inferredLocalPath ? [{ side: "local", root: inferredLocalPath }] : [],
-          input,
-          remotePathById,
-        ));
-        continue;
-      }
-      // F24 (GitHub #21): the tracked cloud folder is gone, but a *different*
-      // live folder may now sit at the same path while the local folder never
-      // moved. When that folder still carries descendant file anchors, the
-      // dead end is real (the kept members make the shell non-empty, so the
-      // existing delete row can neither be confirmed nor rejected) and the
-      // same-path pair belongs to the established unanchored shared-folder
-      // chain: descendant-evidence reconstruction first, explicit
-      // confirmation as the fallback. Without descendant anchors there is no
-      // evidence machinery to hand it to, so the ordinary remote-deletion
-      // reading (and its scope-expansion family behaviours) stays untouched.
-      // The remote index is complete here (planner-state precondition), so
-      // absence by exact id is proof of retirement; a live anchor at the path
-      // keeps this closed.
-      const shadowFolder = remoteFoldersByIdentity.get(
-        identityPath(anchor.lastPath),
-      );
-      if (inferredLocalPath && nfcPath(inferredLocalPath) !== nfcPath(anchor.lastPath)) {
-        unresolvedRemoteIdentity = true;
-        candidates.push(conflictCandidate(
-          anchor.lastPath,
-          "anchored-folder-missing-remote",
-          anchor.remoteId,
-          [{ side: "local", root: inferredLocalPath }],
-          input,
-          remotePathById,
-        ));
-      } else if (
-        inferredLocalPath
-        && shadowFolder
-        && !anchoredRemoteIds.has(shadowFolder.id)
-        && input.state.fileAnchors.some((fileAnchor) =>
-          isDescendant(fileAnchor.lastPath, anchor.lastPath))
-      ) {
-        candidates.push(conflictCandidate(
-          anchor.lastPath,
-          "unanchored-shared-folder",
-          shadowFolder.id,
-          [
-            { side: "local", root: inferredLocalPath },
-            { side: "remote", root: shadowFolder.path },
-          ],
-          input,
-          remotePathById,
-        ));
-      } else {
-        candidates.push(actionCandidate(
-          "delete-local",
-          anchor.lastPath,
-          anchor.lastPath,
-          undefined,
-          anchor.remoteId,
-          inferredLocalPath
-            ? [{ side: "local", root: inferredLocalPath }]
-            : [],
-          input,
-          remotePathById,
-        ));
-      }
+      unresolvedRemoteIdentity = planAnchoredFolderMissingRemoteV2({
+        anchor,
+        inferredLocalPath,
+        includeFolderPath,
+        remoteFoldersByIdentity,
+        anchoredRemoteIds,
+        input,
+        remotePathById,
+        unresolvedRemoteIdentity,
+        candidates,
+      }).unresolvedRemoteIdentity;
       continue;
     }
     if (!inferredLocalPath) {
@@ -788,66 +818,24 @@ function planAnchoredFolderCandidatesV2(args: {
       continue;
     }
 
-    const localSubtreeComparison = compareLocalSubtreeToAnchors(
-      anchor.lastPath,
+    const {
+      localUnchanged,
+      localTopologyMoveSafe,
+      localCompositionSafe,
+      remoteUnchanged,
+      remoteTopologyMoveSafe,
+    } = inspectAnchoredFolderSubtreesV2({
+      anchor,
       inferredLocalPath,
-      input.state,
-      input.localFiles,
-      input.localFolders,
-      includeFilePath,
-      includeFolderPath,
-    );
-    const localUnchanged = localSubtreeComparison.contentMatches;
-    const hasExactLocalMoveHint = validLocalMoveHints.some(
-      (hint) => hint.remoteId === anchor.remoteId
-        && nfcPath(hint.fromPath) === nfcPath(anchor.lastPath)
-        && nfcPath(hint.toPath) === nfcPath(inferredLocalPath),
-    );
-    const hasSupportedLocalMoveHint = hasExactLocalMoveHint
-      || validLocalMoveHints.some((hint) => (
-        isDescendant(anchor.lastPath, hint.fromPath)
-        && nfcPath(translatePath(
-          anchor.lastPath,
-          hint.fromPath,
-          hint.toPath,
-        )) === nfcPath(inferredLocalPath)
-      ));
-    // Exact TFolder evidence settles the root identity independently from its
-    // current members. The canonical folder root protects every descendant
-    // until the folder checkpoint, then the ordinary planner reads the new
-    // active topology and reconciles added, removed, or changed members.
-    const localTopologyMoveSafe = !localUnchanged
-      && localMoved
-      && !remoteMoved
-      && hasExactLocalMoveHint;
-    const localCompositionSafe = !localUnchanged
-      && localMoved
-      && !remoteMoved
-      && hasSupportedLocalMoveHint
-      && localSubtreeDiffIsAnchoredIncomingMoves(
-        anchor,
-        inferredLocalPath,
-        input.state,
-        input.localFiles,
-        input.localFolders,
-        includeFilePath,
-        includeFolderPath,
-      );
-    const remoteUnchanged = remoteSubtreeMatchesAnchors(
-      anchor.lastPath,
       remotePath,
-      input.state,
-      remotePathById,
+      localMoved,
+      remoteMoved,
+      validLocalMoveHints,
       includeFilePath,
       includeFolderPath,
-    );
-    // The remote folder ID is the exact identity evidence for its root move.
-    // Descendant changes do not invalidate that root identity: the protected
-    // folder checkpoint moves the local tree first, then the ordinary planner
-    // re-reads and reconciles the descendants under the committed target.
-    const remoteTopologyMoveSafe = !remoteUnchanged
-      && remoteMoved
-      && !localMoved;
+      input,
+      remotePathById,
+    });
     if (!localUnchanged && !localTopologyMoveSafe && !localCompositionSafe) {
       candidates.push(conflictCandidate(
         anchor.lastPath,
@@ -872,85 +860,29 @@ function planAnchoredFolderCandidatesV2(args: {
     }
 
     if (remoteMoved) {
-      const targetKey = identityPath(remotePath);
-      if (localFoldersByIdentity.has(targetKey) || localFilesByIdentity.has(targetKey)) {
-        candidates.push(conflictCandidate(
-          anchor.lastPath,
-          "target-occupied",
-          anchor.remoteId,
-          [
-            { side: "local", root: inferredLocalPath },
-            { side: "remote", root: remotePath },
-          ],
-          input,
-          remotePathById,
-        ));
-        continue;
-      }
-      if (!localParentExists(remotePath, localFoldersByIdentity)
-        && !plannedParentMoveExists("move-local", remotePath, candidates)) {
-        candidates.push(conflictCandidate(
-          anchor.lastPath,
-          "parent-chain-incomplete",
-          anchor.remoteId,
-          [{ side: "remote", root: remotePath }],
-          input,
-          remotePathById,
-        ));
-        continue;
-      }
-      candidates.push(actionCandidate(
-        "move-local",
+      planAnchoredFolderRemoteMoveV2({
+        anchor,
         remotePath,
-        anchor.lastPath,
-        remotePath,
-        anchor.remoteId,
-        [{ side: "local", root: anchor.lastPath }],
+        inferredLocalPath,
+        localFoldersByIdentity,
+        localFilesByIdentity,
         input,
         remotePathById,
-      ));
+        candidates,
+      });
       continue;
     }
 
-    const targetKey = identityPath(inferredLocalPath);
-    const occupiedRemote = remoteFoldersByIdentity.get(targetKey)
-      ?? remoteFilesByIdentity.get(targetKey);
-    if (occupiedRemote) {
-      candidates.push(conflictCandidate(
-        anchor.lastPath,
-        "target-occupied",
-        anchor.remoteId,
-        [
-          { side: "local", root: inferredLocalPath },
-          { side: "remote", root: remotePath },
-        ],
-        input,
-        remotePathById,
-      ));
-      continue;
-    }
-    if (!remoteParentExists(inferredLocalPath, remoteFoldersByIdentity)
-      && !plannedParentMoveExists("move-remote", inferredLocalPath, candidates)) {
-      candidates.push(conflictCandidate(
-        anchor.lastPath,
-        "parent-chain-incomplete",
-        anchor.remoteId,
-        [{ side: "local", root: inferredLocalPath }],
-        input,
-        remotePathById,
-      ));
-      continue;
-    }
-    candidates.push(actionCandidate(
-      "move-remote",
+    planAnchoredFolderLocalMoveV2({
+      anchor,
       inferredLocalPath,
-      anchor.lastPath,
-      inferredLocalPath,
-      anchor.remoteId,
-      [{ side: "remote", root: anchor.lastPath }],
+      remotePath,
+      remoteFoldersByIdentity,
+      remoteFilesByIdentity,
       input,
       remotePathById,
-    ));
+      candidates,
+    });
   }
 
   return { unresolvedLocalIdentity, unresolvedRemoteIdentity };
@@ -965,6 +897,390 @@ function planAnchoredFolderCandidatesV2(args: {
  * next anchor; the returned flag carries the local-identity verdict back to
  * the shared fail-closed flags.
  */
+interface AnchoredFolderLocalMoveInputV2 {
+  anchor: FolderAnchorV2;
+  inferredLocalPath: string;
+  remotePath: string;
+  remoteFoldersByIdentity: ReadonlyMap<string, { id: string; path: string }>;
+  remoteFilesByIdentity: ReadonlyMap<string, { id: string; path: string }>;
+  input: FolderStatePlanViewInputV2;
+  remotePathById: FolderStatePlanViewInputV2["state"]["remotePathById"];
+  candidates: PlannedCandidate[];
+}
+
+/**
+ * The local folder moved (the remote one did not): refuse when the remote target
+ * path is occupied or its parent chain is incomplete, otherwise mirror the move
+ * remotely. Extracted verbatim from `planAnchoredFolderCandidatesV2`
+ * （2026-10-16 第二期类内分解；块内两处 `continue;` 改为 `return;`，块尾 `continue;`
+ * 由循环自然结束接管，其余逐字符未改）。
+ */
+function planAnchoredFolderLocalMoveV2({
+  anchor, inferredLocalPath, remotePath, remoteFoldersByIdentity, remoteFilesByIdentity,
+  input, remotePathById, candidates,
+}: AnchoredFolderLocalMoveInputV2): void {
+  const targetKey = identityPath(inferredLocalPath);
+  const occupiedRemote = remoteFoldersByIdentity.get(targetKey)
+    ?? remoteFilesByIdentity.get(targetKey);
+  if (occupiedRemote) {
+    candidates.push(conflictCandidate(
+      anchor.lastPath,
+      "target-occupied",
+      anchor.remoteId,
+      [
+        { side: "local", root: inferredLocalPath },
+        { side: "remote", root: remotePath },
+      ],
+      input,
+      remotePathById,
+    ));
+    return;
+  }
+  if (!remoteParentExists(inferredLocalPath, remoteFoldersByIdentity)
+    && !plannedParentMoveExists("move-remote", inferredLocalPath, candidates)) {
+    candidates.push(conflictCandidate(
+      anchor.lastPath,
+      "parent-chain-incomplete",
+      anchor.remoteId,
+      [{ side: "local", root: inferredLocalPath }],
+      input,
+      remotePathById,
+    ));
+    return;
+  }
+  candidates.push(actionCandidate(
+    "move-remote",
+    inferredLocalPath,
+    anchor.lastPath,
+    inferredLocalPath,
+    anchor.remoteId,
+    [{ side: "remote", root: anchor.lastPath }],
+    input,
+    remotePathById,
+  ));
+}
+
+interface AnchoredFolderSubtreeInspectionInputV2 {
+  anchor: FolderAnchorV2;
+  inferredLocalPath: string;
+  remotePath: string;
+  localMoved: boolean;
+  remoteMoved: boolean;
+  validLocalMoveHints: readonly LocalFolderMoveHintV1[];
+  includeFilePath: (path: string) => boolean;
+  includeFolderPath: (path: string) => boolean;
+  input: FolderStatePlanViewInputV2;
+  remotePathById: FolderStatePlanViewInputV2["state"]["remotePathById"];
+}
+
+interface AnchoredFolderSubtreeInspectionV2 {
+  localUnchanged: boolean;
+  localTopologyMoveSafe: boolean;
+  localCompositionSafe: boolean;
+  remoteUnchanged: boolean;
+  remoteTopologyMoveSafe: boolean;
+}
+
+/**
+ * Inspect both subtrees for one anchor whose sides moved: whether the local and
+ * remote subtrees still match the committed anchors, and whether the move is
+ * still safe on identity grounds (exact TFolder evidence / supported move hints
+ * on the local side, remote folder ID on the remote side). Extracted verbatim
+ * from `planAnchoredFolderCandidatesV2`（2026-10-16 第二期类内分解，逐 token 等价）。
+ */
+function inspectAnchoredFolderSubtreesV2({
+  anchor, inferredLocalPath, remotePath, localMoved, remoteMoved, validLocalMoveHints,
+  includeFilePath, includeFolderPath, input, remotePathById,
+}: AnchoredFolderSubtreeInspectionInputV2): AnchoredFolderSubtreeInspectionV2 {
+  const localSubtreeComparison = compareLocalSubtreeToAnchors(
+    anchor.lastPath,
+    inferredLocalPath,
+    input.state,
+    input.localFiles,
+    input.localFolders,
+    includeFilePath,
+    includeFolderPath,
+  );
+  const localUnchanged = localSubtreeComparison.contentMatches;
+  const hasExactLocalMoveHint = validLocalMoveHints.some(
+    (hint) => hint.remoteId === anchor.remoteId
+      && nfcPath(hint.fromPath) === nfcPath(anchor.lastPath)
+      && nfcPath(hint.toPath) === nfcPath(inferredLocalPath),
+  );
+  const hasSupportedLocalMoveHint = hasExactLocalMoveHint
+    || validLocalMoveHints.some((hint) => (
+      isDescendant(anchor.lastPath, hint.fromPath)
+      && nfcPath(translatePath(
+        anchor.lastPath,
+        hint.fromPath,
+        hint.toPath,
+      )) === nfcPath(inferredLocalPath)
+    ));
+  // Exact TFolder evidence settles the root identity independently from its
+  // current members. The canonical folder root protects every descendant
+  // until the folder checkpoint, then the ordinary planner reads the new
+  // active topology and reconciles added, removed, or changed members.
+  const localTopologyMoveSafe = !localUnchanged
+    && localMoved
+    && !remoteMoved
+    && hasExactLocalMoveHint;
+  const localCompositionSafe = !localUnchanged
+    && localMoved
+    && !remoteMoved
+    && hasSupportedLocalMoveHint
+    && localSubtreeDiffIsAnchoredIncomingMoves(
+      anchor,
+      inferredLocalPath,
+      input.state,
+      input.localFiles,
+      input.localFolders,
+      includeFilePath,
+      includeFolderPath,
+    );
+  const remoteUnchanged = remoteSubtreeMatchesAnchors(
+    anchor.lastPath,
+    remotePath,
+    input.state,
+    remotePathById,
+    includeFilePath,
+    includeFolderPath,
+  );
+  // The remote folder ID is the exact identity evidence for its root move.
+  // Descendant changes do not invalidate that root identity: the protected
+  // folder checkpoint moves the local tree first, then the ordinary planner
+  // re-reads and reconciles the descendants under the committed target.
+  const remoteTopologyMoveSafe = !remoteUnchanged
+    && remoteMoved
+    && !localMoved;
+
+  return {
+    localUnchanged,
+    localTopologyMoveSafe,
+    localCompositionSafe,
+    remoteUnchanged,
+    remoteTopologyMoveSafe,
+  };
+}
+
+interface AnchoredFolderRemoteMoveInputV2 {
+  anchor: FolderAnchorV2;
+  remotePath: string;
+  inferredLocalPath: string;
+  localFoldersByIdentity: ReadonlyMap<string, string>;
+  localFilesByIdentity: ReadonlyMap<string, LocalFileEntry>;
+  input: FolderStatePlanViewInputV2;
+  remotePathById: FolderStatePlanViewInputV2["state"]["remotePathById"];
+  candidates: PlannedCandidate[];
+}
+
+/**
+ * The cloud folder moved while the local one did not: refuse when the local
+ * target path is occupied or its parent chain is incomplete, otherwise mirror
+ * the move locally. Extracted verbatim from `planAnchoredFolderCandidatesV2`
+ * （2026-10-16 第二期类内分解；块内两处 `continue;` 改为 `return;`，块尾一处
+ * `continue;` 由调用点接管，其余逐字符未改）。
+ */
+function planAnchoredFolderRemoteMoveV2({
+  anchor, remotePath, inferredLocalPath, localFoldersByIdentity, localFilesByIdentity,
+  input, remotePathById, candidates,
+}: AnchoredFolderRemoteMoveInputV2): void {
+  const targetKey = identityPath(remotePath);
+  if (localFoldersByIdentity.has(targetKey) || localFilesByIdentity.has(targetKey)) {
+    candidates.push(conflictCandidate(
+      anchor.lastPath,
+      "target-occupied",
+      anchor.remoteId,
+      [
+        { side: "local", root: inferredLocalPath },
+        { side: "remote", root: remotePath },
+      ],
+      input,
+      remotePathById,
+    ));
+    return;
+  }
+  if (!localParentExists(remotePath, localFoldersByIdentity)
+    && !plannedParentMoveExists("move-local", remotePath, candidates)) {
+    candidates.push(conflictCandidate(
+      anchor.lastPath,
+      "parent-chain-incomplete",
+      anchor.remoteId,
+      [{ side: "remote", root: remotePath }],
+      input,
+      remotePathById,
+    ));
+    return;
+  }
+  candidates.push(actionCandidate(
+    "move-local",
+    remotePath,
+    anchor.lastPath,
+    remotePath,
+    anchor.remoteId,
+    [{ side: "local", root: anchor.lastPath }],
+    input,
+    remotePathById,
+  ));
+}
+
+interface AnchoredFolderTrashDeleteInputV2 {
+  anchor: FolderAnchorV2;
+  trashDeleteTarget: string;
+  remotePath: string;
+  includeFolderPath: (path: string) => boolean;
+  input: FolderStatePlanViewInputV2;
+  remotePathById: FolderStatePlanViewInputV2["state"]["remotePathById"];
+  candidates: PlannedCandidate[];
+}
+
+/**
+ * The local folder was moved into the vault trash while the cloud copy still
+ * exists: mirror the deletion remotely (or, when the anchor's old path has left
+ * the sync scope, stay fail-closed as a scope crossing). Extracted verbatim from
+ * `planAnchoredFolderCandidatesV2`（2026-10-16 第二期类内分解；仅把块尾的
+ * `continue;` 留在调用点）。
+ */
+function planAnchoredFolderTrashDeleteV2({
+  anchor, trashDeleteTarget, remotePath, includeFolderPath, input, remotePathById,
+  candidates,
+}: AnchoredFolderTrashDeleteInputV2): void {
+  if (!includeFolderPath(anchor.lastPath)) {
+    // The anchor's old path has since left the sync scope (e.g. a scope
+    // narrowing). Scope narrowing never deletes cloud content, so stay
+    // fail-closed as a scope crossing for the existing review surface.
+    candidates.push(conflictCandidate(
+      anchor.lastPath,
+      "scope-crossing",
+      anchor.remoteId,
+      [
+        { side: "local", root: trashDeleteTarget },
+        { side: "remote", root: remotePath },
+      ],
+      input,
+      remotePathById,
+    ));
+  } else {
+    // Local folder was moved into the vault trash == local deletion.
+    // Mirror it on the remote like the file layer already does; the
+    // deletion chain (If-Match → OneDrive recycle bin → read-back) is the
+    // established safety net. When the remote folder is gone too, fall
+    // through to the ordinary both-sides retirement path below.
+    candidates.push(actionCandidate(
+      "delete-remote",
+      anchor.lastPath,
+      anchor.lastPath,
+      undefined,
+      anchor.remoteId,
+      [
+        { side: "local", root: trashDeleteTarget },
+        { side: "remote", root: remotePath },
+      ],
+      input,
+      remotePathById,
+    ));
+  }
+}
+
+interface AnchoredFolderMissingRemoteInputV2 {
+  anchor: FolderAnchorV2;
+  inferredLocalPath: string | undefined;
+  includeFolderPath: (path: string) => boolean;
+  remoteFoldersByIdentity: ReadonlyMap<string, { id: string; path: string }>;
+  anchoredRemoteIds: ReadonlySet<string>;
+  input: FolderStatePlanViewInputV2;
+  remotePathById: FolderStatePlanViewInputV2["state"]["remotePathById"];
+  unresolvedRemoteIdentity: boolean;
+  candidates: PlannedCandidate[];
+}
+
+/**
+ * The tracked cloud folder is gone (or unreadable) while the local side still
+ * has evidence: scope crossing stays fail-closed, a divergent inferred local
+ * path marks the remote identity unresolved, a live same-path folder with
+ * descendant anchors hands over to the unanchored shared-folder chain, and
+ * otherwise the folder is retired locally. Extracted verbatim from
+ * `planAnchoredFolderCandidatesV2`（2026-10-16 第二期类内分解；块内两处
+ * `continue;` 改为返回值，其余逐字符未改）。
+ */
+function planAnchoredFolderMissingRemoteV2({
+  anchor, inferredLocalPath, includeFolderPath, remoteFoldersByIdentity, anchoredRemoteIds,
+  input, remotePathById, unresolvedRemoteIdentity, candidates,
+}: AnchoredFolderMissingRemoteInputV2): { unresolvedRemoteIdentity: boolean } {
+  if (
+    !includeFolderPath(anchor.lastPath)
+    || (inferredLocalPath !== undefined && !includeFolderPath(inferredLocalPath))
+  ) {
+    candidates.push(conflictCandidate(
+      anchor.lastPath,
+      "scope-crossing",
+      anchor.remoteId,
+      inferredLocalPath ? [{ side: "local", root: inferredLocalPath }] : [],
+      input,
+      remotePathById,
+    ));
+    return { unresolvedRemoteIdentity };
+  }
+  // F24 (GitHub #21): the tracked cloud folder is gone, but a *different*
+  // live folder may now sit at the same path while the local folder never
+  // moved. When that folder still carries descendant file anchors, the
+  // dead end is real (the kept members make the shell non-empty, so the
+  // existing delete row can neither be confirmed nor rejected) and the
+  // same-path pair belongs to the established unanchored shared-folder
+  // chain: descendant-evidence reconstruction first, explicit
+  // confirmation as the fallback. Without descendant anchors there is no
+  // evidence machinery to hand it to, so the ordinary remote-deletion
+  // reading (and its scope-expansion family behaviours) stays untouched.
+  // The remote index is complete here (planner-state precondition), so
+  // absence by exact id is proof of retirement; a live anchor at the path
+  // keeps this closed.
+  const shadowFolder = remoteFoldersByIdentity.get(
+    identityPath(anchor.lastPath),
+  );
+  if (inferredLocalPath && nfcPath(inferredLocalPath) !== nfcPath(anchor.lastPath)) {
+    unresolvedRemoteIdentity = true;
+    candidates.push(conflictCandidate(
+      anchor.lastPath,
+      "anchored-folder-missing-remote",
+      anchor.remoteId,
+      [{ side: "local", root: inferredLocalPath }],
+      input,
+      remotePathById,
+    ));
+  } else if (
+    inferredLocalPath
+    && shadowFolder
+    && !anchoredRemoteIds.has(shadowFolder.id)
+    && input.state.fileAnchors.some((fileAnchor) =>
+      isDescendant(fileAnchor.lastPath, anchor.lastPath))
+  ) {
+    candidates.push(conflictCandidate(
+      anchor.lastPath,
+      "unanchored-shared-folder",
+      shadowFolder.id,
+      [
+        { side: "local", root: inferredLocalPath },
+        { side: "remote", root: shadowFolder.path },
+      ],
+      input,
+      remotePathById,
+    ));
+  } else {
+    candidates.push(actionCandidate(
+      "delete-local",
+      anchor.lastPath,
+      anchor.lastPath,
+      undefined,
+      anchor.remoteId,
+      inferredLocalPath
+        ? [{ side: "local", root: inferredLocalPath }]
+        : [],
+      input,
+      remotePathById,
+    ));
+  }
+  return { unresolvedRemoteIdentity };
+}
+
 function planAnchoredFolderMissingLocalV2(args: {
   anchor: FolderAnchorV2;
   remotePath: string;

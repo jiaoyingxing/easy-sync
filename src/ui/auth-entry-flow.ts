@@ -10,19 +10,19 @@ import {
   type EasySyncNoticeCenter,
 } from "./notice-center";
 
-export type AuthEntryLabelKey =
+type AuthEntryLabelKey =
   | "settings.account.checking"
   | "settings.account.confirmAfterBrowser"
   | "settings.account.resumeDevice"
   | "settings.account.login";
 
-export type AuthEntryDescriptionKey =
+type AuthEntryDescriptionKey =
   | "settings.account.desc.connecting"
   | "settings.account.desc.pending"
   | "settings.account.desc.devicePending"
   | "settings.account.desc.notLoggedIn";
 
-export interface AuthEntryPresentation {
+interface AuthEntryPresentation {
   labelKey: AuthEntryLabelKey;
   descriptionKey: AuthEntryDescriptionKey;
   disabled: boolean;

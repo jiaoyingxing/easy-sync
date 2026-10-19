@@ -81,7 +81,7 @@ export function isIndexedDbVaultInstanceId(
   return typeof value === "string" && VAULT_INSTANCE_ID_PATTERN.test(value);
 }
 
-export function createIndexedDbVaultInstanceId(): string {
+function createIndexedDbVaultInstanceId(): string {
   const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   return [...bytes]

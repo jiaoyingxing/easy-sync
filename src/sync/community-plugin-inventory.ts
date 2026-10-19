@@ -33,7 +33,7 @@ export interface CommunityPluginInventoryItem {
   dataHistoricallyPresent?: boolean;
 }
 
-export interface CommunityPluginRemoteManifestEvidence {
+interface CommunityPluginRemoteManifestEvidence {
   scope: Readonly<SyncScope>;
   observations: readonly Readonly<CommunityPluginManifestObservationV1>[];
 }

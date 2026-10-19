@@ -26,7 +26,7 @@ import {
   type SyncScope,
 } from "./types";
 
-export interface RemoteScopeRecoveryCandidateInputV2 {
+interface RemoteScopeRecoveryCandidateInputV2 {
   sourceEnvelope: SyncStateEnvelopeV2;
   observedScope: SyncScope;
   localScanComplete: boolean;
@@ -46,7 +46,7 @@ export interface RemoteScopeRecoveryCandidateInputV2 {
   now?: number;
 }
 
-export interface RemoteScopeRecoveryFactsV2 {
+interface RemoteScopeRecoveryFactsV2 {
   fileAnchorsPreservedById: number;
   fileAnchorsReboundByContent: number;
   fileAnchorsRefreshedEqual: number;
@@ -58,7 +58,7 @@ export interface RemoteScopeRecoveryFactsV2 {
   folderAnchorsRetired: number;
 }
 
-export interface RemoteScopeRecoveryCandidateResultV2 {
+interface RemoteScopeRecoveryCandidateResultV2 {
   status: "ready" | "aborted";
   reason?:
     | "source-not-held"

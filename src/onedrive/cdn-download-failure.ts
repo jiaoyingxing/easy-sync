@@ -14,7 +14,7 @@
  * vocabulary stays "unknown" — the staging is evidence, not a guess.
  */
 
-export type CdnDownloadFailureStage =
+type CdnDownloadFailureStage =
   /** No error object. */
   | "none"
   /** An HTTP status was received (the error carries status > 0). */
@@ -92,7 +92,7 @@ export function cdnHostOfDownloadUrl(url: string): string | null {
   }
 }
 
-export interface CdnDownloadFailureFingerprint {
+interface CdnDownloadFailureFingerprint {
   stage: CdnDownloadFailureStage;
   /** Generic pre-signed host example: my.microsoftpersonalcontent.com — no
    *  URL, query, token or account identifier. */

@@ -9,7 +9,7 @@
 import { type App } from "obsidian";
 import { EasySyncModal } from "./easy-sync-modal";
 
-export type ScopeCrossingPromptChoice = "restore" | "confirm";
+type ScopeCrossingPromptChoice = "restore" | "confirm";
 
 export class ScopeCrossingPromptModal extends EasySyncModal {
   private resolve: ((choice: ScopeCrossingPromptChoice | null) => void) | null =

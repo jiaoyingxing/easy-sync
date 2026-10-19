@@ -945,6 +945,7 @@ const zhCN: LocaleStrings = {
   "mutationRecovery.reason.unknown": "现有证据仍不足以确认结果",
   "syncView.issues.title": "需要处理 {count}",
   "syncView.issues.openFile": "打开文件",
+  "syncView.itemTermination.nonRetryable": "EasySync 连续两次同步看到这一项没有任何变化，当前版本尚不能安全完成它；在它出现新变化之前，再次同步不会得到不同结果。如需反馈，请导出诊断报告发送给作者。",
   "syncView.collapseAll": "全部折叠",
   "syncView.expandAll": "全部展开",
   "syncView.history.title": "同步历史",

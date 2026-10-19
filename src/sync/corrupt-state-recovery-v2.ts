@@ -27,7 +27,7 @@ import type {
   LocalFolderEntry,
 } from "./types";
 
-export interface CorruptStateRecoveryCandidateInputV2 {
+interface CorruptStateRecoveryCandidateInputV2 {
   source: StateEnvelopeV2CorruptionEvidence;
   localScanComplete: boolean;
   localFolderScanComplete: boolean;
@@ -47,7 +47,7 @@ export interface CorruptStateRecoveryCandidateInputV2 {
   now?: number;
 }
 
-export interface CorruptStateRecoveryFactsV2 {
+interface CorruptStateRecoveryFactsV2 {
   sourceAnchorsUsable: boolean;
   fileAnchorsPreservedById: number;
   fileAnchorsReboundByContent: number;
@@ -62,7 +62,7 @@ export interface CorruptStateRecoveryFactsV2 {
   ancestorReferencesDropped: number;
 }
 
-export interface CorruptStateRecoveryCandidateResultV2 {
+interface CorruptStateRecoveryCandidateResultV2 {
   status: "ready" | "aborted";
   reason?:
     | "source-digest-mismatch"

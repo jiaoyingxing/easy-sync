@@ -5,7 +5,7 @@ import type {
   MutationRecoveryHistory,
 } from "../sync/types";
 
-export type MutationRecoveryDisplayKind =
+type MutationRecoveryDisplayKind =
   | "checking"
   | "waiting-network"
   | "blocked";
@@ -104,7 +104,7 @@ export function mutationRecoveryTopStatusLabel(
   return mutationRecoveryStatusLabel(state, t);
 }
 
-export interface MutationRecoveryBodyPresentation {
+interface MutationRecoveryBodyPresentation {
   summary: string;
   path: string | null;
   reason: string | null;
@@ -140,10 +140,21 @@ export function mutationRecoveryPrimaryActionKey(
   return null;
 }
 
+/**
+ * Body copy for one recovery state.
+ *
+ * `options.nonRetryable` (S4 终止判据接线, docs 2026-10-16 §六 S4): the blocked
+ * record's facts were identical across two consecutive observed rounds and it
+ * has no live exit, so the "temporarily cannot be confirmed automatically"
+ * line is false — it is replaced by the one terminal diagnosis line. The
+ * caller resolves that flag from the executor's verdict; no eligibility rule
+ * is re-derived here, and every other state keeps its copy untouched.
+ */
 export function mutationRecoveryBodyPresentation(
   state: Readonly<MutationRecoveryDisplayState>,
   t: Translator,
   formatTime: (timestamp: number) => string,
+  options?: { nonRetryable?: boolean },
 ): MutationRecoveryBodyPresentation {
   if (state.kind === "checking") {
     return {
@@ -171,7 +182,9 @@ export function mutationRecoveryBodyPresentation(
     ? "syncView.recovery.nextStep.review"
     : state.blockReason === "account-changed"
       ? "syncView.recovery.nextStep.accountChanged"
-      : "syncView.recovery.nextStep.blocked";
+      : options?.nonRetryable === true
+        ? "syncView.itemTermination.nonRetryable"
+        : "syncView.recovery.nextStep.blocked";
   return {
     summary: t(
       state.paused

@@ -50,7 +50,7 @@ export function readSyncDirection(value: unknown): SyncDirection {
   return value === "one-way" ? "one-way" : DEFAULT_SYNC_DIRECTION;
 }
 
-export function isOutboundUserContentAction(type: SyncActionType): boolean {
+function isOutboundUserContentAction(type: SyncActionType): boolean {
   return OUTBOUND_USER_CONTENT_ACTIONS.has(type);
 }
 

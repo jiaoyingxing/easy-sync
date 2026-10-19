@@ -17,7 +17,7 @@ import type { App } from "obsidian";
  * dispatchSyncRun). Background automatic updates never enter that set, so
  * they can never flip an enablement state here.
  */
-export type CommunityPluginHostEnableOutcome =
+type CommunityPluginHostEnableOutcome =
   | { kind: "enabled" }
   | { kind: "fallback"; reason: string };
 

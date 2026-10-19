@@ -5,7 +5,7 @@ import {
   type SyncActionActivityKind,
 } from "../sync/sync-action-presentation";
 
-export type SyncActivityKind =
+type SyncActivityKind =
   | "starting"
   | "scanning"
   | "preparing"

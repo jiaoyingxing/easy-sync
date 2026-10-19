@@ -17,7 +17,7 @@ import {
 } from "./sync-action-presentation";
 
 /** High-level phase the sync is currently in */
-export type SyncPhase =
+type SyncPhase =
   | "idle"
   | "scanning"
   | "baseline"
@@ -42,7 +42,7 @@ export interface FileProgress {
   failedAt?: number;
 }
 
-export type RemoteScopeRecoveryFailureStage =
+type RemoteScopeRecoveryFailureStage =
   | "protocol-preflight"
   | "evidence-preflight"
   | "scan"
@@ -98,9 +98,9 @@ export interface SyncProgressState {
   startedAt: number;
 }
 
-export const MAX_SUCCESS_FILE_RECORDS = 100;
+const MAX_SUCCESS_FILE_RECORDS = 100;
 
-export function isProgressActivityRunning(state: Readonly<SyncProgressState>): boolean {
+function isProgressActivityRunning(state: Readonly<SyncProgressState>): boolean {
   return state.startedAt > 0 && state.phase !== "done";
 }
 

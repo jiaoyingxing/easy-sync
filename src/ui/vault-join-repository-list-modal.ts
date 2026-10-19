@@ -10,7 +10,7 @@ import { setIcon, type App } from "obsidian";
 import { EasySyncModal } from "./easy-sync-modal";
 import { NOTICE_PRIORITY, type EasySyncNoticeCenter } from "./notice-center";
 
-export interface VaultJoinRepositoryListViews {
+interface VaultJoinRepositoryListViews {
   title: string;
   guide: string;
   empty: string;

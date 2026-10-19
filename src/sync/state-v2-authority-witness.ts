@@ -31,7 +31,7 @@ export interface StateV2ActiveAuthorityWitness {
   protocolBinding?: SharedSyncProtocolBinding;
 }
 
-export interface StateV2IndexedDbStorageAuthorityV1 {
+interface StateV2IndexedDbStorageAuthorityV1 {
   schemaVersion: 1;
   kind: "indexeddb";
   databaseId: string;
@@ -41,7 +41,7 @@ export interface StateV2IndexedDbStorageAuthorityV1 {
   selectedAt: number;
 }
 
-export interface StateV2IndexedDbStorageAuthorityV2 {
+interface StateV2IndexedDbStorageAuthorityV2 {
   schemaVersion: 2;
   kind: "indexeddb";
   /** Copy of the current App-local identity used to detect cloned Vault files. */

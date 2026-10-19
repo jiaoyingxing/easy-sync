@@ -198,7 +198,9 @@ import {
   createPublic113BackupSnapshot,
   createPublic113MigrationInput,
   public113BackupSnapshotDigest,
-  public113MigrationInputDigest,
+  public113BackupSnapshotSemanticallyMatches,
+  public113MigrationInputDigestMatches,
+  public113MigrationInputDigestV2,
   type Public113MigrationInput,
 } from "./public-1-1-3-state-import";
 import {
@@ -297,7 +299,7 @@ export type V2StateLoadBlockReason =
   | "layout-migration-conflict"
   | "v2-state-load-failed";
 
-export interface V2StateLoadBlock {
+interface V2StateLoadBlock {
   version: 2;
   kind: "v2-state-load-block";
   authority: "v2" | "v1-precommit" | "unknown";
@@ -354,7 +356,7 @@ export class ConservativeResetBlockedError extends Error {
   }
 }
 
-export interface StateV2PreparedActivationInput {
+interface StateV2PreparedActivationInput {
   candidate: SyncStateEnvelopeV2;
   canonicalIdentity: CanonicalPlanIdentityV2;
   source: Public113MigrationInput;
@@ -362,12 +364,12 @@ export interface StateV2PreparedActivationInput {
   now?: number;
 }
 
-export interface SyncExclusionFolderSnapshot {
+interface SyncExclusionFolderSnapshot {
   hadPendingReview: boolean;
   remoteFolderPaths: string[];
 }
 
-export interface SyncScopeExpansionMarkerV1 {
+interface SyncScopeExpansionMarkerV1 {
   version: 1;
   kind: "sync-scope-expansion";
   revision: number;
@@ -388,7 +390,7 @@ export interface SyncScopeExpansionMarkerV1 {
   createdAt: number;
 }
 
-export interface SyncPathSettingsScopeChangeV1 {
+interface SyncPathSettingsScopeChangeV1 {
   previousSettingsFingerprint: string;
   targetSettingsFingerprint: string;
   expandedFolderPaths: readonly string[];
@@ -407,20 +409,20 @@ export interface SyncPathSettingsScopeChangeV1 {
   now?: number;
 }
 
-export type SyncScopeExpansionPreparation =
+type SyncScopeExpansionPreparation =
   | { status: "none" }
   | { status: "blocked"; revision: number }
   | { status: "ready"; revision: number };
 
-export type SyncScopeExpansionAcceptance =
+type SyncScopeExpansionAcceptance =
   | { status: "none" | "blocked" | "stale"; accepted: 0 }
   | { status: "accepted"; accepted: number };
 
-export type ReviewedSharedFolderIdentityAcceptance =
+type ReviewedSharedFolderIdentityAcceptance =
   | { status: "blocked" | "stale"; accepted: 0 }
   | { status: "accepted"; accepted: number };
 
-export type ReviewedStaleIdentityRetirement =
+type ReviewedStaleIdentityRetirement =
   | {
       status: "blocked" | "stale";
       retiredFileAnchors: 0;
@@ -432,7 +434,7 @@ export type ReviewedStaleIdentityRetirement =
       retiredFolderAnchors: number;
     };
 
-export type ReviewedFolderSubtreeRestoreAcceptance =
+type ReviewedFolderSubtreeRestoreAcceptance =
   | {
       status: "blocked" | "stale";
       retiredFileAnchors: 0;
@@ -444,7 +446,7 @@ export type ReviewedFolderSubtreeRestoreAcceptance =
       retiredFolderAnchors: number;
     };
 
-export type ConfirmedDescendantFolderAcceptance =
+type ConfirmedDescendantFolderAcceptance =
   | { status: "none" | "blocked"; accepted: 0; evidenceFiles: 0 }
   | {
       status: "rejected";
@@ -457,17 +459,17 @@ export type ConfirmedDescendantFolderAcceptance =
        *  superseded in the same state commit (audit trail). */
       supersededFolderRemoteIds?: string[] };
 
-export type ConfirmedDescendantFileEvidenceAcceptance =
+type ConfirmedDescendantFileEvidenceAcceptance =
   | { status: "none" | "blocked"; accepted: 0 }
   | { status: "accepted"; accepted: number };
 
-export interface ConfirmedDescendantFileReconstructionRootV1 {
+interface ConfirmedDescendantFileReconstructionRootV1 {
   path: string;
   remoteId: string;
   confirmedGeneration: number;
 }
 
-export interface ConfirmedDescendantFileReconstructionCheckpointV1 {
+interface ConfirmedDescendantFileReconstructionCheckpointV1 {
   version: 1;
   kind: "confirmed-descendant-file-reconstruction";
   scope: SyncScope;
@@ -477,7 +479,7 @@ export interface ConfirmedDescendantFileReconstructionCheckpointV1 {
   startedAt: number;
 }
 
-export type ConfirmedDescendantFileReconstructionPreparation =
+type ConfirmedDescendantFileReconstructionPreparation =
   | { status: "none" | "blocked"; roots: [] }
   | {
       status: "ready";
@@ -490,7 +492,7 @@ interface V2MigrationAuthorizationInput {
   canonicalIdentity: CanonicalPlanIdentityV2;
 }
 
-export interface MutationRecoveryQuarantineEntryV2 {
+interface MutationRecoveryQuarantineEntryV2 {
   version: 2;
   kind: "mutation-recovery-quarantine";
   operationId: string;
@@ -509,7 +511,7 @@ export interface MutationRecoveryQuarantineEntryV2 {
   record: MutationLedgerEntryV1;
 }
 
-export interface Public113AncestorPreparation {
+interface Public113AncestorPreparation {
   hashesByPath: Readonly<Record<string, string>>;
   sourceEntries: number;
   published: number;
@@ -519,7 +521,7 @@ export interface Public113AncestorPreparation {
 
 /** Audit of a user-authorized forced reset that terminated unresolved
  * mutation tracking (user resolution; remote data is never touched). */
-export interface MutationForceResetAuditV1 {
+interface MutationForceResetAuditV1 {
   at: number;
   ledgerCount: number;
   quarantineCount: number;
@@ -842,7 +844,7 @@ interface StateV2StorageAuthorityEvidenceBase {
   lifecycleEpoch: number;
 }
 
-export type StateV2StorageAuthorityEvidence =
+type StateV2StorageAuthorityEvidence =
   | (StateV2StorageAuthorityEvidenceBase & {
       kind: "json";
       databaseId: null;
@@ -3224,10 +3226,10 @@ export class StateManager {
   ): Promise<CanonicalPlannerStateV2 | null> {
     const factory = this.plugin.createPublic113IndexedDbCandidateStore;
     if (!factory) return null;
-    const requestedSourceDigest = await public113MigrationInputDigest(source);
+    const requestedSourceDigest = await public113MigrationInputDigestV2(source);
     const currentSource = await this.readPublic113MigrationInput();
     if (
-      await public113MigrationInputDigest(currentSource)
+      await public113MigrationInputDigestV2(currentSource)
       !== requestedSourceDigest
     ) {
       throw new Error(
@@ -3249,7 +3251,7 @@ export class StateManager {
       );
       const postPreparationSource = await this.readPublic113MigrationInput();
       const postPreparationDigest =
-        await public113MigrationInputDigest(postPreparationSource);
+        await public113MigrationInputDigestV2(postPreparationSource);
       if (postPreparationDigest !== requestedSourceDigest) {
         await store.delete();
         throw new Error(
@@ -3334,8 +3336,8 @@ export class StateManager {
     }
     const currentSource = await this.readPublic113MigrationInput();
     const [sourceDigest, currentDigest] = await Promise.all([
-      public113MigrationInputDigest(input.source),
-      public113MigrationInputDigest(currentSource),
+      public113MigrationInputDigestV2(input.source),
+      public113MigrationInputDigestV2(currentSource),
     ]);
     if (sourceDigest !== currentDigest) {
       throw new Error("Public 1.1.3 migration input changed before review");
@@ -3412,7 +3414,10 @@ export class StateManager {
         && backup.schemaVersion === 1
         && Number.isFinite(backup.createdAt)
         && "snapshot" in backup
-        && JSON.stringify(backup.snapshot) === JSON.stringify(snapshot);
+        && public113BackupSnapshotSemanticallyMatches(
+          backup.snapshot,
+          snapshot,
+        );
     } catch {
       return false;
     }
@@ -3430,7 +3435,16 @@ export class StateManager {
       paths.stateV2ManifestNextFile,
       paths.stateV1BackupFile,
     ]) {
-      if (await adapter.exists(path)) await adapter.remove(path);
+      if (await adapter.exists(path)) {
+        try {
+          await adapter.remove(path);
+        } catch {
+          // Best-effort discard: leftover artifacts are harmless to the
+          // already-settled manifest, and suspended Android mounts reject
+          // deletes intermittently (F31), so cleanup never blocks the
+          // newly activated V2 state.
+        }
+      }
     }
   }
 
@@ -5014,6 +5028,76 @@ export class StateManager {
           : "record shape is not an ordinary file recovery record";
         throw new Error(
           `Mutation receipt evidence is invalid (${gateReason}): ${receipt.operationId}`,
+        );
+      }
+      entries[index] = candidate;
+      return { ...current, [KEY_MUTATION_LEDGER]: entries };
+    });
+  }
+
+  /**
+   * Atomically re-spell one receipted rename's destination paths — intent.path
+   * plus the receipt's base/upsert path — to the committed index spelling of
+   * the moved identity. Every source-side path and every other field stays
+   * byte-identical.
+   *
+   * The upload parent rebase can rewrite its receipt alone because parentId
+   * lives outside the receipt-shape contract; a rename's receipt paths are
+   * pinned to the intent by `assertFileReceiptShapeV1`, so both durable halves
+   * must move in one write. Two writes would open a crash window in which the
+   * record is invalid under the shared admission gate.
+   *
+   * Fail-closed by construction: the expected path and receipt must still be
+   * the exact durable ones this decision was made from, and the rewritten
+   * record must still pass the ordinary-file recovery gate (which keeps the
+   * canonical source/target shape and the action/source pairing) before it is
+   * written.
+   */
+  async rebaseReceiptedRenameSpelling(input: {
+    expected: Readonly<MutationLedgerEntryV1>;
+    path: string;
+    receipt: MutationReceiptV1;
+  }): Promise<void> {
+    if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
+      throw new Error("Mutation spelling rebase requires active V2 authority");
+    }
+    if (this.mutationLedgerCorrupt) throw new Error("Mutation recovery ledger is corrupt");
+    const operationId = input.expected.intent.operationId;
+    await this.commitPluginData((current) => {
+      const index = findUniqueMutationLedgerRecordIndex(
+        current[KEY_MUTATION_LEDGER],
+        operationId,
+      );
+      if (index < 0) throw new Error(`Mutation intent missing: ${operationId}`);
+      const active = current[KEY_MUTATION_LEDGER][index];
+      if (
+        active.intent.path !== input.expected.intent.path
+        || JSON.stringify(active.receipt) !== JSON.stringify(input.expected.receipt)
+      ) {
+        throw new Error(`Mutation changed before its spelling rebase: ${operationId}`);
+      }
+      const entries = [...current[KEY_MUTATION_LEDGER]];
+      const candidate: MutationLedgerEntryV1 = {
+        ...active,
+        intent: { ...active.intent, path: input.path },
+        receipt: input.receipt,
+      };
+      const preparedCandidate = this.prepareMutationRecoveryRecord(
+        candidate,
+        this.v2Envelope!.scope,
+      );
+      if (
+        requiresOrdinaryFileRecoverySemanticGate(candidate)
+        && (
+          !preparedCandidate
+          || !isOrdinaryFileRecoveryRecord(
+            preparedCandidate,
+            this.v2Envelope!.scope,
+          )
+        )
+      ) {
+        throw new Error(
+          `Mutation spelling rebase evidence is invalid: ${operationId}`,
         );
       }
       entries[index] = candidate;
@@ -7556,8 +7640,6 @@ export class StateManager {
       throw new Error("V2 migration hold requires a sealed canonical plan");
     }
     const currentHold = this.activeV2MigrationHold;
-    const requestedSourceDigest =
-      await public113MigrationInputDigest(input.source);
     const sourceStateDigest =
       await this.reconcilePreManifestMigrationArtifacts({
         candidate: input.candidate,
@@ -7565,7 +7647,10 @@ export class StateManager {
         forceReplace: Boolean(
           currentHold
           && (
-            currentHold.sourceStateDigest !== requestedSourceDigest
+            !await public113MigrationInputDigestMatches(
+              input.source,
+              currentHold.sourceStateDigest,
+            )
             || migrationHoldReviewKindV2(currentHold) !== input.reviewKind
             || !sameCanonicalPlanIdentityV2(
               currentHold.canonicalIdentity,
@@ -7664,11 +7749,13 @@ export class StateManager {
       return false;
     }
     const source = await this.readPublic113MigrationInput();
-    const sourceStateDigest = await public113MigrationInputDigest(source);
     const currentHold = this.activeV2MigrationHold;
     return (
       this.matchesPendingV2MigrationAuthorization(input, currentHold)
-      && sourceStateDigest === currentHold.sourceStateDigest
+      && await public113MigrationInputDigestMatches(
+        source,
+        currentHold.sourceStateDigest,
+      )
     );
   }
 
@@ -7733,10 +7820,12 @@ export class StateManager {
       );
     }
     const source = await this.readPublic113MigrationInput();
-    const sourceStateDigest = await public113MigrationInputDigest(source);
     if (
       hold.candidate.meta.lifecycleEpoch !== source.lifecycleEpoch + 1
-      || sourceStateDigest !== hold.sourceStateDigest
+      || !await public113MigrationInputDigestMatches(
+        source,
+        hold.sourceStateDigest,
+      )
     ) {
       throw new Error(
         "V2 migration hold cannot commit after the public 1.1.3 input changed",
@@ -7746,12 +7835,14 @@ export class StateManager {
       this.plugin.app.vault,
       this.plugin.manifest.id,
     );
-    const reconciledSourceStateDigest =
-      await this.reconcilePreManifestMigrationArtifacts({
+    await this.reconcilePreManifestMigrationArtifacts({
       candidate: hold.candidate,
       source,
     });
-    if (reconciledSourceStateDigest !== hold.sourceStateDigest) {
+    if (!await public113MigrationInputDigestMatches(
+      source,
+      hold.sourceStateDigest,
+    )) {
       throw new Error(
         "V2 migration hold source changed before authority commit",
       );
@@ -7772,9 +7863,10 @@ export class StateManager {
       }
       const postStagingSource =
         await this.readPublic113MigrationInput();
-      const postStagingSourceStateDigest =
-        await public113MigrationInputDigest(postStagingSource);
-      if (postStagingSourceStateDigest !== hold.sourceStateDigest) {
+      if (!await public113MigrationInputDigestMatches(
+        postStagingSource,
+        hold.sourceStateDigest,
+      )) {
         throw new Error(
           "V2 migration hold source changed during IndexedDB staging",
         );
@@ -8096,6 +8188,18 @@ export class StateManager {
       if (!completed) return false;
       this.migrationHold = completed;
       return true;
+    }
+    // After an authority-commit interruption the manifest is durably in
+    // place (F31 write-channel substitution even lands it on a true
+    // refusal), which blocks the legacy runtime and keeps the confirmed
+    // hold for the recovery round. That state is a committed V2 gate:
+    // cancellation is refused and activation stays the only way forward.
+    if (
+      hold.phase === "confirmed"
+      && this.v2StateLoadRecoveryBlock?.reason
+        === "migration-authority-commit-interrupted"
+    ) {
+      return false;
     }
     // An older 1.1.3 review is deliberately left untouched while the V2
     // migration hold is merely being prepared. Once the user explicitly
@@ -8794,7 +8898,8 @@ export class StateManager {
       sourceCohort: source
         ? {
             kind: "public-1.1.3",
-            sourceStateDigest: await public113MigrationInputDigest(source),
+            sourceStateDigest:
+              await public113MigrationInputDigestV2(source),
           }
         : { kind: "fresh" },
     }, now);
@@ -9878,7 +9983,7 @@ function sameBaseEntry(
     && left.eTag === right.eTag;
 }
 
-function fileMutationCheckpointIsReflected(
+export function fileMutationCheckpointIsReflected(
   envelope: Readonly<SyncStateEnvelopeV2>,
   record: Readonly<MutationLedgerEntryV1>,
 ): boolean {

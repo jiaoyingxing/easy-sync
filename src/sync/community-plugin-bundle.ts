@@ -6,12 +6,12 @@ import {
   type SyncScope,
 } from "./types";
 
-export type CommunityPluginBundleFileName =
+type CommunityPluginBundleFileName =
   | "main.js"
   | "manifest.json"
   | "styles.css";
 
-export interface CommunityPluginBundlePath {
+interface CommunityPluginBundlePath {
   pluginId: string;
   fileName: CommunityPluginBundleFileName;
 }
@@ -25,12 +25,12 @@ export interface CommunityPluginBundleManifest {
   isDesktopOnly: boolean;
 }
 
-export type CommunityPluginManifestIncompatibility =
+type CommunityPluginManifestIncompatibility =
   | "downgrade"
   | "desktop-only"
   | "minimum-app-version";
 
-export interface CommunityPluginManifestObservationSourceV1 {
+interface CommunityPluginManifestObservationSourceV1 {
   path: string;
   remoteId: string;
   eTag: string;
@@ -59,7 +59,7 @@ export interface CommunityPluginManifestObservationV1 {
  * written and only an observed-fact change can clear the block, so these are
  * safe to retry without pausing the whole auto-sync round.
  */
-export type CommunityPluginIdentityBlockKind =
+type CommunityPluginIdentityBlockKind =
   | "parse" // manifest unreadable, unsafe identity, or missing version
   | "identity-changed" // same directory observed different ids (local vs remote)
   | "identity-ambiguous"; // two selected directories declare the same id

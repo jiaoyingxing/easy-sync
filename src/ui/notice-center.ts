@@ -21,7 +21,7 @@ export type EasySyncNoticeMessage = string | DocumentFragment;
  * in the user-configurable notification-popups level filter; `safety` and the
  * default (feedback) always display.
  */
-export type EasySyncNoticeCategory = "ambient" | "safety";
+type EasySyncNoticeCategory = "ambient" | "safety";
 
 /** User-facing notification popups level (per-device, persisted in data.json). */
 export type EasySyncNotificationPopupsLevel = "all" | "important" | "off";
@@ -33,7 +33,7 @@ export interface EasySyncNoticeHandle {
   hide(): void;
 }
 
-export interface EasySyncNoticeRequest {
+interface EasySyncNoticeRequest {
   key: string;
   message: EasySyncNoticeMessage | (() => EasySyncNoticeMessage);
   priority: number;
@@ -50,7 +50,7 @@ export interface EasySyncNoticeRequest {
   category?: EasySyncNoticeCategory;
 }
 
-export type EasySyncNoticeFactory = (
+type EasySyncNoticeFactory = (
   message: EasySyncNoticeMessage,
   durationMs: number,
 ) => EasySyncNoticeHandle;

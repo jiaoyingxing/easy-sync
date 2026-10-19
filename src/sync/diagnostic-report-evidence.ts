@@ -28,7 +28,7 @@ const shortOpaque = (value?: string): string => value
   ? value.slice(0, 12)
   : "—";
 
-export interface ConflictDiagnosticEvidence {
+interface ConflictDiagnosticEvidence {
   equalityStatus: "equal" | "different" | "unknown";
   equalityProof: string;
   localHash: string;
@@ -43,7 +43,7 @@ export interface ConflictDiagnosticEvidence {
   hasDecisionToken: boolean;
 }
 
-export interface SyncHistoryActionCounts {
+interface SyncHistoryActionCounts {
   uploaded: number;
   downloaded: number;
   filesMoved: number;
@@ -53,7 +53,7 @@ export interface SyncHistoryActionCounts {
   filesDeleted: number;
 }
 
-export type V2StorageAuthorityReportEvidence =
+type V2StorageAuthorityReportEvidence =
   | {
       kind: "json";
       stateCommitSeq: number;
@@ -262,7 +262,7 @@ function isGenerationSummary(value: unknown): value is string {
     || (typeof value === "string" && /^[0-9a-f]{12}$/.test(value));
 }
 
-export interface MutationRecoverySummary {
+interface MutationRecoverySummary {
   total: number;
   intentOnly: number;
   receiptPendingCommit: number;
@@ -303,7 +303,7 @@ export function summarizeMutationRecovery(
   };
 }
 
-export interface CommunityPluginSyncDiagnosticSummary {
+interface CommunityPluginSyncDiagnosticSummary {
   files: {
     mode: CommunityPluginSyncPolicyV1["files"]["mode"];
     selected: number;
@@ -421,7 +421,7 @@ export function computeChangedPluginDataKeys(
   return changed;
 }
 
-export interface PluginDataWriteRecord {
+interface PluginDataWriteRecord {
   at: number;
   keys: string[];
 }

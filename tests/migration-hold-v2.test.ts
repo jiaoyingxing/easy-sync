@@ -618,6 +618,196 @@ describe("MigrationHoldV2Store", () => {
     });
   });
 
+  it("promotes a staged revision by plain write when every destructive op is refused", async () => {
+    const { adapter, files, spies } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    const pending = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      now: 2000,
+    });
+    const promoted = {
+      ...pending,
+      revision: 2,
+      updatedAt: 2200,
+    };
+    files.set(paths.next, JSON.stringify(promoted));
+    // MuMu 共享挂载现场形态：删除与改名对任何路径都间歇性被拒。
+    spies.remove.mockImplementation(async () => {
+      throw new Error("Unable to delete file");
+    });
+    spies.rename.mockImplementation(async () => {
+      throw new Error("Unable to rename, unknown reason");
+    });
+
+    // 恢复层降级＝committed 原地覆盖写后正常返回；next 删不掉只是残留。
+    await expect(store.load()).resolves.toMatchObject({ revision: 2 });
+    expect(JSON.parse(files.get(paths.committed)!)).toMatchObject({
+      revision: 2,
+      updatedAt: 2200,
+    });
+    expect(files.has(paths.next)).toBe(true);
+  });
+
+  it("promotes a staged revision by plain write when rename is refused after a successful delete", async () => {
+    const { adapter, files, spies } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    const pending = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      now: 2000,
+    });
+    files.set(paths.next, JSON.stringify({
+      ...pending,
+      revision: 2,
+      updatedAt: 2200,
+    }));
+    spies.rename.mockImplementation(async () => {
+      throw new Error("Unable to rename, unknown reason");
+    });
+
+    await expect(store.load()).resolves.toMatchObject({ revision: 2 });
+    expect(JSON.parse(files.get(paths.committed)!)).toMatchObject({
+      revision: 2,
+      updatedAt: 2200,
+    });
+    expect(files.has(paths.next)).toBe(false);
+  });
+
+  it("keeps a refused rename conservative when its effect already landed", async () => {
+    const { adapter, files, spies } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    const pending = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      now: 2000,
+    });
+    files.set(paths.next, JSON.stringify({
+      ...pending,
+      revision: 2,
+      updatedAt: 2200,
+    }));
+    // 响应丢失形态：rename 已起效（目标内容已搬入 committed）后才抛。
+    spies.rename.mockImplementation(async (from: string, to: string) => {
+      const value = files.get(from)!;
+      files.delete(from);
+      files.set(to, value);
+      throw new Error("migration hold authority rename response lost");
+    });
+
+    await expect(store.load()).rejects.toThrow("already observed");
+    expect(JSON.parse(files.get(paths.committed)!)).toMatchObject({
+      revision: 2,
+      updatedAt: 2200,
+    });
+    expect(files.has(paths.next)).toBe(false);
+    await expect(store.load()).resolves.toMatchObject({ revision: 2 });
+  });
+
+  it("lets a staging fallback write return normally so the caller syncs its hold", async () => {
+    const { adapter, files, spies } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    spies.remove.mockImplementation(async () => {
+      throw new Error("Unable to delete file");
+    });
+    spies.rename.mockImplementation(async () => {
+      throw new Error("Unable to rename, unknown reason");
+    });
+
+    const hold = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      now: 2000,
+    });
+    // 挂审层＝写盘降级正常返回，调用方据返回值同步内存。
+    expect(hold).toMatchObject({ revision: 1 });
+    expect(JSON.parse(files.get(paths.committed)!)).toMatchObject({ revision: 1 });
+    await expect(store.load()).resolves.toMatchObject({ revision: 1 });
+  });
+
+  it("keeps the authority-layer fallback write conservative despite its effect", async () => {
+    const { adapter, files, spies } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    const staged = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      now: 2000,
+    });
+    // 手工构造 confirmed→authority-committed 的合法流转素材（后一档为 next）。
+    files.set(paths.committed, JSON.stringify({
+      ...staged,
+      revision: 2,
+      phase: "confirmed",
+      updatedAt: 2200,
+      protocolBinding,
+    }));
+    spies.remove.mockImplementation(async () => {
+      throw new Error("Unable to delete file");
+    });
+    spies.rename.mockImplementation(async () => {
+      throw new Error("Unable to rename, unknown reason");
+    });
+
+    await expect(store.transition(2, identity(), "authority-committed", 2300))
+      .rejects.toThrow("retry to resume");
+    // 写盘已推进但本轮仍按失败返回（保守合同）。
+    expect(JSON.parse(files.get(paths.committed)!)).toMatchObject({
+      revision: 3,
+      phase: "authority-committed",
+    });
+  });
+
+  it("treats a refused stale-next cleanup as non-fatal on load", async () => {
+    const { adapter, files, spies } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    const pending = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      now: 2000,
+    });
+    files.set(paths.committed, JSON.stringify({
+      ...pending,
+      revision: 2,
+      updatedAt: 2200,
+    }));
+    files.set(paths.next, JSON.stringify(pending));
+    // 陈旧的 next 已落后于 committed；删除被拒时不得打断读取。
+    spies.remove.mockImplementation(async (path: string) => {
+      if (path === paths.next) throw new Error("Unable to delete file");
+      files.delete(path);
+    });
+
+    await expect(store.load()).resolves.toMatchObject({
+      revision: 2,
+      phase: "pending",
+    });
+    expect(files.has(paths.next)).toBe(true);
+  });
+
   it("rejects an incomplete candidate before writing a hold", async () => {
     const { adapter, files } = makeAdapter();
     const store = new MigrationHoldV2Store(adapter, paths);

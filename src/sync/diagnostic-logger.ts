@@ -20,7 +20,7 @@ import {
   TimeoutHandle,
 } from "../obsidian-compat";
 
-export type DiagCategory =
+type DiagCategory =
   | "scan"       // 本地扫描
   | "plan"       // 同步计划
   | "execute"    // 执行
@@ -29,7 +29,7 @@ export type DiagCategory =
   | "state"      // 状态持久化
   | "lifecycle"; // 插件生命周期
 
-export type DiagLevel = "log" | "warn" | "error";
+type DiagLevel = "log" | "warn" | "error";
 
 export interface DiagEntry {
   ts: number;

@@ -9,7 +9,7 @@ import type { I18nFn } from "./confirm-modal";
  * "其中不再提醒数"只在各自大于 0 时出现——没有可上传内容时不再出现"本机有
  * 0 个文件…"这类空话，界面只剩说明句与两个按钮。
  */
-export interface SyncModeDisableViewV1 {
+interface SyncModeDisableViewV1 {
   title: string;
   lines: string[];
   confirmLabel: string;

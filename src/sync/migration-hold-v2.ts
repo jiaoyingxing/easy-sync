@@ -39,7 +39,7 @@ export interface MigrationHoldV2Paths {
   next: string;
 }
 
-export type MigrationHoldPhaseV2 =
+type MigrationHoldPhaseV2 =
   | "pending"
   | "confirmed"
   | "authority-committed"
@@ -72,7 +72,7 @@ export interface MigrationHoldV2 {
   protocolBinding?: SharedSyncProtocolBinding;
 }
 
-export interface PendingMigrationHoldV2Input {
+interface PendingMigrationHoldV2Input {
   candidate: SyncStateEnvelopeV2;
   sourceStateDigest: string;
   canonicalIdentity: CanonicalPlanIdentityV2;
@@ -108,7 +108,7 @@ export class MigrationHoldV2Store {
       await this.removeIfExists(this.paths.next);
       return committed;
     }
-    await this.promoteStaged(staged);
+    await this.promoteStaged(staged, { conservativeFallback: false });
     return staged;
   }
 
@@ -173,7 +173,7 @@ export class MigrationHoldV2Store {
             ),
           }
         : {}),
-    });
+    }, { conservativeFallback: false });
   }
 
   /**
@@ -195,7 +195,7 @@ export class MigrationHoldV2Store {
       ...preserved,
       revision: current.revision + 1,
       updatedAt: now,
-    });
+    }, { conservativeFallback: false });
   }
 
   async transition(
@@ -224,7 +224,7 @@ export class MigrationHoldV2Store {
       revision: current.revision + 1,
       phase,
       updatedAt: now,
-    });
+    }, { conservativeFallback: true });
   }
 
   async confirm(
@@ -252,7 +252,7 @@ export class MigrationHoldV2Store {
       phase: "confirmed",
       updatedAt: now,
       protocolBinding: structuredClone(protocolBinding),
-    });
+    }, { conservativeFallback: true });
   }
 
   async checkpointPendingProtocolBinding(
@@ -294,10 +294,13 @@ export class MigrationHoldV2Store {
       revision: current.revision + 1,
       updatedAt: now,
       protocolBinding: structuredClone(protocolBinding),
-    });
+    }, { conservativeFallback: false });
   }
 
-  private async publish(hold: MigrationHoldV2): Promise<MigrationHoldV2> {
+  private async publish(
+    hold: MigrationHoldV2,
+    options: { conservativeFallback: boolean },
+  ): Promise<MigrationHoldV2> {
     validateMigrationHoldV2(hold);
     await this.removeIfExists(this.paths.next);
     await this.adapter.write(this.paths.next, JSON.stringify(hold));
@@ -305,7 +308,7 @@ export class MigrationHoldV2Store {
     if (!sameHold(staged, hold)) {
       throw new Error("V2 migration hold failed staged read-back");
     }
-    await this.promoteStaged(staged);
+    await this.promoteStaged(staged, options);
     const committed = await this.readRequired(this.paths.committed);
     if (!sameHold(committed, hold)) {
       throw new Error("V2 migration hold failed committed read-back");
@@ -313,14 +316,89 @@ export class MigrationHoldV2Store {
     return committed;
   }
 
-  private async promoteStaged(staged: MigrationHoldV2): Promise<void> {
+  /**
+   * Two-slot handoff with a plain-write fallback for suspended Android
+   * mounts: `remove`/`rename` intermittently fail there ("Unable to delete
+   * file" / "Unable to rename, unknown reason") while `write` keeps
+   * succeeding. The fallback only advances when the committed slot is
+   * verifiably behind the staged record; a rename refusal that leaves the
+   * committed slot already at the staged revision (a lost response that did
+   * land) fails the round both at staging and authority layers. During
+   * staging/recovery the fallback write returns normally, so the caller
+   * syncs its in-memory hold with the promoted revision and the next
+   * authorization check compares same-generation candidates. During the
+   * authority/completion layers it stays conservative: the write lands but
+   * the round still fails, keeping "user mutations only after a clean
+   * resume" intact. A stale `next` left behind is inert: `load` prefers the
+   * higher revision, so a failed cleanup can never resurrect older facts.
+   */
+  private async promoteStaged(
+    staged: MigrationHoldV2,
+    options: { conservativeFallback: boolean },
+  ): Promise<void> {
     const current = await this.readOptional(this.paths.committed);
     if (current && current.revision >= staged.revision) {
       await this.removeIfExists(this.paths.next);
       return;
     }
-    await this.removeIfExists(this.paths.committed);
-    await this.adapter.rename(this.paths.next, this.paths.committed);
+    if (await this.removeIfExists(this.paths.committed)) {
+      if (await this.tryRename(this.paths.next, this.paths.committed)) {
+        return;
+      }
+    }
+    const observed = await this.readOptional(this.paths.committed);
+    if (observed && observed.revision >= staged.revision) {
+      throw new Error(
+        "V2 migration hold rename was refused with its effect already observed",
+      );
+    }
+    await this.adapter.write(this.paths.committed, JSON.stringify(staged));
+    const settled = await this.readRequired(this.paths.committed);
+    if (!sameHold(settled, staged)) {
+      throw new Error("V2 migration hold failed committed read-back");
+    }
+    await this.removeIfExists(this.paths.next);
+    // The fallback write durably advanced the committed slot. Staging and
+    // recovery return so the in-memory hold syncs with the promoted
+    // revision; the authority layers keep the round's failure contract.
+    if (options.conservativeFallback) {
+      throw new Error(
+        "V2 migration hold promotion fell back to a plain commit write; retry to resume",
+      );
+    }
+  }
+
+  /** Deleted or absent — a rejected delete counts as "not cleaned" (false). */
+  private async removeIfExists(path: string): Promise<boolean> {
+    try {
+      if (await this.adapter.exists(path)) await this.adapter.remove(path);
+      return true;
+    } catch (error) {
+      // MuMu shared mounts report deletes through throw paths here.
+      console.debug?.(
+        "V2 migration hold deferred file cleanup",
+        path,
+        error instanceof Error ? error.message : error,
+      );
+      return false;
+    }
+  }
+
+  private async tryRename(
+    from: string,
+    to: string,
+  ): Promise<boolean> {
+    try {
+      await this.adapter.rename(from, to);
+      return true;
+    } catch (error) {
+      console.debug?.(
+        "V2 migration hold rename refused, falling back to plain write",
+        from,
+        error instanceof Error ? error.message : error,
+      );
+      return false;
+    }
   }
 
   private async readOptional(path: string): Promise<MigrationHoldV2 | null> {
@@ -338,10 +416,6 @@ export class MigrationHoldV2Store {
     validateMigrationHoldV2(value);
     return value;
   }
-
-  private async removeIfExists(path: string): Promise<void> {
-    if (await this.adapter.exists(path)) await this.adapter.remove(path);
-  }
 }
 
 export function isActiveMigrationHoldV2(
@@ -358,7 +432,7 @@ export function migrationHoldReviewKindV2(
   return hold.reviewKind ?? "v2-migration";
 }
 
-export function validateMigrationHoldV2(
+function validateMigrationHoldV2(
   value: unknown,
 ): asserts value is MigrationHoldV2 {
   if (!isRecord(value)) throw new Error("V2 migration hold must be an object");

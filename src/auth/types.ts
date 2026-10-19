@@ -72,7 +72,7 @@ export interface PendingDeviceAuth {
 }
 
 /** Terminal device-code failure states surfaced to the waiting modal */
-export type DeviceCodeAttemptPhase =
+type DeviceCodeAttemptPhase =
   | "declined"
   | "expired"
   | "mismatch"

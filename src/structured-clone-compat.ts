@@ -23,7 +23,7 @@
  */
 import structuredClonePolyfill from "core-js-pure/actual/structured-clone";
 
-export type StructuredCloneImplementation = "native" | "polyfill";
+type StructuredCloneImplementation = "native" | "polyfill";
 
 const EASY_SYNC_POLYFILL_BRAND = Symbol.for(
   "easy-sync.structured-clone-polyfill",

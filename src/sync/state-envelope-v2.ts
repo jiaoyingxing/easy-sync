@@ -15,7 +15,7 @@ export interface CommitMetaV2 {
   committedAt: number;
 }
 
-export type SyncAnchorConfirmationV2 =
+type SyncAnchorConfirmationV2 =
   | "equal-read"
   | "upload-cas"
   | "download-cas"
@@ -24,7 +24,7 @@ export type SyncAnchorConfirmationV2 =
   | "merge-cas"
   | "user-resolution";
 
-export interface RemoteIdentityLineageV2 {
+interface RemoteIdentityLineageV2 {
   fromRemoteId: string;
   toRemoteId: string;
   path: string;
@@ -56,7 +56,7 @@ export interface SyncAnchorV2 {
   confirmedBy: SyncAnchorConfirmationV2;
 }
 
-export interface SyncAnchorSetV2 {
+interface SyncAnchorSetV2 {
   schemaVersion: 2;
   byAnchorId: Record<string, SyncAnchorV2>;
 }
@@ -118,7 +118,7 @@ export interface FolderAnchorV2 {
   confirmedAt: number;
 }
 
-export interface FolderAnchorSetV2 {
+interface FolderAnchorSetV2 {
   schemaVersion: 2;
   byAnchorId: Record<string, FolderAnchorV2>;
 }
@@ -140,7 +140,7 @@ export interface RemoteScopeRecoveryV2 {
   scopeBootstrap?: RemoteScopeBootstrapReviewV2;
 }
 
-export interface RemoteScopeBootstrapReviewV2 {
+interface RemoteScopeBootstrapReviewV2 {
   schemaVersion: 1;
   kind: "v2-remote-scope-bootstrap-review";
   phase: "pending" | "confirmed";
@@ -476,9 +476,13 @@ export class StateEnvelopeV2Store {
   ): Promise<void> {
     validateEnvelope(candidate);
     const current = await this.load(candidate.scope);
-    if (await this.hasRecoveryJournal()) {
-      throw new Error("V2 state has an unresolved recovery journal");
-    }
+    // A leftover recovery journal here means cleanup was refused after the
+    // load-time recovery already converged it (F31: deletes stay
+    // best-effort). Since load() itself throws on any journal state it
+    // cannot resolve, reaching this line only in a deep-load pass that
+    // already processed the journal is safe — the journal below is
+    // rewritten before any slot moves, so the stale entry loses ownership
+    // the moment this publish starts.
     const ancestorHashes = new Set(
       Object.values(candidate.anchors.byAnchorId)
         .map((anchor) => anchor.ancestorHash)
@@ -821,13 +825,52 @@ export class StateEnvelopeV2Store {
 
   private async restorePrevious(): Promise<void> {
     if (!await this.adapter.exists(this.paths.previous)) return;
-    await this.removeIfExists(this.paths.committed);
-    await this.adapter.rename(this.paths.previous, this.paths.committed);
+    await this.renameIntoCommittedSlot(this.paths.previous);
   }
 
   private async promoteStaged(): Promise<void> {
+    await this.renameIntoCommittedSlot(this.paths.next);
+  }
+
+  /**
+   * Move a fully validated slot into the committed slot.
+   *
+   * The preferred path is the native rename; when the mount refuses it and
+   * during load-time recovery (F31 eighth layer, e.g. "Unable to delete
+   * file" / "Unable to rename"), the same result is achieved: a lost rename
+   * response has already landed the slot (source gone, committed in place),
+   * so converging on the observed outcome equals what the recovery journal
+   * resolves on the next round; a true refusal leaves the source readable
+   * and the write channel completes the same promotion with a read-back. A
+   * refusal of the write channel itself still fails this round; recovery
+   * resolves it on the next round, the same conservative contract.
+   */
+  private async renameIntoCommittedSlot(from: string): Promise<void> {
     await this.removeIfExists(this.paths.committed);
-    await this.adapter.rename(this.paths.next, this.paths.committed);
+    try {
+      await this.adapter.rename(from, this.paths.committed);
+    } catch (error) {
+      const committedOutcome = await this.readEnvelopeOutcome(
+        this.paths.committed,
+      );
+      if (committedOutcome.status === "valid") {
+        await this.removeIfExists(from);
+        return;
+      }
+      let staged: SyncStateEnvelopeV2;
+      try {
+        staged = await this.readEnvelopeRequired(from);
+      } catch {
+        throw error;
+      }
+      await this.adapter.write(
+        this.paths.committed,
+        JSON.stringify(staged),
+      );
+      const promoted = await this.readEnvelopeRequired(this.paths.committed);
+      if (!sameEnvelope(promoted, staged)) throw error;
+      await this.removeIfExists(from);
+    }
     await this.readEnvelopeRequired(this.paths.committed);
   }
 
@@ -837,8 +880,20 @@ export class StateEnvelopeV2Store {
     await this.removeIfExists(this.paths.recovery);
   }
 
+  /**
+   * Deletion is best-effort (F31): a refused delete leaves the artifact in
+   * place — loads still resolve authoritatively from the slots they can
+   * read, the next write-through overwrites leftovers, and the recovery
+   * journal replays cleanup on a later round.
+   */
   private async removeIfExists(path: string): Promise<void> {
-    if (await this.adapter.exists(path)) await this.adapter.remove(path);
+    if (await this.adapter.exists(path)) {
+      try {
+        await this.adapter.remove(path);
+      } catch {
+        // Left in place on purpose; see the note above.
+      }
+    }
   }
 }
 

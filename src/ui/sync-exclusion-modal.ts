@@ -44,7 +44,7 @@ export function buildSyncExclusionFolderCandidates(
   );
 }
 
-export type MaxFileSizeSelection =
+type MaxFileSizeSelection =
   | { kind: "preset"; value: number }
   | { kind: "unlimited" }
   | { kind: "custom" };

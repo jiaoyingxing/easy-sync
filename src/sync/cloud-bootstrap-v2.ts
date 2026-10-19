@@ -76,7 +76,7 @@ export interface CloudBootstrapHealthV2 {
   stateRecoveryPending: boolean;
 }
 
-export interface CloudBootstrapPublishResultV2 {
+interface CloudBootstrapPublishResultV2 {
   published: boolean;
   dirty: boolean;
   revision: number | null;
@@ -84,7 +84,7 @@ export interface CloudBootstrapPublishResultV2 {
   reason?: "unhealthy" | "invalid-current" | "write-failed";
 }
 
-export interface VerifiedCloudBootstrapV2 {
+interface VerifiedCloudBootstrapV2 {
   status: "verified" | "rejected";
   reason?: "invalid-schema" | "scope-mismatch" | "remote-index-incomplete";
   anchors: CloudBootstrapAnchorV2[];

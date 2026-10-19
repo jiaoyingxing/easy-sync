@@ -11,12 +11,12 @@
 import { type App } from "obsidian";
 import { EasySyncModal } from "./easy-sync-modal";
 
-export type RsMigrationOfferResult =
+type RsMigrationOfferResult =
   | { action: "migrate" }
   | { action: "fresh-sync" }
   | { action: "dismiss" };
 
-export interface RsMigrationOfferViews {
+interface RsMigrationOfferViews {
   title: string;
   body: string;
   migrate: { title: string; description: string };

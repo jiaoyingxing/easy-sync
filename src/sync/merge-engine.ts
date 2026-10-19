@@ -10,7 +10,7 @@ import { computeDiff } from "../ui/diff-engine";
 import type { DiffLine } from "../ui/diff-engine";
 const MERGE_MAX_TOTAL_LINES = 20_000;
 
-export interface MergeResult {
+interface MergeResult {
   merged: string;
   hasConflicts: boolean;
 }

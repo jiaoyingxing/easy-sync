@@ -872,6 +872,10 @@ export interface LocaleStrings {
   "mutationRecovery.reason.unknown": string;
   "syncView.issues.title": string;
   "syncView.issues.openFile": string;
+  /** S4 终止判据（2026-10-16 §六 S4）：同一项连续两次同步没有任何变化、
+   *  当前版本也没有安全处置方式时的一句终局说明；同一事实一个 key，
+   *  待处理行与核对区共用。 */
+  "syncView.itemTermination.nonRetryable": string;
   "syncView.collapseAll": string;
   "syncView.expandAll": string;
   "syncView.history.title": string;

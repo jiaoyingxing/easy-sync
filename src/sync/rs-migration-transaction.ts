@@ -47,7 +47,7 @@ const RS_MIGRATION_MOVE_ARRIVAL_POLL_INTERVAL_MS = 2_000;
  *  instead of issuing an unbounded sequence of moves. */
 const RS_MIGRATION_MAX_SOURCE_CHILDREN = 1_000;
 
-export type RsMigrationTransactionStatus =
+type RsMigrationTransactionStatus =
   | "moved"
   | "copied"
   | "empty-source"
@@ -70,7 +70,7 @@ export interface RsMigrationTransactionOutcome {
   } | null;
 }
 
-export interface RsMigrationTransactionInput {
+interface RsMigrationTransactionInput {
   onedrive: OneDriveClient;
   vaultName: string;
   /** The EasySync files root (must already exist — initVaultScope ran). */

@@ -15,12 +15,12 @@ export type ContentEqualityProof =
   | "sizeMismatch"
   | "insufficientEvidence";
 
-export interface ContentEqualityResult {
+interface ContentEqualityResult {
   status: "equal" | "different" | "unknown";
   proof: ContentEqualityProof;
 }
 
-export interface ContentEqualityInput {
+interface ContentEqualityInput {
   local: { hash: string; size: number; quickXorHash?: string };
   remote: {
     sha256Hash?: string;
@@ -79,7 +79,7 @@ export function resolveContentEquality(
   return { status: "unknown", proof: "insufficientEvidence" };
 }
 
-export interface ContentBufferComparison {
+interface ContentBufferComparison {
   status: "equal" | "different";
   localHash: string;
   remoteHash: string;

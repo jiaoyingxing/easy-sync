@@ -12,12 +12,12 @@
 import { Platform, type App } from "obsidian";
 import { EasySyncModal } from "./easy-sync-modal";
 
-export type AuthMethodResult =
+type AuthMethodResult =
   | { action: "browser" }
   | { action: "device" }
   | { action: "dismiss" };
 
-export interface AuthMethodOptionView {
+interface AuthMethodOptionView {
   title: string;
   description: string;
 }

@@ -34,7 +34,7 @@ export type SyncActionProgressStatus =
   | "skip"
   | "error";
 
-export interface SyncActionPresentation {
+interface SyncActionPresentation {
   group: SyncActionGroup;
   groupLabelKey: keyof LocaleStrings;
   groupOrder: number;

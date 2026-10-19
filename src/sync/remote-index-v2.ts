@@ -28,7 +28,7 @@ export interface RemoteIndexProjectionV2 {
   pathById: Map<string, string>;
 }
 
-export interface RemoteNodeProjectionV2 {
+interface RemoteNodeProjectionV2 {
   nodeById: Map<string, RemoteNodeV2>;
   pathById: Map<string, string>;
 }
@@ -91,6 +91,34 @@ export function projectRemoteIndexV2(index: RemoteIndexV2): Map<string, string> 
     Object.values(index.itemsById),
     index.filesRootId,
   ).pathById;
+}
+
+/**
+ * Translate one anchored path across a folder-location change: `path` sits at
+ * or below `fromRoot` and moves with it to `toRoot`, so only the prefix is
+ * replaced.
+ *
+ * The reducer's folder-move receipt assertion (`V2 folder move file projection
+ * changed`) compares this result **byte-for-byte** against the moved folder's
+ * committed remote projection, and the canonical plan layer has to answer the
+ * same question before it emits the move (F29 切片 1, 2026-10-16) — so both
+ * sides share this single implementation instead of keeping two copies that
+ * could drift apart. Deliberately no normalization here: the comparison it
+ * feeds is exact, and the callers decide what counts as "below".
+ */
+export function translateAnchoredPathV2(
+  path: string,
+  fromRoot: string,
+  toRoot: string,
+): string {
+  if (path === fromRoot) return toRoot;
+  return `${toRoot}${path.slice(fromRoot.length)}`;
+}
+
+/** Strictly below `root`, matched on the same NFC form the reducer's
+ *  descendant test uses (`path` itself is not a descendant of `root`). */
+export function isAnchoredDescendantV2(path: string, root: string): boolean {
+  return path.normalize("NFC").startsWith(`${root.normalize("NFC")}/`);
 }
 
 /** Build and validate a staging identity index. No state is published here. */

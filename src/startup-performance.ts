@@ -1,5 +1,5 @@
-export type StartupPlatform = "desktop" | "mobile";
-export type StartupReadyOutcome = "ready" | "failed";
+type StartupPlatform = "desktop" | "mobile";
+type StartupReadyOutcome = "ready" | "failed";
 
 export interface StartupStateEvidence {
   outcome: StartupReadyOutcome;
@@ -18,7 +18,7 @@ export interface StartupAuthEvidence {
   accountVerified: boolean;
 }
 
-export interface PluginColdStartSummary {
+interface PluginColdStartSummary {
   schemaVersion: 1;
   platform: StartupPlatform;
   readyMs: {

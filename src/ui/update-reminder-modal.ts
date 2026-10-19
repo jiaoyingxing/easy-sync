@@ -2,7 +2,7 @@ import type { App } from "obsidian";
 
 import { EasySyncModal } from "./easy-sync-modal";
 
-export type UpdateReminderChoice = "snooze" | "skipVersion";
+type UpdateReminderChoice = "snooze" | "skipVersion";
 
 /**
  * Snooze chooser for the sidebar update row (方案单 20260915-0025 §四 跳过层).

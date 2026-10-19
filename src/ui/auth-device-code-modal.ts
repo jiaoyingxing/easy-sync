@@ -28,7 +28,7 @@ import {
 } from "./notice-center";
 import { EasySyncModal } from "./easy-sync-modal";
 
-export interface AuthDeviceCodeModalDeps {
+interface AuthDeviceCodeModalDeps {
   auth: AuthModule;
   noticeCenter: Pick<EasySyncNoticeCenter, "show">;
   t: (key: string, params?: Record<string, string | number>) => string;

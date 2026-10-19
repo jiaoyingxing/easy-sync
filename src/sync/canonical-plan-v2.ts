@@ -50,6 +50,11 @@ import {
 } from "./state-envelope-v2";
 import { isEasySyncInternalPath } from "./local-scanner";
 import {
+  isAnchoredDescendantV2,
+  projectRemoteNodesV2,
+  translateAnchoredPathV2,
+} from "./remote-index-v2";
+import {
   canonicalPlannerStateFromEnvelopeV2,
   type CanonicalPlannerStateV2,
 } from "./canonical-planner-state-v2";
@@ -72,7 +77,7 @@ import {
 
 const MAX_UNANCHORED_DESCENDANT_EVIDENCE = 10;
 
-export interface CanonicalPlanFactsV2 {
+interface CanonicalPlanFactsV2 {
   envelope: SyncStateEnvelopeV2;
   localFiles: readonly LocalFileEntry[];
   localFolders: readonly LocalFolderEntry[];
@@ -90,7 +95,7 @@ export interface CanonicalPlanFactsV2 {
   automaticDeleteLocalFiles: boolean;
 }
 
-export interface CanonicalPlanViewFactsV2
+interface CanonicalPlanViewFactsV2
   extends Omit<CanonicalPlanFactsV2, "envelope"> {
   state: CanonicalPlannerStateV2;
 }
@@ -101,7 +106,7 @@ interface CanonicalActionCompositionFactsV2
   lastTotalFiles: number;
 }
 
-export type CanonicalPlanRejectionReasonV2 =
+type CanonicalPlanRejectionReasonV2 =
   NonNullable<FolderStatePlanV2["rejectionReason"]>;
 
 export interface CanonicalPlanCandidateV2 {
@@ -126,7 +131,7 @@ export interface CanonicalPlanCandidateV2 {
   unanchoredDescendantEvidence: SyncPlanItem[];
 }
 
-export interface CanonicalIdentityReplacementV2 {
+interface CanonicalIdentityReplacementV2 {
   anchorId: string;
   previousRemoteId: string;
   remoteId: string;
@@ -136,7 +141,7 @@ export interface CanonicalIdentityReplacementV2 {
   base: BaseFileEntry;
 }
 
-export interface CanonicalIdentityMoveVerificationV2 {
+interface CanonicalIdentityMoveVerificationV2 {
   anchorId: string;
   remoteId: string;
   fromPath: string;
@@ -146,12 +151,12 @@ export interface CanonicalIdentityMoveVerificationV2 {
   base: BaseFileEntry;
 }
 
-export interface PendingContentComparisonV2 {
+interface PendingContentComparisonV2 {
   path: string;
   contentComparison?: ContentComparisonReceiptV1;
 }
 
-export interface ContentVerificationResultV2 {
+interface ContentVerificationResultV2 {
   path: string;
   outcome: "equal" | "different" | "failed";
   proof?: ContentEqualityProof;
@@ -159,7 +164,7 @@ export interface ContentVerificationResultV2 {
   error?: string;
 }
 
-export interface CanonicalContentVerificationV2 {
+interface CanonicalContentVerificationV2 {
   candidates: number;
   cachedEvidence: number;
   downloads: number;
@@ -173,7 +178,7 @@ export interface FinalizedCanonicalPlanV2 extends CanonicalPlanCandidateV2 {
   requiresThresholdConfirmation: boolean;
 }
 
-export interface SealedCanonicalPlanV2 extends FinalizedCanonicalPlanV2 {
+interface SealedCanonicalPlanV2 extends FinalizedCanonicalPlanV2 {
   canonicalIdentity: CanonicalPlanIdentityV2;
   canonicalReview: CanonicalPlanReviewV2;
 }
@@ -224,7 +229,7 @@ export interface FinalizeCanonicalPlanInputV2 {
   };
 }
 
-export interface SealCanonicalPlanInputV2 {
+interface SealCanonicalPlanInputV2 {
   finalized: FinalizedCanonicalPlanV2;
   sourceEnvelope: SyncStateEnvelopeV2;
   committedEnvelope: SyncStateEnvelopeV2;
@@ -285,6 +290,140 @@ export function buildCanonicalPlanCandidateFromStateV2(
  * folder subtrees, carrying file identities with folder moves, and ordering
  * file/folder actions into one candidate.
  */
+interface CanonicalCarriedFolderMovesInputV2 {
+  folderPlan: ReturnType<typeof planFolderStateFromViewV2>;
+  state: CanonicalActionCompositionFactsV2["state"];
+}
+
+interface CanonicalCarriedFolderMovesV2 {
+  carriedFolderMoves: Array<{ sourcePath: string; targetPath: string }>;
+  projectedFolderIdentities: Array<{ path: string; remoteId: string }>;
+}
+
+/**
+ * Collect the folder moves this plan already carries (source→target) and, for
+ * every `move-remote`, the projected folder identities that move implies.
+ * Extracted verbatim from `composeCanonicalActionsV2`（2026-10-16 第二期类内分解，
+ * 逐 token 等价）。
+ */
+function collectCarriedFolderMovesV2({
+  folderPlan,
+  state,
+}: CanonicalCarriedFolderMovesInputV2): CanonicalCarriedFolderMovesV2 {
+  const carriedFolderMoves: Array<{
+    sourcePath: string;
+    targetPath: string;
+  }> = [];
+  const projectedFolderIdentities: Array<{
+    path: string;
+    remoteId: string;
+  }> = [];
+  for (const item of folderPlan.items) {
+    if (
+      (item.type === "move-remote" || item.type === "move-local")
+      && item.sourcePath
+      && item.targetPath
+      && item.remoteId
+    ) {
+      carriedFolderMoves.push({
+        sourcePath: item.sourcePath,
+        targetPath: item.targetPath,
+      });
+      if (item.type === "move-remote") {
+        projectedFolderIdentities.push(
+          ...projectFolderIdentitiesForMove(
+            state,
+            item.sourcePath,
+            item.targetPath,
+          ),
+        );
+      }
+    }
+  }
+
+  return { carriedFolderMoves, projectedFolderIdentities };
+}
+
+interface CanonicalPlanIndexesInputV2 {
+  state: CanonicalActionCompositionFactsV2["state"];
+  input: CanonicalActionCompositionFactsV2;
+  folderPlan: ReturnType<typeof planFolderStateFromViewV2>;
+}
+
+interface CanonicalPlanIndexFactsV2 {
+  remoteIdByPath: Map<string, string>;
+  canonicalFolderPathById: Map<string, string>;
+  plannedRemoteFolderPaths: Map<string, string>;
+  remoteFilesById: Map<
+    string,
+    ReturnType<typeof projectCanonicalFileFactsFromStateV2>["remoteEntries"][number]
+  >;
+  plannedRemoteCreates: Set<string>;
+}
+
+/**
+ * Build the lookup facts the per-item pass needs: folded remote path → id, the
+ * canonical (byte-exact) spelling per folder identity, the planned spellings of
+ * folders this same plan decided to create/move, the projected remote file facts
+ * and the set of planned remote creates. Extracted verbatim from
+ * `composeCanonicalActionsV2`（2026-10-16 第二期类内分解，逐 token 等价）。
+ */
+function buildCanonicalPlanIndexesV2({
+  state,
+  input,
+  folderPlan,
+}: CanonicalPlanIndexesInputV2): CanonicalPlanIndexFactsV2 {
+  const remoteIdByPath = new Map(
+    [...state.remotePathById]
+      .map(([id, path]) => [normalizeRemotePathKey(path), id]),
+  );
+  // Canonical spelling per folder identity — the spelling a receipt must repeat
+  // byte-for-byte. Identity resolution folds case/NFC (remoteIdByPath), but the
+  // reducer asserts the destination parent path byte-for-byte
+  // (`V2 folder parent path changed`), so the byte check needs the index
+  // spelling, not the folded key.
+  const canonicalFolderPathById = new Map<string, string>();
+  for (const [id, path] of state.remotePathById) {
+    if (state.remoteNodeById.get(id)?.kind === "folder") {
+      canonicalFolderPathById.set(id, path);
+    }
+  }
+  // Folder paths this same plan already decided to create/move: their intended
+  // spelling is definitionally authoritative until the create commits, so a
+  // child planned under a planned parent is judged against the planned
+  // spelling instead of the folded key set.
+  const plannedRemoteFolderPaths = new Map<string, string>();
+  for (const item of folderPlan.items) {
+    if (item.type === "create-remote" || item.type === "move-remote") {
+      plannedRemoteFolderPaths.set(
+        normalizeRemotePathKey(item.path),
+        item.path,
+      );
+    }
+  }
+  const remoteFilesById = new Map(
+    projectCanonicalFileFactsFromStateV2(
+      state,
+      input.includeFilePath ?? (() => true),
+    )
+      .remoteEntries
+      .map((entry) => [entry.driveId, entry]),
+  );
+  const plannedRemoteCreates = new Set(
+    folderPlan.items
+      .filter((item) => item.type === "create-remote")
+      .map((item) => normalizeRemotePathKey(item.path)),
+  );
+
+  return {
+    remoteIdByPath,
+    canonicalFolderPathById,
+    plannedRemoteFolderPaths,
+    remoteFilesById,
+    plannedRemoteCreates,
+  };
+}
+
 function composeCanonicalActionsV2(
   input: CanonicalActionCompositionFactsV2,
 ): CanonicalPlanCandidateV2 {
@@ -319,54 +458,20 @@ function composeCanonicalActionsV2(
   }
 
   const state = input.state;
-  const carriedFolderMoves: Array<{
-    sourcePath: string;
-    targetPath: string;
-  }> = [];
-  const projectedFolderIdentities: Array<{
-    path: string;
-    remoteId: string;
-  }> = [];
-  for (const item of folderPlan.items) {
-    if (
-      (item.type === "move-remote" || item.type === "move-local")
-      && item.sourcePath
-      && item.targetPath
-      && item.remoteId
-    ) {
-      carriedFolderMoves.push({
-        sourcePath: item.sourcePath,
-        targetPath: item.targetPath,
-      });
-      if (item.type === "move-remote") {
-        projectedFolderIdentities.push(
-          ...projectFolderIdentitiesForMove(
-            state,
-            item.sourcePath,
-            item.targetPath,
-          ),
-        );
-      }
-    }
-  }
+  const { carriedFolderMoves, projectedFolderIdentities } = collectCarriedFolderMovesV2({
+    folderPlan,
+    state,
+  });
 
-  const remoteIdByPath = new Map(
-    [...state.remotePathById]
-      .map(([id, path]) => [normalizeRemotePathKey(path), id]),
-  );
-  const remoteFilesById = new Map(
-    projectCanonicalFileFactsFromStateV2(
-      state,
-      input.includeFilePath ?? (() => true),
-    )
-      .remoteEntries
-      .map((entry) => [entry.driveId, entry]),
-  );
-  const plannedRemoteCreates = new Set(
-    folderPlan.items
-      .filter((item) => item.type === "create-remote")
-      .map((item) => normalizeRemotePathKey(item.path)),
-  );
+  // 索引与"逐字节规范拼写"来源见 buildCanonicalPlanIndexesV2 的同名注释
+  // （folder identity 的规范拼写＝回执必须逐字节复述的那种写法）。
+  const {
+    remoteIdByPath,
+    canonicalFolderPathById,
+    plannedRemoteFolderPaths,
+    remoteFilesById,
+    plannedRemoteCreates,
+  } = buildCanonicalPlanIndexesV2({ state, input, folderPlan });
   const createItems: SyncPlanItem[] = [];
   const moveItems: SyncPlanItem[] = [];
   const deleteItems: SyncPlanItem[] = [];
@@ -380,6 +485,8 @@ function composeCanonicalActionsV2(
       item,
       state,
       remoteIdByPath,
+      canonicalFolderPathById,
+      plannedRemoteFolderPaths,
       plannedRemoteCreates,
       configDir: input.configDir,
       automaticDeleteLocalFiles: input.automaticDeleteLocalFiles,
@@ -518,10 +625,265 @@ function composeCanonicalActionsV2(
  * steps consult. The caller's containers are threaded by reference and no
  * binding is reassigned, so a terminal per-item outcome is a plain return.
  */
+type CanonicalFolderPlanItemV2 = Parameters<typeof applyFolderPlanItemV2>[0]["item"];
+
+interface ApplyCreateRemoteFolderItemInputV2 {
+  item: CanonicalFolderPlanItemV2;
+  state: Parameters<typeof applyFolderPlanItemV2>[0]["state"];
+  remoteIdByPath: ReadonlyMap<string, string>;
+  canonicalFolderPathById: ReadonlyMap<string, string>;
+  plannedRemoteCreates: ReadonlySet<string>;
+  plannedRemoteFolderPaths: ReadonlyMap<string, string>;
+  createItems: SyncPlanItem[];
+  deferredItems: SyncPlanItem[];
+}
+
+/**
+ * `create-remote` folder items: resolve the parent identity through the folded
+ * key, defer while the parent chain is incomplete, and — A1「乙」(2026-10-16) —
+ * withhold the create while the parent path is only a **spelling alias** of the
+ * index spelling (the receipt must repeat it byte-for-byte, otherwise the
+ * reducer throws `V2 folder parent path changed`). Extracted verbatim from
+ * `applyFolderPlanItemV2`（2026-10-16 第二期类内分解，逐 token 等价；块内三处
+ * `return;` 原样保留，语义不变）。
+ */
+function applyCreateRemoteFolderItemV2({
+  item,
+  state,
+  remoteIdByPath,
+  canonicalFolderPathById,
+  plannedRemoteCreates,
+  plannedRemoteFolderPaths,
+  createItems,
+  deferredItems,
+}: ApplyCreateRemoteFolderItemInputV2): void {
+  const parent = parentFolderPath(item.path);
+  const parentRemoteId = parent === ""
+    ? state.scope.filesRootId
+    : remoteIdByPath.get(normalizeRemotePathKey(parent));
+  const parentNode = parentRemoteId
+    ? state.remoteNodeById.get(parentRemoteId)
+    : undefined;
+  if (
+    (!parentRemoteId
+      && !plannedRemoteCreates.has(normalizeRemotePathKey(parent)))
+    || (parentRemoteId && parent !== "" && parentNode?.kind !== "folder")
+  ) {
+    deferredItems.push(toDeferredFolderPlanItem(
+      item.path,
+      "parent-chain-incomplete",
+    ));
+    return;
+  }
+  // A1 乙 (2026-10-16): the parent identity above is resolved through the
+  // folded key (NFC + case), but the receipt must repeat the index spelling
+  // byte-for-byte — `V2 folder parent path changed` is otherwise thrown when
+  // the create commits (field shape: index `videos/`, local `Videos/`).
+  // Withhold the create while the parent is only a spelling alias (root is
+  // exempt; a parent planned in this same plan is not).
+  const createParentCanonicalPath = parent === ""
+    ? ""
+    : parentRemoteId
+      ? canonicalFolderPathById.get(parentRemoteId)
+        ?? plannedRemoteFolderPaths.get(normalizeRemotePathKey(parent))
+      : plannedRemoteFolderPaths.get(normalizeRemotePathKey(parent));
+  if (
+    createParentCanonicalPath !== undefined
+    && createParentCanonicalPath !== parent
+  ) {
+    deferredItems.push(toDeferredFolderPlanItem(
+      item.path,
+      "parent-chain-incomplete",
+    ));
+    return;
+  }
+  createItems.push({
+    type: SyncActionType.CreateRemoteFolder,
+    path: item.path,
+    folder: {
+      parentRemoteId,
+      parentPath: parent,
+      parentRemoteETag: parentNode?.eTag,
+    },
+  });
+  return;
+}
+
+type CanonicalFolderMoveItemV2 =
+  Omit<CanonicalFolderPlanItemV2, "remoteId" | "sourcePath" | "targetPath"> & {
+    remoteId: string;
+    sourcePath: string;
+    targetPath: string;
+  };
+
+interface ApplyFolderMoveItemInputV2 {
+  item: CanonicalFolderMoveItemV2;
+  state: Parameters<typeof applyFolderPlanItemV2>[0]["state"];
+  remoteIdByPath: ReadonlyMap<string, string>;
+  plannedRemoteCreates: ReadonlySet<string>;
+  canonicalFolderPathById: ReadonlyMap<string, string>;
+  plannedRemoteFolderPaths: ReadonlyMap<string, string>;
+  moveItems: SyncPlanItem[];
+  deferredItems: SyncPlanItem[];
+  protectedRoots: Set<string>;
+  otherProtectedRoots: Set<string>;
+}
+
+/**
+ * `move-remote` / `move-local` folder items: defer while the anchor or the
+ * destination parent chain is unusable, then — A1「乙」(2026-10-16) — withhold
+ * the move while the destination parent path is only a **spelling alias** of the
+ * index spelling; otherwise emit the folder move and protect both roots.
+ * Extracted verbatim from `applyFolderPlanItemV2`（2026-10-16 第二期类内分解，
+ * 逐 token 等价；块内四处 `return;` 原样保留）。
+ */
+function applyFolderMoveItemV2({
+  item,
+  state,
+  remoteIdByPath,
+  plannedRemoteCreates,
+  canonicalFolderPathById,
+  plannedRemoteFolderPaths,
+  moveItems,
+  deferredItems,
+  protectedRoots,
+  otherProtectedRoots,
+}: ApplyFolderMoveItemInputV2): void {
+  const remoteNode = state.remoteNodeById.get(item.remoteId);
+  const anchor = state.folderAnchorByRemoteId.get(item.remoteId);
+  if (!remoteNode || remoteNode.kind !== "folder" || !anchor) {
+    deferredItems.push(toDeferredFolderPlanItem(
+      item.path,
+      "parent-chain-incomplete",
+    ));
+    return;
+  }
+  const parent = parentFolderPath(item.targetPath);
+  const parentRemoteId = parent === ""
+    ? state.scope.filesRootId
+    : remoteIdByPath.get(normalizeRemotePathKey(parent));
+  const parentNode = parentRemoteId
+    ? state.remoteNodeById.get(parentRemoteId)
+    : undefined;
+  if (
+    (!parentRemoteId
+      && !plannedRemoteCreates.has(normalizeRemotePathKey(parent)))
+    || (parentRemoteId && parent !== "" && parentNode?.kind !== "folder")
+  ) {
+    deferredItems.push(toDeferredFolderPlanItem(
+      item.path,
+      "parent-chain-incomplete",
+    ));
+    return;
+  }
+  // A1 乙 (2026-10-16) — same byte-exact spelling gate as the create-remote
+  // branch above: the destination parent identity is resolved through the
+  // folded key, while the receipt records `item.targetPath` (local spelling)
+  // and the reducer asserts the parent path byte-for-byte, so a move whose
+  // destination parent is only a spelling alias must not be emitted (field
+  // shape: anchor `videos/Notes`, local parent `Videos`). Root is exempt; a
+  // parent moved/created in this same plan is judged by the planned spelling.
+  const moveParentCanonicalPath = parent === ""
+    ? ""
+    : parentRemoteId
+      ? canonicalFolderPathById.get(parentRemoteId)
+        ?? plannedRemoteFolderPaths.get(normalizeRemotePathKey(parent))
+      : plannedRemoteFolderPaths.get(normalizeRemotePathKey(parent));
+  if (
+    moveParentCanonicalPath !== undefined
+    && moveParentCanonicalPath !== parent
+  ) {
+    deferredItems.push(toDeferredFolderPlanItem(
+      item.path,
+      "parent-chain-incomplete",
+    ));
+    return;
+  }
+  // F29 切片 1 (2026-10-16) — descendant projection gate, the same invariant
+  // the reducer enforces when it commits this folder-move receipt
+  // (`folder-state-reducer-v2.ts`: the receipt's folder upsert is applied to the
+  // committed index, and every file anchor below the source path must then
+  // project to the mechanical translation). When the cloud re-organized the
+  // subtree itself — a descendant re-parented, its identity replaced, or the
+  // anchor tombstoned — that assertion is unsatisfiable and the receipt would
+  // never commit: the record stays at `receiptPendingCommit` and every later
+  // round dies in the recovery step (field case 2026-10-16, Android 1.5.9:
+  // whole-vault stall, no exit, reset only). Withhold the move instead: the
+  // descendants reconcile through the ordinary file layer first, and the next
+  // round emits this move against an aligned subtree, so the folder location
+  // still converges — one round later and without a stuck record.
+  //
+  // Ask the question exactly the way the reducer will: patch the moved node
+  // with the receipt facts and project that. For `move-remote` the remote has
+  // not moved yet, so the current index alone would answer wrong (every
+  // descendant would look diverged). A destination parent created in this same
+  // plan has no identity yet — there the gate stays open and the reducer
+  // judges the committed result, as before.
+  if (parentRemoteId !== undefined) {
+    const movedName = item.targetPath.slice(item.targetPath.lastIndexOf("/") + 1);
+    const patchedPathById = projectRemoteNodesV2(
+      state.remoteNodes.map((node) => node.id === item.remoteId
+        ? { ...node, parentId: parentRemoteId, name: movedName }
+        : node),
+      state.scope.filesRootId,
+    ).pathById;
+    for (const anchor of state.fileAnchors) {
+      if (!isAnchoredDescendantV2(anchor.lastPath, item.sourcePath)) continue;
+      const translatedDescendant = translateAnchoredPathV2(
+        anchor.lastPath,
+        item.sourcePath,
+        item.targetPath,
+      );
+      if (
+        !anchor.remoteId
+        || patchedPathById.get(anchor.remoteId) !== translatedDescendant
+      ) {
+        deferredItems.push(toDeferredFolderPlanItem(
+          item.path,
+          "remote-subtree-changed",
+        ));
+        return;
+      }
+    }
+  }
+  moveItems.push({
+    type: item.type === "move-remote"
+      ? SyncActionType.MoveRemoteFolder
+      : SyncActionType.MoveLocalFolder,
+    path: item.targetPath,
+    renameFrom: item.sourcePath,
+    reviewImpactCount: Math.max(
+      1,
+      item.impact.files + item.impact.folders,
+    ),
+    folder: {
+      remoteId: item.remoteId,
+      remoteETag: remoteNode.eTag ?? anchor.remoteETag,
+      parentRemoteId,
+      parentPath: parent,
+      parentRemoteETag: parentNode?.eTag,
+      sourceParentRemoteId: item.type === "move-remote"
+        ? remoteNode.parentId
+        : anchor.parentRemoteId,
+    },
+  });
+  for (const root of [
+    item.sourcePath,
+    item.targetPath,
+    ...(item.affectedPaths ?? []),
+  ]) {
+    protectedRoots.add(root);
+    otherProtectedRoots.add(root);
+  }
+  return;
+}
+
 function applyFolderPlanItemV2(args: {
   item: FolderStatePlanV2["items"][number];
   state: CanonicalPlannerStateV2;
   remoteIdByPath: Map<string, string>;
+  canonicalFolderPathById: ReadonlyMap<string, string>;
+  plannedRemoteFolderPaths: ReadonlyMap<string, string>;
   plannedRemoteCreates: Set<string>;
   configDir: string;
   automaticDeleteLocalFiles: boolean;
@@ -537,6 +899,8 @@ function applyFolderPlanItemV2(args: {
     item,
     state,
     remoteIdByPath,
+    canonicalFolderPathById,
+    plannedRemoteFolderPaths,
     plannedRemoteCreates,
     configDir,
     automaticDeleteLocalFiles,
@@ -550,32 +914,15 @@ function applyFolderPlanItemV2(args: {
   } = args;
 
   if (item.type === "create-remote") {
-    const parent = parentFolderPath(item.path);
-    const parentRemoteId = parent === ""
-      ? state.scope.filesRootId
-      : remoteIdByPath.get(normalizeRemotePathKey(parent));
-    const parentNode = parentRemoteId
-      ? state.remoteNodeById.get(parentRemoteId)
-      : undefined;
-    if (
-      (!parentRemoteId
-        && !plannedRemoteCreates.has(normalizeRemotePathKey(parent)))
-      || (parentRemoteId && parent !== "" && parentNode?.kind !== "folder")
-    ) {
-      deferredItems.push(toDeferredFolderPlanItem(
-        item.path,
-        "parent-chain-incomplete",
-      ));
-      return;
-    }
-    createItems.push({
-      type: SyncActionType.CreateRemoteFolder,
-      path: item.path,
-      folder: {
-        parentRemoteId,
-        parentPath: parent,
-        parentRemoteETag: parentNode?.eTag,
-      },
+    applyCreateRemoteFolderItemV2({
+      item,
+      state,
+      remoteIdByPath,
+      canonicalFolderPathById,
+      plannedRemoteCreates,
+      plannedRemoteFolderPaths,
+      createItems,
+      deferredItems,
     });
     return;
   }
@@ -610,62 +957,20 @@ function applyFolderPlanItemV2(args: {
     && item.sourcePath
     && item.targetPath
   ) {
-    const remoteNode = state.remoteNodeById.get(item.remoteId);
-    const anchor = state.folderAnchorByRemoteId.get(item.remoteId);
-    if (!remoteNode || remoteNode.kind !== "folder" || !anchor) {
-      deferredItems.push(toDeferredFolderPlanItem(
-        item.path,
-        "parent-chain-incomplete",
-      ));
-      return;
-    }
-    const parent = parentFolderPath(item.targetPath);
-    const parentRemoteId = parent === ""
-      ? state.scope.filesRootId
-      : remoteIdByPath.get(normalizeRemotePathKey(parent));
-    const parentNode = parentRemoteId
-      ? state.remoteNodeById.get(parentRemoteId)
-      : undefined;
-    if (
-      (!parentRemoteId
-        && !plannedRemoteCreates.has(normalizeRemotePathKey(parent)))
-      || (parentRemoteId && parent !== "" && parentNode?.kind !== "folder")
-    ) {
-      deferredItems.push(toDeferredFolderPlanItem(
-        item.path,
-        "parent-chain-incomplete",
-      ));
-      return;
-    }
-    moveItems.push({
-      type: item.type === "move-remote"
-        ? SyncActionType.MoveRemoteFolder
-        : SyncActionType.MoveLocalFolder,
-      path: item.targetPath,
-      renameFrom: item.sourcePath,
-      reviewImpactCount: Math.max(
-        1,
-        item.impact.files + item.impact.folders,
-      ),
-      folder: {
-        remoteId: item.remoteId,
-        remoteETag: remoteNode.eTag ?? anchor.remoteETag,
-        parentRemoteId,
-        parentPath: parent,
-        parentRemoteETag: parentNode?.eTag,
-        sourceParentRemoteId: item.type === "move-remote"
-          ? remoteNode.parentId
-          : anchor.parentRemoteId,
-      },
+    applyFolderMoveItemV2({
+      // 上方守卫已证明这三个字段存在；TS 只收窄属性访问、不重定对象类型，
+      // 故在此显式收窄（避免在搬移块里改写引用方式）。
+      item: item as CanonicalFolderMoveItemV2,
+      state,
+      remoteIdByPath,
+      plannedRemoteCreates,
+      canonicalFolderPathById,
+      plannedRemoteFolderPaths,
+      moveItems,
+      deferredItems,
+      protectedRoots,
+      otherProtectedRoots,
     });
-    for (const root of [
-      item.sourcePath,
-      item.targetPath,
-      ...(item.affectedPaths ?? []),
-    ]) {
-      protectedRoots.add(root);
-      otherProtectedRoots.add(root);
-    }
     return;
   }
 
@@ -730,6 +1035,253 @@ function applyFolderPlanItemV2(args: {
  * decisions in the same iteration order as before. Returns the updated file
  * items plus the identity products the candidate is composed from.
  */
+type IdentityRenameActionItemV2 = ReturnType<typeof planIdentityRenamesFromStateV2>[number];
+type VerifyMoveLocalIdentityActionV2 = Extract<
+  IdentityRenameActionItemV2,
+  { type: "verify-move-local" }
+>;
+
+interface ApplyVerifyMoveLocalIdentityActionInputV2 {
+  action: VerifyMoveLocalIdentityActionV2;
+  state: Parameters<typeof applyIdentityRenameActionsV2>[0]["state"];
+  localFiles: Parameters<typeof applyIdentityRenameActionsV2>[0]["localFiles"];
+  remoteFilesById: ReadonlyMap<
+    string,
+    ReturnType<typeof projectCanonicalFileFactsFromStateV2>["remoteEntries"][number]
+  >;
+  deferredItems: SyncPlanItem[];
+  identityMoveVerifications: CanonicalIdentityMoveVerificationV2[];
+  fileItems: SyncPlanItem[];
+}
+
+/**
+ * `verify-move-local` identity actions: defer while the anchor/local/remote facts
+ * no longer match, then drop the file items the move blocks and record the
+ * verification. Returns the (possibly filtered) file items so the caller can
+ * keep its `fileItems` binding. Extracted verbatim from
+ * `applyIdentityRenameActionsV2`（2026-10-16 第二期类内分解；块内两处 `continue;`
+ * 改为 `return fileItems;`，其余逐字符未改）。
+ */
+function applyVerifyMoveLocalIdentityActionV2({
+  action,
+  state,
+  localFiles,
+  remoteFilesById,
+  deferredItems,
+  identityMoveVerifications,
+  fileItems,
+}: ApplyVerifyMoveLocalIdentityActionInputV2): SyncPlanItem[] {
+  const anchor = state.fileAnchorById.get(action.anchorId);
+  const local = localFiles.find(
+    (entry) =>
+      normalizeRemotePathKey(entry.path)
+      === normalizeRemotePathKey(action.fromPath),
+  );
+  const remote = remoteFilesById.get(action.remoteId);
+  if (
+    !anchor
+    || anchor.remoteId !== action.remoteId
+    || !local
+    || local.hash !== action.expectedLocalHash
+    || local.size !== action.expectedLocalSize
+    || !remote
+  ) {
+    deferredItems.push(identityMovePendingItem(
+      action.toPath,
+      "reason.identityMove.factsChanged",
+    ));
+    return fileItems;
+  }
+  const blockedPaths = new Set(
+    [action.fromPath, action.toPath].map(normalizeRemotePathKey),
+  );
+  fileItems = fileItems.filter(
+    (candidate) =>
+      !blockedPaths.has(normalizeRemotePathKey(candidate.path))
+      && !blockedPaths.has(
+        normalizeRemotePathKey(candidate.renameFrom ?? ""),
+      ),
+  );
+  identityMoveVerifications.push({
+    anchorId: action.anchorId,
+    remoteId: action.remoteId,
+    fromPath: action.fromPath,
+    toPath: action.toPath,
+    local,
+    remote,
+    base: {
+      path: anchor.lastPath,
+      hash: anchor.contentHash,
+      size: anchor.size,
+      eTag: anchor.remoteETag ?? "",
+    },
+  });
+  return fileItems;
+}
+
+type IdentityConflictActionV2 = Extract<IdentityRenameActionItemV2, { type: "conflict" }>;
+
+interface ApplyIdentityConflictActionInputV2 {
+  action: IdentityConflictActionV2;
+  protectedRoots: ReadonlySet<string>;
+  fileItems: SyncPlanItem[];
+  deferredItems: SyncPlanItem[];
+}
+
+/**
+ * `conflict` identity actions: keep out of already-protected roots, preserve an
+ * existing ordinary decision for the old cloud path when the local identity is
+ * only ambiguous, otherwise drop the blocked file items and defer the identity
+ * work. Returns the (possibly rewritten) file items so the caller can keep its
+ * `fileItems` binding. Extracted verbatim from `applyIdentityRenameActionsV2`
+ * （2026-10-16 第二期类内分解；块内四处 `continue;` 改为 `return fileItems;`，
+ * 其余逐字符未改）。
+ */
+function applyIdentityConflictActionV2({
+  action,
+  protectedRoots,
+  fileItems,
+  deferredItems,
+}: ApplyIdentityConflictActionInputV2): SyncPlanItem[] {
+  if (
+    [...protectedRoots].some((root) =>
+      isAtOrBelowPath(action.path, root))
+  ) return fileItems;
+  if (action.reason === "local-identity-ambiguous") {
+    const oldPathKey = normalizeRemotePathKey(action.path);
+    const ordinaryOldPathDecision = fileItems.find((candidate) =>
+      normalizeRemotePathKey(candidate.path) === oldPathKey
+      && (
+        candidate.type === SyncActionType.Conflict
+        || candidate.type === SyncActionType.DeleteRemote
+      )
+    );
+    if (ordinaryOldPathDecision?.type === SyncActionType.Conflict) {
+      // The file planner already keeps the old cloud path behind a normal
+      // decision while uploading every distinct local path. Preserve that
+      // safe plan instead of turning same-content copies into a global
+      // identity deferral.
+      return fileItems;
+    }
+    if (ordinaryOldPathDecision?.type === SyncActionType.DeleteRemote) {
+      fileItems = fileItems.filter(
+        (candidate) => candidate !== ordinaryOldPathDecision,
+      );
+      fileItems.push({
+        type: SyncActionType.Conflict,
+        path: action.path,
+        remote: ordinaryOldPathDecision.remote,
+        reason: "reason.renameIdentityAmbiguous",
+      });
+      return fileItems;
+    }
+  }
+  const blockedPaths = new Set(
+    [action.path, action.relatedPath, ...(action.relatedPaths ?? [])]
+      .filter((path): path is string => Boolean(path))
+      .map(normalizeRemotePathKey),
+  );
+  fileItems = fileItems.filter(
+    (candidate) =>
+      !blockedPaths.has(normalizeRemotePathKey(candidate.path))
+      && !blockedPaths.has(
+        normalizeRemotePathKey(candidate.renameFrom ?? ""),
+      ),
+  );
+  const identityReplacementConflict =
+    action.reason === "replacement-with-local-relocation"
+    || action.reason === "same-path-identity-occupied"
+    || action.reason === "remote-identity-missing";
+  deferredItems.push({
+    type: SyncActionType.FolderDeferred,
+    path: action.path,
+    reason: identityReplacementConflict
+      ? "reason.identityReplacement.ambiguous"
+      : identityMoveConflictReason(action.reason),
+  });
+  return fileItems;
+}
+
+type ReconcileRemoteIdentityActionV2 = Extract<
+  IdentityRenameActionItemV2,
+  { type: "reconcile-remote-identity" }
+>;
+
+interface ApplyReconcileRemoteIdentityActionInputV2 {
+  action: ReconcileRemoteIdentityActionV2;
+  state: Parameters<typeof applyIdentityRenameActionsV2>[0]["state"];
+  localFiles: Parameters<typeof applyIdentityRenameActionsV2>[0]["localFiles"];
+  remoteFilesById: ReadonlyMap<
+    string,
+    ReturnType<typeof projectCanonicalFileFactsFromStateV2>["remoteEntries"][number]
+  >;
+  fileItems: SyncPlanItem[];
+  deferredItems: SyncPlanItem[];
+  identityReplacements: CanonicalIdentityReplacementV2[];
+}
+
+/**
+ * `reconcile-remote-identity` identity actions: defer while the anchor/remote
+ * facts no longer match, otherwise drop the file items at the replaced path and
+ * record the identity replacement. Returns the (possibly filtered) file items so
+ * the caller can keep its `fileItems` binding. Extracted verbatim from
+ * `applyIdentityRenameActionsV2`（2026-10-16 第二期类内分解；块内两处 `continue;`
+ * 改为 `return fileItems;`，其余逐字符未改）。
+ */
+function applyReconcileRemoteIdentityActionV2({
+  action,
+  state,
+  localFiles,
+  remoteFilesById,
+  fileItems,
+  deferredItems,
+  identityReplacements,
+}: ApplyReconcileRemoteIdentityActionInputV2): SyncPlanItem[] {
+  const anchor = state.fileAnchorById.get(action.anchorId);
+  const remote = remoteFilesById.get(action.remoteId);
+  const local = localFiles.find(
+    (entry) =>
+      normalizeRemotePathKey(entry.path)
+      === normalizeRemotePathKey(action.path),
+  );
+  if (
+    !anchor
+    || !anchor.remoteId
+    || anchor.remoteId !== action.previousRemoteId
+    || !remote
+    || remote.eTag !== action.expectedRemoteETag
+  ) {
+    deferredItems.push({
+      type: SyncActionType.RetryLater,
+      path: action.path,
+      reason: "reason.identityReplacement.verificationPending",
+    });
+    return fileItems;
+  }
+  const replacementPath = normalizeRemotePathKey(action.path);
+  fileItems = fileItems.filter(
+    (candidate) =>
+      normalizeRemotePathKey(candidate.path) !== replacementPath
+      && normalizeRemotePathKey(candidate.renameFrom ?? "")
+        !== replacementPath,
+  );
+  identityReplacements.push({
+    anchorId: action.anchorId,
+    previousRemoteId: action.previousRemoteId,
+    remoteId: action.remoteId,
+    path: action.path,
+    ...(local ? { local } : {}),
+    remote,
+    base: {
+      path: anchor.lastPath,
+      hash: anchor.contentHash,
+      size: anchor.size,
+      eTag: anchor.remoteETag ?? "",
+    },
+  });
+  return fileItems;
+}
+
 function applyIdentityRenameActionsV2(args: {
   state: CanonicalPlannerStateV2;
   localFiles: readonly LocalFileEntry[];
@@ -787,156 +1339,37 @@ function applyIdentityRenameActionsV2(args: {
       )
     ) continue;
     if (action.type === "conflict") {
-      if (
-        [...protectedRoots].some((root) =>
-          isAtOrBelowPath(action.path, root))
-      ) continue;
-      if (action.reason === "local-identity-ambiguous") {
-        const oldPathKey = normalizeRemotePathKey(action.path);
-        const ordinaryOldPathDecision = fileItems.find((candidate) =>
-          normalizeRemotePathKey(candidate.path) === oldPathKey
-          && (
-            candidate.type === SyncActionType.Conflict
-            || candidate.type === SyncActionType.DeleteRemote
-          )
-        );
-        if (ordinaryOldPathDecision?.type === SyncActionType.Conflict) {
-          // The file planner already keeps the old cloud path behind a normal
-          // decision while uploading every distinct local path. Preserve that
-          // safe plan instead of turning same-content copies into a global
-          // identity deferral.
-          continue;
-        }
-        if (ordinaryOldPathDecision?.type === SyncActionType.DeleteRemote) {
-          fileItems = fileItems.filter(
-            (candidate) => candidate !== ordinaryOldPathDecision,
-          );
-          fileItems.push({
-            type: SyncActionType.Conflict,
-            path: action.path,
-            remote: ordinaryOldPathDecision.remote,
-            reason: "reason.renameIdentityAmbiguous",
-          });
-          continue;
-        }
-      }
-      const blockedPaths = new Set(
-        [action.path, action.relatedPath, ...(action.relatedPaths ?? [])]
-          .filter((path): path is string => Boolean(path))
-          .map(normalizeRemotePathKey),
-      );
-      fileItems = fileItems.filter(
-        (candidate) =>
-          !blockedPaths.has(normalizeRemotePathKey(candidate.path))
-          && !blockedPaths.has(
-            normalizeRemotePathKey(candidate.renameFrom ?? ""),
-          ),
-      );
-      const identityReplacementConflict =
-        action.reason === "replacement-with-local-relocation"
-        || action.reason === "same-path-identity-occupied"
-        || action.reason === "remote-identity-missing";
-      deferredItems.push({
-        type: SyncActionType.FolderDeferred,
-        path: action.path,
-        reason: identityReplacementConflict
-          ? "reason.identityReplacement.ambiguous"
-          : identityMoveConflictReason(action.reason),
+      fileItems = applyIdentityConflictActionV2({
+        action,
+        protectedRoots,
+        fileItems,
+        deferredItems,
       });
       continue;
     }
 
     if (action.type === "verify-move-local") {
-      const anchor = state.fileAnchorById.get(action.anchorId);
-      const local = localFiles.find(
-        (entry) =>
-          normalizeRemotePathKey(entry.path)
-          === normalizeRemotePathKey(action.fromPath),
-      );
-      const remote = remoteFilesById.get(action.remoteId);
-      if (
-        !anchor
-        || anchor.remoteId !== action.remoteId
-        || !local
-        || local.hash !== action.expectedLocalHash
-        || local.size !== action.expectedLocalSize
-        || !remote
-      ) {
-        deferredItems.push(identityMovePendingItem(
-          action.toPath,
-          "reason.identityMove.factsChanged",
-        ));
-        continue;
-      }
-      const blockedPaths = new Set(
-        [action.fromPath, action.toPath].map(normalizeRemotePathKey),
-      );
-      fileItems = fileItems.filter(
-        (candidate) =>
-          !blockedPaths.has(normalizeRemotePathKey(candidate.path))
-          && !blockedPaths.has(
-            normalizeRemotePathKey(candidate.renameFrom ?? ""),
-          ),
-      );
-      identityMoveVerifications.push({
-        anchorId: action.anchorId,
-        remoteId: action.remoteId,
-        fromPath: action.fromPath,
-        toPath: action.toPath,
-        local,
-        remote,
-        base: {
-          path: anchor.lastPath,
-          hash: anchor.contentHash,
-          size: anchor.size,
-          eTag: anchor.remoteETag ?? "",
-        },
+      fileItems = applyVerifyMoveLocalIdentityActionV2({
+        action,
+        state,
+        localFiles,
+        remoteFilesById,
+        deferredItems,
+        identityMoveVerifications,
+        fileItems,
       });
       continue;
     }
 
     if (action.type === "reconcile-remote-identity") {
-      const anchor = state.fileAnchorById.get(action.anchorId);
-      const remote = remoteFilesById.get(action.remoteId);
-      const local = localFiles.find(
-        (entry) =>
-          normalizeRemotePathKey(entry.path)
-          === normalizeRemotePathKey(action.path),
-      );
-      if (
-        !anchor
-        || !anchor.remoteId
-        || anchor.remoteId !== action.previousRemoteId
-        || !remote
-        || remote.eTag !== action.expectedRemoteETag
-      ) {
-        deferredItems.push({
-          type: SyncActionType.RetryLater,
-          path: action.path,
-          reason: "reason.identityReplacement.verificationPending",
-        });
-        continue;
-      }
-      const replacementPath = normalizeRemotePathKey(action.path);
-      fileItems = fileItems.filter(
-        (candidate) =>
-          normalizeRemotePathKey(candidate.path) !== replacementPath
-          && normalizeRemotePathKey(candidate.renameFrom ?? "")
-            !== replacementPath,
-      );
-      identityReplacements.push({
-        anchorId: action.anchorId,
-        previousRemoteId: action.previousRemoteId,
-        remoteId: action.remoteId,
-        path: action.path,
-        ...(local ? { local } : {}),
-        remote,
-        base: {
-          path: anchor.lastPath,
-          hash: anchor.contentHash,
-          size: anchor.size,
-          eTag: anchor.remoteETag ?? "",
-        },
+      fileItems = applyReconcileRemoteIdentityActionV2({
+        action,
+        state,
+        localFiles,
+        remoteFilesById,
+        fileItems,
+        deferredItems,
+        identityReplacements,
       });
       continue;
     }
@@ -1036,6 +1469,190 @@ export async function finalizeUnanchoredFolderEvidenceV2(
  * evidence reuse, download budget, automatic delete projection, decision
  * tokens and the change threshold are owned here.
  */
+interface SelectContentVerificationCandidatesInputV2 {
+  items: SyncPlanItem[];
+  baseByPath: ReadonlyMap<string, Parameters<typeof resolveContentEquality>[0]["base"]>;
+  pendingByPath: ReadonlyMap<string, Parameters<typeof contentDifferenceReceiptMatches>[0]>;
+  input: Parameters<typeof finalizeCanonicalPlanCandidateV2>[0];
+  remainingDownloadBudget: number;
+}
+
+interface SelectedContentVerificationCandidatesV2 {
+  candidates: SyncPlanItem[];
+  evidenceCandidates: SyncPlanItem[];
+  downloadCandidates: SyncPlanItem[];
+  selectedCandidates: SyncPlanItem[];
+}
+
+/**
+ * Pick the conflict candidates whose content equality is worth verifying: the
+ * ones with unknown equality (minus those a pending receipt already explains,
+ * whose receipt is stamped onto the item), the evidence-only subset, and the
+ * budgeted download subset that follows. Extracted verbatim from
+ * `finalizeCanonicalPlanCandidateV2`（2026-10-16 第二期类内分解，逐 token 等价）。
+ */
+function selectContentVerificationCandidatesV2({
+  items,
+  baseByPath,
+  pendingByPath,
+  input,
+  remainingDownloadBudget,
+}: SelectContentVerificationCandidatesInputV2): SelectedContentVerificationCandidatesV2 {
+  const candidates = items.filter((item) => {
+    if (
+      item.type !== SyncActionType.Conflict
+      || (
+        item.reason !== "reason.newFileBothSides"
+        && item.reason !== "reason.bothSidesModified"
+      )
+      || !item.local
+      || !item.remote
+      || item.local.size !== item.remote.size
+    ) {
+      return false;
+    }
+    const equality = resolveContentEquality({
+      local: item.local,
+      remote: item.remote,
+      base: baseByPath.get(item.path),
+      verifiedRemoteHash: input.verifiedRemoteContentHashesById
+        ?.get(item.remote.driveId),
+    });
+    if (equality.status !== "unknown") return true;
+    const receipt = pendingByPath.get(item.path);
+    if (contentDifferenceReceiptMatches(
+      receipt,
+      item.local,
+      item.remote,
+    )) {
+      item.contentComparison = receipt;
+      return false;
+    }
+    return true;
+  });
+  const evidenceCandidates = candidates.filter((item) =>
+    resolveContentEquality({
+      local: item.local!,
+      remote: item.remote!,
+      base: baseByPath.get(item.path),
+      verifiedRemoteHash: input.verifiedRemoteContentHashesById
+        ?.get(item.remote!.driveId),
+    }).status !== "unknown");
+  const evidencePaths = new Set(
+    evidenceCandidates.map((item) => item.path),
+  );
+  const maxDownloads = input.baselineReconstructionIncomplete
+    ? candidates.length
+    : remainingDownloadBudget;
+  const downloadCandidates = candidates
+    .filter((item) => !evidencePaths.has(item.path))
+    .slice(0, maxDownloads);
+  const selectedCandidates = [
+    ...evidenceCandidates,
+    ...downloadCandidates,
+  ];
+
+  return {
+    candidates,
+    evidenceCandidates,
+    downloadCandidates,
+    selectedCandidates,
+  };
+}
+
+interface VerificationPrefetchInputV2 {
+  downloadCandidates: SyncPlanItem[];
+  input: Parameters<typeof finalizeCanonicalPlanCandidateV2>[0];
+}
+
+/**
+ * Knife-1 (2026-09-08, carrier `docs/temp/20260908-1331`): planner-stage
+ * downloadUrl refresh for exactly the budgeted verification download set.
+ * Called at most once, before any content download below; fail-open — a
+ * missing or throwing hook leaves every URL unset so the per-file waterfall
+ * refresh behaves exactly as before batching. Extracted verbatim from
+ * `finalizeCanonicalPlanCandidateV2`（2026-10-16 第二期类内分解，逐 token 等价）。
+ */
+async function refreshVerificationDownloadUrlsV2({
+  downloadCandidates,
+  input,
+}: VerificationPrefetchInputV2): Promise<void> {
+  if (downloadCandidates.length > 0 && input.refreshVerificationDownloadUrls) {
+    try {
+      await input.refreshVerificationDownloadUrls(downloadCandidates);
+    } catch {
+      // Fail-open by contract: never let an optimization hook change the
+      // verification outcome; unrefreshed items keep the per-file waterfall.
+    }
+  }
+}
+
+/**
+ * Knife-2 (2026-09-08, carrier `docs/temp/20260908-1331`): bounded
+ * read-only overlap for the conflict-candidate verification downloads.
+ * downloadCandidates is the exact budgeted set the loop below downloads
+ * (every member has unknown equality by construction), so we may prefetch
+ * them in windows of at most maxFiles files / maxBytes bytes while the
+ * per-item decision loop below stays serial and consumes results in its
+ * original order. Fail-open: a missing window keeps strictly serial
+ * verification downloads (today's behavior); a member missing from the
+ * prefetch map falls back to the original serial await. Extracted verbatim from
+ * `finalizeCanonicalPlanCandidateV2`（2026-10-16 第二期类内分解，逐 token 等价）。
+ */
+async function prefetchVerificationDownloadHashesV2({
+  downloadCandidates,
+  input,
+}: VerificationPrefetchInputV2): Promise<
+  Map<string, { hash: string } | { error: unknown }>
+> {
+  const downloadWindow = input.verificationDownloadWindow;
+  const prefetchedDownloadHashes = new Map<
+    string,
+    { hash: string } | { error: unknown }
+  >();
+  if (
+    downloadWindow
+    && downloadWindow.maxFiles >= 1
+    && downloadWindow.maxBytes >= 1
+    && downloadCandidates.length > 1
+  ) {
+    const windowMembers: SyncPlanItem[] = [];
+    let windowBytes = 0;
+    let prefetchedCount = 0;
+    const flushWindow = async (): Promise<void> => {
+      if (windowMembers.length === 0) return;
+      await Promise.all(windowMembers.map(async (item, inside) => {
+        try {
+          const hash = await input.resolveRemoteContentHash(item, {
+            current: prefetchedCount + inside + 1,
+            total: downloadCandidates.length,
+          });
+          prefetchedDownloadHashes.set(item.path, { hash });
+        } catch (error) {
+          prefetchedDownloadHashes.set(item.path, { error });
+        }
+      }));
+      prefetchedCount += windowMembers.length;
+      windowMembers.length = 0;
+      windowBytes = 0;
+    };
+    for (const item of downloadCandidates) {
+      const bytes = item.remote?.size ?? item.local?.size ?? 0;
+      if (
+        windowMembers.length >= downloadWindow.maxFiles
+        || (windowMembers.length > 0 && windowBytes + bytes > downloadWindow.maxBytes)
+      ) {
+        await flushWindow();
+      }
+      windowMembers.push(item);
+      windowBytes += bytes;
+    }
+    await flushWindow();
+  }
+
+  return prefetchedDownloadHashes;
+}
+
 export async function finalizeCanonicalPlanCandidateV2(
   input: FinalizeCanonicalPlanInputV2,
 ): Promise<FinalizedCanonicalPlanV2> {
@@ -1123,125 +1740,23 @@ export async function finalizeCanonicalPlanCandidateV2(
     remainingDownloadBudget = counters.remainingDownloadBudget;
   }
 
-  const candidates = items.filter((item) => {
-    if (
-      item.type !== SyncActionType.Conflict
-      || (
-        item.reason !== "reason.newFileBothSides"
-        && item.reason !== "reason.bothSidesModified"
-      )
-      || !item.local
-      || !item.remote
-      || item.local.size !== item.remote.size
-    ) {
-      return false;
-    }
-    const equality = resolveContentEquality({
-      local: item.local,
-      remote: item.remote,
-      base: baseByPath.get(item.path),
-      verifiedRemoteHash: input.verifiedRemoteContentHashesById
-        ?.get(item.remote.driveId),
-    });
-    if (equality.status !== "unknown") return true;
-    const receipt = pendingByPath.get(item.path);
-    if (contentDifferenceReceiptMatches(
-      receipt,
-      item.local,
-      item.remote,
-    )) {
-      item.contentComparison = receipt;
-      return false;
-    }
-    return true;
+  const {
+    candidates,
+    evidenceCandidates,
+    downloadCandidates,
+    selectedCandidates,
+  } = selectContentVerificationCandidatesV2({
+    items,
+    baseByPath,
+    pendingByPath,
+    input,
+    remainingDownloadBudget,
   });
-  const evidenceCandidates = candidates.filter((item) =>
-    resolveContentEquality({
-      local: item.local!,
-      remote: item.remote!,
-      base: baseByPath.get(item.path),
-      verifiedRemoteHash: input.verifiedRemoteContentHashesById
-        ?.get(item.remote!.driveId),
-    }).status !== "unknown");
-  const evidencePaths = new Set(
-    evidenceCandidates.map((item) => item.path),
-  );
-  const maxDownloads = input.baselineReconstructionIncomplete
-    ? candidates.length
-    : remainingDownloadBudget;
-  const downloadCandidates = candidates
-    .filter((item) => !evidencePaths.has(item.path))
-    .slice(0, maxDownloads);
-  const selectedCandidates = [
-    ...evidenceCandidates,
-    ...downloadCandidates,
-  ];
-  // Knife-1 (2026-09-08, carrier `docs/temp/20260908-1331`): planner-stage
-  // downloadUrl refresh for exactly the budgeted verification download set.
-  // Called at most once, before any content download below; fail-open — a
-  // missing or throwing hook leaves every URL unset so the per-file waterfall
-  // refresh behaves exactly as before batching.
-  if (downloadCandidates.length > 0 && input.refreshVerificationDownloadUrls) {
-    try {
-      await input.refreshVerificationDownloadUrls(downloadCandidates);
-    } catch {
-      // Fail-open by contract: never let an optimization hook change the
-      // verification outcome; unrefreshed items keep the per-file waterfall.
-    }
-  }
-  const downloadWindow = input.verificationDownloadWindow;
-  // Knife-2 (2026-09-08, carrier `docs/temp/20260908-1331`): bounded
-  // read-only overlap for the conflict-candidate verification downloads.
-  // downloadCandidates is the exact budgeted set the loop below downloads
-  // (every member has unknown equality by construction), so we may prefetch
-  // them in windows of at most maxFiles files / maxBytes bytes while the
-  // per-item decision loop below stays serial and consumes results in its
-  // original order. Fail-open: a missing window keeps strictly serial
-  // verification downloads (today's behavior); a member missing from the
-  // prefetch map falls back to the original serial await.
-  const prefetchedDownloadHashes = new Map<
-    string,
-    { hash: string } | { error: unknown }
-  >();
-  if (
-    downloadWindow
-    && downloadWindow.maxFiles >= 1
-    && downloadWindow.maxBytes >= 1
-    && downloadCandidates.length > 1
-  ) {
-    const windowMembers: SyncPlanItem[] = [];
-    let windowBytes = 0;
-    let prefetchedCount = 0;
-    const flushWindow = async (): Promise<void> => {
-      if (windowMembers.length === 0) return;
-      await Promise.all(windowMembers.map(async (item, inside) => {
-        try {
-          const hash = await input.resolveRemoteContentHash(item, {
-            current: prefetchedCount + inside + 1,
-            total: downloadCandidates.length,
-          });
-          prefetchedDownloadHashes.set(item.path, { hash });
-        } catch (error) {
-          prefetchedDownloadHashes.set(item.path, { error });
-        }
-      }));
-      prefetchedCount += windowMembers.length;
-      windowMembers.length = 0;
-      windowBytes = 0;
-    };
-    for (const item of downloadCandidates) {
-      const bytes = item.remote?.size ?? item.local?.size ?? 0;
-      if (
-        windowMembers.length >= downloadWindow.maxFiles
-        || (windowMembers.length > 0 && windowBytes + bytes > downloadWindow.maxBytes)
-      ) {
-        await flushWindow();
-      }
-      windowMembers.push(item);
-      windowBytes += bytes;
-    }
-    await flushWindow();
-  }
+  await refreshVerificationDownloadUrlsV2({ downloadCandidates, input });
+  const prefetchedDownloadHashes = await prefetchVerificationDownloadHashesV2({
+    downloadCandidates,
+    input,
+  });
   const falseConflicts = new Set<string>();
   const baseUpserts: BaseFileEntry[] = [...identityBaseUpserts];
   const results: ContentVerificationResultV2[] = [];
@@ -2337,12 +2852,12 @@ const CANONICAL_REVIEW_VISIBLE_FACT_NAMES_V2 = new Set<string>([
 
 const CANONICAL_PLAN_ITEM_FACTS_DRIFT_SAMPLE_LIMIT_V2 = 10;
 
-export type CanonicalPlanItemFactsDriftReasonV2 =
+type CanonicalPlanItemFactsDriftReasonV2 =
   | "unparsable"
   | "shape-mismatch"
   | "sealed-plan-not-reproducible";
 
-export interface CanonicalPlanItemFactsDriftSampleV2 {
+interface CanonicalPlanItemFactsDriftSampleV2 {
   kind: "changed" | "added" | "removed";
   type: string;
   path: string;

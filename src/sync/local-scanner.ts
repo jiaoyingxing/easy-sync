@@ -45,7 +45,7 @@ interface ScanCacheEntry {
 }
 
 /** One prior per-path scan observation (the local change history seed). */
-export interface ScanCacheHistoryEntry extends ScanCacheEntry {
+interface ScanCacheHistoryEntry extends ScanCacheEntry {
   observedAt: number;
 }
 
@@ -54,7 +54,7 @@ type ScanCache = {
   entries: Record<string, ScanCacheEntry>;
   histories: Record<string, ScanCacheHistoryEntry[]>;
 };
-export interface LocalScanResult {
+interface LocalScanResult {
   entries: LocalFileEntry[];
   /** Read-only folder topology. It does not authorize folder mutations. */
   folders: LocalFolderEntry[];
@@ -224,7 +224,7 @@ function isBinary(content: ArrayBuffer): boolean {
  *  directory. Directories are intentionally not affected. */
 const DEFAULT_EXCLUDED_FILE_BASENAMES = new Set([".ds_store", "thumbs.db"]);
 
-export function isDefaultExcludedFileName(fileName: string): boolean {
+function isDefaultExcludedFileName(fileName: string): boolean {
   const name = fileName.toLowerCase();
   if (name.startsWith("~$")) return true;
   if (name.endsWith(".tmp")) return true;

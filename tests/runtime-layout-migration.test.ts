@@ -111,6 +111,62 @@ describe("EasySync runtime layout migration", () => {
     expect(files.has(`${legacy.pluginDir}/notes.txt`)).toBe(true);
   });
 
+  // 2026-10-16（Q3）：旧版把远端枚举检查点放在插件根目录，当前布局在
+  // `runtime/cache/` 下；补登记后它必须真的被搬过去（与扫描缓存同档）。
+  // 检查点本身是 fail-open 缓存（缺失／过期只会退化成整段重读，不会读出错数据），
+  // 所以这条钉的是"旧文件不再滞留"——未登记的文件永远不会被发现，也就永远
+  // 不会被清理，旧布局目录会一直留着。
+  it("carries the legacy remote-enumeration checkpoint into the cache directory", async () => {
+    const { adapter, files } = makeAdapter({
+      [legacy.remoteEnumCheckpointFile]: "{\"scopeFingerprint\":\"s\"}",
+    });
+
+    const result = await ensureEasySyncRuntimeLayoutMigration(adapter, current, legacy);
+
+    expect(result.migrated).toEqual([legacy.remoteEnumCheckpointFile]);
+    expect(files.get(current.remoteEnumCheckpointFile))
+      .toBe("{\"scopeFingerprint\":\"s\"}");
+  });
+
+  // 同族的第二个面（Q3 核到）：两份拷贝字节不一致时，缓存类必须**跳过**而不是
+  // 阻断整次布局迁移——当前的扫描缓存本来就在可丢弃档，检查点必须同档，否则
+  // 一个过期缓存会把布局升级卡死（fail-open 缓存没有这种权限）。
+  it("skips a stale checkpoint copy instead of blocking the layout change", async () => {
+    const { adapter, files } = makeAdapter({
+      [legacy.remoteEnumCheckpointFile]: "{\"stale\":true}",
+      [current.remoteEnumCheckpointFile]: "{\"fresh\":true}",
+    });
+
+    const result = await ensureEasySyncRuntimeLayoutMigration(adapter, current, legacy);
+
+    expect(result.conflicts).toEqual([legacy.remoteEnumCheckpointFile]);
+    expect(files.get(current.remoteEnumCheckpointFile)).toBe("{\"fresh\":true}");
+  });
+
+  // 2026-10-16（Q3 顺带核到）：前缀组的**目标路径**写法。旧版把两类隔离文件与
+  // 目录直接放在插件根下，新布局把它们收进 state/v2 与 objects/ 下——目标必须是
+  // "旧的相对路径前缀换成新的相对路径前缀"，不是"再剥一次插件目录前缀"。
+  it("maps the root-level prefix groups onto their new relative prefixes", async () => {
+    const { adapter, files } = makeAdapter({
+      [`${legacy.pluginDir}/state-v2.corrupt-source-1.json`]: "corrupt",
+      [`${legacy.pluginDir}/state-v2.reactivation-archive-2.json`]: "archive",
+      [`${legacy.stateV2IndexedDbRecoveryDir}/db.bin`]: "indexeddb",
+      [`${legacy.ancestorsV2Dir}/tree.json`]: "ancestors",
+    });
+
+    const result = await ensureEasySyncRuntimeLayoutMigration(adapter, current, legacy);
+
+    expect(result.migrated).toHaveLength(4);
+    expect(files.get(`${current.pluginDir}/state/v2/state-v2.corrupt-source-1.json`))
+      .toBe("corrupt");
+    expect(files.get(`${current.pluginDir}/state/v2/state-v2.reactivation-archive-2.json`))
+      .toBe("archive");
+    expect(files.get(`${current.pluginDir}/state/v2/indexeddb-recovery/db.bin`))
+      .toBe("indexeddb");
+    expect(files.get(`${current.pluginDir}/objects/ancestors-v2/tree.json`))
+      .toBe("ancestors");
+  });
+
   it("discovers an isolated legacy V2 or ancestor state file", async () => {
     const { adapter, files } = makeAdapter({
       [legacy.stateV2File]: "state",

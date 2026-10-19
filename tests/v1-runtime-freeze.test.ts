@@ -34,11 +34,33 @@ function listTypeScriptFiles(root: string): string[] {
     .sort();
 }
 
+/**
+ * 本次运行内的源码内容缓存（2026-10-17，B12 时基健康）。
+ *
+ * 本文件的守卫用**同一批 src 文件**（实测 154 个文件 / 4.07 MiB）跑 25 次模式扫描：
+ * 上面那组 `it.each` 每条模式重新走一遍全目录并重新读一遍每个文件，合计约 102 MiB
+ * 同步读取。机器忙时（杀软扫描／磁盘排队）这段纯 I/O 会整段变慢，让守卫在默认 5s
+ * 超时上假红——那是机器的时基，不是判据。
+ *
+ * 只在**同一次进程运行内**复用文件内容：不改任何一条守卫的判据、扫描面或期望值，
+ * 也不改目录遍历本身（`listTypeScriptFiles` 仍然每次真走一遍）。测试不写 `src/`，
+ * 所以一次运行内文件内容不会变。
+ */
+const sourceTextCache = new Map<string, string>();
+
+function readSourceText(path: string): string {
+  const cached = sourceTextCache.get(path);
+  if (cached !== undefined) return cached;
+  const text = readFileSync(path, "utf8");
+  sourceTextCache.set(path, text);
+  return text;
+}
+
 function countDebt(pattern: RegExp): Record<string, number> {
   return Object.fromEntries(
     listTypeScriptFiles("src")
       .map((path) => {
-        const source = readFileSync(path, "utf8");
+        const source = readSourceText(path);
         return [path, [...source.matchAll(pattern)].length] as const;
       })
       .filter((entry) => entry[1] > 0),
@@ -47,7 +69,7 @@ function countDebt(pattern: RegExp): Record<string, number> {
 
 function filesContaining(literal: string): string[] {
   return listTypeScriptFiles("src")
-    .filter((path) => readFileSync(path, "utf8").includes(literal));
+    .filter((path) => readSourceText(path).includes(literal));
 }
 
 const FILE_SYNC_V1_DEBT: DebtGuard[] = [
@@ -145,7 +167,7 @@ const V2_70_BOUNDARY_OWNERS: BoundaryOwnerGuard[] = [
     label: "public 1.1.3 state importer module",
     disposition: "public-read-only-import",
     literal: "public-1-1-3-state-import",
-    expectedFiles: ["src/sync/state-manager.ts"],
+    expectedFiles: ["src/sync/state-manager.ts", "src/sync/state-v2-migration.ts"],
   },
   {
     label: "public 1.1.3 cutover controller module",
@@ -226,27 +248,55 @@ const V2_70_BOUNDARY_OWNERS: BoundaryOwnerGuard[] = [
       "src/sync/diagnostic-report-evidence.ts",
       "src/sync/file-state-reducer-v2.ts",
       "src/sync/folder-state-reducer-v2.ts",
+      // S2 隔离通道（2026-10-17）：逐形状有界证据 capsule 只读记录本身的
+      // 意图与收据形状（准入判定零写入、零第二状态源；见
+      // docs/temp/20261016-151934 §六 S2 行）。
+      "src/sync/isolation-capsules.ts",
       "src/sync/state-manager.ts",
       "src/sync/state-v2-migration.ts",
       "src/sync/sync-executor.ts",
+      // S1 观测刀（2026-10-17 用户拍板）：轮末只读扫描恢复账本记录面组成事实
+      // 指纹（零写入、零控制流；见 docs/temp/20261016-151934 §六 S1）。
+      "src/sync/sync-idle-observation.ts",
       "src/sync/types.ts",
     ],
   },
 ];
 
 describe("file-sync V1 runtime freeze", () => {
+  // 超时分档（2026-10-17，B12 时基健康）：本组守卫每次都要走一遍全 `src` 目录并
+  // 读遍每个文件，属"整仓扫描型"。默认 5s 是给普通用例的时基，机器忙时（杀软／
+  // 磁盘排队／并行全量）纯 I/O 就能吃掉它 ⇒ 给 30s 余量（实测单条 4–83ms，见交付
+  // 报告普查清单）；判据、扫描面与期望值一个没动。
   it.each(FILE_SYNC_V1_DEBT)(
     "allows $label debt only to shrink",
     ({ pattern, expected }) => {
       expect(countDebt(pattern)).toEqual(expected);
     },
+    30_000,
   );
+
+  // 反假绿（2026-10-16 检查体检轮）：上面那组门断言的是"某个模式一处都搜不到"，
+  // 也就是**零命中即通过**——目录改名、递归断掉、`readFileSync` 抛错被吞、
+  // `matchAll` 拿到空串，都会让门静默变绿。这条控制项证明**探测器本身在工作**：
+  // 扫描面非空，且一个必然命中的模式确实命中了一批文件。
+  // 已知边界：它证明的是"扫描机制没坏"，不能证明每条模式的**写法**没写错
+  // （模式写错仍会零命中而变绿）；逐条兜底需要给每个守卫补一个"应当命中的样本串"
+  // 字段并断言 `pattern.test(probe)`，已登记为检查体检轮的实施候选。
+  it("keeps the V1 debt scanner itself non-vacuous", () => {
+    const scanned = listTypeScriptFiles("src");
+    expect(scanned.length).toBeGreaterThan(100);
+
+    const control = countDebt(/\bexport\b/g);
+    expect(Object.keys(control).length).toBeGreaterThan(50);
+  }, 30_000);
 
   it.each(V2_70_BOUNDARY_OWNERS)(
     "keeps $disposition owner set explicit for $label",
     ({ literal, expectedFiles }) => {
       expect(filesContaining(literal)).toEqual(expectedFiles);
     },
+    30_000,
   );
 
   it("keeps deleted V1 planner facades and constructor seams out of src", () => {
@@ -312,7 +362,7 @@ describe("file-sync V1 runtime freeze", () => {
 
   it("keeps the public-1.1.3 reentry fixture independent and outside production source", () => {
     const productionSources = listTypeScriptFiles("src")
-      .map((path) => readFileSync(path, "utf8"))
+      .map((path) => readSourceText(path))
       .join("\n");
     const fixture = readFileSync(
       "tests/helpers/public-1-1-3-reentry-fixture.ts",
@@ -325,7 +375,7 @@ describe("file-sync V1 runtime freeze", () => {
       "ad708214a0421025889cd334f8d3e91b885b7df4747d55ecd425fe8a2a8aa581",
     );
     expect(fixture).not.toContain("file-decision-planner-v2");
-  });
+  }, 30_000);
 
   it("keeps the immutable public-1.1.3 fixture out of the production bundle graph", async () => {
     const bundled = await build({
@@ -351,7 +401,11 @@ describe("file-sync V1 runtime freeze", () => {
     expect(output).not.toContain("V2 file projection shadow");
     expect(output).not.toContain("V2 receipt shadow");
     expect(output).not.toContain("V2 next-envelope shadow");
-  });
+    // 超时分档（2026-10-17，B12 时基健康）：本条是**打包子门**——`esbuild` 真跑一次
+    // 整包构建。它是全仓唯一会拉起打包器／子进程的用例，等待时间由机器负载而非判据
+    // 决定（实测热态 0.19–0.23s，全量跑内 1.97s，并行全量负载下 1.78s，野外曾见 6–10s）
+    // ⇒ 给 60s 余量（约 30x 最慢实测）。
+  }, 60_000);
 
   it("does not confuse unrelated version-1 schemas with the frozen file-sync runtime", () => {
     const policy = readFileSync("src/sync/community-plugin-sync-policy.ts", "utf8");

@@ -641,6 +641,74 @@ describe("OneDriveClient.downloadFile", () => {
     expect(requestSpy).toHaveBeenCalledTimes(1);
   });
 
+  it("reads a response declaring more than the file's own size as the content race, not a standing fact", async () => {
+    // 2026-10-16（Q2）：同一物理竞态的第三个检测点——远端在本机读到元数据之后
+    // 被改写，于是响应头声明的长度大于该文件自己的尺寸。它此前与「自身超硬上限」
+    // 共用 kind="declared" ⇒ 被当恒久条件硬失败、自动同步暂停；改判后归瞬时延后。
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(
+      new Uint8Array([1, 2, 3, 4]),
+      { status: 200, headers: { "Content-Length": "4" } },
+    ));
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    const requestSpy = vi.spyOn(obsidian, "requestUrl");
+
+    try {
+      const client = new OneDriveClient(async () => "token");
+      await expect(client.downloadFile(
+        "testVault",
+        "note.md",
+        "https://download.example/note.md",
+        "file-id",
+        3,
+      )).rejects.toMatchObject({
+        name: "ResponseByteBudgetError",
+        kind: "declared-over-expected",
+        message: expect.stringContaining("4 > 3"),
+      });
+      expect(requestSpy).not.toHaveBeenCalled();
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+    }
+  });
+
+  it("keeps a declared size over the hard cap a standing fact when the file size is unknown", async () => {
+    // 反例护栏（同族精度钉）：元数据尺寸不可用时预算回落到硬上限，此时响应声明
+    // 超上限仍是恒久条件——不得因为新增了竞态档就把这一格也并进延后。
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    const overCap = 2 * 1024 * 1024 * 1024 + 1;
+    const fetchSpy = vi.fn().mockResolvedValue(new Response(
+      new Uint8Array([1, 2, 3, 4]),
+      { status: 200, headers: { "Content-Length": String(overCap) } },
+    ));
+    (globalThis as { window?: unknown }).window = { fetch: fetchSpy };
+    const requestSpy = vi.spyOn(obsidian, "requestUrl");
+
+    try {
+      const client = new OneDriveClient(async () => "token");
+      await expect(client.downloadFile(
+        "testVault",
+        "note.md",
+        "https://download.example/note.md",
+        "file-id",
+      )).rejects.toMatchObject({
+        name: "ResponseByteBudgetError",
+        kind: "declared",
+      });
+      expect(requestSpy).not.toHaveBeenCalled();
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+    }
+  });
+
   it("removes a partial streamed file when the body exceeds its declared size", async () => {
     const originalWindow = (globalThis as { window?: unknown }).window;
     const fetchSpy = vi.fn().mockResolvedValue(
@@ -4504,6 +4572,72 @@ describe("OneDriveClient vault initialization", () => {
       "https://graph.microsoft.com/v1.0/me/drive/special/approot:/vaults/other/files:/delta?token=wrong",
     )).toBe(false);
     expect(requestSpy).not.toHaveBeenCalled();
+  });
+
+  it("recognizes a cursor after the server re-serializes the vault route", () => {
+    const client = new OneDriveClient(async () => "token");
+    const scope = {
+      driveId: "drive-id",
+      vaultFolderId: "vault-folder-id",
+      filesRootId: "files-root-id",
+    };
+    // Field shape (2026-10-14): the client builds this route with the vault
+    // name percent-escaped (`/vaults/AI%40Techseed/files:/delta`), while the
+    // service hands the same route back with a literal "@" and re-escaped
+    // query separators (`%2c`, `%40`).
+    const serverSerialized =
+      "https://graph.microsoft.com/v1.0/me/drive/special/approot:/vaults/AI@Techseed/files:/delta?$top=500&$select=id%2cname%2c%40microsoft.graph.downloadUrl&token=known";
+
+    expect(client.isDeltaLinkForVault("AI@Techseed", serverSerialized)).toBe(true);
+    // A different case is still the same OneDrive directory.
+    expect(client.isDeltaLinkForVault(
+      "AI@Techseed",
+      serverSerialized.replace("/vaults/AI@Techseed/", "/vaults/ai@techseed/"),
+    )).toBe(true);
+    expect(client.restoreVaultScope("AI@Techseed", scope, serverSerialized)).toBe(true);
+  });
+
+  it("keeps the canonical vault spelling after restoring from a re-serialized cursor", async () => {
+    const vaultName = "AI@Techseed";
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: { id: "uploaded-id", eTag: "etag-uploaded" },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    expect(client.restoreVaultScope(
+      vaultName,
+      {
+        driveId: "drive-id",
+        vaultFolderId: "vault-folder-id",
+        filesRootId: "files-root-id",
+      },
+      "https://graph.microsoft.com/v1.0/me/drive/special/approot:/vaults/AI@Techseed/files:/delta?token=known",
+    )).toBe(true);
+    await client.uploadFile(vaultName, "probe.md", new ArrayBuffer(1));
+
+    expect(requestSpy.mock.calls[0][0].url).toContain(
+      "/vaults/AI%40Techseed/files/probe.md:/content",
+    );
+  });
+
+  it("still refuses a cursor for a different vault route and an undecodable one", () => {
+    const client = new OneDriveClient(async () => "token");
+    const scope = {
+      driveId: "drive-id",
+      vaultFolderId: "vault-folder-id",
+      filesRootId: "files-root-id",
+    };
+    const foreignLink =
+      "https://graph.microsoft.com/v1.0/me/drive/special/approot:/vaults/other/files:/delta?token=wrong";
+    const undecodableLink =
+      "https://graph.microsoft.com/v1.0/me/drive/special/approot:/vaults/test%zzVault/files:/delta?token=wrong";
+
+    expect(client.isDeltaLinkForVault("testVault", foreignLink)).toBe(false);
+    expect(client.isDeltaLinkForVault("testVault", undecodableLink)).toBe(false);
+    expect(client.restoreVaultScope("testVault", scope, foreignLink)).toBe(false);
+    expect(client.restoreVaultScope("testVault", scope, undecodableLink)).toBe(false);
   });
 
   it("resolves an existing vault scope with GET requests only in read-only mode", async () => {

@@ -22,7 +22,7 @@ import {
  */
 export const COMMUNITY_PLUGIN_DISPLAY_FACTS_PROBE_LIMIT = 10;
 
-export interface CommunityPluginDisplayFactsResult {
+interface CommunityPluginDisplayFactsResult {
   /** Bundles whose manifest text was downloaded, parsed, and persisted. */
   probed: number;
   /** Complete bundles already covered by a source-matching stored observation. */
@@ -31,7 +31,7 @@ export interface CommunityPluginDisplayFactsResult {
   failed: number;
 }
 
-export interface CommunityPluginDisplayFactsInput {
+interface CommunityPluginDisplayFactsInput {
   /** Scope the catalog and every new observation must be bound to. */
   scope: Readonly<SyncScope>;
   /**
