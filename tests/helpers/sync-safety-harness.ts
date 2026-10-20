@@ -27,6 +27,11 @@ import type {
 } from "../../src/sync/types";
 import { SyncExecutor } from "../../src/sync/sync-executor";
 import type { SyncResult } from "../../src/sync/sync-executor";
+import {
+  emptyDeletionLedgerV1,
+  upsertDeletionLedgerEntryV1,
+  type DeletionLedgerEntryV1,
+} from "../../src/sync/deletion-ledger";
 import { OneDriveClient, ResponseByteBudgetError } from "../../src/onedrive/client";
 import { OneDriveError, OneDriveErrorType, type DriveItem } from "../../src/onedrive/types";
 import type { LocalScanner } from "../../src/sync/local-scanner";
@@ -197,6 +202,9 @@ export function remoteStateStub() {
     cacheBaseContent: vi.fn(),
     getBaseContent: vi.fn().mockReturnValue(undefined),
     getBaseEntry: vi.fn((path: string) => undefined),
+    // 删除记录簿：桩状态没有 committed V2 信封，路径取不到锚点身份——照实返回
+    // undefined（调用方的「拿不到 id 就不记」边界）。
+    remoteIdForPath: vi.fn((_path: string) => undefined),
     mutationLedger: [],
     hasMutationLedgerCorruption: false,
     beginMutationIntent: vi.fn().mockResolvedValue(undefined),
@@ -230,6 +238,7 @@ export function makeActiveV2State(
   const pendingAncestorContent = new Map<string, string | ArrayBuffer>();
   let commitSeq = 1;
   let committedAt = 1;
+  let deletionLedger = emptyDeletionLedgerV1();
   let envelope = createFileStateShadowEnvelopeV2({
     scope,
     lifecycleEpoch: 1,
@@ -337,6 +346,17 @@ export function makeActiveV2State(
     getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
     getBaseEntry: vi.fn((path: string) =>
       baseSnapshot.find((entry) => entry.path === path)),
+    // 删除记录簿：真实涨落（同族命令式 reduce），并在归约删锚点前按路径读身份。
+    remoteIdForPath: vi.fn((path: string) =>
+      Object.values(envelope.anchors.byAnchorId).find(
+        (anchor) => anchor.lastPath === path,
+      )?.remoteId),
+    get deletionLedgerEntries() {
+      return deletionLedger.entries;
+    },
+    recordCloudDeletion: vi.fn(async (entry: DeletionLedgerEntryV1) => {
+      deletionLedger = upsertDeletionLedgerEntryV1(deletionLedger, entry);
+    }),
     upsertPendingConflicts: vi.fn().mockResolvedValue(undefined),
     prunePendingConflicts: vi.fn().mockResolvedValue(undefined),
     upsertPendingDeletes: vi.fn().mockResolvedValue(undefined),
@@ -933,6 +953,9 @@ export async function makeManualResolutionHarness(input: {
   configDir?: string;
   receiptedRenameAnchorCollision?: boolean;
   pendingConflictPaths?: string[];
+  /** 只有云端一侧的冲突行（本机已删、云端改过）：本机删除出口带着合法
+   *  decisionToken，可直接驱动「保留本机＝删掉云端那份多余副本」分支。 */
+  remoteOnlyConflictPaths?: string[];
   withLedger?: boolean;
   progressStore?: SyncProgressStore;
   /** 给了任一项就模拟真实宿主：它认得库里的文件，并且自己有写入面
@@ -1277,6 +1300,31 @@ export async function makeManualResolutionHarness(input: {
           hash: await sha256Hex(local),
           size: local.byteLength,
         },
+        remote: {
+          exists: true,
+          driveId: remote.driveId,
+          eTag: remote.eTag,
+        },
+        ancestorHash: null,
+      },
+    });
+  }
+  for (const path of input.remoteOnlyConflictPaths ?? []) {
+    const remote = remoteFiles.get(path)?.entry;
+    if (!remote) {
+      throw new Error(`remote-only conflict harness requires a remote file: ${path}`);
+    }
+    pendingConflicts.push({
+      type: SyncActionType.Conflict,
+      path,
+      remote,
+      reason: "reason.localDeletedRemoteModified",
+      decisionToken: {
+        version: 1,
+        vaultName: "testVault",
+        accountId: scope.accountId,
+        scope,
+        local: { exists: false },
         remote: {
           exists: true,
           driveId: remote.driveId,

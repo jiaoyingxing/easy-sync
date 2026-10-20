@@ -663,7 +663,7 @@ describe("network-class transfer failure marking (2026-10-16)", () => {
   // 「失败原因就是链路本身」的失败单独计数（`networkFailureErrors`），
   // main 侧暂停门据此只在"整轮错误全是网络类"时放行。计数不改 errors，
   // 历史、待处理行与失败提示继续如实。
-  function makeFailingDownloadExecutor(error: unknown) {
+  function makeFailingDownloadExecutor(error: unknown, i18n?: I18n) {
     const downloadFile = vi.fn().mockRejectedValue(error);
     const remote: RemoteFileEntry = {
       path: "offline.md",
@@ -707,6 +707,7 @@ describe("network-class transfer failure marking (2026-10-16)", () => {
       } as unknown as LocalScanner,
       mockState,
       "testVault",
+      i18n,
     );
     return { executor, downloadFile, mockState };
   }
@@ -782,6 +783,36 @@ describe("network-class transfer failure marking (2026-10-16)", () => {
     const rows = reconcileCalls.at(-1)?.filter((issue) => issue.path === "offline.md") ?? [];
     expect(rows).toHaveLength(1);
     expect(rows[0].issueCode).toBeUndefined();
+  });
+
+  it("presents a run-level 507 with the storage-full reason instead of the raw status", async () => {
+    const { executor, mockState } = makeFailingDownloadExecutor(
+      new OneDriveError(OneDriveErrorType.NetworkError, "offline"),
+      new I18n("zh-cn"),
+    );
+    mockState.reconcilePendingIssues = vi.fn().mockRejectedValue(
+      new OneDriveError(OneDriveErrorType.InsufficientStorage, "HTTP 507", 507),
+    );
+
+    const result = await executor.run("auto", {});
+
+    expect(result.success).toBe(false);
+    expect(result.message).toBe("同步失败：OneDrive 存储空间不足");
+  });
+
+  it("presents a run-level 408 with the network request reason", async () => {
+    const { executor, mockState } = makeFailingDownloadExecutor(
+      new OneDriveError(OneDriveErrorType.NetworkError, "offline"),
+      new I18n("zh-cn"),
+    );
+    mockState.reconcilePendingIssues = vi.fn().mockRejectedValue(
+      new OneDriveError(OneDriveErrorType.Unknown, "request timeout", 408),
+    );
+
+    const result = await executor.run("auto", {});
+
+    expect(result.success).toBe(false);
+    expect(result.message).toBe("同步失败：网络请求失败");
   });
 });
 

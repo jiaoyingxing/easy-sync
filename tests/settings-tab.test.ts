@@ -247,6 +247,13 @@ describe("settings tab", () => {
       /body:not\(\.is-mobile\) \.easy-sync-settings-tab \.setting-item-control button:not\(\.clickable-icon\)\s*\{([^}]*)\}/,
     )?.[1] ?? "";
     expect(rule).toContain("min-width: calc(4em + var(--size-4-3) * 2)");
+    // 1.13+ sub-pages are reparented into a host-owned `.setting-page`
+    // container that drops the tab class, so the rule above misses them.
+    // The active EasySync nav item scopes the same width to those pages.
+    const subpageRule = styles.match(
+      /body:not\(\.is-mobile\) \.vertical-tabs-container:has\(\.vertical-tab-nav-item\.is-active\[data-setting-id="easy-sync"\]\) \.setting-page \.setting-item-control button:not\(\.clickable-icon\)\s*\{([^}]*)\}/,
+    )?.[1] ?? "";
+    expect(subpageRule).toContain("min-width: calc(4em + var(--size-4-3) * 2)");
   });
 
   it("uses a native folder picker and native settings for device-local exclusions", () => {
@@ -1577,8 +1584,10 @@ describe("imperative maintenance group · local-only reversal row (件③)", () 
     t: (key: string, params?: Record<string, string | number>) => string,
   ): Array<{ name: string; desc?: string }> {
     const tab = new EasySyncSettingTab(plugin);
-    (tab as unknown as { maintenanceSectionEl: unknown }).maintenanceSectionEl =
-      createMockElement();
+    const host = tab as unknown as Record<string, unknown>;
+    host.maintenanceSectionEl = createMockElement();
+    // 2026-10-20 起维护页拆两组：顶部诊断＋「高级」组，两组宿主都要给。
+    host.maintenanceAdvancedSectionEl = createMockElement();
     const rows: Array<{ name: string; desc?: string }> = [];
     let current: { name: string; desc?: string } | null = null;
     const nameSpy = vi.spyOn(Setting.prototype, "setName").mockImplementation(
@@ -1618,6 +1627,7 @@ describe("imperative maintenance group · local-only reversal row (件③)", () 
       diagLogEnabled: false,
       generateDiagnosticReport: vi.fn().mockResolvedValue(undefined),
       resetSyncState: vi.fn().mockResolvedValue(undefined),
+      openRecoveryEntry: vi.fn(),
     } as unknown as EasySyncPlugin;
   }
 
@@ -1633,7 +1643,8 @@ describe("imperative maintenance group · local-only reversal row (件③)", () 
     // 单向但没有可收回的内容：保持零动作干净态。
     expect(namesIn(makeMaintenancePlugin({ direction: "one-way", ignoredCount: 0 })))
       .not.toContain(t("settings.localOnlyIgnored.name"));
-    // 单向且有被忽略的条目：出现在「生成报告」与「重置」之间，说明带计数。
+    // 单向且有被忽略的条目：出现在「同步回收站」与「重置」之间（「高级」组
+    // 内，2026-10-20 用户拍板分组），说明带计数。
     const rows = renderRowNames(
       makeMaintenancePlugin({ direction: "one-way", ignoredCount: 4 }),
       t,
@@ -1641,9 +1652,11 @@ describe("imperative maintenance group · local-only reversal row (件③)", () 
     expect(rows.map((row) => row.name)).toEqual([
       t("settings.diagLog.name"),
       t("settings.diagReport.name"),
+      // 「高级」组首行＝同步回收站（同组在重置之上）。
+      t("settings.recoveryBin.name"),
       t("settings.localOnlyIgnored.name"),
       t("settings.reset.name"),
     ]);
-    expect(rows[2].desc).toBe(t("settings.localOnlyIgnored.desc", { count: 4 }));
+    expect(rows[3].desc).toBe(t("settings.localOnlyIgnored.desc", { count: 4 }));
   });
 });

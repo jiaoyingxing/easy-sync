@@ -132,6 +132,9 @@ export class EasySyncSettingTab extends PluginSettingTab {
   private displaySectionEl: HTMLElement | null = null;
   private aboutSectionEl: HTMLElement | null = null;
   private maintenanceSectionEl: HTMLElement | null = null;
+  /** 维护页「高级」组宿主（2026-10-20 用户拍板：同步回收站＋重置一组，
+   *  顶部诊断日志与报告单独成组、不加外侧标题）。 */
+  private maintenanceAdvancedSectionEl: HTMLElement | null = null;
   /** 1.13+ 根级导航行图标的补挂观察器（宿主重建根行后自动补）。 */
   private rootRowIconObserver: MutationObserver | null = null;
 
@@ -145,6 +148,21 @@ export class EasySyncSettingTab extends PluginSettingTab {
     // 插件整栏被宿主隐藏，由 styles.css 只放开我们自己那一行）。
     this.icon = SETTINGS_TAB_ICON;
     this.observeRootRowIcons();
+  }
+
+  /**
+   * 当前宿主是否走声明式渲染（1.13+）。声明式时 `display()` 不会被调用、行由
+   * `getSettingDefinitions()` 承接；几处刷新路径与装饰共用这一个判别。
+   */
+  private isDeclarativeRender(): boolean {
+    const declarative = this as unknown as { settingItems?: unknown[] };
+    if (
+      declarative.settingItems === undefined
+      || declarative.settingItems.length === 0
+    ) {
+      return false;
+    }
+    return true;
   }
 
   display(): void {
@@ -164,6 +182,9 @@ export class EasySyncSettingTab extends PluginSettingTab {
     this.aboutSectionEl = containerEl.createDiv("easy-sync-settings-group-host easy-sync-settings-about");
     this.maintenanceSectionEl = containerEl.createDiv(
       "easy-sync-settings-group-host easy-sync-settings-maintenance",
+    );
+    this.maintenanceAdvancedSectionEl = containerEl.createDiv(
+      "easy-sync-settings-group-host easy-sync-settings-maintenance-advanced",
     );
 
     // ========================================================================
@@ -202,12 +223,8 @@ export class EasySyncSettingTab extends PluginSettingTab {
     // getSettingDefinitions() and accountSectionEl is never populated, so the
     // refresh must go through update(). On older hosts fall back to the
     // imperative display() path.
-    const declarative = this as unknown as {
-      settingItems?: unknown[];
-      update?: () => void;
-    };
-    if (declarative.settingItems !== undefined && declarative.settingItems.length > 0) {
-      declarative.update?.();
+    if (this.isDeclarativeRender()) {
+      (this as unknown as { update?: () => void }).update?.();
       return;
     }
     if (!this.accountSectionEl?.isConnected) return;
@@ -279,12 +296,8 @@ export class EasySyncSettingTab extends PluginSettingTab {
   refreshSyncState(): void {
     // Same split as refreshAuthState: declarative render on 1.13.0+,
     // imperative display() fallback on older hosts.
-    const declarative = this as unknown as {
-      settingItems?: unknown[];
-      update?: () => void;
-    };
-    if (declarative.settingItems !== undefined && declarative.settingItems.length > 0) {
-      declarative.update?.();
+    if (this.isDeclarativeRender()) {
+      (this as unknown as { update?: () => void }).update?.();
       return;
     }
     if (
@@ -293,6 +306,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
       && !this.automaticSectionEl?.isConnected
       && !this.displaySectionEl?.isConnected
       && !this.maintenanceSectionEl?.isConnected
+      && !this.maintenanceAdvancedSectionEl?.isConnected
     ) return;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     this.renderAccountSection(t);
@@ -312,6 +326,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
     this.displaySectionEl = null;
     this.aboutSectionEl = null;
     this.maintenanceSectionEl = null;
+    this.maintenanceAdvancedSectionEl = null;
     this.flushExclusionChanges();
   }
 
@@ -344,13 +359,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
    * 普通设置行），只在声明式渲染（1.13+）才装饰。
    */
   private decorateRootRowIcons(): void {
-    const declarative = this as unknown as { settingItems?: unknown[] };
-    if (
-      declarative.settingItems === undefined
-      || declarative.settingItems.length === 0
-    ) {
-      return;
-    }
+    if (!this.isDeclarativeRender()) return;
     decorateSettingsRootRowIcons(
       this.containerEl,
       this.plugin.i18n.t.bind(this.plugin.i18n),
@@ -610,11 +619,10 @@ export class EasySyncSettingTab extends PluginSettingTab {
   ): void {
     if (!this.maintenanceSectionEl) return;
     this.maintenanceSectionEl.empty();
-    const maintGroup = new SettingGroup(this.maintenanceSectionEl).setHeading(
-      t("settings.group.maintenance"),
-    );
+    // 首组不加外侧标题（同各页口径，2026-10-12 拍板）：顶部只放诊断日志与报告。
+    const diagGroup = new SettingGroup(this.maintenanceSectionEl);
 
-    maintGroup.addSetting((setting) => {
+    diagGroup.addSetting((setting) => {
       setting
         .setName(t("settings.diagLog.name"))
         .setDesc(t("settings.diagLog.desc"))
@@ -637,7 +645,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
         });
     });
 
-    maintGroup.addSetting((setting) => {
+    diagGroup.addSetting((setting) => {
       setting
         .setName(t("settings.diagReport.name"))
         .setDesc(t("settings.diagReport.desc"))
@@ -649,6 +657,23 @@ export class EasySyncSettingTab extends PluginSettingTab {
         });
     });
 
+    if (!this.maintenanceAdvancedSectionEl) return;
+    this.maintenanceAdvancedSectionEl.empty();
+    // 「高级」组（2026-10-20 用户拍板）：同步回收站＋重置一组，回收站在上。
+    const advancedGroup = new SettingGroup(this.maintenanceAdvancedSectionEl)
+      .setHeading(t("settings.maintenanceAdvanced.heading"));
+
+    advancedGroup.addSetting((setting) => {
+      setting
+        .setName(t("settings.recoveryBin.name"))
+        .setDesc(t("settings.recoveryBin.desc"))
+        .addButton((btn) => {
+          btn.setButtonText(t("settings.recoveryBin.button")).onClick(() => {
+            this.plugin.openRecoveryEntry();
+          });
+        });
+    });
+
     // 件③ 反转入口：单向模式且确有被忽略的条目时出现（忽略记忆在双向不生效）。
     // 只隐藏、不删除——双向或计数归零后这一行自己退场；`refreshSyncState()`
     // 会重渲染本组，所以面板里逐条/批量忽略后立刻出现。
@@ -656,7 +681,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
       this.plugin.syncDirection === "one-way"
       && this.plugin.getIgnoredLocalOnlyCount() > 0
     ) {
-      maintGroup.addSetting((setting) => {
+      advancedGroup.addSetting((setting) => {
         applyLocalOnlyIgnoredRow(setting, {
           plugin: this.plugin,
           t,
@@ -666,7 +691,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
       });
     }
 
-    maintGroup.addSetting((setting) => {
+    advancedGroup.addSetting((setting) => {
       setting
         .setName(t("settings.reset.name"))
         .setDesc(t("settings.reset.desc"))
@@ -1255,7 +1280,7 @@ function buildAboutPage(
   };
 }
 
-/** 维护页（原「维护」组逐行平移；件③ 反转入口按条件出现）。 */
+/** 维护页（2026-10-20 用户拍板）：顶部诊断为无标题组，…「高级」组＝同步回收站（上）＋件③ 反转入口（按条件）＋重置。 */
 function buildMaintenancePage(
   t: I18nFn,
   plugin: EasySyncPlugin,
@@ -1265,83 +1290,99 @@ function buildMaintenancePage(
     type: "page",
     name: t("settings.group.maintenance"),
     items: [
-      {
-        name: t("settings.diagLog.name"),
-        desc: t("settings.diagLog.desc"),
-        render: (setting) => {
-          setting.controlEl.empty();
-          setting.addToggle((toggle) => {
-            toggle.setValue(plugin.diagLogEnabled)
-              .onChange(async (value) => {
-                const previous = plugin.diagLogEnabled;
-                plugin.diagLogEnabled = value;
-                try {
-                  await plugin.saveSyncSettings();
-                } catch {
-                  plugin.diagLogEnabled = previous;
-                  toggle.setValue(previous);
-                  new Notice(t("notice.settingsSaveFailed"));
-                  return;
-                }
-                plugin.applyDiagnosticSetting();
-              });
-          });
-        },
-      },
-      {
-        name: t("settings.diagReport.name"),
-        desc: t("settings.diagReport.desc"),
-        render: (setting) => {
-          setting.controlEl.empty();
-          setting.addButton((btn) => {
-            btn.setButtonText(t("settings.diagReport.generate"))
-              .onClick(() => { void plugin.generateDiagnosticReport(); });
-          });
-        },
-      },
-      {
-        name: t("settings.localOnlyIgnored.name"),
-        desc: t("settings.localOnlyIgnored.desc", {
-          count: plugin.getIgnoredLocalOnlyCount(),
-        }),
-        // 件③：单向模式且确有被忽略的条目时才出现（忽略记忆在双向模式不生效，
-        // 没有可收回的内容时保持零动作干净态）。
-        visible: () =>
-          plugin.syncDirection === "one-way"
-          && plugin.getIgnoredLocalOnlyCount() > 0,
-        render: (setting) => applyLocalOnlyIgnoredRow(setting, host),
-      },
-      {
-        name: t("settings.reset.name"),
-        desc: t("settings.reset.desc"),
-        render: (setting) => {
-          setting.controlEl.empty();
-          setting.addButton((btn) => {
-            // Mirror renderMaintenanceSection: destructive style plus a
-            // two-step confirm before any state is cleared.
-            btn.buttonEl.classList.add("mod-warning");
-            btn.setButtonText(t("settings.reset.button")).onClick(() => {
-              void (async () => {
-                const confirmed = await new ConfirmModal(
-                  plugin.app,
-                  t("settings.reset.confirmTitle"),
-                  t("settings.reset.confirm"),
-                  t("confirm.cancel"),
-                  t,
-                  {
-                    message: t("settings.reset.confirmMessage"),
-                    warning: t("settings.reset.confirmWarning"),
-                    danger: true,
-                  },
-                ).awaitConfirm();
-                if (!confirmed) return;
-                await plugin.resetSyncState();
-                host.refresh();
-              })();
+      { type: "group", items: [
+        {
+          name: t("settings.diagLog.name"),
+          desc: t("settings.diagLog.desc"),
+          render: (setting) => {
+            setting.controlEl.empty();
+            setting.addToggle((toggle) => {
+              toggle.setValue(plugin.diagLogEnabled)
+                .onChange(async (value) => {
+                  const previous = plugin.diagLogEnabled;
+                  plugin.diagLogEnabled = value;
+                  try {
+                    await plugin.saveSyncSettings();
+                  } catch {
+                    plugin.diagLogEnabled = previous;
+                    toggle.setValue(previous);
+                    new Notice(t("notice.settingsSaveFailed"));
+                    return;
+                  }
+                  plugin.applyDiagnosticSetting();
+                });
             });
-          });
+          },
         },
-      },
+        {
+          name: t("settings.diagReport.name"),
+          desc: t("settings.diagReport.desc"),
+          render: (setting) => {
+            setting.controlEl.empty();
+            setting.addButton((btn) => {
+              btn.setButtonText(t("settings.diagReport.generate"))
+                .onClick(() => { void plugin.generateDiagnosticReport(); });
+            });
+          },
+        },
+      ] },
+      { heading: t("settings.maintenanceAdvanced.heading"), type: "group", items: [
+        {
+          name: t("settings.recoveryBin.name"),
+          desc: t("settings.recoveryBin.desc"),
+          render: (setting) => {
+            setting.controlEl.empty();
+            setting.addButton((btn) => {
+              btn.setButtonText(t("settings.recoveryBin.button")).onClick(() => {
+                plugin.openRecoveryEntry();
+              });
+            });
+          },
+        },
+        {
+          name: t("settings.localOnlyIgnored.name"),
+          desc: t("settings.localOnlyIgnored.desc", {
+            count: plugin.getIgnoredLocalOnlyCount(),
+          }),
+          // 件③：单向模式且确有被忽略的条目时才出现（忽略记忆在双向模式不生效，
+          // 没有可收回的内容时保持零动作干净态）。
+          visible: () =>
+            plugin.syncDirection === "one-way"
+            && plugin.getIgnoredLocalOnlyCount() > 0,
+          render: (setting) => applyLocalOnlyIgnoredRow(setting, host),
+        },
+        {
+          name: t("settings.reset.name"),
+          desc: t("settings.reset.desc"),
+          render: (setting) => {
+            setting.controlEl.empty();
+            setting.addButton((btn) => {
+              // Mirror renderMaintenanceSection: destructive style plus a
+              // two-step confirm before any state is cleared.
+              btn.buttonEl.classList.add("mod-warning");
+              btn.setButtonText(t("settings.reset.button")).onClick(() => {
+                void (async () => {
+                  const confirmed = await new ConfirmModal(
+                    plugin.app,
+                    t("settings.reset.confirmTitle"),
+                    t("settings.reset.confirm"),
+                    t("confirm.cancel"),
+                    t,
+                    {
+                      message: t("settings.reset.confirmMessage"),
+                      warning: t("settings.reset.confirmWarning"),
+                      danger: true,
+                    },
+                  ).awaitConfirm();
+                  if (!confirmed) return;
+                  await plugin.resetSyncState();
+                  host.refresh();
+                })();
+              });
+            });
+          },
+        },
+      ] },
     ],
   };
 }

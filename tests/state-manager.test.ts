@@ -7,6 +7,7 @@ import {
 import { SyncActionType } from "../src/sync/types";
 import { createCommunityPluginManifestObservation } from "../src/sync/community-plugin-bundle";
 import { buildRemoteCommunityPluginCatalog } from "../src/sync/community-plugin-remote-catalog";
+import { localArchiveStampV1 } from "../src/sync/local-archive";
 import type { DriveItem } from "../src/onedrive/types";
 import type {
   BaseFileEntry,
@@ -1992,5 +1993,243 @@ describe("local-only ignore memory (仅接收片⑤)", () => {
         ignoredPaths: [],
       });
     }
+  });
+});
+
+describe("cloud deletion ledger (文件版本找回刀一之二)", () => {
+  const KEY = "easy-sync-deletion-ledger";
+  const entry = {
+    remoteId: "item-1",
+    path: "notes/deleted.md",
+    deletedAt: 1_700_000_000_000,
+    kind: "file" as const,
+  };
+
+  function ledgerData(entries: Array<Record<string, unknown>>) {
+    return {
+      [KEY]: {
+        schemaVersion: 1,
+        kind: "easy-sync-deletion-ledger",
+        entries,
+      },
+    };
+  }
+
+  it("round-trips the new record family through plugin data", async () => {
+    const { state, plugin, saveData } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue(ledgerData([entry]));
+    await state.load();
+    expect(state.deletionLedgerEntries).toEqual([entry]);
+
+    saveData.mockClear();
+    await state.recordCloudDeletion({
+      remoteId: "item-2",
+      path: "notes/folder",
+      deletedAt: 2,
+      kind: "folder",
+    });
+    const appended = {
+      remoteId: "item-2",
+      path: "notes/folder",
+      deletedAt: 2,
+      kind: "folder",
+    };
+    expect(state.deletionLedgerEntries).toEqual([entry, appended]);
+    expect(saveData).toHaveBeenCalledWith(expect.objectContaining(
+      ledgerData([entry, appended]),
+    ));
+
+    // 同 id 重放＝更新，不重复。
+    saveData.mockClear();
+    await state.recordCloudDeletion({
+      remoteId: "item-2",
+      path: "notes/renamed",
+      deletedAt: 3,
+      kind: "folder",
+    });
+    expect(state.deletionLedgerEntries).toEqual([
+      entry,
+      { remoteId: "item-2", path: "notes/renamed", deletedAt: 3, kind: "folder" },
+    ]);
+    expect(saveData).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips the durable write when a replayed deletion changes nothing", async () => {
+    const { state, plugin, saveData } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue(ledgerData([entry]));
+    await state.load();
+
+    saveData.mockClear();
+    await state.recordCloudDeletion(entry);
+    expect(saveData).not.toHaveBeenCalled();
+  });
+
+  it("clears the record family with the rest of the local sync records on reset", async () => {
+    const { state, plugin } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue(ledgerData([entry]));
+    await state.load();
+    expect(state.deletionLedgerEntries).toEqual([entry]);
+
+    // 记录族随「重置同步状态」清空（留档夹是用户内容，不在此列）。
+    await state.reset();
+    expect(state.deletionLedgerEntries).toEqual([]);
+  });
+
+  it("degrades a corrupt record family to an empty list instead of failing the load", async () => {
+    for (const corrupt of [
+      "nope",
+      ledgerData([{ path: "x" }]),
+      {
+        schemaVersion: 7,
+        kind: "easy-sync-deletion-ledger",
+        entries: [entry],
+      },
+      {
+        schemaVersion: 1,
+        kind: "local-only-copies",
+        entries: [entry],
+      },
+      {
+        schemaVersion: 1,
+        kind: "easy-sync-deletion-ledger",
+        entries: "nope",
+      },
+      [entry],
+      null,
+    ]) {
+      const { state, plugin } = makeState();
+      vi.mocked(plugin.loadData).mockResolvedValue({ [KEY]: corrupt });
+      await state.load();
+      expect(state.deletionLedgerEntries).toEqual([]);
+    }
+  });
+});
+
+describe("deletion ledger 30-day prune in the healthy round", () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  const PLUGIN_DIR = ".obsidian/plugins/easy-sync";
+  const ARCHIVE_ROOT = `${PLUGIN_DIR}/archive`;
+
+  type AdapterSpies = {
+    exists: ReturnType<typeof vi.fn>;
+    list: ReturnType<typeof vi.fn>;
+    rmdir: ReturnType<typeof vi.fn>;
+  };
+
+  function adapterSpies(plugin: PluginDataStore): AdapterSpies {
+    return plugin.app.vault.adapter as unknown as AdapterSpies;
+  }
+
+  function ledgerEntry(remoteId: string, deletedAt: number) {
+    return { remoteId, path: `${remoteId}.md`, deletedAt, kind: "file" as const };
+  }
+
+  function archiveListing(folders: string[], plugin: PluginDataStore): AdapterSpies {
+    const adapter = adapterSpies(plugin);
+    adapter.exists.mockImplementation(async (target: string) =>
+      target === ARCHIVE_ROOT);
+    adapter.list.mockImplementation(async (target: string) =>
+      target === ARCHIVE_ROOT
+        ? { files: [], folders: folders.map((name) => `${ARCHIVE_ROOT}/${name}`) }
+        : { files: [], folders: [] });
+    return adapter;
+  }
+
+  it("prunes expired records and expired archive folders, keeping the rest", async () => {
+    const { state, plugin, saveData } = makeState();
+    const now = Date.now();
+    const expiredRecord = ledgerEntry("expired", now - 31 * DAY);
+    const freshRecord = ledgerEntry("fresh", now - 29 * DAY);
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-deletion-ledger": {
+        schemaVersion: 1,
+        kind: "easy-sync-deletion-ledger",
+        entries: [expiredRecord, freshRecord],
+      },
+    });
+    await state.load();
+
+    const expiredFolder = localArchiveStampV1(now - 31 * DAY);
+    const freshFolder = localArchiveStampV1(now - 2 * DAY);
+    const adapter = archiveListing(
+      [expiredFolder, freshFolder, "manual-backup", "2024-13-01 0000"],
+      plugin,
+    );
+
+    saveData.mockClear();
+    await state.noteHealthySync();
+
+    // 记录簿：窗口外的摘掉，窗口内的原样保留。
+    expect(state.deletionLedgerEntries).toEqual([freshRecord]);
+    expect(saveData).toHaveBeenCalledWith(expect.objectContaining({
+      "easy-sync-deletion-ledger": {
+        schemaVersion: 1,
+        kind: "easy-sync-deletion-ledger",
+        entries: [freshRecord],
+      },
+    }));
+    // 留档夹：旧戳目录连同内容整目录删除；新戳与认不出的名字都不动。
+    expect(adapter.rmdir).toHaveBeenCalledTimes(1);
+    expect(adapter.rmdir).toHaveBeenCalledWith(
+      `${ARCHIVE_ROOT}/${expiredFolder}`,
+      true,
+    );
+    expect(adapter.rmdir).not.toHaveBeenCalledWith(
+      `${ARCHIVE_ROOT}/${freshFolder}`,
+      true,
+    );
+    expect(adapter.rmdir).not.toHaveBeenCalledWith(
+      `${ARCHIVE_ROOT}/manual-backup`,
+      true,
+    );
+    expect(adapter.rmdir).not.toHaveBeenCalledWith(
+      `${ARCHIVE_ROOT}/2024-13-01 0000`,
+      true,
+    );
+  });
+
+  it("writes nothing when no record and no archive folder left the window", async () => {
+    const { state, plugin, saveData } = makeState();
+    const now = Date.now();
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-deletion-ledger": {
+        schemaVersion: 1,
+        kind: "easy-sync-deletion-ledger",
+        entries: [ledgerEntry("fresh", now - 1000)],
+      },
+    });
+    await state.load();
+    const adapter = archiveListing(
+      [localArchiveStampV1(now - 2 * DAY)],
+      plugin,
+    );
+
+    saveData.mockClear();
+    await state.noteHealthySync();
+
+    expect(saveData).not.toHaveBeenCalled();
+    expect(adapter.rmdir).not.toHaveBeenCalled();
+  });
+
+  it("never lets housekeeping failures escape the healthy round", async () => {
+    const { state, plugin, saveData } = makeState();
+    const now = Date.now();
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-deletion-ledger": {
+        schemaVersion: 1,
+        kind: "easy-sync-deletion-ledger",
+        entries: [ledgerEntry("expired", now - 31 * DAY)],
+      },
+    });
+    await state.load();
+    const adapter = archiveListing(["manual-backup"], plugin);
+    adapter.exists.mockRejectedValue(new Error("adapter broken"));
+    adapter.list.mockRejectedValue(new Error("adapter broken"));
+
+    saveData.mockClear();
+    // 留档夹一步失败不上抛，也不挡住记录簿摘除。
+    await expect(state.noteHealthySync()).resolves.toBeUndefined();
+    expect(state.deletionLedgerEntries).toEqual([]);
+    expect(saveData).toHaveBeenCalledTimes(1);
   });
 });

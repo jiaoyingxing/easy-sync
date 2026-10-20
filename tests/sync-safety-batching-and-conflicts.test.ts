@@ -15,6 +15,9 @@ import {
   sha256Hex,
 } from "../src/crypto";
 import {
+  getEasySyncPaths,
+} from "../src/obsidian-compat";
+import {
   SyncActionType,
 } from "../src/sync/types";
 import type {
@@ -1854,6 +1857,60 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     return { center, messages };
   }
 
+  /** 内存盘：`files` 里的键就是磁盘上真实存在的文件，写入/改名都按真语义落地。 */
+  function makeKeepRemoteFileStore(
+    initial: Record<string, ArrayBuffer>,
+    options: { failWriteBinary?: (target: string) => boolean } = {},
+  ) {
+    const files = new Map(Object.entries(initial));
+    return {
+      files,
+      adapterOverrides: {
+        exists: vi.fn(async (target: string) => files.has(target)),
+        stat: vi.fn(async (target: string) => {
+          const bytes = files.get(target);
+          return bytes ? { size: bytes.byteLength, mtime: 2 } : null;
+        }),
+        readBinary: vi.fn(async (target: string) => files.get(target) ?? new ArrayBuffer(0)),
+        writeBinary: vi.fn(async (target: string, bytes: ArrayBuffer) => {
+          if (options.failWriteBinary?.(target)) throw new Error("disk full");
+          files.set(target, bytes.slice(0));
+        }),
+        remove: vi.fn(async (target: string) => { files.delete(target); }),
+        rename: vi.fn(async (from: string, to: string) => {
+          const bytes = files.get(from);
+          if (!bytes) throw new Error(`missing ${from}`);
+          files.set(to, bytes);
+          files.delete(from);
+        }),
+      },
+      inspectFile: vi.fn(async (target: string) => {
+        const bytes = files.get(target);
+        if (!bytes) return { status: "missing" as const };
+        return {
+          status: "present" as const,
+          entry: {
+            path: target,
+            size: bytes.byteLength,
+            mtime: 2,
+            hash: await sha256Hex(bytes),
+            binary: false,
+          },
+        };
+      }),
+    };
+  }
+
+  /** 留档夹契约（独立于实现重算）：`<pluginDir>/archive/<yyyy-MM-dd HHmm>/<库内相对路径>`。 */
+  function expectedArchiveFilePath(path: string, archivedAt: number): string {
+    const pluginDir = getEasySyncPaths(".obsidian").pluginDir;
+    const date = new Date(archivedAt);
+    const pad = (value: number): string => String(value).padStart(2, "0");
+    const stamp = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+      + `${pad(date.getHours())}${pad(date.getMinutes())}`;
+    return `${pluginDir}/archive/${stamp}/${path}`;
+  }
+
   it("keepRemote feeds byte progress into the shared progress store", async () => {
     const progressStore = new SyncProgressStore();
     const snapshots: Array<{
@@ -1872,6 +1929,7 @@ describe("Conflict resolution actions report standalone transfer progress", () =
       eTag: "etag-1",
       cTag: "ctag-1",
     } as RemoteFileEntry;
+    const localBytes = new Uint8Array(10).fill(3).buffer;
     const executor = makeProgressAwareExecutor({
       progressStore,
       pendingConflicts: [{
@@ -1880,14 +1938,16 @@ describe("Conflict resolution actions report standalone transfer progress", () =
         remote,
         local: {
           path: remote.path,
-          hash: "aa".repeat(32),
-          size: 10,
+          hash: await sha256Hex(localBytes),
+          size: localBytes.byteLength,
           mtime: 1,
           binary: true,
         },
       }],
       adapterOverrides: {
         stat: vi.fn().mockResolvedValue({ size: 10, mtime: 1 }),
+        // 留档要读「审阅时的本机版本」：本机文件在磁盘上是真实存在的。
+        readBinary: vi.fn().mockResolvedValue(localBytes),
       },
       downloadFile: vi.fn().mockImplementation(
         async (_vaultName: string, _path: string, _downloadUrl?: string, _driveId?: string, fileSize = 0, onProgress?: (downloaded: number, total: number) => void) => {
@@ -2077,8 +2137,9 @@ describe("Conflict resolution actions report standalone transfer progress", () =
 
   it("abandons a proven not-applied keepRemote intent in the same side action", async () => {
     const path = "network-failed.md";
+    const localBytes = new Uint8Array([1]).buffer;
     const local: LocalFileEntry = {
-      path, hash: "aa".repeat(32), size: 1, mtime: 1, binary: false,
+      path, hash: await sha256Hex(localBytes), size: localBytes.byteLength, mtime: 1, binary: false,
     };
     const abandonMutationIntent = vi.fn().mockResolvedValue(undefined);
     const notice = makeNoticeRecorder();
@@ -2093,6 +2154,8 @@ describe("Conflict resolution actions report standalone transfer progress", () =
         },
       }],
       stateOverrides: { abandonMutationIntent },
+      // 留档要读「审阅时的本机版本」：本机文件在磁盘上是真实存在的。
+      adapterOverrides: { readBinary: vi.fn().mockResolvedValue(localBytes) },
       downloadFile: vi.fn().mockRejectedValue(
         new OneDriveError(OneDriveErrorType.NetworkError, "offline"),
       ),
@@ -2616,6 +2679,13 @@ describe("Conflict resolution actions report standalone transfer progress", () =
         readBinary: vi.fn(async (target: string) => files.get(target) ?? new ArrayBuffer(0)),
         writeBinary: vi.fn(async (target: string, bytes: ArrayBuffer) => { files.set(target, bytes); }),
         remove: vi.fn(async (target: string) => { files.delete(target); }),
+        // 留档是「写暂存 → 改名落入留档夹」：内存盘要按真语义改名。
+        rename: vi.fn(async (from: string, to: string) => {
+          const bytes = files.get(from);
+          if (!bytes) throw new Error(`missing ${from}`);
+          files.set(to, bytes);
+          files.delete(from);
+        }),
       },
       stateOverrides: { recordMutationReceipt },
       noticeCenter: notice.center,
@@ -2692,6 +2762,13 @@ describe("Conflict resolution actions report standalone transfer progress", () =
         readBinary: vi.fn(async (target: string) => files.get(target) ?? new ArrayBuffer(0)),
         writeBinary: vi.fn(async (target: string, bytes: ArrayBuffer) => { files.set(target, bytes); }),
         remove: vi.fn(async (target: string) => { files.delete(target); }),
+        // 留档是「写暂存 → 改名落入留档夹」：内存盘要按真语义改名。
+        rename: vi.fn(async (from: string, to: string) => {
+          const bytes = files.get(from);
+          if (!bytes) throw new Error(`missing ${from}`);
+          files.set(to, bytes);
+          files.delete(from);
+        }),
       },
       stateOverrides: { abandonMutationIntent, recordMutationReceipt },
       noticeCenter: notice.center,
@@ -2769,6 +2846,13 @@ describe("Conflict resolution actions report standalone transfer progress", () =
           files.set(target, bytes);
         }),
         remove: vi.fn(async (target: string) => { files.delete(target); }),
+        // 留档是「写暂存 → 改名落入留档夹」：内存盘要按真语义改名。
+        rename: vi.fn(async (from: string, to: string) => {
+          const bytes = files.get(from);
+          if (!bytes) throw new Error(`missing ${from}`);
+          files.set(to, bytes);
+          files.delete(from);
+        }),
       },
       stateOverrides: { abandonMutationIntent, recordMutationReceipt },
       noticeCenter: notice.center,
@@ -2795,7 +2879,14 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     const racedBytes = encoder.encode("raced\n").buffer;
     const remoteBytes = encoder.encode("cloud\n").buffer;
     // 审阅之后、写入之前的窗口里本机被别人改掉：扫描事实仍是审阅版本，磁盘已经变了。
+    // 留档第一次读到的还是审阅版本；覆盖前的 CAS 复读时才见到改动后的字节。
     const files = new Map<string, ArrayBuffer>([[path, racedBytes]]);
+    let localReads = 0;
+    const readBinary = vi.fn(async (target: string) => {
+      if (target !== path) return files.get(target) ?? new ArrayBuffer(0);
+      localReads += 1;
+      return localReads === 1 ? reviewedBytes.slice(0) : racedBytes.slice(0);
+    });
     const reviewed: LocalFileEntry = {
       path,
       hash: await sha256Hex(reviewedBytes),
@@ -2829,9 +2920,15 @@ describe("Conflict resolution actions report standalone transfer progress", () =
           const bytes = files.get(target);
           return bytes ? { size: bytes.byteLength, mtime: 2 } : null;
         }),
-        readBinary: vi.fn(async (target: string) => files.get(target) ?? new ArrayBuffer(0)),
+        readBinary,
         writeBinary: vi.fn(async (target: string, bytes: ArrayBuffer) => { files.set(target, bytes); }),
         remove: vi.fn(async (target: string) => { files.delete(target); }),
+        rename: vi.fn(async (from: string, to: string) => {
+          const bytes = files.get(from);
+          if (!bytes) throw new Error(`missing ${from}`);
+          files.set(to, bytes);
+          files.delete(from);
+        }),
       },
       stateOverrides: { abandonMutationIntent, recordMutationReceipt },
       noticeCenter: notice.center,
@@ -2848,6 +2945,232 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     expect(notice.messages).toHaveLength(1);
     expect(notice.messages[0]).toContain(zh.t("notice.localChangedSinceReview"));
     expect(notice.messages[0]).not.toContain("Local file changed before replacement");
+    notice.center.dispose();
+  });
+
+  it("keepRemote keeps the local version in the plugin archive folder before the cloud version overwrites it", async () => {
+    const path = "notes/note.md";
+    const localBytes = new TextEncoder().encode("local version\n").buffer;
+    const remoteBytes = new TextEncoder().encode("cloud version\n").buffer;
+    const local: LocalFileEntry = {
+      path,
+      hash: await sha256Hex(localBytes),
+      size: localBytes.byteLength,
+      mtime: 1_700_000_000_000,
+      binary: false,
+    };
+    const store = makeKeepRemoteFileStore({ [path]: localBytes });
+    const recordMutationReceipt = vi.fn().mockResolvedValue(undefined);
+    const notice = makeNoticeRecorder();
+    const executor = makeProgressAwareExecutor({
+      pendingConflicts: [{
+        type: SyncActionType.Conflict,
+        path,
+        local,
+        remote: {
+          path,
+          driveId: "remote-id",
+          size: remoteBytes.byteLength,
+          mtime: 2,
+          eTag: "etag-cloud",
+          cTag: "ctag-cloud",
+          sha256Hash: await sha256Hex(remoteBytes),
+        },
+      }],
+      inspectFile: store.inspectFile,
+      downloadFile: vi.fn().mockResolvedValue(remoteBytes),
+      adapterOverrides: store.adapterOverrides,
+      stateOverrides: { recordMutationReceipt },
+      noticeCenter: notice.center,
+    });
+
+    await executor.resolveConflictKeepRemote(path);
+    await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+    // 覆盖照常发生：留档是复制，不是把这次覆盖换掉。
+    expect(recordMutationReceipt).toHaveBeenCalledTimes(1);
+    expect(new Uint8Array(store.files.get(path)!)).toEqual(new Uint8Array(remoteBytes));
+    // 留档逐字节等于「审阅时的本机版本」，落在插件目录的留档夹里。
+    const archivePath = expectedArchiveFilePath(path, local.mtime);
+    expect(store.files.has(archivePath)).toBe(true);
+    expect(new Uint8Array(store.files.get(archivePath)!)).toEqual(new Uint8Array(localBytes));
+    // 暂存文件不残留（留档是改名的，不是复制两份）。
+    expect([...store.files.keys()].filter((key) => key.endsWith(".part"))).toEqual([]);
+    expect(notice.center.activeKey).toBe(`side-action:notice.conflict.keptRemote:${path}`);
+    notice.center.dispose();
+  });
+
+  it("does not overwrite anything when the local version cannot be archived", async () => {
+    const path = "note.md";
+    const localBytes = new TextEncoder().encode("local version\n").buffer;
+    const remoteBytes = new TextEncoder().encode("cloud version\n").buffer;
+    const local: LocalFileEntry = {
+      path,
+      hash: await sha256Hex(localBytes),
+      size: localBytes.byteLength,
+      mtime: 1,
+      binary: false,
+    };
+    const store = makeKeepRemoteFileStore(
+      { [path]: localBytes },
+      { failWriteBinary: (target) => target.includes("/local-archive/") },
+    );
+    const downloadFile = vi.fn().mockResolvedValue(remoteBytes);
+    const beginMutationIntent = vi.fn().mockResolvedValue(undefined);
+    const recordMutationReceipt = vi.fn().mockResolvedValue(undefined);
+    const removePendingConflict = vi.fn().mockResolvedValue(undefined);
+    const notice = makeNoticeRecorder();
+    const executor = makeProgressAwareExecutor({
+      pendingConflicts: [{
+        type: SyncActionType.Conflict,
+        path,
+        local,
+        remote: {
+          path,
+          driveId: "remote-id",
+          size: remoteBytes.byteLength,
+          mtime: 2,
+          eTag: "etag-cloud",
+          cTag: "ctag-cloud",
+          sha256Hash: await sha256Hex(remoteBytes),
+        },
+      }],
+      inspectFile: store.inspectFile,
+      downloadFile,
+      adapterOverrides: store.adapterOverrides,
+      stateOverrides: { beginMutationIntent, recordMutationReceipt, removePendingConflict },
+      noticeCenter: notice.center,
+    });
+
+    await executor.resolveConflictKeepRemote(path);
+    await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+    // 本机文件仍是审阅那版字节，且没有第二处落盘（留档没成，暂存也不能留）。
+    expect(new Uint8Array(store.files.get(path)!)).toEqual(new Uint8Array(localBytes));
+    expect([...store.files.keys()]).toEqual([path]);
+    // 覆盖链一步都没开始：没有远端传输、没有账本记录、冲突行原地保留。
+    expect(downloadFile).not.toHaveBeenCalled();
+    expect(beginMutationIntent).not.toHaveBeenCalled();
+    expect(recordMutationReceipt).not.toHaveBeenCalled();
+    expect(removePendingConflict).not.toHaveBeenCalled();
+    expect(notice.center.activeKey).toBe(`side-action:notice.conflict.failed:${path}`);
+    notice.center.dispose();
+  });
+
+  it("keepRemote archives the local-only version and records the followed cloud deletion before deleting it", async () => {
+    const path = "notes/note.md";
+    const localBytes = new TextEncoder().encode("local only\n").buffer;
+    const local: LocalFileEntry = {
+      path,
+      hash: await sha256Hex(localBytes),
+      size: localBytes.byteLength,
+      mtime: 1_700_000_000_000,
+      binary: false,
+    };
+    const store = makeKeepRemoteFileStore({ [path]: localBytes });
+    const recordMutationReceipt = vi.fn().mockResolvedValue(undefined);
+    const commitMutationCheckpoint = vi.fn().mockResolvedValue(undefined);
+    const recordCloudDeletion = vi.fn().mockResolvedValue(undefined);
+    const remoteIdForPath = vi.fn().mockReturnValue("anchor-note-id");
+    const notice = makeNoticeRecorder();
+    const executor = makeProgressAwareExecutor({
+      pendingConflicts: [{ type: SyncActionType.Conflict, path, local }],
+      inspectFile: store.inspectFile,
+      adapterOverrides: store.adapterOverrides,
+      stateOverrides: {
+        recordMutationReceipt,
+        commitMutationCheckpoint,
+        recordCloudDeletion,
+        remoteIdForPath,
+      },
+      noticeCenter: notice.center,
+    });
+
+    await executor.resolveConflictKeepRemote(path);
+    await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+    // 本机这份已经被删，但它不是全世界唯一一份了：删除之前先留了档。
+    expect(store.files.has(path)).toBe(false);
+    const archivePath = expectedArchiveFilePath(path, local.mtime);
+    expect(store.files.has(archivePath)).toBe(true);
+    expect(new Uint8Array(store.files.get(archivePath)!))
+      .toEqual(new Uint8Array(localBytes));
+    // 跟随云端删除：删除成功之后、checkpoint 提交（归约删锚点）之前补记一条，
+    // 身份取自己提交的锚点。
+    expect(remoteIdForPath).toHaveBeenCalledWith(path);
+    expect(recordCloudDeletion).toHaveBeenCalledWith({
+      remoteId: "anchor-note-id",
+      path,
+      deletedAt: expect.any(Number),
+      kind: "file",
+    });
+    expect(store.adapterOverrides.remove).toHaveBeenCalledWith(path);
+    expect(store.adapterOverrides.remove.mock.invocationCallOrder[0])
+      .toBeLessThan(recordCloudDeletion.mock.invocationCallOrder[0]);
+    expect(recordCloudDeletion.mock.invocationCallOrder[0])
+      .toBeLessThan(commitMutationCheckpoint.mock.invocationCallOrder[0]);
+    // 归约照常提交：删锚点、删远端镜像、摘掉冲突行。
+    expect(recordMutationReceipt).toHaveBeenCalledWith(expect.objectContaining({
+      checkpoint: expect.objectContaining({
+        baseRemovals: [path],
+        remoteDeletes: [path],
+        pendingConflictRemovals: [path],
+      }),
+    }));
+    expect(commitMutationCheckpoint).toHaveBeenCalledTimes(1);
+    expect(notice.center.activeKey).toBe(`side-action:notice.conflict.keptRemote:${path}`);
+    notice.center.dispose();
+  });
+
+  it("keeps the local-only version in place when it cannot be archived before the followed cloud deletion", async () => {
+    const path = "note.md";
+    const localBytes = new TextEncoder().encode("local only\n").buffer;
+    const local: LocalFileEntry = {
+      path,
+      hash: await sha256Hex(localBytes),
+      size: localBytes.byteLength,
+      mtime: 1_700_000_000_000,
+      binary: false,
+    };
+    const store = makeKeepRemoteFileStore(
+      { [path]: localBytes },
+      { failWriteBinary: (target) => target.includes("/local-archive/") },
+    );
+    const beginMutationIntent = vi.fn().mockResolvedValue(undefined);
+    const recordMutationReceipt = vi.fn().mockResolvedValue(undefined);
+    const commitMutationCheckpoint = vi.fn().mockResolvedValue(undefined);
+    const recordCloudDeletion = vi.fn().mockResolvedValue(undefined);
+    const removePendingConflict = vi.fn().mockResolvedValue(undefined);
+    const notice = makeNoticeRecorder();
+    const executor = makeProgressAwareExecutor({
+      pendingConflicts: [{ type: SyncActionType.Conflict, path, local }],
+      inspectFile: store.inspectFile,
+      adapterOverrides: store.adapterOverrides,
+      stateOverrides: {
+        beginMutationIntent,
+        recordMutationReceipt,
+        commitMutationCheckpoint,
+        recordCloudDeletion,
+        removePendingConflict,
+        remoteIdForPath: vi.fn().mockReturnValue("anchor-note-id"),
+      },
+      noticeCenter: notice.center,
+    });
+
+    await executor.resolveConflictKeepRemote(path);
+    await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+    // 留档没落定就不删：本机文件原样还在，也没有第二处落盘（暂存不能留）。
+    expect(new Uint8Array(store.files.get(path)!)).toEqual(new Uint8Array(localBytes));
+    expect([...store.files.keys()]).toEqual([path]);
+    expect(store.adapterOverrides.remove).not.toHaveBeenCalled();
+    // 删除链一步都没开始：没有账本记录、没有回执、没有 checkpoint、冲突行原地保留。
+    expect(recordCloudDeletion).not.toHaveBeenCalled();
+    expect(beginMutationIntent).not.toHaveBeenCalled();
+    expect(recordMutationReceipt).not.toHaveBeenCalled();
+    expect(commitMutationCheckpoint).not.toHaveBeenCalled();
+    expect(removePendingConflict).not.toHaveBeenCalled();
+    expect(notice.center.activeKey).toBe(`side-action:notice.conflict.failed:${path}`);
     notice.center.dispose();
   });
 
@@ -2979,10 +3302,11 @@ describe("Conflict resolution actions report standalone transfer progress", () =
 
   it("keepRemote stops after download when the reviewed local version changes", async () => {
     const path = "note.md";
+    const reviewedBytes = new Uint8Array([1]).buffer;
     const reviewedLocal: LocalFileEntry = {
       path,
-      hash: "aa".repeat(32),
-      size: 1,
+      hash: await sha256Hex(reviewedBytes),
+      size: reviewedBytes.byteLength,
       mtime: 1,
       binary: false,
     };
@@ -3004,7 +3328,11 @@ describe("Conflict resolution actions report standalone transfer progress", () =
           status: "present",
           entry: { ...reviewedLocal, hash: "bb".repeat(32), mtime: 2 },
         }),
-      adapterOverrides: { writeBinary },
+      adapterOverrides: {
+        writeBinary,
+        // 留档要读「审阅时的本机版本」：本机文件在磁盘上是真实存在的。
+        readBinary: vi.fn().mockResolvedValue(reviewedBytes),
+      },
       downloadFile,
     });
 
@@ -3014,7 +3342,8 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     });
 
     expect(downloadFile).toHaveBeenCalledTimes(1);
-    expect(writeBinary).not.toHaveBeenCalled();
+    // 冲突路径一个字节都没写（留档写的是插件目录下的暂存，不碰库内文件）。
+    expect(writeBinary).not.toHaveBeenCalledWith(path, expect.anything());
   });
 
   it("does not permanently delete when moving the local file to trash fails", async () => {
@@ -3143,8 +3472,9 @@ describe("Conflict resolution actions report standalone transfer progress", () =
 
   it("does not write keepRemote content when the remote version changes during download", async () => {
     const path = "remote-raced.md";
+    const localBytes = new Uint8Array([1]).buffer;
     const local: LocalFileEntry = {
-      path, hash: "aa".repeat(32), size: 1, mtime: 1, binary: false,
+      path, hash: await sha256Hex(localBytes), size: localBytes.byteLength, mtime: 1, binary: false,
     };
     const reviewedRemote = {
       path, driveId: "remote-id", size: 1, mtime: 1, eTag: "etag-old", cTag: "",
@@ -3159,13 +3489,15 @@ describe("Conflict resolution actions report standalone transfer progress", () =
       getFileMetadata,
       stateOverrides: { addPendingConflict },
       downloadFile: vi.fn().mockResolvedValue(new Uint8Array([7]).buffer),
-      adapterOverrides: { writeBinary },
+      // 留档要读「审阅时的本机版本」：本机文件在磁盘上是真实存在的。
+      adapterOverrides: { writeBinary, readBinary: vi.fn().mockResolvedValue(localBytes) },
     });
 
     await executor.resolveConflictKeepRemote(path);
     await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
 
-    expect(writeBinary).not.toHaveBeenCalled();
+    // 冲突路径一个字节都没写（留档写的是插件目录下的暂存，不碰库内文件）。
+    expect(writeBinary).not.toHaveBeenCalledWith(path, expect.anything());
     expect(addPendingConflict).toHaveBeenCalledWith(expect.objectContaining({
       remote: expect.objectContaining({ eTag: "etag-new" }),
     }));
@@ -3173,8 +3505,9 @@ describe("Conflict resolution actions report standalone transfer progress", () =
 
   it("does not write keepRemote content when downloaded bytes fail the reviewed hash", async () => {
     const path = "hash-mismatch.bin";
+    const localBytes = new Uint8Array([1]).buffer;
     const local: LocalFileEntry = {
-      path, hash: "aa".repeat(32), size: 1, mtime: 1, binary: true,
+      path, hash: await sha256Hex(localBytes), size: localBytes.byteLength, mtime: 1, binary: true,
     };
     const expectedContent = new Uint8Array([1]).buffer;
     const reviewedRemote = {
@@ -3194,14 +3527,16 @@ describe("Conflict resolution actions report standalone transfer progress", () =
       inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
       stateOverrides: { recordMutationReceipt },
       downloadFile,
-      adapterOverrides: { writeBinary },
+      // 留档要读「审阅时的本机版本」：本机文件在磁盘上是真实存在的。
+      adapterOverrides: { writeBinary, readBinary: vi.fn().mockResolvedValue(localBytes) },
     });
 
     await executor.resolveConflictKeepRemote(path);
     await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
 
     expect(downloadFile).toHaveBeenCalledTimes(1);
-    expect(writeBinary).not.toHaveBeenCalled();
+    // 冲突路径一个字节都没写（留档写的是插件目录下的暂存，不碰库内文件）。
+    expect(writeBinary).not.toHaveBeenCalledWith(path, expect.anything());
     expect(recordMutationReceipt).not.toHaveBeenCalled();
   });
 

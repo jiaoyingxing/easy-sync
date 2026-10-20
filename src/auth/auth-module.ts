@@ -92,6 +92,8 @@ export class AuthModule {
     accountId: "",
     displayName: "",
     isLoggedIn: false,
+    grantedScopes: "",
+    userType: "",
   };
 
   /** In-memory access token (never persisted to disk) */
@@ -857,6 +859,8 @@ export class AuthModule {
       Date.now(),
     );
     this.state.isLoggedIn = true;
+    this.state.grantedScopes = tokenResponse.scope ?? "";
+    this.warnOnMissingScopes(tokenResponse.scope);
     this.resetRefreshBackoff();
 
     // Fetch user profile (displayName, accountId) for UI display
@@ -951,6 +955,8 @@ export class AuthModule {
         Date.now(),
       );
       this.state.isLoggedIn = true;
+      this.state.grantedScopes = tokenResponse.scope ?? "";
+      this.warnOnMissingScopes(tokenResponse.scope);
       this.resetRefreshBackoff();
 
       return this.accessToken;
@@ -1157,6 +1163,8 @@ export class AuthModule {
       accountId: "",
       displayName: "",
       isLoggedIn: false,
+      grantedScopes: "",
+      userType: "",
     };
     this.resetRefreshBackoff();
     this.notifyChange();
@@ -1242,6 +1250,23 @@ export class AuthModule {
     });
   }
 
+  /** A reduced OAuth grant is a plausible cause of later Graph 403/404s.
+   *  Log it at warning level so it reaches the diagnostic report; do not
+   *  block login or change the existing flow. */
+  private warnOnMissingScopes(scope: string | undefined): void {
+    if (!scope || !scope.trim()) return;
+    const granted = new Set(scope.toLowerCase().split(/\s+/).filter(Boolean));
+    const missing = MS_AUTH_CONFIG.scopes.filter((required) =>
+      required !== "offline_access" && !granted.has(required.toLowerCase())
+    );
+    if (missing.length > 0) {
+      this.diag?.warn("auth", "OAuth token is missing required scopes", {
+        grantedScopes: scope,
+        missingScopes: missing,
+      });
+    }
+  }
+
   /** Fetch user profile from Microsoft Graph to populate displayName and accountId.
    *  Cached profile data is display-only: account authorization must always be
    *  anchored to /me for the current access token. */
@@ -1262,7 +1287,7 @@ export class AuthModule {
 
     try {
       const response = await requestUrl({
-        url: "https://graph.microsoft.com/v1.0/me?$select=displayName,id",
+        url: "https://graph.microsoft.com/v1.0/me?$select=displayName,id,userType",
         method: "GET",
         headers: {
           Authorization: `Bearer ${accessToken}`,
@@ -1271,9 +1296,16 @@ export class AuthModule {
       this.assertGeneration(generation);
 
       if (response.status === 200) {
-        const data = response.json as { displayName?: string; id?: string };
+        const data = response.json as {
+          displayName?: string;
+          id?: string;
+          userType?: string;
+        };
         if (data.displayName) {
           this.state.displayName = data.displayName;
+        }
+        if (typeof data.userType === "string") {
+          this.state.userType = data.userType;
         }
         if (data.id) {
           const wasUnverified = this.state.accountId === "";

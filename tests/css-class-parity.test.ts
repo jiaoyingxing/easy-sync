@@ -53,6 +53,9 @@ const STRUCTURAL_HOOKS = new Set([
   "easy-sync-settings-automatic",
   "easy-sync-settings-display",
   "easy-sync-settings-maintenance",
+  // 2026-10-20 同上家族：「高级」组宿主＝纯刷新容器（间距由通用
+  // group-host 相邻规则承接），无专属样式。
+  "easy-sync-settings-maintenance-advanced",
 ]);
 
 /**

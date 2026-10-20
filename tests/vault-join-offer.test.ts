@@ -99,6 +99,7 @@ vi.mock("../src/ui/vault-join-repository-list-modal", () => ({
 }));
 
 import EasySyncPlugin from "../src/main";
+import { OneDriveDriveUnavailableError } from "../src/onedrive/types";
 import { NOTICE_PRIORITY } from "../src/ui/notice-center";
 
 function makePlugin(): {
@@ -538,8 +539,12 @@ describe("Remotely Save detection failure visibility (2026-10-10 R2)", () => {
   function attachRsDeps(
     plugin: EasySyncPlugin,
     failure: Error,
+    driveFailure?: Error,
   ): { show: ReturnType<typeof vi.fn> } {
     plugin.onedrive = {
+      ensureDriveAvailable: driveFailure
+        ? vi.fn().mockRejectedValue(driveFailure)
+        : vi.fn().mockResolvedValue(undefined),
       detectRemotelySaveRepository: vi.fn().mockRejectedValue(failure),
       setAbortSignal: vi.fn(),
     } as never;
@@ -569,6 +574,25 @@ describe("Remotely Save detection failure visibility (2026-10-10 R2)", () => {
       expect.objectContaining({
         key: "rs-migration-detect-failed",
         message: "rsMigration.detectFailedNotice",
+      }),
+    );
+  });
+
+  it("names the account-level cause when the drive itself is unavailable", async () => {
+    const { plugin } = makePlugin();
+    const driveFailure = new OneDriveDriveUnavailableError();
+    const notice = attachRsDeps(plugin, driveFailure, driveFailure);
+    const detect = (plugin.onedrive as never as {
+      detectRemotelySaveRepository: ReturnType<typeof vi.fn>;
+    }).detectRemotelySaveRepository;
+
+    await expect(callRsOffer(plugin)).resolves.toBe("abort");
+
+    expect(detect).not.toHaveBeenCalled();
+    expect(notice.show).toHaveBeenCalledWith(
+      expect.objectContaining({
+        key: "rs-migration-no-onedrive",
+        message: "rsMigration.noOneDriveNotice",
       }),
     );
   });

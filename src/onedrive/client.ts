@@ -28,6 +28,9 @@ import {
   type UploadResult,
   OneDriveError,
   OneDriveErrorType,
+  OneDriveDriveUnavailableError,
+  type OneDriveDriveProbeDetail,
+  type OneDriveGraphErrorDetail,
   RemoteVaultScopeIdentityError,
   SharedSyncProtocolObservationError,
   SyntheticRequestTimeoutError,
@@ -295,6 +298,25 @@ interface DownloadToPathResult {
   hash: string;
 }
 
+/** Carries a non-2xx RequestUrlResponse through the existing error path.
+ *  requestUrl is called with throw:false so the Graph body stays available;
+ *  the retry/classification pipeline still expects a thrown Error. */
+class GraphHttpErrorResponse extends Error {
+  readonly status: number;
+  readonly headers: Record<string, string>;
+  readonly json: unknown;
+  readonly text: string | undefined;
+
+  constructor(response: RequestUrlResponse) {
+    super(`HTTP ${response.status}`);
+    this.name = "GraphHttpErrorResponse";
+    this.status = response.status;
+    this.headers = response.headers;
+    this.json = response.json;
+    this.text = typeof response.text === "string" ? response.text : undefined;
+  }
+}
+
 export class OneDriveClient {
   private initializedVaults = new Set<string>();
   private storageVaultNames = new Map<string, string>();
@@ -494,6 +516,103 @@ export class OneDriveClient {
   async getAppFolder(): Promise<DriveItem> {
     const response = await this.request("GET", APP_FOLDER_PATHS.appRoot);
     return response.json as DriveItem;
+  }
+
+  /** Ensure the signed-in account has a usable default OneDrive.
+   *
+   *  GET /me/drive is the Graph endpoint documented to provision the drive
+   *  automatically for a licensed user who has never opened OneDrive. Listing
+   *  /me/drive/root/children does not carry that guarantee, so a first sync
+   *  can otherwise fail with 404 forever. A 404 here means no drive can be
+   *  provisioned for this account; auth and permission failures keep their
+   *  own error types and must not be reported as "no OneDrive". */
+  async ensureDriveAvailable(): Promise<void> {
+    try {
+      await this.request("GET", "/me/drive?$select=id");
+    } catch (error) {
+      if (
+        error instanceof OneDriveError
+        && error.type === OneDriveErrorType.NotFound
+      ) {
+        const detail = await this.probeDriveAvailability(error);
+        this.diag?.warn(
+          "onedrive",
+          "drive preflight — default drive unavailable; /me/drives probe completed",
+          {
+            statusCode: detail.statusCode,
+            graphCode: detail.graphError?.code ?? null,
+            graphMessage: detail.graphError?.message ?? null,
+            graphInnerCode: detail.graphError?.innerCode ?? null,
+            requestId: detail.graphError?.requestId ?? null,
+            drivesProbe: detail.drivesProbe,
+            drivesCount: detail.drivesCount,
+            driveTypes: detail.driveTypes,
+            drivesGraphCode: detail.drivesGraphCode,
+            drivesRequestId: detail.drivesRequestId,
+            drivesError: detail.drivesError,
+          },
+        );
+        throw new OneDriveDriveUnavailableError(
+          "No OneDrive drive is available for this account",
+          detail,
+        );
+      }
+      throw error;
+    }
+  }
+
+  /** Cross-check a /me/drive 404 with /me/drives. Diagnostic only: the
+   *  default-drive failure still stops this round, but the report can now
+   *  distinguish "no drive" from "drive exists under another alias" and
+   *  records the Graph code/request id for both calls. */
+  private async probeDriveAvailability(
+    primary: OneDriveError,
+  ): Promise<OneDriveDriveProbeDetail> {
+    let drivesProbe: OneDriveDriveProbeDetail["drivesProbe"] = "failed";
+    let drivesCount = 0;
+    let driveTypes: string[] = [];
+    let drivesGraphCode: string | null = null;
+    let drivesRequestId: string | null = null;
+    let drivesError: string | null = null;
+    try {
+      const response = await this.request(
+        "GET",
+        "/me/drives?$select=id,driveType,name",
+        undefined,
+        undefined,
+        { maxAttempts: 1, expectedNotFound: true },
+      );
+      const body = isRecord(response.json) ? response.json : {};
+      const value = Array.isArray(body.value)
+        ? body.value.filter(isRecord)
+        : [];
+      drivesCount = value.length;
+      driveTypes = [...new Set(value.map((item) =>
+        typeof item.driveType === "string" && item.driveType
+          ? item.driveType
+          : "unknown",
+      ))];
+      drivesProbe = drivesCount > 0 ? "ok" : "empty";
+    } catch (error) {
+      drivesError = error instanceof Error ? error.message : String(error);
+      if (error instanceof OneDriveError) {
+        drivesGraphCode = error.graphCode;
+        drivesRequestId = error.graphRequestId;
+        drivesProbe = error.type === OneDriveErrorType.Forbidden
+          ? "denied"
+          : "failed";
+      }
+    }
+    return {
+      statusCode: primary.statusCode,
+      graphError: primary.graphError,
+      drivesProbe,
+      drivesCount,
+      driveTypes,
+      drivesGraphCode,
+      drivesRequestId,
+      drivesError,
+    };
   }
 
   /** Ensure a directory exists and return its metadata when Graph creates it. */
@@ -699,6 +818,155 @@ export class OneDriveClient {
       }
       throw error;
     }
+  }
+
+  /**
+   * Read the content of one retained version (read-only recovery surface).
+   *
+   * Two field-proven routes, cheapest first (2026-10-19 cloud-version probe):
+   * 1. the version entry's own `@microsoft.graph.downloadUrl` — a one-hop,
+   *    already-authorized URL that must be fetched *without* the bearer token;
+   * 2. `GET /me/drive/items/{id}/versions/{versionId}/content` → 302 → a
+   *    pre-authorized Location that must also be fetched without the bearer
+   *    token (the host's requestUrl may forward Authorization through the
+   *    redirect and get the download host to reject it).
+   *
+   * The version content endpoint answers 400 `invalidRequest` when the
+   * requested id is the item's *current* version: current content stays on the
+   * existing `/content` routes and must never be read through this method.
+   */
+  async downloadDriveItemVersionContent(input: {
+    driveItemId: string;
+    versionId: string;
+    /** The entry's pre-authorized download URL when the caller holds a fresh
+     *  listing; a missing or expired one falls back to route 2. */
+    downloadUrl?: string;
+    /** Version size — budget only (a retained version's size is fixed). */
+    size?: number;
+    metadataReason?: OneDriveMetadataReason;
+  }): Promise<ArrayBuffer> {
+    throwIfAborted(this.abortSignal);
+    const timeoutMs =
+      input.size !== undefined && Number.isFinite(input.size) && input.size > 0
+        ? downloadTimeoutMs(input.size)
+        : DOWNLOAD_MAX_TIMEOUT_MS;
+    if (input.downloadUrl) {
+      try {
+        return await this.fetchPreauthorizedVersionContent(
+          input.downloadUrl,
+          timeoutMs,
+        );
+      } catch (error) {
+        // 用户取消不得被当成"链接失效"再打一次端点。
+        if (isAbortError(error) || this.abortSignal?.aborted) throw error;
+        // 预授权链接失效（过期／被撤）不得当成"没有内容"：退回版本内容端点。
+        this.diag?.warn(
+          "onedrive",
+          `version content downloadUrl failed — falling back to the version content endpoint, version=${input.versionId}`,
+          requestErrorMessage(error),
+        );
+      }
+    }
+    const apiPath = `/me/drive/items/${encodeURIComponent(input.driveItemId)}`
+      + `/versions/${encodeURIComponent(input.versionId)}/content`;
+    const response = await this.request("GET", apiPath, undefined, undefined, {
+      metadataReason: input.metadataReason ?? "other",
+      expectedNotFound: true,
+      maxAttempts: 2,
+      perRequestTimeoutMs: timeoutMs,
+    });
+    if (response.status >= 200 && response.status < 300) {
+      // 宿主若已自行跟随重定向，这一次响应就是内容本体。
+      return response.arrayBuffer;
+    }
+    if (response.status >= 300 && response.status < 400) {
+      const location = responseLocationHeader(response.headers);
+      if (!location) {
+        throw new OneDriveError(
+          OneDriveErrorType.Unknown,
+          `Version content redirect without a location: ${input.versionId}`,
+        );
+      }
+      return this.fetchPreauthorizedVersionContent(location, timeoutMs);
+    }
+    throw this.classifyError(response);
+  }
+
+  /** Fetch one pre-authorized version-content URL. The request must not carry
+   *  the bearer token: the URL holds its own one-shot credential, and a
+   *  forwarded Authorization gets the download host to reject the call. */
+  private async fetchPreauthorizedVersionContent(
+    url: string,
+    timeoutMs: number,
+  ): Promise<ArrayBuffer> {
+    throwIfAborted(this.abortSignal);
+    const startedAt = this.beginMetricAttempt("contentFallback");
+    let response: RequestUrlResponse;
+    try {
+      try {
+        // 原生 fetch 是 CDN 域上的首选通道（宿主 requestUrl 在移动端有已知缺陷）。
+        response = await downloadUrlFetch(
+          url,
+          MAX_REMOTE_FILE_BYTES,
+          "Drive item version content",
+          undefined,
+          this.abortSignal ?? undefined,
+        );
+      } catch (fetchError) {
+        // 与下载瀑布同判据：类型错误／status 0 = 该通道不可用，换 requestUrl。
+        const fetchUnavailable = fetchError instanceof TypeError
+          || (fetchError as { status?: number }).status === 0;
+        if (!fetchUnavailable) throw fetchError;
+        response = await withTimeout(requestUrl({ url, method: "GET" }), timeoutMs);
+      }
+      if (response.status < 200 || response.status >= 300) {
+        throw this.classifyError(response);
+      }
+    } catch (error) {
+      this.finishMetricAttempt(
+        "contentFallback",
+        rawAttemptStatus(error, this.abortSignal),
+        startedAt,
+      );
+      throw error instanceof OneDriveError
+        ? error
+        : this.toRequestError(error, url, false, undefined, "GET");
+    }
+    this.finishMetricAttempt(
+      "contentFallback",
+      "success",
+      startedAt,
+      responsePayloadByteLength(response),
+    );
+    return response.arrayBuffer;
+  }
+
+  /**
+   * Bring one deleted driveItem back from the account's recycle bin
+   * (`POST /me/drive/items/{id}/restore`, no request body — a personal-account
+   * endpoint).
+   *
+   * 已在真实账号实测可用（2026-10-19，应用文件夹权限域 `Files.ReadWrite.AppFolder`
+   * + `Files.Read`，探针目录已清理；原始证据：
+   * `docs/dev-logs/2026-10/evidence/20261019-171659 回收站恢复能力实测-原始证据.json`）：
+   * 成功应答 200 带响应体，文件回到原父目录、名字与内容逐字节不变；旧文档口径的
+   * 204 一并接受（2xx 一律当成功）。
+   *
+   * 不重试：恢复没有幂等保证，结果不明的重发可能把「已经恢复成功」读成第二次的
+   * 404，从而误报失败。失败按既有 `OneDriveError` 分类抛出，由调用方如实呈现
+   * （不吞分类、不循环重试）。仍未实测：原路径已被占用时服务端的行为（可能失败或
+   * 自动改名）——不做猜测分支。
+   */
+  async restoreDeletedDriveItemById(driveItemId: string): Promise<void> {
+    const response = await this.request(
+      "POST",
+      `/me/drive/items/${encodeURIComponent(driveItemId)}/restore`,
+      undefined,
+      undefined,
+      { maxAttempts: 1 },
+    );
+    if (response.status >= 200 && response.status < 300) return;
+    throw this.classifyError(response);
   }
 
   /** Read up to 20 independent driveItem identities per Graph JSON batch.
@@ -3431,6 +3699,10 @@ export class OneDriveClient {
             headers,
             body: requestBody,
             contentType,
+            // Keep the response body on 4xx/5xx so Graph's error.code and
+            // innerError survive into diagnostics. The catch path below
+            // classifies the response exactly like a thrown host error.
+            throw: false,
           });
         const response = options.sharedSyncProtocolRequestKey
           ? await this.requestSharedSyncProtocolUrl(
@@ -3439,6 +3711,18 @@ export class OneDriveClient {
             dispatch,
           )
           : await withTimeout(dispatch(), timeoutMs);
+        if (!Number.isFinite(response.status) || response.status === 0) {
+          throw new OneDriveError(
+            OneDriveErrorType.NetworkError,
+            "Network error: HTTP status unavailable",
+          );
+        }
+        if (response.status >= 400) {
+          // Carry the response through an Error wrapper: toRequestError logs
+          // the now-visible Graph body and classifyError turns it into the
+          // same typed error the host's throw path used to produce.
+          throw new GraphHttpErrorResponse(response);
+        }
         if (options.maxResponseBytes !== undefined) {
           assertResponseByteBudget(
             response,
@@ -3567,11 +3851,10 @@ export class OneDriveClient {
     method?: string,
   ): OneDriveError {
     if (rawError instanceof OneDriveError) return rawError;
-    // Obsidian's requestUrl throws on non-2xx. The thrown error carries only
-    // message/status/headers — the host discards the response body on the
-    // error path (verified against the app bundle, 2026-10-01), so the body
-    // can never be recovered from it and graphCode stays "none" unless a
-    // future host change starts exposing it.
+    // Graph requests are dispatched with requestUrl({ throw: false }), so a
+    // non-2xx response arrives here as the response object itself. That keeps
+    // Graph's error.code / innerError / request-id visible; a "none" code now
+    // means the body was absent, empty, or not JSON.
     const errAny = isRecord(rawError) ? rawError : {};
     const errStatus = typeof errAny.status === "number" ? errAny.status : 0;
     const errHeaders = isStringRecord(errAny.headers) ? errAny.headers : {};
@@ -3586,20 +3869,14 @@ export class OneDriveClient {
         // Not JSON
       }
     }
-    const graphErr = graphBody?.error as Record<string, unknown> | undefined;
-    const graphCodeText = typeof graphErr?.code === "string"
-      ? graphErr.code
-      : typeof graphErr?.code === "number"
-      ? String(graphErr.code)
-      : "none";
-    const graphMsgText = typeof graphErr?.message === "string"
-      ? graphErr.message
-      : "none";
+    const graphError = parseGraphErrorBody(graphBody);
+    const graphCodeText = graphError?.code ?? "none";
+    const graphMsgText = graphError?.message ?? "none";
+    const graphInnerCodeText = graphError?.innerCode ?? "none";
+    const graphRequestIdText = graphError?.requestId ?? "none";
     const methodPrefix = method ? `method=${method}, ` : "";
-    // The host never exposes the body on the error path today; keep the note
-    // tied to the "none" case so it self-corrects if that ever changes.
     const bodyVisibilityNote = graphCodeText === "none"
-      ? ", responseBody=not exposed on requestUrl error path"
+      ? ", responseBody=absent or not JSON"
       : "";
     // 409 is "folder already exists" — handled gracefully, don't alarm the user
     if (errStatus === 409) {
@@ -3607,7 +3884,7 @@ export class OneDriveClient {
     } else if (errStatus > 0 && !(suppressExpectedNotFoundWarning && errStatus === 404)) {
       this.diag?.warn(
         "onedrive",
-        `requestUrl HTTP error — ${methodPrefix}status=${errStatus}, graphCode=${graphCodeText}, graphMsg=${graphMsgText}${bodyVisibilityNote}, url=${sanitizeUrl(url)}`,
+        `requestUrl HTTP error — ${methodPrefix}status=${errStatus}, graphCode=${graphCodeText}, graphMsg=${graphMsgText}, graphInnerCode=${graphInnerCodeText}, graphRequestId=${graphRequestIdText}${bodyVisibilityNote}, url=${sanitizeUrl(url)}`,
         detail,
       );
     } else if (errStatus === 0) {
@@ -3638,95 +3915,46 @@ export class OneDriveClient {
     const status = response.status;
     const retryAfter = parseRetryAfter(response.headers);
     const graphError = tryParseGraphError(response);
-
-    const message = graphError
-      ? `${graphError.code}: ${graphError.message}`
-      : `HTTP ${status}`;
+    // Keep the runtime message stable across body-visibility changes. Graph's
+    // message is developer-facing; typed callers use graphCode/graphError.
+    const message = `HTTP ${status}`;
+    const make = (type: OneDriveErrorType) =>
+      new OneDriveError(
+        type,
+        message,
+        status,
+        retryAfter,
+        graphError?.code ?? null,
+        graphError,
+      );
 
     switch (status) {
       case 401:
-        return new OneDriveError(
-          OneDriveErrorType.AuthExpired,
-          message,
-          status,
-          retryAfter,
-          graphError?.code ?? null,
-        );
+        return make(OneDriveErrorType.AuthExpired);
       case 403:
-        return new OneDriveError(
-          OneDriveErrorType.Forbidden,
-          message,
-          status,
-          retryAfter,
-          graphError?.code ?? null,
-        );
+        return make(OneDriveErrorType.Forbidden);
       case 404:
-        return new OneDriveError(
-          OneDriveErrorType.NotFound,
-          message,
-          status,
-          retryAfter,
-          graphError?.code ?? null,
-        );
+        return make(OneDriveErrorType.NotFound);
       case 409:
-        return new OneDriveError(
-          OneDriveErrorType.Conflict,
-          message,
-          status,
-          retryAfter,
-          graphError?.code ?? null,
-        );
+        return make(OneDriveErrorType.Conflict);
       case 412:
-        return new OneDriveError(
-          OneDriveErrorType.PreconditionFailed,
-          message,
-          status,
-          retryAfter,
-          graphError?.code ?? null,
-        );
+        return make(OneDriveErrorType.PreconditionFailed);
       case 416:
-        return new OneDriveError(
-          OneDriveErrorType.RangeNotSatisfiable,
-          message,
-          status,
-          retryAfter,
-          graphError?.code ?? null,
-        );
+        return make(OneDriveErrorType.RangeNotSatisfiable);
       case 429:
-        return new OneDriveError(
-          OneDriveErrorType.RateLimited,
-          message,
-          status,
-          retryAfter,
-          graphError?.code ?? null,
-        );
+      case 509:
+        // 509 is OneDrive's bandwidth cap. The service documents it as
+        // retryable after more time, so it shares the rate-limited class.
+        return make(OneDriveErrorType.RateLimited);
       case 507:
-        return new OneDriveError(
-          OneDriveErrorType.InsufficientStorage,
-          message,
-          status,
-          retryAfter,
-          graphError?.code ?? null,
-        );
+        return make(OneDriveErrorType.InsufficientStorage);
       case 500:
       case 502:
       case 503:
       case 504:
-        return new OneDriveError(
-          OneDriveErrorType.ServerError,
-          message,
-          status,
-          retryAfter,
-          graphError?.code ?? null,
-        );
+        return make(OneDriveErrorType.ServerError);
       default:
-        return new OneDriveError(
-          OneDriveErrorType.Unknown,
-          message,
-          status,
-          retryAfter,
-          graphError?.code ?? null,
-        );
+        return make(OneDriveErrorType.Unknown);
     }
   }
 }
@@ -3787,6 +4015,22 @@ function responsePayloadByteLength(response: RequestUrlResponse): number {
     return new TextEncoder().encode(JSON.stringify(response.json)).byteLength;
   }
   return 0;
+}
+
+/** Case-insensitive `Location` lookup: header casing is host-provided, and the
+ *  redirect target is the only way to reach a version's content when the host
+ *  hands back the 302 itself. */
+function responseLocationHeader(
+  headers: Record<string, string> | undefined,
+): string | null {
+  for (const [name, value] of Object.entries(headers ?? {})) {
+    if (name.toLowerCase() === "location"
+      && typeof value === "string"
+      && value.length > 0) {
+      return value;
+    }
+  }
+  return null;
 }
 
 /** Per-item response budget for a remote file download.
@@ -3929,6 +4173,7 @@ function rawAttemptStatus(
   if (status === 412) return "precondition";
   if (status === 416) return "rangeNotSatisfiable";
   if (status === 429) return "rateLimited";
+  if (status === 509) return "rateLimited";
   if (status === 507) return "insufficientStorage";
   if ([500, 502, 503, 504].includes(status)) return "serverError";
   if (status === 0 || error instanceof TypeError) return "network";
@@ -4045,29 +4290,47 @@ function parseRetryAfter(
   return isNaN(seconds) ? null : seconds;
 }
 
-function tryParseGraphError(response: RequestUrlResponse): {
-  code: string;
-  message: string;
-} | null {
+function parseGraphErrorBody(body: unknown): OneDriveGraphErrorDetail | null {
+  if (!isRecord(body)) return null;
+  const error = body.error;
+  if (!isRecord(error)) return null;
+  const inner = isRecord(error.innerError)
+    ? error.innerError
+    : isRecord(error.innererror)
+      ? error.innererror
+      : null;
+  const codeRaw = error.code;
+  const messageRaw = error.message;
+  const innerCodeRaw = inner?.code;
+  const requestIdRaw = inner?.["request-id"] ?? inner?.requestId;
+  const dateRaw = inner?.date;
+  return {
+    code: typeof codeRaw === "string" && codeRaw
+      ? codeRaw
+      : typeof codeRaw === "number"
+        ? String(codeRaw)
+        : "unknown",
+    message: typeof messageRaw === "string" && messageRaw
+      ? messageRaw
+      : "no message",
+    innerCode: typeof innerCodeRaw === "string" && innerCodeRaw
+      ? innerCodeRaw
+      : null,
+    requestId: typeof requestIdRaw === "string" && requestIdRaw
+      ? requestIdRaw
+      : null,
+    date: typeof dateRaw === "string" && dateRaw ? dateRaw : null,
+  };
+}
+
+function tryParseGraphError(
+  response: RequestUrlResponse,
+): OneDriveGraphErrorDetail | null {
   try {
-    const json = response.json as Record<string, unknown>;
-    if (json?.error && typeof json.error === "object") {
-      const err = json.error as Record<string, unknown>;
-      return {
-        code: typeof err.code === "string" && err.code
-          ? err.code
-          : typeof err.code === "number"
-          ? String(err.code)
-          : "unknown",
-        message: typeof err.message === "string" && err.message
-          ? err.message
-          : "no message",
-      };
-    }
+    return parseGraphErrorBody(response.json);
   } catch {
-    // Not JSON
+    return null;
   }
-  return null;
 }
 
 /**
@@ -4175,6 +4438,7 @@ function resolveAuthenticatedGraphUrl(apiPath: string): string {
   const route = parsed.pathname.slice(GRAPH_API_PATH_PREFIX.length);
   const allowedRoute = route === "/$batch"
     || route === "/me/drive"
+    || route === "/me/drives"
     || route.startsWith("/me/drive/")
     || route.startsWith("/drives/");
   if (
@@ -4348,8 +4612,12 @@ function isFetchUnavailableError(error: unknown): boolean {
 }
 
 function retryDelayMs(error: OneDriveError, attempt: number): number {
-  const base = error.type === OneDriveErrorType.RateLimited
-    && error.retryAfterSeconds !== null
+  // Retry-After is authoritative for throttling (429/509) and for a
+  // temporarily unavailable service (503 may carry the same header); the
+  // exponential ladder is only the fallback.
+  const retryAfterApplies = error.type === OneDriveErrorType.RateLimited
+    || error.type === OneDriveErrorType.ServerError;
+  const base = retryAfterApplies && error.retryAfterSeconds !== null
     ? error.retryAfterSeconds * 1000
     : RETRY_BASE_MS * (2 ** (attempt - 1));
   return base + Math.floor(Math.random() * RETRY_JITTER_MS);

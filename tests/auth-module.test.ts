@@ -794,6 +794,58 @@ describe("AuthModule device code flow", () => {
     expect(auth.isPending).toBe(false);
   });
 
+  it("records granted scopes and userType, and warns when Files scopes are missing", async () => {
+    vi.useFakeTimers();
+    const diag = { log: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const ctx = makeContext({ diag: diag as never });
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            access_token: "device-access-token",
+            refresh_token: "device-refresh-token",
+            expires_in: 3600,
+            scope: "User.Read offline_access",
+          },
+        } as obsidian.RequestUrlResponse;
+      }
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          displayName: "Device User",
+          id: "device-account",
+          userType: "Guest",
+        },
+      } as obsidian.RequestUrlResponse;
+    });
+    const auth = new AuthModule(ctx);
+
+    await auth.beginDeviceCodeLogin();
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(auth.authState).toMatchObject({
+      grantedScopes: "User.Read offline_access",
+      userType: "Guest",
+    });
+    expect(diag.warn).toHaveBeenCalledWith(
+      "auth",
+      "OAuth token is missing required scopes",
+      {
+        grantedScopes: "User.Read offline_access",
+        missingScopes: [
+          "Files.ReadWrite.AppFolder",
+          "Files.Read",
+        ],
+      },
+    );
+  });
+
   it("marks the attempt declined when the provider reports authorization_declined", async () => {
     vi.useFakeTimers();
     let tokenCalls = 0;

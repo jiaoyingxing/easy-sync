@@ -1,7 +1,7 @@
 import {
   structuredCloneImplementation,
 } from "./structured-clone-compat";
-import { EventRef, Notice, Platform, Plugin, requestUrl, setIcon, setTooltip, TFile, TFolder, WorkspaceLeaf } from "obsidian";
+import { EventRef, Menu, Notice, Platform, Plugin, requestUrl, setIcon, setTooltip, TFile, TFolder, WorkspaceLeaf } from "obsidian";
 
 import {
   fetchLatestStableVersion,
@@ -34,6 +34,7 @@ import {
 } from "./obsidian-compat";
 import { OneDriveClient } from "./onedrive/client";
 import type { EasySyncRepositoryDetection } from "./onedrive/client";
+import { OneDriveDriveUnavailableError } from "./onedrive/types";
 import {
   createFolderSyncScopeSnapshotV1,
   isEasySyncInternalPath,
@@ -112,6 +113,7 @@ import { VaultJoinOfferModal } from "./ui/vault-join-offer-modal";
 import { VaultJoinRepositoryListModal } from "./ui/vault-join-repository-list-modal";
 import { runRsMigrationTransaction } from "./sync/rs-migration-transaction";
 import { ScopeCrossingPromptModal } from "./ui/scope-crossing-prompt-modal";
+import { RecoveryModal } from "./ui/recovery-modal";
 import type {
   MutationRecoveryBlockReason,
   MutationRecoveryHistory,
@@ -706,6 +708,12 @@ type DiagnosticReportProvidedValues = {
   formatSize: (bytes?: number) => string;
 };
 
+/** 宿主未公开的菜单分组名单机制：addSections 把给定名单插进 Host 已声明
+ *  名单中默认组（""）的位置。只用于声明专属分组渲染位置，不作其他用途。 */
+interface MenuWithSectionList extends Menu {
+  addSections?: (sectionNames: string[]) => Menu;
+}
+
 export default class EasySyncPlugin extends Plugin {
   auth: AuthModule | null = null;
   onedrive: OneDriveClient | null = null;
@@ -1256,6 +1264,7 @@ export default class EasySyncPlugin extends Plugin {
         void this.activateSyncView();
       },
     });
+    this.registerRecoveryUi();
     this.startupPerformance.markUiReady();
 
     // Update reminder: prompt-only, silent, 24h-throttled check at the
@@ -1389,6 +1398,65 @@ export default class EasySyncPlugin extends Plugin {
     this.startAutoSync();
 
     this.diag.log("lifecycle", "onload complete (auth initializing in background)");
+  }
+
+  // ════ 文件版本找回入口（文件菜单项＋命令） ════
+  // 两个入口都打开同一个找回弹框，不带路径的进入总列表。
+  // 菜单项只对文件出现（文件夹没有"版本"可找回），且不按 `source` 过滤——
+  // 官方不枚举 source 值（桌面右键／更多选项／标签页头各不相同）。
+
+  /** addSections 未进公开类型但长期是宿主声明分组位置的机制；宿主一旦
+   *  收掉它，可选调用安全失效＝专属分组退回官方默认的沉底现状，不崩。 */
+  private declareSection(section: string, menu: Menu): void {
+    (menu as MenuWithSectionList).addSections?.([section]);
+  }
+
+  private registerRecoveryUi(): void {
+    this.addCommand({
+      id: "open-recovery",
+      name: this.i18n.t("recovery.command"),
+      callback: () => this.openRecoveryEntry(),
+    });
+    this.registerEvent(this.app.workspace.on("file-menu", (menu, file) => {
+      if (!(file instanceof TFile)) return;
+      // 专属分组（不用官方 action 组）＝与系统动作分开、不混入宿主功能
+      // （2026-10-20 用户拍板独立分组）。宿主文件菜单按分组名单渲染，名单外
+      // 的分组名（只 setSection）会被追加到名单末尾沉底；addSections 把给定
+      // 名单插进宿主名单中默认组（""）的位置——紧邻 danger 组（重命名/删除
+      // 所在组）之前＝专属落到重命名/删除之上。
+      this.declareSection("easy-sync", menu);
+      menu.addItem((item) => {
+        item
+          .setTitle(this.i18n.t("recovery.menuItem"))
+          .setIcon("history")
+          .setSection("easy-sync")
+          .onClick(() => this.openRecoveryEntry(file.path));
+      });
+    }));
+  }
+
+  /**
+   * 找回弹框门面：只组装现役依赖（库适配器／插件目录／临时目录／同步状态／
+   * OneDrive 客户端）并打开；一切读写都由弹框内部按用户动作发起。
+   */
+  openRecoveryEntry(path?: string): void {
+    const state = this.state;
+    const cloud = this.onedrive;
+    if (!state || !cloud) return;
+    const { pluginDir, tmpDir } = getEasySyncPaths(
+      this.app.vault,
+      this.manifest.id,
+    );
+    new RecoveryModal(this.app, {
+      i18n: this.i18n,
+      noticeCenter: this.noticeCenter,
+      adapter: this.app.vault.adapter,
+      pluginDir,
+      tmpDir,
+      state,
+      cloud,
+      ...(path === undefined ? {} : { path }),
+    }).open();
   }
 
   // ════ Update reminder (方案单 20260915-0025) ════
@@ -3297,6 +3365,11 @@ export default class EasySyncPlugin extends Plugin {
       ReturnType<OneDriveClient["detectRemotelySaveRepository"]>
     >;
     try {
+      // GET /me/drive is the documented auto-provisioning entry for a licensed
+      // account that has never opened OneDrive. The root listing below does
+      // not carry that guarantee, so a fresh account can otherwise 404 here
+      // forever. Auth/permission errors keep their own path and wording.
+      await deps.onedrive.ensureDriveAvailable();
       detected = await deps.onedrive.detectRemotelySaveRepository(vaultName);
     } catch (error) {
       // 入口取消是用户自己按的，不是检测失败：不出失败提示，只留诊断。
@@ -3306,6 +3379,35 @@ export default class EasySyncPlugin extends Plugin {
           "Remotely Save detection aborted by the sync-entry cancel",
           { mutations: 0 },
         );
+        return "abort";
+      }
+      if (error instanceof OneDriveDriveUnavailableError) {
+        this.diag.warn(
+          "state",
+          "OneDrive drive is unavailable for this account; first sync deferred",
+          {
+            mutations: 0,
+            accountType: this.auth?.authState.userType ?? null,
+            grantedScopes: this.auth?.authState.grantedScopes ?? null,
+            statusCode: error.detail?.statusCode ?? null,
+            graphCode: error.detail?.graphError?.code ?? null,
+            graphMessage: error.detail?.graphError?.message ?? null,
+            graphInnerCode: error.detail?.graphError?.innerCode ?? null,
+            requestId: error.detail?.graphError?.requestId ?? null,
+            drivesProbe: error.detail?.drivesProbe ?? null,
+            drivesCount: error.detail?.drivesCount ?? null,
+            driveTypes: error.detail?.driveTypes ?? null,
+            drivesGraphCode: error.detail?.drivesGraphCode ?? null,
+            drivesRequestId: error.detail?.drivesRequestId ?? null,
+            drivesError: error.detail?.drivesError ?? null,
+          },
+        );
+        this.noticeCenter?.show({
+          key: "rs-migration-no-onedrive",
+          message: this.i18n.t("rsMigration.noOneDriveNotice"),
+          priority: NOTICE_PRIORITY.attention,
+          durationMs: 12_000,
+        });
         return "abort";
       }
       // A detection error is not an absence: keep the choice alive instead
@@ -9629,6 +9731,18 @@ export default class EasySyncPlugin extends Plugin {
     lines.push(`**插件版本**: ${this.manifest.version}`);
     lines.push(`**仓库名**: ${this.app.vault.getName()}`);
     lines.push(`**登录账号**: ${auth?.isLoggedIn ? auth.displayName || "已登录" : "未登录"}`);
+    const accountTypeLabel = !auth?.isLoggedIn
+      ? "未登录"
+      : auth.userType === "Guest"
+        ? "访客"
+        : auth.userType === "Member"
+          ? "成员"
+          : "未知";
+    const grantedScopesLabel = !auth?.isLoggedIn
+      ? "未登录"
+      : (auth.grantedScopes?.trim() || "未知");
+    lines.push(`**账号类型**: ${accountTypeLabel}`);
+    lines.push(`**登录授权范围**: ${grantedScopesLabel}`);
     lines.push(`**平台**: ${platformLabel}`);
     lines.push(`**同步模式**: ${this.syncDirection === "one-way" ? "单向同步（本机不上传笔记与附件）" : "双向同步"}`);
     lines.push("");

@@ -6,6 +6,7 @@ import { OneDriveClient, classifyRemotelySaveVaultChildren } from "../src/onedri
 import { UPLOAD_CHUNK_SLOW_BYTES } from "../src/onedrive/upload-session-policy";
 import {
   type DriveItem,
+  OneDriveDriveUnavailableError,
   OneDriveError,
   OneDriveErrorType,
   RemoteVaultScopeIdentityError,
@@ -4969,6 +4970,30 @@ describe("OneDriveClient request retry policy", () => {
     expect(requestSpy).toHaveBeenCalledTimes(2);
   });
 
+  it("honors Retry-After before retrying a 503 service-unavailable response", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockRejectedValueOnce({
+        status: 503,
+        headers: { "retry-after": "2" },
+        json: { error: { code: "serviceNotAvailable", message: "try later" } },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: { id: "app-root", name: "EasySync", folder: {} },
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    const pending = client.getAppFolder();
+    await vi.advanceTimersByTimeAsync(1999);
+    expect(requestSpy).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await expect(pending).resolves.toMatchObject({ id: "app-root" });
+    expect(requestSpy).toHaveBeenCalledTimes(2);
+  });
+
   it("cancels a pending Retry-After wait without issuing another request", async () => {
     vi.useFakeTimers();
     const requestSpy = vi.spyOn(obsidian, "requestUrl")
@@ -5045,6 +5070,35 @@ describe("OneDriveClient request retry policy", () => {
     expect(requestSpy).toHaveBeenCalledTimes(1);
     expect(summary?.endpoints.metadata?.statusCategories).toMatchObject({
       insufficientStorage: 1,
+    });
+  });
+
+  it("classifies 509 bandwidth throttling as rate limited and retries", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockRejectedValueOnce({
+        status: 509,
+        headers: {},
+        json: { error: { code: "activityLimitReached", message: "bandwidth cap" } },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: { id: "app-root", name: "EasySync", folder: {} },
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    client.beginRunMetrics();
+    const pending = client.getAppFolder();
+    await vi.runAllTimersAsync();
+    await expect(pending).resolves.toMatchObject({ id: "app-root" });
+    expect(requestSpy).toHaveBeenCalledTimes(2);
+    const summary = client.finishRunMetrics();
+
+    expect(summary?.endpoints.metadata?.statusCategories).toMatchObject({
+      rateLimited: 1,
+      success: 1,
     });
   });
 
@@ -5488,7 +5542,7 @@ describe("OneDriveClient folder identity mutations", () => {
     expect(diag.warn).toHaveBeenCalledWith(
       "onedrive",
       expect.stringContaining(
-        "requestUrl HTTP error — method=POST, status=400, graphCode=none, graphMsg=none, responseBody=not exposed on requestUrl error path",
+        "requestUrl HTTP error — method=POST, status=400, graphCode=none, graphMsg=none, graphInnerCode=none, graphRequestId=none, responseBody=absent or not JSON",
       ),
       undefined,
     );
@@ -5626,5 +5680,169 @@ describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
     } finally {
       restore();
     }
+  });
+});
+
+describe("OneDriveClient.ensureDriveAvailable", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("provisions through GET /me/drive before the first root listing", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      json: { id: "drive-id" },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.ensureDriveAvailable()).resolves.toBeUndefined();
+    expect(requestSpy).toHaveBeenCalledWith(expect.objectContaining({
+      method: "GET",
+      url: expect.stringContaining("/me/drive?$select=id"),
+      throw: false,
+    }));
+  });
+
+  it("classifies a 404 on /me/drive as no provisionable OneDrive", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockRejectedValue({
+      status: 404,
+      headers: {},
+      json: { error: { code: "itemNotFound", message: "not found" } },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.ensureDriveAvailable())
+      .rejects.toBeInstanceOf(OneDriveDriveUnavailableError);
+  });
+
+  it("does not misreport auth or permission failures as no OneDrive", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockRejectedValue({
+      status: 403,
+      headers: {},
+      json: { error: { code: "accessDenied", message: "denied" } },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(client.ensureDriveAvailable()).rejects.toMatchObject({
+      type: OneDriveErrorType.Forbidden,
+    });
+  });
+
+  it("captures the Graph error body and cross-checks /me/drives on a 404", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockResolvedValueOnce({
+        status: 404,
+        headers: {},
+        json: {
+          error: {
+            code: "itemNotFound",
+            message: "User's mysite not found.",
+            innerError: {
+              code: "itemNotFound",
+              "request-id": "request-404",
+              date: "2026-10-20T00:00:00Z",
+            },
+          },
+        },
+      } as never)
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: {
+          value: [{ id: "drive-1", driveType: "personal", name: "OneDrive" }],
+        },
+      } as never);
+    const client = new OneDriveClient(async () => "token");
+
+    const failure = await client.ensureDriveAvailable()
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(OneDriveDriveUnavailableError);
+    expect((failure as OneDriveDriveUnavailableError).detail).toMatchObject({
+      statusCode: 404,
+      graphError: {
+        code: "itemNotFound",
+        message: "User's mysite not found.",
+        innerCode: "itemNotFound",
+        requestId: "request-404",
+      },
+      drivesProbe: "ok",
+      drivesCount: 1,
+      driveTypes: ["personal"],
+    });
+    expect(requestSpy.mock.calls.map(([options]) => options.url)).toEqual([
+      expect.stringContaining("/me/drive?$select=id"),
+      expect.stringContaining("/me/drives?$select=id,driveType,name"),
+    ]);
+    expect(requestSpy.mock.calls[0]?.[0]).toMatchObject({ throw: false });
+  });
+
+  it("records an empty /me/drives answer as no available drive", async () => {
+    vi.spyOn(obsidian, "requestUrl")
+      .mockResolvedValueOnce({
+        status: 404,
+        headers: {},
+        json: { error: { code: "itemNotFound", message: "not found" } },
+      } as never)
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: { value: [] },
+      } as never);
+    const client = new OneDriveClient(async () => "token");
+
+    const failure = await client.ensureDriveAvailable()
+      .catch((error: unknown) => error);
+
+    expect((failure as OneDriveDriveUnavailableError).detail).toMatchObject({
+      drivesProbe: "empty",
+      drivesCount: 0,
+      driveTypes: [],
+    });
+  });
+});
+
+describe("OneDriveClient Graph error visibility", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("keeps a resolved Graph error body on the typed error and diagnostic log", async () => {
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 400,
+      headers: {},
+      json: {
+        error: {
+          code: "invalidRequest",
+          message: "bad name",
+          innerError: {
+            code: "invalidName",
+            "request-id": "request-400",
+            date: "2026-10-20T00:00:00Z",
+          },
+        },
+      },
+    } as never);
+    const diag = { log: vi.fn(), warn: vi.fn() };
+    const client = new OneDriveClient(async () => "token", diag as never);
+
+    const failure = await client.createFolderByParentId("parent-id", "New Folder")
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(OneDriveError);
+    expect(failure).toMatchObject({
+      type: OneDriveErrorType.Unknown,
+      statusCode: 400,
+    });
+    const error = failure as OneDriveError;
+    expect(error.graphCode).toBe("invalidRequest");
+    expect(error.graphMessage).toBe("bad name");
+    expect(error.graphInnerCode).toBe("invalidName");
+    expect(error.graphRequestId).toBe("request-400");
+    expect(requestSpy.mock.calls[0]?.[0]).toMatchObject({ throw: false });
+    expect(diag.warn).toHaveBeenCalledWith(
+      "onedrive",
+      expect.stringContaining(
+        "graphCode=invalidRequest, graphMsg=bad name, graphInnerCode=invalidName, graphRequestId=request-400",
+      ),
+      undefined,
+    );
   });
 });

@@ -1184,6 +1184,28 @@ describe("V1 to V2 controlled production activation", () => {
     });
   });
 
+  it("records the reviewed empty-folder delete in the device-local deletion ledger", async () => {
+    const { harness, reviewed } = await prepareAmbiguousEmptyFolderHarness();
+
+    await harness.executor.deleteReviewedEmptyRemoteFolder(reviewed);
+
+    // 删除记录簿（文件版本找回刀一之二）：文件夹级删除按远端 id 记一条，
+    // 并随设备本地记录族落进 data.json。
+    expect(harness.state.deletionLedgerEntries).toEqual([
+      {
+        remoteId: "folder-notes",
+        path: "Notes",
+        deletedAt: expect.any(Number),
+        kind: "folder",
+      },
+    ]);
+    expect(harness.pluginData["easy-sync-deletion-ledger"]).toEqual({
+      schemaVersion: 1,
+      kind: "easy-sync-deletion-ledger",
+      entries: harness.state.deletionLedgerEntries,
+    });
+  });
+
   it("expires an empty-folder choice when local candidates or remote versions change", async () => {
     const localChanged = await prepareAmbiguousEmptyFolderHarness();
     localChanged.harness.localFolderPaths.add("Archive/Child");
@@ -1431,6 +1453,15 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.state.pendingIssues).toEqual([]);
     const envelope = harness.state.getCommittedV2Envelope()!;
     expect(envelope.remoteIndex.itemsById[root.remoteId]).toBeUndefined();
+    // 删除记录簿：整棵树只记根一条（回收站里它们本来就是同一个 item），成员不各记。
+    expect(harness.state.deletionLedgerEntries).toEqual([
+      {
+        remoteId: root.remoteId,
+        path: "Issues",
+        deletedAt: expect.any(Number),
+        kind: "folder",
+      },
+    ]);
 
     harness.mutations.deleteItem.mockClear();
     expect(await harness.executor.run("manual")).toMatchObject({

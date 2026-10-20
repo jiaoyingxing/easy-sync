@@ -22,6 +22,12 @@ export interface AuthState {
   displayName: string;
   /** Whether a valid refresh token exists */
   isLoggedIn: boolean;
+  /** OAuth scopes actually granted by the provider for the current token.
+   *  Diagnostic only: a reduced grant can make Graph return 403/404 even
+   *  though the account itself is fine. */
+  grantedScopes?: string;
+  /** Graph userType for the signed-in account: Member or Guest. */
+  userType?: string;
 }
 
 /** OAuth flow state for CSRF protection.

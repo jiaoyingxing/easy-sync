@@ -196,6 +196,21 @@ describe("V1 to V2 controlled production activation", () => {
     });
     expect(findRemoteItemByPath(harness.remoteItemState, "Notes")).toBeNull();
     expect(harness.state.mutationLedger).toHaveLength(0);
+    // 删除记录簿（文件恢复线索）：空壳目录删除与先行的子文件删除各记一条。
+    expect(harness.state.deletionLedgerEntries).toEqual([
+      {
+        remoteId: "file-a",
+        path: "Notes/a.md",
+        deletedAt: expect.any(Number),
+        kind: "file",
+      },
+      {
+        remoteId: "folder-notes",
+        path: "Notes",
+        deletedAt: expect.any(Number),
+        kind: "folder",
+      },
+    ]);
     expect((await harness.executor.run("manual")).foldersDeleted).toBe(0);
   });
 
@@ -374,6 +389,126 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
   });
 
+  it("settles a conflict-derived deleteLocal intent when the local file still matches the reviewed version and the remote path is absent", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    // Remote deleted + locally modified (hashB) is the keep-remote conflict
+    // shape: the intent's expectedLocal can never match the committed anchor,
+    // which still carries hashA.
+    harness.remoteItemState.splice(
+      harness.remoteItemState.findIndex((item) => item.id === "file-a"),
+      1,
+    );
+    harness.localEntryState[0] = { ...localA, hash: hashB, size: 11 };
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "delete-local-conflict-keep-remote",
+      planRevision: 1,
+      scope,
+      action: "deleteLocal",
+      path: localA.path,
+      expectedLocal: { exists: true, hash: hashB, size: 11 },
+      expectedRemote: { exists: false },
+      createdAt: 10,
+    };
+    await harness.state.beginMutationIntent(intent);
+
+    await expect((harness.executor as unknown as {
+      recoverMutationLedger(currentScope: typeof scope): Promise<unknown>;
+    }).recoverMutationLedger(scope)).resolves.toMatchObject({ state: "settled" });
+
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.fileManager.trashFile).not.toHaveBeenCalled();
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+    expect(harness.diag.warn).toHaveBeenCalledWith(
+      "execute",
+      expect.stringContaining("deleteLocal settled as not applied"),
+    );
+  });
+
+  it("settles the conflict-derived deleteLocal record through an ordinary sync round", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    harness.remoteItemState.splice(
+      harness.remoteItemState.findIndex((item) => item.id === "file-a"),
+      1,
+    );
+    harness.localEntryState[0] = { ...localA, hash: hashB, size: 11 };
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "delete-local-conflict-keep-remote-ordinary-round",
+      planRevision: 1,
+      scope,
+      action: "deleteLocal",
+      path: localA.path,
+      expectedLocal: { exists: true, hash: hashB, size: 11 },
+      expectedRemote: { exists: false },
+      createdAt: 10,
+    };
+    await harness.state.beginMutationIntent(intent);
+
+    const result = await harness.executor.run("manual");
+
+    expect(result).toMatchObject({ errors: 0, conflicts: 1 });
+    expect(harness.state.mutationLedger).toEqual([]);
+    expect(harness.state.pendingConflicts.map((conflict) => conflict.path))
+      .toContain(localA.path);
+    expect(harness.fileManager.trashFile).not.toHaveBeenCalled();
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+  });
+
+  it("keeps a conflict-derived deleteLocal intent unresolved when the local file changed again", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    harness.remoteItemState.splice(
+      harness.remoteItemState.findIndex((item) => item.id === "file-a"),
+      1,
+    );
+    harness.localEntryState[0] = { ...localA, hash: hashB, size: 11 };
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "delete-local-conflict-keep-remote-changed-again",
+      planRevision: 1,
+      scope,
+      action: "deleteLocal",
+      path: localA.path,
+      expectedLocal: { exists: true, hash: hashB, size: 11 },
+      expectedRemote: { exists: false },
+      createdAt: 10,
+    };
+    await harness.state.beginMutationIntent(intent);
+    harness.localEntryState[0] = { ...localA, hash: hashA, size: 10 };
+
+    await expect((harness.executor as unknown as {
+      recoverMutationLedger(currentScope: typeof scope): Promise<unknown>;
+    }).recoverMutationLedger(scope)).rejects.toThrow(/manual review|no longer matches/i);
+
+    expect(harness.state.mutationLedger).toEqual([{ intent, receipt: null }]);
+    expect(harness.fileManager.trashFile).not.toHaveBeenCalled();
+    expect(harness.mutations.deleteItem).not.toHaveBeenCalled();
+  });
+
   it("deletes a local folder only after its remote-deleted children and a second local empty check", async () => {
     const harness = makeHarness();
     await harness.state.load();
@@ -405,6 +540,27 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.localFolderPaths.has("Notes")).toBe(false);
     expect(harness.rawAdapter.list).toHaveBeenCalledWith("Notes");
     expect(harness.fileManager.trashFile).toHaveBeenCalled();
+    // 跟随删除侧（文件版本找回刀一之三）：本机跟随云端删除删掉自己这一份，也记
+    // 一条——云端那份是别的设备（或更早的自己）删的，记录只落在动手那台设备上；
+    // 文件身份按 committed 锚点取，目录身份来自计划项携带的远端 id。
+    expect(harness.state.deletionLedgerEntries).toEqual([
+      {
+        remoteId: "file-a",
+        path: "Notes/a.md",
+        deletedAt: expect.any(Number),
+        kind: "file",
+      },
+      {
+        remoteId: "folder-notes",
+        path: "Notes",
+        deletedAt: expect.any(Number),
+        kind: "folder",
+      },
+    ]);
+    // 取 id 的时机：本轮归约已按 baseRemovals 删掉按路径的锚点，记录簿仍持有身份。
+    expect(Object.values(
+      harness.state.getCommittedV2Envelope()!.anchors.byAnchorId,
+    ).some((anchor) => anchor.lastPath === "Notes/a.md")).toBe(false);
     expect((await harness.executor.run("manual")).foldersDeleted).toBe(0);
   });
 
@@ -510,6 +666,56 @@ describe("V1 to V2 controlled production activation", () => {
     });
   });
 
+  it("records a user-confirmed local file delete that followed a cloud deletion", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    harness.remoteItemState.splice(0);
+
+    const pending = await harness.executor.run("manual");
+
+    expect(pending).toMatchObject({
+      success: true,
+      deleted: 0,
+      errors: 0,
+    });
+    expect(harness.state.pendingRemoteDeletes).toHaveLength(2);
+    expect(harness.state.pendingRemoteDeletes).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "confirmLocalDelete",
+          path: "Notes/a.md",
+        }),
+        expect.objectContaining({
+          type: "deleteLocalFolder",
+          path: "Notes",
+        }),
+      ]),
+    );
+
+    await harness.executor.confirmRemoteDelete("Notes/a.md", false);
+
+    expect(harness.localEntryState).toHaveLength(0);
+    // 用户确认的跟随删除（文件）同样补记一条：身份只能在本轮归约删锚点之前取。
+    expect(harness.state.deletionLedgerEntries).toEqual([
+      {
+        remoteId: "file-a",
+        path: "Notes/a.md",
+        deletedAt: expect.any(Number),
+        kind: "file",
+      },
+    ]);
+    expect(Object.values(
+      harness.state.getCommittedV2Envelope()!.anchors.byAnchorId,
+    ).some((anchor) => anchor.lastPath === "Notes/a.md")).toBe(false);
+  });
+
   it("keeps an empty remote-deleted folder pending until the existing delete approval is used", async () => {
     const harness = makeHarness({
       base: [],
@@ -554,6 +760,15 @@ describe("V1 to V2 controlled production activation", () => {
     expect(harness.localFolderPaths.has("Empty")).toBe(false);
     expect(harness.state.pendingRemoteDeletes).toHaveLength(0);
     expect(harness.state.mutationLedger).toHaveLength(0);
+    // 用户确认的跟随删除（目录）也补记一条，身份来自 committed 目录锚点。
+    expect(harness.state.deletionLedgerEntries).toEqual([
+      {
+        remoteId: "folder-empty",
+        path: "Empty",
+        deletedAt: expect.any(Number),
+        kind: "folder",
+      },
+    ]);
   });
 
   it("confirms nested folder deletes child-first even when the UI passes the parent first", async () => {

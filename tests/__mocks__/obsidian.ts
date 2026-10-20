@@ -173,6 +173,8 @@ export class Modal {
   contentEl: HTMLElement = createMockElement();
   containerEl: HTMLElement = createMockElement();
   modalEl: HTMLElement = createMockElement();
+  // 官方标题槽：找回弹框把手机端返回键（官方锚点）挂在这里。
+  titleEl: HTMLElement = createMockElement();
 
   constructor(_app?: App) {}
   setTitle(_title: string): void {}
@@ -517,6 +519,41 @@ export class DropdownComponent {
     this.onChangeCallback = callback;
     return this;
   }
+  async triggerChange(value: string): Promise<void> {
+    this.value = value;
+    await this.onChangeCallback?.(value);
+  }
+}
+
+/** Search box used by the recovery modal's list pane (host renders the input
+ *  inside the component's own container). */
+export class SearchComponent {
+  static instances: SearchComponent[] = [];
+  inputEl: HTMLInputElement;
+  value = "";
+  private onChangeCallback: ((value: string) => void | Promise<void>) | null = null;
+
+  constructor(readonly containerEl: HTMLElement) {
+    this.inputEl = {
+      id: "",
+      setAttribute: () => {},
+      addEventListener: () => {},
+      // Test hook: the recovery modal focuses the search box on desktop open.
+      focus: vi.fn(),
+    } as unknown as HTMLInputElement;
+    SearchComponent.instances.push(this);
+  }
+  setPlaceholder(_placeholder: string): this { return this; }
+  setValue(value: string): this {
+    this.value = value;
+    return this;
+  }
+  getValue(): string { return this.value; }
+  onChange(callback: (value: string) => void | Promise<void>): this {
+    this.onChangeCallback = callback;
+    return this;
+  }
+  /** Test helper: invoke the registered onChange callback. */
   async triggerChange(value: string): Promise<void> {
     this.value = value;
     await this.onChangeCallback?.(value);

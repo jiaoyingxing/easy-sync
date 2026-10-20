@@ -192,3 +192,25 @@ describe("rs migration completion notice wiring", () => {
     expect(noticeAnchor).toBeGreaterThan(cleanupAnchor);
   });
 });
+
+describe("rs migration no-OneDrive notice copy", () => {
+  it("states the observed condition, the first step, the fallback and the zero-change promise", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+
+    expect(zh.t("rsMigration.noOneDriveNotice")).toBe(
+      "这个微软账号的 OneDrive 现在打不开。请先用同一账号打开 OneDrive 网页版登录一次；还是不行就换账号，工作/学校账号请联系管理员。笔记没有改动。",
+    );
+    expect(en.t("rsMigration.noOneDriveNotice")).toBe(
+      "This Microsoft account's OneDrive can't be opened right now. First sign in to OneDrive on the web with the same account; if that doesn't help, use another account, or contact your admin if this is a work/school account. Your notes are unchanged.",
+    );
+    // A 404 does not prove why the drive is unavailable. The copy must not
+    // turn the observation into a diagnosis, and must not promise that the
+    // suggested sign-in will provision the drive.
+    expect(zh.t("rsMigration.noOneDriveNotice")).not.toContain("还没开通");
+    expect(en.t("rsMigration.noOneDriveNotice")).not.toContain(
+      "has no OneDrive yet",
+    );
+    expect(en.t("rsMigration.noOneDriveNotice")).not.toContain("try again");
+  });
+});

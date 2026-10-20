@@ -189,6 +189,10 @@ import { EasySyncNoticeCenter, NOTICE_PRIORITY } from "../ui/notice-center";
 import { manualResolutionExitAllowedFor } from "../ui/mutation-recovery-presentation";
 import type { TransferRateTickSnapshot } from "./transfer-rate";
 import { LocalRecoveryJournal } from "./local-recovery-journal";
+import {
+  LocalArchiveSourceChangedError,
+  writeLocalArchiveCopyV1,
+} from "./local-archive";
 import { MergeReadyStore } from "./merge-ready-store";
 import {
   isolationCapsuleAdmits,
@@ -3343,6 +3347,12 @@ export class SyncExecutor {
           if (await this.onedrive.getDriveItemMetadataById(root.remoteId)) {
             throw new Error(`Reviewed remote subtree delete read-back failed: ${current.path}`);
           }
+          // 整棵树只记根一条：回收站里它们本来就是同一个 item。
+          await this.noteCloudDeletionLedger({
+            remoteId: root.remoteId,
+            path: current.path,
+            kind: "folder",
+          });
           const checkpoint = folderDeleteCheckpoint(
             current.path,
             root.remoteId,
@@ -3581,6 +3591,11 @@ export class SyncExecutor {
             if (await this.onedrive.getDriveItemMetadataById(latest.remoteId)) {
               throw new Error(`Remote empty-folder delete read-back failed: ${latest.path}`);
             }
+            await this.noteCloudDeletionLedger({
+              remoteId: latest.remoteId,
+              path: latest.path,
+              kind: "folder",
+            });
             return folderDeleteCheckpoint(latest.path, latest.remoteId);
           },
         );
@@ -6136,6 +6151,108 @@ export class SyncExecutor {
   ): Promise<boolean> {
     return bytes.byteLength === expected.size
       && await sha256Hex(bytes) === expected.hash;
+  }
+
+  /**
+   * 冲突「保留云端版」：云端字节即将原地接管本路径，本机那份的留档必须发生在
+   * 覆盖之前。留档是「复制进档」（`<pluginDir>/archive/<stamp>/<路径>`），不是把
+   * 原文件挪走——现役覆盖链（本机 CAS、原子替换、写坏时的回滚）硬依赖目标路径在
+   * 覆盖落地前仍持有旧字节。留档任何一步失败都不覆盖、也不开下载意图：没有账本
+   * 记录，冲突行原地保留，用户可重试。返回 false 即调用方必须原地返回。
+   */
+  private async archiveLocalVersionBeforeKeepRemote(
+    path: string,
+    queuedConflict: SyncPlanItem,
+    operationEpoch: number,
+  ): Promise<boolean> {
+    const expected = queuedConflict.local;
+    // 本机侧没有将丢失的版本（本机已删/云端新增）：没有东西可留档。
+    if (!expected) return true;
+    const paths = getEasySyncPaths(this.scanner.vault);
+    let archived: { archivePath: string } | null;
+    try {
+      archived = await writeLocalArchiveCopyV1({
+        adapter: this.scanner.vault.adapter,
+        path,
+        pluginDir: paths.pluginDir,
+        tmpDir: paths.tmpDir,
+        expected: { size: expected.size, hash: expected.hash },
+        archivedAt: expected.mtime,
+        writeTempFile: (tempPath, content) =>
+          this.writeBinaryTempFileWithAndroidZeroByteRetry(path, tempPath, content),
+        isCurrent: () => this.canContinue(operationEpoch),
+      });
+    } catch (error) {
+      this.diag?.warn(
+        "execute",
+        `local version not archived; the cloud version will not take ${path} over this round`,
+        error instanceof Error ? error.message : String(error),
+      );
+      this.notice("notice.conflict.failed", {
+        path,
+        reason: error instanceof LocalArchiveSourceChangedError
+          ? this.t("notice.localChangedSinceReview")
+          : error instanceof Error ? error.message : this.t("general.unknown"),
+      });
+      return false;
+    }
+    // 取消／换代：留档没落定，本轮不覆盖（与上方失败同一出口，不弹失败提示）。
+    return archived !== null;
+  }
+
+  /**
+   * 删除记录簿（文件版本找回刀一之二）：云端删除已落地之后记一条可恢复线索——
+   * 官方没有「列回收站」API，远端 item id 只在删除这一刻在手里。
+   *
+   * 约束：只在 Graph 删除成功（必要时含回读核验）之后调用；记账失败不得让已经
+   * 生效的删除变成失败，也不得产生用户可见文案（只留诊断行）；id 缺失＝没有可用
+   * 线索，不记。
+   */
+  private async noteCloudDeletionLedger(entry: {
+    remoteId: string | undefined;
+    path: string;
+    kind: "file" | "folder";
+  }): Promise<void> {
+    if (!entry.remoteId) return;
+    try {
+      await this.state.recordCloudDeletion({
+        remoteId: entry.remoteId,
+        path: entry.path,
+        deletedAt: Date.now(),
+        kind: entry.kind,
+      });
+    } catch (error) {
+      this.diag?.warn(
+        "execute",
+        `cloud deletion could not be recorded for recovery — ${entry.path}`,
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  /**
+   * 跟随删除侧（文件版本找回刀一之三）：本机跟随云端的删除、把自己这一份也删掉
+   * 之后补记一条——云端那份是别的设备（或更早的自己）删的，记录只落在动手那台
+   * 设备的记录簿里；本设备补上，每台设备的找回入口才看得见这次删除。
+   *
+   * 只能在删除成功之后、归约按 `checkpoint.baseRemovals` 删锚点之前调用：文件
+   * 身份来自 committed 锚点，之后没有任何入口还能拿到。拿不到 id 就不记——记录
+   * 族身份是 id，路径单独存在无法驱动恢复——只留诊断；删除已经落地，不因此报错。
+   */
+  private async noteFollowedCloudDeletionLedger(entry: {
+    remoteId: string | undefined;
+    path: string;
+    kind: "file" | "folder";
+  }): Promise<void> {
+    if (!entry.remoteId) {
+      this.diag?.warn(
+        "execute",
+        `followed cloud deletion has no recoverable identity — ${entry.path}`,
+        `kind=${entry.kind}`,
+      );
+      return;
+    }
+    await this.noteCloudDeletionLedger(entry);
   }
 
   /**
@@ -14185,7 +14302,13 @@ export class SyncExecutor {
         delete result.breakerDeferredErrors;
         delete result.networkFailureErrors;
         delete result.planningDeferredErrors;
-        result.message = this.t("result.syncFailed", { message: e instanceof Error ? e.message : "unknown error" });
+        // A known provider failure already has one localized presentation;
+        // reuse it instead of showing the raw transport status (e.g. 507 ->
+        // "OneDrive storage is full"). Unknown errors keep their own message.
+        const runFailureMessage = e instanceof OneDriveError
+          ? this.failureReason(e)
+          : e instanceof Error ? e.message : "unknown error";
+        result.message = this.t("result.syncFailed", { message: runFailureMessage });
         this.diag?.error(
           "execute",
           "sync run failed unexpectedly",
@@ -20000,12 +20123,30 @@ export class SyncExecutor {
       if (!requireDeleteLocalRemoteAbsence) {
         if (localStillExpected) return "not-applied";
       } else {
-      const remoteId = this.committedDeleteLocalRemoteId(intent);
-      if (
-        remoteId === null
-        || await this.onedrive.getDriveItemMetadataById(remoteId) !== null
-      ) return null;
-      if (localStillExpected) return "not-applied";
+        const remoteId = this.committedDeleteLocalRemoteId(intent);
+        if (remoteId === null) {
+          // A keep-remote decision on a remoteDeletedLocalModified conflict
+          // records the locally modified version as expectedLocal. That
+          // version was never uploaded, so no committed anchor can carry its
+          // hash. If the local file still matches it and the remote path is
+          // still absent, the local delete provably never ran; abandoning the
+          // intent is zero-write and lets ordinary planning re-decide.
+          if (
+            localStillExpected
+            && intent.expectedLocal.exists
+            && !intent.expectedRemote.exists
+            && remoteStillExpected
+          ) {
+            this.diag?.warn(
+              "execute",
+              `deleteLocal settled as not applied — ${intent.path}`,
+            );
+            return "not-applied";
+          }
+          return null;
+        }
+        if (await this.onedrive.getDriveItemMetadataById(remoteId) !== null) return null;
+        if (localStillExpected) return "not-applied";
       }
     }
     if (intent.action === "download" && localStillExpected) {
@@ -20725,6 +20866,12 @@ export class SyncExecutor {
               return this.t("syncView.failure.remoteInvalidNameControlChar");
           }
         }
+      }
+      // 408 is classified as Unknown by HTTP status, but the pause gate and
+      // retry accounting already treat it as network-class; keep the visible
+      // reason consistent with them.
+      if (error.statusCode === 408) {
+        return this.t("syncView.failure.network");
       }
       switch (error.type) {
         case OneDriveErrorType.Unauthorized:
@@ -21569,6 +21716,12 @@ export class SyncExecutor {
     if (local.status === "present") {
       if (!this.canContinue(operationEpoch, result)) return { executed: false };
       await this.deleteEmptyLocalFolder(item.path);
+      // 跟随删除侧：删掉本机这份空壳之后补记一条，身份来自计划项携带的远端 id。
+      await this.noteFollowedCloudDeletionLedger({
+        remoteId: item.folder.remoteId,
+        path: item.path,
+        kind: "folder",
+      });
     }
     result.foldersDeleted = (result.foldersDeleted ?? 0) + 1;
     return {
@@ -21635,6 +21788,11 @@ export class SyncExecutor {
       }
       throw e;
     }
+    await this.noteCloudDeletionLedger({
+      remoteId: item.remote?.driveId,
+      path: item.path,
+      kind: "file",
+    });
     remoteDeletes.push(item.path);
     result.deleted++;
     return { executed: true, mutationApplied: true, baseRemoval: item.path };
@@ -21679,7 +21837,16 @@ export class SyncExecutor {
       throw new MutationNotAppliedError(error);
     }
     if (!this.canContinue(operationEpoch, result)) return { executed: false };
-    if (current.status === "present") await this.deleteLocalPath(item.path);
+    if (current.status === "present") {
+      await this.deleteLocalPath(item.path);
+      // 跟随删除侧：本机这一份删掉之后、本轮 checkpoint 归约删锚点之前补记
+      // 一条（文件级没有别的 id 来源）。
+      await this.noteFollowedCloudDeletionLedger({
+        remoteId: this.state.remoteIdForPath(item.path),
+        path: item.path,
+        kind: "file",
+      });
+    }
     result.deleted++;
     return { executed: true, mutationApplied: true, baseRemoval: item.path };
   }
@@ -22817,6 +22984,11 @@ export class SyncExecutor {
     if (await this.onedrive.getDriveItemMetadataById(item.folder.remoteId)) {
       throw new Error(`Remote folder delete read-back failed: ${item.path}`);
     }
+    await this.noteCloudDeletionLedger({
+      remoteId: item.folder.remoteId,
+      path: item.path,
+      kind: "folder",
+    });
     result.foldersDeleted = (result.foldersDeleted ?? 0) + 1;
     return {
       executed: true,
@@ -28249,6 +28421,11 @@ export class SyncExecutor {
               queuedConflict.remote!.eTag,
               queuedConflict.remote!.driveId,
             );
+            await this.noteCloudDeletionLedger({
+              remoteId: queuedConflict.remote!.driveId,
+              path,
+              kind: "file",
+            });
             const checkpoint = emptyMutationCheckpoint();
             checkpoint.baseRemovals.push(path);
             checkpoint.remoteDeletes.push(path);
@@ -28366,9 +28543,19 @@ export class SyncExecutor {
           })) return;
           if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict")) return;
           if (!this.canContinue(operationEpoch)) return;
+          // 留档先于删除：这份本机内容云端已无、是唯一一份；留档没落定就不删
+          // （见方法注释）。
+          if (!await this.archiveLocalVersionBeforeKeepRemote(path, queuedConflict, operationEpoch)) return;
           const intent = this.createSideMutationIntent(queuedConflict, "deleteLocal");
           const committed = await this.runDurableSideMutation(intent, operationEpoch, async () => {
             await this.deleteLocalPath(path);
+            // 跟随删除侧：本机这一份删掉之后、checkpoint 提交（归约删锚点）之前
+            // 补记一条——文件级没有别的 id 来源。
+            await this.noteFollowedCloudDeletionLedger({
+              remoteId: this.state.remoteIdForPath(path),
+              path,
+              kind: "file",
+            });
             const checkpoint = emptyMutationCheckpoint();
             checkpoint.baseRemovals.push(path);
             checkpoint.remoteDeletes.push(path);
@@ -28403,6 +28590,8 @@ export class SyncExecutor {
           this.notice("notice.conflict.keptRemote", { path });
           return true;
         }
+        // 留档先于覆盖：留档没落定就不覆盖、也不开下载意图（见方法注释）。
+        if (!await this.archiveLocalVersionBeforeKeepRemote(path, queuedConflict, operationEpoch)) return;
         const intent = this.createSideMutationIntent(queuedConflict, "download");
         let content: ArrayBuffer | null = null;
         const committed = await this.runDurableSideMutation(intent, operationEpoch, async () => {
@@ -28686,6 +28875,13 @@ export class SyncExecutor {
         const intent = this.createSideMutationIntent(pending, "deleteLocal");
         const committed = await this.runDurableSideMutation(intent, operationEpoch, async () => {
           await this.deleteLocalPath(path);
+          // 跟随删除侧：本机这一份删掉之后、checkpoint 提交（归约删锚点）之前
+          // 补记一条——文件级没有别的 id 来源。
+          await this.noteFollowedCloudDeletionLedger({
+            remoteId: this.state.remoteIdForPath(path),
+            path,
+            kind: "file",
+          });
           const checkpoint = emptyMutationCheckpoint();
           checkpoint.baseRemovals.push(path);
           checkpoint.pendingDeleteRemovals.push(path);
@@ -28772,6 +28968,12 @@ export class SyncExecutor {
             throw new MutationNotAppliedError(this.t("notice.decisionExpired"));
           }
           await this.deleteEmptyLocalFolder(path);
+          // 跟随删除侧：删掉本机这份空壳之后补记一条，身份来自 committed 目录锚点。
+          await this.noteFollowedCloudDeletionLedger({
+            remoteId: anchor.remoteId,
+            path,
+            kind: "folder",
+          });
           const checkpoint = folderDeleteCheckpoint(path, anchor.remoteId);
           checkpoint.pendingDeleteRemovals.push(path);
           return checkpoint;

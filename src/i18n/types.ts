@@ -247,6 +247,11 @@ export interface LocaleStrings {
   "settings.localOnlyIgnored.name": string;
   "settings.localOnlyIgnored.desc": string;
   "settings.localOnlyIgnored.button": string;
+  /** 维护页「高级」组标题（2026-10-20 用户拍板：同步回收站＋重置一组）。 */
+  "settings.maintenanceAdvanced.heading": string;
+  "settings.recoveryBin.name": string;
+  "settings.recoveryBin.desc": string;
+  "settings.recoveryBin.button": string;
   "settings.reset.name": string;
   "settings.reset.desc": string;
   "settings.reset.button": string;
@@ -918,6 +923,8 @@ export interface LocaleStrings {
   /** 首同步前的 RS 旧仓检测失败：本轮已中止（选择保留），必须让用户知道
    *  为什么什么都没发生（2026-10-10 R2）。 */
   "rsMigration.detectFailedNotice": string;
+  /** 首同步前 GET /me/drive 返回 404：当前拿不到这个账号的盘。原因无法仅凭 404 区分（未开通/无许可/租户策略/临时故障），文案只陈述观察结果与下一步。 */
+  "rsMigration.noOneDriveNotice": string;
   "rsMigration.completedNotice": string;
   "rsMigration.failureTitle": string;
   "rsMigration.failureBody": string;
@@ -990,6 +997,48 @@ export interface LocaleStrings {
   "updateCheck.optionSkipVersion": string;
   "updateCheck.confirm": string;
   "updateCheck.cancel": string;
+
+  // ---- File version recovery (找回入口：命令＋文件菜单项＋弹框) ----
+  "recovery.recentTitle": string;
+  "recovery.command": string;
+  "recovery.menuItem": string;
+  "recovery.searchPlaceholder": string;
+  "recovery.loading": string;
+  "recovery.loadFailed": string;
+  "recovery.empty": string;
+  "recovery.noMatches": string;
+  "recovery.selectHint": string;
+  "recovery.showMore": string;
+  "recovery.source.localArchive": string;
+  "recovery.source.deletedRecord": string;
+  "recovery.source.cloudVersion": string;
+  "recovery.source.syncBaseline": string;
+  "recovery.reason.noRemoteIdentity": string;
+  "recovery.reason.noVersionHistory": string;
+  "recovery.reason.contentUnavailable": string;
+  "recovery.reason.expired": string;
+  "recovery.reason.writeFailed": string;
+  "recovery.copyContent": string;
+  "recovery.copySuccess": string;
+  "recovery.copyUnavailable": string;
+  "recovery.restoreAsCopy": string;
+  "recovery.restoreFromCloud": string;
+  "recovery.restoreCopySuccess": string;
+  "recovery.restoreCloudSuccess": string;
+  "recovery.restoreFailed": string;
+  "recovery.sourceIntro.localArchive": string;
+  "recovery.sourceIntro.deletedRecord": string;
+  "recovery.sourceIntro.deletedRecordFolder": string;
+  "recovery.sourceIntro.cloudVersion": string;
+  "recovery.sourceIntro.syncBaseline": string;
+  "recovery.binaryNotice": string;
+  "recovery.previewTruncated": string;
+  "recovery.showDiff": string;
+  "recovery.diffLegend.historySuffix": string;
+  "recovery.noComparableVersion": string;
+  "recovery.diffTooLarge": string;
+  "recovery.diffIdentical": string;
+  "recovery.windowHint": string;
 }
 
 /** Language tag to locale mapping */

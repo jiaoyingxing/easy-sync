@@ -69,6 +69,10 @@ export interface DriveItemVersion {
   size?: number;
   lastModifiedDateTime?: string;
   lastModifiedBy?: IdentitySet;
+  /** Pre-authorized URL that downloads *this version's* content directly
+   *  (present on every retained version in the 2026-10-19 field probe; it is
+   *  a one-shot credential, not a stable identity — never persist it). */
+  "@microsoft.graph.downloadUrl"?: string;
 }
 
 /**
@@ -131,11 +135,23 @@ export enum OneDriveErrorType {
   Unknown = "Unknown",
 }
 
+/** Graph error body details kept for diagnostics. `message` is
+ *  developer-facing and must never be shown to users; only `code` and
+ *  `innerCode` are stable enough to reason about. */
+export interface OneDriveGraphErrorDetail {
+  code: string;
+  message: string;
+  innerCode: string | null;
+  requestId: string | null;
+  date: string | null;
+}
+
 export class OneDriveError extends Error {
   public readonly type: OneDriveErrorType;
   public readonly statusCode: number;
   public readonly retryAfterSeconds: number | null;
   public readonly graphCode: string | null;
+  public readonly graphError: OneDriveGraphErrorDetail | null;
 
   constructor(
     type: OneDriveErrorType,
@@ -143,13 +159,64 @@ export class OneDriveError extends Error {
     statusCode: number = 0,
     retryAfterSeconds: number | null = null,
     graphCode: string | null = null,
+    graphError: OneDriveGraphErrorDetail | null = null,
   ) {
     super(message);
     this.name = "OneDriveError";
     this.type = type;
     this.statusCode = statusCode;
     this.retryAfterSeconds = retryAfterSeconds;
-    this.graphCode = graphCode;
+    this.graphCode = graphError?.code ?? graphCode;
+    this.graphError = graphError;
+  }
+
+  get graphMessage(): string | null {
+    return this.graphError?.message ?? null;
+  }
+
+  get graphInnerCode(): string | null {
+    return this.graphError?.innerCode ?? null;
+  }
+
+  get graphRequestId(): string | null {
+    return this.graphError?.requestId ?? null;
+  }
+}
+
+/** What the preflight learned when the default drive was unavailable. */
+export interface OneDriveDriveProbeDetail {
+  statusCode: number;
+  graphError: OneDriveGraphErrorDetail | null;
+  /** `/me/drives` answered with a non-empty list, an empty list, was denied,
+   *  or could not be read. */
+  drivesProbe: "ok" | "empty" | "denied" | "failed";
+  drivesCount: number;
+  driveTypes: string[];
+  drivesGraphCode: string | null;
+  drivesRequestId: string | null;
+  /** Sanitized failure text when the /me/drives probe itself failed. */
+  drivesError: string | null;
+}
+
+/** The signed-in account has no provisionable default OneDrive drive:
+ *  Graph answered 404 for /me/drive, the endpoint documented to provision a
+ *  licensed user's drive automatically. Kept distinct from auth/permission
+ *  failures so the first-sync entry can give account-level guidance. */
+export class OneDriveDriveUnavailableError extends Error {
+  constructor(
+    message = "No OneDrive drive is available for this account",
+    public readonly detail: OneDriveDriveProbeDetail | null = null,
+  ) {
+    super(message);
+    this.name = "OneDriveDriveUnavailableError";
+  }
+
+  get graphCode(): string | null {
+    return this.detail?.graphError?.code ?? null;
+  }
+
+  get requestId(): string | null {
+    return this.detail?.graphError?.requestId ?? null;
   }
 }
 

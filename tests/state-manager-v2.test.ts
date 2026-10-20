@@ -839,6 +839,31 @@ describe("StateManager V2 production controller", () => {
     });
   });
 
+  it("exposes committed baseline facts for one path without writing anything", async () => {
+    const harness = makeHarness({ committed: envelope() });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const writesBefore = harness.rawAdapter.write.mock.calls.length;
+
+    expect(state.baselineFactsForPath(remoteA.path)).toEqual({
+      hash: hashA,
+      size: remoteA.size,
+      at: 1,
+    });
+    expect(state.baselineFactsForPath("Notes/missing.md")).toBeUndefined();
+    expect(state.remoteETagForPath(remoteA.path)).toBe(remoteA.eTag);
+    expect(state.remoteETagForPath("Notes/missing.md")).toBeUndefined();
+
+    expect(harness.rawAdapter.write.mock.calls.length).toBe(writesBefore);
+    expect(harness.readCommitted().anchors.byAnchorId["file:file-a"])
+      .toMatchObject({
+        lastPath: remoteA.path,
+        contentHash: hashA,
+        size: remoteA.size,
+        confirmedAt: 1,
+      });
+  });
+
   it("publishes new common text to AncestorStoreV2 and reads it only through the anchor", async () => {
     const content = "next common text\n";
     const bytes = new TextEncoder().encode(content);

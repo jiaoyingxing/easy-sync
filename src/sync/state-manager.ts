@@ -144,6 +144,16 @@ import {
   type LocalOnlyCreatedEntryV1,
 } from "./local-only-copies";
 import {
+  deletionLedgerCutoffV1,
+  emptyDeletionLedgerV1,
+  pruneDeletionLedgerV1,
+  readDeletionLedgerV1,
+  upsertDeletionLedgerEntryV1,
+  type DeletionLedgerEntryV1,
+  type DeletionLedgerV1,
+} from "./deletion-ledger";
+import { pruneExpiredLocalArchiveDirectoriesV1 } from "./local-archive";
+import {
   StateV2ScopeTransitionError,
   StateV2ScopeTransitionStore,
   type StateV2ScopeTransitionFailureReason,
@@ -562,6 +572,8 @@ const KEY_LOCAL_FILE_MOVE_HINTS = "easy-sync-local-file-move-hints";
 const KEY_LOCAL_FOLDER_DELETE_HINTS = "easy-sync-local-folder-delete-hints";
 /** 片② 本机独有条目记录：原路径 ↔ 本机改动副本（片④ 消费、片⑤ 联动）。 */
 const KEY_LOCAL_ONLY_COPIES = "easy-sync-local-only-copies";
+/** 删除记录簿（设备本地记录族，不进 V2 信封、不进同步）。 */
+const KEY_DELETION_LEDGER = "easy-sync-deletion-ledger";
 /** 片⑤ 忽略记忆：「留在本机，不再提醒」的本机清单（只影响提醒）。 */
 const KEY_LOCAL_ONLY_IGNORE_MEMORY = "easy-sync-local-only-ignore-memory";
 const KEY_TRANSFER_RATES_WINDOW = "easy-sync-transfer-rates-window";
@@ -701,6 +713,7 @@ interface PluginData {
   [KEY_LOCAL_FILE_MOVE_HINTS]: LocalFolderMoveHintV1[];
   [KEY_LOCAL_FOLDER_DELETE_HINTS]: LocalFolderDeleteHintV1[];
   [KEY_LOCAL_ONLY_COPIES]: LocalOnlyCopiesV1;
+  [KEY_DELETION_LEDGER]: DeletionLedgerV1;
   [KEY_LOCAL_ONLY_IGNORE_MEMORY]: LocalOnlyIgnoreMemoryV1;
   [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]:
     CommunityPluginManifestObservationV1[];
@@ -744,6 +757,7 @@ const DEFAULT_DATA: PluginData = {
     [KEY_LOCAL_FILE_MOVE_HINTS]: [],
     [KEY_LOCAL_FOLDER_DELETE_HINTS]: [],
     [KEY_LOCAL_ONLY_COPIES]: emptyLocalOnlyCopiesV1(),
+    [KEY_DELETION_LEDGER]: emptyDeletionLedgerV1(),
     [KEY_LOCAL_ONLY_IGNORE_MEMORY]: createEmptyLocalOnlyIgnoreMemory(),
     [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]: [],
     [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]: null,
@@ -779,6 +793,7 @@ function createDefaultData(generation = 0, planRevision = 0): PluginData {
     [KEY_LOCAL_FILE_MOVE_HINTS]: [],
     [KEY_LOCAL_FOLDER_DELETE_HINTS]: [],
     [KEY_LOCAL_ONLY_COPIES]: emptyLocalOnlyCopiesV1(),
+    [KEY_DELETION_LEDGER]: emptyDeletionLedgerV1(),
     [KEY_LOCAL_ONLY_IGNORE_MEMORY]: createEmptyLocalOnlyIgnoreMemory(),
     [KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS]: [],
     [KEY_REMOTE_COMMUNITY_PLUGIN_CATALOG]: null,
@@ -1637,6 +1652,9 @@ export class StateManager {
       [KEY_LOCAL_ONLY_COPIES]:
         readLocalOnlyCopiesV1(saved[KEY_LOCAL_ONLY_COPIES])
         ?? emptyLocalOnlyCopiesV1(),
+      [KEY_DELETION_LEDGER]:
+        readDeletionLedgerV1(saved[KEY_DELETION_LEDGER])
+        ?? emptyDeletionLedgerV1(),
       [KEY_LOCAL_ONLY_IGNORE_MEMORY]:
         readLocalOnlyIgnoreMemory(saved[KEY_LOCAL_ONLY_IGNORE_MEMORY])
         ?? createEmptyLocalOnlyIgnoreMemory(),
@@ -1684,6 +1702,70 @@ export class StateManager {
       legacy,
       this.plugin.layoutMigrationStorage,
     );
+    await this.pruneExpiredRecoveryClues();
+  }
+
+  /**
+   * 健康轮的 30 天摘除：删除记录簿条目与留档夹目录都已出（或即将出）官方回收站
+   * 的留存窗口。两步各自独立、任何失败都不上抛、无变化不写盘——housekeeping 不
+   * 得影响同步，失败只留诊断。
+   */
+  private async pruneExpiredRecoveryClues(now = Date.now()): Promise<void> {
+    try {
+      await this.commitPluginData((current) => {
+        const family = current[KEY_DELETION_LEDGER] ?? emptyDeletionLedgerV1();
+        const next = pruneDeletionLedgerV1(family, { now });
+        if (next === family) return current;
+        return { ...current, [KEY_DELETION_LEDGER]: next };
+      });
+    } catch (error) {
+      this.plugin.diag?.warn(
+        "state",
+        "deletion ledger prune failed",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+    try {
+      const paths = getEasySyncPaths(
+        this.plugin.app.vault,
+        this.plugin.manifest.id,
+      );
+      const outcome = await pruneExpiredLocalArchiveDirectoriesV1({
+        adapter: this.plugin.app.vault.adapter,
+        pluginDir: paths.pluginDir,
+        cutoff: deletionLedgerCutoffV1(now),
+      });
+      if (outcome.failed.length > 0) {
+        this.plugin.diag?.warn(
+          "state",
+          "some expired local archives could not be removed",
+          outcome.failed,
+        );
+      }
+    } catch (error) {
+      this.plugin.diag?.warn(
+        "state",
+        "local archive prune failed",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+  }
+
+  /**
+   * 删除记录簿：本设备每执行一次「删除云端内容」记一条可恢复线索（远端 item id
+   * 是官方回收站里唯一可用的入口）。身份＝远端 id，重放＝更新。
+   */
+  get deletionLedgerEntries(): readonly DeletionLedgerEntryV1[] {
+    return this.data[KEY_DELETION_LEDGER].entries;
+  }
+
+  async recordCloudDeletion(entry: DeletionLedgerEntryV1): Promise<void> {
+    await this.commitPluginData((current) => {
+      const family = current[KEY_DELETION_LEDGER] ?? emptyDeletionLedgerV1();
+      const next = upsertDeletionLedgerEntryV1(family, entry);
+      if (next === family) return current;
+      return { ...current, [KEY_DELETION_LEDGER]: next };
+    });
   }
 
   private setV2StateLoadBlock(
@@ -8655,6 +8737,52 @@ export class StateManager {
   getCommittedRemoteIndex(): Readonly<RemoteIndexV2> | null {
     const index = this.v2Envelope?.remoteIndex;
     return index && index.complete === true ? index : null;
+  }
+
+  /**
+   * 只读：某个库内路径当前绑定的文件身份的远端 id（committed 文件锚点里最后
+   * 一次已知的 driveItem id）。删除记录簿的「跟随删除」侧要的就是它，而且必须
+   * 在归约按 `checkpoint.baseRemovals` 删锚点之前取——之后没有任何入口还能把它
+   * 找回来。没有信封、没有绑定、或绑定没有 id 时返回 undefined。
+   */
+  remoteIdForPath(path: string): string | undefined {
+    const normalized = path.normalize("NFC");
+    return Object.values(this.v2Envelope?.anchors.byAnchorId ?? {}).find(
+      (anchor) => anchor.lastPath.normalize("NFC") === normalized,
+    )?.remoteId;
+  }
+
+  /**
+   * 只读：某个库内路径当前同步基线的展示事实（内容 hash／体积／确认时刻）。
+   * 「找回」条目的同步历史基线来源要这三个值；内容仍走 `getBaseContent`
+   * （它自带「祖先库确有该内容」的可得性门）。无信封、无该路径锚点时 undefined。
+   */
+  baselineFactsForPath(
+    path: string,
+  ): { hash: string; size: number; at: number } | undefined {
+    const normalized = path.normalize("NFC");
+    const anchor = Object.values(this.v2Envelope?.anchors.byAnchorId ?? {}).find(
+      (entry) => entry.lastPath.normalize("NFC") === normalized,
+    );
+    if (!anchor) return undefined;
+    return {
+      hash: anchor.contentHash,
+      size: anchor.size,
+      at: anchor.confirmedAt,
+    };
+  }
+
+  /**
+   * 只读：某个库内路径当前 committed 锚点记录的远端 eTag（形状 `"{GUID},N"`，
+   * 尾号是该文件的写入序号，也等于当前版本号 `N.0`）。找回读面用它把「当前版本」
+   * 从可恢复版本列表里排除——当前版本既取不到内容（版本内容端点 400），本来也
+   * 就是库里当前那份。无信封、无该路径锚点、或锚点没有 eTag 时 undefined。
+   */
+  remoteETagForPath(path: string): string | undefined {
+    const normalized = path.normalize("NFC");
+    return Object.values(this.v2Envelope?.anchors.byAnchorId ?? {}).find(
+      (anchor) => anchor.lastPath.normalize("NFC") === normalized,
+    )?.remoteETag;
   }
 
   /**

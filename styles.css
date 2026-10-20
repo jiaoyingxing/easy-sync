@@ -1604,6 +1604,16 @@ body:not(.is-mobile) .easy-sync-settings-tab .setting-item-control button:not(.c
   min-width: calc(4em + var(--size-4-3) * 2);
 }
 
+/* 1.13+ 声明式设置页进入子页后，宿主另建 `.setting-page` 容器承载页内容，
+   该容器不带插件页签根容器的 `easy-sync-settings-tab` 类 ⇒ 上面那条规则
+   在子页整体失配，子页动作按钮退回 50px 自然宽，与根页 76px 的「打开」
+   不齐（2026-10-20 用户反馈）。以「当前激活的是本插件页签」为作用域补齐
+   子页；`:has()` 只在 1.13+ 声明式渲染（Chromium 105+）才会用到，旧宿主
+   没有 `.setting-page`，仍由上面那条规则覆盖。 */
+body:not(.is-mobile) .vertical-tabs-container:has(.vertical-tab-nav-item.is-active[data-setting-id="easy-sync"]) .setting-page .setting-item-control button:not(.clickable-icon) {
+  min-width: calc(4em + var(--size-4-3) * 2);
+}
+
 /* 1.13+ 设置页「规则」行被「我知道了」收起后：宿主把组内行间分割线画在每行的
    ::before 上，只对 DOM :first-child 豁免；收起的行以 display:none 隐藏但仍
    占住 first-child，紧随其后那行的分割线会浮在组顶（2026-10-12 真机复测）。
@@ -1759,5 +1769,327 @@ body.is-mobile .easy-sync-transfer-rate.is-mobile-footer {
   .app-container
   .status-bar.easy-sync-mobile-status-bar-shown
   .status-bar-item:not(.plugin-easy-sync) {
+  display: none;
+}
+
+/* ═══ 找回弹框（文件版本找回刀三之一） ═══
+   外壳＝宿主官方侧栏式弹框（mod-sidebar-layout）：宿主隐藏标题栏、手机全屏。
+   .easy-sync-recovery-shell 只做宿主类缺席时的尺寸兜底；宿主的
+   .modal.mod-sidebar-layout 选择器更具体，生效时以宿主为准，两者不打架。
+   内容铺满；桌面＝双栏（列表｜详情）；手机＝单栏切换（列表／详情）。
+   类名一律 easy-sync-recovery-*；颜色只用宿主变量。 */
+.easy-sync-recovery-shell {
+  width: min(90vw, 1100px);
+  height: min(80vh, 800px);
+}
+
+body.is-mobile .easy-sync-recovery-shell {
+  width: 100%;
+  height: 100%;
+}
+
+.easy-sync-recovery-modal {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 内容区头部：桌面单行（左标题／右开关与动作）；手机由下方规则折成两行。 */
+.easy-sync-recovery-header {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--size-4-2);
+  /* 宿主把 mod-sidebar-layout 弹框自身的 padding 清零：顶部与左右留白由
+     头部自带（对齐官方 modal-setting-titlebar 的 8px×16px）；右侧 40px
+     让开浮层关闭 ×。 */
+  padding: var(--size-4-2) var(--size-4-4);
+  padding-inline-end: var(--size-4-10);
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.easy-sync-recovery-header-main {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: var(--size-2-3);
+  min-width: 0;
+}
+
+.easy-sync-recovery-header-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+}
+
+.easy-sync-recovery-header-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--size-4-2);
+  margin-left: auto;
+}
+
+.easy-sync-recovery-diff-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-3);
+}
+
+.easy-sync-recovery-layout {
+  display: flex;
+  flex: 1 1 auto;
+  gap: var(--size-4-2);
+  /* 内容列与搜索框四周留白：对齐头部 8px×16px（宿主清零弹框 padding，
+     内距由我们自己承担；此前只有左右，搜索框与详情顶行上缘贴住头部）。 */
+  padding: var(--size-4-2) var(--size-4-4);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.easy-sync-recovery-list-pane {
+  display: flex;
+  flex: 0 0 38%;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.easy-sync-recovery-search {
+  flex: 0 0 auto;
+}
+
+/* 单一滚动面之一：列表列自己滚（详情列不受影响）。 */
+.easy-sync-recovery-list-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.easy-sync-recovery-row {
+  padding: var(--size-4-2);
+  border-bottom: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s);
+  cursor: pointer;
+}
+
+.easy-sync-recovery-row:hover {
+  background: var(--background-modifier-hover);
+}
+
+.easy-sync-recovery-row.is-selected {
+  background: var(--background-modifier-active-hover, var(--background-modifier-hover));
+}
+
+.easy-sync-recovery-row.is-unavailable .easy-sync-recovery-path,
+.easy-sync-recovery-row.is-unavailable .easy-sync-recovery-time {
+  color: var(--text-muted);
+}
+
+.easy-sync-recovery-row-head {
+  display: flex;
+  align-items: center;
+  gap: var(--size-4-2);
+  min-width: 0;
+}
+
+.easy-sync-recovery-row-head .easy-sync-recovery-time {
+  font-size: var(--font-ui-small);
+}
+
+.easy-sync-recovery-path {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+}
+
+.easy-sync-recovery-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--size-4-2);
+  margin-top: var(--size-2-3);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.easy-sync-recovery-row-meta .easy-sync-recovery-source {
+  margin-left: 0;
+}
+
+.easy-sync-recovery-reason {
+  color: var(--text-faint);
+}
+
+.easy-sync-recovery-show-more {
+  width: 100%;
+  margin-top: var(--size-4-2);
+}
+
+.easy-sync-recovery-message {
+  padding: var(--size-4-2);
+}
+
+.easy-sync-recovery-detail-pane {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* 单一滚动面之二：详情列自己滚，动作页脚固定在它底部。 */
+.easy-sync-recovery-detail-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.easy-sync-recovery-detail-path {
+  margin-bottom: var(--size-4-2);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  word-break: break-all;
+}
+
+/* 云端版本保留期提示：一行小字，不抢正文。 */
+.easy-sync-recovery-note {
+  margin: 0 0 var(--size-4-2);
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller);
+}
+
+.easy-sync-recovery-time,
+.easy-sync-recovery-size {
+  white-space: nowrap;
+}
+
+.easy-sync-recovery-diff-label {
+  font-size: var(--font-ui-small);
+}
+
+.easy-sync-recovery-diff {
+  margin-top: var(--size-4-2);
+}
+
+/* 差异图例：两行色标；颜色映射由色块承担（与 diff 行同一处红／绿规则着色），
+   文字只说含义，不再用左右表述。 */
+.easy-sync-recovery-diff-caption {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--size-2-1);
+  margin-top: var(--size-2-3);
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.easy-sync-recovery-diff-legend {
+  display: flex;
+  align-items: center;
+  gap: var(--size-2-3);
+}
+
+.easy-sync-recovery-legend-swatch {
+  flex: 0 0 auto;
+  width: 1em;
+  height: 1em;
+  border-radius: 2px;
+}
+
+/* 唯一框架子节点：手机端宿主把 modal-content 直接子节点全部绝对叠放，
+   头部与布局收进框架内恢复文档流；桌面端它就是普通弹性满高容器。 */
+.easy-sync-recovery-frame {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+/* 常驻头部的隐藏态：骨架永不重建，只切显隐（每类槽位一个 is-hidden）。 */
+.easy-sync-recovery-header-actions.is-hidden,
+.easy-sync-recovery-diff-toggle.is-hidden,
+.easy-sync-recovery-copy-button.is-hidden,
+.easy-sync-recovery-restore-button.is-hidden {
+  display: none;
+}
+
+/* 手机端返回键＝官方锚点（modal-setting-back-button，定位/安全区/按压样式由
+   宿主承担）；我们只补一个按自家纪律的隐藏态类。 */
+.easy-sync-recovery-modal .modal-setting-back-button.is-hidden {
+  display: none;
+}
+
+/* 手机端：标题与路径由宿主标题槽承担（不随详情态翻面，整条隐藏）；
+   内容区头部只在详情态出现（放"显示变更＋复制＋恢复"这排动作）。 */
+body.is-mobile .easy-sync-recovery-header-title {
+  display: none;
+}
+
+body.is-mobile .easy-sync-recovery-header {
+  display: none;
+}
+
+body.is-mobile .easy-sync-recovery-header.is-detail-open {
+  display: flex;
+}
+
+/* 手机端：布局容器只留左右内距——纵向空隙（分割线与内容之间）按 2026-10-20
+   用户定案不保留；左右 16px 仍在。 */
+body.is-mobile .easy-sync-recovery-layout {
+  padding-block: 0;
+}
+
+/* 手机端单栏：头部两行；列表与详情互斥，切换不加动画。 */
+body.is-mobile .easy-sync-recovery-header {
+  flex-direction: column;
+  align-items: stretch;
+  /* 内容头部在宿主标题槽之下，关闭 × 不占这一排：右侧回到 16px，与内容列对齐。 */
+  padding-inline-end: var(--size-4-4);
+}
+
+body.is-mobile .easy-sync-recovery-header-actions {
+  margin-left: 0;
+  /* 四控件同排是临界布局：iPhone 393pt 只剩约 12px 余量，安卓更窄或界面
+     字号更大时「恢复为副本」会被挤到第二行左侧。手机端间距收一档。 */
+  gap: var(--size-4-1);
+}
+
+/* 宿主按钮默认横向内距 12px；手机端收到 8px，给中文四控件同排留出余量。
+   flex-wrap 保留：英文长文案或更窄屏幕仍可自然换行。 */
+body.is-mobile .easy-sync-recovery-header-actions button {
+  padding-inline: var(--size-4-2);
+}
+
+body.is-mobile .easy-sync-recovery-layout {
+  flex-direction: column;
+}
+
+body.is-mobile .easy-sync-recovery-list-pane {
+  flex: 1 1 auto;
+}
+
+body.is-mobile
+  .easy-sync-recovery-layout.is-detail-open
+  .easy-sync-recovery-list-pane {
+  display: none;
+}
+
+body.is-mobile
+  .easy-sync-recovery-layout:not(.is-detail-open)
+  .easy-sync-recovery-detail-pane {
   display: none;
 }

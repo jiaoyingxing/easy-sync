@@ -94,6 +94,7 @@ function createMockPlugin(): EasySyncPlugin {
       deviceAttempt: null,
     },
     openSyncPanelFromSettings: vi.fn().mockResolvedValue(undefined),
+    openRecoveryEntry: vi.fn(),
     logoutUser: vi.fn().mockResolvedValue(undefined),
     getUpdatePromptState: vi.fn(() => null),
     openUpdatePage: vi.fn(),
@@ -183,12 +184,16 @@ describe("buildSettingDefinitions", () => {
     expect(labels(pageItems(t("settings.group.maintenance")))).toEqual([
       t("settings.diagLog.name"),
       t("settings.diagReport.name"),
+      // 「高级」组（2026-10-20 用户拍板）：同步回收站在上、件③ 常备、重置收尾；
+      // 顶部诊断为无标题组（首组无标题口径同 2026-10-12 拍板）。
+      t("settings.maintenanceAdvanced.heading"),
+      t("settings.recoveryBin.name"),
       // 件③ 反转入口：定义树里常备一行（单向且计数 > 0 才 visible），本桩为
       // 双向模式，所以渲染时隐藏、行名仍在登记表里。
       t("settings.localOnlyIgnored.name"),
       t("settings.reset.name"),
     ]);
-    // 全案只有两个分组标题（每页第一分组不加标题，2026-10-12 拍板）。
+    // 全案只有三个分组标题（每页第一分组不加标题，2026-10-12 拍板）。
     expect(labels(pageItems(t("settings.syncScope.name"))))
       .toContain(t("settings.syncContent.heading"));
     expect(labels(pageItems(t("settings.group.display"))))
@@ -878,22 +883,29 @@ describe("declarative completeness vs display()", () => {
 });
 
 describe("declarative local-only reversal row (件③)", () => {
-  function findReversalItem(defs: ReturnType<typeof buildSettingDefinitions>) {
+  interface ReversalItemRecord {
+    name?: string;
+    desc?: string;
+    visible?: () => boolean;
+    render?: (s: never) => void;
+    items?: unknown[];
+  }
+  function findReversalItem(
+    defs: ReturnType<typeof buildSettingDefinitions>,
+  ): ReversalItemRecord | undefined {
     const i18n = new I18n("zh-cn");
     const page = defs.find((d) =>
       (d as { name?: string }).name === i18n.t("settings.group.maintenance")) as
-      | {
-        items?: Array<{
-          name?: string;
-          desc?: string;
-          visible?: () => boolean;
-          render?: (s: never) => void;
-        }>;
-      }
+      | { items?: ReversalItemRecord[] }
       | undefined;
-    return page?.items?.find(
-      (item) => item.name === i18n.t("settings.localOnlyIgnored.name"),
-    );
+    // 2026-10-20 起件③ 收进「高级」组，不再位于页顶层：递归下钻分组找行。
+    const stack = [...(page?.items ?? [])];
+    while (stack.length > 0) {
+      const item = stack.shift();
+      if (item?.name === i18n.t("settings.localOnlyIgnored.name")) return item;
+      if (item && Array.isArray(item.items)) stack.unshift(...item.items);
+    }
+    return undefined;
   }
 
   it("stays hidden in two-way mode and appears with the live count in one-way mode", () => {

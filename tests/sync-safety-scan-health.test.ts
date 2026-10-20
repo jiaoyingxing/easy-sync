@@ -602,6 +602,7 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
       deleteItem?: ReturnType<typeof vi.fn>;
       adapterOverrides?: Record<string, unknown>;
       recordMutationReceipt?: ReturnType<typeof vi.fn>;
+      recordCloudDeletion?: ReturnType<typeof vi.fn>;
     } = {},
   ) {
     const fillerBaseEntries = Array.from(
@@ -727,6 +728,9 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
       upsertPendingDeletes: mockUpsertPendingDeletes,
       prunePendingDeletes: mockPrunePendingDeletes,
       setLastSyncTime: mockSetLastSyncTime,
+      ...(options.recordCloudDeletion
+        ? { recordCloudDeletion: options.recordCloudDeletion }
+        : {}),
     });
     if (options.recordMutationReceipt) {
       mutationState.recordMutationReceipt = options.recordMutationReceipt;
@@ -876,6 +880,72 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
     expect(mockDeleteItem).toHaveBeenCalled();
   });
 
+  it("records a successful cloud file delete in the device-local deletion ledger", async () => {
+    const deletedLocally = base("safe.md");
+    const recordCloudDeletion = vi.fn().mockResolvedValue(undefined);
+    const { mockDeleteItem } = await runWithV2Facts({
+      baseEntries: [deletedLocally],
+      remoteEntries: [remote(deletedLocally)],
+    }, { recordCloudDeletion });
+
+    expect(mockDeleteItem).toHaveBeenCalledTimes(1);
+    expect(recordCloudDeletion).toHaveBeenCalledWith({
+      remoteId: `id-${deletedLocally.path}`,
+      path: deletedLocally.path,
+      deletedAt: expect.any(Number),
+      kind: "file",
+    });
+  });
+
+  it("records nothing when the Graph delete itself fails", async () => {
+    const deletedLocally = base("safe.md");
+    const recordCloudDeletion = vi.fn().mockResolvedValue(undefined);
+    const deleteItem = vi.fn().mockRejectedValue(new Error("graph 500"));
+    // 回读证明对象仍在云端 ⇒ 这次删除没有发生，不得留下任何恢复线索。
+    const getFileMetadata = vi.fn().mockResolvedValue({
+      driveId: `id-${deletedLocally.path}`,
+      size: deletedLocally.size,
+      mtime: 1,
+      eTag: deletedLocally.eTag,
+      downloadUrl: `https://download.example/${deletedLocally.path}`,
+      sha256Hash: deletedLocally.hash,
+    });
+    const { result, mockDeleteItem } = await runWithV2Facts({
+      baseEntries: [deletedLocally],
+      remoteEntries: [remote(deletedLocally)],
+    }, { recordCloudDeletion, deleteItem, getFileMetadata });
+
+    expect(mockDeleteItem).toHaveBeenCalledTimes(1);
+    expect(result.deleted).toBe(0);
+    expect(recordCloudDeletion).not.toHaveBeenCalled();
+  });
+
+  it("keeps a delete successful when the ledger write fails", async () => {
+    const deletedLocally = base("safe.md");
+    const recordCloudDeletion = vi
+      .fn()
+      .mockRejectedValue(new Error("plugin data write failed"));
+    // 回读仍能看见对象（本轮删除已由 Graph 确认落地）：记账失败若上抛，这一轮
+    // 会把已经发生的删除当失败处理。
+    const getFileMetadata = vi.fn().mockResolvedValue({
+      driveId: `id-${deletedLocally.path}`,
+      size: deletedLocally.size,
+      mtime: 1,
+      eTag: deletedLocally.eTag,
+      downloadUrl: `https://download.example/${deletedLocally.path}`,
+      sha256Hash: deletedLocally.hash,
+    });
+    const { result } = await runWithV2Facts({
+      baseEntries: [deletedLocally],
+      remoteEntries: [remote(deletedLocally)],
+    }, { recordCloudDeletion, getFileMetadata });
+
+    // 记账失败只留诊断：删除照常落地、本轮不因此多一个错误。
+    expect(recordCloudDeletion).toHaveBeenCalledTimes(1);
+    expect(result.deleted).toBe(1);
+    expect(result.errors).toBe(0);
+  });
+
   it("allows ConfirmLocalDelete when scan is healthy", async () => {
     const deletedRemotely = base("safe.md");
     const localEntry = local(deletedRemotely);
@@ -944,6 +1014,7 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
       status: "present",
       entry: localEntry,
     });
+    const recordCloudDeletion = vi.fn().mockResolvedValue(undefined);
     const {
       result,
       mockAdapter,
@@ -957,9 +1028,14 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
       autoDeleteLocalFiles: true,
       inspectFile,
       adapterOverrides: { remove },
+      recordCloudDeletion,
     });
 
     expect(result.deleted).toBe(1);
+    expect(result.errors).toBe(0);
+    // 跟随删除侧（文件版本找回刀一之三）：这个现场取不到远端 id（committed 锚点
+    // 里没有身份）——不记、不抛，删除照常落地。
+    expect(recordCloudDeletion).not.toHaveBeenCalled();
     expect(result.metrics?.automaticHandling.deleteLocal).toEqual({
       candidates: 1,
       completed: 1,

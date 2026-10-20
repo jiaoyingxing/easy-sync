@@ -486,6 +486,30 @@ describe("Persistent remote delta state", () => {
     expect(deleteLocal.adapter.remove).toHaveBeenCalledWith("local-only.md");
   });
 
+  it("records the redundant cloud copy removed by keep-local in the device-local deletion ledger", async () => {
+    const harness = await makeManualResolutionHarness({
+      path: "remote-only.md",
+      remote: { "remote-only.md": "cloud" },
+      remoteOnlyConflictPaths: ["remote-only.md"],
+      withLedger: false,
+    });
+
+    await harness.executor.resolveConflictKeepLocal("remote-only.md");
+
+    // 「保留本机」在只有云端一份多余的现场＝删掉那份云端副本；删除落地后立刻
+    // 记一条可恢复线索（文件版本找回刀一之二）。
+    expect(harness.deleteItem).toHaveBeenCalledOnce();
+    expect(harness.remoteFiles.has("remote-only.md")).toBe(false);
+    expect(harness.state.deletionLedgerEntries).toEqual([
+      {
+        remoteId: "remote-remote-only.md",
+        path: "remote-only.md",
+        deletedAt: expect.any(Number),
+        kind: "file",
+      },
+    ]);
+  });
+
   it("turns strict identical facts into a state-only checkpoint", async () => {
     const harness = await makeManualResolutionHarness({
       path: "same.md",
