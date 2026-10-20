@@ -21,7 +21,11 @@
   </a>
 </p>
 
-EasySync keeps your Obsidian vault in sync across computers, phones, and tablets, with two sync modes: two-way and one-way.
+EasySync keeps your Obsidian vault in sync across your computer, phone, and tablet.
+
+No server, no complex setup — sign in to OneDrive and sync.
+
+Two-way and one-way sync modes are both supported.
 
 ## Table of contents
 
@@ -113,7 +117,7 @@ The `files` directory contains the vault files included in sync, and you can bro
 
 ### 2.2 How data is transferred
 
-Synced files stay in your own OneDrive account. EasySync connects directly to Microsoft sign-in and Microsoft Graph with no third-party relay, and its sync paths are limited to the app folder `Apps/EasySync/`. Every upload recomputes each file's content hash to confirm nothing changed in transit, and downloads are verified before overwriting local files.
+Synced files stay in your own OneDrive account. EasySync connects directly to Microsoft sign-in and Microsoft Graph with no third-party relay, and its sync paths are limited to the app folder `Apps/EasySync/`. Every upload recomputes each file's content hash to confirm nothing changed in transit, and downloads are verified before overwriting local files. The plugin checks for new releases through a public CDN (jsDelivr) — it reads the latest version number only and uploads nothing.
 
 The current Microsoft permissions are:
 
@@ -123,9 +127,11 @@ The current Microsoft permissions are:
 
 No telemetry, ads, or behavioral analytics; diagnostic logs stay in the local plugin directory, and a diagnostic report is written to the vault only when you explicitly generate one. The source is published on GitHub for review.
 
-### 2.3 Recycle Bin and backup boundary
+### 2.3 Recovering files and the backup boundary
 
-If a cloud file is deleted, you may be able to restore it from the OneDrive Recycle Bin according to your account policy. But neither the Recycle Bin nor sync history replaces an independent backup — keep important content backed up regularly, in a place no sync tool manages.
+Whenever EasySync deletes a cloud file on your behalf, it records a recovery clue. Deleted files and folders can be brought back from the plugin's **Sync recycle bin** (Settings → Maintenance → Advanced): records are kept for about 30 days, and restoring asks OneDrive to put the file back at its original location, returning to your devices on the next sync. For a single file, **Recover previous versions** in the file context menu shows the history OneDrive keeps, the content from before the last sync, and local versions discarded during conflicts; restoring always creates a new copy and never overwrites existing files (see section 4).
+
+Recovery and the Recycle Bin still do not replace an independent backup — keep important content backed up regularly, in a place no sync tool manages.
 
 ## 3. Configuration and sync scope
 
@@ -141,7 +147,7 @@ Other options can be enabled as needed:
 | Sync scope | Editor settings, appearance, themes and snippets, hotkeys, bookmarks, and core plugins can be controlled separately |
 | Community plugins | Plugin files can be selected individually; each plugin's `data.json` is controlled separately by **Community plugin data** |
 | Community plugin data | Each plugin's `data.json` can be selected separately; this feature is still experimental, so back up plugin settings on every device before enabling it |
-| Auto sync | Scheduled sync and sync-after-change can be configured separately; **Sync now** remains available when both are off |
+| Auto sync | Under the master switch, three channels — **Sync on startup**, **Scheduled sync**, and **Sync after changes** — are configured separately; **Sync now** remains available when auto sync is off |
 | Automatic handling | Merging non-overlapping text edits is on by default; applying remote deletions locally is off by default, and uncertain cases become conflicts or pending decisions |
 | Diagnostic logging | Leave it off for normal use; enable it when investigating a problem and generating a diagnostic report |
 | Notification popups | All by default; can be set to "Important only" or "Off"; critical alerts such as sign-in expiration are always shown |
@@ -209,6 +215,8 @@ These normally require your decision or another review:
 
 EasySync does not overwrite one side merely because a file "looks newer".
 
+When you choose the cloud version in a conflict, the local version being discarded is safely archived first; discarded content and deleted files can be recovered through the entrances in section 2.3.
+
 ## 5. Migrating from other sync methods
 
 If you already sync another way, follow the steps below. Remember three things while migrating: keep the original vault and an independent backup; do not let two sync tools manage the same local vault; and if the first sync plan shows an unexpected number of uploads, downloads, or conflicts, cancel it and re-check the vault name, directory structure, sync scope, and encryption settings before starting over. Files already placed in EasySync's cloud directory with exactly the same paths and contents as the local copies only establish a shared baseline during the first sync and are not uploaded again.
@@ -257,7 +265,7 @@ Yes. There is no limit on the number of vaults; only your OneDrive storage matte
 
 EasySync does not provide end-to-end encryption: the cloud copies are plain files stored in your own OneDrive, where you can view them at any time (see section 2).
 
-Data safety rests on three things: files stay in your own OneDrive account, with a direct connection to Microsoft and no third-party server; sensitive operations such as deletion have confirmation and protection mechanisms, and mistakenly deleted files can be restored from the OneDrive Recycle Bin according to your account policy; OneDrive account security — sign-in protection and optional two-step verification — protects these files too, so enabling two-step verification on your Microsoft account is recommended.
+Data safety rests on three things: files stay in your own OneDrive account, with a direct connection to Microsoft and no third-party server; sensitive operations such as deletion have confirmation and protection mechanisms, and mistakenly deleted files can be recovered from the plugin's Sync recycle bin (kept for about 30 days), or from the OneDrive Recycle Bin according to your account policy; OneDrive account security — sign-in protection and optional two-step verification — protects these files too, so enabling two-step verification on your Microsoft account is recommended.
 
 If you need end-to-end encryption where even the cloud provider cannot read the content, EasySync does not offer it today.
 
