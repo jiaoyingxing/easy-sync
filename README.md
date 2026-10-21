@@ -117,7 +117,7 @@ EasySync 把每个仓库分别存放在 OneDrive 的应用目录中：
 
 ### 2.2 数据如何传输
 
-同步文件保存在你自己的 OneDrive 账户中。EasySync 直接连接 Microsoft 登录和 Microsoft Graph，不使用第三方中转服务器，同步路径限制在应用目录 `应用/EasySync/` 内。每次上传前会重新计算文件的内容哈希，确认内容没有在中途变化；下载的文件覆盖本机文件前，也会先复核一遍。插件会通过公共 CDN（jsDelivr）检查是否发布新版本——只读取最新版本号，不上传任何内容。
+同步文件保存在你自己的 OneDrive 账户中。EasySync 直接连接 Microsoft 登录和 Microsoft Graph，不使用第三方中转服务器，同步路径限制在应用目录 `应用/EasySync/` 内。每次上传前会重新计算文件的内容哈希，确认内容没有在中途变化；下载的文件覆盖本机文件前，也会先复核一遍。插件会通过 GitHub 原始文件（raw.githubusercontent.com）和公共 CDN（jsDelivr）检查是否发布新版本——只读取最新版本号，不上传任何内容；优先 GitHub，失败才查询 jsDelivr，仍失败则一小时后静默重试。
 
 当前 Microsoft 授权包括：
 
