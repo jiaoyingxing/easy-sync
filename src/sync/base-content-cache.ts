@@ -1,9 +1,9 @@
 /**
  * BaseContentCache — Lightweight baseline content storage for three-way merge.
  *
- * Stores the content of synced text files as the new baseline after each
- * successful upload/download. Used by the merge engine when both sides
- * modify the same file independently.
+ * Holds the content of synced text files as the legacy baseline. Under V2
+ * authority the runtime only loads this snapshot for the legacy read-only
+ * path; new baselines live in AncestorStoreV2.
  *
  * Persisted to the registered base-content path (outside
  * Obsidian's PluginData API, to keep data.json lean).
@@ -17,14 +17,6 @@ const TEXT_EXTENSIONS = new Set([
   ".md", ".txt", ".json", ".css", ".js", ".ts", ".yaml", ".yml",
   ".html", ".xml", ".csv", ".jsx", ".tsx", ".mjs", ".cjs",
 ]);
-
-/** Files larger than this are never cached (2 MB of raw text). */
-const MAX_CACHE_SIZE = 2 * 1024 * 1024;
-
-/** M15: total cache size limit — evict LRU when exceeded. */
-const MAX_TOTAL_BYTES = 10 * 1024 * 1024;
-/** M15: maximum number of cached entries. */
-const MAX_ENTRIES = 5000;
 
 function stringRecordToMap(record: Record<string, string>): Map<string, string> {
   const map = new Map<string, string>();
@@ -44,77 +36,11 @@ export class BaseContentCache {
   /** path → trimmed content (no trailing newline guaranteed for consistent diff) */
   private store = new Map<string, string>();
 
-  /** Whether the in-memory store has changed since last save. */
-  private dirty = false;
-
   // ---- public API ----
 
-  /** Cache the baseline content for a file. Skips binary and oversized files.
-   *  Evicts LRU entries when total size or count exceeds limits. */
-  cache(path: string, content: string | ArrayBuffer): void {
-    if (!isTextFile(path)) return;
-    let text: string;
-    if (typeof content === "string") {
-      if (new TextEncoder().encode(content).byteLength > MAX_CACHE_SIZE) return;
-      text = content;
-    } else {
-      if (content.byteLength > MAX_CACHE_SIZE) return;
-      try {
-        text = new TextDecoder("utf-8", { fatal: true }).decode(content);
-      } catch {
-        return; // invalid UTF-8 is binary for merge purposes
-      }
-    }
-
-    // LRU: delete and re-insert to move to end (most-recently-used)
-    this.store.delete(path);
-    this.store.set(path, text);
-    this.evictLRU();
-    this.dirty = true;
-  }
-
-  /** Get the cached baseline content, or undefined if not cached.
-   *  Access bumps the entry to MRU position. */
+  /** Get the cached baseline content, or undefined if not cached. */
   get(path: string): string | undefined {
-    const content = this.store.get(path);
-    if (content !== undefined) {
-      // LRU bump: delete + re-insert to move to end
-      this.store.delete(path);
-      this.store.set(path, content);
-    }
-    return content;
-  }
-
-  /** Evict least-recently-used entries until within limits. */
-  private evictLRU(): void {
-    // Count limit
-    while (this.store.size > MAX_ENTRIES) {
-      const oldest = this.store.keys().next().value;
-      if (oldest === undefined) break;
-      this.store.delete(oldest);
-    }
-    // Byte limit
-    let total = 0;
-    for (const content of this.store.values()) total += content.length;
-    while (total > MAX_TOTAL_BYTES) {
-      const oldest = this.store.keys().next().value;
-      if (oldest === undefined) break;
-      const removed = this.store.get(oldest) ?? "";
-      total -= removed.length;
-      this.store.delete(oldest);
-    }
-  }
-
-  /** Remove entries for paths no longer in the active set. */
-  prune(activePaths: Set<string>): void {
-    let removed = false;
-    for (const path of this.store.keys()) {
-      if (!activePaths.has(path)) {
-        this.store.delete(path);
-        removed = true;
-      }
-    }
-    if (removed) this.dirty = true;
+    return this.store.get(path);
   }
 
   /** Load the cache from disk. Safe to call when the file doesn't exist yet. */
@@ -140,20 +66,5 @@ export class BaseContentCache {
       // File doesn't exist or is corrupt — start with empty cache
       this.store = new Map<string, string>();
     }
-    this.dirty = false;
-  }
-
-  /** Persist the cache to disk. No-op if unchanged. */
-  async save(adapter: DataAdapter, cachePath: string): Promise<void> {
-    if (!this.dirty) return;
-    const obj: Record<string, string> = {};
-    for (const [path, content] of this.store) {
-      obj[path] = content;
-    }
-    await adapter.write(
-      cachePath,
-      JSON.stringify(obj),
-    );
-    this.dirty = false;
   }
 }

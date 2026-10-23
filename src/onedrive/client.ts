@@ -15,6 +15,7 @@ import {
   compatClearTimeout,
   compatSetTimeout,
   DEFAULT_CONFIG_DIR,
+  describeError,
   getEasySyncPaths,
   isRecord,
   isStringRecord,
@@ -47,8 +48,7 @@ import {
   type UploadMissingRange,
 } from "./upload-session-policy";
 import {
-  cdnHostOfDownloadUrl,
-  classifyCdnDownloadFailure,
+  fingerprintCdnDownloadFailure,
 } from "./cdn-download-failure";
 import {
   createDownloadStallWatchdog,
@@ -594,7 +594,7 @@ export class OneDriveClient {
       ))];
       drivesProbe = drivesCount > 0 ? "ok" : "empty";
     } catch (error) {
-      drivesError = error instanceof Error ? error.message : String(error);
+      drivesError = describeError(error);
       if (error instanceof OneDriveError) {
         drivesGraphCode = error.graphCode;
         drivesRequestId = error.graphRequestId;
@@ -1331,7 +1331,7 @@ export class OneDriveClient {
       vaultFolder.parentReference?.driveId,
       filesFolder.parentReference?.driveId,
     ].filter((value): value is string => Boolean(value));
-    if (observedDriveIds.some((value) => value !== scope.driveId)) {
+    if (observedDriveIds.some((value) => !isSameGraphDriveId(value, scope.driveId))) {
       throw new RemoteVaultScopeIdentityError("drive-invalid");
     }
 
@@ -3052,12 +3052,17 @@ export class OneDriveClient {
         );
         throw error;
       }
-      throw this.toRequestError(error, downloadUrl, false, {
-        stage: classifyCdnDownloadFailure(error),
-        host: cdnHostOfDownloadUrl(downloadUrl),
-        component,
-        elapsedMs: Date.now() - readStartedAt,
-      }, "GET");
+      throw this.toRequestError(
+        error,
+        downloadUrl,
+        false,
+        fingerprintCdnDownloadFailure(error, {
+          elapsedMs: Date.now() - readStartedAt,
+          url: downloadUrl,
+          component,
+        }),
+        "GET",
+      );
     }
     return {
       id: item.id,
@@ -3903,7 +3908,7 @@ export class OneDriveClient {
       } as RequestUrlResponse);
     }
 
-    const errMsg = rawError instanceof Error ? rawError.message : String(rawError);
+    const errMsg = describeError(rawError);
     return new OneDriveError(
       OneDriveErrorType.NetworkError,
       `Network error: ${errMsg}`,
@@ -4506,6 +4511,26 @@ function sanitizeUrl(url: string): string {
   }
 }
 
+/**
+ * Request-deadline wrapper for Graph calls. A timeout rejects with
+ * `SyntheticRequestTimeoutError`; that type plus its `source`/`timeoutMs`
+ * fields are a contract upper layers branch on, so they must never degrade to
+ * a generic `Error`. Every other rejection is normalized through `toErrorLike`
+ * because `requestUrl` can reject with plain Graph error records whose status
+ * fields downstream classification reads. `compatSetTimeout` keeps the timer
+ * on the same active-window source as the rest of the plugin. The wrapped
+ * promise is never cancelled: its handlers stay attached, so a late
+ * settlement is ignored once this outer promise has settled and cannot become
+ * an unhandled rejection.
+ *
+ * Intentionally not merged with `withTimeout` in `src/update-check.ts`: that
+ * copy rejects with `Error("update-check-timeout")`, passes rejection reasons
+ * through untouched and uses `window.setTimeout`; its only caller swallows
+ * every failure, so it has no error-identity or normalization contract. A
+ * shared shell would need an injected error factory, rejection normalizer and
+ * timer provider just to reproduce two unrelated contracts, while risking
+ * that one caller silently inherits the other's semantics.
+ */
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = compatSetTimeout(
@@ -4806,7 +4831,7 @@ function responseToText(
 
 /** Extract structured error data for diag logging. */
 function downloadErrorData(err: unknown): Record<string, unknown> {
-  const message = err instanceof Error ? err.message : String(err);
+  const message = describeError(err);
   const data: Record<string, unknown> = err instanceof OneDriveError
     ? { message, errorType: err.type, statusCode: err.statusCode, graphCode: err.graphCode }
     : { message };

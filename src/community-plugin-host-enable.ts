@@ -1,4 +1,5 @@
 import type { App } from "obsidian";
+import { describeError } from "./obsidian-compat";
 
 /**
  * No-restart enablement for explicitly downloaded community plugins
@@ -52,9 +53,7 @@ export async function tryEnableDownloadedCommunityPlugin(
   } catch (error) {
     return {
       kind: "fallback",
-      reason: error instanceof Error
-        ? error.message
-        : String(error),
+      reason: describeError(error),
     };
   }
 }

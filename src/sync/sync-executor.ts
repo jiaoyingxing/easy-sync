@@ -23,10 +23,12 @@ import {
 import { sha256Hex } from "../crypto";
 import {
   compatSetTimeout,
+  describeError,
   getConfigDir,
   getEasySyncPaths,
   isEasySyncSelfSyncFilePath,
   isRecord,
+  normalizeVaultPathKey,
 } from "../obsidian-compat";
 import { BundleReviewBytesCache } from "./bundle-review-bytes-cache";
 import {
@@ -863,6 +865,17 @@ class MutationNotAppliedError extends Error {
   ) {
     super(original instanceof Error ? original.message : "Reviewed mutation was not applied");
     this.name = "MutationNotAppliedError";
+  }
+}
+
+/** A selected plugin bundle upload would move the remote bundle to an older
+ *  version. Typed so recovery routing can recognise the downgrade without
+ *  matching the user-visible message; the message stays byte-identical
+ *  because `error-presentation.ts` presents it by prefix. */
+class CommunityPluginBundleDowngradeError extends Error {
+  constructor(readonly pluginId: string) {
+    super(`Selected plugin upload would downgrade remote bundle: ${pluginId}`);
+    this.name = "CommunityPluginBundleDowngradeError";
   }
 }
 
@@ -1942,6 +1955,14 @@ export class SyncExecutor {
    *  error so the three root causes (parse failure, same-directory drift,
    *  cross-directory collision) surface as distinct messages. */
   private communityPluginIdentityBlockedErrors = new Map<string, Error>();
+  /** Local plugin directories whose only remote counterpart is the same folder
+   *  under another case/NFC spelling. The folder planner defers the rename;
+   *  this map lets the pending row name both spellings instead of the generic
+   *  rename-conflict copy. Cleared at the start of every run. */
+  private communityPluginDirectorySpellingConflicts = new Map<string, {
+    localDirectory: string;
+    remoteDirectory: string;
+  }>();
   /** Consecutive shared sync protocol observations that ended retryable
    *  (network / service / timeout) since the last healthy observation.
    *  Session-scoped diagnostic counter; never gates behavior. */
@@ -2072,6 +2093,32 @@ export class SyncExecutor {
 
   private t(key: string, params?: Record<string, string | number>): string {
     return this.i18n?.t(key, params) ?? key;
+  }
+
+  /**
+   * Build one pending row. A deferred plugin-directory rename that is only a
+   * case/NFC spelling divergence gets the exact two spellings and the manual
+   * exit instead of the generic rename-conflict copy. The row and its issue
+   * code stay the existing folder-deferred family; this changes copy only.
+   */
+  private buildPendingIssueForPlanItem(item: SyncPlanItem): PendingIssue {
+    const issue = buildPendingIssueFromPlanItem(
+      item,
+      (key) => this.t(key),
+      Date.now(),
+    );
+    if (issue.issueCode !== "local-rename-evidence-conflict") return issue;
+    const conflict = this.communityPluginDirectorySpellingConflicts.get(
+      item.path,
+    );
+    if (!conflict) return issue;
+    return {
+      ...issue,
+      reason: this.t("reason.folder.pluginDirectorySpellingDiffers", {
+        localDirectory: conflict.localDirectory,
+        remoteDirectory: conflict.remoteDirectory,
+      }),
+    };
   }
 
   /**
@@ -2277,7 +2324,7 @@ export class SyncExecutor {
         `folder record auto-settlement unavailable; keeping the record blocked — ${record.intent.path}`,
         {
           operationId: record.intent.operationId,
-          reason: error instanceof Error ? error.message : String(error),
+          reason: describeError(error),
           mutations: 0,
         },
       );
@@ -4742,7 +4789,7 @@ export class SyncExecutor {
         item.type === SyncActionType.FolderDeferred
         || item.type === SyncActionType.RetryLater
       ))
-      .map((item) => buildPendingIssueFromPlanItem(item, (key) => this.t(key), Date.now()))
+      .map((item) => this.buildPendingIssueForPlanItem(item))
       .filter((issue) => (
         issue.issueCode !== undefined
         && PLANNER_DERIVED_PENDING_ISSUE_CODES.has(issue.issueCode)
@@ -5685,7 +5732,7 @@ export class SyncExecutor {
       this.diag?.warn(
         "execute",
         `local version check failed before reviewed action — ${path}`,
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       this.diag?.warn("execute", `reviewed action blocked — ${path} changed locally`);
       this.notice(noticeKey, { path, reason: this.t("notice.localChangedSinceReview") });
@@ -6186,7 +6233,7 @@ export class SyncExecutor {
       this.diag?.warn(
         "execute",
         `local version not archived; the cloud version will not take ${path} over this round`,
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       this.notice("notice.conflict.failed", {
         path,
@@ -6225,7 +6272,7 @@ export class SyncExecutor {
       this.diag?.warn(
         "execute",
         `cloud deletion could not be recorded for recovery — ${entry.path}`,
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -6396,7 +6443,10 @@ export class SyncExecutor {
     manifestObservations: readonly CommunityPluginManifestObservationV1[];
   }>): Promise<void> {
     const selectedDirectoryIds = new Set<string>();
+    const localDirectoryIds = new Set<string>();
+    const remoteDirectoryIds = new Set<string>();
     const localManifestPaths = new Set<string>();
+    const localMainPaths = new Set<string>();
     for (const entry of input.localEntries) {
       const parsed = parseCommunityPluginBundlePath(entry.path, input.configDir);
       if (
@@ -6405,8 +6455,11 @@ export class SyncExecutor {
         || !isPluginSelected(input.policy.files, parsed.pluginId)
       ) continue;
       selectedDirectoryIds.add(parsed.pluginId);
+      localDirectoryIds.add(parsed.pluginId);
       if (parsed.fileName === "manifest.json") {
         localManifestPaths.add(parsed.pluginId);
+      } else if (parsed.fileName === "main.js") {
+        localMainPaths.add(parsed.pluginId);
       }
     }
     for (const entry of input.remoteEntries) {
@@ -6415,7 +6468,10 @@ export class SyncExecutor {
         parsed
         && parsed.pluginId !== "easy-sync"
         && isPluginSelected(input.policy.files, parsed.pluginId)
-      ) selectedDirectoryIds.add(parsed.pluginId);
+      ) {
+        selectedDirectoryIds.add(parsed.pluginId);
+        remoteDirectoryIds.add(parsed.pluginId);
+      }
     }
     const remoteObservationByDirectory = new Map(
       input.manifestObservations.map((observation) => [
@@ -6423,8 +6479,40 @@ export class SyncExecutor {
         observation,
       ]),
     );
+    const directorySpellingsByKey = new Map<string, {
+      local: Set<string>;
+      remote: Set<string>;
+    }>();
+    for (const directoryId of localDirectoryIds) {
+      const key = normalizeVaultPathKey(directoryId);
+      const group = directorySpellingsByKey.get(key)
+        ?? { local: new Set<string>(), remote: new Set<string>() };
+      group.local.add(directoryId);
+      directorySpellingsByKey.set(key, group);
+    }
+    for (const directoryId of remoteDirectoryIds) {
+      const key = normalizeVaultPathKey(directoryId);
+      const group = directorySpellingsByKey.get(key)
+        ?? { local: new Set<string>(), remote: new Set<string>() };
+      group.remote.add(directoryId);
+      directorySpellingsByKey.set(key, group);
+    }
+    const remoteSpellingAliasByLocal = new Map<string, string>();
+    for (const group of directorySpellingsByKey.values()) {
+      if (group.local.size !== 1 || group.remote.size !== 1) continue;
+      const [localDirectoryId] = group.local;
+      const [remoteDirectoryId] = group.remote;
+      if (localDirectoryId !== remoteDirectoryId) {
+        remoteSpellingAliasByLocal.set(localDirectoryId, remoteDirectoryId);
+      }
+    }
+    const claimedRemoteSpellingAliases = new Set(
+      remoteSpellingAliasByLocal.values(),
+    );
     const identities: Array<{ directoryId: string; manifestId: string }> = [];
     for (const directoryId of selectedDirectoryIds) {
+      if (claimedRemoteSpellingAliases.has(directoryId)) continue;
+      const remoteAlias = remoteSpellingAliasByLocal.get(directoryId);
       const manifests = [];
       try {
         if (localManifestPaths.has(directoryId)) {
@@ -6435,26 +6523,68 @@ export class SyncExecutor {
             directoryId,
           ));
         }
-        const remoteObservation = remoteObservationByDirectory.get(directoryId);
+        const remoteObservation = remoteObservationByDirectory.get(directoryId)
+          ?? (remoteAlias
+            ? remoteObservationByDirectory.get(remoteAlias)
+            : undefined);
         if (remoteObservation) {
           manifests.push(parseCommunityPluginBundleManifest(
             remoteObservation.manifestText,
             directoryId,
           ));
         }
-        if (manifests.length === 0) continue;
+        if (manifests.length === 0) {
+          this.recordCommunityPluginDirectorySpellingConflict(
+            input.configDir,
+            directoryId,
+            remoteAlias,
+          );
+          continue;
+        }
         assertCommunityPluginManifestIdentityStable(directoryId, manifests);
+        this.recordCommunityPluginDirectorySpellingConflict(
+          input.configDir,
+          directoryId,
+          remoteAlias,
+        );
         identities.push({ directoryId, manifestId: manifests[0].id });
       } catch (error) {
-        this.communityPluginIdentityBlockedErrors.set(
-          directoryId,
-          error instanceof Error ? error : new Error(String(error)),
-        );
+        const blockedDirectoryIds = remoteAlias
+          ? [directoryId, remoteAlias]
+          : [directoryId];
+        for (const blockedDirectoryId of blockedDirectoryIds) {
+          this.communityPluginIdentityBlockedErrors.set(
+            blockedDirectoryId,
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        }
       }
     }
-    for (const directoryId of findCommunityPluginManifestIdentityCollisions(
+    const identitiesByManifestId = new Map<string, string[]>();
+    for (const identity of identities) {
+      const directoryIds = identitiesByManifestId.get(identity.manifestId) ?? [];
+      directoryIds.push(identity.directoryId);
+      identitiesByManifestId.set(identity.manifestId, directoryIds);
+    }
+    const blockedDirectoryIds = findCommunityPluginManifestIdentityCollisions(
       identities,
-    )) {
+    );
+    for (const directoryIds of identitiesByManifestId.values()) {
+      if (directoryIds.length < 2) continue;
+      const localGroupIds = directoryIds.filter((directoryId) =>
+        localDirectoryIds.has(directoryId));
+      if (localGroupIds.length !== 1) continue;
+      const localDirectoryId = localGroupIds[0];
+      if (
+        !localManifestPaths.has(localDirectoryId)
+        || !localMainPaths.has(localDirectoryId)
+      ) continue;
+      // A same-id peer that exists only in the cloud cannot be loaded by this
+      // device, so it must not stall the one locally complete bundle. The peer
+      // keeps its block for join/download; two local bundles still block.
+      blockedDirectoryIds.delete(localDirectoryId);
+    }
+    for (const directoryId of blockedDirectoryIds) {
       this.communityPluginIdentityBlockedErrors.set(
         directoryId,
         new CommunityPluginIdentityBlockError(
@@ -6463,6 +6593,32 @@ export class SyncExecutor {
         ),
       );
     }
+  }
+
+  /**
+   * One local plugin directory can meet the same cloud folder under another
+   * case/NFC spelling. The folder planner defers that rename; record the pair
+   * so the deferred row names both spellings and the manual exit. This map is
+   * presentation evidence only — it never authorizes a path mutation.
+   */
+  private recordCommunityPluginDirectorySpellingConflict(
+    configDir: string,
+    localDirectory: string,
+    remoteDirectory: string | undefined,
+  ): void {
+    if (!remoteDirectory || remoteDirectory === localDirectory) return;
+    const root = `${configDir.replace(/\/+$/, "")}/plugins`;
+    const conflict = { localDirectory, remoteDirectory };
+    // The folder planner can anchor the deferred row on either spelling, so
+    // both paths must resolve to the same copy.
+    this.communityPluginDirectorySpellingConflicts.set(
+      `${root}/${localDirectory}`,
+      conflict,
+    );
+    this.communityPluginDirectorySpellingConflicts.set(
+      `${root}/${remoteDirectory}`,
+      conflict,
+    );
   }
 
   /**
@@ -6721,7 +6877,7 @@ export class SyncExecutor {
       this.diag?.warn(
         "state",
         "community plugin manifest observations were not persisted",
-        { error: error instanceof Error ? error.message : String(error) },
+        { error: describeError(error) },
       );
     }
   }
@@ -7172,9 +7328,7 @@ export class SyncExecutor {
       );
     }
     if (comparison !== null && comparison < 0) {
-      throw new Error(
-        `Selected plugin upload would downgrade remote bundle: ${pluginId}`,
-      );
+      throw new CommunityPluginBundleDowngradeError(pluginId);
     }
   }
 
@@ -7653,7 +7807,7 @@ export class SyncExecutor {
               : startedWithoutCommittedBase
                 ? "V2 cloud bootstrap read failed; falling back to public-1.1.3 legacy baseline"
                 : "V2 cloud bootstrap read failed; continuing with exact public-1.1.3 content verification",
-            error instanceof Error ? error.message : String(error),
+            describeError(error),
           );
         }
       }
@@ -7946,7 +8100,7 @@ export class SyncExecutor {
           this.diag?.error(
             "state",
             "active V2 shared protocol binding changed before adjacent migration committed",
-            error instanceof Error ? error.message : String(error),
+            describeError(error),
           );
           return { terminated: result };
         }
@@ -8756,7 +8910,7 @@ export class SyncExecutor {
         this.diag?.warn(
           "plan",
           "first-sync content evidence is unavailable; falling back to full verification",
-          error instanceof Error ? error.message : String(error),
+          describeError(error),
         );
       }
     }
@@ -11099,6 +11253,7 @@ export class SyncExecutor {
           localFolders: continuationScan.folders ?? [],
           localFolderScanComplete: true,
           skippedLarge: continuationScan.skippedLarge,
+          maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
           localMoveHints: this.state.localFolderMoveHints,
           localFolderDeleteHints: this.state.localFolderDeleteHints,
           localFileMoveHints: this.state.localFileMoveHints,
@@ -13272,6 +13427,7 @@ export class SyncExecutor {
     this.completeRemoteItems = null;
     this.isolatedMutationRecoveryPathCache = null;
     this.communityPluginIdentityBlockedErrors.clear();
+    this.communityPluginDirectorySpellingConflicts.clear();
     this.cancelController = new AbortController();
     const operationEpoch = this.lifecycle.capture();
     // 片⑥ 收口：本轮的生效策略。单向模式下"将云端删除同步到本机"强制恒开
@@ -13318,7 +13474,7 @@ export class SyncExecutor {
           "stale first-sync evidence cleanup will retry later",
           {
             operationKind: "first-sync-verification",
-            error: error instanceof Error ? error.message : String(error),
+            error: describeError(error),
             mutations: 0,
           },
         );
@@ -13476,7 +13632,7 @@ export class SyncExecutor {
         this.diag?.error(
           "execute",
           "local recovery failed — stopping before scan and remote preparation",
-          error instanceof Error ? error.message : String(error),
+          describeError(error),
         );
         return result;
       }
@@ -13914,7 +14070,7 @@ export class SyncExecutor {
             this.diag?.warn(
               "plan",
               "first-sync content evidence could not be persisted; continuing with verified bytes",
-              error instanceof Error ? error.message : String(error),
+              describeError(error),
             );
           }
         }
@@ -13932,7 +14088,7 @@ export class SyncExecutor {
             "committed V2 authority left disposable first-sync evidence for later pruning",
             {
               operationKind: "first-sync-verification",
-              error: error instanceof Error ? error.message : String(error),
+              error: describeError(error),
               mutations: 0,
             },
           );
@@ -13994,7 +14150,7 @@ export class SyncExecutor {
           this.diag?.warn(
             "plan",
             `batch content-verification downloadUrl refresh failed, falling back to per-file waterfall`,
-            error instanceof Error ? error.message : String(error),
+            describeError(error),
           );
         }
       };
@@ -14312,7 +14468,7 @@ export class SyncExecutor {
         this.diag?.error(
           "execute",
           "sync run failed unexpectedly",
-          e instanceof Error ? e.message : String(e),
+          describeError(e),
         );
       }
     } finally {
@@ -14427,6 +14583,8 @@ export class SyncExecutor {
   ): SyncIdleObservationInput {
     return {
       scope: this.activeSyncScope,
+      contentFactCommitSeq:
+        this.state.activeV2StorageAuthorityEvidence?.contentFactCommitSeq ?? null,
       stateCommitSeq:
         this.state.activeV2StorageAuthorityEvidence?.stateCommitSeq ?? null,
       pendingConflicts: this.state.pendingConflicts,
@@ -15109,7 +15267,7 @@ export class SyncExecutor {
           item.type === SyncActionType.RetryLater
           || item.type === SyncActionType.FolderDeferred
         ) {
-          const issue = buildPendingIssueFromPlanItem(item, (key) => this.t(key), Date.now());
+          const issue = this.buildPendingIssueForPlanItem(item);
           const reason = issue.reason ?? this.t("syncView.failure.local");
           pendingIssues.push(issue);
           callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize);
@@ -15262,9 +15420,7 @@ export class SyncExecutor {
             this.diag?.warn(
               "execute",
               `mutation could not abandon its precondition-failed intent — ${activeIntent.path}`,
-              abandonError instanceof Error
-                ? abandonError.message
-                : String(abandonError),
+              describeError(abandonError),
             );
             mutationRecovery = "unresolved";
           }
@@ -15387,7 +15543,7 @@ export class SyncExecutor {
           return;
         }
         const dbFingerprint = fingerprintIndexedDbError(e);
-        this.diag?.error("execute", `[${position}/${total}] ${item.type} ${item.path} FAILED: ${e instanceof Error ? e.message : String(e)}`, dbFingerprint ? { ...errorDiagData(e), ...dbFingerprint } : errorDiagData(e));
+        this.diag?.error("execute", `[${position}/${total}] ${item.type} ${item.path} FAILED: ${describeError(e)}`, dbFingerprint ? { ...errorDiagData(e), ...dbFingerprint } : errorDiagData(e));
         // Auth failure at any file stops the entire pool immediately —
         // no point letting other workers continue with a dead token.
         if (isAuthFailure(e)) {
@@ -15542,7 +15698,7 @@ export class SyncExecutor {
             `upload checkpoint batch attempt ${attempt + 1} failed`,
             {
               operations: operationIds.length,
-              error: error instanceof Error ? error.message : String(error),
+              error: describeError(error),
               mutations: 0,
             },
           );
@@ -15728,7 +15884,7 @@ export class SyncExecutor {
           this.diag?.warn(
             "execute",
             `batch downloadUrl refresh failed, falling back to per-file waterfall`,
-            error instanceof Error ? error.message : String(error),
+            describeError(error),
           );
         }
       }
@@ -15951,9 +16107,7 @@ export class SyncExecutor {
       );
       return "applied";
     } catch (checkpointError) {
-      const checkpointDetail = checkpointError instanceof Error
-        ? checkpointError.message
-        : String(checkpointError);
+      const checkpointDetail = describeError(checkpointError);
       const dbFingerprint = fingerprintIndexedDbError(checkpointError);
       this.diag?.warn(
         "execute",
@@ -16404,7 +16558,7 @@ export class SyncExecutor {
         this.diag?.warn(
           "execute",
           `remote folder create read-back failed (attempt ${attempt}/${REMOTE_FOLDER_READBACK_ATTEMPTS}) — ${path}`,
-          error instanceof Error ? error.message : String(error),
+          describeError(error),
         );
       }
       if (
@@ -17781,10 +17935,10 @@ export class SyncExecutor {
         // surface the whole bundle as a reviewable conflict so the user can
         // inspect the diff and explicitly confirm (mirror of the plan-level
         // downgrade guards). Anything else fails closed as before.
-        if (
-          this.failureReason(preflightError)
-            .includes("Selected plugin upload would downgrade remote bundle")
-        ) {
+        const downgradeError = preflightError instanceof MutationNotAppliedError
+          ? preflightError.original
+          : preflightError;
+        if (downgradeError instanceof CommunityPluginBundleDowngradeError) {
           // Idempotency: keep an existing downgrade-review row of this bundle
           // untouched so its decision token (and an already-open review
           // dialog) survives recovery retries. The recovery still stays
@@ -17856,7 +18010,7 @@ export class SyncExecutor {
           this.diag?.warn(
             "execute",
             `side mutation could not abandon its not-applied intent — ${intent.path}`,
-            recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+            describeError(recoveryError),
           );
         }
         throw error;
@@ -17892,7 +18046,7 @@ export class SyncExecutor {
       this.diag?.warn(
         "execute",
         `side mutation checkpoint retry failed — ${intent.path}`,
-        recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+        describeError(recoveryError),
       );
       return false;
     }
@@ -17946,7 +18100,7 @@ export class SyncExecutor {
       this.diag?.warn(
         "execute",
         `mutation same-action recovery failed — ${intent.path}`,
-        recoveryError instanceof Error ? recoveryError.message : String(recoveryError),
+        describeError(recoveryError),
       );
       return {
         outcome: "unresolved",
@@ -20300,7 +20454,15 @@ export class SyncExecutor {
       this.inspectRemotePath(intent.sourcePath),
       this.inspectRemotePath(intent.path),
     ]);
-    if (source || !target) return null;
+    // The same case-insensitive addressing that affects the execution
+    // read-back leaves the old spelling resolvable after a landed case-only
+    // rename. An alias of the moved object is not evidence that the source
+    // still exists; a different object there (a real second file, or a
+    // restored source) keeps the record blocked.
+    const sourceIsTargetAlias = source !== undefined
+      && target !== undefined
+      && source.driveId === target.driveId;
+    if ((source !== undefined && !sourceIsTargetAlias) || !target) return null;
     if (
       target.driveId !== intent.expectedRemote.driveId
       && (
@@ -21083,7 +21245,7 @@ export class SyncExecutor {
       this.diag?.warn(
         "execute",
         `automatic merge degraded to manual review — ${item.path}`,
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       return recordAutomaticMergeManual(automaticMetrics, "execution-failed");
     } finally {
@@ -21443,7 +21605,7 @@ export class SyncExecutor {
         this.diag?.warn(
           "state",
           "V2 cloud bootstrap rejected because the remote identity index is incomplete",
-          error instanceof Error ? error.message : String(error),
+          describeError(error),
         );
         return [];
       }
@@ -21531,7 +21693,7 @@ export class SyncExecutor {
         this.diag?.log(
           "state",
           `cloud bootstrap v2 read failed (attempt ${attempt + 1}), retrying in ${waitMs}ms`,
-          error instanceof Error ? error.message : String(error),
+          describeError(error),
         );
         await new Promise<void>((resolve) =>
           compatSetTimeout(() => resolve(), waitMs));
@@ -21555,7 +21717,7 @@ export class SyncExecutor {
           this.diag?.warn(
             "state",
             "legacy cloud baseline download failed after retries",
-            error instanceof Error ? error.message : String(error),
+            describeError(error),
           );
           return null;
         }
@@ -22038,7 +22200,7 @@ export class SyncExecutor {
       this.diag?.warn(
         "state",
         "V2 cloud bootstrap publication deferred",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -22134,7 +22296,7 @@ export class SyncExecutor {
       this.diag?.error(
         "state",
         "V2 corrupt-state forensic source could not be preserved",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       return result;
     }
@@ -22184,7 +22346,7 @@ export class SyncExecutor {
         "state",
         "V2 corrupt-state exact remote scope is not currently observable",
         {
-          cause: error instanceof Error ? error.message : String(error),
+          cause: describeError(error),
           mutations: 0,
         },
       );
@@ -22234,7 +22396,7 @@ export class SyncExecutor {
       this.diag?.error(
         "state",
         "V2 corrupt-state live remote identity snapshot is incomplete",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       return result;
     }
@@ -22296,7 +22458,7 @@ export class SyncExecutor {
           this.diag?.warn(
             "execute",
             `batch downloadUrl refresh failed for verification, falling back to per-file waterfall`,
-            error instanceof Error ? error.message : String(error),
+            describeError(error),
           );
         }
       }
@@ -22394,7 +22556,7 @@ export class SyncExecutor {
         "state",
         "V2 corrupt-state source or scope changed during evidence collection",
         {
-          cause: error instanceof Error ? error.message : String(error),
+          cause: describeError(error),
           mutations: 0,
         },
       );
@@ -22668,7 +22830,7 @@ export class SyncExecutor {
             this.diag?.error(
               "state",
               "V2 corrupt-state recovery authority publication failed closed",
-              error instanceof Error ? error.message : String(error),
+              describeError(error),
             );
           }
           return { terminated: result };
@@ -23158,7 +23320,7 @@ export class SyncExecutor {
       if (inspected?.status !== "missing") throw readError;
       this.diag?.warn(
         "execute",
-        `upload skipped — ${item.path} disappeared since scan (${readError instanceof Error ? readError.message : String(readError)})`,
+        `upload skipped — ${item.path} disappeared since scan (${describeError(readError)})`,
       );
       if (factsChangedPolicy === "throw") {
         throw new MutationNotAppliedError(
@@ -23570,7 +23732,7 @@ export class SyncExecutor {
         this.diag?.warn(
           "execute",
           `local-only copy not kept; the cloud version will not take ${item.path} over this round`,
-          copyError instanceof Error ? copyError.message : String(copyError),
+          describeError(copyError),
         );
         if (factsChangedPolicy === "throw") {
           throw new MutationNotAppliedError(
@@ -23655,7 +23817,7 @@ export class SyncExecutor {
           fileStat = stat ? { size: stat.size, mtime: stat.mtime } : null;
         }
       } catch (writeErr) {
-        this.diag?.warn("execute", `streamed download commit failed for ${item.path}, recovery attempted`, writeErr instanceof Error ? writeErr.message : String(writeErr));
+        this.diag?.warn("execute", `streamed download commit failed for ${item.path}, recovery attempted`, describeError(writeErr));
         if (writeErr instanceof LocalCommitPreconditionError) {
           if (factsChangedPolicy === "throw") {
             throw new MutationNotAppliedError(writeErr);
@@ -23704,7 +23866,7 @@ export class SyncExecutor {
           );
         } catch (writeErr) {
           await this.removePathIfExists(readyPath);
-          this.diag?.warn("execute", `download write failed for ${item.path}, recovery attempted`, writeErr instanceof Error ? writeErr.message : String(writeErr));
+          this.diag?.warn("execute", `download write failed for ${item.path}, recovery attempted`, describeError(writeErr));
           if (writeErr instanceof LocalCommitPreconditionError) {
             if (factsChangedPolicy === "throw") {
               throw new MutationNotAppliedError(writeErr);
@@ -23858,8 +24020,15 @@ export class SyncExecutor {
       this.inspectRemotePath(item.renameFrom),
       this.inspectRemotePath(item.path),
     ]);
+    // Graph resolves paths case-insensitively: after a case-only rename the
+    // pre-rename spelling still addresses the moved object, so path presence
+    // alone cannot prove the move failed. Only a source path that resolves to
+    // a *different* object keeps the read-back fail-closed.
+    const sourceIsTargetAlias = sourceAfter !== undefined
+      && targetAfter !== undefined
+      && sourceAfter.driveId === targetAfter.driveId;
     if (
-      sourceAfter
+      (sourceAfter !== undefined && !sourceIsTargetAlias)
       || !targetAfter
       || targetAfter.driveId !== item.remote.driveId
       || targetAfter.eTag !== movedRemote.eTag
@@ -24852,7 +25021,7 @@ export class SyncExecutor {
         "state",
         "remote scope recovery evidence persistence preflight failed",
         {
-          error: error instanceof Error ? error.message : String(error),
+          error: describeError(error),
           downloadedForRecovery: 0,
           mutations: 0,
         },
@@ -24960,7 +25129,7 @@ export class SyncExecutor {
       this.diag?.error(
         "state",
         "remote scope recovery evidence could not be read",
-        { error: error instanceof Error ? error.message : String(error), mutations: 0 },
+        { error: describeError(error), mutations: 0 },
       );
       return result;
     }
@@ -25016,7 +25185,7 @@ export class SyncExecutor {
           this.diag?.warn(
             "execute",
             `batch downloadUrl refresh failed for scope recovery, falling back to per-file waterfall`,
-            error instanceof Error ? error.message : String(error),
+            describeError(error),
           );
         }
       }
@@ -25258,7 +25427,7 @@ export class SyncExecutor {
       this.diag?.warn(
         "state",
         "committed remote scope recovery left disposable evidence for later pruning",
-        { error: error instanceof Error ? error.message : String(error), mutations: 0 },
+        { error: describeError(error), mutations: 0 },
       );
     }
     const sealed = sealCanonicalPlanV2({
@@ -25460,7 +25629,7 @@ export class SyncExecutor {
             path,
             verifiedThisRun: recoveryVerification.verifiedThisRun,
             reused: recoveryVerification.reused,
-            error: error instanceof Error ? error.message : String(error),
+            error: describeError(error),
             mutations: 0,
           },
         );
@@ -25499,7 +25668,7 @@ export class SyncExecutor {
             path,
             verifiedThisRun: verifiedCount,
             reused: reusableReceiptCount,
-            error: error instanceof Error ? error.message : String(error),
+            error: describeError(error),
             mutations: 0,
           },
         );
@@ -25742,7 +25911,7 @@ export class SyncExecutor {
       this.diag?.warn(
         "onedrive",
         "enumeration checkpoint read failed — continuing without it",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       return null;
     }
@@ -25765,7 +25934,7 @@ export class SyncExecutor {
       this.diag?.warn(
         "onedrive",
         "enumeration checkpoint save failed — continuing (progress loss is safe)",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -26113,7 +26282,7 @@ export class SyncExecutor {
           this.diag?.warn(
             "onedrive",
             "committed remote identities are no longer restorable; resolving the live V1 scope",
-            identityError instanceof Error ? identityError.message : String(identityError),
+            describeError(identityError),
           );
         }
       }
@@ -26455,7 +26624,7 @@ export class SyncExecutor {
           `recovery checkpoint rejected against the committed tree; rebuilding once — ${args.operationIds.join(", ")}`,
           {
             operations: args.operationIds.length,
-            error: error instanceof Error ? error.message : String(error),
+            error: describeError(error),
             mutations: 0,
           },
         );
@@ -26482,7 +26651,7 @@ export class SyncExecutor {
           `recovery checkpoint cannot be absorbed by the committed state; keeping one record blocked — ${args.operationIds.join(", ")}`,
           {
             operations: args.operationIds.length,
-            error: error instanceof Error ? error.message : String(error),
+            error: describeError(error),
             activeLedgerRecords: remaining,
             mutations: 0,
           },
@@ -27053,7 +27222,7 @@ export class SyncExecutor {
     } catch (err) {
       // Can't fetch remote manifest — allow the sync to proceed
       // (downgrade guard is best-effort; don't block normal sync)
-      this.diag?.log("execute", `M19 anti-downgrade — could not fetch remote manifest, allowing sync: ${err instanceof Error ? err.message : String(err)}`);
+      this.diag?.log("execute", `M19 anti-downgrade — could not fetch remote manifest, allowing sync: ${describeError(err)}`);
     }
 
     return 0;
@@ -27247,7 +27416,7 @@ export class SyncExecutor {
         this.diag?.warn(
           "execute",
           `community plugin downgrade-probe downloadUrl refresh failed, falling back to per-file waterfall`,
-          error instanceof Error ? error.message : String(error),
+          describeError(error),
         );
       }
     }
@@ -27317,7 +27486,7 @@ export class SyncExecutor {
           {
             schemaVersion: 1,
             pluginId,
-            error: error instanceof Error ? error.message : String(error),
+            error: describeError(error),
           },
         );
         continue;
@@ -27484,7 +27653,7 @@ export class SyncExecutor {
           {
             schemaVersion: 1,
             pluginId,
-            error: error instanceof Error ? error.message : String(error),
+            error: describeError(error),
           },
         );
         continue;
@@ -27554,7 +27723,7 @@ export class SyncExecutor {
     phase: SideActionPreparationPhase,
     error: unknown,
   ): void {
-    const reason = error instanceof Error ? error.message : String(error);
+    const reason = describeError(error);
     this.diag?.warn("execute", `side action preparation failed — phase=${phase}, path=${path}`, reason);
     if (isAuthFailure(error)) {
       this.invalidateLifecycle("auth-expired");
@@ -28797,7 +28966,7 @@ export class SyncExecutor {
         "execute",
         "batch remote-delete absence verification unavailable — per-item checks continue",
         {
-          reason: error instanceof Error ? error.message : String(error),
+          reason: describeError(error),
           count: paths.length,
           mutations: 0,
         },
@@ -29655,7 +29824,7 @@ function errorDiagData(error: unknown): Record<string, unknown> {
       graphCode: error.graphCode,
     };
   }
-  const message = error instanceof Error ? error.message : String(error);
+  const message = describeError(error);
   return { message };
 }
 

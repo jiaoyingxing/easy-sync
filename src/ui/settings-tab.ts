@@ -455,8 +455,9 @@ export class EasySyncSettingTab extends PluginSettingTab {
       t("settings.group.automatic"),
     );
 
-    // 片⑦（U4）：单向模式下「自动处理」行整体隐藏——它的两个开关在该模式下都
-    // 失效（删除跟随强制恒开、自动合并只发生在上传链内部）。只隐藏、不删除：
+    // 片⑦（U4）：单向模式下「自动处理」组整体隐藏（只隐藏、不删除；双向照常）。
+    // 隐藏不等于开关失效：单向的删除跟随由 canonical-plan-v2 的单向改写强制恒开
+    // （autoDeleteLocalFiles 等效恒真）；两项存值保留，恢复双向后照常生效。
     // 行定义与弹框入口原样保留，双向即恢复。`refreshSyncState()` 会重渲染本组，
     // 所以切换模式后立即生效；声明式镜像同步同改（`buildSettingDefinitions`）。
     if (this.plugin.syncDirection !== "one-way") {

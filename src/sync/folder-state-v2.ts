@@ -9,6 +9,7 @@ import {
   type CanonicalPlannerStateV2,
 } from "./canonical-planner-state-v2";
 import { planIdentityRenamesFromStateV2 } from "./identity-rename-v2";
+import { identityPath } from "./recovery-anchor-v2";
 import type {
   LocalFileEntry,
   LocalFolderEntry,
@@ -1552,7 +1553,7 @@ function localSubtreeDiffIsAnchoredIncomingMoves(
   return sameStringSet(expectedFolders, actualFolders);
 }
 
-function projectFolderIdentitiesForMove(
+export function projectFolderIdentitiesForMove(
   state: CanonicalPlannerStateV2,
   sourceRoot: string,
   targetRoot: string,
@@ -1850,10 +1851,6 @@ function isAtOrBelow(path: string, root: string): boolean {
 
 function pathDepth(path: string): number {
   return path.split("/").length;
-}
-
-function identityPath(path: string): string {
-  return nfcPath(path).toLocaleLowerCase("en-US");
 }
 
 function nfcPath(path: string): string {

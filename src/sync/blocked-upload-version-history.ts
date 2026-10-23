@@ -20,6 +20,7 @@ import type { DriveItemVersion } from "../onedrive/types";
 import {
   compatClearTimeout,
   compatSetTimeout,
+  describeError,
   type TimeoutHandle,
 } from "../obsidian-compat";
 import type { RemoteNodeV2 } from "./remote-index-v2";
@@ -226,7 +227,7 @@ export class BlockedUploadVersionHistoryProbe {
       this.deps.log("blocked upload version history unavailable", {
         operationId: intent.operationId,
         path: intent.path,
-        reason: error instanceof Error ? error.message : String(error),
+        reason: describeError(error),
         mutations: 0,
       });
     } finally {

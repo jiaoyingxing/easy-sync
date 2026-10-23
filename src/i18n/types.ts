@@ -572,6 +572,7 @@ export interface LocaleStrings {
   "reason.folder.type-conflict": string;
   "reason.folder.unanchored-shared-folder": string;
   "reason.folder.local-rename-evidence-conflict": string;
+  "reason.folder.pluginDirectorySpellingDiffers": string;
   "reason.folder.deferred": string;
   "reason.folder.local-source-changed": string;
   "reason.folder.parent-version-changed": string;
@@ -663,6 +664,8 @@ export interface LocaleStrings {
   "conflictDetail.binaryFile": string;
   "conflictDetail.diffRegionsLocated": string;
   "conflictDetail.textDiffByteLimit": string;
+  "conflictDetail.largeRemoteSkipped": string;
+  "conflictDetail.checkContentEquality": string;
   "conflictDetail.previewTruncated": string;
   "conflictDetail.identical": string;
   "conflictDetail.textSameBytesDifferent": string;

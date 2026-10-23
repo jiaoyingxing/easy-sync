@@ -12,6 +12,7 @@
 import type { DataAdapter } from "obsidian";
 import { sha256Hex } from "../crypto";
 import {
+  describeError,
   getEasySyncPaths,
   getEasySyncLegacyPaths,
   getConfigDir,
@@ -854,8 +855,44 @@ function protocolBindingForManifest(
   return structuredClone(hold.protocolBinding);
 }
 
+const CONTENT_FACT_VOLATILE_KEYS = new Set([
+  "commitSeq",
+  "committedAt",
+  "deltaLink",
+  "cursorRevision",
+  "updatedAt",
+  "consecutiveFailures",
+  "downloadUrl",
+]);
+
+/** Canonical content view of a V2 envelope: bookkeeping fields that advance
+ *  on every publication are excluded, so republishing identical content
+ *  (rotated delta cursor, rewritten commit meta) compares equal. */
+function contentFactsCanonicalJson(value: unknown): string {
+  const canonical = (entry: unknown): unknown => {
+    if (entry === null || typeof entry !== "object") {
+      return typeof entry === "number" && Number.isNaN(entry) ? "NaN" : entry;
+    }
+    if (Array.isArray(entry)) return entry.map(canonical);
+    const record = entry as Record<string, unknown>;
+    const next: Record<string, unknown> = {};
+    for (const key of Object.keys(record).sort()) {
+      if (CONTENT_FACT_VOLATILE_KEYS.has(key)) continue;
+      const canonicalEntry = canonical(record[key]);
+      if (canonicalEntry !== undefined) next[key] = canonicalEntry;
+    }
+    return next;
+  };
+  return JSON.stringify(canonical(value));
+}
+
 interface StateV2StorageAuthorityEvidenceBase {
+  /** Raw envelope publication sequence (bookkeeping). */
   stateCommitSeq: number;
+  /** Sequence of the last commit whose content facts changed; identical
+   *  republishing (rotated delta cursor, rewritten commit meta) does not
+   *  advance it. */
+  contentFactCommitSeq: number;
   lifecycleEpoch: number;
 }
 
@@ -875,6 +912,7 @@ export class StateManager {
   private remoteState: RemoteSyncState | null = null;
   private v2Envelope: SyncStateEnvelopeV2 | null = null;
   private v2PathView: StatePathViewV2 | null = null;
+  private lastContentFactCommitSeq: number | null = null;
   private v2Store: StateEnvelopeV2Store | null = null;
   private v2IndexedDbStore: StateV2IndexedDbActiveStore | null = null;
   private remoteScopeRecoveryEvidenceStore:
@@ -1722,7 +1760,7 @@ export class StateManager {
       this.plugin.diag?.warn(
         "state",
         "deletion ledger prune failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
     try {
@@ -1746,7 +1784,7 @@ export class StateManager {
       this.plugin.diag?.warn(
         "state",
         "local archive prune failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -1974,7 +2012,7 @@ export class StateManager {
       this.plugin.diag?.warn(
         "state",
         "mutation ledger backup write failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -2110,9 +2148,15 @@ export class StateManager {
     ).remoteStateFile;
   }
 
-  private activateV2Envelope(envelope: SyncStateEnvelopeV2): void {
+  private activateV2Envelope(
+    envelope: SyncStateEnvelopeV2,
+    contentFactChanged = true,
+  ): void {
     this.v2Envelope = envelope;
     this.v2PathView = null;
+    if (contentFactChanged || this.lastContentFactCommitSeq === null) {
+      this.lastContentFactCommitSeq = envelope.meta.commitSeq;
+    }
   }
 
   private getV2PathView(): StatePathViewV2 | null {
@@ -2283,7 +2327,7 @@ export class StateManager {
         "IndexedDB active store sits behind the witnessed recovery journal — rebuilding from the journal (auto-heal)",
         {
           databaseId: selected.databaseId,
-          form: error instanceof Error ? error.message : String(error),
+          form: describeError(error),
         },
       );
       await active.close().catch(() => undefined);
@@ -2696,8 +2740,11 @@ export class StateManager {
       }
       const candidate = buildNext(this.v2Envelope);
       if (candidate === this.v2Envelope) return;
+      const contentFactChanged =
+        contentFactsCanonicalJson(this.v2Envelope)
+        !== contentFactsCanonicalJson(candidate);
       await this.publishV2Candidate(this.v2Envelope, candidate);
-      this.activateV2Envelope(candidate);
+      this.activateV2Envelope(candidate, contentFactChanged);
       changed = true;
     });
     this.v2StateCommitQueue = task.catch(() => undefined);
@@ -3865,8 +3912,8 @@ export class StateManager {
   }
 
   /**
-   * 移除一条忽略（store 的移除 API）。本片不接任何反转界面——它供后续
-   * 用户拍板后的界面、以及关闭模式时的点名告知（片⑥）使用。
+   * 移除一条忽略（store 的移除 API）。逐条反悔界面未建（2026-10-23 用户
+   * 拍板暂不补）；现役消费方＝设置页整体清空与关闭模式时的点名告知（片⑥）。
    */
   async clearLocalOnlyIgnorePath(path: string): Promise<void> {
     await this.commitPluginData((current) => {
@@ -8698,6 +8745,8 @@ export class StateManager {
     if (!this.v2Envelope) return null;
     const common = {
       stateCommitSeq: this.v2Envelope.meta.commitSeq,
+      contentFactCommitSeq:
+        this.lastContentFactCommitSeq ?? this.v2Envelope.meta.commitSeq,
       lifecycleEpoch: this.v2Envelope.meta.lifecycleEpoch,
     };
     return this.v2IndexedDbStore

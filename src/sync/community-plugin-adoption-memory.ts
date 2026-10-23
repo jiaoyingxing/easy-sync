@@ -1,5 +1,6 @@
 import { normalizePluginIds } from "./community-plugin-sync-policy";
 import { compareText } from "./compare-text";
+import { isRecord } from "../obsidian-compat";
 
 /**
  * Device-local adoption memory for the sidebar new-plugin decision flow
@@ -159,8 +160,4 @@ function hasOnlyKeys(
 ): boolean {
   const allowedKeys = new Set(allowed);
   return Object.keys(value).every((key) => allowedKeys.has(key));
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }

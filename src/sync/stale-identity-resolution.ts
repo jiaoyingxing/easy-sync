@@ -4,6 +4,7 @@ import {
   type IdentityRenameActionV2,
 } from "./identity-rename-v2";
 import { projectRemoteIndexV2 } from "./remote-index-v2";
+import { identityPath } from "./recovery-anchor-v2";
 import {
   validateEnvelope,
   type FolderAnchorV2,
@@ -571,10 +572,6 @@ function isAtOrBelow(path: string, root: string): boolean {
 
 function samePath(left: string, right: string): boolean {
   return identityPath(left) === identityPath(right);
-}
-
-function identityPath(path: string): string {
-  return path.normalize("NFC").toLocaleLowerCase("en-US");
 }
 
 function sortRecord<T>(record: Record<string, T>): Record<string, T> {

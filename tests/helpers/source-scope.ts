@@ -3,9 +3,22 @@ import { resolve } from "node:path";
 
 const REPO_ROOT = resolve(__dirname, "..", "..");
 
+/**
+ * 按解析后的绝对路径缓存源码文本。
+ *
+ * 一次测试运行里源码是只读的，同一文件被几十个断言反复读取没有意义；
+ * 用绝对路径作键，让 `src/main.ts` 与 `./src/main.ts` 命中同一份。
+ */
+const SOURCE_TEXT_CACHE = new Map<string, string>();
+
 /** 读仓库内文本（按仓库根相对路径书写，测试里不出现绝对路径）。 */
 export function readSourceFile(relativePath: string): string {
-  return readFileSync(resolve(REPO_ROOT, relativePath), "utf8");
+  const absolutePath = resolve(REPO_ROOT, relativePath);
+  const cached = SOURCE_TEXT_CACHE.get(absolutePath);
+  if (cached !== undefined) return cached;
+  const source = readFileSync(absolutePath, "utf8");
+  SOURCE_TEXT_CACHE.set(absolutePath, source);
+  return source;
 }
 
 /**

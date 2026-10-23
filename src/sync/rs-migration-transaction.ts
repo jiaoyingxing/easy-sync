@@ -27,6 +27,7 @@
 import type { OneDriveClient } from "../onedrive/client";
 import type { DriveItem } from "../onedrive/types";
 import { OneDriveError, OneDriveErrorType } from "../onedrive/types";
+import { describeError } from "../obsidian-compat";
 import type {
   BaseFileEntry,
   LocalFileEntry,
@@ -398,5 +399,5 @@ function errorMessage(error: unknown): string {
   if (error instanceof OneDriveError) {
     return `${error.type}${error.graphCode ? `:${error.graphCode}` : ""}`;
   }
-  return error instanceof Error ? error.message : String(error);
+  return describeError(error);
 }

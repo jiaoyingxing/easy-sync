@@ -9,6 +9,7 @@ import {
   type FolderAnchorV2,
   type SyncStateEnvelopeV2,
 } from "./state-envelope-v2";
+import { identityPath } from "./recovery-anchor-v2";
 import {
   sameSyncScope,
   type FolderMutationIntentV2,
@@ -1077,10 +1078,6 @@ function parentPath(path: string): string {
 function isAtOrBelow(path: string, root: string): boolean {
   return path.normalize("NFC") === root.normalize("NFC")
     || isAnchoredDescendantV2(path, root);
-}
-
-function identityPath(path: string): string {
-  return path.normalize("NFC").toLocaleLowerCase("en-US");
 }
 
 function nfcPath(path: string): string {

@@ -1,4 +1,5 @@
 import { Platform, TFile, type DataAdapter } from "obsidian";
+import { describeError } from "../obsidian-compat";
 import { toStrictUtf8Bytes } from "./ancestor-store-v2";
 
 export const EASY_SYNC_RECOVERY_SUFFIX = ".easy-sync-recovery";
@@ -243,10 +244,6 @@ function startsWithBytes(candidate: ArrayBuffer, prefix: ArrayBuffer): boolean {
     if (left[index] !== right[index]) return false;
   }
   return true;
-}
-
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function isStrictPrefixOf(candidate: ArrayBuffer, content: ArrayBuffer): boolean {

@@ -27,18 +27,18 @@ describe("MutationRecoveryScheduler", () => {
     expect(scheduler.requestObservation()).toBe(false);
     await vi.advanceTimersByTimeAsync(0);
     expect(observe).toHaveBeenCalledOnce();
-    expect(scheduler.observationCount).toBe(1);
+    expect(scheduler.snapshot.automaticObservations).toBe(1);
 
     await vi.advanceTimersByTimeAsync(MUTATION_RECOVERY_BACKOFF_MS[0] - 1);
     expect(observe).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(1);
     expect(observe).toHaveBeenCalledTimes(2);
-    expect(scheduler.observationCount).toBe(2);
+    expect(scheduler.snapshot.automaticObservations).toBe(2);
 
     await vi.advanceTimersByTimeAsync(MUTATION_RECOVERY_BACKOFF_MS[1]);
     expect(observe).toHaveBeenCalledTimes(3);
     expect(scheduler.pending).toBe(false);
-    expect(scheduler.observationCount).toBe(0);
+    expect(scheduler.snapshot.automaticObservations).toBe(0);
     expect(exhausted).not.toHaveBeenCalled();
   });
 
@@ -107,12 +107,12 @@ describe("MutationRecoveryScheduler", () => {
 
     scheduler.requestObservation();
     await vi.advanceTimersByTimeAsync(0);
-    expect(scheduler.observationCount).toBe(0);
+    expect(scheduler.snapshot.automaticObservations).toBe(0);
     await vi.advanceTimersByTimeAsync(4_999);
     expect(observe).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(1);
     expect(observe).toHaveBeenCalledTimes(2);
-    expect(scheduler.observationCount).toBe(0);
+    expect(scheduler.snapshot.automaticObservations).toBe(0);
   });
 
   it("cancels an in-flight observation without letting its late result re-arm", async () => {
@@ -139,7 +139,7 @@ describe("MutationRecoveryScheduler", () => {
     await Promise.resolve();
 
     expect(scheduler.pending).toBe(false);
-    expect(scheduler.observationCount).toBe(0);
+    expect(scheduler.snapshot.automaticObservations).toBe(0);
     await vi.runAllTimersAsync();
     expect(observe).toHaveBeenCalledOnce();
   });

@@ -1,4 +1,5 @@
 import { compareText } from "./compare-text";
+import { isRecord } from "../obsidian-compat";
 import {
   isPluginSelected,
   normalizePluginIds,
@@ -48,7 +49,6 @@ export type DeviceCommunityPluginParticipationCommand =
     }
   | { type: "request-exit"; pluginId: string; operationId?: string }
   | { type: "confirm-excluded"; pluginId: string }
-  | { type: "mark-never-participated"; pluginId: string }
   | {
       type: "block";
       pluginId: string;
@@ -227,9 +227,6 @@ function resolveDeviceCommunityPluginParticipationEntry(args: {
     }
     case "confirm-excluded":
       entry = { pluginId, phase: "excluded" };
-      break;
-    case "mark-never-participated":
-      entry = { pluginId, phase: "never-participated" };
       break;
     case "block": {
       if (!command.reason.trim()) {
@@ -449,9 +446,6 @@ function hasOnlyKeys(
   return Object.keys(value).every((key) => allowedKeys.has(key));
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
 
 function sameJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);

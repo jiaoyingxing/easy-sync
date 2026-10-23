@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { readBakedBuildVersion } from "../src/build-version";
@@ -42,5 +42,36 @@ describe("build version evidence", () => {
     );
     expect(wrapper).toContain("__EASY_SYNC_BUILD_VERSION__");
     expect(wrapper).toContain('JSON.stringify(version)');
+  });
+
+  it("keeps bundle, minify and compatibility steps in dependency order", () => {
+    // The compat check inspects the minified artifacts and minify consumes the
+    // bundle, so a reordered chain would verify (or ship) the wrong file.
+    const root = path.resolve(__dirname, "..");
+    const pkg = JSON.parse(
+      readFileSync(path.join(root, "package.json"), "utf8"),
+    ) as { main?: string; scripts: Record<string, string> };
+    const build = pkg.scripts.build;
+
+    const bundleAt = build.indexOf("node scripts/build-bundle.mjs");
+    const minifyAt = build.indexOf("node scripts/minify-release-artifacts.mjs");
+    const compatAt = build.indexOf("node scripts/check-bundle-compat.cjs");
+
+    expect(bundleAt).toBeGreaterThanOrEqual(0);
+    expect(minifyAt).toBeGreaterThanOrEqual(0);
+    expect(compatAt).toBeGreaterThanOrEqual(0);
+    expect(bundleAt).toBeLessThan(minifyAt);
+    expect(minifyAt).toBeLessThan(compatAt);
+
+    // Obsidian loads the manifest's main field; the bundle writes main.js.
+    expect(pkg.main).toBe("main.js");
+
+    for (const script of [
+      "scripts/build-bundle.mjs",
+      "scripts/minify-release-artifacts.mjs",
+      "scripts/check-bundle-compat.cjs",
+    ]) {
+      expect(existsSync(path.join(root, script))).toBe(true);
+    }
   });
 });

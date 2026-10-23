@@ -276,6 +276,40 @@ describe("conservative reset ordinary-file recovery contract", () => {
     expect(isOrdinaryFileRecoveryRecord(staleReceipt, scope)).toBe(false);
   });
 
+  it("admits only file-name spelling aliases for case-only renameRemote records", () => {
+    // 2026-10-22 field shape: the user changes a file's letter case locally,
+    // detectRenames emits renameRemote, and the two paths normalize-equal.
+    // The shape is a real rename (same byte-identical parent) and must be
+    // receiptable so execution and recovery keep the ordinary record
+    // contract; exact self-moves, parent spelling changes and moveLocal
+    // remain rejected.
+    expect(isOrdinaryFileRecoveryRecord(
+      record("renameRemote", { path: "MJW.md", sourcePath: "mjw.md" }),
+      scope,
+    )).toBe(true);
+    expect(isOrdinaryFileRecoveryRecord(
+      record("renameRemote", {
+        path: "sub/MJW.md",
+        sourcePath: "sub/mjw.md",
+        receipt: true,
+      }),
+      scope,
+    )).toBe(true);
+
+    expect(isOrdinaryFileRecoveryRecord(
+      record("renameRemote", { path: "mjw.md", sourcePath: "mjw.md" }),
+      scope,
+    )).toBe(false);
+    expect(isOrdinaryFileRecoveryRecord(
+      record("renameRemote", { path: "Dir/MJW.md", sourcePath: "dir/mjw.md" }),
+      scope,
+    )).toBe(false);
+    expect(isOrdinaryFileRecoveryRecord(
+      record("moveLocal", { path: "MJW.md", sourcePath: "mjw.md" }),
+      scope,
+    )).toBe(false);
+  });
+
   it("rejects parser-readable but non-canonical intent and receipt shapes", () => {
     const wrongUpload = record("upload");
     wrongUpload.intent.expectedLocal = { exists: false };

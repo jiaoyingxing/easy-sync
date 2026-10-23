@@ -1,3 +1,4 @@
+import { describeError } from "../obsidian-compat";
 import type { RemoteFileEntry } from "./types";
 
 /**
@@ -266,7 +267,7 @@ export async function executeCommunityPluginCloudCleanupV1(input: Readonly<{
         status: "failed",
         deleted,
         path: object.path,
-        error: error instanceof Error ? error.message : String(error),
+        error: describeError(error),
       };
     }
     if (current === null) continue;
@@ -299,7 +300,7 @@ export async function executeCommunityPluginCloudCleanupV1(input: Readonly<{
         deleted,
         path: object.path,
         reason: "delete-failed",
-        error: error instanceof Error ? error.message : String(error),
+        error: describeError(error),
       };
     }
     let verify: CommunityPluginCloudCleanupPathMetadataV1 | null = null;

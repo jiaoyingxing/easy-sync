@@ -348,6 +348,18 @@ describe("EasySyncNoticeCenter", () => {
     expect(center.activeKey).toBeNull();
   });
 
+  it("refuses new notices after dispose", () => {
+    center.dispose();
+
+    expect(center.show({
+      key: "after-dispose",
+      message: "late",
+      priority: NOTICE_PRIORITY.info,
+    })).toBe(false);
+    expect(created).toHaveLength(0);
+    expect(center.activeKey).toBeNull();
+  });
+
   it("accepts the initial level through the constructor", () => {
     const strictCenter = new EasySyncNoticeCenter((message) => {
       const notice = new FakeNotice(message);

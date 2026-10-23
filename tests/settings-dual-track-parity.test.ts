@@ -78,6 +78,31 @@ function inlineParamNames(
   return names;
 }
 
+/** 调用实参里第一个顶层逗号（跳过嵌套括号、括号内逗号与字符串内容）。 */
+function firstTopLevelComma(source: string, fromIndex: number): number {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = fromIndex; i < source.length; i++) {
+    const ch = source[i];
+    if (quote) {
+      if (ch === "\\") i++;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+    } else if (ch === "(" || ch === "{" || ch === "[") {
+      depth++;
+    } else if (ch === ")" || ch === "}" || ch === "]") {
+      if (depth === 0) return -1;
+      depth--;
+    } else if (ch === "," && depth === 0) {
+      return i;
+    }
+  }
+  return -1;
+}
+
 describe("settings dual-track parity gate", () => {
   it("R1: passes exactly the placeholders each template requires", () => {
     const zh = placeholdersByKey("src/i18n/zh-cn.ts");
@@ -116,8 +141,47 @@ describe("settings dual-track parity gate", () => {
       }
     }
 
+    // 包装入口：`confirmExperimentalPluginData("<key>", { ... })` 的键与
+    // 插值形参不在同一条 `t(...)` 上，按调用表达式单独对账。包装器内部的
+    // `t(messageKey, params)` 是变量实参，由上面的 `names === null` 分支跳过；
+    // 这里只收字面键，包装器定义本身（`messageKey`）没有字面键，也不会入账。
+    let wrapperChecked = 0;
+    for (const file of SETTINGS_FILES) {
+      const source = read(file);
+      for (const m of source.matchAll(/confirmExperimentalPluginData\(\s*/g)) {
+        const argStart = (m.index ?? 0) + m[0].length;
+        const comma = firstTopLevelComma(source, argStart);
+        if (comma === -1) continue;
+        const keys = [
+          ...source.slice(argStart, comma).matchAll(/"([A-Za-z0-9._-]+)"/g),
+        ].map((k) => k[1]);
+        if (keys.length === 0) continue; // 包装器定义／无字面键的分支
+        const names = inlineParamNames(source, comma);
+        wrapperChecked++;
+        for (const key of keys) {
+          const tpl = expected.get(key);
+          if (!tpl) {
+            problems.push(`${file}: ${key} 不在任何 locale 中（包装入口）`);
+            continue;
+          }
+          if (names === null) continue;
+          const missing = [...tpl].filter((p) => !names.has(p));
+          const unused = [...names].filter((p) => !tpl.has(p));
+          if (missing.length || unused.length) {
+            problems.push(
+              `${file}: ${key} 模板需要 {${[...tpl].join("},{")}}`
+                + `，实参${missing.length ? ` 缺 {${missing.join("},{")}}` : ""}`
+                + `${unused.length ? ` 多 {${unused.join("},{")}}` : ""}（包装入口）`,
+            );
+          }
+        }
+      }
+    }
+
     // 门自检：解析必须真的走到调用点，不能因为正则失效而空转（当前 ≈ 24 处）
     expect(checked).toBeGreaterThanOrEqual(15);
+    // 包装入口自检：当前 2 处调用表达式（含 3 个字面键）
+    expect(wrapperChecked).toBeGreaterThanOrEqual(2);
     expect(problems).toEqual([]);
   });
 
@@ -143,6 +207,10 @@ describe("settings dual-track parity gate", () => {
           "src/ui/settings-page-rows.ts",
           "src/ui/sync-exclusion-modal.ts",
         ],
+      },
+      {
+        hook: "easy-sync-notification-popups-hint",
+        files: ["src/ui/settings-tab.ts", "src/ui/settings-page-rows.ts"],
       },
     ];
 

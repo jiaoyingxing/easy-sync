@@ -14,10 +14,10 @@ import {
   buildStateV2MigrationCandidate,
   commitReviewedStateV2MigrationCandidate,
   isStateV2Manifest,
-  migrateV1ToV2,
   readStateV2Manifest,
   type StateV2MigrationInput,
   type StateV2MigrationPaths,
+  type StateV2MigrationResult,
 } from "../src/sync/state-v2-migration";
 import {
   STATE_V1_MIGRATION_CASES,
@@ -100,6 +100,49 @@ function toInput(fixture: MigrationFixture): StateV2MigrationInput {
   };
 }
 
+/**
+ * Drive the exact production sequence used by the sync executor and state
+ * manager: build the read-only candidate, then commit it as the reviewed
+ * sealed-plan candidate. Callers that expect publication must also mark the
+ * folder scan complete, because the reviewed commit gate requires the
+ * folder-anchor section of a complete scan.
+ */
+async function runReviewedMigration(
+  adapter: DataAdapter,
+  migrationPaths: StateV2MigrationPaths,
+  input: StateV2MigrationInput,
+): Promise<StateV2MigrationResult> {
+  const { v1Snapshot, ...candidateInput } = input;
+  const prepared = buildStateV2MigrationCandidate({
+    ...candidateInput,
+    // Keep the removed wrapper's strict gate: an untyped caller must never
+    // turn changed live facts into a publishable candidate.
+    allowChangedAnchors: false,
+  });
+  if (prepared.status !== "ready" || !prepared.envelope) {
+    return {
+      status: "aborted",
+      reason: prepared.reason,
+      pending: prepared.pending,
+      mutations: [],
+      envelope: null,
+      manifest: null,
+      v1BackupRetained: true,
+    };
+  }
+  return commitReviewedStateV2MigrationCandidate(adapter, migrationPaths, {
+    candidate: prepared.envelope,
+    canonicalIdentity: {
+      version: 2,
+      scope: prepared.envelope.scope,
+      sourceCommitSeq: prepared.envelope.meta.commitSeq,
+      digest: "test-reviewed-zero-plan",
+    },
+    v1Snapshot,
+    now: input.now,
+  });
+}
+
 describe("production V1 to V2 migration", () => {
   it("uses one strict manifest validator for every V2 control record", () => {
     const manifest = {
@@ -133,7 +176,9 @@ describe("production V1 to V2 migration", () => {
     "runs %s through real V2 serialization with no user-file mutation",
     async (id, fixture) => {
       const { adapter, files } = makeAdapter();
-      const result = await migrateV1ToV2(adapter, paths, toInput(fixture));
+      const input = toInput(fixture);
+      input.folderScanComplete = true;
+      const result = await runReviewedMigration(adapter, paths, input);
 
       expect(result.mutations).toEqual([]);
       if (id === "missing-drive-id") {
@@ -155,7 +200,7 @@ describe("production V1 to V2 migration", () => {
     const input = toInput(migrationCase("normal-v1"));
     input.localScanComplete = false;
 
-    await expect(migrateV1ToV2(adapter, paths, input)).resolves.toMatchObject({
+    await expect(runReviewedMigration(adapter, paths, input)).resolves.toMatchObject({
       status: "aborted",
       reason: "scan-incomplete",
       mutations: [],
@@ -169,7 +214,7 @@ describe("production V1 to V2 migration", () => {
     input.folderScanComplete = true;
     input.localFolders = [{ path: "notes" }, { path: "local-only" }];
 
-    const result = await migrateV1ToV2(adapter, paths, input);
+    const result = await runReviewedMigration(adapter, paths, input);
 
     expect(result.status).toBe("committed");
     expect(Object.values(result.envelope?.folderAnchors?.byAnchorId ?? {}))
@@ -184,13 +229,14 @@ describe("production V1 to V2 migration", () => {
   it("keeps the V1 backup and committed envelope when manifest publication fails, then resumes", async () => {
     const { adapter, files, spies } = makeAdapter();
     const input = toInput(migrationCase("normal-v1"));
+    input.folderScanComplete = true;
     const originalRename = spies.rename.getMockImplementation()!;
     spies.rename.mockImplementation(async (from: string, to: string) => {
       if (from === paths.manifestNext) throw new Error("manifest rename failed");
       return originalRename(from, to);
     });
 
-    await expect(migrateV1ToV2(adapter, paths, input)).resolves.toMatchObject({
+    await expect(runReviewedMigration(adapter, paths, input)).resolves.toMatchObject({
       status: "aborted",
       reason: "state-save-failure",
       mutations: [],
@@ -205,7 +251,7 @@ describe("production V1 to V2 migration", () => {
     spies.rename.mockImplementation(originalRename);
     input.now = 5678;
     // manifest 已在位＝本轮恢复语义直接已提交态（激活完成），不再是重发布。
-    await expect(migrateV1ToV2(adapter, paths, input)).resolves.toMatchObject({ status: "already-committed" });
+    await expect(runReviewedMigration(adapter, paths, input)).resolves.toMatchObject({ status: "already-committed" });
     expect(files.has(paths.manifest)).toBe(true);
   });
 
@@ -214,7 +260,7 @@ describe("production V1 to V2 migration", () => {
     const input = toInput(migrationCase("same-hash-multiple-paths"));
     input.requireCompleteAnchors = true;
 
-    await expect(migrateV1ToV2(adapter, paths, input)).resolves.toMatchObject({
+    await expect(runReviewedMigration(adapter, paths, input)).resolves.toMatchObject({
       status: "aborted",
       reason: "anchor-incomplete",
       pending: [{
@@ -354,8 +400,9 @@ describe("production V1 to V2 migration", () => {
     input.localEntries = [];
     input.preservedBasePaths = ["notes/a.md"];
     input.requireCompleteAnchors = true;
+    input.folderScanComplete = true;
 
-    const result = await migrateV1ToV2(adapter, paths, input);
+    const result = await runReviewedMigration(adapter, paths, input);
 
     expect(result.status).toBe("committed");
     expect(result.pending).toEqual([]);
@@ -866,18 +913,20 @@ describe("production V1 to V2 migration", () => {
   it("does not activate a stale pre-manifest envelope after V1 facts changed", async () => {
     const { adapter, files, spies } = makeAdapter();
     const initial = toInput(migrationCase("normal-v1"));
+    initial.folderScanComplete = true;
     const originalRename = spies.rename.getMockImplementation()!;
     spies.rename.mockImplementation(async (from: string, to: string) => {
       if (from === paths.manifestNext) throw new Error("manifest rename failed");
       return originalRename(from, to);
     });
-    await expect(migrateV1ToV2(adapter, paths, initial)).resolves.toMatchObject({
+    await expect(runReviewedMigration(adapter, paths, initial)).resolves.toMatchObject({
       status: "aborted",
       reason: "state-save-failure",
     });
     spies.rename.mockImplementation(originalRename);
 
     const changed = toInput(migrationCase("normal-v1"));
+    changed.folderScanComplete = true;
     changed.localEntries = [{
       ...changed.localEntries[0]!,
       hash: "cc".repeat(32),
@@ -888,11 +937,12 @@ describe("production V1 to V2 migration", () => {
     (changed as StateV2MigrationInput & {
       allowChangedAnchors: boolean;
     }).allowChangedAnchors = true;
-    await expect(migrateV1ToV2(adapter, paths, changed)).resolves.toMatchObject({
-      status: "aborted",
-      reason: "committed-envelope-mismatch",
-      mutations: [],
-    });
+    // The reviewed commit path is stricter than the removed wrapper: a
+    // mismatched committed authority throws (fail-closed) instead of
+    // returning a status object, so the stale candidate still never activates.
+    await expect(runReviewedMigration(adapter, paths, changed)).rejects.toThrow(
+      "Committed V2 authority does not match the reviewed migration candidate",
+    );
     // 第一轮写通道已把 manifest 落位；本轮对 stale 候选保守失败、绝不激活。
     expect(files.has(paths.manifest)).toBe(true);
     expect(files.has(paths.v1Backup)).toBe(true);
@@ -911,10 +961,12 @@ describe("production V1 to V2 migration", () => {
       manifestNext: actualPaths.stateV2ManifestNextFile,
       v1Backup: actualPaths.stateV1BackupFile,
     };
-    const migrated = await migrateV1ToV2(
+    const input = toInput(migrationCase("normal-v1"));
+    input.folderScanComplete = true;
+    const migrated = await runReviewedMigration(
       adapter,
       actualMigrationPaths,
-      toInput(migrationCase("normal-v1")),
+      input,
     );
     expect(migrated.status).toBe("committed");
     const plugin: PluginDataStore = {

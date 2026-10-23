@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { DriveItem } from "../src/onedrive/types";
-import { planFolderStateV2 } from "../src/sync/folder-state-v2";
+import {
+  planFolderStateV2,
+  projectFolderIdentitiesForMove as projectFolderStateIdentitiesForMove,
+} from "../src/sync/folder-state-v2";
 import {
   acceptReviewedFolderSubtreeRestoreV2,
   buildEmptyFolderResolutionSnapshotV1,
@@ -10,9 +13,11 @@ import {
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
 import { buildSharedFolderIdentityResolutionSnapshotV1 } from "../src/sync/shared-folder-identity-resolution";
 import {
+  projectFolderIdentitiesForMove as projectCanonicalIdentitiesForMove,
   shouldPauseCanonicalPlanForReviewV2,
   summarizeCanonicalPlanReviewV2,
 } from "../src/sync/canonical-plan-v2";
+import { canonicalPlannerStateFromEnvelopeV2 } from "../src/sync/canonical-planner-state-v2";
 import type {
   FolderAnchorV2,
   SyncAnchorV2,
@@ -1855,5 +1860,38 @@ describe("shared folder identity review outcome", () => {
     });
 
     expect(outcome).toEqual({ status: "unavailable" });
+  });
+});
+
+describe("V2 move-identity path-copy semantics (D6)", () => {
+  it("pins the intentional case-fold divergence between canonical and folder-state projections", () => {
+    // canonical-plan-v2 compares with normalizeRemotePathKey (NFC + en-US case
+    // fold) to mirror OneDrive's case-insensitive namespace, while
+    // folder-state-v2 compares with nfcPath (NFC only). On a case-variant
+    // anchor the two projections therefore disagree: the canonical projection
+    // takes "folder/sub" under "Folder" and rewrites it to "targetRoot/sub",
+    // while the folder-state projection filters it out. This is pinned as the
+    // current intentional semantics; changing it needs a separate product /
+    // guard decision, not a drive-by fix.
+    const state = canonicalPlannerStateFromEnvelopeV2(envelope({
+      folders: [
+        { id: "root-folder", name: "Folder" },
+        { id: "sub", name: "sub", parentId: "root-folder" },
+      ],
+      folderAnchors: [
+        folderAnchor("root-folder", "Folder"),
+        folderAnchor("sub", "folder/sub", "root-folder"),
+      ],
+    }));
+
+    expect(projectCanonicalIdentitiesForMove(state, "Folder", "targetRoot"))
+      .toEqual([
+        { path: "targetRoot", remoteId: "root-folder" },
+        { path: "targetRoot/sub", remoteId: "sub" },
+      ]);
+    expect(projectFolderStateIdentitiesForMove(state, "Folder", "targetRoot"))
+      .toEqual([
+        { path: "targetRoot", remoteId: "root-folder" },
+      ]);
   });
 });

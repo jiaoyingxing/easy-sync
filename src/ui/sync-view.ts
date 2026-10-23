@@ -11,6 +11,7 @@ import {
 import {
   compatCancelAnimationFrame,
   compatRequestAnimationFrame,
+  describeError,
   getConfigDir,
   type AnimationFrameHandle,
 } from "../obsidian-compat";
@@ -1558,8 +1559,18 @@ export class EasySyncSyncView extends ItemView {
       );
     } else if (bodyMode === "progress") {
       this.renderProgressPanel(content, progress);
+      this.renderRemoteScopeRecoveryFailure(
+        content,
+        progress.recoveryVerification,
+      );
     } else if (bodyMode === "pending") {
-      if (sideActionResultsVisible) this.renderProgressPanel(content, progress);
+      if (sideActionResultsVisible) {
+        this.renderProgressPanel(content, progress);
+        this.renderRemoteScopeRecoveryFailure(
+          content,
+          progress.recoveryVerification,
+        );
+      }
       this.renderPendingSection(
         content,
         pendingIssueGroups,
@@ -2412,7 +2423,7 @@ export class EasySyncSyncView extends ItemView {
     void this.plugin.rebuildPlanReview()
       .catch((error: unknown) => {
         this.plugin.diag.warn("plan", "plan review detail recovery failed", {
-          reason: error instanceof Error ? error.message : String(error),
+          reason: describeError(error),
         });
       })
       .finally(() => {
@@ -2653,11 +2664,12 @@ export class EasySyncSyncView extends ItemView {
     container: HTMLElement,
     state: Readonly<SyncProgressState>,
   ): void {
-    if (
-      state.total <= 0
-      && state.completedFiles.length === 0
-      && !state.recoveryVerification
-    ) return;
+    // The recovery-failure section is mounted by render() directly under the
+    // view content. Keeping it inside this panel stacked two `border-top`
+    // rules with only the panel padding between them (visible as a double
+    // divider above the section), so this panel now owns progress content
+    // only and is skipped entirely when there is none.
+    if (state.total <= 0 && state.completedFiles.length === 0) return;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const panel = container.createDiv("easy-sync-progress-panel");
     this.progressPanelEl = panel;
@@ -2676,7 +2688,6 @@ export class EasySyncSyncView extends ItemView {
       );
       this.renderFileResults(panel, state.completedFiles, true);
     }
-    this.renderRemoteScopeRecoveryFailure(panel, state.recoveryVerification);
   }
 
   private renderRemoteScopeRecoveryFailure(
@@ -3032,7 +3043,8 @@ export class EasySyncSyncView extends ItemView {
       },
     );
     // 片⑤：留在本机、不再提醒。点击即写入忽略记忆并刷新（行消失即反馈，
-    // 不加 Notice）；本片不建反转界面，移除 API 留给后续拍板后的界面。
+    // 不加 Notice）。逐条反悔入口未建：设置页整体清空是现役唯一出口
+    // （`tests/sync-view.test.ts` 钉住侧栏不得引用移除 API）。
     this.createActionChip(
       actions,
       t("syncView.localOnly.keep"),

@@ -144,7 +144,7 @@ describe("i18n placeholder parity", () => {
     expect(en["status.occupied"]).toBe("Another operation in progress");
     expect(en["status.occupiedLogout"]).toBe("Logging out");
     expect(en["result.lockBusyWithHolder"]).toBe(
-      "\"{holder}\" is in progress. Please wait.",
+      "“{holder}” is in progress. Please wait.",
     );
     expect(en["opHolder.logout"]).toBe("Log out");
     expect(en["opHolder.other"]).toBe("Another operation");

@@ -16,6 +16,7 @@ import {
   compatClearTimeout,
   compatSetInterval,
   compatSetTimeout,
+  describeError,
   IntervalHandle,
   TimeoutHandle,
 } from "../obsidian-compat";
@@ -1061,7 +1062,7 @@ export class AuthModule {
         await this.logout();
         throw e;
       }
-      this.diag?.warn("auth", `token refresh failed transiently, staying logged in: ${e instanceof Error ? e.message : String(e)}`);
+      this.diag?.warn("auth", `token refresh failed transiently, staying logged in: ${describeError(e)}`);
       this.recordRefreshFailure();
       throw e;
     }

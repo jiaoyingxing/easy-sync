@@ -77,9 +77,12 @@ export interface SyncIdleObservationInput {
     vaultFolderId: string;
     filesRootId: string;
   } | null;
-  /** Shared baseline revision — the V2 state commit sequence when the V2
-   *  authority is active, null on legacy/absent authority. */
-  stateCommitSeq: number | null;
+  /** Content-fact commit sequence — the shared baseline used by the
+   *  fingerprint; identical republishing does not advance it. Null on
+   *  legacy/absent authority. */
+  contentFactCommitSeq: number | null;
+  /** Raw envelope publication sequence; diagnostic only, never fingerprinted. */
+  stateCommitSeq?: number | null;
   pendingConflicts: readonly SyncPlanItem[];
   pendingRemoteDeletes: readonly SyncPlanItem[];
   pendingIssues: readonly PendingIssue[];
@@ -133,6 +136,8 @@ interface SyncIdleObservationDiag {
     schemaVersion: 1;
     fingerprint: string;
     factParts: string[];
+    commitSeq: number | null;
+    factCommitSeq: number | null;
     blocked: SyncRoundBlockedClassifications;
   }): void;
   (message: "sync idle spin detected", data: {
@@ -245,9 +250,6 @@ function scopePart(
   return `scope=${scope.accountId}|${scope.driveId}|${scope.vaultFolderId}|${scope.filesRootId}`;
 }
 
-function baselinePart(stateCommitSeq: number | null): string {
-  return `baseline=${stateCommitSeq === null ? "none" : stateCommitSeq}`;
-}
 
 /** Sort pending rows by path for a stable order across rounds. */
 function pendingRowsPart(input: SyncIdleObservationInput): string {
@@ -326,6 +328,12 @@ function runPart(input: SyncIdleObservationInput): string {
   return `run=${joint}`;
 }
 
+function baselinePart(contentFactCommitSeq: number | null): string {
+  return `baseline=${
+    contentFactCommitSeq === null ? "none" : contentFactCommitSeq
+  }`;
+}
+
 /** Build the stable-ordered canonical parts of one round's fact fingerprint. */
 function buildSyncRoundFactParts(
   input: SyncIdleObservationInput,
@@ -333,7 +341,7 @@ function buildSyncRoundFactParts(
   return {
     schema: "sync-fact-fingerprint-v1",
     scope: scopePart(input.scope),
-    baseline: baselinePart(input.stateCommitSeq),
+    baseline: baselinePart(input.contentFactCommitSeq),
     pending: pendingRowsPart(input),
     ledger: ledgerRecordsPart(input.mutationLedger),
     review: reviewPart(input),
@@ -467,6 +475,8 @@ export function observeSyncRoundEnd(
     schemaVersion: 1,
     fingerprint: fingerprint.fingerprint,
     factParts: fingerprint.partHashes,
+    commitSeq: input.stateCommitSeq ?? null,
+    factCommitSeq: input.contentFactCommitSeq,
     blocked,
   });
   let verdict = false;

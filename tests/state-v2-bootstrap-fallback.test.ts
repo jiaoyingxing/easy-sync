@@ -1565,6 +1565,7 @@ describe("V1 to V2 controlled production activation", () => {
         kind: "indexeddb",
         databaseId: selectedDatabaseId,
         stateCommitSeq: activeEnvelope.meta.commitSeq,
+        contentFactCommitSeq: activeEnvelope.meta.commitSeq,
         lifecycleEpoch: activeEnvelope.meta.lifecycleEpoch,
       });
       expect(activeEnvelope.meta.commitSeq)
@@ -1597,6 +1598,7 @@ describe("V1 to V2 controlled production activation", () => {
         kind: "indexeddb",
         databaseId: selectedDatabaseId,
         stateCommitSeq: activeEnvelope.meta.commitSeq,
+        contentFactCommitSeq: activeEnvelope.meta.commitSeq,
         lifecycleEpoch: activeEnvelope.meta.lifecycleEpoch,
       });
       // Match the production LocalScanner, which excludes EasySync's own

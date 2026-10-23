@@ -23,7 +23,10 @@ import {
   renderDisplayDiff,
   sameVisibleText,
 } from "./diff-view-renderer";
-import { summarizeConflictDetail } from "./conflict-detail-presentation";
+import {
+  shouldAutoLoadRemoteComparison,
+  summarizeConflictDetail,
+} from "./conflict-detail-presentation";
 import type { ConflictDetailSummaryEvidence } from "./conflict-detail-presentation";
 import {
   FileComparisonModal,
@@ -169,12 +172,35 @@ export class ConflictDetailModal extends FileComparisonModal {
 
     // ---- Diff (primary content; local preview is hidden — diff shows both sides) ----
     if (this.item.remote) {
+      // A known remote size above the text-diff budget cannot yield a line
+      // diff, so defer the download to the explicit "check content" action.
+      if (
+        !shouldAutoLoadRemoteComparison(
+          this.item.remote.size,
+          MAX_TEXT_DIFF_BYTES_PER_SIDE,
+        )
+      ) {
+        this.renderLargeRemoteSkipped({
+          t,
+          body,
+          loadingEl,
+          reasonEl,
+          localRaw,
+          localContent,
+          isBinary,
+          remote: this.item.remote,
+          setSummary,
+          setComparisonUnavailableOrReason,
+        });
+        return { kind: "continue" };
+      }
+
       const diffHeaderEl = body.createEl("h4", {
         text: t("conflictDetail.diffTitle"),
       });
 
       try {
-        const outcome = await this.renderRemoteComparison({
+        const outcome = await this.downloadAndCompareRemote({
           t,
           body,
           loadingEl,
@@ -246,8 +272,11 @@ export class ConflictDetailModal extends FileComparisonModal {
    * Fetch the remote side, compare it with the local bytes, and render the
    * line diff or the honest fallback notice. Returns "settled" after the
    * identical case already reconciled the conflict and closed the modal.
+   *
+   * Shared by the automatic path (known small/unknown size) and the explicit
+   * check action that defers an oversized download.
    */
-  private async renderRemoteComparison(args: {
+  private async downloadAndCompareRemote(args: {
     t: (key: string, params?: Record<string, string | number>) => string;
     body: HTMLElement;
     loadingEl: HTMLElement;
@@ -350,11 +379,108 @@ export class ConflictDetailModal extends FileComparisonModal {
             : t("conflictDetail.diffTitle") +
               ` (${t("conflictDetail.diffRegionsLocated", { count: diff.parts.length })})`,
         );
-        this.renderDisplayDiff(body, diff);
+        renderDisplayDiff(body, diff);
       }
     }
     loadingEl.remove();
     return { kind: "continue" };
+  }
+
+  /**
+   * Deferred state for a known oversized remote: explain why it was not
+   * loaded, show the bounded local preview, and expose one explicit action
+   * that runs the same download/compare/render path on demand. The three
+   * conflict decisions stay in the fixed footer, so nothing is duplicated.
+   */
+  private renderLargeRemoteSkipped(args: {
+    t: (key: string, params?: Record<string, string | number>) => string;
+    body: HTMLElement;
+    loadingEl: HTMLElement;
+    reasonEl: HTMLElement;
+    localRaw: ArrayBuffer;
+    localContent: string | null;
+    isBinary: boolean | undefined;
+    remote: NonNullable<SyncPlanItem["remote"]>;
+    setSummary: (evidence: ConflictDetailSummaryEvidence) => void;
+    setComparisonUnavailableOrReason: () => void;
+  }): void {
+    const {
+      t,
+      body,
+      loadingEl,
+      reasonEl,
+      localRaw,
+      localContent,
+      isBinary,
+      remote,
+      setSummary,
+      setComparisonUnavailableOrReason,
+    } = args;
+
+    loadingEl.remove();
+    const deferredEl = body.createDiv();
+    deferredEl.createDiv("easy-sync-diff-truncated").setText(
+      t("conflictDetail.largeRemoteSkipped"),
+    );
+
+    // The only way to bring the remote side in sits between the notice and the
+    // bounded local preview, so the action is visible without scrolling past it.
+    const checkButton = deferredEl.createEl("button", {
+      text: t("conflictDetail.checkContentEquality"),
+    });
+    const statusEl = deferredEl.createDiv();
+    if (localContent != null) {
+      deferredEl.createEl("h4", { text: t("conflictDetail.localPreview") });
+      this.renderTextPreview(deferredEl, localContent, t);
+    }
+    const resultEl = body.createDiv();
+
+    checkButton.addEventListener("click", () => {
+      if (checkButton.disabled) return;
+      checkButton.disabled = true;
+      void (async () => {
+        const checkLoadingEl = statusEl.createDiv("easy-sync-detail-loading");
+        const diffHeaderEl = resultEl.createEl("h4", {
+          text: t("conflictDetail.diffTitle"),
+        });
+        try {
+          const outcome = await this.downloadAndCompareRemote({
+            t,
+            body: resultEl,
+            loadingEl: checkLoadingEl,
+            diffHeaderEl,
+            reasonEl,
+            localRaw,
+            localContent,
+            isBinary,
+            remote,
+            setSummary,
+          });
+          if (outcome.kind === "settled") return;
+          // The rendered result supersedes the deferred notice, action, and
+          // preview, so the disabled button cannot linger as a dead control.
+          deferredEl.remove();
+        } catch (e) {
+          setComparisonUnavailableOrReason();
+          this.plugin.diag.warn(
+            "execute",
+            "Conflict detail remote comparison unavailable",
+            {
+              path: this.item.path,
+              errorKind: getErrorKind(e),
+            },
+          );
+          checkLoadingEl.remove();
+          diffHeaderEl.remove();
+          statusEl.empty();
+          statusEl.createDiv("easy-sync-remote-unavailable").setText(
+            t("conflictDetail.remoteComparisonUnavailable"),
+          );
+          // A failed check changed nothing: allow the user to retry.
+          checkButton.disabled = false;
+        }
+      })();
+    });
   }
 
   /** Render the metadata comparison table */
@@ -409,14 +535,6 @@ export class ConflictDetailModal extends FileComparisonModal {
         },
       ],
     );
-  }
-
-  /** Render bounded exact hunks and clearly marked summary regions. */
-  private renderDisplayDiff(
-    container: HTMLElement,
-    diff: Parameters<typeof renderDisplayDiff>[1],
-  ): void {
-    renderDisplayDiff(container, diff);
   }
 
   private renderTextPreview(

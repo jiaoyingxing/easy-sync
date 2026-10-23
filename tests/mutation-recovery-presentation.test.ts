@@ -114,7 +114,7 @@ describe("mutation recovery presentation", () => {
 
     expect(mutationRecoveryStatusLabel(state, t)).toBe("未完成操作");
     expect(mutationRecoveryBodyPresentation(state, t, () => "")).toEqual({
-      summary: "有 1 笔操作无法自动完成，不影响其他同步。",
+      summary: "有 1 笔操作未确认完成，自动同步已暂停。",
       path: ".obsidian/plugins/dataview/data.json",
       reason: "文件或云端状态已经变化",
       retryAt: null,

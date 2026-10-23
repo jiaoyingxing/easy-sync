@@ -97,23 +97,25 @@ describe("cdnHostOfDownloadUrl", () => {
 });
 
 describe("fingerprintCdnDownloadFailure", () => {
-  it("returns null without an error object", () => {
+  it("reports a none-stage fingerprint without an error object", () => {
     expect(fingerprintCdnDownloadFailure(null, { elapsedMs: 5, url: "https://download.example/f" }))
-      .toBeNull();
+      .toEqual({ stage: "none", host: "download.example", elapsedMs: 5 });
   });
 
-  it("carries stage, bare host and elapsed time", () => {
+  it("carries stage, bare host, elapsed time and an optional component", () => {
     const fingerprint = fingerprintCdnDownloadFailure(
       Object.assign(new Error("getaddrinfo ENOTFOUND download.example"), { status: 0 }),
       {
         elapsedMs: 42,
         url: "https://download.example/protocol-v2.json?token=secret",
+        component: "v2",
       },
     );
     expect(fingerprint).toEqual({
       stage: "dns",
       host: "download.example",
       elapsedMs: 42,
+      component: "v2",
     });
   });
 });

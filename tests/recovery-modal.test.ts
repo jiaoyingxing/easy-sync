@@ -1141,7 +1141,7 @@ describe("RecoveryModal 定稿文案钉子（2026-10-20 用户圈定）", () => 
     expect(zh.t("recovery.reason.writeFailed")).toBe("副本未能写入仓库");
     expect(en.t("recovery.restoreFailed")).toBe("Restore failed: {reason}");
     expect(en.t("recovery.reason.writeFailed")).toBe(
-      "The copy couldn't be written to the vault",
+      "The copy couldn’t be written to the vault",
     );
   });
 

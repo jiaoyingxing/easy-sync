@@ -118,8 +118,9 @@ export function normalizeVaultPathKey(path: string): string {
 }
 
 /** Every sidecar key of the current storage layout, in declaration order.
- *  Exported so the layout-migration completeness gate can prove that no key was
- *  silently left out of the migration table. */
+ *  Exported for the test-side completeness gate
+ *  `tests/easy-sync-storage-layout.test.ts`, which proves no key was silently
+ *  left out of the migration table. */
 export const EASY_SYNC_SIDECAR_KEYS = Object.keys(
   EASY_SYNC_STORAGE_LAYOUT.sidecars,
 ) as ReadonlyArray<keyof typeof EASY_SYNC_STORAGE_LAYOUT.sidecars>;
@@ -129,16 +130,6 @@ export const EASY_SYNC_SIDECAR_KEYS = Object.keys(
 export const EASY_SYNC_LEGACY_SIDECAR_KEYS = Object.keys(
   EASY_SYNC_LEGACY_STORAGE_LAYOUT.sidecars,
 ) as ReadonlyArray<keyof typeof EASY_SYNC_LEGACY_STORAGE_LAYOUT.sidecars>;
-
-export function getPluginDir(
-  vaultOrConfigDir: Pick<Vault, "configDir"> | string,
-  pluginId: string,
-): string {
-  const configDir = typeof vaultOrConfigDir === "string"
-    ? vaultOrConfigDir
-    : getConfigDir(vaultOrConfigDir);
-  return `${configDir}/plugins/${pluginId}`;
-}
 
 export interface EasySyncPathSet {
   configDir: string;
@@ -283,6 +274,16 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 export function isStringRecord(value: unknown): value is Record<string, string> {
   if (!isRecord(value)) return false;
   return Object.values(value).every((entry) => typeof entry === "string");
+}
+
+/**
+ * Human-readable error text. This is the shared extraction of the previously
+ * inlined `error instanceof Error ? error.message : String(error)` expression
+ * and preserves that exact string form: Error message as-is, everything else
+ * via `String(...)`.
+ */
+export function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function getCurrentWindow(): Window | null {

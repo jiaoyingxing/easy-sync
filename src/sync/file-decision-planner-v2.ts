@@ -516,7 +516,7 @@ function parentPath(path: string): string {
     : "";
 }
 
-function orderSyncPlanItemsV2(
+export function orderSyncPlanItemsV2(
   items: readonly SyncPlanItem[],
 ): SyncPlanItem[] {
   const priority: Record<SyncActionType, number> = {

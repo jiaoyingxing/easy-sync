@@ -9,6 +9,7 @@ import {
   isNewerVersion,
   isUpdateReminderSuppressed,
   loadUpdateCheckState,
+  resolveNextUpdateCheckDelay,
   saveUpdateCheckState,
   seedUpdateCheckStateFromLegacyPluginData,
   SNOOZE_DURATION_MS,
@@ -25,6 +26,7 @@ import {
   compatRequestAnimationFrame,
   compatSetInterval,
   compatSetTimeout,
+  describeError,
   type AnimationFrameHandle,
   getConfigDir,
   getEasySyncPaths,
@@ -723,6 +725,11 @@ export default class EasySyncPlugin extends Plugin {
   progressStore: SyncProgressStore = new SyncProgressStore();
   noticeCenter: EasySyncNoticeCenter = new EasySyncNoticeCenter();
   i18n: I18n = new I18n("en");
+
+  /** Bound translator for builders/modals that expect a plain I18nFn. */
+  private get t() {
+    return this.i18n.t.bind(this.i18n);
+  }
   diag: DiagnosticLogger = new DiagnosticLogger();
   // Connection-speed reading: session-local EWMA over real transferred
   // bytes, reseeded once from the persisted raw window on first read.
@@ -845,6 +852,9 @@ export default class EasySyncPlugin extends Plugin {
   private ribbonEl: HTMLElement | null = null;
   private ribbonSuccessTimer: TimeoutHandle | null = null;
   private ribbonSuccessVisible = false;
+  /** Delayed "migration completed" notice; cleared on unload so a queued
+   *  reminder cannot surface after the plugin is gone. */
+  private rsMigrationCompletionNoticeTimer: TimeoutHandle | null = null;
   private settingsTab: EasySyncSettingTab | null = null;
   private stateLoadPromise: Promise<void> | null = null;
   /** One attempt per reload for the retired self-sync opt-in: see
@@ -1505,13 +1515,15 @@ export default class EasySyncPlugin extends Plugin {
 
   /** Startup-tail + 24h-cycle check. lastKnownLatest persists the prompt
    *  across restarts even when the throttle skips the network call; a failed
-   *  check leaves lastCheckAt untouched so the next cycle retries. Bookkeeping
-   *  persists via the official App localStorage API (not the plugin data file)
-   *  so a routine write can never drift a V2 migration input digest
-   *  mid-activation (issue #18). */
+   *  round leaves lastCheckAt untouched and is retried after one hour (still
+   *  silent) instead of waiting the regular 24h cycle. Bookkeeping persists
+   *  via the official App localStorage API (not the plugin data file) so a
+   *  routine write can never drift a V2 migration input digest mid-activation
+   *  (issue #18). */
   private runUpdateCheckFlow(): void {
     void (async () => {
       const now = Date.now();
+      let nextDelayMs = UPDATE_CHECK_INTERVAL_MS;
       if (isUpdateCheckDue(this.updateLastCheckAt, now)) {
         const latest = await fetchLatestStableVersion((opts) =>
           requestUrl(opts),
@@ -1528,11 +1540,14 @@ export default class EasySyncPlugin extends Plugin {
             current: this.manifest.version,
           });
         } else {
-          this.diag.log("lifecycle", "update check unavailable");
+          this.diag.log("lifecycle", "update check unavailable; retry scheduled", {
+            retryInMs: resolveNextUpdateCheckDelay(null),
+          });
         }
+        nextDelayMs = resolveNextUpdateCheckDelay(latest);
       }
       this.syncView?.render();
-      this.scheduleNextUpdateCheck();
+      this.scheduleNextUpdateCheck(nextDelayMs);
     })().catch(() => undefined);
   }
 
@@ -1556,12 +1571,14 @@ export default class EasySyncPlugin extends Plugin {
     };
   }
 
-  private scheduleNextUpdateCheck(): void {
+  private scheduleNextUpdateCheck(
+    delayMs: number = UPDATE_CHECK_INTERVAL_MS,
+  ): void {
     if (this.updateCheckTimer !== null) window.clearTimeout(this.updateCheckTimer);
     this.updateCheckTimer = window.setTimeout(() => {
       this.updateCheckTimer = null;
       this.runUpdateCheckFlow();
-    }, UPDATE_CHECK_INTERVAL_MS);
+    }, delayMs);
   }
 
   onunload(): void {
@@ -1600,6 +1617,8 @@ export default class EasySyncPlugin extends Plugin {
     this.cancelDescendantFileReconstructionContinuation();
     this.disableMobileStatusBar();
     compatClearTimeout(this.ribbonSuccessTimer);
+    compatClearTimeout(this.rsMigrationCompletionNoticeTimer);
+    this.rsMigrationCompletionNoticeTimer = null;
     compatCancelAnimationFrame(this.syncNoticeFrame);
     compatCancelAnimationFrame(this.statusBarFrame);
     this.statusBarFrame = null;
@@ -1801,7 +1820,7 @@ export default class EasySyncPlugin extends Plugin {
       this.settingsTab?.refreshSyncState();
       return true;
     } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
+      const reason = describeError(error);
       this.diag.warn("execute", `side-action gateway failed — ${path}`, reason);
       this.noticeCenter.show({
         key: `side-action-gateway:failed:${path}`,
@@ -2135,7 +2154,7 @@ export default class EasySyncPlugin extends Plugin {
    * exit was retired; see DECISIONS 2026-08-29 提示与出口收束).
    */
   private async confirmForcedReset(): Promise<boolean> {
-    const t = this.i18n.t.bind(this.i18n);
+    const t = this.t;
     return new ConfirmModal(
       this.app,
       t("settings.reset.forceTitle"),
@@ -2371,7 +2390,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "vault cloud client detection failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -2495,7 +2514,8 @@ export default class EasySyncPlugin extends Plugin {
       // is the one correct moment for the completion reminder. Sent on an
       // 8s delay because the round-result notice (shown by handleSyncResult
       // right after this funnel returns) always preempts an immediate show.
-      compatSetTimeout(() => {
+      this.rsMigrationCompletionNoticeTimer = compatSetTimeout(() => {
+        this.rsMigrationCompletionNoticeTimer = null;
         this.noticeCenter?.show({
           key: "rs-migration-completed",
           message: this.i18n.t("rsMigration.completedNotice"),
@@ -2562,7 +2582,7 @@ export default class EasySyncPlugin extends Plugin {
         this.diag.warn(
           "state",
           "community plugin auto-enable step failed — manual enablement after restart still applies",
-          error instanceof Error ? error.message : String(error),
+          describeError(error),
         );
       }
     }
@@ -2742,7 +2762,7 @@ export default class EasySyncPlugin extends Plugin {
     candidates: readonly CommunityPluginAutoUpdateCandidate[],
     configDir: string,
   ): Promise<void> {
-    const t = this.i18n.t.bind(this.i18n);
+    const t = this.t;
     const labels: string[] = [];
     let anyVersioned = false;
     for (const candidate of candidates) {
@@ -2844,7 +2864,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag?.warn(
         "state",
         `V2 state reload self-heal attempt ${attempt} failed`,
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     } finally {
       this.v2StateReloadInFlight = false;
@@ -3131,7 +3151,7 @@ export default class EasySyncPlugin extends Plugin {
         this.diag.warn(
           "state",
           "community plugin participation initialization failed",
-          error instanceof Error ? error.message : String(error),
+          describeError(error),
         );
       }
       this._stateLoaded = true;
@@ -3172,7 +3192,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "EasySync self-sync scope transition did not run; the plugin directory stays out of scope until the next reload",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -3252,7 +3272,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "Remotely Save detection after login failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       return false;
     }
@@ -3295,7 +3315,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "EasySync repository detection after login failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -3416,7 +3436,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "Remotely Save detection failed; first sync deferred",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       this.noticeCenter?.show({
         key: "rs-migration-detect-failed",
@@ -3495,7 +3515,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "Remotely Save adoption transaction threw; the choice is preserved",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       return "abort";
     }
@@ -3536,7 +3556,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "EasySync repository detection failed; the plain first sync proceeds",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       return "continue";
     }
@@ -3710,7 +3730,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private async acknowledgeV2MigrationRisk(): Promise<boolean> {
-    const t = this.i18n.t.bind(this.i18n);
+    const t = this.t;
     return new ConfirmModal(
       this.app,
       t("syncPlan.migrationConfirmTitle"),
@@ -3724,7 +3744,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private async acknowledgeRemoteScopeCreation(): Promise<boolean> {
-    const t = this.i18n.t.bind(this.i18n);
+    const t = this.t;
     return new ConfirmModal(
       this.app,
       t("syncPlan.remoteScopeRecreateConfirmTitle"),
@@ -3746,27 +3766,15 @@ export default class EasySyncPlugin extends Plugin {
     kind: "firstSync" | "threshold",
     plan: SyncPlan,
   ): Promise<boolean> {
-    const t = this.i18n.t.bind(this.i18n);
+    const t = this.t;
 
-    const counts = plan.canonicalReview?.counts ?? {
-      uploads: plan.items.filter((i) => i.type === SyncActionType.Upload).length,
-      downloads: plan.items.filter((i) => i.type === SyncActionType.Download).length,
-      folders: plan.items.filter((i) =>
-        i.type === SyncActionType.RecreateRemoteScope
-          || i.type === SyncActionType.CreateRemoteFolder
-          || i.type === SyncActionType.CreateLocalFolder
-          || i.type === SyncActionType.MoveRemoteFolder
-          || i.type === SyncActionType.MoveLocalFolder).length,
-      deletes: plan.items.filter((i) =>
-        i.type === SyncActionType.DeleteRemote
-          || i.type === SyncActionType.DeleteLocal
-          || i.type === SyncActionType.ConfirmLocalDelete
-          || i.type === SyncActionType.DeleteRemoteFolder
-          || i.type === SyncActionType.DeleteLocalFolder).length,
-      conflicts: plan.items.filter((i) => i.type === SyncActionType.Conflict).length,
-      skipped: plan.items.filter((i) =>
-        i.type === SyncActionType.SkipLargeFile || i.type === SyncActionType.SkipIgnoredPath).length,
-    };
+    const canonicalReview = plan.canonicalReview;
+    if (!canonicalReview) {
+      throw new Error(
+        "Cannot persist a plan review without canonical review counts",
+      );
+    }
+    const counts = canonicalReview.counts;
     if (!plan.scope) {
       throw new Error("Cannot persist a plan review without a complete sync scope");
     }
@@ -3917,7 +3925,7 @@ export default class EasySyncPlugin extends Plugin {
     }
     const progress = this.progressStore.state;
     const presentation = resolveSyncProgressNoticePresentation(progress);
-    const t = this.i18n.t.bind(this.i18n);
+    const t = this.t;
     const label = formatSyncProgressNoticeLabel(presentation, t);
     const signature = [
       presentation.kind,
@@ -4217,7 +4225,7 @@ export default class EasySyncPlugin extends Plugin {
             this.diag.warn(
               "state",
               "conservative local reset kept unresolved recovery evidence",
-              error instanceof Error ? error.message : String(error),
+              describeError(error),
             );
             if (!await this.confirmForcedReset()) {
               this.showMutationRecoveryResetBlockedNotice();
@@ -4236,7 +4244,7 @@ export default class EasySyncPlugin extends Plugin {
           this.diag.warn(
             "state",
             "conservative local reset kept unresolved recovery evidence",
-            error instanceof Error ? error.message : String(error),
+            describeError(error),
           );
           this.showMutationRecoveryResetBlockedNotice();
           return;
@@ -4412,7 +4420,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "execute",
         "reset preflight mutation recovery failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       return { kind: "blocked" };
     }
@@ -4804,7 +4812,7 @@ export default class EasySyncPlugin extends Plugin {
       } catch (error) {
         this.diag.warn(
           "state",
-          `sync recovery history update failed: ${error instanceof Error ? error.message : String(error)}`,
+          `sync recovery history update failed: ${describeError(error)}`,
         );
       }
     } else if (recoveryContext.priorTotal > 0) {
@@ -4904,7 +4912,7 @@ export default class EasySyncPlugin extends Plugin {
     } catch (error) {
       this.diag.warn(
         "state",
-        `sync history save failed: ${error instanceof Error ? error.message : String(error)}`,
+        `sync history save failed: ${describeError(error)}`,
       );
     }
   }
@@ -5174,7 +5182,7 @@ export default class EasySyncPlugin extends Plugin {
     } catch (error) {
       this.diag.warn(
         "state",
-        `sync recovery history refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+        `sync recovery history refresh failed: ${describeError(error)}`,
       );
     }
   }
@@ -5227,7 +5235,7 @@ export default class EasySyncPlugin extends Plugin {
     } catch (error) {
       this.diag.warn(
         "state",
-        `sync recovery history create failed: ${error instanceof Error ? error.message : String(error)}`,
+        `sync recovery history create failed: ${describeError(error)}`,
       );
     }
   }
@@ -5475,7 +5483,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "execute",
         "scheduled mutation recovery setup failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       if (
         this.state?.isV2StateActive
@@ -5723,7 +5731,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         `local folder delete hint was not retained: ${path}`,
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -5814,7 +5822,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "community plugin local participation inventory unavailable",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       return [];
     }
@@ -5869,7 +5877,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "lifecycle",
         "community plugin local participation reconciliation deferred",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       if (
         error instanceof SyncPathSettingsUpdateError
@@ -5993,7 +6001,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         `local folder move hint was not retained: ${oldPath} -> ${newPath}`,
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       return false;
     }
@@ -6030,7 +6038,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         `local file move hint was not retained: ${oldPath} -> ${newPath}`,
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       return false;
     }
@@ -6090,7 +6098,7 @@ export default class EasySyncPlugin extends Plugin {
     const batch = this.scopeCrossingPromptQueue.splice(0);
     if (batch.length === 0) return;
     this.scopeCrossingPromptShowing = true;
-    const t = this.i18n.t.bind(this.i18n);
+    const t = this.t;
     try {
       const first = batch[0];
       const choice = await new ScopeCrossingPromptModal(
@@ -6160,7 +6168,7 @@ export default class EasySyncPlugin extends Plugin {
     fromPath: string,
     toPath: string,
   ): Promise<void> {
-    const t = this.i18n.t.bind(this.i18n);
+    const t = this.t;
     try {
       await this.ensureStateLoaded();
       const state = this.state;
@@ -6197,7 +6205,7 @@ export default class EasySyncPlugin extends Plugin {
     fromPath: string,
     toPath: string,
   ): Promise<void> {
-    const t = this.i18n.t.bind(this.i18n);
+    const t = this.t;
     try {
       await this.ensureStateLoaded();
       const state = this.state;
@@ -6317,7 +6325,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "execute",
         `auto sync setup failed — trigger=${trigger}`,
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       // Only consume a dirty hint after the executor actually received it.
       // A transient setup failure must keep the in-memory hint for retry.
@@ -6395,7 +6403,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "descendant file baseline continuation setup failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     } finally {
       this.releaseOpLock();
@@ -6580,7 +6588,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "failed to persist the auto sync master switch",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       new Notice(this.i18n.t("notice.settingsSaveFailed"));
       return;
@@ -7162,7 +7170,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag?.warn(
         "state",
         "community plugin cloud cleanup stopped before planning: no fresh catalog evidence",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       this.noticeCenter.show({
         key: `cloud-cleanup:failed:${pluginId}`,
@@ -7212,7 +7220,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag?.warn(
         "state",
         "cloud cleanup succeeded but the local plugin sync policy could not be updated",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
     // 清理成功即退出参与并撤侧栏待定行（2026-09-16 用户拍板）：否则参与层
@@ -7228,7 +7236,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag?.warn(
         "state",
         "community plugin participation exit after cloud cleanup failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
     try {
@@ -7240,7 +7248,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag?.warn(
         "state",
         "community plugin pending adoption row removal after cloud cleanup failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
     // 清理成功即触发一轮同步（2026-09-16 用户拍板）：云端删除由清理事务直接
@@ -7485,7 +7493,7 @@ export default class EasySyncPlugin extends Plugin {
       if (outcome.kind === "fallback") fallbackIds.push(pluginId);
     }
     if (fallbackIds.length === 0) return;
-    const t = this.i18n.t.bind(this.i18n);
+    const t = this.t;
     const configDir = getConfigDir(this.app.vault);
     const labels: string[] = [];
     for (const pluginId of fallbackIds) {
@@ -8032,6 +8040,14 @@ export default class EasySyncPlugin extends Plugin {
         allowedLockHolder: input.allowedLockHolder,
         expectedParticipation: participation,
         commitSyncPathSettingsTransition: true,
+        // F33 (2026-10-22): when a plugin's local bundle vanished while an
+        // intent-only code-upload record still blocks recovery, the
+        // participation exit is the only channel that can retire that record.
+        // This reuses the same strict scope-exit evidence gate as the manual
+        // exit (`inspectSelectedPluginCodeUploadRecoveriesForScopeExit`) and
+        // performs zero file writes; anything that gate refuses keeps today's
+        // fail-closed "recovery" behaviour.
+        allowPluginCodeRecoveryScopeExit: true,
       },
     );
     this.diag?.log(
@@ -8152,7 +8168,7 @@ export default class EasySyncPlugin extends Plugin {
         this.diag.warn(
           "state",
           "community plugin join catalog refresh failed closed",
-          error instanceof Error ? error.message : String(error),
+          describeError(error),
         );
         catalog = null;
       }
@@ -8266,7 +8282,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "failed to clear community plugin adoption memory after an explicit join",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
     this.clearCommunityPluginCloudCleanupMarker(pluginId);
@@ -8308,7 +8324,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag?.warn(
         "state",
         "community plugin join immediate sync did not start",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     });
   }
@@ -8408,7 +8424,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "failed to record the community plugin adoption ignore",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -8430,7 +8446,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "failed to retire the community plugin adoption row before download",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
     try {
@@ -8458,7 +8474,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "community plugin download did not start",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -8516,7 +8532,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "failed to clear the cloud cleanup marker after an explicit join",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -8894,7 +8910,7 @@ export default class EasySyncPlugin extends Plugin {
             this.diag?.warn(
               "state",
               `community plugin catalog refresh failed — keeping the last trusted catalog (${this.communityPluginCatalogRefreshConsecutiveFailures}/${COMMUNITY_PLUGIN_CATALOG_STALE_FAILURE_THRESHOLD})`,
-              error instanceof Error ? error.message : String(error),
+              describeError(error),
             );
           }
         }
@@ -8967,7 +8983,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag?.warn(
         "state",
         "community plugin display facts were not ensured; names may fall back to plugin ids",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
     this.communityPluginCatalogRefreshConsecutiveFailures = 0;
@@ -9030,7 +9046,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag?.warn(
         "state",
         "round-end community plugin catalog update failed — keeping the last trusted catalog",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -9096,7 +9112,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag?.warn(
         "state",
         "round-end community plugin display facts were not ensured; names may fall back to plugin ids",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
     this.communityPluginCatalogRefreshConsecutiveFailures = 0;
@@ -9131,7 +9147,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag?.warn(
         "state",
         "round-end community plugin adoption reconcile failed — pending rows stay unchanged",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
   }
@@ -9176,7 +9192,7 @@ export default class EasySyncPlugin extends Plugin {
         this.diag?.warn(
           "state",
           "round-end community plugin local bundle facts were not observed; adoption rows keep phase-only gating",
-          error instanceof Error ? error.message : String(error),
+          describeError(error),
         );
       }
       const candidates = await deriveCommunityPluginAdoptionCandidates({
@@ -9225,7 +9241,7 @@ export default class EasySyncPlugin extends Plugin {
         this.diag.warn(
           "lifecycle",
           "community plugin inventory revision listener failed",
-          error instanceof Error ? error.message : String(error),
+          describeError(error),
         );
       }
     }
@@ -9319,7 +9335,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.error(
         "state",
         "diagnostic report failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
       this.noticeCenter.show({
         key: "diagnostic-report-save-failed",
@@ -9362,7 +9378,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "diagnostic report state load failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
     const auth = this.auth?.authState;
@@ -9401,7 +9417,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "diagnostic report could not read community plugin inventory",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
     const communityPluginSummary = await summarizeCommunityPluginSync({
@@ -9531,7 +9547,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag.warn(
         "state",
         "sync-mode gate count fell back to zero: local scan failed",
-        error instanceof Error ? error.message : String(error),
+        describeError(error),
       );
     }
     return {
@@ -10430,7 +10446,15 @@ export default class EasySyncPlugin extends Plugin {
       this.mobileStatusBarLayoutRetryArmed = true;
       this.app.workspace.onLayoutReady(() => {
         this.mobileStatusBarLayoutRetryArmed = false;
-        if (this.mobileStatusBar) this.enableMobileStatusBar();
+        // Only continue when the host element actually appeared. A blind
+        // re-call on an already-ready layout would see the element missing
+        // again and arm another layout-ready callback forever.
+        if (
+          this.mobileStatusBar
+          && document.querySelector(".is-mobile .app-container .status-bar")
+        ) {
+          this.enableMobileStatusBar();
+        }
       });
       return;
     }
@@ -10474,6 +10498,9 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private disableMobileStatusBar(): void {
+    // A disable always ends any pending layout-ready retry, even when there is
+    // no DOM to restore (Node-side unload tests, abnormal lifecycle).
+    this.mobileStatusBarLayoutRetryArmed = false;
     // 无 DOM 环境（Node 侧卸载测试、异常生命周期）：无可还原的样式，直接返回。
     if (typeof document === "undefined") return;
     this.mobileStatusBarObserver?.disconnect();
@@ -10588,7 +10615,7 @@ export default class EasySyncPlugin extends Plugin {
     this.updateRibbon();
     this.settingsTab?.refreshSyncState();
     if (!this.statusBarEl) return;
-    const t = this.i18n.t.bind(this.i18n);
+    const t = this.t;
     const fullSyncRunning = this.syncExecutor?.isRunning ?? false;
     const sideActionRunning = this.syncExecutor?.hasSideActionsInFlight ?? false;
     const isRunning = isAnySyncActivityRunning(this.progressStore.state, fullSyncRunning, sideActionRunning);

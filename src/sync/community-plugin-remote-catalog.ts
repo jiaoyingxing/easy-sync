@@ -1,4 +1,5 @@
 import { sha256Hex } from "../crypto";
+import { isRecord } from "../obsidian-compat";
 import { compareText } from "./compare-text";
 import type { DriveItem } from "../onedrive/types";
 import {
@@ -551,9 +552,6 @@ function compareMember(
   return compareText(left.path, right.path);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function hasOnlyKeys(
   value: Record<string, unknown>,

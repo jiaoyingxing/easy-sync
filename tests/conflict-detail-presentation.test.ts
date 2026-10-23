@@ -1,9 +1,11 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { I18n } from "../src/i18n";
 import {
   getDiffLineNumberWidth,
 } from "../src/ui/conflict-detail-modal";
 import {
+  shouldAutoLoadRemoteComparison,
   summarizeConflictDetail,
 } from "../src/ui/conflict-detail-presentation";
 import type { DisplayDiffResult } from "../src/ui/diff-engine";
@@ -214,7 +216,9 @@ describe("conflict detail presentation", () => {
       /style\.setProperty\(\s*"--easy-sync-diff-line-number-width"/,
     );
     expect(modal).not.toContain("padStart(6)");
-    expect(modal).toContain('renderDisplayDiff(container, diff)');
+    // 共享渲染器直接从调用点调用；不要再加一层私有转发方法。
+    expect(modal).toContain("renderDisplayDiff(body, diff)");
+    expect(modal).not.toContain("private renderDisplayDiff(");
     expect(styles).toMatch(
       /grid-template-columns:\s*repeat\(2,\s*var\(--easy-sync-diff-line-number-width,\s*2ch\)\);/,
     );
@@ -250,5 +254,73 @@ describe("conflict detail presentation", () => {
     );
     expect(styles).not.toMatch(/background-color:\s*var\(--color-(?:red|green)\);/);
     expect(styles).not.toContain(".easy-sync-conflict-actions .easy-sync-detail-action-local");
+  });
+
+  it("defers only oversized remote downloads and keeps one shared download path", () => {
+    const source = readFileSync("src/ui/conflict-detail-modal.ts", "utf8");
+
+    // The skip guard reads the shared text-diff budget.
+    expect(source).toMatch(
+      /if \(\s*!shouldAutoLoadRemoteComparison\(\s*this\.item\.remote\.size,\s*MAX_TEXT_DIFF_BYTES_PER_SIDE,?\s*\)\s*\) \{/,
+    );
+    expect(source).toContain('t("conflictDetail.largeRemoteSkipped"');
+    expect(source).toContain('t("conflictDetail.checkContentEquality")');
+    expect(source).toContain("this.renderLargeRemoteSkipped({");
+
+    // The check button runs the same download/compare/render method.
+    expect(source).toMatch(
+      /addEventListener\("click", \(\) => \{[\s\S]*?await this\.downloadAndCompareRemote\(\{/,
+    );
+
+    // Exactly two call sites: the automatic <= limit/unknown-size path and
+    // the explicit button. Only the shared method performs the download.
+    expect(source.match(/this\.downloadAndCompareRemote\(\{/g)).toHaveLength(2);
+    expect(source.match(/\.downloadFile\(/g)).toHaveLength(1);
+    const automaticCall = source.indexOf(
+      "const outcome = await this.downloadAndCompareRemote({",
+    );
+    expect(automaticCall).toBeGreaterThan(-1);
+    expect(automaticCall).toBeGreaterThan(
+      source.indexOf("!shouldAutoLoadRemoteComparison("),
+    );
+  });
+});
+
+describe("conflict detail large-remote auto-load rule", () => {
+  const limit = 8 * 1024 * 1024;
+
+  it("defers a known finite size above the limit", () => {
+    expect(shouldAutoLoadRemoteComparison(limit + 1, limit)).toBe(false);
+    expect(shouldAutoLoadRemoteComparison(limit * 2, limit)).toBe(false);
+  });
+
+  it("auto-loads at the limit and below", () => {
+    expect(shouldAutoLoadRemoteComparison(limit, limit)).toBe(true);
+    expect(shouldAutoLoadRemoteComparison(limit - 1, limit)).toBe(true);
+    expect(shouldAutoLoadRemoteComparison(0, limit)).toBe(true);
+  });
+
+  it("auto-loads when the size is missing or non-finite", () => {
+    expect(shouldAutoLoadRemoteComparison(undefined, limit)).toBe(true);
+    expect(shouldAutoLoadRemoteComparison(null, limit)).toBe(true);
+    expect(shouldAutoLoadRemoteComparison(Number.NaN, limit)).toBe(true);
+    expect(shouldAutoLoadRemoteComparison(Number.POSITIVE_INFINITY, limit)).toBe(true);
+  });
+});
+
+describe("conflict detail deferred large-file copy", () => {
+  it("pins the circled notice and button copy", () => {
+    const zh = new I18n("zh-cn");
+    const en = new I18n("en");
+    // 该分支只处理超过逐行对比预算的云端文件：下载后能确认两边是否一致，
+    // 但仍不会渲染逐行差异，所以文案不能承诺「逐行比对」。
+    expect(zh.t("conflictDetail.largeRemoteSkipped")).toBe(
+      "文件较大，需下载后才能比对。",
+    );
+    expect(zh.t("conflictDetail.checkContentEquality")).toBe("下载比对");
+    expect(en.t("conflictDetail.largeRemoteSkipped")).toBe(
+      "This file is large; download it to compare both sides.",
+    );
+    expect(en.t("conflictDetail.checkContentEquality")).toBe("Download and compare");
   });
 });

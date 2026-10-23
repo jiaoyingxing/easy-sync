@@ -6,11 +6,14 @@ import {
   isUpdateCheckDue,
   isUpdateReminderSuppressed,
   loadUpdateCheckState,
+  parseManifestVersion,
   pickLatestStableVersion,
+  resolveNextUpdateCheckDelay,
   saveUpdateCheckState,
   seedUpdateCheckStateFromLegacyPluginData,
   SNOOZE_DURATION_MS,
   UPDATE_CHECK_INTERVAL_MS,
+  UPDATE_CHECK_RETRY_INTERVAL_MS,
   type UpdateCheckStorage,
 } from "../src/update-check";
 import en from "../src/i18n/en";
@@ -127,25 +130,51 @@ describe("update reminder suppression", () => {
 describe("fetchLatestStableVersion", () => {
   const ok = (text: string) =>
     Promise.resolve({ status: 200, text } as const);
+  const raw = (version: string) => ok(JSON.stringify({ version }));
+  const jsdelivr = (versions: string[]) =>
+    ok(JSON.stringify({ versions: versions.map((version) => ({ version })) }));
+  const isRawUrl = (url: string) => url.includes("raw.githubusercontent.com");
 
-  it("returns the newest stable version from the jsDelivr successor payload", async () => {
-    const fetcher = vi.fn(() =>
-      ok(
-        JSON.stringify({
-          versions: [{ version: "1.4.8-beta" }, { version: "1.4.7" }, { version: "1.4.8" }],
-        }),
-      ),
-    );
+  it("reads the raw GitHub manifest first and stops there", async () => {
+    const fetcher = vi.fn(() => raw("1.4.8"));
     await expect(fetchLatestStableVersion(fetcher)).resolves.toBe("1.4.8");
+    expect(fetcher).toHaveBeenCalledTimes(1);
     expect(fetcher).toHaveBeenCalledWith(
+      expect.objectContaining({ url: expect.stringContaining("raw.githubusercontent.com") }),
+    );
+  });
+
+  it("falls back to the jsDelivr successor payload when raw fails", async () => {
+    const fetcher = vi.fn((opts: { url: string }) => {
+      if (isRawUrl(opts.url)) return Promise.reject(new Error("raw-down"));
+      return jsdelivr(["1.4.7", "1.4.8-beta", "1.4.8"]);
+    });
+    await expect(fetchLatestStableVersion(fetcher)).resolves.toBe("1.4.8");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(fetcher).toHaveBeenLastCalledWith(
       expect.objectContaining({ url: expect.stringContaining("/v1/packages/") }),
     );
   });
 
-  it("filters entries without a version field out of the payload", async () => {
-    const fetcher = vi.fn(() =>
-      ok(JSON.stringify({ versions: [null, {}, { version: "1.4.8" }] })),
-    );
+  it("falls back when the raw manifest is malformed or unstable", async () => {
+    const fetcher = vi.fn((opts: { url: string }) => {
+      if (isRawUrl(opts.url)) return ok("not-json");
+      return jsdelivr(["1.4.8"]);
+    });
+    await expect(fetchLatestStableVersion(fetcher)).resolves.toBe("1.4.8");
+
+    const unstable = vi.fn((opts: { url: string }) => {
+      if (isRawUrl(opts.url)) return raw("1.4.8-beta");
+      return jsdelivr(["1.4.8"]);
+    });
+    await expect(fetchLatestStableVersion(unstable)).resolves.toBe("1.4.8");
+  });
+
+  it("filters entries without a version field out of the fallback payload", async () => {
+    const fetcher = vi.fn((opts: { url: string }) => {
+      if (isRawUrl(opts.url)) return Promise.reject(new Error("raw-down"));
+      return ok(JSON.stringify({ versions: [null, {}, { version: "1.4.8" }] }));
+    });
     await expect(fetchLatestStableVersion(fetcher)).resolves.toBe("1.4.8");
   });
 
@@ -159,6 +188,26 @@ describe("fetchLatestStableVersion", () => {
     await expect(
       fetchLatestStableVersion(() => Promise.reject(new Error("offline"))),
     ).resolves.toBeNull();
+  });
+});
+
+describe("manifest payload parsing", () => {
+  it("accepts a stable version and rejects malformed/unstable payloads", () => {
+    expect(parseManifestVersion(JSON.stringify({ version: "1.6.1" }))).toBe("1.6.1");
+    expect(parseManifestVersion(JSON.stringify({ version: "1.6.1-beta" }))).toBeNull();
+    expect(parseManifestVersion("not-json")).toBeNull();
+    expect(parseManifestVersion("{}")).toBeNull();
+  });
+});
+
+describe("failure retry cadence", () => {
+  it("retries after one hour on failure, keeps 24h on success", () => {
+    expect(resolveNextUpdateCheckDelay(null)).toBe(
+      UPDATE_CHECK_RETRY_INTERVAL_MS,
+    );
+    expect(resolveNextUpdateCheckDelay("1.6.1")).toBe(
+      UPDATE_CHECK_INTERVAL_MS,
+    );
   });
 });
 

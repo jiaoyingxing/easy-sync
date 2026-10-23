@@ -11,7 +11,7 @@ import {
   generateFileDecisionPlanV2,
   isObsidianManagedConfigPath,
 } from "./file-decision-planner-v2";
-import { normalizeVaultPathKey } from "../obsidian-compat";
+import { describeError, normalizeVaultPathKey } from "../obsidian-compat";
 import {
   planFolderStateFromViewV2,
   type FolderPlanConflictReasonV2,
@@ -1936,7 +1936,7 @@ async function settleIdentityMoveVerificationV2(args: {
         path: verification.toPath,
         outcome: "failed",
         downloaded: true,
-        error: error instanceof Error ? error.message : String(error),
+        error: describeError(error),
       });
       return counters();
     }
@@ -2070,7 +2070,7 @@ async function settleIdentityReplacementVerificationV2(args: {
         path: replacement.path,
         outcome: "failed",
         downloaded: true,
-        error: error instanceof Error ? error.message : String(error),
+        error: describeError(error),
       });
       return counters();
     }
@@ -2195,7 +2195,7 @@ async function settleSelectedCandidateVerificationV2(args: {
       path: item.path,
       outcome: "failed",
       downloaded: downloadedHash !== undefined,
-      error: error instanceof Error ? error.message : String(error),
+      error: describeError(error),
     });
   }
 }
@@ -3203,7 +3203,7 @@ function sealingEnvelopeFacts(envelope: SyncStateEnvelopeV2): unknown {
   };
 }
 
-function canonicalActionPriority(type: SyncActionType): number {
+export function canonicalActionPriority(type: SyncActionType): number {
   switch (type) {
     case SyncActionType.RecreateRemoteScope:
     case SyncActionType.CreateLocalFolder:
@@ -3329,7 +3329,7 @@ function isFileMoveCarriedByFolderMove(
   });
 }
 
-function projectFolderIdentitiesForMove(
+export function projectFolderIdentitiesForMove(
   state: CanonicalPlannerStateV2,
   sourceRoot: string,
   targetRoot: string,

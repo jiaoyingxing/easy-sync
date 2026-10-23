@@ -6,6 +6,7 @@ import {
   type IDBPDatabase,
 } from "idb";
 import { sha256Hex } from "../crypto";
+import { throwIfAborted } from "../onedrive/download-stream-guards";
 import { isIndexedDbVaultInstanceId } from "./indexeddb-vault-namespace";
 import {
   createCanonicalPlannerStateV2,
@@ -243,7 +244,7 @@ implements Public113IndexedDbCandidateStore {
       startTx.objectStore("meta").put(importingMeta, STATE_META_KEY),
       startTx.done,
     ]);
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, "IndexedDB candidate staging aborted");
 
     let batches = 0;
     batches += await putBatches(
@@ -284,7 +285,7 @@ implements Public113IndexedDbCandidateStore {
         "Public 1.1.3 IndexedDB candidate digest does not match its source",
       );
     }
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, "IndexedDB candidate staging aborted");
 
     const activationTx = db.transaction("meta", "readwrite", {
       durability: "strict",
@@ -638,7 +639,7 @@ async function putBatches<
 ): Promise<number> {
   let batches = 0;
   for (let offset = 0; offset < values.length; offset += batchSize) {
-    throwIfAborted(signal);
+    throwIfAborted(signal, "IndexedDB candidate staging aborted");
     const tx = db.transaction(storeName, "readwrite", {
       durability: "strict",
     });
@@ -648,7 +649,7 @@ async function putBatches<
     await Promise.all([...requests, tx.done]);
     batches += 1;
   }
-  throwIfAborted(signal);
+  throwIfAborted(signal, "IndexedDB candidate staging aborted");
   return batches;
 }
 
@@ -682,11 +683,6 @@ function assertSha256Hex(value: string, label: string): void {
   if (!SHA256_HEX_PATTERN.test(value)) {
     throw new Error(`${label} must be a lowercase SHA-256 hex digest`);
   }
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-  if (!signal?.aborted) return;
-  throw new DOMException("IndexedDB candidate staging aborted", "AbortError");
 }
 
 function sortJsonValue(value: unknown): unknown {

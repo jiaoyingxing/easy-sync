@@ -74,6 +74,7 @@ export class EasySyncNoticeCenter {
   private expiryTimer: TimeoutHandle | null = null;
   private resumable: EasySyncNoticeRequest | null = null;
   private notificationPopups: EasySyncNotificationPopupsLevel;
+  private disposed = false;
 
   constructor(
     private readonly factory: EasySyncNoticeFactory = (message, durationMs) =>
@@ -104,6 +105,7 @@ export class EasySyncNoticeCenter {
   }
 
   show(request: EasySyncNoticeRequest): boolean {
+    if (this.disposed) return false;
     // Filter ambient requests before any slot or resumable state is touched:
     // a rejected request never occupies the slot and never restores.
     if (!this.isAmbientAllowed(request)) return false;
@@ -134,6 +136,7 @@ export class EasySyncNoticeCenter {
   }
 
   dispose(): void {
+    this.disposed = true;
     this.resumable = null;
     this.hideActive();
   }

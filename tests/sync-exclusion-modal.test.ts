@@ -1,18 +1,20 @@
 import { describe, expect, it, vi } from "vitest";
 import { beforeEach } from "vitest";
 import { readFileSync } from "node:fs";
-import { DropdownComponent, TextComponent } from "./__mocks__/obsidian";
+import { DropdownComponent, FuzzySuggestModal, TextComponent, TFile, TFolder } from "./__mocks__/obsidian";
 import { I18n } from "../src/i18n";
 import { DEFAULT_MAX_FILE_SIZE_MB, normalizeMaxFileSizeMb } from "../src/sync/types";
 import type EasySyncPlugin from "../src/main";
 import { functionBody } from "./helpers/source-scope";
 import {
   buildSyncExclusionFolderCandidates,
+  openSyncExclusionFolderPicker,
   parseMaxFileSizeInput,
   resolveMaxFileSizeSelection,
   SyncExclusionEditSession,
   SyncExclusionModal,
 } from "../src/ui/sync-exclusion-modal";
+import type { SyncExclusionFolderCandidate } from "../src/ui/sync-exclusion-modal";
 
 describe("sync exclusion folder candidates", () => {
   it("merges local and cloud folders without exposing duplicates or invalid paths", () => {
@@ -59,6 +61,66 @@ describe("sync exclusion folder candidates", () => {
       ["parent"],
       ".obsidian",
     )).toEqual([]);
+  });
+});
+
+describe("sync exclusion folder picker entry", () => {
+  interface CapturedPicker {
+    getItems(): SyncExclusionFolderCandidate[];
+    onChooseItem(item: SyncExclusionFolderCandidate): void;
+  }
+
+  it("opens the picker with merged candidates and forwards the chosen object", () => {
+    let captured: CapturedPicker | undefined;
+    const openSpy = vi
+      .spyOn(FuzzySuggestModal.prototype, "open")
+      .mockImplementation(function (this: unknown) {
+        captured = this as CapturedPicker;
+      });
+    try {
+      const plugin = {
+        app: {
+          vault: {
+            configDir: ".obsidian",
+            getAllLoadedFiles: () => [
+              new TFolder("Local"),
+              new TFolder("Shared"),
+              new TFolder(".obsidian"),
+              new TFile("Note.md"),
+              new TFolder("Cloud"),
+            ],
+          },
+        },
+        excludedFolders: ["Cloud"],
+        i18n: new I18n("zh-cn"),
+      } as unknown as EasySyncPlugin;
+
+      const onChoose = vi.fn();
+      openSyncExclusionFolderPicker(
+        plugin,
+        ["Cloud/Nested", "shared", "Remote\\Nested", "/"],
+        onChoose,
+      );
+
+      expect(openSpy).toHaveBeenCalledTimes(1);
+      if (!captured) throw new Error("folder picker was not opened");
+      const picker: CapturedPicker = captured;
+
+      // Local TFolder paths + cloud paths, minus the config dir, the excluded
+      // Cloud subtree, duplicates (shared/Shared) and invalid roots; sorted.
+      const items = picker.getItems();
+      expect(items).toEqual([
+        { path: "Local" },
+        { path: "Remote/Nested" },
+        { path: "Shared" },
+      ]);
+
+      picker.onChooseItem(items[1]!);
+      expect(onChoose).toHaveBeenCalledTimes(1);
+      expect(onChoose).toHaveBeenCalledWith(items[1]);
+    } finally {
+      openSpy.mockRestore();
+    }
   });
 });
 

@@ -190,6 +190,24 @@ describe("rs migration completion notice wiring", () => {
     const noticeAnchor = source.indexOf('key: "rs-migration-completed"');
     expect(cleanupAnchor).toBeGreaterThan(-1);
     expect(noticeAnchor).toBeGreaterThan(cleanupAnchor);
+    // The delayed notice carries a tracked timer handle, and unload clears it
+    // so a queued reminder cannot surface after the plugin is gone.
+    expect(source).toContain(
+      "private rsMigrationCompletionNoticeTimer: TimeoutHandle | null = null;",
+    );
+    expect(source).toContain(
+      "this.rsMigrationCompletionNoticeTimer = compatSetTimeout",
+    );
+    const unloadStart = source.indexOf("onunload(): void {");
+    const unloadEnd = source.indexOf(
+      "Vault lifecycle listeners attach only once",
+      unloadStart,
+    );
+    expect(unloadStart).toBeGreaterThan(-1);
+    expect(unloadEnd).toBeGreaterThan(unloadStart);
+    expect(source.slice(unloadStart, unloadEnd)).toContain(
+      "compatClearTimeout(this.rsMigrationCompletionNoticeTimer)",
+    );
   });
 });
 
@@ -202,7 +220,7 @@ describe("rs migration no-OneDrive notice copy", () => {
       "这个微软账号的 OneDrive 现在打不开。请先用同一账号打开 OneDrive 网页版登录一次；还是不行就换账号，工作/学校账号请联系管理员。笔记没有改动。",
     );
     expect(en.t("rsMigration.noOneDriveNotice")).toBe(
-      "This Microsoft account's OneDrive can't be opened right now. First sign in to OneDrive on the web with the same account; if that doesn't help, use another account, or contact your admin if this is a work/school account. Your notes are unchanged.",
+      "This Microsoft account’s OneDrive can’t be opened right now. First sign in to OneDrive on the web with the same account; if that doesn’t help, use another account, or contact your admin if this is a work/school account. Your notes are unchanged.",
     );
     // A 404 does not prove why the drive is unavailable. The copy must not
     // turn the observation into a diagnosis, and must not promise that the

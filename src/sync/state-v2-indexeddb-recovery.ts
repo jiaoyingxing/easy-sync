@@ -8,6 +8,7 @@
  */
 
 import { compareText } from "./compare-text";
+import { describeError, isRecord } from "../obsidian-compat";
 import type { DataAdapter } from "obsidian";
 import { sha256Hex } from "../crypto";
 import type { RemoteNodeV2 } from "./remote-index-v2";
@@ -929,7 +930,7 @@ type VerifiedRecoveryRecord =
  * cannot drift.
  */
 export function isIndexedDbRollbackFormRecoveryError(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
+  const message = describeError(error);
   return (
     message === "IndexedDB recovery future delta contains a gap or branch"
     || message
@@ -1194,9 +1195,6 @@ function formatSeq(value: number): string {
   return String(value).padStart(12, "0");
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
 
 function isPositiveSafeInteger(value: unknown): boolean {
   return Number.isSafeInteger(value) && Number(value) >= 1;

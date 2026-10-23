@@ -58,6 +58,7 @@ function makeRoundInput(
 ): SyncIdleObservationInput {
   return {
     scope: { ...TEST_SYNC_SCOPE },
+    contentFactCommitSeq: 7,
     stateCommitSeq: 7,
     pendingConflicts: [],
     pendingRemoteDeletes: [],
@@ -456,11 +457,28 @@ describe("S4 per-item termination tracker", () => {
       [item(pendingIssueTerminationKey(issue), issue.path, "non-retryable")],
     );
     tracker.observe(round({}));
-    // A different scope or a moved committed baseline is new evidence.
-    tracker.observe(round({ stateCommitSeq: 8 }));
+    // A different scope or a moved content-fact baseline is new evidence.
+    tracker.observe(round({ contentFactCommitSeq: 8 }));
     expect(tracker.snapshot()).toEqual([]);
     tracker.observe(round({ scope: { ...TEST_SYNC_SCOPE, driveId: "other" } }));
     expect(tracker.snapshot()).toEqual([]);
+  });
+
+  it("does not reset the streak when only the raw commit sequence advances", () => {
+    const tracker = new SyncItemTerminationTracker();
+    const issue = contentIssue({
+      issueCode: "target-occupied",
+      reason: "reason.targetOccupied",
+    });
+    const round = (overrides: Partial<SyncIdleObservationInput> = {}) =>
+      withItems(
+        makeRoundInput({ pendingIssues: [issue], ...overrides }),
+        [item(pendingIssueTerminationKey(issue), issue.path, "user-decision")],
+      );
+    tracker.observe(round());
+    const concluded = tracker.observe(round({ stateCommitSeq: 8 }));
+    expect(concluded).toHaveLength(1);
+    expect(concluded[0].outcome).toBe("user-decision");
   });
 
   it("concludes a recovery record only when the round itself did not declare an external wait", () => {
@@ -725,7 +743,13 @@ describe("S4 termination criterion (executor wiring)", () => {
     expect(presentationFor().nextStep)
       .toBe("syncView.recovery.nextStep.blocked");
 
-    // Round 2: identical facts ⇒ the single ending, not a third re-check.
+    // Round 2: the first round's remote-state commit is itself a content-fact
+    // change (the fixture starts with an empty remote index), so the baseline
+    // settles here before two identical observations can accumulate.
+    await executor.run("manual", {});
+    expect(verdictKeys()).toEqual([]);
+
+    // Round 3: identical facts ⇒ the single ending, not a third re-check.
     const second: SyncResult = await executor.run("manual", {});
     expect(second.mutationRecovery).toMatchObject({
       state: "blocked",
@@ -746,7 +770,7 @@ describe("S4 termination criterion (executor wiring)", () => {
     expect(presentationFor().nextStep)
       .not.toContain("syncView.recovery.nextStep.blocked");
 
-    // Round 3: the ending is stable and stated once — no new announcement.
+    // Round 4: the ending is stable and stated once — no new announcement.
     await executor.run("manual", {});
     const announcements = calls.filter((call) =>
       call[1] === "sync item termination concluded");

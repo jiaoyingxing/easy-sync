@@ -153,66 +153,6 @@ interface ReviewedStateV2MigrationInput {
 }
 
 /**
- * Read-only V1→V2 migration. It consumes already completed local/remote scans,
- * never calls a file or Graph mutation API, and cuts the V2 manifest only after
- * the envelope is committed and readable.
- */
-export async function migrateV1ToV2(
-  adapter: DataAdapter,
-  paths: StateV2MigrationPaths,
-  input: StateV2MigrationInput,
-): Promise<StateV2MigrationResult> {
-  const baseResult = {
-    pending: [] as StateV2MigrationPending[],
-    mutations: [] as [],
-    v1BackupRetained: true as const,
-  };
-
-  const prepared = buildStateV2MigrationCandidate({
-    ...input,
-    // Publication is permitted only after an external exact zero-plan gate.
-    // Never let a caller turn changed live facts into committed base state.
-    allowChangedAnchors: false,
-  });
-  if (prepared.status === "aborted" || !prepared.envelope) {
-    return {
-      ...baseResult,
-      pending: prepared.pending,
-      status: "aborted",
-      reason: prepared.reason,
-      envelope: null,
-      manifest: null,
-    };
-  }
-  // The in-place manifest now selects V2 even when a rename was refused
-  // (F31 write-channel substitution), so this caller only accepts a
-  // committed manifest whose envelope equals the candidate built from the
-  // current input — a stale committed envelope must never activate.
-  let existing: StateV2MigrationResult | null = null;
-  try {
-    existing = await readExistingMigration(
-      adapter,
-      paths,
-      input.scope,
-      baseResult,
-      prepared.envelope,
-    );
-  } catch {
-    existing = null;
-  }
-  if (existing) return existing;
-  baseResult.pending.push(...prepared.pending);
-  return publishMigrationCandidate(
-    adapter,
-    paths,
-    prepared.envelope,
-    input.v1Snapshot,
-    input.now ?? Date.now(),
-    baseResult,
-  );
-}
-
-/**
  * Commit the exact candidate bound to a durable reviewed migration hold.
  *
  * The caller must re-create and compare both the candidate and sealed plan

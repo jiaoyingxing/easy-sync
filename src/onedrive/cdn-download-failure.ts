@@ -92,26 +92,28 @@ export function cdnHostOfDownloadUrl(url: string): string | null {
   }
 }
 
-interface CdnDownloadFailureFingerprint {
+type CdnDownloadFailureFingerprint = {
   stage: CdnDownloadFailureStage;
   /** Generic pre-signed host example: my.microsoftpersonalcontent.com — no
    *  URL, query, token or account identifier. */
   host: string | null;
   elapsedMs: number;
-}
+  /** Diagnostic slot name the caller reads (e.g. which control object). */
+  component?: string;
+};
 
-/** Structured fingerprint for a slot content read failure; null only when
- *  there is no error object. The staging is evidence-class, not a verdict:
- *  "unknown" means no recognizable signal was present. */
+/** Structured fingerprint for a slot content read failure. The staging is
+ *  evidence-class, not a verdict: "none" means no recognizable signal was
+ *  present. This is the single composition point for the fingerprint; call
+ *  sites must not re-assemble stage/host by hand. */
 export function fingerprintCdnDownloadFailure(
   error: unknown,
-  context: { elapsedMs: number; url: string },
-): CdnDownloadFailureFingerprint | null {
-  const stage = classifyCdnDownloadFailure(error);
-  if (stage === "none") return null;
+  context: { elapsedMs: number; url: string; component?: string },
+): CdnDownloadFailureFingerprint {
   return {
-    stage,
+    stage: classifyCdnDownloadFailure(error),
     host: cdnHostOfDownloadUrl(context.url),
     elapsedMs: context.elapsedMs,
+    ...(context.component === undefined ? {} : { component: context.component }),
   };
 }

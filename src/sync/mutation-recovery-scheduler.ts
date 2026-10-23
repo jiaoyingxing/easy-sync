@@ -57,10 +57,6 @@ export class MutationRecoveryScheduler {
     return this.timer !== null || this.running;
   }
 
-  get observationCount(): number {
-    return this.automaticObservations;
-  }
-
   get budgetExhausted(): boolean {
     return this.exhausted;
   }

@@ -280,6 +280,13 @@ export class Plugin {
 
   registerEvent(_eventRef: unknown): void {}
 
+  registerDomEvent(
+    _el: unknown,
+    _type: string,
+    _callback: unknown,
+    _options?: unknown,
+  ): void {}
+
   registerObsidianProtocolHandler(_action: string, _handler: (params: unknown) => void): void {}
 }
 

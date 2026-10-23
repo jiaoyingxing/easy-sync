@@ -96,10 +96,14 @@ describe("community plugin local reconciliation", () => {
 
   it("auto-participates complete local installs only when there is no prior opt-out", () => {
     const participation = reduceDeviceCommunityPluginParticipation(
-      reduceDeviceCommunityPluginParticipation(
-        createEmptyDeviceCommunityPluginParticipation(true),
-        { type: "mark-never-participated", pluginId: "calendar" },
-      ),
+      {
+        schemaVersion: 1,
+        kind: "device-community-plugin-participation",
+        scopeEnabled: true,
+        pluginsById: {
+          calendar: { pluginId: "calendar", phase: "never-participated" },
+        },
+      },
       { type: "confirm-excluded", pluginId: "dataview" },
     );
 

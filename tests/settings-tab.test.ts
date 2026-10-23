@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
 import { ConfigSyncModal, isPluginRowHiddenByCloudCleanup } from "../src/ui/config-sync-modal";
 import { SyncPlanAlertModal } from "../src/ui/confirm-modal";
 import { ButtonComponent, Setting, createMockElement } from "./__mocks__/obsidian";
@@ -8,7 +7,7 @@ import { I18n } from "../src/i18n";
 import en from "../src/i18n/en";
 import zhCN from "../src/i18n/zh-cn";
 import type EasySyncPlugin from "../src/main";
-import { functionBody } from "./helpers/source-scope";
+import { functionBody, readSourceFile } from "./helpers/source-scope";
 
 describe("settings tab", () => {
   it("opens the sync panel from the imperative account row", async () => {
@@ -50,7 +49,7 @@ describe("settings tab", () => {
   });
 
   it("keeps the settings page a navigation entry, not a second sync workbench", () => {
-    const source = readFileSync("src/ui/settings-tab.ts", "utf8");
+    const source = readSourceFile("src/ui/settings-tab.ts");
     const accountSection = source.slice(
       source.indexOf("  private renderAccountSection("),
       source.indexOf("  private renderRangeSection("),
@@ -79,7 +78,7 @@ describe("settings tab", () => {
   });
 
   it("keeps notification pop-ups progressive disclosure on both render paths", () => {
-    const source = readFileSync("src/ui/settings-tab.ts", "utf8");
+    const source = readSourceFile("src/ui/settings-tab.ts");
     const displaySectionStart = source.indexOf("  private renderDisplaySection(");
     const aboutSectionStart = source.indexOf("  private renderAboutSection(");
     const displaySection = source.slice(displaySectionStart, aboutSectionStart);
@@ -97,7 +96,7 @@ describe("settings tab", () => {
 
     // Declarative path mirrors the same hint wiring for Obsidian 1.13+；1.13+ 起
     // 通知行实现住在设置页行模块（2026-10-12 重构）。
-    const declarative = readFileSync("src/ui/settings-page-rows.ts", "utf8");
+    const declarative = readSourceFile("src/ui/settings-page-rows.ts");
     expect(declarative).toContain('"easy-sync-notification-popups-hint"');
     expect(declarative).toContain(
       't(`settings.notificationPopups.hint.${plugin.notificationPopups}`)',
@@ -105,7 +104,7 @@ describe("settings tab", () => {
   });
 
   it("keeps tooltip and aria-label on the automatic-handling entry of the legacy path (C10-2)", () => {
-    const source = readFileSync("src/ui/settings-tab.ts", "utf8");
+    const source = readSourceFile("src/ui/settings-tab.ts");
     const sectionStart = source.indexOf("  private renderAutomaticSection(");
     const sectionEnd = source.indexOf("  private renderDisplaySection(");
     const section = source.slice(sectionStart, sectionEnd);
@@ -124,8 +123,8 @@ describe("settings tab", () => {
   });
 
   it("keeps account actions unheaded and separates range from automatic settings", () => {
-    const source = readFileSync("src/ui/settings-tab.ts", "utf8");
-    const autoSyncModalSource = readFileSync("src/ui/auto-sync-modal.ts", "utf8");
+    const source = readSourceFile("src/ui/settings-tab.ts");
+    const autoSyncModalSource = readSourceFile("src/ui/auto-sync-modal.ts");
     const displayStart = source.indexOf("  display(): void {");
     const refreshStart = source.indexOf("  refreshAuthState(): void {", displayStart);
     const displaySource = source.slice(displayStart, refreshStart);
@@ -216,7 +215,7 @@ describe("settings tab", () => {
     expect(en["settings.syncInterval.name"]).toBe("Scheduled sync");
     // "min" keeps the 1-minute stop grammatical in English ("every 1 min").
     expect(en["settings.syncInterval.desc"]).toBe(
-      "Sync once every {minutes} min.",
+      "Syncs once every {minutes} min.",
     );
     expect(en["settings.autoSyncChangeDelay.name"]).toBe("Sync after changes");
     expect(en["settings.autoSyncChangeDelay.disabledDesc"]).toBe(
@@ -242,7 +241,7 @@ describe("settings tab", () => {
     // element selector covers both render paths (1.13+ declarative render
     // emits bare <button> without the .button class); the desktop guard and
     // the clickable-icon exclusion are part of the contract.
-    const styles = readFileSync("styles.css", "utf8");
+    const styles = readSourceFile("styles.css");
     const rule = styles.match(
       /body:not\(\.is-mobile\) \.easy-sync-settings-tab \.setting-item-control button:not\(\.clickable-icon\)\s*\{([^}]*)\}/,
     )?.[1] ?? "";
@@ -257,8 +256,8 @@ describe("settings tab", () => {
   });
 
   it("uses a native folder picker and native settings for device-local exclusions", () => {
-    const source = readFileSync("src/ui/sync-exclusion-modal.ts", "utf8");
-    const settingsSource = readFileSync("src/ui/settings-tab.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-exclusion-modal.ts");
+    const settingsSource = readSourceFile("src/ui/settings-tab.ts");
     // 收窄：这两条句子在各自目标文件里都出现多次（定义处／导入处／别的方法），
     // 文件级断言删掉真正那一处也照样绿。
     const pickerItems = functionBody(source, "getItems(): SyncExclusionFolderCandidate[]");
@@ -290,8 +289,8 @@ describe("settings tab", () => {
     expect(rangeSection).toContain("updateExcludedFoldersFromUi");
   });
   it("mirrors the official hotkey chip geometry without depending on internal host classes", () => {
-    const source = readFileSync("src/ui/sync-exclusion-modal.ts", "utf8");
-    const styles = readFileSync("styles.css", "utf8");
+    const source = readSourceFile("src/ui/sync-exclusion-modal.ts");
+    const styles = readSourceFile("styles.css");
     const chipBlock = styles.match(
       /\.easy-sync-exclusion-chip\s*\{([^}]*)\}/,
     )?.[1] ?? "";
@@ -326,9 +325,9 @@ describe("settings tab", () => {
   });
 
   it("keeps long settings modals within the viewport with one scroll surface", () => {
-    const configSource = readFileSync("src/ui/config-sync-modal.ts", "utf8");
-    const exclusionSource = readFileSync("src/ui/sync-exclusion-modal.ts", "utf8");
-    const styles = readFileSync("styles.css", "utf8");
+    const configSource = readSourceFile("src/ui/config-sync-modal.ts");
+    const exclusionSource = readSourceFile("src/ui/sync-exclusion-modal.ts");
+    const styles = readSourceFile("styles.css");
     const modalBlock = styles.match(/\.easy-sync-settings-modal\s*\{([^}]*)\}/)?.[1] ?? "";
     const contentBlock = styles.match(
       /\.easy-sync-settings-modal \.modal-content\s*\{([^}]*)\}/,
@@ -343,7 +342,7 @@ describe("settings tab", () => {
   });
 
   it("routes existing config toggles through the same sync-path transaction", () => {
-    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    const source = readSourceFile("src/ui/config-sync-modal.ts");
 
     expect(source).toContain("updateSyncPathSettings");
     expect(source).not.toContain("saveSyncSettings");
@@ -351,8 +350,8 @@ describe("settings tab", () => {
   });
 
   it("renders community plugin scope as native outer switches with always-available management", () => {
-    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
-    const styles = readFileSync("styles.css", "utf8");
+    const source = readSourceFile("src/ui/config-sync-modal.ts");
+    const styles = readSourceFile("styles.css");
     // 收窄：下面这些句子在同一文件里多处出现（导入、接口成员、别的方法），
     // 各自绑到真正负责它的那个函数体上。
     const renderScope = functionBody(source, "private renderScope(): void");
@@ -427,7 +426,7 @@ describe("settings tab", () => {
     // ② chip 挂点必须在最后一次 setName 之后——setName 会重写 nameEl 内容，
     //    先挂上去的 chip 会被冲掉（真机 1.13：同步 chip 消失、实验性 chip
     //    因创建在后而幸存）。
-    const source = readFileSync("src/ui/settings-page-rows.ts", "utf8");
+    const source = readSourceFile("src/ui/settings-page-rows.ts");
     const fnStart = source.indexOf("export function applyCommunityPluginScopeRow(");
     const fnEnd = source.indexOf("/** 不同步的文件夹行", fnStart);
     const fn = source.slice(fnStart, fnEnd === -1 ? undefined : fnEnd);
@@ -580,7 +579,7 @@ describe("settings tab", () => {
   });
 
   it("routes every plugin-data row enable through the experimental confirmation gate", () => {
-    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    const source = readSourceFile("src/ui/config-sync-modal.ts");
 
     expect(source).toContain('if (column === "data" && enabled)');
     expect(source).toContain(
@@ -630,8 +629,8 @@ describe("settings tab", () => {
   });
 
   it("uses flat, immediate-save community plugin child modals", () => {
-    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
-    const styles = readFileSync("styles.css", "utf8");
+    const source = readSourceFile("src/ui/config-sync-modal.ts");
+    const styles = readSourceFile("styles.css");
 
     expect(source.match(/extends EasySyncModal/g)).toHaveLength(1);
     expect(source).not.toContain("extends Modal");
@@ -679,7 +678,7 @@ describe("settings tab", () => {
   });
 
   it("renders actionable participation phases from the unified files read model", () => {
-    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    const source = readSourceFile("src/ui/config-sync-modal.ts");
     // 收窄：这两个字段名在同一文件里各有 5–7 处，且分属两个读取函数
     // （逐行描述 / 整段指引）——两处都钉住，文件级断言才不会漏掉其中一处。
     const itemBody = functionBody(source, "private describeInventoryItem(");
@@ -737,7 +736,7 @@ describe("settings tab", () => {
     expect(zhCN["settings.communityPlugins.status.restoreTargetChanged"])
       .toBe("云端插件已变化");
     expect(en["settings.communityPlugins.status.restoreTargetChanged"])
-      .toBe("Remote plugin changed");
+      .toBe("Cloud plugin changed");
     expect(zhCN["settings.communityPlugins.status.restoreScopeChanged"])
       .toBe("同步位置已变化");
     expect(en["settings.communityPlugins.status.restoreScopeChanged"])
@@ -749,7 +748,7 @@ describe("settings tab", () => {
     expect(zhCN["settings.communityPlugins.status.remoteCatalogStale"])
       .toBe("云端状态待重新确认");
     expect(en["settings.communityPlugins.status.remoteCatalogStale"])
-      .toBe("Remote status needs to be checked again");
+      .toBe("Cloud status needs to be checked again");
     expect(itemBody).toContain("item.participationBlockedReason");
     expect(guidanceBody).toContain("item.participationBlockedReason");
     expect(describe("manifest-incompatible", true)).toBe(
@@ -857,7 +856,7 @@ describe("settings tab", () => {
   });
 
   it("seeds the cleaned-plugin set from persisted markers when the modal opens", () => {
-    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    const source = readSourceFile("src/ui/config-sync-modal.ts");
     expect(source.indexOf("getCommunityPluginCloudCleanupMarkers()"))
       .toBeGreaterThan(-1);
     expect(source.indexOf("getCommunityPluginCloudCleanupMarkers()"))
@@ -877,7 +876,7 @@ describe("settings tab", () => {
   });
 
   it("refreshes the range-independent remote catalog only when the plugin manager opens", () => {
-    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    const source = readSourceFile("src/ui/config-sync-modal.ts");
     // 收窄：刷新调用只该出现在那个"只跑一次"的刷新函数体里；先后关系是
     // 位置事实（定义顺序），按整文件判读。
     const refreshOnce = functionBody(source, "private refreshRemoteCatalogOnce(): void");
@@ -1134,8 +1133,8 @@ describe("settings tab", () => {
   });
 
   it("keeps the community plugin manager header compact and native", () => {
-    const source = readFileSync("src/ui/config-sync-modal.ts", "utf8");
-    const styles = readFileSync("styles.css", "utf8");
+    const source = readSourceFile("src/ui/config-sync-modal.ts");
+    const styles = readSourceFile("styles.css");
 
     expect(source).toContain("new SearchComponent(this.contentEl)");
     expect(source).toContain(
@@ -1181,7 +1180,7 @@ describe("settings tab", () => {
     expect(zhCN["settings.syncBookmarks.desc"]).toBe(
       "同步 Obsidian 书签列表（bookmarks.json）。",
     );
-    const configSource = readFileSync("src/ui/config-sync-modal.ts", "utf8");
+    const configSource = readSourceFile("src/ui/config-sync-modal.ts");
     // The self-sync switch is retired: EasySync's own bundle is always in
     // scope, so no toggle may re-introduce a user-controlled opt-in.
     expect(configSource).not.toContain('"settings.syncPluginFiles"');
@@ -1327,7 +1326,7 @@ describe("settings tab", () => {
     );
     expect(en["syncView.selfBundleReview.title"]).toBe("EasySync");
     expect(en["syncView.selfBundleReview.conflictSummary"]).toBe(
-      "This plugin and the cloud hold conflicting versions. Which copy do you want to keep?",
+      "This plugin’s local copy and its cloud version conflict. Which do you want to keep?",
     );
     // 弹框顶部说明在手机上会被宿主的内容列向 flex 挤成 0 高（行数最多的同步范围
     // 弹框首当其冲）：四个弹框都用同一类保住自己的盒子，样式里有对应规则。
@@ -1337,11 +1336,11 @@ describe("settings tab", () => {
       "src/ui/automatic-handling-modal.ts",
       "src/ui/auto-sync-modal.ts",
     ]) {
-      expect(readFileSync(modalSource, "utf8")).toContain(
+      expect(readSourceFile(modalSource)).toContain(
         "setting-item-description easy-sync-modal-intro",
       );
     }
-    expect(readFileSync("styles.css", "utf8")).toMatch(
+    expect(readSourceFile("styles.css")).toMatch(
       /\.easy-sync-modal-intro\s*\{[^}]*flex:\s*0 0 auto/s,
     );
     expect(en["settings.syncScope.name"]).toBe("Sync scope");
@@ -1360,9 +1359,9 @@ describe("settings tab", () => {
   });
 
   it("keeps the plan alert single-purpose after the login notice is removed", () => {
-    const mainSource = readFileSync("src/main.ts", "utf8");
-    const entrySource = readFileSync("src/ui/auth-entry-flow.ts", "utf8");
-    const alertSource = readFileSync("src/ui/confirm-modal.ts", "utf8");
+    const mainSource = readSourceFile("src/main.ts");
+    const entrySource = readSourceFile("src/ui/auth-entry-flow.ts");
+    const alertSource = readSourceFile("src/ui/confirm-modal.ts");
 
     // The login-gate notice ("登录前须知") and the method-chooser lead line
     // were removed entirely in 2026-08-28 (full content archived in the dev
@@ -1458,7 +1457,7 @@ describe("settings tab", () => {
   });
 
   it("renders both automatic handling choices as native toggles without triggering sync", () => {
-    const source = readFileSync("src/ui/automatic-handling-modal.ts", "utf8");
+    const source = readSourceFile("src/ui/automatic-handling-modal.ts");
     // 收窄：两个开关与它们的提交都接在 onOpen 里；文件级断言会被同文件别处
     // （类型声明、别的分支）的同名字段蒙过。
     const onOpen = functionBody(source, "onOpen(): void");
@@ -1520,7 +1519,7 @@ describe("settings tab", () => {
       "本机和云端修改同一份已同步文本、且修改内容互不重叠时，将两边修改合并并同步到两端；无法安全合并时留待手动处理。",
     );
     expect(en["settings.automaticHandling.autoDeleteLocalFiles.name"]).toBe(
-      "Apply remote deletions locally",
+      "Apply cloud deletions locally",
     );
     expect(en["settings.automaticHandling.autoDeleteLocalFiles.desc"]).toContain(
       "delete the corresponding local file",
@@ -1544,8 +1543,8 @@ describe("settings save call sites", () => {
     // 2026-10-12 重构后拆两处承接：命令式路径与模式行留在 settings-tab.ts，
     // 1.13+ 页面行（通知／滑条×2／启动后立即同步／自动处理×2／大文件排除／
     // 移动端状态图标）在 settings-page-rows.ts。
-    const tabSource = readFileSync("src/ui/settings-tab.ts", "utf8");
-    const rowsSource = readFileSync("src/ui/settings-page-rows.ts", "utf8");
+    const tabSource = readSourceFile("src/ui/settings-tab.ts");
+    const rowsSource = readSourceFile("src/ui/settings-page-rows.ts");
     const count = (text: string, needle: string) => text.split(needle).length - 1;
     expect(count(tabSource, "notice.settingsSaveFailed")).toBe(5);
     expect(count(rowsSource, "notice.settingsSaveFailed")).toBe(7);
@@ -1560,15 +1559,15 @@ describe("settings save call sites", () => {
   it("restores the acknowledged rules through reset, not through a new row (2026-10-12 用户裁决)", () => {
     // 恢复出口＝「重置同步状态」本身：重置时清空「已读」记忆，规则随之全部重现；
     // 不新增行、不新增文案（源码守卫；行为随重置链由真机/回归覆盖）。
-    const mainSource = readFileSync("src/main.ts", "utf8");
-    const tabSource = readFileSync("src/ui/settings-tab.ts", "utf8");
+    const mainSource = readSourceFile("src/main.ts");
+    const tabSource = readSourceFile("src/ui/settings-tab.ts");
     expect(mainSource).toContain("this.acknowledgedRules = [];");
     expect(mainSource).not.toContain("restoreAcknowledgedSettingRules");
     expect(tabSource).not.toContain("buildSettingRulesRestoreRow");
   });
 
   it("wraps the exclusion modal max-size persistence with rollback and a failure notice", () => {
-    const source = readFileSync("src/ui/sync-exclusion-modal.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-exclusion-modal.ts");
     const start = source.indexOf("private async persistMaxFileSizeMb(");
     const next = source.indexOf("private async", start + 10);
     const fn = source.slice(start, next === -1 ? undefined : next);

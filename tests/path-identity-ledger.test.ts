@@ -1,3 +1,5 @@
+import { readFileSync, readdirSync, statSync } from "node:fs";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { normalizeVaultPathKey } from "../src/obsidian-compat";
 import { identityPath as sharedIdentityPath } from "../src/sync/recovery-anchor-v2";
@@ -11,7 +13,9 @@ import {
  *
  * 本项目对「两个路径是不是同一个」有多份实现，本文件把**真实语义**钉成可执行
  * 对照表，让漂移不必靠读注释争论。三类语义：
- * - `identityPath` 系（`recovery-anchor-v2.ts:65` 导出，另有 4 份私有副本）＝
+ * - `identityPath` 系（`recovery-anchor-v2.ts:65` 唯一共享导出。原
+ *   `folder-state-reducer-v2.ts`／`folder-state-v2.ts`／`stale-identity-resolution.ts`
+ *   三份私有副本已于 2026-10-23 删除；文件末尾的源码守卫阻止新副本回流）＝
  *   NFC ＋ `toLocaleLowerCase("en-US")`（折大小写）——身份判等的主流语义；
  * - `nfcPath` 系＝只做 NFC，**区分大小写**；
  * - 逐字节＝不归一化。
@@ -24,6 +28,28 @@ const caseFoldedSame = (a: string, b: string) =>
   sharedIdentityPath(a) === sharedIdentityPath(b);
 const belowFolded = (path: string, root: string) =>
   normalizeVaultPathKey(path).startsWith(`${normalizeVaultPathKey(root)}/`);
+
+const SHARED_IDENTITY_PATH_FILE = "src/sync/recovery-anchor-v2.ts";
+/** A local function declaration or an equivalent const/let/var alias. */
+const IDENTITY_PATH_DECLARATION =
+  /^[ \t]*(?:export\s+)?(?:async\s+)?function\s+identityPath\s*[<(]|^[ \t]*(?:export\s+)?(?:const|let|var)\s+identityPath\s*(?::[^=\n]+)?=/m;
+
+function listSourceFiles(directory: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(directory)) {
+    const file = path.posix.join(directory, entry);
+    if (statSync(file).isDirectory()) files.push(...listSourceFiles(file));
+    else if (file.endsWith(".ts")) files.push(file);
+  }
+  return files;
+}
+
+/** Drop comments so a doc mention cannot trip the declaration guard. */
+function withoutComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/^[ \t]*\/\/.*$/gm, "");
+}
 
 describe("path identity ledger", () => {
   it("shared identityPath agrees with normalizeVaultPathKey on slash-only paths", () => {
@@ -75,12 +101,27 @@ describe("path identity ledger", () => {
     expect(translated).toBe(`${"Archive/Child"}${actual.slice(fromRoot.length)}`);
   });
 
-  it("isAnchoredDescendantV2 is case-sensitive while the reducer's own test is not", () => {
-    // 归约层判「在子树之下」折大小写（folder-state-reducer-v2.ts:1077），
-    // 后代投影判定却是 NFC-only（remote-index-v2.ts:120）⇒ 同一锚点两处结论相反。
+  it("isAnchoredDescendantV2 is case-sensitive while the shared path key folds case", () => {
+    // `normalizeVaultPathKey` 折大小写，`isAnchoredDescendantV2` 只做 NFC；
+    // `folder-state-reducer-v2.ts` 的 `isAtOrBelow` 当前也是 NFC-only——真正的
+    // 折叠/NFC 冲突在 `canonical-plan-v2.ts:831` 与 `:3353`，不在本测试的断言面内。
     const anchorPath = "Notes/Child/a.md";
     const sourceRoot = "notes";
     expect(belowFolded(anchorPath, sourceRoot)).toBe(true);
     expect(isAnchoredDescendantV2(anchorPath, sourceRoot)).toBe(false);
+  });
+
+  it("only the shared module declares a local identityPath", () => {
+    const offenders = listSourceFiles("src")
+      .filter((file) => file !== SHARED_IDENTITY_PATH_FILE)
+      .filter((file) =>
+        IDENTITY_PATH_DECLARATION.test(withoutComments(readFileSync(file, "utf8"))));
+    expect(offenders).toEqual([]);
+  });
+
+  it("source guard recognizes the declarations it must reject", () => {
+    expect(IDENTITY_PATH_DECLARATION.test("function identityPath(path: string) {")).toBe(true);
+    expect(IDENTITY_PATH_DECLARATION.test("const identityPath = (p: string) => p;")).toBe(true);
+    expect(IDENTITY_PATH_DECLARATION.test("identityPath(path);")).toBe(false);
   });
 });

@@ -15,6 +15,7 @@
 import {
   compatClearTimeout,
   compatSetTimeout,
+  describeError,
   TimeoutHandle,
 } from "../obsidian-compat";
 import { OneDriveError, OneDriveErrorType } from "./types";
@@ -247,8 +248,15 @@ export function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
 }
 
-export function throwIfAborted(signal: AbortSignal | null | undefined): void {
-  if (signal?.aborted) throw abortError();
+/** Throw when the signal is aborted. Without a message the caller gets the
+ *  default `abortError()`; passing a message selects the DOMException shape
+ *  used by the IndexedDB staging paths so their error text is preserved. */
+export function throwIfAborted(
+  signal: AbortSignal | null | undefined,
+  message?: string,
+): void {
+  if (!signal?.aborted) return;
+  throw message === undefined ? abortError() : new DOMException(message, "AbortError");
 }
 
 export function sleep(ms: number): Promise<void> {
@@ -273,6 +281,6 @@ export function sleepWithAbort(ms: number, signal: AbortSignal | null): Promise<
 }
 
 export function requestErrorMessage(rawError: unknown): string {
-  const message = rawError instanceof Error ? rawError.message : String(rawError);
+  const message = describeError(rawError);
   return message.replace(/https?:\/\/\S+/g, "[redacted-url]");
 }

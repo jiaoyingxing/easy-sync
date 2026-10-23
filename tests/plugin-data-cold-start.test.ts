@@ -16,6 +16,7 @@ import {
 import {
   createEmptyDeviceCommunityPluginParticipation,
   reduceDeviceCommunityPluginParticipation,
+  type DeviceCommunityPluginParticipationV1,
 } from "../src/sync/community-plugin-participation";
 import {
   buildRemoteCommunityPluginCatalog,
@@ -25,6 +26,7 @@ import {
 function makeCommunityPluginScopeSwitchHarness(
   checkpointError?: Error,
   pendingRetirementError?: Error,
+  scopeEnabled = false,
 ): {
   plugin: EasySyncPlugin;
   getParticipation: () => ReturnType<
@@ -39,7 +41,7 @@ function makeCommunityPluginScopeSwitchHarness(
   const commitOrder: string[] = [];
   let committedFingerprint = "";
   let participation = reduceDeviceCommunityPluginParticipation(
-    createEmptyDeviceCommunityPluginParticipation(false),
+    createEmptyDeviceCommunityPluginParticipation(scopeEnabled),
     { type: "confirm-participating", pluginId: "calendar" },
   );
   Object.defineProperty(plugin, "app", {
@@ -303,10 +305,14 @@ describe("plugin data cold-start cache", () => {
 
   it("reads and updates community-plugin file switches only through V2 participation", async () => {
     const plugin = new EasySyncPlugin();
-    let participation = reduceDeviceCommunityPluginParticipation(
-      createEmptyDeviceCommunityPluginParticipation(true),
-      { type: "mark-never-participated", pluginId: "calendar" },
-    );
+    let participation: DeviceCommunityPluginParticipationV1 = {
+      schemaVersion: 1,
+      kind: "device-community-plugin-participation",
+      scopeEnabled: true,
+      pluginsById: {
+        calendar: { pluginId: "calendar", phase: "never-participated" },
+      },
+    };
     const updateCommunityPluginParticipation = vi.fn(async (command) => {
       participation = reduceDeviceCommunityPluginParticipation(
         participation,
@@ -474,10 +480,14 @@ describe("plugin data cold-start cache", () => {
 
   it("queues a manager toggle behind an in-flight round instead of bouncing it busy", async () => {
     const plugin = new EasySyncPlugin();
-    let participation = reduceDeviceCommunityPluginParticipation(
-      createEmptyDeviceCommunityPluginParticipation(true),
-      { type: "mark-never-participated", pluginId: "calendar" },
-    );
+    let participation: DeviceCommunityPluginParticipationV1 = {
+      schemaVersion: 1,
+      kind: "device-community-plugin-participation",
+      scopeEnabled: true,
+      pluginsById: {
+        calendar: { pluginId: "calendar", phase: "never-participated" },
+      },
+    };
     const updateCommunityPluginParticipation = vi.fn(async (command) => {
       participation = reduceDeviceCommunityPluginParticipation(
         participation,
@@ -836,6 +846,89 @@ describe("plugin data cold-start cache", () => {
     expect(state.mutationLedger).toHaveLength(1);
     expect(retire).not.toHaveBeenCalled();
     expect(commitOrder).toEqual(["participation", "scope"]);
+  });
+
+  it("auto reconciliation exits an absent plugin and retires its intent-only code upload (F33)", async () => {
+    const { plugin, getParticipation, commitOrder } =
+      makeCommunityPluginScopeSwitchHarness(undefined, undefined, true);
+    const state = plugin.state as never as {
+      mutationLedger: Array<{ intent: { operationId: string } }>;
+    };
+    state.mutationLedger.push({
+      intent: { operationId: "resojot-main-upload" },
+    });
+    const inspect = vi.fn((
+      isPluginExcluded: (pluginId: string) => boolean,
+    ) => {
+      expect(isPluginExcluded("calendar")).toBe(true);
+      return [...state.mutationLedger];
+    });
+    const retire = vi.fn(async (
+      isPluginExcluded: (pluginId: string) => boolean,
+    ) => {
+      expect(isPluginExcluded("calendar")).toBe(true);
+      state.mutationLedger.splice(0);
+      commitOrder.push("recovery-exit");
+      return true;
+    });
+    Object.assign(plugin.syncExecutor as object, {
+      inspectSelectedPluginCodeUploadRecoveriesForScopeExit: inspect,
+      retireSelectedPluginCodeUploadRecoveriesForScopeExit: retire,
+    });
+    vi.spyOn(plugin as never, "observeCommunityPluginLocalBundleFacts")
+      .mockResolvedValue(new Map([["calendar", "absent"]]));
+
+    await (plugin as never as {
+      reconcileCommunityPluginParticipationFromLocalBundles(input: {
+        trigger: string;
+        pluginIds?: readonly string[];
+      }): Promise<unknown>;
+    }).reconcileCommunityPluginParticipationFromLocalBundles({
+      trigger: "test",
+      pluginIds: ["calendar"],
+    });
+
+    expect(retire).toHaveBeenCalledOnce();
+    expect(state.mutationLedger).toEqual([]);
+    expect(getParticipation().pluginsById.calendar?.phase).toBe("exit-requested");
+    expect(commitOrder).toEqual([
+      "participation",
+      "scope",
+      "recovery-exit",
+      "pending",
+    ]);
+  });
+
+  it("auto reconciliation keeps fail-closed when the ledger holds anything but the exit-owned code upload", async () => {
+    const { plugin, getParticipation, commitOrder } =
+      makeCommunityPluginScopeSwitchHarness(undefined, undefined, true);
+    const state = plugin.state as never as {
+      mutationLedger: Array<{ intent: { operationId: string } }>;
+    };
+    state.mutationLedger.push({
+      intent: { operationId: "note-upload" },
+    });
+    Object.assign(plugin.syncExecutor as object, {
+      inspectSelectedPluginCodeUploadRecoveriesForScopeExit:
+        vi.fn().mockReturnValue(null),
+      retireSelectedPluginCodeUploadRecoveriesForScopeExit: vi.fn(),
+    });
+    vi.spyOn(plugin as never, "observeCommunityPluginLocalBundleFacts")
+      .mockResolvedValue(new Map([["calendar", "absent"]]));
+
+    await expect((plugin as never as {
+      reconcileCommunityPluginParticipationFromLocalBundles(input: {
+        trigger: string;
+        pluginIds?: readonly string[];
+      }): Promise<unknown>;
+    }).reconcileCommunityPluginParticipationFromLocalBundles({
+      trigger: "test",
+      pluginIds: ["calendar"],
+    })).rejects.toMatchObject({ code: "recovery" });
+
+    expect(state.mutationLedger).toHaveLength(1);
+    expect(getParticipation().pluginsById.calendar?.phase).toBe("participating");
+    expect(commitOrder).toEqual([]);
   });
 
   it("resumes a durably excluded plugin scope before retiring old recovery evidence", async () => {

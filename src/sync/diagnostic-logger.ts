@@ -71,9 +71,9 @@ export class DiagnosticLogger {
   private externalRewriteReported = new Set<string>();
 
   /** Must be called after the Obsidian vault adapter is available. */
-  setAdapter(adapter: DataAdapter, configDir: string): void {
+  setAdapter(adapter: DataAdapter, configDir: string = DEFAULT_CONFIG_DIR): void {
     this.adapter = adapter;
-    this.logDir = `${configDir}/plugins/easy-sync/logs`;
+    this.logDir = getEasySyncPaths(configDir).logsDir;
   }
 
   /** Enable all categories. Called when the user turns on diagnostic logging. */

@@ -15,6 +15,21 @@ type Translate = (
   params?: Record<string, string | number>,
 ) => string;
 
+/**
+ * Decide whether the conflict detail may fetch the remote side on open.
+ *
+ * A known finite size above the text-diff budget cannot produce a line diff,
+ * so the download is deferred to the explicit "check content" action. A
+ * missing or non-finite size keeps the existing best-effort auto-download.
+ */
+export function shouldAutoLoadRemoteComparison(
+  remoteSize: number | null | undefined,
+  limit: number,
+): boolean {
+  if (remoteSize == null || !Number.isFinite(remoteSize)) return true;
+  return remoteSize <= limit;
+}
+
 export type ConflictDetailSummaryEvidence =
   | { kind: "comparison-unavailable" }
   | { kind: "reason" }

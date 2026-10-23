@@ -3,6 +3,8 @@
  * Subset focused on App Folder file operations for MVP.
  */
 
+import { describeError } from "../obsidian-compat";
+
 /** Identity set: user, application, or device that performed an action. */
 interface IdentitySet {
   user?: { id?: string; displayName?: string };
@@ -249,9 +251,7 @@ export class SharedSyncProtocolObservationError extends Error {
   ) {
     super(
       `Shared sync protocol ${component} observation failed: ${
-        observationCause instanceof Error
-          ? observationCause.message
-          : String(observationCause)
+        describeError(observationCause)
       }`,
     );
     this.name = "SharedSyncProtocolObservationError";
@@ -320,11 +320,6 @@ export function findOneDriveInvalidNameIssue(fileName: string): OneDriveInvalidN
   // eslint-disable-next-line no-control-regex -- the class intentionally spans ASCII control characters (U+0000-U+001F, U+007F), which OneDrive forbids in item names
   if (/[\u0000-\u001f\u007f]/.test(fileName)) return { kind: "control-char" };
   return null;
-}
-
-/** True when the file/directory *name* (not path) can never be stored on OneDrive. */
-export function hasOneDriveInvalidNameCharacters(fileName: string): boolean {
-  return findOneDriveInvalidNameIssue(fileName) !== null;
 }
 
 /** App Folder directory structure */

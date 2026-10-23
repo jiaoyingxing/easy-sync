@@ -6,6 +6,7 @@ import {
   type IDBPDatabase,
 } from "idb";
 import { sha256Hex } from "../crypto";
+import { throwIfAborted } from "../onedrive/download-stream-guards";
 import { isIndexedDbVaultInstanceId } from "./indexeddb-vault-namespace";
 import type { RemoteNodeV2 } from "./remote-index-v2";
 import {
@@ -168,7 +169,7 @@ export class StateV2IndexedDbActiveStore {
         "IndexedDB active-state batch size must be a positive integer",
       );
     }
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, "IndexedDB active-state preparation aborted");
 
     const stateDigest =
       await stateV2IndexedDbRecoveryEnvelopeDigest(envelope);
@@ -243,7 +244,7 @@ export class StateV2IndexedDbActiveStore {
       startTx.objectStore("meta").put(preparing, STATE_META_KEY),
       startTx.done,
     ]);
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, "IndexedDB active-state preparation aborted");
 
     let batches = 0;
     batches += await putBatches(
@@ -283,7 +284,7 @@ export class StateV2IndexedDbActiveStore {
         "IndexedDB active-state preparation did not rebuild the source envelope",
       );
     }
-    throwIfAborted(options.signal);
+    throwIfAborted(options.signal, "IndexedDB active-state preparation aborted");
 
     const activationTx = db.transaction("meta", "readwrite", {
       durability: "strict",
@@ -827,7 +828,7 @@ async function putBatches<
 ): Promise<number> {
   let batches = 0;
   for (let offset = 0; offset < values.length; offset += batchSize) {
-    throwIfAborted(signal);
+    throwIfAborted(signal, "IndexedDB active-state preparation aborted");
     const tx = db.transaction(storeName, "readwrite", {
       durability: "strict",
     });
@@ -837,7 +838,7 @@ async function putBatches<
     await Promise.all([...requests, tx.done]);
     batches += 1;
   }
-  throwIfAborted(signal);
+  throwIfAborted(signal, "IndexedDB active-state preparation aborted");
   return batches;
 }
 
@@ -892,12 +893,4 @@ function abortTransaction(transaction: { abort(): void }): void {
   } catch {
     // The transaction may already be committed or aborted.
   }
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-  if (!signal?.aborted) return;
-  throw new DOMException(
-    "IndexedDB active-state preparation aborted",
-    "AbortError",
-  );
 }

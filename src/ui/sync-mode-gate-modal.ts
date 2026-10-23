@@ -68,9 +68,7 @@ export function buildSyncModeGateView(input: {
   };
 }
 
-export class SyncModeGateModal extends EasySyncModal {
-  private resolve: ((value: boolean) => void) | null = null;
-
+export class SyncModeGateModal extends EasySyncModal<boolean> {
   constructor(
     app: App,
     private t: I18nFn,
@@ -81,17 +79,7 @@ export class SyncModeGateModal extends EasySyncModal {
   }
 
   awaitDecision(): Promise<boolean> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
-  }
-
-  private finish(value: boolean): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    this.close();
-    resolve?.(value);
+    return this.awaitResult();
   }
 
   onOpen(): void {
@@ -140,15 +128,13 @@ export class SyncModeGateModal extends EasySyncModal {
     confirmBtn.disabled = view.confirmDisabled;
     confirmBtn.addEventListener("click", () => {
       if (confirmBtn?.disabled !== false) return;
-      this.finish(true);
+      this.settle(true);
     });
     const cancelBtn = btnRow.createEl("button", { text: view.cancelLabel });
-    cancelBtn.addEventListener("click", () => this.finish(false));
+    cancelBtn.addEventListener("click", () => this.settle(false));
   }
 
   onClose(): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    resolve?.(false);
+    this.takePendingResolve()?.(false);
   }
 }

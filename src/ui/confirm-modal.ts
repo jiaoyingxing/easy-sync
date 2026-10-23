@@ -63,9 +63,7 @@ import { EasySyncModal } from "./easy-sync-modal";
 
 export type I18nFn = (key: string, params?: Record<string, string | number>) => string;
 
-export class ConfirmModal extends EasySyncModal {
-  private resolve: ((value: boolean) => void) | null = null;
-
+export class ConfirmModal extends EasySyncModal<boolean> {
   constructor(
     app: App,
     private title: string,
@@ -85,17 +83,7 @@ export class ConfirmModal extends EasySyncModal {
 
   /** Open the modal and return a promise that resolves to true (confirmed) or false (cancelled). */
   awaitConfirm(): Promise<boolean> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
-  }
-
-  private finish(value: boolean): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    this.close();
-    resolve?.(value);
+    return this.awaitResult();
   }
 
   onOpen(): void {
@@ -121,19 +109,17 @@ export class ConfirmModal extends EasySyncModal {
       cls: this.options?.danger ? "mod-warning" : "mod-cta",
     });
     confirmBtn.addEventListener("click", () => {
-      this.finish(true);
+      this.settle(true);
     });
 
     const cancelBtn = btnRow.createEl("button", { text: this.cancelLabel });
     cancelBtn.addEventListener("click", () => {
-      this.finish(false);
+      this.settle(false);
     });
   }
 
   onClose(): void {
     // If modal was closed without clicking a button, treat as cancel
-    const resolve = this.resolve;
-    this.resolve = null;
-    resolve?.(false);
+    this.takePendingResolve()?.(false);
   }
 }

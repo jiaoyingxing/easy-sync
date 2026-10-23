@@ -94,17 +94,17 @@ export function planIdentityRenamesFromStateV2(
   options: IdentityRenamePlanOptionsV2 = {},
 ): IdentityRenameActionV2[] {
   const pathByRemoteId = state.remotePathById;
-  const remoteIdByPath = new Map([...pathByRemoteId].map(([id, path]) => [normalizePath(path), id]));
-  const localByPath = new Map(localEntries.map((entry) => [normalizePath(entry.path), entry]));
+  const remoteIdByPath = new Map([...pathByRemoteId].map(([id, path]) => [normalizeIdentityPath(path), id]));
+  const localByPath = new Map(localEntries.map((entry) => [normalizeIdentityPath(entry.path), entry]));
   const occupiedAnchoredLocalPaths = new Set(
     state.fileAnchors
       .filter((anchor) => anchor.remoteId)
-      .map((anchor) => normalizePath(anchor.lastPath))
+      .map((anchor) => normalizeIdentityPath(anchor.lastPath))
       .filter((path) => localByPath.has(path)),
   );
   const unanchoredLocalByContent = new Map<string, LocalFileEntry[]>();
   for (const entry of localEntries) {
-    if (occupiedAnchoredLocalPaths.has(normalizePath(entry.path))) continue;
+    if (occupiedAnchoredLocalPaths.has(normalizeIdentityPath(entry.path))) continue;
     const key = localContentKey(entry.hash, entry.size);
     const matches = unanchoredLocalByContent.get(key) ?? [];
     matches.push(entry);
@@ -114,13 +114,13 @@ export function planIdentityRenamesFromStateV2(
   const pathByFolderId = new Map<string, string>();
   for (const [id, path] of pathByRemoteId) {
     if (state.remoteNodeById.get(id)?.kind === "folder") {
-      folderIdByPath.set(normalizePath(path), id);
+      folderIdByPath.set(normalizeIdentityPath(path), id);
       pathByFolderId.set(id, path);
     }
   }
   for (const projected of options.projectedFolderIdentities ?? []) {
     const node = state.remoteNodeById.get(projected.remoteId);
-    const key = normalizePath(projected.path);
+    const key = normalizeIdentityPath(projected.path);
     const occupiedId = folderIdByPath.get(key);
     if (node?.kind === "folder" && (!occupiedId || occupiedId === projected.remoteId)) {
       folderIdByPath.set(key, projected.remoteId);
@@ -178,7 +178,7 @@ function planIdentityRenameForAnchorV2(args: {
     if (!anchor.remoteId) return;
     const remote = state.remoteNodeById.get(anchor.remoteId);
     const remotePath = pathByRemoteId.get(anchor.remoteId);
-    const anchorPathKey = normalizePath(anchor.lastPath);
+    const anchorPathKey = normalizeIdentityPath(anchor.lastPath);
     const occupantId = remoteIdByPath.get(anchorPathKey);
     const occupant = occupantId
       ? state.remoteNodeById.get(occupantId)
@@ -265,7 +265,7 @@ function planIdentityRenameForAnchorV2(args: {
           "both-paths-diverged",
           remotePath,
         ));
-      } else if (localByPath.has(normalizePath(remotePath))) {
+      } else if (localByPath.has(normalizeIdentityPath(remotePath))) {
         actions.push(conflict(
           anchor,
           remotePath,
@@ -383,7 +383,7 @@ function planIdentityRenameForRelocatedLocalV2(args: {
     ));
     return;
   }
-  const occupiedId = remoteIdByPath.get(normalizePath(destination.path));
+  const occupiedId = remoteIdByPath.get(normalizeIdentityPath(destination.path));
   if (occupiedId && occupiedId !== remote.id) {
     actions.push(conflict(
       anchor,
@@ -397,7 +397,7 @@ function planIdentityRenameForRelocatedLocalV2(args: {
   const parentPath = slash === -1 ? "" : destination.path.slice(0, slash);
   const parentId = parentPath === ""
     ? state.remoteIndex.filesRootId
-    : folderIdByPath.get(normalizePath(parentPath));
+    : folderIdByPath.get(normalizeIdentityPath(parentPath));
   if (!parentId) {
     actions.push(conflict(
       anchor,
@@ -477,7 +477,9 @@ function conflict(
   };
 }
 
-function normalizePath(path: string): string {
+/** Rename-matching path key: NFC + en-US case folding (not separator
+ *  normalization). Semantically equivalent to the shared `identityPath`. */
+function normalizeIdentityPath(path: string): string {
   return path.normalize("NFC").toLocaleLowerCase("en-US");
 }
 

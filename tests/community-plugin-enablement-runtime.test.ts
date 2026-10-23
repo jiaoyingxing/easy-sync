@@ -531,6 +531,7 @@ function makeExecutor(options: {
   localFolders?: LocalFolderEntry[];
   remoteFolders?: RemoteFolderEntry[];
   shouldSyncFolderPath?: (path: string) => boolean;
+  i18n?: ConstructorParameters<typeof SyncExecutor>[4];
   diag?: ConstructorParameters<typeof SyncExecutor>[6];
   progressStore?: SyncProgressStore;
 }): {
@@ -588,7 +589,7 @@ function makeExecutor(options: {
     scanner,
     state,
     "testVault",
-    undefined,
+    options.i18n,
     options.progressStore,
     options.diag,
     undefined,
@@ -3967,6 +3968,245 @@ describe("community plugin enablement runtime", () => {
       .join("\n");
     expect(logText).toContain("identity is ambiguous: calendar");
     expect(logText).toContain("identity is ambiguous: calendar-copy");
+  });
+
+  it("keeps the only locally complete bundle uploadable when same-id peers are remote-only", async () => {
+    const previousMobile = Platform.isMobile;
+    Platform.isMobile = true;
+    try {
+      const calendarMainPath = ".obsidian/plugins/calendar/main.js";
+      const calendarManifestPath = ".obsidian/plugins/calendar/manifest.json";
+      const copyMainPath = ".obsidian/plugins/calendar-copy/main.js";
+      const copyManifestPath = ".obsidian/plugins/calendar-copy/manifest.json";
+      const manifestText = JSON.stringify({
+        id: "calendar",
+        version: "2.0.0",
+        minAppVersion: "1.5.0",
+      });
+      const manifestBytes = bytes(manifestText);
+      const oldMain = bytes("old-main");
+      const changedMain = bytes("changed-main");
+      const localMain = await localEntry(calendarMainPath, changedMain);
+      const localManifest = await localEntry(
+        calendarManifestPath,
+        manifestBytes,
+      );
+      const remoteMain = await remoteEntry(calendarMainPath, oldMain);
+      const remoteManifest = await remoteEntry(
+        calendarManifestPath,
+        manifestBytes,
+      );
+      const copyMain = await remoteEntry(copyMainPath, oldMain, {
+        driveId: "calendar-copy-main-id",
+        parentId: "calendar-copy-folder-id",
+      });
+      const copyManifest = await remoteEntry(copyManifestPath, manifestBytes, {
+        driveId: "calendar-copy-manifest-id",
+        parentId: "calendar-copy-folder-id",
+      });
+      const remoteFolders = [
+        ...REMOTE_FOLDERS,
+        {
+          path: ".obsidian/plugins/calendar-copy",
+          driveId: "calendar-copy-folder-id",
+          parentId: "plugins-folder-id",
+          name: "calendar-copy",
+        },
+      ];
+      const baseEntries: BaseFileEntry[] = [
+        sharedBaseEntry(
+          await localEntry(calendarMainPath, oldMain),
+          remoteMain,
+        ),
+        sharedBaseEntry(localManifest, remoteManifest),
+      ];
+      const state = makeState(
+        [remoteMain, remoteManifest, copyMain, copyManifest],
+        baseEntries,
+        {},
+        remoteFolders,
+      );
+      const memory = makeMemoryAdapter({
+        [calendarMainPath]: changedMain,
+        [calendarManifestPath]: manifestText,
+      });
+      const uploadFile = vi.fn().mockResolvedValue({
+        id: remoteMain.driveId,
+        eTag: "etag:changed",
+        size: changedMain.byteLength,
+        parentReference: { id: "plugin-folder-id" },
+      });
+      const downloadFile = vi.fn(async (
+        _vaultName: string,
+        path: string,
+      ) => path.endsWith("/manifest.json") ? manifestBytes : oldMain);
+      const diag = { error: vi.fn(), warn: vi.fn(), log: vi.fn() } as never;
+      const { executor } = makeExecutor({
+        localEntries: [localMain, localManifest],
+        remoteEntries: [remoteMain, remoteManifest, copyMain, copyManifest],
+        remoteFolders,
+        remoteContent: null,
+        adapter: memory.adapter,
+        state,
+        oneDrive: makeOneDrive(null, { uploadFile, downloadFile }),
+        diag,
+        policy: {
+          version: 1,
+          files: {
+            mode: "selected",
+            pluginIds: ["calendar", "calendar-copy"],
+          },
+          data: { mode: "none", pluginIds: [] },
+        },
+      });
+
+      const result = await executor.run("manual");
+
+      const logText = (diag.error as unknown as ReturnType<typeof vi.fn>)
+        .mock.calls
+        .map((call) => String(call[1]))
+        .join("\n");
+      expect(result.uploaded).toBe(1);
+      expect(uploadFile).toHaveBeenCalledWith(
+        "testVault",
+        calendarMainPath,
+        changedMain,
+        expect.anything(),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(logText).not.toContain(
+        "upload .obsidian/plugins/calendar/main.js FAILED",
+      );
+      expect(logText).toContain("identity is ambiguous: calendar-copy");
+    } finally {
+      Platform.isMobile = previousMobile;
+    }
+  });
+
+  it("keeps a case-only local/remote directory spelling out of identity collision and names the exit", async () => {
+    const previousMobile = Platform.isMobile;
+    Platform.isMobile = true;
+    try {
+      const localMainPath = ".obsidian/plugins/terminal/main.js";
+      const localManifestPath = ".obsidian/plugins/terminal/manifest.json";
+      const remoteMainPath = ".obsidian/plugins/Terminal/main.js";
+      const remoteManifestPath = ".obsidian/plugins/Terminal/manifest.json";
+      const manifestText = JSON.stringify({
+        id: "terminal",
+        version: "2.0.0",
+        minAppVersion: "1.5.0",
+      });
+      const manifestBytes = bytes(manifestText);
+      const oldMain = bytes("old-main");
+      const changedMain = bytes("changed-main");
+      const localMain = await localEntry(localMainPath, changedMain);
+      const localManifest = await localEntry(
+        localManifestPath,
+        manifestBytes,
+      );
+      const remoteMain = await remoteEntry(remoteMainPath, oldMain, {
+        driveId: "terminal-main-id",
+        parentId: "terminal-folder-id",
+      });
+      const remoteManifest = await remoteEntry(
+        remoteManifestPath,
+        manifestBytes,
+        {
+          driveId: "terminal-manifest-id",
+          parentId: "terminal-folder-id",
+        },
+      );
+      const remoteFolders = [
+        ...REMOTE_FOLDERS.slice(0, 2),
+        {
+          path: ".obsidian/plugins/Terminal",
+          driveId: "terminal-folder-id",
+          parentId: "plugins-folder-id",
+          name: "Terminal",
+        },
+      ];
+      const baseEntries: BaseFileEntry[] = [
+        sharedBaseEntry(
+          await localEntry(remoteMainPath, oldMain),
+          remoteMain,
+        ),
+        sharedBaseEntry(
+          await localEntry(remoteManifestPath, manifestBytes),
+          remoteManifest,
+        ),
+      ];
+      const state = makeState(
+        [remoteMain, remoteManifest],
+        baseEntries,
+        {},
+        remoteFolders,
+      );
+      const memory = makeMemoryAdapter({
+        [localMainPath]: changedMain,
+        [localManifestPath]: manifestText,
+      });
+      const i18n = {
+        language: "zh-cn",
+        t: (key: string, params?: Record<string, string | number>) =>
+          params
+            ? `${key}|${String(params.localDirectory)}/${String(params.remoteDirectory)}`
+            : key,
+      } as unknown as ConstructorParameters<typeof SyncExecutor>[4];
+      const diag = { error: vi.fn(), warn: vi.fn(), log: vi.fn() } as never;
+      const { executor } = makeExecutor({
+        localEntries: [localMain, localManifest],
+        localFolders: [
+          ...REMOTE_FOLDERS.slice(0, 2).map((folder) => ({
+            path: folder.path,
+            mtime: 1,
+          })),
+          { path: ".obsidian/plugins/terminal", mtime: 1 },
+        ],
+        remoteEntries: [remoteMain, remoteManifest],
+        remoteFolders,
+        remoteContent: null,
+        adapter: memory.adapter,
+        state,
+        oneDrive: makeOneDrive(null, {
+          downloadFile: vi.fn(async (
+            _vaultName: string,
+            path: string,
+          ) => path.endsWith("/manifest.json") ? manifestBytes : oldMain),
+        }),
+        diag,
+        i18n,
+        policy: {
+          version: 1,
+          files: {
+            mode: "selected",
+            pluginIds: ["terminal", "Terminal"],
+          },
+          data: { mode: "none", pluginIds: [] },
+        },
+      });
+
+      const result = await executor.run("manual");
+
+      const logText = (diag.error as unknown as ReturnType<typeof vi.fn>)
+        .mock.calls
+        .map((call) => String(call[1]))
+        .join("\n");
+      expect(result.deferred).toBe(1);
+      expect(result.identityBlockedErrors ?? 0).toBe(0);
+      expect(logText).not.toContain("identity is ambiguous: terminal");
+      const reconcile = state.reconcilePendingIssues as unknown as
+        ReturnType<typeof vi.fn>;
+      const issues = reconcile.mock.calls.flatMap((call) =>
+        call[0] as Array<{ path: string; reason?: string }>);
+      const issue = issues.find((candidate) =>
+        candidate.reason?.includes("pluginDirectorySpellingDiffers"));
+      expect(issue?.reason).toContain(
+        "reason.folder.pluginDirectorySpellingDiffers|terminal/Terminal",
+      );
+    } finally {
+      Platform.isMobile = previousMobile;
+    }
   });
 
   it("surfaces an unreadable manifest as a parse block", async () => {

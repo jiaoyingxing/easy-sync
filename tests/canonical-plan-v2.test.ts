@@ -2916,6 +2916,57 @@ describe("canonical plan large-file gate wiring", () => {
 
   it("threads the scanner threshold at every canonical facts build site", () => {
     const source = readFileSync("src/sync/sync-executor.ts", "utf8");
-    expect(source).toContain("maxFileSizeBytes: this.scanner.getMaxFileSize?.(),");
+    const field = "maxFileSizeBytes: this.scanner.getMaxFileSize?.(),";
+    // 保留原并集断言（任一处接线），逐点断言见下。
+    expect(source).toContain(field);
+
+    // 收窄取证：原断言是文件级并集，六处接线里删掉任意一处仍绿。
+    // 逐点钉＝要求字段落在该 builder 调用的对象字面量内，缺一处即红。
+    const pinSite = (builder: string, terminator: string, from = 0): number => {
+      const start = source.indexOf(builder, from);
+      expect(start, `missing canonical facts build site: ${builder}`).toBeGreaterThan(-1);
+      const end = source.indexOf(terminator, start + builder.length);
+      expect(end, `missing call terminator after: ${builder}`).toBeGreaterThan(start);
+      expect(
+        source.slice(start, end),
+        `scanner threshold not threaded at: ${builder}`,
+      ).toContain(field);
+      return end;
+    };
+
+    // 1. 失效身份解析快照（buildCurrentStaleIdentityResolutionReview）。
+    pinSite(
+      "    const snapshot = buildStaleIdentityResolutionSnapshotV1(",
+      "\n    );",
+    );
+    // 2. V2 计划重建闭包（runStep5PrepareCanonicalPlanCandidate）。
+    pinSite(
+      "      buildCanonicalPlanCandidateV2({",
+      "\n      });",
+    );
+    // 3. 迁移候选状态（同一方法内的第二个构建点）。
+    pinSite(
+      "      canonicalPlanCandidate = buildCanonicalPlanCandidateFromStateV2({",
+      "\n      });",
+    );
+    // 4／5. 两条 V2 恢复路径各自从已提交信封重建计划。
+    const corruptStateSite = pinSite(
+      "    let canonical = buildCanonicalPlanCandidateV2({",
+      "\n    });",
+    );
+    pinSite(
+      "    let canonical = buildCanonicalPlanCandidateV2({",
+      "\n    });",
+      corruptStateSite,
+    );
+    // 6. 文件夹移动续跑候选（continuationCandidate）；本处原先漏接线，
+    // 逐点钉后补上，续跑轮与普通轮共用同一大文件下载门。
+    pinSite(
+      "      ? buildCanonicalPlanCandidateV2({",
+      "\n        })",
+    );
+
+    // 数量钉住：防止新增接线点只改标题不补断言，或某处字段被别名绕开。
+    expect(source.split(field)).toHaveLength(7);
   });
 });

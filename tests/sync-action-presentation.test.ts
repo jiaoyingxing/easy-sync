@@ -17,12 +17,12 @@ const EXPECTED: Record<
   [SyncActionType.RecreateRemoteScope]: {
     group: "remotePreparation",
     zh: "准备云端同步目录",
-    en: "Prepare remote sync folder",
+    en: "Prepare cloud sync folder",
   },
   [SyncActionType.CreateRemoteFolder]: {
     group: "folderCreate",
     zh: "创建云端文件夹",
-    en: "Create remote folder",
+    en: "Create cloud folder",
   },
   [SyncActionType.CreateLocalFolder]: {
     group: "folderCreate",
@@ -32,7 +32,7 @@ const EXPECTED: Record<
   [SyncActionType.MoveRemoteFolder]: {
     group: "moveRename",
     zh: "移动/重命名云端文件夹",
-    en: "Move/Rename remote folder",
+    en: "Move/Rename cloud folder",
   },
   [SyncActionType.MoveLocalFolder]: {
     group: "moveRename",
@@ -42,7 +42,7 @@ const EXPECTED: Record<
   [SyncActionType.DeleteRemoteFolder]: {
     group: "delete",
     zh: "删除云端文件夹",
-    en: "Delete remote folder",
+    en: "Delete cloud folder",
   },
   [SyncActionType.DeleteLocalFolder]: {
     group: "delete",
@@ -62,7 +62,7 @@ const EXPECTED: Record<
   [SyncActionType.DeleteRemote]: {
     group: "delete",
     zh: "删除云端文件",
-    en: "Delete remote file",
+    en: "Delete cloud file",
   },
   [SyncActionType.DeleteLocal]: {
     group: "delete",
@@ -77,7 +77,7 @@ const EXPECTED: Record<
   [SyncActionType.RenameRemote]: {
     group: "moveRename",
     zh: "移动/重命名云端文件",
-    en: "Move/Rename remote file",
+    en: "Move/Rename cloud file",
   },
   [SyncActionType.Conflict]: {
     group: "conflict",

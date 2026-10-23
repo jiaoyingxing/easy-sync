@@ -676,6 +676,136 @@ describe("LocalScanner large file boundary", () => {
   });
 });
 
+describe("LocalScanner scan cache global history bounds", () => {
+  const GLOBAL_ENTRY_LIMIT = 20_000;
+  const GLOBAL_BYTE_LIMIT = 8 * 1024 * 1024;
+  const LOW_WATER = 0.9;
+
+  /** Seed `pathCount` paths x 16 entries with globally distinct observedAt
+   *  increasing with path order, so "oldest" is exactly the first paths. */
+  function seedHistoryCache(pathCount: number, hash: string) {
+    const histories: Record<string, unknown[]> = {};
+    const paths: string[] = [];
+    for (let pathIndex = 0; pathIndex < pathCount; pathIndex += 1) {
+      const path = `history/path-${String(pathIndex).padStart(4, "0")}.md`;
+      paths.push(path);
+      const entries = [];
+      for (let entryIndex = 0; entryIndex < 16; entryIndex += 1) {
+        entries.push({
+          mtime: pathIndex + entryIndex,
+          size: entryIndex,
+          hash,
+          binary: false,
+          observedAt: pathIndex * 16 + entryIndex + 1,
+        });
+      }
+      histories[path] = entries;
+    }
+    return {
+      paths,
+      cacheJson: JSON.stringify({ format: 2, entries: {}, histories }),
+    };
+  }
+
+  function makeSeededScanner(cacheJson: string) {
+    const adapter = {
+      read: vi.fn(async () => cacheJson),
+      write: vi.fn(async () => undefined),
+      remove: vi.fn(async () => undefined),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      stat: vi.fn(async () => null),
+      readBinary: vi.fn(async () => new ArrayBuffer(0)),
+    };
+    const vault = {
+      configDir: ".obsidian",
+      adapter,
+      getFiles: vi.fn(() => []),
+      getAllLoadedFiles: vi.fn(() => []),
+    } as unknown as Vault;
+    const scanner = new LocalScanner(vault, {
+      excludePaths: [],
+      includePaths: [],
+      maxFileSize: 50 * 1024 * 1024,
+      includePluginCode: false,
+      includePluginData: false,
+    });
+    return { scanner, adapter };
+  }
+
+  function totalEntries(scanner: LocalScanner, paths: string[]): number {
+    return paths.reduce(
+      (sum, path) => sum + scanner.pathHistory(path).length,
+      0,
+    );
+  }
+
+  function totalBytes(scanner: LocalScanner, paths: string[]): number {
+    let bytes = 0;
+    for (const path of paths) {
+      for (const entry of scanner.pathHistory(path)) {
+        bytes += JSON.stringify(entry).length;
+      }
+    }
+    return bytes;
+  }
+
+  it("evicts the oldest entries across paths down to the 20,000-entry low-water mark on load", async () => {
+    const { paths, cacheJson } = seedHistoryCache(1_400, "a".repeat(64));
+    // 22,400 seeded entries stay well under the byte cap, so entries bind.
+    expect(cacheJson.length).toBeLessThan(GLOBAL_BYTE_LIMIT);
+
+    const { scanner, adapter } = makeSeededScanner(cacheJson);
+    await scanner.scanAll();
+
+    const entryTarget = Math.floor(GLOBAL_ENTRY_LIMIT * LOW_WATER);
+    expect(totalEntries(scanner, paths)).toBe(entryTarget);
+    // 22,400 seeded - 18,000 retained = 4,400 oldest entries evicted, which
+    // is exactly the first 275 paths.
+    expect(scanner.pathHistory(paths[0]!)).toHaveLength(0);
+    expect(scanner.pathHistory(paths[274]!)).toHaveLength(0);
+    expect(scanner.pathHistory(paths[275]!)).toHaveLength(16);
+    expect(scanner.pathHistory(paths[275]!)[0]).toMatchObject({
+      observedAt: 4_401,
+    });
+    const newest = scanner.pathHistory(paths[1_399]!);
+    expect(newest).toHaveLength(16);
+    expect(newest[newest.length - 1]).toMatchObject({ observedAt: 22_400 });
+
+    // The shrunk cache is persisted and a second load leaves it untouched.
+    const persisted = adapter.write.mock.calls[0]?.[1] as string | undefined;
+    expect(persisted).toBeTruthy();
+    const second = makeSeededScanner(persisted!);
+    await second.scanner.scanAll();
+    expect(totalEntries(second.scanner, paths)).toBe(entryTarget);
+    const retainedPaths = (target: LocalScanner) => paths.filter(
+      (path) => target.pathHistory(path).length > 0,
+    );
+    expect(retainedPaths(second.scanner)).toEqual(retainedPaths(scanner));
+    expect(second.adapter.write).not.toHaveBeenCalled();
+  });
+
+  it("evicts by the approximate 8 MB byte cap when oversized entries bind first", async () => {
+    // 300 paths x 16 entries x ~2 KB hashes is ~10 MB: over the byte cap while
+    // staying far below the 20,000-entry cap.
+    const { paths, cacheJson } = seedHistoryCache(300, "b".repeat(2_048));
+    expect(cacheJson.length).toBeGreaterThan(GLOBAL_BYTE_LIMIT);
+
+    const { scanner } = makeSeededScanner(cacheJson);
+    await scanner.scanAll();
+
+    const byteTarget = Math.floor(GLOBAL_BYTE_LIMIT * LOW_WATER);
+    const retained = totalEntries(scanner, paths);
+    expect(retained).toBeGreaterThan(0);
+    expect(retained).toBeLessThan(4_800);
+    expect(totalBytes(scanner, paths)).toBeLessThanOrEqual(byteTarget);
+    // Oldest paths lost their chains; the newest path is fully retained.
+    expect(scanner.pathHistory(paths[0]!)).toHaveLength(0);
+    const newest = scanner.pathHistory(paths[299]!);
+    expect(newest).toHaveLength(16);
+    expect(newest[newest.length - 1]).toMatchObject({ observedAt: 4_800 });
+  });
+});
+
 describe("Preflight P0 — Included path failures make the scan incomplete", () => {
   const config: ScanConfig = {
     excludePaths: [".obsidian/"],

@@ -1,4 +1,3 @@
-import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import {
   buildAdaptivePathLayout,
@@ -40,7 +39,7 @@ import { SyncActionType } from "../src/sync/types";
 import type { SyncPlanItem } from "../src/sync/types";
 import { ConfirmModal } from "../src/ui/confirm-modal";
 import { formatFileSize } from "../src/ui/file-comparison-modal";
-import { functionBody } from "./helpers/source-scope";
+import { functionBody, readSourceFile } from "./helpers/source-scope";
 
 interface FakeHistoryElement {
   tag: string;
@@ -208,7 +207,7 @@ describe("shared sidebar detail controls", () => {
   });
 
   it("windows the pending section with the shared decision-row machinery", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const sectionStart = source.indexOf("private renderPendingSection");
     const sectionEnd = source.indexOf("private renderPendingRow(", sectionStart);
     const section = source.slice(sectionStart, sectionEnd);
@@ -370,7 +369,7 @@ describe("shared sidebar detail controls", () => {
       "renderUpdateAvailableItem|easy-sync-tree-item": "readonly",
       "measurePlanDecisionRowHeights|easy-sync-tree-item easy-sync-plan-decision-probe": "probe",
     };
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const found: string[] = [];
     for (const match of source.matchAll(/createEl\(\s*"details"/g)) {
       const at = match.index ?? 0;
@@ -392,7 +391,7 @@ describe("shared sidebar detail controls", () => {
   });
 
   it("does not let a new plan revision wipe the user's explicit global choice", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const revisionStart = source.indexOf(
       "if (this.renderedPlanReviewRevision !== syncState.planReviewRevision) {",
     );
@@ -414,7 +413,7 @@ describe("shared sidebar detail controls", () => {
   });
 
   it("records a decision row's open state from the user's gesture, not the toggle event", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const toggleStart = source.indexOf("private readonly handlePathLayoutToggle");
     const intentStart = source.indexOf("private readonly handlePlanRowToggleIntent");
     const resizeStart = source.indexOf("private readonly handlePathLayoutResize");
@@ -434,7 +433,7 @@ describe("shared sidebar detail controls", () => {
 
 describe("sync view status copy and scrolling layout", () => {
   it("keeps expanded history details subordinate to the summary with host UI tokens", () => {
-    const styles = readFileSync("styles.css", "utf8");
+    const styles = readSourceFile("styles.css");
 
     expect(styles).toMatch(
       /\.easy-sync-history-detail\s*\{[^}]*font-size:\s*var\(--font-ui-smaller\);[^}]*line-height:\s*var\(--line-height-tight\);/s,
@@ -457,7 +456,7 @@ describe("sync view status copy and scrolling layout", () => {
     expect(zh.t("syncPlan.remoteScopeRecreateSummary"))
       .toBe("原云端同步目录无法继续使用。确认后重新创建目录并核对内容。");
     expect(en.t("syncPlan.remoteScopeRecreateSummary"))
-      .toContain("previous remote sync folder");
+      .toContain("previous cloud sync folder");
     expect(zh.t("result.remoteReadUnavailable"))
       .toBe("暂时连不上云端，本轮没有同步任何文件；网络恢复后会自动重试。");
     expect(en.t("result.remoteReadUnavailable"))
@@ -471,13 +470,13 @@ describe("sync view status copy and scrolling layout", () => {
     expect(zh.t("notice.conflict.downloadFailed"))
       .toBe("未能下载云端版本，本次未作更改；请稍后重试。");
     expect(en.t("notice.conflict.downloadFailed"))
-      .toBe("The remote version could not be downloaded, so nothing was changed. Try again later.");
+      .toBe("The cloud version could not be downloaded, so nothing was changed. Try again later.");
     expect(zh.t("syncView.history.noFileChanges"))
       .toBe("本轮没有文件变更。");
     expect(en.t("syncView.history.noFileChanges"))
       .toBe("No files changed in this sync.");
 
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     expect(source).not.toContain("CommunityPluginLegacyMigration");
     expect(source).not.toContain("syncView.communityPlugins.migration");
   });
@@ -509,10 +508,7 @@ describe("sync view status copy and scrolling layout", () => {
       en.t("notice.mutationResolution.unavailable"),
     ].join("\n")).not.toMatch(/安全归并|reduced safely|verification evidence/);
 
-    const modalSource = readFileSync(
-      "src/ui/mutation-recovery-resolution-modal.ts",
-      "utf8",
-    );
+    const modalSource = readSourceFile("src/ui/mutation-recovery-resolution-modal.ts");
     expect(modalSource).toContain("formatFileSize(fact.size ?? 0)");
     expect(modalSource).not.toContain(")：${");
   });
@@ -520,10 +516,7 @@ describe("sync view status copy and scrolling layout", () => {
   it("separates empty-folder situations from actions without exposing folder internals", () => {
     const zh = new I18n("zh-cn");
     const en = new I18n("en");
-    const modalSource = readFileSync(
-      "src/ui/empty-folder-resolution-modal.ts",
-      "utf8",
-    );
+    const modalSource = readSourceFile("src/ui/empty-folder-resolution-modal.ts");
 
     expect([
       zh.t("syncView.emptyFolder.deleteUnavailableDescription"),
@@ -601,7 +594,7 @@ describe("sync view status copy and scrolling layout", () => {
   });
 
   it("keeps empty-folder and subtree deletion at a single confirmation gate", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const start = source.indexOf("  private async openEmptyFolderResolution(");
     expect(start).toBeGreaterThanOrEqual(0);
     const end = source.indexOf("\n  private ", start + 1);
@@ -701,7 +694,7 @@ describe("sync view status copy and scrolling layout", () => {
   });
 
   it("keeps the sidebar toolbar and primary action fixed above one independent content scroller", () => {
-    const styles = readFileSync("styles.css", "utf8");
+    const styles = readSourceFile("styles.css");
     const desktopViewBlock = styles.match(
       /body:not\(\.is-mobile\) \.view-content\.easy-sync-view\s*\{([^}]*)\}/s,
     )?.[1] ?? "";
@@ -1553,7 +1546,7 @@ describe("buildSyncViewContentKey", () => {
     // 2026-09-16 按钮清理：行内「重新检查/再次同步」与顶部主动作完全等同
     // （同一 startManualSync，轮中仅得 busy 提示）——重试统一走顶部；
     // 延后类行由自动轮次收敛。标签分叉函数随 chip 一并退役。
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     expect(source).not.toContain("formatPendingIssueActionLabel");
     expect(source).not.toContain('"syncView.issues.retry"');
     expect(source).not.toContain('"syncView.issues.recheck"');
@@ -1653,7 +1646,7 @@ describe("buildSyncViewContentKey", () => {
     expect(fitDirectoryTail("Projects/", 0, width)).toBe("Projects/");
 
     // 接线：目录元素渲染必须套用保尾显示串（同一盒模型域量测）。
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const scopeStart = source.indexOf("private applyAdaptivePathLayoutScope(");
     const scopeEnd = source.indexOf("private appendNewFileRows(", scopeStart);
     const scope = source.slice(scopeStart, scopeEnd);
@@ -1667,7 +1660,7 @@ describe("buildSyncViewContentKey", () => {
     // 内容超高时默认先压子项；灰字目录带 overflow: hidden，自动最小高度
     // 为零，是唯一被压成空白窄行的受害者。子项必须 flex-shrink: 0，让
     // 列表装满后走滚动。
-    const styles = readFileSync("styles.css", "utf8");
+    const styles = readSourceFile("styles.css");
     const rule = styles.match(/\.easy-sync-file-list > \* \{[^}]*\}/s);
     expect(rule).not.toBeNull();
     expect(rule?.[0]).toContain("flex-shrink: 0");
@@ -1702,7 +1695,7 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("shows the true completed count instead of the retained list length", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const progressPanel = source.slice(
       source.indexOf("private renderProgressPanel"),
       source.indexOf("private renderRemoteScopeRecoveryFailure"),
@@ -1717,7 +1710,7 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("keeps the round bar at the body top in every borrowed body mode while running", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     // While a round runs, a borrowed body (plan review / pending / recovery)
     // mounts the same round bar at its original body-top spot — the status
     // panel itself stays untouched (no bar above the divider).
@@ -1754,7 +1747,7 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("invalidates the windowed height model when the toolbar expands or collapses everything", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     // The toolbar bulk-writes `open` on every tree item without going through
     // rememberPlanRowExpansion, so the windowed lists' offset model would
     // keep the old open-state heights: the mounted absolute window grows in
@@ -1797,7 +1790,7 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("mounts completed rows incrementally and reserves full rebuilds for the fallback", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const append = source.slice(
       source.indexOf("private appendNewFileRows"),
       source.indexOf("private renderToolbar"),
@@ -1821,7 +1814,7 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("keeps ordinary plan rows chip-free and excludes history from adaptive directories", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const planStart = source.indexOf("private renderPlanGroups");
     const conflictStart = source.indexOf("private renderConflictItem", planStart);
     const ordinaryPlanRows = source.slice(planStart, conflictStart);
@@ -2310,8 +2303,8 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("keeps plan confirmation in the fixed primary action and plan details lazy", () => {
-    const styles = readFileSync("styles.css", "utf8");
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const styles = readSourceFile("styles.css");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const statusStart = source.indexOf("private renderStatusPanel");
     const statusEnd = source.indexOf("private updateStatusPanel", statusStart);
     const status = source.slice(statusStart, statusEnd);
@@ -2353,7 +2346,7 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("mounts windowed rows in flow between spacers so overflow cannot paint over siblings", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     // 方案单 20260924-0001（用户拍板）: the visible-row window is an
     // ordinary in-flow block between top/bottom spacers — real row content
     // can only push the bottom spacer (and everything below) down, so
@@ -2387,7 +2380,7 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("renders the summary slot as flow lines plus a timing-matched decision note", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const sectionStart = source.indexOf("private renderPlanReviewSection");
     const sectionEnd = source.indexOf("private renderPlanGroups", sectionStart);
     const section = source.slice(sectionStart, sectionEnd);
@@ -2465,7 +2458,7 @@ describe("buildSyncViewContentKey", () => {
     // 不新增槽位与文案：顶部状态行与计划区说明行按条件改说既有的「已更新」
     // 两句（弹框标题／正文逐字复用）。基线在计划正文首次渲染时记下、审阅
     // 结束时清零。
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     expect(source).toContain(
       "private planReviewBaselineRevision: number | null = null;",
     );
@@ -2507,7 +2500,7 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("preserves an opened plan group and scroll position across side-action rerenders", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
 
     expect(source).toContain("private planGroupExpandedState = new Map<SyncActionGroup, boolean>()");
     const revisionStart = source.indexOf(
@@ -2534,8 +2527,8 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("submits UI decisions only through the plugin gateway", () => {
-    const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
-    const modalSource = readFileSync("src/ui/conflict-detail-modal.ts", "utf8");
+    const viewSource = readSourceFile("src/ui/sync-view.ts");
+    const modalSource = readSourceFile("src/ui/conflict-detail-modal.ts");
     const directExecutorMutation = /syncExecutor[^\n]*(resolveConflictKeepLocal|resolveConflictKeepRemote|confirmRemoteDelete|rejectRemoteDelete)/;
 
     expect(viewSource).not.toMatch(directExecutorMutation);
@@ -2561,7 +2554,7 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("keeps shared-folder identity confirmation local to its pending row", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const rowStart = source.indexOf("  private renderPendingIssue(");
     const openStart = source.indexOf(
       "  private async openSharedFolderIdentityResolution(",
@@ -2597,16 +2590,13 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("drops the no-action last-attempt line from pending rows (2026-09-15 减负 R-5)", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     expect(source).not.toContain("syncView.issues.lastAttempt");
   });
 
   it("routes a two-sided folder move to one existing folder modal", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
-    const modalSource = readFileSync(
-      "src/ui/empty-folder-resolution-modal.ts",
-      "utf8",
-    );
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const modalSource = readSourceFile("src/ui/empty-folder-resolution-modal.ts");
     const rowStart = source.indexOf("  private renderPendingIssue(");
     const openStart = source.indexOf(
       "  private async openFolderLocationResolution(",
@@ -2630,7 +2620,7 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("keeps stale identity retirement explicit, state-only, and local to its pending row", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const rowStart = source.indexOf("  private renderPendingIssue(");
     const openStart = source.indexOf(
       "  private async openStaleIdentityResolution(",
@@ -2662,17 +2652,11 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("keeps facts-changed handling in the fixed top action and reuses the shared comparison surface", () => {
-    const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
-    const modalSource = readFileSync(
-      "src/ui/mutation-recovery-resolution-modal.ts",
-      "utf8",
-    );
-    const conflictSource = readFileSync(
-      "src/ui/conflict-detail-modal.ts",
-      "utf8",
-    );
-    const sharedSource = readFileSync("src/ui/file-comparison-modal.ts", "utf8");
-    const styles = readFileSync("styles.css", "utf8");
+    const viewSource = readSourceFile("src/ui/sync-view.ts");
+    const modalSource = readSourceFile("src/ui/mutation-recovery-resolution-modal.ts");
+    const conflictSource = readSourceFile("src/ui/conflict-detail-modal.ts");
+    const sharedSource = readSourceFile("src/ui/file-comparison-modal.ts");
+    const styles = readSourceFile("styles.css");
     const openStart = viewSource.indexOf(
       "  private async openMutationRecoveryResolution()",
     );
@@ -2774,11 +2758,8 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("reuses the comparison modal and shared confirmation for one plugin bundle", () => {
-    const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
-    const modalSource = readFileSync(
-      "src/ui/mutation-recovery-resolution-modal.ts",
-      "utf8",
-    );
+    const viewSource = readSourceFile("src/ui/sync-view.ts");
+    const modalSource = readSourceFile("src/ui/mutation-recovery-resolution-modal.ts");
     const start = viewSource.indexOf(
       "  private async openCommunityPluginBundleReview",
     );
@@ -2824,7 +2805,7 @@ describe("buildSyncViewContentKey", () => {
   });
 
   it("requires a native confirmation and reuses the full-width primary action style for batch deletes", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const sectionStart = source.indexOf("private renderPendingSection");
     const sectionEnd = source.indexOf("private renderPendingIssue", sectionStart);
     const section = source.slice(sectionStart, sectionEnd);
@@ -2958,7 +2939,7 @@ describe("buildSyncViewContentKey · local-only rows (片⑦ 修复)", () => {
   });
 
   it("feeds the key and the pending section from the same single source", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const doRenderSlice = source.slice(
       source.indexOf("const contentKey = buildSyncViewContentKey("),
       source.indexOf("this.lastContentKey = contentKey"),
@@ -3043,7 +3024,7 @@ describe("buildSyncViewContentKey · update reminder row (2026-10-13 修复)", (
   });
 
   it("renders the row at the tail of the plan and recovery bodies from the same source", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const dispatchSlice = source.slice(
       source.indexOf('if (bodyMode === "plan" && syncState)'),
       source.indexOf("if (this.historyExpanded)"),
@@ -3118,7 +3099,7 @@ describe("resolveSyncViewStatusDetailText (片⑦ E1)", () => {
   });
 
   it("keeps the timestamp branch plain text: no control, no tooltip, no click", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const timestampBranch = source.slice(
       source.indexOf('if (this.statusDetailMode !== "timestamp")'),
       source.indexOf("private updateByteProgress("),
@@ -3134,7 +3115,7 @@ describe("resolveSyncViewStatusDetailText (片⑦ E1)", () => {
   });
 
   it("leaves the three-state mechanism untouched and only wires the indicator into the idle state", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const modeStart = source.indexOf(
       "export function resolveSyncViewStatusDetailMode(",
     );
@@ -3280,7 +3261,7 @@ describe("remote scope recovery failure presentation", () => {
   });
 
   it("carries no per-section next-step line (retry lives in the top primary action)", () => {
-    const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
+    const viewSource = readSourceFile("src/ui/sync-view.ts");
     const start = viewSource.indexOf(
       "  private renderRemoteScopeRecoveryFailure(",
     );
@@ -3289,6 +3270,64 @@ describe("remote scope recovery failure presentation", () => {
     const method = viewSource.slice(start, end < 0 ? undefined : end);
     expect(method).not.toContain("next-step");
     expect(method).not.toContain("nextStep");
+  });
+
+  it("mounts the failure section under the view content, not inside the progress panel", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const panel = source.slice(
+      source.indexOf("private renderProgressPanel"),
+      source.indexOf("private renderRemoteScopeRecoveryFailure"),
+    );
+    // Both containers draw their own `border-top`; nesting the section inside
+    // the panel therefore produced two rules just above the section title.
+    expect(panel).not.toContain("renderRemoteScopeRecoveryFailure");
+    expect(panel).not.toContain("!state.recoveryVerification");
+    const dispatch = source.slice(
+      source.indexOf("const content = container.createDiv"),
+      source.indexOf("// 更新提示行：待处理区自带"),
+    );
+    expect(dispatch).toMatch(
+      /this\.renderRemoteScopeRecoveryFailure\(\s*content,\s*progress\.recoveryVerification,?\s*\)/,
+    );
+    expect(dispatch.indexOf("renderRemoteScopeRecoveryFailure")).toBeLessThan(
+      dispatch.indexOf("this.renderPendingSection"),
+    );
+  });
+
+  it("does not mount an empty progress panel when only the failure section is present", () => {
+    const view = Object.create(EasySyncSyncView.prototype) as {
+      renderProgressPanel: (
+        container: HTMLElement,
+        state: Record<string, unknown>,
+      ) => void;
+    };
+    const container = createFakeHistoryElement("div", "easy-sync-view-content");
+    view.renderProgressPanel(
+      container as unknown as HTMLElement,
+      {
+        phase: "idle",
+        current: 0,
+        total: 0,
+        currentFile: "",
+        currentItemBytes: 0,
+        currentItemTotalBytes: 0,
+        cancelRequested: false,
+        completedFiles: [],
+        completedCount: 0,
+        startedAt: 0,
+        recoveryVerification: {
+          operationFingerprint: "operation-1",
+          protocolPreflight: "blocked",
+          total: 0,
+          verifiedThisRun: 0,
+          reused: 0,
+          invalidated: 0,
+          remaining: 0,
+          failureStage: "protocol-preflight",
+        },
+      },
+    );
+    expect(container.children).toHaveLength(0);
   });
 });
 
@@ -3695,7 +3734,7 @@ describe("resolveSyncViewPrimaryAction (finding ⑧, C9 P1)", () => {
 
 describe("continuous click-in for resolution rows", () => {
   it("filters pendingIssues by queued side-action paths like conflicts and deletes", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const renderStart = source.indexOf("const pendingIssues = ");
     const slice = source.slice(
       renderStart,
@@ -3715,7 +3754,7 @@ describe("continuous click-in for resolution rows", () => {
   });
 
   it("releases each resolution guard before the settlement call, not after the full round", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const cases = [
       {
         open: "  private async openStaleIdentityResolution(",
@@ -3762,7 +3801,7 @@ describe("continuous click-in for resolution rows", () => {
   });
 
   it("holds a per-row guard so the same row cannot decide twice while settling", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const cases = [
       { open: "  private async openStaleIdentityResolution(", key: "stale:" },
       {
@@ -3812,7 +3851,7 @@ describe("continuous click-in for resolution rows", () => {
   });
 
   it("routes every resolution entry's unavailable cause through the shared mapping", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const cases = [
       {
         open: "  private async openStaleIdentityResolution(",
@@ -3850,7 +3889,7 @@ describe("continuous click-in for resolution rows", () => {
 
 describe("scope-crossing row exit gating", () => {
   it("renders exit chips and the folder exit text only when a covering move hint exists", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const renderStart = source.indexOf("  private renderPendingIssue(");
     const renderEnd = source.indexOf(
       "\n  private async openStaleIdentityResolution(",
@@ -3875,19 +3914,16 @@ describe("scope-crossing row exit gating", () => {
   });
 
   it("keeps the covering-hint rule owned by the resolution module", () => {
-    const resolution = readFileSync(
-      "src/sync/scope-crossing-resolution.ts",
-      "utf8",
-    );
+    const resolution = readSourceFile("src/sync/scope-crossing-resolution.ts");
     expect(resolution).toContain("export function findScopeCrossingCoveringHintV1(");
     expect(resolution).toContain("buildScopeCrossingResolutionSnapshotV1");
-    const stateManager = readFileSync("src/sync/state-manager.ts", "utf8");
+    const stateManager = readSourceFile("src/sync/state-manager.ts");
     expect(stateManager).toContain("findScopeCrossingCoveringHintV1(path, {");
     expect(stateManager).toContain("getScopeCrossingExitKind(path: string)");
   });
 
   it("names the moved object in the confirm exit dialog", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     // 行内确认弹框必须点名被移出的对象，否则用户无法判断这条提示指向哪个
     // 文件或文件夹（「撤销移动」弹框此前就是这个写法）。
     const confirmStart = source.indexOf(
@@ -3906,7 +3942,7 @@ describe("scope-crossing row exit gating", () => {
 });
 
 describe("history section lazy entry bodies", () => {
-  const source = readFileSync("src/ui/sync-view.ts", "utf8");
+  const source = readSourceFile("src/ui/sync-view.ts");
 
   it("mounts collapsed history run bodies lazily on first toggle", () => {
     // 懒建形态:默认展开轮同步建,收起轮首次 toggle 才建详情——
@@ -3938,8 +3974,8 @@ describe("history section lazy entry bodies", () => {
 });
 
 describe("sync entry window presentation (2026-10-10 拍板)", () => {
-  const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
-  const mainSource = readFileSync("src/main.ts", "utf8");
+  const viewSource = readSourceFile("src/ui/sync-view.ts");
+  const mainSource = readSourceFile("src/main.ts");
 
   const baseState = () => ({
     isLoggedIn: true,
@@ -4142,7 +4178,7 @@ describe("one-way local-only rows (片④)", () => {
   });
 
   it("pins the note into every review flow line and into the otherwise-empty slot (件①)", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const sectionStart = source.indexOf("private renderPlanReviewSection");
     const section = source.slice(
       sectionStart,
@@ -4221,7 +4257,7 @@ describe("one-way local-only rows (片④)", () => {
   });
 
   it("dispatches the new kind and registers its fold site", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const dispatch = source.slice(
       source.indexOf("private renderPendingRow("),
       source.indexOf("private renderLocalOnlyItem("),
@@ -4264,7 +4300,7 @@ describe("one-way local-only rows (片④)", () => {
   });
 
   it("feeds the section count and the queued-path filter from the same records", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     // 收窄：这两句在文件里各有两处（渲染主流程与待处理区），且都承重——
     // 只留文件级断言时，删掉其中一处仍然全绿。
     const renderBody = functionBody(source, "private doRender(): void");
@@ -4280,7 +4316,7 @@ describe("one-way local-only rows (片④)", () => {
   });
 
   it("renders the keep chip beside upload and never reads the ignore store", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const renderer = source.slice(
       source.indexOf("private renderLocalOnlyItem("),
       source.indexOf("private renderBatchLocalOnlyRow("),
@@ -4301,7 +4337,7 @@ describe("one-way local-only rows (片④)", () => {
   });
 
   it("colors the upload chip as the primary action and keeps the keep chip neutral", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const renderer = source.slice(
       source.indexOf("private renderLocalOnlyItem("),
       source.indexOf("private renderBatchLocalOnlyRow("),
@@ -4340,7 +4376,7 @@ describe("one-way local-only rows (片④)", () => {
   });
 
   it("skips the plan-review count row when every count is zero", () => {
-    const source = readFileSync("src/ui/sync-view.ts", "utf8");
+    const source = readSourceFile("src/ui/sync-view.ts");
     const start = source.indexOf(
       "const present = rows.filter(([, count]) => count > 0);",
     );

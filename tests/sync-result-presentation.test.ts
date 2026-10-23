@@ -162,7 +162,7 @@ describe("sync result presentation", () => {
       }),
       [remoteDelete],
       en.t.bind(en),
-    )).toBe("1 remote deletion(s) need confirmation");
+    )).toBe("1 cloud deletion(s) need confirmation");
 
     expect(formatSyncResultMessage(
       result({
@@ -179,7 +179,7 @@ describe("sync result presentation", () => {
       }),
       [remoteDelete, conflict],
       en.t.bind(en),
-    )).toBe("1 conflict(s) need attention; 1 remote deletion(s) need confirmation");
+    )).toBe("1 conflict(s) need attention; 1 cloud deletion(s) need confirmation");
   });
 
   it("preserves real-conflict and non-default executor messages", () => {

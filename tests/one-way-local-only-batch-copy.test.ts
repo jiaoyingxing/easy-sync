@@ -111,7 +111,7 @@ describe("one-way local-only three-piece copy (三件优化)", () => {
       "单向同步期间，你有 2 个文件选择了“留在本机，不再提醒”。重置后，它会重新出现在同步面板，可再次选择上传到云端或留在本机。",
     );
     expect(en.t("settings.localOnlyIgnored.desc", { count: 2 })).toBe(
-      "While One-way sync is on, you chose not to be reminded about 2 file(s). After you reset, they will appear in the sync panel again, where you can choose to upload them to the cloud or keep them on this device.",
+      "While One-way sync is on, you chose “Keep on this device, no more reminders” for 2 file(s). After you reset, they will appear in the sync panel again, where you can choose to upload them to the cloud or keep them on this device.",
     );
     expect(zh.t("settings.localOnlyIgnored.button")).toBe("重置");
     expect(en.t("settings.localOnlyIgnored.button")).toBe("Reset");

@@ -34,6 +34,13 @@ import type { DiagnosticLogger } from "./diagnostic-logger";
 const SCAN_CACHE_FORMAT = 2;
 const SCAN_CACHE_LEGACY_FORMAT = 1;
 const SCAN_CACHE_HISTORY_LIMIT = 16;
+/** Aggregate bounds across every path's history. The per-path cap alone
+ *  cannot bound deleted/renamed paths, whose histories are kept by design. */
+const SCAN_CACHE_HISTORY_GLOBAL_ENTRY_LIMIT = 20_000;
+const SCAN_CACHE_HISTORY_GLOBAL_BYTE_LIMIT = 8 * 1024 * 1024;
+/** Drain to this fraction of each global cap so one append at the hard limit
+ *  does not trigger the full cross-path prune again on the next append. */
+const SCAN_CACHE_HISTORY_GLOBAL_LOW_WATER = 0.9;
 const SCAN_SLEEP_EVERY = 50;
 
 interface ScanCacheEntry {
@@ -54,6 +61,12 @@ type ScanCache = {
   entries: Record<string, ScanCacheEntry>;
   histories: Record<string, ScanCacheHistoryEntry[]>;
 };
+
+/** Deterministic approximation of one history entry's persisted footprint. */
+function scanCacheHistoryEntryBytes(entry: ScanCacheHistoryEntry): number {
+  return JSON.stringify(entry).length;
+}
+
 interface LocalScanResult {
   entries: LocalFileEntry[];
   /** Read-only folder topology. It does not authorize folder mutations. */
@@ -479,6 +492,9 @@ export class LocalScanner {
   };
   private scanCacheLoaded = false;
   private scanCacheDirty = false;
+  /** Running totals for the global history caps (bytes are approximate). */
+  private historyEntryCount = 0;
+  private historyApproxBytes = 0;
 
   constructor(
     vault: Vault,
@@ -591,6 +607,10 @@ export class LocalScanner {
     }
     this.scanCacheLoaded = true;
     this.scanCacheDirty = false;
+    // An already-oversized cache shrinks on load; the dirty flag makes the
+    // next successful scan persist the bounded shape.
+    this.recountHistoryTotals();
+    this.pruneScanCacheHistoriesGlobally();
   }
 
   private async saveScanCache(): Promise<void> {
@@ -610,6 +630,8 @@ export class LocalScanner {
       entries: {},
       histories: {},
     };
+    this.historyEntryCount = 0;
+    this.historyApproxBytes = 0;
     this.scanCacheLoaded = true;
     this.scanCacheDirty = false;
     const { scanCacheFile } = getEasySyncPaths(this.configDir, this.pluginId);
@@ -663,6 +685,102 @@ export class LocalScanner {
     return out;
   }
 
+  /** Rebuild the running global history totals from the current cache. */
+  private recountHistoryTotals(): void {
+    let entryCount = 0;
+    let approxBytes = 0;
+    for (const history of Object.values(this.scanCache.histories)) {
+      for (const entry of history) {
+        entryCount += 1;
+        approxBytes += scanCacheHistoryEntryBytes(entry);
+      }
+    }
+    this.historyEntryCount = entryCount;
+    this.historyApproxBytes = approxBytes;
+  }
+
+  /**
+   * Bound the aggregate history across all paths.
+   *
+   * Deleted paths keep their histories (entry-level `cachePrune` must not
+   * erase the last known facts), so the number of retained paths has no
+   * natural ceiling. Once either global cap is crossed, entries are evicted
+   * oldest-first by `observedAt` down to a low-water mark of both caps so the
+   * following appends stay O(1) until the headroom is used up.
+   */
+  private pruneScanCacheHistoriesGlobally(): void {
+    if (
+      this.historyEntryCount <= SCAN_CACHE_HISTORY_GLOBAL_ENTRY_LIMIT
+      && this.historyApproxBytes <= SCAN_CACHE_HISTORY_GLOBAL_BYTE_LIMIT
+    ) {
+      return;
+    }
+
+    const entryTarget = Math.floor(
+      SCAN_CACHE_HISTORY_GLOBAL_ENTRY_LIMIT
+        * SCAN_CACHE_HISTORY_GLOBAL_LOW_WATER,
+    );
+    const byteTarget = Math.floor(
+      SCAN_CACHE_HISTORY_GLOBAL_BYTE_LIMIT
+        * SCAN_CACHE_HISTORY_GLOBAL_LOW_WATER,
+    );
+
+    const ordered: Array<{
+      path: string;
+      index: number;
+      entry: ScanCacheHistoryEntry;
+    }> = [];
+    for (const [path, history] of Object.entries(this.scanCache.histories)) {
+      for (let index = 0; index < history.length; index += 1) {
+        ordered.push({ path, index, entry: history[index] });
+      }
+    }
+    // Stable sort: equal timestamps evict earlier per-path positions first.
+    ordered.sort((left, right) => left.entry.observedAt - right.entry.observedAt);
+
+    let remainingEntries = this.historyEntryCount;
+    let remainingBytes = this.historyApproxBytes;
+    let evicted = 0;
+    for (const candidate of ordered) {
+      if (
+        remainingEntries <= entryTarget
+        && remainingBytes <= byteTarget
+      ) {
+        break;
+      }
+      remainingEntries -= 1;
+      remainingBytes -= scanCacheHistoryEntryBytes(candidate.entry);
+      evicted += 1;
+    }
+    if (evicted === 0) return;
+
+    const evictedIndexes = new Map<string, Set<number>>();
+    for (const victim of ordered.slice(0, evicted)) {
+      let indexes = evictedIndexes.get(victim.path);
+      if (!indexes) {
+        indexes = new Set<number>();
+        evictedIndexes.set(victim.path, indexes);
+      }
+      indexes.add(victim.index);
+    }
+
+    const nextHistories: Record<string, ScanCacheHistoryEntry[]> = {};
+    for (const [path, history] of Object.entries(this.scanCache.histories)) {
+      const indexes = evictedIndexes.get(path);
+      if (!indexes) {
+        nextHistories[path] = history;
+        continue;
+      }
+      const kept = history.filter((_entry, index) => !indexes.has(index));
+      if (kept.length > 0) nextHistories[path] = kept;
+    }
+
+    this.scanCache.histories = nextHistories;
+    this.historyEntryCount = remainingEntries;
+    this.historyApproxBytes = Math.max(0, remainingBytes);
+    this.scanCacheDirty = true;
+  }
+
   private cacheProbe(path: string, mtime: number, size: number): ScanCacheEntry | null {
     const entry = this.scanCache.entries[path];
     if (entry && entry.mtime === mtime && entry.size === size) return entry;
@@ -690,11 +808,22 @@ export class LocalScanner {
     }
     if (current) {
       const history = this.scanCache.histories[path] ?? [];
-      history.push({ ...current, observedAt: Date.now() });
+      const appended = { ...current, observedAt: Date.now() };
+      history.push(appended);
+      this.historyEntryCount += 1;
+      this.historyApproxBytes += scanCacheHistoryEntryBytes(appended);
       if (history.length > SCAN_CACHE_HISTORY_LIMIT) {
-        history.splice(0, history.length - SCAN_CACHE_HISTORY_LIMIT);
+        const dropped = history.splice(
+          0,
+          history.length - SCAN_CACHE_HISTORY_LIMIT,
+        );
+        for (const entry of dropped) {
+          this.historyEntryCount -= 1;
+          this.historyApproxBytes -= scanCacheHistoryEntryBytes(entry);
+        }
       }
       this.scanCache.histories[path] = history;
+      this.pruneScanCacheHistoriesGlobally();
     }
     this.scanCache.entries[path] = { mtime, size, hash, quickXorHash, binary };
     this.scanCacheDirty = true;
@@ -1229,27 +1358,8 @@ export class LocalScanner {
     }
   }
 
-  async scanFile(path: string): Promise<LocalFileEntry | null> {
-    const inspection = await this.inspectFile(path);
-    if (inspection.status !== "present" || !inspection.entry) return null;
-    const { entry } = inspection;
-    // Keep scan cache current so the next scanAll() doesn't redundantly re-read
-    await this.loadScanCache();
-    this.cacheSet(
-      path,
-      entry.mtime,
-      entry.size,
-      entry.hash,
-      entry.quickXorHash,
-      entry.binary,
-    );
-    await this.saveScanCache();
-
-    return entry;
-  }
-
   /** Read the current local version for a write-time compare-and-swap check.
-   *  Unlike scanFile(), missing and unreadable are never conflated. */
+   *  Missing and unreadable are never conflated. */
   async inspectFile(
     path: string,
     options: Readonly<{ allowExcludedForRecovery?: boolean }> = {},

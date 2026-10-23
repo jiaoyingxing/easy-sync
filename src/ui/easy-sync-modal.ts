@@ -13,6 +13,12 @@
  *
  * Marker only on the container itself; the shared option-row builder for
  * chooser modals (login methods, migration offer) also lives here.
+ *
+ * This base also owns the promise settle protocol for "open and wait"
+ * modals: `awaitResult()` registers the resolver and opens the modal,
+ * `settle()` is the single settle point (take resolver, null it, close,
+ * resolve once), and `onClose` uses `takePendingResolve()` to resolve the
+ * cancel value only when no real choice was made.
  */
 import { Modal, setIcon, type App } from "obsidian";
 
@@ -22,10 +28,40 @@ interface EasySyncModalOptionView {
   description: string;
 }
 
-export abstract class EasySyncModal extends Modal {
+export abstract class EasySyncModal<TResult = void> extends Modal {
+  private pendingResolve: ((value: TResult) => void) | null = null;
+
   constructor(app: App) {
     super(app);
     this.containerEl.addClass("easy-sync-modal-container");
+  }
+
+  /** Register the awaiting promise's resolver and open the modal. */
+  protected awaitResult(): Promise<TResult> {
+    return new Promise((resolve) => {
+      this.pendingResolve = resolve;
+      this.open();
+    });
+  }
+
+  /**
+   * Single settle point for "open and wait" modals: take the pending
+   * resolver, null it, close, then resolve once. Nulling before `close()`
+   * matters because the host may run `onClose()` synchronously from
+   * `close()`; the cancel path then finds no resolver and cannot steal a
+   * real choice ("close == cancel" only when nothing was chosen).
+   */
+  protected settle(result: TResult): void {
+    const resolve = this.takePendingResolve();
+    this.close();
+    resolve?.(result);
+  }
+
+  /** Take and clear the pending resolver (cancel path, called from onClose). */
+  protected takePendingResolve(): ((value: TResult) => void) | null {
+    const resolve = this.pendingResolve;
+    this.pendingResolve = null;
+    return resolve;
   }
 
   /** Shared option-row button for chooser modals. Visual classes are the

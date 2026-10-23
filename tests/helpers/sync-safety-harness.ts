@@ -237,6 +237,7 @@ export function makeActiveV2State(
   let manifestObservations: CommunityPluginManifestObservationV1[] = [];
   const pendingAncestorContent = new Map<string, string | ArrayBuffer>();
   let commitSeq = 1;
+  let contentFactSeq = 1;
   let committedAt = 1;
   let deletionLedger = emptyDeletionLedgerV1();
   let envelope = createFileStateShadowEnvelopeV2({
@@ -344,6 +345,15 @@ export function makeActiveV2State(
     ) => sameSyncScope(record.intent.scope, currentScope) ? record : null),
     retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
     getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
+    get activeV2StorageAuthorityEvidence() {
+      return {
+        kind: "json" as const,
+        databaseId: null,
+        stateCommitSeq: commitSeq,
+        contentFactCommitSeq: contentFactSeq,
+        lifecycleEpoch: 1,
+      };
+    },
     getBaseEntry: vi.fn((path: string) =>
       baseSnapshot.find((entry) => entry.path === path)),
     // 删除记录簿：真实涨落（同族命令式 reduce），并在归约删锚点前按路径读身份。
@@ -411,12 +421,22 @@ export function makeActiveV2State(
     scope: SyncScope,
     folders: RemoteFolderEntry[] = [],
   ) => {
+    const previousContent = JSON.stringify({
+      entries: remoteSnapshot,
+      folders: remoteFolders,
+    });
     remoteSnapshot = entries.map((entry) => ({
       parentId: entry.parentId ?? scope.filesRootId,
       ...entry,
     }));
     remoteFolders = folders.map((entry) => ({ ...entry }));
     commitSeq += 1;
+    if (
+      previousContent
+      !== JSON.stringify({ entries: remoteSnapshot, folders: remoteFolders })
+    ) {
+      contentFactSeq = commitSeq;
+    }
     committedAt += 1;
     const previousEnvelope = envelope;
     envelope = createFileStateShadowEnvelopeV2({

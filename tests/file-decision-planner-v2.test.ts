@@ -2,10 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   generateFileDecisionPlanV2,
   hasOneDriveInvalidNamePath,
+  orderSyncPlanItemsV2,
   protectEasySyncSelfSyncPlan,
   type FileDecisionFactsV2,
 } from "../src/sync/file-decision-planner-v2";
 import {
+  canonicalActionPriority,
   shouldPauseCanonicalPlanForReviewV2,
   summarizeCanonicalPlanReviewV2,
 } from "../src/sync/canonical-plan-v2";
@@ -15,6 +17,7 @@ import {
   type RemoteFileEntry,
   SyncActionType,
   type SyncPlan,
+  type SyncPlanItem,
 } from "../src/sync/types";
 
 function local(
@@ -551,5 +554,56 @@ describe("V2 planner download-side large-file gate", () => {
     expect(conflictPlan.items).toEqual([
       expect.objectContaining({ type: SyncActionType.Conflict, path: "doc.mp4" }),
     ]);
+  });
+});
+
+describe("V2 plan ordering equivalence pin (D5)", () => {
+  function legacyCompare(
+    left: SyncActionType,
+    right: SyncActionType,
+  ): -1 | 0 | 1 {
+    const item = (type: SyncActionType): SyncPlanItem => ({
+      type,
+      path: "probe",
+    });
+    // orderSyncPlanItemsV2 only compares the priority number and relies on the
+    // stable sort for ties, so a strictly smaller priority puts the same type
+    // first regardless of input order while equal priorities preserve the
+    // caller's order. This recovers the legacy priority relation without
+    // exporting the private table.
+    const forward = orderSyncPlanItemsV2([item(left), item(right)]);
+    const backward = orderSyncPlanItemsV2([item(right), item(left)]);
+    if (forward[0].type === left && backward[0].type === left) return -1;
+    if (forward[0].type === right && backward[0].type === right) return 1;
+    return 0;
+  }
+
+  it("keeps every strict legacy priority order as a weak canonical order", () => {
+    // Coarse equivalence only. The legacy table intentionally lumps folder
+    // creates/moves together with uploads/downloads/renames into priority 0,
+    // while canonicalActionPriority splits them into four classes. The legacy
+    // comparator also has no tie-breaker beyond the priority number (stable
+    // sort preserves input order), whereas canonical adds folder depth,
+    // normalized-path and type tie-breakers. Exact sequences are therefore not
+    // comparable and are intentionally not pinned here; only "strict legacy
+    // order may never invert under canonical priority" is pinned.
+    const types = Object.values(SyncActionType);
+    // Sanity-check the probe itself so the loop cannot pass vacuously.
+    expect(legacyCompare(SyncActionType.Upload, SyncActionType.Conflict)).toBe(-1);
+    expect(legacyCompare(SyncActionType.Conflict, SyncActionType.Upload)).toBe(1);
+    expect(legacyCompare(SyncActionType.Upload, SyncActionType.Download)).toBe(0);
+    for (const left of types) {
+      for (const right of types) {
+        const legacy = legacyCompare(left, right);
+        const canonical = canonicalActionPriority(left)
+          - canonicalActionPriority(right);
+        if (legacy < 0) {
+          expect.soft(canonical, `${left} < ${right}`).toBeLessThanOrEqual(0);
+        }
+        if (legacy > 0) {
+          expect.soft(canonical, `${left} > ${right}`).toBeGreaterThanOrEqual(0);
+        }
+      }
+    }
   });
 });

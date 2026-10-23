@@ -185,6 +185,7 @@ function makeUnitInput(
 ): SyncIdleObservationInput {
   return {
     scope: { ...TEST_SYNC_SCOPE },
+    contentFactCommitSeq: 7,
     stateCommitSeq: 7,
     pendingConflicts: [],
     pendingRemoteDeletes: [],
@@ -235,7 +236,7 @@ describe("S1 fact fingerprint composition", () => {
       buildSyncRoundFingerprint(makeUnitInput({
         scope: { ...TEST_SYNC_SCOPE, driveId: "other-drive" },
       })),
-      buildSyncRoundFingerprint(makeUnitInput({ stateCommitSeq: 8 })),
+      buildSyncRoundFingerprint(makeUnitInput({ contentFactCommitSeq: 8 })),
       buildSyncRoundFingerprint(makeUnitInput({
         pendingIssues: [{
           path: "stuck.m4a",
@@ -274,6 +275,15 @@ describe("S1 fact fingerprint composition", () => {
     for (const variant of variants) {
       expect(variant.fingerprint).not.toBe(base.fingerprint);
     }
+  });
+
+  it("ignores the raw envelope commit sequence (bookkeeping, not a fact)", () => {
+    const base = buildSyncRoundFingerprint(makeUnitInput());
+    const next = buildSyncRoundFingerprint(
+      makeUnitInput({ stateCommitSeq: 8 }),
+    );
+    expect(next.fingerprint).toBe(base.fingerprint);
+    expect(next.parts.baseline).toBe(base.parts.baseline);
   });
 
   it("stays stable when only per-round bookkeeping changes (churn immunity)", () => {

@@ -308,6 +308,10 @@ describe("S2 isolation channel: the third blocking point admits bounded folder c
     // 一次结局：同一事实的第二轮由 S4 结出「不可重试诊断」——被隔离的记录
     // 不出现会在同一事实上反复失败的重试入口（复用 S4 判定，不新建第二套）。
     expect(executor.getSyncItemTerminationSnapshot()).toHaveLength(0);
+    // The first round's unrelated upload is itself a content-fact change, so
+    // the baseline settles here; the next round is the first identical one.
+    await executor.run("manual", {});
+    expect(executor.getSyncItemTerminationSnapshot()).toHaveLength(0);
     const second = await executor.run("manual", {});
     expect(second.mutationRecovery).toMatchObject({
       state: "blocked",

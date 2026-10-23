@@ -51,18 +51,20 @@ interface LayoutMigrationMarker {
   completed?: boolean;
 }
 
-function normalizePath(path: string): string {
+/** Separator-only normalization (backslashes, duplicate and trailing slashes);
+ *  it deliberately does not touch Unicode form or case. */
+function normalizeLayoutPath(path: string): string {
   return path.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/\/$/, "");
 }
 
 function relativeToPlugin(path: string, pluginDir: string): string | null {
-  const prefix = `${normalizePath(pluginDir)}/`;
-  const normalized = normalizePath(path);
+  const prefix = `${normalizeLayoutPath(pluginDir)}/`;
+  const normalized = normalizeLayoutPath(path);
   return normalized.startsWith(prefix) ? normalized.slice(prefix.length) : null;
 }
 
 function join(pluginDir: string, relative: string): string {
-  return `${normalizePath(pluginDir)}/${relative}`;
+  return `${normalizeLayoutPath(pluginDir)}/${relative}`;
 }
 
 /** A path-valued key of the registry (excludes the version/counter fields). */
@@ -160,7 +162,7 @@ function mapLegacyRelativePath(
   legacy: EasySyncPathSet,
   current: EasySyncPathSet,
 ): string | null {
-  const normalized = normalizePath(relative);
+  const normalized = normalizeLayoutPath(relative);
   const legacyRoot = legacy.pluginDir;
   const currentRoot = current.pluginDir;
   const directPairs: Array<[string, string]> =
@@ -215,9 +217,9 @@ async function collectFiles(
     if (!listed || !Array.isArray(listed.files) || !Array.isArray(listed.folders)) {
       return;
     }
-    output.push(...listed.files.map(normalizePath));
+    output.push(...listed.files.map(normalizeLayoutPath));
     for (const folder of listed.folders) {
-      await collectFiles(adapter, normalizePath(folder), output);
+      await collectFiles(adapter, normalizeLayoutPath(folder), output);
     }
   } catch {
     return;
@@ -228,7 +230,7 @@ async function pruneEmptyDirectoryTree(
   adapter: DataAdapter,
   directory: string,
 ): Promise<boolean> {
-  const root = normalizePath(directory);
+  const root = normalizeLayoutPath(directory);
   let listed: { files: string[]; folders: string[] };
   try {
     listed = await adapter.list(root);
@@ -240,7 +242,7 @@ async function pruneEmptyDirectoryTree(
   }
 
   let removedAny = false;
-  for (const folder of listed.folders.map(normalizePath)) {
+  for (const folder of listed.folders.map(normalizeLayoutPath)) {
     if (!folder.startsWith(`${root}/`)) continue;
     removedAny = await pruneEmptyDirectoryTree(adapter, folder) || removedAny;
   }
@@ -313,8 +315,8 @@ async function ensureDirectories(
 ): Promise<boolean> {
   const candidate = adapter as unknown as { mkdir?: (path: string) => Promise<void> };
   if (typeof candidate.mkdir !== "function") return false;
-  const normalizedRoot = normalizePath(existingRoot);
-  const ordered = [...new Set(directories.map(normalizePath))]
+  const normalizedRoot = normalizeLayoutPath(existingRoot);
+  const ordered = [...new Set(directories.map(normalizeLayoutPath))]
     .sort((left, right) => left.split("/").length - right.split("/").length);
   for (const directory of ordered) {
     if (!directory.startsWith(`${normalizedRoot}/`)) continue;
@@ -329,7 +331,7 @@ async function ensureDirectories(
 }
 
 function parentDirectory(path: string): string {
-  const normalized = normalizePath(path);
+  const normalized = normalizeLayoutPath(path);
   const separator = normalized.lastIndexOf("/");
   return separator < 0 ? "" : normalized.slice(0, separator);
 }
@@ -447,7 +449,7 @@ export async function ensureEasySyncRuntimeLayoutMigration(
     const targetRelative = mapLegacyRelativePath(relative, legacy, current);
     if (!targetRelative) continue;
     const targetPath = join(current.pluginDir, targetRelative);
-    if (normalizePath(sourcePath) === normalizePath(targetPath)) continue;
+    if (normalizeLayoutPath(sourcePath) === normalizeLayoutPath(targetPath)) continue;
     if (await adapter.exists(targetPath)) {
       // During the grace period the current tree already owns this sidecar and
       // the legacy copy is stale by contract, so comparing them would report a
@@ -494,7 +496,7 @@ function isDiscardableLegacySidecar(
   relative: string,
   legacy: EasySyncPathSet,
 ): boolean {
-  const normalized = normalizePath(relative);
+  const normalized = normalizeLayoutPath(relative);
   const discardable = EASY_SYNC_LAYOUT_DISCARDABLE_SIDECAR_KEYS
     .map((key) => legacy[key]);
   return discardable.some(

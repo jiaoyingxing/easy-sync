@@ -77,6 +77,22 @@ function isVaultRelativeFilePath(path: string): boolean {
       Boolean(segment) && segment !== "." && segment !== "..");
 }
 
+/**
+ * True only when a rename's two paths differ solely by file-name spelling
+ * (case / NFC) inside the same byte-identical parent. This is the exact shape
+ * `detectRenames` produces for a local file-name case change; it is not a
+ * vacuous self-move and not a relocated file.
+ */
+function isFileNameSpellingAlias(path: string, sourcePath: string): boolean {
+  if (path === sourcePath) return false;
+  const parent = (value: string): string => {
+    const slash = value.lastIndexOf("/");
+    return slash === -1 ? "" : value.slice(0, slash);
+  };
+  return parent(path) === parent(sourcePath)
+    && normalizeRemotePathKey(path) === normalizeRemotePathKey(sourcePath);
+}
+
 function conservativeResetReceiptMatchesIntent(
   record: Readonly<MutationLedgerEntryV1>,
 ): boolean {
@@ -255,10 +271,21 @@ export function isOrdinaryFileRecoveryRecord(
   }
   const sourceBound = intent.action === "renameRemote"
     || intent.action === "moveLocal";
+  // A file-name case change is a real rename (the cloud name changes) whose
+  // two paths normalize-equal. The execution receipt and recovery settlement
+  // must stay admissible so this shape keeps the ordinary record contract
+  // instead of becoming an unreceiptable record (field report 2026-10-22).
+  // Only renameRemote can produce it (detectRenames, same byte-identical
+  // parent); exact self-moves, parent-spelling changes and moveLocal stay
+  // rejected.
+  const fileNameSpellingAlias = intent.action === "renameRemote"
+    && intent.sourcePath !== undefined
+    && isFileNameSpellingAlias(intent.path, intent.sourcePath);
   if (
     sourceBound !== Boolean(intent.sourcePath)
     || (
       intent.sourcePath !== undefined
+      && !fileNameSpellingAlias
       && normalizeRemotePathKey(intent.sourcePath)
         === normalizeRemotePathKey(intent.path)
     )

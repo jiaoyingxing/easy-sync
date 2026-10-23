@@ -78,7 +78,7 @@ describe("plan confirm boundary sentence and cloud join summary", () => {
       "原云端同步目录无法继续使用。确认后重新创建目录并核对内容。",
     );
     expect(en.t("syncPlan.remoteScopeRecreateSummary")).toBe(
-      "The previous remote sync folder can no longer be used. After you confirm, EasySync will recreate the folder and check the content.",
+      "The previous cloud sync folder can no longer be used. After you confirm, EasySync will recreate the folder and check the content.",
     );
     expect(zh.t("syncPlan.activationDecisionSummary")).toBe(
       "冲突和云端已删除的文件不会自动处理，同步完成后由你逐条决定。",

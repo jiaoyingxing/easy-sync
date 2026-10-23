@@ -15,6 +15,7 @@
  */
 
 import { sha256Hex } from "../crypto";
+import { describeError } from "../obsidian-compat";
 
 /** 留档根目录：插件目录下的固定子目录名。 */
 const LOCAL_ARCHIVE_DIR_NAME = "archive";
@@ -355,7 +356,7 @@ async function readSourceBytes(
   } catch (error) {
     throw new LocalArchiveSourceChangedError(
       input.path,
-      error instanceof Error ? error.message : String(error),
+      describeError(error),
     );
   }
 }

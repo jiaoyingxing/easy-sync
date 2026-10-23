@@ -1,10 +1,11 @@
+import { SIGNIFICANT_THROUGHPUT_DROP_RATIO } from "./transfer-throughput-threshold";
+
 export const ADAPTIVE_DOWNLOAD_MAX_BYTES = 8 * 1024 * 1024;
 export const ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY = 3;
 export const MOBILE_DOWNLOAD_MAX_CONCURRENCY = 2;
 
 const MIN_HEALTHY_BATCH_BYTES = 128 * 1024;
 const MIN_HEALTHY_THROUGHPUT_BPS = 512 * 1024;
-const SIGNIFICANT_THROUGHPUT_DROP_RATIO = 0.5;
 
 interface DownloadBatchObservation {
   files: number;
