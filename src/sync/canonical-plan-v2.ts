@@ -344,6 +344,53 @@ function collectCarriedFolderMovesV2({
   return { carriedFolderMoves, projectedFolderIdentities };
 }
 
+interface CanonicalPlannedFileMovementsInputV2 {
+  state: CanonicalActionCompositionFactsV2["state"];
+  localFiles: readonly LocalFileEntry[];
+  projectedFolderIdentities: readonly { path: string; remoteId: string }[];
+  carriedFolderMoves: readonly { sourcePath: string; targetPath: string }[];
+  includeFilePath: (path: string) => boolean;
+  remoteFilesById: ReadonlyMap<string, RemoteFileEntry>;
+}
+
+/**
+ * F29 切片 2（2026-10-25）：本计划真的会发射的文件 `move-local`，按锚点索引到
+ * 目标路径。文件夹移动的后代投影闸用它区分两种不符：
+ *   · 已被本轮的独立文件移动对账（下一轮后代会落在机械翻译的位置）；
+ *   · 没有本轮动作可依赖（墓碑、出范围、内容冲突、被别的文件夹移动携带等）。
+ * 过滤条件必须与 `applyIdentityRenameActionsV2` 的发射条件逐条一致，否则会把
+ * 「会被吞掉的动作」误当成对账依据：范围、携带、远端事实缺一不可。
+ */
+function collectPlannedFileMoveTargetsV2({
+  state,
+  localFiles,
+  projectedFolderIdentities,
+  carriedFolderMoves,
+  includeFilePath,
+  remoteFilesById,
+}: CanonicalPlannedFileMovementsInputV2): Map<string, string> {
+  const targets = new Map<string, string>();
+  for (const action of planIdentityRenamesFromStateV2(
+    state,
+    localFiles,
+    { projectedFolderIdentities },
+  )) {
+    if (action.type !== "move-local") continue;
+    if (
+      !includeFilePath(action.fromPath)
+      || !includeFilePath(action.toPath)
+    ) continue;
+    if (isFileMoveCarriedByFolderMove(
+      action.fromPath,
+      action.toPath,
+      carriedFolderMoves,
+    )) continue;
+    if (!remoteFilesById.has(action.remoteId)) continue;
+    targets.set(action.anchorId, action.toPath);
+  }
+  return targets;
+}
+
 interface CanonicalPlanIndexesInputV2 {
   state: CanonicalActionCompositionFactsV2["state"];
   input: CanonicalActionCompositionFactsV2;
@@ -458,6 +505,7 @@ function composeCanonicalActionsV2(
   }
 
   const state = input.state;
+  const includeFilePath = input.includeFilePath ?? (() => true);
   const { carriedFolderMoves, projectedFolderIdentities } = collectCarriedFolderMovesV2({
     folderPlan,
     state,
@@ -472,6 +520,14 @@ function composeCanonicalActionsV2(
     remoteFilesById,
     plannedRemoteCreates,
   } = buildCanonicalPlanIndexesV2({ state, input, folderPlan });
+  const plannedFileMoveByAnchorId = collectPlannedFileMoveTargetsV2({
+    state,
+    localFiles: input.localFiles,
+    projectedFolderIdentities,
+    carriedFolderMoves,
+    includeFilePath,
+    remoteFilesById,
+  });
   const createItems: SyncPlanItem[] = [];
   const moveItems: SyncPlanItem[] = [];
   const deleteItems: SyncPlanItem[] = [];
@@ -488,6 +544,8 @@ function composeCanonicalActionsV2(
       canonicalFolderPathById,
       plannedRemoteFolderPaths,
       plannedRemoteCreates,
+      includeFilePath,
+      plannedFileMoveByAnchorId,
       configDir: input.configDir,
       automaticDeleteLocalFiles: input.automaticDeleteLocalFiles,
       createItems,
@@ -567,7 +625,6 @@ function composeCanonicalActionsV2(
     fileItems = heldFileItems;
   }
 
-  const includeFilePath = input.includeFilePath ?? (() => true);
   const identityResult = applyIdentityRenameActionsV2({
     state,
     localFiles: input.localFiles,
@@ -723,6 +780,8 @@ interface ApplyFolderMoveItemInputV2 {
   plannedRemoteCreates: ReadonlySet<string>;
   canonicalFolderPathById: ReadonlyMap<string, string>;
   plannedRemoteFolderPaths: ReadonlyMap<string, string>;
+  includeFilePath: (path: string) => boolean;
+  plannedFileMoveByAnchorId: ReadonlyMap<string, string>;
   moveItems: SyncPlanItem[];
   deferredItems: SyncPlanItem[];
   protectedRoots: Set<string>;
@@ -744,6 +803,8 @@ function applyFolderMoveItemV2({
   plannedRemoteCreates,
   canonicalFolderPathById,
   plannedRemoteFolderPaths,
+  includeFilePath,
+  plannedFileMoveByAnchorId,
   moveItems,
   deferredItems,
   protectedRoots,
@@ -819,6 +880,24 @@ function applyFolderMoveItemV2({
   // descendant would look diverged). A destination parent created in this same
   // plan has no identity yet — there the gate stays open and the reducer
   // judges the committed result, as before.
+  //
+  // F29 切片 2 (2026-10-25) — 同轮后代对账. The reducer asserts two families
+  // under the source path, and the gate now mirrors both:
+  //   · folder anchors (reducer `nextFolderAnchors` loop, root included):
+  //     every one must project to the mechanical translation. Any drift here
+  //     is terminal — no same-round file action can align a folder identity;
+  //   · file anchors (reducer `nextFileAnchors` loop): a mismatch is either
+  //     already reconciled by a file `move-local` this same plan really emits
+  //     (then the next round's subtree is aligned), or it is terminal
+  //     (tombstone, out of scope, content conflict, carried by another folder
+  //     move). Terminal is sticky.
+  // A move whose only mismatches are covered file anchors is withheld **without**
+  // a deferral row and without protecting the roots: the descendants reconcile
+  // this round through their own actions, and the next round emits the folder
+  // move against an aligned subtree. That is the same convergence as slice 1,
+  // minus the user-visible deferral for a transient shape. Everything else
+  // keeps the slice-1 deferral (F29-①/②), so a structural mismatch still has
+  // the reviewable row.
   if (parentRemoteId !== undefined) {
     const movedName = item.targetPath.slice(item.targetPath.lastIndexOf("/") + 1);
     const patchedPathById = projectRemoteNodesV2(
@@ -827,23 +906,84 @@ function applyFolderMoveItemV2({
         : node),
       state.scope.filesRootId,
     ).pathById;
-    for (const anchor of state.fileAnchors) {
-      if (!isAnchoredDescendantV2(anchor.lastPath, item.sourcePath)) continue;
-      const translatedDescendant = translateAnchoredPathV2(
-        anchor.lastPath,
+    let deferred = false;
+    // Folder anchors first, in the reducer's own scope: NFC equality or strict
+    // NFC descendant (the plan's case-folded `isAtOrBelowPath` would over-match
+    // and the receipt assertion this mirrors is byte-exact).
+    for (const folderAnchor of state.folderAnchors ?? []) {
+      if (!isNfcAtOrBelowV2(folderAnchor.lastPath, item.sourcePath)) continue;
+      const translatedFolder = translateAnchoredPathV2(
+        folderAnchor.lastPath,
         item.sourcePath,
         item.targetPath,
       );
+      const projectedFolder = patchedPathById.get(folderAnchor.remoteId);
+      const folderNode = state.remoteNodeById.get(folderAnchor.remoteId);
       if (
-        !anchor.remoteId
-        || patchedPathById.get(anchor.remoteId) !== translatedDescendant
+        projectedFolder !== translatedFolder
+        || !folderNode
+        || folderNode.kind !== "folder"
       ) {
-        deferredItems.push(toDeferredFolderPlanItem(
-          item.path,
-          "remote-subtree-changed",
-        ));
-        return;
+        deferred = true;
+        break;
       }
+    }
+    let coveredFileMismatch = false;
+    // Carried descendants (their projection already matches the mechanical
+    // translation) have no file action of their own. When the folder move is
+    // withheld for one round, they must not be re-decided as ordinary files:
+    // the ordinary planner would otherwise download the remote copy to the
+    // target path, create the destination directory and block the next
+    // round's folder move with `target-occupied`. Protect both spellings for
+    // this round only; the moved-out descendant stays unprotected so its own
+    // move-local can reconcile the subtree.
+    const carriedDescendantPaths = new Set<string>();
+    if (!deferred) {
+      for (const anchor of state.fileAnchors) {
+        if (!isAnchoredDescendantV2(anchor.lastPath, item.sourcePath)) continue;
+        const translatedDescendant = translateAnchoredPathV2(
+          anchor.lastPath,
+          item.sourcePath,
+          item.targetPath,
+        );
+        const projectedDescendant = anchor.remoteId
+          ? patchedPathById.get(anchor.remoteId)
+          : undefined;
+        if (anchor.remoteId && projectedDescendant === translatedDescendant) {
+          carriedDescendantPaths.add(anchor.lastPath);
+          carriedDescendantPaths.add(translatedDescendant);
+          continue;
+        }
+        const plannedTarget = plannedFileMoveByAnchorId.get(anchor.anchorId);
+        if (
+          !anchor.remoteId
+          || !includeFilePath(anchor.lastPath)
+          || plannedTarget === undefined
+          || projectedDescendant === undefined
+          || normalizeRemotePathKey(plannedTarget)
+            !== normalizeRemotePathKey(projectedDescendant)
+        ) {
+          deferred = true;
+          continue;
+        }
+        coveredFileMismatch = true;
+      }
+    }
+    if (deferred) {
+      deferredItems.push(toDeferredFolderPlanItem(
+        item.path,
+        "remote-subtree-changed",
+      ));
+      return;
+    }
+    // Every mismatch is on its way to being aligned by this round's own file
+    // moves: hold the folder move silently and let the next round emit it.
+    if (coveredFileMismatch) {
+      for (const path of carriedDescendantPaths) {
+        protectedRoots.add(path);
+        otherProtectedRoots.add(path);
+      }
+      return;
     }
   }
   moveItems.push({
@@ -885,6 +1025,8 @@ function applyFolderPlanItemV2(args: {
   canonicalFolderPathById: ReadonlyMap<string, string>;
   plannedRemoteFolderPaths: ReadonlyMap<string, string>;
   plannedRemoteCreates: Set<string>;
+  includeFilePath: (path: string) => boolean;
+  plannedFileMoveByAnchorId: ReadonlyMap<string, string>;
   configDir: string;
   automaticDeleteLocalFiles: boolean;
   createItems: SyncPlanItem[];
@@ -902,6 +1044,8 @@ function applyFolderPlanItemV2(args: {
     canonicalFolderPathById,
     plannedRemoteFolderPaths,
     plannedRemoteCreates,
+    includeFilePath,
+    plannedFileMoveByAnchorId,
     configDir,
     automaticDeleteLocalFiles,
     createItems,
@@ -966,6 +1110,8 @@ function applyFolderPlanItemV2(args: {
       plannedRemoteCreates,
       canonicalFolderPathById,
       plannedRemoteFolderPaths,
+      includeFilePath,
+      plannedFileMoveByAnchorId,
       moveItems,
       deferredItems,
       protectedRoots,
@@ -1693,6 +1839,7 @@ export async function finalizeCanonicalPlanCandidateV2(
   let remainingDownloadBudget = input.baselineReconstructionIncomplete
     ? Number.POSITIVE_INFINITY
     : 10;
+  const oneWay = (input.syncDirection ?? DEFAULT_SYNC_DIRECTION) === "one-way";
 
   const identityCandidateCount =
     identityMoveVerifications.length + identityReplacements.length;
@@ -1775,8 +1922,69 @@ export async function finalizeCanonicalPlanCandidateV2(
     });
   }
 
+  // One-sided `localDeletedRemoteModified` conflicts cannot enter the ordinary
+  // selector (they have no local entry). Verify them against the base with the
+  // budget the both-sides pass left over: equal bytes mean the remote only
+  // changed its version, so the ordinary local-deletion delete is safe; a
+  // different or unprovable payload keeps the user decision.
+  const remoteOnlyDeletes = new Set<string>();
+  let remoteOnlyCandidateCount = 0;
+  let remoteOnlyEvidenceCount = 0;
+  let remoteOnlyDownloadCount = 0;
+  if (!oneWay) {
+    const remoteOnly = selectRemoteOnlyConflictVerificationCandidatesV2({
+      items,
+      baseByPath,
+      pendingByPath,
+      configDir: input.configDir,
+      verifiedRemoteContentHashesById: input.verifiedRemoteContentHashesById,
+      remainingDownloadBudget: input.baselineReconstructionIncomplete
+        ? Number.POSITIVE_INFINITY
+        : Math.max(0, remainingDownloadBudget - downloadCandidates.length),
+    });
+    remoteOnlyCandidateCount = remoteOnly.candidates.length;
+    remoteOnlyEvidenceCount = remoteOnly.evidenceCandidates.length;
+    remoteOnlyDownloadCount = remoteOnly.downloadCandidates.length;
+    const remoteOnlySelected = [
+      ...remoteOnly.evidenceCandidates,
+      ...remoteOnly.downloadCandidates,
+    ];
+    await refreshVerificationDownloadUrlsV2({
+      downloadCandidates: remoteOnly.downloadCandidates,
+      input,
+    });
+    const remoteOnlyPrefetched = await prefetchVerificationDownloadHashesV2({
+      downloadCandidates: remoteOnly.downloadCandidates,
+      input,
+    });
+    for (let index = 0; index < remoteOnlySelected.length; index++) {
+      await settleRemoteOnlyConflictVerificationV2({
+        index,
+        selectedCandidates: remoteOnlySelected,
+        baseByPath,
+        verifiedRemoteContentHashesById: input.verifiedRemoteContentHashesById,
+        prefetchedDownloadHashes: remoteOnlyPrefetched,
+        resolveRemoteContentHash: input.resolveRemoteContentHash,
+        remoteOnlyDeletes,
+        results,
+      });
+    }
+  }
+
   if (falseConflicts.size > 0) {
     items = items.filter((item) => !falseConflicts.has(item.path));
+  }
+  if (remoteOnlyDeletes.size > 0) {
+    items = items.flatMap((item): SyncPlanItem[] => {
+      if (item.type !== SyncActionType.Conflict
+        || !remoteOnlyDeletes.has(item.path)) return [item];
+      return [{
+        type: SyncActionType.DeleteRemote,
+        path: item.path,
+        remote: item.remote,
+        reason: "reason.fileDeletedLocally",
+      }];
+    });
   }
   items = [...identityItems, ...items];
   // 片①／片② 单向同步的单一挂点：改写与抑制都必须发生在决策令牌绑定
@@ -1787,12 +1995,25 @@ export async function finalizeCanonicalPlanCandidateV2(
   // 口径即 `autoDeleteLocalFiles = true` 的等效行为（applyAutomaticHandlingPolicy
   // 是它唯一的功能性应用点）；目录级标记在建计划期就已由该开关决定，只能在这里
   // 清掉（SkipLargeFile 等其余标记一律不动）。
-  const oneWay = (input.syncDirection ?? DEFAULT_SYNC_DIRECTION) === "one-way";
   if (oneWay) {
     items = applyOneWayLocalOnlyCopyPlan(items, input.configDir);
     items = applyOneWayLocalDeletedPullBackPlan(items, input.configDir);
     items = suppressOutboundUserContentActions(items, input.configDir);
     items = forceRemoteFolderDeleteFollow(items, input.configDir);
+  }
+  // Two-way mode: the same-content-copy identity hold is a wait, not a user
+  // decision. Keep the internal placeholder through the identity layer (the
+  // old-path decision is what keeps the copies' uploads from being blocked),
+  // then drop only the visible conflict from the finalized plan. One-way keeps
+  // the item above so it can still be rewritten to the pull-back download.
+  // The next ordinary round either sees the copies anchored (`DeleteRemote`)
+  // or recreates the same silent hold when their uploads have not committed.
+  if (!oneWay) {
+    items = items.filter((item) =>
+      !(item.type === SyncActionType.Conflict
+        && item.reason === "reason.renameIdentityAmbiguous")
+    );
+    items = suppressParentUnavailableWhenParentCreated(items);
   }
   items = applyAutomaticHandlingPolicy(
     items,
@@ -1824,20 +2045,26 @@ export async function finalizeCanonicalPlanCandidateV2(
     contentVerification: {
       candidates:
         identityCandidateCount
-        + candidates.length,
+        + candidates.length
+        + remoteOnlyCandidateCount,
       cachedEvidence:
         identityCachedEvidence
-        + evidenceCandidates.length,
+        + evidenceCandidates.length
+        + remoteOnlyEvidenceCount,
       downloads:
         identityDownloads
-        + downloadCandidates.length,
+        + downloadCandidates.length
+        + remoteOnlyDownloadCount,
       skippedDownloads:
         identityCandidateCount
         - identityCachedEvidence
         - identityDownloads
         + candidates.length
         - evidenceCandidates.length
-        - downloadCandidates.length,
+        - downloadCandidates.length
+        + remoteOnlyCandidateCount
+        - remoteOnlyEvidenceCount
+        - remoteOnlyDownloadCount,
       results: [...identityResults, ...results],
     },
     requiresThresholdConfirmation,
@@ -2198,6 +2425,171 @@ async function settleSelectedCandidateVerificationV2(args: {
       error: describeError(error),
     });
   }
+}
+
+interface RemoteOnlyConflictVerificationSelectionV2 {
+  candidates: SyncPlanItem[];
+  evidenceCandidates: SyncPlanItem[];
+  downloadCandidates: SyncPlanItem[];
+}
+
+/**
+ * Remote-only conflicts (`localDeletedRemoteModified`) have no local entry, so
+ * the ordinary equality selector cannot see them. Select them separately: a
+ * remote hash (or a verified receipt) is zero-cost evidence; the rest may use
+ * the download budget that the both-sides verification left over. A pending
+ * difference receipt is bound to the base version and the exact remote
+ * version, so an already-proven difference is not downloaded again.
+ */
+function selectRemoteOnlyConflictVerificationCandidatesV2(args: {
+  items: SyncPlanItem[];
+  baseByPath: ReadonlyMap<string, BaseFileEntry>;
+  pendingByPath: ReadonlyMap<
+    string,
+    Parameters<typeof contentDifferenceReceiptMatches>[0]
+  >;
+  configDir: string;
+  verifiedRemoteContentHashesById: ReadonlyMap<string, string> | undefined;
+  remainingDownloadBudget: number;
+}): RemoteOnlyConflictVerificationSelectionV2 {
+  const candidates: SyncPlanItem[] = [];
+  for (const item of args.items) {
+    if (
+      item.type !== SyncActionType.Conflict
+      || item.reason !== "reason.localDeletedRemoteModified"
+      || item.local
+      || !item.remote
+    ) continue;
+    if (isObsidianManagedConfigPath(item.path, args.configDir)) continue;
+    if (isAtOrBelowPath(item.path, `${args.configDir}/plugins`)) continue;
+    const base = args.baseByPath.get(item.path);
+    if (!base) continue;
+    if (contentDifferenceReceiptMatches(
+      args.pendingByPath.get(item.path),
+      base,
+      item.remote,
+    )) continue;
+    candidates.push(item);
+  }
+  const evidenceCandidates = candidates.filter((item) =>
+    Boolean(
+      item.remote!.sha256Hash
+      ?? args.verifiedRemoteContentHashesById?.get(item.remote!.driveId),
+    ));
+  const evidencePaths = new Set(evidenceCandidates.map((item) => item.path));
+  const downloadCandidates = candidates
+    .filter((item) => !evidencePaths.has(item.path))
+    .slice(0, args.remainingDownloadBudget);
+  return { candidates, evidenceCandidates, downloadCandidates };
+}
+
+/**
+ * Settle one remote-only conflict: equal bytes against the base mean the
+ * remote did not really change, so the ordinary local-deletion delete is safe
+ * and the conflict is replaced in the same round. Different or unprovable
+ * bytes keep the conflict; a downloaded difference is stamped on the item so
+ * the next round does not pay for the same comparison again.
+ */
+async function settleRemoteOnlyConflictVerificationV2(args: {
+  index: number;
+  selectedCandidates: readonly SyncPlanItem[];
+  baseByPath: ReadonlyMap<string, BaseFileEntry>;
+  verifiedRemoteContentHashesById: ReadonlyMap<string, string> | undefined;
+  prefetchedDownloadHashes: ReadonlyMap<
+    string,
+    { hash: string } | { error: unknown }
+  >;
+  resolveRemoteContentHash: FinalizeCanonicalPlanInputV2["resolveRemoteContentHash"];
+  remoteOnlyDeletes: Set<string>;
+  results: ContentVerificationResultV2[];
+}): Promise<void> {
+  const item = args.selectedCandidates[args.index];
+  const base = args.baseByPath.get(item.path);
+  const remote = item.remote;
+  if (!base || !remote) return;
+  let downloadedHash: string | undefined;
+  try {
+    let equality: "equal" | "different";
+    const knownHash = remote.sha256Hash
+      ?? args.verifiedRemoteContentHashesById?.get(remote.driveId);
+    if (knownHash) {
+      equality = remote.size === base.size
+        && knownHash.toLowerCase() === base.hash.toLowerCase()
+        ? "equal"
+        : "different";
+    } else {
+      const prefetched = args.prefetchedDownloadHashes.get(item.path);
+      if (prefetched) {
+        if ("error" in prefetched) {
+          throw prefetched.error instanceof Error
+            ? prefetched.error
+            : new Error(String(prefetched.error));
+        }
+        downloadedHash = prefetched.hash;
+      } else {
+        downloadedHash = await args.resolveRemoteContentHash(item, {
+          current: args.index + 1,
+          total: args.selectedCandidates.length,
+        });
+      }
+      equality = remote.size === base.size
+        && downloadedHash.toLowerCase() === base.hash.toLowerCase()
+        ? "equal"
+        : "different";
+    }
+    if (equality === "equal") {
+      args.remoteOnlyDeletes.add(item.path);
+    } else if (downloadedHash) {
+      item.contentComparison = createContentDifferenceReceipt(
+        base,
+        remote,
+        downloadedHash,
+      );
+    }
+    args.results.push({
+      path: item.path,
+      outcome: equality,
+      proof: downloadedHash ? "downloadedSha256" : "remoteSha256",
+      downloaded: downloadedHash !== undefined,
+    });
+  } catch (error) {
+    args.results.push({
+      path: item.path,
+      outcome: "failed",
+      downloaded: downloadedHash !== undefined,
+      error: describeError(error),
+    });
+  }
+}
+
+function parentPath(path: string): string {
+  const index = path.lastIndexOf("/");
+  return index < 0 ? "" : path.slice(0, index);
+}
+
+/**
+ * A planned folder create commits its own anchor in the same receipt
+ * (`folder-state-reducer-v2`). When the file identity move is only waiting for
+ * that parent, keep the wait internal; the next ordinary round sees the
+ * anchored parent and emits the move. The folder create failure remains the
+ * visible, actionable item.
+ */
+function suppressParentUnavailableWhenParentCreated(
+  items: SyncPlanItem[],
+): SyncPlanItem[] {
+  const createdParents = new Set(
+    items
+      .filter((item) => item.type === SyncActionType.CreateLocalFolder
+        || item.type === SyncActionType.CreateRemoteFolder)
+      .map((item) => normalizeRemotePathKey(item.path)),
+  );
+  if (createdParents.size === 0) return items;
+  return items.filter((item) => {
+    if (item.type !== SyncActionType.FolderDeferred
+      || item.reason !== "reason.identityMove.parentUnavailable") return true;
+    const parent = parentPath(item.path);
+    return parent === "" || !createdParents.has(normalizeRemotePathKey(parent));
+  });
 }
 
 function classifyIdentityReplacementV2(
@@ -3355,6 +3747,16 @@ export function isAtOrBelowPath(path: string, root: string): boolean {
   const normalizedRoot = normalizeRemotePathKey(root);
   return normalizedPath === normalizedRoot
     || normalizedPath.startsWith(`${normalizedRoot}/`);
+}
+
+/**
+ * 归约层文件夹移动回执的后代范围（`folder-state-reducer-v2` 的 `isAtOrBelow`）：
+ * NFC 相等或严格 NFC 后代，根包含在内。刻意不做大小写折叠——它保护的断言是
+ * 逐字节的，规划门不能放宽成 `isAtOrBelowPath`。
+ */
+function isNfcAtOrBelowV2(path: string, root: string): boolean {
+  return path.normalize("NFC") === root.normalize("NFC")
+    || isAnchoredDescendantV2(path, root);
 }
 
 export function isProtectedFolderDeletePath(

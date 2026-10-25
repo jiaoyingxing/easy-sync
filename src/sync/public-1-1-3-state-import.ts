@@ -117,8 +117,8 @@ export async function public113MigrationInputDigest(
 }
 
 /**
- * pluginData keys the plugin's own run loop rewrites on its own between
- * rounds, with zero migration semantics (none of them is read by the
+ * pluginData keys the plugin's own run loop rewrites on its own
+ * between rounds, with zero migration semantics (none of them is read by the
  * cutover, the ledger takeover or the adoption paths). The V2 binding
  * masks only this set: every other persisted value — settings, unknown
  * future keys, all migration carriers — stays bound, so an unexpected
@@ -127,7 +127,9 @@ export async function public113MigrationInputDigest(
  * these keys made the authority guards fail on every round with the plan
  * itself unchanged (F31 third layer). Maintenance rule: a key that starts
  * carrying migration semantics must be removed from this set in the same
- * change.
+ * change. `easy-sync-transfer-rates-window` was retired on 2026-10-24 (no
+ * writer remains); it stays masked here because existing stores still carry
+ * the dead key on disk, and the mask is a harmless no-op for them.
  */
 const PUBLIC_113_SELF_CHURNING_PLUGIN_DATA_KEYS = [
   "easy-sync-history",

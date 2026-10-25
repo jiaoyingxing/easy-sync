@@ -3,6 +3,7 @@ import {
   ExtraButtonComponent,
   Notice,
   SearchComponent,
+  setIcon,
   Setting,
   ToggleComponent,
 } from "obsidian";
@@ -35,6 +36,28 @@ import { SequentialSettingsUpdateQueue } from "./sequential-settings-update-queu
 import {
   isCommunityPluginCloudCleanupCandidateV1,
 } from "../sync/community-plugin-cloud-cleanup-v1";
+
+/** 「同步范围」顶部说明的句内官方齿轮（2026-10-24 用户要求）：中文句以 ⚙
+ *  字符指代下方每行的设置按钮，渲染时把字符替换为与按钮同款的 lucide
+ *  「settings」图标，指代更明确；句内无该字符的语言（英文用文字表述）原样
+ *  返回字符串。返回 string｜DocumentFragment——设置行 setDesc 两态直收；
+ *  无 DOM 的单测环境退回纯文本（与 sync-notice 的同款守卫一致）。弹框顶部
+ *  说明与 1.13+ 设置页规则行同句共用，保证两载体一致。 */
+export function buildIntroTextWithInlineGear(
+  text: string,
+): string | DocumentFragment {
+  if (typeof document === "undefined") return text;
+  const parts = text.split("⚙");
+  if (parts.length !== 2) return text;
+  return createFragment((fragment) => {
+    fragment.append(parts[0]);
+    setIcon(
+      fragment.createSpan({ cls: "easy-sync-inline-gear" }),
+      "settings",
+    );
+    fragment.append(parts[1]);
+  });
+}
 
 type ConfigSyncView =
   | "scope"
@@ -195,10 +218,12 @@ export class ConfigSyncModal extends EasySyncModal {
     this.contentEl.empty();
     this.contentEl.removeClass("easy-sync-community-plugin-page");
     this.setTitle(t("settings.syncScope.title"));
-    this.contentEl.createEl("p", {
-      text: t("settings.syncScope.intro"),
+    const scopeIntro = this.contentEl.createEl("p", {
       cls: "setting-item-description easy-sync-modal-intro",
     });
+    const intro = buildIntroTextWithInlineGear(t("settings.syncScope.intro"));
+    if (typeof intro === "string") scopeIntro.setText(intro);
+    else scopeIntro.appendChild(intro);
 
     // Core plugins leads the list; the remaining scope switches follow the
     // community-plugin pair (see trailingToggles).

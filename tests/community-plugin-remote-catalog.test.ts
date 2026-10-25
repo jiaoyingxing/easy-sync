@@ -310,6 +310,45 @@ describe("remote community-plugin catalog", () => {
       expect(withRootCatalog.revision).toBe(first.revision);
     });
 
+    it("keeps the previous observedAt when the round rebuild sees unchanged content", async () => {
+      // W1 2026-10-24: the round-end rebuild used to stamp a fresh
+      // observedAt on every round even when the cloud content was
+      // byte-identical, which defeated the persist short-circuit and paid
+      // one full data.json write per round (~480/day idle). When the
+      // sourceDigest matches the previous catalog, the whole catalog must
+      // stay byte-identical — observedAt included.
+      const first = await buildRemoteCommunityPluginCatalogFromIndex({
+        scope: SCOPE,
+        configDir: ".obsidian",
+        index: committedIndex(items(10)),
+        manifestObservations: [],
+        observedAt: 10,
+        previous: null,
+      });
+      const unchanged = await buildRemoteCommunityPluginCatalogFromIndex({
+        scope: SCOPE,
+        configDir: ".obsidian",
+        index: committedIndex(items(10)),
+        manifestObservations: [],
+        observedAt: 20,
+        previous: first,
+      });
+      expect(unchanged.observedAt).toBe(first.observedAt);
+      expect(JSON.stringify(unchanged)).toBe(JSON.stringify(first));
+
+      // A real content change still refreshes the observation timestamp.
+      const changed = await buildRemoteCommunityPluginCatalogFromIndex({
+        scope: SCOPE,
+        configDir: ".obsidian",
+        index: committedIndex(items(11)),
+        manifestObservations: [],
+        observedAt: 30,
+        previous: first,
+      });
+      expect(changed.observedAt).toBe(30);
+      expect(changed.revision).toBe(first.revision + 1);
+    });
+
     it("rejects an incomplete index or one bound to another files root", async () => {
       const index = committedIndex(items(10));
       await expect(buildRemoteCommunityPluginCatalogFromIndex({
@@ -363,7 +402,9 @@ describe("remote community-plugin catalog", () => {
     it("keeps delta-fresh entries the committed index no longer sees", async () => {
       // Delta refresh saw an unanchored cloud bundle (uploaded by another
       // device): two plugins. The next round-end committed-index build only
-      // sees the anchored one (calendar). The merge must not regress.
+      // sees the anchored one (calendar). The merge must not regress; when
+      // the retained superset is byte-identical, the previous catalog is
+      // reused so the persist JSON short-circuit skips the round write.
       const deltaFresh = await catalogFor(["calendar", "cloud-only"], null, 10);
       const indexOnly = await catalogFor(["calendar"], deltaFresh, 20);
       const merged = await mergeRemoteCommunityPluginCatalogKeepingSuperset(
@@ -372,12 +413,58 @@ describe("remote community-plugin catalog", () => {
       );
       expect(merged.entries.map((entry) => entry.pluginId))
         .toEqual(["calendar", "cloud-only"]);
-      expect(merged.revision).toBeGreaterThan(indexOnly.revision);
-      expect(merged.observedAt).toBe(20);
+      expect(JSON.stringify(merged)).toBe(JSON.stringify(deltaFresh));
+      expect(merged.revision).toBe(deltaFresh.revision);
+      expect(merged.observedAt).toBe(deltaFresh.observedAt);
       expect(merged.complete).toBe(true);
       expect(merged.stale).toBe(false);
       // The merged catalog stays a valid persisted shape.
       expect(await readRemoteCommunityPluginCatalog(merged)).not.toBeNull();
+    });
+
+    it("bumps the revision when a shared entry changed while retaining the superset", async () => {
+      const deltaFresh = await catalogFor(["calendar", "cloud-only"], null, 10);
+      const changedStream: DriveItem[] = [
+        folder("config", ".obsidian", SCOPE.filesRootId),
+        folder("plugins", "plugins", "config"),
+        folder("calendar-root", "calendar", "plugins"),
+        file("calendar-main", "main.js", "calendar-root", {
+          eTag: "etag-calendar-main-v2",
+        }),
+        file("calendar-manifest", "manifest.json", "calendar-root"),
+      ];
+      const changed = await buildRemoteCommunityPluginCatalog({
+        scope: SCOPE,
+        configDir: ".obsidian",
+        items: changedStream,
+        manifestObservations: [],
+        observedAt: 20,
+        previous: deltaFresh,
+        ownPluginId: "easy-sync",
+      });
+      const merged = await mergeRemoteCommunityPluginCatalogKeepingSuperset(
+        deltaFresh,
+        changed,
+      );
+      expect(merged.entries.map((entry) => entry.pluginId))
+        .toEqual(["calendar", "cloud-only"]);
+      expect(merged.revision).toBeGreaterThan(changed.revision);
+      expect(merged.observedAt).toBe(20);
+      expect(merged.stale).toBe(false);
+    });
+
+    it("clears a stale previous catalog even when the superset is unchanged", async () => {
+      const deltaFresh = await catalogFor(["calendar", "cloud-only"], null, 10);
+      const stale = markRemoteCommunityPluginCatalogStale(deltaFresh, 15);
+      const indexOnly = await catalogFor(["calendar"], stale, 20);
+      const merged = await mergeRemoteCommunityPluginCatalogKeepingSuperset(
+        stale,
+        indexOnly,
+      );
+      expect(merged.stale).toBe(false);
+      expect(merged.revision).toBeGreaterThan(stale.revision);
+      expect(merged.entries.map((entry) => entry.pluginId))
+        .toEqual(["calendar", "cloud-only"]);
     });
 
     it("returns the fresh build unchanged when it already covers every entry", async () => {

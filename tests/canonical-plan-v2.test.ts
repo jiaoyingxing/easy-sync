@@ -958,6 +958,196 @@ describe("canonical V2 plan candidate", () => {
     }));
   });
 
+  // F29 切片 2（2026-10-25）：同轮后代对账。云端改了根目录名（子目录跟随机械
+  // 翻译），却把后代文件单独搬去别的目录：目录锚点全部对齐、只有一个文件锚点
+  // 漂移。该文件移动由本计划自己的 MoveLocalFile 对账（下一轮该后代已经落在
+  // 机械翻译之外，归约层不再要求它），所以文件夹移动静默押后一轮——不发移动、
+  // 也不出现 remote-subtree-changed 延后行。
+  const f29Slice2State = (input: {
+    files?: FileSpec[];
+    fileAnchors: SyncAnchorV2[];
+  }) => envelope({
+    folders: [
+      { id: "renamed", name: "projX" },
+      { id: "child", name: "sub", parentId: "renamed" },
+      { id: "other", name: "其他" },
+    ],
+    files: input.files,
+    folderAnchors: [
+      folderAnchor("renamed", "proj"),
+      folderAnchor("child", "proj/sub", "renamed"),
+      folderAnchor("other", "其他"),
+    ],
+    fileAnchors: input.fileAnchors,
+  });
+  const f29Slice2Row = (candidate: ReturnType<typeof build>, path: string) =>
+    candidate.items.some((item) =>
+      item.type === SyncActionType.FolderDeferred
+      && item.path === path
+      && item.reason === "reason.folder.remote-subtree-changed");
+
+  it("F29-④ first round: a file movement this plan emits reconciles the drifted descendant silently", () => {
+    const candidate = build({
+      state: f29Slice2State({
+        files: [
+          { id: "todo", name: "todo.md", parentId: "other" },
+          // Carried descendant: its anchor already projects to the mechanical
+          // target, so it has no file action of its own. It must stay put for
+          // this round (no download to projX/readme.md) or the next round's
+          // folder move would be blocked by a locally created projX directory.
+          { id: "readme", name: "readme.md", parentId: "renamed" },
+        ],
+        fileAnchors: [
+          fileAnchor("todo", "proj/sub/todo.md"),
+          fileAnchor("readme", "proj/readme.md"),
+        ],
+      }),
+      localFiles: [localFile("proj/sub/todo.md"), localFile("proj/readme.md")],
+      localFolders: localFolders("proj", "proj/sub", "其他"),
+    });
+
+    expect(candidate.status).toBe("planned");
+    expect(folderMoveRows(candidate)).toEqual([]);
+    expect(f29Slice2Row(candidate, "projX")).toBe(false);
+    expect(candidate.items).toContainEqual(expect.objectContaining({
+      type: SyncActionType.MoveLocalFile,
+      path: "其他/todo.md",
+      renameFrom: "proj/sub/todo.md",
+    }));
+    // The carried file is neither re-downloaded nor turned into a decision.
+    expect(candidate.items.some((item) =>
+      item.path === "projX/readme.md" || item.path === "proj/readme.md"
+    )).toBe(false);
+  });
+
+  it("F29-⑤ second round: the aligned subtree lets the folder move through", () => {
+    const candidate = build({
+      state: f29Slice2State({
+        files: [
+          { id: "todo", name: "todo.md", parentId: "other" },
+          { id: "readme", name: "readme.md", parentId: "renamed" },
+        ],
+        fileAnchors: [
+          fileAnchor("todo", "其他/todo.md"),
+          fileAnchor("readme", "proj/readme.md"),
+        ],
+      }),
+      localFiles: [localFile("其他/todo.md"), localFile("proj/readme.md")],
+      localFolders: localFolders("proj", "proj/sub", "其他"),
+    });
+
+    expect(candidate.status).toBe("planned");
+    expect(folderMoveRows(candidate)).toContainEqual(expect.objectContaining({
+      type: SyncActionType.MoveLocalFolder,
+      path: "projX",
+      renameFrom: "proj",
+    }));
+    expect(candidate.items).not.toContainEqual(expect.objectContaining({
+      type: SyncActionType.FolderDeferred,
+    }));
+  });
+
+  it("F29-⑥ alignment regression: a committed file move does not bypass the folder-anchor gate", () => {
+    // 文件移动已经提交（锚点落到其他/），但目录锚点仍停在旧路径：目录锚点的
+    // 漂移没有任何本轮文件动作可以对账，仍必须扣下文件夹移动并保留延后行。
+    const candidate = build({
+      state: envelope({
+        folders: [
+          { id: "renamed", name: "05秋招记录" },
+          { id: "misc", name: "其他" },
+          { id: "child", name: "投递与面试记录", parentId: "misc" },
+        ],
+        files: [{ id: "file-y", name: "东风汽车.md", parentId: "child" }],
+        folderAnchors: [
+          folderAnchor("renamed", "05秋招"),
+          folderAnchor("child", "05秋招/投递与面试记录", "renamed"),
+          folderAnchor("misc", "其他"),
+        ],
+        fileAnchors: [fileAnchor("file-y", "其他/投递与面试记录/东风汽车.md")],
+      }),
+      localFiles: [localFile("其他/投递与面试记录/东风汽车.md")],
+      localFolders: localFolders("05秋招", "05秋招/投递与面试记录"),
+    });
+
+    expect(candidate.status).toBe("planned");
+    expect(folderMoveRows(candidate)).toEqual([]);
+    expect(f29Slice2Row(candidate, "05秋招记录")).toBe(true);
+  });
+
+  it("F29-⑦ boundary: tombstones, content conflicts and carried moves still keep the deferral row", () => {
+    // 墓碑：漂移的后代锚点没有远端身份，本轮没有动作可依赖。
+    const tombstone = build({
+      state: f29Slice2State({
+        files: [{ id: "todo", name: "todo.md", parentId: "other" }],
+        fileAnchors: [
+          fileAnchor("todo", "proj/sub/todo.md"),
+          { ...fileAnchor("dead", "proj/sub/dead.md"), remoteId: undefined },
+        ],
+      }),
+      localFiles: [
+        localFile("proj/sub/todo.md"),
+        localFile("proj/sub/dead.md"),
+      ],
+      localFolders: localFolders("proj", "proj/sub", "其他"),
+    });
+    expect(folderMoveRows(tombstone)).toEqual([]);
+    expect(f29Slice2Row(tombstone, "projX")).toBe(true);
+
+    // 冲突：目的路径被本机另一份文件占住，身份层只给冲突行，没有可对账的
+    // move-local（本机旧路径本身未改，文件夹层的本机子树检查照旧通过）。
+    const conflicted = build({
+      state: f29Slice2State({
+        files: [{ id: "todo", name: "todo.md", parentId: "other" }],
+        fileAnchors: [fileAnchor("todo", "proj/sub/todo.md")],
+      }),
+      localFiles: [
+        localFile("proj/sub/todo.md"),
+        localFile("其他/todo.md", hashB),
+      ],
+      localFolders: localFolders("proj", "proj/sub", "其他"),
+    });
+    expect(folderMoveRows(conflicted)).toEqual([]);
+    expect(f29Slice2Row(conflicted, "projX")).toBe(true);
+
+    // 内容冲突（本机也改过）：文件夹层的本机子树检查先一步扣下，同样不静默。
+    const bothChanged = build({
+      state: f29Slice2State({
+        files: [{ id: "todo", name: "todo.md", parentId: "other" }],
+        fileAnchors: [fileAnchor("todo", "proj/sub/todo.md")],
+      }),
+      localFiles: [localFile("proj/sub/todo.md", hashB)],
+      localFolders: localFolders("proj", "proj/sub", "其他"),
+    });
+    expect(folderMoveRows(bothChanged)).toEqual([]);
+    expect(bothChanged.items).toContainEqual(expect.objectContaining({
+      type: SyncActionType.FolderDeferred,
+      path: "proj",
+      reason: "reason.folder.local-subtree-changed",
+    }));
+
+    // 被别的文件夹移动携带的文件移动不算「本轮对账」：该动作不会单独发射。
+    const carried = build({
+      state: envelope({
+        folders: [
+          { id: "renamed", name: "05秋招记录" },
+          { id: "misc", name: "其他" },
+          { id: "child", name: "投递与面试记录", parentId: "misc" },
+        ],
+        files: [{ id: "file-y", name: "东风汽车.md", parentId: "child" }],
+        folderAnchors: [
+          folderAnchor("renamed", "05秋招"),
+          folderAnchor("child", "05秋招/投递与面试记录", "renamed"),
+        ],
+        fileAnchors: [fileAnchor("file-y", "05秋招/投递与面试记录/东风汽车.md")],
+      }),
+      localFiles: [localFile("05秋招/投递与面试记录/东风汽车.md")],
+      localFolders: localFolders("05秋招", "05秋招/投递与面试记录", "其他"),
+    });
+    expect(folderMoveRows(carried)
+      .some((item) => item.path === "05秋招记录")).toBe(false);
+    expect(f29Slice2Row(carried, "05秋招记录")).toBe(true);
+  });
+
   it("uploads same-content copies while keeping the old cloud path as a normal decision", () => {
     const ambiguousLocalRename = envelope({
       files: [{ id: "file", name: "old.md" }],
@@ -987,6 +1177,227 @@ describe("canonical V2 plan candidate", () => {
     ]);
     expect(candidate.items).not.toContainEqual(expect.objectContaining({
       type: SyncActionType.FolderDeferred,
+    }));
+  });
+
+  it("finalizes the same-content-copy hold without a two-way decision row", async () => {
+    const ambiguousLocalRename = envelope({
+      files: [{ id: "file", name: "old.md" }],
+      folderAnchors: [],
+      fileAnchors: [fileAnchor("file", "old.md")],
+    });
+    const candidate = build({
+      state: ambiguousLocalRename,
+      localFiles: [localFile("a.md"), localFile("b.md")],
+    });
+    const resolveRemoteContentHash = async () => hashB;
+    const twoWay = await finalizeCanonicalPlanCandidateV2({
+      candidate,
+      envelope: ambiguousLocalRename,
+      vaultName: "Vault",
+      accountId: scope.accountId,
+      configDir: ".obsidian",
+      automaticHandlingPolicy: {
+        autoDeleteLocalFiles: false,
+        mergeNonOverlappingText: true,
+      },
+      baselineReconstructionIncomplete: false,
+      resolveRemoteContentHash,
+    });
+
+    expect(twoWay.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.Upload,
+        path: "a.md",
+      }),
+      expect.objectContaining({
+        type: SyncActionType.Upload,
+        path: "b.md",
+      }),
+    ]);
+    expect(twoWay.items).not.toContainEqual(expect.objectContaining({
+      type: SyncActionType.Conflict,
+      reason: "reason.renameIdentityAmbiguous",
+    }));
+
+    const oneWay = await finalizeCanonicalPlanCandidateV2({
+      candidate,
+      envelope: ambiguousLocalRename,
+      vaultName: "Vault",
+      accountId: scope.accountId,
+      configDir: ".obsidian",
+      automaticHandlingPolicy: {
+        autoDeleteLocalFiles: false,
+        mergeNonOverlappingText: true,
+      },
+      syncDirection: "one-way",
+      baselineReconstructionIncomplete: false,
+      resolveRemoteContentHash,
+    });
+    expect(oneWay.items).toContainEqual(expect.objectContaining({
+      type: SyncActionType.Download,
+      path: "old.md",
+    }));
+    expect(oneWay.items).not.toContainEqual(expect.objectContaining({
+      type: SyncActionType.Conflict,
+      reason: "reason.renameIdentityAmbiguous",
+    }));
+  });
+
+  describe("remote-only conflict verification (2026-10-24)", () => {
+    function remoteOnlyConflictState(): SyncStateEnvelopeV2 {
+      const state = envelope({
+        files: [{ id: "remote-id", name: "deleted.md" }],
+        folderAnchors: [],
+        fileAnchors: [fileAnchor("remote-id", "deleted.md")],
+      });
+      delete state.remoteIndex.itemsById["remote-id"]!.contentHash;
+      state.remoteIndex.itemsById["remote-id"]!.eTag = "etag-new";
+      return state;
+    }
+
+    async function finalizeWith(
+      state: SyncStateEnvelopeV2,
+      resolveRemoteContentHash: Parameters<
+        typeof finalizeCanonicalPlanCandidateV2
+      >[0]["resolveRemoteContentHash"],
+      pendingContentComparisons?: Parameters<
+        typeof finalizeCanonicalPlanCandidateV2
+      >[0]["pendingContentComparisons"],
+    ) {
+      const candidate = build({ state, localFiles: [] });
+      return finalizeCanonicalPlanCandidateV2({
+        candidate,
+        envelope: state,
+        vaultName: "Vault",
+        accountId: scope.accountId,
+        configDir: ".obsidian",
+        automaticHandlingPolicy: {
+          autoDeleteLocalFiles: false,
+          mergeNonOverlappingText: true,
+        },
+        baselineReconstructionIncomplete: false,
+        resolveRemoteContentHash,
+        ...(pendingContentComparisons
+          ? { pendingContentComparisons }
+          : {}),
+      });
+    }
+
+    it("turns an equal hashless remote into the ordinary local-deletion delete", async () => {
+      const state = remoteOnlyConflictState();
+      const finalized = await finalizeWith(state, async () => hashA);
+
+      expect(finalized.items).toEqual([
+        expect.objectContaining({
+          type: SyncActionType.DeleteRemote,
+          path: "deleted.md",
+          reason: "reason.fileDeletedLocally",
+        }),
+      ]);
+      expect(finalized.items).not.toContainEqual(expect.objectContaining({
+        type: SyncActionType.Conflict,
+      }));
+    });
+
+    it("keeps a proven-different conflict and reuses its receipt next round", async () => {
+      const state = remoteOnlyConflictState();
+      let downloads = 0;
+      const first = await finalizeWith(state, async () => {
+        downloads++;
+        return hashB;
+      });
+      const conflict = first.items.find((item) =>
+        item.type === SyncActionType.Conflict);
+      expect(conflict).toMatchObject({
+        path: "deleted.md",
+        reason: "reason.localDeletedRemoteModified",
+        contentComparison: {
+          result: "different",
+          localHash: hashA,
+          remoteHash: hashB,
+        },
+      });
+      expect(downloads).toBe(1);
+
+      downloads = 0;
+      const second = await finalizeWith(
+        state,
+        async () => {
+          downloads++;
+          return hashB;
+        },
+        [{
+          path: "deleted.md",
+          contentComparison: conflict!.contentComparison,
+        }],
+      );
+      expect(downloads).toBe(0);
+      expect(second.items).toContainEqual(expect.objectContaining({
+        type: SyncActionType.Conflict,
+        path: "deleted.md",
+        reason: "reason.localDeletedRemoteModified",
+      }));
+    });
+
+    it("keeps the conflict when the comparison download fails", async () => {
+      const state = remoteOnlyConflictState();
+      const finalized = await finalizeWith(state, async () => {
+        throw new Error("download failed");
+      });
+
+      expect(finalized.items).toContainEqual(expect.objectContaining({
+        type: SyncActionType.Conflict,
+        path: "deleted.md",
+        reason: "reason.localDeletedRemoteModified",
+      }));
+      expect(finalized.contentVerification.results).toContainEqual(
+        expect.objectContaining({
+          path: "deleted.md",
+          outcome: "failed",
+        }),
+      );
+    });
+  });
+
+  it("holds a file move silently when its destination parent is created in the same plan", async () => {
+    const state = envelope({
+      files: [{ id: "note", name: "note.md" }],
+      folderAnchors: [],
+      fileAnchors: [fileAnchor("note", "note.md")],
+    });
+    const candidate = build({
+      state,
+      localFiles: [localFile("Parent/note.md", hashA)],
+      localFolders: localFolders("Parent"),
+    });
+    expect(candidate.items).toContainEqual(expect.objectContaining({
+      type: SyncActionType.FolderDeferred,
+      path: "Parent/note.md",
+      reason: "reason.identityMove.parentUnavailable",
+    }));
+
+    const finalized = await finalizeCanonicalPlanCandidateV2({
+      candidate,
+      envelope: state,
+      vaultName: "Vault",
+      accountId: scope.accountId,
+      configDir: ".obsidian",
+      automaticHandlingPolicy: {
+        autoDeleteLocalFiles: false,
+        mergeNonOverlappingText: true,
+      },
+      baselineReconstructionIncomplete: false,
+      resolveRemoteContentHash: async () => hashA,
+    });
+
+    expect(finalized.items).toContainEqual(expect.objectContaining({
+      type: SyncActionType.CreateRemoteFolder,
+      path: "Parent",
+    }));
+    expect(finalized.items).not.toContainEqual(expect.objectContaining({
+      type: SyncActionType.FolderDeferred,
+      reason: "reason.identityMove.parentUnavailable",
     }));
   });
 
@@ -2966,7 +3377,14 @@ describe("canonical plan large-file gate wiring", () => {
       "\n        })",
     );
 
+    // 7. 同内容顶替退役的预计划核验（settleProvablyReplacedFileIdentities）：
+    // 选择器的快照构建同样要继承设备大文件门。
+    pinSite(
+      "        await selectNextProvablyReplacedIdentityRetirementV2({",
+      "\n        });",
+    );
+
     // 数量钉住：防止新增接线点只改标题不补断言，或某处字段被别名绕开。
-    expect(source.split(field)).toHaveLength(7);
+    expect(source.split(field)).toHaveLength(8);
   });
 });

@@ -4,10 +4,10 @@
  *
  * Two layers:
  * - Per-round RAW accumulations (`TransferRateFactsV1`: bytes plus
- *   content-transfer ms per direction) are persisted in a small window and on
- *   history entries. They are the honest ledger: the diagnostic report's
- *   per-round table reads them, and they seed the live reading's smoothing
- *   prior after a reload.
+ *   content-transfer ms per direction) persist only embedded in sync-history
+ *   entries — the honest ledger the diagnostic report's per-round table reads.
+ *   (The separate persisted window was retired 2026-10-24: its only consumer,
+ *   the reload seeding, could never pass the 10s freshness window.)
  * - The displayed reading (`TransferRateSampler`) follows standard
  *   connection-speed display practice: sample real byte movement on a fixed
  *   cadence, smooth with an exponential moving average so every transfer
@@ -149,10 +149,9 @@ export function formatTransferRate(kbps: number): string {
  *  - `addRoundFacts`: the settled per-round aggregate, so every round with
  *    bytes moves the reading even when it was too small for a tick to catch.
  *
- *  Smoothing state is session-local; the persisted raw window only seeds
- *  the smoothing prior on load (display itself needs samples inside the
- *  10-second freshness window, so a reloaded device stays blank until real
- *  bytes move again). Only the raw ledger is persisted. */
+ *  Smoothing state is session-local and starts from zero each session
+ *  (display needs samples inside the 10-second freshness window, so a
+ *  reloaded device stays blank until real bytes move again). */
 
 export interface TransferRateTickSnapshot {
   upload: { bytes: number; ms: number };
@@ -191,18 +190,6 @@ export class TransferRateSampler {
     upload: createSamplerDirectionState(),
     download: createSamplerDirectionState(),
   };
-
-  /** Seed the smoothing prior from persisted raw round facts (stored newest
-   *  first). Display requires samples inside the freshness window, so after
-   *  a reload this shapes only how the first new samples blend — it cannot
-   *  conjure a reading from stale data. Entries from the first released
-   *  shape (derived KB/s, 2026-09-13 012242) are converted onto an
-   *  equivalent nominal 10-second sample. */
-  seedFromFacts(factsList: readonly TransferRateFactsV1[]): void {
-    for (const raw of [...factsList].reverse()) {
-      this.addRoundFacts(normalizeLegacyRateFacts(raw));
-    }
-  }
 
   /** A new run started: run ticks measure deltas from zero again. */
   beginRun(): void {
@@ -365,22 +352,4 @@ export class TransferRateSampler {
     return state.lastFoldAt > 0
       && now - state.lastFoldAt <= TRANSFER_RATE_READING_FRESH_MS;
   }
-}
-
-function normalizeLegacyRateFacts(
-  facts: TransferRateFactsV1,
-): TransferRateFactsV1 {
-  const legacy = facts as TransferRateFactsV1 & {
-    uploadKBps?: number;
-    downloadKBps?: number;
-  };
-  const next = { ...facts };
-  for (const direction of ["upload", "download"] as const) {
-    const kbps = legacy[`${direction}KBps`];
-    if (kbps !== undefined && next[`${direction}Bytes`] === undefined) {
-      next[`${direction}Bytes`] = kbps * 1024 * 10;
-      next[`${direction}Ms`] = 10_000;
-    }
-  }
-  return next;
 }

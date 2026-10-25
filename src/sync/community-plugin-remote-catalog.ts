@@ -243,11 +243,13 @@ async function buildRemoteCommunityPluginCatalogCore(
     });
   }
   const sourceDigest = await digest(entries);
-  const revision = input.previous
+  const contentUnchanged = input.previous
     && sameSyncScope(input.previous.scope, input.scope)
-      ? input.previous.sourceDigest === sourceDigest
-        ? input.previous.revision
-        : input.previous.revision + 1
+    && input.previous.sourceDigest === sourceDigest;
+  const revision = contentUnchanged
+    ? input.previous.revision
+    : input.previous && sameSyncScope(input.previous.scope, input.scope)
+      ? input.previous.revision + 1
       : 1;
   return {
     version: 1,
@@ -255,7 +257,11 @@ async function buildRemoteCommunityPluginCatalogCore(
     complete: true,
     stale: false,
     revision,
-    observedAt: input.observedAt,
+    // W1 2026-10-24: keep the previous timestamp when the observed content is
+    // byte-identical so the whole catalog stays byte-stable across rounds and
+    // the persist short-circuit (JSON equality) skips the write. A changed
+    // digest still refreshes the observation timestamp.
+    observedAt: contentUnchanged ? input.previous.observedAt : input.observedAt,
     sourceDigest,
     entries,
   };
@@ -394,6 +400,19 @@ export async function mergeRemoteCommunityPluginCatalogKeepingSuperset(
     compareText(left.pluginId, right.pluginId)
   );
   const sourceDigest = await digest(entries);
+  // W1 completion (2026-10-25): re-adding the entries the narrower view
+  // lacks is only bookkeeping when the shared entries are byte-identical.
+  // Returning the previous catalog keeps revision/observedAt stable so the
+  // persist JSON short-circuit skips the round write; a stale flag still
+  // forces a fresh publication, and any real content change misses the
+  // digest equality below.
+  if (
+    previous.complete
+    && !previous.stale
+    && sourceDigest === previous.sourceDigest
+  ) {
+    return previous;
+  }
   return {
     version: 1,
     scope: { ...next.scope },

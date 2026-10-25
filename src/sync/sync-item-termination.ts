@@ -208,6 +208,12 @@ export function resolvePendingIssueDisposition(input: {
   if (BY_DESIGN_SKIP_ACTION_TYPES.has(input.actionType)) {
     return "by-design-skip";
   }
+  // One-way retained-folder note: the folder is intentionally kept while
+  // local content survives. It is an explanation, not a blocked item, so it
+  // must never turn into the "two identical rounds, cannot finish" diagnosis.
+  if (input.issueCode === "one-way-folder-retained") {
+    return "by-design-skip";
+  }
   if (
     input.issueCode === "transfer-network"
     || input.issueCode === "transfer-remote-moving"

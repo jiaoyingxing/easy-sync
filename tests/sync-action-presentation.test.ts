@@ -186,10 +186,11 @@ describe("sync action presentation", () => {
       .toBe("同步完成（108 项按设置跳过）");
     expect(en.t("result.skippedBySettings", { skipped: 108 }))
       .toBe("Sync complete (108 skipped per your settings).");
-    // 折叠组标题：性质词用设置名「大型文件排除」，徽标措辞候选另评。
-    expect(zh.t("syncView.history.skipGroupTitle", { count: 3 }))
+    // 折叠组标题（运行中与历史共用）：性质词用设置名「大型文件排除」，
+    // 徽标措辞候选另评。
+    expect(zh.t("syncView.skipGroup.title", { count: 3 }))
       .toBe("大型文件排除 3 个");
-    expect(en.t("syncView.history.skipGroupTitle", { count: 3 }))
+    expect(en.t("syncView.skipGroup.title", { count: 3 }))
       .toBe("3 excluded by size limit");
   });
 

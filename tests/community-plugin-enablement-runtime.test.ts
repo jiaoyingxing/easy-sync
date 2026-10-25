@@ -378,6 +378,7 @@ function makeState(
     removePendingDelete: vi.fn().mockResolvedValue(undefined),
     reconcilePendingIssues: vi.fn().mockResolvedValue(undefined),
     setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+    setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
     incrementRemoteGeneration: vi.fn().mockResolvedValue(undefined),
     cacheBaseContent: vi.fn(),
     getCommunityPluginEnablementState: vi.fn().mockReturnValue({

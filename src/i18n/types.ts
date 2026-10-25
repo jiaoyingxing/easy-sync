@@ -287,6 +287,14 @@ export interface LocaleStrings {
   "syncView.conflict.keepRemote": string;
   "syncView.conflict.skip": string;
   "syncView.conflict.defaultReason": string;
+  "syncView.conflict.batchNote": string;
+  "syncView.conflict.batchExcludedNote": string;
+  "syncView.conflict.batchKeepLocal": string;
+  "syncView.conflict.batchKeepRemote": string;
+  "syncView.conflict.batchKeepLocalTitle": string;
+  "syncView.conflict.batchKeepLocalMessage": string;
+  "syncView.conflict.batchKeepRemoteTitle": string;
+  "syncView.conflict.batchKeepRemoteMessage": string;
   /** 片② 副本的文件名标签（用户可见；副本命名模板的一部分；设备中立用词）。 */
   "syncView.localOnly.copyLabel": string;
   "syncView.localOnly.chip.edited": string;
@@ -376,14 +384,20 @@ export interface LocaleStrings {
   "syncView.mutationResolution.operationId": string;
   "syncView.mutationResolution.keepLocal": string;
   "syncView.mutationResolution.keepRemote": string;
+  "syncView.mutationResolution.keepLocalVersion": string;
+  "syncView.mutationResolution.keepRemoteVersion": string;
   "syncView.mutationResolution.singleActionHint": string;
   "syncView.mutationResolution.noAvailableActions": string;
   "syncView.mutationResolution.noAvailableActionsKeepLocal": string;
   "syncView.mutationResolution.noAvailableActionsKeepRemote": string;
   "syncView.mutationResolution.noAvailableActionsFallback": string;
   "syncView.mutationResolution.deleteConfirmTitle": string;
+  "syncView.mutationResolution.deleteConfirmTitleLocal": string;
+  "syncView.mutationResolution.deleteConfirmTitleRemote": string;
   "syncView.mutationResolution.deleteConfirm": string;
   "syncView.mutationResolution.deleteConfirmMessage": string;
+  "syncView.mutationResolution.deleteConfirmMessageLocal": string;
+  "syncView.mutationResolution.deleteConfirmMessageRemote": string;
   "syncView.mutationResolution.deleteConfirmWarning": string;
   "syncView.mutationResolution.action.upload": string;
   "syncView.mutationResolution.action.download": string;
@@ -595,6 +609,7 @@ export interface LocaleStrings {
   "reason.identityMove.verificationFailed": string;
   "reason.identityReplacement.ambiguous": string;
   "reason.identityReplacement.verificationPending": string;
+  "reason.oneWay.folderRetained": string;
 
   // ---- Auth Errors ----
   "auth.error.clientNotConfigured": string;
@@ -752,6 +767,7 @@ export interface LocaleStrings {
   "syncAction.summary.errors": string;
   "syncView.progress.items": string;
   "syncView.progress.completed": string;
+  "syncView.skipGroup.title": string;
   "syncView.progress.remoteScopeRecoveryFailureTitle": string;
   "syncView.progress.remoteScopeRecoveryFailureSummary": string;
   "syncView.cancelSync": string;
@@ -893,7 +909,7 @@ export interface LocaleStrings {
   "syncView.history.empty": string;
   "syncView.history.noFileChanges": string;
   "syncView.history.omitted": string;
-  "syncView.history.skipGroupTitle": string;
+  "syncView.history.skipOmitted": string;
   "syncView.history.status.success": string;
   "syncView.history.status.partial": string;
   "syncView.history.status.cancelled": string;

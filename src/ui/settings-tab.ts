@@ -29,7 +29,10 @@ import {
 } from "./auth-entry-flow";
 import { AutomaticHandlingModal } from "./automatic-handling-modal";
 import { AutoSyncModal } from "./auto-sync-modal";
-import { ConfigSyncModal } from "./config-sync-modal";
+import {
+  buildIntroTextWithInlineGear,
+  ConfigSyncModal,
+} from "./config-sync-modal";
 import { ConfirmModal, type I18nFn } from "./confirm-modal";
 import { SyncModeDisableModal } from "./sync-mode-disable-modal";
 import { SyncModeGateModal } from "./sync-mode-gate-modal";
@@ -1008,7 +1011,11 @@ function buildSettingRuleRow(
     visible: () => !plugin.isSettingRuleAcknowledged(ruleId),
     render: (setting) => {
       setting.controlEl.empty();
-      setting.setName(t("settings.rules.name")).setDesc(t(contentKey));
+      // 说明句内的 ⚙ 指代字符在两载体统一渲染为官方齿轮图标（2026-10-24）；
+      // 其余三条规则句无该字符，助手原样返回字符串。
+      setting
+        .setName(t("settings.rules.name"))
+        .setDesc(buildIntroTextWithInlineGear(t(contentKey)));
       const acknowledged = plugin.isSettingRuleAcknowledged(ruleId);
       // 行级显隐走行内 style（`setCssProps`，官方动态样式口子）：宿主对 visible 谓词
       // 只收走行内容，行壳的分隔线会留下一条横线（2026-10-12 真机反馈）；

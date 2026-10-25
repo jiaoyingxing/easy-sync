@@ -20,6 +20,8 @@ export class SyncPlanAlertModal extends EasySyncModal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
+    // 纯提示框：正文即全部内容，正文放大走 styles.css 白名单。
+    this.modalEl.addClass("easy-sync-prompt-modal");
     this.setTitle(this.title);
 
     for (const message of this.messages) {
@@ -74,7 +76,8 @@ export class ConfirmModal extends EasySyncModal<boolean> {
       message?: string;
       warning?: string;
       danger?: boolean;
-      /** Extra class for the message paragraph; defaults to setting-item-description. */
+      /** Extra class for the message paragraph; omit for a plain paragraph
+       *  written identically to the warning line. */
       messageClass?: string;
     },
   ) {
@@ -91,15 +94,20 @@ export class ConfirmModal extends EasySyncModal<boolean> {
     contentEl.empty();
     this.setTitle(this.title);
 
+    // 两段正文写法必须一致（2026-10-24 用户真机实测指认）：message 与
+    // warning 都用无类纯段落，颜色与字号同链继承。message 之前挂宿主的
+    // 设置页说明专用类（灰字＋小号语义）——CSS 顶字号治不了灰色，iOS 上
+    // 与纯继承行的字号也不重合，两行永远差一截。显式 messageClass 仅留给
+    // 特殊强调（插件版本确认的 modal-title）。
     if (this.options?.message) {
       contentEl.createEl("p", {
         text: this.options.message,
-        cls: this.options?.messageClass ?? "setting-item-description",
+        cls: this.options?.messageClass,
       });
     }
 
     if (this.options?.warning) {
-      contentEl.createDiv().setText(this.options.warning);
+      contentEl.createEl("p", { text: this.options.warning });
     }
 
     // Buttons

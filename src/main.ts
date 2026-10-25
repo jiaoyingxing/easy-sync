@@ -94,7 +94,7 @@ import {
   SyncProgressStore,
 } from "./sync/sync-progress";
 import { resolveSyncActionPresentation } from "./sync/sync-action-presentation";
-import { DiagnosticLogger } from "./sync/diagnostic-logger";
+import { DiagnosticLogger, type DiagCategory } from "./sync/diagnostic-logger";
 import { EasySyncSettingTab } from "./ui/settings-tab";
 import {
   EasySyncSyncView,
@@ -206,7 +206,6 @@ import {
   formatTransferRate,
   transferDirectionKBps,
   TransferRateSampler,
-  type TransferRateFactsV1,
   type TransferRateReading,
 } from "./sync/transfer-rate";
 import {
@@ -732,9 +731,10 @@ export default class EasySyncPlugin extends Plugin {
   }
   diag: DiagnosticLogger = new DiagnosticLogger();
   // Connection-speed reading: session-local EWMA over real transferred
-  // bytes, reseeded once from the persisted raw window on first read.
+  // bytes. Raw per-round facts persist only embedded in sync-history
+  // entries (2026-10-24: the separate persisted window was retired — its
+  // reload seed could never pass the 10s freshness window).
   private transferRateSampler = new TransferRateSampler();
-  private transferRateSamplerSeeded = false;
   private transferRateRunWasActive = false;
 
   // M14: single serialized write queue for PluginData — prevents
@@ -798,6 +798,9 @@ export default class EasySyncPlugin extends Plugin {
   /** 设置页「规则」行的已读记忆（本设备；清空该字段即恢复显示）。 */
   acknowledgedRules: string[] = [];
   private opLock: string | null = null;
+  /** 冲突批量在飞方向（null＝空闲）。自动同步只对这条批量让路；侧栏据此恢复
+   *  加载态。 */
+  private conflictBatchDirection: "local" | "remote" | null = null;
   /** 入口只读准备期的取消范围（2026-10-10 R1）：非空＝armed，期间两个云端仓库
    *  检测可被「取消同步」中止；进入弹框/写事务前清空（见 endEntryCancellation）。 */
   private entryCancelController: AbortController | null = null;
@@ -1135,6 +1138,18 @@ export default class EasySyncPlugin extends Plugin {
       app: this.app,
       layoutMigrationStorage: this.app,
       manifest: this.manifest,
+      // State diagnostics (incl. the W4 canonicalization probe) read this
+      // channel; without it every `this.plugin.diag` site stays silent. The
+      // store contract takes plain strings (no logger import), so the live
+      // logger is narrowed here.
+      diag: {
+        warn: (category, message, detail) =>
+          this.diag.warn(category as DiagCategory, message, detail),
+        log: (category, message, detail) =>
+          this.diag.log(category as DiagCategory, message, detail),
+        isEnabled: (category) =>
+          this.diag.isEnabled(category as DiagCategory),
+      },
       // Read live instead of a construction-time snapshot: a reset-time
       // rotation (orphaned unreadable IndexedDB storage) must keep the
       // captured identity and the live read in agreement.
@@ -1219,7 +1234,6 @@ export default class EasySyncPlugin extends Plugin {
       this.operationLifecycle,
       this.noticeCenter,
       (sample) => {
-        this.ensureTransferRateSamplerSeeded();
         this.transferRateSampler.addCallSample(
           sample.direction,
           sample.bytes,
@@ -1905,6 +1919,46 @@ export default class EasySyncPlugin extends Plugin {
       "notice.conflict.failed",
       (executor) => executor.resolveConflictKeepRemote(path),
     );
+  }
+
+  /** 冲突批量在飞方向；侧栏重挂时按它恢复对应按钮的加载态。 */
+  get conflictBatchState(): "local" | "remote" | null {
+    return this.conflictBatchDirection;
+  }
+
+  /**
+   * 冲突批量：整批只过一次 side-action 忙碌门，逐项仍走现役逐条安全链。
+   * 方向先落位再进等待，自动同步在准备期就能看见并让路。
+   */
+  resolveConflictsKeepLocal(paths: readonly string[]): Promise<boolean> {
+    return this.runConflictBatch(paths, "local");
+  }
+
+  resolveConflictsKeepRemote(paths: readonly string[]): Promise<boolean> {
+    return this.runConflictBatch(paths, "remote");
+  }
+
+  private async runConflictBatch(
+    paths: readonly string[],
+    direction: "local" | "remote",
+  ): Promise<boolean> {
+    const requested = [...new Set(paths)].sort((left, right) =>
+      left.localeCompare(right));
+    if (requested.length === 0 || this.conflictBatchDirection !== null) {
+      return false;
+    }
+    this.conflictBatchDirection = direction;
+    try {
+      return await this.runSideActionIntent(
+        requested[0],
+        "notice.conflict.failed",
+        (executor) => direction === "local"
+          ? executor.resolveConflictsKeepLocal(requested)
+          : executor.resolveConflictsKeepRemote(requested),
+      );
+    } finally {
+      this.conflictBatchDirection = null;
+    }
   }
 
   reconcileIdenticalConflict(
@@ -4868,7 +4922,6 @@ export default class EasySyncPlugin extends Plugin {
       fileTransfers: result.metrics?.fileTransfers,
     });
     if (transferRateFacts) {
-      await this.state.pushTransferRateFacts(transferRateFacts);
       this.transferRateSampler.addRoundFacts(transferRateFacts);
     }
     try {
@@ -4892,6 +4945,7 @@ export default class EasySyncPlugin extends Plugin {
         skippedLarge: result.skippedLarge,
         skippedIgnored: result.skippedIgnored,
         skippedInvalidName: result.skippedInvalidName,
+        skipPaths: result.skippedPaths,
         // Retryable-observation rounds are presented as neutral entries without
         // failure counts; executor result.errors stays untouched (classifier
         // contract requires errors > 0 on the result itself).
@@ -5470,6 +5524,8 @@ export default class EasySyncPlugin extends Plugin {
     if (this.opLock !== null || this.syncExecutor.isRunning) {
       return { state: "busy" };
     }
+    // 冲突批量在飞：恢复观察也属于自动链，让路；调度器按自己的节拍再试。
+    if (this.conflictBatchDirection !== null) return { state: "busy" };
     if (this.acquireOpLock("mutation-recovery")) return { state: "busy" };
     const recoveryContinuation = {
       settled: false,
@@ -6253,6 +6309,10 @@ export default class EasySyncPlugin extends Plugin {
     if (!this.auth?.authState.isLoggedIn) return true;
     if (!this.syncExecutor) return false;
     if (this.opLock !== null || this.syncExecutor.isRunning) return false;
+    // 冲突批量在飞时自动轮让路：批量可能持续很久，整轮同步若中途启动会把
+    // 正在批量的行交给下一轮计划（含自愈侧的删云端）。只让这一条批量；
+    // 逐条 side action 的让路另立候选。
+    if (this.conflictBatchDirection !== null) return false;
     if (this.acquireOpLock("sync")) return false;
     let dispatched = false;
     try {
@@ -6376,6 +6436,7 @@ export default class EasySyncPlugin extends Plugin {
     if (!this.state?.confirmedDescendantFileReconstruction) return;
     if (
       this.opLock !== null
+      || this.conflictBatchDirection !== null
       || !this.syncExecutor
       || this.syncExecutor.isRunning
     ) {
@@ -8340,24 +8401,6 @@ export default class EasySyncPlugin extends Plugin {
     this.startCommunityPluginJoinNow();
   }
 
-  /** Reseed the connection-speed sampler once per session from the persisted
-   *  raw window (history entries only backfill devices whose window predates
-   *  this store). Smoothing state itself is session-local by design. */
-  private ensureTransferRateSamplerSeeded(): void {
-    if (this.transferRateSamplerSeeded) return;
-    this.transferRateSamplerSeeded = true;
-    const state = this.state;
-    if (!state) return;
-    const window = state.transferRatesWindow;
-    this.transferRateSampler.seedFromFacts(
-      window.length > 0
-        ? window
-        : state.syncHistory
-          .map((entry) => entry.transferRates)
-          .filter((facts): facts is TransferRateFactsV1 => facts !== undefined),
-    );
-  }
-
   /** Fixed-cadence sample of the run in flight; the sidebar calls this once
    *  a second while open. beginRun rides the run's rising edge so tick
    *  deltas measure the new run's cumulative counters from zero. */
@@ -8374,9 +8417,11 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   /** Passive connection-speed reading (EWMA over real transferred bytes —
-   *  no probe requests). Null until the first transfer sample exists. */
+   *  no probe requests). Session-local: null until the first transfer sample
+   *  of this session exists (the pre-2026-10-24 reload seeding could never
+   *  conjure a fresh reading anyway — the 10s freshness window excludes
+   *  stale seeds). */
   getTransferRateReading(): TransferRateReading | null {
-    this.ensureTransferRateSamplerSeeded();
     return this.transferRateSampler.getReading();
   }
 
@@ -10071,7 +10116,7 @@ export default class EasySyncPlugin extends Plugin {
         lines.push(`**当前读数**：上传 ${summaryUpload !== null ? formatTransferRate(summaryUpload) : "—"} · 下载 ${summaryDownload !== null ? formatTransferRate(summaryDownload) : "—"}`);
         lines.push("");
       }
-      lines.push("读数来自同步本身已传输的字节（不含清单与规划耗时），不发起任何额外请求；读数为近期样本的指数平滑（传输中每秒采样、轮末并入轮次读数，近期样本权重更高），持久账本仍保留最近 3 个有传输轮次的原始字节/耗时（供重载恢复与本表）。空轮（本轮没有文件变更）不产生吞吐读数——没有字节就没有速度可测，其网络耗时见「近期同步记录」的耗时列。");
+      lines.push("读数来自同步本身已传输的字节（不含清单与规划耗时），不发起任何额外请求；读数为近期样本的指数平滑（传输中每秒采样、轮末并入轮次读数，近期样本权重更高，本次会话从零开始）。本表逐轮读数取自「近期同步记录」条目内嵌的轮次实测。空轮（本轮没有文件变更）不产生吞吐读数——没有字节就没有速度可测，其网络耗时见「近期同步记录」的耗时列。");
       lines.push("");
       lines.push("| 时间 | 上传 | 下载 |");
       lines.push("|------|------|------|");

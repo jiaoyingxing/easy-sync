@@ -69,7 +69,10 @@ import {
   type RemoteIndexV2,
   type RemoteNodeV2,
 } from "./remote-index-v2";
-import { normalizeSizeExclusionBaseline } from "./skip-baseline";
+import {
+  normalizeHistorySkipPaths,
+  normalizeSizeExclusionBaseline,
+} from "./skip-baseline";
 import {
   areIndependentConservativeResetRecords,
   conservativeResetRecordPaths,
@@ -255,7 +258,11 @@ export interface PluginDataStore {
   };
   layoutMigrationStorage?: EasySyncLayoutMigrationStorage;
   manifest: { dir?: string; id: string };
-  diag?: { warn: (category: string, message: string, detail?: unknown) => void };
+  diag?: {
+    warn: (category: string, message: string, detail?: unknown) => void;
+    log?: (category: string, message: string, detail?: unknown) => void;
+    isEnabled?: (category: string) => boolean;
+  };
   indexedDbVaultInstanceId?: string;
   readIndexedDbVaultInstanceId?: () => string | null;
   /** Reset rescue only (F14): rotate the Vault instance identity to orphan
@@ -577,7 +584,6 @@ const KEY_LOCAL_ONLY_COPIES = "easy-sync-local-only-copies";
 const KEY_DELETION_LEDGER = "easy-sync-deletion-ledger";
 /** 片⑤ 忽略记忆：「留在本机，不再提醒」的本机清单（只影响提醒）。 */
 const KEY_LOCAL_ONLY_IGNORE_MEMORY = "easy-sync-local-only-ignore-memory";
-const KEY_TRANSFER_RATES_WINDOW = "easy-sync-transfer-rates-window";
 const KEY_COMMUNITY_PLUGIN_ENABLEMENT_STATE = "community-plugin-enablement-state";
 const KEY_COMMUNITY_PLUGIN_MANIFEST_OBSERVATIONS =
   "community-plugin-manifest-observations";
@@ -635,6 +641,11 @@ export interface SyncHistoryEntry {
   skippedLarge?: number;
   skippedIgnored?: number;
   skippedInvalidName?: number;
+  /** Configuration-skip paths settled this round, capped and de-duplicated.
+   *  Lets every history entry expand the same fold even on rounds where the
+   *  sidebar no longer re-emits stable skips (2026-10-25 拍板). Absent on
+   *  entries written before this field and on rounds with nothing skipped. */
+  skipPaths?: string[];
   errors: number;
   message: string;
   files: FileProgress[];
@@ -669,7 +680,8 @@ export interface PendingIssue {
     | "parent-chain-incomplete"
     | "scope-crossing"
     | "transfer-network"
-    | "transfer-remote-moving";
+    | "transfer-remote-moving"
+    | "one-way-folder-retained";
   reason?: string;
   updatedAt: number;
   fileSize?: number;
@@ -699,10 +711,6 @@ interface PluginData {
   [KEY_PLAN_REVIEW_SCOPE]: SyncScope | null;
   [KEY_PLAN_REVIEW_CANONICAL_IDENTITY]: CanonicalPlanIdentityV2 | null;
   [KEY_SYNC_HISTORY]: SyncHistoryEntry[];
-  /** Persisted rolling window of per-round transfer-rate facts. Kept
-   *  outside the 10-entry history so the reading survives both reloads and
-   *  quiet stretches of no-transfer rounds. */
-  [KEY_TRANSFER_RATES_WINDOW]: TransferRateFactsV1[];
   [KEY_GENERATION]: number;
   [KEY_BOUND_ACCOUNT]: string;
   [KEY_PUBLIC_MUTATION_LEDGER]: MutationLedgerEntryV1[];
@@ -746,7 +754,6 @@ const DEFAULT_DATA: PluginData = {
   [KEY_PLAN_REVIEW_SCOPE]: null,
   [KEY_PLAN_REVIEW_CANONICAL_IDENTITY]: null,
   [KEY_SYNC_HISTORY]: [],
-  [KEY_TRANSFER_RATES_WINDOW]: [],
   [KEY_GENERATION]: 0,
   [KEY_BOUND_ACCOUNT]: "",
   [KEY_PUBLIC_MUTATION_LEDGER]: [],
@@ -972,6 +979,18 @@ export class StateManager {
   async incrementRemoteGeneration(): Promise<void> {
     await this.save((current) => ({
       ...current,
+      [KEY_GENERATION]: current[KEY_GENERATION] + 1,
+    }));
+  }
+
+  /** Healthy round-end mark in one atomic commit (W3 2026-10-24): the round
+   *  end used to pay two full plugin-data commits for these two scalars on
+   *  every round. Merged here the pair is indivisible — where the old
+   *  sequence could be interrupted between the timestamp and the bump. */
+  async setLastSyncTimeAndIncrementGeneration(time: number): Promise<void> {
+    await this.save((current) => ({
+      ...current,
+      [KEY_LAST_SYNC_TIME]: time,
       [KEY_GENERATION]: current[KEY_GENERATION] + 1,
     }));
   }
@@ -1660,11 +1679,6 @@ export class StateManager {
         ),
       [KEY_SYNC_HISTORY]: Array.isArray(saved[KEY_SYNC_HISTORY])
         ? saved[KEY_SYNC_HISTORY]
-        : [],
-      [KEY_TRANSFER_RATES_WINDOW]: Array.isArray(
-        saved[KEY_TRANSFER_RATES_WINDOW],
-      )
-        ? saved[KEY_TRANSFER_RATES_WINDOW]
         : [],
       [KEY_GENERATION]: saved[KEY_GENERATION] ?? 0,
       [KEY_BOUND_ACCOUNT]: saved[KEY_BOUND_ACCOUNT] ?? "",
@@ -2740,11 +2754,36 @@ export class StateManager {
       }
       const candidate = buildNext(this.v2Envelope);
       if (candidate === this.v2Envelope) return;
+      // W4 probe (2026-10-24): the content-facts comparison canonicalizes
+      // the WHOLE envelope (old and new) per commit — the suspected CPU
+      // ceiling on large vaults. Measurement-only, diagnostics-gated; it must
+      // never influence the commit. Numbers decide whether W4 optimization
+      // (touched-subtree comparison) is worth its high-risk gate.
+      const diag = this.plugin.diag;
+      const probeOn = diag?.isEnabled?.("state") === true;
+      const commitStartedAt = probeOn ? performance.now() : 0;
+      const canonicalizeStartedAt = commitStartedAt;
       const contentFactChanged =
         contentFactsCanonicalJson(this.v2Envelope)
         !== contentFactsCanonicalJson(candidate);
+      const canonicalizeFinishedAt = probeOn ? performance.now() : 0;
       await this.publishV2Candidate(this.v2Envelope, candidate);
       this.activateV2Envelope(candidate, contentFactChanged);
+      if (probeOn) {
+        // totalMs is the commit's whole cost (canonicalize + durable publish
+        // + activation) so the probe answers the share question directly.
+        diag?.log?.("state", "V2 content-facts canonicalization", {
+          elapsedMs: Number(
+            (canonicalizeFinishedAt - canonicalizeStartedAt).toFixed(3),
+          ),
+          totalMs: Number(
+            (performance.now() - commitStartedAt).toFixed(3),
+          ),
+          remoteItems: Object.keys(candidate.remoteIndex.itemsById ?? {})
+            .length,
+          anchors: Object.keys(candidate.anchors.byAnchorId ?? {}).length,
+        });
+      }
       changed = true;
     });
     this.v2StateCommitQueue = task.catch(() => undefined);
@@ -7403,13 +7442,16 @@ export class StateManager {
   }
 
   async upsertPendingConflicts(items: SyncPlanItem[]): Promise<void> {
-    await this.save((current) => ({
-      ...current,
-      [KEY_PENDING_CONFLICTS]: upsertPlanItems(
-        current[KEY_PENDING_CONFLICTS],
-        items,
-      ),
-    }));
+    await this.save((current) => {
+      // W2 2026-10-24: round ends re-upsert unresolved rows whose content is
+      // byte-identical (decisionToken derives deterministically). Keep
+      // `current` when the merge changes nothing so the commit short-circuit
+      // skips the full data.json write.
+      const next = upsertPlanItems(current[KEY_PENDING_CONFLICTS], items);
+      return next === current[KEY_PENDING_CONFLICTS]
+        ? current
+        : { ...current, [KEY_PENDING_CONFLICTS]: next };
+    });
   }
 
   async removePendingConflict(path: string): Promise<void> {
@@ -7444,13 +7486,14 @@ export class StateManager {
   }
 
   async upsertPendingDeletes(items: SyncPlanItem[]): Promise<void> {
-    await this.save((current) => ({
-      ...current,
-      [KEY_PENDING_DELETES]: upsertPlanItems(
-        current[KEY_PENDING_DELETES],
-        items,
-      ),
-    }));
+    await this.save((current) => {
+      // W2 2026-10-24: same byte-identical round-end re-upsert short-circuit
+      // as upsertPendingConflicts.
+      const next = upsertPlanItems(current[KEY_PENDING_DELETES], items);
+      return next === current[KEY_PENDING_DELETES]
+        ? current
+        : { ...current, [KEY_PENDING_DELETES]: next };
+    });
   }
 
   async removePendingDelete(path: string): Promise<void> {
@@ -7490,10 +7533,25 @@ export class StateManager {
   }
 
   async commitSizeExclusionBaseline(paths: readonly string[]): Promise<void> {
-    await this.commitPluginData((pluginData) => ({
-      ...pluginData,
-      [KEY_SIZE_EXCLUSION_BASELINE]: [...paths],
-    }));
+    // W8 2026-10-25: the round-end mirror is overwritten wholesale after
+    // every completed plan. Keep the current value when the settled path set
+    // is unchanged (order and duplicates carry no meaning — the consumer
+    // reads it back into a Set), so an idle round skips the full data.json
+    // write instead of emitting a `keys: []` commit.
+    const next = [...normalizeSizeExclusionBaseline(paths)];
+    await this.commitPluginData((pluginData) => {
+      const existing = normalizeSizeExclusionBaseline(
+        pluginData[KEY_SIZE_EXCLUSION_BASELINE],
+      );
+      const existingPaths = new Set(existing);
+      if (
+        existing.length === next.length
+        && next.every((path) => existingPaths.has(path))
+      ) {
+        return pluginData;
+      }
+      return { ...pluginData, [KEY_SIZE_EXCLUSION_BASELINE]: next };
+    });
   }
 
   async reconcilePendingIssues(
@@ -9185,22 +9243,14 @@ export class StateManager {
     return this.data[KEY_SYNC_HISTORY];
   }
 
-  get transferRatesWindow(): TransferRateFactsV1[] {
-    return this.data[KEY_TRANSFER_RATES_WINDOW] ?? [];
-  }
-
-  async pushTransferRateFacts(facts: TransferRateFactsV1): Promise<void> {
-    await this.save((current) => ({
-      ...current,
-      [KEY_TRANSFER_RATES_WINDOW]: [
-        facts,
-        ...(current[KEY_TRANSFER_RATES_WINDOW] ?? []),
-      ].slice(0, 3),
-    }));
-  }
-
   async addSyncHistory(entry: SyncHistoryEntry): Promise<void> {
-    const normalized = { ...entry, files: retainFileProgress(entry.files) };
+    const { skipPaths: rawSkipPaths, ...rest } = entry;
+    const skipPaths = normalizeHistorySkipPaths(rawSkipPaths);
+    const normalized = {
+      ...rest,
+      files: retainFileProgress(entry.files),
+      ...(skipPaths.length > 0 ? { skipPaths } : {}),
+    };
     await this.save((current) => ({
       ...current,
       [KEY_SYNC_HISTORY]: [
@@ -11653,7 +11703,14 @@ function upsertPlanItems(
   for (const item of incoming) {
     byPath.set(item.path, item);
   }
-  return [...byPath.values()];
+  const next = [...byPath.values()];
+  // W2 2026-10-24: round ends re-upsert unresolved rows whose content is
+  // byte-identical (decisionToken derives deterministically). Keep the
+  // original array reference when nothing actually changed so the commit
+  // short-circuit skips the full data.json write.
+  return JSON.stringify(next) === JSON.stringify(existing)
+    ? existing
+    : next;
 }
 
 function clearPlanReviewData(current: PluginData): PluginData {

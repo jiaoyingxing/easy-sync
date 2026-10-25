@@ -34,6 +34,7 @@ import { OneDriveError, OneDriveErrorType, type DriveItem } from "../src/onedriv
 import type { LocalScanner } from "../src/sync/local-scanner";
 import type { PendingIssue } from "../src/sync/types";
 import { generateFileDecisionPlanV2 } from "../src/sync/file-decision-planner-v2";
+import { MAX_HISTORY_SKIP_PATHS } from "../src/sync/skip-baseline";
 import { StateManager } from "../src/sync/state-manager";
 import { I18n } from "../src/i18n";
 import { SyncProgressStore } from "../src/sync/sync-progress";
@@ -105,6 +106,7 @@ describe("Cancellation checkpoint semantics", () => {
       upsertPendingDeletes: vi.fn().mockResolvedValue(undefined),
       prunePendingDeletes: vi.fn().mockResolvedValue(undefined),
       setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+      setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
       lastSyncTime: 0,
       reconcilePendingIssues,
     });
@@ -245,6 +247,7 @@ describe("Cancellation checkpoint semantics", () => {
       upsertPendingDeletes: vi.fn().mockResolvedValue(undefined),
       prunePendingDeletes: vi.fn().mockResolvedValue(undefined),
       setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+      setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
       lastSyncTime: 0,
     });
     state.recordMutationReceipt = recordMutationReceipt;
@@ -364,6 +367,7 @@ describe("Cancellation checkpoint semantics", () => {
     const mockState = makeActiveV2State([], [], {
       reconcilePendingIssues,
       setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+      setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
       lastSyncTime: 0,
     });
     const executor = new SyncExecutor(
@@ -418,6 +422,7 @@ describe("Cancellation checkpoint semantics", () => {
     const state = makeActiveV2State([remote], [], {
       reconcilePendingIssues,
       setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+      setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
       lastSyncTime: 0,
     });
     const executor = new SyncExecutor(
@@ -515,6 +520,7 @@ describe("S1a — sync run phase observability", () => {
       upsertPendingDeletes: vi.fn().mockResolvedValue(undefined),
       reconcilePendingIssues: vi.fn().mockResolvedValue(undefined),
       setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+      setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
       incrementRemoteGeneration: vi.fn().mockResolvedValue(undefined),
     });
     const setRemoteState = state.setRemoteState as ReturnType<typeof vi.fn>;
@@ -707,6 +713,8 @@ describe("S1a — sync run phase observability", () => {
         "@odata.deltaLink": "delta-token-next",
       });
       const setLastSyncTime = vi.fn().mockResolvedValue(undefined);
+      const setLastSyncTimeAndIncrementGeneration = vi.fn()
+        .mockResolvedValue(undefined);
       const diagnosticsEnabled = { value: false };
       const diag = {
         log: vi.fn(),
@@ -730,6 +738,7 @@ describe("S1a — sync run phase observability", () => {
         upsertPendingDeletes: vi.fn().mockResolvedValue(undefined),
         reconcilePendingIssues: vi.fn().mockResolvedValue(undefined),
         setLastSyncTime,
+        setLastSyncTimeAndIncrementGeneration,
         incrementRemoteGeneration: vi.fn().mockResolvedValue(undefined),
       });
       const setRemoteState = state.setRemoteState as ReturnType<typeof vi.fn>;
@@ -782,7 +791,10 @@ describe("S1a — sync run phase observability", () => {
       expect(restoreVaultScope).toHaveBeenCalledTimes(totalRuns);
       expect(initVaultScope).not.toHaveBeenCalled();
       expect(setRemoteState).toHaveBeenCalledTimes(totalRuns);
-      expect(setLastSyncTime).toHaveBeenCalledTimes(totalRuns);
+      // W3 2026-10-24: the healthy round-end mark (timestamp + generation)
+      // is one combined commit, once per round.
+      expect(setLastSyncTimeAndIncrementGeneration).toHaveBeenCalledTimes(totalRuns);
+      expect(setLastSyncTime).not.toHaveBeenCalled();
       expect(beginRunMetrics).toHaveBeenCalledTimes(ROUNDS_PER_MODE);
       expect(finishRunMetrics).toHaveBeenCalledTimes(ROUNDS_PER_MODE);
       const medianIndex = Math.floor(ROUNDS_PER_MODE / 2);
@@ -868,6 +880,7 @@ describe("size exclusion baseline — skip rows are incremental", () => {
 
     expect(skipRows).toEqual(["video.mp4"]);
     expect(first.skippedLarge).toBe(1);
+    expect(first.skippedPaths).toEqual(["video.mp4"]);
     expect(await mockState.getSizeExclusionBaseline()).toEqual(["video.mp4"]);
 
     const second = await executor.run("manual", {
@@ -881,7 +894,39 @@ describe("size exclusion baseline — skip rows are incremental", () => {
 
     expect(skipRows).toEqual(["video.mp4"]);
     expect(second.skippedLarge).toBe(1);
+    // 历史清单与增量呈现解耦：第二轮不再发行行，但仍带出当轮结算的跳过路径。
+    expect(second.skippedPaths).toEqual(["video.mp4"]);
     expect(await mockState.getSizeExclusionBaseline()).toEqual(["video.mp4"]);
+  });
+
+  it("never reports a configuration skip as the current progress item", async () => {
+    // 2026-10-25 拍板：按设置跳过是零动作，不占进度位置。若占位，纯跳过轮也会
+    // 报出「1/1 项」并把被排除路径塞进「当前文件」槽位——正是要消掉的假读数。
+    const oversized: RemoteFileEntry = {
+      path: "video.mp4",
+      driveId: "item-video",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      size: 300 * 1024 * 1024,
+      mtime: 1,
+      eTag: "etag-video",
+      cTag: "ctag-video",
+    };
+    const progress: Array<{ current: number; total: number; file: string }> = [];
+    const executor = new SyncExecutor(
+      makeMockOneDrive({}),
+      makeSkippingScannerStub(),
+      makeActiveV2State([oversized], []),
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {
+      onProgress: (current, total, currentFile) => {
+        progress.push({ current, total, file: currentFile });
+      },
+    });
+
+    expect(result.skippedLarge).toBe(1);
+    expect(progress.some((entry) => entry.file === "video.mp4")).toBe(false);
   });
 
   it("falls back to full visibility when one round exceeds the baseline capacity", async () => {
@@ -913,6 +958,8 @@ describe("size exclusion baseline — skip rows are incremental", () => {
 
     expect(result.skippedLarge).toBe(2001);
     expect(skipRows).toHaveLength(2001);
+    // 历史清单写入时截断（标题仍报 2001，差额走「另有 N 个」），基准不覆写。
+    expect(result.skippedPaths).toHaveLength(MAX_HISTORY_SKIP_PATHS);
     expect(await mockState.getSizeExclusionBaseline()).toEqual([]);
   });
 });

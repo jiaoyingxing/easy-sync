@@ -74,7 +74,12 @@ import {
   protectEasySyncSelfSyncPlan,
   remoteContentMatchesBase,
 } from "./file-decision-planner-v2";
-import { MAX_SIZE_EXCLUSION_BASELINE_PATHS } from "./skip-baseline";
+import {
+  countProgressPlanItems,
+  isConfigurationSkipAction,
+  MAX_SIZE_EXCLUSION_BASELINE_PATHS,
+  normalizeHistorySkipPaths,
+} from "./skip-baseline";
 import { StateManager } from "./state-manager";
 import type {
   MutationCheckpointCommitMetrics,
@@ -105,6 +110,7 @@ import {
   type StaleIdentityRemoteFactV1,
   type StaleIdentityResolutionSnapshotV1,
 } from "./stale-identity-resolution";
+import { selectNextProvablyReplacedIdentityRetirementV2 } from "./stale-replacement-settlement";
 import {
   buildScopeCrossingResolutionSnapshotV1,
   type ScopeCrossingResolutionSnapshotV1,
@@ -402,6 +408,11 @@ export interface SyncResult {
   foldersMoved?: number;
   /** Number of empty folder shells removed after a second read. */
   foldersDeleted?: number;
+  /** One-way rounds: cloud-deleted folders kept because local content that
+   *  must survive (local-only files or unresolved conflicts) still occupies
+   *  them. The folder row itself is informational and is never counted as a
+   *  pending decision. */
+  foldersRetained?: number;
   /** Number of identity-preserving local file moves. */
   filesMoved?: number;
   deleted: number;
@@ -414,6 +425,11 @@ export interface SyncResult {
    *  store (Graph would reject every upload with 400). Visible skip with a
    *  rename hint; they rejoin ordinary sync after the user renames them. */
   skippedInvalidName: number;
+  /** Paths settled as configuration skips this round, capped and de-duplicated
+   *  (`MAX_HISTORY_SKIP_PATHS`). History keeps them so every round can expand
+   *  the same fold even after the sidebar stops re-emitting stable skips
+   *  (2026-10-25 拍板). Absent when nothing was skipped. */
+  skippedPaths?: string[];
   errors: number;
   /** Deterministic community-plugin identity blocks (parse failure,
    *  same-directory drift, cross-directory collision). They stay visible in
@@ -677,6 +693,10 @@ interface ItemExecutionResult {
   folderUpsert?: RemoteFolderEntry;
   /** Exact remote folder identity retired by an empty-shell delete. */
   folderDelete?: { path: string; driveId: string };
+  /** One-way folder delete skipped because the local folder still holds
+   *  content that must survive. No folder receipt is produced; the caller
+   *  records the read-only retention note. */
+  retainedFolder?: boolean;
   /** A Conflict item completed automatically and must not enter pending review. */
   resolvedConflict?: boolean;
   /** User-facing action used by progress/history after a conflict is resolved automatically. */
@@ -829,6 +849,11 @@ const REMOTE_FOLDER_READBACK_RETRY_MS = 500;
  *  identity/eTag-guarded remote round trip, so a bounded batch overlaps the
  *  latency instead of costing one RTT per file serially. */
 const DELETE_CLEANUP_BATCH = Platform.isMobile ? 4 : 8;
+/** Bounded downloads used to prove a same-path replacement's bytes before
+ *  retiring the stale anchor; unprovable candidates keep the review row. */
+const PROVABLE_REPLACEMENT_DOWNLOAD_BUDGET = 10;
+/** Safety bound on replacement candidates examined in one planning round. */
+const PROVABLE_REPLACEMENT_CANDIDATE_LIMIT = 20;
 
 interface PreparedDownload {
   content?: ArrayBuffer;
@@ -5909,10 +5934,123 @@ export class SyncExecutor {
     };
   }
 
+  /** Retire one pending decision row because its reviewed versions can no
+   *  longer authorize any mutation (SC-08 safe subset). Zero mutations. */
+  private async retirePendingDecisionRow(
+    pendingKind: "conflict" | "delete",
+    path: string,
+  ): Promise<void> {
+    if (pendingKind === "delete") {
+      await this.state.removePendingDelete(path);
+      return;
+    }
+    await this.state.removePendingConflict(path);
+  }
+
+  /** SC-08 safe-subset classification for the six pre-action call sites.
+   *
+   *  A missing path is not proof that the reviewed drive item is gone, so
+   *  before rebuilding the decision row we ask by ID: a still-live object was
+   *  moved/renamed and the row retires for reclassification next round. A
+   *  null by-ID answer plus no local file is E0 (both sides absent, nothing to
+   *  decide). An unreadable by-ID answer is fail-closed: the row stays exactly
+   *  as reviewed and no mutation runs. When the path is present instead, an
+   *  exact SHA-256 match with the reviewed local bytes proves there is nothing
+   *  left to resolve and the row retires without upload/download/delete.
+   *  Everything else falls through to the historical rebuild branch (D1/D2/
+   *  D4/E2), which keeps both sides and re-shows the current difference. */
+  private async classifySafeSubsetRemoteDrift(
+    item: SyncPlanItem,
+    noticeKey: "notice.conflict.failed" | "notice.delete.failed",
+    pendingKind: "conflict" | "delete",
+    current: RemoteFileEntry | undefined,
+  ): Promise<"continue" | "resolved"> {
+    const token = item.decisionToken;
+    if (!token) return "continue";
+    if (!current) {
+      // SC-08: resolve the reviewed identity by ID before inferring absence.
+      const reviewedRemoteId = token.remote.exists
+        ? token.remote.driveId
+        : this.state.remoteIdForPath(item.path);
+      if (!reviewedRemoteId) {
+        this.diag?.warn(
+          "execute",
+          `missing reviewed path has no drive item identity to check — keeping the current decision — ${item.path}`,
+        );
+        return "continue";
+      }
+      let alive: DriveItem | null;
+      try {
+        alive = await this.onedrive.getDriveItemMetadataById(reviewedRemoteId);
+      } catch (error) {
+        this.diag?.warn(
+          "execute",
+          `reviewed drive item identity check failed — keeping the decision row — ${item.path}`,
+          describeError(error),
+        );
+        this.notice(noticeKey, {
+          path: item.path,
+          reason: error instanceof Error ? error.message : this.t("general.unknown"),
+        });
+        return "resolved";
+      }
+      if (alive) {
+        await this.retirePendingDecisionRow(pendingKind, item.path);
+        this.diag?.warn(
+          "execute",
+          `reviewed drive item still exists by ID after its path disappeared — pending decision retired for reclassification — ${item.path}`,
+        );
+        this.notice(noticeKey, {
+          path: item.path,
+          reason: this.t("notice.decisionExpired"),
+        });
+        return "resolved";
+      }
+      if (!item.local) {
+        await this.retirePendingDecisionRow(pendingKind, item.path);
+        this.diag?.warn(
+          "execute",
+          `reviewed decision has no local file and the remote object is absent by ID — pending decision retired — ${item.path}`,
+        );
+        this.notice(noticeKey, {
+          path: item.path,
+          reason: this.t("notice.decisionExpired"),
+        });
+        return "resolved";
+      }
+      // Local file survives and the object is truly deleted (D4): rebuild.
+      return "continue";
+    }
+
+    // E1: exact SHA-256 equality on the current remote bytes proves both sides
+    // already hold the same content. QuickXor/size alone never qualify.
+    if (item.local) {
+      const equality = resolveContentEquality({ local: item.local, remote: current });
+      if (equality.status === "equal" && equality.proof === "remoteSha256") {
+        await this.retirePendingDecisionRow(pendingKind, item.path);
+        this.diag?.log(
+          "execute",
+          `reviewed remote bytes now match the local file exactly — pending decision retired — ${item.path}`,
+        );
+        if (pendingKind === "conflict") {
+          this.notice("notice.conflict.identical", { path: item.path });
+        } else {
+          this.notice(noticeKey, {
+            path: item.path,
+            reason: this.t("notice.decisionExpired"),
+          });
+        }
+        return "resolved";
+      }
+    }
+    return "continue";
+  }
+
   private async guardReviewedRemoteVersion(
     item: SyncPlanItem,
     noticeKey: "notice.conflict.failed" | "notice.delete.failed",
     pendingKind: "conflict" | "delete",
+    driftPolicy: "rebuild" | "safeSubset" = "rebuild",
   ): Promise<boolean> {
     const token = item.decisionToken;
     if (!token) return false;
@@ -5927,12 +6065,30 @@ export class SyncExecutor {
       });
       return false;
     }
+    if (driftPolicy === "safeSubset" && !current) {
+      const classification = await this.classifySafeSubsetRemoteDrift(
+        item,
+        noticeKey,
+        pendingKind,
+        current,
+      );
+      if (classification === "resolved") return false;
+    }
     const matches = token.remote.exists
       ? Boolean(current
         && current.driveId === token.remote.driveId
         && current.eTag === token.remote.eTag)
       : !current;
     if (matches) return true;
+    if (driftPolicy === "safeSubset" && current) {
+      const classification = await this.classifySafeSubsetRemoteDrift(
+        item,
+        noticeKey,
+        pendingKind,
+        current,
+      );
+      if (classification === "resolved") return false;
+    }
 
     const refreshed: SyncPlanItem = {
       type: SyncActionType.Conflict,
@@ -8945,6 +9101,11 @@ export class SyncExecutor {
     automaticHandlingPolicy: AutomaticHandlingPolicy;
     baselineReconstructionIncomplete: boolean;
     prepareV2MigrationCandidate: boolean;
+    remoteEntries: readonly RemoteFileEntry[];
+    /** Fresh planning rounds may auto-retire a provably replaced stale file
+     *  identity before the plan exists. A reviewed plan must never be
+     *  invalidated by a planning-time state commit. */
+    allowAutomaticStaleIdentityRetirement: boolean;
     includeCanonicalFilePath: (path: string) => boolean;
     includeCanonicalFolderPath: (path: string) => boolean;
     preserveCanonicalFolderPath: (path: string) => boolean;
@@ -8960,6 +9121,7 @@ export class SyncExecutor {
         canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
         canonicalSourceEnvelope: SyncStateEnvelopeV2 | null;
         committedV2Envelope: SyncStateEnvelopeV2 | null;
+        retiredReplacementPaths: string[];
       }
   > {
     const {
@@ -8978,6 +9140,8 @@ export class SyncExecutor {
       automaticHandlingPolicy,
       baselineReconstructionIncomplete,
       prepareV2MigrationCandidate,
+      remoteEntries,
+      allowAutomaticStaleIdentityRetirement,
       includeCanonicalFilePath,
       includeCanonicalFolderPath,
       preserveCanonicalFolderPath,
@@ -9026,6 +9190,41 @@ export class SyncExecutor {
       });
     } else if (canonicalSourceEnvelope) {
       canonicalPlanCandidate = rebuildCanonicalPlanCandidate(canonicalSourceEnvelope);
+    }
+    // A fresh planning round may retire a same-path replacement whose occupied
+    // bytes are provably the committed anchor's bytes. The retirement is
+    // state-only (keep both objects) and must happen before the ordinary file
+    // plan, otherwise the stale base would read the local relocation as a
+    // deletion of the occupant. Reviewed plans never enter this branch.
+    let retiredReplacementPaths: string[] = [];
+    if (
+      allowAutomaticStaleIdentityRetirement
+      && !migrationPlannerState
+      && canonicalSourceEnvelope
+    ) {
+      const replacementSettlement =
+        await this.settleProvablyReplacedFileIdentities({
+          result,
+          operationEpoch,
+          envelope: canonicalSourceEnvelope,
+          localEntries: planningLocalEntries,
+          localFolders,
+          localFolderScanComplete,
+          skippedLarge,
+          remoteEntries,
+          includeFilePath: includeCanonicalFilePath,
+          includeFolderPath: includeCanonicalFolderPath,
+          preserveFolderPath: preserveCanonicalFolderPath,
+          configDir,
+          resolveRemoteContentHash: resolveCanonicalRemoteContentHash,
+        });
+      if (replacementSettlement) {
+        retiredReplacementPaths = replacementSettlement.retiredPaths;
+        canonicalSourceEnvelope = replacementSettlement.envelope;
+        committedV2Envelope = replacementSettlement.envelope;
+        canonicalPlanCandidate =
+          rebuildCanonicalPlanCandidate(canonicalSourceEnvelope);
+      }
     }
     const folderReconstruction =
       await this.reconstructConfirmedDescendantFolderAnchors({
@@ -9083,7 +9282,126 @@ export class SyncExecutor {
       canonicalPlanCandidate,
       canonicalSourceEnvelope,
       committedV2Envelope,
+      retiredReplacementPaths,
     };
+  }
+
+  /**
+   * Retire stale same-path file identities whose occupant bytes are provably
+   * the committed anchor's bytes. Each acceptance is a state-only commit:
+   * anchors are removed, while both the cloud occupant and the relocated
+   * local copies remain untouched for the ordinary plan. Unprovable or
+   * different occupants keep today's review row.
+   */
+  private async settleProvablyReplacedFileIdentities(args: {
+    result: SyncResult;
+    operationEpoch: number;
+    envelope: SyncStateEnvelopeV2;
+    localEntries: readonly LocalFileEntry[];
+    localFolders: readonly LocalFolderEntry[];
+    localFolderScanComplete: boolean;
+    skippedLarge: readonly string[];
+    remoteEntries: readonly RemoteFileEntry[];
+    includeFilePath: (path: string) => boolean;
+    includeFolderPath: (path: string) => boolean;
+    preserveFolderPath: (path: string) => boolean;
+    configDir: string;
+    resolveRemoteContentHash: (
+      item: Readonly<SyncPlanItem>,
+      progress: { current: number; total: number },
+      resetProgressPhase?: boolean,
+    ) => Promise<string>;
+  }): Promise<{
+    retiredPaths: string[];
+    envelope: SyncStateEnvelopeV2;
+  } | null> {
+    let envelope = args.envelope;
+    let remainingDownloads = PROVABLE_REPLACEMENT_DOWNLOAD_BUDGET;
+    const attempted = new Set<string>();
+    const retiredPaths: string[] = [];
+    for (
+      let attempt = 0;
+      attempt < PROVABLE_REPLACEMENT_CANDIDATE_LIMIT;
+      attempt++
+    ) {
+      if (this.shouldStop(args.result, args.operationEpoch)) break;
+      const candidate =
+        await selectNextProvablyReplacedIdentityRetirementV2({
+          envelope,
+          localFiles: args.localEntries,
+          localFolders: args.localFolders,
+          localFolderScanComplete: args.localFolderScanComplete,
+          skippedLarge: args.skippedLarge,
+          maxFileSizeBytes: this.scanner.getMaxFileSize?.(),
+          localMoveHints: this.state.localFolderMoveHints,
+          localFolderDeleteHints: this.state.localFolderDeleteHints,
+          remoteEntries: args.remoteEntries,
+          includeFilePath: args.includeFilePath,
+          includeFolderPath: args.includeFolderPath,
+          preserveFolderPath: args.preserveFolderPath,
+          configDir: args.configDir,
+          automaticDeleteLocalFiles:
+            this.planBuildAutomaticDeleteLocalFiles(),
+          skippedPaths: attempted,
+          remainingDownloads,
+          resolveRemoteContentHash: async (item, progress) => {
+            let remote = item.remote;
+            if (remote && !remote.downloadUrl) {
+              // Ordinary plans refresh the exact verification download set
+              // before hashing; this pre-plan check owns that step itself so a
+              // metadata-only scan can still prove the occupant.
+              const fresh = await this.inspectRemotePath(item.path);
+              if (!fresh?.downloadUrl) {
+                throw new Error(
+                  `Replacement content URL is unavailable: ${item.path}`,
+                );
+              }
+              remote = fresh;
+            }
+            return args.resolveRemoteContentHash(
+              { ...item, remote },
+              progress,
+              false,
+            );
+          },
+        });
+      if (!candidate) break;
+      if (candidate.downloaded) {
+        remainingDownloads = Math.max(0, remainingDownloads - 1);
+      }
+      const publication = await this.state.retireReviewedStaleIdentity({
+        reviewed: candidate.snapshot,
+      });
+      if (publication.status !== "accepted") {
+        attempted.add(candidate.path);
+        this.diag?.warn(
+          "plan",
+          "provable replacement retirement was not accepted; keeping the review row",
+          {
+            path: candidate.path,
+            status: publication.status,
+            mutations: 0,
+          },
+        );
+        continue;
+      }
+      retiredPaths.push(candidate.path);
+      const committed = this.state.getCommittedV2Envelope();
+      if (!committed) break;
+      envelope = committed;
+      this.diag?.log(
+        "plan",
+        "retired a provably replaced stale file identity; both sides stay",
+        {
+          path: candidate.path,
+          downloaded: candidate.downloaded,
+          mutations: 0,
+        },
+      );
+    }
+    return retiredPaths.length > 0
+      ? { retiredPaths, envelope }
+      : null;
   }
 
   /**
@@ -11447,9 +11765,7 @@ export class SyncExecutor {
         await this.persistSeededBaseEntries(seededBaseEntries);
       }
       if (this.shouldStop(result, operationEpoch)) return { terminated: result };
-      await this.state.setLastSyncTime(Date.now());
-      if (this.shouldStop(result, operationEpoch)) return { terminated: result };
-      await this.state.incrementRemoteGeneration();
+      await this.state.setLastSyncTimeAndIncrementGeneration(Date.now());
       if (this.shouldStop(result, operationEpoch)) return { terminated: result };
       await this.publishHealthyCloudBootstrapV2(
         operationEpoch,
@@ -14172,6 +14488,9 @@ export class SyncExecutor {
         automaticHandlingPolicy,
         baselineReconstructionIncomplete,
         prepareV2MigrationCandidate,
+        remoteEntries,
+        allowAutomaticStaleIdentityRetirement:
+          reviewedAuthorization === undefined,
         includeCanonicalFilePath,
         includeCanonicalFolderPath,
         preserveCanonicalFolderPath,
@@ -14181,6 +14500,10 @@ export class SyncExecutor {
       canonicalPlanCandidate = step5c.canonicalPlanCandidate;
       canonicalSourceEnvelope = step5c.canonicalSourceEnvelope;
       committedV2Envelope = step5c.committedV2Envelope;
+      if (step5c.retiredReplacementPaths.length > 0) {
+        const retired = new Set(step5c.retiredReplacementPaths);
+        baseEntries = baseEntries.filter((entry) => !retired.has(entry.path));
+      }
       const step5d = this.runStep5PrepareExecutablePlan({
         result,
         operationEpoch,
@@ -14894,7 +15217,11 @@ export class SyncExecutor {
     retainedMutationRecovery: readonly Readonly<MutationLedgerEntryV1>[] = [],
   ): Promise<void> {
     const startedAt = Date.now();
-    let total = plan.items.length;
+    // 进度分母只算会产生动作的条目（2026-10-25 拍板）：按设置跳过（超大小／
+    // 忽略路径）零动作，算进来会让「x/y 项」和进度条在整段真实传输期间停在
+    // 错误读数上（y 远大于实际，条几乎不动）。跳过项照常执行、照常上报完成行，
+    // 只是不占进度位置。
+    let total = countProgressPlanItems(plan.items);
     const pendingConflicts: SyncPlanItem[] = [];
     const pendingDeletes: SyncPlanItem[] = [];
     const pendingIssues: PendingIssue[] = [];
@@ -15028,9 +15355,14 @@ export class SyncExecutor {
       deferUploadCheckpoint = false,
     ): Promise<DeferredMutationCompletion | undefined> => {
       if (!this.canContinue(operationEpoch, result)) return;
-      const position = ++started;
-      this.progressStore?.setProgress(position, total, item.path, item.type);
-      callbacks.onProgress?.(position, total, item.path);
+      // 按设置跳过不占进度位置：占位会让进度条在跳过突发里回跳、当前文件槽闪
+      // 一下被排除的路径。完成行照常上报（历史与诊断报告要它们）。
+      const countsTowardProgress = !isConfigurationSkipAction(item.type);
+      const position = countsTowardProgress ? ++started : started;
+      if (countsTowardProgress) {
+        this.progressStore?.setProgress(position, total, item.path, item.type);
+        callbacks.onProgress?.(position, total, item.path);
+      }
 
       const fileSize = fileSizeForAction(item, item.type);
       const localHash = item.local?.hash;
@@ -15240,6 +15572,19 @@ export class SyncExecutor {
           }
           return { terminated: undefined };
         }
+        // One-way retained folder: the shell stays because local content has
+        // to survive. The row is informational (no decision, no count in the
+        // sidebar) and must be re-emitted next round so the round-end
+        // reconciliation keeps it until the folder can follow the cloud.
+        if (itemResult.retainedFolder) {
+          pendingIssues.push({
+            path: item.path,
+            actionType: SyncActionType.FolderDeferred,
+            issueCode: "one-way-folder-retained",
+            reason: this.t("reason.oneWay.folderRetained"),
+            updatedAt: Date.now(),
+          });
+        }
         if (transferMetrics && transferDirection) {
           const completedAfter = transferDirection === "upload"
             ? result.uploaded
@@ -15311,7 +15656,7 @@ export class SyncExecutor {
           callbacks.onFileComplete?.(item.path, item.type, true, reason, fileSize);
           return { terminated: undefined };
         }
-        if (isResolvedIssueAction(item.type)) {
+        if (isResolvedIssueAction(item.type) && !itemResult.retainedFolder) {
           resolvedIssuePaths.add(item.path);
           if (item.renameFrom) resolvedIssuePaths.add(item.renameFrom);
         }
@@ -16031,6 +16376,12 @@ export class SyncExecutor {
     // 总数；结算全集（扫描层+gated 的去重并集）才是真实跳过总量。
     if (settledSkipPaths.size > result.skippedLarge) {
       result.skippedLarge = settledSkipPaths.size;
+    }
+    // 历史清单（2026-10-25 拍板）：运行列表只在“新面孔”那一轮逐条发行，但每一
+    // 轮的历史都要能展开看本轮结算的跳过路径——与基准的增量呈现解耦；写入时
+    // 去重并截断（`MAX_HISTORY_SKIP_PATHS`），标题仍报本轮真实总数。
+    if (settledSkipPaths.size > 0) {
+      result.skippedPaths = normalizeHistorySkipPaths([...settledSkipPaths]);
     }
     this.diag?.log(
       "execute",
@@ -21877,6 +22228,28 @@ export class SyncExecutor {
     }
     if (local.status === "present") {
       if (!this.canContinue(operationEpoch, result)) return { executed: false };
+      // One-way promise: local-only content is never lost. A cloud-deleted
+      // folder may still hold files that only exist on this device (or
+      // unresolved conflicts); the shell therefore cannot be removed. Keep it
+      // and hand the explanation to the caller as a read-only note. Empty
+      // shells keep the existing follow-delete path, and two-way keeps its
+      // fail-closed behavior unchanged.
+      if (
+        this.syncDirection === "one-way"
+        && !isProtectedFolderDeletePath(
+          item.path,
+          getConfigDir(this.scanner.vault),
+        )
+        && !await this.isLocalFolderEmpty(item.path)
+      ) {
+        result.foldersRetained = (result.foldersRetained ?? 0) + 1;
+        return {
+          executed: true,
+          retainedFolder: true,
+          completionActionType: SyncActionType.FolderDeferred,
+          completionReason: this.t("reason.oneWay.folderRetained"),
+        };
+      }
       await this.deleteEmptyLocalFolder(item.path);
       // 跟随删除侧：删掉本机这份空壳之后补记一条，身份来自计划项携带的远端 id。
       await this.noteFollowedCloudDeletionLedger({
@@ -21940,6 +22313,44 @@ export class SyncExecutor {
           fresh,
           item.remote?.parentId,
         );
+        // A concurrent writer may have only touched the version while keeping
+        // the bytes identical. When the fresh metadata proves the content still
+        // matches the base, retry the delete with the fresh eTag instead of
+        // minting a user decision; leave the conflict path untouched when the
+        // hash is absent or differs.
+        const base = this.state.baseSnapshot.find(
+          (entry) => entry.path === item.path,
+        );
+        const freshMatchesBase = Boolean(
+          base
+          && remoteEntry.size === base.size
+          && remoteEntry.sha256Hash
+          && remoteEntry.sha256Hash.toLowerCase() === base.hash.toLowerCase(),
+        );
+        if (freshMatchesBase) {
+          try {
+            await this.onedrive.deleteItem(
+              this.vaultName,
+              item.path,
+              remoteEntry.eTag,
+              remoteEntry.driveId,
+            );
+            await this.noteCloudDeletionLedger({
+              remoteId: remoteEntry.driveId,
+              path: item.path,
+              kind: "file",
+            });
+            remoteDeletes.push(item.path);
+            result.deleted++;
+            return { executed: true, mutationApplied: true, baseRemoval: item.path };
+          } catch (retryError) {
+            if (!(retryError instanceof OneDriveError && isRemoteMutationConflict(retryError))) {
+              throw retryError;
+            }
+            // Another writer won again; fall through to the pending conflict
+            // with the freshest metadata we have.
+          }
+        }
         remoteUpserts.push(remoteEntry);
         return this.queuePendingConflict({
           type: SyncActionType.Conflict,
@@ -28556,8 +28967,37 @@ export class SyncExecutor {
     );
   }
 
-  /** Resolve a conflict: keep local version (re-upload) */
-  async resolveConflictKeepLocal(path: string): Promise<void> {
+  /**
+   * 冲突批量「全部保留本机／全部保留云端」：逐项走现役逐条链（决策令牌、
+   * 版本复核、durable mutation、删除记录/本机留档一项不少），只关掉逐条成功
+   * 提示——照 batch delete / local-only 先例；失败仍逐条报错并保留行。
+   * 顺序按路径排序，重挂/重放稳定；批量不是原子操作，允许部分成功。
+   */
+  async resolveConflictsKeepLocal(paths: readonly string[]): Promise<void> {
+    await this.resolveConflictBatch(paths, "local");
+  }
+
+  async resolveConflictsKeepRemote(paths: readonly string[]): Promise<void> {
+    await this.resolveConflictBatch(paths, "remote");
+  }
+
+  private async resolveConflictBatch(
+    paths: readonly string[],
+    direction: "local" | "remote",
+  ): Promise<void> {
+    const unique = [...new Set(paths)].sort((left, right) =>
+      left.localeCompare(right));
+    await Promise.all(unique.map((path) => direction === "local"
+      ? this.resolveConflictKeepLocal(path, false)
+      : this.resolveConflictKeepRemote(path, false)));
+  }
+
+  /** Resolve a conflict: keep local version (re-upload). Batch callers pass
+   *  `showSuccessNotice = false` and report only failures per item. */
+  async resolveConflictKeepLocal(
+    path: string,
+    showSuccessNotice = true,
+  ): Promise<void> {
     if (this.stopSideActionForStateRecovery()) return;
     const conflict = this.state.pendingConflicts.find((c) => c.path === path);
     if (await this.expireOutOfScopeConflictDecision(path)) return;
@@ -28580,7 +29020,7 @@ export class SyncExecutor {
             pendingKind: "conflict",
             item: queuedConflict,
           })) return;
-          if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict")) return;
+          if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict", "safeSubset")) return;
           if (!this.canContinue(operationEpoch)) return;
           const intent = this.createSideMutationIntent(queuedConflict, "deleteRemote");
           const committed = await this.runDurableSideMutation(intent, operationEpoch, async () => {
@@ -28602,7 +29042,7 @@ export class SyncExecutor {
             return checkpoint;
           });
           if (!committed) return;
-          this.notice("notice.conflict.keptLocal", { path });
+          if (showSuccessNotice) this.notice("notice.conflict.keptLocal", { path });
           return true;
         } catch (e) {
           if (e instanceof OneDriveError && isRemoteMutationConflict(e)) {
@@ -28625,7 +29065,7 @@ export class SyncExecutor {
             pendingKind: "conflict",
             item: queuedConflict,
           })) return;
-        if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict")) return;
+        if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict", "safeSubset")) return;
         const content = await this.scanner.vault.adapter.readBinary(path);
         const uploadLocal = managedConfig
           ? await this.readManagedConfigSnapshot(path, content)
@@ -28683,8 +29123,12 @@ export class SyncExecutor {
     });
   }
 
-  /** Resolve a conflict: keep remote version (re-download) */
-  async resolveConflictKeepRemote(path: string): Promise<void> {
+  /** Resolve a conflict: keep remote version (re-download). Batch callers pass
+   *  `showSuccessNotice = false` and report only failures per item. */
+  async resolveConflictKeepRemote(
+    path: string,
+    showSuccessNotice = true,
+  ): Promise<void> {
     if (this.stopSideActionForStateRecovery()) return;
     const conflict = this.state.pendingConflicts.find((c) => c.path === path);
     if (await this.expireOutOfScopeConflictDecision(path)) return;
@@ -28710,7 +29154,7 @@ export class SyncExecutor {
             pendingKind: "conflict",
             item: queuedConflict,
           })) return;
-          if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict")) return;
+          if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict", "safeSubset")) return;
           if (!this.canContinue(operationEpoch)) return;
           // 留档先于删除：这份本机内容云端已无、是唯一一份；留档没落定就不删
           // （见方法注释）。
@@ -28732,7 +29176,7 @@ export class SyncExecutor {
             return checkpoint;
           });
           if (!committed) return;
-          this.notice("notice.conflict.keptRemote", { path });
+          if (showSuccessNotice) this.notice("notice.conflict.keptRemote", { path });
           return true;
         } catch (e) {
           if (this.stopSideActionForAuthFailure(path, e)) return;
@@ -28752,11 +29196,11 @@ export class SyncExecutor {
             pendingKind: "conflict",
             item: queuedConflict,
           })) return;
-        if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict")) return;
+        if (!await this.guardReviewedRemoteVersion(queuedConflict, "notice.conflict.failed", "conflict", "safeSubset")) return;
         if (managedConfig) {
           const content = await this.replaceManagedConfigWithRemote(queuedConflict, operationEpoch);
           if (!content) return;
-          this.notice("notice.conflict.keptRemote", { path });
+          if (showSuccessNotice) this.notice("notice.conflict.keptRemote", { path });
           return true;
         }
         // 留档先于覆盖：留档没落定就不覆盖、也不开下载意图（见方法注释）。
@@ -28799,7 +29243,7 @@ export class SyncExecutor {
           }
         });
         if (!committed || !content) return;
-        this.notice("notice.conflict.keptRemote", { path });
+        if (showSuccessNotice) this.notice("notice.conflict.keptRemote", { path });
         return true;
       } catch (rawError) {
         if (rawError instanceof MutationNotAppliedError && rawError.noticeAlreadyShown) return;
@@ -29038,6 +29482,7 @@ export class SyncExecutor {
             pending,
             "notice.delete.failed",
             "delete",
+            "safeSubset",
           )
         ) return;
         if (!this.canContinue(operationEpoch)) return;
@@ -29262,7 +29707,7 @@ export class SyncExecutor {
           pendingKind: "delete",
           item: pending,
         })) return;
-        if (!await this.guardReviewedRemoteVersion(pending, "notice.delete.failed", "delete")) return;
+        if (!await this.guardReviewedRemoteVersion(pending, "notice.delete.failed", "delete", "safeSubset")) return;
         const content = await this.scanner.vault.adapter.readBinary(path);
         const contentHash = typeof (this.scanner as LocalScanner & { inspectFile?: unknown }).inspectFile === "function"
           ? await sha256Hex(content)
@@ -29385,6 +29830,8 @@ function plannerIssueCodeForReason(
     case "reason.file.scope-crossing":
     case "reason.folder.scope-crossing":
       return "scope-crossing";
+    case "reason.oneWay.folderRetained":
+      return "one-way-folder-retained";
     default:
       return undefined;
   }

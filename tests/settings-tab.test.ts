@@ -1392,6 +1392,7 @@ describe("settings tab", () => {
       onViewPlan,
       close,
       setTitle: vi.fn(),
+      modalEl: { addClass: vi.fn() },
       contentEl: {
         empty: vi.fn(),
         createEl: (_tag: string, options: { text: string }) => {

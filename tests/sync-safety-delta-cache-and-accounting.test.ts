@@ -128,8 +128,10 @@ describe("Persistent remote delta state", () => {
     expect(result.success).toBe(true);
     expect(result.errors).toBe(0);
     expect(result.skippedLarge).toBe(1);
-    expect(state.setLastSyncTime).toHaveBeenCalledTimes(1);
-    expect(state.incrementRemoteGeneration).toHaveBeenCalledTimes(1);
+    // W3 2026-10-24: healthy round-end mark is one combined commit.
+    expect(state.setLastSyncTimeAndIncrementGeneration).toHaveBeenCalledTimes(1);
+    expect(state.setLastSyncTime).not.toHaveBeenCalled();
+    expect(state.incrementRemoteGeneration).not.toHaveBeenCalled();
   });
 
   it("settles a proven not-applied download failure in the same sync round", async () => {

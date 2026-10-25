@@ -2761,6 +2761,34 @@ describe("main sync entry guards", () => {
     expect(updateStatusBar).toHaveBeenCalledOnce();
   });
 
+  it("routes a conflict batch through one gateway, dedupes and sorts its paths", async () => {
+    const plugin = makePlugin();
+    const resolveConflictsKeepLocal = vi.fn().mockResolvedValue(undefined);
+    plugin.state = {} as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: false,
+      resolveConflictsKeepLocal,
+    } as never;
+    const checkAccountBinding = vi.spyOn(plugin as never, "checkAccountBinding")
+      .mockResolvedValue(true);
+    vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+    vi.spyOn(plugin, "syncView", "get").mockReturnValue(null);
+
+    await expect(plugin.resolveConflictsKeepLocal([
+      "b.md",
+      "a.md",
+      "a.md",
+    ])).resolves.toBe(true);
+
+    expect(plugin.ensureStateLoaded).toHaveBeenCalledOnce();
+    expect(checkAccountBinding).toHaveBeenCalledOnce();
+    expect(resolveConflictsKeepLocal).toHaveBeenCalledOnce();
+    expect(resolveConflictsKeepLocal).toHaveBeenCalledWith(["a.md", "b.md"]);
+    // 批量结束后方向归位，视图重挂拿到的是空闲态。
+    expect(plugin.conflictBatchState).toBeNull();
+  });
+
   it("releases a conflict-owned automatic pause after the final pending decision settles", async () => {
     const plugin = makePlugin();
     plugin.autoSyncPaused = true;

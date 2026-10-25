@@ -31,6 +31,8 @@ export class UpdateReminderModal extends EasySyncModal<UpdateReminderChoice | nu
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
+    // 纯提示框：正文即全部内容，正文放大走 styles.css 白名单。
+    this.modalEl.addClass("easy-sync-prompt-modal");
     this.setTitle(this.title);
 
     contentEl.createEl("p", {

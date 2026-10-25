@@ -17,10 +17,16 @@ import {
   groupBundleConflictReviews,
   groupPendingIssuesForReview,
   formatSyncHistoryCounts,
+  collectBatchConflictItems,
+  isBatchedConflictSet,
   isBatchedDeleteSet,
+  isConflictBatchExcludedPath,
   isDecisionRowKey,
   resolveDecisionRowDefaultOpen,
   isPlanReviewRefreshedSinceShown,
+  collectHistorySkipRows,
+  partitionCompletedProgressRows,
+  resolveCompletedActionCount,
   resolveFileProgressPresentation,
   resolvePlanReviewDetailsState,
   resolveRemoteScopeRecoveryFailurePresentation,
@@ -118,6 +124,123 @@ describe("syncViewProgressPercent", () => {
       completedCount: 0,
       startedAt: 1,
     })).toBe(25);
+  });
+});
+
+describe("configuration-skip rows stay out of the completed counts", () => {
+  const row = (
+    path: string,
+    actionType: SyncActionType | undefined,
+  ) => ({
+    path,
+    status: "skip" as const,
+    actionType,
+  });
+
+  it("partitions size/ignored-path skips away from real completed rows", () => {
+    const rows = partitionCompletedProgressRows([
+      row("big.mp4", SyncActionType.SkipLargeFile),
+      row("note.md", SyncActionType.Upload),
+      row("ignored.md", SyncActionType.SkipIgnoredPath),
+      row("bad?.md", SyncActionType.SkipOneDriveInvalidName),
+    ]);
+    expect(rows.action.map((entry) => entry.path)).toEqual([
+      "note.md",
+      "bad?.md",
+    ]);
+    expect(rows.skipped.map((entry) => entry.path)).toEqual([
+      "big.mp4",
+      "ignored.md",
+    ]);
+  });
+
+  it("reports the completed subtitle count without the zero-action skips", () => {
+    const state = {
+      phase: "executing" as const,
+      current: 2,
+      total: 2,
+      currentFile: "",
+      currentItemBytes: 0,
+      currentItemTotalBytes: 0,
+      cancelRequested: false,
+      completedFiles: [
+        row("note.md", SyncActionType.Upload),
+        row("big.mp4", SyncActionType.SkipLargeFile),
+        row("big-2.mp4", SyncActionType.SkipLargeFile),
+      ],
+      // The retained row list caps successes, so the true total lives here.
+      completedCount: 3,
+      startedAt: 1,
+    };
+    expect(resolveCompletedActionCount(state)).toBe(1);
+    // 非法文件名是真实用户行动（改名），照常计数。
+    expect(resolveCompletedActionCount({
+      ...state,
+      completedFiles: [
+        ...state.completedFiles,
+        row("bad?.md", SyncActionType.SkipOneDriveInvalidName),
+      ],
+      completedCount: 4,
+    })).toBe(2);
+    // 只有跳过行时不出现负值。
+    expect(resolveCompletedActionCount({
+      ...state,
+      completedFiles: [row("big.mp4", SyncActionType.SkipLargeFile)],
+      completedCount: 1,
+    })).toBe(0);
+  });
+});
+
+describe("history keeps the skip list every round", () => {
+  const skipRow = (path: string) => ({
+    path,
+    status: "skip" as const,
+    actionType: SyncActionType.SkipLargeFile,
+  });
+
+  it("rebuilds the fold from retained paths when the round emitted no rows", () => {
+    // 2026-10-25 拍板：运行列表只报新面孔，历史每条记录都能展开同一份清单。
+    const result = collectHistorySkipRows({
+      files: [],
+      skipPaths: ["video.mp4", "podcast.m4a"],
+      total: 2,
+    });
+    expect(result.rows.map((entry) => entry.path)).toEqual([
+      "video.mp4",
+      "podcast.m4a",
+    ]);
+    expect(result.rows.every((entry) => entry.actionType === SyncActionType.SkipLargeFile))
+      .toBe(true);
+    expect(result.total).toBe(2);
+    expect(result.omitted).toBe(0);
+  });
+
+  it("keeps emitted rows and dedupes the retained paths against them", () => {
+    const result = collectHistorySkipRows({
+      files: [skipRow("video.mp4"), { path: "note.md", status: "upload" as const, actionType: SyncActionType.Upload }],
+      skipPaths: ["video.mp4", "podcast.m4a"],
+      total: 2,
+    });
+    expect(result.rows.map((entry) => entry.path)).toEqual([
+      "video.mp4",
+      "podcast.m4a",
+    ]);
+    // 上传行不混进跳过折叠组。
+    expect(result.rows.some((entry) => entry.path === "note.md")).toBe(false);
+  });
+
+  it("reports the round's true total and the omitted remainder", () => {
+    const result = collectHistorySkipRows({
+      files: [],
+      skipPaths: ["a.mp4", "b.mp4"],
+      total: 5,
+    });
+    expect(result.rows).toHaveLength(2);
+    expect(result.total).toBe(5);
+    expect(result.omitted).toBe(3);
+    // 老条目没有 skipPaths：只有发行过的行能显示，总数缺席时不报省略。
+    expect(collectHistorySkipRows({ files: [skipRow("old.mp4")], skipPaths: undefined }))
+      .toEqual({ rows: [skipRow("old.mp4")], total: 1, omitted: 0 });
   });
 });
 
@@ -365,7 +488,9 @@ describe("shared sidebar detail controls", () => {
       "renderLocalOnlyItem|easy-sync-tree-item": "decision",
       "createTreeGroup|easy-sync-tree-item": "container",
       "renderHistorySection|easy-sync-history-run easy-sync-tree-item": "readonly",
-      "renderHistoryEntryBody|easy-sync-history-skip-group easy-sync-tree-item": "readonly",
+      // 运行中列表与历史条目共用的「按设置跳过」折叠件（2026-10-25 拍板）：
+      // 站点随共享化移到 createSkipFold，类别与默认态不变。
+      "createSkipFold|easy-sync-history-skip-group easy-sync-tree-item": "readonly",
       "renderUpdateAvailableItem|easy-sync-tree-item": "readonly",
       "measurePlanDecisionRowHeights|easy-sync-tree-item easy-sync-plan-decision-probe": "probe",
     };
@@ -1532,10 +1657,14 @@ describe("buildSyncViewContentKey", () => {
   it("maps pending issues by outcome instead of repeating the attempted action", () => {
     const zh = new I18n("zh-cn");
     const label = (type: SyncActionType) =>
-      formatPendingIssueChipLabel(type, zh.t.bind(zh));
+      formatPendingIssueChipLabel({ actionType: type }, zh.t.bind(zh));
 
     expect(label(SyncActionType.Upload)).toBe("失败");
     expect(label(SyncActionType.FolderDeferred)).toBe("未同步");
+    expect(formatPendingIssueChipLabel({
+      actionType: SyncActionType.FolderDeferred,
+      issueCode: "one-way-folder-retained",
+    }, zh.t.bind(zh))).toBe("未同步");
     expect(label(SyncActionType.RetryLater)).toBe("未同步");
     expect(label(SyncActionType.SkipLargeFile)).toBe("跳过");
     expect(label(SyncActionType.SkipIgnoredPath)).toBe("跳过");
@@ -1700,12 +1829,15 @@ describe("buildSyncViewContentKey", () => {
       source.indexOf("private renderProgressPanel"),
       source.indexOf("private renderRemoteScopeRecoveryFailure"),
     );
-    expect(progressPanel).toContain("{ count: state.completedCount }");
+    // 2026-10-25：标题数＝真实动作数（`completedCount` 减掉零动作的按设置跳过行）。
+    expect(progressPanel).toContain(
+      "count: resolveCompletedActionCount(state)",
+    );
     const append = source.slice(
       source.indexOf("private appendNewFileRows"),
       source.indexOf("private renderToolbar"),
     );
-    expect(append).toContain("state.completedCount");
+    expect(append).toContain("resolveCompletedActionCount(");
     expect(append).not.toContain("count: files.length");
   });
 
@@ -1738,7 +1870,7 @@ describe("buildSyncViewContentKey", () => {
       source.indexOf("private renderRemoteScopeRecoveryFailure"),
     );
     expect(body).toContain("easy-sync-progress-bar");
-    expect(body).toContain("{ count: state.completedCount }");
+    expect(body).toContain("count: resolveCompletedActionCount(state)");
     const patch = source.slice(
       source.indexOf("this.updateStatusPanel(statusState);"),
       source.indexOf("this.lastContentKey = contentKey;"),
@@ -1813,7 +1945,7 @@ describe("buildSyncViewContentKey", () => {
     expect(rowRenderer).toContain("return row;");
   });
 
-  it("keeps ordinary plan rows chip-free and excludes history from adaptive directories", () => {
+  it("keeps ordinary plan rows chip-free; history action rows and the skip fold both opt into adaptive directories", () => {
     const source = readSourceFile("src/ui/sync-view.ts");
     const planStart = source.indexOf("private renderPlanGroups");
     const conflictStart = source.indexOf("private renderConflictItem", planStart);
@@ -1829,11 +1961,25 @@ describe("buildSyncViewContentKey", () => {
     expect(source).toContain('window.addEventListener("resize"');
     expect(source).toContain("this.scheduleAdaptivePathLayout()");
     // 2026-09-16 增量呈现：历史条目先分区再渲染，普通行走 renderFileResults，
-    // SkipLargeFile 行归入折叠组（见 renderHistorySection 的 skip-group）。
-    expect(source).toContain("this.renderFileResults(body, otherRows, false)");
+    // 按设置跳过行归入共享折叠件（2026-10-25 与运行中合并成同一件，并由
+    // skipPaths 补回稳定集合）。
+    // 2026-10-25 用户确认：历史普通文件行也接灰字目录（此前"历史不挂"只是
+    // 实现现状被追认成约定，不是用户拍板）。
     expect(source).toContain(
-      'if (limitHeight) {\n      list.addClass("is-limited");\n      list.addClass("easy-sync-path-layout");',
+      "this.renderFileResults(body, rows.action, false, true)",
     );
+    expect(source).toContain("collectHistorySkipRows({");
+    expect(source).toContain("this.createSkipFold(body, skip.rows, skip.total)");
+    expect(source).toContain('if (adaptive) list.addClass("easy-sync-path-layout")');
+    expect(source).toContain("renderFileRow(files[i], list, t, adaptive)");
+    // 懒建正文在首帧渲染之后，必须补一次同一任务内的路径摘取。
+    expect(source).toContain("this.renderHistoryEntryBody(body, entry);\n            // 懒建的正文不在首帧渲染里");
+    // 2026-10-25 用户真机反馈：跳过折叠组本身要复用现役灰字目录机制——
+    // 组内列表是独立测量范围，行按真实宽度自适应摘取。
+    expect(source).toContain(
+      '"easy-sync-file-list easy-sync-path-layout"',
+    );
+    expect(source).toContain("configureFilePath(row, pathEl, file.path, true)");
   });
 
   it("keeps moves, deferred work, true skips, and remote preparation in distinct plan groups", () => {
@@ -2119,6 +2265,9 @@ describe("buildSyncViewContentKey", () => {
       createSection: vi.fn(() => section),
       addCollapseIcon: vi.fn(),
       renderFileResults,
+      // 懒建正文后的路径摘取在真实视图里读 contentEl；这里只验证调用，
+      // 不需要真实 DOM。
+      applyAdaptivePathLayout: vi.fn(),
     });
 
     (view as unknown as {
@@ -2195,6 +2344,7 @@ describe("buildSyncViewContentKey", () => {
       createSection: vi.fn(() => section),
       addCollapseIcon: vi.fn(),
       renderFileResults: vi.fn(),
+      applyAdaptivePathLayout: vi.fn(),
     });
 
     (view as unknown as {
@@ -2738,9 +2888,14 @@ describe("buildSyncViewContentKey", () => {
     expect(modalSource.indexOf("syncView.mutationResolution.previousAction")).toBeGreaterThan(
       modalSource.indexOf("syncView.mutationResolution.technicalDetails"),
     );
-    expect(modalSource.indexOf("syncView.mutationResolution.description")).toBeGreaterThan(
+    // 2026-10-25: the reason line moved out of the collapsed evidence into the
+    // body (before the table). With the actions relabelled as operations it is
+    // the only line on the first screen saying why the review exists, and it
+    // carries no {path} (the path shows in the table once, 2026-08-16).
+    expect(modalSource.indexOf("syncView.mutationResolution.description")).toBeLessThan(
       modalSource.indexOf("syncView.mutationResolution.technicalDetails"),
     );
+    expect(modalSource).not.toContain('"syncView.mutationResolution.description", {');
     expect(styles).not.toContain("easy-sync-comparison-previous-action");
     expect(styles).toMatch(
       /\.easy-sync-comparison-path-table\s*\{[^}]*table-layout:\s*fixed;/s,
@@ -3967,7 +4122,11 @@ describe("history section lazy entry bodies", () => {
     expect(body).toContain("easy-sync-history-counts");
     expect(body).toContain("formatMutationRecoveryHistory");
     expect(body).toContain("renderFileResults");
-    expect(body).toContain("easy-sync-history-skip-group");
+    // 跳过折叠组随共享化移到 createSkipFold（运行中与历史同一个折叠件），
+    // 行由当轮发行行＋保留路径合并而来（2026-10-25）。
+    expect(body).toContain("collectHistorySkipRows({");
+    expect(body).toContain("this.createSkipFold(body, skip.rows, skip.total)");
+    expect(body).toContain("syncView.history.skipOmitted");
     expect(body).toContain("syncView.history.noFileChanges");
     expect(body).toContain("formatSyncHistoryCounts");
   });
@@ -4177,6 +4336,57 @@ describe("one-way local-only rows (片④)", () => {
     expect(resolveDecisionRowDefaultOpen("localOnly:only.md", {})).toBe(true);
   });
 
+  it("puts a retained-folder note above its local-only rows and drops it when every file is ignored", () => {
+    const retained = {
+      issue: {
+        path: "notes",
+        actionType: SyncActionType.FolderDeferred,
+        issueCode: "one-way-folder-retained" as const,
+        reason: "云端文件夹已删，本机残留未处理内容。",
+        updatedAt: 1,
+      },
+      nestedIssues: [],
+    };
+    const rows = buildSyncPendingDisplayRows({
+      adoptionRows: [],
+      failures: [],
+      conflictEntries: [],
+      pendingDeletes: [],
+      skipped: [],
+      localOnlyRows: [
+        { kind: "created", path: "notes/a.md", targetPath: "notes/a.md" },
+        { kind: "created", path: "other.md", targetPath: "other.md" },
+        { kind: "created", path: "notes/sub/b.md", targetPath: "notes/sub/b.md" },
+      ],
+      retainedFolders: [retained],
+    });
+    expect(rows.map((row) => row.kind)).toEqual([
+      "batchLocalOnly",
+      "retainedFolder",
+      "localOnly",
+      "localOnly",
+      "localOnly",
+    ]);
+    expect(rows[1].key).toBe("retainedFolder:notes");
+    expect(rows[1].issue).toBe(retained.issue);
+    expect(rows[2].localOnly?.targetPath).toBe("notes/a.md");
+    expect(rows[3].localOnly?.targetPath).toBe("notes/sub/b.md");
+    expect(rows[4].localOnly?.targetPath).toBe("other.md");
+
+    // All files below the retained folder are ignored: the folder stays, but
+    // the reminder row has no actionable file to explain and must disappear.
+    const ignored = buildSyncPendingDisplayRows({
+      adoptionRows: [],
+      failures: [],
+      conflictEntries: [],
+      pendingDeletes: [],
+      skipped: [],
+      localOnlyRows: [],
+      retainedFolders: [retained],
+    });
+    expect(ignored).toEqual([]);
+  });
+
   it("pins the note into every review flow line and into the otherwise-empty slot (件①)", () => {
     const source = readSourceFile("src/ui/sync-view.ts");
     const sectionStart = source.indexOf("private renderPlanReviewSection");
@@ -4384,5 +4594,238 @@ describe("one-way local-only rows (片④)", () => {
     const slice = source.slice(start, start + 400);
     expect(slice).toContain("if (present.length > 0)");
     expect(slice).toContain("easy-sync-plan-counts");
+  });
+});
+
+describe("conflict batch row (2026-10-23)", () => {
+  const conflict = (path: string): SyncPlanItem => ({
+    type: SyncActionType.Conflict,
+    path,
+  });
+  const fileEntry = (path: string) => ({
+    kind: "file" as const,
+    item: conflict(path),
+  });
+  const baseInput = {
+    adoptionRows: [],
+    failures: [],
+    pendingDeletes: [],
+    skipped: [],
+    configDir: ".obsidian",
+  };
+
+  it("adds one batch row before the conflict rows when at least two ordinary files are eligible", () => {
+    const rows = buildSyncPendingDisplayRows({
+      ...baseInput,
+      conflictEntries: [
+        fileEntry("a.md"),
+        fileEntry("b.md"),
+        fileEntry("c.md"),
+      ],
+    });
+    expect(rows.map((row) => row.kind)).toEqual([
+      "batchConflict",
+      "conflict",
+      "conflict",
+      "conflict",
+    ]);
+    expect(rows[0].key).toBe("batch-conflict");
+    expect(rows[0].conflicts?.map((item) => item.path)).toEqual([
+      "a.md",
+      "b.md",
+      "c.md",
+    ]);
+    expect(rows[0].conflictBatchExcluded).toBe(0);
+  });
+
+  it("keeps plugin subtrees and managed config out of the batch but visible per row", () => {
+    const rows = buildSyncPendingDisplayRows({
+      ...baseInput,
+      conflictEntries: [
+        fileEntry("a.md"),
+        fileEntry(".obsidian/plugins/demo/data.json"),
+        fileEntry(".obsidian/appearance.json"),
+        fileEntry("b.md"),
+      ],
+    });
+    expect(rows.map((row) => row.kind)).toEqual([
+      "batchConflict",
+      "conflict",
+      "conflict",
+      "conflict",
+      "conflict",
+    ]);
+    expect(rows[0].conflicts?.map((item) => item.path)).toEqual([
+      "a.md",
+      "b.md",
+    ]);
+    expect(rows[0].conflictBatchExcluded).toBe(2);
+    expect(rows.slice(1).map((row) => row.item?.path)).toEqual([
+      "a.md",
+      ".obsidian/plugins/demo/data.json",
+      ".obsidian/appearance.json",
+      "b.md",
+    ]);
+  });
+
+  it("does not add the batch row for a single eligible conflict", () => {
+    const rows = buildSyncPendingDisplayRows({
+      ...baseInput,
+      conflictEntries: [
+        fileEntry("a.md"),
+        fileEntry(".obsidian/appearance.json"),
+      ],
+    });
+    expect(rows.map((row) => row.kind)).toEqual(["conflict", "conflict"]);
+    expect(rows.some((row) => row.kind === "batchConflict")).toBe(false);
+  });
+
+  it("keeps bundle rows separate and counts only ordinary file conflicts", () => {
+    const rows = buildSyncPendingDisplayRows({
+      ...baseInput,
+      conflictEntries: [
+        fileEntry("a.md"),
+        {
+          kind: "bundle" as const,
+          pluginId: "demo",
+          items: [conflict(".obsidian/plugins/demo/main.js")],
+        },
+        fileEntry("b.md"),
+      ],
+    });
+    expect(rows.map((row) => row.kind)).toEqual([
+      "batchConflict",
+      "conflict",
+      "pluginConflict",
+      "conflict",
+    ]);
+    expect(rows[0].conflicts?.map((item) => item.path)).toEqual([
+      "a.md",
+      "b.md",
+    ]);
+    expect(rows[0].conflictBatchExcluded).toBe(0);
+  });
+
+  it("excludes the whole plugin subtree and only the managed config files at the vault root", () => {
+    expect(isConflictBatchExcludedPath(
+      ".obsidian/plugins/demo/main.js",
+      ".obsidian",
+    )).toBe(true);
+    expect(isConflictBatchExcludedPath(
+      ".obsidian/plugins/demo/data.json",
+      ".obsidian",
+    )).toBe(true);
+    expect(isConflictBatchExcludedPath(
+      ".obsidian/appearance.json",
+      ".obsidian",
+    )).toBe(true);
+    expect(isConflictBatchExcludedPath(
+      ".obsidian/themes/demo.css",
+      ".obsidian",
+    )).toBe(false);
+    expect(isConflictBatchExcludedPath(
+      "notes/.obsidian/appearance.json",
+      ".obsidian",
+    )).toBe(false);
+    expect(isConflictBatchExcludedPath("notes/a.md", ".obsidian")).toBe(false);
+  });
+
+  it("uses the existing two-button batch shell and confirms both directions", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const start = source.indexOf("private renderBatchConflictRow(");
+    const end = source.indexOf("private renderBundleConflictItem(", start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    const renderer = source.slice(start, end);
+    expect(renderer).toContain('rowEl.dataset.easySyncPlanRow = "batch-conflict"');
+    expect(renderer).toContain("easy-sync-local-only-batch-actions");
+    expect(renderer).toContain("syncView.conflict.batchKeepLocalTitle");
+    expect(renderer).toContain("syncView.conflict.batchKeepRemoteTitle");
+    expect(renderer).toContain("syncView.conflict.batchKeepLocalMessage");
+    expect(renderer).toContain("syncView.conflict.batchKeepRemoteMessage");
+    // 入口两颗按钮同色（中性），危险色只留给两个确认弹框的确认键。
+    expect(renderer).not.toContain("applyDestructiveButton");
+    expect(renderer.match(/danger: true/g) ?? []).toHaveLength(2);
+    expect(renderer).not.toContain("版本历史");
+    expect(renderer).not.toContain("version history");
+    expect(source).toContain('case "batchConflict":');
+  });
+
+  it("pins the threshold helper to two eligible conflicts", () => {
+    expect(isBatchedConflictSet(["conflict:a.md"])).toBe(false);
+    expect(isBatchedConflictSet([
+      "conflict:a.md",
+      "conflict:b.md",
+    ])).toBe(true);
+    expect(isBatchedConflictSet([
+      "conflict:a.md",
+      "delete:b.md",
+    ])).toBe(false);
+    expect(collectBatchConflictItems([
+      fileEntry("a.md"),
+    ], ".obsidian")).toHaveLength(1);
+  });
+
+  it("keeps modal body copy at the host's normal UI size", () => {
+    const styles = readSourceFile("styles.css");
+    // 2026-10-24 审计收窄为白名单制：正文放大只适用于"正文即全部内容"的
+    // 纯提示/确认框（挂 easy-sync-prompt-modal）；其余一切弹框（设置表单、
+    // 数据视图、选项卡、列表、多组说明、设备码注脚）一律宿主原本字号。
+    expect(styles).toContain(
+      ".easy-sync-modal-container .easy-sync-prompt-modal .modal-content > .setting-item-description",
+    );
+    expect(styles).not.toContain(
+      ".easy-sync-modal-container .modal-content > .setting-item-description",
+    );
+    // 补口规则已整体撤销（2026-10-24 审计：内容密集处放大＝主次不分），
+    // 不得以任何形式回涨。
+    expect(styles).not.toContain(
+      ".easy-sync-modal-container .easy-sync-detail-reason",
+    );
+    expect(styles).not.toContain(
+      ".easy-sync-modal-container .easy-sync-diff-truncated",
+    );
+    expect(styles).not.toContain(
+      ".easy-sync-modal-container .easy-sync-device-code-hint",
+    );
+    expect(styles).not.toContain(
+      ".easy-sync-modal-container .easy-sync-device-status",
+    );
+    expect(styles).not.toContain(
+      ".easy-sync-modal-container .easy-sync-device-security",
+    );
+    expect(styles).not.toContain(
+      ".easy-sync-modal-container .easy-sync-auth-method-desc",
+    );
+    expect(styles).not.toContain(
+      ".easy-sync-modal-container .easy-sync-plugin-list-message",
+    );
+    expect(styles).not.toContain(
+      ".easy-sync-modal-container .easy-sync-plugin-list-guidance",
+    );
+    // ConfirmModal 两段正文写法一致（2026-10-24 用户真机实测指认）：message
+    // 与 warning 都是无类纯段落——message 不再挂宿主 setting-item-description
+    // （设置页说明类：灰字＋小号语义，CSS 顶字号治不了灰色，iOS 上与纯继承
+    // 行的字号也不重合）。守卫只看 ConfirmModal 类自身（文件里 SyncPlanAlert
+    // 仍统一挂该类，不在本守卫范围）。
+    const confirmModalSource = readSourceFile("src/ui/confirm-modal.ts");
+    const confirmModalBody = confirmModalSource.slice(
+      confirmModalSource.indexOf("export class ConfirmModal"),
+    );
+    expect(confirmModalBody).not.toContain("setting-item-description");
+    expect(confirmModalBody).toContain(
+      'contentEl.createEl("p", { text: this.options.warning });',
+    );
+    // 白名单成员在各自 onOpen 挂标记（新增纯提示弹框时按判据加入并同步此钉）。
+    for (const file of [
+      "src/ui/confirm-modal.ts",
+      "src/ui/scope-crossing-prompt-modal.ts",
+      "src/ui/auth-pending-modal.ts",
+      "src/ui/update-reminder-modal.ts",
+      "src/ui/rs-migration-failure-modal.ts",
+    ]) {
+      expect(readSourceFile(file)).toContain("easy-sync-prompt-modal");
+    }
+    expect(styles).toContain("font-size: var(--font-ui-medium)");
   });
 });

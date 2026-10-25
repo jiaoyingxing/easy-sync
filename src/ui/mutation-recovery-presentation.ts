@@ -1,5 +1,6 @@
 import type { LocaleStrings } from "../i18n/types";
 import type {
+  ManualMutationResolutionChoiceV1,
   ManualMutationResolutionSnapshotV1,
   MutationRecoveryBlockReason,
   MutationRecoveryHistory,
@@ -51,6 +52,83 @@ export function shouldAutoSettleIdenticalRecovery(
   // Whole-bundle reviews carry their own member-level identity semantics
   // and must keep their explicit confirmation flow.
   return snapshot.identical && snapshot.bundleReview === undefined;
+}
+
+interface OrdinaryResolutionAction {
+  choice: ManualMutationResolutionChoiceV1;
+  labelKey: keyof LocaleStrings;
+  /** Native intent of the button: `mod-cta` restores the file, `mod-warning`
+   *  removes the only surviving copy, null keeps both directions neutral. */
+  className: "mod-cta" | "mod-warning" | null;
+}
+
+/**
+ * Action labels for the ordinary single-path review (2026-10-25 user report).
+ *
+ * The old labels named the SIDE ("keep local" / "keep cloud"). That wording is
+ * false as soon as the chosen side holds no file: "keeping" an empty side
+ * deletes the copy on the other side, which is what a recovery review of a
+ * vanished local download actually did. Labels therefore name the resulting
+ * operation, and button colour names the consequence instead of the side.
+ *
+ * Both sides present keeps the side wording with an explicit "version" noun
+ * (there "keep" is true and the decision is which version wins). Move-style
+ * records and whole-bundle reviews keep their own contracts, so this returns
+ * null for both and the caller keeps its existing rendering.
+ */
+export function resolveOrdinaryResolutionActions(
+  snapshot: Readonly<ManualMutationResolutionSnapshotV1>,
+): OrdinaryResolutionAction[] | null {
+  if (snapshot.bundleReview !== undefined || snapshot.sourcePath !== undefined) {
+    return null;
+  }
+  const local = snapshot.local[0];
+  const remote = snapshot.remote[0];
+  if (!local || !remote) return null;
+  if (local.exists && remote.exists) {
+    return [
+      {
+        choice: "keep-local",
+        labelKey: "syncView.mutationResolution.keepLocalVersion",
+        className: null,
+      },
+      {
+        choice: "keep-remote",
+        labelKey: "syncView.mutationResolution.keepRemoteVersion",
+        className: null,
+      },
+    ];
+  }
+  if (!local.exists && remote.exists) {
+    return [
+      {
+        choice: "keep-remote",
+        labelKey: "syncView.mutationResolution.action.download",
+        className: "mod-cta",
+      },
+      {
+        choice: "keep-local",
+        labelKey: "syncView.mutationResolution.action.deleteRemote",
+        className: "mod-warning",
+      },
+    ];
+  }
+  if (local.exists && !remote.exists) {
+    return [
+      {
+        choice: "keep-local",
+        labelKey: "syncView.mutationResolution.action.upload",
+        className: "mod-cta",
+      },
+      {
+        choice: "keep-remote",
+        labelKey: "syncView.mutationResolution.action.deleteLocal",
+        className: "mod-warning",
+      },
+    ];
+  }
+  // Neither side holds the file: identical facts, settled before this surface.
+  return null;
 }
 
 /**

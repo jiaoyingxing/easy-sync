@@ -490,6 +490,7 @@ describe("S1 sync idle observation (executor wiring)", () => {
     const state = makeActiveV2State([], [], {
       reconcilePendingIssues: vi.fn().mockResolvedValue(undefined),
       setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+      setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
       incrementRemoteGeneration: vi.fn().mockResolvedValue(undefined),
     });
     const executor = makeExecutor(state as never, diag, []);
@@ -601,6 +602,7 @@ describe("S1 reverse control (observation cannot change round outcomes)", () => 
       () => makeActiveV2State([], [], {
         reconcilePendingIssues: vi.fn().mockResolvedValue(undefined),
         setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+        setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
         incrementRemoteGeneration: vi.fn().mockResolvedValue(undefined),
       }),
     );

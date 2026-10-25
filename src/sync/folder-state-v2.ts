@@ -316,6 +316,13 @@ export function planFolderStateFromViewV2(
     candidates,
   });
 
+  // A create receipt writes the new folder anchor in the same checkpoint
+  // (`folder-state-reducer-v2`), so a move whose destination parent is a
+  // planned create converges on the next ordinary round. Do not turn that
+  // one-round wait into a user decision; the destructive stale-identity exit
+  // on the conflict row is not a safe answer to a transient parent create.
+  suppressParentChainConflictsCoveredByPlannedCreates(candidates);
+
   const collapsed = collapseCoveredMoves(candidates)
     .sort(comparePlanCandidate);
   return {
@@ -1791,6 +1798,36 @@ function remoteParentExists(
 ): boolean {
   const parent = parentPath(path);
   return parent === "" || remoteFoldersByIdentity.has(identityPath(parent));
+}
+
+function suppressParentChainConflictsCoveredByPlannedCreates(
+  candidates: PlannedCandidate[],
+): void {
+  const plannedRemoteCreates = new Set(
+    candidates
+      .filter((candidate) => candidate.type === "create-remote")
+      .map((candidate) => identityPath(candidate.targetPath ?? candidate.path)),
+  );
+  const plannedLocalCreates = new Set(
+    candidates
+      .filter((candidate) => candidate.type === "create-local")
+      .map((candidate) => identityPath(candidate.targetPath ?? candidate.path)),
+  );
+  if (plannedRemoteCreates.size === 0 && plannedLocalCreates.size === 0) return;
+  for (let index = candidates.length - 1; index >= 0; index--) {
+    const candidate = candidates[index];
+    if (candidate.type !== "conflict"
+      || candidate.reason !== "parent-chain-incomplete") continue;
+    const covered = candidate.coverage.some((entry) => {
+      const parent = parentPath(entry.root);
+      if (!parent) return false;
+      const planned = entry.side === "local"
+        ? plannedRemoteCreates
+        : plannedLocalCreates;
+      return planned.has(identityPath(parent));
+    });
+    if (covered) candidates.splice(index, 1);
+  }
 }
 
 function plannedParentMoveExists(

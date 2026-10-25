@@ -445,6 +445,122 @@ describe("one-way outbound suppression (仅接收片①)", () => {
     expect(oneWay.liveFolders.has("notes/sub/inner")).toBe(false);
     expect(oneWay.upsertPendingDeletes).not.toHaveBeenCalled();
   });
+
+  it("keeps a cloud-deleted folder when local-only content still occupies it", async () => {
+    const folderPaths = ["notes", "notes/sub", "notes/sub/inner"];
+    const localOnly: LocalFileEntry = {
+      path: "notes/sub/local-only.md",
+      hash: "a".repeat(64),
+      size: 12,
+      mtime: 1,
+      binary: false,
+    };
+    const liveFolders = new Set(folderPaths);
+    const upsertPendingDeletes = vi.fn().mockResolvedValue(undefined);
+    const reconcilePendingIssues = vi.fn().mockResolvedValue(undefined);
+    const adapter = makeMockAdapter({
+      stat: vi.fn(async (path: string) =>
+        liveFolders.has(path) ? { type: "folder", size: 0, mtime: 1 } : null),
+      list: vi.fn(async (path: string) => ({
+        files: path === "notes/sub" ? [localOnly.path] : [],
+        folders: [...liveFolders].filter((candidate) =>
+          candidate.startsWith(`${path}/`)
+          && !candidate.slice(path.length + 1).includes("/")),
+      })),
+      remove: vi.fn(async (path: string) => {
+        liveFolders.delete(path);
+      }),
+    });
+    const state = makeActiveV2State([], [], {
+      upsertPendingDeletes,
+      reconcilePendingIssues,
+      remoteFolders: [{
+        path: "notes",
+        driveId: "notes",
+        parentId: TEST_SYNC_SCOPE.filesRootId,
+        name: "notes",
+        eTag: "etag-notes",
+      }],
+      folderAnchors: [
+        {
+          remoteId: "notes",
+          lastPath: "notes",
+          parentId: TEST_SYNC_SCOPE.filesRootId,
+          eTag: "etag-notes",
+        },
+        {
+          remoteId: "notes-sub",
+          lastPath: "notes/sub",
+          parentId: "notes",
+          eTag: "etag-notes-sub",
+        },
+        {
+          remoteId: "notes-sub-inner",
+          lastPath: "notes/sub/inner",
+          parentId: "notes-sub",
+          eTag: "etag-notes-sub-inner",
+        },
+      ],
+    });
+    const scanner = {
+      vault: {
+        adapter,
+        getFiles: vi.fn().mockReturnValue([]),
+        getName: vi.fn().mockReturnValue("testVault"),
+        getAbstractFileByPath: vi.fn((path: string) =>
+          liveFolders.has(path) ? new TFolder(path) : null),
+      },
+      scanAll: vi.fn().mockResolvedValue({
+        entries: [localOnly],
+        folders: folderPaths.map((path) => ({ path })),
+        folderScanComplete: true,
+        skippedLarge: [],
+        failedPaths: [],
+        skippedCount: 0,
+        complete: true,
+      }),
+      inspectFile: vi.fn().mockResolvedValue({
+        status: "present",
+        entry: localOnly,
+      }),
+      shouldSyncPath: vi.fn().mockReturnValue(true),
+      shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      getMaxFileSize: vi.fn().mockReturnValue(500 * 1024 * 1024),
+    } as unknown as LocalScanner;
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getDriveItemMetadata: vi.fn().mockResolvedValue(null),
+      }),
+      scanner,
+      state,
+      "testVault",
+      undefined,
+      undefined,
+      undefined,
+      {
+        trashFile: vi.fn(async (folder: TFolder) => {
+          liveFolders.delete(folder.path);
+        }),
+      } as never,
+    );
+    executor.setSyncDirection("one-way");
+
+    const round = await executor.run("manual", {});
+
+    expect(round.foldersDeleted).toBe(1);
+    expect(round.foldersRetained).toBe(1);
+    expect(liveFolders.has("notes/sub")).toBe(true);
+    expect(liveFolders.has("notes/sub/inner")).toBe(false);
+    expect(upsertPendingDeletes).not.toHaveBeenCalled();
+    const issues = (
+      (reconcilePendingIssues.mock.calls.at(-1)?.[0] ?? []) as PendingIssue[]
+    );
+    expect(issues).toContainEqual(expect.objectContaining({
+      path: "notes/sub",
+      actionType: SyncActionType.FolderDeferred,
+      issueCode: "one-way-folder-retained",
+    }));
+  });
 });
 
 /**
@@ -1450,6 +1566,27 @@ describe("one-way local-only upload action (片④)", () => {
       .map((entry) => (entry[0] as { key: string }).key);
     expect(noticeKeys.some((key) => key.includes("notice.localOnly.uploaded")))
       .toBe(false);
+  });
+
+  it("conflict batch dedupes and sorts paths, and keeps per-item success notices quiet", async () => {
+    const harness = await makeUploadHarness();
+    const keepLocal = vi.spyOn(
+      harness.executor,
+      "resolveConflictKeepLocal",
+    ).mockResolvedValue(undefined);
+    const keepRemote = vi.spyOn(
+      harness.executor,
+      "resolveConflictKeepRemote",
+    ).mockResolvedValue(undefined);
+
+    await harness.executor.resolveConflictsKeepLocal(["b.md", "a.md", "a.md"]);
+    await harness.executor.resolveConflictsKeepRemote(["d.md", "c.md", "c.md"]);
+
+    expect(keepLocal.mock.calls.map(([path]) => path)).toEqual(["a.md", "b.md"]);
+    expect(keepRemote.mock.calls.map(([path]) => path)).toEqual(["c.md", "d.md"]);
+    // 批量只关逐条成功提示；失败出口仍在逐条链里。
+    expect(keepLocal.mock.calls.every(([, quiet]) => quiet === false)).toBe(true);
+    expect(keepRemote.mock.calls.every(([, quiet]) => quiet === false)).toBe(true);
   });
 
   it("batch upload keeps a failed item and reports through the per-item exit (件②)", async () => {

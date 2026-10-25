@@ -11,7 +11,10 @@ import type {
 import { ConfirmModal, type I18nFn } from "./confirm-modal";
 import { EasySyncModal } from "./easy-sync-modal";
 import { computeDisplayDiff } from "./diff-engine";
-import { resolveMoveNoActionHints } from "./mutation-recovery-presentation";
+import {
+  resolveMoveNoActionHints,
+  resolveOrdinaryResolutionActions,
+} from "./mutation-recovery-presentation";
 import {
   MAX_FALLBACK_PREVIEW_LINES,
   MAX_TEXT_DIFF_BYTES_PER_SIDE,
@@ -182,6 +185,14 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
     if (bundle) {
       this.renderBundleOverview(snapshot);
     } else {
+      // One line states why this review exists. It sits in the body, not the
+      // collapsed evidence: the relabelled actions are operations, so nothing
+      // else on the first screen explains the interrupted outcome. The path
+      // stays in the table only (2026-08-16 P1 decision), so no {path} here.
+      body.createEl("p", {
+        text: this.t("syncView.mutationResolution.description"),
+        cls: "easy-sync-detail-reason",
+      });
       this.renderComparisonTable(
         this.t("syncView.mutationResolution.localTitle"),
         this.t("syncView.mutationResolution.remoteTitle"),
@@ -194,11 +205,6 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
         text: this.t("syncView.mutationResolution.technicalDetails"),
       });
       const detailList = details.createEl("ul");
-      detailList.createEl("li", {
-        text: this.t("syncView.mutationResolution.description", {
-          path: snapshot.path,
-        }),
-      });
       detailList.createEl("li", {
         text: this.t("syncView.mutationResolution.previousAction", {
           action: this.t(
@@ -231,19 +237,34 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
     // Ordinary entries only keep the executable actions; the unavailable
     // side is not rendered as a disabled button.
     const ordinaryActions: FileComparisonAction[] = [];
-    if (snapshot.keepLocal.available) {
-      ordinaryActions.push({
-        label: this.t("syncView.mutationResolution.keepLocal"),
-        className: "easy-sync-detail-action-local",
-        onClick: () => this.finish("keep-local"),
-      });
-    }
-    if (snapshot.keepRemote.available) {
-      ordinaryActions.push({
-        label: this.t("syncView.mutationResolution.keepRemote"),
-        className: "easy-sync-detail-action-remote",
-        onClick: () => this.finish("keep-remote"),
-      });
+    const labelledActions = resolveOrdinaryResolutionActions(snapshot);
+    if (labelledActions) {
+      // Single-path review: the label is the operation the button performs, so
+      // "keep" can never be shown for an empty side (2026-10-25).
+      for (const action of labelledActions) {
+        ordinaryActions.push({
+          label: this.t(action.labelKey),
+          ...(action.className ? { className: action.className } : {}),
+          onClick: () => this.finish(action.choice),
+        });
+      }
+    } else {
+      // Move-style records keep the side wording: there the decision really is
+      // which copy survives at which path.
+      if (snapshot.keepLocal.available) {
+        ordinaryActions.push({
+          label: this.t("syncView.mutationResolution.keepLocal"),
+          className: "easy-sync-detail-action-local",
+          onClick: () => this.finish("keep-local"),
+        });
+      }
+      if (snapshot.keepRemote.available) {
+        ordinaryActions.push({
+          label: this.t("syncView.mutationResolution.keepRemote"),
+          className: "easy-sync-detail-action-remote",
+          onClick: () => this.finish("keep-remote"),
+        });
+      }
     }
     if (ordinaryActions.length === 0) {
       body.createEl("p", {

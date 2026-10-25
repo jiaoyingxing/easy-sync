@@ -167,6 +167,27 @@ describe("main sync entry guards", () => {
     expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
   });
 
+  it("yields the automatic round while a conflict batch is in flight", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.state = { planReviewActive: false } as never;
+    (plugin as never as {
+      conflictBatchDirection: "local" | "remote" | null;
+    }).conflictBatchDirection = "local";
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    const consumed = await (plugin as never as {
+      runAutomaticSync: (trigger: "interval") => Promise<boolean>;
+    }).runAutomaticSync("interval");
+
+    // Busy gate: not consumed, no full round, no lock left behind.
+    expect(consumed).toBe(false);
+    expect(run).not.toHaveBeenCalled();
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
   it("routes automatic triggers with persisted V2 mutation intent to recovery instead of a normal plan", async () => {
     const plugin = makePlugin();
     plugin.syncInterval = 3;

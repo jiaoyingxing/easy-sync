@@ -606,6 +606,113 @@ describe("OneDriveClient shared V2 sync protocol", () => {
     expect(requestSpy).toHaveBeenCalledTimes(3);
   });
 
+  it("reuses the V2 slot content within a session when the listed identity is unchanged", async () => {
+    // W5 2026-10-24: protocol-v2.json is an immutable control file; every
+    // round re-downloaded it because the binding-proven skip only covered
+    // the V3 slot. A session cache keyed by (id, eTag) — the same Graph
+    // versioning contract the V3 proof relies on — must skip the content
+    // read on unchanged rounds and re-read once the eTag moves.
+    const requestSpy = vi.spyOn(obsidian, "requestUrl")
+      .mockImplementation(async (options) => {
+        const url = String(options.url);
+        if (url.includes(".easy-sync:/children")) {
+          return {
+            status: 200,
+            headers: {},
+            json: {
+              value: [
+                {
+                  id: "protocol-v2-id",
+                  name: "protocol-v2.json",
+                  size: 21,
+                  eTag: "protocol-v2-etag",
+                  file: {},
+                  "@microsoft.graph.downloadUrl":
+                    "https://download.example/protocol-v2.json",
+                },
+              ],
+            },
+          } as never;
+        }
+        if (url.endsWith("/protocol-v2.json")) {
+          return {
+            status: 200,
+            headers: {},
+            text: '{"protocolVersion":2}',
+          } as never;
+        }
+        throw new Error(`Unexpected request: ${url}`);
+      });
+    const client = new OneDriveClient(async () => "token");
+
+    const first = await client.readSharedSyncProtocolObjects("testVault");
+    expect(first.v2).toEqual({
+      id: "protocol-v2-id",
+      eTag: "protocol-v2-etag",
+      content: '{"protocolVersion":2}',
+    });
+    const requestsAfterFirstRound = requestSpy.mock.calls.length;
+
+    // Second round, same (id, eTag): only the directory listing; no content.
+    const second = await client.readSharedSyncProtocolObjects("testVault");
+    expect(second.v2).toEqual(first.v2);
+    expect(requestSpy.mock.calls.length).toBe(requestsAfterFirstRound + 1);
+    expect(
+      requestSpy.mock.calls
+        .slice(requestsAfterFirstRound)
+        .some(([options]) => String(options.url).endsWith("/protocol-v2.json")),
+    ).toBe(false);
+
+    // The cache is per storage vault: the same listed identity under another
+    // vault name must re-read instead of borrowing this vault's content.
+    const crossVaultRequests = requestSpy.mock.calls.length;
+    const otherVault = await client.readSharedSyncProtocolObjects("otherVault");
+    expect(otherVault.v2).toEqual(first.v2);
+    expect(
+      requestSpy.mock.calls
+        .slice(crossVaultRequests)
+        .some(([options]) => String(options.url).endsWith("/protocol-v2.json")),
+    ).toBe(true);
+
+    // A moved eTag must fall back to a real content read.
+    requestSpy.mockImplementation(async (options) => {
+      const url = String(options.url);
+      if (url.includes(".easy-sync:/children")) {
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            value: [
+              {
+                id: "protocol-v2-id",
+                name: "protocol-v2.json",
+                size: 21,
+                eTag: "protocol-v2-etag-2",
+                file: {},
+                "@microsoft.graph.downloadUrl":
+                  "https://download.example/protocol-v2.json",
+              },
+            ],
+          },
+        } as never;
+      }
+      if (url.endsWith("/protocol-v2.json")) {
+        return {
+          status: 200,
+          headers: {},
+          text: '{"protocolVersion":2,"rev":2}',
+        } as never;
+      }
+      throw new Error(`Unexpected request: ${url}`);
+    });
+    const third = await client.readSharedSyncProtocolObjects("testVault");
+    expect(third.v2).toEqual({
+      id: "protocol-v2-id",
+      eTag: "protocol-v2-etag-2",
+      content: '{"protocolVersion":2,"rev":2}',
+    });
+  });
+
   it("skips the V3 content read when the listed slot matches the expected binding identity", async () => {
     const requestSpy = vi.spyOn(obsidian, "requestUrl")
       .mockImplementation(async (options) => {
@@ -1172,6 +1279,10 @@ describe("OneDriveClient shared V2 sync protocol", () => {
       },
     );
 
+    // W5 2026-10-24: the third read hits the session cache — only content
+    // from a deadline-clean successful read ever enters it, so a late
+    // settlement ("stale-late") can never leak into a later observation
+    // through the cache. The identity gate still re-reads on any eTag move.
     await expect(client.readSharedSyncProtocolObjects("testVault"))
       .resolves.toEqual({
         v2: {
@@ -1181,8 +1292,8 @@ describe("OneDriveClient shared V2 sync protocol", () => {
         },
         v3: null,
       });
-    expect(bodyDispatches).toBe(3);
-    expect(requestSpy).toHaveBeenCalledTimes(6);
+    expect(bodyDispatches).toBe(2);
+    expect(requestSpy).toHaveBeenCalledTimes(5);
   });
 
   it("keeps a native no-response failure distinct from a synthetic local deadline", async () => {

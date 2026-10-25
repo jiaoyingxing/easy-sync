@@ -226,7 +226,28 @@ describe("main sync entry guards", () => {
 
     const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
     expect(viewSource).toContain("easy-sync-history-skip-group");
-    expect(viewSource).toContain("syncView.history.skipGroupTitle");
+    expect(viewSource).toContain("syncView.skipGroup.title");
+  });
+
+  it("keeps the per-round skip list in history: executor, entry, normalization, fold", () => {
+    // 2026-10-25 追加拍板：运行列表仍只报新面孔，但每条历史都要能展开本轮结算
+    // 的跳过路径——执行器带出清单、main 写入条目、StateManager 归一化、历史
+    // 折叠组从清单重建。
+    const executorSource = readFileSync("src/sync/sync-executor.ts", "utf8");
+    expect(executorSource).toContain(
+      "result.skippedPaths = normalizeHistorySkipPaths([...settledSkipPaths])",
+    );
+
+    const mainSource = readFileSync("src/main.ts", "utf8");
+    expect(mainSource).toContain("skipPaths: result.skippedPaths,");
+
+    const stateSource = readFileSync("src/sync/state-manager.ts", "utf8");
+    expect(stateSource).toContain("skipPaths?: string[]");
+    expect(stateSource).toContain("normalizeHistorySkipPaths(rawSkipPaths)");
+
+    const viewSource = readFileSync("src/ui/sync-view.ts", "utf8");
+    expect(viewSource).toContain("collectHistorySkipRows({");
+    expect(viewSource).toContain('"syncView.history.skipOmitted"');
   });
 
   it("keeps one executor run call site with explicit mode callback contracts", async () => {

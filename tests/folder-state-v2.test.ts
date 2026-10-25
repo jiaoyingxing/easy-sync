@@ -761,7 +761,7 @@ describe("V2 folder anchors and pure planner", () => {
     }));
   });
 
-  it("fails closed on target occupancy, scope crossing and missing destination parents", () => {
+  it("fails closed on target occupancy and scope crossing; holds a planned parent create silently", () => {
     const occupied = planFolderStateV2({
       envelope: envelope({
         folders: [{ id: "notes", name: "Archive" }],
@@ -791,21 +791,92 @@ describe("V2 folder anchors and pure planner", () => {
       reason: "scope-crossing",
     }));
 
+    const missingParentEnvelope = envelope({
+      folders: [
+        { id: "parent", name: "Parent" },
+        { id: "notes", name: "Notes", parentId: "parent" },
+      ],
+      folderAnchors: [folderAnchor("notes", "Notes")],
+    });
     const missingParent = planFolderStateV2({
+      envelope: missingParentEnvelope,
+      localFiles: [],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+    });
+    expect(missingParent.items).not.toContainEqual(expect.objectContaining({
+      type: "conflict",
+      reason: "parent-chain-incomplete",
+    }));
+    expect(missingParent.items).toContainEqual(expect.objectContaining({
+      type: "create-local",
+      path: "Parent",
+    }));
+
+    // Without the planned parent create the wait is not covered, so the
+    // conflict remains a visible fail-closed decision.
+    const missingParentNotPlanned = planFolderStateV2({
+      envelope: missingParentEnvelope,
+      localFiles: [],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+      includeFolderPath: (path) => path !== "Parent",
+    });
+    expect(missingParentNotPlanned.items).toContainEqual(expect.objectContaining({
+      type: "conflict",
+      reason: "parent-chain-incomplete",
+    }));
+  });
+
+  it("moves the child on the next round after the planned parent create anchors", () => {
+    const state = envelope({
+      folders: [
+        { id: "parent", name: "Parent" },
+        { id: "notes", name: "Notes", parentId: "parent" },
+      ],
+      folderAnchors: [folderAnchor("notes", "Notes")],
+    });
+    const first = planFolderStateV2({
+      envelope: state,
+      localFiles: [],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+    });
+    // Model the create receipt: folder-state-reducer-v2 writes the parent
+    // anchor in the same checkpoint as the create, so the next round sees an
+    // anchored parent rather than an unanchored shared folder.
+    const next = planFolderStateV2({
       envelope: envelope({
         folders: [
           { id: "parent", name: "Parent" },
           { id: "notes", name: "Notes", parentId: "parent" },
         ],
-        folderAnchors: [folderAnchor("notes", "Notes")],
+        folderAnchors: [
+          folderAnchor("notes", "Notes"),
+          folderAnchor("parent", "Parent"),
+        ],
       }),
       localFiles: [],
-      localFolders: localFolders("Notes"),
+      localFolders: localFolders("Parent", "Notes"),
       localFolderScanComplete: true,
     });
-    expect(missingParent.items).toContainEqual(expect.objectContaining({
+
+    expect(first.items).not.toContainEqual(expect.objectContaining({
       type: "conflict",
       reason: "parent-chain-incomplete",
+    }));
+    expect(first.items).toContainEqual(expect.objectContaining({
+      type: "create-local",
+      path: "Parent",
+    }));
+    expect(next.items).not.toContainEqual(expect.objectContaining({
+      type: "conflict",
+      reason: "unanchored-shared-folder",
+    }));
+    expect(next.items).toContainEqual(expect.objectContaining({
+      type: "move-local",
+      path: "Parent/Notes",
+      sourcePath: "Notes",
     }));
   });
 

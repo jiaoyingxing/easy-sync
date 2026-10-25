@@ -340,12 +340,25 @@ export class OneDriveClient {
   private slowLinkEvidence = createSlowLinkEvidence();
   private runMetrics: ActiveRunMetrics | null = null;
   /** requestUrl cannot be cancelled after our local deadline. Keep one raw
-   * owner per shared-protocol component so later sync rounds cannot pile up
-   * the same request or consume a response from an earlier observation. */
+   *  owner per shared-protocol component so later sync rounds cannot pile up
+   *  the same request or consume a response from an earlier observation. */
   private sharedSyncProtocolRequestsInFlight = new Map<
     string,
     Promise<RequestUrlResponse>
   >();
+  /** W5 2026-10-24: protocol-v2.json is an immutable control file that every
+   *  round re-downloaded. Session cache of the last successful content read,
+   *  keyed by storage vault + the same (id, eTag) Graph versioning contract
+   *  the V3 binding-proven skip relies on; a moved eTag (or another vault
+   *  sharing this client) misses and re-reads. The id+eTag trust boundary is
+   *  drive-scoped in Graph; a same-session account switch would need an id
+   *  and eTag collision across drives, which the listing makes unreachable. */
+  private lastReadProtocolV2: {
+    storageVaultName: string;
+    id: string;
+    eTag: string;
+    content: string;
+  } | null = null;
 
   constructor(
     private getToken: TokenProvider,
@@ -2930,9 +2943,9 @@ export class OneDriveClient {
 
     const [v2, v3] = await Promise.all([
       v2Item
-        ? this.readObservedSharedSyncProtocolItem(
+        ? this.readSharedSyncProtocolV2WithSessionCache(
+          storageVaultName,
           v2Item,
-          "SharedSyncProtocolV2",
           `${requestOwnerPrefix}:v2`,
         )
           .catch((error: unknown) => {
@@ -2969,6 +2982,43 @@ export class OneDriveClient {
         : null,
     ]);
     return { v2, v3 };
+  }
+
+  /** V2 slot read through the session cache: the same storage vault + (id,
+   *  eTag) identity that proves the V3 slot unchanged guarantees the cached
+   *  bytes still match, so unchanged rounds skip the CDN GET entirely. */
+  private async readSharedSyncProtocolV2WithSessionCache(
+    storageVaultName: string,
+    item: DriveItem,
+    requestKey: string,
+  ): Promise<SharedSyncProtocolControlObject> {
+    const cached = this.lastReadProtocolV2;
+    if (
+      cached
+      && cached.storageVaultName === storageVaultName
+      && item.id
+      && item.eTag
+      && cached.id === item.id
+      && cached.eTag === item.eTag
+    ) {
+      this.diag?.log(
+        "onedrive",
+        "shared protocol V2 slot unchanged since this session's last successful read; reusing cached content",
+      );
+      return { id: cached.id, eTag: cached.eTag, content: cached.content };
+    }
+    const observed = await this.readObservedSharedSyncProtocolItem(
+      item,
+      "SharedSyncProtocolV2",
+      requestKey,
+    );
+    this.lastReadProtocolV2 = {
+      storageVaultName,
+      id: observed.id,
+      eTag: observed.eTag,
+      content: observed.content,
+    };
+    return observed;
   }
 
   private async listSharedSyncProtocolControlChildren(

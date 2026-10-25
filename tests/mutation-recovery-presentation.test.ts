@@ -9,6 +9,7 @@ import {
   mutationRecoveryStatusDetail,
   mutationRecoveryStatusLabel,
   resolveMoveNoActionHints,
+  resolveOrdinaryResolutionActions,
   mutationRecoveryTopStatusLabel,
   mutationRecoveryPrimaryActionKey,
   shouldAutoSettleIdenticalRecovery,
@@ -391,5 +392,150 @@ describe("resolveMoveNoActionHints (2026-10-13 field report)", () => {
       "utf8",
     );
     expect(modal).toContain("resolveMoveNoActionHints(");
+  });
+});
+
+describe("resolveOrdinaryResolutionActions (2026-10-25 empty-side naming)", () => {
+  function snapshotFor(options: {
+    local: boolean;
+    remote: boolean;
+    sourcePath?: string;
+    bundle?: boolean;
+  }): ManualMutationResolutionSnapshotV1 {
+    const path = "yx/附件/Screenrecording_20261020_064519.mp4";
+    const local = options.local
+      ? [{ path, exists: true, hash: "a".repeat(64), size: 141_033_472 }]
+      : [{ path, exists: false }];
+    const remote = options.remote
+      ? [{
+          path,
+          exists: true,
+          driveId: "drive-item",
+          eTag: "etag-1",
+          size: 141_033_472,
+        }]
+      : [{ path, exists: false }];
+    return {
+      version: 1,
+      sourceOperationId: "1792853851010-100-download",
+      scope: {
+        accountId: "account",
+        driveId: "drive",
+        vaultFolderId: "vault-folder",
+        filesRootId: "files-root",
+      },
+      previousAction: "download",
+      path,
+      ...(options.sourcePath ? { sourcePath: options.sourcePath } : {}),
+      local,
+      remote,
+      factsDigest: "digest",
+      identical: false,
+      keepLocal: {
+        available: true,
+        deletesOtherSide: !options.local && options.remote,
+      },
+      keepRemote: {
+        available: true,
+        deletesOtherSide: options.local && !options.remote,
+      },
+      ...(options.bundle ? { bundleReview: {} as never } : {}),
+    };
+  }
+
+  it("names the operation, not the side, when the local side is empty", () => {
+    const actions = resolveOrdinaryResolutionActions(
+      snapshotFor({ local: false, remote: true }),
+    );
+
+    // The old buttons said "keep local" / "keep cloud"; keeping an empty local
+    // side deletes the cloud copy, so the labels must name the operation.
+    expect(actions?.map((action) => action.labelKey)).toEqual([
+      "syncView.mutationResolution.action.download",
+      "syncView.mutationResolution.action.deleteRemote",
+    ]);
+    expect(actions?.map((action) => action.choice)).toEqual([
+      "keep-remote",
+      "keep-local",
+    ]);
+    expect(actions?.map((action) => action.className)).toEqual([
+      "mod-cta",
+      "mod-warning",
+    ]);
+  });
+
+  it("names the operation when the cloud side is empty", () => {
+    const actions = resolveOrdinaryResolutionActions(
+      snapshotFor({ local: true, remote: false }),
+    );
+
+    expect(actions?.map((action) => action.labelKey)).toEqual([
+      "syncView.mutationResolution.action.upload",
+      "syncView.mutationResolution.action.deleteLocal",
+    ]);
+    expect(actions?.map((action) => action.choice)).toEqual([
+      "keep-local",
+      "keep-remote",
+    ]);
+    expect(actions?.map((action) => action.className)).toEqual([
+      "mod-cta",
+      "mod-warning",
+    ]);
+  });
+
+  it("keeps the side wording with an explicit version noun when both sides exist", () => {
+    const actions = resolveOrdinaryResolutionActions(
+      snapshotFor({ local: true, remote: true }),
+    );
+
+    expect(actions?.map((action) => action.labelKey)).toEqual([
+      "syncView.mutationResolution.keepLocalVersion",
+      "syncView.mutationResolution.keepRemoteVersion",
+    ]);
+    // Both directions overwrite a recoverable version: no danger colour, no
+    // restored-file CTA.
+    expect(actions?.every((action) => action.className === null)).toBe(true);
+  });
+
+  it("leaves move-style and whole-bundle reviews on their own wording", () => {
+    expect(resolveOrdinaryResolutionActions(
+      snapshotFor({ local: true, remote: true, sourcePath: "old/a.md" }),
+    )).toBeNull();
+    expect(resolveOrdinaryResolutionActions(
+      snapshotFor({ local: true, remote: true, bundle: true }),
+    )).toBeNull();
+  });
+
+  it("pins the visible copy and the body slot", () => {
+    const zh = new I18n("zh-cn");
+    expect(zh.t("syncView.mutationResolution.title")).toBe("选择以哪一侧为准");
+    expect(zh.t("syncView.mutationResolution.description")).toBe(
+      "上次操作的结果已无法自动确认。请核对两侧当前状态后选择。",
+    );
+    expect(zh.t("syncView.mutationResolution.action.deleteRemote")).toBe(
+      "删除云端文件",
+    );
+    expect(zh.t("syncView.mutationResolution.deleteConfirm")).toBe("删除");
+    expect(zh.t("syncView.mutationResolution.deleteConfirmTitleRemote")).toBe(
+      "删除云端这份文件？",
+    );
+    const message = zh.t("syncView.mutationResolution.deleteConfirmMessageRemote", {
+      path: "a.mp4",
+      size: "134.5 MB",
+    });
+    expect(message).toContain("只存在于云端");
+    expect(message).toContain("都不再有这份文件");
+
+    // The reason line moved out of the collapsed evidence into the body and no
+    // longer repeats the path (2026-08-16: the path shows in the table once).
+    const modal = readFileSync(
+      path.resolve(__dirname, "../src/ui/mutation-recovery-resolution-modal.ts"),
+      "utf8",
+    );
+    expect(modal).toContain("resolveOrdinaryResolutionActions(");
+    expect(modal).toMatch(
+      /body\.createEl\("p", \{\s*text: this\.t\("syncView\.mutationResolution\.description"\)/,
+    );
+    expect(modal).not.toContain('"syncView.mutationResolution.description", {');
   });
 });

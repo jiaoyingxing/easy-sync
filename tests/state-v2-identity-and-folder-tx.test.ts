@@ -1014,6 +1014,63 @@ describe("V1 to V2 controlled production activation", () => {
     expectNoFileMutations(harness.mutations);
   });
 
+  it("auto-retires a hashless same-content replacement before planning and keeps both sides", async () => {
+    const content = "0123456789";
+    const contentHash = await sha256Hex(
+      new TextEncoder().encode(content).buffer,
+    );
+    const harness = makeHarness({
+      base: [{ ...baseA, hash: contentHash, size: 10 }],
+      local: [{ ...localA, hash: contentHash, size: 10 }],
+      remoteHash: contentHash,
+      initialFiles: { "Notes/a.md": content },
+      remoteFileContents: { "Notes/a.md": content },
+    });
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+
+    harness.localEntryState[0]!.path = "Notes/moved.md";
+    const retire = vi.spyOn(harness.state, "retireReviewedStaleIdentity");
+    const oldRemoteIndex = harness.remoteItemState.findIndex(
+      (item) => item.id === "file-a",
+    );
+    harness.remoteItemState.splice(oldRemoteIndex, 1, {
+      id: "file-replacement",
+      name: "a.md",
+      size: 10,
+      file: {},
+      parentReference: { id: "folder-notes" },
+      lastModifiedDateTime: "2026-08-07T00:00:00.000Z",
+      eTag: "etag-replacement",
+      cTag: "ctag-replacement",
+      "@microsoft.graph.downloadUrl": "https://example.invalid/Notes/a.md",
+    });
+
+    const round = await harness.executor.run("manual");
+
+    expect(retire).toHaveBeenCalledTimes(1);
+    expect(round).toMatchObject({ success: true, errors: 0 });
+    // No "unresolved replacement" row: the bytes were proven equal before the
+    // ordinary plan, so the stale lineage was retired without a user click.
+    expect(harness.state.pendingIssues).toEqual([]);
+    // Both sides survive: the relocated local file and the cloud occupant.
+    expect(
+      harness.localEntryState.some((entry) => entry.path === "Notes/moved.md"),
+    ).toBe(true);
+    expect(findRemoteItemByPath(harness.remoteItemState, "Notes/a.md")?.id)
+      .toBe("file-replacement");
+    // The retired anchor is gone; ordinary planning met both objects afresh.
+    expect(Object.values(
+      harness.state.getCommittedV2Envelope()!.anchors.byAnchorId,
+    )).not.toContainEqual(expect.objectContaining({ remoteId: "file-a" }));
+  });
+
   it("rejects stale identity retirement when Graph facts change after review", async () => {
     const harness = makeHarness();
     await harness.state.load();

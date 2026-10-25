@@ -167,26 +167,6 @@ describe("transfer rate sampler (live reading)", () => {
     expect(sampler.getReading(2000)!.kbps).toBe(911);
   });
 
-  it("reseeds from the persisted window, newest entry dominating", () => {
-    const sampler = new TransferRateSampler();
-    // Stored newest first, as the state window keeps them.
-    sampler.seedFromFacts([
-      { uploadBytes: MIB, uploadMs: 1000, measuredAt: 5000 },
-      { uploadBytes: 2 * MIB, uploadMs: 4000, measuredAt: 4000 },
-    ]);
-    expect(sampler.getReading(5000)!.kbps).toBe(625);
-  });
-
-  it("converts legacy derived-KBps entries while seeding", () => {
-    const sampler = new TransferRateSampler();
-    sampler.seedFromFacts([
-      { uploadKBps: 128, downloadKBps: 64, measuredAt: 100 } as TransferRateFactsV1,
-    ]);
-    expect(sampler.getDirectionKBps("upload", 100)).toBe(128);
-    expect(sampler.getDirectionKBps("download", 100)).toBe(64);
-    expect(sampler.getReading(100)!.level).toBe("medium");
-  });
-
   it("levels the reading by the worse direction while both sample together", () => {
     const round = (upload: number | undefined, download: number | undefined) => ({
       uploadBytes: upload === undefined ? undefined : upload * 16 * 1024,
@@ -336,5 +316,24 @@ describe("per-call samples (direction 2: wall-honest aggregation)", () => {
     expect(executorSource).toContain("onTransferCallSample?:");
     const mainSource = readFileSync("src/main.ts", "utf8");
     expect(mainSource).toContain("transferRateSampler.addCallSample");
+  });
+
+  it("keeps the transfer-rate sampler session-local (no persisted window)", () => {
+    // 2026-10-24 retirement: the persisted facts window and its reload
+    // seeding had no reachable consumer (the 10s freshness window means a
+    // seed can never conjure a post-reload reading). The per-round facts
+    // survive only embedded in sync-history entries; the sampler's smoothed
+    // state starts from zero each session.
+    for (const sourcePath of [
+      "src/main.ts",
+      "src/sync/state-manager.ts",
+      "src/sync/transfer-rate.ts",
+    ]) {
+      const source = readFileSync(sourcePath, "utf8");
+      expect(source, sourcePath).not.toContain("easy-sync-transfer-rates-window");
+      expect(source, sourcePath).not.toContain("pushTransferRateFacts");
+      expect(source, sourcePath).not.toContain("seedFromFacts");
+      expect(source, sourcePath).not.toContain("transferRateSamplerSeeded");
+    }
   });
 });

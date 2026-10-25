@@ -189,6 +189,7 @@ export function remoteStateStub() {
     remoteDeltaLink: null,
     remoteGeneration: 0,
     incrementRemoteGeneration: vi.fn().mockResolvedValue(undefined),
+    setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
     setRemoteState: vi.fn().mockResolvedValue(undefined),
     clearRemoteState: vi.fn().mockResolvedValue(undefined),
     applyRemoteMutations: vi.fn().mockResolvedValue(undefined),
@@ -377,6 +378,7 @@ export function makeActiveV2State(
     reconcileLocalOnlyEntries: vi.fn().mockResolvedValue(undefined),
     retireLocalOnlyEntries: vi.fn().mockResolvedValue(undefined),
     setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+    setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
     getCommunityPluginEnablementState: vi.fn((currentScope: SyncScope) => ({
       version: 1,
       scope: { ...currentScope },

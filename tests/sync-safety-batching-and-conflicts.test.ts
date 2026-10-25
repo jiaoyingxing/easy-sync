@@ -1385,6 +1385,7 @@ describe("Pending item batching", () => {
       prunePendingConflicts: vi.fn().mockResolvedValue(undefined),
       prunePendingDeletes: vi.fn().mockResolvedValue(undefined),
       setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+      setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
       lastSyncTime: 0,
     });
     const onConfirmThreshold = vi.fn().mockResolvedValue(false);
@@ -1459,6 +1460,7 @@ describe("Pending item batching", () => {
       prunePendingConflicts: vi.fn().mockResolvedValue(undefined),
       prunePendingDeletes: vi.fn().mockResolvedValue(undefined),
       setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+      setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
       lastSyncTime: 0,
     });
     const onConfirmThreshold = vi.fn().mockResolvedValue(false);
@@ -1526,6 +1528,7 @@ describe("Pending item batching", () => {
       upsertPendingDeletes: vi.fn().mockResolvedValue(undefined),
       prunePendingDeletes: vi.fn().mockResolvedValue(undefined),
       setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+      setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
       lastSyncTime: 0,
     });
 
@@ -1694,6 +1697,7 @@ describe("Conflict resolution actions report standalone transfer progress", () =
   function makeProgressAwareExecutor(options: {
     downloadFile?: ReturnType<typeof vi.fn>;
     uploadFile?: ReturnType<typeof vi.fn>;
+    deleteItem?: ReturnType<typeof vi.fn>;
     pendingConflicts?: SyncPlanItem[];
     pendingRemoteDeletes?: SyncPlanItem[];
     adapterOverrides?: Record<string, unknown>;
@@ -1703,6 +1707,7 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     fileManager?: Record<string, unknown>;
     vaultFile?: unknown;
     getFileMetadata?: ReturnType<typeof vi.fn>;
+    getDriveItemMetadataById?: ReturnType<typeof vi.fn>;
     initVaultScope?: ReturnType<typeof vi.fn>;
     preserveMissingDecisionTokens?: boolean;
     onProgressUpdate?: () => void;
@@ -1782,6 +1787,10 @@ describe("Conflict resolution actions report standalone transfer progress", () =
       makeMockOneDrive({
         downloadFile: options.downloadFile,
         uploadFile: options.uploadFile,
+        ...(options.deleteItem ? { deleteItem: options.deleteItem } : {}),
+        ...(options.getDriveItemMetadataById
+          ? { getDriveItemMetadataById: options.getDriveItemMetadataById }
+          : {}),
         ...(options.initVaultScope ? { initVaultScope: options.initVaultScope } : {}),
         getFileMetadata: options.getFileMetadata ?? vi.fn().mockImplementation(async (_vault: string, path: string) => {
           const reviewedRemote = reviewedRemoteByPath.get(path);
@@ -3563,6 +3572,325 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     expect(remove).not.toHaveBeenCalledWith(path);
     expect(addPendingConflict).toHaveBeenCalledTimes(1);
     expect(removePendingDelete).toHaveBeenCalledWith(path);
+  });
+
+  // P0-G safety subset: a missing path is not proof that the reviewed object
+  // is gone (SC-08), and exact SHA-256 equality needs no destructive action.
+  describe("side-action drift safety subset", () => {
+    it("retires a remote-only conflict when both sides are absent by path and by ID", async () => {
+      const path = "gone.md";
+      const deleteItem = vi.fn();
+      const addPendingConflict = vi.fn().mockResolvedValue(undefined);
+      const removePendingConflict = vi.fn().mockResolvedValue(undefined);
+      const executor = makeProgressAwareExecutor({
+        pendingConflicts: [{
+          type: SyncActionType.Conflict,
+          path,
+          remote: { path, driveId: "item-gone", size: 1, mtime: 1, eTag: "etag-gone", cTag: "" },
+        }],
+        getFileMetadata: vi.fn().mockResolvedValue(null),
+        getDriveItemMetadataById: vi.fn().mockResolvedValue(null),
+        deleteItem,
+        stateOverrides: { addPendingConflict, removePendingConflict },
+      });
+
+      await executor.resolveConflictKeepLocal(path);
+      await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+      expect(deleteItem).not.toHaveBeenCalled();
+      expect(addPendingConflict).not.toHaveBeenCalled();
+      expect(removePendingConflict).toHaveBeenCalledWith(path);
+    });
+
+    it("keeps the conflict rebuild when the local file survives a true remote deletion", async () => {
+      const path = "kept.md";
+      const local: LocalFileEntry = {
+        path, hash: "aa".repeat(32), size: 1, mtime: 1, binary: false,
+      };
+      const uploadFile = vi.fn();
+      const remove = vi.fn();
+      const addPendingConflict = vi.fn().mockResolvedValue(undefined);
+      const removePendingConflict = vi.fn().mockResolvedValue(undefined);
+      const executor = makeProgressAwareExecutor({
+        pendingConflicts: [{
+          type: SyncActionType.Conflict,
+          path,
+          local,
+          remote: { path, driveId: "item-kept", size: 1, mtime: 1, eTag: "etag-kept", cTag: "" },
+        }],
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+        getFileMetadata: vi.fn().mockResolvedValue(null),
+        getDriveItemMetadataById: vi.fn().mockResolvedValue(null),
+        uploadFile,
+        adapterOverrides: { remove },
+        stateOverrides: { addPendingConflict, removePendingConflict },
+      });
+
+      await executor.resolveConflictKeepLocal(path);
+      await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+      expect(uploadFile).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalledWith(path);
+      expect(removePendingConflict).not.toHaveBeenCalled();
+      expect(addPendingConflict).toHaveBeenCalledWith(expect.objectContaining({
+        path,
+        remote: undefined,
+        reason: "reason.remoteDeletedLocalModified",
+      }));
+    });
+
+    it("retires a conflict whose reviewed object still exists by ID after its path disappeared", async () => {
+      const path = "moved.md";
+      const deleteItem = vi.fn();
+      const uploadFile = vi.fn();
+      const addPendingConflict = vi.fn().mockResolvedValue(undefined);
+      const removePendingConflict = vi.fn().mockResolvedValue(undefined);
+      const getDriveItemMetadataById = vi.fn().mockResolvedValue(
+        driveItem(path, "aa".repeat(32)),
+      );
+      const executor = makeProgressAwareExecutor({
+        pendingConflicts: [{
+          type: SyncActionType.Conflict,
+          path,
+          remote: { path, driveId: "item-moved", size: 1, mtime: 1, eTag: "etag-moved", cTag: "" },
+        }],
+        getFileMetadata: vi.fn().mockResolvedValue(null),
+        getDriveItemMetadataById,
+        deleteItem,
+        uploadFile,
+        stateOverrides: { addPendingConflict, removePendingConflict },
+      });
+
+      await executor.resolveConflictKeepLocal(path);
+      await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+      expect(getDriveItemMetadataById).toHaveBeenCalledWith("item-moved");
+      expect(deleteItem).not.toHaveBeenCalled();
+      expect(uploadFile).not.toHaveBeenCalled();
+      expect(addPendingConflict).not.toHaveBeenCalled();
+      expect(removePendingConflict).toHaveBeenCalledWith(path);
+    });
+
+    it("retires a pending remote delete when the anchor object is still alive by ID", async () => {
+      const path = "moved-delete.md";
+      const local: LocalFileEntry = {
+        path, hash: "aa".repeat(32), size: 1, mtime: 1, binary: false,
+      };
+      const remove = vi.fn();
+      const addPendingConflict = vi.fn().mockResolvedValue(undefined);
+      const removePendingDelete = vi.fn().mockResolvedValue(undefined);
+      const getDriveItemMetadataById = vi.fn().mockResolvedValue(
+        driveItem(path, local.hash),
+      );
+      const executor = makeProgressAwareExecutor({
+        pendingRemoteDeletes: [{ type: SyncActionType.ConfirmLocalDelete, path, local }],
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+        getFileMetadata: vi.fn().mockResolvedValue(null),
+        getDriveItemMetadataById,
+        adapterOverrides: { remove },
+        stateOverrides: {
+          addPendingConflict,
+          removePendingDelete,
+          remoteIdForPath: vi.fn().mockReturnValue("anchor-id"),
+        },
+      });
+
+      await executor.confirmRemoteDelete(path);
+      await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+      expect(getDriveItemMetadataById).toHaveBeenCalledWith("anchor-id");
+      expect(remove).not.toHaveBeenCalledWith(path);
+      expect(addPendingConflict).not.toHaveBeenCalled();
+      expect(removePendingDelete).toHaveBeenCalledWith(path);
+    });
+
+    it("rebuilds a deleted row whose path reappeared without a by-ID check", async () => {
+      const path = "reappeared-new-object.md";
+      const local: LocalFileEntry = {
+        path, hash: "aa".repeat(32), size: 1, mtime: 1, binary: false,
+      };
+      const remove = vi.fn();
+      const addPendingConflict = vi.fn().mockResolvedValue(undefined);
+      const removePendingDelete = vi.fn().mockResolvedValue(undefined);
+      const getDriveItemMetadataById = vi.fn().mockResolvedValue(null);
+      const executor = makeProgressAwareExecutor({
+        pendingRemoteDeletes: [{ type: SyncActionType.ConfirmLocalDelete, path, local }],
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+        getFileMetadata: vi.fn().mockResolvedValue({
+          driveId: "new-id", size: 1, mtime: 2, eTag: "etag-new",
+        }),
+        getDriveItemMetadataById,
+        adapterOverrides: { remove },
+        stateOverrides: {
+          addPendingConflict,
+          removePendingDelete,
+          remoteIdForPath: vi.fn().mockReturnValue("anchor-id"),
+        },
+      });
+
+      await executor.confirmRemoteDelete(path);
+      await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+      expect(getDriveItemMetadataById).not.toHaveBeenCalled();
+      expect(remove).not.toHaveBeenCalledWith(path);
+      expect(addPendingConflict).toHaveBeenCalledTimes(1);
+      expect(removePendingDelete).toHaveBeenCalledWith(path);
+    });
+
+    it("fails closed when the reviewed object identity cannot be read", async () => {
+      const path = "identity-read-failed.md";
+      const deleteItem = vi.fn();
+      const addPendingConflict = vi.fn().mockResolvedValue(undefined);
+      const removePendingConflict = vi.fn().mockResolvedValue(undefined);
+      const executor = makeProgressAwareExecutor({
+        pendingConflicts: [{
+          type: SyncActionType.Conflict,
+          path,
+          remote: { path, driveId: "item-unreadable", size: 1, mtime: 1, eTag: "etag", cTag: "" },
+        }],
+        getFileMetadata: vi.fn().mockResolvedValue(null),
+        getDriveItemMetadataById: vi.fn().mockRejectedValue(
+          new OneDriveError(OneDriveErrorType.NetworkError, "offline"),
+        ),
+        deleteItem,
+        stateOverrides: { addPendingConflict, removePendingConflict },
+      });
+
+      await executor.resolveConflictKeepLocal(path);
+      await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+      expect(deleteItem).not.toHaveBeenCalled();
+      expect(addPendingConflict).not.toHaveBeenCalled();
+      expect(removePendingConflict).not.toHaveBeenCalled();
+    });
+
+    for (const direction of ["local", "remote"] as const) {
+      it(`retires the conflict when current remote bytes equal the local file (keep ${direction})`, async () => {
+        const path = `identical-${direction}.md`;
+        const bytes = new Uint8Array([1, 2, 3]).buffer;
+        const hash = await sha256Hex(bytes);
+        const local: LocalFileEntry = {
+          path, hash, size: bytes.byteLength, mtime: 1, binary: false,
+        };
+        const addPendingConflict = vi.fn().mockResolvedValue(undefined);
+        const removePendingConflict = vi.fn().mockResolvedValue(undefined);
+        const uploadFile = vi.fn();
+        const downloadFile = vi.fn();
+        const writeBinary = vi.fn();
+        const executor = makeProgressAwareExecutor({
+          pendingConflicts: [{
+            type: SyncActionType.Conflict,
+            path,
+            local,
+            remote: {
+              path, driveId: "remote-id", size: bytes.byteLength, mtime: 1,
+              eTag: "etag-reviewed", cTag: "",
+            },
+          }],
+          inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+          getFileMetadata: vi.fn().mockResolvedValue({
+            driveId: "remote-id",
+            size: bytes.byteLength,
+            mtime: 2,
+            eTag: "etag-new",
+            sha256Hash: hash,
+          }),
+          adapterOverrides: {
+            readBinary: vi.fn().mockResolvedValue(bytes),
+            writeBinary,
+          },
+          uploadFile,
+          downloadFile,
+          stateOverrides: { addPendingConflict, removePendingConflict },
+        });
+
+        if (direction === "local") {
+          await executor.resolveConflictKeepLocal(path);
+        } else {
+          await executor.resolveConflictKeepRemote(path);
+        }
+        await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+        expect(uploadFile).not.toHaveBeenCalled();
+        expect(downloadFile).not.toHaveBeenCalled();
+        expect(writeBinary).not.toHaveBeenCalledWith(path, expect.anything());
+        expect(addPendingConflict).not.toHaveBeenCalled();
+        expect(removePendingConflict).toHaveBeenCalledWith(path);
+      });
+    }
+
+    it("keeps the conflict when only the size matches and no SHA-256 is available", async () => {
+      const path = "size-only.md";
+      const local: LocalFileEntry = {
+        path, hash: "aa".repeat(32), size: 3, mtime: 1, binary: false,
+      };
+      const addPendingConflict = vi.fn().mockResolvedValue(undefined);
+      const removePendingConflict = vi.fn().mockResolvedValue(undefined);
+      const downloadFile = vi.fn();
+      const executor = makeProgressAwareExecutor({
+        pendingConflicts: [{
+          type: SyncActionType.Conflict,
+          path,
+          local,
+          remote: { path, driveId: "remote-id", size: 3, mtime: 1, eTag: "etag-reviewed", cTag: "" },
+        }],
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+        getFileMetadata: vi.fn().mockResolvedValue({
+          driveId: "remote-id", size: 3, mtime: 2, eTag: "etag-new",
+        }),
+        adapterOverrides: { readBinary: vi.fn().mockResolvedValue(new Uint8Array(3).buffer) },
+        downloadFile,
+        stateOverrides: { addPendingConflict, removePendingConflict },
+      });
+
+      await executor.resolveConflictKeepRemote(path);
+      await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+      expect(downloadFile).not.toHaveBeenCalled();
+      expect(removePendingConflict).not.toHaveBeenCalled();
+      expect(addPendingConflict).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the conflict when reviewed and current remote bytes match but the local file differs", async () => {
+      const path = "remote-identical-local-different.md";
+      const remoteHash = "bb".repeat(32);
+      const local: LocalFileEntry = {
+        path, hash: "aa".repeat(32), size: 3, mtime: 1, binary: false,
+      };
+      const addPendingConflict = vi.fn().mockResolvedValue(undefined);
+      const removePendingConflict = vi.fn().mockResolvedValue(undefined);
+      const downloadFile = vi.fn();
+      const writeBinary = vi.fn();
+      const executor = makeProgressAwareExecutor({
+        pendingConflicts: [{
+          type: SyncActionType.Conflict,
+          path,
+          local,
+          remote: {
+            path, driveId: "remote-id", size: 3, mtime: 1,
+            eTag: "etag-reviewed", cTag: "", sha256Hash: remoteHash,
+          },
+        }],
+        inspectFile: vi.fn().mockResolvedValue({ status: "present", entry: local }),
+        getFileMetadata: vi.fn().mockResolvedValue({
+          driveId: "remote-id", size: 3, mtime: 2, eTag: "etag-new", sha256Hash: remoteHash,
+        }),
+        adapterOverrides: {
+          readBinary: vi.fn().mockResolvedValue(new Uint8Array(3).buffer),
+          writeBinary,
+        },
+        downloadFile,
+        stateOverrides: { addPendingConflict, removePendingConflict },
+      });
+
+      await executor.resolveConflictKeepRemote(path);
+      await waitUntil(() => expect(executor.isSideActionQueued(path)).toBe(false));
+
+      expect(downloadFile).not.toHaveBeenCalled();
+      expect(writeBinary).not.toHaveBeenCalledWith(path, expect.anything());
+      expect(removePendingConflict).not.toHaveBeenCalled();
+      expect(addPendingConflict).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("rejects a decision when its ancestor or account binding changed", async () => {

@@ -13,6 +13,7 @@ import {
   compatRequestAnimationFrame,
   describeError,
   getConfigDir,
+  normalizeVaultPathKey,
   type AnimationFrameHandle,
 } from "../obsidian-compat";
 import { UpdateReminderModal } from "./update-reminder-modal";
@@ -39,6 +40,10 @@ import {
 } from "../sync/sync-progress";
 import type { PendingIssue, SyncHistoryEntry } from "../sync/state-manager";
 import {
+  isConfigurationSkipAction,
+  normalizeHistorySkipPaths,
+} from "../sync/skip-baseline";
+import {
   mutationRecoveryItemKey,
   pendingIssueExitKind,
   pendingIssueTerminationKey,
@@ -51,6 +56,7 @@ import {
 } from "../sync/transfer-rate";
 import { ConfirmModal } from "./confirm-modal";
 import { applyDestructiveButton } from "./destructive-button";
+import { formatFileSize } from "./file-comparison-modal";
 import { EmptyFolderResolutionModal } from "./empty-folder-resolution-modal";
 import { ConflictDetailModal } from "./conflict-detail-modal";
 import { ConfigSyncModal } from "./config-sync-modal";
@@ -75,6 +81,7 @@ import {
 import { resolveSyncPendingAttentionCounts } from "./sync-result-presentation";
 import type { LocalOnlyEntryRowV1 } from "../sync/local-only-copies";
 import { parseCommunityPluginBundlePath } from "../sync/community-plugin-bundle";
+import { isObsidianManagedConfigPath } from "../sync/file-decision-planner-v2";
 import type { ManualResolutionEntryReason } from "../sync/manual-resolution-entry";
 import { resolveManualResolutionNotice } from "./manual-resolution-presentation";
 import {
@@ -320,12 +327,14 @@ interface SyncPendingDisplayRow {
   kind:
     | "adoption"
     | "issue"
+    | "batchConflict"
     | "conflict"
     | "pluginConflict"
     | "batchDelete"
     | "delete"
     | "batchLocalOnly"
-    | "localOnly";
+    | "localOnly"
+    | "retainedFolder";
   adoption?: CommunityPluginAdoptionRow;
   issue?: PendingIssue;
   nestedIssues?: PendingIssue[];
@@ -333,6 +342,10 @@ interface SyncPendingDisplayRow {
   item?: SyncPlanItem;
   pluginConflict?: { pluginId: string; items: SyncPlanItem[] };
   deletes?: SyncPlanItem[];
+  /** 成批的普通文件冲突：批量行的动作作用在这整份清单上。 */
+  conflicts?: readonly SyncPlanItem[];
+  /** 同屏可见、但不在批量覆盖范围内的文件冲突数（插件子树/受管设置）。 */
+  conflictBatchExcluded?: number;
   /** 片④ 单向模式的本机独有条目（改动副本／本机新建）。 */
   localOnly?: LocalOnlyEntryRowV1;
   /** 成批的本机独有条目：批量行的动作作用在这整份清单上。 */
@@ -354,6 +367,10 @@ export function buildSyncPendingDisplayRows(input: Readonly<{
   skipped: readonly PendingIssueReviewGroup[];
   /** 片④ 本机独有条目；排在逐条删除之后、只读跳过项之前（仍是要处理的动作）。 */
   localOnlyRows?: readonly LocalOnlyEntryRowV1[];
+  /** 单向模式保留的云端已删文件夹说明行；无动作，不计入待处理数。 */
+  retainedFolders?: readonly PendingIssueReviewGroup[];
+  /** 配置目录；用于把插件目录与受管设置排除出批量冲突。 */
+  configDir?: string;
 }>): SyncPendingDisplayRow[] {
   const rows: SyncPendingDisplayRow[] = [];
   const seen = new Set<string>();
@@ -376,6 +393,29 @@ export function buildSyncPendingDisplayRows(input: Readonly<{
       issue,
       nestedIssues,
       retryable: true,
+    });
+  }
+  const configDir = input.configDir ?? "";
+  const batchConflictItems = collectBatchConflictItems(
+    input.conflictEntries,
+    configDir,
+  );
+  if (
+    isBatchedConflictSet(
+      batchConflictItems.map((item) => `conflict:${item.path}`),
+    )
+  ) {
+    const fileConflictCount = input.conflictEntries.filter(
+      (entry) => entry.kind === "file",
+    ).length;
+    push({
+      key: "batch-conflict",
+      kind: "batchConflict",
+      conflicts: batchConflictItems,
+      conflictBatchExcluded: Math.max(
+        0,
+        fileConflictCount - batchConflictItems.length,
+      ),
     });
   }
   for (const entry of input.conflictEntries) {
@@ -411,7 +451,49 @@ export function buildSyncPendingDisplayRows(input: Readonly<{
       localOnlyBatch: [...localOnlyRows],
     });
   }
+  // A retained folder note is context for its local-only rows, so it rides
+  // immediately above the first file of that folder. Notes only materialize
+  // when this device still shows an actionable (non-ignored) local-only file
+  // below them; ignored files keep the folder but drop the reminder.
+  const retainedFolderIssues = (input.retainedFolders ?? [])
+    .map(({ issue }) => issue)
+    .filter((issue) => localOnlyRows.some((entry) =>
+      isPathAtOrBelow(entry.targetPath, issue.path)))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  const retainedFolderByPath = new Map(
+    retainedFolderIssues.map((issue) => [issue.path, issue]),
+  );
+  const localOnlyByRetainedFolder = new Map<string, LocalOnlyEntryRowV1[]>();
+  const ungroupedLocalOnlyRows: LocalOnlyEntryRowV1[] = [];
   for (const entry of localOnlyRows) {
+    const folder = retainedFolderIssues
+      .filter((issue) => isPathAtOrBelow(entry.targetPath, issue.path))
+      .sort((left, right) => left.path.length - right.path.length)[0];
+    if (!folder) {
+      ungroupedLocalOnlyRows.push(entry);
+      continue;
+    }
+    const bucket = localOnlyByRetainedFolder.get(folder.path) ?? [];
+    bucket.push(entry);
+    localOnlyByRetainedFolder.set(folder.path, bucket);
+  }
+  for (const issue of retainedFolderIssues) {
+    const entries = localOnlyByRetainedFolder.get(issue.path) ?? [];
+    if (entries.length === 0) continue;
+    push({
+      key: `retainedFolder:${issue.path}`,
+      kind: "retainedFolder",
+      issue: retainedFolderByPath.get(issue.path),
+    });
+    for (const entry of entries) {
+      push({
+        key: `localOnly:${entry.targetPath}`,
+        kind: "localOnly",
+        localOnly: entry,
+      });
+    }
+  }
+  for (const entry of ungroupedLocalOnlyRows) {
     push({
       key: `localOnly:${entry.targetPath}`,
       kind: "localOnly",
@@ -489,6 +571,10 @@ function pathDepth(path: string): number {
 
 function isNestedPath(path: string, parent: string): boolean {
   return path.length > parent.length && path.startsWith(`${parent}/`);
+}
+
+function isPathAtOrBelow(path: string, root: string): boolean {
+  return path === root || path.startsWith(`${root}/`);
 }
 
 function pathExtractionHelps(
@@ -657,6 +743,72 @@ interface SyncPlanDisplayGroup {
   group: SyncActionGroup;
   labelKey: keyof LocaleStrings;
   items: PlanReviewItem[];
+}
+
+/** A completed row that only records "excluded by configuration" (size limit
+ *  or ignored path). It performs no work, so it never counts toward the run's
+ *  progress numbers and the list folds it into one collapsed group
+ *  (2026-10-25 拍板). */
+function isConfigurationSkipFile(
+  file: Pick<FileProgress, "actionType">,
+): boolean {
+  return isConfigurationSkipAction(file.actionType);
+}
+
+export function partitionCompletedProgressRows(
+  files: readonly FileProgress[],
+): { action: FileProgress[]; skipped: FileProgress[] } {
+  const action: FileProgress[] = [];
+  const skipped: FileProgress[] = [];
+  for (const file of files) {
+    (isConfigurationSkipFile(file) ? skipped : action).push(file);
+  }
+  return { action, skipped };
+}
+
+/**
+ * The "completed" subtitle counts real actions only. `completedCount` is the
+ * executor's true completed total (the retained row list caps successes), and
+ * size/ignored-path rows are never trimmed, so counting them in the retained
+ * list gives the exact amount to subtract.
+ */
+export function resolveCompletedActionCount(
+  state: Readonly<SyncProgressState>,
+): number {
+  const skipped = state.completedFiles.reduce(
+    (count, file) => count + (isConfigurationSkipFile(file) ? 1 : 0),
+    0,
+  );
+  return Math.max(0, state.completedCount - skipped);
+}
+
+/**
+ * History fold rows for one round: the rows that round actually emitted (a new
+ * skip's first sighting) plus the retained path list, so every entry can expand
+ * the same fold even after the sidebar stops re-emitting stable skips
+ * (2026-10-25 拍板). `total` keeps the round's true skip count and `omitted`
+ * reports the remainder beyond `MAX_HISTORY_SKIP_PATHS`.
+ */
+export function collectHistorySkipRows(args: {
+  files: readonly FileProgress[];
+  skipPaths: unknown;
+  total?: number;
+}): { rows: FileProgress[]; total: number; omitted: number } {
+  const byPath = new Map<string, FileProgress>();
+  for (const file of partitionCompletedProgressRows(args.files).skipped) {
+    byPath.set(file.path, file);
+  }
+  for (const path of normalizeHistorySkipPaths(args.skipPaths)) {
+    if (byPath.has(path)) continue;
+    byPath.set(path, {
+      path,
+      status: "skip",
+      actionType: SyncActionType.SkipLargeFile,
+    });
+  }
+  const rows = [...byPath.values()];
+  const total = Math.max(args.total ?? 0, rows.length);
+  return { rows, total, omitted: Math.max(0, total - rows.length) };
 }
 
 export function shouldAutoRebuildPlanReview(
@@ -857,6 +1009,48 @@ export function isBatchedLocalOnlySet(keys: readonly string[]): boolean {
   return false;
 }
 
+/** 成批的普通文件冲突：≥2 条可批量处理的文件冲突才给批量入口。插件整包与
+ *  受管设置不进入这一族（整包中途失败会留下混装三件套；受管设置覆盖前没有
+ *  本机留档），逐条行保持原出口。 */
+export function isBatchedConflictSet(keys: readonly string[]): boolean {
+  let count = 0;
+  for (const key of keys) {
+    if (!key.startsWith("conflict:")) continue;
+    count += 1;
+    if (count > 1) return true;
+  }
+  return false;
+}
+
+/** 本条冲突是否允许进入批量：插件目录整棵（含插件 data.json）与 Obsidian
+ *  受管设置文件排除，其余普通文件冲突可批量。 */
+export function isConflictBatchExcludedPath(
+  path: string,
+  configDir: string,
+): boolean {
+  const normalizedDir = normalizeVaultPathKey(configDir).replace(/\/+$/, "");
+  if (!normalizedDir) return false;
+  const normalizedPath = normalizeVaultPathKey(path);
+  const pluginsPrefix = `${normalizedDir}/plugins/`;
+  if (
+    normalizedPath === `${normalizedDir}/plugins`
+    || normalizedPath.startsWith(pluginsPrefix)
+  ) return true;
+  return isObsidianManagedConfigPath(path, normalizedDir);
+}
+
+/** 从待处理冲突条目中取出可批量处理的普通文件冲突（保持原显示顺序）。 */
+export function collectBatchConflictItems(
+  conflictEntries: readonly BundleConflictReviewEntry[],
+  configDir: string,
+): SyncPlanItem[] {
+  return conflictEntries
+    .filter((entry): entry is { kind: "file"; item: SyncPlanItem } =>
+      entry.kind === "file"
+      && !isConflictBatchExcludedPath(entry.item.path, configDir))
+    .map((entry) => entry.item);
+}
+
 /** 决策行的类别默认态：决策行默认展开，出口第一眼可见；成批出现的待确认
  *  删除与成批出现的本机独有条目默认收起（这两类各有自己的批量入口）。
  *  只读行不在此列（它们没有行身份，也不会被写成展开态）。 */
@@ -1036,9 +1230,10 @@ export function formatFileProgressLabel(
 }
 
 export function formatPendingIssueChipLabel(
-  actionType: SyncActionType,
+  issue: Pick<PendingIssue, "actionType" | "issueCode">,
   t: (key: string) => string,
 ): string | null {
+  const actionType = issue.actionType;
   if (
     actionType === SyncActionType.AuthExpired
     || actionType === SyncActionType.RecreateRemoteScope
@@ -1268,6 +1463,12 @@ export class EasySyncSyncView extends ItemView {
   private progressSubtitleEl: HTMLElement | null = null;
   private fileListEl: HTMLElement | null = null;
   private completedFileRowsLedger: Map<string, string> | null = null;
+  // 按设置跳过的零动作行：运行中与历史共用同一个折叠组（2026-10-25 拍板），
+  // 这里缓存运行中那一份，供增量补行与标题计数使用。
+  private progressSkipGroupEl: HTMLElement | null = null;
+  private progressSkipListEl: HTMLElement | null = null;
+  private progressSkipTitleEl: HTMLElement | null = null;
+  private progressSkipRowsLedger: Map<string, string> | null = null;
   private planViewportFrameId: AnimationFrameHandle | null = null;
   private planVirtualRenderers = new Set<() => void>();
   // Windowed decision rows are unmounted while off screen, so their open state
@@ -1517,6 +1718,10 @@ export class EasySyncSyncView extends ItemView {
     this.progressSubtitleEl = null;
     this.fileListEl = null;
     this.completedFileRowsLedger = null;
+    this.progressSkipGroupEl = null;
+    this.progressSkipListEl = null;
+    this.progressSkipTitleEl = null;
+    this.progressSkipRowsLedger = null;
     this.statusLineEl = null;
     this.statusIconEl = null;
     this.statusTextEl = null;
@@ -1662,7 +1867,13 @@ export class EasySyncSyncView extends ItemView {
     const pendingIssueGroups = groupPendingIssuesForReview(pendingIssues);
     const adoptionRows = this.plugin.getCommunityPluginAdoptionRows();
     const planReviewActive = syncState?.planReviewActive ?? false;
-    const pendingCount = pendingIssueGroups.length + conflicts.length
+    // Retained-folder notes are context for the local-only file rows, not
+    // tasks: the files inside are already counted one by one, so counting the
+    // note too would inflate "需要处理 N" without adding an exit.
+    const retainedFolderIssueCount = pendingIssueGroups.filter(({ issue }) =>
+      issue.issueCode === "one-way-folder-retained").length;
+    const pendingCount = pendingIssueGroups.length - retainedFolderIssueCount
+      + conflicts.length
       + pendingDeletes.length + adoptionRows.length
       + this.plugin.getLocalOnlyRows().filter((entry) =>
         !this.plugin.syncExecutor?.isSideActionQueued(entry.targetPath)).length;
@@ -1945,12 +2156,20 @@ export class EasySyncSyncView extends ItemView {
 
   private appendNewFileRows(files: readonly FileProgress[]): void {
     if (files.length === 0 || !this.progressPanelEl) return;
+    const rows = partitionCompletedProgressRows(files);
+    if (rows.action.length > 0) this.appendCompletedActionRows(rows.action);
+    if (rows.skipped.length > 0) this.appendProgressSkipRows(rows.skipped);
+  }
+
+  private appendCompletedActionRows(files: readonly FileProgress[]): void {
+    const panel = this.progressPanelEl;
+    if (!panel) return;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     if (!this.progressSubtitleEl) {
-      this.progressSubtitleEl = this.progressPanelEl.createDiv("easy-sync-progress-subtitle");
+      this.progressSubtitleEl = panel.createDiv("easy-sync-progress-subtitle");
       this.progressSubtitleEl.setText(
         t("syncView.progress.completed", {
-          count: this.plugin.progressStore.state.completedCount,
+          count: resolveCompletedActionCount(this.plugin.progressStore.state),
         }),
       );
     }
@@ -1958,7 +2177,7 @@ export class EasySyncSyncView extends ItemView {
       // Fallback: no rendered list (or a stale ledger) to diff against.
       this.fileListEl?.remove();
       this.fileListEl = null;
-      this.renderFileResults(this.progressPanelEl, [...files], true);
+      this.renderFileResults(panel, [...files], true);
     } else {
       const diff = diffCompletedFileRows(this.completedFileRowsLedger, files);
       this.completedFileRowsLedger = diff.nextLedger;
@@ -1977,11 +2196,61 @@ export class EasySyncSyncView extends ItemView {
         this.fileListEl.prepend(row);
       }
     }
+    this.pinProgressSkipFoldLast();
     this.progressSubtitleEl?.setText(
       t("syncView.progress.completed", {
-        count: this.plugin.progressStore.state.completedCount,
+        count: resolveCompletedActionCount(this.plugin.progressStore.state),
       }),
     );
+  }
+
+  /**
+   * 按设置跳过的行在运行中也收进一个折叠组（2026-10-25 拍板）：零动作条目
+   * 不进计数、不逐行铺开；组标题承载规则与数量，组内只留图标＋路径。
+   */
+  private appendProgressSkipRows(files: readonly FileProgress[]): void {
+    const panel = this.progressPanelEl;
+    if (!panel) return;
+    if (
+      !this.progressSkipGroupEl
+      || !this.progressSkipListEl
+      || !this.progressSkipTitleEl
+      || !this.progressSkipRowsLedger
+    ) {
+      const fold = this.createSkipFold(panel, files);
+      this.progressSkipGroupEl = fold.group;
+      this.progressSkipListEl = fold.list;
+      this.progressSkipTitleEl = fold.title;
+      this.progressSkipRowsLedger = fold.ledger;
+      this.pinProgressSkipFoldLast();
+      return;
+    }
+    const diff = diffCompletedFileRows(this.progressSkipRowsLedger, files);
+    this.progressSkipRowsLedger = diff.nextLedger;
+    if (diff.removePaths.length > 0) {
+      const removeSet = new Set(diff.removePaths);
+      for (const row of Array.from(this.progressSkipListEl.children)) {
+        if (!row.instanceOf(HTMLElement)) continue;
+        const path = row.dataset.easySyncCompletedPath;
+        if (path && removeSet.has(path)) row.remove();
+      }
+    }
+    for (let i = diff.prepend.length - 1; i >= 0; i--) {
+      this.appendSkipFoldRow(this.progressSkipListEl, diff.prepend[i], true);
+    }
+    this.progressSkipTitleEl.setText(
+      this.plugin.i18n.t("syncView.skipGroup.title", {
+        count: diff.nextLedger.size,
+      }),
+    );
+  }
+
+  /** 折叠组恒排在动作列表之后：冲突／删除行在跳过项之后结算，列表可能是
+   *  后补的，必须把组重新压到面板末尾。 */
+  private pinProgressSkipFoldLast(): void {
+    if (this.progressSkipGroupEl && this.progressPanelEl) {
+      this.progressPanelEl.appendChild(this.progressSkipGroupEl);
+    }
   }
 
   private renderToolbar(container: HTMLElement): void {
@@ -2682,11 +2951,25 @@ export class EasySyncSyncView extends ItemView {
       }%`;
     }
     if (state.completedFiles.length > 0) {
-      this.progressSubtitleEl = panel.createDiv("easy-sync-progress-subtitle");
-      this.progressSubtitleEl.setText(
-        t("syncView.progress.completed", { count: state.completedCount }),
-      );
-      this.renderFileResults(panel, state.completedFiles, true);
+      const rows = partitionCompletedProgressRows(state.completedFiles);
+      // 「已完成」只算真实动作。按设置跳过是零动作，单独进下方折叠组，
+      // 否则标题数会远大于列表里可见的行（2026-10-25 拍板）。
+      if (rows.action.length > 0) {
+        this.progressSubtitleEl = panel.createDiv("easy-sync-progress-subtitle");
+        this.progressSubtitleEl.setText(
+          t("syncView.progress.completed", {
+            count: resolveCompletedActionCount(state),
+          }),
+        );
+        this.renderFileResults(panel, rows.action, true);
+      }
+      if (rows.skipped.length > 0) {
+        const fold = this.createSkipFold(panel, rows.skipped);
+        this.progressSkipGroupEl = fold.group;
+        this.progressSkipListEl = fold.list;
+        this.progressSkipTitleEl = fold.title;
+        this.progressSkipRowsLedger = fold.ledger;
+      }
     }
   }
 
@@ -2833,25 +3116,31 @@ export class EasySyncSyncView extends ItemView {
       .createDiv("easy-sync-section")
       .createDiv("easy-sync-section-body");
     section.addClass("easy-sync-path-layout");
+    const retainedFolders = issueGroups.filter(({ issue }) =>
+      issue.issueCode === "one-way-folder-retained");
     const skipped = issueGroups.filter(({ issue }) =>
-      issue.actionType === SyncActionType.SkipLargeFile
-      || issue.actionType === SyncActionType.SkipIgnoredPath
-      || issue.actionType === SyncActionType.SkipOneDriveInvalidName);
+      issue.issueCode !== "one-way-folder-retained"
+      && (
+        issue.actionType === SyncActionType.SkipLargeFile
+        || issue.actionType === SyncActionType.SkipIgnoredPath
+        || issue.actionType === SyncActionType.SkipOneDriveInvalidName
+      ));
     const failures = issueGroups.filter(({ issue }) =>
-      issue.actionType !== SyncActionType.SkipLargeFile
+      issue.issueCode !== "one-way-folder-retained"
+      && issue.actionType !== SyncActionType.SkipLargeFile
       && issue.actionType !== SyncActionType.SkipIgnoredPath
       && issue.actionType !== SyncActionType.SkipOneDriveInvalidName);
+    const configDir = getConfigDir(this.plugin.app.vault);
     const rows = buildSyncPendingDisplayRows({
       adoptionRows,
       failures,
-      conflictEntries: groupBundleConflictReviews(
-        conflicts,
-        getConfigDir(this.plugin.app.vault),
-      ),
+      conflictEntries: groupBundleConflictReviews(conflicts, configDir),
       pendingDeletes,
       skipped,
       localOnlyRows: this.plugin.getLocalOnlyRows().filter((entry) =>
         !this.plugin.syncExecutor?.isSideActionQueued(entry.targetPath)),
+      retainedFolders,
+      configDir,
     });
     // 窗口化挂载（2026-09-16，与计划审阅决策行同一机制）：待处理行数大时
     // 只挂载视口附近的行，滚动按窗口替换。行 key（data-easy-sync-plan-row）
@@ -2961,6 +3250,15 @@ export class EasySyncSyncView extends ItemView {
           );
         }
         return;
+      case "batchConflict":
+        if (row.conflicts) {
+          this.renderBatchConflictRow(
+            container,
+            row.conflicts,
+            row.conflictBatchExcluded ?? 0,
+          );
+        }
+        return;
       case "conflict":
         if (row.item) this.renderConflictItem(container, row.item, row.key);
         return;
@@ -2989,7 +3287,41 @@ export class EasySyncSyncView extends ItemView {
           this.renderLocalOnlyItem(container, row.localOnly, row.key);
         }
         return;
+      case "retainedFolder":
+        if (row.issue) {
+          this.renderRetainedFolderRow(container, row.issue, row.key);
+        }
+        return;
     }
+  }
+
+  /**
+   * One-way retained folder note: a cloud-deleted folder stays because local
+   * content still occupies it. Read-only by design — no button, no decision,
+   * no hover/click affordance; the actionable exits stay on the local-only
+   * file rows below it.
+   */
+  private renderRetainedFolderRow(
+    container: HTMLElement,
+    issue: PendingIssue,
+    rowKey?: string,
+  ): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const rowEl = container.createDiv("easy-sync-retained-folder-row");
+    if (rowKey) rowEl.dataset.easySyncPlanRow = rowKey;
+    const header = rowEl.createDiv("easy-sync-retained-folder-header");
+    const icon = header.createSpan("easy-sync-tree-status-icon");
+    // Same icon and chip as every other FolderDeferred row: retained is a
+    // not-synced state, not a new decision category.
+    setIcon(icon, "folder-clock");
+    header.createSpan("easy-sync-tree-path").setText(issue.path);
+    const chipLabel = formatPendingIssueChipLabel(issue, t);
+    if (chipLabel) {
+      header.createSpan("easy-sync-tree-chip").setText(chipLabel);
+    }
+    rowEl.createDiv("easy-sync-item-reason").setText(
+      issue.reason ?? t("reason.oneWay.folderRetained"),
+    );
   }
 
   /**
@@ -3232,7 +3564,7 @@ export class EasySyncSyncView extends ItemView {
     setIcon(actionIcon, action.icon);
     const pathEl = summary.createSpan("easy-sync-tree-path");
     configureFilePath(details, pathEl, issue.path, true);
-    const chipLabel = formatPendingIssueChipLabel(issue.actionType, t);
+    const chipLabel = formatPendingIssueChipLabel(issue, t);
     if (chipLabel) summary.createSpan("easy-sync-tree-chip").setText(chipLabel);
     // scope-crossing 行的出口按当前去向记录分流：有覆盖 hint 的移出行才
     // 渲染撤销/确认双按钮；漂移与设置形态没有去向证据，恢复通用「重新检
@@ -3792,21 +4124,41 @@ export class EasySyncSyncView extends ItemView {
       : snapshot.keepRemote;
     if (!option.deletesOtherSide) return true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    // keep-remote on a missing remote deletes the local copy; keep-local on a
+    // missing local deletes the cloud copy (2026-10-25). Naming the side that
+    // disappears keeps the question and the consequence in one sentence.
+    const deletesLocal = choice === "keep-remote";
+    const bundle = snapshot.bundleReview;
+    const title = bundle
+      ? t("syncView.mutationResolution.deleteConfirmTitle")
+      : t(deletesLocal
+        ? "syncView.mutationResolution.deleteConfirmTitleLocal"
+        : "syncView.mutationResolution.deleteConfirmTitleRemote");
+    const message = bundle
+      ? t("syncView.mutationResolution.deleteConfirmMessage", {
+          path: bundle.displayName ?? bundle.pluginId ?? snapshot.path,
+          // Quote the label the bundle buttons actually show.
+          choice: t(choice === "keep-local"
+            ? "syncView.conflict.keepLocal"
+            : "syncView.conflict.keepRemote"),
+        })
+      : t(deletesLocal
+        ? "syncView.mutationResolution.deleteConfirmMessageLocal"
+        : "syncView.mutationResolution.deleteConfirmMessageRemote", {
+          path: snapshot.path,
+          size: formatFileSize(
+            (deletesLocal ? snapshot.local[0]?.size : snapshot.remote[0]?.size)
+              ?? 0,
+          ),
+        });
     return new ConfirmModal(
       this.plugin.app,
-      t("syncView.mutationResolution.deleteConfirmTitle"),
+      title,
       t("syncView.mutationResolution.deleteConfirm"),
       t("confirm.cancel"),
       t,
       {
-        message: t("syncView.mutationResolution.deleteConfirmMessage", {
-          path: snapshot.bundleReview?.displayName
-            ?? snapshot.bundleReview?.pluginId
-            ?? snapshot.path,
-          choice: choice === "keep-local"
-            ? t("syncView.mutationResolution.keepLocal")
-            : t("syncView.mutationResolution.keepRemote"),
-        }),
+        message,
         warning: t("syncView.mutationResolution.deleteConfirmWarning"),
         danger: true,
       },
@@ -3851,6 +4203,9 @@ export class EasySyncSyncView extends ItemView {
         details.addEventListener("toggle", () => {
           if (details.open && body.firstElementChild === null) {
             this.renderHistoryEntryBody(body, entry);
+            // 懒建的正文不在首帧渲染里，补一次同一任务内的路径摘取，
+            // 否则展开后要等下一次 resize／toggle 才出现灰字目录。
+            this.scheduleAdaptivePathLayout();
           }
         });
       }
@@ -3891,43 +4246,32 @@ export class EasySyncSyncView extends ItemView {
           formatMutationRecoveryHistory(entry.recovery, t),
         );
       }
+      // 增量呈现（2026-09-16 方案单 §十二）：按设置跳过（超大小）的行归入折叠
+      // 组，与运行中共用同一个折叠件；组标题承载性质（设置名），组内行＝图标＋
+      // 路径。历史每轮都能展开——行既有当轮发行的，也有从 `skipPaths` 保留的稳定
+      // 集合（2026-10-25 追加拍板：运行列表仍只报新面孔，历史不再丢清单）。
+      // 其余行（含上传/下载/非法文件名）照旧逐行。
       if (entry.files.length > 0) {
-        // 增量呈现（2026-09-16 方案单 §十二）：SkipLargeFile 行归入折叠组，
-        // 组标题承载性质（设置名「大型文件排除」），组内行=图标+路径，
-        // 徽标与理由句由组收掉；其余行（含上传/下载/invalid-name）照旧。
-        const skipLargeRows = entry.files.filter(
-          (file) => file.actionType === SyncActionType.SkipLargeFile,
-        );
-        const otherRows = entry.files.filter(
-          (file) => file.actionType !== SyncActionType.SkipLargeFile,
-        );
-        if (otherRows.length > 0) {
-          this.renderFileResults(body, otherRows, false);
+        const rows = partitionCompletedProgressRows(entry.files);
+        if (rows.action.length > 0) {
+          // 2026-10-25 用户确认：历史普通文件行也接现役灰字目录（此前"历史
+          // 不挂"只是实现现状被追认成约定，不是用户拍板）。高度不设限，行
+          // 仍按内容自然展开。
+          this.renderFileResults(body, rows.action, false, true);
         }
-        if (skipLargeRows.length > 0) {
-          const group = body.createEl(
-            "details",
-            "easy-sync-history-skip-group easy-sync-tree-item",
-          );
-          const summary = group.createEl(
-            "summary",
-            "easy-sync-history-skip-summary easy-sync-tree-row",
-          );
-          this.addCollapseIcon(summary);
-          summary.createSpan("easy-sync-history-skip-title").setText(
-            t("syncView.history.skipGroupTitle", {
-              count: skipLargeRows.length,
-            }),
-          );
-          const groupRows = group.createDiv("easy-sync-file-list");
-          for (let i = skipLargeRows.length - 1; i >= 0; i--) {
-            const row = groupRows.createDiv("easy-sync-file-row");
-            const icon = row.createSpan("easy-sync-file-icon");
-            setIcon(icon, resolveFileProgressPresentation(skipLargeRows[i]).icon);
-            const pathEl = row.createSpan("easy-sync-file-path");
-            configureFilePath(row, pathEl, skipLargeRows[i].path, false);
-          }
-        }
+      }
+      const skip = collectHistorySkipRows({
+        files: entry.files,
+        skipPaths: entry.skipPaths,
+        total: entry.skippedLarge,
+      });
+      if (skip.rows.length > 0) {
+        this.createSkipFold(body, skip.rows, skip.total);
+      }
+      if (skip.omitted > 0) {
+        body.createDiv("easy-sync-history-omitted").setText(
+          t("syncView.history.skipOmitted", { count: skip.omitted }),
+        );
       }
       const omitted = countOmittedSyncHistorySuccessfulFiles(entry);
       if (omitted > 0) {
@@ -3942,14 +4286,15 @@ export class EasySyncSyncView extends ItemView {
     container: HTMLElement,
     files: FileProgress[],
     limitHeight: boolean,
+    adaptive = limitHeight,
   ): void {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const list = container.createDiv("easy-sync-file-list");
     const renderedPaths = new Set<string>();
     const ledger = new Map<string, string>();
+    if (adaptive) list.addClass("easy-sync-path-layout");
     if (limitHeight) {
       list.addClass("is-limited");
-      list.addClass("easy-sync-path-layout");
       this.fileListEl = list;
     }
 
@@ -3957,10 +4302,70 @@ export class EasySyncSyncView extends ItemView {
     for (let i = files.length - 1; i >= 0; i--) {
       if (limitHeight && renderedPaths.has(files[i].path)) continue;
       renderedPaths.add(files[i].path);
-      renderFileRow(files[i], list, t, limitHeight);
+      renderFileRow(files[i], list, t, adaptive);
       if (limitHeight) ledger.set(files[i].path, completedFileRowKey(files[i]));
     }
     if (limitHeight) this.completedFileRowsLedger = ledger;
+  }
+
+  /**
+   * 按设置跳过（超大小／忽略路径）的折叠组：运行中的完成列表与历史条目共用
+   * 同一个折叠件（2026-10-25 拍板）。组标题＝设置名＋数量，组内行只留图标＋
+   * 路径；视觉家族沿用 `.easy-sync-history-skip-*`，两个载体渲染一致。
+   * 组内列表是独立的 `easy-sync-path-layout` 测量范围（2026-10-25 用户真机
+   * 反馈：长路径要复用现役灰字目录摘取）——不与组外行共享，避免跨组摘取。
+   */
+  private createSkipFold(
+    container: HTMLElement,
+    rows: readonly FileProgress[],
+    titleCount?: number,
+  ): {
+    group: HTMLElement;
+    list: HTMLElement;
+    title: HTMLElement;
+    ledger: Map<string, string>;
+  } {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const group = container.createEl(
+      "details",
+      "easy-sync-history-skip-group easy-sync-tree-item",
+    );
+    const summary = group.createEl(
+      "summary",
+      "easy-sync-history-skip-summary easy-sync-tree-row",
+    );
+    this.addCollapseIcon(summary);
+    const title = summary.createSpan("easy-sync-history-skip-title");
+    const list = group.createDiv(
+      "easy-sync-file-list easy-sync-path-layout",
+    );
+    // 与动作列表同一套行身份／去重口径：同路径后完成的覆盖先前的。
+    const diff = diffCompletedFileRows(new Map(), rows);
+    for (const file of diff.prepend) {
+      this.appendSkipFoldRow(list, file, false);
+    }
+    title.setText(
+      t("syncView.skipGroup.title", {
+        count: titleCount ?? diff.nextLedger.size,
+      }),
+    );
+    return { group, list, title, ledger: diff.nextLedger };
+  }
+
+  /** 折叠组里的一行：图标＋路径；数量与理由句归组标题。 */
+  private appendSkipFoldRow(
+    list: HTMLElement,
+    file: FileProgress,
+    prepend: boolean,
+  ): HTMLElement {
+    const row = list.createDiv("easy-sync-file-row");
+    row.dataset.easySyncCompletedPath = file.path;
+    const icon = row.createSpan("easy-sync-file-icon");
+    setIcon(icon, resolveFileProgressPresentation(file).icon);
+    const pathEl = row.createSpan("easy-sync-file-path");
+    configureFilePath(row, pathEl, file.path, true);
+    if (prepend) list.prepend(row);
+    return row;
   }
 
   /**
@@ -4493,6 +4898,93 @@ export class EasySyncSyncView extends ItemView {
       });
       modal.open();
     });
+  }
+
+  /**
+   * 冲突批量处置行：≥2 条可批量的普通文件冲突时出现在冲突族顶部。两个方向都先
+   * 过确认弹框；插件目录整棵与 Obsidian 受管设置不在这一行覆盖范围内，逐条行
+   * 保持原出口。批量在飞时按方向恢复加载态，避免侧栏整屏重建后按钮又变可点。
+   */
+  private renderBatchConflictRow(
+    container: HTMLElement,
+    conflicts: readonly SyncPlanItem[],
+    excludedCount: number,
+  ): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const rowEl = container.createDiv();
+    rowEl.dataset.easySyncPlanRow = "batch-conflict";
+    rowEl.createDiv("easy-sync-item-reason").setText(
+      t("syncView.conflict.batchNote", { count: conflicts.length }),
+    );
+    if (excludedCount > 0) {
+      rowEl.createDiv("easy-sync-item-reason").setText(
+        t("syncView.conflict.batchExcludedNote", { count: excludedCount }),
+      );
+    }
+    const actions = rowEl.createDiv(
+      "easy-sync-plan-execute easy-sync-local-only-batch-actions",
+    );
+    const paths = conflicts.map((item) => item.path);
+    const batchState = this.plugin.conflictBatchState;
+    // 入口两颗按钮同色（中性）：批量行只是对等入口，危险色留给确认弹框。
+    const keepLocalButton = new ButtonComponent(actions);
+    keepLocalButton
+      .setButtonText(t("syncView.conflict.batchKeepLocal"))
+      .onClick(() => {
+        void this.runItemAction(actions, async () => {
+          const confirmed = await new ConfirmModal(
+            this.plugin.app,
+            t("syncView.conflict.batchKeepLocalTitle", {
+              count: paths.length,
+            }),
+            t("syncView.conflict.batchKeepLocal"),
+            t("confirm.cancel"),
+            t,
+            {
+              message: t("syncView.conflict.batchKeepLocalMessage"),
+              danger: true,
+            },
+          ).awaitConfirm();
+          if (!confirmed) return;
+          keepLocalButton.buttonEl.addClass("mod-loading");
+          keepLocalButton.setDisabled(true);
+          await this.plugin.resolveConflictsKeepLocal(paths);
+        });
+      });
+    const keepRemoteButton = new ButtonComponent(actions);
+    keepRemoteButton
+      .setButtonText(t("syncView.conflict.batchKeepRemote"))
+      .onClick(() => {
+        void this.runItemAction(actions, async () => {
+          const confirmed = await new ConfirmModal(
+            this.plugin.app,
+            t("syncView.conflict.batchKeepRemoteTitle", {
+              count: paths.length,
+            }),
+            t("syncView.conflict.batchKeepRemote"),
+            t("confirm.cancel"),
+            t,
+            {
+              message: t("syncView.conflict.batchKeepRemoteMessage"),
+              danger: true,
+            },
+          ).awaitConfirm();
+          if (!confirmed) return;
+          keepRemoteButton.buttonEl.addClass("mod-loading");
+          keepRemoteButton.setDisabled(true);
+          await this.plugin.resolveConflictsKeepRemote(paths);
+        });
+      });
+    // 重挂恢复加载态：批量在飞时侧栏可能因进度整屏重建；按方向恢复旋转与禁用。
+    if (batchState === "local") {
+      keepLocalButton.buttonEl.addClass("mod-loading");
+      keepLocalButton.setDisabled(true);
+      keepRemoteButton.setDisabled(true);
+    } else if (batchState === "remote") {
+      keepRemoteButton.buttonEl.addClass("mod-loading");
+      keepRemoteButton.setDisabled(true);
+      keepLocalButton.setDisabled(true);
+    }
   }
 
   private renderBundleConflictItem(

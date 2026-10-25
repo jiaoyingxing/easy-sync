@@ -43,6 +43,8 @@ export class ScopeCrossingPromptModal extends EasySyncModal {
   onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
+    // 纯确认框：正文即全部内容，正文放大走 styles.css 白名单。
+    this.modalEl.addClass("easy-sync-prompt-modal");
     this.setTitle(this.title);
 
     contentEl.createEl("p", {

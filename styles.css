@@ -166,6 +166,30 @@ body.is-mobile .modal-container.easy-sync-modal-container .modal-bg {
   flex: 0 0 auto;
 }
 
+/* 句内官方齿轮（2026-10-24 用户要求）：「同步范围」说明句以 ⚙ 字符指代
+   下方每行的设置按钮，渲染时替换为与按钮同款的 lucide「settings」图标；
+   随文字字号缩放、按基线对齐。 */
+.easy-sync-inline-gear {
+  display: inline-flex;
+  vertical-align: -0.15em;
+}
+
+.easy-sync-inline-gear svg {
+  width: 1em;
+  height: 1em;
+}
+
+/* 弹框正文使用宿主正常字号（2026-10-23 用户 UI 要求：弹框正文不得使用
+   小字体；2026-10-24 审计收窄为白名单制）——放大只适用于"正文即全部
+   内容"的纯提示/确认框（删除确认式＝一两段等权重正文＋按钮，别无其他
+   内容结构），成员在各自 onOpen 挂 easy-sync-prompt-modal。其余一切
+   弹框（设置表单、数据视图、选项卡、列表、多组说明、设备码注脚）一律
+   保留宿主原本字号层次，防止内容密集处主次不分。 */
+.easy-sync-modal-container .easy-sync-prompt-modal .modal-content > .setting-item-description {
+  font-size: var(--font-ui-medium);
+  line-height: var(--line-height-normal, 1.5);
+}
+
 .easy-sync-settings-modal .modal-content.easy-sync-community-plugin-page {
   display: flex;
   flex: 1 1 auto;
@@ -1024,6 +1048,26 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
 .easy-sync-tree-row:hover {
   color: var(--nav-item-color-hover, var(--text-normal));
   background: var(--nav-item-background-hover, var(--background-modifier-hover));
+}
+
+/* One-way retained-folder note: context for the local-only rows below it.
+   Deliberately not a clickable row — no hover, no cursor, no collapse. */
+.easy-sync-retained-folder-row {
+  min-width: 0;
+  padding: 4px 4px 2px;
+}
+
+.easy-sync-retained-folder-header {
+  display: flex;
+  align-items: center;
+  min-height: 24px;
+  color: var(--nav-item-color, var(--text-muted));
+  font-size: var(--nav-item-size, var(--font-ui-small));
+}
+
+.easy-sync-retained-folder-row .easy-sync-item-reason {
+  margin-top: 2px;
+  padding-left: 22px;
 }
 
 .easy-sync-collapse-icon {

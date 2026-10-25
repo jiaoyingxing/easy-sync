@@ -20,7 +20,7 @@ import {
   TimeoutHandle,
 } from "../obsidian-compat";
 
-type DiagCategory =
+export type DiagCategory =
   | "scan"       // 本地扫描
   | "plan"       // 同步计划
   | "execute"    // 执行

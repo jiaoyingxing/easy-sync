@@ -337,6 +337,52 @@ describe("S5 shape sequence test bench (dual-device)", () => {
     }
   });
 
+  it("F29 slice2 transient: same-round descendant reconciliation settles a cloud file move before the folder move", async () => {
+    const world = createShapeWorld({
+      files: {
+        "proj/sub/todo.md": "todo-content",
+        "proj/readme.md": "readme-content",
+        "other/keep.md": "keep-me",
+      },
+      folders: ["proj", "proj/sub", "other"],
+    });
+    const { a } = await addConvergedPair(world);
+
+    // 云端第三方：把 proj 改名成 projX（子目录跟随机械翻译），却把后代文件
+    // todo.md 单独搬去 other/。目录锚点全部对齐、只有一个文件锚点漂移——
+    // 切片1 的「先对账再移动」在这里一轮就能对账，不需要延后行。
+    world.renameRemoteFolder("proj", "projX");
+    world.moveRemoteFileToFolder("projX/sub/todo.md", "other");
+
+    const aRound = await a.runRound();
+    expect(aRound.errors).toBe(0);
+    expect(aRound.conflicts).toBe(0);
+    expect(aRound.foldersMoved).toBe(0);
+    expect(aRound.filesMoved).toBe(1);
+    expect(describePending(a).some((row) =>
+      row.path === "projX" && row.issueCode === "remote-subtree-changed"))
+      .toBe(false);
+    expect(a.ledger()).toHaveLength(0);
+    expect(a.hasLocalFile("other/todo.md")).toBe(true);
+    // The carried root file must stay at its old path for this round: a download
+    // to projX/readme.md would create the destination directory and block the
+    // next round's folder move with target-occupied.
+    expect(a.hasLocalFile("proj/readme.md")).toBe(true);
+    expect(a.hasLocalFile("projX/readme.md")).toBe(false);
+    expect(a.localFolders.has("projX")).toBe(false);
+    expect(describePending(a)).toHaveLength(0);
+
+    // 后代文件已按云端现状落位；下一轮文件夹移动按对齐后的子树直接发射。
+    const aRound2 = await a.runRound();
+    expect(aRound2.errors).toBe(0);
+    expect(aRound2.foldersMoved).toBe(1);
+    expect(a.localFolders.has("projX")).toBe(true);
+    expect(a.hasLocalFile("projX/readme.md")).toBe(true);
+    expect(a.hasLocalFile("proj/readme.md")).toBe(false);
+    expect(describePending(a)).toHaveLength(0);
+    expect(a.ledger()).toHaveLength(0);
+  });
+
   it("F29 appendix: an unreceipted folder move already carried out by the world settles in one round", async () => {
     const world = createShapeWorld({
       files: {

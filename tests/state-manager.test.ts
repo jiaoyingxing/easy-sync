@@ -927,6 +927,70 @@ describe("StateManager batch persistence", () => {
     expect(state.lastSyncTime).toBe(0);
   });
 
+  it("commits the healthy round-end mark (timestamp + generation) in one save", async () => {
+    // W3 2026-10-24: the round end used to pay two full plugin-data commits
+    // for two scalars (setLastSyncTime then incrementRemoteGeneration) on
+    // every round — ~960 writes/day on an idle vault at the 3-minute
+    // default. The combined method must write both keys atomically in a
+    // single save call.
+    const { state, saveData } = makeState();
+    const savesBefore = saveData.mock.calls.length;
+    const generationBefore = state.remoteGeneration;
+
+    await state.setLastSyncTimeAndIncrementGeneration(1_800_000_123_456);
+
+    expect(saveData.mock.calls.length).toBe(savesBefore + 1);
+    expect(state.lastSyncTime).toBe(1_800_000_123_456);
+    expect(state.remoteGeneration).toBe(generationBefore + 1);
+    const written = saveData.mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(written["easy-sync-last-sync-time"]).toBe(1_800_000_123_456);
+    expect(written["easy-sync-generation"]).toBe(generationBefore + 1);
+  });
+
+  it("skips the disk write when upserted pending rows are byte-identical", async () => {
+    // W2 2026-10-24: unresolved conflict/delete rows are re-upserted at every
+    // round end with byte-identical content (decisionToken is derived
+    // deterministically), paying a full data.json write per round while they
+    // sit unresolved. An unchanged merge must keep the original array
+    // reference so the commit short-circuit skips the write.
+    const { state, saveData } = makeState();
+    const row = conflict("pending.md");
+    await state.upsertPendingConflicts([row]);
+    const writesAfterFirst = saveData.mock.calls.length;
+    expect(state.pendingConflicts).toHaveLength(1);
+
+    // Same path, same derived facts: no write may happen.
+    await state.upsertPendingConflicts([conflict("pending.md")]);
+    expect(saveData.mock.calls.length).toBe(writesAfterFirst);
+
+    // A genuinely different row still writes.
+    await state.upsertPendingConflicts([{
+      ...row,
+      local: { ...row.local, hash: "bb".repeat(32) },
+    }]);
+    expect(saveData.mock.calls.length).toBe(writesAfterFirst + 1);
+  });
+
+  it("skips the disk write when the size-exclusion baseline is unchanged", async () => {
+    // W8 2026-10-25: the round-end mirror was overwritten unconditionally,
+    // paying one full data.json write per idle round with zero content
+    // change (observed as `keys: []` in the live write log). Same set,
+    // different order or duplicates must keep the stored baseline.
+    const { state, saveData } = makeState();
+    await state.commitSizeExclusionBaseline(["a.md", "b.md"]);
+    const writesAfterFirst = saveData.mock.calls.length;
+    expect(state.getSizeExclusionBaseline()).toEqual(["a.md", "b.md"]);
+
+    await state.commitSizeExclusionBaseline(["b.md", "a.md", "a.md"]);
+    expect(saveData.mock.calls.length).toBe(writesAfterFirst);
+    expect(state.getSizeExclusionBaseline()).toEqual(["a.md", "b.md"]);
+
+    // A real set change still writes.
+    await state.commitSizeExclusionBaseline(["b.md"]);
+    expect(saveData.mock.calls.length).toBe(writesAfterFirst + 1);
+    expect(state.getSizeExclusionBaseline()).toEqual(["b.md"]);
+  });
+
   it("does not append preview content to the public ancestor cache", async () => {
     const { state } = makeState();
     const content = new TextEncoder().encode("base line 1\nbase line 2").buffer;

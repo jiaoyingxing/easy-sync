@@ -1107,9 +1107,11 @@ describe("one-way plan suppression", () => {
     expect(itemKeys(twoWay.items)).toEqual([
       "upload:copy-1.md",
       "upload:copy-2.md",
-      "conflict:old.md",
     ]);
-    expect(twoWay.items[2].reason).toBe("reason.renameIdentityAmbiguous");
+    expect(twoWay.items).not.toContainEqual(expect.objectContaining({
+      type: SyncActionType.Conflict,
+      reason: "reason.renameIdentityAmbiguous",
+    }));
 
     const oneWay = await finalizeCanonicalPlan({
       candidate,

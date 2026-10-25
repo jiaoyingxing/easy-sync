@@ -111,6 +111,7 @@ describe("Execute-time file race safety", () => {
     const state = makeActiveV2State([], [], {
       reconcilePendingIssues,
       setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+      setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
       lastSyncTime: 0,
     });
     const executor = new SyncExecutor(
@@ -176,6 +177,7 @@ describe("Execute-time file race safety", () => {
     const state = makeActiveV2State([], [], {
       reconcilePendingIssues,
       setLastSyncTime: vi.fn().mockResolvedValue(undefined),
+      setLastSyncTimeAndIncrementGeneration: vi.fn().mockResolvedValue(undefined),
       lastSyncTime: 0,
     });
     const executor = new SyncExecutor(
@@ -1210,6 +1212,86 @@ describe("Execute-time file race safety", () => {
       "testVault",
       "deleted.md",
       "etag-old",
+      "remote-id",
+    );
+  });
+
+  it("retries the delete with fresh metadata when the remote bytes still match the base", async () => {
+    const addPendingConflict = vi.fn().mockResolvedValue(undefined);
+    const deleteItem = vi.fn()
+      .mockRejectedValueOnce(
+        new OneDriveError(OneDriveErrorType.PreconditionFailed, "etag changed", 412),
+      )
+      .mockResolvedValueOnce(undefined);
+    const remoteBeforeRace: RemoteFileEntry = {
+      path: "deleted.md",
+      driveId: "remote-id",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      size: 10,
+      mtime: 1,
+      eTag: "etag-old",
+      cTag: "",
+    };
+    const state = makeActiveV2State(
+      [remoteBeforeRace],
+      [{
+        path: "deleted.md",
+        hash: "aa".repeat(32),
+        size: 10,
+        eTag: "etag-old",
+      }],
+      { addPendingConflict },
+    );
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        deleteItem,
+        getFileMetadata: vi.fn().mockResolvedValue({
+          driveId: "remote-id",
+          size: 10,
+          mtime: 7,
+          eTag: "etag-new",
+          sha256Hash: "aa".repeat(32),
+        }),
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          folderScanFailures: [],
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        scanFile: vi.fn().mockResolvedValue(null),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(result.conflicts).toBe(0);
+    expect(result.deleted).toBe(1);
+    expect(addPendingConflict).not.toHaveBeenCalled();
+    expect(deleteItem).toHaveBeenNthCalledWith(
+      1,
+      "testVault",
+      "deleted.md",
+      "etag-old",
+      "remote-id",
+    );
+    expect(deleteItem).toHaveBeenNthCalledWith(
+      2,
+      "testVault",
+      "deleted.md",
+      "etag-new",
       "remote-id",
     );
   });
