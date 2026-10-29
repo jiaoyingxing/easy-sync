@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to check out and verify assets against (default: current ref / latest release)"
+        description: "Release tag to verify assets against (default: latest release)"
         required: false
         type: string
 
@@ -21,15 +21,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Public-face gate: the runnable subset of the source repo's checks.
+  # `npm run check` is deliberately not used: check:docs / dev:* point at
+  # directories that are not projected into this repo.
   verify:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-        with:
-          # workflow_dispatch may verify an already published version: check out
-          # that tag so the build matches the release commit.
-          ref: ${{ inputs.tag || '' }}
 
       - uses: actions/setup-node@v4
         with:
@@ -43,11 +42,27 @@ jobs:
       - run: npm run check:meta
       - run: npm run build
 
-      # `npm run check` is deliberately not used: check:docs / dev:* point at
-      # directories that are not projected into this repo. The runnable subset
-      # above is the public-face gate.
-      - name: Verify release assets match the build
-        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+  # Release readback: rebuild the released commit and compare the three assets
+  # byte for byte. Only `npm ci` + `npm run build` run here, so an older tag
+  # (which may predate test-suite fixes) can still be verified.
+  assets:
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag || '' }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+
+      - name: Compare release assets with the build
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
