@@ -159,6 +159,7 @@ export function makeMockOneDrive(overrides: Record<string, unknown> = {}) {
       },
     ),
     uploadFile: vi.fn().mockResolvedValue({ id: "mock-upload-id", eTag: "mock-etag" }),
+    restoreDeletedDriveItemById: vi.fn().mockResolvedValue(undefined),
     deleteItem: vi.fn().mockResolvedValue(undefined),
     initVaultScope: vi.fn().mockResolvedValue({
       driveId: "drive-id",
@@ -169,6 +170,9 @@ export function makeMockOneDrive(overrides: Record<string, unknown> = {}) {
     invalidateVaultScope: vi.fn(),
     isDeltaLinkForVault: vi.fn().mockReturnValue(true),
     resetDownloadStrategy: vi.fn(),
+    // Required by SyncExecutor's small-file download policy. Healthy by
+    // default; tests that exercise the degraded path override it.
+    hasDegradedDownloadPathThisRound: vi.fn().mockReturnValue(false),
     setAbortSignal: vi.fn(),
     getFileMetadata: vi.fn().mockResolvedValue(null),
     getFileMetadataByPaths: vi.fn().mockResolvedValue(new Map()),
@@ -213,6 +217,11 @@ export function remoteStateStub() {
     abandonMutationIntent: vi.fn().mockResolvedValue(undefined),
     commitMutationCheckpoint: vi.fn().mockResolvedValue(undefined),
     commitMutationCheckpoints: vi.fn().mockResolvedValue(undefined),
+    // 波级批量写（Step 4 清理波、确认删除波）：真实 StateManager 的方法总在场，
+    // 桩默认不落账。需要断言或需要真实归约的用例用 `makeActiveV2State` 覆盖。
+    beginMutationIntents: vi.fn().mockResolvedValue(undefined),
+    recordMutationReceipts: vi.fn().mockResolvedValue(undefined),
+    recordCloudDeletions: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -338,6 +347,10 @@ export function makeActiveV2State(
       accepted: 0,
       evidenceFiles: 0,
     }),
+    acceptDerivedFolderMappings: vi.fn().mockResolvedValue({
+      status: "none",
+      accepted: 0,
+    }),
     prepareMutationRecoveryRecord: vi.fn((
       record: {
         intent: { scope: SyncScope };
@@ -346,6 +359,9 @@ export function makeActiveV2State(
     ) => sameSyncScope(record.intent.scope, currentScope) ? record : null),
     retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
     getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
+    // The real manager also exposes the live read-only view its per-item
+    // readers use; the mock must answer it so those readers keep working.
+    peekCommittedV2Envelope: vi.fn(() => envelope),
     get activeV2StorageAuthorityEvidence() {
       return {
         kind: "json" as const,
@@ -567,12 +583,23 @@ export function makeActiveV2State(
   state.beginMutationIntent = vi.fn(async (intent) => {
     state.mutationLedger.push({ intent, receipt: null });
   });
+  // Cleanup waves persist a whole wave; the fake keeps the single-record
+  // observability so existing assertions on the singular API still hold.
+  state.beginMutationIntents = vi.fn(async (intents) => {
+    for (const intent of intents) await state.beginMutationIntent(intent);
+  });
+  state.recordCloudDeletions = vi.fn(async (entries: DeletionLedgerEntryV1[]) => {
+    for (const entry of entries) await state.recordCloudDeletion(entry);
+  });
   state.recordMutationReceipt = vi.fn(async (receipt) => {
     const record = state.mutationLedger.find(
       (candidate) => candidate.intent.operationId === receipt.operationId,
     );
     if (!record) throw new Error(`Mutation intent missing: ${receipt.operationId}`);
     record.receipt = receipt;
+  });
+  state.recordMutationReceipts = vi.fn(async (receipts) => {
+    for (const receipt of receipts) await state.recordMutationReceipt(receipt);
   });
   state.rebaseReceiptedRenameSpelling = vi.fn(async (input: {
     expected: MutationLedgerEntryV1;

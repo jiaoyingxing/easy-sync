@@ -935,6 +935,7 @@ export function makeHarness(input?: {
       size: 0,
       parentReference: { id: scope.filesRootId },
     }),
+    restoreDeletedDriveItemById: vi.fn(async (_driveItemId: string) => undefined),
     downloadFile: vi.fn(async (_vaultName: string, path: string) => {
       const content = input?.remoteFileContents?.[path];
       return content === undefined
@@ -1088,6 +1089,7 @@ export function makeHarness(input?: {
     isDeltaLinkForVault: vi.fn().mockReturnValue(true),
     setAbortSignal: vi.fn(),
     resetDownloadStrategy: vi.fn(),
+    hasDegradedDownloadPathThisRound: vi.fn().mockReturnValue(false),
     getDelta,
     getDeltaByFolderId: getDelta,
     readSharedSyncProtocolV2,
@@ -1699,29 +1701,37 @@ export async function prepareUnanchoredSharedFolderHarness() {
     { activateV2State: true },
   )).success).toBe(true);
   for (const path of folderPaths) harness.localFolderPaths.add(path);
-  harness.remoteItemState.push(...remoteFolderTree(folderPaths));
-
-  const deferred = await harness.executor.run(
-    "manual",
+  const remoteFolders = remoteFolderTree(folderPaths);
+  harness.remoteItemState.push(...remoteFolders);
+  await harness.state.setRemoteState(
+    harness.state.remoteSnapshot,
+    "https://graph.example/delta-current",
+    scope,
+    [
+      ...harness.state.remoteFolders,
+      ...folderPaths.map((path, index) => ({
+        path,
+        driveId: remoteFolders[index]!.id,
+        parentId: remoteFolders[index]!.parentReference!.id!,
+        name: remoteFolders[index]!.name,
+        eTag: remoteFolders[index]!.eTag,
+      })),
+    ],
   );
-  expect(deferred).toMatchObject({
-    success: true,
-    foldersCreated: 0,
-    foldersMoved: 0,
-    foldersDeleted: 0,
-    deferred: 2,
-    errors: 0,
-  });
-  expect(harness.state.pendingIssues).toEqual([
-    expect.objectContaining({
-      path: ".obsidian",
+  // Complete current facts now derive these mappings on the next round, so the
+  // question is retired before it can become a row. The manual entry still has
+  // to be exercised end to end: stage the row the old round would have
+  // produced and let the real snapshot / confirm path re-derive the facts.
+  await harness.state.reconcilePendingIssues(
+    folderPaths.map((path) => ({
+      path,
+      actionType: SyncActionType.FolderDeferred,
       issueCode: "unanchored-shared-folder",
-    }),
-    expect.objectContaining({
-      path: ".obsidian/plugins",
-      issueCode: "unanchored-shared-folder",
-    }),
-  ]);
+      reason: "folder.identity-unknown",
+      updatedAt: 1,
+    })),
+    [],
+  );
   const reviewed = readySnapshot(
     await harness.executor.getSharedFolderIdentityResolutionSnapshot(
       ".obsidian/plugins",

@@ -21,6 +21,8 @@ interface ReleaseMetadataFiles {
     name?: string;
     version?: string;
     minAppVersion?: string;
+    isDesktopOnly?: boolean;
+    author?: string;
     description?: string;
   } | null;
   versions: Record<string, string> | null;
@@ -32,6 +34,16 @@ interface ReleaseMetadataFiles {
 
 const SEMVER = /^\d+\.\d+\.\d+$/;
 const MAX_DESCRIPTION_LENGTH = 250;
+
+/** Release baseline for fields the shape checks cannot protect. The values are
+ *  the release facts registered in `docs/core/CURRENT_STATUS.md`; a deliberate
+ *  change must update that register and the Release Notes in the same round
+ *  (the gate turns red here so the pair cannot drift apart silently). */
+const RELEASE_BASELINE = {
+  minAppVersion: "1.11.4",
+  isDesktopOnly: false,
+  author: "Jiao Yingxing",
+};
 
 /** 与个人脚本同一套规则：返回问题清单（空数组＝通过）与告警清单。 */
 function collectMetadataIssues(files: ReleaseMetadataFiles): {
@@ -62,6 +74,21 @@ function collectMetadataIssues(files: ReleaseMetadataFiles): {
     }
     if (!SEMVER.test(String(manifest.minAppVersion ?? ""))) {
       issues.push(`manifest.json minAppVersion is not semver x.y.z: ${manifest.minAppVersion}`);
+    }
+    if (manifest.minAppVersion !== RELEASE_BASELINE.minAppVersion) {
+      issues.push(
+        `manifest.json minAppVersion=${manifest.minAppVersion} is off the release baseline ${RELEASE_BASELINE.minAppVersion} (a deliberate raise must update CURRENT_STATUS and the Release Notes in the same round)`,
+      );
+    }
+    if (manifest.isDesktopOnly !== RELEASE_BASELINE.isDesktopOnly) {
+      issues.push(
+        `manifest.json isDesktopOnly=${String(manifest.isDesktopOnly)} is off the release baseline ${String(RELEASE_BASELINE.isDesktopOnly)} (mobile eligibility; a deliberate change must update CURRENT_STATUS and the Release Notes in the same round)`,
+      );
+    }
+    if (manifest.author !== RELEASE_BASELINE.author) {
+      issues.push(
+        `manifest.json author=${String(manifest.author)} is off the release baseline "${RELEASE_BASELINE.author}" (a deliberate change must update CURRENT_STATUS and the Release Notes in the same round)`,
+      );
     }
     if (!manifest.id || !manifest.name) {
       issues.push("manifest.json is missing required identity fields (id / name)");
@@ -150,6 +177,8 @@ describe("release metadata alignment gate", () => {
         name: "EasySync",
         version: "1.6.0",
         minAppVersion: "1.11.4",
+        isDesktopOnly: false,
+        author: "Jiao Yingxing",
         description: "OneDrive sync for Obsidian.",
       },
       versions: { "1.6.0": "1.11.4" },
@@ -170,6 +199,18 @@ describe("release metadata alignment gate", () => {
       [
         "description without period",
         { ...aligned, manifest: { ...aligned.manifest!, description: "no period here" } },
+      ],
+      [
+        "minAppVersion baseline drift",
+        { ...aligned, manifest: { ...aligned.manifest!, minAppVersion: "1.12.3" } },
+      ],
+      [
+        "desktop-only regression",
+        { ...aligned, manifest: { ...aligned.manifest!, isDesktopOnly: true } },
+      ],
+      [
+        "author drift",
+        { ...aligned, manifest: { ...aligned.manifest!, author: "Someone Else" } },
       ],
     ];
 

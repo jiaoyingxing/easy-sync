@@ -20,6 +20,7 @@ import { sha256Hex } from "../src/crypto";
 import { StateManager } from "../src/sync/state-manager";
 import type { SyncStateEnvelopeV2 } from "../src/sync/state-envelope-v2";
 import type {
+  BaseFileEntry,
   MutationLedgerEntryV1,
   RemoteFileEntry,
 } from "../src/sync/types";
@@ -242,6 +243,67 @@ describe("StateManager V2 production controller", () => {
     expect(harness.rawAdapter.write.mock.calls.some(
       ([path]) => path === paths.baseContentFile,
     )).toBe(false);
+  });
+
+  it("publishes one ancestor-manifest refresh for one eight-entry base batch", async () => {
+    const committed = envelope();
+    const entries: BaseFileEntry[] = [];
+    const contentByPath = new Map<string, string>();
+    for (let index = 0; index < 8; index++) {
+      const path = `Notes/batch-${index}.md`;
+      const content = `batch ${index}\n`;
+      const bytes = new TextEncoder().encode(content);
+      const hash = await sha256Hex(bytes);
+      const driveId = `file-batch-${index}`;
+      const eTag = `etag-batch-${index}`;
+      committed.remoteIndex.itemsById[driveId] = {
+        id: driveId,
+        parentId: folder.driveId,
+        name: `batch-${index}.md`,
+        kind: "file",
+        size: bytes.byteLength,
+        mtime: index,
+        eTag,
+        cTag: `ctag-batch-${index}`,
+        contentHash: hash,
+      };
+      committed.anchors.byAnchorId[`file:${driveId}`] = {
+        anchorId: `file:${driveId}`,
+        remoteId: driveId,
+        lastPath: path,
+        contentHash: hash,
+        size: bytes.byteLength,
+        remoteETag: eTag,
+        confirmedAt: 1,
+        confirmedBy: "equal-read",
+      };
+      entries.push({
+        path,
+        hash,
+        size: bytes.byteLength,
+        eTag,
+      });
+      contentByPath.set(path, content);
+    }
+    const harness = makeHarness({ committed });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    for (const entry of entries) {
+      state.cacheBaseContent(entry.path, contentByPath.get(entry.path)!);
+    }
+    harness.rawAdapter.list.mockClear();
+
+    const ancestorHashes = await state.upsertBaseEntries(entries);
+
+    expect(Object.keys(ancestorHashes)).toHaveLength(entries.length);
+    // Old implementation rebuilt the whole manifest once per file (8 lists of
+    // the object directory); one checkpoint batch now rebuilds it once.
+    expect(harness.rawAdapter.list.mock.calls.filter(
+      ([path]) => path === paths.ancestorsV2Dir,
+    )).toHaveLength(1);
+    expect(JSON.parse(
+      harness.files.get(paths.ancestorManifestV2File)!,
+    ).textHashes).toEqual(Object.values(ancestorHashes).sort());
   });
 
   it("commits a proven remote scope recovery candidate and invalidates old decisions", async () => {

@@ -157,11 +157,17 @@ interface SyncIdleObservationDiag {
  *   fact),
  * - `downloadUrl`: a Graph pre-signed token that legitimately expires and
  *   refreshes between unchanged rounds.
+ * - `error`: evidence-only failure facts (A3, 2026-10-26) — bytes moved, tier
+ *   and retry count legitimately differ between two rounds that changed
+ *   nothing, so counting them as "facts changed" would silently disarm the
+ *   idle-spin detector. Excluded, the fingerprint of a row stays byte-identical
+ *   to what it was before the field existed.
  */
 const VOLATILE_FACT_KEYS = new Set([
   "updatedAt",
   "consecutiveFailures",
   "downloadUrl",
+  "error",
 ]);
 
 /** Compact an error checkpoint (full base/remote arrays on every recorded

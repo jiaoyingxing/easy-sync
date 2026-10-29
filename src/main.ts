@@ -1,7 +1,7 @@
 import {
   structuredCloneImplementation,
 } from "./structured-clone-compat";
-import { EventRef, Menu, Notice, Platform, Plugin, requestUrl, setIcon, setTooltip, TFile, TFolder, WorkspaceLeaf } from "obsidian";
+import { EventRef, Menu, Notice, Plugin, requestUrl, setIcon, setTooltip, TFile, TFolder, WorkspaceLeaf } from "obsidian";
 
 import {
   fetchLatestStableVersion,
@@ -30,9 +30,11 @@ import {
   type AnimationFrameHandle,
   getConfigDir,
   getEasySyncPaths,
+  hostPlatformFacts,
   IntervalHandle,
   isRecord,
   TimeoutHandle,
+  type HostPlatformFacts,
 } from "./obsidian-compat";
 import { OneDriveClient } from "./onedrive/client";
 import type { EasySyncRepositoryDetection } from "./onedrive/client";
@@ -94,7 +96,17 @@ import {
   SyncProgressStore,
 } from "./sync/sync-progress";
 import { resolveSyncActionPresentation } from "./sync/sync-action-presentation";
-import { DiagnosticLogger, type DiagCategory } from "./sync/diagnostic-logger";
+import {
+  DiagnosticLogger,
+  type DiagCategory,
+  type DiagEntry,
+} from "./sync/diagnostic-logger";
+import {
+  describeMissingRunSummaries,
+  DIAG_RUN_SUMMARY_LIMIT,
+  formatDiagRunSummaryTable,
+  type DiagRunSummary,
+} from "./sync/diagnostic-run-summary";
 import { EasySyncSettingTab } from "./ui/settings-tab";
 import {
   EasySyncSyncView,
@@ -125,6 +137,7 @@ import type {
   PlanReviewAuthorization,
   RemoteFileEntry,
   ScanConfig,
+  SyncFileErrorFactV1,
   SyncPlan,
 } from "./sync/types";
 import {
@@ -179,6 +192,10 @@ import {
 import { readBakedBuildVersion } from "./build-version";
 import { sha256Hex } from "./crypto";
 import {
+  collectDownloadTransferEvidence,
+  formatDownloadTransferSection,
+} from "./sync/diagnostic-download-evidence";
+import {
   buildConflictEvidence,
   computeChangedPluginDataKeys,
   type DiagnosticResetFacts,
@@ -192,9 +209,11 @@ import {
   formatBuildVersionEvidence,
   formatDiagnosticAutomaticSyncSummary,
   formatRecentPluginDataWrites,
+  formatSyncFileErrorFactSuffix,
   formatV2StorageAuthorityEvidence,
   parseDiagnosticResetFacts,
   PRE_RESET_REPORT_EMBED_CHAR_LIMIT,
+  projectSyncFileErrorFactColumns,
   projectSyncHistoryActionCounts,
   resetPhasePrefix,
   RecentPluginDataWriteLog,
@@ -223,6 +242,14 @@ import {
   type LocalOnlyEntryRowV1,
 } from "./sync/local-only-copies";
 import { isLocalOnlyPathIgnored } from "./sync/local-only-ignore-memory";
+import {
+  isSyncDecisionTokenLike,
+  localDeleteDecisionPathHash,
+  localDeleteDecisionRecordToken,
+  localFolderDeleteDecisionPathHash,
+  localFolderDeleteDecisionRecordToken,
+  type LocalDeleteDecisionScopeV1,
+} from "./sync/local-delete-decision";
 import type { LocalFileEntry } from "./sync/types";
 import {
   countLocalOnlyEditedFacts,
@@ -701,7 +728,9 @@ type DiagnosticReportRenderContext = {
 
 /** Values declared inside a report section and consumed by a later section. */
 type DiagnosticReportProvidedValues = {
-  diagAll: Awaited<ReturnType<DiagnosticLogger["snapshot"]>>;
+  diagAll: DiagEntry[];
+  /** Rounds bypassed from the same snapshot before its 500-entry window. */
+  runSummaries: DiagRunSummary[];
   remoteScopeRecoverySummary:
     | StateManager["syncHistory"][number]["remoteScopeRecovery"]
     | NonNullable<EasySyncPlugin["progressStore"]>["state"]["recoveryVerification"];
@@ -724,6 +753,10 @@ export default class EasySyncPlugin extends Plugin {
   progressStore: SyncProgressStore = new SyncProgressStore();
   noticeCenter: EasySyncNoticeCenter = new EasySyncNoticeCenter();
   i18n: I18n = new I18n("en");
+  /** Platform facts this plugin instance acts on (device runtime + UI mode).
+   *  Per-instance injection point for tests; production keeps the live
+   *  `Platform`-backed defaults. Never a module-level mutable switch. */
+  platformFacts: HostPlatformFacts = hostPlatformFacts;
 
   /** Bound translator for builders/modals that expect a plain I18nFn. */
   private get t() {
@@ -821,6 +854,13 @@ export default class EasySyncPlugin extends Plugin {
   private readonly autoSyncDirtyHint = new AutoSyncDirtyHint(
     () => this.runAutomaticSync("dirty"),
   );
+  /** Local paths this plugin is erasing itself. Their vault delete events are
+   *  already represented in the committed state, so they must not arm a
+   *  follow-up automatic round (2026-10-28 iOS mixed-batch report: the
+   *  batch's own erases re-triggered sync after it finished). Entries are
+   *  one-shot and expire in case a host drops the event. */
+  private readonly selfDeletedLocalPaths = new Map<string, number>();
+  private static readonly SELF_DELETE_EVENT_TTL_MS = 30_000;
   /** Busy-retry wheel for this session's single startup round: the first
    *  attempt fires as soon as auth and state are both ready, and hands further
    *  attempts here when the sync surface is busy (same semantics as the local
@@ -1056,7 +1096,7 @@ export default class EasySyncPlugin extends Plugin {
 
   async onload(): Promise<void> {
     this.startupPerformance.begin(
-      Platform.isMobile ? "mobile" : "desktop",
+      this.platformFacts.isMobileApp ? "mobile" : "desktop",
     );
     this.diag.log("lifecycle", "====== onload start ======");
     this.diag.log(
@@ -1074,7 +1114,7 @@ export default class EasySyncPlugin extends Plugin {
     // ════ ② Auth (create, register callback, then background-init) ════
 
     const authBrowser = createAuthBrowserLauncher({
-      isDesktopApp: Platform.isDesktopApp,
+      isDesktopApp: this.platformFacts.isDesktopApp,
     });
     const authCtx: AuthPluginContext = {
       secretStorage: {
@@ -1216,6 +1256,7 @@ export default class EasySyncPlugin extends Plugin {
       this.diag,
       getConfigDir(this.app.vault),
       this.manifest.id,
+      this.platformFacts,
     );
     this.syncExecutor = new SyncExecutor(
       this.onedrive,
@@ -1228,19 +1269,14 @@ export default class EasySyncPlugin extends Plugin {
       this.app.fileManager,
       () => {
         this.updateStatusBar();
-        this.syncView?.render();
+        // 侧栏动作的字节进度也按每块触发：同样只走轻量数字补丁。
+        this.syncView?.renderProgress();
         this.settingsTab?.refreshSyncState();
       },
       this.operationLifecycle,
       this.noticeCenter,
-      (sample) => {
-        this.transferRateSampler.addCallSample(
-          sample.direction,
-          sample.bytes,
-          sample.ms,
-          sample.at,
-        );
-      },
+      this.platformFacts,
+      (path) => this.noteSelfDeletedLocalPath(path),
     );
     this.syncExecutor.setAutomaticHandlingPolicy(this.automaticHandlingPolicy);
     this.syncExecutor.setSyncDirection(this.syncDirection);
@@ -1250,11 +1286,11 @@ export default class EasySyncPlugin extends Plugin {
 
     // ════ ④ Register UI (Obsidian is usable from here on) ════
 
-    this.settingsTab = new EasySyncSettingTab(this);
+    this.settingsTab = new EasySyncSettingTab(this, this.platformFacts);
     this.addSettingTab(this.settingsTab);
     this.registerView(
       SYNC_VIEW_TYPE,
-      (leaf: WorkspaceLeaf) => new EasySyncSyncView(leaf, this),
+      (leaf: WorkspaceLeaf) => new EasySyncSyncView(leaf, this, this.platformFacts),
     );
     this.registerEvent(this.app.workspace.on(
       "layout-change",
@@ -1480,7 +1516,7 @@ export default class EasySyncPlugin extends Plugin {
       state,
       cloud,
       ...(path === undefined ? {} : { path }),
-    }).open();
+    }, this.platformFacts).open();
   }
 
   // ════ Update reminder (方案单 20260915-0025) ════
@@ -1734,7 +1770,7 @@ export default class EasySyncPlugin extends Plugin {
    */
   async openSyncPanelFromSettings(): Promise<void> {
     await this.activateSyncView();
-    if (Platform.isMobile) this.closePluginSettings();
+    if (this.platformFacts.isMobile) this.closePluginSettings();
   }
 
   private async runSideActionIntent(
@@ -1751,21 +1787,31 @@ export default class EasySyncPlugin extends Plugin {
       | "notice.mutationResolution.failed",
     action: (executor: SyncExecutor, state: StateManager) => Promise<void>,
     requireIdleSideActions = false,
+    /** A confirmed batch waits for a round that is already running instead of
+     *  bouncing off it: the executor drains that round before it takes the
+     *  side-action queue (iOS 2026-10-27, 2,000 confirmed rows dropped by a
+     *  1–5 s round). Every other blocker keeps the ordinary busy notice. */
+    tolerateRunningRound = false,
   ): Promise<boolean> {
     const executor = this.syncExecutor;
     const state = this.state;
     if (!executor || !state) return false;
 
     const rejectBusy = (): boolean => {
-      if (this.opLock === null
-        && !executor.isRunning
-        && (!requireIdleSideActions || !executor.hasSideActionsInFlight)) {
+      if (
+        (
+          this.opLock === null
+          || (tolerateRunningRound && this.opLock === "sync")
+        )
+        && (tolerateRunningRound || !executor.isRunning)
+        && (!requireIdleSideActions || !executor.hasSideActionsInFlight)
+      ) {
         return false;
       }
       // The reason must name the actual blocker: a running round, the exact
       // lock holder, or another in-flight side action. One generic sentence
       // for all three read as a lie while the bar looked idle.
-      const reason = executor.isRunning
+      const reason = executor.isRunning && !tolerateRunningRound
         ? this.i18n.t("result.alreadyRunning")
         : this.opLock !== null
           ? this.i18n.t("result.lockBusyWithHolder", {
@@ -1972,12 +2018,162 @@ export default class EasySyncPlugin extends Plugin {
     );
   }
 
-  confirmRemoteDelete(path: string): Promise<boolean> {
-    return this.runSideActionIntent(
-      path,
+  /**
+   * Confirm one cloud-deletion follow row.
+   *
+   * File rows become a device-local decision consumed by the next plan; the
+   * plan path owns every local delete. Folder rows (and pre-token legacy rows)
+   * keep the existing side-action exit, which is outside this slice.
+   */
+  async confirmRemoteDelete(path: string): Promise<boolean> {
+    await this.ensureStateLoaded();
+    return this.confirmLocalDeletePaths([path]);
+  }
+
+  /**
+   * Write the device-local confirmation facts for the requested rows, then
+   * enqueue the whole batch into the side-action queue (files first, folders
+   * after). A round that is already running is waited out inside the queued
+   * task - no second plan round is started. The decision records are the
+   * crash/failure net only: if the queued batch never runs, the next plan
+   * converts the same rows; once the batch deletes them the records prune.
+   */
+  private async confirmLocalDeletePaths(
+    paths: readonly string[],
+  ): Promise<boolean> {
+    const state = this.state;
+    if (!state) return false;
+    // A running sync round must not drop a confirmed batch (the 2,000-row iOS
+    // case), but any other operation lock (reset, auth, another lifecycle
+    // owner) still closes this entry. Reading/writing the decision is local
+    // and does not take the side-action queue.
+    if (this.opLock !== null && this.opLock !== "sync") {
+      const holder = this.i18n.t(this.opHolderNameKey(this.opLock));
+      this.noticeCenter.show({
+        key: `local-delete-decision:busy:${paths[0] ?? ""}`,
+        message: this.i18n.t("notice.delete.failed", {
+          reason: this.i18n.t("result.lockBusyWithHolder", { holder }),
+        }),
+        priority: NOTICE_PRIORITY.attention,
+        className: "easy-sync-notice-action",
+      });
+      return false;
+    }
+    const pendingRows = Array.isArray(state.pendingRemoteDeletes)
+      ? state.pendingRemoteDeletes
+      : [];
+    const requested = new Set(paths);
+    const pending = pendingRows.filter((item) => requested.has(item.path));
+    if (pending.length === 0) return false;
+    // Decisions are a V2 plan input. Every pre-V2 or recovery-blocked case
+    // keeps the existing side-action exit, so a record can never be written
+    // in a state whose plan path cannot consume it.
+    const canUseDecisions = state.isV2StateActive === true
+      && state.hasV2StateLoadRecoveryBlock !== true
+      && state.hasV2RemoteScopeRecovery !== true;
+    const decisionScope = canUseDecisions
+      ? this.getLocalDeleteDecisionScope()
+      : null;
+    const folderRecordToken = decisionScope
+      ? localFolderDeleteDecisionRecordToken(decisionScope)
+      : null;
+    const decisionGroups = new Map<string, {
+      kind: "file" | "folder";
+      paths: string[];
+      hashes: string[];
+    }>();
+    for (const item of pending) {
+      if (!canUseDecisions) continue;
+      if (item.folder) {
+        // A folder row carries a committed anchor instead of a file decision
+        // token. Only the row the user actually saw (requiresConfirmation)
+        // can be recorded, and only inside the bound scope.
+        const hash = decisionScope && item.requiresConfirmation === true
+          ? localFolderDeleteDecisionPathHash(item, decisionScope)
+          : null;
+        if (!folderRecordToken || hash === null) continue;
+        const group = decisionGroups.get(folderRecordToken) ?? {
+          kind: "folder" as const,
+          paths: [],
+          hashes: [],
+        };
+        group.paths.push(item.path);
+        group.hashes.push(hash);
+        decisionGroups.set(folderRecordToken, group);
+        continue;
+      }
+      const token = item.decisionToken;
+      if (!isSyncDecisionTokenLike(token)) continue;
+      const recordToken = localDeleteDecisionRecordToken(token);
+      const group = decisionGroups.get(recordToken) ?? {
+        kind: "file" as const,
+        paths: [],
+        hashes: [],
+      };
+      group.paths.push(item.path);
+      group.hashes.push(localDeleteDecisionPathHash(token, item.path));
+      decisionGroups.set(recordToken, group);
+    }
+    if (decisionGroups.size > 0) {
+      try {
+        for (const [recordToken, group] of decisionGroups) {
+          await state.addLocalDeleteDecisions({
+            kind: group.kind,
+            recordToken,
+            paths: group.paths,
+            hashes: group.hashes,
+          });
+        }
+      } catch (error) {
+        const reason = describeError(error);
+        this.diag.warn(
+          "state",
+          "failed to record a local delete decision",
+          reason,
+        );
+        this.noticeCenter.show({
+          key: "local-delete-decision:failed",
+          message: this.i18n.t("notice.delete.failed", { reason }),
+          priority: NOTICE_PRIORITY.failure,
+          className: "easy-sync-notice-action",
+        });
+        return false;
+      }
+    }
+    // 确认＝入列（2026-10-27 用户拍板）：整批一次送入现役 side-action 队列，
+    // 文件先、文件夹后；正有轮在跑时批次排在轮后，由队列任务等待执行，不再
+    // 开第二轮计划。决定记录只在入列失败/崩溃后由计划兜底，不在本路径执行。
+    const enqueueOk = await this.runSideActionIntent(
+      pending[0].path,
       "notice.delete.failed",
-      (executor) => executor.confirmRemoteDelete(path),
+      (executor) =>
+        executor.confirmRemoteDeletes(pending.map((item) => item.path)),
+      false,
+      true,
     );
+    if (!enqueueOk && decisionGroups.size === 0) return false;
+    this.updateStatusBar();
+    this.syncView?.render();
+    this.settingsTab?.refreshSyncState();
+    return true;
+  }
+
+  /**
+   * Bound scope for device-local folder decision facts. It uses the same
+   * committed scope the plan seals against; a missing state/scope keeps the
+   * folder row on its existing side-action exit.
+   */
+  getLocalDeleteDecisionScope(): LocalDeleteDecisionScopeV1 | null {
+    const state = this.state;
+    if (!state?.isV2StateActive) return null;
+    const scope = state.remoteScope;
+    const accountId = state.boundAccountId;
+    if (!scope || !accountId) return null;
+    return {
+      vaultName: this.app.vault.getName(),
+      accountId,
+      scope,
+    };
   }
 
   /** 片④ 单向模式：把一条本机独有条目上传到云端（侧栏「上传到云端」）。 */
@@ -2047,9 +2243,9 @@ export default class EasySyncPlugin extends Plugin {
     this.settingsTab?.refreshSyncState();
   }
 
-  confirmRemoteDeletes(paths: readonly string[]): Promise<boolean> {
+  async confirmRemoteDeletes(paths: readonly string[]): Promise<boolean> {
     const requestedPaths = [...new Set(paths)];
-    if (requestedPaths.length === 0) return Promise.resolve(false);
+    if (requestedPaths.length === 0) return false;
     // 批量删除确认后先弹一条总入队提示，避免用户误以为系统卡死。提示走
     // ambient 过滤（遵循「通知弹窗」设置），用户关闭提示时不弹；处理中
     // 不再重复提示，进度由侧栏顶部进度展示承接。
@@ -2060,17 +2256,8 @@ export default class EasySyncPlugin extends Plugin {
       category: "ambient",
       className: "easy-sync-notice-action",
     });
-    return this.runSideActionIntent(
-      requestedPaths[0],
-      "notice.delete.failed",
-      (executor, state) => {
-        const requested = new Set(requestedPaths);
-        const currentPaths = state.pendingRemoteDeletes
-          .filter((item) => requested.has(item.path))
-          .map((item) => item.path);
-        return executor.confirmRemoteDeletes(currentPaths);
-      },
-    );
+    await this.ensureStateLoaded();
+    return this.confirmLocalDeletePaths(requestedPaths);
   }
 
   async getEmptyFolderResolutionSnapshot(
@@ -2385,12 +2572,14 @@ export default class EasySyncPlugin extends Plugin {
       onProgress: (current, total, currentFile) => {
         this.handleProgress(current, total, currentFile);
         this.updateStatusBar();
-        this.syncView?.render();
+        // 逐项数字走轻量路径（每文件都会打一次）：顶部计数、进度条、当前
+        // 文件名、在飞徽标与新增完成行，不整屏重建。
+        this.syncView?.renderProgress();
       },
       onFileProgress: (downloaded, total) => {
         this.handleFileProgress(downloaded, total);
       },
-      onFileComplete: (path, actionType, success, reason, fileSize, sourcePath) => {
+      onFileComplete: (path, actionType, success, reason, fileSize, sourcePath, error) => {
         this.handleFileComplete(
           path,
           actionType,
@@ -2398,7 +2587,11 @@ export default class EasySyncPlugin extends Plugin {
           reason,
           fileSize,
           sourcePath,
+          error,
         );
+      },
+      onFileReverted: (path, reason) => {
+        this.handleFileReverted(path, reason);
       },
       onFirstSyncPreview: mode === "first"
         ? async (plan) => this.showPlanAlert("firstSync", plan)
@@ -2424,7 +2617,10 @@ export default class EasySyncPlugin extends Plugin {
     if (this.vaultCloudClientNoticeShown) return;
     this.vaultCloudClientNoticeShown = true;
     try {
-      const detection = detectVaultCloudClientEnvironment(this.app.vault);
+      const detection = detectVaultCloudClientEnvironment(
+        this.app.vault,
+        this.platformFacts,
+      );
       if (!detection.detected || !detection.service) return;
       this.diag.log(
         "state",
@@ -2991,27 +3187,35 @@ export default class EasySyncPlugin extends Plugin {
     // round continues normally.
     await this.attemptV2StateReloadSelfHeal();
     if (!this.state.hasV2StateLoadRecoveryBlock) return false;
-    if (mode !== "auto") await this.activateSyncView();
-    const recoverV2CorruptState =
-      mode !== "auto"
-      && this.state.v2CorruptStateRecoveryEvidence !== null;
-    if (recoverV2CorruptState && !await this.checkAccountBinding()) {
-      return true;
+    // From here the block flow owns the entry: on success it presents the
+    // block result itself, and on failure it presents the "did not start"
+    // notice. Keeping the rejection inside this segment means a caller's
+    // entry catch can never replace that result notice with a second one.
+    try {
+      if (mode !== "auto") await this.activateSyncView();
+      const recoverV2CorruptState =
+        mode !== "auto"
+        && this.state.v2CorruptStateRecoveryEvidence !== null;
+      if (recoverV2CorruptState && !await this.checkAccountBinding()) {
+        return true;
+      }
+      const reviewedAuthorization =
+        recoverV2CorruptState && this.state.planReviewActive
+          ? this.state.planReviewAuthorization ?? undefined
+          : undefined;
+      await this.dispatchSyncRun({
+        mode,
+        skipConfirmation: reviewedAuthorization !== undefined,
+        reviewedAuthorization,
+        options: recoverV2CorruptState
+          ? { recoverV2CorruptState: true }
+          : undefined,
+        logLabel,
+        renderAfter: true,
+      });
+    } catch (error) {
+      this.presentSyncEntryFailure(error, "v2 state load block flow");
     }
-    const reviewedAuthorization =
-      recoverV2CorruptState && this.state.planReviewActive
-        ? this.state.planReviewAuthorization ?? undefined
-        : undefined;
-    await this.dispatchSyncRun({
-      mode,
-      skipConfirmation: reviewedAuthorization !== undefined,
-      reviewedAuthorization,
-      options: recoverV2CorruptState
-        ? { recoverV2CorruptState: true }
-        : undefined,
-      logLabel,
-      renderAfter: true,
-    });
     return true;
   }
 
@@ -3084,6 +3288,8 @@ export default class EasySyncPlugin extends Plugin {
       logLabel: "plan review execution result",
       renderAfter: true,
     });
+    } catch (error) {
+      this.presentSyncEntryFailure(error, "plan review execution");
     } finally {
       this.releaseOpLock();
     }
@@ -3117,12 +3323,15 @@ export default class EasySyncPlugin extends Plugin {
       || baseCount > 0;
   }
 
-  /** 同步入口占用：一次同步（手动／首同步／审阅确认／自动／后台恢复）已拿到
-   *  共享操作锁，但执行器可能还没开跑——这段要先做云端仓库检测、账号核对与
-   *  运行前准备，首同步实测 6.5 秒以上。三个载体（侧栏状态行、桌面状态栏、
-   *  Ribbon）必须读同一份事实，否则这段会被呈现成空闲（2026-10-10 拍板）。 */
+  /** 同步入口占用：任意持锁者都占入口。手动同步在第一步 acquireOpLock，
+   *  非 sync 持有者（重置／登出／参与核对／突变恢复／路径设置）同样让点击
+   *  在入口弹回 busy 提示——三个载体（侧栏状态行、桌面状态栏、Ribbon）若只
+   *  认 sync 持有者，这段就被呈现成空闲、面板挂着「立即同步」而点击全部
+   *  弹回（2026-10-28 真机：需要处理行在场，点击无轮次、无拒绝日志）。
+   *  sync 持有者的准备期（云端仓库检测、账号核对、运行前准备）实测 6.5 秒
+   *  以上，这段本就按占用呈现（2026-10-10 拍板），现在对全部持有者同档。 */
   get isSyncEntryInProgress(): boolean {
-    return this.opLock === "sync";
+    return this.opLock !== null;
   }
 
   /** 入口只读准备期是否可取消（2026-10-10 R1）：armed 期间侧栏主动作显示现役
@@ -3702,6 +3911,10 @@ export default class EasySyncPlugin extends Plugin {
       },
       logLabel: "first sync result",
     });
+    } catch (error) {
+      // A rejection here means the run never started (executor.run owns
+      // in-run errors); the lock is still released by the finally below.
+      this.presentSyncEntryFailure(error, "first sync");
     } finally {
       this.releaseOpLock();
     }
@@ -3709,13 +3922,40 @@ export default class EasySyncPlugin extends Plugin {
 
   /** One-shot feedback for sync-entry clicks while sync work already holds
    *  the operation lock; reuses the executor's own "already running" phrase.
-   *  Feedback category (no explicit category) shows at every popups level. */
+   *  Feedback category (no explicit category) shows at every popups level.
+   *  Each bounce also names the current holder in the log — a dead-click
+   *  report with zero rejection lines cannot otherwise say WHO held the
+   *  entry (2026-10-28 真机窗口持锁者只能靠排除法反推). */
   private showSyncBusyHint(): void {
+    this.diag?.log(
+      "state",
+      "sync entry click bounced — operation lock held",
+      { holder: this.opLock },
+    );
     this.noticeCenter?.show({
       key: "sync-busy-hint",
       message: this.i18n.t("result.alreadyRunning"),
       priority: NOTICE_PRIORITY.action,
       durationMs: 2_000,
+    });
+  }
+
+  /** Unified presentation for a sync entry that was rejected before the run
+   *  could start: one diagnostic line keeps the cause, one failure Notice
+   *  gives the user feedback. Feedback category (no explicit category) shows
+   *  at every popups level; the single key updates in place on repeats. */
+  private presentSyncEntryFailure(error: unknown, context: string): void {
+    this.diag?.error(
+      "state",
+      `sync entry did not start (${context})`,
+      describeError(error),
+    );
+    this.noticeCenter?.show({
+      key: "sync-entry-failed",
+      message: this.i18n.t("result.syncNotStarted", {
+        message: describeError(error),
+      }),
+      priority: NOTICE_PRIORITY.failure,
     });
   }
 
@@ -3778,6 +4018,8 @@ export default class EasySyncPlugin extends Plugin {
       },
       logLabel: "manual sync result",
     });
+    } catch (error) {
+      this.presentSyncEntryFailure(error, "manual sync");
     } finally {
       this.releaseOpLock();
     }
@@ -4105,9 +4347,9 @@ export default class EasySyncPlugin extends Plugin {
   /** Track byte-level progress for the current file download */
   private handleFileProgress(downloaded: number, total: number): void {
     this.progressStore?.setByteProgress(downloaded, total);
-    // render() uses requestAnimationFrame — multiple calls per frame are
-    // coalesced, so calling on every byte chunk is safe and efficient.
-    this.syncView?.render();
+    // 每个字节块都会到这里：只走轻量数字补丁（同一帧内合并），整屏重建由
+    // 状态回调负责。
+    this.syncView?.renderProgress();
     this.scheduleSyncNoticeUpdate();
   }
 
@@ -4119,6 +4361,10 @@ export default class EasySyncPlugin extends Plugin {
     reason?: string,
     fileSize?: number,
     sourcePath?: string,
+    /** A3 (2026-10-26): evidence-only failure facts from the executor. Stored
+     *  on the progress row (and therefore on the history entry) verbatim; it
+     *  never changes the row's status, wording or any decision. */
+    error?: SyncFileErrorFactV1,
   ): void {
     const safelyDeferred = actionType === SyncActionType.RetryLater
       || actionType === SyncActionType.FolderDeferred;
@@ -4134,13 +4380,27 @@ export default class EasySyncPlugin extends Plugin {
       reason,
       fileSize,
       failedAt: status === "error" ? Date.now() : undefined,
+      ...(error ? { error } : {}),
     });
     this.scheduleSyncNoticeUpdate();
-    // Surface the completed row immediately: the next onProgress only fires
-    // when the following item starts, so without this the completed rows —
-    // and the last one in particular — would wait until round end.
-    // render() coalesces per frame, same as handleFileProgress.
-    this.syncView?.render();
+    // Surface the completed row immediately: the pool reports each file as its
+    // own PUT and receipt land, so the row must not wait for the batch's shared
+    // checkpoint or the round end. renderProgress() coalesces per frame and only
+    // patches the top numbers plus the diffed completed list.
+    this.syncView?.renderProgress();
+  }
+
+  /**
+   * A row already shown as done is not durable after all: its batch's shared
+   * checkpoint failed, or the round was cancelled before that checkpoint
+   * committed. Flip the row where it stands and keep the reason — a shown
+   * success never disappears silently. The file's own work is still recorded
+   * in the mutation receipts; the next round's recovery settles it.
+   */
+  private handleFileReverted(path: string, reason: string): void {
+    if (!this.progressStore.revertCompletedFile(path, reason)) return;
+    this.scheduleSyncNoticeUpdate();
+    this.syncView?.renderProgress();
   }
 
   async cancelSync(): Promise<void> {
@@ -4939,6 +5199,7 @@ export default class EasySyncPlugin extends Plugin {
         filesMoved: result.filesMoved,
         deleted: result.deleted,
         conflicts: result.conflicts,
+        remoteDeletePending: result.remoteDeletePending,
         deferred: result.deferred,
         skipped: result.skippedLarge + result.skippedIgnored
           + result.skippedInvalidName,
@@ -4954,7 +5215,6 @@ export default class EasySyncPlugin extends Plugin {
         files: [...progress.completedFiles],
         uploadBytes: result.metrics?.uploadBytes,
         uploadReadMs: result.metrics?.uploadReadMs,
-        uploadNetworkMs: result.metrics?.uploadNetworkMs,
         peakUploads: result.metrics?.peakUploads,
         transferRates: transferRateFacts ?? undefined,
         recovery: newRecovery ?? priorRecoveryWithoutEntry,
@@ -5110,6 +5370,16 @@ export default class EasySyncPlugin extends Plugin {
           (entry) => entry.intent.operationId === blockedOperationId,
         )
       : undefined;
+    const paths: string[] = [];
+    const seenPaths = new Set<string>();
+    const pushPath = (path: string | undefined | null): void => {
+      if (!path || seenPaths.has(path)) return;
+      seenPaths.add(path);
+      paths.push(path);
+    };
+    pushPath(firstBlockedRecord?.intent.path);
+    for (const entry of mutationLedger) pushPath(entry.intent.path);
+    for (const entry of recoveryQuarantine) pushPath(entry.record.intent.path);
     return {
       kind,
       total,
@@ -5122,6 +5392,8 @@ export default class EasySyncPlugin extends Plugin {
       firstPath: firstBlockedRecord?.intent.path
         ?? mutationLedger[0]?.intent.path
         ?? null,
+      paths,
+      exhausted: scheduler.state === "exhausted",
       blockReason,
       blockedOperationId,
       paused: this.autoSyncPaused,
@@ -5704,6 +5976,28 @@ export default class EasySyncPlugin extends Plugin {
     }
   }
 
+  /** Remember that the plugin itself is erasing this path. The matching vault
+   *  delete event is not a new local change: its checkpoint is (or is about to
+   *  be) committed by the mutation that erased it. */
+  private noteSelfDeletedLocalPath(path: string): void {
+    const now = Date.now();
+    for (const [key, expiresAt] of this.selfDeletedLocalPaths) {
+      if (expiresAt <= now) this.selfDeletedLocalPaths.delete(key);
+    }
+    this.selfDeletedLocalPaths.set(
+      path,
+      now + EasySyncPlugin.SELF_DELETE_EVENT_TTL_MS,
+    );
+  }
+
+  /** One-shot consume: each plugin erase owns at most one delete event. */
+  private consumeSelfDeletedLocalPath(path: string): boolean {
+    const expiresAt = this.selfDeletedLocalPaths.get(path);
+    if (expiresAt === undefined) return false;
+    this.selfDeletedLocalPaths.delete(path);
+    return expiresAt > Date.now();
+  }
+
   private markLocalDirtyFolderHint(path: string, oldPath?: string): void {
     if (!this.canScheduleLocalChangeAutoSync()) return;
     const currentIncluded =
@@ -5738,6 +6032,11 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private async handleLocalVaultDelete(file: { path: string }): Promise<void> {
+    // The erase was the plugin's own follow-delete/cleanup: its committed
+    // checkpoint already accounts for it, and arming the local-change hint
+    // here only produced an extra automatic round after every deletion batch
+    // (2026-10-28 iOS mixed-batch report).
+    if (this.consumeSelfDeletedLocalPath(file.path)) return;
     if (!(file instanceof TFolder)) {
       this.markLocalDirtyHint(file.path);
       this.scheduleCommunityPluginInventoryRevisionForPaths(
@@ -8417,10 +8716,11 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   /** Passive connection-speed reading (EWMA over real transferred bytes —
-   *  no probe requests). Session-local: null until the first transfer sample
-   *  of this session exists (the pre-2026-10-24 reload seeding could never
-   *  conjure a fresh reading anyway — the 10s freshness window excludes
-   *  stale seeds). */
+   *  no probe requests). Session-local: null until one payload-sized sample
+   *  has been measured (small-file sync stays hidden — 18 B per file measures
+   *  request cost, not the link; 用户拍板 2026-10-27). The pre-2026-10-24
+   *  reload seeding could never conjure a fresh reading anyway — the 10s
+   *  freshness window excludes stale seeds. */
   getTransferRateReading(): TransferRateReading | null {
     return this.transferRateSampler.getReading();
   }
@@ -9252,7 +9552,7 @@ export default class EasySyncPlugin extends Plugin {
           this.readCommunityPluginCloudCleanupMarkers().map((marker) =>
             marker.pluginId
           ),
-        isMobile: Platform.isMobile,
+        isMobile: this.platformFacts.isMobileApp,
         ownPluginId: this.manifest.id,
       });
       const next = reduceCommunityPluginAdoptionMemory(
@@ -9487,7 +9787,7 @@ export default class EasySyncPlugin extends Plugin {
       // A missing artifact must not prevent the report itself from being generated.
     }
     const lines: string[] = [];
-    const platformLabel = Platform.isIosApp ? "iOS" : Platform.isAndroidApp ? "Android" : Platform.isMobile ? "Mobile" : "Desktop";
+    const platformLabel = this.platformFacts.isIosApp ? "iOS" : this.platformFacts.isAndroidApp ? "Android" : this.platformFacts.isMobileApp ? "Mobile" : "Desktop";
     const automaticActivity = this.syncExecutor?.isRunning
       ? "同步中"
       : this.opLock !== null
@@ -9526,8 +9826,12 @@ export default class EasySyncPlugin extends Plugin {
     const historyValues = this.renderDiagnosticSyncHistorySection(renderCtx);
     this.renderDiagnosticFailedFileDetailsSection(renderCtx, historyValues);
     this.renderDiagnosticConnectionSpeedSection(renderCtx, historyValues);
+    this.renderDiagnosticDownloadTransferSection(renderCtx, headerValues);
     await this.renderDiagnosticPendingIssuesSection(renderCtx, historyValues);
-    await this.renderDiagnosticAnomaliesSection(renderCtx, headerValues);
+    await this.renderDiagnosticAnomaliesSection(renderCtx, {
+      ...headerValues,
+      formatSize: historyValues.formatSize,
+    });
 
     await this.app.vault.adapter.write(fileName, lines.join("\n"));
     this.noticeCenter.show({
@@ -9759,7 +10063,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
-  private async renderDiagnosticHeaderSection(ctx: DiagnosticReportRenderContext): Promise<Pick<DiagnosticReportProvidedValues, "diagAll" | "remoteScopeRecoverySummary">> {
+  private async renderDiagnosticHeaderSection(ctx: DiagnosticReportRenderContext): Promise<Pick<DiagnosticReportProvidedValues, "diagAll" | "runSummaries" | "remoteScopeRecoverySummary">> {
     const {
       accountFingerprint,
       auth,
@@ -9960,10 +10264,17 @@ export default class EasySyncPlugin extends Plugin {
     }
     lines.push("");
 
-    const diagAll = await this.diag.snapshot(500);
+    const diagSnapshot = await this.diag.snapshot(500);
+    // `entries` keeps the historical 500-entry contract; `runSummaries` is the
+    // pre-window bypass that lets the report show more than the newest round.
+    const diagAll = diagSnapshot.entries;
+    const runSummaries = diagSnapshot.runSummaries;
     lines.push("## 云客户端同步环境");
     lines.push("");
-    const cloudEnvironment = detectVaultCloudClientEnvironment(this.app.vault);
+    const cloudEnvironment = detectVaultCloudClientEnvironment(
+      this.app.vault,
+      this.platformFacts,
+    );
     if (!cloudEnvironment.assessable) {
       lines.push("**仓库位置**: 移动端无法判定（平台不提供仓库本地路径）");
     } else if (cloudEnvironment.detected && cloudEnvironment.service) {
@@ -10012,7 +10323,7 @@ export default class EasySyncPlugin extends Plugin {
     }
     lines.push("");
 
-    return { diagAll, remoteScopeRecoverySummary };
+    return { diagAll, runSummaries, remoteScopeRecoverySummary };
   }
 
   /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
@@ -10042,6 +10353,10 @@ export default class EasySyncPlugin extends Plugin {
         const pending = resolveSyncPendingAttentionCounts(
           h.conflicts,
           h.files,
+          // New entries carry the executor's direct split; legacy entries fall
+          // back to counting ConfirmLocalDelete rows inside `files` (which the
+          // 100-success retention cap can truncate).
+          h.remoteDeletePending,
         );
         const recovery = h.recovery
           ? formatMutationRecoveryHistory(
@@ -10087,7 +10402,16 @@ export default class EasySyncPlugin extends Plugin {
       for (const f of failedFiles) {
         const action = formatActionLabel(f.actionType);
         const size = formatSize(f.fileSize);
-        lines.push(`- \`${f.path}\` (${size}) — ${action} (${f.reason ?? "未知错误"}) — ${fmtShort(f.failedAt ?? f.historyStartedAt)}`);
+        // A3 (2026-10-26): evidence suffix on the same line — error class,
+        // HTTP status, Graph code, bytes moved / file size, waterfall tier,
+        // retry attempts. Legacy rows without `error` print "—" for every cell
+        // instead of guessing; nothing here changes the row's own wording.
+        const evidence = formatSyncFileErrorFactSuffix(
+          f.error,
+          formatSize,
+          f.fileSize,
+        );
+        lines.push(`- \`${f.path}\` (${size}) — ${action} (${f.reason ?? "未知错误"}) — ${fmtShort(f.failedAt ?? f.historyStartedAt)} ${evidence}`);
       }
       lines.push("");
     }
@@ -10133,6 +10457,26 @@ export default class EasySyncPlugin extends Plugin {
 
   }
 
+  /**
+   * 诊断报告区块：下载通道 / 分段序列 / 回退 / 校验（2026-10-28，S1 预留）。
+   *
+   * 只在诊断日志开关打开时追加：开关关闭时必须一个字符都不多，现役报告的
+   * 逐字形状由测试钉住。数据本应来自下载写在日志里的结构化 payload（报告
+   * 不解析日志文本）；2026-10-28 回退删除了移动端分块/流式/择优三层，证据
+   * 生产者随之消失，区块照常出现、单元格显示 `—`，等未来通道重新接线。
+   */
+  private renderDiagnosticDownloadTransferSection(
+    ctx: DiagnosticReportRenderContext,
+    prior: Pick<DiagnosticReportProvidedValues, "diagAll">,
+  ): void {
+    if (!this.diagLogEnabled) return;
+    ctx.lines.push(
+      ...formatDownloadTransferSection(
+        collectDownloadTransferEvidence(prior.diagAll),
+      ),
+    );
+  }
+
   /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
   private async renderDiagnosticPendingIssuesSection(ctx: DiagnosticReportRenderContext, prior: Pick<DiagnosticReportProvidedValues, "formatSize">): Promise<void> {
     const {
@@ -10161,11 +10505,15 @@ export default class EasySyncPlugin extends Plugin {
     if (pendingItems.length > 0) {
       lines.push(`### 待处理项（${pendingItems.length}）`);
       lines.push("");
-      lines.push("| 文件 | 大小 | 操作 | 原因 | 最后尝试 |");
-      lines.push("|------|------|------|------|----------|");
+      // A3 (2026-10-26): the last four columns are evidence only (error class,
+      // bytes already moved, waterfall tier, retry attempts). Rows written
+      // before the fact existed print "—" in all four.
+      lines.push("| 文件 | 大小 | 操作 | 原因 | 最后尝试 | 错误 | 已传 | 层级 | 重试 |");
+      lines.push("|------|------|------|------|----------|------|------|------|------|");
       for (const f of pendingItems) {
         const action = formatActionLabel(f.actionType);
-        lines.push(`| ${f.path} | ${formatSize(f.fileSize)} | ${action} | ${f.reason ?? "—"} | ${fmtShort(f.updatedAt)} |`);
+        const evidence = projectSyncFileErrorFactColumns(f.error, formatSize);
+        lines.push(`| ${f.path} | ${formatSize(f.fileSize)} | ${action} | ${f.reason ?? "—"} | ${fmtShort(f.updatedAt)} | ${evidence.errorType} | ${evidence.transferred} | ${evidence.tier} | ${evidence.attempts} |`);
       }
     } else {
       lines.push("*无待处理项*");
@@ -10217,7 +10565,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   /** Diagnostic report section (extracted verbatim; pushes into ctx.lines). */
-  private async renderDiagnosticAnomaliesSection(ctx: DiagnosticReportRenderContext, prior: Pick<DiagnosticReportProvidedValues, "diagAll" | "remoteScopeRecoverySummary">): Promise<void> {
+  private async renderDiagnosticAnomaliesSection(ctx: DiagnosticReportRenderContext, prior: Pick<DiagnosticReportProvidedValues, "diagAll" | "runSummaries" | "remoteScopeRecoverySummary" | "formatSize">): Promise<void> {
     const {
       fmt,
       fmtShort,
@@ -10231,10 +10579,16 @@ export default class EasySyncPlugin extends Plugin {
     } = ctx;
     const {
       diagAll,
+      formatSize,
       remoteScopeRecoverySummary,
+      runSummaries,
     } = prior;
     // ── Recent Diagnostic Anomalies (from disk logs) ──
-    const latestAutomaticHandlingSummary = findLatestAutomaticHandlingSummary(diagAll);
+    // Prefer the newest bypassed round: the same entries when they still sit in
+    // the 500-entry window, and the only copy when they already rolled out.
+    const latestRunSummary = runSummaries[runSummaries.length - 1];
+    const latestAutomaticHandlingSummary = latestRunSummary?.automatic
+      ?? findLatestAutomaticHandlingSummary(diagAll);
     const currentRecoverySummary = {
       ...summarizeMutationRecovery(reportState?.mutationLedger ?? []),
       v2Quarantined:
@@ -10280,9 +10634,12 @@ export default class EasySyncPlugin extends Plugin {
         reportState?.manualMutationResolutionAudit.slice(-1)[0] ?? null,
       autoSyncPaused: this.autoSyncPaused,
     };
-    const latestPhaseSummary = findLatestPhaseSummary(diagAll);
-    const latestNetworkSummary = findLatestNetworkSummary(diagAll);
-    const latestTransferSummary = findLatestTransferSummary(diagAll);
+    const latestPhaseSummary = latestRunSummary?.phase
+      ?? findLatestPhaseSummary(diagAll);
+    const latestNetworkSummary = latestRunSummary?.network
+      ?? findLatestNetworkSummary(diagAll);
+    const latestTransferSummary = latestRunSummary?.transfer
+      ?? findLatestTransferSummary(diagAll);
     const latestSharedProtocolProfileSummary =
       findLatestSharedProtocolProfileSummary(diagAll);
     lines.push("## V2／V3 协议组合核对");
@@ -10325,7 +10682,37 @@ export default class EasySyncPlugin extends Plugin {
       lines.push("*暂无结构化自动处理摘要；开启诊断日志并完成一轮同步后再生成报告。*");
     }
     lines.push("");
-    lines.push("## 最近一轮阶段耗时与请求摘要");
+    lines.push("## 最近 5 轮阶段耗时与请求摘要");
+    lines.push("");
+    lines.push(`**最近 5 轮汇总**（新→旧，最多 ${DIAG_RUN_SUMMARY_LIMIT} 轮）:`);
+    lines.push("");
+    const missingSummaryNote = describeMissingRunSummaries({
+      roundCount: runSummaries.length,
+      diagnosticsEnabled: this.diag.isEnabled("lifecycle"),
+      hasLogEntries: diagAll.length > 0,
+    });
+    if (runSummaries.length > 0) {
+      for (const tableLine of formatDiagRunSummaryTable(runSummaries, {
+        time: fmt,
+        size: formatSize,
+      })) {
+        lines.push(tableLine);
+      }
+      if (missingSummaryNote) {
+        lines.push("");
+        lines.push(`*${missingSummaryNote}*`);
+      }
+      if (runSummaries.some((round) =>
+        !round.phase || !round.network || !round.transfer
+      )) {
+        lines.push("");
+        lines.push("*表中 missing = 该轮没有这条摘要：可能由诊断日志写入失败、该轮未产生，或已滚出最近 3 个日志分段。*");
+      }
+    } else if (missingSummaryNote) {
+      lines.push(`*${missingSummaryNote}*`);
+    }
+    lines.push("");
+    lines.push("**最新一轮详情**:");
     lines.push("");
     if (latestPhaseSummary) {
       lines.push(`**记录时间**: ${fmt(latestPhaseSummary.ts)}`);
@@ -10467,7 +10854,7 @@ export default class EasySyncPlugin extends Plugin {
    * 设置项不受影响）。
    */
   applyMobileStatusBar(): void {
-    if (!Platform.isMobile) return;
+    if (!this.platformFacts.isMobileApp) return;
     if (this.mobileStatusBar) {
       this.enableMobileStatusBar();
     } else {
@@ -10784,7 +11171,6 @@ export default class EasySyncPlugin extends Plugin {
       );
       return;
     }
-
     // The wide status has four attention members (plan review, pending items,
     // a blocking recovery and an active automatic pause); the bar must cover
     // each one it can render specifically or it silently falls through to the

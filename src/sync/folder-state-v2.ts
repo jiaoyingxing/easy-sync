@@ -1,4 +1,4 @@
-import { projectRemoteIndexV2 } from "./remote-index-v2";
+import { projectRemoteIndexV2, type RemoteNodeV2 } from "./remote-index-v2";
 import {
   type FolderAnchorV2,
   type SyncAnchorV2,
@@ -15,6 +15,7 @@ import type {
   LocalFolderEntry,
   LocalFolderDeleteHintV1,
   LocalFolderMoveHintV1,
+  RemoteFolderEntry,
 } from "./types";
 
 type FolderPlanActionV2 =
@@ -140,6 +141,96 @@ export function buildInitialFolderAnchorsV2(input: {
     };
   }
   return sortRecord(anchors);
+}
+
+/**
+ * Incremental form of `buildInitialFolderAnchorsV2`: derive the folder
+ * mappings that are missing but fully determined by current facts — a local
+ * folder and exactly one cloud folder at the same path, under an already
+ * confirmed parent. The bootstrap derives the whole first generation from
+ * complete observations; a later round only needs the branches whose parent is
+ * already known, so the walk starts at the files root and only descends through
+ * confirmed or freshly derived folders.
+ *
+ * Never crosses an unknown parent, a spelling alias, an occupied path, a
+ * preserved path or a path that is a local file. The result is authority for a
+ * state-only anchor commit only; it authorizes no file or folder mutation.
+ */
+export function deriveMissingFolderMappingCandidatesV2(input: {
+  envelope: Pick<SyncStateEnvelopeV2, "remoteIndex" | "folderAnchors" | "scope">;
+  localFiles: readonly LocalFileEntry[];
+  localFolders: readonly LocalFolderEntry[];
+  localFolderScanComplete: boolean;
+  includeFolderPath?: (path: string) => boolean;
+  preserveFolderPath?: (path: string) => boolean;
+}): RemoteFolderEntry[] {
+  if (!input.localFolderScanComplete) return [];
+  if (input.envelope.remoteIndex.complete !== true) return [];
+  if (!input.envelope.folderAnchors) return [];
+
+  const pathById = projectRemoteIndexV2(input.envelope.remoteIndex);
+  const childrenByParent = new Map<string, RemoteNodeV2[]>();
+  for (const node of Object.values(input.envelope.remoteIndex.itemsById)) {
+    if (node.kind !== "folder" || !pathById.has(node.id)) continue;
+    const siblings = childrenByParent.get(node.parentId) ?? [];
+    siblings.push(node);
+    childrenByParent.set(node.parentId, siblings);
+  }
+  const localFolderPaths = new Set(
+    input.localFolders.map((entry) => nfcPath(entry.path)),
+  );
+  const localFilePaths = new Set(
+    input.localFiles.map((entry) => identityPath(entry.path)),
+  );
+  const anchoredByRemoteId = new Map<string, FolderAnchorV2>();
+  const anchoredPaths = new Set<string>();
+  for (const anchor of Object.values(input.envelope.folderAnchors.byAnchorId)) {
+    anchoredByRemoteId.set(anchor.remoteId, anchor);
+    anchoredPaths.add(identityPath(anchor.lastPath));
+  }
+  const include = input.includeFolderPath ?? (() => true);
+  const preserve = input.preserveFolderPath ?? (() => false);
+  const candidates: RemoteFolderEntry[] = [];
+  const visited = new Set<string>();
+
+  const visit = (parentId: string): void => {
+    const children = (childrenByParent.get(parentId) ?? [])
+      .slice()
+      .sort((left, right) =>
+        left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+    for (const child of children) {
+      if (visited.has(child.id)) continue;
+      visited.add(child.id);
+      const path = pathById.get(child.id);
+      if (path === undefined) continue;
+      if (preserve(path)) continue;
+      const existing = anchoredByRemoteId.get(child.id);
+      if (existing) {
+        // A confirmed parent keeps its branch walkable; a drifted anchor is a
+        // boundary and its subtree stays untouched.
+        if (nfcPath(existing.lastPath) === nfcPath(path)) visit(child.id);
+        continue;
+      }
+      if (anchoredPaths.has(identityPath(path))) continue;
+      if (!include(path)) continue;
+      if (!localFolderPaths.has(nfcPath(path))) continue;
+      if (localFilePaths.has(identityPath(path))) continue;
+      candidates.push({
+        path,
+        driveId: child.id,
+        parentId: child.parentId,
+        name: child.name,
+        ...(child.eTag !== undefined ? { eTag: child.eTag } : {}),
+        ...(child.cTag !== undefined ? { cTag: child.cTag } : {}),
+      });
+      visit(child.id);
+    }
+  };
+  visit(input.envelope.scope.filesRootId);
+
+  return candidates.sort((left, right) =>
+    pathDepth(left.path) - pathDepth(right.path)
+    || left.path.localeCompare(right.path));
 }
 
 /**

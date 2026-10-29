@@ -233,6 +233,7 @@ function makeOneDrive(
       isDeltaLinkForVault: vi.fn().mockReturnValue(true),
       setAbortSignal: vi.fn(),
       resetDownloadStrategy: vi.fn(),
+      hasDegradedDownloadPathThisRound: vi.fn().mockReturnValue(false),
       getDelta,
       fullScan: vi.fn().mockResolvedValue([]),
       getFileMetadata: vi.fn().mockResolvedValue(null),

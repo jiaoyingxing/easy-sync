@@ -220,6 +220,209 @@ describe("OneDriveClient run metrics", () => {
   });
 });
 
+describe("OneDriveClient.getDriveItemMetadataByIds chunk isolation", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("falls back per item only for the chunk whose $batch POST failed", async () => {
+    const postCalls: number[] = [];
+    const getCalls: string[] = [];
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockImplementation(async (request) => {
+      const url = String(request.url);
+      if (url.endsWith("/$batch")) {
+        const body = JSON.parse(String(request.body)) as {
+          requests: Array<{ id: string; url: string }>;
+        };
+        postCalls.push(body.requests.length);
+        if (body.requests.length === 20) {
+          return {
+            status: 400,
+            headers: {},
+            json: { error: { code: "invalidRequest", message: "batch rejected" } },
+          } as never;
+        }
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            responses: body.requests.map((entry) => {
+              const id = decodeURIComponent(entry.url.split("/").pop()!);
+              return {
+                id: entry.id,
+                status: 200,
+                headers: {},
+                body: { id, name: `${id}.md`, eTag: `etag-${id}`, file: {} },
+              };
+            }),
+          },
+        } as never;
+      }
+      const id = decodeURIComponent(url.split("/").pop()!);
+      getCalls.push(id);
+      return {
+        status: 200,
+        headers: {},
+        json: {
+          id,
+          name: `${id}.md`,
+          eTag: `etag-${id}`,
+          file: {},
+          parentReference: { id: "files-root-id" },
+        },
+      } as never;
+    });
+    const client = new OneDriveClient(async () => "token");
+    const ids = Array.from({ length: 25 }, (_, index) => `item-${index}`);
+
+    const result = await client.getDriveItemMetadataByIds(ids, "downloadUrlRefresh");
+
+    // Both chunks were attempted through the batch endpoint; only the failed
+    // first chunk degraded to 20 individual reads (the pre-fix behavior threw
+    // out of the whole call and the executor then re-read all 200 ids one by
+    // one — 199 s of the 558 s measured on 2026-10-27).
+    expect(postCalls).toEqual([20, 5]);
+    expect(getCalls).toEqual(ids.slice(0, 20));
+    expect(result.size).toBe(ids.length);
+    expect(result.get("item-3")).toMatchObject({
+      id: "item-3",
+      eTag: "etag-item-3",
+    });
+    expect(result.get("item-24")).toMatchObject({ id: "item-24" });
+    expect(requestSpy).toHaveBeenCalledTimes(22);
+  });
+
+  it("publishes each chunk before the next POST, and an isolated chunk still publishes its fallback reads", async () => {
+    // The download URL refresh lookahead starts a chunk's downloads as soon as
+    // the chunk resolves. Observer contract: publication is per chunk, in input
+    // order, and a chunk whose POST failed publishes exactly its per-item
+    // fallback entries (the caller's per-batch/per-file fallbacks then decide
+    // that chunk only). The returned map stays the complete result.
+    const publishedIds: string[][] = [];
+    let batchPosts = 0;
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (request) => {
+      const url = String(request.url);
+      if (url.endsWith("/$batch")) {
+        batchPosts++;
+        const body = JSON.parse(String(request.body)) as {
+          requests: Array<{ id: string; url: string }>;
+        };
+        if (batchPosts === 1) {
+          return {
+            status: 400,
+            headers: {},
+            json: { error: { code: "invalidRequest", message: "batch rejected" } },
+          } as never;
+        }
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            responses: body.requests.map((entry) => {
+              const id = decodeURIComponent(entry.url.split("/").pop()!);
+              return {
+                id: entry.id,
+                status: 200,
+                headers: {},
+                body: { id, name: `${id}.md`, eTag: `etag-${id}`, file: {} },
+              };
+            }),
+          },
+        } as never;
+      }
+      const id = decodeURIComponent(url.split("/").pop()!);
+      return {
+        status: 200,
+        headers: {},
+        json: { id, name: `${id}.md`, eTag: `etag-${id}`, file: {} },
+      } as never;
+    });
+    const client = new OneDriveClient(async () => "token");
+    const ids = Array.from({ length: 25 }, (_, index) => `item-${index}`);
+
+    const result = await client.getDriveItemMetadataByIds(ids, "downloadUrlRefresh", {
+      onChunkResolved: (chunk) => {
+        publishedIds.push([...chunk.keys()]);
+      },
+    });
+
+    expect(publishedIds).toEqual([ids.slice(0, 20), ids.slice(20)]);
+    expect(batchPosts).toBe(2);
+    expect(result.size).toBe(ids.length);
+    expect(result.get("item-24")).toMatchObject({ id: "item-24" });
+  });
+
+  it("isolates a timed-out $batch POST instead of aborting the whole call", async () => {
+    let perItemReads = 0;
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (request) => {
+      if (String(request.url).endsWith("/$batch")) {
+        // The field incident: the batch POST never produced an HTTP outcome
+        // and the client refuses to retry a non-idempotent method.
+        throw { status: 0, headers: {}, json: {} };
+      }
+      perItemReads++;
+      return {
+        status: 200,
+        headers: {},
+        json: { id: "item-a", name: "a.md", eTag: "etag-a", file: {} },
+      } as never;
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    const result = await client.getDriveItemMetadataByIds(
+      ["item-a"],
+      "downloadUrlRefresh",
+    );
+
+    expect(perItemReads).toBe(1);
+    expect(result.get("item-a")).toMatchObject({ id: "item-a", eTag: "etag-a" });
+  });
+
+  it("still aborts the whole call when the batch read is an auth failure", async () => {
+    let perItemReads = 0;
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (request) => {
+      if (String(request.url).endsWith("/$batch")) {
+        return {
+          status: 401,
+          headers: {},
+          json: { error: { code: "unauthenticated", message: "expired" } },
+        } as never;
+      }
+      perItemReads++;
+      return { status: 200, headers: {}, json: {} } as never;
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(
+      client.getDriveItemMetadataByIds(["item-a"], "downloadUrlRefresh"),
+    ).rejects.toBeInstanceOf(OneDriveError);
+    expect(perItemReads).toBe(0);
+  });
+
+  it("rethrows a failed per-item fallback instead of reporting a missing item", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (request) => {
+      const url = String(request.url);
+      if (url.endsWith("/$batch")) {
+        return {
+          status: 400,
+          headers: {},
+          json: { error: { code: "invalidRequest", message: "batch rejected" } },
+        } as never;
+      }
+      return {
+        status: 400,
+        headers: {},
+        json: { error: { code: "generalException", message: "item read rejected" } },
+      } as never;
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(
+      client.getDriveItemMetadataByIds(["item-a"], "downloadVersionVerify"),
+    ).rejects.toBeInstanceOf(OneDriveError);
+  });
+});
+
 describe("OneDriveClient.downloadBaseline", () => {
   afterEach(() => {
     vi.useRealTimers();

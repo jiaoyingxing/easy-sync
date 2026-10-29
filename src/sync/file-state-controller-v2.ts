@@ -259,6 +259,10 @@ export function upsertBaseStateEnvelopeV2(
  * produced it. The ancestor is part of the same authoritative checkpoint:
  * when the base projection itself is unchanged, attaching new evidence still
  * advances the envelope revision.
+ *
+ * `buildTimings` is an observation-only sink for the wall clock this function
+ * spends inside `validateEnvelope`; it changes no input, output or failure
+ * path and nothing here reads it back.
  */
 export function attachBaseAncestorHashesV2(
   current: SyncStateEnvelopeV2,
@@ -266,9 +270,12 @@ export function attachBaseAncestorHashesV2(
   entries: readonly BaseFileEntry[],
   hashesByPath: Readonly<Record<string, string>>,
   committedAt = Date.now(),
+  buildTimings?: { validateMs: number },
 ): SyncStateEnvelopeV2 {
+  const validateStartedAt = performance.now();
   validateEnvelope(current);
   validateEnvelope(candidate);
+  if (buildTimings) buildTimings.validateMs += performance.now() - validateStartedAt;
   if (!sameSyncScope(current.scope, candidate.scope)) {
     throw new Error("V2 ancestor state scope does not match the committed envelope");
   }
@@ -309,7 +316,9 @@ export function attachBaseAncestorHashesV2(
       committedAt,
     };
   }
+  const nextValidateStartedAt = performance.now();
   validateEnvelope(next);
+  if (buildTimings) buildTimings.validateMs += performance.now() - nextValidateStartedAt;
   return next;
 }
 

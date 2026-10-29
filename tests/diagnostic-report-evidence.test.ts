@@ -344,7 +344,8 @@ describe("diagnostic report evidence", () => {
       "**社区插件过渡或受阻项**",
       "## 自动处理与恢复摘要",
       "## V2／V3 协议组合核对",
-      "## 最近一轮阶段耗时与请求摘要",
+      "## 最近 5 轮阶段耗时与请求摘要",
+      "**最近 5 轮汇总**",
     ]) {
       expect(source).toContain(label);
     }
@@ -369,12 +370,23 @@ describe("diagnostic report evidence", () => {
     expect(source).toContain("findLatestTransferSummary(diagAll)");
     expect(source).toContain("findLatestAutomaticHandlingSummary(diagAll)");
     expect(source).toContain("findLatestSharedProtocolProfileSummary(diagAll)");
+    // A1 (2026-10-26): the 5-round table and its missing reason come from the
+    // pre-window bypass, and the latest JSON prefers that same newest round.
+    expect(source).toContain("formatDiagRunSummaryTable(runSummaries");
+    expect(source).toContain("describeMissingRunSummaries(");
+    expect(source).toContain(
+      "latestRunSummary?.phase\n      ?? findLatestPhaseSummary(diagAll)",
+    );
     expect(source).toContain("**文件传输与本机处理**");
     expect(source).toContain("summarizeMutationRecovery(");
     expect(source).toContain("automaticRecoverySchedulerState");
     expect(source).toContain("formatMutationRecoveryHistory(");
     expect(source).toContain("云端删除待确认");
     expect(source).toContain("resolveSyncPendingAttentionCounts(");
+    // A2 (2026-10-26): the history table must pass the executor's direct split
+    // so capped success rows cannot change the displayed numbers.
+    expect(source).toContain("h.remoteDeletePending,");
+    expect(source).toContain("remoteDeletePending: result.remoteDeletePending,");
     expect(source).toContain("summarizeCommunityPluginSync(");
     expect(source).toContain(
       "fingerprintOpaqueValue(v2StorageAuthority?.databaseId ?? undefined)",

@@ -31,11 +31,14 @@ const PROJECTED_SCRIPTS = new Set([
  * 明确不投影的测试文件（公开仓 `main` 侧也没有它们）。
  * `recovery-rename-spelling-reflection` 是既有名单；后两件＝2026-10-16 定案补入，
  * 待下次投影时从公开仓删除（删除须随投影推送，推送另行授权）。
+ * `dev-cli-wrapper`＝2026-10-29 补入：它测的是开发期宿主包装器 obsidian.mjs
+ * （dev 目录下的 CLI 守卫），本就不在投影面，公开仓没有该脚本。
  */
 const NOT_PROJECTED_TESTS = new Set([
   "tests/recovery-rename-spelling-reflection.test.ts",
   "tests/dev-deploy-safety.test.ts",
   "tests/graph-contract-fixtures.test.ts",
+  "tests/dev-cli-wrapper.test.ts",
 ]);
 
 /** 引号里出现的 scripts 路径（够用的启发式：不走注释与正则误伤）。 */

@@ -28,6 +28,69 @@ const COMMIT_WITNESS_PREFIX = "confirmed-";
 const FILE_SUFFIX = ".json";
 const STAGED_SUFFIX = ".next";
 
+/**
+ * Observation-only commit timing sink.
+ *
+ * The owning `StateManager` passes one mutable bucket object per checkpoint
+ * commit; every layer that takes part adds the wall clock it measured to the
+ * matching bucket and nothing here ever reads a value back. No commit,
+ * validation, recovery or durability decision may branch on these numbers, and
+ * none of them is persisted. The bucket names are the ones the
+ * `v2 commit breakdown` diagnostic line reports.
+ */
+export interface StateV2CommitTimings {
+  /** Record/row preparation and deep clones. */
+  buildMs: number;
+  /** Canonical serialization plus digests (envelope and recovery records). */
+  canonicalMs: number;
+  /** Durable side-record I/O: staged write, exact read-back, rename, witness. */
+  recoveryMs: number;
+  /** IndexedDB transaction and the metadata reads around it. */
+  idbMs: number;
+  /** Five-way split of `buildMs`; the five buckets sum to it. */
+  build: StateV2CommitBuildTimings;
+}
+
+/**
+ * Observation-only five-way split of `buildMs`, the same contract as its
+ * parent sink: every bucket is written by instrumentation around one region,
+ * read only by the `v2 commit breakdown` diagnostic line, never persisted and
+ * never a decision input.
+ *
+ * - `prepareMs` — the durable ledger lookup and record rebinding a checkpoint
+ *   batch does before it starts deriving.
+ * - `cloneMs` — every `structuredClone` the commit pays for a header, a count
+ *   projection or the prepared recovery rows.
+ * - `reduceMs` — reducer derivation (identity projections, row merges, sorts)
+ *   with the validations the reducers run themselves excluded, so reducer work
+ *   and validation never overlap.
+ * - `validateMs` — every `validateEnvelope` call the commit pays, in any layer
+ *   (reducer input/output, ancestor attachment, candidate, publication owner).
+ * - `diffMs` — the remote-node / anchor / folder-anchor row diff the recovery
+ *   delta is computed from.
+ */
+export interface StateV2CommitBuildTimings {
+  prepareMs: number;
+  cloneMs: number;
+  reduceMs: number;
+  validateMs: number;
+  diffMs: number;
+}
+
+/**
+ * Add one measured build phase to its own bucket and to the parent `buildMs`,
+ * so the five sub-buckets always sum to the bucket the diagnostic row already
+ * reports. Measurement only.
+ */
+export function addBuildPhaseMs(
+  timings: StateV2CommitTimings,
+  phase: keyof StateV2CommitBuildTimings,
+  elapsedMs: number,
+): void {
+  timings.buildMs += elapsedMs;
+  timings.build[phase] += elapsedMs;
+}
+
 interface StateV2IndexedDbRecoveryCheckpointV1 {
   schemaVersion: 1;
   kind: "indexeddb-recovery-checkpoint";
@@ -240,10 +303,15 @@ export class StateV2IndexedDbRecoveryStore {
     next: SyncStateEnvelopeV2,
     options: {
       previousEnvelopeDigest?: string;
+      timings?: StateV2CommitTimings;
     } = {},
   ): Promise<StateV2IndexedDbPreparedRecoveryDelta> {
+    const validateStartedAt = performance.now();
     validateEnvelope(previous);
     validateEnvelope(next);
+    if (options.timings) {
+      addBuildPhaseMs(options.timings, "validateMs", performance.now() - validateStartedAt);
+    }
     return this.prepareValidatedDelta(previous, next, options);
   }
 
@@ -257,8 +325,10 @@ export class StateV2IndexedDbRecoveryStore {
     next: SyncStateEnvelopeV2,
     options: {
       previousEnvelopeDigest?: string;
+      timings?: StateV2CommitTimings;
     } = {},
   ): Promise<StateV2IndexedDbPreparedRecoveryDelta> {
+    const timings = options.timings;
     if (!sameSyncScope(previous.scope, next.scope)) {
       throw new Error("IndexedDB recovery delta cannot change sync scope");
     }
@@ -272,7 +342,10 @@ export class StateV2IndexedDbRecoveryStore {
         "IndexedDB recovery delta cannot move lifecycle epoch backwards",
       );
     }
+    const directoryStartedAt = performance.now();
     await this.ensureDirectory();
+    if (timings) timings.recoveryMs += performance.now() - directoryStartedAt;
+    const diffStartedAt = performance.now();
     const remoteNodes = diffRows(
       previous.remoteIndex.itemsById,
       next.remoteIndex.itemsById,
@@ -285,21 +358,33 @@ export class StateV2IndexedDbRecoveryStore {
       previous.folderAnchors?.byAnchorId ?? {},
       next.folderAnchors?.byAnchorId ?? {},
     );
+    if (timings) {
+      addBuildPhaseMs(timings, "diffMs", performance.now() - diffStartedAt);
+    }
+    const previousDigestStartedAt = performance.now();
     const previousEnvelopeDigest = options.previousEnvelopeDigest
       ?? await digestValidatedEnvelope(previous);
+    if (timings) {
+      timings.canonicalMs += performance.now() - previousDigestStartedAt;
+    }
     if (!isSha256Hex(previousEnvelopeDigest)) {
       throw new Error(
         "IndexedDB recovery previous envelope digest is invalid",
       );
     }
+    const nextDigestStartedAt = performance.now();
+    const nextEnvelopeDigest = await digestValidatedEnvelope(next);
+    if (timings) {
+      timings.canonicalMs += performance.now() - nextDigestStartedAt;
+    }
+    const headerStartedAt = performance.now();
     const unsigned = {
       schemaVersion: 1 as const,
       kind: "indexeddb-recovery-delta" as const,
       previousCommitSeq: previous.meta.commitSeq,
       nextCommitSeq: next.meta.commitSeq,
       previousEnvelopeDigest,
-      nextEnvelopeDigest:
-        await digestValidatedEnvelope(next),
+      nextEnvelopeDigest,
       nextHeader: stateV2EnvelopeHeader(next),
       remoteNodeUpserts: remoteNodes.upserts,
       remoteNodeDeletes: remoteNodes.deletes,
@@ -308,15 +393,25 @@ export class StateV2IndexedDbRecoveryStore {
       folderAnchorUpserts: folderAnchors.upserts,
       folderAnchorDeletes: folderAnchors.deletes,
     };
+    if (timings) {
+      addBuildPhaseMs(timings, "cloneMs", performance.now() - headerStartedAt);
+    }
+    const recordDigestStartedAt = performance.now();
     const delta: StateV2IndexedDbRecoveryDeltaV1 = {
       ...unsigned,
       recordDigest: await canonicalRecordDigest(unsigned),
     };
+    if (timings) {
+      timings.canonicalMs += performance.now() - recordDigestStartedAt;
+    }
+    const publishStartedAt = performance.now();
     await this.publishImmutable(
       this.deltaPath(next.meta.commitSeq),
       delta,
     );
-    return {
+    if (timings) timings.recoveryMs += performance.now() - publishStartedAt;
+    const cloneStartedAt = performance.now();
+    const prepared = {
       previousCommitSeq: delta.previousCommitSeq,
       nextCommitSeq: delta.nextCommitSeq,
       previousEnvelopeDigest: delta.previousEnvelopeDigest,
@@ -326,16 +421,26 @@ export class StateV2IndexedDbRecoveryStore {
       anchors: structuredClone(anchors),
       folderAnchors: structuredClone(folderAnchors),
     };
+    if (timings) {
+      addBuildPhaseMs(timings, "cloneMs", performance.now() - cloneStartedAt);
+    }
+    return prepared;
   }
 
   async confirmCommittedDelta(
     committed: SyncStateEnvelopeV2,
     expectedEnvelopeDigest?: string,
+    timings?: StateV2CommitTimings,
   ): Promise<void> {
+    const validateStartedAt = performance.now();
     validateEnvelope(committed);
+    if (timings) {
+      addBuildPhaseMs(timings, "validateMs", performance.now() - validateStartedAt);
+    }
     await this.confirmValidatedCommittedDelta(
       committed,
       expectedEnvelopeDigest,
+      timings,
     );
   }
 
@@ -346,13 +451,20 @@ export class StateV2IndexedDbRecoveryStore {
   async confirmValidatedCommittedDelta(
     committed: SyncStateEnvelopeV2,
     expectedEnvelopeDigest?: string,
+    timings?: StateV2CommitTimings,
   ): Promise<void> {
+    const directoryStartedAt = performance.now();
     await this.ensureDirectory();
+    if (timings) timings.recoveryMs += performance.now() - directoryStartedAt;
+    const readStartedAt = performance.now();
     const delta = await this.readDelta(
       this.deltaPath(committed.meta.commitSeq),
     );
+    if (timings) timings.recoveryMs += performance.now() - readStartedAt;
+    const digestStartedAt = performance.now();
     const envelopeDigest = expectedEnvelopeDigest
       ?? await digestValidatedEnvelope(committed);
+    if (timings) timings.canonicalMs += performance.now() - digestStartedAt;
     if (!isSha256Hex(envelopeDigest)) {
       throw new Error(
         "IndexedDB recovery commit witness digest is invalid",
@@ -366,6 +478,7 @@ export class StateV2IndexedDbRecoveryStore {
         "IndexedDB recovery commit witness does not match committed state",
       );
     }
+    const headerStartedAt = performance.now();
     const unsigned = {
       schemaVersion: 1 as const,
       kind: "indexeddb-recovery-commit-witness" as const,
@@ -373,14 +486,23 @@ export class StateV2IndexedDbRecoveryStore {
       envelopeDigest,
       deltaRecordDigest: delta.recordDigest,
     };
+    if (timings) {
+      addBuildPhaseMs(timings, "cloneMs", performance.now() - headerStartedAt);
+    }
+    const recordDigestStartedAt = performance.now();
     const witness: StateV2IndexedDbRecoveryCommitWitnessV1 = {
       ...unsigned,
       recordDigest: await canonicalRecordDigest(unsigned),
     };
+    if (timings) {
+      timings.canonicalMs += performance.now() - recordDigestStartedAt;
+    }
+    const publishStartedAt = performance.now();
     await this.publishImmutable(
       this.commitWitnessPath(committed.meta.commitSeq),
       witness,
     );
+    if (timings) timings.recoveryMs += performance.now() - publishStartedAt;
   }
 
   /**
@@ -672,13 +794,20 @@ export class StateV2IndexedDbRecoveryStore {
     } else {
       await this.adapter.write(staged, serialized);
     }
+    // The exact read-back happens once, before the move: it proves that the
+    // bytes about to become an immutable committed record are the intended
+    // ones, and a mismatch still rejects while the target path is absent, so a
+    // bad write can never enter the committed record set. The former second
+    // read-back after `rename` re-read the same bytes this check had already
+    // verified; the only new thing it could observe was a rename that rewrote
+    // content, so it added no proof about the committed bytes and no crash
+    // coverage — a crash between `rename` and a read leaves the target either
+    // absent or complete, exactly as before. Dropping it removes one full read
+    // of the record per immutable publication without relaxing that invariant.
     if (await this.adapter.read(staged) !== serialized) {
       throw new Error("IndexedDB recovery staging failed exact read-back");
     }
     await this.adapter.rename(staged, target);
-    if (await this.adapter.read(target) !== serialized) {
-      throw new Error("IndexedDB recovery record failed committed read-back");
-    }
   }
 
   private async readFutureDeltaSnapshot(

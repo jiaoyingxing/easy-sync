@@ -317,6 +317,7 @@ function makeState(
     planReviewScope: null,
     planReviewDigest: "",
     getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
+    peekCommittedV2Envelope: vi.fn(() => envelope),
     acceptConfirmedDescendantFolderAnchors: vi.fn(async (input) => {
       const reduced = acceptConfirmedDescendantFolderAnchorsV2({
         envelope,
@@ -406,12 +407,20 @@ function makeState(
   state.beginMutationIntent = vi.fn(async (intent) => {
     state.mutationLedger.push({ intent, receipt: null });
   });
+  // Upload batches persist a whole batch; the fake keeps the single-record
+  // observability so existing assertions on the singular API still hold.
+  state.beginMutationIntents = vi.fn(async (intents) => {
+    for (const intent of intents) await state.beginMutationIntent(intent);
+  });
   state.recordMutationReceipt = vi.fn(async (receipt) => {
     const entry = state.mutationLedger.find(
       (candidate) => candidate.intent.operationId === receipt.operationId,
     );
     if (!entry) throw new Error(`Mutation intent missing: ${receipt.operationId}`);
     entry.receipt = receipt;
+  });
+  state.recordMutationReceipts = vi.fn(async (receipts) => {
+    for (const receipt of receipts) await state.recordMutationReceipt(receipt);
   });
   state.abandonMutationIntent = vi.fn(async (operationId) => {
     const index = state.mutationLedger.findIndex(
@@ -516,6 +525,7 @@ function makeOneDrive(
       "@odata.deltaLink": "delta-token-next",
     }),
     resetDownloadStrategy: vi.fn(),
+    hasDegradedDownloadPathThisRound: vi.fn().mockReturnValue(false),
     setAbortSignal: vi.fn(),
     ...overrides,
   } as unknown as OneDriveClient;
@@ -958,7 +968,9 @@ describe("community plugin enablement runtime", () => {
 
   it("does not download a remote manifest solely for desktop inventory display", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = false;
+    Platform.isMobileApp = false;
     try {
       const manifestPath = ".obsidian/plugins/calendar/manifest.json";
       const mainPath = ".obsidian/plugins/calendar/main.js";
@@ -1001,6 +1013,7 @@ describe("community plugin enablement runtime", () => {
       expect(memory.adapter.writeBinary).not.toHaveBeenCalled();
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
@@ -1109,7 +1122,9 @@ describe("community plugin enablement runtime", () => {
 
   it("does not turn a source-bound move hint into executor participation state", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     try {
       const localEnablement = bytes("[]");
       const remoteEnablement = bytes("[\"calendar\"]");
@@ -1191,6 +1206,7 @@ describe("community plugin enablement runtime", () => {
       );
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
@@ -2467,7 +2483,9 @@ describe("community plugin enablement runtime", () => {
 
   it("blocks a host-incompatible selected plugin before writing bundle files", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     try {
       vi.mocked(requireApiVersion).mockReturnValueOnce(false);
       const manifestPath = ".obsidian/plugins/calendar/manifest.json";
@@ -2538,12 +2556,15 @@ describe("community plugin enablement runtime", () => {
       expect(memory.adapter.mkdir).not.toHaveBeenCalled();
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
   it("keeps a desktop-only restore dormant on mobile until a compatible bundle appears", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     try {
       const rootPath = ".obsidian/plugins/calendar";
       const manifestPath = `${rootPath}/manifest.json`;
@@ -2753,12 +2774,15 @@ describe("community plugin enablement runtime", () => {
       expect(uploadFile).not.toHaveBeenCalled();
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
   it("A0-P bounds new-device mobile manifest reads and reuses compatible bytes in bundle staging", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     try {
       const pluginIds = ["alpha", "bravo", "charlie", "delta", "echo"];
       const remoteFolders: RemoteFolderEntry[] = [
@@ -2912,12 +2936,15 @@ describe("community plugin enablement runtime", () => {
       );
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
   it("A0-P reuses source-bound desktop-only evidence after reload so a stable mobile round performs only delta", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     try {
       const rootPath = ".obsidian/plugins/calendar";
       const manifestPath = `${rootPath}/manifest.json`;
@@ -3016,12 +3043,15 @@ describe("community plugin enablement runtime", () => {
       expect(stable.oneDrive.uploadFile).not.toHaveBeenCalled();
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
   it("does not reuse a desktop-only observation from another sync scope", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     try {
       const manifestPath = ".obsidian/plugins/calendar/manifest.json";
       const mainPath = ".obsidian/plugins/calendar/main.js";
@@ -3098,12 +3128,15 @@ describe("community plugin enablement runtime", () => {
       expect(secondDownload).toHaveBeenCalledTimes(1);
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
   it("re-evaluates a mobile non-participant when the remote manifest version changes", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     try {
       const rootPath = ".obsidian/plugins/calendar";
       const manifestPath = `${rootPath}/manifest.json`;
@@ -3202,6 +3235,7 @@ describe("community plugin enablement runtime", () => {
       ]);
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
@@ -3762,8 +3796,10 @@ describe("community plugin enablement runtime", () => {
 
   it("materializes preflighted bundle content for the mobile streamed commit (>= 8 MiB selected plugin)", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     const previousDesktop = Platform.isDesktop;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     Platform.isDesktop = false;
     try {
       const mainPath = ".obsidian/plugins/calendar/main.js";
@@ -3816,6 +3852,7 @@ describe("community plugin enablement runtime", () => {
       ).toBeUndefined();
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
       Platform.isDesktop = previousDesktop;
     }
   });
@@ -3968,12 +4005,14 @@ describe("community plugin enablement runtime", () => {
       .map((call) => String(call[1]))
       .join("\n");
     expect(logText).toContain("identity is ambiguous: calendar");
-    expect(logText).toContain("identity is ambiguous: calendar-copy");
+    expect(logText).toContain("identity is ambiguous: calendar|calendar, calendar-copy");
   });
 
   it("keeps the only locally complete bundle uploadable when same-id peers are remote-only", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     try {
       const calendarMainPath = ".obsidian/plugins/calendar/main.js";
       const calendarManifestPath = ".obsidian/plugins/calendar/manifest.json";
@@ -4079,15 +4118,18 @@ describe("community plugin enablement runtime", () => {
       expect(logText).not.toContain(
         "upload .obsidian/plugins/calendar/main.js FAILED",
       );
-      expect(logText).toContain("identity is ambiguous: calendar-copy");
+      expect(logText).toContain("identity is ambiguous: calendar|calendar, calendar-copy");
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
   it("keeps a case-only local/remote directory spelling out of identity collision and names the exit", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     try {
       const localMainPath = ".obsidian/plugins/terminal/main.js";
       const localManifestPath = ".obsidian/plugins/terminal/manifest.json";
@@ -4207,6 +4249,7 @@ describe("community plugin enablement runtime", () => {
       );
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 

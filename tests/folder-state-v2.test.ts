@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { DriveItem } from "../src/onedrive/types";
 import {
+  deriveMissingFolderMappingCandidatesV2,
   planFolderStateV2,
   projectFolderIdentitiesForMove as projectFolderStateIdentitiesForMove,
 } from "../src/sync/folder-state-v2";
@@ -1932,6 +1933,116 @@ describe("shared folder identity review outcome", () => {
 
     expect(outcome).toEqual({ status: "unavailable" });
   });
+
+  it("summarizes the facts the user can check before confirming", () => {
+    const current = envelope({
+      folders: [
+        { id: "notes", name: "Notes" },
+        { id: "notes-sub", name: "Sub", parentId: "notes" },
+      ],
+      files: [
+        { id: "file-a", name: "a.md", parentId: "notes" },
+        { id: "file-b", name: "b.md", parentId: "notes" },
+        { id: "file-c", name: "c.md", parentId: "notes-sub" },
+      ],
+      folderAnchors: [],
+      fileAnchors: [fileAnchor("file-a", "Notes/a.md")],
+    });
+
+    const outcome = buildSharedFolderIdentityResolutionSnapshotV1("Notes", {
+      envelope: current,
+      localFiles: [
+        localFile("Notes/a.md"),
+        localFile("Notes/b.md", hashB, 20),
+        localFile("Notes/local-only.md"),
+      ],
+      localFolders: localFolders("Notes", "Notes/Sub"),
+      localFolderScanComplete: true,
+    });
+
+    expect(outcome.status).toBe("ready");
+    if (outcome.status !== "ready") return;
+    expect(outcome.snapshot.summary).toEqual({
+      localFiles: 3,
+      localFolders: 1,
+      remoteFiles: 3,
+      remoteFolders: 1,
+      sameNameFiles: 2,
+      sameSizeFiles: 1,
+      localOnlyFiles: 1,
+      remoteOnlyFiles: 1,
+      previouslySyncedFiles: 1,
+    });
+  });
+
+  it("leaves excluded descendants out of the summary", () => {
+    const current = envelope({
+      folders: [
+        { id: "notes", name: "Notes" },
+        { id: "notes-sub", name: "Sub", parentId: "notes" },
+      ],
+      files: [
+        { id: "file-a", name: "a.md", parentId: "notes" },
+        { id: "file-b", name: "b.md", parentId: "notes" },
+        { id: "file-c", name: "c.md", parentId: "notes-sub" },
+      ],
+      folderAnchors: [],
+      fileAnchors: [fileAnchor("file-a", "Notes/a.md")],
+    });
+
+    const outcome = buildSharedFolderIdentityResolutionSnapshotV1("Notes", {
+      envelope: current,
+      localFiles: [
+        localFile("Notes/a.md"),
+        localFile("Notes/b.md", hashB, 20),
+        localFile("Notes/local-only.md"),
+      ],
+      localFolders: localFolders("Notes", "Notes/Sub"),
+      localFolderScanComplete: true,
+      includeFilePath: (path) =>
+        path !== "Notes/local-only.md" && path !== "Notes/Sub/c.md",
+      includeFolderPath: (path) => path !== "Notes/Sub",
+    });
+
+    expect(outcome.status).toBe("ready");
+    if (outcome.status !== "ready") return;
+    expect(outcome.snapshot.summary).toEqual({
+      localFiles: 2,
+      localFolders: 0,
+      remoteFiles: 2,
+      remoteFolders: 0,
+      sameNameFiles: 2,
+      sameSizeFiles: 1,
+      localOnlyFiles: 0,
+      remoteOnlyFiles: 0,
+      previouslySyncedFiles: 1,
+    });
+  });
+
+  it("changes the snapshot revision when the shown counts change", () => {
+    const current = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      files: [
+        { id: "file-a", name: "a.md", parentId: "notes" },
+        { id: "file-b", name: "b.md", parentId: "notes" },
+      ],
+      folderAnchors: [],
+    });
+    const build = (localFiles: LocalFileEntry[]) =>
+      buildSharedFolderIdentityResolutionSnapshotV1("Notes", {
+        envelope: current,
+        localFiles,
+        localFolders: localFolders("Notes"),
+        localFolderScanComplete: true,
+      });
+    const one = build([localFile("Notes/a.md")]);
+    const two = build([localFile("Notes/a.md"), localFile("Notes/b.md")]);
+
+    expect(one.status).toBe("ready");
+    expect(two.status).toBe("ready");
+    if (one.status !== "ready" || two.status !== "ready") return;
+    expect(one.snapshot.revision).not.toBe(two.snapshot.revision);
+  });
 });
 
 describe("V2 move-identity path-copy semantics (D6)", () => {
@@ -1964,5 +2075,195 @@ describe("V2 move-identity path-copy semantics (D6)", () => {
       .toEqual([
         { path: "targetRoot", remoteId: "root-folder" },
       ]);
+  });
+});
+
+describe("V2 derived folder mappings", () => {
+  it("derives an exact same-path pair directly under the files root", () => {
+    const input = envelope({
+      folders: [{ id: "clippings", name: "Clippings" }],
+      folderAnchors: [],
+    });
+
+    expect(deriveMissingFolderMappingCandidatesV2({
+      envelope: input,
+      localFiles: [],
+      localFolders: localFolders("Clippings"),
+      localFolderScanComplete: true,
+    })).toEqual([
+      expect.objectContaining({
+        path: "Clippings",
+        driveId: "clippings",
+        parentId: scope.filesRootId,
+      }),
+    ]);
+  });
+
+  it("derives a nested chain in one top-down pass", () => {
+    const input = envelope({
+      folders: [
+        { id: "un", name: "UNmemos" },
+        { id: "un-assets", name: "assets", parentId: "un" },
+        { id: "un-leaf", name: "UNmemos-8", parentId: "un-assets" },
+      ],
+      folderAnchors: [],
+    });
+
+    expect(deriveMissingFolderMappingCandidatesV2({
+      envelope: input,
+      localFiles: [],
+      localFolders: localFolders("UNmemos", "UNmemos/assets", "UNmemos/assets/UNmemos-8"),
+      localFolderScanComplete: true,
+    }).map((candidate) => candidate.path)).toEqual([
+      "UNmemos",
+      "UNmemos/assets",
+      "UNmemos/assets/UNmemos-8",
+    ]);
+  });
+
+  it("derives only the unanchored child under a confirmed parent", () => {
+    const input = envelope({
+      folders: [
+        { id: "notes", name: "Notes" },
+        { id: "notes-child", name: "child", parentId: "notes" },
+      ],
+      folderAnchors: [folderAnchor("notes", "Notes")],
+    });
+
+    expect(deriveMissingFolderMappingCandidatesV2({
+      envelope: input,
+      localFiles: [],
+      localFolders: localFolders("Notes", "Notes/child"),
+      localFolderScanComplete: true,
+    })).toEqual([
+      expect.objectContaining({
+        path: "Notes/child",
+        driveId: "notes-child",
+        parentId: "notes",
+      }),
+    ]);
+  });
+
+  it("never derives a spelling alias or its subtree", () => {
+    const input = envelope({
+      folders: [
+        { id: "notes", name: "Notes" },
+        { id: "notes-child", name: "child", parentId: "notes" },
+      ],
+      folderAnchors: [],
+    });
+
+    expect(deriveMissingFolderMappingCandidatesV2({
+      envelope: input,
+      localFiles: [],
+      localFolders: localFolders("notes", "notes/child"),
+      localFolderScanComplete: true,
+    })).toEqual([]);
+  });
+
+  it("never derives a path already occupied by another anchor", () => {
+    const input = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      folderAnchors: [folderAnchor("other", "Notes")],
+    });
+
+    expect(deriveMissingFolderMappingCandidatesV2({
+      envelope: input,
+      localFiles: [],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+    })).toEqual([]);
+  });
+
+  it("never re-derives a remote id whose anchor drifted to another path", () => {
+    const input = envelope({
+      folders: [
+        { id: "notes", name: "Notes" },
+        { id: "notes-child", name: "child", parentId: "notes" },
+      ],
+      folderAnchors: [folderAnchor("notes", "OldNotes")],
+    });
+
+    expect(deriveMissingFolderMappingCandidatesV2({
+      envelope: input,
+      localFiles: [],
+      localFolders: localFolders("Notes", "Notes/child"),
+      localFolderScanComplete: true,
+    })).toEqual([]);
+  });
+
+  it("never derives a path that is a local file", () => {
+    const input = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      folderAnchors: [],
+    });
+
+    expect(deriveMissingFolderMappingCandidatesV2({
+      envelope: input,
+      localFiles: [localFile("Notes")],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+    })).toEqual([]);
+  });
+
+  it("respects the include and preserve predicates", () => {
+    const input = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      folderAnchors: [],
+    });
+    const base = {
+      envelope: input,
+      localFiles: [],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+    };
+
+    expect(deriveMissingFolderMappingCandidatesV2({
+      ...base,
+      includeFolderPath: () => false,
+    })).toEqual([]);
+    expect(deriveMissingFolderMappingCandidatesV2({
+      ...base,
+      preserveFolderPath: () => true,
+    })).toEqual([]);
+  });
+
+  it("returns nothing until both sides of the facts are complete", () => {
+    const input = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      folderAnchors: [],
+    });
+    const base = {
+      envelope: input,
+      localFiles: [],
+      localFolders: localFolders("Notes"),
+    };
+
+    expect(deriveMissingFolderMappingCandidatesV2({
+      ...base,
+      localFolderScanComplete: false,
+    })).toEqual([]);
+    expect(deriveMissingFolderMappingCandidatesV2({
+      ...base,
+      envelope: {
+        ...input,
+        remoteIndex: { ...input.remoteIndex, complete: false },
+      } as unknown as SyncStateEnvelopeV2,
+      localFolderScanComplete: true,
+    })).toEqual([]);
+  });
+
+  it("returns nothing when the anchor set is not initialized yet", () => {
+    const input = envelope({
+      folders: [{ id: "notes", name: "Notes" }],
+      folderAnchors: null,
+    });
+
+    expect(deriveMissingFolderMappingCandidatesV2({
+      envelope: input,
+      localFiles: [],
+      localFolders: localFolders("Notes"),
+      localFolderScanComplete: true,
+    })).toEqual([]);
   });
 });

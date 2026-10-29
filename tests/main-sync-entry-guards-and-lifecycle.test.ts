@@ -82,6 +82,7 @@ vi.mock("../src/sync/state-manager", () => ({
   },
   SyncPathMutationRecoveryError: class extends Error {},
   ConservativeResetBlockedError: class extends Error {},
+  MAX_MUTATION_CHECKPOINT_BATCH: 64,
 }));
 
 vi.mock("../src/sync/diagnostic-logger", () => ({
@@ -592,6 +593,41 @@ describe("main sync entry guards", () => {
     expect(executorSource).toContain("fileSize,\n              item.renameFrom,");
   });
 
+  it("renders the sidebar after every completed file while a round produces rows", () => {
+    // A completed row must trigger its own update; batching them behind a
+    // later callback leaves the visible list one item behind — the reported
+    // symptom on iPhone was seeing none of the current round's finished files.
+    // 2026-10-26: that update is the light progress path (`renderProgress`),
+    // which patches the top numbers and prepends the row without rebuilding
+    // the whole view; structural changes still go through `render()`.
+    const plugin = makePlugin();
+    const renderProgress = vi.fn();
+    const render = vi.fn();
+    plugin.app = {
+      workspace: {
+        // The `syncView` getter requires `render` to exist (hot-reload guard).
+        getLeavesOfType: () => [{ view: { render, renderProgress } }],
+      },
+    } as never;
+    const handleFileComplete = (plugin as never as {
+      handleFileComplete: (
+        path: string,
+        actionType: SyncActionType,
+        success: boolean,
+        reason?: string,
+      ) => void;
+    }).handleFileComplete.bind(plugin);
+
+    handleFileComplete("a.md", SyncActionType.Upload, true);
+    handleFileComplete("b.md", SyncActionType.Download, true);
+    handleFileComplete("c.md", SyncActionType.Upload, false, "network");
+
+    expect(renderProgress).toHaveBeenCalledTimes(3);
+    // A completed row never rebuilds the whole view.
+    expect(render).not.toHaveBeenCalled();
+    expect(plugin.progressStore.state.completedFiles).toHaveLength(3);
+  });
+
   it("records the wall-clock failure moment on error rows and renders it in the report failure detail", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-09-15T22:21:09"));
@@ -732,6 +768,33 @@ describe("main sync entry guards", () => {
     await vi.advanceTimersByTimeAsync(60_000);
 
     expect(runAutomaticSync).not.toHaveBeenCalled();
+  });
+
+  it("does not arm a follow-up round for the plugin's own local deletes", async () => {
+    // 2026-10-28 真机反馈：删除批完成后又触发一轮同步。插件自己擦掉的
+    // 本机文件／文件夹，其状态检查点已提交，delete 事件不是新的本机变化。
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 3;
+    plugin.autoSyncPaused = false;
+    const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")
+      .mockResolvedValue(true);
+    const handleLocalVaultDelete = (plugin as never as {
+      handleLocalVaultDelete: (file: { path: string }) => Promise<void>;
+    }).handleLocalVaultDelete.bind(plugin);
+
+    (plugin as never as { noteSelfDeletedLocalPath: (path: string) => void })
+      .noteSelfDeletedLocalPath("notes/a.md");
+    await handleLocalVaultDelete({ path: "notes/a.md" });
+    await vi.advanceTimersByTimeAsync(8_000);
+
+    expect(runAutomaticSync).not.toHaveBeenCalled();
+    expect(plugin.autoSyncDirtyHint.pending).toBe(false);
+
+    // A later ordinary local delete still arms the hint.
+    await handleLocalVaultDelete({ path: "notes/b.md" });
+    expect(plugin.autoSyncDirtyHint.pending).toBe(true);
+    plugin.stopAutoSync();
   });
 
   it("attaches vault lifecycle listeners only after layout ready (host init create flood)", () => {

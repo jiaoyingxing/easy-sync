@@ -25,10 +25,34 @@ interface AncestorManifestV2 {
 
 /** SHA-256 content-addressed, strict UTF-8 ancestor storage. */
 export class AncestorStoreV2 {
+  /** Nesting depth of explicit manifest batches (0 = no batch in progress). */
+  private manifestBatchDepth = 0;
+  /** A putText succeeded since the last manifest publication. */
+  private manifestDirty = false;
+
   constructor(
     private readonly adapter: DataAdapter,
     readonly paths: AncestorStoreV2Paths,
   ) {}
+
+  /**
+   * Coalesce the rebuildable ancestor manifest to one publication for a batch
+   * of putText calls. This is not a transaction: each object is already
+   * durably published and byte-verified before putText resolves, so a crash
+   * inside the batch can only leave the derived inventory behind — never an
+   * unproven ancestor. The next putText/sweep rebuilds the manifest from the
+   * object directory. Nested calls join the outer batch. The callback must
+   * await every putText it starts: the single flush runs after it settles.
+   */
+  async runManifestBatch<T>(work: () => Promise<T>): Promise<T> {
+    this.manifestBatchDepth++;
+    try {
+      return await work();
+    } finally {
+      this.manifestBatchDepth--;
+      if (this.manifestBatchDepth === 0) await this.flushManifest();
+    }
+  }
 
   async putText(content: string | ArrayBuffer): Promise<string | null> {
     const bytes = toStrictUtf8Bytes(content);
@@ -37,7 +61,7 @@ export class AncestorStoreV2 {
     const target = this.pathFor(hash);
     if (await this.adapter.exists(target)) {
       if (!await this.verifyObject(hash)) throw new Error(`Ancestor object is corrupt: ${hash}`);
-      await this.refreshManifestBestEffort();
+      await this.markManifestDirty();
       return hash;
     }
 
@@ -63,7 +87,7 @@ export class AncestorStoreV2 {
       await this.removeIfExists(next);
     }
     if (!await this.verifyObject(hash)) throw new Error(`Ancestor object failed publication: ${hash}`);
-    await this.refreshManifestBestEffort();
+    await this.markManifestDirty();
     return hash;
   }
 
@@ -178,6 +202,24 @@ export class AncestorStoreV2 {
     } catch {
       // Object existence plus hash verification is the publication proof.
     }
+  }
+
+  /** Mark the inventory stale; outside a batch refresh it now. */
+  private async markManifestDirty(): Promise<void> {
+    this.manifestDirty = true;
+    if (this.manifestBatchDepth === 0) await this.flushManifest();
+  }
+
+  /**
+   * Publish one manifest rebuild if a putText succeeded since the last
+   * publication. The dirty flag is cleared first: a failed best-effort
+   * publication stays tolerated exactly as before, and the next put/sweep
+   * rebuilds from the object directory anyway.
+   */
+  private async flushManifest(): Promise<void> {
+    if (!this.manifestDirty) return;
+    this.manifestDirty = false;
+    await this.refreshManifestBestEffort();
   }
 
   private async manifestMatches(

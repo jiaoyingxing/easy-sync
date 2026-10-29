@@ -4,9 +4,10 @@ import {
   inspectRenameTargetAnchorCollisionV2,
   projectFileStatePathViewV2,
   reduceFileStateEnvelopeV2,
+  reduceFileStateEnvelopeV2Deletions,
 } from "../src/sync/file-state-reducer-v2";
 import type { RemoteNodeV2 } from "../src/sync/remote-index-v2";
-import type { SyncStateEnvelopeV2 } from "../src/sync/state-envelope-v2";
+import { validateEnvelope, type SyncStateEnvelopeV2 } from "../src/sync/state-envelope-v2";
 import type {
   BaseFileEntry,
   MutationAction,
@@ -602,3 +603,143 @@ describe("pure V2 file-state reducer", () => {
 function comparePath(left: { path: string }, right: { path: string }): number {
   return left.path < right.path ? -1 : left.path > right.path ? 1 : 0;
 }
+
+describe("batched cleanup-wave reducer", () => {
+  const deletedRemotes = [0, 1, 2, 3].map((index) => remote(
+    `Notes/bulk-${index}.md`,
+    `file-bulk-${index}`,
+    notesFolder.id,
+    hashA,
+    `etag-bulk-${index}`,
+  ));
+  const deletedBases = deletedRemotes.map(
+    (entry) => base(entry.path, hashA, entry.eTag),
+  );
+  const deletionRecords = deletedRemotes.map((entry) => ledger(
+    "deleteRemote",
+    entry.path,
+    checkpoint({
+      remoteDeletes: [entry.path],
+      baseRemovals: [entry.path],
+    }),
+  ));
+
+  it("matches the per-record reducer's state for the same wave", () => {
+    const start = envelope(deletedRemotes, deletedBases);
+    const sequential = deletionRecords.reduce(
+      (current, record) => reduceFileStateEnvelopeV2(current, record),
+      start,
+    );
+    // The commit publishes exactly one revision for the whole wave, so the
+    // sequential result is normalized the way `commitMutationCheckpoints`
+    // normalizes it before the batch comparison.
+    const sequentialPublished: SyncStateEnvelopeV2 = {
+      ...sequential,
+      meta: {
+        ...sequential.meta,
+        commitSeq: start.meta.commitSeq + 1,
+        committedAt: 30,
+      },
+    };
+    expect(reduceFileStateEnvelopeV2Deletions(start, deletionRecords))
+      .toEqual(sequentialPublished);
+  });
+
+  it("returns null when any record is not a plain delete so the caller keeps the per-record path", () => {
+    const start = envelope(deletedRemotes, deletedBases);
+    const upload = ledger(
+      "upload",
+      deletedRemotes[0].path,
+      checkpoint({ baseUpserts: [deletedBases[0]] }),
+    );
+    expect(reduceFileStateEnvelopeV2Deletions(start, [deletionRecords[0], upload]))
+      .toBeNull();
+  });
+
+  it("keeps a 64-deletion wave byte-identical to the per-record reducer", () => {
+    const count = 64;
+    const remotes = Array.from({ length: count }, (_, index) => remote(
+      `${index % 2 === 0 ? "Notes" : "Archive"}/bulk-${index}.md`,
+      `file-bulk-${index}`,
+      index % 2 === 0 ? notesFolder.id : archiveFolder.id,
+      index % 3 === 0 ? hashB : hashA,
+      `etag-bulk-${index}`,
+    ));
+    const bases = remotes.map((entry, index) => base(
+      entry.path,
+      index % 3 === 0 ? hashB : hashA,
+      entry.eTag,
+    ));
+    const records = remotes.map((entry) => ledger(
+      "deleteRemote",
+      entry.path,
+      checkpoint({
+        remoteDeletes: [entry.path],
+        baseRemovals: [entry.path],
+      }),
+    ));
+    const unsortedStart = envelope(remotes, bases);
+    // Published envelopes are key-sorted; the second start exercises the
+    // reducer's already-sorted fast path, the first falls back to the full sort.
+    const sortedStart: SyncStateEnvelopeV2 = {
+      ...unsortedStart,
+      remoteIndex: {
+        ...unsortedStart.remoteIndex,
+        itemsById: Object.fromEntries(
+          Object.entries(unsortedStart.remoteIndex.itemsById)
+            .sort(([left], [right]) => left.localeCompare(right)),
+        ),
+      },
+      anchors: {
+        schemaVersion: 2,
+        byAnchorId: Object.fromEntries(
+          Object.entries(unsortedStart.anchors.byAnchorId)
+            .sort(([left], [right]) => left.localeCompare(right)),
+        ),
+      },
+    };
+
+    for (const start of [unsortedStart, sortedStart]) {
+      const sequential = records.reduce(
+        (current, record) => reduceFileStateEnvelopeV2(current, record),
+        start,
+      );
+      const sequentialPublished: SyncStateEnvelopeV2 = {
+        ...sequential,
+        meta: {
+          ...sequential.meta,
+          commitSeq: start.meta.commitSeq + 1,
+          committedAt: 30,
+        },
+      };
+      const batched = reduceFileStateEnvelopeV2Deletions(start, records)!;
+
+      expect(batched).toEqual(sequentialPublished);
+      // Byte equality pins key order as well as values.
+      expect(JSON.stringify(batched)).toBe(JSON.stringify(sequentialPublished));
+      expect(projectFileStatePathViewV2(batched))
+        .toEqual(projectFileStatePathViewV2(sequentialPublished));
+      expect(() => validateEnvelope(batched)).not.toThrow();
+      expect(batched.meta.commitSeq).toBe(start.meta.commitSeq + 1);
+      expect(batched.meta.committedAt).toBe(30);
+      expect(Object.keys(batched.remoteIndex.itemsById))
+        .toEqual(Object.keys(batched.remoteIndex.itemsById)
+          .slice()
+          .sort((left, right) => left.localeCompare(right)));
+      expect(batched.anchors.byAnchorId).toEqual({});
+    }
+  });
+
+  it("returns the input envelope when a delete wave removes nothing", () => {
+    const start = envelope(deletedRemotes, deletedBases);
+    const missing = ledger(
+      "deleteRemote",
+      "Notes/does-not-exist.md",
+      checkpoint({
+        remoteDeletes: ["Notes/does-not-exist.md"],
+        baseRemovals: ["Notes/does-not-exist.md"],
+      }),
+    );
+    expect(reduceFileStateEnvelopeV2Deletions(start, [missing])).toBe(start);
+  });
+});

@@ -190,7 +190,9 @@ describe("public release 1.1.3 upgrade boundary", () => {
     });
     expect(currentManifest).toMatchObject({
       id: fixture.manifest.id,
-      minAppVersion: fixture.manifest.minAppVersion,
+      // The release floor stays at the pre-chunked 1.11.4 line; the 1.1.3
+      // fixture keeps its historical 1.11.4.
+      minAppVersion: "1.11.4",
       isDesktopOnly: fixture.manifest.isDesktopOnly,
     });
     expect(SS_REFRESH_TOKEN).toBe(fixture.oauth.secretStorageKey);

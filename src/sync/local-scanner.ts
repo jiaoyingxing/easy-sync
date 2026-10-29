@@ -88,6 +88,13 @@ export type LocalFileInspection =
   | { status: "missing" }
   | { status: "present"; entry?: LocalFileEntry }
   | { status: "uncertain"; reason: "excluded" | "stat" | "too-large" | "read" };
+/** Content-free probe for last-instant gates (`inspectFileStat`). Same status
+ *  vocabulary as `LocalFileInspection` minus content facts, so an unreadable
+ *  stat can still fail closed instead of being mistaken for a changed file. */
+export type LocalFileStatInspection =
+  | { status: "missing" }
+  | { status: "present"; size: number; mtime: number }
+  | { status: "uncertain"; reason: "excluded" | "stat" | "too-large" };
 const COMMUNITY_PLUGIN_CODE_FILES = new Set([
   "main.js",
   "manifest.json",
@@ -1407,6 +1414,29 @@ export class LocalScanner {
         binary,
       },
     };
+  }
+
+  /** Read-only, content-free version probe. It applies the same exclusion and
+   *  size gates as `inspectFile` and reads the same `adapter.stat` facts, but
+   *  never reads or hashes the bytes. The confirm-delete wave uses it directly
+   *  before each local erase (2026-10-26) so the window between the reviewed
+   *  SHA-256 guard and one irreversible erase is a single stat, not the whole
+   *  wave. It is a supplementary mtime+size gate, not a content proof. */
+  async inspectFileStat(path: string): Promise<LocalFileStatInspection> {
+    if (isExcluded(path, this.config, this.configDir, this.pluginId)) {
+      return { status: "uncertain", reason: "excluded" };
+    }
+    let stat;
+    try {
+      stat = await this.vault.adapter.stat(path);
+    } catch {
+      return { status: "uncertain", reason: "stat" };
+    }
+    if (!stat) return { status: "missing" };
+    if (stat.size > this.config.maxFileSize) {
+      return { status: "uncertain", reason: "too-large" };
+    }
+    return { status: "present", size: stat.size, mtime: stat.mtime ?? 0 };
   }
 }
 

@@ -10,6 +10,7 @@ export type ContentEqualityProof =
   | "remoteSha256"
   | "verifiedRemoteReceipt"
   | "baseETag"
+  | "baseCTag"
   | "downloadedSha256"
   | "quickXorMismatch"
   | "sizeMismatch"
@@ -27,8 +28,10 @@ interface ContentEqualityInput {
     quickXorHash?: string;
     size: number;
     eTag: string;
+    /** Content version. Recycle-bin restore preserves it while eTag changes. */
+    cTag?: string;
   };
-  base?: Pick<BaseFileEntry, "hash" | "size" | "eTag">;
+  base?: Pick<BaseFileEntry, "hash" | "size" | "eTag"> & { cTag?: string };
   verifiedRemoteHash?: string;
   downloadedHash?: string;
 }
@@ -74,6 +77,15 @@ export function resolveContentEquality(
     return input.local.hash === input.base.hash && input.local.size === input.base.size
       ? { status: "equal", proof: "baseETag" }
       : { status: "different", proof: "baseETag" };
+  }
+
+  // Recycle-bin restore rewrites eTag but keeps cTag. Only an exact match is
+  // used as equality evidence; a mismatch stays unknown here because either
+  // side may lack a cTag, and quickXor already owns definitive difference.
+  if (input.base?.cTag && input.remote.cTag && input.base.cTag === input.remote.cTag) {
+    return input.local.hash === input.base.hash && input.local.size === input.base.size
+      ? { status: "equal", proof: "baseCTag" }
+      : { status: "different", proof: "baseCTag" };
   }
 
   return { status: "unknown", proof: "insufficientEvidence" };

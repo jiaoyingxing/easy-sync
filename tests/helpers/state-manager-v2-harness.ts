@@ -115,6 +115,43 @@ export function envelope(commitSeq = 3): SyncStateEnvelopeV2 {
   };
 }
 
+/**
+ * Synthetic committed envelope with `files` independent file rows under one
+ * folder (plus the matching anchors and one folder anchor). Hot-path and
+ * measurement tests use it when the fixture's three rows are too small for the
+ * cost they are asserting on.
+ */
+export function wideEnvelope(files: number, commitSeq = 3): SyncStateEnvelopeV2 {
+  const rows = envelope(commitSeq);
+  for (let index = 0; index < files; index++) {
+    const name = `wide-${String(index).padStart(5, "0")}.md`;
+    const remoteId = `file-wide-${index}`;
+    const path = `${folder.path}/${name}`;
+    rows.remoteIndex.itemsById[remoteId] = {
+      id: remoteId,
+      parentId: folder.driveId,
+      name,
+      kind: "file",
+      size: 10 + index,
+      mtime: 20 + index,
+      eTag: `etag-wide-${index}`,
+      cTag: `ctag-wide-${index}`,
+      contentHash: hashA,
+    };
+    rows.anchors.byAnchorId[`file:${remoteId}`] = {
+      anchorId: `file:${remoteId}`,
+      remoteId,
+      lastPath: path,
+      contentHash: hashA,
+      size: 10 + index,
+      remoteETag: `etag-wide-${index}`,
+      confirmedAt: 1,
+      confirmedBy: "equal-read",
+    };
+  }
+  return rows;
+}
+
 export function manifest(stateCommitSeq = 1) {
   return {
     schemaVersion: 2,

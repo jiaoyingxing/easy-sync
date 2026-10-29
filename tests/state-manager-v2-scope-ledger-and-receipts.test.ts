@@ -13,12 +13,16 @@ import {
   uploadMutation,
   uploadMutationAt,
   localOnlyDownloadMutation,
+  wideEnvelope,
 } from "./helpers/state-manager-v2-harness";
 import { StateManager } from "../src/sync/state-manager";
 import { canonicalPlanDigestV2 } from "../src/sync/canonical-plan-v2";
+import { reduceFileStateEnvelopeV2 } from "../src/sync/file-state-reducer-v2";
 import type {
   FolderMutationIntentV2,
+  MutationIntentV1,
   MutationLedgerEntryV1,
+  MutationReceiptV1,
 } from "../src/sync/types";
 import { SyncActionType } from "../src/sync/types";
 
@@ -665,10 +669,82 @@ describe("StateManager V2 production controller", () => {
       v2CommitMs: expect.any(Number),
       ledgerClearMs: expect.any(Number),
       totalMs: expect.any(Number),
+      breakdown: {
+        queueMs: expect.any(Number),
+        buildMs: expect.any(Number),
+        canonicalMs: expect.any(Number),
+        recoveryMs: expect.any(Number),
+        idbMs: expect.any(Number),
+        ledgerMs: expect.any(Number),
+        pluginDataMs: expect.any(Number),
+        totalMs: expect.any(Number),
+        build: {
+          prepareMs: expect.any(Number),
+          cloneMs: expect.any(Number),
+          reduceMs: expect.any(Number),
+          validateMs: expect.any(Number),
+          diffMs: expect.any(Number),
+        },
+      },
     });
     expect(metrics.totalMs).toBeGreaterThanOrEqual(
       metrics.ancestorPublishMs + metrics.v2CommitMs + metrics.ledgerClearMs,
     );
+  });
+
+  it("answers the scope-crossing exit kind from the live committed view", async () => {
+    const harness = makeHarness({
+      pluginData: {
+        "easy-sync-local-folder-move-hints": [{
+          version: 1,
+          scope,
+          remoteId: folder.driveId,
+          fromPath: folder.path,
+          toPath: `${folder.path}-moved`,
+          observedAt: 5,
+        }],
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+
+    // Per-item render and action checks read this on every pending row; it
+    // resolves through the live committed view, so the answer has to be the
+    // same one the deep-cloned read would give.
+    expect(state.getScopeCrossingExitKind("Notes/a.md")).toBe("folder");
+    expect(state.getScopeCrossingExitKind("Notes")).toBe("folder");
+    expect(state.getScopeCrossingExitKind("Elsewhere/a.md")).toBeNull();
+
+    // Reading the live view never hands out committed state a caller could
+    // mutate: the detached accessor still isolates the manager's own copy.
+    const detached = state.getCommittedV2Envelope()!;
+    detached.anchors.byAnchorId["file:file-a"]!.lastPath = "tampered.md";
+    expect(
+      state.getCommittedV2Envelope()!.anchors.byAnchorId["file:file-a"]!.lastPath,
+    ).toBe("Notes/a.md");
+    expect(
+      Object.values(harness.readCommitted().anchors.byAnchorId)[0].lastPath,
+    ).toBe("Notes/a.md");
+  });
+
+  it("reports reducer validation time without changing the reduction", () => {
+    const envelope = wideEnvelope(60);
+    const mutation = uploadMutationAt(0);
+    const record = { intent: mutation.intent, receipt: mutation.receipt };
+
+    // The observation sink is measurement only: the same input must produce
+    // the same envelope with and without it, while the sink carries the wall
+    // clock the reducer spent inside `validateEnvelope`.
+    const plain = reduceFileStateEnvelopeV2(structuredClone(envelope), record);
+    const observation = { validateMs: 0 };
+    const observed = reduceFileStateEnvelopeV2(
+      structuredClone(envelope),
+      record,
+      observation,
+    );
+
+    expect(observed).toEqual(plain);
+    expect(observation.validateMs).toBeGreaterThan(0);
   });
 
   it("loads and clears a receipted local-only download without changing ordinary V2 state", async () => {
@@ -754,6 +830,268 @@ describe("StateManager V2 production controller", () => {
     ));
     expect(harness.readCommitted().meta.commitSeq).toBe(sourceCommitSeq + 1);
     expect(metrics.operations).toBe(3);
+  });
+
+  it("publishes a batched delete wave exactly like the per-record reducer and advances content facts", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const source = harness.readCommitted();
+    const factSeqBefore =
+      state.activeV2StorageAuthorityEvidence?.contentFactCommitSeq;
+    const deletedPath = "Notes/a.md";
+    const deletedRemoteId = "file-a";
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: "delete-batch-a",
+      planRevision: 1,
+      scope,
+      action: "deleteRemote",
+      path: deletedPath,
+      expectedLocal: { exists: false },
+      expectedRemote: {
+        exists: true,
+        driveId: deletedRemoteId,
+        eTag: "etag-a",
+        size: 11,
+        sha256Hash: hashA,
+      },
+      createdAt: 10,
+    };
+    const receipt: MutationReceiptV1 = {
+      version: 1,
+      operationId: intent.operationId,
+      completedAt: 40,
+      checkpoint: {
+        baseUpserts: [],
+        baseRemovals: [deletedPath],
+        remoteUpserts: [],
+        remoteDeletes: [deletedPath],
+        pendingConflictRemovals: [],
+        pendingDeleteRemovals: [],
+      },
+    };
+    await state.beginMutationIntent(intent);
+    await state.recordMutationReceipt(receipt);
+    await state.commitMutationCheckpoints([intent.operationId]);
+
+    // The batched publish must be byte-identical to the sequential reducer's
+    // result (one revision, one commit sequence advance).
+    const sequential = reduceFileStateEnvelopeV2(
+      source,
+      { intent, receipt } as MutationLedgerEntryV1,
+    );
+    const committed = harness.readCommitted();
+    expect(committed).toEqual(sequential);
+    expect(JSON.stringify(committed)).toBe(JSON.stringify(sequential));
+    expect(committed.remoteIndex.itemsById[deletedRemoteId]).toBeUndefined();
+    expect(committed.anchors.byAnchorId).toEqual({});
+    // Removing a row is a content fact, so the skipped canonical comparison
+    // must still mark the fact sequence as advanced.
+    expect(state.activeV2StorageAuthorityEvidence?.contentFactCommitSeq)
+      .toBe(committed.meta.commitSeq);
+    expect(state.activeV2StorageAuthorityEvidence?.contentFactCommitSeq)
+      .not.toBe(factSeqBefore);
+  });
+
+  it("skips the whole-envelope content-facts comparison when a checkpoint batch proves the change", async () => {
+    const log = vi.fn();
+    const harness = makeHarness({
+      diag: {
+        warn: vi.fn(),
+        log,
+        isEnabled: () => true,
+      },
+    });
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const mutations = Array.from({ length: 8 }, (_, index) =>
+      uploadMutationAt(index));
+    await state.beginMutationIntents(
+      mutations.map((mutation) => mutation.intent),
+    );
+    await state.recordMutationReceipts(
+      mutations.map((mutation) => mutation.receipt),
+    );
+    const source = harness.readCommitted();
+    log.mockClear();
+
+    await state.commitMutationCheckpoints(
+      mutations.map((mutation) => mutation.intent.operationId),
+    );
+
+    // The W4 probe reports one canonicalization per commit. An upload batch
+    // used to pay two whole-envelope canonicalizations (committed side and
+    // candidate side); the builder now proves the change from the reducer
+    // results, so the skipped flag is the per-commit count: zero.
+    const probes = log.mock.calls.filter(
+      (call) => call[1] === "V2 content-facts canonicalization",
+    );
+    expect(probes).toHaveLength(1);
+    expect(probes[0]?.[2]).toMatchObject({
+      wholeEnvelopeComparisonSkipped: true,
+    });
+
+    const committed = harness.readCommitted();
+    expect(committed.meta.commitSeq).toBe(source.meta.commitSeq + 1);
+    // Skipping the comparison must not lose the evidence it used to derive:
+    // the content-fact sequence still advances with this commit.
+    expect(state.activeV2StorageAuthorityEvidence?.contentFactCommitSeq)
+      .toBe(committed.meta.commitSeq);
+    expect(state.mutationLedger).toEqual([]);
+
+    // A commit whose builder did not prove the change still pays the
+    // comparison, so the flag — not the probe — decides.
+    log.mockClear();
+    await state.removeBaseEntries([mutations[0].remote.path]);
+    const comparisonProbes = log.mock.calls.filter(
+      (call) => call[1] === "V2 content-facts canonicalization",
+    );
+    expect(comparisonProbes).toHaveLength(1);
+    expect(comparisonProbes[0]?.[2]).toMatchObject({
+      wholeEnvelopeComparisonSkipped: false,
+    });
+  });
+
+  it("decomposes one batch checkpoint into the buckets the diagnostic row reports", async () => {
+    const log = vi.fn();
+    const harness = makeHarness({
+      indexedDbActive: true,
+      // A vault-sized identity index: the build phases are O(rows), so the
+      // fixture's three rows would round every sub-bucket down to zero and the
+      // assertion could not tell a measured bucket from an unwritten one.
+      committed: wideEnvelope(200),
+      diag: {
+        warn: vi.fn(),
+        log,
+        isEnabled: () => true,
+      },
+    });
+    // Every durable recovery record is written through the adapter; a real
+    // timer on that write gives the recovery bucket a floor the assertion can
+    // hold on, so the row is proven to be measured and not just zeroes.
+    const RECOVERY_WRITE_MS = 3;
+    const writeWithoutDelay = harness.rawAdapter.write.getMockImplementation()!;
+    harness.rawAdapter.write.mockImplementation(
+      async (path: string, value: string) => {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, RECOVERY_WRITE_MS);
+        });
+        return writeWithoutDelay(path, value);
+      },
+    );
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const mutations = Array.from({ length: 8 }, (_, index) =>
+      uploadMutationAt(index));
+    await state.beginMutationIntents(
+      mutations.map((mutation) => mutation.intent),
+    );
+    await state.recordMutationReceipts(
+      mutations.map((mutation) => mutation.receipt),
+    );
+    log.mockClear();
+
+    const metrics = await state.commitMutationCheckpoints(
+      mutations.map((mutation) => mutation.intent.operationId),
+    );
+
+    // One summary row per checkpoint, with every requested field present.
+    const rows = log.mock.calls.filter(
+      (call) => call[1] === "v2 commit breakdown",
+    );
+    expect(rows).toHaveLength(1);
+    const row = rows[0]?.[2] as {
+      operations: number;
+      queueMs: number;
+      buildMs: number;
+      canonicalMs: number;
+      recoveryMs: number;
+      idbMs: number;
+      ledgerMs: number;
+      pluginDataMs: number;
+      totalMs: number;
+      build: Record<string, number>;
+    };
+    expect(Object.keys(row).sort()).toEqual([
+      "build",
+      "buildMs",
+      "canonicalMs",
+      "idbMs",
+      "ledgerMs",
+      "operations",
+      "pluginDataMs",
+      "queueMs",
+      "recoveryMs",
+      "totalMs",
+    ]);
+    expect(row.operations).toBe(8);
+    const buckets = [
+      "queueMs",
+      "buildMs",
+      "canonicalMs",
+      "recoveryMs",
+      "idbMs",
+      "ledgerMs",
+      "pluginDataMs",
+    ] as const;
+    for (const key of buckets) {
+      expect(Number.isInteger(row[key])).toBe(true);
+      expect(row[key]).toBeGreaterThanOrEqual(0);
+    }
+    // The delta and the commit witness are two immutable writes, so the
+    // recovery bucket must at least hold both waits.
+    expect(row.recoveryMs).toBeGreaterThanOrEqual(2 * RECOVERY_WRITE_MS - 1);
+    // The buckets are measured to add up: only whole-millisecond rounding may
+    // stand between their sum and the commit's own wall clock.
+    const sum = buckets.reduce((total, key) => total + row[key], 0);
+    expect(sum).toBeLessThanOrEqual(row.totalMs);
+    expect(row.totalMs - sum).toBeLessThanOrEqual(buckets.length);
+
+    // `buildMs` is split into its five measured phases, and the split has to
+    // add up to the bucket it decomposes: a phase that silently stopped being
+    // measured would leave its share unattributed and break this identity.
+    expect(Object.keys(row.build).sort()).toEqual([
+      "cloneMs",
+      "diffMs",
+      "prepareMs",
+      "reduceMs",
+      "validateMs",
+    ]);
+    const buildPhases = [
+      "prepareMs",
+      "cloneMs",
+      "reduceMs",
+      "validateMs",
+      "diffMs",
+    ] as const;
+    for (const key of buildPhases) {
+      expect(Number.isInteger(row.build[key])).toBe(true);
+      expect(row.build[key]).toBeGreaterThanOrEqual(0);
+    }
+    const buildSum = buildPhases.reduce(
+      (total, key) => total + row.build[key],
+      0,
+    );
+    expect(Math.abs(buildSum - row.buildMs)).toBeLessThanOrEqual(1);
+    // Eight records over 200 identity rows derive and validate the whole
+    // envelope once per record, so both phases are materially non-zero — the
+    // split is measured, not zero-filled.
+    expect(row.build.reduceMs).toBeGreaterThan(0);
+    expect(row.build.validateMs).toBeGreaterThan(0);
+
+    // The returned metrics carry the same snapshot the row reported.
+    expect(metrics.breakdown).toEqual({
+      queueMs: row.queueMs,
+      buildMs: row.buildMs,
+      canonicalMs: row.canonicalMs,
+      recoveryMs: row.recoveryMs,
+      idbMs: row.idbMs,
+      ledgerMs: row.ledgerMs,
+      pluginDataMs: row.pluginDataMs,
+      totalMs: row.totalMs,
+      build: row.build,
+    });
   });
 
   it("retries only batch ledger cleanup when the shared V2 commit survived", async () => {

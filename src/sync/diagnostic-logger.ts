@@ -19,6 +19,10 @@ import {
   isRecord,
   TimeoutHandle,
 } from "../obsidian-compat";
+import {
+  collectRecentRunSummaries,
+  type DiagRunSummary,
+} from "./diagnostic-run-summary";
 
 export type DiagCategory =
   | "scan"       // 本地扫描
@@ -39,6 +43,16 @@ export interface DiagEntry {
   data?: unknown;
 }
 
+/** What one report read sees: the tail window unchanged, plus the per-round
+ *  summaries that window would otherwise hide. */
+interface DiagnosticSnapshot {
+  /** Recent entries, capped exactly as before (report passes 500). */
+  entries: DiagEntry[];
+  /** Up to 5 most recent rounds, extracted by fixed message name *before* the
+   *  window is applied. Never persisted. */
+  runSummaries: DiagRunSummary[];
+}
+
 const ALL_CATEGORIES: DiagCategory[] = [
   "scan", "plan", "execute", "auth", "onedrive", "state", "lifecycle",
 ];
@@ -48,6 +62,8 @@ const MAX_LOG_DAYS = 7;
 const MAX_LOG_BYTES = 30 * 1024 * 1024;
 const MAX_LOG_FILE_BYTES = 5 * 1024 * 1024;
 const FLUSH_INTERVAL_MS = 5000;
+/** Highest segment suffix rolling will use (`YYYY-MM-DD.99.jsonl`). */
+const MAX_SEGMENT_INDEX = 99;
 /**
  * Backlog cap for entries waiting to reach disk (same order as the memory
  * ring). Background throttling can stall the flush timer for hours; without
@@ -55,6 +71,19 @@ const FLUSH_INTERVAL_MS = 5000;
  * line. Oldest entries are dropped first and the drop is reported to disk.
  */
 export const MAX_PENDING = 5000;
+
+/** The JSONL segment this logger writes, plus the byte count it accounts for
+ *  in that file itself. */
+interface LogSegment {
+  index: number;
+  path: string;
+  /** Bytes this logger expects in the file before the current batch. */
+  bytes: number;
+  /** False when the adapter could not report a size: `bytes` is then only a
+   *  lower bound, so neither the file cap nor the rewrite probe may trust it. */
+  known: boolean;
+}
+
 export class DiagnosticLogger {
   private enabled = new Set<DiagCategory>();
   private buffer: DiagEntry[] = [];
@@ -65,8 +94,18 @@ export class DiagnosticLogger {
   private adapter: DataAdapter | null = null;
   private logDir = getEasySyncPaths(DEFAULT_CONFIG_DIR).logsDir;
   private lastPruneDate: string | null = null;
-  /** Expected on-disk byte size per log path, for the external-rewrite probe. */
-  private expectedBytes = new Map<string, number>();
+  /** Segment already selected for the day, with this logger's own UTF-8 byte
+   *  count for it. Selection must not be re-derived from `stat` on every
+   *  flush: a stale or failing size read used to move one sync round's lines
+   *  between `.jsonl` / `.1.jsonl` / `.2.jsonl`, which reads like a frozen
+   *  sync to anyone opening a single file (2026-10-26 field evidence). */
+  private segment: { date: string; index: number; bytes: number } | null = null;
+  /** Batches whose lines never reached disk (both write attempts failed); the
+   *  next batch that does land stamps the gap into the log. */
+  private unpersistedBatches = 0;
+  private unpersistedEntries = 0;
+  /** One console warning per failure episode, not one per failed flush. */
+  private writeFailureReported = false;
   /** Paths already reported by the external-rewrite probe (once per session). */
   private externalRewriteReported = new Set<string>();
 
@@ -74,6 +113,8 @@ export class DiagnosticLogger {
   setAdapter(adapter: DataAdapter, configDir: string = DEFAULT_CONFIG_DIR): void {
     this.adapter = adapter;
     this.logDir = getEasySyncPaths(configDir).logsDir;
+    // The byte record belongs to the previous log directory.
+    this.segment = null;
   }
 
   /** Enable all categories. Called when the user turns on diagnostic logging. */
@@ -192,52 +233,169 @@ export class DiagnosticLogger {
     }
     if (batch.length === 0) return;
 
+    const entryCount = batch.length;
     const today = localDate();
-    const text = batch.map((e) => JSON.stringify(e)).join("\n") + "\n";
+    const unpersistedBatches = this.unpersistedBatches;
+    const unpersistedEntries = this.unpersistedEntries;
+    let payload = batch;
+    if (unpersistedBatches > 0) {
+      // The lines lost to a failed disk write left no other trace; the next
+      // batch that does land carries the count so a log reader can tell the
+      // gap was the logger, not a frozen sync.
+      const batchWord = unpersistedBatches === 1 ? "batch" : "batches";
+      const entryWord = unpersistedEntries === 1 ? "entry" : "entries";
+      const notice: DiagEntry = {
+        ts: Date.now(),
+        cat: "lifecycle",
+        lvl: "warn",
+        msg: `diagnostic log write failures — ${unpersistedBatches} ${batchWord} / ${unpersistedEntries} ${entryWord} never reached disk`,
+        data: { failedBatches: unpersistedBatches, lostEntries: unpersistedEntries },
+      };
+      this.pushRing(notice);
+      payload = [notice, ...batch];
+    }
+    const text = payload.map((e) => JSON.stringify(e)).join("\n") + "\n";
 
-    try {
-      await ensureDir(this.adapter, this.logDir);
-
-      // Pick the current segment, rolling if the file exceeds the single-file cap
-      let seg = 0;
-      let path = `${this.logDir}/${today}.jsonl`;
-      let observedSize: number | null = null;
-      while (seg < 99) {
-        try {
-          const st = await this.adapter.stat(path);
-          if (!st) {
-            observedSize = null;
-            break;
-          }
-          observedSize = st.size;
-          if (st.size + text.length <= MAX_LOG_FILE_BYTES) break;
-        } catch {
-          observedSize = null;
-          break;
-        }
-        seg++;
-        path = `${this.logDir}/${today}.${seg}.jsonl`;
-      }
-
-      if (await this.adapter.exists(path)) {
-        const expected = this.expectedBytes.get(path);
-        if (expected !== undefined && observedSize !== null && observedSize !== expected) {
-          this.reportExternalRewrite(path, expected, observedSize);
-        }
-        await this.adapter.append(path, text);
-        this.expectedBytes.set(path, (observedSize ?? 0) + text.length);
-      } else {
-        await this.adapter.write(path, text);
-        this.expectedBytes.set(path, text.length);
-      }
+    if (await this.persistBatch(today, text, utf8Bytes(text))) {
+      this.unpersistedBatches = 0;
+      this.unpersistedEntries = 0;
+      this.writeFailureReported = false;
       // Prune daily; always run after write to enforce byte limits
       if (this.lastPruneDate !== today) {
         await pruneLogs(this.adapter, this.logDir, MAX_LOG_DAYS, MAX_LOG_BYTES);
         this.lastPruneDate = today;
       }
-    } catch {
-      // Disk write failed — silently degrade (console + buffer still work)
+      return;
     }
+
+    this.unpersistedBatches += 1;
+    this.unpersistedEntries += entryCount;
+    this.reportWriteFailure(entryCount);
+  }
+
+  /** Write one payload into today's segment. Returns false when both attempts
+   *  failed; never throws, so sync keeps running without disk logging. */
+  private async persistBatch(today: string, text: string, textBytes: number): Promise<boolean> {
+    const adapter = this.adapter;
+    if (!adapter) return false;
+
+    try {
+      await ensureDir(adapter, this.logDir);
+      const segment = await this.resolveSegment(adapter, today, textBytes);
+      const existed = await adapter.exists(segment.path);
+      if (existed) {
+        const observed = await readLogSize(adapter, segment.path);
+        // `segment.bytes` is this logger's own record, not a size read now: a
+        // mismatch means something outside the plugin rewrote the file.
+        if (segment.known && observed !== null && observed !== undefined
+          && observed !== segment.bytes) {
+          this.reportExternalRewrite(segment.path, segment.bytes, observed);
+        }
+      }
+
+      if (!(await this.appendWithRetry(adapter, segment.path, text, existed))) return false;
+
+      if (!segment.known) {
+        // The pre-write size was unreadable, so no trustworthy count exists;
+        // re-read it next flush instead of probing against a lower bound.
+        this.segment = null;
+        return true;
+      }
+      this.segment = {
+        date: today,
+        index: segment.index,
+        // `write` replaces the file from scratch; `append` adds to what we
+        // already expected there.
+        bytes: existed ? segment.bytes + textBytes : textBytes,
+      };
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Pick the segment for `today`, keeping the one already chosen for the day
+   *  until this logger's own byte count says the file is full. `stat` only
+   *  picks the first segment of a day (and the fallback when no count exists
+   *  yet), so a stale or failing size read cannot shuffle lines between
+   *  `.jsonl` / `.1.jsonl` / `.2.jsonl` mid-round. */
+  private async resolveSegment(
+    adapter: DataAdapter,
+    today: string,
+    textBytes: number,
+  ): Promise<LogSegment> {
+    const current = this.segment;
+    if (current && current.date === today && current.bytes + textBytes <= MAX_LOG_FILE_BYTES) {
+      return {
+        index: current.index,
+        path: segmentPath(this.logDir, today, current.index),
+        bytes: current.bytes,
+        known: true,
+      };
+    }
+
+    let index = current && current.date === today
+      ? Math.min(current.index + 1, MAX_SEGMENT_INDEX)
+      : 0;
+    for (;;) {
+      const path = segmentPath(this.logDir, today, index);
+      const size = await readLogSize(adapter, path);
+      if (size === undefined) {
+        // Unknown size: write here, but record nothing so the next flush
+        // re-reads instead of trusting a made-up byte count.
+        return { index, path, bytes: 0, known: false };
+      }
+      const bytes = size ?? 0;
+      // A missing file always starts here, even for a batch larger than the
+      // cap on its own; otherwise roll while the file is full.
+      if (size === null || bytes + textBytes <= MAX_LOG_FILE_BYTES
+        || index >= MAX_SEGMENT_INDEX) {
+        this.segment = { date: today, index, bytes };
+        return { index, path, bytes, known: true };
+      }
+      index += 1;
+    }
+  }
+
+  /** Write one payload, retrying once immediately. A disk that refuses twice
+   *  is reported by the caller; it never fails the sync round. */
+  private async appendWithRetry(
+    adapter: DataAdapter,
+    path: string,
+    text: string,
+    existed: boolean,
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (existed) await adapter.append(path, text);
+        else await adapter.write(path, text);
+        return true;
+      } catch {
+        // Retried once; a second failure is reported by the caller.
+      }
+    }
+    return false;
+  }
+
+  /** A failed batch is already out of `pending`, so keep the loss visible:
+   *  count it, warn on the console once per failure episode, and keep a line
+   *  in the memory ring. Never throws — logging must not block sync. */
+  private reportWriteFailure(entries: number): void {
+    if (this.writeFailureReported) return;
+    this.writeFailureReported = true;
+    const notice: DiagEntry = {
+      ts: Date.now(),
+      cat: "lifecycle",
+      lvl: "warn",
+      msg: `diagnostic log write failed after one retry — ${entries} ${entries === 1 ? "entry" : "entries"} kept in memory only`,
+      data: {
+        entries,
+        failedBatches: this.unpersistedBatches,
+        lostEntries: this.unpersistedEntries,
+      },
+    };
+    this.writeToConsole(notice);
+    this.pushRing(notice);
   }
 
   /** This logger only ever grows its own file, so a size that differs from the
@@ -280,8 +438,15 @@ export class DiagnosticLogger {
 
   /** Return a merged snapshot of recent log entries from disk, pending batch,
    *  and memory buffer. Force-flushes pending to disk first so the report
-   *  includes events that haven't been persisted yet. */
-  async snapshot(count = 500): Promise<DiagEntry[]> {
+   *  includes events that haven't been persisted yet.
+   *
+   *  `entries` keeps the historical tail-window contract verbatim: the same
+   *  merged set is sliced to `count` after sorting. `runSummaries` is a bypass
+   *  over the *unsliced* set, by fixed message name only, so a round whose
+   *  four summary lines sit behind a busy window still reaches the report.
+   *  The bypass costs no extra I/O: the recent segments are already parsed in
+   *  full before the window is applied. */
+  async snapshot(count = 500): Promise<DiagnosticSnapshot> {
     // ① Flush pending so the latest events are on disk
     await this.forceFlush();
 
@@ -299,7 +464,11 @@ export class DiagnosticLogger {
       merged.push(e);
     }
     merged.sort((a, b) => a.ts - b.ts);
-    return merged.slice(-count);
+    return {
+      entries: merged.slice(-count),
+      // The bypass must read the unsliced set: this is the whole point of A1.
+      runSummaries: collectRecentRunSummaries(merged),
+    };
   }
 
   /** Read recent disk log entries from JSONL files (max `count` most recent).
@@ -373,6 +542,35 @@ export class DiagnosticLogger {
 }
 
 // ---- Helpers ----
+
+const UTF8 = new TextEncoder();
+
+/** Byte length of the UTF-8 encoding — the unit log files actually grow in.
+ *  `String.length` counts UTF-16 code units, so CJK text (3 bytes per Han
+ *  character) reads 2 bytes short per character and the rewrite probe would
+ *  fire on every Chinese batch. */
+function utf8Bytes(text: string): number {
+  return UTF8.encode(text).byteLength;
+}
+
+/** `YYYY-MM-DD.jsonl` for segment 0, `YYYY-MM-DD.<n>.jsonl` after that. */
+function segmentPath(dir: string, date: string, index: number): string {
+  return index === 0 ? `${dir}/${date}.jsonl` : `${dir}/${date}.${index}.jsonl`;
+}
+
+/** A log file's size: a number, `null` when the file does not exist, or
+ *  `undefined` when the adapter could not tell (unknown, never treated as 0). */
+async function readLogSize(
+  adapter: DataAdapter,
+  path: string,
+): Promise<number | null | undefined> {
+  try {
+    const stat = await adapter.stat(path);
+    return stat ? stat.size : null;
+  } catch {
+    return undefined;
+  }
+}
 
 /** Ensure a directory path exists, creating parents bottom-up. */
 async function ensureDir(

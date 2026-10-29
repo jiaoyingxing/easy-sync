@@ -27,14 +27,14 @@ import type {
   SyncPlanItem,
   SyncScope,
 } from "../src/sync/types";
-import { SyncExecutor } from "../src/sync/sync-executor";
+import { SyncExecutor, assertConfirmDeleteWaveWithinCheckpointLimit } from "../src/sync/sync-executor";
 import type { SyncResult } from "../src/sync/sync-executor";
 import { OneDriveClient, ResponseByteBudgetError } from "../src/onedrive/client";
 import { OneDriveError, OneDriveErrorType, type DriveItem } from "../src/onedrive/types";
 import type { LocalScanner } from "../src/sync/local-scanner";
 import type { PendingIssue } from "../src/sync/types";
 import { generateFileDecisionPlanV2 } from "../src/sync/file-decision-planner-v2";
-import { StateManager } from "../src/sync/state-manager";
+import { StateManager, MAX_MUTATION_CHECKPOINT_BATCH } from "../src/sync/state-manager";
 import { I18n } from "../src/i18n";
 import { SyncProgressStore } from "../src/sync/sync-progress";
 import type { DiagnosticLogger } from "../src/sync/diagnostic-logger";
@@ -135,6 +135,7 @@ describe("batch remote-delete absence verification", () => {
       removePendingDelete: vi.fn().mockResolvedValue(undefined),
       addPendingConflict: vi.fn().mockResolvedValue(undefined),
       getCommittedV2Envelope: vi.fn(() => null),
+      peekCommittedV2Envelope: vi.fn(() => null),
       retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
     } as unknown as StateManager;
     const getFileMetadata = vi.fn(async (_vault: string, path: string) =>
@@ -179,15 +180,19 @@ describe("batch remote-delete absence verification", () => {
     };
   }
 
-  it("pre-verifies the whole confirm batch once and skips per-item remote checks", async () => {
+  it("pre-verifies each confirm-delete wave once and skips per-item remote checks", async () => {
     const paths = Array.from({ length: 25 }, (_unused, index) => `d-${index}.md`);
     const harness = await makeDeleteConfirmHarness({ paths });
 
     await harness.executor.confirmRemoteDeletes(paths);
 
-    expect(harness.getFileMetadataByPaths).toHaveBeenCalledTimes(1);
+    // Wave-scoped reads (desktop 16): the first wave proves only its own 16
+    // paths so it can delete immediately; the 9 leftovers follow as a second
+    // read. A single 25-path read was the old "front porch".
+    expect(harness.getFileMetadataByPaths).toHaveBeenCalledTimes(2);
     expect(harness.getFileMetadataByPaths.mock.calls).toEqual([
-      ["testVault", [...paths].sort()],
+      ["testVault", [...paths].sort().slice(0, 16)],
+      ["testVault", [...paths].sort().slice(16)],
     ]);
     expect(harness.getFileMetadata).not.toHaveBeenCalled();
     expect(harness.removedPaths.sort()).toEqual([...paths].sort());
@@ -234,6 +239,732 @@ describe("batch remote-delete absence verification", () => {
     expect(harness.removedPaths.sort()).toEqual(["a.md", "b.md"]);
     expect(harness.getFileMetadata).not.toHaveBeenCalled();
   });
+});
+
+describe("confirm delete waves", () => {
+  // 波大小手机 8 / 桌面 16，测试跑桌面（Platform.isMobile=false）：8 项正好一波。
+  const WAVE = 8;
+
+  interface ConfirmDeleteWaveHarnessInput {
+    filePaths?: readonly string[];
+    folderPath?: string;
+    /** 这一条的本机删除抛错（adapter.remove）。 */
+    failErasePath?: string;
+    /** 本条删除成功后执行（用于在波中取消）。 */
+    afterErase?: (path: string) => void;
+    /** 批量缺席读取被调用时执行（参数为该次读取覆盖的路径）。 */
+    duringBatchRead?: (batch: readonly string[]) => void;
+    /** 该次批量读取要不要挂住（用于证明"上一波已删除、下一波的读取还没回来"）。 */
+    batchReadGate?: (batch: readonly string[]) => Promise<void> | void;
+    /** 去掉本机读取／擦除的 1ms 占位（只给大数量用例提速，波内并发断言仍走默认）。 */
+    fast?: boolean;
+    diag?: DiagnosticLogger;
+    /** 插件自身擦除的本机路径通知（宿主据此不把该事件当新本机变化）。 */
+    onSelfLocalDelete?: (path: string) => void;
+  }
+
+  async function makeConfirmDeleteWaveHarness(
+    input: ConfirmDeleteWaveHarnessInput,
+  ) {
+    const scope = { ...TEST_SYNC_SCOPE, accountId: "account-test" };
+    const parentRemoteId = "committed-parent-id";
+    const filePaths = [...(input.filePaths ?? [])];
+    const folderPath = input.folderPath;
+    const localEntries = filePaths.map((path, index) => ({
+      path,
+      hash: `wave-hash-${index}`.padEnd(64, "0"),
+      size: 10 + index,
+      mtime: 1,
+      binary: false,
+    }));
+    // The stat-only pre-erase probe reads this map; a test can mutate one
+    // member's facts mid-wave to simulate an edit between the reviewed SHA-256
+    // guard and that member's turn in the serial erase segment.
+    const localFacts = new Map(
+      localEntries.map((entry) => [
+        entry.path,
+        { size: entry.size, mtime: entry.mtime },
+      ]),
+    );
+    const folderChildCount = filePaths.filter(
+      (path) => folderPath !== undefined && path.startsWith(`${folderPath}/`),
+    ).length;
+    const pendingRemoteDeletes: SyncPlanItem[] = [
+      ...localEntries.map((local) => ({
+        type: SyncActionType.ConfirmLocalDelete,
+        path: local.path,
+        local,
+        decisionToken: {
+          version: 1,
+          vaultName: "testVault",
+          accountId: scope.accountId,
+          scope,
+          local: { exists: true, hash: local.hash, size: local.size },
+          remote: { exists: false },
+          ancestorHash: null,
+        },
+      } as unknown as SyncPlanItem)),
+      ...(folderPath === undefined
+        ? []
+        : [{
+            type: SyncActionType.ConfirmLocalDelete,
+            path: folderPath,
+            folder: {
+              remoteId: "remote-folder",
+              parentRemoteId,
+              parentPath: "",
+              childCount: folderChildCount,
+            },
+          } as unknown as SyncPlanItem]),
+    ];
+    const events: string[] = [];
+    const removedPaths: string[] = [];
+    let eraseInFlight = 0;
+    let erasePeak = 0;
+    const adapter = makeMockAdapter({
+      exists: vi.fn().mockResolvedValue(false),
+      list: vi.fn(async () => ({ files: [], folders: [] })),
+      remove: vi.fn(async (path: string) => {
+        // Hold the erase open for one turn: the wave must still run exactly one
+        // at a time (`trashFile` lock on Android).
+        eraseInFlight++;
+        erasePeak = Math.max(erasePeak, eraseInFlight);
+        try {
+          if (!input.fast) {
+            await new Promise((resolve) => setTimeout(resolve, 1));
+          }
+          if (path === input.failErasePath) {
+            throw new Error(`erase failed: ${path}`);
+          }
+          removedPaths.push(path);
+          events.push(`remove:${path}`);
+          input.afterErase?.(path);
+        } finally {
+          eraseInFlight--;
+        }
+      }),
+    });
+    const trashed: string[] = [];
+    const trashFile = vi.fn(async (file: unknown) => {
+      const path = (file as { path?: string }).path ?? "";
+      trashed.push(path);
+      events.push(`trash:${path}`);
+    });
+    const ledger: Array<{
+      intent: MutationIntentV1;
+      receipt: MutationReceiptV1 | null;
+    }> = [];
+    const ledgerSinkWrites: string[][] = [];
+    const envelope = createFileStateShadowEnvelopeV2({
+      scope,
+      lifecycleEpoch: 1,
+      commitSeq: 1,
+      committedAt: 1,
+      remoteEntries: [],
+      remoteFolders: [],
+      baseEntries: [],
+    });
+    envelope.folderAnchors = {
+      schemaVersion: 2,
+      byAnchorId: folderPath === undefined
+        ? {}
+        : {
+            "folder-anchor": {
+              anchorId: "folder-anchor",
+              remoteId: "remote-folder",
+              lastPath: folderPath,
+              parentRemoteId,
+              confirmedGeneration: 1,
+              confirmedAt: 1,
+            },
+          },
+    };
+    const state = {
+      ...remoteStateStub(),
+      isV2StateActive: true,
+      hasV2StateLoadRecoveryBlock: false,
+      hasV2RemoteScopeRecovery: false,
+      hasMutationLedgerCorruption: false,
+      mutationLedger: ledger,
+      boundAccountId: scope.accountId,
+      remoteScope: scope,
+      pendingRemoteDeletes,
+      planReviewRevision: 0,
+      baseSnapshot: [],
+      pendingIssues: [],
+      getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
+      peekCommittedV2Envelope: vi.fn(() => envelope),
+      remoteIdForPath: vi.fn((path: string) => `remote-id-${path}`),
+      recordCloudDeletion: vi.fn().mockResolvedValue(undefined),
+      addPendingConflict: vi.fn().mockResolvedValue(undefined),
+      removePendingDelete: vi.fn().mockResolvedValue(undefined),
+      retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
+      beginMutationIntents: vi.fn(async (intents: MutationIntentV1[]) => {
+        for (const intent of intents) ledger.push({ intent, receipt: null });
+      }),
+      abandonMutationIntent: vi.fn(async (operationId: string) => {
+        const index = ledger.findIndex(
+          (entry) => entry.intent.operationId === operationId,
+        );
+        if (index >= 0) ledger.splice(index, 1);
+      }),
+      recordMutationReceipts: vi.fn(async (receipts: MutationReceiptV1[]) => {
+        for (const receipt of receipts) {
+          const record = ledger.find(
+            (entry) => entry.intent.operationId === receipt.operationId,
+          );
+          if (!record) {
+            throw new Error(`Mutation intent missing: ${receipt.operationId}`);
+          }
+          record.receipt = receipt;
+        }
+      }),
+      recordCloudDeletions: vi.fn(async (entries: Array<{ path: string }>) => {
+        ledgerSinkWrites.push(entries.map((entry) => entry.path));
+      }),
+      commitMutationCheckpoints: vi.fn(async (operationIds: readonly string[]) => {
+        events.push(`checkpoint:${operationIds.length}`);
+        for (const operationId of operationIds) {
+          const index = ledger.findIndex(
+            (entry) => entry.intent.operationId === operationId,
+          );
+          if (index < 0 || ledger[index].receipt === null) {
+            throw new Error(`Mutation receipt missing: ${operationId}`);
+          }
+          ledger.splice(index, 1);
+        }
+        return {
+          operations: operationIds.length,
+          ancestorPublishMs: 0,
+          v2CommitMs: 0,
+          ledgerClearMs: 0,
+          totalMs: 0,
+        };
+      }),
+    } as unknown as StateManager;
+    const vault = {
+      configDir: ".obsidian",
+      adapter,
+      getFileByPath: vi.fn().mockReturnValue(null),
+      getFiles: vi.fn().mockReturnValue([]),
+      getName: vi.fn().mockReturnValue("testVault"),
+      getAbstractFileByPath: vi.fn((path: string) =>
+        folderPath !== undefined
+        && path === folderPath
+        && !trashed.includes(path)
+          ? new TFolder(path)
+          : null),
+    };
+    const onedrive = makeMockOneDrive({
+      getFileMetadataByPaths: vi.fn(
+        async (_vaultName: string, batch: readonly string[]) => {
+          input.duringBatchRead?.(batch);
+          await input.batchReadGate?.(batch);
+          return new Map(batch.map((path) => [path, null]));
+        },
+      ),
+      getFileMetadata: vi.fn(async () => null),
+      getDriveItemMetadataById: vi.fn(async () => null),
+    });
+    const notice = makeNoticeRecorder();
+    let inspectInFlight = 0;
+    let inspectPeak = 0;
+    const executor = new SyncExecutor(
+      onedrive,
+      {
+        vault,
+        shouldSyncPath: vi.fn().mockReturnValue(true),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+        inspectFile: vi.fn(async (path: string) => {
+          // The only-copy re-check is the expensive read; hold it open for one
+          // turn so the wave's bounded fan-out is observable.
+          inspectInFlight++;
+          inspectPeak = Math.max(inspectPeak, inspectInFlight);
+          if (!input.fast) {
+            await new Promise((resolve) => setTimeout(resolve, 1));
+          }
+          inspectInFlight--;
+          const entry = localEntries.find((candidate) => candidate.path === path);
+          return entry
+            ? { status: "present" as const, entry }
+            : { status: "missing" as const };
+        }),
+        inspectFileStat: vi.fn(async (path: string) => {
+          const facts = localFacts.get(path);
+          return facts
+            ? { status: "present" as const, ...facts }
+            : { status: "missing" as const };
+        }),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+      undefined,
+      undefined,
+      input.diag,
+      { trashFile } as unknown as import("obsidian").FileManager,
+      undefined,
+      undefined,
+      notice.center,
+      undefined,
+      input.onSelfLocalDelete,
+    );
+    return {
+      executor,
+      adapter,
+      state,
+      ledger,
+      ledgerSinkWrites,
+      removedPaths,
+      trashed,
+      events,
+      notices: notice.messages,
+      localFacts,
+      inspectPeak: () => inspectPeak,
+      erasePeak: () => erasePeak,
+    };
+  }
+
+  const wavePaths = (count = WAVE): string[] =>
+    Array.from({ length: count }, (_unused, index) =>
+      `wave-${String(index).padStart(2, "0")}.md`);
+
+  it("settles eight confirmed file deletes as one wave: one intent, receipt, ledger and checkpoint write", async () => {
+    const paths = wavePaths();
+    const log = vi.fn();
+    const diag = {
+      log,
+      warn: vi.fn(),
+      error: vi.fn(),
+      isEnabled: vi.fn().mockReturnValue(false),
+    } as unknown as DiagnosticLogger;
+    const harness = await makeConfirmDeleteWaveHarness({
+      filePaths: paths,
+      diag,
+    });
+
+    await harness.executor.confirmRemoteDeletes(paths);
+
+    expect(harness.removedPaths).toEqual(paths);
+    expect(harness.state.beginMutationIntents).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(harness.state.beginMutationIntents).mock.calls[0][0])
+      .toHaveLength(WAVE);
+    expect(harness.state.recordMutationReceipts).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(harness.state.recordMutationReceipts).mock.calls[0][0])
+      .toHaveLength(WAVE);
+    expect(harness.state.recordCloudDeletions).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(harness.state.recordCloudDeletions).mock.calls[0][0])
+      .toHaveLength(WAVE);
+    expect(harness.state.commitMutationCheckpoints).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(harness.state.commitMutationCheckpoints).mock.calls[0][0])
+      .toHaveLength(WAVE);
+    // The per-item writes are fully replaced inside a wave.
+    expect(harness.state.beginMutationIntent).not.toHaveBeenCalled();
+    expect(harness.state.recordMutationReceipt).not.toHaveBeenCalled();
+    expect(harness.state.commitMutationCheckpoint).not.toHaveBeenCalled();
+    expect(harness.state.recordCloudDeletion).not.toHaveBeenCalled();
+    // The wave's deletion clues ride the one sink write.
+    expect(harness.ledgerSinkWrites).toEqual([[...paths].sort()]);
+    expect(harness.executor.hasSideActionsInFlight).toBe(false);
+    // Hard parameters: the read-only re-check fans out 4-wide on desktop while
+    // the local erase segment stays strictly one-at-a-time.
+    expect(harness.inspectPeak()).toBe(4);
+    expect(harness.erasePeak()).toBe(1);
+    expect(harness.events.filter((event) => event.startsWith("remove:")))
+      .toEqual(paths.map((path) => `remove:${path}`));
+
+    const settled = log.mock.calls.filter(
+      (call) => call[1] === "confirm delete wave settled",
+    );
+    expect(settled).toHaveLength(1);
+    const data = settled[0]?.[2] as {
+      files: number;
+      intentMs: number;
+      localCheckMs: number;
+      deleteMs: number;
+      eraseMs: number;
+      receiptMs: number;
+      ledgerMs: number;
+      checkpointMs: number;
+      totalMs: number;
+    };
+    expect(data.files).toBe(WAVE);
+    for (const ms of [
+      data.intentMs,
+      data.localCheckMs,
+      data.deleteMs,
+      data.eraseMs,
+      data.receiptMs,
+      data.ledgerMs,
+      data.checkpointMs,
+      data.totalMs,
+    ]) {
+      expect(Number.isInteger(ms)).toBe(true);
+      expect(ms).toBeGreaterThanOrEqual(0);
+    }
+    // Observation only: the wave total can never be shorter than its serial
+    // erase segment.
+    expect(data.totalMs).toBeGreaterThanOrEqual(data.deleteMs);
+  });
+
+  it("splits a batch larger than one wave into serial waves of sixteen (desktop)", async () => {
+    const paths = wavePaths(17);
+    const harness = await makeConfirmDeleteWaveHarness({ filePaths: paths });
+
+    await harness.executor.confirmRemoteDeletes(paths);
+
+    expect(harness.removedPaths).toEqual(paths);
+    expect(
+      vi.mocked(harness.state.beginMutationIntents).mock.calls.map(
+        (call) => call[0].length,
+      ),
+    ).toEqual([16, 1]);
+    expect(
+      vi.mocked(harness.state.recordMutationReceipts).mock.calls.map(
+        (call) => call[0].length,
+      ),
+    ).toEqual([16, 1]);
+    expect(harness.state.commitMutationCheckpoints).toHaveBeenCalledTimes(2);
+    // Waves stay serial: the first wave's checkpoint lands before the second
+    // wave's first erase.
+    expect(harness.events).toEqual([
+      ...paths.slice(0, 16).map((path) => `remove:${path}`),
+      "checkpoint:16",
+      `remove:${paths[16]}`,
+      "checkpoint:1",
+    ]);
+  });
+
+  it("keeps one failed erase to its own item: the other seven settle in the shared checkpoint", async () => {
+    const paths = wavePaths();
+    const failedPath = paths[2];
+    const harness = await makeConfirmDeleteWaveHarness({
+      filePaths: paths,
+      failErasePath: failedPath,
+      diag: {
+        log: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        isEnabled: vi.fn().mockReturnValue(false),
+      } as unknown as DiagnosticLogger,
+    });
+
+    await harness.executor.confirmRemoteDeletes(paths);
+
+    expect(harness.removedPaths).toEqual(
+      paths.filter((path) => path !== failedPath),
+    );
+    // The failed member never enters the shared checkpoint …
+    expect(harness.state.recordMutationReceipts).toHaveBeenCalledTimes(1);
+    const receipted = vi.mocked(harness.state.recordMutationReceipts)
+      .mock.calls[0][0] as Array<{ operationId: string }>;
+    expect(receipted).toHaveLength(WAVE - 1);
+    expect(vi.mocked(harness.state.commitMutationCheckpoints).mock.calls[0][0])
+      .toEqual(receipted.map((receipt) => receipt.operationId));
+    // … and keeps the per-item exit: same-action recovery proved the erase not
+    // applied (the local copy is still there), so its intent is abandoned and
+    // the pending row stays for the user.
+    expect(harness.ledger).toHaveLength(0);
+    const failedIntent = vi.mocked(harness.state.beginMutationIntents)
+      .mock.calls[0][0]
+      .find((intent) => intent.path === failedPath);
+    expect(failedIntent).toBeDefined();
+    expect(harness.state.abandonMutationIntent).toHaveBeenCalledWith(
+      failedIntent!.operationId,
+    );
+    // Same per-item exit: one failure notice for the one member that failed
+    // (success notices stay off for a batch, as before this change).
+    expect(harness.notices).toEqual(["notice.delete.failed"]);
+    expect(harness.executor.hasSideActionsInFlight).toBe(false);
+  });
+
+  it("skips only the wave member whose local facts changed before its erase", async () => {
+    const paths = wavePaths();
+    const changedPath = paths[2];
+    let changedFacts: Map<string, { size: number; mtime: number }> | null = null;
+    let mutationApplied = false;
+    const harness = await makeConfirmDeleteWaveHarness({
+      filePaths: paths,
+      afterErase: () => {
+        // The reviewed SHA-256 guard already passed for the whole wave. Mutate
+        // one later member's stat facts, then let the serial erase continue:
+        // its turn must see the drift and skip only that member.
+        if (mutationApplied || !changedFacts) return;
+        mutationApplied = true;
+        changedFacts.set(changedPath, { size: 999, mtime: 2 });
+      },
+    });
+    changedFacts = harness.localFacts;
+
+    await harness.executor.confirmRemoteDeletes(paths);
+
+    expect(mutationApplied).toBe(true);
+    expect(harness.removedPaths).toEqual(
+      paths.filter((path) => path !== changedPath),
+    );
+    // Same per-item failure surface as a rejected guard: one notice, pending
+    // row kept. The other seven members settle through the shared checkpoint.
+    expect(harness.notices).toEqual(["notice.delete.failed"]);
+    expect(harness.state.removePendingDelete).not.toHaveBeenCalled();
+    const intents = vi.mocked(harness.state.beginMutationIntents)
+      .mock.calls[0][0];
+    expect(intents).toHaveLength(WAVE);
+    const skippedIntent = intents.find((intent) => intent.path === changedPath);
+    expect(skippedIntent).toBeDefined();
+    expect(harness.state.abandonMutationIntent).toHaveBeenCalledWith(
+      skippedIntent!.operationId,
+    );
+    expect(harness.state.recordMutationReceipts).toHaveBeenCalledTimes(1);
+    const receipts = vi.mocked(harness.state.recordMutationReceipts)
+      .mock.calls[0][0];
+    expect(receipts).toHaveLength(WAVE - 1);
+    expect(receipts.map((receipt) => receipt.operationId))
+      .not.toContain(skippedIntent!.operationId);
+    expect(vi.mocked(harness.state.commitMutationCheckpoints).mock.calls[0][0])
+      .toEqual(receipts.map((receipt) => receipt.operationId));
+    // Every intent is either receipted+checkpointed or abandoned: no
+    // intent-only record is left for the next round.
+    expect(harness.ledger).toHaveLength(0);
+  });
+
+  it("leaves at most one wave of intent-only records when the user cancels mid-wave", async () => {
+    const paths = wavePaths();
+    let erased = 0;
+    const harness = await makeConfirmDeleteWaveHarness({
+      filePaths: paths,
+      afterErase: () => {
+        erased++;
+        if (erased === 2) harness.executor.cancel();
+      },
+    });
+
+    await harness.executor.confirmRemoteDeletes(paths);
+
+    expect(harness.removedPaths).toEqual(paths.slice(0, 2));
+    expect(harness.state.beginMutationIntents).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(harness.state.beginMutationIntents).mock.calls[0][0])
+      .toHaveLength(WAVE);
+    // The two erased members keep their receipt; the rest stay intent-only for
+    // the next round's mutation recovery, and the shared checkpoint is skipped.
+    expect(harness.state.recordMutationReceipts).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(harness.state.recordMutationReceipts).mock.calls[0][0])
+      .toHaveLength(2);
+    expect(harness.state.commitMutationCheckpoints).not.toHaveBeenCalled();
+    const intentOnly = harness.ledger.filter(
+      (record) => record.receipt === null,
+    );
+    expect(intentOnly).toHaveLength(WAVE - 2);
+    expect(intentOnly.length).toBeLessThanOrEqual(WAVE);
+    // The deletion clues still land: the local copies are already gone.
+    expect(harness.ledgerSinkWrites).toEqual([[...paths.slice(0, 2)].sort()]);
+  });
+
+  it("runs folder rows only after every file row settled and the file wave checkpoint landed", async () => {
+    const folder = "FolderX";
+    const children = Array.from({ length: WAVE }, (_unused, index) =>
+      `${folder}/n${index}.md`);
+    const harness = await makeConfirmDeleteWaveHarness({
+      filePaths: children,
+      folderPath: folder,
+    });
+
+    await harness.executor.confirmRemoteDeletes([folder, ...children]);
+
+    expect(harness.events).toEqual([
+      ...children.map((path) => `remove:${path}`),
+      `checkpoint:${WAVE}`,
+      `trash:${folder}`,
+    ]);
+    expect(harness.trashed).toEqual([folder]);
+    expect(harness.executor.hasSideActionsInFlight).toBe(false);
+  });
+
+  it("keeps the folder shell in the same batch when a round becomes visible before it runs", async () => {
+    // 2026-10-28 真机反馈：文件与文件夹被拆成两轮。旧实现文件波先结批，
+    // 文件夹缺席读取（网络）在空隙里做，此时任何插进来的轮次都会让
+    // `enqueueSideAction` 以 `running` 拒绝文件夹行，下一轮计划再删壳。
+    // 现在整批一条队列登记，文件夹段在已准入的任务里执行。
+    const folder = "FolderX";
+    const children = ["FolderX/a.md", "FolderX/b.md"];
+    let executorRef: SyncExecutor | null = null;
+    let queuedAtFirstRead = -1;
+    const harness = await makeConfirmDeleteWaveHarness({
+      filePaths: children,
+      folderPath: folder,
+      duringBatchRead: () => {
+        if (queuedAtFirstRead < 0) {
+          queuedAtFirstRead = executorRef?.queuedSideActionCount ?? -1;
+        }
+      },
+      batchReadGate: (batch) => {
+        // The folder's own absence read: simulate a round being dispatched in
+        // the old file-wave/folder-shell gap.
+        if (batch.length === 1 && batch[0] === folder) {
+          (executorRef as unknown as { running: boolean }).running = true;
+        }
+      },
+    });
+    executorRef = harness.executor;
+
+    await harness.executor.confirmRemoteDeletes([folder, ...children]);
+    (harness.executor as unknown as { running: boolean }).running = false;
+
+    expect(harness.trashed).toEqual([folder]);
+    expect(harness.notices).toEqual([]);
+    // Every confirmed row is registered before the first read, so the counter
+    // covers the whole batch from the start (no 0/N restart for folders).
+    expect(queuedAtFirstRead).toBe(children.length + 1);
+  });
+
+  it("reports every local erase as a plugin self-delete", async () => {
+    const folder = "FolderX";
+    const children = ["FolderX/a.md", "FolderX/b.md"];
+    const onSelfLocalDelete = vi.fn();
+    const harness = await makeConfirmDeleteWaveHarness({
+      filePaths: children,
+      folderPath: folder,
+      onSelfLocalDelete,
+    });
+
+    await harness.executor.confirmRemoteDeletes([folder, ...children]);
+
+    expect(onSelfLocalDelete.mock.calls.map((call) => call[0]))
+      .toEqual([...children, folder]);
+  });
+
+  it("refuses an oversized, duplicate or folder wave before any write or erase", () => {
+    // The wave slice caps itself at CONFIRM_DELETE_WAVE (8/16), so these edges
+    // are unreachable through `confirmRemoteDeletes`; pin the fail-closed guard
+    // itself, exactly like the cleanup-wave limit test.
+    const members = (count: number) =>
+      Array.from({ length: count }, (_unused, index) => ({ path: `w-${index}.md` }));
+    expect(() => assertConfirmDeleteWaveWithinCheckpointLimit(
+      members(MAX_MUTATION_CHECKPOINT_BATCH),
+    )).not.toThrow();
+    expect(() => assertConfirmDeleteWaveWithinCheckpointLimit(
+      members(MAX_MUTATION_CHECKPOINT_BATCH + 1),
+    )).toThrow(
+      `Confirm delete wave must contain at most ${MAX_MUTATION_CHECKPOINT_BATCH} file deletes (got ${MAX_MUTATION_CHECKPOINT_BATCH + 1})`,
+    );
+    expect(() => assertConfirmDeleteWaveWithinCheckpointLimit([
+      { path: "same.md" },
+      { path: "same.md" },
+    ])).toThrow("Confirm delete wave contains a duplicate path: same.md");
+    expect(() => assertConfirmDeleteWaveWithinCheckpointLimit([
+      { path: "FolderX", folder: { remoteId: "remote-folder" } },
+    ])).toThrow("Confirm delete wave must contain file rows only");
+  });
+
+  it("settles a 2,001-row confirmed batch (2,000 files + 1 folder) in one call", async () => {
+    // 真机现场（iOS 2026-10-27）：2,001 条待确认（2,000 文件 + 1 folder）点
+    // 「全部删除」后每轮都只剩 2,000 条待确认、零意图、零异常。这条同时钉住：
+    // ① 一条 folder 行不会让文件行作废（预检只吃文件切片，folder 走自己的逐条
+    // 链）；② 整批在同一次调用里落定；③ 第一批删除不再等全批读取——旧实现是
+    // 一次 2,001 条读取（101 个串行 $batch），首批要等它全部落地。
+    const folder = "BulkX";
+    const files = Array.from({ length: 2000 }, (_unused, index) =>
+      `${folder}/f-${String(index).padStart(4, "0")}.md`);
+    let inFlightAtBatchRead: boolean | null = null;
+    let executorRef: SyncExecutor | null = null;
+    const readBatches: string[][] = [];
+    let readsAtFirstErase = -1;
+    const harness = await makeConfirmDeleteWaveHarness({
+      filePaths: files,
+      folderPath: folder,
+      fast: true,
+      duringBatchRead: (batch) => {
+        readBatches.push([...batch]);
+        inFlightAtBatchRead ??= executorRef?.hasSideActionsInFlight ?? null;
+      },
+      afterErase: () => {
+        if (readsAtFirstErase < 0) readsAtFirstErase = readBatches.length;
+      },
+    });
+    executorRef = harness.executor;
+
+    await harness.executor.confirmRemoteDeletes([folder, ...files]);
+
+    expect(harness.removedPaths).toHaveLength(2000);
+    expect(harness.trashed).toEqual([folder]);
+    // 读取发生在入队之后（旧实现读在入队前 → 这里读到 false，且轮次能插进来）。
+    expect(inFlightAtBatchRead).toBe(true);
+    // 波内读取：第一刀只读一波，首批擦除只等 ≤2 次读取（本次 + 一次前瞻），
+    // 125 个文件波各一次 + folder 行最后自己一次。
+    expect(readBatches[0]).toHaveLength(16);
+    expect(readsAtFirstErase).toBeGreaterThan(0);
+    expect(readsAtFirstErase).toBeLessThanOrEqual(2);
+    expect(readBatches).toHaveLength(126);
+    expect(readBatches.at(-1)).toEqual([folder]);
+    expect(harness.notices).toEqual([]);
+    expect(harness.ledger).toHaveLength(0);
+    expect(harness.executor.hasSideActionsInFlight).toBe(false);
+    const waveSizes = vi.mocked(harness.state.beginMutationIntents)
+      .mock.calls
+      .map((call) => call[0].length);
+    expect(waveSizes.reduce((sum, size) => sum + size, 0)).toBe(2000);
+    expect(waveSizes.every((size) => size <= 16)).toBe(true);
+  }, 120_000);
+
+  it("deletes the first wave before the rest of the batch has been read", async () => {
+    // 「前摇」验收：首批擦除只等自己那一波的读取，不等整批。旧实现一次读取
+    // 覆盖全批（2,001 条 = 101 个串行 $batch），第一刀要等全部落地；这里把
+    // 第二波起的读取全部挂住，第一波仍应删完。
+    const files = Array.from({ length: 32 }, (_unused, index) =>
+      `porch/f-${String(index).padStart(2, "0")}.md`);
+    let readCount = 0;
+    let releaseReads: (() => void) | null = null;
+    const blocked = new Promise<void>((resolve) => {
+      releaseReads = resolve;
+    });
+    const harness = await makeConfirmDeleteWaveHarness({
+      filePaths: files,
+      fast: true,
+      batchReadGate: () => {
+        readCount++;
+        return readCount > 1 ? blocked : undefined;
+      },
+    });
+
+    let settled = false;
+    const batch = harness.executor.confirmRemoteDeletes(files).then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(settled).toBe(false);
+    expect(harness.removedPaths).toEqual(files.slice(0, 16));
+    expect(readCount).toBe(2);
+
+    releaseReads!();
+    await batch;
+
+    expect(harness.removedPaths).toEqual(files);
+    expect(harness.notices).toEqual([]);
+    expect(harness.ledger).toHaveLength(0);
+  }, 120_000);
+
+  it("waits out a running round instead of dropping the confirmed batch", async () => {
+    // 旧实现：`enqueueSideAction` 见到 `running` 直接拒绝（只有一条瞬时提示），
+    // 整批 2,000 条一行不删、pending 原样留下。现在先等轮次结束再入队。
+    const paths = wavePaths(4);
+    const harness = await makeConfirmDeleteWaveHarness({ filePaths: paths });
+    const running = harness.executor as unknown as { running: boolean };
+    running.running = true;
+
+    let settled = false;
+    const batch = harness.executor.confirmRemoteDeletes(paths).then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(settled).toBe(false);
+    expect(harness.removedPaths).toEqual([]);
+
+    running.running = false;
+    await batch;
+
+    expect(harness.removedPaths).toEqual(paths);
+    expect(harness.notices).toEqual([]);
+    expect(harness.ledger).toHaveLength(0);
+  }, 120_000);
 });
 
 describe("folder confirm-delete batch absence verification", () => {
@@ -328,6 +1059,7 @@ describe("folder confirm-delete batch absence verification", () => {
       removePendingDelete: vi.fn().mockResolvedValue(undefined),
       addPendingConflict: vi.fn().mockResolvedValue(undefined),
       getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
+      peekCommittedV2Envelope: vi.fn(() => envelope),
       retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
     } as unknown as StateManager;
 
@@ -463,7 +1195,7 @@ describe("folder confirm-delete batch absence verification", () => {
     expect(harness.getFileMetadata.mock.calls).toEqual([["testVault", "FolderB"]]);
   });
 
-  it("handles a mixed file+folder batch with one shared batch read", async () => {
+  it("reads a mixed file+folder batch in wave-scoped reads, never one whole-batch read", async () => {
     const paths = ["note-a.md", "FolderA", "note-b.md", "Parent/Child"];
     // Two entries are files (pending.folder absent) and two are folders.
     const pendingByKind: Record<string, "file" | "folder"> = {
@@ -550,6 +1282,7 @@ describe("folder confirm-delete batch absence verification", () => {
       removePendingDelete: vi.fn().mockResolvedValue(undefined),
       addPendingConflict: vi.fn().mockResolvedValue(undefined),
       getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
+      peekCommittedV2Envelope: vi.fn(() => envelope),
       retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
     } as unknown as StateManager;
     const vault = {
@@ -587,12 +1320,21 @@ describe("folder confirm-delete batch absence verification", () => {
 
     await executor.confirmRemoteDeletes(paths);
 
-    expect(getFileMetadataByPaths).toHaveBeenCalledTimes(1);
+    // One read for the file wave and one bounded read for the folder rows:
+    // no read ever covers the whole mixed batch, so a big file set cannot delay
+    // the first deletion behind the folder preparation either.
+    expect(getFileMetadataByPaths).toHaveBeenCalledTimes(2);
+    expect(
+      getFileMetadataByPaths.mock.calls.map((call) => [...call[1]].sort()),
+    ).toEqual([
+      ["note-a.md", "note-b.md"],
+      ["FolderA", "Parent/Child"],
+    ]);
     expect(batchPaths.size).toBe(paths.length);
     for (const path of paths) {
       expect(batchPaths.has(path)).toBe(true);
     }
-    // Single shared read followed by no fallback per-item by-path checks.
+    // Every row was proven absent by its own read; no per-item by-path checks.
     expect(getFileMetadata).not.toHaveBeenCalled();
   });
 
@@ -709,6 +1451,7 @@ describe("folder confirm-delete batch absence verification", () => {
       removePendingDelete: vi.fn().mockResolvedValue(undefined),
       addPendingConflict: vi.fn().mockResolvedValue(undefined),
       getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
+      peekCommittedV2Envelope: vi.fn(() => envelope),
       retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
     } as unknown as StateManager;
     const vault = {
@@ -825,6 +1568,7 @@ describe("folder confirm-delete batch absence verification", () => {
       removePendingDelete: vi.fn().mockResolvedValue(undefined),
       addPendingConflict: vi.fn().mockResolvedValue(undefined),
       getCommittedV2Envelope: vi.fn(() => structuredClone(envelope)),
+      peekCommittedV2Envelope: vi.fn(() => envelope),
       retireMutationCheckpointIfReflected: vi.fn().mockResolvedValue(false),
     } as unknown as StateManager;
     const vault = {

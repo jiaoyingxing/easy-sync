@@ -198,7 +198,11 @@ body.is-mobile .modal-container.easy-sync-modal-container .modal-bg {
   overflow: hidden;
 }
 
-.easy-sync-community-plugin-scope-setting .setting-item-name {
+/* chip 挂点共用的行名/标题间距容器：容器转 flex，chip 与文字之间由 gap
+   留距（社区插件 scope 行、社区插件管理弹框标题、关于页「新版本」chip）。 */
+.easy-sync-community-plugin-scope-setting .setting-item-name,
+.easy-sync-community-plugin-data-title,
+.easy-sync-settings-name-with-chip {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
@@ -227,13 +231,6 @@ body.is-mobile .modal-container.easy-sync-modal-container .modal-bg {
   border-color: rgba(var(--color-red-rgb), 0.32);
   background: rgba(var(--color-red-rgb), 0.12);
   color: var(--text-error);
-}
-
-.easy-sync-community-plugin-data-title {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: var(--size-2-2) var(--size-4-2);
 }
 
 .easy-sync-plugin-selection-chip.is-hidden {
@@ -975,6 +972,27 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
   overflow-wrap: anywhere;
 }
 
+/* Recovery file disclosure: generic tree-row shell, no skip-group semantics. */
+.easy-sync-recovery-details {
+  min-width: 0;
+}
+
+/* Recovery body secondary entry (account-changed): a text link, not a second
+   primary action; the fixed top action remains the only sync entry. */
+.easy-sync-recovery-inline-action {
+  align-self: flex-start;
+  border: 0;
+  background: none;
+  padding: 1px 0;
+  color: var(--text-accent);
+  font-family: inherit;
+  font-size: var(--font-ui-smaller);
+  line-height: var(--line-height-normal);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
 .easy-sync-recovery-facts {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
@@ -1207,6 +1225,33 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
 .easy-sync-file-list.is-limited {
   max-height: 200px;
   overflow-y: auto;
+}
+
+.easy-sync-file-list-omitted {
+  padding: 2px 4px;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  line-height: var(--line-height-tight);
+}
+
+/* 自适应路径的离屏量测探针：静态几何放 CSS，字体由调用方按行内计算值
+ * 以自定义属性注入（商城 lint 不允许静态样式键直接写）。 */
+.easy-sync-path-measure-probe {
+  position: absolute;
+  left: -10000px;
+  top: 0;
+  visibility: hidden;
+  pointer-events: none;
+  white-space: nowrap;
+  display: inline-block;
+  width: auto;
+  height: auto;
+  font-family: var(--easy-sync-probe-font-family, var(--font-interface));
+  font-size: var(--easy-sync-probe-font-size, var(--font-ui-smaller));
+  font-weight: var(--easy-sync-probe-font-weight, normal);
+  font-style: var(--easy-sync-probe-font-style, normal);
+  letter-spacing: var(--easy-sync-probe-letter-spacing, normal);
+  text-transform: var(--easy-sync-probe-text-transform, none);
 }
 
 /* 子项不参与纵向挤压：is-limited 列表装满后应当滚动，而不是把灰字目录

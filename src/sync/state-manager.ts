@@ -63,6 +63,7 @@ import {
 import {
   inspectReceiptedRenameAnchorCollisionV2,
   reduceFileStateEnvelopeV2,
+  reduceFileStateEnvelopeV2Deletions,
 } from "./file-state-reducer-v2";
 import {
   projectRemoteIndexV2,
@@ -124,9 +125,11 @@ import {
   type StateV2IndexedDbActiveStore,
 } from "./state-v2-indexeddb-active";
 import {
+  addBuildPhaseMs,
   isIndexedDbRollbackFormRecoveryError,
   StateV2IndexedDbRecoveryStore,
   stateV2IndexedDbRecoveryEnvelopeDigest,
+  type StateV2CommitBuildTimings,
 } from "./state-v2-indexeddb-recovery";
 import { isIndexedDbVaultInstanceId } from "./indexeddb-vault-namespace";
 import {
@@ -279,12 +282,124 @@ export interface PluginDataStore {
     RemoteScopeRecoveryEvidenceStoreFactory;
 }
 
+/**
+ * Highest number of independent receipted mutations one
+ * `commitMutationCheckpoints` call may publish, and therefore also the size
+ * cap of one bulk-delete cleanup wave in the executor. A wave that exceeds it
+ * could only fail after its DELETEs already happened, so the executor derives
+ * its wave size from this exact number and pre-checks every wave against it.
+ */
+export const MAX_MUTATION_CHECKPOINT_BATCH = 64;
+
 export interface MutationCheckpointCommitMetrics {
   operations: number;
   ancestorPublishMs: number;
   v2CommitMs: number;
   ledgerClearMs: number;
   totalMs: number;
+  breakdown: V2CommitBreakdown;
+}
+
+/**
+ * Observation-only phase decomposition of one checkpoint commit's wall clock.
+ *
+ * Every bucket is written by instrumentation and read only by the
+ * `v2 commit breakdown` diagnostic line: no builder, reducer, recovery,
+ * durability or user-visible decision branches on a value here, and none of it
+ * is persisted or fed back into state. The buckets are measured so that they
+ * add up to `totalMs`, which is what leaves a batch's checkpoint cost with no
+ * unexplained remainder:
+ *
+ * - `queueMs` — waiting for `v2StateCommitQueue` (and, for the ledger clear,
+ *   the plugin-data queue).
+ * - `buildMs` — receipt/record preparation and its deep clones, the envelope
+ *   builder (reducers plus `validateEnvelope`), and the row diff the recovery
+ *   delta is computed from.
+ * - `canonicalMs` — every canonical serialization and digest the commit pays:
+ *   the content-facts comparison, envelope digests, recovery record digests.
+ * - `recoveryMs` — durable side-record I/O: base ancestor content objects, the
+ *   recovery delta and commit witness (staged write, exact read-back, rename),
+ *   or the whole-envelope JSON publication when JSON authority is active.
+ * - `idbMs` — the strict IndexedDB transaction plus the metadata reads before
+ *   and after it.
+ * - `ledgerMs` — the ledger-clear reduction and its in-memory comparisons.
+ * - `pluginDataMs` — the `data.json` write and the ledger backup beside it.
+ */
+export interface V2CommitBreakdown {
+  queueMs: number;
+  buildMs: number;
+  canonicalMs: number;
+  recoveryMs: number;
+  idbMs: number;
+  ledgerMs: number;
+  pluginDataMs: number;
+  totalMs: number;
+  /**
+   * Five-way split of `buildMs` (record preparation, deep clones, reducer
+   * derivation, validation, recovery row diff). The buckets sum to `buildMs`;
+   * `reduceMs` also carries the builder glue that no other bucket measures, so
+   * the split never leaves an unexplained remainder.
+   */
+  build: StateV2CommitBuildTimings;
+}
+
+function createV2CommitBreakdown(): V2CommitBreakdown {
+  return {
+    queueMs: 0,
+    buildMs: 0,
+    canonicalMs: 0,
+    recoveryMs: 0,
+    idbMs: 0,
+    ledgerMs: 0,
+    pluginDataMs: 0,
+    totalMs: 0,
+    build: {
+      prepareMs: 0,
+      cloneMs: 0,
+      reduceMs: 0,
+      validateMs: 0,
+      diffMs: 0,
+    },
+  };
+}
+
+/** Whole, non-negative milliseconds — the shape every diagnostic line uses. */
+function roundV2CommitBreakdown(
+  source: V2CommitBreakdown,
+): V2CommitBreakdown {
+  return {
+    queueMs: Math.max(0, Math.round(source.queueMs)),
+    buildMs: Math.max(0, Math.round(source.buildMs)),
+    canonicalMs: Math.max(0, Math.round(source.canonicalMs)),
+    recoveryMs: Math.max(0, Math.round(source.recoveryMs)),
+    idbMs: Math.max(0, Math.round(source.idbMs)),
+    ledgerMs: Math.max(0, Math.round(source.ledgerMs)),
+    pluginDataMs: Math.max(0, Math.round(source.pluginDataMs)),
+    totalMs: Math.max(0, Math.round(source.totalMs)),
+    build: {
+      prepareMs: Math.max(0, Math.round(source.build.prepareMs)),
+      cloneMs: Math.max(0, Math.round(source.build.cloneMs)),
+      reduceMs: Math.max(0, Math.round(source.build.reduceMs)),
+      validateMs: Math.max(0, Math.round(source.build.validateMs)),
+      diffMs: Math.max(0, Math.round(source.build.diffMs)),
+    },
+  };
+}
+
+/**
+ * Sweep the part of `buildMs` that no build phase measured into `reduceMs`, so
+ * the five reported sub-buckets always add up to the bucket they decompose.
+ * That remainder is the builder's own glue (envelope spreads and meta
+ * advances); it is never a validation, clone, diff or preparation cost.
+ * Measurement only.
+ */
+function finaliseV2BuildBreakdown(breakdown: V2CommitBreakdown): void {
+  const measured = breakdown.build.prepareMs
+    + breakdown.build.cloneMs
+    + breakdown.build.reduceMs
+    + breakdown.build.validateMs
+    + breakdown.build.diffMs;
+  breakdown.build.reduceMs += breakdown.buildMs - measured;
 }
 
 export type V2StateLoadBlockReason =
@@ -349,6 +464,7 @@ import {
   type ReceiptedRenameAnchorCollisionEvidenceV1,
   type MutationRecoveryHistory,
   type SyncRunFacts,
+  type SyncFileErrorFactV1,
   type LocalFolderMoveHintV1,
   type LocalFolderDeleteHintV1,
   type V2ActivationReviewKind,
@@ -358,6 +474,13 @@ import {
   sameSyncScope,
 } from "./types";
 import { BaseContentCache, isTextFile } from "./base-content-cache";
+import {
+  type LocalDeleteDecisionKind,
+  type LocalDeleteDecisionV1,
+  readLocalDeleteDecisions,
+  serializeLocalDeleteDecisionHashes,
+  parseLocalDeleteDecisionHashes,
+} from "./local-delete-decision";
 
 export class SyncPathMutationRecoveryError extends Error {
   constructor(message = "Cannot change sync paths while mutation recovery is unresolved") {
@@ -579,6 +702,13 @@ const KEY_LOCAL_FOLDER_MOVE_HINTS = "easy-sync-local-folder-move-hints";
 const KEY_LOCAL_FILE_MOVE_HINTS = "easy-sync-local-file-move-hints";
 const KEY_LOCAL_FOLDER_DELETE_HINTS = "easy-sync-local-folder-delete-hints";
 /** 片② 本机独有条目记录：原路径 ↔ 本机改动副本（片④ 消费、片⑤ 联动）。 */
+/**
+ * Device-local one-shot authorizations for the cloud-deletion follow direction.
+ * Kept out of the V2 shared envelope: another device must never inherit this
+ * device's confirmation. The records are consumed per path after the delete
+ * checkpoint settles.
+ */
+const KEY_LOCAL_DELETE_DECISIONS = "easy-sync-local-delete-decisions";
 const KEY_LOCAL_ONLY_COPIES = "easy-sync-local-only-copies";
 /** 删除记录簿（设备本地记录族，不进 V2 信封、不进同步）。 */
 const KEY_DELETION_LEDGER = "easy-sync-deletion-ledger";
@@ -635,7 +765,13 @@ export interface SyncHistoryEntry {
   foldersDeleted?: number;
   filesMoved?: number;
   deleted: number;
+  /** Historical compatibility sum: real conflicts + cloud-deleted files
+   *  awaiting local confirmation. Kept as-is for old readers. */
   conflicts: number;
+  /** The cloud-deletion part of `conflicts` this round (A2, 2026-10-26).
+   *  Optional: absent on entries written before the split. When present the
+   *  report table reads it directly instead of re-counting retained rows. */
+  remoteDeletePending?: number;
   deferred?: number;
   skipped: number;
   skippedLarge?: number;
@@ -651,6 +787,12 @@ export interface SyncHistoryEntry {
   files: FileProgress[];
   uploadBytes?: number;
   uploadReadMs?: number;
+  /**
+   * @deprecated Summed per-call upload wall clock from older builds. It
+   * divided throughput by the pool depth, so no new entry writes it; the
+   * round's transfer facts (`transferRates`) use the busy wall clock. Kept
+   * optional so history entries from older builds still parse.
+   */
   uploadNetworkMs?: number;
   peakUploads?: number;
   /** Passive connection-speed reading derived from this run's byte transfers. */
@@ -690,6 +832,10 @@ export interface PendingIssue {
   remoteETag?: string;
   /** M17: consecutive failures with same version. >= 3 → circuit breaker. */
   consecutiveFailures?: number;
+  /** Evidence-only failure facts of the last attempt (A3, 2026-10-26). Absent
+   *  on rows written before the field existed; never read by the breaker,
+   *  the pause gate or planning (see `SyncFileErrorFactV1`). */
+  error?: SyncFileErrorFactV1;
 }
 
 /** Top-level plugin data structure */
@@ -721,6 +867,7 @@ interface PluginData {
   [KEY_LOCAL_FOLDER_MOVE_HINTS]: LocalFolderMoveHintV1[];
   [KEY_LOCAL_FILE_MOVE_HINTS]: LocalFolderMoveHintV1[];
   [KEY_LOCAL_FOLDER_DELETE_HINTS]: LocalFolderDeleteHintV1[];
+  [KEY_LOCAL_DELETE_DECISIONS]: LocalDeleteDecisionV1[];
   [KEY_LOCAL_ONLY_COPIES]: LocalOnlyCopiesV1;
   [KEY_DELETION_LEDGER]: DeletionLedgerV1;
   [KEY_LOCAL_ONLY_IGNORE_MEMORY]: LocalOnlyIgnoreMemoryV1;
@@ -764,6 +911,7 @@ const DEFAULT_DATA: PluginData = {
     [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
     [KEY_LOCAL_FILE_MOVE_HINTS]: [],
     [KEY_LOCAL_FOLDER_DELETE_HINTS]: [],
+    [KEY_LOCAL_DELETE_DECISIONS]: [],
     [KEY_LOCAL_ONLY_COPIES]: emptyLocalOnlyCopiesV1(),
     [KEY_DELETION_LEDGER]: emptyDeletionLedgerV1(),
     [KEY_LOCAL_ONLY_IGNORE_MEMORY]: createEmptyLocalOnlyIgnoreMemory(),
@@ -800,6 +948,7 @@ function createDefaultData(generation = 0, planRevision = 0): PluginData {
     [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
     [KEY_LOCAL_FILE_MOVE_HINTS]: [],
     [KEY_LOCAL_FOLDER_DELETE_HINTS]: [],
+    [KEY_LOCAL_DELETE_DECISIONS]: [],
     [KEY_LOCAL_ONLY_COPIES]: emptyLocalOnlyCopiesV1(),
     [KEY_DELETION_LEDGER]: emptyDeletionLedgerV1(),
     [KEY_LOCAL_ONLY_IGNORE_MEMORY]: createEmptyLocalOnlyIgnoreMemory(),
@@ -912,6 +1061,17 @@ type StateV2StorageAuthorityEvidence =
       kind: "indexeddb";
       databaseId: string;
     });
+
+/** Options a `commitV2State` builder can use to skip duplicate work it has
+ *  already proven. They never relax a revision, scope, receipt or validation
+ *  conclusion; they only avoid recomputing a fact the builder already knows. */
+interface V2CommitOptions {
+  /** The returned envelope already passed `validateEnvelope` unchanged. */
+  candidateValidated?: boolean;
+  /** The returned envelope provably changed content facts, not only
+   *  bookkeeping fields. Builders set this while they run. */
+  contentFactsChanged?: boolean;
+}
 
 export class StateManager {
   private data: PluginData;
@@ -1701,6 +1861,9 @@ export class StateManager {
       [KEY_LOCAL_FOLDER_DELETE_HINTS]: parseLocalFolderDeleteHints(
         saved[KEY_LOCAL_FOLDER_DELETE_HINTS],
       ),
+      [KEY_LOCAL_DELETE_DECISIONS]: readLocalDeleteDecisions(
+        saved[KEY_LOCAL_DELETE_DECISIONS],
+      ),
       [KEY_LOCAL_ONLY_COPIES]:
         readLocalOnlyCopiesV1(saved[KEY_LOCAL_ONLY_COPIES])
         ?? emptyLocalOnlyCopiesV1(),
@@ -1816,6 +1979,27 @@ export class StateManager {
       const family = current[KEY_DELETION_LEDGER] ?? emptyDeletionLedgerV1();
       const next = upsertDeletionLedgerEntryV1(family, entry);
       if (next === family) return current;
+      return { ...current, [KEY_DELETION_LEDGER]: next };
+    });
+  }
+
+  /**
+   * Deletion-ledger half of a cleanup wave: one device-local write for the
+   * whole wave. Upserts keep the remote-id identity semantics of
+   * `recordCloudDeletion`; the ledger only serves the recovery clue, so a
+   * lost wave may cost one clue but never blocks the already-applied delete.
+   */
+  async recordCloudDeletions(
+    entries: readonly DeletionLedgerEntryV1[],
+  ): Promise<void> {
+    if (entries.length === 0) return;
+    await this.commitPluginData((current) => {
+      const previous = current[KEY_DELETION_LEDGER] ?? emptyDeletionLedgerV1();
+      let next = previous;
+      for (const entry of entries) {
+        next = upsertDeletionLedgerEntryV1(next, entry);
+      }
+      if (next === previous) return current;
       return { ...current, [KEY_DELETION_LEDGER]: next };
     });
   }
@@ -1979,12 +2163,21 @@ export class StateManager {
   /** Publish a complete PluginData candidate only after its durable write succeeds. */
   private commitPluginData(
     buildNext: (current: PluginData) => PluginData,
+    breakdown?: V2CommitBreakdown,
   ): Promise<void> {
+    // Measurement only: the queue wait belongs to the same bucket as the
+    // reduction the caller asked for (`ledgerMs`), the durable write to
+    // `pluginDataMs`.
+    const enqueuedAt = performance.now();
     const task = this.pluginDataCommitQueue.then(async () => {
+      if (breakdown) breakdown.ledgerMs += performance.now() - enqueuedAt;
+      const buildStartedAt = performance.now();
       const next = buildNext(this.data);
+      if (breakdown) breakdown.ledgerMs += performance.now() - buildStartedAt;
       if (next === this.data) return;
       const ledgerChanged = next[KEY_MUTATION_LEDGER]
         !== this.data[KEY_MUTATION_LEDGER];
+      const persistStartedAt = performance.now();
       await this.persistPluginData(next);
       this.data = next;
       if (ledgerChanged) {
@@ -1992,6 +2185,9 @@ export class StateManager {
         // every ledger change so a corrupt primary copy can be restored.
         // Best-effort internally; never fails the data commit.
         await this.writeMutationLedgerBackup(next[KEY_MUTATION_LEDGER]);
+      }
+      if (breakdown) {
+        breakdown.pluginDataMs += performance.now() - persistStartedAt;
       }
     });
     this.pluginDataCommitQueue = task.catch(() => undefined);
@@ -2594,6 +2790,8 @@ export class StateManager {
   private async publishV2Candidate(
     current: SyncStateEnvelopeV2,
     candidate: SyncStateEnvelopeV2,
+    candidateValidated = false,
+    breakdown?: V2CommitBreakdown,
   ): Promise<void> {
     if (this.v2IndexedDbStore) {
       if (!this.currentIndexedDbVaultInstanceId()) {
@@ -2601,13 +2799,23 @@ export class StateManager {
           "V2 IndexedDB Vault identity changed after activation",
         );
       }
-      await this.v2IndexedDbStore.commit(current, candidate);
+      await this.v2IndexedDbStore.commit(current, candidate, {
+        nextValidated: candidateValidated,
+        timings: breakdown,
+      });
       return;
     }
     if (!this.v2Store) {
       throw new Error("V2 state controller is not active");
     }
+    // JSON authority publishes the whole envelope through its own staged
+    // write/rename; the recovery bucket is where every durable side-record
+    // publication of a commit lands (see V2CommitBreakdown).
+    const publishStartedAt = performance.now();
     await this.v2Store.publish(candidate);
+    if (breakdown) {
+      breakdown.recoveryMs += performance.now() - publishStartedAt;
+    }
   }
 
   private async selectJsonV2Storage(
@@ -2738,9 +2946,14 @@ export class StateManager {
 
   private commitV2State(
     buildNext: (current: SyncStateEnvelopeV2) => SyncStateEnvelopeV2,
+    options: V2CommitOptions = {},
+    breakdown?: V2CommitBreakdown,
   ): Promise<boolean> {
     let changed = false;
+    // Measurement only: `enqueuedAt` and the marks below never feed a decision.
+    const enqueuedAt = performance.now();
     const task = this.v2StateCommitQueue.then(async () => {
+      if (breakdown) breakdown.queueMs += performance.now() - enqueuedAt;
       if (this.v2StateLoadBlock) {
         throw new Error("V2 state writes are blocked until load recovery completes");
       }
@@ -2752,7 +2965,9 @@ export class StateManager {
           "V2 state writes are blocked during remote scope recovery",
         );
       }
+      const buildStartedAt = performance.now();
       const candidate = buildNext(this.v2Envelope);
+      if (breakdown) breakdown.buildMs += performance.now() - buildStartedAt;
       if (candidate === this.v2Envelope) return;
       // W4 probe (2026-10-24): the content-facts comparison canonicalizes
       // the WHOLE envelope (old and new) per commit — the suspected CPU
@@ -2763,11 +2978,25 @@ export class StateManager {
       const probeOn = diag?.isEnabled?.("state") === true;
       const commitStartedAt = probeOn ? performance.now() : 0;
       const canonicalizeStartedAt = commitStartedAt;
+      const breakdownCanonicalStartedAt = performance.now();
+      // A builder may already know its result changed content facts (not just
+      // bookkeeping fields); in that case the canonical whole-envelope
+      // comparison would always answer "changed" and can be skipped.
+      const contentFactsProven = options.contentFactsChanged === true;
       const contentFactChanged =
-        contentFactsCanonicalJson(this.v2Envelope)
-        !== contentFactsCanonicalJson(candidate);
+        contentFactsProven
+          || contentFactsCanonicalJson(this.v2Envelope)
+            !== contentFactsCanonicalJson(candidate);
       const canonicalizeFinishedAt = probeOn ? performance.now() : 0;
-      await this.publishV2Candidate(this.v2Envelope, candidate);
+      if (breakdown) {
+        breakdown.canonicalMs += performance.now() - breakdownCanonicalStartedAt;
+      }
+      await this.publishV2Candidate(
+        this.v2Envelope,
+        candidate,
+        options.candidateValidated === true,
+        breakdown,
+      );
       this.activateV2Envelope(candidate, contentFactChanged);
       if (probeOn) {
         // totalMs is the commit's whole cost (canonicalize + durable publish
@@ -2782,6 +3011,10 @@ export class StateManager {
           remoteItems: Object.keys(candidate.remoteIndex.itemsById ?? {})
             .length,
           anchors: Object.keys(candidate.anchors.byAnchorId ?? {}).length,
+          // True when the builder proved the change, i.e. this commit paid zero
+          // whole-envelope canonicalizations instead of two. The probe must
+          // stay measurement-only: nothing reads this back.
+          wholeEnvelopeComparisonSkipped: contentFactsProven,
         });
       }
       changed = true;
@@ -3167,6 +3400,7 @@ export class StateManager {
         [KEY_PENDING_CONFLICTS]: [],
         [KEY_PENDING_DELETES]: [],
         [KEY_PENDING_ISSUES]: [],
+        [KEY_LOCAL_DELETE_DECISIONS]: [],
         [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
         [KEY_LOCAL_FILE_MOVE_HINTS]: [],
         [KEY_GENERATION]: pluginData[KEY_GENERATION] + 1,
@@ -3290,6 +3524,7 @@ export class StateManager {
         [KEY_PENDING_CONFLICTS]: [],
         [KEY_PENDING_DELETES]: [],
         [KEY_PENDING_ISSUES]: [],
+        [KEY_LOCAL_DELETE_DECISIONS]: [],
         [KEY_LOCAL_FOLDER_MOVE_HINTS]: [],
         [KEY_LOCAL_FILE_MOVE_HINTS]: [],
         [KEY_GENERATION]: current[KEY_GENERATION] + 1,
@@ -3459,25 +3694,30 @@ export class StateManager {
         ? Object.entries(source.baseContentEntries)
         : []
     ).sort(([left], [right]) => left.localeCompare(right));
-    for (const [path, content] of entries) {
-      const base = baseByPath.get(path);
-      const bytes = new TextEncoder().encode(content).buffer;
-      if (
-        !base
-        || bytes.byteLength !== base.size
-        || await sha256Hex(bytes) !== base.hash
-      ) {
-        rejected++;
-        continue;
+    // One inventory rebuild for the whole migration snapshot instead of one
+    // per file: the objects are individually verified by putText, and the
+    // manifest is only their rebuildable index.
+    await store.runManifestBatch(async () => {
+      for (const [path, content] of entries) {
+        const base = baseByPath.get(path);
+        const bytes = new TextEncoder().encode(content).buffer;
+        if (
+          !base
+          || bytes.byteLength !== base.size
+          || await sha256Hex(bytes) !== base.hash
+        ) {
+          rejected++;
+          continue;
+        }
+        try {
+          const hash = await store.putText(bytes);
+          if (hash === base.hash) hashesByPath[path] = hash;
+          else unavailable++;
+        } catch {
+          unavailable++;
+        }
       }
-      try {
-        const hash = await store.putText(bytes);
-        if (hash === base.hash) hashesByPath[path] = hash;
-        else unavailable++;
-      } catch {
-        unavailable++;
-      }
-    }
+    });
     return {
       hashesByPath,
       sourceEntries: entries.length,
@@ -4015,7 +4255,7 @@ export class StateManager {
    * action the row cannot take.
    */
   getScopeCrossingExitKind(path: string): "folder" | "file" | null {
-    const envelope = this.getCommittedV2Envelope();
+    const envelope = this.peekCommittedV2Envelope();
     if (!envelope) return null;
     return findScopeCrossingCoveringHintV1(path, {
       envelope,
@@ -4460,6 +4700,54 @@ export class StateManager {
         [KEY_MUTATION_LEDGER]: [
           ...current[KEY_MUTATION_LEDGER],
           { intent, receipt: null },
+        ],
+      };
+    });
+  }
+
+  /**
+   * Persist one cleanup wave's intents in a single device-local write.
+   *
+   * Admission is identical to `beginMutationIntent` (no duplicate operation,
+   * no already-pending path); the whole wave is validated before the one
+   * write, so a rejected wave leaves the durable ledger untouched. Batching
+   * exists only to remove the per-file whole-`data.json` rewrite from bulk
+   * deletes — the durability contract is unchanged: every intent of the wave
+   * is durable before the wave's first mutation starts.
+   */
+  async beginMutationIntents(intents: readonly MutationIntent[]): Promise<void> {
+    if (intents.length === 0) return;
+    if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
+      throw new Error("Mutation intent requires active V2 authority");
+    }
+    if (this.mutationLedgerCorrupt) throw new Error("Mutation recovery ledger is corrupt");
+    const operationIds = new Set<string>();
+    const paths = new Set<string>();
+    for (const intent of intents) {
+      if (operationIds.has(intent.operationId)) {
+        throw new Error(`Duplicate mutation operation: ${intent.operationId}`);
+      }
+      if (paths.has(intent.path)) {
+        throw new Error(`Mutation already pending for path: ${intent.path}`);
+      }
+      operationIds.add(intent.operationId);
+      paths.add(intent.path);
+    }
+    await this.commitPluginData((current) => {
+      const ledger = current[KEY_MUTATION_LEDGER];
+      for (const intent of intents) {
+        if (ledger.some((entry) => entry.intent.operationId === intent.operationId)) {
+          throw new Error(`Duplicate mutation operation: ${intent.operationId}`);
+        }
+        if (ledger.some((entry) => entry.intent.path === intent.path)) {
+          throw new Error(`Mutation already pending for path: ${intent.path}`);
+        }
+      }
+      return {
+        ...current,
+        [KEY_MUTATION_LEDGER]: [
+          ...ledger,
+          ...intents.map((intent) => ({ intent, receipt: null })),
         ],
       };
     });
@@ -5204,6 +5492,59 @@ export class StateManager {
   }
 
   /**
+   * Receipt half of a cleanup wave: one device-local write for every receipted
+   * member. Each receipt passes the same admission gates as
+   * `recordMutationReceipt`; the wave is applied progressively inside the
+   * single write, so a rejected member aborts the whole write and leaves the
+   * previous durable ledger in place.
+   */
+  async recordMutationReceipts(
+    receipts: readonly MutationReceiptV1[],
+  ): Promise<void> {
+    if (receipts.length === 0) return;
+    if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
+      throw new Error("Mutation receipt requires active V2 authority");
+    }
+    if (this.mutationLedgerCorrupt) throw new Error("Mutation recovery ledger is corrupt");
+    await this.commitPluginData((current) => {
+      let entries = current[KEY_MUTATION_LEDGER];
+      for (const receipt of receipts) {
+        const index = findUniqueMutationLedgerRecordIndex(
+          entries,
+          receipt.operationId,
+        );
+        if (index < 0) throw new Error(`Mutation intent missing: ${receipt.operationId}`);
+        const candidate = { ...entries[index], receipt };
+        const preparedCandidate = this.prepareMutationRecoveryRecord(
+          candidate,
+          this.v2Envelope!.scope,
+        );
+        if (
+          requiresOrdinaryFileRecoverySemanticGate(candidate)
+          && (
+            !preparedCandidate
+            || !isOrdinaryFileRecoveryRecord(
+              preparedCandidate,
+              this.v2Envelope!.scope,
+            )
+          )
+        ) {
+          const gateReason = !preparedCandidate
+            ? "scope does not match the committed envelope"
+            : "record shape is not an ordinary file recovery record";
+          throw new Error(
+            `Mutation receipt evidence is invalid (${gateReason}): ${receipt.operationId}`,
+          );
+        }
+        entries = entries.map((entry, entryIndex) =>
+          entryIndex === index ? candidate : entry,
+        );
+      }
+      return { ...current, [KEY_MUTATION_LEDGER]: entries };
+    });
+  }
+
+  /**
    * Atomically re-spell one receipted rename's destination paths — intent.path
    * plus the receipt's base/upsert path — to the committed index spelling of
    * the moved identity. Every source-side path and every other field stays
@@ -5507,15 +5848,25 @@ export class StateManager {
     operationIds: readonly string[],
   ): Promise<MutationCheckpointCommitMetrics> {
     const totalStartedAt = Date.now();
+    // One observation record per commit; `v2 commit breakdown` is its only
+    // consumer. Nothing below reads these numbers back into a decision.
+    const breakdown = createV2CommitBreakdown();
+    const totalPerfStartedAt = performance.now();
     if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
       throw new Error("Mutation checkpoint requires active V2 authority");
     }
-    if (operationIds.length === 0 || operationIds.length > 32) {
-      throw new Error("Mutation checkpoint batch must contain 1 to 32 operations");
+    if (
+      operationIds.length === 0
+      || operationIds.length > MAX_MUTATION_CHECKPOINT_BATCH
+    ) {
+      throw new Error(
+        `Mutation checkpoint batch must contain 1 to ${MAX_MUTATION_CHECKPOINT_BATCH} operations`,
+      );
     }
     if (new Set(operationIds).size !== operationIds.length) {
       throw new Error("Mutation checkpoint batch contains duplicate operations");
     }
+    const recordBuildStartedAt = performance.now();
     const records = operationIds.map((operationId) => {
       const recordIndex = findUniqueMutationLedgerRecordIndex(
         this.data[KEY_MUTATION_LEDGER],
@@ -5551,15 +5902,59 @@ export class StateManager {
       return recoveryRecord;
     });
     this.assertIndependentMutationCheckpointBatch(records);
+    addBuildPhaseMs(breakdown, "prepareMs", performance.now() - recordBuildStartedAt);
     const checkpoints = records.map((record) => record.receipt!.checkpoint);
     const baseUpserts = checkpoints.flatMap((checkpoint) => checkpoint.baseUpserts);
     const ancestorStartedAt = Date.now();
+    const ancestorPerfStartedAt = performance.now();
     const ancestorHashes = records.some((record) => isFolderMutationIntent(record.intent))
       ? {}
       : await this.publishPendingV2Ancestors(baseUpserts);
     const ancestorPublishMs = Date.now() - ancestorStartedAt;
+    breakdown.recoveryMs += performance.now() - ancestorPerfStartedAt;
     const v2CommitStartedAt = Date.now();
+    // The builder marks the options only at the two return points that have
+    // just validated the exact envelope object it returns, so the IndexedDB
+    // owner can skip its own duplicate validation of that unmodified object.
+    const commitOptions: V2CommitOptions = {};
     await this.commitV2State((current) => {
+      // `buildMs` already measures this whole builder, so only the five-way
+      // split is attributed here: the reducer sink carries every validation
+      // the reducers and the ancestor attachment run themselves, the explicit
+      // candidate validation is timed on its own, and the rest of the region's
+      // wall clock is the reducer derivation (identity projections, row merges,
+      // sorts). Measurement only — nothing below reads these numbers back.
+      const reduceRegionStartedAt = performance.now();
+      const reducerValidation = { validateMs: 0 };
+      let candidateValidationMs = 0;
+      const closeReduceRegion = (): void => {
+        const elapsed = performance.now() - reduceRegionStartedAt;
+        breakdown.build.validateMs += reducerValidation.validateMs
+          + candidateValidationMs;
+        breakdown.build.reduceMs += Math.max(
+          0,
+          elapsed - reducerValidation.validateMs - candidateValidationMs,
+        );
+      };
+      // A cleanup wave is N plain file deletions: one batched reduce applies
+      // them in a single projection instead of N full-vault reduces.
+      const batchedDeletions = reduceFileStateEnvelopeV2Deletions(
+        current,
+        records,
+        reducerValidation,
+      );
+      if (batchedDeletions) {
+        // A new envelope from the batched reducer was validated by it and
+        // only appears after removing at least one remote node or anchor row.
+        // Rows are part of the content facts, so the canonical comparison
+        // must answer "changed".
+        if (batchedDeletions !== current) {
+          commitOptions.contentFactsChanged = true;
+        }
+        commitOptions.candidateValidated = true;
+        closeReduceRegion();
+        return batchedDeletions;
+      }
       let reduced = current;
       let changed = false;
       let committedAt = current.meta.committedAt;
@@ -5567,21 +5962,36 @@ export class StateManager {
         const before = reduced;
         const checkpoint = record.receipt!.checkpoint;
         let next = isFolderMutationIntent(record.intent)
-          ? reduceFolderStateEnvelopeV2(before, record)
-          : reduceFileStateEnvelopeV2(before, record);
+          ? reduceFolderStateEnvelopeV2(before, record, reducerValidation)
+          : reduceFileStateEnvelopeV2(before, record, reducerValidation);
         if (Object.keys(ancestorHashes).length > 0) {
           next = attachBaseAncestorHashesV2(
             before,
             next,
             checkpoint.baseUpserts,
             ancestorHashes,
+            undefined,
+            reducerValidation,
           );
         }
         if (next !== before) changed = true;
         reduced = next;
         committedAt = Math.max(committedAt, record.receipt!.completedAt);
       }
-      if (!changed) return current;
+      if (!changed) {
+        closeReduceRegion();
+        return current;
+      }
+      // Both reducers return their input envelope unchanged when their derived
+      // rows equal the committed ones (`sameFileState` / the folder reducers'
+      // own `return envelope` early exits). Reaching this point therefore means
+      // at least one remote node, file anchor or folder anchor row differs, and
+      // every one of those rows is a content fact (only `commitSeq`,
+      // `committedAt`, the delta cursor and the remote-entry bookkeeping keys
+      // are volatile). The canonical whole-envelope comparison would answer
+      // "changed" by construction, so the builder proves it instead of paying
+      // two full-envelope canonicalizations per batch.
+      commitOptions.contentFactsChanged = true;
       const candidate: SyncStateEnvelopeV2 = {
         ...reduced,
         meta: {
@@ -5590,9 +6000,13 @@ export class StateManager {
           committedAt,
         },
       };
+      const candidateValidateStartedAt = performance.now();
       validateEnvelope(candidate);
+      candidateValidationMs = performance.now() - candidateValidateStartedAt;
+      commitOptions.candidateValidated = true;
+      closeReduceRegion();
       return candidate;
-    });
+    }, commitOptions, breakdown);
     const v2CommitMs = Date.now() - v2CommitStartedAt;
     this.clearPendingV2AncestorContent(baseUpserts);
     const conflictRemovals = new Set(
@@ -5659,14 +6073,22 @@ export class StateManager {
           (hint) => !folderMoveHintRemovals.has(hint.remoteId),
         ),
       };
-    });
+    }, breakdown);
     const ledgerClearMs = Date.now() - ledgerClearStartedAt;
+    breakdown.totalMs = performance.now() - totalPerfStartedAt;
+    finaliseV2BuildBreakdown(breakdown);
+    const roundedBreakdown = roundV2CommitBreakdown(breakdown);
+    this.plugin.diag?.log?.("state", "v2 commit breakdown", {
+      operations: records.length,
+      ...roundedBreakdown,
+    });
     return {
       operations: records.length,
       ancestorPublishMs,
       v2CommitMs,
       ledgerClearMs,
       totalMs: Date.now() - totalStartedAt,
+      breakdown: roundedBreakdown,
     };
   }
 
@@ -5835,26 +6257,32 @@ export class StateManager {
     if (!this.v2Envelope || entries.length === 0) return {};
     const store = this.ancestorStoreV2 ?? this.createAncestorStoreV2();
     this.ancestorStoreV2 = store;
-    const hashes: Record<string, string> = {};
-    for (const entry of entries) {
-      const content = this.pendingV2AncestorContent.get(entry.path);
-      if (content === undefined) continue;
-      const bytes = typeof content === "string"
-        ? new TextEncoder().encode(content).buffer
-        : content;
-      if (
-        bytes.byteLength !== entry.size
-        || await sha256Hex(bytes) !== entry.hash
-      ) continue;
-      try {
-        const hash = await store.putText(bytes);
-        if (hash === entry.hash) hashes[entry.path] = hash;
-      } catch {
-        // Ancestor availability is optional. Never attach a dangling hash or
-        // roll back an otherwise proven common-state checkpoint.
+    // One checkpoint batch owns one manifest rebuild. Each putText still
+    // proves its own bytes before returning; only the derived inventory write
+    // is coalesced, so a crash mid-batch can never expose an unverified
+    // ancestor and the next put/sweep rebuilds the manifest from the objects.
+    return store.runManifestBatch(async () => {
+      const hashes: Record<string, string> = {};
+      for (const entry of entries) {
+        const content = this.pendingV2AncestorContent.get(entry.path);
+        if (content === undefined) continue;
+        const bytes = typeof content === "string"
+          ? new TextEncoder().encode(content).buffer
+          : content;
+        if (
+          bytes.byteLength !== entry.size
+          || await sha256Hex(bytes) !== entry.hash
+        ) continue;
+        try {
+          const hash = await store.putText(bytes);
+          if (hash === entry.hash) hashes[entry.path] = hash;
+        } catch {
+          // Ancestor availability is optional. Never attach a dangling hash or
+          // roll back an otherwise proven common-state checkpoint.
+        }
       }
-    }
-    return hashes;
+      return hashes;
+    });
   }
 
   private clearPendingV2AncestorContent(
@@ -6638,6 +7066,90 @@ export class StateManager {
       }).envelope;
     });
     await this.clearSyncScopeExpansion(marker.revision);
+    return { status: "accepted", accepted: reduced.accepted };
+  }
+
+  /**
+   * Commit folder mappings that complete current facts already determine: a
+   * local folder and exactly one cloud folder at the same path under a known
+   * parent. This is the incremental form of the first-generation bootstrap; it
+   * is state-only authority and authorizes no file or folder mutation. The
+   * caller derives the candidates from a complete local scan and a complete
+   * remote index, and this method re-validates them against the committed
+   * envelope before one CAS commit.
+   */
+  async acceptDerivedFolderMappings(input: {
+    scope: Readonly<SyncScope>;
+    localFiles: readonly LocalFileEntry[];
+    localFolders: readonly LocalFolderEntry[];
+    localFolderScanComplete: boolean;
+    remoteIdentityComplete: boolean;
+    authorizedFolders: readonly RemoteFolderEntry[];
+    now?: number;
+  }): Promise<{
+    status: "accepted" | "none" | "blocked";
+    accepted: number;
+    reason?: string;
+  }> {
+    if (input.authorizedFolders.length === 0) {
+      return { status: "none", accepted: 0 };
+    }
+    const envelope = this.v2Envelope;
+    if (
+      !envelope
+      || !sameSyncScope(envelope.scope, input.scope)
+      || await this.confirmedDescendantEvidenceBlocked(input.scope)
+    ) {
+      return { status: "blocked", accepted: 0, reason: "state-not-clean" };
+    }
+    const confirmedAt = input.now ?? Date.now();
+    const reduced = acceptScopeExpansionFolderAnchorsV2({
+      envelope,
+      localFiles: input.localFiles,
+      localFolders: input.localFolders,
+      localFolderScanComplete: input.localFolderScanComplete,
+      remoteIdentityComplete: input.remoteIdentityComplete,
+      authorizedFolders: input.authorizedFolders,
+      confirmedAt,
+    });
+    if (reduced.status !== "accepted") {
+      return { status: "blocked", accepted: 0, reason: reduced.reason };
+    }
+    const expectedCommitSeq = envelope.meta.commitSeq;
+    const staleCommit = new Error(
+      "Derived folder mappings changed before state commit",
+    );
+    try {
+      await this.commitV2State((current) => {
+        if (
+          current.meta.commitSeq !== expectedCommitSeq
+          || !sameSyncScope(current.scope, input.scope)
+        ) {
+          throw staleCommit;
+        }
+        const currentReduction = acceptScopeExpansionFolderAnchorsV2({
+          envelope: current,
+          localFiles: input.localFiles,
+          localFolders: input.localFolders,
+          localFolderScanComplete: input.localFolderScanComplete,
+          remoteIdentityComplete: input.remoteIdentityComplete,
+          authorizedFolders: input.authorizedFolders,
+          confirmedAt,
+        });
+        if (
+          currentReduction.status !== "accepted"
+          || currentReduction.accepted !== reduced.accepted
+        ) {
+          throw staleCommit;
+        }
+        return currentReduction.envelope;
+      });
+    } catch (error) {
+      if (error === staleCommit) {
+        return { status: "blocked", accepted: 0, reason: "facts-changed" };
+      }
+      throw error;
+    }
     return { status: "accepted", accepted: reduced.accepted };
   }
 
@@ -7497,12 +8009,21 @@ export class StateManager {
   }
 
   async removePendingDelete(path: string): Promise<void> {
-    await this.save((current) => ({
-      ...current,
-      [KEY_PENDING_DELETES]: current[KEY_PENDING_DELETES].filter(
-        (i) => i.path !== path,
-      ),
-    }));
+    await this.save((current) => {
+      const decisions = withoutLocalDeleteDecisionPaths(
+        current[KEY_LOCAL_DELETE_DECISIONS],
+        new Set([path]),
+      );
+      return {
+        ...current,
+        [KEY_PENDING_DELETES]: current[KEY_PENDING_DELETES].filter(
+          (i) => i.path !== path,
+        ),
+        ...(decisions.changed
+          ? { [KEY_LOCAL_DELETE_DECISIONS]: decisions.records }
+          : {}),
+      };
+    });
   }
 
   async prunePendingDeletes(activePaths: Iterable<string>): Promise<void> {
@@ -7514,6 +8035,198 @@ export class StateManager {
       return next.length === current[KEY_PENDING_DELETES].length
         ? current
         : { ...current, [KEY_PENDING_DELETES]: next };
+    });
+  }
+
+  // ---- Local delete decisions ----
+
+  get localDeleteDecisions(): LocalDeleteDecisionV1[] {
+    return this.data[KEY_LOCAL_DELETE_DECISIONS];
+  }
+
+  /**
+   * Merge one confirmation into the device-local record for its scope.
+   *
+   * Re-confirming a path supersedes its previous fact hash. The record token
+   * is scope-derived, so separate confirmations in the same vault/account/scope
+   * share one record and one data.json key.
+   */
+  async addLocalDeleteDecisions(input: {
+    kind?: LocalDeleteDecisionKind;
+    recordToken: string;
+    paths: readonly string[];
+    hashes: readonly string[];
+    now?: number;
+  }): Promise<void> {
+    const kind: LocalDeleteDecisionKind = input.kind ?? "file";
+    if (
+      input.recordToken.length === 0
+      || input.paths.length !== input.hashes.length
+      || input.paths.length === 0
+    ) {
+      throw new Error("Local delete decision paths and hashes must align");
+    }
+    const paths = [...input.paths];
+    if (new Set(paths).size !== paths.length) {
+      throw new Error("Local delete decision paths must be unique");
+    }
+    const incoming = new Map<string, string>();
+    for (let index = 0; index < paths.length; index++) {
+      incoming.set(paths[index], input.hashes[index]);
+    }
+    const now = input.now ?? Date.now();
+    await this.save((current) => {
+      const nextRecords: LocalDeleteDecisionV1[] = [];
+      let existing: LocalDeleteDecisionV1 | null = null;
+      for (const record of current[KEY_LOCAL_DELETE_DECISIONS]) {
+        if (record.token === input.recordToken) {
+          if (record.kind !== kind) continue;
+          const hashes = parseLocalDeleteDecisionHashes(record.planDigest);
+          if (!hashes || hashes.length !== record.paths.length) {
+            // An unreadable record can never authorize anything; replace it.
+            continue;
+          }
+          existing = record;
+          continue;
+        }
+        const hashes = parseLocalDeleteDecisionHashes(record.planDigest);
+        if (!hashes || hashes.length !== record.paths.length) {
+          nextRecords.push(record);
+          continue;
+        }
+        const keepPaths: string[] = [];
+        const keepHashes: string[] = [];
+        for (let index = 0; index < record.paths.length; index++) {
+          if (incoming.has(record.paths[index])) continue;
+          keepPaths.push(record.paths[index]);
+          keepHashes.push(hashes[index]);
+        }
+        if (keepPaths.length > 0) {
+          nextRecords.push({
+            ...record,
+            paths: keepPaths,
+            planDigest: serializeLocalDeleteDecisionHashes(keepHashes),
+          });
+        }
+      }
+      const mergedPaths: string[] = [];
+      const mergedHashes: string[] = [];
+      if (existing) {
+        const hashes = parseLocalDeleteDecisionHashes(existing.planDigest);
+        if (hashes && hashes.length === existing.paths.length) {
+          for (let index = 0; index < existing.paths.length; index++) {
+            if (incoming.has(existing.paths[index])) continue;
+            mergedPaths.push(existing.paths[index]);
+            mergedHashes.push(hashes[index]);
+          }
+        }
+      }
+      for (const [path, hash] of incoming) {
+        mergedPaths.push(path);
+        mergedHashes.push(hash);
+      }
+      nextRecords.push({
+        kind,
+        token: input.recordToken,
+        paths: mergedPaths,
+        planDigest: serializeLocalDeleteDecisionHashes(mergedHashes),
+        createdAt: existing?.createdAt ?? now,
+      });
+      if (
+        JSON.stringify(nextRecords)
+          === JSON.stringify(current[KEY_LOCAL_DELETE_DECISIONS])
+      ) return current;
+      return { ...current, [KEY_LOCAL_DELETE_DECISIONS]: nextRecords };
+    });
+  }
+
+  /** Remove paths from every decision record (reject, retire, out-of-scope). */
+  async removeLocalDeleteDecisionPaths(
+    paths: Iterable<string>,
+  ): Promise<void> {
+    const removed = new Set(paths);
+    if (removed.size === 0) return;
+    await this.save((current) => {
+      const next: LocalDeleteDecisionV1[] = [];
+      let changed = false;
+      for (const record of current[KEY_LOCAL_DELETE_DECISIONS]) {
+        const hashes = parseLocalDeleteDecisionHashes(record.planDigest);
+        if (!hashes || hashes.length !== record.paths.length) {
+          next.push(record);
+          continue;
+        }
+        const keepPaths: string[] = [];
+        const keepHashes: string[] = [];
+        for (let index = 0; index < record.paths.length; index++) {
+          if (removed.has(record.paths[index])) {
+            changed = true;
+            continue;
+          }
+          keepPaths.push(record.paths[index]);
+          keepHashes.push(hashes[index]);
+        }
+        if (keepPaths.length > 0) {
+          next.push({
+            ...record,
+            paths: keepPaths,
+            planDigest: serializeLocalDeleteDecisionHashes(keepHashes),
+          });
+        }
+      }
+      if (!changed) return current;
+      return { ...current, [KEY_LOCAL_DELETE_DECISIONS]: next };
+    });
+  }
+
+  /**
+   * Remove successfully deleted paths from their decision records after the
+   * delete checkpoint settled. The stored hash of every remaining path stays
+   * byte-identical, so a changed failed path cannot inherit the confirmation.
+   */
+  async settleLocalDeleteDecisions(
+    settled: ReadonlyArray<{ token: string; path: string }>,
+  ): Promise<void> {
+    if (settled.length === 0) return;
+    const byToken = new Map<string, Set<string>>();
+    for (const entry of settled) {
+      const paths = byToken.get(entry.token) ?? new Set<string>();
+      paths.add(entry.path);
+      byToken.set(entry.token, paths);
+    }
+    await this.save((current) => {
+      const next: LocalDeleteDecisionV1[] = [];
+      let changed = false;
+      for (const record of current[KEY_LOCAL_DELETE_DECISIONS]) {
+        const removed = byToken.get(record.token);
+        if (!removed || removed.size === 0) {
+          next.push(record);
+          continue;
+        }
+        const hashes = parseLocalDeleteDecisionHashes(record.planDigest);
+        if (!hashes || hashes.length !== record.paths.length) {
+          next.push(record);
+          continue;
+        }
+        const keepPaths: string[] = [];
+        const keepHashes: string[] = [];
+        for (let index = 0; index < record.paths.length; index++) {
+          if (removed.has(record.paths[index])) {
+            changed = true;
+            continue;
+          }
+          keepPaths.push(record.paths[index]);
+          keepHashes.push(hashes[index]);
+        }
+        if (keepPaths.length > 0) {
+          next.push({
+            ...record,
+            paths: keepPaths,
+            planDigest: serializeLocalDeleteDecisionHashes(keepHashes),
+          });
+        }
+      }
+      if (!changed) return current;
+      return { ...current, [KEY_LOCAL_DELETE_DECISIONS]: next };
     });
   }
 
@@ -7703,11 +8416,21 @@ export class StateManager {
       const reviewedPathRetired = current[KEY_PLAN_REVIEW_ITEMS].some(
         (item) => shouldRetire(item.path),
       );
+      const retiredDecisionPaths = new Set(
+        current[KEY_LOCAL_DELETE_DECISIONS]
+          .flatMap((record) => record.paths)
+          .filter((path) => shouldRetire(path)),
+      );
+      const decisions = withoutLocalDeleteDecisionPaths(
+        current[KEY_LOCAL_DELETE_DECISIONS],
+        retiredDecisionPaths,
+      );
       const clearReview = invalidatePlanReview || reviewedPathRetired;
       const changed =
         pendingConflicts.length !== current[KEY_PENDING_CONFLICTS].length
         || pendingDeletes.length !== current[KEY_PENDING_DELETES].length
         || pendingIssues.length !== current[KEY_PENDING_ISSUES].length
+        || decisions.changed
         || clearReview;
       if (!changed) return current;
       return {
@@ -7715,6 +8438,9 @@ export class StateManager {
         [KEY_PENDING_CONFLICTS]: pendingConflicts,
         [KEY_PENDING_DELETES]: pendingDeletes,
         [KEY_PENDING_ISSUES]: pendingIssues,
+        ...(decisions.changed
+          ? { [KEY_LOCAL_DELETE_DECISIONS]: decisions.records }
+          : {}),
         ...(clearReview
           ? {
               [KEY_PLAN_REVIEW_ACTIVE]: false,
@@ -8836,6 +9562,24 @@ export class StateManager {
   }
 
   /**
+   * Live read-only view of the committed V2 envelope, for call sites that
+   * extract a fact and return without writing anything.
+   *
+   * The manager only ever replaces `this.v2Envelope` as a whole
+   * (`activateV2Envelope`); it never mutates the object graph in place, so a
+   * captured reference stays internally consistent. The caller contract is
+   * therefore: **never mutate the returned object or anything reachable from
+   * it** (that would corrupt committed state), and do not keep using it as
+   * "the current state" after an await that may publish a successor — read a
+   * fresh view instead. Callers that need a mutable, detached copy (or that
+   * compare two snapshots taken around an await) keep using
+   * `getCommittedV2Envelope`, which still deep-clones.
+   */
+  peekCommittedV2Envelope(): Readonly<SyncStateEnvelopeV2> | null {
+    return this.v2Envelope;
+  }
+
+  /**
    * Live read-only view of the committed remote index of the active V2
    * envelope. The caller must not retain it across awaits that may publish a
    * successor envelope; the returned objects are never mutated in place by
@@ -8890,6 +9634,19 @@ export class StateManager {
     return Object.values(this.v2Envelope?.anchors.byAnchorId ?? {}).find(
       (anchor) => anchor.lastPath.normalize("NFC") === normalized,
     )?.remoteETag;
+  }
+
+  /**
+   * 只读：某个库内路径当前 committed 锚点记录的远端 cTag（内容版本；只改名／
+   * 改 metadata 不会改变它）。回收站恢复会把 eTag 换成新值而保留 cTag，删除
+   * 确认的恢复快路径因此用它证明「恢复出来的就是本机上次同步的那一版」。
+   * 无信封、无该路径锚点、或锚点没有 cTag 时 undefined。
+   */
+  remoteCTagForPath(path: string): string | undefined {
+    const normalized = path.normalize("NFC");
+    return Object.values(this.v2Envelope?.anchors.byAnchorId ?? {}).find(
+      (anchor) => anchor.lastPath.normalize("NFC") === normalized,
+    )?.remoteCTag;
   }
 
   /**
@@ -11711,6 +12468,39 @@ function upsertPlanItems(
   return JSON.stringify(next) === JSON.stringify(existing)
     ? existing
     : next;
+}
+
+function withoutLocalDeleteDecisionPaths(
+  records: readonly LocalDeleteDecisionV1[],
+  removed: ReadonlySet<string>,
+): { records: LocalDeleteDecisionV1[]; changed: boolean } {
+  const next: LocalDeleteDecisionV1[] = [];
+  let changed = false;
+  for (const record of records) {
+    const hashes = parseLocalDeleteDecisionHashes(record.planDigest);
+    if (!hashes || hashes.length !== record.paths.length) {
+      next.push(record);
+      continue;
+    }
+    const keepPaths: string[] = [];
+    const keepHashes: string[] = [];
+    for (let index = 0; index < record.paths.length; index++) {
+      if (removed.has(record.paths[index])) {
+        changed = true;
+        continue;
+      }
+      keepPaths.push(record.paths[index]);
+      keepHashes.push(hashes[index]);
+    }
+    if (keepPaths.length > 0) {
+      next.push({
+        ...record,
+        paths: keepPaths,
+        planDigest: serializeLocalDeleteDecisionHashes(keepHashes),
+      });
+    }
+  }
+  return { records: next, changed };
 }
 
 function clearPlanReviewData(current: PluginData): PluginData {

@@ -301,6 +301,112 @@ describe("AncestorStoreV2", () => {
       .toEqual([hash]);
     expect(files.has(ancestorPaths.manifestNext)).toBe(false);
   });
+
+  it("refreshes the ancestor manifest once for a batch of eight objects", async () => {
+    const { adapter, files, spies } = makeAdapter();
+    const store = new AncestorStoreV2(adapter, ancestorPaths);
+    const refresh = vi.spyOn(
+      AncestorStoreV2.prototype as unknown as {
+        refreshManifestBestEffort: () => Promise<void>;
+      },
+      "refreshManifestBestEffort",
+    );
+    try {
+      const hashes = await store.runManifestBatch(async () => {
+        const published: string[] = [];
+        for (let index = 0; index < 8; index++) {
+          published.push((await store.putText(`batch-${index}\n`))!);
+        }
+        return published;
+      });
+
+      // Old per-file implementation refreshed eight times (and listed the
+      // object directory eight times) for this same batch.
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(
+        spies.list.mock.calls.filter(
+          ([path]) => path === ancestorPaths.directory,
+        ),
+      ).toHaveLength(1);
+      expect(JSON.parse(files.get(ancestorPaths.manifest)!).textHashes)
+        .toEqual([...hashes].sort());
+    } finally {
+      refresh.mockRestore();
+    }
+  });
+
+  it("keeps one mid-batch failure from multiplying or skipping the manifest refresh", async () => {
+    const { adapter, files, spies, failObjectWriteOnce } = makeAdapter();
+    const store = new AncestorStoreV2(adapter, ancestorPaths);
+    const refresh = vi.spyOn(
+      AncestorStoreV2.prototype as unknown as {
+        refreshManifestBestEffort: () => Promise<void>;
+      },
+      "refreshManifestBestEffort",
+    );
+    try {
+      const published: string[] = [];
+      await store.runManifestBatch(async () => {
+        for (let index = 0; index < 4; index++) {
+          published.push((await store.putText(`mid-${index}\n`))!);
+        }
+        failObjectWriteOnce();
+        await expect(store.putText("mid-4\n")).rejects.toThrow(
+          "object write interrupted",
+        );
+        for (let index = 5; index < 8; index++) {
+          published.push((await store.putText(`mid-${index}\n`))!);
+        }
+      });
+
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(
+        spies.list.mock.calls.filter(
+          ([path]) => path === ancestorPaths.directory,
+        ),
+      ).toHaveLength(1);
+      // The failed object never entered the inventory; everything already
+      // proven by putText did, and the batch did not stop at the failure.
+      expect(published).toHaveLength(7);
+      expect(JSON.parse(files.get(ancestorPaths.manifest)!).textHashes)
+        .toEqual([...published].sort());
+    } finally {
+      refresh.mockRestore();
+    }
+  });
+
+  it("keeps every batched object recoverable when the only manifest flush is lost", async () => {
+    const { adapter, files, failManifestRenameOnce } = makeAdapter();
+    const store = new AncestorStoreV2(adapter, ancestorPaths);
+    failManifestRenameOnce();
+    const contents = Array.from({ length: 8 }, (_, index) => `durable-${index}\n`);
+
+    const hashes = await store.runManifestBatch(async () => {
+      const published: string[] = [];
+      for (const content of contents) {
+        published.push((await store.putText(content))!);
+      }
+      return published;
+    });
+
+    // The batch's single manifest publication was interrupted: the derived
+    // inventory is absent, exactly as it could be after a crash at that point.
+    expect(files.has(ancestorPaths.manifest)).toBe(false);
+    for (const [index, hash] of hashes.entries()) {
+      expect(await store.getText(hash)).toBe(contents[index]);
+    }
+
+    // A restarted store still proves every object by its own bytes, and the
+    // next putText rebuilds the inventory from the object directory.
+    const restarted = new AncestorStoreV2(adapter, ancestorPaths);
+    for (const hash of hashes) {
+      expect(await restarted.has(hash)).toBe(true);
+    }
+    const trigger = await restarted.putText("trigger\n");
+    expect(JSON.parse(files.get(ancestorPaths.manifest)!).textHashes)
+      .toEqual([...hashes, trigger!].sort());
+    expect(files.has(ancestorPaths.manifestNext)).toBe(false);
+  });
 });
 
 describe("AncestorStoreV2 envelope linkage", () => {

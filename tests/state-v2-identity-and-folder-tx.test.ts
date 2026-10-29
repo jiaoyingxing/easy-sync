@@ -501,8 +501,10 @@ describe("V1 to V2 controlled production activation", () => {
 
   it("confirms a mobile folder create once adapter/index visibility settles", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     const previousDesktop = Platform.isDesktop;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     Platform.isDesktop = false;
     try {
       const harness = makeHarness();
@@ -566,14 +568,17 @@ describe("V1 to V2 controlled production activation", () => {
       expect((await harness.executor.run("manual")).foldersCreated).toBe(0);
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
       Platform.isDesktop = previousDesktop;
     }
   });
 
   it("keeps the fail-closed path when a mobile folder create never becomes visible", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     const previousDesktop = Platform.isDesktop;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     Platform.isDesktop = false;
     try {
       const harness = makeHarness();
@@ -630,6 +635,7 @@ describe("V1 to V2 controlled production activation", () => {
       ]);
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
       Platform.isDesktop = previousDesktop;
     }
   });
@@ -872,6 +878,9 @@ describe("V1 to V2 controlled production activation", () => {
       ".obsidian/plugins",
       "Notes",
     ]);
+    // The reviewed chain is settled now, so its rows must disappear at once:
+    // waiting for the next plan leaves a row that can only answer "changed".
+    expect(harness.state.pendingIssues).toEqual([]);
     expectNoFileMutations(harness.mutations);
 
     expect(await harness.executor.run("manual")).toMatchObject({
@@ -897,6 +906,8 @@ describe("V1 to V2 controlled production activation", () => {
     expect(Object.values(
       harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
     ).map((anchor) => anchor.lastPath)).toEqual(["Notes"]);
+    // Facts changed: nothing was recorded, so both staged rows stay.
+    expect(harness.state.pendingIssues).toHaveLength(2);
     expectNoFileMutations(harness.mutations);
   });
 
@@ -3362,7 +3373,7 @@ describe("V1 to V2 controlled production activation", () => {
         parentReference: { ...remote.parentReference },
       };
     });
-    const receiptWrite = vi.spyOn(harness.state, "recordMutationReceipt");
+    const receiptWrite = vi.spyOn(harness.state, "recordMutationReceipts");
     harness.failStateRenameOnce();
 
     const recovered = await harness.executor.run("manual");
@@ -3373,7 +3384,9 @@ describe("V1 to V2 controlled production activation", () => {
       errors: 0,
     });
     expect(harness.mutations.uploadFile).toHaveBeenCalledOnce();
+    // The upload batch writes its receipts in one durable commit.
     expect(receiptWrite).toHaveBeenCalledOnce();
+    expect(receiptWrite.mock.calls[0]?.[0]).toHaveLength(1);
     expect(harness.state.mutationLedger).toEqual([]);
     expect(harness.state.baseSnapshot).toContainEqual({
       path: localA.path,
@@ -4002,4 +4015,124 @@ describe("V1 to V2 controlled production activation", () => {
     expect((await harness.executor.run("manual")).foldersDeleted).toBe(0);
   });
 
+});
+
+describe("V2 derived folder mappings", () => {
+  it("derives complete same-path folder mappings before planning and stays zero", async () => {
+    const folderPaths = [
+      "UNmemos",
+      "UNmemos/assets",
+      "UNmemos/assets/UNmemos-8",
+      "Clippings",
+      "Clippings/assets",
+    ];
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    for (const path of folderPaths) harness.localFolderPaths.add(path);
+    harness.remoteItemState.push(...remoteFolderTree(folderPaths));
+
+    const derived = await harness.executor.run("manual");
+
+    expect(derived).toMatchObject({
+      success: true,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      foldersCreated: 0,
+      foldersMoved: 0,
+      foldersDeleted: 0,
+      deferred: 0,
+      conflicts: 0,
+      errors: 0,
+    });
+    expect(harness.state.pendingIssues).toEqual([]);
+    expect(
+      Object.values(
+        harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+      ).map((anchor) => anchor.lastPath),
+    ).toEqual(expect.arrayContaining([...folderPaths, "Notes"]));
+    expectNoFileMutations(harness.mutations);
+
+    const stable = await harness.executor.run("manual");
+    expect(stable).toMatchObject({
+      success: true,
+      uploaded: 0,
+      downloaded: 0,
+      deferred: 0,
+      errors: 0,
+    });
+  });
+
+  it("refuses an empty derivation list without touching state", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    const before = harness.state.getCommittedV2Envelope();
+
+    await expect(harness.state.acceptDerivedFolderMappings({
+      scope,
+      localFiles: harness.localEntryState,
+      localFolders: [...harness.localFolderPaths].map((path) => ({ path })),
+      localFolderScanComplete: true,
+      remoteIdentityComplete: true,
+      authorizedFolders: [],
+    })).resolves.toEqual({ status: "none", accepted: 0 });
+    expect(harness.state.getCommittedV2Envelope()).toBe(before);
+  });
+
+  it("refuses to derive while an unresolved mutation ledger exists", async () => {
+    const harness = makeHarness();
+    await harness.state.load();
+    expect((await harness.executor.run(
+      "manual",
+      {},
+      false,
+      undefined,
+      { activateV2State: true },
+    )).success).toBe(true);
+    await harness.state.beginMutationIntent({
+      version: 1,
+      operationId: "derivation-blocked-by-ledger",
+      planRevision: 1,
+      scope,
+      action: "upload",
+      path: localA.path,
+      expectedLocal: {
+        exists: true,
+        hash: localA.hash,
+        size: localA.size,
+      },
+      expectedRemote: {
+        exists: true,
+        driveId: "file-a",
+        eTag: "etag-a",
+        size: localA.size,
+        sha256Hash: localA.hash,
+      },
+      createdAt: 1,
+    });
+    const before = harness.state.getCommittedV2Envelope()!;
+
+    await expect(harness.state.acceptDerivedFolderMappings({
+      scope,
+      localFiles: harness.localEntryState,
+      localFolders: [...harness.localFolderPaths].map((path) => ({ path })),
+      localFolderScanComplete: true,
+      remoteIdentityComplete: true,
+      authorizedFolders: [{
+        path: "Notes",
+        driveId: "folder-notes",
+        parentId: scope.filesRootId,
+        name: "Notes",
+      }],
+    })).resolves.toMatchObject({ status: "blocked", accepted: 0 });
+    expect(harness.state.getCommittedV2Envelope()!.meta.commitSeq)
+      .toBe(before.meta.commitSeq);
+  });
 });

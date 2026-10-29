@@ -111,6 +111,44 @@ describe("resolveSyncNoticeOutcome", () => {
     });
   });
 
+  it("uses the executor's direct remote-delete split over retained rows", () => {
+    const remoteDelete = {
+      path: "deleted-remotely.md",
+      status: "conflict" as const,
+      actionType: SyncActionType.ConfirmLocalDelete,
+    };
+    const conflict = {
+      path: "edited-both-sides.md",
+      status: "conflict" as const,
+      actionType: SyncActionType.Conflict,
+    };
+
+    // The direct split works even when the retained rows were capped away.
+    expect(resolveSyncNoticeOutcome(
+      result({ conflicts: 2, remoteDeletePending: 2 }),
+      {},
+      [],
+    )).toEqual({ kind: "remoteDeletes", count: 2 });
+    expect(resolveSyncNoticeOutcome(
+      result({ conflicts: 2, remoteDeletePending: 1 }),
+      {},
+      [],
+    )).toEqual({ kind: "mixedPending", count: 1, remoteDeletes: 1 });
+    // A direct 0 wins over a ConfirmLocalDelete row that would infer 1.
+    expect(resolveSyncNoticeOutcome(
+      result({ conflicts: 1, remoteDeletePending: 0 }),
+      {},
+      [remoteDelete],
+    )).toEqual({ kind: "conflicts", count: 1 });
+    // The old inference stays verbatim when the field is absent (legacy
+    // results are represented by this helper's missing field).
+    expect(resolveSyncNoticeOutcome(
+      result({ conflicts: 2 }),
+      {},
+      [remoteDelete, conflict],
+    )).toEqual({ kind: "mixedPending", count: 1, remoteDeletes: 1 });
+  });
+
   it("uses failure when errors and conflicts occur in the same run", () => {
     expect(resolveSyncNoticeOutcome(result({
       success: false,
@@ -240,6 +278,8 @@ describe("resolveSyncProgressNoticePresentation", () => {
   it("uses whole-run progress only when execution has a known total", () => {
     expect(resolveSyncProgressNoticePresentation(progress({
       phase: "executing",
+      // `current` counts settled items (2026-10-26): 3 done + half of the
+      // current item's bytes = 29% of 12.
       current: 3,
       total: 12,
       currentItemBytes: 50,
@@ -247,7 +287,7 @@ describe("resolveSyncProgressNoticePresentation", () => {
     }))).toMatchObject({
       kind: "progress",
       determinate: true,
-      percent: 21,
+      percent: 29,
       current: 3,
       total: 12,
     });

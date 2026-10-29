@@ -9,8 +9,12 @@
  * device login fires its request there) before the modal closes.
  */
 
-import { Platform, type App } from "obsidian";
+import type { App } from "obsidian";
 import { EasySyncModal } from "./easy-sync-modal";
+import {
+  hostPlatformFacts,
+  type HostPlatformFacts,
+} from "../obsidian-compat";
 
 type AuthMethodResult =
   | { action: "browser" }
@@ -36,6 +40,8 @@ export class AuthMethodModal extends EasySyncModal {
     /** Called in the device option's click handler; resolves when the
      *  devicecode request succeeded. On rejection the option re-enables. */
     private onDeviceSelect: () => Promise<unknown>,
+    /** Platform facts for option order; tests may inject a fake. */
+    private readonly platformFacts: HostPlatformFacts = hostPlatformFacts,
   ) {
     super(app);
   }
@@ -97,7 +103,7 @@ export class AuthMethodModal extends EasySyncModal {
     };
     // D1: platform-based order, device code first on mobile, no "recommended".
     const ordered = orderMethodOptions(
-      Platform.isMobile,
+      this.platformFacts.isMobileApp,
       [browserEntry, deviceEntry] as const,
     );
     for (const option of ordered) {

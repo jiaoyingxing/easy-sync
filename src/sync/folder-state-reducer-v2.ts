@@ -7,6 +7,7 @@ import {
 import {
   validateEnvelope,
   type FolderAnchorV2,
+  type SyncAnchorV2,
   type SyncStateEnvelopeV2,
 } from "./state-envelope-v2";
 import { identityPath } from "./recovery-anchor-v2";
@@ -545,12 +546,19 @@ function settleConfirmedDescendantFolderAnchorV2(args: {
  * converge on the same result: the remote folder identity is present in the
  * current index and a same-generation folder anchor binds it to the local
  * path.
+ *
+ * `buildTimings` is an observation-only sink for the wall clock this reducer
+ * spends inside `validateEnvelope`; it changes no input, output or failure
+ * path and nothing here reads it back.
  */
 export function reduceFolderStateEnvelopeV2(
   envelope: SyncStateEnvelopeV2,
   ledgerEntry: MutationLedgerEntryV1,
+  buildTimings?: { validateMs: number },
 ): SyncStateEnvelopeV2 {
+  const validateStartedAt = performance.now();
   validateEnvelope(envelope);
+  if (buildTimings) buildTimings.validateMs += performance.now() - validateStartedAt;
   const { intent, receipt } = ledgerEntry;
   if (!isFolderMutationIntent(intent)) {
     throw new Error(`V2 folder reducer received a non-folder intent: ${intent.operationId}`);
@@ -577,10 +585,10 @@ export function reduceFolderStateEnvelopeV2(
     throw new Error(`V2 folder receipt contains file state: ${intent.path}`);
   }
   if (intent.action === "moveLocalFolder" || intent.action === "moveRemoteFolder") {
-    return reduceFolderMove(envelope, ledgerEntry);
+    return reduceFolderMove(envelope, ledgerEntry, buildTimings);
   }
   if (intent.action === "deleteLocalFolder" || intent.action === "deleteRemoteFolder") {
-    return reduceFolderDelete(envelope, ledgerEntry);
+    return reduceFolderDelete(envelope, ledgerEntry, buildTimings);
   }
 
   const folderUpserts = receipt.checkpoint.folderUpserts ?? [];
@@ -673,7 +681,9 @@ export function reduceFolderStateEnvelopeV2(
       byAnchorId: sortRecord(nextAnchors),
     },
   };
+  const nextValidateStartedAt = performance.now();
   validateEnvelope(next);
+  if (buildTimings) buildTimings.validateMs += performance.now() - nextValidateStartedAt;
   return next;
 }
 
@@ -692,6 +702,7 @@ export function isFolderMutationIntent(
 function reduceFolderMove(
   envelope: SyncStateEnvelopeV2,
   ledgerEntry: MutationLedgerEntryV1,
+  buildTimings?: { validateMs: number },
 ): SyncStateEnvelopeV2 {
   const intent = ledgerEntry.intent as FolderMutationIntentV2;
   const receipt = ledgerEntry.receipt!;
@@ -842,18 +853,96 @@ function reduceFolderMove(
       byAnchorId: sortRecord(nextFolderAnchors),
     },
   };
+  const nextValidateStartedAt = performance.now();
   validateEnvelope(next);
+  if (buildTimings) buildTimings.validateMs += performance.now() - nextValidateStartedAt;
   return next;
+}
+
+/** One descendant anchor whose remote identity the committed index cannot
+ *  prove retired. `remoteId` is absent for a file anchor that never carried a
+ *  remote identity; the committed state alone cannot rule that object out. */
+interface FolderDeleteCommittedDescendantV2 {
+  kind: "file" | "folder";
+  lastPath: string;
+  remoteId?: string;
+}
+
+interface FolderDeleteDescendantScanV2 {
+  /** Every file anchor at or below the folder path. */
+  fileAnchors: SyncAnchorV2[];
+  /** Every folder anchor at or below the path except the target identity. */
+  folderAnchors: FolderAnchorV2[];
+  /** Descendant anchors that still own a remote identity. */
+  blockers: FolderDeleteCommittedDescendantV2[];
+  /** Direct children of the target in the committed remote index. */
+  remoteChildren: RemoteNodeV2[];
+}
+
+/**
+ * The folder-delete precondition as one projection of the committed envelope.
+ *
+ * `reduceFolderDelete` may only retire a folder identity when every descendant
+ * anchor's remote identity is provably gone from the committed index, and the
+ * executor must ask the same question *before* it sends the remote DELETE.
+ * A live empty-folder read is not that proof: a child DELETE whose response was
+ * lost can land remotely after this device classified it as "not applied", so
+ * the live folder is already empty while the committed index still owns the
+ * child. Deleting the folder in that window leaves a receipt no state revision
+ * can absorb (`V2 folder delete still has committed descendants`).
+ */
+export function scanFolderDeleteDescendantsV2(
+  envelope: SyncStateEnvelopeV2,
+  path: string,
+  folderId: string,
+): FolderDeleteDescendantScanV2 {
+  const itemsById = envelope.remoteIndex.itemsById;
+  const fileAnchors = Object.values(envelope.anchors.byAnchorId).filter(
+    (anchor) => isAnchoredDescendantV2(anchor.lastPath, path),
+  );
+  const folderAnchors = envelope.folderAnchors
+    ? Object.values(envelope.folderAnchors.byAnchorId).filter(
+        (anchor) => anchor.remoteId !== folderId
+          && isAnchoredDescendantV2(anchor.lastPath, path),
+      )
+    : [];
+  const blockers: FolderDeleteCommittedDescendantV2[] = [];
+  for (const anchor of fileAnchors) {
+    if (anchor.remoteId && itemsById[anchor.remoteId] === undefined) continue;
+    blockers.push({
+      kind: "file",
+      lastPath: anchor.lastPath,
+      ...(anchor.remoteId ? { remoteId: anchor.remoteId } : {}),
+    });
+  }
+  for (const anchor of folderAnchors) {
+    if (itemsById[anchor.remoteId] === undefined) continue;
+    blockers.push({
+      kind: "folder",
+      lastPath: anchor.lastPath,
+      remoteId: anchor.remoteId,
+    });
+  }
+  const remoteChildren = Object.values(itemsById).filter(
+    (node) => node.parentId === folderId,
+  );
+  return { fileAnchors, folderAnchors, blockers, remoteChildren };
 }
 
 function reduceFolderDelete(
   envelope: SyncStateEnvelopeV2,
   ledgerEntry: MutationLedgerEntryV1,
+  buildTimings?: { validateMs: number },
 ): SyncStateEnvelopeV2 {
   const intent = ledgerEntry.intent as FolderMutationIntentV2;
   const receipt = ledgerEntry.receipt!;
   if (intent.reviewedSubtreeDelete) {
-    return reduceReviewedFolderSubtreeDelete(envelope, intent, receipt);
+    return reduceReviewedFolderSubtreeDelete(
+      envelope,
+      intent,
+      receipt,
+      buildTimings,
+    );
   }
   const deletes = receipt.checkpoint.folderDeletes ?? [];
   if (
@@ -865,23 +954,14 @@ function reduceFolderDelete(
     throw new Error(`V2 folder delete receipt is incomplete: ${intent.path}`);
   }
   const nextItemsById = { ...envelope.remoteIndex.itemsById };
-  const descendantFileAnchors = Object.values(envelope.anchors.byAnchorId).filter(
-    (anchor) => isAnchoredDescendantV2(anchor.lastPath, intent.path),
+  const descendantScan = scanFolderDeleteDescendantsV2(
+    envelope,
+    intent.path,
+    intent.folderId,
   );
-  const descendantFolderAnchors = Object.values(
-    envelope.folderAnchors!.byAnchorId,
-  ).filter(
-    (anchor) => anchor.remoteId !== intent.folderId
-      && isAnchoredDescendantV2(anchor.lastPath, intent.path),
-  );
-  if (
-    descendantFileAnchors.some(
-      (anchor) => !anchor.remoteId || nextItemsById[anchor.remoteId] !== undefined,
-    )
-    || descendantFolderAnchors.some(
-      (anchor) => nextItemsById[anchor.remoteId] !== undefined,
-    )
-  ) {
+  const descendantFileAnchors = descendantScan.fileAnchors;
+  const descendantFolderAnchors = descendantScan.folderAnchors;
+  if (descendantScan.blockers.length > 0) {
     throw new Error(`V2 folder delete still has committed descendants: ${intent.path}`);
   }
 
@@ -889,7 +969,7 @@ function reduceFolderDelete(
   if (currentNode && currentNode.kind !== "folder") {
     throw new Error(`V2 folder delete identity changed type: ${intent.path}`);
   }
-  if (Object.values(nextItemsById).some((node) => node.parentId === intent.folderId)) {
+  if (descendantScan.remoteChildren.length > 0) {
     throw new Error(`V2 folder delete still has remote children: ${intent.path}`);
   }
   delete nextItemsById[intent.folderId];
@@ -932,7 +1012,9 @@ function reduceFolderDelete(
       byAnchorId: sortRecord(nextFolderAnchors),
     },
   };
+  const nextValidateStartedAt = performance.now();
   validateEnvelope(next);
+  if (buildTimings) buildTimings.validateMs += performance.now() - nextValidateStartedAt;
   return next;
 }
 
@@ -940,6 +1022,7 @@ function reduceReviewedFolderSubtreeDelete(
   envelope: SyncStateEnvelopeV2,
   intent: FolderMutationIntentV2,
   receipt: MutationReceiptV1,
+  buildTimings?: { validateMs: number },
 ): SyncStateEnvelopeV2 {
   const binding = intent.reviewedSubtreeDelete!;
   const deletes = receipt.checkpoint.folderDeletes ?? [];
@@ -1016,7 +1099,9 @@ function reduceReviewedFolderSubtreeDelete(
       byAnchorId: sortRecord(nextFolderAnchors),
     },
   };
+  const nextValidateStartedAt = performance.now();
   validateEnvelope(next);
+  if (buildTimings) buildTimings.validateMs += performance.now() - nextValidateStartedAt;
   return next;
 }
 

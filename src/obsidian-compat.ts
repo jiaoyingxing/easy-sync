@@ -1,7 +1,67 @@
-import "obsidian";
-import type { Vault } from "obsidian";
+import { Platform, type Vault } from "obsidian";
 
 export const DEFAULT_CONFIG_DIR = `.${"obsidian"}`;
+
+/**
+ * Platform facts the plugin acts on, split by what each flag actually means:
+ *
+ * - App/runtime facts (`isDesktopApp`, `isMobileApp`, `isIosApp`,
+ *   `isAndroidApp`) describe where the code is running. They are the only
+ *   correct gate for device behaviour and host capabilities.
+ * - UI-mode facts (`isDesktop`, `isMobile`) describe how the host lays out its
+ *   UI. `app.emulateMobile()` flips these on a desktop app, so they must never
+ *   stand in for "is this a phone".
+ *
+ * Consumers take this interface as an optional constructor/parameter default
+ * so tests can construct a fake platform (e.g. `isMobile: true` with
+ * `isMobileApp: false`) without mutating the global singleton or calling the
+ * host's `emulateMobile()`.
+ */
+export interface HostPlatformFacts {
+  /** Running the Electron desktop app. */
+  readonly isDesktopApp: boolean;
+  /** Running the Capacitor mobile app. */
+  readonly isMobileApp: boolean;
+  /** Running the iOS app. */
+  readonly isIosApp: boolean;
+  /** Running the Android app. */
+  readonly isAndroidApp: boolean;
+  /** Host UI is in desktop mode (layout only — not a device fact). */
+  readonly isDesktop: boolean;
+  /** Host UI is in mobile mode (layout only — not a device fact). */
+  readonly isMobile: boolean;
+}
+
+/**
+ * Default platform facts: lazy getters over the host `Platform` singleton.
+ *
+ * Deliberately a live read rather than `{ ...Platform }`: a snapshot would
+ * freeze at module load, which both diverges from the host's current state and
+ * would silently change the default path of every existing caller/test that
+ * flips `Platform` flags. The object is frozen — it exposes no writable state,
+ * and production always observes the real host. Inject a plain object to
+ * simulate another platform.
+ */
+export const hostPlatformFacts: HostPlatformFacts = Object.freeze({
+  get isDesktopApp(): boolean {
+    return Platform.isDesktopApp;
+  },
+  get isMobileApp(): boolean {
+    return Platform.isMobileApp;
+  },
+  get isIosApp(): boolean {
+    return Platform.isIosApp;
+  },
+  get isAndroidApp(): boolean {
+    return Platform.isAndroidApp;
+  },
+  get isDesktop(): boolean {
+    return Platform.isDesktop;
+  },
+  get isMobile(): boolean {
+    return Platform.isMobile;
+  },
+});
 
 /**
  * Version of the local EasySync path contract. This is deliberately separate

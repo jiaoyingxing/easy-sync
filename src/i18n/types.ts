@@ -353,7 +353,14 @@ export interface LocaleStrings {
   "syncView.emptyFolder.deleteConfirm": string;
   "syncView.sharedFolderIdentity.resolve": string;
   "syncView.sharedFolderIdentity.confirmTitle": string;
-  "syncView.sharedFolderIdentity.confirmMessage": string;
+  "syncView.sharedFolderIdentity.confirmIntro": string;
+  "syncView.sharedFolderIdentity.confirmSummary": string;
+  "syncView.sharedFolderIdentity.confirmSameName": string;
+  "syncView.sharedFolderIdentity.confirmUnique": string;
+  "syncView.sharedFolderIdentity.confirmSynced": string;
+  "syncView.sharedFolderIdentity.confirmLocalEmpty": string;
+  "syncView.sharedFolderIdentity.confirmRemoteEmpty": string;
+  "syncView.sharedFolderIdentity.confirmOutro": string;
   "syncView.sharedFolderIdentity.confirm": string;
   "syncView.staleIdentity.resolve": string;
   "syncView.scopeCrossing.restore": string;
@@ -464,6 +471,7 @@ export interface LocaleStrings {
   "result.skippedBySettings": string;
   "result.authExpired": string;
   "result.syncFailed": string;
+  "result.syncNotStarted": string;
   "result.alreadyRunning": string;
   "result.cancelled": string;
   "result.generationMismatch": string;
@@ -646,6 +654,7 @@ export interface LocaleStrings {
   "notice.decisionExpired": string;
   "notice.delete.confirmed": string;
   "notice.delete.rejected": string;
+  "notice.delete.restored": string;
   "notice.delete.failed": string;
   "notice.delete.queueing": string;
 
@@ -767,6 +776,7 @@ export interface LocaleStrings {
   "syncAction.summary.errors": string;
   "syncView.progress.items": string;
   "syncView.progress.completed": string;
+  "syncView.progress.omitted": string;
   "syncView.skipGroup.title": string;
   "syncView.progress.remoteScopeRecoveryFailureTitle": string;
   "syncView.progress.remoteScopeRecoveryFailureSummary": string;
@@ -877,14 +887,26 @@ export interface LocaleStrings {
   "syncView.recovery.sectionTitle": string;
   "syncView.recovery.summary.checking": string;
   "syncView.recovery.summary.waitingNetwork": string;
+  "syncView.recovery.summary.waitingNetworkAt": string;
+  "syncView.recovery.summary.interrupted": string;
   "syncView.recovery.summary.blocked": string;
   "syncView.recovery.summary.blockedPaused": string;
+  "syncView.recovery.body.review": string;
+  "syncView.recovery.body.scopeChanged": string;
+  "syncView.recovery.body.accountChanged": string;
+  "syncView.recovery.body.exhausted": string;
   "syncView.recovery.field.path": string;
   "syncView.recovery.field.reason": string;
   "syncView.recovery.field.retryAt": string;
   "syncView.recovery.nextStep.review": string;
   "syncView.recovery.nextStep.blocked": string;
+  "syncView.recovery.nextStep.scope": string;
   "syncView.recovery.nextStep.accountChanged": string;
+  "syncView.recovery.details": string;
+  "syncView.recovery.detailsOmitted": string;
+  "syncView.recovery.retry": string;
+  "syncView.recovery.openAccountSettings": string;
+  "syncView.recovery.remainingAria": string;
   "syncView.recovery.retryScopeRecovery": string;
   "syncView.recovery.reviewDetails": string;
   "mutationRecovery.reason.factsChanged": string;

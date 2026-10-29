@@ -1,5 +1,9 @@
-import { Platform, TFile, type DataAdapter } from "obsidian";
-import { describeError } from "../obsidian-compat";
+import { TFile, type DataAdapter } from "obsidian";
+import {
+  describeError,
+  hostPlatformFacts,
+  type HostPlatformFacts,
+} from "../obsidian-compat";
 import { toStrictUtf8Bytes } from "./ancestor-store-v2";
 
 export const EASY_SYNC_RECOVERY_SUFFIX = ".easy-sync-recovery";
@@ -92,6 +96,9 @@ interface InPlaceReplacementRequest {
    */
   expectedVersion: { size: number };
   maxAttempts?: number;
+  /** Host platform facts used for the Android zero-byte retry; defaults to the
+   *  live `Platform`-backed facts. */
+  platform?: HostPlatformFacts;
   onWarning?: (message: string) => void;
 }
 
@@ -119,7 +126,7 @@ export async function writeReplacementInPlace(
     ? "host-modify"
     : "adapter-write";
   const maxAttempts = request.maxAttempts
-    ?? (Platform.isAndroidApp && content.byteLength > 0
+    ?? ((request.platform ?? hostPlatformFacts).isAndroidApp && content.byteLength > 0
       ? ANDROID_TARGET_WRITE_MAX_ATTEMPTS
       : DEFAULT_TARGET_WRITE_MAX_ATTEMPTS);
 

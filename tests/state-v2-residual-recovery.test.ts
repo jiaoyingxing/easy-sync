@@ -176,9 +176,10 @@ describe("V1 to V2 controlled production activation", () => {
     expect(corruptState.confirmedDescendantFileReconstruction).toBeNull();
   });
 
-  it("keeps an unanchored folder chain deferred when the unanchored descendant content differs", async () => {
+  it("derives the folder chain and leaves the differing file as an ordinary conflict", async () => {
     const {
       harness,
+      pluginFolders,
       remotePluginFile,
     } = await stageConfirmedDescendantWithoutFolderAnchors({
       seedFileAnchor: false,
@@ -192,9 +193,15 @@ describe("V1 to V2 controlled production activation", () => {
 
     expect(stopped).toMatchObject({
       success: true,
-      deferred: 3,
+      deferred: 0,
+      conflicts: 1,
       errors: 0,
     });
+    expect(
+      Object.values(
+        harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+      ).map((anchor) => anchor.lastPath).sort(),
+    ).toEqual([...pluginFolders, "Notes"].sort());
     expect(
       Object.values(
         harness.state.getCommittedV2Envelope()!.anchors.byAnchorId,
@@ -202,22 +209,27 @@ describe("V1 to V2 controlled production activation", () => {
     ).not.toContainEqual(expect.objectContaining({
       remoteId: remotePluginFile.id,
     }));
-    expect(
-      Object.values(
-        harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
-      ).map((anchor) => anchor.lastPath),
-    ).toEqual(["Notes"]);
     expectNoFileMutations(harness.mutations);
   });
 
-  it("does not publish unanchored descendant evidence when the state recovery gate is blocked", async () => {
+  it("keeps folders deferred when the state gate blocks folder-identity publication", async () => {
     const {
       harness,
       remotePluginFile,
     } = await stageConfirmedDescendantWithoutFolderAnchors({
       seedFileAnchor: false,
     });
-    const recoveryGate = vi.spyOn(
+    const derivationGate = vi.spyOn(
+      harness.state,
+      "acceptDerivedFolderMappings",
+    ).mockResolvedValue({
+      status: "blocked",
+      accepted: 0,
+      reason: "gate-blocked",
+    });
+    // The descendant-evidence channel shares the same state gate; a blocked
+    // derivation must not leave a second path that anchors the same folders.
+    vi.spyOn(
       harness.state,
       "acceptConfirmedDescendantFolderAnchors",
     ).mockResolvedValue({
@@ -233,7 +245,12 @@ describe("V1 to V2 controlled production activation", () => {
       deferred: 3,
       errors: 0,
     });
-    expect(recoveryGate).toHaveBeenCalledOnce();
+    expect(derivationGate).toHaveBeenCalledOnce();
+    expect(
+      Object.values(
+        harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+      ).map((anchor) => anchor.lastPath),
+    ).toEqual(["Notes"]);
     expect(
       Object.values(
         harness.state.getCommittedV2Envelope()!.anchors.byAnchorId,
@@ -244,9 +261,10 @@ describe("V1 to V2 controlled production activation", () => {
     expectNoFileMutations(harness.mutations);
   });
 
-  it("discards exact descendant evidence when the remote version changes before publication", async () => {
+  it("derives the folder chain even when the file's remote version changes during the round", async () => {
     const {
       harness,
+      pluginFolders,
       remotePluginFile,
     } = await stageConfirmedDescendantWithoutFolderAnchors({
       seedFileAnchor: false,
@@ -265,131 +283,24 @@ describe("V1 to V2 controlled production activation", () => {
 
     expect(stopped).toMatchObject({
       success: true,
-      deferred: 3,
-      errors: 0,
-    });
-    expect(
-      Object.values(
-        harness.state.getCommittedV2Envelope()!.anchors.byAnchorId,
-      ),
-    ).not.toContainEqual(expect.objectContaining({
-      remoteId: remotePluginFile.id,
-    }));
-    expectNoFileMutations(harness.mutations);
-  });
-
-  it("keeps missing folder anchors fail-closed when the descendant remote identity and content were replaced", async () => {
-    const {
-      harness,
-      remotePluginFile,
-    } = await stageConfirmedDescendantWithoutFolderAnchors();
-    const originalId = remotePluginFile.id;
-    const replacementId = `${originalId}-replacement`;
-    const replacement = {
-      ...harness.state.remoteSnapshot.find(
-        (entry) => entry.driveId === originalId,
-      )!,
-      driveId: replacementId,
-      eTag: `${remotePluginFile.eTag}-replacement`,
-      sha256Hash: hashA,
-    };
-    const remoteItem = harness.remoteItemState.find(
-      (item) => item.id === originalId,
-    )!;
-    remoteItem.id = replacementId;
-    remoteItem.eTag = replacement.eTag;
-    remoteItem.file!.hashes = { sha256Hash: hashA };
-    await harness.state.setRemoteState(
-      [
-        ...harness.state.remoteSnapshot.filter(
-          (entry) => entry.driveId !== originalId,
-        ),
-        replacement,
-      ],
-      "https://graph.example/delta-current",
-      scope,
-      harness.state.remoteFolders,
-    );
-
-    const stopped = await harness.executor.run("manual");
-
-    expect(stopped).toMatchObject({
-      foldersCreated: 0,
-      foldersMoved: 0,
-      foldersDeleted: 0,
-      deferred: 3,
-    });
-    expect(
-      Object.values(
-        harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
-      ).map((anchor) => anchor.lastPath),
-    ).toEqual(["Notes"]);
-    expectNoFileMutations(harness.mutations);
-  });
-
-  it("does not let an unchanged remote eTag override a contradictory content hash", async () => {
-    const {
-      harness,
-      remotePluginFile,
-    } = await stageConfirmedDescendantWithoutFolderAnchors();
-    const remoteItem = harness.remoteItemState.find(
-      (item) => item.id === remotePluginFile.id,
-    )!;
-    remoteItem.file!.hashes = { sha256Hash: hashA };
-    await harness.state.setRemoteState(
-      harness.state.remoteSnapshot.map((entry) => (
-        entry.driveId === remotePluginFile.id
-          ? { ...entry, sha256Hash: hashA }
-          : entry
-      )),
-      "https://graph.example/delta-current",
-      scope,
-      harness.state.remoteFolders,
-    );
-
-    const stopped = await harness.executor.run("manual");
-
-    expect(stopped).toMatchObject({
-      foldersCreated: 0,
-      foldersMoved: 0,
-      foldersDeleted: 0,
-      deferred: 3,
-    });
-    expect(
-      Object.values(
-        harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
-      ).map((anchor) => anchor.lastPath),
-    ).toEqual(["Notes"]);
-    expectNoFileMutations(harness.mutations);
-  });
-
-  it("keeps missing folder anchors fail-closed when the descendant local bytes changed", async () => {
-    const {
-      harness,
-      pluginFile,
-    } = await stageConfirmedDescendantWithoutFolderAnchors();
-    const local = harness.localEntryState.find(
-      (entry) => entry.path === pluginFile.path,
-    )!;
-    local.hash = "c".repeat(64);
-    local.mtime++;
-
-    const stopped = await harness.executor.run("manual");
-
-    expect(stopped).toMatchObject({
-      foldersCreated: 0,
-      foldersMoved: 0,
-      foldersDeleted: 0,
-      deferred: 3,
+      deferred: 0,
       errors: 0,
     });
     expect(
       Object.values(
         harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
-      ).map((anchor) => anchor.lastPath),
-    ).toEqual(["Notes"]);
+      ).map((anchor) => anchor.lastPath).sort(),
+    ).toEqual([...pluginFolders, "Notes"].sort());
     expectNoFileMutations(harness.mutations);
   });
+
+  // The former fail-closed descendant-evidence scenarios (replaced remote
+  // identity, contradictory content hash, changed local bytes) were retired
+  // with the 2026-10-26 decision: complete same-path facts now derive the
+  // folder mappings before planning, so those shapes no longer reach the
+  // evidence channel. Their file-layer outcomes are covered by the ordinary
+  // conflict tests and by the derivation tests in
+  // state-v2-identity-and-folder-tx.test.ts.
 
   it("does not reconstruct descendant-proven folders while mutation recovery is unresolved", async () => {
     const {
@@ -1121,7 +1032,11 @@ describe("V1 to V2 controlled production activation", () => {
       expect(retired).toMatchObject({
         success: true,
         uploaded: 0,
-        downloaded: 1,
+        // The formerly unanchored Notes folder is now derived from complete
+        // facts before planning, so its unchanged-locally file is ordinary
+        // work: the two files converge in this round instead of waiting for
+        // the folder question to be answered.
+        downloaded: 2,
         errors: 0,
       });
       expect(stableState.mutationLedger).toEqual([]);
@@ -1135,8 +1050,8 @@ describe("V1 to V2 controlled production activation", () => {
       expect(stableState.baseSnapshot).toContainEqual(
         expect.objectContaining({
           path: secondLocal.path,
-          hash: initialHash,
-          eTag: "etag-a-b",
+          hash: remoteHash,
+          eTag: observedSecondRemote.eTag,
         }),
       );
       await stableState.close();
@@ -1159,7 +1074,9 @@ describe("V1 to V2 controlled production activation", () => {
       expect(secondRetirementRun).toMatchObject({
         success: true,
         uploaded: 0,
-        downloaded: 1,
+        // Both files already converged in the previous round; this round only
+        // retires the remaining records and must not re-download anything.
+        downloaded: 0,
         deleted: 0,
         conflicts: 0,
         errors: 0,

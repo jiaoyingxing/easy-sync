@@ -28,11 +28,9 @@ interface KnownErrorPattern {
   prefix: string;
 }
 
+const AMBIGUOUS_IDENTITY_PREFIX = "Selected plugin identity is ambiguous: ";
+
 const KNOWN_PLUGIN_ERROR_PATTERNS: readonly KnownErrorPattern[] = [
-  {
-    key: "error.present.plugin.identityAmbiguous",
-    prefix: "Selected plugin identity is ambiguous: ",
-  },
   {
     key: "error.present.plugin.identityChangedInDirectory",
     prefix: "Selected plugin manifest identity changed within directory: ",
@@ -183,6 +181,19 @@ export function presentKnownPluginBundleError(
   message: string,
   t: PresentT,
 ): string | null {
+  // The collision message carries two facts: the plugin id that both folders
+  // declare, and the two directory names. A pre-2026-10 message carried only
+  // the directory, so it cannot be presented without inventing the id: keep
+  // those raw instead of showing a half sentence.
+  if (message.startsWith(AMBIGUOUS_IDENTITY_PREFIX)) {
+    const rest = message.slice(AMBIGUOUS_IDENTITY_PREFIX.length).trim();
+    const separator = rest.indexOf("|");
+    if (separator <= 0) return null;
+    return t("error.present.plugin.identityAmbiguous", {
+      pluginId: rest.slice(0, separator).trim(),
+      directories: rest.slice(separator + 1).trim(),
+    });
+  }
   if (message.startsWith(INCOMPATIBLE_PREFIX)) {
     const rest = message.slice(INCOMPATIBLE_PREFIX.length);
     const close = rest.indexOf("): ");

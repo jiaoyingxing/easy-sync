@@ -112,11 +112,17 @@ describe("i18n placeholder parity", () => {
   it("locks every plugin-presence key to exactly the pluginId placeholder", () => {
     // C11-3(账本 §七):error.present.plugin.* 的插值必须恰为 {pluginId}——
     // 多余/缺失占位会让 t() 渲染出坏文案而 parity 门无感。
+    // identityAmbiguous 例外：它同时要点名插件 ID 和重复声明它的目录，
+    // 呈现层为该键单独解析两个值（tests/error-presentation.test.ts 有正例）。
+    const twoFactKeys = new Set(["error.present.plugin.identityAmbiguous"]);
     const keys = Object.keys(zhCN).filter((k) => k.startsWith("error.present.plugin."));
     expect(keys.length).toBeGreaterThan(0);
     for (const key of keys) {
-      expect(tokens(zhCN[key as keyof typeof zhCN])).toEqual(["pluginId"]);
-      expect(tokens(en[key as keyof typeof en])).toEqual(["pluginId"]);
+      const expected = twoFactKeys.has(key)
+        ? ["directories", "pluginId"]
+        : ["pluginId"];
+      expect(tokens(zhCN[key as keyof typeof zhCN])).toEqual(expected);
+      expect(tokens(en[key as keyof typeof en])).toEqual(expected);
     }
   });
 

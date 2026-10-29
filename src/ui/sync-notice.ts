@@ -181,6 +181,9 @@ export function resolveSyncNoticeOutcome(
     const pending = resolveSyncPendingAttentionCounts(
       result.conflicts,
       completedFiles,
+      // Executor's direct split wins when present; legacy results without it
+      // keep the retained-row inference.
+      result.remoteDeletePending,
     );
     if (pending.remoteDeletes > 0 && pending.conflicts === 0) {
       return { kind: "remoteDeletes", count: pending.remoteDeletes };

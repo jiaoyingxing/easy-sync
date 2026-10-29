@@ -17,8 +17,10 @@ import {
   DEFAULT_CONFIG_DIR,
   describeError,
   getEasySyncPaths,
+  hostPlatformFacts,
   isRecord,
   isStringRecord,
+  type HostPlatformFacts,
 } from "../obsidian-compat";
 import {
   type DriveItem,
@@ -50,6 +52,7 @@ import {
 import {
   fingerprintCdnDownloadFailure,
 } from "./cdn-download-failure";
+import type { SyncFileErrorTierV1 } from "../sync/types";
 import {
   createDownloadStallWatchdog,
   createSlowConnectionGate,
@@ -64,9 +67,15 @@ import {
 import {
   createRangeStreamDownloader,
   loadNodeHttps,
+  readRangePartialDownload,
+  type RangePartialDownload,
   type RangeStreamDownloader,
 } from "./range-download";
-import { planRangeDownloadWindows } from "./download-range-policy";
+import { planRangeDownloadWindows, DOWNLOAD_RANGE_MIN_BYTES } from "./download-range-policy";
+import {
+  createRangeStreamAdaptation,
+  type RangeStreamAdaptation,
+} from "./range-stream-adaptation";
 import type { DiagnosticLogger } from "../sync/diagnostic-logger";
 
 /** Callback to get a fresh access token */
@@ -144,6 +153,29 @@ const DOWNLOAD_BASE_TIMEOUT_MS = 30_000;  // 30s base — covers slow/unstable c
 const DOWNLOAD_PER_MIB_TIMEOUT_MS = 12_000;
 const DOWNLOAD_MAX_TIMEOUT_MS = 300_000; // 5min hard cap — slow connections may need minutes, not seconds
 const DOWNLOAD_FAILURE_RESERVE_RATIO = 0.5;  // 50% reserve for slow/stalled connections
+/** 预算阶梯 (2026-10-27, docs/temp/20261026-1240 T2): `ceil(size/1MiB)` priced
+ *  an 18-byte note as one full MiB — 42 s of primary patience for a transfer a
+ *  50 KiB/s field link finishes in under a second, and the first channel could
+ *  hold the *whole* waterfall deadline (later channels then threw on
+ *  `remainingMs()` without an attempt). Files at or below
+ *  {@link DOWNLOAD_MEDIUM_MAX_BYTES} now get a flat channel window, and the
+ *  complete pre-ladder budget stays behind as the fallback reserve, so a
+ *  slow-but-progressing transfer keeps exactly the same overall window it has
+ *  today (it may be restarted once on the /content channel). Files above it
+ *  keep the pre-ladder pair byte for byte. */
+const DOWNLOAD_SMALL_MAX_BYTES = 64 * 1024;
+const DOWNLOAD_MEDIUM_MAX_BYTES = 256 * 1024;
+/** Channel windows of the two small tiers. The slowest healthy link on record
+ *  (50 KiB/s, 2026-10-26 iOS) moves 64 KiB in 1.3 s and 256 KiB in 5.2 s, so
+ *  both windows keep 3-5× headroom over observed traffic while still leaving
+ *  the CDN path in seconds instead of a whole minute. */
+const DOWNLOAD_SMALL_PRIMARY_TIMEOUT_MS = 15_000;
+const DOWNLOAD_MEDIUM_PRIMARY_TIMEOUT_MS = 25_000;
+/** 连续传输级 CDN 失败熔断 (2026-10-27): `statusCode 0` says nothing about the
+ *  endpoint (it must never blacklist), but a link that returns no HTTP
+ *  response three files in a row is dead for this round — every further file
+ *  would pay one more first-byte wait on it. */
+const DOWNLOAD_CDN_TRANSPORT_FAILURE_LIMIT = 3;
 const UPLOAD_SESSION_CONTROL_TIMEOUT_MS = 15_000;
 const MAX_UPLOAD_SESSION_RECOVERIES = 3;
 const MAX_REMOTE_FILE_BYTES = 2 * 1024 * 1024 * 1024;
@@ -317,6 +349,13 @@ class GraphHttpErrorResponse extends Error {
   }
 }
 
+/** Per-chunk publication of one batched driveItem read (see
+ *  `getDriveItemMetadataByIds`). Observation only — the call's returned map is
+ *  unchanged, so a caller that ignores this keeps the old contract. */
+interface DriveItemMetadataChunkOptions {
+  onChunkResolved?: (resolved: ReadonlyMap<string, DriveItem | null>) => void;
+}
+
 export class OneDriveClient {
   private initializedVaults = new Set<string>();
   private storageVaultNames = new Map<string, string>();
@@ -334,6 +373,15 @@ export class OneDriveClient {
    *  HTTP status. Subsequent files skip CDN entirely — saves budget for
    *  /content. Transport-level failures never blacklist (连坐切片). */
   private cdnFailedThisRound = false;
+  /** 连续传输级 CDN 失败熔断 (2026-10-27): `statusCode 0` must not blacklist
+   *  the endpoint (a dead link is not a broken CDN), but nothing counted them
+   *  either, so a dead link charged every single file one first-byte wait.
+   *  Three in a row open this breaker: the rest of the round skips the CDN
+   *  path and goes straight to /content. One successful CDN transfer (or a
+   *  new round) resets it; a /content 401/403 reverses it (see
+   *  `releaseCdnCircuitAfterContentRejection`). */
+  private cdnTransportFailuresThisRound = 0;
+  private cdnCircuitOpenThisRound = false;
   /** Per-round slow-link evidence (2026-09-15 乙路): window rates from every
    *  download feed the slow gate's relative judgment, so only the round's
    *  first window pays the cold-start tuition against the absolute line. */
@@ -365,7 +413,12 @@ export class OneDriveClient {
     private diag?: DiagnosticLogger,
     private configDir = DEFAULT_CONFIG_DIR,
     private pluginId = "easy-sync",
-  ) {}
+    /** Host platform facts; tests inject a fake, production keeps the live
+     *  `Platform`-backed default. */
+    private platform: HostPlatformFacts = hostPlatformFacts,
+  ) {
+    this.rangeStreamAdaptation = createRangeStreamAdaptation({ diag: this.diag });
+  }
 
   setAbortSignal(signal: AbortSignal | null): void {
     this.abortSignal = signal;
@@ -379,10 +432,19 @@ export class OneDriveClient {
 
   private resolveRangeStreamDownloader(): RangeStreamDownloader | null {
     if (this.rangeStreamDownloader === undefined) {
-      this.rangeStreamDownloader = createRangeStreamDownloader(loadNodeHttps(), this.diag);
+      this.rangeStreamDownloader = createRangeStreamDownloader(loadNodeHttps(this.platform), this.diag);
     }
     return this.rangeStreamDownloader;
   }
+
+  /** Round-scoped stream-count plan for desktop multi-range downloads (G3,
+   *  2026-10-27). One instance is shared by every large file in the round, so
+   *  a second file starts where the previous one stopped instead of probing
+   *  from 8 again. `resetDownloadStrategy()` restores the 8-stream start; the
+   *  state deliberately never reaches data.json (link conditions are
+   *  round-local, and a stale high tier after a network switch is worse than
+   *  one cheap first file). */
+  private rangeStreamAdaptation: RangeStreamAdaptation;
 
   /** Start an in-memory diagnostic scope for one sync round. */
   beginRunMetrics(): void {
@@ -961,7 +1023,7 @@ export class OneDriveClient {
    *
    * 已在真实账号实测可用（2026-10-19，应用文件夹权限域 `Files.ReadWrite.AppFolder`
    * + `Files.Read`，探针目录已清理；原始证据：
-   * `docs/dev-logs/2026-10/evidence/20261019-171659 回收站恢复能力实测-原始证据.json`）：
+   * `.tmp/20261027-235123-docs-evidence迁出/20261019-171659 回收站恢复能力实测-原始证据.json`）：
    * 成功应答 200 带响应体，文件回到原父目录、名字与内容逐字节不变；旧文档口径的
    * 204 一并接受（2xx 一律当成功）。
    *
@@ -983,89 +1045,152 @@ export class OneDriveClient {
   }
 
   /** Read up to 20 independent driveItem identities per Graph JSON batch.
-   *  Every sub-response is checked independently; retryable or malformed   *  sub-responses fall back through the ordinary single-item GET contract. */
+   *  Every sub-response is checked independently; retryable or malformed
+   *  sub-responses fall back through the ordinary single-item GET contract.
+   *  Chunk isolation (2026-10-27): one failed POST (a 15 s timeout was enough
+   *  in the field) only costs its own 20 ids their fan-out; the remaining
+   *  chunks still use `$batch` and the caller keeps every resolved entry.
+   *
+   *  `options.onChunkResolved` (2026-10-27) publishes each chunk as soon as it
+   *  is resolved, so a caller whose next step only needs that chunk (the
+   *  download URL refresh lookahead) can start on it while the later chunks are
+   *  still in flight. Observer only: the returned map is still the complete
+   *  result in input order, the request shape and count are unchanged, and a
+   *  chunk that lost its POST publishes exactly the entries its per-item GET
+   *  fallback resolved. The callback must not throw. */
   async getDriveItemMetadataByIds(
     driveItemIds: readonly string[],
     metadataReason: OneDriveMetadataReason = "other",
+    options?: DriveItemMetadataChunkOptions,
   ): Promise<Map<string, DriveItem | null>> {
     const uniqueIds = [...new Set(driveItemIds.filter(Boolean))];
     const resolved = new Map<string, DriveItem | null>();
     for (let offset = 0; offset < uniqueIds.length; offset += 20) {
       const batchIds = uniqueIds.slice(offset, offset + 20);
-      const response = await this.request(
-        "POST",
-        "/$batch",
-        {
-          requests: batchIds.map((driveItemId, index) => ({
-            id: String(index + 1),
-            method: "GET",
-            url: `/me/drive/items/${encodeURIComponent(driveItemId)}`,
-          })),
-        },
-        undefined,
-        { metadataReason },
-      );
-      const body = isRecord(response.json) ? response.json : {};
-      const rawSubresponses = Array.isArray(body.responses)
-        ? body.responses
-        : [];
-      const subresponses = new Map(
-        rawSubresponses.filter(isRecord).map((item) => [
-          typeof item.id === "string" ? item.id : "",
-          item as {
-          id?: string;
-          status?: number;
-          headers?: Record<string, string>;
-          body?: unknown;
+      const chunkResolved = new Map<string, DriveItem | null>();
+      let response: RequestUrlResponse;
+      try {
+        response = await this.request(
+          "POST",
+          "/$batch",
+          {
+            requests: batchIds.map((driveItemId, index) => ({
+              id: String(index + 1),
+              method: "GET",
+              url: `/me/drive/items/${encodeURIComponent(driveItemId)}`,
+            })),
           },
-        ]),
-      );
-      for (let index = 0; index < batchIds.length; index++) {
-        const driveItemId = batchIds[index];
-        const subresponse = subresponses.get(String(index + 1));
-        if (subresponse?.status === 200 && isRecord(subresponse.body)) {
-          const item = subresponse.body as unknown as DriveItem;
-          if (item.id === driveItemId) {
-            resolved.set(driveItemId, item);
-            continue;
-          }
-        }
-        if (subresponse?.status === 404) {
-          resolved.set(driveItemId, null);
-          continue;
-        }
-        if (subresponse?.status === 401 || subresponse?.status === 403) {
-          throw this.classifyError({
-            status: subresponse.status,
-            headers: subresponse.headers ?? {},
-            json: isRecord(subresponse.body) ? subresponse.body : {},
-          } as RequestUrlResponse);
-        }
-        if (
-          subresponse?.status === 429
-          || (typeof subresponse?.status === "number"
-            && [500, 502, 503, 504].includes(subresponse.status))
-        ) {
-          const error = this.classifyError({
-            status: subresponse.status,
-            headers: subresponse.headers ?? {},
-            json: isRecord(subresponse.body) ? subresponse.body : {},
-          } as RequestUrlResponse);
-          await sleepWithAbort(retryDelayMs(error, 1), this.abortSignal);
-        }
-        resolved.set(
-          driveItemId,
-          await this.getDriveItemMetadataById(driveItemId, metadataReason),
+          undefined,
+          { metadataReason },
         );
+      } catch (error) {
+        if (isAbortError(error) || this.abortSignal?.aborted) throw error;
+        if (isFatalMetadataBatchReadError(error)) throw error;
+        this.diag?.warn(
+          "onedrive",
+          `$batch metadata read failed for ${batchIds.length} item(s) — per-item verification takes over`,
+          {
+            reason: describeError(error),
+            batchRequests: 1,
+            items: batchIds.length,
+            mutations: 0,
+          },
+        );
+        for (const driveItemId of batchIds) {
+          chunkResolved.set(
+            driveItemId,
+            await this.getDriveItemMetadataById(driveItemId, metadataReason),
+          );
+        }
+        for (const [driveItemId, item] of chunkResolved) {
+          resolved.set(driveItemId, item);
+        }
+        options?.onChunkResolved?.(chunkResolved);
+        continue;
       }
+      await this.readDriveItemIdBatchResponse(
+        response,
+        batchIds,
+        metadataReason,
+        chunkResolved,
+      );
+      for (const [driveItemId, item] of chunkResolved) {
+        resolved.set(driveItemId, item);
+      }
+      options?.onChunkResolved?.(chunkResolved);
     }
     return resolved;
+  }
+
+  /** One 20-id `$batch` response; the caller isolates a failed POST per chunk. */
+  private async readDriveItemIdBatchResponse(
+    response: RequestUrlResponse,
+    batchIds: readonly string[],
+    metadataReason: OneDriveMetadataReason,
+    resolved: Map<string, DriveItem | null>,
+  ): Promise<void> {
+    const body = isRecord(response.json) ? response.json : {};
+    const rawSubresponses = Array.isArray(body.responses)
+      ? body.responses
+      : [];
+    const subresponses = new Map(
+      rawSubresponses.filter(isRecord).map((item) => [
+        typeof item.id === "string" ? item.id : "",
+        item as {
+        id?: string;
+        status?: number;
+        headers?: Record<string, string>;
+        body?: unknown;
+        },
+      ]),
+    );
+    for (let index = 0; index < batchIds.length; index++) {
+      const driveItemId = batchIds[index];
+      const subresponse = subresponses.get(String(index + 1));
+      if (subresponse?.status === 200 && isRecord(subresponse.body)) {
+        const item = subresponse.body as unknown as DriveItem;
+        if (item.id === driveItemId) {
+          resolved.set(driveItemId, item);
+          continue;
+        }
+      }
+      if (subresponse?.status === 404) {
+        resolved.set(driveItemId, null);
+        continue;
+      }
+      if (subresponse?.status === 401 || subresponse?.status === 403) {
+        throw this.classifyError({
+          status: subresponse.status,
+          headers: subresponse.headers ?? {},
+          json: isRecord(subresponse.body) ? subresponse.body : {},
+        } as RequestUrlResponse);
+      }
+      if (
+        subresponse?.status === 429
+        || (typeof subresponse?.status === "number"
+          && [500, 502, 503, 504].includes(subresponse.status))
+      ) {
+        const error = this.classifyError({
+          status: subresponse.status,
+          headers: subresponse.headers ?? {},
+          json: isRecord(subresponse.body) ? subresponse.body : {},
+        } as RequestUrlResponse);
+        await sleepWithAbort(retryDelayMs(error, 1), this.abortSignal);
+      }
+      resolved.set(
+        driveItemId,
+        await this.getDriveItemMetadataById(driveItemId, metadataReason),
+      );
+    }
   }
 
   /** Read up to 20 vault-relative file paths per Graph JSON batch and return
    *  presence per path (null = provably absent). Every sub-response is checked
    *  independently; retryable or malformed sub-responses fall back through the
-   *  ordinary single-item GET contract. */
+   *  ordinary single-item GET contract. Chunk isolation (2026-10-26): one
+   *  failed POST only costs its own 20 paths their fan-out, so the caller
+   *  degrades those items to per-item verification instead of the whole call
+   *  falling back. Auth failures and cancellation still abort the read. */
   async getFileMetadataByPaths(
     vaultName: string,
     filePaths: readonly string[],
@@ -1075,74 +1200,104 @@ export class OneDriveClient {
     const resolved = new Map<string, DriveItem | null>();
     for (let offset = 0; offset < uniquePaths.length; offset += 20) {
       const batchPaths = uniquePaths.slice(offset, offset + 20);
-      const response = await this.request(
-        "POST",
-        "/$batch",
-        {
-          requests: batchPaths.map((path, index) => ({
-            id: String(index + 1),
-            method: "GET",
-            url: APP_FOLDER_PATHS.filePath(
-              this.getStorageVaultName(vaultName),
-              path,
-            ),
-          })),
-        },
-        undefined,
-        { metadataReason },
-      );
-      const body = isRecord(response.json) ? response.json : {};
-      const rawSubresponses = Array.isArray(body.responses)
-        ? body.responses
-        : [];
-      const subresponses = new Map(
-        rawSubresponses.filter(isRecord).map((item) => [
-          typeof item.id === "string" ? item.id : "",
-          item as {
-          id?: string;
-          status?: number;
-          headers?: Record<string, string>;
-          body?: unknown;
+      try {
+        await this.readFilePathBatch(
+          vaultName,
+          batchPaths,
+          metadataReason,
+          resolved,
+        );
+      } catch (error) {
+        if (isAbortError(error) || this.abortSignal?.aborted) throw error;
+        if (isFatalMetadataBatchReadError(error)) throw error;
+        this.diag?.warn(
+          "onedrive",
+          `$batch path read failed for ${batchPaths.length} path(s) — per-item verification takes over`,
+          {
+            reason: describeError(error),
+            batchRequests: 1,
+            paths: batchPaths.length,
+            mutations: 0,
           },
-        ]),
-      );
-      for (let index = 0; index < batchPaths.length; index++) {
-        const path = batchPaths[index];
-        const subresponse = subresponses.get(String(index + 1));
-        if (subresponse?.status === 200 && isRecord(subresponse.body)) {
-          resolved.set(path, subresponse.body as unknown as DriveItem);
-          continue;
-        }
-        if (subresponse?.status === 404) {
-          resolved.set(path, null);
-          continue;
-        }
-        if (subresponse?.status === 401 || subresponse?.status === 403) {
-          throw this.classifyError({
-            status: subresponse.status,
-            headers: subresponse.headers ?? {},
-            json: isRecord(subresponse.body) ? subresponse.body : {},
-          } as RequestUrlResponse);
-        }
-        if (
-          subresponse?.status === 429
-          || (typeof subresponse?.status === "number"
-            && [500, 502, 503, 504].includes(subresponse.status))
-        ) {
-          const error = this.classifyError({
-            status: subresponse.status,
-            headers: subresponse.headers ?? {},
-            json: isRecord(subresponse.body) ? subresponse.body : {},
-          } as RequestUrlResponse);
-          await sleepWithAbort(retryDelayMs(error, 1), this.abortSignal);
-        }
-        resolved.set(
-          path,
-          await this.getDriveItemMetadata(vaultName, path),
         );
       }
     }
     return resolved;
+  }
+
+  /** One 20-path `$batch` read; the caller isolates its failures per chunk. */
+  private async readFilePathBatch(
+    vaultName: string,
+    batchPaths: readonly string[],
+    metadataReason: OneDriveMetadataReason,
+    resolved: Map<string, DriveItem | null>,
+  ): Promise<void> {
+    const response = await this.request(
+      "POST",
+      "/$batch",
+      {
+        requests: batchPaths.map((path, index) => ({
+          id: String(index + 1),
+          method: "GET",
+          url: APP_FOLDER_PATHS.filePath(
+            this.getStorageVaultName(vaultName),
+            path,
+          ),
+        })),
+      },
+      undefined,
+      { metadataReason },
+    );
+    const body = isRecord(response.json) ? response.json : {};
+    const rawSubresponses = Array.isArray(body.responses)
+      ? body.responses
+      : [];
+    const subresponses = new Map(
+      rawSubresponses.filter(isRecord).map((item) => [
+        typeof item.id === "string" ? item.id : "",
+        item as {
+        id?: string;
+        status?: number;
+        headers?: Record<string, string>;
+        body?: unknown;
+        },
+      ]),
+    );
+    for (let index = 0; index < batchPaths.length; index++) {
+      const path = batchPaths[index];
+      const subresponse = subresponses.get(String(index + 1));
+      if (subresponse?.status === 200 && isRecord(subresponse.body)) {
+        resolved.set(path, subresponse.body as unknown as DriveItem);
+        continue;
+      }
+      if (subresponse?.status === 404) {
+        resolved.set(path, null);
+        continue;
+      }
+      if (subresponse?.status === 401 || subresponse?.status === 403) {
+        throw this.classifyError({
+          status: subresponse.status,
+          headers: subresponse.headers ?? {},
+          json: isRecord(subresponse.body) ? subresponse.body : {},
+        } as RequestUrlResponse);
+      }
+      if (
+        subresponse?.status === 429
+        || (typeof subresponse?.status === "number"
+          && [500, 502, 503, 504].includes(subresponse.status))
+      ) {
+        const error = this.classifyError({
+          status: subresponse.status,
+          headers: subresponse.headers ?? {},
+          json: isRecord(subresponse.body) ? subresponse.body : {},
+        } as RequestUrlResponse);
+        await sleepWithAbort(retryDelayMs(error, 1), this.abortSignal);
+      }
+      resolved.set(
+        path,
+        await this.getDriveItemMetadata(vaultName, path),
+      );
+    }
   }
 
   /** List every direct child of one committed folder identity.
@@ -1373,7 +1528,65 @@ export class OneDriveClient {
     this.downloadMethod = null;
     this.contentFailedThisRound = false;
     this.cdnFailedThisRound = false;
+    this.cdnTransportFailuresThisRound = 0;
+    this.cdnCircuitOpenThisRound = false;
     this.slowLinkEvidence = createSlowLinkEvidence();
+    this.rangeStreamAdaptation.reset();
+  }
+
+  /** One CDN-path attempt ended. Two independent rules read the same failure:
+   *  only real HTTP evidence may blacklist an endpoint (2026-09-16 连坐切片,
+   *  `cdnFailedThisRound`), while a *no-HTTP-response* failure counts toward
+   *  the 2026-10-27 channel breaker. Never reads error evidence fields
+   *  (`tier`, `attempts`, `transferredBytes`) — only the status the transport
+   *  reported, via the same classifier the run metrics already use. */
+  private noteCdnTierFailure(error: unknown): void {
+    if (!isTransportLevelDownloadFailure(error)) {
+      this.cdnFailedThisRound = true;
+    }
+    if (rawAttemptStatus(error, this.abortSignal) !== "network") return;
+    this.cdnTransportFailuresThisRound++;
+    if (
+      this.cdnTransportFailuresThisRound < DOWNLOAD_CDN_TRANSPORT_FAILURE_LIMIT
+      || this.cdnCircuitOpenThisRound
+    ) return;
+    this.cdnCircuitOpenThisRound = true;
+    this.diag?.warn(
+      "onedrive",
+      `download CDN breaker opened — ${this.cdnTransportFailuresThisRound} consecutive transport-level failures, this round skips the CDN path`,
+    );
+  }
+
+  /** A CDN transfer carried its file: the link is alive, so the breaker (and
+   *  the streak behind it) is reset rather than left armed for the rest of the
+   *  round. */
+  private noteCdnTransferSuccess(): void {
+    this.cdnTransportFailuresThisRound = 0;
+    if (!this.cdnCircuitOpenThisRound) return;
+    this.cdnCircuitOpenThisRound = false;
+    this.diag?.warn(
+      "onedrive",
+      "download CDN breaker released — a CDN transfer succeeded again",
+    );
+  }
+
+  /** The whole point of the breaker is to reach /content faster; a /content
+   *  401/403 says that channel cannot serve these files, so skipping the CDN
+   *  would fail every remaining file without an attempt. Reverse the decision. */
+  private releaseCdnCircuitAfterContentRejection(
+    error: unknown,
+    tier: SyncFileErrorTierV1,
+  ): void {
+    if (!this.cdnCircuitOpenThisRound || !isContentEndpointRejection(error)) {
+      return;
+    }
+    this.cdnCircuitOpenThisRound = false;
+    this.cdnTransportFailuresThisRound = 0;
+    this.diag?.warn(
+      "onedrive",
+      "download CDN breaker released — /content rejected the file, CDN re-enabled for the round",
+      { tier, statusCode: (error as { statusCode?: number }).statusCode },
+    );
   }
 
   /**
@@ -1732,15 +1945,18 @@ export class OneDriveClient {
       if (!isFetchUnavailableError(fetchError)) {
         const classified = classifyUploadSessionUrlError(this.toRequestError(fetchError, uploadUrl, false, undefined, "PUT"));
         if (isRequestTimeoutError(fetchError)) {
-          throw new OneDriveError(
-            OneDriveErrorType.NetworkError,
-            `Abortable upload chunk timed out after ${timeoutMs}ms`,
-            classified.statusCode,
-            classified.retryAfterSeconds,
-            classified.graphCode,
+          throw stampDownloadTier(
+            new OneDriveError(
+              OneDriveErrorType.NetworkError,
+              `Abortable upload chunk timed out after ${timeoutMs}ms`,
+              classified.statusCode,
+              classified.retryAfterSeconds,
+              classified.graphCode,
+            ),
+            "uploadSession",
           );
         }
-        throw classified;
+        throw stampDownloadTier(classified, "uploadSession");
       }
       this.diag?.log("onedrive", "upload chunk fetch unavailable, falling back to requestUrl");
     }
@@ -1781,7 +1997,15 @@ export class OneDriveClient {
         "onedrive",
         `large upload chunk failed — range=${start}-${end}, bytes=${chunk.byteLength}, hostError=${requestErrorMessage(rawError)}`,
       );
-      throw classifyUploadSessionUrlError(this.toRequestError(rawError, uploadUrl, false, undefined, "PUT"));
+      // A3 (2026-10-26): evidence-only tier stamp, same shape as the download
+      // waterfall. Stamped after classification so an AuthExpired rewrite onto
+      // a fresh OneDriveError keeps the mark.
+      throw stampDownloadTier(
+        classifyUploadSessionUrlError(
+          this.toRequestError(rawError, uploadUrl, false, undefined, "PUT"),
+        ),
+        "uploadSession",
+      );
     }
   }
 
@@ -1934,26 +2158,45 @@ export class OneDriveClient {
     // status — only that blacklists content for the round when the caller has
     // no driveItemId and the fallthrough below is reached.
     let sawEndpointLevelContentFailure = false;
-    const primaryTimeoutMs = downloadTimeoutMs(input.fileSize);
-    const failureReserveMs = Math.ceil(
-      primaryTimeoutMs * DOWNLOAD_FAILURE_RESERVE_RATIO,
-    );
-    const timeoutMs = primaryTimeoutMs + failureReserveMs;
-    const deadlineMs = Date.now() + timeoutMs;
+    // The one place a download's financials are decided (2026-10-27 ladder):
+    // the log line below and every deadline in this waterfall read this value.
+    const budget = downloadBudget(input.fileSize);
+    // 阶梯只在有空网接着的时候提前收杆: once this round knows /content cannot
+    // serve these files (a real HTTP rejection was recorded), cutting the CDN
+    // early would trade a slow success for a certain failure — such files keep
+    // the whole waterfall deadline on the CDN.
+    const channelCapMs = this.contentFailedThisRound ? null : budget.channelCapMs;
+    const deadlineMs = Date.now() + budget.totalMs;
     const remainingMs = () =>
       ensureDownloadBudget(deadlineMs, input.filePath);
+    /** Deadline of the CDN path only. Started lazily at the first CDN attempt so
+     *  a preceding /content shortcut cannot eat it, and never longer than the
+     *  waterfall's own deadline. `null` cap keeps the pre-ladder rule that the
+     *  first channel may hold the whole deadline. */
+    let cdnWindowDeadlineMs = 0;
+    const cdnWindowLeftMs = (): number => {
+      if (cdnWindowDeadlineMs === 0) {
+        cdnWindowDeadlineMs = Date.now()
+          + (channelCapMs ?? budget.totalMs);
+      }
+      return Math.min(deadlineMs, cdnWindowDeadlineMs) - Date.now();
+    };
     const loadDownloadUrl = async (
       url: string,
       maxAttempts: number,
     ): Promise<T> => {
       let observedAttempt = 0;
+      // Every attempt of the CDN path shares the channel window: exhausting it
+      // hands the file to the fallback channels instead of letting the CDN
+      // swallow the reserve.
+      const channelRemaining = () => Math.min(remainingMs(), cdnWindowLeftMs());
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         observedAttempt++;
         const fetchStartedAt = this.beginMetricAttempt("downloadUrl");
         try {
           const result = await withAbortableTimeout(
             (signal) => input.loadDownloadUrl(url, signal, slowGate),
-            remainingMs(),
+            channelRemaining(),
             this.abortSignal,
           );
           this.finishMetricAttempt(
@@ -1986,7 +2229,7 @@ export class OneDriveClient {
               throwIfAborted(this.abortSignal);
               const response = await withTimeout(
                 requestUrl({ url, method: "GET" }),
-                remainingMs(),
+                channelRemaining(),
               );
               const result = await input.loadRequestUrlResponse(response);
               this.finishMetricAttempt(
@@ -2008,16 +2251,16 @@ export class OneDriveClient {
             }
           }
           if (isUncancellableRequestTimeout(err)) {
-            throw downloadTimeoutError(input.filePath);
+            throw stampDownloadAttempts(downloadTimeoutError(input.filePath), attempt);
           }
           if (
             attempt === maxAttempts
             || !isTransientDownloadUrlError(err)
           ) {
-            throw err;
+            throw stampDownloadAttempts(err, attempt);
           }
-          const remaining = remainingMs();
-          if (remaining <= RETRY_BASE_MS) throw err;
+          const remaining = channelRemaining();
+          if (remaining <= RETRY_BASE_MS) throw stampDownloadAttempts(err, attempt);
           this.diag?.warn(
             "onedrive",
             `${input.operationName} "${input.filePath}" — CDN retry ${attempt + 1}/${maxAttempts}, remainingMs=${remaining}`,
@@ -2039,14 +2282,16 @@ export class OneDriveClient {
       maxResponseBytesDeclaredKind: declaredOverflowKind,
       responseLabel: `Remote file "${input.filePath}"`,
     };
-    const metaRequestOptions: RequestOptions = {
-      deadlineMs,
+    /** Metadata refresh exists only to mint a fresh CDN URL, so it lives inside
+     *  the CDN window — built per call so the window starts with the CDN path. */
+    const metaRequestOptions = (): RequestOptions => ({
+      deadlineMs: Math.min(deadlineMs, Date.now() + Math.max(0, cdnWindowLeftMs())),
       maxAttempts: 1,
       metadataReason: "downloadUrlRefresh",
-    };
+    });
     this.diag?.log(
       "onedrive",
-      `${input.operationName} "${input.filePath}" — size=${input.fileSize}, primaryMs=${primaryTimeoutMs}, reserveMs=${failureReserveMs}, budgetMs=${timeoutMs}, hint=${this.downloadMethod ?? "none"}`,
+      `${input.operationName} "${input.filePath}" — size=${input.fileSize}, primaryMs=${budget.primaryMs}, reserveMs=${budget.reserveMs}, budgetMs=${budget.totalMs}, class=${budget.budgetClass}, channelCapMs=${channelCapMs ?? "none"}, hint=${this.downloadMethod ?? "none"}`,
     );
     input.onProgress?.(0, input.fileSize);
 
@@ -2060,11 +2305,18 @@ export class OneDriveClient {
         const value = await input.loadContent(apiPath, contentRequestOptions, slowGate);
         input.afterContentShortcut?.(value);
         return value;
-      } catch (err) {
+      } catch (caught) {
+        // A3: stamp the tier on the error itself so both this tier's warn line
+        // and any error that escapes carry "where the waterfall died".
+        const err = stampDownloadTier(caught, "content");
         if (isResponseByteBudgetError(err)) throw err;
         if (isUncancellableRequestTimeout(err)) {
-          throw downloadTimeoutError(input.filePath);
+          throw stampDownloadTier(downloadTimeoutError(input.filePath), "content");
         }
+        // 内容端点整批 401/403 时反向撤销熔断 (2026-10-27): the breaker pushed
+        // this file onto /content, and /content cannot even authorize it — the
+        // direction was wrong, so the next file must be allowed to try the CDN.
+        this.releaseCdnCircuitAfterContentRejection(err, "content");
         if (isAuthExpired(err)) throw err;
         this.diag?.warn(
           "onedrive",
@@ -2074,26 +2326,36 @@ export class OneDriveClient {
       }
     }
 
-    if (input.downloadUrl && !this.cdnFailedThisRound) {
+    if (
+      input.downloadUrl
+      && !this.cdnFailedThisRound
+      && !this.cdnCircuitOpenThisRound
+      && cdnWindowLeftMs() > 0
+    ) {
       const tierStartMs = Date.now();
       try {
         const value = await loadDownloadUrl(input.downloadUrl, 1);
         this.downloadMethod = "downloadUrl";
+        this.noteCdnTransferSuccess();
         input.afterHintDownload?.(value);
         return value;
-      } catch (err) {
+      } catch (caught) {
+        const err = stampDownloadTier(caught, "downloadUrl");
         if (isResponseByteBudgetError(err)) throw err;
         this.diag?.warn(
           "onedrive",
           `${input.operationName} "${input.filePath}" — downloadUrl failed, trying item metadata`,
           { ...downloadErrorData(err), tierMs: Date.now() - tierStartMs },
         );
-        if (!isTransportLevelDownloadFailure(err)) this.cdnFailedThisRound = true;
+        this.noteCdnTierFailure(err);
         remainingMs();
       }
     }
 
-    if (input.driveItemId) {
+    // The item-metadata tier exists only to mint a fresh CDN URL, so an open
+    // breaker skips it with the rest of the CDN path and an exhausted channel
+    // window is not re-opened for it.
+    if (input.driveItemId && !this.cdnCircuitOpenThisRound && cdnWindowLeftMs() > 0) {
       const tierStartMs = Date.now();
       try {
         throwIfAborted(this.abortSignal);
@@ -2102,7 +2364,7 @@ export class OneDriveClient {
           `/me/drive/items/${input.driveItemId}?select=id,name,size,file,@microsoft.graph.downloadUrl`,
           undefined,
           undefined,
-          metaRequestOptions,
+          metaRequestOptions(),
         );
         const meta = metaResp.json as {
           "@microsoft.graph.downloadUrl"?: string;
@@ -2113,9 +2375,11 @@ export class OneDriveClient {
             input.downloadUrl ? 1 : 2,
           );
           this.downloadMethod = "downloadUrl";
+          this.noteCdnTransferSuccess();
           return value;
         }
-      } catch (err) {
+      } catch (caught) {
+        const err = stampDownloadTier(caught, "itemMetadata");
         if (isResponseByteBudgetError(err)) throw err;
         if (isAuthExpired(err)) metadataAuthError = err;
         this.diag?.warn(
@@ -2123,7 +2387,7 @@ export class OneDriveClient {
           `${input.operationName} "${input.filePath}" — item metadata downloadUrl failed, trying path /content`,
           { ...downloadErrorData(err), tierMs: Date.now() - tierStartMs },
         );
-        if (!isTransportLevelDownloadFailure(err)) this.cdnFailedThisRound = true;
+        this.noteCdnTierFailure(err);
         remainingMs();
       }
     }
@@ -2152,11 +2416,13 @@ export class OneDriveClient {
       const value = await input.loadContent(apiPath, contentRequestOptions, slowGate);
       this.downloadMethod = "content";
       return value;
-    } catch (err) {
+    } catch (caught) {
+      const err = stampDownloadTier(caught, "pathContent");
       if (isResponseByteBudgetError(err)) throw err;
       if (isUncancellableRequestTimeout(err)) {
-        throw downloadTimeoutError(input.filePath);
+        throw stampDownloadTier(downloadTimeoutError(input.filePath), "pathContent");
       }
+      this.releaseCdnCircuitAfterContentRejection(err, "pathContent");
       if (isAuthExpired(err)) {
         throw metadataAuthError
           ?? asFileDownloadUnauthorized(err, input.filePath);
@@ -2185,8 +2451,12 @@ export class OneDriveClient {
         );
         this.downloadMethod = "content";
         return value;
-      } catch (err) {
+      } catch (caught) {
+        // The last resort: this error is the one that escapes the waterfall,
+        // so its tier is what the diagnostic report reads back.
+        const err = stampDownloadTier(caught, "itemContent");
         if (isResponseByteBudgetError(err)) throw err;
+        this.releaseCdnCircuitAfterContentRejection(err, "itemContent");
         if (isAuthExpired(err)) {
           throw metadataAuthError
             ?? asFileDownloadUnauthorized(err, input.filePath);
@@ -2247,13 +2517,25 @@ export class OneDriveClient {
         // falls back to the proven single-stream attempt right here, so the
         // worst case is exactly the pre-multi-range behavior.
         const rangeDownloader = this.resolveRangeStreamDownloader();
-        const rangePlan = rangeDownloader
-          ? planRangeDownloadWindows(fileSize)
+        // Only a file that can actually arm the Range path may consume an
+        // adaptive probe; small files must not advance the round's tier. The
+        // file size also caps which rung may be probed (a 20 MiB file cannot
+        // fund the 24-stream rung at the 1 MiB per-stream floor).
+        const rangePlan = rangeDownloader && fileSize >= DOWNLOAD_RANGE_MIN_BYTES
+          ? planRangeDownloadWindows(
+            fileSize,
+            this.rangeStreamAdaptation.planStreams(fileSize),
+          )
           : null;
+        // 回退不重下 (2026-10-28): a failed ladder still hands back the bytes it
+        // landed. The single stream below then continues at its first hole
+        // inside that same assembly buffer instead of restarting the file,
+        // which is what made a bad-link fallback cost more than no fallback.
+        let rangePartial: RangePartialDownload | null = null;
         if (rangeDownloader && rangePlan) {
           this.diag?.log(
             "onedrive",
-            `downloadFile "${filePath}" — multi-range download — streams=${rangePlan.length}, fileSize=${fileSize}`,
+            `downloadFile "${filePath}" — multi-range download — streams=${rangePlan.length}, tier=${this.rangeStreamAdaptation.plannedStreams}, fileSize=${fileSize}`,
           );
           try {
             const buffer = await rangeDownloader.download({
@@ -2264,17 +2546,51 @@ export class OneDriveClient {
               label: `Remote file "${filePath}"`,
               onProgress,
               slowLinkEvidence: this.slowLinkEvidence,
+              adaptation: this.rangeStreamAdaptation,
             });
             return { value: buffer, bytes: buffer.byteLength };
           } catch (error) {
             if (isAbortError(error) || signal.aborted) throw error;
+            rangePartial = readRangePartialDownload(error);
+            const resumeAt = rangePartial && rangePartial.landedOffset > 0
+              ? rangePartial.landedOffset
+              : 0;
             this.diag?.warn(
               "onedrive",
-              `downloadFile "${filePath}" — multi-range download failed, falling back to single stream`,
+              `downloadFile "${filePath}" — multi-range download failed, falling back to single stream`
+                + (resumeAt > 0
+                  ? ` (resume at byte ${resumeAt}, remaining ${fileSize - resumeAt}/${fileSize})`
+                  : " (from byte 0)"),
               requestErrorMessage(error),
             );
           }
         }
+        // A resume request that the CDN ignores (200 instead of 206) must not
+        // be stitched onto the landed prefix: the buffer keeps its unchanged
+        // size + sha256 check, and the retry is the plain whole-file GET.
+        let resumeRejected = false;
+        // Holder (not a plain `let`): the evidence is written by a callback, so
+        // control-flow analysis would otherwise keep the initial `null` type.
+        const resumeEvidence: { contentRange: string | null } = {
+          contentRange: null,
+        };
+        const rangeResume = rangePartial && rangePartial.landedOffset > 0
+          ? {
+            assembly: rangePartial.assembly,
+            offset: rangePartial.landedOffset,
+            fileSize,
+            onRangeAccepted: (evidence: { contentRange: string | null }): void => {
+              resumeEvidence.contentRange = evidence.contentRange;
+            },
+            onRangeRejected: (rejection: DownloadRangeRejection): void => {
+              resumeRejected = true;
+              this.diag?.warn(
+                "onedrive",
+                `downloadFile "${filePath}" — single-stream resume not honored (status ${rejection.status}, Content-Range ${rejection.contentRange ?? "none"}); re-downloading from byte 0`,
+              );
+            },
+          }
+          : undefined;
         const response = await downloadUrlFetch(
           url,
           maxResponseBytes,
@@ -2283,7 +2599,18 @@ export class OneDriveClient {
           signal,
           slowGate,
           declaredOverflowKind,
+          rangeResume,
         );
+        if (rangeResume && !resumeRejected) {
+          const contentRange = resumeEvidence.contentRange;
+          this.diag?.log(
+            "onedrive",
+            `downloadFile "${filePath}" — single-stream resume landed ${fileSize - rangeResume.offset} byte(s) from byte ${rangeResume.offset}`
+              + (contentRange === null
+                ? " (206, Content-Range not exposed)"
+                : ` (206, Content-Range ${contentRange})`),
+          );
+        }
         return {
           value: response.arrayBuffer,
           bytes: responsePayloadByteLength(response),
@@ -4248,12 +4575,97 @@ function asFileDownloadUnauthorized(
   );
 }
 
+/** Pre-ladder, size-scaled budget. Kept for the single-shot retained-version
+ *  content reads, which have no waterfall to split. The download waterfall
+ *  itself prices every file through {@link downloadBudget}. */
 function downloadTimeoutMs(fileSize: number): number {
   const sizeMiB = Math.ceil(Math.max(0, fileSize) / (1024 * 1024));
   return Math.min(
     DOWNLOAD_MAX_TIMEOUT_MS,
     DOWNLOAD_BASE_TIMEOUT_MS + sizeMiB * DOWNLOAD_PER_MIB_TIMEOUT_MS,
   );
+}
+
+type DownloadBudgetClass = "small" | "medium" | "regular";
+
+interface DownloadBudget {
+  /** Which ladder rung priced this file (log evidence). */
+  budgetClass: DownloadBudgetClass;
+  /** Patience of one channel: the CDN path loses the file to the fallback
+   *  channels after this much silence/time. */
+  primaryMs: number;
+  /** What the fallback channels keep after a failed primary attempt. Never
+   *  shorter than the pre-ladder budget of the same file. */
+  reserveMs: number;
+  /** Hard deadline of the whole waterfall. */
+  totalMs: number;
+  /** Cap for the CDN path as a whole, or `null` for regular files. `null`
+   *  keeps the pre-ladder rule that the first channel may hold the entire
+   *  deadline: restarting a multi-MiB transfer discards far more than a flat
+   *  window can buy back, and the 2026-07-14 decision ("CDN 下载不给短 leash")
+   *  rests on the same observation. */
+  channelCapMs: number | null;
+}
+
+/** Single source of the download budget (2026-10-27 预算阶梯).
+ *
+ *  - `regular` (> 256 KiB) is the pre-ladder pair unchanged: primary =
+ *    `30 s + ceil(size/1MiB) × 12 s`, reserve = 50 %, no channel cap.
+ *  - `small` (< 64 KiB) and `medium` (64–256 KiB) replace the primary with a
+ *    flat channel window (15 s / 25 s) and keep the *complete* pre-ladder
+ *    budget as the reserve, so the two windows together are strictly longer
+ *    than today's single deadline. Nothing that succeeds today can be killed
+ *    by the ladder: a transfer that needs the old window still gets it on the
+ *    fallback channel; only the CDN's share shrinks, which is the point —
+ *    the first channel can no longer swallow the reserve.
+ *
+ *  The `ceil` is what made an 18-byte note cost 42 s in the first place
+ *  (docs/temp/20261026-1240 T2); the ladder fixes the pricing for the two
+ *  smallest size bands only, as decided. */
+export function downloadBudget(fileSize: number): DownloadBudget {
+  const size = Number.isFinite(fileSize) ? Math.max(0, fileSize) : 0;
+  const preLadderPrimaryMs = downloadTimeoutMs(size);
+  const preLadderReserveMs = Math.ceil(
+    preLadderPrimaryMs * DOWNLOAD_FAILURE_RESERVE_RATIO,
+  );
+  const budgetClass: DownloadBudgetClass = size < DOWNLOAD_SMALL_MAX_BYTES
+    ? "small"
+    : size <= DOWNLOAD_MEDIUM_MAX_BYTES
+      ? "medium"
+      : "regular";
+  if (budgetClass === "regular") {
+    return {
+      budgetClass,
+      primaryMs: preLadderPrimaryMs,
+      reserveMs: preLadderReserveMs,
+      totalMs: preLadderPrimaryMs + preLadderReserveMs,
+      channelCapMs: null,
+    };
+  }
+  const primaryMs = budgetClass === "small"
+    ? DOWNLOAD_SMALL_PRIMARY_TIMEOUT_MS
+    : DOWNLOAD_MEDIUM_PRIMARY_TIMEOUT_MS;
+  // The reserve is the whole pre-ladder deadline, not 50 % of the shortened
+  // primary: that is what "失败后仍有一次完整备用预算" buys, and it is the only
+  // way a slow-but-progressing transfer keeps the window it has today.
+  const reserveMs = preLadderPrimaryMs + preLadderReserveMs;
+  return {
+    budgetClass,
+    primaryMs,
+    reserveMs,
+    totalMs: primaryMs + reserveMs,
+    channelCapMs: primaryMs,
+  };
+}
+
+/** 401/403 with a real HTTP status: the endpoint answered, it just refused this
+ *  file. Used only to reverse the CDN breaker (the channel cannot serve us). */
+function isContentEndpointRejection(error: unknown): boolean {
+  if (!(error instanceof OneDriveError)) return false;
+  return error.statusCode === 401
+    || error.statusCode === 403
+    || error.type === OneDriveErrorType.AuthExpired
+    || error.type === OneDriveErrorType.Forbidden;
 }
 
 function ensureDownloadBudget(deadlineMs: number, filePath: string): number {
@@ -4664,6 +5076,17 @@ function isTransientRequestError(error: OneDriveError): boolean {
     || error.type === OneDriveErrorType.ServerError;
 }
 
+/** A failed `$batch` path read that must still abort the whole call: the
+ *  session is gone, so degrading the chunk to per-item GETs would only repeat
+ *  the same rejection once per path. Every other failure stays inside its
+ *  chunk (see `getFileMetadataByPaths`). */
+function isFatalMetadataBatchReadError(error: unknown): boolean {
+  return error instanceof OneDriveError
+    && (error.type === OneDriveErrorType.Unauthorized
+      || error.type === OneDriveErrorType.Forbidden
+      || error.type === OneDriveErrorType.AuthExpired);
+}
+
 function isRecoverableUploadSessionError(error: OneDriveError): boolean {
   return error.type === OneDriveErrorType.NetworkError
     || error.type === OneDriveErrorType.RateLimited
@@ -4891,6 +5314,13 @@ function downloadErrorData(err: unknown): Record<string, unknown> {
   if (typeof slowGateRate === "number") data.slowGateRateKiBps = slowGateRate;
   const slowGatePrior = (err as { slowGatePriorRateKiBps?: unknown } | null)?.slowGatePriorRateKiBps;
   if (typeof slowGatePrior === "number") data.slowGatePriorRateKiBps = slowGatePrior;
+  // A3 (2026-10-26): the tier that raised this failure and the retry attempts
+  // it consumed. Read-only evidence for the per-tier warn lines; the report
+  // reads the same props off the thrown error.
+  const tier = (err as { tier?: unknown } | null)?.tier;
+  if (typeof tier === "string") data.tier = tier;
+  const attempts = (err as { attempts?: unknown } | null)?.attempts;
+  if (typeof attempts === "number") data.attempts = attempts;
   return data;
 }
 
@@ -4984,9 +5414,46 @@ function responseContentLength(response: Response): number {
   return Number.isFinite(value) && value > 0 ? value : 0;
 }
 
+/** Where a resumed single-stream body has to land: the failed multi-range
+ *  attempt's own assembly buffer (2026-10-28). `offset` is the first hole, so
+ *  the expected body length is `assembly.byteLength - offset` — the buffer is
+ *  always exactly the declared file size. */
+interface ResponseBufferSink {
+  assembly: Uint8Array;
+  offset: number;
+}
+
+/** Why a resume request was not stitched: the CDN ignored the Range (200), or
+ *  answered a different start. The caller logs the safe retreat; byte 0 is
+ *  used instead. */
+interface DownloadRangeRejection {
+  status: number;
+  contentRange: string | null;
+}
+
+/** Resume payload of the single-stream fallback after a failed multi-range
+ *  attempt. The body is written into `assembly` at `offset`; no second
+ *  whole-file buffer is allocated. */
+interface DownloadUrlResume extends ResponseBufferSink {
+  fileSize: number;
+  /** The answer was accepted as the resume tail. `contentRange` is null when
+   *  the CDN does not expose the header to the renderer (the documented CORS
+   *  limitation that forced the Node carrier in the first place): a 206 with
+   *  no readable start is then trusted on status + exact remaining length,
+   *  the same contract the on-disk resume path uses. Log evidence only. */
+  onRangeAccepted: (evidence: { contentRange: string | null }) => void;
+  onRangeRejected: (rejection: DownloadRangeRejection) => void;
+}
+
 /** Shared helper: read a fetch Response as ArrayBuffer, optionally reporting
  *  byte-level progress via streaming read.  Falls back to simple arrayBuffer()
- *  when no progress callback is provided. */
+ *  when no progress callback is provided.
+ *
+ *  With a `sink` the body is the tail of a resumed download: it is written
+ *  into the caller's existing buffer at `sink.offset`, the sink's own
+ *  remainder (not the whole-file budget) bounds both byte checks, and a short
+ *  body fails closed — a hole here must never reach the caller as a
+ *  plausibly-sized buffer. */
 async function readResponseBuffer(
   res: Response,
   maxBytes: number,
@@ -4994,17 +5461,31 @@ async function readResponseBuffer(
   watchdog: DownloadStallWatchdog,
   onProgress?: (downloaded: number, total: number) => void,
   declaredKind: ResponseByteBudgetKind = "declared",
+  sink?: ResponseBufferSink,
 ): Promise<ArrayBuffer> {
   if (!res.ok) {
     const err = new Error(`HTTP ${res.status}`) as Error & { status: number };
     err.status = res.status;
     throw err;
   }
+  const budgetBytes = sink
+    ? sink.assembly.byteLength - sink.offset
+    : maxBytes;
   const contentLength = responseContentLength(res);
-  assertDeclaredRemoteSize(contentLength, maxBytes, label, declaredKind);
+  assertDeclaredRemoteSize(contentLength, budgetBytes, label, declaredKind);
   if (!res.body) {
     const data = await watchdog.guard(res.arrayBuffer());
-    assertByteBudget(data.byteLength, maxBytes, label);
+    assertByteBudget(data.byteLength, budgetBytes, label);
+    if (sink) {
+      if (data.byteLength !== budgetBytes) {
+        throw resumeShortBodyError(label, data.byteLength, budgetBytes);
+      }
+      sink.assembly.set(new Uint8Array(data), sink.offset);
+      onProgress?.(sink.offset + data.byteLength, sink.assembly.byteLength);
+      // The producer's assembly buffer is a plain ArrayBuffer; the caller
+      // never passes a SharedArrayBuffer view.
+      return sink.assembly.buffer as ArrayBuffer;
+    }
     return data;
   }
   const reader = res.body.getReader();
@@ -5015,16 +5496,24 @@ async function readResponseBuffer(
       throwIfAborted(watchdog.signal);
       const { done, value } = await watchdog.guard(reader.read());
       if (done) break;
-      assertByteBudget(downloaded + value.length, maxBytes, label);
-      chunks.push(value);
+      assertByteBudget(downloaded + value.length, budgetBytes, label);
+      if (sink) sink.assembly.set(value, sink.offset + downloaded);
+      else chunks.push(value);
       downloaded += value.length;
       watchdog.slowGate?.evaluate(downloaded);
-      onProgress?.(downloaded, contentLength || downloaded);
+      if (sink) onProgress?.(sink.offset + downloaded, sink.assembly.byteLength);
+      else onProgress?.(downloaded, contentLength || downloaded);
     }
   } catch (error) {
     throw withTransferredBytes(error, downloaded);
   } finally {
     try { reader.releaseLock(); } catch { /* noop */ }
+  }
+  if (sink) {
+    if (downloaded !== budgetBytes) {
+      throw resumeShortBodyError(label, downloaded, budgetBytes);
+    }
+    return sink.assembly.buffer as ArrayBuffer;
   }
   const buf = new Uint8Array(downloaded);
   let pos = 0;
@@ -5033,6 +5522,40 @@ async function readResponseBuffer(
     pos += chunk.length;
   }
   return buf.buffer;
+}
+
+/** Fail closed on a resumed body that did not fill the rest of the buffer.
+ *  Network error type keeps the retry/fallback classification unchanged; the
+ *  terminal size + sha256 check stays the last word either way. */
+function resumeShortBodyError(
+  label: string,
+  received: number,
+  expected: number,
+): OneDriveError {
+  return new OneDriveError(
+    OneDriveErrorType.NetworkError,
+    `${label} resume ended early (${received}/${expected})`,
+  );
+}
+
+/** `Content-Range: bytes <start>-<end>/<total>` → its start; null when the
+ *  header is absent or not a byte range (a CDN that ignores the Range request
+ *  answers 200 without one, and a cross-origin renderer response may not
+ *  expose the header at all). */
+function contentRangeStart(raw: string | null): number | null {
+  if (!raw) return null;
+  const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(raw.trim());
+  if (!match) return null;
+  const start = Number(match[1]);
+  const end = Number(match[2]);
+  return Number.isSafeInteger(start) && end >= start ? start : null;
+}
+
+/** Release a response body we are not going to read (the range answer that
+ *  cannot be stitched). Cancelling frees the connection instead of leaving a
+ *  whole-file body streaming behind the fresh request. */
+async function discardResponseBody(res: Response): Promise<void> {
+  try { await res.body?.cancel(); } catch { /* body already closed */ }
 }
 
 async function writeArrayBufferToBinaryFile(
@@ -5188,6 +5711,38 @@ function transferredBytesFromError(error: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
 
+/** A3 (2026-10-26): stamp the waterfall tier that raised this failure onto the
+ *  error object, the same way `slowGateRateKiBps` already rides along. The
+ *  value is evidence for the diagnostic report only — nothing in the client,
+ *  the executor or the pause/breaker logic reads it back to decide anything
+ *  (see `SyncFileErrorFactV1`). Never replaces the error: callers keep the
+ *  exact same instance so every existing `instanceof` / status check holds.
+ *  Despite the download-era name it is the single tier stamp for every
+ *  waterfall, including the upload-session chunk PUT (`uploadSession`). */
+function stampDownloadTier(error: unknown, tier: SyncFileErrorTierV1): unknown {
+  return stampErrorEvidence(error, "tier", tier);
+}
+
+/** A3 (2026-10-26): stamp how many attempts the retry loop spent, so a report
+ *  can tell a first-try failure from an exhausted retry budget. Evidence only. */
+function stampDownloadAttempts(error: unknown, attempts: number): unknown {
+  return stampErrorEvidence(error, "attempts", attempts);
+}
+
+function stampErrorEvidence(
+  error: unknown,
+  key: "tier" | "attempts",
+  value: string | number,
+): unknown {
+  if ((typeof error !== "object" || error === null) && typeof error !== "function") {
+    return error;
+  }
+  try {
+    (error as Record<string, unknown>)[key] = value;
+  } catch { /* Preserve the original error even when it is not extensible. */ }
+  return error;
+}
+
 /** Download via a Graph API /content endpoint using native fetch.
  *  Includes the Authorization header for the initial Graph call, but
  *  fetch correctly strips it when following cross-origin redirects to
@@ -5273,7 +5828,16 @@ async function contentUrlFetchToBinaryFile(
 /** Download a CDN pre-signed URL using native fetch (bypasses requestUrl
  *  mobile bugs: Android base64 encoding, iOS status=0 on CDN domains).
  *  Only active in browser/Electron/WebView environments (has window).
- *  Returns a minimal RequestUrlResponse shape for compatibility. */
+ *  Returns a minimal RequestUrlResponse shape for compatibility.
+ *
+ *  回退不重下 (2026-10-28): with a `resume` payload this is the last tier of
+ *  the multi-range ladder continuing a partially landed file. It asks for
+ *  `Range: bytes=<offset>-`, accepts only a 206 whose Content-Range starts at
+ *  exactly that offset, and writes the body into the failed attempt's own
+ *  assembly buffer. Anything else (200 = the CDN ignored Range, a 206 with a
+ *  different start, no Content-Range) cannot be stitched: the body is
+ *  discarded, the caller is told so it can log, and the file is downloaded in
+ *  full from byte 0 — the same bytes the old fallback always fetched. */
 async function downloadUrlFetch(
   url: string,
   maxBytes = MAX_REMOTE_FILE_BYTES,
@@ -5282,9 +5846,43 @@ async function downloadUrlFetch(
   signal?: AbortSignal,
   slowGate?: SlowConnectionGate,
   declaredKind: ResponseByteBudgetKind = "declared",
+  resume?: DownloadUrlResume,
 ): Promise<RequestUrlResponse> {
   const watchdog = createDownloadStallWatchdog(signal, label, slowGate);
   try {
+    if (resume && resume.offset > 0) {
+      const resumed = await watchdog.guard(browserFetch(url, {
+        cache: "no-store",
+        signal: watchdog.signal,
+        headers: { Range: `bytes=${resume.offset}-` },
+      }));
+      // Only a 206 can be a tail. When the start is readable it must be our
+      // offset; when the CDN does not expose Content-Range to the renderer
+      // (documented in range-download.ts) the 206 status plus a body that
+      // fills exactly the remaining bytes is the available evidence — the
+      // same contract the on-disk resume path uses. Everything else is
+      // discarded and re-downloaded from byte 0.
+      const visibleRange = resumed.headers.get("Content-Range");
+      const start = contentRangeStart(visibleRange);
+      if (resumed.status === 206 && (start === null || start === resume.offset)) {
+        resume.onRangeAccepted({ contentRange: visibleRange });
+        const arrayBuffer = await readResponseBuffer(
+          resumed,
+          maxBytes,
+          label,
+          watchdog,
+          onProgress,
+          declaredKind,
+          { assembly: resume.assembly, offset: resume.offset },
+        );
+        return { arrayBuffer, status: resumed.status, headers: {} } as RequestUrlResponse;
+      }
+      await discardResponseBody(resumed);
+      resume.onRangeRejected({
+        status: resumed.status,
+        contentRange: visibleRange,
+      });
+    }
     const res = await watchdog.guard(browserFetch(url, { cache: "no-store", signal: watchdog.signal }));
     const buf = await readResponseBuffer(
       res,

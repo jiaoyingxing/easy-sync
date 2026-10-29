@@ -14,6 +14,7 @@ import type {
   MutationLedgerEntryV1,
   PendingIssue,
   RemoteFileEntry,
+  SyncFileErrorFactV1,
 } from "../src/sync/types";
 import { OneDriveError, OneDriveErrorType } from "../src/onedrive/types";
 import {
@@ -228,6 +229,38 @@ describe("S1 fact fingerprint composition", () => {
     const first = buildSyncRoundFingerprint(makeUnitInput());
     const second = buildSyncRoundFingerprint(makeUnitInput());
     expect(second.fingerprint).toBe(first.fingerprint);
+  });
+
+  it("ignores the evidence-only failure fact (A3): bytes/tier drift is not a fact change", () => {
+    // A3（2026-10-26）：`PendingIssue.error` 只作证据。同一行两轮之间已传字节、
+    // 层级或重试次数不同是常态，若把它们算进事实指纹，空转观测会被静默解除。
+    const row = (error?: SyncFileErrorFactV1): PendingIssue[] => [{
+      path: "stuck.m4a",
+      actionType: SyncActionType.RetryLater,
+      reason: "reason.circuitBreaker.network",
+      updatedAt: 1,
+      remoteETag: "etag-next",
+      ...(error ? { error } : {}),
+    }];
+    const bare = buildSyncRoundFingerprint(makeUnitInput({ pendingIssues: row() }));
+    const network = buildSyncRoundFingerprint(makeUnitInput({
+      pendingIssues: row({
+        errorType: "NetworkError",
+        statusCode: 0,
+        transferredBytes: 1_258_291,
+        tier: "downloadUrl",
+        attempts: 2,
+      }),
+    }));
+    const server = buildSyncRoundFingerprint(makeUnitInput({
+      pendingIssues: row({
+        errorType: "ServerError",
+        statusCode: 503,
+        graphCode: "serviceUnavailable",
+      }),
+    }));
+    expect(network.fingerprint).toBe(bare.fingerprint);
+    expect(server.fingerprint).toBe(bare.fingerprint);
   });
 
   it("reflects a fact change in every fingerprinted group (no constant hash)", () => {

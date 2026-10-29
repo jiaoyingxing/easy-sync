@@ -1,5 +1,9 @@
 import { sha256Hex } from "../crypto";
 import type { DiagEntry } from "./diagnostic-logger";
+import {
+  diagRunSummarySegmentOf,
+  type DiagRunSummarySegment,
+} from "./diagnostic-run-summary";
 import { isRecord } from "../obsidian-compat";
 import {
   SHARED_SYNC_PROTOCOL_PROFILE_DIAGNOSTIC_EVENT,
@@ -18,6 +22,7 @@ import type {
   FolderMutationActionV2,
   MutationAction,
   MutationLedgerEntryV1,
+  SyncFileErrorFactV1,
   SyncPlanItem,
 } from "./types";
 
@@ -124,6 +129,74 @@ export function formatDiagnosticAutomaticSyncSummary(input: {
   ];
 }
 
+/**
+ * A3 (2026-10-26): the six evidence cells of one failure fact, reduced to
+ * report text. A missing field renders as "—" and is never guessed — a legacy
+ * row without `error` and a failure that produced no evidence look the same.
+ * Presentation only: this never feeds a decision.
+ */
+function projectSyncFileErrorFactCells(
+  fact: SyncFileErrorFactV1 | undefined,
+  formatSize: (bytes?: number) => string,
+  fileSize?: number,
+): {
+  errorType: string;
+  statusCode: string;
+  graphCode: string;
+  moved: string;
+  tier: string;
+  attempts: string;
+} {
+  return {
+    errorType: fact?.errorType ?? "—",
+    // 0 is a real value here ("no HTTP response at all"), never falsy-fallback.
+    statusCode: fact?.statusCode === undefined ? "—" : String(fact.statusCode),
+    graphCode: fact?.graphCode ?? "—",
+    moved: fact?.transferredBytes === undefined
+      ? "—"
+      : `${formatSize(fact.transferredBytes)}/${
+        fileSize === undefined ? "—" : formatSize(fileSize)
+      }`,
+    tier: fact?.tier ?? "—",
+    attempts: fact?.attempts === undefined ? "—" : String(fact.attempts),
+  };
+}
+
+/** One-line evidence suffix of a "失败文件明细" row. Never wraps and never
+ *  dumps JSON: the six cells stay in a fixed order so two reports can be
+ *  diffed line by line. */
+export function formatSyncFileErrorFactSuffix(
+  fact: SyncFileErrorFactV1 | undefined,
+  formatSize: (bytes?: number) => string,
+  fileSize?: number,
+): string {
+  const cells = projectSyncFileErrorFactCells(fact, formatSize, fileSize);
+  return `— type=${cells.errorType} status=${cells.statusCode} code=${cells.graphCode}`
+    + ` moved=${cells.moved} tier=${cells.tier} retries=${cells.attempts}`;
+}
+
+/** The four evidence columns the "待处理项" table adds (A3, 2026-10-26):
+ *  error class, bytes already moved, transport tier, retry attempts. */
+export function projectSyncFileErrorFactColumns(
+  fact: SyncFileErrorFactV1 | undefined,
+  formatSize: (bytes?: number) => string,
+): {
+  errorType: string;
+  transferred: string;
+  tier: string;
+  attempts: string;
+} {
+  const cells = projectSyncFileErrorFactCells(fact, formatSize);
+  return {
+    errorType: cells.errorType,
+    transferred: fact?.transferredBytes === undefined
+      ? "—"
+      : formatSize(fact.transferredBytes),
+    tier: cells.tier,
+    attempts: cells.attempts,
+  };
+}
+
 export function projectSyncHistoryActionCounts(
   entry: {
     uploaded: number;
@@ -170,44 +243,42 @@ export function buildConflictEvidence(
   };
 }
 
+/** Latest entry of one fixed round-summary kind. The names live in
+ *  `diagnostic-run-summary` (shared with the `snapshot` bypass and the 5-round
+ *  table) so the report can never drift from the logger's side channel. */
+function findLatestRunSummaryEntry(
+  entries: readonly DiagEntry[],
+  segment: DiagRunSummarySegment,
+): DiagEntry | undefined {
+  for (let index = entries.length - 1; index >= 0; index--) {
+    const entry = entries[index];
+    if (diagRunSummarySegmentOf(entry) === segment) return entry;
+  }
+  return undefined;
+}
+
 export function findLatestPhaseSummary(
   entries: readonly DiagEntry[],
 ): DiagEntry | undefined {
-  return [...entries].reverse().find(
-    (entry) => entry.cat === "lifecycle"
-      && entry.lvl === "log"
-      && entry.msg === "sync run phase summary",
-  );
+  return findLatestRunSummaryEntry(entries, "phase");
 }
 
 export function findLatestNetworkSummary(
   entries: readonly DiagEntry[],
 ): DiagEntry | undefined {
-  return [...entries].reverse().find(
-    (entry) => entry.cat === "onedrive"
-      && entry.lvl === "log"
-      && entry.msg === "sync network summary",
-  );
+  return findLatestRunSummaryEntry(entries, "network");
 }
 
 export function findLatestTransferSummary(
   entries: readonly DiagEntry[],
 ): DiagEntry | undefined {
-  return [...entries].reverse().find(
-    (entry) => entry.cat === "execute"
-      && entry.lvl === "log"
-      && entry.msg === "sync file transfer summary",
-  );
+  return findLatestRunSummaryEntry(entries, "transfer");
 }
 
 export function findLatestAutomaticHandlingSummary(
   entries: readonly DiagEntry[],
 ): DiagEntry | undefined {
-  return [...entries].reverse().find(
-    (entry) => entry.cat === "execute"
-      && entry.lvl === "log"
-      && entry.msg === "sync automatic handling summary",
-  );
+  return findLatestRunSummaryEntry(entries, "automatic");
 }
 
 const SHARED_PROTOCOL_REASONS = new Set<SharedSyncProtocolInconsistencyReason>([

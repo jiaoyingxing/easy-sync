@@ -61,4 +61,54 @@ describe("OneDriveClient.getFileMetadataByPaths", () => {
       expect(body.requests[index].url).toContain(path.split("/")[1]);
     }
   });
+
+  it("isolates a failed 20-path chunk so only its own paths degrade to per-item reads", async () => {
+    const paths = Array.from({ length: 25 }, (_unused, index) => `chunk-${index}.md`);
+    let batchPosts = 0;
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockImplementation(
+      async (request) => {
+        const body = JSON.parse(request.body as string) as {
+          requests: Array<{ id: string; url: string }>;
+        };
+        batchPosts++;
+        if (body.requests[0].url.includes("chunk-0.md")) {
+          // The first chunk's POST fails with a gateway timeout; the client
+          // retries it, then isolates it.
+          return {
+            status: 504,
+            headers: {},
+            json: { error: { code: "gatewayTimeout", message: "timeout" } },
+          };
+        }
+        return {
+          status: 200,
+          headers: {},
+          json: {
+            responses: body.requests.map((entry) => ({
+              id: entry.id,
+              status: 404,
+              headers: {},
+              body: { error: { code: "itemNotFound", message: "missing" } },
+            })),
+          },
+        };
+      },
+    );
+    const client = new OneDriveClient(async () => "token");
+
+    const result = await client.getFileMetadataByPaths("testVault", paths);
+
+    // Chunk 1 (20 paths) is left unresolved: the caller re-verifies exactly
+    // those items one by one. Chunk 2 (5 paths) still resolves in one read.
+    expect(result.size).toBe(5);
+    for (const path of paths.slice(20)) {
+      expect(result.get(path)).toBeNull();
+    }
+    for (const path of paths.slice(0, 20)) {
+      expect(result.has(path)).toBe(false);
+    }
+    // One POST for the healthy chunk plus the failed chunk's own attempts.
+    expect(batchPosts).toBeGreaterThan(1);
+    expect(requestSpy).toHaveBeenCalledTimes(batchPosts);
+  });
 });

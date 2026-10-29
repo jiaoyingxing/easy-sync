@@ -14,13 +14,16 @@
  */
 
 import {
-  Platform,
   SearchComponent,
   ToggleComponent,
   setIcon,
   type App,
 } from "obsidian";
 import type { I18n } from "../i18n";
+import {
+  hostPlatformFacts,
+  type HostPlatformFacts,
+} from "../obsidian-compat";
 import {
   RecoveryIndexV1,
   type RecoveryContentV1,
@@ -123,7 +126,13 @@ export class RecoveryModal extends EasySyncModal {
   /** 桌面打开时自动选中首条；手机不选（避免自动跳详情）。 */
   private autoSelectPending = false;
 
-  constructor(app: App, private readonly options: RecoveryModalOptionsV1) {
+  constructor(
+    app: App,
+    private readonly options: RecoveryModalOptionsV1,
+    /** UI-mode facts for the single-pane mobile layout; tests may inject a
+     *  fake, production keeps the live `Platform`-backed default. */
+    private readonly platformFacts: HostPlatformFacts = hostPlatformFacts,
+  ) {
     super(app);
     // 宿主官方侧栏式弹框：宿主隐藏标题栏、手机全屏；自有类只做尺寸兜底。
     this.modalEl.addClass("mod-sidebar-layout", "easy-sync-recovery-shell");
@@ -140,7 +149,7 @@ export class RecoveryModal extends EasySyncModal {
   onOpen(): void {
     this.contentEl.empty();
     this.contentEl.addClass("easy-sync-recovery-modal");
-    this.autoSelectPending = !Platform.isMobile;
+    this.autoSelectPending = !this.platformFacts.isMobile;
 
     // 手机端宿主把 modal-content 的直接子节点全部绝对叠放（`.is-phone …
     // .modal-content > *`，2026-10-20 真机两处错位的根因）：头部与双栏布局
@@ -181,7 +190,7 @@ export class RecoveryModal extends EasySyncModal {
     this.renderList();
     this.renderDetail();
     // 桌面打开即定位搜索框（仅全库模式有搜索框）；手机不聚焦，避免一打开就弹键盘。
-    if (search !== null && !Platform.isMobile) {
+    if (search !== null && !this.platformFacts.isMobile) {
       search.inputEl.focus({ preventScroll: true });
     }
     void this.loadEntries();
@@ -331,7 +340,7 @@ export class RecoveryModal extends EasySyncModal {
     if (!header) return;
 
     this.buildTitleSlot();
-    if (!Platform.isMobile) {
+    if (!this.platformFacts.isMobile) {
       const main = header.createDiv("easy-sync-recovery-header-main");
       main.createSpan({
         cls: "easy-sync-recovery-header-title",
@@ -402,7 +411,7 @@ export class RecoveryModal extends EasySyncModal {
     if (this.headerBackEl !== null) {
       this.headerBackEl.toggleClass(
         "is-hidden",
-        !Platform.isMobile || entry === null,
+        !this.platformFacts.isMobile || entry === null,
       );
     }
     const detail = this.readyDetail();
@@ -836,7 +845,7 @@ export class RecoveryModal extends EasySyncModal {
   private syncMobilePane(): void {
     const layout = this.layoutEl;
     if (!layout) return;
-    const detailOpen = Platform.isMobile && this.selectedEntry() !== null;
+    const detailOpen = this.platformFacts.isMobile && this.selectedEntry() !== null;
     layout.toggleClass("is-detail-open", detailOpen);
     this.headerEl?.toggleClass("is-detail-open", detailOpen);
   }

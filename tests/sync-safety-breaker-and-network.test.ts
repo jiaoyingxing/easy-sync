@@ -457,6 +457,45 @@ describe("M17 circuit breaker retry semantics", () => {
     expect(result.breakerDeferredErrors).toBe(1);
   });
 
+  it("a successful retry hands the transfer-remote-moving path to the round-end reconcile", async () => {
+    // 2026-10-28 真机（焦应行的笔记本）：延后行在下一轮成功下载后仍挂在
+    // 「需要处理」，直到重启才消失。轮末对账只删除 resolved 集合里的路径、
+    // 未重签的旧行原样存活——成功结算必须把该路径交给 resolvedIssuePaths，
+    // 否则行在账本里永生，显示层随账本走就永远不会刷新。
+    const { executor, downloadFile, mode, mockState, getFileMetadata } =
+      makeBreakerExecutor("auto", SyncActionType.Download, {
+        issueCode: "transfer-remote-moving",
+        consecutiveFailures: 1,
+      });
+    const deferredByRound: string[][] = [];
+    const resolvedByRound: string[][] = [];
+    mockState.reconcilePendingIssues = vi.fn(async (
+      issues: PendingIssue[],
+      resolvedPaths?: Iterable<string>,
+    ) => {
+      deferredByRound.push(
+        issues.filter((issue) => issue.path === "stuck.m4a").map((issue) => issue.path),
+      );
+      resolvedByRound.push([...(resolvedPaths ?? [])]);
+    });
+    // 首轮：下载期间远端版本前移（计划 etag-stuck、实读 etag-newer）→ 延后。
+    getFileMetadata.mockResolvedValueOnce({
+      driveId: "item-stuck",
+      parentId: TEST_SYNC_SCOPE.filesRootId,
+      size: 3,
+      mtime: 1,
+      eTag: "etag-newer",
+    });
+    const first = await executor.run(mode, {});
+    expect(first.deferred).toBe(1);
+    expect(deferredByRound.at(-1)).toEqual(["stuck.m4a"]);
+    // 次轮：远端版本已稳定（回到计划版本）→ 下载成功 → 路径必须进 resolved。
+    const second = await executor.run(mode, {});
+    expect(second.downloaded).toBe(1);
+    expect(deferredByRound.at(-1)).toEqual([]);
+    expect(resolvedByRound.at(-1)).toContain("stuck.m4a");
+  });
+
   it("auto sync defers a remote-version-changed download instead of failing the round", async () => {
     // 2026-09-28 热文件现场（resojot 录音分片、传输中的照片）：下载期间云端
     // 版本前移是瞬态内容竞态，下一轮重排计划即可拿到新版本——不得当作整轮

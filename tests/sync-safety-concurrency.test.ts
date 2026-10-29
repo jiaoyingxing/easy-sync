@@ -89,7 +89,7 @@ import {
 } from "./helpers/sync-safety-harness";
 
 describe("Bounded small-file upload concurrency", () => {
-  it("checkpoints each independent small-upload wave after every receipt is durable", async () => {
+  it("checkpoints each independent small-upload batch after every receipt is durable", async () => {
     const smallContent = new ArrayBuffer(8);
     const smallHash = await sha256Hex(smallContent);
     const largeContent = new Uint8Array(9 * 1024 * 1024).fill(1).buffer;
@@ -186,7 +186,10 @@ describe("Bounded small-file upload concurrency", () => {
       intentWrites: 9,
       receiptWrites: 9,
       checkpointOperations: 9,
-      checkpointCommits: 5,
+      // One shared checkpoint per persistence batch: the eight small uploads
+      // are one batch (desktop 8) and the large upload keeps its own per-file
+      // checkpoint. The old concurrency-derived wave paid five.
+      checkpointCommits: 2,
       checkpointFailures: 0,
     });
     expect(
@@ -225,6 +228,7 @@ describe("Bounded small-file upload concurrency", () => {
     );
     state.commitMutationCheckpoints = commitMutationCheckpoints;
     const onFileComplete = vi.fn();
+    const onFileReverted = vi.fn();
     const executor = new SyncExecutor(
       makeMockOneDrive({ uploadFile }),
       {
@@ -257,7 +261,7 @@ describe("Bounded small-file upload concurrency", () => {
       "testVault",
     );
 
-    const result = await executor.run("manual", { onFileComplete });
+    const result = await executor.run("manual", { onFileComplete, onFileReverted });
 
     expect(result.success).toBe(false);
     expect(result.uploaded).toBe(2);
@@ -274,8 +278,19 @@ describe("Bounded small-file upload concurrency", () => {
       checkpointCommits: 0,
       checkpointFailures: 2,
     });
+    // 2026-10-26: each member reports its own row as its PUT and receipt land,
+    // so the user sees progress inside the batch. When the shared checkpoint
+    // then fails, those rows are flipped to failed with the checkpoint's
+    // reason — the success is corrected, not duplicated and not left standing.
     expect(onFileComplete).toHaveBeenCalledTimes(2);
-    expect(onFileComplete.mock.calls.every((call) => call[2] === false)).toBe(true);
+    expect(onFileComplete.mock.calls.every((call) => call[2] === true)).toBe(true);
+    expect(onFileReverted).toHaveBeenCalledTimes(2);
+    expect(onFileReverted.mock.calls.map((call) => call[0]).sort()).toEqual([
+      "first.md",
+      "second.md",
+    ]);
+    expect(onFileReverted.mock.calls.every((call) => call[1] === "shared checkpoint failed"))
+      .toBe(true);
   });
 
   it("serializes concurrent state saves", async () => {
@@ -410,7 +425,9 @@ describe("Conservative desktop small-file download concurrency", () => {
 
   it("overlaps only network prefetch while local writes stay serial", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = false;
+    Platform.isMobileApp = false;
     try {
       const bytes = new Uint8Array(256 * 1024);
       bytes.fill(7);
@@ -496,12 +513,15 @@ describe("Conservative desktop small-file download concurrency", () => {
       expect(localStore.files.size).toBe(remoteEntries.length);
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
   it("A2 — overlaps read-only download prefetch on mobile while local writes stay serial and capped at two", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     try {
       const bytes = new Uint8Array(256 * 1024);
       bytes.fill(7);
@@ -586,12 +606,15 @@ describe("Conservative desktop small-file download concurrency", () => {
       expect(localStore.files.size).toBe(remoteEntries.length);
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
   it("batches missing download URLs and hashless version checks without weakening verification", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = false;
+    Platform.isMobileApp = false;
     try {
       const buffer = new Uint8Array(256 * 1024).fill(9).buffer;
       const hash = await sha256Hex(buffer);
@@ -685,12 +708,15 @@ describe("Conservative desktop small-file download concurrency", () => {
       expect(state.baseSnapshot).toHaveLength(remoteEntries.length);
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
   it("returns to serial after the download path reports degradation", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = false;
+    Platform.isMobileApp = false;
     try {
       const buffer = new Uint8Array(1024 * 1024).fill(3).buffer;
       const hash = await sha256Hex(buffer);
@@ -759,6 +785,7 @@ describe("Conservative desktop small-file download concurrency", () => {
       expect(localStore.files.size).toBe(remoteEntries.length);
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 });
@@ -829,7 +856,9 @@ describe("B② large upload cross-file concurrency", () => {
 
   it("starts a second large upload before the first finishes (desktop)", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = false;
+    Platform.isMobileApp = false;
     try {
       const content = new Uint8Array(1024).fill(9).buffer;
       const entryA = await makeLargeLocalEntry("large-a.bin");
@@ -863,12 +892,15 @@ describe("B② large upload cross-file concurrency", () => {
       expect(result.metrics?.peakUploads).toBe(2);
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
   it("keeps the sibling upload and per-file checkpoints alive when one large upload fails (desktop)", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = false;
+    Platform.isMobileApp = false;
     try {
       const content = new Uint8Array(1024).fill(9).buffer;
       const entryA = await makeLargeLocalEntry("large-fail-a.bin");
@@ -903,12 +935,15 @@ describe("B② large upload cross-file concurrency", () => {
       expect(state.commitMutationCheckpoint).toHaveBeenCalledTimes(1);
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
   it("keeps mobile large uploads strictly serial", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     try {
       const content = new Uint8Array(1024).fill(9).buffer;
       const entryA = await makeLargeLocalEntry("large-m-a.bin");
@@ -941,6 +976,7 @@ describe("B② large upload cross-file concurrency", () => {
       expect(result.metrics?.peakUploads).toBe(1);
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 });

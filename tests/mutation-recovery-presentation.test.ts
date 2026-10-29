@@ -98,7 +98,7 @@ describe("mutation recovery presentation", () => {
     }
   });
 
-  it("separates the short top status from persistent reason, path, and next step", () => {
+  it("gives the review state its own one-line body and keeps the file list out", () => {
     const zh = new I18n("zh-cn");
     const t = zh.t.bind(zh);
     const state = {
@@ -108,6 +108,7 @@ describe("mutation recovery presentation", () => {
       remaining: 1,
       retryAt: null,
       firstPath: ".obsidian/plugins/dataview/data.json",
+      paths: [".obsidian/plugins/dataview/data.json"],
       blockReason: "facts-changed" as const,
       blockedOperationId: "op-1",
       manualResolutionAvailable: true,
@@ -115,12 +116,12 @@ describe("mutation recovery presentation", () => {
 
     expect(mutationRecoveryStatusLabel(state, t)).toBe("未完成操作");
     expect(mutationRecoveryBodyPresentation(state, t, () => "")).toEqual({
-      summary: "有 1 笔操作未确认完成，自动同步已暂停。",
-      path: ".obsidian/plugins/dataview/data.json",
-      reason: "文件或云端状态已经变化",
-      retryAt: null,
-      nextStep: "核对本机与云端内容并选择保留哪一侧。完成后会自动继续同步。",
+      summary: "请检查本机与云端差异，选择保留版本，之后自动继续。",
+      paths: [],
+      showFileList: false,
+      nextStep: null,
       actionKey: "syncView.recovery.reviewDetails",
+      secondaryAction: null,
     });
   });
 
@@ -143,7 +144,8 @@ describe("mutation recovery presentation", () => {
       manualResolutionAvailable: false,
     }, t, () => "")).toMatchObject({
       actionKey: null,
-      nextStep: "暂时无法自动确认。可导出诊断报告，或强制重置同步状态。",
+      nextStep: "如果再次同步后仍未完成，请前往「设置 → 维护」生成诊断报告发给作者，或重置同步状态。",
+      showFileList: true,
     });
 
     expect(mutationRecoveryBodyPresentation({
@@ -193,7 +195,9 @@ describe("mutation recovery presentation", () => {
       manualResolutionAvailable: true,
     }, t, () => "")).toMatchObject({
       actionKey: "syncView.recovery.reviewDetails",
-      nextStep: "核对本机与云端内容并选择保留哪一侧。完成后会自动继续同步。",
+      nextStep: null,
+      summary: "请检查本机与云端差异，选择保留版本，之后自动继续。",
+      showFileList: false,
     });
 
     // Eligibility still governs: an ineligible or corrupt-evidence block
@@ -240,8 +244,9 @@ describe("mutation recovery presentation", () => {
       firstPath: "notes/a.md",
       blockReason: null,
     }, t, () => "")).toMatchObject({
-      summary: "EasySync 正在核对上次未完成操作的结果。核对结束前不会继续同步。",
+      summary: "正在核对上次操作的结果，核对结束前不会继续同步。",
       nextStep: null,
+      showFileList: true,
     });
 
     expect(mutationRecoveryBodyPresentation({
@@ -254,9 +259,85 @@ describe("mutation recovery presentation", () => {
       blockReason: "evidence-corrupt",
       paused: true,
     }, t, () => "")).toMatchObject({
-      summary: "同步已暂停：有 1 笔操作无法自动确认。",
+      summary: "上次同步意外中断，有文件未能完成同步。",
       actionKey: null,
+      showFileList: true,
     });
+  });
+
+  it("maps each recovery family to its own body, footer, list mode, and chip", () => {
+    const zh = new I18n("zh-cn");
+    const t = zh.t.bind(zh);
+    const base = {
+      kind: "blocked" as const,
+      total: 8,
+      settled: 0,
+      remaining: 8,
+      retryAt: null,
+      firstPath: "notes/a.md",
+      paths: ["notes/a.md", "notes/b.md"],
+      blockedOperationId: "op-1",
+    };
+
+    expect(mutationRecoveryBodyPresentation({
+      ...base,
+      blockReason: "facts-changed",
+    }, t, () => "")).toMatchObject({
+      summary: "上次同步意外中断，有文件未能完成同步。",
+      paths: ["notes/a.md", "notes/b.md"],
+      showFileList: true,
+      nextStep: "如果再次同步后仍未完成，请前往「设置 → 维护」生成诊断报告发给作者，或重置同步状态。",
+    });
+
+    expect(mutationRecoveryBodyPresentation({
+      ...base,
+      kind: "waiting-network",
+      retryAt: 20,
+      blockReason: null,
+    }, t, () => "20:30")).toMatchObject({
+      summary: "网络暂时不可用，将在 20:30 自动重试。",
+      paths: ["notes/a.md", "notes/b.md"],
+      showFileList: true,
+      nextStep: null,
+    });
+
+    expect(mutationRecoveryBodyPresentation({
+      ...base,
+      kind: "waiting-network",
+      retryAt: null,
+      blockReason: null,
+      exhausted: true,
+    }, t, () => "")).toMatchObject({
+      summary: "系统不再自动重试，有文件未能完成同步。",
+      showFileList: false,
+      nextStep: "如果再次同步后仍未完成，请前往「设置 → 维护」生成诊断报告发给作者，或重置同步状态。",
+    });
+    expect(mutationRecoveryTopStatusLabel({
+      ...base,
+      kind: "waiting-network",
+      retryAt: null,
+      blockReason: null,
+      exhausted: true,
+    }, t)).toBe("未完成操作");
+
+    expect(mutationRecoveryBodyPresentation({
+      ...base,
+      blockReason: "scope-changed",
+    }, t, () => "")).toMatchObject({
+      summary: "同步位置与上次操作不一致，有文件未能完成同步。",
+      showFileList: false,
+      nextStep: "恢复同步位置后会重新核对。",
+    });
+
+    expect(mutationRecoveryBodyPresentation({
+      ...base,
+      blockReason: "account-changed",
+    }, t, () => "")).toMatchObject({
+      summary: "当前账号与上次操作不一致，有文件未能完成同步。",
+      showFileList: false,
+      secondaryAction: "open-settings",
+    });
+
   });
 
   it("describes one continuing history event without inventing separate failures", () => {

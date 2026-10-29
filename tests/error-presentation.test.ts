@@ -19,9 +19,9 @@ function en(): (key: string, params?: Record<string, string | number>) => string
 describe("known plugin bundle error presentation", () => {
   it("presents known identity errors in the current language", () => {
     expect(presentKnownPluginBundleError(
-      "Selected plugin identity is ambiguous: dataview",
+      "Selected plugin identity is ambiguous: dataview|dataview, dataview-copy",
       zh(),
-    )).toBe("插件身份不明确：dataview（多个目录声明了同一插件）");
+    )).toBe("插件ID dataview 被 dataview, dataview-copy 重复声明。");
     expect(presentKnownPluginBundleError(
       "Selected plugin manifest identity changed within directory: calendar",
       zh(),
@@ -30,6 +30,12 @@ describe("known plugin bundle error presentation", () => {
       "Selected plugin manifest identity is invalid: calendar",
       zh(),
     )).toBe("插件清单中的身份字段无效：calendar");
+    // Pre-2026-10 messages carried only the directory, so the plugin id is
+    // unknown: keep the raw message instead of inventing half a sentence.
+    expect(presentKnownPluginBundleError(
+      "Selected plugin identity is ambiguous: dataview",
+      zh(),
+    )).toBeNull();
   });
 
   it("keeps retired restore-source errors unmapped in every language", () => {
@@ -93,9 +99,11 @@ describe("known plugin bundle error presentation", () => {
     )).toBe("插件要求更高的 Obsidian 版本：calendar");
   });
 
-  it("returns the raw message for English users (identical to today)", () => {
-    const message = "Selected plugin identity is ambiguous: dataview";
-    expect(presentKnownPluginBundleError(message, en())).toBe(message);
+  it("presents the actionable English text for known plugin errors", () => {
+    const message = "Selected plugin identity is ambiguous: dataview|dataview, dataview-copy";
+    expect(presentKnownPluginBundleError(message, en())).toBe(
+      "Plugin ID dataview is declared by both dataview, dataview-copy.",
+    );
     const incompatible = "Selected plugin bundle is incompatible (downgrade): calendar";
     expect(presentKnownPluginBundleError(incompatible, en())).toBe(incompatible);
   });
@@ -117,9 +125,11 @@ describe("known plugin bundle error presentation", () => {
 
   it("trims the extracted plugin id and keeps whitespace-safe tails", () => {
     expect(presentKnownPluginBundleError(
-      "Selected plugin identity is ambiguous:  calendar ",
+      "Selected plugin identity is ambiguous:  calendar|calendar, calendar-copy ",
       en(),
-    )).toBe("Selected plugin identity is ambiguous: calendar");
+    )).toBe(
+      "Plugin ID calendar is declared by both calendar, calendar-copy.",
+    );
   });
 
   it("presents known file-operation errors in Chinese without parameters", () => {
@@ -210,10 +220,10 @@ describe("known plugin bundle error presentation", () => {
 
   it("routes known plugin errors first through the single entry point", () => {
     expect(presentKnownError(
-      "Selected plugin identity is ambiguous: dataview",
+      "Selected plugin identity is ambiguous: dataview|dataview, dataview-copy",
       zh(),
       "zh-cn",
-    )).toBe("插件身份不明确：dataview（多个目录声明了同一插件）");
+    )).toBe("插件ID dataview 被 dataview, dataview-copy 重复声明。");
     expect(presentKnownError(
       "Local folder move read-back failed: a -> b",
       zh(),

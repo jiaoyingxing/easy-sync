@@ -18,8 +18,10 @@ import {
   type SyncStateEnvelopeV2,
 } from "./state-envelope-v2";
 import {
+  addBuildPhaseMs,
   StateV2IndexedDbRecoveryStore,
   stateV2IndexedDbRecoveryEnvelopeDigest,
+  type StateV2CommitTimings,
 } from "./state-v2-indexeddb-recovery";
 import { sameSyncScope } from "./types";
 
@@ -408,7 +410,12 @@ export class StateV2IndexedDbActiveStore {
   async commit(
     previous: SyncStateEnvelopeV2,
     next: SyncStateEnvelopeV2,
+    options: {
+      nextValidated?: boolean;
+      timings?: StateV2CommitTimings;
+    } = {},
   ): Promise<StateV2IndexedDbActiveCommitResult> {
+    const timings = options.timings;
     const resumesPendingWitness =
       this.pendingWitnessCommit?.previous === previous
       && this.pendingWitnessCommit.next === next;
@@ -418,7 +425,16 @@ export class StateV2IndexedDbActiveStore {
         "IndexedDB active-state commit must use the exact loaded envelope",
       );
     }
-    if (!resumesPendingWitness) validateEnvelope(next);
+    // `nextValidated` is the owner's proof that this exact `next` object just
+    // passed `validateEnvelope` and was not mutated since; it only removes the
+    // duplicate validation, never the revision/scope checks below.
+    if (!resumesPendingWitness && options.nextValidated !== true) {
+      const validateStartedAt = performance.now();
+      validateEnvelope(next);
+      if (timings) {
+        addBuildPhaseMs(timings, "validateMs", performance.now() - validateStartedAt);
+      }
+    }
     if (!sameSyncScope(previous.scope, next.scope)) {
       throw new Error(
         "IndexedDB active-state incremental commit cannot change sync scope",
@@ -435,7 +451,9 @@ export class StateV2IndexedDbActiveStore {
       );
     }
 
+    const metaReadStartedAt = performance.now();
     const meta = await this.readMeta();
+    if (timings) timings.idbMs += performance.now() - metaReadStartedAt;
     if (!meta) {
       throw new StateV2IndexedDbActiveStateError(
         "missing",
@@ -458,8 +476,8 @@ export class StateV2IndexedDbActiveStore {
       previous,
       next,
       databaseAtPrevious
-        ? { previousEnvelopeDigest: meta.stateDigest }
-        : {},
+        ? { previousEnvelopeDigest: meta.stateDigest, timings }
+        : { timings },
     );
     if (
       databaseAtNext
@@ -468,6 +486,7 @@ export class StateV2IndexedDbActiveStore {
       await this.recovery.confirmValidatedCommittedDelta(
         next,
         prepared.nextEnvelopeDigest,
+        timings,
       );
       this.currentEnvelope = next;
       this.pendingWitnessCommit = null;
@@ -491,12 +510,17 @@ export class StateV2IndexedDbActiveStore {
     const remoteNodes = prepared.remoteNodes;
     const anchors = prepared.anchors;
     const folderAnchors = prepared.folderAnchors;
+    const metaBuildStartedAt = performance.now();
     const nextMeta: StoredActiveStateMeta = {
       ...meta,
       stateDigest: prepared.nextEnvelopeDigest,
       expectedCounts: envelopeCounts(next),
       header: stateV2EnvelopeHeader(next),
     };
+    if (timings) {
+      addBuildPhaseMs(timings, "cloneMs", performance.now() - metaBuildStartedAt);
+    }
+    const transactionStartedAt = performance.now();
     const db = await this.open();
     const tx = db.transaction(
       ["meta", "remoteNodes", "anchors", "folderAnchors"],
@@ -526,8 +550,15 @@ export class StateV2IndexedDbActiveStore {
       await tx.done.catch(() => undefined);
       throw error;
     }
+    if (timings) {
+      timings.idbMs += performance.now() - transactionStartedAt;
+    }
 
+    const committedMetaStartedAt = performance.now();
     const committedMeta = await this.readMeta();
+    if (timings) {
+      timings.idbMs += performance.now() - committedMetaStartedAt;
+    }
     if (
       !committedMeta
       || committedMeta.phase !== "ready"
@@ -544,6 +575,7 @@ export class StateV2IndexedDbActiveStore {
     await this.recovery.confirmValidatedCommittedDelta(
       next,
       prepared.nextEnvelopeDigest,
+      timings,
     );
     this.currentEnvelope = next;
     this.pendingWitnessCommit = null;

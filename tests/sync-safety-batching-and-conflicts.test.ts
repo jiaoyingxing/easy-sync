@@ -4061,6 +4061,54 @@ describe("Conflict resolution actions report standalone transfer progress", () =
     expect(notice.messages).not.toContain("notice.delete.confirmed");
   });
 
+  it("flips the wave's shown delete rows when its shared checkpoint cannot commit", async () => {
+    const progressStore = new SyncProgressStore();
+    const notice = makeNoticeRecorder();
+    const localByPath = new Map<string, LocalFileEntry>([
+      ["a.md", { path: "a.md", hash: "aa".repeat(32), size: 1, mtime: 1, binary: false }],
+      ["b.md", { path: "b.md", hash: "bb".repeat(32), size: 1, mtime: 1, binary: false }],
+    ]);
+    const executor = makeProgressAwareExecutor({
+      progressStore,
+      noticeCenter: notice.center,
+      pendingRemoteDeletes: [...localByPath.values()].map((local) => ({
+        type: SyncActionType.ConfirmLocalDelete,
+        path: local.path,
+        local,
+      })),
+      inspectFile: vi.fn().mockImplementation(async (path: string) => ({
+        status: "present",
+        entry: localByPath.get(path),
+      })),
+      adapterOverrides: { remove: vi.fn().mockResolvedValue(undefined) },
+      stateOverrides: {
+        commitMutationCheckpoints: vi.fn().mockRejectedValue(
+          new Error("shared checkpoint failed"),
+        ),
+      },
+    });
+
+    await executor.confirmRemoteDeletes(["a.md", "b.md"]);
+
+    // 2026-10-26: the wave reports each erase as soon as it lands, and its one
+    // shared checkpoint follows. When that checkpoint fails the shown rows must
+    // flip to failed with the reason — two rows, not four (no duplicate), and
+    // no leftover success.
+    expect(progressStore.state.completedFiles).toHaveLength(2);
+    expect(progressStore.state.completedFiles).toEqual([
+      expect.objectContaining({
+        path: "a.md",
+        status: "error",
+        reason: "shared checkpoint failed",
+      }),
+      expect.objectContaining({
+        path: "b.md",
+        status: "error",
+        reason: "shared checkpoint failed",
+      }),
+    ]);
+  });
+
   it("keeps one side-action result batch across sequential conflict clicks", async () => {
     const progressStore = new SyncProgressStore();
     const executor = makeProgressAwareExecutor({

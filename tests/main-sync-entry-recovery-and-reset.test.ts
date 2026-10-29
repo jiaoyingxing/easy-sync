@@ -73,6 +73,7 @@ vi.mock("../src/sync/state-manager", () => ({
   },
   SyncPathMutationRecoveryError: class extends Error {},
   ConservativeResetBlockedError: class extends Error {},
+  MAX_MUTATION_CHECKPOINT_BATCH: 64,
 }));
 
 vi.mock("../src/sync/diagnostic-logger", () => ({
@@ -396,7 +397,40 @@ describe("main sync entry guards", () => {
       kind: "blocked",
       blockReason: "facts-changed",
       blockedOperationId: "pending",
+      paths: ["notes/a.md"],
     });
+  });
+
+  it("derives display paths blocked-first, deduped, without changing execution state", () => {
+    const plugin = makePlugin();
+    plugin.state = {
+      isV2StateActive: true,
+      syncHistory: [{
+        recovery: {
+          state: "blocked",
+          total: 3,
+          settled: 0,
+          remaining: 3,
+          blockedOperationId: "b",
+        },
+      }],
+      mutationLedger: [
+        { intent: { operationId: "a", path: "notes/a.md" }, receipt: null },
+        { intent: { operationId: "b", path: "notes/b.md" }, receipt: null },
+        { intent: { operationId: "c", path: "notes/a.md" }, receipt: null },
+      ],
+      mutationRecoveryQuarantine: [],
+    } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: false,
+      canResolveMutationRecovery: vi.fn().mockReturnValue(false),
+    } as never;
+
+    expect(plugin.getMutationRecoveryDisplayState()?.paths).toEqual([
+      "notes/b.md",
+      "notes/a.md",
+    ]);
   });
 
   it("keeps the manual resolution exit reachable under a state-unavailable stamp when the record is eligible", () => {

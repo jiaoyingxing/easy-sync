@@ -2297,3 +2297,75 @@ describe("deletion ledger 30-day prune in the healthy round", () => {
     expect(saveData).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("device-local local delete decisions", () => {
+  it("merges a re-confirmation, settles one path and keeps the other hash byte-identical", async () => {
+    const { state } = makeState();
+    await state.load();
+    const firstHash = "1".repeat(16);
+    const secondHash = "2".repeat(16);
+
+    await state.addLocalDeleteDecisions({
+      recordToken: "local-delete:scope",
+      paths: ["a.md", "b.md"],
+      hashes: [firstHash, secondHash],
+    });
+    expect(state.localDeleteDecisions).toEqual([{
+      kind: "file",
+      token: "local-delete:scope",
+      paths: ["a.md", "b.md"],
+      planDigest: JSON.stringify([firstHash, secondHash]),
+      createdAt: expect.any(Number),
+    }]);
+
+    // Re-confirming the same path replaces only that path's fact hash.
+    await state.addLocalDeleteDecisions({
+      recordToken: "local-delete:scope",
+      paths: ["a.md"],
+      hashes: ["3".repeat(16)],
+    });
+    expect(state.localDeleteDecisions[0].paths).toEqual(["b.md", "a.md"]);
+    expect(JSON.parse(state.localDeleteDecisions[0].planDigest))
+      .toEqual([secondHash, "3".repeat(16)]);
+
+    await state.settleLocalDeleteDecisions([
+      { token: "local-delete:scope", path: "a.md" },
+    ]);
+    expect(state.localDeleteDecisions).toEqual([{
+      kind: "file",
+      token: "local-delete:scope",
+      paths: ["b.md"],
+      planDigest: JSON.stringify([secondHash]),
+      createdAt: expect.any(Number),
+    }]);
+
+    await state.removeLocalDeleteDecisionPaths(["b.md"]);
+    expect(state.localDeleteDecisions).toEqual([]);
+  });
+
+  it("does not let a rejected path inherit the confirmation of another record path", async () => {
+    const { state } = makeState();
+    await state.load();
+    await state.addLocalDeleteDecisions({
+      recordToken: "local-delete:scope",
+      paths: ["a.md"],
+      hashes: ["1".repeat(16)],
+    });
+    await state.removeLocalDeleteDecisionPaths(["a.md"]);
+    expect(state.localDeleteDecisions).toEqual([]);
+  });
+
+  it("drops a malformed persisted record instead of authorizing from it", async () => {
+    const { state, plugin } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-local-delete-decisions": [{
+        token: "broken",
+        paths: ["a.md", "b.md"],
+        planDigest: JSON.stringify(["1".repeat(16)]),
+        createdAt: 1,
+      }],
+    });
+    await state.load();
+    expect(state.localDeleteDecisions).toEqual([]);
+  });
+});

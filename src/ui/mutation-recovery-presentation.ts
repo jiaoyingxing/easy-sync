@@ -18,6 +18,12 @@ export interface MutationRecoveryDisplayState {
   remaining: number;
   retryAt: number | null;
   firstPath: string | null;
+  /** Display-only snapshot of unresolved paths, blocked record first.
+   *  Optional so older callers/tests remain valid; the sidebar treats
+   *  missing/empty as "path unavailable". */
+  paths?: readonly string[];
+  /** Display-only: scheduler exhausted. In-memory; never persisted. */
+  exhausted?: boolean;
   blockReason: MutationRecoveryBlockReason | null;
   blockedOperationId: string | null;
   /** Synchronous path/intent eligibility only; no remote fact is inferred here. */
@@ -179,19 +185,22 @@ export function mutationRecoveryTopStatusLabel(
   if (state.kind === "checking") {
     return t("syncView.recovery.checkingTop");
   }
+  // Budget exhaustion is no longer an implicit network wait: the scheduler
+  // has stopped automatic retries, so the row belongs to the blocked family.
+  if (state.exhausted === true) {
+    return t("syncView.recovery.blocked");
+  }
   return mutationRecoveryStatusLabel(state, t);
 }
 
 interface MutationRecoveryBodyPresentation {
   summary: string;
-  path: string | null;
-  reason: string | null;
-  retryAt: string | null;
-  /** Null for automatic states (checking / waiting-network): their summaries
-   *  already state the auto-continue outcome, and a next-step line would only
-   *  repeat it (2026-09-15 copy-reduction round R-4). */
+  /** Paths this state chooses to show. V3–V6 deliberately return none. */
+  paths: readonly string[];
+  showFileList: boolean;
   nextStep: string | null;
   actionKey: keyof LocaleStrings | null;
+  secondaryAction: "open-settings" | null;
 }
 
 export function mutationRecoveryPrimaryActionKey(
@@ -232,51 +241,82 @@ export function mutationRecoveryBodyPresentation(
   state: Readonly<MutationRecoveryDisplayState>,
   t: Translator,
   formatTime: (timestamp: number) => string,
-  options?: { nonRetryable?: boolean },
 ): MutationRecoveryBodyPresentation {
+  const paths = state.paths ?? [];
+  const exhausted = state.exhausted === true;
   if (state.kind === "checking") {
     return {
       summary: t("syncView.recovery.summary.checking"),
-      path: state.firstPath,
-      reason: null,
-      retryAt: null,
+      paths,
+      showFileList: true,
       nextStep: null,
       actionKey: mutationRecoveryPrimaryActionKey(state),
+      secondaryAction: null,
     };
   }
   if (state.kind === "waiting-network") {
+    if (exhausted) {
+      return {
+        summary: t("syncView.recovery.body.exhausted"),
+        paths: [],
+        showFileList: false,
+        nextStep: t("syncView.recovery.nextStep.blocked"),
+        actionKey: null,
+        secondaryAction: null,
+      };
+    }
     return {
-      summary: t("syncView.recovery.summary.waitingNetwork"),
-      path: state.firstPath,
-      reason: null,
-      retryAt: state.retryAt === null ? null : formatTime(state.retryAt),
+      summary: state.retryAt === null
+        ? t("syncView.recovery.summary.waitingNetwork")
+        : t("syncView.recovery.summary.waitingNetworkAt", {
+          time: formatTime(state.retryAt),
+        }),
+      paths,
+      showFileList: true,
       nextStep: null,
       actionKey: null,
+      secondaryAction: null,
     };
   }
+
   const actionKey = mutationRecoveryPrimaryActionKey(state);
-  const canReview = actionKey === "syncView.recovery.reviewDetails";
-  const nextStepKey = canReview
-    ? "syncView.recovery.nextStep.review"
-    : state.blockReason === "account-changed"
-      ? "syncView.recovery.nextStep.accountChanged"
-      : options?.nonRetryable === true
-        ? "syncView.itemTermination.nonRetryable"
-        : "syncView.recovery.nextStep.blocked";
+  if (actionKey === "syncView.recovery.reviewDetails") {
+    return {
+      summary: t("syncView.recovery.body.review"),
+      paths: [],
+      showFileList: false,
+      nextStep: null,
+      actionKey,
+      secondaryAction: null,
+    };
+  }
+  if (state.blockReason === "scope-changed") {
+    return {
+      summary: t("syncView.recovery.body.scopeChanged"),
+      paths: [],
+      showFileList: false,
+      nextStep: t("syncView.recovery.nextStep.scope"),
+      actionKey,
+      secondaryAction: null,
+    };
+  }
+  if (state.blockReason === "account-changed") {
+    return {
+      summary: t("syncView.recovery.body.accountChanged"),
+      paths: [],
+      showFileList: false,
+      nextStep: t("syncView.recovery.nextStep.accountChanged"),
+      actionKey,
+      secondaryAction: "open-settings",
+    };
+  }
   return {
-    summary: t(
-      state.paused
-        ? "syncView.recovery.summary.blockedPaused"
-        : "syncView.recovery.summary.blocked",
-      {
-        count: state.remaining,
-      },
-    ),
-    path: state.firstPath,
-    reason: mutationRecoveryBlockReasonText(state.blockReason, t),
-    retryAt: null,
-    nextStep: t(nextStepKey),
+    summary: t("syncView.recovery.summary.interrupted"),
+    paths,
+    showFileList: true,
+    nextStep: t("syncView.recovery.nextStep.blocked"),
     actionKey,
+    secondaryAction: null,
   };
 }
 

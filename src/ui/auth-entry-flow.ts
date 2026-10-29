@@ -2,6 +2,10 @@ import type { App } from "obsidian";
 import type { AuthModule } from "../auth/auth-module";
 import type { DeviceCodeAttemptView } from "../auth/types";
 import type { I18n } from "../i18n";
+import {
+  hostPlatformFacts,
+  type HostPlatformFacts,
+} from "../obsidian-compat";
 import { AuthPendingModal } from "./auth-pending-modal";
 import { AuthMethodModal } from "./auth-method-modal";
 import { AuthDeviceCodeModal } from "./auth-device-code-modal";
@@ -34,6 +38,9 @@ export interface AuthEntryFlowHost {
   auth: AuthModule | null;
   i18n: Pick<I18n, "t">;
   noticeCenter: Pick<EasySyncNoticeCenter, "show">;
+  /** Platform facts for the method chooser order; defaults to the live host
+   *  facts when a caller (or test double) omits them. */
+  platformFacts?: HostPlatformFacts;
 }
 
 export function resolveAuthEntryPresentation(input: {
@@ -129,6 +136,7 @@ async function chooseAuthMethod(
       browserPromise = startLogin(host, auth);
     },
     () => beginDeviceCodeFlow(host, auth),
+    host.platformFacts ?? hostPlatformFacts,
   ).awaitAction();
 
   if (result.action === "browser" && browserPromise) {

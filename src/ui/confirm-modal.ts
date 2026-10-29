@@ -74,6 +74,10 @@ export class ConfirmModal extends EasySyncModal<boolean> {
     private t: I18nFn,
     private options?: {
       message?: string;
+      /** Additional plain paragraphs after `message` (one per line). Used when
+       *  the body is a short list of facts rather than one sentence; each line
+       *  uses the same unstyled paragraph as `message`. */
+      lines?: readonly string[];
       warning?: string;
       danger?: boolean;
       /** Extra class for the message paragraph; omit for a plain paragraph
@@ -104,6 +108,10 @@ export class ConfirmModal extends EasySyncModal<boolean> {
         text: this.options.message,
         cls: this.options?.messageClass,
       });
+    }
+
+    for (const line of this.options?.lines ?? []) {
+      contentEl.createEl("p", { text: line });
     }
 
     if (this.options?.warning) {

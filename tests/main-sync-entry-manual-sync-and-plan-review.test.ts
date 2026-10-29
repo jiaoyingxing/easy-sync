@@ -74,6 +74,7 @@ vi.mock("../src/sync/state-manager", () => ({
   },
   SyncPathMutationRecoveryError: class extends Error {},
   ConservativeResetBlockedError: class extends Error {},
+  MAX_MUTATION_CHECKPOINT_BATCH: 64,
 }));
 
 vi.mock("../src/sync/diagnostic-logger", () => ({
@@ -338,10 +339,59 @@ describe("main sync entry guards", () => {
     expect((plugin as never as { opLock: string | null }).opLock).toBe("recovery");
   });
 
+  it("reads the entry as occupied for every lock holder, not only sync", () => {
+    // 2026-10-28 真机：非 sync 持有者（参与核对/重置/登出/恢复/路径设置）
+    // 同样让手动同步在入口弹回，入口忙事实若只认 sync，面板就在持锁期间
+    // 挂着「立即同步」，点击全部弹回 busy——三个载体必须读同一份完整事实。
+    const plugin = makePlugin();
+    const internals = plugin as never as {
+      opLock: string | null;
+      acquireOpLock: (name: string) => string | null;
+      releaseOpLock: () => void;
+      isSyncEntryInProgress: boolean;
+    };
+    expect(internals.isSyncEntryInProgress).toBe(false);
+    for (const holder of [
+      "sync",
+      "community-plugin-participation",
+      "reset",
+      "logout",
+      "mutation-recovery",
+      "sync-path-settings",
+    ]) {
+      expect(internals.acquireOpLock(holder)).toBeNull();
+      expect(internals.isSyncEntryInProgress).toBe(true);
+      internals.releaseOpLock();
+      expect(internals.isSyncEntryInProgress).toBe(false);
+    }
+  });
+
+  it("logs the lock holder when a sync entry click bounces", async () => {
+    // 弹回不留痕，「点了没反应」无从查起：busy 提示必须把当时持锁者写进日志。
+    const plugin = makePlugin();
+    plugin.syncExecutor = { isRunning: false, run: vi.fn() } as never;
+    plugin.state = { planReviewActive: true } as never;
+    plugin.noticeCenter = {
+      show: vi.fn(),
+      clear: vi.fn(),
+      dispose: vi.fn(),
+    } as never;
+    (plugin as never as { acquireOpLock: (name: string) => string | null })
+      .acquireOpLock("community-plugin-participation");
+
+    await plugin.startManualSync();
+
+    expect(plugin.diag.log).toHaveBeenCalledWith(
+      "state",
+      "sync entry click bounced — operation lock held",
+      { holder: "community-plugin-participation" },
+    );
+  });
+
   it("renders the sidebar when a file completes so rows do not lag one item behind", () => {
     const plugin = makePlugin();
-    const render = vi.fn();
-    vi.spyOn(plugin, "syncView", "get").mockReturnValue({ render } as never);
+    const renderProgress = vi.fn();
+    vi.spyOn(plugin, "syncView", "get").mockReturnValue({ renderProgress } as never);
 
     (plugin as never as {
       handleFileComplete: (
@@ -351,7 +401,9 @@ describe("main sync entry guards", () => {
       ) => void;
     }).handleFileComplete("Notes/A.md", SyncActionType.Upload, true);
 
-    expect(render).toHaveBeenCalledOnce();
+    // 2026-10-26: the completed row rides the light progress path — the top
+    // numbers and the row itself, never a whole-view rebuild.
+    expect(renderProgress).toHaveBeenCalledOnce();
     expect(plugin.progressStore.state.completedFiles).toHaveLength(1);
   });
 
@@ -1459,6 +1511,7 @@ describe("main sync entry guards", () => {
     // than claim a review that does not exist (2026-10-13 review finding).
     expect(paused?.blockReason).toBe("unknown");
     expect(paused?.manualResolutionAvailable).toBe(false);
+    expect(paused?.exhausted).toBe(true);
 
     stub.snapshot = {
       state: "scheduled",
@@ -1499,6 +1552,7 @@ describe("main sync entry guards", () => {
     plugin.state.syncHistory = [] as never;
     plugin.syncExecutor = undefined as never;
     expect(plugin.getMutationRecoveryDisplayState()?.kind).toBe("waiting-network");
+    expect(plugin.getMutationRecoveryDisplayState()?.exhausted).toBe(false);
   });
 
   it("keeps the paused shape in the persisted recovery row when a retry is scheduled", async () => {
@@ -3079,6 +3133,187 @@ describe("main sync entry guards", () => {
     expect(confirmRemoteDeletes).toHaveBeenCalledOnce();
   });
 
+  it("records a file decision and enqueues the row in the same action", async () => {
+    const plugin = makePlugin();
+    const addLocalDeleteDecisions = vi.fn().mockResolvedValue(undefined);
+    const confirmRemoteDelete = vi.fn();
+    const confirmRemoteDeletes = vi.fn().mockResolvedValue(undefined);
+    const decisionToken = {
+      version: 1 as const,
+      vaultName: "Vault",
+      accountId: "account",
+      scope: {
+        accountId: "account",
+        driveId: "drive",
+        vaultFolderId: "vault",
+        filesRootId: "root",
+      },
+      local: { exists: true as const, hash: "a".repeat(64), size: 10 },
+      remote: { exists: false as const },
+      ancestorHash: "a".repeat(64),
+    };
+    plugin.state = {
+      isV2StateActive: true,
+      pendingRemoteDeletes: [{
+        type: SyncActionType.ConfirmLocalDelete,
+        path: "note.md",
+        local: {
+          path: "note.md",
+          hash: "a".repeat(64),
+          size: 10,
+          mtime: 1,
+          binary: false,
+        },
+        decisionToken,
+      }],
+      addLocalDeleteDecisions,
+    } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: false,
+      confirmRemoteDelete,
+      confirmRemoteDeletes,
+    } as never;
+    vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+    vi.spyOn(plugin, "syncView", "get").mockReturnValue(null);
+
+    await expect(plugin.confirmRemoteDelete("note.md")).resolves.toBe(true);
+
+    expect(confirmRemoteDelete).not.toHaveBeenCalled();
+    expect(confirmRemoteDeletes).toHaveBeenCalledOnce();
+    expect(confirmRemoteDeletes).toHaveBeenCalledWith(["note.md"]);
+    expect(addLocalDeleteDecisions).toHaveBeenCalledOnce();
+    const input = addLocalDeleteDecisions.mock.calls[0][0];
+    expect(input.paths).toEqual(["note.md"]);
+    expect(input.hashes).toHaveLength(1);
+    expect(input.hashes[0]).toEqual(expect.any(String));
+    expect(input.hashes[0].length).toBeGreaterThan(0);
+    expect(input.recordToken).toContain("local-delete:");
+  });
+
+  it("enqueues a mixed batch at once and records both decision kinds", async () => {
+    const plugin = makePlugin();
+    const addLocalDeleteDecisions = vi.fn().mockResolvedValue(undefined);
+    const confirmRemoteDelete = vi.fn().mockResolvedValue(undefined);
+    const confirmRemoteDeletes = vi.fn().mockResolvedValue(undefined);
+    const decisionToken = {
+      version: 1 as const,
+      vaultName: "Vault",
+      accountId: "account",
+      scope: {
+        accountId: "account",
+        driveId: "drive",
+        vaultFolderId: "vault",
+        filesRootId: "root",
+      },
+      local: { exists: true as const, hash: "a".repeat(64), size: 10 },
+      remote: { exists: false as const },
+      ancestorHash: "a".repeat(64),
+    };
+    const pending = ["a.md", "b.md"].map((path) => ({
+      type: SyncActionType.ConfirmLocalDelete,
+      path,
+      local: {
+        path,
+        hash: "a".repeat(64),
+        size: 10,
+        mtime: 1,
+        binary: false,
+      },
+      decisionToken,
+    }));
+    plugin.state = {
+      isV2StateActive: true,
+      boundAccountId: "account",
+      remoteScope: {
+        accountId: "account",
+        driveId: "drive",
+        vaultFolderId: "vault",
+        filesRootId: "root",
+      },
+      localDeleteDecisions: [],
+      pendingRemoteDeletes: [
+        ...pending,
+        {
+          type: SyncActionType.DeleteLocalFolder,
+          path: "Folder",
+          requiresConfirmation: true,
+          folder: {
+            remoteId: "folder-id",
+            parentRemoteId: "root",
+            parentPath: "",
+            sourceParentRemoteId: "root",
+          },
+        },
+      ],
+      addLocalDeleteDecisions,
+    } as never;
+    plugin.syncExecutor = {
+      isRunning: false,
+      hasSideActionsInFlight: false,
+      confirmRemoteDelete,
+      confirmRemoteDeletes,
+    } as never;
+    vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+    vi.spyOn(plugin, "syncView", "get").mockReturnValue(null);
+    plugin.noticeCenter = { show: vi.fn(), clear: vi.fn(), dispose: vi.fn() } as never;
+
+    await expect(plugin.confirmRemoteDeletes(["a.md", "b.md", "Folder"]))
+      .resolves.toBe(true);
+
+    expect(addLocalDeleteDecisions).toHaveBeenCalledTimes(2);
+    expect(addLocalDeleteDecisions.mock.calls[0][0]).toMatchObject({
+      kind: "file",
+      paths: ["a.md", "b.md"],
+    });
+    expect(addLocalDeleteDecisions.mock.calls[1][0]).toMatchObject({
+      kind: "folder",
+      paths: ["Folder"],
+    });
+    expect(confirmRemoteDelete).not.toHaveBeenCalled();
+    expect(confirmRemoteDeletes).toHaveBeenCalledOnce();
+    expect(confirmRemoteDeletes).toHaveBeenCalledWith([
+      "a.md",
+      "b.md",
+      "Folder",
+    ]);
+  });
+
+  it("sends a confirmed batch delete through while a round is still running", async () => {
+    // 真机现场（iOS 2026-10-27）：点「全部删除」时正有一轮同步在跑，网关直接
+    // 拒绝，2,001 条确认行一行没进队列（零意图、零异常、按钮一直转圈）。已确认
+    // 的批量删除是一次用户动作：网关不再因为「轮在跑」先拒，等待由执行器负责。
+    const plugin = makePlugin();
+    const show = vi.fn();
+    const confirmRemoteDeletes = vi.fn().mockResolvedValue(undefined);
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    plugin.state = {
+      pendingRemoteDeletes: [{ path: "a.md" }, { path: "b.md" }],
+    } as never;
+    plugin.syncExecutor = {
+      isRunning: true,
+      hasSideActionsInFlight: false,
+      confirmRemoteDeletes,
+    } as never;
+    vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+    vi.spyOn(plugin, "syncView", "get").mockReturnValue(null);
+
+    await expect(plugin.confirmRemoteDeletes(["a.md", "b.md"]))
+      .resolves.toBe(true);
+
+    expect(confirmRemoteDeletes).toHaveBeenCalledOnce();
+    expect(confirmRemoteDeletes).toHaveBeenCalledWith(["a.md", "b.md"]);
+    // 不再是「同步进行中 / 占用」那条拒绝。
+    for (const call of show.mock.calls) {
+      expect((call[0] as { key: string }).key)
+        .not.toBe("side-action-gateway:busy:a.md");
+    }
+  });
+
   it("blocks UI side actions when the current token account does not match", async () => {
     const plugin = makePlugin();
     const resolveConflictKeepRemote = vi.fn();
@@ -3158,6 +3393,101 @@ describe("main sync entry guards", () => {
     expect(resolveConflictKeepLocal).not.toHaveBeenCalled();
     expect(show).toHaveBeenCalledOnce();
     expect(plugin.diag.warn).toHaveBeenCalled();
+  });
+
+  it("presents a failure notice when a manual sync entry is rejected before the run starts", async () => {
+    const plugin = makePlugin();
+    const show = vi.fn();
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    plugin.state = { hasV2StateLoadRecoveryBlock: false } as never;
+    plugin.syncExecutor = { isRunning: false, hasActivityInFlight: false } as never;
+    vi.spyOn(plugin as never, "hasCompletedSyncState").mockReturnValue(true);
+    vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+    vi.mocked(plugin.ensureStateLoaded).mockRejectedValueOnce(
+      new Error("state unavailable"),
+    );
+
+    // The rejection is presented and swallowed: the entry resolves and the
+    // operation lock is released by the existing finally.
+    await expect(plugin.startManualSync()).resolves.toBeUndefined();
+
+    expect(show).toHaveBeenCalledTimes(1);
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "sync-entry-failed",
+      message: "result.syncNotStarted",
+      priority: NOTICE_PRIORITY.failure,
+    }));
+    expect(plugin.diag.error).toHaveBeenCalledWith(
+      "state",
+      "sync entry did not start (manual sync)",
+      expect.any(String),
+    );
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
+  it("presents exactly one notice when the V2 load-block flow rejects after taking over the entry", async () => {
+    const plugin = makePlugin();
+    const show = vi.fn();
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    plugin.state = {
+      hasV2StateLoadRecoveryBlock: true,
+      v2CorruptStateRecoveryEvidence: null,
+      planReviewActive: false,
+    } as never;
+    plugin.syncExecutor = { isRunning: false, hasActivityInFlight: false } as never;
+    vi.spyOn(plugin as never, "hasCompletedSyncState").mockReturnValue(true);
+    vi.spyOn(plugin as never, "attemptV2StateReloadSelfHeal")
+      .mockResolvedValue(undefined);
+    vi.spyOn(plugin as never, "activateSyncView").mockResolvedValue(undefined);
+    vi.spyOn(plugin as never, "dispatchSyncRun")
+      .mockRejectedValue(new Error("persist failed"));
+    vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+
+    await expect(plugin.startManualSync()).resolves.toBeUndefined();
+
+    // The block flow owns the entry: its own catch presents the failure, and
+    // the entry catch stays structurally blind to it (no second notice).
+    expect(show).toHaveBeenCalledTimes(1);
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "sync-entry-failed",
+      priority: NOTICE_PRIORITY.failure,
+    }));
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
+  });
+
+  it("presents exactly one notice when the first-sync entry is rejected through the manual entry", async () => {
+    const plugin = makePlugin();
+    const show = vi.fn();
+    plugin.noticeCenter = { show, clear: vi.fn(), dispose: vi.fn() } as never;
+    plugin.i18n = { t: (key: string) => key } as never;
+    plugin.state = {
+      hasV2StateLoadRecoveryBlock: false,
+      planReviewActive: false,
+    } as never;
+    plugin.syncExecutor = { isRunning: false, hasActivityInFlight: false } as never;
+    vi.spyOn(plugin as never, "hasCompletedSyncState").mockReturnValue(false);
+    vi.spyOn(plugin, "updateStatusBar").mockImplementation(() => undefined);
+    vi.mocked(plugin.ensureStateLoaded).mockRejectedValueOnce(
+      new Error("state unavailable"),
+    );
+
+    // startManualSync delegates before taking the lock; only startFirstSync's
+    // catch can present, so the delegated path cannot double-notify.
+    await expect(plugin.startManualSync()).resolves.toBeUndefined();
+
+    expect(show).toHaveBeenCalledTimes(1);
+    expect(show).toHaveBeenCalledWith(expect.objectContaining({
+      key: "sync-entry-failed",
+      priority: NOTICE_PRIORITY.failure,
+    }));
+    expect(plugin.diag.error).toHaveBeenCalledWith(
+      "state",
+      "sync entry did not start (first sync)",
+      expect.any(String),
+    );
+    expect((plugin as never as { opLock: string | null }).opLock).toBeNull();
   });
 
 });

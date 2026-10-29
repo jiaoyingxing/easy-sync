@@ -47,6 +47,42 @@ class AuthOperationInvalidatedError extends Error {
   }
 }
 
+/** Auth-domain request ceiling: the token endpoint and Graph /me are single
+ *  lightweight requests, so 30s matches client.ts METADATA_READ_TIMEOUT_MS. */
+const AUTH_REQUEST_TIMEOUT_MS = 30_000;
+
+class AuthRequestTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`auth request timed out after ${timeoutMs}ms`);
+    this.name = "AuthRequestTimeoutError";
+  }
+}
+
+/** Race a request against a timeout timer so the await always settles.
+ *  requestUrl cannot be aborted (official API), so a hung request stays in
+ *  flight; its late settle lands in the handlers attached here, which means
+ *  the value is discarded and it can never surface as an unhandled rejection.
+ *  The timer goes through compatSetTimeout to share the plugin's activeWindow
+ *  source. Deliberately not merged with client.ts `withTimeout`: that helper
+ *  carries the SyntheticRequestTimeoutError contract plus toErrorLike
+ *  normalization, while auth's catch only reads `e.message` — two small
+ *  local contracts stay cheaper than a shared shell. */
+function withAuthRequestTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = compatSetTimeout(() => reject(new AuthRequestTimeoutError(ms)), ms);
+    promise.then(
+      (value) => {
+        compatClearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        compatClearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
+}
+
 /** Classification of a single device-code token poll. */
 type DevicePollResult =
   | { status: "pending" }
@@ -1177,18 +1213,21 @@ export class AuthModule {
   private async tokenRequest(body: URLSearchParams): Promise<TokenResponse> {
     let response: RequestUrlResponse;
     try {
-      response = await requestUrl({
-        url: MS_AUTH_CONFIG.tokenEndpoint,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: body.toString(),
-        // OAuth failures are structured JSON responses. Keep them available
-        // for redacted provider diagnostics instead of letting requestUrl
-        // convert every HTTP 400+ response into an opaque network exception.
-        throw: false,
-      });
+      response = await withAuthRequestTimeout(
+        requestUrl({
+          url: MS_AUTH_CONFIG.tokenEndpoint,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: body.toString(),
+          // OAuth failures are structured JSON responses. Keep them available
+          // for redacted provider diagnostics instead of letting requestUrl
+          // convert every HTTP 400+ response into an opaque network exception.
+          throw: false,
+        }),
+        AUTH_REQUEST_TIMEOUT_MS,
+      );
     } catch (e) {
       throw new AuthError(
         AuthErrorType.NetworkError,
@@ -1287,13 +1326,16 @@ export class AuthModule {
     this.diag?.log("auth", "verifying current token account through Graph /me");
 
     try {
-      const response = await requestUrl({
-        url: "https://graph.microsoft.com/v1.0/me?$select=displayName,id,userType",
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-        },
-      });
+      const response = await withAuthRequestTimeout(
+        requestUrl({
+          url: "https://graph.microsoft.com/v1.0/me?$select=displayName,id,userType",
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+          },
+        }),
+        AUTH_REQUEST_TIMEOUT_MS,
+      );
       this.assertGeneration(generation);
 
       if (response.status === 200) {

@@ -283,7 +283,7 @@ describe("Cancellation checkpoint semantics", () => {
     expect(result.errors).toBe(1);
   });
 
-  it("keeps the completed item checkpoint when cancellation happens after its completion callback", async () => {
+  it("keeps the completed item's durable receipt when cancellation arrives on its completion callback", async () => {
     let executor: SyncExecutor;
     const reconcilePendingIssues = vi.fn().mockResolvedValue(undefined);
     const local: LocalFileEntry = {
@@ -334,19 +334,29 @@ describe("Cancellation checkpoint semantics", () => {
       "testVault",
     );
 
+    const reverted = vi.fn();
     const result = await executor.run("manual", {
+      // 2026-10-26: a completed file is reported as soon as its own PUT and
+      // receipt land — before the batch's shared checkpoint. A cancel raised
+      // on that callback therefore finds the checkpoint not yet committed:
+      // the row must flip to cancelled (never stay a silent success) while the
+      // durable receipt survives for the next round's recovery.
       onFileComplete: () => executor.cancel(),
+      onFileReverted: reverted,
     });
 
     expect(result.success).toBe(false);
     expect(result.message).toBe("result.cancelled");
-    expect(mockState.mutationLedger).toEqual([]);
-    expect(mockState.baseSnapshot).toEqual([
-      expect.objectContaining({ path: local.path, hash: local.hash }),
-    ]);
-    expect(mockState.remoteSnapshot).toEqual([
-      expect.objectContaining({ path: local.path, driveId: "uploaded-id" }),
-    ]);
+    // The receipt is durable — not an intent-only record — so the next round
+    // settles the file without re-uploading it.
+    expect(mockState.mutationLedger).toHaveLength(1);
+    expect(mockState.mutationLedger[0].receipt).not.toBeNull();
+    // Nothing was published this round, and the shown row says so.
+    expect(mockState.baseSnapshot).toEqual([]);
+    expect(mockState.remoteSnapshot).toEqual([]);
+    expect(reverted).toHaveBeenCalledTimes(1);
+    expect(reverted.mock.calls[0][0]).toBe(local.path);
+    expect(reverted.mock.calls[0][1]).toBe("result.cancelled");
     expect(reconcilePendingIssues).not.toHaveBeenCalled();
     expect(setLastSyncTime).not.toHaveBeenCalled();
   });

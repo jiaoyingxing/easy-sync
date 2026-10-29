@@ -20,6 +20,45 @@ describe("content equality evidence", () => {
     })).toEqual({ status: "equal", proof: "baseETag" });
   });
 
+  it("reuses the committed base when only the eTag changed and the cTag still matches", () => {
+    expect(resolveContentEquality({
+      local: { hash: "bb".repeat(32), size: 8 },
+      remote: { size: 8, eTag: "restored-etag", cTag: "same-ctag" },
+      base: {
+        hash: "bb".repeat(32),
+        size: 8,
+        eTag: "base-etag",
+        cTag: "same-ctag",
+      },
+    })).toEqual({ status: "equal", proof: "baseCTag" });
+  });
+
+  it("does not use a cTag mismatch as either equality or difference", () => {
+    expect(resolveContentEquality({
+      local: { hash: "bb".repeat(32), size: 8 },
+      remote: { size: 8, eTag: "restored-etag", cTag: "other-ctag" },
+      base: {
+        hash: "bb".repeat(32),
+        size: 8,
+        eTag: "base-etag",
+        cTag: "same-ctag",
+      },
+    })).toEqual({ status: "unknown", proof: "insufficientEvidence" });
+  });
+
+  it("reports a local change against a matching cTag as different", () => {
+    expect(resolveContentEquality({
+      local: { hash: "cc".repeat(32), size: 8 },
+      remote: { size: 8, eTag: "restored-etag", cTag: "same-ctag" },
+      base: {
+        hash: "bb".repeat(32),
+        size: 8,
+        eTag: "base-etag",
+        cTag: "same-ctag",
+      },
+    })).toEqual({ status: "different", proof: "baseCTag" });
+  });
+
   it("returns unknown instead of treating matching size as matching content", () => {
     expect(resolveContentEquality({
       local: { hash: "aa".repeat(32), size: 4 },

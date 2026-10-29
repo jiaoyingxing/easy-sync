@@ -2109,7 +2109,9 @@ describe("V1 to V2 controlled production activation", () => {
 
   it("keeps a desktop-only empty plugin root non-participating when mobile scope is enabled from off", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     try {
       const pluginId = "realtime-transcription";
       const rootPath = `.obsidian/plugins/${pluginId}`;
@@ -2277,6 +2279,7 @@ describe("V1 to V2 controlled production activation", () => {
       await restartedState.close();
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
     }
   });
 
@@ -2550,7 +2553,7 @@ describe("V1 to V2 controlled production activation", () => {
     expectNoFileMutations(harness.mutations);
   });
 
-  it("does not use one folder-range expansion to accept an unknown folder already in scope", async () => {
+  it("derives an in-scope unknown folder from complete facts without using the folder-range expansion", async () => {
     const expandedPaths = [
       ".obsidian",
       ".obsidian/plugins",
@@ -2606,7 +2609,7 @@ describe("V1 to V2 controlled production activation", () => {
 
     expect(result).toMatchObject({
       success: true,
-      deferred: 1,
+      deferred: 0,
       uploaded: 0,
       downloaded: 0,
       deleted: 0,
@@ -2615,11 +2618,11 @@ describe("V1 to V2 controlled production activation", () => {
     const anchors = Object.values(
       harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
     ).map((anchor) => anchor.lastPath);
-    expect(anchors).toEqual(expect.arrayContaining(expandedPaths));
-    expect(anchors).not.toContain(unrelatedPath);
-    expect(harness.state.pendingIssues).toEqual([
-      expect.objectContaining({ path: unrelatedPath }),
-    ]);
+    expect(anchors).toEqual(expect.arrayContaining([
+      ...expandedPaths,
+      unrelatedPath,
+    ]));
+    expect(harness.state.pendingIssues).toEqual([]);
     expectNoFileMutations(harness.mutations);
   });
 
@@ -3152,15 +3155,17 @@ describe("V1 to V2 controlled production activation", () => {
       foldersCreated: 0,
       foldersMoved: 0,
       foldersDeleted: 0,
-      deferred: 3,
+      deferred: 0,
       errors: 0,
     });
     expect(restartedState.activeSyncScopeExpansion).toBeNull();
+    // The stale marker still authorizes nothing; the anchors below come from
+    // the complete-facts derivation, not from the expansion.
     expect(
       Object.values(
         restartedState.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
       ).map((anchor) => anchor.lastPath),
-    ).toEqual(["Notes"]);
+    ).toEqual(expect.arrayContaining([...expandedPaths, "Notes"]));
     expectNoFileMutations(harness.mutations);
   });
 
@@ -3248,7 +3253,7 @@ describe("V1 to V2 controlled production activation", () => {
     expectNoFileMutations(harness.mutations);
   });
 
-  it("keeps same-path unknown folders fail-closed without a scope-expansion authorization", async () => {
+  it("derives same-path unknown folders from complete facts without a scope-expansion authorization", async () => {
     const expandedPaths = [
       ".obsidian",
       ".obsidian/plugins",
@@ -3274,10 +3279,15 @@ describe("V1 to V2 controlled production activation", () => {
       foldersCreated: 0,
       foldersMoved: 0,
       foldersDeleted: 0,
-      deferred: 3,
+      deferred: 0,
       errors: 0,
     });
     expect(harness.state.activeSyncScopeExpansion).toBeNull();
+    expect(
+      Object.values(
+        harness.state.getCommittedV2Envelope()!.folderAnchors!.byAnchorId,
+      ).map((anchor) => anchor.lastPath),
+    ).toEqual(expect.arrayContaining([...expandedPaths, "Notes"]));
     expectNoFileMutations(harness.mutations);
   });
 

@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import * as obsidian from "obsidian";
 import { getEasySyncPaths } from "../src/obsidian-compat";
-import { OneDriveClient } from "../src/onedrive/client";
+import { OneDriveClient, downloadBudget } from "../src/onedrive/client";
+import { createRangeStreamDownloader } from "../src/onedrive/range-download";
+import { sha256Hex } from "../src/crypto";
 import { UPLOAD_CHUNK_SLOW_BYTES } from "../src/onedrive/upload-session-policy";
 import {
   OneDriveError,
@@ -1393,6 +1395,372 @@ describe("OneDriveClient.downloadFile", () => {
   });
 });
 
+describe("OneDriveClient 下载预算阶梯与 CDN 熔断 (2026-10-27)", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("小档 <64 KiB 主 15 秒、中档 64–256 KiB 主 25 秒、≥256 KiB 原公式不变", () => {
+    // 18 字节：阶梯前按 1 MiB 报价（30s + 12s 主 / 21s 备用），阶梯后只换主预算，
+    // 备用预算仍是阶梯前的完整 63 秒。
+    expect(downloadBudget(18)).toEqual({
+      budgetClass: "small",
+      primaryMs: 15_000,
+      reserveMs: 63_000,
+      totalMs: 78_000,
+      channelCapMs: 15_000,
+    });
+    expect(downloadBudget(64 * 1024 - 1).budgetClass).toBe("small");
+
+    expect(downloadBudget(64 * 1024)).toEqual({
+      budgetClass: "medium",
+      primaryMs: 25_000,
+      reserveMs: 63_000,
+      totalMs: 88_000,
+      channelCapMs: 25_000,
+    });
+    expect(downloadBudget(256 * 1024).budgetClass).toBe("medium");
+
+    // ≥256 KiB 逐字段保持阶梯前的取值，且没有通道窗口（首个通道仍可用满整份预算）。
+    expect(downloadBudget(256 * 1024 + 1)).toEqual({
+      budgetClass: "regular",
+      primaryMs: 42_000,
+      reserveMs: 21_000,
+      totalMs: 63_000,
+      channelCapMs: null,
+    });
+    expect(downloadBudget(5 * 1024 * 1024)).toEqual({
+      budgetClass: "regular",
+      primaryMs: 90_000,
+      reserveMs: 45_000,
+      totalMs: 135_000,
+      channelCapMs: null,
+    });
+  });
+
+  it("预算日志与 deadline 同源：18 字节文件按 small 档打印同一组取值", async () => {
+    const diag = { log: vi.fn(), warn: vi.fn() };
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValue({
+      status: 200,
+      headers: {},
+      arrayBuffer: new Uint8Array(18).buffer,
+    });
+    const client = new OneDriveClient(async () => "token", diag as never);
+
+    await client.downloadFile(
+      "testVault",
+      "note.md",
+      "https://download.example/note.md",
+      undefined,
+      18,
+    );
+
+    const budgetLine = diag.log.mock.calls
+      .map((call) => String(call[1]))
+      .find((message) => message.includes("primaryMs="));
+    expect(budgetLine).toContain("class=small");
+    expect(budgetLine).toContain("primaryMs=15000");
+    expect(budgetLine).toContain("reserveMs=63000");
+    expect(budgetLine).toContain("budgetMs=78000");
+    expect(budgetLine).toContain("channelCapMs=15000");
+  });
+
+  /** CDN responses are served through `window.fetch`; a function mock lets each
+   *  file decide whether the CDN hangs (no HTTP response at all — the dead-link
+   *  shape) or answers, and records when each attempt started. A hanging fetch
+   *  still rejects on abort like the real one, so the waterfall's channel window
+   *  behaves as it does in production. */
+  function installCdnFetch(respond: (url: string) => Promise<Response> | null): {
+    calls: { url: string; at: number }[];
+    restore: () => void;
+  } {
+    const previous = (globalThis as { window?: unknown }).window;
+    const calls: { url: string; at: number }[] = [];
+    (globalThis as { window?: unknown }).window = {
+      fetch: (input: RequestInfo | URL, init?: { signal?: AbortSignal }) => {
+        const url = String(input);
+        calls.push({ url, at: Date.now() });
+        const answer = respond(url);
+        if (answer) return answer;
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("Aborted", "AbortError")),
+            { once: true },
+          );
+        });
+      },
+    };
+    return {
+      calls,
+      restore: () => {
+        if (previous === undefined) delete (globalThis as { window?: unknown }).window;
+        else (globalThis as { window?: unknown }).window = previous;
+      },
+    };
+  }
+
+  /** Advance the fake clock in small steps until the download settles. Exact
+   *  one-shot advances miss the timers that later waterfall tiers register while
+   *  the previous tier's rejection is still unwinding. */
+  async function settle<T>(pending: Promise<T>, maxSteps = 240): Promise<T> {
+    let settled = false;
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    for (let step = 0; step < maxSteps && !settled; step++) {
+      await vi.advanceTimersByTimeAsync(1_000);
+    }
+    return pending;
+  }
+
+  const cdnCallsFor = (
+    calls: { url: string; at: number }[],
+    id: string,
+  ) => calls.filter((call) => call.url.includes(`${id}.bin`));
+
+  it("连续 3 次传输级失败后本轮跳过 CDN，第 4 个文件直接走内容端点", async () => {
+    vi.useFakeTimers();
+    const body = new Uint8Array(64).buffer;
+    // /content 由同一个 fetch 通道回答；CDN 的 .bin 地址永远不给响应。
+    const cdn = installCdnFetch((url) => url.includes("cdn.example")
+      ? null
+      : Promise.resolve(new Response(body, { status: 200 })));
+    const contentCallsFor = (id: string) => cdn.calls.filter((call) =>
+      call.url.includes("/content") && call.url.includes(`${id}.md`)).length;
+    try {
+      const client = new OneDriveClient(async () => "token");
+      const download = (id: string) => client.downloadFile(
+        "testVault",
+        `${id}.md`,
+        `https://cdn.example/${id}.bin`,
+        undefined,
+        64,
+      );
+      // 每个文件在 CDN 上等满小档主预算（15 秒）也拿不到一个响应，随后 /content 完成它。
+      for (const id of ["id-a", "id-b", "id-c"]) {
+        await expect(settle(download(id))).resolves.toEqual(expect.any(ArrayBuffer));
+        expect(cdnCallsFor(cdn.calls, id)).toHaveLength(1);
+        expect(contentCallsFor(id)).toBe(1);
+      }
+
+      // 熔断已开：第 4 个文件不再付 CDN 首包时间，但文件照样成功。
+      await expect(settle(download("id-d"))).resolves.toEqual(expect.any(ArrayBuffer));
+      expect(cdnCallsFor(cdn.calls, "id-d")).toHaveLength(0);
+      expect(contentCallsFor("id-d")).toBe(1);
+    } finally {
+      cdn.restore();
+    }
+  });
+
+  it("一次 CDN 成功即复位：两次失败 + 一次成功 + 两次失败后仍会再试 CDN", async () => {
+    vi.useFakeTimers();
+    const body = new Uint8Array(64).buffer;
+    const cdn = installCdnFetch((url) => {
+      if (url.includes("cdn.example")) {
+        return url.includes("id-c.bin")
+          ? Promise.resolve(new Response(body, { status: 200 }))
+          : null;
+      }
+      return Promise.resolve(new Response(body, { status: 200 }));
+    });
+    try {
+      const client = new OneDriveClient(async () => "token");
+      const download = (id: string) => client.downloadFile(
+        "testVault",
+        `${id}.md`,
+        `https://cdn.example/${id}.bin`,
+        undefined,
+        64,
+      );
+      for (const id of ["id-a", "id-b", "id-c", "id-d", "id-e"]) {
+        await expect(settle(download(id))).resolves.toEqual(expect.any(ArrayBuffer));
+        expect(cdnCallsFor(cdn.calls, id)).toHaveLength(1);
+      }
+
+      // id-c 的 CDN 成功把连续失败计数清零；此后只有两次失败，不足以熔断。
+      await expect(settle(download("id-f"))).resolves.toEqual(expect.any(ArrayBuffer));
+      expect(cdnCallsFor(cdn.calls, "id-f")).toHaveLength(1);
+    } finally {
+      cdn.restore();
+    }
+  });
+
+  it("内容端点 401 反向撤销熔断：被跳过 CDN 的文件撞上 401 后，下一个文件重新试 CDN", async () => {
+    vi.useFakeTimers();
+    const body = new Uint8Array(64).buffer;
+    const cdn = installCdnFetch((url) => {
+      if (url.includes("cdn.example")) return null;
+      if (url.includes("id-c.md")) {
+        // 熔断把文件推到 /content，而 /content 连授权都过不了：方向错了。
+        return Promise.resolve(new Response(null, { status: 401 }));
+      }
+      return Promise.resolve(new Response(body, { status: 200 }));
+    });
+    // /content 的 fetch 失败后会退到 requestUrl，那条路也给同样的答案。
+    vi.spyOn(obsidian, "requestUrl").mockImplementation((request) => {
+      const url = String(request.url);
+      if (url.includes("id-c.md")) {
+        return Promise.reject({
+          status: 401,
+          headers: {},
+          json: { error: { code: "unauthenticated", message: "content denied" } },
+        });
+      }
+      return Promise.resolve({ status: 200, headers: {}, arrayBuffer: body });
+    });
+    try {
+      const client = new OneDriveClient(async () => "token");
+      const download = (id: string) => client.downloadFile(
+        "testVault",
+        `${id}.md`,
+        `https://cdn.example/${id}.bin`,
+        undefined,
+        64,
+      ).then(() => "ok" as const, (error: unknown) => error as OneDriveError);
+
+      for (const id of ["id-a", "id-b"]) {
+        await expect(settle(download(id))).resolves.toBe("ok");
+      }
+      // 第三个文件把熔断推上去，随后 /content 以 401 拒绝它。
+      await expect(settle(download("id-c"))).resolves.toMatchObject({
+        type: OneDriveErrorType.Unauthorized,
+        statusCode: 401,
+      });
+
+      // 401 撤销了熔断：下一个文件重新走 CDN 通道。
+      await expect(settle(download("id-d"))).resolves.toBe("ok");
+      expect(cdnCallsFor(cdn.calls, "id-d")).toHaveLength(1);
+    } finally {
+      cdn.restore();
+    }
+  });
+
+  it("回退通道本轮已被证不可用时，小文件不再被 CDN 窗口提前收杆", async () => {
+    vi.useFakeTimers();
+    const body = new Uint8Array(64).buffer;
+    const cdn = installCdnFetch((url) => {
+      if (url.includes("slow.bin")) {
+        // 慢但会成功：20 秒后才把 64 字节送到，超过小档 15 秒窗口。
+        return new Promise((resolve) => {
+          setTimeout(() => resolve(new Response(body, { status: 200 })), 20_000);
+        });
+      }
+      // 其余一律 404：先把「/content 端点不可用」这条本轮事实立起来。
+      return Promise.resolve(new Response(null, { status: 404 }));
+    });
+    vi.spyOn(obsidian, "requestUrl").mockImplementation((request) => {
+      const url = String(request.url);
+      if (url.includes("?select=")) {
+        const id = /items\/([^?]+)\?select=/.exec(url)?.[1] ?? "missing";
+        return Promise.resolve({
+          status: 200,
+          headers: {},
+          json: {
+            "@microsoft.graph.downloadUrl": id === "id-b"
+              ? "https://cdn.example/slow.bin"
+              : `https://cdn.example/${id}.bin`,
+          },
+        });
+      }
+      return Promise.reject({
+        status: 404,
+        headers: {},
+        json: { error: { code: "itemNotFound", message: "content gone" } },
+      });
+    });
+    try {
+      const client = new OneDriveClient(async () => "token");
+      // 文件 A：CDN 与两个 /content 端点全 404 ⇒ 本轮记下「内容端点不可用」。
+      await expect(settle(client.downloadFile(
+        "testVault",
+        "id-a.md",
+        undefined,
+        "id-a",
+        64,
+      ))).rejects.toMatchObject({ statusCode: 404 });
+
+      // 文件 B：CDN 要 20 秒。既然 /content 已被证不可用，这里必须给足预算，
+      // 不能按 15 秒窗口收杆去撞一堵已知的墙。
+      await expect(settle(client.downloadFile(
+        "testVault",
+        "id-b.md",
+        undefined,
+        "id-b",
+        64,
+      ))).resolves.toEqual(expect.any(ArrayBuffer));
+      const slowCall = cdn.calls.find((call) => call.url.includes("slow.bin"));
+      expect(slowCall).toBeDefined();
+    } finally {
+      cdn.restore();
+    }
+  });
+
+  it("慢成功（小文件）：CDN 窗口到期不判失败，/content 仍拿到完整备用预算", async () => {
+    vi.useFakeTimers();
+    const body = new Uint8Array(40 * 1024).fill(7).buffer;
+    const requests: { url: string; at: number }[] = [];
+    vi.spyOn(obsidian, "requestUrl").mockImplementation((request) => {
+      const url = String(request.url);
+      requests.push({ url, at: Date.now() });
+      if (url.includes("cdn.example")) {
+        // 慢链路：窗口内一个字节都不给，但这不是「文件失败」。
+        return new Promise(() => {});
+      }
+      // /content 在 61 秒后把整份内容送到。旧的总预算只有 63 秒，小档
+      // 主预算（15s）若不把完整备用留给后续通道，这份下载就会被误杀。
+      return new Promise((resolve) => {
+        setTimeout(() => resolve({ status: 200, headers: {}, arrayBuffer: body }), 61_000);
+      });
+    });
+    const client = new OneDriveClient(async () => "token");
+    const startedAt = Date.now();
+    const pending = client.downloadFile(
+      "testVault",
+      "note.md",
+      "https://cdn.example/note.md",
+      undefined,
+      40 * 1024,
+    );
+    const settled = settle(pending);
+
+    await expect(settled).resolves.toEqual(expect.any(ArrayBuffer));
+    const contentRequest = requests.find((request) => request.url.includes("/content"));
+    expect(contentRequest).toBeDefined();
+    // 15 秒整就交棒：小档主预算生效，不是旧的 42 秒；整份下载也只在主预算 + 完整
+    // 备用预算（78s）里完成，而不是被主预算单独掐死。
+    const handoffMs = contentRequest!.at - startedAt;
+    expect(handoffMs).toBeGreaterThanOrEqual(15_000);
+    expect(handoffMs).toBeLessThan(17_000);
+    expect(Date.now() - startedAt).toBeGreaterThan(60_000);
+  });
+
+  it("大文件不受通道窗口约束：5 MiB 在 CDN 上慢 100 秒也一次成功、不切通道", async () => {
+    vi.useFakeTimers();
+    const body = new Uint8Array(5 * 1024 * 1024).buffer;
+    const requestSpy = vi.spyOn(obsidian, "requestUrl").mockImplementation((request) => {
+      const url = String(request.url);
+      if (url.includes("cdn.example")) {
+        return new Promise((resolve) => {
+          setTimeout(() => resolve({ status: 200, headers: {}, arrayBuffer: body }), 100_000);
+        });
+      }
+      throw new Error("no /content fallback expected for a regular-size file");
+    });
+    const client = new OneDriveClient(async () => "token");
+    const pending = client.downloadFile(
+      "testVault",
+      "big.bin",
+      "https://cdn.example/big.bin",
+      undefined,
+      5 * 1024 * 1024,
+    );
+
+    await expect(settle(pending)).resolves.toEqual(expect.any(ArrayBuffer));
+    expect(requestSpy.mock.calls.filter(([call]) =>
+      String(call.url).includes("/content"))).toHaveLength(0);
+  });
+});
+
 describe("OneDriveClient.uploadFile", () => {
   afterEach(() => {
     vi.useRealTimers();
@@ -1692,6 +2060,89 @@ describe("OneDriveClient.uploadFile", () => {
         rangeNotSatisfiable: 1,
       });
       expect(summary?.endpoints.uploadSessionStatus).toMatchObject({ succeeded: 1 });
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+    }
+  });
+
+  it("stamps tier=uploadSession on a terminal chunk PUT failure", async () => {
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    (globalThis as { window?: unknown }).window = {
+      fetch: vi.fn().mockRejectedValue(new TypeError("fetch unavailable")),
+    };
+    const uploadUrl = "https://upload.example/session";
+    vi.spyOn(obsidian, "requestUrl").mockImplementation(async (options) => {
+      if (options.url.endsWith(":/createUploadSession")) {
+        return {
+          status: 200,
+          headers: {},
+          json: { uploadUrl },
+        };
+      }
+      if (options.method === "PUT") {
+        throw Object.assign(new Error("HTTP 404 Not Found"), { status: 404 });
+      }
+      return { status: 204, headers: {}, json: {} };
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    try {
+      const failure = await client.uploadFile(
+        "testVault",
+        "large.bin",
+        new ArrayBuffer(10 * 1024 * 1024 + 1),
+      ).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(OneDriveError);
+      // The existing classification is unchanged; the tier is evidence only.
+      expect(failure).toMatchObject({
+        type: OneDriveErrorType.NotFound,
+        statusCode: 404,
+      });
+      expect((failure as unknown as { tier?: string }).tier).toBe("uploadSession");
+    } finally {
+      if (originalWindow === undefined) {
+        delete (globalThis as { window?: unknown }).window;
+      } else {
+        (globalThis as { window?: unknown }).window = originalWindow;
+      }
+    }
+  });
+
+  it("stamps tier=uploadSession when the native chunk fetch fails terminally", async () => {
+    const originalWindow = (globalThis as { window?: unknown }).window;
+    (globalThis as { window?: unknown }).window = {
+      fetch: vi.fn().mockRejectedValue(
+        Object.assign(new Error("HTTP 403 Forbidden"), { status: 403 }),
+      ),
+    };
+    const uploadUrl = "https://upload.example/session";
+    vi.spyOn(obsidian, "requestUrl")
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        json: { uploadUrl },
+      })
+      .mockResolvedValue({ status: 204, headers: {}, json: {} });
+    const client = new OneDriveClient(async () => "token");
+
+    try {
+      const failure = await client.uploadFile(
+        "testVault",
+        "large.bin",
+        new ArrayBuffer(10 * 1024 * 1024 + 1),
+      ).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(OneDriveError);
+      expect(failure).toMatchObject({
+        type: OneDriveErrorType.Forbidden,
+        statusCode: 403,
+      });
+      expect((failure as unknown as { tier?: string }).tier).toBe("uploadSession");
     } finally {
       if (originalWindow === undefined) {
         delete (globalThis as { window?: unknown }).window;
@@ -2117,7 +2568,9 @@ describe("OneDriveClient.uploadFile", () => {
 
 describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
   const MIB = 1024 * 1024;
-  const SIXTEEN_MIB = 16 * MIB;
+  /** 2026-10-27 桌面实测文件：单流 52.8 KB/s、双流 103–108 KB/s。 */
+  const TWENTY_MIB = 20 * MIB;
+  const STREAM_BYTES_20MIB = TWENTY_MIB / 8;
 
   function makeWindowFetchSpy(body: Uint8Array): ReturnType<typeof vi.fn> {
     return vi.fn().mockResolvedValue(
@@ -2136,8 +2589,8 @@ describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
     };
   }
 
-  it("routes large downloadUrl downloads through the range downloader", async () => {
-    const rangeBuffer = new Uint8Array(SIXTEEN_MIB).fill(7).buffer;
+  it("routes large desktop downloadUrl downloads through the 8-stream start tier", async () => {
+    const rangeBuffer = new Uint8Array(TWENTY_MIB).fill(7).buffer;
     const download = vi.fn().mockResolvedValue(rangeBuffer);
     const fetchSpy = makeWindowFetchSpy(new Uint8Array([1]));
     const restore = withWindowFetch(fetchSpy);
@@ -2151,7 +2604,7 @@ describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
         "big.bin",
         "https://download.example/big.bin",
         undefined,
-        SIXTEEN_MIB,
+        TWENTY_MIB,
       );
 
       expect(download).toHaveBeenCalledTimes(1);
@@ -2161,11 +2614,21 @@ describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
         url: string;
       };
       expect(input.url).toBe("https://download.example/big.bin");
-      expect(input.fileSize).toBe(SIXTEEN_MIB);
-      expect(input.windows).toEqual([
-        { start: 0, end: 8 * MIB - 1 },
-        { start: 8 * MIB, end: SIXTEEN_MIB - 1 },
-      ]);
+      expect(input.fileSize).toBe(TWENTY_MIB);
+      // 20 MiB → the adaptive start tier (G3): 8 windows of 2.5 MiB, still
+      // above the 1 MiB per-stream floor.
+      expect(input.windows).toHaveLength(8);
+      expect(input.windows[0]).toEqual({
+        start: 0,
+        end: STREAM_BYTES_20MIB - 1,
+      });
+      expect(input.windows[7]).toEqual({
+        start: 7 * STREAM_BYTES_20MIB,
+        end: TWENTY_MIB - 1,
+      });
+      for (const window of input.windows) {
+        expect(window.end - window.start + 1).toBeGreaterThanOrEqual(MIB);
+      }
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(result).toBe(rangeBuffer);
     } finally {
@@ -2173,7 +2636,63 @@ describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
     }
   });
 
-  it("falls back to the single-stream fetch when the range attempt fails", async () => {
+  it("shares one adaptive tier across large files in a round and resets with the round", async () => {
+    const adaptations: unknown[] = [];
+    const download = vi.fn(async (input: {
+      windows: unknown[];
+      adaptation?: {
+        recordCleanTransfer: (sample: {
+          streams: number;
+          bytes: number;
+          elapsedMs: number;
+        }) => void;
+      };
+    }) => {
+      adaptations.push(input.adaptation);
+      input.adaptation?.recordCleanTransfer({
+        streams: input.windows.length,
+        bytes: TWENTY_MIB,
+        elapsedMs: 1_000,
+      });
+      return new ArrayBuffer(8);
+    });
+    const fetchSpy = makeWindowFetchSpy(new Uint8Array([1]));
+    const restore = withWindowFetch(fetchSpy);
+    try {
+      const client = new OneDriveClient(async () => "token");
+      (client as unknown as { rangeStreamDownloader: unknown })
+        .rangeStreamDownloader = { download };
+      const downloadOnce = (): Promise<ArrayBuffer> => client.downloadFile(
+        "testVault",
+        "big.bin",
+        "https://download.example/big.bin",
+        undefined,
+        TWENTY_MIB,
+      );
+
+      await downloadOnce();
+      await downloadOnce();
+      const streamCounts = download.mock.calls.map(
+        ([input]) => (input as { windows: unknown[] }).windows.length,
+      );
+      // The first file starts at 8, the second one inherits the tier the first
+      // measured and probes the next rung (12) instead of starting at 8 again.
+      expect(streamCounts).toEqual([8, 12]);
+      expect(adaptations[0]).toBe(adaptations[1]);
+
+      // A new round restores the conservative start tier.
+      client.resetDownloadStrategy();
+      await downloadOnce();
+      expect(
+        (download.mock.calls[2][0] as { windows: unknown[] }).windows,
+      ).toHaveLength(8);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it("falls back to the single-stream fetch when a 20 MiB range attempt fails", async () => {
     const fallbackBody = new Uint8Array([1, 2, 3]).buffer;
     const fetchSpy = makeWindowFetchSpy(new Uint8Array(fallbackBody));
     const restore = withWindowFetch(fetchSpy);
@@ -2189,7 +2708,7 @@ describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
         "big.bin",
         "https://download.example/big.bin",
         undefined,
-        SIXTEEN_MIB,
+        TWENTY_MIB,
       );
 
       expect(fetchSpy).toHaveBeenCalledTimes(1);
@@ -2199,12 +2718,14 @@ describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
     }
   });
 
-  it("keeps the single-stream path when no Node downloader is available", async () => {
+  it("keeps the mobile-shaped single-stream path when no Node downloader exists", async () => {
     const body = new Uint8Array([4, 5]).buffer;
     const fetchSpy = makeWindowFetchSpy(new Uint8Array(body));
     const restore = withWindowFetch(fetchSpy);
     try {
       const client = new OneDriveClient(async () => "token");
+      // The exact object `resolveRangeStreamDownloader()` produces off desktop
+      // (no Node https): no window plan is ever requested.
       (client as unknown as { rangeStreamDownloader: unknown })
         .rangeStreamDownloader = null;
 
@@ -2213,7 +2734,7 @@ describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
         "big.bin",
         "https://download.example/big.bin",
         undefined,
-        SIXTEEN_MIB,
+        TWENTY_MIB,
       );
 
       expect(fetchSpy).toHaveBeenCalledTimes(1);
@@ -2243,6 +2764,392 @@ describe("OneDriveClient multi-range download (C Node h1 载体)", () => {
 
       expect(download).not.toHaveBeenCalled();
       expect(fetchSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      restore();
+    }
+  });
+
+  // ---- 回退不重下 (2026-10-28): after both multi-stream tiers fail, the
+  // single-stream fallback continues at the first hole instead of byte 0 ------
+
+  /** 16 MiB is the smallest file that arms the Range path and, split into 16
+   *  streams, gives exactly 1 MiB windows (clean byte arithmetic). */
+  const RANGE_FILE_BYTES = 16 * MIB;
+  const RANGE_WINDOW_BYTES = RANGE_FILE_BYTES / 16;
+  let sharedRangeSource: Uint8Array | null = null;
+
+  /** Deterministic body, built once: a shifted window changes the sha256, so
+   *  an assembly that resumes at the wrong offset cannot pass the check. */
+  function rangeSource(): Uint8Array {
+    if (sharedRangeSource === null) {
+      const source = new Uint8Array(RANGE_FILE_BYTES);
+      for (let index = 0; index < RANGE_FILE_BYTES; index++) {
+        source[index] = (index * 31 + 7) & 0xff;
+      }
+      sharedRangeSource = source;
+    }
+    return sharedRangeSource;
+  }
+
+  interface LadderServerOptions {
+    /** Windows below this index land completely. */
+    intactWindows: number;
+    /** Window that lands exactly half of itself on its first attempt and
+     *  nothing afterwards — the "about 60% landed" shape. */
+    halfLandedWindow: number | null;
+  }
+
+  interface LadderRequest {
+    start: number;
+    end: number;
+    windowIndex: number;
+    attempt: number;
+  }
+
+  /** Fake Node-https CDN for the 16→4→single ladder: serves the requested
+   *  sub-range like the real 206 stream, except for the configured holes,
+   *  which reject with the field transport-error shape (`aborted` /
+   *  ECONNRESET) before or after their first body chunk. */
+  function makeLadderServer(source: Uint8Array, options: LadderServerOptions) {
+    const attempts = new Map<number, number>();
+    const requests: LadderRequest[] = [];
+    const https = {
+      request: vi.fn(
+        (
+          _url: string,
+          requestOptions: { headers: { Range: string } },
+          callback: (response: unknown) => void,
+        ) => {
+          const match = /^bytes=(\d+)-(\d+)$/.exec(requestOptions.headers.Range)!;
+          const start = Number(match[1]);
+          const end = Number(match[2]);
+          const windowIndex = Math.floor(start / RANGE_WINDOW_BYTES);
+          const attempt = (attempts.get(windowIndex) ?? 0) + 1;
+          attempts.set(windowIndex, attempt);
+          requests.push({ start, end, windowIndex, attempt });
+          const body = source.subarray(start, end + 1);
+          const isPartialLanding = windowIndex === options.halfLandedWindow
+            && attempt === 1;
+          const isHole = windowIndex >= options.intactWindows
+            && !isPartialLanding;
+          const served = isPartialLanding
+            ? body.subarray(0, Math.ceil(body.byteLength / 2))
+            : body;
+          const transportError = Object.assign(new Error("aborted"), {
+            code: "ECONNRESET",
+          });
+          const node = {
+            statusCode: 206,
+            headers: {
+              "content-range": `bytes ${start}-${end}/${source.byteLength}`,
+            },
+            destroy: vi.fn(),
+            [Symbol.asyncIterator]: () => {
+              let index = 0;
+              return {
+                next: (): Promise<IteratorResult<Uint8Array>> => {
+                  if (isHole) return Promise.reject(transportError);
+                  if (index === 0) {
+                    index = 1;
+                    return Promise.resolve({ value: served, done: false });
+                  }
+                  // The partial window dies right after its half window, so
+                  // the first hole stays exactly half a window wide.
+                  if (windowIndex >= options.intactWindows) {
+                    return Promise.reject(transportError);
+                  }
+                  return Promise.resolve({ value: undefined, done: true });
+                },
+                return: (): Promise<IteratorResult<Uint8Array>> =>
+                  Promise.resolve({ value: undefined, done: true }),
+              };
+            },
+          };
+          const request = { on: vi.fn(), end: vi.fn(), destroy: node.destroy };
+          queueMicrotask(() => callback(node));
+          return request;
+        },
+      ),
+    };
+    return { https, requests };
+  }
+
+  interface ResumeFetchCall {
+    range: string | null;
+    status: number;
+    served: number;
+  }
+
+  /** window.fetch double for the single-stream tier:
+   *  - `honor`: 206 tail with its Content-Range (a CDN that exposes it);
+   *  - `honor-hidden`: 206 tail without Content-Range (the renderer CORS case
+   *    range-download.ts documents — the header is not exposed);
+   *  - `honor-wrong-start`: 206 whose Content-Range starts at byte 0;
+   *  - `ignore`: 200 with the whole file (the Range was dropped). */
+  function makeResumeFetch(
+    source: Uint8Array,
+    mode: "honor" | "honor-hidden" | "honor-wrong-start" | "ignore",
+  ) {
+    const calls: ResumeFetchCall[] = [];
+    const fetchSpy = vi.fn(
+      (_url: unknown, init?: { headers?: Record<string, string> }) => {
+        const range = init?.headers?.Range ?? null;
+        if (range === null || mode === "ignore") {
+          calls.push({ range, status: 200, served: source.byteLength });
+          return Promise.resolve(new Response(source, {
+            status: 200,
+            headers: { "Content-Length": String(source.byteLength) },
+          }));
+        }
+        const start = Number(/^bytes=(\d+)-$/.exec(range)![1]);
+        calls.push({ range, status: 206, served: source.byteLength - start });
+        return Promise.resolve(new Response(source.subarray(start), {
+          status: 206,
+          headers: {
+            ...(mode === "honor-hidden"
+              ? {}
+              : {
+                "Content-Range": mode === "honor-wrong-start"
+                  ? `bytes 0-${source.byteLength - 1}/${source.byteLength}`
+                  : `bytes ${start}-${source.byteLength - 1}/${source.byteLength}`,
+              }),
+            "Content-Length": String(source.byteLength - start),
+          },
+        }));
+      },
+    );
+    return { fetchSpy, calls };
+  }
+
+  function makeDiagSpy() {
+    const logs: string[] = [];
+    const warnings: string[] = [];
+    const diag = {
+      log: (_category: string, message: string): void => { logs.push(message); },
+      warn: (_category: string, message: string): void => { warnings.push(message); },
+    };
+    return { diag: diag as never, logs, warnings };
+  }
+
+  /** Client wired to the fake Node-https CDN with the tier pinned: these
+   *  cases prove the fallback ladder's resume behavior, not the adaptive
+   *  policy (range-stream-adaptation.test.ts owns that one). */
+  function makeRangeClient(
+    https: unknown,
+    diag: unknown,
+    streams: number,
+  ): OneDriveClient {
+    const client = new OneDriveClient(async () => "token", diag as never);
+    (client as unknown as { rangeStreamDownloader: unknown })
+      .rangeStreamDownloader = createRangeStreamDownloader(https as never, diag as never);
+    (client as unknown as { rangeStreamAdaptation: unknown })
+      .rangeStreamAdaptation = {
+      plannedStreams: streams,
+      planStreams: () => streams,
+      nowMs: () => 0,
+      recordCleanTransfer: () => {},
+      recordConnectionFailure: () => {},
+      recordRateLimited: () => {},
+    };
+    return client;
+  }
+
+  it("A: resumes the fallback at the first unlanded byte when 16 and 4 streams both fail (2026-10-28)", async () => {
+    const source = rangeSource();
+    const server = makeLadderServer(source, {
+      intactWindows: 9,
+      halfLandedWindow: 9,
+    });
+    const resumed = makeResumeFetch(source, "honor");
+    const { diag, logs, warnings } = makeDiagSpy();
+    const restore = withWindowFetch(resumed.fetchSpy);
+    try {
+      const client = makeRangeClient(server.https, diag, 16);
+      const result = await client.downloadFile(
+        "testVault",
+        "big.bin",
+        "https://download.example/big.bin",
+        undefined,
+        RANGE_FILE_BYTES,
+      );
+
+      // Both tiers ran and both failed: 16 streams on the full pass, at most
+      // four on the degraded retry.
+      expect(server.requests.filter((request) => request.attempt === 1))
+        .toHaveLength(16);
+      const degraded = server.requests.filter((request) => request.attempt === 2);
+      expect(degraded.length).toBeGreaterThan(0);
+      expect(degraded.length).toBeLessThanOrEqual(4);
+
+      // 9.5 of 16 windows landed: the single stream asks for the remaining
+      // 6.5 MiB only, starting exactly at the first hole.
+      const landedBytes = 9 * RANGE_WINDOW_BYTES + RANGE_WINDOW_BYTES / 2;
+      expect(resumed.fetchSpy).toHaveBeenCalledTimes(1);
+      expect(resumed.calls[0]).toEqual({
+        range: `bytes=${landedBytes}-`,
+        status: 206,
+        served: RANGE_FILE_BYTES - landedBytes,
+      });
+      expect(resumed.calls[0].served).toBeLessThan(RANGE_FILE_BYTES);
+      expect(warnings.some((message) => message.includes(
+        `multi-range download failed, falling back to single stream (resume at byte ${landedBytes}, remaining ${RANGE_FILE_BYTES - landedBytes}/${RANGE_FILE_BYTES})`,
+      ))).toBe(true);
+
+      // One buffer end to end — the tail landed in the ladder's assembly — and
+      // the unchanged size + sha256 check still passes.
+      expect(result.byteLength).toBe(RANGE_FILE_BYTES);
+      expect(await sha256Hex(result)).toBe(await sha256Hex(source.buffer));
+      expect(logs.some((message) => message.includes(
+        `single-stream resume landed ${RANGE_FILE_BYTES - landedBytes} byte(s) from byte ${landedBytes} (206, Content-Range bytes ${landedBytes}-${RANGE_FILE_BYTES - 1}/${RANGE_FILE_BYTES})`,
+      ))).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it("A2: stitches a 206 whose Content-Range is hidden by CORS, using the length as evidence", async () => {
+    // range-download.ts documents that the CDN does not expose Content-Range
+    // to renderer fetch (the reason the Node carrier exists at all). A resume
+    // that insisted on reading the header would never stitch in the real
+    // host, so a 206 plus a body of exactly the remaining length is accepted —
+    // the same contract the on-disk resume path uses; size + sha256 still
+    // decide at the end.
+    const source = rangeSource();
+    const server = makeLadderServer(source, {
+      intactWindows: 9,
+      halfLandedWindow: 9,
+    });
+    const resumed = makeResumeFetch(source, "honor-hidden");
+    const { diag, logs } = makeDiagSpy();
+    const restore = withWindowFetch(resumed.fetchSpy);
+    try {
+      const client = makeRangeClient(server.https, diag, 16);
+      const result = await client.downloadFile(
+        "testVault",
+        "big.bin",
+        "https://download.example/big.bin",
+        undefined,
+        RANGE_FILE_BYTES,
+      );
+
+      const landedBytes = 9 * RANGE_WINDOW_BYTES + RANGE_WINDOW_BYTES / 2;
+      expect(resumed.fetchSpy).toHaveBeenCalledTimes(1);
+      expect(resumed.calls[0]).toEqual({
+        range: `bytes=${landedBytes}-`,
+        status: 206,
+        served: RANGE_FILE_BYTES - landedBytes,
+      });
+      expect(logs.some((message) => message.includes(
+        `(206, Content-Range not exposed)`,
+      ))).toBe(true);
+      expect(result.byteLength).toBe(RANGE_FILE_BYTES);
+      expect(await sha256Hex(result)).toBe(await sha256Hex(source.buffer));
+    } finally {
+      restore();
+    }
+  });
+
+  it("B: re-downloads from byte 0 when the CDN ignores the resume Range (200)", async () => {
+    const source = rangeSource();
+    const server = makeLadderServer(source, {
+      intactWindows: 9,
+      halfLandedWindow: 9,
+    });
+    const resumed = makeResumeFetch(source, "ignore");
+    const { diag, warnings } = makeDiagSpy();
+    const restore = withWindowFetch(resumed.fetchSpy);
+    try {
+      const client = makeRangeClient(server.https, diag, 16);
+      const result = await client.downloadFile(
+        "testVault",
+        "big.bin",
+        "https://download.example/big.bin",
+        undefined,
+        RANGE_FILE_BYTES,
+      );
+
+      const landedBytes = 9 * RANGE_WINDOW_BYTES + RANGE_WINDOW_BYTES / 2;
+      // The resume was attempted, its 200 was discarded instead of being
+      // stitched, and the file came back through the plain whole-file GET.
+      expect(resumed.calls.map((call) => [call.range, call.status])).toEqual([
+        [`bytes=${landedBytes}-`, 200],
+        [null, 200],
+      ]);
+      expect(warnings.some((message) =>
+        message.includes("single-stream resume not honored (status 200")
+        && message.includes("re-downloading from byte 0"))).toBe(true);
+      expect(result.byteLength).toBe(RANGE_FILE_BYTES);
+      expect(await sha256Hex(result)).toBe(await sha256Hex(source.buffer));
+    } finally {
+      restore();
+    }
+  });
+
+  it("B2: re-downloads from byte 0 when the resume 206 starts at the wrong offset", async () => {
+    const source = rangeSource();
+    const server = makeLadderServer(source, {
+      intactWindows: 9,
+      halfLandedWindow: 9,
+    });
+    const resumed = makeResumeFetch(source, "honor-wrong-start");
+    const { diag, warnings } = makeDiagSpy();
+    const restore = withWindowFetch(resumed.fetchSpy);
+    try {
+      const client = makeRangeClient(server.https, diag, 16);
+      const result = await client.downloadFile(
+        "testVault",
+        "big.bin",
+        "https://download.example/big.bin",
+        undefined,
+        RANGE_FILE_BYTES,
+      );
+
+      const landedBytes = 9 * RANGE_WINDOW_BYTES + RANGE_WINDOW_BYTES / 2;
+      // A readable start that is not our offset cannot be stitched: the body
+      // is discarded and the plain whole-file GET runs instead.
+      expect(resumed.calls.map((call) => [call.range, call.status])).toEqual([
+        [`bytes=${landedBytes}-`, 206],
+        [null, 200],
+      ]);
+      expect(warnings.some((message) =>
+        message.includes("single-stream resume not honored (status 206")
+        && message.includes(`Content-Range bytes 0-${RANGE_FILE_BYTES - 1}/${RANGE_FILE_BYTES}`)
+        && message.includes("re-downloading from byte 0"))).toBe(true);
+      expect(result.byteLength).toBe(RANGE_FILE_BYTES);
+      expect(await sha256Hex(result)).toBe(await sha256Hex(source.buffer));
+    } finally {
+      restore();
+    }
+  });
+
+  it("C: keeps the whole-file single stream when nothing landed (no regression)", async () => {
+    const source = rangeSource();
+    const server = makeLadderServer(source, {
+      intactWindows: 0,
+      halfLandedWindow: null,
+    });
+    const resumed = makeResumeFetch(source, "honor");
+    const restore = withWindowFetch(resumed.fetchSpy);
+    try {
+      const client = makeRangeClient(server.https, undefined, 16);
+      const result = await client.downloadFile(
+        "testVault",
+        "big.bin",
+        "https://download.example/big.bin",
+        undefined,
+        RANGE_FILE_BYTES,
+      );
+
+      // Every window died before its first byte: there is no prefix to keep,
+      // so the fallback is exactly the pre-2026-10-28 request (no Range).
+      expect(resumed.fetchSpy).toHaveBeenCalledTimes(1);
+      expect(resumed.calls[0]).toEqual({
+        range: null,
+        status: 200,
+        served: RANGE_FILE_BYTES,
+      });
+      expect(result.byteLength).toBe(RANGE_FILE_BYTES);
+      expect(await sha256Hex(result)).toBe(await sha256Hex(source.buffer));
     } finally {
       restore();
     }

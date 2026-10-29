@@ -271,6 +271,25 @@ export interface SyncPlan {
   canonicalReview?: CanonicalPlanReviewV2;
   /** V2 activation review is a control-plane hold, never a V1 execution grant. */
   reviewKind?: V2ActivationReviewKind;
+  /**
+   * Sealed identity of the plan before one-shot local-delete decisions were
+   * applied. Equal to `canonicalIdentity` when nothing converted; otherwise it
+   * is the reviewed D0 the decision records compose with.
+   */
+  preDecisionIdentity?: CanonicalPlanIdentityV2;
+  /** Whether the pre-decision plan would have paused for the bulk-change
+   *  review. Used to decide whether converted deletes need their own review. */
+  preDecisionRequiresThresholdConfirmation?: boolean;
+  /** Bulk-change review gate for the sealed (post-decision) plan. Mirrors the
+   *  finalized plan so the reviewed-plan check can compare D0 and D1. */
+  requiresThresholdConfirmation?: boolean;
+  /** Decision rows consumed into this plan, kept for post-checkpoint
+   *  consumption and for the reviewed-plan composition check. */
+  appliedLocalDeleteDecisions?: ReadonlyArray<{
+    kind: "file" | "folder";
+    token: string;
+    path: string;
+  }>;
 }
 
 export type V2ActivationReviewKind =
@@ -699,6 +718,70 @@ export interface SyncRunFacts {
    * layer T2 reverted fail-closed, 2026-09-07) — do not "clean up" as dead
    * code without checking DECISIONS 2026-09-07 first. */
   convergences?: number;
+}
+
+/**
+ * Where a failed download/upload died inside the OneDrive client's transport
+ * waterfall (A3, 2026-10-26).
+ *
+ * - `content`      — the round's remembered `/content` shortcut (`downloadMethod`)
+ * - `downloadUrl`  — the pre-signed `@microsoft.graph.downloadUrl` tier
+ * - `itemMetadata` — the driveItem metadata read that refreshes that URL
+ * - `pathContent`  — the path-addressed `/content` fallback
+ * - `itemContent`  — the item-id-addressed `/content` last resort
+ * - `uploadSession` — the chunked upload session transport
+ * - `localIO`      — a vault/adapter read or write on this device
+ * - `state`        — local state (plugin data / IndexedDB) bookkeeping
+ *
+ * Vocabulary only: this slice stamps the five download tiers; the remaining
+ * three values are reserved for the same fact shape. Declared as one runtime
+ * tuple so the union type and the "is this a known tier" check can never drift.
+ */
+export const SYNC_FILE_ERROR_TIERS = [
+  "content",
+  "downloadUrl",
+  "itemMetadata",
+  "pathContent",
+  "itemContent",
+  "uploadSession",
+  "localIO",
+  "state",
+] as const;
+
+export type SyncFileErrorTierV1 = (typeof SYNC_FILE_ERROR_TIERS)[number];
+
+/**
+ * Structured, **evidence-only** facts about one failed file action (A3,
+ * 2026-10-26). Lets a diagnostic report answer "why did this file fail":
+ * error class, HTTP status, Graph code, bytes already moved, which waterfall
+ * tier died, and how many attempts the retry loop spent.
+ *
+ * HARD BOUNDARY — these fields are never inputs to any decision. They must not
+ * reach `isNetworkClassTransferFailure`, the M17 circuit breaker, the
+ * automatic-sync pause gate, planning, reconciliation or any retry budget. The
+ * user-visible `reason` / `outcome` text and every existing classification stay
+ * exactly as they were; this object only rides along as evidence. Adding a
+ * reader outside the diagnostic report is a regression — the consumer set is
+ * pinned by tests/sync-file-error-fact.test.ts.
+ *
+ * Every field is optional: a failure may have no HTTP status (local IO), no
+ * Graph code (transport drop), no byte count (failure before the first byte),
+ * no tier (failure outside the waterfall) or no attempt count (single-shot
+ * call). Reports render a missing field as "—" instead of guessing.
+ */
+export interface SyncFileErrorFactV1 {
+  /** `OneDriveErrorType` value (e.g. "NetworkError", "ServerError"). */
+  errorType?: string;
+  /** HTTP status; 0 means no HTTP response at all (dropped link, deadline). */
+  statusCode?: number;
+  /** Stable Graph error code when the service returned an error body. */
+  graphCode?: string;
+  /** Bytes of the payload already moved when the failure was raised. */
+  transferredBytes?: number;
+  /** Transport tier that raised the failure. */
+  tier?: SyncFileErrorTierV1;
+  /** Attempts the retry loop spent on that tier (1 = first attempt, no retry). */
+  attempts?: number;
 }
 
 export interface MutationRecoveryHistory {

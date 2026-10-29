@@ -73,6 +73,7 @@ vi.mock("../src/sync/state-manager", () => ({
   },
   SyncPathMutationRecoveryError: class extends Error {},
   ConservativeResetBlockedError: class extends Error {},
+  MAX_MUTATION_CHECKPOINT_BATCH: 64,
 }));
 
 vi.mock("../src/sync/diagnostic-logger", () => ({

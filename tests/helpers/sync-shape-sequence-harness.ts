@@ -1008,6 +1008,7 @@ export async function addShapeDevice(
     isDeltaLinkForVault: vi.fn(() => true),
     setAbortSignal: vi.fn(),
     resetDownloadStrategy: vi.fn(),
+    hasDegradedDownloadPathThisRound: vi.fn(() => false),
     beginRunMetrics: vi.fn(),
     finishRunMetrics: vi.fn(() => null),
     getDelta,

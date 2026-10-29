@@ -59,6 +59,13 @@ import {
   type CanonicalPlannerStateV2,
 } from "./canonical-planner-state-v2";
 import {
+  applyLocalDeleteDecisions,
+  type LocalDeleteDecisionAppliedPath,
+  type LocalDeleteDecisionDiagnostic,
+  type LocalDeleteDecisionScopeV1,
+  type LocalDeleteDecisionV1,
+} from "./local-delete-decision";
+import {
   CHANGE_THRESHOLD_RATIO,
   SyncActionType,
   sameSyncScope,
@@ -178,9 +185,21 @@ export interface FinalizedCanonicalPlanV2 extends CanonicalPlanCandidateV2 {
   requiresThresholdConfirmation: boolean;
 }
 
+interface LocalDeleteDecisionReportV2 {
+  nextDecisions: LocalDeleteDecisionV1[];
+  pruned: LocalDeleteDecisionDiagnostic[];
+  rejected: LocalDeleteDecisionDiagnostic[];
+  changed: boolean;
+}
+
 interface SealedCanonicalPlanV2 extends FinalizedCanonicalPlanV2 {
   canonicalIdentity: CanonicalPlanIdentityV2;
   canonicalReview: CanonicalPlanReviewV2;
+  /** Identity of the plan before local-delete decisions converted rows. */
+  preDecisionIdentity?: CanonicalPlanIdentityV2;
+  preDecisionRequiresThresholdConfirmation?: boolean;
+  appliedLocalDeleteDecisions?: LocalDeleteDecisionAppliedPath[];
+  localDeleteDecisionReport?: LocalDeleteDecisionReportV2;
 }
 
 export interface FinalizeCanonicalPlanInputV2 {
@@ -238,6 +257,18 @@ interface SealCanonicalPlanInputV2 {
   /** Public-1.1.3 content verification may refine the first in-memory
    * migration candidate before any V2 envelope has been published. */
   unpublishedMigrationCandidate?: boolean;
+  /** Device-local one-shot authorizations, read by the executor and passed in
+   *  as a pure input. Absent keeps every existing caller on today's output. */
+  localDeleteDecisions?: readonly LocalDeleteDecisionV1[];
+  /** Paths present in the raw local scan. Absent means "unknown": no
+   *  already-consumed decision path may be pruned. */
+  localPathsPresent?: ReadonlySet<string>;
+  /** Folder paths present in the raw local scan. Absent means "unknown": no
+   *  folder decision path may be pruned. */
+  localFolderPathsPresent?: ReadonlySet<string>;
+  /** Bound scope for folder decision facts; absent keeps folder records
+   *  unconsumed (file records carry their own token). */
+  decisionScope?: LocalDeleteDecisionScopeV1;
 }
 
 /**
@@ -2817,8 +2848,52 @@ export function sealCanonicalPlanV2(
     );
   }
 
-  const items = orderCanonicalPlanItemsV2(input.finalized.items);
+  const preDecisionItems = orderCanonicalPlanItemsV2(input.finalized.items);
   const sourceCommitSeq = input.committedEnvelope.meta.commitSeq;
+  const preDecisionReview = summarizeCanonicalPlanReviewV2(preDecisionItems);
+  const preDecisionRequiresThresholdConfirmation =
+    shouldPauseCanonicalPlanForReviewV2(
+      preDecisionReview.impactCount,
+      input.finalized.lastTotalFiles,
+    );
+  const preDecisionIdentity: CanonicalPlanIdentityV2 = {
+    version: 2,
+    scope: { ...input.committedEnvelope.scope },
+    sourceCommitSeq,
+    digest: canonicalPlanDigestV2({
+      items: preDecisionItems,
+      lastTotalFiles: input.finalized.lastTotalFiles,
+      scope: input.committedEnvelope.scope,
+      sourceCommitSeq,
+    }),
+  };
+  const remotePathsPresent = new Set(
+    canonicalPlannerStateFromEnvelopeV2(input.committedEnvelope)
+      .remoteFiles.map((entry) => entry.path),
+  );
+  // Remote folder presence for folder-decision pruning. Use the current remote
+  // index nodes, not the anchors: an anchor may outlive the remote folder it
+  // once pointed at, and treating that stale anchor as "still present" would
+  // keep a folder decision alive after both sides are gone.
+  const committedPlannerState = canonicalPlannerStateFromEnvelopeV2(
+    input.committedEnvelope,
+  );
+  const remoteFolderPathsPresent = new Set<string>();
+  for (const [id, node] of committedPlannerState.remoteNodeById) {
+    if (node.kind !== "folder") continue;
+    const path = committedPlannerState.remotePathById.get(id);
+    if (path) remoteFolderPathsPresent.add(path);
+  }
+  const decisionResult = applyLocalDeleteDecisions({
+    items: preDecisionItems,
+    decisions: input.localDeleteDecisions ?? [],
+    localPathsPresent: input.localPathsPresent,
+    remotePathsPresent,
+    localFolderPathsPresent: input.localFolderPathsPresent,
+    remoteFolderPathsPresent,
+    decisionScope: input.decisionScope,
+  });
+  const items = orderCanonicalPlanItemsV2(decisionResult.items);
   const canonicalReview = summarizeCanonicalPlanReviewV2(items);
   const digest = canonicalPlanDigestV2({
     items,
@@ -2843,6 +2918,15 @@ export function sealCanonicalPlanV2(
       digest,
     },
     canonicalReview,
+    preDecisionIdentity,
+    preDecisionRequiresThresholdConfirmation,
+    appliedLocalDeleteDecisions: decisionResult.applied,
+    localDeleteDecisionReport: {
+      nextDecisions: decisionResult.nextDecisions,
+      pruned: decisionResult.pruned,
+      rejected: decisionResult.rejected,
+      changed: decisionResult.changed,
+    },
   };
 }
 

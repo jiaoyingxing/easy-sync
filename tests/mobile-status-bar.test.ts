@@ -60,6 +60,7 @@ function isRetryArmed(plugin: EasySyncPlugin): boolean {
 
 describe("mobile status bar", () => {
   const previousMobile = Platform.isMobile;
+  const previousMobileApp = Platform.isMobileApp;
   const previousDocument = (globalThis as { document?: Document }).document;
   const previousWindow = (globalThis as { window?: Window }).window;
   let statusBar: FakeStatusBar;
@@ -67,6 +68,7 @@ describe("mobile status bar", () => {
 
   beforeEach(() => {
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     statusBar = createFakeStatusBar();
     statusBarPresent = true;
     const querySelector = vi.fn((selector: string) =>
@@ -86,6 +88,7 @@ describe("mobile status bar", () => {
 
   afterEach(() => {
     Platform.isMobile = previousMobile;
+    Platform.isMobileApp = previousMobileApp;
     if (previousDocument === undefined) {
       delete (globalThis as { document?: Document }).document;
     } else {

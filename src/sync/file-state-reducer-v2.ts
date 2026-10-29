@@ -173,12 +173,20 @@ export function inspectReceiptedRenameAnchorCollisionV2(
  * It consumes an already durable V1 intent + receipt and derives the next
  * in-memory envelope. It never reads or writes the manifest, adapter, Vault,
  * Graph, or plugin data. Publication remains a separate transaction.
+ *
+ * `buildTimings` is an observation-only sink: the reducer adds the wall clock
+ * it spends inside `validateEnvelope` so one checkpoint commit can report
+ * reducer derivation and validation as separate phases. Nothing here reads it
+ * back, and passing it changes no input, output or failure path.
  */
 export function reduceFileStateEnvelopeV2(
   envelope: SyncStateEnvelopeV2,
   ledgerEntry: MutationLedgerEntryV1,
+  buildTimings?: { validateMs: number },
 ): SyncStateEnvelopeV2 {
+  const validateStartedAt = performance.now();
   validateEnvelope(envelope);
+  if (buildTimings) buildTimings.validateMs += performance.now() - validateStartedAt;
   const { intent, receipt } = ledgerEntry;
   if (!receipt) throw new Error(`V2 reducer requires a completed receipt: ${intent.operationId}`);
   if (intent.version !== 1 || receipt.version !== 1) {
@@ -272,7 +280,122 @@ export function reduceFileStateEnvelopeV2(
       committedAt: receipt.completedAt,
     },
   };
+  const nextValidateStartedAt = performance.now();
   validateEnvelope(next);
+  if (buildTimings) buildTimings.validateMs += performance.now() - nextValidateStartedAt;
+  return next;
+}
+
+/**
+ * Batched V2 file reducer for a cleanup wave.
+ *
+ * Every ledger entry must be a plain `deleteRemote` receipt whose checkpoint
+ * carries exactly one path in `remoteDeletes` and the same path in
+ * `baseRemovals` — the only shape a bulk local-delete round produces. Any
+ * other shape returns `null` so the caller keeps the one-record-at-a-time
+ * reducer. One projection, one anchor sweep and one validation replace N full
+ * reduces; the single-record reducer is O(vault) per call, which is what made
+ * a 32-file checkpoint cost seconds.
+ */
+export function reduceFileStateEnvelopeV2Deletions(
+  envelope: SyncStateEnvelopeV2,
+  ledgerEntries: readonly MutationLedgerEntryV1[],
+  buildTimings?: { validateMs: number },
+): SyncStateEnvelopeV2 | null {
+  if (ledgerEntries.length === 0) return null;
+  const paths: string[] = [];
+  let committedAt = envelope.meta.committedAt;
+  for (const entry of ledgerEntries) {
+    const { intent, receipt } = entry;
+    if (!receipt) return null;
+    if (intent.version !== 1 || receipt.version !== 1) return null;
+    if (receipt.operationId !== intent.operationId) return null;
+    if (intent.action !== "deleteRemote") return null;
+    if (!sameSyncScope(intent.scope, envelope.scope)) return null;
+    if (!Number.isFinite(receipt.completedAt)) return null;
+    const checkpoint = receipt.checkpoint;
+    assertFileReceiptShape(
+      intent.action,
+      intent.path,
+      intent.sourcePath,
+      intent.stateEffect,
+      checkpoint,
+    );
+    if (
+      checkpoint.remoteUpserts.length > 0
+      || checkpoint.baseUpserts.length > 0
+      || checkpoint.folderUpserts !== undefined
+      || checkpoint.folderDeletes !== undefined
+      || checkpoint.folderMoveHintRemovals !== undefined
+      || checkpoint.pendingConflictRemovals.length > 0
+      || checkpoint.pendingDeleteRemovals.length > 0
+      || checkpoint.remoteDeletes.length !== 1
+      || checkpoint.baseRemovals.length !== 1
+      || checkpoint.remoteDeletes[0] !== checkpoint.baseRemovals[0]
+    ) {
+      return null;
+    }
+    paths.push(checkpoint.remoteDeletes[0]);
+    committedAt = Math.max(committedAt, receipt.completedAt);
+  }
+  // Only a wave that really is this shape pays the full-envelope validation;
+  // upload/download checkpoints return above and keep their per-record path.
+  const validateStartedAt = performance.now();
+  validateEnvelope(envelope);
+  if (buildTimings) buildTimings.validateMs += performance.now() - validateStartedAt;
+
+  const pathById = projectRemoteIndexV2(envelope.remoteIndex);
+  // The projection guarantees one raw path per node, so a single path → id
+  // table answers every record without rescanning the map per deletion.
+  const nodeIdByPath = new Map<string, string>();
+  for (const [nodeId, path] of pathById) {
+    if (!nodeIdByPath.has(path)) nodeIdByPath.set(path, nodeId);
+  }
+  const nextItemsById: Record<string, RemoteNodeV2> = {
+    ...envelope.remoteIndex.itemsById,
+  };
+  let removedNodes = 0;
+  for (const path of paths) {
+    const nodeId = nodeIdByPath.get(path);
+    if (!nodeId) continue;
+    if (nextItemsById[nodeId]?.kind !== "file") return null;
+    delete nextItemsById[nodeId];
+    removedNodes += 1;
+  }
+  const nextRemoteIndex: RemoteIndexV2 = {
+    ...envelope.remoteIndex,
+    itemsById: sortRecordByKey(nextItemsById),
+  };
+  const removedPaths = new Set(paths);
+  let removedAnchors = 0;
+  const nextAnchors: Record<string, SyncAnchorV2> = {};
+  for (const [anchorId, anchor] of Object.entries(envelope.anchors.byAnchorId)) {
+    if (!removedPaths.has(anchor.lastPath)) nextAnchors[anchorId] = anchor;
+    else removedAnchors += 1;
+  }
+  // Every surviving row keeps the exact same reference, so the only way this
+  // candidate differs from the input is a removed node/anchor row: the deep
+  // envelope comparison would just walk all keys to prove that.
+  if (removedNodes === 0 && removedAnchors === 0) return envelope;
+  const candidate: SyncStateEnvelopeV2 = {
+    ...envelope,
+    remoteIndex: nextRemoteIndex,
+    anchors: {
+      schemaVersion: 2,
+      byAnchorId: sortRecordByKey(nextAnchors),
+    },
+  };
+  const next: SyncStateEnvelopeV2 = {
+    ...candidate,
+    meta: {
+      ...envelope.meta,
+      commitSeq: envelope.meta.commitSeq + 1,
+      committedAt,
+    },
+  };
+  const nextValidateStartedAt = performance.now();
+  validateEnvelope(next);
+  if (buildTimings) buildTimings.validateMs += performance.now() - nextValidateStartedAt;
   return next;
 }
 
@@ -696,6 +819,20 @@ function sameRecordRows<T>(
 }
 
 function sortRecordByKey<T>(record: Record<string, T>): Record<string, T> {
+  // Published envelopes are already key-sorted, and a deletion batch only
+  // copies that order minus removed rows. Verify with the exact comparator
+  // the sort uses and keep the input object instead of rebuilding/sorting it;
+  // anything not already ordered (in-memory test/hand-built envelopes) still
+  // takes the original path and therefore keeps the exact same output order.
+  const keys = Object.keys(record);
+  let alreadySorted = true;
+  for (let index = 1; index < keys.length; index++) {
+    if (keys[index - 1].localeCompare(keys[index]) > 0) {
+      alreadySorted = false;
+      break;
+    }
+  }
+  if (alreadySorted) return record;
   return Object.fromEntries(
     Object.entries(record).sort(([left], [right]) => left.localeCompare(right)),
   );

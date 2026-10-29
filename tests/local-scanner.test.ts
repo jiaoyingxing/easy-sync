@@ -1258,3 +1258,44 @@ describe("LocalScanner fresh-file stat quirk (2026-09-13 mobile receipt incident
     });
   });
 });
+
+describe("LocalScanner.inspectFileStat", () => {
+  it("reads only stat facts and keeps missing, unreadable and too-large distinct", async () => {
+    const { scanner, adapter } = makeScanner(false, false);
+
+    adapter.stat.mockResolvedValueOnce({ size: 123, mtime: 456 });
+    await expect(scanner.inspectFileStat("Notes/note.md")).resolves.toEqual({
+      status: "present",
+      size: 123,
+      mtime: 456,
+    });
+    // The probe must never read or hash the file content.
+    expect(adapter.readBinary).not.toHaveBeenCalled();
+
+    adapter.stat.mockResolvedValueOnce(null);
+    await expect(scanner.inspectFileStat("Notes/gone.md")).resolves.toEqual({
+      status: "missing",
+    });
+
+    adapter.stat.mockRejectedValueOnce(new Error("stat failed"));
+    await expect(scanner.inspectFileStat("Notes/error.md")).resolves.toEqual({
+      status: "uncertain",
+      reason: "stat",
+    });
+
+    adapter.stat.mockResolvedValueOnce({ size: 50 * 1024 * 1024 + 1, mtime: 1 });
+    await expect(scanner.inspectFileStat("Notes/huge.bin")).resolves.toEqual({
+      status: "uncertain",
+      reason: "too-large",
+    });
+
+    // Excluded paths are rejected before any adapter call.
+    adapter.stat.mockClear();
+    await expect(scanner.inspectFileStat(".obsidian/app.json")).resolves.toEqual({
+      status: "uncertain",
+      reason: "excluded",
+    });
+    expect(adapter.stat).not.toHaveBeenCalled();
+    expect(adapter.readBinary).not.toHaveBeenCalled();
+  });
+});

@@ -13,7 +13,6 @@
 import {
   ButtonComponent,
   Notice,
-  Platform,
   PluginSettingTab,
   SettingGroup,
   setIcon,
@@ -23,6 +22,10 @@ import {
   type SettingDefinitionPage,
 } from "obsidian";
 import type EasySyncPlugin from "../main";
+import {
+  hostPlatformFacts,
+  type HostPlatformFacts,
+} from "../obsidian-compat";
 import {
   handleAuthEntryAction,
   resolveAuthEntryPresentation,
@@ -111,7 +114,11 @@ function renderAboutUpdateAffordance(
   t: I18nFn,
   plugin: EasySyncPlugin,
 ): void {
-  if (!plugin.getUpdatePromptState()) return;
+  const hasUpdate = !!plugin.getUpdatePromptState();
+  // chip 与行名文字之间靠 nameEl 的 flex+gap 留距（与社区插件行同款容器）；
+  // 该类随 chip 同生命周期挂摘，无新版时 nameEl 保持原生布局。
+  setting.nameEl.toggleClass("easy-sync-settings-name-with-chip", hasUpdate);
+  if (!hasUpdate) return;
   // update() 会重跑行渲染回调但不重建行节点：先清掉本行上一次的 chip，
   // 避免重复追加（Resojot 1.13.7 实测同型）。
   setting.nameEl
@@ -141,7 +148,12 @@ export class EasySyncSettingTab extends PluginSettingTab {
   /** 1.13+ 根级导航行图标的补挂观察器（宿主重建根行后自动补）。 */
   private rootRowIconObserver: MutationObserver | null = null;
 
-  constructor(plugin: EasySyncPlugin) {
+  constructor(
+    plugin: EasySyncPlugin,
+    /** Platform facts for mobile-only rows; tests inject a fake, production
+     *  keeps the live `Platform`-backed default. */
+    private readonly platformFacts: HostPlatformFacts = hostPlatformFacts,
+  ) {
     super(plugin.app, plugin);
     this.plugin = plugin;
     // Tab-level class must be applied at construction time: on Obsidian
@@ -256,6 +268,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
         this.plugin,
         () => this.refreshSyncState(),
         () => this.noteExclusionChange(),
+        this.platformFacts,
       );
     return [
       buildAccountSettingDefinitions(t, this.plugin),
@@ -563,7 +576,7 @@ export class EasySyncSettingTab extends PluginSettingTab {
       renderHint();
     });
     // 移动端专属开关：桌面端本行不渲染（显示隔离，桌面状态栏体系不受影响）。
-    if (Platform.isMobile) {
+    if (this.platformFacts.isMobileApp) {
       displayGroup.addSetting((setting) => {
         applyMobileStatusBarRow(setting, {
           plugin: this.plugin,
@@ -940,6 +953,7 @@ export function buildSettingDefinitions(
   plugin: EasySyncPlugin,
   onStateChanged?: () => void,
   onExclusionChange?: () => void,
+  platformFacts: HostPlatformFacts = hostPlatformFacts,
 ): SettingDefinitionPage[] {
   const host: SettingsPageRowHost = {
     plugin,
@@ -952,7 +966,7 @@ export function buildSettingDefinitions(
   const rows: SettingDefinitionPage[] = [
     buildScopePage(t, plugin, host),
     buildAutoSyncPage(t, plugin, host),
-    buildDisplayPage(t, plugin, host),
+    buildDisplayPage(t, plugin, host, platformFacts),
     buildAboutPage(t, plugin, onStateChanged),
     buildMaintenancePage(t, plugin, host),
   ];
@@ -1220,6 +1234,7 @@ function buildDisplayPage(
   t: I18nFn,
   plugin: EasySyncPlugin,
   host: SettingsPageRowHost,
+  platformFacts: HostPlatformFacts,
 ): SettingDefinitionPage {
   return {
     type: "page",
@@ -1232,7 +1247,7 @@ function buildDisplayPage(
       {
         name: t("settings.mobileStatusBar.name"),
         // 移动端专属开关：定义树常备（定义测试对账），渲染时按平台隐藏。
-        visible: () => Platform.isMobile,
+        visible: () => platformFacts.isMobileApp,
         render: (setting) => applyMobileStatusBarRow(setting, host),
       },
     ],

@@ -1449,6 +1449,179 @@ describe("AuthModule login persistence (transient refresh failures)", () => {
     expect(meCalls).toBeGreaterThan(0);
   });
 
+  it("times out a hung token request, keeps the session, and backs off without another HTTP call", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-01T00:00:00Z"));
+    let tokenCalls = 0;
+    vi.spyOn(obsidian, "requestUrl").mockImplementation((options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        tokenCalls++;
+        if (tokenCalls === 1) {
+          return Promise.resolve({
+            status: 200,
+            headers: {},
+            json: { access_token: "init-token", expires_in: 3600 },
+          } as obsidian.RequestUrlResponse);
+        }
+        // Hung request: requestUrl cannot be aborted, so only the timeout can settle it.
+        return new Promise<never>(() => {});
+      }
+      return Promise.resolve({
+        status: 200,
+        headers: {},
+        json: { displayName: "U", id: "acct" },
+      } as obsidian.RequestUrlResponse);
+    });
+    const auth = new AuthModule(
+      makeContext({
+        secretStorage: {
+          set: vi.fn().mockResolvedValue(undefined),
+          get: vi.fn(async () => "stored-refresh-token"),
+          remove: vi.fn().mockResolvedValue(undefined),
+        },
+        diag: makeDiagnostics(),
+      }),
+      (key, params) => `${key}:${String(params?.details ?? "")}`,
+    );
+
+    await auth.initialize();
+    expect(auth.authState.accountId).toBe("acct");
+
+    // Expire the access token, then hang the next refresh request.
+    vi.setSystemTime(new Date(Date.now() + 2 * 60 * 60 * 1000));
+    const pending = auth.getAccessToken();
+    const settled = pending.then(() => null, (error) => error);
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    const failure = await settled;
+    expect(failure).toMatchObject({
+      type: "NetworkError",
+      message: expect.stringContaining("timed out after 30000ms"),
+    });
+    expect(tokenCalls).toBe(2);
+    // Transient timeout keeps the login contract: the session stays logged in.
+    expect(auth.authState.isLoggedIn).toBe(true);
+
+    // Inside the 15s backoff window the next call rejects without touching the network.
+    await expect(auth.getAccessToken()).rejects.toMatchObject({
+      type: "NetworkError",
+    });
+    expect(tokenCalls).toBe(2);
+  });
+
+  it("settles concurrent refresh waiters with one timeout and clears the in-flight refresh", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-01T00:00:00Z"));
+    let tokenCalls = 0;
+    vi.spyOn(obsidian, "requestUrl").mockImplementation((options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        tokenCalls++;
+        if (tokenCalls === 1) {
+          return Promise.resolve({
+            status: 200,
+            headers: {},
+            json: { access_token: "init-token", expires_in: 3600 },
+          } as obsidian.RequestUrlResponse);
+        }
+        return new Promise<never>(() => {});
+      }
+      return Promise.resolve({
+        status: 200,
+        headers: {},
+        json: { displayName: "U", id: "acct" },
+      } as obsidian.RequestUrlResponse);
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn(async () => "stored-refresh-token"),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      diag: makeDiagnostics(),
+    }));
+
+    await auth.initialize();
+    vi.setSystemTime(new Date(Date.now() + 2 * 60 * 60 * 1000));
+
+    const first = auth.getAccessToken();
+    const second = auth.getAccessToken();
+    // Attach handlers before the clock advances so the timeout rejection is
+    // never reported as an unhandled rejection.
+    const settledPromise = Promise.allSettled([first, second]);
+    await vi.advanceTimersByTimeAsync(30_000);
+    const settled = await settledPromise;
+
+    // Single flight: both waiters share the same rejection and one HTTP attempt.
+    const reasons = settled.map((entry) =>
+      entry.status === "rejected" ? entry.reason : null);
+    expect(reasons[0]).toBe(reasons[1]);
+    expect(settled.map((entry) => entry.status)).toEqual(["rejected", "rejected"]);
+    expect(tokenCalls).toBe(2);
+
+    // The finally branch cleared refreshInFlight: after the backoff window a
+    // new attempt must reach the network instead of reusing the dead promise.
+    // Each waiter records the failure, so two waiters escalate the backoff to 30s.
+    await vi.advanceTimersByTimeAsync(30_000);
+    const third = auth.getAccessToken();
+    const thirdSettled = third.then(() => null, (error) => error);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(await thirdSettled).toMatchObject({ type: "NetworkError" });
+    expect(tokenCalls).toBe(3);
+  });
+
+  it("treats a hung /me as non-fatal: the token is still returned and sync authorization stays closed", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-01T00:00:00Z"));
+    let meCalls = 0;
+    const warn = vi.fn();
+    vi.spyOn(obsidian, "requestUrl").mockImplementation((options) => {
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        return Promise.resolve({
+          status: 200,
+          headers: {},
+          json: { access_token: "fresh-at", expires_in: 3600 },
+        } as obsidian.RequestUrlResponse);
+      }
+      if (options.url.includes("graph.microsoft.com/v1.0/me")) {
+        meCalls++;
+        return new Promise<never>(() => {}); // hung /me
+      }
+      return Promise.resolve({
+        status: 200,
+        headers: {},
+        json: {},
+      } as obsidian.RequestUrlResponse);
+    });
+    const auth = new AuthModule(makeContext({
+      secretStorage: {
+        set: vi.fn().mockResolvedValue(undefined),
+        get: vi.fn(async () => "stored-refresh-token"),
+        remove: vi.fn().mockResolvedValue(undefined),
+      },
+      diag: { log: vi.fn(), warn, error: vi.fn() } as never,
+    }));
+
+    // initialize() binds the account through /me; the hang times out and stays
+    // non-fatal (warn only), so the restore completes with accountId empty.
+    const init = auth.initialize();
+    await vi.advanceTimersByTimeAsync(30_000);
+    await init;
+    expect(auth.authState.accountId).toBe("");
+    expect(warn).toHaveBeenCalledWith(
+      "auth",
+      "failed to verify current token account",
+      expect.anything(),
+    );
+
+    // getAccessToken still returns the refreshed token while /me hangs again.
+    const token = auth.getAccessToken();
+    token.catch(() => undefined); // keep the window free of unhandled rejections
+    await vi.advanceTimersByTimeAsync(30_000);
+    await expect(token).resolves.toBe("fresh-at");
+    expect(meCalls).toBe(2);
+    expect(auth.authState.isLoggedIn).toBe(true);
+  });
+
   it("recovers a pending session via refreshNowIfNeeded on connectivity events", async () => {
     vi.useFakeTimers();
     let tokenCalls = 0;

@@ -452,9 +452,11 @@ describe("Cloud baseline bootstrap safety", () => {
     corruptWrites,
   }) => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     const previousDesktop = Platform.isDesktop;
     const previousAndroid = Platform.isAndroidApp;
     Platform.isMobile = mobile;
+    Platform.isMobileApp = mobile;
     Platform.isDesktop = !mobile;
     Platform.isAndroidApp = android;
     const path = "android-retry.md";
@@ -576,6 +578,7 @@ describe("Cloud baseline bootstrap safety", () => {
       expect(state.mutationLedger).toEqual([]);
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
       Platform.isDesktop = previousDesktop;
       Platform.isAndroidApp = previousAndroid;
     }
@@ -583,8 +586,10 @@ describe("Cloud baseline bootstrap safety", () => {
 
   it("streams large mobile downloads through a temp file before rename", async () => {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     const previousDesktop = Platform.isDesktop;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     Platform.isDesktop = false;
     const hash = "aa".repeat(32);
     const size = 9 * 1024 * 1024;
@@ -660,6 +665,7 @@ describe("Cloud baseline bootstrap safety", () => {
       );
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
       Platform.isDesktop = previousDesktop;
     }
   });
@@ -852,8 +858,10 @@ describe("Download integrity gate", () => {
     tempContent: ArrayBuffer;
   }) {
     const previousMobile = Platform.isMobile;
+    const previousMobileApp = Platform.isMobileApp;
     const previousDesktop = Platform.isDesktop;
     Platform.isMobile = true;
+    Platform.isMobileApp = true;
     Platform.isDesktop = false;
     const remove = vi.fn().mockResolvedValue(undefined);
     const rename = vi.fn().mockResolvedValue(undefined);
@@ -897,6 +905,7 @@ describe("Download integrity gate", () => {
       return { result, state, remove, rename, downloadFileToPath };
     } finally {
       Platform.isMobile = previousMobile;
+      Platform.isMobileApp = previousMobileApp;
       Platform.isDesktop = previousDesktop;
     }
   }

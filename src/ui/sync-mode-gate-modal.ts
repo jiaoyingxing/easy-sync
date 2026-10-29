@@ -44,10 +44,12 @@ export function buildSyncModeGateView(input: {
   return {
     title: t("settings.syncMode.gate.title"),
     message: t("settings.syncMode.gate.message"),
+    // 显示顺序（2026-10-28 用户拍板）：「作用范围」最反直觉、也最容易让用户
+    // 误以为单向会停掉全部上传，放第一条；键名保持语义稳定，只改渲染顺序。
     points: [
+      t("settings.syncMode.gate.point3"),
       t("settings.syncMode.gate.point1"),
       t("settings.syncMode.gate.point2"),
-      t("settings.syncMode.gate.point3"),
     ],
     tail: t("settings.syncMode.gate.tail"),
     counts: [

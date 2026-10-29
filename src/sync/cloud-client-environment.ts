@@ -1,5 +1,9 @@
-import { FileSystemAdapter, Platform, type Vault } from "obsidian";
-import { normalizeVaultPathKey } from "../obsidian-compat";
+import { FileSystemAdapter, type Vault } from "obsidian";
+import {
+  hostPlatformFacts,
+  normalizeVaultPathKey,
+  type HostPlatformFacts,
+} from "../obsidian-compat";
 
 type VaultCloudClientService = "onedrive" | "icloud";
 
@@ -92,8 +96,9 @@ const CLOUD_PATH_SIGNATURES: readonly CloudPathSignature[] = [
  */
 export function detectVaultCloudClientEnvironment(
   vault: Vault,
+  platform: HostPlatformFacts = hostPlatformFacts,
 ): VaultCloudClientDetection {
-  if (!Platform.isDesktopApp) {
+  if (!platform.isDesktopApp) {
     return { assessable: false, detected: false, service: null, signature: null };
   }
   if (!(vault.adapter instanceof FileSystemAdapter)) {

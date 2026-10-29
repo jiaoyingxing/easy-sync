@@ -21,19 +21,34 @@ type SyncResultTranslator = (
  * The executor intentionally keeps ConfirmLocalDelete in the historical
  * `conflicts` control count. User-facing surfaces recover the exact meaning
  * from the concrete action type without changing that compatibility contract.
+ *
+ * `remoteDeletePending` is the executor's direct split (A2, 2026-10-26). New
+ * history entries pass it so the numbers stay right even when the retained
+ * `files` rows no longer carry every ConfirmLocalDelete row (success rows have
+ * a 100-entry retention cap). Legacy entries omit it and fall back to counting
+ * the action rows — the pre-existing inference, kept verbatim.
  */
 export function resolveSyncPendingAttentionCounts(
   totalConflicts: number,
   files: readonly Pick<FileProgress, "actionType">[],
+  remoteDeletePending?: number,
 ): SyncPendingAttentionCounts {
+  const total = Math.max(0, totalConflicts);
+  if (typeof remoteDeletePending === "number" && Number.isFinite(remoteDeletePending)) {
+    const direct = Math.min(total, Math.max(0, remoteDeletePending));
+    return {
+      conflicts: total - direct,
+      remoteDeletes: direct,
+    };
+  }
   const remoteDeletes = Math.min(
-    Math.max(0, totalConflicts),
+    total,
     files.filter(
       (file) => file.actionType === SyncActionType.ConfirmLocalDelete,
     ).length,
   );
   return {
-    conflicts: Math.max(0, totalConflicts - remoteDeletes),
+    conflicts: total - remoteDeletes,
     remoteDeletes,
   };
 }
@@ -56,6 +71,9 @@ export function formatSyncResultMessage(
   const pending = resolveSyncPendingAttentionCounts(
     result.conflicts,
     files,
+    // Executor's direct split wins when present; legacy results without it
+    // keep the action-row inference above.
+    result.remoteDeletePending,
   );
   if (pending.remoteDeletes === 0) return result.message;
   if (pending.conflicts === 0) {

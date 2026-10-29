@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildAdaptivePathLayout,
   diffCompletedFileRows,
+  selectCompletedDisplayRows,
   buildSyncPlanDisplayGroups,
   buildSyncPlanDisplayRows,
   buildSyncPlanMeasuredVirtualOffsets,
@@ -32,15 +33,19 @@ import {
   resolveRemoteScopeRecoveryFailurePresentation,
   resolveSyncViewBodyMode,
   resolveSyncViewPrimaryAction,
+  resolveSyncViewProgressPanelVisibility,
   resolveSyncViewStatusDetailMode,
   resolveSyncViewStatusDetailText,
   shouldExpandAllVisibleDetails,
   shouldAutoRebuildPlanReview,
+  sharedFolderIdentityConfirmLines,
   SYNC_PLAN_VIRTUAL_OVERSCAN,
   syncViewProgressPercent,
   trimFilePathPrefix,
 } from "../src/ui/sync-view";
 import { I18n } from "../src/i18n";
+import en from "../src/i18n/en";
+import zhCN from "../src/i18n/zh-cn";
 import { SyncActionType } from "../src/sync/types";
 import type { SyncPlanItem } from "../src/sync/types";
 import { ConfirmModal } from "../src/ui/confirm-modal";
@@ -107,6 +112,146 @@ function collectFakeHistoryText(element: FakeHistoryElement): string[] {
     ...(element.text ? [element.text] : []),
     ...element.children.flatMap(collectFakeHistoryText),
   ];
+}
+
+/** Minimal DOM stand-in for the adaptive path pass: rows, path children,
+ *  sibling order and the two box metrics the layout reads. */
+class FakeAdaptivePathElement {
+  className: string;
+  textContent = "";
+  readonly dataset: Record<string, string> = {};
+  readonly style = { setProperty: (): void => undefined };
+  clientWidth = 40;
+  left = 10;
+  rectCalls = 0;
+  children: FakeAdaptivePathElement[] = [];
+  parentElement: FakeAdaptivePathElement | null = null;
+
+  constructor(className = "") {
+    this.className = className;
+  }
+
+  get classList(): {
+    contains(name: string): boolean;
+    add(name: string): void;
+  } {
+    return {
+      contains: (name) => this.className.split(/\s+/).includes(name),
+      add: (name) => {
+        if (!this.className.split(/\s+/).includes(name)) {
+          this.className = `${this.className} ${name}`.trim();
+        }
+      },
+    };
+  }
+
+  get scrollWidth(): number {
+    return this.textContent.length * 10;
+  }
+
+  get previousElementSibling(): FakeAdaptivePathElement | null {
+    const parent = this.parentElement;
+    if (!parent) return null;
+    const index = parent.children.indexOf(this);
+    return index > 0 ? parent.children[index - 1] : null;
+  }
+
+  get nextElementSibling(): FakeAdaptivePathElement | null {
+    const parent = this.parentElement;
+    if (!parent) return null;
+    const index = parent.children.indexOf(this);
+    return index >= 0 && index + 1 < parent.children.length
+      ? parent.children[index + 1]
+      : null;
+  }
+
+  setText(text: string): this {
+    this.textContent = text;
+    return this;
+  }
+
+  setAttribute(): void {
+    // aria-hidden and friends are irrelevant to the measured geometry.
+  }
+
+  getBoundingClientRect(): { left: number } {
+    this.rectCalls++;
+    return { left: this.left };
+  }
+
+  createDiv(className = ""): FakeAdaptivePathElement {
+    const child = new FakeAdaptivePathElement(className);
+    // A gray-directory prefix fits without tail truncation in these fixtures.
+    child.clientWidth = 400;
+    child.left = 0;
+    this.appendChild(child);
+    return child;
+  }
+
+  appendChild(child: FakeAdaptivePathElement): void {
+    child.parentElement = this;
+    this.children.push(child);
+  }
+
+  prepend(child: FakeAdaptivePathElement): void {
+    child.parentElement = this;
+    this.children.unshift(child);
+  }
+
+  before(node: FakeAdaptivePathElement): void {
+    const parent = this.parentElement;
+    if (!parent) return;
+    // Mirror DOM `before`: move an already-parented node instead of cloning it.
+    const existingIndex = parent.children.indexOf(node);
+    if (existingIndex >= 0) parent.children.splice(existingIndex, 1);
+    const index = parent.children.indexOf(this);
+    parent.children.splice(index, 0, node);
+    node.parentElement = parent;
+  }
+
+  remove(): void {
+    const parent = this.parentElement;
+    if (!parent) return;
+    const index = parent.children.indexOf(this);
+    if (index >= 0) parent.children.splice(index, 1);
+    this.parentElement = null;
+  }
+
+  querySelector(selector: string): FakeAdaptivePathElement | null {
+    if (selector !== ".easy-sync-adaptive-path") return null;
+    return this.children.find((child) =>
+      child.classList.contains("easy-sync-adaptive-path")) ?? null;
+  }
+}
+
+function createFakePathRow(path: string): {
+  row: FakeAdaptivePathElement;
+  pathEl: FakeAdaptivePathElement;
+} {
+  const row = new FakeAdaptivePathElement(
+    "easy-sync-file-row easy-sync-path-layout-item",
+  );
+  const pathEl = new FakeAdaptivePathElement(
+    "easy-sync-file-path easy-sync-adaptive-path",
+  );
+  pathEl.dataset.easySyncFullPath = path;
+  pathEl.setText(path);
+  row.appendChild(pathEl);
+  return { row, pathEl };
+}
+
+function createBareSyncView(): EasySyncSyncView {
+  const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+  Object.assign(view as object, {
+    adaptivePathRowStates: new WeakMap(),
+    adaptivePathScopeStates: new WeakMap(),
+    adaptivePathTextWidths: new Map(),
+    adaptivePathDirectoryTexts: new Map(),
+    adaptivePathMonospaceAdvances: new Map(),
+    adaptivePathProbe: null,
+    adaptivePathProbeFontKey: null,
+  });
+  return view;
 }
 
 describe("syncViewProgressPercent", () => {
@@ -445,12 +590,17 @@ describe("shared sidebar detail controls", () => {
     // 件② 同一规则搬到本机独有条目族：成批（≥2 条）时逐条默认收起。
     expect(decide("localOnly:a.md", batched(false))).toBe(true);
     expect(decide("localOnly:a.md", batched(false, true))).toBe(false);
+    // 更新提示行（2026-10-28 拍板）：默认展开，避免「去更新」藏在折叠里。
+    expect(decide("update:available", batched(false))).toBe(true);
 
     // 行级手势压过类别默认。
     state.set("conflict:a.md", false);
     expect(decide("conflict:a.md", batched(false))).toBe(false);
     state.set("issue:download:timeout:a.md", true);
     expect(decide("issue:download:timeout:a.md", batched(false))).toBe(true);
+    // 用户手动收起的更新提示行，重建后不回弹。
+    state.set("update:available", false);
+    expect(decide("update:available", batched(false))).toBe(false);
 
     // 会话级覆盖压过类别默认，但压不过行级手势。
     Object.assign(view as object, { sessionOverride: "expanded" });
@@ -470,6 +620,7 @@ describe("shared sidebar detail controls", () => {
     expect(isDecisionRowKey("delete:a.md")).toBe(true);
     expect(isDecisionRowKey("plugin:resp")).toBe(true);
     expect(isDecisionRowKey("adoption:resp")).toBe(true);
+    expect(isDecisionRowKey("update:available")).toBe(true);
     expect(isDecisionRowKey("issue:upload:timeout:a.md")).toBe(false);
     expect(isDecisionRowKey("row:Upload:a.md")).toBe(false);
     expect(isDecisionRowKey("batch-delete")).toBe(false);
@@ -487,11 +638,13 @@ describe("shared sidebar detail controls", () => {
       "renderPendingIssue|easy-sync-tree-item": "decision",
       "renderLocalOnlyItem|easy-sync-tree-item": "decision",
       "createTreeGroup|easy-sync-tree-item": "container",
+      "renderMutationRecoverySection|easy-sync-tree-item easy-sync-recovery-details": "readonly",
       "renderHistorySection|easy-sync-history-run easy-sync-tree-item": "readonly",
       // 运行中列表与历史条目共用的「按设置跳过」折叠件（2026-10-25 拍板）：
       // 站点随共享化移到 createSkipFold，类别与默认态不变。
       "createSkipFold|easy-sync-history-skip-group easy-sync-tree-item": "readonly",
-      "renderUpdateAvailableItem|easy-sync-tree-item": "readonly",
+      // 更新提示行 2026-10-28 起按决策行族默认展开（出口只在折叠里）。
+      "renderUpdateAvailableItem|easy-sync-tree-item": "decision",
       "measurePlanDecisionRowHeights|easy-sync-tree-item easy-sync-plan-decision-probe": "probe",
     };
     const source = readSourceFile("src/ui/sync-view.ts");
@@ -513,6 +666,23 @@ describe("shared sidebar detail controls", () => {
       const start = source.indexOf(`private ${fn}(`);
       expect(source.slice(start, start + 1600)).toContain("details.dataset.easySyncPlanRow = rowKey");
     }
+  });
+
+  it("renders recovery files through the standard row and disclosure contract", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const start = source.indexOf("  private renderMutationRecoverySection(");
+    const end = source.indexOf("\n  private appendRecoveryFileRow(", start);
+    const section = source.slice(start, end);
+    expect(section).toContain("displayedPaths.length === 1");
+    expect(section).toContain("easy-sync-recovery-details");
+    expect(section).toContain("easy-sync-file-list easy-sync-path-layout");
+    expect(section).toContain("easy-sync-tree-label");
+    expect(section).toContain('t("syncView.recovery.details")');
+    expect(section).toContain("syncView.recovery.openAccountSettings");
+    expect(section).toContain("this.plugin.openPluginSettings()");
+    expect(section).not.toContain("easy-sync-recovery-subject");
+    expect(section).not.toContain("easy-sync-recovery-facts");
+    expect(section).not.toContain("createSkipFold");
   });
 
   it("does not let a new plan revision wipe the user's explicit global choice", () => {
@@ -751,35 +921,177 @@ describe("sync view status copy and scrolling layout", () => {
 
     expect(zh.t("progress.verifyingFiles", { current: 2, total: 5 }))
       .toBe("验证文件一致性…");
+    // 量词「项」是 2026-07-11 用户要求，2026-10-27 决定恢复；验证文案本身不带计数。
     expect(zh.t("syncView.progress.items", { current: 2, total: 5 }))
       .toBe("2/5项");
+    expect(zh.t("syncView.progress.items", { current: 32, total: 2001 }))
+      .toBe("32/2001项");
     expect(en.t("progress.verifyingFiles", { current: 2, total: 5 }))
       .toBe("Verifying file consistency…");
     expect(en.t("syncView.progress.items", { current: 2, total: 5 }))
       .toBe("2/5 items");
   });
 
-  it("separates shared-folder identity recording from the following sync", () => {
+  it("removes the in-flight badge everywhere it used to live", () => {
+    const view = readSourceFile("src/ui/sync-view.ts");
+    const styles = readSourceFile("styles.css");
+    const executor = readSourceFile("src/sync/sync-executor.ts");
+
+    // 2026-10-27 用户拍板：未经批准加的「处理中 N」整块回退，不留空容器、
+    // 不留只被它读取的计数。
+    expect(view).not.toContain("easy-sync-status-inflight");
+    expect(view).not.toContain("inFlightBadgeEl");
+    expect(view).not.toContain("updateInFlightBadge");
+    expect(styles).not.toContain(".easy-sync-status-inflight");
+    expect(executor).not.toContain("inFlightItemCount");
+    expect(executor).not.toContain("inFlightItems");
+    for (const locale of [zhCN, en]) {
+      expect(Object.keys(locale)).not.toContain("syncView.progress.inFlight");
+    }
+  });
+
+  it("renders the speed chip only when the sampler has a quotable reading", () => {
+    // 用户拍板 2026-10-27：底部连接速度不准确就不显示。采样不足时整块不渲染，
+    // 连空容器都不留——隐藏态就是「从来没有过读数」的既有布局。
+    const makeContainer = () => {
+      const children: Array<{ className: string }> = [];
+      const container = {
+        children,
+        createDiv(className = "") {
+          const child = {
+            className,
+            style: {} as Record<string, string>,
+            textContent: "",
+            createSpan(spanClass = "") {
+              const span = {
+                className: spanClass,
+                textContent: "",
+                setText(value: string) {
+                  this.textContent = value;
+                  return this;
+                },
+              };
+              return span;
+            },
+            addClass() {
+              return child;
+            },
+            removeClass() {
+              return child;
+            },
+            setText(value: string) {
+              child.textContent = value;
+              return child;
+            },
+          };
+          children.push(child);
+          return child;
+        },
+      };
+      return container;
+    };
+    const render = (reading: { level: string; kbps: number | null } | null) => {
+      const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+      Object.assign(view as object, {
+        // Prototype-only harness bypasses the constructor's default; give the
+        // view the desktop UI-mode fact explicitly (the injected seam this
+        // slice introduced).
+        platformFacts: { isMobile: false },
+        plugin: {
+          i18n: new I18n("zh-cn"),
+          getTransferRateReading: () => reading,
+        },
+      });
+      const container = makeContainer();
+      (view as unknown as {
+        renderTransferRateFooter: (target: unknown) => void;
+      }).renderTransferRateFooter(container);
+      return container;
+    };
+
+    expect(render(null).children).toHaveLength(0);
+    const shown = render({ level: "medium", kbps: 512 });
+    expect(shown.children).toHaveLength(1);
+    expect(shown.children[0].className).toBe("easy-sync-transfer-rate");
+  });
+
+  it("takes the speed chip away instead of leaving an empty slot", () => {
+    // 读数过期时走的是移除节点，不是留一个空壳/占位；布局回到没有读数的常态。
+    const removed: string[] = [];
+    const indicator = {
+      remove: () => {
+        removed.push("chip");
+      },
+    };
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      contentEl: {
+        querySelector: (selector: string) =>
+          selector === ".easy-sync-transfer-rate" ? indicator : null,
+      },
+      plugin: {
+        i18n: new I18n("zh-cn"),
+        getTransferRateReading: () => null,
+      },
+    });
+    (view as unknown as { refreshTransferRateValue: () => void })
+      .refreshTransferRateValue();
+    expect(removed).toEqual(["chip"]);
+  });
+
+  it("reserves no space for the speed chip when it is absent", () => {
+    // 隐藏不得留下空位：载体本身没有预留高度，也没有为隐藏态保留盒子的规则
+    // （移动端 is-hidden 用 display:none；is-anchor-pending 的 visibility 只
+    // 服务首次锚定前的待命，不属于隐藏读数）。
+    const styles = readSourceFile("styles.css");
+    const baseRule = styles.match(/^\.easy-sync-transfer-rate \{[^}]*\}/m)?.[0] ?? "";
+    expect(baseRule).not.toBe("");
+    expect(baseRule).not.toMatch(/min-height|height:/);
+    expect(styles).toContain(
+      "body.is-mobile .easy-sync-transfer-rate.is-mobile-footer.is-hidden {\n  display: none;\n}",
+    );
+  });
+
+  it("shows the user-checkable facts before the same-folder question", () => {
     const zh = new I18n("zh-cn");
     const en = new I18n("en");
-    const zhMessage = zh.t("syncView.sharedFolderIdentity.confirmMessage", {
+    const snapshot = {
       path: ".obsidian/plugins",
-    });
-    const enMessage = en.t("syncView.sharedFolderIdentity.confirmMessage", {
-      path: ".obsidian/plugins",
-    });
+      summary: {
+        localFiles: 12,
+        localFolders: 3,
+        remoteFiles: 11,
+        remoteFolders: 3,
+        sameNameFiles: 10,
+        sameSizeFiles: 8,
+        localOnlyFiles: 2,
+        remoteOnlyFiles: 1,
+        previouslySyncedFiles: 12,
+      },
+    };
 
-    expect(zh.t("syncView.sharedFolderIdentity.resolve"))
-      .toBe("确认是同一文件夹");
-    expect(zhMessage).toContain("请只在你确认两边原本就是同一个文件夹时继续");
-    expect(zhMessage).toContain("尚未确认的上级文件夹");
-    expect(zhMessage).toContain("记录身份这一步不会上传、下载或删除文件");
-    expect(zhMessage).toContain("随后会立即按当前设置重新同步");
-    expect(en.t("syncView.sharedFolderIdentity.resolve"))
-      .toBe("Confirm same folder");
-    expect(enMessage).toContain("Continue only if you know they were originally the same folder");
-    expect(enMessage).toContain("any unconfirmed parent folders");
-    expect(enMessage).toContain("It will then sync immediately using the current settings");
+    expect(zh.t("syncView.sharedFolderIdentity.resolve")).toBe("查看");
+    expect(zh.t("syncView.sharedFolderIdentity.confirmTitle"))
+      .toBe("确认文件夹身份");
+    expect(sharedFolderIdentityConfirmLines(snapshot, zh.t.bind(zh))).toEqual([
+      "“.obsidian/plugins”未登记，无法自动匹配。",
+      "本机共 12 个文件 / 3 个文件夹，云端共 11 个文件 / 3 个文件夹。",
+      "同名文件 10 个，其中 8 个大小一致。",
+      "本机独有 2 个，云端独有 1 个。",
+      "本机曾同步过 12 个文件。",
+      "请确认是同一文件夹后继续。",
+    ]);
+    expect(en.t("syncView.sharedFolderIdentity.resolve")).toBe("Review");
+    expect(en.t("syncView.sharedFolderIdentity.confirmTitle"))
+      .toBe("Confirm folder identity");
+    expect(sharedFolderIdentityConfirmLines(snapshot, en.t.bind(en))).toEqual([
+      "“.obsidian/plugins” is not registered, so EasySync cannot match it automatically.",
+      "This device has 12 files / 3 folders; the cloud has 11 files / 3 folders.",
+      "10 files have the same name on both sides; 8 of them are the same size.",
+      "Only on this device: 2; only in the cloud: 1.",
+      "12 files here were synced before.",
+      "Confirm they are the same folder to continue.",
+    ]);
     expect(zh.t("notice.sharedFolderIdentity.failed", {
       path: ".obsidian/plugins",
       reason: "raw-provider-error",
@@ -788,6 +1100,33 @@ describe("sync view status copy and scrolling layout", () => {
       path: ".obsidian/plugins",
       reason: "raw-provider-error",
     })).not.toContain("raw-provider-error");
+  });
+
+  it("adds the empty-side warnings only when one side holds nothing", () => {
+    const zh = new I18n("zh-cn");
+    const snapshot = {
+      path: "Clippings",
+      summary: {
+        localFiles: 0,
+        localFolders: 0,
+        remoteFiles: 4,
+        remoteFolders: 0,
+        sameNameFiles: 0,
+        sameSizeFiles: 0,
+        localOnlyFiles: 0,
+        remoteOnlyFiles: 4,
+        previouslySyncedFiles: 0,
+      },
+    };
+
+    expect(sharedFolderIdentityConfirmLines(snapshot, zh.t.bind(zh))).toEqual([
+      "“Clippings”未登记，无法自动匹配。",
+      "本机共 0 个文件 / 0 个文件夹，云端共 4 个文件 / 0 个文件夹。",
+      "同名文件 0 个，其中 0 个大小一致。",
+      "本机独有 0 个，云端独有 4 个。",
+      "本机文件夹是空的。",
+      "请确认是同一文件夹后继续。",
+    ]);
   });
 
   it("keeps stale-identity retirement state-only and hides raw failures", () => {
@@ -873,6 +1212,24 @@ describe("sync view status copy and scrolling layout", () => {
     );
     expect(styles).not.toMatch(
       /body\.is-mobile \.easy-sync-view-content\s*\{[^}]*overflow(?:-y)?:/s,
+    );
+  });
+
+  it("never paints the host bottom action bar or disables its fade", () => {
+    const styles = readSourceFile("styles.css");
+    // 宿主抽屉底栏的渐隐是标准样式（2026-10-27 用户 iPhone 真机指认：官方文件
+    // 列表与 EasySync 列表都带渐隐）。插件给 `.nav-buttons-container` 画实体底色
+    // 会盖掉列表化进背景的过渡，关掉它的 ::after 更会把渐隐整条抹掉——2026-10-27
+    // 一次误改正是这两条（已回退）。这里钉住：插件不得改底栏表面，也不得动宿主
+    // 画在 `nav-buttons-container` / `workspace-leaf-content` 上的渐隐层。
+    expect(styles).not.toMatch(
+      /\.nav-buttons-container[^{]*\{[^}]*background(?:-color)?:/s,
+    );
+    expect(styles).not.toMatch(
+      /\.nav-buttons-container[^{]*::after[^{]*\{[^}]*display:\s*none/s,
+    );
+    expect(styles).not.toMatch(
+      /\.workspace-leaf-content[^{]*::after[^{]*\{[^}]*display:\s*none/s,
     );
   });
 });
@@ -1484,6 +1841,37 @@ describe("buildSyncViewContentKey", () => {
     expect(moved.removePaths).toEqual(["Folder"]);
   });
 
+  it("mounts only the newest completed page and counts the rest", () => {
+    const files = Array.from({ length: 350 }, (_, index) => ({
+      path: `f-${index}.md`,
+      status: "upload",
+    })) as never[];
+    const display = selectCompletedDisplayRows(files);
+    expect(display.rows).toHaveLength(300);
+    expect(display.rows[0].path).toBe("f-349.md");
+    expect(display.rows[299].path).toBe("f-50.md");
+    expect(display.omitted).toBe(50);
+
+    const deduped = selectCompletedDisplayRows([
+      { path: "a.md", status: "error" },
+      { path: "b.md", status: "upload" },
+      { path: "a.md", status: "upload" },
+    ] as never[]);
+    expect(deduped.rows.map((file) => file.path)).toEqual(["a.md", "b.md"]);
+    expect(deduped.omitted).toBe(0);
+  });
+
+  it("renders the newest completed page with a summary row", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const render = source.slice(
+      source.indexOf("private renderFileResults("),
+      source.indexOf("private updateCompletedOmittedRow("),
+    );
+    expect(render).toContain("selectCompletedDisplayRows(files)");
+    expect(render).toContain("this.updateCompletedOmittedRow(display.omitted, t)");
+    expect(source).toContain('t("syncView.progress.omitted"');
+  });
+
   it("keeps retained rows untouched when nothing changed", () => {
     const files = [
       { path: "a.md", status: "download" },
@@ -1533,6 +1921,46 @@ describe("buildSyncViewContentKey", () => {
     expect(diff.prepend).toHaveLength(1);
     expect(diff.prepend[0].status).toBe("error");
     expect(diff.removePaths).toEqual([]);
+  });
+
+  it("keeps incremental append order, partition and dedup equal to the full render", () => {
+    const files = [
+      { path: "skip.bin", status: "skip", actionType: SyncActionType.SkipLargeFile },
+      { path: "notes/a.md", status: "download" },
+      { path: "notes/b.md", status: "upload" },
+      { path: "notes/a.md", status: "error", reason: "timeout" },
+    ] as never;
+    const fullRenderOrder = (rows: readonly Record<string, unknown>[]) => {
+      const seen = new Set<string>();
+      const order: string[] = [];
+      for (let index = rows.length - 1; index >= 0; index--) {
+        const path = String(rows[index].path);
+        if (seen.has(path)) continue;
+        seen.add(path);
+        order.push(path);
+      }
+      return order;
+    };
+    const rows = partitionCompletedProgressRows(files);
+    const action = diffCompletedFileRows(new Map(), rows.action);
+    const skipped = diffCompletedFileRows(new Map(), rows.skipped);
+
+    // Full `renderFileResults` walks the source array backwards (newest
+    // first), dedups by path and renders directly. The light path must agree
+    // in partition, dedup and final order for both lists.
+    expect(action.prepend.map((file) => file.path)).toEqual(
+      fullRenderOrder(rows.action as never),
+    );
+    expect(skipped.prepend.map((file) => file.path)).toEqual(
+      fullRenderOrder(rows.skipped as never),
+    );
+    expect(action.prepend.find((file) => file.path === "notes/a.md")?.status)
+      .toBe("error");
+    expect(action.prepend.map((file) => file.path)).toEqual([
+      "notes/a.md",
+      "notes/b.md",
+    ]);
+    expect(skipped.prepend.map((file) => file.path)).toEqual(["skip.bin"]);
   });
 
   it("maps completed rows to one short result chip without losing exact action facts", () => {
@@ -1774,14 +2202,566 @@ describe("buildSyncViewContentKey", () => {
     // 零宽/负宽 → 原样返回。
     expect(fitDirectoryTail("Projects/", 0, width)).toBe("Projects/");
 
-    // 接线：目录元素渲染必须套用保尾显示串（同一盒模型域量测）。
+    // 接线：目录元素渲染必须套用保尾显示串（同一缓存量测域）。
     const source = readSourceFile("src/ui/sync-view.ts");
     const scopeStart = source.indexOf("private applyAdaptivePathLayoutScope(");
     const scopeEnd = source.indexOf("private appendNewFileRows(", scopeStart);
     const scope = source.slice(scopeStart, scopeEnd);
-    expect(scope).toContain("directory.setText(fitDirectoryTail(");
+    expect(scope).toContain("this.fitAdaptiveDirectoryText(");
     expect(scope).toContain("directory.clientWidth");
-    expect(scope).toContain("directory.scrollWidth");
+    expect(scope).toContain("measureAdaptiveDirectoryText(");
+  });
+
+  it("only re-measures newly appended rows for adaptive path layout", () => {
+    const scope = new FakeAdaptivePathElement(
+      "easy-sync-file-list easy-sync-path-layout",
+    );
+    const existing = createFakePathRow("Projects/Alpha/old.md");
+    scope.appendChild(existing.row);
+
+    const view = createBareSyncView();
+    const layout = (view as unknown as {
+      applyAdaptivePathLayoutScope(scope: HTMLElement): void;
+    }).applyAdaptivePathLayoutScope.bind(view);
+    layout(scope as unknown as HTMLElement);
+    const existingText = existing.pathEl.textContent;
+    const existingMeasurements = existing.pathEl.rectCalls;
+
+    const first = createFakePathRow("Projects/Alpha/one.md");
+    const second = createFakePathRow("Projects/Alpha/two.md");
+    // Same insertion order as appendCompletedActionRows: bottom-up prepend.
+    scope.prepend(second.row);
+    scope.prepend(first.row);
+    layout(scope as unknown as HTMLElement);
+
+    // Existing rows are not touched at all: no forced layout, no text rewrite.
+    expect(existing.pathEl.rectCalls).toBe(existingMeasurements);
+    expect(existing.pathEl.textContent).toBe(existingText);
+    // Only the new rows were measured (and their extraction proves it).
+    expect(first.pathEl.rectCalls).toBeGreaterThan(0);
+    expect(second.pathEl.rectCalls).toBeGreaterThan(0);
+    // All three now share the same prefix, so one directory sits above the
+    // first row and every row is trimmed against it.
+    expect(
+      scope.children[0].classList.contains("easy-sync-path-directory"),
+    ).toBe(true);
+    expect(scope.children[0].textContent).toBe("Projects/Alpha/");
+    expect(first.pathEl.textContent).toBe("one.md");
+    expect(second.pathEl.textContent).toBe("two.md");
+    expect(existing.pathEl.textContent).toBe("old.md");
+    // The gray directory is a sibling, so the row order stays untouched.
+    expect(
+      scope.children.filter((child) =>
+        child.classList.contains("easy-sync-file-row")),
+    ).toEqual([first.row, second.row, existing.row]);
+  });
+
+  it("lays out a closed details scope only after it opens", () => {
+    const scope = new FakeAdaptivePathElement(
+      "easy-sync-file-list easy-sync-path-layout",
+    );
+    const row = createFakePathRow("Projects/Alpha/long-name.md");
+    scope.appendChild(row.row);
+    let closed = true;
+    (scope as unknown as { closest(selector: string): unknown }).closest =
+      (selector) => selector === "details:not([open])" && closed ? {} : null;
+
+    const view = createBareSyncView();
+    const layout = (view as unknown as {
+      applyAdaptivePathLayoutScope(scope: HTMLElement): void;
+    }).applyAdaptivePathLayoutScope.bind(view);
+    layout(scope as unknown as HTMLElement);
+    // A collapsed group is not measured: no directory, full path untouched.
+    expect(scope.children).toHaveLength(1);
+    expect(row.pathEl.textContent).toBe("Projects/Alpha/long-name.md");
+
+    closed = false;
+    layout(scope as unknown as HTMLElement);
+    expect(
+      scope.children[0].classList.contains("easy-sync-path-directory"),
+    ).toBe(true);
+    expect(row.pathEl.textContent).toBe("long-name.md");
+  });
+
+  it("plans the limited completed list in chunks and extends it on scroll", () => {
+    const scope = new FakeAdaptivePathElement(
+      "easy-sync-file-list is-limited easy-sync-path-layout",
+    );
+    (scope as unknown as { clientHeight: number }).clientHeight = 200;
+    (scope as unknown as { scrollTop: number }).scrollTop = 0;
+    const rows: Array<ReturnType<typeof createFakePathRow>> = [];
+    for (let i = 0; i < 350; i++) {
+      const row = createFakePathRow(`Projects/Alpha/file-${i}.md`);
+      scope.appendChild(row.row);
+      rows.push(row);
+    }
+
+    const view = createBareSyncView();
+    const layout = (view as unknown as {
+      applyAdaptivePathLayoutScope(scope: HTMLElement): void;
+    }).applyAdaptivePathLayoutScope.bind(view);
+    layout(scope as unknown as HTMLElement);
+    // The newest chunk (300) is planned; the tail keeps its full path until
+    // the list is scrolled, so one per-file pass stays bounded.
+    expect(rows[0].pathEl.textContent).toBe("file-0.md");
+    expect(rows[299].pathEl.textContent).toBe("file-299.md");
+    expect(rows[349].pathEl.textContent).toBe("Projects/Alpha/file-349.md");
+
+    (scope as unknown as { scrollTop: number }).scrollTop = 8_900;
+    layout(scope as unknown as HTMLElement);
+    expect(rows[349].pathEl.textContent).toBe("file-349.md");
+  });
+
+  it("drops a rewritten row's stale gray directory before laying it out", () => {
+    const scope = new FakeAdaptivePathElement(
+      "easy-sync-file-list easy-sync-path-layout",
+    );
+    const stale = new FakeAdaptivePathElement("easy-sync-path-directory");
+    stale.setText("Projects/Alpha/");
+    scope.appendChild(stale);
+    const replacement = createFakePathRow("Archive/2026/July/long-name.md");
+    scope.appendChild(replacement.row);
+
+    const view = createBareSyncView();
+    (view as unknown as {
+      applyAdaptivePathLayoutScope(scope: HTMLElement): void;
+    }).applyAdaptivePathLayoutScope(scope as unknown as HTMLElement);
+
+    expect(scope.children).not.toContain(stale);
+    expect(
+      scope.children[0].classList.contains("easy-sync-path-directory"),
+    ).toBe(true);
+    expect(scope.children[0].textContent).toBe("Archive/2026/July/");
+    expect(replacement.pathEl.textContent).toBe("long-name.md");
+  });
+
+  it("keeps a shared directory only while a row still uses it", () => {
+    const sharedScope = new FakeAdaptivePathElement(
+      "easy-sync-file-list easy-sync-path-layout",
+    );
+    const head = createFakePathRow("Projects/Alpha/one.md");
+    const member = createFakePathRow("Projects/Alpha/two.md");
+    sharedScope.appendChild(head.row);
+    sharedScope.appendChild(member.row);
+
+    const view = createBareSyncView();
+    const layout = (view as unknown as {
+      applyAdaptivePathLayoutScope(scope: HTMLElement): void;
+    }).applyAdaptivePathLayoutScope.bind(view);
+    layout(sharedScope as unknown as HTMLElement);
+    expect(
+      sharedScope.children[0].classList.contains("easy-sync-path-directory"),
+    ).toBe(true);
+
+    head.row.remove();
+    layout(sharedScope as unknown as HTMLElement);
+    // The remaining member is still trimmed against the same prefix, so exactly
+    // one directory must remain above it instead of an orphan + a duplicate.
+    expect(
+      sharedScope.children.filter((child) =>
+        child.classList.contains("easy-sync-path-directory")),
+    ).toHaveLength(1);
+    expect(sharedScope.children[0].textContent).toBe("Projects/Alpha/");
+    expect(member.pathEl.textContent).toBe("two.md");
+
+    const separateScope = new FakeAdaptivePathElement(
+      "easy-sync-file-list easy-sync-path-layout",
+    );
+    const standalone = createFakePathRow("Archive/2026/July/one.md");
+    separateScope.appendChild(standalone.row);
+    layout(separateScope as unknown as HTMLElement);
+    expect(
+      separateScope.children.some((child) =>
+        child.classList.contains("easy-sync-path-directory")),
+    ).toBe(true);
+
+    standalone.row.remove();
+    layout(separateScope as unknown as HTMLElement);
+    expect(
+      separateScope.children.some((child) =>
+        child.classList.contains("easy-sync-path-directory")),
+    ).toBe(false);
+  });
+
+  it("re-plans an unchanged scope without forcing another layout", () => {
+    const scope = new FakeAdaptivePathElement(
+      "easy-sync-file-list easy-sync-path-layout",
+    );
+    const rows = [
+      createFakePathRow("Projects/Alpha/one.md"),
+      createFakePathRow("Projects/Beta/two.md"),
+      createFakePathRow("Projects/Gamma/three.md"),
+    ];
+    for (const row of rows) scope.appendChild(row.row);
+
+    const view = createBareSyncView();
+    const layout = (view as unknown as {
+      applyAdaptivePathLayoutScope(scope: HTMLElement): void;
+    }).applyAdaptivePathLayoutScope.bind(view);
+    layout(scope as unknown as HTMLElement);
+    const measurements = rows.map((row) => row.pathEl.rectCalls);
+    const texts = rows.map((row) => row.pathEl.textContent);
+    const directories = scope.children.filter((child) =>
+      child.classList.contains("easy-sync-path-directory")).length;
+
+    layout(scope as unknown as HTMLElement);
+    expect(rows.map((row) => row.pathEl.rectCalls)).toEqual(measurements);
+    expect(rows.map((row) => row.pathEl.textContent)).toEqual(texts);
+    expect(
+      scope.children.filter((child) =>
+        child.classList.contains("easy-sync-path-directory")),
+    ).toHaveLength(directories);
+  });
+
+  it("shows and hides the completed summary row", () => {
+    const list = new FakeAdaptivePathElement("easy-sync-file-list is-limited");
+    const view = createBareSyncView();
+    Object.assign(view as object, {
+      fileListEl: list,
+      completedOmittedRowEl: null,
+    });
+    const t = (key: string, params?: Record<string, string | number>) =>
+      `${key}:${params?.count}`;
+    const update = (view as unknown as {
+      updateCompletedOmittedRow(
+        omitted: number,
+        translate: typeof t,
+      ): void;
+    }).updateCompletedOmittedRow.bind(view);
+
+    update(5, t);
+    expect(list.children).toHaveLength(1);
+    expect(
+      list.children[0].classList.contains("easy-sync-file-list-omitted"),
+    ).toBe(true);
+    expect(list.children[0].textContent).toBe("syncView.progress.omitted:5");
+
+    update(0, t);
+    expect(list.children).toHaveLength(0);
+  });
+
+  it("does not start path layout from window remounts or unbounded toggles", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const pending = source.slice(
+      source.indexOf("private renderPendingSection("),
+      source.indexOf("private renderPendingRow("),
+    );
+    expect(pending).not.toContain("scheduleAdaptivePathLayout");
+    const plan = source.slice(
+      source.indexOf("private renderPlanGroups("),
+      source.indexOf("private measurePlanRowHeights("),
+    );
+    expect(plan).not.toContain("scheduleAdaptivePathLayout");
+    const toggle = source.slice(
+      source.indexOf("private readonly handlePathLayoutToggle"),
+      source.indexOf("private readonly handlePlanRowToggleIntent"),
+    );
+    expect(toggle).toContain("applyAdaptivePathLayoutWithin(details)");
+    const resize = source.slice(
+      source.indexOf("private readonly handlePathLayoutResize"),
+      source.indexOf("private readonly handlePlanViewportScroll"),
+    );
+    expect(resize).toContain("scheduleAdaptivePathLayoutAfterResize");
+    expect(source).toContain("private scheduleAdaptivePathLayoutAfterResize(");
+  });
+
+  it("patches running progress numbers without rebuilding the view", () => {
+    // 用户可见的症状：8 个并发在飞时计数整批跳（1→8→16），批内不动。修法不
+    // 只是改计数，还要求每文件/每字节的更新走轻量路径——每 tick 整屏 empty()
+    // 重建的话，提高事件频率只会更卡。这条用例直接断言：轻量路径改了顶部
+    // 计数、进度条、当前文件名，并且没有调用整屏重建；状态行也不再多出
+    // 「处理中 N」徽标（2026-10-27 用户拍板回退）。
+    const prototype = EasySyncSyncView.prototype as unknown as {
+      doRender: () => void;
+      renderSyncViewFullRebuild: () => void;
+      patchProgressOnly: () => void;
+      appendNewFileRows: (files: unknown) => void;
+      scheduleAdaptivePathLayout: () => void;
+    };
+    const doRender = vi.spyOn(prototype, "doRender").mockImplementation(() => undefined);
+    const fullRebuild = vi
+      .spyOn(prototype, "renderSyncViewFullRebuild")
+      .mockImplementation(() => undefined);
+    const appendRows = vi
+      .spyOn(prototype, "appendNewFileRows")
+      .mockImplementation(() => undefined);
+    const layout = vi
+      .spyOn(prototype, "scheduleAdaptivePathLayout")
+      .mockImplementation(() => undefined);
+
+    const makeEl = (text = "") => {
+      const el = {
+        textContent: text,
+        dataset: {} as Record<string, string>,
+        style: {} as Record<string, string>,
+        children: [] as unknown[],
+        removed: false,
+        setText(next: string) {
+          this.textContent = next;
+          return this;
+        },
+        addClass() {
+          return this;
+        },
+        removeClass() {
+          return this;
+        },
+        empty() {
+          this.children = [];
+          return this;
+        },
+        createSpan(className = "") {
+          const child = makeEl();
+          (child as unknown as { className: string }).className = className;
+          this.children.push(child);
+          return child;
+        },
+        after(node: unknown) {
+          this.children.push(node);
+          return this;
+        },
+        remove() {
+          this.removed = true;
+          return this;
+        },
+      };
+      return el;
+    };
+
+    const statusLine = makeEl();
+    const statusText = makeEl("检查云端变更…");
+    const counter = makeEl();
+    const statusDetail = makeEl();
+    const progressFill = makeEl();
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    const completed = [
+      { path: "a.md", status: "upload", actionType: SyncActionType.Upload },
+    ];
+    Object.assign(view as object, {
+      closed: false,
+      lastContentKey: "progress:key",
+      renderedBodyMode: "progress",
+      contentEl: { querySelector: () => null } as unknown as HTMLElement,
+      statusLineEl: statusLine,
+      statusTextEl: statusText,
+      statusCounterEl: counter,
+      statusDetailEl: statusDetail,
+      statusDetailMode: "current-file",
+      currentFileTextEl: makeEl(),
+      progressPanelEl: makeEl(),
+      progressFillEl: progressFill,
+      fileListEl: makeEl(),
+      completedFileRowsLedger: new Map(),
+      progressSubtitleEl: makeEl(),
+      plugin: {
+        i18n: new I18n("zh-cn"),
+        // 8 concurrent items, 3 of 24 settled, one file mid-transfer.
+        progressStore: {
+          state: {
+            phase: "executing",
+            current: 3,
+            total: 24,
+            currentFile: "Notes/b.md",
+            currentItemBytes: 0,
+            currentItemTotalBytes: 0,
+            currentItemComplete: false,
+            cancelRequested: false,
+            completedFiles: completed,
+            completedCount: 1,
+            startedAt: 1,
+          },
+        },
+        syncExecutor: {
+          isRunning: true,
+          hasSideActionsInFlight: false,
+        },
+        syncDirection: "two-way",
+        getMutationRecoveryDisplayState: () => null,
+      },
+    });
+
+    try {
+      (view as unknown as { patchProgressOnly: () => void }).patchProgressOnly();
+
+      expect(doRender).not.toHaveBeenCalled();
+      expect(fullRebuild).not.toHaveBeenCalled();
+      // 顶部计数＝已结算/总量，就在原元素上改写（没有重建节点）。
+      expect(counter.textContent).toBe("3/24项");
+      expect(progressFill.style.width).toBe("13%");
+      expect(
+        (statusDetail as unknown as { children: Array<{ textContent: string }> })
+          .children,
+      ).toHaveLength(0);
+      // 当前文件名落在既有槽位里；状态行没有追加任何第二个数字节点。
+      const currentFile = (view as unknown as {
+        currentFileTextEl: { textContent: string };
+      }).currentFileTextEl;
+      expect(currentFile.textContent).toBe("Notes/b.md");
+      // 状态短语在轻量路径里同步刷新：执行期按 S4 边界落通用「正在同步」，
+      // 不再带着上一阶段的「检查云端变更…」跑完整轮（2026-10-27 真机）。
+      expect(statusText.textContent).toBe(
+        new I18n("zh-cn").t("syncView.progress"),
+      );
+      expect((statusLine as unknown as { children: unknown[] }).children)
+        .toHaveLength(0);
+      expect(appendRows).toHaveBeenCalledWith(completed);
+      // 完成行补进来时要量一次路径；但整屏布局重排不在这个路径里。
+      expect(layout).toHaveBeenCalledTimes(0);
+    } finally {
+      doRender.mockRestore();
+      fullRebuild.mockRestore();
+      appendRows.mockRestore();
+      layout.mockRestore();
+    }
+  });
+
+  it("falls back to the full render when the round is no longer running", () => {
+    const prototype = EasySyncSyncView.prototype as unknown as {
+      doRender: () => void;
+      patchProgressOnly: () => void;
+    };
+    const doRender = vi.spyOn(prototype, "doRender").mockImplementation(() => undefined);
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      closed: false,
+      lastContentKey: "progress:key",
+      renderedBodyMode: "progress",
+      progressPanelEl: { } as unknown as HTMLElement,
+      contentEl: { querySelector: () => null } as unknown as HTMLElement,
+      plugin: {
+        i18n: new I18n("zh-cn"),
+        progressStore: {
+          state: {
+            phase: "done",
+            current: 24,
+            total: 24,
+            currentFile: "",
+            currentItemBytes: 0,
+            currentItemTotalBytes: 0,
+            currentItemComplete: false,
+            cancelRequested: false,
+            completedFiles: [],
+            completedCount: 24,
+            startedAt: 0,
+          },
+        },
+        syncExecutor: { isRunning: false, hasSideActionsInFlight: false },
+        syncDirection: "two-way",
+        getMutationRecoveryDisplayState: () => null,
+      },
+    });
+    try {
+      (view as unknown as { patchProgressOnly: () => void }).patchProgressOnly();
+      // 轮次结束＝结构态（体态、结果行、状态行都要换）：必须回整屏渲染，
+      // 轻量路径不能把「跑完了」吞成几个数字。
+      expect(doRender).toHaveBeenCalledTimes(1);
+    } finally {
+      doRender.mockRestore();
+    }
+  });
+
+  it("rebuilds the running body when its progress panel was never mounted", () => {
+    // 2026-10-28 真机：同步中按钮下方偶发整块空白，切一次「历史记录」才出现
+    // 当轮文件列表，关掉历史后仍保留。整屏重建曾落在轮次尚无条目的一瞬
+    // （executing 相位清零到首个 setProgress 之间），进度面板有意不建空面板；
+    // 随后条目落地只走轻量 tick，只信 renderedBodyMode 会把这个结构缺口当成
+    // 已挂载，文件列表永远补不回来。轻量路径必须核对真实 DOM。
+    const prototype = EasySyncSyncView.prototype as unknown as {
+      doRender: () => void;
+      patchProgressOnly: () => void;
+    };
+    const doRender = vi.spyOn(prototype, "doRender").mockImplementation(() => undefined);
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    Object.assign(view as object, {
+      closed: false,
+      lastContentKey: "progress:key",
+      renderedBodyMode: "progress",
+      // 上一帧整屏重建时 total=0：面板没有挂上，引用保持 null。
+      progressPanelEl: null,
+      contentEl: { querySelector: () => null } as unknown as HTMLElement,
+      plugin: {
+        i18n: new I18n("zh-cn"),
+        progressStore: {
+          state: {
+            phase: "executing",
+            current: 0,
+            total: 12,
+            currentFile: "",
+            currentItemBytes: 0,
+            currentItemTotalBytes: 0,
+            currentItemComplete: false,
+            cancelRequested: false,
+            completedFiles: [],
+            completedCount: 0,
+            startedAt: 1,
+          },
+        },
+        syncExecutor: { isRunning: true, hasSideActionsInFlight: false },
+        syncDirection: "two-way",
+        getMutationRecoveryDisplayState: () => null,
+      },
+    });
+    try {
+      (view as unknown as { patchProgressOnly: () => void }).patchProgressOnly();
+      expect(doRender).toHaveBeenCalledTimes(1);
+    } finally {
+      doRender.mockRestore();
+    }
+  });
+
+  it("logs a failed render frame instead of dying silently with a frozen panel", async () => {
+    // 2026-10-28 真机（焦应行的笔记本）：渲染抛错此前静默死于 rAF 回调——
+    // DOM 定格在上一次成功的画面、fullRenderPending 已清、后续每次渲染按
+    // 同一输入原样重抛，「需要处理」行在账本自愈后仍冻结约 40 分钟直到
+    // 重启，触发源因无堆栈而无法指认。抛错必须落诊断日志（error 级别不受
+    // 类别开关约束），帧句柄必须已清（下一轮状态变化自带重试语义）。
+    const prototype = EasySyncSyncView.prototype as unknown as {
+      doRender: () => void;
+    };
+    const doRender = vi.spyOn(prototype, "doRender").mockImplementation(() => {
+      throw new Error("render exploded");
+    });
+    const view = Object.create(EasySyncSyncView.prototype) as EasySyncSyncView;
+    const diagError = vi.fn();
+    Object.assign(view as object, {
+      closed: false,
+      fullRenderPending: false,
+      renderFrameId: null,
+      plugin: {
+        diag: { error: diagError },
+        i18n: new I18n("zh-cn"),
+        progressStore: {
+          state: {
+            phase: "done",
+            current: 0,
+            total: 0,
+            currentFile: "",
+            currentItemBytes: 0,
+            currentItemTotalBytes: 0,
+            currentItemComplete: false,
+            cancelRequested: false,
+            completedFiles: [],
+            completedCount: 0,
+            startedAt: 0,
+          },
+        },
+        syncExecutor: { isRunning: false, hasSideActionsInFlight: false },
+        getMutationRecoveryDisplayState: () => null,
+      },
+    });
+    try {
+      (view as unknown as { render: () => void }).render();
+      // 帧回调在 rAF／超时垫片上异步执行，等它落地。
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(diagError).toHaveBeenCalledTimes(1);
+      expect(String(diagError.mock.calls[0]?.[1])).toContain("render failed");
+      expect(diagError.mock.calls[0]?.[2]).toContain("render exploded");
+      // 帧句柄已清：后续渲染请求可以继续调度。
+      expect((view as unknown as { renderFrameId: unknown }).renderFrameId)
+        .toBeNull();
+    } finally {
+      doRender.mockRestore();
+    }
   });
 
   it("scrolls the limited file list instead of squeezing gray directory lines flat", () => {
@@ -1795,8 +2775,7 @@ describe("buildSyncViewContentKey", () => {
     expect(rule?.[0]).toContain("flex-shrink: 0");
   });
 
-  it("applies the adaptive path layout in the same task that updated the rows (no two-frame flicker)", () => {
-    const prototype = EasySyncSyncView.prototype as unknown as {
+  it("applies the adaptive path layout in the same task that updated the rows (no two-frame flicker)", () => {    const prototype = EasySyncSyncView.prototype as unknown as {
       applyAdaptivePathLayout: () => void;
     };
     const applySpy = vi.spyOn(prototype, "applyAdaptivePathLayout");
@@ -1856,15 +2835,22 @@ describe("buildSyncViewContentKey", () => {
       source.indexOf("this.lastContentKey = contentKey;"),
     );
     // The cross-mode mount sits before the body dispatch and mirrors the
-    // progress body's bar element-for-element.
-    expect(dispatch).toContain("const progressPanelShown = bodyMode === \"progress\"");
+    // progress body's bar element-for-element. One predicate now decides both
+    // the panel mount and the bare-bar suppression (no double bar when a
+    // pending body mounts the progress panel during a running round).
+    expect(dispatch).toContain(
+      "const progressPanelShown = resolveSyncViewProgressPanelVisibility({",
+    );
+    expect(dispatch).toContain("if (!progressPanelShown && isRunning)");
     expect(dispatch.indexOf("progressPanelShown")).toBeLessThan(
       dispatch.indexOf('if (bodyMode === "plan"'),
     );
     expect(dispatch).toContain("easy-sync-progress-bar");
     expect(dispatch).toContain("remoteScopeRecoveryPercent(progress)");
     // The progress body keeps painting its own bar; the patch branch keeps
-    // updating whichever bar the current body mounted.
+    // updating whichever bar the current body mounted (2026-10-26: the width
+    // write is one shared helper so the light progress path and the full patch
+    // branch cannot drift).
     const body = source.slice(
       source.indexOf("private renderProgressPanel"),
       source.indexOf("private renderRemoteScopeRecoveryFailure"),
@@ -1875,7 +2861,8 @@ describe("buildSyncViewContentKey", () => {
       source.indexOf("this.updateStatusPanel(statusState);"),
       source.indexOf("this.lastContentKey = contentKey;"),
     );
-    expect(patch).toContain("progressFillEl");
+    expect(patch).toContain("this.updateProgressBarWidth(progress);");
+    expect(source).toContain("private updateProgressBarWidth(");
   });
 
   it("invalidates the windowed height model when the toolbar expands or collapses everything", () => {
@@ -1943,6 +2930,24 @@ describe("buildSyncViewContentKey", () => {
     );
     expect(rowRenderer).toContain("dataset.easySyncCompletedPath");
     expect(rowRenderer).toContain("return row;");
+    // Per-file append must never re-run a row-by-row full measure: it re-plans
+    // the scope against the cached row states, so unchanged rows do no DOM
+    // reads and only rows whose decision changed receive a write.
+    expect(append).toContain("this.applyAdaptivePathLayoutScope(");
+    expect(source).not.toContain("applyAdaptivePathLayoutToRows");
+    const scopePass = source.slice(
+      source.indexOf("private applyAdaptivePathLayoutScope("),
+      source.indexOf("private applyAdaptivePathDecisions("),
+    );
+    expect(scopePass).toContain("this.adaptivePathRowStates.get(");
+    expect(scopePass).toContain("this.measureAdaptivePathText(");
+    expect(scopePass).not.toContain("pathLeft = pathEl.getBoundingClientRect");
+    const patch = source.slice(
+      source.indexOf("private patchProgressOnly("),
+      source.indexOf("private renderSyncViewFullRebuild("),
+    );
+    expect(patch).toContain("this.appendNewFileRows(progress.completedFiles);");
+    expect(patch).not.toContain("scheduleAdaptivePathLayout");
   });
 
   it("keeps ordinary plan rows chip-free; history action rows and the skip fold both opt into adaptive directories", () => {
@@ -2452,6 +3457,48 @@ describe("buildSyncViewContentKey", () => {
     expect(counts).toBe("冲突 1 · 云端删除待确认 1");
   });
 
+  it("prefers the history entry's direct remote-delete split over retained rows", () => {
+    const i18n = new I18n("zh-cn");
+    const entry = {
+      id: "pending-direct",
+      mode: "manual" as const,
+      status: "partial" as const,
+      startedAt: 1,
+      endedAt: 2,
+      uploaded: 0,
+      downloaded: 0,
+      deleted: 0,
+      conflicts: 2,
+      deferred: 0,
+      skipped: 0,
+      errors: 0,
+      message: "pending",
+      files: [
+        {
+          path: "deleted-remotely.md",
+          status: "conflict" as const,
+          actionType: SyncActionType.ConfirmLocalDelete,
+        },
+        {
+          path: "edited-both-sides.md",
+          status: "conflict" as const,
+          actionType: SyncActionType.Conflict,
+        },
+      ],
+    };
+
+    // Direct 0 wins even though a ConfirmLocalDelete row would infer 1.
+    expect(formatSyncHistoryCounts(
+      { ...entry, remoteDeletePending: 0 },
+      i18n.t.bind(i18n),
+    )).toBe("冲突 2");
+    // Direct split works when the retained rows are gone (100-row cap).
+    expect(formatSyncHistoryCounts(
+      { ...entry, remoteDeletePending: 2, files: [] },
+      i18n.t.bind(i18n),
+    )).toBe("云端删除待确认 2");
+  });
+
   it("keeps plan confirmation in the fixed primary action and plan details lazy", () => {
     const styles = readSourceFile("styles.css");
     const source = readSourceFile("src/ui/sync-view.ts");
@@ -2728,7 +3775,7 @@ describe("buildSyncViewContentKey", () => {
     );
     expect(openMethod.match(/new ConfirmModal\(/g)).toHaveLength(1);
     expect(openMethod).toContain(
-      't("syncView.sharedFolderIdentity.confirmMessage", { path })',
+      "lines: sharedFolderIdentityConfirmLines(snapshot, t)",
     );
     expect(openMethod).toContain("if (!confirmed) return");
     expect(openMethod).toContain(
@@ -3002,6 +4049,24 @@ describe("buildSyncViewContentKey", () => {
     );
     expect(batchSlice.match(/addClass\("mod-loading"\)/g)).toHaveLength(2);
     expect(batchSlice.match(/setDisabled\(true\)/g)?.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("releases the borrowed loading state on every row-action exit", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const start = source.indexOf("private enableActionButtons(");
+    const end = source.indexOf("private async runItemAction(", start);
+    const enable = source.slice(start, end);
+
+    // 批量删除借官方 mod-loading 表示「处理中」，而只有整屏重建才会把它清掉；
+    // 运行中的轮次只走轻量数字补丁，所以网关拒绝一次就会让按钮永久转圈
+    // （iOS 2026-10-27）。行动作唯一的必达出口（runItemAction 的 finally）
+    // 必须把加载态一起交还，终止条件不依赖重挂。
+    expect(start).toBeGreaterThan(-1);
+    expect(enable).toContain('removeClass("mod-loading")');
+    expect(enable).toContain("disabled = false");
+    const runStart = source.indexOf("private async runItemAction(");
+    const runBody = source.slice(runStart, source.indexOf("\n  }\n", runStart));
+    expect(runBody).toContain("this.enableActionButtons(actionsEl)");
   });
 });
 
@@ -3391,6 +4456,199 @@ describe("resolveSyncViewBodyMode", () => {
       pendingCount: 2,
       sideActionResultsVisible: false,
     })).toBe("plan");
+  });
+});
+
+describe("resolveSyncViewProgressPanelVisibility", () => {
+  const cases: Array<{
+    label: string;
+    bodyMode: "plan" | "progress" | "pending" | "recovery" | "idle";
+    sideActionResultsVisible: boolean;
+    isRunning: boolean;
+    progressTotal: number;
+    expected: boolean;
+  }> = [
+    {
+      label: "progress body owns the panel",
+      bodyMode: "progress",
+      sideActionResultsVisible: false,
+      isRunning: true,
+      progressTotal: 7,
+      expected: true,
+    },
+    {
+      label: "pending body with a running round that already has items",
+      bodyMode: "pending",
+      sideActionResultsVisible: false,
+      isRunning: true,
+      progressTotal: 7,
+      expected: true,
+    },
+    {
+      label: "pending body before the running round has any item total",
+      bodyMode: "pending",
+      sideActionResultsVisible: false,
+      isRunning: true,
+      progressTotal: 0,
+      expected: false,
+    },
+    {
+      label: "pending body with a finished round (idle)",
+      bodyMode: "pending",
+      sideActionResultsVisible: false,
+      isRunning: false,
+      progressTotal: 7,
+      expected: false,
+    },
+    {
+      label: "pending body showing a side-action result batch",
+      bodyMode: "pending",
+      sideActionResultsVisible: true,
+      isRunning: false,
+      progressTotal: 0,
+      expected: true,
+    },
+    {
+      label: "plan body while a round runs (bare bar only)",
+      bodyMode: "plan",
+      sideActionResultsVisible: false,
+      isRunning: true,
+      progressTotal: 7,
+      expected: false,
+    },
+    {
+      label: "recovery body while a round runs (bare bar only)",
+      bodyMode: "recovery",
+      sideActionResultsVisible: false,
+      isRunning: true,
+      progressTotal: 7,
+      expected: false,
+    },
+    {
+      label: "idle body",
+      bodyMode: "idle",
+      sideActionResultsVisible: false,
+      isRunning: false,
+      progressTotal: 0,
+      expected: false,
+    },
+  ];
+
+  it.each(cases)("$label ⇒ $expected", ({
+    bodyMode,
+    sideActionResultsVisible,
+    isRunning,
+    progressTotal,
+    expected,
+  }) => {
+    expect(resolveSyncViewProgressPanelVisibility({
+      bodyMode,
+      sideActionResultsVisible,
+      isRunning,
+      progressTotal,
+    })).toBe(expected);
+  });
+
+  it("mounts the shared progress panel above pending rows and never a second bar", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const dispatch = source.slice(
+      source.indexOf("const content = container.createDiv"),
+      source.indexOf("// 更新提示行：待处理区自带"),
+    );
+    // One predicate owns both decisions: mounting the panel and suppressing
+    // the bare bar. Two independent checks could drift into a double bar.
+    expect(dispatch).toContain("resolveSyncViewProgressPanelVisibility({");
+    expect(dispatch).toContain("if (!progressPanelShown && isRunning)");
+    const pendingStart = dispatch.indexOf('} else if (bodyMode === "pending") {');
+    const pendingEnd = dispatch.indexOf('} else if (bodyMode === "recovery"');
+    expect(pendingStart).toBeGreaterThan(-1);
+    expect(pendingEnd).toBeGreaterThan(pendingStart);
+    const pendingBranch = dispatch.slice(pendingStart, pendingEnd);
+    expect(pendingBranch).toContain("if (progressPanelShown) {");
+    expect(pendingBranch).toContain("this.renderProgressPanel(content, progress);");
+    // Completed list first, pending rows after: the action rows keep their
+    // order and stay the last thing in the body.
+    expect(
+      pendingBranch.indexOf("this.renderProgressPanel(content, progress);"),
+    ).toBeLessThan(pendingBranch.indexOf("this.renderPendingSection("));
+  });
+
+  it("keeps the incremental completed-row path in a running pending body", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const patchStart = source.indexOf("this.updateStatusPanel(statusState);");
+    const patchEnd = source.indexOf("this.lastContentKey = contentKey;");
+    expect(patchStart).toBeGreaterThan(-1);
+    expect(patchEnd).toBeGreaterThan(patchStart);
+    const patch = source.slice(patchStart, patchEnd);
+    expect(patch).toContain("if (isRunning) {");
+    expect(patch).toContain("this.appendNewFileRows(progress.completedFiles);");
+    // The append path stays body-mode agnostic: it fills whatever panel the
+    // rebuild mounted and no-ops when there is none, so the pending body uses
+    // the exact same incremental path as the progress body.
+    const appendStart = source.indexOf("private appendNewFileRows");
+    const appendEnd = source.indexOf("private appendCompletedActionRows");
+    expect(appendStart).toBeGreaterThan(-1);
+    expect(appendEnd).toBeGreaterThan(appendStart);
+    const append = source.slice(appendStart, appendEnd);
+    expect(append).not.toContain("bodyMode");
+    expect(append).toContain("!this.progressPanelEl");
+  });
+
+  it("rebuilds the pending body when the round becomes mountable, not per completed file", () => {
+    const base = {
+      isLoggedIn: true,
+      isInitializing: false,
+      isPending: false,
+      isRunning: true,
+      canCancel: true,
+      syncEntryInProgress: false,
+      bodyMode: "pending" as const,
+      progress: {
+        phase: "executing" as const,
+        current: 0,
+        total: 0,
+        currentFile: "",
+        completedFiles: [],
+        completedCount: 0,
+        currentItemBytes: 0,
+        currentItemTotalBytes: 0,
+        cancelRequested: false,
+        startedAt: 1,
+      },
+      planReviewActive: false,
+      planReviewDetailsState: "ready" as const,
+      pendingIssues: [],
+      conflicts: [],
+      pendingDeletes: [],
+      planReviewCounts: null,
+      planReviewRevision: 0,
+      history: [],
+      lastSyncTime: 0,
+      mutationRecovery: null,
+    };
+    const before = buildSyncViewContentKey(false, base);
+    const mountable = {
+      ...base,
+      progress: { ...base.progress, total: 7 },
+    };
+    // The list is mount-only content: without this bit the panel could never
+    // appear when the round's first item total lands mid-render.
+    expect(buildSyncViewContentKey(false, mountable)).not.toBe(before);
+    // Per-file changes stay out of the pending fingerprint: the panel is up,
+    // so the incremental append owns them (no full rebuild per completed file).
+    expect(buildSyncViewContentKey(false, {
+      ...mountable,
+      progress: {
+        ...mountable.progress,
+        current: 1,
+        completedFiles: [{
+          path: "a.md",
+          status: "upload" as const,
+          actionType: SyncActionType.Upload,
+        }],
+        completedCount: 1,
+      },
+    })).toBe(buildSyncViewContentKey(false, mountable));
   });
 });
 

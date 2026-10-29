@@ -201,6 +201,56 @@ describe("StateManager V2 production controller", () => {
     }
   });
 
+  it("verifies each recovery record once, while it is still staged", async () => {
+    const harness = makeHarness({ indexedDbActive: true });
+    const state = new StateManager(harness.plugin);
+    let databaseId = "";
+    try {
+      await state.load();
+      databaseId = JSON.parse(
+        harness.files.get(paths.stateV2AuthorityWitnessFile)!,
+      ).storageAuthority.databaseId;
+      const { intent, receipt } = uploadMutation();
+      await state.beginMutationIntent(intent);
+      await state.recordMutationReceipt(receipt);
+      harness.rawAdapter.read.mockClear();
+      harness.rawAdapter.write.mockClear();
+      harness.rawAdapter.rename.mockClear();
+
+      await state.commitMutationCheckpoint(intent.operationId);
+
+      // One commit publishes two immutable records (the delta and its commit
+      // witness). Each is written once and read back once while staged — the
+      // committed path is the pre-rename target, so it is never re-read to
+      // prove bytes that the staged read-back already proved.
+      const recoveryDir = paths.stateV2IndexedDbRecoveryDir;
+      const recoveryReads = harness.rawAdapter.read.mock.calls
+        .map((call) => String(call[0]))
+        .filter((path) => path.startsWith(recoveryDir));
+      const stagedReads = recoveryReads.filter((path) =>
+        path.endsWith(".json.next"));
+      const committedReads = recoveryReads.filter((path) =>
+        !path.endsWith(".json.next"));
+      expect(new Set(stagedReads).size).toBe(2);
+      const recoveryWrites = harness.rawAdapter.write.mock.calls
+        .map((call) => String(call[0]))
+        .filter((path) => path.startsWith(recoveryDir));
+      expect(recoveryWrites).toHaveLength(2);
+      expect(harness.rawAdapter.rename).toHaveBeenCalledTimes(2);
+      // The only remaining read of a committed record is the witness binding
+      // proof: the commit witness must bind the exact delta it confirms.
+      expect(committedReads).toHaveLength(1);
+      expect(committedReads[0]).toContain("/commit-");
+      expect(state.mutationLedger).toEqual([]);
+      expect(state.getCommittedV2Envelope()?.meta.commitSeq).toBe(4);
+    } finally {
+      await state.close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
   it("selects IndexedDB and recovers it on a host without native structuredClone", async () => {
     vi.stubGlobal("structuredClone", undefined);
     await import("../src/structured-clone-compat");

@@ -635,6 +635,67 @@ describe("V2 folder-create reducer", () => {
     expect(() => reduceFolderStateEnvelopeV2(current, record))
       .toThrow("still has committed descendants");
   });
+
+  // 归约层与执行层共用同一份「已提交子树」扫描：没有锚点的已提交子节点
+  // 同样必须挡住文件夹退休（执行层的前置闸必须与这里的判定同源，否则会先发
+  // 远端 DELETE、再在检查点阶段结构性失败）。
+  it("rejects folder retirement while the committed index lists a child without an anchor", () => {
+    const current = envelope([
+      {
+        id: "notes",
+        name: "Notes",
+        folder: {},
+        parentReference: { id: scope.filesRootId },
+        eTag: "etag-notes",
+      },
+      {
+        id: "file",
+        name: "a.md",
+        file: { hashes: { sha256Hash: "a".repeat(64) } },
+        size: 10,
+        parentReference: { id: "notes" },
+        eTag: "etag-file",
+        cTag: "ctag-file",
+      },
+    ]);
+    current.folderAnchors!.byAnchorId = {
+      "folder:notes": {
+        anchorId: "folder:notes",
+        remoteId: "notes",
+        lastPath: "Notes",
+        parentRemoteId: scope.filesRootId,
+        remoteETag: "etag-notes",
+        confirmedGeneration: 3,
+        confirmedAt: 1,
+      },
+    };
+    const deleteIntent: FolderMutationIntentV2 = {
+      ...intent("deleteLocalFolder", "Notes"),
+      folderId: "notes",
+      expectedLocal: { exists: false },
+      expectedRemote: { exists: false },
+    };
+    const record: MutationLedgerEntryV1 = {
+      intent: deleteIntent,
+      receipt: {
+        version: 1,
+        operationId: deleteIntent.operationId,
+        completedAt: 20,
+        checkpoint: {
+          baseUpserts: [],
+          baseRemovals: [],
+          remoteUpserts: [],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+          folderDeletes: [{ path: "Notes", driveId: "notes" }],
+        },
+      },
+    };
+
+    expect(() => reduceFolderStateEnvelopeV2(current, record))
+      .toThrow("still has remote children");
+  });
 });
 
 const hashA = "a".repeat(64);

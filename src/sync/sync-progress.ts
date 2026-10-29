@@ -10,7 +10,7 @@
  * render loop reads each time it fires.
  */
 
-import { SyncActionType } from "./types";
+import { SyncActionType, type SyncFileErrorFactV1 } from "./types";
 import {
   resolveSyncActionPresentation,
   type SyncActionProgressStatus,
@@ -40,6 +40,10 @@ export interface FileProgress {
   /** Wall-clock moment the action failed, for error entries only; absent on
    *  success rows and on history entries persisted before this field. */
   failedAt?: number;
+  /** Evidence-only failure facts (A3, 2026-10-26). Absent on success rows and
+   *  on history entries written before the field existed; never read by any
+   *  decision (see `SyncFileErrorFactV1`). */
+  error?: SyncFileErrorFactV1;
 }
 
 type RemoteScopeRecoveryFailureStage =
@@ -73,7 +77,10 @@ export interface SyncProgressState {
   /** Which user-visible workflow owns the current progress/result snapshot. */
   activityKind?: "fullSync" | "sideAction" | "mutationRecovery";
   phase: SyncPhase;
-  /** Current item index (1-based during execution, 0 for phase-only steps) */
+  /** Settled item count while executing (an item counts once it finishes,
+   *  whatever its outcome — the pool keeps several in flight at once, so
+   *  counting starts made the number jump in whole batches); 0 for phase-only
+   *  steps. */
   current: number;
   /** Total items in the current phase */
   total: number;
@@ -114,14 +121,15 @@ export function isAnySyncActivityRunning(
 
 /**
  * Whole-run progress with the current file's byte fraction folded in.
- * `current` identifies the item being processed, so completed items are
- * `current - 1` until the item settles.
+ * `current` counts settled items (a settled item is done regardless of its
+ * outcome), so the completed share is `current` itself; the item still in
+ * flight contributes only its byte fraction.
  */
 export function syncProgressPercent(state: Readonly<SyncProgressState>): number {
   if (state.total <= 0) return 0;
-  const completedItems = Math.max(0, state.current - 1);
+  const completedItems = Math.max(0, state.current);
   const currentFraction = state.currentItemComplete
-    ? 1
+    ? 0
     : state.currentItemTotalBytes > 0
       ? Math.min(1, Math.max(0, state.currentItemBytes / state.currentItemTotalBytes))
       : 0;
@@ -246,6 +254,30 @@ export class SyncProgressStore {
       file,
     ]);
     this._state.completedCount++;
+  }
+
+  /**
+   * Flip a row that was already reported as done: the file's own work happened,
+   * but the shared batch checkpoint it belongs to did not commit (failed, or
+   * the round was cancelled before it ran), so the shown success does not hold.
+   * The row keeps its place, action type and its one settled-action count; it
+   * gains the failure status and the reason, because a shown success must never
+   * vanish silently. Presentation only — the mutation ledger and the next
+   * round's receipt recovery own the actual settlement.
+   */
+  revertCompletedFile(path: string, reason: string): boolean {
+    const files = this._state.completedFiles;
+    for (let index = files.length - 1; index >= 0; index--) {
+      const file = files[index];
+      if (file.path !== path || !isSuccessfulFileProgress(file)) continue;
+      this._state.completedFiles = [
+        ...files.slice(0, index),
+        { ...file, status: "error", reason, failedAt: Date.now() },
+        ...files.slice(index + 1),
+      ];
+      return true;
+    }
+    return false;
   }
 
   /** Update byte-level progress for the current file */

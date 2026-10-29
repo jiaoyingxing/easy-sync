@@ -13,7 +13,6 @@
  */
 
 import {
-  Platform,
   TFile,
   TFolder,
   requireApiVersion,
@@ -26,9 +25,11 @@ import {
   describeError,
   getConfigDir,
   getEasySyncPaths,
+  hostPlatformFacts,
   isEasySyncSelfSyncFilePath,
   isRecord,
   normalizeVaultPathKey,
+  type HostPlatformFacts,
 } from "../obsidian-compat";
 import { BundleReviewBytesCache } from "./bundle-review-bytes-cache";
 import {
@@ -58,6 +59,7 @@ import {
   planDigest,
   sameCanonicalPlanIdentityV2,
   sameSyncScope,
+  SYNC_FILE_ERROR_TIERS,
   type CanonicalPlanIdentityV2,
 } from "./types";
 import type {
@@ -67,7 +69,7 @@ import type {
 } from "../onedrive/client";
 import { isResponseByteBudgetError } from "../onedrive/client";
 import { isEasySyncInternalPath } from "./local-scanner";
-import type { LocalFileInspection, LocalScanner } from "./local-scanner";
+import type { LocalFileInspection, LocalFileStatInspection, LocalScanner } from "./local-scanner";
 import {
   hasOneDriveInvalidNamePath,
   isObsidianManagedConfigPath,
@@ -75,16 +77,22 @@ import {
   remoteContentMatchesBase,
 } from "./file-decision-planner-v2";
 import {
+  localDeleteDecisionCompositionAuthorized,
+  resolveLocalDeleteReviewDisposition,
+  type LocalDeleteDecisionScopeV1,
+} from "./local-delete-decision";
+import {
   countProgressPlanItems,
   isConfigurationSkipAction,
   MAX_SIZE_EXCLUSION_BASELINE_PATHS,
   normalizeHistorySkipPaths,
 } from "./skip-baseline";
-import { StateManager } from "./state-manager";
+import { MAX_MUTATION_CHECKPOINT_BATCH, StateManager } from "./state-manager";
 import type {
   MutationCheckpointCommitMetrics,
   PendingIssue,
   RemoteEnumCheckpoint,
+  V2CommitBreakdown,
 } from "./state-manager";
 import {
   buildEmptyFolderResolutionSnapshotV1,
@@ -146,7 +154,9 @@ import type {
   CommunityPluginBundleReviewBlockReasonV1,
   CommunityPluginBundleSettlementV2,
   CommunityPluginBundlePresentationV1,
+  SyncFileErrorFactV1,
 } from "./types";
+import type { DeletionLedgerEntryV1 } from "./deletion-ledger";
 import type { DiagnosticLogger } from "./diagnostic-logger";
 import {
   BlockedUploadVersionHistoryProbe,
@@ -227,7 +237,11 @@ import {
   projectRemoteIndexV2,
   type RemoteIndexV2,
 } from "./remote-index-v2";
-import { isFolderMutationIntent } from "./folder-state-reducer-v2";
+import {
+  isFolderMutationIntent,
+  scanFolderDeleteDescendantsV2,
+} from "./folder-state-reducer-v2";
+import { deriveMissingFolderMappingCandidatesV2 } from "./folder-state-v2";
 import {
   buildCanonicalPlanCandidateFromStateV2,
   buildCanonicalPlanCandidateV2,
@@ -256,6 +270,7 @@ import {
   ADAPTIVE_UPLOAD_MAX_BYTES,
   largeUploadConcurrency,
   UploadConcurrencyPolicy,
+  type UploadConcurrencyChange,
 } from "./upload-concurrency-policy";
 import {
   contentDifferenceReceiptMatches,
@@ -416,7 +431,15 @@ export interface SyncResult {
   /** Number of identity-preserving local file moves. */
   filesMoved?: number;
   deleted: number;
+  /** Historical compatibility count: real conflicts **plus** cloud-deleted
+   *  files awaiting local confirmation. Every existing pause/status/message
+   *  judgement still reads this sum, so its meaning must not change. */
   conflicts: number;
+  /** The cloud-deletion part of `conflicts`: files kept because the cloud
+   *  deleted them and the user has not confirmed removing the local copy.
+   *  Incremented in the same branch as `conflicts`, so
+   *  `conflicts = conflictsOnly + remoteDeletePending` always holds. */
+  remoteDeletePending: number;
   /** Files safely left for the next round because their version changed in flight. */
   deferred: number;
   skippedLarge: number;
@@ -507,6 +530,58 @@ export interface SyncResult {
   /** Aggregated GET-only remote-scope proof progress, never file mutations. */
   remoteScopeRecovery?: RemoteScopeRecoveryVerificationSummary;
   metrics?: ExecutionMetrics;
+}
+
+/** Counts printed by the round's `sync run phase summary`. Keeps the
+ *  historical `conflicts` sum for tooling that already reads it, and splits it
+ *  so the table and the JSON in one report can no longer disagree:
+ *  `conflicts === conflictsOnly + remoteDeletePending` by construction. */
+interface SyncRunPhaseSummaryCounts {
+  uploaded: number;
+  downloaded: number;
+  deleted: number;
+  conflicts: number;
+  conflictsOnly: number;
+  remoteDeletePending: number;
+  deferred: number;
+  errors: number;
+  skippedLarge: number;
+  skippedIgnored: number;
+}
+
+/** Project one finished round into the phase-summary counts. Tolerates a
+ *  missing `remoteDeletePending` (legacy/test doubles) by reporting zero, and
+ *  clamps it into `conflicts` so the printed identity can never break. */
+export function projectSyncRunPhaseSummaryCounts(
+  result: Pick<
+    SyncResult,
+    | "uploaded"
+    | "downloaded"
+    | "deleted"
+    | "conflicts"
+    | "deferred"
+    | "errors"
+    | "skippedLarge"
+    | "skippedIgnored"
+  > & { remoteDeletePending?: number },
+): SyncRunPhaseSummaryCounts {
+  const conflicts = Math.max(0, result.conflicts);
+  const remoteDeletePending = Math.min(
+    conflicts,
+    Math.max(0, result.remoteDeletePending ?? 0),
+  );
+  return {
+    uploaded: result.uploaded,
+    downloaded: result.downloaded,
+    deleted: result.deleted,
+    conflicts,
+    conflictsOnly: conflicts - remoteDeletePending,
+    remoteDeletePending,
+    deferred: result.deferred,
+    errors: result.errors,
+    skippedLarge: result.skippedLarge,
+    skippedIgnored: result.skippedIgnored,
+  };
 }
 
 /** Strict UTF-8 decode; null when the bytes are not valid text. */
@@ -821,6 +896,14 @@ type ExactEmptyRemoteFolderInspection =
  *  evidence class: 2.6–5 MB recordings) stream into the .part carrier, where
  *  reconnects resume from the received prefix instead of losing every byte. */
 const MOBILE_STREAM_DOWNLOAD_MIN_BYTES = 2 * 1024 * 1024;
+/** 下载流水线 (2026-10-27): stage 1 may run this many prepared small-download
+ *  batches ahead of stage 3 before it waits for the oldest commit. Two kept
+ *  payloads (the committing batch plus the one in or waiting for its `$batch`
+ *  check) is the extra memory this overlap buys: one batch beyond what the
+ *  pre-pipeline window ever held, and the ceiling the mobile prefetch note
+ *  already prices as "2 × ≤8 MiB in flight". A deeper window would retain a
+ *  third batch without moving the verify-bound critical path. */
+const DOWNLOAD_PIPELINE_IN_FLIGHT_BATCHES = 2;
 /** 片② 留副本换名落位的最大尝试次数（同分钟重名/既有文件同名）。 */
 const LOCAL_ONLY_COPY_MAX_ATTEMPTS = 50;
 const COMMUNITY_PLUGIN_MANIFEST_PREFLIGHT_CONCURRENCY = 3;
@@ -845,10 +928,114 @@ const MIGRATION_PENDING_DIAGNOSTIC_LIMIT = 20;
 /** Bounded re-read attempts for a remote folder create receipt (slow links). */
 const REMOTE_FOLDER_READBACK_ATTEMPTS = 2;
 const REMOTE_FOLDER_READBACK_RETRY_MS = 500;
-/** File-delete cleanup pool batch size: each delete is an independent
- *  identity/eTag-guarded remote round trip, so a bounded batch overlaps the
- *  latency instead of costing one RTT per file serially. */
-const DELETE_CLEANUP_BATCH = Platform.isMobile ? 4 : 8;
+/** Folder-shell delete wave (Step 5): same-depth siblings are independent and
+ *  each is one identity/cTag-guarded round trip. File deletes use
+ *  `deleteCheckpointWave` instead. Platform-scaled: mobile 4 / desktop 8. */
+function deleteCleanupBatch(platform: HostPlatformFacts): number {
+  return platform.isMobileApp ? 4 : 8;
+}
+/** One cleanup wave: up to this many file deletes share a single intent
+ *  write, a single receipt/deletion-ledger write and a single V2 checkpoint.
+ *  Desktop derives the wave from the shared checkpoint batch limit
+ *  (`StateManager.commitMutationCheckpoints`), so a full wave is exactly the
+ *  largest batch that endpoint accepts; mobile keeps its smaller 16.
+ *
+ *  The same slice is also the local-follow remote-absence read's unit
+ *  (`localDeleteAbsenceProof`): one `getFileMetadataByPaths` call per wave
+ *  instead of one metadata GET per file. Desktop 64 = up to four serial
+ *  20-path `$batch` POSTs before the wave's first erase, mobile 16 = one; the
+ *  erase segment, the per-file local re-check and the wave-level checkpoint
+ *  are unchanged. */
+function deleteCheckpointWave(platform: HostPlatformFacts): number {
+  return platform.isMobileApp ? 16 : MAX_MUTATION_CHECKPOINT_BATCH;
+}
+/** One small-upload persistence batch: the whole batch's mutation intents are
+ *  durable before its first PUT, its receipts are written in one device-local
+ *  commit after the uploads, and one shared V2 checkpoint publishes it.
+ *  Desktop 8 / mobile 4 is the crash granularity the user approved for
+ *  uploads: an interrupted batch leaves at most that many intent-only records
+ *  for the next round's observation (SC-15 unchanged — still no upload without
+ *  a durable intent, still no shared baseline before its receipts). Upload
+ *  concurrency inside the batch is unrelated: `UploadConcurrencyPolicy` keeps
+ *  deciding how many PUTs may overlap. */
+function uploadCheckpointBatch(platform: HostPlatformFacts): number {
+  return platform.isMobileApp ? 4 : 8;
+}
+/** Slice length used while waiting out a 429/509 Retry-After pause. The whole
+ *  upload direction must issue no request inside the window, but cancellation
+ *  has to stay responsive, so the wait re-checks the round instead of sleeping
+ *  the full Retry-After in one go. */
+const UPLOAD_PAUSE_POLL_MS = 250;
+/** Network fan-out inside a cleanup wave. Every member is one tiny DELETE, so
+ *  a full desktop wave runs as one concurrent fold instead of 64 serial round
+ *  trips; mobile keeps its smaller 8. */
+function deleteCleanupNetworkConcurrency(platform: HostPlatformFacts): number {
+  return platform.isMobileApp ? 8 : MAX_MUTATION_CHECKPOINT_BATCH;
+}
+/** Fail-closed guard for Step 4: a cleanup wave pre-writes its intents and
+ *  issues its DELETEs before the shared checkpoint commit, and that commit
+ *  asserts `MAX_MUTATION_CHECKPOINT_BATCH`. Rejecting an oversized wave up
+ *  front keeps the failure ahead of any DELETE, never after it. */
+export function assertCleanupWaveWithinCheckpointLimit(
+  waveSize: number,
+): void {
+  if (waveSize > MAX_MUTATION_CHECKPOINT_BATCH) {
+    throw new Error(
+      `Cleanup wave must contain at most ${MAX_MUTATION_CHECKPOINT_BATCH} file deletes (got ${waveSize})`,
+    );
+  }
+}
+/** One confirm-delete wave: pending cloud deletions the user confirmed in one
+ *  batch share a single intent write, a single receipt write, a single
+ *  deletion-ledger write and a single shared checkpoint. Kept at 8 mobile / 16
+ *  desktop — deliberately smaller than the cleanup wave (16 mobile / 64
+ *  desktop): every member erases this device's only copy, so a crash costs a
+ *  full local re-verify through the next round's mutation recovery. */
+function confirmDeleteWave(platform: HostPlatformFacts): number {
+  return platform.isMobileApp ? 8 : 16;
+}
+/** Read-only local re-check fan-out inside one confirm-delete wave
+ *  (`inspectFile` re-hashes the only copy). The erase segment (`trashFile`)
+ *  stays strictly serial — Android holds a lock per local erase. */
+function confirmDeleteLocalCheckConcurrency(
+  platform: HostPlatformFacts,
+): number {
+  return platform.isMobileApp ? 2 : 4;
+}
+/** Poll interval of the in-task wait for a sync round that is already running
+ *  when a confirmed batch delete arrives. A round only holds the executor for
+ *  its own lifetime, so waiting keeps the user's confirmed batch ("runs next")
+ *  instead of letting the queue refuse it ("was dropped"). */
+const CONFIRM_DELETE_ROUND_WAIT_POLL_MS = 100;
+/** Fail-closed guard for a confirm-delete wave, same shape as the cleanup wave:
+ *  the shared checkpoint commit asserts `MAX_MUTATION_CHECKPOINT_BATCH`, a
+ *  duplicate path would make the one intent write reject the whole wave with
+ *  every member already past its local re-check, and a folder row never
+ *  belongs in a file wave (the checkpoint independence assertion refuses
+ *  folder intents). All three must fail before any state write or local erase. */
+export function assertConfirmDeleteWaveWithinCheckpointLimit(
+  wave: readonly Readonly<{ path: string; folder?: unknown }>[],
+): void {
+  if (wave.length > MAX_MUTATION_CHECKPOINT_BATCH) {
+    throw new Error(
+      `Confirm delete wave must contain at most ${MAX_MUTATION_CHECKPOINT_BATCH} file deletes (got ${wave.length})`,
+    );
+  }
+  const paths = new Set<string>();
+  for (const member of wave) {
+    if (member.folder !== undefined && member.folder !== null) {
+      throw new Error(
+        `Confirm delete wave must contain file rows only (got folder row ${member.path})`,
+      );
+    }
+    if (paths.has(member.path)) {
+      throw new Error(
+        `Confirm delete wave contains a duplicate path: ${member.path}`,
+      );
+    }
+    paths.add(member.path);
+  }
+}
 /** Bounded downloads used to prove a same-path replacement's bytes before
  *  retiring the stale anchor; unprovable candidates keep the review row. */
 const PROVABLE_REPLACEMENT_DOWNLOAD_BUDGET = 10;
@@ -970,6 +1157,13 @@ interface FileTransferMetrics {
   cancelled: number;
   skipped: number;
   logicalBytes: number;
+  /** Busy wall clock of this direction: only the time during which at least
+   *  one transfer of the direction was moving (or signalling) bytes. Whole-body
+   *  transports book their call window — their only byte report lands after
+   *  the payload already moved. Concurrent calls overlap, so this is the
+   *  honest denominator for a combined throughput — the sum of their own
+   *  durations would report the link divided by the pool depth. */
+  busyMs: number;
   activeConcurrency: number;
   peakConcurrency: number;
   stagesMs: {
@@ -990,18 +1184,6 @@ interface InFlightTransfer {
   direction: "upload" | "download";
   bytesSoFar: number;
   startedAt: number;
-  callStart: number;
-}
-
-/** One settled transport call's real movement (direction 2, 2026-09-17):
- *  the connection-speed sampler folds each call at its own bytes/wall, so
- *  overlapping calls no longer divide the aggregate and sub-second calls no
- *  longer crawl behind the smoothing prior. */
-interface TransferCallSample {
-  direction: "upload" | "download";
-  bytes: number;
-  ms: number;
-  at: number;
 }
 
 type AutomaticMergeManualReason =
@@ -1055,7 +1237,6 @@ export interface AutomaticHandlingMetrics {
 interface ExecutionMetrics {
   uploadBytes: number;
   uploadReadMs: number;
-  uploadNetworkMs: number;
   activeUploads: number;
   peakUploads: number;
   fileTransfers: {
@@ -1105,6 +1286,7 @@ function createFileTransferMetrics(): FileTransferMetrics {
     cancelled: 0,
     skipped: 0,
     logicalBytes: 0,
+    busyMs: 0,
     activeConcurrency: 0,
     peakConcurrency: 0,
     stagesMs: {
@@ -1156,6 +1338,96 @@ interface DeferredMutationCompletion {
   reason?: string;
   fileSize?: number;
   renameFrom?: string;
+}
+
+interface PlanItemMutationReceiptArgs {
+  item: SyncPlanItem;
+  itemResult: ItemExecutionResult;
+  itemRemoteUpserts: RemoteFileEntry[];
+  itemRemoteDeletes: string[];
+  mutationIntent: MutationIntent;
+  automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
+  metrics: ExecutionMetrics;
+  isFolderMove: (candidate: SyncPlanItem) => boolean;
+  isFolderDelete: (candidate: SyncPlanItem) => boolean;
+}
+
+/** One persisted batch's shared bookkeeping (cleanup wave, upload batch):
+ *  every member's mutation intent is already durable (pre-written by the
+ *  batch), receipts are collected instead of written per file, and the batch
+ *  commits one checkpoint for all of them. `intent === null` keeps that member
+ *  on the ordinary per-file path. */
+interface CleanupWaveHandoff {
+  intent: MutationIntent | null;
+  receipts: MutationReceiptV1[];
+}
+
+/** One small upload's transfer evidence, filled by `executeUploadItem` and
+ *  read by the adaptive upload pool right after the item settles.
+ *
+ *  The pool owns the record and stamps the depth the file was served at; the
+ *  transfer path only writes what it alone knows (how long the PUT itself
+ *  took, and whether the failure was a rate limit). Only the pool passes one:
+ *  every other upload path (large files, manual single-item runs) leaves it
+ *  undefined and pays nothing. */
+interface UploadTransferObservation {
+  bytes: number;
+  /** `contentTransfer` duration of the settled PUT, in ms. */
+  transferMs: number;
+  /** `none` = the item settled without a PUT (preflight, conflict, cancel):
+   *  no throughput sample and no failure streak entry. */
+  outcome: "none" | "success" | "failure";
+  /** The failure was a 429/509 that survived the request-level retry budget. */
+  throttled: boolean;
+  /** Retry-After of that rate limit; `null` when the response carried none. */
+  retryAfterSeconds: number | null;
+}
+
+/** One cleanup wave's per-DELETE duration distribution (rounded ms). Nearest
+ *  rank on the sorted samples, so p95 >= p50 by construction. Observability
+ *  only: nothing branches on these numbers. */
+interface LatencySummaryMs {
+  count: number;
+  p50: number;
+  p95: number;
+  max: number;
+}
+
+function summarizeLatencyMs(samples: readonly number[]): LatencySummaryMs {
+  if (samples.length === 0) return { count: 0, p50: 0, p95: 0, max: 0 };
+  const sorted = [...samples].sort((a, b) => a - b);
+  const at = (percentile: number): number => {
+    const rank = Math.ceil((percentile / 100) * sorted.length);
+    return sorted[Math.min(sorted.length, Math.max(1, rank)) - 1];
+  };
+  return {
+    count: sorted.length,
+    p50: Math.max(0, Math.round(at(50))),
+    p95: Math.max(0, Math.round(at(95))),
+    max: Math.max(0, Math.round(sorted[sorted.length - 1])),
+  };
+}
+
+/** Run `worker` over `items` with at most `limit` in flight and return the
+ *  results in input order. Used by the cleanup wave so a wave's DELETEs
+ *  overlap their round trips without opening one promise per file. */
+async function mapWithBoundedConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const run = async (): Promise<void> => {
+    for (;;) {
+      const index = nextIndex++;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  };
+  const workers = Math.max(1, Math.min(limit, items.length));
+  await Promise.all(Array.from({ length: workers }, () => run()));
+  return results;
 }
 
 function createAutomaticHandlingMetrics(
@@ -1212,7 +1484,19 @@ export interface SyncCallbacks {
     reason?: string,
     fileSize?: number,
     sourcePath?: string,
+    /** A3 (2026-10-26): evidence-only failure facts, present on failure rows
+     *  only. Callers may persist them into `FileProgress.error`; they never
+     *  feed a decision and never replace `reason`. */
+    error?: SyncFileErrorFactV1,
   ) => void;
+  /** A completion reported by `onFileComplete` turned out not to be durable:
+   *  the file's own transport work succeeded (the row was already shown as
+   *  done) but the shared batch checkpoint it belongs to failed or was
+   *  skipped by cancellation. The row must flip to failed with `reason` —
+   *  a shown success never disappears silently. Display only: nothing here
+   *  re-decides the mutation, the receipts and the next round's mutation
+   *  recovery own the actual settlement. */
+  onFileReverted?: (path: string, reason: string) => void;
   onStateChange?: () => void;
   onConfirmThreshold?: (plan: SyncPlan) => Promise<boolean>;
   onFirstSyncPreview?: (plan: SyncPlan) => Promise<boolean>;
@@ -1260,6 +1544,14 @@ function availableSharedSyncProtocolRepairTransportV2(
     : null;
 }
 
+/** Per-chunk observer accepted by the batch metadata client (see
+ *  `OneDriveClient.getDriveItemMetadataByIds`). The download URL refresh
+ *  lookahead uses it to start a chunk's downloads before the later chunks have
+ *  been read; every site that passes no observer keeps the old contract. */
+type BatchMetadataChunkObserver = (
+  resolved: ReadonlyMap<string, DriveItem | null>,
+) => void;
+
 /** Capability probe shared by every batched metadata refresh site: returns a
  *  client-bound refresh function, or null when the OneDrive client lacks the
  *  Graph $batch metadata API (older build / mock). Callers keep their own
@@ -1270,11 +1562,13 @@ export function resolveBatchMetadataClient(
 ): ((
   driveItemIds: readonly string[],
   metadataReason?: OneDriveMetadataReason,
+  options?: { onChunkResolved?: BatchMetadataChunkObserver },
 ) => Promise<Map<string, DriveItem | null>>) | null {
   const candidate = onedrive as OneDriveClient & {
     getDriveItemMetadataByIds?: (
       driveItemIds: readonly string[],
       metadataReason?: OneDriveMetadataReason,
+      options?: { onChunkResolved?: BatchMetadataChunkObserver },
     ) => Promise<Map<string, DriveItem | null>>;
   } | null | undefined;
   return candidate != null
@@ -1897,6 +2191,29 @@ type RejectRemoteDeleteFolderOutcome =
   | { handled: true; value: boolean | undefined }
   | { handled: false };
 
+/** Committed facts a recycle-bin restore can be checked against without
+ *  downloading the restored bytes. Built only when every fact is present. */
+type RestoreFastPathPlan = {
+  remoteId: string;
+  remoteCTag: string;
+  anchorHash: string;
+  anchorSize: number;
+  anchorETag: string | undefined;
+  expectedParentId: string;
+  expectedName: string;
+};
+
+type RestoreFastPathOutcome =
+  /** Proof succeeded: no upload, commit this checkpoint. */
+  | { kind: "restored"; checkpoint: MutationCheckpointV1 }
+  /** Continue with the ordinary upload; `restored` targets the restored item. */
+  | { kind: "upload"; restored?: { driveItemId: string; eTag: string } }
+  /** Restore provably did not land: abandon the intent, keep the row. */
+  | { kind: "abandon" }
+  /** Restore may have landed but could not be verified: keep the intent for
+   *  mutation recovery instead of uploading (a duplicate is worse). */
+  | { kind: "unresolved"; error: Error };
+
 export class SyncExecutor {
   private running = false;
   private sideActionRunning = false;
@@ -1908,6 +2225,32 @@ export class SyncExecutor {
   private cancelController: AbortController | null = null;
   private startGeneration = 0;
   private mutationSequence = 0;
+  /** Cleanup-wave collector for cloud deletion ledger entries: while set, a
+   *  delete hands its recovery clue to the wave instead of paying one whole
+   *  `data.json` write per file. Always cleared in a `finally` around the wave
+   *  so a failed wave cannot leak the buffer into the next one. */
+  private deletionLedgerSink: DeletionLedgerEntryV1[] | null = null;
+  /** Cleanup-wave collector for pure DELETE round-trip times: while set, each
+   *  remote file delete appends its request duration here so the wave log can
+   *  separate the network request from the item's local preparation. Absent
+   *  (null) on every other path, so no request pays a timer there; cleared in
+   *  the same `finally` that clears `deletionLedgerSink`. */
+  private deleteRequestTimingSink: number[] | null = null;
+  /** Wave-scoped remote-absence proof for the cleanup wave's `DeleteLocal`
+   *  members: while set, a local-follow delete whose path the wave proved
+   *  absent (an explicit 404 from the batched read) skips its own metadata GET
+   *  — one `$batch` read per wave instead of one round trip per file (the
+   *  186 ms/file field cost on iOS, 2026-10-27). Only paths this read proved
+   *  absent are in the set: a failed read, an omitted path or any other status
+   *  leaves the member on its ordinary per-file check, so batching never
+   *  loosens the pre-erase proof. Cleared in the same `finally` that clears
+   *  `deletionLedgerSink`, so it can never leak into the next wave. */
+  private localDeleteAbsenceProof: ReadonlySet<string> | null = null;
+  /** Decision record token for every path the sealer converted in this round.
+   *  Set immediately before execution and cleared in its `finally`; only a
+   *  settled delete checkpoint may consume those paths. */
+  private activeLocalDeleteDecisionEntries: ReadonlyMap<string, string> | null =
+    null;
   private activeSyncScope: SyncScope | null = null;
   private remoteRecoveryPreviewRequired = false;
   private localVersionRecoveredDuringLedger = false;
@@ -2023,7 +2366,15 @@ export class SyncExecutor {
     private onProgressUpdate?: () => void,
     private lifecycle: OperationLifecycle = new OperationLifecycle(),
     private noticeCenter: EasySyncNoticeCenter = new EasySyncNoticeCenter(),
-    private onTransferCallSample?: (sample: TransferCallSample) => void,
+    /** Host platform facts; tests inject a fake, production keeps the live
+     *  `Platform`-backed default. Every wave/concurrency/checkpoint constant
+     *  below is derived from this per-instance value. */
+    private platform: HostPlatformFacts = hostPlatformFacts,
+    /** Notifies the host that this path is being erased by the plugin itself.
+     *  The vault's delete event is already represented in the committed state,
+     *  so the host must not treat it as a new local change and arm a follow-up
+     *  automatic round (2026-10-28 mixed batch field report). */
+    private onSelfLocalDelete?: (path: string) => void,
   ) {}
 
   /** Live accumulator of the run in flight; the connection-speed sampler
@@ -2039,41 +2390,98 @@ export class SyncExecutor {
   /** Cumulative per-direction byte/time totals of the run in flight,
    *  composed with the byte-level overlay of transfers still in flight so
    *  the sampler's Δbytes/Δms is true throughput while a single file is
-   *  still transferring. The ms term only accrues while content actually
-   *  transfers, so planning, queueing and verification time fold into
-   *  neither term. */
+   *  still transferring. `ms` is the direction's **busy wall clock**
+   *  (`busyMs`): it advances only while at least one transfer of that
+   *  direction is moving bytes — never the sum of the concurrent calls'
+   *  durations, which would divide the reading by the pool depth. Idle gaps,
+   *  planning, queueing and verification time fold into neither term. */
   getActiveTransferMetrics(now: number = Date.now()): TransferRateTickSnapshot | null {
     const metrics = this.activeRunMetrics;
     if (!metrics) return null;
     let uploadInFlightBytes = 0;
-    let uploadInFlightMs = 0;
     let downloadInFlightBytes = 0;
-    let downloadInFlightMs = 0;
     for (const transfer of this.inFlightTransfers) {
-      const ms = transfer.startedAt > 0
-        ? Math.max(0, now - transfer.startedAt)
-        : 0;
+      if (transfer.startedAt === 0) continue;
       if (transfer.direction === "upload") {
         uploadInFlightBytes += transfer.bytesSoFar;
-        uploadInFlightMs += ms;
       } else {
         downloadInFlightBytes += transfer.bytesSoFar;
-        downloadInFlightMs += ms;
       }
     }
     return {
       upload: {
         bytes: metrics.fileTransfers.upload.logicalBytes + uploadInFlightBytes,
-        ms: metrics.fileTransfers.upload.stagesMs.contentTransfer
-          + uploadInFlightMs,
+        ms: this.busyWallClockMs("upload", metrics, now),
       },
       download: {
         bytes: metrics.fileTransfers.download.logicalBytes + downloadInFlightBytes,
-        ms: metrics.fileTransfers.download.stagesMs.contentTransfer
-          + downloadInFlightMs,
+        ms: this.busyWallClockMs("download", metrics, now),
       },
     };
   }
+
+  /** One direction's busy wall clock: settled busy spans plus the span still
+   *  open, if a transfer is moving bytes right now. */
+  private busyWallClockMs(
+    direction: "upload" | "download",
+    metrics: ExecutionMetrics,
+    now: number,
+  ): number {
+    const settledMs = metrics.fileTransfers[direction].busyMs;
+    const openSince = this.transferBusySince[direction];
+    return openSince > 0
+      ? settledMs + Math.max(0, now - openSince)
+      : settledMs;
+  }
+
+  /** A transfer signalled transfer start — any progress callback of the call,
+   *  including a pre-dispatch (0, size): the first one opens the busy span,
+   *  later ones only raise the in-flight depth. Whole-body transports report
+   *  their bytes only after the call settles, so waiting for downloaded>0
+   *  here would open the span after the payload already moved. */
+  private beginTransferBusy(
+    direction: "upload" | "download",
+    metrics: ExecutionMetrics | null,
+  ): void {
+    if (!metrics) return;
+    if (this.transferInFlightByDirection[direction]++ === 0) {
+      this.transferBusySince[direction] = Date.now();
+    }
+  }
+
+  /** A byte-moving transfer settled: the last one closes the busy span and
+   *  books its wall time into that direction's ledger. Concurrent spans
+   *  overlap, so the ledger holds wall clock — not the sum of the calls. */
+  private endTransferBusy(
+    direction: "upload" | "download",
+    metrics: ExecutionMetrics | null,
+  ): void {
+    if (!metrics) return;
+    const depth = this.transferInFlightByDirection[direction];
+    if (depth <= 0) return;
+    if (depth > 1) {
+      this.transferInFlightByDirection[direction] = depth - 1;
+      return;
+    }
+    this.transferInFlightByDirection[direction] = 0;
+    const openSince = this.transferBusySince[direction];
+    this.transferBusySince[direction] = 0;
+    if (openSince > 0) {
+      metrics.fileTransfers[direction].busyMs += Math.max(0, Date.now() - openSince);
+    }
+  }
+
+  /** Byte-moving depth per direction plus the open busy-span start (0 = idle).
+   *  The attribution to a run is the metrics object captured when the transfer
+   *  started, so a transfer outliving its run cannot bill the next one. */
+  private transferInFlightByDirection: Record<"upload" | "download", number> = {
+    upload: 0,
+    download: 0,
+  };
+  private transferBusySince: Record<"upload" | "download", number> = {
+    upload: 0,
+    download: 0,
+  };
 
   /** Byte-level overlay for the connection-speed sampler: wrap a transport
    *  progress callback so bytes moved by the transfer in flight are visible
@@ -2086,33 +2494,45 @@ export class SyncExecutor {
     onProgress: ((downloaded: number, total: number) => void) | undefined,
     transfer: (report: (downloaded: number, total: number) => void) => Promise<T>,
   ): Promise<T> {
+    const runMetrics = this.activeRunMetrics;
     const handle: InFlightTransfer = {
       direction,
       bytesSoFar: 0,
       startedAt: 0,
-      callStart: Date.now(),
     };
     this.inFlightTransfers.add(handle);
     try {
       return await transfer((downloaded, total) => {
-        if (downloaded > 0 && handle.startedAt === 0) {
+        // The busy span opens on the call's FIRST progress callback, including
+        // a pre-dispatch (0, size) signal — whole-body transports (simple PUT
+        // ≤4 MiB, the requestUrl whole-buffer fallback) move every byte before
+        // their only downloaded>0 report; opening on bytes alone books ~0 ms
+        // of busy time for the whole payload and the sampler folds MB-per-ms
+        // samples (真机 2026-10-28: 2694.5 MB/s on opening). A call that never
+        // fires a callback still owns no busy time.
+        if (handle.startedAt === 0) {
           handle.startedAt = Date.now();
+          this.beginTransferBusy(direction, runMetrics);
         }
         if (downloaded !== handle.bytesSoFar) handle.bytesSoFar = downloaded;
         onProgress?.(downloaded, total);
       });
+    } catch (error) {
+      // A3 (2026-10-26): stamp the bytes this call already moved onto the
+      // failure, so the diagnostic report can say "died after 1.2MB of 3.4MB"
+      // instead of only naming the error. One place covers every wrapped
+      // transfer (upload, download, streamed download to a temp file).
+      // Evidence only — the same error instance is rethrown unchanged, so
+      // every classification and retry decision downstream is untouched.
+      attachTransferredBytes(error, handle.bytesSoFar);
+      throw error;
     } finally {
       this.inFlightTransfers.delete(handle);
-      // A settled call that moved bytes is a real throughput measurement
-      // regardless of how the call ended — fold it at its own bytes/wall.
-      if (handle.bytesSoFar > 0) {
-        this.onTransferCallSample?.({
-          direction,
-          bytes: handle.bytesSoFar,
-          ms: Date.now() - handle.callStart,
-          at: Date.now(),
-        });
-      }
+      // A call owns busy time once it has fired any progress callback (its
+      // span opened); a call that failed before signalling anything never
+      // opened one. A signalled call that still settles byte-less books its
+      // burn as byte-less busy time — the sampler's zero fact, not a rate.
+      if (handle.startedAt > 0) this.endTransferBusy(direction, runMetrics);
     }
   }
 
@@ -3174,6 +3594,7 @@ export class SyncExecutor {
             filesMoved: 0,
             deleted: 0,
             conflicts: 0,
+            remoteDeletePending: 0,
             deferred: 0,
             skippedLarge: 0,
             skippedIgnored: 0,
@@ -3185,7 +3606,6 @@ export class SyncExecutor {
           const metrics: ExecutionMetrics = {
             uploadBytes: 0,
             uploadReadMs: 0,
-            uploadNetworkMs: 0,
             activeUploads: 0,
             peakUploads: 0,
             fileTransfers: {
@@ -3542,6 +3962,13 @@ export class SyncExecutor {
           return;
         }
         accepted = true;
+        // The row exists only to carry this question. The commit above already
+        // recorded the identity, so retire the whole reviewed chain now, like
+        // the folder-location and scope-crossing exits do. Waiting for the next
+        // plan leaves a row that can only answer "facts changed" if clicked.
+        await this.state.retirePendingIssues(
+          current.snapshot.folders.map((folder) => folder.path),
+        );
         this.notice("notice.sharedFolderIdentity.accepted", {
           path: reviewed.path,
         });
@@ -3680,6 +4107,13 @@ export class SyncExecutor {
 
   get hasSideActionsInFlight(): boolean {
     return this.sideActionRunning || this.queuedSideActionPaths.size > 0;
+  }
+
+  /** Side-action rows registered but not settled yet. While a round runs this
+   *  is exactly the confirmed-delete batch waiting behind it, so the panel can
+   *  fold the queued work into the round's own XX/XX counter. */
+  get queuedSideActionCount(): number {
+    return this.queuedSideActionPaths.size;
   }
 
   isSideActionQueued(path: string): boolean {
@@ -4279,7 +4713,7 @@ export class SyncExecutor {
         remoteManifest,
         {
           localVersion: null,
-          isMobile: Platform.isMobile,
+          isMobile: this.platform.isMobileApp,
           apiVersionSupported: remoteManifest.minAppVersion
             ? requireApiVersion(remoteManifest.minAppVersion)
             : true,
@@ -5445,7 +5879,7 @@ export class SyncExecutor {
 
   private currentRemoteFolderNode(remoteId: string):
     { eTag?: string } | undefined {
-    const node = this.state.getCommittedV2Envelope()?.remoteIndex.itemsById[remoteId];
+    const node = this.state.peekCommittedV2Envelope()?.remoteIndex.itemsById[remoteId];
     return node?.kind === "folder" ? node : undefined;
   }
 
@@ -5592,7 +6026,7 @@ export class SyncExecutor {
   private async inspectLocalFolderAfterFolderCreate(
     path: string,
   ): Promise<LocalFolderInspection> {
-    const attempts = Platform.isMobile
+    const attempts = this.platform.isMobileApp
       ? MOBILE_FOLDER_CREATE_READBACK_SETTLE_ATTEMPTS
       : 1;
     for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -5700,6 +6134,7 @@ export class SyncExecutor {
     if (!(folder instanceof TFolder) || !this.fileManager) {
       throw new Error(`Local folder cannot be moved to trash safely: ${path}`);
     }
+    this.onSelfLocalDelete?.(path);
     await this.fileManager.trashFile(folder);
     if ((await this.inspectLocalFolder(path)).status !== "missing") {
       throw new Error(`Local folder delete read-back failed: ${path}`);
@@ -5716,6 +6151,54 @@ export class SyncExecutor {
       && Boolean(current.entry)
       && current.entry!.hash === expected.hash
       && current.entry!.size === expected.size;
+  }
+
+  /** Ask the scanner for its content-free stat probe. Returns null only for
+   *  legacy scanner doubles that predate the probe; production `LocalScanner`
+   *  always exposes it, so the wave gate below is a test-double no-op rather
+   *  than a production bypass. */
+  private async inspectLocalVersionStat(
+    path: string,
+  ): Promise<LocalFileStatInspection | null> {
+    const scanner = this.scanner as LocalScanner & {
+      inspectFileStat?: (filePath: string) => Promise<LocalFileStatInspection>;
+    };
+    if (typeof scanner.inspectFileStat !== "function") return null;
+    return scanner.inspectFileStat(path);
+  }
+
+  /** Last-instant gate for one confirm-delete erase (2026-10-26): the reviewed
+   *  local mtime+size must still match. It reads the same `adapter.stat` facts
+   *  `guardReviewedLocalVersion` starts from, but skips the whole-file read and
+   *  SHA-256, so the window is one millisecond-scale stat per member instead
+   *  of the whole wave. It supplements, never replaces, the hash guard: a
+   *  mismatch skips only this member (notice + pending row kept), an unreadable
+   *  probe fails closed, and a scanner without the probe (legacy test doubles)
+   *  keeps its pre-gate behavior. A metadata-only change is treated as drift
+   *  too (conservative; the next round refreshes the row from current facts). */
+  private async localVersionStillMatchesReviewedFacts(
+    pending: SyncPlanItem,
+  ): Promise<boolean> {
+    const expected = pending.local;
+    if (!expected) return true;
+    let current: LocalFileStatInspection | null;
+    try {
+      current = await this.inspectLocalVersionStat(pending.path);
+    } catch (error) {
+      this.diag?.warn(
+        "execute",
+        `local stat re-check failed before reviewed erase — ${pending.path}`,
+        describeError(error),
+      );
+      return false;
+    }
+    if (current === null) return true;
+    if (current.status !== "present" || current.size !== expected.size) {
+      return false;
+    }
+    // Legacy rows without a finite mtime keep the size half of the gate; the
+    // reviewed content was already proven by the wave's SHA-256 guard.
+    return !Number.isFinite(expected.mtime) || current.mtime === expected.mtime;
   }
 
   /** Read-only eligibility gate used before adaptive network prefetch.
@@ -6224,7 +6707,7 @@ export class SyncExecutor {
   }
 
   private getStreamDownloadAdapter(fileSize: number): StreamDownloadAdapter | null {
-    if (!Platform.isMobile || fileSize < MOBILE_STREAM_DOWNLOAD_MIN_BYTES) {
+    if (!this.platform.isMobileApp || fileSize < MOBILE_STREAM_DOWNLOAD_MIN_BYTES) {
       return null;
     }
     const adapter = this.scanner.vault.adapter as StreamDownloadAdapter;
@@ -6417,6 +6900,17 @@ export class SyncExecutor {
     kind: "file" | "folder";
   }): Promise<void> {
     if (!entry.remoteId) return;
+    // Cleanup wave: the clue rides the wave's single ledger write instead of
+    // one whole-data write per file (see `deletionLedgerSink`).
+    if (this.deletionLedgerSink) {
+      this.deletionLedgerSink.push({
+        remoteId: entry.remoteId,
+        path: entry.path,
+        deletedAt: Date.now(),
+        kind: entry.kind,
+      });
+      return;
+    }
     try {
       await this.state.recordCloudDeletion({
         remoteId: entry.remoteId,
@@ -6722,6 +7216,19 @@ export class SyncExecutor {
       directoryIds.push(identity.directoryId);
       identitiesByManifestId.set(identity.manifestId, directoryIds);
     }
+    // The blocked row must name every directory that declares the same plugin:
+    // telling the user only "this one is ambiguous" leaves them guessing which
+    // other folder to remove. Every blocked member shows the same group order
+    // so the two rows read identically. Presentation evidence only.
+    const collisionGroupByDirectoryId = new Map<string, string[]>();
+    const collisionManifestIdByDirectoryId = new Map<string, string>();
+    for (const [manifestId, directoryIds] of identitiesByManifestId) {
+      if (directoryIds.length < 2) continue;
+      for (const directoryId of directoryIds) {
+        collisionGroupByDirectoryId.set(directoryId, directoryIds);
+        collisionManifestIdByDirectoryId.set(directoryId, manifestId);
+      }
+    }
     const blockedDirectoryIds = findCommunityPluginManifestIdentityCollisions(
       identities,
     );
@@ -6741,10 +7248,13 @@ export class SyncExecutor {
       blockedDirectoryIds.delete(localDirectoryId);
     }
     for (const directoryId of blockedDirectoryIds) {
+      const names = collisionGroupByDirectoryId.get(directoryId) ?? [directoryId];
+      const manifestId =
+        collisionManifestIdByDirectoryId.get(directoryId) ?? directoryId;
       this.communityPluginIdentityBlockedErrors.set(
         directoryId,
         new CommunityPluginIdentityBlockError(
-          `Selected plugin identity is ambiguous: ${directoryId}`,
+          `Selected plugin identity is ambiguous: ${manifestId}|${names.join(", ")}`,
           "identity-ambiguous",
         ),
       );
@@ -6838,7 +7348,7 @@ export class SyncExecutor {
     }> = [];
     for (const [pluginId, bundle] of remoteBundles) {
       if (!bundle.main || !bundle.manifest) continue;
-      if (!Platform.isMobile && !joiningPluginIds.has(pluginId)) continue;
+      if (!this.platform.isMobileApp && !joiningPluginIds.has(pluginId)) continue;
       const root = `${input.configDir.replace(/\/+$/, "")}/plugins/${pluginId}`;
       if (
         localPaths.has(`${root}/manifest.json`)
@@ -6978,7 +7488,7 @@ export class SyncExecutor {
         manifest,
         {
           localVersion: null,
-          isMobile: Platform.isMobile,
+          isMobile: this.platform.isMobileApp,
           apiVersionSupported: manifest.minAppVersion
             ? requireApiVersion(manifest.minAppVersion)
             : true,
@@ -7055,6 +7565,11 @@ export class SyncExecutor {
       downloaded: number,
       total: number,
     ) => void,
+    /** One bounded batched URL refresh for one group's members, before their
+     *  content is downloaded (the window's lookahead starts only after this
+     *  stage). Absent or failing leaves URLs unset; the member's own download
+     *  waterfall then refreshes per file, exactly as before. */
+    refreshDownloadUrls?: (items: readonly SyncPlanItem[]) => Promise<void>,
   ): Promise<Map<string, PreparedDownload>> {
     const preparedByPath = new Map<string, PreparedDownload>();
     if (policy.files.mode === "none") return preparedByPath;
@@ -7154,6 +7669,11 @@ export class SyncExecutor {
     };
 
     for (const [pluginId, items] of groups) {
+      // This group's content is read here, before the download window opens,
+      // so it cannot use that window's URL lookahead. One batched refresh for
+      // exactly these members keeps their downloads on the batched path; the
+      // set is bounded by the selected bundle, not by the round size.
+      await refreshDownloadUrls?.(items);
       const groupOutcome = await this.prepareCommunityPluginBundleGroup({
         pluginId,
         items,
@@ -7401,7 +7921,7 @@ export class SyncExecutor {
       manifest,
       {
         localVersion,
-        isMobile: Platform.isMobile,
+        isMobile: this.platform.isMobileApp,
         apiVersionSupported: manifest.minAppVersion
           ? requireApiVersion(manifest.minAppVersion)
           : true,
@@ -7642,7 +8162,7 @@ export class SyncExecutor {
     content: ArrayBuffer,
   ): Promise<void> {
     const adapter = this.scanner.vault.adapter;
-    const maxAttempts = Platform.isAndroidApp && content.byteLength > 0
+    const maxAttempts = this.platform.isAndroidApp && content.byteLength > 0
       ? ANDROID_TEMP_WRITE_MAX_ATTEMPTS
       : 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -7750,6 +8270,7 @@ export class SyncExecutor {
           content: tempBytes,
           previousBytes: originalBytes,
           expectedVersion: downloaded,
+          platform: this.platform,
           onWarning: (message) => this.diag?.warn("execute", message),
         });
         // 原地写不消费暂存文件（旧实现的改名会），成功后必须自己清掉，
@@ -8797,6 +9318,65 @@ export class SyncExecutor {
       publishCommunityPluginPostAuthorityState,
       configDir,
     };
+  }
+
+  /**
+   * Derive folder mappings that complete current facts already determine and
+   * commit them before the plan. This is the incremental form of the V2
+   * bootstrap: a local folder and exactly one cloud folder at the same path
+   * under an already confirmed parent. The commit is state-only (no file or
+   * folder mutation, no ledger, no receipt) and its failure never fails the
+   * round; the next round retries from fresh facts.
+   */
+  private async deriveMissingFolderMappings(args: {
+    syncScope: SyncScope;
+    committedV2Envelope: SyncStateEnvelopeV2 | null;
+    prepareV2MigrationCandidate: boolean;
+    localEntries: readonly LocalFileEntry[];
+    localFolders: readonly LocalFolderEntry[];
+    localFolderScanComplete: boolean;
+    includeFolderPath: (path: string) => boolean;
+    preserveFolderPath: (path: string) => boolean;
+  }): Promise<SyncStateEnvelopeV2 | null> {
+    // The migration/first-sync branch builds its own envelope and binds the
+    // first-sync evidence operation to the current commit sequence; deriving
+    // before it would replace that sequence under the binding.
+    if (args.prepareV2MigrationCandidate) return null;
+    const envelope = args.committedV2Envelope;
+    if (!envelope || !args.localFolderScanComplete) return null;
+    if (!this.state.hasCompleteRemoteFolderIndex) return null;
+    const candidates = deriveMissingFolderMappingCandidatesV2({
+      envelope,
+      localFiles: args.localEntries,
+      localFolders: args.localFolders,
+      localFolderScanComplete: args.localFolderScanComplete,
+      includeFolderPath: args.includeFolderPath,
+      preserveFolderPath: args.preserveFolderPath,
+    });
+    if (candidates.length === 0) return null;
+    const accepted = await this.state.acceptDerivedFolderMappings({
+      scope: args.syncScope,
+      localFiles: args.localEntries,
+      localFolders: args.localFolders,
+      localFolderScanComplete: args.localFolderScanComplete,
+      remoteIdentityComplete: this.state.hasCompleteRemoteFolderIndex,
+      authorizedFolders: candidates,
+    });
+    if (accepted.status === "accepted" && accepted.accepted > 0) {
+      this.diag?.log(
+        "state",
+        "derived missing folder mappings from complete current facts",
+        { accepted: accepted.accepted, mutations: 0 },
+      );
+      return this.state.getCommittedV2Envelope();
+    }
+    if (accepted.status === "blocked") {
+      this.diag?.warn("state", "derived folder mappings were not committed", {
+        reason: accepted.reason ?? "unknown",
+        candidates: candidates.length,
+      });
+    }
+    return null;
   }
 
   /** Step 5 (migration path): build the V2 migration candidate envelope from
@@ -10118,10 +10698,10 @@ export class SyncExecutor {
     if (unresolved.length === 0) return accumulators(true);
     const next = unresolved[0];
     if (!next) return accumulators(true);
-    const batchFileLimit = Platform.isMobile
+    const batchFileLimit = this.platform.isMobileApp
       ? MOBILE_RECONSTRUCTION_BATCH_FILES
       : DESKTOP_RECONSTRUCTION_BATCH_FILES;
-    const batchByteLimit = Platform.isMobile
+    const batchByteLimit = this.platform.isMobileApp
       ? MOBILE_RECONSTRUCTION_BATCH_BYTES
       : DESKTOP_RECONSTRUCTION_BATCH_BYTES;
     const batch: SyncPlanItem[] = [];
@@ -10635,6 +11215,14 @@ export class SyncExecutor {
     refreshVerificationDownloadUrls: (
       items: ReadonlyArray<SyncPlanItem>,
     ) => Promise<void>;
+    /** Raw local scan paths; only used to prune already-consumed decision
+     *  records, never to plan or authorize anything. */
+    localPathsPresent: ReadonlySet<string>;
+    /** Raw local folder scan paths; same prune-only contract. Undefined when
+     *  the folder scan is incomplete. */
+    localFolderPathsPresent?: ReadonlySet<string>;
+    /** Bound scope for folder decision facts (also used by the review gate). */
+    decisionScope: LocalDeleteDecisionScopeV1;
   }): Promise<
     | { terminated: SyncResult }
     | {
@@ -10655,6 +11243,9 @@ export class SyncExecutor {
       prepareV2MigrationCandidate,
       resolveCanonicalRemoteContentHash,
       refreshVerificationDownloadUrls,
+      localPathsPresent,
+      localFolderPathsPresent,
+      decisionScope,
     } = args;
     let { canonicalPlanCandidate, migrationCandidateEnvelope } = args;
     // Step 5.5: Content hash dedup — for files that appear on both sides
@@ -10739,6 +11330,16 @@ export class SyncExecutor {
         committedEnvelope,
         ancestorHashesByPath: contentEqualityAncestorHashes,
         unpublishedMigrationCandidate: prepareV2MigrationCandidate,
+        // Ordinary plans only: activation/control-plane reviews keep every
+        // decision row deferred after the run. The executor reads the
+        // device-local key and passes a pure snapshot to the sealer.
+        localDeleteDecisions:
+          plan.reviewKind === undefined && !prepareV2MigrationCandidate
+            ? this.state.localDeleteDecisions
+            : undefined,
+        localPathsPresent,
+        localFolderPathsPresent,
+        decisionScope,
       });
       finalizedCanonicalPlan = sealed;
       canonicalPlanCandidate = sealed;
@@ -10746,6 +11347,46 @@ export class SyncExecutor {
       plan.scope = { ...sealed.scope };
       plan.canonicalIdentity = sealed.canonicalIdentity;
       plan.canonicalReview = sealed.canonicalReview;
+      plan.requiresThresholdConfirmation =
+        sealed.requiresThresholdConfirmation;
+      plan.preDecisionIdentity = sealed.preDecisionIdentity;
+      plan.preDecisionRequiresThresholdConfirmation =
+        sealed.preDecisionRequiresThresholdConfirmation;
+      plan.appliedLocalDeleteDecisions = sealed.appliedLocalDeleteDecisions;
+      const decisionReport = sealed.localDeleteDecisionReport;
+      if (decisionReport) {
+        for (const entry of decisionReport.rejected) {
+          this.diag?.warn(
+            "plan",
+            `local delete decision not consumed — ${entry.reason}`,
+            { token: entry.token, path: entry.path, mutations: 0 },
+          );
+        }
+        for (const entry of decisionReport.pruned) {
+          this.diag?.log(
+            "plan",
+            `local delete decision path pruned — ${entry.reason}`,
+            { token: entry.token, path: entry.path, mutations: 0 },
+          );
+        }
+        // Apply only the proven-absent removals to the live records. Replacing
+        // the whole snapshot could drop a confirmation the user wrote while
+        // this round was planning; a removal is the only mutation the plan
+        // itself owns.
+        if (decisionReport.pruned.length > 0) {
+          try {
+            await this.state.removeLocalDeleteDecisionPaths(
+              decisionReport.pruned.map((entry) => entry.path),
+            );
+          } catch (error) {
+            this.diag?.warn(
+              "state",
+              "failed to persist pruned local delete decisions",
+              describeError(error),
+            );
+          }
+        }
+      }
       if (localOnlyPathsForReview) {
         await this.state.reconcileLocalOnlyEntries(localOnlyPathsForReview);
       }
@@ -10757,6 +11398,8 @@ export class SyncExecutor {
           actions: sealed.items.length,
           reviewImpact: sealed.canonicalReview.impactCount,
           digestBytes: sealed.canonicalIdentity.digest.length,
+          localDeleteDecisions:
+            sealed.appliedLocalDeleteDecisions?.length ?? 0,
           mutations: 0,
         },
       );
@@ -10823,7 +11466,7 @@ export class SyncExecutor {
         // reconstruction batch caps (desktop 4 files/32 MiB, mobile
         // 2 files/8 MiB) — the same read-only memory envelope proven on
         // real devices; absent here means strictly serial verification.
-        verificationDownloadWindow: Platform.isMobile
+        verificationDownloadWindow: this.platform.isMobileApp
           ? {
               maxFiles: MOBILE_RECONSTRUCTION_BATCH_FILES,
               maxBytes: MOBILE_RECONSTRUCTION_BATCH_BYTES,
@@ -11107,10 +11750,7 @@ export class SyncExecutor {
         ...plan.items
           .filter((item) => item.type === SyncActionType.ConfirmLocalDelete
           || item.type === SyncActionType.DeleteLocal
-          || (
-            item.type === SyncActionType.DeleteLocalFolder
-            && item.requiresConfirmation
-          ))
+          || item.type === SyncActionType.DeleteLocalFolder)
           .map((item) => item.path),
         ...this.state.pendingRemoteDeletes
           .filter((item) => this.isPathProtectedByIsolatedRecovery(
@@ -11264,16 +11904,29 @@ export class SyncExecutor {
         ? stagedFolderMoves[0]
         : null;
     const foldersMovedBeforeExecution = result.foldersMoved ?? 0;
-    await this.executePlan(
-      plan,
-      result,
-      callbacks,
-      operationEpoch,
-      automaticHandlingPolicy,
-      automaticHandlingMetrics,
-      communityPluginSyncPolicy,
-      protectedMutationRecoveryRecords,
-    );
+    const appliedLocalDeleteDecisions =
+      plan.appliedLocalDeleteDecisions ?? [];
+    this.activeLocalDeleteDecisionEntries =
+      appliedLocalDeleteDecisions.length > 0
+        ? new Map(appliedLocalDeleteDecisions.map((entry) => [
+            entry.path,
+            entry.token,
+          ]))
+        : null;
+    try {
+      await this.executePlan(
+        plan,
+        result,
+        callbacks,
+        operationEpoch,
+        automaticHandlingPolicy,
+        automaticHandlingMetrics,
+        communityPluginSyncPolicy,
+        protectedMutationRecoveryRecords,
+      );
+    } finally {
+      this.activeLocalDeleteDecisionEntries = null;
+    }
     // A folder move is a topology transaction in either direction. Only
     // after its receipt/checkpoint has advanced the authority may one fresh
     // scan produce a single bounded descendant plan; never recurse into run().
@@ -13640,24 +14293,46 @@ export class SyncExecutor {
     // If the user is executing a reviewed plan, verify the digest after all
     // pre-execution rewrites (scan health and dedup). The
     // reviewed bundle stays in state until this point so stale plans re-pause.
+    const reviewedIdentity = reviewedAuthorization?.canonicalIdentity;
+    const compositionAuthorized = localDeleteDecisionCompositionAuthorized({
+      decisions: this.state.localDeleteDecisions,
+      applied: plan.appliedLocalDeleteDecisions ?? [],
+      items: plan.items,
+      decisionScope: {
+        vaultName: this.vaultName,
+        accountId: this.state.boundAccountId,
+        scope: syncScope,
+      },
+    });
+    const disposition = resolveLocalDeleteReviewDisposition({
+      reviewedIdentity,
+      planIdentity: plan.canonicalIdentity,
+      preDecisionIdentity: plan.preDecisionIdentity,
+      compositionAuthorized,
+      requiresThresholdConfirmation:
+        plan.requiresThresholdConfirmation === true,
+      preDecisionRequiresThresholdConfirmation:
+        plan.preDecisionRequiresThresholdConfirmation === true,
+    });
     const authorizationIsCurrent = Boolean(
       reviewedAuthorization
       && reviewedAuthorization.revision === this.state.planReviewRevision
       && sameSyncScope(reviewedAuthorization.scope, this.state.planReviewScope)
       && sameSyncScope(reviewedAuthorization.scope, syncScope)
       && sameCanonicalPlanIdentityV2(
-        reviewedAuthorization.canonicalIdentity,
-        plan.canonicalIdentity,
-      )
-      && sameCanonicalPlanIdentityV2(
         this.state.planReviewCanonicalIdentity,
-        plan.canonicalIdentity,
+        reviewedIdentity,
       )
+      && (disposition === "current" || disposition === "compose")
     );
     if (!authorizationIsCurrent) {
       this.diag?.warn(
         "plan",
-        "plan revision, scope, or canonical identity changed since review — re-pausing for confirmation",
+        disposition === "threshold-re-review"
+          ? "local delete decisions push the plan over the review threshold — re-pausing for confirmation"
+          : disposition === "changed" && compositionAuthorized
+            ? "local delete decision authorization changed — re-pausing for confirmation"
+            : "plan revision, scope, or canonical identity changed since review — re-pausing for confirmation",
       );
       if (callbacks.onConfirmThreshold) {
         await waitForReview(() => callbacks.onConfirmThreshold!(plan));
@@ -13680,7 +14355,7 @@ export class SyncExecutor {
     );
     if (
       sealedIdentityChanged
-      || (savedDigest && currentDigest !== savedDigest)
+      || (savedDigest && currentDigest !== savedDigest && !compositionAuthorized)
     ) {
       this.diag?.warn("plan", "plan changed since review — re-pausing for confirmation");
       const confirmed = callbacks.onConfirmThreshold
@@ -13708,7 +14383,7 @@ export class SyncExecutor {
     options: SyncRunOptions = {},
   ): Promise<SyncResult> {
     if (this.running || this.sideActionRunning || this.queuedSideActionPaths.size > 0) {
-      return { success: false, uploaded: 0, downloaded: 0, deleted: 0, conflicts: 0, deferred: 0, skippedLarge: 0, skippedIgnored: 0, skippedInvalidName: 0, errors: 0, authExpired: false, message: this.t("result.alreadyRunning") };
+      return { success: false, uploaded: 0, downloaded: 0, deleted: 0, conflicts: 0, remoteDeletePending: 0, deferred: 0, skippedLarge: 0, skippedIgnored: 0, skippedInvalidName: 0, errors: 0, authExpired: false, message: this.t("result.alreadyRunning") };
     }
 
     if (options.recoveryOnly === true && !this.state.isV2StateActive) {
@@ -13718,6 +14393,7 @@ export class SyncExecutor {
         downloaded: 0,
         deleted: 0,
         conflicts: 0,
+        remoteDeletePending: 0,
         deferred: 0,
         skippedLarge: 0,
         skippedIgnored: 0,
@@ -13869,6 +14545,7 @@ export class SyncExecutor {
       filesMoved: 0,
       deleted: 0,
       conflicts: 0,
+      remoteDeletePending: 0,
       deferred: 0,
       skippedLarge: 0,
       skippedIgnored: 0,
@@ -14078,6 +14755,19 @@ export class SyncExecutor {
       let localFolders = step1.localFolders;
       let localFolderScanComplete = step1.localFolderScanComplete;
       const { skippedLarge, folderScanFailures } = step1;
+      // Raw scan presence for the decision sealer's already-consumed prune.
+      // Kept separate from the later planning filter so identity retirement
+      // cannot make an existing local file look absent.
+      const scannedLocalPaths = new Set(
+        step1.localEntries.map((entry) => entry.path),
+      );
+      // Folder counterpart for the same already-consumed prune. The folder
+      // scan is complete only when `localFolderScanComplete` is true; an
+      // incomplete scan leaves this set undefined at the seal call below so a
+      // folder decision can never be pruned from partial evidence.
+      const scannedLocalFolderPaths = step1.localFolderScanComplete
+        ? new Set(step1.localFolders.map((entry) => entry.path))
+        : undefined;
 
       const step1_5 = await this.runStep1_5PrepareRemoteVaultScope({
         result,
@@ -14290,6 +14980,34 @@ export class SyncExecutor {
       if (step5a.terminated) return step5a.terminated;
       migrationCandidateEnvelope = step5a.migrationCandidateEnvelope;
       migrationPlannerState = step5a.migrationPlannerState;
+      // A missing folder mapping that complete facts already determine is
+      // authority only for a state-only anchor commit. It runs before the plan
+      // so the same round plans those branches as ordinary content work.
+      const includeDerivedFolderPath = (path: string): boolean =>
+        this.scanner.shouldSyncFolderPath(path);
+      const preserveDerivedFolderPath = (path: string): boolean =>
+        !includeDerivedFolderPath(path)
+        || this.isFolderProtectedByIsolatedRecovery(
+          path,
+          protectedMutationRecoveryRecords,
+        )
+        || isCommunityPluginFolderPreservedByPolicy(
+          path,
+          communityPluginSyncPolicy,
+          configDir,
+          "easy-sync",
+          [...joinAuthorizationsByPluginId.keys()],
+        );
+      committedV2Envelope = await this.deriveMissingFolderMappings({
+        syncScope,
+        committedV2Envelope,
+        prepareV2MigrationCandidate,
+        localEntries: planningLocalEntries,
+        localFolders,
+        localFolderScanComplete,
+        includeFolderPath: includeDerivedFolderPath,
+        preserveFolderPath: preserveDerivedFolderPath,
+      }) ?? committedV2Envelope;
       let canonicalSourceEnvelope =
         committedV2Envelope ?? migrationCandidateEnvelope;
       const includeCanonicalFilePath = (path: string): boolean =>
@@ -14303,21 +15021,8 @@ export class SyncExecutor {
           communityPluginSyncPolicy,
           configDir,
         );
-      const includeCanonicalFolderPath = (path: string): boolean =>
-        this.scanner.shouldSyncFolderPath(path);
-      const preserveCanonicalFolderPath = (path: string): boolean =>
-        !includeCanonicalFolderPath(path)
-        || this.isFolderProtectedByIsolatedRecovery(
-          path,
-          protectedMutationRecoveryRecords,
-        )
-        || isCommunityPluginFolderPreservedByPolicy(
-          path,
-          communityPluginSyncPolicy,
-          configDir,
-          "easy-sync",
-          [...joinAuthorizationsByPluginId.keys()],
-        );
+      const includeCanonicalFolderPath = includeDerivedFolderPath;
+      const preserveCanonicalFolderPath = preserveDerivedFolderPath;
       // Step 5: first-sync verification evidence session (see
       // runStep5PrepareFirstSyncVerificationEvidence; the canonical
       // verification closures below capture these bindings and may null the
@@ -14536,6 +15241,13 @@ export class SyncExecutor {
         prepareV2MigrationCandidate,
         resolveCanonicalRemoteContentHash,
         refreshVerificationDownloadUrls,
+        localPathsPresent: scannedLocalPaths,
+        localFolderPathsPresent: scannedLocalFolderPaths,
+        decisionScope: {
+          vaultName: this.vaultName,
+          accountId: this.state.boundAccountId,
+          scope: syncScope,
+        },
       });
       if (step5_5.terminated) return step5_5.terminated;
       canonicalPlanCandidate = step5_5.canonicalPlanCandidate;
@@ -14805,7 +15517,7 @@ export class SyncExecutor {
       if (result.metrics) {
         this.diag?.log("execute", "sync file transfer summary", {
           schemaVersion: 3,
-          platform: Platform.isMobile ? "mobile" : "desktop",
+          platform: this.platform.isMobileApp ? "mobile" : "desktop",
           upload: result.metrics.fileTransfers.upload,
           download: result.metrics.fileTransfers.download,
           mutationPersistence: result.metrics.mutationPersistence,
@@ -14830,7 +15542,7 @@ export class SyncExecutor {
       );
       this.diag?.log("lifecycle", "sync run phase summary", {
         schemaVersion: 2,
-        platform: Platform.isMobile ? "mobile" : "desktop",
+        platform: this.platform.isMobileApp ? "mobile" : "desktop",
         mode,
         status: result.success
           ? "success"
@@ -14842,16 +15554,7 @@ export class SyncExecutor {
                 ? "failed"
                 : "stopped",
         readOnlyPreview: options.readOnlyPreview === true,
-        counts: {
-          uploaded: result.uploaded,
-          downloaded: result.downloaded,
-          deleted: result.deleted,
-          conflicts: result.conflicts,
-          deferred: result.deferred,
-          errors: result.errors,
-          skippedLarge: result.skippedLarge,
-          skippedIgnored: result.skippedIgnored,
-        },
+        counts: projectSyncRunPhaseSummaryCounts(result),
         phasesMs,
         totalMs: Math.max(0, Date.now() - runStartedAt),
       }, { urgent: true });
@@ -15244,7 +15947,6 @@ export class SyncExecutor {
     const metrics: ExecutionMetrics = {
       uploadBytes: 0,
       uploadReadMs: 0,
-      uploadNetworkMs: 0,
       activeUploads: 0,
       peakUploads: 0,
       fileTransfers: {
@@ -15296,9 +15998,9 @@ export class SyncExecutor {
         ? cleanupItems.filter((item) => item.type === SyncActionType.DeleteLocal).length
         : 0;
 
-    const uploadPolicy = new UploadConcurrencyPolicy(Platform.isMobile);
+    const uploadPolicy = new UploadConcurrencyPolicy(this.platform.isMobileApp);
     const downloadPolicy = new DownloadConcurrencyPolicy(
-      Platform.isMobile
+      this.platform.isMobileApp
         ? MOBILE_DOWNLOAD_MAX_CONCURRENCY
         : ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY,
     );
@@ -15341,27 +16043,35 @@ export class SyncExecutor {
       );
     }
 
-    let started = 0;
+    /** Settled (finished) plan items — the visible progress counter. */
+    let settled = 0;
     this.progressStore?.setProgress(0, total, "");
     callbacks.onProgress?.(0, total, "");
     this.diag?.log(
       "execute",
-      `pools — folders=${folderCreates.length} small=${smallUploads.length}(adaptive ${uploadPolicy.limit}→${Platform.isMobile ? 2 : 4}) large=${largeUploads.length}(x${largeUploadConcurrency(Platform.isMobile)}) download=${downloads.length}(adaptive 1→${Platform.isMobile ? MOBILE_DOWNLOAD_MAX_CONCURRENCY : ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY} small files) passthrough=${passthroughItems.length} cleanup=${cleanupItems.length}`,
+      `pools — folders=${folderCreates.length} small=${smallUploads.length}(adaptive ${uploadPolicy.limit}→${uploadPolicy.maxLimit}) large=${largeUploads.length}(x${largeUploadConcurrency(this.platform.isMobileApp)}) download=${downloads.length}(adaptive 1→${this.platform.isMobileApp ? MOBILE_DOWNLOAD_MAX_CONCURRENCY : ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY} small files) passthrough=${passthroughItems.length} cleanup=${cleanupItems.length}`,
     );
 
     const executePlanItem = async (
       item: SyncPlanItem,
       preparedDownload?: PreparedDownload,
-      deferUploadCheckpoint = false,
+      cleanupWave?: CleanupWaveHandoff,
+      uploadObservation?: UploadTransferObservation,
     ): Promise<DeferredMutationCompletion | undefined> => {
       if (!this.canContinue(operationEpoch, result)) return;
+      // 清理/上传波：意图已由波次一次性落盘，回执并入波次统一提交。
+      const prePersistedIntent = cleanupWave !== undefined && cleanupWave.intent !== null;
+      const receiptSink = cleanupWave !== undefined ? cleanupWave.receipts : null;
       // 按设置跳过不占进度位置：占位会让进度条在跳过突发里回跳、当前文件槽闪
       // 一下被排除的路径。完成行照常上报（历史与诊断报告要它们）。
       const countsTowardProgress = !isConfigurationSkipAction(item.type);
-      const position = countsTowardProgress ? ++started : started;
+      // 计数语义＝**已结算**项数，不是「已开始」项数：常驻池一次派满 N 个，
+      // 按开始计数会让计数整批跳（1→8→16），批内长时间不动。开始点只把当前
+      // 文件名换成本项（字节进度归零、在飞徽标 +1），计数在 finally 里 +1。
+      const position = countsTowardProgress ? settled + 1 : settled;
       if (countsTowardProgress) {
-        this.progressStore?.setProgress(position, total, item.path, item.type);
-        callbacks.onProgress?.(position, total, item.path);
+        this.progressStore?.setProgress(settled, total, item.path, item.type);
+        callbacks.onProgress?.(settled, total, item.path);
       }
 
       const fileSize = fileSizeForAction(item, item.type);
@@ -15430,7 +16140,8 @@ export class SyncExecutor {
         transferMetrics: FileTransferMetrics | null;
         transferDirection: "upload" | "download" | null;
         completedBefore: number;
-        deferUploadCheckpoint: boolean;
+        prePersistedIntent: boolean;
+        receiptSink: MutationReceiptV1[] | null;
         mutationIntent: MutationIntent | null;
         preparedDownload: PreparedDownload | undefined;
         fileSize: number | undefined;
@@ -15465,7 +16176,8 @@ export class SyncExecutor {
           transferMetrics,
           transferDirection,
           completedBefore,
-          deferUploadCheckpoint,
+          prePersistedIntent,
+          receiptSink,
           mutationIntent,
           preparedDownload,
           fileSize,
@@ -15482,7 +16194,7 @@ export class SyncExecutor {
           skipBaseline,
         } = args;
 
-        if (mutationIntent) {
+        if (mutationIntent && !prePersistedIntent) {
           const intentStartedAt = Date.now();
           await this.state.beginMutationIntent(mutationIntent);
           this.diag?.log(
@@ -15510,24 +16222,42 @@ export class SyncExecutor {
           operationEpoch,
           automaticHandlingPolicy,
           preparedDownload,
+          uploadObservation,
         );
         if (mutationIntent && !itemResult.mutationApplied) {
           await this.state.abandonMutationIntent(mutationIntent.operationId);
         }
         if (mutationIntent && itemResult.mutationApplied) {
-          await this.persistPlanItemMutationReceipt({
-            item,
-            itemResult,
-            itemRemoteUpserts,
-            itemRemoteDeletes,
-            mutationIntent,
-            automaticHandlingPolicy,
-            metrics,
-            isFolderMove,
-            isFolderDelete,
-          });
+          if (receiptSink) {
+            receiptSink.push(this.buildPlanItemMutationReceipt({
+              item,
+              itemResult,
+              itemRemoteUpserts,
+              itemRemoteDeletes,
+              mutationIntent,
+              automaticHandlingPolicy,
+              metrics,
+              isFolderMove,
+              isFolderDelete,
+            }));
+            metrics.mutationPersistence.receiptWrites++;
+          } else {
+            await this.persistPlanItemMutationReceipt({
+              item,
+              itemResult,
+              itemRemoteUpserts,
+              itemRemoteDeletes,
+              mutationIntent,
+              automaticHandlingPolicy,
+              metrics,
+              isFolderMove,
+              isFolderDelete,
+            });
+          }
           if (!this.canContinue(operationEpoch, result)) return { terminated: undefined };
-          if (deferUploadCheckpoint && item.type === SyncActionType.Upload) {
+          if (receiptSink) {
+            // The wave owns the shared checkpoint; the completion is reported
+            // by the wave after that checkpoint commits.
             deferredMutationOperationId = mutationIntent.operationId;
           } else {
             const checkpointStartedAt = Date.now();
@@ -15550,6 +16280,16 @@ export class SyncExecutor {
           if (item.type === SyncActionType.DeleteLocal) {
             metrics.automaticHandling.deleteLocal.completed++;
             automaticDeleteCompleted = true;
+          }
+          // Folder rows convert from a confirmation row to the executable
+          // delete in the same plan. The checkpoint above is this item's own
+          // (folder deletes never ride a cleanup wave), so the authorization
+          // is consumed only after the committed state retired the shell.
+          if (
+            item.type === SyncActionType.DeleteLocalFolder
+            && itemResult.mutationApplied
+          ) {
+            await this.settleAppliedFolderDeleteDecision(item.path);
           }
           itemResult.baseUpsert = undefined;
           itemResult.baseRemoval = undefined;
@@ -15667,6 +16407,18 @@ export class SyncExecutor {
           completionActionType,
         );
         if (deferredMutationOperationId) {
+          // 逐文件即时反馈：这一项自己的传输与回执都已落地，行先按「完成」
+          // 显示，不等整批共享检查点（批末才发会让批内长时间没有任何反馈）。
+          // 检查点随后仍按批提交（SC-15 粒度不变）；若它失败或被取消，调用方
+          // 用 onFileReverted 把这一行翻成失败并带上原因。
+          callbacks.onFileComplete?.(
+            item.path,
+            completionActionType,
+            true,
+            itemResult.completionReason,
+            completionFileSize,
+            item.renameFrom,
+          );
           return {
             terminated: {
               operationId: deferredMutationOperationId,
@@ -15707,11 +16459,13 @@ export class SyncExecutor {
             ? preparedDownload.error
             : new Error(describeThrownValue(preparedDownload.error));
         }
-        mutationIntent = plan.scope
-          && isMutationAction(item.type)
-          && !item.requiresConfirmation
-          ? this.createMutationIntent(item, plan.scope)
-          : null;
+        mutationIntent = cleanupWave
+          ? cleanupWave.intent
+          : (plan.scope
+            && isMutationAction(item.type)
+            && !item.requiresConfirmation
+            ? this.createMutationIntent(item, plan.scope)
+            : null);
         const attempt = await runPlanItemExecutionAttempt({
           item,
           result,
@@ -15728,7 +16482,8 @@ export class SyncExecutor {
           transferMetrics,
           transferDirection,
           completedBefore,
-          deferUploadCheckpoint,
+          prePersistedIntent,
+          receiptSink,
           mutationIntent,
           preparedDownload,
           fileSize,
@@ -15873,6 +16628,9 @@ export class SyncExecutor {
           );
           result.deferred++;
           const reason = this.failureReason(e, item.path);
+          // A3: evidence-only facts of the deferral; `reason` and the deferral
+          // classification above are untouched by this object.
+          const error = fileErrorFactFromError(e);
           pendingIssues.push({
             path: item.path,
             actionType: item.type,
@@ -15883,8 +16641,9 @@ export class SyncExecutor {
             remoteETag,
             consecutiveFailures: 1,
             issueCode: "transfer-remote-moving" as const,
+            ...(error ? { error } : {}),
           });
-          callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize);
+          callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize, undefined, error);
           return;
         }
         const dbFingerprint = fingerprintIndexedDbError(e);
@@ -15895,7 +16654,15 @@ export class SyncExecutor {
           result.authExpired = true;
           result.message = this.t("result.authExpired");
           this.invalidateLifecycle("auth-expired");
-          callbacks.onFileComplete?.(item.path, item.type, false, this.failureReason(e, item.path), fileSize);
+          callbacks.onFileComplete?.(
+            item.path,
+            item.type,
+            false,
+            this.failureReason(e, item.path),
+            fileSize,
+            undefined,
+            fileErrorFactFromError(e),
+          );
           return;
         }
         result.errors++;
@@ -15933,6 +16700,9 @@ export class SyncExecutor {
           };
         }
         const reason = this.failureReason(e, item.path);
+        // A3 (2026-10-26): the evidence object rides along *after* every
+        // counter and classification above. Nothing below reads it back.
+        const error = fileErrorFactFromError(e);
         pendingIssues.push({
           path: item.path,
           actionType: item.type,
@@ -15945,9 +16715,17 @@ export class SyncExecutor {
           ...(isNetworkClassTransferFailure(e)
             ? { issueCode: "transfer-network" as const }
             : {}),
+          ...(error ? { error } : {}),
         });
-        callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize);
+        callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize, undefined, error);
       } finally {
+        // 结算点：这一项（成功、失败、跳过、取消）到此为止，计数 +1 并立即
+        // 上报。并发池里的其它项还在飞，计数因此逐条走而不是整批跳。
+        if (countsTowardProgress) {
+          settled++;
+          this.progressStore?.setProgress(settled, total, item.path, item.type);
+          callbacks.onProgress?.(settled, total, item.path);
+        }
         if (transferMetrics) {
           const outcome = transferOutcome ?? "cancelled";
           transferMetrics[outcome]++;
@@ -16012,20 +16790,35 @@ export class SyncExecutor {
         operationEpoch,
       );
 
-    const commitDeferredUploadBatch = async (
+    /** Flip rows that were already reported as done: their shared checkpoint
+     *  never committed (failed, or skipped by cancellation), so the shown
+     *  success does not hold. The reason stays on the row — a success that
+     *  becomes false must never disappear silently. */
+    const revertDeferredCompletions = (
+      completed: readonly DeferredMutationCompletion[],
+      reason: string,
+    ): void => {
+      for (const completion of completed) {
+        callbacks.onFileReverted?.(completion.path, reason);
+      }
+    };
+
+    const commitDeferredCheckpointBatch = async (
       completions: readonly DeferredMutationCompletion[],
-    ): Promise<void> => {
-      if (completions.length === 0) return;
+    ): Promise<V2CommitBreakdown | undefined> => {
+      if (completions.length === 0) return undefined;
       const operationIds = completions.map((completion) => completion.operationId);
       const commit = () => operationIds.length === 1
         ? this.commitMutationCheckpoint(operationIds[0])
         : this.commitMutationCheckpoints(operationIds);
       let checkpointError: unknown;
+      let checkpointBreakdown: V2CommitBreakdown | undefined;
       let hierarchyRefreshAttempted = false;
       for (let attempt = 0; attempt < 2; attempt++) {
         const checkpointStartedAt = Date.now();
         try {
           const checkpointMetrics = await commit();
+          checkpointBreakdown = checkpointMetrics?.breakdown;
           recordCheckpointMetrics(
             metrics.mutationPersistence,
             checkpointMetrics,
@@ -16073,16 +16866,10 @@ export class SyncExecutor {
       }
       if (checkpointError !== undefined) {
         const reason = this.failureReason(checkpointError);
-        for (const completion of completions) {
-          callbacks.onFileComplete?.(
-            completion.path,
-            completion.actionType,
-            false,
-            reason,
-            completion.fileSize,
-            completion.renameFrom,
-          );
-        }
+        // Every member already reported its own success when it settled; the
+        // failed checkpoint means that success is not durable, so flip the
+        // rows instead of showing a second, duplicate failure row.
+        revertDeferredCompletions(completions, reason);
         // Rethrown fail-closed on purpose: the round-end shared checkpoint
         // refuses to publish while net-new unresolved ledger records exist
         // (sameRetainedMutationRecovery), so a degraded "keep going" would
@@ -16094,54 +16881,233 @@ export class SyncExecutor {
           ? checkpointError
           : new Error(describeThrownValue(checkpointError));
       }
-      for (const completion of completions) {
-        callbacks.onFileComplete?.(
-          completion.path,
-          completion.actionType,
-          true,
-          completion.reason,
-          completion.fileSize,
-          completion.renameFrom,
-        );
-      }
+      return checkpointBreakdown;
     };
 
-    // Step 3a — independent small uploads overlap only through receipt
-    // persistence. A wave becomes visible as successful only after one shared
-    // V2 checkpoint covers every durable receipt in that wave.
-    for (let index = 0; index < smallUploads.length;) {
+    // Step 3a — independent small uploads are persisted one batch at a time
+    // (`uploadCheckpointBatch`). The whole batch's mutation intents are
+    // durable before its first PUT, every member's receipt is written in one
+    // device-local commit after the uploads, and one shared V2 checkpoint
+    // publishes the batch. Each member reports its own row as soon as its PUT
+    // and receipt land (per-file feedback); a failed or cancelled checkpoint
+    // flips those rows instead of deciding what the user may see. Inside a
+    // batch a resident pool keeps `limit` requests in
+    // flight and refills a freed slot at once (no wave barrier), so one slow
+    // file no longer stalls its peers' round trips. `limit` follows the
+    // per-file AIMD controller, and a 429/509 pauses the whole upload
+    // direction for Retry-After before the pool resumes at half the depth.
+    for (
+      let index = 0;
+      index < smallUploads.length;
+      index += uploadCheckpointBatch(this.platform)
+    ) {
       if (!this.canContinue(operationEpoch, result)) break;
+      const batch = smallUploads.slice(
+        index,
+        index + uploadCheckpointBatch(this.platform),
+      );
       const batchStartedAt = Date.now();
-      const errorsBefore = result.errors;
-      const concurrency = uploadPolicy.limit;
-      const batch = smallUploads.slice(index, index + concurrency);
-      const completions = (await Promise.all(batch.map(async (item) => {
+      const batchPerfStartedAt = performance.now();
+      const batchErrorsBefore = result.errors;
+      const intents: MutationIntent[] = [];
+      const handoffs: CleanupWaveHandoff[] = [];
+      for (const item of batch) {
+        // A member blocked by the bundle preflight never reaches a mutation
+        // attempt (`executePlanItem` throws before `executeItem`), so the batch
+        // must not leave a durable intent behind for it: the per-file path
+        // creates the intent only after that check. Same map, same key as the
+        // throw below — one expression decides both.
+        const preflightBlocked =
+          communityPluginUploadErrors.get(item.path) !== undefined;
+        const intent = !preflightBlocked
+          && plan.scope
+          && isMutationAction(item.type)
+          && !item.requiresConfirmation
+          ? this.createMutationIntent(item, plan.scope)
+          : null;
+        if (intent) intents.push(intent);
+        handoffs.push({ intent, receipts: [] });
+      }
+      const intentStartedAt = Date.now();
+      const intentPerfStartedAt = performance.now();
+      await this.state.beginMutationIntents(intents);
+      const intentMs = performance.now() - intentPerfStartedAt;
+      // The batch owns the intent write, so it owns the counters the per-item
+      // path would have incremented (diagnostics read them per round).
+      metrics.mutationPersistence.intentWrites += intents.length;
+      metrics.mutationPersistence.stagesMs.intentPersist +=
+        Date.now() - intentStartedAt;
+      const completions: DeferredMutationCompletion[] = [];
+      const poolStartedAt = performance.now();
+      let pauseMs = 0;
+      const inFlight = new Set<Promise<void>>();
+      const noteUploadStep = (change: UploadConcurrencyChange | null): void => {
+        if (!change) return;
+        const cause = change.cause ? ` cause=${change.cause}` : "";
+        this.diag?.log(
+          "execute",
+          `upload concurrency ${change.from} → ${change.to} reason=${change.reason}${cause}`,
+          {
+            schemaVersion: 1,
+            from: change.from,
+            to: change.to,
+            reason: change.reason,
+            cause: change.cause ?? null,
+            windowThroughput: change.windowThroughput ?? null,
+            referenceMedian: change.referenceMedian ?? null,
+            maxConcurrency: uploadPolicy.maxLimit,
+          },
+        );
+      };
+      /** One settled file → the controller. Successes carry the PUT's own
+       *  duration; failures only reach the consecutive-failure rule (a rate
+       *  limit additionally pauses the whole direction); items that settled
+       *  without a PUT (preflight, conflict, cancel) say nothing about the
+       *  link. */
+      const settleUpload = (observation: UploadTransferObservation): void => {
+        if (observation.throttled) {
+          const throttle = uploadPolicy.noteThrottle(
+            Date.now(),
+            observation.retryAfterSeconds,
+          );
+          pauseMs += throttle.pauseMs;
+          this.diag?.warn(
+            "execute",
+            `upload throttled — 429/509 (${
+              observation.retryAfterSeconds === null
+                ? "no Retry-After"
+                : `Retry-After ${observation.retryAfterSeconds}s`
+            }); the whole upload direction pauses ${throttle.pauseMs}ms`,
+          );
+          noteUploadStep(throttle.change);
+          return;
+        }
+        if (observation.outcome === "failure") {
+          noteUploadStep(uploadPolicy.noteFailure());
+          return;
+        }
+        if (observation.outcome === "success") {
+          noteUploadStep(uploadPolicy.noteFile({
+            bytes: observation.bytes,
+            transferMs: observation.transferMs,
+          }));
+        }
+      };
+      /** Honour a Retry-After pause: no new upload request is issued while it
+       *  runs, and cancellation stays responsive (bounded slices). */
+      const waitOutThrottlePause = async (): Promise<void> => {
+        for (;;) {
+          const remaining = uploadPolicy.pauseRemainingMs(Date.now());
+          if (remaining <= 0 || !this.canContinue(operationEpoch, result)) return;
+          await new Promise<void>((resolve) => compatSetTimeout(
+            () => resolve(),
+            Math.min(remaining, UPLOAD_PAUSE_POLL_MS),
+          ));
+        }
+      };
+      const dispatchUpload = (offset: number): void => {
+        const item = batch[offset];
+        const observation: UploadTransferObservation = {
+          bytes: Math.max(0, item.local?.size ?? 0),
+          transferMs: 0,
+          outcome: "none",
+          throttled: false,
+          retryAfterSeconds: null,
+        };
         const preflightError = communityPluginUploadErrors.get(item.path);
-        return executePlanItem(
+        const task = executePlanItem(
           item,
           preflightError === undefined ? undefined : { error: preflightError },
-          true,
-        );
-      }))).filter(
-        (completion): completion is DeferredMutationCompletion =>
-          completion !== undefined,
+          handoffs[offset],
+          observation,
+        ).then((completion) => {
+          if (completion) completions.push(completion);
+          settleUpload(observation);
+        }).finally(() => {
+          inFlight.delete(task);
+        });
+        inFlight.add(task);
+      };
+      // Resident pool: a freed slot takes the next member right away, so a
+      // slow file delays only its own slot instead of the whole wave.
+      let nextOffset = 0;
+      while (
+        nextOffset < batch.length
+        && this.canContinue(operationEpoch, result)
+      ) {
+        if (uploadPolicy.pauseRemainingMs(Date.now()) > 0) {
+          await waitOutThrottlePause();
+          continue;
+        }
+        while (
+          inFlight.size < uploadPolicy.limit
+          && nextOffset < batch.length
+          && this.canContinue(operationEpoch, result)
+        ) {
+          dispatchUpload(nextOffset++);
+        }
+        if (inFlight.size === 0) break;
+        await Promise.race(inFlight);
+      }
+      await Promise.all(inFlight);
+      // PUT segment wall clock minus the throttling pauses it contains.
+      const networkMs = Math.max(
+        0,
+        performance.now() - poolStartedAt - pauseMs,
       );
-      if (!this.canContinue(operationEpoch, result)) break;
-      await commitDeferredUploadBatch(completions);
-      uploadPolicy.observeBatch({
+      // Receipts stay durable even when the round was cancelled inside the
+      // batch: the per-item path also wrote them before checking the epoch, so
+      // the next round's mutation recovery commits the checkpoint without
+      // re-observing the cloud. Only the shared checkpoint waits for the epoch.
+      const receipts = handoffs.flatMap((handoff) => handoff.receipts);
+      let receiptMs = 0;
+      if (receipts.length > 0) {
+        const receiptStartedAt = Date.now();
+        const receiptPerfStartedAt = performance.now();
+        await this.state.recordMutationReceipts(receipts);
+        metrics.mutationPersistence.stagesMs.receiptPersist +=
+          Date.now() - receiptStartedAt;
+        receiptMs = performance.now() - receiptPerfStartedAt;
+      }
+      let checkpointMs = 0;
+      let checkpointedOperations = 0;
+      let checkpointBreakdown: V2CommitBreakdown | undefined;
+      if (this.canContinue(operationEpoch, result)) {
+        const checkpointStartedAt = performance.now();
+        checkpointBreakdown = await commitDeferredCheckpointBatch(completions);
+        checkpointMs = performance.now() - checkpointStartedAt;
+        checkpointedOperations = completions.length;
+      } else if (completions.length > 0) {
+        // 取消落在批末：这些文件的 PUT 与回执都已落地，但共享检查点按契约
+        // 等 epoch，没有提交——先前逐条显示的「完成」本轮不成立，按实际
+        // 结果翻成失败（原因用现役取消句），下一轮由回执恢复结算。
+        revertDeferredCompletions(completions, this.t("result.cancelled"));
+      }
+      this.diag?.log("execute", "upload batch settled", {
         files: batch.length,
-        elapsedMs: Date.now() - batchStartedAt,
-        failed: result.errors > errorsBefore,
-      });
-      this.diag?.log("execute", "adaptive upload batch", {
-        schemaVersion: 1,
-        files: batch.length,
+        intents: intents.length,
+        receipts: receipts.length,
+        checkpointOperations: checkpointedOperations,
+        // Phase decomposition of the batch's fixed cost: the one intent write,
+        // the PUT segment (resident pool), the one receipt write and the one
+        // shared checkpoint. `pauseMs` is the part of the PUT segment that a
+        // 429/509 Retry-After held idle, so it is excluded from `networkMs`.
+        intentMs: Math.max(0, Math.round(intentMs)),
+        networkMs: Math.max(0, Math.round(networkMs)),
+        pauseMs: Math.max(0, Math.round(pauseMs)),
+        concurrency: uploadPolicy.limit,
+        receiptMs: Math.max(0, Math.round(receiptMs)),
+        checkpointMs: Math.max(0, Math.round(checkpointMs)),
+        // The same commit, split into its own phases: the counterpart of the
+        // `v2 commit breakdown` line this batch's checkpoint also logs, carried
+        // here so one row answers "where did checkpointMs go". A batch that
+        // needed the hierarchy-refresh retry reports the attempt that settled;
+        // observation only — nothing below reads it back.
+        checkpointBreakdown,
+        totalMs: Math.max(0, Math.round(performance.now() - batchPerfStartedAt)),
         elapsedMs: Math.max(0, Date.now() - batchStartedAt),
-        failed: result.errors > errorsBefore,
-        nextConcurrency: uploadPolicy.limit,
-        lockedSerial: uploadPolicy.isLockedSerial,
+        failed: result.errors > batchErrorsBefore,
       });
-      index += batch.length;
     }
 
     // Step 3c — large uploads parallelize across files (B②, 2026-09-14):
@@ -16151,11 +17117,26 @@ export class SyncExecutor {
     // transfer. Per-file checkpointing and error isolation are unchanged,
     // and executePlanItem settles every failure internally (no rethrow),
     // so this worker pool has the same Promise.all semantics as the small
-    // upload wave above. Mobile stays serial: two concurrent large uploads
+    // upload pool above. Mobile stays serial: two concurrent large uploads
     // would hold two full file reads plus two chunk buffers in memory.
+    // A small-upload 429/509 pause still covers the direction: the large pool
+    // waits it out before issuing its first session request.
+    for (;;) {
+      const remainingPauseMs = uploadPolicy.pauseRemainingMs(Date.now());
+      if (
+        remainingPauseMs <= 0
+        || !this.canContinue(operationEpoch, result)
+      ) {
+        break;
+      }
+      await new Promise<void>((resolve) => compatSetTimeout(
+        () => resolve(),
+        Math.min(remainingPauseMs, UPLOAD_PAUSE_POLL_MS),
+      ));
+    }
     const largeConcurrency = Math.min(
       largeUploads.length,
-      largeUploadConcurrency(Platform.isMobile),
+      largeUploadConcurrency(this.platform.isMobileApp),
     );
     let nextLargeUploadIndex = 0;
     await Promise.all(
@@ -16174,66 +17155,54 @@ export class SyncExecutor {
       }),
     );
 
-    // P1 — universal downloadUrl refresh batching: every plan download that
-    // lacks a fresh pre-signed URL (any platform, any size) is refreshed once
-    // up front through Graph $batch (20 ids per request) instead of paying one
-    // per-file `downloadUrlRefresh` round trip inside the download waterfall.
-    // This covers mobile (A1), desktop prefetch batches (whose members are now
-    // already filled and therefore skipped), and — the previously uncovered
-    // case — desktop large files (>8 MiB) that never enter the prefetch path.
-    // Running before the community-plugin bundle pre-download (A2 companion
-    // reorder, 2026-09-08) lets preflight member downloads reuse the same
-    // fresh URLs instead of paying their own per-file waterfall refresh.
-    // Any batch failure or malformed sub-response leaves URLs unset: plan
-    // downloads then refresh per file inside the download waterfall, while
-    // Step-3b prefetch members are handled by the per-batch prep below —
-    // which fails its own refresh closed per member (see 2026-09-08 review
-    // F2: the prep catch marks missing members failed instead of re-falling
-    // to the per-file GET; behaviour predates 1.4.3 and is intentionally
-    // fail-closed, comment kept in sync with the implementation).
-    const universalBatchMetadataClient = resolveBatchMetadataClient(this.onedrive);
-    const canBatchDownloadUrlRefresh = universalBatchMetadataClient !== null;
-    if (canBatchDownloadUrlRefresh) {
-      const missingDownloadUrl = downloads.filter(
-        (item) => item.type === SyncActionType.Download
-          && !item.remote?.downloadUrl
-          && Boolean(item.remote?.driveId),
+    // P1a (2026-10-27) — the up-front refresh of every missing downloadUrl is
+    // gone. Two thousand new files meant ~100 serial `$batch` POSTs (~5.8 s
+    // each on the field link) before the first content byte: two rounds were
+    // cancelled at 297 s / 260 s with 0 B transferred. The refresh now runs as
+    // a lookahead beside the download window (`startDownloadUrlLookahead`), so
+    // the first chunk's downloads start while the later chunks are still read.
+    //
+    // The one consumer that runs *before* that window — the selected
+    // community-plugin bundle pre-download below (A2 companion reorder,
+    // 2026-09-08) — keeps its own batched refresh, so its member downloads still
+    // reuse fresh URLs instead of paying one per-file waterfall refresh each.
+    // It is bounded by the selected bundles, never by the round size, and stays
+    // fail-open exactly like the old universal call: on any failure the URLs
+    // stay unset and the member's own download waterfall takes over.
+    const bundleBatchMetadataClient = resolveBatchMetadataClient(this.onedrive);
+    const refreshBundleDownloadUrls = async (
+      items: readonly SyncPlanItem[],
+    ): Promise<void> => {
+      if (!bundleBatchMetadataClient) return;
+      const missingDownloadUrl = items.filter(
+        (item) => !item.remote?.downloadUrl && Boolean(item.remote?.driveId),
       );
-      if (missingDownloadUrl.length > 0) {
-        const batchStartedAt = Date.now();
-        try {
-          const refreshed = await universalBatchMetadataClient(
-            missingDownloadUrl.map((item) => item.remote!.driveId),
-            "downloadUrlRefresh",
-          );
-          for (const item of missingDownloadUrl) {
-            const driveId = item.remote!.driveId;
-            const current = refreshed.get(driveId);
-            if (refreshedMetadataMatchesIdentity(current, driveId, item.remote!.eTag)) {
-              const downloadUrl = current["@microsoft.graph.downloadUrl"];
-              if (downloadUrl) item.remote!.downloadUrl = downloadUrl;
-            }
-            // No URL / identity mismatch / missing item: leave downloadUrl
-            // unset so the existing waterfall refresh (or error path) handles
-            // it exactly as before.
-          }
-          this.diag?.log("execute", "batch downloadUrl refresh", {
-            schemaVersion: 1,
-            files: missingDownloadUrl.length,
-            batchRequests: Math.ceil(missingDownloadUrl.length / 20),
-            elapsedMs: Math.max(0, Date.now() - batchStartedAt),
-          });
-        } catch (error) {
-          // Fail-closed: leave every URL unset; the serial loop re-fetches
-          // per file through the existing waterfall, as before batching.
-          this.diag?.warn(
-            "execute",
-            `batch downloadUrl refresh failed, falling back to per-file waterfall`,
-            describeError(error),
-          );
-        }
+      if (missingDownloadUrl.length === 0) return;
+      const batchStartedAt = Date.now();
+      try {
+        const refreshed = await bundleBatchMetadataClient(
+          missingDownloadUrl.map((item) => item.remote!.driveId),
+          "downloadUrlRefresh",
+        );
+        const filled = this.applyBatchedDownloadUrls(
+          missingDownloadUrl,
+          refreshed,
+        );
+        this.diag?.log("execute", "bundle downloadUrl refresh", {
+          schemaVersion: 1,
+          files: missingDownloadUrl.length,
+          filled,
+          batchRequests: Math.ceil(missingDownloadUrl.length / 20),
+          elapsedMs: Math.max(0, Date.now() - batchStartedAt),
+        });
+      } catch (error) {
+        this.diag?.warn(
+          "execute",
+          `bundle downloadUrl refresh failed, members fall back to the per-file waterfall`,
+          describeError(error),
+        );
       }
-    }
+    };
 
     let visibleBundleRoot = "";
     const preparedCommunityPluginDownloads =
@@ -16246,9 +17215,9 @@ export class SyncExecutor {
         (root, downloaded, totalBytes) => {
           if (visibleBundleRoot !== root) {
             visibleBundleRoot = root;
-            const position = total > 0
-              ? Math.min(started + 1, total)
-              : 0;
+            // 计数只按已结算项推进：预取中的插件目录只占「当前文件」槽，
+            // 不提前把计数推高一格（否则结算后同一格会被推两次）。
+            const position = total > 0 ? Math.min(settled, total) : 0;
             this.progressStore?.setProgress(
               position,
               total,
@@ -16259,6 +17228,7 @@ export class SyncExecutor {
           }
           callbacks.onFileProgress?.(downloaded, totalBytes);
         },
+        refreshBundleDownloadUrls,
       );
 
     // Step 3b — only the read-only network stage of independent small
@@ -16277,21 +17247,203 @@ export class SyncExecutor {
       metrics,
     });
 
-    // Step 4 — cleanup (file deletes) after all uploads/downloads. Each
-    // delete is an independent identity/eTag-guarded round trip, so run a
-    // bounded batch to overlap the latency — the previous strict serial loop
-    // made bulk local-delete rounds cost one remote RTT per file. Per-item
-    // fail-closed semantics are unchanged (remote-version changes route to
-    // conflict/defer) and shared state commits stay serialized by the state
-    // queues; folder shells keep their child-first serial order in Step 5.
+    // Step 4 — cleanup (file deletes) after all uploads/downloads. A wave
+    // pre-writes every member's mutation intent in one device-local commit,
+    // runs the DELETEs with bounded network concurrency, then publishes one
+    // shared checkpoint and one receipt/ledger write for the whole wave. Per
+    // item fail-closed semantics are unchanged (remote-version changes route
+    // to conflict/defer) and wave members are independent paths, which the
+    // shared checkpoint's independence assertion requires. Folder shells keep
+    // their child-first order in Step 5.
+    const settledDecisionEntries: Array<{ token: string; path: string }> = [];
     for (
       let index = 0;
       index < cleanupItems.length;
-      index += DELETE_CLEANUP_BATCH
+      index += deleteCheckpointWave(this.platform)
     ) {
       if (!this.canContinue(operationEpoch, result)) break;
-      const batch = cleanupItems.slice(index, index + DELETE_CLEANUP_BATCH);
-      await Promise.all(batch.map((item) => executePlanItem(item)));
+      const wave = cleanupItems.slice(
+        index,
+        index + deleteCheckpointWave(this.platform),
+      );
+      // Preflight: no intent write and no DELETE may run for a wave the shared
+      // checkpoint would refuse later (see the guard's own comment).
+      assertCleanupWaveWithinCheckpointLimit(wave.length);
+      const intents: MutationIntent[] = [];
+      const handoffs: CleanupWaveHandoff[] = [];
+      for (const item of wave) {
+        const intent = plan.scope
+          && isMutationAction(item.type)
+          && !item.requiresConfirmation
+          ? this.createMutationIntent(item, plan.scope)
+          : null;
+        if (intent) intents.push(intent);
+        handoffs.push({ intent, receipts: [] });
+      }
+      const waveStartedAt = Date.now();
+      // Wall-clock marks for the phase log line only. No wave decision, batch
+      // size, ordering or counter below reads them, so measuring the wave
+      // cannot change what the wave does.
+      const wavePerfStartedAt = performance.now();
+      const intentStartedAt = Date.now();
+      const intentPerfStartedAt = performance.now();
+      await this.state.beginMutationIntents(intents);
+      const intentMs = performance.now() - intentPerfStartedAt;
+      // The wave owns the intent write, so it owns the counters the per-item
+      // path would have incremented (diagnostics read them per round).
+      metrics.mutationPersistence.intentWrites += intents.length;
+      metrics.mutationPersistence.stagesMs.intentPersist +=
+        Date.now() - intentStartedAt;
+      const ledgerSink: DeletionLedgerEntryV1[] = [];
+      /** Wave members that erase this device's only copy because the cloud
+       *  already lost them (`DeleteLocal`, see `localDeleteAbsenceProof`).
+       *  Only members that will really run are read for: the branch returns
+       *  early without one. */
+      const localDeletePaths = wave
+        .filter((item) => item.type === SyncActionType.DeleteLocal
+          && item.local !== undefined)
+        .map((item) => item.path);
+      // One batched absence read for the whole wave, before its first erase:
+      // the wave-level proof replaces one metadata GET per file (the per-file
+      // fixed cost that kept this path at 186 ms/file on iOS). A failed read
+      // returns an empty set, so every member falls back to the ordinary
+      // per-file check; the per-file local re-check is untouched either way.
+      const localDeleteAbsent = localDeletePaths.length === 0
+        ? null
+        : await this.verifyRemoteDeleteBatchAbsence(localDeletePaths);
+      /** One sample per wave member: the whole `executePlanItem` call, so
+       *  local preparation and the DELETE round trip are both inside. */
+      const deleteItemMs: number[] = [];
+      /** One sample per remote DELETE request (see `deleteRequestTimingSink`),
+       *  i.e. the network-only part of a `DeleteRemote` member. */
+      const deleteRequestMs: number[] = [];
+      let networkMs = 0;
+      let waveError: unknown;
+      let completions: DeferredMutationCompletion[];
+      this.deletionLedgerSink = ledgerSink;
+      this.deleteRequestTimingSink = deleteRequestMs;
+      this.localDeleteAbsenceProof = localDeleteAbsent;
+      const networkPerfStartedAt = performance.now();
+      try {
+        const settled = await mapWithBoundedConcurrency(
+          wave,
+          deleteCleanupNetworkConcurrency(this.platform),
+          async (item, waveIndex) => {
+            const itemPerfStartedAt = performance.now();
+            try {
+              return await executePlanItem(item, undefined, handoffs[waveIndex]);
+            } catch (error) {
+              waveError ??= error;
+              return undefined;
+            } finally {
+              deleteItemMs.push(performance.now() - itemPerfStartedAt);
+            }
+          },
+        );
+        networkMs = performance.now() - networkPerfStartedAt;
+        completions = settled.filter(
+          (completion): completion is DeferredMutationCompletion =>
+            completion !== undefined,
+        );
+      } finally {
+        this.deletionLedgerSink = null;
+        this.deleteRequestTimingSink = null;
+        this.localDeleteAbsenceProof = null;
+      }
+      const receipts = handoffs.flatMap((handoff) => handoff.receipts);
+      let receiptMs = 0;
+      if (receipts.length > 0) {
+        const receiptStartedAt = Date.now();
+        const receiptPerfStartedAt = performance.now();
+        try {
+          await this.state.recordMutationReceipts(receipts);
+          metrics.mutationPersistence.stagesMs.receiptPersist +=
+            Date.now() - receiptStartedAt;
+          receiptMs = performance.now() - receiptPerfStartedAt;
+        } catch (error) {
+          metrics.mutationPersistence.stagesMs.receiptPersist +=
+            Date.now() - receiptStartedAt;
+          throw error;
+        }
+      }
+      let ledgerMs = 0;
+      if (ledgerSink.length > 0) {
+        const ledgerPerfStartedAt = performance.now();
+        // Same contract as the per-file clue: a failed ledger write must never
+        // turn already-applied deletes into failures, so it only logs.
+        try {
+          await this.state.recordCloudDeletions(ledgerSink);
+        } catch (error) {
+          this.diag?.warn(
+            "execute",
+            `cloud deletion wave could not be recorded for recovery — ${ledgerSink.length} file(s)`,
+            describeError(error),
+          );
+        } finally {
+          ledgerMs = performance.now() - ledgerPerfStartedAt;
+        }
+      }
+      const checkpointPerfStartedAt = performance.now();
+      await commitDeferredCheckpointBatch(completions);
+      const checkpointMs = performance.now() - checkpointPerfStartedAt;
+      // A delete is only consumed after this wave's checkpoint settled. A
+      // failed or skipped path never enters `completions`, so its decision
+      // stays recorded and can run again next round.
+      for (const completion of completions) {
+        if (completion.actionType !== SyncActionType.DeleteLocal) continue;
+        const token = this.activeLocalDeleteDecisionEntries?.get(
+          completion.path,
+        );
+        if (token) {
+          settledDecisionEntries.push({ token, path: completion.path });
+        }
+      }
+      const totalMs = performance.now() - wavePerfStartedAt;
+      this.diag?.log("execute", "cleanup wave settled", {
+        files: wave.length,
+        receipts: receipts.length,
+        deletions: ledgerSink.length,
+        checkpointOperations: completions.length,
+        // Local-follow members of this wave and how many of them the one
+        // batched absence read proved absent (the rest re-verified per file).
+        localDeletes: localDeletePaths.length,
+        localDeletesPreverified: localDeleteAbsent?.size ?? 0,
+        // A wave is now decomposable: intent write, the concurrent DELETE
+        // segment, the receipt write, the ledger write, the shared checkpoint,
+        // and their wall-clock total.
+        intentMs: Math.max(0, Math.round(intentMs)),
+        networkMs: Math.max(0, Math.round(networkMs)),
+        receiptMs: Math.max(0, Math.round(receiptMs)),
+        ledgerMs: Math.max(0, Math.round(ledgerMs)),
+        checkpointMs: Math.max(0, Math.round(checkpointMs)),
+        totalMs: Math.max(0, Math.round(totalMs)),
+        // Per-member duration (whole item) and per-request duration of the
+        // DELETE round trips, as count/p50/p95/max.
+        deleteItemLatencyMs: summarizeLatencyMs(deleteItemMs),
+        deleteRequestLatencyMs: summarizeLatencyMs(deleteRequestMs),
+        elapsedMs: Math.max(0, Date.now() - waveStartedAt),
+        error: waveError === undefined ? undefined : describeError(waveError),
+      });
+      if (waveError !== undefined) {
+        throw waveError instanceof Error
+          ? waveError
+          : new Error(describeThrownValue(waveError));
+      }
+    }
+
+    if (settledDecisionEntries.length > 0) {
+      try {
+        await this.state.settleLocalDeleteDecisions(settledDecisionEntries);
+      } catch (error) {
+        // The local files are already gone; a failed consume write only leaves
+        // stale paths that the next plan prunes after proving both sides are
+        // absent. Never turn it into a failed delete or a second erase.
+        this.diag?.warn(
+          "state",
+          "failed to consume local delete decisions after settled delete checkpoints",
+          describeError(error),
+        );
+      }
     }
 
     // Step 5 — directory shells are removed child-first only after every file
@@ -16315,16 +17467,19 @@ export class SyncExecutor {
       for (
         let index = 0;
         index < layer.length;
-        index += DELETE_CLEANUP_BATCH
+        index += deleteCleanupBatch(this.platform)
       ) {
         if (!this.canContinue(operationEpoch, result)) break;
-        const batch = layer.slice(index, index + DELETE_CLEANUP_BATCH);
+        const batch = layer.slice(
+          index,
+          index + deleteCleanupBatch(this.platform),
+        );
         await Promise.all(batch.map((item) => executePlanItem(item)));
       }
     }
 
     if (!this.canContinue(operationEpoch, result)) {
-      this.diag?.log("execute", `sync cancelled after starting ${started}/${total} item(s)`);
+      this.diag?.log("execute", `sync cancelled after settling ${settled}/${total} item(s)`);
       this.markCancelled(result);
       return;
     }
@@ -16335,6 +17490,34 @@ export class SyncExecutor {
         retainedMutationRecovery,
       )
     ) {
+      // The run is about to stop on a net-new unresolved checkpoint (for
+      // example a folder receipt whose reducer precondition refused the
+      // committed state). Name the records here so the diagnostic report
+      // answers "which mutation is unsettled" instead of only the generic
+      // round-level sentence, and state the recovery action the next ordinary
+      // round performs. Observation only: no counter or decision below reads
+      // this back.
+      const retainedIds = new Set(
+        retainedMutationRecovery.map((record) => record.intent.operationId),
+      );
+      const unresolved = this.state.mutationLedger
+        .filter((record) => !retainedIds.has(record.intent.operationId))
+        .map((record) => ({
+          operationId: record.intent.operationId,
+          action: record.intent.action,
+          path: record.intent.path,
+          receipted: record.receipt !== null,
+        }));
+      this.diag?.warn(
+        "execute",
+        "round stopped with unresolved mutation checkpoints",
+        {
+          remaining: unresolved.length,
+          records: unresolved,
+          nextAction:
+            "run one ordinary sync so the remote delta can absorb the applied change and the receipted checkpoint is replayed; if the same record remains unresolved, generate a diagnostic report before resetting state",
+        },
+      );
       throw new Error("Mutation recovery is unresolved; shared state checkpoint stopped");
     }
 
@@ -16385,7 +17568,7 @@ export class SyncExecutor {
     }
     this.diag?.log(
       "execute",
-      `upload summary — files=${result.uploaded}, bytes=${metrics.uploadBytes}, peak=${metrics.peakUploads}/${(Platform.isMobile ? 2 : 4) + largeUploadConcurrency(Platform.isMobile)}, readMs=${metrics.uploadReadMs}, networkMs=${metrics.uploadNetworkMs}, elapsedMs=${Date.now() - startedAt}`,
+      `upload summary — files=${result.uploaded}, bytes=${metrics.uploadBytes}, peak=${metrics.peakUploads}/${uploadPolicy.maxLimit + largeUploadConcurrency(this.platform.isMobileApp)}, readMs=${metrics.uploadReadMs}, busyMs=${Math.round(metrics.fileTransfers.upload.busyMs)}, elapsedMs=${Date.now() - startedAt}`,
     );
 
   }
@@ -16534,17 +17717,35 @@ export class SyncExecutor {
   /** Build the mutation checkpoint from the item's committed effects and
    *  persist the applied mutation's receipt before the checkpoint commit is
    *  decided; every input is read-only. */
-  private async persistPlanItemMutationReceipt(args: {
-    item: SyncPlanItem;
-    itemResult: ItemExecutionResult;
-    itemRemoteUpserts: RemoteFileEntry[];
-    itemRemoteDeletes: string[];
-    mutationIntent: MutationIntent;
-    automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
-    metrics: ExecutionMetrics;
-    isFolderMove: (candidate: SyncPlanItem) => boolean;
-    isFolderDelete: (candidate: SyncPlanItem) => boolean;
-  }): Promise<void> {
+  private async persistPlanItemMutationReceipt(
+    args: PlanItemMutationReceiptArgs,
+  ): Promise<void> {
+    const { mutationIntent, metrics } = args;
+    const receiptStartedAt = Date.now();
+    const receipt = this.buildPlanItemMutationReceipt(args);
+    await this.state.recordMutationReceipt(receipt);
+    this.diag?.log(
+      "state",
+      "mutation receipt persisted after execution",
+      {
+        operationId: mutationIntent.operationId,
+        action: mutationIntent.action,
+        path: mutationIntent.path,
+        completedAt: receipt.completedAt,
+        mutations: 0,
+      },
+    );
+    metrics.mutationPersistence.receiptWrites++;
+    metrics.mutationPersistence.stagesMs.receiptPersist +=
+      Date.now() - receiptStartedAt;
+  }
+
+  /** Receipt construction half of `persistPlanItemMutationReceipt`; the
+   *  cleanup wave collects these and writes them in one device-local commit
+   *  together with its cloud-deletion clues. */
+  private buildPlanItemMutationReceipt(
+    args: PlanItemMutationReceiptArgs,
+  ): MutationReceiptV1 {
     const {
       item,
       itemResult,
@@ -16552,7 +17753,6 @@ export class SyncExecutor {
       itemRemoteDeletes,
       mutationIntent,
       automaticHandlingPolicy,
-      metrics,
       isFolderMove,
       isFolderDelete,
     } = args;
@@ -16574,37 +17774,231 @@ export class SyncExecutor {
           : [remoteId];
       }
     }
+    // A folder delete settles its own confirmation row here. Without this the
+    // row would outlive the checkpoint, and once the decision is consumed the
+    // UI would show it as pending again until the next plan pruned it.
+    if (isFolderDelete(item)) {
+      checkpoint.pendingDeleteRemovals.push(item.path);
+    }
     if (automaticHandlingPolicy.autoDeleteLocalFiles
       && item.type === SyncActionType.DeleteLocal) {
       checkpoint.pendingDeleteRemovals.push(item.path);
     }
-    const receipt: MutationReceiptV1 = {
+    return {
       version: 1,
       operationId: mutationIntent.operationId,
       completedAt: Date.now(),
       checkpoint,
     };
-    const receiptStartedAt = Date.now();
-    await this.state.recordMutationReceipt(receipt);
-    this.diag?.log(
-      "state",
-      "mutation receipt persisted after execution",
-      {
-        operationId: mutationIntent.operationId,
-        action: mutationIntent.action,
-        path: mutationIntent.path,
-        completedAt: receipt.completedAt,
-        mutations: 0,
-      },
-    );
-    metrics.mutationPersistence.receiptWrites++;
-    metrics.mutationPersistence.stagesMs.receiptPersist +=
-      Date.now() - receiptStartedAt;
   }
 
-  /** Step 3b download window: overlap only the read-only network stage of
-   *  independent small downloads; local CAS, temp verification, intent/
-   *  receipt and checkpoint publication stay strictly serial per file. */
+  /** Fill fresh pre-signed download URLs from one batched metadata read into
+   *  the plan items it was read for. Acceptance is the shared identity gate and
+   *  nothing else: an entry fills its item only while it still carries the
+   *  item's driveId *and* the eTag the plan was built against, so a moved or
+   *  re-written file keeps its URL unset and the existing fail-closed fallbacks
+   *  (per-batch refresh, then the per-file waterfall) keep their meaning.
+   *  Returns the number of items actually filled. */
+  private applyBatchedDownloadUrls(
+    items: readonly SyncPlanItem[],
+    refreshed: ReadonlyMap<string, DriveItem | null>,
+  ): number {
+    let filled = 0;
+    for (const item of items) {
+      const driveId = item.remote?.driveId;
+      if (!driveId || item.remote?.downloadUrl) continue;
+      const current = refreshed.get(driveId);
+      if (!refreshedMetadataMatchesIdentity(current, driveId, item.remote!.eTag)) {
+        continue;
+      }
+      const downloadUrl = current["@microsoft.graph.downloadUrl"];
+      if (!downloadUrl) continue;
+      item.remote!.downloadUrl = downloadUrl;
+      filled++;
+    }
+    return filled;
+  }
+
+  /** Start the download URL refresh lookahead that runs beside one download
+   *  window (2026-10-27).
+   *
+   *  The round used to mint every missing pre-signed URL before the window
+   *  opened: one `$batch` POST per 20 files, strictly serial — 2,000 new files
+   *  meant ~100 requests and, at the field link's ~5.8 s each, ~10 minutes of
+   *  0 B transferred (rounds cancelled at 297 s / 260 s). This reads the same
+   *  2,000 ids through the same client call, but the client publishes each
+   *  20-id chunk as it resolves; the chunk's URLs are filled into the plan items
+   *  immediately and the window starts downloading them while the remaining
+   *  chunks are still in flight. Request shape, request count, the identity gate
+   *  and the per-chunk isolation are unchanged.
+   *
+   *  Failure isolation: a chunk that loses its POST is already degraded by the
+   *  client to per-item GETs for exactly its own 20 ids; a call that still dies
+   *  (auth expiry, abort, network down) keeps every chunk already published and
+   *  leaves only the unread tail to the window's existing per-batch refresh —
+   *  the same fail-open contract the old up-front call had, scoped to what was
+   *  not read instead of discarding URLs that had already been minted. */
+  private startDownloadUrlLookahead(args: {
+    downloads: readonly SyncPlanItem[];
+    batchMetadataClient: NonNullable<
+      ReturnType<typeof resolveBatchMetadataClient>
+    >;
+    result: SyncResult;
+    operationEpoch: number;
+  }): {
+    /** Resolve once the chunk covering every missing-URL member of `items` has
+     *  been published, or once the whole read has settled. */
+    awaitCoverage: (items: readonly SyncPlanItem[]) => Promise<void>;
+    /** Settle the lookahead so no read outlives the window. Never rejects. */
+    drain: () => Promise<void>;
+  } {
+    const { downloads, batchMetadataClient, result, operationEpoch } = args;
+    const refreshItems = downloads.filter(
+      (item) => Boolean(item.remote?.driveId) && !item.remote?.downloadUrl,
+    );
+    if (refreshItems.length === 0) {
+      // Nothing to mint (every URL is already fresh): no request, exactly as
+      // the former up-front refresh skipped this case.
+      return {
+        awaitCoverage: async (): Promise<void> => {},
+        drain: async (): Promise<void> => {},
+      };
+    }
+    const indexByPath = new Map<string, number>();
+    refreshItems.forEach((item, index) => {
+      indexByPath.set(item.path, index);
+    });
+    let covered = 0;
+    let filled = 0;
+    let publishedChunks = 0;
+    let waitedMs = 0;
+    const waiters: Array<() => void> = [];
+    const wakeWaiters = (): void => {
+      if (waiters.length === 0) return;
+      const pending = waiters.splice(0);
+      for (const wake of pending) wake();
+    };
+    const publish = (refreshed: ReadonlyMap<string, DriveItem | null>): void => {
+      const filledNow = this.applyBatchedDownloadUrls(downloads, refreshed);
+      filled += filledNow;
+      // Chunks are published in plan order, so coverage only advances while the
+      // next waiting item was part of this chunk.
+      while (
+        covered < refreshItems.length
+        && refreshed.has(refreshItems[covered].remote!.driveId)
+      ) {
+        covered++;
+      }
+      wakeWaiters();
+    };
+
+    const startedAt = Date.now();
+    const tail = (async (): Promise<void> => {
+      try {
+        const refreshed = await batchMetadataClient(
+          refreshItems.map((item) => item.remote!.driveId),
+          "downloadUrlRefresh",
+          {
+            onChunkResolved: (chunk) => {
+              publishedChunks++;
+              publish(chunk);
+              this.diag?.log("execute", "download URL refresh chunk published", {
+                schemaVersion: 1,
+                chunk: publishedChunks,
+                files: chunk.size,
+                filled,
+                elapsedMs: Math.max(0, Date.now() - startedAt),
+              });
+            },
+          },
+        );
+        publish(refreshed);
+      } catch (error) {
+        // Fail-open with respect to the published prefix: every chunk that
+        // already resolved keeps its URLs, so its downloads are unaffected.
+        // Only the unread tail falls back to the window's per-batch refresh.
+        this.diag?.warn(
+          "execute",
+          `download URL refresh lookahead stopped, per-batch refresh takes over`,
+          describeError(error),
+        );
+      } finally {
+        covered = refreshItems.length;
+        wakeWaiters();
+        this.diag?.log("execute", "batch downloadUrl refresh", {
+          schemaVersion: 1,
+          files: refreshItems.length,
+          // A failed chunk is isolated inside the client and comes back as
+          // per-item reads, so `filled` is the field signal for how much of
+          // the round stayed on the batched path.
+          filled,
+          batchRequests: Math.ceil(refreshItems.length / 20),
+          publishedChunks,
+          waitedMs: Math.max(0, waitedMs),
+          elapsedMs: Math.max(0, Date.now() - startedAt),
+        });
+      }
+    })();
+
+    return {
+      awaitCoverage: async (items: readonly SyncPlanItem[]): Promise<void> => {
+        let lastIndex = -1;
+        for (const item of items) {
+          const index = indexByPath.get(item.path);
+          if (index !== undefined && index > lastIndex) lastIndex = index;
+        }
+        while (lastIndex >= covered) {
+          const waitStartedAt = Date.now();
+          await new Promise<void>((resolve) => {
+            waiters.push(resolve);
+          });
+          waitedMs += Math.max(0, Date.now() - waitStartedAt);
+          // A cancelled window must not keep waiting for chunks it will never
+          // download; the tail settlement also wakes this loop.
+          if (!this.canContinue(operationEpoch, result)) return;
+        }
+      },
+      drain: async (): Promise<void> => {
+        await tail;
+      },
+    };
+  }
+
+  /** Step 3b download window — three-stage pipeline plus a URL lookahead
+   *  (2026-10-27).
+   *
+   *  Only the read-only network stages of independent small downloads
+   *  overlap. Three lanes, each in plan order:
+   *
+   *  1. transfer: build the batch, take its URLs from the lookahead, download
+   *               + hash;
+   *  2. verify:   one `$batch` identity re-read for the batch's hashless
+   *               files, then the adaptive-policy observation;
+   *  3. commit:   the batch's per-file `executePlanItem` — intent, local CAS,
+   *               receipt, checkpoint — strictly serial and in batch order.
+   *
+   *  The URL lookahead (`startDownloadUrlLookahead` below) replaced the
+   *  up-front refresh of every missing `downloadUrl` (P1): that call made
+   *  2,000 new files pay ~100 serial `$batch` POSTs — 297 s / 260 s rounds were
+   *  cancelled with 0 B transferred on the field link. The same single batched
+   *  read now publishes each 20-id chunk as it resolves; this window fills the
+   *  published URLs into the plan items through the unchanged identity gate and
+   *  a batch waits only for the chunk that covers it, so content downloads and
+   *  the remaining URL chunks overlap.
+   *
+   *  Batch N's verify and its local commits therefore run while batch N+1's
+   *  content is already transferring and hashing; the row for a file still
+   *  appears from its own commit as soon as its batch verified, never after
+   *  the next batch. SC-15 is unchanged: the commit lane is the only state
+   *  writer, so two batches' checkpoints cannot interleave, `commitSeq` keeps
+   *  advancing in order, and every checkpoint stays behind its own receipts.
+   *  Failure semantics are unchanged: a transfer error rides in the prepared
+   *  slot, an eTag drift still fails that item closed with
+   *  `DownloadRemoteVersionChangedError`, and neighbouring batches keep their
+   *  own outcomes. A member that cannot be prefetched (large file, rename,
+   *  bundle) is a barrier: both lanes drain first, so only the read-only
+   *  small-file stage is ever concurrent.
+   */
   private async runDownloadWindow(args: {
     result: SyncResult;
     operationEpoch: number;
@@ -16613,7 +18007,6 @@ export class SyncExecutor {
     executePlanItem: (
       item: SyncPlanItem,
       preparedDownload?: PreparedDownload,
-      deferUploadCheckpoint?: boolean,
     ) => Promise<DeferredMutationCompletion | undefined>;
     preparedCommunityPluginDownloads: Awaited<
       ReturnType<SyncExecutor["prepareCommunityPluginBundleDownloads"]>
@@ -16629,21 +18022,138 @@ export class SyncExecutor {
       preparedCommunityPluginDownloads,
       metrics,
     } = args;
+    // One capability probe serves both the per-batch URL prep (lane 1) and the
+    // post-transfer version check (lane 2); the probe itself is unchanged.
+    const metadataBatchClient = resolveBatchMetadataClient(this.onedrive);
+    const canBatchMetadata = metadataBatchClient !== null;
+    // URL lookahead (2026-10-27): started beside the window so the first chunk
+    // of pre-signed URLs is available to the first batch and the remaining
+    // chunks are read while this window's content transfers. Covers every
+    // download that lacks a URL, including the large files and rename/move
+    // members that never enter the prefetch batches.
+    const downloadUrlLookahead = metadataBatchClient
+      ? this.startDownloadUrlLookahead({
+        downloads,
+        batchMetadataClient: metadataBatchClient,
+        result,
+        operationEpoch,
+      })
+      : null;
     let downloadIndex = 0;
+
+    // Pipeline bookkeeping. Neither tail rejects: a lane failure is parked in
+    // `pipelineError`, the producer stops handing off batches, and the window
+    // rethrows it only after every handed-off batch has settled (no dangling
+    // transfer, state write or unhandled rejection).
+    let verifyTail: Promise<void> = Promise.resolve();
+    let commitTail: Promise<void> = Promise.resolve();
+    let pipelineError: unknown = null;
+    /** Handed-off batches not yet committed, oldest first. This is the
+     *  backpressure gate that keeps at most
+     *  {@link DOWNLOAD_PIPELINE_IN_FLIGHT_BATCHES} prepared payloads alive. */
+    const pendingBatches: Promise<void>[] = [];
+
+    const commitPreparedBatch = async (
+      batch: SyncPlanItem[],
+      prepared: PreparedDownload[],
+    ): Promise<void> => {
+      if (!this.canContinue(operationEpoch, result)) {
+        // Same accounting as the former post-prefetch cancellation gate: a
+        // prepared batch that never commits counts as cancelled exactly once,
+        // and its files report nothing (they were not attempted).
+        metrics.fileTransfers.download.cancelled += batch.length;
+        return;
+      }
+      for (let index = 0; index < batch.length; index++) {
+        if (!this.canContinue(operationEpoch, result)) break;
+        await executePlanItem(batch[index], prepared[index]);
+      }
+    };
+
+    const handOffPreparedBatch = (
+      batch: SyncPlanItem[],
+      prepared: PreparedDownload[],
+      batchStartedAt: number,
+      preparedAt: number,
+      batchTransferMs: number,
+      shouldBatchVersionVerification: boolean,
+    ): void => {
+      // Capture the tails this batch must respect; later hand-offs append to
+      // them, so reading the fields inside a deferred callback would chain a
+      // batch behind its successors.
+      const previousVerify = verifyTail;
+      const previousCommit = commitTail;
+      const verified = previousVerify.then(async () => {
+        if (pipelineError !== null) return;
+        await this.verifyDownloadBatchAfterTransfer({
+          batch,
+          prepared,
+          metadataBatchClient,
+          shouldBatchVersionVerification,
+          downloadPolicy,
+          metrics,
+          batchStartedAt,
+          preparedAt,
+          verifyStartedAt: Date.now(),
+          batchTransferMs,
+        });
+      });
+      verifyTail = verified.catch((error) => {
+        pipelineError ??= error;
+      });
+      const committed = verified
+        .then(() => previousCommit)
+        .then(async () => {
+          if (pipelineError !== null) return;
+          await commitPreparedBatch(batch, prepared);
+        })
+        .catch((error) => {
+          pipelineError ??= error;
+        });
+      commitTail = committed;
+      pendingBatches.push(committed);
+    };
+
+    const awaitOldestPreparedBatch = async (): Promise<void> => {
+      const oldest = pendingBatches.shift();
+      if (oldest) await oldest;
+    };
+    /** Barrier / window end: wait until every handed-off batch committed (or
+     *  failed) so a non-prefetchable member never runs beside a pipeline
+     *  commit and the caller only sees a settled window. */
+    const drainPreparedBatches = async (): Promise<void> => {
+      while (pendingBatches.length > 0) await awaitOldestPreparedBatch();
+    };
+
     while (downloadIndex < downloads.length && this.canContinue(operationEpoch, result)) {
+      if (pipelineError !== null) break;
       const first = downloads[downloadIndex];
       const preparedCommunityPluginDownload =
         preparedCommunityPluginDownloads.get(first.path);
       if (preparedCommunityPluginDownload) {
+        // Not a pipeline member: the bundle bytes are already in memory and
+        // its commit is one local write. Run it in plan order, alone.
+        await drainPreparedBatches();
+        if (pipelineError !== null) break;
         await executePlanItem(first, preparedCommunityPluginDownload);
         downloadIndex++;
         continue;
       }
       const eligible = await this.canPrefetchDownload(first);
       if (!eligible) {
+        await drainPreparedBatches();
+        if (pipelineError !== null) break;
+        // A non-prefetchable member (large file, rename/move) still downloads
+        // from the lookahead's batched URL instead of its own waterfall.
+        await downloadUrlLookahead?.awaitCoverage([first]);
         await executePlanItem(first);
         downloadIndex++;
         continue;
+      }
+
+      if (pendingBatches.length >= DOWNLOAD_PIPELINE_IN_FLIGHT_BATCHES) {
+        await awaitOldestPreparedBatch();
+        if (pipelineError !== null || !this.canContinue(operationEpoch, result)) break;
       }
 
       const batch: SyncPlanItem[] = [first];
@@ -16655,9 +18165,12 @@ export class SyncExecutor {
         downloadIndex++;
       }
 
+      // Wait only for the chunk that covers this batch; the remaining chunks
+      // are still being read while this batch's bytes move. Items the chunk
+      // could not fill (identity drift, failed chunk) keep their existing
+      // per-batch refresh below, unchanged.
+      await downloadUrlLookahead?.awaitCoverage(batch);
       const batchStartedAt = Date.now();
-      const metadataBatchClient = resolveBatchMetadataClient(this.onedrive);
-      const canBatchMetadata = metadataBatchClient !== null;
       const missingDownloadUrl = batch.filter((item) =>
         !item.remote?.downloadUrl && Boolean(item.remote?.driveId)
       );
@@ -16690,6 +18203,11 @@ export class SyncExecutor {
         }
       }
       let activePrefetch = 0;
+      // Sum of this batch's own content-transfer durations. The concurrency
+      // controller's recovery signal reads only this: metadata refresh,
+      // sha256 and the remote verification below are not link evidence (C2,
+      // docs/temp/20261026-1240).
+      let batchTransferMs = 0;
       const prepared = await Promise.all(batch.map(async (item): Promise<PreparedDownload> => {
         metrics.fileTransfers.download.started++;
         activePrefetch++;
@@ -16722,8 +18240,10 @@ export class SyncExecutor {
               ),
             );
           } finally {
+            const transferElapsedMs = Date.now() - transferStartedAt;
             metrics.fileTransfers.download.stagesMs.contentTransfer +=
-              Date.now() - transferStartedAt;
+              transferElapsedMs;
+            batchTransferMs += transferElapsedMs;
           }
           const hashStartedAt = Date.now();
           const downloaded = {
@@ -16753,86 +18273,166 @@ export class SyncExecutor {
           );
         }
       }));
-      const hashlessVerificationIndexes = prepared.flatMap((preparedItem, index) =>
-        preparedItem.error === undefined
-          && preparedItem.downloaded
-          && !batch[index].remote?.sha256Hash
-          ? [index]
-          : []
+      // Hand the prepared payload to the batch-ordered verify lane and return
+      // to stage 1 at once: the next batch's transfers now run beside this
+      // batch's `$batch` check and its serial local commits.
+      handOffPreparedBatch(
+        batch,
+        prepared,
+        batchStartedAt,
+        Date.now(),
+        batchTransferMs,
+        shouldBatchVersionVerification,
       );
-      if (shouldBatchVersionVerification && hashlessVerificationIndexes.length > 0) {
-        const remoteVerifyStartedAt = Date.now();
-        try {
-          const currentById = await metadataBatchClient(
-            hashlessVerificationIndexes.map((index) => batch[index].remote!.driveId),
-            "downloadVersionVerify",
-          );
-          for (const index of hashlessVerificationIndexes) {
-            const item = batch[index];
-            const current = currentById.get(item.remote!.driveId);
-            try {
-              if (!refreshedMetadataMatchesIdentity(current, item.remote!.driveId, item.remote!.eTag)) {
-                throw new DownloadRemoteVersionChangedError(item.path);
-              }
-              await this.verifyDownloadedPayload(
-                item.path,
-                item.remote!,
-                prepared[index].downloaded!,
-                true,
-              );
-            } catch (error) {
-              prepared[index] = { error };
+    }
+    await drainPreparedBatches();
+    // A normally completed window consumed every chunk, so settling the
+    // lookahead here is a no-op guard that no URL read outlives the window. A
+    // failed or cancelled window deliberately does not queue behind it: the
+    // read is tied to the run's abort signal, and an error must not wait for a
+    // slow metadata request. Nothing durable is written there — only plan
+    // items and log lines.
+    if (pipelineError === null && this.canContinue(operationEpoch, result)) {
+      await downloadUrlLookahead?.drain();
+    }
+    if (pipelineError !== null) {
+      throw pipelineError instanceof Error
+        ? pipelineError
+        : new Error(describeThrownValue(pipelineError));
+    }
+  }
+
+  /** Stage 2 of the download pipeline: one batch's post-transfer version
+   *  check plus its adaptive-policy observation.
+   *
+   *  The check itself is the pre-pipeline block verbatim: every file without a
+   *  Graph SHA-256 is re-read by driveId through one `$batch` (the client's own
+   *  per-item fallback included), a missing item or eTag drift replaces that
+   *  item's prepared slot with `DownloadRemoteVersionChangedError`, and the
+   *  payload gate (`verifyDownloadedPayload`) still runs per file. `prepared`
+   *  is mutated in place; the commit lane reads the result. Nothing here writes
+   *  durable state, so it may overlap the previous batch's commits.
+   */
+  private async verifyDownloadBatchAfterTransfer(args: {
+    batch: SyncPlanItem[];
+    prepared: PreparedDownload[];
+    metadataBatchClient: ((
+      driveItemIds: readonly string[],
+      metadataReason?: OneDriveMetadataReason,
+    ) => Promise<Map<string, DriveItem | null>>) | null;
+    shouldBatchVersionVerification: boolean;
+    downloadPolicy: DownloadConcurrencyPolicy;
+    metrics: ExecutionMetrics;
+    /** Wall clock when stage 1 began preparing this batch. */
+    batchStartedAt: number;
+    /** Wall clock when stage 1 finished (transfer + hash, before this lane). */
+    preparedAt: number;
+    /** Wall clock when this lane actually began the batch's check. */
+    verifyStartedAt: number;
+    batchTransferMs: number;
+  }): Promise<void> {
+    const {
+      batch,
+      prepared,
+      metadataBatchClient,
+      shouldBatchVersionVerification,
+      downloadPolicy,
+      metrics,
+      batchStartedAt,
+      preparedAt,
+      verifyStartedAt,
+      batchTransferMs,
+    } = args;
+    const hashlessVerificationIndexes = prepared.flatMap((preparedItem, index) =>
+      preparedItem.error === undefined
+        && preparedItem.downloaded
+        && !batch[index].remote?.sha256Hash
+        ? [index]
+        : []
+    );
+    let remoteVerifyMs = 0;
+    if (
+      metadataBatchClient
+      && shouldBatchVersionVerification
+      && hashlessVerificationIndexes.length > 0
+    ) {
+      const remoteVerifyStartedAt = Date.now();
+      try {
+        const currentById = await metadataBatchClient(
+          hashlessVerificationIndexes.map((index) => batch[index].remote!.driveId),
+          "downloadVersionVerify",
+        );
+        for (const index of hashlessVerificationIndexes) {
+          const item = batch[index];
+          const current = currentById.get(item.remote!.driveId);
+          try {
+            if (!refreshedMetadataMatchesIdentity(current, item.remote!.driveId, item.remote!.eTag)) {
+              throw new DownloadRemoteVersionChangedError(item.path);
             }
-          }
-        } catch (error) {
-          for (const index of hashlessVerificationIndexes) {
+            await this.verifyDownloadedPayload(
+              item.path,
+              item.remote!,
+              prepared[index].downloaded!,
+              true,
+            );
+          } catch (error) {
             prepared[index] = { error };
           }
-        } finally {
-          metrics.fileTransfers.download.stagesMs.remoteVersionVerify +=
-            Date.now() - remoteVerifyStartedAt;
         }
-      }
-      const failed = prepared.some((item) => item.error !== undefined);
-      const downloadedBytes = prepared.reduce(
-        (sum, item) => sum + (item.downloaded?.size ?? 0),
-        0,
-      );
-      const degradedProbe = this.onedrive as OneDriveClient & {
-        hasDegradedDownloadPathThisRound?: () => boolean;
-      };
-      downloadPolicy.observeBatch({
-        files: prepared.length,
-        bytes: downloadedBytes,
-        elapsedMs: Date.now() - batchStartedAt,
-        failed,
-        degradedPath: degradedProbe.hasDegradedDownloadPathThisRound?.() ?? false,
-      });
-      this.diag?.log("execute", "adaptive download batch", {
-        schemaVersion: 1,
-        files: batch.length,
-        bytes: downloadedBytes,
-        elapsedMs: Math.max(0, Date.now() - batchStartedAt),
-        failed,
-        nextConcurrency: downloadPolicy.limit,
-        lockedSerial: downloadPolicy.isLockedSerial,
-      });
-      if (!this.canContinue(operationEpoch, result)) {
-        metrics.fileTransfers.download.cancelled += batch.length;
-        break;
-      }
-      for (let index = 0; index < batch.length; index++) {
-        if (!this.canContinue(operationEpoch, result)) break;
-        await executePlanItem(batch[index], prepared[index]);
+      } catch (error) {
+        for (const index of hashlessVerificationIndexes) {
+          prepared[index] = { error };
+        }
+      } finally {
+        remoteVerifyMs = Date.now() - remoteVerifyStartedAt;
+        metrics.fileTransfers.download.stagesMs.remoteVersionVerify +=
+          remoteVerifyMs;
       }
     }
+    const failed = prepared.some((item) => item.error !== undefined);
+    const downloadedBytes = prepared.reduce(
+      (sum, item) => sum + (item.downloaded?.size ?? 0),
+      0,
+    );
+    // Keep the pre-pipeline meaning of the batch wall clock: preparation up to
+    // the hand-off plus this check. The wait behind an earlier batch's check is
+    // pipeline queueing, not batch cost, and must not read as a slow link.
+    const elapsedMs = Math.max(0, preparedAt - batchStartedAt) + remoteVerifyMs;
+    downloadPolicy.observeBatch({
+      files: prepared.length,
+      bytes: downloadedBytes,
+      elapsedMs,
+      transferMs: batchTransferMs,
+      failed,
+      // Required member of OneDriveClient: a rename here fails type-check
+      // instead of silently disabling the degraded-path lock.
+      degradedPath: this.onedrive.hasDegradedDownloadPathThisRound(),
+    });
+    this.diag?.log("execute", "adaptive download batch", {
+      schemaVersion: 1,
+      files: batch.length,
+      bytes: downloadedBytes,
+      elapsedMs: Math.max(0, elapsedMs),
+      transferMs: Math.max(0, batchTransferMs),
+      failed,
+      nextConcurrency: downloadPolicy.limit,
+      lockedSerial: downloadPolicy.isLockedSerial,
+      // Pipeline observation only (nothing reads these back): stage-1 wall,
+      // the check's own wall, and how long the check queued behind the
+      // previous batch. A non-zero queue is the expected real-machine proof
+      // that stage 1 ran ahead — the next batch's downloads overlapped this
+      // check instead of waiting for it.
+      preparedMs: Math.max(0, preparedAt - batchStartedAt),
+      verifyMs: Math.max(0, remoteVerifyMs),
+      verifyQueueMs: Math.max(0, verifyStartedAt - preparedAt),
+    });
   }
 
   /** Reconcile every durable mutation record before reading a cursor or planning. */
   private resolveCurrentFolderParent(
     folder: NonNullable<SyncPlanItem["folder"]>,
   ): { driveId: string; eTag?: string } {
-    const envelope = this.state.getCommittedV2Envelope();
+    const envelope = this.state.peekCommittedV2Envelope();
     if (!envelope) throw new Error("Folder mutation requires the active V2 envelope");
     if (folder.parentPath === "") {
       if (
@@ -16997,7 +18597,7 @@ export class SyncExecutor {
         : {
             driveId: item.folder.parentRemoteId
               ?? item.folder.sourceParentRemoteId
-              ?? this.state.getCommittedV2Envelope()?.scope.filesRootId
+              ?? this.state.peekCommittedV2Envelope()?.scope.filesRootId
               ?? "",
             eTag: item.folder.parentRemoteETag,
           };
@@ -18194,6 +19794,7 @@ export class SyncExecutor {
       downloaded: 0,
       deleted: 0,
       conflicts: 0,
+      remoteDeletePending: 0,
       deferred: 0,
       skippedLarge: 0,
       skippedIgnored: 0,
@@ -18205,7 +19806,6 @@ export class SyncExecutor {
     const metrics: ExecutionMetrics = {
       uploadBytes: 0,
       uploadReadMs: 0,
-      uploadNetworkMs: 0,
       activeUploads: 0,
       peakUploads: 0,
       fileTransfers: {
@@ -18233,6 +19833,7 @@ export class SyncExecutor {
       { onFileProgress: (bytes, total) => this.updateSideActionProgress(bytes, total) },
       operationEpoch,
       this.automaticHandlingPolicy,
+      undefined,
       undefined,
       "throw",
       this.isPersistedPluginDataDownloadSettlement(intent),
@@ -21231,7 +22832,7 @@ export class SyncExecutor {
   }
 
   private folderIdentityIdsAtOrBelow(path: string): string[] {
-    const envelope = this.state.getCommittedV2Envelope();
+    const envelope = this.state.peekCommittedV2Envelope();
     if (!envelope?.folderAnchors) return [];
     return Object.values(envelope.folderAnchors.byAnchorId)
       .filter((anchor) => isAtOrBelowPath(anchor.lastPath, path))
@@ -21761,6 +23362,7 @@ export class SyncExecutor {
     operationEpoch: number,
     automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>,
     preparedDownload?: PreparedDownload,
+    uploadObservation?: UploadTransferObservation,
     factsChangedPolicy: "defer" | "throw" = "defer",
     allowExcludedForRecovery = false,
   ): Promise<ItemExecutionResult> {
@@ -21818,6 +23420,7 @@ export class SyncExecutor {
           callbacks,
           operationEpoch,
           factsChangedPolicy,
+          observation: uploadObservation,
         });
       case SyncActionType.Download:
         return this.executeDownloadItem({
@@ -22266,6 +23869,47 @@ export class SyncExecutor {
     };
   }
 
+  /**
+   * Consume the folder half of a one-shot delete authorization after its own
+   * checkpoint committed. The decision record is the only durable proof that
+   * this folder delete was the user's confirmed action; a failed write only
+   * leaves a stale path that the next plan prunes once both sides are absent.
+   */
+  private async settleAppliedFolderDeleteDecision(path: string): Promise<void> {
+    const token = this.activeLocalDeleteDecisionEntries?.get(path);
+    if (!token) return;
+    try {
+      await this.state.settleLocalDeleteDecisions([{ token, path }]);
+    } catch (error) {
+      this.diag?.warn(
+        "state",
+        "failed to consume local folder delete decision after settled checkpoint",
+        describeError(error),
+      );
+    }
+  }
+
+  /** One DELETE round trip for cleanup-wave members. When the wave installed
+   *  a request-timing sink, the pure request duration is appended there; the
+   *  call itself, its arguments, its ordering and its errors are unchanged. */
+  private async deleteItemTimed(
+    path: string,
+    matchTag?: string,
+    driveItemId?: string,
+  ): Promise<void> {
+    const sink = this.deleteRequestTimingSink;
+    if (!sink) {
+      await this.onedrive.deleteItem(this.vaultName, path, matchTag, driveItemId);
+      return;
+    }
+    const startedAt = performance.now();
+    try {
+      await this.onedrive.deleteItem(this.vaultName, path, matchTag, driveItemId);
+    } finally {
+      sink.push(performance.now() - startedAt);
+    }
+  }
+
   /** Extracted verbatim from the executeItem switch (case DeleteRemote). */
   private async executeDeleteRemoteItem(args: {
     item: SyncPlanItem;
@@ -22285,8 +23929,7 @@ export class SyncExecutor {
     } = args;
     try {
       if (!this.canContinue(operationEpoch, result)) return { executed: false };
-      await this.onedrive.deleteItem(
-        this.vaultName,
+      await this.deleteItemTimed(
         item.path,
         item.remote?.eTag,
         item.remote?.driveId,
@@ -22329,8 +23972,7 @@ export class SyncExecutor {
         );
         if (freshMatchesBase) {
           try {
-            await this.onedrive.deleteItem(
-              this.vaultName,
+            await this.deleteItemTimed(
               item.path,
               remoteEntry.eTag,
               remoteEntry.driveId,
@@ -22391,7 +24033,17 @@ export class SyncExecutor {
     let current: LocalFileInspection;
     try {
       if (!this.canContinue(operationEpoch, result)) return { executed: false };
-      const remote = await this.onedrive.getFileMetadata(this.vaultName, item.path);
+      // The cleanup wave already proved this path absent remotely with one
+      // batched read (`localDeleteAbsenceProof`); only then may the per-file
+      // round trip be skipped. Anything the read did not prove absent (failed
+      // read, omitted path, explicit presence) still runs the ordinary check
+      // below, so batching never widens the pre-erase proof — and the local
+      // re-check stays per file either way.
+      const preverifiedAbsent =
+        this.localDeleteAbsenceProof?.has(item.path) === true;
+      const remote = preverifiedAbsent
+        ? null
+        : await this.onedrive.getFileMetadata(this.vaultName, item.path);
       if (!this.canContinue(operationEpoch, result)) return { executed: false };
       if (remote) throw new Error(this.t("notice.decisionExpired"));
 
@@ -22429,8 +24081,11 @@ export class SyncExecutor {
     result: SyncResult;
   }): ItemExecutionResult {
     const { result } = args;
-    // Route to pending — user must confirm
+    // Route to pending — user must confirm. The same branch feeds the split
+    // counters: `conflicts` keeps the historical sum, `remoteDeletePending`
+    // records how much of it is cloud-deletion confirmation.
     result.conflicts++;
+    result.remoteDeletePending++;
     return { executed: true };
   }
 
@@ -23474,6 +25129,49 @@ export class SyncExecutor {
         completionReason: this.t("reason.folder.local-source-changed"),
       };
     }
+    // The reducer retires this folder identity only when the committed index
+    // proves every descendant anchor's remote identity is gone. A live
+    // empty-folder read is not that proof: a child DELETE whose response was
+    // lost can land remotely after this device classified it as "not applied",
+    // so the live folder can be empty while the committed index still owns a
+    // child file. Sending the folder DELETE in that window leaves a receipt no
+    // state revision can absorb, and the round stops on unresolved mutation
+    // recovery. Ask the reducer's own projection first and defer one round
+    // with zero writes; the next round's delta absorbs the real deletion and
+    // the plan re-emits this folder delete. Nothing is relaxed: a descendant
+    // that still owns a remote identity keeps the gate closed either way.
+    const committedEnvelope = this.state.peekCommittedV2Envelope();
+    const committedDescendants = committedEnvelope
+      ? scanFolderDeleteDescendantsV2(
+          committedEnvelope,
+          item.path,
+          item.folder.remoteId,
+        )
+      : null;
+    if (
+      committedDescendants
+      && (
+        committedDescendants.blockers.length > 0
+        || committedDescendants.remoteChildren.length > 0
+      )
+    ) {
+      this.diag?.log(
+        "execute",
+        "folder delete deferred — committed descendants",
+        {
+          path: item.path,
+          blockers: committedDescendants.blockers.length,
+          remoteChildren: committedDescendants.remoteChildren.length,
+          firstBlocker: committedDescendants.blockers[0],
+        },
+      );
+      result.deferred++;
+      return {
+        executed: false,
+        completionActionType: SyncActionType.FolderDeferred,
+        completionReason: this.t("reason.folder.remote-subtree-changed"),
+      };
+    }
     const [byId, byPath] = await Promise.all([
       this.onedrive.getDriveItemMetadataById(item.folder.remoteId),
       this.onedrive.getDriveItemMetadata(this.vaultName, item.path),
@@ -23704,6 +25402,10 @@ export class SyncExecutor {
     callbacks: SyncCallbacks;
     operationEpoch: number;
     factsChangedPolicy: "defer" | "throw";
+    /** Only the adaptive small-upload pool passes one: it stamps the depth and
+     *  reads the PUT's own duration back so the pool's signal never includes
+     *  the local read, the hash or the batch's checkpoint. */
+    observation?: UploadTransferObservation;
   }): Promise<ItemExecutionResult> {
     const {
       item,
@@ -23713,6 +25415,7 @@ export class SyncExecutor {
       callbacks,
       operationEpoch,
       factsChangedPolicy,
+      observation,
     } = args;
     if (!item.local) return { executed: true };
     const readStartedAt = Date.now();
@@ -23789,12 +25492,26 @@ export class SyncExecutor {
         ),
       );
       const uploadElapsedMs = Date.now() - uploadStartedAt;
-      metrics.uploadNetworkMs += uploadElapsedMs;
       metrics.fileTransfers.upload.stagesMs.contentTransfer += uploadElapsedMs;
+      if (observation) {
+        observation.outcome = "success";
+        observation.transferMs = uploadElapsedMs;
+      }
     } catch (e) {
       const uploadElapsedMs = Date.now() - uploadStartedAt;
-      metrics.uploadNetworkMs += uploadElapsedMs;
       metrics.fileTransfers.upload.stagesMs.contentTransfer += uploadElapsedMs;
+      if (observation) {
+        // A failed PUT is a data point about the link only when it was a
+        // rate limit; any other failure stays on the file's own exit and is
+        // counted by the pool as one failed file (never a throughput sample).
+        observation.outcome = "failure";
+        observation.transferMs = uploadElapsedMs;
+        const throttle = throttleRetryAfter(e);
+        if (throttle !== null) {
+          observation.throttled = true;
+          observation.retryAfterSeconds = throttle.retryAfterSeconds;
+        }
+      }
       const conflictOutcome = await this.runUploadRemoteConflictRecovery({
         e,
         item,
@@ -23808,6 +25525,13 @@ export class SyncExecutor {
       });
       if (conflictOutcome.terminated) return conflictOutcome.terminated;
       uploadResult = conflictOutcome.uploadResult;
+      if (observation) {
+        // The race recovery re-uploaded the file. Its duration belongs to a
+        // second transport call, so it contributes no throughput sample; the
+        // file still counts as a success (no failure streak entry).
+        observation.outcome = "success";
+        observation.transferMs = 0;
+      }
     }
     metrics.activeUploads--;
 
@@ -23957,7 +25681,6 @@ export class SyncExecutor {
         throw retryError;
       }
       const retryElapsedMs = Date.now() - retryStartedAt;
-      metrics.uploadNetworkMs += retryElapsedMs;
       metrics.fileTransfers.upload.stagesMs.contentTransfer += retryElapsedMs;
       // fall through to post-upload logic
     } else {
@@ -28172,13 +29895,33 @@ export class SyncExecutor {
     actionType: SyncActionType,
     task: (operationEpoch: number) => Promise<boolean | void>,
     completionPresentation?: Pick<FileProgress, "status" | "reason">,
-    options?: { skipMutationRecovery?: boolean; queuedPaths?: readonly string[] },
+    options?: {
+      skipMutationRecovery?: boolean;
+      queuedPaths?: readonly string[];
+      /** Visible rows this one call settles (default 1). A batch caller owns
+       *  each member's `beginSideAction`/`completeSideAction` through the
+       *  task, so the progress total must cover every member up front. */
+      batchSize?: number;
+      /** The task settles every member's progress row itself; the outer
+       *  `finally` then only cleans the queue. A preparation failure before
+       *  the task starts still records the batch row, so the failure stays
+       *  visible in the running list. */
+      completionsOwnedByTask?: boolean;
+      /** Register the entry even while a round runs; the task waits for the
+       *  round before its own progress display takes over. */
+      waitForRunningRound?: boolean;
+    },
   ): Promise<void> {
     if (this.state.isV2StateActive === false) {
       this.notice("notice.v2MigrationRequired");
       return Promise.resolve();
     }
-    if (this.running) {
+    // A confirmed batch may register while a round is still running: the
+    // queue holds it and the task waits for the round below, so nothing is
+    // dropped and the batch's own progress display starts only after the
+    // round's store has been handed over.
+    const deferProgress = options?.waitForRunningRound === true && this.running;
+    if (this.running && !options?.waitForRunningRound) {
       this.notice("notice.conflict.failed", { path, reason: this.t("result.lockBusy") });
       return Promise.resolve();
     }
@@ -28186,7 +29929,12 @@ export class SyncExecutor {
       return Promise.resolve();
     }
 
-    if (!this.sideActionRunning && this.queuedSideActionPaths.size === 0) {
+    if (deferProgress) {
+      // The round owns the shared progress store right now; the batch lane
+      // starts from a fresh total when its task finally runs.
+      this.sideActionBatchTotal = 0;
+      this.sideActionBatchSettled = 0;
+    } else if (!this.sideActionRunning && this.queuedSideActionPaths.size === 0) {
       this.cancelled = false;
       if (this.progressStore?.state.activityKind === "sideAction") {
         this.sideActionBatchTotal = Math.max(
@@ -28211,15 +29959,17 @@ export class SyncExecutor {
     for (const queuedPath of options?.queuedPaths ?? []) {
       this.queuedSideActionPaths.add(queuedPath);
     }
-    this.sideActionBatchTotal++;
-    const currentProgress = this.progressStore?.state;
-    if (currentProgress?.currentFile) {
-      this.progressStore?.setProgress(
-        currentProgress.current,
-        this.sideActionBatchTotal,
-        currentProgress.currentFile,
-        currentProgress.currentActionType,
-      );
+    this.sideActionBatchTotal += Math.max(1, options?.batchSize ?? 1);
+    if (!deferProgress) {
+      const currentProgress = this.progressStore?.state;
+      if (currentProgress?.currentFile) {
+        this.progressStore?.setProgress(
+          currentProgress.current,
+          this.sideActionBatchTotal,
+          currentProgress.currentFile,
+          currentProgress.currentActionType,
+        );
+      }
     }
     this.diag?.log("execute", `queued side action ${actionType} ${path}`);
     this.onProgressUpdate?.();
@@ -28234,9 +29984,24 @@ export class SyncExecutor {
       .then(async () => {
         let started = false;
         let succeeded = false;
+        let taskStarted = false;
         let preparationPhase: SideActionPreparationPhase = "localRecovery";
         try {
           if (!this.canContinue(operationEpoch)) return;
+          if (options?.waitForRunningRound) {
+            while (this.running && this.canContinue(operationEpoch)) {
+              await new Promise<void>((resolve) => compatSetTimeout(
+                () => resolve(),
+                CONFIRM_DELETE_ROUND_WAIT_POLL_MS,
+              ));
+            }
+            if (!this.canContinue(operationEpoch)) return;
+            if (this.progressStore?.state.activityKind !== "sideAction") {
+              this.cancelled = false;
+              this.progressStore?.markStarted("sideAction");
+              this.progressStore?.setPhase("executing");
+            }
+          }
           this.beginSideAction(path, actionType);
           started = true;
           await this.getRecoveryJournal().recover();
@@ -28323,11 +30088,15 @@ export class SyncExecutor {
           }
           if (!this.canContinue(operationEpoch)) return;
           preparationPhase = "action";
+          taskStarted = true;
           succeeded = await task(operationEpoch) === true;
         } catch (error) {
           this.handleSideActionPreparationFailure(path, preparationPhase, error);
         } finally {
-          if (started) this.completeSideAction(
+          if (
+            started
+            && !(taskStarted && options?.completionsOwnedByTask)
+          ) this.completeSideAction(
             path,
             actionType,
             succeeded,
@@ -28457,12 +30226,15 @@ export class SyncExecutor {
       if (this.fileManager) {
         // A failed trash operation must remain a failure. Falling back to a
         // permanent delete would silently defeat the user's recovery path.
+        this.onSelfLocalDelete?.(path);
         await this.fileManager.trashFile(tfile);
       } else {
+        this.onSelfLocalDelete?.(path);
         await this.scanner.vault.adapter.remove(path);
       }
       return;
     }
+    this.onSelfLocalDelete?.(path);
     await this.scanner.vault.adapter.remove(path);
   }
 
@@ -28815,7 +30587,7 @@ export class SyncExecutor {
 
   /** 已提交 V2 远端索引里该路径的目录 id（null＝未提交/不存在）。 */
   private committedRemoteFolderId(path: string): string | null {
-    const envelope = this.state.getCommittedV2Envelope();
+    const envelope = this.state.peekCommittedV2Envelope();
     if (!envelope) return null;
     const pathById = projectRemoteIndexV2(envelope.remoteIndex);
     const node = Object.values(envelope.remoteIndex.itemsById).find(
@@ -29341,7 +31113,32 @@ export class SyncExecutor {
     return { content, checkpoint };
   }
 
-  /** Confirm the exact pending delete paths from one user action. */
+  /**
+   * Confirm the exact pending delete paths from one user action.
+   *
+   * File rows run in confirm-delete waves (`confirmDeleteWave`): every wave
+   * shares one intent write, one receipt write, one deletion-ledger write and
+   * one checkpoint, with a bounded read-only local re-check, one stat-only
+   * mtime+size re-check immediately before each erase, and a strictly serial
+   * erase segment. Folder rows keep the per-item path and run only after
+   * every file row has settled — a folder shell is removed after its members
+   * are gone, so the ordering no longer depends on side-action queue order.
+   *
+   * The batch's own preparation is queue-first and wave-scoped (2026-10-27):
+   * the batch enters the side-action queue before any network read - even
+   * while a round is still running, in which case the queued task waits for
+   * the round to settle before its first wave - and each wave proves its own
+   * remote absence right before it runs (next wave's read overlaps the
+   * current erase segment). A 2,001-row batch therefore deletes its first
+   * files after one small read instead of after 101 serial reads, and the
+   * panel gets the queue's progress entry instead of an unbounded silent
+   * preparation.
+   *
+   * File rows and folder shells are one queue entry (2026-10-28): the entry
+   * registers every confirmed path up front, so no round can slip between the
+   * file waves and the folder shells, and the batch keeps one continuous
+   * progress count.
+   */
   async confirmRemoteDeletes(paths: readonly string[]): Promise<void> {
     const pendingByPath = new Map(
       this.state.pendingRemoteDeletes.map((item) => [item.path, item]),
@@ -29362,29 +31159,536 @@ export class SyncExecutor {
     const folderPaths = uniquePaths.filter((path) =>
       Boolean(pendingByPath.get(path)?.folder),
     );
-    // One batched absence read covers the whole batch (files and folders); each
-    // item then skips its per-item remote re-check. Read failures degrade to an
-    // empty set so every item still verifies individually.
-    const preverifyPaths = [...filePaths, ...folderPaths];
-    const preverifiedAbsent = preverifyPaths.length === 0
-      ? new Set<string>()
-      : await this.verifyRemoteDeleteBatchAbsence(preverifyPaths);
-    // Ordering contract: folder rows must not start before every file row
-    // has settled — a folder shell is only removed after its members are
-    // gone. The shared serial side-action queue preserves enqueue order and
-    // rows are enqueued files-first (sort above), so folder rows below are
-    // guaranteed to run last. If that queue is ever parallelized, split this
-    // call into two awaited phases instead of relying on enqueue order.
-    await Promise.all([
-      ...filePaths.map((path) =>
-        this.confirmRemoteDelete(path, false, {
-          preverifiedAbsent: preverifiedAbsent.has(path),
-        })),
-      ...folderPaths.map((path) =>
-        this.confirmRemoteDelete(path, false, {
-          preverifiedAbsent: preverifiedAbsent.has(path),
-        })),
-    ]);
+    // Wave-scoped remote absence reads (2026-10-27 b): each wave proves its own
+    // members absent immediately before it runs, one `$batch` read of at most
+    // `confirmDeleteWave` paths, with the next wave's read overlapping the
+    // current wave's serial erase segment. A single whole-batch read was the
+    // confirmed batch's real "long front porch" on a phone: 2,001 paths are 101
+    // serial `$batch` POSTs, so nothing was deleted until all of them landed.
+    // Read failures still degrade to an empty set per wave, so every member
+    // re-verifies individually through its ordinary remote guard. Folder rows
+    // keep one bounded read of their own right before they run.
+    // Per-item admission that already runs before each side action is enqueued
+    // stays ahead of the wave, so an admitted wave only contains rows it may
+    // mutate. A row rejected here keeps its existing exit (row retired, notice
+    // shown) and never reaches a wave intent write or a local erase.
+    if (this.stopSideActionForStateRecovery()) return;
+    const wavePaths: string[] = [];
+    for (const path of filePaths) {
+      if (await this.expireOutOfScopeDeleteDecision(path, false)) continue;
+      if (isEasySyncSelfSyncFilePath(path, getConfigDir(this.scanner.vault))) {
+        await this.state.removePendingDelete(path);
+        this.notice("notice.delete.failed", {
+          path,
+          reason: this.t("notice.decisionExpired"),
+        });
+        continue;
+      }
+      if (
+        classifyCommunityPluginManagedPath(
+          path,
+          getConfigDir(this.scanner.vault),
+        )?.kind !== undefined
+      ) {
+        await this.state.removePendingDelete(path);
+        this.notice("notice.communityPlugins.globalDeleteUnavailable");
+        continue;
+      }
+      wavePaths.push(path);
+    }
+    // Folder shells keep the same admission guards the per-item entry used to
+    // run before each of them was enqueued; an admitted shell then runs inside
+    // the batch's own task below.
+    const folderShellPaths: string[] = [];
+    for (const path of folderPaths) {
+      if (isEasySyncSelfSyncFilePath(path, getConfigDir(this.scanner.vault))) {
+        await this.state.removePendingDelete(path);
+        this.notice("notice.delete.failed", {
+          path,
+          reason: this.t("notice.decisionExpired"),
+        });
+        continue;
+      }
+      if (
+        classifyCommunityPluginManagedPath(
+          path,
+          getConfigDir(this.scanner.vault),
+        )?.kind !== undefined
+      ) {
+        await this.state.removePendingDelete(path);
+        this.notice("notice.communityPlugins.globalDeleteUnavailable");
+        continue;
+      }
+      folderShellPaths.push(path);
+    }
+    // A confirmed batch is one user action: files and folder shells enter the
+    // side-action queue as ONE entry, so `queuedSideActionPaths` never empties
+    // between the file waves and the folder shells. The old split (file wave,
+    // then one queued side action per folder) finished the first batch, left a
+    // verification gap, and any round dispatched in that gap refused every
+    // folder row - the next plan then deleted those shells in a second round
+    // (2026-10-28 iOS mixed-batch report: one confirm, two rounds, extra
+    // follow-up syncs). One entry also keeps the panel counter continuous:
+    // 0/N covers every row from the start instead of restarting per folder.
+    const batchPaths = [...wavePaths, ...folderShellPaths];
+    if (batchPaths.length === 0) return;
+    await this.enqueueSideAction(
+      batchPaths[0],
+      wavePaths.length > 0
+        ? SyncActionType.DeleteRemote
+        : SyncActionType.DeleteLocalFolder,
+      async (operationEpoch) => {
+        if (wavePaths.length > 0) {
+          try {
+            if (!await this.runConfirmDeleteWaves(wavePaths, operationEpoch)) {
+              // Cancelled / lifecycle-invalidated: folder shells keep their
+              // pending rows and decisions for the next plan, exactly like a
+              // dropped file row.
+              return false;
+            }
+          } catch (error) {
+            // A wave-level failure (shared checkpoint) flips the rows it
+            // already reported; the remaining folder shells still get their
+            // own empty-shell and identity gates. Per-member failures already
+            // showed their own notices.
+            this.diag?.warn(
+              "execute",
+              "confirm delete file wave failed before folder rows",
+              describeError(error),
+            );
+            if (!this.canContinue(operationEpoch)) return false;
+          }
+        }
+        if (folderShellPaths.length === 0) return true;
+        if (!this.canContinue(operationEpoch)) return false;
+        const folderAbsent = await this.verifyRemoteDeleteBatchAbsence(
+          folderShellPaths,
+        );
+        for (const path of folderShellPaths) {
+          if (!this.canContinue(operationEpoch)) return false;
+          this.beginSideAction(path, SyncActionType.DeleteLocalFolder);
+          let settled = false;
+          try {
+            settled = await this.runConfirmRemoteDeleteAction(
+              path,
+              operationEpoch,
+              { preverifiedAbsent: folderAbsent.has(path) },
+              false,
+            ) === true;
+          } catch (error) {
+            this.notice("notice.delete.failed", {
+              path,
+              reason: this.failureReason(error),
+            });
+          }
+          this.completeSideAction(path, SyncActionType.DeleteLocalFolder, settled);
+        }
+        return true;
+      },
+      undefined,
+      {
+        queuedPaths: batchPaths,
+        batchSize: batchPaths.length,
+        completionsOwnedByTask: true,
+        waitForRunningRound: true,
+      },
+    );
+  }
+
+  /**
+   * Run the admitted file rows in confirm-delete waves; waves stay serial.
+   *
+   * Each wave reads its own remote absence (one `$batch` of at most
+   * `confirmDeleteWave` paths) and the next wave's read is issued before the
+   * current wave's serial erase segment starts, so the very first wave can
+   * delete after one small read instead of after the whole batch's read. The
+   * lookahead is read-only and bounded: at most one extra wave read is in
+   * flight, its result is dropped with the round on cancellation, and a failed
+   * read still degrades its own wave to per-member remote guards.
+   */
+  private async runConfirmDeleteWaves(
+    filePaths: readonly string[],
+    operationEpoch: number,
+  ): Promise<boolean> {
+    const waves: string[][] = [];
+    for (
+      let offset = 0;
+      offset < filePaths.length;
+      offset += confirmDeleteWave(this.platform)
+    ) {
+      waves.push(
+        filePaths.slice(offset, offset + confirmDeleteWave(this.platform)),
+      );
+    }
+    let lookahead: Promise<ReadonlySet<string>> | null = null;
+    for (const [index, wave] of waves.entries()) {
+      if (!this.canContinue(operationEpoch)) return false;
+      const absence = lookahead ?? this.verifyRemoteDeleteBatchAbsence(wave);
+      lookahead = index + 1 < waves.length
+        ? this.verifyRemoteDeleteBatchAbsence(waves[index + 1])
+        : null;
+      await this.runConfirmDeleteWave(wave, await absence, operationEpoch);
+    }
+    return true;
+  }
+
+  /**
+   * One confirm-delete wave. Every batch member shares the wave's intent write,
+   * receipt write, deletion-ledger write and shared checkpoint; failures and
+   * cancellation keep their per-item meaning:
+   *
+   * - a member the wave cannot own (its pending row lost the reviewed local
+   *   fact) runs through the ordinary per-item body, including its own
+   *   intent/receipt/checkpoint; a path a durable record still owns keeps the
+   *   existing mutation-recovery block (the one intent write would otherwise
+   *   reject the whole wave);
+   * - a member whose read-only re-check fails shows the same notice, keeps its
+   *   pending row and never enters the shared checkpoint;
+   * - a member whose reviewed mtime+size drifted between that re-check and its
+   *   turn in the serial erase segment is skipped through the same failure
+   *   exit (the SHA-256 guard still owns content equality; this only closes the
+   *   wave-length window);
+   * - a member whose erase fails reconciles through the same recovery step as
+   *   the per-item path and stays out of the shared checkpoint;
+   * - cancellation stops the wave before the shared checkpoint, so at most
+   *   `confirmDeleteWave` intent-only records remain for the next round.
+   */
+  private async runConfirmDeleteWave(
+    wavePaths: readonly string[],
+    preverifiedAbsent: ReadonlySet<string>,
+    operationEpoch: number,
+  ): Promise<void> {
+    const pendingByPath = new Map(
+      this.state.pendingRemoteDeletes.map((item) => [item.path, item]),
+    );
+    // Zero writes, zero local erases: reject an oversized wave (the shared
+    // checkpoint would refuse it later), a duplicate path (the one intent write
+    // would refuse the whole wave), or a folder row (folder intents fail the
+    // checkpoint independence assertion).
+    assertConfirmDeleteWaveWithinCheckpointLimit(
+      wavePaths.map((path) => pendingByPath.get(path) ?? { path }),
+    );
+    const wavePerfStartedAt = performance.now();
+    const waveStartedAt = Date.now();
+    const actionType = SyncActionType.DeleteRemote;
+    const perItemPaths = new Set<string>();
+    const blockedPaths = new Set<string>();
+    const batchMembers: SyncPlanItem[] = [];
+    for (const path of wavePaths) {
+      const pending = pendingByPath.get(path);
+      if (!pending?.local) {
+        perItemPaths.add(path);
+        continue;
+      }
+      // A durable record still owns this path; the one intent write would
+      // reject the whole wave (its own per-item exit reports the block).
+      if (this.state.mutationLedger.some(
+        (record) => record.intent.path === path,
+      )) {
+        blockedPaths.add(path);
+        continue;
+      }
+      batchMembers.push(pending);
+    }
+
+    // Read-only segment: the local `inspectFile` re-check of the only copy
+    // (bounded fan-out) plus the remote identity guard when the batch read did
+    // not prove absence. No intent is written and no local file is erased
+    // here; drift keeps its ordinary notices and drops the member from the
+    // wave.
+    const localCheckStartedAt = performance.now();
+    const verdicts = await mapWithBoundedConcurrency(
+      batchMembers,
+      confirmDeleteLocalCheckConcurrency(this.platform),
+      async (pending) => {
+        try {
+          if (!this.guardDecisionToken(pending, "notice.delete.failed")) {
+            return false;
+          }
+          if (!await this.guardReviewedLocalVersion(
+            pending.path,
+            pending.local,
+            "notice.delete.failed",
+            { pendingKind: "delete", item: pending },
+          )) return false;
+          if (preverifiedAbsent.has(pending.path)) return true;
+          return await this.guardReviewedRemoteVersion(
+            pending,
+            "notice.delete.failed",
+            "delete",
+            "safeSubset",
+          );
+        } catch (error) {
+          this.notice("notice.delete.failed", {
+            path: pending.path,
+            reason: this.failureReason(error),
+          });
+          return false;
+        }
+      },
+    );
+    const localCheckMs = performance.now() - localCheckStartedAt;
+    const intentByPath = new Map<string, MutationIntent>();
+    const intents: MutationIntent[] = [];
+    for (const [index, member] of batchMembers.entries()) {
+      if (!verdicts[index]) continue;
+      const intent = this.createSideMutationIntent(member, "deleteLocal");
+      intents.push(intent);
+      intentByPath.set(member.path, intent);
+    }
+    // A cancel that lands during the read-only segment must not leave a wave of
+    // intent-only records that the next round would have to abandon one by one.
+    let intentMs = 0;
+    let persistedIntents = 0;
+    if (intents.length > 0 && this.canContinue(operationEpoch)) {
+      const intentStartedAt = performance.now();
+      await this.state.beginMutationIntents(intents);
+      intentMs = performance.now() - intentStartedAt;
+      persistedIntents = intents.length;
+    }
+
+    const receipts: MutationReceiptV1[] = [];
+    const ledgerSink: DeletionLedgerEntryV1[] = [];
+    /** Members this wave already reported as done. The shared checkpoint runs
+     *  after them, so a failing or skipped checkpoint must flip these rows
+     *  instead of leaving a success the round did not keep. */
+    const reportedPaths: string[] = [];
+    let eraseMs = 0;
+    let recheckMs = 0;
+    const deleteStartedAt = performance.now();
+    this.deletionLedgerSink = ledgerSink;
+    try {
+      for (const path of wavePaths) {
+        if (!this.canContinue(operationEpoch)) break;
+        this.beginSideAction(path, actionType);
+        if (blockedPaths.has(path)) {
+          this.handleSideActionPreparationFailure(
+            path,
+            "mutationRecovery",
+            new Error("Mutation recovery still owns this path"),
+          );
+          this.completeSideAction(path, actionType, false);
+          continue;
+        }
+        if (perItemPaths.has(path)) {
+          let settled = false;
+          try {
+            settled = await this.runConfirmRemoteDeleteAction(
+              path,
+              operationEpoch,
+              { preverifiedAbsent: preverifiedAbsent.has(path) },
+              false,
+            ) === true;
+          } catch (error) {
+            this.notice("notice.delete.failed", {
+              path,
+              reason: this.failureReason(error),
+            });
+          }
+          this.completeSideAction(path, actionType, settled);
+          continue;
+        }
+        const intent = intentByPath.get(path);
+        if (!intent) {
+          // Read-only re-check refused this member (its notice is already
+          // shown and its pending row is untouched).
+          this.completeSideAction(path, actionType, false);
+          continue;
+        }
+        const pending = pendingByPath.get(path);
+        if (!pending) {
+          this.completeSideAction(path, actionType, false);
+          continue;
+        }
+        // Lightweight re-check immediately before this member's erase: the
+        // reviewed mtime+size must still match. A drift skips only this member
+        // through the ordinary failure exit (notice + pending row + intent
+        // abandoned) and leaves every other member's erase untouched.
+        const recheckStartedAt = performance.now();
+        const factsStillMatch = await this.localVersionStillMatchesReviewedFacts(pending);
+        recheckMs += performance.now() - recheckStartedAt;
+        if (!factsStillMatch) {
+          this.diag?.warn(
+            "execute",
+            `confirm delete wave skipped a locally changed file — ${path}`,
+            {
+              expectedMtime: pending.local?.mtime,
+              expectedSize: pending.local?.size,
+            },
+          );
+          this.completeSideAction(
+            path,
+            actionType,
+            await this.recoverFailedConfirmDelete(
+              intent,
+              new MutationNotAppliedError(
+                new LocalVersionChangedBeforeDeleteError(path),
+              ),
+            ),
+          );
+          continue;
+        }
+        const eraseStartedAt = performance.now();
+        try {
+          await this.deleteLocalPath(path);
+        } catch (error) {
+          eraseMs += performance.now() - eraseStartedAt;
+          this.completeSideAction(
+            path,
+            actionType,
+            await this.recoverFailedConfirmDelete(intent, error),
+          );
+          continue;
+        }
+        eraseMs += performance.now() - eraseStartedAt;
+        // 跟随删除侧：本机这一份删掉之后、checkpoint 提交（归约删锚点）之前
+        // 补记一条——文件级没有别的 id 来源。
+        await this.noteFollowedCloudDeletionLedger({
+          remoteId: this.state.remoteIdForPath(path),
+          path,
+          kind: "file",
+        });
+        const checkpoint = emptyMutationCheckpoint();
+        checkpoint.baseRemovals.push(path);
+        checkpoint.pendingDeleteRemovals.push(path);
+        receipts.push({
+          version: 1,
+          operationId: intent.operationId,
+          completedAt: Date.now(),
+          checkpoint,
+        });
+        this.completeSideAction(path, actionType, true);
+        reportedPaths.push(path);
+      }
+    } finally {
+      this.deletionLedgerSink = null;
+    }
+    const deleteMs = performance.now() - deleteStartedAt;
+
+    // The receipt is written even when the wave was cancelled: the per-item
+    // path also records it before checking the epoch, and the next round's
+    // mutation recovery can then commit the checkpoint without re-reading the
+    // (already erased) local file.
+    let receiptMs = 0;
+    if (receipts.length > 0) {
+      const receiptStartedAt = performance.now();
+      await this.state.recordMutationReceipts(receipts);
+      receiptMs = performance.now() - receiptStartedAt;
+    }
+    let ledgerMs = 0;
+    if (ledgerSink.length > 0) {
+      const ledgerStartedAt = performance.now();
+      // Same contract as the per-file clue: a failed ledger write must never
+      // turn already-applied deletes into failures, so it only logs.
+      try {
+        await this.state.recordCloudDeletions(ledgerSink);
+      } catch (error) {
+        this.diag?.warn(
+          "execute",
+          `confirm delete wave could not record ${ledgerSink.length} deletion clue(s)`,
+          describeError(error),
+        );
+      } finally {
+        ledgerMs = performance.now() - ledgerStartedAt;
+      }
+    }
+    let checkpointMs = 0;
+    let checkpointedOperations = 0;
+    if (receipts.length > 0 && this.canContinue(operationEpoch)) {
+      const checkpointStartedAt = performance.now();
+      try {
+        await this.commitMutationCheckpoints(
+          receipts.map((receipt) => receipt.operationId),
+        );
+        checkpointMs = performance.now() - checkpointStartedAt;
+        checkpointedOperations = receipts.length;
+      } catch (error) {
+        checkpointMs = performance.now() - checkpointStartedAt;
+        // Every member already showed its row; the checkpoint failure means
+        // that success is not durable, so flip them before the closed failure
+        // leaves the wave (a shown success never disappears silently).
+        this.revertReportedWaveRows(reportedPaths, this.failureReason(error));
+        throw error;
+      }
+    } else if (reportedPaths.length > 0) {
+      // 取消落在批末：行已显示，检查点按契约等 epoch、本轮没有提交。
+      this.revertReportedWaveRows(reportedPaths, this.t("result.cancelled"));
+    }
+    const totalMs = performance.now() - wavePerfStartedAt;
+    this.diag?.log("execute", "confirm delete wave settled", {
+      files: wavePaths.length,
+      intents: persistedIntents,
+      receipts: receipts.length,
+      deletions: ledgerSink.length,
+      checkpointOperations: checkpointedOperations,
+      // Phase decomposition: the concurrent read-only re-check, the per-erase
+      // stat gate, the serial erase segment (and the part of it spent inside
+      // `deleteLocalPath`, i.e. the irreversible local erase), then the wave's
+      // single writes. Observability only: nothing branches on these numbers.
+      intentMs: Math.max(0, Math.round(intentMs)),
+      localCheckMs: Math.max(0, Math.round(localCheckMs)),
+      deleteMs: Math.max(0, Math.round(deleteMs)),
+      recheckMs: Math.max(0, Math.round(recheckMs)),
+      eraseMs: Math.max(0, Math.round(eraseMs)),
+      receiptMs: Math.max(0, Math.round(receiptMs)),
+      ledgerMs: Math.max(0, Math.round(ledgerMs)),
+      checkpointMs: Math.max(0, Math.round(checkpointMs)),
+      totalMs: Math.max(0, Math.round(totalMs)),
+      elapsedMs: Math.max(0, Date.now() - waveStartedAt),
+    });
+  }
+
+  /** Flip rows a wave already reported as done when its shared checkpoint did
+   *  not commit (failed or skipped by cancellation). Presentation only: the
+   *  receipts and the next round's mutation recovery own the settlement. */
+  private revertReportedWaveRows(
+    paths: readonly string[],
+    reason: string,
+  ): void {
+    let changed = false;
+    for (const path of paths) {
+      if (this.progressStore?.revertCompletedFile(path, reason)) changed = true;
+    }
+    if (changed) this.onProgressUpdate?.();
+  }
+
+  /**
+   * Per-member failure exit inside a wave: the same same-action reconciliation
+   * `runDurableSideMutation` runs for the per-item path, then the same notice.
+   * Returns true only when recovery proved the erase applied (then that member
+   * was checkpointed individually and must stay out of the shared checkpoint).
+   */
+  private async recoverFailedConfirmDelete(
+    intent: MutationIntent,
+    error: unknown,
+  ): Promise<boolean> {
+    if (error instanceof MutationNotAppliedError) {
+      try {
+        await this.abandonKnownUnappliedMutation(
+          intent,
+          "side mutation proved not applied and was abandoned",
+        );
+      } catch (recoveryError) {
+        this.diag?.warn(
+          "execute",
+          `side mutation could not abandon its not-applied intent — ${intent.path}`,
+          describeError(recoveryError),
+        );
+      }
+      this.notice("notice.delete.failed", {
+        path: intent.path,
+        reason: this.failureReason(error.original),
+      });
+      return false;
+    }
+    if (this.stopSideActionForAuthFailure(intent.path, error)) return false;
+    const recovery = await this.reconcileFailedMutation(intent);
+    if (recovery.outcome === "applied") return true;
+    this.notice("notice.delete.failed", {
+      path: intent.path,
+      reason: this.failureReason(error),
+    });
+    return false;
   }
 
   /**
@@ -29452,67 +31756,91 @@ export class SyncExecutor {
     const actionType = initialPending?.folder
       ? SyncActionType.DeleteLocalFolder
       : SyncActionType.DeleteRemote;
-    return this.enqueueSideAction(path, actionType, async (operationEpoch) => {
-      const pending = this.state.pendingRemoteDeletes.find((d) => d.path === path);
-      if (await this.expireOutOfScopeDeleteDecision(
-        path,
-        Boolean(pending?.folder),
-      )) return;
-      try {
-        const folderHandled = await this.confirmPendingFolderRemoteDelete({
+    return this.enqueueSideAction(
+      path,
+      actionType,
+      (operationEpoch) =>
+        this.runConfirmRemoteDeleteAction(
           path,
-          pending,
           operationEpoch,
           options,
           showSuccessNotice,
-        });
-        if (folderHandled.handled) return folderHandled.value;
-        if (!pending?.local) {
-          this.notice("notice.delete.failed", { path, reason: this.t("general.unknown") });
-          return;
-        }
-        if (!this.guardDecisionToken(pending, "notice.delete.failed")) return;
-        if (!await this.guardReviewedLocalVersion(path, pending.local, "notice.delete.failed", {
-          pendingKind: "delete",
-          item: pending,
-        })) return;
-        if (
-          options?.preverifiedAbsent !== true
-          && !await this.guardReviewedRemoteVersion(
-            pending,
-            "notice.delete.failed",
-            "delete",
-            "safeSubset",
-          )
-        ) return;
-        if (!this.canContinue(operationEpoch)) return;
-        const intent = this.createSideMutationIntent(pending, "deleteLocal");
-        const committed = await this.runDurableSideMutation(intent, operationEpoch, async () => {
-          await this.deleteLocalPath(path);
-          // 跟随删除侧：本机这一份删掉之后、checkpoint 提交（归约删锚点）之前
-          // 补记一条——文件级没有别的 id 来源。
-          await this.noteFollowedCloudDeletionLedger({
-            remoteId: this.state.remoteIdForPath(path),
-            path,
-            kind: "file",
-          });
-          const checkpoint = emptyMutationCheckpoint();
-          checkpoint.baseRemovals.push(path);
-          checkpoint.pendingDeleteRemovals.push(path);
-          return checkpoint;
-        });
-        if (!committed) return;
-        if (showSuccessNotice) this.notice("notice.delete.confirmed", { path });
-        return true;
-      } catch (e) {
-        if (this.stopSideActionForAuthFailure(path, e)) return;
-        if (pending && e instanceof OneDriveError && isRemoteMutationConflict(e)) {
-          await this.guardReviewedRemoteVersion(pending, "notice.delete.failed", "delete");
-          return;
-        }
-        this.notice("notice.delete.failed", { path, reason: this.failureReason(e) });
+        ),
+    );
+  }
+
+  /**
+   * The reviewed per-item confirm-delete body. Split out of
+   * `confirmRemoteDelete` (2026-10-26) so a confirm-delete wave can drive one
+   * item through the exact same exit when it cannot own that item (a durable
+   * record already exists for the path, or the pending row lost its reviewed
+   * local fact). Every check, notice and recovery step below is unchanged.
+   */
+  private async runConfirmRemoteDeleteAction(
+    path: string,
+    operationEpoch: number,
+    options: { preverifiedAbsent?: boolean } | undefined,
+    showSuccessNotice: boolean,
+  ): Promise<boolean | void> {
+    const pending = this.state.pendingRemoteDeletes.find((d) => d.path === path);
+    if (await this.expireOutOfScopeDeleteDecision(
+      path,
+      Boolean(pending?.folder),
+    )) return;
+    try {
+      const folderHandled = await this.confirmPendingFolderRemoteDelete({
+        path,
+        pending,
+        operationEpoch,
+        options,
+        showSuccessNotice,
+      });
+      if (folderHandled.handled) return folderHandled.value;
+      if (!pending?.local) {
+        this.notice("notice.delete.failed", { path, reason: this.t("general.unknown") });
+        return;
       }
-    });
+      if (!this.guardDecisionToken(pending, "notice.delete.failed")) return;
+      if (!await this.guardReviewedLocalVersion(path, pending.local, "notice.delete.failed", {
+        pendingKind: "delete",
+        item: pending,
+      })) return;
+      if (
+        options?.preverifiedAbsent !== true
+        && !await this.guardReviewedRemoteVersion(
+          pending,
+          "notice.delete.failed",
+          "delete",
+          "safeSubset",
+        )
+      ) return;
+      if (!this.canContinue(operationEpoch)) return;
+      const intent = this.createSideMutationIntent(pending, "deleteLocal");
+      const committed = await this.runDurableSideMutation(intent, operationEpoch, async () => {
+        await this.deleteLocalPath(path);
+        // 跟随删除侧：本机这一份删掉之后、checkpoint 提交（归约删锚点）之前
+        // 补记一条——文件级没有别的 id 来源。
+        await this.noteFollowedCloudDeletionLedger({
+          remoteId: this.state.remoteIdForPath(path),
+          path,
+          kind: "file",
+        });
+        const checkpoint = emptyMutationCheckpoint();
+        checkpoint.baseRemovals.push(path);
+        checkpoint.pendingDeleteRemovals.push(path);
+        return checkpoint;
+      });
+      if (!committed) return;
+      if (showSuccessNotice) this.notice("notice.delete.confirmed", { path });
+      return true;
+    } catch (e) {
+      if (this.stopSideActionForAuthFailure(path, e)) return;
+      if (pending && e instanceof OneDriveError && isRemoteMutationConflict(e)) {
+        await this.guardReviewedRemoteVersion(pending, "notice.delete.failed", "delete");
+        return;
+      }
+      this.notice("notice.delete.failed", { path, reason: this.failureReason(e) });
+    }
   }
 
   private async confirmPendingFolderRemoteDelete(args: ConfirmPendingFolderRemoteDeleteArgs): Promise<ConfirmPendingFolderRemoteDeleteOutcome> {
@@ -29678,9 +32006,255 @@ export class SyncExecutor {
     return { handled: false };
   }
 
+  /**
+   * Facts for a no-transfer restore, taken only from committed state. A
+   * missing id/cTag/baseline/parent means the old upload path decides.
+   */
+  private buildRestoreFastPathPlan(
+    pending: SyncPlanItem,
+    path: string,
+  ): RestoreFastPathPlan | null {
+    const local = pending.local;
+    if (!local || local.size < ADAPTIVE_UPLOAD_MAX_BYTES) return null;
+    const remoteId = this.state.remoteIdForPath(path);
+    const remoteCTag = this.state.remoteCTagForPath(path);
+    const baseline = this.state.baselineFactsForPath(path);
+    if (!remoteId || !remoteCTag || !baseline) return null;
+    if (baseline.hash !== local.hash || baseline.size !== local.size) return null;
+    let expectedParentId: string;
+    try {
+      expectedParentId = this.requireKnownRemoteParentId(path);
+    } catch {
+      return null;
+    }
+    return {
+      remoteId,
+      remoteCTag,
+      anchorHash: baseline.hash,
+      anchorSize: baseline.size,
+      anchorETag: this.state.remoteETagForPath(path),
+      expectedParentId,
+      expectedName: path.slice(path.lastIndexOf("/") + 1),
+    };
+  }
+
+  /**
+   * Best-effort guard against the one race the restore endpoint does not
+   * resolve with a conflict: a file created at the reviewed path after the
+   * guard, which the service would rename to make room for the restored item.
+   * Only a committed parent cTag gives a baseline; without it the post-restore
+   * read-back remains the only check.
+   */
+  private async parentFolderStableForRestore(
+    path: string,
+    operationEpoch: number,
+  ): Promise<"stable" | "changed" | "stop"> {
+    const parentPath = parentFolderPath(path);
+    if (!parentPath) return "stable";
+    const folder = (this.state.remoteFolders ?? []).find(
+      (candidate) =>
+        normalizeRemotePathKey(candidate.path) === normalizeRemotePathKey(parentPath),
+    );
+    if (!folder?.cTag) return "stable";
+    let live: DriveItem | null;
+    try {
+      live = await this.onedrive.getDriveItemMetadataById(folder.driveId);
+    } catch (error) {
+      if (this.stopSideActionForAuthFailure(path, error)) return "stop";
+      this.diag?.warn(
+        "execute",
+        `restore fast path skipped — parent folder could not be verified — ${path}`,
+        describeError(error),
+      );
+      return "changed";
+    }
+    if (!live) return "changed";
+    if (!live.cTag) return "stable";
+    if (live.cTag !== folder.cTag) return "changed";
+    return this.canContinue(operationEpoch) ? "stable" : "stop";
+  }
+
+  /**
+   * Restore one reviewed deletion and prove the restored bytes still describe
+   * the reviewed local version. Every failure either falls back to the old
+   * upload path or keeps the durable intent for recovery; it never uploads
+   * blindly over an unknown restore outcome.
+   */
+  private async tryRestoreReviewedDeletion(args: {
+    pending: SyncPlanItem;
+    path: string;
+    plan: RestoreFastPathPlan;
+    operationEpoch: number;
+  }): Promise<RestoreFastPathOutcome> {
+    const { pending, path, plan, operationEpoch } = args;
+    const local = pending.local;
+    if (!local) return { kind: "upload" };
+    if (!this.canContinue(operationEpoch)) return { kind: "abandon" };
+    const parent = await this.parentFolderStableForRestore(path, operationEpoch);
+    if (parent === "stop") return { kind: "abandon" };
+    if (parent === "changed") {
+      this.diag?.log("execute", `restore fast path skipped — parent folder changed — ${path}`, {
+        mutations: 0,
+      });
+      return { kind: "upload" };
+    }
+
+    const restoreStartedAt = Date.now();
+    let restoreError: unknown = null;
+    try {
+      await this.onedrive.restoreDeletedDriveItemById(plan.remoteId);
+    } catch (error) {
+      if (this.stopSideActionForAuthFailure(path, error)) return { kind: "abandon" };
+      restoreError = error;
+    }
+
+    const verifyStartedAt = Date.now();
+    let restored: DriveItem | null;
+    try {
+      restored = await this.onedrive.getDriveItemMetadataById(plan.remoteId);
+    } catch (error) {
+      if (this.stopSideActionForAuthFailure(path, error)) return { kind: "abandon" };
+      return {
+        kind: "unresolved",
+        error: error instanceof Error ? error : new Error(String(error)),
+      };
+    }
+
+    if (!restored) {
+      if (restoreError && isDefinitiveRestoreAbsence(restoreError)) {
+        this.diag?.log("execute", `restore fast path unavailable — ${path}`, {
+          reason: describeRestoreFailure(restoreError),
+          mutations: 0,
+        });
+        return { kind: "upload" };
+      }
+      if (restoreError instanceof OneDriveError && isRemoteMutationConflict(restoreError)) {
+        this.notice("notice.delete.failed", {
+          path,
+          reason: this.t("notice.decisionExpired"),
+        });
+        return { kind: "abandon" };
+      }
+      if (restoreError) {
+        this.notice("notice.delete.failed", {
+          path,
+          reason: this.failureReason(restoreError),
+        });
+        return { kind: "abandon" };
+      }
+      return {
+        kind: "unresolved",
+        error: new Error(`Restore reported success but the item is absent: ${path}`),
+      };
+    }
+
+    if (restored.id !== plan.remoteId) {
+      return {
+        kind: "unresolved",
+        error: new Error(`Restore returned a different item identity: ${path}`),
+      };
+    }
+    const restoredName = (restored.name ?? "").normalize("NFC");
+    if (
+      restored.parentReference?.id !== plan.expectedParentId
+      || restoredName !== plan.expectedName.normalize("NFC")
+    ) {
+      const removed = await this.removeMisplacedRestoredItem(path, restored);
+      if (!removed) {
+        return {
+          kind: "unresolved",
+          error: new Error(`Restored item landed outside the reviewed path: ${path}`),
+        };
+      }
+      return { kind: "upload" };
+    }
+
+    const restoredEntry = this.toRemoteEntry(restored, path, plan.expectedParentId);
+    if (!restoredEntry.driveId || !restoredEntry.eTag) {
+      return {
+        kind: "unresolved",
+        error: new Error(`Restored item has no stable identity/version: ${path}`),
+      };
+    }
+    const equality = resolveContentEquality({
+      local,
+      remote: restoredEntry,
+      base: {
+        hash: plan.anchorHash,
+        size: plan.anchorSize,
+        eTag: plan.anchorETag ?? "",
+        cTag: plan.remoteCTag,
+      },
+    });
+    if (equality.status !== "equal") {
+      this.diag?.log("execute", `restore fast path fell back to upload — ${path}`, {
+        proof: equality.proof,
+        status: equality.status,
+        size: local.size,
+        restoreMs: Date.now() - restoreStartedAt,
+        mutations: 1,
+      });
+      return {
+        kind: "upload",
+        restored: { driveItemId: restoredEntry.driveId, eTag: restoredEntry.eTag },
+      };
+    }
+
+    const checkpoint = emptyMutationCheckpoint();
+    checkpoint.baseUpserts.push({
+      path,
+      hash: local.hash,
+      size: local.size,
+      eTag: restoredEntry.eTag,
+    });
+    checkpoint.remoteUpserts.push(restoredEntry);
+    checkpoint.pendingDeleteRemovals.push(path);
+    this.diag?.log("execute", `restore fast path settled — ${path}`, {
+      size: local.size,
+      proof: equality.proof,
+      restoreMs: verifyStartedAt - restoreStartedAt,
+      verifyMs: Date.now() - verifyStartedAt,
+      mutations: 1,
+      uploadedBytes: 0,
+    });
+    return { kind: "restored", checkpoint };
+  }
+
+  /** Remove the copy our restore placed outside the reviewed path. A failure
+   *  keeps the intent unresolved: uploading afterwards could leave two items. */
+  private async removeMisplacedRestoredItem(
+    path: string,
+    restored: DriveItem,
+  ): Promise<boolean> {
+    try {
+      await this.onedrive.deleteItem(
+        this.vaultName,
+        path,
+        restored.eTag ?? undefined,
+        restored.id,
+      );
+      return true;
+    } catch (error) {
+      if (this.stopSideActionForAuthFailure(path, error)) return false;
+      if (error instanceof OneDriveError && error.type === OneDriveErrorType.NotFound) {
+        return true;
+      }
+      this.diag?.warn(
+        "execute",
+        `restored item could not be removed after landing outside the reviewed path — ${path}`,
+        describeError(error),
+      );
+      return false;
+    }
+  }
+
   /** Reject a remote delete: re-upload local file */
   async rejectRemoteDelete(path: string): Promise<void> {
     if (this.stopSideActionForStateRecovery()) return;
+    // Rejecting is the explicit reversal of any earlier confirmation. Revoke
+    // it before the upload side action, so a failed re-upload cannot leave a
+    // decision that would delete the file on the next plan.
+    await this.state.removeLocalDeleteDecisionPaths([path]);
     const initialPending = this.state.pendingRemoteDeletes.find((item) => item.path === path);
     const actionType = initialPending?.folder
       ? SyncActionType.CreateRemoteFolder
@@ -29708,41 +32282,76 @@ export class SyncExecutor {
           item: pending,
         })) return;
         if (!await this.guardReviewedRemoteVersion(pending, "notice.delete.failed", "delete", "safeSubset")) return;
+        const reviewedLocal = pending.local;
+        if (!reviewedLocal) return;
         const content = await this.scanner.vault.adapter.readBinary(path);
         const contentHash = typeof (this.scanner as LocalScanner & { inspectFile?: unknown }).inspectFile === "function"
           ? await sha256Hex(content)
-          : pending.local.hash;
-        if (contentHash !== pending.local.hash || content.byteLength !== pending.local.size) {
+          : reviewedLocal.hash;
+        if (contentHash !== reviewedLocal.hash || content.byteLength !== reviewedLocal.size) {
           this.notice("notice.delete.failed", { path, reason: this.t("notice.localChangedSinceReview") });
           return;
         }
         if (!this.canContinue(operationEpoch)) return;
+        const restorePlan = this.buildRestoreFastPathPlan(pending, path);
         const intent = this.createSideMutationIntent(pending, "upload");
+        let restoredWithoutUpload = false;
         const committed = await this.runDurableSideMutation(intent, operationEpoch, async () => {
+          let restoredTarget: { driveItemId: string; eTag: string } | undefined;
+          if (restorePlan) {
+            const restoreOutcome = await this.tryRestoreReviewedDeletion({
+              pending,
+              path,
+              plan: restorePlan,
+              operationEpoch,
+            });
+            if (restoreOutcome.kind === "restored") {
+              restoredWithoutUpload = true;
+              return restoreOutcome.checkpoint;
+            }
+            if (restoreOutcome.kind === "abandon") {
+              throw new MutationNotAppliedError(
+                new Error(`Recycle-bin restore did not land: ${path}`),
+                true,
+              );
+            }
+            if (restoreOutcome.kind === "unresolved") {
+              throw restoreOutcome.error;
+            }
+            restoredTarget = restoreOutcome.restored;
+            if (!this.canContinue(operationEpoch)) {
+              throw new Error(
+                `Restore landed but the run was cancelled before fallback upload: ${path}`,
+              );
+            }
+          }
           const uploadResult = await this.onedrive.uploadFile(
             this.vaultName,
             path,
             content,
             (uploaded, total) => this.updateSideActionProgress(uploaded, total),
+            restoredTarget?.eTag,
+            restoredTarget?.driveItemId,
           );
           const checkpoint = emptyMutationCheckpoint();
           checkpoint.baseUpserts.push({
-            path, hash: pending.local!.hash, size: pending.local!.size, eTag: uploadResult.eTag ?? "",
+            path, hash: reviewedLocal.hash, size: reviewedLocal.size, eTag: uploadResult.eTag ?? "",
           });
           this.state.cacheBaseContent(path, content);
           checkpoint.remoteUpserts.push(this.toUploadedRemoteEntry(
             path,
-            pending.local!,
+            reviewedLocal,
             uploadResult,
-            pending.remote?.parentId,
+            restorePlan?.expectedParentId ?? pending.remote?.parentId,
           ));
           checkpoint.pendingDeleteRemovals.push(path);
           return checkpoint;
         });
         if (!committed) return;
-        this.notice("notice.delete.rejected", { path });
+        this.notice(restoredWithoutUpload ? "notice.delete.restored" : "notice.delete.rejected", { path });
         return true;
       } catch (e) {
+        if (e instanceof MutationNotAppliedError && e.noticeAlreadyShown) return;
         if (this.stopSideActionForAuthFailure(path, e)) return;
         if (e instanceof OneDriveError && isRemoteMutationConflict(e)) {
           await this.guardReviewedRemoteVersion(pending, "notice.delete.failed", "delete");
@@ -29902,6 +32511,34 @@ function isNetworkClassTransferFailure(error: unknown): boolean {
 }
 
 /**
+ * A 429/509 that reached the executor: the client's request-level budget
+ * (three attempts, Retry-After honored) is already spent, so the plan-level
+ * upload pool is the next responder — it pauses the whole upload direction for
+ * Retry-After and halves its concurrency.
+ *
+ * `null` means "not a rate limit"; `retryAfterSeconds` is `null` when the
+ * response carried no usable header (the pool then uses its own fallback).
+ */
+function throttleRetryAfter(
+  error: unknown,
+): { retryAfterSeconds: number | null } | null {
+  if (
+    !(error instanceof OneDriveError)
+    || error.type !== OneDriveErrorType.RateLimited
+  ) {
+    return null;
+  }
+  const retryAfter = error.retryAfterSeconds;
+  return {
+    retryAfterSeconds: retryAfter !== null
+      && Number.isFinite(retryAfter)
+      && retryAfter >= 0
+      ? retryAfter
+      : null,
+  };
+}
+
+/**
  * A transient Graph read failure proves nothing about the mutation outcome,
  * but it also does not invalidate the independent evidence available for
  * later ledger records. Keep the failed intent pending and continue read-only
@@ -30050,6 +32687,22 @@ function isRemoteMutationConflict(error: OneDriveError): boolean {
   return error.type === OneDriveErrorType.PreconditionFailed
     || error.type === OneDriveErrorType.Conflict
     || error.type === OneDriveErrorType.NotFound;
+}
+
+/** A 404/403 from restore proves the item cannot be brought back (purged,
+ *  expired, parent gone, or the endpoint is unavailable for this account). */
+function isDefinitiveRestoreAbsence(error: unknown): boolean {
+  return error instanceof OneDriveError
+    && (error.type === OneDriveErrorType.NotFound
+      || error.type === OneDriveErrorType.Forbidden);
+}
+
+/** Stable, path-free restore failure label for diagnostics. */
+function describeRestoreFailure(error: unknown): string {
+  if (error instanceof OneDriveError) {
+    return `${error.type}${error.statusCode ? `/${error.statusCode}` : ""}`;
+  }
+  return error instanceof Error ? error.name : "unknown";
 }
 
 function isSyncDecisionToken(value: unknown): value is SyncDecisionToken {
@@ -30275,3 +32928,67 @@ function errorDiagData(error: unknown): Record<string, unknown> {
   return { message };
 }
 
+/**
+ * A3 (2026-10-26): attach the bytes a transfer already moved to its failure.
+ *
+ * Same contract as the OneDrive client's own `withTransferredBytes`: a zero
+ * count adds nothing (there is no evidence to record), an already-stamped
+ * larger count wins (the deepest layer knows best), and a non-extensible error
+ * keeps its identity. Evidence only — the error instance is never replaced and
+ * no caller reads the property back to decide anything.
+ */
+function attachTransferredBytes(error: unknown, transferredBytes: number): void {
+  if (!(transferredBytes > 0)) return;
+  if ((typeof error !== "object" || error === null) && typeof error !== "function") {
+    return;
+  }
+  try {
+    const target = error as { transferredBytes?: number };
+    target.transferredBytes = Math.max(
+      typeof target.transferredBytes === "number" ? target.transferredBytes : 0,
+      transferredBytes,
+    );
+  } catch { /* Preserve the original error even when it is not extensible. */ }
+}
+
+/** Read one numeric evidence property without trusting its shape. */
+function errorEvidenceNumber(error: unknown, key: string): number | undefined {
+  if ((typeof error !== "object" || error === null) && typeof error !== "function") {
+    return undefined;
+  }
+  const value = (error as Record<string, unknown>)[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * A3 (2026-10-26): project a thrown failure into the shared evidence shape
+ * (`SyncFileErrorFactV1`) that `PendingIssue.error` / `FileProgress.error`
+ * carry into the diagnostic report.
+ *
+ * Evidence only, by construction: this function is called from the failure
+ * branches *after* every classification and counter has already been computed,
+ * and nothing reads the result back. Returns `undefined` when the failure
+ * offers no evidence at all (e.g. a planner deferral with no error object), so
+ * old rows and evidence-free failures keep their exact previous shape.
+ */
+function fileErrorFactFromError(error: unknown): SyncFileErrorFactV1 | undefined {
+  const fact: SyncFileErrorFactV1 = {};
+  if (error instanceof OneDriveError) {
+    fact.errorType = error.type;
+    fact.statusCode = error.statusCode;
+    if (typeof error.graphCode === "string" && error.graphCode.length > 0) {
+      fact.graphCode = error.graphCode;
+    }
+  }
+  const transferredBytes = errorEvidenceNumber(error, "transferredBytes");
+  if (transferredBytes !== undefined && transferredBytes > 0) {
+    fact.transferredBytes = transferredBytes;
+  }
+  const tier = (error as { tier?: unknown } | null)?.tier;
+  if (typeof tier === "string" && (SYNC_FILE_ERROR_TIERS as readonly string[]).includes(tier)) {
+    fact.tier = tier as SyncFileErrorFactV1["tier"];
+  }
+  const attempts = errorEvidenceNumber(error, "attempts");
+  if (attempts !== undefined && attempts > 0) fact.attempts = attempts;
+  return Object.keys(fact).length > 0 ? fact : undefined;
+}

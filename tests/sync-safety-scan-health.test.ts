@@ -15,6 +15,7 @@ import {
   expect,
   vi,
 } from "vitest";
+import { readFileSync } from "node:fs";
 import * as obsidian from "obsidian";
 import {
   Platform,
@@ -38,14 +39,17 @@ import type {
   SyncPlanItem,
   SyncScope,
 } from "../src/sync/types";
-import { SyncExecutor } from "../src/sync/sync-executor";
+import {
+  assertCleanupWaveWithinCheckpointLimit,
+  SyncExecutor,
+} from "../src/sync/sync-executor";
 import type { SyncResult } from "../src/sync/sync-executor";
 import { OneDriveClient, ResponseByteBudgetError } from "../src/onedrive/client";
 import { OneDriveError, OneDriveErrorType, type DriveItem } from "../src/onedrive/types";
 import type { LocalScanner } from "../src/sync/local-scanner";
 import type { PendingIssue } from "../src/sync/types";
 import { generateFileDecisionPlanV2 } from "../src/sync/file-decision-planner-v2";
-import { StateManager } from "../src/sync/state-manager";
+import { StateManager, MAX_MUTATION_CHECKPOINT_BATCH } from "../src/sync/state-manager";
 import { I18n } from "../src/i18n";
 import { SyncProgressStore } from "../src/sync/sync-progress";
 import type { DiagnosticLogger } from "../src/sync/diagnostic-logger";
@@ -603,6 +607,7 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
       adapterOverrides?: Record<string, unknown>;
       recordMutationReceipt?: ReturnType<typeof vi.fn>;
       recordCloudDeletion?: ReturnType<typeof vi.fn>;
+      diag?: DiagnosticLogger;
     } = {},
   ) {
     const fillerBaseEntries = Array.from(
@@ -741,6 +746,9 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
       mockScanner,
       mutationState,
       "testVault",
+      undefined,
+      undefined,
+      options.diag,
     );
     executor.setAutomaticHandlingPolicy({
       autoDeleteLocalFiles: options.autoDeleteLocalFiles ?? false,
@@ -839,6 +847,206 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
     }
   });
 
+  it("shares one intent write, one receipt write and one checkpoint across a cleanup wave", async () => {
+    const entries = Array.from({ length: 9 }, (_, index) => base(`wave-${index}.md`));
+    const { result, mutationState } = await runWithV2Facts({
+      baseEntries: entries,
+      remoteEntries: entries.map((entry) => remote(entry)),
+    });
+
+    expect(result.deleted).toBe(entries.length);
+    // Bulk-delete cost contract: a wave pays one durable write per phase,
+    // never one whole-data write per file (that is what made 4000 deletes
+    // take hours). The individual per-file APIs must stay unused.
+    expect(mutationState.beginMutationIntents).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mutationState.beginMutationIntents).mock.calls[0][0])
+      .toHaveLength(entries.length);
+    expect(mutationState.recordMutationReceipts).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mutationState.recordMutationReceipts).mock.calls[0][0])
+      .toHaveLength(entries.length);
+    expect(mutationState.recordCloudDeletions).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mutationState.recordCloudDeletions).mock.calls[0][0])
+      .toHaveLength(entries.length);
+    expect(mutationState.commitMutationCheckpoints).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mutationState.commitMutationCheckpoints).mock.calls[0][0])
+      .toHaveLength(entries.length);
+    expect(mutationState.commitMutationCheckpoint).not.toHaveBeenCalled();
+    expect(mutationState.beginMutationIntent).toHaveBeenCalledTimes(entries.length);
+    expect(mutationState.recordMutationReceipt).toHaveBeenCalledTimes(entries.length);
+  });
+
+  it("keeps 64 file deletes in one cleanup wave — one write per phase", async () => {
+    const entries = Array.from(
+      { length: 64 },
+      (_, index) => base(`wave-64-${index}.md`),
+    );
+    const log = vi.fn();
+    const diag = {
+      log,
+      warn: vi.fn(),
+      error: vi.fn(),
+      isEnabled: vi.fn().mockReturnValue(false),
+    } as unknown as DiagnosticLogger;
+    const { result, mutationState } = await runWithV2Facts({
+      baseEntries: entries,
+      remoteEntries: entries.map((entry) => remote(entry)),
+    }, { diag });
+
+    // A 64-member wave is exactly the shared checkpoint batch limit, so it
+    // still fits the one-intent / one-receipt / one-ledger / one-checkpoint
+    // contract instead of splitting into two 32-item waves.
+    expect(MAX_MUTATION_CHECKPOINT_BATCH).toBe(64);
+    expect(result.deleted).toBe(entries.length);
+    expect(result.errors).toBe(0);
+    expect(mutationState.beginMutationIntents).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mutationState.beginMutationIntents).mock.calls[0][0])
+      .toHaveLength(64);
+    expect(mutationState.recordMutationReceipts).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mutationState.recordMutationReceipts).mock.calls[0][0])
+      .toHaveLength(64);
+    expect(mutationState.recordCloudDeletions).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mutationState.recordCloudDeletions).mock.calls[0][0])
+      .toHaveLength(64);
+    expect(mutationState.commitMutationCheckpoints).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mutationState.commitMutationCheckpoints).mock.calls[0][0])
+      .toHaveLength(64);
+    expect(mutationState.commitMutationCheckpoint).not.toHaveBeenCalled();
+
+    const settled = log.mock.calls.filter(
+      (call) => call[1] === "cleanup wave settled",
+    );
+    expect(settled).toHaveLength(1);
+    expect((settled[0]?.[2] as { files: number }).files).toBe(64);
+  });
+
+  it("refuses an oversized cleanup wave before any intent write or DELETE", () => {
+    // The wave slice caps itself at the shared checkpoint limit, so an
+    // over-limit wave cannot be produced through the executor's public path.
+    // Pin the function's fail-closed edge, then pin its wiring ahead of the
+    // intent write and the first DELETE in Step 4.
+    expect(MAX_MUTATION_CHECKPOINT_BATCH).toBe(64);
+    expect(() => assertCleanupWaveWithinCheckpointLimit(64)).not.toThrow();
+    expect(() => assertCleanupWaveWithinCheckpointLimit(65))
+      .toThrow("Cleanup wave must contain at most 64 file deletes (got 65)");
+
+    const executorSource = readFileSync("src/sync/sync-executor.ts", "utf8");
+    const guardCall = executorSource.indexOf(
+      "assertCleanupWaveWithinCheckpointLimit(wave.length)",
+    );
+    // Both anchors are searched from the cleanup guard forward: the upload
+    // batch (Step 3a) writes its intents with the same statement earlier in the
+    // file, and only the cleanup wave's own write has to follow its guard.
+    const firstIntentWrite = executorSource.indexOf(
+      "await this.state.beginMutationIntents(intents)",
+      guardCall,
+    );
+    const firstDelete = executorSource.indexOf(
+      "executePlanItem(item, undefined, handoffs[waveIndex])",
+      guardCall,
+    );
+    expect(guardCall).toBeGreaterThan(-1);
+    expect(firstIntentWrite).toBeGreaterThan(guardCall);
+    expect(firstDelete).toBeGreaterThan(guardCall);
+  });
+
+  it("decomposes a wave into phase timings, a total and DELETE latency percentiles", async () => {
+    const entries = Array.from({ length: 9 }, (_, index) => base(`wave-timing-${index}.md`));
+    const log = vi.fn();
+    const diag = {
+      log,
+      warn: vi.fn(),
+      error: vi.fn(),
+      isEnabled: vi.fn().mockReturnValue(false),
+    } as unknown as DiagnosticLogger;
+    const { result } = await runWithV2Facts({
+      baseEntries: entries,
+      remoteEntries: entries.map((entry) => remote(entry)),
+    }, { diag });
+
+    expect(result.deleted).toBe(entries.length);
+    const settled = log.mock.calls.filter((call) => call[1] === "cleanup wave settled");
+    expect(settled).toHaveLength(1);
+    const data = settled[0]?.[2] as {
+      files: number;
+      intentMs: number;
+      networkMs: number;
+      receiptMs: number;
+      ledgerMs: number;
+      checkpointMs: number;
+      totalMs: number;
+      deleteItemLatencyMs: { count: number; p50: number; p95: number; max: number };
+      deleteRequestLatencyMs: { count: number; p50: number; p95: number; max: number };
+    };
+
+    expect(data.files).toBe(entries.length);
+    // Observation only: every phase is a non-negative whole millisecond and the
+    // wave total can never be shorter than its concurrent DELETE segment.
+    for (const ms of [
+      data.intentMs,
+      data.networkMs,
+      data.receiptMs,
+      data.ledgerMs,
+      data.checkpointMs,
+      data.totalMs,
+    ]) {
+      expect(Number.isInteger(ms)).toBe(true);
+      expect(ms).toBeGreaterThanOrEqual(0);
+    }
+    expect(data.totalMs).toBeGreaterThanOrEqual(data.networkMs);
+    // One whole-item sample and one pure-request sample per member: a wave of
+    // plain cloud deletes pays exactly one DELETE round trip each.
+    for (const latency of [data.deleteItemLatencyMs, data.deleteRequestLatencyMs]) {
+      expect(latency.count).toBe(entries.length);
+      expect(Number.isInteger(latency.p50)).toBe(true);
+      expect(Number.isInteger(latency.p95)).toBe(true);
+      expect(Number.isInteger(latency.max)).toBe(true);
+      expect(latency.p50).toBeGreaterThanOrEqual(0);
+      expect(latency.p95).toBeGreaterThanOrEqual(latency.p50);
+      expect(latency.max).toBeGreaterThanOrEqual(latency.p95);
+    }
+  });
+
+  it("keeps the other members' receipts and checkpoint when one wave delete fails", async () => {
+    const entries = Array.from({ length: 5 }, (_, index) => base(`wave-fail-${index}.md`));
+    const failed = entries[2];
+    const deleteItem = vi.fn(async (_vault: string, path: string) => {
+      if (path === failed.path) throw new Error("graph 500");
+    });
+    // 回读证明失败项仍在云端 ⇒ 该次删除没有发生，只能失败关闭，不能混进回执。
+    const getFileMetadata = vi.fn(async (_vault: string, path: string) => (
+      path === failed.path
+        ? {
+            driveId: `id-${path}`,
+            size: failed.size,
+            mtime: 1,
+            eTag: failed.eTag,
+            downloadUrl: `https://download.example/${path}`,
+            sha256Hash: failed.hash,
+          }
+        : null
+    ));
+    const { result, mutationState, mockDeleteItem } = await runWithV2Facts({
+      baseEntries: entries,
+      remoteEntries: entries.map((entry) => remote(entry)),
+    }, { deleteItem, getFileMetadata });
+
+    expect(mockDeleteItem).toHaveBeenCalledTimes(entries.length);
+    expect(result.deleted).toBe(entries.length - 1);
+    expect(result.errors).toBe(1);
+    // 4 个成功项仍合批落盘并提交同一次共享检查点；失败项不产生回执。
+    expect(mutationState.recordMutationReceipts).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mutationState.recordMutationReceipts).mock.calls[0][0])
+      .toHaveLength(entries.length - 1);
+    expect(mutationState.recordCloudDeletions).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mutationState.recordCloudDeletions).mock.calls[0][0])
+      .toHaveLength(entries.length - 1);
+    expect(mutationState.commitMutationCheckpoints).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(mutationState.commitMutationCheckpoints).mock.calls[0][0])
+      .toHaveLength(entries.length - 1);
+    // 失败项的预写意图被放弃，不留 pending 记录。
+    expect(mutationState.abandonMutationIntent).toHaveBeenCalledTimes(1);
+  });
+
   it("blocks ConfirmLocalDelete — pending delete batch stays empty when scan unhealthy", async () => {
     const deletedRemotely = base("c.md");
     const { mockUpsertPendingDeletes } = await runWithV2Facts({
@@ -868,6 +1076,10 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
     expect(mockGetDelta).not.toHaveBeenCalled();
     expect(mockInitVaultDirectories).not.toHaveBeenCalled();
     expect(mutationState.getCommittedV2Envelope).not.toHaveBeenCalled();
+    // Reading the committed envelope through the live view counts as reading
+    // it too: this assertion is about an incomplete scan never reaching a
+    // plan, not about one particular accessor staying unused.
+    expect(mutationState.peekCommittedV2Envelope).not.toHaveBeenCalled();
   });
 
   it("allows DeleteRemote when scan is healthy (no failed paths)", async () => {

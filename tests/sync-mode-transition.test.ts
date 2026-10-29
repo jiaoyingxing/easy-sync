@@ -30,12 +30,13 @@ describe("sync mode gate view", () => {
     });
     expect(normal.title).toBe("切换到单向同步");
     expect(normal.message).toBe("切换后，自下一次同步起：");
-    // 2026-10-12 末轮定稿：三条要点（以云端为准／本机新建与修改／作用范围合一），
-    // 收尾句单列（tail），数量行只说数字（0 件时不出现）。
+    // 2026-10-12 末轮定稿三条要点；2026-10-28 用户拍板改序——「作用范围」
+    // 最反直觉（单向并不停掉插件/配置同步），放第一条。收尾句单列（tail），
+    // 数量行只说数字（0 件时不出现）。
     expect(normal.points).toEqual([
+      "仅作用于笔记与附件；插件与其他配置不受影响，仍照常同步。",
       "以云端为准：云端修改会覆盖本机，云端删除会同步删除本机。",
       "本机新建不主动上传；本机修改会另存副本。",
-      "仅作用于笔记与附件；插件与其他配置不受影响，仍照常同步。",
     ]);
     expect(normal.tail).toBe(
       "上述“本机修改”和“本机新建”的文件会列在同步面板中，可选择上传到云端，或留在本机。",
@@ -114,9 +115,9 @@ describe("sync mode gate view", () => {
     expect(view.inputLabel).toBe("Type “Turn on One-way sync” to continue.");
     expect(view.message).toBe("After you switch, from the next sync on:");
     expect(view.points).toEqual([
+      "This applies to notes and attachments only; plugins and other settings are unaffected and keep syncing as before.",
       "The cloud takes precedence: cloud edits overwrite this device, and cloud deletions delete the files here as well.",
       "Files created here are not uploaded automatically; files edited here are saved as a copy.",
-      "This applies to notes and attachments only; plugins and other settings are unaffected and keep syncing as before.",
     ]);
     expect(view.tail).toBe(
       "The files you edited or created here are listed in the sync panel, where you can upload them to the cloud or keep them on this device.",

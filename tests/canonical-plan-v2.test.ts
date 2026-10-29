@@ -46,6 +46,13 @@ import {
   upsertBaseStateEnvelopeV2,
 } from "../src/sync/file-state-controller-v2";
 import { buildRemoteIndexV2 } from "../src/sync/remote-index-v2";
+import {
+  localDeleteDecisionPathHash,
+  localFolderDeleteDecisionPathHash,
+  localFolderDeleteDecisionRecordToken,
+  serializeLocalDeleteDecisionHashes,
+  type LocalDeleteDecisionV1,
+} from "../src/sync/local-delete-decision";
 import { isEasySyncInternalPath } from "../src/sync/local-scanner";
 import type {
   FolderAnchorV2,
@@ -3386,5 +3393,309 @@ describe("canonical plan large-file gate wiring", () => {
 
     // 数量钉住：防止新增接线点只改标题不补断言，或某处字段被别名绕开。
     expect(source.split(field)).toHaveLength(8);
+  });
+});
+
+describe("local delete decisions sealed into the plan (S4)", () => {
+  async function finalizedPlan(input: {
+    deleted: string[];
+    stable?: string[];
+  }) {
+    const stable = input.stable ?? [];
+    const state = envelope({
+      files: stable.map((path, index) => ({
+        id: `stable-${index}`,
+        name: path,
+        hash: hashA,
+        size: 10,
+      })),
+      folderAnchors: [],
+      fileAnchors: [
+        ...input.deleted.map((path, index) =>
+          fileAnchor(`deleted-${index}`, path)),
+        ...stable.map((path, index) => fileAnchor(`stable-${index}`, path)),
+      ],
+    });
+    const localFiles = [
+      ...input.deleted.map((path) => localFile(path)),
+      ...stable.map((path) => localFile(path)),
+    ];
+    const candidate = build({ state, localFiles });
+    const finalized = await finalizeCanonicalPlanCandidateV2({
+      candidate,
+      envelope: state,
+      vaultName: "Vault",
+      accountId: scope.accountId,
+      automaticHandlingPolicy: {
+        autoDeleteLocalFiles: false,
+        mergeNonOverlappingText: true,
+      },
+      baselineReconstructionIncomplete: false,
+      resolveRemoteContentHash: async () => {
+        throw new Error("no download expected");
+      },
+      configDir: ".obsidian",
+    });
+    return { state, finalized, localFiles };
+  }
+
+  function decisionFor(
+    finalized: Awaited<ReturnType<typeof finalizedPlan>>["finalized"],
+    paths: string[],
+    hashes?: Map<string, string>,
+  ): LocalDeleteDecisionV1 {
+    const resolved = paths.map((path) => {
+      const item = finalized.items.find((candidate) => candidate.path === path);
+      expect(item?.decisionToken).toBeDefined();
+      return hashes?.get(path)
+        ?? localDeleteDecisionPathHash(item!.decisionToken!, path);
+    });
+    return {
+      token: "local-delete:test",
+      paths: [...paths],
+      planDigest: serializeLocalDeleteDecisionHashes(resolved),
+      createdAt: 1,
+    };
+  }
+
+  function seal(
+    state: SyncStateEnvelopeV2,
+    finalized: Awaited<ReturnType<typeof finalizedPlan>>["finalized"],
+    decisions: LocalDeleteDecisionV1[],
+    localPathsPresent: ReadonlySet<string>,
+  ) {
+    return sealCanonicalPlanV2({
+      finalized,
+      sourceEnvelope: state,
+      committedEnvelope: state,
+      localDeleteDecisions: decisions,
+      localPathsPresent,
+    });
+  }
+
+  it("keeps the confirmation row when no decision exists", async () => {
+    const { state, finalized, localFiles } = await finalizedPlan({
+      deleted: ["gone.md"],
+      stable: ["a.md", "b.md", "c.md"],
+    });
+    const sealed = seal(
+      state,
+      finalized,
+      [],
+      new Set(localFiles.map((entry) => entry.path)),
+    );
+    expect(sealed.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.ConfirmLocalDelete,
+        path: "gone.md",
+      }),
+    ]);
+    expect(sealed.appliedLocalDeleteDecisions).toEqual([]);
+    expect(sealed.canonicalIdentity.digest)
+      .toBe(sealed.preDecisionIdentity?.digest);
+  });
+
+  it("converts a matching row to DeleteLocal and keeps D0 for the review composition", async () => {
+    const { state, finalized, localFiles } = await finalizedPlan({
+      deleted: ["gone.md"],
+      stable: ["a.md", "b.md", "c.md"],
+    });
+    const sealed = seal(
+      state,
+      finalized,
+      [decisionFor(finalized, ["gone.md"])],
+      new Set(localFiles.map((entry) => entry.path)),
+    );
+    expect(sealed.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.DeleteLocal,
+        path: "gone.md",
+      }),
+    ]);
+    expect(sealed.appliedLocalDeleteDecisions).toEqual([
+      { kind: "file", token: "local-delete:test", path: "gone.md" },
+    ]);
+    expect(sealed.preDecisionIdentity?.digest)
+      .not.toBe(sealed.canonicalIdentity.digest);
+    expect(sealed.requiresThresholdConfirmation).toBe(false);
+  });
+
+  it("does not consume a matching-looking row when the recorded fact hash differs", async () => {
+    const { state, finalized, localFiles } = await finalizedPlan({
+      deleted: ["gone.md"],
+    });
+    const wrong = decisionFor(
+      finalized,
+      ["gone.md"],
+      new Map([["gone.md", "0".repeat(16)]]),
+    );
+    const sealed = seal(
+      state,
+      finalized,
+      [wrong],
+      new Set(localFiles.map((entry) => entry.path)),
+    );
+    expect(sealed.items).toEqual([
+      expect.objectContaining({
+        type: SyncActionType.ConfirmLocalDelete,
+        path: "gone.md",
+      }),
+    ]);
+    expect(sealed.appliedLocalDeleteDecisions).toEqual([]);
+    expect(sealed.localDeleteDecisionReport?.rejected).toEqual([
+      expect.objectContaining({
+        path: "gone.md",
+        reason: "path facts changed since confirmation",
+      }),
+    ]);
+    expect(sealed.canonicalIdentity.digest)
+      .toBe(sealed.preDecisionIdentity?.digest);
+  });
+
+  it("refuses the whole record when one path no longer matches, even if another does", async () => {
+    const { state, finalized, localFiles } = await finalizedPlan({
+      deleted: ["a.md", "b.md"],
+    });
+    const hashes = new Map<string, string>([
+      ["a.md", localDeleteDecisionPathHash(
+        finalized.items.find((item) => item.path === "a.md")!.decisionToken!,
+        "a.md",
+      )],
+      ["b.md", "f".repeat(16)],
+    ]);
+    const sealed = seal(
+      state,
+      finalized,
+      [decisionFor(finalized, ["a.md", "b.md"], hashes)],
+      new Set(localFiles.map((entry) => entry.path)),
+    );
+    expect(sealed.items).toEqual([
+      expect.objectContaining({ type: SyncActionType.ConfirmLocalDelete, path: "a.md" }),
+      expect.objectContaining({ type: SyncActionType.ConfirmLocalDelete, path: "b.md" }),
+    ]);
+    expect(sealed.appliedLocalDeleteDecisions).toEqual([]);
+    expect(sealed.localDeleteDecisionReport?.rejected).toEqual([
+      expect.objectContaining({ path: "b.md" }),
+    ]);
+  });
+
+  it("recovers after a crash: drops a checkpoint-settled path only when both sides are absent and still applies the residual row", async () => {
+    const { state, finalized, localFiles } = await finalizedPlan({
+      deleted: ["a.md"],
+    });
+    const aHash = localDeleteDecisionPathHash(
+      finalized.items.find((item) => item.path === "a.md")!.decisionToken!,
+      "a.md",
+    );
+    const sealed = seal(
+      state,
+      finalized,
+      [{
+        token: "local-delete:test",
+        paths: ["a.md", "b.md"],
+        planDigest: serializeLocalDeleteDecisionHashes([
+          aHash,
+          "0".repeat(16),
+        ]),
+        createdAt: 1,
+      }],
+      new Set(localFiles.map((entry) => entry.path)),
+    );
+    expect(sealed.appliedLocalDeleteDecisions).toEqual([
+      { kind: "file", token: "local-delete:test", path: "a.md" },
+    ]);
+    expect(sealed.localDeleteDecisionReport?.pruned).toEqual([
+      expect.objectContaining({
+        path: "b.md",
+        reason: "path is already absent locally and remotely",
+      }),
+    ]);
+    expect(sealed.localDeleteDecisionReport?.nextDecisions[0].paths)
+      .toEqual(["a.md"]);
+  });
+
+  it("seals a folder confirmation row into the same plan with the confirmation cleared", async () => {
+    const state = envelope({
+      folders: [],
+      folderAnchors: [
+        folderAnchor("themes", "themes"),
+        folderAnchor("primary", "themes/Primary", "themes"),
+      ],
+    });
+    const candidate = build({
+      state,
+      localFiles: [],
+      localFolders: localFolders("themes", "themes/Primary"),
+    });
+    const finalized = await finalizeCanonicalPlanCandidateV2({
+      candidate,
+      envelope: state,
+      vaultName: "Vault",
+      accountId: scope.accountId,
+      automaticHandlingPolicy: {
+        autoDeleteLocalFiles: false,
+        mergeNonOverlappingText: true,
+      },
+      baselineReconstructionIncomplete: false,
+      resolveRemoteContentHash: async () => {
+        throw new Error("no download expected");
+      },
+      configDir: ".obsidian",
+    });
+    const folderRow = finalized.items.find((item) =>
+      item.type === SyncActionType.DeleteLocalFolder
+      && item.requiresConfirmation === true);
+    expect(folderRow).toBeDefined();
+    const decisionScope = {
+      vaultName: "Vault",
+      accountId: scope.accountId,
+      scope,
+    };
+    const hash = localFolderDeleteDecisionPathHash(
+      folderRow!,
+      decisionScope,
+    );
+    expect(hash).not.toBeNull();
+    const sealed = sealCanonicalPlanV2({
+      finalized,
+      sourceEnvelope: state,
+      committedEnvelope: state,
+      localDeleteDecisions: [{
+        kind: "folder",
+        token: localFolderDeleteDecisionRecordToken(decisionScope),
+        paths: [folderRow!.path],
+        planDigest: serializeLocalDeleteDecisionHashes([hash!]),
+        createdAt: 1,
+      }],
+      localPathsPresent: new Set(),
+      localFolderPathsPresent: new Set(["themes", "themes/Primary"]),
+      decisionScope,
+    });
+    expect(sealed.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: SyncActionType.DeleteLocalFolder,
+        path: folderRow!.path,
+        requiresConfirmation: false,
+      }),
+    ]));
+    expect(sealed.appliedLocalDeleteDecisions).toEqual([{
+      kind: "folder",
+      token: localFolderDeleteDecisionRecordToken(decisionScope),
+      path: folderRow!.path,
+    }]);
+  });
+
+  it("counts converted deletes in the 50% gate while keeping the pre-decision gate", async () => {
+    const { state, finalized, localFiles } = await finalizedPlan({
+      deleted: ["a.md", "b.md"],
+    });
+    const sealed = seal(
+      state,
+      finalized,
+      [decisionFor(finalized, ["a.md", "b.md"])],
+      new Set(localFiles.map((entry) => entry.path)),
+    );
+    expect(sealed.preDecisionRequiresThresholdConfirmation).toBe(false);
+    expect(sealed.requiresThresholdConfirmation).toBe(true);
   });
 });

@@ -17,6 +17,7 @@ function result(overrides: Partial<SyncResult> = {}): SyncResult {
     downloaded: 0,
     deleted: 0,
     conflicts: 0,
+    remoteDeletePending: 0,
     deferred: 0,
     skippedLarge: 0,
     skippedIgnored: 0,
@@ -133,6 +134,35 @@ describe("sync result presentation", () => {
     });
   });
 
+  it("keeps the report-table split equal to the executor counts after the success-row cap", () => {
+    // A2 regression nail: the history entry retains only 100 successful rows.
+    // With 8 pending attention items (3 real conflicts + 5 cloud-delete
+    // confirmations) the ConfirmLocalDelete rows can be dropped from `files`
+    // while `conflicts` still says 8. Row inference then shows 8 / 0 — the old
+    // table/JSON disagreement. The executor's direct split must win.
+    const retainedSuccessRows: FileProgress[] = Array.from(
+      { length: 100 },
+      (_, index) => ({
+        path: `uploaded-${index}.md`,
+        status: "upload",
+        actionType: SyncActionType.Upload,
+      }),
+    );
+
+    expect(resolveSyncPendingAttentionCounts(8, retainedSuccessRows)).toEqual({
+      conflicts: 8,
+      remoteDeletes: 0,
+    });
+    expect(resolveSyncPendingAttentionCounts(
+      8,
+      retainedSuccessRows,
+      5,
+    )).toEqual({
+      conflicts: 3,
+      remoteDeletes: 5,
+    });
+  });
+
   it("uses action-accurate bilingual summaries for remote deletions and mixed pending items", () => {
     const zh = new I18n("zh-cn");
     const en = new I18n("en");
@@ -150,6 +180,7 @@ describe("sync result presentation", () => {
     expect(formatSyncResultMessage(
       result({
         conflicts: 1,
+        remoteDeletePending: 1,
         message: zh.t("result.conflictsPending", { conflicts: 1 }),
       }),
       [remoteDelete],
@@ -158,6 +189,7 @@ describe("sync result presentation", () => {
     expect(formatSyncResultMessage(
       result({
         conflicts: 1,
+        remoteDeletePending: 1,
         message: en.t("result.conflictsPending", { conflicts: 1 }),
       }),
       [remoteDelete],
@@ -167,6 +199,7 @@ describe("sync result presentation", () => {
     expect(formatSyncResultMessage(
       result({
         conflicts: 2,
+        remoteDeletePending: 1,
         message: zh.t("result.conflictsPending", { conflicts: 2 }),
       }),
       [remoteDelete, conflict],
@@ -175,11 +208,59 @@ describe("sync result presentation", () => {
     expect(formatSyncResultMessage(
       result({
         conflicts: 2,
+        remoteDeletePending: 1,
         message: en.t("result.conflictsPending", { conflicts: 2 }),
       }),
       [remoteDelete, conflict],
       en.t.bind(en),
     )).toBe("1 conflict(s) need attention; 1 cloud deletion(s) need confirmation");
+  });
+
+  it("prefers the executor's direct split and falls back only when it is absent", () => {
+    const zh = new I18n("zh-cn");
+    const remoteDelete: FileProgress = {
+      path: "deleted-remotely.md",
+      status: "conflict",
+      actionType: SyncActionType.ConfirmLocalDelete,
+    };
+    const conflict: FileProgress = {
+      path: "edited-both-sides.md",
+      status: "conflict",
+      actionType: SyncActionType.Conflict,
+    };
+
+    // Direct 0 wins even when a retained ConfirmLocalDelete row would infer 1.
+    expect(formatSyncResultMessage(
+      result({
+        conflicts: 1,
+        remoteDeletePending: 0,
+        message: zh.t("result.conflictsPending", { conflicts: 1 }),
+      }),
+      [remoteDelete],
+      zh.t.bind(zh),
+    )).toBe("本轮有 1 项冲突待处理");
+    // Direct split also works when no action row was retained at all.
+    expect(formatSyncResultMessage(
+      result({
+        conflicts: 2,
+        remoteDeletePending: 2,
+        message: zh.t("result.conflictsPending", { conflicts: 2 }),
+      }),
+      [],
+      zh.t.bind(zh),
+    )).toBe("本轮有 2 项云端删除待确认");
+
+    // Legacy entry without the field keeps the row inference verbatim.
+    const legacy = result({
+      conflicts: 2,
+      message: zh.t("result.conflictsPending", { conflicts: 2 }),
+    });
+    delete (legacy as Partial<SyncResult>).remoteDeletePending;
+    expect(formatSyncResultMessage(
+      legacy,
+      [remoteDelete, conflict],
+      zh.t.bind(zh),
+    )).toBe("本轮有 1 项冲突待处理，1 项云端删除待确认");
   });
 
   it("preserves real-conflict and non-default executor messages", () => {

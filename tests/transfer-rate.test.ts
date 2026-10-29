@@ -10,6 +10,7 @@ import {
 } from "../src/sync/transfer-rate";
 
 const MIB = 1024 * 1024;
+const KIB = 1024;
 
 describe("passive transfer-rate facts", () => {
   it("returns null when no transfer metrics exist", () => {
@@ -17,12 +18,15 @@ describe("passive transfer-rate facts", () => {
     expect(deriveTransferRateFacts({ endedAt: 1, fileTransfers: null })).toBeNull();
   });
 
-  it("stores raw per-direction accumulations", () => {
+  it("stores raw per-direction accumulations on the busy wall clock", () => {
     expect(deriveTransferRateFacts({
       endedAt: 100,
       fileTransfers: {
-        upload: { logicalBytes: 2 * MIB, stagesMs: { contentTransfer: 4000 } },
-        download: { logicalBytes: MIB, stagesMs: { contentTransfer: 8000 } },
+        // Eight concurrent 1 s PUTs are 1 s of busy time, not 8 s: the
+        // denominator is what keeps the round's rate from being divided by
+        // the pool depth.
+        upload: { logicalBytes: 2 * MIB, busyMs: 4000 },
+        download: { logicalBytes: MIB, busyMs: 8000 },
       },
     })).toEqual({
       uploadBytes: 2 * MIB,
@@ -37,7 +41,7 @@ describe("passive transfer-rate facts", () => {
     expect(deriveTransferRateFacts({
       endedAt: 1,
       fileTransfers: {
-        upload: { logicalBytes: 0, stagesMs: { contentTransfer: 0 } },
+        upload: { logicalBytes: 0, busyMs: 0 },
       },
     })).toBeNull();
   });
@@ -75,17 +79,17 @@ describe("passive transfer-rate facts", () => {
   });
 });
 
-describe("transfer rate sampler (live reading)", () => {
-  const snapshot = (
-    uploadBytes: number,
-    uploadMs: number,
-    downloadBytes = 0,
-    downloadMs = 0,
-  ): TransferRateTickSnapshot => ({
-    upload: { bytes: uploadBytes, ms: uploadMs },
-    download: { bytes: downloadBytes, ms: downloadMs },
-  });
+const snapshot = (
+  uploadBytes: number,
+  uploadMs: number,
+  downloadBytes = 0,
+  downloadMs = 0,
+): TransferRateTickSnapshot => ({
+  upload: { bytes: uploadBytes, ms: uploadMs },
+  download: { bytes: downloadBytes, ms: downloadMs },
+});
 
+describe("transfer rate sampler (live reading)", () => {
   it("seeds the reading outright from the first sample", () => {
     const sampler = new TransferRateSampler();
     sampler.addRoundFacts({ uploadBytes: 2 * MIB, uploadMs: 4000, measuredAt: 1000 });
@@ -136,15 +140,15 @@ describe("transfer rate sampler (live reading)", () => {
     expect(sampler.getReading(5000)!.kbps).toBe(417);
   });
 
-  it("moves the figure on every round with bytes — even tiny ones", () => {
+  it("does not move the figure on a round too small to judge the link", () => {
     const sampler = new TransferRateSampler();
     sampler.addRoundFacts({ uploadBytes: 4 * MIB, uploadMs: 4000, measuredAt: 1000 });
     expect(sampler.getReading(1000)!.kbps).toBe(1024);
-    // A 2 KB note round reads ~7 KB/s on its own; the fold moves the figure
-    // visibly instead of freezing it (the windowed cumulative average this
-    // replaces would have left the number effectively unchanged).
+    // 2 KB over 300 ms reads ~7 KB/s and carries 2 KB of payload: that is one
+    // note's request cost, not the link. It must not move the bottom figure
+    // (用户拍板 2026-10-27: 不准确就不显示；旧实现让每个小轮都拉动读数).
     sampler.addRoundFacts({ uploadBytes: 2048, uploadMs: 300, measuredAt: 2000 });
-    expect(sampler.getReading(2000)).toEqual({ level: "medium", kbps: 956 });
+    expect(sampler.getReading(2000)).toEqual({ level: "high", kbps: 1024 });
   });
 
   it("reads zero when a direction burns time without bytes, and recovers", () => {
@@ -263,33 +267,147 @@ describe("transfer rate sampler (live reading)", () => {
   });
 });
 
-describe("per-call samples (direction 2: wall-honest aggregation)", () => {
-  it("folds each completed call at its own rate — parallel calls do not divide the reading", () => {
+describe("connection-speed sample quality (bottom reading gate)", () => {
+  // 用户拍板 2026-10-27：底部连接速度不准确就不显示。现役小文件场景（每个
+  // 18 B、内容传输约 420 ms/文件）里 Δbytes/Δbusy 量的是每请求固定成本，不是
+  // 链路；这一组把「什么时候可以显示」钉成可观察行为。
+  const GATE = 256 * 1024;
+  const noteBytes = 18;
+  const noteMs = 420;
+  const noteFiles = 2001;
+
+  it("keeps the reading hidden for a 2,001-note library (18 B per file)", () => {
+    // 2,001 × 18 B = 36,018 B：整套库的载荷只有 35.2 KiB，低于一个可判断链路
+    // 的 256 KiB 门槛 7.3 倍，因此小文件库永远不产生底部读数。
+    expect(noteFiles * noteBytes).toBe(36_018);
+    expect(noteFiles * noteBytes).toBeLessThan(GATE);
+
     const sampler = new TransferRateSampler();
-    // Two 1 MiB calls, each 1 s, settling in the same wall instant. The old
-    // sum-based tick fold read (2 MiB)/(2 s) — the aggregate divided by the
-    // concurrency (「一」23④ candidate); per-call samples keep 1024.
-    sampler.addCallSample("download", MIB, 1000, 1000);
-    sampler.addCallSample("download", MIB, 1000, 1000);
-    expect(sampler.getReading(1000)).toEqual({ level: "high", kbps: 1024 });
+    sampler.beginRun();
+    // Per-round facts of a note sync: 0.04 KB/s (one 420 ms request per file).
+    sampler.addRoundFacts({
+      uploadBytes: noteFiles * noteBytes,
+      uploadMs: noteFiles * noteMs,
+      measuredAt: 1000,
+    });
+    expect(sampler.getReading(1000)).toBeNull();
+
+    // Per-second ticks of the same run: the desktop pool settles 8 notes per
+    // second = 144 B over ~1 s of busy time (0.14 KB/s). Neither shape may
+    // become a figure.
+    let at = 2000;
+    let bytes = 0;
+    for (let second = 0; second < noteFiles / 8; second++) {
+      at += 1000;
+      bytes += 8 * noteBytes;
+      sampler.sampleRunTick(snapshot(bytes, second * 1000 + 1000), at);
+    }
+    expect(bytes).toBeLessThan(GATE);
+    expect(sampler.getReading(at)).toBeNull();
+    expect(sampler.getDirectionKBps("upload", at)).toBeNull();
+  });
+
+  it("shows the reading once one accumulated sample reaches 256 KiB", () => {
+    const sampler = new TransferRateSampler();
+    sampler.beginRun();
+    // 64 KiB per second of payload = 64 KB/s: a real link, but each single
+    // tick is below the byte gate, so the figure waits for the accumulated
+    // sample (the slow-link case a per-tick byte gate would wrongly hide).
+    for (let second = 1; second <= 3; second++) {
+      sampler.sampleRunTick(snapshot(second * 64 * KIB, second * 1000), second * 1000);
+      expect(sampler.getReading(second * 1000)).toBeNull();
+    }
+    sampler.sampleRunTick(snapshot(256 * KIB, 4000), 4000);
+    expect(sampler.getReading(4000)).toEqual({ level: "medium", kbps: 64 });
+  });
+
+  it("quotes a slow but payload-dominated link after one full sample", () => {
+    const sampler = new TransferRateSampler();
+    sampler.beginRun();
+    // 40 KB/s sits in the low band and above the 25.6 KB/s admission floor
+    // (256 KiB per 10 s freshness window): it shows, after 7 s of payload.
+    for (let second = 1; second <= 6; second++) {
+      sampler.sampleRunTick(snapshot(second * 40 * KIB, second * 1000), second * 1000);
+      expect(sampler.getReading(second * 1000)).toBeNull();
+    }
+    sampler.sampleRunTick(snapshot(7 * 40 * KIB, 7000), 7000);
+    expect(sampler.getReading(7000)).toEqual({ level: "low", kbps: 40 });
+  });
+
+  it("does not let a note phase drag a big file's reading down", () => {
+    const sampler = new TransferRateSampler();
+    sampler.beginRun();
+    // Twenty seconds of 8-concurrent 18 B notes: 2.9 KiB of payload over 20 s
+    // of per-request time. Their busy time must never enter a 1 MiB/s sample.
+    let bytes = 0;
+    for (let second = 1; second <= 20; second++) {
+      bytes += 8 * noteBytes;
+      sampler.sampleRunTick(snapshot(bytes, second * 1000), second * 1000);
+    }
+    expect(sampler.getReading(20_000)).toBeNull();
+    sampler.sampleRunTick(snapshot(bytes + MIB, 21_000), 21_000);
+    expect(sampler.getReading(21_000)).toEqual({ level: "high", kbps: 1024 });
+  });
+
+  it("hides a slow link whose samples cannot fill inside the freshness window", () => {
+    const sampler = new TransferRateSampler();
+    sampler.beginRun();
+    // 10 KB/s: 256 KiB needs ~26 s to accumulate, longer than the 10 s the
+    // reading may stay on screen — showing it would blink on and off. Below
+    // the derived 25.6 KB/s floor every contribution is rejected.
+    let at = 0;
+    let bytes = 0;
+    for (let second = 1; second <= 40; second++) {
+      at = second * 1000;
+      bytes += 10 * KIB;
+      sampler.sampleRunTick(snapshot(bytes, at), at);
+    }
+    expect(sampler.getReading(at)).toBeNull();
+  });
+
+  it("hides again ten seconds after the last payload-sized sample", () => {
+    const sampler = new TransferRateSampler();
+    sampler.addRoundFacts({ downloadBytes: MIB, downloadMs: 1000, measuredAt: 1000 });
+    expect(sampler.getReading(11_000)?.kbps).toBe(1024);
+    expect(sampler.getReading(11_001)).toBeNull();
+  });
+});
+
+describe("busy wall clock (combined throughput, not per stream)", () => {
+  it("reads two parallel 1 MiB calls settling in the same second as 2 MiB/s", () => {
+    const sampler = new TransferRateSampler();
+    sampler.beginRun();
+    // Two 1 MiB calls, each taking 1 s, overlapping exactly. Busy wall clock
+    // = 1 s (not the 2 s sum of their own durations), so the combined
+    // throughput is 2 MiB/s. The sum-of-durations denominator this replaces
+    // read 1024 — one stream — and made a deeper pool look slower instead of
+    // faster (「一」23④ candidate).
+    sampler.sampleRunTick(snapshot(2 * MIB, 1000), 1000);
+    expect(sampler.getReading(1000)).toEqual({ level: "high", kbps: 2048 });
   });
 
   it("tracks the current network within seconds during small-file sync", () => {
     const sampler = new TransferRateSampler();
-    // Prior pinned at a slow era's 1 KB/s, folded 1 s before the calls.
+    // The earlier reading (2 KB over 2 s = 1 KB/s) is far below the admission
+    // floor, so it never seeds the figure; the number must come from the
+    // current link's own payload-sized sample.
     sampler.addRoundFacts({ uploadBytes: 2048, uploadMs: 2000, measuredAt: 29_000 });
-    // Fast link now: 8 KB calls completing in 100 ms, back to back for 8 s.
-    // The confidence-crawled tick fold took tens of seconds to escape the
-    // prior (short rounds never escaped it at all — the "无论网速如何都是
-    // 1 KB/s" report); per-call folds ride the designed τ cadence.
+    expect(sampler.getReading(29_000)).toBeNull();
+    // Fast link now: 8 KB calls completing in 100 ms, and the run's busy
+    // clock advances by those 100 ms only (idle time between calls never
+    // enters the denominator). One tick per second over 8 s.
     let at = 30_000;
-    for (let i = 0; i < 80; i++) {
-      sampler.addCallSample("upload", 8192, 100, at);
-      at += 100;
+    let bytes = 0;
+    for (let i = 0; i < 8; i++) {
+      at += 1000;
+      bytes += 8 * 8192;
+      sampler.sampleRunTick(snapshot(bytes, 100 * (i + 1)), at);
     }
     const reading = sampler.getReading(at);
+    // Four ticks (256 KiB of payload) fill one quotable sample ≈ 4 s in; the
+    // figure is the link's 640 KB/s, not one small request's cost.
     expect(reading?.level).toBe("medium");
-    expect(reading?.kbps ?? 0).toBeGreaterThan(45);
+    expect(reading?.kbps).toBe(640);
   });
 
   it("clears a fresh zero signal once real bytes come through", () => {
@@ -300,22 +418,33 @@ describe("per-call samples (direction 2: wall-honest aggregation)", () => {
       1000,
     );
     expect(sampler.getReading(1500)).toMatchObject({ level: "zero" });
-    sampler.addCallSample("upload", 4096, 500, 2000);
-    const reading = sampler.getReading(2500);
+    // A trickle of bytes clears the red signal at once, but it does not become
+    // a speed reading: only a payload-sized sample may quote a rate.
+    sampler.sampleRunTick(snapshot(4096, 6500), 2000);
+    expect(sampler.getReading(2500)).toBeNull();
+    sampler.sampleRunTick(snapshot(4096 + 512 * KIB, 7500), 3000);
+    const reading = sampler.getReading(3000);
     expect(reading?.level).not.toBe("zero");
-    expect(reading?.kbps).toBe(8);
+    expect(reading?.kbps).toBe(512);
   });
 
-  it("keeps the per-call sample wired from the executor settle path into the plugin", () => {
+  it("keeps the busy clock wired from the executor transfer path into the plugin", () => {
     const executorSource = readFileSync("src/sync/sync-executor.ts", "utf8");
-    // trackTransfer stamps the call start, emits one sample per settled
-    // byte-moving call, and the constructor exposes the hook for main.
-    expect(executorSource).toContain("callStart: Date.now()");
-    expect(executorSource).toContain("handle.bytesSoFar > 0");
-    expect(executorSource).toContain("this.onTransferCallSample?.({");
-    expect(executorSource).toContain("onTransferCallSample?:");
+    // The executor owns the only busy clock: it opens on the first byte of a
+    // transfer, closes when the last one settles, and books wall time (never
+    // the sum of the calls) into the run's per-direction metrics.
+    expect(executorSource).toContain("busyMs");
+    expect(executorSource).toContain("private beginTransferBusy(");
+    expect(executorSource).toContain("private endTransferBusy(");
+    expect(executorSource).toContain("private busyWallClockMs(");
+    // No per-call sample channel: while calls overlap, folding each one at its
+    // own bytes/wall quotes a single stream instead of the combined rate.
+    expect(executorSource).not.toContain("onTransferCallSample");
+    expect(executorSource).not.toContain("TransferCallSample");
+    const rateSource = readFileSync("src/sync/transfer-rate.ts", "utf8");
+    expect(rateSource).not.toContain("addCallSample");
     const mainSource = readFileSync("src/main.ts", "utf8");
-    expect(mainSource).toContain("transferRateSampler.addCallSample");
+    expect(mainSource).not.toContain("addCallSample");
   });
 
   it("keeps the transfer-rate sampler session-local (no persisted window)", () => {

@@ -763,12 +763,13 @@ describe("S4 termination criterion (executor wiring)", () => {
       outcome: "non-retryable",
       streak: 2,
     });
-    // The recovery section's temporary line is replaced by the one terminal
-    // diagnosis line (and the reset pointer survives nowhere in that line).
+    // S4 stays a pending-row/diagnostic verdict. Recovery deliberately keeps
+    // its generic blocked body: there is no user operation behind a separate
+    // terminal recovery state, so it must not grow one.
+    expect(presentationFor().summary)
+      .toBe("syncView.recovery.summary.interrupted");
     expect(presentationFor().nextStep)
-      .toBe("syncView.itemTermination.nonRetryable");
-    expect(presentationFor().nextStep)
-      .not.toContain("syncView.recovery.nextStep.blocked");
+      .toBe("syncView.recovery.nextStep.blocked");
 
     // Round 4: the ending is stable and stated once — no new announcement.
     await executor.run("manual", {});
@@ -900,18 +901,17 @@ describe("S4 termination criterion (executor wiring)", () => {
     expect(withVerdict).not.toBe(without);
   });
 
-  it("pins the two surfaces that render the terminal line", () => {
+  it("keeps the terminal line on pending rows and out of recovery", () => {
     const view = readSourceFile("src/ui/sync-view.ts");
     const row = functionBody(view, "  private renderPendingIssue(");
     expect(row).toContain("pendingIssueTerminationKey(issue)");
     expect(row).toContain('t("syncView.itemTermination.nonRetryable")');
     const section = functionBody(view, "  private renderMutationRecoverySection(");
-    expect(section).toContain("mutationRecoveryItemKey(state.blockedOperationId)");
-    expect(section).toContain("nonRetryable:");
-    // Both surfaces read the same key and the same one judgement source.
+    expect(section).not.toContain("mutationRecoveryItemKey");
+    expect(section).not.toContain("nonRetryable");
     const presentation = readSourceFile("src/ui/mutation-recovery-presentation.ts");
     expect(functionBody(presentation, "export function mutationRecoveryBodyPresentation("))
-      .toContain('"syncView.itemTermination.nonRetryable"');
+      .not.toContain("syncView.recovery.body.nonRetryable");
   });
 
   it("uses the same exit list the renderer draws chips from (no contradiction possible)", () => {

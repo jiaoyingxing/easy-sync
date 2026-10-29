@@ -33,6 +33,38 @@ describe("SyncProgressStore retention", () => {
     expect(progress.state.completedCount).toBe(150);
   });
 
+  it("keeps a 37-success round's failure row and never trims issue rows at the cap", () => {
+    const progress = new SyncProgressStore();
+    for (let index = 0; index < 37; index++) {
+      progress.addCompletedFile({ path: `ok-${index}.md`, status: "upload" });
+    }
+    progress.addCompletedFile({
+      path: "failed.md",
+      status: "error",
+      reason: "network",
+    });
+
+    // 真机情景（iPhone 截图）：一轮 37 个成功 + 1 条上一轮遗留的失败，行数
+    // 必须是 38——失败行不是「可省略的成功记录」，不会被保留上限吃掉。
+    expect(progress.state.completedFiles).toHaveLength(38);
+    expect(progress.state.completedFiles.at(-1)).toMatchObject({
+      path: "failed.md",
+      status: "error",
+    });
+    expect(progress.state.completedCount).toBe(38);
+
+    // 成功记录超过上限后只裁成功行：失败行仍留在列表里。
+    for (let index = 0; index < 100; index++) {
+      progress.addCompletedFile({ path: `later-${index}.md`, status: "upload" });
+    }
+    expect(
+      progress.state.completedFiles.filter((file) => file.status !== "error"),
+    ).toHaveLength(100);
+    expect(
+      progress.state.completedFiles.find((file) => file.path === "failed.md"),
+    ).toBeDefined();
+  });
+
   it("resets the completed count together with the retained list", () => {
     const progress = new SyncProgressStore();
     progress.addCompletedFile({ path: "a.md", status: "upload" });
@@ -103,17 +135,15 @@ describe("SyncProgressStore retention", () => {
     const progress = new SyncProgressStore();
 
     progress.setPhase("executing");
+    // `current` counts settled items (2026-10-26): three of four done = 75%.
     progress.setProgress(3, 4, "large.bin", SyncActionType.Download);
-    expect(syncProgressPercent(progress.state)).toBe(50);
+    expect(syncProgressPercent(progress.state)).toBe(75);
 
     progress.setByteProgress(50, 100);
-    expect(syncProgressPercent(progress.state)).toBe(63);
-
-    progress.completeCurrentItem();
-    expect(syncProgressPercent(progress.state)).toBe(75);
+    expect(syncProgressPercent(progress.state)).toBe(88);
 
     progress.setProgress(4, 4, "last.md", SyncActionType.Upload);
-    expect(syncProgressPercent(progress.state)).toBe(75);
+    expect(syncProgressPercent(progress.state)).toBe(100);
   });
 
   it("treats executor and progress store as one running signal", () => {
@@ -156,6 +186,46 @@ describe("SyncProgressStore retention", () => {
 
     progress.markStarted();
     expect(progress.state.recoveryVerification).toBeUndefined();
+  });
+
+  it("flips a shown success to failed in place when its batch checkpoint did not commit", () => {
+    const progress = new SyncProgressStore();
+    progress.setPhase("executing");
+    progress.addCompletedFile({ path: "a.md", status: "upload", actionType: SyncActionType.Upload });
+    progress.addCompletedFile({ path: "b.md", status: "upload", actionType: SyncActionType.Upload });
+
+    expect(progress.revertCompletedFile("a.md", "同步已取消")).toBe(true);
+
+    // The row stays where it was (no jump to the top) and keeps its action
+    // type; it gains the failure status and the reason. The settled-action
+    // count does not change: the file's own work did happen.
+    expect(progress.state.completedFiles.map((file) => file.path)).toEqual([
+      "a.md",
+      "b.md",
+    ]);
+    expect(progress.state.completedFiles[0]).toMatchObject({
+      path: "a.md",
+      status: "error",
+      reason: "同步已取消",
+      actionType: SyncActionType.Upload,
+    });
+    expect(progress.state.completedFiles[0].failedAt).toBeTypeOf("number");
+    expect(progress.state.completedFiles[1].status).toBe("upload");
+    expect(progress.state.completedCount).toBe(2);
+  });
+
+  it("keeps an already-failed row as the failure it is when a flip is asked twice", () => {
+    const progress = new SyncProgressStore();
+    progress.setPhase("executing");
+    progress.addCompletedFile({ path: "a.md", status: "error", reason: "network" });
+
+    // Nothing successful to flip: the row already tells the truth, so the
+    // second report is a no-op instead of rewriting the reason.
+    expect(progress.revertCompletedFile("a.md", "同步已取消")).toBe(false);
+    expect(progress.state.completedFiles[0]).toMatchObject({
+      status: "error",
+      reason: "network",
+    });
   });
 
 });
