@@ -1073,7 +1073,12 @@ describe("StateManager V2 production controller", () => {
       (total, key) => total + row.build[key],
       0,
     );
-    expect(Math.abs(buildSum - row.buildMs)).toBeLessThanOrEqual(1);
+    // Five phases and the parent are each rounded to whole milliseconds, so the
+    // sum may differ from the rounded parent by up to one unit per rounded
+    // value — the same budget the outer bucket identity above allows. A phase
+    // that stopped being measured would miss by orders of magnitude, not by
+    // 1–2 ms (2026-10-29: a 2 ms gap on the Windows CI runner was pure rounding).
+    expect(Math.abs(buildSum - row.buildMs)).toBeLessThanOrEqual(buildPhases.length);
     // Eight records over 200 identity rows derive and validate the whole
     // envelope once per record, so both phases are materially non-zero — the
     // split is measured, not zero-filled.
