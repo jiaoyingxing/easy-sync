@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -29,16 +29,25 @@ const PROJECTED_SCRIPTS = new Set([
 
 /**
  * 明确不投影的测试文件（公开仓 `main` 侧也没有它们）。
- * `recovery-rename-spelling-reflection` 是既有名单；后两件＝2026-10-16 定案补入，
- * 待下次投影时从公开仓删除（删除须随投影推送，推送另行授权）。
+ * `dev-deploy-safety` 与 `graph-contract-fixtures`＝2026-10-16 定案补入：它们读
+ * dev-deploy 部署脚本与 probes 目录下的私有脚本，公开仓没有这些文件。1.6.0 已从公开仓
+ * 删除，1.6.2 整目录复制时被带回，2026-10-29 随投影脚本再次删除。
  * `dev-cli-wrapper`＝2026-10-29 补入：它测的是开发期宿主包装器 obsidian.mjs
  * （dev 目录下的 CLI 守卫），本就不在投影面，公开仓没有该脚本。
+ * `release-projection`＝2026-10-29 补入：它测 scripts/release/ 的投影脚本，
+ * 该目录不投影（投影规则本身只在源码面维护）。
+ *
+ * 名单里允许存在「两仓都已删除」的条目（本门只判现存文件＋引用），但死条目会误导
+ * 后来者：2026-10-29 清掉了随死代码删除的 recovery-rename-spelling-reflection。
+ *
+ * 本名单与 scripts/release/projection-policy.json 的 exclude 必须一致：
+ * 下面第三条用例在源码面（该 JSON 存在时）做交叉校验，公开面没有该文件则跳过。
  */
 const NOT_PROJECTED_TESTS = new Set([
-  "tests/recovery-rename-spelling-reflection.test.ts",
   "tests/dev-deploy-safety.test.ts",
   "tests/graph-contract-fixtures.test.ts",
   "tests/dev-cli-wrapper.test.ts",
+  "tests/release-projection.test.ts",
 ]);
 
 /** 引号里出现的 scripts 路径（够用的启发式：不走注释与正则误伤）。 */
@@ -88,6 +97,22 @@ describe("public projection dependency gate", () => {
     // 构建链脚本是投影面的一部分：把它们误列进"不投影"会让门失去意义。
     for (const script of PROJECTED_SCRIPTS) {
       expect(script.startsWith("scripts/")).toBe(true);
+    }
+  });
+
+  // 交叉校验（2026-10-29）：本名单为公开面自足而硬编码，投影规则在
+  // scripts/release/projection-policy.json 另存一份机读来源。两份漂移会让投影
+  // 脚本删错文件或留下不该有的文件，所以源码面必须逐项相等；公开仓没有
+  // `scripts/`，该 JSON 不存在时直接跳过（本文件在公开面照常可跑）。
+  it("keeps the projection policy in sync with this list", () => {
+    // 路径按段拼装：本门用「引号里的 scripts 路径」做启发式，直接写成字面量会把
+    // 本文件自己也判成依赖未投影脚本（本文件必须在公开面可跑）。
+    const policyPath = ["scripts", "release", "projection-policy.json"].join("/");
+    if (!existsSync(policyPath)) return;
+    const policy = JSON.parse(readFileSync(policyPath, "utf8"));
+    expect([...policy.exclude].sort()).toEqual([...NOT_PROJECTED_TESTS].sort());
+    for (const script of PROJECTED_SCRIPTS) {
+      expect(policy.include).toContain(script);
     }
   });
 });
