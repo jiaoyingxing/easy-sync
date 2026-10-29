@@ -1043,10 +1043,11 @@ describe("StateManager V2 production controller", () => {
     // recovery bucket must at least hold both waits.
     expect(row.recoveryMs).toBeGreaterThanOrEqual(2 * RECOVERY_WRITE_MS - 1);
     // The buckets are measured to add up: only whole-millisecond rounding may
-    // stand between their sum and the commit's own wall clock.
+    // stand between their sum and the commit's own wall clock. Each value is
+    // rounded on its own, so the sum may sit on either side of the total by up
+    // to one unit per rounded value (2026-10-29: 1 ms over on the CI runner).
     const sum = buckets.reduce((total, key) => total + row[key], 0);
-    expect(sum).toBeLessThanOrEqual(row.totalMs);
-    expect(row.totalMs - sum).toBeLessThanOrEqual(buckets.length);
+    expect(Math.abs(sum - row.totalMs)).toBeLessThanOrEqual(buckets.length);
 
     // `buildMs` is split into its five measured phases, and the split has to
     // add up to the bucket it decomposes: a phase that silently stopped being
