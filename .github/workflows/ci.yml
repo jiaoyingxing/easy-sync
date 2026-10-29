@@ -17,7 +17,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -78,8 +78,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/assets"
           for f in main.js manifest.json styles.css; do
             gh release download "$tag" --pattern "$f" --dir "$RUNNER_TEMP/assets" --clobber
-            remote=$(sha256sum "$RUNNER_TEMP/assets/$f" | cut -d' ' -f1)
-            local=$(sha256sum "$f" | cut -d' ' -f1)
+            # Read through stdin: sha256sum escapes file names that contain
+            # backslashes (Windows RUNNER_TEMP) with a leading "\", which would
+            # make the two hashes differ by a character that is not content.
+            remote=$(sha256sum < "$RUNNER_TEMP/assets/$f" | cut -d' ' -f1)
+            local=$(sha256sum < "$f" | cut -d' ' -f1)
             echo "$f asset=$remote build=$local"
             if [ "$remote" != "$local" ]; then
               echo "::error::$f does not match the release asset"
