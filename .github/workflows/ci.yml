@@ -1,0 +1,74 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to check out and verify assets against (default: current ref / latest release)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # workflow_dispatch may verify an already published version: check out
+          # that tag so the build matches the release commit.
+          ref: ${{ inputs.tag || '' }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npm test
+      - run: npm run check:meta
+      - run: npm run build
+
+      # `npm run check` is deliberately not used: check:docs / dev:* point at
+      # directories that are not projected into this repo. The runnable subset
+      # above is the public-face gate.
+      - name: Verify release assets match the build
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG:-$INPUT_TAG}"
+          if [ -z "$tag" ]; then
+            tag=$(gh release view --json tagName -q .tagName)
+          fi
+          echo "verifying release assets of $tag"
+          mkdir -p "$RUNNER_TEMP/assets"
+          for f in main.js manifest.json styles.css; do
+            gh release download "$tag" --pattern "$f" --dir "$RUNNER_TEMP/assets" --clobber
+            remote=$(sha256sum "$RUNNER_TEMP/assets/$f" | cut -d' ' -f1)
+            local=$(sha256sum "$f" | cut -d' ' -f1)
+            echo "$f asset=$remote build=$local"
+            if [ "$remote" != "$local" ]; then
+              echo "::error::$f does not match the release asset"
+              exit 1
+            fi
+          done
+          echo "all three assets match the build"
