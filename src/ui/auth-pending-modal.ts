@@ -19,10 +19,14 @@ import {
 } from "../obsidian-compat";
 import type { AuthModule } from "../auth/auth-module";
 import {
+  addEasySyncFooterButton,
+  createEasySyncModalFooter,
+  EasySyncModal,
+} from "./easy-sync-modal";
+import {
   NOTICE_PRIORITY,
   type EasySyncNoticeCenter,
 } from "./notice-center";
-import { EasySyncModal } from "./easy-sync-modal";
 
 type PendingModalResult =
   | { action: "reopen" }
@@ -35,8 +39,7 @@ interface AuthPendingModalDeps {
   t: (key: string) => string;
 }
 
-export class AuthPendingModal extends EasySyncModal {
-  private resolve: ((value: PendingModalResult) => void) | null = null;
+export class AuthPendingModal extends EasySyncModal<PendingModalResult> {
   private authTick: IntervalHandle | null = null;
   private closed = false;
   private failureShown = false;
@@ -58,17 +61,7 @@ export class AuthPendingModal extends EasySyncModal {
 
   /** Open the modal and return the user's chosen action */
   awaitAction(): Promise<PendingModalResult> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
-  }
-
-  private finish(result: PendingModalResult): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    this.close();
-    resolve?.(result);
+    return this.awaitResult();
   }
 
   onOpen(): void {
@@ -83,30 +76,27 @@ export class AuthPendingModal extends EasySyncModal {
       cls: "setting-item-description",
     });
 
-    const btnRow = contentEl.createDiv({
-      cls: "modal-button-container easy-sync-auth-pending-actions",
+    // No CTA in a waiting room (success auto-closes): the cancel exit leads
+    // the DOM so phones keep it at the bottom via the host's column-reverse.
+    const btnRow = createEasySyncModalFooter(contentEl);
+    addEasySyncFooterButton(btnRow, {
+      label: this.cancelLabel,
+      onClick: () => {
+        this.settle({ action: "cancel" });
+      },
     });
-
-    const copyBtn = btnRow.createEl("button", {
-      text: this.copyLabel,
+    addEasySyncFooterButton(btnRow, {
+      label: this.copyLabel,
+      onClick: () => {
+        this.onCopy?.();
+      },
     });
-    copyBtn.addEventListener("click", () => {
-      this.onCopy?.();
-    });
-
-    const reopenBtn = btnRow.createEl("button", {
-      text: this.reopenLabel,
-    });
-    reopenBtn.addEventListener("click", () => {
-      this.onReopen?.();
-      this.finish({ action: "reopen" });
-    });
-
-    const cancelBtn = btnRow.createEl("button", {
-      text: this.cancelLabel,
-    });
-    cancelBtn.addEventListener("click", () => {
-      this.finish({ action: "cancel" });
+    addEasySyncFooterButton(btnRow, {
+      label: this.reopenLabel,
+      onClick: () => {
+        this.onReopen?.();
+        this.settle({ action: "reopen" });
+      },
     });
 
     if (this.deps) {
@@ -131,7 +121,7 @@ export class AuthPendingModal extends EasySyncModal {
       message: this.deps.t("settings.account.loginSuccess"),
       priority: NOTICE_PRIORITY.action,
     });
-    this.finish({ action: "dismiss" });
+    this.settle({ action: "dismiss" });
   }
 
   private showFailure(): void {
@@ -145,14 +135,12 @@ export class AuthPendingModal extends EasySyncModal {
     this.messageEl?.setText(this.deps.t("settings.account.pendingFailed"));
   }
 
-  onClose(): void {
+  override onClose(): void {
     if (this.authTick !== null) {
       compatClearInterval(this.authTick);
       this.authTick = null;
     }
     this.closed = true;
-    const resolve = this.resolve;
-    this.resolve = null;
-    resolve?.({ action: "dismiss" });
+    this.takePendingResolve()?.({ action: "dismiss" });
   }
 }

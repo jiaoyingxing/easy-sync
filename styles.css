@@ -143,12 +143,101 @@ body.is-mobile .modal-container.easy-sync-modal-container .modal-bg {
   font-variant-numeric: tabular-nums;
 }
 
+/* ---- Shared modal contract (2026-10-30 弹框共享件) ---- */
+
+/* 高度上限全仓只有这一处定义；内容密集弹框（配置表单、冲突详情）共用。
+   recovery 的侧栏式形态是登记例外（DECISIONS 2026-10-30）。 */
+:root {
+  --easy-sync-modal-max-height: 80vh;
+}
+
+/* 弹框底栏：容器＝宿主 .modal-button-container（对齐/换行/手机 column-reverse
+   归宿主），插件只补顶距与可选分割线。fixed＝内容详情族的固定动作排。 */
+.easy-sync-modal-footer {
+  margin-top: 16px;
+}
+
+.easy-sync-modal-footer.is-divided {
+  border-top: 1px solid var(--background-modifier-border);
+  padding-top: 12px;
+}
+
+.easy-sync-modal-footer.is-fixed {
+  flex-shrink: 0;
+  margin-top: 0;
+  padding: 8px 0 2px;
+  border-top: 1px solid var(--background-modifier-border);
+  background: var(--modal-background);
+}
+
+/* 手机：宿主给 .modal-button-container 挂的 safe-area 外边距会随软键盘变化，
+   浮动卡片不吃它，底距由底栏内衬承担（Resojot 2026-10-26 实测口径）。 */
+body.is-phone .easy-sync-modal-footer {
+  margin-bottom: 0;
+  padding-left: 0;
+  padding-right: 0;
+}
+
+body.is-phone .easy-sync-modal-footer.is-fixed {
+  padding: 8px 0 2px;
+}
+
+/* 确认框编号行（2026-10-31）：多条动作/规则才用 ol；单动作保持一句，
+   零文件动作保持段落。槽位顺序＝message → lines → steps → warning。 */
+.easy-sync-confirm-steps {
+  margin: 8px 0 0;
+  padding-left: 1.5em;
+  line-height: 1.6;
+}
+
+.easy-sync-confirm-steps li {
+  margin: 0 0 2px;
+}
+
+/* 手机软键盘余量：挂到弹框内的滚动容器；--keyboard-height 键盘收起为 0、
+   弹出自动让位，桌面恒为 0。基准内衬按容器覆盖 --easy-sync-tail-*。 */
+.easy-sync-keyboard-tail {
+  padding-bottom: calc(var(--easy-sync-tail-pad, 0px) + var(--keyboard-height, 0px));
+  scroll-padding-bottom: calc(var(--easy-sync-tail-scroll, 0px) + var(--keyboard-height, 0px));
+}
+
+/* 错误提示两组令牌（2026-10-30 第二轮）：字号/行高/颜色只在这里定，新增
+   错误提示不要再另起类名。弹框级＝底栏/内容尾上方一条；字段级＝出错字段
+   下方（配置行的 control 是横向 flex，flex-basis 100% 让它独占一行）。 */
+.easy-sync-modal-error {
+  margin: var(--size-4-2) 0 0;
+  color: var(--text-error);
+  font-size: var(--font-ui-small);
+  line-height: 1.45;
+}
+
+.easy-sync-field-error {
+  flex-basis: 100%;
+  margin-top: var(--size-2-1);
+  color: var(--text-error);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.4;
+}
+
+.easy-sync-modal-error.is-hidden,
+.easy-sync-field-error.is-hidden {
+  display: none;
+}
+
+/* 弹框宽度两档：默认档＝宿主不写 width；宽版档＝本条唯一规则。选择器必须带
+   .modal 前缀——宿主宽度规则是双类选择器，单类名压不过（Resojot 2026-10-26
+   实测 12 条手写宽度静默失效）。除本条与 recovery 侧栏式例外，不再有第三种
+   弹框宽度。 */
+.modal.easy-sync-modal-wide {
+  width: min(620px, calc(100vw - 24px));
+}
+
 /* ---- Settings Modals ---- */
 
 .easy-sync-settings-modal {
   display: flex;
   flex-direction: column;
-  max-height: 80vh;
+  max-height: var(--easy-sync-modal-max-height);
   overflow: hidden;
 }
 
@@ -199,14 +288,30 @@ body.is-mobile .modal-container.easy-sync-modal-container .modal-bg {
 }
 
 /* chip 挂点共用的行名/标题间距容器：容器转 flex，chip 与文字之间由 gap
-   留距（社区插件 scope 行、社区插件管理弹框标题、关于页「新版本」chip）。 */
+   留距（社区插件 scope 行、关于页「新版本」chip）。弹框标题另见下方
+   高优先级规则。 */
 .easy-sync-community-plugin-scope-setting .setting-item-name,
-.easy-sync-community-plugin-data-title,
 .easy-sync-settings-name-with-chip {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
   gap: var(--size-2-2) var(--size-4-2);
+}
+
+/* 管理弹框标题旁的计数 chip。手机宿主 `.is-phone .modal-title` 会把标题
+   设成 display:block，同优先级下我们的 flex+gap 会失效、chip 紧贴标题；
+   这里用更高优先级的组合选择器覆盖，并保留手机端的居中与完整宽度。 */
+.easy-sync-settings-modal .modal-title.easy-sync-community-plugin-title-with-chip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--size-4-2);
+  max-width: 100%;
+  overflow: visible;
+}
+
+body.is-phone .easy-sync-settings-modal .modal-title.easy-sync-community-plugin-title-with-chip {
+  justify-content: center;
 }
 
 .easy-sync-plugin-search {
@@ -315,16 +420,10 @@ body:not(.is-mobile) .easy-sync-plugin-search {
   padding: 0 var(--size-4-2);
 }
 
-.easy-sync-empty-folder-modal {
-  width: min(640px, calc(100vw - 32px));
-}
-
+/* 空文件夹弹框走宽版档（.modal.easy-sync-modal-wide，见共享分节）；
+   640px 手写宽度已撤。 */
 .easy-sync-empty-folder-modal h3 {
   margin-bottom: var(--size-4-1);
-}
-
-.easy-sync-empty-folder-actions {
-  margin-top: var(--size-4-3);
 }
 
 body.is-mobile .easy-sync-empty-folder-modal .setting-item {
@@ -334,8 +433,7 @@ body.is-mobile .easy-sync-empty-folder-modal .setting-item {
 }
 
 body.is-mobile .easy-sync-empty-folder-modal .setting-item-control,
-body.is-mobile .easy-sync-empty-folder-modal .setting-item-control button,
-body.is-mobile .easy-sync-empty-folder-actions button {
+body.is-mobile .easy-sync-empty-folder-modal .setting-item-control button {
   width: 100%;
 }
 
@@ -421,7 +519,7 @@ body.is-mobile .easy-sync-empty-folder-actions button {
 .easy-sync-conflict-detail {
   display: flex;
   flex-direction: column;
-  max-height: 80vh;
+  max-height: var(--easy-sync-modal-max-height);
   padding: 4px;
   overflow: hidden; /* ponytail: single scroll surface — only .easy-sync-conflict-body scrolls */
 }
@@ -724,43 +822,28 @@ body.is-mobile .easy-sync-bundle-overview .easy-sync-bundle-diff-link {
   margin: 8px 0;
 }
 
-/* Modal action buttons — fixed footer below scrollable body.
-   Must track the dialog card via --modal-background: the shell repaints with
-   --background-secondary on dark mobile (.is-mobile.theme-dark), so pinning
-   --background-primary here leaves a visibly lighter band there. */
-.easy-sync-detail-actions {
-  display: flex;
-  gap: 8px;
-  justify-content: center;
-  padding: 8px 0 2px;
-  flex-shrink: 0;
-  border-top: 1px solid var(--background-modifier-border);
-  background: var(--modal-background);
-}
-
-.easy-sync-detail-actions button {
-  padding: 6px 16px;
-}
-
-.easy-sync-detail-actions .easy-sync-detail-action-local {
+/* Content-detail fixed-footer action colors (2026-10-25「颜色＝后果」): the
+   container itself is the shared `.easy-sync-modal-footer.is-fixed`; only the
+   keep-side tinting lives here. */
+.easy-sync-modal-footer .easy-sync-detail-action-local {
   background-color: rgba(var(--color-red-rgb), 0.18);
   border-color: rgba(var(--color-red-rgb), 0.28);
   box-shadow: none;
   color: var(--color-red);
 }
 
-.easy-sync-detail-actions .easy-sync-detail-action-remote {
+.easy-sync-modal-footer .easy-sync-detail-action-remote {
   background-color: rgba(var(--color-green-rgb), 0.18);
   border-color: rgba(var(--color-green-rgb), 0.28);
   box-shadow: none;
   color: var(--color-green);
 }
 
-.easy-sync-detail-actions .easy-sync-detail-action-local:hover {
+.easy-sync-modal-footer .easy-sync-detail-action-local:hover {
   background-color: rgba(var(--color-red-rgb), 0.26);
 }
 
-.easy-sync-detail-actions .easy-sync-detail-action-remote:hover {
+.easy-sync-modal-footer .easy-sync-detail-action-remote:hover {
   background-color: rgba(var(--color-green-rgb), 0.26);
 }
 
@@ -1277,6 +1360,12 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
   white-space: nowrap;
 }
 
+/* 窗口行的目录行上沿留白：它紧跟在批量动作／上一段行之后，2px 太贴
+ * （2026-10-29 现场目审）。探针用同一个类，行高预算按真实留白算。 */
+.easy-sync-window-directory {
+  padding-top: 8px;
+}
+
 .easy-sync-file-row {
   display: flex;
   flex-wrap: wrap;
@@ -1375,6 +1464,13 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
   min-width: 0;
 }
 
+/* 窗口行的测量单位：可选灰字目录行＋行本体。行高缓存量的是 slot，目录行
+ * 因此进入滚动偏移模型，不再是预算外的额外子节点；目录行本身仍复用静态
+ * 列表的 .easy-sync-path-directory 外观。 */
+.easy-sync-plan-row-slot {
+  min-width: 0;
+}
+
 .easy-sync-plan-virtual-spacer {
   pointer-events: none;
 }
@@ -1425,15 +1521,6 @@ body.is-mobile .easy-sync-plan-execute button {
 /* 移动端＝逐条整宽堆叠（与其余计划动作行一致）：等分只属于并排形态。 */
 body.is-mobile .easy-sync-local-only-batch-actions button {
   flex: 0 0 auto;
-}
-
-body.is-mobile .easy-sync-auth-pending-actions {
-  flex-direction: column;
-  align-items: stretch;
-}
-
-body.is-mobile .easy-sync-auth-pending-actions button {
-  width: 100%;
 }
 
 /* Auth method chooser modal (first login) — light list rows, not capsule buttons */
@@ -1566,19 +1653,6 @@ body.is-mobile .easy-sync-auth-pending-actions button {
   color: var(--text-muted);
   font-size: var(--font-ui-smaller);
   margin-bottom: var(--size-4-4);
-}
-
-.easy-sync-device-actions {
-  flex-wrap: wrap;
-}
-
-body.is-mobile .easy-sync-device-actions {
-  flex-direction: column;
-  align-items: stretch;
-}
-
-body.is-mobile .easy-sync-device-actions button {
-  width: 100%;
 }
 
 .easy-sync-device-status {

@@ -6,7 +6,11 @@
  * window), or the manual guide (opened on top; this modal stays).
  */
 import { type App } from "obsidian";
-import { EasySyncModal } from "./easy-sync-modal";
+import {
+  addEasySyncFooterButton,
+  createEasySyncModalFooter,
+  EasySyncModal,
+} from "./easy-sync-modal";
 
 type RsMigrationFailureResult =
   | { action: "retry" }
@@ -25,8 +29,6 @@ interface RsMigrationFailureViews {
 }
 
 export class RsMigrationGuideModal extends EasySyncModal {
-  private resolve: (() => void) | null = null;
-
   constructor(
     app: App,
     private views: { title: string; body: string; okLabel: string },
@@ -46,35 +48,28 @@ export class RsMigrationGuideModal extends EasySyncModal {
         cls: "setting-item-description",
       });
     }
-    const btnRow = contentEl.createDiv("modal-button-container");
-    const closeButton = btnRow.createEl("button", {
-      text: this.views.okLabel,
-      cls: "mod-cta",
-      type: "button",
-    });
-    closeButton.addEventListener("click", () => {
-      this.close();
+    const btnRow = createEasySyncModalFooter(contentEl);
+    addEasySyncFooterButton(btnRow, {
+      label: this.views.okLabel,
+      variant: "cta",
+      onClick: () => {
+        this.close();
+      },
     });
   }
 
-  onClose(): void {
-    this.resolve?.();
-    this.resolve = null;
+  override onClose(): void {
+    // Resolves when the guide has been read (or dismissed).
+    this.takePendingResolve()?.();
   }
 
   /** Resolves when the guide has been read (or dismissed). */
   awaitRead(): Promise<void> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
+    return this.awaitResult();
   }
 }
 
-export class RsMigrationFailureModal extends EasySyncModal {
-  private resolve: ((value: RsMigrationFailureResult) => void) | null = null;
-  private finished = false;
-
+export class RsMigrationFailureModal extends EasySyncModal<RsMigrationFailureResult> {
   constructor(
     app: App,
     private views: RsMigrationFailureViews,
@@ -83,19 +78,7 @@ export class RsMigrationFailureModal extends EasySyncModal {
   }
 
   awaitAction(): Promise<RsMigrationFailureResult> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
-  }
-
-  private finish(result: RsMigrationFailureResult): void {
-    if (this.finished) return;
-    this.finished = true;
-    const resolve = this.resolve;
-    this.resolve = null;
-    this.close();
-    resolve?.(result);
+    return this.awaitResult();
   }
 
   onOpen(): void {
@@ -110,41 +93,36 @@ export class RsMigrationFailureModal extends EasySyncModal {
       cls: "setting-item-description",
     });
 
-    const btnRow = contentEl.createDiv("modal-button-container");
-    const retryButton = btnRow.createEl("button", {
-      text: this.views.retryLabel,
-      cls: "mod-cta",
-      type: "button",
+    // DOM order: the guide link and the plain alternative first, the CTA
+    // retry last — phones show the retry on top via the host's column-reverse.
+    const btnRow = createEasySyncModalFooter(contentEl);
+    addEasySyncFooterButton(btnRow, {
+      label: this.views.guideLabel,
+      variant: "link",
+      onClick: () => {
+        void new RsMigrationGuideModal(this.app, {
+          title: this.views.guideTitle,
+          body: this.views.guideBody,
+          okLabel: this.views.guideOk,
+        }).awaitRead();
+      },
     });
-    retryButton.addEventListener("click", () => {
-      this.finish({ action: "retry" });
+    addEasySyncFooterButton(btnRow, {
+      label: this.views.freshLabel,
+      onClick: () => {
+        this.settle({ action: "fresh-sync" });
+      },
     });
-
-    const freshButton = btnRow.createEl("button", {
-      text: this.views.freshLabel,
-      type: "button",
-    });
-    freshButton.addEventListener("click", () => {
-      this.finish({ action: "fresh-sync" });
-    });
-
-    const guideButton = btnRow.createEl("button", {
-      text: this.views.guideLabel,
-      cls: "mod-link",
-      type: "button",
-    });
-    guideButton.addEventListener("click", () => {
-      void new RsMigrationGuideModal(this.app, {
-        title: this.views.guideTitle,
-        body: this.views.guideBody,
-        okLabel: this.views.guideOk,
-      }).awaitRead();
+    addEasySyncFooterButton(btnRow, {
+      label: this.views.retryLabel,
+      variant: "cta",
+      onClick: () => {
+        this.settle({ action: "retry" });
+      },
     });
   }
 
-  onClose(): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    resolve?.({ action: "dismiss" });
+  override onClose(): void {
+    this.takePendingResolve()?.({ action: "dismiss" });
   }
 }

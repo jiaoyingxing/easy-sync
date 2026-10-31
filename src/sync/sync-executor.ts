@@ -148,6 +148,7 @@ import type {
   ManualMutationResolutionV1,
   ManualMutationResolutionLocalFactV1,
   ManualMutationResolutionRemoteFactV1,
+  FileConsolidationSettlementV2,
   ReceiptedRenameAnchorCollisionEvidenceV1,
   V2ActivationReviewKind,
   CommunityPluginBundleReviewV1,
@@ -3252,7 +3253,15 @@ export class SyncExecutor {
           (entry) => entry.intent.operationId === reviewed.sourceOperationId,
         );
         if (!attached?.manualResolution) return;
-        await this.resumeManualMutationResolution(attached, operationEpoch, true);
+        if (attached.manualResolution.version === 2) {
+          await this.resumeFileConsolidationSettlement(
+            attached,
+            operationEpoch,
+            true,
+          );
+        } else {
+          await this.resumeManualMutationResolution(attached, operationEpoch, true);
+        }
         resolved = !this.state.mutationLedger.some(
           (entry) => entry.intent.operationId === reviewed.sourceOperationId,
         );
@@ -3312,7 +3321,11 @@ export class SyncExecutor {
         const persisted = this.state.mutationLedger.find(
           (candidate) => candidate.intent.operationId === entry.intent.operationId,
         );
-        if (!persisted?.manualResolution || persisted.manualResolution.version !== 2) {
+        if (
+          !persisted?.manualResolution
+          || persisted.manualResolution.version !== 2
+          || persisted.manualResolution.kind !== "community-plugin-bundle-settlement"
+        ) {
           return;
         }
         const predecessorOperationIds = new Set(
@@ -4853,6 +4866,10 @@ export class SyncExecutor {
       this.isPersistedPluginDataDownloadSettlement(record.intent);
     const local: ManualMutationResolutionLocalFactV1[] = [];
     const remote: ManualMutationResolutionRemoteFactV1[] = [];
+    // Display-only modification times (2026-10-31): kept beside the facts so
+    // the digest input stays byte-identical to the pre-time shape.
+    const localTimes: Array<number | undefined> = [];
+    const remoteTimes: Array<number | undefined> = [];
     for (const path of paths) {
       const [localInspection, remoteInspection] = await Promise.all([
         this.inspectLocalPath(path, settlesExcludedPluginData
@@ -4861,6 +4878,10 @@ export class SyncExecutor {
         this.inspectManualResolutionRemote(path),
       ]);
       if (!localInspection || localInspection.status === "uncertain") return null;
+      localTimes.push(localInspection.status === "present"
+        ? localInspection.entry?.mtime
+        : undefined);
+      remoteTimes.push(remoteInspection.entry?.mtime);
       local.push(localInspection.status === "present" && localInspection.entry
         ? {
             path,
@@ -4910,6 +4931,21 @@ export class SyncExecutor {
         && localPresent[0].path !== remotePresent[0].path
         && localPresent[0].hash === remotePresent[0].hash
         && localPresent[0].size === remotePresent[0].size;
+      // Exactly one side still holds a copy: the other side has none at
+      // either path. There is no version or location decision left — the
+      // only executable outcomes are "restore/create this copy" or "delete
+      // it", and the button labels name the operation (2026-10-31 field
+      // case: a failed rename plus a deleted local copy left the record
+      // with no action at all).
+      const remoteOnly = localPresent.length === 0 && remotePresent.length === 1;
+      const localOnly = remotePresent.length === 0 && localPresent.length === 1;
+      // One copy per side at the two record paths, but the bytes diverged:
+      // the user picks which version wins, and the settlement creates the
+      // winner on the other side before retiring the loser (2026-10-31).
+      const oneEachAtBothPaths = localPresent.length === 1
+        && remotePresent.length === 1
+        && localPresent[0].path !== remotePresent[0].path;
+      const contentDiverged = oneEachAtBothPaths && !pureMove;
       // A completed rename/move converges both sides onto the same path with
       // the same content. There is no keep-side decision left: settle it the
       // same zero-write way as the single-path identical case.
@@ -4918,8 +4954,16 @@ export class SyncExecutor {
         && localPresent[0].path === remotePresent[0].path
         && localPresent[0].hash === remotePresent[0].hash
         && localPresent[0].size === remotePresent[0].size;
-      keepLocal = { available: pureMove, deletesOtherSide: false };
-      keepRemote = { available: pureMove, deletesOtherSide: false };
+      keepLocal = {
+        available: pureMove || contentDiverged || remoteOnly || localOnly,
+        // keep-local on a remote-only record deletes the only surviving copy.
+        deletesOtherSide: remoteOnly,
+      };
+      keepRemote = {
+        available: pureMove || contentDiverged || remoteOnly || localOnly,
+        // keep-remote on a local-only record deletes the only surviving copy.
+        deletesOtherSide: localOnly,
+      };
       const sourceLocal = local.find((fact) => fact.path === record.intent.sourcePath);
       const targetLocal = local.find((fact) => fact.path === record.intent.path);
       const sourceRemote = remote.find((fact) => fact.path === record.intent.sourcePath);
@@ -4934,7 +4978,11 @@ export class SyncExecutor {
         const collision = this.currentReceiptedRenameAnchorCollision(record);
         if (collision && await this.areRemoteIdentitiesAbsent(collision.evidence.staleRemoteIds)) {
           recoveryEvidence = collision.evidence;
+          // The collision continuation is keep-local only; keep-remote would
+          // fall through to a delete of the only local copy and cannot carry
+          // the recovery evidence.
           keepLocal = { available: true, deletesOtherSide: false };
+          keepRemote = { available: false, deletesOtherSide: false };
         }
       }
     }
@@ -4950,6 +4998,18 @@ export class SyncExecutor {
       remote,
       recoveryEvidence: recoveryEvidence ?? null,
     };
+    const factsDigest = await sha256Hex(
+      new TextEncoder().encode(JSON.stringify(digestInput)).buffer,
+    );
+    const withDisplayTimes = <T extends { exists: boolean }>(
+      facts: readonly T[],
+      times: ReadonlyArray<number | undefined>,
+    ): T[] => facts.map((fact, index) => {
+      const mtime = times[index];
+      return fact.exists && mtime !== undefined
+        ? { ...fact, mtime }
+        : fact;
+    });
     return {
       version: 1,
       sourceOperationId: digestInput.sourceOperationId,
@@ -4957,12 +5017,10 @@ export class SyncExecutor {
       previousAction: digestInput.previousAction,
       path: digestInput.path,
       ...(record.intent.sourcePath ? { sourcePath: record.intent.sourcePath } : {}),
-      local,
-      remote,
+      local: withDisplayTimes(local, localTimes),
+      remote: withDisplayTimes(remote, remoteTimes),
       ...(recoveryEvidence ? { recoveryEvidence } : {}),
-      factsDigest: await sha256Hex(
-        new TextEncoder().encode(JSON.stringify(digestInput)).buffer,
-      ),
+      factsDigest,
       identical,
       keepLocal,
       keepRemote,
@@ -18762,8 +18820,9 @@ export class SyncExecutor {
     record: Readonly<MutationLedgerEntryV1>,
     snapshot: Readonly<ManualMutationResolutionSnapshotV1>,
     choice: ManualMutationResolutionChoiceV1,
-  ): Promise<ManualMutationResolutionV1 | null> {
+  ): Promise<ManualMutationResolutionV1 | FileConsolidationSettlementV2 | null> {
     if (isFolderMutationIntent(record.intent)) return null;
+    if (choice === "as-observed") return null;
     const selectedAt = Date.now();
     const managed = classifyCommunityPluginManagedPath(
       snapshot.path,
@@ -18919,8 +18978,82 @@ export class SyncExecutor {
       ), snapshot.recoveryEvidence);
     }
 
-    const local = snapshot.local.find((fact) => fact.exists);
-    const remote = snapshot.remote.find((fact) => fact.exists);
+    const localPresent = snapshot.local.filter((fact) => fact.exists);
+    const remotePresent = snapshot.remote.filter((fact) => fact.exists);
+    if (
+      localPresent.length === 1
+      && remotePresent.length === 1
+      && localPresent[0].path !== remotePresent[0].path
+      && !(localPresent[0].hash === remotePresent[0].hash
+        && localPresent[0].size === remotePresent[0].size)
+    ) {
+      // Content diverged: create the winning copy on the losing side first,
+      // then retire the losing copy. Both steps are external mutations; the
+      // shared envelope is only updated after both receipts exist.
+      const local = localPresent[0];
+      const remote = remotePresent[0];
+      const keepLocal = choice === "keep-local";
+      const stepOne = keepLocal
+        ? createIntent(
+            "upload",
+            snapshot.path,
+            local,
+            { path: snapshot.path, exists: false },
+          )
+        : createIntent(
+            "download",
+            remote.path,
+            { path: remote.path, exists: false },
+            remote,
+          );
+      const stepTwo = keepLocal
+        ? createIntent(
+            "deleteRemote",
+            remote.path,
+            { path: remote.path, exists: false },
+            remote,
+          )
+        : createIntent(
+            "deleteLocal",
+            local.path,
+            local,
+            { path: local.path, exists: false },
+          );
+      return {
+        version: 2,
+        kind: "file-consolidation",
+        choice,
+        factsDigest: snapshot.factsDigest,
+        selectedAt,
+        externalMutation: true,
+        steps: [
+          { intent: stepOne, receipt: null },
+          { intent: stepTwo, receipt: null },
+        ],
+      };
+    }
+
+    // Exactly one surviving copy: the settlement touches only that copy's
+    // path; the other side is empty at both record paths. These shapes carry
+    // no version/location decision, so the nested intent is the plain
+    // operation the button names (2026-10-31 field case).
+    if (localPresent.length === 0 && remotePresent.length === 1) {
+      const remote = remotePresent[0];
+      const emptyLocal = { path: remote.path, exists: false as const };
+      return withoutReceipt(choice === "keep-remote"
+        ? createIntent("download", remote.path, emptyLocal, remote)
+        : createIntent("deleteRemote", remote.path, emptyLocal, remote));
+    }
+    if (remotePresent.length === 0 && localPresent.length === 1) {
+      const local = localPresent[0];
+      const emptyRemote = { path: local.path, exists: false as const };
+      return withoutReceipt(choice === "keep-local"
+        ? createIntent("upload", local.path, local, emptyRemote)
+        : createIntent("deleteLocal", local.path, local, emptyRemote));
+    }
+
+    const local = localPresent.length === 1 ? localPresent[0] : undefined;
+    const remote = remotePresent.length === 1 ? remotePresent[0] : undefined;
     if (
       !local
       || !remote
@@ -19047,6 +19180,81 @@ export class SyncExecutor {
     )) {
       throw new Error(
         `Manual mutation collision evidence no longer matches: ${record.intent.operationId}`,
+      );
+    }
+    await this.state.commitManualMutationResolutionCheckpoint(
+      record.intent.operationId,
+    );
+  }
+
+  /**
+   * Continue one reviewed two-step file consolidation: create the winning
+   * copy on the losing side, then retire the losing copy (2026-10-31). Each
+   * step persists its own receipt; the shared envelope is only reduced after
+   * both exist, so an interruption can never publish a half-applied move.
+   */
+  private async resumeFileConsolidationSettlement(
+    record: Readonly<MutationLedgerEntryV1>,
+    operationEpoch: number | undefined,
+    allowExternalMutation: boolean,
+    onExternalMutation?: () => void,
+  ): Promise<void> {
+    const settlement = record.manualResolution;
+    if (
+      !settlement
+      || settlement.version !== 2
+      || settlement.kind !== "file-consolidation"
+      || isFolderMutationIntent(record.intent)
+    ) {
+      throw new Error(
+        `File consolidation settlement is unavailable: ${record.intent.operationId}`,
+      );
+    }
+    if (operationEpoch !== undefined && !this.canContinue(operationEpoch)) {
+      throw new Error(
+        `File consolidation was cancelled: ${record.intent.operationId}`,
+      );
+    }
+    for (const stepIndex of [0, 1] as const) {
+      const step = settlement.steps[stepIndex];
+      if (step.receipt) continue;
+      if (!allowExternalMutation || operationEpoch === undefined) {
+        throw new Error(
+          `File consolidation waits for its authorized continuation: ${record.intent.operationId}`,
+        );
+      }
+      onExternalMutation?.();
+      let receipt: MutationReceiptV1;
+      try {
+        const checkpoint = await this.executeManualMutationIntentWithCanonicalExecutor(
+          step.intent,
+          operationEpoch,
+        );
+        receipt = {
+          version: 1,
+          operationId: step.intent.operationId,
+          completedAt: Date.now(),
+          checkpoint,
+        };
+      } catch (error) {
+        const recovered = await this.classifyUnreceiptedMutation(step.intent);
+        if (!recovered || recovered === "not-applied") throw error;
+        receipt = {
+          version: 1,
+          operationId: step.intent.operationId,
+          completedAt: Date.now(),
+          checkpoint: recovered,
+        };
+      }
+      await this.state.recordFileConsolidationStepReceipt(
+        record.intent.operationId,
+        stepIndex,
+        receipt,
+      );
+    }
+    if (operationEpoch !== undefined && !this.canContinue(operationEpoch)) {
+      throw new Error(
+        `File consolidation checkpoint waits after cancellation: ${record.intent.operationId}`,
       );
     }
     await this.state.commitManualMutationResolutionCheckpoint(
@@ -19386,7 +19594,11 @@ export class SyncExecutor {
     });
     for (const [ordinal, originalMember] of membersInCommitOrder.entries()) {
       const currentSettlement = record.manualResolution;
-      if (!currentSettlement || currentSettlement.version !== 2) {
+      if (
+        !currentSettlement
+        || currentSettlement.version !== 2
+        || currentSettlement.kind !== "community-plugin-bundle-settlement"
+      ) {
         throw new Error(
           `Community plugin bundle settlement disappeared: ${record.intent.operationId}`,
         );
@@ -19636,7 +19848,11 @@ export class SyncExecutor {
     record: Readonly<MutationLedgerEntryV1>,
   ): Promise<void> {
     const settlement = record.manualResolution;
-    if (!settlement || settlement.version !== 2) {
+    if (
+      !settlement
+      || settlement.version !== 2
+      || settlement.kind !== "community-plugin-bundle-settlement"
+    ) {
       throw new Error(
         `Community plugin bundle settlement is unavailable: ${record.intent.operationId}`,
       );
@@ -20149,14 +20365,15 @@ export class SyncExecutor {
       recoveryCurrentPathByRemoteId,
       Object.values(recoveryEnvelope?.anchors.byAnchorId ?? {}),
     );
-    const bundleSettlements = persistedRecords.filter((record) =>
-      record.manualResolution?.version === 2
-      && record.manualResolution.kind === "community-plugin-bundle-settlement");
+    const bundleSettlements = persistedRecords.filter(
+      (record): record is MutationLedgerEntryV1 & {
+        manualResolution: CommunityPluginBundleSettlementV2;
+      } => record.manualResolution?.version === 2
+        && record.manualResolution.kind === "community-plugin-bundle-settlement",
+    );
     const bundlePredecessorIds = new Set(
       bundleSettlements.flatMap((record) =>
-        record.manualResolution?.version === 2
-          ? record.manualResolution.predecessorOperationIds
-          : []),
+        record.manualResolution.predecessorOperationIds),
     );
     const blocked: Array<{
       operationId: string;
@@ -20813,15 +21030,25 @@ export class SyncExecutor {
       }
       if (record.manualResolution.version === 2) {
         try {
-          const predecessorCount = record.manualResolution
-            .predecessorOperationIds.length;
-          await this.resumeCommunityPluginBundleSettlement(
-            record,
-            operationEpoch,
-            operationEpoch !== undefined,
-            () => { externalMutations++; },
-          );
-          settled += 1 + predecessorCount;
+          if (record.manualResolution.kind === "file-consolidation") {
+            await this.resumeFileConsolidationSettlement(
+              record,
+              operationEpoch,
+              operationEpoch !== undefined,
+              () => { externalMutations++; },
+            );
+            settled += 1;
+          } else {
+            const predecessorCount = record.manualResolution
+              .predecessorOperationIds.length;
+            await this.resumeCommunityPluginBundleSettlement(
+              record,
+              operationEpoch,
+              operationEpoch !== undefined,
+              () => { externalMutations++; },
+            );
+            settled += 1 + predecessorCount;
+          }
         } catch (error) {
           if (this.cancelled) throw error;
           const retryable = isRetryableMutationRecoveryObservationError(error);
@@ -22212,6 +22439,29 @@ export class SyncExecutor {
         checkpoint.pendingConflictRemovals.push(intent.path);
       }
       return checkpoint;
+    }
+    if (
+      intent.action === "renameRemote"
+      && intent.sourcePath
+      && local.status === "missing"
+      && remote === undefined
+    ) {
+      // Four-endpoint emptiness: this rename left no copy at either local
+      // path and no object at either remote path. There is no content to
+      // protect, so the intent is provably inert — retire it zero-write
+      // instead of blocking the vault on a record with nothing to decide
+      // (2026-10-31 field case).
+      const [sourceLocal, targetRemote] = await Promise.all([
+        this.inspectLocalPath(intent.sourcePath),
+        this.inspectRemotePath(intent.path),
+      ]);
+      if (sourceLocal?.status === "missing" && targetRemote === undefined) {
+        this.diag?.warn(
+          "execute",
+          `rename settled as not applied — no copy on either side: ${intent.path}`,
+        );
+        return "not-applied";
+      }
     }
     if (
       (intent.action === "upload" || intent.action === "renameRemote")

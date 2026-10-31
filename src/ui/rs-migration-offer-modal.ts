@@ -24,10 +24,7 @@ interface RsMigrationOfferViews {
   crossDeviceNote: string;
 }
 
-export class RsMigrationOfferModal extends EasySyncModal {
-  private resolve: ((value: RsMigrationOfferResult) => void) | null = null;
-  private finished = false;
-
+export class RsMigrationOfferModal extends EasySyncModal<RsMigrationOfferResult> {
   constructor(
     app: App,
     private views: RsMigrationOfferViews,
@@ -36,19 +33,7 @@ export class RsMigrationOfferModal extends EasySyncModal {
   }
 
   awaitAction(): Promise<RsMigrationOfferResult> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
-  }
-
-  private finish(result: RsMigrationOfferResult): void {
-    if (this.finished) return;
-    this.finished = true;
-    const resolve = this.resolve;
-    this.resolve = null;
-    this.close();
-    resolve?.(result);
+    return this.awaitResult();
   }
 
   onOpen(): void {
@@ -63,12 +48,12 @@ export class RsMigrationOfferModal extends EasySyncModal {
     });
     const migrateButton = this.buildOptionButton(this.views.migrate);
     migrateButton.addEventListener("click", () => {
-      this.finish({ action: "migrate" });
+      this.settle({ action: "migrate" });
     });
     contentEl.appendChild(migrateButton);
     const freshButton = this.buildOptionButton(this.views.fresh);
     freshButton.addEventListener("click", () => {
-      this.finish({ action: "fresh-sync" });
+      this.settle({ action: "fresh-sync" });
     });
     contentEl.appendChild(freshButton);
 
@@ -78,9 +63,7 @@ export class RsMigrationOfferModal extends EasySyncModal {
     });
   }
 
-  onClose(): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    resolve?.({ action: "dismiss" });
+  override onClose(): void {
+    this.takePendingResolve()?.({ action: "dismiss" });
   }
 }

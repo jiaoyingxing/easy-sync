@@ -77,11 +77,17 @@ describe("one-way local-only three-piece copy (三件优化)", () => {
     expect(en.t("syncView.localOnly.batchConfirmTitle", { count: 12 })).toBe(
       "Upload all 12 file(s)?",
     );
-    expect(zh.t("syncView.localOnly.batchConfirmMessage")).toBe(
-      "上传后，这些文件以云端为准：云端删除，本机同步删除。同名文件会自动跳过，留在面板待处理。",
+    expect(zh.t("syncView.localOnly.batchConfirmStep.authoritative")).toBe(
+      "以云端为准：云端删除时，本机同步删除。",
     );
-    expect(en.t("syncView.localOnly.batchConfirmMessage")).toBe(
-      "After the upload, the cloud takes precedence for these files: if the cloud deletes them, they are deleted here as well. Files whose names already exist in the cloud are skipped automatically and stay in the panel for you to handle.",
+    expect(en.t("syncView.localOnly.batchConfirmStep.authoritative")).toBe(
+      "The cloud is authoritative: when it deletes them, this device deletes them too.",
+    );
+    expect(zh.t("syncView.localOnly.batchConfirmStep.sameName")).toBe(
+      "同名文件：跳过，留在面板待处理。",
+    );
+    expect(en.t("syncView.localOnly.batchConfirmStep.sameName")).toBe(
+      "Same-name files: skipped and left in the panel.",
     );
     expect(zh.t("syncView.localOnly.batchConfirmUpload")).toBe("上传");
     expect(en.t("syncView.localOnly.batchConfirmUpload")).toBe("Upload");
@@ -99,7 +105,7 @@ describe("one-way local-only three-piece copy (三件优化)", () => {
       "Edits made on this device are saved in this copy.",
     );
     expect(zh.t("syncView.localOnly.upload")).toBe("上传到云端");
-    expect(zh.t("syncView.localOnly.keep")).toBe("留在本机，不再提醒");
+    expect(zh.t("syncView.localOnly.keep")).toBe("留在本机");
   });
 
   it("pins the settings reminder row and its one-line feedback (件③)", () => {
@@ -108,10 +114,10 @@ describe("one-way local-only three-piece copy (三件优化)", () => {
     expect(zh.t("settings.localOnlyIgnored.name")).toBe("不再提醒的文件");
     expect(en.t("settings.localOnlyIgnored.name")).toBe("Files with reminders off");
     expect(zh.t("settings.localOnlyIgnored.desc", { count: 2 })).toBe(
-      "单向同步期间，你有 2 个文件选择了“留在本机，不再提醒”。重置后，它会重新出现在同步面板，可再次选择上传到云端或留在本机。",
+      "单向同步期间，你有 2 个文件选择了“留在本机”。重置后，它会重新出现在同步面板，可再次选择上传到云端或留在本机。",
     );
     expect(en.t("settings.localOnlyIgnored.desc", { count: 2 })).toBe(
-      "While One-way sync is on, you chose “Keep on this device, no more reminders” for 2 file(s). After you reset, they will appear in the sync panel again, where you can choose to upload them to the cloud or keep them on this device.",
+      "While One-way sync is on, you chose “Keep on this device” for 2 file(s). After you reset, they will appear in the sync panel again, where you can choose to upload them to the cloud or keep them on this device.",
     );
     expect(zh.t("settings.localOnlyIgnored.button")).toBe("重置");
     expect(en.t("settings.localOnlyIgnored.button")).toBe("Reset");
@@ -121,9 +127,9 @@ describe("one-way local-only three-piece copy (三件优化)", () => {
     expect(en.t("notice.localOnly.reminded", { count: 4 })).toBe(
       "Reminders reset. 4 file(s) can be decided again in the sync panel.",
     );
-    // 状态词「不再提醒」仍与逐条动作名同源（说明句引用的是动作名原文）。
+    // 说明句引用的是动作名原文（2026-10-29 动作名精简为「留在本机」）。
     expect(zh.t("settings.localOnlyIgnored.desc", { count: 2 }))
-      .toContain("留在本机，不再提醒");
-    expect(zh.t("syncView.localOnly.keep")).toContain("不再提醒");
+      .toContain("留在本机");
+    expect(zh.t("syncView.localOnly.keep")).toBe("留在本机");
   });
 });

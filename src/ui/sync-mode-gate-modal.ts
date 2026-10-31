@@ -1,5 +1,11 @@
-import { Setting, type App } from "obsidian";
-import { EasySyncModal } from "./easy-sync-modal";
+import { Setting, type App, type ButtonComponent } from "obsidian";
+import {
+  addEasySyncFooterButton,
+  bindModalKeyboardDismissal,
+  createEasySyncModalFooter,
+  EasySyncModal,
+  keepModalFocusOnBody,
+} from "./easy-sync-modal";
 import type { I18nFn } from "./confirm-modal";
 
 /**
@@ -106,7 +112,7 @@ export class SyncModeGateModal extends EasySyncModal<boolean> {
       contentEl.createEl("p", { text: line });
     }
 
-    let confirmBtn: HTMLButtonElement | null = null;
+    let confirmBtn: ButtonComponent | null = null;
     const refresh = (typed: string): void => {
       view = buildSyncModeGateView({
         t: this.t,
@@ -114,26 +120,31 @@ export class SyncModeGateModal extends EasySyncModal<boolean> {
         expectedInput: this.expectedInput,
         typed,
       });
-      if (confirmBtn) confirmBtn.disabled = view.confirmDisabled;
+      confirmBtn?.setDisabled(view.confirmDisabled);
     };
     new Setting(contentEl)
       .setName(view.inputLabel)
       .addText((text) => {
         text.onChange((value) => refresh(value));
       });
-    const btnRow = contentEl.createDiv("modal-button-container");
-    confirmBtn = btnRow.createEl("button", {
-      text: view.confirmLabel,
-      cls: "mod-cta",
+    // Divided: the typed-confirmation input row sits above the buttons.
+    const btnRow = createEasySyncModalFooter(contentEl, { divided: true });
+    addEasySyncFooterButton(btnRow, {
+      label: view.cancelLabel,
+      onClick: () => this.settle(false),
     });
     // 门槛不降：手输一致之前、以及被拦下时，确认都不可用。
-    confirmBtn.disabled = view.confirmDisabled;
-    confirmBtn.addEventListener("click", () => {
-      if (confirmBtn?.disabled !== false) return;
-      this.settle(true);
+    confirmBtn = addEasySyncFooterButton(btnRow, {
+      label: view.confirmLabel,
+      variant: "cta",
+      disabled: view.confirmDisabled,
+      onClick: () => {
+        if (view.confirmDisabled) return;
+        this.settle(true);
+      },
     });
-    const cancelBtn = btnRow.createEl("button", { text: view.cancelLabel });
-    cancelBtn.addEventListener("click", () => this.settle(false));
+    keepModalFocusOnBody(this);
+    bindModalKeyboardDismissal(this);
   }
 
   onClose(): void {

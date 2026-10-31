@@ -1,6 +1,6 @@
 import { Notice, Setting, SliderComponent } from "obsidian";
 import type EasySyncPlugin from "../main";
-import { EasySyncModal } from "./easy-sync-modal";
+import { EasySyncModal, keepModalFocusOnBody } from "./easy-sync-modal";
 
 /**
  * Paint the accent fill left of the thumb. Host 1.13+ drives this itself
@@ -72,6 +72,7 @@ export class AutoSyncModal extends EasySyncModal {
     contentEl.empty();
     contentEl.addClass("easy-sync-auto-sync");
     this.setTitle(t("settings.autoSync.title"));
+    keepModalFocusOnBody(this);
     contentEl.createEl("p", {
       text: t("settings.autoSync.intro"),
       cls: "setting-item-description easy-sync-modal-intro",

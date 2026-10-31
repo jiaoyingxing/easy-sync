@@ -121,7 +121,7 @@ describe("RsMigrationOfferModal", () => {
 });
 
 describe("RsMigrationFailureModal", () => {
-  it("renders three exits in the host button container with hierarchy classes", () => {
+  it("renders three exits in the shared footer, secondary first and CTA last", () => {
     const plugin = createMockPlugin();
     const t = plugin.i18n.t.bind(plugin.i18n);
     const modal = new RsMigrationFailureModal(plugin, {
@@ -141,14 +141,18 @@ describe("RsMigrationFailureModal", () => {
     expect(children).toHaveLength(2);
     const btnRow = children[1];
     expect(btnRow.classList.contains("modal-button-container")).toBe(true);
+    expect(btnRow.classList.contains("easy-sync-modal-footer")).toBe(true);
     const buttons = btnRow.children as unknown as RecordedEl[];
+    // DOM contract: secondary first, CTA last (phones show the CTA on top
+    // via the host's column-reverse).
     expect(buttons).toHaveLength(3);
-    expect(buttons[0].textContent).toBe(t("rsMigration.failureRetry"));
-    expect(buttons[0].classList.contains("mod-cta")).toBe(true);
+    expect(buttons[0].textContent).toBe(t("rsMigration.failureGuide"));
+    expect(buttons[0].classList.contains("mod-link")).toBe(true);
     expect(buttons[1].textContent).toBe(t("rsMigration.failureFreshSync"));
     expect(buttons[1].classList.contains("mod-cta")).toBe(false);
-    expect(buttons[2].textContent).toBe(t("rsMigration.failureGuide"));
-    expect(buttons[2].classList.contains("mod-link")).toBe(true);
+    expect(buttons[1].classList.contains("mod-cancel")).toBe(true);
+    expect(buttons[2].textContent).toBe(t("rsMigration.failureRetry"));
+    expect(buttons[2].classList.contains("mod-cta")).toBe(true);
   });
 });
 

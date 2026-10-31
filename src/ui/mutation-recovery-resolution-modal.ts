@@ -12,7 +12,6 @@ import { ConfirmModal, type I18nFn } from "./confirm-modal";
 import { EasySyncModal } from "./easy-sync-modal";
 import { computeDisplayDiff } from "./diff-engine";
 import {
-  resolveMoveNoActionHints,
   resolveOrdinaryResolutionActions,
 } from "./mutation-recovery-presentation";
 import {
@@ -46,11 +45,14 @@ function fileFactText(
   > | undefined,
   t: I18nFn,
 ): string {
-  return fact?.exists
-    ? t("syncView.mutationResolution.present", {
-        size: formatFileSize(fact.size ?? 0),
+  if (!fact?.exists) return t("syncView.mutationResolution.missing");
+  const size = formatFileSize(fact.size ?? 0);
+  return fact.mtime !== undefined
+    ? t("syncView.mutationResolution.presentWithTime", {
+        size,
+        time: new Date(fact.mtime).toLocaleString(),
       })
-    : t("syncView.mutationResolution.missing");
+    : t("syncView.mutationResolution.present", { size });
 }
 
 function bundleReasonText(
@@ -105,9 +107,10 @@ function bundleRemoteText(
  * It only returns a reviewed choice; the ledger recheck and mutations remain
  * in SyncExecutor.
  */
-export class MutationRecoveryResolutionModal extends FileComparisonModal {
-  private resolve:
-    ((choice: ManualMutationResolutionChoiceV1 | null) => void) | null = null;
+export class MutationRecoveryResolutionModal extends FileComparisonModal<ManualMutationResolutionChoiceV1 | null> {
+  /** Set when the modal closed while the snapshot promise was still loading;
+   *  the late `onOpen` continuation must not render into a closed modal. */
+  private loadAbandoned = false;
   private snapshot: MutationResolutionSnapshot | null;
   private pendingSnapshot: Promise<MutationResolutionSnapshot | null> | null;
   private snapshotUnavailable = false;
@@ -127,10 +130,19 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
   }
 
   awaitChoice(): Promise<ManualMutationResolutionChoiceV1 | null> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
+    return this.awaitResult();
+  }
+
+  /** One review modal at a time: same target rejected, another replaces. */
+  override open(): void {
+    const key = this.snapshot?.path ?? null;
+    if (!this.takeOverSingleInstance(key, { replace: true })) {
+      // The awaiting caller registered its resolver before open(); settle as
+      // "nothing chosen" instead of leaving the promise hanging.
+      this.settle(null);
+      return;
+    }
+    super.open();
   }
 
   async onOpen(): Promise<void> {
@@ -144,7 +156,7 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
     } catch {
       this.snapshotUnavailable = true;
     }
-    if (!this.resolve) return;
+    if (this.loadAbandoned) return;
 
     this.pendingSnapshot = null;
     this.snapshot = snapshot;
@@ -235,67 +247,40 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
     }
 
     // Ordinary entries only keep the executable actions; the unavailable
-    // side is not rendered as a disabled button.
+    // side is not rendered as a disabled button. DOM order: the cancel exit
+    // first (secondary), then the operations with the CTA last — phones show
+    // the CTA on top via the host's column-reverse.
     const ordinaryActions: FileComparisonAction[] = [];
     const labelledActions = resolveOrdinaryResolutionActions(snapshot);
     if (labelledActions) {
-      // Single-path review: the label is the operation the button performs, so
-      // "keep" can never be shown for an empty side (2026-10-25).
+      // The label is the operation the button performs, so "keep" can never
+      // be shown for an empty side (2026-10-25); move records reuse the same
+      // matrix over their two paths (2026-10-31).
       for (const action of labelledActions) {
         ordinaryActions.push({
           label: this.t(action.labelKey),
           ...(action.className ? { className: action.className } : {}),
-          onClick: () => this.finish(action.choice),
-        });
-      }
-    } else {
-      // Move-style records keep the side wording: there the decision really is
-      // which copy survives at which path.
-      if (snapshot.keepLocal.available) {
-        ordinaryActions.push({
-          label: this.t("syncView.mutationResolution.keepLocal"),
-          className: "easy-sync-detail-action-local",
-          onClick: () => this.finish("keep-local"),
-        });
-      }
-      if (snapshot.keepRemote.available) {
-        ordinaryActions.push({
-          label: this.t("syncView.mutationResolution.keepRemote"),
-          className: "easy-sync-detail-action-remote",
-          onClick: () => this.finish("keep-remote"),
+          onClick: () => this.settle(action.choice),
         });
       }
     }
     if (ordinaryActions.length === 0) {
+      const localCount = snapshot.local.filter((fact) => fact.exists).length;
+      const remoteCount = snapshot.remote.filter((fact) => fact.exists).length;
+      // Never instruct a delete when the engine cannot settle the result:
+      // the 2026-10-31 field case lost the local copy to exactly that advice.
+      const contentDiverged = Boolean(snapshot.sourcePath)
+        && localCount === 1
+        && remoteCount === 1;
       body.createEl("p", {
-        text: this.t("syncView.mutationResolution.noAvailableActions"),
-        cls: "easy-sync-detail-reason",
-      });
-      // This shape is a move-style intent with no executable keep-side
-      // action. Rather than only "export a diagnostic report", tell the user
-      // what they can actually do to change the outcome, and be honest that
-      // one direction cannot yet converge automatically (the two sides
-      // differ, and the current classifier has no automatic branch for it).
-      const sourcePath = snapshot.sourcePath ?? null;
-      if (sourcePath) {
-        const remoteSourceExists = snapshot.remote.some((fact) =>
-          fact.path === sourcePath && fact.exists);
-        for (const hint of resolveMoveNoActionHints({ sourcePath, remoteSourceExists })) {
-          body.createEl("p", {
-            text: hint === "keep-local"
-              ? this.t("syncView.mutationResolution.noAvailableActionsKeepLocal", {
-                  sourcePath,
-                })
-              : this.t("syncView.mutationResolution.noAvailableActionsKeepRemote", {
-                  sourcePath,
-                  path: snapshot.path,
-                }),
-            cls: "easy-sync-detail-reason",
-          });
-        }
-      }
-      body.createEl("p", {
-        text: this.t("syncView.mutationResolution.noAvailableActionsFallback"),
+        text: !snapshot.sourcePath
+          ? this.t("syncView.mutationResolution.noAvailableActions")
+          : contentDiverged
+            ? this.t("syncView.mutationResolution.noAvailableActionsMoveDiverged")
+            : this.t("syncView.mutationResolution.noAvailableActionsMoveMismatch", {
+                localCount,
+                remoteCount,
+              }),
         cls: "easy-sync-detail-reason",
       });
     } else if (ordinaryActions.length === 1) {
@@ -305,11 +290,11 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
       });
     }
     this.renderFileComparisonActions([
-      ...ordinaryActions,
       {
         label: this.t("confirm.cancel"),
-        onClick: () => this.finish(null),
+        onClick: () => this.settle(null),
       },
+      ...ordinaryActions,
     ]);
   }
 
@@ -375,6 +360,10 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
     const executableChoices = bundle.executableChoices ?? [];
     this.renderFileComparisonActions([
       {
+        label: this.t("confirm.cancel"),
+        onClick: () => this.settle(null),
+      },
+      {
         label: this.t("syncView.conflict.keepLocal"),
         className: "easy-sync-detail-action-local",
         disabled: !executableChoices.includes("keep-local")
@@ -392,17 +381,13 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
           void this.confirmDowngradeIfNeeded(snapshot, "keep-remote");
         },
       },
-      {
-        label: this.t("confirm.cancel"),
-        onClick: () => this.finish(null),
-      },
     ]);
   }
 
-  onClose(): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    resolve?.(null);
+  override onClose(): void {
+    this.loadAbandoned = true;
+    this.releaseSingleInstance();
+    this.takePendingResolve()?.(null);
   }
 
   /**
@@ -621,7 +606,7 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
     const localVersion = presentation?.localVersion ?? null;
     const remoteVersion = presentation?.remoteVersion ?? null;
     if (localVersion === null || remoteVersion === null) {
-      this.finish(choice);
+      this.settle(choice);
       return;
     }
     // Single SemVer comparison for both the downgrade and the overwrite gate
@@ -631,7 +616,7 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
     // compare as null → no confirmation (guard stays best-effort).
     const comparison = compareCommunityPluginVersions(localVersion, remoteVersion);
     if (!requiresBundleVersionConfirmation(choice, comparison)) {
-      this.finish(choice);
+      this.settle(choice);
       return;
     }
     const isDowngradeChoice = choice === "keep-remote";
@@ -657,14 +642,7 @@ export class MutationRecoveryResolutionModal extends FileComparisonModal {
       },
     ).awaitConfirm();
     if (!confirmed) return;
-    this.finish(choice);
-  }
-
-  private finish(choice: ManualMutationResolutionChoiceV1 | null): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    this.close();
-    resolve?.(choice);
+    this.settle(choice);
   }
 }
 

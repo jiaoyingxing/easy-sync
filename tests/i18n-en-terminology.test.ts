@@ -33,11 +33,9 @@ describe("en copy contracts", () => {
   });
 
   it("pins the one-way keep action name quoted by the reminders-off row", () => {
-    expect(en["syncView.localOnly.keep"]).toBe(
-      "Keep on this device, no more reminders",
-    );
+    expect(en["syncView.localOnly.keep"]).toBe("Keep on this device");
     expect(en["settings.localOnlyIgnored.desc"]).toContain(
-      "you chose “Keep on this device, no more reminders” for {count} file(s)",
+      "you chose “Keep on this device” for {count} file(s)",
     );
   });
 });

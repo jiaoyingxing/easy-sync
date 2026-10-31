@@ -1,5 +1,9 @@
 import { type App } from "obsidian";
-import { EasySyncModal } from "./easy-sync-modal";
+import {
+  addEasySyncFooterButton,
+  createEasySyncModalFooter,
+  EasySyncModal,
+} from "./easy-sync-modal";
 
 export interface FileComparisonRow {
   label: string;
@@ -32,7 +36,7 @@ export function formatFileSize(bytes: number): string {
  * class owns only the single scroll surface, comparison table, and fixed action
  * footer used by both ordinary conflicts and unfinished-operation review.
  */
-export abstract class FileComparisonModal extends EasySyncModal {
+export abstract class FileComparisonModal<T = void> extends EasySyncModal<T> {
   protected comparisonBodyEl!: HTMLElement;
 
   constructor(app: App) {
@@ -89,15 +93,23 @@ export abstract class FileComparisonModal extends EasySyncModal {
     return table;
   }
 
+  /**
+   * The content-detail family's fixed action bar: the shared modal footer in
+   * its `fixed` variant (border + background + shrink lock under the
+   * scrolling body). DOM order contract: secondary actions first, primary
+   * last — the host's mobile column-reverse then shows the primary on top.
+   */
   protected renderFileComparisonActions(
     actions: readonly FileComparisonAction[],
   ): HTMLDivElement {
-    const btnRow = this.contentEl.createDiv("easy-sync-detail-actions");
+    const btnRow = createEasySyncModalFooter(this.contentEl, { fixed: true });
     for (const action of actions) {
-      const button = btnRow.createEl("button", { text: action.label });
-      button.disabled = action.disabled === true;
-      if (action.className) button.addClass(action.className);
-      if (!action.disabled) button.addEventListener("click", action.onClick);
+      addEasySyncFooterButton(btnRow, {
+        label: action.label,
+        ...(action.className ? { className: action.className } : {}),
+        disabled: action.disabled === true,
+        onClick: action.onClick,
+      });
     }
     return btnRow;
   }

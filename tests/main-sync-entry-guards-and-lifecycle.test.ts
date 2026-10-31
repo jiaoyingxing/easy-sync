@@ -1206,6 +1206,51 @@ describe("main sync entry guards", () => {
     expect(joinedRun.mock.calls[0]?.[0]).toBe("auto");
   });
 
+  it("keeps the startup round off while only another channel holds the master on", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 10; // 定时通道开着 ⇒ 派生总开关为开
+    plugin.setAutoSyncChangeDelaySeconds(0);
+    plugin.autoSyncOnStartup = false; // 用户自己关掉了启动通道
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.state = { planReviewActive: false, lastSyncTime: 1 } as never;
+    vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(plugin as never, "beginSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    const consumed = await (plugin as never as {
+      runAutomaticSync: (trigger: "startup") => Promise<boolean>;
+    }).runAutomaticSync("startup");
+
+    // 总开关是三条通道的派生态，不是启动通道的开关：启动开关关掉时，
+    // 这一轮如实让路并且被消费（不交给忙时重试轮反复重试）。
+    expect(plugin.isAutoSyncMasterEnabled()).toBe(true);
+    expect(consumed).toBe(true);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("runs the startup round when the startup channel is the only one on", async () => {
+    const plugin = makePlugin();
+    plugin.syncInterval = 0;
+    plugin.setAutoSyncChangeDelaySeconds(0);
+    plugin.autoSyncOnStartup = true;
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.state = { planReviewActive: false, lastSyncTime: 1 } as never;
+    vi.spyOn(plugin as never, "checkAccountBinding").mockResolvedValue(true);
+    vi.spyOn(plugin as never, "beginSyncNotice").mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar").mockImplementation(() => undefined);
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    const consumed = await (plugin as never as {
+      runAutomaticSync: (trigger: "startup") => Promise<boolean>;
+    }).runAutomaticSync("startup");
+
+    expect(consumed).toBe(true);
+    expect(run).toHaveBeenCalledTimes(1);
+  });
+
   it("fires the once-per-session startup round only after auth and state are both ready", async () => {
     const plugin = makePlugin();
     const runAutomaticSync = vi.spyOn(plugin as never, "runAutomaticSync")

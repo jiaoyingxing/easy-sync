@@ -69,7 +69,8 @@ interface OrdinaryResolutionAction {
 }
 
 /**
- * Action labels for the ordinary single-path review (2026-10-25 user report).
+ * Action labels for the ordinary review (2026-10-25 user report; move-style
+ * shapes added 2026-10-31).
  *
  * The old labels named the SIDE ("keep local" / "keep cloud"). That wording is
  * false as soon as the chosen side holds no file: "keeping" an empty side
@@ -78,16 +79,85 @@ interface OrdinaryResolutionAction {
  * operation, and button colour names the consequence instead of the side.
  *
  * Both sides present keeps the side wording with an explicit "version" noun
- * (there "keep" is true and the decision is which version wins). Move-style
- * records and whole-bundle reviews keep their own contracts, so this returns
- * null for both and the caller keeps its existing rendering.
+ * (there "keep" is true and the decision is which version wins). Move records
+ * use the same matrix over their two paths: identical content keeps the side
+ * wording (a location choice with no data loss), diverged content uses the
+ * version wording (the two-step settlement creates the winner on the other
+ * side), and one surviving copy names the operation. Whole-bundle reviews keep
+ * their own contract.
+ *
+ * DOM order is secondary first and the CTA last, matching
+ * `addEasySyncFooterButton`; the host's mobile column-reverse then shows the
+ * primary on top and the destructive action below it.
  */
 export function resolveOrdinaryResolutionActions(
   snapshot: Readonly<ManualMutationResolutionSnapshotV1>,
 ): OrdinaryResolutionAction[] | null {
-  if (snapshot.bundleReview !== undefined || snapshot.sourcePath !== undefined) {
+  if (snapshot.bundleReview !== undefined) return null;
+  const available = (actions: OrdinaryResolutionAction[]) => actions.filter(
+    (action) => (action.choice === "keep-local"
+      ? snapshot.keepLocal.available
+      : snapshot.keepRemote.available),
+  );
+
+  if (snapshot.sourcePath !== undefined) {
+    const localPresent = snapshot.local.filter((fact) => fact.exists);
+    const remotePresent = snapshot.remote.filter((fact) => fact.exists);
+    if (
+      localPresent.length === 1
+      && remotePresent.length === 1
+      && localPresent[0].path !== remotePresent[0].path
+    ) {
+      const sameContent = localPresent[0].hash === remotePresent[0].hash
+        && localPresent[0].size === remotePresent[0].size;
+      return available([
+        {
+          choice: "keep-local",
+          labelKey: sameContent
+            ? "syncView.mutationResolution.keepLocal"
+            : "syncView.mutationResolution.keepLocalVersion",
+          className: null,
+        },
+        {
+          choice: "keep-remote",
+          labelKey: sameContent
+            ? "syncView.mutationResolution.keepRemote"
+            : "syncView.mutationResolution.keepRemoteVersion",
+          className: null,
+        },
+      ]);
+    }
+    if (localPresent.length === 0 && remotePresent.length === 1) {
+      return available([
+        {
+          choice: "keep-local",
+          labelKey: "syncView.mutationResolution.action.deleteRemote",
+          className: "mod-warning",
+        },
+        {
+          choice: "keep-remote",
+          labelKey: "syncView.mutationResolution.action.download",
+          className: "mod-cta",
+        },
+      ]);
+    }
+    if (remotePresent.length === 0 && localPresent.length === 1) {
+      return available([
+        {
+          choice: "keep-remote",
+          labelKey: "syncView.mutationResolution.action.deleteLocal",
+          className: "mod-warning",
+        },
+        {
+          choice: "keep-local",
+          labelKey: "syncView.mutationResolution.action.upload",
+          className: "mod-cta",
+        },
+      ]);
+    }
     return null;
   }
+
   const local = snapshot.local[0];
   const remote = snapshot.remote[0];
   if (!local || !remote) return null;
@@ -108,28 +178,28 @@ export function resolveOrdinaryResolutionActions(
   if (!local.exists && remote.exists) {
     return [
       {
-        choice: "keep-remote",
-        labelKey: "syncView.mutationResolution.action.download",
-        className: "mod-cta",
-      },
-      {
         choice: "keep-local",
         labelKey: "syncView.mutationResolution.action.deleteRemote",
         className: "mod-warning",
+      },
+      {
+        choice: "keep-remote",
+        labelKey: "syncView.mutationResolution.action.download",
+        className: "mod-cta",
       },
     ];
   }
   if (local.exists && !remote.exists) {
     return [
       {
-        choice: "keep-local",
-        labelKey: "syncView.mutationResolution.action.upload",
-        className: "mod-cta",
-      },
-      {
         choice: "keep-remote",
         labelKey: "syncView.mutationResolution.action.deleteLocal",
         className: "mod-warning",
+      },
+      {
+        choice: "keep-local",
+        labelKey: "syncView.mutationResolution.action.upload",
+        className: "mod-cta",
       },
     ];
   }
@@ -376,22 +446,4 @@ export function formatMutationRecoveryHistory(
           : 1,
       });
   }
-}
-
-/**
- * Which of the two "no available action" hints a move-style record can still
- * state honestly. The keep-cloud sentence promises the file at the *old* cloud
- * path and its return to the old local path; once the cloud already holds the
- * moved name that path is gone (2026-10-13 field report), so the sentence is
- * dropped rather than promising a file that is not there. The keep-local
- * sentence carries its own "（若存在）" qualifier and stays.
- */
-export function resolveMoveNoActionHints(input: {
-  sourcePath: string | null;
-  remoteSourceExists: boolean;
-}): Array<"keep-local" | "keep-remote"> {
-  if (!input.sourcePath) return [];
-  return input.remoteSourceExists
-    ? ["keep-local", "keep-remote"]
-    : ["keep-local"];
 }

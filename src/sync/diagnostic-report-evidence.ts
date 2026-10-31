@@ -102,31 +102,33 @@ export function formatDiagnosticAutomaticSyncSummary(input: {
   intervalMinutes: number;
   paused: boolean;
   changeDelaySeconds: number;
+  startupSyncEnabled: boolean;
   dirtyPending: boolean;
   activity: string;
 }): [string, string] {
-  if (input.intervalMinutes <= 0) {
+  // 总开关是三条通道（定时／修改后触发／启动后）的派生态：只看定时会把
+  // 「定时 0、其它通道开着」的设备写成「自动同步已关闭」（2026-10-29）。
+  const channels: string[] = [];
+  if (input.intervalMinutes > 0) {
+    channels.push(`每 ${input.intervalMinutes} 分钟`);
+  }
+  if (input.changeDelaySeconds > 0) channels.push("修改后触发");
+  if (input.startupSyncEnabled) channels.push("启动后立即同步");
+  if (channels.length === 0) {
     return [
       "**自动同步**: 已关闭",
       "**修改后触发同步**: 未启用（自动同步已关闭）",
     ];
   }
-  if (input.changeDelaySeconds <= 0) {
-    return [
-      `**自动同步**: ${input.paused
-        ? "已暂停"
-        : `运行中（每 ${input.intervalMinutes} 分钟）`}`,
-      "**修改后触发同步**: 已关闭",
-    ];
-  }
-  return [
-    `**自动同步**: ${input.paused
-      ? "已暂停"
-      : `运行中（每 ${input.intervalMinutes} 分钟）`}`,
-    `**修改后触发同步**: 本机变化后等待 ${input.changeDelaySeconds} 秒（${input.dirtyPending
+  const masterLine = input.paused
+    ? "**自动同步**: 已暂停"
+    : `**自动同步**: 运行中（${channels.join("；")}）`;
+  const changeLine = input.changeDelaySeconds > 0
+    ? `**修改后触发同步**: 本机变化后等待 ${input.changeDelaySeconds} 秒（${input.dirtyPending
       ? "已有待处理变化"
-      : "当前无待处理变化"}）/ 当前状态：${input.activity}`,
-  ];
+      : "当前无待处理变化"}）/ 当前状态：${input.activity}`
+    : "**修改后触发同步**: 已关闭";
+  return [masterLine, changeLine];
 }
 
 /**

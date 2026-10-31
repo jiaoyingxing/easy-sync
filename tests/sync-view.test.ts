@@ -10,6 +10,7 @@ import {
   buildSyncPlanVirtualWindow,
   buildSyncPendingDisplayRows,
   buildSyncViewContentKey,
+  buildWindowedPathPlan,
   fitDirectoryTail,
   EasySyncSyncView,
   countOmittedSyncHistorySuccessfulFiles,
@@ -705,6 +706,18 @@ describe("shared sidebar detail controls", () => {
     const groupStart = source.indexOf("private resolvePlanGroupOpen(");
     const groupBody = source.slice(groupStart, groupStart + 500);
     expect(groupBody).toContain("return hasDecisionRows;");
+  });
+
+  it("lets the toolbar bulk action clear row-level expansion memory", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    const start = source.indexOf("private renderCollapseToggle(");
+    const end = source.indexOf("private isSessionCollapsed(");
+    const body = source.slice(start, end);
+    // 工具栏是全局手势：行级／组级记忆都清空，否则换窗后行级选择会压过
+    // 这次显式选择，按钮看起来失灵／混合（2026-10-29 现场）。
+    expect(body).toContain("this.planGroupExpandedState.clear()");
+    expect(body).toContain("this.planRowExpandedState.clear()");
+    expect(body).toContain("this.toggleAllDetails()");
   });
 
   it("records a decision row's open state from the user's gesture, not the toggle event", () => {
@@ -2987,6 +3000,162 @@ describe("buildSyncViewContentKey", () => {
     expect(source).toContain("configureFilePath(row, pathEl, file.path, true)");
   });
 
+  it("keeps every static sidebar file list on the adaptive gray-directory path", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+
+    // 2026-10-29 盘点：静态文件列表一律接入灰字目录；生产路径只允许
+    // 计划审阅分组与待处理区这两个虚拟列表例外（窗口行的行高预算冲突）。
+    const fileResults = source.slice(
+      source.indexOf("private renderFileResults("),
+      source.indexOf("private updateCompletedOmittedRow("),
+    );
+    expect(fileResults).toContain(
+      'if (adaptive) list.addClass("easy-sync-path-layout")',
+    );
+    expect(fileResults).toContain("renderFileRow(file, list, t, adaptive)");
+
+    const mutationRecovery = source.slice(
+      source.indexOf("private renderMutationRecoverySection("),
+      source.indexOf("private appendRecoveryFileRow("),
+    );
+    expect(mutationRecovery).toContain(
+      '"easy-sync-file-list easy-sync-path-layout"',
+    );
+    expect(mutationRecovery).toContain(
+      "this.applyAdaptivePathLayoutScope(list)",
+    );
+
+    const recoveryRow = source.slice(
+      source.indexOf("private appendRecoveryFileRow("),
+      source.indexOf("private nonRetryableItemKeys("),
+    );
+    expect(recoveryRow).toContain(
+      "configureFilePath(row, pathEl, path, true)",
+    );
+  });
+
+  it("builds the windowed two-line path plan from the full row list, not the mounted window", () => {
+    const plan = buildWindowedPathPlan([
+      "9. 存档区/归档/学习归档/20260529/a.md",
+      "9. 存档区/归档/学习归档/20260529/b.md",
+      "9. 存档区/归档/学习归档/20260530/c.md",
+      "root.md",
+      null,
+      "deep/one/two/d.md",
+      "a/b.md",
+      "a/b/c/",
+    ]);
+    // 相邻两行共享到日期目录：段首行拥有目录行，其余行只显示剩余段。
+    expect(plan[0]).toEqual({
+      displayPath: "a.md",
+      directory: "9. 存档区/归档/学习归档/20260529/",
+      directoryOwner: true,
+    });
+    expect(plan[1]).toEqual({
+      displayPath: "b.md",
+      directory: null,
+      directoryOwner: false,
+    });
+    // 与上一行不再共享：孤立摘取，自己拥有目录行。
+    expect(plan[2]).toEqual({
+      displayPath: "c.md",
+      directory: "9. 存档区/归档/学习归档/20260530/",
+      directoryOwner: true,
+    });
+    // 浅路径与无路径行保持完整路径，且无路径行会断开共享段。
+    expect(plan[3]).toEqual({
+      displayPath: null,
+      directory: null,
+      directoryOwner: false,
+    });
+    expect(plan[4]).toEqual({
+      displayPath: null,
+      directory: null,
+      directoryOwner: false,
+    });
+    // 孤立深路径。
+    expect(plan[5]).toEqual({
+      displayPath: "d.md",
+      directory: "deep/one/two/",
+      directoryOwner: true,
+    });
+    // 父目录只有一层：不摘取。
+    expect(plan[6]).toEqual({
+      displayPath: null,
+      directory: null,
+      directoryOwner: false,
+    });
+    // 文件夹尾斜杠：父目录 a/b/，末级 c/。
+    expect(plan[7]).toEqual({
+      displayPath: "c/",
+      directory: "a/b/",
+      directoryOwner: true,
+    });
+  });
+
+  it("falls back to per-row directories when the shared prefix would still hide the leaf", () => {
+    const plan = buildWindowedPathPlan([
+      "a/b/c/d.md",
+      "a/b/c/e/f/g.md",
+    ]);
+    // 共享前缀 a/b/c/ 的剩余深度是 1 与 3；第二行超过「一层父目录＋末级」，
+    // 整段退回逐行目录，保证末级可见。
+    expect(plan[0]).toEqual({
+      displayPath: "d.md",
+      directory: "a/b/c/",
+      directoryOwner: true,
+    });
+    expect(plan[1]).toEqual({
+      displayPath: "g.md",
+      directory: "a/b/c/e/f/",
+      directoryOwner: true,
+    });
+  });
+
+  it("adds the windowed directory line height to the rows that own it", () => {
+    expect(buildSyncPlanVirtualOffsets(
+      [{ reason: undefined }, { reason: "syncReason.test" }],
+      20,
+      42,
+      [14, 0],
+    )).toEqual([0, 34, 76]);
+  });
+
+  it("keeps the windowed path plan linear and owner-light on a 50k row list", () => {
+    const paths = Array.from({ length: 50_000 }, (_, index) =>
+      `Archive/2026/${String(index % 365).padStart(3, "0")}/file-${index}.md`);
+    const plan = buildWindowedPathPlan(paths);
+    expect(plan).toHaveLength(50_000);
+    // 50k 行共享 Archive/2026/：整段只出一条目录行，其余行只存剩余路径。
+    expect(plan.filter((entry) => entry.directoryOwner)).toHaveLength(1);
+    expect(plan[0].directory).toBe("Archive/2026/");
+    expect(plan[0].displayPath).toBe("000/file-0.md");
+    expect(plan[1].directory).toBeNull();
+    expect(plan[1].displayPath).toBe("001/file-1.md");
+  });
+
+  it("wires the windowed path plan through slots, height accounting and the directory line", () => {
+    const source = readSourceFile("src/ui/sync-view.ts");
+    expect(source).toContain(
+      "buildWindowedPathPlan(rows.map(pendingDisplayRowPath))",
+    );
+    expect(source).toContain(
+      "buildWindowedPathPlan(rows.map(planDisplayRowPath))",
+    );
+    expect(source).toContain("this.createWindowRowSlot(visible, rows[index].key)");
+    expect(source).toContain("this.applyWindowedPathPlan(");
+    expect(source).toContain('"[data-easy-sync-plan-slot]"');
+    expect(source).toContain('root.querySelectorAll<HTMLElement>("[data-easy-sync-plan-row]")');
+    expect(source).toContain("pathPlan[index]?.directoryOwner");
+    expect(source).toContain("resolvePathPlan().map((entry) =>");
+    expect(source).toContain("directoryHeight");
+    expect(source).toContain("this.refreshWindowedPathDirectories()");
+    // 目录行与探针共用窗口行留白类，探针高度和实际行高保持同一口径。
+    expect(source).toContain(
+      '"easy-sync-path-directory easy-sync-window-directory"',
+    );
+  });
+
   it("keeps moves, deferred work, true skips, and remote preparation in distinct plan groups", () => {
     const groups = buildSyncPlanDisplayGroups([
       { type: SyncActionType.Upload, path: "upload.md" },
@@ -3898,9 +4067,12 @@ describe("buildSyncViewContentKey", () => {
     expect(openMethod).toContain("confirmMutationResolutionDeletion(snapshot, choice)");
     expect(confirmMethod).toContain("option.deletesOtherSide");
     expect(confirmMethod).toContain("new ConfirmModal(");
-    expect(confirmMethod.indexOf("option.deletesOtherSide")).toBeLessThan(
-      confirmMethod.indexOf("new ConfirmModal("),
-    );
+    // The diverged-move branch owns its own numbered confirm; the single-copy
+    // path still returns before building its sentence (2026-10-31).
+    expect(confirmMethod).toContain("if (!option.deletesOtherSide) return true;");
+    expect(
+      confirmMethod.indexOf("if (!option.deletesOtherSide) return true;"),
+    ).toBeLessThan(confirmMethod.indexOf("const deletesLocal"));
     expect(openMethod).toContain("this.plugin.resolveMutationRecovery(snapshot, choice)");
     expect(modalSource).toContain("extends FileComparisonModal");
     expect(modalSource).toContain('this.setTitle(this.t(bundle');
@@ -3921,7 +4093,10 @@ describe("buildSyncViewContentKey", () => {
     expect(sharedSource).toContain('this.contentEl.addClass("easy-sync-conflict-detail")');
     expect(sharedSource).toContain('createDiv("easy-sync-conflict-body")');
     expect(sharedSource).toContain('createEl("table", "easy-sync-metadata-table")');
-    expect(sharedSource).toContain('createDiv("easy-sync-detail-actions")');
+    // 2026-10-30 弹框共享件：固定动作排＝共享底栏 fixed 变体。
+    expect(sharedSource).toContain(
+      "createEasySyncModalFooter(this.contentEl, { fixed: true })",
+    );
     expect(modalSource).not.toContain(".setCta()");
     // Slice B: ordinary entries keep only executable actions and one short path.
     expect(modalSource).not.toContain("syncView.mutationResolution.unavailable");
@@ -5783,19 +5958,24 @@ describe("one-way local-only rows (片④)", () => {
       .toContain("this.plugin.getLocalOnlyRows()");
   });
 
-  it("renders the keep chip beside upload and never reads the ignore store", () => {
+  it("renders upload, open-file and keep chips and never reads the ignore store", () => {
     const source = readSourceFile("src/ui/sync-view.ts");
     const renderer = source.slice(
       source.indexOf("private renderLocalOnlyItem("),
       source.indexOf("private renderBatchLocalOnlyRow("),
     );
-    // 两个动作 chip 都在展开区、都用现役动作形状与现役执行反馈。
+    // 三个动作 chip 都在展开区、都用现役动作形状与现役执行反馈。
     expect(renderer).toContain('t("syncView.localOnly.upload")');
+    expect(renderer).toContain('t("syncView.issues.openFile")');
     expect(renderer).toContain('t("syncView.localOnly.keep")');
     expect(renderer).toContain(
       "this.plugin.ignoreLocalOnlyEntry(entry.targetPath)",
     );
-    expect(renderer.match(/this\.createActionChip\(/g) ?? []).toHaveLength(2);
+    expect(renderer).toContain(
+      "this.plugin.app.workspace.getLeaf(false).openFile(localFile)",
+    );
+    expect(renderer.match(/this\.createActionChip\(/g) ?? []).toHaveLength(3);
+    // 打开文件是同步动作，不走 runItemAction 的异步执行反馈。
     expect(renderer.match(/this\.runItemAction\(/g) ?? []).toHaveLength(2);
     // 忽略只走单一真源（getLocalOnlyRows）：侧栏不直接读写忽略记忆，
     // 也不建反转界面（本片只留 store 的移除 API）。
@@ -5804,19 +5984,19 @@ describe("one-way local-only rows (片④)", () => {
     expect(source).not.toContain("localOnly.unignore");
   });
 
-  it("colors the upload chip as the primary action and keeps the keep chip neutral", () => {
+  it("colors the upload chip as the primary action and keeps open/keep neutral", () => {
     const source = readSourceFile("src/ui/sync-view.ts");
     const renderer = source.slice(
       source.indexOf("private renderLocalOnlyItem("),
       source.indexOf("private renderBatchLocalOnlyRow("),
     );
     const chips = renderer.split("this.createActionChip(").slice(1);
-    expect(chips).toHaveLength(2);
+    expect(chips).toHaveLength(3);
     const variantBeforeCallback = (chip: string): string | null =>
       chip.match(/("accent"|"warning"|""),\s*\n\s*\(\) => \{/)?.[1] ?? null;
 
     // 主次判据（与「新插件待决策」行同形）：主动作 accent、次动作中性。
-    // 顺序不变：第一个＝上传到云端（强调色），第二个＝留在本机（中性）。
+    // 顺序：上传到云端（强调色）→ 留在本机（中性）→ 打开文件（中性）。
     expect(chips[0]).toContain('t("syncView.localOnly.upload")');
     expect(chips[0]).toContain(
       "this.plugin.uploadLocalOnlyEntry(entry.targetPath)",
@@ -5827,6 +6007,11 @@ describe("one-way local-only rows (片④)", () => {
       "this.plugin.ignoreLocalOnlyEntry(entry.targetPath)",
     );
     expect(variantBeforeCallback(chips[1])).toBe('""');
+    expect(chips[2]).toContain('t("syncView.issues.openFile")');
+    expect(chips[2]).toContain(
+      "this.plugin.app.workspace.getLeaf(false).openFile(localFile)",
+    );
+    expect(variantBeforeCallback(chips[2])).toBe('""');
 
     // 同族先例对拍：采纳行主动作 accent／跳过中性；删除行 warning／拒绝中性。
     const adoption = source.slice(
@@ -5999,8 +6184,8 @@ describe("conflict batch row (2026-10-23)", () => {
     expect(renderer).toContain("easy-sync-local-only-batch-actions");
     expect(renderer).toContain("syncView.conflict.batchKeepLocalTitle");
     expect(renderer).toContain("syncView.conflict.batchKeepRemoteTitle");
-    expect(renderer).toContain("syncView.conflict.batchKeepLocalMessage");
-    expect(renderer).toContain("syncView.conflict.batchKeepRemoteMessage");
+    expect(renderer).toContain("syncView.conflict.batchKeepLocalStep.cloudOnly");
+    expect(renderer).toContain("syncView.conflict.batchKeepRemoteStep.cloudOnly");
     // 入口两颗按钮同色（中性），危险色只留给两个确认弹框的确认键。
     expect(renderer).not.toContain("applyDestructiveButton");
     expect(renderer.match(/danger: true/g) ?? []).toHaveLength(2);

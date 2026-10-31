@@ -24,10 +24,7 @@ interface VaultJoinOfferViews {
   fresh: { title: string; description: string };
 }
 
-export class VaultJoinOfferModal extends EasySyncModal {
-  private resolve: ((value: VaultJoinOfferResult) => void) | null = null;
-  private finished = false;
-
+export class VaultJoinOfferModal extends EasySyncModal<VaultJoinOfferResult> {
   constructor(
     app: App,
     private views: VaultJoinOfferViews,
@@ -36,19 +33,7 @@ export class VaultJoinOfferModal extends EasySyncModal {
   }
 
   awaitAction(): Promise<VaultJoinOfferResult> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
-  }
-
-  private finish(result: VaultJoinOfferResult): void {
-    if (this.finished) return;
-    this.finished = true;
-    const resolve = this.resolve;
-    this.resolve = null;
-    this.close();
-    resolve?.(result);
+    return this.awaitResult();
   }
 
   onOpen(): void {
@@ -63,19 +48,17 @@ export class VaultJoinOfferModal extends EasySyncModal {
     });
     const joinButton = this.buildOptionButton(this.views.join);
     joinButton.addEventListener("click", () => {
-      this.finish({ action: "join" });
+      this.settle({ action: "join" });
     });
     contentEl.appendChild(joinButton);
     const freshButton = this.buildOptionButton(this.views.fresh);
     freshButton.addEventListener("click", () => {
-      this.finish({ action: "fresh-sync" });
+      this.settle({ action: "fresh-sync" });
     });
     contentEl.appendChild(freshButton);
   }
 
-  onClose(): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    resolve?.({ action: "dismiss" });
+  override onClose(): void {
+    this.takePendingResolve()?.({ action: "dismiss" });
   }
 }

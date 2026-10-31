@@ -1,7 +1,11 @@
-import { ButtonComponent, Setting, type App } from "obsidian";
+import { Setting, type App } from "obsidian";
 import type { I18nFn } from "./confirm-modal";
+import {
+  addEasySyncFooterButton,
+  createEasySyncModalFooter,
+  EasySyncModal,
+} from "./easy-sync-modal";
 import { applyDestructiveButton } from "./destructive-button";
-import { EasySyncModal } from "./easy-sync-modal";
 import type {
   EmptyFolderResolutionSnapshotV1,
   FolderLocationResolutionSnapshotV1,
@@ -16,10 +20,7 @@ type EmptyFolderResolutionChoice =
   | { action: "keep-local-location" }
   | { action: "keep-remote-location" };
 
-export class EmptyFolderResolutionModal extends EasySyncModal {
-  private resolve:
-    ((choice: EmptyFolderResolutionChoice | null) => void) | null = null;
-
+export class EmptyFolderResolutionModal extends EasySyncModal<EmptyFolderResolutionChoice | null> {
   constructor(
     app: App,
     private readonly snapshot: Readonly<
@@ -33,23 +34,23 @@ export class EmptyFolderResolutionModal extends EasySyncModal {
   }
 
   awaitChoice(): Promise<EmptyFolderResolutionChoice | null> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
+    return this.awaitResult();
   }
 
-  private finish(choice: EmptyFolderResolutionChoice | null): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    this.close();
-    resolve?.(choice);
+  /** One resolution modal at a time: same path rejected, another replaces. */
+  override open(): void {
+    const key = (this.snapshot as { path?: string }).path ?? null;
+    if (!this.takeOverSingleInstance(key, { replace: true })) {
+      this.settle(null);
+      return;
+    }
+    super.open();
   }
 
   onOpen(): void {
     const { contentEl, modalEl } = this;
     contentEl.empty();
-    modalEl.addClass("easy-sync-empty-folder-modal");
+    modalEl.addClass("easy-sync-empty-folder-modal", "easy-sync-modal-wide");
     if ("localPath" in this.snapshot) {
       this.renderLocationReview(contentEl);
       return;
@@ -72,7 +73,7 @@ export class EmptyFolderResolutionModal extends EasySyncModal {
       .addButton((button) => button
         .setButtonText(this.t("syncView.emptyFolder.restore"))
         .setCta()
-        .onClick(() => this.finish({ action: "restore" })));
+        .onClick(() => this.settle({ action: "restore" })));
 
     contentEl.createEl("h3", {
       text: this.t("syncView.emptyFolder.bindTitle"),
@@ -86,7 +87,7 @@ export class EmptyFolderResolutionModal extends EasySyncModal {
         .setName(candidatePath)
         .addButton((button) => button
           .setButtonText(this.t("syncView.emptyFolder.bind"))
-          .onClick(() => this.finish({
+          .onClick(() => this.settle({
             action: "bind",
             candidatePath,
           })));
@@ -102,15 +103,20 @@ export class EmptyFolderResolutionModal extends EasySyncModal {
     if (this.snapshot.remoteETag) {
       deleteSetting.addButton((button) => applyDestructiveButton(button)
         .setButtonText(this.t("syncView.emptyFolder.deleteConfirm"))
-        .onClick(() => this.finish({ action: "delete" })));
+        .onClick(() => this.settle({ action: "delete" })));
     }
 
-    const actions = contentEl.createDiv(
-      "modal-button-container easy-sync-empty-folder-actions",
-    );
-    new ButtonComponent(actions)
-      .setButtonText(this.t("confirm.cancel"))
-      .onClick(() => this.finish(null));
+    this.renderCancelFooter(contentEl);
+  }
+
+  /** The three review shapes share one cancel-only footer (divided: the
+   *  interactive rows above it decide, the footer only exits). */
+  private renderCancelFooter(contentEl: HTMLElement): void {
+    const actions = createEasySyncModalFooter(contentEl, { divided: true });
+    addEasySyncFooterButton(actions, {
+      label: this.t("confirm.cancel"),
+      onClick: () => this.settle(null),
+    });
   }
 
   private renderLocationReview(contentEl: HTMLElement): void {
@@ -128,19 +134,14 @@ export class EmptyFolderResolutionModal extends EasySyncModal {
       .setDesc(snapshot.localPath)
       .addButton((button) => button
         .setButtonText(this.t("syncView.folderLocation.keepLocal"))
-        .onClick(() => this.finish({ action: "keep-local-location" })));
+        .onClick(() => this.settle({ action: "keep-local-location" })));
     new Setting(contentEl)
       .setName(this.t("syncView.folderLocation.remoteTitle"))
       .setDesc(snapshot.remotePath)
       .addButton((button) => button
         .setButtonText(this.t("syncView.folderLocation.keepRemote"))
-        .onClick(() => this.finish({ action: "keep-remote-location" })));
-    const actions = contentEl.createDiv(
-      "modal-button-container easy-sync-empty-folder-actions",
-    );
-    new ButtonComponent(actions)
-      .setButtonText(this.t("confirm.cancel"))
-      .onClick(() => this.finish(null));
+        .onClick(() => this.settle({ action: "keep-remote-location" })));
+    this.renderCancelFooter(contentEl);
   }
 
   private renderSubtreeReview(contentEl: HTMLElement): void {
@@ -174,7 +175,7 @@ export class EmptyFolderResolutionModal extends EasySyncModal {
       .addButton((button) => button
         .setButtonText(this.t("syncView.folderSubtree.restore"))
         .setCta()
-        .onClick(() => this.finish({ action: "restore" })));
+        .onClick(() => this.settle({ action: "restore" })));
     const root = snapshot.members[0];
     const deleteSetting = new Setting(contentEl)
       .setName(root?.remoteETag
@@ -186,19 +187,13 @@ export class EmptyFolderResolutionModal extends EasySyncModal {
     if (root?.remoteETag) {
       deleteSetting.addButton((button) => applyDestructiveButton(button)
         .setButtonText(this.t("syncView.folderSubtree.delete"))
-        .onClick(() => this.finish({ action: "delete-subtree" })));
+        .onClick(() => this.settle({ action: "delete-subtree" })));
     }
-    const actions = contentEl.createDiv(
-      "modal-button-container easy-sync-empty-folder-actions",
-    );
-    new ButtonComponent(actions)
-      .setButtonText(this.t("confirm.cancel"))
-      .onClick(() => this.finish(null));
+    this.renderCancelFooter(contentEl);
   }
 
-  onClose(): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    resolve?.(null);
+  override onClose(): void {
+    this.releaseSingleInstance();
+    this.takePendingResolve()?.(null);
   }
 }

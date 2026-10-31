@@ -14,7 +14,7 @@
  * "generate a new code" recovery.
  */
 
-import { type App } from "obsidian";
+import { type App, type ButtonComponent } from "obsidian";
 import {
   compatClearInterval,
   compatSetInterval,
@@ -23,10 +23,14 @@ import {
 import type { AuthModule } from "../auth/auth-module";
 import type { DeviceCodeAttemptView } from "../auth/types";
 import {
+  addEasySyncFooterButton,
+  createEasySyncModalFooter,
+  EasySyncModal,
+} from "./easy-sync-modal";
+import {
   NOTICE_PRIORITY,
   type EasySyncNoticeCenter,
 } from "./notice-center";
-import { EasySyncModal } from "./easy-sync-modal";
 
 interface AuthDeviceCodeModalDeps {
   auth: AuthModule;
@@ -111,57 +115,53 @@ export class AuthDeviceCodeModal extends EasySyncModal {
       cls: "easy-sync-device-code-hint",
     });
 
-    const btnRow = contentEl.createDiv({
-      cls: "modal-button-container easy-sync-device-actions",
+    // DOM order: the cancel exit first, the waiting-room actions next and the
+    // CTA (open verify / regenerate) last — phones show the CTA on top via
+    // the host's column-reverse.
+    const btnRow = createEasySyncModalFooter(contentEl);
+    addEasySyncFooterButton(btnRow, {
+      label: t("settings.account.device.cancel"),
+      onClick: () => {
+        // The only path that abandons the attempt; closing the modal alone
+        // keeps the code alive for the whole verification cycle.
+        this.deps.auth.cancelPendingLogin();
+        this.close();
+      },
     });
     if (attempt.phase === "waiting") {
-      const openBtn = btnRow.createEl("button", {
-        text: t("settings.account.device.openVerify"),
-        cls: "mod-cta",
-        type: "button",
+      addEasySyncFooterButton(btnRow, {
+        label: t("settings.account.device.copyCode"),
+        onClick: () => {
+          void this.copyCode();
+        },
       });
-      openBtn.addEventListener("click", () => {
-        // Same-device path: copy the code (with notice — the user pastes it
-        // on the verification page, since Microsoft does not pre-fill) and
-        // open the page. Both must stay inside the click so iOS keeps the
-        // browser popup user-initiated.
-        void this.copyCode();
-        this.deps.auth.openUrl(verificationPageUrl(attempt));
+      const checkButton = addEasySyncFooterButton(btnRow, {
+        label: t("settings.account.device.checkNow"),
+        onClick: () => {
+          void this.manualCheck(checkButton);
+        },
       });
-      const copyBtn = btnRow.createEl("button", {
-        text: t("settings.account.device.copyCode"),
-        type: "button",
-      });
-      copyBtn.addEventListener("click", () => {
-        void this.copyCode();
-      });
-      const checkBtn = btnRow.createEl("button", {
-        text: t("settings.account.device.checkNow"),
-        type: "button",
-      });
-      checkBtn.addEventListener("click", () => {
-        void this.manualCheck(checkBtn);
+      addEasySyncFooterButton(btnRow, {
+        label: t("settings.account.device.openVerify"),
+        variant: "cta",
+        onClick: () => {
+          // Same-device path: copy the code (with notice — the user pastes it
+          // on the verification page, since Microsoft does not pre-fill) and
+          // open the page. Both must stay inside the click so iOS keeps the
+          // browser popup user-initiated.
+          void this.copyCode();
+          this.deps.auth.openUrl(verificationPageUrl(attempt));
+        },
       });
     } else {
-      const regenerateBtn = btnRow.createEl("button", {
-        text: t("settings.account.device.regenerate"),
-        cls: "mod-cta",
-        type: "button",
-      });
-      regenerateBtn.addEventListener("click", () => {
-        void this.regenerate();
+      addEasySyncFooterButton(btnRow, {
+        label: t("settings.account.device.regenerate"),
+        variant: "cta",
+        onClick: () => {
+          void this.regenerate();
+        },
       });
     }
-    const cancelBtn = btnRow.createEl("button", {
-      text: t("settings.account.device.cancel"),
-      type: "button",
-    });
-    cancelBtn.addEventListener("click", () => {
-      // The only path that abandons the attempt; closing the modal alone
-      // keeps the code alive for the whole verification cycle.
-      this.deps.auth.cancelPendingLogin();
-      this.close();
-    });
 
     const status = contentEl.createDiv({ cls: "easy-sync-device-status" });
     if (attempt.phase === "waiting") {
@@ -197,13 +197,13 @@ export class AuthDeviceCodeModal extends EasySyncModal {
   /** Manual "check now": run one immediate poll and always answer the user —
    *  the modal completes or advances to a terminal phase, or the user is told
    *  the provider still reports the login as unfinished. */
-  private async manualCheck(button: HTMLButtonElement): Promise<void> {
+  private async manualCheck(button: ButtonComponent): Promise<void> {
     if (this.busy) return;
     const t = this.deps.t;
-    const originalLabel = button.getText();
+    const originalLabel = button.buttonEl.getText();
     this.busy = true;
-    button.disabled = true;
-    button.setText(t("settings.account.device.checking"));
+    button.setDisabled(true);
+    button.setButtonText(t("settings.account.device.checking"));
     try {
       await this.deps.auth.checkDeviceCodeNow();
     } finally {
@@ -218,8 +218,8 @@ export class AuthDeviceCodeModal extends EasySyncModal {
       return;
     }
     if (attempt.phase === "waiting") {
-      button.disabled = false;
-      button.setText(originalLabel);
+      button.setDisabled(false);
+      button.setButtonText(originalLabel);
       this.deps.noticeCenter.show({
         key: "settings-device-check-pending",
         message: t("settings.account.device.notYet"),

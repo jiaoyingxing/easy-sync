@@ -457,8 +457,11 @@ import {
   type MutationIntent,
   type MutationIntentV1,
   type MutationReceiptV1,
+  type MutationCheckpointV1,
   type MutationLedgerEntryV1,
   type ManualMutationResolutionV1,
+  type FileConsolidationStepV2,
+  type FileConsolidationSettlementV2,
   type CommunityPluginBundleSettlementV2,
   type ManualMutationResolutionAuditV1,
   type ReceiptedRenameAnchorCollisionEvidenceV1,
@@ -4814,6 +4817,7 @@ export class StateManager {
         (candidate) =>
           candidate !== existing
           && candidate.manualResolution?.version === 2
+          && candidate.manualResolution.kind === "community-plugin-bundle-settlement"
           && candidate.manualResolution.pluginRoot === settlement.pluginRoot,
       );
       if (
@@ -5070,31 +5074,40 @@ export class StateManager {
    */
   async attachManualMutationResolution(
     expectedRecord: Readonly<MutationLedgerEntryV1>,
-    resolution: Readonly<ManualMutationResolutionV1>,
+    resolution: Readonly<ManualMutationResolutionV1 | FileConsolidationSettlementV2>,
   ): Promise<boolean> {
     if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
       throw new Error("Manual mutation resolution requires active V2 authority");
     }
-    if (
-      this.mutationLedgerCorrupt
-      || !isManualMutationResolution(
-        resolution,
+    const v1Resolution = "kind" in resolution ? null : resolution;
+    const valid = v1Resolution
+      ? isManualMutationResolution(
+        v1Resolution,
         expectedRecord.intent,
         expectedRecord.receipt,
       )
-      || !sameSyncScope(resolution.intent.scope, this.v2Envelope.scope)
-      || resolution.intent.operationId === expectedRecord.intent.operationId
+      : isFileConsolidationSettlementV2(
+        resolution,
+        expectedRecord.intent,
+        expectedRecord.receipt,
+      );
+    if (
+      this.mutationLedgerCorrupt
+      || !valid
+      || !sameSyncScope(expectedRecord.intent.scope, this.v2Envelope.scope)
+      || (v1Resolution
+        && v1Resolution.intent.operationId === expectedRecord.intent.operationId)
     ) {
       throw new Error("Manual mutation resolution evidence is invalid");
     }
-    if (resolution.recoveryEvidence) {
+    if (v1Resolution?.recoveryEvidence) {
       const collision = inspectReceiptedRenameAnchorCollisionV2(
         this.v2Envelope,
         expectedRecord,
       );
       if (
         !collision
-        || JSON.stringify(collision.evidence) !== JSON.stringify(resolution.recoveryEvidence)
+        || JSON.stringify(collision.evidence) !== JSON.stringify(v1Resolution.recoveryEvidence)
       ) {
         throw new Error("Manual mutation resolution evidence is invalid");
       }
@@ -5131,21 +5144,30 @@ export class StateManager {
    */
   async replaceManualMutationResolution(
     expectedRecord: Readonly<MutationLedgerEntryV1>,
-    resolution: Readonly<ManualMutationResolutionV1>,
+    resolution: Readonly<ManualMutationResolutionV1 | FileConsolidationSettlementV2>,
   ): Promise<boolean> {
     if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
       throw new Error("Manual mutation replacement requires active V2 authority");
     }
-    if (
-      this.mutationLedgerCorrupt
-      || !isManualMutationResolution(
-        resolution,
+    const v1Resolution = "kind" in resolution ? null : resolution;
+    const valid = v1Resolution
+      ? isManualMutationResolution(
+        v1Resolution,
         expectedRecord.intent,
         expectedRecord.receipt,
       )
-      || !sameSyncScope(resolution.intent.scope, this.v2Envelope.scope)
-      || resolution.intent.operationId === expectedRecord.intent.operationId
-      || resolution.recoveryEvidence !== undefined
+      : isFileConsolidationSettlementV2(
+        resolution,
+        expectedRecord.intent,
+        expectedRecord.receipt,
+      );
+    if (
+      this.mutationLedgerCorrupt
+      || !valid
+      || !sameSyncScope(expectedRecord.intent.scope, this.v2Envelope.scope)
+      || (v1Resolution
+        && (v1Resolution.intent.operationId === expectedRecord.intent.operationId
+          || v1Resolution.recoveryEvidence !== undefined))
     ) {
       throw new Error("Manual mutation replacement evidence is invalid");
     }
@@ -5215,6 +5237,193 @@ export class StateManager {
     });
   }
 
+  /**
+   * Persist one reviewed create/delete step of a file-consolidation
+   * settlement (2026-10-31). Steps are ordered: index 0 creates the winner on
+   * the losing side, index 1 retires the losing copy. The shared V2 envelope
+   * is not touched until both receipts exist.
+   */
+  async recordFileConsolidationStepReceipt(
+    sourceOperationId: string,
+    stepIndex: 0 | 1,
+    receipt: Readonly<MutationReceiptV1>,
+  ): Promise<void> {
+    if (this.v2StateLoadBlock || !this.v2Envelope || this.legacyStateAllowed) {
+      throw new Error("File consolidation receipt requires active V2 authority");
+    }
+    if (this.mutationLedgerCorrupt) {
+      throw new Error("Mutation recovery ledger is corrupt");
+    }
+    await this.commitPluginData((current) => {
+      const index = findUniqueMutationLedgerRecordIndex(
+        current[KEY_MUTATION_LEDGER],
+        sourceOperationId,
+      );
+      if (index < 0) {
+        throw new Error(`Mutation intent missing: ${sourceOperationId}`);
+      }
+      const active = current[KEY_MUTATION_LEDGER][index];
+      const manual = active.manualResolution;
+      if (!manual || manual.version !== 2 || manual.kind !== "file-consolidation") {
+        throw new Error(`File consolidation settlement missing: ${sourceOperationId}`);
+      }
+      const step = manual.steps[stepIndex];
+      if (!step || receipt.operationId !== step.intent.operationId) {
+        throw new Error(`File consolidation step missing: ${sourceOperationId}`);
+      }
+      if (step.receipt) {
+        if (JSON.stringify(step.receipt) === JSON.stringify(receipt)) return current;
+        throw new Error(`File consolidation step receipt changed: ${sourceOperationId}`);
+      }
+      const steps: [FileConsolidationStepV2, FileConsolidationStepV2] = [
+        manual.steps[0],
+        manual.steps[1],
+      ];
+      steps[stepIndex] = { ...step, receipt: structuredClone(receipt) };
+      const entries = [...current[KEY_MUTATION_LEDGER]];
+      entries[index] = { ...active, manualResolution: { ...manual, steps } };
+      return { ...current, [KEY_MUTATION_LEDGER]: entries };
+    });
+  }
+
+  /**
+   * Synthesize the single converged-move commit for a two-step settlement:
+   * the winner's receipt proves the created side, the loser's receipt proves
+   * the retired side, and the reducer sees one upload-with-source checkpoint.
+   */
+  private buildFileConsolidationCommit(
+    record: Readonly<MutationLedgerEntryV1>,
+    manual: Readonly<FileConsolidationSettlementV2>,
+  ): { intent: MutationIntentV1; receipt: MutationReceiptV1 } {
+    const [first, second] = manual.steps;
+    if (!first.receipt || !second.receipt) {
+      throw new Error(
+        `File consolidation steps are incomplete: ${record.intent.operationId}`,
+      );
+    }
+    const keepLocal = manual.choice === "keep-local";
+    const winnerPath = keepLocal ? record.intent.path : record.intent.sourcePath;
+    const loserPath = keepLocal ? record.intent.sourcePath : record.intent.path;
+    if (!winnerPath || !loserPath) {
+      throw new Error(
+        `File consolidation paths are incomplete: ${record.intent.operationId}`,
+      );
+    }
+    const winnerBase = first.receipt.checkpoint.baseUpserts[0];
+    if (!winnerBase || winnerBase.path !== winnerPath) {
+      throw new Error(
+        `File consolidation create receipt is missing: ${record.intent.operationId}`,
+      );
+    }
+    const checkpoint: MutationCheckpointV1 = {
+      baseUpserts: [winnerBase],
+      baseRemovals: keepLocal
+        ? [...second.receipt.checkpoint.baseRemovals]
+        : [loserPath],
+      remoteUpserts: [],
+      remoteDeletes: keepLocal
+        ? [...second.receipt.checkpoint.remoteDeletes]
+        : [loserPath],
+      pendingConflictRemovals: [
+        ...first.receipt.checkpoint.pendingConflictRemovals,
+        ...second.receipt.checkpoint.pendingConflictRemovals,
+      ],
+      pendingDeleteRemovals: [
+        ...first.receipt.checkpoint.pendingDeleteRemovals,
+        ...second.receipt.checkpoint.pendingDeleteRemovals,
+      ],
+    };
+    let expectedRemote: MutationIntentV1["expectedRemote"];
+    if (keepLocal) {
+      const winnerRemote = first.receipt.checkpoint.remoteUpserts[0];
+      if (!winnerRemote || winnerRemote.path !== winnerPath) {
+        throw new Error(
+          `File consolidation upload receipt is missing: ${record.intent.operationId}`,
+        );
+      }
+      checkpoint.remoteUpserts.push(winnerRemote);
+      expectedRemote = {
+        exists: true,
+        driveId: winnerRemote.driveId,
+        eTag: winnerRemote.eTag,
+        size: winnerRemote.size,
+        ...(winnerRemote.sha256Hash
+          ? { sha256Hash: winnerRemote.sha256Hash }
+          : {}),
+      };
+    } else {
+      const envelope = this.v2Envelope;
+      if (!envelope) {
+        throw new Error("File consolidation requires active V2 authority");
+      }
+      const pathById = projectRemoteIndexV2(envelope.remoteIndex);
+      const remoteId = [...pathById.entries()].find(
+        ([, path]) => path === winnerPath,
+      )?.[0];
+      const node = remoteId
+        ? envelope.remoteIndex.itemsById[remoteId]
+        : undefined;
+      if (
+        !node
+        || node.kind !== "file"
+        || node.eTag === undefined
+        || node.cTag === undefined
+        || node.size === undefined
+        || node.mtime === undefined
+      ) {
+        throw new Error(
+          `File consolidation remote winner is missing: ${winnerPath}`,
+        );
+      }
+      checkpoint.remoteUpserts.push({
+        path: winnerPath,
+        driveId: node.id,
+        parentId: node.parentId,
+        size: node.size,
+        mtime: node.mtime,
+        eTag: node.eTag,
+        cTag: node.cTag,
+        ...(node.contentHash ? { sha256Hash: node.contentHash } : {}),
+        ...(node.quickXorHash ? { quickXorHash: node.quickXorHash } : {}),
+      });
+      expectedRemote = {
+        exists: true,
+        driveId: node.id,
+        eTag: node.eTag,
+        size: node.size,
+        ...(node.contentHash ? { sha256Hash: node.contentHash } : {}),
+      };
+    }
+    const intent: MutationIntentV1 = {
+      version: 1,
+      operationId: `${record.intent.operationId}-consolidation`,
+      planRevision: record.intent.planRevision,
+      scope: { ...record.intent.scope },
+      action: "upload",
+      path: winnerPath,
+      sourcePath: loserPath,
+      expectedLocal: {
+        exists: true,
+        hash: winnerBase.hash,
+        size: winnerBase.size,
+      },
+      expectedRemote,
+      createdAt: manual.selectedAt,
+    };
+    return {
+      intent,
+      receipt: {
+        version: 1,
+        operationId: intent.operationId,
+        completedAt: Math.max(
+          first.receipt.completedAt,
+          second.receipt.completedAt,
+        ),
+        checkpoint,
+      },
+    };
+  }
+
   /** Publish a reviewed continuation checkpoint, then retire its outer block. */
   async commitManualMutationResolutionCheckpoint(
     sourceOperationId: string,
@@ -5230,21 +5439,36 @@ export class StateManager {
       ? undefined
       : this.data[KEY_MUTATION_LEDGER][recordIndex];
     const manual = record?.manualResolution;
-    if (!record || manual?.version !== 1 || !manual.receipt) {
+    if (!record || !manual) {
       throw new Error(`Manual mutation receipt missing: ${sourceOperationId}`);
     }
-    if (!sameSyncScope(manual.intent.scope, this.v2Envelope.scope)) {
-      throw new Error(`Manual mutation scope no longer matches: ${sourceOperationId}`);
+    let commitIntent: MutationIntentV1;
+    let commitReceipt: MutationReceiptV1;
+    if (manual.version === 1) {
+      if (!manual.receipt) {
+        throw new Error(`Manual mutation receipt missing: ${sourceOperationId}`);
+      }
+      if (!sameSyncScope(manual.intent.scope, this.v2Envelope.scope)) {
+        throw new Error(`Manual mutation scope no longer matches: ${sourceOperationId}`);
+      }
+      commitIntent = manual.intent;
+      commitReceipt = manual.receipt;
+    } else if (manual.kind === "file-consolidation") {
+      const commit = this.buildFileConsolidationCommit(record, manual);
+      commitIntent = commit.intent;
+      commitReceipt = commit.receipt;
+    } else {
+      throw new Error(`Manual mutation receipt missing: ${sourceOperationId}`);
     }
-    const checkpoint = manual.receipt.checkpoint;
+    const checkpoint = commitReceipt.checkpoint;
     assertRemoteUpsertsHaveParentIdentity(checkpoint.remoteUpserts);
     const ancestorHashes = await this.publishPendingV2Ancestors(
       checkpoint.baseUpserts,
     );
     await this.commitV2State((current) => {
       const reduced = reduceFileStateEnvelopeV2(current, {
-        intent: manual.intent,
-        receipt: manual.receipt,
+        intent: commitIntent,
+        receipt: commitReceipt,
       });
       return Object.keys(ancestorHashes).length === 0
         ? reduced
@@ -5259,13 +5483,13 @@ export class StateManager {
     const audit: ManualMutationResolutionAuditV1 = {
       version: 1,
       sourceOperationId,
-      resolutionOperationId: manual.intent.operationId,
-      path: manual.intent.path,
+      resolutionOperationId: commitIntent.operationId,
+      path: commitIntent.path,
       choice: manual.choice,
-      action: manual.intent.action,
-      externalMutation: manual.externalMutation,
+      action: commitIntent.action,
+      externalMutation: manual.version === 1 ? manual.externalMutation : true,
       selectedAt: manual.selectedAt,
-      completedAt: manual.receipt.completedAt,
+      completedAt: commitReceipt.completedAt,
     };
     await this.commitPluginData((current) => {
       const activeIndex = findUniqueMutationLedgerRecordIndex(
@@ -5277,7 +5501,7 @@ export class StateManager {
         : current[KEY_MUTATION_LEDGER][activeIndex];
       if (!active) {
         if (current[KEY_MANUAL_MUTATION_RESOLUTION_AUDIT].some(
-          (entry) => entry.resolutionOperationId === manual.intent.operationId,
+          (entry) => entry.resolutionOperationId === commitIntent.operationId,
         )) return current;
         throw new Error(`Manual mutation intent missing: ${sourceOperationId}`);
       }
@@ -11523,7 +11747,96 @@ function isMutationLedgerEntry(value: unknown): value is MutationLedgerEntryV1 {
   return isMutationIntent(entry.intent)
     && (entry.receipt === null || isMutationReceipt(entry.receipt, entry.intent.operationId))
     && (entry.manualResolution === undefined
-      || isManualMutationResolution(entry.manualResolution, entry.intent, entry.receipt));
+      || isManualMutationResolution(entry.manualResolution, entry.intent, entry.receipt)
+      || isFileConsolidationSettlementV2(
+        entry.manualResolution,
+        entry.intent,
+        entry.receipt,
+      ));
+}
+
+/**
+ * Ordered two-step settlement for a content-diverged move record
+ * (2026-10-31). Step 1 creates the winning content on the losing side; step 2
+ * retires the losing copy. Both intents must reference the record's two
+ * paths, and their operation ids must be distinct from the outer record.
+ */
+function isFileConsolidationSettlementV2(
+  value: unknown,
+  sourceIntent?: MutationIntent,
+  sourceReceipt?: MutationReceiptV1 | null,
+): value is FileConsolidationSettlementV2 {
+  if (!isRecord(value) || !sourceIntent) return false;
+  if (
+    value.version !== 2
+    || value.kind !== "file-consolidation"
+    || (value.choice !== "keep-local" && value.choice !== "keep-remote")
+    || typeof value.factsDigest !== "string"
+    || !/^[0-9a-f]{64}$/i.test(value.factsDigest)
+    || typeof value.selectedAt !== "number"
+    || !Number.isFinite(value.selectedAt)
+    || value.externalMutation !== true
+    || !Array.isArray(value.steps)
+    || value.steps.length !== 2
+  ) return false;
+  if (
+    sourceIntent.version !== 1
+    || sourceIntent.action !== "renameRemote"
+    || typeof sourceIntent.sourcePath !== "string"
+    || sourceIntent.sourcePath === sourceIntent.path
+    || (sourceReceipt !== null && sourceReceipt !== undefined)
+  ) return false;
+  const first: unknown = value.steps[0];
+  const second: unknown = value.steps[1];
+  if (!isRecord(first) || !isRecord(second)) return false;
+  const firstIntent: unknown = first.intent;
+  const secondIntent: unknown = second.intent;
+  if (
+    !isMutationIntent(firstIntent, true)
+    || !isMutationIntent(secondIntent, true)
+    || firstIntent.version !== 1
+    || secondIntent.version !== 1
+  ) return false;
+  const stepOne = firstIntent;
+  const stepTwo = secondIntent;
+  if (
+    !sameSyncScope(stepOne.scope, sourceIntent.scope)
+    || !sameSyncScope(stepTwo.scope, sourceIntent.scope)
+    || stepOne.sourcePath !== undefined
+    || stepTwo.sourcePath !== undefined
+  ) return false;
+  if (
+    (first.receipt !== null && !isMutationReceipt(first.receipt, stepOne.operationId))
+    || (second.receipt !== null && !isMutationReceipt(second.receipt, stepTwo.operationId))
+  ) return false;
+  const operationIds = [
+    sourceIntent.operationId,
+    stepOne.operationId,
+    stepTwo.operationId,
+  ];
+  if (new Set(operationIds).size !== operationIds.length) return false;
+  const sourcePath = sourceIntent.sourcePath;
+  const targetPath = sourceIntent.path;
+  if (value.choice === "keep-local") {
+    // Upload the local target to the cloud target, then delete the cloud source.
+    return stepOne.action === "upload"
+      && stepOne.path === targetPath
+      && stepOne.expectedLocal.exists
+      && !stepOne.expectedRemote.exists
+      && stepTwo.action === "deleteRemote"
+      && stepTwo.path === sourcePath
+      && !stepTwo.expectedLocal.exists
+      && stepTwo.expectedRemote.exists;
+  }
+  // Download the cloud source to the local source, then delete the local target.
+  return stepOne.action === "download"
+    && stepOne.path === sourcePath
+    && !stepOne.expectedLocal.exists
+    && stepOne.expectedRemote.exists
+    && stepTwo.action === "deleteLocal"
+    && stepTwo.path === targetPath
+    && stepTwo.expectedLocal.exists
+    && !stepTwo.expectedRemote.exists;
 }
 
 function isCommunityPluginBundleSettlementEntry(
@@ -11757,11 +12070,28 @@ function isManualMutationResolution(
     : hasSourcePath
       ? isCollisionRecovery || (
         value.recoveryEvidence === undefined
-          && value.intent.expectedLocal.exists
-          && value.intent.expectedRemote.exists
           && (
-            (value.choice === "keep-local" && value.intent.action === "renameRemote")
-            || (value.choice === "keep-remote" && value.intent.action === "moveLocal")
+            (value.intent.expectedLocal.exists
+              && value.intent.expectedRemote.exists
+              && (
+                (value.choice === "keep-local" && value.intent.action === "renameRemote")
+                || (value.choice === "keep-remote" && value.intent.action === "moveLocal")
+              ))
+            // One surviving copy (2026-10-31): the other side is empty at
+            // both record paths, so the settlement is the plain operation on
+            // the surviving copy's path.
+            || (!value.intent.expectedLocal.exists
+              && value.intent.expectedRemote.exists
+              && (
+                (value.choice === "keep-remote" && value.intent.action === "download")
+                || (value.choice === "keep-local" && value.intent.action === "deleteRemote")
+              ))
+            || (value.intent.expectedLocal.exists
+              && !value.intent.expectedRemote.exists
+              && (
+                (value.choice === "keep-local" && value.intent.action === "upload")
+                || (value.choice === "keep-remote" && value.intent.action === "deleteLocal")
+              ))
           )
       )
       : value.choice === "keep-local"
@@ -11797,7 +12127,13 @@ function isManualMutationResolution(
     value.intent.path,
     value.intent.sourcePath,
   ].filter((path): path is string => Boolean(path)))].sort();
-  if (JSON.stringify(sourcePaths) !== JSON.stringify(resolutionPaths)) return false;
+  // A one-surviving-copy settlement touches only the surviving copy's path;
+  // the other record path is empty on both sides (2026-10-31). The digest
+  // and the executor's live recheck still bind the choice to the reviewed
+  // facts, so a subset is allowed — but never a path outside the record.
+  const resolutionCoversOnlyRecordPaths = resolutionPaths.length > 0
+    && resolutionPaths.every((path) => sourcePaths.includes(path));
+  if (!resolutionCoversOnlyRecordPaths) return false;
   if (!isCollisionRecovery) return true;
   if (
     sourceIntent.action !== "renameRemote"

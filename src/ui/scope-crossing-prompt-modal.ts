@@ -7,14 +7,15 @@
  * decision available on the next plan.
  */
 import { type App } from "obsidian";
-import { EasySyncModal } from "./easy-sync-modal";
+import {
+  addEasySyncFooterButton,
+  createEasySyncModalFooter,
+  EasySyncModal,
+} from "./easy-sync-modal";
 
 type ScopeCrossingPromptChoice = "restore" | "confirm";
 
-export class ScopeCrossingPromptModal extends EasySyncModal {
-  private resolve: ((choice: ScopeCrossingPromptChoice | null) => void) | null =
-    null;
-
+export class ScopeCrossingPromptModal extends EasySyncModal<ScopeCrossingPromptChoice | null> {
   constructor(
     app: App,
     private title: string,
@@ -27,17 +28,7 @@ export class ScopeCrossingPromptModal extends EasySyncModal {
   }
 
   awaitChoice(): Promise<ScopeCrossingPromptChoice | null> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
-  }
-
-  private finish(choice: ScopeCrossingPromptChoice | null): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    this.close();
-    resolve?.(choice);
+    return this.awaitResult();
   }
 
   onOpen(): void {
@@ -58,28 +49,27 @@ export class ScopeCrossingPromptModal extends EasySyncModal {
       });
     }
 
-    const btnRow = contentEl.createDiv("modal-button-container");
-    const restoreBtn = btnRow.createEl("button", {
-      text: this.restoreLabel,
-      cls: "mod-cta",
+    // Two positive actions, no cancel: dismissing (Escape / backdrop) is the
+    // zero-side-effect exit, so neither button carries the cancel styling.
+    const btnRow = createEasySyncModalFooter(contentEl);
+    addEasySyncFooterButton(btnRow, {
+      label: this.restoreLabel,
+      variant: "cta",
+      onClick: () => {
+        this.settle("restore");
+      },
     });
-    restoreBtn.addEventListener("click", () => {
-      this.finish("restore");
-    });
-
-    const confirmBtn = btnRow.createEl("button", {
-      text: this.confirmLabel,
-      cls: "mod-warning",
-    });
-    confirmBtn.addEventListener("click", () => {
-      this.finish("confirm");
+    addEasySyncFooterButton(btnRow, {
+      label: this.confirmLabel,
+      variant: "destructive",
+      onClick: () => {
+        this.settle("confirm");
+      },
     });
   }
 
   onClose(): void {
     // Dismissing without a choice keeps the pending-row fallback.
-    const resolve = this.resolve;
-    this.resolve = null;
-    resolve?.(null);
+    this.takePendingResolve()?.(null);
   }
 }

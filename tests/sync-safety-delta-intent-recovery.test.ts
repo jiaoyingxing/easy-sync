@@ -2779,7 +2779,80 @@ describe("Persistent remote delta state", () => {
     expect(result.mutationRecovery).toMatchObject({ state: "blocked" });
   });
 
-  // --- renameRemote whose local copy was edited after the move landed (2026-10-14) ---
+  it("retires a renameRemote whose four endpoints are all absent (2026-10-31)", async () => {
+    // The 2026-10-22 field case: the failed rename was followed by deleting the
+    // only local copy, so neither local path nor either remote path holds the
+    // file. There is no content left to protect; the record must not keep the
+    // vault blocked with nothing to decide.
+    const activeScope = {
+      ...TEST_SYNC_SCOPE,
+      accountId: "account-id",
+    };
+    const sourcePath = "a.md";
+    const targetPath = "b.md";
+    const state = makeActiveV2State([], [], {
+      mutationLedger: [{
+        intent: {
+          version: 1,
+          operationId: "op-renameremote-all-empty",
+          planRevision: 1,
+          scope: activeScope,
+          action: "renameRemote",
+          path: targetPath,
+          sourcePath,
+          expectedLocal: { exists: true, hash: "a".repeat(64), size: 3 },
+          expectedRemote: {
+            exists: true,
+            driveId: "renameremote-old-id",
+            eTag: "old-etag",
+            size: 3,
+          },
+          createdAt: 1,
+        },
+        receipt: null,
+      }],
+    });
+    const getFileMetadata = vi.fn().mockResolvedValue(undefined);
+    const getDriveItemMetadataById = vi.fn().mockResolvedValue(null);
+    const downloadFile = vi.fn().mockResolvedValue(new Uint8Array([]).buffer);
+    const getDelta = vi.fn().mockResolvedValue({
+      value: [],
+      "@odata.deltaLink": "https://graph.example/delta-renameremote-all-empty",
+    });
+    const executor = new SyncExecutor(
+      makeMockOneDrive({
+        getFileMetadata,
+        getDriveItemMetadataById,
+        downloadFile,
+        getDelta,
+      }),
+      {
+        vault: {
+          adapter: makeMockAdapter(),
+          getFiles: vi.fn().mockReturnValue([]),
+          getName: vi.fn().mockReturnValue("testVault"),
+        },
+        scanAll: vi.fn().mockResolvedValue({
+          entries: [],
+          folders: [],
+          folderScanComplete: true,
+          skippedLarge: [],
+          failedPaths: [],
+          skippedCount: 0,
+          complete: true,
+        }),
+        inspectFile: vi.fn().mockResolvedValue({ status: "missing" }),
+        shouldSyncFolderPath: vi.fn().mockReturnValue(true),
+      } as unknown as LocalScanner,
+      state,
+      "testVault",
+    );
+
+    const result = await executor.run("manual", {});
+
+    expect(state.mutationLedger).toHaveLength(0);
+    expect(result.success).toBe(true);
+  });
   // Second shape of the F20 family (field report 2026-10-13): the cloud rename
   // landed and the local file was then edited or replaced, so the plain
   // branch's "local unchanged" precondition can never hold again — every round

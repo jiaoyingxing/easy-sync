@@ -335,7 +335,8 @@ describe("settings tab", () => {
 
     expect(configSource).toContain('modalEl.addClass("easy-sync-settings-modal")');
     expect(exclusionSource).toContain('modalEl.addClass("easy-sync-settings-modal")');
-    expect(modalBlock).toContain("max-height: 80vh");
+    // 2026-10-30 弹框共享件：上限收敛为共享变量一处定义（值仍 80vh）。
+    expect(modalBlock).toContain("max-height: var(--easy-sync-modal-max-height)");
     expect(modalBlock).toContain("overflow: hidden");
     expect(contentBlock).toContain("overflow-y: auto");
     expect(contentBlock).toContain("min-height: 0");
@@ -361,7 +362,7 @@ describe("settings tab", () => {
     );
     const manager = functionBody(
       source,
-      "private renderCommunityPluginManager(column: PluginColumn): void",
+      "private renderCommunityPluginManager(",
     );
 
     expect(renderScope).toContain("renderCommunityPluginScopeSetting(");
@@ -373,9 +374,25 @@ describe("settings tab", () => {
     expect(source).toMatch(
       /setting\.nameEl\.createSpan\(\s*"easy-sync-plugin-selection-chip"/,
     );
-    expect(scopeSetting).toContain("appendExperimentalPluginDataChip(");
+    // 2026-10-30：「实验性」chip 已停止渲染（样式与 i18n key 保留），
+    // 两处挂点都必须缺席。
+    expect(scopeSetting).not.toContain("appendExperimentalPluginDataChip(");
+    expect(manager).not.toContain("appendExperimentalPluginDataChip(");
     expect(manager).toContain("this.titleEl");
-    expect(source).toContain("settings.communityPlugins.experimental");
+    expect(manager).toContain(
+      'this.titleEl.addClass("easy-sync-community-plugin-title-with-chip")',
+    );
+    expect(manager).toContain(
+      "this.managerTitleChipEl = this.titleEl.createSpan(",
+    );
+    expect(manager).toContain("this.renderCommunityPluginManagerTitleChip()");
+    expect(manager).not.toContain("easy-sync-community-plugin-data-title");
+    const listArea = functionBody(
+      source,
+      "private renderPluginListArea(): void",
+    );
+    expect(listArea).toContain("this.renderCommunityPluginManagerTitleChip()");
+    expect(source).not.toContain("settings.communityPlugins.experimental");
     expect(source).toContain("busyCommunityPluginScopeRows");
     expect(source).toContain("pendingCommunityPluginScopeValues");
     expect(source).toContain("const scopeDisabled = !this.getCommunityPluginScopeEnabled(column)");
@@ -403,6 +420,15 @@ describe("settings tab", () => {
     expect(styles).toMatch(
       /\.easy-sync-plugin-selection-chip\.is-hidden\s*\{[^}]*display:\s*none/s,
     );
+    // 手机宿主把 .modal-title 强制成 block（.is-phone .modal-title），
+    // 标题 chip 必须用更高优先级的组合选择器恢复 flex+gap。
+    expect(styles).toMatch(
+      /\.easy-sync-settings-modal \.modal-title\.easy-sync-community-plugin-title-with-chip\s*\{[^}]*display:\s*flex[^}]*gap:\s*var\(--size-4-2\)/s,
+    );
+    expect(styles).toMatch(
+      /body\.is-phone \.easy-sync-settings-modal \.modal-title\.easy-sync-community-plugin-title-with-chip\s*\{[^}]*justify-content:\s*center/s,
+    );
+    expect(styles).not.toContain("easy-sync-community-plugin-data-title");
     const selectionChipStyle = styles.match(
       /\.easy-sync-plugin-selection-chip\s*\{(?<body>[^}]*)\}/,
     )?.groups?.body ?? "";
@@ -424,8 +450,7 @@ describe("settings tab", () => {
     // 1.13+ 页面行与弹框同口径（settings-page-rows 模块头 S1 双轨）：
     // ① 行类触发 nameEl 的 flex+gap（styles.css），缺了 chip 会紧贴行名；
     // ② chip 挂点必须在最后一次 setName 之后——setName 会重写 nameEl 内容，
-    //    先挂上去的 chip 会被冲掉（真机 1.13：同步 chip 消失、实验性 chip
-    //    因创建在后而幸存）。
+    //    先挂上去的 chip 会被冲掉（真机 1.13：同步 chip 消失）。
     const source = readSourceFile("src/ui/settings-page-rows.ts");
     const fnStart = source.indexOf("export function applyCommunityPluginScopeRow(");
     const fnEnd = source.indexOf("/** 不同步的文件夹行", fnStart);
@@ -434,19 +459,81 @@ describe("settings tab", () => {
       'setting.setClass("easy-sync-community-plugin-scope-setting")',
     );
     const setNameIdx = fn.indexOf(".setName(");
-    const experimentalIdx = fn.indexOf(
-      '"easy-sync-plugin-selection-chip is-experimental"',
-    );
     const chipIdx = fn.indexOf(
       'setting.nameEl.createSpan("easy-sync-plugin-selection-chip")',
     );
     expect(setNameIdx).toBeGreaterThan(-1);
-    expect(experimentalIdx).toBeGreaterThan(setNameIdx);
-    expect(chipIdx).toBeGreaterThan(experimentalIdx);
+    expect(chipIdx).toBeGreaterThan(setNameIdx);
+    // 2026-10-30：「实验性」chip 已停止渲染，挂点不得重新出现。
+    expect(fn).not.toContain("is-experimental");
     // ③ 计数 chip 的插值参数名与模板占位符对齐（模板＝{enabled}/{total}；
     //    曾误传 selected，真机 1.14 直显「同步：{enabled}/30」）。
     expect(fn).toContain("enabled: enabledCount");
     expect(fn).not.toContain("selected:");
+  });
+
+  it("shows the selection count in both manager titles and follows pending rows", () => {
+    const chipEl = createMockElement();
+    const modal = Object.create(ConfigSyncModal.prototype) as ConfigSyncModal;
+    Object.assign(modal as object, {
+      plugin: {
+        i18n: {
+          t: (key: string, params?: Record<string, string | number>) =>
+            key === "settings.communityPlugins.selectionSummary"
+              ? `${params?.enabled}/${params?.total}`
+              : key,
+        },
+      },
+      view: "community-plugin-files",
+      inventory: [
+        { id: "calendar", local: true },
+        { id: "tasks", local: true },
+        { id: "cleaned", local: false },
+      ],
+      cleanedPluginIds: new Set(["cleaned"]),
+      inventoryLoading: false,
+      inventoryLoadFailed: false,
+      managerTitleChipEl: chipEl,
+      pendingPluginValues: new Map<string, boolean>(),
+      getCommunityPluginScopeEnabled: () => true,
+      isPluginEffectivelyEnabled: (id: string) => id === "calendar",
+    });
+    const renderTitleChip = () => (modal as unknown as {
+      renderCommunityPluginManagerTitleChip(): void;
+    }).renderCommunityPluginManagerTitleChip();
+
+    renderTitleChip();
+    // cleaned 行不计入总数；files 列按插件本体参与计数。
+    expect(chipEl.textContent).toBe("1/2");
+    expect(chipEl.classList.contains("is-hidden")).toBe(false);
+
+    // 行的待提交值先反映在标题计数里，与列表 toggle 的乐观显示一致。
+    (modal as unknown as { pendingPluginValues: Map<string, boolean> })
+      .pendingPluginValues.set("files:tasks", true);
+    renderTitleChip();
+    expect(chipEl.textContent).toBe("2/2");
+
+    // data 列只统计本体已参与的插件，且待提交值按列隔离。
+    (modal as unknown as { view: string }).view = "community-plugin-data";
+    (modal as unknown as {
+      isPluginEffectivelyEnabled: (id: string, column: string) => boolean;
+    }).isPluginEffectivelyEnabled = (id, column) =>
+      column === "files" ? id !== "cleaned" : id === "calendar";
+    renderTitleChip();
+    expect(chipEl.textContent).toBe("1/2");
+
+    (modal as unknown as { pendingPluginValues: Map<string, boolean> })
+      .pendingPluginValues.set("data:tasks", true);
+    renderTitleChip();
+    expect(chipEl.textContent).toBe("2/2");
+
+    // 外层范围关闭时不显示计数，避免把参与清单误读成正在同步。
+    (modal as unknown as {
+      getCommunityPluginScopeEnabled: (column: string) => boolean;
+    }).getCommunityPluginScopeEnabled = () => false;
+    renderTitleChip();
+    expect(chipEl.classList.contains("is-hidden")).toBe(true);
+    expect(chipEl.textContent).toBe("");
   });
 
   it("uses historical data evidence when the outer plugin-data switch rejoins scope", async () => {
@@ -636,8 +723,14 @@ describe("settings tab", () => {
     expect(source).not.toContain("extends Modal");
     expect(source).toContain('"community-plugin-files"');
     expect(source).toContain('"community-plugin-data"');
+    // 2026-10-31 用户拍板撤回去叠层实验：管理齿轮恢复叠层子弹框（关子弹框
+    // 即回范围页，无需页内返回控件）；单实例门只防同视图重复打开。
     expect(source).toContain("openCommunityPluginManagerModal");
     expect(source).toContain("new ConfigSyncModal(");
+    expect(source).not.toContain("fromScope");
+    expect(source).not.toContain("easy-sync-manager-back-bar");
+    expect(source).not.toContain("confirm.back");
+    expect(source).not.toContain("modal-setting-back-button");
     expect(source).not.toContain(".addDropdown");
     expect(source).not.toContain("requestLeave");
     expect(source).not.toContain("hasUnsavedPolicy");
@@ -906,7 +999,11 @@ describe("settings tab", () => {
       destroyed: true,
       loadGeneration: 0,
       modalEl: { addClass: vi.fn() },
-      contentEl: { empty: vi.fn() },
+      contentEl: {
+        empty: vi.fn(),
+        setAttribute: vi.fn(),
+        focus: vi.fn(),
+      },
       settingsUpdateQueue: { whenIdle: vi.fn() },
       renderScope: vi.fn(),
       handleCommunityPluginInventoryRevision: handleRevision,
@@ -1203,21 +1300,45 @@ describe("settings tab", () => {
     expect(zhCN["settings.syncCommunityPlugins.name"]).toBe("社区插件");
     expect(zhCN["settings.syncPluginData.name"]).toBe("社区插件数据");
     expect(zhCN["settings.syncCommunityPlugins.desc"]).toBe(
-      "同步社区插件安装时下载的文件（main.js、manifest.json、styles.css）；不同步启用状态。",
+      "同步插件本体（main.js、manifest.json、styles.css），不包含启用状态、插件设置及缓存数据。",
     );
     expect(en["settings.syncCommunityPlugins.desc"]).toBe(
-      "Sync the files downloaded when installing a community plugin (main.js, manifest.json, styles.css); enabled state is not synced.",
+      "Sync the plugin itself (main.js, manifest.json, styles.css); enabled state, plugin settings, and cached data are not included.",
     );
     expect(zhCN["settings.syncPluginData.desc"]).toBe(
-      "同步所选插件的设置数据。此功能尚未充分测试，可能替换其他设备上的插件设置；请先备份。",
+      "同步所选插件的设置（data.json）。开启此项的设备共用一份设置，任一处修改都会替换其他设备上的设置；需按设备区分的插件请勿纳入。",
+    );
+    expect(en["settings.syncPluginData.desc"]).toBe(
+      "Sync settings for selected plugins (data.json). Devices with this on share one copy, so a change on any device replaces the settings on the others; leave out plugins that need per-device settings.",
     );
     expect(zhCN["settings.communityPlugins.experimental"]).toBe("实验性");
     expect(en["settings.communityPlugins.experimental"]).toBe("Experimental");
+    expect(zhCN["settings.communityPlugins.data.toggleAria"]).toBe(
+      "为“{plugin}”开启数据同步",
+    );
+    expect(zhCN["settings.communityPlugins.data.restrictedAria"]).toBe(
+      "为“{plugin}”开启数据同步；确认时会同时开启插件本体",
+    );
     expect(zhCN["settings.communityPlugins.data.experimentalConfirmTitle"]).toBe(
       "开启社区插件数据同步？",
     );
+    expect(zhCN["settings.communityPlugins.data.experimentalBulkStep.shared"]).toBe(
+      "当前 {count} 个插件及以后加入的插件：共用一份设置。",
+    );
+    expect(zhCN["settings.communityPlugins.data.experimentalBulkStep.replace"]).toBe(
+      "任一设备修改设置：替换其他设备上的设置。",
+    );
+    expect(zhCN["settings.communityPlugins.data.experimentalBulkStep.conflict"]).toBe(
+      "两侧同时修改：转为冲突，需整份选择保留本机或云端；未保留的一侧修改会丢失。",
+    );
+    expect(zhCN["settings.communityPlugins.data.experimentalItemMessage"]).toBe(
+      "开启后，“{plugin}”的设置会在设备间同步，开启此项的设备共用一份设置；任一设备的修改会替换其他设备上的设置，无法按设备保留不同设置。",
+    );
+    expect(zhCN["settings.communityPlugins.data.experimentalItemWithFilesMessage"]).toBe(
+      "这会同时开启“{plugin}”的插件本体和数据同步。该插件的设置会在设备间同步，开启此项的设备共用一份设置，任一设备的修改会替换其他设备上的设置。",
+    );
     expect(zhCN["settings.communityPlugins.data.experimentalConfirm"]).toBe(
-      "了解风险并开启",
+      "了解并开启",
     );
     expect(zhCN["settings.communityPlugins.data.experimentalWarning"]).toBe(
       "请先备份各设备上的插件设置。",
@@ -1241,7 +1362,7 @@ describe("settings tab", () => {
       "Syncing: {enabled}/{total}",
     );
     expect(en["settings.communityPlugins.data.experimentalConfirm"]).toBe(
-      "I understand the risk — turn it on",
+      "I understand — turn it on",
     );
     expect(zhCN["settings.communityPlugins.status.localOnly"]).toBe(
       "插件仅本机有",

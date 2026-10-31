@@ -20,8 +20,6 @@ interface VaultJoinRepositoryListViews {
 }
 
 export class VaultJoinRepositoryListModal extends EasySyncModal {
-  private resolve: (() => void) | null = null;
-
   constructor(
     app: App,
     private views: VaultJoinRepositoryListViews,
@@ -31,10 +29,7 @@ export class VaultJoinRepositoryListModal extends EasySyncModal {
   }
 
   awaitAction(): Promise<void> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
+    return this.awaitResult();
   }
 
   onOpen(): void {
@@ -74,10 +69,8 @@ export class VaultJoinRepositoryListModal extends EasySyncModal {
     }
   }
 
-  onClose(): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    resolve?.();
+  override onClose(): void {
+    this.takePendingResolve()?.();
   }
 
   private async copyName(name: string): Promise<void> {

@@ -8,7 +8,6 @@ import {
   mutationRecoveryBodyPresentation,
   mutationRecoveryStatusDetail,
   mutationRecoveryStatusLabel,
-  resolveMoveNoActionHints,
   resolveOrdinaryResolutionActions,
   mutationRecoveryTopStatusLabel,
   mutationRecoveryPrimaryActionKey,
@@ -439,40 +438,174 @@ describe("folder recovery settle exit presentation", () => {
   });
 });
 
-describe("resolveMoveNoActionHints (2026-10-13 field report)", () => {
-  it("states both directions while the cloud still holds the old path", () => {
-    expect(resolveMoveNoActionHints({
-      sourcePath: "无标题 2.md",
-      remoteSourceExists: true,
-    })).toEqual(["keep-local", "keep-remote"]);
+describe("resolveOrdinaryResolutionActions (2026-10-31 move shapes)", () => {
+  const sourcePath = "情感勒索.md";
+  const targetPath = "心理学习/情感勒索.md";
+
+  function moveSnapshot(options: {
+    localSource?: boolean;
+    localTarget?: boolean;
+    remoteSource?: boolean;
+    remoteTarget?: boolean;
+    localHash?: string;
+    remoteHash?: string;
+    keepLocalAvailable?: boolean;
+    keepRemoteAvailable?: boolean;
+    recoveryEvidence?: boolean;
+  }): ManualMutationResolutionSnapshotV1 {
+    const localHash = options.localHash ?? "a".repeat(64);
+    const remoteHash = options.remoteHash ?? "a".repeat(64);
+    const local = [
+      options.localSource
+        ? { path: sourcePath, exists: true, hash: localHash, size: 12_300 }
+        : { path: sourcePath, exists: false },
+      options.localTarget
+        ? { path: targetPath, exists: true, hash: localHash, size: 12_300 }
+        : { path: targetPath, exists: false },
+    ];
+    const remote = [
+      options.remoteSource
+        ? {
+            path: sourcePath,
+            exists: true,
+            driveId: "drive-source",
+            eTag: "etag-source",
+            hash: remoteHash,
+            size: 12_300,
+          }
+        : { path: sourcePath, exists: false },
+      options.remoteTarget
+        ? {
+            path: targetPath,
+            exists: true,
+            driveId: "drive-target",
+            eTag: "etag-target",
+            hash: remoteHash,
+            size: 12_300,
+          }
+        : { path: targetPath, exists: false },
+    ];
+    return {
+      version: 1,
+      sourceOperationId: "1792661471166-283-renameRemote",
+      scope: {
+        accountId: "account",
+        driveId: "drive",
+        vaultFolderId: "vault-folder",
+        filesRootId: "files-root",
+      },
+      previousAction: "renameRemote",
+      path: targetPath,
+      sourcePath,
+      local,
+      remote,
+      factsDigest: "digest",
+      identical: false,
+      keepLocal: {
+        available: options.keepLocalAvailable ?? true,
+        deletesOtherSide: false,
+      },
+      keepRemote: {
+        available: options.keepRemoteAvailable ?? true,
+        deletesOtherSide: false,
+      },
+      ...(options.recoveryEvidence
+        ? {
+            recoveryEvidence: {
+              kind: "receipted-rename-target-anchor-collision" as const,
+              lifecycleEpoch: 1,
+              sourceCommitSeq: 1,
+              sourceAnchorId: "source-anchor",
+              targetAnchorId: "target-anchor",
+              staleRemoteIds: ["stale"],
+            },
+          }
+        : {}),
+    };
+  }
+
+  it("names the operation when only the cloud copy survives", () => {
+    const actions = resolveOrdinaryResolutionActions(moveSnapshot({
+      remoteSource: true,
+    }));
+    expect(actions?.map((action) => action.labelKey)).toEqual([
+      "syncView.mutationResolution.action.deleteRemote",
+      "syncView.mutationResolution.action.download",
+    ]);
+    expect(actions?.map((action) => action.choice)).toEqual([
+      "keep-local",
+      "keep-remote",
+    ]);
+    expect(actions?.map((action) => action.className)).toEqual([
+      "mod-warning",
+      "mod-cta",
+    ]);
   });
 
-  it("drops the keep-cloud sentence once the cloud already holds the moved name", () => {
-    // The sentence promises the file at the old cloud path and its return to
-    // the old local path; after the rename landed that path is gone, so the
-    // modal must not promise it (the field report read exactly this line).
-    expect(resolveMoveNoActionHints({
-      sourcePath: "无标题 2.md",
-      remoteSourceExists: false,
-    })).toEqual(["keep-local"]);
+  it("names the operation when only the local copy survives", () => {
+    const actions = resolveOrdinaryResolutionActions(moveSnapshot({
+      localTarget: true,
+    }));
+    expect(actions?.map((action) => action.labelKey)).toEqual([
+      "syncView.mutationResolution.action.deleteLocal",
+      "syncView.mutationResolution.action.upload",
+    ]);
+    expect(actions?.map((action) => action.choice)).toEqual([
+      "keep-remote",
+      "keep-local",
+    ]);
+    expect(actions?.map((action) => action.className)).toEqual([
+      "mod-warning",
+      "mod-cta",
+    ]);
   });
 
-  it("renders no move hint without a source path", () => {
-    expect(resolveMoveNoActionHints({
-      sourcePath: null,
-      remoteSourceExists: true,
-    })).toEqual([]);
+  it("keeps the location wording when both copies are identical", () => {
+    const actions = resolveOrdinaryResolutionActions(moveSnapshot({
+      localTarget: true,
+      remoteSource: true,
+    }));
+    expect(actions?.map((action) => action.labelKey)).toEqual([
+      "syncView.mutationResolution.keepLocal",
+      "syncView.mutationResolution.keepRemote",
+    ]);
+    expect(actions?.every((action) => action.className === null)).toBe(true);
   });
 
-  it("keeps the modal wired to the resolver", () => {
+  it("uses the version wording when the two copies diverged", () => {
+    const actions = resolveOrdinaryResolutionActions(moveSnapshot({
+      localTarget: true,
+      remoteSource: true,
+      localHash: "b".repeat(64),
+    }));
+    expect(actions?.map((action) => action.labelKey)).toEqual([
+      "syncView.mutationResolution.keepLocalVersion",
+      "syncView.mutationResolution.keepRemoteVersion",
+    ]);
+    expect(actions?.every((action) => action.className === null)).toBe(true);
+  });
+
+  it("drops an unavailable direction instead of rendering it", () => {
+    const actions = resolveOrdinaryResolutionActions(moveSnapshot({
+      localTarget: true,
+      remoteSource: true,
+      keepRemoteAvailable: false,
+    }));
+    expect(actions?.map((action) => action.choice)).toEqual(["keep-local"]);
+  });
+
+  it("keeps the modal wired to the resolver and drops the old prose hints", () => {
     // No DOM harness exists in this repo, so the render wiring is pinned by
-    // source shape: the modal must ask the resolver instead of rendering both
-    // sentences unconditionally.
+    // source shape: the modal must ask the resolver, and the old
+    // "delete this side" sentences must be gone (2026-10-31 field case).
     const modal = readFileSync(
       path.resolve(__dirname, "../src/ui/mutation-recovery-resolution-modal.ts"),
       "utf8",
     );
-    expect(modal).toContain("resolveMoveNoActionHints(");
+    expect(modal).toContain("resolveOrdinaryResolutionActions(");
+    expect(modal).not.toContain("resolveMoveNoActionHints(");
+    expect(modal).toContain("noAvailableActionsMoveDiverged");
+    expect(modal).toContain("noAvailableActionsMoveMismatch");
   });
 });
 
@@ -530,18 +663,19 @@ describe("resolveOrdinaryResolutionActions (2026-10-25 empty-side naming)", () =
     );
 
     // The old buttons said "keep local" / "keep cloud"; keeping an empty local
-    // side deletes the cloud copy, so the labels must name the operation.
+    // side deletes the cloud copy, so the labels must name the operation, and
+    // the CTA sits last (DOM secondary → primary). 2026-10-31.
     expect(actions?.map((action) => action.labelKey)).toEqual([
-      "syncView.mutationResolution.action.download",
       "syncView.mutationResolution.action.deleteRemote",
+      "syncView.mutationResolution.action.download",
     ]);
     expect(actions?.map((action) => action.choice)).toEqual([
-      "keep-remote",
       "keep-local",
+      "keep-remote",
     ]);
     expect(actions?.map((action) => action.className)).toEqual([
-      "mod-cta",
       "mod-warning",
+      "mod-cta",
     ]);
   });
 
@@ -551,16 +685,16 @@ describe("resolveOrdinaryResolutionActions (2026-10-25 empty-side naming)", () =
     );
 
     expect(actions?.map((action) => action.labelKey)).toEqual([
-      "syncView.mutationResolution.action.upload",
       "syncView.mutationResolution.action.deleteLocal",
+      "syncView.mutationResolution.action.upload",
     ]);
     expect(actions?.map((action) => action.choice)).toEqual([
-      "keep-local",
       "keep-remote",
+      "keep-local",
     ]);
     expect(actions?.map((action) => action.className)).toEqual([
-      "mod-cta",
       "mod-warning",
+      "mod-cta",
     ]);
   });
 
@@ -578,12 +712,15 @@ describe("resolveOrdinaryResolutionActions (2026-10-25 empty-side naming)", () =
     expect(actions?.every((action) => action.className === null)).toBe(true);
   });
 
-  it("leaves move-style and whole-bundle reviews on their own wording", () => {
-    expect(resolveOrdinaryResolutionActions(
-      snapshotFor({ local: true, remote: true, sourcePath: "old/a.md" }),
-    )).toBeNull();
+  it("leaves whole-bundle reviews on their own wording", () => {
     expect(resolveOrdinaryResolutionActions(
       snapshotFor({ local: true, remote: true, bundle: true }),
+    )).toBeNull();
+    // A move-style review with one copy per side but different content has no
+    // executable single-step settlement yet; the caller keeps the honest
+    // "do not delete either side" body (2026-10-31).
+    expect(resolveOrdinaryResolutionActions(
+      snapshotFor({ local: true, remote: true, sourcePath: "old/a.md" }),
     )).toBeNull();
   });
 
@@ -591,7 +728,10 @@ describe("resolveOrdinaryResolutionActions (2026-10-25 empty-side naming)", () =
     const zh = new I18n("zh-cn");
     expect(zh.t("syncView.mutationResolution.title")).toBe("选择以哪一侧为准");
     expect(zh.t("syncView.mutationResolution.description")).toBe(
-      "上次操作的结果已无法自动确认。请核对两侧当前状态后选择。",
+      "上次操作结果无法确认，请核对后选择。",
+    );
+    expect(zh.t("syncView.mutationResolution.deleteConfirmWarning")).toBe(
+      "执行前会再核对两侧，有变化就停止。",
     );
     expect(zh.t("syncView.mutationResolution.action.deleteRemote")).toBe(
       "删除云端文件",
@@ -606,6 +746,12 @@ describe("resolveOrdinaryResolutionActions (2026-10-25 empty-side naming)", () =
     });
     expect(message).toContain("只存在于云端");
     expect(message).toContain("都不再有这份文件");
+    expect(zh.t("syncView.mutationResolution.noAvailableActionsMoveDiverged"))
+      .toContain("请不要删除任何一侧");
+    expect(zh.t("syncView.mutationResolution.noAvailableActionsMoveMismatch", {
+      localCount: 2,
+      remoteCount: 1,
+    })).toContain("本机 2 份、云端 1 份");
 
     // The reason line moved out of the collapsed evidence into the body and no
     // longer repeats the path (2026-08-16: the path shows in the table once).
@@ -618,5 +764,6 @@ describe("resolveOrdinaryResolutionActions (2026-10-25 empty-side naming)", () =
       /body\.createEl\("p", \{\s*text: this\.t\("syncView\.mutationResolution\.description"\)/,
     );
     expect(modal).not.toContain('"syncView.mutationResolution.description", {');
+    expect(modal).not.toContain("noAvailableActionsKeepLocal");
   });
 });

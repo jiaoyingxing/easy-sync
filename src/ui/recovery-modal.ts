@@ -649,30 +649,15 @@ export class RecoveryModal extends EasySyncModal {
     row.createSpan({ text });
   }
 
-  /** 单实例门：同一目标已开＝拒绝重复打开（不叠层）；换目标＝关旧开新。 */
-  private static activeInstance: RecoveryModal | null = null;
-
+  /** 单实例门（2026-10-30 抽为基类共享件）：同一目标已开＝拒绝重复打开
+     （不叠层）；换目标＝关旧开新。 */
   override open(): void {
-    const active = RecoveryModal.activeInstance;
-    if (active !== null && active !== this) {
-      if (active.options.path === this.options.path) return;
-      active.close();
-    }
-    RecoveryModal.activeInstance = this;
+    if (!this.takeOverSingleInstance(this.options.path ?? null, { replace: true })) return;
     super.open();
   }
 
-  override close(): void {
-    if (RecoveryModal.activeInstance === this) {
-      RecoveryModal.activeInstance = null;
-    }
-    super.close();
-  }
-
   override onClose(): void {
-    if (RecoveryModal.activeInstance === this) {
-      RecoveryModal.activeInstance = null;
-    }
+    this.releaseSingleInstance();
   }
 
   private enumerate: undefined;

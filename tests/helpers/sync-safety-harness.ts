@@ -14,6 +14,7 @@ import { sameSyncScope, SyncActionType } from "../../src/sync/types";
 import { planDigest } from "../../src/sync/types";
 import type {
   BaseFileEntry,
+  FileConsolidationSettlementV2,
   LocalFileEntry,
   ManualMutationResolutionV1,
   MutationIntentV1,
@@ -783,8 +784,26 @@ export function makeActiveV2State(
     const record = state.mutationLedger.find(
       (candidate) => candidate.intent.operationId === sourceOperationId,
     ) as MutationLedgerEntryV1 | undefined;
-    if (!record?.manualResolution) throw new Error("manual resolution missing");
+    if (!record?.manualResolution || record.manualResolution.version !== 1) {
+      throw new Error("manual resolution missing");
+    }
     record.manualResolution.receipt = structuredClone(receipt);
+  });
+  state.recordFileConsolidationStepReceipt = vi.fn(async (
+    sourceOperationId: string,
+    stepIndex: 0 | 1,
+    receipt: MutationReceiptV1,
+  ) => {
+    const record = state.mutationLedger.find(
+      (candidate) => candidate.intent.operationId === sourceOperationId,
+    ) as MutationLedgerEntryV1 | undefined;
+    const manual = record?.manualResolution;
+    if (!manual || manual.version !== 2 || manual.kind !== "file-consolidation") {
+      throw new Error("file consolidation missing");
+    }
+    const step = manual.steps[stepIndex];
+    if (!step || step.receipt) throw new Error("file consolidation step missing");
+    step.receipt = structuredClone(receipt);
   });
   state.commitManualMutationResolutionCheckpoint = vi.fn(async (
     sourceOperationId: string,
@@ -793,12 +812,79 @@ export function makeActiveV2State(
       (record) => record.intent.operationId === sourceOperationId,
     );
     const record = state.mutationLedger[index] as MutationLedgerEntryV1 | undefined;
-    if (index < 0 || !record?.manualResolution?.receipt) {
+    const manual = record?.manualResolution;
+    if (index < 0 || !record || !manual) {
+      throw new Error(`Manual mutation receipt missing: ${sourceOperationId}`);
+    }
+    let commitIntent: MutationIntentV1;
+    let commitReceipt: MutationReceiptV1;
+    if (manual.version === 1) {
+      if (!manual.receipt) {
+        throw new Error(`Manual mutation receipt missing: ${sourceOperationId}`);
+      }
+      commitIntent = manual.intent;
+      commitReceipt = manual.receipt;
+    } else if (manual.kind === "file-consolidation") {
+      const settlement = manual as FileConsolidationSettlementV2;
+      const [first, second] = settlement.steps;
+      if (!first.receipt || !second.receipt) {
+        throw new Error(`Manual mutation receipt missing: ${sourceOperationId}`);
+      }
+      const keepLocal = settlement.choice === "keep-local";
+      const winnerPath = keepLocal ? record.intent.path : record.intent.sourcePath!;
+      const loserPath = keepLocal ? record.intent.sourcePath! : record.intent.path;
+      const winnerBase = first.receipt.checkpoint.baseUpserts[0];
+      const winnerRemote = keepLocal
+        ? first.receipt.checkpoint.remoteUpserts[0]
+        : state.remoteSnapshot.find((entry) => entry.path === winnerPath);
+      if (!winnerBase || !winnerRemote) {
+        throw new Error("file consolidation winner missing");
+      }
+      commitIntent = {
+        ...record.intent,
+        operationId: `${record.intent.operationId}-consolidation`,
+        action: "upload",
+        path: winnerPath,
+        sourcePath: loserPath,
+        expectedLocal: {
+          exists: true,
+          hash: winnerBase.hash,
+          size: winnerBase.size,
+        },
+        expectedRemote: {
+          exists: true,
+          driveId: winnerRemote.driveId,
+          eTag: winnerRemote.eTag,
+          size: winnerRemote.size,
+        },
+        createdAt: settlement.selectedAt,
+      };
+      commitReceipt = {
+        version: 1,
+        operationId: commitIntent.operationId,
+        completedAt: Math.max(
+          first.receipt.completedAt,
+          second.receipt.completedAt,
+        ),
+        checkpoint: {
+          baseUpserts: [winnerBase],
+          baseRemovals: keepLocal
+            ? [...second.receipt.checkpoint.baseRemovals]
+            : [loserPath],
+          remoteUpserts: [winnerRemote],
+          remoteDeletes: keepLocal
+            ? [...second.receipt.checkpoint.remoteDeletes]
+            : [loserPath],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      };
+    } else {
       throw new Error(`Manual mutation receipt missing: ${sourceOperationId}`);
     }
     envelope = reduceFileStateEnvelopeV2(envelope, {
-      intent: record.manualResolution.intent,
-      receipt: record.manualResolution.receipt,
+      intent: commitIntent,
+      receipt: commitReceipt,
     });
     commitSeq = envelope.meta.commitSeq;
     committedAt = envelope.meta.committedAt;

@@ -626,6 +626,169 @@ describe("main sync entry guards", () => {
     ).toBeNull();
   });
 
+  it("keeps the subtree reconstruction continuation silent while automatic sync is off", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 0;
+    plugin.setAutoSyncChangeDelaySeconds(0);
+    plugin.autoSyncOnStartup = false; // 三条通道全零：总开关为关
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.state = {
+      isV2StateActive: true,
+      hasV2StateLoadRecoveryBlock: false,
+      planReviewActive: false,
+      confirmedDescendantFileReconstruction: {
+        version: 1,
+        kind: "confirmed-descendant-file-reconstruction",
+        roots: [{
+          path: ".obsidian/plugins",
+          remoteId: "plugins",
+          confirmedGeneration: 1,
+        }],
+      },
+      mutationLedger: [],
+    } as never;
+    vi.spyOn(plugin as never, "checkAccountBindingForSync")
+      .mockResolvedValue(true);
+    vi.spyOn(plugin as never, "beginSyncNotice")
+      .mockImplementation(() => undefined);
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    const requested = (plugin as never as {
+      requestDescendantFileReconstructionContinuation: (
+        trigger: string,
+      ) => boolean;
+    }).requestDescendantFileReconstructionContinuation("state-loaded");
+
+    expect(requested).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("keeps the subtree reconstruction continuation silent while auto sync is paused", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 10; // 总开关为开，但自动同步处于暂停
+    plugin.autoSyncPaused = true;
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.state = {
+      isV2StateActive: true,
+      hasV2StateLoadRecoveryBlock: false,
+      planReviewActive: false,
+      confirmedDescendantFileReconstruction: {
+        version: 1,
+        kind: "confirmed-descendant-file-reconstruction",
+        roots: [{
+          path: ".obsidian/plugins",
+          remoteId: "plugins",
+          confirmedGeneration: 1,
+        }],
+      },
+      mutationLedger: [],
+    } as never;
+    vi.spyOn(plugin as never, "checkAccountBindingForSync")
+      .mockResolvedValue(true);
+    vi.spyOn(plugin as never, "beginSyncNotice")
+      .mockImplementation(() => undefined);
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    const requested = (plugin as never as {
+      requestDescendantFileReconstructionContinuation: (
+        trigger: string,
+      ) => boolean;
+    }).requestDescendantFileReconstructionContinuation("state-loaded");
+
+    expect(requested).toBe(false);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(run).not.toHaveBeenCalled();
+  });
+
+  it("still resumes the subtree reconstruction continuation under an enabled master", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 10;
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.state = {
+      isV2StateActive: true,
+      hasV2StateLoadRecoveryBlock: false,
+      planReviewActive: false,
+      confirmedDescendantFileReconstruction: {
+        version: 1,
+        kind: "confirmed-descendant-file-reconstruction",
+        roots: [{
+          path: ".obsidian/plugins",
+          remoteId: "plugins",
+          confirmedGeneration: 1,
+        }],
+      },
+      mutationLedger: [],
+    } as never;
+    vi.spyOn(plugin as never, "checkAccountBindingForSync")
+      .mockResolvedValue(true);
+    vi.spyOn(plugin as never, "beginSyncNotice")
+      .mockImplementation(() => undefined);
+    vi.spyOn(plugin as never, "updateStatusBar")
+      .mockImplementation(() => undefined);
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    const requested = (plugin as never as {
+      requestDescendantFileReconstructionContinuation: (
+        trigger: string,
+      ) => boolean;
+    }).requestDescendantFileReconstructionContinuation("state-loaded");
+
+    expect(requested).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls[0]?.[0]).toBe("auto");
+  });
+
+  it("cancels a pending subtree reconstruction continuation when auto sync stops", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    plugin.syncInterval = 10;
+    plugin.auth = { authState: { isLoggedIn: true } } as never;
+    plugin.state = {
+      isV2StateActive: true,
+      hasV2StateLoadRecoveryBlock: false,
+      planReviewActive: false,
+      confirmedDescendantFileReconstruction: {
+        version: 1,
+        kind: "confirmed-descendant-file-reconstruction",
+        roots: [{
+          path: ".obsidian/plugins",
+          remoteId: "plugins",
+          confirmedGeneration: 1,
+        }],
+      },
+      mutationLedger: [],
+    } as never;
+    vi.spyOn(plugin as never, "checkAccountBindingForSync")
+      .mockResolvedValue(true);
+    vi.spyOn(plugin as never, "beginSyncNotice")
+      .mockImplementation(() => undefined);
+    const run = vi.fn().mockResolvedValue(okResult());
+    plugin.syncExecutor = { isRunning: false, run } as never;
+
+    expect((plugin as never as {
+      requestDescendantFileReconstructionContinuation: (
+        trigger: string,
+      ) => boolean;
+    }).requestDescendantFileReconstructionContinuation("state-loaded")).toBe(true);
+
+    // 计时器还没到点，用户关掉自动同步。
+    plugin.syncInterval = 0;
+    plugin.setAutoSyncChangeDelaySeconds(0);
+    plugin.autoSyncOnStartup = false;
+    plugin.stopAutoSync();
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it("continues corrupt-state recovery with the same sealed review authorization", async () => {
     const plugin = makePlugin();
     vi.spyOn(plugin as never, "beginSyncNotice").mockImplementation(() => undefined);

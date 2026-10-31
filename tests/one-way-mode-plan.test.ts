@@ -1360,8 +1360,8 @@ describe("local-only copy label", () => {
   });
 
   it("pins the keep-on-device action label in both locales", () => {
-    expect(zhCN["syncView.localOnly.keep"]).toBe("留在本机，不再提醒");
-    expect(en["syncView.localOnly.keep"]).toBe("Keep on this device, no more reminders");
+    expect(zhCN["syncView.localOnly.keep"]).toBe("留在本机");
+    expect(en["syncView.localOnly.keep"]).toBe("Keep on this device");
   });
 });
 

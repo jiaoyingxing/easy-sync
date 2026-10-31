@@ -121,6 +121,10 @@ export function createMockElement(): HTMLElement {
     element.children = [];
     return element;
   };
+  // Focus/blur are no-ops: the stub never participates in real focus flow,
+  // but keepModalFocusOnBody calls focus() in a microtask after onOpen.
+  element.focus = () => undefined;
+  element.blur = () => undefined;
   // Element-level class helpers share the classList token set, mirroring the
   // real DOM (Obsidian's addClass writes through to classList).
   element.addClass = (...tokens: string[]) => {
@@ -299,31 +303,165 @@ export class PluginSettingTab {
   hide(): void {}
 }
 
-export class ButtonComponent {
-  buttonEl = {
-    classList: { add: () => undefined },
-    addClass: () => undefined,
-    setAttribute: () => undefined,
-    empty: () => undefined,
-    createSpan: (_fields?: { cls?: string; text?: string }) => createMockElement(),
-  } as unknown as HTMLButtonElement;
+/**
+ * Attach the Obsidian-style element helpers that production code calls on
+ * HTMLElement (addClass / toggleClass / …) onto a real DOM node, so modal
+ * structure tests run against real DOM without jsdom. Existing helper
+ * implementations (real Obsidian host) are left untouched.
+ */
+function augmentRealElement(el: HTMLElement): HTMLElement {
+  const extended = el as HTMLElement & Record<string, unknown>;
+  if (typeof extended.classList !== "object" || extended.classList === null) {
+    const tokens = new Set<string>();
+    extended.classList = {
+      add: (...added: string[]) => {
+        for (const token of added) tokens.add(token);
+      },
+      remove: (...removed: string[]) => {
+        for (const token of removed) tokens.delete(token);
+      },
+      contains: (token: string) => tokens.has(token),
+    } as unknown as DOMTokenList;
+  }
+  const classList = extended.classList as unknown as {
+    add: (...tokens: string[]) => void;
+  };
+  if (typeof extended.addClass !== "function") {
+    extended.addClass = (...tokens: string[]) => {
+      classList.add(...tokens);
+      return el;
+    };
+  }
+  if (typeof extended.removeClass !== "function") {
+    extended.removeClass = (...tokens: string[]) => {
+      el.classList.remove(...tokens);
+      return el;
+    };
+  }
+  if (typeof extended.toggleClass !== "function") {
+    extended.toggleClass = (token: string, force?: boolean) => {
+      const tokens = extended.classList as unknown as {
+        contains(token: string): boolean;
+        add(...tokens: string[]): void;
+        remove(...tokens: string[]): void;
+      };
+      const on = force === undefined ? !tokens.contains(token) : force;
+      if (on) tokens.add(token);
+      else tokens.remove(token);
+      return el;
+    };
+  }
+  if (typeof extended.setText !== "function") {
+    extended.setText = (text: string | DocumentFragment) => {
+      el.textContent = text as string;
+      return el;
+    };
+  }
+  if (typeof extended.getText !== "function") {
+    extended.getText = () => el.textContent ?? "";
+  }
+  if (typeof extended.createDiv !== "function") {
+    extended.createDiv = (cls?: string) => {
+      const child = document.createElement("div");
+      if (cls) child.className = cls;
+      el.appendChild(child);
+      return child;
+    };
+  }
+  if (typeof extended.createSpan !== "function") {
+    extended.createSpan = (cls?: string) => {
+      const child = document.createElement("span");
+      if (cls) child.className = cls;
+      el.appendChild(child);
+      return child;
+    };
+  }
+  if (typeof extended.createEl !== "function") {
+    extended.createEl = (
+      tag: keyof HTMLElementTagNameMap,
+      fields?: { cls?: string; text?: string },
+    ) => {
+      const child = document.createElement(tag);
+      if (fields?.cls) child.className = fields.cls;
+      if (fields?.text !== undefined) child.textContent = fields.text;
+      el.appendChild(child);
+      return child;
+    };
+  }
+  return el;
+}
 
-  constructor(_containerEl: HTMLElement) {}
-  setButtonText(_text: string): this { return this; }
-  setClass(_cls: string): this { return this; }
+/**
+ * Renders a `<button>` through the container's own createEl, mirroring the
+ * host's ButtonComponent: modal tests read the real classList of footer
+ * buttons, and the recording wrappers tests install on contentEl.createEl
+ * keep structure assertions working. A plain-DOM fallback covers containers
+ * without createEl.
+ */
+export class ButtonComponent {
+  buttonEl: HTMLButtonElement;
+
+  constructor(containerEl?: HTMLElement) {
+    const candidate = containerEl as unknown as
+      | { createEl?: (tag: string) => HTMLElement; appendChild?: (c: unknown) => unknown }
+      | undefined;
+    let button: HTMLElement;
+    if (typeof candidate?.createEl === "function") {
+      button = augmentRealElement(candidate.createEl("button"));
+    } else if (typeof document !== "undefined") {
+      button = augmentRealElement(document.createElement("button"));
+      candidate?.appendChild?.(button);
+    } else {
+      // No DOM in this test environment: fall back to the bare element stub.
+      button = createMockElement();
+      candidate?.appendChild?.(button);
+    }
+    this.buttonEl = button as HTMLButtonElement;
+  }
+
+  setButtonText(text: string): this {
+    this.buttonEl.textContent = text;
+    return this;
+  }
+
+  setClass(cls: string): this {
+    this.buttonEl.classList.add(...cls.split(/\s+/).filter(Boolean));
+    return this;
+  }
+
   setIcon(_icon: string): this { return this; }
   setTooltip(_tooltip: string): this { return this; }
-  setDisabled(_disabled: boolean): this { return this; }
-  setWarning(): this { return this; }
+  setDisabled(disabled: boolean): this {
+    this.buttonEl.disabled = disabled;
+    return this;
+  }
+  setWarning(): this {
+    this.buttonEl.classList.add("mod-warning");
+    return this;
+  }
   // NOTE: `setDestructive` exists only on Obsidian 1.13.0+ hosts. This mock
   // exposes it unconditionally, so any test that calls it directly would pass
   // here but throw on 1.11.4–1.12.x. Production code must go through
   // `applyDestructiveButton` (src/ui/destructive-button.ts), which gates on
   // the runtime capability and falls back to `mod-warning` — never call
   // `button.setDestructive()` directly.
-  setDestructive(): this { return this; }
-  setCta(): this { return this; }
-  onClick(_callback: () => void | Promise<void>): this { return this; }
+  setDestructive(): this {
+    this.buttonEl.classList.add("mod-warning");
+    return this;
+  }
+  setCta(): this {
+    this.buttonEl.classList.add("mod-cta");
+    return this;
+  }
+  onClick(callback: () => void | Promise<void>): this {
+    const el = this.buttonEl as unknown as {
+      addEventListener?: (type: string, cb: () => void) => void;
+    };
+    el.addEventListener?.("click", () => {
+      void callback();
+    });
+    return this;
+  }
 }
 
 export class ToggleComponent {

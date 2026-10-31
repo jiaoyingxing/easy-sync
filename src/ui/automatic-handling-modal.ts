@@ -1,6 +1,6 @@
 import { Notice, Setting } from "obsidian";
 import type EasySyncPlugin from "../main";
-import { EasySyncModal } from "./easy-sync-modal";
+import { EasySyncModal, keepModalFocusOnBody } from "./easy-sync-modal";
 
 export class AutomaticHandlingModal extends EasySyncModal {
   constructor(private plugin: EasySyncPlugin) {
@@ -13,6 +13,7 @@ export class AutomaticHandlingModal extends EasySyncModal {
     contentEl.empty();
     contentEl.addClass("easy-sync-automatic-handling");
     this.setTitle(t("settings.automaticHandling.title"));
+    keepModalFocusOnBody(this);
 
     contentEl.createEl("p", {
       text: t("settings.automaticHandling.intro"),

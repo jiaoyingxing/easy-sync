@@ -43,11 +43,61 @@ describe("diagnostic report evidence", () => {
     expect(rendered).not.toContain(rawDatabaseId);
   });
 
-  it("does not claim local-change triggering is active when automatic sync is off", () => {
+  it("describes the master switch by every enabled channel, not the interval alone", () => {
+    // 总开关是三条通道的派生态：定时为零不代表自动同步已关闭。
     expect(formatDiagnosticAutomaticSyncSummary({
       intervalMinutes: 0,
       paused: false,
       changeDelaySeconds: 7,
+      startupSyncEnabled: false,
+      dirtyPending: false,
+      activity: "空闲",
+    })).toEqual([
+      "**自动同步**: 运行中（修改后触发）",
+      "**修改后触发同步**: 本机变化后等待 7 秒（当前无待处理变化）/ 当前状态：空闲",
+    ]);
+
+    expect(formatDiagnosticAutomaticSyncSummary({
+      intervalMinutes: 0,
+      paused: false,
+      changeDelaySeconds: 0,
+      startupSyncEnabled: true,
+      dirtyPending: false,
+      activity: "空闲",
+    })).toEqual([
+      "**自动同步**: 运行中（启动后立即同步）",
+      "**修改后触发同步**: 已关闭",
+    ]);
+
+    expect(formatDiagnosticAutomaticSyncSummary({
+      intervalMinutes: 3,
+      paused: false,
+      changeDelaySeconds: 7,
+      startupSyncEnabled: true,
+      dirtyPending: true,
+      activity: "同步中",
+    })).toEqual([
+      "**自动同步**: 运行中（每 3 分钟；修改后触发；启动后立即同步）",
+      "**修改后触发同步**: 本机变化后等待 7 秒（已有待处理变化）/ 当前状态：同步中",
+    ]);
+
+    expect(formatDiagnosticAutomaticSyncSummary({
+      intervalMinutes: 3,
+      paused: false,
+      changeDelaySeconds: 0,
+      startupSyncEnabled: false,
+      dirtyPending: false,
+      activity: "空闲",
+    })).toEqual([
+      "**自动同步**: 运行中（每 3 分钟）",
+      "**修改后触发同步**: 已关闭",
+    ]);
+
+    expect(formatDiagnosticAutomaticSyncSummary({
+      intervalMinutes: 0,
+      paused: false,
+      changeDelaySeconds: 0,
+      startupSyncEnabled: false,
       dirtyPending: false,
       activity: "空闲",
     })).toEqual([
@@ -56,25 +106,15 @@ describe("diagnostic report evidence", () => {
     ]);
 
     expect(formatDiagnosticAutomaticSyncSummary({
-      intervalMinutes: 3,
-      paused: false,
+      intervalMinutes: 0,
+      paused: true,
       changeDelaySeconds: 7,
-      dirtyPending: true,
-      activity: "同步中",
-    })).toEqual([
-      "**自动同步**: 运行中（每 3 分钟）",
-      "**修改后触发同步**: 本机变化后等待 7 秒（已有待处理变化）/ 当前状态：同步中",
-    ]);
-
-    expect(formatDiagnosticAutomaticSyncSummary({
-      intervalMinutes: 3,
-      paused: false,
-      changeDelaySeconds: 0,
+      startupSyncEnabled: false,
       dirtyPending: false,
       activity: "空闲",
     })).toEqual([
-      "**自动同步**: 运行中（每 3 分钟）",
-      "**修改后触发同步**: 已关闭",
+      "**自动同步**: 已暂停",
+      "**修改后触发同步**: 本机变化后等待 7 秒（当前无待处理变化）/ 当前状态：空闲",
     ]);
   });
 

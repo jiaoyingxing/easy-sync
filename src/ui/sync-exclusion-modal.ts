@@ -5,11 +5,20 @@ import {
   Setting,
   TFolder,
 } from "obsidian";
-import type { DropdownComponent, TextComponent } from "obsidian";
+import type { ButtonComponent, DropdownComponent, TextComponent } from "obsidian";
 import type EasySyncPlugin from "../main";
 import { SyncPathSettingsUpdateError } from "../sync/sync-path-settings-error";
 import { getConfigDir } from "../obsidian-compat";
 import { EasySyncModal } from "./easy-sync-modal";
+import {
+  createFieldErrorSlot,
+  createModalErrorSlot,
+  setErrorSlot,
+} from "./easy-sync-modal";
+import {
+  bindModalKeyboardDismissal,
+  keepModalFocusOnBody,
+} from "./easy-sync-modal";
 import {
   isPathExcludedByFolders,
   normalizeExcludedFolders,
@@ -204,6 +213,13 @@ export class SyncExclusionModal extends EasySyncModal {
   private maxFileSizeDropdown: DropdownComponent | null = null;
   private maxFileSizeDescEl: HTMLElement | null = null;
   private maxFileSizeText: TextComponent | null = null;
+  /** 局部刷新挂点（2026-10-30 第二轮）：文件夹行只重绘这里，不整窗重建。 */
+  private folderChipsEl: HTMLElement | null = null;
+  private folderAddButton: ButtonComponent | null = null;
+  /** 两组错误令牌（2026-10-30 第二轮）：字段级挂自定义值下方、弹框级挂内容尾。 */
+  private maxFileSizeFieldErrorEl: HTMLElement | null = null;
+  private modalErrorSlotEl: HTMLElement | null = null;
+  private keyboardDismissDisposer: (() => void) | null = null;
 
   constructor(private plugin: EasySyncPlugin) {
     super(plugin.app);
@@ -212,15 +228,25 @@ export class SyncExclusionModal extends EasySyncModal {
   onOpen(): void {
     this.closed = false;
     this.initialized = false;
+    // 手机软键盘弹出时给内容滚动区让位（自定义输入框在表单中部）。
+    this.contentEl.addClass("easy-sync-keyboard-tail");
+    keepModalFocusOnBody(this);
+    this.keyboardDismissDisposer = bindModalKeyboardDismissal(this);
     this.render();
     this.initialization = this.initialize();
   }
 
   onClose(): void {
     this.closed = true;
+    this.keyboardDismissDisposer?.();
+    this.keyboardDismissDisposer = null;
     this.maxFileSizeDropdown = null;
     this.maxFileSizeDescEl = null;
     this.maxFileSizeText = null;
+    this.folderChipsEl = null;
+    this.folderAddButton = null;
+    this.maxFileSizeFieldErrorEl = null;
+    this.modalErrorSlotEl = null;
     this.contentEl.empty();
     void this.finalizeClose();
   }
@@ -244,7 +270,8 @@ export class SyncExclusionModal extends EasySyncModal {
       );
     } finally {
       this.initialized = true;
-      if (!this.closed) this.render();
+      // 清单就绪＝启用添加按钮并铺候选相关的 chip；不再整窗重建。
+      if (!this.closed) this.refreshFolderChips();
     }
   }
 
@@ -277,6 +304,7 @@ export class SyncExclusionModal extends EasySyncModal {
     const folderSetting = new Setting(this.contentEl)
       .setName(t("settings.syncExclusion.folders.name"))
       .addButton((button) => {
+        this.folderAddButton = button;
         button
           .setButtonText(t("settings.syncExclusion.add"))
           .setDisabled(this.saving || !this.initialized)
@@ -290,19 +318,10 @@ export class SyncExclusionModal extends EasySyncModal {
             ).open();
           });
       });
+    this.folderChipsEl = folderSetting.descEl.createDiv();
+    this.refreshFolderChips();
 
-    if (this.plugin.excludedFolders.length === 0) {
-      folderSetting.setDesc(t("settings.syncExclusion.empty"));
-    } else {
-      const chipsEl = folderSetting.descEl.createDiv();
-      renderExcludedFolderChips(chipsEl, this.plugin.excludedFolders, {
-        disabled: this.saving,
-        removeLabel: (path) => t("settings.syncExclusion.removeFolder", { path }),
-        onRemove: (path) => this.removeFolder(path),
-      });
-    }
-
-    new Setting(this.contentEl)
+    const sizeSetting = new Setting(this.contentEl)
       .setName(t("settings.maxFileSize.name"))
       .setDesc(this.maxFileSizeDescText())
       .addText(text => {
@@ -319,7 +338,11 @@ export class SyncExclusionModal extends EasySyncModal {
         });
         text.onChange(raw => {
           const parsed = parseMaxFileSizeInput(raw);
-          if (parsed !== null) void this.persistMaxFileSizeMb(parsed);
+          // 输入即清（2026-10-30 错误令牌清除规则）。
+          if (parsed !== null) {
+            setErrorSlot(this.maxFileSizeFieldErrorEl, null);
+            void this.persistMaxFileSizeMb(parsed);
+          }
         });
       })
       .addDropdown(dropdown => {
@@ -334,6 +357,7 @@ export class SyncExclusionModal extends EasySyncModal {
         this.syncMaxFileSizeDropdownSelection(dropdown);
         dropdown.onChange(value => {
           const text = this.maxFileSizeText;
+          setErrorSlot(this.maxFileSizeFieldErrorEl, null);
           if (value === "custom") {
             // Resojot renderModelField 同型：只翻 hidden＋聚焦，不落写、不重渲染。
             if (text) {
@@ -352,6 +376,30 @@ export class SyncExclusionModal extends EasySyncModal {
         this.maxFileSizeDropdown = dropdown;
       });
     this.maxFileSizeDescEl = this.resolveMaxFileSizeDescEl();
+    // 字段级错误槽挂自定义值控件之后；弹框级错误槽挂内容尾（配置族无底栏）。
+    this.maxFileSizeFieldErrorEl = createFieldErrorSlot(sizeSetting.controlEl);
+    this.modalErrorSlotEl = createModalErrorSlot(this.contentEl);
+  }
+
+  /**
+   * 文件夹行的局部刷新（2026-10-30 第二轮）：chip 容器就地重建、添加按钮
+   * 同步禁用态；不动文件大小行——输入到一半的自定义值与焦点保持原样。
+   */
+  private refreshFolderChips(): void {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    this.folderAddButton?.setDisabled(this.saving || !this.initialized);
+    const chipsEl = this.folderChipsEl;
+    if (!chipsEl) return;
+    chipsEl.empty();
+    if (this.plugin.excludedFolders.length === 0) {
+      chipsEl.setText(t("settings.syncExclusion.empty"));
+      return;
+    }
+    renderExcludedFolderChips(chipsEl, this.plugin.excludedFolders, {
+      disabled: this.saving,
+      removeLabel: (path) => t("settings.syncExclusion.removeFolder", { path }),
+      onRemove: (path) => this.removeFolder(path),
+    });
   }
 
   private maxFileSizeDescText(): string {
@@ -381,7 +429,11 @@ export class SyncExclusionModal extends EasySyncModal {
     const text = this.maxFileSizeText;
     if (!text) return;
     if (parseMaxFileSizeInput(text.getValue()) !== null) return;
-    new Notice(this.plugin.i18n.t("settings.maxFileSize.invalidValue"));
+    // 字段级错误槽（2026-10-30 错误令牌）：视线就在字段上，不再弹右上角 Notice。
+    setErrorSlot(
+      this.maxFileSizeFieldErrorEl,
+      this.plugin.i18n.t("settings.maxFileSize.invalidValue"),
+    );
     text.setValue(this.plugin.syncMaxFileSizeMb > 0 ? String(this.plugin.syncMaxFileSizeMb) : "");
   }
 
@@ -400,13 +452,18 @@ export class SyncExclusionModal extends EasySyncModal {
   private async persistMaxFileSizeMb(value: number): Promise<void> {
     const previous = this.plugin.syncMaxFileSizeMb;
     this.plugin.syncMaxFileSizeMb = value;
+    // 动作开始即清（错误令牌清除规则）：上次失败留下的弹框级错误不再挂着。
+    setErrorSlot(this.modalErrorSlotEl, null);
     try {
       await this.plugin.saveSyncSettings();
     } catch {
       this.plugin.syncMaxFileSizeMb = previous;
       this.plugin.applyMaxFileSize();
       this.syncMaxFileSizeDropdownSelection();
-      new Notice(this.plugin.i18n.t("notice.settingsSaveFailed"));
+      setErrorSlot(
+        this.modalErrorSlotEl,
+        this.plugin.i18n.t("notice.settingsSaveFailed"),
+      );
       return;
     }
     this.plugin.applyMaxFileSize();
@@ -423,14 +480,33 @@ export class SyncExclusionModal extends EasySyncModal {
     );
   }
 
+  private syncPathSettingsErrorText(error: unknown): string {
+    const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const key = error instanceof SyncPathSettingsUpdateError
+      ? error.code === "busy"
+        ? "notice.syncPathSettings.busy"
+        : "notice.syncPathSettings.recovery"
+      : "notice.syncPathSettings.failed";
+    return t(key);
+  }
+
   private async updateFolders(paths: string[]): Promise<boolean> {
     if (this.saving || !this.initialized || this.closed || !this.editSession) {
       return false;
     }
     this.saving = true;
+    setErrorSlot(this.modalErrorSlotEl, null);
     const save = (async () => {
       const before = [...this.plugin.excludedFolders];
-      const saved = await updateExcludedFoldersFromUi(this.plugin, paths);
+      // 失败改走弹框级错误槽（2026-10-30 错误令牌）：设置页路径仍走
+      // updateExcludedFoldersFromUi 的 Notice；弹框内视线就在字段上。
+      let saved = false;
+      try {
+        await this.plugin.updateExcludedFolders(paths);
+        saved = true;
+      } catch (error) {
+        setErrorSlot(this.modalErrorSlotEl, this.syncPathSettingsErrorText(error));
+      }
       if (
         saved
         && (
@@ -449,7 +525,8 @@ export class SyncExclusionModal extends EasySyncModal {
       return await save;
     } finally {
       this.saving = false;
-      if (!this.closed) this.render();
+      // 局部刷新：只重绘文件夹行，文件大小行的输入与焦点保持原样。
+      if (!this.closed) this.refreshFolderChips();
     }
   }
 }

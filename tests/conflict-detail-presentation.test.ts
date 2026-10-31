@@ -246,13 +246,15 @@ describe("conflict detail presentation", () => {
     expect(source).toContain('className: "easy-sync-detail-action-local"');
     expect(source).toContain('className: "easy-sync-detail-action-remote"');
     expect(source).toContain("this.renderFileComparisonActions([");
+    // 2026-10-30 弹框共享件：固定动作排容器＝共享底栏 is-fixed 变体。
     expect(styles).toMatch(
-      /\.easy-sync-detail-actions \.easy-sync-detail-action-local\s*\{[^}]*background-color:\s*rgba\(var\(--color-red-rgb\),\s*0\.18\);[^}]*color:\s*var\(--color-red\);/s,
+      /\.easy-sync-modal-footer \.easy-sync-detail-action-local\s*\{[^}]*background-color:\s*rgba\(var\(--color-red-rgb\),\s*0\.18\);[^}]*color:\s*var\(--color-red\);/s,
     );
     expect(styles).toMatch(
-      /\.easy-sync-detail-actions \.easy-sync-detail-action-remote\s*\{[^}]*background-color:\s*rgba\(var\(--color-green-rgb\),\s*0\.18\);[^}]*color:\s*var\(--color-green\);/s,
+      /\.easy-sync-modal-footer \.easy-sync-detail-action-remote\s*\{[^}]*background-color:\s*rgba\(var\(--color-green-rgb\),\s*0\.18\);[^}]*color:\s*var\(--color-green\);/s,
     );
     expect(styles).not.toMatch(/background-color:\s*var\(--color-(?:red|green)\);/);
+    expect(styles).not.toContain(".easy-sync-detail-actions");
     expect(styles).not.toContain(".easy-sync-conflict-actions .easy-sync-detail-action-local");
   });
 

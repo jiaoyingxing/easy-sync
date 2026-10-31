@@ -26,10 +26,9 @@ interface AuthMethodOptionView {
   description: string;
 }
 
-export class AuthMethodModal extends EasySyncModal {
-  private resolve: ((value: AuthMethodResult) => void) | null = null;
-  private finished = false;
+export class AuthMethodModal extends EasySyncModal<AuthMethodResult> {
   private busy = false;
+  private decided = false;
 
   constructor(
     app: App,
@@ -48,19 +47,7 @@ export class AuthMethodModal extends EasySyncModal {
 
   /** Open the modal and return the user's chosen method */
   awaitAction(): Promise<AuthMethodResult> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
-  }
-
-  private finish(result: AuthMethodResult): void {
-    if (this.finished) return;
-    this.finished = true;
-    const resolve = this.resolve;
-    this.resolve = null;
-    this.close();
-    resolve?.(result);
+    return this.awaitResult();
   }
 
   private async handleDeviceClick(button: HTMLButtonElement): Promise<void> {
@@ -69,9 +56,12 @@ export class AuthMethodModal extends EasySyncModal {
     button.disabled = true;
     try {
       await this.onDeviceSelect();
-      this.finish({ action: "device" });
+      this.decided = true;
+      this.settle({ action: "device" });
     } catch {
-      if (this.finished) return;
+      // The modal may have been closed while the request was in flight; only
+      // re-arm the option when it is still open and undecided.
+      if (this.decided) return;
       this.busy = false;
       button.disabled = false;
     }
@@ -87,7 +77,8 @@ export class AuthMethodModal extends EasySyncModal {
         const btn = this.buildOptionButton(this.browser);
         btn.addEventListener("click", () => {
           void this.onBrowserSelect();
-          this.finish({ action: "browser" });
+          this.decided = true;
+          this.settle({ action: "browser" });
         });
         return btn;
       },
@@ -114,10 +105,8 @@ export class AuthMethodModal extends EasySyncModal {
   // Option-row construction is inherited from EasySyncModal (shared with the
   // Remotely Save migration offer; extraction 2026-10-01).
 
-  onClose(): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    resolve?.({ action: "dismiss" });
+  override onClose(): void {
+    this.takePendingResolve()?.({ action: "dismiss" });
   }
 }
 

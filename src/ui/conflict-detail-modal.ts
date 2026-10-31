@@ -63,6 +63,16 @@ export class ConflictDetailModal extends FileComparisonModal {
     return this;
   }
 
+  /** One detail modal at a time: same path rejected, another path replaces. */
+  override open(): void {
+    if (!this.takeOverSingleInstance(this.item.path, { replace: true })) return;
+    super.open();
+  }
+
+  override onClose(): void {
+    this.releaseSingleInstance();
+  }
+
   protected async renderComparison(): Promise<void> {
     const t = (key: string, params?: Record<string, string | number>) =>
       this.plugin.i18n.t(key, params);
@@ -554,11 +564,23 @@ export class ConflictDetailModal extends FileComparisonModal {
     pre.createEl("code", { text: lines.slice(0, shown).join("\n") });
   }
 
-  /** Render the bottom action buttons */
+  /** Render the bottom action buttons. DOM order: the skip exit first
+   *  (secondary), the two keep-side choices last — on phones the host's
+   *  column-reverse then shows the keep actions on top. */
   private renderActionButtons(
     t: (key: string, params?: Record<string, string | number>) => string,
   ): void {
     this.renderFileComparisonActions([
+      {
+        label: t("syncView.conflict.skip"),
+        onClick: () => {
+          this.close();
+          void (async () => {
+            await this.plugin.dismissConflict(this.item.path);
+            this.onResolved?.();
+          })();
+        },
+      },
       {
         label: t("syncView.conflict.keepLocal"),
         className: "easy-sync-detail-action-local",
@@ -577,16 +599,6 @@ export class ConflictDetailModal extends FileComparisonModal {
           this.close();
           void (async () => {
             await this.plugin.resolveConflictKeepRemote(this.item.path);
-            this.onResolved?.();
-          })();
-        },
-      },
-      {
-        label: t("syncView.conflict.skip"),
-        onClick: () => {
-          this.close();
-          void (async () => {
-            await this.plugin.dismissConflict(this.item.path);
             this.onResolved?.();
           })();
         },

@@ -148,16 +148,59 @@ describe("settings dual-track parity gate", () => {
     let wrapperChecked = 0;
     for (const file of SETTINGS_FILES) {
       const source = read(file);
-      for (const m of source.matchAll(/confirmExperimentalPluginData\(\s*/g)) {
-        const argStart = (m.index ?? 0) + m[0].length;
-        const comma = firstTopLevelComma(source, argStart);
-        if (comma === -1) continue;
+      // 2026-10-31: the wrapper takes `{ messageKey, params }` or `{ steps }`.
+      // Steps are plain `t("key", { ... })` calls checked by the main pass;
+      // here only the object-form messageKey branch needs its own pass.
+      for (const m of source.matchAll(/confirmExperimentalPluginData\(\s*\{/g)) {
+        const argStart = (m.index ?? 0) + m[0].length - 1;
+        let depth = 0;
+        let objEnd = -1;
+        for (let i = argStart; i < source.length; i++) {
+          if (source[i] === "{") depth++;
+          else if (source[i] === "}") {
+            depth--;
+            if (depth === 0) {
+              objEnd = i;
+              break;
+            }
+          }
+        }
+        if (objEnd === -1) continue;
+        const body = source.slice(argStart + 1, objEnd);
+        const keyAt = body.indexOf("messageKey:");
+        if (keyAt === -1) continue; // steps-only call: covered by the main pass
+        const keyStart = keyAt + "messageKey:".length;
+        const paramsAt = body.indexOf("params:", keyStart);
+        const keyExpr = paramsAt === -1 ? body.slice(keyStart) : body.slice(keyStart, paramsAt);
         const keys = [
-          ...source.slice(argStart, comma).matchAll(/"([A-Za-z0-9._-]+)"/g),
+          ...keyExpr.matchAll(/"([A-Za-z0-9._-]+)"/g),
         ].map((k) => k[1]);
-        if (keys.length === 0) continue; // 包装器定义／无字面键的分支
-        const names = inlineParamNames(source, comma);
-        wrapperChecked++;
+        if (keys.length === 0) continue;
+        let names: Set<string> | null = null;
+        if (paramsAt !== -1) {
+          const paramsStart = body.indexOf("{", paramsAt);
+          if (paramsStart !== -1) {
+            let paramDepth = 0;
+            let paramEnd = -1;
+            for (let i = paramsStart; i < body.length; i++) {
+              if (body[i] === "{") paramDepth++;
+              else if (body[i] === "}") {
+                paramDepth--;
+                if (paramDepth === 0) {
+                  paramEnd = i;
+                  break;
+                }
+              }
+            }
+            if (paramEnd !== -1) {
+              names = new Set([
+                ...body.slice(paramsStart + 1, paramEnd)
+                  .matchAll(/([A-Za-z_$][\w$]*)\s*:/g),
+              ].map((p) => p[1]));
+            }
+          }
+        }
+        wrapperChecked += keys.length;
         for (const key of keys) {
           const tpl = expected.get(key);
           if (!tpl) {
@@ -197,10 +240,8 @@ describe("settings dual-track parity gate", () => {
         hook: "easy-sync-plugin-selection-chip",
         files: ["src/ui/settings-page-rows.ts", "src/ui/config-sync-modal.ts"],
       },
-      {
-        hook: "easy-sync-plugin-selection-chip is-experimental",
-        files: ["src/ui/settings-page-rows.ts", "src/ui/config-sync-modal.ts"],
-      },
+      // 2026-10-30：「实验性」chip 已停止渲染（样式与 i18n key 保留），
+      // 不再作为双轨钩子。
       {
         hook: "easy-sync-exclusion-chips",
         files: [

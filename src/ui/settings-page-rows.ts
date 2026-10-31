@@ -210,8 +210,8 @@ export function applyCommunityPluginScopeRow(
 
   // 行类与弹框同源（styles.css 的 .setting-item-name flex+gap），没有它 chip
   // 会紧贴行名。chip 挂点必须在最后一次 setName 之后：setName 会重写 nameEl
-  // 内容，先挂上去的 chip 节点会被冲掉（真机 1.13：同步 chip 消失、实验性
-  // chip 因创建在后而幸存）；update() 重跑时同样由 setName 先清场再重建。
+  // 内容，先挂上去的 chip 节点会被冲掉（真机 1.13：同步 chip 消失）；
+  // update() 重跑时同样由 setName 先清场再重建。
   setting.setClass("easy-sync-community-plugin-scope-setting");
   setting
     .setName(t(`${column === "files" ? "settings.syncCommunityPlugins" : "settings.syncPluginData"}.name`))
@@ -285,10 +285,14 @@ export function applyCommunityPluginScopeRow(
                 t("confirm.cancel"),
                 t,
                 {
-                  message: t(
-                    "settings.communityPlugins.data.experimentalBulkMessage",
-                    { count: knownPluginIds.length },
-                  ),
+                  steps: [
+                    t(
+                      "settings.communityPlugins.data.experimentalBulkStep.shared",
+                      { count: knownPluginIds.length },
+                    ),
+                    t("settings.communityPlugins.data.experimentalBulkStep.replace"),
+                    t("settings.communityPlugins.data.experimentalBulkStep.conflict"),
+                  ],
                   warning: t("settings.communityPlugins.data.experimentalWarning"),
                   danger: true,
                 },
@@ -323,12 +327,6 @@ export function applyCommunityPluginScopeRow(
       });
     });
 
-  if (column === "data") {
-    setting.nameEl.createSpan({
-      cls: "easy-sync-plugin-selection-chip is-experimental",
-      text: t("settings.communityPlugins.experimental"),
-    });
-  }
   const chipEl = setting.nameEl.createSpan("easy-sync-plugin-selection-chip");
   chipEl.addClass("is-hidden");
   renderChip();

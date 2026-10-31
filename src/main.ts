@@ -6597,11 +6597,14 @@ export default class EasySyncPlugin extends Plugin {
       } else if (this.autoSyncChangeDelaySeconds <= 0) {
         return true;
       }
-    } else if (trigger === "recovery-continuation" || trigger === "startup") {
-      // Both ride the master switch rather than one channel: a recovery
-      // continuation inherits the round that started it, and the startup
-      // round is its own (third) channel of the same master.
+    } else if (trigger === "recovery-continuation") {
+      // Inherits the round that started it; follows the master switch only.
       if (!this.isAutoSyncMasterEnabled()) return true;
+    } else if (trigger === "startup") {
+      // 启动轮是第三通道，和定时／修改后触发一样按自己的开关放行：总开关是
+      // 三条通道的派生态，只看它会让「启动后立即同步」关掉、其它通道开着的
+      // 设备每次打开 Obsidian 照样补一轮。
+      if (!this.isAutoSyncMasterEnabled() || !this.autoSyncOnStartup) return true;
     } else if (this.syncInterval <= 0) {
       return true;
     }
@@ -6712,6 +6715,11 @@ export default class EasySyncPlugin extends Plugin {
       || this.state.hasV2StateLoadRecoveryBlock
       || this.state.planReviewActive
       || !this.auth?.authState.isLoggedIn
+      // 自动面静默（2026-10-29）：重建续跑是一轮自动同步，与其它自动轮同规
+      // ——总开关关或已暂停时不开；检查点与失败重试阶梯原样保留，由下一次
+      // 手动轮（计划层会接手）或恢复后的自动轮补完。
+      || this.autoSyncPaused
+      || !this.isAutoSyncMasterEnabled()
     ) return false;
     this.descendantFileReconstructionTimer = compatSetTimeout(() => {
       this.descendantFileReconstructionTimer = null;
@@ -6733,6 +6741,9 @@ export default class EasySyncPlugin extends Plugin {
 
   private async runDescendantFileReconstructionContinuation(): Promise<void> {
     if (!this.state?.confirmedDescendantFileReconstruction) return;
+    // 计时器可能在总开关关闭/暂停之前就已排定：真正开跑前再按自动面静默规则
+    // 让一次（stopAutoSync 也会取消计时器，这里兜住已进入回调的竞态）。
+    if (this.autoSyncPaused || !this.isAutoSyncMasterEnabled()) return;
     if (
       this.opLock !== null
       || this.conflictBatchDirection !== null
@@ -6753,6 +6764,8 @@ export default class EasySyncPlugin extends Plugin {
         || this.state.hasV2StateLoadRecoveryBlock
         || this.state.planReviewActive
         || !this.auth?.authState.isLoggedIn
+        || this.autoSyncPaused
+        || !this.isAutoSyncMasterEnabled()
       ) return;
       if (!await this.checkAccountBindingForSync()) return;
       await this.dispatchSyncRun({
@@ -6806,6 +6819,7 @@ export default class EasySyncPlugin extends Plugin {
     this.autoSyncDirtyHint.cancel();
     this.startupSyncRetryHint.cancel();
     this.mutationRecoveryScheduler.cancel();
+    this.cancelDescendantFileReconstructionContinuation();
   }
 
   /**
@@ -10139,6 +10153,7 @@ export default class EasySyncPlugin extends Plugin {
       intervalMinutes: this.syncInterval,
       paused: this.autoSyncPaused,
       changeDelaySeconds: this.autoSyncChangeDelaySeconds,
+      startupSyncEnabled: this.autoSyncOnStartup,
       dirtyPending: this.autoSyncDirtyHint.pending,
       activity: automaticActivity,
     }));

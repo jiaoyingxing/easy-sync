@@ -20,6 +20,7 @@ import {
 } from "./helpers/state-manager-v2-harness";
 import { StateManager } from "../src/sync/state-manager";
 import type {
+  FileConsolidationSettlementV2,
   ManualMutationResolutionV1,
   MutationIntentV1,
   MutationReceiptV1,
@@ -710,6 +711,247 @@ describe("StateManager V2 production controller", () => {
       intent: mutation.intent,
       receipt: null,
     }]);
+  });
+
+  it("accepts a one-surviving-copy download on a move record (2026-10-31)", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const sourcePath = remoteA.path;
+    const targetPath = "Notes/心理学习/情感勒索.md";
+    const sourceIntent: MutationIntentV1 = {
+      version: 1,
+      operationId: "blocked-rename",
+      planRevision: 2,
+      scope,
+      action: "renameRemote",
+      path: targetPath,
+      sourcePath,
+      expectedLocal: { exists: true, hash: hashA, size: remoteA.size },
+      expectedRemote: {
+        exists: true,
+        driveId: remoteA.driveId,
+        eTag: remoteA.eTag,
+        size: remoteA.size,
+      },
+      createdAt: 10,
+    };
+    await state.beginMutationIntent(sourceIntent);
+    const resolution: ManualMutationResolutionV1 = {
+      version: 1,
+      choice: "keep-remote",
+      factsDigest: "a".repeat(64),
+      selectedAt: 30,
+      externalMutation: true,
+      intent: {
+        ...sourceIntent,
+        operationId: "manual-restore",
+        path: sourcePath,
+        sourcePath: undefined,
+        action: "download",
+        expectedLocal: { exists: false },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: "etag-current",
+          size: remoteA.size,
+        },
+        createdAt: 30,
+      },
+      receipt: null,
+    };
+
+    await expect(state.attachManualMutationResolution(
+      structuredClone(state.mutationLedger[0]),
+      resolution,
+    )).resolves.toBe(true);
+  });
+
+  it("rejects a one-copy move choice whose action contradicts the surviving side", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const sourcePath = remoteA.path;
+    const targetPath = "Notes/心理学习/情感勒索.md";
+    const sourceIntent: MutationIntentV1 = {
+      version: 1,
+      operationId: "blocked-rename",
+      planRevision: 2,
+      scope,
+      action: "renameRemote",
+      path: targetPath,
+      sourcePath,
+      expectedLocal: { exists: false },
+      expectedRemote: {
+        exists: true,
+        driveId: remoteA.driveId,
+        eTag: remoteA.eTag,
+        size: remoteA.size,
+      },
+      createdAt: 10,
+    };
+    await state.beginMutationIntent(sourceIntent);
+    const contradictory: ManualMutationResolutionV1 = {
+      version: 1,
+      choice: "keep-remote",
+      factsDigest: "b".repeat(64),
+      selectedAt: 30,
+      externalMutation: true,
+      intent: {
+        ...sourceIntent,
+        operationId: "manual-wrong-direction",
+        path: sourcePath,
+        sourcePath: undefined,
+        action: "deleteRemote",
+        expectedLocal: { exists: false },
+        expectedRemote: {
+          exists: true,
+          driveId: remoteA.driveId,
+          eTag: "etag-current",
+          size: remoteA.size,
+        },
+        createdAt: 30,
+      },
+      receipt: null,
+    };
+
+    await expect(state.attachManualMutationResolution(
+      structuredClone(state.mutationLedger[0]),
+      contradictory,
+    )).rejects.toThrow("evidence is invalid");
+  });
+
+  it("records both steps before committing a diverged-move consolidation", async () => {
+    const harness = makeHarness();
+    const state = new StateManager(harness.plugin);
+    await state.load();
+    const sourcePath = remoteA.path;
+    const targetPath = "Notes/b.md";
+    const sourceIntent: MutationIntentV1 = {
+      version: 1,
+      operationId: "diverged-rename",
+      planRevision: 1,
+      scope,
+      action: "renameRemote",
+      path: targetPath,
+      sourcePath,
+      expectedLocal: { exists: true, hash: hashB, size: 7 },
+      expectedRemote: {
+        exists: true,
+        driveId: remoteA.driveId,
+        eTag: remoteA.eTag,
+        size: remoteA.size,
+      },
+      createdAt: 1,
+    };
+    await state.beginMutationIntent(sourceIntent);
+    const settlement: FileConsolidationSettlementV2 = {
+      version: 2,
+      kind: "file-consolidation",
+      choice: "keep-remote",
+      factsDigest: "c".repeat(64),
+      selectedAt: 5,
+      externalMutation: true,
+      steps: [
+        {
+          intent: {
+            ...sourceIntent,
+            operationId: "diverged-create",
+            action: "download",
+            path: sourcePath,
+            sourcePath: undefined,
+            expectedLocal: { exists: false },
+            expectedRemote: {
+              exists: true,
+              driveId: remoteA.driveId,
+              eTag: remoteA.eTag,
+              size: remoteA.size,
+            },
+            createdAt: 5,
+          },
+          receipt: null,
+        },
+        {
+          intent: {
+            ...sourceIntent,
+            operationId: "diverged-delete",
+            action: "deleteLocal",
+            path: targetPath,
+            sourcePath: undefined,
+            expectedLocal: { exists: true, hash: hashB, size: 7 },
+            expectedRemote: { exists: false },
+            createdAt: 5,
+          },
+          receipt: null,
+        },
+      ],
+    };
+
+    await expect(state.attachManualMutationResolution(
+      structuredClone(state.mutationLedger[0]),
+      settlement,
+    )).resolves.toBe(true);
+    await expect(state.commitManualMutationResolutionCheckpoint(
+      sourceIntent.operationId,
+    )).rejects.toThrow("steps are incomplete");
+
+    await state.recordFileConsolidationStepReceipt(
+      sourceIntent.operationId,
+      0,
+      {
+        version: 1,
+        operationId: "diverged-create",
+        completedAt: 10,
+        checkpoint: {
+          baseUpserts: [{
+            path: sourcePath,
+            hash: hashA,
+            size: remoteA.size,
+            eTag: remoteA.eTag,
+          }],
+          baseRemovals: [],
+          remoteUpserts: [],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      },
+    );
+    await expect(state.commitManualMutationResolutionCheckpoint(
+      sourceIntent.operationId,
+    )).rejects.toThrow("steps are incomplete");
+
+    await state.recordFileConsolidationStepReceipt(
+      sourceIntent.operationId,
+      1,
+      {
+        version: 1,
+        operationId: "diverged-delete",
+        completedAt: 11,
+        checkpoint: {
+          baseUpserts: [],
+          baseRemovals: [targetPath],
+          remoteUpserts: [],
+          remoteDeletes: [],
+          pendingConflictRemovals: [],
+          pendingDeleteRemovals: [],
+        },
+      },
+    );
+    await state.commitManualMutationResolutionCheckpoint(sourceIntent.operationId);
+
+    expect(state.mutationLedger).toEqual([]);
+    expect(state.baseSnapshot).toContainEqual(expect.objectContaining({
+      path: sourcePath,
+      hash: hashA,
+    }));
+    expect(state.manualMutationResolutionAudit.slice(-1)[0]).toMatchObject({
+      sourceOperationId: sourceIntent.operationId,
+      resolutionOperationId: `${sourceIntent.operationId}-consolidation`,
+      choice: "keep-remote",
+      action: "upload",
+      externalMutation: true,
+    });
   });
 
   it("retries reviewed checkpoint cleanup after the V2 commit survives a plugin-data failure", async () => {

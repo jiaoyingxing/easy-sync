@@ -1,6 +1,12 @@
 import type { App } from "obsidian";
 
-import { EasySyncModal } from "./easy-sync-modal";
+import {
+  addEasySyncFooterButton,
+  bindModalKeyboardDismissal,
+  createEasySyncModalFooter,
+  EasySyncModal,
+  keepModalFocusOnBody,
+} from "./easy-sync-modal";
 
 type UpdateReminderChoice = "snooze" | "skipVersion";
 
@@ -48,18 +54,23 @@ export class UpdateReminderModal extends EasySyncModal<UpdateReminderChoice | nu
     });
     select.value = "snooze";
 
-    const btnRow = contentEl.createDiv("modal-button-container");
-    const cancelBtn = btnRow.createEl("button", { text: this.cancelLabel });
-    cancelBtn.addEventListener("click", () => {
-      this.settle(null);
+    // Divided: the interactive select sits above the buttons.
+    const btnRow = createEasySyncModalFooter(contentEl, { divided: true });
+    addEasySyncFooterButton(btnRow, {
+      label: this.cancelLabel,
+      onClick: () => {
+        this.settle(null);
+      },
     });
-    const confirmBtn = btnRow.createEl("button", {
-      text: this.confirmLabel,
-      cls: "mod-cta",
+    addEasySyncFooterButton(btnRow, {
+      label: this.confirmLabel,
+      variant: "cta",
+      onClick: () => {
+        this.settle(select.value === "skipVersion" ? "skipVersion" : "snooze");
+      },
     });
-    confirmBtn.addEventListener("click", () => {
-      this.settle(select.value === "skipVersion" ? "skipVersion" : "snooze");
-    });
+    keepModalFocusOnBody(this);
+    bindModalKeyboardDismissal(this);
   }
 
   onClose(): void {

@@ -542,8 +542,30 @@ export interface CommunityPluginBundleSettlementV2 {
   members: CommunityPluginBundleSettlementMemberV2[];
 }
 
+export interface FileConsolidationStepV2 {
+  intent: MutationIntentV1;
+  receipt: MutationReceiptV1 | null;
+}
+
+/**
+ * Ordered two-step settlement for a move record whose two copies diverged:
+ * step 1 creates the winning content on the losing side, step 2 retires the
+ * losing copy. Committing both steps reduces one synthetic upload-with-source
+ * checkpoint, so the shared V2 envelope only ever sees a converged move.
+ */
+export interface FileConsolidationSettlementV2 {
+  version: 2;
+  kind: "file-consolidation";
+  choice: "keep-local" | "keep-remote";
+  factsDigest: string;
+  selectedAt: number;
+  externalMutation: true;
+  steps: [FileConsolidationStepV2, FileConsolidationStepV2];
+}
+
 type ManualMutationResolution =
   | ManualMutationResolutionV1
+  | FileConsolidationSettlementV2
   | CommunityPluginBundleSettlementV2;
 
 export interface MutationLedgerEntryV1 {
@@ -571,6 +593,8 @@ export interface ManualMutationResolutionLocalFactV1 {
   exists: boolean;
   hash?: string;
   size?: number;
+  /** Display-only last-modified time; never part of `factsDigest`. */
+  mtime?: number;
 }
 
 export interface ManualMutationResolutionRemoteFactV1 {
@@ -580,6 +604,8 @@ export interface ManualMutationResolutionRemoteFactV1 {
   eTag?: string;
   hash?: string;
   size?: number;
+  /** Display-only last-modified time; never part of `factsDigest`. */
+  mtime?: number;
 }
 
 interface ManualMutationResolutionOptionV1 {

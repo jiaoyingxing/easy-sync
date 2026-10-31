@@ -185,6 +185,39 @@ describe("large-file exclusion select control in the modal", () => {
 });
 
 describe("large-file size value helpers", () => {
+  it("keeps the folder row refresh local and routes failures to the error slots", () => {
+    const source = readFileSync("src/ui/sync-exclusion-modal.ts", "utf8");
+    // 2026-10-30 第二轮：加/删 chip 只重绘文件夹行，不再整窗重建（文件大小行
+    // 的输入与焦点保持原样）；失败改走两组错误令牌（字段级/弹框级）。
+    const updateBody = functionBody(
+      source,
+      "private async updateFolders(paths: string[]): Promise<boolean>",
+    );
+    expect(updateBody).toContain("setErrorSlot(this.modalErrorSlotEl, null)");
+    expect(updateBody).toContain("this.refreshFolderChips()");
+    expect(updateBody).not.toContain("this.render()");
+    const initBody = functionBody(
+      source,
+      "private async initialize(): Promise<void>",
+    );
+    expect(initBody).toContain("this.refreshFolderChips()");
+    expect(initBody).not.toContain("this.render()");
+    const revertBody = functionBody(
+      source,
+      "private revertMaxFileSizeTextIfInvalid(): void",
+    );
+    expect(revertBody).toContain("setErrorSlot(");
+    expect(revertBody).not.toContain("new Notice(");
+    const persistBody = functionBody(
+      source,
+      "private async persistMaxFileSizeMb(value: number): Promise<void>",
+    );
+    expect(persistBody).toContain("setErrorSlot(this.modalErrorSlotEl, null)");
+    expect(persistBody).toContain("setErrorSlot(");
+    expect(source).toContain("createModalErrorSlot(");
+    expect(source).toContain("createFieldErrorSlot(");
+  });
+
   it("normalizes stored values into the -1 / positive-MiB domain", () => {
     expect(normalizeMaxFileSizeMb(-1)).toBe(-1);
     expect(normalizeMaxFileSizeMb(300)).toBe(300);
@@ -287,13 +320,26 @@ describe("SyncExclusionModal large-file select behavior", () => {
     expect(plugin.saveSyncSettings).toHaveBeenCalledTimes(1);
     expect(modal.maxFileSizeDescText()).toContain("300 MB");
 
-    // Invalid input never persists; blur reverts the display and re-syncs.
+    // Invalid input never persists; blur reverts the display and re-syncs,
+    // and the field-level error slot surfaces instead of a Notice.
     await text.triggerChange("abc");
     expect(plugin.syncMaxFileSizeMb).toBe(300);
     expect(plugin.saveSyncSettings).toHaveBeenCalledTimes(1);
     (text.inputEl as unknown as { __fire: (type: string) => void }).__fire("blur");
     expect(text.getValue()).toBe("300");
     expect(text.inputEl.hidden).toBe(false);
+    const fieldError = (modal as unknown as {
+      maxFileSizeFieldErrorEl: HTMLElement | null;
+    }).maxFileSizeFieldErrorEl;
+    expect(fieldError).not.toBeNull();
+    expect(fieldError!.classList.contains("is-hidden")).toBe(false);
+    expect(fieldError!.textContent).toBe(
+      plugin.i18n.t("settings.maxFileSize.invalidValue"),
+    );
+
+    // 输入即清：合法值一进来字段级错误就退场（2026-10-30 清除规则）。
+    await text.triggerChange("300");
+    expect(fieldError!.classList.contains("is-hidden")).toBe(true);
     expect(dropdown.value).toBe("custom");
   });
 

@@ -190,7 +190,9 @@ export interface LocaleStrings {
   "settings.communityPlugins.data.toggleAria": string;
   "settings.communityPlugins.data.restrictedAria": string;
   "settings.communityPlugins.data.experimentalConfirmTitle": string;
-  "settings.communityPlugins.data.experimentalBulkMessage": string;
+  "settings.communityPlugins.data.experimentalBulkStep.shared": string;
+  "settings.communityPlugins.data.experimentalBulkStep.replace": string;
+  "settings.communityPlugins.data.experimentalBulkStep.conflict": string;
   "settings.communityPlugins.data.experimentalItemMessage": string;
   "settings.communityPlugins.data.experimentalItemWithFilesMessage": string;
   "settings.communityPlugins.data.experimentalWarning": string;
@@ -292,9 +294,13 @@ export interface LocaleStrings {
   "syncView.conflict.batchKeepLocal": string;
   "syncView.conflict.batchKeepRemote": string;
   "syncView.conflict.batchKeepLocalTitle": string;
-  "syncView.conflict.batchKeepLocalMessage": string;
+  "syncView.conflict.batchKeepLocalStep.cloudOnly": string;
+  "syncView.conflict.batchKeepLocalStep.localOnly": string;
+  "syncView.conflict.batchKeepLocalStep.both": string;
   "syncView.conflict.batchKeepRemoteTitle": string;
-  "syncView.conflict.batchKeepRemoteMessage": string;
+  "syncView.conflict.batchKeepRemoteStep.localOnly": string;
+  "syncView.conflict.batchKeepRemoteStep.cloudOnly": string;
+  "syncView.conflict.batchKeepRemoteStep.both": string;
   /** 片② 副本的文件名标签（用户可见；副本命名模板的一部分；设备中立用词）。 */
   "syncView.localOnly.copyLabel": string;
   "syncView.localOnly.chip.edited": string;
@@ -307,7 +313,8 @@ export interface LocaleStrings {
   "syncView.localOnly.batchUploadAll": string;
   "syncView.localOnly.batchKeepAll": string;
   "syncView.localOnly.batchConfirmTitle": string;
-  "syncView.localOnly.batchConfirmMessage": string;
+  "syncView.localOnly.batchConfirmStep.authoritative": string;
+  "syncView.localOnly.batchConfirmStep.sameName": string;
   "syncView.localOnly.batchConfirmUpload": string;
   "notice.localOnly.uploaded": string;
   "notice.localOnly.reminded": string;
@@ -386,6 +393,7 @@ export interface LocaleStrings {
   "syncView.mutationResolution.localTitle": string;
   "syncView.mutationResolution.remoteTitle": string;
   "syncView.mutationResolution.present": string;
+  "syncView.mutationResolution.presentWithTime": string;
   "syncView.mutationResolution.missing": string;
   "syncView.mutationResolution.technicalDetails": string;
   "syncView.mutationResolution.operationId": string;
@@ -395,9 +403,8 @@ export interface LocaleStrings {
   "syncView.mutationResolution.keepRemoteVersion": string;
   "syncView.mutationResolution.singleActionHint": string;
   "syncView.mutationResolution.noAvailableActions": string;
-  "syncView.mutationResolution.noAvailableActionsKeepLocal": string;
-  "syncView.mutationResolution.noAvailableActionsKeepRemote": string;
-  "syncView.mutationResolution.noAvailableActionsFallback": string;
+  "syncView.mutationResolution.noAvailableActionsMoveDiverged": string;
+  "syncView.mutationResolution.noAvailableActionsMoveMismatch": string;
   "syncView.mutationResolution.deleteConfirmTitle": string;
   "syncView.mutationResolution.deleteConfirmTitleLocal": string;
   "syncView.mutationResolution.deleteConfirmTitleRemote": string;
@@ -406,6 +413,10 @@ export interface LocaleStrings {
   "syncView.mutationResolution.deleteConfirmMessageLocal": string;
   "syncView.mutationResolution.deleteConfirmMessageRemote": string;
   "syncView.mutationResolution.deleteConfirmWarning": string;
+  "syncView.mutationResolution.deleteConfirmStepUploadLocal": string;
+  "syncView.mutationResolution.deleteConfirmStepDeleteCloud": string;
+  "syncView.mutationResolution.deleteConfirmStepDownloadCloud": string;
+  "syncView.mutationResolution.deleteConfirmStepDeleteLocal": string;
   "syncView.mutationResolution.action.upload": string;
   "syncView.mutationResolution.action.download": string;
   "syncView.mutationResolution.action.deleteRemote": string;

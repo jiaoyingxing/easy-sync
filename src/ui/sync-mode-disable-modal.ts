@@ -1,5 +1,9 @@
 import { type App } from "obsidian";
-import { EasySyncModal } from "./easy-sync-modal";
+import {
+  addEasySyncFooterButton,
+  createEasySyncModalFooter,
+  EasySyncModal,
+} from "./easy-sync-modal";
 import type { I18nFn } from "./confirm-modal";
 
 /**
@@ -42,9 +46,7 @@ export function buildSyncModeDisableView(input: {
   };
 }
 
-export class SyncModeDisableModal extends EasySyncModal {
-  private resolve: ((value: boolean) => void) | null = null;
-
+export class SyncModeDisableModal extends EasySyncModal<boolean> {
   constructor(
     app: App,
     private t: I18nFn,
@@ -54,17 +56,7 @@ export class SyncModeDisableModal extends EasySyncModal {
   }
 
   awaitDecision(): Promise<boolean> {
-    return new Promise((resolve) => {
-      this.resolve = resolve;
-      this.open();
-    });
-  }
-
-  private finish(value: boolean): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    this.close();
-    resolve?.(value);
+    return this.awaitResult();
   }
 
   onOpen(): void {
@@ -76,19 +68,19 @@ export class SyncModeDisableModal extends EasySyncModal {
     for (const line of view.lines) {
       contentEl.createEl("p", { text: line });
     }
-    const btnRow = contentEl.createDiv("modal-button-container");
-    const confirmBtn = btnRow.createEl("button", {
-      text: view.confirmLabel,
-      cls: "mod-cta",
+    const btnRow = createEasySyncModalFooter(contentEl);
+    addEasySyncFooterButton(btnRow, {
+      label: view.cancelLabel,
+      onClick: () => this.settle(false),
     });
-    confirmBtn.addEventListener("click", () => this.finish(true));
-    const cancelBtn = btnRow.createEl("button", { text: view.cancelLabel });
-    cancelBtn.addEventListener("click", () => this.finish(false));
+    addEasySyncFooterButton(btnRow, {
+      label: view.confirmLabel,
+      variant: "cta",
+      onClick: () => this.settle(true),
+    });
   }
 
   onClose(): void {
-    const resolve = this.resolve;
-    this.resolve = null;
-    resolve?.(false);
+    this.takePendingResolve()?.(false);
   }
 }

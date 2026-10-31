@@ -1,6 +1,6 @@
 {
   "name": "easy-sync",
-  "version": "1.6.4",
+  "version": "1.6.5",
   "description": "EasySync / 易同步 — Obsidian OneDrive sync with minimal setup, clear status, and controlled conflict handling",
   "main": "main.js",
   "scripts": {
@@ -9,10 +9,11 @@
     "test": "vitest run",
     "test:performance": "vitest run tests/sync-performance-contract.test.ts tests/sync-safety-cancellation-and-progress.test.ts tests/plugin-data-cold-start.test.ts tests/startup-performance-contract.test.ts tests/community-plugin-enablement-runtime.test.ts -t \"A0-P|platform-neutral 500-file|V2 cold-start\" --reporter=verbose",
     "lint": "eslint .",
-    "check": "npm run typecheck && npm run lint && npm test && npm run check:meta && npm run check:lockfile && npm run check:docs && node scripts/dev/check-hooks.mjs",
+    "check": "npm run typecheck && npm run lint && npm test && npm run check:meta && npm run check:lockfile && npm run check:docs && npm run check:modal && node scripts/dev/check-hooks.mjs",
     "check:meta": "vitest run tests/release-metadata-alignment.test.ts",
     "check:lockfile": "pwsh -NoProfile -File scripts/check-lockfile-ci.ps1",
     "check:docs": "node scripts/docs/gen-topic-index.mjs --check && node scripts/docs/check-archive-index.mjs && node scripts/docs/check-handoff-pointers.mjs && node scripts/docs/check-doc-ids.mjs && node scripts/docs/check-source-paths.mjs && node scripts/docs/check-doc-system.mjs && node scripts/docs/check-temp-fields.mjs && node scripts/docs/check-doc-links.mjs && node scripts/docs/check-topic-entry.mjs && node scripts/docs/gen-tool-catalog.mjs --check",
+    "check:modal": "node scripts/check-modal-contract.mjs",
     "tools": "node scripts/docs/gen-tool-catalog.mjs",
     "dev:reload": "node scripts/dev/obsidian.mjs reload --vault",
     "dev:errors": "node scripts/dev/obsidian.mjs errors --vault",

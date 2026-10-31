@@ -2321,7 +2321,7 @@ describe("Persistent remote delta state", () => {
     expect(harness.adapter.rename).not.toHaveBeenCalled();
   });
 
-  it("resolves a pure move in either direction and rejects composite moves", async () => {
+  it("resolves a pure move in either direction and a diverged move in two steps", async () => {
     const keepLocal = await makeManualResolutionHarness({
       sourcePath: "old.md",
       path: "new.md",
@@ -2357,8 +2357,20 @@ describe("Persistent remote delta state", () => {
     });
     const compositeReview = await composite.executor
       .getMutationRecoveryResolutionSnapshot();
-    expect(compositeReview?.keepLocal.available).toBe(false);
-    expect(compositeReview?.keepRemote.available).toBe(false);
+    // Content diverged: both directions are executable through the ordered
+    // two-step settlement (create the winner on the losing side, then retire
+    // the losing copy).
+    expect(compositeReview?.keepLocal.available).toBe(true);
+    expect(compositeReview?.keepRemote.available).toBe(true);
+    expect(await composite.executor.resolveMutationRecovery(
+      compositeReview!,
+      "keep-remote",
+    )).toBe(true);
+    expect(new TextDecoder().decode(composite.localBytes.get("old.md"))).toBe("cloud");
+    expect(composite.localBytes.has("new.md")).toBe(false);
+    expect(composite.remoteFiles.has("old.md")).toBe(true);
+    expect(composite.remoteFiles.has("new.md")).toBe(false);
+    expect(composite.state.mutationLedger).toEqual([]);
   });
 
   it("recovers a receipted rename target-anchor collision by creating the reviewed local target", async () => {

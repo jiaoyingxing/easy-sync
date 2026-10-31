@@ -31,14 +31,14 @@ export class SyncPlanAlertModal extends EasySyncModal {
       });
     }
 
-    const btnRow = contentEl.createDiv("modal-button-container");
-    const viewBtn = btnRow.createEl("button", {
-      text: this.buttonLabel,
-      cls: "mod-cta",
-    });
-    viewBtn.addEventListener("click", () => {
-      this.onViewPlan();
-      this.close();
+    const btnRow = createEasySyncModalFooter(contentEl);
+    addEasySyncFooterButton(btnRow, {
+      label: this.buttonLabel,
+      variant: "cta",
+      onClick: () => {
+        this.onViewPlan();
+        this.close();
+      },
     });
   }
 
@@ -61,7 +61,11 @@ export class SyncPlanAlertModal extends EasySyncModal {
  */
 
 import { type App } from "obsidian";
-import { EasySyncModal } from "./easy-sync-modal";
+import {
+  addEasySyncFooterButton,
+  createEasySyncModalFooter,
+  EasySyncModal,
+} from "./easy-sync-modal";
 
 export type I18nFn = (key: string, params?: Record<string, string | number>) => string;
 
@@ -78,6 +82,10 @@ export class ConfirmModal extends EasySyncModal<boolean> {
        *  the body is a short list of facts rather than one sentence; each line
        *  uses the same unstyled paragraph as `message`. */
       lines?: readonly string[];
+      /** Ordered action/rule lines rendered as a native `<ol>`. Use only when
+       *  the body describes two or more actions or rules; single actions stay
+       *  one sentence and zero-file actions stay paragraphs (2026-10-31). */
+      steps?: readonly string[];
       warning?: string;
       danger?: boolean;
       /** Extra class for the message paragraph; omit for a plain paragraph
@@ -114,23 +122,32 @@ export class ConfirmModal extends EasySyncModal<boolean> {
       contentEl.createEl("p", { text: line });
     }
 
+    if (this.options?.steps && this.options.steps.length > 0) {
+      const steps = contentEl.createEl("ol", { cls: "easy-sync-confirm-steps" });
+      for (const step of this.options.steps) {
+        steps.createEl("li", { text: step });
+      }
+    }
+
     if (this.options?.warning) {
       contentEl.createEl("p", { text: this.options.warning });
     }
 
-    // Buttons
-    const btnRow = contentEl.createDiv("modal-button-container");
-    const confirmBtn = btnRow.createEl("button", {
-      text: this.confirmLabel,
-      cls: this.options?.danger ? "mod-warning" : "mod-cta",
+    const btnRow = createEasySyncModalFooter(contentEl);
+    // DOM order: the cancel exit first (secondary), the confirm action last —
+    // phones show the confirm on top via the host's column-reverse.
+    addEasySyncFooterButton(btnRow, {
+      label: this.cancelLabel,
+      onClick: () => {
+        this.settle(false);
+      },
     });
-    confirmBtn.addEventListener("click", () => {
-      this.settle(true);
-    });
-
-    const cancelBtn = btnRow.createEl("button", { text: this.cancelLabel });
-    cancelBtn.addEventListener("click", () => {
-      this.settle(false);
+    addEasySyncFooterButton(btnRow, {
+      label: this.confirmLabel,
+      variant: this.options?.danger ? "destructive" : "cta",
+      onClick: () => {
+        this.settle(true);
+      },
     });
   }
 

@@ -538,6 +538,24 @@ export function buildSyncPendingDisplayRows(input: Readonly<{
   return rows;
 }
 
+/** The single path a pending row stands for, or null for batch, adoption and
+ *  plugin-bundle rows (they carry no one path to shorten). */
+function pendingDisplayRowPath(row: SyncPendingDisplayRow): string | null {
+  switch (row.kind) {
+    case "issue":
+      return row.issue?.path ?? null;
+    case "conflict":
+    case "delete":
+      return row.item?.path ?? null;
+    case "localOnly":
+      return row.localOnly?.targetPath ?? null;
+    case "retainedFolder":
+      return row.issue?.path ?? null;
+    default:
+      return null;
+  }
+}
+
 function remoteScopeRecoveryPercent(
   state: Readonly<SyncProgressState>,
 ): number | null {
@@ -705,6 +723,141 @@ export function buildAdaptivePathLayout(
   }
 
   return decisions;
+}
+
+/** One row's path presentation inside a virtualized list. The directory line
+ *  is owned by a single row of a run; every row in the run shows only the
+ *  remainder. The plan is derived from the full row list, never from the
+ *  mounted window, so a window shift cannot change which row owns a directory
+ *  or whether a row is shortened at all. */
+interface WindowedPathPlanEntry {
+  /** 主行显示的路径（摘取后的剩余段）；null＝保持完整路径。 */
+  displayPath: string | null;
+  /** 灰字目录（含尾斜杠）；null＝这一行不摘取。 */
+  directory: string | null;
+  /** 这一行是否拥有上方那条灰字目录行。同一段只有段首行拥有。 */
+  directoryOwner: boolean;
+}
+
+/** Segment count without splitting: the windowed plan only needs "is the depth
+ *  at least/most N", and a 50k-row list must stay allocation-light. */
+function countPathSegments(path: string): number {
+  let segments = 0;
+  let inSegment = false;
+  for (let index = 0; index < path.length; index++) {
+    if (path[index] === "/") {
+      if (inSegment) {
+        segments++;
+        inSegment = false;
+      }
+    } else {
+      inSegment = true;
+    }
+  }
+  return segments + (inSegment ? 1 : 0);
+}
+
+/** Two-path common directory prefix without splitting either path. Matches
+ *  `commonDirPrefix` for the pair case (it stops before the shorter path's
+ *  final segment) and avoids two arrays per row on large lists. */
+function commonDirPrefixOfPair(left: string, right: string): string {
+  const limit = Math.min(left.length, right.length);
+  let index = 0;
+  while (index < limit && left[index] === right[index]) index++;
+  if (index === 0) return "";
+  const slash = left.lastIndexOf("/", index - 1);
+  return slash >= 0 ? left.slice(0, slash + 1) : "";
+}
+
+/** Split at the last separator, keeping a folder's trailing slash on the leaf.
+ *  `parentPath` cannot serve here because a folder path ends with `/` and its
+ *  parent is one level higher than `lastIndexOf("/")` would suggest. */
+function splitWindowedPath(
+  path: string,
+): { directory: string; leaf: string } | null {
+  const body = path.endsWith("/") ? path.slice(0, -1) : path;
+  const cut = body.lastIndexOf("/");
+  if (cut < 0) return null;
+  return {
+    directory: body.slice(0, cut + 1),
+    leaf: path.slice(cut + 1),
+  };
+}
+
+/**
+ * Build the two-line gray-directory plan for a virtualized list.
+ *
+ * The measured adaptive pass cannot run here: its output depends on adjacent
+ * mounted rows, and its extra directory element would sit outside the scroll
+ * offset model. This plan is data-only and deterministic:
+ *
+ * - an adjacent run shares one directory line when the common prefix has at
+ *   least two segments and every remainder has at most two segments (one
+ *   parent plus the leaf);
+ * - otherwise a row whose parent has at least two segments owns its own line;
+ * - rows without a path, or with shallow paths, keep the full path.
+ *
+ * No text width is measured here; the directory text is tail-fitted when the
+ * row mounts, which never changes the row height.
+ */
+export function buildWindowedPathPlan(
+  paths: readonly (string | null)[],
+): WindowedPathPlanEntry[] {
+  const entries = paths.map<WindowedPathPlanEntry>(() => ({
+    displayPath: null,
+    directory: null,
+    directoryOwner: false,
+  }));
+  let index = 0;
+  while (index < paths.length) {
+    const path = paths[index];
+    if (!path) {
+      index++;
+      continue;
+    }
+    const next = paths[index + 1];
+    const shared = next ? commonDirPrefixOfPair(path, next) : "";
+    if (shared && countPathSegments(shared) >= 2) {
+      let end = index + 1;
+      while (end + 1 < paths.length && paths[end + 1]?.startsWith(shared)) {
+        end++;
+      }
+      let sharedFits = true;
+      for (let cursor = index; cursor <= end; cursor++) {
+        const current = paths[cursor];
+        if (!current) {
+          sharedFits = false;
+          break;
+        }
+        const rest = trimFilePathPrefix(current, shared);
+        if (!rest || countPathSegments(rest) > 2) {
+          sharedFits = false;
+          break;
+        }
+      }
+      if (sharedFits) {
+        for (let cursor = index; cursor <= end; cursor++) {
+          entries[cursor] = {
+            displayPath: trimFilePathPrefix(paths[cursor]!, shared),
+            directory: cursor === index ? shared : null,
+            directoryOwner: cursor === index,
+          };
+        }
+        index = end + 1;
+        continue;
+      }
+    }
+    const parts = splitWindowedPath(path);
+    if (parts && countPathSegments(parts.directory) >= 2) {
+      entries[index] = {
+        displayPath: parts.leaf,
+        directory: parts.directory,
+        directoryOwner: true,
+      };
+    }
+    index++;
+  }
+  return entries;
 }
 
 /** Per-row content identity: the same five fields the list renders, so a
@@ -916,14 +1069,18 @@ export function buildSyncPlanVirtualOffsets(
   items: readonly Pick<PlanReviewItem, "reason">[],
   rowHeight: number,
   reasonRowHeight: number,
+  /** Per-row extra height (windowed gray-directory owner rows). */
+  extraHeights?: readonly number[],
 ): number[] {
   const safeRowHeight = Math.max(1, rowHeight);
   const safeReasonRowHeight = Math.max(safeRowHeight, reasonRowHeight);
   const offsets = [0];
-  for (const item of items) {
+  for (let index = 0; index < items.length; index++) {
+    const item = items[index];
     offsets.push(
       offsets[offsets.length - 1]
-      + (item.reason ? safeReasonRowHeight : safeRowHeight),
+      + (item.reason ? safeReasonRowHeight : safeRowHeight)
+      + Math.max(0, extraHeights?.[index] ?? 0),
     );
   }
   return offsets;
@@ -1023,6 +1180,12 @@ export function buildSyncPlanDisplayRows(
     rows.push({ key, item, pluginConflict });
   }
   return rows;
+}
+
+/** The single path a plan row stands for; a plugin-bundle row represents many
+ *  files and keeps its name-only presentation. */
+function planDisplayRowPath(row: SyncPlanDisplayRow): string | null {
+  return row.pluginConflict ? null : row.item.path;
 }
 
 /** 决策行＝折叠里藏着该条目唯一出口的行（冲突、插件捆绑冲突、插件待决策、
@@ -1839,6 +2002,9 @@ export class EasySyncSyncView extends ItemView {
     this.adaptivePathResizeTimer = window.setTimeout(() => {
       this.adaptivePathResizeTimer = null;
       this.applyAdaptivePathLayout();
+      // 窗口行的灰字目录不在静态测量范围内：宽度变了只重排已挂载目录
+      // 文本的尾部截断。文本变化不改行高，所以不需要重挂窗口或重建 offsets。
+      this.refreshWindowedPathDirectories();
     }, 100);
   }
 
@@ -3133,6 +3299,9 @@ export class EasySyncSyncView extends ItemView {
       // 新出现的可展开项（含下一轮新计划）都服从它。
       this.sessionOverride = expand ? "expanded" : "collapsed";
       this.planGroupExpandedState.clear();
+      // 工具栏是全局手势：行级记忆也一并清空。否则行级选择会压过这次显式
+      // 选择，换窗重挂后部分行回到旧状态，按钮看起来失灵／混合（2026-10-29 现场）。
+      this.planRowExpandedState.clear();
       this.toggleAllDetails();
       this.updateCollapseTogglePresentation();
     });
@@ -3939,6 +4108,9 @@ export class EasySyncSyncView extends ItemView {
       retainedFolders,
       configDir,
     });
+    // 两行灰字目录的计划只依赖全量 rows（不依赖挂载窗口）：换窗不会改变
+    // 哪一行拥有目录行，也不会改变行高。目录文本在挂载时才做尾部截断。
+    const pathPlan = buildWindowedPathPlan(rows.map(pendingDisplayRowPath));
     // 窗口化挂载（2026-09-16，与计划审阅决策行同一机制）：待处理行数大时
     // 只挂载视口附近的行，滚动按窗口替换。行 key（data-easy-sync-plan-row）
     // 与计划决策行同族——展开记忆、在飞 pin、换窗回填顺序全部沿用；计数
@@ -3962,11 +4134,16 @@ export class EasySyncSyncView extends ItemView {
       }
       const probe = this.measurePlanDecisionRowHeights(section);
       virtualOffsets = buildSyncPlanMeasuredVirtualOffsets(
-        rows.map((row) =>
-          this.planRowHeights.get(row.key)
-          ?? (this.resolvePlanRowOpen(row.key, this.renderedBatchedRows)
+        rows.map((row, index) => {
+          const measured = this.planRowHeights.get(row.key);
+          if (measured !== undefined) return measured;
+          const base = this.resolvePlanRowOpen(row.key, this.renderedBatchedRows)
             ? probe.expandedRowHeight
-            : probe.collapsedRowHeight)),
+            : probe.collapsedRowHeight;
+          return base + (pathPlan[index]?.directoryOwner
+            ? probe.directoryHeight
+            : 0);
+        }),
       );
       offsetsRevision = this.planRowLayoutRevision;
       return virtualOffsets;
@@ -4004,9 +4181,16 @@ export class EasySyncSyncView extends ItemView {
         offsets,
       );
       if (!visible) return;
+      const slots: HTMLElement[] = [];
       for (let index = windowState.start; index < windowState.end; index++) {
-        this.renderPendingRow(visible, rows[index]);
+        const slot = this.createWindowRowSlot(visible, rows[index].key);
+        this.renderPendingRow(slot, rows[index]);
+        slots.push(slot);
       }
+      this.applyWindowedPathPlan(
+        slots,
+        pathPlan.slice(windowState.start, windowState.end),
+      );
       // Restore the per-row open state before measuring: a row remounted by a
       // window shift has to answer to the same rule as its first mount.
       this.applyPlanRowExpansionIn(visible, this.renderedBatchedRows);
@@ -4110,7 +4294,10 @@ export class EasySyncSyncView extends ItemView {
     // Same icon and chip as every other FolderDeferred row: retained is a
     // not-synced state, not a new decision category.
     setIcon(icon, "folder-clock");
-    header.createSpan("easy-sync-tree-path").setText(issue.path);
+    // The windowed path plan needs the same full-path contract as every other
+    // window row (tooltip, aria-label, data-easy-sync-full-path) before the
+    // visible text is shortened to the folder leaf.
+    configureFilePath(header, header.createSpan("easy-sync-tree-path"), issue.path, true);
     const chipLabel = formatPendingIssueChipLabel(issue, t);
     if (chipLabel) {
       header.createSpan("easy-sync-tree-chip").setText(chipLabel);
@@ -4158,7 +4345,8 @@ export class EasySyncSyncView extends ItemView {
     const actions = body.createDiv("easy-sync-item-actions");
     // 主次判据（同族先例：采纳行「下载并同步」＝accent／「跳过」＝""，删除行
     // 「确认删除」＝warning／「拒绝」＝""）：上传是这一行的主动作，上强调色；
-    // 「留在本机，不再提醒」是次动作，保持中性。
+    // 「留在本机」与「打开文件」是次动作，保持中性。顺序＝上传／留在本机／
+    // 打开文件（2026-10-29 用户目审定序）。
     this.createActionChip(
       actions,
       t("syncView.localOnly.upload"),
@@ -4184,6 +4372,20 @@ export class EasySyncSyncView extends ItemView {
         );
       },
     );
+    // 打开文件复用待处理问题行的既有动作名与打开方式（2026-10-29 用户要求）。
+    const localFile = this.plugin.app.vault.getAbstractFileByPath(
+      entry.targetPath,
+    );
+    if (localFile instanceof TFile) {
+      this.createActionChip(
+        actions,
+        t("syncView.issues.openFile"),
+        "",
+        () => {
+          void this.plugin.app.workspace.getLeaf(false).openFile(localFile);
+        },
+      );
+    }
 
   }
 
@@ -4225,7 +4427,10 @@ export class EasySyncSyncView extends ItemView {
             t("confirm.cancel"),
             t,
             {
-              message: t("syncView.localOnly.batchConfirmMessage"),
+              steps: [
+                t("syncView.localOnly.batchConfirmStep.authoritative"),
+                t("syncView.localOnly.batchConfirmStep.sameName"),
+              ],
             },
           ).awaitConfirm();
           if (!confirmed) return;
@@ -4269,7 +4474,9 @@ export class EasySyncSyncView extends ItemView {
             t("confirm.cancel"),
             t,
             {
-              message: t("syncView.delete.confirmAllMessage"),
+              message: t("syncView.delete.confirmAllMessage", {
+                count: paths.length,
+              }),
               warning: t("syncView.delete.confirmAllWarning"),
               danger: true,
             },
@@ -4927,8 +5134,60 @@ export class EasySyncSyncView extends ItemView {
     const option = choice === "keep-local"
       ? snapshot.keepLocal
       : snapshot.keepRemote;
-    if (!option.deletesOtherSide) return true;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
+    const localPresent = snapshot.local.filter((fact) => fact.exists);
+    const remotePresent = snapshot.remote.filter((fact) => fact.exists);
+    const contentDiverged = Boolean(snapshot.sourcePath)
+      && localPresent.length === 1
+      && remotePresent.length === 1
+      && localPresent[0].path !== remotePresent[0].path
+      && !(localPresent[0].hash === remotePresent[0].hash
+        && localPresent[0].size === remotePresent[0].size);
+    if (contentDiverged) {
+      // Two-step consolidation: the winner is created on the losing side
+      // first, then the losing copy is retired (2026-10-31).
+      const keepLocal = choice === "keep-local";
+      const local = localPresent[0];
+      const remote = remotePresent[0];
+      const factSize = (fact: { size?: number }) =>
+        formatFileSize(fact.size ?? 0);
+      const steps = keepLocal
+        ? [
+            t("syncView.mutationResolution.deleteConfirmStepUploadLocal", {
+              path: local.path,
+              size: factSize(local),
+            }),
+            t("syncView.mutationResolution.deleteConfirmStepDeleteCloud", {
+              path: remote.path,
+              size: factSize(remote),
+            }),
+          ]
+        : [
+            t("syncView.mutationResolution.deleteConfirmStepDownloadCloud", {
+              path: remote.path,
+              size: factSize(remote),
+            }),
+            t("syncView.mutationResolution.deleteConfirmStepDeleteLocal", {
+              path: local.path,
+              size: factSize(local),
+            }),
+          ];
+      return new ConfirmModal(
+        this.plugin.app,
+        t(keepLocal
+          ? "syncView.mutationResolution.deleteConfirmTitleRemote"
+          : "syncView.mutationResolution.deleteConfirmTitleLocal"),
+        t("syncView.mutationResolution.deleteConfirm"),
+        t("confirm.cancel"),
+        t,
+        {
+          steps,
+          warning: t("syncView.mutationResolution.deleteConfirmWarning"),
+          danger: true,
+        },
+      ).awaitConfirm();
+    }
+    if (!option.deletesOtherSide) return true;
     // keep-remote on a missing remote deletes the local copy; keep-local on a
     // missing local deletes the cloud copy (2026-10-25). Naming the side that
     // disappears keeps the question and the consequence in one sentence.
@@ -4947,15 +5206,19 @@ export class EasySyncSyncView extends ItemView {
             ? "syncView.conflict.keepLocal"
             : "syncView.conflict.keepRemote"),
         })
-      : t(deletesLocal
-        ? "syncView.mutationResolution.deleteConfirmMessageLocal"
-        : "syncView.mutationResolution.deleteConfirmMessageRemote", {
-          path: snapshot.path,
-          size: formatFileSize(
-            (deletesLocal ? snapshot.local[0]?.size : snapshot.remote[0]?.size)
-              ?? 0,
-          ),
-        });
+      : (() => {
+          // Name the copy that disappears. On a move record it can sit on
+          // either record path, not just `snapshot.path` (2026-10-31).
+          const deleted = deletesLocal
+            ? snapshot.local.find((fact) => fact.exists)
+            : snapshot.remote.find((fact) => fact.exists);
+          return t(deletesLocal
+            ? "syncView.mutationResolution.deleteConfirmMessageLocal"
+            : "syncView.mutationResolution.deleteConfirmMessageRemote", {
+              path: deleted?.path ?? snapshot.path,
+              size: formatFileSize(deleted?.size ?? 0),
+            });
+        })();
     return new ConfirmModal(
       this.plugin.app,
       title,
@@ -5399,6 +5662,11 @@ export class EasySyncSyncView extends ItemView {
       let offsetsRevision = -1;
       let renderedKey = "";
       let renderDepth = 0;
+      // 懒算：收起的分组不生成计划，也不做任何 DOM 读取；打开后同一份
+      // 计划服务 offsets 与窗口挂载。
+      let pathPlan: WindowedPathPlanEntry[] | null = null;
+      const resolvePathPlan = (): WindowedPathPlanEntry[] =>
+        pathPlan ??= buildWindowedPathPlan(rows.map(planDisplayRowPath));
 
       const resolveOffsets = (): number[] => {
         if (virtualOffsets && offsetsRevision === this.planRowLayoutRevision) {
@@ -5406,12 +5674,21 @@ export class EasySyncSyncView extends ItemView {
         }
         if (hasInlineDecisions) {
           const probe = this.measurePlanDecisionRowHeights(body);
+          const plan = resolvePathPlan();
           virtualOffsets = buildSyncPlanMeasuredVirtualOffsets(
-            rows.map((row) =>
-              this.planRowHeights.get(row.key)
-              ?? (this.resolvePlanRowOpen(row.key, this.renderedBatchedRows)
+            rows.map((row, index) => {
+              const measured = this.planRowHeights.get(row.key);
+              if (measured !== undefined) return measured;
+              const base = this.resolvePlanRowOpen(
+                row.key,
+                this.renderedBatchedRows,
+              )
                 ? probe.expandedRowHeight
-                : probe.collapsedRowHeight)),
+                : probe.collapsedRowHeight;
+              return base + (plan[index]?.directoryOwner
+                ? probe.directoryHeight
+                : 0);
+            }),
           );
         } else {
           const probe = this.measurePlanRowHeights(body);
@@ -5419,6 +5696,8 @@ export class EasySyncSyncView extends ItemView {
             rows.map((row) => row.item),
             probe.rowHeight,
             probe.reasonRowHeight,
+            resolvePathPlan().map((entry) =>
+              entry.directoryOwner ? probe.directoryHeight : 0),
           );
         }
         offsetsRevision = this.planRowLayoutRevision;
@@ -5468,14 +5747,22 @@ export class EasySyncSyncView extends ItemView {
           offsets,
         );
         if (!visible) return;
+        const plan = resolvePathPlan();
+        const slots: HTMLElement[] = [];
         for (let index = windowState.start; index < windowState.end; index++) {
+          const slot = this.createWindowRowSlot(visible, rows[index].key);
           this.renderPlanReviewRow(
-            visible,
+            slot,
             rows[index],
             conflictByPath,
             deleteByPath,
           );
+          slots.push(slot);
         }
+        this.applyWindowedPathPlan(
+          slots,
+          plan.slice(windowState.start, windowState.end),
+        );
         // Restore the per-row open state before measuring: a row remounted by a
         // window shift has to answer to the same rule as its first mount.
         this.applyPlanRowExpansionIn(visible, this.renderedBatchedRows);
@@ -5495,10 +5782,24 @@ export class EasySyncSyncView extends ItemView {
     }
   }
 
+  /** Height of one gray-directory line, measured once per list so the offset
+   *  estimate can add it to the rows that own a directory. */
+  private measureWindowDirectoryHeight(container: HTMLElement): number {
+    const probe = container.createDiv(
+      "easy-sync-path-directory easy-sync-window-directory",
+    );
+    probe.setText("measure/directory/");
+    const height = probe.getBoundingClientRect().height;
+    probe.remove();
+    return height > 0 ? height : 14;
+  }
+
   private measurePlanRowHeights(container: HTMLElement): {
     rowHeight: number;
     reasonRowHeight: number;
+    directoryHeight: number;
   } {
+    const directoryHeight = this.measureWindowDirectoryHeight(container);
     const probe = container.createDiv(
       "easy-sync-file-row easy-sync-plan-measure-probe",
     );
@@ -5512,6 +5813,7 @@ export class EasySyncSyncView extends ItemView {
     return {
       rowHeight: rowHeight > 0 ? rowHeight : 20,
       reasonRowHeight: reasonRowHeight > 0 ? reasonRowHeight : 42,
+      directoryHeight,
     };
   }
 
@@ -5524,7 +5826,9 @@ export class EasySyncSyncView extends ItemView {
   private measurePlanDecisionRowHeights(container: HTMLElement): {
     collapsedRowHeight: number;
     expandedRowHeight: number;
+    directoryHeight: number;
   } {
+    const directoryHeight = this.measureWindowDirectoryHeight(container);
     const probe = container.createEl("details", {
       cls: "easy-sync-tree-item easy-sync-plan-decision-probe",
     });
@@ -5556,6 +5860,7 @@ export class EasySyncSyncView extends ItemView {
       expandedRowHeight: expandedRowHeight > collapsed
         ? expandedRowHeight
         : collapsed + 62,
+      directoryHeight,
     };
   }
 
@@ -5615,6 +5920,138 @@ export class EasySyncSyncView extends ItemView {
     }
   }
 
+  /** A virtualized row's measurement unit: the optional gray-directory line
+   *  plus the row itself. The slot carries the row key, so the height cache
+   *  keeps keying by row identity while the directory line is inside the
+   *  measured box instead of being an unaccounted sibling. */
+  private createWindowRowSlot(container: HTMLElement, key: string): HTMLElement {
+    const slot = container.createDiv("easy-sync-plan-row-slot");
+    slot.dataset.easySyncPlanSlot = key;
+    return slot;
+  }
+
+  private resolveWindowRowPathElement(slot: ParentNode): HTMLElement | null {
+    return slot.querySelector<HTMLElement>(".easy-sync-adaptive-path")
+      ?? slot.querySelector<HTMLElement>(".easy-sync-tree-path")
+      ?? slot.querySelector<HTMLElement>(".easy-sync-file-path");
+  }
+
+  /**
+   * Apply the data-level path plan to the mounted slots.
+   *
+   * Writes are split into passes (create all directory elements, read all
+   * widths, then write text) so a window of ~20 rows costs one layout read per
+   * row instead of an interleaved read/write per row. Text fitting never
+   * changes a row's height, so the offsets built from the plan stay valid.
+   */
+  private applyWindowedPathPlan(
+    slots: readonly HTMLElement[],
+    plan: readonly WindowedPathPlanEntry[],
+  ): void {
+    if (slots.length === 0) return;
+    // Pass 1 (writes): create every directory element first.
+    const created: Array<{
+      dir: HTMLElement;
+      slot: HTMLElement;
+      directory: string;
+    }> = [];
+    for (let index = 0; index < slots.length; index++) {
+      const entry = plan[index];
+      if (!entry?.directory || !entry.directoryOwner) continue;
+      const slot = slots[index];
+      const dir = slot.createDiv(
+        "easy-sync-path-directory easy-sync-window-directory",
+      );
+      slot.insertBefore(dir, slot.firstChild);
+      dir.setAttribute("aria-hidden", "true");
+      dir.dataset.easySyncFullDirectory = entry.directory;
+      created.push({ dir, slot, directory: entry.directory });
+    }
+    // Pass 2 (reads): geometry for every created directory, with no writes in
+    // between, so the browser does not recalculate layout for each row.
+    const measured = created.map(({ dir, slot, directory }) => {
+      const pathEl = this.resolveWindowRowPathElement(slot);
+      const dirRect = dir.getBoundingClientRect();
+      const pathLeft = pathEl
+        ? pathEl.getBoundingClientRect().left
+        : dirRect.left;
+      const indent = Math.max(0, Math.round(pathLeft - dirRect.left));
+      const width = Math.max(0, dir.clientWidth - indent - 4);
+      return {
+        dir,
+        directory,
+        indent,
+        width,
+        font: this.resolveAdaptivePathFont(dir),
+      };
+    });
+    // Pass 3 (text fitting; the monospace fast path does no layout).
+    const fittedTexts = measured.map((fit) =>
+      this.fitAdaptiveDirectoryText(
+        fit.directory,
+        fit.width,
+        fit.font?.key ?? "",
+        (text) => this.measureAdaptiveDirectoryText(fit.dir, fit.font, text),
+      ));
+    // Pass 4 (writes): indent, fitted directory text, then the main-line text.
+    for (let index = 0; index < measured.length; index++) {
+      const fit = measured[index];
+      if (fit.indent > 0) {
+        fit.dir.style.setProperty(
+          "--easy-sync-path-directory-indent",
+          `${fit.indent}px`,
+        );
+      }
+      const text = fittedTexts[index];
+      if (fit.dir.textContent !== text) fit.dir.setText(text);
+    }
+    for (let index = 0; index < slots.length; index++) {
+      const entry = plan[index];
+      if (!entry?.displayPath) continue;
+      const pathEl = this.resolveWindowRowPathElement(slots[index]);
+      if (pathEl) pathEl.setText(entry.displayPath);
+    }
+  }
+
+  /** Re-fit mounted directory text after a width or font change. Text-only:
+   *  it never changes a row's height, so the scroll offset model stays valid
+   *  and the window does not need to re-mount on every resize frame. */
+  private refreshWindowedPathDirectories(): void {
+    const dirs = this.contentEl.querySelectorAll<HTMLElement>(
+      ".easy-sync-plan-row-slot > .easy-sync-path-directory",
+    );
+    const fits: Array<{ dir: HTMLElement; indent: number; text: string }> = [];
+    for (const dir of Array.from(dirs)) {
+      const directory = dir.dataset.easySyncFullDirectory;
+      const slot = dir.parentElement;
+      if (!directory || !slot) continue;
+      const pathEl = this.resolveWindowRowPathElement(slot);
+      const dirRect = dir.getBoundingClientRect();
+      const pathLeft = pathEl
+        ? pathEl.getBoundingClientRect().left
+        : dirRect.left;
+      const indent = Math.max(0, Math.round(pathLeft - dirRect.left));
+      const width = Math.max(0, dir.clientWidth - indent - 4);
+      const font = this.resolveAdaptivePathFont(dir);
+      const text = this.fitAdaptiveDirectoryText(
+        directory,
+        width,
+        font?.key ?? "",
+        (candidate) => this.measureAdaptiveDirectoryText(dir, font, candidate),
+      );
+      fits.push({ dir, indent, text });
+    }
+    for (const fit of fits) {
+      if (fit.indent > 0) {
+        fit.dir.style.setProperty(
+          "--easy-sync-path-directory-indent",
+          `${fit.indent}px`,
+        );
+      }
+      if (fit.dir.textContent !== fit.text) fit.dir.setText(fit.text);
+    }
+  }
+
   /**
    * Record the user's choice for one decision row. The row is about to
    * re-flow, so its cached height no longer applies.
@@ -5628,14 +6065,17 @@ export class EasySyncSyncView extends ItemView {
 
   /** Measure the mounted rows and report whether any height changed. */
   private rememberPlanRowHeights(container: HTMLElement): boolean {
-    const rows = container.querySelectorAll<HTMLElement>(
-      "[data-easy-sync-plan-row]",
+    // The slot is the measured box: it contains the optional gray-directory
+    // line and the row. Measuring the row alone would leave the directory
+    // line outside the scroll offset model.
+    const slots = container.querySelectorAll<HTMLElement>(
+      "[data-easy-sync-plan-slot]",
     );
     let changed = false;
-    for (const row of Array.from(rows)) {
-      const key = row.dataset.easySyncPlanRow;
+    for (const slot of Array.from(slots)) {
+      const key = slot.dataset.easySyncPlanSlot;
       if (!key) continue;
-      const height = row.getBoundingClientRect().height;
+      const height = slot.getBoundingClientRect().height;
       if (height <= 0 || this.planRowHeights.get(key) === height) continue;
       this.planRowHeights.set(key, height);
       changed = true;
@@ -5785,7 +6225,11 @@ export class EasySyncSyncView extends ItemView {
             t("confirm.cancel"),
             t,
             {
-              message: t("syncView.conflict.batchKeepLocalMessage"),
+              steps: [
+                t("syncView.conflict.batchKeepLocalStep.cloudOnly"),
+                t("syncView.conflict.batchKeepLocalStep.localOnly"),
+                t("syncView.conflict.batchKeepLocalStep.both"),
+              ],
               danger: true,
             },
           ).awaitConfirm();
@@ -5809,7 +6253,11 @@ export class EasySyncSyncView extends ItemView {
             t("confirm.cancel"),
             t,
             {
-              message: t("syncView.conflict.batchKeepRemoteMessage"),
+              steps: [
+                t("syncView.conflict.batchKeepRemoteStep.localOnly"),
+                t("syncView.conflict.batchKeepRemoteStep.cloudOnly"),
+                t("syncView.conflict.batchKeepRemoteStep.both"),
+              ],
               danger: true,
             },
           ).awaitConfirm();

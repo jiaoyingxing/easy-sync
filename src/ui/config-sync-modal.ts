@@ -31,6 +31,10 @@ import {
   type TimeoutHandle,
 } from "../obsidian-compat";
 import { EasySyncModal } from "./easy-sync-modal";
+import {
+  bindModalKeyboardDismissal,
+  keepModalFocusOnBody,
+} from "./easy-sync-modal";
 import { ConfirmModal } from "./confirm-modal";
 import { SequentialSettingsUpdateQueue } from "./sequential-settings-update-queue";
 import {
@@ -117,6 +121,7 @@ export class ConfigSyncModal extends EasySyncModal {
   private loadGeneration = 0;
   private destroyed = false;
   private listScrollEl: HTMLElement | null = null;
+  private managerTitleChipEl: HTMLElement | null = null;
   private communityPluginScopeControls = new Map<
     PluginColumn,
     CommunityPluginScopeControls
@@ -142,6 +147,7 @@ export class ConfigSyncModal extends EasySyncModal {
   private searchRenderDebounce: TimeoutHandle | null = null;
   private inventoryReloadGateTimer: TimeoutHandle | null = null;
   private lastInventoryReloadCompletedAt = 0;
+  private keyboardDismissDisposer: (() => void) | null = null;
   /**
    * Set when the remote catalog refresh was skipped because a sync round was
    * in flight at manager open time. Cleared once a follow-up refresh succeeds
@@ -163,6 +169,12 @@ export class ConfigSyncModal extends EasySyncModal {
     }
   }
 
+  /** One scope/manager modal at a time: same view rejected, another replaces. */
+  override open(): void {
+    if (!this.takeOverSingleInstance(this.initialView)) return;
+    super.open();
+  }
+
   onOpen(): void {
     this.destroyed = false;
     this.catalogRefreshSkippedWhileSyncing = false;
@@ -172,6 +184,8 @@ export class ConfigSyncModal extends EasySyncModal {
         this.handleCommunityPluginInventoryRevision(revision);
       });
     this.modalEl.addClass("easy-sync-settings-modal");
+    keepModalFocusOnBody(this);
+    this.keyboardDismissDisposer = bindModalKeyboardDismissal(this);
     if (this.initialView === "scope") {
       this.renderScope();
       return;
@@ -184,7 +198,10 @@ export class ConfigSyncModal extends EasySyncModal {
   onClose(): void {
     this.destroyed = true;
     this.loadGeneration += 1;
+    this.releaseSingleInstance();
     this.inventoryRevisionRefreshPending = false;
+    this.keyboardDismissDisposer?.();
+    this.keyboardDismissDisposer = null;
     compatClearTimeout(this.searchRenderDebounce);
     this.searchRenderDebounce = null;
     compatClearTimeout(this.inventoryReloadGateTimer);
@@ -321,6 +338,8 @@ export class ConfigSyncModal extends EasySyncModal {
               : "settings.communityPlugins.manage.data",
           ))
           .onClick(() => {
+            // 叠层子弹框（2026-10-31 用户拍板撤回去叠层）：管理页开在范围页
+            // 之上，关掉子弹框即回范围页，不需要页内返回控件。
             this.openCommunityPluginManagerModal(column);
           });
         button.buttonEl.addClass("clickable-icon");
@@ -341,9 +360,6 @@ export class ConfigSyncModal extends EasySyncModal {
           });
       });
     setting.settingEl.addClass("easy-sync-community-plugin-scope-setting");
-    if (column === "data") {
-      this.appendExperimentalPluginDataChip(setting.nameEl);
-    }
     const selectionChipEl = setting.nameEl.createSpan(
       "easy-sync-plugin-selection-chip",
     );
@@ -425,10 +441,20 @@ export class ConfigSyncModal extends EasySyncModal {
         .map((item) => item.id);
       if (
         requiresExperimentalConfirmation
-        && !await this.confirmExperimentalPluginData(
-          "settings.communityPlugins.data.experimentalBulkMessage",
-          { count: knownPluginIds.length },
-        )
+        && !await this.confirmExperimentalPluginData({
+          steps: [
+            this.plugin.i18n.t(
+              "settings.communityPlugins.data.experimentalBulkStep.shared",
+              { count: knownPluginIds.length },
+            ),
+            this.plugin.i18n.t(
+              "settings.communityPlugins.data.experimentalBulkStep.replace",
+            ),
+            this.plugin.i18n.t(
+              "settings.communityPlugins.data.experimentalBulkStep.conflict",
+            ),
+          ],
+        })
       ) return;
       if (requiresExperimentalConfirmation) {
         this.pendingCommunityPluginScopeValues.set(column, value);
@@ -490,42 +516,69 @@ export class ConfigSyncModal extends EasySyncModal {
     column: PluginColumn,
     chipEl: HTMLElement,
     scopeEnabled: boolean,
+    inventory: readonly CommunityPluginInventoryItem[] = this.scopeInventory,
+    loaded: boolean = this.scopeInventoryLoaded,
   ): void {
     if (
       !scopeEnabled
-      || !this.scopeInventoryLoaded
+      || !loaded
     ) {
       chipEl.setText("");
       chipEl.addClass("is-hidden");
       return;
     }
-    const items = column === "files"
-      ? this.scopeInventory.filter((item) =>
+    const items = this.getCommunityPluginChipItems(column, inventory);
+    if (items.length === 0) {
+      chipEl.setText("");
+      chipEl.addClass("is-hidden");
+      return;
+    }
+    const enabledCount = items.filter((item) => {
+      const pending = this.pendingPluginValues.get(
+        this.getRowKey(column, item.id),
+      );
+      return pending ?? this.isPluginEffectivelyEnabled(item.id, column);
+    }).length;
+    chipEl.setText(this.plugin.i18n.t(
+      "settings.communityPlugins.selectionSummary",
+      { enabled: enabledCount, total: items.length },
+    ));
+    chipEl.removeClass("is-hidden");
+  }
+
+  /** 可见行口径与设置页 chip 共用；data 列只统计插件本体已参与的插件。 */
+  private getCommunityPluginChipItems(
+    column: PluginColumn,
+    inventory: readonly CommunityPluginInventoryItem[],
+  ): CommunityPluginInventoryItem[] {
+    return column === "files"
+      ? inventory.filter((item) =>
           !isPluginRowHiddenByCloudCleanup(
             column,
             item.local,
             this.cleanedPluginIds.has(item.id),
           ))
-      : this.scopeInventory.filter((item) =>
+      : inventory.filter((item) =>
           this.isPluginEffectivelyEnabled(item.id, "files")
           && !isPluginRowHiddenByCloudCleanup(
             column,
             item.local,
             this.cleanedPluginIds.has(item.id),
           ));
-    if (items.length === 0) {
-      chipEl.setText("");
-      chipEl.addClass("is-hidden");
-      return;
-    }
-    const enabledCount = items.filter((item) =>
-      this.isPluginEffectivelyEnabled(item.id, column)
-    ).length;
-    chipEl.setText(this.plugin.i18n.t(
-      "settings.communityPlugins.selectionSummary",
-      { enabled: enabledCount, total: items.length },
-    ));
-    chipEl.removeClass("is-hidden");
+  }
+
+  private renderCommunityPluginManagerTitleChip(): void {
+    const chipEl = this.managerTitleChipEl;
+    const column = this.getManagerColumn();
+    if (!chipEl || !column) return;
+    this.renderCommunityPluginSelectionChip(
+      column,
+      chipEl,
+      this.getCommunityPluginScopeEnabled(column)
+        && (column !== "data" || this.getCommunityPluginScopeEnabled("files")),
+      this.inventory,
+      !this.inventoryLoading && !this.inventoryLoadFailed,
+    );
   }
 
   private async openCommunityPluginManager(
@@ -689,13 +742,12 @@ export class ConfigSyncModal extends EasySyncModal {
         ? "settings.communityPlugins.files.title"
         : "settings.communityPlugins.data.title",
     ));
-    this.titleEl.toggleClass(
-      "easy-sync-community-plugin-data-title",
-      column === "data",
+    this.titleEl.addClass("easy-sync-community-plugin-title-with-chip");
+    this.managerTitleChipEl = this.titleEl.createSpan(
+      "easy-sync-plugin-selection-chip",
     );
-    if (column === "data") {
-      this.appendExperimentalPluginDataChip(this.titleEl);
-    }
+    this.managerTitleChipEl.addClass("is-hidden");
+    this.renderCommunityPluginManagerTitleChip();
 
     const search = new SearchComponent(this.contentEl)
       .setPlaceholder(t("settings.communityPlugins.search"))
@@ -713,6 +765,8 @@ export class ConfigSyncModal extends EasySyncModal {
     this.listScrollEl = this.contentEl.createDiv(
       "easy-sync-plugin-list-scroll",
     );
+    // 手机软键盘弹出时给清单滚动区让位（键盘收起为 0，桌面恒 0）。
+    this.listScrollEl.addClass("easy-sync-keyboard-tail");
     this.renderPluginListArea();
   }
 
@@ -720,6 +774,7 @@ export class ConfigSyncModal extends EasySyncModal {
     if (!this.listScrollEl) return;
     const column = this.getManagerColumn();
     if (!column) return;
+    this.renderCommunityPluginManagerTitleChip();
     if (this.inventoryLoading && this.inventory.length > 0) return;
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     const previousScrollTop = this.listScrollEl.scrollTop;
@@ -1077,12 +1132,12 @@ export class ConfigSyncModal extends EasySyncModal {
     if (this.confirmingDataRows.has(item.id)) return;
     this.confirmingDataRows.add(item.id);
     if (!this.destroyed) this.renderPluginListArea();
-    const confirmed = await this.confirmExperimentalPluginData(
-      enablePluginFiles
+    const confirmed = await this.confirmExperimentalPluginData({
+      messageKey: enablePluginFiles
         ? "settings.communityPlugins.data.experimentalItemWithFilesMessage"
         : "settings.communityPlugins.data.experimentalItemMessage",
-      { plugin: this.getCommunityPluginDisplayName(item) },
-    );
+      params: { plugin: this.getCommunityPluginDisplayName(item) },
+    });
     this.confirmingDataRows.delete(item.id);
     if (!confirmed) {
       if (!this.destroyed) this.renderPluginListArea();
@@ -1120,8 +1175,9 @@ export class ConfigSyncModal extends EasySyncModal {
   }
 
   private confirmExperimentalPluginData(
-    messageKey: string,
-    params: Record<string, string | number>,
+    copy:
+      | { messageKey: string; params: Record<string, string | number> }
+      | { steps: readonly string[] },
   ): Promise<boolean> {
     const t = this.plugin.i18n.t.bind(this.plugin.i18n);
     return new ConfirmModal(
@@ -1131,18 +1187,13 @@ export class ConfigSyncModal extends EasySyncModal {
       t("confirm.cancel"),
       t,
       {
-        message: t(messageKey, params),
+        ...("steps" in copy
+          ? { steps: copy.steps }
+          : { message: t(copy.messageKey, copy.params) }),
         warning: t("settings.communityPlugins.data.experimentalWarning"),
         danger: true,
       },
     ).awaitConfirm();
-  }
-
-  private appendExperimentalPluginDataChip(containerEl: HTMLElement): void {
-    containerEl.createSpan({
-      cls: "easy-sync-plugin-selection-chip is-experimental",
-      text: this.plugin.i18n.t("settings.communityPlugins.experimental"),
-    });
   }
 
   private queuePluginSelectionUpdate(
