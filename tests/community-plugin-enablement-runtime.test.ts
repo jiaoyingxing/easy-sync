@@ -5,9 +5,9 @@ import type { OneDriveClient } from "../src/onedrive/client";
 import { OneDriveError, OneDriveErrorType } from "../src/onedrive/types";
 import {
   SyncExecutor,
-  type AutomaticHandlingMetrics,
   type SyncResult,
 } from "../src/sync/sync-executor";
+import type { AutomaticHandlingMetrics } from "../src/sync/executor-metrics";
 import type { LocalScanner } from "../src/sync/local-scanner";
 import type { StateManager } from "../src/sync/state-manager";
 import {

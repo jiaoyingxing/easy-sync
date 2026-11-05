@@ -21,6 +21,7 @@ import type {
   RemoteFileEntry,
   SyncScope,
 } from "../src/sync/types";
+import { V2StateRefusalError } from "../src/sync/v2-state-refusal";
 import { SyncActionType } from "../src/sync/types";
 import { I18n } from "../src/i18n";
 import {
@@ -622,8 +623,9 @@ async function makeStuckFolderRecordFixture() {
   const baseCommit = state.commitMutationCheckpoint;
   state.commitMutationCheckpoint = vi.fn(async (operationId: string) => {
     if (operationId === record.intent.operationId) {
-      throw new Error(
-        `V2 folder move file projection changed: ${record.intent.path}`,
+      throw new V2StateRefusalError(
+        "V2 folder move file projection changed",
+        record.intent.path,
       );
     }
     return baseCommit(operationId);

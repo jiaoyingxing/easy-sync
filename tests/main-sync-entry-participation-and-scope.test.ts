@@ -272,7 +272,7 @@ describe("main sync entry guards", () => {
       filesRootId: "root-reviewed-restore",
     };
     const canonicalIdentity = {
-      version: 2 as const,
+      version: 3 as const,
       scope,
       sourceCommitSeq: 11,
       digest: "c".repeat(64),

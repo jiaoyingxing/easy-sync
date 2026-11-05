@@ -2199,6 +2199,27 @@ describe("OneDriveClient delta continuation", () => {
     }));
   });
 
+  // R7（账本 §十三）：200 页的 value 不是数组时必须抛类型化 NetworkError，
+  // 而不是让裸 TypeError 逃逸（重试分类退化为 unknown）。
+  it("rejects a delta page whose value is not an array as a typed network error", async () => {
+    vi.spyOn(obsidian, "requestUrl").mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      json: {
+        value: null,
+        "@odata.deltaLink": "https://graph.microsoft.com/v1.0/drives/drive-id/items/root-id/delta?token=2",
+      },
+    });
+    const client = new OneDriveClient(async () => "token");
+
+    await expect(
+      client.getDelta(
+        "testVault",
+        "https://graph.microsoft.com/v1.0/drives/drive-id/items/root-id/delta?token=1",
+      ),
+    ).rejects.toMatchObject({ type: OneDriveErrorType.NetworkError });
+  });
+
   it("rejects an untrusted persisted delta link before acquiring or sending a bearer token", async () => {
     const getToken = vi.fn().mockResolvedValue("token");
     const requestSpy = vi.spyOn(obsidian, "requestUrl");

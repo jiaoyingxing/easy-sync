@@ -801,7 +801,7 @@ describe("main sync entry guards", () => {
         filesRootId: "root",
       },
       canonicalIdentity: {
-        version: 2 as const,
+        version: 3 as const,
         scope: {
           accountId: "account",
           driveId: "drive",

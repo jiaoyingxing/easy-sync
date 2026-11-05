@@ -49,11 +49,17 @@ import {
 } from "../onedrive/types";
 import type {
   DriveItem,
-  RemoteVaultScopeIdentityFailureReason,
   SharedSyncProtocolObservationComponent,
   UploadResult,
 } from "../onedrive/types";
 import { AuthError, AuthErrorType } from "../auth/types";
+import { PLAN_REASON } from "./plan-reason";
+import {
+  isV2BaseUpsertRejectionError,
+  isV2RemoteMoveMissingSourceDeletionError,
+  isV2RemoteUpsertParentMismatchError,
+  isV2StateAbsorptionRefusalError,
+} from "./v2-state-refusal";
 import {
   SyncActionType,
   planDigest,
@@ -68,6 +74,7 @@ import type {
   SharedSyncProtocolBindingProvenObject,
 } from "../onedrive/client";
 import { isResponseByteBudgetError } from "../onedrive/client";
+import type { SyncProvider } from "./sync-provider";
 import { isEasySyncInternalPath } from "./local-scanner";
 import type { LocalFileInspection, LocalFileStatInspection, LocalScanner } from "./local-scanner";
 import {
@@ -391,27 +398,68 @@ import {
   type CommunityPluginJoinAuthorization,
   type CommunityPluginJoinBlock,
 } from "./community-plugin-join";
-
-interface RetryableObservationDisposition {
-  kind: "retryable-observation";
-  phase: "remotePrepare";
-  code:
-    | "shared-control-read-unavailable"
-    | "ordinary-remote-read-unavailable";
-  retry: "next-sync";
-  component:
-    | SharedSyncProtocolObservationComponent
-    | "ordinary-remote";
-}
-
-type SyncRunDisposition = RetryableObservationDisposition;
-
-/** Monotonic execution facts owned by the executor. Presentation and
- * scheduling must not reconstruct these facts from aggregate counters. */
-type RetryableObservationResultClassification =
-  | { kind: "absent" }
-  | { kind: "valid"; disposition: RetryableObservationDisposition }
-  | { kind: "contradictory"; disposition: RetryableObservationDisposition };
+import {
+  CommunityPluginBundleDowngradeError,
+  DownloadRemoteVersionChangedError,
+  DownloadedPayloadSizeMismatchError,
+  IncrementalRemoteHierarchyError,
+  LocalCommitPreconditionError,
+  LocalFolderCreateUnconfirmedError,
+  LocalVersionChangedBeforeDeleteError,
+  LocalWriteNotLandedError,
+  MutationNotAppliedError,
+  MutationRecoveryBlockedError,
+  type V2CommittedScopeLossReason,
+  V2CommittedScopeUnreachableError,
+} from "./executor-errors";
+import {
+  createAutomaticHandlingMetrics,
+  createFileTransferMetrics,
+  createMutationPersistenceMetrics,
+  recordAutomaticMergeManual,
+  recordCheckpointMetrics,
+  summarizeLatencyMs,
+  type AutomaticHandlingMetrics,
+  type CleanupWaveHandoff,
+  type DeferredMutationCompletion,
+  type ExecutionMetrics,
+  type ExecutionPhaseState,
+  type FileTransferMetrics,
+  type InFlightTransfer,
+  type PreparedDownload,
+  type SyncRunPhase,
+  type SyncRunPhaseDurations,
+  type UploadTransferObservation,
+} from "./executor-metrics";
+import type {
+  CommitReviewedFolderLocationResolutionArgs,
+  CommitReviewedFolderLocationResolutionOutcome,
+  CommitReviewedFolderSubtreeDeletionArgs,
+  CommitReviewedFolderSubtreeDeletionOutcome,
+  CommitReviewedRemoteDownloadTransferArgs,
+  CommitReviewedRemoteDownloadTransferOutcome,
+  ConfirmPendingFolderRemoteDeleteArgs,
+  ConfirmPendingFolderRemoteDeleteOutcome,
+  CreateFolderMutationIntentArgs,
+  CreateFolderMutationIntentOutcome,
+  FinalizeCanonicalContentVerificationArgs,
+  FinalizeCanonicalContentVerificationOutcome,
+  PersistedMutationRecoveryAccumulatorState,
+  RejectRemoteDeleteFolderArgs,
+  RejectRemoteDeleteFolderOutcome,
+  RestoreFastPathOutcome,
+  RestoreFastPathPlan,
+  RetryableObservationDisposition,
+  RetryableObservationResultClassification,
+  SettleAppliedMutationRecoveryOutcome,
+  SettlePersistedManualMutationResolutionOutcome,
+  SideActionPreparationPhase,
+  SideMutationRecoveryOutcome,
+  SideMutationRecoveryResult,
+  SyncRunDisposition,
+  V2ScopeRecoveryVerificationCandidate,
+} from "./executor-recovery-types";
+import type { CommunityPluginBundleDownloadDeferralArgs } from "./executor-community-plugin-types";
 
 /** Result of a sync run */
 export interface SyncResult {
@@ -841,37 +889,6 @@ type StreamDownloadAdapter = DataAdapter & {
   rename: (normalizedPath: string, normalizedNewPath: string) => Promise<void>;
 };
 
-class IncrementalRemoteHierarchyError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "IncrementalRemoteHierarchyError";
-  }
-}
-
-class MutationRecoveryBlockedError extends Error {
-  constructor(
-    readonly summary: MutationRecoveryRunSummary,
-    cause: Error,
-  ) {
-    super(cause.message);
-    this.name = "MutationRecoveryBlockedError";
-  }
-}
-
-type V2CommittedScopeLossReason =
-  | "graph-not-found"
-  | RemoteVaultScopeIdentityFailureReason;
-
-class V2CommittedScopeUnreachableError extends Error {
-  constructor(
-    readonly observedScope: SyncScope | null,
-    readonly causeReason: V2CommittedScopeLossReason,
-  ) {
-    super("Committed V2 remote scope is unreachable");
-    this.name = "V2CommittedScopeUnreachableError";
-  }
-}
-
 interface RemoteProjection {
   entries: RemoteFileEntry[];
   folders: RemoteFolderEntry[];
@@ -1043,302 +1060,12 @@ const PROVABLE_REPLACEMENT_DOWNLOAD_BUDGET = 10;
 /** Safety bound on replacement candidates examined in one planning round. */
 const PROVABLE_REPLACEMENT_CANDIDATE_LIMIT = 20;
 
-interface PreparedDownload {
-  content?: ArrayBuffer;
-  downloaded?: { size: number; hash: string };
-  error?: unknown;
-}
-
 export interface ReviewedContentEqualityProof {
   localHash: string;
   localSize: number;
   remoteHash: string;
   remoteSize: number;
   remoteETag: string;
-}
-
-type SideActionPreparationPhase =
-  | "localRecovery"
-  | "remotePrepare"
-  | "scopeValidation"
-  | "mutationRecovery"
-  | "action";
-
-type SideMutationRecoveryOutcome = "applied" | "not-applied" | "unresolved";
-interface SideMutationRecoveryResult {
-  outcome: SideMutationRecoveryOutcome;
-  retryableObservationError: OneDriveError | null;
-}
-
-/** Marks a failure that happened before the reviewed target was mutated. */
-class MutationNotAppliedError extends Error {
-  constructor(
-    readonly original: unknown,
-    readonly noticeAlreadyShown = false,
-  ) {
-    super(original instanceof Error ? original.message : "Reviewed mutation was not applied");
-    this.name = "MutationNotAppliedError";
-  }
-}
-
-/** A selected plugin bundle upload would move the remote bundle to an older
- *  version. Typed so recovery routing can recognise the downgrade without
- *  matching the user-visible message; the message stays byte-identical
- *  because `error-presentation.ts` presents it by prefix. */
-class CommunityPluginBundleDowngradeError extends Error {
-  constructor(readonly pluginId: string) {
-    super(`Selected plugin upload would downgrade remote bundle: ${pluginId}`);
-    this.name = "CommunityPluginBundleDowngradeError";
-  }
-}
-
-/** Local CAS failed before commitDownloadedTempFile touched the target. */
-class LocalCommitPreconditionError extends Error {}
-
-/**
- * The local write itself did not land: our own truncation, a write that left
- * the reviewed version in place, or content we cannot attribute. Still a
- * precondition error for every caller that defers.
- *
- * `localStateUncertain` marks the sub-cases where the attempt may have left the
- * local file modified (rollback failed, or the read-back was unattributable or
- * missing). Only when it is false may a user-facing message say the file was
- * not changed (`DECISIONS` 2026-09-23 point 9③④⑤).
- */
-class LocalWriteNotLandedError extends LocalCommitPreconditionError {
-  constructor(message: string, readonly localStateUncertain = false) {
-    super(message);
-    this.name = "LocalWriteNotLandedError";
-  }
-}
-
-/** Local file changed after DeleteLocal was planned but before deletion began. */
-class LocalVersionChangedBeforeDeleteError extends Error {
-  constructor(path: string) {
-    super(`Local version changed before deletion: ${path}`);
-    this.name = "LocalVersionChangedBeforeDeleteError";
-  }
-}
-
-/** The downloaded bytes belong to a remote version that is no longer current. */
-class DownloadRemoteVersionChangedError extends Error {
-  constructor(path: string) {
-    super(`Remote version changed during download: ${path}`);
-    this.name = "DownloadRemoteVersionChangedError";
-  }
-}
-
-/** The body we received no longer matches the remote item's declared size —
- *  the same content race as DownloadRemoteVersionChangedError caught at the
- *  other guard (the declared size was read before the rewrite). Deferred like
- *  the version-changed case; the next round replans from the newer remote. */
-class DownloadedPayloadSizeMismatchError extends Error {
-  constructor(path: string, downloadedSize: number, declaredSize: number) {
-    super(
-      `Downloaded size mismatch: ${path} (${downloadedSize} != ${declaredSize})`,
-    );
-    this.name = "DownloadedPayloadSizeMismatchError";
-  }
-}
-
-/** A local folder create was invoked but its result could not be confirmed
- *  after bounded settle re-reads. The failure-classification chain still
- *  re-reads both sides before deciding not-applied vs checkpoint. */
-class LocalFolderCreateUnconfirmedError extends Error {
-  constructor(path: string) {
-    super(`Local folder create read-back failed: ${path}`);
-    this.name = "LocalFolderCreateUnconfirmedError";
-  }
-}
-
-interface FileTransferMetrics {
-  started: number;
-  succeeded: number;
-  failed: number;
-  cancelled: number;
-  skipped: number;
-  logicalBytes: number;
-  /** Busy wall clock of this direction: only the time during which at least
-   *  one transfer of the direction was moving (or signalling) bytes. Whole-body
-   *  transports book their call window — their only byte report lands after
-   *  the payload already moved. Concurrent calls overlap, so this is the
-   *  honest denominator for a combined throughput — the sum of their own
-   *  durations would report the link divided by the pool depth. */
-  busyMs: number;
-  activeConcurrency: number;
-  peakConcurrency: number;
-  stagesMs: {
-    sourceRead: number;
-    contentTransfer: number;
-    contentHash: number;
-    remoteVersionVerify: number;
-    localVersionGuard: number;
-    localCommit: number;
-  };
-}
-
-/** Byte-level progress of one transport call still in flight, kept so the
- *  connection-speed sampler sees movement before the file-level ledger
- *  accrues. `startedAt` is the first nonzero byte event: session setup and
- *  first-byte latency are not transfer time. */
-interface InFlightTransfer {
-  direction: "upload" | "download";
-  bytesSoFar: number;
-  startedAt: number;
-}
-
-type AutomaticMergeManualReason =
-  | "missing-version"
-  | "binary-file"
-  | "unsupported-text-path"
-  | "protected-config"
-  | "ancestor-unavailable"
-  | "ancestor-unverified"
-  | "local-version-changed"
-  | "remote-version-changed"
-  | "stale-version"
-  | "recovery-pending"
-  | "invalid-hash"
-  | "invalid-utf8"
-  | "mixed-line-endings"
-  | "too-large"
-  | "overlap"
-  | "remote-committed-local-pending"
-  | "execution-failed";
-
-export interface AutomaticHandlingMetrics {
-  policy: AutomaticHandlingPolicy;
-  deleteLocal: {
-    candidates: number;
-    completed: number;
-    failed: number;
-  };
-  textMerge: {
-    candidates: number;
-    completed: number;
-    keptManual: number;
-    failed: number;
-    cancelled: number;
-    manualReasons: Partial<Record<AutomaticMergeManualReason, number>>;
-  };
-  mergeRecovery: {
-    records: number;
-    receiptCommitted: number;
-    notApplied: number;
-    remoteCommittedLocalRecovered: number;
-    remoteCommittedLocalPending: number;
-    unresolved: number;
-  };
-  recoveryPendingAtEnd: {
-    deleteLocal: number;
-    merge: number;
-  };
-}
-
-interface ExecutionMetrics {
-  uploadBytes: number;
-  uploadReadMs: number;
-  activeUploads: number;
-  peakUploads: number;
-  fileTransfers: {
-    upload: FileTransferMetrics;
-    download: FileTransferMetrics;
-  };
-  mutationPersistence: MutationPersistenceMetrics;
-  automaticHandling: AutomaticHandlingMetrics;
-}
-
-interface MutationPersistenceMetrics {
-  intentWrites: number;
-  receiptWrites: number;
-  /** Logical mutation receipts covered by successful checkpoint commits. */
-  checkpointOperations: number;
-  /** Physical V2 checkpoint commits, after any safe batching. */
-  checkpointCommits: number;
-  checkpointFailures: number;
-  stagesMs: {
-    intentPersist: number;
-    receiptPersist: number;
-    checkpointAncestorPublish: number;
-    checkpointV2Commit: number;
-    checkpointLedgerClear: number;
-    checkpointTotal: number;
-  };
-}
-
-type SyncRunPhase =
-  | "recovery"
-  | "scan"
-  | "remotePrepare"
-  | "baseline"
-  | "remoteChanges"
-  | "planning"
-  | "reviewWait"
-  | "transfer"
-  | "commit";
-
-type SyncRunPhaseDurations = Record<SyncRunPhase, number>;
-
-function createFileTransferMetrics(): FileTransferMetrics {
-  return {
-    started: 0,
-    succeeded: 0,
-    failed: 0,
-    cancelled: 0,
-    skipped: 0,
-    logicalBytes: 0,
-    busyMs: 0,
-    activeConcurrency: 0,
-    peakConcurrency: 0,
-    stagesMs: {
-      sourceRead: 0,
-      contentTransfer: 0,
-      contentHash: 0,
-      remoteVersionVerify: 0,
-      localVersionGuard: 0,
-      localCommit: 0,
-    },
-  };
-}
-
-function createMutationPersistenceMetrics(): MutationPersistenceMetrics {
-  return {
-    intentWrites: 0,
-    receiptWrites: 0,
-    checkpointOperations: 0,
-    checkpointCommits: 0,
-    checkpointFailures: 0,
-    stagesMs: {
-      intentPersist: 0,
-      receiptPersist: 0,
-      checkpointAncestorPublish: 0,
-      checkpointV2Commit: 0,
-      checkpointLedgerClear: 0,
-      checkpointTotal: 0,
-    },
-  };
-}
-
-function recordCheckpointMetrics(
-  target: MutationPersistenceMetrics,
-  detail: MutationCheckpointCommitMetrics | undefined,
-  elapsedMs: number,
-): void {
-  target.checkpointCommits++;
-  target.checkpointOperations += detail?.operations ?? 1;
-  target.stagesMs.checkpointTotal += detail?.totalMs ?? elapsedMs;
-  target.stagesMs.checkpointAncestorPublish += detail?.ancestorPublishMs ?? 0;
-  target.stagesMs.checkpointV2Commit += detail?.v2CommitMs ?? 0;
-  target.stagesMs.checkpointLedgerClear += detail?.ledgerClearMs ?? 0;
-}
-
-interface DeferredMutationCompletion {
-  operationId: string;
-  path: string;
-  actionType: SyncActionType;
-  reason?: string;
-  fileSize?: number;
-  renameFrom?: string;
 }
 
 interface PlanItemMutationReceiptArgs {
@@ -1351,62 +1078,6 @@ interface PlanItemMutationReceiptArgs {
   metrics: ExecutionMetrics;
   isFolderMove: (candidate: SyncPlanItem) => boolean;
   isFolderDelete: (candidate: SyncPlanItem) => boolean;
-}
-
-/** One persisted batch's shared bookkeeping (cleanup wave, upload batch):
- *  every member's mutation intent is already durable (pre-written by the
- *  batch), receipts are collected instead of written per file, and the batch
- *  commits one checkpoint for all of them. `intent === null` keeps that member
- *  on the ordinary per-file path. */
-interface CleanupWaveHandoff {
-  intent: MutationIntent | null;
-  receipts: MutationReceiptV1[];
-}
-
-/** One small upload's transfer evidence, filled by `executeUploadItem` and
- *  read by the adaptive upload pool right after the item settles.
- *
- *  The pool owns the record and stamps the depth the file was served at; the
- *  transfer path only writes what it alone knows (how long the PUT itself
- *  took, and whether the failure was a rate limit). Only the pool passes one:
- *  every other upload path (large files, manual single-item runs) leaves it
- *  undefined and pays nothing. */
-interface UploadTransferObservation {
-  bytes: number;
-  /** `contentTransfer` duration of the settled PUT, in ms. */
-  transferMs: number;
-  /** `none` = the item settled without a PUT (preflight, conflict, cancel):
-   *  no throughput sample and no failure streak entry. */
-  outcome: "none" | "success" | "failure";
-  /** The failure was a 429/509 that survived the request-level retry budget. */
-  throttled: boolean;
-  /** Retry-After of that rate limit; `null` when the response carried none. */
-  retryAfterSeconds: number | null;
-}
-
-/** One cleanup wave's per-DELETE duration distribution (rounded ms). Nearest
- *  rank on the sorted samples, so p95 >= p50 by construction. Observability
- *  only: nothing branches on these numbers. */
-interface LatencySummaryMs {
-  count: number;
-  p50: number;
-  p95: number;
-  max: number;
-}
-
-function summarizeLatencyMs(samples: readonly number[]): LatencySummaryMs {
-  if (samples.length === 0) return { count: 0, p50: 0, p95: 0, max: 0 };
-  const sorted = [...samples].sort((a, b) => a - b);
-  const at = (percentile: number): number => {
-    const rank = Math.ceil((percentile / 100) * sorted.length);
-    return sorted[Math.min(sorted.length, Math.max(1, rank)) - 1];
-  };
-  return {
-    count: sorted.length,
-    p50: Math.max(0, Math.round(at(50))),
-    p95: Math.max(0, Math.round(at(95))),
-    max: Math.max(0, Math.round(sorted[sorted.length - 1])),
-  };
 }
 
 /** Run `worker` over `items` with at most `limit` in flight and return the
@@ -1429,49 +1100,6 @@ async function mapWithBoundedConcurrency<T, R>(
   const workers = Math.max(1, Math.min(limit, items.length));
   await Promise.all(Array.from({ length: workers }, () => run()));
   return results;
-}
-
-function createAutomaticHandlingMetrics(
-  policy: Readonly<AutomaticHandlingPolicy>,
-): AutomaticHandlingMetrics {
-  return {
-    policy: { ...policy },
-    deleteLocal: {
-      candidates: 0,
-      completed: 0,
-      failed: 0,
-    },
-    textMerge: {
-      candidates: 0,
-      completed: 0,
-      keptManual: 0,
-      failed: 0,
-      cancelled: 0,
-      manualReasons: {},
-    },
-    mergeRecovery: {
-      records: 0,
-      receiptCommitted: 0,
-      notApplied: 0,
-      remoteCommittedLocalRecovered: 0,
-      remoteCommittedLocalPending: 0,
-      unresolved: 0,
-    },
-    recoveryPendingAtEnd: {
-      deleteLocal: 0,
-      merge: 0,
-    },
-  };
-}
-
-function recordAutomaticMergeManual(
-  metrics: AutomaticHandlingMetrics,
-  reason: AutomaticMergeManualReason,
-): null {
-  metrics.textMerge.keptManual++;
-  metrics.textMerge.manualReasons[reason] =
-    (metrics.textMerge.manualReasons[reason] ?? 0) + 1;
-  return null;
 }
 
 /** Callbacks for UI updates during sync */
@@ -1504,7 +1132,7 @@ export interface SyncCallbacks {
 }
 
 function availableSharedSyncProtocolTransportV2(
-  client: OneDriveClient,
+  client: SyncProvider,
   vaultName: string,
 ): SharedSyncProtocolMutationTransportV2 | null {
   const candidate = client as OneDriveClient & {
@@ -1523,7 +1151,7 @@ function availableSharedSyncProtocolTransportV2(
 }
 
 function availableSharedSyncProtocolRepairTransportV2(
-  client: OneDriveClient,
+  client: SyncProvider,
 ): SharedSyncProtocolRepairTransportV2 | null {
   const candidate = client as OneDriveClient & {
     overwriteSharedSyncProtocolV2?:
@@ -1593,7 +1221,7 @@ export function refreshedMetadataMatchesIdentity(
 }
 
 function availableSharedSyncProtocolTransportV3(
-  client: OneDriveClient,
+  client: SyncProvider,
   vaultName: string,
 ): SharedSyncProtocolMutationTransportV3 | null {
   const candidate = client as OneDriveClient & {
@@ -1888,15 +1516,6 @@ type CommunityPluginDowngradeProbeRefreshArgs = {
   probeBatchClient: NonNullable<ReturnType<typeof resolveBatchMetadataClient>>;
 };
 
-type CommunityPluginBundleDownloadDeferralArgs = {
-  byPlugin: Map<string, SyncPlanItem[]>;
-  configDir: string;
-  remoteByPath: Map<string, RemoteFileEntry>;
-  adapter: DataAdapter;
-  refreshedProbeUrls: Map<string, string>;
-  downloads: SyncPlanItem[];
-};
-
 type FreshV2LegacyV2ClassificationArgs = {
   result: SyncResult;
   protocolProfile: Extract<SharedSyncProtocolProfile, { status: "legacy-v2" }>;
@@ -1948,58 +1567,11 @@ type AcceptPreparedSyncScopeExpansionArgs = {
     | { status: "none" };
 };
 
-type FinalizeCanonicalContentVerificationArgs = {
-  plan: SyncPlan;
-  canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
-  migrationCandidateEnvelope: SyncStateEnvelopeV2 | null;
-  v2PlanState: StateManager & {
-    getCommittedV2Envelope?: StateManager["getCommittedV2Envelope"];
-  };
-  verifiedFirstSyncRemoteHashesById: ReadonlyMap<string, string>;
-  automaticHandlingPolicy: AutomaticHandlingPolicy;
-  baselineReconstructionIncomplete: boolean;
-  resolveCanonicalRemoteContentHash: (
-    item: Readonly<SyncPlanItem>,
-    progress: { current: number; total: number },
-    resetProgressPhase?: boolean,
-  ) => Promise<string>;
-  refreshVerificationDownloadUrls: (
-    items: ReadonlyArray<SyncPlanItem>,
-  ) => Promise<void>;
-};
-
-type FinalizeCanonicalContentVerificationOutcome = {
-  finalizedCanonicalPlan: FinalizedCanonicalPlanV2 | null;
-  canonicalPlanCandidate: CanonicalPlanCandidateV2 | null;
-  canonicalFinalizationEnvelope: SyncStateEnvelopeV2 | null;
-  contentEqualityBaseUpserts: BaseFileEntry[];
-};
-
-type CreateFolderMutationIntentArgs = {
-  item: SyncPlanItem;
-  scope: SyncScope;
-};
-
-type CreateFolderMutationIntentOutcome =
-  | { terminated: FolderMutationIntentV2 }
-  | { terminated: null };
-
 type DeferPersistedPluginUploadDowngradeToReviewArgs = {
   intent: MutationIntentV1;
   item: SyncPlanItem;
   result: SyncResult;
   operationEpoch: number;
-};
-
-type PersistedMutationRecoveryAccumulatorState = {
-  hierarchyRefreshedForRecovery: boolean;
-  reflectedCheckpointRetirementCommitSeq: number | undefined;
-  settled: number;
-  applied: number;
-  notApplied: number;
-  receiptCommitted: number;
-  quarantined: number;
-  externalMutations: number;
 };
 
 type SettlePersistedManualMutationResolutionArgs = {
@@ -2019,10 +1591,6 @@ type SettlePersistedManualMutationResolutionArgs = {
   externalMutations: number;
 };
 
-type SettlePersistedManualMutationResolutionOutcome =
-  | { terminated: PersistedMutationRecoveryAccumulatorState }
-  | { terminated: null; settled: number; externalMutations: number };
-
 type SettleExistingV2CorruptStateRecoveryHoldArgs = {
   result: SyncResult;
   callbacks: SyncCallbacks;
@@ -2033,31 +1601,6 @@ type SettleExistingV2CorruptStateRecoveryHoldArgs = {
 type SettleExistingV2CorruptStateRecoveryHoldOutcome =
   | { terminated: SyncResult }
   | { terminated: null };
-
-type CommitReviewedFolderLocationResolutionArgs = {
-  intent: FolderMutationIntentV2;
-  operationEpoch: number;
-  current: FolderLocationResolutionSnapshotV1;
-  item: SyncPlanItem;
-  choice: FolderLocationResolutionChoiceV1;
-};
-
-type CommitReviewedFolderLocationResolutionOutcome = {
-  resolved: boolean;
-  value: boolean | undefined;
-};
-
-type CommitReviewedFolderSubtreeDeletionArgs = {
-  intent: FolderMutationIntentV2;
-  operationEpoch: number;
-  current: FolderSubtreeReviewSnapshotV1;
-  root: FolderSubtreeReviewSnapshotV1["members"][number];
-};
-
-type CommitReviewedFolderSubtreeDeletionOutcome = {
-  deleted: boolean;
-  value: boolean | undefined;
-};
 
 type PublishExactDescendantEvidenceForUnanchoredFolderArgs = {
   result: SyncResult;
@@ -2085,30 +1628,6 @@ type PublishExactDescendantEvidenceForUnanchoredFolderOutcome =
       committedV2Envelope: SyncStateEnvelopeV2 | null;
       reconstructed: Awaited<ReturnType<StateManager["acceptConfirmedDescendantFolderAnchors"]>>;
     };
-
-type CommitReviewedRemoteDownloadTransferArgs = {
-  path: string;
-  queuedConflict: SyncPlanItem;
-  operationEpoch: number;
-  transferState: { targetMutationStarted: boolean };
-};
-
-type CommitReviewedRemoteDownloadTransferOutcome = {
-  content: ArrayBuffer | null;
-  checkpoint: MutationCheckpointV1;
-};
-
-type ConfirmPendingFolderRemoteDeleteArgs = {
-  path: string;
-  pending: SyncPlanItem | undefined;
-  operationEpoch: number;
-  options: { preverifiedAbsent?: boolean } | undefined;
-  showSuccessNotice: boolean;
-};
-
-type ConfirmPendingFolderRemoteDeleteOutcome =
-  | { handled: true; value: boolean | undefined }
-  | { handled: false };
 
 type RecoverReceiptedMutationFailureArgs = {
   error: unknown;
@@ -2141,10 +1660,6 @@ type SettleAppliedMutationRecoveryArgs = {
   resolvedIssuePaths: Set<string>;
 };
 
-type SettleAppliedMutationRecoveryOutcome =
-  | { cancelled: true; transferOutcome: "cancelled" | null }
-  | { cancelled: false; transferOutcome: "succeeded" | "failed" | "cancelled" | "skipped" | null };
-
 type SettleMissingV2RemoteScopeArgs = {
   result: SyncResult;
   callbacks: SyncCallbacks;
@@ -2163,11 +1678,6 @@ type SettleMissingV2RemoteScopeOutcome =
       recovery: NonNullable<SyncStateEnvelopeV2["remoteScopeRecovery"]>;
     };
 
-type V2ScopeRecoveryVerificationCandidate = {
-  node: ReturnType<typeof buildRemoteIndexV2>["index"]["itemsById"][string];
-  path: string;
-};
-
 type VerifyPendingV2ScopeRecoveryCandidatesArgs = {
   result: SyncResult;
   callbacks: SyncCallbacks;
@@ -2181,39 +1691,6 @@ type VerifyPendingV2ScopeRecoveryCandidatesArgs = {
   recoveryVerification: RemoteScopeRecoveryVerificationSummary;
   publishRecoveryVerification: (patch?: Partial<RemoteScopeRecoveryVerificationSummary>) => void;
 };
-
-type RejectRemoteDeleteFolderArgs = {
-  pending: SyncPlanItem;
-  path: string;
-  operationEpoch: number;
-};
-
-type RejectRemoteDeleteFolderOutcome =
-  | { handled: true; value: boolean | undefined }
-  | { handled: false };
-
-/** Committed facts a recycle-bin restore can be checked against without
- *  downloading the restored bytes. Built only when every fact is present. */
-type RestoreFastPathPlan = {
-  remoteId: string;
-  remoteCTag: string;
-  anchorHash: string;
-  anchorSize: number;
-  anchorETag: string | undefined;
-  expectedParentId: string;
-  expectedName: string;
-};
-
-type RestoreFastPathOutcome =
-  /** Proof succeeded: no upload, commit this checkpoint. */
-  | { kind: "restored"; checkpoint: MutationCheckpointV1 }
-  /** Continue with the ordinary upload; `restored` targets the restored item. */
-  | { kind: "upload"; restored?: { driveItemId: string; eTag: string } }
-  /** Restore provably did not land: abandon the intent, keep the row. */
-  | { kind: "abandon" }
-  /** Restore may have landed but could not be verified: keep the intent for
-   *  mutation recovery instead of uploading (a duplicate is worse). */
-  | { kind: "unresolved"; error: Error };
 
 export class SyncExecutor {
   private running = false;
@@ -2356,7 +1833,7 @@ export class SyncExecutor {
   private syncItemTermination = new SyncItemTerminationTracker();
 
   constructor(
-    private onedrive: OneDriveClient,
+    private onedrive: SyncProvider,
     private scanner: LocalScanner,
     private state: StateManager,
     private vaultName: string,
@@ -10483,7 +9960,7 @@ export class SyncExecutor {
       item: Readonly<SyncPlanItem>,
     ): boolean =>
       item.type === SyncActionType.Conflict
-      && item.reason === "reason.newFileBothSides"
+      && item.reason === PLAN_REASON.newFileBothSides
       && Boolean(item.local)
       && Boolean(item.remote)
       && item.local!.size === item.remote!.size
@@ -11209,10 +10686,10 @@ export class SyncExecutor {
           if (breakerApplies) {
             item.type = SyncActionType.RetryLater;
             item.reason = breaker.issueCode === "transfer-network"
-              ? "reason.circuitBreaker.network"
+              ? PLAN_REASON.circuitBreakerNetwork
               : breaker.issueCode === "transfer-remote-moving"
-                ? "reason.circuitBreaker.remoteMoving"
-                : "reason.circuitBreaker";
+                ? PLAN_REASON.circuitBreakerRemoteMoving
+                : PLAN_REASON.circuitBreaker;
             breakerDeferredCount++;
           }
         }
@@ -11783,7 +11260,7 @@ export class SyncExecutor {
     // stops touching the bundle (remote no longer lower than local).
     const pendingDowngradeRetained = new Set(
       this.state.pendingConflicts
-        .filter((item) => item.reason === "reason.pluginDowngradeRemote")
+        .filter((item) => item.reason === PLAN_REASON.pluginDowngradeRemote)
         .filter((item) => this.planStillDownloadsPluginBundle(plan, item.path)
           || this.planStillUploadsPluginBundle(plan, item.path))
         .map((item) => item.path),
@@ -15475,7 +14952,6 @@ export class SyncExecutor {
         migrationExecutionHold,
       });
       if (step8.terminated) return step8.terminated;
-      migrationExecutionHold = step8.migrationExecutionHold;
 
       const step9 = await this.runStep9MarkHealthySync({
         result,
@@ -15977,47 +15453,100 @@ export class SyncExecutor {
     communityPluginSyncPolicy: Readonly<CommunityPluginSyncPolicyV1>,
     retainedMutationRecovery: readonly Readonly<MutationLedgerEntryV1>[] = [],
   ): Promise<void> {
-    const startedAt = Date.now();
-    // 进度分母只算会产生动作的条目（2026-10-25 拍板）：按设置跳过（超大小／
-    // 忽略路径）零动作，算进来会让「x/y 项」和进度条在整段真实传输期间停在
-    // 错误读数上（y 远大于实际，条几乎不动）。跳过项照常执行、照常上报完成行，
-    // 只是不占进度位置。
-    let total = countProgressPlanItems(plan.items);
-    const pendingConflicts: SyncPlanItem[] = [];
-    const pendingDeletes: SyncPlanItem[] = [];
-    const pendingIssues: PendingIssue[] = [];
-    const resolvedIssuePaths = new Set<string>();
-    // 增量跳过呈现（2026-09-16 方案单 §十二）：基准=上一完成轮的结算全集；
-    // 基准成员不再逐行重演，轮末把本轮结算全集整体覆写回去（镜像语义）。
-    // 单轮超容量的极端库回退现役全量展示（可见性不丢），且不覆写基准。
-    const skipBaseline = new Set(
-      this.state.getSizeExclusionBaseline?.() ?? [],
+    const run = await this.buildExecutionRunState(
+      plan,
+      result,
+      callbacks,
+      automaticHandlingPolicy,
+      automaticHandlingMetrics,
+      communityPluginSyncPolicy,
     );
-    const settledSkipPaths = new Set<string>();
-    const skipDeltaDisabled = plan.items.filter(
-      (item) => item.type === SyncActionType.SkipLargeFile,
-    ).length > MAX_SIZE_EXCLUSION_BASELINE_PATHS;
-    const remoteUpserts: RemoteFileEntry[] = [];
-    const remoteDeletes: string[] = [];
-    // P1-a: collect base entry updates for batch persistence after pools drain
-    const baseUpserts: BaseFileEntry[] = [];
-    const baseRemovals: string[] = [];
-    const metrics: ExecutionMetrics = {
-      uploadBytes: 0,
-      uploadReadMs: 0,
-      activeUploads: 0,
-      peakUploads: 0,
-      fileTransfers: {
-        upload: createFileTransferMetrics(),
-        download: createFileTransferMetrics(),
-      },
-      mutationPersistence: createMutationPersistenceMetrics(),
-      automaticHandling: automaticHandlingMetrics,
-    };
-    // Attach the live accumulator immediately so cancellations and early
-    // checkpoint failures retain the file-level outcome evidence.
-    result.metrics = metrics;
-    this.activeRunMetrics = metrics;
+
+    await this.runSequentialPlanPhases(plan, result, callbacks, operationEpoch, automaticHandlingPolicy, run);
+
+    const uploadItems = [...run.smallUploads, ...run.largeUploads];
+    // Upload-direction downgrade guard: a local plugin version lower than the
+    // remote one must not overwrite the cloud bundle automatically. Whole
+    // affected bundles are removed from the upload pools (run.smallUploads /
+    // run.largeUploads directly, since the pools are iterated later) and surfaced
+    // as reviewable conflicts (mirror of guardCommunityPluginBundleDowngrades).
+    const communityPluginUploadDowngradesDeferred: string[] = [];
+    const communityPluginUploadDowngradeRemoved =
+      await this.guardCommunityPluginBundleUploadDowngrades(
+        run.smallUploads,
+        run.largeUploads,
+        communityPluginSyncPolicy,
+        communityPluginUploadDowngradesDeferred,
+      );
+    if (communityPluginUploadDowngradeRemoved > 0) {
+      run.total -= communityPluginUploadDowngradeRemoved;
+      this.diag?.log(
+        "execute",
+        `community plugin upload downgrade guard deferred ${communityPluginUploadDowngradeRemoved} upload(s) to user review`,
+      );
+    }
+    if (communityPluginUploadDowngradesDeferred.length > 0) {
+      result.communityPluginUploadDowngradesDeferred = [
+        ...new Set(communityPluginUploadDowngradesDeferred),
+      ];
+    }
+    const communityPluginUploadErrors =
+      await this.prepareCommunityPluginBundleUploads(
+        uploadItems,
+        communityPluginSyncPolicy,
+        result,
+        operationEpoch,
+      );
+
+    await this.runSmallUploadPoolPhase(plan, result, callbacks, operationEpoch, automaticHandlingPolicy, run, communityPluginUploadErrors);
+
+    const preparedCommunityPluginDownloads = await this.runLargeUploadPoolPhase(plan, result, callbacks, operationEpoch, automaticHandlingPolicy, run, communityPluginSyncPolicy, communityPluginUploadErrors);
+
+    // Step 3b — only the read-only network stage of independent small
+    // downloads (≤ 8 MiB, desktop and — since A2 2026-09-08 — mobile with a
+    // lower adaptive ceiling) may overlap. Local CAS, temp verification,
+    // intent/receipt and checkpoint publication below remain strictly serial
+    // per file on every platform.
+
+    await this.runDownloadWindow({
+      result,
+      operationEpoch,
+      downloads: run.downloads,
+      downloadPolicy: run.downloadPolicy,
+      executePlanItem: (item, preparedDownload) =>
+        this.executeSinglePlanItem(
+          plan,
+          result,
+          callbacks,
+          operationEpoch,
+          automaticHandlingPolicy,
+          run,
+          item,
+          preparedDownload,
+        ),
+      preparedCommunityPluginDownloads,
+      metrics: run.metrics,
+    });
+
+    await this.runCleanupWavePhase(plan, result, callbacks, operationEpoch, automaticHandlingPolicy, run);
+
+    await this.runFolderDeletePhaseAndFinalize(plan, result, callbacks, operationEpoch, automaticHandlingPolicy, run, retainedMutationRecovery);
+
+  }
+
+  /** 建态 — build the shared per-run execution state: the pool partitioning,
+   *  folder predicates, metrics accumulator (attached to `result` and the
+   *  live diagnostics immediately), concurrency policies, the progress
+   *  denominator and the download-direction downgrade guards (M19 EasySync,
+   *  community-plugin bundles) that shrink the download pool up front. */
+  private async buildExecutionRunState(
+    plan: SyncPlan,
+    result: SyncResult,
+    callbacks: SyncCallbacks,
+    automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>,
+    automaticHandlingMetrics: AutomaticHandlingMetrics,
+    communityPluginSyncPolicy: Readonly<CommunityPluginSyncPolicyV1>,
+  ): Promise<ExecutionPhaseState> {
     const isSmallUpload = (i: SyncPlanItem) =>
       i.type === SyncActionType.Upload && Boolean(i.local)
       && i.local!.size <= ADAPTIVE_UPLOAD_MAX_BYTES;
@@ -16043,42 +15572,91 @@ export class SyncExecutor {
       !isFolderCreate(i) && !isFolderMove(i) && !isFolderDelete(i)
       && !isSmallUpload(i) && !isLargeUpload(i) && !isDownload(i) && !isCleanup(i);
 
-    const folderCreates  = plan.items.filter(isFolderCreate);
-    const folderMoves    = plan.items.filter(isFolderMove);
-    const folderDeletes  = plan.items.filter(isFolderDelete);
-    const smallUploads   = plan.items.filter(isSmallUpload);
-    const largeUploads   = plan.items.filter(isLargeUpload);
-    const downloads      = plan.items.filter(isDownload);
-    const cleanupItems   = plan.items.filter(isCleanup);
-    const passthroughItems = plan.items.filter(isPassthrough);
-    metrics.automaticHandling.deleteLocal.candidates =
+    // One shared state object for the whole run: the phase methods below read
+    // and mutate it in place (sequential phases, upload pools, download window,
+    // cleanup waves, folder-delete + finalize).
+    const run: ExecutionPhaseState = {
+      startedAt: Date.now(),
+      // 进度分母只算会产生动作的条目（2026-10-25 拍板）：按设置跳过（超大小／
+      // 忽略路径）零动作，算进来会让「x/y 项」和进度条在整段真实传输期间停在
+      // 错误读数上（y 远大于实际，条几乎不动）。跳过项照常执行、照常上报完成行，
+      // 只是不占进度位置。
+      total: countProgressPlanItems(plan.items),
+      /** Settled (finished) plan items — the visible progress counter. */
+      settled: 0,
+      pendingConflicts: [],
+      pendingDeletes: [],
+      pendingIssues: [],
+      resolvedIssuePaths: new Set<string>(),
+      // 增量跳过呈现（2026-09-16 方案单 §十二）：基准=上一完成轮的结算全集；
+      // 基准成员不再逐行重演，轮末把本轮结算全集整体覆写回去（镜像语义）。
+      // 单轮超容量的极端库回退现役全量展示（可见性不丢），且不覆写基准。
+      skipBaseline: new Set(
+        this.state.getSizeExclusionBaseline?.() ?? [],
+      ),
+      settledSkipPaths: new Set<string>(),
+      skipDeltaDisabled: plan.items.filter(
+        (item) => item.type === SyncActionType.SkipLargeFile,
+      ).length > MAX_SIZE_EXCLUSION_BASELINE_PATHS,
+      remoteUpserts: [],
+      remoteDeletes: [],
+      // P1-a: collect base entry updates for batch persistence after pools drain
+      baseUpserts: [],
+      baseRemovals: [],
+      metrics: {
+        uploadBytes: 0,
+        uploadReadMs: 0,
+        activeUploads: 0,
+        peakUploads: 0,
+        fileTransfers: {
+          upload: createFileTransferMetrics(),
+          download: createFileTransferMetrics(),
+        },
+        mutationPersistence: createMutationPersistenceMetrics(),
+        automaticHandling: automaticHandlingMetrics,
+      },
+      folderCreates: plan.items.filter(isFolderCreate),
+      folderMoves: plan.items.filter(isFolderMove),
+      folderDeletes: plan.items.filter(isFolderDelete),
+      smallUploads: plan.items.filter(isSmallUpload),
+      largeUploads: plan.items.filter(isLargeUpload),
+      downloads: plan.items.filter(isDownload),
+      cleanupItems: plan.items.filter(isCleanup),
+      passthroughItems: plan.items.filter(isPassthrough),
+      isFolderCreate,
+      isFolderMove,
+      isFolderDelete,
+      uploadPolicy: new UploadConcurrencyPolicy(this.platform.isMobileApp),
+      downloadPolicy: new DownloadConcurrencyPolicy(
+        this.platform.isMobileApp
+          ? MOBILE_DOWNLOAD_MAX_CONCURRENCY
+          : ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY,
+      ),
+    };
+    // Attach the live accumulator immediately so cancellations and early
+    // checkpoint failures retain the file-level outcome evidence.
+    result.metrics = run.metrics;
+    this.activeRunMetrics = run.metrics;
+    run.metrics.automaticHandling.deleteLocal.candidates =
       automaticHandlingPolicy.autoDeleteLocalFiles
-        ? cleanupItems.filter((item) => item.type === SyncActionType.DeleteLocal).length
+        ? run.cleanupItems.filter((item) => item.type === SyncActionType.DeleteLocal).length
         : 0;
-
-    const uploadPolicy = new UploadConcurrencyPolicy(this.platform.isMobileApp);
-    const downloadPolicy = new DownloadConcurrencyPolicy(
-      this.platform.isMobileApp
-        ? MOBILE_DOWNLOAD_MAX_CONCURRENCY
-        : ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY,
-    );
-
     // M19: anti-downgrade guard for EasySync self-sync.
     // Before any plugin files are downloaded, fetch remote manifest.json and
     // compare versions. If remote < local, skip all EasySync downloads this round.
     const { pluginDirPrefix } = getEasySyncPaths(this.scanner.vault);
-    const easySyncDownloads = downloads.filter((i) =>
+    const easySyncDownloads = run.downloads.filter((i) =>
       i.path.startsWith(pluginDirPrefix));
     if (easySyncDownloads.length > 0) {
       const skipped = await this.guardEasySyncDowngrade(easySyncDownloads);
       if (skipped > 0) {
         // Remove skipped items from the download pool
         const skippedPaths = new Set(easySyncDownloads.slice(0, skipped).map((i) => i.path));
-        const origLen = downloads.length;
-        for (let i = downloads.length - 1; i >= 0; i--) {
-          if (skippedPaths.has(downloads[i].path)) downloads.splice(i, 1);
+        const origLen = run.downloads.length;
+        for (let i = run.downloads.length - 1; i >= 0; i--) {
+          if (skippedPaths.has(run.downloads[i].path)) run.downloads.splice(i, 1);
         }
-        total -= origLen - downloads.length;
+        run.total -= origLen - run.downloads.length;
         this.diag?.log("execute", `M19 anti-downgrade — skipped ${skipped} EasySync file(s), remote version is older`);
       }
     }
@@ -16090,677 +15668,402 @@ export class SyncExecutor {
     // conflicts instead.
     const communityPluginDowngradeRemoved =
       await this.guardCommunityPluginBundleDowngrades(
-        downloads,
+        run.downloads,
         communityPluginSyncPolicy,
       );
     if (communityPluginDowngradeRemoved > 0) {
-      total -= communityPluginDowngradeRemoved;
+      run.total -= communityPluginDowngradeRemoved;
       this.diag?.log(
         "execute",
         `community plugin downgrade guard deferred ${communityPluginDowngradeRemoved} download(s) to user review`,
       );
     }
 
-    /** Settled (finished) plan items — the visible progress counter. */
-    let settled = 0;
-    this.progressStore?.setProgress(0, total, "");
-    callbacks.onProgress?.(0, total, "");
+    this.progressStore?.setProgress(0, run.total, "");
+    callbacks.onProgress?.(0, run.total, "");
     this.diag?.log(
       "execute",
-      `pools — folders=${folderCreates.length} small=${smallUploads.length}(adaptive ${uploadPolicy.limit}→${uploadPolicy.maxLimit}) large=${largeUploads.length}(x${largeUploadConcurrency(this.platform.isMobileApp)}) download=${downloads.length}(adaptive 1→${this.platform.isMobileApp ? MOBILE_DOWNLOAD_MAX_CONCURRENCY : ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY} small files) passthrough=${passthroughItems.length} cleanup=${cleanupItems.length}`,
+      `pools — folders=${run.folderCreates.length} small=${run.smallUploads.length}(adaptive ${run.uploadPolicy.limit}→${run.uploadPolicy.maxLimit}) large=${run.largeUploads.length}(x${largeUploadConcurrency(this.platform.isMobileApp)}) download=${run.downloads.length}(adaptive 1→${this.platform.isMobileApp ? MOBILE_DOWNLOAD_MAX_CONCURRENCY : ADAPTIVE_DOWNLOAD_MAX_CONCURRENCY} small files) passthrough=${run.passthroughItems.length} cleanup=${run.cleanupItems.length}`,
     );
+    return run;
+  }
 
-    const executePlanItem = async (
-      item: SyncPlanItem,
-      preparedDownload?: PreparedDownload,
-      cleanupWave?: CleanupWaveHandoff,
-      uploadObservation?: UploadTransferObservation,
-    ): Promise<DeferredMutationCompletion | undefined> => {
-      if (!this.canContinue(operationEpoch, result)) return;
-      // 清理/上传波：意图已由波次一次性落盘，回执并入波次统一提交。
-      const prePersistedIntent = cleanupWave !== undefined && cleanupWave.intent !== null;
-      const receiptSink = cleanupWave !== undefined ? cleanupWave.receipts : null;
-      // 按设置跳过不占进度位置：占位会让进度条在跳过突发里回跳、当前文件槽闪
-      // 一下被排除的路径。完成行照常上报（历史与诊断报告要它们）。
-      const countsTowardProgress = !isConfigurationSkipAction(item.type);
-      // 计数语义＝**已结算**项数，不是「已开始」项数：常驻池一次派满 N 个，
-      // 按开始计数会让计数整批跳（1→8→16），批内长时间不动。开始点只把当前
-      // 文件名换成本项（字节进度归零、在飞徽标 +1），计数在 finally 里 +1。
-      const position = countsTowardProgress ? settled + 1 : settled;
-      if (countsTowardProgress) {
-        this.progressStore?.setProgress(settled, total, item.path, item.type);
-        callbacks.onProgress?.(settled, total, item.path);
-      }
+  /** Steps 1/1b/2 — the strictly ordered pre-pool phases: folder creates,
+   *  folder identity moves, then passthrough items (each loop breaks once
+   *  the round can no longer continue). */
+  private async runSequentialPlanPhases(
+    plan: SyncPlan,
+    result: SyncResult,
+    callbacks: SyncCallbacks,
+    operationEpoch: number,
+    automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>,
+    run: ExecutionPhaseState,
+  ): Promise<void> {
+    // Step 1 — create folders parent-first so every later file mutation has a
+    // committed destination parent identity on both sides.
+    for (const item of run.folderCreates) {
+      if (!this.canContinue(operationEpoch, result)) break;
+      await this.executeSinglePlanItem(plan, result, callbacks, operationEpoch, automaticHandlingPolicy, run, item);
+    }
 
-      const fileSize = fileSizeForAction(item, item.type);
-      const localHash = item.local?.hash;
-      const remoteETag = item.remote?.eTag;
-      let mutationIntent: MutationIntent | null = null;
-      let deferredMutationOperationId: string | null = null;
-      const itemRemoteUpserts: RemoteFileEntry[] = [];
-      const itemRemoteDeletes: string[] = [];
-      const transferDirection = item.type === SyncActionType.Upload
-        ? "upload"
-        : item.type === SyncActionType.Download
-          ? "download"
-          : null;
-      const transferMetrics = transferDirection
-        ? metrics.fileTransfers[transferDirection]
+    // Step 1b — identity moves run after creates, before file mutations. A
+    // top-level folder receipt reprojects the entire committed subtree.
+    for (const item of run.folderMoves) {
+      if (!this.canContinue(operationEpoch, result)) break;
+      await this.executeSinglePlanItem(plan, result, callbacks, operationEpoch, automaticHandlingPolicy, run, item);
+    }
+
+    // Step 2 — passthrough items (no network I/O)
+    for (const item of run.passthroughItems) {
+      if (!this.canContinue(operationEpoch, result)) break;
+      await this.executeSinglePlanItem(plan, result, callbacks, operationEpoch, automaticHandlingPolicy, run, item);
+    }
+  }
+
+  /** Execute one plan item end to end: progress position, mutation intent
+   *  persistence, execution, receipt/checkpoint settlement, completion
+   *  reporting and the failure/recovery path. Lifted verbatim from the
+   *  former `executePlanItem` closure (its `runPlanItemExecutionAttempt`
+   *  helper stays nested); shared per-run state arrives through `run`, the
+   *  round bindings as explicit parameters. */
+  private async executeSinglePlanItem(
+    plan: SyncPlan,
+    result: SyncResult,
+    callbacks: SyncCallbacks,
+    operationEpoch: number,
+    automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>,
+    run: ExecutionPhaseState,
+    item: SyncPlanItem,
+    preparedDownload?: PreparedDownload,
+    cleanupWave?: CleanupWaveHandoff,
+    uploadObservation?: UploadTransferObservation,
+  ): Promise<DeferredMutationCompletion | undefined> {
+    if (!this.canContinue(operationEpoch, result)) return;
+    // 清理/上传波：意图已由波次一次性落盘，回执并入波次统一提交。
+    const prePersistedIntent = cleanupWave !== undefined && cleanupWave.intent !== null;
+    const receiptSink = cleanupWave !== undefined ? cleanupWave.receipts : null;
+    // 按设置跳过不占进度位置：占位会让进度条在跳过突发里回跳、当前文件槽闪
+    // 一下被排除的路径。完成行照常上报（历史与诊断报告要它们）。
+    const countsTowardProgress = !isConfigurationSkipAction(item.type);
+    // 计数语义＝**已结算**项数，不是「已开始」项数：常驻池一次派满 N 个，
+    // 按开始计数会让计数整批跳（1→8→16），批内长时间不动。开始点只把当前
+    // 文件名换成本项（字节进度归零、在飞徽标 +1），计数在 finally 里 +1。
+    const position = countsTowardProgress ? run.settled + 1 : run.settled;
+    if (countsTowardProgress) {
+      this.progressStore?.setProgress(run.settled, run.total, item.path, item.type);
+      callbacks.onProgress?.(run.settled, run.total, item.path);
+    }
+
+    const fileSize = fileSizeForAction(item, item.type);
+    const localHash = item.local?.hash;
+    const remoteETag = item.remote?.eTag;
+    let mutationIntent: MutationIntent | null = null;
+    let deferredMutationOperationId: string | null = null;
+    const itemRemoteUpserts: RemoteFileEntry[] = [];
+    const itemRemoteDeletes: string[] = [];
+    const transferDirection = item.type === SyncActionType.Upload
+      ? "upload"
+      : item.type === SyncActionType.Download
+        ? "download"
         : null;
-      const transferAlreadyStarted = transferDirection === "download"
-        && preparedDownload !== undefined;
-      const completedBefore = transferDirection === "upload"
-        ? result.uploaded
-        : result.downloaded;
-      const deletedBefore = result.deleted;
-      const foldersCreatedBefore = result.foldersCreated ?? 0;
-      const foldersMovedBefore = result.foldersMoved ?? 0;
-      const foldersDeletedBefore = result.foldersDeleted ?? 0;
-      const filesMovedBefore = result.filesMoved ?? 0;
-      const automaticMergeCandidatesBefore =
-        metrics.automaticHandling.textMerge.candidates;
-      const automaticMergeSettledBefore =
-        metrics.automaticHandling.textMerge.completed
-        + metrics.automaticHandling.textMerge.keptManual
-        + metrics.automaticHandling.textMerge.failed
-        + metrics.automaticHandling.textMerge.cancelled;
-      let transferOutcome: "succeeded" | "failed" | "cancelled" | "skipped" | null = null;
-      let automaticDeleteCompleted = false;
-      if (transferMetrics && !transferAlreadyStarted) {
-        transferMetrics.started++;
-        transferMetrics.activeConcurrency++;
-        transferMetrics.peakConcurrency = Math.max(
-          transferMetrics.peakConcurrency,
-          transferMetrics.activeConcurrency,
+    const transferMetrics = transferDirection
+      ? run.metrics.fileTransfers[transferDirection]
+      : null;
+    const transferAlreadyStarted = transferDirection === "download"
+      && preparedDownload !== undefined;
+    const completedBefore = transferDirection === "upload"
+      ? result.uploaded
+      : result.downloaded;
+    const deletedBefore = result.deleted;
+    const foldersCreatedBefore = result.foldersCreated ?? 0;
+    const foldersMovedBefore = result.foldersMoved ?? 0;
+    const foldersDeletedBefore = result.foldersDeleted ?? 0;
+    const filesMovedBefore = result.filesMoved ?? 0;
+    const automaticMergeCandidatesBefore =
+      run.metrics.automaticHandling.textMerge.candidates;
+    const automaticMergeSettledBefore =
+      run.metrics.automaticHandling.textMerge.completed
+      + run.metrics.automaticHandling.textMerge.keptManual
+      + run.metrics.automaticHandling.textMerge.failed
+      + run.metrics.automaticHandling.textMerge.cancelled;
+    let transferOutcome: "succeeded" | "failed" | "cancelled" | "skipped" | null = null;
+    let automaticDeleteCompleted = false;
+    if (transferMetrics && !transferAlreadyStarted) {
+      transferMetrics.started++;
+      transferMetrics.activeConcurrency++;
+      transferMetrics.peakConcurrency = Math.max(
+        transferMetrics.peakConcurrency,
+        transferMetrics.activeConcurrency,
+      );
+    }
+
+    /** Run one plan item's execution attempt: persist the mutation intent,
+     *  execute the item, settle its receipt and checkpoint, and record the
+     *  item's completion. The caller's containers are threaded by reference;
+     *  the caller's own phase bindings (mutationIntent, the deferred
+     *  operation id, the delete-completed flag and the transfer outcome) are
+     *  mutated in place for the caller's catch/finally, and a terminal item
+     *  reports its completion back through the returned union. */
+    const runPlanItemExecutionAttempt = async (args: {
+      item: SyncPlanItem;
+      result: SyncResult;
+      itemRemoteUpserts: RemoteFileEntry[];
+      itemRemoteDeletes: string[];
+      remoteUpserts: RemoteFileEntry[];
+      remoteDeletes: string[];
+      metrics: ExecutionMetrics;
+      callbacks: SyncCallbacks;
+      operationEpoch: number;
+      automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
+      isFolderMove: (candidate: SyncPlanItem) => boolean;
+      isFolderDelete: (candidate: SyncPlanItem) => boolean;
+      transferMetrics: FileTransferMetrics | null;
+      transferDirection: "upload" | "download" | null;
+      completedBefore: number;
+      prePersistedIntent: boolean;
+      receiptSink: MutationReceiptV1[] | null;
+      mutationIntent: MutationIntent | null;
+      preparedDownload: PreparedDownload | undefined;
+      fileSize: number | undefined;
+      localHash: string | undefined;
+      remoteETag: string | undefined;
+      baseUpserts: BaseFileEntry[];
+      baseRemovals: string[];
+      pendingConflicts: SyncPlanItem[];
+      pendingDeletes: SyncPlanItem[];
+      pendingIssues: PendingIssue[];
+      resolvedIssuePaths: Set<string>;
+      settledSkipPaths: Set<string>;
+      skipDeltaDisabled: boolean;
+      skipBaseline: Set<string>;
+    }): Promise<
+      | { terminated: DeferredMutationCompletion | undefined }
+      | { terminated: null }
+    > => {
+      const {
+        item,
+        result,
+        itemRemoteUpserts,
+        itemRemoteDeletes,
+        remoteUpserts,
+        remoteDeletes,
+        metrics,
+        callbacks,
+        operationEpoch,
+        automaticHandlingPolicy,
+        isFolderMove,
+        isFolderDelete,
+        transferMetrics,
+        transferDirection,
+        completedBefore,
+        prePersistedIntent,
+        receiptSink,
+        mutationIntent,
+        preparedDownload,
+        fileSize,
+        localHash,
+        remoteETag,
+        baseUpserts,
+        baseRemovals,
+        pendingConflicts,
+        pendingDeletes,
+        pendingIssues,
+        resolvedIssuePaths,
+        settledSkipPaths,
+        skipDeltaDisabled,
+        skipBaseline,
+      } = args;
+
+      if (mutationIntent && !prePersistedIntent) {
+        const intentStartedAt = Date.now();
+        await this.state.beginMutationIntent(mutationIntent);
+        this.diag?.log(
+          "state",
+          "mutation intent persisted before execution",
+          {
+            operationId: mutationIntent.operationId,
+            action: mutationIntent.action,
+            path: mutationIntent.path,
+            createdAt: mutationIntent.createdAt,
+            mutations: 0,
+          },
         );
+        metrics.mutationPersistence.intentWrites++;
+        metrics.mutationPersistence.stagesMs.intentPersist +=
+          Date.now() - intentStartedAt;
       }
-
-      /** Run one plan item's execution attempt: persist the mutation intent,
-       *  execute the item, settle its receipt and checkpoint, and record the
-       *  item's completion. The caller's containers are threaded by reference;
-       *  the caller's own phase bindings (mutationIntent, the deferred
-       *  operation id, the delete-completed flag and the transfer outcome) are
-       *  mutated in place for the caller's catch/finally, and a terminal item
-       *  reports its completion back through the returned union. */
-      const runPlanItemExecutionAttempt = async (args: {
-        item: SyncPlanItem;
-        result: SyncResult;
-        itemRemoteUpserts: RemoteFileEntry[];
-        itemRemoteDeletes: string[];
-        remoteUpserts: RemoteFileEntry[];
-        remoteDeletes: string[];
-        metrics: ExecutionMetrics;
-        callbacks: SyncCallbacks;
-        operationEpoch: number;
-        automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>;
-        isFolderMove: (candidate: SyncPlanItem) => boolean;
-        isFolderDelete: (candidate: SyncPlanItem) => boolean;
-        transferMetrics: FileTransferMetrics | null;
-        transferDirection: "upload" | "download" | null;
-        completedBefore: number;
-        prePersistedIntent: boolean;
-        receiptSink: MutationReceiptV1[] | null;
-        mutationIntent: MutationIntent | null;
-        preparedDownload: PreparedDownload | undefined;
-        fileSize: number | undefined;
-        localHash: string | undefined;
-        remoteETag: string | undefined;
-        baseUpserts: BaseFileEntry[];
-        baseRemovals: string[];
-        pendingConflicts: SyncPlanItem[];
-        pendingDeletes: SyncPlanItem[];
-        pendingIssues: PendingIssue[];
-        resolvedIssuePaths: Set<string>;
-        settledSkipPaths: Set<string>;
-        skipDeltaDisabled: boolean;
-        skipBaseline: Set<string>;
-      }): Promise<
-        | { terminated: DeferredMutationCompletion | undefined }
-        | { terminated: null }
-      > => {
-        const {
-          item,
-          result,
-          itemRemoteUpserts,
-          itemRemoteDeletes,
-          remoteUpserts,
-          remoteDeletes,
-          metrics,
-          callbacks,
-          operationEpoch,
-          automaticHandlingPolicy,
-          isFolderMove,
-          isFolderDelete,
-          transferMetrics,
-          transferDirection,
-          completedBefore,
-          prePersistedIntent,
-          receiptSink,
-          mutationIntent,
-          preparedDownload,
-          fileSize,
-          localHash,
-          remoteETag,
-          baseUpserts,
-          baseRemovals,
-          pendingConflicts,
-          pendingDeletes,
-          pendingIssues,
-          resolvedIssuePaths,
-          settledSkipPaths,
-          skipDeltaDisabled,
-          skipBaseline,
-        } = args;
-
-        if (mutationIntent && !prePersistedIntent) {
-          const intentStartedAt = Date.now();
-          await this.state.beginMutationIntent(mutationIntent);
-          this.diag?.log(
-            "state",
-            "mutation intent persisted before execution",
-            {
-              operationId: mutationIntent.operationId,
-              action: mutationIntent.action,
-              path: mutationIntent.path,
-              createdAt: mutationIntent.createdAt,
-              mutations: 0,
-            },
-          );
-          metrics.mutationPersistence.intentWrites++;
-          metrics.mutationPersistence.stagesMs.intentPersist +=
-            Date.now() - intentStartedAt;
-        }
-        const itemResult = await this.executeItem(
-          item,
-          result,
-          itemRemoteUpserts,
-          itemRemoteDeletes,
-          metrics,
-          callbacks,
-          operationEpoch,
-          automaticHandlingPolicy,
-          preparedDownload,
-          uploadObservation,
-        );
-        if (mutationIntent && !itemResult.mutationApplied) {
-          await this.state.abandonMutationIntent(mutationIntent.operationId);
-        }
-        if (mutationIntent && itemResult.mutationApplied) {
-          if (receiptSink) {
-            receiptSink.push(this.buildPlanItemMutationReceipt({
-              item,
-              itemResult,
-              itemRemoteUpserts,
-              itemRemoteDeletes,
-              mutationIntent,
-              automaticHandlingPolicy,
-              metrics,
-              isFolderMove,
-              isFolderDelete,
-            }));
-            metrics.mutationPersistence.receiptWrites++;
-          } else {
-            await this.persistPlanItemMutationReceipt({
-              item,
-              itemResult,
-              itemRemoteUpserts,
-              itemRemoteDeletes,
-              mutationIntent,
-              automaticHandlingPolicy,
-              metrics,
-              isFolderMove,
-              isFolderDelete,
-            });
-          }
-          if (!this.canContinue(operationEpoch, result)) return { terminated: undefined };
-          if (receiptSink) {
-            // The wave owns the shared checkpoint; the completion is reported
-            // by the wave after that checkpoint commits.
-            deferredMutationOperationId = mutationIntent.operationId;
-          } else {
-            const checkpointStartedAt = Date.now();
-            try {
-              const checkpointMetrics = await this.commitMutationCheckpoint(
-                mutationIntent.operationId,
-              );
-              recordCheckpointMetrics(
-                metrics.mutationPersistence,
-                checkpointMetrics,
-                Date.now() - checkpointStartedAt,
-              );
-            } catch (error) {
-              metrics.mutationPersistence.checkpointFailures++;
-              metrics.mutationPersistence.stagesMs.checkpointTotal +=
-                Date.now() - checkpointStartedAt;
-              throw error;
-            }
-          }
-          if (item.type === SyncActionType.DeleteLocal) {
-            metrics.automaticHandling.deleteLocal.completed++;
-            automaticDeleteCompleted = true;
-          }
-          // Folder rows convert from a confirmation row to the executable
-          // delete in the same plan. The checkpoint above is this item's own
-          // (folder deletes never ride a cleanup wave), so the authorization
-          // is consumed only after the committed state retired the shell.
-          if (
-            item.type === SyncActionType.DeleteLocalFolder
-            && itemResult.mutationApplied
-          ) {
-            await this.settleAppliedFolderDeleteDecision(item.path);
-          }
-          itemResult.baseUpsert = undefined;
-          itemResult.baseRemoval = undefined;
-        }
-        remoteUpserts.push(...itemRemoteUpserts);
-        remoteDeletes.push(...itemRemoteDeletes);
-        if (!this.canContinue(operationEpoch, result)) return { terminated: undefined };
-        if (!itemResult.executed) {
-          transferOutcome = transferMetrics ? "skipped" : null;
-          if (itemResult.completionReason) {
-            const completionActionType =
-              itemResult.completionActionType ?? item.type;
-            callbacks.onFileComplete?.(
-              item.path,
-              completionActionType,
-              true,
-              itemResult.completionReason,
-              fileSizeForAction(item, completionActionType),
-            );
-          }
-          return { terminated: undefined };
-        }
-        // One-way retained folder: the shell stays because local content has
-        // to survive. The row is informational (no decision, no count in the
-        // sidebar) and must be re-emitted next round so the round-end
-        // reconciliation keeps it until the folder can follow the cloud.
-        if (itemResult.retainedFolder) {
-          pendingIssues.push({
-            path: item.path,
-            actionType: SyncActionType.FolderDeferred,
-            issueCode: "one-way-folder-retained",
-            reason: this.t("reason.oneWay.folderRetained"),
-            updatedAt: Date.now(),
-          });
-        }
-        if (transferMetrics && transferDirection) {
-          const completedAfter = transferDirection === "upload"
-            ? result.uploaded
-            : result.downloaded;
-          if (completedAfter > completedBefore) {
-            transferOutcome = "succeeded";
-            transferMetrics.logicalBytes += Math.max(0, fileSize ?? 0);
-          } else {
-            transferOutcome = "skipped";
-          }
-        }
-        // P1-a: collect deferred base entry updates for batch persistence
-        if (itemResult.baseUpsert) baseUpserts.push(itemResult.baseUpsert);
-        if (itemResult.baseRemoval) baseRemovals.push(itemResult.baseRemoval);
-        if (item.type === SyncActionType.Conflict) {
-          if (!itemResult.resolvedConflict) {
-            const row = this.decisionRowForPlanItem(item);
-            if (row !== null) pendingConflicts.push(row);
-          }
-        } else {
-          const row = this.decisionRowForPlanItem(item);
-          if (row !== null) pendingDeletes.push(row);
-        }
-        if (
-          item.type === SyncActionType.RetryLater
-          || item.type === SyncActionType.FolderDeferred
-        ) {
-          const issue = this.buildPendingIssueForPlanItem(item);
-          const reason = issue.reason ?? this.t("syncView.failure.local");
-          pendingIssues.push(issue);
-          callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize);
-          return { terminated: undefined };
-        }
-        if (item.type === SyncActionType.SkipLargeFile) {
-          // 2026-09-16 拍板：按设置跳过（大型文件）是预期行为、零行动，
-          // 不属于「需要处理」——不入待处理账本；记入已解决路径让轮末对账
-          // 退役既有跳过行。轮内可见性由完成列表/历史承接，细节面在诊断报告。
-          // 增量呈现（方案单 §十二）：基准成员不发行行——计数与对账不受
-          // 影响；新面孔照常发行，轮末结算全集覆写基准。
-          resolvedIssuePaths.add(item.path);
-          settledSkipPaths.add(item.path);
-          const reason = item.reason
-            ? this.t(item.reason)
-            : this.t("syncView.fileStatus.skip");
-          if (skipDeltaDisabled || !skipBaseline.has(item.path)) {
-            callbacks.onFileComplete?.(
-              item.path,
-              item.type,
-              true,
-              reason,
-              fileSize,
-            );
-          }
-          return { terminated: undefined };
-        }
-        if (item.type === SyncActionType.SkipOneDriveInvalidName) {
-          const reason = item.reason
-            ? this.t(item.reason)
-            : this.t("syncView.fileStatus.skip");
-          pendingIssues.push({
-            path: item.path,
-            actionType: item.type,
-            reason,
-            updatedAt: Date.now(),
-            fileSize,
-            localHash,
-            remoteETag,
-          });
-          callbacks.onFileComplete?.(item.path, item.type, true, reason, fileSize);
-          return { terminated: undefined };
-        }
-        if (isResolvedIssueAction(item.type) && !itemResult.retainedFolder) {
-          resolvedIssuePaths.add(item.path);
-          if (item.renameFrom) resolvedIssuePaths.add(item.renameFrom);
-        }
-        const completionActionType =
-          itemResult.completionActionType ?? item.type;
-        const completionFileSize = fileSizeForAction(
-          item,
-          completionActionType,
-        );
-        if (deferredMutationOperationId) {
-          // 逐文件即时反馈：这一项自己的传输与回执都已落地，行先按「完成」
-          // 显示，不等整批共享检查点（批末才发会让批内长时间没有任何反馈）。
-          // 检查点随后仍按批提交（SC-15 粒度不变）；若它失败或被取消，调用方
-          // 用 onFileReverted 把这一行翻成失败并带上原因。
-          callbacks.onFileComplete?.(
-            item.path,
-            completionActionType,
-            true,
-            itemResult.completionReason,
-            completionFileSize,
-            item.renameFrom,
-          );
-          return {
-            terminated: {
-              operationId: deferredMutationOperationId,
-              path: item.path,
-              actionType: completionActionType,
-              reason: itemResult.completionReason,
-              fileSize: completionFileSize,
-              renameFrom: item.renameFrom,
-            },
-          };
-        }
-        if (item.renameFrom) {
-          callbacks.onFileComplete?.(
-            item.path,
-            completionActionType,
-            true,
-            itemResult.completionReason,
-            completionFileSize,
-            item.renameFrom,
-          );
-        } else {
-          callbacks.onFileComplete?.(
-            item.path,
-            completionActionType,
-            true,
-            itemResult.completionReason,
-            completionFileSize,
-          );
-        }
-
-        return { terminated: null };
-      };
-
-      try {
-        this.diag?.log("execute", `[${position}/${total}] ${item.type} ${item.path}`);
-        if (preparedDownload?.error) {
-          throw preparedDownload.error instanceof Error
-            ? preparedDownload.error
-            : new Error(describeThrownValue(preparedDownload.error));
-        }
-        mutationIntent = cleanupWave
-          ? cleanupWave.intent
-          : (plan.scope
-            && isMutationAction(item.type)
-            && !item.requiresConfirmation
-            ? this.createMutationIntent(item, plan.scope)
-            : null);
-        const attempt = await runPlanItemExecutionAttempt({
-          item,
-          result,
-          itemRemoteUpserts,
-          itemRemoteDeletes,
-          remoteUpserts,
-          remoteDeletes,
-          metrics,
-          callbacks,
-          operationEpoch,
-          automaticHandlingPolicy,
-          isFolderMove,
-          isFolderDelete,
-          transferMetrics,
-          transferDirection,
-          completedBefore,
-          prePersistedIntent,
-          receiptSink,
-          mutationIntent,
-          preparedDownload,
-          fileSize,
-          localHash,
-          remoteETag,
-          baseUpserts,
-          baseRemovals,
-          pendingConflicts,
-          pendingDeletes,
-          pendingIssues,
-          resolvedIssuePaths,
-          settledSkipPaths,
-          skipDeltaDisabled,
-          skipBaseline,
-        });
-        if (attempt.terminated !== null) return attempt.terminated;
-      } catch (e) {
-        let mutationRecovery: SideMutationRecoveryOutcome | null = null;
-        let retryableRecoveryObservationError: OneDriveError | null = null;
-        const activeIntent = mutationIntent;
-        const activeRecord = activeIntent
-          ? this.state.mutationLedger.find(
-              (entry) => entry.intent.operationId === activeIntent.operationId,
-            )
-          : undefined;
-        if (activeIntent && e instanceof MutationNotAppliedError) {
-          try {
-            await this.abandonKnownUnappliedMutation(
-              activeIntent,
-              "mutation stopped before target change and was abandoned",
-            );
-            mutationRecovery = "not-applied";
-          } catch (abandonError) {
-            this.diag?.warn(
-              "execute",
-              `mutation could not abandon its precondition-failed intent — ${activeIntent.path}`,
-              describeError(abandonError),
-            );
-            mutationRecovery = "unresolved";
-          }
-        } else if (activeIntent && activeRecord?.receipt) {
-          mutationRecovery = await this.recoverReceiptedMutationFailure({
-            error: e,
-            activeIntent,
-            activeRecord,
-            operationEpoch,
-            result,
-            metrics,
-          });
-        } else if (activeIntent && activeRecord) {
-          const recovery = await this.reconcileFailedMutation(activeIntent);
-          mutationRecovery = recovery.outcome;
-          retryableRecoveryObservationError =
-            recovery.retryableObservationError;
-        }
-        if (mutationRecovery === "applied") {
-          const appliedSettlement = await this.settleAppliedMutationRecovery({
-            operationEpoch,
-            result,
-            transferMetrics,
-            transferOutcome,
+      const itemResult = await this.executeItem(
+        item,
+        result,
+        itemRemoteUpserts,
+        itemRemoteDeletes,
+        metrics,
+        callbacks,
+        operationEpoch,
+        automaticHandlingPolicy,
+        preparedDownload,
+        uploadObservation,
+      );
+      if (mutationIntent && !itemResult.mutationApplied) {
+        await this.state.abandonMutationIntent(mutationIntent.operationId);
+      }
+      if (mutationIntent && itemResult.mutationApplied) {
+        if (receiptSink) {
+          receiptSink.push(this.buildPlanItemMutationReceipt({
             item,
-            metrics,
-            fileSize,
-            completedBefore,
-            deletedBefore,
-            foldersCreatedBefore,
-            foldersMovedBefore,
-            foldersDeletedBefore,
-            filesMovedBefore,
+            itemResult,
+            itemRemoteUpserts,
+            itemRemoteDeletes,
+            mutationIntent,
             automaticHandlingPolicy,
-            automaticDeleteCompleted,
-            isFolderCreate,
+            metrics,
             isFolderMove,
             isFolderDelete,
-            resolvedIssuePaths,
+          }));
+          metrics.mutationPersistence.receiptWrites++;
+        } else {
+          await this.persistPlanItemMutationReceipt({
+            item,
+            itemResult,
+            itemRemoteUpserts,
+            itemRemoteDeletes,
+            mutationIntent,
+            automaticHandlingPolicy,
+            metrics,
+            isFolderMove,
+            isFolderDelete,
           });
-          transferOutcome = appliedSettlement.transferOutcome;
-          if (appliedSettlement.cancelled) return;
-          if (item.renameFrom) {
-            callbacks.onFileComplete?.(
-              item.path,
-              item.type,
-              true,
-              undefined,
-              fileSize,
-              item.renameFrom,
+        }
+        if (!this.canContinue(operationEpoch, result)) return { terminated: undefined };
+        if (receiptSink) {
+          // The wave owns the shared checkpoint; the completion is reported
+          // by the wave after that checkpoint commits.
+          deferredMutationOperationId = mutationIntent.operationId;
+        } else {
+          const checkpointStartedAt = Date.now();
+          try {
+            const checkpointMetrics = await this.commitMutationCheckpoint(
+              mutationIntent.operationId,
             );
-          } else {
-            callbacks.onFileComplete?.(
-              item.path,
-              item.type,
-              true,
-              undefined,
-              fileSize,
+            recordCheckpointMetrics(
+              metrics.mutationPersistence,
+              checkpointMetrics,
+              Date.now() - checkpointStartedAt,
             );
+          } catch (error) {
+            metrics.mutationPersistence.checkpointFailures++;
+            metrics.mutationPersistence.stagesMs.checkpointTotal +=
+              Date.now() - checkpointStartedAt;
+            throw error;
           }
-          return;
         }
-        if (automaticHandlingPolicy.autoDeleteLocalFiles
-          && item.type === SyncActionType.DeleteLocal
-          && !automaticDeleteCompleted) {
-          metrics.automaticHandling.deleteLocal.failed++;
+        if (item.type === SyncActionType.DeleteLocal) {
+          metrics.automaticHandling.deleteLocal.completed++;
+          automaticDeleteCompleted = true;
         }
-        const automaticMergeSettledAfter =
-          metrics.automaticHandling.textMerge.completed
-          + metrics.automaticHandling.textMerge.keptManual
-          + metrics.automaticHandling.textMerge.failed
-          + metrics.automaticHandling.textMerge.cancelled;
-        if (metrics.automaticHandling.textMerge.candidates > automaticMergeCandidatesBefore
-          && automaticMergeSettledAfter === automaticMergeSettledBefore) {
-          metrics.automaticHandling.textMerge.failed++;
+        // Folder rows convert from a confirmation row to the executable
+        // delete in the same plan. The checkpoint above is this item's own
+        // (folder deletes never ride a cleanup wave), so the authorization
+        // is consumed only after the committed state retired the shell.
+        if (
+          item.type === SyncActionType.DeleteLocalFolder
+          && itemResult.mutationApplied
+        ) {
+          await this.settleAppliedFolderDeleteDecision(item.path);
         }
-        if (this.cancelled && !result.authExpired) {
-          transferOutcome = transferMetrics ? "cancelled" : null;
-          this.diag?.log("execute", `[${position}/${total}] ${item.type} ${item.path} aborted after cancellation`);
-          return;
-        }
-        transferOutcome = transferMetrics ? "failed" : null;
-        if (e instanceof DownloadRemoteVersionChangedError
-          || e instanceof DownloadedPayloadSizeMismatchError
-          || (isResponseByteBudgetError(e)
-            && (e.kind === "observed" || e.kind === "declared-over-expected"))) {
-          // A stale-version download is a transient content race — the source
-          // device was still writing while we read (hot file: recording part,
-          // in-flight photo). The next round replans from the newer remote
-          // version, so defer the item instead of failing the round; auto sync
-          // keeps running (2026-09-28). The transfer-remote-moving breaker row
-          // grants one real attempt per backoff window so a still-growing file
-          // is not re-downloaded every round. 2026-10-13: the same race is also
-          // caught by the size guards (body over the declared budget, or a
-          // completed body whose size no longer matches) — those defer too; a
-          // declared size over the hard cap stays the hard failure above.
-          const deferCause = e instanceof DownloadRemoteVersionChangedError
-            ? "remote version changed during download"
-            : e instanceof DownloadedPayloadSizeMismatchError
-              ? "downloaded size no longer matches the declared size"
-              : "response body exceeded the declared size budget";
-          this.diag?.warn(
-            "execute",
-            `[${position}/${total}] download deferred — ${deferCause}: ${item.path}`,
+        itemResult.baseUpsert = undefined;
+        itemResult.baseRemoval = undefined;
+      }
+      remoteUpserts.push(...itemRemoteUpserts);
+      remoteDeletes.push(...itemRemoteDeletes);
+      if (!this.canContinue(operationEpoch, result)) return { terminated: undefined };
+      if (!itemResult.executed) {
+        transferOutcome = transferMetrics ? "skipped" : null;
+        if (itemResult.completionReason) {
+          const completionActionType =
+            itemResult.completionActionType ?? item.type;
+          callbacks.onFileComplete?.(
+            item.path,
+            completionActionType,
+            true,
+            itemResult.completionReason,
+            fileSizeForAction(item, completionActionType),
           );
-          result.deferred++;
-          const reason = this.failureReason(e, item.path);
-          // A3: evidence-only facts of the deferral; `reason` and the deferral
-          // classification above are untouched by this object.
-          const error = fileErrorFactFromError(e);
-          pendingIssues.push({
-            path: item.path,
-            actionType: item.type,
-            reason,
-            updatedAt: Date.now(),
-            fileSize,
-            localHash,
-            remoteETag,
-            consecutiveFailures: 1,
-            issueCode: "transfer-remote-moving" as const,
-            ...(error ? { error } : {}),
-          });
-          callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize, undefined, error);
-          return;
         }
-        const dbFingerprint = fingerprintIndexedDbError(e);
-        this.diag?.error("execute", `[${position}/${total}] ${item.type} ${item.path} FAILED: ${describeError(e)}`, dbFingerprint ? { ...errorDiagData(e), ...dbFingerprint } : errorDiagData(e));
-        // Auth failure at any file stops the entire pool immediately —
-        // no point letting other workers continue with a dead token.
-        if (isAuthFailure(e)) {
-          result.authExpired = true;
-          result.message = this.t("result.authExpired");
-          this.invalidateLifecycle("auth-expired");
+        return { terminated: undefined };
+      }
+      // One-way retained folder: the shell stays because local content has
+      // to survive. The row is informational (no decision, no count in the
+      // sidebar) and must be re-emitted next round so the round-end
+      // reconciliation keeps it until the folder can follow the cloud.
+      if (itemResult.retainedFolder) {
+        pendingIssues.push({
+          path: item.path,
+          actionType: SyncActionType.FolderDeferred,
+          issueCode: "one-way-folder-retained",
+          reason: this.t("reason.oneWay.folderRetained"),
+          updatedAt: Date.now(),
+        });
+      }
+      if (transferMetrics && transferDirection) {
+        const completedAfter = transferDirection === "upload"
+          ? result.uploaded
+          : result.downloaded;
+        if (completedAfter > completedBefore) {
+          transferOutcome = "succeeded";
+          transferMetrics.logicalBytes += Math.max(0, fileSize ?? 0);
+        } else {
+          transferOutcome = "skipped";
+        }
+      }
+      // P1-a: collect deferred base entry updates for batch persistence
+      if (itemResult.baseUpsert) baseUpserts.push(itemResult.baseUpsert);
+      if (itemResult.baseRemoval) baseRemovals.push(itemResult.baseRemoval);
+      if (item.type === SyncActionType.Conflict) {
+        if (!itemResult.resolvedConflict) {
+          const row = this.decisionRowForPlanItem(item);
+          if (row !== null) pendingConflicts.push(row);
+        }
+      } else {
+        const row = this.decisionRowForPlanItem(item);
+        if (row !== null) pendingDeletes.push(row);
+      }
+      if (
+        item.type === SyncActionType.RetryLater
+        || item.type === SyncActionType.FolderDeferred
+      ) {
+        const issue = this.buildPendingIssueForPlanItem(item);
+        const reason = issue.reason ?? this.t("syncView.failure.local");
+        pendingIssues.push(issue);
+        callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize);
+        return { terminated: undefined };
+      }
+      if (item.type === SyncActionType.SkipLargeFile) {
+        // 2026-09-16 拍板：按设置跳过（大型文件）是预期行为、零行动，
+        // 不属于「需要处理」——不入待处理账本；记入已解决路径让轮末对账
+        // 退役既有跳过行。轮内可见性由完成列表/历史承接，细节面在诊断报告。
+        // 增量呈现（方案单 §十二）：基准成员不发行行——计数与对账不受
+        // 影响；新面孔照常发行，轮末结算全集覆写基准。
+        resolvedIssuePaths.add(item.path);
+        settledSkipPaths.add(item.path);
+        const reason = item.reason
+          ? this.t(item.reason)
+          : this.t("syncView.fileStatus.skip");
+        if (skipDeltaDisabled || !skipBaseline.has(item.path)) {
           callbacks.onFileComplete?.(
             item.path,
             item.type,
-            false,
-            this.failureReason(e, item.path),
+            true,
+            reason,
             fileSize,
-            undefined,
-            fileErrorFactFromError(e),
           );
-          return;
         }
-        result.errors++;
-        if (isNetworkClassTransferFailure(e)) {
-          result.networkFailureErrors =
-            (result.networkFailureErrors ?? 0) + 1;
-        }
-        if (e instanceof CommunityPluginIdentityBlockError) {
-          result.identityBlockedErrors =
-            (result.identityBlockedErrors ?? 0) + 1;
-        }
-        if (
-          retryableRecoveryObservationError
-          && this.state.isV2StateActive
-          && this.state.mutationLedger.length > 0
-        ) {
-          const remaining = this.state.mutationLedger.length;
-          const previous = result.mutationRecovery;
-          const retryAfterSeconds =
-            retryableRecoveryObservationError.retryAfterSeconds;
-          result.mutationRecovery = {
-            state: "network-unavailable",
-            total: Math.max(previous?.total ?? 0, remaining),
-            settled: previous?.settled ?? 0,
-            remaining,
-            retryAfterSeconds:
-              previous?.retryAfterSeconds === null
-                ? retryAfterSeconds
-                : retryAfterSeconds === null
-                  ? previous?.retryAfterSeconds ?? null
-                  : Math.max(
-                      previous?.retryAfterSeconds ?? 0,
-                      retryAfterSeconds,
-                    ),
-          };
-        }
-        const reason = this.failureReason(e, item.path);
-        // A3 (2026-10-26): the evidence object rides along *after* every
-        // counter and classification above. Nothing below reads it back.
-        const error = fileErrorFactFromError(e);
+        return { terminated: undefined };
+      }
+      if (item.type === SyncActionType.SkipOneDriveInvalidName) {
+        const reason = item.reason
+          ? this.t(item.reason)
+          : this.t("syncView.fileStatus.skip");
         pendingIssues.push({
           path: item.path,
           actionType: item.type,
@@ -16769,179 +16072,466 @@ export class SyncExecutor {
           fileSize,
           localHash,
           remoteETag,
+        });
+        callbacks.onFileComplete?.(item.path, item.type, true, reason, fileSize);
+        return { terminated: undefined };
+      }
+      if (isResolvedIssueAction(item.type) && !itemResult.retainedFolder) {
+        resolvedIssuePaths.add(item.path);
+        if (item.renameFrom) resolvedIssuePaths.add(item.renameFrom);
+      }
+      const completionActionType =
+        itemResult.completionActionType ?? item.type;
+      const completionFileSize = fileSizeForAction(
+        item,
+        completionActionType,
+      );
+      if (deferredMutationOperationId) {
+        // 逐文件即时反馈：这一项自己的传输与回执都已落地，行先按「完成」
+        // 显示，不等整批共享检查点（批末才发会让批内长时间没有任何反馈）。
+        // 检查点随后仍按批提交（SC-15 粒度不变）；若它失败或被取消，调用方
+        // 用 onFileReverted 把这一行翻成失败并带上原因。
+        callbacks.onFileComplete?.(
+          item.path,
+          completionActionType,
+          true,
+          itemResult.completionReason,
+          completionFileSize,
+          item.renameFrom,
+        );
+        return {
+          terminated: {
+            operationId: deferredMutationOperationId,
+            path: item.path,
+            actionType: completionActionType,
+            reason: itemResult.completionReason,
+            fileSize: completionFileSize,
+            renameFrom: item.renameFrom,
+          },
+        };
+      }
+      if (item.renameFrom) {
+        callbacks.onFileComplete?.(
+          item.path,
+          completionActionType,
+          true,
+          itemResult.completionReason,
+          completionFileSize,
+          item.renameFrom,
+        );
+      } else {
+        callbacks.onFileComplete?.(
+          item.path,
+          completionActionType,
+          true,
+          itemResult.completionReason,
+          completionFileSize,
+        );
+      }
+
+      return { terminated: null };
+    };
+
+    try {
+      this.diag?.log("execute", `[${position}/${run.total}] ${item.type} ${item.path}`);
+      if (preparedDownload?.error) {
+        throw preparedDownload.error instanceof Error
+          ? preparedDownload.error
+          : new Error(describeThrownValue(preparedDownload.error));
+      }
+      mutationIntent = cleanupWave
+        ? cleanupWave.intent
+        : (plan.scope
+          && isMutationAction(item.type)
+          && !item.requiresConfirmation
+          ? this.createMutationIntent(item, plan.scope)
+          : null);
+      const attempt = await runPlanItemExecutionAttempt({
+        item,
+        result,
+        itemRemoteUpserts,
+        itemRemoteDeletes,
+        remoteUpserts: run.remoteUpserts,
+        remoteDeletes: run.remoteDeletes,
+        metrics: run.metrics,
+        callbacks,
+        operationEpoch,
+        automaticHandlingPolicy,
+        isFolderMove: run.isFolderMove,
+        isFolderDelete: run.isFolderDelete,
+        transferMetrics,
+        transferDirection,
+        completedBefore,
+        prePersistedIntent,
+        receiptSink,
+        mutationIntent,
+        preparedDownload,
+        fileSize,
+        localHash,
+        remoteETag,
+        baseUpserts: run.baseUpserts,
+        baseRemovals: run.baseRemovals,
+        pendingConflicts: run.pendingConflicts,
+        pendingDeletes: run.pendingDeletes,
+        pendingIssues: run.pendingIssues,
+        resolvedIssuePaths: run.resolvedIssuePaths,
+        settledSkipPaths: run.settledSkipPaths,
+        skipDeltaDisabled: run.skipDeltaDisabled,
+        skipBaseline: run.skipBaseline,
+      });
+      if (attempt.terminated !== null) return attempt.terminated;
+    } catch (e) {
+      let mutationRecovery: SideMutationRecoveryOutcome | null = null;
+      let retryableRecoveryObservationError: OneDriveError | null = null;
+      const activeIntent = mutationIntent;
+      const activeRecord = activeIntent
+        ? this.state.mutationLedger.find(
+            (entry) => entry.intent.operationId === activeIntent.operationId,
+          )
+        : undefined;
+      if (activeIntent && e instanceof MutationNotAppliedError) {
+        try {
+          await this.abandonKnownUnappliedMutation(
+            activeIntent,
+            "mutation stopped before target change and was abandoned",
+          );
+          mutationRecovery = "not-applied";
+        } catch (abandonError) {
+          this.diag?.warn(
+            "execute",
+            `mutation could not abandon its precondition-failed intent — ${activeIntent.path}`,
+            describeError(abandonError),
+          );
+          mutationRecovery = "unresolved";
+        }
+      } else if (activeIntent && activeRecord?.receipt) {
+        mutationRecovery = await this.recoverReceiptedMutationFailure({
+          error: e,
+          activeIntent,
+          activeRecord,
+          operationEpoch,
+          result,
+          metrics: run.metrics,
+        });
+      } else if (activeIntent && activeRecord) {
+        const recovery = await this.reconcileFailedMutation(activeIntent);
+        mutationRecovery = recovery.outcome;
+        retryableRecoveryObservationError =
+          recovery.retryableObservationError;
+      }
+      if (mutationRecovery === "applied") {
+        const appliedSettlement = await this.settleAppliedMutationRecovery({
+          operationEpoch,
+          result,
+          transferMetrics,
+          transferOutcome,
+          item,
+          metrics: run.metrics,
+          fileSize,
+          completedBefore,
+          deletedBefore,
+          foldersCreatedBefore,
+          foldersMovedBefore,
+          foldersDeletedBefore,
+          filesMovedBefore,
+          automaticHandlingPolicy,
+          automaticDeleteCompleted,
+          isFolderCreate: run.isFolderCreate,
+          isFolderMove: run.isFolderMove,
+          isFolderDelete: run.isFolderDelete,
+          resolvedIssuePaths: run.resolvedIssuePaths,
+        });
+        transferOutcome = appliedSettlement.transferOutcome;
+        if (appliedSettlement.cancelled) return;
+        if (item.renameFrom) {
+          callbacks.onFileComplete?.(
+            item.path,
+            item.type,
+            true,
+            undefined,
+            fileSize,
+            item.renameFrom,
+          );
+        } else {
+          callbacks.onFileComplete?.(
+            item.path,
+            item.type,
+            true,
+            undefined,
+            fileSize,
+          );
+        }
+        return;
+      }
+      if (automaticHandlingPolicy.autoDeleteLocalFiles
+        && item.type === SyncActionType.DeleteLocal
+        && !automaticDeleteCompleted) {
+        run.metrics.automaticHandling.deleteLocal.failed++;
+      }
+      const automaticMergeSettledAfter =
+        run.metrics.automaticHandling.textMerge.completed
+        + run.metrics.automaticHandling.textMerge.keptManual
+        + run.metrics.automaticHandling.textMerge.failed
+        + run.metrics.automaticHandling.textMerge.cancelled;
+      if (run.metrics.automaticHandling.textMerge.candidates > automaticMergeCandidatesBefore
+        && automaticMergeSettledAfter === automaticMergeSettledBefore) {
+        run.metrics.automaticHandling.textMerge.failed++;
+      }
+      if (this.cancelled && !result.authExpired) {
+        transferOutcome = transferMetrics ? "cancelled" : null;
+        this.diag?.log("execute", `[${position}/${run.total}] ${item.type} ${item.path} aborted after cancellation`);
+        return;
+      }
+      transferOutcome = transferMetrics ? "failed" : null;
+      if (e instanceof DownloadRemoteVersionChangedError
+        || e instanceof DownloadedPayloadSizeMismatchError
+        || (isResponseByteBudgetError(e)
+          && (e.kind === "observed" || e.kind === "declared-over-expected"))) {
+        // A stale-version download is a transient content race — the source
+        // device was still writing while we read (hot file: recording part,
+        // in-flight photo). The next round replans from the newer remote
+        // version, so defer the item instead of failing the round; auto sync
+        // keeps running (2026-09-28). The transfer-remote-moving breaker row
+        // grants one real attempt per backoff window so a still-growing file
+        // is not re-downloaded every round. 2026-10-13: the same race is also
+        // caught by the size guards (body over the declared budget, or a
+        // completed body whose size no longer matches) — those defer too; a
+        // declared size over the hard cap stays the hard failure above.
+        const deferCause = e instanceof DownloadRemoteVersionChangedError
+          ? "remote version changed during download"
+          : e instanceof DownloadedPayloadSizeMismatchError
+            ? "downloaded size no longer matches the declared size"
+            : "response body exceeded the declared size budget";
+        this.diag?.warn(
+          "execute",
+          `[${position}/${run.total}] download deferred — ${deferCause}: ${item.path}`,
+        );
+        result.deferred++;
+        const reason = this.failureReason(e, item.path);
+        // A3: evidence-only facts of the deferral; `reason` and the deferral
+        // classification above are untouched by this object.
+        const error = fileErrorFactFromError(e);
+        run.pendingIssues.push({
+          path: item.path,
+          actionType: item.type,
+          reason,
+          updatedAt: Date.now(),
+          fileSize,
+          localHash,
+          remoteETag,
           consecutiveFailures: 1,
-          ...(isNetworkClassTransferFailure(e)
-            ? { issueCode: "transfer-network" as const }
-            : {}),
+          issueCode: "transfer-remote-moving" as const,
           ...(error ? { error } : {}),
         });
         callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize, undefined, error);
-      } finally {
-        // 结算点：这一项（成功、失败、跳过、取消）到此为止，计数 +1 并立即
-        // 上报。并发池里的其它项还在飞，计数因此逐条走而不是整批跳。
-        if (countsTowardProgress) {
-          settled++;
-          this.progressStore?.setProgress(settled, total, item.path, item.type);
-          callbacks.onProgress?.(settled, total, item.path);
+        return;
+      }
+      const dbFingerprint = fingerprintIndexedDbError(e);
+      this.diag?.error("execute", `[${position}/${run.total}] ${item.type} ${item.path} FAILED: ${describeError(e)}`, dbFingerprint ? { ...errorDiagData(e), ...dbFingerprint } : errorDiagData(e));
+      // Auth failure at any file stops the entire pool immediately —
+      // no point letting other workers continue with a dead token.
+      if (isAuthFailure(e)) {
+        result.authExpired = true;
+        result.message = this.t("result.authExpired");
+        this.invalidateLifecycle("auth-expired");
+        callbacks.onFileComplete?.(
+          item.path,
+          item.type,
+          false,
+          this.failureReason(e, item.path),
+          fileSize,
+          undefined,
+          fileErrorFactFromError(e),
+        );
+        return;
+      }
+      result.errors++;
+      if (isNetworkClassTransferFailure(e)) {
+        result.networkFailureErrors =
+          (result.networkFailureErrors ?? 0) + 1;
+      }
+      if (e instanceof CommunityPluginIdentityBlockError) {
+        result.identityBlockedErrors =
+          (result.identityBlockedErrors ?? 0) + 1;
+      }
+      if (
+        retryableRecoveryObservationError
+        && this.state.isV2StateActive
+        && this.state.mutationLedger.length > 0
+      ) {
+        const remaining = this.state.mutationLedger.length;
+        const previous = result.mutationRecovery;
+        const retryAfterSeconds =
+          retryableRecoveryObservationError.retryAfterSeconds;
+        result.mutationRecovery = {
+          state: "network-unavailable",
+          total: Math.max(previous?.total ?? 0, remaining),
+          settled: previous?.settled ?? 0,
+          remaining,
+          retryAfterSeconds:
+            previous?.retryAfterSeconds === null
+              ? retryAfterSeconds
+              : retryAfterSeconds === null
+                ? previous?.retryAfterSeconds ?? null
+                : Math.max(
+                    previous?.retryAfterSeconds ?? 0,
+                    retryAfterSeconds,
+                  ),
+        };
+      }
+      const reason = this.failureReason(e, item.path);
+      // A3 (2026-10-26): the evidence object rides along *after* every
+      // counter and classification above. Nothing below reads it back.
+      const error = fileErrorFactFromError(e);
+      run.pendingIssues.push({
+        path: item.path,
+        actionType: item.type,
+        reason,
+        updatedAt: Date.now(),
+        fileSize,
+        localHash,
+        remoteETag,
+        consecutiveFailures: 1,
+        ...(isNetworkClassTransferFailure(e)
+          ? { issueCode: "transfer-network" as const }
+          : {}),
+        ...(error ? { error } : {}),
+      });
+      callbacks.onFileComplete?.(item.path, item.type, false, reason, fileSize, undefined, error);
+    } finally {
+      // 结算点：这一项（成功、失败、跳过、取消）到此为止，计数 +1 并立即
+      // 上报。并发池里的其它项还在飞，计数因此逐条走而不是整批跳。
+      if (countsTowardProgress) {
+        run.settled++;
+        this.progressStore?.setProgress(run.settled, run.total, item.path, item.type);
+        callbacks.onProgress?.(run.settled, run.total, item.path);
+      }
+      if (transferMetrics) {
+        const outcome = transferOutcome ?? "cancelled";
+        transferMetrics[outcome]++;
+        if (!transferAlreadyStarted) {
+          transferMetrics.activeConcurrency = Math.max(0, transferMetrics.activeConcurrency - 1);
         }
-        if (transferMetrics) {
-          const outcome = transferOutcome ?? "cancelled";
-          transferMetrics[outcome]++;
-          if (!transferAlreadyStarted) {
-            transferMetrics.activeConcurrency = Math.max(0, transferMetrics.activeConcurrency - 1);
+      }
+    }
+  }
+
+  /** Flip rows that were already reported as done: their shared checkpoint
+   *  never committed (failed, or skipped by cancellation), so the shown
+   *  success does not hold. The reason stays on the row — a success that
+   *  becomes false must never disappear silently. */
+  private revertDeferredCompletions(
+    completed: readonly DeferredMutationCompletion[],
+    reason: string,
+    callbacks: SyncCallbacks,
+  ): void {
+    for (const completion of completed) {
+      callbacks.onFileReverted?.(completion.path, reason);
+    }
+  }
+
+  /** Commit one deferred batch's shared checkpoint (single operation or
+   *  several), with one hierarchy-refresh rebase retry for parent-mismatch
+   *  refusals; on final failure flip the batch's already-shown rows and
+   *  rethrow fail-closed. */
+  private async commitDeferredCheckpointBatch(
+    completions: readonly DeferredMutationCompletion[],
+    run: ExecutionPhaseState,
+    callbacks: SyncCallbacks,
+    operationEpoch: number,
+    result: SyncResult,
+  ): Promise<V2CommitBreakdown | undefined> {
+    if (completions.length === 0) return undefined;
+    const operationIds = completions.map((completion) => completion.operationId);
+    const commit = () => operationIds.length === 1
+      ? this.commitMutationCheckpoint(operationIds[0])
+      : this.commitMutationCheckpoints(operationIds);
+    let checkpointError: unknown;
+    let checkpointBreakdown: V2CommitBreakdown | undefined;
+    let hierarchyRefreshAttempted = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const checkpointStartedAt = Date.now();
+      try {
+        const checkpointMetrics = await commit();
+        checkpointBreakdown = checkpointMetrics?.breakdown;
+        recordCheckpointMetrics(
+          run.metrics.mutationPersistence,
+          checkpointMetrics,
+          Date.now() - checkpointStartedAt,
+        );
+        checkpointError = undefined;
+        break;
+      } catch (error) {
+        checkpointError = error;
+        run.metrics.mutationPersistence.checkpointFailures++;
+        run.metrics.mutationPersistence.stagesMs.checkpointTotal +=
+          Date.now() - checkpointStartedAt;
+        this.diag?.warn(
+          "state",
+          `upload checkpoint batch attempt ${attempt + 1} failed`,
+          {
+            operations: operationIds.length,
+            error: describeError(error),
+            mutations: 0,
+          },
+        );
+        if (
+          attempt === 0
+          && !hierarchyRefreshAttempted
+          && isV2RemoteUpsertParentMismatchError(error)
+        ) {
+          // Same recovery the single-item commit path owns: the hierarchy
+          // may have changed after this run's initial scan, so refresh the
+          // committed identity tree once, rebind every receipt the
+          // refreshed tree accepts, and let attempt 2 face that tree. The
+          // reducer's parent assertion itself stays fail-closed.
+          hierarchyRefreshAttempted = true;
+          const rebound = await this.rebaseReceiptsAfterHierarchyRefresh(
+            operationIds,
+            operationEpoch,
+            result,
+          );
+          if (rebound.rebound > 0) {
+            run.metrics.mutationPersistence.receiptWrites += rebound.rebound;
+            run.metrics.mutationPersistence.stagesMs.receiptPersist +=
+              rebound.receiptPersistMs;
           }
         }
       }
-    };
-
-    // Step 1 — create folders parent-first so every later file mutation has a
-    // committed destination parent identity on both sides.
-    for (const item of folderCreates) {
-      if (!this.canContinue(operationEpoch, result)) break;
-      await executePlanItem(item);
     }
-
-    // Step 1b — identity moves run after creates, before file mutations. A
-    // top-level folder receipt reprojects the entire committed subtree.
-    for (const item of folderMoves) {
-      if (!this.canContinue(operationEpoch, result)) break;
-      await executePlanItem(item);
+    if (checkpointError !== undefined) {
+      const reason = this.failureReason(checkpointError);
+      // Every member already reported its own success when it settled; the
+      // failed checkpoint means that success is not durable, so flip the
+      // rows instead of showing a second, duplicate failure row.
+      this.revertDeferredCompletions(completions, reason, callbacks);
+      // Rethrown fail-closed on purpose: the round-end shared checkpoint
+      // refuses to publish while net-new unresolved ledger records exist
+      // (sameRetainedMutationRecovery), so a degraded "keep going" would
+      // crash at round end anyway. The rebuild-rebase-retry above settles
+      // the reachable parent-drift shape; the stranded receipts of a still
+      // failing batch settle through the next round's mutation recovery,
+      // which runs the same refresh (uploadReceiptParentDriftedFromIndex).
+      throw checkpointError instanceof Error
+        ? checkpointError
+        : new Error(describeThrownValue(checkpointError));
     }
+    return checkpointBreakdown;
+  }
 
-    // Step 2 — passthrough items (no network I/O)
-    for (const item of passthroughItems) {
-      if (!this.canContinue(operationEpoch, result)) break;
-      await executePlanItem(item);
-    }
-
-    const uploadItems = [...smallUploads, ...largeUploads];
-    // Upload-direction downgrade guard: a local plugin version lower than the
-    // remote one must not overwrite the cloud bundle automatically. Whole
-    // affected bundles are removed from the upload pools (smallUploads /
-    // largeUploads directly, since the pools are iterated later) and surfaced
-    // as reviewable conflicts (mirror of guardCommunityPluginBundleDowngrades).
-    const communityPluginUploadDowngradesDeferred: string[] = [];
-    const communityPluginUploadDowngradeRemoved =
-      await this.guardCommunityPluginBundleUploadDowngrades(
-        smallUploads,
-        largeUploads,
-        communityPluginSyncPolicy,
-        communityPluginUploadDowngradesDeferred,
-      );
-    if (communityPluginUploadDowngradeRemoved > 0) {
-      total -= communityPluginUploadDowngradeRemoved;
-      this.diag?.log(
-        "execute",
-        `community plugin upload downgrade guard deferred ${communityPluginUploadDowngradeRemoved} upload(s) to user review`,
-      );
-    }
-    if (communityPluginUploadDowngradesDeferred.length > 0) {
-      result.communityPluginUploadDowngradesDeferred = [
-        ...new Set(communityPluginUploadDowngradesDeferred),
-      ];
-    }
-    const communityPluginUploadErrors =
-      await this.prepareCommunityPluginBundleUploads(
-        uploadItems,
-        communityPluginSyncPolicy,
-        result,
-        operationEpoch,
-      );
-
-    /** Flip rows that were already reported as done: their shared checkpoint
-     *  never committed (failed, or skipped by cancellation), so the shown
-     *  success does not hold. The reason stays on the row — a success that
-     *  becomes false must never disappear silently. */
-    const revertDeferredCompletions = (
-      completed: readonly DeferredMutationCompletion[],
-      reason: string,
-    ): void => {
-      for (const completion of completed) {
-        callbacks.onFileReverted?.(completion.path, reason);
-      }
-    };
-
-    const commitDeferredCheckpointBatch = async (
-      completions: readonly DeferredMutationCompletion[],
-    ): Promise<V2CommitBreakdown | undefined> => {
-      if (completions.length === 0) return undefined;
-      const operationIds = completions.map((completion) => completion.operationId);
-      const commit = () => operationIds.length === 1
-        ? this.commitMutationCheckpoint(operationIds[0])
-        : this.commitMutationCheckpoints(operationIds);
-      let checkpointError: unknown;
-      let checkpointBreakdown: V2CommitBreakdown | undefined;
-      let hierarchyRefreshAttempted = false;
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const checkpointStartedAt = Date.now();
-        try {
-          const checkpointMetrics = await commit();
-          checkpointBreakdown = checkpointMetrics?.breakdown;
-          recordCheckpointMetrics(
-            metrics.mutationPersistence,
-            checkpointMetrics,
-            Date.now() - checkpointStartedAt,
-          );
-          checkpointError = undefined;
-          break;
-        } catch (error) {
-          checkpointError = error;
-          metrics.mutationPersistence.checkpointFailures++;
-          metrics.mutationPersistence.stagesMs.checkpointTotal +=
-            Date.now() - checkpointStartedAt;
-          this.diag?.warn(
-            "state",
-            `upload checkpoint batch attempt ${attempt + 1} failed`,
-            {
-              operations: operationIds.length,
-              error: describeError(error),
-              mutations: 0,
-            },
-          );
-          if (
-            attempt === 0
-            && !hierarchyRefreshAttempted
-            && isV2RemoteUpsertParentMismatchError(error)
-          ) {
-            // Same recovery the single-item commit path owns: the hierarchy
-            // may have changed after this run's initial scan, so refresh the
-            // committed identity tree once, rebind every receipt the
-            // refreshed tree accepts, and let attempt 2 face that tree. The
-            // reducer's parent assertion itself stays fail-closed.
-            hierarchyRefreshAttempted = true;
-            const rebound = await this.rebaseReceiptsAfterHierarchyRefresh(
-              operationIds,
-              operationEpoch,
-              result,
-            );
-            if (rebound.rebound > 0) {
-              metrics.mutationPersistence.receiptWrites += rebound.rebound;
-              metrics.mutationPersistence.stagesMs.receiptPersist +=
-                rebound.receiptPersistMs;
-            }
-          }
-        }
-      }
-      if (checkpointError !== undefined) {
-        const reason = this.failureReason(checkpointError);
-        // Every member already reported its own success when it settled; the
-        // failed checkpoint means that success is not durable, so flip the
-        // rows instead of showing a second, duplicate failure row.
-        revertDeferredCompletions(completions, reason);
-        // Rethrown fail-closed on purpose: the round-end shared checkpoint
-        // refuses to publish while net-new unresolved ledger records exist
-        // (sameRetainedMutationRecovery), so a degraded "keep going" would
-        // crash at round end anyway. The rebuild-rebase-retry above settles
-        // the reachable parent-drift shape; the stranded receipts of a still
-        // failing batch settle through the next round's mutation recovery,
-        // which runs the same refresh (uploadReceiptParentDriftedFromIndex).
-        throw checkpointError instanceof Error
-          ? checkpointError
-          : new Error(describeThrownValue(checkpointError));
-      }
-      return checkpointBreakdown;
-    };
-
+  /** Step 3a — the small-upload resident pool: one batch per checkpoint,
+   *  batch intents pre-written, receipts collected, one shared checkpoint
+   *  per batch with per-file feedback. Runs the adaptive AIMD upload policy
+   *  for the whole direction. */
+  private async runSmallUploadPoolPhase(
+    plan: SyncPlan,
+    result: SyncResult,
+    callbacks: SyncCallbacks,
+    operationEpoch: number,
+    automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>,
+    run: ExecutionPhaseState,
+    communityPluginUploadErrors: Map<string, unknown>,
+  ): Promise<void> {
     // Step 3a — independent small uploads are persisted one batch at a time
     // (`uploadCheckpointBatch`). The whole batch's mutation intents are
     // durable before its first PUT, every member's receipt is written in one
@@ -16956,11 +16546,11 @@ export class SyncExecutor {
     // direction for Retry-After before the pool resumes at half the depth.
     for (
       let index = 0;
-      index < smallUploads.length;
+      index < run.smallUploads.length;
       index += uploadCheckpointBatch(this.platform)
     ) {
       if (!this.canContinue(operationEpoch, result)) break;
-      const batch = smallUploads.slice(
+      const batch = run.smallUploads.slice(
         index,
         index + uploadCheckpointBatch(this.platform),
       );
@@ -16971,7 +16561,7 @@ export class SyncExecutor {
       const handoffs: CleanupWaveHandoff[] = [];
       for (const item of batch) {
         // A member blocked by the bundle preflight never reaches a mutation
-        // attempt (`executePlanItem` throws before `executeItem`), so the batch
+        // attempt (`executeSinglePlanItem` throws before `executeItem`), so the batch
         // must not leave a durable intent behind for it: the per-file path
         // creates the intent only after that check. Same map, same key as the
         // throw below — one expression decides both.
@@ -16992,8 +16582,8 @@ export class SyncExecutor {
       const intentMs = performance.now() - intentPerfStartedAt;
       // The batch owns the intent write, so it owns the counters the per-item
       // path would have incremented (diagnostics read them per round).
-      metrics.mutationPersistence.intentWrites += intents.length;
-      metrics.mutationPersistence.stagesMs.intentPersist +=
+      run.metrics.mutationPersistence.intentWrites += intents.length;
+      run.metrics.mutationPersistence.stagesMs.intentPersist +=
         Date.now() - intentStartedAt;
       const completions: DeferredMutationCompletion[] = [];
       const poolStartedAt = performance.now();
@@ -17013,7 +16603,7 @@ export class SyncExecutor {
             cause: change.cause ?? null,
             windowThroughput: change.windowThroughput ?? null,
             referenceMedian: change.referenceMedian ?? null,
-            maxConcurrency: uploadPolicy.maxLimit,
+            maxConcurrency: run.uploadPolicy.maxLimit,
           },
         );
       };
@@ -17024,7 +16614,7 @@ export class SyncExecutor {
        *  link. */
       const settleUpload = (observation: UploadTransferObservation): void => {
         if (observation.throttled) {
-          const throttle = uploadPolicy.noteThrottle(
+          const throttle = run.uploadPolicy.noteThrottle(
             Date.now(),
             observation.retryAfterSeconds,
           );
@@ -17041,11 +16631,11 @@ export class SyncExecutor {
           return;
         }
         if (observation.outcome === "failure") {
-          noteUploadStep(uploadPolicy.noteFailure());
+          noteUploadStep(run.uploadPolicy.noteFailure());
           return;
         }
         if (observation.outcome === "success") {
-          noteUploadStep(uploadPolicy.noteFile({
+          noteUploadStep(run.uploadPolicy.noteFile({
             bytes: observation.bytes,
             transferMs: observation.transferMs,
           }));
@@ -17055,7 +16645,7 @@ export class SyncExecutor {
        *  runs, and cancellation stays responsive (bounded slices). */
       const waitOutThrottlePause = async (): Promise<void> => {
         for (;;) {
-          const remaining = uploadPolicy.pauseRemainingMs(Date.now());
+          const remaining = run.uploadPolicy.pauseRemainingMs(Date.now());
           if (remaining <= 0 || !this.canContinue(operationEpoch, result)) return;
           await new Promise<void>((resolve) => compatSetTimeout(
             () => resolve(),
@@ -17073,7 +16663,13 @@ export class SyncExecutor {
           retryAfterSeconds: null,
         };
         const preflightError = communityPluginUploadErrors.get(item.path);
-        const task = executePlanItem(
+        const task = this.executeSinglePlanItem(
+          plan,
+          result,
+          callbacks,
+          operationEpoch,
+          automaticHandlingPolicy,
+          run,
           item,
           preflightError === undefined ? undefined : { error: preflightError },
           handoffs[offset],
@@ -17093,12 +16689,12 @@ export class SyncExecutor {
         nextOffset < batch.length
         && this.canContinue(operationEpoch, result)
       ) {
-        if (uploadPolicy.pauseRemainingMs(Date.now()) > 0) {
+        if (run.uploadPolicy.pauseRemainingMs(Date.now()) > 0) {
           await waitOutThrottlePause();
           continue;
         }
         while (
-          inFlight.size < uploadPolicy.limit
+          inFlight.size < run.uploadPolicy.limit
           && nextOffset < batch.length
           && this.canContinue(operationEpoch, result)
         ) {
@@ -17123,7 +16719,7 @@ export class SyncExecutor {
         const receiptStartedAt = Date.now();
         const receiptPerfStartedAt = performance.now();
         await this.state.recordMutationReceipts(receipts);
-        metrics.mutationPersistence.stagesMs.receiptPersist +=
+        run.metrics.mutationPersistence.stagesMs.receiptPersist +=
           Date.now() - receiptStartedAt;
         receiptMs = performance.now() - receiptPerfStartedAt;
       }
@@ -17132,14 +16728,20 @@ export class SyncExecutor {
       let checkpointBreakdown: V2CommitBreakdown | undefined;
       if (this.canContinue(operationEpoch, result)) {
         const checkpointStartedAt = performance.now();
-        checkpointBreakdown = await commitDeferredCheckpointBatch(completions);
+        checkpointBreakdown = await this.commitDeferredCheckpointBatch(
+          completions,
+          run,
+          callbacks,
+          operationEpoch,
+          result,
+        );
         checkpointMs = performance.now() - checkpointStartedAt;
         checkpointedOperations = completions.length;
       } else if (completions.length > 0) {
         // 取消落在批末：这些文件的 PUT 与回执都已落地，但共享检查点按契约
         // 等 epoch，没有提交——先前逐条显示的「完成」本轮不成立，按实际
         // 结果翻成失败（原因用现役取消句），下一轮由回执恢复结算。
-        revertDeferredCompletions(completions, this.t("result.cancelled"));
+        this.revertDeferredCompletions(completions, this.t("result.cancelled"), callbacks);
       }
       this.diag?.log("execute", "upload batch settled", {
         files: batch.length,
@@ -17153,7 +16755,7 @@ export class SyncExecutor {
         intentMs: Math.max(0, Math.round(intentMs)),
         networkMs: Math.max(0, Math.round(networkMs)),
         pauseMs: Math.max(0, Math.round(pauseMs)),
-        concurrency: uploadPolicy.limit,
+        concurrency: run.uploadPolicy.limit,
         receiptMs: Math.max(0, Math.round(receiptMs)),
         checkpointMs: Math.max(0, Math.round(checkpointMs)),
         // The same commit, split into its own phases: the counterpart of the
@@ -17167,20 +16769,36 @@ export class SyncExecutor {
         failed: result.errors > batchErrorsBefore,
       });
     }
+  }
 
+  /** Step 3c — the large-upload worker pool (serial upload session per file,
+   *  two sessions in flight on desktop, serial on mobile) plus the bundle
+   *  download prep that only the selected community-plugin pre-download
+   *  consumes: one batched downloadUrl refresh and the bundle pre-download
+   *  plan. */
+  private async runLargeUploadPoolPhase(
+    plan: SyncPlan,
+    result: SyncResult,
+    callbacks: SyncCallbacks,
+    operationEpoch: number,
+    automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>,
+    run: ExecutionPhaseState,
+    communityPluginSyncPolicy: Readonly<CommunityPluginSyncPolicyV1>,
+    communityPluginUploadErrors: Map<string, unknown>,
+  ): Promise<Awaited<ReturnType<SyncExecutor["prepareCommunityPluginBundleDownloads"]>>> {
     // Step 3c — large uploads parallelize across files (B②, 2026-09-14):
     // each file still owns one strictly sequential upload session (session
     // chunks are order-mandated), but desktop keeps two sessions in flight
     // so one file's per-chunk request overhead overlaps another file's
     // transfer. Per-file checkpointing and error isolation are unchanged,
-    // and executePlanItem settles every failure internally (no rethrow),
+    // and executeSinglePlanItem settles every failure internally (no rethrow),
     // so this worker pool has the same Promise.all semantics as the small
     // upload pool above. Mobile stays serial: two concurrent large uploads
     // would hold two full file reads plus two chunk buffers in memory.
     // A small-upload 429/509 pause still covers the direction: the large pool
     // waits it out before issuing its first session request.
     for (;;) {
-      const remainingPauseMs = uploadPolicy.pauseRemainingMs(Date.now());
+      const remainingPauseMs = run.uploadPolicy.pauseRemainingMs(Date.now());
       if (
         remainingPauseMs <= 0
         || !this.canContinue(operationEpoch, result)
@@ -17193,19 +16811,25 @@ export class SyncExecutor {
       ));
     }
     const largeConcurrency = Math.min(
-      largeUploads.length,
+      run.largeUploads.length,
       largeUploadConcurrency(this.platform.isMobileApp),
     );
     let nextLargeUploadIndex = 0;
     await Promise.all(
       Array.from({ length: largeConcurrency }, async () => {
         while (
-          nextLargeUploadIndex < largeUploads.length
+          nextLargeUploadIndex < run.largeUploads.length
           && this.canContinue(operationEpoch, result)
         ) {
-          const item = largeUploads[nextLargeUploadIndex++];
+          const item = run.largeUploads[nextLargeUploadIndex++];
           const preflightError = communityPluginUploadErrors.get(item.path);
-          await executePlanItem(
+          await this.executeSinglePlanItem(
+            plan,
+            result,
+            callbacks,
+            operationEpoch,
+            automaticHandlingPolicy,
+            run,
             item,
             preflightError === undefined ? undefined : { error: preflightError },
           );
@@ -17265,9 +16889,9 @@ export class SyncExecutor {
     let visibleBundleRoot = "";
     const preparedCommunityPluginDownloads =
       await this.prepareCommunityPluginBundleDownloads(
-        downloads,
+        run.downloads,
         communityPluginSyncPolicy,
-        metrics,
+        run.metrics,
         result,
         operationEpoch,
         (root, downloaded, totalBytes) => {
@@ -17275,36 +16899,34 @@ export class SyncExecutor {
             visibleBundleRoot = root;
             // 计数只按已结算项推进：预取中的插件目录只占「当前文件」槽，
             // 不提前把计数推高一格（否则结算后同一格会被推两次）。
-            const position = total > 0 ? Math.min(settled, total) : 0;
+            const position = run.total > 0 ? Math.min(run.settled, run.total) : 0;
             this.progressStore?.setProgress(
               position,
-              total,
+              run.total,
               root,
               SyncActionType.Download,
             );
-            callbacks.onProgress?.(position, total, root);
+            callbacks.onProgress?.(position, run.total, root);
           }
           callbacks.onFileProgress?.(downloaded, totalBytes);
         },
         refreshBundleDownloadUrls,
       );
+    return preparedCommunityPluginDownloads;
+  }
 
-    // Step 3b — only the read-only network stage of independent small
-    // downloads (≤ 8 MiB, desktop and — since A2 2026-09-08 — mobile with a
-    // lower adaptive ceiling) may overlap. Local CAS, temp verification,
-    // intent/receipt and checkpoint publication below remain strictly serial
-    // per file on every platform.
-
-    await this.runDownloadWindow({
-      result,
-      operationEpoch,
-      downloads,
-      downloadPolicy,
-      executePlanItem,
-      preparedCommunityPluginDownloads,
-      metrics,
-    });
-
+  /** Step 4 — the file-delete cleanup waves: each wave pre-writes every
+   *  member's mutation intent in one device-local commit, runs the DELETEs
+   *  with bounded network concurrency, then publishes one shared checkpoint
+   *  plus one receipt/ledger write for the whole wave. */
+  private async runCleanupWavePhase(
+    plan: SyncPlan,
+    result: SyncResult,
+    callbacks: SyncCallbacks,
+    operationEpoch: number,
+    automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>,
+    run: ExecutionPhaseState,
+  ): Promise<void> {
     // Step 4 — cleanup (file deletes) after all uploads/downloads. A wave
     // pre-writes every member's mutation intent in one device-local commit,
     // runs the DELETEs with bounded network concurrency, then publishes one
@@ -17316,11 +16938,11 @@ export class SyncExecutor {
     const settledDecisionEntries: Array<{ token: string; path: string }> = [];
     for (
       let index = 0;
-      index < cleanupItems.length;
+      index < run.cleanupItems.length;
       index += deleteCheckpointWave(this.platform)
     ) {
       if (!this.canContinue(operationEpoch, result)) break;
-      const wave = cleanupItems.slice(
+      const wave = run.cleanupItems.slice(
         index,
         index + deleteCheckpointWave(this.platform),
       );
@@ -17349,8 +16971,8 @@ export class SyncExecutor {
       const intentMs = performance.now() - intentPerfStartedAt;
       // The wave owns the intent write, so it owns the counters the per-item
       // path would have incremented (diagnostics read them per round).
-      metrics.mutationPersistence.intentWrites += intents.length;
-      metrics.mutationPersistence.stagesMs.intentPersist +=
+      run.metrics.mutationPersistence.intentWrites += intents.length;
+      run.metrics.mutationPersistence.stagesMs.intentPersist +=
         Date.now() - intentStartedAt;
       const ledgerSink: DeletionLedgerEntryV1[] = [];
       /** Wave members that erase this device's only copy because the cloud
@@ -17369,7 +16991,7 @@ export class SyncExecutor {
       const localDeleteAbsent = localDeletePaths.length === 0
         ? null
         : await this.verifyRemoteDeleteBatchAbsence(localDeletePaths);
-      /** One sample per wave member: the whole `executePlanItem` call, so
+      /** One sample per wave member: the whole `executeSinglePlanItem` call, so
        *  local preparation and the DELETE round trip are both inside. */
       const deleteItemMs: number[] = [];
       /** One sample per remote DELETE request (see `deleteRequestTimingSink`),
@@ -17389,7 +17011,7 @@ export class SyncExecutor {
           async (item, waveIndex) => {
             const itemPerfStartedAt = performance.now();
             try {
-              return await executePlanItem(item, undefined, handoffs[waveIndex]);
+              return await this.executeSinglePlanItem(plan, result, callbacks, operationEpoch, automaticHandlingPolicy, run, item, undefined, handoffs[waveIndex]);
             } catch (error) {
               waveError ??= error;
               return undefined;
@@ -17415,11 +17037,11 @@ export class SyncExecutor {
         const receiptPerfStartedAt = performance.now();
         try {
           await this.state.recordMutationReceipts(receipts);
-          metrics.mutationPersistence.stagesMs.receiptPersist +=
+          run.metrics.mutationPersistence.stagesMs.receiptPersist +=
             Date.now() - receiptStartedAt;
           receiptMs = performance.now() - receiptPerfStartedAt;
         } catch (error) {
-          metrics.mutationPersistence.stagesMs.receiptPersist +=
+          run.metrics.mutationPersistence.stagesMs.receiptPersist +=
             Date.now() - receiptStartedAt;
           throw error;
         }
@@ -17442,7 +17064,13 @@ export class SyncExecutor {
         }
       }
       const checkpointPerfStartedAt = performance.now();
-      await commitDeferredCheckpointBatch(completions);
+      await this.commitDeferredCheckpointBatch(
+        completions,
+        run,
+        callbacks,
+        operationEpoch,
+        result,
+      );
       const checkpointMs = performance.now() - checkpointPerfStartedAt;
       // A delete is only consumed after this wave's checkpoint settled. A
       // failed or skipped path never enters `completions`, so its decision
@@ -17503,7 +17131,23 @@ export class SyncExecutor {
         );
       }
     }
+  }
 
+  /** Step 5 — folder shells are removed child-first only after every file
+   *  action settled, then the round finalizes: cancellation accounting, the
+   *  unresolved-checkpoint stop, remote-mutation and base-entry persistence,
+   *  pending ledgers, the skip-baseline mirror overwrite and the upload
+   *  summary. Every early return below is the round's terminal state, so a
+   *  return from this tail phase equals a return from `executePlan`. */
+  private async runFolderDeletePhaseAndFinalize(
+    plan: SyncPlan,
+    result: SyncResult,
+    callbacks: SyncCallbacks,
+    operationEpoch: number,
+    automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>,
+    run: ExecutionPhaseState,
+    retainedMutationRecovery: readonly Readonly<MutationLedgerEntryV1>[],
+  ): Promise<void> {
     // Step 5 — directory shells are removed child-first only after every file
     // action settled. Deletes at the same path depth are independent, so
     // each depth layer runs as a bounded batch and a folder is only
@@ -17513,13 +17157,13 @@ export class SyncExecutor {
     // branch still re-lists the target immediately (fail-closed semantics
     // unchanged; non-empty or drifted folders defer as before).
     const folderDeleteDepth = (path: string): number => path.split("/").length;
-    const maxFolderDeleteDepth = folderDeletes.reduce(
+    const maxFolderDeleteDepth = run.folderDeletes.reduce(
       (max, item) => Math.max(max, folderDeleteDepth(item.path)),
       0,
     );
     for (let depth = maxFolderDeleteDepth; depth >= 1; depth--) {
       if (!this.canContinue(operationEpoch, result)) break;
-      const layer = folderDeletes.filter(
+      const layer = run.folderDeletes.filter(
         (item) => folderDeleteDepth(item.path) === depth,
       );
       for (
@@ -17532,12 +17176,12 @@ export class SyncExecutor {
           index,
           index + deleteCleanupBatch(this.platform),
         );
-        await Promise.all(batch.map((item) => executePlanItem(item)));
+        await Promise.all(batch.map((item) => this.executeSinglePlanItem(plan, result, callbacks, operationEpoch, automaticHandlingPolicy, run, item)));
       }
     }
 
     if (!this.canContinue(operationEpoch, result)) {
-      this.diag?.log("execute", `sync cancelled after settling ${settled}/${total} item(s)`);
+      this.diag?.log("execute", `sync cancelled after settling ${run.settled}/${run.total} item(s)`);
       this.markCancelled(result);
       return;
     }
@@ -17583,52 +17227,51 @@ export class SyncExecutor {
     // performing a mutation (for example, an If-Match upload race whose
     // winner already has the local bytes). Publish that remote identity
     // before a base anchor is allowed to reference its eTag.
-    if (remoteUpserts.length > 0 || remoteDeletes.length > 0) {
+    if (run.remoteUpserts.length > 0 || run.remoteDeletes.length > 0) {
       if (!this.canContinue(operationEpoch, result)) return;
-      await this.state.applyRemoteMutations(remoteUpserts, remoteDeletes);
+      await this.state.applyRemoteMutations(run.remoteUpserts, run.remoteDeletes);
     }
 
     // P1-a: batch persist base entry updates (deferred from per-file calls)
-    if (baseUpserts.length > 0) {
+    if (run.baseUpserts.length > 0) {
       if (!this.canContinue(operationEpoch, result)) return;
-      await this.state.upsertBaseEntries(baseUpserts);
+      await this.state.upsertBaseEntries(run.baseUpserts);
     }
-    if (baseRemovals.length > 0) {
+    if (run.baseRemovals.length > 0) {
       if (!this.canContinue(operationEpoch, result)) return;
-      await this.state.removeBaseEntries(baseRemovals);
+      await this.state.removeBaseEntries(run.baseRemovals);
     }
 
-    if (pendingConflicts.length > 0) {
+    if (run.pendingConflicts.length > 0) {
       if (!this.canContinue(operationEpoch, result)) return;
-      await this.state.upsertPendingConflicts(pendingConflicts);
+      await this.state.upsertPendingConflicts(run.pendingConflicts);
     }
-    if (pendingDeletes.length > 0) {
+    if (run.pendingDeletes.length > 0) {
       if (!this.canContinue(operationEpoch, result)) return;
-      await this.state.upsertPendingDeletes(pendingDeletes);
+      await this.state.upsertPendingDeletes(run.pendingDeletes);
     }
     if (!this.canContinue(operationEpoch, result)) return;
-    await this.state.reconcilePendingIssues(pendingIssues, resolvedIssuePaths);
+    await this.state.reconcilePendingIssues(run.pendingIssues, run.resolvedIssuePaths);
     // 镜像覆写：基准=本轮结算全集（文件改名/回线/删除自动掉出）。失败轮
     // 走不到这里，基准保留；取消/鉴权过期同样跳过覆写，下轮自愈。
-    if (!skipDeltaDisabled && this.canContinue(operationEpoch, result)) {
-      await this.state.commitSizeExclusionBaseline?.([...settledSkipPaths]);
+    if (!run.skipDeltaDisabled && this.canContinue(operationEpoch, result)) {
+      await this.state.commitSizeExclusionBaseline?.([...run.settledSkipPaths]);
     }
     // 附带修正：skippedLarge 此前只来自扫描层，下载方向 gated 跳过不计入
     // 总数；结算全集（扫描层+gated 的去重并集）才是真实跳过总量。
-    if (settledSkipPaths.size > result.skippedLarge) {
-      result.skippedLarge = settledSkipPaths.size;
+    if (run.settledSkipPaths.size > result.skippedLarge) {
+      result.skippedLarge = run.settledSkipPaths.size;
     }
     // 历史清单（2026-10-25 拍板）：运行列表只在“新面孔”那一轮逐条发行，但每一
     // 轮的历史都要能展开看本轮结算的跳过路径——与基准的增量呈现解耦；写入时
     // 去重并截断（`MAX_HISTORY_SKIP_PATHS`），标题仍报本轮真实总数。
-    if (settledSkipPaths.size > 0) {
-      result.skippedPaths = normalizeHistorySkipPaths([...settledSkipPaths]);
+    if (run.settledSkipPaths.size > 0) {
+      result.skippedPaths = normalizeHistorySkipPaths([...run.settledSkipPaths]);
     }
     this.diag?.log(
       "execute",
-      `upload summary — files=${result.uploaded}, bytes=${metrics.uploadBytes}, peak=${metrics.peakUploads}/${uploadPolicy.maxLimit + largeUploadConcurrency(this.platform.isMobileApp)}, readMs=${metrics.uploadReadMs}, busyMs=${Math.round(metrics.fileTransfers.upload.busyMs)}, elapsedMs=${Date.now() - startedAt}`,
+      `upload summary — files=${result.uploaded}, bytes=${run.metrics.uploadBytes}, peak=${run.metrics.peakUploads}/${run.uploadPolicy.maxLimit + largeUploadConcurrency(this.platform.isMobileApp)}, readMs=${run.metrics.uploadReadMs}, busyMs=${Math.round(run.metrics.fileTransfers.upload.busyMs)}, elapsedMs=${Date.now() - run.startedAt}`,
     );
-
   }
 
   /** Retry the recorded mutation checkpoint in the same action when the
@@ -18032,7 +17675,7 @@ export class SyncExecutor {
    *               + hash;
    *  2. verify:   one `$batch` identity re-read for the batch's hashless
    *               files, then the adaptive-policy observation;
-   *  3. commit:   the batch's per-file `executePlanItem` — intent, local CAS,
+   *  3. commit:   the batch's per-file `executeSinglePlanItem` — intent, local CAS,
    *               receipt, checkpoint — strictly serial and in batch order.
    *
    *  The URL lookahead (`startDownloadUrlLookahead` below) replaced the
@@ -20112,7 +19755,7 @@ export class SyncExecutor {
           // dialog) survives recovery retries. The recovery still stays
           // pending either way.
           const alreadyPending = this.state.pendingConflicts.some((candidate) =>
-            candidate.reason === "reason.pluginDowngradeRemote"
+            candidate.reason === PLAN_REASON.pluginDowngradeRemote
             && parseCommunityPluginBundlePath(
               candidate.path,
               getConfigDir(this.scanner.vault),
@@ -23287,7 +22930,7 @@ export class SyncExecutor {
     automaticHandlingPolicy: Readonly<AutomaticHandlingPolicy>,
   ): Promise<ItemExecutionResult | null> {
     if (!automaticHandlingPolicy.mergeNonOverlappingText
-      || item.reason !== "reason.bothSidesModified") return null;
+      || item.reason !== PLAN_REASON.bothSidesModified) return null;
 
     const automaticMetrics = metrics.automaticHandling;
     automaticMetrics.textMerge.candidates++;
@@ -23874,7 +23517,7 @@ export class SyncExecutor {
    * fallback decision.
    */
   private async readCloudBootstrapV2WithRetry(
-    client: OneDriveClient & {
+    client: SyncProvider & {
       readCloudBootstrapV2: OneDriveClient["readCloudBootstrapV2"];
     },
     vaultName: string,
@@ -24405,7 +24048,7 @@ export class SyncExecutor {
   }): ItemExecutionResult {
     const { item, result } = args;
     result.errors++;
-    if (item.reason === "reason.identityReplacement.verificationPending") {
+    if (item.reason === PLAN_REASON.identityReplacementVerificationPending) {
       result.planningDeferredErrors =
         (result.planningDeferredErrors ?? 0) + 1;
     }
@@ -25036,7 +24679,8 @@ export class SyncExecutor {
     const canonicalReview =
       summarizeCanonicalPlanReviewV2(finalized.items);
     const canonicalIdentity = {
-      version: 2 as const,
+      // 刀 5b：封存身份升版 3（2026-11-02）。
+      version: 3 as const,
       scope: { ...prepared.envelope.scope },
       sourceCommitSeq: prepared.envelope.meta.commitSeq,
       digest: canonicalPlanDigestV2({
@@ -28100,7 +27744,7 @@ export class SyncExecutor {
       confirmed: false,
       scope: { ...envelope.scope },
       canonicalIdentity: {
-        version: 2,
+        version: 3,
         scope: { ...envelope.scope },
         sourceCommitSeq: envelope.meta.commitSeq,
         digest,
@@ -29889,7 +29533,7 @@ export class SyncExecutor {
       // (the very "核对卡住" symptom). The download items are still removed
       // from this round either way.
       const alreadyPending = this.state.pendingConflicts.some((candidate) =>
-        candidate.reason === "reason.pluginDowngradeRemote"
+        candidate.reason === PLAN_REASON.pluginDowngradeRemote
         && parseCommunityPluginBundlePath(candidate.path, configDir)?.pluginId
           === pluginId);
       if (!alreadyPending) {
@@ -30054,7 +29698,7 @@ export class SyncExecutor {
       // untouched — re-upserting it every round would mint a fresh decision
       // token and break an already-open review dialog's factsDigest check.
       const alreadyPending = this.state.pendingConflicts.some((candidate) =>
-        candidate.reason === "reason.pluginDowngradeRemote"
+        candidate.reason === PLAN_REASON.pluginDowngradeRemote
         && parseCommunityPluginBundlePath(candidate.path, configDir)?.pluginId
           === pluginId);
       if (!alreadyPending) {
@@ -32805,114 +32449,6 @@ function isRetryableMutationRecoveryObservationError(
       || error.type === OneDriveErrorType.ServerError
     );
 }
-
-function isV2RemoteUpsertParentMismatchError(error: unknown): boolean {
-  return error instanceof Error
-    && error.message.includes("V2 remote upsert parent does not match path");
-}
-
-/**
- * The second reducer refusal a receipted rename can hit: the receipt records
- * the destination in the local spelling while the refreshed index already
- * projects the moved identity at the cloud spelling, so the reducer asks for a
- * source deletion of the index path the receipt never had to record
- * (`V2 remote move is missing its source deletion`, 2026-10-14 field case).
- * Same read-only recovery lane as the parent mismatch — refresh the committed
- * tree once, then run the alias-spelling rebase.
- */
-function isV2RemoteMoveMissingSourceDeletionError(error: unknown): boolean {
-  return error instanceof Error
-    && error.message.includes("V2 remote move is missing its source deletion");
-}
-
-/**
- * The three reducer rejections a committed identity tree can raise against a
- * recovery checkpoint's base upsert (`file-state-reducer-v2.ts`): the tree has
- * no node at the path, its node carries a different version, or the path is
- * held by another anchor. Every one of them is a statement about the committed
- * tree, so a single full rebuild of that tree is the read-only repair to try
- * before keeping the record blocked.
- */
-function isV2BaseUpsertRejectionError(error: unknown): boolean {
-  return error instanceof Error
-    && (
-      error.message.includes("V2 base upsert has no remote file identity")
-      || error.message.includes("V2 base upsert remote version mismatch")
-      || error.message.includes("V2 base upsert would replace another anchor")
-    );
-}
-
-/**
- * The reducer refusals one **already receipted** record can still be rejected by
- * after its mutation reached the world: the committed common state cannot
- * mechanically absorb this record's checkpoint any more, because either the
- * receipt claims a projection the committed tree contradicts or the cloud
- * re-organized the same objects underneath it (2026-10-16 field case F29:
- * `V2 folder move file projection changed`).
- *
- * These are not environment faults and not batch-level failures: the record's
- * own receipt is what cannot be absorbed. Reporting them as a record-level
- * `blocked` outcome (instead of a bare `Error`) is what keeps one unabsorbable
- * record from aborting the whole recovery loop — the loop in
- * `recoverMutationLedgerRecords` has no per-record guard, so a bare throw ends
- * the round for every record queued behind it (see SC-20: a record that cannot
- * be mechanically absorbed must have a zero-write degradation target and must
- * not block the whole vault).
- *
- * Fail-closed by construction: the message is matched against the exact V2
- * assertion vocabulary, so a *new* assertion keeps today's loud round-level
- * failure until it is classified here on purpose. Silence is never assumed.
- */
-function isV2StateAbsorptionRefusalError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  const message = error.message;
-  // Every assertion in either reducer names its own subject after "V2 ", before
-  // the first variable part (path / operation id). Matching that prefix keeps a
-  // path containing a colon from faking a kind.
-  const colon = message.indexOf(":");
-  const kind = colon < 0 ? message : message.slice(0, colon);
-  return V2_STATE_ABSORPTION_REFUSAL_KINDS.has(kind);
-}
-
-/**
- * The exact set of reducer assertions that mean "this receipt cannot be
- * absorbed", as opposed to a malformed receipt (the batch never should have
- * produced it) or an environment fault (IndexedDB / adapter / host).
- *
- * Kept deliberately explicit and closed so the classification is auditable;
- * {@link isV2StateAbsorptionRefusalError} stays fail-closed for anything absent.
- */
-const V2_STATE_ABSORPTION_REFUSAL_KINDS: ReadonlySet<string> = new Set([
-  // file-state-reducer-v2.ts — committed-tree / world divergence
-  "V2 remote upsert is missing a drive id",
-  "V2 remote upsert is missing a parent id",
-  "V2 remote upsert would replace another identity",
-  "V2 remote move is missing its source deletion",
-  "V2 remote upsert parent does not match path",
-  "V2 base upsert has no remote file identity",
-  "V2 base upsert remote version mismatch",
-  "V2 base upsert would replace another anchor",
-  "V2 root file upsert has a non-root parent identity",
-  "V2 file path is invalid",
-  // folder-state-reducer-v2.ts — committed-tree / world divergence
-  "V2 folder move file projection changed",
-  "V2 folder move descendant projection changed",
-  "V2 folder move descendant identity is missing",
-  "V2 folder move has no committed source anchor",
-  "V2 folder move source identity is missing",
-  "V2 folder move projection differs from receipt",
-  "V2 folder move would replace another identity",
-  "V2 folder upsert projection differs from receipt",
-  "V2 folder upsert would replace another identity",
-  "V2 folder parent identity is missing",
-  "V2 folder parent path changed",
-  "V2 folder delete still has committed descendants",
-  "V2 folder delete still has remote children",
-  "V2 folder delete identity changed type",
-  "V2 local folder create lost its remote identity",
-  "V2 remote folder create expected an existing target",
-  "V2 root folder has a non-root parent identity",
-]);
 
 function mutationRecoveryIntentsOverlap(
   left: MutationIntent,

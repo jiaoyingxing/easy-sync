@@ -1,23 +1,44 @@
 import type { DriveItem } from "../onedrive/types";
+import type {
+  ContentVersionToken,
+  ExternalItemId,
+  StrongContentFingerprint,
+  VersionToken,
+  WeakContentFingerprint,
+} from "./types";
 
+/**
+ * 远端节点（刀 5b 中性词汇，2026-11-02）：字段名保留历史名（id／parentId／
+ * eTag／cTag／contentHash／quickXorHash），类型与注释改中性语义。词汇表
+ * 指针：src/sync/sync-provider.ts 文件头。
+ */
 export interface RemoteNodeV2 {
-  id: string;
-  parentId: string;
+  /** 条目身份（历史名 id；OneDrive 下实存 driveItem id）。 */
+  id: ExternalItemId;
+  /** 父条目身份（历史名 parentId）。 */
+  parentId: ExternalItemId;
   name: string;
   kind: "file" | "folder";
-  eTag?: string;
-  cTag?: string;
+  /** 版本令牌（历史名 eTag），If-Match 与三方比较的远端版本事实。 */
+  eTag?: VersionToken;
+  /** 内容版本令牌（历史名 cTag），rename/move 不变的次级令牌。 */
+  cTag?: ContentVersionToken;
   size?: number;
   mtime?: number;
-  contentHash?: string;
-  quickXorHash?: string;
+  /** 强内容指纹（历史名 contentHash，OneDrive sha256Hash 小写）。 */
+  contentHash?: StrongContentFingerprint;
+  /** 弱内容指纹（历史名 quickXorHash）：只证不同、不证相同。 */
+  quickXorHash?: WeakContentFingerprint;
 }
 
 export interface RemoteIndexV2 {
   schemaVersion: 2;
-  /** Stable OneDrive ID of the files/ content root, never the outer vault folder. */
+  /** 文件根身份（历史字段语义不变；OneDrive 下为 files/ 内容根的稳定 ID，
+   *  绝不是外层库夹）。与条目级身份（ExternalItemId）名异实同级。 */
   filesRootId: string;
+  /** 集合状态令牌（历史名 cursorRevision）：换游标不算内容变化。 */
   cursorRevision: number;
+  /** 集合状态令牌（历史名 deltaLink）：换游标不算内容变化。 */
   deltaLink: string | null;
   complete: true;
   itemsById: Record<string, RemoteNodeV2>;

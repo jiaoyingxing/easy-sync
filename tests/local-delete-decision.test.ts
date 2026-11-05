@@ -313,7 +313,7 @@ describe("local delete decision (S4)", () => {
 
   it("classifies the reviewed plan as current, composed, threshold-re-review or changed", () => {
     const identity = (digest: string): CanonicalPlanIdentityV2 => ({
-      version: 2,
+      version: 3,
       scope: token().scope,
       sourceCommitSeq: 1,
       digest,

@@ -21,6 +21,7 @@ import {
   applyAutomaticHandlingPolicy,
   type AutomaticHandlingPolicy,
 } from "./automatic-handling-policy";
+import { PLAN_REASON, type PlanReason } from "./plan-reason";
 import {
   applyOneWayLocalDeletedPullBackPlan,
   applyOneWayLocalOnlyCopyPlan,
@@ -73,13 +74,18 @@ import {
   type CanonicalPlanIdentityV2,
   type CanonicalPlanReviewV2,
   type ContentComparisonReceiptV1,
+  type ContentVersionToken,
+  type ExternalItemId,
   type LocalFileEntry,
   type LocalFolderEntry,
   type LocalFolderMoveHintV1,
   type LocalFolderDeleteHintV1,
   type RemoteFileEntry,
+  type StrongContentFingerprint,
   type SyncPlanItem,
   type SyncScope,
+  type VersionToken,
+  type WeakContentFingerprint,
 } from "./types";
 
 const MAX_UNANCHORED_DESCENDANT_EVIDENCE = 10;
@@ -600,7 +606,7 @@ function composeCanonicalActionsV2(
   const unanchoredEvidenceCandidates = input.fileItems
     .filter((candidate) =>
       candidate.type === SyncActionType.Conflict
-      && candidate.reason === "reason.newFileBothSides"
+      && candidate.reason === PLAN_REASON.newFileBothSides
       && Boolean(candidate.local)
       && Boolean(candidate.remote)
       && candidate.local!.size === candidate.remote!.size
@@ -1373,7 +1379,7 @@ function applyIdentityConflictActionV2({
     type: SyncActionType.FolderDeferred,
     path: action.path,
     reason: identityReplacementConflict
-      ? "reason.identityReplacement.ambiguous"
+      ? PLAN_REASON.identityReplacementAmbiguous
       : identityMoveConflictReason(action.reason),
   });
   return fileItems;
@@ -1679,8 +1685,8 @@ function selectContentVerificationCandidatesV2({
     if (
       item.type !== SyncActionType.Conflict
       || (
-        item.reason !== "reason.newFileBothSides"
-        && item.reason !== "reason.bothSidesModified"
+        item.reason !== PLAN_REASON.newFileBothSides
+        && item.reason !== PLAN_REASON.bothSidesModified
       )
       || !item.local
       || !item.remote
@@ -2042,7 +2048,7 @@ export async function finalizeCanonicalPlanCandidateV2(
   if (!oneWay) {
     items = items.filter((item) =>
       !(item.type === SyncActionType.Conflict
-        && item.reason === "reason.renameIdentityAmbiguous")
+        && item.reason === PLAN_REASON.renameIdentityAmbiguous)
     );
     items = suppressParentUnavailableWhenParentCreated(items);
   }
@@ -2487,7 +2493,7 @@ function selectRemoteOnlyConflictVerificationCandidatesV2(args: {
   for (const item of args.items) {
     if (
       item.type !== SyncActionType.Conflict
-      || item.reason !== "reason.localDeletedRemoteModified"
+      || item.reason !== PLAN_REASON.localDeletedRemoteModified
       || item.local
       || !item.remote
     ) continue;
@@ -2617,7 +2623,7 @@ function suppressParentUnavailableWhenParentCreated(
   if (createdParents.size === 0) return items;
   return items.filter((item) => {
     if (item.type !== SyncActionType.FolderDeferred
-      || item.reason !== "reason.identityMove.parentUnavailable") return true;
+      || item.reason !== PLAN_REASON.identityMoveParentUnavailable) return true;
     const parent = parentPath(item.path);
     return parent === "" || !createdParents.has(normalizeRemotePathKey(parent));
   });
@@ -2732,7 +2738,7 @@ type IdentityRenameConflictReasonV2 = Extract<
 
 function identityMoveConflictReason(
   reason: IdentityRenameConflictReasonV2,
-): string {
+): PlanReason {
   switch (reason) {
     case "local-destination-occupied":
       return "reason.identityMove.localTargetOccupied";
@@ -2753,7 +2759,7 @@ function identityMoveConflictReason(
 
 function identityMovePendingItem(
   path: string,
-  reason: string,
+  reason: PlanReason,
 ): SyncPlanItem {
   return {
     type: SyncActionType.FolderDeferred,
@@ -2857,7 +2863,7 @@ export function sealCanonicalPlanV2(
       input.finalized.lastTotalFiles,
     );
   const preDecisionIdentity: CanonicalPlanIdentityV2 = {
-    version: 2,
+    version: 3,
     scope: { ...input.committedEnvelope.scope },
     sourceCommitSeq,
     digest: canonicalPlanDigestV2({
@@ -2912,7 +2918,7 @@ export function sealCanonicalPlanV2(
         input.finalized.lastTotalFiles,
       ),
     canonicalIdentity: {
-      version: 2,
+      version: 3,
       scope: { ...input.committedEnvelope.scope },
       sourceCommitSeq,
       digest,
@@ -2937,7 +2943,9 @@ export function canonicalPlanDigestV2(input: {
   sourceCommitSeq: number;
 }): string {
   return JSON.stringify({
-    version: 2,
+    // 刀 5b（2026-11-02）：事实形状中性化（位置数组→定键对象）随升版 2→3。
+    // 旧形状摘要字符串与新形状必然不等——这就是一次性重审的失效闸门。
+    version: 3,
     sourceCommitSeq: input.sourceCommitSeq,
     scope: [
       input.scope.accountId,
@@ -3166,84 +3174,161 @@ function countsForCanonicalReviewImpact(type: SyncActionType): boolean {
     && type !== SyncActionType.ConfirmLocalDelete;
 }
 
-function canonicalPlanItemFactsV2(item: SyncPlanItem): unknown[] {
-  const token = item.decisionToken;
-  const comparison = item.contentComparison;
-  return [
-    item.type,
-    item.path,
-    item.reason ?? null,
-    item.local
-      ? [
-          item.local.path,
-          item.local.hash,
-          item.local.size,
-          item.local.binary,
-        ]
-      : null,
-    item.remote
-      ? [
-          item.remote.path,
-          item.remote.driveId,
-          item.remote.parentId,
-          item.remote.size,
-          item.remote.eTag,
-          item.remote.cTag,
-          item.remote.sha256Hash ?? null,
-          item.remote.quickXorHash ?? null,
-        ]
-      : null,
-    item.folder
-      ? [
-          item.folder.remoteId ?? null,
-          item.folder.parentRemoteId ?? null,
-          item.folder.parentPath,
-          item.folder.remoteETag ?? null,
-          item.folder.parentRemoteETag ?? null,
-          item.folder.sourceParentRemoteId ?? null,
-        ]
-      : null,
-    item.baseEtag ?? null,
-    item.renameFrom ?? null,
-    item.targetParentRemoteId ?? null,
-    item.requiresConfirmation ?? false,
-    item.reviewImpactCount ?? 1,
-    token
-      ? [
-          token.version,
-          token.vaultName,
-          token.accountId,
-          token.scope.accountId,
-          token.scope.driveId,
-          token.scope.vaultFolderId,
-          token.scope.filesRootId,
-          token.local.exists
-            ? [true, token.local.hash, token.local.size]
-            : [false],
-          token.remote.exists
-            ? [true, token.remote.driveId, token.remote.eTag]
-            : [false],
-          token.ancestorHash,
-        ]
-      : null,
-    comparison
-      ? [
-          comparison.version,
-          comparison.result,
-          comparison.localHash,
-          comparison.localSize,
-          comparison.remoteDriveId,
-          comparison.remoteETag,
-          comparison.remoteSize,
-          comparison.remoteHash,
-        ]
-      : null,
-    // Appended last on purpose: the nested-name map below indexes by position.
-    item.localOnlyCopyKind ?? null,
-  ];
+/**
+ * One sealed item's neutral fact shape (重构刀 5b, 2026-11-02).
+ *
+ * 刀 5b 前这是位置数组；现为定键对象，键插入顺序固定（序列化确定性）。
+ * 值映射纪律：每个叶子值＝原字段表达式逐字值（identity=driveId、
+ * versionToken=eTag、contentVersionToken=cTag、strongFingerprint=sha256Hash、
+ * weakFingerprint=quickXorHash……），OneDrive 用户数据零变化；变的是键名与
+ * 容器形状，随摘要升版 3。中性词汇表指针：src/sync/sync-provider.ts 文件头。
+ */
+interface CanonicalPlanItemFactsV2 {
+  type: string;
+  path: string;
+  reason: string | null;
+  local: {
+    path: string;
+    hash: string;
+    size: number;
+    binary: boolean;
+  } | null;
+  remote: {
+    path: string;
+    identity: ExternalItemId;
+    parentIdentity: ExternalItemId | null;
+    size: number;
+    versionToken: VersionToken;
+    contentVersionToken: ContentVersionToken;
+    strongFingerprint: StrongContentFingerprint | null;
+    weakFingerprint: WeakContentFingerprint | null;
+  } | null;
+  folder: {
+    identity: ExternalItemId | null;
+    parentIdentity: ExternalItemId | null;
+    parentPath: string;
+    versionToken: VersionToken | null;
+    parentVersionToken: VersionToken | null;
+    sourceParentIdentity: ExternalItemId | null;
+  } | null;
+  baseVersionToken: VersionToken | null;
+  renameFrom: string | null;
+  targetParentRemoteId: ExternalItemId | null;
+  requiresConfirmation: boolean;
+  reviewImpactCount: number;
+  decisionToken: {
+    version: number;
+    vaultName: string;
+    accountId: string;
+    scope: {
+      accountId: string;
+      driveId: string;
+      vaultFolderId: string;
+      filesRootId: string;
+    };
+    local: { exists: false } | { exists: true; hash: string; size: number };
+    remote:
+      | { exists: false }
+      | { exists: true; identity: ExternalItemId; versionToken: VersionToken };
+    ancestorHash: string | null;
+  } | null;
+  contentComparison: {
+    version: number;
+    result: string;
+    localHash: string;
+    localSize: number;
+    remoteIdentity: ExternalItemId;
+    remoteVersionToken: VersionToken;
+    remoteSize: number;
+    remoteHash: string;
+  } | null;
+  localOnlyCopyKind: string | null;
 }
 
-/** Field names for canonicalPlanItemFactsV2 positions, in the same order. */
+function canonicalPlanItemFactsV2(item: SyncPlanItem): CanonicalPlanItemFactsV2 {
+  const token = item.decisionToken;
+  const comparison = item.contentComparison;
+  return {
+    type: item.type,
+    path: item.path,
+    reason: item.reason ?? null,
+    local: item.local
+      ? {
+          path: item.local.path,
+          hash: item.local.hash,
+          size: item.local.size,
+          binary: item.local.binary,
+        }
+      : null,
+    remote: item.remote
+      ? {
+          path: item.remote.path,
+          identity: item.remote.driveId,
+          parentIdentity: item.remote.parentId ?? null,
+          size: item.remote.size,
+          versionToken: item.remote.eTag,
+          contentVersionToken: item.remote.cTag,
+          strongFingerprint: item.remote.sha256Hash ?? null,
+          weakFingerprint: item.remote.quickXorHash ?? null,
+        }
+      : null,
+    folder: item.folder
+      ? {
+          identity: item.folder.remoteId ?? null,
+          parentIdentity: item.folder.parentRemoteId ?? null,
+          parentPath: item.folder.parentPath,
+          versionToken: item.folder.remoteETag ?? null,
+          parentVersionToken: item.folder.parentRemoteETag ?? null,
+          sourceParentIdentity: item.folder.sourceParentRemoteId ?? null,
+        }
+      : null,
+    baseVersionToken: item.baseEtag ?? null,
+    renameFrom: item.renameFrom ?? null,
+    targetParentRemoteId: item.targetParentRemoteId ?? null,
+    requiresConfirmation: item.requiresConfirmation ?? false,
+    reviewImpactCount: item.reviewImpactCount ?? 1,
+    decisionToken: token
+      ? {
+          version: token.version,
+          vaultName: token.vaultName,
+          accountId: token.accountId,
+          scope: {
+            accountId: token.scope.accountId,
+            driveId: token.scope.driveId,
+            vaultFolderId: token.scope.vaultFolderId,
+            filesRootId: token.scope.filesRootId,
+          },
+          local: token.local.exists
+            ? { exists: true, hash: token.local.hash, size: token.local.size }
+            : { exists: false },
+          remote: token.remote.exists
+            ? {
+                exists: true,
+                identity: token.remote.driveId,
+                versionToken: token.remote.eTag,
+              }
+            : { exists: false },
+          ancestorHash: token.ancestorHash,
+        }
+      : null,
+    contentComparison: comparison
+      ? {
+          version: comparison.version,
+          result: comparison.result,
+          localHash: comparison.localHash,
+          localSize: comparison.localSize,
+          remoteIdentity: comparison.remoteDriveId,
+          remoteVersionToken: comparison.remoteETag,
+          remoteSize: comparison.remoteSize,
+          remoteHash: comparison.remoteHash,
+        }
+      : null,
+    // Appended last on purpose: the key list below fixes this order.
+    localOnlyCopyKind: item.localOnlyCopyKind ?? null,
+  };
+}
+
+/** Key names of canonicalPlanItemFactsV2, in fixed insertion order. */
 const CANONICAL_PLAN_ITEM_FACT_NAMES_V2 = [
   "type",
   "path",
@@ -3251,7 +3336,7 @@ const CANONICAL_PLAN_ITEM_FACT_NAMES_V2 = [
   "local",
   "remote",
   "folder",
-  "baseEtag",
+  "baseVersionToken",
   "renameFrom",
   "targetParentRemoteId",
   "requiresConfirmation",
@@ -3261,69 +3346,75 @@ const CANONICAL_PLAN_ITEM_FACT_NAMES_V2 = [
   "localOnlyCopyKind",
 ] as const;
 
-/** Nested fact names per top-level position of canonicalPlanItemFactsV2. */
-const CANONICAL_PLAN_ITEM_FACT_NESTED_NAMES_V2: Readonly<
-  Record<number, readonly string[]>
+/**
+ * Nested fact value paths per top-level key of canonicalPlanItemFactsV2
+ * (drift diagnostics only). Each path is addressed from the field's value;
+ * the reported name is `${key}.${path.join(".")}`.
+ */
+const CANONICAL_PLAN_ITEM_FACT_NESTED_PATHS_V2: Readonly<
+  Record<string, readonly (readonly string[])[]>
 > = {
-  3: ["local.path", "local.hash", "local.size", "local.binary"],
-  4: [
-    "remote.path",
-    "remote.driveId",
-    "remote.parentId",
-    "remote.size",
-    "remote.eTag",
-    "remote.cTag",
-    "remote.sha256Hash",
-    "remote.quickXorHash",
+  local: [["path"], ["hash"], ["size"], ["binary"]],
+  remote: [
+    ["path"],
+    ["identity"],
+    ["parentIdentity"],
+    ["size"],
+    ["versionToken"],
+    ["contentVersionToken"],
+    ["strongFingerprint"],
+    ["weakFingerprint"],
   ],
-  5: [
-    "folder.remoteId",
-    "folder.parentRemoteId",
-    "folder.parentPath",
-    "folder.remoteETag",
-    "folder.parentRemoteETag",
-    "folder.sourceParentRemoteId",
+  folder: [
+    ["identity"],
+    ["parentIdentity"],
+    ["parentPath"],
+    ["versionToken"],
+    ["parentVersionToken"],
+    ["sourceParentIdentity"],
   ],
-  11: [
-    "decisionToken.version",
-    "decisionToken.vaultName",
-    "decisionToken.accountId",
-    "decisionToken.scope.accountId",
-    "decisionToken.scope.driveId",
-    "decisionToken.scope.vaultFolderId",
-    "decisionToken.scope.filesRootId",
-    "decisionToken.local",
-    "decisionToken.remote",
-    "decisionToken.ancestorHash",
+  decisionToken: [
+    ["version"],
+    ["vaultName"],
+    ["accountId"],
+    ["scope", "accountId"],
+    ["scope", "driveId"],
+    ["scope", "vaultFolderId"],
+    ["scope", "filesRootId"],
+    ["local"],
+    ["remote"],
+    ["ancestorHash"],
   ],
-  12: [
-    "contentComparison.version",
-    "contentComparison.result",
-    "contentComparison.localHash",
-    "contentComparison.localSize",
-    "contentComparison.remoteDriveId",
-    "contentComparison.remoteETag",
-    "contentComparison.remoteSize",
-    "contentComparison.remoteHash",
+  contentComparison: [
+    ["version"],
+    ["result"],
+    ["localHash"],
+    ["localSize"],
+    ["remoteIdentity"],
+    ["remoteVersionToken"],
+    ["remoteSize"],
+    ["remoteHash"],
   ],
 };
 
 /**
  * Fact names the published review projection can show a user (see
  * migration-hold-v2 projectReviewItems). Drift outside this set is invisible
- * in the review the user is asked to confirm.
+ * in the review the user is asked to confirm. Names follow the neutral
+ * version-3 keys; the visible semantic surface is unchanged from v2
+ * (type/path/reason/local.hash/remote.eTag/folder identity+versions+path).
  */
 const CANONICAL_REVIEW_VISIBLE_FACT_NAMES_V2 = new Set<string>([
   "type",
   "path",
   "reason",
   "local.hash",
-  "remote.eTag",
-  "folder.remoteId",
-  "folder.remoteETag",
-  "folder.parentRemoteId",
+  "remote.versionToken",
+  "folder.identity",
+  "folder.versionToken",
+  "folder.parentIdentity",
   "folder.parentPath",
-  "folder.parentRemoteETag",
+  "folder.parentVersionToken",
 ]);
 
 const CANONICAL_PLAN_ITEM_FACTS_DRIFT_SAMPLE_LIMIT_V2 = 10;
@@ -3364,9 +3455,6 @@ interface CanonicalPlanDigestFactsV2 {
   items: CanonicalPlanItemFactsV2[];
 }
 
-/** One sealed item's ordered facts; positions align with the name table. */
-type CanonicalPlanItemFactsV2 = unknown[];
-
 /**
  * Diagnostic item-fact drift between the sealed plan of a previous review hold
  * and the freshly sealed plan of this round.
@@ -3374,9 +3462,11 @@ type CanonicalPlanItemFactsV2 = unknown[];
  * The previous side is read back from `canonicalIdentity.digest`, which is the
  * exact JSON serialization of the sealed item facts (never a hash), so the
  * knife needs no new persisted state. The report is bounded and leak-free:
- * paths and field names only, never field values. Names align position by
- * position with canonicalPlanItemFactsV2; the guard test in
- * tests/canonical-plan-v2.test.ts turns red when that layout moves.
+ * paths and field names only, never field values. Names are the neutral
+ * version-3 keys of canonicalPlanItemFactsV2 (top-level keys plus nested
+ * value paths); the guard test in tests/canonical-plan-v2.test.ts turns red
+ * when that layout moves. Digests of the pre-5b version-2 shape read back as
+ * `shape-mismatch` (degrade, never throw).
  *
  * This never throws: a caller logging a review drift must not turn a
  * diagnostic into a new failure. `available: false` carries the reason.
@@ -3449,11 +3539,13 @@ function readCanonicalPlanDigestFactsV2(
   } catch {
     return "unparsable";
   }
+  // 刀 5b：version 3 ＝定键对象形。旧 version 2（位置数组形）与新形状都
+  // 在这里降级 shape-mismatch，不抛错（一次性重审的漂移诊断守卫）。
   if (
     typeof parsed !== "object"
     || parsed === null
     || Array.isArray(parsed)
-    || (parsed as { version?: unknown }).version !== 2
+    || (parsed as { version?: unknown }).version !== 3
   ) {
     return "shape-mismatch";
   }
@@ -3464,12 +3556,7 @@ function readCanonicalPlanDigestFactsV2(
     || !Number.isSafeInteger(record.sourceCommitSeq)
     || !Number.isSafeInteger(record.lastTotalFiles)
     || !Array.isArray(record.items)
-    || !record.items.every((entry) =>
-      Array.isArray(entry)
-      && entry.length === CANONICAL_PLAN_ITEM_FACT_NAMES_V2.length
-      && typeof entry[0] === "string"
-      && typeof entry[1] === "string"
-    )
+    || !record.items.every(isCanonicalPlanItemFactsObjectShapeV2)
   ) {
     return "shape-mismatch";
   }
@@ -3479,6 +3566,25 @@ function readCanonicalPlanDigestFactsV2(
     lastTotalFiles: Number(record.lastTotalFiles),
     items: record.items as CanonicalPlanItemFactsV2[],
   };
+}
+
+/**
+ * Key-shape guard for one sealed item: an object whose own keys equal
+ * CANONICAL_PLAN_ITEM_FACT_NAMES_V2 in the exact serialized order, with
+ * string type/path (the pairing key).
+ */
+function isCanonicalPlanItemFactsObjectShapeV2(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  if (keys.length !== CANONICAL_PLAN_ITEM_FACT_NAMES_V2.length) return false;
+  const entry = value as CanonicalPlanItemFactsV2;
+  return CANONICAL_PLAN_ITEM_FACT_NAMES_V2.every(
+    (key, index) => keys[index] === key,
+  )
+    && typeof entry.type === "string"
+    && typeof entry.path === "string";
 }
 
 function readCanonicalPlanDigestScopeV2(value: unknown): SyncScope | null {
@@ -3507,7 +3613,7 @@ function diffCanonicalPlanItemFactsV2(input: {
   const group = (facts: readonly CanonicalPlanItemFactsV2[]) => {
     const groups = new Map<string, number[]>();
     facts.forEach((entry, index) => {
-      const key = `${String(entry[0])}\u0000${String(entry[1])}`;
+      const key = `${String(entry.type)}\u0000${String(entry.path)}`;
       const indexes = groups.get(key);
       if (indexes) indexes.push(index);
       else groups.set(key, [index]);
@@ -3520,8 +3626,8 @@ function diffCanonicalPlanItemFactsV2(input: {
     fields: string[],
   ): CanonicalPlanItemFactsDriftSampleV2 => ({
     kind,
-    type: String(facts[0]),
-    path: String(facts[1]),
+    type: String(facts.type),
+    path: String(facts.path),
     fields,
   });
   const previousGroups = group(input.previous);
@@ -3597,31 +3703,48 @@ function canonicalPlanItemFactChangeNamesV2(
   next: CanonicalPlanItemFactsV2,
 ): string[] {
   const names: string[] = [];
-  CANONICAL_PLAN_ITEM_FACT_NAMES_V2.forEach((name, position) => {
-    const previousValue = previous[position];
-    const nextValue = next[position];
-    if (sameCanonicalPlanItemFactValueV2(previousValue, nextValue)) return;
-    const nested = CANONICAL_PLAN_ITEM_FACT_NESTED_NAMES_V2[position];
+  for (const name of CANONICAL_PLAN_ITEM_FACT_NAMES_V2) {
+    const previousValue = previous[name];
+    const nextValue = next[name];
+    if (sameCanonicalPlanItemFactValueV2(previousValue, nextValue)) continue;
+    const nestedPaths = CANONICAL_PLAN_ITEM_FACT_NESTED_PATHS_V2[name];
     if (
-      !nested
-      || !Array.isArray(previousValue)
-      || !Array.isArray(nextValue)
-      || previousValue.length !== nested.length
-      || nextValue.length !== nested.length
+      !nestedPaths
+      || typeof previousValue !== "object"
+      || previousValue === null
+      || typeof nextValue !== "object"
+      || nextValue === null
     ) {
       names.push(name);
-      return;
+      continue;
     }
-    nested.forEach((nestedName, nestedPosition) => {
-      if (!sameCanonicalPlanItemFactValueV2(
-        previousValue[nestedPosition],
-        nextValue[nestedPosition],
-      )) {
-        names.push(nestedName);
-      }
-    });
-  });
+    const changedNestedNames = nestedPaths
+      .filter((nestedPath) =>
+        !sameCanonicalPlanItemFactValueV2(
+          canonicalPlanFactValueAtPathV2(previousValue, nestedPath),
+          canonicalPlanFactValueAtPathV2(nextValue, nestedPath),
+        ))
+      .map((nestedPath) => `${name}.${nestedPath.join(".")}`);
+    // A value that differs without any named nested leaf differing can only
+    // come from an out-of-table shape; name the whole field so the change is
+    // never silently unnamed.
+    if (changedNestedNames.length === 0) names.push(name);
+    else names.push(...changedNestedNames);
+  }
   return names;
+}
+
+/** Read a nested fact value by key path; missing keys read as undefined. */
+function canonicalPlanFactValueAtPathV2(
+  value: object,
+  path: readonly string[],
+): unknown {
+  let current: unknown = value;
+  for (const key of path) {
+    if (typeof current !== "object" || current === null) return undefined;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current;
 }
 
 function sameCanonicalPlanItemFactValueV2(
@@ -3771,6 +3894,25 @@ function collectFileScopeCrossingHolds(
   return holds;
 }
 
+/**
+ * FolderPlanConflictReasonV2 → 计划词汇键式取值的一一映射（刀 1 收口）。
+ * 新增内部冲突原因时必须同步补表，映射的完备性由 Record 类型强制。
+ */
+const FOLDER_PLAN_CONFLICT_REASON: Record<FolderPlanConflictReasonV2, PlanReason> = {
+  "folder-anchors-uninitialized": PLAN_REASON.folderAnchorsUninitialized,
+  "anchored-folder-missing-local": PLAN_REASON.folderAnchoredFolderMissingLocal,
+  "anchored-folder-missing-remote": PLAN_REASON.folderAnchoredFolderMissingRemote,
+  "both-sides-moved": PLAN_REASON.folderBothSidesMoved,
+  "local-subtree-changed": PLAN_REASON.folderLocalSubtreeChanged,
+  "remote-subtree-changed": PLAN_REASON.folderRemoteSubtreeChanged,
+  "target-occupied": PLAN_REASON.folderTargetOccupied,
+  "scope-crossing": PLAN_REASON.folderScopeCrossing,
+  "parent-chain-incomplete": PLAN_REASON.folderParentChainIncomplete,
+  "type-conflict": PLAN_REASON.folderTypeConflict,
+  "unanchored-shared-folder": PLAN_REASON.folderUnanchoredSharedFolder,
+  "local-rename-evidence-conflict": PLAN_REASON.folderLocalRenameEvidenceConflict,
+};
+
 function toDeferredFolderPlanItem(
   path: string,
   reason?: FolderPlanConflictReasonV2,
@@ -3779,8 +3921,8 @@ function toDeferredFolderPlanItem(
     type: SyncActionType.FolderDeferred,
     path,
     reason: reason
-      ? `reason.folder.${reason}`
-      : "reason.folder.deferred",
+      ? FOLDER_PLAN_CONFLICT_REASON[reason]
+      : PLAN_REASON.folderDeferred,
   };
 }
 

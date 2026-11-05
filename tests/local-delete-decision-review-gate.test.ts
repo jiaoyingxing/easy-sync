@@ -45,7 +45,7 @@ function token(): SyncDecisionToken {
 
 function identity(items: SyncPlanItem[], digestItems = items): CanonicalPlanIdentityV2 {
   return {
-    version: 2,
+    version: 3,
     scope,
     sourceCommitSeq: 7,
     digest: canonicalPlanDigestV2({

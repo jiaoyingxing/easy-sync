@@ -23,6 +23,7 @@ import type {
   MutationLedgerEntryV1,
   SyncPlanItem,
 } from "../src/sync/types";
+import { SyncActionType } from "../src/sync/types";
 import { StateV2IndexedDbActiveStore } from "../src/sync/state-v2-indexeddb-active";
 
 describe("StateManager V2 production controller", () => {
@@ -625,7 +626,7 @@ describe("StateManager V2 production controller", () => {
     candidate.meta.lifecycleEpoch = 3;
     const items: SyncPlanItem[] = [];
     const canonicalIdentity = {
-      version: 2 as const,
+      version: 3 as const,
       scope,
       sourceCommitSeq: 4,
       digest: canonicalPlanDigestV2({
@@ -722,7 +723,7 @@ describe("StateManager V2 production controller", () => {
     candidate.meta.lifecycleEpoch = source.sourceLifecycleEpoch + 1;
     const items: SyncPlanItem[] = [];
     const canonicalIdentity = {
-      version: 2 as const,
+      version: 3 as const,
       scope,
       sourceCommitSeq: candidate.meta.commitSeq,
       digest: canonicalPlanDigestV2({
@@ -866,7 +867,7 @@ describe("StateManager V2 production controller", () => {
             scope,
             candidate,
             canonicalIdentity: {
-              version: 2,
+              version: 3,
               scope,
               sourceCommitSeq: 4,
               digest: canonicalPlanDigestV2({
@@ -1211,5 +1212,61 @@ describe("folder recovery settle-as-observed (zero-write manual exit)", () => {
     })).rejects.toThrow("Only a folder mutation record");
     expect(state.mutationLedger).toHaveLength(1);
     expect(state.manualMutationResolutionAudit).toHaveLength(0);
+  });
+
+  it("retires a persisted completed v2 migration hold instead of blocking the upgrade", async () => {
+    const items: SyncPlanItem[] = [{
+      type: SyncActionType.Conflict,
+      path: remoteA.path,
+    }];
+    const candidate = envelope();
+    const warn = vi.fn();
+    const harness = makeHarness({
+      diag: { warn },
+    });
+    harness.files.set(
+      paths.stateV2MigrationHoldFile,
+      JSON.stringify({
+        schemaVersion: 1,
+        kind: "state-v2-migration-hold",
+        revision: 1,
+        phase: "completed",
+        createdAt: 1,
+        updatedAt: 2,
+        scope,
+        candidate,
+        sourceStateDigest: "a".repeat(64),
+        canonicalIdentity: {
+          version: 2,
+          scope,
+          sourceCommitSeq: candidate.meta.commitSeq,
+          digest: canonicalPlanDigestV2({
+            items,
+            lastTotalFiles: 1,
+            scope,
+            sourceCommitSeq: candidate.meta.commitSeq,
+          }),
+        },
+        canonicalReview: summarizeCanonicalPlanReviewV2(items),
+        lastTotalFiles: 1,
+        planFactsDigest: "legacy-plan-facts",
+        items,
+      }),
+    );
+    const state = new StateManager(harness.plugin);
+
+    await state.load();
+
+    expect(state.v2StateLoadRecoveryBlock).toBeNull();
+    expect(state.isV2StateActive).toBe(true);
+    expect(harness.files.has(paths.stateV2MigrationHoldFile)).toBe(false);
+    expect(warn).toHaveBeenCalledWith(
+      "state",
+      "V2 migration hold retired — legacy v2 identity",
+      expect.objectContaining({
+        path: paths.stateV2MigrationHoldFile,
+        phase: "completed",
+      }),
+    );
   });
 });

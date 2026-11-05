@@ -5788,7 +5788,7 @@ export class EasySyncSyncView extends ItemView {
     const probe = container.createDiv(
       "easy-sync-path-directory easy-sync-window-directory",
     );
-    probe.setText("measure/directory/");
+    probe.setText("Measure/directory/");
     const height = probe.getBoundingClientRect().height;
     probe.remove();
     return height > 0 ? height : 14;

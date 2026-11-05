@@ -58,7 +58,10 @@ import {
   createSlowConnectionGate,
   createSlowLinkEvidence,
   isAbortError,
+  isRequestTimeoutError,
+  isUncancellableRequestTimeout,
   requestErrorMessage,
+  rethrowUncancellableRequestTimeout,
   sleepWithAbort,
   throwIfAborted,
   type DownloadStallWatchdog,
@@ -3812,6 +3815,16 @@ export class OneDriveClient {
     while (url) {
       const response = await this.request("GET", url);
       const data = response.json as DeltaResponse;
+      // A proxied/garbled page can answer 200 with a non-array body; let it
+      // escape as a typed network error (retryable classification) instead of
+      // a bare TypeError from the spread.
+      if (!Array.isArray(data.value)) {
+        throw new OneDriveError(
+          OneDriveErrorType.NetworkError,
+          `Delta response "value" is not an array (status ${response.status})`,
+          response.status,
+        );
+      }
       allValues.push(...data.value);
       deltaLink = data["@odata.deltaLink"];
       nextLink = data["@odata.nextLink"];
@@ -4286,9 +4299,19 @@ export class OneDriveClient {
     }
 
     const errMsg = describeError(rawError);
+    // 刀 2：transport 层把超时源包装成 NetworkError 时，把 deadline 毫秒带进
+    // 标记位（此前下游只能靠消息文本里的 "Request timed out after " 识别）。
+    const requestTimeoutMs = rawError instanceof SyntheticRequestTimeoutError
+      ? rawError.timeoutMs
+      : null;
     return new OneDriveError(
       OneDriveErrorType.NetworkError,
       `Network error: ${errMsg}`,
+      0,
+      null,
+      null,
+      null,
+      requestTimeoutMs,
     );
   }
 
@@ -4686,28 +4709,8 @@ function downloadTimeoutError(filePath: string): OneDriveError {
   );
 }
 
-function isRequestTimeoutError(error: unknown): boolean {
-  return error instanceof SyntheticRequestTimeoutError
-    || (error instanceof Error && error.message.startsWith("Request timed out after "));
-}
-
-function rethrowUncancellableRequestTimeout(error: unknown): void {
-  if (isRequestTimeoutError(error)) {
-    throw new OneDriveError(
-      OneDriveErrorType.NetworkError,
-      requestErrorMessage(error),
-    );
-  }
-}
-
 function rawStatusCode(error: unknown): number {
   return isRecord(error) && typeof error.status === "number" ? error.status : 0;
-}
-
-function isUncancellableRequestTimeout(error: unknown): boolean {
-  return error instanceof SyntheticRequestTimeoutError
-    || isRequestTimeoutError(error)
-    || (error instanceof OneDriveError && error.message.includes("Request timed out after "));
 }
 
 function isTransientDownloadUrlError(error: unknown): boolean {
@@ -5042,7 +5045,9 @@ function withAbortableTimeout<T>(
         compatClearTimeout(timer);
         outerSignal?.removeEventListener("abort", onAbort);
         if (timedOut && isAbortError(error)) {
-          reject(new Error(`Request timed out after ${ms}ms`));
+          // 刀 2：客户端 deadline 到点＝SyntheticRequestTimeoutError（消息
+          // 逐字节不变；此前是裸 Error，只能靠文本前缀识别）。
+          reject(new SyntheticRequestTimeoutError(ms));
           return;
         }
         reject(toErrorLike(error));

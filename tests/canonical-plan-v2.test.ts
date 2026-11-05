@@ -2123,7 +2123,7 @@ describe("canonical V2 plan candidate", () => {
     expect(sealed.sourceCommitSeq).toBe(22);
     expect(sealed.items).toEqual([]);
     expect(sealed.canonicalIdentity).toMatchObject({
-      version: 2,
+      version: 3,
       scope,
       sourceCommitSeq: 22,
     });
@@ -2541,49 +2541,49 @@ describe("canonical V2 plan candidate", () => {
         { name: "remote.path", mutate: (item) => {
           item.remote!.path = "guard/moved.md";
         } },
-        { name: "remote.driveId", mutate: (item) => {
+        { name: "remote.identity", mutate: (item) => {
           item.remote!.driveId = "other-drive";
         } },
-        { name: "remote.parentId", mutate: (item) => {
+        { name: "remote.parentIdentity", mutate: (item) => {
           item.remote!.parentId = "other-parent";
         } },
         { name: "remote.size", mutate: (item) => {
           item.remote!.size = 99;
         } },
-        { name: "remote.eTag", mutate: (item) => {
+        { name: "remote.versionToken", mutate: (item) => {
           item.remote!.eTag = "etag-other";
         } },
-        { name: "remote.cTag", mutate: (item) => {
+        { name: "remote.contentVersionToken", mutate: (item) => {
           item.remote!.cTag = "ctag-other";
         } },
-        { name: "remote.sha256Hash", mutate: (item) => {
+        { name: "remote.strongFingerprint", mutate: (item) => {
           item.remote!.sha256Hash = hashA;
         } },
-        { name: "remote.quickXorHash", mutate: (item) => {
+        { name: "remote.weakFingerprint", mutate: (item) => {
           item.remote!.quickXorHash = "quick-other";
         } },
         { name: "folder", mutate: (item) => {
           delete item.folder;
         } },
-        { name: "folder.remoteId", mutate: (item) => {
+        { name: "folder.identity", mutate: (item) => {
           item.folder!.remoteId = "other-folder";
         } },
-        { name: "folder.parentRemoteId", mutate: (item) => {
+        { name: "folder.parentIdentity", mutate: (item) => {
           item.folder!.parentRemoteId = "other-parent";
         } },
         { name: "folder.parentPath", mutate: (item) => {
           item.folder!.parentPath = "other";
         } },
-        { name: "folder.remoteETag", mutate: (item) => {
+        { name: "folder.versionToken", mutate: (item) => {
           item.folder!.remoteETag = "etag-other";
         } },
-        { name: "folder.parentRemoteETag", mutate: (item) => {
+        { name: "folder.parentVersionToken", mutate: (item) => {
           item.folder!.parentRemoteETag = "etag-other";
         } },
-        { name: "folder.sourceParentRemoteId", mutate: (item) => {
+        { name: "folder.sourceParentIdentity", mutate: (item) => {
           item.folder!.sourceParentRemoteId = "other-source";
         } },
-        { name: "baseEtag", mutate: (item) => {
+        { name: "baseVersionToken", mutate: (item) => {
           item.baseEtag = "etag-other";
         } },
         { name: "renameFrom", mutate: (item) => {
@@ -2646,10 +2646,10 @@ describe("canonical V2 plan candidate", () => {
         { name: "contentComparison.localSize", mutate: (item) => {
           item.contentComparison!.localSize = 99;
         } },
-        { name: "contentComparison.remoteDriveId", mutate: (item) => {
+        { name: "contentComparison.remoteIdentity", mutate: (item) => {
           item.contentComparison!.remoteDriveId = "other-drive";
         } },
-        { name: "contentComparison.remoteETag", mutate: (item) => {
+        { name: "contentComparison.remoteVersionToken", mutate: (item) => {
           item.contentComparison!.remoteETag = "etag-other";
         } },
         { name: "contentComparison.remoteSize", mutate: (item) => {
@@ -2658,10 +2658,15 @@ describe("canonical V2 plan candidate", () => {
         { name: "contentComparison.remoteHash", mutate: (item) => {
           item.contentComparison!.remoteHash = "e".repeat(64);
         } },
+        { name: "localOnlyCopyKind", mutate: (item) => {
+          (item as { localOnlyCopyKind?: string }).localOnlyCopyKind
+            = "edited";
+        } },
       ];
-      // 13 top-level positions + local 4 / remote 8 / folder 6 / token 10 /
-      // comparison 8 nested positions of canonicalPlanItemFactsV2.
-      expect(mutations).toHaveLength(13 + 4 + 8 + 6 + 10 + 8);
+      // 14 top-level keys + local 4 / remote 8 / folder 6 / token 10 /
+      // comparison 8 nested value paths of the version-3 object shape
+      // (重构刀 5b：位置数组→定键对象).
+      expect(mutations).toHaveLength(14 + 4 + 8 + 6 + 10 + 8);
       for (const { name, mutate } of mutations) {
         const next = [structuredClone(base)];
         mutate(next[0]!);
@@ -2792,7 +2797,7 @@ describe("canonical V2 plan candidate", () => {
         kind: "changed",
         type: base.type,
         path: base.path,
-        fields: ["local.hash", "remote.cTag"],
+        fields: ["local.hash", "remote.contentVersionToken"],
       }]);
       const serialized = JSON.stringify(report);
       expect(serialized).not.toContain("f".repeat(64));
@@ -2848,7 +2853,9 @@ describe("canonical V2 plan candidate", () => {
       })).toEqual({ ...failure, reason: "unparsable" });
       for (const malformed of [
         JSON.stringify([1, 2, 3]),
+        // 刀 5b 后 version 3 缺 scope 仍不合格。
         JSON.stringify({ version: 3, items: [] }),
+        // 旧 version 2（位置数组形）摘要：升版后整体降级 shape-mismatch。
         JSON.stringify({
           version: 2,
           sourceCommitSeq: 7,
@@ -2869,6 +2876,14 @@ describe("canonical V2 plan candidate", () => {
           scope: ["a", "b", "c", "d"],
           lastTotalFiles: 1.5,
           items: [],
+        }),
+        // version 3 但条目仍是旧数组形：键形守卫拒收。
+        JSON.stringify({
+          version: 3,
+          sourceCommitSeq: 7,
+          scope: ["a", "b", "c", "d"],
+          lastTotalFiles: 1,
+          items: [["upload", "note.md"]],
         }),
       ]) {
         expect(describeCanonicalPlanItemFactsDriftV2({

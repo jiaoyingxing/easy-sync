@@ -11,6 +11,7 @@ import {
   type SyncStateEnvelopeV2,
 } from "./state-envelope-v2";
 import { identityPath } from "./recovery-anchor-v2";
+import { V2StateRefusalError } from "./v2-state-refusal";
 import {
   sameSyncScope,
   type FolderMutationIntentV2,
@@ -603,7 +604,7 @@ export function reduceFolderStateEnvelopeV2(
     ([, path]) => identityPath(path) === identityPath(upsert.path),
   );
   if (occupied && occupied[0] !== upsert.driveId) {
-    throw new Error(`V2 folder upsert would replace another identity: ${upsert.path}`);
+    throw new V2StateRefusalError("V2 folder upsert would replace another identity", upsert.path);
   }
   assertParentMatchesPath(envelope, upsert);
 
@@ -624,7 +625,7 @@ export function reduceFolderStateEnvelopeV2(
   };
   const projected = projectRemoteIndexV2(nextRemoteIndex);
   if (projected.get(upsert.driveId) !== upsert.path) {
-    throw new Error(`V2 folder upsert projection differs from receipt: ${upsert.path}`);
+    throw new V2StateRefusalError("V2 folder upsert projection differs from receipt", upsert.path);
   }
 
   const existingAnchor = Object.values(envelope.folderAnchors.byAnchorId).find(
@@ -726,14 +727,14 @@ function reduceFolderMove(
   const originalPathById = projectRemoteIndexV2(envelope.remoteIndex);
   const originalNode = envelope.remoteIndex.itemsById[upsert.driveId];
   if (!originalNode || originalNode.kind !== "folder") {
-    throw new Error(`V2 folder move source identity is missing: ${intent.sourcePath}`);
+    throw new V2StateRefusalError("V2 folder move source identity is missing", intent.sourcePath);
   }
   const occupied = [...originalPathById].find(
     ([id, path]) => id !== upsert.driveId
       && identityPath(path) === identityPath(upsert.path),
   );
   if (occupied) {
-    throw new Error(`V2 folder move would replace another identity: ${upsert.path}`);
+    throw new V2StateRefusalError("V2 folder move would replace another identity", upsert.path);
   }
 
   const reviewedMove = intent.reviewedLocationMove;
@@ -782,7 +783,7 @@ function reduceFolderMove(
   };
   const nextPathById = projectRemoteIndexV2(nextRemoteIndex);
   if (nextPathById.get(upsert.driveId) !== upsert.path) {
-    throw new Error(`V2 folder move projection differs from receipt: ${upsert.path}`);
+    throw new V2StateRefusalError("V2 folder move projection differs from receipt", upsert.path);
   }
 
   const sourcePath = projectionSourcePath;
@@ -794,11 +795,11 @@ function reduceFolderMove(
     const projectedPath = nextPathById.get(anchor.remoteId);
     const translated = translateAnchoredPathV2(anchor.lastPath, sourcePath, intent.path);
     if (projectedPath !== translated) {
-      throw new Error(`V2 folder move descendant projection changed: ${anchor.lastPath}`);
+      throw new V2StateRefusalError("V2 folder move descendant projection changed", anchor.lastPath);
     }
     const node = nextRemoteIndex.itemsById[anchor.remoteId];
     if (!node || node.kind !== "folder") {
-      throw new Error(`V2 folder move descendant identity is missing: ${anchor.lastPath}`);
+      throw new V2StateRefusalError("V2 folder move descendant identity is missing", anchor.lastPath);
     }
     nextFolderAnchors[anchor.anchorId] = {
       ...anchor,
@@ -818,7 +819,7 @@ function reduceFolderMove(
         && anchor.remoteETag === upsert.eTag,
     );
     if (receiptAlreadyApplied) return envelope;
-    throw new Error(`V2 folder move has no committed source anchor: ${sourcePath}`);
+    throw new V2StateRefusalError("V2 folder move has no committed source anchor", sourcePath);
   }
 
   const nextFileAnchors = { ...envelope.anchors.byAnchorId };
@@ -826,7 +827,7 @@ function reduceFolderMove(
     if (!isAnchoredDescendantV2(anchor.lastPath, sourcePath)) continue;
     const translated = translateAnchoredPathV2(anchor.lastPath, sourcePath, intent.path);
     if (!anchor.remoteId || nextPathById.get(anchor.remoteId) !== translated) {
-      throw new Error(`V2 folder move file projection changed: ${anchor.lastPath}`);
+      throw new V2StateRefusalError("V2 folder move file projection changed", anchor.lastPath);
     }
     nextFileAnchors[anchor.anchorId] = {
       ...anchor,
@@ -962,15 +963,15 @@ function reduceFolderDelete(
   const descendantFileAnchors = descendantScan.fileAnchors;
   const descendantFolderAnchors = descendantScan.folderAnchors;
   if (descendantScan.blockers.length > 0) {
-    throw new Error(`V2 folder delete still has committed descendants: ${intent.path}`);
+    throw new V2StateRefusalError("V2 folder delete still has committed descendants", intent.path);
   }
 
   const currentNode = nextItemsById[intent.folderId];
   if (currentNode && currentNode.kind !== "folder") {
-    throw new Error(`V2 folder delete identity changed type: ${intent.path}`);
+    throw new V2StateRefusalError("V2 folder delete identity changed type", intent.path);
   }
   if (descendantScan.remoteChildren.length > 0) {
-    throw new Error(`V2 folder delete still has remote children: ${intent.path}`);
+    throw new V2StateRefusalError("V2 folder delete still has remote children", intent.path);
   }
   delete nextItemsById[intent.folderId];
 
@@ -1127,10 +1128,10 @@ function assertFolderReceiptMatchesIntent(
       )
     )
   ) {
-    throw new Error(`V2 local folder create lost its remote identity: ${intent.path}`);
+    throw new V2StateRefusalError("V2 local folder create lost its remote identity", intent.path);
   }
   if (intent.action === "createRemoteFolder" && intent.expectedRemote.exists) {
-    throw new Error(`V2 remote folder create expected an existing target: ${intent.path}`);
+    throw new V2StateRefusalError("V2 remote folder create expected an existing target", intent.path);
   }
 }
 
@@ -1141,17 +1142,17 @@ function assertParentMatchesPath(
   const expectedParentPath = parentPath(upsert.path);
   if (expectedParentPath === "") {
     if (upsert.parentId !== envelope.scope.filesRootId) {
-      throw new Error(`V2 root folder has a non-root parent identity: ${upsert.path}`);
+      throw new V2StateRefusalError("V2 root folder has a non-root parent identity", upsert.path);
     }
     return;
   }
   const parent = envelope.remoteIndex.itemsById[upsert.parentId];
   if (!parent || parent.kind !== "folder") {
-    throw new Error(`V2 folder parent identity is missing: ${upsert.path}`);
+    throw new V2StateRefusalError("V2 folder parent identity is missing", upsert.path);
   }
   const pathById = projectRemoteIndexV2(envelope.remoteIndex);
   if (pathById.get(parent.id) !== expectedParentPath) {
-    throw new Error(`V2 folder parent path changed: ${upsert.path}`);
+    throw new V2StateRefusalError("V2 folder parent path changed", upsert.path);
   }
 }
 

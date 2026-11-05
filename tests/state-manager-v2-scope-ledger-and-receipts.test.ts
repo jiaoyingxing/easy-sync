@@ -98,7 +98,7 @@ describe("StateManager V2 production controller", () => {
       reviewImpactCount: 1,
     }];
     const identity = {
-      version: 2 as const,
+      version: 3 as const,
       scope,
       sourceCommitSeq: staged.meta.commitSeq,
       digest: canonicalPlanDigestV2({

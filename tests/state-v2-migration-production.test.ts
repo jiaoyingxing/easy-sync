@@ -133,7 +133,7 @@ async function runReviewedMigration(
   return commitReviewedStateV2MigrationCandidate(adapter, migrationPaths, {
     candidate: prepared.envelope,
     canonicalIdentity: {
-      version: 2,
+      version: 3,
       scope: prepared.envelope.scope,
       sourceCommitSeq: prepared.envelope.meta.commitSeq,
       digest: "test-reviewed-zero-plan",
@@ -815,7 +815,7 @@ describe("production V1 to V2 migration", () => {
       {
         candidate: prepared.envelope!,
         canonicalIdentity: {
-          version: 2,
+          version: 3,
           scope: candidateInput.scope,
           sourceCommitSeq: 1,
           digest: "reviewed-non-zero-plan",
@@ -858,7 +858,7 @@ describe("production V1 to V2 migration", () => {
       {
         candidate: prepared.envelope!,
         canonicalIdentity: {
-          version: 2,
+          version: 3,
           scope: candidateInput.scope,
           sourceCommitSeq: 2,
           digest: "wrong-source",
@@ -877,7 +877,7 @@ describe("production V1 to V2 migration", () => {
     candidateInput.localFolders = [{ path: "notes" }];
     const prepared = buildStateV2MigrationCandidate(candidateInput);
     const identity = {
-      version: 2 as const,
+      version: 3 as const,
       scope: candidateInput.scope,
       sourceCommitSeq: 1,
       digest: "first-reviewed-plan",

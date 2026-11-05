@@ -1,5 +1,5 @@
 import { isSyncScope, sameSyncScope, type LocalFileEntry, type SyncScope } from "./types";
-import type { OneDriveClient } from "../onedrive/client";
+import type { SyncProvider } from "./sync-provider";
 import { sha256Hex } from "../crypto";
 import { isRecord } from "../obsidian-compat";
 import {
@@ -55,7 +55,7 @@ export interface CloudBootstrapTransportV2 {
 }
 
 export function createOneDriveCloudBootstrapTransportV2(
-  client: OneDriveClient,
+  client: SyncProvider,
   vaultName: string,
 ): CloudBootstrapTransportV2 {
   return {

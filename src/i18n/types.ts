@@ -173,7 +173,6 @@ export interface LocaleStrings {
   "settings.communityPlugins.data.title": string;
   "settings.communityPlugins.manage.files": string;
   "settings.communityPlugins.manage.data": string;
-  "settings.communityPlugins.experimental": string;
   "settings.communityPlugins.selectionSummary": string;
   "settings.communityPlugins.search": string;
   "settings.communityPlugins.loading": string;
@@ -604,6 +603,7 @@ export interface LocaleStrings {
   "reason.folder.parent-chain-incomplete": string;
   "reason.folder.type-conflict": string;
   "reason.folder.unanchored-shared-folder": string;
+  "reason.folder.folder-anchors-uninitialized": string;
   "reason.folder.local-rename-evidence-conflict": string;
   "reason.folder.pluginDirectorySpellingDiffers": string;
   "reason.folder.deferred": string;
@@ -900,16 +900,11 @@ export interface LocaleStrings {
   "syncView.recovery.summary.waitingNetwork": string;
   "syncView.recovery.summary.waitingNetworkAt": string;
   "syncView.recovery.summary.interrupted": string;
-  "syncView.recovery.summary.blocked": string;
-  "syncView.recovery.summary.blockedPaused": string;
   "syncView.recovery.body.review": string;
   "syncView.recovery.body.scopeChanged": string;
   "syncView.recovery.body.accountChanged": string;
   "syncView.recovery.body.exhausted": string;
   "syncView.recovery.field.path": string;
-  "syncView.recovery.field.reason": string;
-  "syncView.recovery.field.retryAt": string;
-  "syncView.recovery.nextStep.review": string;
   "syncView.recovery.nextStep.blocked": string;
   "syncView.recovery.nextStep.scope": string;
   "syncView.recovery.nextStep.accountChanged": string;

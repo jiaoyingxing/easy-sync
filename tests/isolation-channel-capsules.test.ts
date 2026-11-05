@@ -32,6 +32,10 @@ import type {
   SyncScope,
 } from "../src/sync/types";
 import {
+  V2_STATE_REFUSAL_KINDS,
+  V2StateRefusalError,
+} from "../src/sync/v2-state-refusal";
+import {
   TEST_SYNC_SCOPE,
   makeActiveV2State,
   makeMockAdapter,
@@ -157,7 +161,10 @@ const makeThirdBlockingPointRound = (args: {
   record: MutationLedgerEntryV1;
   localEntries: LocalFileEntry[];
   contents: Map<string, ArrayBuffer>;
-  refusalMessage?: string;
+  refusal?: {
+    kind: (typeof V2_STATE_REFUSAL_KINDS)[number];
+    detail: string;
+  };
   verificationMatches?: boolean;
 }) => {
   const state = makeActiveV2State([], [], {
@@ -166,10 +173,14 @@ const makeThirdBlockingPointRound = (args: {
   const baseCommit = state.commitMutationCheckpoint;
   state.commitMutationCheckpoint = vi.fn(async (operationId: string) => {
     if (operationId === args.record.intent.operationId) {
-      throw new Error(
-        args.refusalMessage
-          ?? `V2 folder upsert would replace another identity: ${args.record.intent.path}`,
-      );
+      // 刀 2 错误路由类型化：拒绝以类型化错误注入，消息仍是
+      // `${kind}: ${detail}` 逐字节不变。
+      throw args.refusal
+        ? new V2StateRefusalError(args.refusal.kind, args.refusal.detail)
+        : new V2StateRefusalError(
+          "V2 folder upsert would replace another identity",
+          args.record.intent.path,
+        );
     }
     return baseCommit(operationId);
   }) as never;
@@ -332,7 +343,10 @@ describe("S2 isolation channel: the third blocking point admits bounded folder c
       record: makeCreateLocalFolderRecord(),
       localEntries: [await scannedFile("other.md", unrelatedBytes)],
       contents: new Map([["other.md", unrelatedBytes]]),
-      refusalMessage: "V2 folder parent path changed: Videos/New",
+      refusal: {
+        kind: "V2 folder parent path changed",
+        detail: "Videos/New",
+      },
     });
 
     const result: SyncResult = await executor.run("manual", {});

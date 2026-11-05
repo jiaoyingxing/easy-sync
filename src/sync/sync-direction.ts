@@ -25,6 +25,7 @@ import {
   isObsidianConfigWhitelistDirectoryPath,
   isObsidianManagedConfigPath,
 } from "./file-decision-planner-v2";
+import { PLAN_REASON } from "./plan-reason";
 import {
   SyncActionType,
   type LocalOnlyCopyKindV1,
@@ -186,11 +187,11 @@ export function applyOneWayLocalDeletedPullBackPlan(
 
 function isLocalDeletedPullBackItem(item: SyncPlanItem): boolean {
   if (item.type === SyncActionType.DeleteRemote) {
-    return item.reason === "reason.fileDeletedLocally";
+    return item.reason === PLAN_REASON.fileDeletedLocally;
   }
   if (item.type !== SyncActionType.Conflict) return false;
-  return item.reason === "reason.localDeletedRemoteModified"
-    || item.reason === "reason.renameIdentityAmbiguous";
+  return item.reason === PLAN_REASON.localDeletedRemoteModified
+    || item.reason === PLAN_REASON.renameIdentityAmbiguous;
 }
 
 /** Same remote identity facts, inbound action: create the missing local folder. */
@@ -221,8 +222,8 @@ function localOnlyCopyKindForOneWayItem(
     return "edited";
   }
   if (item.type !== SyncActionType.Conflict) return null;
-  if (item.reason === "reason.bothSidesModified") return "edited";
-  if (item.reason === "reason.newFileBothSides") return "new-file-both-sides";
+  if (item.reason === PLAN_REASON.bothSidesModified) return "edited";
+  if (item.reason === PLAN_REASON.newFileBothSides) return "new-file-both-sides";
   return null;
 }
 

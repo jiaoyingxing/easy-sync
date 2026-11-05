@@ -1151,7 +1151,7 @@ describe("StateManager batch persistence", () => {
       skipped: 0,
     };
     const canonicalIdentity = {
-      version: 2 as const,
+      version: 3 as const,
       scope: TEST_SCOPE,
       sourceCommitSeq: 12,
       digest: "sealed-plan-12",
@@ -2367,5 +2367,88 @@ describe("device-local local delete decisions", () => {
     });
     await state.load();
     expect(state.localDeleteDecisions).toEqual([]);
+  });
+
+  it("retires a persisted plan review whose identity is still version 2", async () => {
+    const { state, plugin, saveData } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-plan-review-active": true,
+      "easy-sync-plan-review-counts": {
+        uploads: 1,
+        downloads: 0,
+        deletes: 0,
+        conflicts: 0,
+        skipped: 0,
+      },
+      "easy-sync-plan-review-items": [{
+        type: SyncActionType.Upload,
+        path: "a.md",
+      }],
+      "easy-sync-plan-review-digest": JSON.stringify(["legacy"]),
+      "easy-sync-plan-review-revision": 41,
+      "easy-sync-plan-review-scope": TEST_SCOPE,
+      "easy-sync-plan-review-canonical-identity-v2": {
+        version: 2,
+        scope: TEST_SCOPE,
+        sourceCommitSeq: 12,
+        digest: "legacy-plan-digest",
+      },
+    });
+
+    await state.load();
+
+    expect(state.planReviewActive).toBe(false);
+    expect(state.planReviewCounts).toBeNull();
+    expect(state.planReviewItems).toEqual([]);
+    expect(state.planReviewDigest).toBe("");
+    expect(state.planReviewRevision).toBe(42);
+    expect(state.planReviewScope).toBeNull();
+    expect(state.planReviewCanonicalIdentity).toBeNull();
+    expect(state.planReviewAuthorization).toBeNull();
+    expect(saveData).toHaveBeenCalled();
+    expect(saveData.mock.calls.at(-1)?.[0]).toEqual(expect.objectContaining({
+      "easy-sync-plan-review-active": false,
+      "easy-sync-plan-review-revision": 42,
+      "easy-sync-plan-review-canonical-identity-v2": null,
+    }));
+  });
+
+  it("keeps an already-v3 persisted plan review active", async () => {
+    const canonicalIdentity = {
+      version: 3 as const,
+      scope: TEST_SCOPE,
+      sourceCommitSeq: 12,
+      digest: "sealed-plan-digest",
+    };
+    const { state, plugin } = makeState();
+    vi.mocked(plugin.loadData).mockResolvedValue({
+      "easy-sync-plan-review-active": true,
+      "easy-sync-plan-review-counts": {
+        uploads: 0,
+        downloads: 0,
+        deletes: 0,
+        conflicts: 1,
+        skipped: 0,
+      },
+      "easy-sync-plan-review-items": [{
+        type: SyncActionType.Conflict,
+        path: "a.md",
+      }],
+      "easy-sync-plan-review-digest": canonicalIdentity.digest,
+      "easy-sync-plan-review-revision": 7,
+      "easy-sync-plan-review-scope": TEST_SCOPE,
+      "easy-sync-plan-review-canonical-identity-v2": canonicalIdentity,
+    });
+
+    await state.load();
+
+    expect(state.planReviewActive).toBe(true);
+    expect(state.planReviewRevision).toBe(7);
+    expect(state.planReviewCanonicalIdentity).toEqual(canonicalIdentity);
+    expect(state.planReviewAuthorization).toEqual({
+      revision: 7,
+      scope: TEST_SCOPE,
+      canonicalIdentity,
+    });
   });
 });

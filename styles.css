@@ -332,12 +332,6 @@ body.is-phone .easy-sync-settings-modal .modal-title.easy-sync-community-plugin-
   white-space: nowrap;
 }
 
-.easy-sync-plugin-selection-chip.is-experimental {
-  border-color: rgba(var(--color-red-rgb), 0.32);
-  background: rgba(var(--color-red-rgb), 0.12);
-  color: var(--text-error);
-}
-
 .easy-sync-plugin-selection-chip.is-hidden {
   display: none;
 }
@@ -1044,15 +1038,10 @@ body.theme-dark.is-mobile .view-content.easy-sync-view > .easy-sync-status-panel
 }
 
 .easy-sync-recovery-summary,
-.easy-sync-recovery-next-step,
-.easy-sync-recovery-subject {
+.easy-sync-recovery-next-step {
   color: var(--text-muted);
   font-size: var(--font-ui-small);
   line-height: var(--line-height-normal);
-}
-
-.easy-sync-recovery-subject {
-  overflow-wrap: anywhere;
 }
 
 /* Recovery file disclosure: generic tree-row shell, no skip-group semantics. */

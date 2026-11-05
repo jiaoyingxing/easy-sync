@@ -28,6 +28,7 @@ import type {
   PendingIssue,
   RemoteFileEntry,
 } from "../src/sync/types";
+import { V2StateRefusalError } from "../src/sync/v2-state-refusal";
 import {
   TEST_SYNC_SCOPE,
   emptyScanner,
@@ -217,8 +218,9 @@ async function makeRound(options: { refuseInRoundCommits?: boolean } = {}) {
   const baseCommit = state.commitMutationCheckpoint;
   state.commitMutationCheckpoint = vi.fn(async (operationId: string) => {
     if (operationId === record.intent.operationId) {
-      throw new Error(
-        "V2 folder upsert would replace another identity: NewDir",
+      throw new V2StateRefusalError(
+        "V2 folder upsert would replace another identity",
+        "NewDir",
       );
     }
     if (refuseInRound && operationId.includes("-upload")) {

@@ -124,7 +124,7 @@ async function makeHarness(fault?: Fault) {
   );
   const items: [] = [];
   const canonicalIdentity = {
-    version: 2 as const,
+    version: 3 as const,
     scope,
     sourceCommitSeq: candidate.meta.commitSeq,
     digest: canonicalPlanDigestV2({

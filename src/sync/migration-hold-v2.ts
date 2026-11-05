@@ -91,13 +91,30 @@ interface PendingMigrationHoldV2Input {
  * valid record authorizes only migration orchestration; item-level mutation
  * remains behind the V2 ledger after the manifest commits.
  */
+interface LegacyMigrationHoldRetirement {
+  path: string;
+  phase: MigrationHoldPhaseV2;
+}
+
 export class MigrationHoldV2Store {
   constructor(
     private readonly adapter: DataAdapter,
     private readonly paths: MigrationHoldV2Paths,
+    private readonly options: {
+      onLegacyHoldRetired?: (event: LegacyMigrationHoldRetirement) => void;
+    } = {},
   ) {}
 
   async load(): Promise<MigrationHoldV2 | null> {
+    try {
+      return await this.loadCommittedAndStaged();
+    } catch (error) {
+      if (!await this.retireLegacyPreV3Holds()) throw error;
+      return this.loadCommittedAndStaged();
+    }
+  }
+
+  private async loadCommittedAndStaged(): Promise<MigrationHoldV2 | null> {
     const [committed, staged] = await Promise.all([
       this.readOptional(this.paths.committed),
       this.readOptional(this.paths.next),
@@ -110,6 +127,37 @@ export class MigrationHoldV2Store {
     }
     await this.promoteStaged(staged, { conservativeFallback: false });
     return staged;
+  }
+
+  /**
+   * Retire pre-v3 control records that cannot authorise anything after the
+   * canonical identity version bump.
+   *
+   * A terminal (completed/cancelled) record is inert. A pending/confirmed
+   * record only carried a review that never reached authority commit; the
+   * next sync re-plans and re-reviews. Both are safe to discard. An
+   * authority-committed record is post-commit, so it stays fail-closed until
+   * it can be handled with manifest context.
+   */
+  private async retireLegacyPreV3Holds(): Promise<boolean> {
+    let retired = false;
+    for (const path of [this.paths.committed, this.paths.next]) {
+      let value: unknown;
+      try {
+        value = JSON.parse(await this.adapter.read(path));
+      } catch {
+        continue;
+      }
+      if (!isRetirableLegacyMigrationHoldV2(value)) continue;
+      // Only report retirement when the delete actually landed (an Android
+      // mount can refuse deletions): a failed delete keeps the record on
+      // disk, and the next load must still fail closed instead of trusting
+      // a "retired" claim the files contradict.
+      if (!(await this.removeIfExists(path))) continue;
+      this.options.onLegacyHoldRetired?.({ path, phase: value.phase });
+      retired = true;
+    }
+    return retired;
   }
 
   async publishPending(
@@ -432,6 +480,40 @@ export function migrationHoldReviewKindV2(
   return hold.reviewKind ?? "v2-migration";
 }
 
+/**
+ * Identify a well-formed pre-v3 record whose only incompatibility is the
+ * canonical identity version.
+ *
+ * The record is revalidated with the version field temporarily lifted so every
+ * other field and the candidate binding still have to pass the present
+ * validator. The lifted clone is never returned or persisted; it only decides
+ * whether the on-disk record is safe to retire.
+ */
+function isRetirableLegacyMigrationHoldV2(
+  value: unknown,
+): value is { phase: MigrationHoldPhaseV2 } {
+  if (!isRecord(value)) return false;
+  if (
+    value.phase !== "pending"
+    && value.phase !== "confirmed"
+    && value.phase !== "completed"
+    && value.phase !== "cancelled"
+  ) {
+    return false;
+  }
+  const identity = value.canonicalIdentity;
+  if (!isRecord(identity) || identity.version !== 2) return false;
+  try {
+    validateMigrationHoldV2({
+      ...value,
+      canonicalIdentity: { ...identity, version: 3 },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function validateMigrationHoldV2(
   value: unknown,
 ): asserts value is MigrationHoldV2 {
@@ -605,7 +687,10 @@ function projectReviewItems(items: readonly SyncPlanItem[]): PlanReviewItem[] {
 
 function isCanonicalIdentity(value: unknown): value is CanonicalPlanIdentityV2 {
   if (!isRecord(value)) return false;
-  return value.version === 2
+  // 刀 5b：封存身份升版 3（2026-11-02）。旧版本（2）身份的持久化 hold 不再
+  // 通过校验——其审阅授权经 sameCanonicalPlanIdentityV2 的 ===3 门与摘要
+  // 重新配对整体失效（一次性重审，不抛错于新写入路径）。
+  return value.version === 3
     && isSyncScope(value.scope)
     && Number.isSafeInteger(value.sourceCommitSeq)
     && Number(value.sourceCommitSeq) >= 1

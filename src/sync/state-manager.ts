@@ -28,6 +28,7 @@ import {
   type EasySyncRuntimeLayoutMigrationConflict,
 } from "./runtime-layout-migration";
 import { AncestorStoreV2 } from "./ancestor-store-v2";
+import { PLAN_REASON } from "./plan-reason";
 import type { TransferRateFactsV1 } from "./transfer-rate";
 import {
   findScopeCrossingCoveringHintV1,
@@ -1332,6 +1333,19 @@ export class StateManager {
         committed: paths.stateV2MigrationHoldFile,
         next: paths.stateV2MigrationHoldNextFile,
       },
+      {
+        onLegacyHoldRetired: ({ path, phase }) => {
+          this.plugin.diag?.warn(
+            "state",
+            "V2 migration hold retired — legacy v2 identity",
+            {
+              path,
+              phase,
+              mutations: 0,
+            },
+          );
+        },
+      },
     );
     this.v2CorruptRecoveryHoldStore =
       new CorruptStateRecoveryHoldV2Store(
@@ -1817,6 +1831,51 @@ export class StateManager {
         communityPluginAdoptionMemory = null;
       }
     }
+    // A persisted review whose canonical identity is still version 2 cannot
+    // authorise a plan under the v3 identity gate. Keep the review from being
+    // shown as a stale confirmation: retire the bundle and let the next sync
+    // produce a fresh review. This runs only when the identity field exists in
+    // its legacy shape; reviews that never carried an identity are untouched.
+    const legacyPlanReview = isLegacyCanonicalPlanIdentityRecord(
+      saved[KEY_PLAN_REVIEW_CANONICAL_IDENTITY],
+    );
+    const savedPlanReviewRevision =
+      Number.isSafeInteger(saved[KEY_PLAN_REVIEW_REVISION])
+      && Number(saved[KEY_PLAN_REVIEW_REVISION]) >= 0
+        ? Number(saved[KEY_PLAN_REVIEW_REVISION])
+        : 0;
+    if (legacyPlanReview) {
+      let retirementPersisted = true;
+      try {
+        await this.plugin.updatePluginData((data) => {
+          data[KEY_PLAN_REVIEW_ACTIVE] = false;
+          data[KEY_PLAN_REVIEW_COUNTS] = null;
+          data[KEY_PLAN_REVIEW_ITEMS] = [];
+          data[KEY_PLAN_REVIEW_DIGEST] = "";
+          data[KEY_PLAN_REVIEW_REVISION] =
+            Number.isSafeInteger(data[KEY_PLAN_REVIEW_REVISION])
+            && Number(data[KEY_PLAN_REVIEW_REVISION]) >= 0
+              ? Number(data[KEY_PLAN_REVIEW_REVISION]) + 1
+              : 1;
+          data[KEY_PLAN_REVIEW_SCOPE] = null;
+          data[KEY_PLAN_REVIEW_CANONICAL_IDENTITY] = null;
+        });
+      } catch {
+        retirementPersisted = false;
+        // The in-memory retirement still keeps this load safe; the next data
+        // write persists the cleared bundle. Surface the split in the payload
+        // instead of swallowing it silently.
+      }
+      this.plugin.diag?.warn(
+        "plan",
+        "plan review retired — legacy v2 identity",
+        {
+          revision: savedPlanReviewRevision,
+          mutations: 0,
+          persisted: retirementPersisted,
+        },
+      );
+    }
     this.data = {
       [KEY_BASE_SNAPSHOT]: saved[KEY_BASE_SNAPSHOT] ?? {},
       [KEY_PENDING_CONFLICTS]: saved[KEY_PENDING_CONFLICTS] ?? [],
@@ -1825,19 +1884,29 @@ export class StateManager {
         ? saved[KEY_PENDING_ISSUES]
         : [],
       [KEY_LAST_SYNC_TIME]: saved[KEY_LAST_SYNC_TIME] ?? 0,
-      [KEY_PLAN_REVIEW_ACTIVE]: saved[KEY_PLAN_REVIEW_ACTIVE] ?? false,
-      [KEY_PLAN_REVIEW_COUNTS]: saved[KEY_PLAN_REVIEW_COUNTS] ?? null,
-      [KEY_PLAN_REVIEW_ITEMS]: saved[KEY_PLAN_REVIEW_ITEMS] ?? [],
-      [KEY_PLAN_REVIEW_DIGEST]: saved[KEY_PLAN_REVIEW_DIGEST] ?? "",
-      [KEY_PLAN_REVIEW_REVISION]: Number.isSafeInteger(saved[KEY_PLAN_REVIEW_REVISION])
-        && Number(saved[KEY_PLAN_REVIEW_REVISION]) >= 0
-        ? Number(saved[KEY_PLAN_REVIEW_REVISION])
-        : 0,
-      [KEY_PLAN_REVIEW_SCOPE]: isSyncScope(saved[KEY_PLAN_REVIEW_SCOPE])
-        ? saved[KEY_PLAN_REVIEW_SCOPE]
-        : null,
-      [KEY_PLAN_REVIEW_CANONICAL_IDENTITY]:
-        parseCanonicalPlanIdentityV2(
+      [KEY_PLAN_REVIEW_ACTIVE]: legacyPlanReview
+        ? false
+        : saved[KEY_PLAN_REVIEW_ACTIVE] ?? false,
+      [KEY_PLAN_REVIEW_COUNTS]: legacyPlanReview
+        ? null
+        : saved[KEY_PLAN_REVIEW_COUNTS] ?? null,
+      [KEY_PLAN_REVIEW_ITEMS]: legacyPlanReview
+        ? []
+        : saved[KEY_PLAN_REVIEW_ITEMS] ?? [],
+      [KEY_PLAN_REVIEW_DIGEST]: legacyPlanReview
+        ? ""
+        : saved[KEY_PLAN_REVIEW_DIGEST] ?? "",
+      [KEY_PLAN_REVIEW_REVISION]: legacyPlanReview
+        ? savedPlanReviewRevision + 1
+        : savedPlanReviewRevision,
+      [KEY_PLAN_REVIEW_SCOPE]: legacyPlanReview
+        ? null
+        : isSyncScope(saved[KEY_PLAN_REVIEW_SCOPE])
+          ? saved[KEY_PLAN_REVIEW_SCOPE]
+          : null,
+      [KEY_PLAN_REVIEW_CANONICAL_IDENTITY]: legacyPlanReview
+        ? null
+        : parseCanonicalPlanIdentityV2(
           saved[KEY_PLAN_REVIEW_CANONICAL_IDENTITY],
         ),
       [KEY_SYNC_HISTORY]: Array.isArray(saved[KEY_SYNC_HISTORY])
@@ -7874,7 +7943,7 @@ export class StateManager {
       this.data[KEY_CONFIRMED_DESCENDANT_FILE_RECONSTRUCTION];
     const relevantConflicts = input.candidateItems.filter((item) =>
       item.type === SyncActionType.Conflict
-      && item.reason === "reason.newFileBothSides"
+      && item.reason === PLAN_REASON.newFileBothSides
       && Boolean(item.local)
       && Boolean(item.remote),
     );
@@ -10260,6 +10329,12 @@ export class StateManager {
     ) {
       throw new Error("Cannot reset while mutation recovery is unresolved");
     }
+    // Drain queued V2/PluginData commits before deleting any artifact so a
+    // queued write can never land after (or recreate) deleted storage. This
+    // mirrors resetPreservingIsolatedMutationRecovery and keeps the invariant
+    // owned here instead of by caller discipline.
+    await this.v2StateCommitQueue;
+    await this.pluginDataCommitQueue;
     const paths = getEasySyncPaths(
       this.plugin.app.vault,
       this.plugin.manifest.id,
@@ -11583,12 +11658,18 @@ function parseRemoteState(value: unknown): RemoteSyncState | null {
   };
 }
 
+function isLegacyCanonicalPlanIdentityRecord(value: unknown): boolean {
+  return isRecord(value) && value.version === 2;
+}
+
 function parseCanonicalPlanIdentityV2(
   value: unknown,
 ): CanonicalPlanIdentityV2 | null {
+  // 刀 5b：封存身份升版 3。持久化的旧版本（2）身份在此读为 null——相关审阅
+  // 授权经 sameCanonicalPlanIdentityV2 的 ===3 门整体失效（一次性重审）。
   if (
     !isRecord(value)
-    || value.version !== 2
+    || value.version !== 3
     || !Number.isSafeInteger(value.sourceCommitSeq)
     || Number(value.sourceCommitSeq) < 0
     || typeof value.digest !== "string"
@@ -11596,7 +11677,7 @@ function parseCanonicalPlanIdentityV2(
     || !isSyncScope(value.scope)
   ) return null;
   return {
-    version: 2,
+    version: 3,
     sourceCommitSeq: Number(value.sourceCommitSeq),
     digest: value.digest,
     scope: { ...value.scope },

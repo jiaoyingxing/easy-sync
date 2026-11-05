@@ -941,7 +941,7 @@ describe("P0.2 — incomplete local scan causes zero mutation (real executor)", 
       guardCall,
     );
     const firstDelete = executorSource.indexOf(
-      "executePlanItem(item, undefined, handoffs[waveIndex])",
+      "item, undefined, handoffs[waveIndex])",
       guardCall,
     );
     expect(guardCall).toBeGreaterThan(-1);

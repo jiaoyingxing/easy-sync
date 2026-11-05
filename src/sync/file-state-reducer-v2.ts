@@ -15,6 +15,7 @@ import {
   type ReceiptedRenameAnchorCollisionEvidenceV1,
   type RemoteFileEntry,
 } from "./types";
+import { V2StateRefusalError } from "./v2-state-refusal";
 
 interface FileStatePathViewV2 {
   baseEntries: BaseFileEntry[];
@@ -480,8 +481,8 @@ function applyRemoteUpsert(
   remoteDeletes: Set<string>,
   entry: RemoteFileEntry,
 ): void {
-  if (!entry.driveId) throw new Error(`V2 remote upsert is missing a drive id: ${entry.path}`);
-  if (!entry.parentId) throw new Error(`V2 remote upsert is missing a parent id: ${entry.path}`);
+  if (!entry.driveId) throw new V2StateRefusalError("V2 remote upsert is missing a drive id", entry.path);
+  if (!entry.parentId) throw new V2StateRefusalError("V2 remote upsert is missing a parent id", entry.path);
   const { name, parentPath } = splitFilePath(entry.path);
   const workingIndex: RemoteIndexV2 = {
     ...originalIndex,
@@ -490,12 +491,12 @@ function applyRemoteUpsert(
   const workingPathById = projectRemoteIndexV2(workingIndex);
   const occupiedId = findNodeIdByPath(workingPathById, entry.path);
   if (occupiedId && occupiedId !== entry.driveId) {
-    throw new Error(`V2 remote upsert would replace another identity: ${entry.path}`);
+    throw new V2StateRefusalError("V2 remote upsert would replace another identity", entry.path);
   }
 
   const priorPath = originalPathById.get(entry.driveId);
   if (priorPath && priorPath !== entry.path && !remoteDeletes.has(priorPath)) {
-    throw new Error(`V2 remote move is missing its source deletion: ${priorPath}`);
+    throw new V2StateRefusalError("V2 remote move is missing its source deletion", priorPath);
   }
   assertParentMatchesPath(workingIndex, workingPathById, entry.parentId, parentPath);
 
@@ -653,10 +654,10 @@ function applyBaseUpsert(
   const remoteId = findNodeIdByPath(pathById, base.path);
   const remote = remoteId ? remoteIndex.itemsById[remoteId] : undefined;
   if (!remoteId || !remote || remote.kind !== "file") {
-    throw new Error(`V2 base upsert has no remote file identity: ${base.path}`);
+    throw new V2StateRefusalError("V2 base upsert has no remote file identity", base.path);
   }
   if (remote.eTag !== undefined && remote.eTag !== base.eTag) {
-    throw new Error(`V2 base upsert remote version mismatch: ${base.path}`);
+    throw new V2StateRefusalError("V2 base upsert remote version mismatch", base.path);
   }
 
   const { prior, pathCollision } = findBaseUpsertAnchorContext(
@@ -666,7 +667,7 @@ function applyBaseUpsert(
     remoteId,
   );
   if (pathCollision && pathCollision.anchorId !== prior?.anchorId) {
-    throw new Error(`V2 base upsert would replace another anchor: ${base.path}`);
+    throw new V2StateRefusalError("V2 base upsert would replace another anchor", base.path);
   }
   for (const anchor of Object.values(anchors)) {
     if (anchor.remoteId === remoteId || anchor.lastPath === base.path) {
@@ -747,13 +748,13 @@ function assertParentMatchesPath(
 ): void {
   if (parentPath === "") {
     if (parentId !== index.filesRootId) {
-      throw new Error("V2 root file upsert has a non-root parent identity");
+      throw new V2StateRefusalError("V2 root file upsert has a non-root parent identity");
     }
     return;
   }
   const parent = index.itemsById[parentId];
   if (!parent || parent.kind !== "folder" || pathById.get(parentId) !== parentPath) {
-    throw new Error(`V2 remote upsert parent does not match path: ${parentPath}`);
+    throw new V2StateRefusalError("V2 remote upsert parent does not match path", parentPath);
   }
 }
 
@@ -770,7 +771,7 @@ function findNodeIdByPath(
 function splitFilePath(path: string): { parentPath: string; name: string } {
   if (!path || path.startsWith("/") || path.endsWith("/") || path.includes("\\")
     || path.split("/").some((segment) => !segment || segment === "." || segment === "..")) {
-    throw new Error(`V2 file path is invalid: ${path}`);
+    throw new V2StateRefusalError("V2 file path is invalid", path);
   }
   const separator = path.lastIndexOf("/");
   return separator < 0

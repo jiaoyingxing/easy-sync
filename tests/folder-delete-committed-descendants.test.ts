@@ -20,7 +20,7 @@ import {
   addShapeDevice,
   createShapeWorld,
 } from "./helpers/sync-shape-sequence-harness";
-import { OneDriveError, OneDriveErrorType } from "../src/onedrive/types";
+import { SyntheticRequestTimeoutError } from "../src/onedrive/types";
 
 const TIMED_OUT_CHILD = "perf-share/s1552.md";
 
@@ -99,10 +99,9 @@ describe("folder delete after in-round child deletions", () => {
       await originalDelete(vaultName, path, eTag, driveItemId);
       if (path === TIMED_OUT_CHILD) {
         staleReadPending = true;
-        throw new OneDriveError(
-          OneDriveErrorType.NetworkError,
-          "Request timed out after 15000ms",
-        );
+        // 刀 2 错误路由类型化：请求超时用类型化错误注入（消息逐字节等于
+        // 原 "Request timed out after 15000ms"），路由只认这一类型。
+        throw new SyntheticRequestTimeoutError(15000);
       }
     }) as never;
 

@@ -658,6 +658,39 @@ describe("AuthModule device code flow", () => {
     expect(auth.deviceAttempt?.phase).toBe("waiting");
   });
 
+  // R5（账本 §十三）：设备码端点与轮询此前未套 withAuthRequestTimeout，
+  // 宿主 requestUrl 挂死会让登录链永久停摆。
+  it("rejects a hung devicecode endpoint request after the auth request timeout", async () => {
+    vi.useFakeTimers();
+    const auth = makeAuth(() =>
+      new Promise<obsidian.RequestUrlResponse>(() => undefined));
+
+    const pending = auth.beginDeviceCodeLogin();
+    const expectation = expect(pending).rejects.toThrow(/network/i);
+    await vi.advanceTimersByTimeAsync(30_000);
+    await expectation;
+    expect(auth.isPending).toBe(false);
+  });
+
+  it("keeps the device poll chain alive when a token poll hangs past the auth request timeout", async () => {
+    vi.useFakeTimers();
+    const tokenCalls: string[] = [];
+    const auth = makeAuth(async (options) => {
+      if (options.url.includes("/oauth2/v2.0/devicecode")) {
+        return DEVICE_CODE_RESPONSE as obsidian.RequestUrlResponse;
+      }
+      if (options.url.includes("/oauth2/v2.0/token")) {
+        tokenCalls.push(String(options.body));
+        return new Promise(() => undefined);
+      }
+      throw new Error("unexpected request");
+    });
+
+    await auth.beginDeviceCodeLogin();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(tokenCalls.length).toBeGreaterThanOrEqual(2);
+  });
+
   it("rejects a devicecode response whose expires_in is not a finite positive number", async () => {
     const auth = makeAuth(async (options) => {
       if (options.url.includes("/oauth2/v2.0/devicecode")) {

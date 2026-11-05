@@ -6,6 +6,27 @@
  */
 
 import type { PluginScopeSelection } from "./community-plugin-sync-policy";
+import type { PlanReason } from "./plan-reason";
+
+// ---- Neutral provider vocabulary (重构刀 5b, 2026-11-02) ----
+
+/**
+ * 刀 5b 中性词汇表：提供方耦合的元数据概念在模型层用以下别名声明。
+ * 全部是 `string` 的零运行时别名——持久化字段名、字节格式与行为一字不动，
+ * 改的只是声明处的类型名与注释语义。字段名保留历史名（driveId／eTag／cTag／
+ * sha256Hash／quickXorHash），JSDoc 用中性语义＋注明历史名。词汇表指针：
+ * src/sync/sync-provider.ts 文件头。
+ */
+/** 提供方条目身份（历史名 driveId／parentId／remoteId；OneDrive 下实存 driveItem id）。 */
+export type ExternalItemId = string;
+/** 版本令牌：If-Match 全链与三方比较的远端版本事实（历史名 eTag）。 */
+export type VersionToken = string;
+/** 内容版本令牌：rename/move 不变的次级令牌，与版本令牌互为兜底（历史名 cTag）。 */
+export type ContentVersionToken = string;
+/** 强内容指纹：逐字节等值证据（历史名 sha256Hash）。 */
+export type StrongContentFingerprint = string;
+/** 弱内容指纹：只证不同、不证相同（历史名 quickXorHash）。 */
+export type WeakContentFingerprint = string;
 
 // ---- File Metadata ----
 
@@ -19,8 +40,8 @@ export interface LocalFileEntry {
   mtime: number;
   /** Full SHA-256 hash of file content (64 hex characters) */
   hash: string;
-  /** OneDrive-compatible QuickXor content hash when calculated from the same bytes */
-  quickXorHash?: string;
+  /** 本机算出的弱内容指纹（历史名 quickXorHash），与远端同名字段同算法可比。 */
+  quickXorHash?: WeakContentFingerprint;
   /** Whether the file is binary (true) or text (false) */
   binary: boolean;
 }
@@ -35,48 +56,52 @@ export interface LocalFolderEntry {
 export interface RemoteFileEntry {
   /** Vault-relative path (forward slashes, no leading slash) */
   path: string;
-  /** OneDrive driveItem id */
-  driveId: string;
-  /** Stable OneDrive parent driveItem id; absent only on legacy/local mutation entries. */
-  parentId?: string;
+  /** 提供方条目身份；历史名 driveId，OneDrive 下实存 driveItem id。 */
+  driveId: ExternalItemId;
+  /** 父条目身份；历史名 parentId，仅 legacy／本机变更条目缺省。 */
+  parentId?: ExternalItemId;
   /** Pre-signed download URL (from @microsoft.graph.downloadUrl) */
   downloadUrl?: string;
   /** File size in bytes */
   size: number;
   /** Last modified time from OneDrive (epoch ms) */
   mtime: number;
-  /** ETag from OneDrive */
-  eTag: string;
-  /** CTag from OneDrive */
-  cTag: string;
-  /** SHA-256 content hash from OneDrive metadata when available */
-  sha256Hash?: string;
+  /** 版本令牌（历史名 eTag），If-Match 与三方比较的远端版本事实。 */
+  eTag: VersionToken;
+  /** 内容版本令牌（历史名 cTag），rename/move 不变的次级令牌。 */
+  cTag: ContentVersionToken;
+  /** 强内容指纹（历史名 sha256Hash），可用时来自提供方元数据。 */
+  sha256Hash?: StrongContentFingerprint;
   /**
-   * OneDrive QuickXor content hash when available.
-   * A mismatch proves different bytes; a match is not SHA-256-grade equality.
+   * 弱内容指纹（历史名 quickXorHash）：不匹配证字节不同；匹配不等于
+   * SHA-256 级等值。
    */
-  quickXorHash?: string;
+  quickXorHash?: WeakContentFingerprint;
 }
 
 /** Persisted Graph folder identity used only to project incremental deltas. */
 export interface RemoteFolderEntry {
   /** Vault-relative folder path below files/ (forward slashes). */
   path: string;
-  /** Stable OneDrive driveItem id. */
-  driveId: string;
-  /** Stable parent driveItem id. */
-  parentId: string;
+  /** 提供方条目身份；历史名 driveId，实存文件夹 driveItem id。 */
+  driveId: ExternalItemId;
+  /** 父条目身份；历史名 parentId。 */
+  parentId: ExternalItemId;
   /** Current Graph-owned folder name. */
   name: string;
-  /** Graph metadata version for rename/move and create-parent guards. */
-  eTag?: string;
-  /** Descendant-sensitive tag when the provider exposes it for folders. */
-  cTag?: string;
+  /** 文件夹版本令牌（历史名 eTag），rename/move 与 create-parent 守卫用。 */
+  eTag?: VersionToken;
+  /** 内容版本令牌（历史名 cTag），提供方对文件夹暴露时才存在。 */
+  cTag?: ContentVersionToken;
 }
 
 /** Complete identity boundary for every reusable sync artifact. */
 export interface SyncScope {
   accountId: string;
+  /**
+   * 集合根身份（OneDrive 下为 drive id）。与条目级历史名 driveId 名同实异：
+   * 这里是集合根，条目级 `driveId` 字段是条目身份（见 {@link ExternalItemId}）。
+   */
   driveId: string;
   vaultFolderId: string;
   filesRootId: string;
@@ -112,8 +137,8 @@ export interface BaseFileEntry {
   hash: string;
   /** Size at last sync */
   size: number;
-  /** ETag at last sync (for remote comparison) */
-  eTag: string;
+  /** 上次同步时的版本令牌（历史名 eTag），供远端比较。 */
+  eTag: VersionToken;
 }
 
 // ---- Sync Plan Types ----
@@ -147,18 +172,18 @@ export enum SyncActionType {
 }
 
 interface SyncPlanFolder {
-  /** Stable remote identity when the folder already exists remotely. */
-  remoteId?: string;
-  /** Parent identity used for create-only Graph writes and read-back checks. */
-  parentRemoteId?: string;
+  /** 文件夹条目身份（历史名 remoteId），已存在时稳定。 */
+  remoteId?: ExternalItemId;
+  /** 父条目身份（历史名 parentRemoteId），create-only 写入与读回校验用。 */
+  parentRemoteId?: ExternalItemId;
   /** Vault-relative parent path; empty means the committed files root. */
   parentPath: string;
-  /** Folder version captured by the committed V2 envelope. */
-  remoteETag?: string;
-  /** Parent version captured by the committed V2 envelope. */
-  parentRemoteETag?: string;
-  /** Source parent identity for an identity-preserving move or delete. */
-  sourceParentRemoteId?: string;
+  /** 文件夹版本令牌（历史名 remoteETag），来自已提交的 V2 信封。 */
+  remoteETag?: VersionToken;
+  /** 父文件夹版本令牌（历史名 parentRemoteETag），来自已提交的 V2 信封。 */
+  parentRemoteETag?: VersionToken;
+  /** 来源父条目身份（历史名 sourceParentRemoteId），保身份 move/delete 用。 */
+  sourceParentRemoteId?: ExternalItemId;
 }
 
 /**
@@ -178,15 +203,15 @@ export interface SyncPlanItem {
   remote?: RemoteFileEntry;
   /** Present only for V2 folder actions. */
   folder?: SyncPlanFolder;
-  /** Reason for skip or retry */
-  reason?: string;
-  /** eTag from the baseline entry — used as If-Match on upload to prevent
-   *  silent overwrite when another device changed the file concurrently. */
-  baseEtag?: string;
+  /** Reason for skip or retry — 封闭词汇见 plan-reason.ts（刀 1：只加类型，字面值逐字不变） */
+  reason?: PlanReason;
+  /** 基线条目的版本令牌（历史名 baseEtag）——上传时作 If-Match，防止其他
+   *  设备并发改动后被静默覆盖。 */
+  baseEtag?: VersionToken;
   /** For RenameRemote: the old path the file is being renamed from. */
   renameFrom?: string;
-  /** Destination parent identity for a cross-directory file move. */
-  targetParentRemoteId?: string;
+  /** 跨目录文件移动的目标父条目身份（历史名 targetParentRemoteId）。 */
+  targetParentRemoteId?: ExternalItemId;
   /** Destructive local folder shell removal still awaits the existing delete approval. */
   requiresConfirmation?: boolean;
   /** Grouped identity action weight used by the existing bulk-change review gate. */
@@ -218,8 +243,10 @@ export interface ContentComparisonReceiptV1 {
   result: "different";
   localHash: string;
   localSize: number;
-  remoteDriveId: string;
-  remoteETag: string;
+  /** 远端条目身份（历史名 remoteDriveId）。 */
+  remoteDriveId: ExternalItemId;
+  /** 远端版本令牌（历史名 remoteETag）。 */
+  remoteETag: VersionToken;
   remoteSize: number;
   remoteHash: string;
 }
@@ -238,11 +265,14 @@ export interface TextMergeManualEvidenceV1 {
   scope: SyncScope;
   ancestorHash: string;
   ancestorSize: number;
-  ancestorETag: string;
+  /** 祖先版本令牌（历史名 ancestorETag）。 */
+  ancestorETag: VersionToken;
   localHash: string;
   localSize: number;
-  remoteDriveId: string;
-  remoteETag: string;
+  /** 远端条目身份（历史名 remoteDriveId）。 */
+  remoteDriveId: ExternalItemId;
+  /** 远端版本令牌（历史名 remoteETag）。 */
+  remoteETag: VersionToken;
   remoteSize: number;
   remoteHash: string;
 }
@@ -253,7 +283,10 @@ export interface SyncDecisionToken {
   accountId: string;
   scope: SyncScope;
   local: { exists: false } | { exists: true; hash: string; size: number };
-  remote: { exists: false } | { exists: true; driveId: string; eTag: string };
+  /** 远端事实：条目身份（历史名 driveId）＋版本令牌（历史名 eTag）。 */
+  remote:
+    | { exists: false }
+    | { exists: true; driveId: ExternalItemId; eTag: VersionToken };
   ancestorHash: string | null;
 }
 
@@ -302,7 +335,12 @@ export type V2ActivationReviewKind =
   | "v2-rs-adoption";
 
 export interface CanonicalPlanIdentityV2 {
-  version: 2;
+  /**
+   * 封存身份版本（刀 5b 升 3，2026-11-02）：摘要事实形状中性化时一并升版，
+   * 旧版本身份经 {@link sameCanonicalPlanIdentityV2} 全门失效关闭（一次性
+   * 重审），不做旧读新写兼容层。
+   */
+  version: 3;
   scope: SyncScope;
   sourceCommitSeq: number;
   digest: string;
@@ -349,7 +387,16 @@ type MutationLocalExpectation =
 
 export type MutationRemoteExpectation =
   | { exists: false }
-  | { exists: true; driveId: string; eTag: string; size: number; sha256Hash?: string };
+  | {
+      exists: true;
+      /** 条目身份（历史名 driveId）。 */
+      driveId: ExternalItemId;
+      /** 版本令牌（历史名 eTag）。 */
+      eTag: VersionToken;
+      size: number;
+      /** 强内容指纹（历史名 sha256Hash）。 */
+      sha256Hash?: StrongContentFingerprint;
+    };
 
 /**
  * Additive V1 recovery semantics which deliberately do not establish or alter
@@ -396,8 +443,9 @@ interface ReviewedFolderSubtreeDeleteBindingV1 {
   sourceCommitSeq: number;
   sourceLifecycleEpoch: number;
   /** Present only when the platform returned a descendant-sensitive tag
-   *  (OneDrive Personal never returns folder cTags). */
-  rootCTag?: string;
+   *  (OneDrive Personal never returns folder cTags). 历史名 rootCTag，
+   *  内容版本令牌语义。 */
+  rootCTag?: ContentVersionToken;
   memberCount: number;
 }
 
@@ -422,22 +470,28 @@ export interface FolderMutationIntentV2 {
   action: FolderMutationActionV2;
   path: string;
   sourcePath?: string;
-  /** Stable identity retained even when the current remote index has a tombstone. */
-  folderId?: string;
+  /** Stable identity retained even when the current remote index has a tombstone.
+   *  历史名 folderId，条目身份语义。 */
+  folderId?: ExternalItemId;
   expectedLocal: { exists: boolean };
   expectedSourceLocal?: { exists: boolean };
   expectedRemote:
     | { exists: false }
     | {
         exists: true;
-        driveId: string;
-        parentId: string;
-        eTag?: string;
+        /** 条目身份（历史名 driveId）。 */
+        driveId: ExternalItemId;
+        /** 父条目身份（历史名 parentId）。 */
+        parentId: ExternalItemId;
+        /** 版本令牌（历史名 eTag）。 */
+        eTag?: VersionToken;
       };
   expectedParent: {
-    driveId: string;
+    /** 父条目身份（历史名 driveId）。 */
+    driveId: ExternalItemId;
     path: string;
-    eTag?: string;
+    /** 版本令牌（历史名 eTag）。 */
+    eTag?: VersionToken;
   };
   /** Present only for an explicit reviewed non-empty subtree deletion. */
   reviewedSubtreeDelete?: ReviewedFolderSubtreeDeleteBindingV1;
@@ -458,7 +512,7 @@ export interface MutationCheckpointV1 {
   /** V2-only directory facts produced by create-local/create-remote. */
   folderUpserts?: RemoteFolderEntry[];
   /** V2-only directory identities retired after an empty-shell delete. */
-  folderDeletes?: Array<{ path: string; driveId: string }>;
+  folderDeletes?: Array<{ path: string; driveId: ExternalItemId }>;
   /** Device-local rename hints consumed by a committed folder mutation. */
   folderMoveHintRemovals?: string[];
 }
@@ -600,8 +654,10 @@ export interface ManualMutationResolutionLocalFactV1 {
 export interface ManualMutationResolutionRemoteFactV1 {
   path: string;
   exists: boolean;
-  driveId?: string;
-  eTag?: string;
+  /** 条目身份（历史名 driveId）。 */
+  driveId?: ExternalItemId;
+  /** 版本令牌（历史名 eTag）。 */
+  eTag?: VersionToken;
   hash?: string;
   size?: number;
   /** Display-only last-modified time; never part of `factsDigest`. */
@@ -829,7 +885,8 @@ export interface MutationRecoveryHistory {
 export interface LocalFolderMoveHintV1 {
   version: 1;
   scope: SyncScope;
-  remoteId: string;
+  /** 文件夹条目身份（历史名 remoteId）。 */
+  remoteId: ExternalItemId;
   fromPath: string;
   toPath: string;
   observedAt: number;
@@ -847,7 +904,8 @@ export interface LocalFolderMoveHintV1 {
 export interface LocalFolderDeleteHintV1 {
   version: 1;
   scope: SyncScope;
-  remoteId: string;
+  /** 文件夹条目身份（历史名 remoteId）。 */
+  remoteId: ExternalItemId;
   path: string;
   observedAt: number;
 }
@@ -883,8 +941,10 @@ export function sameCanonicalPlanIdentityV2(
   right: CanonicalPlanIdentityV2 | null | undefined,
 ): boolean {
   if (!left || !right) return left == null && right == null;
-  return left.version === 2
-    && right.version === 2
+  // 刀 5b：版本门 2→3。旧版本（2）身份在此整体失效（一次性重审）——
+  // 这是升版失效的闸门语义，不是兼容判断。
+  return left.version === 3
+    && right.version === 3
     && left.sourceCommitSeq === right.sourceCommitSeq
     && left.digest === right.digest
     && sameSyncScope(left.scope, right.scope);
@@ -959,7 +1019,8 @@ export const CHANGE_THRESHOLD_RATIO = 0.5;
 interface BaselineFileEntry {
   hash: string;
   size: number;
-  eTag: string;
+  /** 版本令牌（历史名 eTag）。 */
+  eTag: VersionToken;
   mtime: number;
 }
 
@@ -986,17 +1047,17 @@ export interface PlanReviewCounts {
 export interface PlanReviewItem {
   type: SyncActionType;
   path: string;
-  reason?: string;
+  reason?: PlanReason;
   /** Hash from the local file at review time — used to detect plan staleness */
   localHash?: string;
-  /** eTag from the remote file at review time */
-  remoteETag?: string;
+  /** 审阅时远端文件的版本令牌（历史名 remoteETag）。 */
+  remoteETag?: VersionToken;
   /** Stable folder identity/version used to make review digests stale-safe. */
-  folderRemoteId?: string;
-  folderRemoteETag?: string;
-  folderParentRemoteId?: string;
+  folderRemoteId?: ExternalItemId;
+  folderRemoteETag?: VersionToken;
+  folderParentRemoteId?: ExternalItemId;
   folderParentPath?: string;
-  folderParentRemoteETag?: string;
+  folderParentRemoteETag?: VersionToken;
 }
 
 /** Compute a stable digest from plan items — used to detect plan changes

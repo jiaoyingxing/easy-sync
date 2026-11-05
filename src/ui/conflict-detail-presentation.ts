@@ -9,6 +9,7 @@
 import type {
   DisplayDiffResult,
 } from "./diff-engine";
+import { PLAN_REASON } from "../sync/plan-reason";
 
 type Translate = (
   key: string,
@@ -42,7 +43,7 @@ function summarizeConflictReason(
   t: Translate,
   fallbackKey: string,
 ): string {
-  if (reason === "reason.bothSidesModified") {
+  if (reason === PLAN_REASON.bothSidesModified) {
     return t("conflictDetail.summaryBothModified");
   }
   return reason ? t(reason) : t(fallbackKey);
@@ -52,7 +53,7 @@ function summarizeDifferentContent(
   reason: string | undefined,
   t: Translate,
 ): string {
-  if (reason === "reason.newFileBothSides") {
+  if (reason === PLAN_REASON.newFileBothSides) {
     return t("conflictDetail.summaryBothExistDifferent");
   }
   return summarizeConflictReason(reason, t, "conflictDetail.summaryDifferent");

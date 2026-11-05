@@ -25,6 +25,7 @@ import type {
   MutationRecoveryRunSummary,
   SyncScope,
 } from "../src/sync/types";
+import { V2StateRefusalError } from "../src/sync/v2-state-refusal";
 import {
   TEST_SYNC_SCOPE,
   makeActiveV2State,
@@ -126,16 +127,18 @@ const makeFolderRecordRound = (args: {
     ...(args.folderAnchors ? { folderAnchors: args.folderAnchors } : {}),
   });
   // Only the folder record's checkpoint is refused (the F29 shape); every
-  // ordinary commit in the same round keeps the stub's behavior. The message is
-  // one of the closed absorption-refusal kinds, chosen per folder action.
+  // ordinary commit in the same round keeps the stub's behavior. The kind is
+  // one of the closed absorption-refusal kinds, chosen per folder action, and
+  // the message stays `${kind}: ${path}` byte-for-byte.
   const baseCommit = state.commitMutationCheckpoint;
   state.commitMutationCheckpoint = vi.fn(async (operationId: string) => {
     if (operationId === args.record.intent.operationId) {
-      throw new Error(
+      throw new V2StateRefusalError(
         args.record.intent.action === "deleteLocalFolder"
           || args.record.intent.action === "deleteRemoteFolder"
-          ? `V2 folder delete still has committed descendants: ${args.record.intent.path}`
-          : `V2 folder move file projection changed: ${args.record.intent.path}`,
+          ? "V2 folder delete still has committed descendants"
+          : "V2 folder move file projection changed",
+        args.record.intent.path,
       );
     }
     return baseCommit(operationId);

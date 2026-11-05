@@ -169,7 +169,8 @@ export async function commitReviewedStateV2MigrationCandidate(
     input.candidate.remoteIndex.complete !== true
     || !input.candidate.folderAnchors
     || input.candidate.meta.commitSeq !== 1
-    || input.canonicalIdentity.version !== 2
+    // 刀 5b：封存身份升版 3（2026-11-02）。
+    || input.canonicalIdentity.version !== 3
     || input.canonicalIdentity.sourceCommitSeq
       !== input.candidate.meta.commitSeq
     || input.canonicalIdentity.digest.length === 0

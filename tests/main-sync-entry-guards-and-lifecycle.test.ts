@@ -6,6 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
 import { I18n } from "../src/i18n";
+import { AuthErrorType } from "../src/auth/types";
 import type { SyncCallbacks, SyncResult } from "../src/sync/sync-executor";
 import { SyncActionType, type SyncPlan } from "../src/sync/types";
 import {
@@ -28,6 +29,7 @@ import {
 const confirmModalAwaitConfirm = vi.hoisted(() => vi.fn());
 const scopeCrossingPromptAwaitChoice = vi.hoisted(() => vi.fn());
 const scopeCrossingPromptMockArgs = vi.hoisted(() => [] as unknown[][]);
+const updateCheckFetchLatest = vi.hoisted(() => vi.fn());
 
 vi.mock("../src/auth/auth-module", () => ({
   AuthModule: class {
@@ -147,6 +149,18 @@ vi.mock("../src/ui/scope-crossing-prompt-modal", () => ({
   },
 }));
 
+// 只把网络面换成受控假体；其余更新检查纯函数沿用真实现，其他用例的
+// 既有行为（fetch 失败 → null → 静默重试排程）保持不变。
+vi.mock("../src/update-check", async () => {
+  const actual = await vi.importActual<
+    typeof import("../src/update-check")
+  >("../src/update-check");
+  return {
+    ...actual,
+    fetchLatestStableVersion: updateCheckFetchLatest,
+  };
+});
+
 // 本套件用替身替掉扫描器与侧栏视图，但其中两条规则不属于「外部依赖」，
 // 而是产品自己的判定。替身必须直接引用真实现：验收「替身没有变成第二份
 // 实现」，否则规则一改，替身会继续按旧规则放行，本套件全绿却已经失真。
@@ -186,6 +200,8 @@ describe("main sync entry guards", () => {
     vi.restoreAllMocks();
     confirmModalAwaitConfirm.mockReset();
     confirmModalAwaitConfirm.mockResolvedValue(true);
+    updateCheckFetchLatest.mockReset();
+    updateCheckFetchLatest.mockResolvedValue(null);
   });
 
   afterEach(() => {
@@ -236,7 +252,7 @@ describe("main sync entry guards", () => {
     // 折叠组从清单重建。
     const executorSource = readFileSync("src/sync/sync-executor.ts", "utf8");
     expect(executorSource).toContain(
-      "result.skippedPaths = normalizeHistorySkipPaths([...settledSkipPaths])",
+      "result.skippedPaths = normalizeHistorySkipPaths([...run.settledSkipPaths])",
     );
 
     const mainSource = readFileSync("src/main.ts", "utf8");
@@ -589,8 +605,8 @@ describe("main sync entry guards", () => {
         actionType: SyncActionType.RetryLater,
       }),
     ]);
-    expect(executorSource).toContain("completionFileSize,\n            item.renameFrom,");
-    expect(executorSource).toContain("fileSize,\n              item.renameFrom,");
+    expect(executorSource).toContain("completionFileSize,\n          item.renameFrom,");
+    expect(executorSource).toContain("fileSize,\n            item.renameFrom,");
   });
 
   it("renders the sidebar after every completed file while a round produces rows", () => {
@@ -1455,6 +1471,79 @@ describe("main sync entry guards", () => {
     await plugin.setAutoSyncMasterEnabled(true);
     expect(plugin.syncInterval).toBe(1);
     expect(plugin.autoSyncChangeDelaySeconds).toBe(1);
+  });
+
+  // R2（账本 §十三）：卸载后不得再有幽灵回调——越界提示防抖定时器在
+  // onunload 清单之外，更新检查 async 续体不查 unloaded，都会在卸载后
+  // 继续行动（弹无主提示框／重挂 24h 定时器）。
+  it("does not fire the scope crossing prompt from its debounce timer after unload", async () => {
+    scopeCrossingPromptMockArgs.length = 0;
+    scopeCrossingPromptAwaitChoice.mockReset();
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    const seams = plugin as never as {
+      enqueueScopeCrossingPrompt(
+        kind: "file",
+        fromPath: string,
+        toPath: string,
+      ): void;
+    };
+    seams.enqueueScopeCrossingPrompt("file", "Notes/a.md", "Archive/a.md");
+    plugin.onunload();
+    await vi.advanceTimersByTimeAsync(700);
+    expect(scopeCrossingPromptMockArgs).toHaveLength(0);
+  });
+
+  it("does not resurrect the scope crossing prompt when fired after unload", async () => {
+    scopeCrossingPromptMockArgs.length = 0;
+    scopeCrossingPromptAwaitChoice.mockReset();
+    const plugin = makePlugin();
+    const seams = plugin as never as {
+      enqueueScopeCrossingPrompt(
+        kind: "file",
+        fromPath: string,
+        toPath: string,
+      ): void;
+      fireScopeCrossingPrompt(): Promise<void>;
+    };
+    seams.enqueueScopeCrossingPrompt("file", "Notes/a.md", "Archive/a.md");
+    (plugin as never as { unloaded: boolean }).unloaded = true;
+    await seams.fireScopeCrossingPrompt();
+    expect(scopeCrossingPromptMockArgs).toHaveLength(0);
+  });
+
+  it("update check continuation re-arms nothing after unload", async () => {
+    vi.useFakeTimers();
+    const plugin = makePlugin();
+    let resolveFetch: (latest: string | null) => void = () => undefined;
+    updateCheckFetchLatest.mockImplementationOnce(
+      () =>
+        new Promise<string | null>((resolve) => {
+          resolveFetch = resolve;
+        }),
+    );
+    const seams = plugin as never as {
+      runUpdateCheckFlow(): void;
+      updateCheckTimer: number | null;
+    };
+    seams.runUpdateCheckFlow();
+    plugin.onunload();
+    resolveFetch("9.9.9");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(seams.updateCheckTimer).toBeNull();
+  });
+
+  // R6（账本 §十三）：宿主缺 SecretStorage 时写入必须显式失败——静默成功
+  // 会让登录看似完成、凭据永不落盘、下次冷启动无诊断掉登录。
+  it("saveSecret fails loudly when the host has no SecretStorage", async () => {
+    const plugin = makePlugin();
+    const seams = plugin as never as {
+      saveSecret(key: string, value: string): Promise<void>;
+    };
+    expect((plugin.app as { secretStorage?: unknown }).secretStorage)
+      .toBeUndefined();
+    await expect(seams.saveSecret("easy-sync-refresh", "token"))
+      .rejects.toMatchObject({ type: AuthErrorType.SecretStorageUnavailable });
   });
 
 });

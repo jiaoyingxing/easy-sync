@@ -2944,7 +2944,7 @@ describe("V1 to V2 controlled production activation", () => {
       path: localA.path,
     }));
     expect(reviewed.canonicalIdentity).toMatchObject({
-      version: 2,
+      version: 3,
       scope: {
         accountId: scope.accountId,
         ...replacementScope,
@@ -3173,7 +3173,7 @@ describe("V1 to V2 controlled production activation", () => {
       reviewImpactCount: 1,
     };
     const identity = {
-      version: 2 as const,
+      version: 3 as const,
       scope,
       sourceCommitSeq: staged.meta.commitSeq,
       digest: canonicalPlanDigestV2({

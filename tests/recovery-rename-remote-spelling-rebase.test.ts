@@ -15,6 +15,7 @@ import type {
   MutationReceiptV1,
   SyncScope,
 } from "../src/sync/types";
+import { V2StateRefusalError } from "../src/sync/v2-state-refusal";
 import type { SyncStateEnvelopeV2 } from "../src/sync/state-envelope-v2";
 import {
   graphFolder,
@@ -421,10 +422,10 @@ describe("receipted renameRemote destination-spelling rebase", () => {
   });
 
   it("settles the same shape inside the same action from either reducer refusal", async () => {
-    for (const message of [
-      "V2 remote upsert parent does not match path: Videos",
-      "V2 remote move is missing its source deletion: videos/x.md",
-    ]) {
+    for (const [kind, detail] of [
+      ["V2 remote upsert parent does not match path", "Videos"],
+      ["V2 remote move is missing its source deletion", "videos/x.md"],
+    ] as const) {
       const state = fieldState();
       const { executor, onedrive } = fieldExecutor(state);
       const metrics = {
@@ -446,7 +447,7 @@ describe("receipted renameRemote destination-spelling rebase", () => {
           metrics: never;
         }): Promise<string>;
       }).recoverReceiptedMutationFailure({
-        error: new Error(message),
+        error: new V2StateRefusalError(kind, detail),
         activeIntent: fieldRecord().intent,
         activeRecord: fieldRecord(),
         operationEpoch: 1,

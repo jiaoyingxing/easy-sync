@@ -31,6 +31,10 @@ import { OneDriveError, OneDriveErrorType, type DriveItem } from "../src/onedriv
 import type { LocalScanner } from "../src/sync/local-scanner";
 import type { PendingIssue } from "../src/sync/types";
 import type { MutationRecoveryRunSummary } from "../src/sync/types";
+import {
+  V2_STATE_REFUSAL_KINDS,
+  V2StateRefusalError,
+} from "../src/sync/v2-state-refusal";
 import { generateFileDecisionPlanV2 } from "../src/sync/file-decision-planner-v2";
 import { StateManager } from "../src/sync/state-manager";
 import { I18n } from "../src/i18n";
@@ -2756,6 +2760,21 @@ describe("Persistent remote delta state", () => {
     });
   };
 
+  /** The classified absorption-refusal shape: the real reducer throws a typed
+   *  `V2StateRefusalError` whose message is `${kind}: ${detail}` byte-for-byte,
+   *  and only that type is routed as a refusal (刀 2 deleted the text fallback). */
+  const setCommitRefusal = (
+    probe: Awaited<ReturnType<typeof makeStaleTreeCommitProbe>>,
+    kind: (typeof V2_STATE_REFUSAL_KINDS)[number],
+    detail: string,
+  ) => {
+    (probe.state.commitMutationCheckpoint as unknown as {
+      mockImplementation(fn: (operationId: string) => Promise<unknown>): void;
+    }).mockImplementation(async () => {
+      throw new V2StateRefusalError(kind, detail);
+    });
+  };
+
   const recoverWithRepair = (
     probe: Awaited<ReturnType<typeof makeStaleTreeCommitProbe>>,
   ) => (probe.executor as unknown as {
@@ -2786,18 +2805,22 @@ describe("Persistent remote delta state", () => {
 
   const STATE_ABSORPTION_REFUSALS = [
     // Reproduces the F29 field message exactly, through the real commit path.
-    "V2 folder move file projection changed: Notes/Child",
+    { kind: "V2 folder move file projection changed", detail: "Notes/Child" },
     // A same-family refusal the planner-side gate does not cover yet.
-    "V2 folder move descendant projection changed: Notes/Child",
+    { kind: "V2 folder move descendant projection changed", detail: "Notes/Child" },
     // A file-layer refusal of the same kind.
-    "V2 remote move is missing its source deletion: Notes/Child/a.md",
-  ];
+    { kind: "V2 remote move is missing its source deletion", detail: "Notes/Child/a.md" },
+  ] as const;
 
-  it.each(STATE_ABSORPTION_REFUSALS.map((message) => ({ message })))(
+  it.each(STATE_ABSORPTION_REFUSALS.map(({ kind, detail }) => ({
+    kind,
+    detail,
+    message: `${kind}: ${detail}`,
+  })))(
     "reports one record-level blocked outcome when the committed state cannot absorb a receipted record ($message)",
-    async ({ message }) => {
+    async ({ kind, detail }) => {
       const probe = await makeStaleTreeCommitProbe(() => "reject");
-      setCommitRefusalMessage(probe, message);
+      setCommitRefusal(probe, kind, detail);
 
       await expect(blockedSummary(probe)).resolves.toMatchObject({
         state: "blocked",
@@ -2849,7 +2872,7 @@ describe("Persistent remote delta state", () => {
   // verification debt rather than asserted here.
   it("keeps the refused record itself blocked and untouched", async () => {
     const probe = await makeStaleTreeCommitProbe(() => "reject");
-    setCommitRefusalMessage(probe, "V2 folder move file projection changed: Notes/Child");
+    setCommitRefusal(probe, "V2 folder move file projection changed", "Notes/Child");
 
     await expect(blockedSummary(probe)).resolves.toMatchObject({
       state: "blocked",
@@ -2927,7 +2950,10 @@ describe("Persistent remote delta state", () => {
     (probe.state.commitMutationCheckpoint as unknown as {
       mockImplementation(fn: (operationId: string) => Promise<unknown>): void;
     }).mockImplementation(async () => {
-      throw new Error("V2 folder move file projection changed: F/y.md");
+      throw new V2StateRefusalError(
+        "V2 folder move file projection changed",
+        "F/y.md",
+      );
     });
     // A committed descendant file anchor under the move's source path: the
     // reducer requires it to project to the mechanical translation.

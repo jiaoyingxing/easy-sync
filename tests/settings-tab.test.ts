@@ -415,9 +415,6 @@ describe("settings tab", () => {
     );
     expect(styles).toContain(".easy-sync-plugin-selection-chip");
     expect(styles).toMatch(
-      /\.easy-sync-plugin-selection-chip\.is-experimental\s*\{[^}]*color:\s*var\(--text-error\)/s,
-    );
-    expect(styles).toMatch(
       /\.easy-sync-plugin-selection-chip\.is-hidden\s*\{[^}]*display:\s*none/s,
     );
     // 手机宿主把 .modal-title 强制成 block（.is-phone .modal-title），
@@ -1311,8 +1308,6 @@ describe("settings tab", () => {
     expect(en["settings.syncPluginData.desc"]).toBe(
       "Sync settings for selected plugins (data.json). Devices with this on share one copy, so a change on any device replaces the settings on the others; leave out plugins that need per-device settings.",
     );
-    expect(zhCN["settings.communityPlugins.experimental"]).toBe("实验性");
-    expect(en["settings.communityPlugins.experimental"]).toBe("Experimental");
     expect(zhCN["settings.communityPlugins.data.toggleAria"]).toBe(
       "为“{plugin}”开启数据同步",
     );

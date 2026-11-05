@@ -318,8 +318,11 @@ function validatePendingInput(
 function isCanonicalIdentity(
   value: unknown,
 ): value is CanonicalPlanIdentityV2 {
+  // 刀 5b：封存身份升版 3（2026-11-02）。旧版本（2）身份的持久化 hold 即使
+  // 通过本门，也会在其后的事实重算（canonicalPlanDigestV2 v3 形状）处失配
+  // 抛错——一次性重审，读路径降级为既有 unreadable 块，不静默放行。
   return isRecord(value)
-    && value.version === 2
+    && value.version === 3
     && isSyncScope(value.scope)
     && Number.isSafeInteger(value.sourceCommitSeq)
     && Number(value.sourceCommitSeq) > 0

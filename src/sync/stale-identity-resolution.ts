@@ -3,6 +3,7 @@ import {
   planIdentityRenamesV2,
   type IdentityRenameActionV2,
 } from "./identity-rename-v2";
+import { PLAN_REASON } from "./plan-reason";
 import { projectRemoteIndexV2 } from "./remote-index-v2";
 import { identityPath } from "./recovery-anchor-v2";
 import {
@@ -135,7 +136,7 @@ export function buildStaleIdentityResolutionSnapshotV1(
     const deferred = candidate.items.filter((item) =>
       item.type === SyncActionType.FolderDeferred
         && item.path === path
-        && item.reason === "reason.identityReplacement.ambiguous",
+        && item.reason === PLAN_REASON.identityReplacementAmbiguous,
     );
     if (deferred.length !== 1) return null;
 
@@ -204,7 +205,7 @@ export function buildStaleIdentityResolutionSnapshotV1(
   const deferred = candidate.items.filter((item) =>
     item.type === SyncActionType.FolderDeferred
       && item.path === path
-      && item.reason === "reason.folder.anchored-folder-missing-remote",
+      && item.reason === PLAN_REASON.folderAnchoredFolderMissingRemote,
   );
   const folderConflicts = candidate.folderPlan.items.filter((item) =>
     item.type === "conflict"

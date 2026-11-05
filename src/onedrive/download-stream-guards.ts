@@ -18,7 +18,7 @@ import {
   describeError,
   TimeoutHandle,
 } from "../obsidian-compat";
-import { OneDriveError, OneDriveErrorType } from "./types";
+import { OneDriveError, OneDriveErrorType, SyntheticRequestTimeoutError } from "./types";
 
 /** Zero-progress watchdog for streaming downloads (60 s, user-decided
  *  2026-09-14). 2026-09-13 real failure: four stalled downloads burned their
@@ -246,6 +246,38 @@ export function abortError(): Error {
 
 export function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
+}
+
+/** 刀 2 错误路由类型化：请求超时分类器从 client.ts 迁入（2026-11-01，路由
+ *  面改判别码后只认类型化超时），与 requestErrorMessage 同域——超时包装与
+ *  标记位路由的规则负责点集中在这里，client 与多流下载器共用。 */
+export function isRequestTimeoutError(error: unknown): boolean {
+  return error instanceof SyntheticRequestTimeoutError;
+}
+
+/** Wrap an uncancellable request timeout into a typed NetworkError, carrying
+ *  the deadline milliseconds in `OneDriveError.requestTimeoutMs` so downstream
+ *  routing reads the marker instead of matching message text. */
+export function rethrowUncancellableRequestTimeout(error: unknown): void {
+  if (isRequestTimeoutError(error)) {
+    const requestTimeoutMs = error instanceof SyntheticRequestTimeoutError
+      ? error.timeoutMs
+      : null;
+    throw new OneDriveError(
+      OneDriveErrorType.NetworkError,
+      requestErrorMessage(error),
+      0,
+      null,
+      null,
+      null,
+      requestTimeoutMs,
+    );
+  }
+}
+
+export function isUncancellableRequestTimeout(error: unknown): boolean {
+  return error instanceof SyntheticRequestTimeoutError
+    || (error instanceof OneDriveError && error.requestTimeoutMs !== null);
 }
 
 /** Throw when the signal is aborted. Without a message the caller gets the

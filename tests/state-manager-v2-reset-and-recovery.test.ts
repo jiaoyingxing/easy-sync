@@ -30,6 +30,7 @@ import {
   stateV2ActiveIndexedDbDatabaseName,
 } from "../src/sync/state-v2-indexeddb-active";
 import { MergeReadyStore } from "../src/sync/merge-ready-store";
+import type { SyncStateEnvelopeV2 } from "../src/sync/state-envelope-v2";
 
 describe("StateManager V2 production controller", () => {
   it("clears every local V2 baseline and record while preserving logs, settings carriers, plugin assets, and user files", async () => {
@@ -112,6 +113,76 @@ describe("StateManager V2 production controller", () => {
         paths.logsDir,
         true,
       );
+    } finally {
+      await state.close();
+      if (databaseId) {
+        await deleteDB(stateV2ActiveIndexedDbDatabaseName(databaseId));
+      }
+    }
+  });
+
+  // R1（账本 §十三）：reset() 删工件前必须排空 V2/PluginData 提交队列，
+  // 与 resetPreservingIsolatedMutationRecovery 的既有排空对齐；否则排队中的
+  // 提交可在 IndexedDB 删除后落地，正中「reset 不得盲重放」铁律。
+  it("drains queued V2 commits before deleting state artifacts so a late commit cannot land after the delete", async () => {
+    const harness = makeHarness({ indexedDbActive: true });
+    const originalStoreFactory = harness.plugin
+      .createStateV2IndexedDbActiveStore;
+    const events: string[] = [];
+    if (originalStoreFactory) {
+      harness.plugin.createStateV2IndexedDbActiveStore = (...args) => {
+        const store = originalStoreFactory(...args);
+        const originalDelete = store.delete.bind(store);
+        (store as { delete: () => Promise<void> }).delete = async () => {
+          events.push("delete");
+          await originalDelete();
+        };
+        return store;
+      };
+    }
+    const state = new StateManager(harness.plugin);
+    let databaseId = "";
+    try {
+      await state.load();
+      databaseId = state.activeV2StorageAuthorityEvidence.databaseId ?? "";
+      expect(databaseId).not.toBe("");
+
+      const manager = state as unknown as {
+        commitV2State(
+          buildNext: (current: SyncStateEnvelopeV2) => SyncStateEnvelopeV2,
+        ): Promise<boolean>;
+        publishV2Candidate(
+          previous: SyncStateEnvelopeV2,
+          candidate: SyncStateEnvelopeV2,
+          candidateValidated: boolean,
+          breakdown?: unknown,
+        ): Promise<void>;
+      };
+      let releasePublish!: () => void;
+      const publishGate = new Promise<void>((resolve) => {
+        releasePublish = resolve;
+      });
+      const originalPublish = manager.publishV2Candidate.bind(state);
+      manager.publishV2Candidate = async (...args) => {
+        events.push("publish-entered");
+        await publishGate;
+        await originalPublish(...args);
+        events.push("publish-completed");
+      };
+
+      const commitPromise = manager.commitV2State((current) => ({
+        ...current,
+        meta: { ...current.meta, commitSeq: current.meta.commitSeq + 1 },
+      }));
+      const resetPromise = state.reset();
+      releasePublish();
+      await commitPromise;
+      await resetPromise;
+
+      // 排空成立时 publish（含其完成）严格先于 delete；缺口时 delete 会
+      // 抢在仍被门闸挂住的 publish 之前发生。
+      expect(events).toEqual(["publish-entered", "publish-completed", "delete"]);
+      expect(state.isV2StateActive).toBe(false);
     } finally {
       await state.close();
       if (databaseId) {

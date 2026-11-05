@@ -35,6 +35,7 @@ import {
 } from "../../src/sync/deletion-ledger";
 import { OneDriveClient, ResponseByteBudgetError } from "../../src/onedrive/client";
 import { OneDriveError, OneDriveErrorType, type DriveItem } from "../../src/onedrive/types";
+import { V2StateRefusalError } from "../../src/sync/v2-state-refusal";
 import type { LocalScanner } from "../../src/sync/local-scanner";
 import type { PendingIssue } from "../../src/sync/types";
 import { generateFileDecisionPlanV2 } from "../../src/sync/file-decision-planner-v2";
@@ -1571,11 +1572,19 @@ export function makeNoticeRecorder(): {
   return { center, messages };
 }
 
-export const BASE_UPSERT_GATES = [
-  "V2 base upsert has no remote file identity: note.md",
-  "V2 base upsert remote version mismatch: note.md",
-  "V2 base upsert would replace another anchor: note.md",
-];
+/** The three committed-tree rejections a recovery checkpoint's base upsert
+ *  can hit, kept as typed kind/detail pairs so the probe can throw the same
+ *  refusal the real reducer throws (刀 2: typed routing, message byte-identical
+ *  to the historical `${kind}: ${detail}` texts that BASE_UPSERT_GATES keeps). */
+const BASE_UPSERT_GATE_SHAPES = [
+  { kind: "V2 base upsert has no remote file identity", detail: "note.md" },
+  { kind: "V2 base upsert remote version mismatch", detail: "note.md" },
+  { kind: "V2 base upsert would replace another anchor", detail: "note.md" },
+] as const;
+
+export const BASE_UPSERT_GATES = BASE_UPSERT_GATE_SHAPES.map(
+  ({ kind, detail }) => `${kind}: ${detail}`,
+);
 
 export const makeStaleTreeCommitProbe = async (decide: (
   attempt: number,
@@ -1636,7 +1645,10 @@ export const makeStaleTreeCommitProbe = async (decide: (
   state.commitMutationCheckpoint = vi.fn(async (operationId: string) => {
     attempts++;
     if (decide(attempts) === "reject") {
-      throw new Error(BASE_UPSERT_GATES[0]);
+      throw new V2StateRefusalError(
+        BASE_UPSERT_GATE_SHAPES[0].kind,
+        BASE_UPSERT_GATE_SHAPES[0].detail,
+      );
     }
     return realCommit(operationId);
   }) as never;

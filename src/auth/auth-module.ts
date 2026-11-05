@@ -520,15 +520,18 @@ export class AuthModule {
 
     let response: RequestUrlResponse;
     try {
-      response = await requestUrl({
-        url: MS_AUTH_CONFIG.deviceCodeEndpoint,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: body.toString(),
-        throw: false,
-      });
+      response = await withAuthRequestTimeout(
+        requestUrl({
+          url: MS_AUTH_CONFIG.deviceCodeEndpoint,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: body.toString(),
+          throw: false,
+        }),
+        AUTH_REQUEST_TIMEOUT_MS,
+      );
     } catch (e) {
       throw new AuthError(
         AuthErrorType.NetworkError,
@@ -765,15 +768,18 @@ export class AuthModule {
 
     let response: RequestUrlResponse;
     try {
-      response = await requestUrl({
-        url: MS_AUTH_CONFIG.tokenEndpoint,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: body.toString(),
-        throw: false,
-      });
+      response = await withAuthRequestTimeout(
+        requestUrl({
+          url: MS_AUTH_CONFIG.tokenEndpoint,
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded",
+          },
+          body: body.toString(),
+          throw: false,
+        }),
+        AUTH_REQUEST_TIMEOUT_MS,
+      );
     } catch (e) {
       this.diag?.warn("auth", "device code poll network error", authErrorDiagData(e));
       return { status: "networkError" };

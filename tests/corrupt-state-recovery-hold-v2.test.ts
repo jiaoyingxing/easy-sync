@@ -51,7 +51,7 @@ function candidate(commitSeq = 4): SyncStateEnvelopeV2 {
 function input(items: SyncPlanItem[] = []) {
   const state = candidate();
   const canonicalIdentity = {
-    version: 2 as const,
+    version: 3 as const,
     scope,
     sourceCommitSeq: state.meta.commitSeq,
     digest: canonicalPlanDigestV2({
@@ -190,5 +190,20 @@ describe("CorruptStateRecoveryHoldV2Store", () => {
       phase: "pending",
     });
     expect(replacement.items).toEqual(items);
+  });
+
+  it("keeps a v2-identity recovery hold fail-closed", async () => {
+    const harness = makeStore();
+    const pending = await harness.store.publishPending(input());
+    harness.files.set(paths.committed, JSON.stringify({
+      ...pending,
+      canonicalIdentity: {
+        ...pending.canonicalIdentity,
+        version: 2,
+      },
+    }));
+
+    await expect(harness.store.load()).rejects.toThrow("unsupported format");
+    expect(harness.files.has(paths.committed)).toBe(true);
   });
 });

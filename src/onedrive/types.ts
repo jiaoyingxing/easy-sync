@@ -154,6 +154,12 @@ export class OneDriveError extends Error {
   public readonly retryAfterSeconds: number | null;
   public readonly graphCode: string | null;
   public readonly graphError: OneDriveGraphErrorDetail | null;
+  /**
+   * 刀 2 错误路由类型化：当本错误承载的是一个不可取消的请求超时（客户端
+   * deadline 到点，请求可能仍在宿主侧运行）时，记录该 deadline 的毫秒数；
+   * 其余错误为 null。路由面以此判别，不再依赖错误消息文本。
+   */
+  public readonly requestTimeoutMs: number | null;
 
   constructor(
     type: OneDriveErrorType,
@@ -162,6 +168,7 @@ export class OneDriveError extends Error {
     retryAfterSeconds: number | null = null,
     graphCode: string | null = null,
     graphError: OneDriveGraphErrorDetail | null = null,
+    requestTimeoutMs: number | null = null,
   ) {
     super(message);
     this.name = "OneDriveError";
@@ -170,6 +177,7 @@ export class OneDriveError extends Error {
     this.retryAfterSeconds = retryAfterSeconds;
     this.graphCode = graphError?.code ?? graphCode;
     this.graphError = graphError;
+    this.requestTimeoutMs = requestTimeoutMs;
   }
 
   get graphMessage(): string | null {

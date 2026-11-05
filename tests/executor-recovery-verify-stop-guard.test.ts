@@ -3,6 +3,10 @@ import { functionBody, readSourceFile } from "./helpers/source-scope";
 
 const EXECUTOR_PATH = "src/sync/sync-executor.ts";
 const source = readSourceFile(EXECUTOR_PATH);
+// 分解刀 4（纯搬移）：错误类按域搬进 executor-errors.ts，本文件的
+// 「错误类声明＋消息逐字」钉随之指向新模块；类体逐 token 未动。
+const ERRORS_PATH = "src/sync/executor-errors.ts";
+const errorsSource = readSourceFile(ERRORS_PATH);
 
 function occurrenceIndexes(text: string, needle: string): number[] {
   const indexes: number[] = [];
@@ -204,10 +208,10 @@ describe("community plugin downgrade error routing", () => {
   it("throws a typed downgrade error whose message stays byte-identical", () => {
     const preflight = functionBody(source, "private async assertCommunityPluginUploadPreflight(");
     expect(preflight).toContain("throw new CommunityPluginBundleDowngradeError(pluginId);");
-    expect(source).toContain(
+    expect(errorsSource).toContain(
       "class CommunityPluginBundleDowngradeError extends Error {",
     );
-    expect(source).toContain(
+    expect(errorsSource).toContain(
       "super(`Selected plugin upload would downgrade remote bundle: ${pluginId}`);",
     );
   });

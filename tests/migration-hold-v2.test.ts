@@ -122,7 +122,7 @@ function identity(
   }),
 ): CanonicalPlanIdentityV2 {
   return {
-    version: 2,
+    version: 3,
     scope,
     sourceCommitSeq: 1,
     digest,
@@ -841,5 +841,158 @@ describe("MigrationHoldV2Store", () => {
       lastTotalFiles: 1,
     })).rejects.toThrow("not bound");
     expect(files.size).toBe(0);
+  });
+});
+
+describe("MigrationHoldV2Store legacy v2 upgrade retirement", () => {
+  async function completedHold() {
+    const { adapter, files } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    const pending = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      now: 2000,
+    });
+    const confirmed = await store.confirm(
+      pending.revision,
+      pending.canonicalIdentity,
+      protocolBinding,
+      2100,
+    );
+    const committed = await store.transition(
+      confirmed!.revision,
+      confirmed!.canonicalIdentity,
+      "authority-committed",
+      2200,
+    );
+    const completed = await store.transition(
+      committed!.revision,
+      committed!.canonicalIdentity,
+      "completed",
+      2300,
+    );
+    return { adapter, files, store, hold: completed! };
+  }
+
+  function persistLegacy(
+    files: Map<string, string>,
+    path: string,
+    hold: unknown,
+  ): void {
+    files.set(path, JSON.stringify(hold));
+  }
+
+  function downgrade(hold: unknown): Record<string, unknown> {
+    const value = structuredClone(hold) as Record<string, unknown>;
+    value.canonicalIdentity = {
+      ...(value.canonicalIdentity as Record<string, unknown>),
+      version: 2,
+    };
+    return value;
+  }
+
+  it.each(["completed", "cancelled", "pending", "confirmed"] as const)(
+    "retires a persisted %s hold whose identity is still version 2",
+    async (phase) => {
+      const { adapter, files, store, hold } = await completedHold();
+      let legacy = downgrade(hold);
+      if (phase === "cancelled") {
+        legacy = downgrade(await store.publishPending({
+          candidate: candidate(),
+          sourceStateDigest,
+          canonicalIdentity: identity(),
+          canonicalReview: review,
+          items,
+          lastTotalFiles: 1,
+          now: 2400,
+        }));
+        legacy.phase = "cancelled";
+      } else if (phase === "pending") {
+        legacy.phase = "pending";
+        delete legacy.protocolBinding;
+      } else if (phase === "confirmed") {
+        legacy.phase = "confirmed";
+      }
+      files.clear();
+      persistLegacy(files, paths.committed, legacy);
+      const retired = vi.fn();
+      const upgraded = new MigrationHoldV2Store(adapter, paths, {
+        onLegacyHoldRetired: retired,
+      });
+
+      await expect(upgraded.load()).resolves.toBeNull();
+      expect(files.has(paths.committed)).toBe(false);
+      expect(retired).toHaveBeenCalledWith({
+        path: paths.committed,
+        phase,
+      });
+    },
+  );
+
+  it("keeps an authority-committed v2 hold fail-closed", async () => {
+    const { adapter, files } = makeAdapter();
+    const store = new MigrationHoldV2Store(adapter, paths);
+    const pending = await store.publishPending({
+      candidate: candidate(),
+      sourceStateDigest,
+      canonicalIdentity: identity(),
+      canonicalReview: review,
+      items,
+      lastTotalFiles: 1,
+      now: 2000,
+    });
+    const confirmed = await store.confirm(
+      pending.revision,
+      pending.canonicalIdentity,
+      protocolBinding,
+      2100,
+    );
+    const committed = await store.transition(
+      confirmed!.revision,
+      confirmed!.canonicalIdentity,
+      "authority-committed",
+      2200,
+    );
+    files.clear();
+    persistLegacy(files, paths.committed, downgrade(committed!));
+
+    await expect(store.load()).rejects.toThrow("unsupported format");
+    expect(files.has(paths.committed)).toBe(true);
+  });
+
+  it("does not retire a v2-shaped hold with unrelated record corruption", async () => {
+    const { adapter, files, store, hold } = await completedHold();
+    const legacy = downgrade(hold);
+    delete legacy.canonicalReview;
+    files.clear();
+    persistLegacy(files, paths.committed, legacy);
+
+    await expect(store.load()).rejects.toThrow("unsupported format");
+    expect(files.has(paths.committed)).toBe(true);
+  });
+
+  it("retires a legacy staged slot and keeps a valid committed v3 hold", async () => {
+    const { adapter, files, store, hold } = await completedHold();
+    files.set(paths.next, JSON.stringify({
+      ...downgrade(hold),
+      revision: hold.revision + 1,
+      phase: "completed",
+    }));
+
+    const loaded = await store.load();
+
+    expect(loaded).toEqual(hold);
+    expect(files.has(paths.next)).toBe(false);
+    expect(files.has(paths.committed)).toBe(true);
+  });
+
+  it("keeps loading an already-valid v3 hold unchanged", async () => {
+    const { adapter, store, hold } = await completedHold();
+
+    await expect(store.load()).resolves.toEqual(hold);
   });
 });

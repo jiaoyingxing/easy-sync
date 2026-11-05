@@ -18,6 +18,7 @@ import {
   type UpdateReminderSnooze,
 } from "./update-check";
 import { AuthModule, type AuthPluginContext } from "./auth/auth-module";
+import { AuthError, AuthErrorType } from "./auth/types";
 import { createAuthBrowserLauncher } from "./auth/auth-browser";
 import {
   compatClearInterval,
@@ -1578,6 +1579,10 @@ export default class EasySyncPlugin extends Plugin {
         const latest = await fetchLatestStableVersion((opts) =>
           requestUrl(opts),
         );
+        // The fetch can outlive the plugin (unload during flight); a stale
+        // continuation must not write bookkeeping, re-render, or re-arm the
+        // 24h timer on a dead instance.
+        if (this.unloaded) return;
         if (latest !== null) {
           this.updateLastKnownLatest = latest;
           this.updateLastCheckAt = now;
@@ -1663,6 +1668,8 @@ export default class EasySyncPlugin extends Plugin {
     this.communityPluginLocalReconciliationTimer = null;
     compatClearTimeout(this.v2StateReloadRetryTimer);
     this.v2StateReloadRetryTimer = null;
+    compatClearTimeout(this.scopeCrossingPromptTimer);
+    this.scopeCrossingPromptTimer = null;
     this.stopAutoSync();
     this.cancelDescendantFileReconstructionContinuation();
     this.disableMobileStatusBar();
@@ -6449,6 +6456,7 @@ export default class EasySyncPlugin extends Plugin {
   }
 
   private async fireScopeCrossingPrompt(): Promise<void> {
+    if (this.unloaded) return;
     if (this.scopeCrossingPromptShowing) return;
     const batch = this.scopeCrossingPromptQueue.splice(0);
     if (batch.length === 0) return;
@@ -11406,7 +11414,16 @@ export default class EasySyncPlugin extends Plugin {
 
   private async saveSecret(key: string, value: string): Promise<void> {
     const ss = this.app.secretStorage;
-    if (!ss) return;
+    // A missing SecretStorage must fail the write loudly: silent success made
+    // login look complete while the refresh token was never persisted, and
+    // the next cold start silently dropped the session (账本 §十三 R6). The
+    // read path surfaces the same condition as this error type already.
+    if (!ss) {
+      throw new AuthError(
+        AuthErrorType.SecretStorageUnavailable,
+        "SecretStorage is not available",
+      );
+    }
     // Obsidian's runtime returns a real promise; the shipped type signature
     // still says void. Assert the actual shape so the write still propagates.
     await (ss.setSecret as (id: string, secret: string) => Promise<void>)(key, value);
